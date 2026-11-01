@@ -1406,6 +1406,15 @@ A target whose host is at its `concurrency` limit waits for a slot for up to
 one build timeout (`DSR_BUILD_TIMEOUT`, default 3600s) instead of failing
 after five minutes; set `DSR_SELECTOR_WAIT_TIMEOUT` to choose another bound.
 
+Native disk admission budgets 20 GiB of available capacity per configured host
+build slot: two slots require 40 GiB and four require 80 GiB. Shared filesystems
+and APFS containers count their capacity once, while each volume's quota still
+limits usable space. A large volume above 90% usage can proceed with a warning
+when its byte requirement is met. Missing `concurrency` defaults to two; invalid
+counts refuse admission. This check observes capacity without reserving it.
+See [disk admission](docs/UNIX_DISK_ADMISSION.md) for split-storage contracts,
+effective native paths, and the deterministic regression commands.
+
 ---
 
 ## Logging and State

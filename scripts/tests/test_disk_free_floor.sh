@@ -47,7 +47,7 @@ class DiskFloor(unittest.TestCase):
         self.env.pop('TMPDIR', None)
         Path(self.env['DSR_HOSTS_FILE']).write_text(
             'hosts:\n  localtest:\n    platform: linux/amd64\n    connection: local\n'
-            '    enabled: true\n    capabilities:\n')
+            '    concurrency: 1\n    enabled: true\n    capabilities:\n')
         self.sequence = 0
 
     def call(self, function, *arguments, module=MODULE, setup=''):

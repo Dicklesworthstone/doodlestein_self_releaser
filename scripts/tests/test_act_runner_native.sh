@@ -964,8 +964,10 @@ test_native_host_capability_admission() (
     host=$(_hh_get_host_config incapable) || return 1
     fingerprint=$(_hh_admission_fingerprint "$host") || return 1
     old_receipt=$(_hh_cache_read incapable) || return 1
+    # Retain the historical v5 contract after percentage-only errors were
+    # removed; do not depend on a threshold absent from the current policy.
     old_contract=$(jq -ncS --argjson host "$host" --arg disk_warn "$_HH_DISK_WARN_THRESHOLD" \
-        --arg disk_error "$_HH_DISK_ERROR_THRESHOLD" --arg disk_min_free "$_HH_DISK_MIN_FREE_BYTES" \
+        --arg disk_error "95" --arg disk_min_free "$_HH_DISK_MIN_FREE_BYTES" \
         --arg clock_warn "$_HH_CLOCK_DRIFT_WARN" --arg ssh_timeout "$_HH_SSH_TIMEOUT" \
         --arg command_timeout "$_HH_CMD_TIMEOUT" '
         {schema:"dsr-host-admission-v5",host:$host,policy:{disk_warn:$disk_warn,disk_error:$disk_error,

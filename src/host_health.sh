@@ -71,7 +71,7 @@ _hh_parse_host_fallback() {
     local in_hosts=false
     local in_target=false
     local in_capabilities=false
-    local platform="" connection="" ssh_host="" description="" concurrency="1"
+    local platform="" connection="" ssh_host="" description="" concurrency="2"
     local enabled="true" build_root=""
     local capabilities=""
     local line
@@ -143,7 +143,8 @@ _hh_parse_host_fallback() {
                 description="${BASH_REMATCH[1]}"
                 description="${description%\"}"
                 description="${description#\"}"
-            elif [[ "$line" =~ ^[[:space:]]+concurrency:[[:space:]]*([0-9]+) ]]; then
+            elif [[ "$line" =~ ^[[:space:]]+concurrency: ]]; then
+                [[ "$line" =~ ^[[:space:]]+concurrency:[[:space:]]*([0-9]+)[[:space:]]*(#.*)?$ ]] || return 4
                 concurrency="${BASH_REMATCH[1]}"
             elif [[ "$line" =~ ^[[:space:]]+enabled: ]]; then
                 [[ "$line" =~ ^[[:space:]]+enabled:[[:space:]]*(true|false)[[:space:]]*$ ]] || return 4
@@ -255,6 +256,8 @@ _hh_normalize_host_config() {
                 (.ssh_host | type == "string" and test("^[^[:space:][:cntrl:]-][^[:space:][:cntrl:]]*$"))) and
             (.description == null or (.description | type == "string")) and
             (.enabled == null or (.enabled | type == "boolean")) and
+            (.concurrency == null or (.concurrency | type == "number" and
+                . == floor and . > 0 and . <= 9007199254740991)) and
             (.capabilities == null or (.capabilities | type == "array" and
                 all(.[]; type == "string" and test("^[A-Za-z0-9_][A-Za-z0-9_.+-]*$"))))
         then . + {
@@ -262,6 +265,7 @@ _hh_normalize_host_config() {
             ssh_host: (if .ssh_host == null or .ssh_host == "" then $hostname else .ssh_host end),
             description: (.description // ""),
             capabilities: (.capabilities // []),
+            concurrency: (if .concurrency == null then 2 else .concurrency end),
             enabled: (if .enabled == null then true else .enabled end)
         } else error("invalid host configuration fields") end
     ' <<< "$raw" 2>/dev/null); then
@@ -317,7 +321,7 @@ _HH_CACHE_TTL=300  # 5 minutes
 
 # Thresholds
 _HH_DISK_WARN_THRESHOLD=90   # Warn if disk usage > 90%
-_HH_DISK_MIN_FREE_BYTES=21474836480  # Refuse below 20 GiB; percentage alone only warns
+_HH_DISK_MIN_FREE_BYTES=21474836480  # 20 GiB per configured build slot; percentage alone only warns
 _HH_CLOCK_DRIFT_WARN=30      # Warn if clock drift > 30 seconds
 _HH_SSH_TIMEOUT=10           # SSH connect timeout (seconds)
 _HH_CMD_TIMEOUT=30           # Command execution timeout (seconds)
@@ -409,7 +413,7 @@ _hh_admission_fingerprint() {
         --arg clock_warn "$_HH_CLOCK_DRIFT_WARN" \
         --arg ssh_timeout "$_HH_SSH_TIMEOUT" \
         --arg command_timeout "$_HH_CMD_TIMEOUT" \
-        '{schema:"dsr-host-admission-v8",host:$host,writable_paths:$requested_paths,policy:{
+        '{schema:"dsr-host-admission-v9",host:$host,writable_paths:$requested_paths,policy:{
             disk_warn:$disk_warn,clock_warn:$clock_warn,
             disk_min_free_bytes:$disk_min_free,
             ssh_timeout:$ssh_timeout,command_timeout:$command_timeout}}') || return 4
@@ -609,6 +613,34 @@ _hh_windows_storage_command() {
     printf '%s\n' "$command"
 }
 
+# Default capacity is budgeted for every configured simultaneous build. This
+# is a conservative observation, not a disk reservation: roles on the same
+# filesystem/container compare against one budget, never a sum of role copies.
+# Validate operands BEFORE arithmetic and keep the result exactly representable
+# in the JSON numbers used by every admission path.
+_hh_disk_minimum_bytes() {
+    local minimum="${1:-}" concurrent_builds="${2-1}"
+    [[ "$minimum" =~ ^[0-9]{1,16}$ && "$concurrent_builds" =~ ^[0-9]{1,16}$ ]] || return 4
+    minimum=$((10#$minimum))
+    concurrent_builds=$((10#$concurrent_builds))
+    [[ $minimum -gt 0 && $minimum -le 9007199254740991 && $concurrent_builds -gt 0 ]] || return 4
+    (( concurrent_builds <= 9007199254740991 / minimum )) || return 4
+    printf '%s\n' "$((minimum * concurrent_builds))"
+}
+
+_hh_disk_concurrency() {
+    # Keep omitted host limits aligned with host_selector.sh, which admits two
+    # simultaneous builds by default. Explicit floor-only helpers still use
+    # one budget so the configured split-root reserve is never multiplied.
+    jq -ers '
+        if length == 1 and (.[0]|type == "object") then .[0]
+        else error("invalid host for disk admission") end |
+        (if .concurrency == null then 2 else .concurrency end) |
+        if type == "number" and . == floor and . > 0 and . <= 9007199254740991
+        then . else error("invalid disk concurrency") end
+    ' <<< "$1" 2>/dev/null
+}
+
 # Check disk space
 # Returns: JSON object { "path": str, "usage_percent": int, "available_gb": float, "status": str }
 # Classify raw counts, never rounded GiB. APFS can report a modest usage
@@ -622,7 +654,7 @@ _hh_disk_status() {
        "$minimum_bytes" =~ ^[0-9]{1,16}$ && "$warning" =~ ^[0-9]{1,3}$ ]] || return 4
     usage=$((10#$usage))
     available_kb=$((10#$available_kb))
-    minimum_bytes=$((10#$minimum_bytes))
+    minimum_bytes=$(_hh_disk_minimum_bytes "$minimum_bytes" "${4-1}") || return 4
     warning=$((10#$warning))
     [[ $usage -le 100 && $available_kb -le 8796093022207 &&
        $minimum_bytes -gt 0 && $minimum_bytes -le 9007199254740991 && $warning -le 100 ]] || return 4
@@ -861,7 +893,7 @@ _hh_default_unix_storage_admission() {
     local hostname="$1" connection="$2" ssh_host="$3" host_config="${4:-}"
     local split_storage="${5-null}"
     local requested_paths="${6-[]}" encoded_paths
-    local config_status=0 build_root script result
+    local config_status=0 build_root script result concurrent_builds
     if ! requested_paths=$(_hh_writable_paths_json "$requested_paths") || \
        ! encoded_paths=$(printf '%s' "$requested_paths" | base64 | tr -d '\r\n') || \
        [[ ! "$encoded_paths" =~ ^[A-Za-z0-9+/=]+$ ]]; then
@@ -874,6 +906,11 @@ _hh_default_unix_storage_admission() {
             echo '{"path":"writable-storage","status":"error","error":"Cannot select configured writable storage"}'
             return 1
         fi
+    fi
+    if ! concurrent_builds=$(_hh_disk_concurrency "$host_config") ||
+       ! _hh_disk_minimum_bytes "$_HH_DISK_MIN_FREE_BYTES" "$concurrent_builds" >/dev/null; then
+        echo '{"path":"writable-storage","status":"error","error":"Invalid disk concurrency or overflowing free-space requirement"}'
+        return 1
     fi
     build_root=$(jq -ers 'if length == 1 and (.[0]|type == "object") then .[0] else error("invalid host") end |
         if .build_root == null then "/var/tmp"
@@ -893,7 +930,7 @@ _hh_default_unix_storage_admission() {
                     ($requested | map(.role + " " + .path) | join("; ")) end))}'
         return 1
     fi
-    if ! _hh_writable_storage_verdict "$split_storage" "$requested_paths" <<< "$result"; then
+    if ! _hh_writable_storage_verdict "$split_storage" "$requested_paths" "$concurrent_builds" <<< "$result"; then
         echo '{"path":"writable-storage","status":"error","error":"Invalid writable storage inventory or free-space policy"}'
         return 1
     fi
@@ -903,9 +940,12 @@ _hh_default_unix_storage_admission() {
 # distinction between filesystem IDs and APFS containers shared by volumes.
 _hh_writable_storage_verdict() {
     local split_storage="${1-null}"
-    local requested_paths
+    local requested_paths minimum concurrent_builds="${3-1}"
+    minimum=$(_hh_disk_minimum_bytes "$_HH_DISK_MIN_FREE_BYTES" "$concurrent_builds") || return 4
+    concurrent_builds=$((10#$concurrent_builds))
     requested_paths=$(_hh_writable_paths_json "${2-[]}") || return 4
-    jq -ces --argjson split "$split_storage" --argjson minimum "$_HH_DISK_MIN_FREE_BYTES" \
+    jq -ces --argjson split "$split_storage" --argjson minimum "$minimum" \
+            --argjson concurrent_builds "$concurrent_builds" \
             --argjson requested "$requested_paths" \
             --argjson warning "$_HH_DISK_WARN_THRESHOLD" '
         def whole: type == "number" and . >= 0 and . <= 9007199254740991 and . == floor;
@@ -970,6 +1010,7 @@ _hh_writable_storage_verdict() {
         .roles as $roles | ($roles|map(select(.role == "root" and .requested != true))[0]) as $root |
         {path:$root.path,usage_percent:$root.usage_percent,available_bytes:$root.available_bytes,
          available_gb:$root.available_gb,min_free_bytes:$root.min_free_bytes,admission:"unix-writable-roles-v2",roles:$roles,
+         concurrent_builds:$concurrent_builds,
          requested_paths:$requested,
          filesystems:($roles|group_by(.filesystem_id)|map({filesystem_id:.[0].filesystem_id,
              roles:map(.role),paths:map(.probe_path)|unique,available_bytes:(map(.available_bytes)|min)})),
@@ -1004,13 +1045,14 @@ _hh_check_disk_space() {
         return 1
     fi
 
+    local host_config="${5:-}" concurrent_builds minimum_bytes
     if [[ "$platform" != windows/* ]]; then
         if declare -F config_unix_storage_json >/dev/null; then
             unix_status=0
             unix_storage=$(config_unix_storage_json "$hostname") || unix_status=$?
         fi
         if [[ $unix_status -eq 1 ]]; then
-            _hh_default_unix_storage_admission "$hostname" "$connection" "$ssh_host" "${5:-}" null "$requested_paths"
+            _hh_default_unix_storage_admission "$hostname" "$connection" "$ssh_host" "$host_config" null "$requested_paths"
             return $?
         elif [[ $unix_status -ne 0 ]]; then
             echo '{"path":"/","status":"error","error":"Invalid Unix split-storage contract"}'
@@ -1018,11 +1060,30 @@ _hh_check_disk_space() {
         fi
     fi
 
+    if [[ -z "$host_config" ]]; then
+        host_config=$(_hh_get_host_config "$hostname") || {
+            echo '{"path":"/","status":"error","error":"Cannot select configured disk concurrency"}'
+            return 1
+        }
+    fi
+    if ! concurrent_builds=$(_hh_disk_concurrency "$host_config") ||
+       ! minimum_bytes=$(_hh_disk_minimum_bytes "$_HH_DISK_MIN_FREE_BYTES" "$concurrent_builds"); then
+        echo '{"path":"/","status":"error","error":"Invalid disk concurrency or overflowing free-space requirement"}'
+        return 1
+    fi
+
     if [[ "$platform" == windows/* ]]; then
-        local storage storage_status=0 storage_script storage_probe storage_result
+        local storage storage_status=0 storage_script storage_probe storage_result target_minimum
         storage=$(config_windows_storage_json "$hostname") || storage_status=$?
         if [[ $storage_status -eq 0 ]]; then
+            target_minimum=$(jq -er '.target_min_free_bytes' <<< "$storage") &&
+                target_minimum=$(_hh_disk_minimum_bytes "$target_minimum") || return 4
+            (( target_minimum >= minimum_bytes )) || target_minimum=$minimum_bytes
             storage_script=$(config_windows_storage_session_script "$hostname") || return 4
+            # The explicit target budget is aggregate, not per slot. Retain it
+            # when stronger; otherwise require the same concurrent-build floor
+            # as ordinary storage, without changing source reserve accounting.
+            storage_script+=$'\n'"if (\$null -eq \$dsrTargetDisk -or \$dsrTargetDisk.FreeSpace -lt [long]$target_minimum) { throw 'DSR concurrent target capacity admission failed' };"
             storage_script+=$'\n'"$(config_windows_storage_lock_script "$hostname")" || return 4
             # Preserve the source volume's actual pressure. A split layout is
             # admitted by BOTH role budgets, never by substituting NFS free
@@ -1031,8 +1092,15 @@ _hh_check_disk_space() {
             storage_probe=$(printf '%s' "$storage_script" | _hh_windows_storage_command) || return 4
             if storage_result=$(_hh_exec_on_host "$hostname" "$connection" "$ssh_host" \
                 "$storage_probe") && \
-               jq -e '.admission == "split-storage-role-budgets-v1" and .lock_range == "cargo-win32-whole-u64-v1" and (.status == "ok" or .status == "warning")' <<< "$storage_result" >/dev/null; then
-                jq --argjson contract "$storage" '. + {storage_contract:$contract}' <<< "$storage_result"
+               jq -e --argjson minimum "$target_minimum" '
+                   .admission == "split-storage-role-budgets-v1" and .lock_range == "cargo-win32-whole-u64-v1" and
+                   (.status == "ok" or .status == "warning") and
+                   (.target.free_bytes | type == "number" and . == floor and . >= $minimum and . <= 9007199254740991)
+               ' <<< "$storage_result" >/dev/null; then
+                jq --argjson contract "$storage" --argjson minimum "$target_minimum" \
+                    --argjson concurrent_builds "$concurrent_builds" '
+                    . + {storage_contract:$contract,concurrent_builds:$concurrent_builds} |
+                    .target.min_free_bytes=$minimum' <<< "$storage_result"
                 return 0
             fi
             echo '{"path":"split-storage","status":"error","available_gb":null,"error":"Windows source/target capacity, mapping identity, or lock admission failed"}'
@@ -1094,20 +1162,21 @@ _hh_check_disk_space() {
     # Use awk for division (more portable than bc which may not be installed)
     available_gb=$(awk -v kb="$available_kb" 'BEGIN {printf "%.2f", kb / 1048576}')
 
-    status=$(_hh_disk_status "$usage_percent" "$available_kb" "$_HH_DISK_MIN_FREE_BYTES") || {
+    status=$(_hh_disk_status "$usage_percent" "$available_kb" "$_HH_DISK_MIN_FREE_BYTES" "$concurrent_builds") || {
         echo '{"path":"/","usage_percent":null,"available_gb":null,"status":"error","error":"Invalid disk metrics or free-space floor"}'
         return 1
     }
 
     if [[ "$platform" != windows/* ]]; then
         _hh_unix_split_storage_admission "$hostname" "$connection" "$ssh_host" "$unix_storage" \
-            "$usage_percent" "$available_kb" "$status" "$requested_paths"
+            "$usage_percent" "$available_kb" "$status" "$requested_paths" "$concurrent_builds"
     else
         jq -nc --argjson usage "$usage_percent" --argjson available_kb "$available_kb" \
-            --argjson available_gb "$available_gb" --argjson minimum "$_HH_DISK_MIN_FREE_BYTES" \
+            --argjson available_gb "$available_gb" --argjson minimum "$minimum_bytes" \
+            --argjson concurrent_builds "$concurrent_builds" \
             --arg status "$status" '
             {path:"/",usage_percent:$usage,available_bytes:($available_kb*1024),
-             available_gb:$available_gb,min_free_bytes:$minimum,status:$status} |
+             available_gb:$available_gb,min_free_bytes:$minimum,concurrent_builds:$concurrent_builds,status:$status} |
             if .status == "error" then . + {error:("Available disk space is below the required " +
                 ($minimum/1073741824|tostring) + " GiB floor")} else . end'
     fi
@@ -1143,6 +1212,11 @@ _hh_unix_split_storage_admission() {
     local hostname="$1" connection="$2" ssh_host="$3" storage="$4"
     local root_usage="$5" root_available_kb="$6" root_status="$7"
     local requested_paths="${8-[]}"
+    local concurrent_builds="${9-1}" build_minimum
+    build_minimum=$(_hh_disk_minimum_bytes "$_HH_DISK_MIN_FREE_BYTES" "$concurrent_builds") || {
+        echo '{"path":"/","status":"error","error":"Invalid disk concurrency or overflowing free-space requirement"}'
+        return 1
+    }
     local build_root min_free_bytes df_output df_status=0
     # Validate before either remote command. Sourceable callers must not be
     # able to interpolate an unchecked build path into the retained df probe.
@@ -1183,7 +1257,7 @@ _hh_unix_split_storage_admission() {
     build_available_kb=$((10#$build_available_kb))
 
     local build_status
-    build_status=$(_hh_disk_status "$build_usage" "$build_available_kb" "$_HH_DISK_MIN_FREE_BYTES") || {
+    build_status=$(_hh_disk_status "$build_usage" "$build_available_kb" "$_HH_DISK_MIN_FREE_BYTES" "$concurrent_builds") || {
         echo '{"path":"/","status":"error","error":"Invalid build-root disk metrics"}'
         return 1
     }
@@ -1213,7 +1287,7 @@ _hh_unix_split_storage_admission() {
         --argjson build_usage "$build_usage" \
         --argjson build_kb "$build_available_kb" \
         --arg build_status "$build_status" \
-        --argjson build_min_free "$_HH_DISK_MIN_FREE_BYTES" \
+        --argjson build_min_free "$build_minimum" \
         --arg overall "$overall" \
         'def gb: (. / 1048576 * 100 | floor) / 100;
          {path: "/", usage_percent: $root_usage, available_gb: ($root_kb | gb), status: $overall,
@@ -1228,7 +1302,8 @@ _hh_unix_split_storage_admission() {
     # A split contract is not permission to omit ambient Cargo/temp storage or
     # APFS quotas. Keep BOTH original df decisions, then strengthen them with
     # the complete receiving-host observation used by the default path.
-    role_config=$(jq -c '{build_root}' <<< "$storage") || return 1
+    role_config=$(jq -c --argjson concurrent_builds "$concurrent_builds" \
+        '{build_root,concurrency:$concurrent_builds}' <<< "$storage") || return 1
     writable=$(_hh_default_unix_storage_admission "$hostname" "$connection" "$ssh_host" \
         "$role_config" "$storage" "$requested_paths") || writable_status=$?
     if [[ $writable_status -ne 0 ]]; then

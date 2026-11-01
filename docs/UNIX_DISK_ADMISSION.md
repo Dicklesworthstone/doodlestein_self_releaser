@@ -1,9 +1,13 @@
 # Unix disk free-space admission
 
-Host health requires **20 GiB (21,474,836,480 bytes) available** for each default
-writable role. The comparison uses the raw available capacity returned by the
-filesystem, not the rounded `available_gb` display. Exactly 20 GiB passes the
-byte floor. Usage above 90% remains a visible warning, including values above
+Host health budgets **20 GiB (21,474,836,480 bytes) per configured simultaneous
+build** for each default writable storage location. The host's `concurrency`
+setting supplies the build count and defaults to two when omitted, matching the
+host scheduler. Two build slots require 40 GiB available; four slots require
+80 GiB. An explicit `concurrency: 1` retains the 20 GiB single-build requirement.
+The comparison uses the raw available capacity returned by the filesystem,
+not the rounded `available_gb` display. Exactly the required byte floor passes.
+Usage above 90% remains a visible warning, including values above
 95%; a percentage alone does not refuse a host that meets its byte floor.
 The explicit Unix split contract retains its `df -Pk` probes.
 
@@ -14,27 +18,36 @@ The JSON includes `available_bytes` and `min_free_bytes`; the human error names
 the capacity floor instead of incorrectly claiming usage exceeds 95%.
 
 This also fixes issue #51's opposite failure: 179 GiB free at 96% usage on a
-large volume produces a warning and can pass readiness. Every required role
-must still meet its own floor; 2.32 GiB remains an error at any usage percentage.
+large volume produces a warning and can pass readiness with room for up to
+eight configured build slots. Nine slots require 180 GiB and refuse that same
+179 GiB observation. Every required role must still meet its own floor;
+2.32 GiB remains an error at any usage percentage.
 
 The opt-in `unix_storage` split-volume contract retains its explicitly configured
 `root_min_free_bytes`. Its root floor is enforced even when the root's reported
-percentage is low. The separately probed build root must satisfy the 20 GiB
-floor. A healthy external build root cannot compensate
-for an internal root below the contract floor, or vice versa. Both role verdicts
+percentage is low. This host reserve is not multiplied by concurrency. The
+separately probed build root must satisfy the 20 GiB-per-slot floor. A healthy
+external build root cannot compensate for an internal root below the contract
+floor, or vice versa. Both role verdicts
 remain visible in the report.
 
-Malformed, excessive, or non-decimal counts fail before shell arithmetic. An
-empty, invalid, or unsuccessful disk-probe result cannot produce a healthy public
+Malformed, fractional, zero, negative, or excessive concurrency values refuse
+admission. Multiplication must fit the exact integer range of JSON numbers;
+overflow cannot reduce the required space. Malformed, excessive, or non-decimal
+disk counts fail before shell arithmetic. An empty, invalid, or unsuccessful
+disk-probe result cannot produce a healthy public
 host verdict. The admission fingerprint changed, so cached results created by
 an older policy cannot authorize a build under the new policy.
 
-The unconfigured Windows system-drive probe uses the same 20 GiB floor and
+The unconfigured Windows system-drive probe uses the same 20 GiB-per-slot floor and
 percentage-warning policy. It rounds free bytes down to KiB before transport,
 so a value just below the floor cannot round up into admission. Its JSON now
-retains `available_bytes` and `min_free_bytes` alongside the display value.
-Configured Windows split-storage source/target budgets, mapping identity and
-locking requirements remain unchanged.
+retains `available_bytes`, `min_free_bytes`, and `concurrent_builds` alongside
+the display value. The writable-role result also reports `concurrent_builds`.
+Configured Windows split-storage keeps its source budget and source reserve.
+The target must satisfy the greater of its configured `target_min_free_bytes`
+and the default per-slot requirement; an explicit budget is never multiplied a
+second time. Mapping identity and locking requirements remain unchanged.
 
 Both native source staging and native compilation require host-health admission,
 including ordinary builds, explicit repository host pins, and static mapping
@@ -57,8 +70,9 @@ Each role has its own path, resolved probe path, filesystem identifier, availabl
 and total byte counts, effective usage, free-byte floor, and verdict. Every role
 must pass. Tight internal Cargo or temporary storage cannot hide behind a healthy
 external build root, and a tight external build root cannot hide behind `/`.
-Shared filesystem identifiers are grouped without summing their free bytes;
-role attribution remains complete. Separate `capacity_groups` additionally
+Shared filesystem identifiers are grouped without summing their free bytes
+or multiplying the slot budget by the number of roles; role attribution remains
+complete. Separate `capacity_groups` additionally
 group APFS volumes by container UUID, even when their filesystem identifiers
 differ. Warnings name all observed roles, and errors identify failing locations.
 
@@ -135,8 +149,9 @@ output custody checks still decide whether a path is acceptable for staging.
 
 Requested rows carry `requested: true`; `requested_paths` records the exact
 normalized request. Admission requires matching coverage in the returned
-inventory. Each requested location must satisfy the normal **20 GiB** floor
-and usage thresholds, including when it shares the root's capacity group under
+inventory. Each requested location must satisfy the normal **20 GiB per
+configured build slot** floor and percentage-warning policy, including when
+it shares the root's capacity group under
 an explicit split-storage contract. Shared filesystems and APFS containers are
 still grouped without adding their free space together.
 
@@ -166,8 +181,9 @@ described below. Default and split-storage macOS probes now bind selected
 APFS volumes to their container identities and capacity/volume-quota observations
 as described below. A fresh native macOS acceptance run remains required under
 issue #46. Do not treat a cached health observation as a disk reservation,
-per-build capacity estimate, or a substitute for the independent SBH/native
-release gates. No storage is cleaned, reconfigured, or automatically expanded.
+a measured capacity estimate for a particular build, or a substitute for the
+independent SBH/native release gates. No storage is cleaned, reconfigured,
+or automatically expanded.
 
 ## Reproduction
 
@@ -189,6 +205,15 @@ Set `DSR_TEST_DISK_BASELINE` to the unchanged prior `host_health.sh` to compare 
 same supplied root counts and real build-root `df` in one invocation. The prior
 split checker admits the 2.32 GiB root; the new checker refuses it. No network,
 compiler, signing, or release upload is required. Tests retain their evidence.
+
+Run `bash scripts/tests/test_host_health.sh --disk-capacity-only` for the
+concurrent-build cases. They cover the 179 GiB/96% incident, exact and one-KiB
+below-floor boundaries, shared APFS containers with distinct volume identities,
+volume quotas, and malformed or overflowing concurrency. The Bash controller
+uses deterministic probe observations for Windows; these cases do not claim
+native PowerShell execution or allocate large test files. An omitted-concurrency
+case compares the actual scheduler and health defaults. The existing 20 GiB
+free-floor fixtures explicitly select one build slot.
 
 The writable-path cases exercise future-directory ancestor resolution, literal
 path transport, ordinary directory symlinks, rejected dangling links and file
@@ -265,7 +290,7 @@ floor using its own effective availability, including its volume quota. A root
 allowance never rescues an exhausted quota or applies to another capacity pool.
 
 **Build-root and explicit Cargo-target roles always require the normal 20 GiB
-floor**, even if they share root's storage. Ambient roles
+per configured build slot floor**, even if they share root's storage. Ambient roles
 on another pool use that normal policy too. This preserves usable split layouts
 with a spacious external build drive and an explicitly admitted internal root,
 without letting an unrelated tight temporary or Cargo filesystem disappear.
@@ -275,7 +300,7 @@ The `unix-split-storage-v2` result retains the original `df` observations under
 and APFS-effective metrics. `filesystems` and `capacity_groups` retain their
 individual identities. `unix_storage_contract` records the selected contract.
 Each role records `capacity_policy`, `min_free_bytes`, `pressure_status` under
-the default 20 GiB policy, and final `status` under its applicable floor. A
+the default 20 GiB-per-slot policy, and final `status` under its applicable floor. A
 configured root floor can be lower or higher than the default; both verdicts
 remain visible. All roles retain percentage warnings above 90%. Human diagnostics show
 both original observations and every role, including probe-failure reasons.
@@ -284,8 +309,8 @@ The new host-admission fingerprint invalidates earlier two-path cached verdicts.
 Explicit split probing now needs Python 3 and the same native macOS metadata
 tools as the default path. All probes remain read-only, with the existing helper
 deadlines. They are sequential observations, not an atomic capacity reservation.
-No directory is created or storage cleaned. The default byte floor and the
-configured role budgets are unchanged.
+No directory is created or storage cleaned. The configured root reserve stays
+fixed while default build floors account for the host's configured slots.
 
 The existing test script includes actual low-capacity `/dev/shm` observations
 for split temp/Cargo/target roles and production policy tests with explicit APFS
