@@ -9490,8 +9490,10 @@ act_run_native_build() {
     [[ -z "$capability" ]] || readiness_args+=(--require "$capability")
     if ! declare -F host_health_is_ready &>/dev/null || ! host_health_is_ready "${readiness_args[@]}"; then
         _log_error "Native build host is not ready: $host${capability:+ (requires $capability)}"
-        jq -nc --arg host "$host" \
-            '{status:"error",exit_code:4,host:$host,error:"Native build host is not ready"}'
+        jq -nc --arg platform "$platform" --arg host "$host" --arg triple "$selected_triple" \
+            '{platform:$platform,method:"native",status:"error",exit_code:4,host:$host,
+              stage:"host_readiness",error:"Native build host is not ready"} +
+             (if $triple == "" then {} else {target_triple:$triple} end)'
         return 4
     fi
     local ssh_destination="$host"
@@ -11778,9 +11780,16 @@ _act_run_target_worker() {
     _act_write_worker_result() {
         local body="$1"
         # Never trust build-command stdout to classify an artifact for publication.
+        # A refused attempt still belongs to this scheduled target, even when
+        # admission stopped before the backend emitted its execution identity.
+        # Leave successful identities untouched for the artifact/matrix checks.
         body=$(jq -c --arg purpose "$build_purpose" --arg task_key "$task_key" \
+            --arg platform "$target" --arg host "$host" --arg triple "$selected_triple" \
             --argjson source_sync "$source_sync_receipt" \
             '. + {build_purpose: $purpose, publishable: ($purpose == "release"), task_key:$task_key} |
+             if (.status // "") | IN("success", "ok", "passed") then .
+             else . + {platform:$platform,host:(.host // $host)} +
+                  (if $triple == "" then {} else {target_triple:$triple} end) end |
              if $source_sync == null then . else .source_sync = $source_sync end' \
             <<< "$body") || return 4
         (
@@ -11929,18 +11938,26 @@ _act_run_target_worker() {
     if [[ "$worker_status" -ne 0 ]] &&
        [[ "$result_status" == success || "$result_status" == ok || "$result_status" == passed ]]; then
         result_status=failed
-        result=$(jq -c --argjson exit_code "$worker_status" '
+        if ! result=$(jq -c --argjson exit_code "$worker_status" '
             .status = "failed" | .exit_code = $exit_code |
             .error = (.error // "Worker exited nonzero despite reporting success") |
             del(.resume_artifacts)
-        ' <<< "$result") || return 4
+        ' <<< "$result"); then
+            _act_worker_release_slot
+            trap - EXIT INT TERM
+            return 4
+        fi
     fi
     if [[ "$result_status" == success || "$result_status" == ok || "$result_status" == passed ]] && \
        ! _act_matrix_result_matches "$result" "$target" "$selected_triple"; then
         worker_status=4
         result_status=failed
-        result=$(jq -c '.status = "failed" | .exit_code = 4 |
-            .error = "Native worker result does not match the requested target triple"' <<< "$result") || return 4
+        if ! result=$(jq -c '.status = "failed" | .exit_code = 4 |
+            .error = "Native worker result does not match the requested target triple"' <<< "$result"); then
+            _act_worker_release_slot
+            trap - EXIT INT TERM
+            return 4
+        fi
     fi
     if [[ "$result_status" == "success" || "$result_status" == "ok" ||
           "$result_status" == "passed" ]]; then
@@ -11956,6 +11973,11 @@ _act_run_target_worker() {
         fi
     fi
     if ! _act_write_worker_result "$result"; then
+        # Returning unwinds these locals before the background shell's EXIT
+        # trap runs. Release while the attempt's lease identity is still in
+        # scope, including storage/receipt failures after a real build.
+        _act_worker_release_slot
+        trap - EXIT INT TERM
         return 4
     fi
     _act_worker_release_slot

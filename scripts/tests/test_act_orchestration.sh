@@ -98,6 +98,10 @@ event = dict(target=target, attempt=attempt, mode=mode, pid=os.getpid(), stdin_i
 fd = os.open(case / 'invocations.jsonl', os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
 os.write(fd, (json.dumps(event) + '\n').encode())
 os.close(fd)
+if mode == 'readiness':
+    # The actual native runner converts this health refusal into its own
+    # structured result. No compiler or successful artifact is simulated.
+    raise SystemExit(1)
 if mode == 'cancel' or (mode == 'timeout' and target == 'linux/amd64'):
     while True:
         time.sleep(0.05)
@@ -149,11 +153,27 @@ selector_release_slot() {
     fi
 }
 act_run_native_build() {
-    local deadline=10
+    if [[ ( "$DSR_STDIN_MODE" == readiness && "$2" == darwin/* ) ||
+          "$DSR_STDIN_MODE" == cli-readiness ]]; then
+        (
+            # Re-enter the production native runner in this child only. Its
+            # real admission gate must retain target identity on refusal;
+            # replacing the runner with prebuilt JSON would hide that bug.
+            source "$DSR_STDIN_MODULE"
+            host_health_is_ready() {
+                _act_run_with_timeout 10 python3 "$DSR_STDIN_WORKER" \
+                    "$DSR_STDIN_CASE" "$platform" "$attempt" readiness
+            }
+            act_run_native_build "$@"
+        )
+        return $?
+    fi
+    local deadline=10 native_mode="$DSR_STDIN_MODE"
+    [[ "$native_mode" != readiness ]] || native_mode=success
     [[ "$DSR_STDIN_MODE" != cancel ]] || deadline=60
     if [[ "$DSR_STDIN_MODE" == timeout && "$2" == linux/amd64 ]]; then deadline=1; fi
     _act_run_with_timeout "$deadline" python3 "$DSR_STDIN_WORKER" \
-        "$DSR_STDIN_CASE" "$2" "$attempt" "$DSR_STDIN_MODE"
+        "$DSR_STDIN_CASE" "$2" "$attempt" "$native_mode"
 }
 # Explicit fault injection at the worker boundary tests the real parent's
 # recovery of a missing receipt, including an actual uncatchable child death.
@@ -179,8 +199,24 @@ case "$DSR_STDIN_MODE" in
 esac
 args=(--run-id "$DSR_STDIN_RUN")
 if [[ "$DSR_STDIN_PHASE" == resume* ]]; then args=(--resume-run-id "$DSR_STDIN_RUN"); fi
-act_orchestrate_build stdinfixture 1.0.0 --parallel-jobs "$DSR_STDIN_JOBS" \
-    --no-source-sync-gate --output-dir "$DSR_STDIN_CASE/output" "${args[@]}"
+if [[ "$DSR_STDIN_PHASE" == cli ]]; then
+    for module in git_ops artifact_naming packaging; do
+        source "$DSR_STDIN_PROJECT/src/$module.sh" || exit 1
+    done
+    export SCRIPT_DIR="$DSR_STDIN_PROJECT" JSON_MODE=true DRY_RUN=false VERBOSE=false DSR_VERSION=fixture
+    declare -A _DSR_LOADED_MODULES=([packaging]=1 [artifact_naming]=1)
+    # Load the real public command and envelope as the native release fixtures
+    # do; do not duplicate or substitute its per-target JSON projection.
+    source <(awk '/^(_dsr_require|cmd_build)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' \
+        "$DSR_STDIN_PROJECT/dsr") || exit 1
+    source <(awk '/^json_envelope\(\) \{/{copy=1} copy{print} copy && /^# ====/{exit}' \
+        "$DSR_STDIN_PROJECT/dsr") || exit 1
+    cmd_build stdinfixture --version 1.0.0 --no-sync --jobs "$DSR_STDIN_JOBS" \
+        --output-dir "$DSR_STDIN_CASE/output"
+else
+    act_orchestrate_build stdinfixture 1.0.0 --parallel-jobs "$DSR_STDIN_JOBS" \
+        --no-source-sync-gate --output-dir "$DSR_STDIN_CASE/output" "${args[@]}"
+fi
 ''')
 
 
@@ -244,12 +280,19 @@ def invoke(case, identity, jobs, mode, phase):
         out.close()
         err.close()
     value = read(case / (phase + '.stdout'))
+    if phase == 'cli':
+        check(case.name + ': real build command preserves failure in one JSON envelope',
+              code == 6 and value['command'] == 'build' and value['exit_code'] == code and
+              value['status'] == 'error')
+        details = value['details']
+        state = read(case / 'state/builds/stdinfixture/1.0.0' / details['run_id'] / 'state.json')
+        return details, state
     state_path = case / 'state/builds/stdinfixture/1.0.0' / identity / 'state.json'
     state = read(state_path)
     (case / (phase + '.state.json')).write_text(json.dumps(state) + '\n')
     expected_code = (0 if mode in ('child-success', 'child-durable-success-killed') else 1) \
         if mode.startswith('child-') else {
-        'success': 0, 'failure': 1, 'timeout': 1, 'cancel': 130,
+        'success': 0, 'failure': 1, 'timeout': 1, 'readiness': 1, 'cancel': 130,
         'missing-receipt': 6, 'killed-worker': 6}[mode]
     check(case.name + '/' + phase + ': aggregate preserves the real exit status', code == expected_code)
     check(case.name + '/' + phase + ': exactly six ordered target rows',
@@ -297,6 +340,17 @@ def verify_attempts(case, value, state, expected_counts, expected_codes, label, 
                   row['status'] == 'success' and len(frozen) == 1 and
                   frozen[0]['sha256'] == hashlib.sha256(Path(frozen[0]['path']).read_bytes()).hexdigest() and
                   frozen[0]['size_bytes'] == Path(frozen[0]['path']).stat().st_size)
+        elif code == 4:
+            check(label + ': ' + target + ' retains the actual host-readiness refusal',
+                  row['status'] == 'error' and row['method'] == 'native' and
+                  row['stage'] == 'host_readiness' and
+                  row['host'] == 'host-' + target.replace('/', '-') and
+                  row['error'] == 'Native build host is not ready' and
+                  not row.get('resume_artifacts') and
+                  read(receipt)['platform'] == target and
+                  read(receipt)['task_key'] == target and
+                  read(receipt)['stage'] == 'host_readiness' and
+                  not list((case / 'output').glob(target.replace('/', '-') + '.attempt-*.bin')))
         else:
             check(label + ': ' + target + ' failure cannot supply successful artifacts',
                   row['status'] == 'failed' and not row.get('resume_artifacts'))
@@ -307,15 +361,22 @@ def verify_attempts(case, value, state, expected_counts, expected_codes, label, 
 
 
 for jobs in (() if sys.argv[3] in ('--coordinator-receipt-only', '--sidecar-recovery-only',
-                                  '--worker-completion-only') else (1, 3)):
-    for mode in ('success', 'failure', 'timeout', 'cancel'):
+                                  '--worker-completion-only', '--host-readiness-cli-only') else (1, 3)):
+    for mode in (('readiness',) if sys.argv[3] == '--host-readiness-only' else
+                 ('success', 'failure', 'timeout', 'readiness', 'cancel')):
         case, identity = fixture(jobs, mode)
         first, state = invoke(case, identity, jobs, mode, 'first')
         counts = {target: 1 for target in (targets[:jobs] if mode == 'cancel' else targets)}
         codes = ({target: 130 for target in targets[:jobs]} if mode == 'cancel' else
+                 {target: 4 for target in targets if target.startswith('darwin/')} if mode == 'readiness' else
                  {'linux/amd64': {'failure': 9, 'timeout': 124}[mode]}
                  if mode in ('failure', 'timeout') else {})
         verify_attempts(case, first, state, counts, codes, case.name + '/first')
+        if mode == 'readiness':
+            check(case.name + ': only unready hosts are refused before compilation',
+                  {event['target'] for event in events(case) if event['mode'] == 'readiness'} ==
+                  {target for target in targets if target.startswith('darwin/')} and
+                  len(list((case / 'output').glob('*.bin'))) == 4)
         if mode == 'cancel':
             for event in events(case):
                 probe = subprocess.run(['ps', '-p', str(event['pid']), '-o', 'stat='], capture_output=True)
@@ -337,7 +398,8 @@ for jobs in (() if sys.argv[3] in ('--coordinator-receipt-only', '--sidecar-reco
         check(case.name + ': retries preserve all earlier attempt evidence',
               all(path.read_bytes() == contents for path, contents in immutable.items()))
 
-for jobs in (() if sys.argv[3] in ('--sidecar-recovery-only', '--worker-completion-only') else (1, 3)):
+for jobs in (() if sys.argv[3] in ('--sidecar-recovery-only', '--worker-completion-only',
+                                  '--host-readiness-only', '--host-readiness-cli-only') else (1, 3)):
     for mode, observed_exit in (('missing-receipt', 0), ('killed-worker', 137)):
         case, identity = fixture(jobs, mode)
         first, state = invoke(case, identity, jobs, mode, 'first')
@@ -364,7 +426,6 @@ for jobs in (() if sys.argv[3] in ('--sidecar-recovery-only', '--worker-completi
         check(case.name + ': exact resume runs each compiler once and preserves failed receipts',
               all(not row.get('resume_reused') for row in resumed['targets']) and
               all(path.read_bytes() == contents for path, contents in immutable.items()))
-
 
 for jobs in ((1, 3) if sys.argv[3] in ('all', '--stdin-isolation-only', '--worker-completion-only') else ()):
     for mode, observed_exit in (('child-success-killed', 137), ('child-success-exit', 9),
@@ -410,7 +471,8 @@ def worker_running(pid):
     return probe.returncode == 0 and bool(probe.stdout.strip()) and not probe.stdout.strip().startswith(b'Z')
 
 
-for jobs in (() if sys.argv[3] in ('--coordinator-receipt-only', '--worker-completion-only') else (1, 3)):
+for jobs in (() if sys.argv[3] in ('--coordinator-receipt-only', '--worker-completion-only',
+                                  '--host-readiness-only', '--host-readiness-cli-only') else (1, 3)):
     case, identity = fixture(jobs, 'sidecar-recovery')
     workspace = case / 'state/builds/stdinfixture/1.0.0' / identity
     env = invocation_env(case, identity, jobs, 'sidecar-recovery', 'first')
@@ -490,13 +552,75 @@ for jobs in (() if sys.argv[3] in ('--coordinator-receipt-only', '--worker-compl
           all(row.get('resume_reused') is True for row in again['targets']) and
           all(path.read_bytes() == contents for path, contents in immutable.items()))
 
+if sys.argv[3] not in ('--coordinator-receipt-only', '--sidecar-recovery-only', '--worker-completion-only'):
+    case = root / 'early-worker-refusal'
+    case.mkdir()
+    early_script = r'''
+source "$1"
+case_dir="$2"
+selector_acquire_slot() { : > "$case_dir/unexpected-slot"; }
+_act_build_orchestration_target() { : > "$case_dir/unexpected-build"; return 99; }
+_act_run_target_worker fixture 1.0.0 55555555-5555-4555-8555-555555555555 \
+    linux/amd64 1 "$case_dir/worker.log" "$case_dir/result.json" \
+    true null '{}' '' '' unbound-host release x86_64-unknown-linux-musl \
+    linux/amd64@x86_64-unknown-linux-musl
+'''
+    early = subprocess.run(['bash', '-c', early_script, '_', str(module), str(case)],
+                           stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+    (case / 'stdout').write_bytes(early.stdout)
+    (case / 'stderr').write_bytes(early.stderr)
+    receipt = read(case / 'result.json')
+    check('early worker admission: missing source identity retains the attempted matrix task',
+          early.returncode == 4 and receipt['status'] == 'failed' and receipt['exit_code'] == 4 and
+          receipt['error'] == 'Missing strict worker source binding' and
+          receipt['platform'] == 'linux/amd64' and receipt['host'] == 'unbound-host' and
+          receipt['target_triple'] == 'x86_64-unknown-linux-musl' and
+          receipt['task_key'] == 'linux/amd64@x86_64-unknown-linux-musl' and
+          not receipt.get('resume_artifacts') and not (case / 'unexpected-slot').exists() and
+          not (case / 'unexpected-build').exists())
+
+    case, identity = fixture(3, 'cli-readiness')
+    source = case / 'source'
+    (source / 'README').write_text('Readiness-refusal fixture; no compiler should run.\n')
+    for command in (['git', 'init', '-q', '--initial-branch=main', str(source)],
+                    ['git', '-C', str(source), 'add', 'README'],
+                    ['git', '-C', str(source), '-c', 'user.name=Fixture',
+                     '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'fixture'],
+                    ['git', '-C', str(source), 'tag', 'v1.0.0']):
+        subprocess.run(command, check=True, capture_output=True)
+    (case / 'release').write_text('continue\n')
+    details, state = invoke(case, identity, 3, 'cli-readiness', 'cli')
+    check('public CLI: every configured target keeps its real refusal instead of becoming skipped',
+          [row['platform'] for row in details['targets']] == targets and
+          (details['total'], details['success'], details['failed']) == (6, 0, 6))
+    for row in details['targets']:
+        target = row['platform']
+        saved = state['target_statuses'][target]
+        check('public CLI: ' + target + ' exposes host readiness, attempt and immutable receipts',
+              row['status'] == 'failed' and row['exit_code'] == 4 and row['attempt'] == 1 and
+              row['stage'] == 'host_readiness' and row['method'] == 'native' and
+              row['host'] == 'host-' + target.replace('/', '-') and
+              row['error'] == 'Native build host is not ready' and
+              Path(row['log_path']).is_file() and Path(row['result_path']).is_file() and
+              read(Path(row['result_path']))['platform'] == target and
+              saved['attempts'] == 1 and saved['status'] == 'failed' and saved['result']['exit_code'] == 4)
+    check('public CLI: all six stdin-reading health probes actually ran without compilation',
+          Counter(event['target'] for event in events(case)) == Counter({target: 1 for target in targets}) and
+          all(event['stdin_is_null'] and event['mode'] == 'readiness' for event in events(case)) and
+          all(path.stat().st_size == 0 for path in case.glob('*.stdin')) and
+          not list((case / 'output').glob('*.bin')))
+    check('public CLI: readiness refusals retain failed state and cannot authorize publication',
+          state['status'] == 'failed' and not details['publishable'] and not details['manifest_path'] and
+          read(case / 'output/.dsr-build-purpose.json')['publishable'] is False)
+
 (root / 'summary.json').write_text(json.dumps({'checks': checks, 'failures': 0}) + '\n')
 print('Worker stdin isolation: %d checks, 0 failures' % checks, flush=True)
 PY
 }
 
 if [[ "${1:-}" == --stdin-isolation-only || "${1:-}" == --coordinator-receipt-only ||
-      "${1:-}" == --sidecar-recovery-only || "${1:-}" == --worker-completion-only ]]; then
+      "${1:-}" == --sidecar-recovery-only || "${1:-}" == --worker-completion-only ||
+      "${1:-}" == --host-readiness-only || "${1:-}" == --host-readiness-cli-only ]]; then
     test_worker_stdin_isolation "$1"
     exit $?
 fi

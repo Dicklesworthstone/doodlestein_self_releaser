@@ -127,7 +127,7 @@
         "stage": {
           "type": "string",
           "minLength": 1,
-          "description": "Failure stage; source_sync means no compiler or capacity slot was started"
+          "description": "Failure stage; source_sync means no compiler or capacity slot was started, host_readiness means native host admission refused before compilation"
         },
         "source_sync": {
           "type": "object",

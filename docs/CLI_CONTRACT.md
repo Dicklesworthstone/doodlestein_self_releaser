@@ -556,6 +556,11 @@ Per-target JSON includes the retained `attempt`, `exit_code`, `log_path`, and
 `result_path` when available. A coordinator-recovered receipt records the
 observed `worker_exit_code` and `receipt_source: "coordinator"`; a missing
 receipt cannot turn a zero process exit into a successful build.
+Native host-readiness refusals retain the requested platform, optional selected
+triple, host, and attempt receipts. They report `stage: "host_readiness"` and
+`exit_code: 4`; public target status is `failed`, even though no compiler ran.
+Receipt-write failures release the attempt's capacity lease before the worker
+returns, preserving unrelated workers' slots and allowing a later retry.
 The aggregate failed count includes all unsuccessful requested tasks, including
 skipped tasks. An interrupted run remains resumable and cannot publish an
 authoritative manifest.

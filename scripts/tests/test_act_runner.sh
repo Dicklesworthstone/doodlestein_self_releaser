@@ -1804,6 +1804,47 @@ for mode in ('waiting', 'granted'):
         stop(worker)
         stop(holder)
 
+# A failed immutable-result write must release the real worker lease before
+# returning from the function: an EXIT trap runs after its locals unwind.
+# Keep a peer alive so garbage collection cannot disguise ownership mistakes.
+case = fixture('receipt-write-failure', capacity=2)
+(case / 'result.json').mkdir()
+receipt_failure_script = r'''
+source "$DSR_ADMISSION_PROJECT/src/host_selector.sh"
+source "$DSR_ADMISSION_MODULE"
+act_platform_uses_act() { return 0; }
+_act_build_orchestration_target() {
+    cat "$DSR_ADMISSION_CASE/state/selector/locks/shared/55555555-5555-4555-8555-555555555555-linux-amd64-attempt-1.lock" \
+        > "$DSR_ADMISSION_CASE/acquired-lease.json" || return 99
+    printf '%s\n' '{"platform":"linux/amd64","status":"failed","exit_code":9,"error":"deliberate build failure before receipt write"}'
+    return 9
+}
+_act_run_target_worker fixture 1.0.0 55555555-5555-4555-8555-555555555555 \
+    linux/amd64 1 "$DSR_ADMISSION_CASE/worker.log" "$DSR_ADMISSION_CASE/result.json" \
+    false null '{}' '' '' shared release
+'''
+holder = worker = None
+locks = case / 'state/selector/locks/shared'
+try:
+    holder = launch(case, holder_script, 'holder')
+    wait_for(holder, lambda: (case / 'holder.ready').exists(), 'receipt-failure peer did not start')
+    retained_holder = (locks / 'unrelated.lock').read_bytes()
+    worker = launch(case, receipt_failure_script, 'receipt-failure')
+    check('receipt failure: immutable-result write failure remains nonzero', worker.wait(timeout=10) == 4)
+    check('receipt failure: target ran under a genuine owned capacity lease',
+          read(case / 'acquired-lease.json')['pid'] == worker.pid and
+          b'deliberate build failure before receipt write' in (case / 'worker.log').read_bytes())
+    own_slot = locks / '55555555-5555-4555-8555-555555555555-linux-amd64-attempt-1.lock'
+    check('receipt failure: failed publication releases the worker lease', not own_slot.exists())
+    check('receipt failure: failure preserves the live peer and its exact lease',
+          holder.poll() is None and (locks / 'unrelated.lock').read_bytes() == retained_holder)
+    check('receipt failure: no success receipt or artifact is fabricated',
+          (case / 'result.json').is_dir() and not list((case / 'output').iterdir()) and
+          b'unbound variable' not in (case / 'receipt-failure.stderr').read_bytes())
+finally:
+    stop(worker)
+    stop(holder)
+
 case = fixture('output-conflict', capacity=2)
 targets = ['linux/amd64', 'linux/arm64', 'darwin/arm64']
 identity = str(uuid.uuid4())
