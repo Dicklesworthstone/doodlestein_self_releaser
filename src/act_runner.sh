@@ -861,6 +861,54 @@ _act_workspace_include_path_is_symlink_free() {
     [[ ! -L "$cursor/$remainder" ]]
 }
 
+# Freeze a member as soon as collection/staging hands it to the coordinator.
+# Keep its original inode open while checking bytes and permissions twice;
+# later members and the archiver must not redefine an earlier member's bytes.
+# Empty companion files are valid, unlike empty executable/archive streams.
+_act_workspace_member_receipt() (
+    local artifact_dir="$1" member="$2"
+    local path="$artifact_dir/$member" identity sha size mode
+    local final_identity final_sha final_size final_mode
+
+    [[ -d "$artifact_dir" && ! -L "$artifact_dir" ]] || return 4
+    _act_is_safe_workspace_include_path "$member" || return 4
+    _act_workspace_include_path_is_symlink_free "$artifact_dir" "$member" || return 4
+    [[ -f "$path" && ! -L "$path" ]] || return 4
+    exec 8< "$path" || return 4
+    identity=$(_act_file_identity /dev/fd/8) || return 4
+    [[ "$(_act_file_identity "$path")" == "$identity" ]] || return 4
+    mode=$(stat -L -c %A /dev/fd/8 2>/dev/null || stat -L -f %Sp /dev/fd/8 2>/dev/null) || return 4
+    size=$(stat -L -c %s /dev/fd/8 2>/dev/null || stat -L -f %z /dev/fd/8 2>/dev/null) || return 4
+    # A fresh read descriptor for each digest avoids relying on whether a
+    # /dev/fd reopen shares the original offset (as it can on macOS).
+    exec 9< "$path" || return 4
+    [[ "$(_act_file_identity /dev/fd/9)" == "$identity" ]] || return 4
+    sha=$(_act_sha256 /dev/fd/9) || return 4
+    exec 9<&-
+    [[ "$sha" =~ ^[a-fA-F0-9]{64}$ && "$size" =~ ^[0-9]+$ &&
+       "$mode" =~ ^-[r-][w-][xsS-][r-][w-][xsS-][r-][w-][xtT-]$ ]] || return 4
+
+    _act_workspace_include_path_is_symlink_free "$artifact_dir" "$member" || return 4
+    [[ -f "$path" && ! -L "$path" ]] || return 4
+    final_identity=$(_act_file_identity "$path") || return 4
+    final_mode=$(stat -L -c %A /dev/fd/8 2>/dev/null || stat -L -f %Sp /dev/fd/8 2>/dev/null) || return 4
+    final_size=$(stat -L -c %s /dev/fd/8 2>/dev/null || stat -L -f %z /dev/fd/8 2>/dev/null) || return 4
+    exec 9< "$path" || return 4
+    [[ "$(_act_file_identity /dev/fd/9)" == "$identity" ]] || return 4
+    final_sha=$(_act_sha256 /dev/fd/9) || return 4
+    exec 9<&-
+    _act_workspace_include_path_is_symlink_free "$artifact_dir" "$member" || return 4
+    [[ -f "$path" && ! -L "$path" ]] || return 4
+    [[ "$identity" == "$final_identity" && "$identity" == "$(_act_file_identity /dev/fd/8)" &&
+       "$identity" == "$(_act_file_identity "$path")" && "$mode" == "$final_mode" &&
+       "$size" == "$final_size" && "$sha" == "$final_sha" ]] || return 4
+
+    jq -ncS --arg path "$path" --arg member "$member" --arg sha256 "${sha,,}" \
+        --argjson size_bytes "$size" --arg identity "$identity" --arg mode "$mode" \
+        '{path:$path, member:$member, sha256:$sha256, size_bytes:$size_bytes,
+          identity:$identity, mode:$mode}'
+)
+
 _act_release_tree_file_metadata() {
     local repo_path="$1"
     local revision="$2"
@@ -921,8 +969,10 @@ _act_stage_workspace_include_files() {
     local source_root="$2"
     local artifact_dir="$3"
     local revision="${4:-}"
+    local emit_receipts="${5:-false}"
     local configured=""
 
+    [[ "$emit_receipts" == true || "$emit_receipts" == false ]] || return 7
     [[ -f "$config_file" && ! -L "$config_file" ]] || return 7
     [[ -d "$source_root" && ! -L "$source_root" ]] || return 7
     [[ -d "$artifact_dir" && ! -L "$artifact_dir" ]] || return 7
@@ -988,7 +1038,11 @@ _act_stage_workspace_include_files() {
             _log_error "Unable to stage workspace include: $include"
             return 7
         fi
-        printf '%s\n' "$include"
+        if [[ "$emit_receipts" == true ]]; then
+            _act_workspace_member_receipt "$artifact_dir" "$include" || return 7
+        else
+            printf '%s\n' "$include"
+        fi
     done <<< "$configured"
 }
 
@@ -1300,6 +1354,61 @@ _act_validate_workspace_archive_collection_receipts() {
         [[ "$actual_sha" == "$expected_sha" && "$actual_size" == "$expected_size" ]] || return 4
     done
     [[ ${#receipt_seen_members[@]} -eq $expected_count ]]
+}
+
+# Ordinary workspace packages may contain scripts as well as machine code.
+# Bind every archived member, including empty notices and declared companions,
+# to the bytes, permissions, and inode frozen at its collection handoff.
+_act_validate_workspace_member_receipts() {
+    local archive="$1" format="$2" artifact_dir="$3"
+    shift 3
+    [[ -f "$archive" && ! -L "$archive" && $# -gt 0 ]] || return 4
+
+    local entries tar_reader=tar
+    command -v gtar &>/dev/null && tar_reader=gtar
+    case "$format" in
+        tar.gz) entries=$("$tar_reader" -tzf "$archive" 2>/dev/null) || return 4 ;;
+        tar.xz) entries=$("$tar_reader" -tJf "$archive" 2>/dev/null) || return 4 ;;
+        zip) entries=$(unzip -Z1 "$archive" 2>/dev/null) || return 4 ;;
+        *) return 4 ;;
+    esac
+
+    local -A seen_members=()
+    local -a members=()
+    local receipt expected actual member expected_sha expected_size expected_mode
+    local actual_sha actual_size actual_mode
+    for receipt in "$@"; do
+        expected=$(jq -ceS 'select(type == "object")' <<< "$receipt") || return 4
+        member=$(jq -er '.member | select(type == "string" and length > 0)' <<< "$expected") || return 4
+        _act_is_safe_workspace_include_path "$member" || return 4
+        [[ -z "${seen_members[$member]:-}" ]] || return 4
+        seen_members["$member"]=1
+        members+=("$member")
+        actual=$(_act_workspace_member_receipt "$artifact_dir" "$member") || return 4
+        [[ "$actual" == "$expected" ]] || return 4
+
+        expected_sha=$(jq -er '.sha256' <<< "$expected") || return 4
+        expected_size=$(jq -er '.size_bytes' <<< "$expected") || return 4
+        expected_mode=$(jq -er '.mode' <<< "$expected") || return 4
+        actual_mode=$(_act_archive_member_mode "$archive" "$format" "$member") || return 4
+        [[ "$actual_mode" == "$expected_mode" ]] || return 4
+        if command -v sha256sum &>/dev/null; then
+            actual_sha=$(_act_archive_entry_stream "$archive" "$format" "$member" |
+                sha256sum | awk '{print $1}') || return 4
+        elif command -v shasum &>/dev/null; then
+            actual_sha=$(_act_archive_entry_stream "$archive" "$format" "$member" |
+                shasum -a 256 | awk '{print $1}') || return 4
+        else
+            return 3
+        fi
+        actual_size=$(_act_archive_entry_stream "$archive" "$format" "$member" |
+            wc -c | tr -d '[:space:]') || return 4
+        [[ "$actual_sha" == "$expected_sha" && "$actual_size" == "$expected_size" ]] || return 4
+    done
+    # A receipt subset is not a complete custody proof, even if every member
+    # in that subset matches. Duplicates and unreceipted members also fail.
+    [[ "$(printf '%s\n' "$entries" | LC_ALL=C sort)" == \
+       "$(printf '%s\n' "${members[@]}" | LC_ALL=C sort)" ]]
 }
 
 _act_read_archive_hex_bytes() {
@@ -1634,19 +1743,22 @@ finally:
 PY
 }
 
-# Validate a release archive that was already assembled by the strict native
-# workspace collector. Unlike the single-binary archive path above, this form
-# must retain every configured workspace binary and companion notice while
-# still proving that each executable has the requested target architecture.
+# Validate the complete configured workspace archive. Strict callers retain
+# architecture validation by default; ordinary noncompiled languages may opt
+# out of the machine-format check while retaining exact closure and executable
+# regular payloads. Byte/mode custody is checked separately against receipts.
 _act_validate_workspace_archive() {
     local archive="$1"
     local format="$2"
     local target="$3"
     local config_file="$4"
+    local validate_architecture="${5:-true}"
     local entries="" expected_entries="" configured=""
     local tar_reader="tar"
     command -v gtar &>/dev/null && tar_reader="gtar"
 
+    [[ "$validate_architecture" == true || "$validate_architecture" == false ]] || return 4
+    [[ -f "$archive" && ! -L "$archive" ]] || return 4
     [[ -f "$config_file" && ! -L "$config_file" ]] || return 4
     command -v yq &>/dev/null || return 4
 
@@ -1722,7 +1834,7 @@ _act_validate_workspace_archive() {
     expected_entries=$(printf '%s\n' "${expected_members[@]}" | LC_ALL=C sort)
     entries=$(printf '%s\n' "$entries" | LC_ALL=C sort)
     if [[ "$entries" != "$expected_entries" ]]; then
-        _log_error "Strict workspace archive members do not match configured closure: $archive"
+        _log_error "Workspace archive members do not match configured closure: $archive"
         return 4
     fi
 
@@ -1748,9 +1860,15 @@ _act_validate_workspace_archive() {
         executable=false
         mode=$(_act_archive_member_mode "$archive" "$format" "$member") || return 4
         [[ "$mode" == *x* ]] && executable=true
-        _act_validate_target_binary_reader \
-            "$archive::$member" "$target" "$size" "$executable" \
-            _act_read_archive_hex_bytes "$archive" "$format" "$member" || return 4
+        if [[ "$validate_architecture" == true ]]; then
+            _act_validate_target_binary_reader \
+                "$archive::$member" "$target" "$size" "$executable" \
+                _act_read_archive_hex_bytes "$archive" "$format" "$member" || return 4
+        elif [[ ! "$size" =~ ^[1-9][0-9]*$ ]] || \
+             { [[ "$target" != windows/* ]] && [[ "$executable" != true ]]; }; then
+            _log_error "Workspace binary is empty or not executable: $archive::$member"
+            return 4
+        fi
     done
 }
 
@@ -11550,6 +11668,7 @@ EOF
     local additional_artifact_receipts=()
     local collected_sha256="" collected_size_bytes=0 collected_identity=""
     local strict_collection_receipts=()
+    local workspace_member_receipts=()
     if [[ $exit_code -eq 0 ]]; then
         _log_ok "Build completed on $host in ${duration}s"
         status="success"
@@ -11621,6 +11740,7 @@ EOF
             local artifact_filename
             artifact_filename=$(basename "$remote_artifact_path")
             local this_artifact_path="$artifact_dir/$artifact_filename"
+            local ordinary_member_collected=false workspace_member_receipt=""
 
             _log_info "Downloading artifact: ${host}:${remote_artifact_path}"
             local scp_output
@@ -11725,6 +11845,7 @@ EOF
                     fi
                     if _act_accept_collected_binary "$this_artifact_path" "$platform" "$language" "$rust_glibc_floor_enforced"; then
                         local_artifact_paths+=("$this_artifact_path")
+                        ordinary_member_collected=true
                     else
                         echo "Collected artifact failed $platform validation: $this_artifact_path" >> "$log_file"
                         download_failed=true
@@ -11746,6 +11867,7 @@ EOF
                 fi
                 if _act_accept_collected_binary "$this_artifact_path" "$platform" "$language" "$rust_glibc_floor_enforced"; then
                     local_artifact_paths+=("$this_artifact_path")
+                    ordinary_member_collected=true
                 else
                     echo "Collected artifact failed $platform validation: $this_artifact_path" >> "$log_file"
                     download_failed=true
@@ -11773,6 +11895,7 @@ EOF
                         fi
                         if _act_accept_collected_binary "$this_artifact_path" "$platform" "$language" "$rust_glibc_floor_enforced"; then
                             local_artifact_paths+=("$this_artifact_path")
+                            ordinary_member_collected=true
                         else
                             echo "Collected artifact failed $platform validation: $this_artifact_path" >> "$log_file"
                             download_failed=true
@@ -11789,6 +11912,15 @@ EOF
                     _log_error "Failed to download artifact $bin from $host"
                     _log_error "SCP error: $scp_output"
                     echo "SCP failed for $bin: $scp_output" >> "$log_file"
+                    download_failed=true
+                fi
+            fi
+            if $ordinary_member_collected && [[ -n "$workspace_binaries" ]]; then
+                if workspace_member_receipt=$(_act_workspace_member_receipt \
+                        "$artifact_dir" "$artifact_filename"); then
+                    workspace_member_receipts+=("$workspace_member_receipt")
+                else
+                    _log_error "Unable to freeze collected workspace member: $this_artifact_path"
                     download_failed=true
                 fi
             fi
@@ -11887,8 +12019,12 @@ EOF
             elif _act_is_local_host "$host"; then
                 if [[ -f "$archive_file_remote" && ! -L "$archive_file_remote" ]] && \
                    cp "$archive_file_remote" "$archive_file_local" && \
-                   chmod "$archive_file_mode" "$archive_file_local"; then
+                   chmod "$archive_file_mode" "$archive_file_local" && \
+                   { [[ -z "$workspace_binaries" ]] || \
+                     archive_file_receipt=$(_act_workspace_member_receipt \
+                         "$artifact_dir" "$archive_file"); }; then
                     local_artifact_paths+=("$archive_file_local")
+                    [[ -z "$workspace_binaries" ]] || workspace_member_receipts+=("$archive_file_receipt")
                 else
                     _log_error "Failed to collect workspace archive member $archive_file from $host:$archive_file_remote"
                     download_failed=true
@@ -11897,8 +12033,12 @@ EOF
                     -o StrictHostKeyChecking=accept-new \
                     "${ssh_destination}:${archive_file_remote}" \
                     "$archive_file_local" >/dev/null 2>&1 && \
-                 chmod "$archive_file_mode" "$archive_file_local"; then
+                 chmod "$archive_file_mode" "$archive_file_local" && \
+                 { [[ -z "$workspace_binaries" ]] || \
+                   archive_file_receipt=$(_act_workspace_member_receipt \
+                       "$artifact_dir" "$archive_file"); }; then
                 local_artifact_paths+=("$archive_file_local")
+                [[ -z "$workspace_binaries" ]] || workspace_member_receipts+=("$archive_file_receipt")
             else
                 _log_error "Failed to collect workspace archive member $archive_file from $host:$archive_file_remote"
                 download_failed=true
@@ -12007,9 +12147,14 @@ EOF
         output_stage_root=""
 
         if [[ "$download_failed" == true ]]; then
-            if $strict_native_build || [[ ${#local_artifact_paths[@]} -eq 0 ]]; then
+            if $strict_native_build || [[ -n "$workspace_binaries" || ${#local_artifact_paths[@]} -eq 0 ]]; then
                 status="failed"
                 exit_code=7
+                if [[ -n "$workspace_binaries" ]]; then
+                    local_artifact_path=""
+                    local_artifact_paths=()
+                    additional_artifact_receipts=()
+                fi
             else
                 # Partial success - some artifacts downloaded
                 status="partial"
@@ -12081,37 +12226,60 @@ EOF
 
             local staged_workspace_includes=""
             local workspace_include_revision=""
+            local emit_workspace_include_receipts=false
+            $strict_native_build || emit_workspace_include_receipts=true
             if [[ -z "$archive_ext" ]]; then
                 :
             elif $strict_native_build; then
                 if [[ ! "$release_git_sha" =~ ^[0-9a-f]{40}$ || "$release_git_sha" =~ ^0{40}$ ]]; then
                     _log_error "Strict workspace companion-file staging requires an exact release commit"
                     jq -nc --arg platform "$platform" \
-                        '{status: "failed", exit_code: 7, error: ("Release commit is missing for workspace companion-file staging on " + $platform)}'
+                        '{status:"failed",exit_code:7,platform:$platform,
+                          artifact_path:"",artifact_paths:[],additional_artifacts:[],
+                          error:("Release commit is missing for workspace companion-file staging on " + $platform)}'
                     return 7
                 fi
                 workspace_include_revision="$release_git_sha"
             fi
             if ! staged_workspace_includes=$(
                 _act_stage_workspace_include_files \
-                    "$config_file" "$local_path" "$artifact_dir" "$workspace_include_revision"
+                    "$config_file" "$local_path" "$artifact_dir" "$workspace_include_revision" \
+                    "$emit_workspace_include_receipts"
             ); then
                 _log_error "Failed to stage configured workspace companion files for $platform"
                 jq -nc --arg platform "$platform" \
-                    '{status: "failed", exit_code: 7, error: ("Workspace companion-file staging failed for " + $platform)}'
+                    '{status:"failed",exit_code:7,platform:$platform,
+                      artifact_path:"",artifact_paths:[],additional_artifacts:[],
+                      error:("Workspace companion-file staging failed for " + $platform)}'
                 return 7
             fi
-            local staged_include
-            while IFS= read -r staged_include; do
-                [[ -n "$staged_include" ]] && archive_files+=("$staged_include")
+            local staged_include staged_include_record
+            while IFS= read -r staged_include_record; do
+                [[ -n "$staged_include_record" ]] || continue
+                if $emit_workspace_include_receipts; then
+                    if ! staged_include=$(jq -er '.member | select(type == "string" and length > 0)' \
+                            <<< "$staged_include_record"); then
+                        _log_error "Workspace companion receipt is invalid for $platform"
+                        jq -nc --arg platform "$platform" \
+                            '{status:"failed",exit_code:7,platform:$platform,
+                              artifact_path:"",artifact_paths:[],additional_artifacts:[],
+                              error:"Workspace companion receipt is invalid"}'
+                        return 7
+                    fi
+                    workspace_member_receipts+=("$staged_include_record")
+                else
+                    staged_include="$staged_include_record"
+                fi
+                archive_files+=("$staged_include")
             done <<< "$staged_workspace_includes"
             _log_info "Workspace archive members: ${archive_files[*]}"
 
-            # Create the archive
-            local archive_output
-            if $strict_native_build; then
-                local archive_receipt="" archive_mode=700
-                [[ "$platform" == windows/* ]] && archive_mode=600
+            # All workspace producers use the same fresh held destination.
+            # An archiver failure never becomes a raw-binary fallback, and a
+            # zero-exit partial ZIP still has to prove its complete payload.
+            local archive_receipt="" archive_mode=700
+            [[ "$platform" == windows/* ]] && archive_mode=600
+            if _act_is_safe_basename "$archive_name"; then
                 case "$archive_ext" in
                     zip)
                         if command -v zip &>/dev/null; then
@@ -12134,6 +12302,8 @@ EOF
                             "${archive_files[@]}") || archive_receipt=""
                         ;;
                 esac
+            fi
+            if $strict_native_build; then
                 if [[ -n "$archive_receipt" ]] && \
                    ! _act_validate_workspace_archive_release_tree_includes \
                        "$archive_path" "$archive_ext" "$config_file" \
@@ -12155,72 +12325,53 @@ EOF
                     _log_error "Windows family ZIP failed final component-manifest verification"
                     archive_receipt=""
                 fi
-                if [[ -n "$archive_receipt" ]]; then
-                    _log_ok "Created archive through held descriptor: $archive_path"
-                    local_artifact_path="$archive_path"
-                    local_artifact_paths=("$archive_path")
-                    collected_sha256=$(jq -r '.sha256' <<< "$archive_receipt")
-                    collected_size_bytes=$(jq -r '.size_bytes' <<< "$archive_receipt")
-                    collected_identity=$(jq -r '.identity' <<< "$archive_receipt")
-                else
-                    _log_error "Strict workspace archive stream failed for $platform"
-                    echo "Strict workspace archive creation failed" >> "$log_file"
-                    status="failed"
-                    exit_code=7
-                    local_artifact_path=""
-                    local_artifact_paths=()
-                fi
-            elif [[ "$archive_ext" == "zip" ]]; then
-                # Windows: use zip
-                if command -v zip &>/dev/null; then
-                    archive_output=$(cd "$artifact_dir" && zip "$archive_name" "${archive_files[@]}" 2>&1)
-                    if [[ -f "$archive_path" ]]; then
-                        _log_ok "Created archive: $archive_path"
-                        # Update artifact path to point to the archive
-                        local_artifact_path="$archive_path"
-                        local_artifact_paths=("$archive_path")
-                    else
-                        _log_warn "Failed to create zip archive"
-                        _log_warn "zip output: $archive_output"
-                        echo "Archive creation failed: $archive_output" >> "$log_file"
-                        # Fall back to comma-separated paths
-                        local_artifact_path=$(IFS=','; echo "${local_artifact_paths[*]}")
-                    fi
-                else
-                    _log_warn "zip not available, skipping archive creation"
-                    # Fall back to comma-separated paths
-                    local_artifact_path=$(IFS=','; echo "${local_artifact_paths[*]}")
-                fi
-            elif [[ "$archive_ext" == "tar.gz" ]]; then
-                archive_output=$(cd "$artifact_dir" && \
-                    COPYFILE_DISABLE=1 tar --no-xattrs -czf "$archive_name" \
-                        "${archive_files[@]}" 2>&1)
-                if [[ -f "$archive_path" ]]; then
-                    _log_ok "Created archive: $archive_path"
-                    local_artifact_path="$archive_path"
-                    local_artifact_paths=("$archive_path")
-                else
-                    _log_warn "Failed to create tar.gz archive"
-                    _log_warn "tar output: $archive_output"
-                    echo "Archive creation failed: $archive_output" >> "$log_file"
-                    local_artifact_path=$(IFS=','; echo "${local_artifact_paths[*]}")
-                fi
             else
-                archive_output=$(cd "$artifact_dir" && \
-                    COPYFILE_DISABLE=1 tar --no-xattrs -cJf "$archive_name" \
-                        "${archive_files[@]}" 2>&1)
-                if [[ -f "$archive_path" ]]; then
-                    _log_ok "Created archive: $archive_path"
-                    # Update artifact path to point to the archive
-                    local_artifact_path="$archive_path"
-                    local_artifact_paths=("$archive_path")
-                else
-                    _log_warn "Failed to create tar.xz archive"
-                    _log_warn "tar output: $archive_output"
-                    echo "Archive creation failed: $archive_output" >> "$log_file"
-                    # Fall back to comma-separated paths
-                    local_artifact_path=$(IFS=','; echo "${local_artifact_paths[*]}")
+                local validate_workspace_architecture=false
+                case "$language" in rust|go) validate_workspace_architecture=true ;; esac
+                if [[ -n "$archive_receipt" ]] && \
+                   { ! _act_validate_workspace_archive \
+                         "$archive_path" "$archive_ext" "$platform" "$config_file" \
+                         "$validate_workspace_architecture" || \
+                     ! _act_validate_workspace_member_receipts \
+                         "$archive_path" "$archive_ext" "$artifact_dir" \
+                         "${workspace_member_receipts[@]}"; }; then
+                    _log_error "Workspace archive does not match its configured members and collection receipts for $platform"
+                    archive_receipt=""
                 fi
+            fi
+            # Member validators must not replace/rewrite the archive that the
+            # exclusive producer accepted, even with another valid archive.
+            local verified_archive_receipt=""
+            if [[ -n "$archive_receipt" ]]; then
+                verified_archive_receipt=$(_act_workspace_member_receipt \
+                    "$artifact_dir" "$archive_name") || verified_archive_receipt=""
+                if [[ -z "$verified_archive_receipt" ]] || \
+                   ! jq -e --argjson collected "$archive_receipt" '
+                       .path == $collected.path and .sha256 == $collected.sha256 and
+                       .size_bytes == $collected.size_bytes and .identity == $collected.identity
+                   ' <<< "$verified_archive_receipt" >/dev/null; then
+                    _log_error "Workspace archive changed after collection for $platform"
+                    archive_receipt=""
+                fi
+            fi
+            if [[ -n "$archive_receipt" ]]; then
+                _log_ok "Created archive through held descriptor: $archive_path"
+                local_artifact_path="$archive_path"
+                local_artifact_paths=("$archive_path")
+                collected_sha256=$(jq -r '.sha256' <<< "$archive_receipt")
+                collected_size_bytes=$(jq -r '.size_bytes' <<< "$archive_receipt")
+                collected_identity=$(jq -r '.identity' <<< "$archive_receipt")
+            else
+                _log_error "Workspace archive creation or verification failed for $platform"
+                echo "Workspace archive creation or verification failed" >> "$log_file"
+                status="failed"
+                exit_code=7
+                local_artifact_path=""
+                local_artifact_paths=()
+                additional_artifact_receipts=()
+                collected_sha256=""
+                collected_size_bytes=0
+                collected_identity=""
             fi
         else
             # Join paths with comma for JSON output (single binary or no packaging needed)

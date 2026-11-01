@@ -113,6 +113,12 @@ jobs:
           bash -n scripts/tests/test_act_runner_native.sh
           bash scripts/tests/test_act_runner_native.sh --attempt-isolation-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/native-attempt-isolation.log"
           test -z "$(git status --porcelain)"
+      - name: Validate complete native workspace archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/tests/test_act_runner_native.sh --workspace-archives-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/native-workspace-archives.log"
+          test -z "$(git status --porcelain)"
       - name: Validate Go compiler selectors and ARMv7 command expansion
         shell: bash
         run: |

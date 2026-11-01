@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_act_runner_native.sh - Unit tests for act_runner.sh native build SSH logic
 #
-# Usage: ./test_act_runner_native.sh [--typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only]
+# Usage: ./test_act_runner_native.sh [--typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --workspace-archives-only]
 #
 # Tests native build SSH command construction with mocks.
 # Covers: command construction, path handling, env vars, SCP, error handling.
@@ -339,6 +339,451 @@ PY
 
 if [[ "${1:-}" == --attempt-isolation-only ]]; then
     test_native_attempt_isolation
+    exit $?
+fi
+
+# Run the complete ordinary native backend with real local shell builds,
+# collection, archivers, worker receipts and manifest/resume readers. Admission
+# is controlled; no remote host or machine-code compiler is claimed. Faults
+# alter actual collected files at copy/archive boundaries, retaining evidence.
+test_native_workspace_archives() {
+    local dependency
+    for dependency in python3 yq jq git tar gzip xz zip unzip; do
+        command -v "$dependency" >/dev/null || { printf 'Missing test dependency: %s\n' "$dependency" >&2; return 3; }
+    done
+    python3 - "$PROJECT_ROOT" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import zipfile
+
+root = Path(sys.argv[1])
+module = Path(os.environ.get('DSR_TEST_ACT_RUNNER', str(root / 'src/act_runner.sh')))
+work = Path(tempfile.mkdtemp(prefix='dsr-native-workspace-archives-'))
+print('Retained native workspace archive evidence: ' + str(work), flush=True)
+checks = failures = 0
+run_id = '22222222-2222-4222-8222-222222222222'
+
+
+def check(label, condition):
+    global checks, failures
+    checks += 1
+    failures += not condition
+    print(('PASS: ' if condition else 'FAIL: ') + label, flush=True)
+
+
+def save(path, value):
+    path.write_text(json.dumps(value, sort_keys=True) + '\n')
+
+
+def snapshot(paths):
+    return {str(path): (path.stat().st_dev, path.stat().st_ino,
+            stat.S_IMODE(path.stat().st_mode), path.read_bytes()) for path in map(Path, paths)}
+
+
+program = r'''
+set -uo pipefail
+umask 022
+source "$DSR_WS_PROJECT/src/config.sh" || exit $?
+source "$DSR_WS_MODULE" || exit $?
+host_health_is_ready() { [[ "$DSR_WS_FAULT" != unhealthy ]]; }
+selector_acquire_slot() { return 0; }
+selector_release_slot() { return 0; }
+
+# The build command itself runs through the real local transport. These
+# wrappers affect only collection into its fresh artifact attempt directory.
+cp() {
+    local destination="${!#}" rc=0
+    if [[ "$destination" == "$ACT_ARTIFACTS_DIR/"*/helper &&
+          "$DSR_WS_FAULT" == collection-mutation ]]; then
+        python3 - "${destination%/*}/app" <<'MUTATE'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+p.write_bytes(p.read_bytes().replace(b'app:', b'APP:', 1))
+MUTATE
+        printf 'collection-mutation\n' > "$DSR_WS_CASE/$DSR_WS_LABEL.fault-observed"
+    fi
+    command cp "$@" || rc=$?
+    if [[ "$rc" == 0 && "$destination" == "$ACT_ARTIFACTS_DIR/"*/app &&
+          "$DSR_WS_FAULT" == collection-missing ]]; then
+        mv "$DSR_WS_SOURCE/helper" "$DSR_WS_SOURCE/helper.retained"
+        printf 'collection-missing\n' > "$DSR_WS_CASE/$DSR_WS_LABEL.fault-observed"
+    fi
+    if [[ "$rc" == 0 && "$destination" == "$ACT_ARTIFACTS_DIR/"*/helper &&
+          "$DSR_WS_FAULT" == occupied-output ]]; then
+        python3 - "${destination%/*}/occupied.zip" "$DSR_WS_CASE/$DSR_WS_LABEL.occupant.json" <<'OCCUPIED'
+import hashlib
+import json
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+with p.open('xb') as stream:
+    stream.write(b'preexisting archive output must remain unchanged\n')
+Path(sys.argv[2]).write_text(json.dumps({'path': str(p), 'device': p.stat().st_dev,
+    'inode': p.stat().st_ino, 'sha256': hashlib.sha256(p.read_bytes()).hexdigest()}))
+OCCUPIED
+        printf 'occupied-output\n' > "$DSR_WS_CASE/$DSR_WS_LABEL.fault-observed"
+    fi
+    return "$rc"
+}
+
+_ws_archiver() {
+    local kind="$1" create=false rc=0
+    shift
+    if [[ "$kind" == zip ]]; then
+        create=true
+    else
+        local argument
+        for argument in "$@"; do
+            case "$argument" in -c*|--create) create=true ;; esac
+        done
+    fi
+    if $create && [[ "$PWD" == "$ACT_ARTIFACTS_DIR/"* ]]; then
+        case "$DSR_WS_FAULT" in
+            archive-missing)
+                mv helper helper.retained || return 96
+                ;;
+            archive-mutation)
+                python3 - helper <<'MUTATE'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+p.write_bytes(p.read_bytes().replace(b'helper:', b'HELPER:', 1))
+MUTATE
+                ;;
+            archive-mode) chmod 644 helper || return 96 ;;
+            archive-include-mutation)
+                python3 - LICENSE <<'MUTATE'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+p.write_bytes(p.read_bytes().replace(b'complete', b'COMPLETE', 1))
+MUTATE
+                ;;
+            archive-data-mutation)
+                python3 - metadata.json <<'MUTATE'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+p.write_bytes(p.read_bytes().replace(b'attempt', b'ATTEMPT', 1))
+MUTATE
+                ;;
+            archive-extra)
+                printf 'unrequested archive member\n' > unrequested.txt
+                set -- "$@" unrequested.txt
+                ;;
+        esac
+        printf '%s\n' "$PWD" > "$DSR_WS_CASE/$DSR_WS_LABEL.archive-directory"
+        printf '%s\n' "$DSR_WS_FAULT" > "$DSR_WS_CASE/$DSR_WS_LABEL.fault-observed"
+    fi
+    if [[ "$kind" == zip ]]; then
+        "$DSR_WS_REAL_ZIP" "$@" || rc=$?
+    else
+        "$DSR_WS_REAL_TAR" "$@" || rc=$?
+    fi
+    if $create && [[ "$PWD" == "$ACT_ARTIFACTS_DIR/"* ]]; then
+        printf '%s %s\n' "$kind" "$rc" >> "$DSR_WS_CASE/$DSR_WS_LABEL.archiver-status"
+        # Model an archiver that reports a write/finalization failure after
+        # producing bytes; the archive is made by the genuine tool above.
+        [[ "$DSR_WS_FAULT" != archive-exit ]] || return 23
+    fi
+    return "$rc"
+}
+tar() { _ws_archiver tar "$@"; }
+if [[ "$DSR_WS_FAULT" != missing-zip ]]; then
+    zip() { _ws_archiver zip "$@"; }
+else
+    if command -v zip >/dev/null 2>&1; then exit 97; fi
+    printf 'zip unavailable on actual PATH\n' > "$DSR_WS_CASE/$DSR_WS_LABEL.fault-observed"
+fi
+
+case "$DSR_WS_OPERATION" in
+    native)
+        act_run_native_build workspace linux/amd64 1.0.0 "$DSR_WS_RUN" '' '' '' fixture
+        ;;
+    worker)
+        _act_run_target_worker workspace 1.0.0 "$DSR_WS_RUN" linux/amd64 \
+            "$DSR_WS_ATTEMPT" "$DSR_WS_CASE/$DSR_WS_LABEL.worker.log" "$DSR_WS_RESULT" \
+            false null '{}' '' '' fixture release
+        ;;
+    receipts) _act_result_artifact_receipts "$(cat "$DSR_WS_RESULT")" ;;
+    available) _act_target_result_available "$(cat "$DSR_WS_RESULT")" ;;
+    manifest) act_generate_manifest "$(cat "$DSR_WS_RESULT")" "$DSR_WS_MANIFEST" ;;
+    *) exit 98 ;;
+esac
+'''
+
+
+def prepare(name, extension, naming=None):
+    case = work / name
+    (case / 'config/repos.d').mkdir(parents=True)
+    source = case / 'source'
+    (source / 'docs').mkdir(parents=True)
+    includes = {'LICENSE': (b'complete license\n', 0o644), 'EMPTY': (b'', 0o644),
+                'docs/README.md': (b'workspace installation notes\n', 0o644),
+                'install.sh': (b'#!/usr/bin/env bash\nprintf "install\\n"\n', 0o755)}
+    for name, (content, mode) in includes.items():
+        (source / name).write_bytes(content)
+        (source / name).chmod(mode)
+    (source / 'build.sh').write_text('''#!/usr/bin/env bash
+set -uo pipefail
+printf '%s\\n' "$DSR_WS_LABEL" >> "$DSR_WS_CASE/build-events"
+cp "$DSR_WS_INPUTS/app" app && cp "$DSR_WS_INPUTS/helper" helper &&
+    cp "$DSR_WS_INPUTS/metadata.json" metadata.json && cp "$DSR_WS_INPUTS/verify.sh" verify.sh
+''')
+    subprocess.run(['git', '-C', str(source), 'init', '-q', '-b', 'main'], check=True)
+    subprocess.run(['git', '-C', str(source), 'add', '.'], check=True)
+    subprocess.run(['git', '-C', str(source), '-c', 'user.name=DSR fixture',
+                    '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false',
+                    'commit', '-qm', 'Ordinary workspace archive fixture'], check=True)
+    sha = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD']).decode().strip()
+    save(case / 'config/repos.yaml', {'tools': {}})
+    save(case / 'config/hosts.yaml', {'hosts': {'fixture': {
+        'platform': 'linux/amd64', 'connection': 'local', 'enabled': True, 'concurrency': 2}}})
+    config = {'tool_name': 'workspace', 'repo': 'owner/workspace', 'local_path': str(source),
+        'language': 'bash', 'binary_name': 'app', 'build_cmd': 'bash ./build.sh',
+        'targets': ['linux/amd64'], 'act_job_map': {'linux/amd64': None},
+        'workspace_binaries': ['app', 'helper'], 'archive_format': extension,
+        'include_files': list(includes), 'workspace_archive_files': {'linux/amd64': [
+            {'name': 'metadata.json', 'executable': False}, {'name': 'verify.sh', 'executable': True}]}}
+    if naming is not None:
+        config['artifact_naming'] = naming
+    save(case / 'config/repos.d/workspace.yaml', config)
+    env = dict(os.environ, DSR_CONFIG_DIR=str(case / 'config'),
+        DSR_REPOS_FILE=str(case / 'config/repos.yaml'), DSR_HOSTS_FILE=str(case / 'config/hosts.yaml'),
+        DSR_STATE_DIR=str(case / 'state'), ACT_REPOS_DIR=str(case / 'config/repos.d'),
+        ACT_ARTIFACTS_DIR=str(case / 'artifacts'), ACT_LOGS_DIR=str(case / 'logs'),
+        DSR_WS_PROJECT=str(root), DSR_WS_MODULE=str(module), DSR_WS_CASE=str(case),
+        DSR_WS_SOURCE=str(source), DSR_WS_RUN=run_id, DSR_WS_REAL_TAR=shutil.which('tar'),
+        DSR_WS_REAL_ZIP=shutil.which('zip'), RCH_REQUIRE_REMOTE='0', DSR_NATIVE_OUTPUT_STAGE='0', NO_COLOR='1')
+    return case, env, includes, sha
+
+
+def invoke(context, operation, label, **extra):
+    case, env, _, _ = context
+    child = dict(env, DSR_WS_LABEL=label, DSR_WS_OPERATION=operation, DSR_WS_FAULT='none',
+                 DSR_WS_RESULT=str(case / (label + '.result.json')))
+    child.update(extra)
+    result = subprocess.run(['bash', '-c', program], env=child, capture_output=True, timeout=75)
+    (case / (label + '.' + operation + '.stdout')).write_bytes(result.stdout)
+    (case / (label + '.' + operation + '.stderr')).write_bytes(result.stderr)
+    return result
+
+
+def build(context, label, fault='none', operation='native', attempt=1, path=None):
+    case, env, includes, _ = context
+    inputs = case / ('inputs-' + label)
+    inputs.mkdir()
+    payloads = {name: (('#!/usr/bin/env bash\nprintf "' + name + ':' + label + '\\n"\n').encode(), 0o755)
+                for name in ('app', 'helper')}
+    payloads.update({'metadata.json': ((json.dumps({'attempt': label}) + '\n').encode(), 0o644),
+                     'verify.sh': (b'#!/usr/bin/env bash\nprintf "verified\\n"\n', 0o755)})
+    for name, (content, mode) in payloads.items():
+        (inputs / name).write_bytes(content)
+        (inputs / name).chmod(mode)
+    kwargs = {'DSR_WS_FAULT': fault, 'DSR_WS_INPUTS': str(inputs), 'DSR_WS_ATTEMPT': str(attempt)}
+    if path is not None:
+        kwargs['PATH'] = path
+    process = invoke(context, operation, label, **kwargs)
+    result_file = case / (label + '.result.json')
+    if operation == 'worker' and result_file.exists():
+        result = json.loads(result_file.read_text())
+    else:
+        rows = [row for row in process.stdout.splitlines() if row.startswith(b'{')]
+        result = json.loads(rows[-1]) if rows else {}
+        save(result_file, result)
+    # Native declared non-binary members deliberately receive private modes
+    # during collection; their archive must preserve those collected modes.
+    expected = dict(includes, **payloads)
+    expected['metadata.json'] = (payloads['metadata.json'][0], 0o600)
+    expected['verify.sh'] = (payloads['verify.sh'][0], 0o700)
+    return process.returncode, result, expected
+
+
+def archive_members(path):
+    if path.name.endswith('.zip'):
+        with zipfile.ZipFile(path) as archive:
+            return {entry.filename: (archive.read(entry), (entry.external_attr >> 16) & 0o777)
+                    for entry in archive.infolist()}
+    with tarfile.open(path) as archive:
+        return {entry.name: (archive.extractfile(entry).read(), entry.mode & 0o777)
+                for entry in archive.getmembers()}
+
+
+def accepted(context, label, outcome):
+    code, result, expected = outcome
+    paths = result.get('artifact_paths', [])
+    good = code == 0 and result.get('status') == 'success' and len(paths) == 1
+    if good:
+        archive = Path(paths[0])
+        good = archive_members(archive) == expected
+        good = good and result.get('collected_sha256') == hashlib.sha256(archive.read_bytes()).hexdigest()
+        good = good and result.get('collected_size_bytes') == archive.stat().st_size
+        good = good and bool(result.get('collected_identity'))
+        # Execute the actual collected Bash payloads; no machine-code-shaped
+        # header or architecture validator is substituted for script support.
+        for binary in ('app', 'helper'):
+            ran = subprocess.run([str(archive.parent / binary)], capture_output=True, timeout=10)
+            good = good and ran.returncode == 0 and ran.stdout == (binary + ':' + label + '\n').encode()
+    check(label + ': real native Bash build produces one complete archive with frozen bytes and modes', good)
+    return result
+
+
+def refused(context, label, outcome, expected_code=7):
+    code, result, _ = outcome
+    check(label + ': failed packaging advertises no primary or companion artifact',
+          code == expected_code and result.get('status') == 'failed' and
+          result.get('exit_code') == expected_code and result.get('artifact_path', '') == '' and
+          result.get('artifact_paths', []) == [] and result.get('additional_artifacts', []) == [] and
+          not result.get('collected_sha256'))
+    # Native results acquire resume receipts at the real worker boundary.
+    # Freeze their actual advertised inventory before checking availability,
+    # so an incorrectly successful native result is not rejected merely for
+    # lacking worker metadata. Existing worker receipts remain untouched.
+    receipt_result = dict(result)
+    if 'build_purpose' not in result:
+        receipts = invoke(context, 'receipts', label)
+        if receipts.returncode == 0:
+            receipt_result['resume_artifacts'] = json.loads(receipts.stdout)
+    readback = context[0] / (label + '.resume-readback.json')
+    save(readback, receipt_result)
+    available = invoke(context, 'available', label, DSR_WS_RESULT=str(readback))
+    check(label + ': failed attempt cannot be reused as a completed release target', available.returncode != 0)
+    return result
+
+
+for extension in ('tar.gz', 'tar.xz', 'zip'):
+    context = prepare('success-' + extension, extension)
+    accepted(context, extension, build(context, extension))
+    for fault in ('archive-missing', 'archive-mutation', 'archive-mode', 'archive-exit'):
+        label = extension + '-' + fault
+        context = prepare(label, extension)
+        refused(context, label, build(context, label, fault))
+        case = context[0]
+        observed = case / (label + '.archiver-status')
+        check(label + ': genuine archiver ran against the altered collected inputs', observed.exists())
+        if fault == 'archive-missing' and observed.exists():
+            statuses = observed.read_text().splitlines()
+            fields = statuses[0].split() if len(statuses) == 1 else []
+            # GNU tar reports 2 here; BSD tar may report 1. Both must be
+            # actual nonzero exits, while ZIP's deceptive success is exact.
+            expected_status = (fields == ['zip', '0'] if extension == 'zip' else
+                               len(fields) == 2 and fields[0] == 'tar' and
+                               fields[1].isdigit() and int(fields[1]) != 0)
+            archives = list((case / 'artifacts').rglob('*.' + extension))
+            partial = len(archives) == 1 and 'helper' not in archive_members(archives[0])
+            check(label + ': real archiver leaves a readable partial archive with its genuine exit status',
+                  expected_status and partial)
+
+for fault in ('collection-mutation', 'collection-missing', 'archive-extra',
+              'archive-include-mutation', 'archive-data-mutation'):
+    context = prepare(fault, 'zip')
+    refused(context, fault, build(context, fault, fault))
+    check(fault + ': fault reached actual native collection or archiving',
+          (context[0] / (fault + '.fault-observed')).exists())
+
+context = prepare('occupied-output', 'zip', naming='occupied.zip')
+refused(context, 'occupied-output', build(context, 'occupied-output', 'occupied-output'))
+occupant = json.loads((context[0] / 'occupied-output.occupant.json').read_text())
+retained = Path(occupant['path'])
+check('occupied output: existing bytes and inode survive refusal before archiver execution',
+      (retained.stat().st_dev, retained.stat().st_ino, hashlib.sha256(retained.read_bytes()).hexdigest()) ==
+      (occupant['device'], occupant['inode'], occupant['sha256']) and
+      not (context[0] / 'occupied-output.archiver-status').exists())
+
+context = prepare('unknown-format', 'rar')
+refused(context, 'unknown-format', build(context, 'unknown-format'))
+
+# The search path contains actual executable tools but no zip executable.
+# This checks a missing dependency without pretending a failing zip is absent.
+without_zip = work / 'path-without-zip'
+without_zip.mkdir()
+for directory in os.environ['PATH'].split(os.pathsep):
+    if not directory or not Path(directory).is_dir():
+        continue
+    for entry in Path(directory).iterdir():
+        destination = without_zip / entry.name
+        if entry.name != 'zip' and not destination.exists() and not destination.is_symlink() and entry.is_file() and os.access(entry, os.X_OK):
+            destination.symlink_to(entry.resolve())
+context = prepare('missing-zip', 'zip')
+refused(context, 'missing-zip', build(context, 'missing-zip', 'missing-zip', path=str(without_zip)))
+check('missing zip: dependency absence is observed on the actual search path',
+      (context[0] / 'missing-zip.fault-observed').exists())
+
+# Real workers persist the receipts used by resume. A later failed or successful
+# retry must not mutate the earlier success, and failed archives never enter it.
+context = prepare('worker-retry', 'zip')
+first = accepted(context, 'first', build(context, 'first', operation='worker'))
+case = context[0]
+first_paths = [Path(row['path']) for row in first.get('resume_artifacts', [])]
+first_paths.append(case / 'first.result.json')
+if first.get('log_file'):
+    first_paths.append(Path(first['log_file']))
+before = snapshot(first_paths)
+failed = refused(context, 'failed', build(context, 'failed', 'archive-missing', operation='worker', attempt=2))
+third = accepted(context, 'retry', build(context, 'retry', operation='worker', attempt=3))
+check('worker retry: persisted failure and both successes represent genuine execution attempts',
+      (case / 'build-events').read_text().splitlines() == ['first', 'failed', 'retry'] and
+      not failed.get('resume_artifacts') and bool(first.get('resume_artifacts')) and bool(third.get('resume_artifacts')))
+check('worker retry: actual worker receipts retain release purpose and scheduled target identity',
+      all(row.get('build_purpose') == 'release' and row.get('publishable') is True and
+          row.get('task_key') == 'linux/amd64' and row.get('platform') == 'linux/amd64' and
+          row.get('host') == 'fixture' and row.get('method') == 'native' for row in (first, failed, third)))
+check('worker retry: prior archive, log and receipt bytes remain immutable',
+      snapshot(first_paths) == before and first.get('artifact_paths') != third.get('artifact_paths') and
+      invoke(context, 'available', 'first').returncode == 0 and invoke(context, 'available', 'retry').returncode == 0)
+
+inventory = {'tool': 'workspace', 'version': '1.0.0', 'run_id': run_id, 'git_sha': context[3],
+             'git_ref': 'v1.0.0', 'status': 'success', 'summary': {'total': 1, 'success': 1, 'failed': 0},
+             'duration_seconds': 0, 'targets': [first]}
+inventory_file = case / 'inventory.json'
+save(inventory_file, inventory)
+manifest = case / 'manifest.json'
+generated = invoke(context, 'manifest', 'publication', DSR_WS_RESULT=str(inventory_file), DSR_WS_MANIFEST=str(manifest))
+rows = json.loads(manifest.read_text()).get('artifacts', []) if generated.returncode == 0 else []
+check('publication: complete retained archive reaches the real manifest with its original hash and target',
+      generated.returncode == 0 and len(rows) == 1 and rows[0].get('target') == 'linux/amd64' and
+      rows[0].get('sha256') == first.get('collected_sha256'))
+
+failure_inventory = dict(inventory, targets=[failed])
+if failed.get('status') != 'success':
+    failure_inventory.update(status='failed', summary={'total': 1, 'success': 0, 'failed': 1})
+failure_file = case / 'failed-inventory.json'
+save(failure_file, failure_inventory)
+failure_manifest = case / 'failed-manifest.json'
+rejected = invoke(context, 'manifest', 'failed-publication', DSR_WS_RESULT=str(failure_file),
+                  DSR_WS_MANIFEST=str(failure_manifest))
+check('publication: incomplete worker output contributes no release artifact to the real manifest',
+      rejected.returncode != 0 or not json.loads(failure_manifest.read_text()).get('artifacts'))
+
+if third.get('artifact_paths'):
+    archive = Path(third['artifact_paths'][0])
+    with archive.open('ab') as stream:
+        stream.write(b'changed after worker completion\n')
+    check('resume: changed archive bytes cannot replace the frozen completed attempt',
+          invoke(context, 'available', 'retry').returncode != 0)
+
+context = prepare('unhealthy', 'zip')
+code, result, _ = build(context, 'unhealthy', 'unhealthy')
+check('readiness: explicit host refusal remains code 4 without any build or collection attempt',
+      code == 4 and result.get('stage') == 'host_readiness' and result.get('exit_code') == 4 and
+      not (context[0] / 'build-events').exists() and not (context[0] / 'artifacts').exists())
+
+print('Native workspace archives: %d checks, %d failures' % (checks, failures), flush=True)
+raise SystemExit(1 if failures else 0)
+PY
+}
+
+if [[ "${1:-}" == --workspace-archives-only ]]; then
+    test_native_workspace_archives
     exit $?
 fi
 

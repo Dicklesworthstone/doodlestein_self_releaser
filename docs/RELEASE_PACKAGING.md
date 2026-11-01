@@ -118,6 +118,38 @@ The cases cover gzip and ZIP companions, conversion, preserved prebuilt bytes,
 raw binaries, compiler variant selection, reserved-name collisions and unusable primaries. They do not
 claim native compiler, GNU/musl ABI or remote-host qualification.
 
+## Complete native workspace archives
+
+A native workspace build succeeds only after its ZIP, tar.gz or tar.xz archive
+contains every configured workspace binary, `workspace_archive_files` entry and
+enabled include file, with no unexpected members. The runner records each
+collected or staged member's bytes and permissions before packaging, then checks
+the actual archive against those records. Nested include paths and empty include
+files remain valid. Ordinary builds use their working-tree includes; strict
+release builds retain the additional checks against the selected Git commit.
+
+Archive creation reserves a fresh output file and checks the compressor's exit
+status, the complete member inventory, each member's bytes and mode, and the
+final archive receipt. A missing tool, incomplete collection, partial archive or
+changed member fails the target with exit code `7`. Raw binaries and partial
+archives are not returned as successful substitutes. Retained files from a
+failed attempt remain diagnostic evidence, and retries use a separate attempt
+directory so they cannot overwrite an earlier completed archive or its resume
+receipt.
+
+Script payloads are supported for ordinary noncompiled workspaces. Rust and Go
+payloads still undergo native target validation, and strict release callers
+retain their architecture checks.
+
+Run `bash scripts/tests/test_act_runner_native.sh --workspace-archives-only`
+for this boundary. It executes the production native build and collection path
+with local shell builds and real ZIP and tar tools. Faults include archivers
+that leave readable but incomplete output, changed collected members, failed
+collection and unavailable output paths. The test also checks failed-result
+resume refusal and preservation of completed bytes across retries. Host
+readiness and slot admission are controlled; this test does not qualify a remote
+host or a compiler toolchain.
+
 ## Describe and execute
 
 ```bash
