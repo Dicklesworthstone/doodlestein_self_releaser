@@ -8,6 +8,7 @@ for tool in python3 bash jq flock timeout sha256sum; do
 done
 [[ "$(uname -s)" == Linux ]] || { printf 'SKIP requires Linux\n'; exit 0; }
 python3 - "$ROOT" <<'PY'
+import fcntl
 import hashlib
 import json
 import os
@@ -23,6 +24,7 @@ root = Path(sys.argv[1])
 # The native entry point is replaced below by native.py; this policy applies
 # only to that installation's process fixtures, never to an actual compiler.
 fixture_env = dict(os.environ, RCH_REQUIRE_REMOTE='0')
+fixture_env.pop('DSR_IMPORT_MUTATION_PATH', None)
 work = Path(tempfile.mkdtemp(prefix='dsr-native-resume-test-'))
 passes = 0
 
@@ -56,7 +58,7 @@ try:
         shutil.copyfile(root / 'src' / name, repo / 'src' / name)
     (repo / 'dsr').write_text('#!/usr/bin/env bash\nexec python3 "$(dirname "$0")/native.py" "$@"\n')
     (repo / 'native.py').write_text(r'''
-import hashlib, json, os, subprocess, sys, uuid
+import hashlib, json, os, signal, subprocess, sys, time, uuid
 from pathlib import Path
 args = sys.argv[1:]
 assert args[:3] == ['--json', '--non-interactive', 'build']
@@ -68,6 +70,8 @@ assert os.environ['DSR_REPOS_FILE'] == str(cfg / 'repos.yaml')
 assert os.environ['DSR_HOSTS_FILE'] == str(cfg / 'hosts.yaml')
 spec = json.loads((cfg / 'config.yaml').read_text())
 mode = Path(spec['control']).read_text().strip()
+if mode == 'stubborn':
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
 tool, version = arg('--tool'), arg('--version')
 targets = arg('--targets').split(',')
 output = Path(arg('--output-dir'))
@@ -119,8 +123,17 @@ for number, target in enumerate(targets):
     item = state['target_statuses'][target]
     if item['status'] == 'success':
         event('reuse', target=target); continue
-    if number == 1 and mode == 'slow':
-        child = subprocess.Popen(['sleep', '60'])
+    if number == 1 and mode in ('slow', 'stubborn'):
+        child = (subprocess.Popen([sys.executable, '-c',
+                 'import pathlib,signal,sys,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); '
+                 'pathlib.Path(sys.argv[1]).write_text("ready"); time.sleep(60)', spec['control'] + '.stubborn-ready'],
+                 start_new_session=True) if mode == 'stubborn' else subprocess.Popen(['sleep', '60']))
+        if mode == 'stubborn':
+            until = time.monotonic() + 5
+            while not Path(spec['control'] + '.stubborn-ready').exists():
+                if time.monotonic() >= until:
+                    sys.exit(124)
+                time.sleep(.01)
         Path(spec['control'] + '.pid').write_text(str(child.pid))
         event('sleep', child=child.pid)
         child.wait()
@@ -147,7 +160,56 @@ if mode == 'import-corrupt':
     # The command is successful, but the actual collector must refuse the
     # damaged payload. Recovery must retain its manifest pin, not compile anew.
     Path(state['target_statuses'][targets[0]]['path']).write_bytes(b'damaged transfer')
-print(json.dumps({'command':'build', 'status':'success', 'exit_code':0, 'details':{'manifest':str(manifest)}}))
+if mode != 'complete-hold-silent':
+    print(json.dumps({'command':'build', 'status':'success', 'exit_code':0, 'details':{'manifest':str(manifest)}}), flush=True)
+if mode == 'complete-hold-escaped':
+    lock_path = str(Path(spec['control']).parent / 'run/lock')
+    locks = []
+    for descriptor in Path('/proc/self/fd').iterdir():
+        try:
+            if os.readlink(descriptor) == lock_path:
+                locks.append(int(descriptor.name))
+        except FileNotFoundError:
+            pass
+    assert locks, 'fixture driver did not inherit the coordinator lock'
+    escaped = subprocess.Popen([sys.executable, '-c',
+        'import ctypes,pathlib,sys,time; ctypes.CDLL(None).prctl(15,bytes([255])+b"dsr-writer",0,0,0); '
+        'p=pathlib.Path(sys.argv[1]); pathlib.Path(str(p)+".ready").write_text("ready"); end=time.monotonic()+20; '
+        '\nwhile not p.exists() and time.monotonic()<end: time.sleep(.02)'
+        '\nif p.exists(): print("late stdout mutation",flush=True)',
+        spec['control'] + '.late'], start_new_session=True, pass_fds=tuple(locks))
+    until = time.monotonic() + 5
+    while not Path(spec['control'] + '.late.ready').exists():
+        if time.monotonic() >= until:
+            sys.exit(124)
+        time.sleep(.01)
+    Path(spec['control'] + '.escaped').write_text(str(escaped.pid))
+if mode.startswith('complete-hold'):
+    Path(spec['control'] + '.completed').write_text('ready\n')
+    until = time.monotonic() + 30
+    while not Path(spec['control'] + '.release').exists():
+        if time.monotonic() >= until:
+            sys.exit(124)
+        time.sleep(.03)
+    if mode == 'complete-hold-nonzero':
+        sys.exit(42)
+    if mode == 'complete-hold-killed':
+        os.kill(os.getpid(), 9)
+''')
+    # Keep actual shard import/admission intact; this explicit boundary fault
+    # changes observed command evidence only after a real import completes.
+    with (repo / 'src/release_bundle.sh').open('a') as stream:
+        stream.write(r'''
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    original_import=$(declare -f _rb_import)
+    eval "${original_import/_rb_import ()/_rb_test_original_import ()}"
+    _rb_import() {
+        _rb_test_original_import "$@" || return $?
+        if [[ -n "${DSR_IMPORT_MUTATION_PATH:-}" ]]; then
+            printf 'changed after real import\n' >> "$DSR_IMPORT_MUTATION_PATH"
+        fi
+    }
+fi
 ''')
     script = repo / 'src/release_builds.sh'
     def fixture(label, mode='partial', resume=True):
@@ -162,9 +224,9 @@ print(json.dumps({'command':'build', 'status':'success', 'exit_code':0, 'details
         write(case / 'plan.json', {'schema_version':1, 'repo':'owner/demo', 'tool':'demo', 'tag':'v1.2.3', 'source_sha':'a'*40,
                                   'required_targets':job['targets'], 'builds':[job]})
         return case
-    def invoke(case, expected=0):
+    def invoke(case, expected=0, extra_env=None):
         proc = subprocess.run(['bash', str(script), '--plan', str(case / 'plan.json'), '--output-dir', str(case / 'run')],
-                              env=fixture_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+                              env=dict(fixture_env, **(extra_env or {})), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
         if proc.returncode != expected:
             print(proc.stderr.decode(), file=sys.stderr)
             raise AssertionError(f'{case.name}: expected {expected}, got {proc.returncode}: {proc.stdout.decode()}')
@@ -182,6 +244,193 @@ print(json.dumps({'command':'build', 'status':'success', 'exit_code':0, 'details
         mutate()
         invoke(case, 1)
         check(message, events(case) == before and not (case / 'run/completed/native').exists())
+
+    # Kill the real coordinator before it can observe the native command's
+    # terminal status. Its child still owns the coordinator lock and finishes
+    # normally; a terminal checkpoint alone must never supply exit evidence.
+    def crash_before_completion(case):
+        with open(case / 'crash.stdout', 'wb') as out, open(case / 'crash.stderr', 'wb') as err:
+            process = subprocess.Popen(['bash', str(script), '--plan', str(case / 'plan.json'),
+                                        '--output-dir', str(case / 'run')], env=fixture_env,
+                                       stdout=out, stderr=err, start_new_session=True)
+            try:
+                until = time.monotonic() + 15
+                while time.monotonic() < until and not (case / 'control.completed').exists():
+                    if process.poll() is not None:
+                        break
+                    time.sleep(.03)
+                check(case.name + ': native targets complete before coordinator crash',
+                      (case / 'control.completed').exists() and read(checkpoint(case))['status'] == 'completed')
+                process.kill()
+                check(case.name + ': coordinator really dies before acknowledging completion',
+                      process.wait(timeout=5) == -signal.SIGKILL)
+                record = read(case / 'run/state.json')['jobs']['native']
+                check(case.name + ': crashed coordinator has no candidate or completed import',
+                      record['candidate'] is None and record['complete'] is None and
+                      record['attempts'][0]['status'] == 'running')
+            finally:
+                (case / 'control.release').write_text('finish\n')
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=10)
+            until = time.monotonic() + 15
+            lock_released = False
+            with (case / 'run/lock').open('rb') as lock:
+                while time.monotonic() < until:
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        time.sleep(.03)
+                    else:
+                        lock_released = True
+                        fcntl.flock(lock, fcntl.LOCK_UN)
+                        break
+            check(case.name + ': native command exits and releases its inherited lock', lock_released)
+
+    case = fixture('coordinator-completion-crash', mode='complete-hold')
+    crash_before_completion(case)
+    previous_events = events(case)
+    immutable = {p: p.read_bytes() for p in session(case).rglob('*') if p.is_file()}
+    result = invoke(case)
+    check('crashed completion recovers the same native attempt without compilation',
+          result['bundle']['status'] == 'verified' and events(case) == previous_events and
+          len(read(case / 'run/state.json')['jobs']['native']['attempts']) == 1)
+    check('completion recovery preserves prior command, logs, checkpoint and artifacts',
+          all(p.read_bytes() == contents for p, contents in immutable.items()))
+    invoke(case)
+    check('repeated completion recovery reuses the same admitted job',
+          events(case) == previous_events and len(read(case / 'run/state.json')['jobs']['native']['attempts']) == 1)
+
+    for mode in ('complete-hold-nonzero', 'complete-hold-killed', 'complete-hold-silent'):
+        case = fixture(mode, mode=mode)
+        crash_before_completion(case)
+        previous_events = events(case)
+        invoke(case, 1)
+        record = read(case / 'run/state.json')['jobs']['native']
+        check(mode + ': terminal native state cannot replace successful command evidence',
+              record['candidate'] is None and record['complete'] is None and events(case) == previous_events and
+              not (case / 'run/completed/native').exists())
+
+    for label, mutate in (
+        ('command', lambda c: write(session(c) / 'command.json', ['bash', '/different-driver'])),
+        ('inputs', lambda c: write(session(c) / 'inputs.json', {})),
+        ('stdout', lambda c: (session(c) / 'stdout.json').write_bytes((session(c) / 'stdout.json').read_bytes() + b'\n')),
+        ('stderr', lambda c: (session(c) / 'stderr.log').write_bytes(b'changed diagnostics\n')),
+        ('config', lambda c: overwrite(session(c) / 'config/config.yaml', '{}')),
+        ('manifest', lambda c: write(session(c) / 'output/demo-v1.2.3-manifest.json', {})),
+        ('checkpoint', lambda c: write(checkpoint(c), dict(read(checkpoint(c)), status='failed'))),
+        ('receipt', lambda c: write(session(c) / 'driver-exit.json', dict(read(session(c) / 'driver-exit.json'), unknown=True))),
+    ):
+        case = fixture('completion-drift-' + label, mode='complete-hold')
+        crash_before_completion(case)
+        previous_events = events(case)
+        mutate(case)
+        invoke(case, 1)
+        invoke(case, 1)
+        record = read(case / 'run/state.json')['jobs']['native']
+        check(label + ' drift keeps observed completion pinned and cannot trigger fresh compilation',
+              record['complete'] is None and record['candidate'] is None and events(case) == previous_events and
+              len(record['attempts']) == 1 and record['attempts'][0].get('completion_pending') is True)
+
+    for linked in (False, True):
+        case = fixture('completion-' + ('linked' if linked else 'missing') + '-receipt', mode='complete-hold')
+        crash_before_completion(case)
+        previous_events = events(case)
+        original = session(case) / 'driver-exit.json'
+        held = case / 'held-driver-exit.json'
+        original.rename(held)
+        if linked:
+            original.symlink_to(held)
+        invoke(case, 1)
+        record = read(case / 'run/state.json')['jobs']['native']
+        check(case.name + ': bare completed state cannot replace held original exit evidence',
+              record['complete'] is None and record['candidate'] is None and events(case) == previous_events)
+
+    case = fixture('completion-existing-observation', mode='complete-hold')
+    crash_before_completion(case)
+    write(session(case) / 'native-after.json', read(checkpoint(case)))
+    observed = (session(case) / 'native-after.json').read_bytes()
+    invoke(case)
+    check('recovery accepts an identical already-retained native observation without replacing it',
+          (session(case) / 'native-after.json').read_bytes() == observed and
+          len([e for e in events(case) if e['event'] == 'invoke']) == 1)
+
+    case = fixture('completion-import-mutation', mode='complete-hold')
+    crash_before_completion(case)
+    stderr = session(case) / 'stderr.log'
+    original_stderr, previous_events = stderr.read_bytes(), events(case)
+    invoke(case, 1, {'DSR_IMPORT_MUTATION_PATH': str(stderr)})
+    record = read(case / 'run/state.json')['jobs']['native']
+    check('evidence changed after real import cannot publish completed state',
+          (case / 'run/completed/native').is_dir() and record['complete'] is None and
+          record['candidate'] is not None and record['attempts'][0].get('completion_pending') is True)
+    invoke(case, 1)
+    check('existing import cannot bypass its rejected completion evidence on retry',
+          read(case / 'run/state.json')['jobs']['native']['complete'] is None and events(case) == previous_events)
+    original_output = session(case) / 'output'
+    held_output = case / 'offline-output'
+    original_output.rename(held_output)
+    invoke(case, 1)
+    check('offline original manifest cannot mask changed command logs',
+          read(case / 'run/state.json')['jobs']['native']['complete'] is None and events(case) == previous_events)
+    held_output.rename(original_output)
+    stderr.write_bytes(original_stderr)
+    manifest = original_output / 'demo-v1.2.3-manifest.json'
+    original_manifest = manifest.read_bytes()
+    manifest.write_text('{}')
+    invoke(case, 1)
+    check('retained import cannot mask a present but changed original manifest',
+          read(case / 'run/state.json')['jobs']['native']['complete'] is None and events(case) == previous_events)
+    manifest.write_bytes(original_manifest)
+    original_output.rename(held_output)
+    invoke(case)
+    check('restored command evidence recovers the verified offline import without recompilation',
+          events(case) == previous_events and len(read(case / 'run/state.json')['jobs']['native']['attempts']) == 1)
+
+    case = fixture('escaped-writer', mode='complete-hold-escaped')
+    try:
+        crash_before_completion(case)
+        pid = int((case / 'control.escaped').read_text())
+        probe = subprocess.run(['ps', '-p', str(pid), '-o', 'stat='], capture_output=True)
+        check('supervisor settles escaped stdout and lock holder before publishing receipt',
+              probe.returncode != 0 or probe.stdout.strip().startswith(b'Z'))
+        before = (session(case) / 'stdout.json').read_bytes()
+        (case / 'control.late').write_text('write\n')
+        invoke(case)
+        check('escaped writer cannot mutate admitted completion output',
+              (session(case) / 'stdout.json').read_bytes() == before and
+              len([e for e in events(case) if e['event'] == 'invoke']) == 1)
+    finally:
+        (case / 'control.late').write_text('finish\n')
+
+    case = fixture('stubborn-cancellation', mode='stubborn')
+    with open(case / 'cancel.stdout', 'wb') as out, open(case / 'cancel.stderr', 'wb') as err:
+        process = subprocess.Popen(['bash', str(script), '--plan', str(case / 'plan.json'),
+                                    '--output-dir', str(case / 'run')], env=fixture_env, stdout=out, stderr=err)
+        try:
+            until = time.monotonic() + 15
+            while time.monotonic() < until and not (case / 'control.pid').exists():
+                time.sleep(.03)
+            check('cancellation fixture starts an escaped signal-ignoring child', (case / 'control.pid').exists())
+            started = time.monotonic()
+            process.send_signal(signal.SIGTERM)
+            check('supervisor cancellation settles inside the coordinator grace',
+                  process.wait(timeout=7) == 5 and time.monotonic() - started < 6)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=10)
+    pid = int((case / 'control.pid').read_text())
+    probe = subprocess.run(['ps', '-p', str(pid), '-o', 'stat='], capture_output=True)
+    check('cancellation leaves no signal-ignoring escaped child', probe.returncode != 0 or probe.stdout.strip().startswith(b'Z'))
+    (case / 'control').write_text('good')
+    invoke(case)
+    check('cancelled supervisor retains the existing native partial-target resume',
+          len([e for e in events(case) if e['event'] == 'compile' and e['target'] == 'darwin/arm64']) == 1)
+    if os.environ.get('DSR_BUILD_COMPLETION_ONLY') == '1':
+        print(f'Native command completion recovery: {passes} passed, 0 failed', flush=True)
+        print('Retained fixtures: ' + str(work), flush=True)
+        sys.exit(0)
 
     case = fixture('resume')
     invoke(case, 1)
@@ -353,5 +602,8 @@ except Exception:
     print('Retained failing fixtures: '+str(work), file=sys.stderr)
     raise
 else:
-    shutil.rmtree(work)
+    if os.environ.get('DSR_TEST_KEEP_TMP') == '1':
+        print('Retained fixtures: ' + str(work), flush=True)
+    else:
+        shutil.rmtree(work)
 PY

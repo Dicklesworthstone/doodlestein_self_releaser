@@ -35,6 +35,10 @@ on:
       - scripts/tests/test_host_health.sh
       - scripts/tests/test_host_config_admission.sh
       - scripts/tests/test_release_resume.sh
+      - scripts/tests/test_release_builds.sh
+      - scripts/tests/test_release_builds_resume.sh
+      - scripts/tests/test_release_builds_recovery.sh
+      - scripts/tests/test_release_builds_admission.sh
       - scripts/tests/test_release_build_plan_variants.sh
       - scripts/tests/test_release_packaging.sh
       - scripts/tests/test_release_packaging_variants.sh
@@ -56,6 +60,44 @@ concurrency:
   group: release-regression-refs/heads/main
   cancel-in-progress: false
 jobs:
+  build-recovery:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install build recovery regression dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq python3 shellcheck util-linux coreutils procps
+          mkdir -p "$RUNNER_TEMP/build-recovery-evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/build-recovery-evidence/head.txt"
+      - name: Validate scheduling, durable completion, recovery and cancellation
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(src/release_builds.sh scripts/tests/test_release_builds.sh
+                 scripts/tests/test_release_builds_resume.sh scripts/tests/test_release_builds_recovery.sh
+                 scripts/tests/test_release_builds_admission.sh)
+          for source in "${files[@]}"; do
+            bash -n "$source"
+            shellcheck -S warning "$source"
+          done
+          for suite in release_builds release_builds_resume release_builds_recovery release_builds_admission; do
+            bash "scripts/tests/test_${suite}.sh" 2>&1 | tee "$RUNNER_TEMP/build-recovery-evidence/${suite}.log"
+          done
+          test -z "$(git status --porcelain)"
+      - name: Retain build recovery validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: build-recovery-evidence
+          path: ${{ runner.temp }}/build-recovery-evidence
+          retention-days: 7
+          if-no-files-found: error
   build-packaging-contracts:
     runs-on: ubuntu-24.04
     timeout-minutes: 15

@@ -206,6 +206,7 @@ release-run/
   plan.json                         # Frozen canonical input plan
   state.json                        # Job attempts and selected completion pins
   attempts/ID/000001/                # Command, private inputs, stdout/stderr, outputs
+    driver-exit.json                # Supervisor's durable observed command exit
   attempts/ID/000002/                # Failed retries never overwrite earlier attempts
   completed/ID/build-manifest.json   # Verified, pinned producer manifest
   completed/ID/artifacts/            # Copied, not hardlinked, accepted payloads
@@ -273,8 +274,9 @@ attempt, containing its selection and admission log. Continued corruption or a
 missing payload keeps the candidate selected and the job incomplete; another
 compiler is not started as a fallback. Repairing/transferring the originally
 selected bytes permits retry without repeating a completed build. A terminal
-native run with no coordinator candidate still requires inspection: this does
-not recover a driver exit that the coordinator never observed or acknowledged.
+native run without either an admitted candidate or the supervisor receipt
+described below still requires inspection. A completed checkpoint or
+success-shaped stdout alone never supplies proof of a successful command exit.
 
 This is native **target-level** resume, not a promise to reuse every failed
 compiler's intermediate cache or to continue a remote process after a network
@@ -283,6 +285,68 @@ selection, target retention, signal cancellation, interrupted import recovery,
 state/configuration drift and failure-boundary tests. Native compilation/SSH
 is an explicit command-boundary fixture; the
 coordinator and full bundle/SLSA modules run unchanged apart from this feature.
+
+### Recover a command after its coordinator dies
+
+Each newly executed native or xwin command has a local supervisor that owns its
+actual timed driver process. The supervisor retains the coordinator lock while
+the command runs, observes its real wait status, stops and reaps remaining local
+descendants, then writes an exclusive, fsynced `driver-exit.json` in that attempt.
+The receipt binds the original argv, plan/job/attempt identity, command and input
+documents, stdout and stderr bytes, selected manifest, and the native checkpoint
+when exact native resume is enabled. Its status comes from the actual child;
+JSON claiming success cannot replace a nonzero or signal exit.
+CLI cancellation still exits with interruption code `5`. When the supervisor
+observes a terminal signal, attempt history retains that actual normalized exit
+(for example, `143` for SIGTERM) as a failed attempt. `interrupted` identifies
+attempts for which no terminal driver evidence was observed.
+
+Killing only the coordinator therefore does not lose a successful command's
+completion. The supervisor can finish and retain the receipt independently.
+Another invocation remains locked out until the supervisor and its descendants
+release the inherited lock. Retrying the same plan checks that original attempt's
+receipt and unchanged evidence, repeats the existing native run, configuration,
+envelope, manifest and artifact admission checks, and imports the same manifest
+hash without starting another compiler. A previously written, identical
+`native-after.json` is retained; a conflicting observation is refused.
+
+Completion evidence is checked again around artifact import, before the job is
+recorded as completed. An interrupted import that already produced a retained
+directory cannot bypass these checks on retry. Changed command/input documents,
+logs, manifest, native checkpoint, frozen configuration or observed exit receipt
+leave the job incomplete. The original receipt stays selected; starting a fresh
+compiler cannot silently replace that evidence. Restoring the originally selected
+bytes permits recovery under the same checks. Admission retries retain separate
+`driver-admission-recovery-*` directories inside the original attempt.
+
+Once a candidate's complete shard has been atomically imported, its verified
+retained manifest can supply those same pinned bytes if the original compiler
+output directory goes offline before acknowledgement. The retained shard still
+passes full admission, and the original command, logs, configuration and exit
+receipt remain checked. A present but changed producer manifest cannot be
+replaced by this offline recovery path.
+
+Genuine nonzero driver exits retain the existing failed-job retry policy. Missing,
+linked or malformed exit receipts never authorize a terminal native checkpoint.
+A supervisor killed before writing its receipt can still leave a completed
+native run requiring inspection; this is not recovery from arbitrary loss of all
+local completion evidence or a distributed transaction. These receipts are local
+cooperating-writer custody, not cryptographic attestations of compilation.
+
+Cancellation forwards to the supervisor's distinct driver process group. A Linux
+subreaper also settles orphaned local writers, including a child that created a
+new session, before evidence is sealed. Only live owned children are signalled;
+no PID restored from persistent state is trusted. Cleanup stays inside the
+coordinator's existing five-second grace. Killing the coordinator deliberately
+with SIGKILL differs from requesting cancellation: its surviving supervisor can
+finish the selected command, while SIGTERM, SIGINT and HUP request cleanup.
+
+The native resume test also covers real coordinator SIGKILL, failed/signalled
+drivers, missing completion JSON, changed retained evidence, mutation after real
+artifact import, an escaped writer retaining stdout and the lock, and a
+signal-ignoring child during cancellation. Use `DSR_BUILD_COMPLETION_ONLY=1` to
+run just these completion controls. Compilation remains an explicit fixture;
+process supervision, wait statuses, custody, admission and recovery are real.
 
 ### Recover completed native and Windows cross-compilation
 
