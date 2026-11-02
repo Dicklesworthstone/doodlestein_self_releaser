@@ -277,6 +277,7 @@ _run_tests_parallel() {
     local tests=("$@")
     local max_jobs=$_PARALLEL
     local pids=()
+    local live_pids=() pid running_pids
     local result_files=()
     local tmpdir
     tmpdir=$(mktemp -d)
@@ -296,11 +297,26 @@ _run_tests_parallel() {
 
         i=$((i + 1))
 
-        # Wait if we've hit max parallel jobs
-        if [[ ${#pids[@]} -ge $max_jobs ]]; then
-            wait "${pids[0]}"
-            pids=("${pids[@]:1}")
-        fi
+        # Reuse whichever slot finishes, not necessarily the oldest PID.
+        # Keep the two bounds independent: each test retains its timeout,
+        # and no more than max_jobs test processes are admitted at once.
+        while [[ ${#pids[@]} -ge $max_jobs ]]; do
+            live_pids=()
+            running_pids=$(jobs -pr)
+            for pid in "${pids[@]}"; do
+                # The job table owns these children; PID liveness alone can
+                # mistake a recycled PID for a still-running test.
+                case $'\n'"$running_pids"$'\n' in
+                    *$'\n'"$pid"$'\n'*) live_pids+=("$pid") ;;
+                    *) wait "$pid" || true ;; # Result accounting is below.
+                esac
+            done
+            pids=()
+            if [[ ${#live_pids[@]} -gt 0 ]]; then
+                pids=("${live_pids[@]}")
+            fi
+            [[ ${#pids[@]} -lt $max_jobs ]] || sleep 0.05
+        done
     done
 
     # Wait for remaining jobs
