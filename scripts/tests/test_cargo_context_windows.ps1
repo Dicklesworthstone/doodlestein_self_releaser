@@ -437,6 +437,18 @@ try {
     Check 'managed Cargo home and RCH bypass values override differently cased configured selectors' (
         $context.Environment['CARGO_HOME'] -eq (Get-DsrCacheFullPath $privateHome) -and $context.Environment['RCH_DISABLED'] -eq '1' -and $context.Environment['RCH_CARGO_WRAPPER_BYPASS'] -eq '1')
     Check 'unconfigured ambient Rust selectors are removed from both operations' (-not $context.Environment.ContainsKey('RUSTFLAGS') -and -not $context.Environment.ContainsKey('RUSTC_WRAPPER'))
+    $gitEnvironment=New-DsrCargoContextEnvironment -CargoHome $privateHome -Environment ($baseEnvironment + @(
+        'git_config_nosystem=0','GIT_CONFIG_GLOBAL=untrusted.config',
+        'GIT_CONFIG_COUNT=2','GIT_CONFIG_KEY_1=core.symlinks','GIT_CONFIG_VALUE_1=true','GIT_DIR=untrusted.git'))
+    Check 'managed Git policy overrides caller configuration and removes extra selectors' (
+        $gitEnvironment.Environment['GIT_CONFIG_NOSYSTEM'] -ceq '1' -and
+        $gitEnvironment.Environment['GIT_CONFIG_GLOBAL'] -ceq 'NUL' -and
+        $gitEnvironment.Environment['GIT_CONFIG_COUNT'] -ceq '1' -and
+        $gitEnvironment.Environment['GIT_CONFIG_KEY_0'] -ceq 'core.symlinks' -and
+        $gitEnvironment.Environment['GIT_CONFIG_VALUE_0'] -ceq 'false' -and
+        -not $gitEnvironment.Environment.ContainsKey('GIT_CONFIG_KEY_1') -and
+        -not $gitEnvironment.Environment.ContainsKey('GIT_DIR'))
+    Check 'Git policy is included in context influence selection' (Test-DsrCargoContextEnvironmentName 'GIT_CONFIG_VALUE_0')
     # LINK prepends command arguments and _LINK_ appends them. Ambient values
     # must not enter either operation; explicitly configured values remain
     # supported and bound by the same context environment digest.

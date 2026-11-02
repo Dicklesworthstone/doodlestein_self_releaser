@@ -50,7 +50,7 @@ function ConvertTo-DsrCargoLiteralArgument {
 
 function Test-DsrCargoSanitizedEnvironmentName {
     param([string]$Name)
-    return $Name -match '^(CARGO_|RUST|XWIN_)' -or
+    return $Name -match '^(CARGO_|RUST|XWIN_|GIT_)' -or
         $Name -match '^DSR_RELEASE_GIT_(SHA|REF)$' -or
         $Name -match '^(LINK|_LINK_)$' -or
         $Name -match '^(CC|CXX|CPP|AR|RANLIB|LD|NM|OBJCOPY|STRIP|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|BINDGEN_EXTRA_CLANG_ARGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET|IPHONEOS_DEPLOYMENT_TARGET|INCLUDE|LIB|LIBPATH)(_|$)' -or
@@ -985,10 +985,19 @@ function New-DsrCargoContextEnvironment {
         if ($assignment -notmatch '^([A-Za-z_][A-Za-z0-9_]*)=([^\x00\r\n]*)$') { throw 'Invalid configured Windows Cargo environment assignment' }
         $name = $Matches[1]; $value = $Matches[2]
         # Managed values win and are not additional configured influences.
-        if ($name -in @('CARGO_HOME','RCH_DISABLED','RCH_CARGO_WRAPPER_BYPASS')) { continue }
+        if ($name -in @('CARGO_HOME','RCH_DISABLED','RCH_CARGO_WRAPPER_BYPASS') -or $name -match '^GIT_') { continue }
         $effective[$name] = $value; $null = $configured.Add($name.ToUpperInvariant())
     }
     $effective['CARGO_HOME'] = $CargoHome
+    # Cargo's native Git checkout must agree with the source authenticator:
+    # Windows links are inert locked-blob bytes, never followed reparse points.
+    # Ignore ambient system/global Git policy without changing the host config.
+    # GIT_ keys participate in the context fingerprint above.
+    $effective['GIT_CONFIG_NOSYSTEM'] = '1'
+    $effective['GIT_CONFIG_GLOBAL'] = 'NUL'
+    $effective['GIT_CONFIG_COUNT'] = '1'
+    $effective['GIT_CONFIG_KEY_0'] = 'core.symlinks'
+    $effective['GIT_CONFIG_VALUE_0'] = 'false'
     $effective['RCH_DISABLED'] = '1'; $effective['RCH_CARGO_WRAPPER_BYPASS'] = '1'
     return @{Environment=$effective; ConfiguredNames=@($configured)}
 }
