@@ -15,9 +15,11 @@ import sys
 import tempfile
 import tarfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 MODULE = os.environ.get('DSR_TEST_CARGO_CACHE_MODULE', sys.argv.pop(1))
+ACT_RUNNER = os.environ.get('DSR_TEST_ACT_RUNNER', str(Path(MODULE).with_name('act_runner.sh')))
 
 
 class PrivateCacheTests(unittest.TestCase):
@@ -515,6 +517,183 @@ class LockedCacheTests(unittest.TestCase):
         database = self.source / ('git/db/' + name)
         self.git('clone', '-q', '--bare', '--no-hardlinks', work, database)
         return database, sha
+
+    def submodule_checkout(self):
+        checkout = self.source / 'git/checkouts/selected-submodule/abcdef0'
+        child = checkout / 'deps/child'
+        for tree in (checkout, child):
+            self.git('init', '-q', '-b', 'main', tree)
+            (tree / 'LICENSE').write_text('reviewed license\n')
+            (tree / 'crate').mkdir()
+            (tree / 'crate/LICENSE').symlink_to('../LICENSE')
+            (tree / 'lib.rs').write_text('pub fn value() -> u32 { 42 }\n')
+        (checkout / 'Cargo.toml').write_text('[package]\nname="helper"\nversion="1.0.0"\n')
+        for tree in (child, checkout):
+            self.git('-C', tree, 'add', '.')
+            self.git('-C', tree, '-c', 'user.name=DSR Test', '-c', 'user.email=dsr@example.invalid',
+                     'commit', '-qm', 'locked submodule with file links')
+        sha = self.git('-C', checkout, 'rev-parse', 'HEAD')
+        database = self.source / 'git/db/selected-submodule'
+        self.git('clone', '-q', '--bare', '--no-hardlinks', checkout, database)
+        self.write_lock([{'name': 'helper', 'version': '1.0.0', 'source': 'git+https://example.invalid/helper#' + sha}])
+        return checkout, child
+
+    def assert_submodule_link_seed(self, relocated=False):
+        checkout, child = self.submodule_checkout()
+        if relocated:
+            (self.source / 'git').rename(self.root / 'relocated git')
+            (self.source / 'git').symlink_to('../relocated git', target_is_directory=True)
+        result = self.scoped()
+        evidence = json.loads(Path(result['receipt_path']).read_bytes())
+        for tree in (checkout, child):
+            copied = self.copied(tree)
+            self.assertEqual(os.readlink(copied / 'crate/LICENSE'), '../LICENSE')
+            self.assertEqual((copied / 'crate/LICENSE').read_text(), 'reviewed license\n')
+            self.assertTrue((copied / '.git/objects').is_dir())
+            self.assertNotEqual((copied / 'LICENSE').stat().st_ino, (tree / 'LICENSE').stat().st_ino)
+            row = next(row for row in evidence['inventory']['files']
+                       if row['path'] == str((tree / 'crate/LICENSE').relative_to(self.source)))
+            self.assertTrue(row['symlink'])
+            self.assertEqual(row['sha256'], hashlib.sha256(b'../LICENSE').hexdigest())
+            self.assertEqual(row['size_bytes'], len(b'../LICENSE'))
+        self.assertFalse((self.home / 'git').is_symlink())
+        # Strict admission copies the prepared seed into another private home.
+        second = self.root / 'second private home'
+        copied_seed = self.scoped(source=self.home, home=second)
+        self.assertEqual(json.loads(Path(copied_seed['receipt_path']).read_bytes())['inventory'], evidence['inventory'])
+        (checkout / 'LICENSE').write_text('changed ambient license\n')
+        self.assertEqual((self.copied(checkout) / 'crate/LICENSE').read_text(), 'reviewed license\n')
+        self.source.rename(self.root / 'retained ambient')
+        self.invoke('verify', self.home, result['receipt_path'])
+        self.invoke('verify', second, copied_seed['receipt_path'])
+
+    @unittest.skipUnless(shutil.which('git'), 'Git not installed')
+    def test_locked_submodule_seed_preserves_confined_file_link_text(self):
+        self.assert_submodule_link_seed()
+
+    @unittest.skipUnless(shutil.which('git'), 'Git not installed')
+    def test_locked_submodule_file_links_survive_relocated_git_root(self):
+        self.assert_submodule_link_seed(relocated=True)
+
+    @unittest.skipUnless(shutil.which('git'), 'Git not installed')
+    def test_locked_submodule_seed_refuses_unsafe_links(self):
+        checkout, _ = self.submodule_checkout()
+        link = checkout / 'crate/LICENSE'
+        cases = {'absolute': str(checkout / 'LICENSE'), 'escape': '../../../../../outside',
+                 'admin': '../.git/HEAD', 'admin-case': '../.GiT/HEAD',
+                 'directory': '..', 'cycle': 'LICENSE', 'dangling': '../missing',
+                 'backslash': '..\\LICENSE', 'control': '../LICENSE\n'}
+        for label, target in cases.items():
+            with self.subTest(label=label):
+                link.rename(self.root / ('retained-link-' + label))
+                link.symlink_to(target)
+                destination = self.root / ('refused-' + label)
+                self.scoped(7, home=destination)
+                self.assertFalse(destination.exists())
+
+    @unittest.skipUnless(shutil.which('git'), 'Git not installed')
+    def test_locked_submodule_seed_refuses_linked_administration_and_special_files(self):
+        checkout, _ = self.submodule_checkout()
+        admin = checkout / '.git/linked-license'
+        admin.symlink_to('../LICENSE')
+        self.scoped(7)
+        self.assertFalse(self.home.exists())
+        admin.rename(self.root / 'retained-admin-link')
+        os.mkfifo(checkout / 'special')
+        self.scoped(7)
+        self.assertFalse(self.home.exists())
+
+    @unittest.skipUnless(shutil.which('git'), 'Git not installed')
+    def test_selected_checkout_link_replacement_during_read_is_refused(self):
+        self.submodule_checkout()
+        import ast
+        code = Path(MODULE).read_text().split("<<'PY'\n", 1)[1].rsplit('\nPY\n', 1)[0]
+        definitions = ast.parse(code)
+        definitions.body = [node for node in definitions.body if isinstance(
+            node, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.ClassDef))]
+        namespace = {}
+        exec(compile(definitions, MODULE, 'exec'), namespace)
+        original = os.readlink
+        changed = []
+
+        def replace_after_read(path, **kwargs):
+            result = original(path, **kwargs)
+            if path == 'LICENSE' and not changed:
+                parent = kwargs['dir_fd']
+                os.rename(path, 'retained-link', src_dir_fd=parent, dst_dir_fd=parent)
+                os.symlink('../lib.rs', path, dir_fd=parent)
+                changed.append(True)
+            return result
+
+        with patch.object(os, 'readlink', replace_after_read):
+            with self.assertRaisesRegex(namespace['Failure'], 'checkout link changed while reading'):
+                namespace['main'](['snapshot', str(self.source), str(self.home), str(self.lock)])
+        self.assertTrue(changed)
+        self.assertFalse(self.home.exists())
+
+    @unittest.skipUnless(shutil.which('cargo') and shutil.which('rustc') and shutil.which('git'),
+                         'real Cargo/rustc/Git unavailable; submodule consumption requires genuine tools')
+    def test_real_cargo_build_uses_seeded_submodule_file_links_offline(self):
+        # Both repositories are local file:// inputs. The compiler must read
+        # nested submodule bytes and both committed license links after every
+        # original repository and the ambient Cargo home have moved away.
+        child = self.root / 'child-upstream'
+        upstream = self.root / 'parent-upstream'
+        for tree in (child, upstream):
+            self.git('init', '-q', '-b', 'main', tree)
+            (tree / 'LICENSE').write_text('reviewed license\n')
+            (tree / 'crate').mkdir()
+            (tree / 'crate/LICENSE').symlink_to('../LICENSE')
+        (child / 'value.rs').write_text(
+            'pub fn value() -> u32 { assert_eq!(include_str!("crate/LICENSE"), "reviewed license\\n"); 42 }\n')
+        self.git('-C', child, 'add', '.')
+        self.git('-C', child, '-c', 'user.name=DSR Test', '-c', 'user.email=dsr@example.invalid',
+                 'commit', '-qm', 'local nested source')
+        (upstream / 'Cargo.toml').write_text(
+            '[package]\nname="seed-dependency"\nversion="1.0.0"\nedition="2021"\n[lib]\npath="lib.rs"\n')
+        (upstream / 'lib.rs').write_text(
+            'include!("deps/child/value.rs");\n'
+            'pub fn answer() -> u32 { assert_eq!(include_str!("crate/LICENSE"), "reviewed license\\n"); value() }\n')
+        self.git('-C', upstream, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q',
+                 child.as_uri(), 'deps/child')
+        self.git('-C', upstream, 'add', '.')
+        self.git('-C', upstream, '-c', 'user.name=DSR Test', '-c', 'user.email=dsr@example.invalid',
+                 'commit', '-qm', 'local parent with linked submodule sources')
+        revision = self.git('-C', upstream, 'rev-parse', 'HEAD')
+        project = self.root / 'submodule-consumer'
+        (project / 'src').mkdir(parents=True)
+        (project / 'Cargo.toml').write_text(
+            '[package]\nname="seed-consumer"\nversion="1.0.0"\nedition="2021"\n[dependencies]\n'
+            'seed-dependency={git=' + json.dumps(upstream.as_uri()) + ',rev=' + json.dumps(revision) + '}\n')
+        (project / 'src/main.rs').write_text('fn main() { println!("{}", seed_dependency::answer()); }\n')
+        ambient = self.root / 'submodule-cargo-home'
+        ambient.mkdir()
+        env = {k: v for k, v in os.environ.items() if not k.startswith(('CARGO_', 'RUST', 'GIT_'))}
+        env.update(CARGO_HOME=str(ambient), CARGO_TARGET_DIR=str(self.root / 'submodule-target'),
+                   RUSTUP_AUTO_INSTALL='0', GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
+        for name in ('RUSTUP_HOME', 'RUSTUP_TOOLCHAIN'):
+            if name in os.environ:
+                env[name] = os.environ[name]
+        fetched = subprocess.run(['cargo', 'fetch'], cwd=project, env=env, capture_output=True, timeout=90)
+        self.assertEqual(fetched.returncode, 0, fetched.stderr.decode())
+        self.lock = project / 'Cargo.lock'
+        home = self.root / 'submodule-private-home'
+        seed = self.scoped(source=ambient, home=home)
+        checkout = next((home / 'git/checkouts').glob('*/*/Cargo.toml')).parent
+        self.assertEqual(os.readlink(checkout / 'crate/LICENSE'), '../LICENSE')
+        self.assertEqual(os.readlink(checkout / 'deps/child/crate/LICENSE'), '../LICENSE')
+        self.assertTrue((checkout / 'deps/child/.git/objects').is_dir())
+        self.invoke('verify', home, seed['receipt_path'])
+        ambient.rename(self.root / 'retained-cargo-home')
+        upstream.rename(self.root / 'retained-parent-upstream')
+        child.rename(self.root / 'retained-child-upstream')
+        env['CARGO_HOME'] = str(home)
+        built = subprocess.run(['cargo', 'run', '--locked', '--offline', '--quiet'],
+                               cwd=project, env=env, capture_output=True, timeout=90)
+        self.assertEqual(built.returncode, 0, built.stderr.decode())
+        self.assertEqual(built.stdout.strip(), b'42')
+        final = self.invoke('inventory', home, self.root / 'submodule-final.json')
+        self.invoke('verify', home, final['receipt_path'])
 
     @unittest.skipUnless(shutil.which('git'), 'Git not installed')
     def test_only_locked_git_database_is_copied_and_can_recreate_checkout(self):
@@ -1134,6 +1313,422 @@ class UnscopedRegistrySeedTests(unittest.TestCase):
         final = self.invoke('inventory', home, self.root / 'registry-final.json')
         self.invoke('verify', home, final['receipt_path'])
         self.assertEqual(json.loads(Path(seed['receipt_path']).read_bytes())['kind'], 'private-copy')
+
+
+class PrivateCargoHomeGeneratorTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='dsr-cargo-generator-test.')
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+
+    git = LockedCacheTests.git
+
+    def shell(self, function, *args, env=None):
+        # Execute the actual emitted program locally with closed worker stdin.
+        # Transport is the only adapter; cache and source admission remain real.
+        program = r'''
+source "$1" || exit $?
+shift
+_act_ssh_exec() { bash -s <<< $'{\n'"$2"$'\n} </dev/null'; }
+"$@"
+'''
+        return subprocess.run(['bash', '-c', program, '_', ACT_RUNNER, function,
+                               *map(str, args)], env=env, text=True,
+                              capture_output=True, timeout=90)
+
+    def test_both_generators_preserve_underscore_attempt_suffixes(self):
+        suffixes = ('linux-amd64-0123456789abcdef0123456789abcdef',
+                    'linux-musl_amd64-0123456789abcdef0123456789abcdef',
+                    'windows-arm64_ec-0123456789abcdef0123456789abcdef',
+                    'a_', 'Z9')
+        for backend, root in (('unix', '/tmp/source'), ('windows', 'C:/fixture/source')):
+            for suffix in suffixes:
+                with self.subTest(backend=backend, suffix=suffix):
+                    result = self.shell('_act_' + backend + '_private_cargo_home_script', root, suffix)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stderr, '')
+                    self.assertIn('.cargo-home-' + suffix, result.stdout)
+                    if '_' in suffix:
+                        self.assertNotIn('.cargo-home-' + suffix.replace('_', '-'), result.stdout)
+
+    def test_windows_generator_keeps_backslash_root_normalization(self):
+        result = self.shell('_act_windows_private_cargo_home_script',
+                            r'C:\fixture\source', 'attempt_native')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Open-DsrCachePathGuard 'C:/fixture/source'", result.stdout)
+        self.assertIn("'.cargo-home-attempt_native'", result.stdout)
+
+    def unicode_collation_locale(self):
+        if not shutil.which('locale'):
+            self.skipTest('locale inventory unavailable')
+        result = subprocess.run(['locale', '-a'], env=dict(os.environ, LC_ALL='C'),
+                                text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in result.stdout.splitlines():
+            if name.lower().replace('-', '') == 'en_us.utf8':
+                return name
+        self.skipTest('en_US UTF-8 locale unavailable; non-C collation regression requires it')
+
+    def test_both_generators_keep_ascii_path_contract_under_unicode_collation(self):
+        # libc collation can make Bash's [A-Za-z] ranges accept accented and
+        # fullwidth letters. Test the actual generators in that locale, with
+        # the supported underscore suffix as a positive control.
+        env = dict(os.environ, LC_ALL=self.unicode_collation_locale())
+        suffix = 'linux-musl_amd64-0123456789abcdef0123456789abcdef'
+        for backend, root in (('unix', '/tmp/source'), ('windows', 'C:/fixture/source')):
+            function = '_act_' + backend + '_private_cargo_home_script'
+            result = self.shell(function, root, suffix, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('.cargo-home-' + suffix, result.stdout)
+            self.assertEqual(result.stderr, '')
+            for invalid in ('attempt_é', 'attempt_K', 'attempt_Ａ'):
+                with self.subTest(backend=backend, suffix=invalid):
+                    result = self.shell(function, root, invalid, env=env)
+                    self.assertEqual(result.returncode, 4, result.stderr)
+                    self.assertEqual(result.stdout, '')
+                    self.assertIn('Cargo attempt suffix', result.stderr)
+            for invalid in (root + '/caché', root + '/K', root + '/Ａ'):
+                with self.subTest(backend=backend, root=invalid):
+                    result = self.shell(function, invalid, suffix, env=env)
+                    self.assertEqual(result.returncode, 4, result.stderr)
+                    self.assertEqual(result.stdout, '')
+                    self.assertIn('Cargo source root', result.stderr)
+
+    def test_both_generators_preserve_caller_locale_on_success_and_refusal(self):
+        language = self.unicode_collation_locale()
+        program = r'''
+source "$1" || exit $?
+shift
+status=0
+"$@" >/dev/null || status=$?
+printf '%s\n%s\n' "$status" "$LC_ALL"
+'''
+        for backend, root in (('unix', '/tmp/source'), ('windows', 'C:/fixture/source')):
+            for suffix, status in (('linux-musl_amd64-attempt', 0), ('../escape', 4)):
+                with self.subTest(backend=backend, suffix=suffix):
+                    result = subprocess.run(
+                        ['bash', '-c', program, '_', ACT_RUNNER,
+                         '_act_' + backend + '_private_cargo_home_script', root, suffix],
+                        env=dict(os.environ, LC_ALL=language), text=True,
+                        capture_output=True, timeout=30)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.splitlines(), [str(status), language])
+
+    def test_both_generators_fail_closed_if_validation_locale_is_readonly(self):
+        program = r'''
+source "$1" || exit $?
+shift
+readonly LC_ALL
+"$@"
+'''
+        env = dict(os.environ, LC_ALL=self.unicode_collation_locale())
+        for backend, root in (('unix', '/tmp/source'), ('windows', 'C:/fixture/source')):
+            with self.subTest(backend=backend):
+                result = subprocess.run(
+                    ['bash', '-c', program, '_', ACT_RUNNER,
+                     '_act_' + backend + '_private_cargo_home_script', root, 'attempt_é'],
+                    env=env, text=True, capture_output=True, timeout=30)
+                self.assertEqual(result.returncode, 4, result.stderr)
+                self.assertEqual(result.stdout, '')
+                self.assertIn('ASCII validation locale', result.stderr)
+
+    def test_both_generators_refuse_unsafe_suffixes_before_emitting_programs(self):
+        suffixes = ('', 'a', '_leading', '-leading', 'a/b', 'a\\b', '../attempt',
+                    'a..b', 'a b', 'a\tb', 'a\nb', 'a\rb', "a'b", 'a"b', 'a;b',
+                    'a$(id)', 'a`id`', 'a:b', 'a+b', 'a.b', 'a*', 'a?', 'a[0]',
+                    'a|b', 'a&b', 'aé')
+        for backend, root in (('unix', '/tmp/source'), ('windows', 'C:/fixture/source')):
+            for suffix in suffixes:
+                with self.subTest(backend=backend, suffix=suffix):
+                    result = self.shell('_act_' + backend + '_private_cargo_home_script', root, suffix)
+                    self.assertEqual(result.returncode, 4, result.stderr)
+                    self.assertEqual(result.stdout, '')
+                    self.assertIn('Cargo attempt suffix', result.stderr)
+                    self.assertEqual(len(result.stderr.splitlines()), 1)
+
+    def test_both_generators_refuse_unsafe_roots_before_emitting_programs(self):
+        roots = {
+            'unix': ('relative/source', '/', '/tmp/../source', '/tmp/source name',
+                     "/tmp/source'", '/tmp/source$(id)', '/tmp/a\\b', '/tmp/source\nline'),
+            'windows': ('/tmp/source', 'C:source', 'C:/', 'C:/safe/../source',
+                        'C:/source name', "C:/source'", r'\\server\share\source',
+                        'C:/source\nline'),
+        }
+        for backend, candidates in roots.items():
+            for root in candidates:
+                with self.subTest(backend=backend, root=root):
+                    result = self.shell('_act_' + backend + '_private_cargo_home_script',
+                                        root, 'attempt_native')
+                    self.assertEqual(result.returncode, 4, result.stderr)
+                    self.assertEqual(result.stdout, '')
+                    self.assertIn('Cargo source root', result.stderr)
+                    self.assertEqual(len(result.stderr.splitlines()), 1)
+
+    def preparation_response(self, backend):
+        source = '/logical/snapshot/source' if backend == 'unix' else 'C:/snapshot/source'
+        parent = '/physical/snapshot' if backend == 'unix' else 'C:/snapshot'
+        home = parent + '/.cargo-home-linux-musl_amd64-0123456789abcdef0123456789abcdef'
+        sources = {'schema_version': 1, 'kind': 'dsr-cargo-dependency-sources', 'sha256': '1' * 64,
+                   'metadata_sha256': '2' * 64, 'package_count': 1, 'root_count': 1,
+                   'file_count': 1, 'size_bytes': 1,
+                   'authentication': {'lockfile_sha256': '3' * 64, 'locked_archive_packages': 0,
+                                      'locked_git_packages': 0, 'workspace_snapshot_packages': 1}}
+        summary = {'schema_version': 1, 'mode': 'private-copy', 'cargo_home': home,
+                   'receipt_path': home + '/.dsr-cache-seed.json', 'receipt_sha256': '4' * 64,
+                   'inventory_sha256': '5' * 64, 'dependency_sources': sources,
+                   'selection': {'kind': 'cargo-lock-downloads', 'lockfile_sha256': '3' * 64,
+                                 'registry_packages': 0, 'git_revisions': []}}
+        if backend == 'windows':
+            summary['cargo_context'] = {'schema_version': 1, 'fingerprint': '6' * 64,
+                                       'receipt_sha256': '7' * 64}
+            summary['toolchain'] = {'schema_version': 1, 'cwd': source,
+                'target_triple': 'x86_64-pc-windows-msvc',
+                'tools': {tool: {'program': tool, 'selected_path': 'C:/tools/' + tool + '.exe',
+                                'selected_sha256': '8' * 64, 'selected_kind': 'executable', 'version': 'fixture'}
+                          for tool in ('cargo', 'rustc', 'linker')},
+                'selection': {'rustup_toolchain': None, 'cargo_commands': ['build'], 'cargo_config': []}}
+        return source, summary
+
+    def controlled_prepare(self, backend, response, suffix=None, transport_status=0):
+        # Only the remote response and metadata/compiler execution are
+        # controlled. Keep the actual argument, generator and evidence gates.
+        # Native Windows execution remains in test_cargo_cache_windows.ps1.
+        program = r'''
+source "$1" || exit $?
+shift
+_act_unix_cargo_metadata_body() { :; }
+_act_windows_cargo_metadata_body() { :; }
+_act_windows_cache_command() { printf 'controlled-host-command'; }
+_act_ssh_exec() {
+    printf 'transport\n' >> "$DSR_ADMISSION_TRANSPORT"
+    [[ "$DSR_ADMISSION_TRANSPORT_EXIT" == 0 ]] || return "$DSR_ADMISSION_TRANSPORT_EXIT"
+    cat "$DSR_ADMISSION_RESPONSE"
+}
+"$@"
+'''
+        response_path = self.root / 'response.json'
+        response_path.write_text(response if isinstance(response, str) else json.dumps(response))
+        source, _ = self.preparation_response(backend)
+        env = dict(os.environ, DSR_ADMISSION_RESPONSE=str(response_path),
+                   DSR_ADMISSION_TRANSPORT=str(self.root / 'transport.log'),
+                   DSR_ADMISSION_TRANSPORT_EXIT=str(transport_status))
+        return subprocess.run(['bash', '-c', program, '_', ACT_RUNNER,
+                               '_act_prepare_' + backend + '_private_cargo_home', 'fixture', source,
+                               suffix if suffix is not None else
+                               'linux-musl_amd64-0123456789abcdef0123456789abcdef'],
+                              capture_output=True, text=True, timeout=30, env=env)
+
+    @unittest.skipUnless(shutil.which('jq'), 'jq unavailable')
+    def test_both_preparers_bind_reported_home_to_requested_attempt(self):
+        for backend in ('unix', 'windows'):
+            _, summary = self.preparation_response(backend)
+            result = self.controlled_prepare(backend, summary)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), summary)
+            # Legitimate Unix aliases can resolve to a different parent. The
+            # unique attempt leaf must still be exactly the requested one.
+            home = summary['cargo_home']
+            parent, name = home.rsplit('/', 1)
+            for wrong_home in (parent + '/.cargo-home', parent + '/.cargo-home-other-attempt',
+                               home + '/child', parent + '/../escape/' + name,
+                               parent + "/bad'path/" + name):
+                with self.subTest(backend=backend, home=wrong_home):
+                    wrong = dict(summary, cargo_home=wrong_home,
+                                 receipt_path=wrong_home + '/.dsr-cache-seed.json')
+                    result = self.controlled_prepare(backend, wrong)
+                    self.assertEqual(result.returncode, 4, result.stderr)
+                    self.assertEqual(result.stdout, '')
+                    self.assertIn('invalid private attempt evidence', result.stderr)
+
+    @unittest.skipUnless(shutil.which('jq'), 'jq unavailable')
+    def test_both_preparers_diagnose_malformed_or_unauthenticated_evidence(self):
+        for backend in ('unix', 'windows'):
+            _, summary = self.preparation_response(backend)
+            for payload in (json.dumps(summary) + '\n' + json.dumps(summary), '{}', 'not JSON'):
+                with self.subTest(backend=backend, payload=payload):
+                    result = self.controlled_prepare(backend, payload)
+                    self.assertEqual(result.returncode, 4, result.stderr)
+                    self.assertEqual(result.stdout, '')
+                    self.assertIn('Cargo cache preparation', result.stderr)
+            summary['dependency_sources']['metadata_sha256'] = 'invalid'
+            result = self.controlled_prepare(backend, summary)
+            self.assertEqual(result.returncode, 4, result.stderr)
+            self.assertEqual(result.stdout, '')
+            self.assertIn('invalid dependency-source evidence', result.stderr)
+        _, summary = self.preparation_response('windows')
+        summary['selection']['lockfile_sha256'] = '9' * 64
+        result = self.controlled_prepare('windows', summary)
+        self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertEqual(result.stdout, '')
+        self.assertIn('invalid lockfile selection evidence', result.stderr)
+        _, summary = self.preparation_response('windows')
+        summary['toolchain']['cwd'] = 'C:/unadmitted/source'
+        result = self.controlled_prepare('windows', summary)
+        self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertEqual(result.stdout, '')
+        self.assertIn('invalid toolchain evidence', result.stderr)
+
+    @unittest.skipUnless(shutil.which('jq'), 'jq unavailable')
+    def test_both_preparers_preserve_transport_failure_and_refuse_unsafe_inputs_locally(self):
+        for backend in ('unix', 'windows'):
+            _, summary = self.preparation_response(backend)
+            result = self.controlled_prepare(backend, summary, transport_status=19)
+            self.assertEqual(result.returncode, 19, result.stderr)
+            self.assertEqual(result.stdout, '')
+            self.assertIn('Cargo cache preparation failed', result.stderr)
+            self.assertIn('exit 19', result.stderr)
+            before = (self.root / 'transport.log').read_bytes()
+            result = self.controlled_prepare(backend, summary, suffix='../escape')
+            self.assertEqual(result.returncode, 4, result.stderr)
+            self.assertEqual(result.stdout, '')
+            self.assertIn('Cargo attempt suffix', result.stderr)
+            self.assertEqual((self.root / 'transport.log').read_bytes(), before)
+
+    @unittest.skipUnless(sys.version_info >= (3, 11), 'lock-selected downloads require Python 3.11+')
+    def test_unix_underscore_cache_custody_without_compilation(self):
+        # Deterministic selected download bytes, real generated cache copying,
+        # no metadata/compiler invocation. Cold attempts cannot publish a seed.
+        source = self.root / 'snapshot/source'
+        source.mkdir(parents=True)
+        ambient = self.root / 'ambient'
+        archive = ambient / 'registry/cache/fixture/dependency-1.0.0.crate'
+        archive.parent.mkdir(parents=True)
+        archive.write_bytes(b'locked download fixture\n')
+        lockfile = source / 'Cargo.lock'
+        lockfile.write_text('version = 4\n[[package]]\nname = "dependency"\nversion = "1.0.0"\n'
+                            'source = "registry+https://example.invalid/index"\nchecksum = "' +
+                            hashlib.sha256(archive.read_bytes()).hexdigest() + '"\n')
+        env = dict(os.environ, CARGO_HOME=str(ambient))
+
+        def prepare(suffix):
+            generated = self.shell('_act_unix_private_cargo_home_script', source, suffix)
+            self.assertEqual(generated.returncode, 0, generated.stderr)
+            return subprocess.run(['bash', '-s'], input=generated.stdout +
+                                  '\nprintf "%s\\n" "$dsr_private_summary"\n',
+                                  text=True, capture_output=True, timeout=30, env=env)
+
+        suffix = 'linux-musl_amd64-0123456789abcdef0123456789abcdef'
+        cold = prepare(suffix)
+        self.assertEqual(cold.returncode, 0, cold.stderr)
+        home = source.parent / ('.cargo-home-' + suffix)
+        copied_archive = home / archive.relative_to(ambient)
+        self.assertEqual(copied_archive.read_bytes(), archive.read_bytes())
+        self.assertNotEqual(copied_archive.stat().st_ino, archive.stat().st_ino)
+        self.assertEqual(home.stat().st_mode & 0o777, 0o700)
+        self.assertFalse((source.parent / '.cargo-home').exists())
+        marker = home / 'operator-evidence'
+        marker.write_bytes(b'preserve refused attempt\n')
+        collision = prepare(suffix)
+        self.assertNotEqual(collision.returncode, 0, collision.stderr)
+        self.assertEqual(collision.stdout, '')
+        self.assertEqual(marker.read_bytes(), b'preserve refused attempt\n')
+        self.assertEqual(copied_archive.read_bytes(), archive.read_bytes())
+        victim = self.root / 'victim'
+        victim.mkdir()
+        (victim / 'evidence').write_bytes(b'preserve symlink destination\n')
+        (source.parent / '.cargo-home-linked_attempt').symlink_to(victim, target_is_directory=True)
+        linked = prepare('linked_attempt')
+        self.assertNotEqual(linked.returncode, 0, linked.stderr)
+        self.assertEqual(linked.stdout, '')
+        self.assertEqual((victim / 'evidence').read_bytes(), b'preserve symlink destination\n')
+        self.assertEqual(len(list(victim.iterdir())), 1)
+        seed = source.parent / '.cargo-home'
+        seeded = subprocess.run(['bash', MODULE, 'snapshot', str(ambient), str(seed), str(lockfile)],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(seeded.returncode, 0, seeded.stderr)
+        seed_receipt = (seed / '.dsr-cache-seed.json').read_bytes()
+        seed_archive = seed / archive.relative_to(ambient)
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            attempts = list(workers.map(prepare, ('linux-musl_amd64-one', 'linux-musl-amd64-one')))
+        for result in attempts:
+            self.assertEqual(result.returncode, 0, result.stderr)
+        copies = [Path(json.loads(result.stdout)['cargo_home']) / archive.relative_to(ambient) for result in attempts]
+        copies[0].write_bytes(b'one attempt mutates its private bytes\n')
+        self.assertEqual(len({path.stat().st_ino for path in (*copies, seed_archive, archive)}), 4)
+        self.assertEqual(copies[1].read_bytes(), archive.read_bytes())
+        self.assertEqual(seed_archive.read_bytes(), archive.read_bytes())
+        self.assertEqual((seed / '.dsr-cache-seed.json').read_bytes(), seed_receipt)
+
+    @unittest.skipUnless(all(shutil.which(name) for name in ('cargo', 'rustc', 'git', 'jq')),
+                         'real Cargo/rustc/Git/jq unavailable; native cache use requires genuine tools')
+    def test_unix_underscore_attempts_prepare_reuse_seed_and_build_offline(self):
+        # This uses the exact reported internal suffix. The host compiler proves
+        # private-cache consumption, not musl ABI or native Windows qualification.
+        upstream = self.root / 'upstream'
+        self.git('init', '-q', '-b', 'main', upstream)
+        (upstream / 'src').mkdir()
+        (upstream / 'Cargo.toml').write_text(
+            '[package]\nname="suffix-dependency"\nversion="1.0.0"\nedition="2021"\n')
+        (upstream / 'src/lib.rs').write_text('pub fn answer() -> u32 { 42 }\n')
+        self.git('-C', upstream, 'add', '.')
+        self.git('-C', upstream, '-c', 'user.name=DSR Test',
+                 '-c', 'user.email=dsr@example.invalid', 'commit', '-qm', 'dependency')
+        revision = self.git('-C', upstream, 'rev-parse', 'HEAD')
+        source = self.root / 'snapshot/source'
+        (source / 'src').mkdir(parents=True)
+        (source / 'Cargo.toml').write_text(
+            '[package]\nname="suffix-consumer"\nversion="1.0.0"\nedition="2021"\n'
+            '[dependencies]\nsuffix-dependency={git=' + json.dumps(upstream.as_uri()) +
+            ',rev=' + json.dumps(revision) + '}\n')
+        (source / 'src/main.rs').write_text('fn main() { println!("{}", suffix_dependency::answer()); }\n')
+        ambient = self.root / 'real-cargo-home'
+        ambient.mkdir()
+        target = self.root / 'target'
+        env = {k: v for k, v in os.environ.items() if not k.startswith(('CARGO_', 'RUST', 'GIT_'))}
+        env.update(CARGO_HOME=str(ambient), CARGO_TARGET_DIR=str(target),
+                   RUSTUP_AUTO_INSTALL='0', GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
+        for name in ('RUSTUP_HOME', 'RUSTUP_TOOLCHAIN'):
+            if name in os.environ: env[name] = os.environ[name]
+        fetched = subprocess.run(['cargo', 'fetch'], cwd=source, env=env,
+                                 text=True, capture_output=True, timeout=90)
+        self.assertEqual(fetched.returncode, 0, fetched.stderr)
+        original_source = {path.relative_to(source): path.read_bytes()
+                           for path in source.rglob('*') if path.is_file()}
+        lock_digest = hashlib.sha256((source / 'Cargo.lock').read_bytes()).hexdigest()
+
+        def prepare(suffix):
+            result = self.shell('_act_prepare_unix_private_cargo_home', 'fixture', source, suffix,
+                                'cargo build --locked --offline', 'CARGO_TARGET_DIR=' + str(target),
+                                env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            summary = json.loads(result.stdout)
+            self.assertEqual(summary['cargo_home'], str(source.parent / ('.cargo-home-' + suffix)))
+            self.assertEqual(summary['selection']['lockfile_sha256'], lock_digest)
+            self.assertEqual(summary['dependency_sources']['authentication']['lockfile_sha256'], lock_digest)
+            return summary
+
+        first = prepare('linux-musl_amd64-0123456789abcdef0123456789abcdef')
+        seed = source.parent / '.cargo-home'
+        seed_receipt = (seed / '.dsr-cache-seed.json').read_bytes()
+        ambient.rename(self.root / 'retained-ambient')
+        upstream.rename(self.root / 'retained-upstream')
+        second_suffix = 'linux-musl_amd64-fedcba9876543210fedcba9876543210'
+        second = prepare(second_suffix)
+        self.assertEqual((seed / '.dsr-cache-seed.json').read_bytes(), seed_receipt)
+        homes = (seed, Path(first['cargo_home']), Path(second['cargo_home']))
+        database = next((seed / 'git/db').glob('*/config')).relative_to(seed)
+        self.assertEqual(len({(home / database).stat().st_ino for home in homes}), 3)
+        env['CARGO_HOME'] = second['cargo_home']
+        built = subprocess.run(['cargo', 'run', '--locked', '--offline', '--quiet'],
+                               cwd=source, env=env, text=True, capture_output=True, timeout=90)
+        self.assertEqual(built.returncode, 0, built.stderr)
+        self.assertEqual(built.stdout.strip(), '42')
+        finished = self.shell('_act_finish_unix_private_cargo_home', 'fixture', second['cargo_home'],
+                              second['receipt_sha256'], source,
+                              json.dumps(second['dependency_sources']), env=env)
+        self.assertEqual(finished.returncode, 0, finished.stderr)
+        self.assertEqual(json.loads(finished.stdout)['mode'], 'inventory')
+        self.assertEqual({path.relative_to(source): path.read_bytes()
+                          for path in source.rglob('*') if path.is_file()}, original_source)
+
+        retained = {home / name: (home / name).read_bytes() for home in homes[1:]
+                    for name in ('.dsr-cache-seed.json', '.dsr-cargo-metadata.json', '.dsr-cargo-sources.json')}
+        collision = self.shell('_act_prepare_unix_private_cargo_home', 'fixture', source,
+                               second_suffix, env=env)
+        self.assertNotEqual(collision.returncode, 0, collision.stderr)
+        self.assertEqual(collision.stdout, '')
+        for path, content in retained.items(): self.assertEqual(path.read_bytes(), content)
+        self.assertEqual((seed / '.dsr-cache-seed.json').read_bytes(), seed_receipt)
 
 
 unittest.main(verbosity=2)

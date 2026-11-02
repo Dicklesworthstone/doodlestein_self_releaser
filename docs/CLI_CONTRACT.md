@@ -496,9 +496,13 @@ Each attempt retains its output and terminal exit status under
 watcher restarts. Failed attempts can retry while the same source run remains
 throttled, with an exponential cooldown capped at one hour. A retry resumes
 only a unique build UUID matching the exact tool, tag, source SHA, and private
-output directory. Successful runs are never replayed. Legacy timestamp-only
-history and workers lost without a completion receipt require manual recovery;
-their publication outcome cannot safely be inferred.
+output directory. A `partial` build with both successful and failed targets is
+eligible for this recovery; fallback validates and reuses successful target
+artifacts while retrying the remaining targets. Cancelled, mismatched, or
+ambiguous checkpoints block automatic recovery. Successful runs are never
+replayed. Legacy timestamp-only history and workers lost without a completion
+receipt require manual recovery; their publication outcome cannot safely be
+inferred.
 Terminal fallback notifications are sent only after the worker has saved its
 completion receipt; detailed phase output remains in the attempt's `result.json`
 and the run's `fallback-<run-id>.log`.
@@ -545,6 +549,105 @@ toolchain.
 
 Target logs and result receipts are isolated by task and attempt. Aggregation
 is deterministic in requested-platform order, then configured triple order.
+Workers start with stdin connected to the null device; only the coordinator
+reads the queued task records. A worker failure or timeout does not discard
+later tasks. Cancellation stops dispatch, drains started workers, and retains
+their interrupted attempt receipts. Each worker keeps an owned local process-group
+anchor alive until cleanup completes. Interrupt, termination and hangup signals
+request cancellation, which allows five seconds for active
+backends to terminate, then kills remaining members of that group before the live
+worker releases capacity or writes an interruption receipt. Completed backends
+drain without that grace delay. Losing the worker closes its control channel and
+retires the group; a killed worker does not fabricate a completion receipt or claim
+to have released its lease. Native remote builds retain their host-side supervisors.
+Timed local commands also remain in an owned process group. A command leader
+exiting does not abandon a descendant that ignored termination; cleanup finishes
+before the timeout wrapper returns its actual command or deadline status.
+The timed command retains its original stdin, including staged script input.
+Queued tasks that have never run report
+`status: "skipped"` and `attempt: 0`, without a log or result path. They remain
+pending in run state, so exact-run resume starts their first attempt while
+reusing verified successful receipts and retrying interrupted attempts.
+Per-target JSON includes the retained `attempt`, `exit_code`, `log_path`, and
+`result_path` when available. When a live coordinator recovers a missing
+receipt, it records the observed `worker_exit_code` and
+`receipt_source: "coordinator"`; a missing receipt cannot turn a zero process
+exit into a successful build.
+
+Build exclusion is held by an inherited operating-system file lock for each
+tool and version. If the coordinator dies while a worker remains active, an
+immediate resume returns exit 2 until the last inherited holder closes its
+descriptor. The saved PID and lock age are diagnostic information; neither a
+dead coordinator nor an old timestamp permits overlapping attempts. Public
+build and fallback commands retain this exclusion through collection and
+publication. Build state requires a filesystem that supports local advisory
+locks, with `flock` or Python 3's `fcntl` available on the coordinator.
+
+The `.lock.lease` sidecar is a stable lock inode and must remain in place.
+Legacy PID-only metadata or a missing, replaced or malformed lease identity
+fails closed. For a retained legacy `.lock`, verify that the old coordinator
+and all of its workers have stopped before moving that metadata aside; keep
+any `.lock.lease` sidecar. Current lease-backed runs recover automatically once
+their inherited holders finish.
+
+After coordinator loss and release of that exclusion, resume reconciles valid
+terminal worker receipts with their retained dispatch attempt and paths. The
+original sidecars remain unchanged. Failed sidecars retain their observed error
+and exit code, and a source-sync refusal is excluded from the compiler retry
+budget exactly once, even across repeated crashes during reconciliation.
+The retry limit applies to every non-reusable target, including one still
+recorded as running or completed with unavailable artifacts. Verified completed
+results remain reusable at the limit. Exhaustion does not launch another worker
+or create an attempt receipt. When no valid failed result is available, run
+state and aggregate output record a failed coordinator result with
+`stage: "resume"` and exit code 6, without inventing an observed worker exit or
+successful artifact evidence.
+Native host-readiness refusals retain the requested platform, optional selected
+triple, host, and attempt receipts. They report `stage: "host_readiness"` and
+`exit_code: 4`; public target status is `failed`, even though no compiler ran.
+Host-slot acquisition failures report `stage: "host_capacity"`, `exit_code: 2`,
+and `backend_started: false`. They retain their own immutable attempt receipts
+and remain eligible for resume after host capacity becomes available.
+Receipt-write failures release the attempt's capacity lease before the worker
+returns, preserving unrelated workers' slots and allowing a later retry.
+The coordinator persists an attempt reservation before creating its log or
+starting its worker. A failed reservation leaves no orphan log to block resume.
+A later dispatch failure reports `stage: "dispatch"`, `exit_code: 4`, and
+`execution_started: false`; any already started workers are cancelled and
+drained. A saved reservation keeps its attempt number even if the coordinator
+stops before launch, so resume uses a fresh number and preserves old receipts.
+Receipt paths are reported only when the corresponding refusal receipt was
+written. A recovered successful worker receipt regains its saved attempt and
+log/result paths without changing the original receipt or rebuilding its output.
+If the coordinator cannot persist a finished worker's outcome, dispatch stops
+and active peers are cancelled and reaped. The run reports exit code 4 and
+`details.error`, preserving the actual target outcome and attempt rather than
+classifying the worker as unstarted. `execution_started: true` means the worker
+was launched; it does not assert that a compiler ran. Worker receipts also
+record the worker-owned `backend_started` flag. It becomes true
+when the worker launches its build backend after capacity acquisition; native
+host readiness can still refuse before compilation. Backend output cannot
+override this flag to claim a capacity refusal after execution.
+Existing immutable worker receipts remain available for exact-run resume, and a failed coordinator receipt
+write does not create a reported `result_path`. A retained nonempty malformed
+receipt still causes resume to refuse; it is not overwritten or accepted.
+The same rule applies when resume cannot checkpoint an already verified
+sidecar or a retry-budget decision. Its original outcome, attempt and existing
+receipt remain observable while the coordinator stops and drains active peers.
+Saved attempt counters and build purposes are checked before resumed dispatch;
+later checkpoint-read failures return an explicit coordinator error without
+inventing an unknown attempt count. A new durable reservation supersedes the
+previous failed observation even if cancellation precedes worker launch.
+Missing or unadmitted sidecars are not reported as result files, and a reserved
+but unstarted attempt does not acquire a nonexistent build log on recovery.
+Actual INT/TERM interruption retains exit code 130. These recovery boundaries
+are exercised by `test_act_orchestration.sh --resume-persistence-only` and the
+existing dispatch-reservation CI gate using real local processes and controlled
+producer/checkpoint faults; they do not qualify native build hosts.
+The aggregate failed count includes all unsuccessful requested tasks, including
+skipped tasks. An interrupted run remains resumable and cannot publish an
+authoritative manifest.
+
 For native Rust builds, a `target_triples` list expands one platform
 into independent GNU/musl tasks. Each task records its selected `target_triple`
 and a `task_key` such as `linux/amd64@x86_64-unknown-linux-musl`; singleton and
@@ -585,12 +688,32 @@ authoritative manifest while any target remains unsuccessful.
 Both local and SSH rsync transfers use checksums to detect edited files whose
 sizes and timestamps match the older destination files.
 
+Native Unix admission checks the actual selected source, build, Cargo and recipe
+temporary paths in addition to the host's default storage roles. Source planning
+checks every required host/path combination before any source export or transfer;
+native execution checks its effective paths before cache preparation, staging or
+compilation. Planned directories are observed through their nearest existing
+parent without creating them. Explicit path requests require fresh observations
+and the normal 20 GiB floor, including on the root's split-storage capacity group.
+An old healthy host-cache result cannot admit a new release destination.
+See [Unix disk admission](UNIX_DISK_ADMISSION.md) for path resolution, receipt
+coverage, split-storage behavior and the limits of this capacity check.
+
 Run context and aggregate results retain the complete `source_sync` receipt.
 Resume syncs again, updates the ordinary host/path bindings, and records the
 new receipt in `source_sync_history`. It verifies completed artifact receipts
-before deciding which targets still need work. `attempts` counts retained
-target attempts, while `source_sync_failures` excludes transfers that never
-reached compilation from the compiler retry limit. Direct orchestration resume
+before deciding which targets still need work. `attempts` counts durable attempt
+reservations. `source_sync_failures`, `host_readiness_failures`, and
+`host_capacity_failures` count recorded transfer failures, native admission
+refusals, and host-slot acquisition failures that never reached compilation;
+these are excluded from the compiler retry limit. Readiness exemptions require
+the explicit `host_readiness` stage and exit code 4. Capacity exemptions require
+the explicit `host_capacity` stage, exit code 2, and the worker-owned
+`backend_started: false` flag. Replaying the same failed attempt does not increase
+the counters, and real build failures still consume the configured retry
+allowance. Checkpoints without these counters retain
+their prior conservative accounting; resume does not invent missing history.
+Direct orchestration resume
 without a new receipt retains the saved gate; the explicit CLI `--no-sync`
 opt-out clears it while preserving recorded host/path bindings and history.
 An ordinary sync receipt records transfer admission; strict releases continue
@@ -668,6 +791,25 @@ The native worker still enforces the requested target's output and architecture.
 Retained failed result/log files must agree with the old host and frozen source;
 completed artifacts and result files must still verify. Replacement staging and
 its pinned dependency closure are verified before an atomic state transition.
+
+New strict native worker receipts carry `scheduled_source` with the original
+`run_id`, `git_sha`, `git_ref`, assigned `host`, and snapshot `root`. Relocation
+requires this exact object to match the retained run context. The assignment records
+which frozen source the worker was given; it does not assert that source admission
+or compilation ran. A host-capacity or host-readiness refusal, or a failed Go
+backend, can therefore retain its truthful outcome and still move to an approved
+replacement host. When either Rust source identity field is recorded, both
+`DSR_RELEASE_GIT_SHA` and `DSR_RELEASE_GIT_REF` must match that assignment.
+Older receipts without `scheduled_source` still require both source identity fields.
+
+The retained worker receipt must report `failed`, `error`, or `timeout`, with an
+integer exit code from 1 through 255, excluding interruption and termination
+codes 130 and 143. Its target must be recorded as failed in run state. Its outcome
+must match the saved result after accounting for coordinator-added attempt and
+log/result path metadata. The coordinator annotations `execution_started`,
+`resume_reused`, and `retry_limit_exceeded` must be absent or `true`; other outcome
+fields must agree. Relocation preserves the original receipt and its refusal,
+failure, or timeout classification.
 The run records the prior context, replacement host platform, configuration
 delta, source archive/manifest hashes, and prior attempt hashes; the next worker
 uses the next attempt number.
@@ -745,11 +887,27 @@ An upload, inventory, source, or publication failure suppresses dispatch and
 upgrade hooks. A failed publication can be returned to draft only while its
 current nonce and metadata still prove ownership.
 
+Ordinary `dsr release verify TOOL VERSION --fix` binds repair to the observed
+GitHub release ID and a validated local manifest. It uploads through the shared
+verified upload helper and never clobbers existing assets. It verifies every
+required name, size, hash, and uploaded asset ID against one complete, fresh
+paginated inventory, including on reruns where no names appear missing.
+Empty or invalid local manifests cannot authorize repair. Release identity and local
+manifest or payload changes prevent success. A nominal upload acknowledgement
+cannot remove an asset from the missing list. Repair failures appear in
+`details.repair.errors` when present; normal verification and dry-run output keep
+their existing shape.
+
 Downstream dispatch uses a persistent outbox keyed by the source repository and
 GitHub release ID. Accepted destinations are skipped across process restarts;
 definitively rejected destinations can retry, and uncertain POSTs require an
-explicit resend decision. The complete request plan and verified public release
-are retained. Before each POST, DSR rechecks the release ID, visibility, tag
+explicit resend decision. Authentication, dependency, and local preparation
+failures known to occur before transport are recorded as `blocked` and can resume
+normally. Their receipts count zero HTTP attempts, or only earlier definitive
+rate-limit rejections if preparation fails before a later retry. Missing
+receipts, interrupted transports, and unreadable transport outcomes remain
+uncertain. The complete request plan and verified public release are retained.
+Before each POST, DSR rechecks the release ID, visibility, tag
 commit, and exact paginated asset inventory, downloading and hashing assets when
 GitHub supplies no digest. Changed plans or publication evidence refuse delivery.
 Explicit `dispatch.enabled: false` in repository or global configuration remains
@@ -886,6 +1044,18 @@ receive EOF on stdin. A missing host runtime returns dependency error 3 before
 the compiler runs. Commands that deliberately detach into a new session are
 outside this process-group boundary. Strict Rust still requires Python 3.11+.
 
+Native Windows guards retain the complete compiler program as `payload.ps1`
+beside the staged launcher and start PowerShell with a quoted `-File` path.
+The program's size therefore does not become a child command-line argument.
+The payload is created exclusively, flushed, scanned with the existing Defender
+policy, and checked against its original bytes under a held read handle before
+launch. Directory-chain handles prevent ancestor substitution during execution;
+linked files, reparses, conflicting existing payloads and changed bytes are
+refused. The file preserves Unicode with a UTF-8 BOM and remains as attempt
+evidence. The child still starts suspended, enters its owned kill-on-close Job
+Object, and only then resumes. Normal exit status is preserved; the host-side
+deadline returns 124 after stopping the job.
+
 The manifest also retains `requested_targets` when supplied by the orchestrator.
 For native matrices, both generation and release admission reconcile selected
 triples, environment receipts and retained payloads. A missing or duplicate
@@ -961,6 +1131,16 @@ Cargo-generated version 3/4 lockfiles. Unused patch records are parsed but never
 contribute resolved-package authority. No Python installation is needed on the
 Windows build host.
 
+Strict native source export checks the ordinary Git tar stream against the
+selected committed tree before choosing the transfer bytes. Complete archives
+retain their existing bytes and hashes, including when export attributes have
+no effect. When Git export attributes omit or substitute committed content,
+the coordinator uses its authenticated raw-object exporter to retain the
+complete source inventory and original blob bytes. Archive generation or
+parsing failures refuse export; they do not authorize a fallback. The comparison
+streams file contents without an additional archive spool. Staging, relocation,
+final verification and exact-run resume derive the same selected archive hash.
+
 Strict native project snapshots expand initialized submodules recursively from
 the gitlink commits in their parent trees. The coordinator's shared Git object
 reader authenticates every commit, tree and blob, then streams a deterministic
@@ -976,8 +1156,9 @@ External administration pointers, alternates, linked object stores, missing or
 wrong-type objects and configuration includes are refused. No submodule URL is
 fetched, and a child HEAD cannot override its parent's selected commit. Each
 source archive has a shared limit of 100000 Git tree entries, 256 repositories
-and 16 nested submodule levels. Recursive export requires Python 3.9+ on the
-coordinator; it adds no Python requirement to Windows build hosts.
+and 16 nested submodule levels. Archive selection and recursive export require
+Python 3.9+ on the coordinator; they add no Python requirement to Windows build
+hosts.
 
 The Unix and Windows receivers admit only the manifest's exact directory and
 file inventory, including empty nested submodules. Links cannot leave their
@@ -1077,25 +1258,41 @@ configuration uses a bounded literal grammar for build/compiler settings,
 literal target settings, ordinary source/registry settings and Rust flags.
 Includes, dotted keys, general inline tables, unsupported `cfg(...)` predicates, general environment
 injection, unstable selector environments and flags that can select another
-linker/compiler/backend are refused before dependency admission. Positive
-integer strings for `RUST_MIN_STACK` and `RUST_TEST_THREADS` are the supported
-`[env]` exceptions. These accept a literal string or a single-line inline table
-with `value`, optional Boolean `force`, and absent or false `relative`:
+linker/compiler/backend are refused before dependency admission. The supported
+`[env]` exceptions are positive-integer strings for `RUST_MIN_STACK` and
+`RUST_TEST_THREADS`, and exactly the string `"0"` for `CARGO_INCREMENTAL`.
+These accept a literal string or a single-line inline table with `value`,
+optional Boolean `force`, and absent or false `relative`:
 
 ```toml
 [env]
 RUST_MIN_STACK = { value = "16777216", force = true }
 RUST_TEST_THREADS = { value = "4", force = false, relative = false }
+CARGO_INCREMENTAL = "0"
 ```
 
 Existing configured environment values take precedence unless `force=true`.
-The resulting value must also be a positive-integer string. The observer uses
-the same effective settings as Cargo's children and retains the configured
+Both configured and effective values must satisfy the same name-specific
+restriction. For `CARGO_INCREMENTAL`, numeric zero, `"1"`, whitespace,
+invisible suffixes and alternate zero spellings are refused. Cargo
+reads its own incremental mode before applying `[env]` to children, so a
+nonzero or malformed incoming `CARGO_INCREMENTAL` refuses admission even when
+the tracked table says `force=true`. A tracked `"0"` alone does not override
+the profile's incremental setting; set `CARGO_INCREMENTAL=0` in the build
+environment to disable incremental compilation in Cargo itself. The observer
+uses the same effective settings as Cargo's children and retains the configured
 value, force flag, effective value and origin in
 `toolchain.selection.cargo_config[].env_exemptions`. Metadata, compilation and
 independent collection bind this evidence. Unknown or duplicate attributes,
 relative-path expansion, non-Boolean flags, multiline tables and trailing
 commas are refused; this exception does not admit compiler environment changes.
+
+Cargo's `[build] incremental=false` also disables incremental compilation when
+there is no overriding parent `CARGO_INCREMENTAL`.
+The exemption and its receipt describe the effective child environment; they
+do not certify that Cargo emitted no incremental artifacts. See Cargo's
+[`env` configuration](https://doc.rust-lang.org/cargo/reference/config.html#env)
+and [incremental setting](https://doc.rust-lang.org/cargo/reference/config.html#buildincremental).
 
 Tracked target tables can use bounded `cfg(...)` expressions on Windows as well
 as Unix. Supported predicates are `unix`, `windows`, and literal values for
@@ -1119,6 +1316,20 @@ Cargo's ordinal order. Build flags combine the build table and
 target table, which overrides a matching cfg linker; multiple matching cfg
 linkers without a higher-priority selection are refused. Changing the cfg
 configuration or selected compiler invalidates the held metadata receipt.
+
+On both Unix and Windows, configure the linker through the explicit target key
+so its selected executable is resolved and attested. Move a
+`-C linker=cc` or `--codegen linker=cc` selection out of `rustflags`, for example:
+
+```toml
+[target.x86_64-unknown-linux-gnu]
+linker = "cc"
+rustflags = ["-Z", "threads=4", "-C", "link-arg=-B/usr/bin"]
+```
+
+The remaining flags still need the selected compiler's normal support. Linker
+selection inside `rustflags` remains refused even when it spells the default
+linker; naming `cc` alone does not establish its executable identity.
 
 Configured compiler
 or linker paths must be absolute, or project-relative paths in tracked Cargo
@@ -1152,16 +1363,43 @@ named Cargo plugins, and `cargo-zigbuild`/`zig` when DSR routes through them.
 Explicit `RUSTC`/`CARGO_BUILD_RUSTC` executables and compiler wrappers retain
 their own identities; arbitrary scripts are not mislabeled as rustup's
 compiler. Proven rustup proxies and Apple `/usr/bin` compiler launchers also
-record their resolved executable. Literal tracked Cargo configuration can
+record their resolved executable. Unix Rustup recognition requires byte equality
+with the existing manager on the build PATH or at `$HOME/.cargo/bin/rustup`.
+A mismatched PATH manager cannot hide a matching HOME reference. The physical
+manager file and parent are held through dispatch resolution and checked before
+and afterward; its path and hash remain in the toolchain receipt alongside the
+actual delegated Cargo/rustc hashes. Missing or mismatched references cannot
+authorize a receipt containing only proxy bytes. A Rustup dispatch response, or
+an unsuccessful check for unresolved dispatch, refuses admission; neither a
+version response nor `RUSTUP_FORCE_ARG0` grants identity authority. Configured
+`RUSTUP_FORCE_ARG0` is refused. Direct native Cargo/rustc remain supported without
+a manager, and the existing reviewed RCH launchers retain their specific dispatch
+rules. Arbitrary custom native forwarding and complete subprocess graphs remain
+outside this trusted-host entrypoint contract.
+
+Literal tracked Cargo configuration can
 select the compiler, target and linker; those configuration files are hashed
 into the receipt and require Python 3.11+ to parse. A tracked `[env]` table
 that sets any `RUST*`, `CARGO_*`, `XWIN_*`, `PATH` or C toolchain variable is
-refused, with two exceptions, each set to a plain positive integer string:
+refused, with three bounded exceptions:
 `RUST_MIN_STACK`, which only sizes rustc's and test/run threads' stacks, and
-`RUST_TEST_THREADS`, which only sets libtest's default thread count. They are
-admitted and recorded under that file's `env_exemptions` (name and value) in
-every receipt. Any other value form, or any other influencing name, still fails
-closed.
+`RUST_TEST_THREADS`, which only sets libtest's default thread count, require
+positive-integer strings. `CARGO_INCREMENTAL` accepts exactly the string `"0"`.
+They are admitted as plain strings or tables containing `value`, optional Boolean `force`,
+and absent or false `relative`. The receipt's `env_exemptions` retain the configured
+value/force and effective value, force and origin. Other attributes, invalid
+numeric values and other influencing names still fail closed.
+
+For `CARGO_INCREMENTAL`, an incoming process value other than `0` is refused
+even with `force=true`: Cargo selects its own incremental mode before applying
+the child environment. The tracked setting does not override the selected
+profile. A build environment value of `CARGO_INCREMENTAL=0` explicitly disables
+incremental compilation. Unix and Windows use the same bounded exemption.
+
+Linker overrides in Rust flags remain outside this exemption. Configure a
+literal linker through `[target.<triple>].linker` instead of `-C linker=...`
+so DSR can resolve, hash, and verify the selected executable. A program named
+`cc` is not assumed to be the default linker merely because of its name.
 
 Strict Unix source-closure validation runs locked, offline, all-features Cargo
 metadata with each target's selected toolchain and configured environment.
@@ -1191,7 +1429,7 @@ represent. Configure those selections outside `build_cmd`.
 
 Conflicting toolchains/targets, dynamic selectors, Cargo `--config`/`-C`,
 compiler-selecting shell context changes, opaque Cargo drivers, Cargo aliases,
-configuration includes/`cfg` selectors, and configuration-driven compiler
+configuration includes, unsupported `cfg` predicates, and configuration-driven compiler
 environment changes cannot be represented by one proven selection and are
 refused before compilation. Move those selections into the repository's
 configured build environment or a supported literal Cargo invocation. The
@@ -1270,7 +1508,51 @@ predecessor receipt information. Retain these private receipts between attempts.
 
 ### `dsr installer`
 
-Generate and validate standalone installers from registered tool configuration.
+Generate installers, or authenticate and install an exact signed release.
+
+#### Authenticated release commands
+
+```bash
+dsr installer generate-release --policy /absolute/policy.json \
+  --public-key /absolute/release.pub --output /absolute/install.sh
+
+dsr installer describe-recipe --recipe /absolute/recipe.json
+
+dsr installer install --snapshot /absolute/snapshot \
+  --recipe /absolute/recipe.json --prefix /absolute/prefix \
+  --repo OWNER/TOOL --tag v1.2.3 --sha "$SOURCE_SHA" \
+  --builder "$BUILDER" --targets "$TARGETS" --public-key /absolute/release.pub
+```
+
+These commands use the authenticated release engines' strict argument parsing
+and exact identity, target, compiler-variant and trust policy. `install` accepts
+either a complete local `--snapshot` or explicit `--fetch`; it authenticates the
+complete signed inventory before installing the recipe's executable and runtime
+data set. Changing an existing managed generation requires `--replace`.
+Recipe inspection validates policy and reports `authenticated: false`.
+See [authenticated installation](RELEASE_INSTALLATION.md) for the snapshot,
+recipe, independent contract and activation requirements.
+
+Both global `--dry-run` and command-local `--dry-run` are supported for
+`generate-release` and `install`. Generation validates the policy, key, captured
+engines, recipes, resulting script and existing-output conflict before returning
+a plan. It does not create the selected output or its adjacent lock. Installation
+planning authenticates and extracts into private staging without activating a
+generation or changing the managed prefix. With `--fetch`, planning still fetches
+and authenticates the exact release. A plan is an observation, not a reservation;
+execution repeats the validation and concurrency checks.
+
+With global `--json`, the command emits one standard envelope with
+`command: "installer"`. `details.action` identifies `generate-release`, `install`
+or `describe-recipe`; all authoritative engine fields remain in `details`,
+including `status`, `activated`, `authenticated` and any reported error. The
+envelope exit code matches the process result. A successful plan has outer
+`status: "success"` and `details.status: "planned"`; it does not claim activation
+or authenticated generation. Help is returned as help text within the envelope.
+See [standalone release installers](GENERATED_RELEASE_INSTALLERS.md) for pinned
+generator policy and distribution trust.
+
+#### Registered-tool installer generation
 
 ```bash
 dsr installer generate <tool>... [--output-dir DIR] [--dry-run]
@@ -1373,6 +1655,52 @@ toolchain and distribution evidence when provisioning occurs. See
 
 ---
 
+### `dsr docker`
+
+Build, publish, sign, verify and repair container evidence through the shared
+container module parser.
+
+```bash
+dsr docker build TOOL VERSION --repo-path /absolute/project \
+  --dockerfile docker/Dockerfile --output /absolute/image.oci.tar
+dsr docker release TOOL VERSION --repo-path /absolute/project \
+  --platform linux/amd64,linux/arm64 \
+  --certificate-identity "$SIGNER" --certificate-oidc-issuer "$ISSUER"
+dsr docker verify "$PINNED_IMAGE" --platform linux/amd64,linux/arm64 \
+  --certificate-identity "$SIGNER" --certificate-oidc-issuer "$ISSUER"
+dsr docker attest "$PINNED_IMAGE" \
+  --certificate-identity "$SIGNER" --certificate-oidc-issuer "$ISSUER"
+dsr docker sign "$PINNED_IMAGE"
+dsr docker setup --dry-run
+```
+
+`PINNED_IMAGE` is an independently selected `REPOSITORY@sha256:DIGEST`.
+`build` forwards explicit context, Dockerfile, platform, repeated tag and output
+options to the module. `release` uses registry export and retains every digest,
+platform, signer, SPDX and final inventory verification gate. `verify` checks
+published evidence without building, scanning, logging in, signing or uploading.
+`attest` regenerates and verifies per-platform SBOM attestations, but reports the
+root signature as `not_checked`; a subsequent `verify` checks that signature.
+`sign` alone reports signing without claiming independent signature verification.
+
+Global and command-local dry runs validate and return plans without Docker,
+registry, scanning, signing, builder setup or output publication. In particular,
+`setup --dry-run` does not inspect, create or bootstrap a builder. Planning does
+not establish registry access or credential validity. Missing option values and
+unexpected positional arguments fail with exit code 4.
+
+Global `--json` returns exactly one standard envelope using the command name
+`docker-build`, `docker-release`, `docker-sign`, `docker-setup`, `docker-verify`
+or `docker-attest`. `details.result` preserves the complete module receipt;
+`details.status` and `details.dry_run` identify its operation state. Successful
+plans use outer `status: "success"` with `details.status: "planned"`; completion
+fields such as `pushed`, `signed` and `ready` remain false. Failures preserve the
+module's nonzero exit status and do not claim completed publication or verification.
+See [container workflows](CONTAINERS.md) for the full exporter, evidence and trust
+contracts and the standalone module entry points.
+
+---
+
 ### `dsr fallback`
 
 Full fallback pipeline: check -> build -> release.
@@ -1392,6 +1720,14 @@ asked for, since `dsr check` itself exits 1 exactly when throttled. Its step
 carries `throttled` and the check's own exit code. The build step covers the
 quality gate, build, artifact verification and signing; `--build-only` runs
 the build step alone. `details.steps[]` lists the steps that ran.
+
+`--resume=RUN_UUID` accepts a saved `partial` build as well as failed or
+interrupted builds. It retains the original run UUID and output directory,
+validates the saved source and successful target artifacts, and retries only
+targets that remain eligible under the existing attempt budget. A partial
+checkpoint does not bypass the build step or authorize publication; release
+still requires a complete, validated successful build. Cancelled or unknown
+checkpoint states are refused before execution.
 
 The release step succeeds only when `dsr release` confirms the requested
 repository and tag as public. An upload that correctly leaves an unrelated

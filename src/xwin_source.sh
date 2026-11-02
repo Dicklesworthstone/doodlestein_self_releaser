@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Committed-source admission for manifest-backed Windows x64/ARM64 builds
 # and the native coordinator's authenticated recursive source archives.
-# No checkout mutation, archive export filters, network access, or tag writes.
+# No checkout mutation, network access, or tag writes. Native legacy archive
+# comparison observes export attributes without making them source authority.
 
 xwin_source_snapshot() {
     [[ $# == 6 ]] || return 4
@@ -32,6 +33,16 @@ source_archive_export() {
     [[ $# == 3 && ( "$3" == archive || "$3" == manifest ) ]] || return 4
     command -v python3 >/dev/null && command -v git >/dev/null || return 3
     _xws_source native-export "$@"
+}
+
+# Inspect the legacy Git tar without writing or emitting an archive. Only a
+# fully parsed stream from a successful producer may report semantic divergence
+# (10); producer, inventory and parsing failures remain errors (4, or 3 when a
+# prerequisite is missing). A complete stream returns 0 and keeps its old digest.
+source_archive_matches_git() {
+    [[ $# == 2 ]] || return 4
+    command -v python3 >/dev/null && command -v git >/dev/null || return 3
+    _xws_source native-archive-check "$@"
 }
 
 _xws_source() {
@@ -539,6 +550,144 @@ def native_export(project, commit, output_kind):
                 emit(child, path + "/")
         emit(selection)
 
+def native_archive_check(project, commit):
+    require(re.fullmatch(r"[0-9a-f]{40}", commit) is not None and commit != "0" * 40,
+            "expected an explicit SHA-1 source commit")
+    # Match the existing native Git commands, including their export metadata
+    # and attribute environment. Do not impose the raw exporter's object-store
+    # restrictions on a legacy archive that already represents the whole tree.
+    environment = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1")
+    command = ["git", "-C", project]
+    listing = subprocess.run(command + ["ls-tree", "-rz", "--full-tree", commit],
+                             env=environment, check=True, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE).stdout
+    require(listing and listing.endswith(b"\0"), "missing native Git tree inventory")
+    expected = {}
+    for record in listing[:-1].split(b"\0"):
+        metadata, separator, raw_name = record.partition(b"\t")
+        fields = metadata.split(b" ")
+        require(separator and len(fields) == 3, "malformed native Git tree inventory")
+        mode, kind, oid = (value.decode("ascii") for value in fields)
+        name = os.fsdecode(raw_name)
+        require(kind == "blob" and mode in ("100644", "100755", "120000") and
+                re.fullmatch(r"[0-9a-f]{40}", oid) is not None and
+                re.fullmatch(r"[A-Za-z0-9_./+@~#,=()\[\] -]+", name) is not None and
+                ".." not in name and not name.startswith("/") and name not in expected,
+                "unsupported or duplicate native Git tree entry: " + name)
+        expected[name] = (mode, oid)
+    for name in list(expected):
+        while "/" in name:
+            name = name.rsplit("/", 1)[0]
+            require(name not in expected or expected[name] == ("tree", None),
+                    "native Git tree path conflicts with a directory")
+            expected[name] = ("tree", None)
+
+    class StrictTarInfo(tarfile.TarInfo):
+        @classmethod
+        def fromtarfile(cls, archive):
+            try:
+                return super().fromtarfile(archive)
+            except tarfile.EOFHeaderError:
+                archive.dsr_end_marker = True
+                raise
+            except tarfile.HeaderError as error:
+                # TarFile.next normally tolerates a corrupt or missing later
+                # header. It must never turn a failed comparison into fallback.
+                raise Rejected("invalid native Git archive header: " + str(error)) from error
+
+    class PrefixReader:
+        def __init__(self, prefix, stream):
+            self.prefix, self.stream = prefix, stream
+
+        def read(self, size):
+            prefix, self.prefix = self.prefix[:size], self.prefix[size:]
+            return prefix + self.stream.read(size - len(prefix))
+
+    producer = subprocess.Popen(command + ["archive", "--format=tar", commit],
+                                env=environment, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE)
+    try:
+        prefix = producer.stdout.read(tarfile.BLOCKSIZE)
+        header = tarfile.TarInfo.frombuf(prefix, "utf-8", "surrogateescape")
+        if header.type == tarfile.XGLTYPE:
+            # Git emits a global PAX comment even when export-ignore removes
+            # every member. Strip only nonsemantic global metadata for parsing:
+            # tarfile otherwise rejects that valid metadata-only empty archive.
+            require(0 <= header.size <= 1024 ** 2, "invalid Git PAX metadata size")
+            padded = (header.size + 511) // 512 * 512
+            data = producer.stdout.read(padded)
+            require(len(data) == padded, "truncated Git PAX metadata")
+            payload, keys, offset = data[:header.size], set(), 0
+            while offset < len(payload):
+                end = payload.find(b" ", offset)
+                require(end > offset and re.fullmatch(b"[1-9][0-9]*", payload[offset:end]) is not None,
+                        "invalid Git PAX record length")
+                length = int(payload[offset:end])
+                require(length >= 5 and offset + length <= len(payload), "truncated Git PAX record")
+                record = payload[end + 1:offset + length]
+                key, equals, _ = record[:-1].partition(b"=")
+                require(record.endswith(b"\n") and key and equals, "invalid Git PAX record")
+                keys.add(key)
+                offset += length
+            metadata_only = {b"comment", b"mtime", b"atime", b"ctime", b"uid", b"gid", b"uname", b"gname"}
+            prefix = b"" if keys <= metadata_only else prefix + data
+
+        seen, complete = set(), True
+        with tarfile.open(fileobj=PrefixReader(prefix, producer.stdout), mode="r|",
+                          tarinfo=StrictTarInfo) as archive:
+            while not getattr(archive, "dsr_end_marker", False):
+                member = archive.next()
+                if member is None:
+                    break
+                archive.members.clear()
+                require(member.name not in seen and member.size >= 0 and not member.issparse(),
+                        "duplicate or unsupported native Git archive member")
+                seen.add(member.name)
+                selected = expected.get(member.name)
+                if member.isdir():
+                    require(member.size == 0, "native Git archive directory has data")
+                    matches = selected == ("tree", None)
+                elif member.issym():
+                    require(member.size == 0, "native Git archive link has data")
+                    link = member.linkname.encode("utf-8", "surrogateescape")
+                    oid = hashlib.sha1(b"blob " + str(len(link)).encode() + b"\0" + link).hexdigest()
+                    matches = selected == ("120000", oid)
+                elif member.isreg():
+                    digest = hashlib.sha1(b"blob " + str(member.size).encode() + b"\0")
+                    with archive.extractfile(member) as stream:
+                        while True:
+                            chunk = stream.read(1024 ** 2)
+                            if not chunk:
+                                break
+                            digest.update(chunk)
+                    matches = (selected is not None and selected[0] in ("100644", "100755") and
+                               bool(member.mode & 0o111) == (selected[0] == "100755") and
+                               digest.hexdigest() == selected[1])
+                else:
+                    raise Rejected("unsupported native Git archive member type")
+                complete = complete and matches
+            require(getattr(archive, "dsr_end_marker", False), "missing native Git archive terminator")
+            require(archive.fileobj.read(512) == b"\0" * 512, "incomplete native Git archive terminator")
+            padding = 0
+            while True:
+                chunk = archive.fileobj.read(1024 ** 2)
+                if not chunk:
+                    break
+                require(not any(chunk), "unexpected data after native Git archive terminator")
+                padding += len(chunk)
+            require(padding % 512 == 0, "truncated native Git archive padding")
+        require(producer.wait() == 0, "native Git archive producer failed")
+        return 0 if complete and seen == set(expected) else 10
+    finally:
+        producer.stdout.close()
+        if producer.poll() is None:
+            producer.terminate()
+            try:
+                producer.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                producer.kill()
+                producer.wait()
+
 def write_repository(selection, root, links, prefix=""):
     root.mkdir(mode=0o700)
     # Read raw Git objects, not a working tree or git archive: attributes such
@@ -728,6 +877,8 @@ def verify(root, evidence):
 
 try:
     mode = sys.argv[1]
+    if mode == "native-archive-check":
+        sys.exit(native_archive_check(*sys.argv[2:]))
     if mode == "native-export":
         native_export(*sys.argv[2:])
         sys.exit(0)

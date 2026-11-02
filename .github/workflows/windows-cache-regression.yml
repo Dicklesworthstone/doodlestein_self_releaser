@@ -52,3 +52,19 @@ jobs:
           $ErrorActionPreference = 'Stop'
           & ./scripts/tests/test_cargo_context_windows.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  windows-build-guard:
+    runs-on: windows-2025
+    timeout-minutes: 10
+    env:
+      POWERSHELL_TELEMETRY_OPTOUT: '1'
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Execute large guarded builds with native file and process custody
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ./scripts/tests/test_cargo_context_windows.ps1 -BuildGuardOnly
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

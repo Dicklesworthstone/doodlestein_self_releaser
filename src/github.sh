@@ -1345,7 +1345,8 @@ _gh_manifest_has_upload_name() {
     [[ "${file##*/}" == "$upload_name" ]] || return 4
     local base="$upload_name"
     case "$base" in *.minisig|*.sig|*.asc) base="${base%.*}" ;; esac
-    if [[ "$base" == SHA256SUMS || "$base" == "${manifest##*/}" ]]; then
+    if [[ "$base" == SHA256SUMS || "$base" == SHA256SUMS.txt ||
+          "$base" == checksums.txt || "$base" == "${manifest##*/}" ]]; then
         return 0
     fi
     case "$base" in

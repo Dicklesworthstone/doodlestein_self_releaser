@@ -16,8 +16,10 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 
 root = Path(sys.argv[1])
@@ -129,7 +131,7 @@ def sign(proof):
                         "-t", "dsr installer variant test"], check=True, capture_output=True, timeout=30)
 
 
-def make_snapshot(label, variants=(gnu, musl), explicit=True):
+def make_snapshot(label, variants=(gnu, musl), explicit=True, with_data=False):
     base = work / label
     base.mkdir()
     snapshot = base / "snapshot"
@@ -144,24 +146,58 @@ def make_snapshot(label, variants=(gnu, musl), explicit=True):
         for binary in ("app", "helper"):
             (payload / binary).write_text("#!/bin/sh\nprintf '%s\\n' 'TEST " + triple + " " + binary + "'\nexit 93\n")
             (payload / binary).chmod(0o755)
+        members = ["app", "helper"]
+        if with_data:
+            (payload / "docs").mkdir()
+            (payload / "docs/help.txt").write_text("Owned documentation for " + triple + "\n")
+            (payload / "docs/help.txt").chmod(0o755)
+            (payload / "docs/EMPTY").write_bytes(b"")
+            members += ["docs/help.txt", "docs/EMPTY"]
         fmt = "tar.gz" if index == 0 else "tar.xz"
         archive_name = "payload-%d.%s" % (index, fmt)
-        subprocess.run(["bash", "-c", 'source "$1"; packaging_build_archive "$2" "$3" "$4" app helper', "_",
-                        str(runtime / "packaging.sh"), fmt, str(assets / archive_name), str(payload)],
+        subprocess.run(["bash", "-c", 'source "$1"; shift; packaging_build_archive "$@"', "_",
+                        str(runtime / "packaging.sh"), fmt, str(assets / archive_name), str(payload), *members],
                        env=env, check=True, capture_output=True, timeout=30)
         raw_name = "alias-%d" % index
         shutil.copy2(payload / "app", assets / raw_name)
-        for name, format_name in ((archive_name, fmt), (raw_name, "binary")):
+        produced = [(archive_name, fmt), (raw_name, "binary")]
+        if with_data:
+            model_name = "model-%d.json" % index
+            save(assets / model_name, dict(fixture=True, compiler=triple))
+            (assets / model_name).chmod(0o755)
+            produced.append((model_name, "none"))
+        for name, format_name in produced:
             file = assets / name
             rows.append(dict(name=name, target=target, target_triple=triple, archive_format=format_name,
                              sha256=digest(file), size_bytes=file.stat().st_size))
         environments.append(dict(target=target, target_triple=triple, method="native", host="fixture"))
+    if with_data:
+        for name, data in (("runtime.json", b'{"fixture":true,"version":1}\n'),
+                           ("runtime-next.json", b'{"fixture":true,"version":2}\n'),
+                           ("unused.json", b'{"fixture":true,"selected":false}\n')):
+            file = assets / name
+            file.write_bytes(data)
+            rows.append(dict(name=name, target="additional", archive_format="none", sha256=digest(file), size_bytes=len(data)))
+        shared = base / "shared-members"
+        (shared / "texts").mkdir(parents=True)
+        (shared / "texts/shared.txt").write_text("Owned shared archive data\n")
+        subprocess.run(["bash", "-c", 'source "$1"; packaging_build_archive tar.gz "$2" "$3" texts/shared.txt', "_",
+                        str(runtime / "packaging.sh"), str(assets / "resources.tar.gz"), str(shared)],
+                       env=env, check=True, capture_output=True, timeout=30)
+        file = assets / "resources.tar.gz"
+        rows.append(dict(name=file.name, target="additional", archive_format="tar.gz", sha256=digest(file), size_bytes=file.stat().st_size))
+        foreign = assets / "foreign.json"
+        foreign.write_text('{"fixture":true,"platform":"windows"}\n')
+        rows.append(dict(name=foreign.name, target="windows/arm64", target_triple="aarch64-pc-windows-msvc",
+                         archive_format="none", sha256=digest(foreign), size_bytes=foreign.stat().st_size))
+        environments.append(dict(target="windows/arm64", target_triple="aarch64-pc-windows-msvc", method="native", host="fixture"))
     manifest = dict(schema_version="1.0.0", tool="app", version=tag, source=dict(git_sha=pin, git_ref="refs/tags/" + tag, dependencies=[]),
                     run_id="12345678-1234-4123-8123-123456789abc", built_at="2026-10-10T01:02:03Z", status="success",
-                    requested_targets=[target], summary=dict(total=len(variants), success=len(variants), failed=0),
+                    requested_targets=sorted({e["target"] for e in environments}),
+                    summary=dict(total=len(environments), success=len(environments), failed=0),
                     build_environments=environments, artifacts=rows)
     if explicit:
-        manifest["required_variants"] = [dict(target=target, target_triple=v) for v in variants]
+        manifest["required_variants"] = [dict(target=e["target"], target_triple=e["target_triple"]) for e in environments]
     producer = save(base / "producer.json", manifest)
     proof = snapshot / "release.intoto.jsonl"
     result = invoke(["bash", runtime / "slsa.sh", "generate-manifest", producer, assets, "--repository", repo,
@@ -184,12 +220,12 @@ def recipe_for(index, triple=None):
     return value
 
 
-def install(label, snapshot, recipe, prefix=None, expected=0, extra=()):
+def install(label, snapshot, recipe, prefix=None, expected=0, extra=(), policy_targets=None):
     file = save(work / (label + "-recipe.json"), recipe)
     prefix = prefix or work / (label + "-prefix")
     result = invoke(["bash", runtime / "release_install.sh", "--snapshot", snapshot, "--recipe", file,
                      "--prefix", prefix, "--repo", repo, "--tag", tag, "--sha", pin, "--builder", builder,
-                     "--targets", target, "--public-key", public, *extra], expected, label)
+                     "--targets", ",".join(policy_targets or [target]), "--public-key", public, *extra], expected, label)
     value = json.loads(result.stdout)
     check(label + " one result agrees with process exit", value.get("kind") == "dsr-release-install" and value.get("exit_code") == result.returncode)
     if expected:
@@ -202,6 +238,241 @@ def install(label, snapshot, recipe, prefix=None, expected=0, extra=()):
 def state(prefix):
     return {str(p.relative_to(prefix)): (p.lstat().st_ino, os.readlink(p) if p.is_symlink() else digest(p))
             for p in prefix.rglob("*") if p.is_symlink() or p.is_file()}
+
+
+def data_state(prefix):
+    observed = {}
+    for directory, dirs, files in os.walk(prefix, followlinks=False):
+        for filename in dirs + files:
+            path = Path(directory) / filename
+            info = path.lstat()
+            value = os.readlink(path) if stat.S_ISLNK(info.st_mode) else digest(path) if stat.S_ISREG(info.st_mode) else None
+            observed[str(path.relative_to(prefix))] = (info.st_ino, info.st_mode, info.st_nlink, value)
+    return observed
+
+
+def runtime_data_cases():
+    # All bytes and compiler metadata are owned fixtures. The production
+    # manifest mapper and full snapshot verifier run with the selected signer
+    # above (real Minisign by default); no installed payload is executed.
+    snapshot, producer = make_snapshot("runtime-data", with_data=True)
+    matrix = [target, "windows/arm64"]
+    selected = recipe_for(0, gnu)
+    selected["files"] = [
+        dict(path="share/app/runtime.json", artifact="runtime.json"),
+        dict(path="share/app/help.txt", artifact="payload-0.tar.gz", member="docs/help.txt"),
+        dict(path="share/app/EMPTY", artifact="payload-0.tar.gz", member="docs/EMPTY"),
+        dict(path="share/app/models/model.json", artifact="model-0.json"),
+        dict(path="share/app/texts/common.txt", artifact="resources.tar.gz", member="texts/shared.txt"),
+    ]
+    expected_bytes = {
+        "share/app/runtime.json": (snapshot / "artifacts/runtime.json").read_bytes(),
+        "share/app/help.txt": (producer.parent / "payload-0/docs/help.txt").read_bytes(),
+        "share/app/EMPTY": b"",
+        "share/app/models/model.json": (snapshot / "artifacts/model-0.json").read_bytes(),
+        "share/app/texts/common.txt": (producer.parent / "shared-members/texts/shared.txt").read_bytes(),
+    }
+    expected_dirs = {"share", "share/app", "share/app/models", "share/app/texts"}
+
+    def data_install(label, recipe=selected, prefix=None, expected=0, extra=(), source=snapshot):
+        return install("data-" + label, source, recipe, prefix, expected, extra, matrix)
+
+    planned, prefix = data_install("plan", extra=("--dry-run",))
+    check("data dry-run authenticates and extracts without installation state",
+          planned.get("status") == "planned" and not prefix.exists() and not Path(str(prefix) + ".lock").exists() and
+          {f["path"] for f in planned.get("files", [])} == set(expected_bytes))
+    first, prefix = data_install("install")
+    if first.get("status") != "installed":
+        check("runtime-data lifecycle requires successful direct installation", False)
+        return
+    first_id = first["generation"]
+    generation = prefix / "generations" / first_id
+    original = data_state(prefix)
+    receipt = load(generation / "receipt.json")
+    check("one pointer activates complete executable and nested data sets",
+          os.readlink(prefix / "current") == "generations/" + first_id and first["activated"] and
+          {p.name for p in (generation / "bin").iterdir()} == {"app", "helper", "alias"} and
+          all((generation / name).read_bytes() == data for name, data in expected_bytes.items()))
+    check("data results expose stable current and generation share paths",
+          first.get("share_dir") == str(prefix / "current/share") and
+          first.get("generation_share_dir") == str(generation / "share"))
+    check("data are ordinary 0644 files including empty and originally executable members",
+          all(stat.S_IMODE((generation / name).stat().st_mode) == 0o644 and
+              (generation / name).stat().st_nlink == 1 for name in expected_bytes) and
+          (generation / "share/app/EMPTY").stat().st_size == 0 and
+          stat.S_IMODE((producer.parent / "payload-0/docs/help.txt").stat().st_mode) == 0o755)
+    check("data directory closure is exact and uses fixed ordinary modes",
+          {str(p.relative_to(generation)) for p in (generation / "share").rglob("*") if p.is_dir()} | {"share"} == expected_dirs and
+          all(stat.S_IMODE((generation / name).stat().st_mode) == 0o755 for name in expected_dirs))
+    check("receipt binds every data selector, byte digest, size and non-executable mode",
+          receipt.get("files") == first["files"] and
+          {f["path"] for f in receipt["files"]} == set(expected_bytes) and
+          all(f["sha256"] == hashlib.sha256(expected_bytes[f["path"]]).hexdigest() and
+              f["size_bytes"] == len(expected_bytes[f["path"]]) and f["mode"] == 0o644 for f in receipt["files"]))
+    check("shared files never gain a compiler identity while physical files retain the selected ABI",
+          all(f.get("target") == ("additional" if f["artifact"] in ("runtime.json", "resources.tar.gz") else target) and
+              ("target_triple" not in f if f["target"] == "additional" else f.get("target_triple") == gnu)
+              for f in receipt["files"]))
+    check("unselected signed data and credentials are not installed",
+          {p.name for p in generation.iterdir()} == {"bin", "share", "receipt.json", "release.intoto.jsonl", "release.intoto.jsonl.minisig"} and
+          {str(p.relative_to(generation)) for p in (generation / "share").rglob("*") if p.is_file()} == set(expected_bytes))
+    ordered = copy.deepcopy(selected)
+    ordered["files"].reverse()
+    ordered["executables"].reverse()
+    same, _ = data_install("reordered", ordered, prefix)
+    check("equivalent executable and data ordering reuses every generation inode",
+          same.get("generation") == first_id and same.get("activated") is False and data_state(prefix) == original)
+
+    # A data-only change is a new complete generation; it cannot silently
+    # replace user-selected runtime resources while retaining the same bins.
+    replacement = copy.deepcopy(selected)
+    next(f for f in replacement["files"] if f["path"] == "share/app/runtime.json")["artifact"] = "runtime-next.json"
+    data_install("replacement-needs-consent", replacement, prefix, 2)
+    check("data-only replacement without consent leaves all active files untouched", data_state(prefix) == original)
+    newer, _ = data_install("replacement", replacement, prefix, extra=("--replace",))
+    check("data-only replacement switches one complete generation and retains the old one",
+          newer.get("generation") != first_id and newer.get("previous_generation") == first_id and
+          (prefix / "current/share/app/runtime.json").read_bytes() == (snapshot / "artifacts/runtime-next.json").read_bytes() and
+          (generation / "share/app/runtime.json").read_bytes() == expected_bytes["share/app/runtime.json"] and
+          (prefix / "current/bin/app").read_bytes() == (generation / "bin/app").read_bytes())
+    replaced = data_state(prefix)
+    forged = work / "data-forged-rollback"
+    shutil.copytree(snapshot, forged)
+    (forged / "release.intoto.jsonl.minisig").write_text("not an authentic signature\n")
+    data_install("rollback-reauthenticates", selected, prefix, 1, ("--replace",), forged)
+    check("retained generations cannot authorize rollback with invalid current proof", data_state(prefix) == replaced)
+    rolled, _ = data_install("rollback", selected, prefix, extra=("--replace",))
+    check("authenticated rollback reuses the exact original executable and data generation",
+          rolled.get("generation") == first_id and
+          all((generation / name).stat().st_ino == original["generations/" + first_id + "/" + name][0]
+              for name in expected_bytes))
+    active = data_state(prefix)
+
+    for label, mutate in (
+        ("foreign-owner", lambda r: r["files"][0].update(artifact="foreign.json")),
+        ("wrong-abi", lambda r: r["files"][3].update(artifact="model-1.json")),
+        ("shared-executable", lambda r: r["executables"][2].update(artifact="runtime.json")),
+        ("raw-member", lambda r: r["files"][0].update(member="runtime.json")),
+        ("archive-without-member", lambda r: r["files"][1].pop("member")),
+        ("unlisted-asset", lambda r: r["files"][0].update(artifact="absent.json")),
+    ):
+        invalid = copy.deepcopy(selected)
+        mutate(invalid)
+        data_install(label, invalid, prefix, 4, ("--replace",))
+        check(label + " never changes the prior executable/data generation", data_state(prefix) == active)
+    partial = copy.deepcopy(selected)
+    partial["files"].append(dict(path="share/zz-after-copies.txt", artifact="payload-0.tar.gz", member="docs/missing.txt"))
+    data_install("partial-staging", partial, prefix, 7, ("--replace",))
+    check("failure after earlier data copies leaves no partial active generation", data_state(prefix) == active)
+
+    # Independent contracts are checked before acquisition and then compared
+    # with the whole authenticated statement, never selected from a receipt.
+    manifest = load(producer)
+    contract = dict(schema_version=1, required_variants=manifest["required_variants"],
+                    required_assets=[{k:a[k] for k in ("name", "target", "target_triple", "archive_format") if k in a}
+                                     for a in manifest["artifacts"]])
+    contract_file = save(work / "data-contract.json", contract)
+    contracted, contract_prefix = data_install("contract", extra=("--release-contract", contract_file))
+    check("independent exact content policy binds the installed data generation",
+          contracted.get("status") == "installed" and isinstance(contracted.get("release_contract_sha256"), str) and
+          load(contract_prefix / "generations" / contracted["generation"] / "receipt.json")["release_contract_sha256"] ==
+              contracted["release_contract_sha256"])
+    for label, edit in (
+        ("contract-missing-data", lambda c: c.update(required_assets=[a for a in c["required_assets"] if a["name"] != "runtime.json"])),
+        ("contract-wrong-owner", lambda c: next(a for a in c["required_assets"] if a["name"] == "runtime.json").update(
+            target="windows/arm64", target_triple="aarch64-pc-windows-msvc")),
+        ("contract-wrong-abi", lambda c: next(a for a in c["required_assets"] if a["name"] == "model-0.json").update(target_triple=musl)),
+        ("contract-wrong-format", lambda c: next(a for a in c["required_assets"] if a["name"] == "runtime.json").update(archive_format="tar.gz")),
+    ):
+        invalid = copy.deepcopy(contract)
+        edit(invalid)
+        file = save(work / (label + ".json"), invalid)
+        data_install(label, selected, prefix, 4, ("--replace", "--release-contract", file))
+        check(label + " rejects before replacing any active data", data_state(prefix) == active)
+
+    for label, fields in (
+        ("null", None), ("wrong-type", {}),
+        ("traversal", [dict(path="share/../outside", artifact="runtime.json")]),
+        ("bin-destination", [dict(path="bin/runtime.json", artifact="runtime.json")]),
+        ("proof-destination", [dict(path="release.intoto.jsonl", artifact="runtime.json")]),
+        ("share-root", [dict(path="share", artifact="runtime.json")]),
+        ("mode-override", [dict(path="share/runtime.json", artifact="runtime.json", mode=0o755)]),
+        ("case-file", [dict(path="share/Data", artifact="runtime.json"), dict(path="share/data", artifact="runtime.json")]),
+        ("case-directory", [dict(path="share/App/a", artifact="runtime.json"), dict(path="share/app/b", artifact="runtime.json")]),
+        ("file-ancestor", [dict(path="share/app", artifact="runtime.json"), dict(path="share/app/data", artifact="runtime.json")]),
+    ):
+        invalid = dict(copy.deepcopy(selected), files=fields)
+        file = save(work / ("data-invalid-" + label + ".json"), invalid)
+        invoke(["bash", runtime / "release_install.sh", "describe-recipe", "--recipe", file], 4, "invalid data " + label)
+
+    # The complete snapshot remains authoritative even for subjects the
+    # installation did not select. No data selector narrows authentication.
+    for name in ("runtime.json", "unused.json"):
+        damaged = work / ("data-damaged-" + name)
+        shutil.copytree(snapshot, damaged)
+        (damaged / "artifacts" / name).write_bytes(b"changed signed data\n")
+        data_install("snapshot-drift-" + name, selected, prefix, 1, ("--replace",), damaged)
+        check("changed " + name + " blocks installation without touching current", data_state(prefix) == active)
+    missing = work / "data-missing-subject"
+    shutil.copytree(snapshot, missing)
+    (missing / "artifacts/runtime.json").rename(work / "data-missing-subject-held.json")
+    data_install("snapshot-missing-data", selected, prefix, 7, ("--replace",), missing)
+    check("missing signed data cannot be replaced from a retained generation", data_state(prefix) == active)
+
+    unsafe = work / "data-unsafe-shared-archive"
+    shutil.copytree(snapshot, unsafe)
+    with tarfile.open(unsafe / "artifacts/resources.tar.gz", "w:gz") as archive:
+        link = tarfile.TarInfo("texts/shared.txt")
+        link.type, link.linkname = tarfile.SYMTYPE, "../../outside"
+        archive.addfile(link)
+    unsafe_manifest = copy.deepcopy(manifest)
+    asset = next(a for a in unsafe_manifest["artifacts"] if a["name"] == "resources.tar.gz")
+    asset.update(sha256=digest(unsafe / "artifacts/resources.tar.gz"), size_bytes=(unsafe / "artifacts/resources.tar.gz").stat().st_size)
+    unsafe_producer = save(work / "data-unsafe-producer.json", unsafe_manifest)
+    (unsafe / "release.intoto.jsonl").rename(work / "data-unsafe-original-proof.jsonl")
+    (unsafe / "release.intoto.jsonl.minisig").rename(work / "data-unsafe-original-proof.minisig")
+    invoke(["bash", runtime / "slsa.sh", "generate-manifest", unsafe_producer, unsafe / "artifacts", "--repository", repo,
+            "--builder", builder, "--output", unsafe / "release.intoto.jsonl"], label="unsafe data archive manifest mapping")
+    sign(unsafe / "release.intoto.jsonl")
+    data_install("signed-unsafe-archive", selected, prefix, 4, ("--replace",), unsafe)
+    check("authentic shared archive links cannot escape or activate", data_state(prefix) == active and not (work / "outside").exists())
+
+    for label in ("bytes", "missing", "extra-file", "extra-dir", "file-mode", "directory-mode", "file-link", "directory-link", "hardlink"):
+        damaged = work / ("data-retained-" + label)
+        shutil.copytree(prefix, damaged, symlinks=True)
+        saved = damaged / "generations" / first_id
+        file = saved / "share/app/runtime.json"
+        held = work / ("data-held-" + label)
+        if label == "bytes":
+            file.write_bytes(b"changed installed data\n")
+        elif label == "missing":
+            file.rename(held)
+        elif label == "extra-file":
+            (saved / "share/app/unlisted.json").write_bytes(b"unlisted data\n")
+        elif label == "extra-dir":
+            (saved / "share/app/unlisted-dir").mkdir()
+        elif label == "file-mode":
+            file.chmod(0o755)
+        elif label == "directory-mode":
+            (saved / "share/app").chmod(0o700)
+        elif label == "file-link":
+            file.rename(held)
+            file.symlink_to(held)
+        elif label == "directory-link":
+            (saved / "share/app/texts").rename(held)
+            (saved / "share/app/texts").symlink_to(held, target_is_directory=True)
+        else:
+            os.link(file, held)
+        before = data_state(damaged)
+        data_install("retained-" + label, selected, damaged, 7)
+        check("retained data " + label + " is refused without repair or pointer replacement", data_state(damaged) == before)
+    check("failed data preparations leave no private installation staging", not list(work.glob(".dsr-install-*")))
+
+
+runtime_data_cases()
+if os.environ.get("DSR_INSTALL_DATA_ONLY") == "1":
+    print("Results: %d passed, %d failed\nEvidence: %s" % (passed, failed, work), flush=True)
+    sys.exit(1 if failed else 0)
 
 
 snapshot, producer = make_snapshot("matrix")

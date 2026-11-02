@@ -351,10 +351,16 @@ Cargo configuration, or toolchain selection file prevents artifact collection,
 even if compilation succeeds. Results, durable state and manifests retain the
 full identities under `cargo_isolation.toolchain` and the context digests under
 `cargo_isolation.cargo_context`. General environment values remain digest-only;
-the safe numeric Cargo `[env]` settings `RUST_MIN_STACK` and `RUST_TEST_THREADS`
-retain their configured and effective values in toolchain evidence. These
-settings support literal strings and inline tables with Boolean `force` and
-absent or false `relative`, preserving Cargo's configured-environment precedence.
+the bounded Cargo `[env]` settings `RUST_MIN_STACK`, `RUST_TEST_THREADS`, and
+`CARGO_INCREMENTAL` retain their configured and effective values in toolchain
+evidence. The two `RUST_*` settings require positive-integer strings;
+`CARGO_INCREMENTAL` accepts only the string `"0"`. These settings support literal
+strings and inline tables with Boolean `force` and absent or false `relative`.
+Cargo applies `[env]` to its children, so `force=true` cannot override Cargo's
+own incremental mode. An incoming `CARGO_INCREMENTAL` other than `0` therefore
+refuses this exemption even with `force=true`. Set `CARGO_INCREMENTAL=0` in the
+build environment to force Cargo itself to disable incremental compilation;
+a tracked `[env]` value alone does not override the selected profile.
 
 This Windows boundary accepts one literal `cargo build` or `cargo rustc` command,
 an optional first `+toolchain`, and ordinary Cargo build options. Quote whole
@@ -975,10 +981,15 @@ replacement restores the previous executables and leaves unrelated files
 alone. Successful `--json` output includes each installed executable's name,
 path, SHA-256 and byte size in `binaries`, alongside the primary `path`.
 
-Rust source fallback builds the same selected set from one pinned commit,
-including binaries in other workspace packages, and rejects ambiguous Cargo
-output providers. Source installation still requires `--from-source` or
-`--allow-source-build`; Go and Bun source builds support a single executable.
+Source fallback builds the same selected set from one pinned commit. Rust
+includes binaries in other workspace packages and rejects ambiguous Cargo
+output providers. Go companions use their own `cmd/<name>` packages; Bun and
+TypeScript companions use their exact `package.json` `bin` entries. An explicit
+`source_entry` selects only the primary. Every selected member must build and
+verify before the family is installed. Source installation still requires
+`--from-source` or `--allow-source-build`; see the
+[source family contract](docs/INSTALLER_GENERATION.md#executable-families-from-source)
+for entry selection, dependency locking and failure behavior.
 
 Private GitHub source builds use the same account as release downloads and
 freshness checks: `DSR_GH_TOKEN`, then `GITHUB_TOKEN`, then `GH_TOKEN`, then the
@@ -1400,6 +1411,15 @@ run one after the other.
 A target whose host is at its `concurrency` limit waits for a slot for up to
 one build timeout (`DSR_BUILD_TIMEOUT`, default 3600s) instead of failing
 after five minutes; set `DSR_SELECTOR_WAIT_TIMEOUT` to choose another bound.
+
+Native disk admission budgets 20 GiB of available capacity per configured host
+build slot: two slots require 40 GiB and four require 80 GiB. Shared filesystems
+and APFS containers count their capacity once, while each volume's quota still
+limits usable space. A large volume above 90% usage can proceed with a warning
+when its byte requirement is met. Missing `concurrency` defaults to two; invalid
+counts refuse admission. This check observes capacity without reserving it.
+See [disk admission](docs/UNIX_DISK_ADMISSION.md) for split-storage contracts,
+effective native paths, and the deterministic regression commands.
 
 ---
 

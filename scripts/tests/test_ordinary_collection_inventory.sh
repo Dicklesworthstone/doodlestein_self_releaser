@@ -4,8 +4,299 @@
 # shellcheck disable=SC1090,SC2034 # Extracted production functions consume fixture variables through Bash dynamic scope.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+
+# Full build-command regressions use a controlled producer/scheduler boundary.
+# Config parsing, receipts, collection, packaging, final byte admission and
+# publication/checkpoint writes are real. Tiny host ELF executables are compiled
+# with cc; the fixture does not claim native Go/Rust or GNU/musl qualification.
+test_companion_packaging() {
+    python3 - "$ROOT" "${DSR_TEST_COMMAND_FILE:-$ROOT/dsr}" <<'PY'
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import platform
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import zipfile
+
+root, command_file = map(Path, sys.argv[1:])
+for dependency in ('bash', 'cc', 'git', 'jq', 'yq', 'tar', 'gzip', 'xz', 'zip', 'unzip'):
+    if not shutil.which(dependency):
+        raise SystemExit('Companion packaging tests require ' + dependency)
+machine = platform.machine()
+if platform.system() != 'Linux' or machine not in ('x86_64', 'aarch64'):
+    print('SKIP: host ELF companion-packaging fixture requires Linux AMD64 or ARM64')
+    raise SystemExit(0)
+target = 'linux/' + ('amd64' if machine == 'x86_64' else 'arm64')
+triple_arch = 'x86_64' if machine == 'x86_64' else 'aarch64'
+triples = [triple_arch + '-unknown-linux-' + libc for libc in ('gnu', 'musl')]
+work = Path(tempfile.mkdtemp(prefix='dsr-companion-packaging-'))
+print('Companion packaging evidence: ' + str(work), flush=True)
+print('Command SHA256: ' + hashlib.sha256(command_file.read_bytes()).hexdigest(), flush=True)
+passed = 0
+failures = []
+
+def check(label, condition):
+    global passed
+    if not condition:
+        raise AssertionError(label)
+    passed += 1
+    print('PASS: ' + label, flush=True)
+
+def run(args, **options):
+    return subprocess.run(list(map(str, args)), check=True, capture_output=True, timeout=30, **options)
+
+def save(path, value):
+    path.write_text(json.dumps(value) + '\n')
+
+source = work / 'source'
+source.mkdir()
+(source / 'main.c').write_text('#include <stdio.h>\n#ifndef LABEL\n#define LABEL "primary"\n#endif\nint main(void) { puts("rolefixture " LABEL); return 0; }\n')
+(source / 'LICENSE').write_text('Fixture license: redistribution permitted.\n')
+run(['git', '-C', source, 'init', '-q', '-b', 'main'])
+run(['git', '-C', source, 'add', 'main.c', 'LICENSE'])
+run(['git', '-C', source, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+     '-c', 'commit.gpgsign=false', 'commit', '-qm', 'tiny packaging fixture'])
+run(['git', '-C', source, 'tag', 'v1.2.3'])
+source_sha = run(['git', '-C', source, 'rev-parse', 'HEAD']).stdout.decode().strip()
+binaries = []
+for label in ('primary', 'secondary'):
+    binary = work / label
+    run(['cc', '-O2', '-DLABEL="' + label + '"', source / 'main.c', '-o', binary])
+    check('real host ELF runs: ' + label, run([binary]).stdout == ('rolefixture ' + label + '\n').encode())
+    binaries.append(binary.read_bytes())
+
+driver = work / 'driver.sh'
+driver.write_text(r'''#!/usr/bin/env bash
+set -uo pipefail
+ROOT="$1" COMMAND_FILE="$2" CASE_ROOT="$3"
+export DSR_CONFIG_DIR="$CASE_ROOT/config" DSR_STATE_DIR="$CASE_ROOT/state" DSR_CACHE_DIR="$CASE_ROOT/cache"
+export DSR_CONFIG_FILE="$DSR_CONFIG_DIR/config.yaml" DSR_REPOS_FILE="$DSR_CONFIG_DIR/repos.yaml"
+export DSR_HOSTS_FILE="$DSR_CONFIG_DIR/hosts.yaml" ACT_CONFIG_DIR="$DSR_CONFIG_DIR" ACT_REPOS_DIR="$DSR_CONFIG_DIR/repos.d"
+export JSON_MODE=true DRY_RUN=false VERBOSE=false DSR_VERSION=fixture NO_COLOR=1
+export RCH_DISABLED=1 RCH_CARGO_WRAPPER_BYPASS=1
+unset RCH_REQUIRE_REMOTE
+for module in logging config build_state act_runner artifact_naming git_ops packaging; do
+    source "$ROOT/src/$module.sh" || exit 1
+done
+source <(awk '/^cmd_build\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$COMMAND_FILE") || exit 1
+source <(awk '/^json_envelope\(\) \{/{copy=1} copy{print} copy && /^# ====/{exit}' "$COMMAND_FILE") || exit 1
+_dsr_require() { case "$1" in artifact_naming|packaging) return 0 ;; *) return 3 ;; esac; }
+act_check() { return 0; }
+act_check_prereqs() { return 0; }
+act_orchestrate_build() {
+    local tool="$1" version="$2" run='' rows row path receipt additional result task key
+    local completed='[]' keys=()
+    shift 2
+    while (($#)); do
+        case "$1" in --run-id) run="$2"; shift 2 ;; --) break ;; *) shift ;; esac
+    done
+    [[ -n "$run" ]] || return 4
+    rows=$(cat "$CASE_ROOT/producer.json") || return 4
+    while IFS= read -r key; do keys+=("$key"); done < <(jq -r '.[].task_key' <<< "$rows")
+    run=$(DSR_RUN_ID="$run" build_state_create "$tool" "$version" "${keys[@]}") || return 4
+    build_state_update_status "$tool" "$version" running "$run" || return 4
+    while IFS= read -r row; do
+        additional='[]'
+        while IFS= read -r path; do
+            [[ -n "$path" ]] || continue
+            receipt=$(jq -nc --arg path "$path" --arg sha "$(_act_sha256 "$path")" \
+                --argjson size "$(_act_file_size "$path")" --arg identity "$(_act_file_identity "$path")" \
+                '{path:$path,sha256:$sha,size_bytes:$size,identity:$identity}') || return 4
+            additional=$(jq -c --argjson receipt "$receipt" '. + [$receipt]' <<< "$additional") || return 4
+        done < <(jq -r '.additional_paths[]' <<< "$row")
+        row=$(jq -c --argjson additional "$additional" 'del(.additional_paths) + {additional_artifacts:$additional}' <<< "$row") || return 4
+        row=$(jq -c --argjson receipts "$(_act_result_artifact_receipts "$row")" '. + {resume_artifacts:$receipts}' <<< "$row") || return 4
+        completed=$(jq -c --argjson row "$row" '. + [$row]' <<< "$completed") || return 4
+        task=$(jq -r '.task_key' <<< "$row") || return 4
+        build_state_update_target "$tool" "$version" "$task" completed \
+            "$(jq -cn --argjson row "$row" '{result:$row}')" "$run" || return 4
+    done < <(jq -c '.[]' <<< "$rows")
+    result=$(jq -nc --arg tool "$tool" --arg version "$version" --arg run "$run" \
+        --arg sha "$DSR_FIXTURE_SOURCE_SHA" --argjson rows "$completed" \
+        '{tool:$tool,version:$version,run_id:$run,status:"success",git_sha:$sha,git_ref:"v1.2.3",
+          build_purpose:"release",publishable:true,requested_targets:([$rows[].platform]|unique),
+          summary:{total:($rows|length),success:($rows|length),failed:0},targets:$rows}') || return 4
+    printf '%s\n' "$result" > "$CASE_ROOT/observed-producer.json" || return 4
+    printf '%s\n' "$result"
+}
+config_load || exit 1
+cmd_build rolefixture --version 1.2.3 --no-sync --output-dir "$CASE_ROOT/output"
+''')
+
+def archive(path, format, members):
+    if format == 'zip':
+        with zipfile.ZipFile(path, 'w', compression=zipfile.ZIP_DEFLATED) as stream:
+            for name, data, mode in members:
+                item = zipfile.ZipInfo(name)
+                item.create_system = 3
+                item.external_attr = (stat.S_IFREG | mode) << 16
+                stream.writestr(item, data)
+    else:
+        with tarfile.open(path, 'w:gz' if format == 'tar.gz' else 'w:xz') as stream:
+            for name, data, mode in members:
+                item = tarfile.TarInfo(name)
+                item.size, item.mode, item.mtime = len(data), mode, 1
+                stream.addfile(item, io.BytesIO(data))
+
+def contents(path, format):
+    if format == 'zip':
+        with zipfile.ZipFile(path) as stream:
+            return {row.filename: stream.read(row) for row in stream.infolist() if not row.is_dir()}
+    with tarfile.open(path) as stream:
+        return {row.name: stream.extractfile(row).read() for row in stream.getmembers() if row.isfile()}
+
+def exercise(label, desired='tar.gz', primary_format=None, matrix=False, missing=False, corrupt=False,
+             includes=False, companion_role=None, alternate_primary=False, same_bytes=False):
+    base = work / label
+    (base / 'config/repos.d').mkdir(parents=True)
+    producer = base / 'producer'
+    producer.mkdir()
+    save(base / 'config/config.yaml', {'schema_version': '1.0.0'})
+    save(base / 'config/repos.yaml', {'tools': {}})
+    save(base / 'config/hosts.yaml', {'schema_version': '1.0.0', 'hosts': {}})
+    companion_format = 'tar.gz' if desired == 'binary' else desired
+    companion_name = 'documentation.' + companion_format
+    if companion_role:
+        suffix = triples[1] if companion_role.startswith('secondary-') else target.replace('/','-')
+        versioned = 'versioned' in companion_role
+        companion_name = 'rolefixture-' + ('1.2.3-' if versioned else '') + suffix + ('' if desired=='binary' else '.'+desired)
+        if companion_role.startswith('case-'):
+            companion_name = companion_name.upper()
+    companion = producer / companion_name
+    archive(companion, companion_format, [('README.txt', b'Companion documentation without an executable.\n', 0o644)])
+    companion_bytes = companion.read_bytes()
+    config = dict(tool_name='rolefixture', repo='example/rolefixture', local_path=str(source), language='go',
+                  binary_name='rolefixture', build_cmd='cc main.c -o rolefixture', targets=[target], act_job_map={target: None},
+                  artifact_naming='${name}-${version}-' + ('${target_triple}' if matrix else '${os}-${arch}'),
+                  install_script_compat='${name}-' + ('${target_triple}' if matrix else '${os}-${arch}'),
+                  archive_format={'linux': desired}, workspace_additional_artifacts={target:[dict(name=companion.name,format=companion_format)]})
+    if matrix:
+        config['target_triples'] = {target: triples}
+    if includes:
+        config['include_files'] = ['LICENSE']
+    save(base / 'config/repos.d/rolefixture.yaml', config)
+    rows, original_primaries = [], []
+    for index, triple in enumerate(triples if matrix else ['']):
+        directory = producer / str(index)
+        directory.mkdir()
+        primary = directory / ('rolefixture-1.2.3-' + target.replace('/', '-') + '.' + primary_format if primary_format else 'rolefixture')
+        if alternate_primary:
+            primary = directory / ('producer.' + primary_format)
+        data = binaries[index]
+        if not missing:
+            if corrupt:
+                primary.write_bytes(b'not an archive\n')
+            elif primary_format:
+                archive(primary, primary_format, [('rolefixture', data, 0o755)])
+            else:
+                primary.write_bytes(data)
+                primary.chmod(0o755)
+            original_primaries.append((primary, primary.read_bytes()))
+        row = dict(platform=target,method='native',host='fixture',status='success',
+                   task_key=target + ('@'+triple if triple else ''),artifact_paths=[] if missing else [str(primary)],
+                   additional_paths=[str(companion)] if index==0 else [])
+        if triple:
+            row['target_triple'] = triple
+        rows.append(row)
+    if same_bytes:
+        companion.write_bytes(original_primaries[0][1])
+        companion_bytes = companion.read_bytes()
+    save(base / 'producer.json', rows)
+    process = subprocess.run(['bash',str(driver),str(root),str(command_file),str(base)], capture_output=True, timeout=60,
+                             env=dict(os.environ,DSR_FIXTURE_SOURCE_SHA=source_sha))
+    (base / 'stdout.json').write_bytes(process.stdout)
+    (base / 'stderr.log').write_bytes(process.stderr)
+    (base / 'exit-status').write_text(str(process.returncode) + '\n')
+    marker = json.loads((base/'output/.dsr-build-purpose.json').read_bytes())
+    states = list((base/'state/builds/rolefixture').glob('**/state.json'))
+    check(label + ': exactly one durable build checkpoint', len(states)==1)
+    state = json.loads(states[0].read_bytes())
+    check(label + ': companion source bytes stay unchanged', companion.read_bytes()==companion_bytes)
+    for path, original in original_primaries:
+        check(label + ': primary source stays unchanged ' + path.parent.name, path.read_bytes()==original)
+    if missing or corrupt or companion_role:
+        check(label + ': invalid primary ownership refuses the build', process.returncode!=0)
+        check(label + ': failed packaging grants no publication authority', marker['publishable'] is False and state['status']!='completed' and
+              not (base/'output/rolefixture-v1.2.3-manifest.json').exists())
+        check(label + ': refusal preserves collected companion bytes', (base/'output'/companion.name).read_bytes()==companion_bytes)
+        if companion_role:
+            check(label + ': refusal identifies the reserved-name conflict', b'collides with a configured additional artifact' in process.stderr)
+        return
+    check(label + ': build command succeeds', process.returncode==0)
+    result = json.loads(process.stdout)
+    check(label + ': success envelope and completion marker agree', result['status']=='success' and result['details']['publishable'] is True and
+          marker['publishable'] is True and marker['publication_status']=='completed' and state['status']=='completed')
+    manifest = json.loads((base/'output/rolefixture-v1.2.3-manifest.json').read_bytes())
+    inventory = {row['name']:row for row in manifest['artifacts']}
+    check(label + ': literal companion is retained in the final manifest', companion.name in inventory and
+          (base/'output'/companion.name).read_bytes()==companion_bytes)
+    for index, triple in enumerate(triples if matrix else ['']):
+        suffix = triple if matrix else target.replace('/','-')
+        extension = '' if desired=='binary' else '.'+desired
+        versioned = 'rolefixture-1.2.3-'+suffix+extension
+        alias = 'rolefixture-'+suffix+extension
+        check(label + ': complete primary naming for ' + suffix, all(name in inventory and (base/'output'/name).is_file() for name in (versioned,alias)))
+        actual = (base/'output'/versioned).read_bytes()
+        check(label + ': installer alias binds primary bytes for ' + suffix, (base/'output'/alias).read_bytes()==actual)
+        if desired=='binary':
+            check(label + ': raw primary remains the compiled executable', actual==binaries[index])
+        else:
+            expected = {'rolefixture':binaries[index]}
+            if includes:
+                expected['LICENSE']=(source/'LICENSE').read_bytes()
+            check(label + ': archive contains the exact primary payload for ' + suffix, contents(base/'output'/versioned,desired)==expected)
+            if primary_format==desired and not includes:
+                check(label + ': matching prebuilt bytes are preserved', actual==original_primaries[index][1])
+        if matrix:
+            check(label + ': selected compiler variant stays bound', all(inventory[name]['target']==target and inventory[name]['target_triple']==triple for name in (versioned,alias)))
+    check(label + ': every final digest and size matches actual output', all(
+        hashlib.sha256((base/'output'/row['name']).read_bytes()).hexdigest()==row['sha256'] and
+        (base/'output'/row['name']).stat().st_size==row['size_bytes'] for row in manifest['artifacts']))
+
+cases = [
+    ('raw-with-gzip-companion', {}),
+    ('raw-with-zip-companion', dict(desired='zip')),
+    ('convert-primary-with-gzip-companion', dict(primary_format='tar.xz',includes=True)),
+    ('preserve-prebuilt-primary', dict(primary_format='tar.gz')),
+    ('raw-binary-primary', dict(desired='binary')),
+    ('variant-primary-ownership', dict(matrix=True)),
+    ('missing-primary', dict(missing=True)),
+    ('corrupt-primary', dict(primary_format='tar.xz',corrupt=True)),
+    ('reserved-versioned-archive', dict(companion_role='versioned')),
+    ('reserved-versioned-binary', dict(desired='binary',companion_role='versioned')),
+    ('reserved-name-ignores-case', dict(companion_role='case-versioned')),
+    ('reserved-prebuilt-destination', dict(primary_format='tar.gz',alternate_primary=True,companion_role='versioned')),
+    ('reserved-secondary-variant', dict(matrix=True,companion_role='secondary-versioned')),
+    ('reserved-identical-alias', dict(primary_format='tar.gz',alternate_primary=True,same_bytes=True,companion_role='compat')),
+]
+for label, options in cases:
+    try:
+        exercise(label, **options)
+    except (AssertionError, OSError, ValueError, subprocess.SubprocessError, tarfile.TarError, zipfile.BadZipFile) as error:
+        failures.append(label)
+        print('FAIL: ' + label + ': ' + str(error), file=sys.stderr, flush=True)
+print('Companion packaging: %d passed, %d failed cases' % (passed,len(failures)), flush=True)
+raise SystemExit(1 if failures else 0)
+PY
+}
+
+case "${1:-}" in
+    --companion-packaging-only) test_companion_packaging; exit $? ;;
+    '') ;;
+    *) printf 'Unknown test option: %s\n' "$1" >&2; exit 4 ;;
+esac
 WORK=$(mktemp -d) || exit 1
 printf 'Fixtures retained: %s\n' "$WORK"
+# Ownership validation now uses the real document parser even when the legacy
+# matrix fixture below supplies its narrow target/naming API responses.
+source "$ROOT/src/config.sh"
 source "$ROOT/src/act_runner.sh"
 source "$ROOT/src/signing.sh"
 # The checksum writer is now an explicit pre-publication helper; the normal
@@ -264,3 +555,4 @@ echo 'PASS: actual collected-byte mutation refuses final sealing'
 printf 'post-worker mutation\n' >> "$WORK/linux_amd64/sbh"
 if act_generate_manifest "$result" "$WORK/source-mutation.json" "$renames"; then exit 1; fi
 echo 'PASS: source mutation cannot silently replace frozen worker bytes'
+test_companion_packaging

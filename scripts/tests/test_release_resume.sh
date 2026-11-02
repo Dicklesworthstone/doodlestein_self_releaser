@@ -660,6 +660,193 @@ planned_names() {
     jq -c --arg name "$1" '.details.plan.artifacts[] | select(.name == $name) | .upload_names' "$CASE/stdout"
 }
 
+# These are byte-bound command-planning fixtures, not compiler receipts. Use
+# the real declaration normalizer, ABI parser, naming policy and inventory
+# validator; only the existing command harness's remote boundary is replaced.
+literal_companion_fixture() {
+    local name="$1" triples="$2" format="${3:-json}"
+    # Restore real name generation rather than the global archive-name stub.
+    # shellcheck source=../../src/artifact_naming.sh
+    source "$PROJECT_ROOT/src/artifact_naming.sh" || return 1
+    python3 - "$CASE" "$name" "$triples" "$format" <<'PY'
+import hashlib
+import io
+import json
+from pathlib import Path
+import sys
+import tarfile
+
+case, name, triples, kind = Path(sys.argv[1]), sys.argv[2], json.loads(sys.argv[3]), sys.argv[4]
+config = dict(tool_name='tool', binary_name='tool', targets=['linux/amd64'],
+              language='rust' if triples else 'go',
+              artifact_naming='${name}-${version}-${os}-${arch}',
+              install_script_compat='${name}-${os}-${arch}',
+              workspace_additional_artifacts={'linux/amd64': [dict(name=name, format=kind)]})
+if triples:
+    config['target_triples'] = {'linux/amd64': triples}
+(case / 'config/repos.d/tool.yaml').write_text(json.dumps(config))
+artifacts = case / 'artifacts'
+rows = []
+
+def add(asset, triple, archive_format='none'):
+    data = (artifacts / asset).read_bytes()
+    row = dict(name=asset, target='linux/amd64', sha256=hashlib.sha256(data).hexdigest(),
+               size_bytes=len(data), archive_format=archive_format)
+    if triple:
+        row['target_triple'] = triple
+    rows.append(row)
+
+for index, triple in enumerate(triples or [None]):
+    asset = 'payload.bin' if index == 0 else 'tool-' + triple + '.bin'
+    (artifacts / asset).write_text('Release planning data for ' + asset + '\n')
+    add(asset, triple)
+primary = triples[0] if triples else None
+if kind == 'tar.gz':
+    with tarfile.open(artifacts / name, 'w:gz') as archive:
+        data = b'Literal companion archive content\n'
+        entry = tarfile.TarInfo('README.txt')
+        entry.size = len(data)
+        archive.addfile(entry, io.BytesIO(data))
+    # Equal bytes make the old alias planner incorrectly assign the primary
+    # archive's name to this companion too, independently of ABI inference.
+    (artifacts / 'tool-linux-amd64.tar.gz').write_bytes((artifacts / name).read_bytes())
+    add('tool-linux-amd64.tar.gz', primary, 'tar.gz')
+else:
+    (artifacts / name).write_text('{"compatibility_notes":["gnu","musl"]}\n')
+add(name, primary, 'tar.gz' if kind == 'tar.gz' else 'none')
+(artifacts / 'tool-v1.2.3-manifest.json').write_text(json.dumps(
+    dict(tool='tool', version='v1.2.3', status='success', artifacts=rows)))
+PY
+    [[ $? -eq 0 ]] || return 1
+    DRY_RUN=true
+}
+
+literal_companion_plan_is_read_only() {
+    [[ ! -s "$CALLS" && ! -e "$CASE/artifacts/SHA256SUMS" &&
+       ! -e "$DSR_STATE_DIR/releases/tool-v1.2.3-upload.json" ]] &&
+        [[ "$(_gh_asset_sha256 "$CASE/artifacts/tool-v1.2.3-manifest.json")" == "$LITERAL_MANIFEST_SHA" ]]
+}
+
+literal_companion_run_plan() {
+    LITERAL_MANIFEST_SHA=$(_gh_asset_sha256 "$CASE/artifacts/tool-v1.2.3-manifest.json") || return 1
+    run_release --resume
+    literal_companion_plan_is_read_only
+}
+
+test_literal_companion_unknown_abi_word_keeps_owner() {
+    setup literal_companion_unknown
+    literal_companion_fixture abi-musl-notes.json '["x86_64-unknown-linux-gnu"]' || return 1
+    literal_companion_run_plan || return 1
+    [[ $STATUS -eq 0 && "$(planned_names abi-musl-notes.json)" == '["abi-musl-notes.json"]' ]] &&
+        jq -e '.status == "dry_run" and any(.details.plan.artifacts[];
+            .name == "abi-musl-notes.json" and .target == "linux/amd64" and
+            .target_triple == "x86_64-unknown-linux-gnu")' "$CASE/stdout" >/dev/null
+}
+
+test_literal_companion_conflicting_abi_words_keep_primary_variant() {
+    setup literal_companion_variants
+    literal_companion_fixture abi-gnu-vs-musl.json \
+        '["x86_64-unknown-linux-gnu","x86_64-unknown-linux-musl"]' || return 1
+    literal_companion_run_plan || return 1
+    [[ $STATUS -eq 0 && "$(planned_names abi-gnu-vs-musl.json)" == '["abi-gnu-vs-musl.json"]' ]] &&
+        jq -e 'any(.details.plan.artifacts[]; .name == "abi-gnu-vs-musl.json" and
+            .target_triple == "x86_64-unknown-linux-gnu") and
+            any(.details.plan.artifacts[]; .name == "tool-x86_64-unknown-linux-musl.bin" and
+            .target_triple == "x86_64-unknown-linux-musl")' "$CASE/stdout" >/dev/null
+}
+
+test_literal_companion_go_singleton_needs_no_triple() {
+    setup literal_companion_go
+    literal_companion_fixture abi-gnu-vs-musl.json '[]' || return 1
+    literal_companion_run_plan || return 1
+    [[ $STATUS -eq 0 && "$(planned_names abi-gnu-vs-musl.json)" == '["abi-gnu-vs-musl.json"]' ]] &&
+        jq -e 'any(.details.plan.artifacts[]; .name == "abi-gnu-vs-musl.json" and
+            .target == "linux/amd64" and (.target_triple == null or .target_triple == ""))' \
+            "$CASE/stdout" >/dev/null
+}
+
+test_literal_companion_archive_never_derives_primary_aliases() {
+    setup literal_companion_archive
+    literal_companion_fixture support.tar.gz '["x86_64-unknown-linux-gnu"]' tar.gz || return 1
+    literal_companion_run_plan || return 1
+    [[ $STATUS -eq 0 && "$(planned_names support.tar.gz)" == '["support.tar.gz"]' ]] &&
+        jq -e '[.details.plan.artifacts[] | select(.upload_names | index("tool-linux-amd64.tar.gz")) | .name]
+            == ["tool-linux-amd64.tar.gz"]' "$CASE/stdout" >/dev/null
+}
+
+test_literal_companion_wrong_platform_is_rejected() {
+    setup literal_companion_wrong_platform
+    literal_companion_fixture notes.json '["x86_64-unknown-linux-gnu"]' || return 1
+    jq '(.artifacts[] | select(.name == "notes.json")) |=
+        (.target="darwin/amd64" | del(.target_triple))' \
+        "$CASE/artifacts/tool-v1.2.3-manifest.json" > "$CASE/manifest.next" &&
+        mv "$CASE/manifest.next" "$CASE/artifacts/tool-v1.2.3-manifest.json" || return 1
+    literal_companion_run_plan || return 1
+    [[ $STATUS -eq 4 ]] && grep -q 'notes.json.*linux/amd64.*darwin/amd64' "$CASE/stderr"
+}
+
+test_literal_companion_nonprimary_configured_variant_is_rejected() {
+    setup literal_companion_secondary
+    literal_companion_fixture notes.json \
+        '["x86_64-unknown-linux-gnu","x86_64-unknown-linux-musl"]' || return 1
+    jq '(.artifacts[] | select(.name == "notes.json")).target_triple="x86_64-unknown-linux-musl"' \
+        "$CASE/artifacts/tool-v1.2.3-manifest.json" > "$CASE/manifest.next" &&
+        mv "$CASE/manifest.next" "$CASE/artifacts/tool-v1.2.3-manifest.json" || return 1
+    literal_companion_run_plan || return 1
+    [[ $STATUS -eq 4 ]] && grep -q 'notes.json.*primary.*x86_64-unknown-linux-gnu' "$CASE/stderr"
+}
+
+test_literal_companion_unconfigured_variant_is_rejected() {
+    setup literal_companion_unconfigured
+    literal_companion_fixture notes.json '["x86_64-unknown-linux-gnu"]' || return 1
+    jq '(.artifacts[] | select(.name == "notes.json")).target_triple="x86_64-unknown-linux-musl"' \
+        "$CASE/artifacts/tool-v1.2.3-manifest.json" > "$CASE/manifest.next" &&
+        mv "$CASE/manifest.next" "$CASE/artifacts/tool-v1.2.3-manifest.json" || return 1
+    literal_companion_run_plan || return 1
+    [[ $STATUS -eq 4 ]] && grep -q 'notes.json.*not configured' "$CASE/stderr"
+}
+
+test_literal_companion_multivariant_missing_triple_is_rejected() {
+    setup literal_companion_missing_triple
+    literal_companion_fixture notes.json \
+        '["x86_64-unknown-linux-gnu","x86_64-unknown-linux-musl"]' || return 1
+    jq '(.artifacts[] | select(.name == "notes.json")) |= del(.target_triple)' \
+        "$CASE/artifacts/tool-v1.2.3-manifest.json" > "$CASE/manifest.next" &&
+        mv "$CASE/manifest.next" "$CASE/artifacts/tool-v1.2.3-manifest.json" || return 1
+    literal_companion_run_plan || return 1
+    [[ $STATUS -eq 4 ]] && grep -Eq 'target_triple|lacks the configured native variants' "$CASE/stderr"
+}
+
+test_literal_companion_registry_shadow_cannot_exempt_undeclared_name() {
+    setup literal_companion_undeclared
+    literal_companion_fixture abi-musl-notes.json '["x86_64-unknown-linux-gnu"]' || return 1
+    jq '{tools:{tool:.}}' "$ACT_REPOS_DIR/tool.yaml" > "$DSR_REPOS_FILE" || return 1
+    jq 'del(.workspace_additional_artifacts)' "$ACT_REPOS_DIR/tool.yaml" > "$CASE/config.next" &&
+        mv "$CASE/config.next" "$ACT_REPOS_DIR/tool.yaml" || return 1
+    literal_companion_run_plan || return 1
+    [[ $STATUS -eq 4 ]] && grep -q 'Cannot identify.*abi-musl-notes.json' "$CASE/stderr"
+}
+
+test_literal_companion_does_not_exempt_primary_name_contradiction() {
+    setup literal_companion_primary_contradiction
+    literal_companion_fixture notes.json \
+        '["x86_64-unknown-linux-gnu","x86_64-unknown-linux-musl"]' || return 1
+    mv "$CASE/artifacts/payload.bin" "$CASE/artifacts/tool-gnu-musl.bin" || return 1
+    jq '(.artifacts[] | select(.name == "payload.bin")).name="tool-gnu-musl.bin"' \
+        "$CASE/artifacts/tool-v1.2.3-manifest.json" > "$CASE/manifest.next" &&
+        mv "$CASE/manifest.next" "$CASE/artifacts/tool-v1.2.3-manifest.json" || return 1
+    literal_companion_run_plan || return 1
+    [[ $STATUS -eq 4 ]] && grep -q 'Cannot reconcile target_triple.*tool-gnu-musl.bin' "$CASE/stderr"
+}
+
+test_literal_companion_still_requires_manifest_bound_bytes() {
+    setup literal_companion_changed_bytes
+    literal_companion_fixture abi-gnu-vs-musl.json '["x86_64-unknown-linux-gnu"]' || return 1
+    printf '{"changed":true}\n' > "$CASE/artifacts/abi-gnu-vs-musl.json"
+    literal_companion_run_plan || return 1
+    [[ $STATUS -eq 4 ]] && grep -q 'differs from the manifest: abi-gnu-vs-musl.json' "$CASE/stderr"
+}
+
 test_variants_publish_under_their_own_triple_names() {
     setup variant_triples
     TRIPLE_NAMING=true
@@ -2103,6 +2290,13 @@ for test in test_saved_name_missing_remotely_is_uploaded test_identical_remote_i
     test_release_records_installer_check_after_upload test_installer_mismatch_does_not_fail_verified_release \
     test_variants_publish_under_their_own_triple_names test_shared_variant_names_go_to_the_primary_build \
     test_shared_variant_names_upload_without_collision \
+    test_literal_companion_unknown_abi_word_keeps_owner \
+    test_literal_companion_conflicting_abi_words_keep_primary_variant \
+    test_literal_companion_go_singleton_needs_no_triple test_literal_companion_archive_never_derives_primary_aliases \
+    test_literal_companion_wrong_platform_is_rejected test_literal_companion_nonprimary_configured_variant_is_rejected \
+    test_literal_companion_unconfigured_variant_is_rejected test_literal_companion_multivariant_missing_triple_is_rejected \
+    test_literal_companion_registry_shadow_cannot_exempt_undeclared_name \
+    test_literal_companion_does_not_exempt_primary_name_contradiction test_literal_companion_still_requires_manifest_bound_bytes \
     test_remote_drift_after_upload_prevents_success test_release_visibility_drift_prevents_dispatch \
     test_checkpoint_symlink_failure_preserves_foreign_file test_checkpoint_receipt_is_bound_and_private \
     test_partial_release_resumes_only_missing_upload test_completed_release_resume_does_not_reupload \

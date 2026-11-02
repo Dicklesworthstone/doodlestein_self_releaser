@@ -55,6 +55,101 @@ JSON keys, explicit null lists, missing input assets and unconsumed producer
 assets are errors. A source may participate in several independent outputs.
 The recipe is an exact inventory, not an instruction to glob a directory.
 
+## Shared release payloads
+
+Recipes can consume explicitly declared shared producer assets with
+`target: "additional"`. For example, preserve a release notice unchanged:
+
+```json
+{
+  "name": "NOTICE",
+  "source": "NOTICE",
+  "target": "additional",
+  "archive_format": "none"
+}
+```
+
+Raw shared files retain their selected names and exact bytes. A shared archive
+may instead select `members`, or use `source` to preserve or convert an admitted
+shared archive through the normal extraction and parity checks. All its producer
+inputs must also belong to `additional`; packaging cannot relabel a physical
+executable as shared data or assign a shared file to a physical platform.
+Aliases are created only when explicitly listed in the recipe.
+
+Shared assets must omit `target_triple`, including explicit null. They never
+stand in for a physical target or compiler variant. All physical outputs must
+still cover the original platform and variant matrix, while the derived manifest
+preserves the actual build environments and successful-task count. Every producer
+asset, including each selected shared file, must be consumed. The public
+build-plan finalizer checks that complete input selection before starting work
+and checks the actual bytes and resulting manifest before downstream finalization.
+An execution plan containing only xwin jobs cannot supply shared recipe inputs,
+even when the plan omits the optional `required_assets` selection. Such a recipe
+is rejected before compilation. Mixed DSR/import plans and completed build sets
+remain subject to their actual pinned producer manifests and exact ownership.
+
+These files remain payloads in the exact release inventory. This feature does
+not reclassify arbitrary metadata or weaken checksum, signature, provenance or
+publication checks. Retained shared files and archives undergo the same
+completed-output verification on retry as physical-platform outputs.
+
+## Companion archives in ordinary builds
+
+The packaging step in `dsr build` also preserves the ownership declared by
+`workspace_additional_artifacts`. A validated companion ZIP or tar archive
+keeps its literal name and exact bytes in the final inventory. Sharing a target
+and archive format with the primary executable does not make that companion
+eligible to supply the primary release archive or its installer alias.
+Companion names are reserved across the flat output directory, ignoring case.
+A primary or installer name that collides with one is refused before packaging,
+including a compiler variant's name or a companion with identical bytes.
+
+Primary selection excludes the configured companions whose collection receipts
+were verified, then matches the requested platform and compiler variant. DSR
+packages a raw primary, converts a primary archive when needed, or reuses an
+already complete primary archive without changing its bytes. A missing or
+invalid primary prevents publication even when every companion is valid.
+
+`bash scripts/tests/test_ordinary_collection_inventory.sh --companion-packaging-only`
+exercises the complete build command with real small host ELF files and archives.
+Its producer and scheduler responses are controlled fixtures; receipt validation,
+collection, packaging, manifest admission and completion writes run unchanged.
+The cases cover gzip and ZIP companions, conversion, preserved prebuilt bytes,
+raw binaries, compiler variant selection, reserved-name collisions and unusable primaries. They do not
+claim native compiler, GNU/musl ABI or remote-host qualification.
+
+## Complete native workspace archives
+
+A native workspace build succeeds only after its ZIP, tar.gz or tar.xz archive
+contains every configured workspace binary, `workspace_archive_files` entry and
+enabled include file, with no unexpected members. The runner records each
+collected or staged member's bytes and permissions before packaging, then checks
+the actual archive against those records. Nested include paths and empty include
+files remain valid. Ordinary builds use their working-tree includes; strict
+release builds retain the additional checks against the selected Git commit.
+
+Archive creation reserves a fresh output file and checks the compressor's exit
+status, the complete member inventory, each member's bytes and mode, and the
+final archive receipt. A missing tool, incomplete collection, partial archive or
+changed member fails the target with exit code `7`. Raw binaries and partial
+archives are not returned as successful substitutes. Retained files from a
+failed attempt remain diagnostic evidence, and retries use a separate attempt
+directory so they cannot overwrite an earlier completed archive or its resume
+receipt.
+
+Script payloads are supported for ordinary noncompiled workspaces. Rust and Go
+payloads still undergo native target validation, and strict release callers
+retain their architecture checks.
+
+Run `bash scripts/tests/test_act_runner_native.sh --workspace-archives-only`
+for this boundary. It executes the production native build and collection path
+with local shell builds and real ZIP and tar tools. Faults include archivers
+that leave readable but incomplete output, changed collected members, failed
+collection and unavailable output paths. The test also checks failed-result
+resume refusal and preservation of completed bytes across retries. Host
+readiness and slot admission are controlled; this test does not qualify a remote
+host or a compiler toolchain.
+
 ## Describe and execute
 
 ```bash
@@ -129,6 +224,16 @@ a tiny C fixture when `cc` is available (otherwise it uses a shell executable).
 It tests all output formats, prebuilt preservation, independent repacking,
 producer disappearance, drift, malicious archive entries and compressor failure.
 No live GitHub, signing or Rust/Windows build acceptance is claimed.
+
+`bash scripts/tests/test_release_packaging_variants.sh` also exercises exact
+plans with shared raw files and archives alongside GNU, musl and Windows compiler
+identities. It uses the real coordinator, pinned imports, collection, archive
+construction, manifest/SLSA admission and public finalizer CLI. The imported
+producer evidence and the final network/signing engine are fixtures; this test
+does not claim actual compilation or authenticated build provenance. Its shared
+payload group can run alone with `DSR_PACKAGING_SHARED_ONLY=1`. Controls cover
+invalid physical/triple selections, missing and unselected payloads, duplicate
+owners, unchanged offline retries, and refusal of changed completed outputs.
 
 ## Reproducible new archives
 

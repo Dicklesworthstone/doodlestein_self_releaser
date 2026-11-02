@@ -52,6 +52,33 @@ as a fallback source or a replacement database; the seed can be incomplete.
 The caller's existing dependency-resolution and build checks remain required.
 The source cache is never repaired or modified by selection.
 
+### Ordinary native stage protection
+
+The Unix native runner creates an exclusive `.sbh-protect` file in each fresh
+ordinary Rust stage before seeding its private Cargo home. SBH recognizes a
+marker in an ancestor as protection for that directory and its descendants,
+including direct deletion-candidate checks, as implemented by its
+[protection registry](https://github.com/Dicklesworthstone/storage_ballast_helper/blob/main/src/scanner/protection.rs).
+This protects the private dependency
+cache and staged source from pressure-driven reclamation while a build uses
+them. The marker is outside both source and cache inventories; it changes no
+authenticated or compiled source bytes and invokes no SBH command.
+
+The stage and marker retain private ownership and modes. An existing marker,
+symlink or directory at the marker path refuses preparation before a cache is
+published. Protection follows the existing stage lifecycle: normal success,
+failure and cancellation remove the owned stage; `DSR_KEEP_BUILD_STAGES=1`
+deliberately retains it for diagnosis. Shared build roots, ambient caches and
+separate Cargo target directories receive no permanent marker from this step.
+
+Run `bash scripts/tests/test_nonstrict_cargo_lock_seed.sh` for marker and refusal
+checks. With Cargo/rustc available, `bash scripts/tests/test_strict_cargo_private_cache.sh`
+also runs the actual ordinary native coordinator, checks protection before
+compilation, builds offline after the original cache and dependency origin are
+removed, and verifies success/failure stage cleanup. The host readiness fixture
+is controlled and has an explicit refusal check; this is not a live SBH emergency
+cleanup or native fleet qualification.
+
 ## Lockfile-scoped seeds
 
 ```bash
@@ -60,11 +87,54 @@ bash src/cargo_cache.sh snapshot /home/builder/.cargo /srv/build/cargo-home \
 ```
 
 Lockfile-scoped selection retains matching registry archives and indexes plus
-Git databases containing locked revisions. It excludes extracted registry and
-Git sources and binds the lockfile digest in the selection receipt.
+Git databases containing locked revisions. It excludes extracted registry
+sources and ordinary Git checkouts and binds the lockfile digest in the
+selection receipt. A locked Git commit containing submodules also retains its
+exact matching checkout, including the nested object databases that Cargo
+cannot recreate offline from the parent database alone.
 A missing or incorrect download is not silently replaced with untrusted
 extracted source bytes. The caller's locked/offline metadata gate determines
 whether the resulting seed is complete before release compilation.
+
+Selected submodule checkouts may contain relative links to regular source files,
+such as `crate/LICENSE -> ../LICENSE`. The copier preserves the link text in a
+fresh symlink without reading the ambient target. The completed private inventory
+must resolve each link to a regular file inside that checkout; escaping, absolute,
+dangling, cyclic, directory, special-file and Git-administration links are refused.
+The same narrow copying rule applies when a prepared seed is copied into the
+build's private home, including when the original ambient Git root was relocated.
+
+Preserving the text matters: later source authentication checks the exact Git
+symlink blob, and replacing it with file contents would change the authenticated
+type. Cache copying does not authenticate source. The locked commit/tree/blob
+verifier still rejects a confined but uncommitted retarget and recursively
+confines each nested submodule's links to that submodule's own root. A link from
+a child to its parent or a sibling cannot acquire authority from a cache receipt.
+
+### Native attempt names
+
+The strict Unix and Windows cache generators preserve the attempt suffix in
+`.cargo-home-SUFFIX`, including underscores in names such as
+`linux-musl_amd64-0123456789abcdef0123456789abcdef` (issue #50). A suffix starts
+with an ASCII letter or digit, contains at least two characters, and permits
+only letters, digits, underscores and hyphens. Keeping the exact suffix preserves
+the cache identity expected by native readiness and subsequent admission.
+Both generators enforce that ASCII contract in a function-local `C` locale,
+so Unicode collation cannot expand the permitted letter ranges. The caller's
+locale is restored on return; inability to establish the validation locale
+refuses generation with exit code 4.
+Invalid source roots or suffixes produce a specific stderr diagnostic before
+the generator emits any program. The existing source-root constraints, exclusive
+private-home creation and immutable seed verification remain in force. These
+internal naming rules do not change the public platform registry.
+
+Run `bash scripts/tests/test_cargo_cache.sh PrivateCargoHomeGeneratorTests` for
+both generators' accepted names, invalid inputs and diagnostics. With genuine
+Cargo/rustc available, the Unix test also prepares two independent underscore
+attempts, reuses the retained seed after removing the ambient cache and dependency
+origin, compiles offline, verifies final source/cache admission, and refuses a
+duplicate attempt without altering its receipts. It uses the host compiler;
+musl artifact and native Windows qualification remain separate requirements.
 
 ## Relocated ambient cache roots
 
@@ -101,8 +171,9 @@ ambient-layout exception, including for a previously successful private copy.
 
 ## Integrity and later materialization
 
-Apart from the two ambient root aliases described above, selected cache entries
-still refuse symlinks, special files and external Git storage pointers.
+Apart from the two ambient root aliases and explicitly selected checkout file
+links described above, selected cache entries still refuse symlinks. Special
+files and external Git storage pointers remain refused throughout the cache.
 Ordinary selection holds root/database identities through the copy and rechecks
 them before publishing a seed receipt. It also
 binds every archive that authorizes omission of an extracted registry package,
@@ -148,7 +219,14 @@ repository have been moved away. A second test uses a tiny registry served on
 loopback, stops its server, moves the ambient cache away, and requires genuine
 locked/offline Cargo to reconstruct and compile authentic archived source rather
 than a modified working copy. Neither test installs a toolchain or uses public
-network services; without the dependencies each reports an explicit skip. Git/tar reconstruction
+network services; without the dependencies each reports an explicit skip. A
+third real Cargo test uses a locked Git dependency with a submodule and file
+links in both repositories. It moves the original cache and both upstreams away,
+then compiles and runs with `--locked --offline`, consuming the preserved nested
+source and link targets. The source-authentication suite separately verifies the
+copied Git object chains and refuses retargeted links and nested-root escapes.
+Git/tar reconstruction
 alone is not claimed as native compiler, complete DSR orchestration, or public
-release qualification. Windows has its separate cache backend and is unchanged.
+release qualification. Windows has its separate cache backend; the generator
+checks above do not qualify its native filesystem execution.
 No fleet performance improvement or exact dependency-minimality is claimed.

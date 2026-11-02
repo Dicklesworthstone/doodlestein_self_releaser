@@ -8,9 +8,20 @@ on:
       - .github/workflows/native-artifact-regression.yml
       - scripts/tests/test_native_artifact_build.sh
       - scripts/tests/test_act_runner.sh
+      - scripts/tests/test_act_orchestration.sh
+      - scripts/tests/test_build_state.sh
+      - scripts/tests/test_act_build_cmd_tokens.sh
       - scripts/tests/test_act_runner_native.sh
+      - scripts/tests/test_config.sh
+      - scripts/tests/test_disk_free_floor.sh
+      - scripts/tests/test_host_health.sh
+      - scripts/tests/test_host_config_admission.sh
       - scripts/tests/test_artifact_formats.sh
+      - scripts/tests/test_ordinary_collection_inventory.sh
       - scripts/tests/test_generated_installer_transactions.sh
+      - scripts/tests/test_generated_workspace_installer.sh
+      - scripts/tests/test_install_source.sh
+      - scripts/tests/test_install_source_family.sh
       - dsr
       - src/act_runner.sh
       - src/artifact_naming.sh
@@ -18,7 +29,9 @@ on:
       - src/build_state.sh
       - src/config.sh
       - src/git_ops.sh
+      - src/host_health.sh
       - src/install_gen.sh
+      - src/install_source.sh
       - src/packaging.sh
       - src/platforms.sh
       - src/slsa.sh
@@ -41,7 +54,7 @@ jobs:
           - os: macos-15
             targets: all-platforms
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -60,17 +73,31 @@ jobs:
           set -euo pipefail
           if [[ "$RUNNER_OS" == Linux ]]; then
             sudo apt-get update
-            sudo apt-get install -y --no-install-recommends jq xz-utils golang-go minisign zip unzip msitools wixl
+            sudo apt-get install -y --no-install-recommends jq xz-utils golang-go minisign zip unzip msitools wixl rsync
           else
-            for tool in jq xz go minisign; do
+            for tool in jq xz go minisign rsync; do
               command -v "$tool" >/dev/null || brew install "$tool"
             done
+            if ! command -v timeout >/dev/null && ! command -v gtimeout >/dev/null; then brew install coreutils; fi
             if (( BASH_VERSINFO[0] < 4 )); then brew install bash; fi
             echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
           fi
           mkdir -p "$RUNNER_TEMP/dsr-test-bin"
           GOBIN="$RUNNER_TEMP/dsr-test-bin" go install github.com/mikefarah/yq/v4@v4.47.1
           echo "$RUNNER_TEMP/dsr-test-bin" >> "$GITHUB_PATH"
+      - name: Install pinned Bun for genuine source-family compilation
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/bun-v1.4.4-linux-x64-baseline.zip"
+          curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
+            --user-agent 'doodlestein_self_releaser-agent (+https://github.com/Dicklesworthstone/doodlestein_self_releaser)' \
+            --output "$archive" \
+            https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/bun-linux-x64-baseline.zip
+          printf '%s  %s\n' e0446eb55995772eb9894bebae9a6be368d985a8b9271ee124486f9946eedd76 "$archive" | sha256sum --check --strict
+          unzip -j "$archive" bun-linux-x64-baseline/bun -d "$RUNNER_TEMP/dsr-test-bin"
+          test "$("$RUNNER_TEMP/dsr-test-bin/bun" --version)" = 1.4.4
       - name: Validate concurrent workflow evidence
         shell: bash
         run: |
@@ -78,15 +105,87 @@ jobs:
           bash -n scripts/tests/test_act_runner.sh
           bash scripts/tests/test_act_runner.sh --workflow-isolation-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/workflow-isolation.log"
           test -z "$(git status --porcelain)"
-      - name: Validate typed additional artifact admission
+      - name: Preserve native evidence across retries and concurrent attempts
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n src/act_runner.sh
+          bash -n scripts/tests/test_act_runner_native.sh
+          bash scripts/tests/test_act_runner_native.sh --attempt-isolation-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/native-attempt-isolation.log"
+          test -z "$(git status --porcelain)"
+      - name: Validate complete native workspace archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/tests/test_act_runner_native.sh --workspace-archives-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/native-workspace-archives.log"
+          test -z "$(git status --porcelain)"
+      - name: Validate Go compiler selectors and ARMv7 command expansion
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/tests/test_act_build_cmd_tokens.sh
+          bash scripts/tests/test_act_build_cmd_tokens.sh --go-cross-build 2>&1 | tee "$RUNNER_TEMP/collector-evidence/go-command-tokens.log"
+          test -z "$(git status --porcelain)"
+      - name: Preserve build custody and timed process ownership
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n src/build_state.sh
+          bash -n scripts/tests/test_build_state.sh
+          bash scripts/tests/test_build_state.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/build-state.log"
+          bash scripts/tests/test_act_orchestration.sh --coordinator-custody-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/coordinator-custody.log"
+          bash scripts/tests/test_act_runner.sh --timeout-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/timeout-ownership.log"
+          test -z "$(git status --porcelain)"
+      - name: Validate stdin-isolated target dispatch and exact-run resume
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/tests/test_act_orchestration.sh
+          bash scripts/tests/test_act_orchestration.sh --stdin-isolation-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/stdin-isolation.log"
+          bash scripts/tests/test_act_orchestration.sh --worker-lifecycle-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/worker-lifecycle.log"
+          bash scripts/tests/test_act_orchestration.sh --dispatch-reservation-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/dispatch-reservation.log"
+          bash scripts/tests/test_act_runner.sh --worker-admission-cancel-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/admission-cancellation.log"
+          bash scripts/tests/test_act_orchestration.sh --dispatch-stdin-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/dispatch-stdin.log"
+          bash scripts/tests/test_act_orchestration.sh --capacity-resume-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/capacity-resume.log"
+          test -z "$(git status --porcelain)"
+      - name: Recover refused and failed native targets on approved replacement hosts
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/tests/test_act_orchestration.sh --relocation-recovery-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/relocation-recovery.log"
+          test -z "$(git status --porcelain)"
+      - name: Validate native and workflow companion artifact admission
         shell: bash
         run: |
           set -euo pipefail
           bash -n src/artifact_formats.sh
           bash -n scripts/tests/test_artifact_formats.sh
           bash -n scripts/tests/test_act_runner_native.sh
+          bash -n scripts/tests/test_config.sh
+          bash scripts/tests/test_config.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/companion-config.log"
           bash scripts/tests/test_artifact_formats.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/artifact-formats.log"
           bash scripts/tests/test_act_runner_native.sh --typed-companions-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/typed-companions.log"
+          bash scripts/tests/test_act_runner.sh --typed-companions-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/workflow-companions.log"
+          test -z "$(git status --porcelain)"
+      - name: Validate ordinary primary and companion packaging ownership
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/tests/test_ordinary_collection_inventory.sh
+          bash scripts/tests/test_ordinary_collection_inventory.sh --companion-packaging-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/ordinary-companion-packaging.log"
+          test -z "$(git status --porcelain)"
+      - name: Validate actual native writable-path admission
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n src/host_health.sh
+          bash -n scripts/tests/test_disk_free_floor.sh
+          bash -n scripts/tests/test_host_health.sh
+          bash scripts/tests/test_disk_free_floor.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/writable-storage.log"
+          bash scripts/tests/test_host_health.sh --disk-capacity-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/concurrent-storage.log"
+          bash scripts/tests/test_host_config_admission.sh --capacity-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/public-capacity-admission.log"
+          bash scripts/tests/test_act_runner_native.sh --host-writable-path-tests 2>&1 | tee "$RUNNER_TEMP/collector-evidence/writable-path-boundaries.log"
           test -z "$(git status --porcelain)"
       - name: Validate concurrent generated installers
         shell: bash
@@ -95,6 +194,18 @@ jobs:
           bash -n src/install_gen.sh
           bash -n scripts/tests/test_generated_installer_transactions.sh
           bash scripts/tests/test_generated_installer_transactions.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/installer-transactions.log"
+          test -z "$(git status --porcelain)"
+      - name: Validate genuine Go and Bun source executable families
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go version
+          bun --version
+          bash -n src/install_source.sh
+          bash scripts/tests/test_install_source.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/source-engine.log"
+          bash scripts/tests/test_install_source_family.sh --bun-contracts-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/bun-family-contracts.log"
+          bash scripts/tests/test_generated_workspace_installer.sh --go-bun-source-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/go-bun-source-families.log"
           test -z "$(git status --porcelain)"
       - name: Validate native compilation, manifests and signed provenance
         shell: bash

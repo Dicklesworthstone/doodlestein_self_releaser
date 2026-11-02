@@ -5,7 +5,7 @@ _INSTALL_GEN_RELEASE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 # shellcheck source=src/platforms.sh
 source "$_INSTALL_GEN_RELEASE_DIR/platforms.sh" || { return 3 2>/dev/null || exit 3; }
 
-install_gen_release() (
+_install_gen_release_execute() {
     command -v python3 >/dev/null || return 3
     exec python3 - "$_INSTALL_GEN_RELEASE_DIR" "$(dsr_platform_pattern)" "$@" <<'PY'
 import argparse
@@ -277,6 +277,7 @@ try:
     for flag in ("policy", "public-key", "output"):
         parser.add_argument("--" + flag, required=True)
     parser.add_argument("--replace", action="store_true", help="Permit replacing an existing regular installer file")
+    parser.add_argument("--dry-run", action="store_true", help="Validate the complete installer without writing its output or lock")
     flags = [a.split("=", 1)[0] for a in sys.argv[2:] if a.startswith("--")]
     need(len(flags) == len(set(flags)), "duplicate generator option")
     args = parser.parse_args(sys.argv[2:])
@@ -310,7 +311,9 @@ try:
     sources = {p.name: read(p, 2097152) for p in source_paths}
     need(sum(map(len, sources.values())) <= 8388608, "installer engine bundle exceeds size limit")
     os.umask(0o077)
-    with tempfile.TemporaryDirectory(prefix=".dsr-installer-gen-", dir=output.parent) as temporary:
+    # A plan uses private temporary storage, never the selected output parent.
+    # Real publication keeps same-filesystem staging for its atomic replace.
+    with tempfile.TemporaryDirectory(prefix=".dsr-installer-gen-", dir=None if args.dry_run else output.parent) as temporary:
         work = Path(temporary)
         for name, data in sources.items():
             (work / name).write_bytes(data)
@@ -369,6 +372,17 @@ try:
         need(read(policy_file, 1048576) == policy_bytes and read(key_file, 8192) == key_bytes and
              all(read(p, 2097152) == sources[p.name] for p in source_paths), "generator inputs changed", 7)
         lock = plain(str(output) + ".lock")
+        data = script.encode("utf-8")
+        if args.dry_run:
+            need(not lock.exists() or stat.S_ISREG(lock.stat().st_mode), "invalid generator lock", 2)
+            plain(str(output))
+            same = output.exists() and read(output, 33554432) == data and stat.S_IMODE(output.stat().st_mode) == 0o755
+            need(not output.exists() or same or args.replace, "existing installer requires --replace", 2)
+            print(canonical(dict(kind="dsr-release-installer-generation", status="planned", exit_code=0, output=str(output),
+                                 sha256=hashlib.sha256(data).hexdigest(), policy_sha256=hashlib.sha256(canonical(value)).hexdigest(),
+                                 targets=wanted, reused=same, dry_run=True, authenticated=False,
+                                 engines={n: r["sha256"] for n, r in inventory.items()})).decode(), end="")
+            sys.exit(0)
         lockfd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
         held = os.fstat(lockfd)
         need(stat.S_ISREG(held.st_mode), "invalid generator lock", 2)
@@ -377,7 +391,6 @@ try:
         except BlockingIOError:
             raise Failure("installer generation already active", 2)
         plain(str(output))
-        data = script.encode("utf-8")
         same = output.exists() and read(output, 33554432) == data and stat.S_IMODE(output.stat().st_mode) == 0o755
         need(not output.exists() or same or args.replace, "existing installer requires --replace", 2)
         named = plain(str(lock)).stat()
@@ -403,8 +416,10 @@ finally:
     if lockfd is not None:
         os.close(lockfd)
 PY
-)
+}
+
+install_gen_release() ( _install_gen_release_execute "$@"; )
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    install_gen_release "$@"
+    _install_gen_release_execute "$@"
 fi

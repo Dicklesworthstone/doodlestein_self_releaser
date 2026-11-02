@@ -44,6 +44,11 @@
     "source_sync": {
       "type": ["object", "null"],
       "description": "Complete ordinary source synchronization receipt, including host/path bindings and failed transfers; null when synchronization was bypassed or the build used strict snapshots"
+    },
+    "error": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Coordinator failure that prevents completion, even when an individual worker succeeded"
     }
   },
   "$defs": {
@@ -105,6 +110,21 @@
           "type": "string",
           "description": "Path to build log"
         },
+        "result_path": {
+          "type": "string",
+          "description": "Path to the retained target result or coordinator refusal; absent when no receipt could be written"
+        },
+        "attempt": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Durable target attempt reservation number, or zero before any reservation"
+        },
+        "exit_code": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255,
+          "description": "Target outcome code; skipped targets use the dispatch or interruption reason, not a compiler exit"
+        },
         "error": {
           "type": "string",
           "description": "Error message if failed"
@@ -112,7 +132,26 @@
         "stage": {
           "type": "string",
           "minLength": 1,
-          "description": "Failure stage; source_sync means no compiler or capacity slot was started"
+          "description": "Failure stage; dispatch means the worker was not started, source_sync means no compiler or capacity slot was started, host_capacity means slot acquisition failed before backend launch, host_readiness means native host admission refused before compilation"
+        },
+        "execution_started": {
+          "type": "boolean",
+          "description": "True when the coordinator observed a launched worker; false on a dispatch refusal. This does not establish compiler execution: native host readiness may still refuse the attempt"
+        },
+        "backend_started": {
+          "type": "boolean",
+          "description": "Worker-owned observation that its build backend was launched after capacity acquisition; false for a host_capacity refusal. True does not establish compiler execution because native host readiness can still refuse"
+        },
+        "worker_exit_code": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255,
+          "description": "Actual worker process exit observed by the coordinator when recovering a missing or invalid worker receipt"
+        },
+        "receipt_source": {
+          "type": "string",
+          "enum": ["coordinator"],
+          "description": "Identifies a result synthesized by the coordinator without claiming the worker wrote a receipt"
         },
         "source_sync": {
           "type": "object",

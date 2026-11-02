@@ -424,21 +424,80 @@ _isb_prepare_toolchain() {
     esac
 }
 
+# Resolve every Go/Bun entry before a compiler or dependency install can run.
+# An explicit entry selects only the primary. Companions must have their own
+# conventional Go command directory or package.json bin declaration; a missing
+# companion must never fall back to building the primary a second time.
+_isb_source_entries() (
+    local language="$1" tree="$2" binary="$3" entry="$4"
+    shift 4
+    local name source_name selected primary windows=false
+    local -a entries=()
+    case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) windows=true ;; esac
+    binary=$(_isb_binary_name "$binary") || return 4
+    for name in "$@"; do
+        name=$(_isb_binary_name "$name") || return 4
+        primary=false
+        if [[ "$name" == "$binary" ]] || { $windows && [[ "${name,,}" == "${binary,,}" ]]; }; then
+            primary=true
+        fi
+        source_name="$name"
+        $windows && source_name="${source_name%.exe}"
+        selected=''
+        $primary && selected="$entry"
+        if [[ -z "$selected" ]]; then
+            case "$language" in
+                go)
+                    selected="cmd/$source_name"
+                    if $primary && [[ ! -e "$tree/$selected" && ! -L "$tree/$selected" ]]; then
+                        selected=.
+                    fi
+                    ;;
+                bun|typescript)
+                    selected=$(jq -er --arg binary "$source_name" --argjson primary "$primary" '
+                        .bin | if type == "object" then .[$binary]
+                        elif type == "string" and $primary then . else empty end |
+                        select(type == "string" and length > 0)
+                    ' "$tree/package.json") || {
+                        _isb_log "Bun source entry is missing for $name; declare package.json bin.$source_name"
+                        return 4
+                    }
+                    selected="${selected#./}"
+                    ;;
+                *) return 4 ;;
+            esac
+        fi
+        if ! _isb_path_in_tree "$tree" "$selected"; then
+            _isb_log "Missing or unsafe source entry for $name: $selected"
+            return 4
+        fi
+        case "$language" in
+            go) [[ -d "$tree/$selected" ]] || {
+                _isb_log "Go source entry for $name must be a package directory: $selected"; return 4;
+            } ;;
+            *) [[ -f "$tree/$selected" ]] || {
+                _isb_log "Bun source entry for $name must be a regular file: $selected"; return 4;
+            } ;;
+        esac
+        entries+=("$selected")
+    done
+    printf '%s\n' "${entries[@]}"
+)
+
 # Build only the requested executable family, into a new private output directory.
 # Never run arbitrary command strings from installer configuration.
 _isb_compile() (
     local language="$1" tree="$2" output="$3" binary="$4" entry="$5" package="$6" limit="$7"
     shift 7
-    local -a binaries=("$@") targets=()
+    local -a binaries=("$@") targets=() entries=()
     ((${#binaries[@]})) || binaries=("$binary")
-    [[ "$language" == rust || ${#binaries[@]} -eq 1 ]] || return 4
-    local status=0 host target name mod=readonly
+    local status=0 host target name mod=readonly resolved_entries selected_entry index log
     cd "$tree" || return 4
-    _isb_prepare_toolchain "$language" "$tree" "$output" "$limit" || return $?
     binary=$(_isb_binary_name "$binary") || return 4
     case "$language" in
         rust)
             [[ -f Cargo.toml && ! -L Cargo.toml ]] || return 4
+            _isb_prepare_toolchain "$language" "$tree" "$output" "$limit" || return $?
             # rustup proxies may auto-install a missing repository-selected
             # toolchain. Any separately authorized bootstrap is already active;
             # never let a proxy modify an existing global installation.
@@ -500,6 +559,9 @@ _isb_compile() (
             ;;
         go)
             [[ -f go.mod && ! -L go.mod ]] || return 4
+            resolved_entries=$(_isb_source_entries "$language" "$tree" "$binary" "$entry" "${binaries[@]}") || return $?
+            while IFS= read -r selected_entry; do entries+=("$selected_entry"); done <<< "$resolved_entries"
+            _isb_prepare_toolchain "$language" "$tree" "$output" "$limit" || return $?
             # Build for this installer host, not an inherited cross target.
             export GOENV=off GOWORK=off GOTOOLCHAIN=local GOFLAGS='' GOOS='' GOARCH=''
             _isb_run "$limit" "$output/compiler.log" go version || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
@@ -510,35 +572,56 @@ _isb_compile() (
             [[ "$host_os" =~ ^[a-z0-9]+$ && "$host_arch" =~ ^[a-z0-9]+$ ]] || return 6
             export GOOS="$host_os" GOARCH="$host_arch"
             [[ ! -d vendor ]] || mod=vendor
-            if [[ -z "$entry" ]]; then
-                entry=.
-                [[ ! -d "cmd/${binary%.exe}" ]] || entry="cmd/${binary%.exe}"
-            fi
-            _isb_path_in_tree "$tree" "$entry" || return 4
-            _isb_run "$limit" "$output/package.log" go list "-mod=$mod" -f '{{.Name}}' "./$entry" || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
-            [[ "$(cat "$output/package.log")" == main ]] || { _isb_log 'Requested Go package is not one executable'; return 6; }
-            target="$output/$binary"
-            _isb_run "$limit" "$output/build.log" go build "-mod=$mod" -trimpath -o "$target" "./$entry" || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
-            targets+=("$target")
+            # Check all providers before compiling the first member. A library
+            # can make go build succeed with an archive, not an executable.
+            for index in "${!entries[@]}"; do
+                log="$output/package.log"
+                ((${#entries[@]} == 1)) || log="$output/package-$index.log"
+                _isb_run "$limit" "$log" go list "-mod=$mod" -f '{{.Name}}' "./${entries[$index]}" || {
+                    status=$?; [[ $status == 5 ]] && return 5; return 6;
+                }
+                [[ "$(cat "$log")" == main ]] || {
+                    _isb_log "Requested Go package is not one executable: ${binaries[$index]} (${entries[$index]})"; return 6;
+                }
+            done
+            # Executable names may legally be compiler.log or dependencies.log.
+            # Keep payloads separate from retained diagnostics and toolchains.
+            mkdir "$output/bin" || return 1
+            for index in "${!entries[@]}"; do
+                name=$(_isb_binary_name "${binaries[$index]}") || return 4
+                _isb_path_in_tree "$tree" "${entries[$index]}" || return 6
+                target="$output/bin/$name"
+                log="$output/build.log"
+                ((${#entries[@]} == 1)) || log="$output/build-$index.log"
+                _isb_run "$limit" "$log" go build "-mod=$mod" -trimpath -o "$target" "./${entries[$index]}" || {
+                    status=$?; [[ $status == 5 ]] && return 5; return 6;
+                }
+                targets+=("$target")
+            done
             ;;
         bun|typescript)
             [[ -f package.json && ! -L package.json ]] || return 4
-            if [[ -z "$entry" ]]; then
-                entry=$(jq -er --arg binary "${binary%.exe}" '.bin | if type == "string" then . elif type == "object" then .[$binary] else empty end | select(type == "string" and length > 0)' package.json) || {
-                    _isb_log 'Bun source build needs source_entry or a matching package.json bin'; return 4;
-                }
-                entry="${entry#./}"
-            fi
-            _isb_path_in_tree "$tree" "$entry" && [[ -f "$entry" ]] || return 4
+            resolved_entries=$(_isb_source_entries "$language" "$tree" "$binary" "$entry" "${binaries[@]}") || return $?
+            while IFS= read -r selected_entry; do entries+=("$selected_entry"); done <<< "$resolved_entries"
             if [[ ! -f bun.lock && ! -f bun.lockb ]]; then
                 _isb_log 'A committed bun.lock or bun.lockb is required'; return 4
             fi
             [[ ! -L bun.lock && ! -L bun.lockb ]] || return 4
+            _isb_prepare_toolchain "$language" "$tree" "$output" "$limit" || return $?
             _isb_run "$limit" "$output/compiler.log" bun --version || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
             _isb_run "$limit" "$output/dependencies.log" bun install --frozen-lockfile || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
-            target="$output/$binary"
-            _isb_run "$limit" "$output/build.log" bun build --compile --outfile "$target" "./$entry" || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
-            targets+=("$target")
+            mkdir "$output/bin" || return 1
+            for index in "${!entries[@]}"; do
+                name=$(_isb_binary_name "${binaries[$index]}") || return 4
+                _isb_path_in_tree "$tree" "${entries[$index]}" && [[ -f "${entries[$index]}" ]] || return 6
+                target="$output/bin/$name"
+                log="$output/build.log"
+                ((${#entries[@]} == 1)) || log="$output/build-$index.log"
+                _isb_run "$limit" "$log" bun build --compile --outfile "$target" "./${entries[$index]}" || {
+                    status=$?; [[ $status == 5 ]] && return 5; return 6;
+                }
+                targets+=("$target")
+            done
             ;;
         *) return 4 ;;
     esac
@@ -587,10 +670,6 @@ install_source_build() (
     [[ "$language" != rust || -z "$entry" ]] || { _isb_log 'Rust selects the configured binary, not --entry'; return 4; }
     [[ "$language" == rust || -z "$package" ]] || { _isb_log '--package is only supported for Rust'; return 4; }
     ((${#binaries[@]})) || binaries=("$binary")
-    if [[ "$language" != rust && ${#binaries[@]} -gt 1 ]]; then
-        _isb_log 'Executable families are supported only for Rust source builds'
-        return 4
-    fi
     local -A binary_keys=()
     local -a binary_names=()
     local selected key primary_name primary_index=-1 index=0 windows=false

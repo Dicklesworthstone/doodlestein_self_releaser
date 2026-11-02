@@ -23,6 +23,7 @@ import unittest
 ROOT = Path(sys.argv.pop(1))
 MODULE = Path(os.environ.get('DSR_TEST_HOST_HEALTH', ROOT / 'src/host_health.sh'))
 BASELINE = os.environ.get('DSR_TEST_DISK_BASELINE')
+CAPACITY_BASELINE = os.environ.get('DSR_TEST_CAPACITY_BASELINE')
 BASH = os.environ['DSR_TEST_DISK_BASH']
 WORK = Path(tempfile.mkdtemp(prefix='dsr-disk-floor-'))
 print('Retained evidence:', WORK, flush=True)
@@ -46,10 +47,10 @@ class DiskFloor(unittest.TestCase):
         self.env.pop('TMPDIR', None)
         Path(self.env['DSR_HOSTS_FILE']).write_text(
             'hosts:\n  localtest:\n    platform: linux/amd64\n    connection: local\n'
-            '    enabled: true\n    capabilities:\n')
+            '    concurrency: 1\n    enabled: true\n    capabilities:\n')
         self.sequence = 0
 
-    def call(self, function, *arguments, module=MODULE, setup=''):
+    def call(self, function, *arguments, module=MODULE, setup='', input_text=None):
         # A complete checkout loads its actual config module, including the
         # YAML parser helpers. The retained partial-workspace mode only supports
         # the existing no-yq reader; no function or executable is replaced.
@@ -60,7 +61,7 @@ class DiskFloor(unittest.TestCase):
                    'source "$2" || exit $?; shift 2; ' + setup + '; "$@"')
         result = subprocess.run([BASH, '-c', program, '_', str(ROOT), str(module),
                                  function, *map(str, arguments)], env=self.env,
-                                text=True, capture_output=True, timeout=20)
+                                text=True, input=input_text, capture_output=True, timeout=20)
         self.sequence += 1
         (self.work / f'{self.sequence}.stdout').write_text(result.stdout)
         (self.work / f'{self.sequence}.stderr').write_text(result.stderr)
@@ -93,8 +94,10 @@ class DiskFloor(unittest.TestCase):
     def test_percentage_warning_still_applies(self):
         self.verdict(91, FLOOR_KB * 2, 'warning')
 
-    def test_percentage_error_still_applies(self):
-        self.verdict(96, FLOOR_KB * 2, 'error')
+    def test_large_spacious_volume_warns_instead_of_refusing(self):
+        self.verdict(96, 179 * GIB // 1024, 'warning')
+        self.verdict(97, 30 * GIB // 1024, 'warning')
+        self.verdict(100, FLOOR_KB, 'warning')
 
     def test_percentage_boundaries_unchanged(self):
         self.verdict(90, FLOOR_KB, 'ok')
@@ -102,6 +105,41 @@ class DiskFloor(unittest.TestCase):
 
     def test_byte_floor_overrides_percentage_warning(self):
         self.verdict(91, FLOOR_KB - 1, 'error')
+        self.verdict(96, FLOOR_KB - 1, 'error')
+        self.verdict(100, FLOOR_KB - 1, 'error')
+
+    def test_malformed_warning_policy_never_reaches_arithmetic(self):
+        for warning in ('', '-1', '101', '1.5', '1+2', '9007199254740992'):
+            with self.subTest(warning=warning):
+                self.env['DSR_TEST_WARNING_POLICY'] = warning
+                result = self.call('_hh_disk_status', 96, 179 * GIB // 1024, MINIMUM,
+                                   setup='_HH_DISK_WARN_THRESHOLD="$DSR_TEST_WARNING_POLICY"')
+                self.assertEqual(result.returncode, 4, result.stderr)
+                self.assertEqual(result.stdout, '')
+
+    @unittest.skipUnless(CAPACITY_BASELINE, 'set DSR_TEST_CAPACITY_BASELINE for same-input policy comparison')
+    def test_capacity_policy_retains_floor_refusals_and_fixes_percentage_false_refusals(self):
+        for usage, kb, old_status, current_status in (
+            (96, 179 * GIB // 1024, 'error', 'warning'),
+            (97, 30 * GIB // 1024, 'error', 'warning'),
+            (100, FLOOR_KB, 'error', 'warning'),
+            (90, FLOOR_KB, 'ok', 'ok'),
+            (95, FLOOR_KB, 'warning', 'warning'),
+            (84, 2427860, 'error', 'error'),
+            (0, FLOOR_KB - 1, 'error', 'error'),
+            (100, FLOOR_KB - 1, 'error', 'error'),
+        ):
+            with self.subTest(usage=usage, kb=kb):
+                before = self.call('_hh_disk_status', usage, kb, MINIMUM,
+                                   module=CAPACITY_BASELINE, setup=':')
+                after = self.call('_hh_disk_status', usage, kb, MINIMUM, setup=':')
+                self.assertEqual((before.returncode, before.stdout), (0, old_status + '\n'))
+                self.assertEqual((after.returncode, after.stdout), (0, current_status + '\n'))
+        config = '{"platform":"darwin/arm64","connection":"ssh","ssh_host":"fixture"}'
+        before = self.call('_hh_admission_fingerprint', config, module=CAPACITY_BASELINE, setup=':')
+        after = self.call('_hh_admission_fingerprint', config, setup=':')
+        self.assertEqual((before.returncode, after.returncode), (0, 0))
+        self.assertNotEqual(before.stdout, after.stdout)
 
     def test_decimal_leading_zeroes(self):
         self.verdict('084', '0000002427860', 'error')
@@ -334,6 +372,175 @@ class DiskFloor(unittest.TestCase):
         for row in value['roles']:
             self.assertIn(row['role'] + ' ' + row['path'], lines.stdout)
 
+    def requested_probe(self, requested):
+        result = self.call('_hh_check_disk_space', 'localtest', 'local', '',
+                           'linux/amd64', '', json.dumps(requested), setup=':')
+        return result, json.loads(result.stdout)
+
+    def test_requested_paths_normalize_exact_pairs_without_losing_roles(self):
+        requested = [dict(role='temp', path='/tmp/second'),
+                     dict(role='source', path='/tmp/first'),
+                     dict(role='temp', path='/tmp/first'),
+                     dict(role='temp', path='/tmp/second')]
+        result = self.call('_hh_writable_paths_json', json.dumps(requested), setup=':')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [requested[1], requested[2], requested[0]])
+
+    def test_requested_paths_reject_malformed_requests_before_probing(self):
+        for requested in ['', 'null', '{}', '[] []', '"/tmp"',
+                          '[{"role":"temp","path":"relative"}]',
+                          '[{"role":"Temp","path":"/tmp"}]',
+                          '[{"role":"temp","path":"/tmp/../full"}]',
+                          '[{"role":"temp","path":"/tmp//full"}]',
+                          '[{"role":"temp","path":"/tmp/\\u0000full"}]',
+                          '[{"role":"temp","path":"/tmp","optional":true}]',
+                          json.dumps([dict(role='temp', path='/tmp')] * 129)]:
+            with self.subTest(requested=requested):
+                result = self.call('host_health_check', 'localtest', '--json',
+                                   '--writable-paths', requested, setup=':')
+                self.assertEqual(result.returncode, 4, result.stderr)
+                self.assertFalse(json.loads(result.stdout)['healthy'])
+                self.assertFalse(Path(self.env['DSR_CACHE_DIR']).exists())
+        missing = self.call('host_health_check', 'localtest', '--writable-paths', setup=':')
+        self.assertEqual(missing.returncode, 4)
+        ready = self.call('host_health_is_ready', 'localtest', '--writable-paths', setup=':')
+        self.assertEqual(ready.returncode, 1)
+
+    def test_requested_future_paths_probe_parent_without_creating_or_executing(self):
+        selected = self.work / "source $(touch injected); quote's" / 'new-stage'
+        requested = [dict(role=role, path=str(selected)) for role in ('source', 'temp')]
+        result, value = self.requested_probe(requested)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [row for row in value['roles'] if row.get('requested')]
+        self.assertEqual(value['requested_paths'], requested)
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertEqual(row['path'], str(selected))
+            self.assertEqual(row['probe_path'], str(self.work.resolve()))
+            self.assertEqual(row['min_free_bytes'], MINIMUM)
+            self.assertEqual(row['filesystem_id'], str(self.work.stat().st_dev))
+        self.assertFalse(selected.parent.exists())
+        self.assertFalse((self.work / 'injected').exists())
+        self.assertFalse((ROOT / 'injected').exists())
+
+    def test_requested_existing_directory_symlink_keeps_actual_filesystem(self):
+        directory = self.work / 'actual'
+        directory.mkdir()
+        selected = self.work / 'selected'
+        selected.symlink_to(directory, target_is_directory=True)
+        requested = [dict(role='cargo_target', path=str(selected / 'new' / 'target'))]
+        result, value = self.requested_probe(requested)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = next(row for row in value['roles'] if row.get('requested'))
+        self.assertEqual(row['path'], requested[0]['path'])
+        self.assertEqual(row['probe_path'], str(directory.resolve()))
+        self.assertFalse((directory / 'new').exists())
+
+    def test_requested_dangling_links_loops_and_file_ancestors_are_refused(self):
+        dangling = self.work / 'dangling'
+        dangling.symlink_to(self.work / 'missing', target_is_directory=True)
+        loop = self.work / 'loop'
+        loop.symlink_to(loop, target_is_directory=True)
+        regular = self.work / 'regular'
+        regular.write_text('not a directory')
+        for path in [str(dangling), str(dangling) + '/', str(dangling / 'child'),
+                     str(loop), str(loop / 'child'), str(regular), str(regular / 'child')]:
+            with self.subTest(path=path):
+                result, value = self.requested_probe([dict(role='source', path=path)])
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(value['status'], 'error')
+        self.assertFalse((self.work / 'missing').exists())
+
+    def test_requested_real_small_filesystem_has_its_own_full_floor(self):
+        stats = os.statvfs(self.work)
+        if stats.f_bavail * stats.f_frsize >= MINIMUM:
+            selected = self.small_filesystem()
+        else:
+            selected = self.work
+        request = [dict(role='cargo_target', path=str(selected / 'not-created'))]
+        result, value = self.requested_probe(request)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = next(row for row in value['roles'] if row.get('requested'))
+        self.assertEqual(row['status'], 'error')
+        self.assertEqual(row['min_free_bytes'], MINIMUM)
+        self.assertLess(row['available_bytes'], MINIMUM)
+        self.assertEqual(value['status'], 'error')
+        self.assertFalse((selected / 'not-created').exists())
+
+    def test_requested_paths_bind_cache_fingerprint(self):
+        config = '{"platform":"linux/amd64","connection":"local"}'
+        values = []
+        for requested in [[], [dict(role='temp', path='/tmp/first')],
+                          [dict(role='temp', path='/tmp/second')],
+                          [dict(role='cargo_target', path='/tmp/first')]]:
+            result = self.call('_hh_admission_fingerprint', config,
+                               json.dumps(requested), setup=':')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            values.append(result.stdout)
+        self.assertEqual(len(set(values)), len(values))
+
+    def test_requested_paths_bypass_even_matching_healthy_cached_evidence(self):
+        stats = os.statvfs(self.work)
+        selected = self.work if stats.f_bavail * stats.f_frsize < MINIMUM else self.small_filesystem()
+        requested = [dict(role='cargo_target', path=str(selected / 'future'))]
+        for request in ([], requested):
+            with self.subTest(request=request):
+                fresh = self.call('host_health_check', 'localtest', '--json', '--no-cache',
+                                  '--writable-paths', json.dumps(request), setup=':')
+                receipt = json.loads(fresh.stdout)
+                # Supply a complete, internally consistent historical capacity
+                # fixture. The cache reader now re-admits disk evidence, so
+                # changing status/free bytes alone cannot make a valid hit.
+                # All re-probes below still use the actual local filesystem.
+                receipt.update(status='ok', healthy=True, errors=0, warnings=0)
+                receipt['historical_cache_fixture'] = True
+                historical = dict(roles=[], requested_paths=request)
+                for observed in receipt['checks']['disk_space']['roles']:
+                    row = {key: observed[key] for key in
+                           ('role', 'path', 'probe_path', 'filesystem_id')}
+                    row.update(available_bytes=100 * GIB, total_bytes=200 * GIB,
+                               usage_percent=50,
+                               capacity_group='filesystem:' + row['filesystem_id'])
+                    if observed.get('requested'):
+                        row['requested'] = True
+                    historical['roles'].append(row)
+                admitted = self.call('_hh_writable_storage_verdict', 'null', json.dumps(request), '1',
+                                     setup=':', input_text=json.dumps(historical))
+                self.assertEqual(admitted.returncode, 0, admitted.stderr)
+                receipt['checks']['disk_space'] = json.loads(admitted.stdout)
+                stored = self.call('_hh_cache_write', 'localtest', json.dumps(receipt),
+                                   setup='_hh_init_cache')
+                self.assertEqual(stored.returncode, 0, stored.stderr)
+                cached = self.call('_hh_cache_get', 'localtest', receipt['admission_fingerprint'], setup=':')
+                self.assertEqual(cached.returncode, 0, cached.stderr)
+                self.assertTrue(json.loads(cached.stdout)['healthy'])
+                if not request:
+                    empty = self.call('host_health_check', 'localtest', '--json',
+                                      '--writable-paths', '[]', setup=':')
+                    self.assertNotIn('historical_cache_fixture', json.loads(empty.stdout))
+                current = self.call('host_health_check', 'localtest', '--json',
+                                    '--writable-paths', json.dumps(requested), setup=':')
+                self.assertEqual(current.returncode, 1, current.stderr)
+                value = json.loads(current.stdout)
+                self.assertFalse(value['healthy'])
+                self.assertEqual(value['checks']['disk_space']['requested_paths'], requested)
+                self.assertEqual(next(row['status'] for row in value['checks']['disk_space']['roles']
+                                      if row.get('requested')), 'error')
+        ready = self.call('host_health_is_ready', 'localtest', '--writable-paths',
+                          json.dumps(requested), setup=':')
+        self.assertEqual(ready.returncode, 1, ready.stderr)
+        self.assertIn(requested[0]['path'], ready.stderr)
+        self.assertIn('20 GiB required', ready.stderr)
+        self.assertFalse((selected / 'future').exists())
+
+    def test_requested_unix_paths_cannot_silently_authorize_windows(self):
+        request = json.dumps([dict(role='source', path='/tmp')])
+        result = self.call('_hh_check_disk_space', 'localtest', 'local', '',
+                           'windows/amd64', '{}', request, setup=':')
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(json.loads(result.stdout)['status'], 'error')
+        self.assertIn('Windows', json.loads(result.stdout)['error'])
+
     @unittest.skipUnless(BASELINE, 'set DSR_TEST_DISK_BASELINE for the unchanged default root-only probe')
     def test_incumbent_ignores_the_same_real_low_capacity_temp(self):
         self.require_room()
@@ -491,18 +698,24 @@ class ApfsCapacity(unittest.TestCase):
         inventory = self.probe['apfs_inventory'](data)
         return self.probe['bind_apfs'](self.rows, self.infos, inventory)
 
-    def verdict(self, rows, storage=None):
+    def verdict(self, rows, storage=None, requested=None, document=None):
+        payload = dict(roles=rows)
+        if requested is not None:
+            payload['requested_paths'] = requested
+        if document is not None:
+            payload = document
         result = subprocess.run([BASH, '-c',
             'declare -A DSR_CONFIG=(); source "$1/src/logging.sh"; source "$2"; '
-            '_hh_writable_storage_verdict "$3"', '_', str(ROOT), str(MODULE), json.dumps(storage)],
-            input=json.dumps(dict(roles=rows)), text=True, capture_output=True, timeout=10)
+            '_hh_writable_storage_verdict "$3" "$4"', '_', str(ROOT), str(MODULE),
+            json.dumps(storage), json.dumps(requested or [])],
+            input=json.dumps(payload), text=True, capture_output=True, timeout=10)
         self.sequence += 1
         (self.work / f'{self.sequence}.stdout').write_text(result.stdout)
         (self.work / f'{self.sequence}.stderr').write_text(result.stderr)
         return result
 
-    def accepted(self, rows, storage=None):
-        result = self.verdict(rows, storage)
+    def accepted(self, rows, storage=None, requested=None):
+        result = self.verdict(rows, storage, requested)
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
@@ -516,6 +729,114 @@ class ApfsCapacity(unittest.TestCase):
         self.assertEqual(sorted(pool['roles']), sorted(r['role'] for r in self.rows))
         self.assertEqual(pool['available_bytes'], 100 * GIB)
         self.assertEqual(pool['apfs_container']['available_bytes'], 100 * GIB)
+
+    def test_requested_full_container_cannot_hide_behind_healthy_ambient_roles(self):
+        baseline = self.accepted(self.bind())
+        self.assertEqual(baseline['status'], 'ok')
+        second = copy.deepcopy(self.document['Containers'][0])
+        second.update(ContainerReference='disk8', APFSContainerUUID='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+                      CapacityFree=2427860 * 1024)
+        second['Volumes'] = [dict(second['Volumes'][1], DeviceIdentifier='disk8s1')]
+        self.document['Containers'].append(second)
+        self.infos['30'] = dict(FilesystemType='apfs', DeviceIdentifier='disk8s1', APFSContainerReference='disk8')
+        requested = [dict(role=role, path='/fixture/selected-' + role)
+                     for role in ('cache', 'source', 'temp')]
+        for selected in requested:
+            self.rows.append(dict(self.rows[0], **selected, probe_path=selected['path'],
+                                  requested=True, filesystem_id='30'))
+        value = self.accepted(self.bind(), requested=requested)
+        self.assertEqual(value['status'], 'error')
+        self.assertEqual(value['requested_paths'], requested)
+        self.assertEqual(len(value['capacity_groups']), 2)
+        for row in value['roles']:
+            if row.get('requested'):
+                self.assertEqual(row['status'], 'error')
+                self.assertEqual(row['available_bytes'], 2427860 * 1024)
+                self.assertEqual(row['min_free_bytes'], MINIMUM)
+            else:
+                self.assertEqual(row['status'], 'ok')
+
+    def test_requested_roles_share_capacity_without_losing_same_named_paths(self):
+        requested = [dict(role='temp', path='/fixture/first'),
+                     dict(role='temp', path='/fixture/second')]
+        for selected in requested:
+            self.rows.append(dict(self.rows[0], **selected, probe_path=selected['path'], requested=True))
+        value = self.accepted(self.bind(), requested=requested)
+        self.assertEqual(value['status'], 'ok')
+        self.assertEqual(len(value['capacity_groups']), 1)
+        self.assertEqual(value['capacity_groups'][0]['available_bytes'], 100 * GIB)
+        self.assertEqual([row['path'] for row in value['roles'] if row.get('requested')],
+                         [row['path'] for row in requested])
+        self.assertEqual(len([row for row in value['roles'] if row['role'] == 'temp']), 3)
+
+    def test_requested_paths_require_exact_complete_probe_evidence(self):
+        request = [dict(role='temp', path='/fixture/selected')]
+        self.rows.append(dict(self.rows[0], **request[0], probe_path=request[0]['path'], requested=True))
+        rows = self.bind()
+        self.assertEqual(self.accepted(rows, requested=request)['status'], 'ok')
+        bad = []
+        bad.append(dict(roles=rows[:-1], requested_paths=request))
+        bad.append(dict(roles=rows, requested_paths=[]))
+        bad.append(dict(roles=rows))
+        bad.append(dict(roles=rows + [dict(rows[-1])], requested_paths=request))
+        for change in [dict(path='/fixture/other'), dict(role='cache'), dict(requested=False)]:
+            changed = copy.deepcopy(rows)
+            changed[-1].update(change)
+            bad.append(dict(roles=changed, requested_paths=request))
+        for field in ('probe_path', 'filesystem_id', 'available_bytes', 'capacity_group'):
+            changed = copy.deepcopy(rows)
+            changed[-1].pop(field)
+            bad.append(dict(roles=changed, requested_paths=request))
+        for index, document in enumerate(bad):
+            with self.subTest(index=index):
+                result = self.verdict(rows, requested=request, document=document)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+
+    @unittest.skipUnless(os.environ.get('DSR_TEST_REQUESTED_BASELINE'),
+                         'set DSR_TEST_REQUESTED_BASELINE for the unchanged selected-path policy')
+    def test_requested_incumbent_accepts_missing_selected_path_evidence(self):
+        rows = self.bind()
+        request = [dict(role='temp', path='/fixture/unobserved-recipe-temp')]
+        payload = dict(roles=rows)
+        current = self.verdict(rows, requested=request, document=payload)
+        self.assertNotEqual(current.returncode, 0)
+        original = subprocess.run([BASH, '-c',
+            'declare -A DSR_CONFIG=(); source "$1/src/logging.sh"; source "$2"; '
+            '_hh_writable_storage_verdict null "$3"', '_', str(ROOT),
+            os.environ['DSR_TEST_REQUESTED_BASELINE'], json.dumps(request)],
+            input=json.dumps(payload), text=True, capture_output=True, timeout=10)
+        self.assertEqual(original.returncode, 0, original.stderr)
+        self.assertEqual(json.loads(original.stdout)['status'], 'ok')
+        (self.work / 'incumbent.stdout').write_text(original.stdout)
+        (self.work / 'incumbent.stderr').write_text(original.stderr)
+        print('CONTROL: identical requested recipe temp and healthy ambient inventory: '
+              'unchanged policy admits without its observation; candidate refuses missing evidence')
+
+    def test_requested_roles_never_inherit_split_root_allowance(self):
+        # A healthy external build volume permits the explicit ambient root
+        # budget, but a compiler's actual destination still needs the full floor.
+        external = copy.deepcopy(self.document['Containers'][0])
+        external.update(ContainerReference='disk8', APFSContainerUUID='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee')
+        external['Volumes'] = [dict(external['Volumes'][1], DeviceIdentifier='disk8s1')]
+        self.document['Containers'].append(external)
+        self.document['Containers'][0]['CapacityFree'] = 15 * GIB
+        self.infos['20'].update(DeviceIdentifier='disk8s1', APFSContainerReference='disk8')
+        for row in self.rows:
+            if row['role'] == 'temp':
+                row['filesystem_id'] = '10'
+        storage = dict(build_root='/fixture/build_root', root_min_free_bytes=10 * GIB)
+        baseline = self.accepted(self.bind(), storage)
+        self.assertEqual(baseline['status'], 'warning')
+        request = [dict(role='temp', path='/fixture/selected-temp')]
+        self.rows.append(dict(self.rows[0], **request[0], probe_path=request[0]['path'], requested=True))
+        value = self.accepted(self.bind(), storage, request)
+        row = next(row for row in value['roles'] if row.get('requested'))
+        self.assertEqual(row['capacity_policy'], 'build-default')
+        self.assertEqual(row['min_free_bytes'], MINIMUM)
+        self.assertEqual(row['status'], 'error')
+        self.assertEqual(value['status'], 'error')
+        self.assertEqual(next(row['status'] for row in value['roles']
+                              if row['role'] == 'temp' and not row.get('requested')), 'warning')
 
     def test_binary_and_xml_plists_produce_identical_evidence(self):
         self.assertEqual(self.bind(plistlib.FMT_BINARY), self.bind())
@@ -560,8 +881,34 @@ class ApfsCapacity(unittest.TestCase):
     def test_container_percentage_cannot_be_hidden_by_volume_percentage(self):
         self.document['Containers'][0].update(CapacityCeiling=1000 * GIB, CapacityFree=30 * GIB)
         value = self.accepted(self.bind())
-        self.assertEqual(value['status'], 'error')
+        self.assertEqual(value['status'], 'warning')
+        self.assertTrue(all(r['status'] == 'warning' for r in value['roles']))
         self.assertTrue(all(r['usage_percent'] == 97 for r in value['roles']))
+
+    def test_reported_large_apfs_pool_keeps_all_roles_and_warns(self):
+        total = 36 * 1024 * GIB // 10
+        self.document['Containers'][0].update(CapacityCeiling=total, CapacityFree=179 * GIB)
+        for row in self.rows:
+            row.update(total_bytes=total, available_bytes=179 * GIB, usage_percent=84)
+        rows = self.bind()
+        for storage in (None, self.split_policy()):
+            with self.subTest(split=storage is not None):
+                value = self.accepted(rows, storage)
+                self.assertEqual(value['status'], 'warning')
+                self.assertEqual(len(value['capacity_groups']), 1)
+                self.assertEqual(len(value['roles']), 5)
+                self.assertTrue(all(r['status'] == 'warning' and r['usage_percent'] == 96 and
+                                    r['available_bytes'] == 179 * GIB for r in value['roles']))
+                self.assertTrue(all(r.get('pressure_status', 'warning') == 'warning' for r in value['roles']))
+
+    def test_spacious_pool_cannot_hide_one_byte_below_the_required_floor(self):
+        for selected in ('root', 'home', 'cargo_home', 'temp', 'build_root'):
+            with self.subTest(role=selected):
+                rows = self.bind()
+                next(r for r in rows if r['role'] == selected)['available_bytes'] = MINIMUM - 1
+                value = self.accepted(rows)
+                self.assertEqual(value['status'], 'error')
+                self.assertEqual([r['role'] for r in value['roles'] if r['status'] == 'error'], [selected])
 
     def test_reserve_is_evidence_not_additional_free_space(self):
         self.document['Containers'][0]['Volumes'][1]['CapacityReserve'] = 60 * GIB

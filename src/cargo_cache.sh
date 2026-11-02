@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Private Cargo download caches. Copy bytes, never ambient configuration,
-# credentials, symlinks, or source hardlinks. Sourceable and directly runnable.
+# credentials, or source hardlinks. Locked submodule checkouts retain confined
+# file-link text for later Git authentication. Sourceable and directly runnable.
 # Ambient registry/git roots may be relocated links; private copies may not.
 
 _cargo_cache_run() {
@@ -253,7 +254,8 @@ def external_git_reference(path, size):
              ('.git' in parts[:-1] or (len(parts) == 4 and parts[1] == 'db'))))
 
 
-def inventory(root, destination=None, require_private_links=False, selected_paths=None, source_roots=None):
+def inventory(root, destination=None, require_private_links=False, selected_paths=None, source_roots=None,
+              copy_link_checkouts=()):
     files, directories, caches = [], [], []
     inodes = {}
     private_entries = {}
@@ -284,8 +286,9 @@ def inventory(root, destination=None, require_private_links=False, selected_path
                     raise Failure('cache directory changed while reading: ' + relative)
             finally:
                 os.close(fd)
-        elif (stat.S_ISLNK(before.st_mode) and destination is None and require_private_links and
-              relative.startswith('git/checkouts/')):
+        elif (stat.S_ISLNK(before.st_mode) and relative.startswith('git/checkouts/') and
+              ((destination is None and require_private_links) or
+               (destination is not None and '/'.join(relative.split('/')[:4]) in copy_link_checkouts))):
             # Cargo may materialize committed relative file links. Inventory
             # their text, never follow them as cache traversal. Source-object
             # authentication separately proves that text against the Git blob.
@@ -293,17 +296,30 @@ def inventory(root, destination=None, require_private_links=False, selected_path
             if len(parts) < 5 or '.git' in (part.casefold() for part in parts):
                 raise Failure('unsafe checkout link location: ' + relative)
             target = os.readlink(name, dir_fd=parent)
-            checkout = os.path.join(root, *parts[:4])
-            resolved = os.path.realpath(os.path.join(root, *parts[:-1], target))
             if (not target or os.path.isabs(target) or '.git' in (part.casefold() for part in target.split('/')) or
-                    any(ord(c) < 32 or ord(c) == 127 or c in '\\:' for c in target) or
-                    not inside(resolved, checkout) or
-                    '.git' in (part.casefold() for part in os.path.relpath(resolved, checkout).split('/')) or
-                    not stat.S_ISREG(os.stat(resolved).st_mode)):
+                    any(ord(c) < 32 or ord(c) == 127 or c in '\\:' for c in target)):
                 raise Failure('checkout link escapes private source files: ' + relative)
+            if destination is None:
+                checkout = os.path.join(root, *parts[:4])
+                resolved = os.path.realpath(os.path.join(root, *parts[:-1], target))
+                if (not inside(resolved, checkout) or
+                        '.git' in (part.casefold() for part in os.path.relpath(resolved, checkout).split('/')) or
+                        not stat.S_ISREG(os.stat(resolved).st_mode)):
+                    raise Failure('checkout link escapes private source files: ' + relative)
+            else:
+                # Preserve only the text of links in explicitly lock-selected
+                # submodule checkouts. Never resolve/read an ambient target,
+                # including through a relocated Git root. The completed private
+                # inventory below must resolve every link to a regular file in
+                # this checkout before publishing the seed receipt.
+                resolved = os.path.normpath(os.path.join(*parts[:-1], target))
+                if not inside(resolved, '/'.join(parts[:4])):
+                    raise Failure('checkout link escapes private source files: ' + relative)
             data = target.encode('utf-8')
             if identity(before) != identity(os.stat(name, dir_fd=parent, follow_symlinks=False)):
                 raise Failure('checkout link changed while reading: ' + relative)
+            if destination is not None:
+                os.symlink(target, os.path.join(destination, relative))
             files.append({'path': relative, 'sha256': hashlib.sha256(data).hexdigest(),
                           'size_bytes': len(data), 'executable_bits': 0, 'symlink': True})
         elif stat.S_ISREG(before.st_mode):
@@ -634,7 +650,7 @@ def locked_selection(source, lockfile, roots=None):
             revisions.add(origin.rsplit('#', 1)[1])
         else:
             raise Failure('unsupported or unpinned Cargo.lock source', 4)
-    selected, expected = {}, {}
+    selected, expected, link_checkouts = {}, {}, set()
 
     def add(relative):
         parts = relative.split('/')
@@ -765,11 +781,12 @@ def locked_selection(source, lockfile, roots=None):
                         head = git_probe(admin, ['rev-parse', '--verify', 'HEAD']).strip()
                         if head == revision.encode('ascii'):
                             add(checkout_path)
+                            link_checkouts.add(checkout_path)
     scope = {'kind': 'cargo-lock-downloads', 'lockfile_sha256': hashlib.sha256(raw).hexdigest(),
              'registry_packages': len(archives), 'git_revisions': sorted(revisions)}
     if roots is not None:
         roots.verify()
-    return selected, expected, scope
+    return selected, expected, scope, link_checkouts
 
 
 def new_receipt(path, value):
@@ -814,9 +831,9 @@ def main(args):
             raise Failure('source and private Cargo home must not overlap', 4)
         roots = CacheSourceRoots(source, destination)
         try:
-            paths, checksums, scope = None, {}, None
+            paths, checksums, scope, link_checkouts = None, {}, None, set()
             if len(args) == 4:
-                paths, checksums, scope = locked_selection(source, args[3], roots)
+                paths, checksums, scope, link_checkouts = locked_selection(source, args[3], roots)
             else:
                 paths, seed_anchors = unscoped_selection(source, roots)
             roots.verify()
@@ -824,7 +841,8 @@ def main(args):
             created = os.lstat(destination)
             complete = False
             try:
-                selected = inventory(source, destination, selected_paths=paths, source_roots=roots) if source else {'caches': [], 'directories': [], 'files': []}
+                selected = inventory(source, destination, selected_paths=paths, source_roots=roots,
+                                     copy_link_checkouts=link_checkouts) if source else {'caches': [], 'directories': [], 'files': []}
                 if any(entry['path'] in checksums and entry['sha256'] != checksums[entry['path']]
                        for entry in selected['files']):
                     raise Failure('selected archive changed after lockfile admission')

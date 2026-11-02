@@ -4,13 +4,13 @@
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 case "${1:-}" in
-    ''|--project-submodules-only) ;;
+    ''|--project-submodules-only|--export-attributes-only) ;;
     *) printf 'Unknown snapshot test selection: %s\n' "$1" >&2; exit 4 ;;
 esac
 for tool in python3 bash sh git tar awk grep; do
     command -v "$tool" >/dev/null || { printf 'Missing dependency: %s\n' "$tool" >&2; exit 3; }
 done
-if [[ "${1:-}" != --project-submodules-only ]]; then
+if [[ -z "${1:-}" ]]; then
 python3 - "$ROOT" <<'PY'
 import hashlib
 import json
@@ -195,6 +195,317 @@ batch_status=$?
 [[ "$batch_status" -eq 0 ]] || exit "$batch_status"
 fi
 
+# Tiny real repositories exercise the native writer, independent receivers,
+# retained-source recovery and relocation inventory. Export attributes are
+# archive filters, so they must not remove or rewrite committed build inputs.
+if [[ "${1:-}" != --project-submodules-only ]]; then
+for tool in jq yq rg; do
+    command -v "$tool" >/dev/null || { printf 'Missing dependency: %s\n' "$tool" >&2; exit 3; }
+done
+python3 - "$ROOT" <<'PY'
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+root = Path(sys.argv[1])
+module = Path(os.environ.get('DSR_TEST_ACT_RUNNER', str(root / 'src/act_runner.sh')))
+exporter = root / 'src/xwin_source.sh'
+os.umask(0o077)
+work = Path(tempfile.mkdtemp(prefix='dsr-unix-export-attributes-'))
+print('Export-attribute fixtures: ' + str(work), flush=True)
+environment = {key: value for key, value in os.environ.items() if not key.upper().startswith('GIT_')}
+environment.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull,
+    GIT_AUTHOR_NAME='DSR fixture', GIT_AUTHOR_EMAIL='fixture@example.invalid',
+    GIT_COMMITTER_NAME='DSR fixture', GIT_COMMITTER_EMAIL='fixture@example.invalid',
+    GIT_AUTHOR_DATE='2026-01-01T00:00:00Z', GIT_COMMITTER_DATE='2026-01-01T00:00:00Z',
+    ACT_ARTIFACTS_DIR=str(work / 'artifacts'), DSR_STATE_DIR=str(work / 'state'),
+    DSR_CONFIG_DIR=str(work / 'config'), DSR_REPOS_FILE=str(work / 'config/repos.yaml'),
+    NO_COLOR='1', LC_ALL='C')
+(work / 'state').mkdir()
+(work / 'config/repos.d').mkdir(parents=True)
+(work / 'config/repos.d/source-fixture.yaml').write_text(json.dumps({'sibling_crates': []}))
+checks, cases = 0, {}
+
+def check(label, condition):
+    global checks
+    if not condition:
+        raise AssertionError(label)
+    checks += 1
+    print('PASS ' + label, flush=True)
+
+def run(arguments, overrides=None, **kwargs):
+    return subprocess.run(arguments, capture_output=True, timeout=30,
+                          env=dict(environment, **(overrides or {})), **kwargs)
+
+def git(repository, *arguments):
+    return run(['git', '-C', str(repository), *arguments], check=True).stdout
+
+def call(function, *arguments, overrides=None):
+    return run(['bash', '-c', 'source "$1" || exit; shift; "$@"',
+                'fixture', str(module), function, *map(str, arguments)], overrides=overrides)
+
+def success(function, *arguments):
+    result = call(function, *arguments)
+    if result.returncode:
+        raise AssertionError(function + ': ' + result.stderr.decode(errors='replace'))
+    return result.stdout
+
+def probe(repository, revision, overrides=None):
+    return run(['bash', '-c', 'source "$1" || exit; source_archive_matches_git "$2" "$3"',
+                'fixture', str(exporter), str(repository), revision], overrides=overrides)
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def unpack(archive, destination):
+    destination.mkdir()
+    run(['tar', '-xf', str(archive), '-C', str(destination)], check=True)
+
+ram_backed = call('_act_dir_is_ram_backed', work).returncode == 0
+print('Primary staging filesystem: ' + ('RAM-backed; refusal required' if ram_backed else
+                                       'ordinary filesystem; successful admission required'), flush=True)
+for name, attributes, changed in (
+    ('ordinary', None, False),
+    ('noop-subst', b'version-no-token.txt export-subst\n', False),
+    ('export-ignore', b'src/input.txt export-ignore\n', True),
+    ('export-subst', b'version.txt export-subst\n', True),
+    ('all-export-ignore', b'* export-ignore\n', True),
+):
+    directory = work / name
+    repository = directory / 'repo'
+    repository.mkdir(parents=True)
+    git(repository, 'init', '-q', '--initial-branch=main', '--object-format=sha1')
+    files = {'Cargo.toml': b'[package]\nname="source-fixture"\nversion="0.1.0"\n',
+             'src/input.txt': b'tracked compiler input\n',
+             'version.txt': b'commit=$Format:%H$\n',
+             'version-no-token.txt': b'no substitution placeholder\n',
+             'run.sh': b'#!/bin/sh\nprintf "tracked executable\\n"\n'}
+    if not changed:
+        files['-leading'] = b'legacy path remains admitted\n'
+    long_path = 'nested/' + 'long-name-' * 12 + '.txt' if name == 'ordinary' else None
+    if long_path:
+        files[long_path] = b'long tracked path retains PAX metadata\n'
+    if attributes is not None:
+        files['.gitattributes'] = attributes
+    for relative, data in files.items():
+        path = repository / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        path.chmod(0o755 if relative == 'run.sh' else 0o644)
+    (repository / 'input-link').symlink_to('src/input.txt')
+    if long_path:
+        (repository / 'long-link').symlink_to(long_path)
+    git(repository, 'add', '.')
+    git(repository, 'commit', '-qm', 'tracked archive attributes')
+    revision = git(repository, 'rev-parse', 'HEAD').decode().strip()
+    if name == 'noop-subst':
+        git(repository, 'config', 'tar.umask', '0077')
+    check(name + ': genuine pinned source checkout is clean', not git(repository, 'status', '--porcelain'))
+
+    legacy = directory / 'legacy.tar'
+    legacy.write_bytes(git(repository, 'archive', '--format=tar', revision))
+    original_legacy = legacy.read_bytes()
+    if name == 'all-export-ignore':
+        # Python tarfile rejects Git's valid global-PAX-only empty archive.
+        # The real tar reader independently establishes its empty inventory.
+        empty_listing = run(['tar', '-tf', str(legacy)])
+        check(name + ': real Git export has no source members but retains a valid tar stream',
+              empty_listing.returncode == 0 and not empty_listing.stdout and len(original_legacy) >= 1024)
+    else:
+        with tarfile.open(legacy) as archive_reader:
+            legacy_members = archive_reader.getmembers()
+            if name == 'export-ignore':
+                check(name + ': real Git export omits the committed input',
+                      'src/input.txt' not in {entry.name for entry in legacy_members})
+            elif name == 'export-subst':
+                check(name + ': real Git export rewrites the committed token',
+                      archive_reader.extractfile('version.txt').read() == ('commit=' + revision + '\n').encode())
+            elif name == 'noop-subst':
+                check(name + ': non-default tar umask is a valid legacy archive identity',
+                      archive_reader.getmember('run.sh').mode == 0o700 and
+                      archive_reader.getmember('version-no-token.txt').mode == 0o600)
+            elif long_path:
+                check(name + ': genuine Git tar includes long path and linkpath PAX headers',
+                      archive_reader.getmember(long_path).pax_headers.get('path') == long_path and
+                      archive_reader.getmember('long-link').pax_headers.get('linkpath') == long_path)
+    match = probe(repository, revision)
+    check(name + ': comparison distinguishes actual transformation from unchanged bytes',
+          match.returncode == (10 if changed else 0) and not match.stdout)
+
+    manifest, archive = directory / 'tracked.manifest', directory / 'selected.tar'
+    success('_act_write_tracked_manifest', repository, revision, manifest)
+    success('_act_write_git_archive_evidence', repository, revision, archive)
+    original_manifest, original_archive = manifest.read_bytes(), archive.read_bytes()
+    check(name + ': archive selection preserves accepted legacy bytes and replaces only changed trees',
+          (original_archive != original_legacy) if changed else (original_archive == original_legacy))
+    check(name + ': recovery digest agrees with the selected writer bytes',
+          success('_act_git_archive_sha256', repository, revision).decode().strip() == digest(archive))
+    extracted = directory / 'selected-source'
+    unpack(archive, extracted)
+    check(name + ': selected archive contains every original tracked byte and symlink',
+          all((extracted / relative).read_bytes() == data for relative, data in files.items()) and
+          (extracted / 'input-link').is_symlink() and os.readlink(extracted / 'input-link') == 'src/input.txt' and
+          (not long_path or ((extracted / 'long-link').is_symlink() and os.readlink(extracted / 'long-link') == long_path)) and
+          os.access(extracted / 'run.sh', os.X_OK))
+    check(name + ': independent local tracked-tree verifier accepts the selected archive',
+          call('_act_verify_tracked_manifest_local', extracted, manifest).returncode == 0)
+    count = int(success('_act_tracked_manifest_object_count', manifest))
+    program = success('_act_unix_strict_snapshot_verify_script', extracted, archive, manifest, digest(manifest), count)
+    script = directory / 'verify-selected.sh'
+    script.write_bytes(program)
+    wanted = (digest(archive) + ' ' + digest(manifest) + '\n').encode()
+    verified = run(['sh', str(script)])
+    check(name + ': generated POSIX receiver verifies the same selected identity',
+          verified.returncode == 0 and verified.stdout == wanted)
+
+    if not changed:
+        retained_parent = directory / 'retained-run'
+        retained_parent.mkdir()
+        retained_archive = retained_parent / '.source.tar'
+        retained_manifest = retained_parent / '.source.manifest'
+        retained_archive.write_bytes(original_legacy)
+        retained_manifest.write_bytes(original_manifest)
+        retained = retained_parent / 'source'
+        unpack(retained_archive, retained)
+        for attempt in range(2):
+            check(name + ': retained legacy source resumes without restaging, pass ' + str(attempt + 1),
+                  call('_act_verify_strict_checkout_snapshot', 'act', repository, revision,
+                       retained, 'source.tar', name).returncode == 0)
+        check(name + ': resumed legacy receipts remain byte-identical',
+              retained_archive.read_bytes() == original_legacy and retained_manifest.read_bytes() == original_manifest)
+
+    # This is the actual sibling staging path. Its parent is already owned by
+    # the run; it uses the same writer and receiver as a fresh primary source.
+    sibling_parent = directory / 'sibling-run'
+    sibling_parent.mkdir()
+    (sibling_parent / '.sbh-protect').write_text('DSR source regression fixture\n')
+    stage = sibling_parent / 'dependency'
+    success('_act_sync_strict_checkout', 'act', repository, revision, stage, 'dependency.tar', name)
+    check(name + ': actual sibling source staging retains committed inputs',
+          (stage / 'src/input.txt').read_bytes() == files['src/input.txt'] and
+          (stage / 'version.txt').read_bytes() == files['version.txt'])
+    staged_archive, staged_manifest = sibling_parent / '.dependency.tar', sibling_parent / '.dependency.manifest'
+    check(name + ': staged receipts match the independently retained selected archive',
+          staged_archive.read_bytes() == original_archive and staged_manifest.read_bytes() == original_manifest)
+    primary = directory / 'primary-run/source'
+    primary_result = call('_act_sync_strict_checkout', 'act', repository, revision, primary, 'source.tar', name)
+    check(name + ': primary source staging respects the real filesystem storage gate',
+          (primary_result.returncode == 4 and b'RAM-backed' in primary_result.stderr and not primary.exists())
+          if ram_backed else (primary_result.returncode == 0 and (primary / 'src/input.txt').read_bytes() == files['src/input.txt']))
+
+    def finalization():
+        return call('_act_verify_strict_checkout_snapshot', 'act', repository, revision,
+                    stage, 'dependency.tar', name)
+
+    check(name + ': actual retained-source finalization accepts the selected archive', finalization().returncode == 0)
+    if changed:
+        stage_program = success('_act_unix_strict_snapshot_verify_script', stage, staged_archive,
+                                staged_manifest, digest(manifest), count)
+        stage_script = directory / 'verify-staged.sh'
+        stage_script.write_bytes(stage_program)
+        for kind in ('source', 'executable-mode', 'manifest', 'archive'):
+            selected = {'source': stage / 'src/input.txt', 'executable-mode': stage / 'run.sh',
+                        'manifest': staged_manifest, 'archive': staged_archive}[kind]
+            held, held_mode = selected.read_bytes(), selected.stat().st_mode & 0o777
+            if kind == 'executable-mode':
+                selected.chmod(0o644)
+            else:
+                selected.write_bytes((bytes([held[0] ^ 1]) + held[1:]) if held else b'changed')
+            result = finalization()
+            received = run(['sh', str(stage_script)])
+            check(name + ': ' + kind + ' tampering is refused by actual source finalization', result.returncode == 4)
+            check(name + ': ' + kind + ' tampering cannot reproduce the pinned receiver identity',
+                  received.returncode != 0 or received.stdout != wanted)
+            if kind == 'executable-mode':
+                selected.chmod(held_mode)
+            else:
+                selected.write_bytes(held)
+        check(name + ': restored original source and receipt bytes are accepted', finalization().returncode == 0)
+
+    repeated = directory / 'regenerated.tar'
+    success('_act_write_git_archive_evidence', repository, revision, repeated)
+    check(name + ': repeated export preserves the selected immutable identity', repeated.read_bytes() == original_archive)
+    relocated = directory / 'relocated-repo'
+    repository.rename(relocated)
+    repository = relocated
+    check(name + ': moving the controller checkout does not change the archive digest',
+          success('_act_git_archive_sha256', repository, revision).decode().strip() == digest(archive))
+    inventory = run(['bash', '-c',
+        'source "$1" || exit; source "$2" || exit; ACT_REPO_LOCAL_PATH="$3"; _act_relocation_source_inventory source-fixture "$4"',
+        'fixture', str(root / 'src/config.sh'), str(module), str(repository), revision])
+    check(name + ': real relocation inventory retains both selected source identities',
+          inventory.returncode == 0 and json.loads(inventory.stdout) == [dict(path='source', git_sha=revision,
+              archive_sha256=digest(archive), manifest_sha256=digest(manifest))])
+    check(name + ': repeated verification after relocation does not rewrite original evidence',
+          finalization().returncode == 0 and archive.read_bytes() == original_archive and
+          manifest.read_bytes() == original_manifest and legacy.read_bytes() == original_legacy and
+          staged_archive.read_bytes() == original_archive and staged_manifest.read_bytes() == original_manifest)
+    cases[name] = (repository, revision)
+
+# Faults occur at real Git process boundaries. The archive itself is genuine
+# Git output until the named corruption; all selection/writer/hash functions
+# remain production code, so a fallback that hides a failure is observable.
+observer = work / 'observer'
+observer.mkdir()
+git_wrapper = observer / 'git'
+git_wrapper.write_text('''#!/usr/bin/env python3
+import io, os, subprocess, sys, tarfile
+arguments = sys.argv[1:]
+fault = os.environ.get('DSR_ARCHIVE_FAULT', '')
+if fault == 'inventory-failure' and 'ls-tree' in arguments:
+    sys.exit(27)
+if 'archive' not in arguments:
+    os.execv(os.environ['DSR_REAL_GIT'], [os.environ['DSR_REAL_GIT'], *arguments])
+result = subprocess.run([os.environ['DSR_REAL_GIT'], *arguments], capture_output=True)
+sys.stderr.buffer.write(result.stderr)
+if result.returncode:
+    sys.exit(result.returncode)
+data = result.stdout
+if fault == 'malformed-header':
+    data = bytes([data[0] ^ 1]) + data[1:]
+elif fault == 'missing-terminators':
+    with tarfile.open(fileobj=io.BytesIO(data)) as archive:
+        entries = archive.getmembers()
+    end = max(entry.offset_data + ((entry.size + 511) // 512) * 512 for entry in entries)
+    data = data[:end]
+sys.stdout.buffer.write(data)
+sys.exit(23 if fault == 'producer-failure' else 0)
+''')
+git_wrapper.chmod(0o755)
+for name, fault in (('ordinary', 'producer-failure'), ('export-ignore', 'producer-failure'),
+                    ('all-export-ignore', 'producer-failure'),
+                    ('ordinary', 'malformed-header'), ('ordinary', 'missing-terminators'),
+                    ('ordinary', 'inventory-failure')):
+    repository, revision = cases[name]
+    overrides = dict(PATH=str(observer) + os.pathsep + environment['PATH'],
+                     DSR_REAL_GIT=shutil.which('git'), DSR_ARCHIVE_FAULT=fault)
+    result = probe(repository, revision, overrides)
+    check(name + ': ' + fault + ' is a comparison error rather than semantic divergence',
+          result.returncode == 4 and not result.stdout)
+    refused_archive = work / (name + '-' + fault + '.tar')
+    result = call('_act_write_git_archive_evidence', repository, revision, refused_archive, overrides=overrides)
+    check(name + ': ' + fault + ' cannot fall back to an apparently successful writer', result.returncode != 0)
+    check(name + ': ' + fault + ' refuses before emitting any archive evidence',
+          refused_archive.is_file() and refused_archive.stat().st_size == 0)
+    result = call('_act_git_archive_sha256', repository, revision, overrides=overrides)
+    check(name + ': ' + fault + ' cannot produce a successful recovery digest', result.returncode != 0)
+
+print(f'Unix export attributes: {checks} assertions passed; real Git, writer, receivers, sibling staging and retained-source recovery.', flush=True)
+print('Primary staging: ' + ('RAM-backed refusal verified; native host readiness not qualified.' if ram_backed else
+                             'fresh primary source admitted on ordinary storage; no compiler or SSH transport.'), flush=True)
+PY
+attributes_status=$?
+[[ "$attributes_status" -eq 0 ]] || exit "$attributes_status"
+[[ "${1:-}" != --export-attributes-only ]] || exit 0
+fi
+
 # Authenticate the actual native export and receiver path with recursive Git
 # repositories. This is separate from the large-file batch above so an
 # incumbent negative control can select it without rerunning that matrix.
@@ -354,14 +665,23 @@ check('production recovery archive hash matches admitted export',
 # Use actual local staging and final source verification; no transport, source
 # admission, path selection, or manifest function is substituted here.
 stage = work / 'native-run/source'
-success('_act_sync_strict_checkout', 'act', project, revision, stage, 'source.tar', 'submodule-fixture')
+stage_archive = 'source.tar'
+if call('_act_dir_is_ram_backed', work).returncode == 0:
+    refused = call('_act_sync_strict_checkout', 'act', project, revision, stage, stage_archive, 'submodule-fixture')
+    check('actual primary project staging retains the RAM-backed storage refusal',
+          refused.returncode == 4 and b'RAM-backed' in refused.stderr and not stage.exists())
+    stage.parent.mkdir()
+    (stage.parent / '.sbh-protect').write_text('DSR project-submodule regression fixture\n')
+    stage_archive = 'dependency.tar'
+    print('Project-submodule integration uses genuine sibling staging on RAM-backed fixtures.', flush=True)
+success('_act_sync_strict_checkout', 'act', project, revision, stage, stage_archive, 'submodule-fixture')
 check('actual strict local stage contains the nested pinned source',
       (stage / 'vendor/dep/nested/leaf/leaf.txt').read_bytes() == b'pinned nested source\n')
 check('actual strict source finalization accepts the unchanged staged graph',
-      call('_act_verify_strict_checkout_snapshot', 'act', project, revision, stage, 'source.tar', 'submodule-fixture').returncode == 0)
+      call('_act_verify_strict_checkout_snapshot', 'act', project, revision, stage, stage_archive, 'submodule-fixture').returncode == 0)
 (stage / 'vendor/dep/data.txt').write_bytes(b'changed staged child\n')
 check('actual strict source finalization refuses changed staged child bytes',
-      call('_act_verify_strict_checkout_snapshot', 'act', project, revision, stage, 'source.tar', 'submodule-fixture').returncode != 0)
+      call('_act_verify_strict_checkout_snapshot', 'act', project, revision, stage, stage_archive, 'submodule-fixture').returncode != 0)
 
 payload = source / 'vendor/dep/data.txt'; original = payload.read_bytes()
 payload.write_bytes(b'changed child\n'); verify('changed-child-bytes', accepted=False); payload.write_bytes(original)

@@ -2587,95 +2587,402 @@ test_strict_fix_final_get_rejects_postcheck_asset_flip() {
     harness_teardown
 }
 
-test_verify_fix_attempts_upload() {
-    ((TESTS_RUN++))
+# A real local inventory and a stateful API transport keep repair admission
+# under test. Production upload, manifest and readback helpers are not stubbed.
+seed_ordinary_verify_repair() {
+    local directory="$DSR_STATE_DIR/artifacts/test-tool-v1.0.0"
+    mkdir -p "$directory" "$TEST_TMPDIR/ordinary-repair"
+    printf 'ordinary linux payload\n' > "$directory/test-tool-linux-amd64"
+    printf 'ordinary darwin payload\n' > "$directory/test-tool-darwin-arm64"
+    jq -nc --arg linux "$(test_sha256 "$directory/test-tool-linux-amd64")" \
+        --arg darwin "$(test_sha256 "$directory/test-tool-darwin-arm64")" \
+        --argjson linux_size "$(test_file_size "$directory/test-tool-linux-amd64")" \
+        --argjson darwin_size "$(test_file_size "$directory/test-tool-darwin-arm64")" '
+        {schema_version:"1.0.0",tool:"test-tool",version:"v1.0.0",status:"success",
+         artifacts:[
+            {name:"test-tool-linux-amd64",target:"linux/amd64",sha256:$linux,size_bytes:$linux_size},
+            {name:"test-tool-darwin-arm64",target:"darwin/arm64",sha256:$darwin,size_bytes:$darwin_size}
+         ]}' > "$directory/test-tool-v1.0.0-manifest.json"
+    ORDINARY_REPAIR_ROOT="$TEST_TMPDIR/ordinary-repair"
+    ORDINARY_REPAIR_MODE="$1"
+    export ORDINARY_REPAIR_ROOT ORDINARY_REPAIR_MODE
+    printf 'v1.0.0\n' > "$ORDINARY_REPAIR_ROOT/tag"
+    : > "$ORDINARY_REPAIR_ROOT/uploads"
+    jq '[.artifacts[0] | {id:101,name,state:"uploaded",size:.size_bytes,digest:("sha256:" + .sha256)}]' \
+        "$directory/test-tool-v1.0.0-manifest.json" > "$ORDINARY_REPAIR_ROOT/assets.json" || return 1
+    printf 'testuser/test-tool\n' > "$ORDINARY_REPAIR_ROOT/upload-repo"
+    printf '0\n' > "$ORDINARY_REPAIR_ROOT/inventory-gets"
+    : > "$ORDINARY_REPAIR_ROOT/inventory-pages"
+    case "$ORDINARY_REPAIR_MODE" in
+        mixed_repo_case)
+            yq -i '.repo = "TestUser/Test-Tool"' \
+                "$DSR_CONFIG_DIR/repos.d/test-tool.yaml" || return 1
+            ;;
+        foreign_upload_repo)
+            printf 'different-owner/different-tool\n' > "$ORDINARY_REPAIR_ROOT/upload-repo"
+            ;;
+        empty_manifest)
+            jq '.artifacts = []' "$directory/test-tool-v1.0.0-manifest.json" \
+                > "$ORDINARY_REPAIR_ROOT/empty-manifest.json" || return 1
+            cp "$ORDINARY_REPAIR_ROOT/empty-manifest.json" \
+                "$directory/test-tool-v1.0.0-manifest.json" || return 1
+            ;;
+        paginated)
+            # Linux and 99 unrelated assets fill page one. The uploaded
+            # Darwin payload is discoverable only on the second page.
+            jq '. + [range(1;100) |
+                {id:(1000 + .),name:("unrelated-" + tostring),state:"uploaded",
+                 size:1,digest:("sha256:" + ("e" * 64))}]' \
+                "$ORDINARY_REPAIR_ROOT/assets.json" > "$ORDINARY_REPAIR_ROOT/assets.seeded" || return 1
+            mv "$ORDINARY_REPAIR_ROOT/assets.seeded" "$ORDINARY_REPAIR_ROOT/assets.json" || return 1
+            ;;
+    esac
+    if [[ "$1" == already_present || "$1" == already_present_wrong_bytes ]]; then
+        jq --arg mode "$1" '
+            [.artifacts | to_entries[] |
+             {id:(101 + .key),name:.value.name,state:"uploaded",size:.value.size_bytes,
+              digest:("sha256:" + (if $mode == "already_present_wrong_bytes" and .key == 1
+                                  then ("f" * 64) else .value.sha256 end))}]' \
+            "$directory/test-tool-v1.0.0-manifest.json" > "$ORDINARY_REPAIR_ROOT/assets.json"
+    fi
+}
 
-    if [[ "$HAS_YQ" != "true" ]]; then
+create_ordinary_verify_repair_mock() {
+    _ordinary_repair_release_json() {
+        jq -nc --arg tag "$(cat "$ORDINARY_REPAIR_ROOT/tag")" \
+            --arg upload_repo "$(cat "$ORDINARY_REPAIR_ROOT/upload-repo")" \
+            --slurpfile assets "$ORDINARY_REPAIR_ROOT/assets.json" '
+            {id:12345,tag_name:$tag,draft:false,prerelease:false,target_commitish:"main",
+             html_url:"https://github.com/testuser/test-tool/releases/tag/v1.0.0",
+             upload_url:("https://uploads.github.com/repos/" + $upload_repo + "/releases/12345/assets{?name,label}"),
+             assets:$assets[0]}'
+    }
+    gh() {
+        [[ "${GH_TOKEN:-}" == release-fixture-token && "${GH_HOST:-}" == github.com ]] || return 9
+        case "${1:-}" in
+            auth)
+                [[ "${2:-}" == status ]] && return 0
+                [[ "${2:-}" == token ]] && { printf 'release-fixture-token\n'; return 0; }
+                ;;
+            api)
+                case "${2:-}" in
+                    repos/testuser/test-tool/releases/tags/v1.0.0|repos/TestUser/Test-Tool/releases/tags/v1.0.0)
+                        _ordinary_repair_release_json
+                        return $?
+                        ;;
+                    repos/testuser/test-tool/releases/12345|repos/TestUser/Test-Tool/releases/12345)
+                        if [[ "$ORDINARY_REPAIR_MODE" == postcheck_flip ]]; then
+                            # The final release observation occurs after a
+                            # successful POST. Its latest asset bytes must
+                            # constrain success, even with unchanged identity.
+                            printf 'get\n' >> "$ORDINARY_REPAIR_ROOT/release-gets"
+                            local observed_gets
+                            observed_gets=$(wc -l < "$ORDINARY_REPAIR_ROOT/release-gets")
+                            if (( observed_gets == 2 )); then
+                                jq 'map(if .name == "test-tool-darwin-arm64"
+                                    then .digest = ("sha256:" + ("f" * 64))
+                                    else . end)' "$ORDINARY_REPAIR_ROOT/assets.json" \
+                                    > "$ORDINARY_REPAIR_ROOT/assets.next" || return 9
+                                mv "$ORDINARY_REPAIR_ROOT/assets.next" \
+                                    "$ORDINARY_REPAIR_ROOT/assets.json" || return 9
+                            fi
+                        fi
+                        if [[ "$ORDINARY_REPAIR_MODE" == tag_before_upload ]]; then
+                            printf 'v9.9.9\n' > "$ORDINARY_REPAIR_ROOT/tag"
+                        fi
+                        _ordinary_repair_release_json
+                        return $?
+                        ;;
+                    repos/testuser/test-tool/releases/12345/assets\?per_page=100\&page=*|repos/TestUser/Test-Tool/releases/12345/assets\?per_page=100\&page=*)
+                        local page="${2##*=}" inventory_gets snapshot
+                        [[ "$page" =~ ^[1-9][0-9]*$ ]] || return 9
+                        inventory_gets=$(cat "$ORDINARY_REPAIR_ROOT/inventory-gets") || return 9
+                        inventory_gets=$((inventory_gets + 1))
+                        printf '%s\n' "$inventory_gets" > "$ORDINARY_REPAIR_ROOT/inventory-gets"
+                        printf '%s\n' "$page" >> "$ORDINARY_REPAIR_ROOT/inventory-pages"
+                        if [[ "$ORDINARY_REPAIR_MODE" == inventory_coherence && "$inventory_gets" -eq 3 ]]; then
+                            # A later complete response contradicts an earlier
+                            # Linux row while still reporting valid Darwin.
+                            jq 'map(if .name == "test-tool-linux-amd64" then
+                                .digest = ("sha256:" + ("f" * 64)) else . end)' \
+                                "$ORDINARY_REPAIR_ROOT/assets.json" > "$ORDINARY_REPAIR_ROOT/assets.changed" || return 9
+                            mv "$ORDINARY_REPAIR_ROOT/assets.changed" "$ORDINARY_REPAIR_ROOT/assets.json" || return 9
+                        fi
+                        snapshot=$(jq --argjson start "$(((10#$page - 1) * 100))" \
+                            '.[$start:($start + 100)]' "$ORDINARY_REPAIR_ROOT/assets.json") || return 9
+                        printf '%s\n' "$snapshot" > "$ORDINARY_REPAIR_ROOT/last-inventory.json"
+                        printf '%s\n' "$snapshot"
+                        return 0
+                        ;;
+                esac
+                ;;
+            release)
+                if [[ "${2:-}" == upload ]]; then
+                    # The old implementation trusts this nominal success even
+                    # though the remote asset inventory remains unchanged.
+                    printf 'legacy-tag-upload\n' >> "$ORDINARY_REPAIR_ROOT/uploads"
+                    return 0
+                fi
+                ;;
+        esac
+        return 1
+    }
+    curl() {
+        local output="" headers="" body="" url="" authorization="" argument
+        while [[ $# -gt 0 ]]; do
+            argument="$1"; shift
+            case "$argument" in
+                -o|-D|--data-binary|-H)
+                    [[ $# -gt 0 ]] || return 9
+                    case "$argument" in
+                        -o) output="$1" ;;
+                        -D) headers="$1" ;;
+                        --data-binary) body="${1#@}" ;;
+                        -H) [[ "$1" != Authorization:* ]] || authorization="$1" ;;
+                    esac
+                    shift
+                    ;;
+                https://*) url="$argument" ;;
+            esac
+        done
+        # Count every attempted network write, including a forbidden repo
+        # URL which this transport will reject before storing any server asset.
+        printf 'attempt-post:%s\n' "$url" >> "$ORDINARY_REPAIR_ROOT/uploads"
+        [[ "$url" == "https://uploads.github.com/repos/testuser/test-tool/releases/12345/assets?name=test-tool-darwin-arm64" &&
+           "$authorization" == "Authorization: Bearer release-fixture-token" &&
+           -n "$output" && -n "$headers" && -f "$body" ]] || return 9
+        local sha size response stored
+        sha=$(_gh_asset_sha256 "$body") || return 9
+        size=$(wc -c < "$body") || return 9
+        size="${size//[[:space:]]/}"
+        response=$(jq -nc --arg sha "$sha" --argjson size "$size" '
+            {id:102,name:"test-tool-darwin-arm64",state:"uploaded",size:$size,digest:("sha256:" + $sha)}') || return 9
+        stored="$response"
+        if [[ "$ORDINARY_REPAIR_MODE" == changed_bytes ]]; then
+            stored=$(jq '.digest = ("sha256:" + ("f" * 64))' <<< "$response") || return 9
+        elif [[ "$ORDINARY_REPAIR_MODE" == replaced_id ]]; then
+            stored=$(jq '.id = 103' <<< "$response") || return 9
+        fi
+        printf 'post:12345:test-tool-darwin-arm64\n' >> "$ORDINARY_REPAIR_ROOT/uploads"
+        if [[ "$ORDINARY_REPAIR_MODE" != no_upload ]]; then
+            jq --argjson asset "$stored" '. + [$asset]' "$ORDINARY_REPAIR_ROOT/assets.json" \
+                > "$ORDINARY_REPAIR_ROOT/assets.next" || return 9
+            mv "$ORDINARY_REPAIR_ROOT/assets.next" "$ORDINARY_REPAIR_ROOT/assets.json" || return 9
+        fi
+        if [[ "$ORDINARY_REPAIR_MODE" == tag_after_upload ]]; then
+            printf 'v9.9.9\n' > "$ORDINARY_REPAIR_ROOT/tag"
+        fi
+        printf '%s\n' "$response" > "$output"
+        printf 'HTTP/1.1 201 Created\r\n\r\n' > "$headers"
+        if [[ "$ORDINARY_REPAIR_MODE" == lost_ack ]]; then
+            printf '{"message":"upstream acknowledgement lost"}' > "$output"
+            printf 'HTTP/1.1 500 Internal Server Error\r\n\r\n' > "$headers"
+            printf '500'
+        else
+            printf '201'
+        fi
+    }
+    export -f gh curl _ordinary_repair_release_json
+}
+
+remove_ordinary_verify_repair_mock() {
+    unset -f gh curl _ordinary_repair_release_json
+    unset ORDINARY_REPAIR_ROOT ORDINARY_REPAIR_MODE
+}
+
+_verify_ordinary_repair_case() {
+    local mode="$1" expected_status="$2" label="$3"
+    ((TESTS_RUN++))
+    if [[ "$HAS_YQ" != true ]]; then
         skip "yq required for repos.yaml parsing"
         return 0
     fi
-
     harness_setup
     seed_repos_config
-    seed_manifest "test-tool" "v1.0.0"
-
-    # Track upload attempts
-    local upload_log="$TEST_TMPDIR/upload.log"
-
-    create_mock_gh '{
-        "id": 12345,
-        "html_url": "https://github.com/testuser/test-tool/releases/tag/v1.0.0",
-        "assets": [
-            {"name": "test-tool-linux-amd64", "browser_download_url": "https://example.com/a"},
-            {"name": "SHA256SUMS", "browser_download_url": "https://example.com/c"}
-        ]
-    }' 0 0 0 "$upload_log"
-
-    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" release verify test-tool v1.0.0 --fix
-    local status
-    status=$(exec_status)
-
-    # Check if upload was attempted
-    if [[ -f "$upload_log" ]]; then
-        if grep -q "darwin-arm64" "$upload_log" 2>/dev/null; then
-            pass "release verify --fix attempts to upload missing asset"
-        else
-            fail "release verify --fix should attempt to upload darwin-arm64"
-            echo "upload log: $(cat "$upload_log")"
-        fi
-    else
-        # If no upload log, check stderr for upload attempt message
-        if exec_stderr_contains "Uploading" || exec_stderr_contains "Upload"; then
-            pass "release verify --fix attempts upload (log message found)"
-        else
-            fail "release verify --fix should attempt to upload missing asset"
-            echo "stderr: $(exec_stderr | head -10)"
-        fi
+    if ! seed_ordinary_verify_repair "$mode"; then
+        fail "$label (fixture setup failed)"
+        harness_teardown
+        return 0
     fi
-
-    remove_release_verify_mock_gh
+    create_ordinary_verify_repair_mock
+    DSR_GH_TOKEN=release-fixture-token GITHUB_TOKEN=ci-fixture-token \
+        GH_TOKEN=ambient-fixture-token GH_HOST=enterprise.fixture.invalid \
+        GH_MAX_RETRIES=1 GH_RETRY_DELAY=0 \
+        PATH="$TEST_TMPDIR/bin:$PATH" exec_run \
+        "$DSR_CMD" --json release verify test-tool v1.0.0 --fix
+    local status expected_posts=1 report_filter='true'
+    status=$(exec_status)
+    case "$mode" in
+        complete|lost_ack|already_present)
+            report_filter='.status == "success" and .details.verification.missing == 0 and
+                (.details.assets.present | sort) == ["test-tool-darwin-arm64","test-tool-linux-amd64"] and
+                (.details.repair.errors // []) == []'
+            ;;
+        mixed_repo_case|paginated)
+            report_filter='.status == "success" and .details.verification.missing == 0 and
+                (.details.assets.present | sort) == ["test-tool-darwin-arm64","test-tool-linux-amd64"] and
+                (.details.repair.errors // []) == []'
+            ;;
+        foreign_upload_repo|empty_manifest)
+            expected_posts=0
+            report_filter='.status == "incomplete" and
+                (.details.repair.errors | length) > 0 and
+                .details.verification.remote_records_valid == false'
+            ;;
+        no_upload)
+            report_filter='.status == "incomplete" and
+                .details.assets.missing == ["test-tool-darwin-arm64"] and
+                .details.assets.present == ["test-tool-linux-amd64"]'
+            ;;
+        changed_bytes|replaced_id|postcheck_flip|already_present_wrong_bytes)
+            report_filter='.status == "incomplete" and
+                .details.assets.present == ["test-tool-linux-amd64"] and
+                (.details.repair.errors | length) > 0 and
+                .details.verification.remote_records_valid == false'
+            ;;
+        tag_before_upload)
+            expected_posts=0
+            report_filter='.status == "incomplete" and
+                (.details.repair.errors | length) > 0 and
+                .details.verification.remote_records_valid == false'
+            ;;
+        tag_after_upload)
+            report_filter='.status == "incomplete" and
+                (.details.repair.errors | length) > 0 and
+                .details.verification.remote_records_valid == false'
+            ;;
+    esac
+    if [[ "$mode" == already_present || "$mode" == already_present_wrong_bytes ]]; then
+        expected_posts=0
+    fi
+    if [[ "$mode" == inventory_coherence ]]; then
+        local latest_present
+        # Derive the oracle from the last complete response actually served,
+        # not from how many inventory requests an implementation chooses.
+        if ! latest_present=$(jq -ce --slurpfile manifest \
+                "$DSR_STATE_DIR/artifacts/test-tool-v1.0.0/test-tool-v1.0.0-manifest.json" '
+                [.[] | . as $remote |
+                 select(any($manifest[0].artifacts[];
+                    .name == $remote.name and $remote.state == "uploaded" and
+                    .size_bytes == $remote.size and ("sha256:" + .sha256) == $remote.digest)) |
+                 .name] | sort
+            ' "$ORDINARY_REPAIR_ROOT/last-inventory.json"); then
+            report_filter=false
+        elif [[ "$latest_present" == '["test-tool-darwin-arm64","test-tool-linux-amd64"]' ]]; then
+            expected_status=0
+            report_filter='.status == "success" and
+                (.details.assets.present | sort) == ["test-tool-darwin-arm64","test-tool-linux-amd64"] and
+                (.details.repair.errors // []) == []'
+        elif [[ "$latest_present" == '["test-tool-darwin-arm64"]' ]]; then
+            expected_status=1
+            report_filter='.status == "incomplete" and
+                .details.assets.present == ["test-tool-darwin-arm64"] and
+                (.details.repair.errors | length) > 0 and
+                .details.verification.remote_records_valid == false'
+        else
+            report_filter=false
+        fi
+    elif [[ "$mode" == paginated ]]; then
+        if ! grep -q '^2$' "$ORDINARY_REPAIR_ROOT/inventory-pages" ||
+           ! jq -e 'length == 1 and .[0].name == "test-tool-darwin-arm64"' \
+                "$ORDINARY_REPAIR_ROOT/last-inventory.json" >/dev/null; then
+            report_filter=false
+        fi
+    elif [[ "$mode" == empty_manifest ]]; then
+        report_filter+=' and .details.verification.expected == 0 and .details.repair.uploads == []'
+    fi
+    local observed_posts attempted_posts
+    observed_posts=$(awk '/^post:/{n++} END {print n+0}' "$ORDINARY_REPAIR_ROOT/uploads")
+    attempted_posts=$(awk '/^attempt-post:/{n++} END {print n+0}' "$ORDINARY_REPAIR_ROOT/uploads")
+    if [[ "$status" -eq "$expected_status" && "$observed_posts" -eq "$expected_posts" &&
+          "$attempted_posts" -eq "$expected_posts" ]] &&
+       ! grep -q '^legacy-tag-upload' "$ORDINARY_REPAIR_ROOT/uploads" &&
+       exec_stdout | jq -e --argjson code "$expected_status" \
+           ".command == \"release-verify\" and .exit_code == \$code and ($report_filter)" >/dev/null; then
+        pass "$label"
+    else
+        fail "$label"
+        printf 'status=%s; POSTs=%s\n' "$status" "$observed_posts"
+        exec_stdout
+        exec_stderr | tail -10
+    fi
+    remove_ordinary_verify_repair_mock
     harness_teardown
 }
 
+test_verify_fix_attempts_upload() {
+    _verify_ordinary_repair_case lost_ack 0 \
+        "ordinary repair reconciles a lost acknowledgement through the ID-bound inventory"
+}
+
 test_verify_fix_uses_selected_github_identity() {
-    ((TESTS_RUN++))
+    _verify_ordinary_repair_case complete 0 \
+        "ordinary repair verifies final assets using the selected public-GitHub identity"
+}
 
-    if [[ "$HAS_YQ" != "true" ]]; then
-        skip "yq required for repos.yaml parsing"
-        return 0
-    fi
+test_verify_fix_requires_remote_asset_after_upload() {
+    _verify_ordinary_repair_case no_upload 1 \
+        "ordinary repair cannot report a missing asset present after nominal upload success"
+}
 
-    harness_setup
-    seed_repos_config
-    seed_manifest "test-tool" "v1.0.0"
-    local upload_log="$TEST_TMPDIR/identity-upload.log"
-    create_mock_gh '{
-        "id": 12345,
-        "html_url": "https://github.com/testuser/test-tool/releases/tag/v1.0.0",
-        "assets": [
-            {"name": "test-tool-linux-amd64", "browser_download_url": "https://example.invalid/a"},
-            {"name": "SHA256SUMS", "browser_download_url": "https://example.invalid/c"}
-        ]
-    }' 0 0 0 "$upload_log"
+test_verify_fix_rejects_changed_remote_bytes() {
+    _verify_ordinary_repair_case changed_bytes 1 \
+        "ordinary repair rejects changed bytes observed after an initially matching POST receipt"
+}
 
-    DSR_GH_TOKEN=release-fixture-token GITHUB_TOKEN=ci-fixture-token \
-        GH_TOKEN=ambient-fixture-token GH_HOST=enterprise.fixture.invalid \
-        VERIFY_MOCK_EXPECTED_TOKEN=release-fixture-token \
-        PATH="$TEST_TMPDIR/bin:$PATH" exec_run \
-        "$DSR_CMD" --json release verify test-tool v1.0.0 --fix
+test_verify_fix_rejects_replaced_asset_id() {
+    _verify_ordinary_repair_case replaced_id 1 \
+        "ordinary repair rejects replacement of an uploaded asset even when bytes match"
+}
 
-    if [[ $(exec_status) -eq 0 && -f "$upload_log" ]] && \
-       grep -q 'darwin-arm64' "$upload_log" && \
-       exec_stdout | jq -e '.details.verification.missing == 0 and .details.assets.missing == []' >/dev/null 2>&1; then
-        pass "release verify --fix uploads with the selected token and github.com host"
-    else
-        fail "release repair must use the same GitHub identity as release discovery"
-        printf 'exit status: %s\n' "$(exec_status)"
-        exec_stderr | tail -10
-    fi
+test_verify_fix_rejects_release_retag_after_upload() {
+    _verify_ordinary_repair_case tag_after_upload 1 \
+        "ordinary repair refuses success after its release is retagged"
+}
 
-    remove_release_verify_mock_gh
-    harness_teardown
+test_verify_fix_stops_before_upload_after_release_retag() {
+    _verify_ordinary_repair_case tag_before_upload 1 \
+        "ordinary repair performs no upload after fresh metadata shows a different tag"
+}
+
+test_verify_fix_final_observation_rejects_asset_flip() {
+    _verify_ordinary_repair_case postcheck_flip 1 \
+        "ordinary repair rejects asset drift first observed in its final release GET"
+}
+
+test_verify_fix_verifies_complete_inventory_without_uploads() {
+    _verify_ordinary_repair_case already_present 0 \
+        "ordinary repair verifies an already complete inventory without uploading"
+}
+
+test_verify_fix_rejects_complete_inventory_with_wrong_bytes() {
+    _verify_ordinary_repair_case already_present_wrong_bytes 1 \
+        "ordinary repair never trusts complete names without matching remote bytes"
+}
+
+test_verify_fix_accepts_repository_case_variation() {
+    _verify_ordinary_repair_case mixed_repo_case 0 \
+        "ordinary repair accepts configured repository case without changing GitHub authority"
+}
+
+test_verify_fix_rejects_foreign_upload_repository() {
+    _verify_ordinary_repair_case foreign_upload_repo 1 \
+        "ordinary repair refuses a different upload repository before any POST"
+}
+
+test_verify_fix_rejects_empty_manifest() {
+    _verify_ordinary_repair_case empty_manifest 1 \
+        "ordinary repair refuses an empty manifest even when discovery finds no missing names"
+}
+
+test_verify_fix_reads_paginated_inventory() {
+    _verify_ordinary_repair_case paginated 0 \
+        "ordinary repair finds the required uploaded asset beyond a full first inventory page"
+}
+
+test_verify_fix_reports_latest_inventory_coherently() {
+    _verify_ordinary_repair_case inventory_coherence 0 \
+        "ordinary repair reports presence from the latest complete inventory without mixing snapshots"
 }
 
 test_verify_fix_dry_run_uploads_nothing() {
@@ -2959,6 +3266,19 @@ test_strict_fix_final_get_rejects_postcheck_asset_flip
 test_strict_fix_dry_run_leaves_draft_and_sidecars_untouched
 test_verify_fix_attempts_upload
 test_verify_fix_uses_selected_github_identity
+test_verify_fix_requires_remote_asset_after_upload
+test_verify_fix_rejects_changed_remote_bytes
+test_verify_fix_rejects_replaced_asset_id
+test_verify_fix_rejects_release_retag_after_upload
+test_verify_fix_stops_before_upload_after_release_retag
+test_verify_fix_final_observation_rejects_asset_flip
+test_verify_fix_verifies_complete_inventory_without_uploads
+test_verify_fix_rejects_complete_inventory_with_wrong_bytes
+test_verify_fix_accepts_repository_case_variation
+test_verify_fix_rejects_foreign_upload_repository
+test_verify_fix_rejects_empty_manifest
+test_verify_fix_reads_paginated_inventory
+test_verify_fix_reports_latest_inventory_coherently
 test_verify_fix_dry_run_uploads_nothing
 test_verify_fix_reports_not_found_locally
 

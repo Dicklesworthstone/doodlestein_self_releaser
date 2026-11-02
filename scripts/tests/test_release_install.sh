@@ -165,6 +165,14 @@ check("no credential file is installed", {p.name for p in first_dir.iterdir()} =
 original = state()
 same = run()
 check("identical retry changes no generation or pointer inode", not same["activated"] and state() == original)
+empty_files = copy.deepcopy(base)
+empty_files["files"] = []
+save(recipe, empty_files)
+same = run()
+check("empty data selection preserves the original executable-only generation and namespace",
+      same["generation"] == first_id and not same["activated"] and state() == original and
+      "files" not in same and "share_dir" not in same and not (first_dir / "share").exists())
+save(recipe, base)
 reordered = copy.deepcopy(base)
 reordered["executables"].reverse()
 save(recipe, reordered)

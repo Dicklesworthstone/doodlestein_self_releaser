@@ -81,7 +81,8 @@ export -f log_info log_warn log_error log_debug
 
 # Source the modules
 source "$PROJECT_ROOT/src/config.sh"
-source "$PROJECT_ROOT/src/host_health.sh"
+# shellcheck source=src/host_health.sh
+source "${DSR_TEST_HOST_HEALTH:-$PROJECT_ROOT/src/host_health.sh}"
 
 # ============================================================================
 # Cache Tests
@@ -91,11 +92,17 @@ _test_health_result_json() {
     local hostname="$1"
     local status="$2"
     local healthy="$3"
+    local usage=50 available_kb=2147483648 disk
+    if [[ "$status" == warning ]]; then usage=96; available_kb=187695104;
+    elif [[ "$status" == error ]]; then usage=100; available_kb=0; fi
+    disk=$(_test_writable_inventory "$usage" "$available_kb" "$usage" "$available_kb" |
+        _hh_writable_storage_verdict null '[]' 2) || return 1
 
     jq -nc \
         --arg hostname "$hostname" \
         --arg status "$status" \
         --argjson healthy "$healthy" \
+        --argjson disk "$disk" \
         '{
             hostname: $hostname,
             platform: "linux/amd64",
@@ -104,10 +111,10 @@ _test_health_result_json() {
             status: $status,
             healthy: $healthy,
             errors: (if $healthy then 0 else 1 end),
-            warnings: 0,
+            warnings: (if $status == "warning" then 1 else 0 end),
             checks: {
                 connectivity: {reachable: $healthy},
-                disk_space: {status: $status, usage_percent: null},
+                disk_space: $disk,
                 toolchains: {},
                 docker: {},
                 clock_drift: {}
@@ -199,6 +206,213 @@ test_cache_rejects_invalid_json() {
     else
         fail "Fresh cache should reject one-byte invalid JSON"
     fi
+}
+
+_test_cached_disk_receipt() {
+    local label="$1" receipt="$2" expected="$3" contract="${4:-}" actual=refused
+    ((TESTS_RUN+=1))
+    _hh_init_cache || { fail "$label: cannot initialize cache"; return; }
+    _hh_cache_write cacheprobe "$receipt" || { fail "$label: cannot write fixture"; return; }
+    if [[ -n "$contract" ]]; then
+        # Only the configured Windows contract is supplied at this boundary;
+        # the cache reader and complete capacity validators are production code.
+        if (config_windows_storage_json() { printf '%s\n' "$contract"; }
+            _hh_cache_get cacheprobe >/dev/null 2>&1); then actual=accepted; fi
+    elif _hh_cache_get cacheprobe >/dev/null 2>&1; then actual=accepted; fi
+    if [[ "$actual" == "$expected" ]]; then pass "$label: $actual";
+    else fail "$label: $actual, expected $expected"; fi
+}
+
+test_cache_requires_disk_evidence() {
+    local receipt warning expression
+    receipt=$(_test_health_result_json cacheprobe ok true) || return 1
+    warning=$(_test_health_result_json cacheprobe warning true) || return 1
+    _test_cached_disk_receipt 'Complete multi-filesystem cache remains reusable' "$receipt" accepted
+    _test_cached_disk_receipt '179 GiB at 96% remains an admissible cached warning' "$warning" accepted
+    while IFS= read -r expression; do
+        _test_cached_disk_receipt "Incomplete or contradictory healthy cache ($expression)" \
+            "$(jq "$expression" <<< "$receipt")" refused
+    done <<'CASES'
+del(.checks.disk_space)
+.checks.disk_space=null
+.checks.disk_space=[]
+.checks.disk_space={}
+.checks.disk_space={status:"ok"}
+.checks.disk_space={status:"error",error:"capacity unavailable"}
+.checks.disk_space.error="capacity unavailable"
+del(.checks.disk_space.concurrent_builds)
+del(.checks.disk_space.min_free_bytes)
+.checks.disk_space.min_free_bytes=1
+.checks.disk_space.roles=[]
+del(.checks.disk_space.roles[0].available_bytes)
+.checks.disk_space.roles[0].available_bytes=0
+.checks.disk_space.roles[0].status="error"
+del(.checks.disk_space.capacity_groups)
+.checks.disk_space.capacity_groups[0].available_bytes=1
+.checks.connectivity.reachable=false
+.errors=1
+.errors=-1
+.warnings=0.5
+CASES
+    _test_cached_disk_receipt 'Disk warning cannot hide behind outer ok' \
+        "$(jq '.status="ok" | .warnings=0' <<< "$warning")" refused
+    _test_cached_disk_receipt 'Cached probe failure remains a readable refusal' \
+        "$(_test_health_result_json cacheprobe error false | jq \
+            '.checks.disk_space={status:"error",error:"required filesystem unavailable"}')" accepted
+}
+
+test_cache_apfs_and_split_evidence() {
+    local inventory disk receipt expression split
+    inventory=$(_test_writable_inventory 96 187695104 96 187695104 | jq '
+        .roles |= map(. + {filesystem_available_bytes:.available_bytes,
+            filesystem_total_bytes:.total_bytes,
+            capacity_group:"apfs:12345678-1234-1234-1234-123456789abc",
+            apfs:{container_id:"disk3",container_uuid:"12345678-1234-1234-1234-123456789abc",
+                  volume_id:(if .role == "build_root" then "disk3s5" else "disk3s1" end),
+                  available_bytes:.available_bytes,total_bytes:.total_bytes,
+                  used_bytes:0,quota_bytes:0,reserve_bytes:0}})') || return 1
+    disk=$(_hh_writable_storage_verdict null '[]' 2 <<< "$inventory") || return 1
+    receipt=$(_test_health_result_json cacheprobe warning true | jq --argjson disk "$disk" \
+        '.platform="darwin/arm64" | .checks.disk_space=$disk') || return 1
+    _test_cached_disk_receipt 'Shared APFS-container warning remains reusable' "$receipt" accepted
+    for expression in \
+        'del(.checks.disk_space.roles[0].apfs.total_bytes)' \
+        '.checks.disk_space.roles[0].apfs.quota_bytes=1073741824' \
+        '.checks.disk_space.roles[0].apfs.available_bytes=0'; do
+        _test_cached_disk_receipt "APFS cached capacity contradiction ($expression)" \
+            "$(jq "$expression" <<< "$receipt")" refused
+    done
+
+    split='{"build_root":"/external","root_min_free_bytes":1073741824}'
+    disk=$(
+        _hh_exec_on_host() {
+            if [[ "$4" == *DSR_UNIX_WRITABLE_PY* ]]; then
+                _test_writable_inventory 99 8388608 50 2147483648 /external
+            else
+                printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\nfixture 4294967296 2147483648 2147483648 50%% /external\n'
+            fi
+        }
+        _hh_unix_split_storage_admission cacheprobe local '' "$split" 99 8388608 error '[]' 2
+    ) || return 1
+    receipt=$(_test_health_result_json cacheprobe warning true | jq --argjson disk "$disk" \
+        '.checks.disk_space=$disk') || return 1
+    _test_cached_disk_receipt 'Explicit split-root allowance remains reusable' "$receipt" accepted
+    for expression in \
+        'del(.checks.disk_space.root)' \
+        '.checks.disk_space.root.available_bytes=0' \
+        '.checks.disk_space.build_root.available_bytes=0' \
+        '.checks.disk_space.build_root.status="error"'; do
+        _test_cached_disk_receipt "Initial split observation remains required ($expression)" \
+            "$(jq "$expression" <<< "$receipt")" refused
+    done
+
+    ((TESTS_RUN+=1))
+    if (
+        local host_config='{"platform":"linux/amd64","connection":"local","concurrency":2,"build_root":"/external"}'
+        local fingerprint
+        fingerprint=$(_hh_admission_fingerprint "$host_config") || exit 1
+        receipt=$(jq --arg fingerprint "$fingerprint" '.admission_fingerprint=$fingerprint' <<< "$receipt") || exit 1
+        _hh_cache_write cacheprobe "$receipt" || exit 1
+        # The current configured reserve is stronger than this historical
+        # receipt, even though its outer fingerprint claims current policy.
+        config_unix_storage_json() { printf '%s\n' '{"build_root":"/external","root_min_free_bytes":17179869184}'; }
+        ! _hh_cache_get cacheprobe "$fingerprint" "$host_config" >/dev/null 2>&1
+    ); then pass 'Cached split allowance is bound to the current configured reserve';
+    else fail 'Cached split allowance relaxed the current configured reserve'; fi
+}
+
+test_cache_windows_disk_evidence() {
+    local disk receipt contract expression
+    disk=$(
+        _hh_exec_on_host() { printf '96\r\n187695104\r\n'; }
+        _hh_check_disk_space fixture local '' windows/amd64 '{"concurrency":2}'
+    ) || return 1
+    receipt=$(_test_health_result_json cacheprobe warning true | jq --argjson disk "$disk" \
+        '.platform="windows/amd64" | .checks.disk_space=$disk') || return 1
+    _test_cached_disk_receipt 'Windows scalar warning remains reusable' "$receipt" accepted
+    for expression in \
+        'del(.checks.disk_space.available_bytes)' \
+        '.checks.disk_space.available_bytes=42949671936' \
+        '.checks.disk_space.available_bytes+=1' \
+        '.checks.disk_space.min_free_bytes=1'; do
+        _test_cached_disk_receipt "Windows cached capacity refusal ($expression)" \
+            "$(jq "$expression" <<< "$receipt")" refused
+    done
+
+    contract=$(_test_windows_capacity_contract) || return 1
+    disk=$(
+        config_windows_storage_json() { printf '%s\n' "$contract"; }
+        _hh_exec_on_host() {
+            jq -nc --argjson contract "$contract" '
+                {path:"C:",usage_percent:88,available_gb:12,status:"warning",
+                 admission:"split-storage-role-budgets-v1",
+                 source:{path:"C:",free_bytes:12884901888,size_bytes:107374182400},
+                 target:{path:"R:",provider:("\\\\"+$contract.server+($contract.export|gsub("/";"\\"))),
+                         free_bytes:192199786496,size_bytes:4398046511104},
+                 lock_probe:"independent-process-exclusion-and-reacquisition",lock_range:"cargo-win32-whole-u64-v1"}'
+        }
+        _hh_check_disk_space cacheprobe local '' windows/amd64 '{"concurrency":2}'
+    ) || return 1
+    receipt=$(_test_health_result_json cacheprobe warning true | jq --argjson disk "$disk" \
+        '.platform="windows/amd64" | .checks.disk_space=$disk') || return 1
+    _test_cached_disk_receipt 'Windows split source reserve and target warning remain reusable' "$receipt" accepted "$contract"
+    for expression in \
+        'del(.checks.disk_space.source)' \
+        '.checks.disk_space.source.free_bytes=0' \
+        '.checks.disk_space.target.free_bytes=42949672959' \
+        '.checks.disk_space.target.min_free_bytes=1' \
+        '.checks.disk_space.target.provider="wrong"' \
+        '.checks.disk_space.lock_probe=null'; do
+        _test_cached_disk_receipt "Windows split cached evidence refusal ($expression)" \
+            "$(jq "$expression" <<< "$receipt")" refused "$contract"
+    done
+}
+
+test_cached_disk_public_readiness() {
+    local mode
+    for mode in missing concurrency build_root requested_paths; do
+        ((TESTS_RUN+=1))
+        if (
+            local host_config fingerprint receipt disk result status=0
+            local DSR_HOSTS_FILE="$TEMP_DIR/cache-public-$mode.yaml"
+            printf 'hosts:\n  cacheprobe:\n    platform: linux/amd64\n    connection: local\n    concurrency: 2\n' > "$DSR_HOSTS_FILE"
+            host_config=$(_hh_get_host_config cacheprobe) || exit 1
+            fingerprint=$(_hh_admission_fingerprint "$host_config") || exit 1
+            receipt=$(_test_health_result_json cacheprobe warning true | jq --arg fingerprint "$fingerprint" \
+                '.admission_fingerprint=$fingerprint | .historical_cache_fixture=true') || exit 1
+            if [[ "$mode" == missing ]]; then
+                receipt=$(jq '.checks.disk_space={}' <<< "$receipt") || exit 1
+            elif [[ "$mode" == concurrency ]]; then
+                disk=$(_test_writable_inventory 96 187695104 96 187695104 |
+                    _hh_writable_storage_verdict null '[]' 1) || exit 1
+                receipt=$(jq --argjson disk "$disk" '.checks.disk_space=$disk' <<< "$receipt") || exit 1
+            elif [[ "$mode" == build_root ]]; then
+                disk=$(_test_writable_inventory 96 187695104 96 187695104 /unrelated |
+                    _hh_writable_storage_verdict null '[]' 2) || exit 1
+                receipt=$(jq --argjson disk "$disk" '.checks.disk_space=$disk' <<< "$receipt") || exit 1
+            else
+                disk=$(_test_writable_inventory 96 187695104 96 187695104 | jq '
+                    .requested_paths=[{role:"temp",path:"/different/recipe"}] |
+                    .roles += [(.roles[0] + {requested:true,role:"temp",path:"/different/recipe",probe_path:"/different"})]' |
+                    _hh_writable_storage_verdict null '[{"role":"temp","path":"/different/recipe"}]' 2) || exit 1
+                receipt=$(jq --argjson disk "$disk" '.checks.disk_space=$disk' <<< "$receipt") || exit 1
+            fi
+            _hh_cache_write cacheprobe "$receipt" || exit 1
+            # Only the remote filesystem observation is controlled. The public
+            # parser, fingerprint, cache reader, verdict and readiness are real.
+            _hh_exec_on_host() {
+                [[ "$4" == *DSR_UNIX_WRITABLE_PY* ]] || return 1
+                printf 'probe\n' >> "$TEMP_DIR/cache-public-$mode.probes"
+                _test_writable_inventory 100 0 100 0
+            }
+            result=$(host_health_check cacheprobe --json 2>/dev/null) || status=$?
+            [[ $status -eq 1 && -s "$TEMP_DIR/cache-public-$mode.probes" ]] || exit 1
+            jq -e '.healthy == false and .checks.disk_space.status == "error" and
+                .historical_cache_fixture == null' <<< "$result" >/dev/null || exit 1
+            ! host_health_is_ready cacheprobe
+        ); then pass "Public readiness reprobes/refuses $mode evidence despite matching fingerprint";
+        else fail "Public readiness accepted $mode evidence with matching fingerprint"; fi
+    done
 }
 
 test_cache_clear() {
@@ -327,6 +541,22 @@ test_remote_health_preserves_caller_stdin() {
     done
 }
 
+# Explicit data at the external writable-probe boundary. Classification and
+# role/contract admission remain the complete production implementation.
+_test_writable_inventory() {
+    local root_usage="$1" root_kb="$2" build_usage="$3" build_kb="$4" build_path="${5:-/var/tmp}"
+    jq -nc --argjson root_usage "$root_usage" --argjson root_kb "$root_kb" \
+        --argjson build_usage "$build_usage" --argjson build_kb "$build_kb" --arg build_path "$build_path" '
+        {requested_paths:[],roles:(["root","home","cargo_home","temp","build_root"] | map(
+            . as $role | ($role == "build_root") as $build |
+            (if $role == "root" then "/" elif $build then $build_path else "/fixture/" + $role end) as $path |
+            {role:$role,path:$path,probe_path:$path,filesystem_id:(if $build then "20" else "10" end),
+             capacity_group:(if $build then "filesystem:20" else "filesystem:10" end),
+             usage_percent:(if $build then $build_usage else $root_usage end),
+             available_bytes:((if $build then $build_kb else $root_kb end)*1024),
+             total_bytes:4398046511104}))}'
+}
+
 test_local_disk_space() {
     ((TESTS_RUN+=1))
 
@@ -359,23 +589,15 @@ test_disk_space_forces_kilobytes_with_512_byte_default() {
     ((TESTS_RUN+=1))
 
     local result
-    result=$(
-        (
-            _hh_exec_on_host() {
-                if [[ "$4" == *"df -Pk /"* ]]; then
-                    printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
-                    printf '/dev/test 8388608 4194304 2097152 50%% /\n'
-                else
-                    printf 'Filesystem 512-blocks Used Available Capacity Mounted on\n'
-                    printf '/dev/test 16777216 8388608 4194304 50%% /\n'
-                fi
-            }
-            _hh_check_disk_space "testlocal" "local" ""
-        )
-    )
+    # Only the explicit split route still uses df. Its fixture rejects commands
+    # without -k, and also supplies the now-required complete writable inventory.
+    result=$(_test_unix_split_disk "50 2097152" "50 67108864")
 
-    if echo "$result" | jq -e '.usage_percent == 50 and .available_gb == 2' &>/dev/null; then
-        pass "Disk space forces 1K blocks under a 512-byte default"
+    if echo "$result" | jq -e '.admission == "unix-split-storage-v2" and
+        .root.usage_percent == 50 and .root.available_gb == 2 and
+        .root.available_bytes == 2147483648 and .root.admitted_as == "error" and
+        .status == "error" and (.roles|length) == 5' &>/dev/null; then
+        pass "Retained df probes force 1K blocks and preserve the absolute capacity refusal"
     else
         fail "Disk space should report 2 GiB from df -Pk output, got: $result"
     fi
@@ -402,12 +624,13 @@ test_windows_disk_probe_survives_bash_default_shell() {
                 # expansion before the PowerShell process receives its argv.
                 bash -uc "$4"
             }
-            _hh_check_disk_space "testwindows" "ssh" "example.invalid" "windows/amd64"
+            _hh_check_disk_space "testwindows" "ssh" "example.invalid" "windows/amd64" '{"concurrency":1}'
         )
     ) || status=$?
 
-    if [[ $status -eq 0 ]] && echo "$result" | jq -e '.usage_percent == 50 and .available_gb == 2 and .status == "ok"' &>/dev/null; then
-        pass "Windows disk probe preserves PowerShell variables through Bash"
+    if [[ $status -eq 0 ]] && echo "$result" | jq -e '.usage_percent == 50 and .available_gb == 2 and
+        .available_bytes == 2147483648 and .min_free_bytes == 21474836480 and .status == "error"' &>/dev/null; then
+        pass "Windows disk probe preserves PowerShell variables and refuses capacity below its floor"
     else
         fail "Windows disk probe failed through Bash: status=$status result=$result"
     fi
@@ -420,18 +643,305 @@ test_disk_space_rejects_non_numeric_fields() {
     result=$(
         (
             _hh_exec_on_host() {
-                printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
-                printf '/dev/test 8388608 4194304 invalid 50%% /\n'
+                [[ "$4" == *DSR_UNIX_WRITABLE_PY* ]] || return 91
+                _test_writable_inventory 50 67108864 50 67108864 |
+                    jq '.roles[0].available_bytes="invalid"'
             }
             _hh_check_disk_space "testlocal" "local" ""
         )
     ) || status=$?
 
-    if [[ $status -ne 0 ]] && echo "$result" | jq -e '.status == "error" and .available_gb == null' &>/dev/null; then
+    if [[ $status -ne 0 ]] && echo "$result" | jq -e '.status == "error" and .available_gb == null and
+        .error == "Invalid writable storage inventory or free-space policy"' &>/dev/null; then
         pass "Disk space rejects non-numeric fields"
     else
         fail "Disk space should reject non-numeric fields, got status=$status result=$result"
     fi
+}
+
+test_windows_disk_capacity_boundaries() {
+    # Controlled transport output exercises the real scalar admission path;
+    # this is not native PowerShell or Windows filesystem qualification.
+    local usage available expected result status
+    while read -r usage available expected; do
+        ((TESTS_RUN+=1))
+        status=0
+        result=$(
+            (
+                _hh_exec_on_host() {
+                    [[ "$4" == 'powershell -NoProfile -NonInteractive -EncodedCommand '* ]] || return 91
+                    printf '%s\r\n%s\r\n' "$usage" "$available"
+                }
+                _hh_check_disk_space "testwindows" "ssh" "example.invalid" "windows/amd64" '{"concurrency":1}'
+            )
+        ) || status=$?
+        if [[ $status -eq 0 ]] && jq -e --arg expected "$expected" --argjson usage "$usage" --argjson kb "$available" '
+            .status == $expected and .usage_percent == $usage and
+            .available_bytes == ($kb*1024) and .min_free_bytes == 21474836480 and
+            (if $expected == "error" then .available_gb == 20 and
+                (.error|contains("20 GiB floor")) else .error == null end)
+        ' <<< "$result" >/dev/null; then
+            pass "Windows scalar capacity: $usage percent and $available KiB produces $expected"
+        else
+            fail "Windows scalar capacity: $usage percent and $available KiB: $result"
+        fi
+    done <<'CASES'
+96 187695104 warning
+100 20971520 warning
+90 20971520 ok
+96 20971519 error
+CASES
+}
+
+test_concurrent_disk_capacity() {
+    # Exercise all three decisions with the same external observations. The
+    # 179 GiB/96% case must pass for eight 20 GiB slots but refuse nine, and
+    # five writable role aliases must not turn two slots into ten budgets.
+    local usage available slots minimum expected platform result status scalar
+    while read -r usage available slots minimum expected; do
+        ((TESTS_RUN+=1))
+        scalar=$(_hh_disk_status "$usage" "$available" 21474836480 "$slots")
+        if [[ "$scalar" == "$expected" ]]; then
+            pass "Raw disk status admits $slots slots at $available KiB as $expected"
+        else
+            fail "Raw disk status for $slots slots: $scalar, expected $expected"
+        fi
+        for platform in linux/amd64 windows/amd64; do
+            ((TESTS_RUN+=1))
+            status=0
+            result=$(
+                config_unix_storage_json() { return 1; }
+                config_windows_storage_json() { return 1; }
+                _hh_exec_on_host() {
+                    if [[ "$4" == *DSR_UNIX_WRITABLE_PY* ]]; then
+                        _test_writable_inventory "$usage" "$available" "$usage" "$available"
+                    elif [[ "$4" == 'powershell -NoProfile -NonInteractive -EncodedCommand '* ]]; then
+                        printf '%s\r\n%s\r\n' "$usage" "$available"
+                    else
+                        return 91
+                    fi
+                }
+                _hh_check_disk_space concurrent local '' "$platform" "{\"concurrency\":$slots}"
+            ) || status=$?
+            if [[ $status -eq 0 ]] && jq -e --arg expected "$expected" --argjson minimum "$minimum" \
+                --argjson slots "$slots" --argjson usage "$usage" '
+                .status == $expected and .min_free_bytes == $minimum and .concurrent_builds == $slots and
+                .usage_percent == $usage and
+                (if .roles != null then all(.roles[]; .status == $expected and .min_free_bytes == $minimum)
+                 else true end)
+            ' <<< "$result" >/dev/null; then
+                pass "$platform admits $slots concurrent builds at $available KiB as $expected"
+            else
+                fail "$platform concurrent disk admission: status=$status result=$result"
+            fi
+        done
+    done <<'CASES'
+96 187695104 2 42949672960 warning
+96 187695104 8 171798691840 warning
+96 187695104 9 193273528320 error
+50 41943039 2 42949672960 error
+50 41943040 2 42949672960 ok
+100 41943040 2 42949672960 warning
+90 20971520 1 21474836480 ok
+91 20971520 1 21474836480 warning
+CASES
+}
+
+test_default_disk_concurrency_matches_scheduler() {
+    local fixture="$TEMP_DIR/default-disk-concurrency.yaml" result platform available expected status=0
+    printf 'hosts:\n  defaultlimit:\n    platform: linux/amd64\n    connection: local\n' > "$fixture"
+    ((TESTS_RUN+=1))
+    result=$(
+        source "$PROJECT_ROOT/src/host_selector.sh"
+        selector=$(_sel_limit_from_config defaultlimit '{"hosts":{"defaultlimit":{"platform":"linux/amd64","connection":"local"}}}') || exit 1
+        normalized=$(_hh_normalize_host_config defaultlimit '{"platform":"linux/amd64","connection":"local"}') || exit 1
+        fallback=$(DSR_HOSTS_FILE="$fixture" _hh_parse_host_fallback defaultlimit) || exit 1
+        [[ "$selector" == 2 && "$(_hh_disk_concurrency '{}')" == "$selector" ]] || exit 1
+        jq -e --argjson selected "$selector" '.concurrency == $selected' <<< "$normalized" >/dev/null &&
+            jq -e --argjson selected "$selector" '.concurrency == $selected' <<< "$fallback" >/dev/null
+    ) || status=$?
+    if [[ $status -eq 0 ]]; then
+        pass "Host normalization, fallback parsing and disk admission share the scheduler default of two builds"
+    else
+        fail "Disk concurrency defaults diverged from the production scheduler: $result"
+    fi
+
+    for platform in linux/amd64 windows/amd64; do
+        while read -r available expected; do
+            ((TESTS_RUN+=1))
+            result=$(
+                config_unix_storage_json() { return 1; }
+                config_windows_storage_json() { return 1; }
+                _hh_exec_on_host() {
+                    if [[ "$4" == *DSR_UNIX_WRITABLE_PY* ]]; then
+                        _test_writable_inventory 50 "$available" 50 "$available"
+                    else
+                        printf '50\r\n%s\r\n' "$available"
+                    fi
+                }
+                _hh_check_disk_space defaultlimit local '' "$platform" '{}'
+            )
+            if jq -e --arg expected "$expected" '.status == $expected and
+                .concurrent_builds == 2 and .min_free_bytes == 42949672960' <<< "$result" >/dev/null; then
+                pass "$platform without an explicit slot limit requires 40 GiB: $available KiB is $expected"
+            else
+                fail "$platform default disk requirement: $result"
+            fi
+        done <<'CASES'
+20971520 error
+41943040 ok
+CASES
+    done
+}
+
+test_shared_apfs_concurrent_capacity() {
+    local inventory result mode slots expected available quota
+    # The two APFS volumes share one pool. Capacity cannot be summed across
+    # their filesystem IDs, and a volume quota remains an independent limit.
+    while read -r mode available slots expected quota; do
+        ((TESTS_RUN+=1))
+        inventory=$(_test_writable_inventory 96 "$available" 96 "$available" | jq \
+            --argjson quota "$quota" '
+            .roles |= map(.usage_percent=(((.total_bytes-.available_bytes)*100/.total_bytes)|ceil) | . + {
+                filesystem_available_bytes:.available_bytes,
+                filesystem_total_bytes:.total_bytes,
+                capacity_group:"apfs:12345678-1234-1234-1234-123456789abc",
+                apfs:{container_id:"disk3",container_uuid:"12345678-1234-1234-1234-123456789abc",
+                      volume_id:(if .role == "build_root" then "disk3s5" else "disk3s1" end),
+                      available_bytes:.available_bytes,total_bytes:.total_bytes,
+                      used_bytes:0,quota_bytes:0,reserve_bytes:0}}
+                | if .role == "cargo_home" and $quota > 0 then
+                    .filesystem_id="30" | .apfs.volume_id="disk3s7" |
+                    .apfs.quota_bytes=$quota | .available_bytes=([.available_bytes,$quota]|min) |
+                    .total_bytes=$quota
+                  else . end)')
+        result=$(_hh_writable_storage_verdict null '[]' "$slots" <<< "$inventory")
+        if jq -e --arg expected "$expected" --argjson slots "$slots" --argjson kb "$available" \
+            --argjson quota "$quota" '
+            .status == $expected and .concurrent_builds == $slots and
+            (.roles|length) == 5 and (.capacity_groups|length) == 1 and
+            .capacity_groups[0].apfs_container.available_bytes == ($kb*1024) and
+            (if $quota > 0 then
+                [.roles[]|select(.role == "cargo_home")][0].available_bytes == $quota
+             else .capacity_groups[0].available_bytes == ($kb*1024) end)
+        ' <<< "$result" >/dev/null; then
+            pass "Shared APFS $mode: $slots builds receive one pool and retain volume quota limits"
+        else
+            fail "Shared APFS $mode admission: $result"
+        fi
+    done <<'CASES'
+large-warning 187695104 8 warning 0
+insufficient-for-nine 187695104 9 error 0
+shared-space-not-summed 52428800 3 error 0
+role-aliases-not-multiplied 52428800 2 warning 0
+separate-volume-quota 187695104 2 error 32212254720
+exact-quota-boundary 187695104 2 warning 42949672960
+CASES
+
+    ((TESTS_RUN+=1))
+    inventory=$(jq '.roles[0].apfs.available_bytes += 1024' <<< "$inventory")
+    if _hh_writable_storage_verdict null '[]' 2 <<< "$inventory" >/dev/null 2>&1; then
+        fail "Conflicting observations of shared APFS capacity were admitted"
+    else
+        pass "Concurrent admission refuses conflicting observations of one APFS container"
+    fi
+}
+
+_test_windows_capacity_contract() {
+    jq -nc --argjson target_minimum "${1:-21474836480}" '
+        {drive:"R",source_drive:"C",server:"192.0.2.1",export:"/owned/builds",
+         source_budget_bytes:2147483648,source_reserve_bytes:8589934592,
+         target_min_free_bytes:$target_minimum}'
+}
+
+test_windows_split_concurrent_capacity() {
+    # Real production script generation and controller validation, with
+    # controlled transport observations. Native Win32/PowerShell execution is
+    # covered separately; no native-runtime qualification is claimed here.
+    local slots contract_minimum available required expected result status script counter=0
+    while read -r slots contract_minimum available required expected; do
+        ((TESTS_RUN+=1))
+        counter=$((counter+1))
+        script="$TEMP_DIR/windows-concurrent-storage-$counter.ps1"
+        status=0
+        result=$(
+            config_windows_storage_json() { _test_windows_capacity_contract "$contract_minimum"; }
+            _hh_exec_on_host() {
+                local payload
+                payload="${4#*FromBase64String(\'}"
+                payload="${payload%%\'*}"
+                printf '%s' "$payload" | base64 -d | gzip -d > "$script" || return 91
+                jq -nc --argjson available "$available" '
+                    {admission:"split-storage-role-budgets-v1",status:"warning",
+                     lock_range:"cargo-win32-whole-u64-v1",target:{free_bytes:$available}}'
+            }
+            _hh_check_disk_space concurrent ssh fixture windows/amd64 "{\"concurrency\":$slots}"
+        ) || status=$?
+        if [[ -f "$script" ]] &&
+           grep -Fq "FreeSpace -lt [long]$required) { throw 'DSR concurrent target capacity admission failed'" "$script" &&
+           grep -Fq 'DSR NFS mapping identity mismatch' "$script" &&
+           grep -Fq 'DSR Cargo whole-u64 lock exclusion failed' "$script" &&
+           jq -e --arg expected "$expected" --argjson minimum "$required" --argjson slots "$slots" '
+               .status == $expected and
+               (if $expected == "error" then .error != null
+                else .concurrent_builds == $slots and .target.min_free_bytes == $minimum and
+                     .storage_contract.source_budget_bytes == 2147483648 and
+                     .storage_contract.source_reserve_bytes == 8589934592 end)
+           ' <<< "$result" >/dev/null &&
+           { [[ "$expected" == error && $status -ne 0 ]] || [[ "$expected" == warning && $status -eq 0 ]]; }; then
+            pass "Windows split target for $slots builds enforces max(contract, concurrent floor)=$required"
+        else
+            fail "Windows split concurrent capacity: status=$status result=$result"
+        fi
+    done <<'CASES'
+2 21474836480 42949672960 42949672960 warning
+2 21474836480 42949672959 42949672960 error
+2 64424509440 64424509440 64424509440 warning
+2 64424509440 64424509439 64424509440 error
+8 21474836480 192199786496 171798691840 warning
+9 21474836480 192199786496 193273528320 error
+2 21474836480 null 42949672960 error
+2 21474836480 "42949672960" 42949672960 error
+CASES
+}
+
+test_invalid_disk_concurrency() {
+    local slots platform result status marker counter=0
+    for slots in 0 -1 1.5 false '"2"' '[]' '{}' 419431 9007199254740991; do
+        for platform in linux/amd64 windows/amd64 windows/split; do
+            ((TESTS_RUN+=1))
+            counter=$((counter+1))
+            marker="$TEMP_DIR/invalid-concurrency-transport-$counter"
+            status=0
+            result=$(
+                config_unix_storage_json() { return 1; }
+                config_windows_storage_json() {
+                    [[ "$platform" == windows/split ]] || return 1
+                    _test_windows_capacity_contract
+                }
+                _hh_exec_on_host() { printf 'transport was invoked\n' >> "$marker"; return 91; }
+                _hh_check_disk_space concurrent local '' "$platform" "{\"concurrency\":$slots}"
+            ) || status=$?
+            if [[ $status -ne 0 && ! -e "$marker" ]] && jq -e '.status == "error" and
+                .error == "Invalid disk concurrency or overflowing free-space requirement"' <<< "$result" >/dev/null; then
+                pass "$platform refuses unsafe concurrency $slots before probing storage"
+            else
+                fail "$platform unsafe concurrency $slots: status=$status result=$result"
+            fi
+        done
+    done
+
+    local fixture="$TEMP_DIR/invalid-fallback-concurrency.yaml"
+    for slots in 0 -1 2suffix 1.5 false; do
+        ((TESTS_RUN+=1))
+        printf 'hosts:\n  concurrent:\n    platform: linux/amd64\n    connection: local\n    concurrency: %s\n' "$slots" > "$fixture"
+        if (export DSR_HOSTS_FILE="$fixture"; raw=$(_hh_parse_host_fallback concurrent) &&
+            _hh_normalize_host_config concurrent "$raw") >/dev/null 2>&1; then
+            fail "Fallback parser admitted unsafe concurrency $slots"
+        else
+            pass "Fallback parser refuses unsafe concurrency $slots"
+        fi
+    done
 }
 
 test_disk_space_rejects_numeric_output_from_failed_command() {
@@ -441,15 +951,16 @@ test_disk_space_rejects_numeric_output_from_failed_command() {
     result=$(
         (
             _hh_exec_on_host() {
-                printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
-                printf '/dev/test 4194304 2097152 1048576 50%% /\n'
+                [[ "$4" == *DSR_UNIX_WRITABLE_PY* ]] || return 91
+                _test_writable_inventory 50 67108864 50 67108864
                 return 23
             }
             _hh_check_disk_space "testlocal" "local" ""
         )
     ) || status=$?
 
-    if [[ $status -ne 0 ]] && echo "$result" | jq -e '.status == "error" and .error == "Failed to get disk info"' &>/dev/null; then
+    if [[ $status -ne 0 ]] && echo "$result" | jq -e '.status == "error" and
+        (.error|startswith("Required writable storage probe failed"))' &>/dev/null; then
         pass "Disk space preserves command failure despite numeric stdout"
     else
         fail "Disk space should fail when command returns nonzero, got status=$status result=$result"
@@ -760,10 +1271,10 @@ test_disk_threshold_values() {
     ((TESTS_RUN+=1))
 
     # Verify thresholds are set
-    if [[ $_HH_DISK_WARN_THRESHOLD -eq 90 ]] && [[ $_HH_DISK_ERROR_THRESHOLD -eq 95 ]]; then
+    if [[ $_HH_DISK_WARN_THRESHOLD -eq 90 ]] && [[ $_HH_DISK_MIN_FREE_BYTES -eq 21474836480 ]]; then
         pass "Disk thresholds have expected defaults"
     else
-        fail "Disk thresholds: warn=$_HH_DISK_WARN_THRESHOLD error=$_HH_DISK_ERROR_THRESHOLD"
+        fail "Disk thresholds: warn=$_HH_DISK_WARN_THRESHOLD min_free_bytes=$_HH_DISK_MIN_FREE_BYTES"
     fi
 }
 
@@ -1083,9 +1594,9 @@ POWERSHELL
             [[ ${#4} -lt 7000 && "$4" == 'powershell -NoProfile -NonInteractive -Command "& '* ]] || return 91
             # Transport-size control only; native admission is exercised by
             # the separate parent/child primitive controls and Windows probe.
-            printf '%s' '{"admission":"split-storage-role-budgets-v1","status":"ok","lock_range":"cargo-win32-whole-u64-v1"}'
+            printf '%s' '{"admission":"split-storage-role-budgets-v1","status":"ok","lock_range":"cargo-win32-whole-u64-v1","target":{"free_bytes":42949672960}}'
         }
-        _hh_check_disk_space fixture ssh example.invalid windows/amd64
+        _hh_check_disk_space fixture ssh example.invalid windows/amd64 '{"concurrency":2}'
     ) || status=$?
     if [[ $status -eq 0 ]] && jq -e '.lock_range=="cargo-win32-whole-u64-v1"' <<< "$result" >/dev/null; then
         pass "Complete Win32 storage probe fits the unchanged transport limit"
@@ -1107,13 +1618,21 @@ hosts:
       source_reserve_bytes: 8589934592
       target_min_free_bytes: 21474836480
 YAML
-    local DSR_HOSTS_FILE="$storage_fixture" contract
+    local DSR_HOSTS_FILE="$storage_fixture" contract ordinary_result
     contract=$(config_windows_storage_json lockcontract)
     _hh_init_cache
-    result=$(_test_health_result_json "lockcontract" "ok" "true" | jq \
-        --argjson contract "$contract" '.platform="windows/amd64" |
-        .checks.disk_space.storage_contract=$contract |
-        .checks.disk_space.admission="split-storage-role-budgets-v1"')
+    ordinary_result=$(_test_health_result_json "lockcontract" "ok" "true" | jq '
+        .platform="windows/amd64" |
+        .checks.disk_space={path:"/",usage_percent:50,available_bytes:214748364800,
+            available_gb:200,min_free_bytes:42949672960,concurrent_builds:2,status:"ok"}')
+    result=$(jq --argjson contract "$contract" '
+        .checks.disk_space={path:"C:",usage_percent:50,available_gb:50,status:"ok",
+            concurrent_builds:2,storage_contract:$contract,admission:"split-storage-role-budgets-v1",
+            lock_probe:"independent-process-exclusion-and-reacquisition",
+            source:{path:"C:",free_bytes:53687091200,size_bytes:107374182400},
+            target:{path:"R:",provider:("\\\\"+$contract.server+($contract.export|gsub("/";"\\"))),
+                free_bytes:214748364800,size_bytes:429496729600,min_free_bytes:42949672960}}
+    ' <<< "$ordinary_result")
     _hh_cache_write lockcontract "$result"
     ((TESTS_RUN+=1))
     if _hh_cache_valid lockcontract; then fail "Legacy one-byte cached admission must be reprobed";
@@ -1122,9 +1641,8 @@ YAML
     ((TESTS_RUN+=1))
     if _hh_cache_valid lockcontract; then pass "Whole-u64 cached admission retains normal TTL";
     else fail "Whole-u64 cached admission unexpectedly refused"; fi
-    local current_result ordinary_result changed_contract
+    local current_result changed_contract
     current_result=$(_hh_cache_read lockcontract)
-    ordinary_result=$(_test_health_result_json "lockcontract" "ok" "true" | jq '.platform="windows/amd64"')
     _hh_cache_write lockcontract "$ordinary_result"
     ((TESTS_RUN+=1))
     if _hh_cache_valid lockcontract; then fail "Local cached health must not admit new split storage";
@@ -1407,18 +1925,34 @@ EOF
     fi
 }
 
-# $1 root df line fields "usage avail_kb", $2 build df "usage avail_kb" or "FAIL"
+# Root/build df observations plus the required v2 complete-role observation.
+# $1 root "usage avail_kb", $2 build "usage avail_kb" or "FAIL", $3 probe mode.
 _test_unix_split_disk() {
-    local root="$1" build="$2" fixture="$TEMP_DIR/unix-storage-admission.yaml"
-    printf 'hosts:\n  splithost:\n    platform: linux/amd64\n    connection: local\n    build_root: /data\n    unix_storage:\n      root_min_free_bytes: 21474836480\n' > "$fixture"
+    local root="$1" build="$2" probe_mode="${3:-valid}" fixture="$TEMP_DIR/unix-storage-admission.yaml"
+    local slots="${4:-1}"
+    printf 'hosts:\n  splithost:\n    platform: linux/amd64\n    connection: local\n    concurrency: %s\n    build_root: /data\n    unix_storage:\n      root_min_free_bytes: 21474836480\n' "$slots" > "$fixture"
     (
         export DSR_HOSTS_FILE="$fixture"
         _hh_exec_on_host() {
             local fields
-            if [[ "$4" == *"df -Pk '/data'"* ]]; then
+            if [[ "$4" == *DSR_UNIX_WRITABLE_PY* ]]; then
+                [[ "$4" == *"python3 -I - '/data'"* ]] || return 91
+                local inventory
+                inventory=$(_test_writable_inventory "${root%% *}" "${root#* }" \
+                    "${build%% *}" "${build#* }" /data) || return 92
+                case "$probe_mode" in
+                    valid) printf '%s\n' "$inventory" ;;
+                    low_temp) jq '.roles |= map(if .role == "temp" then
+                        . + {available_bytes:1073741824,usage_percent:99,
+                             filesystem_id:"30",capacity_group:"filesystem:30"} else . end)' <<< "$inventory" ;;
+                    incomplete) jq '.roles |= map(select(.role != "temp"))' <<< "$inventory" ;;
+                    *) return 93 ;;
+                esac
+                return $?
+            elif [[ "$4" == "LC_ALL=C df -Pk '/data'" ]]; then
                 [[ "$build" == FAIL ]] && return 7
                 fields="$build"
-            elif [[ "$4" == *"df -Pk /"* ]]; then
+            elif [[ "$4" == "LC_ALL=C df -Pk /" ]]; then
                 fields="$root"
             else
                 return 9
@@ -1435,9 +1969,11 @@ test_unix_split_storage_admission() {
     # trj on 2026-10-13: / 97% with ~33 GiB free, /data 69%.
     ((TESTS_RUN+=1))
     result=$(_test_unix_split_disk "97 34664140" "69 1700000000")
-    if jq -e '.status == "warning" and .admission == "unix-split-storage-v1" and
-              .root.status == "error" and .root.admitted_as == "warning" and
-              .build_root.status == "ok" and .build_root.path == "/data" and .usage_percent == 97' <<< "$result" >/dev/null; then
+    if jq -e '.status == "warning" and .admission == "unix-split-storage-v2" and
+              .root.status == "warning" and .root.admitted_as == "warning" and
+              .build_root.status == "ok" and .build_root.path == "/data" and .usage_percent == 97 and
+              (.roles|length) == 5 and (.capacity_groups|length) == 2 and
+              all(.roles[]; if .role == "build_root" then .status == "ok" else .status == "warning" end)' <<< "$result" >/dev/null; then
         pass "Full root above its free floor is admitted as a warning beside a healthy build root"
     else
         fail "Split admission (root over floor) got: $result"
@@ -1468,6 +2004,37 @@ test_unix_split_storage_admission() {
     fi
 
     ((TESTS_RUN+=1))
+    result=$(_test_unix_split_disk "96 187695104" "96 187695104")
+    if jq -e '.status == "warning" and .root.admitted_as == "warning" and
+              .build_root.status == "warning" and (.roles|length) == 5 and
+              all(.roles[]; .status == "warning" and .available_bytes == 192199786496)' <<< "$result" >/dev/null; then
+        pass "Large split volumes at 96 percent preserve all roles and admit their sufficient byte capacity"
+    else
+        fail "Split admission (large spacious volumes) got: $result"
+    fi
+
+    ((TESTS_RUN+=1))
+    result=$(_test_unix_split_disk "96 187695104" "96 187695104" low_temp)
+    if jq -e '.status == "error" and .root.admitted_as == "warning" and
+              .build_root.status == "warning" and
+              [.roles[]|select(.status == "error")|.role] == ["temp"] and
+              (.error|contains("temp /fixture/temp"))' <<< "$result" >/dev/null; then
+        pass "Spacious split root and build storage cannot hide a separate exhausted temp role"
+    else
+        fail "Split admission (independent low temp) got: $result"
+    fi
+
+    ((TESTS_RUN+=1))
+    status=0
+    result=$(_test_unix_split_disk "96 187695104" "96 187695104" incomplete) || status=$?
+    if [[ $status -ne 0 ]] && jq -e '.admission == "unix-split-storage-v2" and .status == "error" and
+              .error == "Required complete writable-storage inspection failed"' <<< "$result" >/dev/null; then
+        pass "Split admission refuses an incomplete role inventory despite two spacious df observations"
+    else
+        fail "Split admission (incomplete roles) status=$status got: $result"
+    fi
+
+    ((TESTS_RUN+=1))
     status=0
     result=$(_test_unix_split_disk "50 400000000" FAIL) || status=$?
     if [[ $status -ne 0 ]] && jq -e '.status == "error" and (.error | test("build root /data"))' <<< "$result" >/dev/null; then
@@ -1494,29 +2061,118 @@ test_unix_split_storage_admission() {
 
 test_unix_split_storage_human_report() {
     local warn_result err_result output
-    warn_result='{"hostname":"trj","platform":"linux/amd64","status":"warning","healthy":true,"checks":{"connectivity":{"reachable":true},"disk_space":{"path":"/","usage_percent":97,"available_gb":33.02,"status":"warning","admission":"unix-split-storage-v1","root":{"path":"/","usage_percent":97,"available_gb":33.02,"status":"error","admitted_as":"warning","min_free_bytes":21474836480},"build_root":{"path":"/data/dsr-build-root","usage_percent":70,"available_gb":1494.49,"status":"ok"}},"toolchains":{},"docker":{},"clock_drift":{}}}'
-    err_result='{"hostname":"trj","platform":"linux/amd64","status":"error","healthy":false,"checks":{"connectivity":{"reachable":true},"disk_space":{"path":"/","usage_percent":50,"available_gb":400,"status":"error","admission":"unix-split-storage-v1","root":{"path":"/","usage_percent":50,"available_gb":400,"status":"ok","admitted_as":"ok","min_free_bytes":21474836480},"build_root":{"path":"/data/dsr-build-root","usage_percent":96,"available_gb":3.1,"status":"error"}},"toolchains":{}}}'
+    warn_result=$(jq -nc --argjson disk "$(_test_unix_split_disk "97 34664140" "69 1700000000")" '
+        {hostname:"trj",platform:"linux/amd64",status:"warning",healthy:true,
+         checks:{connectivity:{reachable:true},disk_space:$disk,toolchains:{},docker:{},clock_drift:{}}}')
+    err_result=$(jq -nc --argjson disk "$(_test_unix_split_disk "50 400000000" "96 1000000")" '
+        {hostname:"trj",platform:"linux/amd64",status:"error",healthy:false,
+         checks:{connectivity:{reachable:true},disk_space:$disk,toolchains:{},docker:{},clock_drift:{}}}')
     ((TESTS_RUN+=1))
     output=$(_hh_print_result "trj" "$warn_result" 2>&1)
-    if [[ "$output" == *"root / 97% used, 33.02 GB free: warning (above its 20 GiB free floor)"* &&
-          "$output" == *"build root /data/dsr-build-root 70% used"*": ok"* && "$output" != *"Disk usage >"* ]]; then
-        pass "Split-storage warning report names each volume and the floor"
+    if [[ "$output" == *"initial root / 97% used,"*"GiB free: warning"* &&
+          "$output" == *"initial build root /data 69% used"*": ok"* &&
+          "$output" == *"cargo_home /fixture/cargo_home 97% used"* &&
+          "$output" == *"temp /fixture/temp 97% used"* && "$output" != *"Disk usage >"* ]]; then
+        pass "Current split-storage warning report names both initial volumes and every writable role"
     else
         fail "Split-storage warning report: $output"
     fi
     ((TESTS_RUN+=1))
     output=$(_hh_print_result "trj" "$err_result" 2>&1)
-    if [[ "$output" == *"build root /data/dsr-build-root 96% used, 3.1 GB free: error"* && "$output" != *"Disk usage >"* ]]; then
+    if [[ "$output" == *"initial build root /data 96% used"*"GiB free: error"* &&
+          "$output" == *"20 GiB required"* && "$output" != *"Disk usage >"* ]]; then
         pass "Split-storage error report names the full build root, not the healthy root"
     else
         fail "Split-storage error report: $output"
     fi
 }
 
+# Only configuration/transport inputs are fixtures here. The scalar df check,
+# split policy, complete writable-role verdict and concurrent budget all run
+# through their production entrypoint without depending on an installed yq.
+_test_unix_concurrent_disk() {
+    local build_kb="$1"
+    (
+        config_unix_storage_json() {
+            printf '%s\n' '{"build_root":"/data","root_min_free_bytes":21474836480}'
+        }
+        _hh_exec_on_host() {
+            case "$4" in
+                *DSR_UNIX_WRITABLE_PY*) _test_writable_inventory 96 20971520 96 "$build_kb" /data ;;
+                'LC_ALL=C df -Pk /') printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/root 524288000 1 20971520 96%% /\n' ;;
+                "LC_ALL=C df -Pk '/data'") printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/build 1048576000 1 %s 96%% /data\n' "$build_kb" ;;
+                *) return 91 ;;
+            esac
+        }
+        _hh_check_disk_space concurrent local '' linux/amd64 '{"build_root":"/data","concurrency":2}'
+    )
+}
+
+test_unix_split_concurrent_capacity() {
+    local result inventory
+    ((TESTS_RUN+=1))
+    result=$(_test_unix_concurrent_disk 41943040)
+    if jq -e '.status == "warning" and .concurrent_builds == 2 and
+        .root.min_free_bytes == 21474836480 and .root.admitted_as == "warning" and
+        .build_root.min_free_bytes == 42949672960 and .build_root.status == "warning" and
+        all(.roles[]; if .role == "build_root" then .min_free_bytes == 42949672960
+            else .min_free_bytes == 21474836480 end)' <<< "$result" >/dev/null; then
+        pass "Concurrent split storage preserves the host root reserve and budgets both build slots"
+    else
+        fail "Concurrent split storage multiplied a reserve or omitted a build budget: $result"
+    fi
+
+    ((TESTS_RUN+=1))
+    result=$(_test_unix_concurrent_disk 41943039)
+    if jq -e '.status == "error" and .root.admitted_as == "warning" and
+        .build_root.min_free_bytes == 42949672960 and .build_root.status == "error" and
+        any(.roles[]; .role == "build_root" and .status == "error")' <<< "$result" >/dev/null; then
+        pass "Split df and writable-role checks both refuse a build volume below its concurrent requirement"
+    else
+        fail "Concurrent split storage admitted insufficient build capacity: $result"
+    fi
+
+    ((TESTS_RUN+=1))
+    inventory=$(_test_writable_inventory 96 20971520 96 20971520 /data |
+        jq '.roles |= map(.filesystem_id="10" | .capacity_group="filesystem:10")')
+    result=$(_hh_writable_storage_verdict '{"build_root":"/data","root_min_free_bytes":21474836480}' '[]' 2 <<< "$inventory")
+    if jq -e '.status == "error" and (.capacity_groups|length) == 1 and
+        [.roles[]|select(.status == "error")|.role] == ["build_root"] and
+        [.roles[]|select(.role == "build_root")][0].min_free_bytes == 42949672960' <<< "$result" >/dev/null; then
+        pass "A shared root/build filesystem cannot borrow the lower root reserve to admit two builds"
+    else
+        fail "Shared split storage bypassed the concurrent build requirement: $result"
+    fi
+}
+
+if [[ "${1:-}" == --disk-cache-only ]]; then
+    test_cache_requires_disk_evidence
+    test_cache_apfs_and_split_evidence
+    test_cache_windows_disk_evidence
+    test_cached_disk_public_readiness
+    echo "Tests run: $TESTS_RUN  Passed: $TESTS_PASSED  Failed: $TESTS_FAILED"
+    [[ $TESTS_FAILED -eq 0 ]]
+    exit $?
+fi
+
+if [[ "${1:-}" == --disk-capacity-only ]]; then
+    test_windows_disk_capacity_boundaries
+    test_concurrent_disk_capacity
+    test_default_disk_concurrency_matches_scheduler
+    test_shared_apfs_concurrent_capacity
+    test_windows_split_concurrent_capacity
+    test_invalid_disk_concurrency
+    test_unix_split_concurrent_capacity
+    echo "Tests run: $TESTS_RUN  Passed: $TESTS_PASSED  Failed: $TESTS_FAILED"
+    [[ $TESTS_FAILED -eq 0 ]]
+    exit $?
+fi
+
 if [[ "${1:-}" == --unix-storage-only ]]; then
     test_unix_storage_config_contract
     test_unix_split_storage_admission
     test_unix_split_storage_human_report
+    test_unix_split_concurrent_capacity
     echo "Tests run: $TESTS_RUN  Passed: $TESTS_PASSED  Failed: $TESTS_FAILED"
     [[ $TESTS_FAILED -eq 0 ]]
     exit $?
@@ -1541,6 +2197,10 @@ test_cache_validity
 test_cache_rejects_invalid_json
 test_cache_rejects_wrong_shape_or_hostname
 test_cached_unhealthy_result_returns_nonzero
+test_cache_requires_disk_evidence
+test_cache_apfs_and_split_evidence
+test_cache_windows_disk_evidence
+test_cached_disk_public_readiness
 test_cache_clear
 test_cache_clear_all
 
@@ -1554,6 +2214,12 @@ test_disk_space_forces_kilobytes_with_512_byte_default
 test_disk_space_rejects_non_numeric_fields
 test_disk_space_rejects_numeric_output_from_failed_command
 test_windows_disk_probe_survives_bash_default_shell
+test_windows_disk_capacity_boundaries
+test_concurrent_disk_capacity
+test_default_disk_concurrency_matches_scheduler
+test_shared_apfs_concurrent_capacity
+test_windows_split_concurrent_capacity
+test_invalid_disk_concurrency
 test_windows_storage_optional_config
 test_powershell_program_failure
 test_windows_split_storage_admission
@@ -1562,6 +2228,7 @@ test_windows_cargo_lock_range
 test_unix_storage_config_contract
 test_unix_split_storage_admission
 test_unix_split_storage_human_report
+test_unix_split_concurrent_capacity
 test_human_disk_error_reports_probe_failure
 test_local_toolchains_check
 test_local_clock_drift

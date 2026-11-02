@@ -58,7 +58,11 @@ setup() {
 
 teardown() {
   if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
-    rm -rf "$TEMP_DIR"
+    if [[ "${DSR_TEST_KEEP_TMP:-0}" == "1" ]]; then
+      echo "Retained test fixture: $TEMP_DIR" >&2
+    else
+      rm -rf "$TEMP_DIR"
+    fi
   fi
 
   # Restore original XDG values
@@ -1548,7 +1552,7 @@ YAML
   ! config_get_additional_artifacts_json contract-tool >/dev/null 2>&1
 }
 
-test_additional_artifact_configuration_requires_native_producer() {
+test_additional_artifact_configuration_accepts_native_and_act_producers() {
   release_contract_test_deps_available || return 0
   config_init >/dev/null
   config_load >/dev/null
@@ -1559,10 +1563,10 @@ act_job_map:
 workspace_additional_artifacts:
   windows/amd64: [{name: setup.msi, format: msi}]
 YAML
-  local status=0
-  config_validate > "$TEMP_DIR/validation.out" 2> "$TEMP_DIR/validation.err" || status=$?
-  [[ "$status" == 4 ]] || return 1
-  grep -q 'windows/amd64.*build-windows.*native producer' "$TEMP_DIR/validation.err" || return 1
+  config_validate > "$TEMP_DIR/validation.out" 2> "$TEMP_DIR/validation.err" || return 1
+  local value jobs
+  value=$(config_get_additional_artifacts_json contract-tool) || return 1
+  jq -e '. == {"windows/amd64":[{name:"setup.msi",format:"msi"}]}' <<< "$value" >/dev/null || return 1
   write_contract_tool_config <<'YAML'
 targets: [linux/amd64, windows/amd64]
 act_job_map:
@@ -1573,11 +1577,16 @@ workspace_additional_artifacts:
   windows/amd64: [{name: setup.msi, format: msi}]
 YAML
   config_validate >/dev/null || return 1
-  # Match the existing native selector's handling of a quoted null value.
-  config_normalize_additional_artifacts_json \
-    '{"windows/amd64":[{"name":"setup.msi","format":"msi"}]}' \
-    fixture '{"windows/amd64":"null"}' >/dev/null || return 1
-  # Registry-only validation must apply the same producer policy.
+  # Explicit native selectors and real workflow job arguments preserve the
+  # same ownership mapping; the producer cannot change the declared format.
+  for jobs in null '{}' '{"windows/amd64":null}' '{"windows/amd64":""}' \
+      '{"windows/amd64":"null"}' '{"windows/amd64":"build-windows"}'; do
+    value=$(config_normalize_additional_artifacts_json \
+      '{"windows/amd64":[{"name":"setup.msi","format":"msi"}]}' \
+      fixture "$jobs") || return 1
+    jq -e '. == {"windows/amd64":[{name:"setup.msi",format:"msi"}]}' <<< "$value" >/dev/null || return 1
+  done
+  # Registry-only validation must admit the same exact typed declaration.
   cat > "$DSR_REPOS_FILE" <<'YAML'
 tools:
   registry-only:
@@ -1586,7 +1595,40 @@ tools:
     workspace_additional_artifacts:
       linux/amd64: [notes.txt]
 YAML
-  ! config_get_additional_artifacts_json registry-only >/dev/null 2>&1
+  value=$(config_get_additional_artifacts_json registry-only) || return 1
+  jq -e '. == {"linux/amd64":[{name:"notes.txt",format:"file"}]}' <<< "$value" >/dev/null
+}
+
+test_additional_artifact_configuration_rejects_malformed_producer() {
+  local jobs status
+  for jobs in false true 0 '[]' '"build-windows"' \
+      '{"windows/amd64":false}' '{"windows/amd64":true}' '{"windows/amd64":0}' \
+      '{"windows/amd64":[]}' '{"windows/amd64":{}}' \
+      '{"windows/amd64":"build\nwindows"}' '{"windows/amd64":"build\twindows"}' \
+      '{"windows/amd64":"build\u007fwindows"}'; do
+    status=0
+    config_normalize_additional_artifacts_json \
+      '{"windows/amd64":[{"name":"setup.msi","format":"msi"}]}' \
+      fixture "$jobs" > "$TEMP_DIR/output" 2> "$TEMP_DIR/error" || status=$?
+    [[ "$status" == 4 && ! -s "$TEMP_DIR/output" ]] || return 1
+    grep -Eq 'act_job_map|act job selector' "$TEMP_DIR/error" || return 1
+  done
+  release_contract_test_deps_available || return 0
+  config_init >/dev/null
+  config_load >/dev/null
+  write_contract_tool_config <<'YAML'
+targets: [linux/amd64, windows/amd64]
+act_job_map:
+  linux/amd64: build-linux
+  windows/amd64: false
+workspace_additional_artifacts:
+  windows/amd64: [{name: setup.msi, format: msi}]
+YAML
+  status=0
+  config_validate > "$TEMP_DIR/validation.out" 2> "$TEMP_DIR/validation.err" || status=$?
+  [[ "$status" == 4 ]] || return 1
+  grep -q 'windows/amd64' "$TEMP_DIR/validation.err" || return 1
+  grep -Eq 'act_job_map|act job selector' "$TEMP_DIR/validation.err"
 }
 
 test_config_validate_checks_all_additional_artifact_declarations() {
@@ -1795,7 +1837,8 @@ main() {
   run_test "additional_artifact_declarations_preserve_metadata_namespace" test_additional_artifact_declarations_preserve_metadata_namespace
   run_test "additional_artifact_registry_and_explicit_repo_precedence" test_additional_artifact_registry_and_explicit_repo_precedence
   run_test "additional_artifact_configuration_rejects_duplicate_yaml_keys" test_additional_artifact_configuration_rejects_duplicate_yaml_keys
-  run_test "additional_artifact_configuration_requires_native_producer" test_additional_artifact_configuration_requires_native_producer
+  run_test "additional_artifact_configuration_accepts_native_and_act_producers" test_additional_artifact_configuration_accepts_native_and_act_producers
+  run_test "additional_artifact_configuration_rejects_malformed_producer" test_additional_artifact_configuration_rejects_malformed_producer
   run_test "config_validate_checks_all_additional_artifact_declarations" test_config_validate_checks_all_additional_artifact_declarations
   run_test "seven_target_configuration_without_strict_contract" test_seven_target_configuration_without_strict_contract
   run_test "unsupported_configuration_names_target_without_strict_contract" test_unsupported_configuration_names_target_without_strict_contract

@@ -95,19 +95,35 @@ _dp_result() {
           attempts:$attempts,http_status:(if $http=="" then null else $http end),retry_not_before:$retry_at}'
 }
 
+# A known failure before any HTTP invocation is safe to retry normally. Keep
+# it distinct from a missing receipt after the transport may have run.
+_dp_blocked_result() {
+    _dp_result "$1" "$2" blocked "$3" 0 '' || return 1
+    return "$3"
+}
+
 # Validated request transport. Retry only explicit rate-limit rejections; a
 # timeout, 5xx or unrecognized acknowledgement may follow a completed POST.
 _dp_deliver() (
     set -o pipefail
     local repo="$1" event="$2" body="$3" guard="${4:-}" work attempt=0 rc=0 http=''
     local outcome=uncertain code=8 delay retry_after remaining reset now retry_at=null
-    [[ -z "$guard" ]] || declare -F "$guard" >/dev/null || return 3
-    dispatch_check_auth || return $?
-    command -v curl >/dev/null || { _dp_log_error 'curl is required'; return 3; }
-    work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-dispatch.XXXXXXXX") || return 1
+    [[ -z "$guard" ]] || declare -F "$guard" >/dev/null || {
+        _dp_blocked_result "$repo" "$event" 3; return $?;
+    }
+    dispatch_check_auth || { _dp_blocked_result "$repo" "$event" 3; return $?; }
+    command -v curl >/dev/null || {
+        _dp_log_error 'curl is required'
+        _dp_blocked_result "$repo" "$event" 3; return $?
+    }
+    work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-dispatch.XXXXXXXX") || {
+        _dp_blocked_result "$repo" "$event" 1; return $?;
+    }
     trap 'rm -rf -- "$work"' EXIT
     trap 'exit 5' HUP INT TERM
-    printf '%s' "$body" > "$work/body" || return 1
+    printf '%s' "$body" > "$work/body" || {
+        _dp_blocked_result "$repo" "$event" 1; return $?;
+    }
     while (( attempt < ${DISPATCH_MAX_RETRIES:-3} )); do
         rc=0; http=''
         # Release orchestration may require a fresh evidence gate before EVERY
@@ -119,13 +135,25 @@ _dp_deliver() (
                 break
             fi
         fi
+        # Do not count an HTTP attempt until its local output files are ready.
+        if ! { : > "$work/headers" && : > "$work/code"; }; then
+            outcome=blocked; code=1; break
+        fi
         attempt=$((attempt + 1))
-        : > "$work/headers"; : > "$work/code"
         _dp_http "$repo" "$work/body" "$work" || rc=$?
-        http=$(cat "$work/code")
+        if ! http=$(cat "$work/code"); then
+            outcome=uncertain; code=8; break
+        fi
+        # _dp_http returns 3 without invoking curl when its last token lookup
+        # fails. Curl's write-out supplies a status (including 000) when it
+        # runs; a nonempty or unreadable response is never proof of no POST.
+        if (( rc == 3 )) && [[ -z "$http" ]]; then
+            attempt=$((attempt - 1))
+            outcome=blocked; code=3; break
+        fi
         [[ "$http" =~ ^[0-9]{3}$ ]] || http=''
         if (( rc != 0 )); then
-            if (( rc == 3 )); then outcome=rejected; code=3; else outcome=uncertain; code=8; fi
+            outcome=uncertain; code=8
             break
         fi
         case "$http" in
@@ -249,7 +277,9 @@ dispatch_batch() (
     trap 'for index in "${pids[@]}"; do kill "$index" 2>/dev/null || :; done; wait; exit 5' HUP INT TERM
     [[ "$parallel" != true ]] || limit="${DISPATCH_PARALLELISM:-4}"
     while IFS= read -r repo; do
-        _dp_deliver "$repo" "$event" "$body" > "$work/$i.json" &
+        # A transport/auth descendant must not read the remaining repository
+        # records from this loop's stdin. Isolate the whole delivery worker.
+        _dp_deliver "$repo" "$event" "$body" </dev/null > "$work/$i.json" &
         pids+=("$!"); i=$((i + 1))
         if (( ${#pids[@]} >= limit )); then
             for index in "${pids[@]}"; do wait "$index" || failed=$((failed + 1)); done
@@ -258,10 +288,13 @@ dispatch_batch() (
     done <<< "$selected"
     for index in "${pids[@]}"; do wait "$index" || failed=$((failed + 1)); done
     (( failed == 0 )) || rc=1
-    jq -sc --argjson rc "$rc" --argjson expected "$i" '
-        if length == $expected and all(.[]; type=="object" and has("outcome"))
+    # Reconcile against the requested inventory, not the number of workers the
+    # loop happened to launch; a short dispatch must never report acceptance.
+    jq -sc --argjson rc "$rc" --arg repos "$selected" '
+        ($repos|split("\n")|sort) as $expected |
+        if ([.[].repo]|sort) == $expected and all(.[]; type=="object" and has("outcome"))
         then {status:(if $rc==0 then "accepted" else "incomplete" end),exit_code:$rc,results:sort_by(.repo)}
-        else error("Missing dispatch outcomes") end' "$work/"*.json || return 1
+        else error("Missing or mismatched dispatch outcomes") end' "$work/"*.json || return 1
     return "$rc"
 )
 
@@ -461,7 +494,10 @@ _dp_release_outbox() (
     # Whole-state validation above precedes every external side effect.
     indices=$(jq -r '.requests|keys[]' <<< "$plan") || return 1
     [[ -n "$indices" ]] || return 4
-    while IFS= read -r i; do
+    # Only the dispatcher reads task indices. Authentication, release guards
+    # and delivery descendants may read stdin; none may consume queued work.
+    # FD3 is scoped to this loop; inherited release/outbox locks use FD8/FD9.
+    while IFS= read -r -u 3 i; do
         outcome=$(jq -r --argjson i "$i" '.deliveries[$i].history[-1].outcome // "pending"' <<< "$state") || return 1
         [[ "$outcome" != accepted ]] || continue
         [[ "$inspect" != true ]] || continue
@@ -508,7 +544,7 @@ _dp_release_outbox() (
         oldhash=$(_dp_state_write "$file" "$next" "$oldhash" "$work" "$plan") || return $?
         state="$next"
         if [[ "$(jq -r '.outcome' <<< "$receipt")" == blocked ]]; then rc="$result"; break; fi
-    done <<< "$indices"
+    done 3<<< "$indices" </dev/null
     current=$(_dp_state_hash "$file") || return $?
     [[ "$current" == "$oldhash" ]] || return 2
     _dp_state_valid "$file" "$plan" || return 2
@@ -617,7 +653,7 @@ dispatch_release_json() (
 )
 
 export -f _dp_log_error _dp_log_info _dp_repo _dp_int _dp_body _dp_get_token
-export -f _dp_config _dp_http _dp_header _dp_result _dp_deliver _dp_repos
+export -f _dp_config _dp_http _dp_header _dp_result _dp_blocked_result _dp_deliver _dp_repos
 export -f _dp_digest_text _dp_state_hash _dp_release_plan _dp_outbox_identity _dp_state_valid _dp_state_write
 export -f _dp_outbox_summary _dp_release_outbox
 export -f dispatch_check_auth dispatch_event dispatch_batch dispatch_release dispatch_release_json

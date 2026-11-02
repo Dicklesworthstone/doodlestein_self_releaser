@@ -6,11 +6,19 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 # Run the identical public integration against a retained baseline checkout.
 ROOT="${DSR_TEST_ROOT:-$ROOT}"
+MODE="${1:-}"
+[[ $# -eq 0 || ( $# -eq 1 && "$MODE" == --go-bun-source-only ) ]] || {
+    printf 'Usage: %s [--go-bun-source-only]\n' "$0" >&2
+    exit 4
+}
 # Source cases intentionally use Git's local URL rewrite with no GitHub login.
 export DSR_GH_TOKEN='' GITHUB_TOKEN='' GH_TOKEN=''
 gh() { return 1; }
 export -f gh
-for dependency in bash python3 rustc cargo git jq yq tar gzip ps; do
+dependencies=(bash python3 git jq yq tar gzip ps)
+if [[ "$MODE" == --go-bun-source-only ]]; then dependencies+=(go)
+else dependencies+=(rustc cargo); fi
+for dependency in "${dependencies[@]}"; do
     command -v "$dependency" >/dev/null 2>&1 || {
         printf 'SKIP: generated workspace installer requires %s\n' "$dependency"
         exit 0
@@ -25,7 +33,7 @@ case "$(uname -s)/$(uname -m)" in
 esac
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/dsr-workspace-installer.XXXXXXXX") || exit 1
 printf 'Evidence: %s\n' "$WORK"
-python3 - "$ROOT" "$WORK" "$PLATFORM" "$TRIPLE" <<'PY'
+python3 - "$ROOT" "$WORK" "$PLATFORM" "$TRIPLE" "$MODE" <<'PY'
 import hashlib
 import io
 import json
@@ -33,6 +41,7 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import shlex
 import stat
 import subprocess
 import sys
@@ -42,6 +51,7 @@ import zipfile
 
 root, work = map(Path, sys.argv[1:3])
 platform, triple = sys.argv[3:5]
+source_families_only = sys.argv[5] == "--go-bun-source-only"
 names = ["nativefamily", "family-helper", "family-agent"]
 passed = failed = sequence = 0
 env = os.environ.copy()
@@ -196,6 +206,258 @@ def family(label, destination, version, expected=names, receipt=None):
               len(matches) == 1 and path.is_file() and matches[0].get("path") == str(path)
               and matches[0].get("sha256") == digest(path)
               and matches[0].get("size_bytes") == path.stat().st_size)
+
+
+def source_language_families():
+    # Genuine public generation, pinned Git checkout, native compilers, receipt
+    # validation and installation. Only GitHub transport is redirected locally;
+    # the compiler wrappers record argv and always execute the real programs.
+    selected = [names[0], names[1], "compiler.log"]
+    tools = work / "source-tools"
+    tools.mkdir()
+    calls = work / "source-calls"
+    release_calls = work / "release-calls"
+    native_env = env | {
+        "HOME": str(work / "source-home"),
+        "GOCACHE": env.get("DSR_TEST_GO_CACHE", str(work / "go-cache")),
+        "GOPATH": str(work / "go-home"), "GOPROXY": "off", "GOSUMDB": "off",
+        "GOMAXPROCS": "2", "BUN_INSTALL_CACHE_DIR": str(work / "bun-cache"),
+        "FAMILY_COMPILER_CALLS": str(calls), "FAMILY_RELEASE_CALLS": str(release_calls),
+        "FAMILY_RELEASE_MODE": "unavailable",
+    }
+    Path(native_env["HOME"]).mkdir()
+    for compiler in ["go", "bun"]:
+        real = shutil.which(compiler)
+        if real:
+            wrapper = tools / compiler
+            wrapper.write_text("#!/usr/bin/env bash\nset -uo pipefail\n"
+                               f"printf '%s\\n' \"{compiler} $*\" >> \"$FAMILY_COMPILER_CALLS\"\n"
+                               f"exec {shlex.quote(real)} \"$@\"\n")
+            wrapper.chmod(0o755)
+    curl = tools / "curl"
+    curl.write_text("""#!/usr/bin/env python3
+import os, pathlib, shutil, sys
+args = sys.argv[1:]
+with open(os.environ['FAMILY_RELEASE_CALLS'], 'a') as out:
+    out.write(' '.join(args) + '\\n')
+if os.environ['FAMILY_RELEASE_MODE'] != 'bad-checksum' or '-o' not in args:
+    sys.exit(22)
+url = args[-1]
+output = pathlib.Path(args[args.index('-o') + 1])
+if url.endswith('.tar.gz.sha256'):
+    output.write_text('0' * 64 + '  ' + url.rsplit('/', 1)[1][:-7] + '\\n')
+elif url.endswith('.tar.gz'):
+    shutil.copyfile(os.environ['FAMILY_RELEASE_ARCHIVE'], output)
+else:
+    sys.exit(22)
+""")
+    curl.chmod(0o755)
+    native_env["PATH"] = str(tools) + os.pathsep + env["PATH"]
+    source_modes = ["go", "bun"]
+    for language in source_modes:
+        if not (tools / language).is_file():
+            print(f"SKIP: genuine {language} source-family integration requires {language}", flush=True)
+            continue
+        upstream = work / (language + "-upstream")
+        project = upstream / "project"
+        project.mkdir(parents=True)
+        repository = "example/nativefamily-" + language
+        if language == "go":
+            (project / "go.mod").write_text("module example.invalid/family\n\ngo 1.20\n")
+            entries = ["entry/main", "cmd/" + names[1], "cmd/compiler.log"]
+            for name, entry in zip(selected, entries):
+                directory = project / entry
+                directory.mkdir(parents=True)
+                (directory / "main.go").write_text(
+                    f'package main\nimport "syscall"\nfunc main() {{ syscall.Write(1, []byte("{name} 1.2.5\\n")) }}\n')
+            source_entry = entries[0]
+        else:
+            (project / "src").mkdir()
+            (project / "dependency").mkdir()
+            (project / "dependency/package.json").write_text(
+                '{"name":"fixture-dependency","version":"1.0.0","main":"index.js"}\n')
+            (project / "dependency/index.js").write_text('export const version = "1.2.5";\n')
+            entries = ["src/primary.ts", "src/helper.ts", "src/metadata.ts"]
+            for name, entry in zip(selected, entries):
+                (project / entry).write_text(
+                    f'import {{ version }} from "fixture-dependency";\nconsole.log("{name} " + version);\n')
+            (project / "src/wrong.ts").write_text('console.log("wrong-primary");\n')
+            package = {"name": "nativefamily", "version": "1.2.5",
+                       "dependencies": {"fixture-dependency": "file:./dependency"},
+                       "bin": {name: "./" + entry for name, entry in zip(selected, entries)}}
+            package["bin"][names[0]] = "./src/wrong.ts"
+            (project / "package.json").write_text(json.dumps(package) + "\n")
+            (project / ".gitignore").write_text("node_modules/\n")
+            required("bun-real-lockfile", [tools / "bun", "install", "--lockfile-only", "--ignore-scripts",
+                                          "--cwd", project], selected_env=native_env)
+            check("Bun producer creates its actual committed dependency lock",
+                  (project / "bun.lock").is_file() or (project / "bun.lockb").is_file())
+            source_entry = entries[0]
+        required(language + "-init", ["git", "init", "-q", "-b", "main", upstream])
+        required(language + "-author", ["git", "-C", upstream, "config", "user.name", "DSR integration"])
+        required(language + "-email", ["git", "-C", upstream, "config", "user.email", "test@example.invalid"])
+        required(language + "-add", ["git", "-C", upstream, "add", "project"])
+        required(language + "-commit", ["git", "-C", upstream, "commit", "-qm", "real source executable family"])
+        required(language + "-tag", ["git", "-C", upstream, "tag", "v1.2.5"])
+        pin = required(language + "-pin", ["git", "-C", upstream, "rev-parse", "HEAD"]).stdout.decode().strip()
+        required(language + "-transport", ["git", "config", "--file", env["GIT_CONFIG_GLOBAL"],
+                 "url." + upstream.as_uri() + ".insteadOf", "https://github.com/" + repository + ".git"])
+
+        def configure(label, members=selected, override=None, language_name=language):
+            config(family=members, override=override)
+            path = work / "config/repos.d/nativefamily.yaml"
+            value = json.loads(path.read_text())
+            value.update(repo=repository, language=language_name,
+                         source_subdir="project", source_entry=source_entry)
+            path.write_text(json.dumps(value) + "\n")
+            return generate(language + "-" + label)
+
+        script = configure("family")
+        destination = work / (language + "-installed")
+        before = calls.read_bytes() if calls.exists() else b""
+        compile_env = native_env | ({"GOOS": "windows", "GOARCH": "arm64", "GOFLAGS": "-buildmode=archive"}
+                                    if language == "go" else {})
+        receipt = install(language + "-real-family", script, destination, version="1.2.5",
+                          extra=["--from-source", "--source-timeout", "90"], selected_env=compile_env)
+        family(language + " source family", destination, "1.2.5", expected=selected, receipt=receipt)
+        source_receipt = receipt.get("source", {})
+        check(language + " receipt binds the complete family to its selected source tag",
+              receipt.get("method") == "source" and receipt.get("signed_release") is False
+              and source_receipt.get("source_commit") == pin
+              and source_receipt.get("repository") == repository
+              and source_receipt.get("requested_ref") == "refs/tags/v1.2.5"
+              and [item.get("name") for item in source_receipt.get("binaries", [])] == selected
+              and all("path" not in item for item in source_receipt.get("binaries", [])))
+        check(language + " executable compiler.log cannot overwrite compiler identity",
+              isinstance(source_receipt.get("compiler"), str)
+              and (source_receipt["compiler"].startswith("go version ") if language == "go"
+                   else source_receipt["compiler"].strip() == required("bun-version", [tools / "bun", "--version"],
+                                                                    selected_env=native_env).stdout.decode().strip()))
+        invoked = (calls.read_bytes() if calls.exists() else b"")[len(before):].decode().splitlines()
+        check(language + " compiles each selected entry exactly once",
+              sum(line.startswith(language + " build ") for line in invoked) == len(selected))
+        if language == "bun":
+            check("Bun installs frozen dependencies once for the complete family",
+                  sum(line == "bun install --frozen-lockfile" for line in invoked) == 1)
+        check(language + " source installation releases its transaction lock",
+              not (destination / ".dsr-install.lock").exists())
+        if any(not (destination / name).is_file() for name in selected):
+            continue
+
+        # A selected platform subset must not build globally configured roles
+        # that do not exist in this source tree. The TypeScript language alias
+        # uses the genuine Bun compiler and the same source receipt contract.
+        subset_script = configure("target-subset", members=selected + ["unavailable-role"],
+                                  override=[names[0]], language_name="typescript" if language == "bun" else language)
+        subset = work / (language + "-subset")
+        subset_receipt = install(language + "-target-subset", subset_script, subset, version="1.2.5",
+                                 extra=["--from-source", "--source-timeout", "90"], selected_env=native_env)
+        family(language + " target subset", subset, "1.2.5", expected=[names[0]], receipt=subset_receipt)
+        check(language + " target subset never installs an excluded companion",
+              sorted(path.name for path in subset.iterdir()) == [names[0]] if subset.exists() else False)
+
+        missing = configure("missing", members=[names[0], names[1], "unavailable-role"])
+        prior = snapshot(destination, inodes=True)
+        before = calls.read_bytes()
+        install(language + "-missing-provider", missing, destination, version="1.2.5",
+                extra=["--from-source", "--yes", "--source-timeout", "90"],
+                selected_env=native_env, success=False)
+        check(language + " resolves the entire family before invoking a compiler or dependency installer",
+              calls.read_bytes() == before)
+        check(language + " missing provider preserves the installed family and inodes",
+              snapshot(destination, inodes=True) == prior)
+
+        # Even a link that stays inside the checkout cannot provide a declared
+        # role. Reject every entry before dependency scripts or compilers run.
+        if language == "go":
+            (project / "cmd/linked-role").symlink_to("../entry/main", target_is_directory=True)
+        else:
+            (project / "src/linked.ts").symlink_to("primary.ts")
+            package["bin"]["linked-role"] = "./src/linked.ts"
+            (project / "package.json").write_text(json.dumps(package) + "\n")
+        required(language + "-link-add", ["git", "-C", upstream, "add", "project"])
+        required(language + "-link-commit", ["git", "-C", upstream, "commit", "-qm", "unsafe companion link"])
+        link_pin = required(language + "-link-pin", ["git", "-C", upstream, "rev-parse", "HEAD"]).stdout.decode().strip()
+        linked_script = configure("linked", members=[names[0], "linked-role"])
+        before = calls.read_bytes()
+        install(language + "-linked-provider", linked_script, destination, version=None,
+                extra=["--from-source", "--source-ref", link_pin, "--yes", "--source-timeout", "90"],
+                selected_env=native_env, success=False)
+        check(language + " linked companion is refused before compiler or dependency execution",
+              calls.read_bytes() == before)
+        check(language + " linked companion cannot replace an installed role",
+              snapshot(destination, inodes=True) == prior)
+
+        # Source admission failure occurs even when an earlier member is valid.
+        if language == "go":
+            broken = project / entries[1] / "main.go"
+            broken.write_text('package library\nconst Value = 1\n')
+        else:
+            package["bin"] = "./src/primary.ts"
+            (project / "package.json").write_text(json.dumps(package) + "\n")
+        required(language + "-invalid-add", ["git", "-C", upstream, "add", "project"])
+        required(language + "-invalid-commit", ["git", "-C", upstream, "commit", "-qm", "invalid companion provider"])
+        bad_pin = required(language + "-invalid-pin", ["git", "-C", upstream, "rev-parse", "HEAD"]).stdout.decode().strip()
+        before = calls.read_bytes()
+        install(language + "-invalid-provider", script, destination, version=None,
+                extra=["--from-source", "--source-ref", bad_pin, "--yes", "--source-timeout", "90"],
+                selected_env=native_env, success=False)
+        invoked = calls.read_bytes()[len(before):].decode().splitlines()
+        check(language + " invalid companion blocks every build and dependency install",
+              not any(line.startswith((language + " build ", language + " install ")) for line in invoked))
+        check(language + " invalid companion leaves the existing installation unchanged",
+              snapshot(destination, inodes=True) == prior)
+
+        # A genuine later compiler failure must never activate an earlier
+        # successfully built family member or emit a success source receipt.
+        if language == "go":
+            broken.write_text('package main\nfunc main() { undefinedFunction() }\n')
+        else:
+            package["bin"] = {name: "./" + entry for name, entry in zip(selected, entries)}
+            package["bin"][names[0]] = "./src/wrong.ts"
+            (project / "package.json").write_text(json.dumps(package) + "\n")
+            (project / entries[1]).write_text('const = ;\n')
+        required(language + "-failure-add", ["git", "-C", upstream, "add", "project"])
+        required(language + "-failure-commit", ["git", "-C", upstream, "commit", "-qm", "later real compiler failure"])
+        failed_pin = required(language + "-failure-pin", ["git", "-C", upstream, "rev-parse", "HEAD"]).stdout.decode().strip()
+        before = calls.read_bytes()
+        failure_receipt = install(language + "-compiler-failure", script, destination, version=None,
+                                  extra=["--from-source", "--source-ref", failed_pin, "--yes", "--source-timeout", "90"],
+                                  selected_env=native_env, success=False)
+        invoked = calls.read_bytes()[len(before):].decode().splitlines()
+        check(language + " failure exercised both the first and the failing companion compiler",
+              sum(line.startswith(language + " build ") for line in invoked) == 2)
+        check(language + " compiler failure preserves all installed bytes and modes",
+              snapshot(destination, inodes=True) == prior)
+        check(language + " compiler failure does not attest partial family success",
+              "source" not in failure_receipt and failure_receipt.get("status") == "error")
+
+        if language == "go":
+            # HEAD is now broken: acquisition fallback must still build every
+            # member from the explicitly requested, immutable release tag.
+            fallback = work / "go-fallback-installed"
+            fallback_receipt = install("go-unavailable-release-fallback", script, fallback, version="1.2.5",
+                                       extra=["--allow-source-build", "--source-timeout", "90"], selected_env=native_env)
+            family("Go fallback pinned family", fallback, "1.2.5", expected=selected, receipt=fallback_receipt)
+            check("Go fallback pins the requested tag even after HEAD becomes unbuildable",
+                  fallback_receipt.get("source", {}).get("source_commit") == pin)
+            archive_path = work / "go-family-release.tar.gz"
+            with tarfile.open(archive_path, "w:gz") as tar:
+                for name in selected:
+                    tar.add(destination / name, arcname=name, recursive=False)
+            bad_env = native_env | {"FAMILY_RELEASE_MODE": "bad-checksum",
+                                   "FAMILY_RELEASE_ARCHIVE": str(archive_path)}
+            before = calls.read_bytes()
+            install("go-corrupt-release-cannot-fall-back", script, destination, version="1.2.5",
+                    extra=["--allow-source-build", "--yes", "--source-timeout", "90"], selected_env=bad_env, success=False)
+            check("bad release checksum cannot start a source family build", calls.read_bytes() == before)
+            check("bad release checksum preserves the complete installation", snapshot(destination, inodes=True) == prior)
+
+
+if source_families_only:
+    source_language_families()
+    print(f"Generated Go/Bun source families: {passed} passed, {failed} failed", flush=True)
+    sys.exit(1 if failed else 0)
 
 
 # Two genuinely compiled generations make partial upgrades observable.

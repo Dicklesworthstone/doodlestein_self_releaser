@@ -1,6 +1,6 @@
-# Install a complete authenticated executable set
+# Install an authenticated application generation
 
-`src/release_install.sh` installs explicitly selected executables from a signed
+`dsr installer install` installs explicitly selected executables and runtime data from a signed
 [release snapshot](RELEASE_SNAPSHOTS.md). It authenticates the whole snapshot,
 extracts selected archive members, verifies a complete installation generation,
 and switches one managed `current` pointer. It does not publish, build,
@@ -9,7 +9,7 @@ files. This is an explicit consumer command, not a silent change to the generate
 curl-bash installers or ordinary `dsr release` policy.
 
 For a distributable per-release script with embedded engines, recipes and trust
-policy, use `generate-installer` as described in
+policy, use `dsr installer generate-release` as described in
 [generated release installers](GENERATED_RELEASE_INSTALLERS.md). Consumers can
 then use online or offline installation without a DSR checkout or repeated
 policy/key arguments.
@@ -20,7 +20,7 @@ Use `--fetch` instead of `--snapshot DIR` to fetch the exact selected signed
 release into private staging and install from those authenticated bytes:
 
 ```bash
-bash src/release_install.sh --fetch \
+dsr installer install --fetch \
   --recipe /srv/policies/demo-install.json --prefix /home/alice/.local/demo \
   --repo OWNER/REPO --tag v1.2.3 --sha "$REVIEWED_SOURCE_COMMIT" \
   --builder "$TRUSTED_BUILDER_ID" --public-key /srv/keys/release.pub \
@@ -58,6 +58,22 @@ produces the same generation identity; transport receipts are not part of that
 identity. Every online retry fetches again rather than trusting a cached success.
 Use the separate `fetch-release` command to keep an offline snapshot permanently.
 
+The public command delegates to the same strict `src/release_install.sh` engine.
+Use `dsr installer install --help` for its complete argument list. It accepts no
+release-discovery or source-build fallback options. Global `dsr --dry-run` and
+installation `--dry-run` both authenticate and extract without activating a
+generation; online mode still downloads the complete snapshot.
+
+With `dsr --json installer install ...`, stdout contains one standard DSR
+envelope. `details` retains the engine's complete result, including
+`authenticated`, `status`, `generation`, selected files, and `activated` when
+activation was attempted. The envelope's exit code agrees with the process and
+the engine. `details.action` identifies `install`. A signal to the public DSR
+process is forwarded to the engine, which finishes its cleanup and returns its
+actual activation state. If activation already completed, that committed result
+remains authoritative. Without `--json`, the engine's JSON receipt is printed
+directly. `--help` prints usage, or one help envelope in JSON mode.
+
 Run `bash scripts/tests/test_release_install_fetch.sh` for the full fetch,
 offline authentication and installation handoff. GitHub transport and Minisign
 are explicit fixtures, not live HTTP or native cryptographic acceptance tests.
@@ -84,15 +100,76 @@ forbid it. A single archive can supply several companion binaries. Safe nested
 members such as `bin/demo` are supported. Only the 1–64 explicitly selected names
 are installed; the recipe is not a wildcard inventory. Names are unique ignoring
 ASCII case, are limited to 128 characters, and cannot contain traversal. Unknown
-fields, duplicate JSON keys, null lists, empty selections and ambiguous names
+fields, duplicate JSON keys, null lists, empty executable selections and ambiguous names
 are errors. Member paths are limited to 1024 characters.
 
-The recipe's target must equal the local host, and every selected artifact must
-be signed for that target. The current installer supports Linux and macOS on
-recognized amd64, arm64 or 386 hosts. Windows payloads may be present in a full
+The recipe's target must equal the local host, and every executable artifact must
+be signed for that target. Supported pairs are Linux on amd64, arm64, 386 or
+armv7; macOS on amd64 or arm64; and FreeBSD on amd64. Windows payloads may be present in a full
 release snapshot but are not installed on POSIX hosts. This check authenticates
 the producer's platform claim; it is not independent executable-format or loader
 qualification. The installer does not execute a candidate to discover its platform.
+
+Review a recipe without downloading or authenticating a release:
+
+```bash
+dsr --json installer describe-recipe --recipe /srv/policies/demo-install.json
+```
+
+Add both `--release-contract FILE` and `--targets LIST` to validate it against an
+independent complete release contract. This command uses the installation
+engine's normalizer and always reports `authenticated: false`; a valid recipe
+does not establish that the named release assets exist or are signed.
+
+## Select runtime data
+
+Applications that need schemas, templates, model metadata, notices or other
+runtime files can add an explicit `files` list to the same recipe:
+
+```json
+{
+  "schema_version": 1,
+  "target": "linux/amd64",
+  "executables": [
+    {"name": "demo", "artifact": "demo-linux.tar.gz", "member": "bin/demo"}
+  ],
+  "files": [
+    {"path": "share/demo/runtime.json", "artifact": "runtime.json"},
+    {"path": "share/demo/docs/help.txt", "artifact": "demo-linux.tar.gz", "member": "docs/help.txt"}
+  ]
+}
+```
+
+Each `path` is a destination relative to the generation root and must begin
+with exactly `share/`. The same safe components and 1024-character limit used
+for archive members apply. There are at most 256 file selections. Duplicate
+destinations, case aliases in any path component, file/directory prefix
+collisions, traversal and unknown fields are rejected before acquisition. There
+is no wildcard, directory-copy, destination outside `share/`, or mode override.
+An absent or empty `files` list preserves the executable-only recipe and
+generation identity; a null list is invalid.
+
+An exact signed payload may supply a raw data file, or a safe archive `member`
+may supply it. Its signed target must be either the recipe's physical platform
+or `additional`, the release-wide shared asset namespace. A shared asset cannot
+supply an executable or satisfy the platform matrix. When the recipe has an
+explicit `target_triple`, platform-owned data must have that same signed
+compiler identity. Shared data remains independent of the compiler variant and
+must have no `target_triple`. An independently supplied release contract is also
+checked against these selections before network acquisition.
+
+Data files always receive mode **0644**, even when an archive marks the member
+executable. Their required directories receive mode **0755**. Empty archive
+members are valid data; executable members must remain nonempty, and existing
+whole-snapshot subject admission still applies to raw assets. An archive used
+by both executable and data selections is authenticated and extracted once.
+No file is inferred from its extension or copied merely because it is present
+beside a selected binary.
+
+The application must know how to locate its data under the generation's
+`share/` tree. The installer does not inject environment variables or rewrite
+application configuration. Treat these installed files as immutable release
+content; keep mutable application state outside the managed generations.
 
 ## Authenticate and install
 
@@ -102,7 +179,7 @@ have an existing parent and be new, empty, or already owned by this installer.
 It must not overlap the snapshot, recipe or public key.
 
 ```bash
-bash src/release_install.sh \
+dsr installer install \
   --snapshot /srv/downloads/demo-v1.2.3 \
   --recipe /srv/policies/demo-install.json \
   --prefix /home/alice/.local/demo \
@@ -124,8 +201,8 @@ After successful authentication, selected payloads and the exact signed proof
 pair are copied into private staging and rehashed against the verified selection.
 Archive extraction uses the existing packaging validator: declared compression
 must match, and traversal, links, special files and duplicate members are refused.
-No archive or raw payload is executed. The selected output files are installed
-with mode **0755**, without setuid/setgid or unusual write permissions.
+No archive or raw payload is executed. Executables receive mode **0755** and
+runtime data receives **0644**, without setuid/setgid or unusual write permissions.
 
 The result names both `bin_dir` (the active path) and `generation_bin_dir` (the
 immutable-version path). Add the active directory to PATH explicitly, for example:
@@ -135,6 +212,9 @@ export PATH="/home/alice/.local/demo/current/bin:$PATH"
 ```
 
 The installer never creates or replaces unrelated files in `~/.local/bin`.
+For a recipe with runtime files, the result also includes their selected paths,
+signed ownership, hashes, sizes and modes in `files`, plus `share_dir` (the active
+path) and `generation_share_dir` (the immutable-version path).
 Its managed prefix looks like:
 
 ```text
@@ -145,7 +225,10 @@ demo/
   generations/
     GENERATION_SHA256/
       bin/                           # Exactly the selected executable names
-      receipt.json                   # Recipe, signer, source and binary hashes
+      share/                         # Only when runtime files are selected
+        demo/runtime.json            # Explicit destination, fixed mode 0644
+        demo/docs/help.txt
+      receipt.json                   # Recipe, signer, source and installed hashes
       release.intoto.jsonl
       release.intoto.jsonl.minisig
   current -> generations/GENERATION_SHA256
@@ -153,7 +236,8 @@ demo/
 
 The generation identity covers the canonical installation receipt, including
 the exact snapshot/proof identity, selected signing key, recipe, source/build
-pins and extracted binary hashes. Input paths and current time do not select a
+pins and every selected executable/data path, hash, size and mode. Required data
+directories are derived exactly from those paths. Input paths and current time do not select a
 new generation. Each retained proof is checked against the newly authenticated
 snapshot on reuse; a saved `authenticated` field alone is never sufficient.
 No private key, GitHub credential or private producer manifest is installed.
@@ -161,7 +245,7 @@ No private key, GitHub credential or private producer manifest is installed.
 ## Upgrades, retries and rollback
 
 Changing an active installation requires explicit `--replace`. The new
-executable set is fully prepared and verified first. One same-filesystem
+executable and runtime-data set is fully prepared and verified first. One same-filesystem
 symlink replacement activates it; the installer does not overwrite each live
 binary in turn. A failure before activation leaves the old `current` pointer
 unchanged. The failure JSON reports whether activation actually occurred, so a
@@ -169,7 +253,10 @@ handled signal after the pointer switch is not represented as a pre-activation
 failure. Old generations are retained and are never pruned automatically.
 
 Repeating the identical command reauthenticates the snapshot, reconstructs the
-expected generation and verifies its retained binaries and proofs. It reuses an
+expected generation and verifies its retained binaries, data and proofs. The
+complete `share/` file and directory namespace must match: missing or extra
+files, undeclared empty directories, links, changed bytes and changed modes are
+refused before reuse or activation. It reuses an
 identical generation without changing its file or pointer identities. Changed
 or corrupted retained files are conflicts, not permission to silently repair
 them. An incomplete copy or extraction is not an active installation. A complete
@@ -186,7 +273,9 @@ has not since been revoked.
 A pointer switch is not a transaction spanning separate pathname lookups. Two
 process launches straddling an upgrade can observe different generations, and
 already-running processes continue independently. Applications needing one fixed
-version across multiple launches should use the returned `generation_bin_dir`.
+version across multiple launches or data reads should use the returned
+`generation_bin_dir` and `generation_share_dir` from the same result. Repeated
+lookups through `current` can straddle a pointer switch.
 The prefix is single-user, trusted local installation storage, not a sandbox
 against a privileged concurrent filesystem writer.
 
@@ -221,6 +310,17 @@ Snapshot/cryptographic failures preserve their underlying nonzero status.
 Missing Python itself returns dependency exit `3` before the JSON engine starts.
 
 ## Validation
+
+Run `bash scripts/tests/test_installer_release_cli.sh` for the public command
+path. It uses the actual DSR executable, generator, archive handling and
+installation engine with real Minisign signatures over small private fixtures.
+It verifies dry-run output/lock/prefix preservation, standalone inspection,
+complete executable/data activation, retry, replacement, rollback, exact
+ownership and compiler selection, and refusal of signed-subject corruption.
+Cancellation is tested through the public PID before activation and through an
+explicit result-delivery boundary after the real engine has already committed.
+No network, compiler or installed payload is executed by this suite. The
+existing legacy installer commands remain separate regression controls.
 
 Run `bash scripts/tests/test_release_install.sh`. It starts with the actual
 snapshot fetch/verification flow, then executes the real installer CLI and

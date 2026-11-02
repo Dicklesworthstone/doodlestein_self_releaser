@@ -577,7 +577,7 @@
     },
     "cargo_environment_exemption": {
       "type": "object",
-      "description": "Legacy literal values or complete configured/effective numeric environment observations. Force and effective provenance must be retained together.",
+      "description": "Legacy literal values or complete configured/effective environment observations. Rust numeric values remain positive integers; CARGO_INCREMENTAL admits only the string zero. Force and effective provenance must be retained together.",
       "required": ["name", "value"],
       "additionalProperties": false,
       "dependentRequired": {
@@ -587,12 +587,28 @@
         "effective_source": ["force", "effective_value", "effective_force"]
       },
       "properties": {
-        "name": {"enum": ["RUST_MIN_STACK", "RUST_TEST_THREADS"]},
-        "value": {"$ref": "#/$defs/cargo_numeric_value"},
+        "name": {"enum": ["RUST_MIN_STACK", "RUST_TEST_THREADS", "CARGO_INCREMENTAL"]},
+        "value": {"type": "string"},
         "force": {"type": "boolean"},
-        "effective_value": {"$ref": "#/$defs/cargo_numeric_value"},
+        "effective_value": {"type": "string"},
         "effective_force": {"type": "boolean"},
         "effective_source": {"enum": ["configuration", "environment"]}
+      },
+      "if": {
+        "properties": {"name": {"const": "CARGO_INCREMENTAL"}},
+        "required": ["name"]
+      },
+      "then": {
+        "properties": {
+          "value": {"const": "0"},
+          "effective_value": {"const": "0"}
+        }
+      },
+      "else": {
+        "properties": {
+          "value": {"$ref": "#/$defs/cargo_numeric_value"},
+          "effective_value": {"$ref": "#/$defs/cargo_numeric_value"}
+        }
       }
     },
     "cargo_cfg_expression": {

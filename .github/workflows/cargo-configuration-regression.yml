@@ -4,8 +4,10 @@ on:
     branches: [main]
     paths:
       - src/act_runner.sh
+      - src/cargo_context_windows.ps1
       - schemas/manifest.json
       - scripts/tests/test_cargo_configuration.py
+      - scripts/tests/test_cargo_context_windows.ps1
       - scripts/tests/test_cargo_configuration_security.py
       - scripts/tests/test_cargo_invocation_security.py
       - scripts/tests/test_toolchain_identity.sh
@@ -83,7 +85,7 @@ jobs:
         run: |
           set -euo pipefail
           shellcheck -S warning src/act_runner.sh scripts/tests/test_toolchain_identity.sh
-          python3 -I scripts/tests/test_cargo_configuration.py --integration
+          python3 -I scripts/tests/test_cargo_configuration.py --integration --incremental-integration
           bash scripts/tests/test_toolchain_identity.sh
           git hash-object src/act_runner.sh schemas/manifest.json scripts/tests/test_cargo_invocation_security.py scripts/tests/test_toolchain_identity.sh scripts/tests/test_cargo_configuration.py > "$RUNNER_TEMP/cargo-source-after-tests.txt"
           cmp "$RUNNER_TEMP/cargo-source-before-tests.txt" "$RUNNER_TEMP/cargo-source-after-tests.txt"

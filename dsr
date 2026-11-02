@@ -178,10 +178,10 @@ COMMANDS:
     report      Recent runs, failures and throttling
     version     Detect and tag versions from version files
     canary      Test installers in Docker containers
-    installer   Generate and validate curl|bash installers
+    installer   Generate installers and install authenticated releases
     sbom        Generate Software Bill of Materials
     slsa        Generate SLSA provenance attestation
-    docker      Build multi-arch Docker images
+    docker      Build, release, verify and attest container images
     verify      Verification commands (upgrade checks)
 
 GLOBAL OPTIONS:
@@ -1727,7 +1727,7 @@ _watch_resume_checkpoint() {
         state=$(build_state_get "$tool" "$version" "$run") || return 4
         jq -e --arg sha "$sha" --arg output "$output" '
             .git_sha == $sha and .context.output_dir == $output and
-            (.status | IN("created","running","failed","targets-complete","completed"))
+            (.status | IN("created","running","failed","partial","targets-complete","completed"))
         ' <<< "$state" >/dev/null || return 4
         found="$run"; count=$((count + 1))
     done
@@ -3743,6 +3743,37 @@ EOF
         return 1
     }
 
+    # A typed companion may have the same container format and target as the
+    # primary executable. Its verified ownership must survive manifest-based
+    # selection: documentation.tar.gz cannot become the installer archive.
+    # Stream the receipt map; large release inventories must not enter argv.
+    _build_primary_manifest_artifacts() {
+        local manifest_file="$1" additional_receipts="${verified_additional_receipts:-}"
+        [[ -n "$additional_receipts" ]] || additional_receipts='{}'
+        jq -c --slurpfile manifest "$manifest_file" '
+            [.[] | {name, target}] as $additional |
+            $manifest[0].artifacts | map(select(. as $artifact |
+                all($additional[];
+                    .name != $artifact.name or .target != $artifact.target)))
+        ' <<< "$additional_receipts"
+    }
+
+    # The flattened output has one owner per name, even when two owners have
+    # identical bytes. Reserve companions before primary packaging can replace
+    # a destination or choose an existing file as its installer alias.
+    _build_require_primary_names_available() {
+        local versioned="$1" compat="$2" additional_receipts="${verified_additional_receipts:-}"
+        [[ -n "$additional_receipts" ]] || additional_receipts='{}'
+        if ! jq -e --arg versioned "$versioned" --arg compat "$compat" '
+            ([$versioned, $compat] | map(select(length > 0) | ascii_downcase)) as $primary |
+            all(.[]; (.name | ascii_downcase) as $name |
+                ($primary | index($name)) == null)
+        ' <<< "$additional_receipts" >/dev/null; then
+            log_error "Primary release or installer name collides with a configured additional artifact: $versioned ${compat:-}"
+            return 4
+        fi
+    }
+
     _build_find_manifest_artifact() {
         local manifest_file="$1"
         local output_dir="$2"
@@ -3751,21 +3782,22 @@ EOF
         local target_triple="${5:-}"
 
         if [[ -f "$manifest_file" ]]; then
-            local name
+            local name primary_artifacts
+            primary_artifacts=$(_build_primary_manifest_artifacts "$manifest_file") || return 4
             name=$(jq -r --arg t "$target" --arg f "$format" --arg triple "$target_triple" '
-                .artifacts[]? | select(.target == $t) |
+                .[] | select(.target == $t) |
                 select($triple == "" or .target_triple == $triple) |
                 select(.archive_format == $f) | .name
-            ' "$manifest_file" 2>/dev/null | head -1)
+            ' <<< "$primary_artifacts" 2>/dev/null | head -1)
             if [[ -n "$name" && -f "$output_dir/$name" ]]; then
                 echo "$output_dir/$name"
                 return 0
             fi
 
             name=$(jq -r --arg t "$target" --arg triple "$target_triple" '
-                .artifacts[]? | select(.target == $t) |
+                .[] | select(.target == $t) |
                 select($triple == "" or .target_triple == $triple) | .name
-            ' "$manifest_file" 2>/dev/null | head -1)
+            ' <<< "$primary_artifacts" 2>/dev/null | head -1)
             if [[ -n "$name" && -f "$output_dir/$name" ]]; then
                 echo "$output_dir/$name"
                 return 0
@@ -4128,6 +4160,10 @@ EOF
                 naming_override=$(jq -nc --arg versioned "$versioned" --arg compat "$compat" \
                     '{versioned:$versioned, compat:$compat}') || return 1
             fi
+            if ! _build_require_primary_names_available "$versioned" "$compat"; then
+                collect_failed=true
+                return 1
+            fi
             variant_path=$(_build_find_manifest_artifact "$manifest_file" "$output_dir" "$target" "$format" "$triple" 2>/dev/null || true)
             if [[ -z "$variant_path" || -L "$variant_path" ]]; then
                 log_warn "Variant $triple of $tool $target was not produced by this build ($versioned); installers selecting it will find no asset"
@@ -4275,7 +4311,9 @@ EOF
         fi
 
         local existing_format="${existing_archive_formats[$target]:-}"
-        if [[ -n "$target_triple" && -n "$binary_override" && -f "$binary_override" ]]; then
+        if [[ -n "$binary_override" && -f "$binary_override" ]]; then
+            # Only the selected primary determines prebuilt reuse. A platform
+            # may also carry companion archives or another compiler variant.
             existing_format=$(packaging_format_for_name "${binary_override##*/}")
             [[ "$existing_format" != none ]] || existing_format=""
         fi
@@ -4486,11 +4524,12 @@ EOF
         fi
 
         if [[ -n "$manifest_file" && -f "$manifest_file" ]]; then
-            local target format
+            local target format primary_artifacts
+            primary_artifacts=$(_build_primary_manifest_artifacts "$manifest_file") || return 4
             while IFS=$'\t' read -r target format; do
                 [[ -z "$target" || -z "$format" || "$format" == "none" ]] && continue
                 existing_archive_formats["$target"]="$format"
-            done < <(jq -r '.artifacts[]? | [.target // "", .archive_format // ""] | @tsv' "$manifest_file" 2>/dev/null)
+            done < <(jq -r '.[] | [.target // "", .archive_format // ""] | @tsv' <<< "$primary_artifacts" 2>/dev/null)
         else
             local target artifact_path
             while IFS=$'\t' read -r target artifact_path; do
@@ -4546,6 +4585,10 @@ EOF
             }
             versioned_name=$(echo "$names_json" | jq -r '.versioned // empty' 2>/dev/null)
             compat_name=$(echo "$names_json" | jq -r '.compat // empty' 2>/dev/null)
+            if ! _build_require_primary_names_available "$versioned_name" "$compat_name"; then
+                collect_failed=true
+                return 1
+            fi
 
             if [[ "$format" != "none" ]]; then
                 _build_emit_variant_aliases "$tool" "$version" "$target" "$format" "$naming_ext" \
@@ -4559,6 +4602,11 @@ EOF
             existing_path=$(_build_find_manifest_artifact "$manifest_file" "$output_dir" "$target" "$format" "$primary_triple" 2>/dev/null || true)
             if [[ -z "$existing_path" && ! -f "$manifest_file" && -n "$versioned_name" && -f "$output_dir/$versioned_name" ]]; then
                 existing_path="$output_dir/$versioned_name"
+            fi
+            if [[ -f "$manifest_file" && -z "$existing_path" && "$format" != none ]]; then
+                log_error "Primary artifact not found for $tool $target ${primary_triple:-}; additional artifacts cannot replace it"
+                collect_failed=true
+                return 1
             fi
             if [[ -n "$existing_path" ]]; then
                 existing_format=$(packaging_format_for_name "${existing_path##*/}")
@@ -4880,16 +4928,24 @@ EOF
         target_results_json=$(jq -c '[.targets[]? | select(type == "object" and (.platform | type == "string")) |
             {platform, host: (.host // ""), method: (.method // "native"),
              status: (if (.status // "") | IN("success", "ok", "passed") then "success"
-                      elif .status == "timeout" then "timeout" else "failed" end)}
+                      elif .status == "timeout" then "timeout"
+                      elif .status == "skipped" then "skipped" else "failed" end)}
             + (if (.artifact_path | type) == "string" then {artifact_path} else {} end)
             + (if (.artifact_paths | type) == "array" then {artifact_paths} else {} end)
             + (if (.target_triple | type) == "string" then {target_triple} else {} end)
             + (if (.task_key | type) == "string" then {task_key} else {} end)
             + (if (.stage | type) == "string" then {stage} else {} end)
+            + (if (.execution_started | type) == "boolean" then {execution_started} else {} end)
+            + (if (.backend_started | type) == "boolean" then {backend_started} else {} end)
             + (if (.source_sync | type) == "object" then {source_sync} else {} end)
             + (if (.build_influence_env | type) == "object" then {build_influence_env} else {} end)
             + (if (.cargo_isolation | type) == "object" then {cargo_isolation} else {} end)
             + (if (.log_path | type) == "string" then {log_path} else {} end)
+            + (if (.result_path | type) == "string" then {result_path} else {} end)
+            + (if (.attempt | type) == "number" then {attempt} else {} end)
+            + (if (.exit_code | type) == "number" then {exit_code} else {} end)
+            + (if (.worker_exit_code | type) == "number" then {worker_exit_code} else {} end)
+            + (if (.receipt_source | type) == "string" then {receipt_source} else {} end)
             + (if (.error | type) == "string" then {error} else {} end)
             + (if (.duration_ms | type) == "number" then {duration_ms: (.duration_ms | floor)} else {} end)]' \
             <<< "$result" 2>/dev/null) || target_results_json='[]'
@@ -4898,6 +4954,7 @@ EOF
             --arg build_purpose "$build_purpose" --arg targets "$target_list" \
             --argjson results "$target_results_json" --arg run_id "$result_run_id" \
             --argjson source_sync "$(jq -c '.source_sync // null' <<< "$result")" \
+            --argjson coordinator_error "$(jq -c '.error // null' <<< "$result")" \
             --argjson total "$total" --argjson success "$success" --argjson failed "$failed" \
             --argjson duration "$duration" --arg output_dir "$output_dir" \
             --arg manifest "$authoritative_manifest" '
@@ -4910,7 +4967,9 @@ EOF
                  else {platform: $platform, host: "", method: "native", status: "skipped"} end],
              total: $total, success: $success, failed: $failed,
              duration_seconds: $duration, total_build_time_ms: ($duration * 1000),
-             output_dir: $output_dir, manifest_path: $manifest}') || return 4
+             output_dir: $output_dir, manifest_path: $manifest}
+            + (if ($coordinator_error | type) == "string" and $coordinator_error != ""
+               then {error: $coordinator_error} else {} end)') || return 4
         json_envelope "build" "$final_status" "$final_exit" "$build_details"
     else
         echo ""
@@ -8149,8 +8208,20 @@ EOF
     local -A release_upload_plan=() release_artifact_triples=()
     _release_plan_upload_names() {
         local -A claimants=() rank=() sha_of=() artifact_candidates=()
+        local -A companion_targets=()
         local -a order=()
         local a_name a_sha a_target a_format a_triple variant triple how primary candidate configured
+        local companion_json companion_rows companion_name companion_target
+        companion_json=$(config_get_additional_artifacts_json "$tool_name") || {
+            log_error "Cannot validate additional artifact ownership for $tool_name"
+            return 4
+        }
+        companion_rows=$(jq -r 'to_entries[] | .key as $target |
+            .value[] | [.name, $target] | @tsv' <<< "$companion_json") || return 4
+        while IFS=$'\t' read -r companion_name companion_target; do
+            [[ -n "$companion_name" ]] || continue
+            companion_targets["$companion_name"]="$companion_target"
+        done <<< "$companion_rows"
         while IFS=$'\t' read -r a_name a_sha a_target a_format a_triple; do
             [[ "$a_target" == "-" ]] && a_target=""
             [[ "$a_format" == "-" ]] && a_format=""
@@ -8163,6 +8234,11 @@ EOF
             order+=("$a_name")
             sha_of["$a_name"]="$a_sha"
             triple="" how="" rank["$a_name"]=2
+            companion_target="${companion_targets[$a_name]:-}"
+            if [[ -n "$companion_target" && "$a_target" != "$companion_target" ]]; then
+                log_error "Additional artifact $a_name is configured for $companion_target, but the manifest declares ${a_target:-no platform}"
+                return 4
+            fi
             configured='[]'
             if [[ "$a_target" == */* ]] && declare -F config_get_target_triples_json &>/dev/null; then
                 configured=$(config_get_target_triples_json "$tool_name" "$a_target") || return 4
@@ -8180,7 +8256,17 @@ EOF
                 log_error "Manifest artifact $a_name has a target_triple without a platform"
                 return 4
             fi
-            if [[ "$a_target" == */* ]]; then
+            if [[ -n "$companion_target" ]]; then
+                # Native companions belong to their configured platform's
+                # first variant. Their names are literal data: ABI words in a
+                # JSON/NOTICE/archive name do not select a compiler variant.
+                primary=$(jq -r '.[0] // empty' <<< "$configured") || return 4
+                if [[ -n "$a_triple" && -n "$primary" && "$a_triple" != "$primary" ]]; then
+                    log_error "Additional artifact $a_name must belong to the primary configured target_triple $primary, not $a_triple"
+                    return 4
+                fi
+                triple="${a_triple:-$primary}"
+            elif [[ "$a_target" == */* ]]; then
                 if ! variant=$(artifact_naming_artifact_variant \
                         "$tool_name" "${a_target%/*}" "${a_target#*/}" "$a_name"); then
                     log_error "Cannot reconcile target_triple with artifact name: $a_name"
@@ -8205,8 +8291,14 @@ EOF
             fi
             [[ -z "$a_triple" ]] || triple="$a_triple"
             release_artifact_triples["$a_name"]="$triple"
-            artifact_candidates["$a_name"]=$(_release_artifact_candidate_names \
-                "$a_name" "$a_target" "$a_format" "$triple") || return 4
+            if [[ -n "$companion_target" ]]; then
+                # Companions, including archives, never acquire the primary
+                # binary's versioned, compatibility or architecture aliases.
+                artifact_candidates["$a_name"]="$a_name"
+            else
+                artifact_candidates["$a_name"]=$(_release_artifact_candidate_names \
+                    "$a_name" "$a_target" "$a_format" "$triple") || return 4
+            fi
             while IFS= read -r candidate; do
                 [[ -n "$candidate" ]] || continue
                 claimants["$candidate"]+="$a_name"$'\n'
@@ -10586,6 +10678,7 @@ EOF
     local digest_mismatches=()
     local checksum_errors=()
     local verified_checksums=()
+    local -a ordinary_repair_errors=()
 
     # Get list of actual asset names from release
     local actual_assets=()
@@ -10756,7 +10849,7 @@ EOF
         for planned_fix in ${planned_fixes[@]+"${planned_fixes[@]}"}; do
             log_info "[dry-run] Would upload: $planned_fix"
         done
-    elif $fix_missing && { $release_contract_enabled || [[ ${#assets_to_fix[@]} -gt 0 ]]; }; then
+    elif $fix_missing; then
         planned_fixes=(${assets_to_fix[@]+"${assets_to_fix[@]}"})
         if [[ ${#assets_to_fix[@]} -gt 0 ]]; then
             if $release_contract_enabled; then
@@ -10979,36 +11072,164 @@ EOF
                 fi
             fi
         else
-            for missing in "${assets_to_fix[@]}"; do
-                local file_path="$artifacts_dir/$missing"
-                if [[ -f "$file_path" ]]; then
-                    log_info "  Uploading: $missing"
-                    if secrets_run_gh release upload "$tag" "$file_path" \
-                        --repo "github.com/$repo" --clobber >/dev/null 2>&1; then
-                        log_ok "    Uploaded"
-                        present_assets+=("$missing")
-                    else
-                        log_error "    Upload failed"
-                    fi
-                else
-                    log_warn "  Not found locally: $missing"
-                fi
-            done
+            # Repair must retain the selected release and artifact bytes. A
+            # successful upload response alone does not prove the final release
+            # still serves the requested asset.
+            local repair_identity="" repair_upload_url="" repair_manifest_sha="" repair_rows=""
+            local repair_result="" repair_asset="" repair_inventory=""
+            local -A repair_shas=() repair_sizes=() repair_remote_ids=()
 
-            # Re-check missing assets using the successful local upload results.
-            missing_assets=()
-            for expected in "${expected_assets[@]}"; do
-                local found=false
-                for present in "${present_assets[@]}"; do
-                    if [[ "$expected" == "$present" ]]; then
-                        found=true
+            _release_ordinary_repair_identity() {
+                jq -ces --arg repo "$repo" --arg tag "$tag" --argjson id "$release_id" '
+                    if length == 1 and (.[0] | type == "object") then .[0]
+                    else error("expected one release") end |
+                    (.upload_url | capture("^https://uploads[.]github[.]com/repos/(?<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/releases/(?<id>[1-9][0-9]*)/assets(?:\\{\\?name,label\\})?$")) as $upload |
+                    select(($id | type == "number" and floor == . and . > 0 and . <= 9007199254740991) and
+                        .id == $id and .tag_name == $tag and
+                        (.draft | type == "boolean") and (.prerelease | type == "boolean") and
+                        (.target_commitish | type == "string" and length > 0) and
+                        ($upload.repo | ascii_downcase) == ($repo | ascii_downcase) and
+                        $upload.id == ($id | tostring)) |
+                    {id,tag_name,draft,prerelease,target_commitish,upload_url}
+                ' <<< "$1"
+            }
+
+            _release_ordinary_repair_context_matches() {
+                local observed identity encoded_tag
+                observed=$(gh_api "repos/$repo/releases/$release_id" --no-cache) || return 1
+                identity=$(_release_ordinary_repair_identity "$observed") || return 1
+                [[ "$identity" == "$repair_identity" ]] || return 1
+                encoded_tag=$(jq -rn --arg tag "$tag" '$tag | @uri') || return 1
+                observed=$(gh_api "repos/$repo/releases/tags/$encoded_tag" --no-cache) || return 1
+                identity=$(_release_ordinary_repair_identity "$observed") || return 1
+                [[ "$identity" == "$repair_identity" ]]
+            }
+
+            _release_ordinary_repair_verify_asset() (
+                local name="$1" asset="$2" work cleanup
+                umask 077
+                work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-repair-verify.XXXXXXXX") || return 1
+                printf -v cleanup 'rm -f -- %q; rmdir -- %q 2>/dev/null || true' "$work/verified" "$work"
+                # shellcheck disable=SC2064 # Freeze our private paths before EXIT.
+                trap "$cleanup" EXIT
+                trap 'exit 5' INT TERM
+                _gh_verify_uploaded_asset "$repo" "$name" "${repair_sizes[$name]}" \
+                    "${repair_shas[$name]}" "$asset" "$work" >/dev/null
+            )
+
+            _release_ordinary_repair_inventory() {
+                local page=1 response count inventory='[]'
+                while ((page <= 100)); do
+                    response=$(gh_api "repos/$repo/releases/$release_id/assets?per_page=100&page=$page" \
+                        --no-cache) || return 1
+                    if ! jq -es '
+                        length == 1 and (.[0] | type == "array" and length <= 100 and
+                            all(.[]; type == "object" and
+                                (.id | type == "number" and floor == . and . > 0 and
+                                    . <= 9007199254740991) and
+                                (.name | type == "string" and length > 0 and
+                                    (test("[[:cntrl:]]") | not))))
+                    ' <<< "$response" >/dev/null; then
+                        return 1
+                    fi
+                    count=$(jq -r 'length' <<< "$response") || return 1
+                    # Feed growing JSON through stdin, never an external
+                    # command argument. Preserve one complete observation for
+                    # every required name instead of mixing repeated scans.
+                    inventory=$(printf '%s\n%s\n' "$inventory" "$response" |
+                        jq -cs '.[0] + .[1]') || return 1
+                    if ((count < 100)); then
+                        jq -ce '
+                            select((([.[].id] | unique | length) == length) and
+                                   (([.[].name] | unique | length) == length))
+                        ' <<< "$inventory"
+                        return $?
+                    fi
+                    page=$((page + 1))
+                done
+                # A full final page cannot prove that pagination ended.
+                return 1
+            }
+
+            if ! repair_identity=$(_release_ordinary_repair_identity "$release_json") ||
+               ! repair_upload_url=$(jq -er '.upload_url' <<< "$repair_identity") ||
+               ! repair_manifest_sha=$(_gh_asset_sha256 "$manifest_file") ||
+               ! _gh_require_upload_inventory ||
+               ! signing_validate_release_inventory "$manifest_file" "$artifacts_dir" "$repair_manifest_sha" ||
+               ! repair_rows=$(jq -er '.artifacts[] | [.name,.sha256,(.size_bytes | tostring)] | @tsv' "$manifest_file") ||
+               [[ "$(_gh_asset_sha256 "$manifest_file")" != "$repair_manifest_sha" ]]; then
+                ordinary_repair_errors+=("Could not bind repair to the selected release and complete local manifest")
+            else
+                local repair_name repair_sha repair_size
+                # Final completeness follows the validated frozen manifest,
+                # including names absent from the earlier discovery response.
+                expected_assets=()
+                while IFS=$'\t' read -r repair_name repair_sha repair_size; do
+                    expected_assets+=("$repair_name")
+                    repair_shas["$repair_name"]="$repair_sha"
+                    repair_sizes["$repair_name"]="$repair_size"
+                done <<< "$repair_rows"
+
+                for missing in ${assets_to_fix[@]+"${assets_to_fix[@]}"}; do
+                    if ! _release_ordinary_repair_context_matches ||
+                       [[ "$(_gh_asset_sha256 "$manifest_file")" != "$repair_manifest_sha" ]]; then
+                        ordinary_repair_errors+=("Release identity or selected manifest changed before repair upload")
                         break
                     fi
+                    local file_path="$artifacts_dir/$missing"
+                    log_info "  Uploading by release ID: $missing"
+                    if repair_result=$(gh_upload_asset "$repair_upload_url" "$file_path" application/octet-stream); then
+                        repair_remote_ids["$missing"]=$(jq -er '.id' <<< "$repair_result") || {
+                            ordinary_repair_errors+=("Invalid upload receipt: $missing")
+                            continue
+                        }
+                    else
+                        ordinary_repair_errors+=("Verified upload failed: $missing")
+                    fi
                 done
-                if ! $found; then
-                    missing_assets+=("$expected")
+
+                # Observe release identity before the final asset snapshot so
+                # no later release response can contain ignored asset changes.
+                if ! _release_ordinary_repair_context_matches; then
+                    ordinary_repair_errors+=("Release identity changed after repair")
                 fi
+                # Derive every required name from the same complete paginated
+                # snapshot. Reject duplicate names/IDs and failed pagination
+                # rather than combining individually successful stale scans.
+                present_assets=()
+                missing_assets=()
+                if ! repair_inventory=$(_release_ordinary_repair_inventory); then
+                    ordinary_repair_errors+=("Could not read a complete, unambiguous remote asset inventory after repair")
+                else
+                    for expected in "${expected_assets[@]}"; do
+                        if ! repair_asset=$(jq -c --arg name "$expected" \
+                                '[.[] | select(.name == $name)] | .[0] // null' <<< "$repair_inventory"); then
+                            ordinary_repair_errors+=("Could not read final asset evidence for: $expected")
+                        elif [[ "$repair_asset" == null ]]; then
+                            missing_assets+=("$expected")
+                        elif [[ -n "${repair_remote_ids[$expected]:-}" &&
+                                "$(jq -r '.id' <<< "$repair_asset")" != "${repair_remote_ids[$expected]}" ]]; then
+                            ordinary_repair_errors+=("Repaired asset was replaced: $expected")
+                        elif _release_ordinary_repair_verify_asset "$expected" "$repair_asset"; then
+                            present_assets+=("$expected")
+                        else
+                            ordinary_repair_errors+=("Remote asset differs from the selected manifest: $expected")
+                        fi
+                    done
+                fi
+                if ! signing_validate_release_inventory "$manifest_file" "$artifacts_dir" "$repair_manifest_sha"; then
+                    ordinary_repair_errors+=("Selected manifest or artifact bytes changed after repair")
+                fi
+            fi
+            for repair_result in ${ordinary_repair_errors[@]+"${ordinary_repair_errors[@]}"}; do
+                log_error "$repair_result"
             done
+            if [[ ${#ordinary_repair_errors[@]} -gt 0 ]]; then
+                strict_remote_records_valid=false
+            elif [[ ${#missing_assets[@]} -eq 0 ]]; then
+                size_mismatches=()
+                digest_mismatches=()
+            fi
         fi
     fi
 
@@ -11023,6 +11244,7 @@ EOF
     if [[ ${#missing_assets[@]} -gt 0 ]] || [[ ${#size_mismatches[@]} -gt 0 ]] || \
         [[ ${#digest_mismatches[@]} -gt 0 ]] || \
         [[ ${#checksum_errors[@]} -gt 0 ]] || \
+        [[ ${#ordinary_repair_errors[@]} -gt 0 ]] || \
         { $release_contract_enabled && { [[ ${#extra_assets[@]} -gt 0 ]] || ! $strict_remote_records_valid; }; }; then
         status="incomplete"
         exit_code=1
@@ -11051,6 +11273,7 @@ EOF
             --argjson fix_requested "$fix_missing" \
             --argjson dry_run "${DRY_RUN:-false}" \
             --argjson planned_fixes "$(printf '%s\n' ${planned_fixes[@]+"${planned_fixes[@]}"} | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+            --argjson repair_errors "$(printf '%s\n' ${ordinary_repair_errors[@]+"${ordinary_repair_errors[@]}"} | jq -Rsc 'split("\n") | map(select(length > 0))')" \
             --argjson duration "$duration" \
             '{
                 repo: $repo,
@@ -11081,7 +11304,9 @@ EOF
                     errors: $checksum_errors
                 },
                 repair: (if $fix_requested then
-                    {dry_run: $dry_run, uploads: $planned_fixes} else null end),
+                    ({dry_run: $dry_run, uploads: $planned_fixes} +
+                     (if ($repair_errors | length) > 0 then {errors: $repair_errors} else {} end))
+                    else null end),
                 duration_seconds: $duration
             }')
         json_envelope "release-verify" "$status" "$exit_code" "$details"
@@ -11537,7 +11762,7 @@ EOF
                 length == 1 and (.[0] | .tool == $tool and .version == $version and
                 (.run_id | type == "string" and
                     test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")) and
-                (.status == "created" or .status == "running" or .status == "failed" or
+                (.status == "created" or .status == "running" or .status == "failed" or .status == "partial" or
                  .status == "targets-complete" or .status == "completed") and
                 (.git_sha | type == "string" and test("^[0-9a-f]{40}$")) and
                 (.context.output_dir | type == "string" and length > 0) and
@@ -15340,14 +15565,22 @@ cmd_installer() {
 
     case "$subcmd" in
         generate|validate) ;;
+        generate-release|install|describe-recipe)
+            _dsr_require installer_release_cli
+            installer_release_cli "$subcmd" "$@"
+            return $?
+            ;;
         --help|-h|help|"")
             cat << 'EOF'
-dsr installer - Generate and validate curl|bash installers
+dsr installer - Generate installers and install authenticated releases
 
 USAGE:
     dsr installer generate <tool>... [--output-dir DIR] [--dry-run]
     dsr installer generate --all [--output-dir DIR] [--dry-run]
     dsr installer validate <tool>... [--output-dir DIR]
+    dsr installer generate-release --policy FILE --public-key FILE --output FILE [--dry-run]
+    dsr installer install (--snapshot DIR | --fetch) --recipe FILE --prefix DIR [release policy...]
+    dsr installer describe-recipe --recipe FILE [--release-contract FILE --targets LIST]
 
 DESCRIPTION:
     Writes <output-dir>/<tool>/install.sh from repos.d/<tool>.yaml: platform
@@ -15363,10 +15596,22 @@ DESCRIPTION:
 
     validate checks syntax, ShellCheck and the required safety elements.
 
+    generate-release captures an explicit pinned release policy and trust key
+    in a standalone authenticated installer. install authenticates the complete
+    signed snapshot and atomically selects an executable/runtime-data generation.
+    These actions require exact release identity and trust inputs; they do not
+    discover a release or fall back to source. Each action's --help lists its
+    strict engine options. --json wraps its authoritative result in one envelope.
+    Generator dry-run validates without writing output or its lock. Installation
+    dry-run authenticates and extracts without changing the prefix; --fetch still
+    downloads the complete signed snapshot. describe-recipe is always read-only.
+
 EXIT CODES:
     0  - All installers generated/valid
     1  - Some tools failed
     4  - Invalid arguments or tool configuration
+
+    Authenticated actions preserve their engine's documented exit codes.
 EOF
             return 0
             ;;
@@ -16080,17 +16325,8 @@ cmd_docker() {
     shift 2>/dev/null || true
 
     case "$subcmd" in
-        build)
-            _docker_build "$@"
-            ;;
-        release)
-            _docker_release "$@"
-            ;;
-        sign)
-            _docker_sign "$@"
-            ;;
-        setup)
-            _docker_setup "$@"
+        build|release|sign|setup|verify|attest)
+            _docker_command "$subcmd" "$@"
             ;;
         --help|-h|help|"")
             cat << 'EOF'
@@ -16101,22 +16337,30 @@ USAGE:
     dsr docker release <tool> <version> --certificate-identity <id>
                        --certificate-oidc-issuer <https-url> [options]
     dsr docker sign <registry/repository@sha256:<digest>>
-    dsr docker setup
+    dsr docker verify <registry/repository@sha256:<digest>> [options]
+    dsr docker attest <registry/repository@sha256:<digest>> [options]
+    dsr docker setup [--dry-run]
 
 SUBCOMMANDS:
     build     Build multi-arch Docker image
     release   Build, push, sign, and attest image
     sign      Sign a digest-pinned image with cosign (keyless)
-    setup     Setup buildx builder
+    verify    Verify the image signature and every platform's SBOM attestation
+    attest    Repair platform SBOM attestations without rebuilding
+    setup     Prepare the named Buildx builder without changing global selection
 
 OPTIONS:
     --push              Push to GHCR after build (build only)
     --local             Build for local platform only (build only)
-    -p, --platform      Platforms (build only; default: linux/amd64,linux/arm64)
-    --skip-sign         Skip cosign signing (release only)
+    --repo-path DIR     Source checkout for build/release
+    --dockerfile FILE   Dockerfile inside the source checkout
+    --tag TAG           Additional explicit tag (repeatable; build/release)
+    --output OCI_TAR    OCI archive destination (build only)
+    -p, --platform      Exact Linux platform list (build/release/verify/attest)
+    --skip-sign         Skip the image signature only; SBOM checks remain
     --certificate-identity, --certificate-oidc-issuer
                         Keyless identity the release verifies its signature
-                        and SBOM attestation against (release only; or set
+                        and SBOM attestation against (release/verify/attest; or set
                         DOCKER_CERTIFICATE_IDENTITY / _OIDC_ISSUER)
     -n, --dry-run       Show what would be done
 
@@ -16135,239 +16379,76 @@ EXAMPLES:
         --certificate-oidc-issuer https://token.actions.githubusercontent.com
     dsr docker sign ghcr.io/dicklesworthstone/ubs@sha256:<64-hex digest>
                                              # Tags are refused: sign the digest
+    dsr --json --dry-run docker setup         # Plan without contacting Docker
 
 EXIT CODES:
     0  - Success
     1  - Build/operation failed
     3  - Dependency error (docker/buildx/cosign)
     4  - Invalid arguments
-    7  - No Dockerfile found
+    7  - Missing Dockerfile or invalid/mismatched evidence
+    8  - Registry read failed
 EOF
             return 0
             ;;
         *)
-            log_error "Unknown docker subcommand: $subcmd"
-            log_info "Run 'dsr docker --help' for usage"
-            return 4
+            _docker_command "$subcmd" "$@"
             ;;
     esac
 }
 
-_docker_build() {
-    local tool=""
-    local version=""
-    local push=false
-    local local_only=false
-    local platforms=""
-    local dry_run=false
-
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --push) push=true; shift ;;
-            --local) local_only=true; shift ;;
-            --platform|-p) platforms="$2"; shift 2 ;;
-            --dry-run|-n) dry_run=true; shift ;;
-            --help|-h) docker_build --help; return 0 ;;
-            -*) log_error "Unknown option: $1"; return 4 ;;
-            *)
-                if [[ -z "$tool" ]]; then
-                    tool="$1"
-                elif [[ -z "$version" ]]; then
-                    version="$1"
-                fi
-                shift
-                ;;
+# The module owns argument validation and operation receipts. This adapter only
+# adds DSR's envelope; successful planning is not evidence of completed work.
+_docker_command() {
+    local operation="$1" command_name=docker exit_code=0 output='' receipt=null
+    local dry="${DRY_RUN:-false}" help_requested=false arg start=$SECONDS details
+    shift
+    case "$operation" in
+        build|release|sign|setup|verify|attest) command_name="docker-$operation" ;;
+    esac
+    if ! $JSON_MODE; then
+        docker_command "$operation" "$@"
+        return $?
+    fi
+    for arg in "$@"; do
+        case "$arg" in
+            --dry-run|-n) dry=true ;;
+            --help|-h) help_requested=true ;;
         esac
     done
-
-    if [[ -z "$tool" || -z "$version" ]]; then
-        log_error "Tool and version required"
-        log_info "Usage: dsr docker build <tool> <version>"
-        return 4
-    fi
-
-    local start_time
-    start_time=$(date +%s)
-
-    local args=(--tool "$tool" --version "$version")
-    $push && args+=(--push)
-    $local_only && args+=(--local)
-    [[ -n "$platforms" ]] && args+=(--platform "$platforms")
-    $dry_run && args+=(--dry-run)
-
-    # As in _docker_release: the module's stdout JSON belongs in the envelope.
-    local build_output="" exit_code=0
-    if $JSON_MODE; then
-        build_output=$(docker_build "${args[@]}") || exit_code=$?
-    else
-        docker_build "${args[@]}" || exit_code=$?
-    fi
-    local duration=$(($(date +%s) - start_time))
-    if [[ $exit_code -eq 0 ]]; then
-        if $JSON_MODE; then
-            local image="$DOCKER_REGISTRY/$tool:v${version#v}"
-            json_envelope "docker-build" "ok" 0 "$(jq -nc \
-                --arg tool "$tool" \
-                --arg version "$version" \
-                --arg image "$image" \
-                --argjson pushed "$push" \
-                --arg result "$build_output" \
-                --argjson duration "$duration" \
-                '{tool: $tool, version: $version, image: $image, pushed: $pushed, duration_seconds: $duration,
-                  result: (if $result == "" then null else ($result | try fromjson catch $result) end)}')"
+    output=$(docker_command "$operation" "$@") || exit_code=$?
+    if [[ -n "$output" ]]; then
+        if ! receipt=$(jq -ce -s 'if length == 1 and (.[0] | type == "object") then .[0]
+            else error("expected one operation receipt") end' <<< "$output" 2>/dev/null); then
+            receipt=null
+            if [[ $exit_code -eq 0 ]]; then
+                log_error 'Container operation did not return one JSON receipt'
+                exit_code=1
+            fi
         fi
-        return 0
+    elif [[ $exit_code -eq 0 ]] && ! $help_requested; then
+        log_error 'Container operation returned no receipt'
+        exit_code=1
     fi
-    if $JSON_MODE; then
-        json_envelope "docker-build" "error" "$exit_code" "$(jq -nc \
-            --arg tool "$tool" \
-            --arg version "$version" \
-            --arg result "$build_output" \
-            --argjson duration "$duration" \
-            '{tool: $tool, version: $version, duration_seconds: $duration,
-              result: (if $result == "" then null else ($result | try fromjson catch $result) end)}')"
-    fi
-    return $exit_code
-}
-
-_docker_release() {
-    local tool=""
-    local version=""
-    local skip_sign=false
-    local dry_run=false
-    local -a policy_args=()
-
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --skip-sign) skip_sign=true; shift ;;
-            --dry-run|-n) dry_run=true; shift ;;
-            # The module verifies signatures and SBOM attestations against this
-            # keyless policy (also DOCKER_CERTIFICATE_IDENTITY/_OIDC_ISSUER).
-            --certificate-identity|--certificate-oidc-issuer)
-                if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
-                    log_error "$1 requires a value"
-                    return 4
-                fi
-                policy_args+=("$1" "$2")
-                shift 2
-                ;;
-            --help|-h) docker_release --help; return 0 ;;
-            -*) log_error "Unknown option: $1"; return 4 ;;
-            *)
-                if [[ -z "$tool" ]]; then
-                    tool="$1"
-                elif [[ -z "$version" ]]; then
-                    version="$1"
-                fi
-                shift
-                ;;
-        esac
-    done
-
-    if [[ -z "$tool" || -z "$version" ]]; then
-        log_error "Tool and version required"
-        log_info "Usage: dsr docker release <tool> <version> [--certificate-identity ID --certificate-oidc-issuer URL] [--skip-sign] [--dry-run]"
-        return 4
-    fi
-
-    local start_time
-    start_time=$(date +%s)
-
-    local args=(--tool "$tool" --version "$version")
-    $skip_sign && args+=(--skip-sign)
-    $dry_run && args+=(--dry-run)
-    [[ ${#policy_args[@]} -eq 0 ]] || args+=("${policy_args[@]}")
-
-    # The module prints its plan/result JSON on stdout. In --json mode that
-    # document goes inside the envelope, so stdout stays a single document.
-    local release_output="" exit_code=0
-    if $JSON_MODE; then
-        release_output=$(docker_release "${args[@]}") || exit_code=$?
-    else
-        docker_release "${args[@]}" || exit_code=$?
-    fi
-    local duration=$(($(date +%s) - start_time))
-    if [[ $exit_code -eq 0 ]]; then
-        if $JSON_MODE; then
-            local image="$DOCKER_REGISTRY/$tool:v${version#v}"
-            json_envelope "docker-release" "ok" 0 "$(jq -nc \
-                --arg tool "$tool" \
-                --arg version "$version" \
-                --arg image "$image" \
-                --arg result "$release_output" \
-                --argjson duration "$duration" \
-                '{tool: $tool, version: $version, image: $image, duration_seconds: $duration,
-                  result: (if $result == "" then null else ($result | try fromjson catch $result) end)}')"
-        fi
-        return 0
-    fi
-    if $JSON_MODE; then
-        json_envelope "docker-release" "error" "$exit_code" "$(jq -nc \
-            --arg tool "$tool" \
-            --arg version "$version" \
-            --arg result "$release_output" \
-            --argjson duration "$duration" \
-            '{tool: $tool, version: $version, duration_seconds: $duration,
-              result: (if $result == "" then null else ($result | try fromjson catch $result) end)}')"
-    fi
-    return $exit_code
-}
-
-_docker_sign() {
-    local image=""
-    local dry_run=false
-
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --dry-run|-n) dry_run=true; shift ;;
-            --help|-h) docker_sign --help; return 0 ;;
-            -*)
-                log_error "Unknown option: $1"
-                return 4
-                ;;
-            *)
-                [[ -z "$image" ]] && image="$1"
-                shift
-                ;;
-        esac
-    done
-
-    if [[ -z "$image" ]]; then
-        log_error "Image reference required"
-        log_info "Usage: dsr docker sign <image>"
-        return 4
-    fi
-
-    local args=("$image")
-    $dry_run && args+=(--dry-run)
-
-    if docker_sign "${args[@]}"; then
-        if $JSON_MODE; then
-            json_envelope "docker-sign" "ok" 0 "$(jq -nc --arg image "$image" '{image: $image, signed: true}')"
-        fi
-        return 0
-    else
-        local exit_code=$?
-        if $JSON_MODE; then
-            json_envelope "docker-sign" "error" "$exit_code" "$(jq -nc --arg image "$image" '{image: $image, signed: false}')"
-        fi
-        return $exit_code
-    fi
-}
-
-_docker_setup() {
-    if docker_setup_buildx; then
-        if $JSON_MODE; then
-            json_envelope "docker-setup" "ok" 0 "$(jq -nc --arg builder "$DOCKER_BUILDER_NAME" '{builder: $builder, ready: true}')"
-        fi
-        return 0
-    else
-        local exit_code=$?
-        if $JSON_MODE; then
-            json_envelope "docker-setup" "error" "$exit_code" '{"ready": false}'
-        fi
-        return $exit_code
-    fi
+    details=$(jq -nc --argjson result "$receipt" --argjson code "$exit_code" \
+        --arg operation "$operation" --argjson dry "$dry" --argjson duration "$((SECONDS-start))" '
+        ($result // {}) as $r | ($r.build // $r) as $build |
+        {status:(if $code != 0 then "error" elif $result == null then "help" else $r.status end),
+         dry_run:($dry or ($r.status == "planned")),duration_seconds:$duration,result:$result} +
+        (if $build.tool then {tool:$build.tool,version:$build.version} else {} end) +
+        (if ($build.tags[0] // $r.reference // $build.reference) then
+            {image:($build.tags[0] // $r.reference // $build.reference)} else {} end) +
+        (if $code != 0 then {}
+         elif $operation == "build" or $operation == "release" then
+            {pushed:($build.status == "built" and $build.exporter == "registry")}
+         elif $operation == "sign" then {signed:($r.signed == true),verified:false}
+         elif $operation == "setup" then
+            {ready:($code == 0 and $r.ready == true)} + (if $r.builder then {builder:$r.builder} else {} end)
+         else {} end)') || return 1
+    local envelope_status=success
+    [[ $exit_code -eq 0 ]] || envelope_status=error
+    json_envelope "$command_name" "$envelope_status" "$exit_code" "$details"
+    return "$exit_code"
 }
 
 # ============================================================================

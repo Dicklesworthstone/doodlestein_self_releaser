@@ -7,6 +7,18 @@ on:
       - src/github.sh
       - src/dispatch.sh
       - src/release_finalize_core.sh
+      - src/release_finalize.sh
+      - src/release_builds.sh
+      - src/release_bundle.sh
+      - src/release_packaging.sh
+      - src/release_packaging_pipeline.sh
+      - src/release_install.sh
+      - src/install_gen_release.sh
+      - src/installer_release_cli.sh
+      - src/docker.sh
+      - src/platforms.sh
+      - src/slsa.sh
+      - src/slsa_remote.sh
       - src/cargo_cache.sh
       - src/cargo_sources.sh
       - src/packaging.sh
@@ -17,6 +29,7 @@ on:
       - 'scripts/xwin*.sh'
       - 'scripts/tests/test_xwin*.sh'
       - schemas/manifest.json
+      - schemas/envelope.json
       - scripts/tests/test_json_schemas.sh
       - scripts/tests/test_cargo_cache.sh
       - scripts/tests/test_cargo_sources.sh
@@ -25,12 +38,29 @@ on:
       - scripts/tests/test_host_health.sh
       - scripts/tests/test_host_config_admission.sh
       - scripts/tests/test_release_resume.sh
+      - scripts/tests/test_release_verify.sh
+      - scripts/tests/test_release_builds.sh
+      - scripts/tests/test_release_builds_resume.sh
+      - scripts/tests/test_release_builds_recovery.sh
+      - scripts/tests/test_release_builds_admission.sh
+      - scripts/tests/test_release_build_plan_variants.sh
+      - scripts/tests/test_release_packaging.sh
+      - scripts/tests/test_release_packaging_variants.sh
+      - scripts/tests/test_release_install.sh
+      - scripts/tests/test_release_install_fetch.sh
+      - scripts/tests/test_release_install_variants.sh
+      - scripts/tests/test_generated_release_installer.sh
+      - scripts/tests/test_installer_release_cli.sh
+      - scripts/tests/test_docker_release.sh
+      - tests/unit/test_docker.bats
+      - scripts/tests/test_slsa_snapshot.sh
       - scripts/tests/test_release_source_only.sh
       - scripts/tests/test_release_source_only_exact_tag.sh
       - scripts/tests/test_dispatch_delivery.sh
       - scripts/tests/test_dispatch_outbox.sh
       - tests/unit/test_dispatch.bats
       - scripts/tests/test_fallback_pipeline.sh
+      - tests/integration/test_commands.bats
       - .github/workflows/release-regression.yml
 permissions:
   contents: read
@@ -38,6 +68,159 @@ concurrency:
   group: release-regression-refs/heads/main
   cancel-in-progress: false
 jobs:
+  container-workflow:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install container contract regression dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bats jq python3 python3-jsonschema shellcheck tar
+          mkdir -p "$RUNNER_TEMP/container-evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/container-evidence/head.txt"
+      - name: Validate public container commands and immutable evidence gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n dsr
+          bash -n src/docker.sh
+          bash -n scripts/tests/test_docker_release.sh
+          shellcheck -S warning src/docker.sh scripts/tests/test_docker_release.sh
+          bash scripts/tests/test_docker_release.sh 2>&1 | tee "$RUNNER_TEMP/container-evidence/container-workflow.log"
+          bats tests/unit/test_docker.bats 2>&1 | tee "$RUNNER_TEMP/container-evidence/container-unit.log"
+          test -z "$(git status --porcelain)"
+      - name: Retain container workflow evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: container-workflow-evidence
+          path: ${{ runner.temp }}/container-evidence
+          retention-days: 7
+          if-no-files-found: error
+  build-recovery:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install build recovery regression dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq python3 shellcheck util-linux coreutils procps
+          mkdir -p "$RUNNER_TEMP/build-recovery-evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/build-recovery-evidence/head.txt"
+      - name: Validate scheduling, durable completion, recovery and cancellation
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(src/release_builds.sh scripts/tests/test_release_builds.sh
+                 scripts/tests/test_release_builds_resume.sh scripts/tests/test_release_builds_recovery.sh
+                 scripts/tests/test_release_builds_admission.sh)
+          for source in "${files[@]}"; do
+            bash -n "$source"
+            shellcheck -S warning "$source"
+          done
+          for suite in release_builds release_builds_resume release_builds_recovery release_builds_admission; do
+            bash "scripts/tests/test_${suite}.sh" 2>&1 | tee "$RUNNER_TEMP/build-recovery-evidence/${suite}.log"
+          done
+          test -z "$(git status --porcelain)"
+      - name: Retain build recovery validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: build-recovery-evidence
+          path: ${{ runner.temp }}/build-recovery-evidence
+          retention-days: 7
+          if-no-files-found: error
+  build-packaging-contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install local packaging regression dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq python3 shellcheck gcc tar zip unzip xz-utils util-linux
+          mkdir -p "$RUNNER_TEMP/packaging-evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/packaging-evidence/head.txt"
+      - name: Validate exact build plans and shared-asset packaging
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(src/release_builds.sh src/release_packaging.sh src/release_packaging_pipeline.sh
+                 scripts/tests/test_release_build_plan_variants.sh scripts/tests/test_release_packaging.sh
+                 scripts/tests/test_release_packaging_variants.sh)
+          for source in "${files[@]}"; do
+            bash -n "$source"
+            shellcheck -S warning "$source"
+          done
+          bash scripts/tests/test_release_build_plan_variants.sh 2>&1 | tee "$RUNNER_TEMP/packaging-evidence/build-plan-variants.log"
+          bash scripts/tests/test_release_packaging.sh 2>&1 | tee "$RUNNER_TEMP/packaging-evidence/packaging.log"
+          bash scripts/tests/test_release_packaging_variants.sh 2>&1 | tee "$RUNNER_TEMP/packaging-evidence/packaging-variants.log"
+          test -z "$(git status --porcelain)"
+      - name: Retain packaging validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: build-packaging-contract-evidence
+          path: ${{ runner.temp }}/packaging-evidence
+          retention-days: 7
+          if-no-files-found: error
+  authenticated-installation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      DSR_TEST_MINISIGN_FIXTURE: '0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install signed installation regression dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq python3 python3-jsonschema minisign shellcheck gcc tar zip unzip xz-utils util-linux
+          mkdir -p "$RUNNER_TEMP/installation-evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/installation-evidence/head.txt"
+      - name: Validate complete authenticated installation generations
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(src/release_install.sh src/install_gen_release.sh src/installer_release_cli.sh
+                 scripts/tests/test_release_install.sh scripts/tests/test_release_install_fetch.sh
+                 scripts/tests/test_release_install_variants.sh scripts/tests/test_generated_release_installer.sh
+                 scripts/tests/test_installer_release_cli.sh)
+          for source in "${files[@]}"; do
+            bash -n "$source"
+            shellcheck -S warning "$source"
+          done
+          bash scripts/tests/test_release_install.sh 2>&1 | tee "$RUNNER_TEMP/installation-evidence/install.log"
+          bash scripts/tests/test_release_install_variants.sh 2>&1 | tee "$RUNNER_TEMP/installation-evidence/signed-variants-and-data.log"
+          bash scripts/tests/test_release_install_fetch.sh 2>&1 | tee "$RUNNER_TEMP/installation-evidence/fetch.log"
+          bash scripts/tests/test_generated_release_installer.sh 2>&1 | tee "$RUNNER_TEMP/installation-evidence/generated-installer.log"
+          bash scripts/tests/test_installer_release_cli.sh 2>&1 | tee "$RUNNER_TEMP/installation-evidence/public-installer.log"
+          test -z "$(git status --porcelain)"
+      - name: Retain installation validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: authenticated-installation-evidence
+          path: ${{ runner.temp }}/installation-evidence
+          retention-days: 7
+          if-no-files-found: error
   release-regression:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 15
@@ -50,7 +233,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends bats jq shellcheck curl util-linux golang-go
+          sudo apt-get install -y --no-install-recommends bats jq python3 rsync shellcheck curl util-linux golang-go
           mkdir -p "$RUNNER_TEMP/dsr-test-bin"
           GOBIN="$RUNNER_TEMP/dsr-test-bin" go install github.com/mikefarah/yq/v4@v4.47.1
           echo "$RUNNER_TEMP/dsr-test-bin" >> "$GITHUB_PATH"
@@ -68,6 +251,7 @@ jobs:
           bash ./dsr --version
           bash ./dsr fallback --help
           bash scripts/tests/test_fallback_pipeline.sh
+          bats --filter 'watch.*recovery' tests/integration/test_commands.bats
           bash scripts/tests/test_release_resume.sh
           bash scripts/tests/test_release_source_only.sh
           bash scripts/tests/test_release_source_only_exact_tag.sh
@@ -75,6 +259,30 @@ jobs:
           bash scripts/tests/test_dispatch_outbox.sh
           bats tests/unit/test_dispatch.bats
           bash scripts/tests/test_github.sh
+      - name: Verify ordinary repair against fresh remote receipts
+        shell: bash
+        run: |
+          set -euo pipefail
+          yq --version
+          bash -n scripts/tests/test_release_verify.sh
+          bash scripts/tests/test_release_verify.sh \
+            test_verify_fix_attempts_upload \
+            test_verify_fix_uses_selected_github_identity \
+            test_verify_fix_requires_remote_asset_after_upload \
+            test_verify_fix_rejects_changed_remote_bytes \
+            test_verify_fix_rejects_replaced_asset_id \
+            test_verify_fix_rejects_release_retag_after_upload \
+            test_verify_fix_stops_before_upload_after_release_retag \
+            test_verify_fix_final_observation_rejects_asset_flip \
+            test_verify_fix_verifies_complete_inventory_without_uploads \
+            test_verify_fix_rejects_complete_inventory_with_wrong_bytes \
+            test_verify_fix_accepts_repository_case_variation \
+            test_verify_fix_rejects_foreign_upload_repository \
+            test_verify_fix_rejects_empty_manifest \
+            test_verify_fix_reads_paginated_inventory \
+            test_verify_fix_reports_latest_inventory_coherently \
+            test_verify_fix_dry_run_uploads_nothing \
+            test_verify_fix_reports_not_found_locally
   private-cargo-cache:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 35

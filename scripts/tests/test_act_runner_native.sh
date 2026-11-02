@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_act_runner_native.sh - Unit tests for act_runner.sh native build SSH logic
 #
-# Usage: ./test_act_runner_native.sh [--typed-companions-only | --typed-companion-preflight-only]
+# Usage: ./test_act_runner_native.sh [--typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --workspace-archives-only]
 #
 # Tests native build SSH command construction with mocks.
 # Covers: command construction, path handling, env vars, SCP, error handling.
@@ -11,6 +11,781 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SRC_DIR="$PROJECT_ROOT/src"
+
+# Real native allocation/collection/manifest code with controlled remote
+# admission, transport and Rust cache protocol responses. No compiler, network
+# request or native Windows execution is claimed. Every fixture is retained.
+test_native_attempt_isolation() {
+    local dependency
+    for dependency in python3 yq jq git; do
+        command -v "$dependency" >/dev/null || { printf 'Missing test dependency: %s\n' "$dependency" >&2; return 3; }
+    done
+    python3 - "$PROJECT_ROOT" <<'PY'
+import copy
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import subprocess
+import sys
+import tempfile
+
+root = Path(sys.argv[1])
+work = Path(tempfile.mkdtemp(prefix='dsr-native-attempts-'))
+print('Retained native attempt evidence: ' + str(work), flush=True)
+checks = failures = 0
+run_id = '11111111-1111-4111-8111-111111111111'
+triple = 'x86_64-pc-windows-msvc'
+module = Path(os.environ.get('DSR_NATIVE_ATTEMPT_MODULE', str(root / 'src/act_runner.sh')))
+
+
+def check(label, condition):
+    global checks, failures
+    checks += 1
+    failures += not condition
+    print(('PASS: ' if condition else 'FAIL: ') + label, flush=True)
+
+
+def save(path, value):
+    path.write_text(json.dumps(value, sort_keys=True) + '\n')
+
+
+def snapshot(paths):
+    result = {}
+    for path in map(Path, paths):
+        info = path.stat()
+        result[str(path)] = (info.st_dev, info.st_ino, stat.S_IMODE(info.st_mode),
+                            info.st_size, hashlib.sha256(path.read_bytes()).hexdigest())
+    return result
+
+
+program = r'''
+source "$DSR_ATTEMPT_PROJECT/src/config.sh" || exit $?
+source "$DSR_ATTEMPT_MODULE" || exit $?
+host_health_is_ready() { [[ "${DSR_ATTEMPT_HEALTH:-healthy}" == healthy ]]; }
+_act_ssh_exec() {
+    local decoded
+    decoded=$(_act_windows_command_script "$2") || return 94
+    if [[ "$decoded" == *'Launcher parent is not a plain directory'* ]]; then
+        printf '%s\n' "$DSR_ATTEMPT_LABEL" >> "$DSR_ATTEMPT_CASE/launcher-events"
+        return 0
+    fi
+    [[ "$decoded" == *'Launcher digest mismatch'* ]] || return 95
+    printf 'remote invocation %s\n' "$DSR_ATTEMPT_LABEL" >> "$DSR_ATTEMPT_CASE/transport-events"
+    if [[ -n "${DSR_ATTEMPT_BARRIER:-}" ]]; then
+        : > "$DSR_ATTEMPT_BARRIER/$DSR_ATTEMPT_LABEL"
+        while [[ $(find "$DSR_ATTEMPT_BARRIER" -type f | wc -l) -lt 2 ]]; do sleep 0.05; done
+    fi
+    printf 'controlled remote output: %s\n' "$DSR_ATTEMPT_LABEL"
+    return "${DSR_ATTEMPT_EXIT:-0}"
+}
+scp() {
+    local destination="${!#}" source="${*: -2:1}"
+    # Guarded PowerShell programs may be staged through this same transport.
+    if [[ "$destination" == *:* ]]; then
+        [[ "$destination" == */launcher-*/build.ps1 ]] || return 96
+        cp "$source" "$DSR_ATTEMPT_CASE/$DSR_ATTEMPT_LABEL.guard.ps1"
+        return $?
+    fi
+    cp "$DSR_ATTEMPT_INPUTS/${source##*/}" "$destination"
+}
+ssh() {
+    local command="${!#}" decoded path
+    decoded=$(_act_windows_command_script "$command") || return 91
+    [[ "$decoded" == *"[IO.File]::OpenRead('"* ]] || return 92
+    path="${decoded#*OpenRead(\'}"
+    path="${path%%\'*}"
+    cat "$DSR_ATTEMPT_INPUTS/${path##*/}"
+}
+# These two responses isolate native attempt storage from the independently
+# tested remote Cargo cache implementation. Collection and receipts stay real.
+_act_prepare_windows_nonstrict_cargo_home() {
+    jq -nc --arg home "$4" '{mode:"private-copy",cargo_home:$home,
+        receipt_sha256:("3"*64),inventory_sha256:("4"*64),file_count:0,size_bytes:0,caches:[]}'
+}
+_act_finish_windows_private_cargo_home() {
+    jq -nc --arg home "$2" '{mode:"inventory",cargo_home:$home,
+        receipt_sha256:("5"*64),inventory_sha256:("4"*64),file_count:0,size_bytes:0,caches:[]}'
+}
+if [[ "${DSR_ATTEMPT_MKTEMP_FAIL:-}" == logs ]]; then
+    mktemp() {
+        if [[ "$*" == *"$ACT_LOGS_DIR/"* ]]; then
+            printf 'controlled native log allocation failure\n' >&2
+            return 19
+        fi
+        command mktemp "$@"
+    }
+fi
+case "$DSR_ATTEMPT_OPERATION" in
+    build)
+        selected='' source_root=''
+        [[ "$DSR_ATTEMPT_MODE" != variant ]] || selected=x86_64-pc-windows-msvc
+        [[ "$DSR_ATTEMPT_MODE" != strict ]] || source_root=C:/fixture/release/source
+        act_run_native_build attempt windows/amd64 1.0.0 "$DSR_ATTEMPT_RUN" \
+            "$source_root" '' '' fixture "$selected"
+        ;;
+    receipts) _act_result_artifact_receipts "$(cat "$DSR_ATTEMPT_RESULT")" ;;
+    available) _act_target_result_available "$(cat "$DSR_ATTEMPT_RESULT")" ;;
+    manifest) act_generate_manifest "$(cat "$DSR_ATTEMPT_RESULT")" "$DSR_ATTEMPT_MANIFEST" ;;
+    *) exit 93 ;;
+esac
+'''
+
+
+def prepare(name, mode='ordinary'):
+    case = work / name
+    (case / 'config/repos.d').mkdir(parents=True)
+    source = case / 'source'
+    source.mkdir()
+    (source / 'main.go').write_text('package main\nfunc main() {}\n')
+    subprocess.run(['git', '-C', str(source), 'init', '-q', '-b', 'main'], check=True)
+    blob = subprocess.check_output(['git', '-C', str(source), 'hash-object', '-w', 'main.go']).decode().strip()
+    tree = subprocess.check_output(['git', '-C', str(source), 'mktree'],
+                                   input=('100644 blob ' + blob + '\tmain.go\n').encode()).decode().strip()
+    sha = subprocess.check_output(['git', '-C', str(source), '-c', 'user.name=DSR fixture',
+        '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false',
+        'commit-tree', tree, '-m', 'Native attempt custody fixture']).decode().strip()
+    save(case / 'config/repos.yaml', {'tools': {}})
+    save(case / 'config/hosts.yaml', {'hosts': {'fixture': {
+        'platform': 'windows/amd64', 'connection': 'ssh', 'ssh_host': 'fixture.invalid', 'enabled': True}}})
+    config = {'tool_name': 'attempt', 'repo': 'owner/attempt', 'local_path': str(source),
+        'host_paths': {'fixture': 'C:/fixture/attempt'}, 'language': 'go', 'binary_name': 'attempt',
+        'build_cmd': 'go build -o attempt.exe', 'targets': ['windows/amd64'],
+        'act_job_map': {'windows/amd64': None},
+        'workspace_additional_artifacts': {'windows/amd64': [{'name': 'metadata.json', 'format': 'json'}]}}
+    if mode == 'variant':
+        config.update(language='rust', build_cmd='cargo build --release --target ${target_triple}',
+                      target_triples={'windows/amd64': triple})
+    save(case / 'config/repos.d/attempt.yaml', config)
+    env = dict(os.environ, DSR_CONFIG_DIR=str(case / 'config'), DSR_REPOS_FILE=str(case / 'config/repos.yaml'),
+        DSR_HOSTS_FILE=str(case / 'config/hosts.yaml'), DSR_STATE_DIR=str(case / 'state'),
+        ACT_ARTIFACTS_DIR=str(case / 'artifacts'), ACT_LOGS_DIR=str(case / 'logs'),
+        DSR_ATTEMPT_PROJECT=str(root), DSR_ATTEMPT_MODULE=str(module), DSR_ATTEMPT_CASE=str(case),
+        DSR_ATTEMPT_RUN=run_id, DSR_ATTEMPT_MODE=mode, DSR_ATTEMPT_OPERATION='build',
+        RCH_REQUIRE_REMOTE='0', NO_COLOR='1')
+    return case, env, sha
+
+
+def launch(context, label, **overrides):
+    case, env, _ = context
+    inputs = case / ('inputs-' + label)
+    inputs.mkdir()
+    header = b'MZ' + b'\0' * 58 + b'\x40\0\0\0PE\0\0\x64\x86' + b'\0' * 18 + b'\x0b\x02' + b'\0' * 6
+    (inputs / 'attempt.exe').write_bytes(header + ('inert fixture ' + label + '\n').encode())
+    save(inputs / 'metadata.json', {'attempt': label})
+    child_env = dict(env, DSR_ATTEMPT_LABEL=label, DSR_ATTEMPT_INPUTS=str(inputs), **overrides)
+    return subprocess.Popen(['bash', '-c', program], env=child_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def finish(context, label, process):
+    case, env, _ = context
+    stdout, stderr = process.communicate(timeout=45)
+    (case / (label + '.stdout')).write_bytes(stdout)
+    (case / (label + '.stderr')).write_bytes(stderr)
+    rows = [line for line in stdout.splitlines() if line.startswith(b'{')]
+    result = json.loads(rows[-1]) if rows else {}
+    if result.get('status') == 'success':
+        result_path = case / (label + '.result.json')
+        save(result_path, result)
+        observed = subprocess.run(['bash', '-c', program], env=dict(env,
+            DSR_ATTEMPT_OPERATION='receipts', DSR_ATTEMPT_RESULT=str(result_path)),
+            capture_output=True, timeout=20)
+        if observed.returncode:
+            raise AssertionError('Cannot read actual collected receipts: ' + observed.stderr.decode())
+        result['resume_artifacts'] = json.loads(observed.stdout)
+    save(case / (label + '.result.json'), result)
+    return process.returncode, result
+
+
+def build(context, label, **overrides):
+    return finish(context, label, launch(context, label, **overrides))
+
+
+def retained_paths(result):
+    return [result['log_file'], *[row['path'] for row in result['resume_artifacts']]]
+
+
+def accepted(context, label, outcome):
+    code, result = outcome
+    check(label + ': native collection succeeds', code == 0 and result.get('status') == 'success')
+    guard = context[0] / (label + '.guard.ps1')
+    check(label + ': Windows compiler uses its retained private file guard',
+          guard.is_file() and '$dsrBuildDirectoryHandles=' in guard.read_text() and
+          label in (context[0] / 'launcher-events').read_text().splitlines())
+    check(label + ': primary name and physical target are unchanged',
+          result.get('platform') == 'windows/amd64' and result.get('method') == 'native' and
+          [Path(p).name for p in result.get('artifact_paths', [])] == ['attempt.exe'])
+    check(label + ': typed companion has its own complete held receipt',
+          [Path(r['path']).name for r in result.get('additional_artifacts', [])] == ['metadata.json'] and
+          len(result.get('resume_artifacts', [])) == 2)
+    check(label + ': actual primary and companion bytes belong to this attempt',
+          Path(result['artifact_paths'][0]).read_bytes().endswith(('inert fixture ' + label + '\n').encode()) and
+          json.loads(Path(result['additional_artifacts'][0]['path']).read_text()) == {'attempt': label})
+    check(label + ': native log contains its own remote output',
+          ('controlled remote output: ' + label) in Path(result['log_file']).read_text())
+    check(label + ': log directory and file have private permissions',
+          stat.S_IMODE(Path(result['log_file']).parent.stat().st_mode) == 0o700 and
+          stat.S_IMODE(Path(result['log_file']).stat().st_mode) == 0o600)
+    return result
+
+
+def admission(context, label, result):
+    case, env, sha = context
+    receipt = case / (label + '.readback.json')
+    save(receipt, result)
+    available = subprocess.run(['bash', '-c', program], env=dict(env,
+        DSR_ATTEMPT_OPERATION='available', DSR_ATTEMPT_RESULT=str(receipt)), capture_output=True, timeout=20)
+    check(label + ': production resume verifies the original bytes after later attempts', available.returncode == 0)
+    inventory = {'tool': 'attempt', 'version': '1.0.0', 'run_id': run_id,
+        'git_sha': sha, 'git_ref': 'v1.0.0', 'status': 'success',
+        'summary': {'total': 1, 'success': 1, 'failed': 0}, 'duration_seconds': 0, 'targets': [result]}
+    save(receipt, inventory)
+    manifest = case / (label + '.manifest.json')
+    generated = subprocess.run(['bash', '-c', program], env=dict(env,
+        DSR_ATTEMPT_OPERATION='manifest', DSR_ATTEMPT_RESULT=str(receipt), DSR_ATTEMPT_MANIFEST=str(manifest)),
+        capture_output=True, timeout=30)
+    (case / (label + '.manifest.stderr')).write_bytes(generated.stderr)
+    check(label + ': production manifest still admits the complete original inventory', generated.returncode == 0)
+    if generated.returncode == 0:
+        actual = json.loads(manifest.read_text())['artifacts']
+        expected = {Path(r['path']).name: r['sha256'] for r in result['resume_artifacts']}
+        check(label + ': manifest hashes and owners match retained original receipts',
+              {r['name']: r['sha256'] for r in actual} == expected and
+              all(r['target'] == 'windows/amd64' for r in actual))
+
+
+context = prepare('sequential')
+case, env, _ = context
+legacy_payload = case / 'artifacts' / run_id / 'windows-amd64' / 'attempt.exe'
+legacy_payload.parent.mkdir(parents=True)
+legacy_payload.write_bytes(b'preexisting native payload must be retained\n')
+(case / 'logs').mkdir()
+legacy_log = case / 'logs' / ('attempt-windows-amd64-' + run_id + '.log')
+legacy_log.write_text('preexisting native log must be retained\n')
+legacy = snapshot([legacy_payload, legacy_log])
+first = accepted(context, 'first', build(context, 'first'))
+held = snapshot(retained_paths(first))
+second = accepted(context, 'second', build(context, 'second'))
+check('retry: earlier payload, companion and log bytes/inodes remain unchanged', snapshot(held) == held)
+check('retry: primary and companion attempt directories are distinct',
+      Path(first['artifact_paths'][0]).parent != Path(second['artifact_paths'][0]).parent and
+      Path(first['additional_artifacts'][0]['path']).parent != Path(second['additional_artifacts'][0]['path']).parent)
+check('retry: native logs have distinct paths', first['log_file'] != second['log_file'])
+check('retry: preexisting legacy payload and log remain unchanged', snapshot(legacy) == legacy)
+held_second = snapshot(retained_paths(second))
+code, failed = build(context, 'failed-retry', DSR_ATTEMPT_EXIT='23')
+check('failed retry: real nonzero transport becomes a failed build without artifacts',
+      code != 0 and failed.get('status') == 'failed' and failed.get('artifact_paths') == [] and
+      failed.get('additional_artifacts') == [])
+check('failed retry: its native log is retained separately',
+      failed.get('log_file') not in (first['log_file'], second['log_file']) and
+      'failed-retry' in Path(failed['log_file']).read_text())
+check('failed retry: both prior complete receipts and logs stay unchanged',
+      snapshot(held) == held and snapshot(held_second) == held_second)
+admission(context, 'first-after-retry', first)
+admission(context, 'second-after-failure', second)
+
+context = prepare('concurrent')
+barrier = context[0] / 'barrier'
+barrier.mkdir()
+left = launch(context, 'left', DSR_ATTEMPT_BARRIER=str(barrier))
+right = launch(context, 'right', DSR_ATTEMPT_BARRIER=str(barrier))
+a = accepted(context, 'left', finish(context, 'left', left))
+b = accepted(context, 'right', finish(context, 'right', right))
+check('concurrent: both native calls reached the remote barrier', len(list(barrier.iterdir())) == 2)
+check('concurrent: no payload, companion or log path is shared', set(retained_paths(a)).isdisjoint(retained_paths(b)))
+admission(context, 'left-after-peer', a)
+admission(context, 'right-after-peer', b)
+
+for mode in ('strict', 'variant'):
+    context = prepare(mode, mode)
+    a = accepted(context, mode + '-first', build(context, mode + '-first'))
+    before = snapshot(retained_paths(a))
+    b = accepted(context, mode + '-second', build(context, mode + '-second'))
+    check(mode + ': existing payload isolation and new log isolation both remain private',
+          set(retained_paths(a)).isdisjoint(retained_paths(b)) and snapshot(before) == before)
+    check(mode + ': target label remains present in the native log namespace',
+          'windows-amd64' in str(Path(a['log_file']).parent) and
+          (mode != 'variant' or triple in str(Path(a['log_file']).parent)))
+
+for obstruction in ('log-file', 'log-symlink', 'log-mktemp', 'unhealthy'):
+    context = prepare(obstruction)
+    case, env, _ = context
+    extra = {}
+    victim = case / 'retained-victim'
+    victim.mkdir()
+    (victim / 'marker').write_text('unchanged\n')
+    before = snapshot([victim / 'marker'])
+    if obstruction == 'log-file':
+        (case / 'logs').write_text('preexisting regular file\n')
+    elif obstruction == 'log-symlink':
+        (case / 'logs').symlink_to(victim, target_is_directory=True)
+    elif obstruction == 'log-mktemp':
+        extra['DSR_ATTEMPT_MKTEMP_FAIL'] = 'logs'
+    else:
+        extra['DSR_ATTEMPT_HEALTH'] = 'unhealthy'
+    code, result = build(context, obstruction, **extra)
+    check(obstruction + ': unavailable admission/log storage refuses the native build',
+          code == 4 and result.get('status') == 'error')
+    check(obstruction + ': no remote compiler invocation or artifact collection occurred',
+          not (case / 'transport-events').exists() and not (case / 'artifacts').exists())
+    check(obstruction + ': existing outside bytes remain unchanged', snapshot(before) == before)
+
+print('Native attempt isolation: %d checks, %d failures' % (checks, failures), flush=True)
+raise SystemExit(1 if failures else 0)
+PY
+}
+
+if [[ "${1:-}" == --attempt-isolation-only ]]; then
+    test_native_attempt_isolation
+    exit $?
+fi
+
+# Run the complete ordinary native backend with real local shell builds,
+# collection, archivers, worker receipts and manifest/resume readers. Admission
+# is controlled; no remote host or machine-code compiler is claimed. Faults
+# alter actual collected files at copy/archive boundaries, retaining evidence.
+test_native_workspace_archives() {
+    local dependency
+    for dependency in python3 yq jq git tar gzip xz zip unzip; do
+        command -v "$dependency" >/dev/null || { printf 'Missing test dependency: %s\n' "$dependency" >&2; return 3; }
+    done
+    python3 - "$PROJECT_ROOT" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import zipfile
+
+root = Path(sys.argv[1])
+module = Path(os.environ.get('DSR_TEST_ACT_RUNNER', str(root / 'src/act_runner.sh')))
+work = Path(tempfile.mkdtemp(prefix='dsr-native-workspace-archives-'))
+print('Retained native workspace archive evidence: ' + str(work), flush=True)
+checks = failures = 0
+run_id = '22222222-2222-4222-8222-222222222222'
+
+
+def check(label, condition):
+    global checks, failures
+    checks += 1
+    failures += not condition
+    print(('PASS: ' if condition else 'FAIL: ') + label, flush=True)
+
+
+def save(path, value):
+    path.write_text(json.dumps(value, sort_keys=True) + '\n')
+
+
+def snapshot(paths):
+    return {str(path): (path.stat().st_dev, path.stat().st_ino,
+            stat.S_IMODE(path.stat().st_mode), path.read_bytes()) for path in map(Path, paths)}
+
+
+program = r'''
+set -uo pipefail
+umask 022
+source "$DSR_WS_PROJECT/src/config.sh" || exit $?
+source "$DSR_WS_MODULE" || exit $?
+host_health_is_ready() { [[ "$DSR_WS_FAULT" != unhealthy ]]; }
+selector_acquire_slot() { return 0; }
+selector_release_slot() { return 0; }
+
+# The build command itself runs through the real local transport. These
+# wrappers affect only collection into its fresh artifact attempt directory.
+cp() {
+    local destination="${!#}" rc=0
+    if [[ "$destination" == "$ACT_ARTIFACTS_DIR/"*/helper &&
+          "$DSR_WS_FAULT" == collection-mutation ]]; then
+        python3 - "${destination%/*}/app" <<'MUTATE'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+p.write_bytes(p.read_bytes().replace(b'app:', b'APP:', 1))
+MUTATE
+        printf 'collection-mutation\n' > "$DSR_WS_CASE/$DSR_WS_LABEL.fault-observed"
+    fi
+    command cp "$@" || rc=$?
+    if [[ "$rc" == 0 && "$destination" == "$ACT_ARTIFACTS_DIR/"*/app &&
+          "$DSR_WS_FAULT" == collection-missing ]]; then
+        mv "$DSR_WS_SOURCE/helper" "$DSR_WS_SOURCE/helper.retained"
+        printf 'collection-missing\n' > "$DSR_WS_CASE/$DSR_WS_LABEL.fault-observed"
+    fi
+    if [[ "$rc" == 0 && "$destination" == "$ACT_ARTIFACTS_DIR/"*/helper &&
+          "$DSR_WS_FAULT" == occupied-output ]]; then
+        python3 - "${destination%/*}/occupied.zip" "$DSR_WS_CASE/$DSR_WS_LABEL.occupant.json" <<'OCCUPIED'
+import hashlib
+import json
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+with p.open('xb') as stream:
+    stream.write(b'preexisting archive output must remain unchanged\n')
+Path(sys.argv[2]).write_text(json.dumps({'path': str(p), 'device': p.stat().st_dev,
+    'inode': p.stat().st_ino, 'sha256': hashlib.sha256(p.read_bytes()).hexdigest()}))
+OCCUPIED
+        printf 'occupied-output\n' > "$DSR_WS_CASE/$DSR_WS_LABEL.fault-observed"
+    fi
+    return "$rc"
+}
+
+_ws_archiver() {
+    local kind="$1" create=false rc=0
+    shift
+    if [[ "$kind" == zip ]]; then
+        create=true
+    else
+        local argument
+        for argument in "$@"; do
+            case "$argument" in -c*|--create) create=true ;; esac
+        done
+    fi
+    if $create && [[ "$PWD" == "$ACT_ARTIFACTS_DIR/"* ]]; then
+        case "$DSR_WS_FAULT" in
+            archive-missing)
+                mv helper helper.retained || return 96
+                ;;
+            archive-mutation)
+                python3 - helper <<'MUTATE'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+p.write_bytes(p.read_bytes().replace(b'helper:', b'HELPER:', 1))
+MUTATE
+                ;;
+            archive-mode) chmod 644 helper || return 96 ;;
+            archive-include-mutation)
+                python3 - LICENSE <<'MUTATE'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+p.write_bytes(p.read_bytes().replace(b'complete', b'COMPLETE', 1))
+MUTATE
+                ;;
+            archive-data-mutation)
+                python3 - metadata.json <<'MUTATE'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+p.write_bytes(p.read_bytes().replace(b'attempt', b'ATTEMPT', 1))
+MUTATE
+                ;;
+            archive-extra)
+                printf 'unrequested archive member\n' > unrequested.txt
+                set -- "$@" unrequested.txt
+                ;;
+        esac
+        printf '%s\n' "$PWD" > "$DSR_WS_CASE/$DSR_WS_LABEL.archive-directory"
+        printf '%s\n' "$DSR_WS_FAULT" > "$DSR_WS_CASE/$DSR_WS_LABEL.fault-observed"
+    fi
+    if [[ "$kind" == zip ]]; then
+        "$DSR_WS_REAL_ZIP" "$@" || rc=$?
+    else
+        "$DSR_WS_REAL_TAR" "$@" || rc=$?
+    fi
+    if $create && [[ "$PWD" == "$ACT_ARTIFACTS_DIR/"* ]]; then
+        printf '%s %s\n' "$kind" "$rc" >> "$DSR_WS_CASE/$DSR_WS_LABEL.archiver-status"
+        # Model an archiver that reports a write/finalization failure after
+        # producing bytes; the archive is made by the genuine tool above.
+        [[ "$DSR_WS_FAULT" != archive-exit ]] || return 23
+    fi
+    return "$rc"
+}
+tar() { _ws_archiver tar "$@"; }
+if [[ "$DSR_WS_FAULT" != missing-zip ]]; then
+    zip() { _ws_archiver zip "$@"; }
+else
+    if command -v zip >/dev/null 2>&1; then exit 97; fi
+    printf 'zip unavailable on actual PATH\n' > "$DSR_WS_CASE/$DSR_WS_LABEL.fault-observed"
+fi
+
+case "$DSR_WS_OPERATION" in
+    native)
+        act_run_native_build workspace linux/amd64 1.0.0 "$DSR_WS_RUN" '' '' '' fixture
+        ;;
+    worker)
+        _act_run_target_worker workspace 1.0.0 "$DSR_WS_RUN" linux/amd64 \
+            "$DSR_WS_ATTEMPT" "$DSR_WS_CASE/$DSR_WS_LABEL.worker.log" "$DSR_WS_RESULT" \
+            false null '{}' '' '' fixture release
+        ;;
+    receipts) _act_result_artifact_receipts "$(cat "$DSR_WS_RESULT")" ;;
+    available) _act_target_result_available "$(cat "$DSR_WS_RESULT")" ;;
+    manifest) act_generate_manifest "$(cat "$DSR_WS_RESULT")" "$DSR_WS_MANIFEST" ;;
+    *) exit 98 ;;
+esac
+'''
+
+
+def prepare(name, extension, naming=None):
+    case = work / name
+    (case / 'config/repos.d').mkdir(parents=True)
+    source = case / 'source'
+    (source / 'docs').mkdir(parents=True)
+    includes = {'LICENSE': (b'complete license\n', 0o644), 'EMPTY': (b'', 0o644),
+                'docs/README.md': (b'workspace installation notes\n', 0o644),
+                'install.sh': (b'#!/usr/bin/env bash\nprintf "install\\n"\n', 0o755)}
+    for name, (content, mode) in includes.items():
+        (source / name).write_bytes(content)
+        (source / name).chmod(mode)
+    (source / 'build.sh').write_text('''#!/usr/bin/env bash
+set -uo pipefail
+printf '%s\\n' "$DSR_WS_LABEL" >> "$DSR_WS_CASE/build-events"
+cp "$DSR_WS_INPUTS/app" app && cp "$DSR_WS_INPUTS/helper" helper &&
+    cp "$DSR_WS_INPUTS/metadata.json" metadata.json && cp "$DSR_WS_INPUTS/verify.sh" verify.sh
+''')
+    subprocess.run(['git', '-C', str(source), 'init', '-q', '-b', 'main'], check=True)
+    subprocess.run(['git', '-C', str(source), 'add', '.'], check=True)
+    subprocess.run(['git', '-C', str(source), '-c', 'user.name=DSR fixture',
+                    '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false',
+                    'commit', '-qm', 'Ordinary workspace archive fixture'], check=True)
+    sha = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD']).decode().strip()
+    save(case / 'config/repos.yaml', {'tools': {}})
+    save(case / 'config/hosts.yaml', {'hosts': {'fixture': {
+        'platform': 'linux/amd64', 'connection': 'local', 'enabled': True, 'concurrency': 2}}})
+    config = {'tool_name': 'workspace', 'repo': 'owner/workspace', 'local_path': str(source),
+        'language': 'bash', 'binary_name': 'app', 'build_cmd': 'bash ./build.sh',
+        'targets': ['linux/amd64'], 'act_job_map': {'linux/amd64': None},
+        'workspace_binaries': ['app', 'helper'], 'archive_format': extension,
+        'include_files': list(includes), 'workspace_archive_files': {'linux/amd64': [
+            {'name': 'metadata.json', 'executable': False}, {'name': 'verify.sh', 'executable': True}]}}
+    if naming is not None:
+        config['artifact_naming'] = naming
+    save(case / 'config/repos.d/workspace.yaml', config)
+    env = dict(os.environ, DSR_CONFIG_DIR=str(case / 'config'),
+        DSR_REPOS_FILE=str(case / 'config/repos.yaml'), DSR_HOSTS_FILE=str(case / 'config/hosts.yaml'),
+        DSR_STATE_DIR=str(case / 'state'), ACT_REPOS_DIR=str(case / 'config/repos.d'),
+        ACT_ARTIFACTS_DIR=str(case / 'artifacts'), ACT_LOGS_DIR=str(case / 'logs'),
+        DSR_WS_PROJECT=str(root), DSR_WS_MODULE=str(module), DSR_WS_CASE=str(case),
+        DSR_WS_SOURCE=str(source), DSR_WS_RUN=run_id, DSR_WS_REAL_TAR=shutil.which('tar'),
+        DSR_WS_REAL_ZIP=shutil.which('zip'), RCH_REQUIRE_REMOTE='0', DSR_NATIVE_OUTPUT_STAGE='0', NO_COLOR='1')
+    return case, env, includes, sha
+
+
+def invoke(context, operation, label, **extra):
+    case, env, _, _ = context
+    child = dict(env, DSR_WS_LABEL=label, DSR_WS_OPERATION=operation, DSR_WS_FAULT='none',
+                 DSR_WS_RESULT=str(case / (label + '.result.json')))
+    child.update(extra)
+    result = subprocess.run(['bash', '-c', program], env=child, capture_output=True, timeout=75)
+    (case / (label + '.' + operation + '.stdout')).write_bytes(result.stdout)
+    (case / (label + '.' + operation + '.stderr')).write_bytes(result.stderr)
+    return result
+
+
+def build(context, label, fault='none', operation='native', attempt=1, path=None):
+    case, env, includes, _ = context
+    inputs = case / ('inputs-' + label)
+    inputs.mkdir()
+    payloads = {name: (('#!/usr/bin/env bash\nprintf "' + name + ':' + label + '\\n"\n').encode(), 0o755)
+                for name in ('app', 'helper')}
+    payloads.update({'metadata.json': ((json.dumps({'attempt': label}) + '\n').encode(), 0o644),
+                     'verify.sh': (b'#!/usr/bin/env bash\nprintf "verified\\n"\n', 0o755)})
+    for name, (content, mode) in payloads.items():
+        (inputs / name).write_bytes(content)
+        (inputs / name).chmod(mode)
+    kwargs = {'DSR_WS_FAULT': fault, 'DSR_WS_INPUTS': str(inputs), 'DSR_WS_ATTEMPT': str(attempt)}
+    if path is not None:
+        kwargs['PATH'] = path
+    process = invoke(context, operation, label, **kwargs)
+    result_file = case / (label + '.result.json')
+    if operation == 'worker' and result_file.exists():
+        result = json.loads(result_file.read_text())
+    else:
+        rows = [row for row in process.stdout.splitlines() if row.startswith(b'{')]
+        result = json.loads(rows[-1]) if rows else {}
+        save(result_file, result)
+    # Native declared non-binary members deliberately receive private modes
+    # during collection; their archive must preserve those collected modes.
+    expected = dict(includes, **payloads)
+    expected['metadata.json'] = (payloads['metadata.json'][0], 0o600)
+    expected['verify.sh'] = (payloads['verify.sh'][0], 0o700)
+    return process.returncode, result, expected
+
+
+def archive_members(path):
+    if path.name.endswith('.zip'):
+        with zipfile.ZipFile(path) as archive:
+            return {entry.filename: (archive.read(entry), (entry.external_attr >> 16) & 0o777)
+                    for entry in archive.infolist()}
+    with tarfile.open(path) as archive:
+        return {entry.name: (archive.extractfile(entry).read(), entry.mode & 0o777)
+                for entry in archive.getmembers()}
+
+
+def accepted(context, label, outcome):
+    code, result, expected = outcome
+    paths = result.get('artifact_paths', [])
+    good = code == 0 and result.get('status') == 'success' and len(paths) == 1
+    if good:
+        archive = Path(paths[0])
+        good = archive_members(archive) == expected
+        good = good and result.get('collected_sha256') == hashlib.sha256(archive.read_bytes()).hexdigest()
+        good = good and result.get('collected_size_bytes') == archive.stat().st_size
+        good = good and bool(result.get('collected_identity'))
+        # Execute the actual collected Bash payloads; no machine-code-shaped
+        # header or architecture validator is substituted for script support.
+        for binary in ('app', 'helper'):
+            ran = subprocess.run([str(archive.parent / binary)], capture_output=True, timeout=10)
+            good = good and ran.returncode == 0 and ran.stdout == (binary + ':' + label + '\n').encode()
+    check(label + ': real native Bash build produces one complete archive with frozen bytes and modes', good)
+    return result
+
+
+def refused(context, label, outcome, expected_code=7):
+    code, result, _ = outcome
+    check(label + ': failed packaging advertises no primary or companion artifact',
+          code == expected_code and result.get('status') == 'failed' and
+          result.get('exit_code') == expected_code and result.get('artifact_path', '') == '' and
+          result.get('artifact_paths', []) == [] and result.get('additional_artifacts', []) == [] and
+          not result.get('collected_sha256'))
+    # Native results acquire resume receipts at the real worker boundary.
+    # Freeze their actual advertised inventory before checking availability,
+    # so an incorrectly successful native result is not rejected merely for
+    # lacking worker metadata. Existing worker receipts remain untouched.
+    receipt_result = dict(result)
+    if 'build_purpose' not in result:
+        receipts = invoke(context, 'receipts', label)
+        if receipts.returncode == 0:
+            receipt_result['resume_artifacts'] = json.loads(receipts.stdout)
+    readback = context[0] / (label + '.resume-readback.json')
+    save(readback, receipt_result)
+    available = invoke(context, 'available', label, DSR_WS_RESULT=str(readback))
+    check(label + ': failed attempt cannot be reused as a completed release target', available.returncode != 0)
+    return result
+
+
+for extension in ('tar.gz', 'tar.xz', 'zip'):
+    context = prepare('success-' + extension, extension)
+    accepted(context, extension, build(context, extension))
+    for fault in ('archive-missing', 'archive-mutation', 'archive-mode', 'archive-exit'):
+        label = extension + '-' + fault
+        context = prepare(label, extension)
+        refused(context, label, build(context, label, fault))
+        case = context[0]
+        observed = case / (label + '.archiver-status')
+        check(label + ': genuine archiver ran against the altered collected inputs', observed.exists())
+        if fault == 'archive-missing' and observed.exists():
+            statuses = observed.read_text().splitlines()
+            fields = statuses[0].split() if len(statuses) == 1 else []
+            # GNU tar reports 2 here; BSD tar may report 1. Both must be
+            # actual nonzero exits, while ZIP's deceptive success is exact.
+            expected_status = (fields == ['zip', '0'] if extension == 'zip' else
+                               len(fields) == 2 and fields[0] == 'tar' and
+                               fields[1].isdigit() and int(fields[1]) != 0)
+            archives = list((case / 'artifacts').rglob('*.' + extension))
+            partial = len(archives) == 1 and 'helper' not in archive_members(archives[0])
+            check(label + ': real archiver leaves a readable partial archive with its genuine exit status',
+                  expected_status and partial)
+
+for fault in ('collection-mutation', 'collection-missing', 'archive-extra',
+              'archive-include-mutation', 'archive-data-mutation'):
+    context = prepare(fault, 'zip')
+    refused(context, fault, build(context, fault, fault))
+    check(fault + ': fault reached actual native collection or archiving',
+          (context[0] / (fault + '.fault-observed')).exists())
+
+context = prepare('occupied-output', 'zip', naming='occupied.zip')
+refused(context, 'occupied-output', build(context, 'occupied-output', 'occupied-output'))
+occupant = json.loads((context[0] / 'occupied-output.occupant.json').read_text())
+retained = Path(occupant['path'])
+check('occupied output: existing bytes and inode survive refusal before archiver execution',
+      (retained.stat().st_dev, retained.stat().st_ino, hashlib.sha256(retained.read_bytes()).hexdigest()) ==
+      (occupant['device'], occupant['inode'], occupant['sha256']) and
+      not (context[0] / 'occupied-output.archiver-status').exists())
+
+context = prepare('unknown-format', 'rar')
+refused(context, 'unknown-format', build(context, 'unknown-format'))
+
+# The search path contains actual executable tools but no zip executable.
+# This checks a missing dependency without pretending a failing zip is absent.
+without_zip = work / 'path-without-zip'
+without_zip.mkdir()
+for directory in os.environ['PATH'].split(os.pathsep):
+    if not directory or not Path(directory).is_dir():
+        continue
+    for entry in Path(directory).iterdir():
+        destination = without_zip / entry.name
+        if entry.name != 'zip' and not destination.exists() and not destination.is_symlink() and entry.is_file() and os.access(entry, os.X_OK):
+            destination.symlink_to(entry.resolve())
+context = prepare('missing-zip', 'zip')
+refused(context, 'missing-zip', build(context, 'missing-zip', 'missing-zip', path=str(without_zip)))
+check('missing zip: dependency absence is observed on the actual search path',
+      (context[0] / 'missing-zip.fault-observed').exists())
+
+# Real workers persist the receipts used by resume. A later failed or successful
+# retry must not mutate the earlier success, and failed archives never enter it.
+context = prepare('worker-retry', 'zip')
+first = accepted(context, 'first', build(context, 'first', operation='worker'))
+case = context[0]
+first_paths = [Path(row['path']) for row in first.get('resume_artifacts', [])]
+first_paths.append(case / 'first.result.json')
+if first.get('log_file'):
+    first_paths.append(Path(first['log_file']))
+before = snapshot(first_paths)
+failed = refused(context, 'failed', build(context, 'failed', 'archive-missing', operation='worker', attempt=2))
+third = accepted(context, 'retry', build(context, 'retry', operation='worker', attempt=3))
+check('worker retry: persisted failure and both successes represent genuine execution attempts',
+      (case / 'build-events').read_text().splitlines() == ['first', 'failed', 'retry'] and
+      not failed.get('resume_artifacts') and bool(first.get('resume_artifacts')) and bool(third.get('resume_artifacts')))
+check('worker retry: actual worker receipts retain release purpose and scheduled target identity',
+      all(row.get('build_purpose') == 'release' and row.get('publishable') is True and
+          row.get('task_key') == 'linux/amd64' and row.get('platform') == 'linux/amd64' and
+          row.get('host') == 'fixture' and row.get('method') == 'native' for row in (first, failed, third)))
+check('worker retry: prior archive, log and receipt bytes remain immutable',
+      snapshot(first_paths) == before and first.get('artifact_paths') != third.get('artifact_paths') and
+      invoke(context, 'available', 'first').returncode == 0 and invoke(context, 'available', 'retry').returncode == 0)
+
+inventory = {'tool': 'workspace', 'version': '1.0.0', 'run_id': run_id, 'git_sha': context[3],
+             'git_ref': 'v1.0.0', 'status': 'success', 'summary': {'total': 1, 'success': 1, 'failed': 0},
+             'duration_seconds': 0, 'targets': [first]}
+inventory_file = case / 'inventory.json'
+save(inventory_file, inventory)
+manifest = case / 'manifest.json'
+generated = invoke(context, 'manifest', 'publication', DSR_WS_RESULT=str(inventory_file), DSR_WS_MANIFEST=str(manifest))
+rows = json.loads(manifest.read_text()).get('artifacts', []) if generated.returncode == 0 else []
+check('publication: complete retained archive reaches the real manifest with its original hash and target',
+      generated.returncode == 0 and len(rows) == 1 and rows[0].get('target') == 'linux/amd64' and
+      rows[0].get('sha256') == first.get('collected_sha256'))
+
+failure_inventory = dict(inventory, targets=[failed])
+if failed.get('status') != 'success':
+    failure_inventory.update(status='failed', summary={'total': 1, 'success': 0, 'failed': 1})
+failure_file = case / 'failed-inventory.json'
+save(failure_file, failure_inventory)
+failure_manifest = case / 'failed-manifest.json'
+rejected = invoke(context, 'manifest', 'failed-publication', DSR_WS_RESULT=str(failure_file),
+                  DSR_WS_MANIFEST=str(failure_manifest))
+check('publication: incomplete worker output contributes no release artifact to the real manifest',
+      rejected.returncode != 0 or not json.loads(failure_manifest.read_text()).get('artifacts'))
+
+if third.get('artifact_paths'):
+    archive = Path(third['artifact_paths'][0])
+    with archive.open('ab') as stream:
+        stream.write(b'changed after worker completion\n')
+    check('resume: changed archive bytes cannot replace the frozen completed attempt',
+          invoke(context, 'available', 'retry').returncode != 0)
+
+context = prepare('unhealthy', 'zip')
+code, result, _ = build(context, 'unhealthy', 'unhealthy')
+check('readiness: explicit host refusal remains code 4 without any build or collection attempt',
+      code == 4 and result.get('stage') == 'host_readiness' and result.get('exit_code') == 4 and
+      not (context[0] / 'build-events').exists() and not (context[0] / 'artifacts').exists())
+
+print('Native workspace archives: %d checks, %d failures' % (checks, failures), flush=True)
+raise SystemExit(1 if failures else 0)
+PY
+}
+
+if [[ "${1:-}" == --workspace-archives-only ]]; then
+    test_native_workspace_archives
+    exit $?
+fi
 
 # Controlled admission boundaries through the complete production modules and
 # real configuration parsers. Healthy cases stop at transport resolution or
@@ -120,7 +895,8 @@ for label, route, health in cases:
                     ['health:first', 'health:second'] if route == 'late' else
                     ['health:act'] if route == 'local-alias' else ['health:first'])
         if route == 'act': expected = []
-        elif health == 'healthy': expected.append('contexts')
+        elif health == 'healthy':
+            expected += ['health:act' if route == 'local-alias' else 'health:first', 'contexts']
     else:
         arguments = ['act_run_native_build', 'tool', 'darwin/arm64', 'v0.0.0', 'fixture']
         if route in ('strict', 'missing-root', 'missing-host'):
@@ -177,6 +953,400 @@ if [[ "${1:-}" == --host-health-admission-tests ]]; then
     exit $?
 fi
 
+# Exercise real configuration, source/native consumers, writable-path inventory,
+# host observation program, disk policy, and fresh admission. Only raw machine
+# capacity and the downstream compiler/cache/transfer boundaries are controlled.
+# No fixture compiler result is represented as a successful release build.
+test_native_writable_path_admission() (
+    command -v python3 >/dev/null && command -v yq >/dev/null && command -v jq >/dev/null || return 3
+    python3 - "$PROJECT_ROOT" "${DSR_TEST_NATIVE_ADMISSION_MODULE:-$SRC_DIR/act_runner.sh}" <<'PY'
+import concurrent.futures
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import uuid
+
+project, module = map(Path, sys.argv[1:3])
+work = Path(tempfile.mkdtemp(prefix='dsr-native-paths-',
+                           dir=os.environ.get('DSR_NATIVE_ADMISSION_TEST_ROOT')))
+print('Retained native writable-path evidence:', work, flush=True)
+source = work / 'committed-source'
+source.mkdir()
+(source / 'tracked.txt').write_text('release source fixture\n')
+git = ['git', '-C', str(source)]
+subprocess.run(git + ['init', '-q', '-b', 'main'], check=True)
+subprocess.run(git + ['add', 'tracked.txt'], check=True)
+subprocess.run(git + ['-c', 'user.name=DSR Fixture', '-c', 'user.email=fixture@example.invalid',
+                     '-c', 'commit.gpgsign=false', 'commit', '-qm', 'Writable path fixture'], check=True)
+sha = subprocess.check_output(git + ['rev-parse', 'HEAD'], text=True).strip()
+
+observer = work / 'observe.py'
+observer.write_text(r'''import json, os, shlex, sys, types
+from pathlib import Path
+program = sys.stdin.read()
+lines = program.splitlines()
+argv = shlex.split(lines[0].split(' <<')[0])
+sys.argv = ['probe', *argv[3:]]
+code = '\n'.join(lines[1:-1])
+case = Path(os.environ['DSR_PATH_CASE'])
+selected = os.environ.get('DSR_PATH_FULL', '')
+if (case / 'capacity-dropped').exists():
+    selected = os.environ['DSR_PATH_DROP']
+original_stat = os.stat
+def limited(path):
+    text = str(path)
+    return selected and (text == selected or text.startswith(selected + '/'))
+def stat(path, *args, **kwargs):
+    result = original_stat(path, *args, **kwargs)
+    if limited(path):
+        values = list(result)
+        values[2] = 987654321
+        return os.stat_result(values)
+    return result
+def statvfs(path):
+    available = (2 if limited(path) else 60) * 1024**3
+    return types.SimpleNamespace(f_frsize=4096, f_bsize=4096,
+                                 f_bavail=available // 4096, f_blocks=100 * 1024**3 // 4096)
+os.stat, os.statvfs = stat, statvfs
+# Portable controlled Unix observations; the separate host-health suite owns
+# native APFS plist/container accounting. Real paths, nearest ancestors and
+# directory checks remain production code.
+sys.platform = 'linux'
+namespace = {'__name__': 'fixture'}
+exec(compile(code, 'production-writable-probe', 'exec'), namespace)
+namespace['main']()
+''')
+driver = work / 'driver.sh'
+driver.write_text(r'''#!/usr/bin/env bash
+set -uo pipefail
+source "$DSR_PATH_PROJECT/src/logging.sh" || exit $?
+source "$DSR_PATH_PROJECT/src/config.sh" || exit $?
+source "$DSR_PATH_PROJECT/src/host_health.sh" || exit $?
+source "$DSR_PATH_MODULE" || exit $?
+_hh_exec_on_host() {
+    if [[ "$4" == *DSR_UNIX_WRITABLE_PY* ]]; then
+        local result
+        result=$(printf '%s' "$4" | python3 "$DSR_PATH_OBSERVER") || return $?
+        printf '%s\n' "$result" >> "$DSR_PATH_CASE/observations.jsonl"
+        printf '%s\n' "$result"
+    else
+        "$BASH" -c "$4"
+    fi
+}
+_act_prepare_unix_private_cargo_home() {
+    printf 'prepare:strict\n' >> "$DSR_PATH_CASE/events"
+    return 97
+}
+_act_prepare_unix_nonstrict_cargo_home() {
+    printf 'prepare:ordinary\n' >> "$DSR_PATH_CASE/events"
+    if [[ "$DSR_PATH_MODE" != drop ]]; then return 97; fi
+    printf 'full\n' > "$DSR_PATH_CASE/capacity-dropped"
+    jq -nc --arg home "$4" '{cargo_home:$home,receipt_sha256:("1"*64)}'
+}
+_act_ssh_exec() { printf 'compile\n' >> "$DSR_PATH_CASE/events"; return 97; }
+_act_remove_build_stage_root() { return 0; }
+_act_sync_strict_checkout() { printf 'sync\n' >> "$DSR_PATH_CASE/events"; return 97; }
+_act_sync_source() { printf 'sync\n' >> "$DSR_PATH_CASE/events"; return 97; }
+_act_prepare_ordinary_source_root() { printf 'stage\n' >> "$DSR_PATH_CASE/events"; return 97; }
+_act_export_ordinary_git_contexts() { printf 'contexts\n' >> "$DSR_PATH_CASE/events"; return 97; }
+"$@"
+''')
+
+cases = [
+    ('strict-source-full', 'strict-sync', 'source', True),
+    ('strict-source-healthy', 'strict-sync', 'source', False),
+    ('recipe-temp-full', 'native', 'temp', True),
+    ('recipe-temp-healthy', 'native', 'temp', False),
+    ('ordinary-target-full', 'ordinary-rust', 'cargo_target', True),
+    ('ordinary-target-healthy', 'ordinary-rust', 'cargo_target', False),
+    ('strict-cache-full', 'strict-rust', 'cargo_cache', True),
+    ('strict-cache-healthy', 'strict-rust', 'cargo_cache', False),
+    ('ordinary-build-dir-full', 'ordinary-rust', 'cargo_build', True),
+    ('strict-build-dir-full', 'strict-rust', 'cargo_build', True),
+    ('same-host-second-temp-full', 'sync-two', 'temp', True),
+    ('same-host-second-temp-healthy', 'sync-two', 'temp', False),
+    ('strict-overridden-paths', 'strict-overridden', 'cargo_target', False),
+    ('platform-temp-overrides-global', 'duplicate', 'temp', False),
+    ('cache-preparation-fills-target', 'drop', 'cargo_target', True),
+    ('relative-temp-in-private-stage', 'relative', 'temp', False),
+    ('source-relative-target-overrides-global', 'source-relative', 'cargo_target', False),
+    ('source-sibling-full-trailing-slashes', 'source-sibling', 'source_dependency', True),
+    ('source-sibling-healthy-trailing-slashes', 'source-sibling', 'source_dependency', False),
+    ('go-cache-full', 'go-native', 'go_cache', True),
+    ('go-cache-healthy', 'go-native', 'go_cache', False),
+    ('go-module-cache-full', 'go-native', 'go_modcache', True),
+    ('go-module-cache-healthy', 'go-native', 'go_modcache', False),
+    ('go-temp-full', 'go-native', 'go_temp', True),
+    ('go-temp-healthy', 'go-native', 'go_temp', False),
+    ('go-source-cache-full', 'go-sync', 'go_cache', True),
+    ('go-source-cache-healthy', 'go-sync', 'go_cache', False),
+    ('go-source-module-cache-full', 'go-sync', 'go_modcache', True),
+    ('go-source-module-cache-healthy', 'go-sync', 'go_modcache', False),
+    ('go-source-temp-full', 'go-sync', 'go_temp', True),
+    ('go-source-temp-healthy', 'go-sync', 'go_temp', False),
+    ('go-relative-temp-in-private-stage', 'go-relative', 'go_temp', False),
+    ('go-platform-cache-overrides-global', 'go-duplicate', 'go_cache', False),
+    ('go-explicit-module-cache-overrides-gopath', 'go-explicit', 'go_modcache', False),
+]
+
+def run_case(spec):
+    label, route, role, refused = spec
+    case = work / label
+    config, healthy, full = case / 'config', case / 'healthy', case / 'full'
+    for directory in [config / 'repos.d', healthy / 'build', healthy / 'target',
+                      case / 'home', case / 'temp', full, case / 'strict/source']:
+        directory.mkdir(parents=True)
+    target = 'darwin/arm64'
+    root = full if refused and route != 'drop' else healthy
+    selected = root / {'source': 'snapshots', 'temp': 'new temp',
+                       'cargo_target': 'target', 'cargo_cache': 'cargo-cache',
+                       'cargo_build': 'intermediates', 'source_dependency': 'dependency',
+                       'go_cache': 'go cache', 'go_modcache': 'go-modules',
+                       'go_temp': 'go temp'}[role]
+    recipe = dict(tool_name='tool', repo='fixture/tool', local_path=str(source),
+                  binary_name='tool', build_cmd='printf compiler', language='go',
+                  targets=[target], hosts={target: 'fixture'}, act_job_map={target: None})
+    env = dict(os.environ, DSR_PATH_PROJECT=str(project), DSR_PATH_MODULE=str(module),
+               DSR_PATH_OBSERVER=str(observer), DSR_PATH_CASE=str(case), DSR_PATH_MODE=route,
+               DSR_PATH_FULL=str(full) if refused and route != 'drop' else '',
+               DSR_PATH_DROP=str(healthy / 'target'), HOME=str(case / 'home'), TMPDIR=str(case / 'temp'),
+               DSR_CONFIG_DIR=str(config), ACT_CONFIG_DIR=str(config),
+               ACT_REPOS_DIR=str(config / 'repos.d'), DSR_HOSTS_FILE=str(config / 'hosts.yaml'),
+               DSR_CONFIG_FILE=str(config / 'config.yaml'), DSR_REPOS_FILE=str(config / 'repos.yaml'),
+               DSR_CACHE_DIR=str(case / 'cache'), DSR_STATE_DIR=str(case / 'state'),
+               ACT_LOGS_DIR=str(case / 'logs'), ACT_ARTIFACTS_DIR=str(case / 'artifacts'),
+               DSR_DISABLE_HOST_SELECTOR='1', RCH_REQUIRE_REMOTE='0', NO_COLOR='1')
+    for name in ['CARGO_HOME', 'CARGO_TARGET_DIR', 'CARGO_BUILD_BUILD_DIR', 'DSR_STRICT_BUILD_ROOT',
+                 'DSR_NATIVE_OUTPUT_STAGE', 'DSR_CONFIG_LOADED', 'ACT_REPO_LOCAL_PATH']:
+        env.pop(name, None)
+    (config / 'hosts.yaml').write_text(json.dumps({'hosts': {'fixture': dict(
+        platform='linux/amd64', connection='local', enabled=True, capabilities=[],
+        build_root=str(healthy / 'build'))}}))
+    run = str(uuid.uuid4())
+    args = ['act_run_native_build', 'tool', target, '1.0.0', run, '', '', '', 'fixture']
+    expected = 'compile'
+    setting = {'temp': 'TMPDIR', 'cargo_target': 'CARGO_TARGET_DIR',
+               'cargo_build': 'CARGO_BUILD_BUILD_DIR', 'go_cache': 'GOCACHE',
+               'go_modcache': 'GOMODCACHE', 'go_temp': 'GOTMPDIR'}.get(role)
+    if setting:
+        recipe['env'] = {setting: str(selected)}
+    if route in ['ordinary-rust', 'strict-rust', 'strict-overridden', 'drop']:
+        recipe['language'] = 'rust'
+        expected = 'prepare:strict' if route.startswith('strict') else 'prepare:ordinary'
+    if route.startswith('strict') and route != 'strict-sync':
+        args[5] = str(case / 'strict/source')
+    if role == 'cargo_cache':
+        recipe['strict_cargo_cache_root'] = str(selected)
+    if route == 'strict-overridden':
+        env['DSR_PATH_FULL'] = str(full)
+        recipe['env'] = {'CARGO_HOME': str(full / 'ignored-home'),
+                         'CARGO_TARGET_DIR': str(full / 'ignored-target')}
+    if route == 'duplicate':
+        recipe['env'] = {'TMPDIR': str(full / 'ignored-temp')}
+        recipe['cross_compile'] = {target: {'env': {'TMPDIR': str(healthy / 'new temp')}}}
+        env['DSR_PATH_FULL'] = str(full)
+    if route == 'relative':
+        recipe['env'] = {'TMPDIR': './scratch space'}
+        env['DSR_NATIVE_OUTPUT_STAGE'] = '1'
+    if route == 'go-sync':
+        args = ['act_sync_sources', 'tool', '--stage-ordinary']
+        expected = 'contexts'
+    if route == 'go-relative':
+        recipe['env'] = {'GOTMPDIR': './go scratch space'}
+        env['DSR_NATIVE_OUTPUT_STAGE'] = '1'
+    if route == 'go-duplicate':
+        recipe['env'] = {'GOCACHE': str(full / 'ignored-go-cache')}
+        recipe['cross_compile'] = {target: {'env': {'GOCACHE': str(selected)}}}
+        env['DSR_PATH_FULL'] = str(full)
+    if route == 'go-explicit':
+        recipe['env'] = {'GOPATH': str(full / 'unused-go-path'),
+                         'GOENV': 'off', 'GOMODCACHE': str(selected)}
+        env['DSR_PATH_FULL'] = str(full)
+    if route == 'strict-sync':
+        recipe['release_contract'] = dict(checksum_sidecar='sha256',
+            exact_primary_assets={target: 'tool-aarch64-apple-darwin'})
+        env['DSR_STRICT_BUILD_ROOT'] = str(selected)
+        args = ['act_sync_sources', 'tool', '--strict-release', '--run-id', run, '--git-sha', sha]
+        expected = 'sync'
+    if route == 'sync-two':
+        second = 'darwin/amd64'
+        recipe['targets'].append(second)
+        recipe['hosts'][second] = 'fixture'
+        recipe['act_job_map'][second] = None
+        recipe['env'] = {'TMPDIR': str(healthy / 'first-temp')}
+        recipe['cross_compile'] = {second: {'env': {'TMPDIR': str(selected)}}}
+        args = ['act_sync_sources', 'tool', '--stage-ordinary']
+        expected = 'contexts'
+    if route == 'source-relative':
+        recipe['language'] = 'rust'
+        recipe['env'] = {'CARGO_TARGET_DIR': str(full / 'ignored-target')}
+        recipe['cross_compile'] = {target: {'env': {'CARGO_TARGET_DIR': '${HOME}/ignored-relative'}}}
+        env['DSR_PATH_FULL'] = str(full)
+        args = ['act_sync_sources', 'tool', '--stage-ordinary']
+        expected = 'contexts'
+    if route == 'source-sibling':
+        destination = healthy / 'inplace/source'
+        selected = healthy / 'inplace' / source.name
+        destination.mkdir(parents=True)
+        selected.mkdir()
+        env['DSR_PATH_FULL'] = str(selected) if refused else ''
+        recipe['host_paths'] = {'fixture': str(destination) + '/'}
+        recipe['sibling_crates'] = [{'local_path': str(source) + '/'}]
+        args = ['act_sync_sources', 'tool']
+        expected = 'sync'
+    (config / 'repos.d/tool.yaml').write_text(json.dumps(recipe))
+    result = subprocess.run([os.environ.get('BASH', 'bash'), str(driver), *args], env=env,
+                            text=True, capture_output=True, timeout=45)
+    (case / 'stdout').write_text(result.stdout)
+    (case / 'stderr').write_text(result.stderr)
+    (case / 'exit').write_text(str(result.returncode) + '\n')
+    events = (case / 'events').read_text().splitlines() if (case / 'events').exists() else []
+    observation_file = case / 'observations.jsonl'
+    observations = [json.loads(line) for line in observation_file.read_text().splitlines()] if observation_file.exists() else []
+    requests = [row for value in observations for row in value['roles'] if row.get('requested')]
+    checks = []
+    if refused:
+        checks += [('refuses with the established terminal status', result.returncode == 4),
+                   ('stops before source/cache/compiler side effects',
+                    events == (['prepare:ordinary'] if route == 'drop' else [])),
+                   ('observes the full selected volume with healthy defaults',
+                    any(row['role'] == role and row['available_bytes'] == 2 * 1024**3 for row in requests)
+                    and all(row['available_bytes'] == 60 * 1024**3
+                            for value in observations for row in value['roles'] if not row.get('requested')))]
+        if args[0] == 'act_run_native_build':
+            try:
+                refusal = json.loads(result.stdout)
+            except ValueError:
+                refusal = {}
+            checks += [('native refusal retains its identity and pre-compiler stage',
+                        refusal.get('platform') == target and refusal.get('method') == 'native'
+                        and refusal.get('host') == 'fixture' and refusal.get('stage') == 'host_readiness'
+                        and refusal.get('exit_code') == 4
+                        and refusal.get('status') in ('error', 'failed'))]
+    else:
+        checks += [('healthy selected paths reach existing execution boundary', expected in events),
+                   ('healthy path evidence is present', bool(requests)),
+                   ('fixture is not misrepresented as successful build', result.returncode != 0)]
+    if route in ['strict-overridden', 'duplicate', 'source-relative', 'go-duplicate', 'go-explicit']:
+        checks += [('inactive overridden paths are not admitted',
+                    all(not row['path'].startswith(str(full)) for row in requests))]
+    if route == 'relative':
+        checks += [('relative temp resolves inside the actual unique output stage',
+                    any(row['role'] == 'temp' and '/dsr-build-tool-darwin-arm64-' in row['path']
+                        and row['path'].endswith('/source/scratch space') for row in requests))]
+    if route == 'go-relative':
+        checks += [('relative Go temp resolves inside the actual unique output stage',
+                    any(row['role'] == 'go_temp' and '/dsr-build-tool-darwin-arm64-' in row['path']
+                        and row['path'].endswith('/source/go scratch space') for row in requests))]
+    if role.startswith('go_') and route != 'go-relative':
+        checks += [('selected Go role retains the actual destination',
+                    any(row['role'] == role and row['path'] == str(selected) for row in requests))]
+    if route == 'source-sibling':
+        checks += [('sibling probe matches dirname/basename transfer semantics',
+                    any(row['role'] == 'source_dependency' and row['path'] == str(selected)
+                        for row in requests))]
+    if route == 'drop':
+        try:
+            receipt = json.loads(result.stdout)
+        except ValueError:
+            receipt = {}
+        checks += [('late refusal records failed build without artifact or final-cache authority',
+                    receipt.get('status') == 'failed' and receipt.get('exit_code') == 4
+                    and receipt.get('artifact_paths') == [] and receipt.get('artifact_path') == ''
+                    and 'build command was not started' in receipt.get('error', '')
+                    and 'final' not in receipt.get('cargo_isolation', {}).get('dependency_cache', {}))]
+    if route.startswith('sync') or route in ['strict-sync', 'go-sync']:
+        checks += [('refused plan leaves no source context or snapshot',
+                    not refused or (not (case / 'state/source-contexts').exists()
+                                    and not selected.exists()))]
+    return [(label + ': ' + check, valid) for check, valid in checks]
+
+results = []
+with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    for case_checks in executor.map(run_case, cases):
+        results += case_checks
+for label, valid in results:
+    print(('PASS: ' if valid else 'FAIL: ') + label, flush=True)
+
+# Resolver controls exercise actual literal/precedence decisions without a
+# compiler or synthetic health verdict. Paths with spaces/single quotes remain
+# literal; shell expansion and Cargo templates cannot masquerade as evidence.
+resolver_start = len(results)
+def resolve(environment, absolute_only=False, language='rust'):
+    command = ['bash', '-c', 'source "$1"; shift; _act_native_writable_paths_json "$@"',
+               '_', str(module), '/planned/source', '/planned/stage/source', environment,
+               language, '', '[]', str(absolute_only).lower()]
+    return subprocess.run(command, text=True, capture_output=True, timeout=10)
+
+literal = resolve("TMPDIR=/unused\nTMPDIR=./scratch space\nCARGO_BUILD_BUILD_DIR=objects")
+try:
+    rows = json.loads(literal.stdout)
+except ValueError:
+    rows = []
+results.append(('resolver last assignment and actual cwd',
+                literal.returncode == 0 and
+                {'role': 'temp', 'path': '/planned/stage/source/scratch space'} in rows and
+                {'role': 'cargo_build', 'path': '/planned/stage/source/objects'} in rows))
+quoted = resolve("TMPDIR=/scratch/John's directory")
+results.append(('literal single quotes and spaces remain supported', quoted.returncode == 0))
+for label, environment in [
+    ('variable expansion', 'TMPDIR=/scratch/$HOME'),
+    ('command substitution', 'TMPDIR=/scratch/$(touch refused)'),
+    ('backtick substitution', 'TMPDIR=/scratch/' + chr(96) + 'false' + chr(96)),
+    ('double quote shell syntax', 'TMPDIR=/scratch/"redirect"'),
+    ('backslash shell syntax', 'TMPDIR=/scratch/escape\\space'),
+    ('Cargo build-directory templates', 'CARGO_BUILD_BUILD_DIR={cargo-cache-home}/build'),
+]:
+    response = resolve(environment)
+    results.append((label + ' is refused before path observation',
+                    response.returncode == 4 and not response.stdout))
+for label, environment in [
+    ('relative Go build cache', 'GOCACHE=cache'),
+    ('relative Go module cache', 'GOMODCACHE=modules'),
+    ('disabled required Go build cache', 'GOCACHE=off'),
+    ('Go cache variable expansion', 'GOCACHE=/scratch/$HOME'),
+    ('Go module cache command substitution', 'GOMODCACHE=/scratch/$(touch refused)'),
+    ('Go temp shell expansion', 'GOTMPDIR=${HOME}/tmp'),
+]:
+    response = resolve(environment, absolute_only=True, language='go')
+    results.append((label + ' is refused before source observation',
+                    response.returncode == 4 and not response.stdout))
+for label, environment, expected in [
+    ('Go cache last assignment', "GOCACHE=/ignored\nGOCACHE=/scratch/John's cache",
+     [{'role': 'go_cache', 'path': "/scratch/John's cache"}]),
+    ('explicit empty Go paths retain target defaults', 'GOCACHE=\nGOMODCACHE=\nGOTMPDIR=', []),
+    ('GOENV off still leaves GOROOT go.env defaults unclaimed',
+     'GOENV=off\nGOMODCACHE=\nGOPATH=/first/:/unused', []),
+    ('GOPATH does not invent an inherited module cache override', 'GOENV=off\nGOPATH=/first', []),
+    ('GOPATH does not invent a persisted module cache override', 'GOMODCACHE=\nGOPATH=/first', []),
+    ('explicit module cache takes precedence over GOPATH',
+     'GOENV=off\nGOMODCACHE=/selected\nGOPATH=/unused',
+     [{'role': 'go_modcache', 'path': '/selected'}]),
+    ('unused Go install directory does not gate go build', 'GOBIN=/unused', []),
+]:
+    response = resolve(environment, language='go')
+    try:
+        rows = json.loads(response.stdout)
+    except ValueError:
+        rows = []
+    results.append((label, response.returncode == 0 and
+                    [row for row in rows if row['role'].startswith('go_')] == expected))
+for label, valid in results[resolver_start:]:
+    print(('PASS: ' if valid else 'FAIL: ') + label, flush=True)
+failures = sum(not valid for _, valid in results)
+print(f'Native writable paths: cases={len(cases)} checks={len(results)} failures={failures}', flush=True)
+sys.exit(bool(failures))
+PY
+)
+
+if [[ "${1:-}" == --host-writable-path-tests ]]; then
+    test_native_writable_path_admission
+    exit $?
+fi
+
 # Real selector and health-cache readers over explicitly controlled machine
 # observations. Transport boundaries stop before staging or compilation; these
 # checks do not assert that the fixture hosts or their disks actually exist.
@@ -214,14 +1384,27 @@ test_native_host_capability_admission() (
         "capable":{"platform":"linux/amd64","connection":"ssh","ssh_host":"capable.invalid","concurrency":1,"capabilities":["rust","go","bun","node"]}},
         "platform_mapping":{"linux/amd64":"incapable"}}' > "$DSR_HOSTS_FILE" || return 1
     _cap_seed() {
-        local hostname="$1" supported="$2" host fingerprint receipt
+        local hostname="$1" supported="$2" host fingerprint receipt disk concurrent_builds
         host=$(_hh_get_host_config "$hostname") || return 1
         fingerprint=$(_hh_admission_fingerprint "$host") || return 1
-        receipt=$(jq -nc --arg hostname "$hostname" --arg fingerprint "$fingerprint" --argjson supported "$supported" '
+        concurrent_builds=$(_hh_disk_concurrency "$host") || return 1
+        # Supply complete controlled capacity observations, then let the real
+        # policy classify them for each host's configured build count. These
+        # fixtures isolate compiler capability, not disk-evidence validation.
+        disk=$(jq -nc '
+            [{role:"root",path:"/"}, {role:"home",path:"/fixture/home"},
+             {role:"build_root",path:"/var/tmp"},
+             {role:"cargo_home",path:"/fixture/home/.cargo"}, {role:"temp",path:"/tmp"}] |
+            {requested_paths:[],roles:map(. + {probe_path:.path,
+                filesystem_id:"1",capacity_group:"filesystem:1",usage_percent:50,
+                available_bytes:214748364800,total_bytes:429496729600})}
+        ' | _hh_writable_storage_verdict null '[]' "$concurrent_builds") || return 1
+        receipt=$(jq -nc --arg hostname "$hostname" --arg fingerprint "$fingerprint" \
+            --argjson supported "$supported" --argjson disk "$disk" '
             {hostname:$hostname,platform:"linux/amd64",description:"Controlled scheduling fixture",
              connection:"ssh",status:"ok",healthy:true,errors:0,warnings:0,
              admission_fingerprint:$fingerprint,checked_at:"fixture",
-             checks:{connectivity:{reachable:true},disk_space:{status:"ok"},docker:{},clock_drift:{},
+             checks:{connectivity:{reachable:true},disk_space:$disk,docker:{},clock_drift:{},
                 toolchains:(["rust","go","bun","node"] | map(. as $cap |
                     {key:$cap,value:{status:(if $supported | index($cap) then "ok" else "missing" end),version:"fixture"}}) | from_entries)}}
         ') || return 1
@@ -325,8 +1508,10 @@ test_native_host_capability_admission() (
     host=$(_hh_get_host_config incapable) || return 1
     fingerprint=$(_hh_admission_fingerprint "$host") || return 1
     old_receipt=$(_hh_cache_read incapable) || return 1
+    # Retain the historical v5 contract after percentage-only errors were
+    # removed; do not depend on a threshold absent from the current policy.
     old_contract=$(jq -ncS --argjson host "$host" --arg disk_warn "$_HH_DISK_WARN_THRESHOLD" \
-        --arg disk_error "$_HH_DISK_ERROR_THRESHOLD" --arg disk_min_free "$_HH_DISK_MIN_FREE_BYTES" \
+        --arg disk_error "95" --arg disk_min_free "$_HH_DISK_MIN_FREE_BYTES" \
         --arg clock_warn "$_HH_CLOCK_DRIFT_WARN" --arg ssh_timeout "$_HH_SSH_TIMEOUT" \
         --arg command_timeout "$_HH_CMD_TIMEOUT" '
         {schema:"dsr-host-admission-v5",host:$host,policy:{disk_warn:$disk_warn,disk_error:$disk_error,
@@ -738,15 +1923,22 @@ _test_decode_remote_command() {
     if [[ "$command" == powershell\ -NoProfile\ -NonInteractive\ * ||
           "$command" == pwsh\ -NoProfile\ -NonInteractive\ * ]]; then
         decoded=$(_act_windows_command_script "$command") || return 1
-        if [[ "$decoded" == *"[IO.File]::Open("* && "$decoded" == *"Launcher digest mismatch"* &&
-              -s "$MOCK_DIR/staged-command.ps1" ]]; then
-            decoded=$(cat "$MOCK_DIR/staged-command.ps1") || return 1
+        if [[ "$decoded" == *"[IO.File]::Open("* && "$decoded" == *"Launcher digest mismatch"* ]]; then
+            decoded=$(printf '%s' "$decoded" | python3 -c '
+import hashlib, pathlib, re, sys
+match = re.search(r"\$held=\[IO\.File\]::Open\(\x27((?:[^\x27]|\x27\x27)*)\x27,", sys.stdin.read())
+if match is None:
+    raise SystemExit("missing staged launcher path")
+remote = match[1].replace("\x27\x27", "\x27")
+key = hashlib.sha256(remote.encode()).hexdigest()
+sys.stdout.buffer.write((pathlib.Path(sys.argv[1]) / "staged-launchers" / key).read_bytes())
+' "$MOCK_DIR") || return 1
         fi
         if [[ "$decoded" == *'$dsrBuildScript='* ]]; then
             decoded=$(printf '%s' "$decoded" | python3 -c '
 import re, sys
 source = sys.stdin.read()
-match = re.search(r"(?m)^\$dsrBuildScript=\x27((?:[^\x27]|\x27\x27)*)\x27\n\$dsrBuildEncoded=", source)
+match = re.search(r"(?m)^\$dsrBuildScript=\x27((?:[^\x27]|\x27\x27)*)\x27\n\$dsrBuildDirectoryHandles=", source)
 if match is None:
     raise SystemExit("missing guarded build script")
 sys.stdout.write(match[1].replace("\x27\x27", "\x27"))
@@ -1017,6 +2209,24 @@ write_mock_artifact() {
     chmod 755 "$dest" 2>/dev/null || true
 }
 
+# Retain each upload by its remote path. Cache preparation can stage another
+# script between build-guard upload and invocation; those are distinct files.
+_test_capture_windows_launcher() {
+    local source="$1" destination="$2"
+    python3 - "$source" "$destination" "$MOCK_DIR" <<'PY' || return 1
+import hashlib, pathlib, sys
+source, destination, fixture = sys.argv[1:]
+remote = destination.split(":", 1)[1]
+directory = pathlib.Path(fixture) / "staged-launchers"
+directory.mkdir(exist_ok=True)
+(directory / hashlib.sha256(remote.encode()).hexdigest()).write_bytes(pathlib.Path(source).read_bytes())
+PY
+    cat "$source" > "$MOCK_DIR/staged-command.ps1" || return 1
+    if grep -q '\$dsrBuildScript=' "$source"; then
+        cat "$source" > "$MOCK_DIR/staged-build.ps1" || return 1
+    fi
+}
+
 # Mock scp - captures args to file
 scp() {
     printf '%s\n' "$@" > "$SCP_ARGS_FILE"
@@ -1029,10 +2239,7 @@ scp() {
             # Launcher uploads must not create a bogus host:path tree locally.
             local source="${*: -2:1}"
             if [[ "$target" == */build.ps1 && -f "$source" ]]; then
-                cat "$source" > "$MOCK_DIR/staged-command.ps1"
-                if grep -q '\$dsrBuildScript=' "$source"; then
-                    cat "$source" > "$MOCK_DIR/staged-build.ps1"
-                fi
+                _test_capture_windows_launcher "$source" "$target" || return 1
             fi
             return 0
         fi
@@ -2966,6 +4173,22 @@ test_windows_build_guard_transport_and_timeout_validation() {
     else
         log_fail "Guard changed the original build script"
     fi
+    # The actual private Cargo runtime is already larger than Windows accepts
+    # as a child command line. Preserve that complete source through the same
+    # generator/transport boundary; the PowerShell fixture executes it by file.
+    local large_script large_guard large_encoded large_decoded
+    large_script=$(printf '# retained build runtime\n%.0s' {1..9000})$'\n'"$script"
+    if ! large_guard=$(_act_windows_build_guard_script 30 "$large_script") ||
+       ! large_encoded=$(_act_windows_encoded_powershell "$large_guard") ||
+       ! large_decoded=$(_test_decode_remote_command "$large_encoded"); then
+        log_fail "Large guard transport failed"
+        return
+    fi
+    if [[ "${#large_script}" -gt 131072 && "$large_decoded" == "$large_script" ]]; then
+        log_pass "Guard retains a complete script larger than process argument limits"
+    else
+        log_fail "Large guard source was truncated or changed"
+    fi
     for bad in 0 -1 2147484 invalid '1;exit'; do
         if _act_windows_build_guard_script "$bad" "$script" >/dev/null 2>&1; then
             rejected=false
@@ -2976,6 +4199,38 @@ test_windows_build_guard_transport_and_timeout_validation() {
     else
         log_fail "Guard accepted an invalid remote deadline"
     fi
+    local source_path parent parent_quoted staged_command staged_guard setup_command
+    for source_path in '/c/Users/dsr/work tree/tool' "C:/Users/O'Brien/tool" 'C:/tool'; do
+        case "$source_path" in
+            /c/*) parent='c:/Users/dsr/work tree' ;;
+            "C:/Users/O'Brien/tool") parent="C:/Users/O'Brien" ;;
+            *) parent='C:/' ;;
+        esac
+        parent_quoted="${parent//\'/\'\'}"
+        reset_state
+        if ! staged_command=$(_act_windows_stage_build_script wlap "$source_path" "$script"); then
+            log_fail "Guard staging refused the admitted Windows path: $source_path"
+            continue
+        fi
+        staged_guard=$(_act_windows_command_script "$staged_command") || {
+            log_fail "Guard staging returned an invalid file launcher"
+            continue
+        }
+        setup_command=$(get_ssh_cmd)
+        if [[ "$setup_command" == *"Get-Item -LiteralPath '$parent_quoted' -Force"* &&
+              "$staged_guard" == *"Get-Item -LiteralPath '${parent_quoted%/}/launcher-"* ]]; then
+            log_pass "Guard uses the existing parent with literal Windows path: $source_path"
+        else
+            log_fail "Guard staging changed the Windows parent or quoting: $source_path"
+        fi
+        if [[ "$(cat "$MOCK_DIR/staged-command.ps1")" == "$script" &&
+              ${#staged_command} -le 7000 && "$staged_guard" == *'Launcher digest mismatch'* &&
+              "$staged_guard" == *'[IO.FileShare]::Read'* ]]; then
+            log_pass "Staging retains exact source and sends only its held file launcher"
+        else
+            log_fail "Staging changed source bytes or lost bounded held-file transport"
+        fi
+    done
 }
 
 test_windows_cd_command() {
@@ -3271,7 +4526,7 @@ _test_windows_companion_collection() (
     scp() {
         local source="${*: -2:1}" destination="${!#}" selected
         if [[ "$destination" == wlap:*/build.ps1 ]]; then
-            cp "$source" "$MOCK_DIR/staged-command.ps1"
+            _test_capture_windows_launcher "$source" "$destination"
             return $?
         fi
         [[ "$source" == wlap:* ]] || return 7
@@ -3415,17 +4670,19 @@ test_typed_additional_artifact_preflight() {
         fi
     done
 
-    log_test "Actual configuration parser rejects companions assigned to act producers before work begins"
-    local route owner
-    for route in load orchestrate native native-control; do
+    log_test "Actual configuration parser admits typed act owners and refuses malformed producers before work"
+    local route owner job
+    for route in load orchestrate native act-control native-control; do
         case_dir=$(mktemp -d "$MOCK_DIR/typed-producer-${route}.XXXXXXXX") || return
         mkdir -p "$case_dir/config/repos.d" || return
         owner=linux/amd64
         [[ "$route" != native-control ]] || owner=windows/amd64
-        jq -nc --arg owner "$owner" --arg source "$case_dir/source" '
+        job=false
+        [[ "$route" != *-control ]] || job='"release-linux"'
+        jq -nc --arg owner "$owner" --argjson job "$job" --arg source "$case_dir/source" '
             {tool_name:"tool",repo:"Test/tool",language:"go",binary_name:"tool",local_path:$source,
              targets:["linux/amd64","windows/amd64"],
-             act_job_map:{"linux/amd64":"release-linux","windows/amd64":null},
+             act_job_map:{"linux/amd64":$job,"windows/amd64":null},
              workspace_additional_artifacts:{($owner):[{name:"notes.json",format:"json"}]}}
         ' > "$case_dir/config/repos.d/tool.yaml" || return
         status=0
@@ -3445,24 +4702,24 @@ test_typed_additional_artifact_preflight() {
                 load) act_load_repo_config tool ;;
                 orchestrate) act_orchestrate_build tool v1.6.0 -- windows/amd64 ;;
                 native) act_run_native_build tool windows/amd64 v1.6.0 44444444-4444-4444-8444-444444444444 ;;
-                native-control)
+                act-control|native-control)
                     act_load_repo_config tool || exit $?
                     [[ "$(act_get_job_for_target tool linux/amd64)" == release-linux ]] || exit 99
                     [[ -z "$(act_get_job_for_target tool windows/amd64)" ]] || exit 99
                     ;;
             esac
         ) || status=$?
-        if [[ "$route" == native-control ]]; then
+        if [[ "$route" == *-control ]]; then
             if [[ "$status" -eq 0 && "$(cat "$case_dir/events")" == source-selection ]]; then
-                log_pass "Native companions retain existing native/act target selection"
+                log_pass "$route typed companions retain exact native/act target selection"
             else
-                log_fail "Native companion configuration changed target selection: status=$status evidence=$case_dir"
+                log_fail "$route typed companion configuration changed target selection: status=$status evidence=$case_dir"
             fi
         elif [[ "$status" -eq 4 && ! -e "$case_dir/events" && ! -e "$case_dir/artifacts" ]] &&
-             grep -q 'linux/amd64' "$case_dir/stderr" && grep -q 'release-linux' "$case_dir/stderr"; then
-            log_pass "$route rejects the nonselected act companion producer before source, transport or compiler work"
+             grep -q 'linux/amd64' "$case_dir/stderr" && grep -Eq 'act_job_map|act job selector' "$case_dir/stderr"; then
+            log_pass "$route rejects the nonselected malformed producer before source, transport or compiler work"
         else
-            log_fail "$route act companion producer crossed admission: status=$status result=$result evidence=$case_dir"
+            log_fail "$route malformed producer crossed admission: status=$status result=$result evidence=$case_dir"
         fi
     done
 }
@@ -5063,6 +6320,14 @@ test_windows_private_cache_collection() {
 }
 
 main() {
+    if [[ "${1:-}" == --windows-guard-only ]]; then
+        test_windows_build_guard_transport_and_timeout_validation
+        test_windows_rust_isolation_receipt_matches_command
+        test_windows_rust_absolute_target_is_private
+        printf 'Windows guard transport tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return $?
+    fi
     if [[ "${1:-}" == --typed-companion-preflight-only ]]; then
         test_typed_additional_artifact_preflight
         printf 'Typed companion preflight tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
@@ -5104,6 +6369,11 @@ main() {
             log_pass "Native capability routing admits the required toolchain before transport"
         else
             log_fail "Native capability routing regression cases failed"
+        fi
+        if test_native_writable_path_admission; then
+            log_pass "Native staging and builds admit their actual writable paths"
+        else
+            log_fail "Native writable-path regression cases failed"
         fi
     fi
     if [[ "${1:-}" == --go-targets-only ]]; then

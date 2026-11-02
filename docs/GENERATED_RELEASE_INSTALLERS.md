@@ -5,10 +5,10 @@ for a reviewed release. Consumers need no DSR checkout, policy file or separate
 public-key file: the script embeds the exact verifier, transport and installation
 engines together with the independently selected policy. It downloads no new
 installer code at runtime. The release payloads are still authenticated by the
-embedded policy before the complete executable generation is activated.
+embedded policy before the complete executable and runtime-data generation is activated.
 
 This is an explicit per-release generator, exposed through
-`src/release_install.sh generate-installer`. It does not silently change the
+`dsr installer generate-release`. It does not silently change the
 older `install_gen_create` templates, their version discovery, or source-build
 fallback. Those configurations do not supply the independent source/build and
 complete-matrix policy this installer requires.
@@ -53,7 +53,7 @@ reviewed release values. Optional `statement_sha256`, `manifest_sha256` and
 `invocation_id` restrict the accepted signed build further. They are selected by
 the publisher, not inferred from the downloaded proof. Unknown fields, duplicate
 JSON keys, null lists, invalid pins, duplicate targets and unsafe or colliding
-executable selections fail generation.
+executable or runtime-file selections fail generation.
 
 `targets` is the **complete signed release matrix**, including platforms that
 will not be installed on this machine. Supply at least one installation recipe
@@ -65,13 +65,54 @@ one supported POSIX recipe is required. Each recipe uses the exact same
 normalizer as [authenticated installation](RELEASE_INSTALLATION.md); raw/archive
 compatibility and actual signed artifact membership are checked during install.
 
+## Include authenticated runtime files
+
+Each recipe may include an optional `files` list alongside its `executables`:
+
+```json
+"files": [
+  {"path": "share/demo/runtime.json", "artifact": "runtime.json"},
+  {"path": "share/demo/docs/help.txt", "artifact": "demo-linux.tar.gz", "member": "docs/help.txt"}
+]
+```
+
+The first file can come from a signed release-wide `additional` asset; the
+second comes from an exact member of the selected platform archive. Both are
+installed with fixed mode **0644**, and their required `share/` directories
+receive **0755**. Executables keep mode **0755**. Select each file explicitly;
+the installer does not copy unlisted archive content, generate configuration,
+run hooks or provide a runtime destination override.
+
+Every destination is a safe relative path beneath `share/`, with at most 256
+files per recipe. The captured installation engine rejects traversal, duplicate
+or case-aliased paths, file/directory collisions, unknown fields and mode
+overrides during generation. Empty archive members are permitted as data;
+executables must remain nonempty. Omitting `files` or supplying `files: []`
+preserves the original executable-only policy and generation identity. A null
+list is invalid. See [runtime data selections](RELEASE_INSTALLATION.md#select-runtime-data)
+for the complete recipe rules.
+
+The embedded policy fixes these selections for each platform and compiler
+variant. `--inspect` shows them for review. Installation authenticates the
+whole signed snapshot, including unselected shared assets and other platforms,
+before staging any generation. A shared asset can supply data but cannot stand
+in for a platform executable. An embedded independent release contract is
+checked against data selections during generation and again during installation.
+
+Applications must locate their data in the installed `share/` tree themselves.
+Successful results with data include `share_dir`, `generation_share_dir`, and a
+`files` inventory with paths, signed targets, hashes, sizes and modes. All of
+these selected contents belong to the same generation as the executable family.
+
 ## Select an authenticated compiler variant
 
 GNU and musl are different compiler variants of the same `linux/amd64` routing
 platform. The physical host check alone cannot choose between them. Add
-`target_triple` at recipe level to bind **every executable** in that recipe to
+`target_triple` at recipe level to bind **every executable and platform-owned runtime file** in that recipe to
 one identity in the signed artifact records, including raw aliases and all
 archives supplying workspace companions.
+Release-wide data signed as `additional` remains independent of the compiler
+choice and must not carry a target triple.
 
 For a release containing both variants, replace the Linux recipe in the policy
 above with two entries such as these. Retain the other recipes and the complete
@@ -119,13 +160,14 @@ ARM64 uses `linux/arm64` and the corresponding `aarch64-unknown-linux-*` triples
 The same optional recipe field works directly with `src/release_install.sh`.
 After authenticating the **complete snapshot**, the engine requires an explicit
 selection whenever the installed platform contains several signed compiler
-identities, including mixed typed/untyped records. Every chosen artifact must
-match the recipe's exact triple. Missing signed identities, invalid explicit
+identities, including mixed typed/untyped records. Every chosen platform artifact
+must match the recipe's exact triple. Shared data does not add a compiler variant
+to that selection. Missing signed identities, invalid explicit
 triples, or a GNU executable mixed into a musl workspace are refused before
 activation. Selecting GNU does not excuse corruption in an unselected musl
 payload: whole-release snapshot verification still runs.
 
-Explicit compiler selections are retained on executable results, the generation
+Explicit compiler selections are retained on executable and platform-data results, the generation
 receipt and the top-level installation result. Switching between variants is a
 new complete generation and requires runtime `--replace`; old generations stay
 available for explicit, reauthenticated rollback. Equivalent recipe ordering
@@ -143,7 +185,7 @@ that the claimed compiler was executed. Select a compatible variant deliberately
 ## Generate and inspect
 
 ```bash
-bash src/release_install.sh generate-installer \
+dsr installer generate-release \
   --policy /srv/policies/demo-release.json \
   --public-key /srv/keys/release.pub \
   --output /srv/installers/demo-v1.2.3.sh
@@ -151,8 +193,16 @@ bash src/release_install.sh generate-installer \
 bash /srv/installers/demo-v1.2.3.sh --inspect
 ```
 
+The public command uses the existing `install_gen_release.sh` engine. The
+low-level `bash src/release_install.sh generate-installer ...` entry point and
+sourceable `install_gen_release` API remain available with the same arguments.
+`dsr --json installer generate-release ...` wraps the engine's complete result
+in one standard envelope with `details.action: "generate-release"`; the engine
+status and exit code remain authoritative. Without `--json`, it prints the
+engine's JSON generation receipt directly.
+
 The generator reads the existing DSR installation's `release_install.sh`,
-`slsa_remote.sh`, `slsa.sh`, `packaging.sh`, `sbom_release.sh`, `sbom.sh`, and
+`slsa_remote.sh`, `slsa.sh`, `platforms.sh`, `packaging.sh`, `sbom_release.sh`, `sbom.sh`, and
 `github.sh`. It snapshots and hashes their complete source files, validates each
 recipe using that captured installation engine, checks generated Python/Bash
 syntax, and refuses input drift. All policy and engine data are base64-encoded
@@ -172,6 +222,17 @@ an existing executable installer without changing its inode. A different script
 requires explicit generator `--replace`; no source module, key or policy file may
 be selected as its output. Input paths and timestamps are not embedded in the
 identity. Public-key comments are normalized; the key token remains exact.
+
+Add generator `--dry-run`, or use the global `dsr --dry-run`, to review the exact
+prospective installer without publishing it. The plan performs the same
+policy/key/module admission, recipe normalization, Python/Bash syntax checks,
+input-stability checks and existing-output replacement checks. Its
+`status: "planned"` result includes the script hash, policy hash, embedded engine
+hashes and whether an existing installer would be reused. Conflicting existing
+output still requires `--replace`. Planning stages in private temporary storage;
+it does not create or change the selected output or adjacent lock, and does not
+reserve either against another writer. Real publication repeats the validation
+and checks the selected output under its normal cooperating-writer lock.
 
 ## Consumers: one file, one installation command
 
@@ -217,11 +278,17 @@ the generator does not install dependencies or change shell startup files.
 
 For a new release, generate a new script with its new reviewed policy. Run that
 script with runtime `--replace` to permit changing an existing managed prefix.
-The existing installation engine authenticates and stages every executable
+The existing installation engine authenticates and stages every selected executable and runtime file
 before switching `current`; old generations remain available. To roll back,
 run the original generated script with its matching snapshot or release and
 `--replace`. Rollback is explicit and reauthenticated, not an automatic policy.
 Online re-download and equivalent offline installation select the same generation.
+The retained generation must still have exactly its declared files and directories,
+with the expected bytes and permissions and no links. A changed or extra runtime
+file blocks reuse and rollback rather than being silently overwritten. For a
+program that needs one version across separate executable and data lookups, use
+`generation_bin_dir` and `generation_share_dir` from the same result; repeated
+lookups through `current` can straddle an upgrade.
 
 Cancellation is forwarded to the installation engine, which owns its fetch and
 archive-helper processes and reports whether activation happened. The wrapper
@@ -243,11 +310,21 @@ anti-rollback policy: regenerate and redistribute under the intended policy.
 
 ## Tests
 
+`bash scripts/tests/test_installer_release_cli.sh` exercises the public
+`generate-release`, `describe-recipe` and `install` commands with real Minisign
+signatures and inert payload fixtures. It covers planning without output or
+lock changes, exact planned/published script hashes, invalid policy/key refusal,
+replacement consent, public JSON envelopes, complete activation and rollback,
+integrity failures, and cancellation. It uses no network or compiler.
+
 Run `bash scripts/tests/test_generated_release_installer.sh`. The suite generates
 and executes the actual standalone script, removes the original DSR/policy/key
 paths, exercises streamed online and offline installation, validates frozen trust
 options, preserves active files on failures and cancellation, and upgrades and
-rolls back a complete native executable set. It checks canonical regeneration,
+rolls back a complete native executable set. It also installs, runs, upgrades
+and rolls back an application that requires both shared JSON and archive data,
+with the original engine, key and policy paths detached. It checks fixed data
+modes, empty data members, corrupt shared subjects, canonical regeneration,
 unsafe policy rejection and literal builder identities. Only the tests execute
 installed payloads; they compile small C fixtures when `cc` is available.
 

@@ -111,6 +111,33 @@ def write(p, value, replace=False):
         if os.path.exists(temporary):
             os.unlink(temporary)
 
+def observe_file(p, optional=False, contents=False, limit=None):
+    """Hash one held regular file; never follow a terminal receipt or log link."""
+    plain(p)
+    if optional and not p.exists():
+        return None, None
+    before = p.lstat()
+    require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1,
+            "driver evidence is not a single regular file: " + str(p))
+    require(limit is None or before.st_size <= limit, "driver evidence exceeds its size bound")
+    identity = lambda s: (s.st_dev, s.st_ino, s.st_mode, s.st_nlink, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+    fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    digest_value, data, size = hashlib.sha256(), bytearray(), 0
+    with os.fdopen(fd, "rb") as stream:
+        require(identity(os.fstat(stream.fileno())) == identity(before), "driver evidence replaced before reading")
+        for block in iter(lambda: stream.read(1048576), b""):
+            size += len(block)
+            require(limit is None or size <= limit, "driver evidence grew beyond its size bound")
+            digest_value.update(block)
+            if contents:
+                data.extend(block)
+        require(identity(os.fstat(stream.fileno())) == identity(before) == identity(p.lstat()),
+                "driver evidence changed while reading")
+    return {"path": str(p), "sha256": digest_value.hexdigest(), "size_bytes": size}, bytes(data)
+
+def file_observation(p, optional=False):
+    return observe_file(p, optional=optional)[0]
+
 def matches(value, pattern):
     return isinstance(value, str) and re.fullmatch(pattern, value) is not None
 
@@ -157,13 +184,17 @@ def asset_contract(value, matrix):
     require(isinstance(value, list) and 1 <= len(value) <= 256, "expected 1..256 required assets", 4)
     for asset in value:
         require(isinstance(asset, dict) and set(asset) - {"target_triple"} == {"name", "target", "archive_format"} and
-                name(asset["name"]) and len(asset["name"]) <= 128 and asset["target"] in matrix and
+                name(asset["name"]) and len(asset["name"]) <= 128 and
+                (asset["target"] in matrix or asset["target"] == "additional") and
                 asset["archive_format"] in ("tar.gz", "tar.xz", "zip", "binary", "none"), "invalid required asset", 4)
-        if "target_triple" in asset:
+        if asset["target"] == "additional":
+            require("target_triple" not in asset, "shared required assets cannot select a compiler target", 4)
+        elif "target_triple" in asset:
             require(name(asset["target_triple"]) and len(asset["target_triple"]) <= 128,
                     "invalid required asset compiler target", 4)
     require(len({a["name"].casefold() for a in value}) == len(value) and
-            sorted({a["target"] for a in value}) == matrix, "required assets must uniquely cover every target", 4)
+            sorted({a["target"] for a in value if a["target"] != "additional"}) == matrix,
+            "required assets must uniquely cover every target", 4)
     return sorted(value, key=lambda a: a["name"])
 
 XWIN_TARGETS = {"windows/amd64": "x86_64-pc-windows-msvc", "windows/arm64": "aarch64-pc-windows-msvc"}
@@ -283,6 +314,11 @@ def validate(value):
                 "jobs must partition the entire required compiler matrix", 4)
     else:
         require(sorted(matrix) == value["required_targets"], "jobs must partition the entire required target matrix", 4)
+    # Xwin's exact executable inventory cannot supply a shared data payload.
+    # Refuse an impossible selection before starting any compiler work.
+    if any(a["target"] == "additional" for a in value.get("required_assets", [])):
+        require(any(j["driver"] in ("dsr", "import") for j in value["builds"]),
+                "shared required assets need a DSR or imported producer", 4)
     value["builds"].sort(key=lambda j: j["id"])
     return value
 
@@ -301,6 +337,8 @@ for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
     signal.signal(sig, stop)
 
 def kill_group(proc, sig):
+    if isinstance(proc, DriverSupervisor) and proc.poll() is not None:
+        return
     try:
         os.killpg(proc.pid, sig)
     except ProcessLookupError:
@@ -533,6 +571,221 @@ def native_session(job, record, attempt):
     print("[release-builds] Resuming " + job["id"] + " native run " + identity, file=sys.stderr)
     return session, identity, pin
 
+def driver_binding(job, attempt, command):
+    command_file, command_bytes = observe_file(attempt / "command.json", contents=True, limit=1048576)
+    inputs_file, inputs_bytes = observe_file(attempt / "inputs.json", contents=True, limit=1048576)
+    require(json.loads(command_bytes, object_pairs_hook=pairs) == command and
+            json.loads(inputs_bytes, object_pairs_hook=pairs) == {"plan_sha256": plan_hash, "job": job},
+            "driver invocation differs from its frozen selection")
+    return {"plan_sha256": plan_hash, "job_id": job["id"], "attempt": int(attempt.name),
+            "command": command, "command_file": command_file, "inputs_file": inputs_file}
+
+def driver_checkpoint(job, session):
+    if job["driver"] != "dsr" or not job.get("resume", False):
+        return None
+    observed = native_checkpoint(job, session)
+    return file_observation(observed[0]) if observed is not None else None
+
+class DriverSupervisor:
+    """A live owned fork, with the same poll/wait surface as admission Popen."""
+    def __init__(self, pid):
+        self.pid, self.returncode = pid, None
+
+    def collect(self, options):
+        if self.returncode is None:
+            pid, status = os.waitpid(self.pid, options)
+            if pid:
+                self.returncode = (os.WEXITSTATUS(status) if os.WIFEXITED(status)
+                                   else -os.WTERMSIG(status))
+        return self.returncode
+
+    def poll(self):
+        return self.collect(os.WNOHANG)
+
+    def wait(self):
+        return self.collect(0)
+
+def start_supervisor(job, attempt, session, command, manifest, environment):
+    binding = driver_binding(job, attempt, command)
+    ready_read, ready_write = os.pipe()
+    try:
+        pid = os.fork()
+    except BaseException:
+        os.close(ready_read)
+        os.close(ready_write)
+        raise
+    if pid:
+        os.close(ready_write)
+        try:
+            ready = os.read(ready_read, 1)
+        finally:
+            os.close(ready_read)
+        child = DriverSupervisor(pid)
+        if ready != b"1":
+            child.wait()
+            raise Failure("driver supervisor could not establish process custody")
+        return child
+
+    child_exit = 7
+    try:
+        child_exit = supervise_driver(job, attempt, session, command, manifest, environment,
+                                      binding, ready_read, ready_write)
+    except BaseException:
+        pass
+    finally:
+        # Even failed diagnostics (for example ENOSPC on stderr) must never
+        # unwind into the forked copy of the coordinator's cleanup handlers.
+        os._exit(child_exit if type(child_exit) is int and 0 <= child_exit <= 255 else 7)
+
+def supervise_driver(job, attempt, session, command, manifest, environment, binding, ready_read, ready_write):
+    # A fork shares Python objects, not ownership of the coordinator's older
+    # children. Never run its finally block or signal its inherited active map.
+    os.close(ready_read)
+    driver = None
+    cancel_at = None
+
+    def cancel(signum, frame):
+        nonlocal cancel_at
+        if cancel_at is None:
+            cancel_at = time.monotonic()
+
+    def owned_children(deadline):
+        # /proc may be mounted from an outer PID namespace. Translate its
+        # kernel-reported *unreaped direct children* into our namespace before
+        # signalling; those PIDs cannot be reused until this sole waiter reaps.
+        def namespace_ids(lines):
+            selected = next((line.split()[1:] for line in lines if line.startswith("NSpid:")), None)
+            require(selected and all(n.isdecimal() for n in selected), "cannot inspect driver child ownership")
+            return [int(n) for n in selected]
+        own = namespace_ids(Path("/proc/self/status").read_text(errors="replace").splitlines())
+        require(own[-1] == os.getpid(), "driver supervisor PID namespace is inconsistent")
+        # The per-task children file is optional in Linux kernels. PPid is
+        # always available, and a subreaper's direct children remain allocated
+        # until this process reaps them, including exited zombies.
+        for selected in Path("/proc").iterdir():
+            require(time.monotonic() < deadline and (cancel_at is None or time.monotonic() < cancel_at + 4),
+                    "driver descendant inspection exceeded its cleanup budget", 5)
+            if not selected.name.isdecimal():
+                continue
+            try:
+                lines = (selected / "status").read_text(errors="replace").splitlines()
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue
+            parent = next((line.split()[1] for line in lines if line.startswith("PPid:")), None)
+            if parent != str(own[0]):
+                continue
+            ids = namespace_ids(lines)
+            require(len(ids) >= len(own), "driver child escaped PID custody")
+            yield ids[len(own) - 1]
+
+    def settle():
+        if driver is None:
+            return
+        if driver.returncode is None:
+            kill_group(driver, signal.SIGKILL)
+        # Popen must reap its actual child before broad subreaper collection:
+        # otherwise subprocess could lose its status and report a false zero.
+        driver.wait()
+        deadline = (cancel_at + 4) if cancel_at is not None else time.monotonic() + 4
+        while True:
+            try:
+                while os.waitpid(-1, os.WNOHANG)[0]:
+                    pass
+            except ChildProcessError:
+                return
+            for selected in owned_children(deadline):
+                try:
+                    os.kill(selected, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            require(time.monotonic() < deadline, "driver descendants did not stop before receipt publication", 5)
+            time.sleep(0.02)
+
+    try:
+        os.setsid()
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(sig, cancel)
+        # Linux is already required for execution. Adopt orphaned descendants
+        # so an escaped background writer cannot keep mutating sealed evidence.
+        import ctypes
+        require(ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0,
+                "cannot establish driver descendant custody", 3)
+        with open(attempt / "stdout.json", "xb") as out, open(attempt / "stderr.log", "xb") as err:
+            os.dup2(out.fileno(), 1)
+            os.dup2(err.fileno(), 2)
+        try:
+            os.write(ready_write, b"1")
+        except BrokenPipeError:
+            # Coordinator-only death does not cancel an already selected job.
+            pass
+        os.close(ready_write)
+        ready_write = None
+        driver = subprocess.Popen(["timeout", "--foreground", "--kill-after=5s", str(job["timeout"]) + "s"] + command,
+                                  env=environment, stdin=subprocess.DEVNULL, start_new_session=True,
+                                  pass_fds=(lockfd,))
+        forwarded = False
+        while driver.poll() is None:
+            if cancel_at is not None:
+                if not forwarded:
+                    kill_group(driver, signal.SIGTERM)
+                    forwarded = True
+                if time.monotonic() >= cancel_at + 3:
+                    kill_group(driver, signal.SIGKILL)
+            time.sleep(0.02)
+        observed_status = driver.wait()
+        settle()
+        require(driver_binding(job, attempt, command) == binding, "driver invocation changed during execution")
+        receipt = {"schema_version": 1, "kind": "dsr-release-driver-exit", "identity": binding,
+                   "wait_status": observed_status, "exit_code": observed_status if observed_status >= 0 else 128 - observed_status,
+                   "stdout": file_observation(attempt / "stdout.json"),
+                   "stderr": file_observation(attempt / "stderr.log"),
+                   "manifest": file_observation(manifest, optional=True),
+                   "native_checkpoint": driver_checkpoint(job, session)}
+        write(attempt / "driver-exit.json", receipt)
+        return receipt["exit_code"]
+    except BaseException as exc:
+        try:
+            settle()
+        except BaseException:
+            pass
+        print("[release-builds] Driver supervision failed: " + str(exc), file=sys.stderr, flush=True)
+        return getattr(exc, "code", 7)
+
+def driver_completion(job, attempt, session, command, manifest, retained_manifest=None):
+    item = state["jobs"][job["id"]]["attempts"][-1]
+    evidence, data = observe_file(attempt / "driver-exit.json", contents=True, limit=1048576)
+    if "driver_exit_sha256" in item:
+        require(item["driver_exit_sha256"] == evidence["sha256"], "observed driver exit receipt changed")
+    else:
+        item["driver_exit_sha256"] = evidence["sha256"]
+        save_state()
+    receipt = json.loads(data, object_pairs_hook=pairs)
+    require(isinstance(receipt, dict) and set(receipt) == {"schema_version", "kind", "identity", "wait_status",
+            "exit_code", "stdout", "stderr", "manifest", "native_checkpoint"} and
+            type(receipt["schema_version"]) is int and receipt["schema_version"] == 1 and
+            receipt["kind"] == "dsr-release-driver-exit" and
+            receipt["identity"] == driver_binding(job, attempt, command) and
+            type(receipt["wait_status"]) is int and -64 <= receipt["wait_status"] <= 255 and
+            type(receipt["exit_code"]) is int and receipt["exit_code"] ==
+            (receipt["wait_status"] if receipt["wait_status"] >= 0 else 128 - receipt["wait_status"]),
+            "invalid or unrelated driver exit receipt")
+    observed_manifest = file_observation(manifest, optional=True)
+    if observed_manifest is None and retained_manifest is not None and receipt["manifest"] is not None:
+        # A previously selected, atomically imported shard retains the exact
+        # manifest bytes even after original compiler outputs go offline.
+        # This never substitutes for a present but changed producer manifest.
+        observed_manifest = file_observation(retained_manifest)
+        observed_manifest["path"] = str(manifest)
+    require(receipt["stdout"] == file_observation(attempt / "stdout.json") and
+            receipt["stderr"] == file_observation(attempt / "stderr.log") and
+            receipt["manifest"] == observed_manifest and
+            receipt["native_checkpoint"] == driver_checkpoint(job, session),
+            "driver evidence changed after its observed exit")
+    if job["driver"] == "dsr":
+        native_config(job, session)
+    require(file_observation(attempt / "driver-exit.json") == evidence, "driver exit receipt changed during admission")
+    return receipt, evidence
+
 def start_job(job):
     record = state["jobs"][job["id"]]
     attempt = root / "attempts" / job["id"] / ("%06d" % (len(record["attempts"]) + 1))
@@ -580,14 +833,12 @@ def start_job(job):
             if resume_id is not None:
                 native_file = session / "state/builds" / plan["tool"] / plan["tag"] / resume_id / "state.json"
                 require(digest(native_file) == resume_pin, "native state changed before driver launch")
-        item["status"] = "running"
+        item.update(status="running", supervised=True)
         save_state()
-        # A inherited high descriptor keeps the coordinator lock occupied even
-        # if the parent dies before a driver finishes. Never unlock it in a child.
-        with open(attempt / "stdout.json", "xb") as out, open(attempt / "stderr.log", "xb") as err:
-            proc = subprocess.Popen(["timeout", "--foreground", "--kill-after=5s", str(job["timeout"]) + "s"] + command,
-                                    env=environment, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
-                                    start_new_session=True, pass_fds=(lockfd,))
+        # The supervisor and actual driver both retain this inherited lock.
+        # Only the supervisor can durably report the driver's actual wait status.
+        proc = start_supervisor(job, attempt, session if job["driver"] == "dsr" else attempt,
+                                command, manifest, environment)
         active[job["id"]] = (proc, job, attempt, manifest, artifacts)
         print("[release-builds] Started " + job["id"] + "; log: " + str(attempt / "stderr.log"), file=sys.stderr)
     except (Failure, OSError, ValueError) as exc:
@@ -595,7 +846,7 @@ def start_job(job):
         save_state()
         print("[release-builds] " + job["id"] + ": " + str(exc), file=sys.stderr)
 
-def accept(job, attempt, entry, admission_dir=None):
+def accept(job, attempt, entry, admission_dir=None, completion_guard=None):
     record = state["jobs"][job["id"]]
     # Only a valid selection may be pinned: an xwin output that omits or
     # changes the selected executables fails this attempt and the retry
@@ -609,17 +860,22 @@ def accept(job, attempt, entry, admission_dir=None):
     # parser; payload acquisition still happens only after the durable pin.
     # This preserves candidates with valid manifests but missing payload bytes.
     helper("_rb_shard_manifest", entry, destination, admission_dir or attempt)
+    if completion_guard is not None:
+        completion_guard()
     # Persist the selected manifest BEFORE importing. A crash between import
     # and the completion update can only reuse that exact pinned selection.
     record["candidate"] = entry
     save_state()
     helper("_rb_import", entry, destination, admission_dir or attempt)
+    if completion_guard is not None:
+        completion_guard()
     record["complete"] = entry
     record["candidate"] = None
     record["attempts"][-1].update(status="completed", exit_code=0)
+    record["attempts"][-1].pop("completion_pending", None)
     save_state()
 
-def recover_native_import(job, record):
+def recover_native_import(job, record, completion_guard=None):
     # A persisted candidate means the coordinator observed a zero driver exit
     # and validated its completion, then selected these exact manifest bytes.
     # This is not permission to adopt a bare 'completed' native state. Retain
@@ -654,17 +910,19 @@ def recover_native_import(job, record):
     require(isinstance(value, dict) and value.get("run_id") == native["run_id"], "candidate native run changed")
     recovery = Path(tempfile.mkdtemp(prefix="admission-recovery-", dir=attempt))
     write(recovery / "selection.json", candidate)
-    accept(job, attempt, candidate, recovery)
+    accept(job, attempt, candidate, recovery, completion_guard)
     print("[release-builds] Recovered completed native import: " + job["id"], file=sys.stderr)
 
 def recover_compiled_import(job, record):
     # Selection happened only after a zero driver exit and completion admission.
     # Import failure is not compilation failure: never discard that selection
     # or run another compiler merely because the original payload is missing.
-    if job["driver"] == "dsr" and job.get("resume", False):
-        recover_native_import(job, record)
-        return
     previous = record["attempts"][-1]
+    completion_guard = (imported_completion_guard(job, record["candidate"])
+                        if previous.get("supervised") is True else None)
+    if job["driver"] == "dsr" and job.get("resume", False):
+        recover_native_import(job, record, completion_guard)
+        return
     attempt = plain(root / "attempts" / job["id"] / ("%06d" % previous["number"]), "dir")
     candidate = record["candidate"]
     require(isinstance(candidate, dict) and sha(candidate.get("manifest_sha256")), "invalid candidate pin", 2)
@@ -701,53 +959,118 @@ def recover_compiled_import(job, record):
     write(recovery / "selection.json", candidate)
     # Reuse the full collector, including exact xwin binary-set admission. A
     # successful receipt alone cannot import damaged or incomplete payloads.
-    accept(job, attempt, candidate, recovery)
+    accept(job, attempt, candidate, recovery, completion_guard)
     print("[release-builds] Recovered completed compiler import: " + job["id"], file=sys.stderr)
 
-def finish_job(item):
-    proc, job, attempt, manifest, artifacts = item
-    code = proc.wait()
-    kill_group(proc, signal.SIGKILL)
+def attempt_paths(job, attempt):
+    session = attempt
+    if job["driver"] == "dsr":
+        native = state["jobs"][job["id"]]["attempts"][-1].get("native")
+        if job.get("resume", False):
+            require(isinstance(native, dict), "supervised native attempt has no session binding")
+            session = plain(attempt.parent / ("%06d" % native["session_attempt"]), "dir")
+        command = native_command(job, session, native["resume_run_id"] if native else None)
+        artifacts = session / "output"
+        manifest = artifacts / (plan["tool"] + "-" + plan["tag"] + "-manifest.json")
+    else:
+        command = xwin_command(job, attempt)
+        manifest, artifacts = attempt / "run/release/build-manifest.json", attempt / "run/artifacts"
+    return session, command, manifest, artifacts
+
+def imported_completion_guard(job, entry, retained_manifest=None):
+    previous = state["jobs"][job["id"]]["attempts"][-1]
+    attempt = plain(root / "attempts" / job["id"] / ("%06d" % previous["number"]), "dir")
+    session, command, manifest, _ = attempt_paths(job, attempt)
+    completion, evidence = driver_completion(job, attempt, session, command, manifest, retained_manifest)
+    require(completion["exit_code"] == 0 and completion["manifest"] is not None and
+            completion["manifest"]["sha256"] == entry["manifest_sha256"],
+            "compiler candidate differs from its observed successful exit")
+    def guard():
+        current, current_evidence = driver_completion(job, attempt, session, command, manifest, retained_manifest)
+        require(current == completion and current_evidence == evidence,
+                "driver exit receipt changed before recovered completion")
+    return guard
+
+def finish_observed_job(job, attempt, session, manifest, artifacts, completion, admission_dir=None, completion_guard=None):
+    code = completion["exit_code"]
     record = state["jobs"][job["id"]]
-    try:
-        if job["driver"] == "dsr" and job.get("resume", False):
-            native = record["attempts"][-1]["native"]
-            session = attempt.parent / ("%06d" % native["session_attempt"])
-            native_config(job, session)
-            observed = native_checkpoint(job, session)
-            if observed is not None:
-                _, _, checkpoint = observed
-                require(native["run_id"] in (None, checkpoint["run_id"]), "native builder switched run identity")
-                native["run_id"] = checkpoint["run_id"]
-                write(attempt / "native-after.json", checkpoint)
+    if job["driver"] == "dsr" and job.get("resume", False):
+        native = record["attempts"][-1]["native"]
+        native_config(job, session)
+        observed = native_checkpoint(job, session)
+        if observed is not None:
+            _, _, checkpoint = observed
+            require(native["run_id"] in (None, checkpoint["run_id"]), "native builder switched run identity")
+            native["run_id"] = checkpoint["run_id"]
+            after = attempt / "native-after.json"
+            if after.exists() or after.is_symlink():
+                require(load(after) == checkpoint, "retained native completion observation changed")
             else:
-                require(native["run_id"] is None, "native builder removed its bound checkpoint")
-            if code == 0:
-                native_manifest = load(manifest)
-                require(observed is not None and checkpoint["status"] == "completed" and
-                        isinstance(native_manifest, dict) and native_manifest.get("run_id") == native["run_id"],
-                        "native success does not bind its completed run")
-        require(code == 0, "builder exited " + str(code), code if 0 < code < 256 else 5)
-        response = load(attempt / "stdout.json")
-        require(isinstance(response, dict) and type(response.get("exit_code")) is int,
-                "builder did not return a typed completion object")
-        if job["driver"] == "dsr":
-            require(response.get("command") == "build" and response.get("status") == "success" and response.get("exit_code") == 0 and
-                    isinstance(response.get("details"), dict) and response["details"].get("manifest") == str(manifest),
-                    "native completion envelope does not bind its manifest")
-            native_config(job, session if job.get("resume", False) else attempt)
+                write(after, checkpoint)
         else:
-            require(response.get("kind") == "dsr-xwin-build" and response.get("status") == "verified" and response.get("exit_code") == 0 and
-                    response.get("target") == xwin_target(job) and
-                    response.get("release_manifest") == {"path": str(manifest), "sha256": digest(manifest)}, "xwin completion receipt does not bind its manifest")
-            require_xwin_toolchain(job, attempt)
-            if "siblings" in job:
-                require(digest(attempt / "siblings.json") == job["siblings"]["sha256"], "sibling plan changed")
-        accept(job, attempt, selected(job, manifest, artifacts))
+            require(native["run_id"] is None, "native builder removed its bound checkpoint")
+        if code == 0:
+            native_manifest = load(manifest)
+            require(observed is not None and checkpoint["status"] == "completed" and
+                    isinstance(native_manifest, dict) and native_manifest.get("run_id") == native["run_id"],
+                    "native success does not bind its completed run")
+    require(code == 0, "builder exited " + str(code), code)
+    response = load(attempt / "stdout.json")
+    require(isinstance(response, dict) and type(response.get("exit_code")) is int,
+            "builder did not return a typed completion object")
+    if job["driver"] == "dsr":
+        require(response.get("command") == "build" and response.get("status") == "success" and response.get("exit_code") == 0 and
+                isinstance(response.get("details"), dict) and response["details"].get("manifest") == str(manifest),
+                "native completion envelope does not bind its manifest")
+        native_config(job, session)
+    else:
+        require(response.get("kind") == "dsr-xwin-build" and response.get("status") == "verified" and response.get("exit_code") == 0 and
+                response.get("target") == xwin_target(job) and
+                response.get("release_manifest") == {"path": str(manifest), "sha256": digest(manifest)}, "xwin completion receipt does not bind its manifest")
+        require_xwin_toolchain(job, attempt)
+        if "siblings" in job:
+            require(digest(attempt / "siblings.json") == job["siblings"]["sha256"], "sibling plan changed")
+    require(completion["manifest"] is not None and
+            file_observation(manifest) == completion["manifest"], "observed compiler manifest changed")
+    # Never repin whatever manifest happens to be present during recovery.
+    accept(job, attempt, selected(job, manifest, artifacts, completion["manifest"]["sha256"]),
+           admission_dir, completion_guard)
+
+def complete_supervised_attempt(job, attempt, recovery=False):
+    record = state["jobs"][job["id"]]
+    item = record["attempts"][-1]
+    completion = None
+    receipt = attempt / "driver-exit.json"
+    if receipt.exists() or receipt.is_symlink():
+        item["completion_pending"] = True
+        save_state()
+    try:
+        session, command, manifest, artifacts = attempt_paths(job, attempt)
+        completion, evidence = driver_completion(job, attempt, session, command, manifest)
+        directory = Path(tempfile.mkdtemp(prefix="driver-admission-recovery-", dir=attempt)) if recovery else None
+        def completion_guard():
+            current, current_evidence = driver_completion(job, attempt, session, command, manifest)
+            require(current == completion and current_evidence == evidence,
+                    "driver exit receipt changed before completion")
+        finish_observed_job(job, attempt, session, manifest, artifacts, completion, directory, completion_guard)
     except (Failure, OSError, ValueError) as exc:
-        record["attempts"][-1].update(status="failed", exit_code=getattr(exc, "code", 7))
+        if completion is not None:
+            try:
+                # A genuinely invalid producer remains eligible for the old
+                # retry policy. Changed observed evidence must stay selected,
+                # incomplete, and unavailable to a fresh compiler fallback.
+                driver_completion(job, attempt, session, command, manifest)
+                item.pop("completion_pending", None)
+            except (Failure, OSError, ValueError):
+                pass
+        item.update(status="failed", exit_code=getattr(exc, "code", 7))
         save_state()
         print("[release-builds] " + job["id"] + ": " + str(exc), file=sys.stderr)
+
+def finish_job(item):
+    proc, job, attempt, _, _ = item
+    proc.wait()
+    complete_supervised_attempt(job, attempt)
 
 try:
     class Parser(argparse.ArgumentParser):
@@ -837,9 +1160,14 @@ try:
         require(isinstance(record, dict) and set(record) == {"attempts", "complete", "candidate"} and
                 isinstance(record["attempts"], list), "invalid job checkpoint", 2)
         for number, attempt in enumerate(record["attempts"], 1):
-            require(isinstance(attempt, dict) and {"number", "status", "exit_code"} <= set(attempt) <= {"number", "status", "exit_code", "native"} and attempt["number"] == number and
+            require(isinstance(attempt, dict) and {"number", "status", "exit_code"} <= set(attempt) <=
+                    {"number", "status", "exit_code", "native", "supervised", "completion_pending", "driver_exit_sha256"} and attempt["number"] == number and
                     attempt["status"] in ("starting", "running", "failed", "interrupted", "completed") and
                     (attempt["exit_code"] is None or integer(attempt["exit_code"], 0, 255)), "invalid attempt checkpoint", 2)
+            require(("supervised" not in attempt or (attempt["supervised"] is True and job["driver"] in ("dsr", "xwin"))) and
+                    ("completion_pending" not in attempt or (attempt["completion_pending"] is True and attempt.get("supervised") is True)) and
+                    ("driver_exit_sha256" not in attempt or (sha(attempt["driver_exit_sha256"]) and attempt.get("supervised") is True)),
+                    "invalid driver completion binding", 2)
             if "native" in attempt:
                 native = attempt["native"]
                 require(job["driver"] == "dsr" and job.get("resume", False) and isinstance(native, dict) and
@@ -859,10 +1187,25 @@ try:
                     sha(entry.get("manifest_sha256")), "unbound completed build", 2)
             require(("variants" in entry) == ("variants" in job) and entry.get("variants") == job.get("variants"),
                     "completed build compiler selection changed", 2)
-            with tempfile.TemporaryDirectory(prefix=".verify-", dir=root) as temporary:
-                helper("_rb_verify_shard", entry, destination, Path(temporary))
+            try:
+                completion_guard = (imported_completion_guard(job, entry, destination / "build-manifest.json")
+                                    if record["complete"] is None and record["attempts"][-1].get("supervised") is True else None)
+                with tempfile.TemporaryDirectory(prefix=".verify-", dir=root) as temporary:
+                    helper("_rb_verify_shard", entry, destination, Path(temporary))
+                if completion_guard is not None:
+                    completion_guard()
+            except (Failure, OSError, ValueError, TypeError, KeyError) as exc:
+                if record["complete"] is not None:
+                    raise
+                record["attempts"][-1].update(status="failed", exit_code=getattr(exc, "code", 7))
+                if record["attempts"][-1].get("supervised") is True:
+                    record["attempts"][-1]["completion_pending"] = True
+                save_state()
+                print("[release-builds] " + job["id"] + ": " + str(exc), file=sys.stderr)
+                continue
             record["complete"], record["candidate"] = entry, None
             record["attempts"][-1].update(status="completed", exit_code=0)
+            record["attempts"][-1].pop("completion_pending", None)
         else:
             require(record["complete"] is None, "completed build disappeared")
             if record["candidate"] is not None and job["driver"] in ("dsr", "xwin"):
@@ -877,6 +1220,20 @@ try:
                 # Both success and rejection finish this job's work for this
                 # invocation. Independent queued jobs may still make progress.
                 continue
+            if record["attempts"]:
+                previous = record["attempts"][-1]
+                attempt = root / "attempts" / job["id"] / ("%06d" % previous["number"])
+                receipt = attempt / "driver-exit.json"
+                if previous.get("supervised") is True and (previous.get("completion_pending") is True or
+                        (previous["status"] in ("running", "starting") and (receipt.exists() or receipt.is_symlink()))):
+                    complete_supervised_attempt(job, attempt, recovery=True)
+                    # A success observed after coordinator death is recovered
+                    # in place. Corrupt observed evidence stays pinned; genuine
+                    # failed commands retain the existing explicit retry policy.
+                    if record["complete"] is not None or record["candidate"] is not None or previous.get("completion_pending") is True:
+                        continue
+                    if previous.get("driver_exit_sha256") and previous["exit_code"] == 0:
+                        continue
             if record["attempts"] and record["attempts"][-1]["status"] in ("running", "starting"):
                 record["attempts"][-1].update(status="interrupted", exit_code=5)
             record["candidate"] = None

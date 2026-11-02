@@ -178,12 +178,14 @@ Put these declarations in `repos.d/<tool>.yaml`. When that file exists, it is
 the native build authority; omitted declarations mean no additional files, and
 are not filled from the repository registry during preflight.
 
-These declarations require a native producer. A target with a nonempty
-`act_job_map` entry cannot also declare additional native files; configuration
-validation reports the target and workflow job before source staging or
-compilation. Set that target's `act_job_map` entry to `null` when selecting a
-native build. A workflow target with no additional declarations retains its
-existing artifact collection behavior.
+These declarations also opt an ordinary `act` target into exact workflow
+payload collection. Native targets read the files from their effective output
+directory; workflow jobs upload them alongside their primary release archive.
+Set a target's `act_job_map` entry to `null`, an empty string or the string
+`"null"` when selecting a native build. Typed declarations reject malformed job
+selectors, including Boolean values, before execution. A workflow target with
+no additional declarations retains its existing artifact collection behavior.
+Strict release contracts still require native producers.
 
 Names remain literal for every format, including `binary`. For example,
 `helper.EXE` is collected under that exact spelling. Each name has one configured
@@ -192,6 +194,16 @@ that differ only by case, are rejected. A platform with several target triples
 collects its additional files from its first configured triple. Primary
 executables and `workspace_binaries` retain their existing target architecture
 and executable checks.
+
+Ordinary `dsr release` also preserves these literal names. A declared companion
+must belong to its configured platform and, when target triples are configured,
+the first triple. Words such as `gnu` or `musl` in a companion name are ordinary
+filename text; they do not identify its ABI. Archive companions keep their own
+names instead of claiming the primary executable's archive aliases. The usual
+explicit `target_triple` requirement still applies to platforms with multiple
+configured variants, and primary executable names still undergo variant checks.
+Manifest hashes, complete inventory validation and upload collision checks apply
+to both primary artifacts and companions.
 
 Checksum, signature, SBOM and provenance names belong to the existing release
 metadata generators. Additional declarations cannot use `.sha256`, `.sha512`,
@@ -233,6 +245,56 @@ the focused collection and manifest regressions, and
 coverage. These use real file content and production validators with controlled
 SSH/compiler transport; they do not claim a native Windows build or installer
 execution.
+
+### Typed companions from workflow jobs
+
+An opted-in workflow job must belong to exactly one configured physical target,
+with at most one configured target triple. Distinct targets need distinct job
+names, including targets without additional declarations. DSR checks the whole
+configuration before invoking `act`; a target subset cannot hide shared jobs,
+multiple compiler variants or ambiguous primary names. This bounded contract
+does not split a matrix-wide upload among several producers.
+
+The job must upload the versioned primary name resolved by `artifact_naming`
+and `archive_format`, together with every declared companion. The primary
+format must be `tar.gz`, `tar.xz` or `zip`, and its root must contain
+`binary_name` or every selected `workspace_binaries` executable. DSR checks the
+archive's complete readable content and each configured executable's target
+format and architecture. Ordinary regular-file notices inside the archive are
+permitted. The distinct name resolved by `install_script_compat` is optional;
+when supplied, it undergoes the same primary validation.
+
+Upload ZIP wrappers may contain these files under safe nested paths. DSR
+materializes their literal basenames into a private, flat payload directory,
+rejecting missing, extra, foreign, repeated or case-colliding names. A declared
+ZIP companion remains one complete ZIP file; it is not unpacked again by
+manifest generation or CLI collection. Unversioned companions, including names
+containing words such as `musl`, retain their configured owner and first target
+triple without filename-based platform or ABI inference.
+
+An optional `<owned-primary>.sha256` upload is accepted only when it names that
+primary and contains its exact digest (a plain digest is also accepted).
+Other undeclared files, including aggregate metadata, are refused. Normal DSR
+checksum, signing, provenance and publication stages continue independently.
+
+The original transport tree and materialized payload tree remain separate in
+the worker result. Both complete inventories are frozen for resume checks;
+changed, added, removed or replaced files invalidate reuse. Linked files,
+linked directories and special entries are refused. Manifest admission repeats
+the configuration ownership, required inventory, type, hash, size and file
+identity checks before using the materialized paths.
+
+Run `bash scripts/tests/test_act_runner.sh --typed-companions-only` for the
+focused workflow tests. They launch the real worker and production collection,
+manifest and provenance code, with controlled external `act`/Docker transport
+and inert executable-header fixtures. They cover concurrent producer isolation
+and malicious or contradictory uploads; they do not claim Docker execution or
+a real compiler run.
+
+For ordinary release planning, run
+`DSR_RELEASE_RESUME_TEST_FILTER='^test_literal_companion_' bash scripts/tests/test_release_resume.sh`.
+These dry-run command tests use byte-bound manifest fixtures and the production
+configuration, naming and inventory validators, without remote requests.
 
 ## Git-aware ordinary source synchronization
 
@@ -324,6 +386,38 @@ receipt validation with a controlled uploader that writes actual ZIP files;
 it covers concurrent success and failure, a retry within the same clock
 second, retained logs, and isolated HOME ownership. It does not execute a
 GitHub Actions job inside a container.
+
+The coordinator also owns the task stream used to dispatch targets. Target
+workers start with empty stdin, so a compiler, transport or build command that
+reads stdin cannot consume undispatched tasks. Explicit input streams used by
+individual build helpers retain their existing behavior. Target failures still
+produce attempt receipts, and resume reuses completed work only after checking
+its recorded artifact bytes.
+
+Run `bash scripts/tests/test_act_orchestration.sh --dispatch-stdin-only` for the
+focused scheduler regression. It exercises six physical targets serially and
+seven physical/variant tasks with two workers, including a failed task, changed
+artifact bytes, and selective resume. Native execution is a controlled subprocess
+that deliberately reads stdin; the planner, scheduler, worker supervision and
+state/receipt validation are production code.
+
+Every native invocation also reserves a private log directory before remote
+preparation or compilation. Its `log_file` identifies that exact attempt,
+including failures and retries. Native singleton and variant builds collect
+each attempt into a fresh directory under the requested run and target; primary
+and companion basenames remain literal. Consumers must use the returned
+`artifact_paths`, `additional_artifacts` and `log_file` rather than deriving
+paths from a run ID. A retry or concurrent caller cannot replace the bytes
+referenced by an earlier result. Unavailable log storage stops execution before
+the compiler is invoked.
+
+Run `bash scripts/tests/test_act_runner_native.sh --attempt-isolation-only`
+for this boundary. The test executes the production native function,
+collection, resume checks and manifest admission with tiny inert executable
+fixtures and explicitly controlled remote admission, transport and Cargo cache
+responses. It checks sequential and concurrent calls, failed retries, retained
+prior receipts, strict/variant log ownership and allocation failures. It does
+not run a compiler or qualify a native Windows host.
 
 ### dsr build flow (Linux via act)
 

@@ -90,8 +90,17 @@ log_ok() { log_info "$@"; }
 log_warn() { log_info "$@"; }
 # Explicit transport fixtures: all local source, byte and signature gates run.
 gh_resolve_tag_sha() { [[ "$1" == owner/app && "$2" == v1.2.3 ]] && printf '%s\n' "$SOURCE_SHA"; }
-gh_api() { [[ "$1" == repos/owner/app/releases/9 && "$2" == --no-cache ]] && cat "$CASE/remote.json"; }
+gh_api() {
+    [[ "$2" == --no-cache ]] || return 91
+    case "$1" in
+        repos/owner/app/releases/9) cat "$CASE/remote.json" ;;
+        repos/owner/app/releases/9/assets\?per_page=100\&page=1) jq -c .assets "$CASE/remote.json" ;;
+        *) return 91 ;;
+    esac
+}
 gh_download_release_asset() { [[ "$1" == owner/app && ! -e "$3" ]] && cp "$CASE/remote/$2" "$3"; }
+_gh_resolve_token() { printf 'fixture-token\n'; }
+curl() { printf 'Unexpected upload POST\n' >&2; return 91; }
 act_load_repo_config app >&2 || exit $?
 contract=$(config_get_release_contract_json app) || exit $?
 case "$1" in
@@ -121,6 +130,12 @@ case "$1" in
     ;;
   remote)
     _release_contract_verify_remote_assets owner/app 9 "$(jq -c .assets "$CASE/plan.json")" true v1.2.3
+    ;;
+  upload)
+    while IFS=$'\t' read -r name path; do
+      gh_upload_asset_named 'https://uploads.github.com/repos/owner/app/releases/9/assets' \
+        "$path" "$name" </dev/null || exit $?
+    done < <(jq -r '.assets[] | [.name,.path] | @tsv' "$CASE/plan.json")
     ;;
   diagnostic)
     _act_contract_for_build_purpose app "$contract" "$(jq -nc --arg target "$TARGET" '[$target]')" diagnostic-native
@@ -172,6 +187,12 @@ for identifier,a in enumerate(plan['assets'],100):
     remote['assets'].append(dict(id=identifier,name=a['name'],state='uploaded',size=a['size_bytes'],digest='sha256:'+a['sha256']))
 dump(work / 'remote.json',remote)
 invoke('remote')
+uploads = [json.loads(line) for line in invoke('upload').stdout.splitlines()]
+check('production uploader reconciles every frozen payload, aggregate and genuine signature',
+      len(uploads) == len(plan['assets']) and {a['name'] for a in uploads} == {a['name'] for a in plan['assets']})
+check('uploader leaves completed payloads, checksums and real signatures unchanged',
+      all((p.read_bytes(),p.stat().st_ino,p.stat().st_mtime_ns) == originals[p.name]
+          for p in (work / 'publication').iterdir()))
 legacy = work / 'publication/checksums.txt'
 signature = work / 'publication/checksums.txt.minisig'
 for file in (legacy,signature):
@@ -179,6 +200,8 @@ for file in (legacy,signature):
     file.write_bytes(b'wrong pre-existing bytes\n')
     invoke('verify',4)
     invoke('create',4)
+    if file == legacy:
+        invoke('upload',4)
     check('invalid ' + file.name + ' is not silently repaired', file.read_bytes() == b'wrong pre-existing bytes\n')
     file.write_bytes(original)
 held = work / 'held-legacy-aggregate'

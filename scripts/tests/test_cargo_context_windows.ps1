@@ -1,11 +1,317 @@
 # Windows runs use the production CMD launcher and Win32 handles. The explicit
-# Linux mode shares only the cache test's documented OS/process adapters; its
-# real Cargo builds are evidence of context semantics, never native CMD proof.
+# Linux Cargo mode shares the cache test's documented OS/process adapters; its
+# real builds establish context semantics. The guard-only mode names its own
+# three native-boundary adapters. Neither portable mode establishes Win32 proof.
 [CmdletBinding()]
-param([switch]$PortableStorageSemantics, [string]$BashPath, [switch]$ToolchainOnly, [switch]$CfgOnly)
+param([switch]$PortableStorageSemantics, [string]$BashPath, [switch]$ToolchainOnly, [switch]$CfgOnly,
+    [switch]$BuildGuardOnly)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+# This focused entry point does not initialize Cargo or use its OS adapters.
+# Portable runs compile the actual generated C# and check command construction;
+# only Windows runs exercise CreateProcess, sharing exclusions and Job Objects.
+function Invoke-DsrBuildGuardChecks {
+    $nativeWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+    if (-not $nativeWindows -and -not $PortableStorageSemantics) {
+        throw 'Native Windows is required; use -PortableStorageSemantics only for generator checks.'
+    }
+    if ($nativeWindows -and $PortableStorageSemantics) { throw 'Portable adapters are forbidden on Windows.' }
+    $script:BuildGuardChecks = 0
+    $guardWork = Join-Path ([IO.Path]::GetTempPath()) ('dsr-build-guard-' + [Guid]::NewGuid().ToString('N'))
+    $null = [IO.Directory]::CreateDirectory($guardWork)
+    Write-Output "Retained build guard fixtures: $guardWork"
+    $guardModule = (Resolve-Path (Join-Path $PSScriptRoot '../../src/act_runner.sh')).Path
+    $guardUtf8 = [Text.UTF8Encoding]::new($false)
+    if ($BashPath) { $guardBash = $BashPath }
+    elseif ($nativeWindows) {
+        $guardGit = (Get-Command git -CommandType Application | Select-Object -First 1).Source
+        $guardBash = Join-Path (Split-Path -Parent (Split-Path -Parent $guardGit)) 'bin/bash.exe'
+    } else { $guardBash = (Get-Command bash -CommandType Application | Select-Object -First 1).Source }
+    if (-not (Test-Path -LiteralPath $guardBash -PathType Leaf)) { throw 'Git Bash is required for build guard generation.' }
+
+    function Guard-Check {
+        param([string]$Label, [bool]$Condition)
+        if (-not $Condition) { throw "FAIL $Label" }
+        $script:BuildGuardChecks++
+        Write-Output "PASS $Label"
+    }
+    function Guard-Invoke {
+        param([string]$Executable, [string[]]$Arguments, [hashtable]$Environment=@{})
+        $info = [Diagnostics.ProcessStartInfo]::new()
+        $info.FileName = $Executable
+        $info.UseShellExecute = $false
+        $info.RedirectStandardInput = $true
+        $info.RedirectStandardOutput = $true
+        $info.RedirectStandardError = $true
+        $info.StandardOutputEncoding = $guardUtf8
+        $info.StandardErrorEncoding = $guardUtf8
+        foreach ($argument in $Arguments) { $info.ArgumentList.Add($argument) }
+        foreach ($entry in $Environment.GetEnumerator()) { $info.Environment[$entry.Key] = $entry.Value }
+        $process = [Diagnostics.Process]::new()
+        $process.StartInfo = $info
+        try {
+            $null = $process.Start()
+            $process.StandardInput.Close()
+            $stdout = $process.StandardOutput.ReadToEndAsync()
+            $stderr = $process.StandardError.ReadToEndAsync()
+            if (-not $process.WaitForExit(120000)) { $process.Kill($true); throw "Build guard fixture timed out: $Executable" }
+            return [pscustomobject]@{ExitCode=$process.ExitCode; Stdout=$stdout.GetAwaiter().GetResult(); Stderr=$stderr.GetAwaiter().GetResult()}
+        } finally { $process.Dispose() }
+    }
+    function Guard-Generate {
+        param([string]$Name, [string]$Body, [int]$Seconds=30)
+        $case = Join-Path $guardWork $Name
+        $launcher = Join-Path $case "launcher 日本語 ' quoted"
+        $null = [IO.Directory]::CreateDirectory($launcher)
+        $inputPath = Join-Path $case 'source.ps1'
+        $outputPath = Join-Path $launcher 'build.ps1'
+        [IO.File]::WriteAllText($inputPath,$Body,$guardUtf8)
+        $generator = 'source "$1" || exit $?; _act_windows_build_guard_script "$2" "$(cat "$3")"'
+        $generated = Guard-Invoke $guardBash @('-c',$generator,'_',
+            $guardModule.Replace('\','/'),[string]$Seconds,$inputPath.Replace('\','/'))
+        if ($generated.ExitCode -ne 0) { throw "Guard generation failed: $($generated.Stderr)" }
+        [IO.File]::WriteAllText($outputPath,$generated.Stdout,$guardUtf8)
+        return [pscustomobject]@{Path=$outputPath; Case=$case; Directory=$launcher;
+            Payload=(Join-Path $launcher 'payload.ps1'); Source=$Body; Generated=$generated.Stdout}
+    }
+
+    $marker = Join-Path $guardWork 'large-result.json'
+    $literal = "日本語 ' quoted `" double and spaces"
+    $largeBody = ("# Private native runtime padding; must remain inspectable.`n" * 4000) + @'
+$writeRefused=$false; $renameRefused=$false; $directoryRefused=$false; $ancestorRefused=$false
+try { $probe=[IO.File]::Open($PSCommandPath,[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::ReadWrite); $probe.Dispose() } catch { $writeRefused=$true }
+try { [IO.File]::Move($PSCommandPath,$PSCommandPath+'.moved') } catch { $renameRefused=$true }
+try { [IO.Directory]::Move($PSScriptRoot,$PSScriptRoot+'.moved') } catch { $directoryRefused=$true }
+$ancestor=[IO.Path]::GetDirectoryName($PSScriptRoot)
+try { [IO.Directory]::Move($ancestor,$ancestor+'.moved') } catch { $ancestorRefused=$true }
+$value=[pscustomobject]@{literal='日本語 '' quoted " double and spaces'; path=$PSCommandPath;
+    command=[Environment]::CommandLine; write_refused=$writeRefused; rename_refused=$renameRefused;
+    directory_refused=$directoryRefused; ancestor_refused=$ancestorRefused}
+'@
+    $largeBody += "`n[IO.File]::WriteAllText('" + $marker.Replace("'","''") + "',(`$value | ConvertTo-Json -Compress),[Text.UTF8Encoding]::new(`$false))`nexit 37"
+    $large = Guard-Generate 'large' $largeBody
+    $oldEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($largeBody))
+    Guard-Check 'real generator retains a payload beyond Linux and Windows argument budgets' (
+        $guardUtf8.GetByteCount($largeBody) -gt 131072 -and $oldEncoded.Length -gt 32767)
+    $tokens = $null; $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile($large.Path,[ref]$tokens,[ref]$parseErrors)
+    Guard-Check 'complete generated guard parses as PowerShell' ($parseErrors.Count -eq 0)
+    $payloadAssignment = $ast.Find({ param($node)
+        $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+        $node.Left -is [Management.Automation.Language.VariableExpressionAst] -and
+        $node.Left.VariablePath.UserPath -ceq 'dsrBuildScript'
+    },$true)
+    $payloadLiteral = @($payloadAssignment.Right.FindAll({ param($node)
+        $node -is [Management.Automation.Language.StringConstantExpressionAst]
+    },$true))
+    Guard-Check 'PowerShell parses the exact large Unicode source literal' (
+        $payloadLiteral.Count -eq 1 -and $payloadLiteral[0].Value -ceq $largeBody)
+    $addType = @($ast.FindAll({ param($node)
+        $node -is [Management.Automation.Language.CommandAst] -and $node.GetCommandName() -ceq 'Add-Type'
+    },$true))
+    Guard-Check 'generated guard exposes one inspectable native supervisor definition' (
+        $addType.Count -eq 1 -and $addType[0].CommandElements[2] -is [Management.Automation.Language.StringConstantExpressionAst])
+    Add-Type -TypeDefinition $addType[0].CommandElements[2].Value
+    $selected = 'C:\Program Files\PowerShell\7\pwsh.exe'
+    $path = "C:\build 日本語 ' quoted\payload.ps1"
+    $command = [DSRNativeBuildGuard]::BuildCommand($selected,$path)
+    Guard-Check 'native command contains only the explicit executable and quoted file path' (
+        $command -ceq ('"'+$selected+'" -NoProfile -NonInteractive -File "'+$path+'"') -and
+        $command.Length -lt 32767 -and $command -notmatch 'EncodedCommand')
+    foreach ($invalid in @('',"C:\bad`"path.ps1","C:\bad`npath.ps1","C:\bad`rpath.ps1",("C:\bad"+[char]0+'path.ps1'),'C:\trailing\',('C:\'+('x'*32767)+'.ps1'))) {
+        $refused = $false
+        try { $null = [DSRNativeBuildGuard]::BuildCommand($selected,$invalid) } catch { $refused = $true }
+        Guard-Check 'ambiguous or oversized child script arguments are refused' $refused
+    }
+    if (-not $nativeWindows) {
+        # Replace exactly the three Win32 boundary calls, preserving every
+        # generated creation/flush/scan/hash/finally statement. These adapters
+        # provide portable file handles and a genuine pwsh child, but never
+        # claim Windows sharing, reparse or Job Object enforcement.
+        $portableAdapter = @'
+Add-Type -TypeDefinition @"
+using System;
+using System.Diagnostics;
+using System.IO;
+public static class DSRPortableBuildGuard {
+    public static IDisposable[] HoldDirectory(string path) {
+        if (!Directory.Exists(path)) throw new IOException("Missing fixture directory");
+        return new IDisposable[0];
+    }
+    public static FileStream OpenPayload(string path) {
+        if (Environment.GetEnvironmentVariable("DSR_GUARD_PORTABLE_FAULT") == "drift")
+            File.AppendAllText(path, "# changed after creation");
+        return new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+    }
+    public static int Run(string application, string script, int seconds) {
+        ProcessStartInfo info = new ProcessStartInfo();
+        info.FileName = Environment.ProcessPath;
+        info.UseShellExecute = false;
+        info.ArgumentList.Add("-NoProfile");
+        info.ArgumentList.Add("-NonInteractive");
+        info.ArgumentList.Add("-File");
+        info.ArgumentList.Add(script);
+        using (Process process = Process.Start(info)) {
+            if (!process.WaitForExit(checked(seconds * 1000))) {
+                process.Kill(true); process.WaitForExit(); return 124;
+            }
+            return process.ExitCode;
+        }
+    }
+}
+"@
+'@
+        function Guard-PortableProgram {
+            param([string]$Name, [string]$Body)
+            $program = Guard-Generate $Name $Body
+            $adapted = $program.Generated
+            foreach ($method in @('HoldDirectory','OpenPayload','Run')) {
+                $boundary = '[DSRNativeBuildGuard]::'+$method+'('
+                if ([regex]::Matches($adapted,[regex]::Escape($boundary)).Count -ne 1) {
+                    throw "Expected one explicit native boundary: $method"
+                }
+                $adapted = $adapted.Replace($boundary,('[DSRPortableBuildGuard]::'+$method+'('))
+            }
+            $program.Path = Join-Path $program.Directory 'portable.ps1'
+            [IO.File]::WriteAllText($program.Path,($portableAdapter+"`n"+$adapted),$guardUtf8)
+            return $program
+        }
+        $portablePrograms = Join-Path $guardWork 'portable-program-files'
+        $null = [IO.Directory]::CreateDirectory($portablePrograms)
+        $portableEnvironment = @{ProgramFiles=$portablePrograms}
+        $portableMarker = Join-Path $guardWork 'portable-result.txt'
+        $portableBody = ("# Retained portable staging runtime.`n"*6000) +
+            "[IO.File]::WriteAllText('"+$portableMarker.Replace("'","''")+"','"+$literal.Replace("'","''")+"',[Text.UTF8Encoding]::new(`$false))`nexit 37"
+        $portable = Guard-PortableProgram 'portable-large' $portableBody
+        $result = Guard-Invoke ([Environment]::ProcessPath) @('-NoProfile','-NonInteractive','-File',$portable.Path) $portableEnvironment
+        [IO.File]::WriteAllText((Join-Path $guardWork 'portable-large.stderr'),$result.Stderr,$guardUtf8)
+        Guard-Check 'portable staging executes a genuine large file child with its exact exit and Unicode' (
+            $result.ExitCode -eq 37 -and [IO.File]::ReadAllText($portableMarker) -ceq $literal)
+        $withBom = [Text.UTF8Encoding]::new($true)
+        $expected = $withBom.GetPreamble() + $withBom.GetBytes($portableBody)
+        Guard-Check 'portable generated file creation retains exact BOM and payload bytes' (
+            [Convert]::ToBase64String([IO.File]::ReadAllBytes($portable.Payload)) -ceq [Convert]::ToBase64String([byte[]]$expected))
+        $released = [IO.File]::Open($portable.Payload,[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::None)
+        $released.Dispose()
+        Guard-Check 'portable completion disposes the held payload stream' $true
+
+        $collision = Guard-PortableProgram 'portable-collision' 'exit 0'
+        [IO.File]::WriteAllText($collision.Payload,'retained original',$guardUtf8)
+        $result = Guard-Invoke ([Environment]::ProcessPath) @('-NoProfile','-NonInteractive','-File',$collision.Path) $portableEnvironment
+        Guard-Check 'portable exclusive creation refuses existing bytes before child launch' (
+            $result.ExitCode -ne 0 -and [IO.File]::ReadAllText($collision.Payload) -ceq 'retained original')
+
+        $faultMarker = Join-Path $guardWork 'unexpected-child.txt'
+        $faultBody = "[IO.File]::WriteAllText('"+$faultMarker.Replace("'","''")+"','unexpected'); exit 0"
+        $drift = Guard-PortableProgram 'portable-drift' $faultBody
+        $result = Guard-Invoke ([Environment]::ProcessPath) @('-NoProfile','-NonInteractive','-File',$drift.Path) `
+            @{ProgramFiles=$portablePrograms; DSR_GUARD_PORTABLE_FAULT='drift'}
+        Guard-Check 'portable held-byte hash refuses changed source before execution' (
+            $result.ExitCode -ne 0 -and $result.Stderr -match 'Native build payload digest mismatch' -and
+            -not (Test-Path -LiteralPath $faultMarker))
+        $released = [IO.File]::Open($drift.Payload,[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::None)
+        $released.Dispose()
+        Guard-Check 'portable hash refusal still disposes its held payload stream' $true
+
+        $scannerDirectory = Join-Path $portablePrograms 'Windows Defender'
+        $null = [IO.Directory]::CreateDirectory($scannerDirectory)
+        $scanner = Join-Path $scannerDirectory 'MpCmdRun.exe'
+        [IO.File]::WriteAllText($scanner,"#!/bin/sh`nexit 42`n",$guardUtf8)
+        [IO.File]::SetUnixFileMode($scanner,[IO.UnixFileMode]493)
+        $scan = Guard-PortableProgram 'portable-scan-refusal' $faultBody
+        $result = Guard-Invoke ([Environment]::ProcessPath) @('-NoProfile','-NonInteractive','-File',$scan.Path) $portableEnvironment
+        Guard-Check 'portable scanner failure remains fatal before payload execution' (
+            $result.ExitCode -ne 0 -and $result.Stderr -match 'Native build payload security scan failed' -and
+            -not (Test-Path -LiteralPath $faultMarker))
+        Write-Output "Build guard portable generator/file checks: $script:BuildGuardChecks passed; native Win32 execution intentionally not run"
+        return
+    }
+
+    # A genuine legacy launch of these same bytes must fail at Windows process
+    # creation. No production validation or test assertions are substituted.
+    $legacyInfo = [Diagnostics.ProcessStartInfo]::new()
+    $legacyInfo.FileName = [Environment]::ProcessPath
+    $legacyInfo.UseShellExecute = $false
+    $legacyInfo.Arguments = '-NoProfile -NonInteractive -EncodedCommand ' + $oldEncoded
+    $legacyProcess = [Diagnostics.Process]::new(); $legacyProcess.StartInfo = $legacyInfo
+    $legacyError = 0
+    try { if ($legacyProcess.Start()) { $legacyProcess.Kill($true); $legacyProcess.WaitForExit() } }
+    catch {
+        $legacyFailure = $_.Exception
+        while ($null -ne $legacyFailure.InnerException) { $legacyFailure = $legacyFailure.InnerException }
+        if ($legacyFailure -isnot [ComponentModel.Win32Exception]) { throw }
+        $legacyError = $legacyFailure.NativeErrorCode
+    }
+    finally { $legacyProcess.Dispose() }
+    Guard-Check 'legacy encoded child launch exceeds the actual Windows process limit' (
+        $legacyError -eq 206 -and -not (Test-Path -LiteralPath $marker))
+
+    $result = Guard-Invoke ([Environment]::ProcessPath) @('-NoProfile','-NonInteractive','-File',$large.Path)
+    [IO.File]::WriteAllText((Join-Path $guardWork 'large.stdout'),$result.Stdout,$guardUtf8)
+    [IO.File]::WriteAllText((Join-Path $guardWork 'large.stderr'),$result.Stderr,$guardUtf8)
+    Guard-Check 'large native payload executes and retains the exact nonzero exit' ($result.ExitCode -eq 37)
+    $observed = [IO.File]::ReadAllText($marker) | ConvertFrom-Json
+    Guard-Check 'native file launch preserves Unicode and quoting without payload argv' (
+        $observed.literal -ceq $literal -and $observed.path -ceq $large.Payload -and
+        $observed.command.Length -lt 32767 -and $observed.command -notmatch 'EncodedCommand')
+    Guard-Check 'native handles exclude payload writes, deletion and ancestor substitution' (
+        $observed.write_refused -and $observed.rename_refused -and
+        $observed.directory_refused -and $observed.ancestor_refused)
+    $withBom = [Text.UTF8Encoding]::new($true)
+    $expected = $withBom.GetPreamble() + $withBom.GetBytes($largeBody)
+    Guard-Check 'retained child file contains the exact admitted bytes with a UTF-8 BOM' (
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($large.Payload)) -ceq [Convert]::ToBase64String([byte[]]$expected))
+    $released = [IO.File]::Open($large.Payload,[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::None)
+    $released.Dispose()
+    Guard-Check 'payload custody releases after the guarded process finishes' $true
+
+    $success = Guard-Generate 'success' 'exit 0'
+    $result = Guard-Invoke ([Environment]::ProcessPath) @('-NoProfile','-NonInteractive','-File',$success.Path)
+    Guard-Check 'zero exit survives native Job Object cleanup' ($result.ExitCode -eq 0)
+    $collision = Guard-Generate 'collision' 'exit 0'
+    [IO.File]::WriteAllText($collision.Payload,'retained original',$guardUtf8)
+    $result = Guard-Invoke ([Environment]::ProcessPath) @('-NoProfile','-NonInteractive','-File',$collision.Path)
+    Guard-Check 'exclusive creation refuses existing payloads without changing their bytes' (
+        $result.ExitCode -ne 0 -and [IO.File]::ReadAllText($collision.Payload) -ceq 'retained original')
+
+    $linked = Join-Path $guardWork 'linked-launcher'
+    $null = New-Item -ItemType Junction -Path $linked -Target $success.Directory
+    $linkRefused = $false; $linkedHandles = @()
+    try { $linkedHandles = [DSRNativeBuildGuard]::HoldDirectory($linked) } catch { $linkRefused = $true }
+    finally { foreach ($handle in $linkedHandles) { $handle.Dispose() } }
+    Guard-Check 'native directory custody refuses a reparse ancestor' $linkRefused
+
+    $timeoutMarker = Join-Path $guardWork 'timeout-descendant.pid'
+    $timeoutChild = Join-Path $guardWork 'timeout-descendant.ps1'
+    [IO.File]::WriteAllText($timeoutChild,('[IO.File]::WriteAllText('''+$timeoutMarker.Replace("'","''")+''',[string]$PID); Start-Sleep -Seconds 60'),$guardUtf8)
+    $timeoutBody = @'
+$info=[Diagnostics.ProcessStartInfo]::new()
+$info.FileName=Join-Path $PSHOME 'pwsh.exe'
+if (-not (Test-Path -LiteralPath $info.FileName)) { $info.FileName=Join-Path $PSHOME 'powershell.exe' }
+$info.UseShellExecute=$false
+'@
+    $timeoutBody += "`n`$info.Arguments='-NoProfile -NonInteractive -File `""+$timeoutChild.Replace("'","''")+"`"'`n`$child=[Diagnostics.Process]::Start(`$info)`nStart-Sleep -Seconds 60"
+    $timed = Guard-Generate 'timeout' $timeoutBody 10
+    $result = Guard-Invoke ([Environment]::ProcessPath) @('-NoProfile','-NonInteractive','-File',$timed.Path)
+    Guard-Check 'native guard timeout retains exit 124 after file launch' ($result.ExitCode -eq 124)
+    $descendant = [int][IO.File]::ReadAllText($timeoutMarker)
+    $descendantStopped = $false
+    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+    do {
+        $remaining = Get-Process -Id $descendant -ErrorAction SilentlyContinue
+        if ($null -eq $remaining) { $descendantStopped = $true; break }
+        try { $descendantStopped = $remaining.HasExited } finally { $remaining.Dispose() }
+        if ($descendantStopped) { break }
+        Start-Sleep -Milliseconds 50
+    } while ([DateTime]::UtcNow -lt $deadline)
+    Guard-Check 'timeout closes the owned job and stops the genuine descendant' $descendantStopped
+    Write-Output "Native Windows build guard checks: $script:BuildGuardChecks passed"
+}
+
+if ($BuildGuardOnly) { Invoke-DsrBuildGuardChecks; return }
+
 $contextTestPath = $PSCommandPath
 $cacheTestPath = Join-Path $PSScriptRoot 'test_cargo_cache_windows.ps1'
 $moduleRoot = (Resolve-Path (Join-Path $PSScriptRoot '../../src')).Path
@@ -373,7 +679,7 @@ Write-Text (Join-Path $source 'closure-dependency/Cargo.toml') "[package]`nname=
 Write-Text (Join-Path $source 'closure-dependency/src/lib.rs') 'pub fn value() -> u32 { 42 }'
 $null = Invoke-Exe $cargo @('generate-lockfile','--offline','--manifest-path',$manifest)
 $saved = @{}
-foreach ($name in @('RUSTUP_HOME','RUSTUP_TOOLCHAIN','CARGO_HOME','RUSTFLAGS','RUSTC_WRAPPER','NoDefaultCurrentDirectoryInExePath')) {
+foreach ($name in @('RUSTUP_HOME','RUSTUP_TOOLCHAIN','CARGO_HOME','CARGO_INCREMENTAL','RUSTFLAGS','RUSTC_WRAPPER','NoDefaultCurrentDirectoryInExePath')) {
     $saved[$name] = [Environment]::GetEnvironmentVariable($name,'Process')
 }
 try {
@@ -805,57 +1111,76 @@ fn main() {
     # Cargo must apply the admitted numeric settings to both build scripts
     # and rustc. Executing the real result distinguishes actual precedence
     # from a parser that merely produces a plausible receipt.
+    # Ambient incremental compilation is scrubbed; only explicitly configured
+    # environment values participate in Cargo's force/default precedence.
+    $env:CARGO_INCREMENTAL = '1'
     Write-Text (Join-Path $configSource 'src/main.rs') @'
 fn main() {
-    println!("{}:{}|{}", env!("RUST_MIN_STACK"), env!("RUST_TEST_THREADS"), env!("DSR_NUMERIC_ENV_PROBE"));
+    println!("{}:{}:{}|{}", env!("RUST_MIN_STACK"), env!("RUST_TEST_THREADS"),
+        env!("CARGO_INCREMENTAL"), env!("DSR_NUMERIC_ENV_PROBE"));
 }
 '@
     Write-Text (Join-Path $configSource 'build.rs') @'
 fn main() {
     println!("cargo:rerun-if-env-changed=RUST_MIN_STACK");
     println!("cargo:rerun-if-env-changed=RUST_TEST_THREADS");
-    println!("cargo:rustc-env=DSR_NUMERIC_ENV_PROBE={}:{}",
-        std::env::var("RUST_MIN_STACK").unwrap(), std::env::var("RUST_TEST_THREADS").unwrap());
+    println!("cargo:rerun-if-env-changed=CARGO_INCREMENTAL");
+    println!("cargo:rustc-env=DSR_NUMERIC_ENV_PROBE={}:{}:{}",
+        std::env::var("RUST_MIN_STACK").unwrap(), std::env::var("RUST_TEST_THREADS").unwrap(),
+        std::env::var("CARGO_INCREMENTAL").unwrap());
 }
 '@
     $numericCases=@(
-        @{Name='literal-default'; Config="RUST_MIN_STACK='16777216'`nRUST_TEST_THREADS=`"4`"";
+        @{Name='literal-default'; Config="RUST_MIN_STACK='16777216'`nRUST_TEST_THREADS=`"4`"`nCARGO_INCREMENTAL=`"0`"";
             Environment=@(); Minimum='16777216'; Threads='4'; Force=$false; Origin='configuration'},
-        @{Name='table-default'; Config="RUST_MIN_STACK={relative=false,value='16777216'}`nRUST_TEST_THREADS={value=`"4`",force=false}";
+        @{Name='table-default'; Config="RUST_MIN_STACK={relative=false,value='16777216'}`nRUST_TEST_THREADS={value=`"4`",force=false}`nCARGO_INCREMENTAL={relative=false,value='0'}";
             Environment=@(); Minimum='16777216'; Threads='4'; Force=$false; Origin='configuration'},
-        @{Name='table-inherited'; Config="RUST_MIN_STACK={value='16777216',force=false}`nRUST_TEST_THREADS={relative=false,value='4'}";
-            Environment=@('RUST_MIN_STACK=8388608','RUST_TEST_THREADS=2'); Minimum='8388608'; Threads='2'; Force=$false; Origin='environment'},
-        @{Name='table-forced'; Config="RUST_MIN_STACK={value='16777216',force=true,relative=false}`nRUST_TEST_THREADS={force=true,value='4'}";
-            Environment=@('RUST_MIN_STACK=8388608','RUST_TEST_THREADS=2'); Minimum='16777216'; Threads='4'; Force=$true; Origin='configuration'}
+        @{Name='table-inherited'; Config="RUST_MIN_STACK={value='16777216',force=false}`nRUST_TEST_THREADS={relative=false,value='4'}`nCARGO_INCREMENTAL={value='0',force=false}";
+            Environment=@('RUST_MIN_STACK=8388608','RUST_TEST_THREADS=2','CARGO_INCREMENTAL=0'); Minimum='8388608'; Threads='2'; Force=$false; Origin='environment'},
+        @{Name='table-forced'; Config="RUST_MIN_STACK={value='16777216',force=true,relative=false}`nRUST_TEST_THREADS={force=true,value='4'}`nCARGO_INCREMENTAL={force=true,value='0',relative=false}";
+            Environment=@('RUST_MIN_STACK=8388608','RUST_TEST_THREADS=2','CARGO_INCREMENTAL=0'); Minimum='16777216'; Threads='4'; Force=$true; Origin='configuration'}
     )
+    $numericCommand='"' + $proxyCargo + '" +dsr-context-selected build --release -vv -j1 --locked --offline --target ' + $hostTriple
     foreach ($case in $numericCases) {
         Write-Text $selectionConfig ("[env]`n" + $case.Config + "`n")
         $numericTarget=Join-Path $work ('numeric-env-' + $case.Name)
         $numericEnvironment=$baseEnvironment + $case.Environment + @("CARGO_TARGET_DIR=$numericTarget")
-        $numericContext=New-DsrCargoContext -BuildCommand $mutableCommand -SourceRoot $configSource -CargoHome $configHome -Environment $numericEnvironment
+        $numericContext=New-DsrCargoContext -BuildCommand $numericCommand -SourceRoot $configSource -CargoHome $configHome -Environment $numericEnvironment
         $rows=@($numericContext.ToolchainIdentity.selection.cargo_config[0].env_exemptions)
         $minimumRow=@($rows | Where-Object name -ceq 'RUST_MIN_STACK')
         $threadsRow=@($rows | Where-Object name -ceq 'RUST_TEST_THREADS')
+        $incrementalRow=@($rows | Where-Object name -ceq 'CARGO_INCREMENTAL')
         Check ("numeric $($case.Name) retains configured values and effective precedence") (
-            $rows.Count -eq 2 -and $minimumRow.Count -eq 1 -and $threadsRow.Count -eq 1 -and
+            $rows.Count -eq 3 -and $minimumRow.Count -eq 1 -and $threadsRow.Count -eq 1 -and $incrementalRow.Count -eq 1 -and
             $minimumRow[0].value -ceq '16777216' -and $threadsRow[0].value -ceq '4' -and
+            $incrementalRow[0].value -ceq '0' -and $incrementalRow[0].effective_value -ceq '0' -and
             $minimumRow[0].effective_value -ceq $case.Minimum -and $threadsRow[0].effective_value -ceq $case.Threads -and
             $minimumRow[0].force -eq $case.Force -and $threadsRow[0].force -eq $case.Force -and
+            $incrementalRow[0].force -eq $case.Force -and $incrementalRow[0].effective_force -eq $case.Force -and
             $minimumRow[0].effective_force -eq $case.Force -and $threadsRow[0].effective_force -eq $case.Force -and
-            $minimumRow[0].effective_source -ceq $case.Origin -and $threadsRow[0].effective_source -ceq $case.Origin)
+            $minimumRow[0].effective_source -ceq $case.Origin -and $threadsRow[0].effective_source -ceq $case.Origin -and
+            $incrementalRow[0].effective_source -ceq $case.Origin)
         $null=Invoke-ContextChecked $numericContext Metadata
         $numericReceiptPath=Join-Path $work ('numeric-env-' + $case.Name + '-receipt.json')
         $numericReceipt=Write-DsrCargoContextReceipt -Context $numericContext -Path $numericReceiptPath
-        $null=Invoke-ContextChecked $numericContext Build
-        $numericBinary=Join-Path $numericTarget ($hostTriple + '/debug/config-selection-probe' + $extension)
-        $expectedNumeric=$case.Minimum + ':' + $case.Threads
+        $numericBuild=Invoke-ContextChecked $numericContext Build
+        Check ("release Cargo $($case.Name) invokes the compiler without incremental codegen") (
+            $numericBuild.Stderr -match '--crate-name config_selection_probe' -and
+            $numericBuild.Stderr -notmatch '(?:-C\s*|--codegen(?:=|\s+))incremental=')
+        $numericBinary=Join-Path $numericTarget ($hostTriple + '/release/config-selection-probe' + $extension)
+        $expectedNumeric=$case.Minimum + ':' + $case.Threads + ':0'
         Check ("real Cargo $($case.Name) supplies the admitted values to build scripts and rustc") (
             (Invoke-Exe $numericBinary @()).Stdout.Trim() -ceq ($expectedNumeric + '|' + $expectedNumeric))
         Assert-DsrCargoContextReceipt -Context $numericContext -Path $numericReceiptPath `
             -Fingerprint $numericReceipt.fingerprint -ReceiptSha256 $numericReceipt.receipt_sha256
         Check ("numeric $($case.Name) retains metadata authority after genuine compilation") $true
     }
-    Write-Text $selectionConfig "[env]`nRUST_MIN_STACK={value='16777216',force=false}`nRUST_TEST_THREADS={value='4',force=false}`n"
+    Write-Text $selectionConfig "[env]`nRUST_MIN_STACK={value='16777216',force=true,relative=false}`nRUST_TEST_THREADS={force=true,value='4'}`nCARGO_INCREMENTAL={value='0',force=false,relative=false}`n"
+    Refused 'changing incremental force cannot reuse the held metadata receipt' {
+        Assert-DsrCargoContextReceipt -Context $numericContext -Path $numericReceiptPath `
+            -Fingerprint $numericReceipt.fingerprint -ReceiptSha256 $numericReceipt.receipt_sha256
+    } 'context changed'
+    Write-Text $selectionConfig "[env]`nRUST_MIN_STACK={value='16777216',force=false}`nRUST_TEST_THREADS={value='4',force=false}`nCARGO_INCREMENTAL={value='0',force=false}`n"
     Refused 'changing numeric force semantics invalidates the held metadata receipt' {
         Assert-DsrCargoContextReceipt -Context $numericContext -Path $numericReceiptPath `
             -Fingerprint $numericReceipt.fingerprint -ReceiptSha256 $numericReceipt.receipt_sha256
@@ -864,6 +1189,25 @@ fn main() {
         New-DsrCargoContext -BuildCommand $mutableCommand -SourceRoot $configSource -CargoHome $configHome `
             -Environment ($baseEnvironment + @('RUST_MIN_STACK=invalid','RUST_TEST_THREADS=2'))
     } 'Effective Cargo numeric environment is invalid'
+    foreach ($force in @('false','true')) {
+        Write-Text $selectionConfig ("[env]`nCARGO_INCREMENTAL={value='0',force=" + $force + "}`n")
+        foreach ($incremental in @('1','00','false','',' 0','0 ',('0'+[char]0x00ad),('0'+[char]0x200b))) {
+            Refused ("Cargo's incoming incremental setting is refused even with force=${force}: " + $incremental) {
+                New-DsrCargoContext -BuildCommand $numericCommand -SourceRoot $configSource -CargoHome $configHome `
+                    -Environment ($baseEnvironment + ('CARGO_INCREMENTAL=' + $incremental))
+            } 'Effective Cargo numeric environment is invalid: CARGO_INCREMENTAL'
+        }
+    }
+    foreach ($entry in @(
+        '0', 'false', '"1"', '"00"', '"false"', '""', '" 0"', '"0 "', '"0\n"',
+        '{value=0}', '{value=false}', '{value="1"}', '{value="1",force=true}', '{value="0",relative=true}',
+        '{value="0",force="true"}', '{value="0",unknown=false}', '{value="0",value="1"}'
+    )) {
+        Write-Text $selectionConfig ("[env]`nCARGO_INCREMENTAL=" + $entry + "`n")
+        Refused ('incremental compilation admission requires exactly the string zero: ' + $entry) {
+            New-DsrCargoContext -BuildCommand $mutableCommand -SourceRoot $configSource -CargoHome $configHome -Environment $baseEnvironment
+        }
+    }
     foreach ($entry in @(
         '{}', '{force=true}', '{value=4}', '{value="0"}', '{value="-1"}', '{value=" 4"}',
         '{value="4\n"}', '{value="4\u000a"}', '"4\n"',
@@ -876,6 +1220,38 @@ fn main() {
         Refused ('unsupported numeric environment value cannot receive an attestation: ' + $entry) {
             New-DsrCargoContext -BuildCommand $mutableCommand -SourceRoot $configSource -CargoHome $configHome -Environment $baseEnvironment
         }
+    }
+    foreach ($entry in @(
+        '0', '1', 'true', 'false', '""', '"1"', '"00"', '"+0"', '"-0"', '" 0"', '"0 "', '"0\n"',
+        '"0\u000a"', '"0\u0000"', '"0\u00ad"', '"0\u200b"', '"\u200b0"', '"\uff10"',
+        '{}', '{force=true}', '{value=0}', '{value="1",force=true}',
+        '{value="0",relative=true}', '{value="0",force="true"}', '{value="0",unknown=false}',
+        '{value="0",value="0"}', '{value="0",force=true,force=false}',
+        '{value="0",}', '{value="0"} extra', '{value="0"'
+    )) {
+        Write-Text $selectionConfig ("[env]`nCARGO_INCREMENTAL=" + $entry + "`n")
+        Refused ('unsupported incremental configuration cannot be hidden by an inherited zero: ' + $entry) {
+            New-DsrCargoContext -BuildCommand $mutableCommand -SourceRoot $configSource -CargoHome $configHome `
+                -Environment ($baseEnvironment + 'CARGO_INCREMENTAL=0')
+        }
+    }
+    Write-Text $selectionConfig "[env]`nCARGO_INCREMENTAL='0'`n"
+    foreach ($value in @('1','00','+0','-0',' 0','0 ','false','',('0'+[char]0x00ad),('0'+[char]0x200b))) {
+        Refused ('invalid effective incremental value cannot reach a compiler probe: ' + $value) {
+            New-DsrCargoContext -BuildCommand $mutableCommand -SourceRoot $configSource -CargoHome $configHome `
+                -Environment ($baseEnvironment + ("CARGO_INCREMENTAL=" + $value))
+        } 'Effective Cargo numeric environment is invalid: CARGO_INCREMENTAL'
+    }
+    foreach ($flags in @(@('-C','linker=cc'), @('--codegen','linker=cc'), @('-Clinker=cc'), @('--codegen=linker=cc'))) {
+        Refused 'hidden linker selection names the existing attested target-linker migration' {
+            Assert-DsrCargoRustFlags -Words $flags
+        } '\[target\.<triple>\] linker'
+    }
+    foreach ($flags in @(@('-Z','codegen-backend=hidden'), @('-Z','codegen_backend=hidden'), @('--sysroot','hidden'))) {
+        $failure=$null
+        try { Assert-DsrCargoRustFlags -Words $flags } catch { $failure=$_ }
+        Check 'other executable selectors remain refused without suggesting a target linker' (
+            $null -ne $failure -and $failure.Exception.Message -notmatch '\[target\.<triple>\] linker')
     }
     foreach ($configText in @(
         'build.rustc="hidden-rustc"', ('[build]'+"`n"+'rustc={value="hidden-rustc"}'),

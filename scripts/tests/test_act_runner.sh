@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_act_runner.sh - Unit tests for act_runner.sh module
 #
-# Usage: ./test_act_runner.sh [--workflow-isolation-only]
+# Usage: ./test_act_runner.sh [--workflow-isolation-only | --worker-admission-cancel-only | --typed-companions-only]
 #
 # Tests act integration functions without actually running Docker
 
@@ -1068,7 +1068,8 @@ print(job + ' workflow log', flush=True)
 raise SystemExit(9 if job == 'failure' else 0)
 '''
 
-driver = r'''source "$1"
+driver = r'''source "${1%/*}/config.sh"
+source "$1"
 act_check() { return 0; }
 act_platform_uses_act() { return 0; }
 act_get_job_for_target() {
@@ -1121,9 +1122,17 @@ for case in ('ordinary', 'writable-parent'):
     binary.chmod(0o755)
     (directory / 'workflow.yml').write_text(
         'name: fixture\n# ' + ('../sibling' if case == 'writable-parent' else 'ordinary') + '\n')
+    # Real worker admission resolves the repository's complete workflow plan.
+    # Keep that gate active and provide each fixture job's actual owner.
+    repos = directory / 'repos.d'
+    repos.mkdir()
+    (repos / 'fixture.yaml').write_text(
+        'targets: [linux/amd64, linux/arm64, linux/386]\n'
+        'act_job_map:\n  linux/amd64: success\n  linux/arm64: failure\n  linux/386: retry\n')
     env = os.environ.copy()
     env.update(PATH=str(directory) + os.pathsep + env['PATH'], HOME=str(home),
                DSR_WORKFLOW_FIXTURE=str(directory), DSR_CACHE_DIR=str(directory / 'cache'),
+               DSR_CONFIG_DIR=str(directory),
                ACT_ARTIFACTS_DIR=str(directory / 'artifacts'),
                ACT_LOGS_DIR=str(directory / 'logs'), ACT_TIMEOUT='20')
     output = open(directory / 'driver.log', 'wb')
@@ -1261,6 +1270,444 @@ PY
     fi
 }
 
+test_typed_workflow_companions() {
+    log_test "Actual act workers preserve typed companions and both evidence inventories"
+    if python3 - "$SRC_DIR/act_runner.sh" <<'PY'
+import copy
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import stat
+import struct
+import subprocess
+import sys
+import tarfile
+import tempfile
+import zipfile
+
+module = Path(sys.argv[1])
+root = Path(tempfile.mkdtemp(prefix="dsr-typed-act-"))
+print("Retained typed act fixture:", root, flush=True)
+checks = 0
+failures = []
+run_id = "44444444-4444-4444-8444-444444444444"
+arches = ("amd64", "arm64")
+triples = {"amd64": "x86_64-unknown-linux-gnu", "arm64": "aarch64-unknown-linux-gnu"}
+
+def check(label, condition):
+    global checks
+    checks += 1
+    print(("PASS " if condition else "FAIL ") + label, flush=True)
+    if not condition:
+        failures.append(label)
+
+def require(label, condition):
+    check(label, condition)
+    if not condition:
+        raise AssertionError(label + "; retained evidence: " + str(root))
+
+def save(path, value):
+    path.write_text(json.dumps(value, sort_keys=True) + "\n")
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+for dependency in ("bash", "git", "jq", "yq", "tar", "gzip", "unzip"):
+    require("fixture dependency is available: " + dependency, shutil.which(dependency) is not None)
+
+source = root / "source"
+source.mkdir()
+(source / "workflow.yml").write_text("name: typed transport fixture\non: push\njobs:\n"
+    "  build-amd64:\n    runs-on: ubuntu-latest\n    steps: []\n"
+    "  build-arm64:\n    runs-on: ubuntu-latest\n    steps: []\n")
+(source / "README").write_text("Owned synthetic workflow fixture; no compilation or payload execution.\n")
+for command in (("init", "--initial-branch=main"), ("add", "README", "workflow.yml"),
+                ("-c", "user.name=DSR fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "fixture"),
+                ("tag", "v1.0.0")):
+    subprocess.run(["git", "-C", str(source), *command], check=True, capture_output=True)
+source_pin = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+
+def primary(arch):
+    return "typedact-1.0.0-linux-" + arch + ".tar.gz"
+
+def compat(arch):
+    return "typedact-linux-" + arch + ".tar.gz"
+
+def metadata(arch):
+    # A filename's misleading ABI token must not override declared ownership.
+    return "metadata-musl-" + arch + ".json"
+
+def runtime(arch):
+    return "runtime-" + arch + ".zip"
+
+fixtures = root / "payload-fixtures"
+fixtures.mkdir()
+for arch, machine in (("amd64", 62), ("arm64", 183)):
+    header = bytearray(64)
+    header[:7] = b"\x7fELF\x02\x01\x01"
+    struct.pack_into("<HHI", header, 16, 2, machine, 1)
+    header.extend(("inert " + arch + " header fixture\n").encode())
+    with tarfile.open(fixtures / primary(arch), "w:gz") as archive:
+        member = tarfile.TarInfo("typedact")
+        member.size, member.mode, member.mtime = len(header), 0o755, 0
+        archive.addfile(member, io.BytesIO(header))
+    (fixtures / metadata(arch)).write_text(json.dumps({"target": "linux/" + arch, "fixture": True}) + "\n")
+    with zipfile.ZipFile(fixtures / runtime(arch), "w", zipfile.ZIP_DEFLATED) as archive:
+        member = zipfile.ZipInfo("runtime/info.json")
+        member.create_system = 3
+        member.external_attr = (stat.S_IFREG | 0o644) << 16
+        archive.writestr(member, json.dumps({"runtime": arch}).encode())
+    (fixtures / (primary(arch) + ".sha256")).write_text(digest(fixtures / primary(arch)) + "  " + primary(arch) + "\n")
+(fixtures / "invalid.json").write_bytes(b'{"duplicate":1,"duplicate":2}\n')
+(fixtures / "invalid.zip").write_bytes(b"PK\x03\x04truncated final ZIP companion")
+(fixtures / "extra.txt").write_bytes(b"unexpected workflow upload\n")
+
+base_config = dict(tool_name="typedact", repo="owner/typedact", language="go", binary_name="typedact",
+    local_path=str(source), workflow="workflow.yml", targets=["linux/" + a for a in arches],
+    target_triples={"linux/" + a: [triples[a]] for a in arches},
+    act_job_map={"linux/" + a: "build-" + a for a in arches},
+    act_overrides=dict(platform_image="fixture/no-image-download"), archive_format="tar.gz",
+    artifact_naming="${name}-${version}-${os}-${arch}", install_script_compat="${name}-${os}-${arch}",
+    workspace_additional_artifacts={"linux/" + a: [dict(name=metadata(a), format="json"),
+                                                  dict(name=runtime(a), format="zip")] for a in arches})
+
+# These are the only replaced execution boundaries. The actual act argv,
+# config parser, worker, wrapper admission, architecture/content validators,
+# collection receipts, manifest mapper, and SLSA mapper all remain production.
+transport = r'''#!/usr/bin/env python3
+import json, os, stat, sys, time, zipfile
+from pathlib import Path
+args = sys.argv[1:]
+case = Path(os.environ["DSR_TYPED_ACT_CASE"])
+fd = os.open(case / "requests.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+os.write(fd, (json.dumps(args) + "\n").encode())
+os.close(fd)
+if args == ["--version"]:
+    print("act version 0.2.86")
+    raise SystemExit(0)
+job = args[args.index("-j") + 1]
+assert job.startswith("build-")
+arch = job[len("build-"):]
+uploads = Path(args[args.index("--artifact-server-path") + 1])
+(case / (arch + ".launch.json")).write_text(json.dumps({"argv": args, "uploads": str(uploads)}))
+if os.environ.get("DSR_TYPED_ACT_BARRIER") == "1":
+    (case / (arch + ".ready")).write_text("ready\n")
+    deadline = time.monotonic() + 15
+    while not all((case / (a + ".ready")).exists() for a in ("amd64", "arm64")):
+        if time.monotonic() > deadline:
+            raise SystemExit("concurrent typed transport peer did not start")
+        time.sleep(.02)
+for wrapper in json.loads((case / "uploads.json").read_text())[arch]:
+    destination = uploads / wrapper["name"]
+    output = case / (arch + "-linked-source.zip") if wrapper.get("linked") else destination
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        for item in wrapper["members"]:
+            info = zipfile.ZipInfo(item["name"])
+            info.create_system = 3
+            info.external_attr = ((stat.S_IFLNK | 0o777) if item.get("symlink") else (stat.S_IFREG | 0o644)) << 16
+            archive.writestr(info, Path(item["source"]).read_bytes())
+    if wrapper.get("linked"):
+        destination.symlink_to(output)
+print("typed fixture uploaded " + arch, flush=True)
+'''
+worker = r'''source "$1" || exit $?
+act_load_repo_config typedact || exit $?
+status=0
+_act_run_target_worker typedact v1.0.0 44444444-4444-4444-8444-444444444444 \
+    "linux/$3" 1 "$2/$3.worker.log" "$2/$3.result.json" false null '{}' '' '' act-local release || status=$?
+[[ ! -f "$2/$3.result.json" ]] || cat "$2/$3.result.json"
+exit "$status"
+'''
+
+def make_case(label, mode="valid", change=None):
+    case = root / label
+    (case / "config/repos.d").mkdir(parents=True)
+    (case / "home").mkdir()
+    (case / "bin").mkdir()
+    for name, data in (("act", transport), ("docker", '#!/bin/sh\n[ "$1" = info ] || exit 98\n')):
+        (case / "bin" / name).write_text(data)
+        (case / "bin" / name).chmod(0o755)
+    config = copy.deepcopy(base_config)
+    if change:
+        change(config)
+    save(case / "config/repos.d/typedact.yaml", config)
+    save(case / "config/config.yaml", {})
+    save(case / "config/repos.yaml", {"tools": {}})
+    uploads = {}
+    for arch in arches:
+        def entry(name, source_name=None, **extra):
+            return dict(name=name, source=str(fixtures / (source_name or Path(name).name)), **extra)
+        payload = [entry("dist/" + primary(arch)), entry("dist/" + compat(arch), primary(arch)),
+                   entry("dist/" + primary(arch) + ".sha256")]
+        companions = [entry("reports/" + metadata(arch)), entry("assets/" + runtime(arch))]
+        if mode == "no-compat":
+            payload = [e for e in payload if Path(e["name"]).name != compat(arch)]
+        elif mode == "missing-primary":
+            payload = [e for e in payload if Path(e["name"]).name != primary(arch)]
+        elif mode == "missing-companion":
+            companions = companions[1:]
+        elif mode == "extra":
+            companions.append(entry("extra.txt"))
+        elif mode == "foreign":
+            other = "arm64" if arch == "amd64" else "amd64"
+            companions.append(entry(primary(other)))
+        elif mode == "duplicate":
+            companions.append(entry("another/" + primary(arch)))
+        elif mode == "case-alias":
+            payload.append(entry("other/" + metadata(arch).upper(), metadata(arch)))
+        elif mode == "invalid-json":
+            companions[0]["source"] = str(fixtures / "invalid.json")
+        elif mode == "invalid-zip":
+            companions[1]["source"] = str(fixtures / "invalid.zip")
+        elif mode == "invalid-checksum":
+            payload[2]["source"] = str(fixtures / "extra.txt")
+        elif mode in ("wrong-machine", "wrong-compat-machine"):
+            payload[0 if mode == "wrong-machine" else 1]["source"] = str(fixtures / primary("arm64" if arch == "amd64" else "amd64"))
+        elif mode == "traversal":
+            companions[0]["name"] = "../escaped-" + metadata(arch)
+        elif mode == "member-symlink":
+            companions[0]["symlink"] = True
+        uploads[arch] = [dict(name="primary-upload.zip", members=payload),
+                         dict(name="companion-upload.zip", members=companions)]
+        if mode in ("colliding-wrapper-name", "missing-inner-zip"):
+            uploads[arch] = [dict(name="primary-upload.zip", members=payload),
+                             dict(name="metadata-upload.zip", members=companions[:1]),
+                             dict(name=runtime(arch), members=companions[1:])]
+            if mode == "missing-inner-zip":
+                uploads[arch][2]["members"] = [entry("extra.txt")]
+        if mode == "wrapper-symlink":
+            uploads[arch][1]["linked"] = True
+    save(case / "uploads.json", uploads)
+    return case
+
+def environment(case, concurrent=False):
+    env = os.environ.copy()
+    env.update(PATH=str(case / "bin") + os.pathsep + env["PATH"], HOME=str(case / "home"),
+        XDG_CONFIG_HOME=str(case / "home/.config"), DSR_TYPED_ACT_CASE=str(case),
+        DSR_TYPED_ACT_BARRIER="1" if concurrent else "0", DSR_CONFIG_DIR=str(case / "config"),
+        DSR_CONFIG_FILE=str(case / "config/config.yaml"), DSR_REPOS_FILE=str(case / "config/repos.yaml"),
+        DSR_HOSTS_FILE=str(case / "config/hosts.yaml"), DSR_STATE_DIR=str(case / "state"),
+        DSR_CACHE_DIR=str(case / "cache"), ACT_ARTIFACTS_DIR=str(case / "artifacts"),
+        ACT_LOGS_DIR=str(case / "logs"), ACT_TIMEOUT="25", NO_COLOR="1")
+    return env
+
+def launch(case, arch="amd64", concurrent=False):
+    return subprocess.Popen(["bash", "-c", worker, "_", str(module), str(case), arch],
+        env=environment(case, concurrent), stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+
+def finish(case, arch, process):
+    try:
+        out, err = process.communicate(timeout=40)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGTERM)
+        out, err = process.communicate(timeout=10)
+        raise AssertionError("typed act worker timed out: " + str(case))
+    (case / (arch + ".stdout")).write_bytes(out)
+    (case / (arch + ".stderr")).write_bytes(err)
+    result_path = case / (arch + ".result.json")
+    return process.returncode, json.loads(result_path.read_text()) if result_path.is_file() else {}
+
+def reusable(case, result):
+    return subprocess.run(["bash", "-c", 'source "$1"; _act_target_result_available "$2"',
+        "_", str(module), json.dumps(result)], env=environment(case), capture_output=True, timeout=10).returncode == 0
+
+def manifest(case, results, label, expected=0):
+    wanted = sorted(r["platform"] for r in results)
+    inventory = dict(tool="typedact", version="v1.0.0", run_id=run_id, git_sha=source_pin, git_ref="v1.0.0",
+        requested_targets=wanted, status="success", summary=dict(total=len(results), success=len(results), failed=0),
+        build_purpose="release", publishable=True, source_dependencies=[], targets=results)
+    selected, output = case / (label + "-inventory.json"), case / (label + "-manifest.json")
+    save(selected, inventory)
+    command = r'''source "$1" || exit $?
+act_load_repo_config typedact || exit $?
+act_generate_manifest "$(cat "$2")" "$3"
+'''
+    completed = subprocess.run(["bash", "-c", command, "_", str(module), str(selected), str(output)],
+        env=environment(case), capture_output=True, timeout=30)
+    (case / (label + "-manifest.stderr")).write_bytes(completed.stderr)
+    check(label + ": real manifest admission has expected outcome",
+          completed.returncode == expected and (output.is_file() if expected == 0 else not output.exists()))
+    return output if completed.returncode == 0 else None
+
+case = make_case("concurrent-success")
+processes = {a: launch(case, a, True) for a in arches}
+results = {}
+try:
+    for arch, process in processes.items():
+        status, result = finish(case, arch, process)
+        require(arch + ": actual concurrent worker accepts the complete typed output", status == 0 and result.get("status") == "success")
+        results[arch] = result
+finally:
+    for process in processes.values():
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.communicate(timeout=10)
+
+for arch, result in results.items():
+    wrappers, payload = Path(result["workflow_artifact_dir"]), Path(result["workflow_payload_dir"])
+    expected_payloads = {primary(arch), compat(arch), primary(arch) + ".sha256", metadata(arch), runtime(arch)}
+    check(arch + ": bridge owns an exact flat materialized payload inventory",
+          not result.get("artifact_dir") and {p.name for p in payload.iterdir()} == expected_payloads and
+          all(p.is_file() and not p.is_symlink() for p in payload.iterdir()))
+    check(arch + ": authoritative primaries do not duplicate typed companions",
+          {Path(p).name for p in result["artifact_paths"]} == {primary(arch), compat(arch), primary(arch) + ".sha256"} and
+          len(result["artifact_paths"]) == 3 and len(result["additional_artifacts"]) == 2 and
+          {Path(r["path"]).name for r in result["additional_artifacts"]} == {metadata(arch), runtime(arch)})
+    check(arch + ": final ZIP companion survives as exact bytes instead of being unwrapped",
+          (payload / runtime(arch)).read_bytes() == (fixtures / runtime(arch)).read_bytes() and
+          not (payload / "info.json").exists())
+    check(arch + ": unversioned misleading-ABI JSON is preserved under its exact declared name",
+          (payload / metadata(arch)).read_bytes() == (fixtures / metadata(arch)).read_bytes())
+    actual_paths = {str(p) for directory in (wrappers, payload) for p in directory.rglob("*") if p.is_file()}
+    receipts = result.get("resume_artifacts", [])
+    check(arch + ": completion receipts bind every original wrapper and materialized payload",
+          {r["path"] for r in receipts} == actual_paths and len(receipts) == len(actual_paths) and
+          all(r["sha256"] == digest(Path(r["path"])) and r["size_bytes"] == Path(r["path"]).stat().st_size for r in receipts))
+    check(arch + ": completed worker is reusable with both inventories intact", reusable(case, result))
+    check(arch + ": ordinary JSON object key reordering preserves valid receipt semantics",
+          reusable(case, json.loads(json.dumps(result, sort_keys=True))))
+    launch_record = json.loads((case / (arch + ".launch.json")).read_text())
+    check(arch + ": actual act subprocess retains target job, tag, and private upload directory",
+          launch_record["uploads"] == str(wrappers) and "build-" + arch in launch_record["argv"] and
+          "GITHUB_REF=refs/tags/v1.0.0" in launch_record["argv"])
+check("concurrent targets retain separate wrapper and payload directories",
+      all(len({results[a][field] for a in arches}) == 2 for field in ("workflow_artifact_dir", "workflow_payload_dir", "log_file")))
+output = manifest(case, list(results.values()), "complete")
+require("complete typed workflow manifest exists", output is not None)
+records = json.loads(output.read_text())["artifacts"]
+expected_names = {name for a in arches for name in (primary(a), compat(a), metadata(a), runtime(a))}
+check("manifest includes every primary and typed companion exactly once, without transport ZIPs",
+      {r["name"] for r in records} == expected_names and len(records) == len(expected_names))
+for arch in arches:
+    own = [r for r in records if r["name"] in (primary(arch), compat(arch), metadata(arch), runtime(arch))]
+    check(arch + ": manifest uses configured GNU ownership despite companion musl filename",
+          len(own) == 4 and all(r["target"] == "linux/" + arch and r["target_triple"] == triples[arch] for r in own))
+    check(arch + ": manifest hashes exact materialized final ZIP and JSON bodies",
+          all(r["sha256"] == digest(Path(results[arch]["workflow_payload_dir"]) / r["name"]) for r in own) and
+          next(r for r in own if r["name"] == runtime(arch))["archive_format"] == "zip")
+proof = case / "complete.intoto.jsonl"
+with proof.open("wb") as out:
+    statement_result = subprocess.run(["bash", "-c", 'source "$1/slsa.sh"; _slsa_manifest_statement "$2" owner/typedact dsr:typed-act-fixture',
+        "_", str(module.parent), str(output)], stdout=out, stderr=subprocess.PIPE, env=environment(case), timeout=20)
+(case / "proof.stderr").write_bytes(statement_result.stderr)
+require("production SLSA mapper accepts complete typed workflow manifest", statement_result.returncode == 0)
+statement = json.loads(proof.read_text())
+check("SLSA subjects bind each complete payload digest exactly once",
+      {s["name"]: s["digest"]["sha256"] for s in statement["subject"]} == {r["name"]: r["sha256"] for r in records} and
+      len(statement["subject"]) == len(records))
+check("SLSA preserves platform ownership and binds the manifest containing explicit GNU triples",
+      {r["name"]: r["target"] for r in statement["dsr_evidence"]["artifacts"]} == {r["name"]: r["target"] for r in records} and
+      statement["dsr_evidence"]["manifest_sha256"] == digest(output) and
+      statement["predicate"]["runDetails"]["byproducts"][0]["digest"]["sha256"] == digest(output))
+
+# Recheck real resume and manifest admission after mutations of either complete
+# directory. Restore private evidence through renames; retain every adversarial
+# object, including links, instead of deleting failed fixtures.
+result = results["amd64"]
+for index, mutation in enumerate(("wrapper-bytes", "wrapper-added", "wrapper-missing", "wrapper-link", "wrapper-dir-link",
+                                  "payload-bytes", "payload-added", "payload-missing", "payload-link", "payload-dir-link")):
+    wrappers, payload = Path(result["workflow_artifact_dir"]), Path(result["workflow_payload_dir"])
+    directory = wrappers if mutation.startswith("wrapper") else payload
+    selected = wrappers / "primary-upload.zip" if mutation.startswith("wrapper") else payload / metadata("amd64")
+    held = case / ("held-" + mutation)
+    if mutation.endswith("bytes"):
+        original = selected.read_bytes()
+        selected.write_bytes(original + b"same inode, changed evidence\n")
+        restore = lambda p=selected, data=original: p.write_bytes(data)
+    elif mutation.endswith("added"):
+        selected = directory / ("unlisted.zip" if mutation.startswith("wrapper") else "unlisted.json")
+        selected.write_bytes((fixtures / runtime("amd64")).read_bytes())
+        restore = lambda p=selected, h=held: p.rename(h)
+    elif mutation.endswith("missing"):
+        selected.rename(held)
+        restore = lambda p=selected, h=held: h.rename(p)
+    else:
+        if mutation.endswith("dir-link"):
+            selected = directory
+        selected.rename(held)
+        selected.symlink_to(held, target_is_directory=held.is_dir())
+        def restore(p=selected, h=held):
+            p.rename(Path(str(h) + "-link"))
+            h.rename(p)
+    try:
+        check(mutation + ": frozen worker cannot be resumed", not reusable(case, result))
+        manifest(case, list(results.values()), "drift-" + str(index), 4)
+    finally:
+        restore()
+    check(mutation + ": exact evidence restoration restores availability", reusable(case, result))
+
+optional_case = make_case("optional-compat", "no-compat")
+status, optional = finish(optional_case, "amd64", launch(optional_case))
+check("configured compatibility primary remains optional", status == 0 and optional.get("status") == "success" and
+      compat("amd64") not in {Path(p).name for p in optional.get("artifact_paths", [])})
+
+named_case = make_case("colliding-wrapper-name", "colliding-wrapper-name")
+status, named = finish(named_case, "amd64", launch(named_case))
+require("transport wrapper may share the final ZIP companion's basename", status == 0 and named.get("status") == "success")
+check("colliding wrapper name publishes exact inner ZIP bytes, never the transport container",
+      (Path(named["workflow_payload_dir"]) / runtime("amd64")).read_bytes() == (fixtures / runtime("amd64")).read_bytes() and
+      (Path(named["workflow_payload_dir"]) / runtime("amd64")).read_bytes() !=
+      (Path(named["workflow_artifact_dir"]) / runtime("amd64")).read_bytes())
+named_manifest = manifest(named_case, [named], "colliding-wrapper-name")
+check("manifest retains the inner companion ZIP digest after colliding wrapper-name admission",
+      named_manifest is not None and any(r["name"] == runtime("amd64") and r["sha256"] == digest(fixtures / runtime("amd64"))
+                                        for r in json.loads(named_manifest.read_text())["artifacts"]))
+
+for kind in ("wrapper", "payload"):
+    linked_case = make_case("retained-" + kind + "-hardlink")
+    status, linked = finish(linked_case, "amd64", launch(linked_case))
+    require(kind + " hardlink control starts with an accepted actual worker", status == 0 and linked.get("status") == "success")
+    selected = (Path(linked["workflow_artifact_dir"]) / "primary-upload.zip" if kind == "wrapper" else
+                Path(linked["workflow_payload_dir"]) / metadata("amd64"))
+    frozen = (selected.stat().st_ino, digest(selected), selected.stat().st_size)
+    os.link(selected, linked_case / "external-hardlink")
+    check(kind + " hardlink changes link count while retaining every frozen byte and file identity",
+          selected.stat().st_nlink == 2 and frozen == (selected.stat().st_ino, digest(selected), selected.stat().st_size))
+    check(kind + " hardlink blocks resume even without a byte change", not reusable(linked_case, linked))
+    manifest(linked_case, [linked], "hardlink", 4)
+
+for mode in ("missing-primary", "missing-companion", "extra", "foreign", "duplicate", "case-alias", "invalid-json", "invalid-zip", "invalid-checksum",
+             "wrong-machine", "wrong-compat-machine", "traversal", "member-symlink", "wrapper-symlink", "missing-inner-zip"):
+    rejected = make_case("reject-" + mode, mode)
+    status, refused = finish(rejected, "amd64", launch(rejected))
+    check(mode + ": invalid actual upload fails worker publication",
+          status != 0 and refused.get("status") not in ("success", "ok", "passed") and not refused.get("resume_artifacts"))
+    check(mode + ": test reached the real act subprocess without escaping its upload boundary",
+          (rejected / "amd64.launch.json").is_file() and not list(root.rglob("escaped-*.json")))
+
+def share_job_with_untyped_peer(config):
+    config["act_job_map"]["linux/arm64"] = "build-amd64"
+    config["workspace_additional_artifacts"]["linux/arm64"] = []
+
+for label, change in (
+    ("multiple-act-variants", lambda c: c["target_triples"]["linux/amd64"].append("x86_64-unknown-linux-musl")),
+    ("nonselected-act-variants", lambda c: c["target_triples"]["linux/arm64"].append("aarch64-unknown-linux-musl")),
+    ("ambiguous-primary-owner", lambda c: c.update(artifact_naming="${name}-${version}", install_script_compat="${name}")),
+    ("shared-act-job", lambda c: c["act_job_map"].update({"linux/arm64": "build-amd64"})),
+    ("shared-act-job-untyped-peer", share_job_with_untyped_peer),
+    ("companion-primary-collision", lambda c: c["workspace_additional_artifacts"]["linux/arm64"].append(
+        dict(name=primary("amd64"), format="tar.gz"))),
+):
+    rejected = make_case("preflight-" + label, change=change)
+    status, refused = finish(rejected, "amd64", launch(rejected))
+    check(label + ": invalid entire ownership plan rejects before any act invocation",
+          status == 4 and not (rejected / "requests.jsonl").exists() and not refused.get("resume_artifacts"))
+
+save(root / "summary.json", dict(checks=checks, failures=failures))
+print("Typed act companions: %d checks, %d failures" % (checks, len(failures)), flush=True)
+sys.exit(bool(failures))
+PY
+    then
+        log_pass "Actual typed workflow workers preserve complete release and resume evidence"
+    else
+        log_fail "Typed workflow companion admission, publication or resume failed"
+    fi
+}
+
 test_timeout_descendant_cancellation() {
     log_test "Real timeout descendant cancellation"
     if python3 - "$SRC_DIR/act_runner.sh" <<'PY'
@@ -1334,6 +1781,267 @@ PY
     fi
 }
 
+test_timeout_owned_groups() {
+    log_test "Real timeout groups retain descendants until cleanup"
+    if python3 - "${DSR_TEST_ACT_RUNNER:-$SRC_DIR/act_runner.sh}" <<'PY'
+import ctypes
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+module = Path(sys.argv[1]).resolve()
+root = Path(tempfile.mkdtemp(prefix='dsr-timeout-owned-groups-'))
+print('Retained timeout ownership fixture: ' + str(root), flush=True)
+checks = failures = 0
+if sys.platform.startswith('linux'):
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(36, 1, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), 'PR_SET_CHILD_SUBREAPER')
+
+
+def check(label, valid):
+    global checks, failures
+    checks += 1
+    failures += not valid
+    print(('PASS: ' if valid else 'FAIL: ') + label, flush=True)
+
+
+def alive(pid):
+    state = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)],
+                           capture_output=True, text=True).stdout.strip()
+    return bool(state and not state.startswith('Z'))
+
+
+def until(predicate, seconds=5):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def fixture_signals():
+    # Bash cannot trap a signal that the invoking runtime ignored on entry.
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)
+
+
+probe = root / 'probe.py'
+probe.write_text(r'''import json, os, pathlib, signal, subprocess, sys, time
+case = pathlib.Path(sys.argv[1])
+def alive(pid):
+    state = subprocess.run(['ps','-o','stat=','-p',str(pid)],
+                           capture_output=True,text=True).stdout.strip()
+    return bool(state and not state.startswith('Z'))
+if sys.argv[2] == 'child':
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    (case / 'descendant.json').write_text(json.dumps(dict(pid=os.getpid(),pgid=os.getpgrp())))
+    while True:
+        time.sleep(0.05)
+else:
+    child=json.loads((case/'descendant.json').read_text())['pid']
+    leader=int((case/'leader.pid').read_text())
+    (case/'released.json').write_text(json.dumps(dict(alive=[p for p in (child,leader) if alive(p)])))
+''')
+leader = root / 'leader.bash'
+leader.write_text(r'''set -uo pipefail
+case_dir="$1" probe="$2" mode="$3"
+printf '%s\n' "$BASHPID" > "$case_dir/leader.pid"
+if [[ "$mode" == resistant_deadline ]]; then trap '' TERM HUP
+else trap 'exit 17' TERM HUP; fi
+python3 "$probe" "$case_dir" child &
+child=$!
+while [[ ! -s "$case_dir/descendant.json" ]]; do sleep 0.01; done
+if [[ "$mode" == completed || "$mode" == worker_completed ]]; then exit 17; fi
+wait "$child"
+''')
+driver = root / 'driver.bash'
+driver.write_text(r'''set -uo pipefail
+source "$1" || exit 90
+case_dir="$2" mode="$3" probe="$4" leader="$5"
+ACT_LOGS_DIR="$case_dir/logs"
+mkdir "$ACT_LOGS_DIR"
+seconds=30
+[[ "$mode" != *deadline ]] || seconds=1
+if [[ "$mode" == worker_* ]]; then
+    act_platform_uses_act() { return 0; }
+    selector_acquire_slot() { printf '%s\n' "$BASHPID" > "$case_dir/acquired"; }
+    selector_release_slot() { python3 "$probe" "$case_dir" release; }
+    _act_build_orchestration_target() {
+        local status=0
+        _act_run_with_timeout "$seconds" bash "$leader" "$case_dir" "$probe" "$mode" || status=$?
+        jq -nc --argjson status "$status" \
+            '{platform:"linux/amd64",host:"act-local",status:"failed",exit_code:$status,error:"fixture backend"}'
+        return "$status"
+    }
+    _act_run_target_worker tool v1.0.0 run linux/amd64 1 \
+        "$case_dir/attempt.log" "$case_dir/attempt.json" false '{}' '{}' '' '' act-local release
+else
+    # This driver must keep waiting for its managed helper when we signal the
+    # whole invocation group; only the helper owns the cancellation result.
+    trap ':' INT TERM HUP
+    status=0
+    _act_run_with_timeout "$seconds" bash "$leader" "$case_dir" "$probe" "$mode" || status=$?
+    exit "$status"
+fi
+''')
+sentinel = subprocess.Popen(['sleep', '90'], start_new_session=True)
+try:
+    for mode, expected in (('completed', 17), ('deadline', 124),
+                           ('resistant_deadline', 137), ('cancel', 143), ('interrupt', 130),
+                           ('hangup', 129), ('wrapper_lost', 137),
+                           ('worker_cancel', 130), ('worker_deadline', 124),
+                           ('worker_completed', 17)):
+        case = root / mode
+        case.mkdir()
+        process = None
+        child = None
+        group = None
+        with (case / 'transcript.log').open('w') as log:
+            started = time.monotonic()
+            try:
+                process = subprocess.Popen(['bash', str(driver), str(module), str(case),
+                                            mode, str(probe), str(leader)],
+                                           stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                           start_new_session=True, preexec_fn=fixture_signals)
+                if not until(lambda: (case / 'descendant.json').exists() and
+                             (case / 'descendant.json').stat().st_size > 0):
+                    raise RuntimeError('command descendant did not start')
+                owned = json.loads((case / 'descendant.json').read_text())
+                child, group = owned['pid'], owned['pgid']
+                check(mode + ': exercise an owned nested group',
+                      group != process.pid and os.getpgid(process.pid) == process.pid)
+                if mode == 'cancel':
+                    os.killpg(process.pid, signal.SIGTERM)
+                elif mode == 'interrupt':
+                    os.killpg(process.pid, signal.SIGINT)
+                elif mode == 'hangup':
+                    os.killpg(process.pid, signal.SIGHUP)
+                elif mode == 'worker_cancel':
+                    os.kill(process.pid, signal.SIGTERM)
+                elif mode == 'wrapper_lost':
+                    # The group anchor is a direct child of the managed
+                    # timeout wrapper. Kill that exact parent, not a PID found
+                    # by name, to exercise the parent-lifetime channel.
+                    owner = int(subprocess.check_output(
+                        ['ps', '-o', 'ppid=', '-p', str(group)], text=True).strip())
+                    check('lost wrapper belongs to this invocation',
+                          owner != process.pid and os.getpgid(owner) == process.pid)
+                    os.kill(owner, signal.SIGKILL)
+                status = process.wait(timeout=12)
+                check(mode + ': preserve actual exit status ' + str(expected), status == expected)
+                drained = until(lambda: not alive(child), 4) if mode == 'wrapper_lost' else not alive(child)
+                check(mode + ': no running descendant after managed completion', drained)
+                check(mode + ': cleanup is bounded', time.monotonic() - started < 10)
+                if mode.startswith('worker_'):
+                    receipt = json.loads((case / 'attempt.json').read_text())
+                    released = json.loads((case / 'released.json').read_text())
+                    check(mode + ': slot release follows descendant cleanup', released['alive'] == [])
+                    check(mode + ': immutable receipt records actual failed attempt',
+                          receipt.get('status') == 'failed' and receipt.get('exit_code') == expected and
+                          receipt.get('platform') == 'linux/amd64' and not receipt.get('resume_artifacts'))
+                check(mode + ': unrelated process survives', sentinel.poll() is None)
+            except Exception as error:
+                check(mode + ': ' + str(error), False)
+            finally:
+                # The fixture exclusively created these sessions/groups. With
+                # Linux subreaping, exited anchors also stay unreusable until
+                # reaped. Never search for processes by a shared program name.
+                if process is not None and process.poll() is None:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=5)
+                if child is not None and alive(child):
+                    # A live, still-owned descendant keeps its process group
+                    # from being reused even if its original leader exited.
+                    if group is not None and os.getpgid(child) == group:
+                        os.killpg(group, signal.SIGKILL)
+                    else:
+                        os.kill(child, signal.SIGKILL)
+                while True:
+                    try:
+                        if os.waitpid(-1, os.WNOHANG)[0] == 0:
+                            break
+                    except ChildProcessError:
+                        break
+
+    io_driver = root / 'io.bash'
+    io_driver.write_text(r'''set -uo pipefail
+source "$1" || exit 90
+case_dir="$2" monitor="$3"
+[[ "$monitor" != on ]] || set -m
+exec 10< "$case_dir/fd-input" 11> "$case_dir/fd-output"
+coproc FOREIGN_TIMEOUT_TEST {
+    IFS= read -r request
+    printf 'foreign:%s\n' "$request"
+    IFS= read -r acknowledged
+}
+foreign_pid="$FOREIGN_TIMEOUT_TEST_PID"
+foreign_read="${FOREIGN_TIMEOUT_TEST[0]}" foreign_write="${FOREIGN_TIMEOUT_TEST[1]}"
+before_flags="$-"
+trap ':' HUP
+before_trap=$(trap -p HUP)
+status=0
+_act_run_with_timeout 5 bash -c '
+    printf "arg1=<%s> arg2=<%s> arg3=<%s>\n" "$1" "$2" "$3"
+    cat
+    cat <&10
+    printf "fd-output\n" >&11
+    printf "real-stderr\n" >&2
+    exit 37' _ 'space argument' '' '$literal' || status=$?
+[[ "$status" == 37 && "$before_flags" == "$-" && "$before_trap" == "$(trap -p HUP)" ]] || exit 91
+printf 'intact\n' >&"$foreign_write"
+IFS= read -r -u "$foreign_read" reply || exit 92
+[[ "$reply" == foreign:intact ]] || exit 93
+printf 'acknowledged\n' >&"$foreign_write"
+wait "$foreign_pid" || exit 94
+exit 37
+''')
+    for monitor in ('on', 'off'):
+        case = root / ('streams-' + monitor)
+        case.mkdir()
+        (case / 'fd-input').write_text('fd-input\n')
+        result = subprocess.run(['bash', str(io_driver), str(module), str(case), monitor],
+                                input='real-stdin\n', text=True, capture_output=True, timeout=10,
+                                preexec_fn=fixture_signals)
+        (case / 'stdout').write_text(result.stdout)
+        (case / 'stderr').write_text(result.stderr)
+        check(monitor + ': preserve status, monitor, signal trap and foreign coprocess', result.returncode == 37)
+        check(monitor + ': preserve argument boundaries and stdin/stdout',
+              result.stdout == 'arg1=<space argument> arg2=<> arg3=<$literal>\nreal-stdin\nfd-input\n')
+        check(monitor + ': preserve an occupied output descriptor',
+              (case / 'fd-output').read_text() == 'fd-output\n')
+        check(monitor + ': preserve real stderr', 'real-stderr\n' in result.stderr)
+    fallback = subprocess.run(['bash', '-c', r'''source "$1"
+_act_timeout_cmd() { printf ''; }
+payload() { printf 'fallback:<%s>\n' "$1"; cat; return 23; }
+_act_run_with_timeout 1 payload 'space argument'
+''', '_', str(module)], input='fallback stdin\n', text=True, capture_output=True, timeout=5)
+    check('missing timeout preserves direct function status', fallback.returncode == 23)
+    check('missing timeout preserves direct function arguments and streams',
+          fallback.stdout == 'fallback:<space argument>\nfallback stdin\n')
+finally:
+    if sentinel.poll() is None:
+        sentinel.terminate()
+    sentinel.wait(timeout=5)
+
+(root / 'summary.json').write_text(json.dumps(dict(checks=checks, failures=failures)) + '\n')
+print('Owned timeout groups: %d checks, %d failures' % (checks, failures), flush=True)
+sys.exit(bool(failures))
+PY
+    then
+        log_pass "timeout groups drain resistant descendants before returning or releasing slots"
+    else
+        log_fail "timeout group ownership regression"
+    fi
+}
+
 test_workflow_process_cancellation() {
     log_test "Real workflow cancellation and bounded timeout escalation"
     if python3 - "$SRC_DIR/act_runner.sh" <<'PY'
@@ -1393,16 +2101,25 @@ try:
         marker, heartbeat = directory / 'pid.json', directory / 'heartbeat'
         workflow_file = directory / 'workflow.yml'
         workflow_file.write_text('name: fixture\n# ' + ('../sibling' if isolated else 'ordinary') + '\n')
+        # The production worker validates the complete workflow payload plan
+        # before launching act. Supply a real untyped repository document so
+        # these lifetime probes reach that launch through the actual gate.
+        repos = directory / 'repos.d'
+        repos.mkdir()
+        (repos / 'fixture.yaml').write_text(
+            'targets: [linux/amd64]\nact_job_map:\n  linux/amd64: fixture\n')
         env = os.environ.copy()
         env.update(PATH=str(directory) + os.pathsep + env['PATH'],
                    DSR_FIXTURE_MARKER=str(marker), DSR_FIXTURE_BEAT=str(heartbeat),
                    DSR_FIXTURE_RESIST_TERM='1' if resistant else '0',
                    DSR_CACHE_DIR=str(directory / 'cache'),
+                   DSR_CONFIG_DIR=str(directory),
                    ACT_ARTIFACTS_DIR=str(directory / 'artifacts'),
                    ACT_LOGS_DIR=str(directory / 'logs'),
                    ACT_TIMEOUT='1' if deadline else '30')
         if workflow:
-            script = '''source "$1"
+            script = '''source "${1%/*}/config.sh"
+source "$1"
 act_check() { return 0; }
 act_platform_uses_act() { return 0; }
 act_get_job_for_target() { printf 'fixture\\n'; }
@@ -1450,7 +2167,10 @@ _act_run_with_timeout "$ACT_TIMEOUT" act
                 time.sleep(0.1)
                 check(case + ': no post-cancellation work', heartbeat.stat().st_size == size)
             try:
-                status = process.wait(timeout=1)
+                # The target may exit immediately, while the owning worker
+                # keeps its five-second group grace before publishing a
+                # receipt. Wait within the same overall cleanup deadline.
+                status = process.wait(timeout=max(0.1, retired_by - time.monotonic()))
             except subprocess.TimeoutExpired:
                 status = None
             if deadline:
@@ -1462,13 +2182,19 @@ _act_run_with_timeout "$ACT_TIMEOUT" act
             check(case + ': caller exits with the intended failure', status in expected)
             check(case + ': unrelated process remains alive', sentinel.poll() is None)
         finally:
-            # Only this fixture's newly created groups are eligible for cleanup.
-            for group in (process.pid, None if target is None else target['group']):
-                if group is not None:
-                    try:
-                        os.killpg(group, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+            # Only groups with a still-live owned member are eligible. Do not
+            # signal a reaped invocation's potentially reusable numeric PGID.
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if target is not None and running(target['pid']):
+                try:
+                    if os.getpgid(target['pid']) == target['group']:
+                        os.killpg(target['group'], signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             process.wait(timeout=5)
             output.close()
 finally:
@@ -1653,8 +2379,287 @@ PY
     fi
 }
 
+# Cancellation before compilation must retain a real interrupted attempt and
+# release only its own capacity. The final case drives real output-conflict
+# scheduling and exact-run resume; only the compiler itself is a fixture.
+test_worker_admission_cancellation() {
+    log_test "Worker cancellation during capacity and output-conflict waits"
+    local dependency
+    for dependency in python3 jq yq; do
+        if ! command -v "$dependency" >/dev/null; then
+            log_skip "worker admission cancellation requires $dependency"
+            return
+        fi
+    done
+    if python3 - "$PROJECT_ROOT" "${DSR_TEST_ACT_RUNNER:-$SRC_DIR/act_runner.sh}" <<'PY'
+from collections import Counter
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+project, module = map(Path, sys.argv[1:])
+root = Path(tempfile.mkdtemp(prefix='dsr-admission-cancel-'))
+print('Retained admission cancellation fixture: ' + str(root), flush=True)
+checks = 0
+
+
+def check(label, valid):
+    global checks
+    if not valid:
+        raise AssertionError(label)
+    checks += 1
+    print('PASS: ' + label, flush=True)
+
+
+def read(path):
+    return json.loads(path.read_text())
+
+
+def stop(process):
+    if process is not None and process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+
+
+def wait_for(process, predicate, label):
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        if process.poll() is not None:
+            break
+        time.sleep(0.02)
+    raise AssertionError(label)
+
+
+def launch(case, script, phase, extra=None):
+    env = dict(os.environ, DSR_ADMISSION_PROJECT=str(project), DSR_ADMISSION_MODULE=str(module),
+               DSR_ADMISSION_CASE=str(case), DSR_ADMISSION_PHASE=phase,
+               DSR_CONFIG_DIR=str(case / 'config'), DSR_HOSTS_FILE=str(case / 'config/hosts.yaml'),
+               DSR_STATE_DIR=str(case / 'state'), ACT_REPOS_DIR=str(case / 'config/repos.d'),
+               ACT_LOGS_DIR=str(case / 'logs'), ACT_ARTIFACTS_DIR=str(case / 'artifacts'),
+               DSR_DISABLE_HOST_SELECTOR='1', DSR_SELECTOR_LOCK_TIMEOUT='2',
+               DSR_SELECTOR_WAIT_TIMEOUT='30', DSR_SELECTOR_POLL_MAX='1', NO_COLOR='1')
+    env.pop('DSR_BUILD_LOCK_HELD_BY_CALLER', None)
+    env.update(extra or {})
+    with open(case / (phase + '.stdout'), 'wb') as out, open(case / (phase + '.stderr'), 'wb') as err:
+        return subprocess.Popen(['bash', '-c', script], env=env, stdin=subprocess.DEVNULL,
+                                stdout=out, stderr=err, start_new_session=True)
+
+
+def fixture(name, capacity=1):
+    case = root / name
+    for directory in ('config/repos.d', 'state', 'source', 'output'):
+        (case / directory).mkdir(parents=True, exist_ok=True)
+    (case / 'config/hosts.yaml').write_text(json.dumps({'hosts': {
+        'shared': {'platform': 'linux/amd64', 'connection': 'local', 'concurrency': capacity}}}))
+    return case
+
+
+check('stdin isolation tests require the actual null device', stat.S_ISCHR(os.stat(os.devnull).st_mode))
+holder_script = r'''
+source "$DSR_ADMISSION_PROJECT/src/host_selector.sh"
+selector_acquire_slot shared unrelated || exit 1
+trap 'selector_release_slot shared unrelated' EXIT
+trap 'exit 0' INT TERM
+: > "$DSR_ADMISSION_CASE/holder.ready"
+while :; do sleep 0.05; done
+'''
+worker_script = r'''
+source "$DSR_ADMISSION_PROJECT/src/host_selector.sh"
+source "$DSR_ADMISSION_MODULE"
+act_platform_uses_act() { return 0; }
+_act_build_orchestration_target() {
+    : > "$DSR_ADMISSION_CASE/unexpected-build"
+    cat > "$DSR_ADMISSION_CASE/unexpected.stdin"
+    return 99
+}
+if [[ "$DSR_ADMISSION_PHASE" == waiting ]]; then
+    # Observe the real selector's first capacity backoff, after its locked
+    # attempt found the holder. Do not substitute the lease or its result.
+    sleep() { : > "$DSR_ADMISSION_CASE/worker.ready"; command sleep "$@"; }
+else
+    # The real lease has been atomically granted, but acquire has not returned.
+    _sel_log_ok() {
+        : > "$DSR_ADMISSION_CASE/worker.ready"
+        while :; do command sleep 0.05; done
+    }
+fi
+_act_run_target_worker fixture 1.0.0 55555555-5555-4555-8555-555555555555 \
+    linux/amd64 1 "$DSR_ADMISSION_CASE/worker.log" "$DSR_ADMISSION_CASE/result.json" \
+    false null '{}' '' '' shared release
+'''
+for mode in ('waiting', 'granted'):
+    case = fixture('capacity-' + mode)
+    (case / 'worker.log').touch()
+    holder = worker = None
+    locks = case / 'state/selector/locks/shared'
+    try:
+        if mode == 'waiting':
+            holder = launch(case, holder_script, 'holder')
+            wait_for(holder, lambda: (case / 'holder.ready').exists(), 'capacity holder did not start')
+            retained_holder = (locks / 'unrelated.lock').read_bytes()
+        worker = launch(case, worker_script, mode)
+        wait_for(worker, lambda: (case / 'worker.ready').exists(), 'worker did not reach ' + mode)
+        own_slot = locks / '55555555-5555-4555-8555-555555555555-linux-amd64-attempt-1.lock'
+        check(mode + ': the barrier observes the intended real lease state', own_slot.exists() == (mode == 'granted'))
+        worker.send_signal(signal.SIGTERM)
+        check(mode + ': interrupted admission preserves exit 130', worker.wait(timeout=8) == 130)
+        check(mode + ': cancellation retains an immutable attempt receipt',
+              (case / 'result.json').is_file() and read(case / 'result.json')['exit_code'] == 130 and
+              read(case / 'result.json')['status'] == 'failed' and
+              read(case / 'result.json')['task_key'] == 'linux/amd64')
+        check(mode + ': capacity admission never starts compilation', not (case / 'unexpected-build').exists())
+        check(mode + ': cancellation leaves no owned capacity lease', not own_slot.exists())
+        if holder is not None:
+            check('waiting: cancellation preserves the live unrelated holder and its exact lease',
+                  holder.poll() is None and (locks / 'unrelated.lock').read_bytes() == retained_holder)
+    finally:
+        stop(worker)
+        stop(holder)
+
+# A failed immutable-result write must release the real worker lease before
+# returning from the function: an EXIT trap runs after its locals unwind.
+# Keep a peer alive so garbage collection cannot disguise ownership mistakes.
+case = fixture('receipt-write-failure', capacity=2)
+(case / 'result.json').mkdir()
+receipt_failure_script = r'''
+source "$DSR_ADMISSION_PROJECT/src/host_selector.sh"
+source "$DSR_ADMISSION_MODULE"
+act_platform_uses_act() { return 0; }
+_act_build_orchestration_target() {
+    cat "$DSR_ADMISSION_CASE/state/selector/locks/shared/55555555-5555-4555-8555-555555555555-linux-amd64-attempt-1.lock" \
+        > "$DSR_ADMISSION_CASE/acquired-lease.json" || return 99
+    printf '%s\n' '{"platform":"linux/amd64","status":"failed","exit_code":9,"error":"deliberate build failure before receipt write"}'
+    return 9
+}
+_act_run_target_worker fixture 1.0.0 55555555-5555-4555-8555-555555555555 \
+    linux/amd64 1 "$DSR_ADMISSION_CASE/worker.log" "$DSR_ADMISSION_CASE/result.json" \
+    false null '{}' '' '' shared release
+'''
+holder = worker = None
+locks = case / 'state/selector/locks/shared'
+try:
+    holder = launch(case, holder_script, 'holder')
+    wait_for(holder, lambda: (case / 'holder.ready').exists(), 'receipt-failure peer did not start')
+    retained_holder = (locks / 'unrelated.lock').read_bytes()
+    worker = launch(case, receipt_failure_script, 'receipt-failure')
+    check('receipt failure: immutable-result write failure remains nonzero', worker.wait(timeout=10) == 4)
+    check('receipt failure: target ran under a genuine owned capacity lease',
+          read(case / 'acquired-lease.json')['pid'] == worker.pid and
+          b'deliberate build failure before receipt write' in (case / 'worker.log').read_bytes())
+    own_slot = locks / '55555555-5555-4555-8555-555555555555-linux-amd64-attempt-1.lock'
+    check('receipt failure: failed publication releases the worker lease', not own_slot.exists())
+    check('receipt failure: failure preserves the live peer and its exact lease',
+          holder.poll() is None and (locks / 'unrelated.lock').read_bytes() == retained_holder)
+    check('receipt failure: no success receipt or artifact is fabricated',
+          (case / 'result.json').is_dir() and not list((case / 'output').iterdir()) and
+          b'unbound variable' not in (case / 'receipt-failure.stderr').read_bytes())
+finally:
+    stop(worker)
+    stop(holder)
+
+case = fixture('output-conflict', capacity=2)
+targets = ['linux/amd64', 'linux/arm64', 'darwin/arm64']
+identity = str(uuid.uuid4())
+(case / 'config/repos.d/conflictfixture.yaml').write_text(json.dumps({
+    'tool_name': 'conflictfixture', 'repo': 'fixture/conflictfixture', 'language': 'go',
+    'local_path': str(case / 'source'), 'binary_name': 'fixture', 'targets': targets,
+    'env': {'GOBIN': str(case / 'shared-output')},
+    'cross_compile': {target: {'host': 'shared'} for target in targets}}))
+coordinator_script = r'''
+source "$DSR_ADMISSION_PROJECT/src/logging.sh"
+source "$DSR_ADMISSION_PROJECT/src/config.sh"
+source "$DSR_ADMISSION_PROJECT/src/build_state.sh"
+source "$DSR_ADMISSION_PROJECT/src/host_selector.sh"
+source "$DSR_ADMISSION_MODULE"
+act_run_native_build() {
+    local slug="${2//\//-}.attempt-$attempt" artifact
+    printf '%s %s\n' "$2" "$attempt" >> "$DSR_ADMISSION_CASE/invocations"
+    cat > "$DSR_ADMISSION_CASE/$slug.stdin"
+    if [[ "$DSR_ADMISSION_PHASE" == first ]]; then while :; do sleep 0.05; done; fi
+    artifact="$DSR_ADMISSION_CASE/output/$slug.bin"
+    printf 'artifact %s\n' "$2" > "$artifact"
+    jq -nc --arg platform "$2" --arg path "$artifact" \
+        '{platform:$platform,method:"native",status:"success",exit_code:0,artifact_path:$path,artifact_paths:[$path]}'
+}
+args=(--run-id "$DSR_ADMISSION_RUN")
+[[ "$DSR_ADMISSION_PHASE" != resume ]] || args=(--resume-run-id "$DSR_ADMISSION_RUN")
+act_orchestrate_build conflictfixture 1.0.0 --parallel-jobs 2 --no-source-sync-gate \
+    --output-dir "$DSR_ADMISSION_CASE/output" "${args[@]}"
+'''
+process = None
+try:
+    process = launch(case, coordinator_script, 'first', {'DSR_ADMISSION_RUN': identity})
+    wait_for(process, lambda: (case / 'invocations').exists() and
+             b'waiting for that build to finish' in (case / 'first.stderr').read_bytes(),
+             'second target did not reach the real shared-output wait')
+    process.send_signal(signal.SIGTERM)
+    check('output conflict: cancellation drains the active worker and returns 130', process.wait(timeout=10) == 130)
+    first = read(case / 'first.stdout')
+    workspace = case / 'state/builds/conflictfixture/1.0.0' / identity
+    state = read(workspace / 'state.json')
+    check('output conflict: only the admitted target ran', (case / 'invocations').read_text().splitlines() == [targets[0] + ' 1'])
+    for target, row in zip(targets[1:], first['targets'][1:]):
+        saved = state['target_statuses'][target]
+        check('output conflict: ' + target + ' stays pending with zero attempts',
+              saved['status'] == 'pending' and saved['attempts'] == 0 and row['status'] == 'skipped')
+    check('output conflict: no queued target reserves an immutable log or result',
+          not any(p.name.startswith(('002-', '003-'))
+                  for directory in ('logs', 'results') for p in (workspace / directory).iterdir()))
+    receipts = {p: hashlib.sha256(p.read_bytes()).hexdigest()
+                for directory in ('logs', 'results') for p in (workspace / directory).iterdir() if p.is_file()}
+    process = launch(case, coordinator_script, 'resume', {'DSR_ADMISSION_RUN': identity})
+    check('output conflict: exact-run resume completes successfully', process.wait(timeout=30) == 0)
+    resumed = read(case / 'resume.stdout')
+    state = read(workspace / 'state.json')
+    check('output conflict: every queued target runs once and the interrupted target retries once',
+          Counter((case / 'invocations').read_text().splitlines()) ==
+          Counter([targets[0] + ' 1', targets[0] + ' 2', targets[1] + ' 1', targets[2] + ' 1']))
+    check('output conflict: resume preserves ordered results and truthful attempt counters',
+          resumed['run_id'] == identity and resumed['summary'] == {'total': 3, 'success': 3, 'failed': 0} and
+          [r['platform'] for r in resumed['targets']] == targets and
+          [state['target_statuses'][target]['attempts'] for target in targets] == [2, 1, 1] and
+          state['status'] == 'targets-complete')
+    check('output conflict: resume preserves prior immutable receipt bytes',
+          all(hashlib.sha256(p.read_bytes()).hexdigest() == digest for p, digest in receipts.items()))
+    check('output conflict: stdin-reading descendants receive EOF on every attempt',
+          len(list(case.glob('*.stdin'))) == 4 and all(p.stat().st_size == 0 for p in case.glob('*.stdin')))
+finally:
+    stop(process)
+print('Worker admission cancellation: %d passed, 0 failed' % checks, flush=True)
+PY
+    then
+        log_pass "capacity and output-conflict cancellation preserve leases, receipts and resume"
+    else
+        log_fail "worker admission cancellation regression"
+    fi
+}
+
 # Main
 main() {
+    if [[ "${1:-}" == "--typed-companions-only" ]]; then
+        test_typed_workflow_companions
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return
+    fi
+    if [[ "${1:-}" == "--worker-admission-cancel-only" ]]; then
+        test_worker_admission_cancellation
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return
+    fi
     if [[ "${1:-}" == "--workflow-isolation-only" ]]; then
         test_concurrent_workflow_isolation
         [[ "$FAIL_COUNT" -eq 0 ]]
@@ -1667,6 +2672,7 @@ main() {
     fi
     if [[ "${1:-}" == "--timeout-only" ]]; then
         test_timeout_descendant_cancellation
+        test_timeout_owned_groups
         test_workflow_process_cancellation
         [[ "$FAIL_COUNT" -eq 0 ]]
         return
@@ -1696,9 +2702,12 @@ main() {
     test_act_run_workflow_requires_runner_image_mapping
     test_act_run_workflow_isolates_parent_write_workflows
     test_concurrent_workflow_isolation
+    test_typed_workflow_companions
     test_act_analyze_workflow
     test_timeout_descendant_cancellation
+    test_timeout_owned_groups
     test_workflow_process_cancellation
+    test_worker_admission_cancellation
     test_unix_native_build_guard
 
     echo ""

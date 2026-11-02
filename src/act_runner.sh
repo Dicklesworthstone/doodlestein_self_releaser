@@ -432,6 +432,304 @@ _act_validate_additional_artifact() {
     fi
 }
 
+# Opted-in workflow producers must own one physical target and one unambiguous
+# release naming family. Resolve the whole configuration before any job starts;
+# a selected subset cannot hide a second owner of the same job or asset name.
+_act_workflow_payload_plans_json() {
+    local tool="$1" version="$2" config_file="$ACT_REPOS_DIR/$1.yaml"
+    local configured document enabled module_dir target job owners triples triple format names binaries binary repo_path
+    local primary compat outputs plan plans='{}' primary_owners='[]' all_names='{}'
+    configured=$(_act_workspace_additional_artifacts_json "$config_file") || return 4
+    document=$(_config_read_single_mapping_json "$config_file") || return 4
+    enabled=$(jq -c --argjson configured "$configured" '
+        . as $doc | [$configured | to_entries[] | select(.value | length > 0) |
+        .key as $target | $doc.act_job_map[$target] as $job |
+        select(($job | type) == "string" and $job != "" and $job != "null") | $target]
+    ' <<< "$document") || return 4
+    [[ "$enabled" != '[]' ]] || { printf '{}\n'; return 0; }
+    repo_path=$(act_get_local_path "$tool") || return 4
+    if ! jq -e --argjson enabled "$enabled" '
+        (.targets | type == "array") and (($enabled - .targets) | length == 0)
+    ' <<< "$document" >/dev/null; then
+        _log_error "Workflow additional artifacts require their owners in the configured targets: $enabled"
+        return 4
+    fi
+    if ! declare -F artifact_naming_generate_dual_for_tool &>/dev/null; then
+        module_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" || return 3
+        # shellcheck source=SCRIPTDIR/artifact_naming.sh
+        source "$module_dir/artifact_naming.sh" || return 3
+    fi
+    while IFS= read -r target; do
+        job=$(jq -r --arg target "$target" '.act_job_map[$target]' <<< "$document") || return 4
+        owners=$(jq -c --arg job "$job" '. as $doc | [.targets[] | select($doc.act_job_map[.] == $job)]' \
+            <<< "$document") || return 4
+        if [[ "$(jq length <<< "$owners")" != 1 ]]; then
+            _log_error "Workflow job '$job' for $target has ambiguous target owners $owners; use a distinct job per typed companion producer"
+            return 4
+        fi
+        triples=$(config_get_target_triples_json "$tool" "$target") || return 4
+        if [[ "$(jq length <<< "$triples")" -gt 1 ]]; then
+            _log_error "Workflow job '$job' for $target declares multiple target triples; typed companion producers require one target variant"
+            return 4
+        fi
+    done < <(jq -r '.[]' <<< "$enabled")
+
+    # Include unselected and native targets when checking release-name owners.
+    while IFS= read -r target; do
+        format=$(jq -r --arg os "${target%/*}" '
+            if (.archive_format | type) == "object" then .archive_format[$os] // ""
+            elif (.archive_format | type) == "string" then .archive_format else "" end
+        ' <<< "$document") || return 4
+        if [[ "$format" == binary && "$target" == windows/* ]]; then
+            format=exe
+        elif [[ "$format" == none || "$format" == binary ]]; then
+            format=none
+        else
+            format=$(_act_workspace_archive_format "$config_file" "$target") || return 4
+        fi
+        triples=$(config_get_target_triples_json "$tool" "$target") || return 4
+        [[ "$triples" != '[]' ]] || triples='[""]'
+        while IFS= read -r triple; do
+            names=$(artifact_naming_generate_dual_for_tool "$tool" "$version" "${target%/*}" "${target#*/}" \
+                "$format" "$repo_path" release "$triple") || return 4
+            primary_owners=$(jq -c --arg target "$target" --argjson names "$names" \
+                '. + ([$names.versioned, $names.compat] | unique | map({target:$target,name:.}))' \
+                <<< "$primary_owners") || return 4
+            all_names=$(jq -c --arg target "$target" --argjson names "$names" \
+                '. + {($target):$names}' <<< "$all_names") || return 4
+        done < <(jq -r '.[]' <<< "$triples")
+    done < <(jq -r '.targets[]' <<< "$document")
+    if ! jq -en --argjson primary "$primary_owners" --argjson additional "$configured" '
+        [$additional[][] | .name | ascii_downcase] as $names |
+        all($primary[]; (.name | ascii_downcase) as $name | ($names | index($name)) == null)
+    ' >/dev/null; then
+        _log_error "Workflow additional artifact name collides with a configured primary or installer alias"
+        return 4
+    fi
+    while IFS= read -r target; do
+        job=$(jq -r --arg target "$target" '.act_job_map[$target]' <<< "$document") || return 4
+        names=$(jq -c --arg target "$target" '.[$target]' <<< "$all_names") || return 4
+        if ! jq -en --arg target "$target" --argjson owners "$primary_owners" --argjson names "$names" '
+            [$names.versioned, $names.compat] | map(ascii_downcase) as $own |
+            all($owners[] | select(.target != $target); (.name | ascii_downcase) as $name |
+                ($own | index($name)) == null)
+        ' >/dev/null; then
+            _log_error "Workflow job '$job' for $target has ambiguous primary names; include the platform in artifact_naming and install_script_compat"
+            return 4
+        fi
+        format=$(_act_workspace_archive_format "$config_file" "$target") || return 4
+        primary=$(jq -r '.versioned' <<< "$names") || return 4
+        compat=$(jq -r '.compat' <<< "$names") || return 4
+        if [[ "$primary" != "$compat" && "${primary,,}" == "${compat,,}" ]]; then
+            _log_error "Workflow job '$job' for $target has primary names that differ only by case"
+            return 4
+        fi
+        binaries=$(_act_workspace_binaries_for_target "$config_file" "$target") || return 4
+        [[ -n "$binaries" ]] || binaries=$(jq -r --arg tool "$tool" '.binary_name // $tool' <<< "$document") || return 4
+        local -a members=()
+        while IFS= read -r binary; do
+            _act_is_safe_basename "$binary" || return 4
+            if [[ "$target" == windows/* ]]; then
+                [[ "${binary,,}" != *.exe ]] || binary="${binary:0:${#binary}-4}"
+                binary="${binary}.exe"
+            fi
+            members+=("$binary")
+        done <<< "$binaries"
+        binaries=$(printf '%s\n' "${members[@]}" | jq -Rsc 'split("\n")[:-1]') || return 4
+        outputs=$(jq -cn --arg primary "$primary" --arg compat "$compat" --arg format "$format" \
+            --argjson companions "$(jq -c --arg target "$target" '.[$target]' <<< "$configured")" '
+            ([$primary,$compat] | unique | map({key:.,value:{role:"primary",format:$format,required:(. == $primary)}}) |
+             from_entries) as $primaries |
+            $primaries + ($primaries | to_entries | map({key:(.key + ".sha256"),value:{role:"checksum",format:"file",required:false}}) | from_entries) +
+            ($companions | map({key:.name,value:{role:"additional",format:.format,required:true}}) | from_entries)
+        ') || return 4
+        plan=$(jq -cn --arg target "$target" --arg job "$job" --arg version "$version" \
+            --arg primary "$primary" --arg compat "$compat" --arg format "$format" \
+            --argjson binaries "$binaries" --argjson outputs "$outputs" \
+            '{target:$target,job:$job,version:$version,primary:$primary,compat:$compat,
+              archive_format:$format,binaries:$binaries,outputs:$outputs}') || return 4
+        plans=$(jq -c --arg target "$target" --argjson plan "$plan" '. + {($target):$plan}' <<< "$plans") || return 4
+    done < <(jq -r '.[]' <<< "$enabled")
+    printf '%s\n' "$plans"
+}
+
+# Workflow primary archives may include notices or other regular data, but
+# every configured executable must exist at its exact root name and have the
+# owning target's binary format and architecture. Full archive admission runs
+# first, including CRC/trailer, path, link and expansion checks.
+_act_validate_workflow_primary() {
+    local file="$1" plan="$2" format target members binary size mode executable
+    format=$(jq -r '.archive_format' <<< "$plan") || return 4
+    target=$(jq -r '.target' <<< "$plan") || return 4
+    packaging_validate_archive "$file" "$format" || return 4
+    members=$(packaging_payload_members "$file" "$format") || return 4
+    while IFS= read -r binary; do
+        if ! printf '%s\n' "$members" | grep -Fx -- "$binary" >/dev/null; then
+            _log_error "Workflow primary $(basename "$file") for $target is missing configured binary $binary"
+            return 4
+        fi
+        size=$(_act_archive_entry_stream "$file" "$format" "$binary" | wc -c | tr -d '[:space:]') || return 4
+        mode=$(_act_archive_member_mode "$file" "$format" "$binary") || return 4
+        executable=false
+        [[ "$mode" != *x* ]] || executable=true
+        _act_validate_target_binary_reader "$file::$binary" "$target" "$size" "$executable" \
+            _act_read_archive_hex_bytes "$file" "$format" "$binary" || return 4
+    done < <(jq -r '.binaries[]' <<< "$plan")
+}
+
+# Independent manifest admission repeats this check using a freshly resolved
+# configuration plan. Neither a worker's method flag nor its filename can
+# choose the owner, declared content type or compiler variant.
+_act_validate_workflow_payload_result() {
+    local result="$1" plan="$2" payload inventory actual paths additional name path row role format sha size identity
+    payload=$(jq -er '.workflow_payload_dir | strings | select(length > 0)' <<< "$result") || return 4
+    if ! jq -e --argjson plan "$plan" '
+        .method == "act" and .platform == $plan.target and .job == $plan.job and
+        .workflow_payload_plan == $plan and (.artifact_dir // "") == "" and (.artifact_path // "") == "" and
+        (.workflow_artifact_dir | type == "string" and length > 0) and
+        .workflow_artifact_dir != .workflow_payload_dir and
+        (.artifact_paths | type == "array" and all(.[]; type == "string")) and
+        (.additional_artifacts | type == "array")
+    ' <<< "$result" >/dev/null; then
+        _log_error "Workflow result does not match its configured payload ownership plan"
+        return 4
+    fi
+    inventory=$(jq -ceS '.workflow_inventory | if type == "array" and length > 0 then sort_by(.path) else error("missing workflow inventory") end' \
+        <<< "$result") || return 4
+    actual=$(_act_result_artifact_receipts "$result") || return 4
+    [[ "$actual" == "$inventory" ]] || { _log_error "Workflow transport or payload bytes differ from their collection inventory"; return 4; }
+    paths='[]' additional='[]'
+    local seen='[]'
+    while IFS= read -r -d '' path; do
+        [[ "$path" == "$payload" ]] && continue
+        [[ -f "$path" && ! -L "$path" && "${path%/*}" == "$payload" ]] || return 4
+        name="${path##*/}"
+        row=$(jq -ce --arg name "$name" '.outputs[$name] // error("undeclared workflow payload: " + $name)' <<< "$plan") || return 4
+        seen=$(jq -c --arg name "$name" '. + [$name]' <<< "$seen") || return 4
+        role=$(jq -r '.role' <<< "$row") || return 4
+        format=$(jq -r '.format' <<< "$row") || return 4
+        row=$(jq -ce --arg path "$path" '.[] | select(.path == $path)' <<< "$inventory") || return 4
+        sha=$(jq -r '.sha256' <<< "$row"); size=$(jq -r '.size_bytes' <<< "$row"); identity=$(jq -r '.identity' <<< "$row")
+        _act_validate_additional_artifact "$path" "$(jq -r '.target' <<< "$plan")" "$format" "$sha" "$size" "$identity" || return 4
+        if [[ "$role" == additional ]]; then
+            additional=$(jq -c --argjson row "$row" '. + [$row]' <<< "$additional") || return 4
+        else
+            paths=$(jq -c --arg path "$path" '. + [$path]' <<< "$paths") || return 4
+            if [[ "$role" == primary ]]; then
+                _act_validate_workflow_primary "$path" "$plan" || return 4
+            else
+                [[ -f "$payload/${name%.sha256}" && ! -L "$payload/${name%.sha256}" ]] || return 4
+                sha=$(_act_sha256 "$payload/${name%.sha256}") || return 4
+                if ! python3 - "$path" "$sha" "${name%.sha256}" <<'PY'
+import sys
+path, digest, name = sys.argv[1:]
+with open(path, 'rb') as stream:
+    data = stream.read(1025)
+forms = [digest, digest + '  ' + name, digest + ' *' + name]
+allowed = {form.encode('ascii') + ending for form in forms for ending in (b'', b'\n', b'\r\n')}
+raise SystemExit(0 if data in allowed else 4)
+PY
+                then
+                    _log_error "Workflow checksum does not describe its owned primary: $name"
+                    return 4
+                fi
+            fi
+        fi
+    done < <(find "$payload" -print0)
+    if ! jq -en --argjson seen "$seen" --argjson plan "$plan" --argjson result "$result" \
+        --argjson paths "$paths" --argjson additional "$additional" '
+        ($seen | map(ascii_downcase) | length == (unique | length)) and
+        (([$plan.outputs | to_entries[] | select(.value.required) | .key] - $seen) | length == 0) and
+        ($paths | sort) == ($result.artifact_paths | sort) and
+        ($additional | sort_by(.path)) == ($result.additional_artifacts | sort_by(.path))
+    ' >/dev/null; then
+        _log_error "Workflow result is missing required primaries or companions, or has contradictory payload receipts"
+        return 4
+    fi
+    actual=$(_act_result_artifact_receipts "$result") || return 4
+    [[ "$actual" == "$inventory" ]] || return 4
+}
+
+# act's upload ZIPs are transport containers. Materialize one exact payload
+# namespace before exposing a successful result, retaining both the original
+# transport inventory and final files for resume verification. A final archive
+# companion is copied intact and never fed through the legacy ZIP heuristic.
+_act_materialize_workflow_payloads() {
+    local result="$1" plan="$2" raw root payload before after row source copy name path receipt selected
+    local index=0 role format paths='[]' additional='[]' inventory module_dir extracted
+    local -A seen=()
+    raw=$(jq -er '.artifact_dir | strings | select(length > 0)' <<< "$result") || return 4
+    before=$(_act_result_artifact_receipts "$(jq -cn --arg dir "$raw" '{workflow_artifact_dir:$dir}')") || return 4
+    module_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" || return 3
+    if ! declare -F packaging_extract_payload &>/dev/null; then
+        # shellcheck source=SCRIPTDIR/packaging.sh
+        source "$module_dir/packaging.sh" || return 3
+    fi
+    root=$(mktemp -d "$ACT_ARTIFACTS_DIR/workflow-payload.XXXXXXXX") || return 4
+    payload="$root/payload"
+    mkdir -m 700 "$payload" || return 4
+    while IFS= read -r row; do
+        source=$(jq -r '.path' <<< "$row") || return 4
+        index=$((index + 1))
+        copy="$root/input-$index"
+        receipt=$(_act_collect_stream_exclusive "$copy" 600 _act_stream_local_file "$source") || return 4
+        if ! jq -en --argjson source "$row" --argjson copy "$receipt" \
+            '$source.sha256 == $copy.sha256 and $source.size_bytes == $copy.size_bytes' >/dev/null; then
+            _log_error "Workflow upload changed during held collection: $source"
+            return 4
+        fi
+        name="${source##*/}"
+        if act_artifact_zip_is_wrapper act "$source"; then
+            extracted="$root/extracted-$index"
+            mkdir -m 700 "$extracted" || return 4
+            packaging_extract_payload "$copy" zip "$extracted" || return 4
+            selected='[]'
+            while IFS= read -r -d '' path; do
+                [[ -f "$path" && ! -L "$path" ]] || return 4
+                selected=$(jq -c --arg name "${path##*/}" --arg path "$path" \
+                    '. + [{name:$name,path:$path}]' <<< "$selected") || return 4
+            done < <(find "$extracted" -type f -print0)
+        elif jq -e --arg name "$name" '.outputs | has($name)' <<< "$plan" >/dev/null; then
+            selected=$(jq -cn --arg name "$name" --arg path "$copy" '[{name:$name,path:$path}]') || return 4
+        else
+            _log_error "Workflow job $(jq -r '.job' <<< "$plan") uploaded an undeclared file: $source"
+            return 4
+        fi
+        while IFS= read -r receipt; do
+            name=$(jq -r '.name' <<< "$receipt"); path=$(jq -r '.path' <<< "$receipt")
+            if [[ -n "${seen[${name,,}]:-}" ]] ||
+               ! jq -e --arg name "$name" '.outputs | has($name)' <<< "$plan" >/dev/null ||
+               { ! _act_is_safe_basename "$name" &&
+                 ! jq -e --arg name "$name" '.outputs[$name].role == "checksum"' <<< "$plan" >/dev/null; }; then
+                _log_error "Workflow job $(jq -r '.job' <<< "$plan") for $(jq -r '.target' <<< "$plan") has a duplicate, foreign or undeclared payload: $name"
+                return 4
+            fi
+            seen["${name,,}"]=1
+            role=$(jq -r --arg name "$name" '.outputs[$name].role' <<< "$plan") || return 4
+            format=$(jq -r --arg name "$name" '.outputs[$name].format' <<< "$plan") || return 4
+            local mode=600
+            [[ "$format" != binary ]] || mode=700
+            receipt=$(_act_collect_stream_exclusive "$payload/$name" "$mode" _act_stream_local_file "$path") || return 4
+            if [[ "$role" == additional ]]; then
+                additional=$(jq -c --argjson receipt "$receipt" '. + [$receipt]' <<< "$additional") || return 4
+            else
+                paths=$(jq -c --arg path "$payload/$name" '. + [$path]' <<< "$paths") || return 4
+            fi
+        done < <(jq -c '.[]' <<< "$selected")
+    done < <(jq -c '.[]' <<< "$before")
+    after=$(_act_result_artifact_receipts "$(jq -cn --arg dir "$raw" '{workflow_artifact_dir:$dir}')") || return 4
+    [[ "$before" == "$after" ]] || { _log_error "Workflow transport inventory changed during collection"; return 4; }
+    result=$(jq -c --arg raw "$raw" --arg payload "$payload" --argjson plan "$plan" \
+        --argjson paths "$paths" --argjson additional "$additional" '
+        . + {artifact_dir:"",artifact_path:"",artifact_paths:$paths,additional_artifacts:$additional,
+             workflow_artifact_dir:$raw,workflow_payload_dir:$payload,workflow_payload_plan:$plan,
+             artifact_count:(($paths|length)+($additional|length))}' <<< "$result") || return 4
+    inventory=$(_act_result_artifact_receipts "$result") || return 4
+    result=$(jq -c --argjson inventory "$inventory" '.workflow_inventory=$inventory' <<< "$result") || return 4
+    _act_validate_workflow_payload_result "$result" "$plan" || return 4
+    printf '%s\n' "$result"
+}
+
 # Reconstruct additional-artifact ownership from trusted configuration before
 # manifest admission. This also refuses missing, extra or repeated receipts and
 # prevents later variants from taking ownership of platform-level companions.
@@ -439,7 +737,7 @@ _act_validate_additional_artifact() {
 _act_additional_artifact_receipts_json() {
     local tool="$1" result_json="$2" configured target_json target triple specs
     local receipts names expected triples row name path format sha size identity complete primary_paths
-    local verified='{}'
+    local verified='{}' workflow_plans workflow_plan
     jq -e '.targets | type == "array" and all(.[]; type == "object")' \
         <<< "$result_json" >/dev/null || return 4
     primary_paths=$(jq -c '[.targets[] |
@@ -447,11 +745,13 @@ _act_additional_artifact_receipts_json() {
         else (.artifact_path // "" | split(",")[]) end | select(length > 0)]' \
         <<< "$result_json") || return 4
     configured=$(_act_workspace_additional_artifacts_json "$ACT_REPOS_DIR/$tool.yaml") || return 4
+    workflow_plans=$(_act_workflow_payload_plans_json "$tool" "$(jq -r '.version // ""' <<< "$result_json")") || return 4
     while IFS= read -r target_json; do
         target=$(jq -er '.platform // .target | strings' <<< "$target_json") || return 4
         specs=$(jq -c --arg target "$target" '.[$target] // []' <<< "$configured") || return 4
         triple=$(jq -r '.target_triple // ""' <<< "$target_json") || return 4
-        if [[ -n "$triple" ]] && [[ "$(jq 'length' <<< "$specs")" -gt 0 ]]; then
+        if [[ "$(jq -r '.method // ""' <<< "$target_json")" != act && -n "$triple" ]] &&
+           [[ "$(jq 'length' <<< "$specs")" -gt 0 ]]; then
             triples=$(config_get_target_triples_json "$tool" "$target") || return 4
             if [[ "$triple" != "$(jq -r '.[0] // ""' <<< "$triples")" ]]; then
                 specs='[]'
@@ -470,6 +770,10 @@ _act_additional_artifact_receipts_json() {
         complete=$(jq -r --arg overall "$(jq -r '.status // ""' <<< "$result_json")" '
             $overall == "success" or .status == "success" or .status == "ok" or .status == "passed"
         ' <<< "$target_json") || return 4
+        workflow_plan=$(jq -c --arg target "$target" '.[$target] // null' <<< "$workflow_plans") || return 4
+        if [[ "$workflow_plan" != null && "$complete" == true ]]; then
+            _act_validate_workflow_payload_result "$target_json" "$workflow_plan" || return 4
+        fi
         if ! jq -en --argjson names "$names" --argjson expected "$expected" \
             --argjson complete "$complete" '
             ($names | length) == ($names | unique | length) and
@@ -557,6 +861,54 @@ _act_workspace_include_path_is_symlink_free() {
     [[ ! -L "$cursor/$remainder" ]]
 }
 
+# Freeze a member as soon as collection/staging hands it to the coordinator.
+# Keep its original inode open while checking bytes and permissions twice;
+# later members and the archiver must not redefine an earlier member's bytes.
+# Empty companion files are valid, unlike empty executable/archive streams.
+_act_workspace_member_receipt() (
+    local artifact_dir="$1" member="$2"
+    local path="$artifact_dir/$member" identity sha size mode
+    local final_identity final_sha final_size final_mode
+
+    [[ -d "$artifact_dir" && ! -L "$artifact_dir" ]] || return 4
+    _act_is_safe_workspace_include_path "$member" || return 4
+    _act_workspace_include_path_is_symlink_free "$artifact_dir" "$member" || return 4
+    [[ -f "$path" && ! -L "$path" ]] || return 4
+    exec 8< "$path" || return 4
+    identity=$(_act_file_identity /dev/fd/8) || return 4
+    [[ "$(_act_file_identity "$path")" == "$identity" ]] || return 4
+    mode=$(stat -L -c %A /dev/fd/8 2>/dev/null || stat -L -f %Sp /dev/fd/8 2>/dev/null) || return 4
+    size=$(stat -L -c %s /dev/fd/8 2>/dev/null || stat -L -f %z /dev/fd/8 2>/dev/null) || return 4
+    # A fresh read descriptor for each digest avoids relying on whether a
+    # /dev/fd reopen shares the original offset (as it can on macOS).
+    exec 9< "$path" || return 4
+    [[ "$(_act_file_identity /dev/fd/9)" == "$identity" ]] || return 4
+    sha=$(_act_sha256 /dev/fd/9) || return 4
+    exec 9<&-
+    [[ "$sha" =~ ^[a-fA-F0-9]{64}$ && "$size" =~ ^[0-9]+$ &&
+       "$mode" =~ ^-[r-][w-][xsS-][r-][w-][xsS-][r-][w-][xtT-]$ ]] || return 4
+
+    _act_workspace_include_path_is_symlink_free "$artifact_dir" "$member" || return 4
+    [[ -f "$path" && ! -L "$path" ]] || return 4
+    final_identity=$(_act_file_identity "$path") || return 4
+    final_mode=$(stat -L -c %A /dev/fd/8 2>/dev/null || stat -L -f %Sp /dev/fd/8 2>/dev/null) || return 4
+    final_size=$(stat -L -c %s /dev/fd/8 2>/dev/null || stat -L -f %z /dev/fd/8 2>/dev/null) || return 4
+    exec 9< "$path" || return 4
+    [[ "$(_act_file_identity /dev/fd/9)" == "$identity" ]] || return 4
+    final_sha=$(_act_sha256 /dev/fd/9) || return 4
+    exec 9<&-
+    _act_workspace_include_path_is_symlink_free "$artifact_dir" "$member" || return 4
+    [[ -f "$path" && ! -L "$path" ]] || return 4
+    [[ "$identity" == "$final_identity" && "$identity" == "$(_act_file_identity /dev/fd/8)" &&
+       "$identity" == "$(_act_file_identity "$path")" && "$mode" == "$final_mode" &&
+       "$size" == "$final_size" && "$sha" == "$final_sha" ]] || return 4
+
+    jq -ncS --arg path "$path" --arg member "$member" --arg sha256 "${sha,,}" \
+        --argjson size_bytes "$size" --arg identity "$identity" --arg mode "$mode" \
+        '{path:$path, member:$member, sha256:$sha256, size_bytes:$size_bytes,
+          identity:$identity, mode:$mode}'
+)
+
 _act_release_tree_file_metadata() {
     local repo_path="$1"
     local revision="$2"
@@ -617,8 +969,10 @@ _act_stage_workspace_include_files() {
     local source_root="$2"
     local artifact_dir="$3"
     local revision="${4:-}"
+    local emit_receipts="${5:-false}"
     local configured=""
 
+    [[ "$emit_receipts" == true || "$emit_receipts" == false ]] || return 7
     [[ -f "$config_file" && ! -L "$config_file" ]] || return 7
     [[ -d "$source_root" && ! -L "$source_root" ]] || return 7
     [[ -d "$artifact_dir" && ! -L "$artifact_dir" ]] || return 7
@@ -684,7 +1038,11 @@ _act_stage_workspace_include_files() {
             _log_error "Unable to stage workspace include: $include"
             return 7
         fi
-        printf '%s\n' "$include"
+        if [[ "$emit_receipts" == true ]]; then
+            _act_workspace_member_receipt "$artifact_dir" "$include" || return 7
+        else
+            printf '%s\n' "$include"
+        fi
     done <<< "$configured"
 }
 
@@ -996,6 +1354,61 @@ _act_validate_workspace_archive_collection_receipts() {
         [[ "$actual_sha" == "$expected_sha" && "$actual_size" == "$expected_size" ]] || return 4
     done
     [[ ${#receipt_seen_members[@]} -eq $expected_count ]]
+}
+
+# Ordinary workspace packages may contain scripts as well as machine code.
+# Bind every archived member, including empty notices and declared companions,
+# to the bytes, permissions, and inode frozen at its collection handoff.
+_act_validate_workspace_member_receipts() {
+    local archive="$1" format="$2" artifact_dir="$3"
+    shift 3
+    [[ -f "$archive" && ! -L "$archive" && $# -gt 0 ]] || return 4
+
+    local entries tar_reader=tar
+    command -v gtar &>/dev/null && tar_reader=gtar
+    case "$format" in
+        tar.gz) entries=$("$tar_reader" -tzf "$archive" 2>/dev/null) || return 4 ;;
+        tar.xz) entries=$("$tar_reader" -tJf "$archive" 2>/dev/null) || return 4 ;;
+        zip) entries=$(unzip -Z1 "$archive" 2>/dev/null) || return 4 ;;
+        *) return 4 ;;
+    esac
+
+    local -A seen_members=()
+    local -a members=()
+    local receipt expected actual member expected_sha expected_size expected_mode
+    local actual_sha actual_size actual_mode
+    for receipt in "$@"; do
+        expected=$(jq -ceS 'select(type == "object")' <<< "$receipt") || return 4
+        member=$(jq -er '.member | select(type == "string" and length > 0)' <<< "$expected") || return 4
+        _act_is_safe_workspace_include_path "$member" || return 4
+        [[ -z "${seen_members[$member]:-}" ]] || return 4
+        seen_members["$member"]=1
+        members+=("$member")
+        actual=$(_act_workspace_member_receipt "$artifact_dir" "$member") || return 4
+        [[ "$actual" == "$expected" ]] || return 4
+
+        expected_sha=$(jq -er '.sha256' <<< "$expected") || return 4
+        expected_size=$(jq -er '.size_bytes' <<< "$expected") || return 4
+        expected_mode=$(jq -er '.mode' <<< "$expected") || return 4
+        actual_mode=$(_act_archive_member_mode "$archive" "$format" "$member") || return 4
+        [[ "$actual_mode" == "$expected_mode" ]] || return 4
+        if command -v sha256sum &>/dev/null; then
+            actual_sha=$(_act_archive_entry_stream "$archive" "$format" "$member" |
+                sha256sum | awk '{print $1}') || return 4
+        elif command -v shasum &>/dev/null; then
+            actual_sha=$(_act_archive_entry_stream "$archive" "$format" "$member" |
+                shasum -a 256 | awk '{print $1}') || return 4
+        else
+            return 3
+        fi
+        actual_size=$(_act_archive_entry_stream "$archive" "$format" "$member" |
+            wc -c | tr -d '[:space:]') || return 4
+        [[ "$actual_sha" == "$expected_sha" && "$actual_size" == "$expected_size" ]] || return 4
+    done
+    # A receipt subset is not a complete custody proof, even if every member
+    # in that subset matches. Duplicates and unreceipted members also fail.
+    [[ "$(printf '%s\n' "$entries" | LC_ALL=C sort)" == \
+       "$(printf '%s\n' "${members[@]}" | LC_ALL=C sort)" ]]
 }
 
 _act_read_archive_hex_bytes() {
@@ -1330,19 +1743,22 @@ finally:
 PY
 }
 
-# Validate a release archive that was already assembled by the strict native
-# workspace collector. Unlike the single-binary archive path above, this form
-# must retain every configured workspace binary and companion notice while
-# still proving that each executable has the requested target architecture.
+# Validate the complete configured workspace archive. Strict callers retain
+# architecture validation by default; ordinary noncompiled languages may opt
+# out of the machine-format check while retaining exact closure and executable
+# regular payloads. Byte/mode custody is checked separately against receipts.
 _act_validate_workspace_archive() {
     local archive="$1"
     local format="$2"
     local target="$3"
     local config_file="$4"
+    local validate_architecture="${5:-true}"
     local entries="" expected_entries="" configured=""
     local tar_reader="tar"
     command -v gtar &>/dev/null && tar_reader="gtar"
 
+    [[ "$validate_architecture" == true || "$validate_architecture" == false ]] || return 4
+    [[ -f "$archive" && ! -L "$archive" ]] || return 4
     [[ -f "$config_file" && ! -L "$config_file" ]] || return 4
     command -v yq &>/dev/null || return 4
 
@@ -1418,7 +1834,7 @@ _act_validate_workspace_archive() {
     expected_entries=$(printf '%s\n' "${expected_members[@]}" | LC_ALL=C sort)
     entries=$(printf '%s\n' "$entries" | LC_ALL=C sort)
     if [[ "$entries" != "$expected_entries" ]]; then
-        _log_error "Strict workspace archive members do not match configured closure: $archive"
+        _log_error "Workspace archive members do not match configured closure: $archive"
         return 4
     fi
 
@@ -1444,9 +1860,15 @@ _act_validate_workspace_archive() {
         executable=false
         mode=$(_act_archive_member_mode "$archive" "$format" "$member") || return 4
         [[ "$mode" == *x* ]] && executable=true
-        _act_validate_target_binary_reader \
-            "$archive::$member" "$target" "$size" "$executable" \
-            _act_read_archive_hex_bytes "$archive" "$format" "$member" || return 4
+        if [[ "$validate_architecture" == true ]]; then
+            _act_validate_target_binary_reader \
+                "$archive::$member" "$target" "$size" "$executable" \
+                _act_read_archive_hex_bytes "$archive" "$format" "$member" || return 4
+        elif [[ ! "$size" =~ ^[1-9][0-9]*$ ]] || \
+             { [[ "$target" != windows/* ]] && [[ "$executable" != true ]]; }; then
+            _log_error "Workspace binary is empty or not executable: $archive::$member"
+            return 4
+        fi
     done
 }
 
@@ -2032,43 +2454,153 @@ _act_timeout_cmd() {
     echo "$_ACT_TIMEOUT_CMD"
 }
 
+# GNU timeout normally leaves its process group as soon as the command leader
+# exits, even when a descendant ignored TERM. Its pending --kill-after timer
+# then disappears with it. Keep our own live group anchor and use --foreground
+# so timeout and every ordinary descendant remain in the group we still own.
+_act_timeout_group() {
+    local input_fd="$1" output_fd="$2" timeout_command="$3" seconds="$4"
+    shift 4
+    [[ "$input_fd" =~ ^[0-9]+$ && "$output_fd" =~ ^[0-9]+$ ]] || return 4
+    local group_pid="$BASHPID" child="" finished=false cancelled=false
+    local control="" running="" status=0 read_status=0
+    set +m
+    trap - EXIT
+    trap 'cancelled=true' INT TERM HUP PIPE
+    # Register the exact PID and private channels before starting a command.
+    if ! IFS= read -r control || [[ "$control" != start ]] || $cancelled; then
+        return 130
+    fi
+    (
+        # Only fd0/fd1 are inherited by the command for these streams. In
+        # particular it must not retain the anchor's parent-lifetime reader.
+        eval "exec ${input_fd}<&- ${output_fd}>&-"
+        exec "$timeout_command" --foreground --kill-after=5 "$seconds" "$@"
+    ) <&"$input_fd" >&"$output_fd" &
+    child=$!
+    eval "exec ${input_fd}<&- ${output_fd}>&-"
+    while ! $cancelled; do
+        if ! $finished; then
+            running=$(jobs -pr)
+            case $'\n'"$running"$'\n' in
+                *$'\n'"$child"$'\n'*) ;;
+                *)
+                    wait "$child" || status=$?
+                    finished=true
+                    printf 'exit:%s\n' "$status" || break
+                    ;;
+            esac
+        fi
+        read_status=0
+        IFS= read -r -t 0.1 control || read_status=$?
+        # EOF also retires the group after SIGKILL/OOM of the waiting shell.
+        if (( read_status == 0 || read_status == 1 )); then
+            break
+        fi
+        (( read_status > 128 )) || break
+    done
+    trap '' INT TERM HUP PIPE
+    kill -TERM -- "-$group_pid" 2>/dev/null || true
+    if ! $finished; then
+        # Finish inside the outer target worker's five-second cancellation
+        # grace. The command's own deadline still retains --kill-after=5.
+        sleep 2
+    fi
+    # Never signal a reaped/reusable PGID: the anchor is still its live leader.
+    kill -KILL -- "-$group_pid" 2>/dev/null || true
+    return 4
+}
+
 _act_run_with_timeout() (
     local seconds="$1"
     shift
     local cmd
     cmd=$(_act_timeout_cmd)
-    if [[ -n "$cmd" ]]; then
-        # GNU timeout creates its own process group. Forward cancellation from
-        # the orchestration group into that group before releasing our waiter.
-        # --foreground would lose timeout's descendant deadline enforcement.
-        local timeout_pid="" cancel_status=0
-        _act_timeout_cancel() {
-            # A signal may arrive between the background fork and recording $!.
-            # Defer forwarding until the exact owned PID is available.
-            cancel_status=$1
-            [[ -n "$timeout_pid" ]] || return 0
-            trap '' INT TERM
-            kill -TERM -- "-$timeout_pid" 2>/dev/null ||
-                kill -TERM "$timeout_pid" 2>/dev/null || true
-            wait "$timeout_pid" 2>/dev/null || true
-            exit "$1"
-        }
-        trap '_act_timeout_cancel 130' INT
-        trap '_act_timeout_cancel 143' TERM
-        # A compiler, transport, or act process may ignore TERM. Bound both
-        # deadline and explicit cancellation cleanup in timeout's own group;
-        # never send a delayed signal to a PID/group that we have reaped.
-        # GNU timeout preserves ordinary command statuses and reports 137
-        # when this final group-wide KILL is necessary.
-        "$cmd" --kill-after=5 "$seconds" "$@" <&0 &
-        timeout_pid=$!
-        if (( cancel_status != 0 )); then
-            _act_timeout_cancel "$cancel_status"
-        fi
-        wait "$timeout_pid"
-    else
+    if [[ -z "$cmd" ]]; then
         "$@"
+        return
     fi
+
+    # Coprocess stdin/stdout carry only control/status. Reserve unused numeric
+    # descriptors for the caller's actual streams, including a large program
+    # fed through stdin. Do not overwrite an inherited fd or coprocess channel.
+    # Numeric eval redirections retain Bash 4.0 support ({var} needs Bash 4.1).
+    local input_fd="" output_fd="" candidate_fd
+    for ((candidate_fd = 10; candidate_fd < 63; candidate_fd++)); do
+        if { : <&"$candidate_fd"; } 2>/dev/null; then
+            continue
+        fi
+        if [[ -z "$input_fd" ]]; then
+            eval "exec ${candidate_fd}<&0" || return 4
+            input_fd=$candidate_fd
+        else
+            eval "exec ${candidate_fd}>&1" || return 4
+            output_fd=$candidate_fd
+            break
+        fi
+    done
+    [[ -n "$input_fd" && -n "$output_fd" ]] || return 4
+
+    local timeout_pid="" result_fd="" control_fd="" guard_status=0
+    local cancel_status=0 launch_pending=false monitor=false
+    local message="" result=4 protocol_valid=false
+    local -a _ACT_TIMEOUT_GROUP=()
+    local _ACT_TIMEOUT_GROUP_PID=""
+    _act_timeout_drain() {
+        if [[ "$control_fd" =~ ^[0-9]+$ ]]; then
+            eval "exec ${control_fd}>&-"
+            control_fd=""
+        fi
+        if [[ "$timeout_pid" =~ ^[1-9][0-9]*$ ]]; then
+            guard_status=0
+            wait "$timeout_pid" 2>/dev/null || guard_status=$?
+            timeout_pid=""
+        fi
+        if [[ "$result_fd" =~ ^[0-9]+$ ]]; then
+            eval "exec ${result_fd}<&-"
+            result_fd=""
+        fi
+    }
+    _act_timeout_cancel() {
+        (( cancel_status != 0 )) || cancel_status=$1
+        $launch_pending && return 0
+        trap '' INT TERM HUP PIPE
+        _act_timeout_drain
+        exit "$cancel_status"
+    }
+    trap '_act_timeout_cancel 130' INT
+    trap '_act_timeout_cancel 143' TERM
+    trap '_act_timeout_cancel 129' HUP
+    trap '_act_timeout_cancel 141' PIPE
+    [[ $- != *m* ]] || monitor=true
+    set -m
+    launch_pending=true
+    coproc _ACT_TIMEOUT_GROUP {
+        _act_timeout_group "$input_fd" "$output_fd" "$cmd" "$seconds" "$@"
+    }
+    timeout_pid="${_ACT_TIMEOUT_GROUP_PID:-}"
+    result_fd="${_ACT_TIMEOUT_GROUP[0]:-}"
+    control_fd="${_ACT_TIMEOUT_GROUP[1]:-}"
+    launch_pending=false
+    $monitor || set +m
+    eval "exec ${input_fd}<&- ${output_fd}>&-"
+    if (( cancel_status != 0 )); then
+        _act_timeout_cancel "$cancel_status"
+    fi
+    if [[ "$control_fd" =~ ^[0-9]+$ && "$result_fd" =~ ^[0-9]+$ ]] &&
+       printf 'start\n' >&"$control_fd" &&
+       IFS= read -r -u "$result_fd" message &&
+       [[ "$message" =~ ^exit:([0-9]{1,3})$ ]] &&
+       (( 10#${BASH_REMATCH[1]} <= 255 )); then
+        result=$((10#${BASH_REMATCH[1]}))
+        protocol_valid=true
+    fi
+    _act_timeout_drain
+    if ! $protocol_valid; then
+        result=$guard_status
+        [[ "$result" -ne 0 ]] || result=4
+    fi
+    return "$result"
 )
 
 # Return the first act config file in a home directory that has --bind without
@@ -3846,10 +4378,17 @@ _act_windows_build_guard_script() {
 $ErrorActionPreference='Stop'
 Add-Type -TypeDefinition @'
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using Microsoft.Win32.SafeHandles;
 public static class DSRNativeBuildGuard {
+    [StructLayout(LayoutKind.Sequential)] struct FileInfo {
+        public uint Attributes, CreationLow, CreationHigh, AccessLow, AccessHigh,
+            WriteLow, WriteHigh, Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow;
+    }
     [StructLayout(LayoutKind.Sequential)] struct BasicLimits {
         public long ProcessTime, JobTime;
         public uint Flags;
@@ -3905,6 +4444,73 @@ public static class DSRNativeBuildGuard {
         IntPtr processAttributes, IntPtr threadAttributes, bool inheritHandles,
         uint flags, IntPtr environment, string directory,
         ref StartupInfo startup, out ProcessInfo process);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern SafeFileHandle CreateFileW(string name, uint access, uint share,
+        IntPtr security, uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool GetFileInformationByHandle(SafeFileHandle handle, out FileInfo info);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern uint GetFileType(SafeFileHandle handle);
+    static SafeFileHandle HoldPath(string path, bool directory) {
+        string native = path.Replace('/', '\\');
+        if (!native.StartsWith(@"\\?\", StringComparison.Ordinal)) native = @"\\?\" + native;
+        // As in the private Cargo cache, FILE_LIST_DIRECTORY is required for
+        // directory sharing exclusions; FILE_READ_ATTRIBUTES alone is not.
+        SafeFileHandle handle = CreateFileW(native, directory ? 0x81u : 0x80000000u,
+            directory ? 3u : 1u, IntPtr.Zero, 3, 0x00200000u | 0x02000000u, IntPtr.Zero);
+        if (handle.IsInvalid) {
+            int error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            throw new Win32Exception(error, "Cannot hold native build launcher path: " + path);
+        }
+        try {
+            FileInfo info;
+            if (!GetFileInformationByHandle(handle, out info))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            if ((info.Attributes & (0x400u | 0x40u)) != 0 ||
+                    ((info.Attributes & 0x10u) != 0) != directory || GetFileType(handle) != 1 ||
+                    (!directory && info.Links != 1))
+                throw new IOException("Linked or unexpected native build launcher path: " + path);
+            return handle;
+        } catch { handle.Dispose(); throw; }
+    }
+    public static SafeFileHandle[] HoldDirectory(string directory) {
+        string path = Path.GetFullPath(directory);
+        string root = Path.GetPathRoot(path);
+        if (root == null || root.Length != 3 || root[1] != ':')
+            throw new IOException("Native build launcher requires a local drive directory");
+        List<SafeFileHandle> handles = new List<SafeFileHandle>();
+        try {
+            string current = root;
+            handles.Add(HoldPath(current, true));
+            foreach (string part in path.Substring(root.Length).Split(
+                    new char[] { '\\', '/' }, StringSplitOptions.RemoveEmptyEntries)) {
+                current = Path.Combine(current, part);
+                handles.Add(HoldPath(current, true));
+            }
+            return handles.ToArray();
+        } catch {
+            foreach (SafeFileHandle handle in handles) handle.Dispose();
+            throw;
+        }
+    }
+    public static FileStream OpenPayload(string path) {
+        SafeFileHandle handle = HoldPath(path, false);
+        try { return new FileStream(handle, FileAccess.Read); }
+        catch { handle.Dispose(); throw; }
+    }
+    public static string BuildCommand(string application, string script) {
+        char[] forbidden = new char[] { '\0', '"', '\r', '\n' };
+        if (String.IsNullOrEmpty(application) || String.IsNullOrEmpty(script) ||
+                application.IndexOfAny(forbidden) >= 0 || script.IndexOfAny(forbidden) >= 0 ||
+                application.EndsWith("\\", StringComparison.Ordinal) ||
+                script.EndsWith("\\", StringComparison.Ordinal))
+            throw new ArgumentException("Invalid native build executable or script path");
+        string command = "\"" + application + "\" -NoProfile -NonInteractive -File \"" + script + "\"";
+        if (command.Length >= 32767)
+            throw new ArgumentException("Native build file command exceeds the Windows process limit");
+        return command;
+    }
     static IntPtr InheritableStandardHandle(int kind) {
         IntPtr handle = GetStdHandle(kind);
         if (handle == IntPtr.Zero || handle == new IntPtr(-1) ||
@@ -3912,7 +4518,8 @@ public static class DSRNativeBuildGuard {
             throw new Win32Exception(Marshal.GetLastWin32Error());
         return handle;
     }
-    public static int Run(string command, int seconds) {
+    public static int Run(string application, string script, int seconds) {
+        string command = BuildCommand(application, script);
         uint milliseconds = checked((uint)seconds * 1000);
         IntPtr job = CreateJobObject(IntPtr.Zero, null);
         if (job == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
@@ -3929,7 +4536,7 @@ public static class DSRNativeBuildGuard {
             startup.Input = InheritableStandardHandle(-10);
             startup.Output = InheritableStandardHandle(-11);
             startup.Error = InheritableStandardHandle(-12);
-            if (!CreateProcess(null, new StringBuilder(command), IntPtr.Zero,
+            if (!CreateProcess(application, new StringBuilder(command), IntPtr.Zero,
                     IntPtr.Zero, true, 4, IntPtr.Zero, null, ref startup, out process))
                 throw new Win32Exception(Marshal.GetLastWin32Error());
             if (!AssignProcessToJobObject(job, process.Process))
@@ -3964,15 +4571,47 @@ public static class DSRNativeBuildGuard {
 '@
 POWERSHELL
     # Keep the original source visible in the staged Defender-scanned file.
-    # Encoding is only for the child command-line transport after admission.
+    # The child gets a held file, never a payload-sized CreateProcess argument.
     printf '$dsrBuildScript='\''%s'\''\n' "$script_quoted"
     cat <<'POWERSHELL'
-$dsrBuildEncoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($dsrBuildScript))
+$dsrBuildDirectoryHandles=@()
+$dsrBuildHeld=$null
+$dsrBuildHash=$null
 $dsrPowerShell=Join-Path $PSHOME 'powershell.exe'
 if (-not (Test-Path -LiteralPath $dsrPowerShell -PathType Leaf)) { $dsrPowerShell=Join-Path $PSHOME 'pwsh.exe' }
-$dsrBuildCommand='"' + $dsrPowerShell + '" -NoProfile -NonInteractive -EncodedCommand ' + $dsrBuildEncoded
+try {
+    if ([string]::IsNullOrEmpty($PSScriptRoot)) { throw 'Native build guard requires its retained launcher directory' }
+    $dsrBuildDirectoryHandles=[DSRNativeBuildGuard]::HoldDirectory($PSScriptRoot)
+    $dsrBuildPath=Join-Path $PSScriptRoot 'payload.ps1'
+    $dsrBuildEncoding=[Text.UTF8Encoding]::new($true)
+    $dsrBuildBytes=$dsrBuildEncoding.GetPreamble() + $dsrBuildEncoding.GetBytes($dsrBuildScript)
+    $dsrBuildWriter=[IO.File]::Open($dsrBuildPath,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+    try {
+        $dsrBuildWriter.Write($dsrBuildBytes,0,$dsrBuildBytes.Length)
+        $dsrBuildWriter.Flush($true)
+    } finally { $dsrBuildWriter.Dispose() }
+    # Keep the normal scanner policy. Permit quarantine before opening the
+    # read-only custody handle; changed or missing bytes then fail admission.
+    $dsrBuildScanner=Join-Path $env:ProgramFiles 'Windows Defender/MpCmdRun.exe'
+    if (Test-Path -LiteralPath $dsrBuildScanner) {
+        & $dsrBuildScanner -Scan -ScanType 3 -File $dsrBuildPath
+        if ($LASTEXITCODE -ne 0) { throw 'Native build payload security scan failed' }
+    }
+    $dsrBuildHeld=[DSRNativeBuildGuard]::OpenPayload($dsrBuildPath)
+    $dsrBuildHash=[Security.Cryptography.SHA256]::Create()
+    $dsrBuildExpected=[Convert]::ToBase64String($dsrBuildHash.ComputeHash([byte[]]$dsrBuildBytes))
+    $dsrBuildActual=[Convert]::ToBase64String($dsrBuildHash.ComputeHash($dsrBuildHeld))
+    if ($dsrBuildActual -cne $dsrBuildExpected) { throw 'Native build payload digest mismatch' }
+    [Console]::Error.WriteLine('Native build payload retained: ' + $dsrBuildPath)
 POWERSHELL
-    printf 'exit [DSRNativeBuildGuard]::Run($dsrBuildCommand, %s)\n' "$timeout_sec"
+    printf '    exit [DSRNativeBuildGuard]::Run($dsrPowerShell, $dsrBuildPath, %s)\n' "$timeout_sec"
+    cat <<'POWERSHELL'
+} finally {
+    if ($null -ne $dsrBuildHash) { $dsrBuildHash.Dispose() }
+    if ($null -ne $dsrBuildHeld) { $dsrBuildHeld.Dispose() }
+    foreach ($dsrBuildDirectoryHandle in $dsrBuildDirectoryHandles) { $dsrBuildDirectoryHandle.Dispose() }
+}
+POWERSHELL
 }
 
 # Recover only command forms produced above; never evaluate launcher text.
@@ -4007,26 +4646,36 @@ _act_windows_command_script() {
 _act_windows_stage_build_script() {
     local host="$1" source_root="$2" script="$3"
     local destination uuid local_dir local_script remote_dir remote_script digest setup guard
+    local remote_parent remote_parent_q remote_dir_q remote_script_q
     destination=$(_act_get_ssh_destination "$host") || return 4
     uuid=$(_act_generate_uuid) || return 4
     _act_is_uuid "$uuid" || return 4
     source_root="${source_root//\\//}"
-    [[ "$source_root" =~ ^[A-Za-z]:/ && "$source_root" != *"'"* ]] || return 4
-    remote_dir="${source_root%/*}/launcher-$uuid"
+    if [[ "$source_root" =~ ^/([A-Za-z])/(.*)$ ]]; then
+        source_root="${BASH_REMATCH[1]}:/${BASH_REMATCH[2]}"
+    fi
+    [[ "$source_root" =~ ^[A-Za-z]:/ && "$source_root" != *[[:cntrl:]]* ]] || return 4
+    while [[ "$source_root" == */ && ${#source_root} -gt 3 ]]; do source_root="${source_root%/}"; done
+    remote_parent="${source_root%/*}"
+    [[ ! "$remote_parent" =~ ^[A-Za-z]:$ ]] || remote_parent+='/'
+    remote_dir="${remote_parent%/}/launcher-$uuid"
     remote_script="$remote_dir/build.ps1"
+    remote_parent_q="${remote_parent//\'/\'\'}"
+    remote_dir_q="${remote_dir//\'/\'\'}"
+    remote_script_q="${remote_script//\'/\'\'}"
     mkdir -p "$ACT_ARTIFACTS_DIR" || return 4
     local_dir=$(mktemp -d "$ACT_ARTIFACTS_DIR/windows-launcher.XXXXXXXX") || return 4
     local_script="$local_dir/build.ps1"
     (umask 077; printf '%s\n' "$script" > "$local_script") || return 4
     digest=$(_act_sha256 "$local_script") || return 4
-    setup="\$ErrorActionPreference='Stop'; \$parent=Get-Item -LiteralPath '${source_root%/*}' -Force; if (-not \$parent.PSIsContainer -or ((\$parent.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Launcher parent is not a plain directory' }; if (Test-Path -LiteralPath '$remote_dir') { throw 'Launcher destination already exists' }; New-Item -ItemType Directory -Path '$remote_dir' | Out-Null; \$acl=Get-Acl -LiteralPath '$remote_dir'; \$acl.SetAccessRuleProtection(\$true,\$false); \$user=[Security.Principal.WindowsIdentity]::GetCurrent().User; \$rule=[Security.AccessControl.FileSystemAccessRule]::new(\$user,'FullControl','ContainerInherit,ObjectInherit','None','Allow'); \$acl.AddAccessRule(\$rule); Set-Acl -LiteralPath '$remote_dir' -AclObject \$acl"
-    setup+="; \$system=[Security.Principal.SecurityIdentifier]::new('S-1-5-18'); \$systemRule=[Security.AccessControl.FileSystemAccessRule]::new(\$system,'FullControl','ContainerInherit,ObjectInherit','None','Allow'); \$acl.AddAccessRule(\$systemRule); Set-Acl -LiteralPath '$remote_dir' -AclObject \$acl"
+    setup="\$ErrorActionPreference='Stop'; \$parent=Get-Item -LiteralPath '$remote_parent_q' -Force; if (-not \$parent.PSIsContainer -or ((\$parent.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Launcher parent is not a plain directory' }; if (Test-Path -LiteralPath '$remote_dir_q') { throw 'Launcher destination already exists' }; New-Item -ItemType Directory -Path '$remote_dir_q' | Out-Null; \$acl=Get-Acl -LiteralPath '$remote_dir_q'; \$acl.SetAccessRuleProtection(\$true,\$false); \$user=[Security.Principal.WindowsIdentity]::GetCurrent().User; \$rule=[Security.AccessControl.FileSystemAccessRule]::new(\$user,'FullControl','ContainerInherit,ObjectInherit','None','Allow'); \$acl.AddAccessRule(\$rule); Set-Acl -LiteralPath '$remote_dir_q' -AclObject \$acl"
+    setup+="; \$system=[Security.Principal.SecurityIdentifier]::new('S-1-5-18'); \$systemRule=[Security.AccessControl.FileSystemAccessRule]::new(\$system,'FullControl','ContainerInherit,ObjectInherit','None','Allow'); \$acl.AddAccessRule(\$systemRule); Set-Acl -LiteralPath '$remote_dir_q' -AclObject \$acl"
     _act_ssh_exec "$host" "$(_act_windows_encoded_powershell "$setup" pwsh)" 60 >&2 || return 4
     scp -q -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
         -o StrictHostKeyChecking=accept-new "$local_script" "$destination:$remote_script" >&2 || return 4
     # A normal custom scan retains Defender policy; no exclusion, policy
     # bypass, or restoration of quarantined content is permitted here.
-    guard="\$ErrorActionPreference='Stop'; \$item=Get-Item -LiteralPath '$remote_script' -Force; if (\$item.PSIsContainer -or ((\$item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Launcher is not a plain file' }; \$scanner=Join-Path \$env:ProgramFiles 'Windows Defender/MpCmdRun.exe'; if (Test-Path -LiteralPath \$scanner) { & \$scanner -Scan -ScanType 3 -File \$item.FullName; if (\$LASTEXITCODE -ne 0) { throw 'Launcher security scan failed' } }; \$held=[IO.File]::Open('$remote_script',[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read); try { \$actual=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(\$held)); if (\$actual -ne '$digest') { throw 'Launcher digest mismatch' }; & '$remote_script'; exit \$LASTEXITCODE } finally { \$held.Dispose() }"
+    guard="\$ErrorActionPreference='Stop'; \$item=Get-Item -LiteralPath '$remote_script_q' -Force; if (\$item.PSIsContainer -or ((\$item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Launcher is not a plain file' }; \$scanner=Join-Path \$env:ProgramFiles 'Windows Defender/MpCmdRun.exe'; if (Test-Path -LiteralPath \$scanner) { & \$scanner -Scan -ScanType 3 -File \$item.FullName; if (\$LASTEXITCODE -ne 0) { throw 'Launcher security scan failed' } }; \$held=[IO.File]::Open('$remote_script_q',[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read); try { \$actual=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(\$held)); if (\$actual -ne '$digest') { throw 'Launcher digest mismatch' }; & '$remote_script_q'; exit \$LASTEXITCODE } finally { \$held.Dispose() }"
     _log_info "Windows build script retained: $local_script (sha256=$digest), host path $remote_script"
     _act_windows_encoded_powershell "$guard" pwsh
 }
@@ -4530,6 +5179,78 @@ _act_strict_source_root_path() {
     printf '%s/%s-%s/source\n' "$strict_root" "$tool_name" "$run_id"
 }
 
+# Describe Unix write locations as data, never by evaluating recipe text in a
+# coordinator shell. The final launcher applies the last environment assignment.
+# Relative settings belong to the build's actual working directory, not to the
+# coordinator or the original checkout. Source planning has no final per-target
+# working directory yet, so that phase admits absolute overrides only; native
+# preparation admits the complete, resolved set before creating its private home.
+_act_native_writable_paths_json() {
+    local source_root="$1" working_root="$2" build_env="$3" language="$4"
+    local cache_root="${5:-}" extra_paths="${6:-[]}" absolute_only="${7:-false}"
+    jq -nce --arg source "$source_root" --arg working "$working_root" \
+        --arg environment "$build_env" --arg language "$language" \
+        --arg cache "$cache_root" --argjson extra "$extra_paths" \
+        --argjson absolute_only "$absolute_only" '
+        def literal:
+            . as $path | type == "string" and length > 0 and
+            all(explode[]; . >= 32 and . != 127) and
+            (["$","`","\\","\""] | all(.[]; . as $char | ($path | contains($char) | not)));
+        def absolute:
+            literal and startswith("/");
+        if ($source | absolute | not) or ($working | absolute | not) or
+           ($extra | type != "array") then error("Invalid native writable roots") else . end |
+        (reduce ($environment | split("\n")[] | select(contains("="))) as $pair ({};
+            ($pair | index("=")) as $equals |
+            .[$pair[:$equals]] = $pair[$equals + 1:])) as $env |
+        [{role:"source",path:$source}] + $extra +
+        (if $working != $source then [{role:"stage",path:$working}] else [] end) +
+        (if $cache != "" then [{role:"cargo_cache",path:$cache}] else [] end) +
+        ([{role:"temp",name:"TMPDIR"}] +
+          (if $language == "rust" then
+            [{role:"cargo_home",name:"CARGO_HOME"},
+             {role:"cargo_target",name:"CARGO_TARGET_DIR"},
+             {role:"cargo_build",name:"CARGO_BUILD_BUILD_DIR"}]
+           elif $language == "go" then
+            # Even GOENV=off retains GOROOT/go.env defaults on the build host.
+            # Admit explicit recipe locations without guessing those defaults.
+            [{role:"go_cache",name:"GOCACHE",absolute_required:true,empty_default:true},
+             {role:"go_modcache",name:"GOMODCACHE",absolute_required:true,empty_default:true},
+             {role:"go_temp",name:"GOTMPDIR",empty_default:true}]
+           else [] end) | map(. as $entry | $env[.name] // empty |
+              if $entry.empty_default and . == "" then empty
+              elif $entry.name == "GOCACHE" and . == "off" then
+                  error("GOCACHE=off disables the build cache required by Go")
+              elif $absolute_only and $entry.name == "CARGO_TARGET_DIR" and (startswith("/") | not) then
+                 empty
+             elif literal | not then error("Unresolved native writable environment path: " + $entry.name)
+             elif $entry.name == "CARGO_BUILD_BUILD_DIR" and (test("[{}]")) then
+                 error("Cargo build-directory templates require resolved writable paths")
+              elif $entry.absolute_required and (startswith("/") | not) then
+                  error($entry.name + " must be an absolute Go cache path")
+             elif startswith("/") then {role:$entry.role,path:.}
+             elif $absolute_only then empty
+             else {role:$entry.role,path:($working + "/" +
+                    (split("/") | map(select(. != "." and . != "")) | join("/")))} end)) |
+        if all(.[]; (.path | absolute)) then unique_by([.role,.path])
+        else error("Invalid native writable path") end
+    ' || return 4
+}
+
+# Keep the general host gate, then require fresh evidence for the selected
+# paths. Windows has a separate split-storage contract and does not consume
+# these Unix path observations.
+_act_native_writable_paths_ready() {
+    local host="$1" capability="$2" paths="$3"
+    local readiness_args=("$host" --writable-paths "$paths")
+    [[ -z "$capability" ]] || readiness_args+=(--require "$capability")
+    if ! declare -F host_health_is_ready &>/dev/null ||
+       ! host_health_is_ready "${readiness_args[@]}"; then
+        _log_error "Native writable paths are not ready on $host"
+        return 4
+    fi
+}
+
 _act_source_has_gitlinks() {
     local listing
     listing=$(_act_strict_git -C "$1" ls-tree -r --full-tree "$2" 2>/dev/null) || return 4
@@ -4542,7 +5263,11 @@ _act_source_archive_export() {
     # shellcheck source=src/xwin_source.sh
     source "$module_dir/xwin_source.sh" || return 3
     commit=$(_act_strict_git -C "$repo_path" rev-parse --verify "${revision}^{commit}" 2>/dev/null) || return 4
-    source_archive_export "$repo_path" "$commit" "$kind"
+    if [[ "$kind" == compare ]]; then
+        source_archive_matches_git "$repo_path" "$commit"
+    else
+        source_archive_export "$repo_path" "$commit" "$kind"
+    fi
 }
 
 _act_stream_git_archive() {
@@ -4550,7 +5275,18 @@ _act_stream_git_archive() {
     _act_source_has_gitlinks "$1" "$2" || status=$?
     case "$status" in
         0) _act_source_archive_export "$1" "$2" archive ;;
-        1) _act_strict_git -C "$1" archive --format=tar "$2" 2>/dev/null ;;
+        1)
+            # Keep every already-admitted legacy archive byte-identical.
+            # Attribute declarations alone do not imply a changed tree: an
+            # export-subst file without a token still has its committed bytes.
+            status=0
+            _act_source_archive_export "$1" "$2" compare || status=$?
+            case "$status" in
+                0) _act_strict_git -C "$1" archive --format=tar "$2" 2>/dev/null ;;
+                10) _act_source_archive_export "$1" "$2" archive ;;
+                *) return "$status" ;;
+            esac
+            ;;
         *) return "$status" ;;
     esac
 }
@@ -5214,8 +5950,20 @@ EOF
 # or letting normal unpacking race another target's cache inventory.
 _act_unix_private_cargo_home_script() {
     local source_root="$1" suffix="$2"
-    [[ "$source_root" =~ ^/[A-Za-z0-9_./+-]+$ && "$source_root" != *..* &&
-       "$suffix" =~ ^[A-Za-z0-9][A-Za-z0-9-]+$ ]] || return 4
+    # Shell ranges follow LC_COLLATE: en_US.UTF-8 can otherwise admit non-ASCII
+    # letters in these path components. Keep the wire/path allowlist literal.
+    local LC_ALL=C || {
+        _log_error "Unable to select ASCII validation locale for strict Unix Cargo paths"
+        return 4
+    }
+    if [[ ! "$source_root" =~ ^/[A-Za-z0-9_./+-]+$ || "$source_root" == *..* ]]; then
+        _log_error "Invalid strict Unix Cargo source root: expected an absolute source path using letters, digits, _, ., /, + or -, without '..'"
+        return 4
+    fi
+    if [[ ! "$suffix" =~ ^[A-Za-z0-9][A-Za-z0-9_-]+$ ]]; then
+        _log_error "Invalid strict Unix Cargo attempt suffix: require a leading letter or digit and at least one further letter, digit, _ or -"
+        return 4
+    fi
     printf 'set -e\numask 077\n'
     _act_unix_cargo_cache_runtime || return $?
     cat <<EOF
@@ -5320,18 +6068,34 @@ print(json.dumps(summary, sort_keys=True, separators=(',', ':')))
 DSR_NATIVE_CARGO_PREPARED
 SH
 )"
-    summary=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT") || return $?
-    sources_json=$(jq -ce '.dependency_sources' <<< "$summary") || return 4
-    _act_validate_cargo_sources_summary "$sources_json" >/dev/null || return 4
-    jq -ce '
+    summary=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT") || {
+        local prepare_status=$?
+        _log_error "Strict Unix Cargo cache preparation failed on $host (exit $prepare_status)"
+        return "$prepare_status"
+    }
+    if ! sources_json=$(jq -ce '.dependency_sources' <<< "$summary") ||
+       ! _act_validate_cargo_sources_summary "$sources_json" >/dev/null; then
+        _log_error "Strict Unix Cargo cache preparation returned invalid dependency-source evidence on $host"
+        return 4
+    fi
+    # Physical parent paths can differ through legitimate source aliases, but
+    # the home must belong to this attempt, never the retained seed or another
+    # target. Do not publish partial/multiple transport receipts on refusal.
+    if ! summary=$(jq -cse --arg name ".cargo-home-$suffix" '
+        select(length == 1) | .[0] |
         select(type == "object" and .schema_version == 1 and .mode == "private-copy" and
-            (.cargo_home | type == "string" and startswith("/")) and
+            (.cargo_home | type == "string" and test("^/[A-Za-z0-9_./+-]+$") and
+                (contains("..") | not) and endswith("/" + $name)) and
             .receipt_path == (.cargo_home + "/.dsr-cache-seed.json") and
             (.receipt_sha256 | test("^[0-9a-f]{64}$")) and
             (.inventory_sha256 | test("^[0-9a-f]{64}$")) and
             .selection.kind == "cargo-lock-downloads" and
             .selection.lockfile_sha256 == .dependency_sources.authentication.lockfile_sha256)
-    ' <<< "$summary"
+    ' <<< "$summary"); then
+        _log_error "Strict Unix Cargo cache preparation returned invalid private attempt evidence on $host (expected .cargo-home-$suffix)"
+        return 4
+    fi
+    printf '%s\n' "$summary"
 }
 
 # Ordinary (non-strict) Unix Rust builds stage their source under a fresh,
@@ -5366,6 +6130,24 @@ while test -n "\$dsr_ancestor"; do
 done
 test ! -e '$stage_root'; test ! -L '$stage_root'
 mkdir '$stage_root'; test -d '$stage_root'; test ! -L '$stage_root'
+# SBH honors ancestor markers for both scanning and direct deletion checks.
+# Protect the private source/cache before copying any bytes; the existing
+# all-outcome stage cleanup retires this marker with the owned stage. O_EXCL
+# refuses every existing leaf, including a FIFO that shell noclobber can block on.
+python3 -I - '$stage_root' <<'DSR_ORDINARY_STAGE_PROTECTION'
+import os, stat, sys
+parent = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    info = os.fstat(parent)
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o777 != 0o700:
+        raise RuntimeError('ordinary build stage must be private and owned')
+    fd = os.open('.sbh-protect', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                 0o600, dir_fd=parent)
+    with os.fdopen(fd, 'w') as marker:
+        marker.write('reason = "DSR ordinary native build stage"' + chr(10))
+finally:
+    os.close(parent)
+DSR_ORDINARY_STAGE_PROTECTION
 ambient_home=\${CARGO_HOME:-\$HOME/.cargo}
 if test ! -e "\$ambient_home" && test ! -L "\$ambient_home"; then ambient_home=; fi
 dsr_lockfile=
@@ -5578,9 +6360,20 @@ _act_windows_cache_command() {
 
 _act_windows_private_cargo_home_script() {
     local source_root="$1" suffix="$2"
+    # Match the Unix ASCII path contract independently of coordinator locale.
+    local LC_ALL=C || {
+        _log_error "Unable to select ASCII validation locale for strict Windows Cargo paths"
+        return 4
+    }
     source_root="${source_root//\\//}"
-    [[ "$source_root" =~ ^[A-Za-z]:/[A-Za-z0-9_./+-]+$ && "$source_root" != *..* &&
-       "$suffix" =~ ^[A-Za-z0-9][A-Za-z0-9-]+$ ]] || return 4
+    if [[ ! "$source_root" =~ ^[A-Za-z]:/[A-Za-z0-9_./+-]+$ || "$source_root" == *..* ]]; then
+        _log_error "Invalid strict Windows Cargo source root: expected a drive-qualified source path using letters, digits, _, ., /, + or -, without '..'"
+        return 4
+    fi
+    if [[ ! "$suffix" =~ ^[A-Za-z0-9][A-Za-z0-9_-]+$ ]]; then
+        _log_error "Invalid strict Windows Cargo attempt suffix: require a leading letter or digit and at least one further letter, digit, _ or -"
+        return 4
+    fi
     _act_windows_cargo_cache_runtime || return $?
     cat <<EOF
 \$ErrorActionPreference='Stop'
@@ -5674,15 +6467,32 @@ _act_prepare_windows_private_cargo_home() {
     script+=$'\n'"$(_act_windows_cargo_metadata_body "$build_cmd" "$build_env")" || return $?
     script+=$'\n''$dsrPrivateSummary | ConvertTo-Json -Compress -Depth 100; exit 0'
     command=$(_act_windows_cache_command "$host" "$source_root" "$script") || return $?
-    summary=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT") || return $?
-    sources_json=$(jq -ce '.dependency_sources' <<< "$summary") || return 4
-    _act_validate_cargo_sources_summary "$sources_json" >/dev/null || return 4
-    _act_validate_cargo_cache_selection "$summary" "$sources_json" >/dev/null || return 4
-    toolchain_json=$(jq -ce '.toolchain' <<< "$summary") || return 4
-    _act_validate_windows_toolchain_summary "$toolchain_json" "$source_root" >/dev/null || return 4
-    jq -ce '
+    summary=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT") || {
+        local prepare_status=$?
+        _log_error "Strict Windows Cargo cache preparation failed on $host (exit $prepare_status)"
+        return "$prepare_status"
+    }
+    if ! sources_json=$(jq -ce '.dependency_sources' <<< "$summary") ||
+       ! _act_validate_cargo_sources_summary "$sources_json" >/dev/null; then
+        _log_error "Strict Windows Cargo cache preparation returned invalid dependency-source evidence on $host"
+        return 4
+    fi
+    if ! _act_validate_cargo_cache_selection "$summary" "$sources_json" >/dev/null; then
+        _log_error "Strict Windows Cargo cache preparation returned invalid lockfile selection evidence on $host"
+        return 4
+    fi
+    if ! toolchain_json=$(jq -ce '.toolchain' <<< "$summary") ||
+       ! _act_validate_windows_toolchain_summary "$toolchain_json" "$source_root" >/dev/null; then
+        _log_error "Strict Windows Cargo cache preparation returned invalid toolchain evidence on $host"
+        return 4
+    fi
+    # Retain the requested attempt identity even when the host resolves a
+    # physical source parent. A valid receipt cannot authorize another home.
+    if ! summary=$(jq -cse --arg name ".cargo-home-$suffix" '
+        select(length == 1) | .[0] |
         select(type == "object" and .schema_version == 1 and .mode == "private-copy" and
-            (.cargo_home | type == "string" and test("^[A-Za-z]:/")) and
+            (.cargo_home | type == "string" and test("^[A-Za-z]:/[A-Za-z0-9_./+-]+$") and
+                (contains("..") | not) and endswith("/" + $name)) and
             .receipt_path == (.cargo_home + "/.dsr-cache-seed.json") and
             (.receipt_sha256 | test("^[0-9a-f]{64}$")) and
             (.inventory_sha256 | test("^[0-9a-f]{64}$")) and
@@ -5690,7 +6500,11 @@ _act_prepare_windows_private_cargo_home() {
                 (keys | sort) == ["fingerprint", "receipt_sha256", "schema_version"] and
                 (.fingerprint | test("^[0-9a-f]{64}$")) and
                 (.receipt_sha256 | test("^[0-9a-f]{64}$"))))
-    ' <<< "$summary"
+    ' <<< "$summary"); then
+        _log_error "Strict Windows Cargo cache preparation returned invalid private attempt evidence on $host (expected .cargo-home-$suffix)"
+        return 4
+    fi
+    printf '%s\n' "$summary"
 }
 
 # The build uses the same context constructor and CMD launcher as admission.
@@ -6885,6 +7699,8 @@ act_sync_sources() {
     local host_paths=()
     local configured_host_paths=()
     local admitted_host_capabilities=()
+    local admitted_writable_paths=()
+    local writable_admission_plans=()
     local target_hosts_json='{}'
     for target in $targets; do
         local host remote_path
@@ -6908,9 +7724,11 @@ act_sync_sources() {
         target_hosts_json=$(jq -c --arg target "$target" --arg host "$host" \
             '.[$target] = $host' <<< "$target_hosts_json") || return 4
         local already_added=false
-        for h in "${hosts_to_sync[@]}"; do
-            if [[ "$h" == "$host" ]]; then
+        local sync_host_index
+        for sync_host_index in "${!hosts_to_sync[@]}"; do
+            if [[ "${hosts_to_sync[$sync_host_index]}" == "$host" ]]; then
                 already_added=true
+                remote_path="${host_paths[$sync_host_index]}"
                 break
             fi
         done
@@ -6934,9 +7752,8 @@ act_sync_sources() {
             fi
             admitted_host_capabilities+=("$admission_key")
         fi
-        $already_added && continue
         local configured_remote_path="$remote_path"
-        if $stage_ordinary; then
+        if ! $already_added && $stage_ordinary; then
             ordinary_stage_id=$(_act_generate_uuid) || return 4
             remote_path=$(_act_ordinary_source_root_path "$host" "$ordinary_stage_id" "$configured_remote_path") || return 4
         fi
@@ -6956,7 +7773,7 @@ act_sync_sources() {
             esac
         fi
 
-        if $strict_release; then
+        if ! $already_added && $strict_release; then
             if ! remote_path=$(_act_strict_source_root_path \
                 "$remote_path" "$tool_name" "$strict_run_id" "$host"); then
                 _log_error "Could not derive a safe fresh source root for $host"
@@ -6965,9 +7782,83 @@ act_sync_sources() {
             fi
         fi
 
+        if ! _act_is_windows_host "$host"; then
+            local sync_build_env sync_language sync_cache_root sync_env_pair sync_filtered_env=""
+            local sync_writable_paths sync_paths_key sync_paths_admitted=false
+            local sync_extra_paths='[]' sync_dependency_count sync_dependency_index
+            local sync_dependency_local sync_dependency_relative sync_source_parent
+            sync_source_parent=$(dirname "$remote_path") || return 4
+            if $strict_release || $stage_ordinary; then
+                sync_extra_paths=$(jq -nc --arg path "$sync_source_parent" \
+                    '[{role:"source_parent",path:$path}]') || return 4
+            fi
+            if $strict_release; then
+                sync_extra_paths=$(jq -nc --argjson extra "$sync_extra_paths" \
+                    --argjson dependencies "$strict_dependency_checkouts" --arg parent "$sync_source_parent" \
+                    '$extra + [$dependencies[] | {role:"source_dependency",path:($parent + "/" + .relative_path)}]') || return 4
+            elif [[ "$remote_path" != "$local_path" ]]; then
+                sync_dependency_count=$(yq -r '.sibling_crates // [] | length' "$config_file") || return 4
+                [[ "$sync_dependency_count" =~ ^[0-9]+$ ]] || return 4
+                for ((sync_dependency_index = 0; sync_dependency_index < sync_dependency_count; sync_dependency_index++)); do
+                    sync_dependency_local=$(yq -r ".sibling_crates[$sync_dependency_index].local_path" "$config_file") || return 4
+                    sync_dependency_local=$(_act_materialized_source_path "$tool_name" "$sync_dependency_local") || return 4
+                    sync_dependency_relative=$(yq -r ".sibling_crates[$sync_dependency_index].relative_path // \"\"" "$config_file") || return 4
+                    [[ -n "$sync_dependency_relative" ]] || sync_dependency_relative=$(basename "$sync_dependency_local") || return 4
+                    sync_extra_paths=$(jq -nc --argjson extra "$sync_extra_paths" \
+                        --arg path "$sync_source_parent/$sync_dependency_relative" \
+                        '$extra + [{role:"source_dependency",path:$path}]') || return 4
+                done
+            fi
+            sync_build_env=$(act_get_build_env "$tool_name" "$target") || return 4
+            sync_language=$(yq -r '.language // ""' "$config_file") || return 4
+            sync_cache_root=$(yq -r '.strict_cargo_cache_root // ""' "$config_file") || return 4
+            if [[ -n "$sync_cache_root" ]] &&
+               { ! $strict_release || [[ "$sync_language" != rust ||
+                    ! "$sync_cache_root" =~ ^/[A-Za-z0-9_./+-]+$ || "$sync_cache_root" == *..* ]]; }; then
+                _log_error "strict_cargo_cache_root requires strict Unix Rust and a canonical absolute private directory"
+                return 4
+            fi
+            while IFS= read -r sync_env_pair; do
+                [[ -n "$sync_env_pair" ]] || continue
+                if [[ "$sync_language" == rust ]]; then
+                    [[ "$sync_env_pair" != CARGO_HOME=* ]] || continue
+                    if $strict_release; then
+                        [[ "$sync_env_pair" != CARGO_TARGET_DIR=* ]] || continue
+                        [[ -z "$sync_cache_root" || "$sync_env_pair" != CARGO_BUILD_BUILD_DIR=* ]] || continue
+                    fi
+                fi
+                sync_filtered_env+="${sync_filtered_env:+$'\n'}$sync_env_pair"
+            done <<< "$sync_build_env"
+            sync_writable_paths=$(_act_native_writable_paths_json "$remote_path" "$remote_path" \
+                "$sync_filtered_env" "$sync_language" "$sync_cache_root" "$sync_extra_paths" true) || return 4
+            sync_paths_key="$host:$capability:$sync_writable_paths"
+            for admitted in "${admitted_writable_paths[@]}"; do
+                [[ "$admitted" != "$sync_paths_key" ]] || sync_paths_admitted=true
+            done
+            if ! $sync_paths_admitted; then
+                writable_admission_plans+=("$(jq -nc --arg host "$host" --arg capability "$capability" \
+                    --argjson paths "$sync_writable_paths" '{host:$host,capability:$capability,paths:$paths}')")
+                admitted_writable_paths+=("$sync_paths_key")
+            fi
+        fi
+        $already_added && continue
         hosts_to_sync+=("$host")
         host_paths+=("$remote_path")
         configured_host_paths+=("$configured_remote_path")
+    done
+
+    # General host/capability admission for the entire plan completes first.
+    # Path-bound observations still precede the first context export or write.
+    local writable_plan writable_host writable_capability writable_paths
+    for writable_plan in "${writable_admission_plans[@]}"; do
+        writable_host=$(jq -r .host <<< "$writable_plan") || return 4
+        writable_capability=$(jq -r .capability <<< "$writable_plan") || return 4
+        writable_paths=$(jq -c .paths <<< "$writable_plan") || return 4
+        if ! _act_native_writable_paths_ready "$writable_host" "$writable_capability" "$writable_paths"; then
+            jq -nc --arg host "$writable_host" \
+                '{status:"error",exit_code:4,host:$host,error:"Native source writable paths are not ready"}'
+            return 4
+        fi
     done
 
     if [[ ${#hosts_to_sync[@]} -eq 0 ]]; then
@@ -7325,8 +8216,14 @@ act_substitute_build_cmd_tokens() {
 
     cmd="${cmd//\$\{arch\}/$arch}"
     cmd="${cmd//\$\{ARCH\}/$arch}"
-    cmd="${cmd//\$\{goarch\}/$arch}"
-    cmd="${cmd//\$\{GOARCH\}/$arch}"
+    # Keep release-routing names in ${arch}, but use the compiler's spelling
+    # for Go selectors. An inline GOARCH assignment otherwise overrides the
+    # correctly resolved environment with unsupported GOARCH=armv7. The
+    # existing environment resolver still owns the required GOARM=7 value.
+    local go_arch="$arch"
+    [[ "$go_arch" != armv7 ]] || go_arch=arm
+    cmd="${cmd//\$\{goarch\}/$go_arch}"
+    cmd="${cmd//\$\{GOARCH\}/$go_arch}"
 
     if [[ -n "$target_triple" ]]; then
         cmd="${cmd//\$\{target_triple\}/$target_triple}"
@@ -8438,7 +9335,7 @@ def influences(name):
 
 
 def cargo_env_exemption(name, entry):
-    if name not in ('RUST_MIN_STACK', 'RUST_TEST_THREADS'):
+    if name not in ('RUST_MIN_STACK', 'RUST_TEST_THREADS', 'CARGO_INCREMENTAL'):
         return None
     force = False
     value = entry
@@ -8450,7 +9347,12 @@ def cargo_env_exemption(name, entry):
         relative = entry.get('relative', False)
         if type(force) is not bool or type(relative) is not bool or relative:
             fail('Cargo numeric environment requires boolean force and relative=false: ' + name)
-    if not isinstance(value, str) or not re.fullmatch(r'[1-9][0-9]*', value):
+    # Admit only the disabling value for Cargo's children. Cargo itself reads
+    # its process environment before applying [env] (checked below).
+    if name == 'CARGO_INCREMENTAL':
+        if value != '0':
+            fail('Cargo incremental environment requires the string "0": ' + name)
+    elif not isinstance(value, str) or not re.fullmatch(r'[1-9][0-9]*', value):
         fail('Cargo environment requires a positive-integer string: ' + name)
     return {'name': name, 'value': value, 'force': force}
 
@@ -8462,9 +9364,15 @@ def cargo_effective_environment(config, receipts, environment):
     effective = {}
     for name, entry in sorted(config.get('env', {}).items()):
         row = cargo_env_exemption(name, entry)
+        # Cargo consumes this variable before applying [env] to its children;
+        # force=true cannot override an enabling value in Cargo's own process.
+        if name == 'CARGO_INCREMENTAL' and name in environment and environment[name] != '0':
+            fail('Cargo process incremental environment requires the string "0": ' + name)
         ambient = name in environment and not row['force']
         value = environment[name] if ambient else row['value']
-        if not re.fullmatch(r'[1-9][0-9]*', value):
+        valid = value == '0' if name == 'CARGO_INCREMENTAL' else (
+            isinstance(value, str) and re.fullmatch(r'[1-9][0-9]*', value))
+        if not valid:
             fail('effective Cargo numeric environment is invalid: ' + name)
         effective[name] = (value, row['force'], 'environment' if ambient else 'configuration')
     for receipt in receipts:
@@ -8533,6 +9441,8 @@ def cargo_validate_flags(words, cfg_scoped=False):
                 key = re.split(r'[=\s]', option.strip().lstrip('='), maxsplit=1)[0]
                 # rustc accepts underscores as well as hyphens in -C/-Z keys.
                 if key.replace('_', '-') == forbidden:
+                    if forbidden == 'linker':
+                        fail('rustflags compiler/linker overrides require explicit attested configuration; move the linker option to [target.<triple>] linker')
                     fail('rustflags compiler/linker overrides require explicit attested configuration')
         if cfg_scoped and (word in ('--cfg', '--target') or word.startswith(('--cfg=', '--target='))):
             fail('cfg-scoped Cargo selection cannot be combined with rustflags --cfg or --target')
@@ -9110,15 +10020,99 @@ def is_script(path):
     with open(path, 'rb') as stream:
         return stream.read(2) == b'#!'
 
-rustup = shutil.which('rustup', path=probe_env.get('PATH'))
-if not rustup:
-    # The managed HOME Cargo fallback may be the stock Rustup proxy even
-    # when neither rustc nor rustup is on PATH. Bind its actual HOME dispatcher
-    # before deciding whether those Cargo bytes are the compiler or a proxy.
-    home_rustup = pathlib.Path(probe_env.get('HOME', '') + '/.cargo/bin/rustup')
-    if home_rustup.is_file() and os.access(home_rustup, os.X_OK) and not is_script(home_rustup):
-        rustup = str(home_rustup)
-rustup_digest = digest(pathlib.Path(rustup).resolve()) if rustup else None
+if 'RUSTUP_FORCE_ARG0' in probe_env:
+    fail('configured Rustup dispatch overrides are outside executable attestation')
+
+# These are the existing trusted host's manager locations, not arbitrary
+# siblings of a selected executable. A mismatched PATH manager must not hide
+# a byte-identical HOME manager. Version output never recognizes a proxy.
+rustup_candidates = []
+path_rustup = shutil.which('rustup', path=probe_env.get('PATH'))
+if path_rustup:
+    rustup_candidates.append(pathlib.Path(path_rustup).absolute())
+home_rustup = pathlib.Path(probe_env.get('HOME', '') + '/.cargo/bin/rustup')
+if home_rustup not in rustup_candidates:
+    rustup_candidates.append(home_rustup)
+
+
+def rustup_reference(expected_digest=None):
+    # Reviewed launchers invoke the configured manager, so their unqualified
+    # lookup must not fall through a broken PATH manager to another install.
+    candidates = rustup_candidates if expected_digest is not None else rustup_candidates[:1]
+    for candidate in candidates:
+        try:
+            physical = candidate.resolve(strict=True)
+            if (physical.name != 'rustup' or not physical.is_file() or
+                    not os.access(physical, os.X_OK) or is_script(physical)):
+                continue
+            observed = digest(physical)
+            if expected_digest is None or observed == expected_digest:
+                return candidate, physical, observed
+        except (OSError, RuntimeError):
+            continue
+    return None
+
+
+def rustup_resolve(reference, tool):
+    candidate, physical, expected = reference
+    parent = fd = None
+    try:
+        parent = os.open(physical.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        parent_before = os.fstat(parent)
+        fd = os.open(physical.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            fail('Rustup manager reference is not a regular executable')
+        with os.fdopen(fd, 'rb') as stream:
+            fd = None
+
+            def unchanged():
+                stream.seek(0)
+                observed = hashlib.sha256()
+                for block in iter(lambda: stream.read(1048576), b''):
+                    observed.update(block)
+                named = os.stat(physical, follow_symlinks=False)
+                current_parent = os.stat(physical.parent, follow_symlinks=False)
+                return (candidate.resolve(strict=True) == physical and
+                        receipt_identity(before) == receipt_identity(os.fstat(stream.fileno())) and
+                        receipt_identity(before) == receipt_identity(named) and
+                        (parent_before.st_dev, parent_before.st_ino) ==
+                        (current_parent.st_dev, current_parent.st_ino) and
+                        observed.hexdigest() == expected)
+
+            if not unchanged():
+                fail('Rustup manager reference changed before dispatch resolution')
+            which = run([str(physical), 'which', tool])
+            if not unchanged():
+                fail('Rustup manager reference changed during dispatch resolution')
+        actual = pathlib.Path(which)
+        if not actual.is_absolute() or not actual.is_file():
+            fail('rustup did not resolve the selected ' + tool)
+        return actual.resolve(strict=True), {'path': str(physical), 'sha256': expected}
+    except (OSError, RuntimeError) as error:
+        fail('cannot hold Rustup manager reference: ' + str(error))
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if parent is not None:
+            os.close(parent)
+
+
+def refuse_unresolved_rustup(path):
+    # Rustup documents FORCE_ARG0 as binary-name dispatch. Native forwarders
+    # can relay it, so a response only refuses unresolved delegation; it never
+    # grants authority or supplies a resolved executable path.
+    environment = dict(probe_env, RUSTUP_FORCE_ARG0='rustup')
+    try:
+        result = subprocess.run([str(path), '--version'], capture_output=True,
+                                text=True, timeout=60, env=environment)
+    except (OSError, UnicodeError, subprocess.TimeoutExpired) as error:
+        fail('cannot check unresolved Rustup dispatch: ' + str(error))
+    if re.fullmatch(
+            r'rustup [0-9]+\.[0-9]+\.[0-9]+(?:[-+ ][^\r\n]*)?', result.stdout.strip()):
+        fail('unresolved Rustup dispatch or opaque native wrapper: no byte-identical manager reference')
+    if result.returncode:
+        fail('cannot rule out unresolved Rustup dispatch: version check failed for ' + str(path))
 
 # Same exact reviewed v4 shim/v3 toolchain-wrapper bytes used by the strict
 # cache resolver. v6 was additionally source-reviewed against RCH's shim.rs
@@ -9136,15 +10130,17 @@ def identity(name, program, version_args, rustup_tool=None, required=True):
         return None
     selected = pathlib.Path(selected).absolute()
     resolved_selected = selected.resolve()
+    selected_digest = digest(resolved_selected)
     version = run([str(selected), *version_args]) if version_args else ''
     if version_args and version_args[-1] != '-vV':
         version = version.splitlines()[0] if version else ''
     record = {'program': program, 'selected_path': str(selected),
-              'selected_sha256': digest(resolved_selected),
+              'selected_sha256': selected_digest,
               'selected_kind': 'script' if is_script(resolved_selected) else 'executable',
               'version': version}
     actual = None
-    proxy = rustup_digest is not None and record['selected_sha256'] == rustup_digest
+    manager = rustup_reference(selected_digest) if rustup_tool else None
+    proxy = manager is not None
     managed_cargo = rustup_tool == 'cargo' and record['selected_kind'] == 'script' and \
         record['selected_sha256'] in (rch_shim_hash, rch_toolchain_hash, rch_shim_v6_hash)
     if managed_cargo:
@@ -9187,24 +10183,22 @@ def identity(name, program, version_args, rustup_tool=None, required=True):
             else:
                 actual = pathlib.Path(probe_env.get('HOME', '') + '/.cargo/bin/cargo')
     if rustup_tool and (proxy or managed_cargo and actual is None):
-        if not rustup or is_script(pathlib.Path(rustup).resolve()):
+        reference = manager or rustup_reference()
+        if reference is None:
             fail('selected compiler requires an executable rustup resolver')
-        record['rustup_resolver'] = {'path': str(pathlib.Path(rustup).resolve()),
-                                     'sha256': rustup_digest}
-        which = run([rustup, 'which', rustup_tool])
-        if not which or not pathlib.Path(which).is_file():
-            fail('rustup did not resolve the selected ' + rustup_tool)
-        actual = pathlib.Path(which).resolve()
+        actual, record['rustup_resolver'] = rustup_resolve(reference, rustup_tool)
+    elif rustup_tool and not managed_cargo:
+        refuse_unresolved_rustup(resolved_selected)
+        if rustup_tool == 'cargo' and explicit_toolchain:
+            fail('an explicit +toolchain requires a recognized Rustup Cargo proxy or reviewed launcher')
     if actual is not None and rustup_tool:
         try:
             actual = actual.resolve(strict=True)
             # The v6 fallback can itself be the stock rustup Cargo proxy.
-            if managed_cargo and not is_script(actual) and digest(actual) == rustup_digest:
-                if not rustup or is_script(pathlib.Path(rustup).resolve()):
-                    fail('managed Cargo fallback requires an executable rustup resolver')
-                record['rustup_resolver'] = {'path': str(pathlib.Path(rustup).resolve()),
-                                             'sha256': rustup_digest}
-                actual = pathlib.Path(run([rustup, 'which', rustup_tool])).resolve(strict=True)
+            if managed_cargo and not is_script(actual):
+                fallback_manager = rustup_reference(digest(actual))
+                if fallback_manager is not None:
+                    actual, record['rustup_resolver'] = rustup_resolve(fallback_manager, rustup_tool)
             if is_script(actual):
                 if (rustup_tool != 'cargo' or digest(actual) != rch_toolchain_hash or
                         probe_env.get('RCH_CARGO_WRAPPER_BYPASS') != '1' or
@@ -9212,15 +10206,18 @@ def identity(name, program, version_args, rustup_tool=None, required=True):
                     fail('unresolved compiler launcher: ' + str(actual))
                 record['toolchain_launcher'] = {'path': str(actual), 'sha256': digest(actual)}
                 actual = (actual.parent / 'cargo-rch-real').resolve(strict=True)
-            if (not actual.is_file() or not os.access(actual, os.X_OK) or is_script(actual) or
-                    digest(actual) == rustup_digest):
+            if not actual.is_file() or not os.access(actual, os.X_OK) or is_script(actual):
                 fail('compiler delegation did not resolve a real executable: ' + str(actual))
+            refuse_unresolved_rustup(actual)
+            actual_digest = digest(actual)
             native_args = version_args[1:] if version_args and version_args[0].startswith('+') else version_args
             native_version = run([str(actual), *native_args]) if native_args else ''
             if native_args and native_args[-1] != '-vV':
                 native_version = native_version.splitlines()[0] if native_version else ''
             if native_version != version:
                 fail('selected launcher and resolved executable version disagree: ' + program)
+            if digest(actual) != actual_digest:
+                fail('resolved compiler executable changed during its version probe: ' + program)
         except (OSError, RuntimeError) as error:
             fail('cannot resolve actual compiler executable: ' + str(error))
     if sys.platform == 'darwin' and str(resolved_selected) in (
@@ -9234,6 +10231,8 @@ def identity(name, program, version_args, rustup_tool=None, required=True):
         record['resolved_path'] = str(actual)
         record['resolved_sha256'] = digest(actual)
         record['resolved_kind'] = 'script' if is_script(actual) else 'executable'
+    if selected.resolve() != resolved_selected or digest(resolved_selected) != selected_digest:
+        fail('selected executable changed during its identity probe: ' + program)
     return record
 
 triple = selection['target']
@@ -9490,8 +10489,10 @@ act_run_native_build() {
     [[ -z "$capability" ]] || readiness_args+=(--require "$capability")
     if ! declare -F host_health_is_ready &>/dev/null || ! host_health_is_ready "${readiness_args[@]}"; then
         _log_error "Native build host is not ready: $host${capability:+ (requires $capability)}"
-        jq -nc --arg host "$host" \
-            '{status:"error",exit_code:4,host:$host,error:"Native build host is not ready"}'
+        jq -nc --arg platform "$platform" --arg host "$host" --arg triple "$selected_triple" \
+            '{platform:$platform,method:"native",status:"error",exit_code:4,host:$host,
+              stage:"host_readiness",error:"Native build host is not ready"} +
+             (if $triple == "" then {} else {target_triple:$triple} end)'
         return 4
     fi
     local ssh_destination="$host"
@@ -9676,6 +10677,7 @@ act_run_native_build() {
     local strict_sources_verification=""
     local build_influence_env_json='{}'
     local cargo_isolation_json='null'
+    local native_writable_paths='[]' native_storage_error=""
     local nonstrict_stage_root="" nonstrict_source_root="" nonstrict_cargo_home=""
     local nonstrict_sibling_roots_json='[]'
     local nonstrict_sibling_relatives=()
@@ -9770,6 +10772,19 @@ act_run_native_build() {
         local cargo_attempt cargo_prepare=_act_prepare_unix_private_cargo_home
         cargo_attempt=$(_act_generate_uuid) || return 3
         _act_is_windows_host "$host" && cargo_prepare=_act_prepare_windows_private_cargo_home
+        if ! _act_is_windows_host "$host"; then
+            local prepared_cargo_home="${remote_path%/*}/.cargo-home-${platform//\//-}-${cargo_attempt//-/}"
+            native_writable_paths=$(_act_native_writable_paths_json "$remote_path" "$remote_path" \
+                "$strict_build_env"$'\n'"CARGO_HOME=$prepared_cargo_home" "$language" \
+                "$strict_cache_root") || return 4
+            if ! _act_native_writable_paths_ready "$host" "$capability" "$native_writable_paths"; then
+                jq -nc --arg platform "$platform" --arg host "$host" --arg triple "$selected_triple" \
+                    '{platform:$platform,method:"native",status:"error",exit_code:4,host:$host,
+                      stage:"host_readiness",error:"Native Cargo writable paths are not ready"} +
+                     (if $triple == "" then {} else {target_triple:$triple} end)'
+                return 4
+            fi
+        fi
         if ! strict_cargo_seed_json=$("$cargo_prepare" \
                 "$host" "$remote_path" "${platform//\//-}-${cargo_attempt//-/}" \
                 "$build_cmd" "$strict_build_env") || \
@@ -10115,11 +11130,37 @@ act_run_native_build() {
     # Where in-tree outputs of this build land (collection reads from here).
     local artifact_source_root="${output_stage_source:-$remote_path}"
 
-    # Prepare log file
-    local log_dir log_file
+    if ! _act_is_windows_host "$host"; then
+        local native_working_root="${nonstrict_source_root:-${output_stage_source:-$remote_path}}"
+        native_writable_paths=$(_act_native_writable_paths_json "$remote_path" "$native_working_root" \
+            "$build_env" "$language" "$strict_cache_root") || return 4
+        if ! _act_native_writable_paths_ready "$host" "$capability" "$native_writable_paths"; then
+            jq -nc --arg platform "$platform" --arg host "$host" --arg triple "$selected_triple" \
+                '{platform:$platform,method:"native",status:"error",exit_code:4,host:$host,
+                  stage:"host_readiness",error:"Native build writable paths are not ready"} +
+                 (if $triple == "" then {} else {target_triple:$triple} end)'
+            return 4
+        fi
+    fi
+
+    # Every invocation owns its log, including retries of one target and
+    # concurrent standalone callers that share a release run. Allocate before
+    # preparation or compilation so unavailable evidence storage fails closed.
+    local log_dir log_file native_log_dir native_log_label
     log_dir="$ACT_LOGS_DIR"
-    mkdir -p "$log_dir"
-    log_file="$log_dir/${tool_name}-${native_target_slug}-${run_id:-$$}.log"
+    native_log_label="${tool_name}-${native_target_slug}-${run_id:-$$}"
+    native_log_label="${native_log_label//[^A-Za-z0-9._+-]/_}"
+    if ! mkdir -p "$log_dir" || [[ ! -d "$log_dir" || -L "$log_dir" ]] ||
+       ! native_log_dir=$(umask 077; mktemp -d "$log_dir/${native_log_label}.XXXXXXXX") ||
+       [[ ! -d "$native_log_dir" || -L "$native_log_dir" ]] ||
+       ! (umask 077; set -C; : > "$native_log_dir/build.log"); then
+        _log_error "Unable to allocate a private native build log for $platform on $host"
+        jq -nc --arg platform "$platform" --arg host "$host" \
+            '{platform:$platform,method:"native",host:$host,status:"error",exit_code:4,
+              error:"Private native build log could not be allocated; compiler was not started"}'
+        return 4
+    fi
+    log_file="$native_log_dir/build.log"
 
     _log_info "Building $tool_name for $platform${selected_triple:+ ($selected_triple)} on $host"
     _log_info "Remote path: $remote_path"
@@ -10134,7 +11175,7 @@ act_run_native_build() {
     local cargo_env_to_unset=()
     if [[ "$language" == "rust" ]]; then
         cargo_env_to_unset=(
-            CARGO_HOME CARGO_TARGET_DIR CARGO_BUILD_TARGET CARGO_BUILD_JOBS
+            CARGO_HOME CARGO_TARGET_DIR CARGO_BUILD_BUILD_DIR CARGO_BUILD_TARGET CARGO_BUILD_JOBS
             CARGO_INCREMENTAL CARGO_ENCODED_RUSTFLAGS
             RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER RUSTFLAGS
             RUSTDOC RUSTDOCFLAGS RUSTUP_HOME RUSTUP_TOOLCHAIN
@@ -10302,7 +11343,7 @@ $ps_env_assignments
 exit \$process.ExitCode
 EOF
             ) || return 4
-            remote_cmd=$(_act_windows_encoded_powershell "$ps_nonstrict_build" pwsh) || return 4
+            windows_build_body="$ps_nonstrict_build"
         fi
     else
         # Unix: use bash/zsh compatible syntax
@@ -10469,11 +11510,10 @@ EOF
         fi
         windows_build_guard=$(_act_windows_build_guard_script "$_ACT_BUILD_TIMEOUT" "$windows_build_script") || return 4
         windows_build_script="$windows_build_guard"
-        if $strict_rust_build; then
-            remote_cmd=$(_act_windows_stage_build_script "$host" "$remote_path" "$windows_build_script") || return 4
-        else
-            remote_cmd=$(_act_windows_encoded_powershell "$windows_build_script" pwsh) || return 4
-        fi
+        # Every guard needs its private launcher directory, including ordinary
+        # and non-Rust builds. remote_path still names the existing source;
+        # the future ordinary Cargo stage is prepared separately below.
+        remote_cmd=$(_act_windows_stage_build_script "$host" "$remote_path" "$windows_build_script") || return 4
         # Let the remote deadline retire its job before killing the transport.
         # This grace is not additional build time and never enables local work.
         build_transport_timeout=$((_ACT_BUILD_TIMEOUT + 60))
@@ -10579,6 +11619,15 @@ EOF
         fi
     fi
 
+    # Cache/source preparation can consume the last available bytes. Observe
+    # the same selected volumes again immediately before starting the compiler.
+    if [[ $exit_code -eq 0 ]] && ! _act_is_windows_host "$host" &&
+       ! _act_native_writable_paths_ready "$host" "$capability" "$native_writable_paths"; then
+        exit_code=4
+        native_storage_error="Native writable paths are not ready after preparation; build command was not started"
+        _log_error "$native_storage_error"
+    fi
+
     # Execute on remote host
     # Use PIPESTATUS to capture the actual command exit code, not tee's
     if [[ $exit_code -eq 0 ]]; then
@@ -10669,6 +11718,7 @@ EOF
     local additional_artifact_receipts=()
     local collected_sha256="" collected_size_bytes=0 collected_identity=""
     local strict_collection_receipts=()
+    local workspace_member_receipts=()
     if [[ $exit_code -eq 0 ]]; then
         _log_ok "Build completed on $host in ${duration}s"
         status="success"
@@ -10686,17 +11736,21 @@ EOF
                 jq -nc '{status: "error", exit_code: 4, error: "Private strict artifact directory unavailable"}'
                 return 4
             fi
-        elif [[ -n "$selected_triple" ]]; then
-            local variant_artifact_parent="$ACT_ARTIFACTS_DIR/${run_id:-build-$tool_name}/${native_target_slug}"
-            if ! mkdir -p "$variant_artifact_parent" || \
-               [[ ! -d "$variant_artifact_parent" || -L "$variant_artifact_parent" ]] || \
-               ! artifact_dir=$(mktemp -d "$variant_artifact_parent/attempt.XXXXXXXX"); then
-                _log_error "Unable to create a fresh artifact directory for native variant $selected_triple"
+        else
+            # Singleton targets need the same per-attempt custody as variants.
+            # Reusing <run>/<platform>/<name> overwrites earlier result bytes
+            # on retry, even though their worker receipts remain immutable.
+            local native_artifact_parent="$ACT_ARTIFACTS_DIR/${run_id:-build-$tool_name}/${native_target_slug}"
+            if ! mkdir -p "$native_artifact_parent" || \
+               [[ ! -d "$native_artifact_parent" || -L "$native_artifact_parent" ]] || \
+               ! artifact_dir=$(umask 077; mktemp -d "$native_artifact_parent/attempt.XXXXXXXX") || \
+               [[ ! -d "$artifact_dir" || -L "$artifact_dir" ]]; then
+                _log_error "Unable to create a fresh native artifact directory for $platform${selected_triple:+ ($selected_triple)}"
+                jq -nc --arg platform "$platform" --arg host "$host" \
+                    '{platform:$platform,method:"native",host:$host,status:"error",exit_code:4,
+                      error:"Private native artifact directory could not be allocated"}'
                 return 4
             fi
-        else
-            artifact_dir="$ACT_ARTIFACTS_DIR/${run_id:-build-$tool_name-$(date +%s)}/${platform//\//-}"
-            mkdir -p "$artifact_dir"
         fi
 
         # Small delay to ensure files are fully flushed on remote
@@ -10736,6 +11790,7 @@ EOF
             local artifact_filename
             artifact_filename=$(basename "$remote_artifact_path")
             local this_artifact_path="$artifact_dir/$artifact_filename"
+            local ordinary_member_collected=false workspace_member_receipt=""
 
             _log_info "Downloading artifact: ${host}:${remote_artifact_path}"
             local scp_output
@@ -10840,6 +11895,7 @@ EOF
                     fi
                     if _act_accept_collected_binary "$this_artifact_path" "$platform" "$language" "$rust_glibc_floor_enforced"; then
                         local_artifact_paths+=("$this_artifact_path")
+                        ordinary_member_collected=true
                     else
                         echo "Collected artifact failed $platform validation: $this_artifact_path" >> "$log_file"
                         download_failed=true
@@ -10861,6 +11917,7 @@ EOF
                 fi
                 if _act_accept_collected_binary "$this_artifact_path" "$platform" "$language" "$rust_glibc_floor_enforced"; then
                     local_artifact_paths+=("$this_artifact_path")
+                    ordinary_member_collected=true
                 else
                     echo "Collected artifact failed $platform validation: $this_artifact_path" >> "$log_file"
                     download_failed=true
@@ -10888,6 +11945,7 @@ EOF
                         fi
                         if _act_accept_collected_binary "$this_artifact_path" "$platform" "$language" "$rust_glibc_floor_enforced"; then
                             local_artifact_paths+=("$this_artifact_path")
+                            ordinary_member_collected=true
                         else
                             echo "Collected artifact failed $platform validation: $this_artifact_path" >> "$log_file"
                             download_failed=true
@@ -10904,6 +11962,15 @@ EOF
                     _log_error "Failed to download artifact $bin from $host"
                     _log_error "SCP error: $scp_output"
                     echo "SCP failed for $bin: $scp_output" >> "$log_file"
+                    download_failed=true
+                fi
+            fi
+            if $ordinary_member_collected && [[ -n "$workspace_binaries" ]]; then
+                if workspace_member_receipt=$(_act_workspace_member_receipt \
+                        "$artifact_dir" "$artifact_filename"); then
+                    workspace_member_receipts+=("$workspace_member_receipt")
+                else
+                    _log_error "Unable to freeze collected workspace member: $this_artifact_path"
                     download_failed=true
                 fi
             fi
@@ -11002,8 +12069,12 @@ EOF
             elif _act_is_local_host "$host"; then
                 if [[ -f "$archive_file_remote" && ! -L "$archive_file_remote" ]] && \
                    cp "$archive_file_remote" "$archive_file_local" && \
-                   chmod "$archive_file_mode" "$archive_file_local"; then
+                   chmod "$archive_file_mode" "$archive_file_local" && \
+                   { [[ -z "$workspace_binaries" ]] || \
+                     archive_file_receipt=$(_act_workspace_member_receipt \
+                         "$artifact_dir" "$archive_file"); }; then
                     local_artifact_paths+=("$archive_file_local")
+                    [[ -z "$workspace_binaries" ]] || workspace_member_receipts+=("$archive_file_receipt")
                 else
                     _log_error "Failed to collect workspace archive member $archive_file from $host:$archive_file_remote"
                     download_failed=true
@@ -11012,8 +12083,12 @@ EOF
                     -o StrictHostKeyChecking=accept-new \
                     "${ssh_destination}:${archive_file_remote}" \
                     "$archive_file_local" >/dev/null 2>&1 && \
-                 chmod "$archive_file_mode" "$archive_file_local"; then
+                 chmod "$archive_file_mode" "$archive_file_local" && \
+                 { [[ -z "$workspace_binaries" ]] || \
+                   archive_file_receipt=$(_act_workspace_member_receipt \
+                       "$artifact_dir" "$archive_file"); }; then
                 local_artifact_paths+=("$archive_file_local")
+                [[ -z "$workspace_binaries" ]] || workspace_member_receipts+=("$archive_file_receipt")
             else
                 _log_error "Failed to collect workspace archive member $archive_file from $host:$archive_file_remote"
                 download_failed=true
@@ -11122,9 +12197,14 @@ EOF
         output_stage_root=""
 
         if [[ "$download_failed" == true ]]; then
-            if $strict_native_build || [[ ${#local_artifact_paths[@]} -eq 0 ]]; then
+            if $strict_native_build || [[ -n "$workspace_binaries" || ${#local_artifact_paths[@]} -eq 0 ]]; then
                 status="failed"
                 exit_code=7
+                if [[ -n "$workspace_binaries" ]]; then
+                    local_artifact_path=""
+                    local_artifact_paths=()
+                    additional_artifact_receipts=()
+                fi
             else
                 # Partial success - some artifacts downloaded
                 status="partial"
@@ -11196,37 +12276,60 @@ EOF
 
             local staged_workspace_includes=""
             local workspace_include_revision=""
+            local emit_workspace_include_receipts=false
+            $strict_native_build || emit_workspace_include_receipts=true
             if [[ -z "$archive_ext" ]]; then
                 :
             elif $strict_native_build; then
                 if [[ ! "$release_git_sha" =~ ^[0-9a-f]{40}$ || "$release_git_sha" =~ ^0{40}$ ]]; then
                     _log_error "Strict workspace companion-file staging requires an exact release commit"
                     jq -nc --arg platform "$platform" \
-                        '{status: "failed", exit_code: 7, error: ("Release commit is missing for workspace companion-file staging on " + $platform)}'
+                        '{status:"failed",exit_code:7,platform:$platform,
+                          artifact_path:"",artifact_paths:[],additional_artifacts:[],
+                          error:("Release commit is missing for workspace companion-file staging on " + $platform)}'
                     return 7
                 fi
                 workspace_include_revision="$release_git_sha"
             fi
             if ! staged_workspace_includes=$(
                 _act_stage_workspace_include_files \
-                    "$config_file" "$local_path" "$artifact_dir" "$workspace_include_revision"
+                    "$config_file" "$local_path" "$artifact_dir" "$workspace_include_revision" \
+                    "$emit_workspace_include_receipts"
             ); then
                 _log_error "Failed to stage configured workspace companion files for $platform"
                 jq -nc --arg platform "$platform" \
-                    '{status: "failed", exit_code: 7, error: ("Workspace companion-file staging failed for " + $platform)}'
+                    '{status:"failed",exit_code:7,platform:$platform,
+                      artifact_path:"",artifact_paths:[],additional_artifacts:[],
+                      error:("Workspace companion-file staging failed for " + $platform)}'
                 return 7
             fi
-            local staged_include
-            while IFS= read -r staged_include; do
-                [[ -n "$staged_include" ]] && archive_files+=("$staged_include")
+            local staged_include staged_include_record
+            while IFS= read -r staged_include_record; do
+                [[ -n "$staged_include_record" ]] || continue
+                if $emit_workspace_include_receipts; then
+                    if ! staged_include=$(jq -er '.member | select(type == "string" and length > 0)' \
+                            <<< "$staged_include_record"); then
+                        _log_error "Workspace companion receipt is invalid for $platform"
+                        jq -nc --arg platform "$platform" \
+                            '{status:"failed",exit_code:7,platform:$platform,
+                              artifact_path:"",artifact_paths:[],additional_artifacts:[],
+                              error:"Workspace companion receipt is invalid"}'
+                        return 7
+                    fi
+                    workspace_member_receipts+=("$staged_include_record")
+                else
+                    staged_include="$staged_include_record"
+                fi
+                archive_files+=("$staged_include")
             done <<< "$staged_workspace_includes"
             _log_info "Workspace archive members: ${archive_files[*]}"
 
-            # Create the archive
-            local archive_output
-            if $strict_native_build; then
-                local archive_receipt="" archive_mode=700
-                [[ "$platform" == windows/* ]] && archive_mode=600
+            # All workspace producers use the same fresh held destination.
+            # An archiver failure never becomes a raw-binary fallback, and a
+            # zero-exit partial ZIP still has to prove its complete payload.
+            local archive_receipt="" archive_mode=700
+            [[ "$platform" == windows/* ]] && archive_mode=600
+            if _act_is_safe_basename "$archive_name"; then
                 case "$archive_ext" in
                     zip)
                         if command -v zip &>/dev/null; then
@@ -11249,6 +12352,8 @@ EOF
                             "${archive_files[@]}") || archive_receipt=""
                         ;;
                 esac
+            fi
+            if $strict_native_build; then
                 if [[ -n "$archive_receipt" ]] && \
                    ! _act_validate_workspace_archive_release_tree_includes \
                        "$archive_path" "$archive_ext" "$config_file" \
@@ -11270,72 +12375,53 @@ EOF
                     _log_error "Windows family ZIP failed final component-manifest verification"
                     archive_receipt=""
                 fi
-                if [[ -n "$archive_receipt" ]]; then
-                    _log_ok "Created archive through held descriptor: $archive_path"
-                    local_artifact_path="$archive_path"
-                    local_artifact_paths=("$archive_path")
-                    collected_sha256=$(jq -r '.sha256' <<< "$archive_receipt")
-                    collected_size_bytes=$(jq -r '.size_bytes' <<< "$archive_receipt")
-                    collected_identity=$(jq -r '.identity' <<< "$archive_receipt")
-                else
-                    _log_error "Strict workspace archive stream failed for $platform"
-                    echo "Strict workspace archive creation failed" >> "$log_file"
-                    status="failed"
-                    exit_code=7
-                    local_artifact_path=""
-                    local_artifact_paths=()
-                fi
-            elif [[ "$archive_ext" == "zip" ]]; then
-                # Windows: use zip
-                if command -v zip &>/dev/null; then
-                    archive_output=$(cd "$artifact_dir" && zip "$archive_name" "${archive_files[@]}" 2>&1)
-                    if [[ -f "$archive_path" ]]; then
-                        _log_ok "Created archive: $archive_path"
-                        # Update artifact path to point to the archive
-                        local_artifact_path="$archive_path"
-                        local_artifact_paths=("$archive_path")
-                    else
-                        _log_warn "Failed to create zip archive"
-                        _log_warn "zip output: $archive_output"
-                        echo "Archive creation failed: $archive_output" >> "$log_file"
-                        # Fall back to comma-separated paths
-                        local_artifact_path=$(IFS=','; echo "${local_artifact_paths[*]}")
-                    fi
-                else
-                    _log_warn "zip not available, skipping archive creation"
-                    # Fall back to comma-separated paths
-                    local_artifact_path=$(IFS=','; echo "${local_artifact_paths[*]}")
-                fi
-            elif [[ "$archive_ext" == "tar.gz" ]]; then
-                archive_output=$(cd "$artifact_dir" && \
-                    COPYFILE_DISABLE=1 tar --no-xattrs -czf "$archive_name" \
-                        "${archive_files[@]}" 2>&1)
-                if [[ -f "$archive_path" ]]; then
-                    _log_ok "Created archive: $archive_path"
-                    local_artifact_path="$archive_path"
-                    local_artifact_paths=("$archive_path")
-                else
-                    _log_warn "Failed to create tar.gz archive"
-                    _log_warn "tar output: $archive_output"
-                    echo "Archive creation failed: $archive_output" >> "$log_file"
-                    local_artifact_path=$(IFS=','; echo "${local_artifact_paths[*]}")
-                fi
             else
-                archive_output=$(cd "$artifact_dir" && \
-                    COPYFILE_DISABLE=1 tar --no-xattrs -cJf "$archive_name" \
-                        "${archive_files[@]}" 2>&1)
-                if [[ -f "$archive_path" ]]; then
-                    _log_ok "Created archive: $archive_path"
-                    # Update artifact path to point to the archive
-                    local_artifact_path="$archive_path"
-                    local_artifact_paths=("$archive_path")
-                else
-                    _log_warn "Failed to create tar.xz archive"
-                    _log_warn "tar output: $archive_output"
-                    echo "Archive creation failed: $archive_output" >> "$log_file"
-                    # Fall back to comma-separated paths
-                    local_artifact_path=$(IFS=','; echo "${local_artifact_paths[*]}")
+                local validate_workspace_architecture=false
+                case "$language" in rust|go) validate_workspace_architecture=true ;; esac
+                if [[ -n "$archive_receipt" ]] && \
+                   { ! _act_validate_workspace_archive \
+                         "$archive_path" "$archive_ext" "$platform" "$config_file" \
+                         "$validate_workspace_architecture" || \
+                     ! _act_validate_workspace_member_receipts \
+                         "$archive_path" "$archive_ext" "$artifact_dir" \
+                         "${workspace_member_receipts[@]}"; }; then
+                    _log_error "Workspace archive does not match its configured members and collection receipts for $platform"
+                    archive_receipt=""
                 fi
+            fi
+            # Member validators must not replace/rewrite the archive that the
+            # exclusive producer accepted, even with another valid archive.
+            local verified_archive_receipt=""
+            if [[ -n "$archive_receipt" ]]; then
+                verified_archive_receipt=$(_act_workspace_member_receipt \
+                    "$artifact_dir" "$archive_name") || verified_archive_receipt=""
+                if [[ -z "$verified_archive_receipt" ]] || \
+                   ! jq -e --argjson collected "$archive_receipt" '
+                       .path == $collected.path and .sha256 == $collected.sha256 and
+                       .size_bytes == $collected.size_bytes and .identity == $collected.identity
+                   ' <<< "$verified_archive_receipt" >/dev/null; then
+                    _log_error "Workspace archive changed after collection for $platform"
+                    archive_receipt=""
+                fi
+            fi
+            if [[ -n "$archive_receipt" ]]; then
+                _log_ok "Created archive through held descriptor: $archive_path"
+                local_artifact_path="$archive_path"
+                local_artifact_paths=("$archive_path")
+                collected_sha256=$(jq -r '.sha256' <<< "$archive_receipt")
+                collected_size_bytes=$(jq -r '.size_bytes' <<< "$archive_receipt")
+                collected_identity=$(jq -r '.identity' <<< "$archive_receipt")
+            else
+                _log_error "Workspace archive creation or verification failed for $platform"
+                echo "Workspace archive creation or verification failed" >> "$log_file"
+                status="failed"
+                exit_code=7
+                local_artifact_path=""
+                local_artifact_paths=()
+                additional_artifact_receipts=()
+                collected_sha256=""
+                collected_size_bytes=0
+                collected_identity=""
             fi
         else
             # Join paths with comma for JSON output (single binary or no packaging needed)
@@ -11347,6 +12433,11 @@ EOF
             fi
         fi
 
+    elif [[ -n "$native_storage_error" ]]; then
+        # A late capacity refusal never started the build command. Preserve
+        # the admission outcome for public reporting and resume accounting.
+        status="failed"
+        exit_code=4
     elif [[ $exit_code -eq 124 ]]; then
         _log_error "Build timed out on $host after ${_ACT_BUILD_TIMEOUT}s"
         status="timeout"
@@ -11387,6 +12478,7 @@ EOF
         --argjson collected_size_bytes "$collected_size_bytes" \
         --arg collected_identity "$collected_identity" \
         --argjson build_influence_env "$build_influence_env_json" \
+        --arg storage_error "$native_storage_error" \
         --arg log_file "$log_file" \
         'input as $cargo_isolation | {
             tool: $tool,
@@ -11406,7 +12498,8 @@ EOF
             build_influence_env: $build_influence_env,
             cargo_isolation: $cargo_isolation,
             log_file: $log_file
-        }' <<< "$cargo_isolation_json" || return 4
+        } + (if $storage_error == "" then {} else
+               {stage:"host_readiness",error:$storage_error} end)' <<< "$cargo_isolation_json" || return 4
 
     return "$exit_code"
 }
@@ -11419,7 +12512,7 @@ _act_result_artifact_receipts() {
     local result_json="$1"
     local -A seen_paths=()
     local -a artifact_paths=() receipts=()
-    local path artifact_dir legacy_paths array_count
+    local path artifact_dir directory_field legacy_paths array_count
 
     # The array form is authoritative and preserves commas/newlines in valid
     # Unix paths. The scalar form is a legacy comma-separated compatibility
@@ -11464,19 +12557,25 @@ _act_result_artifact_receipts() {
         return 4
     fi
 
-    artifact_dir=$(jq -r '.artifact_dir // empty' <<< "$result_json" 2>/dev/null)
-    if [[ -n "$artifact_dir" ]]; then
+    for directory_field in artifact_dir workflow_artifact_dir workflow_payload_dir; do
+        artifact_dir=$(jq -r --arg field "$directory_field" '.[$field] // empty' <<< "$result_json" 2>/dev/null)
+        [[ -n "$artifact_dir" ]] || continue
         [[ -d "$artifact_dir" && ! -L "$artifact_dir" ]] || return 4
         # Process substitution cannot propagate find's exit status. Preflight
         # traversal explicitly so an unreadable subtree cannot yield a
         # deceptively partial receipt set.
         find "$artifact_dir" -type f ! -type l -print0 >/dev/null 2>&1 || return 4
+        if [[ "$directory_field" != artifact_dir ]] &&
+           [[ -n "$(find "$artifact_dir" \( -type l -o \( -type f -links +1 \) -o \( ! -type f ! -type d \) \) -print -quit)" ]]; then
+            _log_error "Workflow inventory contains a linked directory/file or special entry: $artifact_dir"
+            return 4
+        fi
         while IFS= read -r -d '' path; do
             [[ -z "${seen_paths[$path]:-}" ]] || continue
             seen_paths["$path"]=1
             artifact_paths+=("$path")
         done < <(find "$artifact_dir" -type f ! -type l -print0 2>/dev/null)
-    fi
+    done
 
     [[ ${#artifact_paths[@]} -gt 0 ]] || return 4
     for path in "${artifact_paths[@]}"; do
@@ -11493,7 +12592,7 @@ _act_result_artifact_receipts() {
         receipts+=("$receipt")
     done
 
-    printf '%s\n' "${receipts[@]}" | jq -sc 'sort_by(.path)'
+    printf '%s\n' "${receipts[@]}" | jq -scS 'sort_by(.path)'
 }
 
 # Return success only when a persisted result still points at the exact frozen
@@ -11505,7 +12604,7 @@ _act_target_result_available() {
     jq -e '(.status == "success" or .status == "ok" or .status == "passed")' \
         <<< "$result_json" &>/dev/null || return 1
     local expected actual
-    expected=$(jq -ce '
+    expected=$(jq -ceS '
         .resume_artifacts |
         if type == "array" and length > 0 then sort_by(.path)
         else error("missing artifact receipts") end
@@ -11521,6 +12620,7 @@ _act_build_task_plan() {
     local tool="$1" version="$2" platforms_json="$3" strict="$4"
     local platform method triples triple key environment command command_template language binary_name
     local plan='[]' config_file="$ACT_REPOS_DIR/${tool}.yaml"
+    _act_workflow_payload_plans_json "$tool" "$version" >/dev/null || return 4
     language=$(yq -r '.language // ""' "$config_file") || return 4
     binary_name=$(yq -r '.binary_name // ""' "$config_file") || return 4
     [[ -n "$binary_name" ]] || binary_name="$tool"
@@ -11614,7 +12714,9 @@ _act_build_orchestration_target() {
             jq -nc '{status: "error", exit_code: 4, error: "Strict release targets must use native builds"}'
             return 4
         fi
-        local job workflow local_path extra_flags
+        local job workflow local_path extra_flags workflow_plans workflow_plan materialized
+        workflow_plans=$(_act_workflow_payload_plans_json "$tool_name" "$version") || return 4
+        workflow_plan=$(jq -c --arg target "$target" '.[$target] // null' <<< "$workflow_plans") || return 4
         job=$(act_get_job_for_target "$tool_name" "$target")
         workflow="$ACT_REPO_WORKFLOW"
         local_path="$ACT_REPO_LOCAL_PATH"
@@ -11647,6 +12749,19 @@ _act_build_orchestration_target() {
             exit_code=6
             result=$(jq -c '.status = "failed" | .exit_code = 6 |
                 .error = "act workflow completed without producing any artifacts"' <<< "$result")
+        fi
+        if [[ "$workflow_plan" != null && "$exit_code" -eq 0 ]] &&
+           jq -e '.status == "success" or .status == "ok" or .status == "passed"' <<< "$result" >/dev/null; then
+            if materialized=$(_act_materialize_workflow_payloads "$result" "$workflow_plan"); then
+                result="$materialized"
+            else
+                exit_code=4
+                result=$(jq -c '.workflow_artifact_dir=.artifact_dir | .artifact_dir="" |
+                    .artifact_path="" | .artifact_paths=[] | .additional_artifacts=[] |
+                    .status="failed" | .exit_code=4 |
+                    .error="Workflow payloads do not satisfy the configured primary and companion ownership contract"' \
+                    <<< "$result") || return 4
+            fi
         fi
     else
         _log_info "Method: native (host=$host)"
@@ -11755,6 +12870,60 @@ _act_native_output_paths() {
     done <<< "$binaries"
 }
 
+# Keep the backend's process-group leader alive until the worker has observed
+# its exit and requested cleanup. This Bash 4 coprocess owns only this target:
+# its stdin is a parent-lifetime channel, never the dispatcher's task stream.
+# A caught TERM keeps the anchor alive during cleanup, preventing a delayed
+# group signal from reaching a reused PID after an early backend exit.
+_act_run_target_group() {
+    local group_log="$1"
+    shift
+    local group_pid="$BASHPID" group_child="" group_finished=false
+    local group_cancelled=false group_command="" group_running="" group_exit=0
+    local group_read_status=0
+    set +m
+    trap - EXIT
+    trap 'group_cancelled=true' INT TERM HUP PIPE
+    # The worker registers its PID/channels before authorizing any backend.
+    if ! IFS= read -r group_command || [[ "$group_command" != start ]] || $group_cancelled; then
+        return 130
+    fi
+    "$@" </dev/null >> "$group_log" 2>&1 &
+    group_child=$!
+    while ! $group_cancelled; do
+        if ! $group_finished; then
+            group_running=$(jobs -pr)
+            case $'\n'"$group_running"$'\n' in
+                *$'\n'"$group_child"$'\n'*) ;;
+                *)
+                    wait "$group_child" || group_exit=$?
+                    group_finished=true
+                    printf 'exit:%s\n' "$group_exit" || break
+                    ;;
+            esac
+        fi
+        group_read_status=0
+        IFS= read -r -t 0.1 group_command || group_read_status=$?
+        # EOF also retires the group if the outer worker is killed. Backend
+        # stdin was replaced above, so it cannot keep this lease pipe open.
+        if (( group_read_status == 0 || group_read_status == 1 )); then
+            break
+        fi
+        (( group_read_status > 128 )) || break
+    done
+    trap '' INT TERM HUP PIPE
+    kill -TERM -- "-$group_pid" 2>/dev/null || true
+    if ! $group_finished; then
+        # Native supervisors have their own two-second descendant drain.
+        # Give them time to finish before forcing remaining local processes.
+        sleep 5
+    fi
+    # The live anchor still owns this group even if its backend exited first.
+    # Completion does not need a grace delay: no backend work remains valid.
+    kill -KILL -- "-$group_pid" 2>/dev/null || true
+    return 4
+}
+
 # Worker wrapper: reserve host capacity and write immutable attempt receipts.
 _act_run_target_worker() {
     local tool_name="$1" version="$2" run_id="$3" target="$4"
@@ -11773,15 +12942,35 @@ _act_run_target_worker() {
     local slot_task="${task_key//\//-}"
     slot_task="${slot_task//@/-}"
     local slot_id="${run_id}-${slot_task}-attempt-${attempt}"
-    local slot_acquired=false
+    local slot_requested=false backend_started=false
+    local scheduled_source=null
+    if [[ "$strict_release_contract" == "true" ]]; then
+        # Record the source assigned to this worker even if capacity or host
+        # admission refuses it. This is not evidence that a compiler ran.
+        scheduled_source=$(jq -nc --arg run "$run_id" --arg sha "$release_git_sha" \
+            --arg ref "$release_git_ref" --arg host "$host" --argjson roots "$source_roots_json" \
+            '{run_id:$run,git_sha:$sha,git_ref:$ref,host:$host,root:$roots[$host]}') || return 4
+    fi
 
     _act_write_worker_result() {
         local body="$1"
         # Never trust build-command stdout to classify an artifact for publication.
+        # A refused attempt still belongs to this scheduled target, even when
+        # admission stopped before the backend emitted its execution identity.
+        # Leave successful identities untouched for the artifact/matrix checks.
         body=$(jq -c --arg purpose "$build_purpose" --arg task_key "$task_key" \
+            --arg platform "$target" --arg host "$host" --arg triple "$selected_triple" \
             --argjson source_sync "$source_sync_receipt" \
-            '. + {build_purpose: $purpose, publishable: ($purpose == "release"), task_key:$task_key} |
-             if $source_sync == null then . else .source_sync = $source_sync end' \
+            --argjson backend_started "$backend_started" \
+            --argjson scheduled_source "$scheduled_source" \
+            '. + {build_purpose: $purpose, publishable: ($purpose == "release"), task_key:$task_key,
+                  backend_started:$backend_started} |
+             if (.status // "") | IN("success", "ok", "passed") then .
+             else . + {platform:$platform,host:(.host // $host)} +
+                  (if $triple == "" then {} else {target_triple:$triple} end) end |
+             if $source_sync == null then . else .source_sync = $source_sync end |
+             if $scheduled_source == null then del(.scheduled_source)
+             else .scheduled_source = $scheduled_source end' \
             <<< "$body") || return 4
         (
             umask 077
@@ -11828,6 +13017,62 @@ _act_run_target_worker() {
         fi
     fi
 
+    local worker_pid="" worker_launch_pending=false worker_cancelled=false
+    local worker_result_fd="" worker_control_fd="" worker_guard_exit=0
+    local -a _ACT_TARGET_GROUP=()
+    local _ACT_TARGET_GROUP_PID=""
+    _act_worker_release_slot() {
+        # Release is ownership-checked and safe when no slot was granted. Mark
+        # the request before acquisition so cancellation between grant and
+        # return cannot strand this attempt's capacity lease.
+        if $slot_requested && declare -F selector_release_slot &>/dev/null; then
+            selector_release_slot "$host" "$slot_id" >/dev/null 2>&1 || true
+            slot_requested=false
+        fi
+    }
+
+    _act_worker_drain_group() {
+        # Both descriptors came from Bash's own coprocess table. Numeric
+        # validation confines eval to closing those descriptors on Bash 4.0,
+        # which predates the later {variable} redirection syntax.
+        if [[ "$worker_control_fd" =~ ^[0-9]+$ ]]; then
+            eval "exec ${worker_control_fd}>&-"
+            worker_control_fd=""
+        fi
+        if [[ "$worker_pid" =~ ^[1-9][0-9]*$ ]]; then
+            worker_guard_exit=0
+            wait "$worker_pid" 2>/dev/null || worker_guard_exit=$?
+            worker_pid=""
+        fi
+        if [[ "$worker_result_fd" =~ ^[0-9]+$ ]]; then
+            eval "exec ${worker_result_fd}<&-"
+            worker_result_fd=""
+        fi
+    }
+
+    _act_worker_cancel() {
+        worker_cancelled=true
+        # A trap can run between the background fork and assigning $!. Defer
+        # cleanup until the exact child process group has been recorded.
+        $worker_launch_pending && return 0
+        trap '' INT TERM HUP
+        # Closing the parent-lifetime channel asks the still-owned anchor
+        # to drain every descendant before this worker releases its slot.
+        _act_worker_drain_group
+        # Preserve a completed receipt if cancellation raced its publication.
+        # Otherwise retain an actual interrupted attempt for exact-run resume.
+        if [[ ! -e "$result_path" && ! -L "$result_path" ]]; then
+            local cancelled_result
+            cancelled_result=$(jq -nc --arg target "$target" --arg host "$host" \
+                '{platform: $target, host: $host, status: "failed", exit_code: 130,
+                  error: "Target interrupted"}') &&
+                _act_write_worker_result "$cancelled_result" || true
+        fi
+        exit 130
+    }
+    trap _act_worker_release_slot EXIT
+    trap _act_worker_cancel INT TERM HUP
+
     if declare -F selector_acquire_slot &>/dev/null; then
         # A target whose host is at its concurrency limit queues for a slot
         # rather than failing: its budget is one build timeout (the longest a
@@ -11838,6 +13083,7 @@ _act_run_target_worker() {
             slot_wait_budget=99999
         fi
         local slot_status=0 slot_wait_started=$SECONDS
+        slot_requested=true
         DSR_SELECTOR_WAIT_TIMEOUT="$slot_wait_budget" \
             selector_acquire_slot "$host" "$slot_id" --wait || slot_status=$?
         if [[ $slot_status -ne 0 ]]; then
@@ -11849,65 +13095,88 @@ _act_run_target_worker() {
             fi
             slot_failure=$(jq -nc --arg target "$target" --arg host "$host" --arg error "$slot_error" \
                 '{platform: $target, host: $host, status: "failed", exit_code: 2,
-                  error: $error}')
-            _act_write_worker_result "$slot_failure" || return 4
+                  stage:"host_capacity", error: $error}')
+            if ! _act_write_worker_result "$slot_failure"; then
+                _act_worker_release_slot
+                trap - EXIT INT TERM HUP
+                return 4
+            fi
+            _act_worker_release_slot
+            trap - EXIT INT TERM HUP
             return 2
         fi
-        slot_acquired=true
     fi
 
-    _act_worker_release_slot() {
-        if $slot_acquired && declare -F selector_release_slot &>/dev/null; then
-            selector_release_slot "$host" "$slot_id" >/dev/null 2>&1 || true
-            slot_acquired=false
-        fi
-    }
-
-    local worker_pid=""
-    _act_worker_cancel() {
-        # Ignore repeated signals while the first cancellation drains the
-        # dedicated build process group and releases the host slot.
-        trap '' INT TERM
-        if [[ "$worker_pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$worker_pid" 2>/dev/null; then
-            # Job control gives the target and all of its descendants a
-            # dedicated process group, so cancellation does not orphan ssh,
-            # compilers, or user build commands.
-            kill -TERM -- "-$worker_pid" 2>/dev/null || kill -TERM "$worker_pid" 2>/dev/null || true
-            wait "$worker_pid" 2>/dev/null || true
-        fi
-        exit 130
-    }
-    trap _act_worker_release_slot EXIT
-    trap _act_worker_cancel INT TERM
-
     local worker_status=0 result receipts result_status
+    local worker_monitor=false worker_message="" worker_protocol_valid=false
+    [[ $- != *m* ]] || worker_monitor=true
     set -m
-    _act_build_orchestration_target \
-        "$tool_name" "$version" "$run_id" "$target" \
-        "$strict_release_contract" "$release_contract_json" "$source_roots_json" \
-        "$release_git_sha" "$release_git_ref" "$host" "$selected_triple" \
-        >> "$log_path" 2>&1 &
-    worker_pid=$!
-    # The process group remains distinct after monitor mode is disabled; this
-    # avoids interactive-style job-completion notices in coordinator logs.
-    set +m
-    wait "$worker_pid" || worker_status=$?
-    worker_pid=""
+    worker_launch_pending=true
+    # Only this wrapper knows whether capacity was granted and the backend
+    # was launched. Backend stdout cannot claim a pre-execution refusal to
+    # recover retry budget after it has actually run.
+    backend_started=true
+    coproc _ACT_TARGET_GROUP {
+        _act_run_target_group "$log_path" _act_build_orchestration_target \
+            "$tool_name" "$version" "$run_id" "$target" \
+            "$strict_release_contract" "$release_contract_json" "$source_roots_json" \
+            "$release_git_sha" "$release_git_ref" "$host" "$selected_triple"
+    }
+    worker_pid="${_ACT_TARGET_GROUP_PID:-}"
+    worker_result_fd="${_ACT_TARGET_GROUP[0]:-}"
+    worker_control_fd="${_ACT_TARGET_GROUP[1]:-}"
+    worker_launch_pending=false
+    $worker_monitor || set +m
+    $worker_cancelled && _act_worker_cancel
+    if [[ "$worker_control_fd" =~ ^[0-9]+$ && "$worker_result_fd" =~ ^[0-9]+$ ]] &&
+       printf 'start\n' >&"$worker_control_fd" &&
+       IFS= read -r -u "$worker_result_fd" worker_message &&
+       [[ "$worker_message" =~ ^exit:([0-9]{1,3})$ ]] &&
+       (( 10#${BASH_REMATCH[1]} <= 255 )); then
+        worker_status=$((10#${BASH_REMATCH[1]}))
+        worker_protocol_valid=true
+    fi
+    _act_worker_drain_group
+    if ! $worker_protocol_valid; then
+        worker_status="$worker_guard_exit"
+        [[ "$worker_status" -ne 0 ]] || worker_status=6
+    fi
 
     result=$(grep '^{.*}$' "$log_path" | tail -1)
     if [[ -z "$result" ]] || ! jq -e '.' <<< "$result" &>/dev/null; then
+        [[ "$worker_status" -ne 0 ]] || worker_status=6
         result=$(jq -nc --arg target "$target" --arg host "$host" \
             --argjson exit_code "$worker_status" \
             '{platform: $target, host: $host, status: "failed",
               exit_code: $exit_code, error: "Worker produced no valid result"}')
     fi
     result_status=$(jq -r '.status // "unknown"' <<< "$result")
+    # The log can contain backend success before the orchestration child has
+    # finished normalization and strict staging. Its observed exit must agree
+    # before those artifact paths become an immutable, reusable success.
+    if [[ "$worker_status" -ne 0 ]] &&
+       [[ "$result_status" == success || "$result_status" == ok || "$result_status" == passed ]]; then
+        result_status=failed
+        if ! result=$(jq -c --argjson exit_code "$worker_status" '
+            .status = "failed" | .exit_code = $exit_code |
+            .error = (.error // "Worker exited nonzero despite reporting success") |
+            del(.resume_artifacts)
+        ' <<< "$result"); then
+            _act_worker_release_slot
+            trap - EXIT INT TERM HUP
+            return 4
+        fi
+    fi
     if [[ "$result_status" == success || "$result_status" == ok || "$result_status" == passed ]] && \
        ! _act_matrix_result_matches "$result" "$target" "$selected_triple"; then
         worker_status=4
         result_status=failed
-        result=$(jq -c '.status = "failed" | .exit_code = 4 |
-            .error = "Native worker result does not match the requested target triple"' <<< "$result") || return 4
+        if ! result=$(jq -c '.status = "failed" | .exit_code = 4 |
+            .error = "Native worker result does not match the requested target triple"' <<< "$result"); then
+            _act_worker_release_slot
+            trap - EXIT INT TERM HUP
+            return 4
+        fi
     fi
     if [[ "$result_status" == "success" || "$result_status" == "ok" ||
           "$result_status" == "passed" ]]; then
@@ -11923,10 +13192,15 @@ _act_run_target_worker() {
         fi
     fi
     if ! _act_write_worker_result "$result"; then
+        # Returning unwinds these locals before the background shell's EXIT
+        # trap runs. Release while the attempt's lease identity is still in
+        # scope, including storage/receipt failures after a real build.
+        _act_worker_release_slot
+        trap - EXIT INT TERM HUP
         return 4
     fi
     _act_worker_release_slot
-    trap - EXIT INT TERM
+    trap - EXIT INT TERM HUP
     return "$worker_status"
 }
 
@@ -11959,6 +13233,25 @@ _act_relocation_source_inventory() {
     printf '%s\n' "$records"
 }
 
+# The immutable worker receipt omits annotations added by the coordinator.
+# Compare every substantive field, allowing only the known true annotations
+# from worker collection, recovered-success reuse and retry-limit reporting.
+_act_relocation_receipt_matches() {
+    local path="$1" saved="$2"
+    jq -se --slurpfile saved /dev/stdin '
+        def annotations:
+            . as $result |
+            all(["execution_started","resume_reused","retry_limit_exceeded"][];
+                . as $key | ($result | has($key) | not) or $result[$key] == true);
+        def receipt:
+            del(.log_path,.result_path,.attempt,.execution_started,.resume_reused,.retry_limit_exceeded);
+        length == 1 and ($saved | length == 1) and ($saved[0] as $saved | .[0] |
+            type == "object" and ($saved | type == "object") and
+            annotations and ($saved | annotations) and
+            (receipt == ($saved | receipt)))
+    ' "$path" <<< "$saved" >/dev/null
+}
+
 _act_relocate_failed_target() {
     local tool="$1" version="$2" run_id="$3" before="$4" request="$5" approval_file="$6"
     local target="${request%%=*}" host="${request#*=}" old_host configured_host host_platform
@@ -11967,6 +13260,7 @@ _act_relocate_failed_target() {
     local prior_result prior_log result_hash log_hash
     local approval prior_config prior_config_hash prior_json current_json projection
     local source_inventory dependency_checkouts replacement_path replacement_root
+    local source_sha source_ref source_root
     [[ "$request" == *=* && "$target" =~ ^[a-z]+/[a-z0-9]+$ &&
        "$host" =~ ^[A-Za-z0-9_-]+$ ]] || return 4
     local relocation_triples
@@ -12027,16 +13321,37 @@ _act_relocate_failed_target() {
     prior_log=$(jq -er --arg target "$target" '.target_statuses[$target].log_path | strings' <<< "$before") || return 4
     [[ -f "$prior_result" && ! -L "$prior_result" && -f "$prior_log" && ! -L "$prior_log" ]] || return 4
     jq -e --arg target "$target" --arg host "$old_host" \
-        '.platform == $target and .host == $host and .status == "failed" and .build_purpose == "release" and .publishable == true' \
+        '.platform == $target and .host == $host and
+         (.status | IN("failed","error","timeout")) and
+         (.exit_code | type == "number" and floor == . and . > 0 and . <= 255) and
+         (.exit_code != 130 and .exit_code != 143) and
+         .build_purpose == "release" and .publishable == true' \
         "$prior_result" >/dev/null || return 4
     result_hash=$(_act_sha256 "$prior_result") || return 4
     log_hash=$(_act_sha256 "$prior_log") || return 4
     [[ "$result_hash" =~ ^[0-9a-f]{64}$ && "$log_hash" =~ ^[0-9a-f]{64}$ ]] || return 4
     result=$(jq -c --arg target "$target" '.target_statuses[$target].result' <<< "$before") || return 4
-    [[ "$(jq -cS 'del(.log_path,.result_path,.attempt)' "$prior_result")" == \
-       "$(jq -cS 'del(.log_path,.result_path,.attempt)' <<< "$result")" ]] || return 4
-    jq -e --arg sha "$(jq -r '.git_sha' <<< "$before")" --arg ref "$(jq -r '.git_ref' <<< "$before")" \
-        '.build_influence_env.DSR_RELEASE_GIT_SHA == $sha and .build_influence_env.DSR_RELEASE_GIT_REF == $ref' \
+    _act_relocation_receipt_matches "$prior_result" "$result" || return 4
+    source_sha=$(jq -er '.git_sha | strings | select(test("^[0-9a-f]{40}$"))' <<< "$before") || return 4
+    source_ref=$(jq -er '.git_ref | strings | select(length > 0)' <<< "$before") || return 4
+    source_root=$(jq -er --arg host "$old_host" \
+        '.context.source_roots[$host] | strings | select(length > 0)' <<< "$before") || return 4
+    # Strict Rust attempts may also attest their compiler environment. Keep
+    # that evidence mandatory for older receipts, and reject any contradiction
+    # when the worker's scheduled source supplies the non-Rust/refusal binding.
+    jq -e --arg run "$run_id" --arg sha "$source_sha" --arg ref "$source_ref" \
+        --arg host "$old_host" --arg root "$source_root" '
+        (.build_influence_env == null or (.build_influence_env | type == "object")) and
+        (if has("scheduled_source") then
+            .scheduled_source == {run_id:$run,git_sha:$sha,git_ref:$ref,host:$host,root:$root} and
+            ((.build_influence_env // {}) as $env |
+                if ($env | has("DSR_RELEASE_GIT_SHA") or has("DSR_RELEASE_GIT_REF")) then
+                    $env.DSR_RELEASE_GIT_SHA == $sha and $env.DSR_RELEASE_GIT_REF == $ref
+                else true end)
+         else
+            .build_influence_env.DSR_RELEASE_GIT_SHA == $sha and
+            .build_influence_env.DSR_RELEASE_GIT_REF == $ref
+         end)' \
         "$prior_result" >/dev/null || return 4
     # An unavailable successful artifact is not permission to silently rebuild
     # or relocate it. Preserve all successful receipt identities before staging.
@@ -12046,8 +13361,7 @@ _act_relocate_failed_target() {
         [[ -n "$result" ]] && _act_target_result_available "$result" release true || return 4
         if [[ -n "$result_path" ]]; then
             [[ -f "$result_path" && ! -L "$result_path" ]] || return 4
-            [[ "$(jq -cS 'del(.log_path,.result_path,.attempt)' "$result_path")" == \
-               "$(jq -cS 'del(.log_path,.result_path,.attempt)' <<< "$result")" ]] || return 4
+            _act_relocation_receipt_matches "$result_path" "$result" || return 4
         fi
     done < <(jq -c '.target_statuses[] | select(.status == "completed")' <<< "$before")
     repo_hash=$(_act_sha256 "$config_file") || return 4
@@ -12281,6 +13595,31 @@ act_orchestrate_build() {
         _log_error "--resume-run-id requires a schema-valid UUID"
         return 4
     fi
+    local resume_retry_limit="${BUILD_RETRY_MAX:-3}"
+    if $resume_run; then
+        if [[ ! "$resume_retry_limit" =~ ^[0-9]{1,4}$ ]] ||
+           ((10#$resume_retry_limit < 1 || 10#$resume_retry_limit > 1000)); then
+            _log_error "Resume retry limit must be an integer from 1 through 1000"
+            return 4
+        fi
+        resume_retry_limit=$((10#$resume_retry_limit))
+    fi
+    _act_prior_build_attempts() {
+        # Use the same admission rule before dispatch and when rereading a
+        # checkpoint. Missing or invalid history must not become attempt zero.
+        jq -er -s '
+            select(length == 1) | .[0] | select(type == "object") |
+            def counter($key): if has($key) then .[$key] else 0 end;
+            counter("attempts") as $all | counter("source_sync_failures") as $sync |
+            counter("host_readiness_failures") as $readiness |
+            counter("host_capacity_failures") as $capacity |
+            select(($all | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
+              ($sync | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
+              ($readiness | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
+              ($capacity | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
+              ($sync + $readiness + $capacity) <= $all) |
+            $all - $sync - $readiness - $capacity' <<< "$1"
+    }
     if [[ -n "$resume_target_host" || -n "$resume_target_host_approval" ]]; then
         if ! $resume_run || [[ "$build_purpose" != "release" ||
              -z "$resume_target_host" || -z "$resume_target_host_approval" ]]; then
@@ -12601,7 +13940,17 @@ act_orchestrate_build() {
             # Inspect both authorities before admitting any resumed worker.
             # A valid embedded result cannot launder a differently purposed sidecar.
             local resume_entry resume_receipt resume_result_path
+            if ! jq -e '.target_statuses | type == "object"' <<< "$resume_state" >/dev/null; then
+                _log_error "Resume target history is not a target-keyed map"
+                _act_release_orchestration_lock
+                return 4
+            fi
             while IFS= read -r resume_entry; do
+                if ! _act_prior_build_attempts "$resume_entry" >/dev/null; then
+                    _log_error "Invalid source synchronization/readiness/build attempt counters in resume state"
+                    _act_release_orchestration_lock
+                    return 4
+                fi
                 resume_receipt=$(jq -c '.result // empty' <<< "$resume_entry")
                 if [[ -n "$resume_receipt" ]] && \
                    ! _act_build_purpose_matches "$resume_receipt" "$build_purpose" "$strict_release_contract"; then
@@ -12754,6 +14103,7 @@ act_orchestrate_build() {
     fi
 
     local results=() success_count=0 fail_count=0 interrupted=false
+    local coordinator_error=""
     local start_time target_index=0
     start_time=$(date +%s)
     local -a worker_pids=() worker_targets=() worker_platforms=() worker_triples=()
@@ -12796,9 +14146,12 @@ act_orchestrate_build() {
                       error: "Worker result purpose is missing or inconsistent"}')
             fi
         else
+            local receipt_exit="$worker_status"
+            [[ "$receipt_exit" -ne 0 ]] || receipt_exit=6
             finished_result=$(jq -nc --arg target "$finished_platform" --arg host "$host" \
-                --argjson exit_code "$worker_status" \
+                --argjson exit_code "$receipt_exit" --argjson worker_exit_code "$worker_status" \
                 '{platform: $target, host: $host, status: "failed", exit_code: $exit_code,
+                  worker_exit_code: $worker_exit_code,
                   error: "Worker result receipt missing or invalid"}')
         fi
         if [[ "$(jq -r '.status // ""' <<< "$finished_result")" == success ]] && \
@@ -12806,12 +14159,37 @@ act_orchestrate_build() {
             finished_result=$(jq -c '.status = "failed" | .exit_code = 4 |
                 .error = "Completed native result has inconsistent variant identity"' <<< "$finished_result") || return 4
         fi
-        finished_result=$(jq -c --arg log_path "$log_path" --arg result_path "$result_path" \
+        finished_result=$(jq -c --arg log_path "$log_path" \
             --argjson attempt "$attempt" \
             --arg purpose "$build_purpose" --arg task_key "$finished_target" \
-            '. + {log_path: $log_path, result_path: $result_path, attempt: $attempt,
-                  build_purpose: $purpose, publishable: ($purpose == "release"), task_key:$task_key}' \
-            <<< "$finished_result")
+            '. + {log_path: $log_path, attempt: $attempt, execution_started:true,
+                  build_purpose: $purpose, publishable: ($purpose == "release"), task_key:$task_key} |
+             del(.result_path)' <<< "$finished_result") || return 4
+        # The coordinator waited for this registered worker. Retain that fact
+        # before any receipt or state write can fail; storage failure must not
+        # turn a genuine attempt into an undispatched target at aggregation.
+        final_results["$finished_target"]="$finished_result"
+        if [[ -f "$result_path" && ! -L "$result_path" ]]; then
+            finished_result=$(jq -c --arg result_path "$result_path" \
+                '. + {result_path:$result_path}' <<< "$finished_result") || return 4
+        elif [[ ! -e "$result_path" && ! -L "$result_path" ]]; then
+            # Even a worker killed before installing its traps has a durable
+            # outcome. Identify coordinator recovery rather than pretending
+            # the child wrote a receipt; never replace existing evidence.
+            finished_result=$(jq -c '. + {receipt_source: "coordinator"}' <<< "$finished_result") || return 4
+            final_results["$finished_target"]="$finished_result"
+            local retained_result
+            retained_result=$(jq -c --arg result_path "$result_path" \
+                '. + {result_path:$result_path}' <<< "$finished_result") || return 4
+            if ! (umask 077; set -o noclobber; printf '%s\n' "$retained_result" > "$result_path"); then
+                _log_error "Could not retain missing worker outcome for $finished_target"
+                return 4
+            fi
+            finished_result="$retained_result"
+        else
+            _log_error "Worker result receipt path is not a regular file: $result_path"
+            return 4
+        fi
         final_results["$finished_target"]="$finished_result"
         status=$(jq -r '.status // "unknown"' <<< "$finished_result")
 
@@ -12845,7 +14223,7 @@ act_orchestrate_build() {
     _act_cancel_parallel_workers() {
         # A second Ctrl-C must not interrupt cleanup after workers have been
         # told to terminate; keep the coordinator alive until they are reaped.
-        trap '' INT TERM
+        trap '' INT TERM HUP
         interrupted=true
         local cancel_index cancel_pid
         for ((cancel_index = 0; cancel_index < ${#worker_pids[@]}; cancel_index++)); do
@@ -12853,6 +14231,82 @@ act_orchestrate_build() {
             cancel_pid="${worker_pids[$cancel_index]}"
             kill -TERM "$cancel_pid" 2>/dev/null || true
         done
+    }
+
+    _act_fail_coordinator() {
+        [[ -n "$coordinator_error" ]] || coordinator_error="$1"
+        _log_error "$1"
+        interrupted=true
+        # Aggregation can discover unreadable queued history after workers
+        # were drained and the signal traps restored. Do not reinstall
+        # ignored signals in the caller when no owned worker remains.
+        if (( active_workers > 0 )); then
+            _act_cancel_parallel_workers
+        fi
+    }
+
+    _act_refuse_retained_target() {
+        local message="$1" known_attempt="${2:-}" refusal refusal_stage=dispatch
+        $resume_run && refusal_stage=resume
+        # A verified observation is stronger than the failure to persist it.
+        # Otherwise return only this coordinator's refusal, without borrowing
+        # unverified result paths or inventing an unknown attempt history.
+        if [[ -z "${final_results[$task_key]:-}" ]]; then
+            if refusal=$(jq -nc --arg target "$target" --arg task_key "$task_key" \
+                    --arg triple "$selected_triple" --arg purpose "$build_purpose" \
+                    --arg error "$message" --arg attempt "$known_attempt" --arg stage "$refusal_stage" '
+                    {platform:$target, task_key:$task_key, status:"failed", exit_code:4,
+                     stage:$stage, receipt_source:"coordinator", execution_started:false,
+                     error:$error, build_purpose:$purpose, publishable:($purpose == "release")} +
+                    (if $triple == "" then {} else {target_triple:$triple} end) +
+                    (if $attempt == "" then {} else {attempt:($attempt | tonumber)} end)'); then
+                final_results["$task_key"]="$refusal"
+            fi
+        fi
+        _act_fail_coordinator "$message"
+    }
+
+    _act_refuse_unstarted_attempt() {
+        local message="$1" reserved="$2" refusal refusal_with_path refusal_extra
+        local refusal_attempt="$prior_attempts" refusal_status=skipped
+        [[ -n "$coordinator_error" ]] || coordinator_error="$message"
+        _log_error "$message"
+        if $reserved; then
+            refusal_attempt="$attempt"
+            refusal_status=failed
+        fi
+        if refusal=$(jq -nc --arg target "$target" --arg task_key "$task_key" \
+                --arg triple "$selected_triple" --arg host "$host" \
+                --arg purpose "$build_purpose" --arg status "$refusal_status" \
+                --arg error "$message" --argjson attempt "$refusal_attempt" \
+                '{platform:$target, task_key:$task_key, host:$host, status:$status,
+                  exit_code:4, stage:"dispatch", execution_started:false, error:$error,
+                  attempt:$attempt, build_purpose:$purpose, publishable:($purpose == "release")} +
+                 (if $triple == "" then {} else {target_triple:$triple} end)'); then
+            # A failed reservation has no durable attempt identity. Do not
+            # create orphan receipts that would obstruct its first retry.
+            if $reserved; then
+                refusal_with_path=$(jq -c --arg path "$result_path" \
+                    '. + {result_path:$path, receipt_source:"coordinator"}' <<< "$refusal")
+                if [[ -n "$refusal_with_path" ]] &&
+                   (umask 077; set -o noclobber; printf '%s\n' "$refusal_with_path" > "$result_path"); then
+                    refusal="$refusal_with_path"
+                fi
+                if $state_available; then
+                    refusal_extra=$(jq -nc --argjson attempts "$attempt" \
+                        'input as $result | {result:$result, attempts:$attempts,
+                         log_path:null, result_path:($result.result_path // null)}' <<< "$refusal") &&
+                        build_state_update_target "$tool_name" "$version" "$task_key" \
+                            failed "$refusal_extra" "$run_id" ||
+                        _log_error "Could not persist dispatch refusal for $task_key"
+                fi
+            fi
+            final_results["$task_key"]="$refusal"
+        fi
+        # A coordinator persistence failure must not leave previously started
+        # targets running after dispatch stops. Their own traps retain actual
+        # interrupted attempts; the coordinator failure remains exit 4.
+        _act_cancel_parallel_workers
     }
 
     # Bash 4.0 lacks wait -n. Poll only the bounded worker set and reap the
@@ -12873,7 +14327,12 @@ act_orchestrate_build() {
                     wait "$reap_pid" || worker_status=$?
                     worker_reaped["$reap_index"]=1
                     active_workers=$((active_workers - 1))
-                    _act_record_worker_result "$reap_index" "$worker_status" || interrupted=true
+                    if ! _act_record_worker_result "$reap_index" "$worker_status"; then
+                        # Completion persistence is a coordinator failure,
+                        # not an operator interruption. Keep the first cause
+                        # while cancelling and draining all remaining peers.
+                        _act_fail_coordinator "Could not retain completed target outcome for ${worker_targets[$reap_index]}"
+                    fi
                     return 0
                 fi
             done
@@ -12881,7 +14340,7 @@ act_orchestrate_build() {
         done
         return 1
     }
-    trap _act_cancel_parallel_workers INT TERM
+    trap _act_cancel_parallel_workers INT TERM HUP
 
     local task_json task_key selected_triple
     while IFS= read -r task_json; do
@@ -12894,18 +14353,13 @@ act_orchestrate_build() {
         local persisted_entry='{}' persisted_result="" persisted_result_path=""
         local prior_attempts=0 prior_build_attempts=0
         if $state_available; then
-            persisted_entry=$(build_state_get "$tool_name" "$version" "$run_id" | \
-                jq -c --arg target "$task_key" '.target_statuses[$target] // {}')
-            prior_attempts=$(jq -r '.attempts // 0' <<< "$persisted_entry")
-            if ! prior_build_attempts=$(jq -er '
-                (.attempts // 0) as $all | (.source_sync_failures // 0) as $sync |
-                select(($all | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
-                  ($sync | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and $sync <= $all) |
-                $all - $sync' <<< "$persisted_entry"); then
-                _log_error "Invalid source synchronization/build attempt counters for $task_key"
-                interrupted=true
+            if ! persisted_entry=$(build_state_get "$tool_name" "$version" "$run_id" | \
+                    jq -ce --arg target "$task_key" '.target_statuses[$target] // {}') ||
+               ! prior_build_attempts=$(_act_prior_build_attempts "$persisted_entry"); then
+                _act_refuse_retained_target "Invalid or unavailable source synchronization/readiness/capacity/build attempt counters for $task_key"
                 break
             fi
+            prior_attempts=$(jq -r '.attempts // 0' <<< "$persisted_entry")
             persisted_result=$(jq -c '.result // empty' <<< "$persisted_entry")
             persisted_result_path=$(jq -r '.result_path // empty' <<< "$persisted_entry")
         fi
@@ -12913,8 +14367,7 @@ act_orchestrate_build() {
         if $resume_run; then
             if [[ -n "$persisted_result" ]] && \
                ! _act_build_purpose_matches "$persisted_result" "$build_purpose" "$strict_release_contract"; then
-                _log_error "Resume target result has missing or different build purpose: $target"
-                interrupted=true
+                _act_refuse_retained_target "Resume target result has missing or different build purpose: $target" "$prior_attempts"
                 break
             fi
             if [[ -n "$persisted_result" ]] && \
@@ -12925,39 +14378,142 @@ act_orchestrate_build() {
                 _log_info "Resume: reusing completed target $task_key"
                 continue
             fi
-            if [[ -n "$persisted_result_path" && -s "$persisted_result_path" ]] && \
-               persisted_result=$(jq -ce '.' "$persisted_result_path" 2>/dev/null); then
-                if ! _act_build_purpose_matches "$persisted_result" "$build_purpose" "$strict_release_contract"; then
-                    _log_error "Resume sidecar has missing or different build purpose: $target"
-                    interrupted=true
+            local recovered_result="" recovered_status=""
+            if [[ -n "$persisted_result_path" && -s "$persisted_result_path" ]] &&
+               recovered_result=$(jq -ce '.' "$persisted_result_path" 2>/dev/null); then
+                if ! _act_build_purpose_matches "$recovered_result" "$build_purpose" "$strict_release_contract"; then
+                    _act_refuse_retained_target "Resume sidecar has missing or different build purpose: $target" "$prior_attempts"
                     break
                 fi
+                if _act_matrix_result_matches "$recovered_result" "$target" "$selected_triple" &&
+                   [[ "$(jq -r '.task_key // ""' <<< "$recovered_result")" == "$task_key" ]] &&
+                   _act_target_result_available "$recovered_result" "$build_purpose" "$strict_release_contract"; then
+                    recovered_status=completed
+                elif jq -e --arg task_key "$task_key" --arg platform "$target" \
+                        --arg triple "$selected_triple" '
+                        .task_key == $task_key and .platform == $platform and
+                        ($triple == "" or .target_triple == $triple) and
+                        ((.status // "") | IN("failed", "error", "timeout", "cancelled"))
+                    ' <<< "$recovered_result" >/dev/null; then
+                    # Early failures may precede backend selection, so unlike
+                    # successful reuse their identity does not require method.
+                    recovered_status=failed
+                fi
+                if [[ -n "$recovered_status" ]]; then
+                    # The immutable sidecar is written before the coordinator
+                    # records completion. Its attempt identity comes from the
+                    # retained dispatch entry, not fields supplied by a worker.
+                    local recovered_log_path
+                    recovered_log_path=$(jq -r '.log_path // empty' <<< "$persisted_entry")
+                    [[ -f "$recovered_log_path" && ! -L "$recovered_log_path" ]] || recovered_log_path=""
+                    recovered_result=$(jq -c \
+                        --arg log_path "$recovered_log_path" \
+                        --arg result_path "$persisted_result_path" --argjson attempt "$prior_attempts" \
+                        --arg status "$recovered_status" '
+                        . + {result_path: $result_path, attempt: $attempt} |
+                        if $log_path == "" then del(.log_path) else .log_path = $log_path end |
+                        if $status == "completed" then
+                            . + {resume_reused: true} |
+                            if has("execution_started") then . else .execution_started = true end
+                        else . end
+                    ' <<< "$recovered_result") || {
+                        _act_refuse_retained_target "Could not retain recovered target observation for $task_key" "$prior_attempts"
+                        break
+                    }
+                    # Keep this verified sidecar even if checkpointing it
+                    # fails. Recovery did not launch another target attempt.
+                    final_results["$task_key"]="$recovered_result"
+                    if $state_available; then
+                        local reconciled_extra
+                        if ! reconciled_extra=$(jq -nc --argjson attempts "$prior_attempts" \
+                                'input as $result | {result: $result, attempts: $attempts,
+                                 reconciled_from_sidecar: true}' <<< "$recovered_result") ||
+                           ! build_state_update_target "$tool_name" "$version" "$task_key" "$recovered_status" \
+                                "$reconciled_extra" "$run_id"; then
+                            _act_refuse_retained_target "Could not persist recovered target outcome for $task_key" "$prior_attempts"
+                            break
+                        fi
+                    fi
+                    persisted_result="$recovered_result"
+                    if [[ "$recovered_status" == completed ]]; then
+                        final_results["$task_key"]="$recovered_result"
+                        _log_info "Resume: reconciled completed sidecar for $task_key"
+                        continue
+                    fi
+                    # Reconciliation accounts for source-sync and readiness
+                    # refusals once. Reread those authoritative discounts
+                    # before applying the compiler budget on every resume.
+                    if $state_available; then
+                        if ! persisted_entry=$(build_state_get "$tool_name" "$version" "$run_id" | \
+                                jq -ce --arg target "$task_key" '.target_statuses[$target] // {}') ||
+                           ! prior_build_attempts=$(_act_prior_build_attempts "$persisted_entry"); then
+                            _act_refuse_retained_target "Invalid or unavailable reconciled attempt counters for $task_key" "$prior_attempts"
+                            break
+                        fi
+                    fi
+                fi
             fi
-            if [[ -n "$persisted_result_path" && -s "$persisted_result_path" ]] && \
-               _act_matrix_result_matches "$persisted_result" "$target" "$selected_triple" && \
-               [[ "$(jq -r '.task_key // ""' <<< "$persisted_result")" == "$task_key" ]] && \
-               _act_target_result_available "$persisted_result" "$build_purpose" "$strict_release_contract"; then
-                final_results["$task_key"]=$(jq -c '. + {resume_reused: true}' <<< "$persisted_result")
+            if [[ "$prior_build_attempts" -ge "$resume_retry_limit" ]]; then
+                local exhausted_result exhausted_extra
+                if [[ -n "$persisted_result" ]] &&
+                   jq -e --arg task_key "$task_key" --arg platform "$target" \
+                        --arg triple "$selected_triple" '
+                        .task_key == $task_key and .platform == $platform and
+                        ($triple == "" or .target_triple == $triple) and
+                        ((.status // "") | IN("failed", "error", "timeout", "cancelled"))
+                    ' <<< "$persisted_result" >/dev/null; then
+                    # Keep an observed failure's exit and error. Exhaustion is
+                    # a scheduling decision, not another worker execution.
+                    exhausted_result="$persisted_result"
+                else
+                    # A lost worker or unavailable successful artifacts cannot
+                    # become success merely because the budget is exhausted.
+                    # Do not invent a worker exit or rewrite its old sidecar.
+                    exhausted_result=$(jq -nc --arg platform "$target" \
+                        --arg host "$(jq -r '.host // empty' <<< "$persisted_entry")" \
+                        --arg triple "$selected_triple" '
+                        {platform: $platform, host: $host, status: "failed", exit_code: 6,
+                         stage: "resume", receipt_source: "coordinator",
+                         error: "Target retry limit exceeded without a reusable target result"} +
+                        (if $triple == "" then {} else {target_triple: $triple} end)
+                    ') || {
+                        _act_refuse_retained_target "Could not retain retry-budget refusal for $task_key" "$prior_attempts"
+                        break
+                    }
+                fi
+                local exhausted_result_path="" exhausted_log_path=""
+                # A path that merely exists is not an admitted receipt. Empty
+                # or wrong-target sidecars cannot acquire authority at exhaustion.
+                if [[ -n "$recovered_status" && -f "$persisted_result_path" && ! -L "$persisted_result_path" ]]; then
+                    exhausted_result_path="$persisted_result_path"
+                fi
+                exhausted_log_path=$(jq -r '.log_path // empty' <<< "$persisted_entry")
+                [[ -f "$exhausted_log_path" && ! -L "$exhausted_log_path" ]] || exhausted_log_path=""
+                exhausted_result=$(jq -c \
+                    --arg log_path "$exhausted_log_path" \
+                    --arg result_path "$exhausted_result_path" --argjson attempt "$prior_attempts" \
+                    --arg purpose "$build_purpose" --arg task_key "$task_key" '
+                    . + {attempt: $attempt,
+                         build_purpose: $purpose, publishable: ($purpose == "release"),
+                         task_key: $task_key, retry_limit_exceeded: true} |
+                    if $log_path == "" then del(.log_path) else .log_path = $log_path end |
+                    if $result_path == "" then del(.result_path) else .result_path = $result_path end
+                ' <<< "$exhausted_result") || {
+                    _act_refuse_retained_target "Could not retain retry-budget outcome for $task_key" "$prior_attempts"
+                    break
+                }
+                final_results["$task_key"]="$exhausted_result"
                 if $state_available; then
-                    local reconciled_extra
-                    if ! reconciled_extra=$(jq -nc --argjson attempts "$prior_attempts" \
-                            'input as $result | {result: $result, attempts: $attempts,
-                             reconciled_from_sidecar: true}' <<< "${final_results[$task_key]}") || \
-                       ! build_state_update_target "$tool_name" "$version" "$task_key" "completed" \
-                        "$reconciled_extra" \
-                        "$run_id"; then
-                        interrupted=true
+                    if ! exhausted_extra=$(jq -nc --argjson attempts "$prior_attempts" \
+                            'input as $result | {result: $result, attempts: $attempts}' \
+                            <<< "$exhausted_result") ||
+                       ! build_state_update_target "$tool_name" "$version" "$task_key" failed \
+                            "$exhausted_extra" "$run_id"; then
+                        _act_refuse_retained_target "Could not persist retry-budget outcome for $task_key" "$prior_attempts"
                         break
                     fi
                 fi
-                _log_info "Resume: reconciled completed sidecar for $task_key"
-                continue
-            fi
-            if [[ "$(jq -r '.status // "pending"' <<< "$persisted_entry")" == "failed" && \
-                  "$prior_build_attempts" -ge "${BUILD_RETRY_MAX:-3}" ]]; then
-                final_results["$task_key"]=$(jq -c \
-                    '.result // {platform: "'"$target"'", status: "failed", exit_code: 6,
-                     error: "Target retry limit exceeded"}' <<< "$persisted_entry")
+                final_results["$task_key"]="$exhausted_result"
                 _log_warn "Resume: retry limit exceeded for $target"
                 continue
             fi
@@ -12969,18 +14525,15 @@ act_orchestrate_build() {
         log_path="$workspace/logs/${index_prefix}-${target_slug}.attempt-${attempt}.log"
         result_path="$workspace/results/${index_prefix}-${target_slug}.attempt-${attempt}.json"
         if [[ -e "$log_path" || -L "$log_path" || -e "$result_path" || -L "$result_path" ]]; then
-            _log_error "Refusing to overwrite an existing target attempt receipt"
-            interrupted=true
-            break
-        fi
-        if ! (umask 077; set -o noclobber; : > "$log_path"); then
-            _log_error "Could not create immutable target log receipt: $log_path"
-            interrupted=true
+            _act_fail_coordinator "Refusing to overwrite an existing target attempt receipt"
             break
         fi
         host="act-local"
         if $strict_release_contract; then
-            host=$(jq -er --arg target "$target" '.[$target]' <<< "$target_hosts_json") || return 4
+            host=$(jq -er --arg target "$target" '.[$target]' <<< "$target_hosts_json") || {
+                _act_refuse_retained_target "Strict target host binding became unavailable for $task_key" "$prior_attempts"
+                break
+            }
         elif ! act_platform_uses_act "$tool_name" "$target"; then
             # Build where the source was synced. Asking the capacity selector
             # again could pick a busier-now host that was never synced and
@@ -12991,7 +14544,10 @@ act_orchestrate_build() {
         local target_sync_receipt=null
         if [[ -n "$source_sync_json" ]] && ! act_platform_uses_act "$tool_name" "$target"; then
             target_sync_receipt=$(jq -ce --arg host "$host" '.hosts[] | select(.host == $host)' \
-                <<< "$source_sync_json") || { interrupted=true; break; }
+                <<< "$source_sync_json") || {
+                _act_refuse_retained_target "Source synchronization receipt became unavailable for $task_key" "$prior_attempts"
+                break
+            }
         fi
 
         # Two concurrent targets on one host whose builds write the same file
@@ -13021,25 +14577,51 @@ act_orchestrate_build() {
             fi
         fi
 
+        # Do not reserve an attempt while waiting on another target's output.
+        # Cancellation there must leave queued tasks at zero attempts, without
+        # an empty immutable log that would prevent the next resume.
+        $interrupted && break
+        local attempt_reserved=false
+        # Commit the attempt identity before creating any immutable receipt.
+        # If persistence fails, exact-run resume must still be able to start
+        # this attempt; after a crash, a saved reservation advances its number.
         if $state_available; then
             if ! build_state_update_target "$tool_name" "$version" "$task_key" "running" \
                 "$(jq -nc --arg host "$host" --arg log_path "$log_path" \
                     --arg result_path "$result_path" --argjson attempts "$attempt" \
                     '{host: $host, log_path: $log_path, result_path: $result_path,
-                      attempts: $attempts, result: null}')" "$run_id" || \
-               ! build_state_update_host "$tool_name" "$version" "$host" "running" \
+                      attempts: $attempts, result: null}')" "$run_id"; then
+                $interrupted && break
+                _act_refuse_unstarted_attempt "Could not persist target attempt reservation; worker was not started: $task_key" false
+                break
+            fi
+            attempt_reserved=true
+            # A new durable reservation supersedes the earlier failed
+            # observation, even if cancellation arrives before its worker
+            # starts. The immutable prior sidecar remains retained on disk.
+            unset 'final_results[$task_key]'
+            if ! build_state_update_host "$tool_name" "$version" "$host" "running" \
                     "$(jq -nc --arg target "$target" '{target: $target}')" "$run_id"; then
-                _log_error "Could not persist running state for target $target"
-                interrupted=true
+                $interrupted && break
+                _act_refuse_unstarted_attempt "Could not persist host running state; worker was not started: $task_key" true
                 break
             fi
         fi
+        $interrupted && break
+        if ! (umask 077; set -o noclobber; : > "$log_path"); then
+            $interrupted && break
+            _act_refuse_unstarted_attempt "Could not create immutable target log; worker was not started: $task_key" "$attempt_reserved"
+            break
+        fi
 
+        # Only this loop may read the remaining JSON task records. Isolate the
+        # whole worker, including capacity selection and all descendants, so
+        # an stdin-reading build or transport cannot silently eat queued tasks.
         DSR_NATIVE_OUTPUT_STAGE="$output_stage" \
         _act_run_target_worker "$tool_name" "$version" "$run_id" "$target" "$attempt" \
             "$log_path" "$result_path" "$strict_release_contract" \
             "$release_contract_json" "$source_roots_json" "$git_sha" "$git_ref" "$host" "$build_purpose" \
-            "$selected_triple" "$task_key" "$target_sync_receipt" &
+            "$selected_triple" "$task_key" "$target_sync_receipt" </dev/null &
         worker_pids+=("$!")
         worker_output_paths+=("$output_paths")
         worker_targets+=("$task_key")
@@ -13051,6 +14633,13 @@ act_orchestrate_build() {
         worker_attempts+=("$attempt")
         active_workers=$((active_workers + 1))
 
+        # Cancellation may arrive while the new worker is being registered.
+        # Include that worker in cleanup once its PID and receipts are known.
+        if $interrupted; then
+            _act_cancel_parallel_workers
+            break
+        fi
+
         if (( active_workers >= parallel_jobs )); then
             _act_reap_one_worker || interrupted=true
             $interrupted && break
@@ -13060,7 +14649,7 @@ act_orchestrate_build() {
     while (( active_workers > 0 )); do
         _act_reap_one_worker || interrupted=true
     done
-    trap - INT TERM
+    trap - INT TERM HUP
 
     # Deterministic aggregation follows configured target order, never worker
     # completion order.
@@ -13069,16 +14658,38 @@ act_orchestrate_build() {
         task_key=$(jq -r '.key' <<< "$task_json")
         selected_triple=""
         [[ "$task_key" == "$target" ]] || selected_triple=$(jq -r '.target_triple' <<< "$task_json")
-        local ordered_result="${final_results[$task_key]:-}"
+        local ordered_result="${final_results[$task_key]:-}" undispatched_attempts=0
         if [[ -z "$ordered_result" && $state_available == true ]]; then
-            ordered_result=$(build_state_get "$tool_name" "$version" "$run_id" | \
-                jq -c --arg target "$target" --arg task_key "$task_key" \
-                    '.target_statuses[$task_key].result // {platform: $target, status: "failed",
-                     exit_code: 6, error: "No target result"}')
+            local ordered_entry
+            if ! ordered_entry=$(build_state_get "$tool_name" "$version" "$run_id" | \
+                    jq -ce --arg task_key "$task_key" '.target_statuses[$task_key] // {}') ||
+               ! _act_prior_build_attempts "$ordered_entry" >/dev/null; then
+                _act_refuse_retained_target "Invalid or unavailable retained attempt history for $task_key"
+                ordered_result="${final_results[$task_key]:-}"
+            else
+                ordered_result=$(jq -c '.result // empty' <<< "$ordered_entry") || return 4
+                undispatched_attempts=$(jq -r '.attempts // 0' <<< "$ordered_entry") || return 4
+            fi
         fi
         if [[ -z "$ordered_result" ]]; then
+            # No worker result means this invocation never dispatched this
+            # task. Do not invent a failed build or an execution receipt.
+            local dispatch_exit=6 dispatch_error="Target was not dispatched"
+            if [[ -n "$coordinator_error" ]]; then
+                dispatch_exit=4
+                dispatch_error="Dispatch stopped before this target started: $coordinator_error"
+            elif $interrupted; then
+                dispatch_exit=130
+                dispatch_error="Interrupted before target dispatch"
+            else
+                _log_error "No worker was dispatched for requested task $task_key"
+            fi
             ordered_result=$(jq -nc --arg target "$target" \
-                '{platform: $target, status: "failed", exit_code: 6, error: "No target result"}')
+                --argjson exit_code "$dispatch_exit" --arg error "$dispatch_error" \
+                --argjson attempt "$undispatched_attempts" \
+                '{platform: $target, status: "skipped", attempt: $attempt,
+                  exit_code: $exit_code, stage:"dispatch", execution_started:false,
+                  error: $error}')
         fi
         if [[ "$(jq -r '.status // empty' <<< "$ordered_result")" == "success" ]] && \
            { ! _act_build_purpose_matches "$ordered_result" "$build_purpose" "$strict_release_contract" || \
@@ -13115,7 +14726,10 @@ act_orchestrate_build() {
 
     # Determine overall status
     local overall_status overall_exit_code
-    if $interrupted; then
+    if [[ -n "$coordinator_error" ]]; then
+        overall_status="failed"
+        overall_exit_code=4
+    elif $interrupted; then
         overall_status="failed"
         overall_exit_code=130
     elif $source_validation_failed; then
@@ -13164,6 +14778,7 @@ act_orchestrate_build() {
         --arg git_ref "$git_ref" \
         --argjson source_dependencies "$source_dependencies_json" \
         --arg status "$overall_status" \
+        --arg error "$coordinator_error" \
         --argjson exit_code "$overall_exit_code" \
         --argjson duration "$total_duration" \
         --argjson total "$((success_count + fail_count))" \
@@ -13191,7 +14806,7 @@ act_orchestrate_build() {
                 success: $success,
                 failed: $failed
             }
-        }') || return 4
+        } + (if $error == "" then {} else {error:$error} end)') || return 4
     _act_bind_orchestration_targets "$summary_json" "$results_json" || return 4
 
     return "$overall_exit_code"
@@ -13993,8 +15608,13 @@ act_generate_manifest() {
     fi
     config_validate_target_triples "$tool" || return 4
     _act_validate_native_matrix_result_inventory "$tool" "$result_json" || return 4
-    local verified_additional
+    local verified_additional verified_workflow_files workflow_plans
     verified_additional=$(_act_additional_artifact_receipts_json "$tool" "$result_json") || return 4
+    workflow_plans=$(_act_workflow_payload_plans_json "$tool" "$version") || return 4
+    verified_workflow_files=$(jq -c --argjson plans "$workflow_plans" '[.targets[] |
+        select(.method == "act" and $plans[.platform] != null and
+               (.status == "success" or .status == "ok" or .status == "passed")) |
+        .platform as $target | .artifact_paths[] | {key:.,value:$target}] | from_entries' <<< "$result_json") || return 4
     if ! declare -F artifact_naming_artifact_variant &>/dev/null; then
         # shellcheck source=SCRIPTDIR/artifact_naming.sh
         source "$manifest_module_dir/artifact_naming.sh" || return 3
@@ -14116,13 +15736,17 @@ act_generate_manifest() {
         fi
         [[ -z "$target" ]] && return 0
 
-        local name additional_receipt literal_additional=false
+        local name additional_receipt literal_additional=false authoritative_workflow=false
         name=$(basename "$file")
         additional_receipt=$(jq -c --arg path "$file" '.[$path] // null' <<< "$verified_additional") || return 4
         if [[ "$additional_receipt" != null ]]; then
             literal_additional=true
             [[ "$name" == "$(jq -r '.name' <<< "$additional_receipt")" &&
                "$target" == "$(jq -r '.target' <<< "$additional_receipt")" ]] || return 4
+        fi
+        if jq -e --arg path "$file" 'has($path)' <<< "$verified_workflow_files" >/dev/null; then
+            authoritative_workflow=true
+            [[ "$(jq -r --arg path "$file" '.[$path]' <<< "$verified_workflow_files")" == "$target" ]] || return 4
         fi
 
         case "$name" in
@@ -14203,7 +15827,7 @@ act_generate_manifest() {
         # act job.
         local inferred_target
         inferred_target=""
-        if ! $literal_additional; then
+        if ! $literal_additional && ! $authoritative_workflow; then
             inferred_target=$(_act_infer_target_from_name "$name")
         fi
         if [[ "$native_result" == true && -n "$inferred_target" && "$inferred_target" != "$target" ]]; then
@@ -14215,6 +15839,8 @@ act_generate_manifest() {
         local target_triple
         if [[ "$native_result" == true && -n "$declared_triple" ]]; then
             target_triple="$declared_triple"
+        elif $literal_additional || $authoritative_workflow; then
+            target_triple=$(_act_manifest_target_triple "$target" "") || return 4
         else
             target_triple=$(_act_manifest_target_triple "$target" "$name") || return 4
         fi

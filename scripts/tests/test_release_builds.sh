@@ -8,6 +8,7 @@ for tool in python3 bash jq flock timeout sha256sum; do
 done
 [[ "$(uname -s)" == Linux ]] || { printf 'SKIP requires Linux\n'; exit 0; }
 python3 - "${RELEASE_BUILDS_TEST_ROOT:-$ROOT}" <<'PY'
+import fcntl
 import hashlib
 import json
 import os
@@ -88,6 +89,16 @@ def event(phase):
         f.write(json.dumps({'job':spec['id'], 'phase':phase, 'at':time.monotonic(), 'pid':os.getpid()})+'\n')
 mode = Path(spec['control']).read_text().strip()
 event('start')
+start_barrier = os.environ.get('RELEASE_BUILDS_TEST_START_BARRIER')
+if start_barrier and spec['id'] in ('linux', 'darwin'):
+    # Prove actual concurrent driver execution without assuming either Python
+    # startup is scheduled inside the other's short artificial build delay.
+    barrier = Path(start_barrier)
+    (barrier/spec['id']).write_text('ready')
+    deadline = time.monotonic()+10
+    while time.monotonic()<deadline and not all((barrier/name).exists() for name in ('linux', 'darwin')):
+        time.sleep(.01)
+    assert all((barrier/name).exists() for name in ('linux', 'darwin')), 'parallel driver did not start'
 if mode in ('slow', 'leak'):
     sleeper = subprocess.Popen(['sleep', '60'])
     Path(spec['control']+'.pid').write_text(str(sleeper.pid))
@@ -192,6 +203,7 @@ print(json.dumps(response))
     # they are Python fixtures, not native or RCH builds. Keep that fixture policy
     # explicit; the real coordinator's required-remote refusal is tested below.
     fixture_env = dict(os.environ, RCH_REQUIRE_REMOTE='0')
+    fixture_env.pop('RELEASE_BUILDS_TEST_START_BARRIER', None)
     def run(output, expected=0, selected=planfile, extra=(), env=None):
         proc = subprocess.run(['bash',str(script),'--plan',str(selected),'--output-dir',str(output)] + list(extra),
                               env=fixture_env if env is None else env,
@@ -243,7 +255,9 @@ print(json.dumps(response))
               refusal['reason_code']=='RCH_REQUIRED_NATIVE_UNAVAILABLE' and
               not refusal['publishable'] and not output.exists() and not trace.exists())
     controls['windows'].write_text('fail')
-    env = dict(fixture_env, DSR_CONFIG_FILE='/wrong', DSR_REPOS_FILE='/wrong', DSR_HOSTS_FILE='/wrong')
+    barrier = work/'parallel-start'; barrier.mkdir()
+    env = dict(fixture_env, DSR_CONFIG_FILE='/wrong', DSR_REPOS_FILE='/wrong', DSR_HOSTS_FILE='/wrong',
+               RELEASE_BUILDS_TEST_START_BARRIER=str(barrier))
     result = run(output,1,extra=('--jobs','2'),env=env)
     check('independent successes survive a failed builder', result['completed_builds']==2 and result['failed_builds']==['windows'])
     check('incomplete matrix has no publishable bundle', not (output/'bundle').exists() and not result['publishable'])
@@ -465,9 +479,11 @@ print(json.dumps(response))
     original_receipt = receipt_path.read_bytes()
     receipt = read(receipt_path); receipt['target'] = 'aarch64-pc-windows-msvc'; encode(receipt_path, receipt)
     run(pending, 1, amd64_file)
-    check('admission recovery rechecks the selected target in the original completion receipt',
-          'completed xwin envelope changed' in run.stderr and trace.read_bytes()==before_trace and
-          read(pending/'state.json')['jobs']['windows-amd64']['candidate']==candidate)
+    recovered_record = read(pending/'state.json')['jobs']['windows-amd64']
+    check('admission recovery refuses target drift in the observed completion receipt',
+          'driver evidence changed after its observed exit' in run.stderr and trace.read_bytes()==before_trace and
+          recovered_record['candidate']==candidate and recovered_record['complete'] is None and
+          len(recovered_record['attempts'])==1)
     receipt_path.write_bytes(original_receipt)
     (Path(candidate['artifacts_dir'])/'demo-x86_64-pc-windows-msvc.exe').write_bytes(b'built windows/amd64\n')
     result = run(pending, selected=amd64_file)
@@ -530,7 +546,11 @@ print(json.dumps(response))
     check('SIGTERM to CLI exits with interruption status',code==5 and read(work/'cancel.stdout')['exit_code']==5)
     check('cancellation kills compiler descendants',stopped(int(Path(str(controls['linux'])+'.pid').read_text())))
     controls['linux'].write_text('good'); run(work/'cancel',selected=work/'slow.json')
-    check('interrupted attempt is retained while a fresh retry succeeds', [r['status'] for r in read(work/'cancel/state.json')['jobs']['linux']['attempts']]==['interrupted','completed'])
+    observed = read(work/'cancel/attempts/linux/000001/driver-exit.json')
+    check('observed cancellation is retained while exactly one fresh retry succeeds',
+          observed['wait_status'] in (-signal.SIGTERM, 143) and observed['exit_code']==143 and
+          [(r['status'],r['exit_code']) for r in read(work/'cancel/state.json')['jobs']['linux']['attempts']]==
+          [('failed',143),('completed',0)] and trace.read_text().count('start')==prior+2)
     # A killed coordinator cannot perform finally cleanup. Its live driver
     # must nevertheless retain the inherited lock and prevent a second build.
     controls['linux'].write_text('slow')
@@ -559,9 +579,25 @@ print(json.dumps(response))
     deadline=time.monotonic()+10
     while time.monotonic()<deadline and not stopped(event['pid']): time.sleep(.03)
     check('crash probe driver has terminated before recovery',stopped(event['pid']))
+    # The surviving supervisor owns the lock through descendant settlement
+    # and durable receipt publication, beyond the direct driver's lifetime.
+    released = False
+    with (work/'crash/lock').open('rb') as held:
+        while time.monotonic()<deadline:
+            try:
+                fcntl.flock(held,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                fcntl.flock(held,fcntl.LOCK_UN)
+                released = True
+                break
+            except BlockingIOError:
+                time.sleep(.03)
+    check('crash supervisor releases custody before recovery',released)
     controls['linux'].write_text('good'); run(work/'crash',selected=work/'slow.json')
-    check('crash recovery never adopts unacknowledged compiler output',
-          [r['status'] for r in read(work/'crash/state.json')['jobs']['linux']['attempts']]==['interrupted','completed'])
+    observed = read(work/'crash/attempts/linux/000001/driver-exit.json')
+    check('crash recovery retains observed signal failure and compiles exactly one fresh attempt',
+          observed['wait_status'] in (-signal.SIGTERM, 143) and observed['exit_code']==143 and
+          [(r['status'],r['exit_code']) for r in read(work/'crash/state.json')['jobs']['linux']['attempts']]==
+          [('failed',143),('completed',0)] and trace.read_text().count('start')==prior+2)
     controls['linux'].write_text('leak'); run(work/'leak',selected=work/'single.json')
     check('successful builder cannot leave detached group children running',stopped(int(Path(str(controls['linux'])+'.pid').read_text())))
     controls['linux'].write_text('good')

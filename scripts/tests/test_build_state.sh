@@ -116,6 +116,248 @@ test_build_lock_info() {
   build_lock_release "test-tool5" "v1.0.0"
 }
 
+# Real shell/process tests for the custody boundary. The Python path forces
+# only flock discovery to be unavailable, exercising the production macOS
+# fcntl fallback without substituting lock acquisition or release behavior.
+test_build_lock_custody() {
+  python3 - "$PROJECT_ROOT" <<'PY'
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import time
+
+project = Path(sys.argv[1])
+root = Path(tempfile.mkdtemp(prefix='dsr-build-custody-'))
+print('Retained build custody fixture: ' + str(root), flush=True)
+checks = 0
+
+
+def check(label, value):
+    global checks
+    if not value:
+        raise AssertionError(label)
+    checks += 1
+    print('PASS: ' + label, flush=True)
+
+
+def until(predicate, seconds=12):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.02)
+    raise AssertionError('fixture barrier timed out')
+
+
+driver = root / 'driver.sh'
+driver.write_text(r'''#!/usr/bin/env bash
+set -uo pipefail
+log_info() { :; }; log_warn() { :; }; log_debug() { :; }
+log_error() { printf '%s\n' "$*" >&2; }
+# shellcheck source=src/build_state.sh
+source "$MODULE" || exit 90
+if [[ "$BACKEND" == python ]]; then
+    command() {
+        if [[ "${1:-}" == -v && "${2:-}" == flock ]]; then return 1; fi
+        builtin command "$@"
+    }
+fi
+build_state_init || exit 91
+barrier() {
+    local deadline=$((SECONDS + 20))
+    while [[ ! -f "$1" ]]; do
+        ((SECONDS < deadline)) || return 1
+        sleep 0.02
+    done
+}
+participant() {
+    local name="$1" status=0 owner
+    printf '%s\n' "$BASHPID" > "$FIXTURE/$name.ready"
+    barrier "$FIXTURE/start" || return 92
+    build_lock_acquire task v1 || status=$?
+    if [[ "$status" == 0 ]]; then
+        read -r owner _ < "$DSR_STATE_DIR/builds/task/v1/.lock"
+        [[ "$owner" == "$BASHPID" ]] || return 93
+    fi
+    printf '%s\n' "$status" > "$FIXTURE/$name.result"
+    if [[ "$status" == 0 ]]; then
+        barrier "$FIXTURE/release" || return 94
+        build_lock_release task v1 || return 95
+    fi
+    return "$status"
+}
+case "$ACTION" in
+    basic)
+        exec 10<> "$FIXTURE/caller-a" 11<> "$FIXTURE/caller-b"
+        printf 'first:' >&10; printf 'second:' >&11
+        build_lock_acquire one v1 && build_lock_acquire two v1 || exit 96
+        status=0; build_lock_acquire one v1 || status=$?
+        [[ "$status" == 2 ]] && build_lock_check one v1 || exit 97
+        # A loader re-source must preserve both namespace and descriptor registry.
+        loader() {
+            # shellcheck source=src/build_state.sh
+            source "$MODULE"
+        }
+        loader || exit 98
+        status=0; (build_lock_release one v1) || status=$?
+        [[ "$status" == 1 ]] && build_lock_check one v1 || exit 99
+        (printf '%s\n' "$BASHPID" > "$FIXTURE/child.ready";
+         barrier "$FIXTURE/release") & child=$!
+        barrier "$FIXTURE/child.ready" || exit 100
+        build_lock_release one v1 && build_lock_release two v1 || exit 101
+        # Closing this shell's copies cannot unlock the child's description.
+        build_lock_check one v1 && build_lock_check two v1 || exit 102
+        printf 'ready\n' > "$FIXTURE/parent-released"
+        wait "$child" || exit 103
+        if build_lock_check one v1 || build_lock_check two v1; then exit 104; fi
+        build_lock_release one v1 || exit 105
+        build_lock_acquire one v1 && build_lock_release one v1 || exit 106
+        printf 'after\n' >&10; printf 'after\n' >&11
+        [[ "$(cat "$FIXTURE/caller-a")" == first:after &&
+           "$(cat "$FIXTURE/caller-b")" == second:after ]] || exit 107
+        ;;
+    compete) participant "$NAME"; exit $? ;;
+    siblings)
+        participant sibling-a & first=$!
+        participant sibling-b & second=$!
+        wait "$first" || true
+        wait "$second" || true
+        ;;
+    acquire) build_lock_acquire "${TOOL:-task}" v1; exit $? ;;
+    inspect) build_lock_info "${TOOL:-task}" v1 ;;
+    hold)
+        build_lock_acquire task v1 || exit 108
+        printf 'ready\n' > "$FIXTURE/holder.ready"
+        barrier "$FIXTURE/release" || exit 109
+        # Identity-tampering cases intentionally cannot claim an explicit release.
+        build_lock_release task v1
+        ;;
+esac
+''')
+
+
+def environment(case, backend, action, **extra):
+    return dict(os.environ, DSR_STATE_DIR=str(case / 'state'), DSR_RUN_ID='custody-fixture',
+                MODULE=os.environ.get('DSR_TEST_BUILD_STATE', str(project / 'src/build_state.sh')),
+                FIXTURE=str(case),
+                BACKEND=backend, ACTION=action, **extra)
+
+
+def run(case, backend, action, **extra):
+    return subprocess.run(['bash', str(driver)], env=environment(case, backend, action, **extra),
+                          stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+
+
+for backend in ('flock', 'python'):
+    case = root / (backend + '-basic')
+    case.mkdir()
+    with open(case / 'stdout', 'wb') as out, open(case / 'stderr', 'wb') as err:
+        owner = subprocess.Popen(['bash', str(driver)], env=environment(case, backend, 'basic'),
+                                 stdin=subprocess.DEVNULL, stdout=out, stderr=err)
+        try:
+            until(lambda: (case / 'parent-released').exists() or owner.poll() is not None)
+            check(backend + ': distinct locks, same-shell refusal, re-source and child ownership checks pass',
+                  (case / 'parent-released').exists() and owner.poll() is None)
+            for tool in ('one', 'two'):
+                probe = run(case, backend, 'acquire', TOOL=tool)
+                info = run(case, backend, 'inspect', TOOL=tool)
+                check(backend + ': inherited child keeps ' + tool + ' excluded after owner release',
+                      probe.returncode == 2 and info.returncode == 0 and
+                      json.loads(info.stdout)['custody'] == 'held')
+        finally:
+            (case / 'release').write_text('continue\n')
+            if owner.poll() is None:
+                owner.wait(timeout=10)
+        check(backend + ': final descendant close allows reacquisition and preserves caller descriptors',
+              owner.returncode == 0 and (case / 'caller-a').read_text() == 'first:after\n' and
+              (case / 'caller-b').read_text() == 'second:after\n')
+        free = run(case, backend, 'inspect', TOOL='one')
+        check(backend + ': retained valid metadata reports free custody after release',
+              free.returncode == 0 and json.loads(free.stdout)['locked'] is False and
+              (case / 'state/builds/one/v1/.lock.lease').is_file())
+
+    for sibling in (False, True):
+        case = root / (backend + ('-siblings' if sibling else '-independent'))
+        case.mkdir()
+        names = ['sibling-a', 'sibling-b'] if sibling else ['process-%d' % i for i in range(8)]
+        processes = []
+        streams = []
+        try:
+            for name in (['parent'] if sibling else names):
+                stream = open(case / (name + '.log'), 'wb')
+                streams.append(stream)
+                processes.append(subprocess.Popen(['bash', str(driver)],
+                    env=environment(case, backend, 'siblings' if sibling else 'compete', NAME=name),
+                    stdin=subprocess.DEVNULL, stdout=stream, stderr=stream))
+            until(lambda: all((case / (name + '.ready')).exists() for name in names))
+            (case / 'start').write_text('continue\n')
+            until(lambda: all((case / (name + '.result')).exists() for name in names))
+            results = {name: int((case / (name + '.result')).read_text()) for name in names}
+            check(case.name + ': exactly one simultaneous independent owner is admitted',
+                  list(results.values()).count(0) == 1 and list(results.values()).count(2) == len(names) - 1)
+            winner = next(name for name in names if results[name] == 0)
+            pid = int((case / (winner + '.ready')).read_text())
+            metadata = (case / 'state/builds/task/v1/.lock').read_text()
+            check(case.name + ': metadata identifies the actual acquiring process',
+                  int(metadata.split()[0]) == pid and
+                  (not sibling or pid != processes[0].pid))
+        finally:
+            (case / 'release').write_text('continue\n')
+            for process in processes:
+                process.wait(timeout=10)
+            for stream in streams:
+                stream.close()
+
+    for kind in ('legacy', 'malformed', 'linked-lease', 'linked-metadata', 'missing-lease', 'replaced-lease'):
+        case = root / (backend + '-' + kind)
+        namespace = case / 'state/builds/task/v1'
+        namespace.mkdir(parents=True)
+        metadata, lease = namespace / '.lock', namespace / '.lock.lease'
+        victim = case / 'victim'
+        victim.write_text('retained independent bytes\n')
+        owner = None
+        out = err = None
+        try:
+            if kind == 'legacy':
+                metadata.write_text('999999 0 legacy-run\n')
+            elif kind == 'malformed':
+                lease.touch()
+                metadata.write_text('invalid custody\n')
+            elif kind == 'linked-lease':
+                lease.symlink_to(victim)
+            elif kind == 'linked-metadata':
+                metadata.symlink_to(victim)
+            else:
+                out, err = open(case / 'stdout', 'wb'), open(case / 'stderr', 'wb')
+                owner = subprocess.Popen(['bash', str(driver)], env=environment(case, backend, 'hold'),
+                                         stdin=subprocess.DEVNULL, stdout=out, stderr=err)
+                until(lambda: (case / 'holder.ready').exists())
+                lease.rename(namespace / '.retained-original-lease')
+                if kind == 'replaced-lease':
+                    lease.touch()
+            before = metadata.read_bytes() if metadata.exists() else None
+            refused = run(case, backend, 'acquire')
+            info = run(case, backend, 'inspect')
+            check(case.name + ': unsafe or legacy custody refuses admission and reports locked',
+                  refused.returncode == 1 and info.returncode == 0 and
+                  json.loads(info.stdout)['locked'] is True and
+                  json.loads(info.stdout)['custody'] == 'unverifiable')
+            check(case.name + ': refusal preserves existing metadata and unrelated bytes',
+                  victim.read_text() == 'retained independent bytes\n' and
+                  (before is None or metadata.read_bytes() == before))
+        finally:
+            if owner is not None:
+                (case / 'release').write_text('continue\n')
+                owner.wait(timeout=10)
+                out.close(); err.close()
+
+print('Build custody: %d checks passed' % checks, flush=True)
+PY
+}
+
 # ============================================================================
 # State Tests
 # ============================================================================
@@ -873,6 +1115,19 @@ test_resume_rejects_malformed_inventory() {
     '.target_statuses["linux/amd64"].source_sync_failures = "0"' \
     '.target_statuses["linux/amd64"].source_sync_failures = 1.5' \
     '.target_statuses["linux/amd64"].source_sync_failures = 99' \
+    '.target_statuses["linux/amd64"].host_readiness_failures = -1' \
+    '.target_statuses["linux/amd64"].host_readiness_failures = "0"' \
+    '.target_statuses["linux/amd64"].host_readiness_failures = null' \
+    '.target_statuses["linux/amd64"].host_readiness_failures = 1.5' \
+    '.target_statuses["linux/amd64"].host_readiness_failures = 99' \
+    '.target_statuses["linux/amd64"].host_capacity_failures = -1' \
+    '.target_statuses["linux/amd64"].host_capacity_failures = "0"' \
+    '.target_statuses["linux/amd64"].host_capacity_failures = null' \
+    '.target_statuses["linux/amd64"].host_capacity_failures = false' \
+    '.target_statuses["linux/amd64"].host_capacity_failures = 1.5' \
+    '.target_statuses["linux/amd64"].host_capacity_failures = 99' \
+    '.target_statuses["linux/amd64"] |= . + {attempts:3,source_sync_failures:2,host_readiness_failures:2}' \
+    '.target_statuses["linux/amd64"] |= . + {attempts:3,source_sync_failures:1,host_readiness_failures:1,host_capacity_failures:2}' \
     '.context = []' '.context.target_hosts = {"linux/amd64":null}'; do
     jq "$filter" <<< "$original" > "$RESUME_STATE_FILE" || return 1
     status=0
@@ -1183,6 +1438,130 @@ test_source_sync_compiler_retry_budget() {
   done
 }
 
+test_host_readiness_compiler_retry_budget() {
+  local run_id attempt extra plan
+  local BUILD_RETRY_MAX=3
+  run_id=$(build_state_create readiness-budget v1.0.0 linux/amd64) || return 1
+  build_state_set_context readiness-budget v1.0.0 "$run_id" '' '' '{}' /output 1 '{}' || return 1
+  build_state_update_status readiness-budget v1.0.0 failed "$run_id" || return 1
+  # Source transfer and three host-readiness refusals retain four distinct
+  # attempts without admitting a compiler. Replay is idempotent for each.
+  for attempt in 1 2 3 4; do
+    extra=$(jq -nc --argjson attempt "$attempt" '
+      {attempts:$attempt,result:{status:"failed",exit_code:4,attempt:$attempt,
+       stage:(if $attempt == 1 then "source_sync" else "host_readiness" end)}}') || return 1
+    build_state_update_target readiness-budget v1.0.0 linux/amd64 failed "$extra" "$run_id" || return 1
+    build_state_update_target readiness-budget v1.0.0 linux/amd64 failed "$extra" "$run_id" || return 1
+  done
+  plan=$(build_state_resume readiness-budget v1.0.0 "$run_id") || return 1
+  jq -e '.targets_to_process == ["linux/amd64"] and .exceeded_target_retry_limit == []' \
+    <<< "$plan" >/dev/null || return 1
+  build_state_get readiness-budget v1.0.0 "$run_id" | jq -e '
+    .target_statuses["linux/amd64"].attempts == 4 and
+    .target_statuses["linux/amd64"].source_sync_failures == 1 and
+    .target_statuses["linux/amd64"].host_readiness_failures == 3' >/dev/null || return 1
+  # A label alone cannot exempt a compiler failure. Exit 4 from a build
+  # stage, or another exit with the readiness label, still consumes budget.
+  for attempt in 5 6 7; do
+    extra=$(jq -nc --argjson attempt "$attempt" '{attempts:$attempt,result:null}') || return 1
+    build_state_update_target readiness-budget v1.0.0 linux/amd64 running "$extra" "$run_id" || return 1
+    extra=$(jq -nc --argjson attempt "$attempt" '
+      {attempts:$attempt,result:{status:"failed",attempt:$attempt,
+       stage:(if $attempt == 6 then "host_readiness" else "build" end),
+       exit_code:(if $attempt == 5 then 4 else 9 end)}}') || return 1
+    build_state_update_target readiness-budget v1.0.0 linux/amd64 failed "$extra" "$run_id" || return 1
+    plan=$(build_state_resume readiness-budget v1.0.0 "$run_id") || return 1
+    if ((attempt < 7)); then
+      jq -e '.targets_to_process == ["linux/amd64"]' <<< "$plan" >/dev/null || return 1
+    else
+      jq -e '.targets_to_process == [] and .exceeded_target_retry_limit == ["linux/amd64"]' \
+        <<< "$plan" >/dev/null || return 1
+    fi
+  done
+  build_state_get readiness-budget v1.0.0 "$run_id" | jq -e '
+    .target_statuses["linux/amd64"].attempts == 7 and
+    .target_statuses["linux/amd64"].source_sync_failures == 1 and
+    .target_statuses["linux/amd64"].host_readiness_failures == 3' >/dev/null
+}
+
+test_host_capacity_compiler_retry_budget() {
+  local run_id attempt extra plan
+  local BUILD_RETRY_MAX=3
+  build_state_init || return 1
+  run_id=$(build_state_create capacity-budget v1.0.0 linux/amd64) || return 1
+  build_state_set_context capacity-budget v1.0.0 "$run_id" '' '' '{}' /output 1 '{}' || return 1
+  build_state_update_status capacity-budget v1.0.0 failed "$run_id" || return 1
+  # Six reservations fail before compilation, including four busy-host
+  # refusals: the immutable attempt number must outgrow the retry allowance
+  # without preventing a build once capacity becomes available.
+  for attempt in 1 2 3 4 5 6; do
+    extra=$(jq -nc --argjson attempt "$attempt" '{attempts:$attempt,result:null}') || return 1
+    build_state_update_target capacity-budget v1.0.0 linux/amd64 running "$extra" "$run_id" || return 1
+    extra=$(jq -nc --argjson attempt "$attempt" '
+      {attempts:$attempt,result:{attempt:$attempt,backend_started:false,
+       status:(if $attempt == 6 then "error" else "failed" end),
+       exit_code:(if $attempt < 3 then 4 else 2 end),
+       stage:(if $attempt == 1 then "source_sync" elif $attempt == 2 then "host_readiness"
+              else "host_capacity" end)}}') || return 1
+    build_state_update_target capacity-budget v1.0.0 linux/amd64 failed "$extra" "$run_id" || return 1
+    # Aggregation and resumed receipt replay may repeat this exact write.
+    build_state_update_target capacity-budget v1.0.0 linux/amd64 failed "$extra" "$run_id" || return 1
+    plan=$(build_state_resume capacity-budget v1.0.0 "$run_id") || return 1
+    jq -e '.targets_to_process == ["linux/amd64"] and .exceeded_target_retry_limit == []' \
+      <<< "$plan" >/dev/null || return 1
+  done
+  build_state_get capacity-budget v1.0.0 "$run_id" | jq -e '
+    .target_statuses["linux/amd64"] |
+    .attempts == 6 and .source_sync_failures == 1 and .host_readiness_failures == 1 and
+    .host_capacity_failures == 4' >/dev/null || return 1
+  # Once a backend runs, even exit 2 is a genuine build attempt. Exactly the
+  # configured three attempts remain available after all six refusals.
+  for attempt in 7 8 9; do
+    extra=$(jq -nc --argjson attempt "$attempt" '{attempts:$attempt,result:null}') || return 1
+    build_state_update_target capacity-budget v1.0.0 linux/amd64 running "$extra" "$run_id" || return 1
+    extra=$(jq -nc --argjson attempt "$attempt" '
+      {attempts:$attempt,result:{status:"failed",stage:"build",exit_code:2,
+       backend_started:true,attempt:$attempt}}') || return 1
+    build_state_update_target capacity-budget v1.0.0 linux/amd64 failed "$extra" "$run_id" || return 1
+    plan=$(build_state_resume capacity-budget v1.0.0 "$run_id") || return 1
+    if ((attempt < 9)); then
+      jq -e '.targets_to_process == ["linux/amd64"] and .exceeded_target_retry_limit == []' \
+        <<< "$plan" >/dev/null || return 1
+    else
+      jq -e '.targets_to_process == [] and .exceeded_target_retry_limit == ["linux/amd64"]' \
+        <<< "$plan" >/dev/null || return 1
+    fi
+  done
+  build_state_get capacity-budget v1.0.0 "$run_id" | jq -e '
+    .target_statuses["linux/amd64"] |
+    .attempts == 9 and .source_sync_failures == 1 and .host_readiness_failures == 1 and
+    .host_capacity_failures == 4' >/dev/null
+}
+
+test_host_capacity_requires_preexecution_evidence() {
+  local BUILD_RETRY_MAX=1
+  local sequence=0 filter tool run_id extra plan
+  build_state_init || return 1
+  for filter in '.stage="build"' '.exit_code=6' '.status="success"' \
+    '.backend_started=true' 'del(.backend_started)' '.backend_started=null' \
+    '.backend_started="false"'; do
+    ((sequence+=1))
+    tool="capacity-evidence-$sequence"
+    run_id=$(build_state_create "$tool" v1.0.0 linux/amd64) || return 1
+    build_state_update_status "$tool" v1.0.0 failed "$run_id" || return 1
+    extra=$(jq -nc '{status:"failed",stage:"host_capacity",exit_code:2,backend_started:false}' |
+      jq -c "$filter" | jq -c '{attempts:1,result:.}') || return 1
+    build_state_update_target "$tool" v1.0.0 linux/amd64 failed "$extra" "$run_id" || return 1
+    build_state_update_target "$tool" v1.0.0 linux/amd64 failed "$extra" "$run_id" || return 1
+    plan=$(build_state_resume "$tool" v1.0.0 "$run_id") || return 1
+    jq -e '.targets_to_process == [] and .exceeded_target_retry_limit == ["linux/amd64"]' \
+      <<< "$plan" >/dev/null || return 1
+    build_state_get "$tool" v1.0.0 "$run_id" | jq -e --argjson limit "$BUILD_RETRY_MAX" '
+      .target_statuses["linux/amd64"] |
+      .attempts == $limit and (.host_capacity_failures // 0) == 0' >/dev/null || return 1
+  done
+}
+
 # Cleanup
 cleanup() {
   if [[ "${DSR_TEST_KEEP_TMP:-0}" == 1 ]]; then
@@ -1192,6 +1571,20 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+
+if [[ "${1:-}" == --lock-custody-only ]]; then
+  test_build_lock_custody
+  exit $?
+fi
+
+if [[ "${1:-}" == --capacity-budget-only ]]; then
+  run_state_regression "capacity refusals retain all compiler retries without double counting" test_host_capacity_compiler_retry_budget
+  run_state_regression "capacity exemptions require an explicit pre-execution refusal" test_host_capacity_requires_preexecution_evidence
+  run_state_regression "resume rejects malformed and overlapping refusal counters" test_resume_rejects_malformed_inventory
+  echo "Tests run: $TESTS_RUN  Passed: $TESTS_PASSED  Failed: $TESTS_FAILED"
+  [[ $TESTS_FAILED -eq 0 ]]
+  exit $?
+fi
 
 # ============================================================================
 # Run All Tests
@@ -1206,6 +1599,12 @@ test_build_lock_blocks_concurrent
 test_build_lock_release
 test_build_lock_check
 test_build_lock_info
+((TESTS_RUN++))
+if test_build_lock_custody; then
+  pass "inherited build custody preserves exclusion, ownership and caller descriptors"
+else
+  fail "inherited build custody regression"
+fi
 
 # State tests
 test_build_state_create
@@ -1260,6 +1659,9 @@ run_state_regression "resume rejects malformed target/host inventories and count
 run_state_regression "native variant checkpoints resume only failed tasks and reject duplicate identities" test_native_matrix_resume_tasks
 run_state_regression "source-sync refresh preserves completed artifacts and records repair/opt-out history" test_source_sync_context_refresh
 run_state_regression "source-sync failures preserve the compiler retry allowance without double counting" test_source_sync_compiler_retry_budget
+run_state_regression "host-readiness refusals preserve compiler retries and real build failures exhaust them" test_host_readiness_compiler_retry_budget
+run_state_regression "capacity refusals retain all compiler retries without double counting" test_host_capacity_compiler_retry_budget
+run_state_regression "capacity exemptions require an explicit pre-execution refusal" test_host_capacity_requires_preexecution_evidence
 run_state_regression "generic retry rejects zero or invalid budgets before execution" test_retry_budget_validation
 run_state_regression "exponential retry backoff never exceeds its cap or overflows" test_retry_backoff_is_bounded
 run_state_regression "missing or invalid saved retry budgets cannot launch commands" test_retry_unreadable_budget_blocks_execution

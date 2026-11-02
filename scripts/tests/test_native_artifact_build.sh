@@ -147,6 +147,8 @@ for module in logging config build_state act_runner artifact_naming git_ops pack
     # shellcheck disable=SC1090
     source "$ROOT/src/$module.sh" || exit 1
 done
+# Initialize this shell too: the native orchestrator initializes its subshell.
+build_state_init || exit 1
 export SCRIPT_DIR="$ROOT"
 declare -A _DSR_LOADED_MODULES=([packaging]=1 [artifact_naming]=1)
 # shellcheck disable=SC1090

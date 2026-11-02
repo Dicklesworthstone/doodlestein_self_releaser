@@ -37,7 +37,12 @@ docker_version() {
 # --builder explicitly. Inspect/bootstrap the named builder, including on reuse.
 docker_setup_buildx() {
     local builder="${1:-${DOCKER_BUILDER_NAME:-dsr-builder}}"
-    [[ "$builder" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || return 4
+    [[ $# -le 1 && "$builder" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || return 4
+    [[ "${DRY_RUN:-false}" =~ ^(true|false)$ ]] || return 4
+    if [[ "${DRY_RUN:-false}" == true ]]; then
+        _dk_log_info "[dry-run] Would prepare builder $builder"
+        return 0
+    fi
     docker_check_buildx || return $?
     if ! docker buildx inspect "$builder" >/dev/null 2>&1; then
         if ! docker buildx create --name "$builder" --driver docker-container >&2; then
@@ -46,6 +51,30 @@ docker_setup_buildx() {
         fi
     fi
     docker buildx inspect "$builder" --bootstrap >&2 || return 1
+}
+
+# Public setup has the same no-effects planning contract as builds. Keep the
+# lower-level builder helper quiet on stdout for callers that produce receipts.
+docker_setup() {
+    local dry="${DRY_RUN:-false}" builder="${DOCKER_BUILDER_NAME:-dsr-builder}" status=ready
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run|-n) dry=true; shift ;;
+            --help|-h)
+                printf '%s\n' 'docker_setup - Prepare the named Buildx builder' \
+                    'Usage: docker_setup [--dry-run]' \
+                    'DOCKER_BUILDER_NAME selects the builder; the global selection is unchanged.' >&2
+                return 0 ;;
+            *) _dk_log_error "Unexpected setup argument: $1"; return 4 ;;
+        esac
+    done
+    [[ "$builder" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ && "$dry" =~ ^(true|false)$ ]] || return 4
+    _dk_dependency jq || return $?
+    if [[ "$dry" == true ]]; then status=planned
+    else docker_setup_buildx "$builder" || return $?; fi
+    jq -nc --arg builder "$builder" --arg status "$status" --argjson dry "$dry" '
+        {schema_version:1,kind:"dsr-container-setup",status:$status,builder:$builder,
+         dry_run:$dry,ready:($status == "ready")}'
 }
 
 # Explicit environment choices win; do not accidentally prefer another account
@@ -285,19 +314,34 @@ docker_build() {
 # These operations accept immutable qualified references only. A mutable tag
 # must not be resolved independently by the scanner and signer.
 docker_sign() {
-    local image="${1:-}" dry="${DRY_RUN:-false}"
-    case "$image" in --help|-h)
-        printf '%s\n' 'docker_sign - Sign container image by immutable repository@sha256:digest' >&2; return 0 ;;
-    esac
-    [[ $# -eq 0 ]] || shift
+    local image='' dry="${DRY_RUN:-false}" status=signed
     while [[ $# -gt 0 ]]; do
-        case "$1" in --dry-run|-n) dry=true; shift ;; *) return 4 ;; esac
+        case "$1" in
+            --dry-run|-n) dry=true; shift ;;
+            --help|-h)
+                printf '%s\n' 'docker_sign - Sign container image by immutable repository@sha256:digest' \
+                    'Usage: docker_sign REPOSITORY@sha256:DIGEST [--dry-run]' >&2
+                return 0 ;;
+            -*) _dk_log_error "Unknown sign option: $1"; return 4 ;;
+            *)
+                [[ -z "$image" ]] || { _dk_log_error "Unexpected sign argument: $1"; return 4; }
+                image="$1"; shift ;;
+        esac
     done
     [[ -n "$image" ]] || { _dk_log_error 'Image reference required'; return 4; }
     _dk_pinned_valid "$image" || { _dk_log_error 'Use an immutable repository@sha256:digest'; return 4; }
-    [[ "$dry" != true ]] || { _dk_log_info "[dry-run] Would sign $image"; return 0; }
-    docker_check_cosign || return $?
-    cosign sign --yes "$image" >&2 || { _dk_log_error "Signing failed: $image"; return 1; }
+    [[ "$dry" =~ ^(true|false)$ ]] || return 4
+    _dk_dependency jq || return $?
+    if [[ "$dry" == true ]]; then status=planned
+    else
+        docker_check_cosign || return $?
+        cosign sign --yes "$image" >&2 || { _dk_log_error "Signing failed: $image"; return 1; }
+    fi
+    # Signing is an acknowledged write, not independent signature verification.
+    # Release performs that verification separately against its trusted policy.
+    jq -nc --arg image "$image" --arg status "$status" --argjson dry "$dry" '
+        {schema_version:1,kind:"dsr-container-signature",status:$status,reference:$image,
+         dry_run:$dry,signed:($status == "signed"),verified:false}'
 }
 _dk_spdx_valid() {
     [[ -f "$1" && ! -L "$1" ]] || return 1
@@ -499,6 +543,13 @@ _dk_evidence_command() (
     local expected_scans='' expected_file='' expected_hash=''
     shift
     [[ $# -eq 0 ]] || shift
+    case "$image" in --help|-h)
+        printf '%s\n' "docker_$action - Check digest-pinned container evidence" \
+            "Usage: docker_$action REPOSITORY@sha256:DIGEST [--platform PLATFORMS]" \
+            '  --certificate-identity ID --certificate-oidc-issuer HTTPS_ISSUER' \
+            '  --skip-sign --dry-run' >&2
+        return 0 ;;
+    esac
     # Internal release verification additionally binds the exact freshly scanned
     # predicates. The public read-only verifier accepts any valid matching SPDX
     # from the configured signer, so older attestations may coexist on an image.
@@ -509,7 +560,7 @@ _dk_evidence_command() (
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --certificate-identity|--certificate-oidc-issuer|--platform|-p)
-                [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || return 4
+                [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || { _dk_log_error "Missing value for $1"; return 4; }
                 case "$1" in
                     --certificate-identity) identity="$2" ;;
                     --certificate-oidc-issuer) issuer="$2" ;;
@@ -518,13 +569,20 @@ _dk_evidence_command() (
                 shift 2 ;;
             --skip-sign) skip=true; shift ;;
             --dry-run|-n) dry=true; shift ;;
-            *) return 4 ;;
+            *) _dk_log_error "Unexpected $action argument: $1"; return 4 ;;
         esac
     done
-    _dk_pinned_valid "$image" || return 4
+    _dk_pinned_valid "$image" || { _dk_log_error 'Use an immutable repository@sha256:digest'; return 4; }
+    [[ "$dry" =~ ^(true|false)$ ]] || return 4
     _dk_dependency jq || return $?
     if [[ "$dry" == true ]]; then
-        jq -nc --arg image "$image" --arg action "$action" '{status:"planned",reference:$image,operation:$action}'
+        jq -nc --arg image "$image" --arg action "$action" --argjson expected "$expected" \
+            --arg identity "$identity" --arg issuer "$issuer" --argjson skip "$skip" '
+            {schema_version:1,kind:"dsr-container-evidence",status:"planned",dry_run:true,
+             reference:$image,operation:$action,platforms:$expected,
+             certificate_identity:$identity,certificate_oidc_issuer:$issuer,
+             signature:(if $action == "attest" then "not_checked" elif $skip then "skipped" else "planned" end),
+             sbom:"planned"}'
         return $?
     fi
     _dk_verify_policy "$identity" "$issuer" || return $?
@@ -558,7 +616,8 @@ _dk_evidence_command() (
     [[ "$inventory" == "$after" ]] || return 7
     jq -nc --arg image "$image" --arg identity "$identity" --arg issuer "$issuer" --arg action "$action" \
         --argjson skip "$skip" --argjson rows "$rows" '
-        {schema_version:1,kind:"dsr-container-evidence",status:"verified",reference:$image,platforms:$rows,
+        {schema_version:1,kind:"dsr-container-evidence",status:"verified",dry_run:false,operation:$action,
+         reference:$image,platforms:$rows,
          certificate_identity:$identity,certificate_oidc_issuer:$issuer,
          signature:(if $action == "attest" then "not_checked" elif $skip then "skipped" else "verified" end)}'
 )
@@ -585,8 +644,14 @@ docker_release() (
     local -a args=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --tool|-t|--version|-V|--repo-path|--dockerfile|--platform|-p|--tag)
+                # Keep build values paired before removing release-only flags.
+                # Otherwise a missing value could swallow --skip-sign or shift
+                # a trust-policy option into the build plan's positional slots.
+                [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || { _dk_log_error "Missing value for $1"; return 4; }
+                args+=("$1" "$2"); shift 2 ;;
             --certificate-identity|--certificate-oidc-issuer)
-                [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || return 4
+                [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || { _dk_log_error "Missing value for $1"; return 4; }
                 case "$1" in --certificate-identity) identity="$2" ;; *) issuer="$2" ;; esac
                 shift 2 ;;
             --skip-sign) skip=true; shift ;;
@@ -602,7 +667,9 @@ docker_release() (
     [[ ${#args[@]} -gt 0 ]] || { _dk_log_error 'Tool and version required'; return 4; }
     plan=$(_dk_build_plan "${args[@]}" --push) || return $?
     if [[ $(jq -r '.dry_run' <<< "$plan") == true ]]; then
-        jq -c --argjson skip "$skip" '. + {kind:"dsr-container-release",signature:(if $skip then "skipped" else "planned" end),sbom:"planned"}' <<< "$plan"
+        jq -c --argjson skip "$skip" --arg identity "$identity" --arg issuer "$issuer" '
+            . + {kind:"dsr-container-release",certificate_identity:$identity,certificate_oidc_issuer:$issuer,
+                 signature:(if $skip then "skipped" else "planned" end),sbom:"planned"}' <<< "$plan"
         return $?
     fi
     _dk_verify_policy "$identity" "$issuer" || return $?
@@ -620,7 +687,7 @@ docker_release() (
     scans=$(_dk_prepare_sboms "$inventory" "$work") || return $?
     _dk_check_tags "$build" "$work" || return $?
     if ! $skip; then
-        docker_sign "$image" || return $?
+        docker_sign "$image" >/dev/null || return $?
         _dk_verify_signature "$image" "$identity" "$issuer" "$work/signature.json" || return $?
     fi
     evidence=$(_dk_publish_sboms "$scans" "$identity" "$issuer" "$work") || return $?
@@ -660,8 +727,27 @@ _dk_json() (
 docker_build_json() { _dk_json docker_build "$@"; }
 docker_release_json() { _dk_json docker_release "$@"; }
 
+# Both entry points use these exact parsers. The public dsr CLI adds only its
+# common JSON envelope, never a second interpretation of operation arguments.
+docker_command() {
+    local command="${1:-help}"
+    [[ $# -eq 0 ]] || shift
+    case "$command" in
+        build) docker_build "$@" ;;
+        release) docker_release "$@" ;;
+        sign) docker_sign "$@" ;;
+        setup) docker_setup "$@" ;;
+        attest) docker_attest_sbom "$@" ;;
+        verify) docker_verify_release "$@" ;;
+        build-json) docker_build_json "$@" ;;
+        release-json) docker_release_json "$@" ;;
+        help|--help|-h) printf '%s\n' 'Usage: bash src/docker.sh build|release|sign|setup|attest|verify|build-json|release-json [options]' ;;
+        *) _dk_log_error "Unknown docker subcommand: $command"; return 4 ;;
+    esac
+}
+
 export -f docker_check docker_check_buildx docker_check_cosign docker_version
-export -f docker_setup_buildx docker_check_ghcr_auth docker_login_ghcr
+export -f docker_setup_buildx docker_setup docker_command docker_check_ghcr_auth docker_login_ghcr
 export -f docker_is_containerized docker_find_dockerfile docker_build docker_sign
 export -f docker_attest_sbom docker_release docker_build_json docker_release_json
 export -f _dk_log_info _dk_log_ok _dk_log_warn _dk_log_error _dk_log_debug
@@ -673,18 +759,6 @@ export -f docker_verify_release _dk_check_tags
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     set -uo pipefail
-    _dk_cmd="${1:-help}"
-    [[ $# -eq 0 ]] || shift
-    case "$_dk_cmd" in
-        build) docker_build "$@" ;;
-        release) docker_release "$@" ;;
-        sign) docker_sign "$@" ;;
-        attest) docker_attest_sbom "$@" ;;
-        verify) docker_verify_release "$@" ;;
-        build-json) docker_build_json "$@" ;;
-        release-json) docker_release_json "$@" ;;
-        help|--help|-h) printf '%s\n' 'Usage: bash src/docker.sh build|release|sign|attest|verify|build-json|release-json [options]' ;;
-        *) _dk_log_error "Unknown container command: $_dk_cmd"; exit 4 ;;
-    esac
+    docker_command "$@"
     exit $?
 fi

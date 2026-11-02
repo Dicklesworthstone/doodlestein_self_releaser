@@ -162,6 +162,68 @@ class ToolchainReceiptSchemaTests(unittest.TestCase):
                         self.assertEqual(row['effective_value'], '33554432' if expected == 'environment' else '16777216')
                         self.accepted(result)
 
+    def test_incremental_production_receipts_and_precedence(self):
+        for entry in ('0', {'value': '0'}, {'value': '0', 'force': False},
+                      {'value': '0', 'force': True, 'relative': False}):
+            forced = isinstance(entry, dict) and entry.get('force', False)
+            inherited_values = ({}, {'CARGO_INCREMENTAL': '0'})
+            for inherited in inherited_values:
+                with self.subTest(entry=entry, inherited=inherited):
+                    result = numeric_observation('CARGO_INCREMENTAL', entry, inherited)
+                    row = result['selection']['cargo_config'][0]['env_exemptions'][0]
+                    expected = 'environment' if inherited and not forced else 'configuration'
+                    self.assertEqual(row, {'name': 'CARGO_INCREMENTAL', 'value': '0',
+                        'force': forced, 'effective_value': '0',
+                        'effective_force': forced, 'effective_source': expected})
+                    self.accepted(result)
+
+    def test_incremental_parent_enable_cannot_produce_a_forced_receipt(self):
+        for entry in ('0', {'value': '0', 'force': False}, {'value': '0', 'force': True}):
+            with self.subTest(entry=entry), self.assertRaisesRegex(
+                    ValueError, 'Cargo process incremental environment requires the string "0"'):
+                numeric_observation('CARGO_INCREMENTAL', entry, {'CARGO_INCREMENTAL': '1'})
+
+    def test_incremental_receipts_reject_nonzero_and_nonliteral_evidence(self):
+        for field in ('value', 'effective_value'):
+            for value in ('1', '00', '-0', '+0', '0.0', '', ' 0', '0 ', '0\n',
+                          '0\x00', '0\u00ad', '0\u200b', '0\u200d', '0\u034f',
+                          '0\ufe0f', 0, False, None):
+                with self.subTest(field=field, value=value):
+                    result = numeric_observation('CARGO_INCREMENTAL', '0')
+                    result['selection']['cargo_config'][0]['env_exemptions'][0][field] = value
+                    self.rejected(result)
+
+    def test_environment_value_rules_follow_the_recorded_name(self):
+        for name in ('RUST_MIN_STACK', 'RUST_TEST_THREADS'):
+            with self.subTest(name=name, change='zero-name-substitution'):
+                result = numeric_observation('CARGO_INCREMENTAL', '0')
+                result['selection']['cargo_config'][0]['env_exemptions'][0]['name'] = name
+                self.rejected(result)
+            with self.subTest(name=name, change='positive-name-substitution'):
+                result = numeric_observation(name)
+                result['selection']['cargo_config'][0]['env_exemptions'][0]['name'] = 'CARGO_INCREMENTAL'
+                self.rejected(result)
+            for field in ('value', 'effective_value'):
+                with self.subTest(name=name, field=field):
+                    result = numeric_observation(name)
+                    result['selection']['cargo_config'][0]['env_exemptions'][0][field] = '0'
+                    self.rejected(result)
+
+    def test_incremental_receipts_preserve_common_provenance_constraints(self):
+        original = numeric_observation('CARGO_INCREMENTAL', {'value': '0', 'force': True})
+        for field in ('name', 'value', 'force', 'effective_value', 'effective_force', 'effective_source'):
+            with self.subTest(missing=field):
+                result = deepcopy(original)
+                del result['selection']['cargo_config'][0]['env_exemptions'][0][field]
+                self.rejected(result)
+        for field, value in (('name', 'cargo_incremental'), ('name', 'CARGO_INCREMENTAL_X'),
+                             ('name', 'RUSTC'), ('force', 'true'), ('effective_force', 1),
+                             ('effective_source', 'assumed'), ('unknown', True)):
+            with self.subTest(field=field, value=value):
+                result = deepcopy(original)
+                result['selection']['cargo_config'][0]['env_exemptions'][0][field] = value
+                self.rejected(result)
+
     def test_partial_numeric_provenance_is_rejected(self):
         for field in ('force', 'effective_value', 'effective_force', 'effective_source'):
             with self.subTest(field=field):

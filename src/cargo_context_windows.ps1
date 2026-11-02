@@ -207,12 +207,20 @@ function ConvertFrom-DsrCargoConfigString {
     return ConvertFrom-Json -InputObject $Value -ErrorAction Stop
 }
 
+function Test-DsrCargoNumericEnvironmentValue {
+    param([string]$Name, $Value)
+    if ($Value -isnot [string]) { return $false }
+    if ($Name -ceq 'CARGO_INCREMENTAL') { return [string]::Equals($Value,'0',[StringComparison]::Ordinal) }
+    return $Name -cin @('RUST_MIN_STACK','RUST_TEST_THREADS') -and $Value -cmatch '^[1-9][0-9]*\z'
+}
+
 function ConvertFrom-DsrCargoNumericEnvironment {
     param([string]$Name, [string]$Text)
-    # Only these numeric runtime settings are exempt from the compiler-input
-    # prohibition. Consume the whole inline table; never evaluate TOML values
+    # Only these bounded runtime settings are exempt from the compiler-input
+    # prohibition. Incremental compilation may only be disabled. Consume the
+    # whole inline table; never evaluate TOML values
     # or allow an unknown attribute to hide environment/path indirection.
-    if ($Name -cnotin @('RUST_MIN_STACK','RUST_TEST_THREADS')) { throw 'Unsupported Cargo configuration environment name' }
+    if ($Name -cnotin @('RUST_MIN_STACK','RUST_TEST_THREADS','CARGO_INCREMENTAL')) { throw 'Unsupported Cargo configuration environment name' }
     $value=$null; $force=$false
     if ($Text.StartsWith('{')) {
         if (-not $Text.EndsWith('}')) { throw 'Unfinished Cargo numeric environment table' }
@@ -235,7 +243,8 @@ function ConvertFrom-DsrCargoNumericEnvironment {
             }
         }
     } else { $value=ConvertFrom-DsrCargoConfigString $Text }
-    if ($value -isnot [string] -or $value -cnotmatch '^[1-9][0-9]*\z') {
+    if (-not (Test-DsrCargoNumericEnvironmentValue -Name $Name -Value $value)) {
+        if ($Name -ceq 'CARGO_INCREMENTAL') { throw 'Cargo CARGO_INCREMENTAL requires the string "0"' }
         throw 'Cargo numeric environment requires a positive-integer string'
     }
     return @{name=$Name; value=$value; force=$force}
@@ -380,6 +389,9 @@ function Assert-DsrCargoRustFlags {
     # Keep the existing Windows executable-selection boundary, then validate
     # actual argument boundaries as well as the final concatenated cfg argv.
     if (($Words -join ' ') -match '(?i)(linker|link-self-contained|codegen-backend|gcc-ld|sysroot|--target|@)') {
+        if (($Words -join ' ') -cmatch '(?:^|\s)(?:-C(?:\s+|=)?|--codegen(?:\s+|=))linker(?:=|\s|$)') {
+            throw 'Rustflags can change executable selection; move the linker option to [target.<triple>] linker'
+        }
         throw 'Rustflags can change executable selection; configure an explicit Cargo target linker and compiler'
     }
     for ($index=0; $index -lt $Words.Count; $index++) {
@@ -400,6 +412,7 @@ function Assert-DsrCargoRustFlags {
             if ($null -ne $option) {
                 $key=([regex]::Split($option.Trim().TrimStart('='),'[=\s]'))[0]
                 if ($key.Replace('_','-') -ceq $selector.Forbidden) {
+                    if ($selector.Forbidden -ceq 'linker') { throw 'Rustflags compiler/linker overrides require explicit attested configuration; move the linker option to [target.<triple>] linker' }
                     throw 'Rustflags compiler/linker overrides require explicit attested configuration'
                 }
             }
@@ -573,7 +586,7 @@ function Get-DsrCargoToolConfiguration {
                 net { @('offline','retry','git-fetch-with-cli') }
                 term { @('color','verbose','quiet') }
                 registry { @('default') }
-                env { @('RUST_MIN_STACK','RUST_TEST_THREADS') }
+                env { @('RUST_MIN_STACK','RUST_TEST_THREADS','CARGO_INCREMENTAL') }
             }
             if ($key -cnotin $allowed) { throw ('Unsupported Cargo configuration selector: ' + $section + '.' + $key) }
             if ($section -ceq 'env') {
@@ -892,9 +905,17 @@ function Get-DsrCargoToolchainIdentity {
     foreach ($name in $Context.Environment.Keys) { $effective[$name]=$Context.Environment[$name] }
     foreach ($name in $config.env.Keys) {
         $row=$config.env[$name]
+        # Cargo reads this control before applying [env] to child processes.
+        # A forced child value of zero cannot neutralize an incoming one.
+        if ($name -ceq 'CARGO_INCREMENTAL' -and $effective.ContainsKey($name) -and
+            -not (Test-DsrCargoNumericEnvironmentValue -Name $name -Value $effective[$name])) {
+            throw 'Effective Cargo numeric environment is invalid: CARGO_INCREMENTAL; [env] force cannot disable an incoming incremental setting'
+        }
         $inherited=$effective.ContainsKey($name) -and -not $row.force
         $value=if ($inherited) { $effective[$name] } else { $row.value }
-        if ($value -cnotmatch '^[1-9][0-9]*\z') { throw ('Effective Cargo numeric environment is invalid: ' + $name) }
+        if (-not (Test-DsrCargoNumericEnvironmentValue -Name $name -Value $value)) {
+            throw ('Effective Cargo numeric environment is invalid: ' + $name)
+        }
         $row.effective_value=$value; $row.effective_force=$row.force
         $row.effective_source=if ($inherited) { 'environment' } else { 'configuration' }
         # Cargo applies [env] to its children. Probe those children with the
