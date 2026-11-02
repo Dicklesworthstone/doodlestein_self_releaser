@@ -157,6 +157,10 @@ _rf_build_set_execute() {
     [[ -n "$metadata" ]] || forwarded+=(--output-dir "$bundle/metadata")
     [[ -n "$state" ]] || forwarded+=(--state-dir "$bundle/finalization")
     work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-build-set-finalize.XXXXXXXX") || return 1
+    # This directory is ours, unlike caller-selected inputs. Canonicalize it
+    # before passing it to strict consumers: macOS TMPDIR has a trailing slash
+    # and /var is a symlink to /private/var.
+    work=$(cd "$work" && pwd -P) || return 1
     printf -v cleanup 'rm -rf -- %q' "$work"
     # shellcheck disable=SC2064
     trap "$cleanup" EXIT
