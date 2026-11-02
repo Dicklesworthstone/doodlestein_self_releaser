@@ -4,6 +4,8 @@
 # archive substitute. Host-slot reservation is outside this local fixture.
 # --seven-target-release selects the exact issue #47 matrix.
 # --validate-targets-only checks early rejection and structured errors only.
+# --diagnostic-only builds one locked Rust binary through the real strict
+# scheduler and collector, then checks purpose, nonpublication and byte refusal.
 # --manifest-provenance-only compiles that matrix directly, then exercises the
 # real collector/packager/manifest/provenance APIs without running the scheduler
 # or changing its host-health admission. It is narrower evidence, not a full
@@ -14,6 +16,7 @@ EXPECT_INVENTORY_GAP=false
 GO_ENVIRONMENT_ONLY=false
 MANIFEST_PROVENANCE_ONLY=false
 VALIDATE_TARGETS_ONLY=false
+DIAGNOSTIC_ONLY=false
 TARGETS_JSON='["linux/amd64","linux/arm64","linux/armv7","darwin/amd64","darwin/arm64","windows/amd64","windows/arm64","windows/386","freebsd/amd64"]'
 case "${1:-}" in
     --expect-inventory-gap) EXPECT_INVENTORY_GAP=true ;;
@@ -22,12 +25,15 @@ case "${1:-}" in
     --seven-target-release) TARGETS_JSON='["linux/amd64","linux/arm64","linux/armv7","darwin/amd64","darwin/arm64","windows/amd64","freebsd/amd64"]' ;;
     --manifest-provenance-only) MANIFEST_PROVENANCE_ONLY=true; TARGETS_JSON='["linux/amd64","linux/arm64","linux/armv7","darwin/amd64","darwin/arm64","windows/amd64","freebsd/amd64"]' ;;
     --validate-targets-only) VALIDATE_TARGETS_ONLY=true ;;
+    --diagnostic-only) DIAGNOSTIC_ONLY=true ;;
     --go-targets-only) TARGETS_JSON='["linux/amd64","linux/arm64"]' ;;
     --go-environment-only) GO_ENVIRONMENT_ONLY=true; TARGETS_JSON='["linux/amd64","linux/arm64"]' ;;
     '') ;;
     *) printf 'Unknown test option: %s\n' "$1" >&2; exit 4 ;;
 esac
-for dependency in bash go git jq yq python3 tar gzip zip unzip minisign; do
+dependencies=(bash git jq yq python3 tar gzip zip unzip minisign)
+if $DIAGNOSTIC_ONLY; then dependencies+=(cargo); else dependencies+=(go); fi
+for dependency in "${dependencies[@]}"; do
     command -v "$dependency" >/dev/null 2>&1 || {
         printf 'Missing native artifact integration dependency: %s\n' "$dependency" >&2; exit 3;
     }
@@ -48,6 +54,9 @@ case "$(uname -s)/$(uname -m)" in
     Darwin/arm64) HOST_PLATFORM=darwin/arm64 ;;
     *) printf 'Unsupported execution host\n' >&2; exit 3 ;;
 esac
+if $DIAGNOSTIC_ONLY; then
+    TARGETS_JSON=$(jq -nc --arg host "$HOST_PLATFORM" '[$host]') || exit 1
+fi
 if ! $GO_ENVIRONMENT_ONLY && ! jq -e --arg host "$HOST_PLATFORM" 'index($host) != null' <<< "$TARGETS_JSON" >/dev/null; then
     printf 'The selected fixture targets must include the execution host\n' >&2; exit 3
 fi
@@ -75,6 +84,16 @@ go build -trimpath -o "$binary" .
 BUILD
 printf 'Fixture license: redistribution permitted.\n' > "$WORK/source/LICENSE"
 printf '/nativeartifacts\n/nativeartifacts.exe\n' > "$WORK/source/.gitignore"
+fixture_language=go
+fixture_build_command='bash build.sh'
+if $DIAGNOSTIC_ONLY; then
+    fixture_language=rust
+    fixture_build_command='cargo build --release --locked'
+    mkdir -p "$WORK/source/src" || exit 1
+    printf '[package]\nname="nativeartifacts"\nversion="1.2.3"\nedition="2021"\n' > "$WORK/source/Cargo.toml"
+    printf 'version = 4\n[[package]]\nname = "nativeartifacts"\nversion = "1.2.3"\n' > "$WORK/source/Cargo.lock"
+    printf 'fn main() { println!("native diagnostic fixture"); }\n' > "$WORK/source/src/main.rs"
+fi
 git -C "$WORK/source" init -q -b main || exit 1
 git -C "$WORK/source" add . || exit 1
 git -C "$WORK/source" -c user.name=Fixture -c user.email=fixture@example.invalid \
@@ -105,9 +124,9 @@ cat > "$ACT_REPOS_DIR/nativeartifacts.yaml" <<YAML
 tool_name: nativeartifacts
 repo: example/nativeartifacts
 local_path: $WORK/source
-language: go
+language: $fixture_language
 binary_name: nativeartifacts
-build_cmd: bash build.sh
+build_cmd: $fixture_build_command
 targets: $TARGETS_JSON
 act_job_map:
   linux/amd64: null
@@ -139,6 +158,17 @@ env:
   DSR_TEST_EVENTS: "$WORK/build-events"
   DSR_TEST_FAIL: "$WORK/fail-target"
 YAML
+if $DIAGNOSTIC_ONLY; then
+    cat >> "$ACT_REPOS_DIR/nativeartifacts.yaml" <<YAML
+linux_glibc_floor: native
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    $HOST_PLATFORM: nativeartifacts-diagnostic.tar.gz
+YAML
+    # Confined to this DSR native compiler context, never global configuration.
+    yq -i '.env.RCH_SHIM_LOCAL_IDE = "1"' "$ACT_REPOS_DIR/nativeartifacts.yaml" || exit 1
+fi
 : > "$WORK/build-events"
 # Same definition-loading boundary as test_native_variants.sh. This preserves
 # every line of the real build command and the real native scheduler; it avoids
@@ -147,8 +177,6 @@ for module in logging config build_state act_runner artifact_naming git_ops pack
     # shellcheck disable=SC1090
     source "$ROOT/src/$module.sh" || exit 1
 done
-# Initialize this shell too: the native orchestrator initializes its subshell.
-build_state_init || exit 1
 export SCRIPT_DIR="$ROOT"
 declare -A _DSR_LOADED_MODULES=([packaging]=1 [artifact_naming]=1)
 # shellcheck disable=SC1090
@@ -159,6 +187,67 @@ export JSON_MODE=true DRY_RUN=false VERBOSE=false DSR_VERSION=fixture
 # The requested target must override both the host default and selectors from
 # the caller. The recipe intentionally has no GOOS/GOARCH or cross_compile map.
 export GOOS=plan9 GOARCH=386 GOARM=5
+if $DIAGNOSTIC_ONLY; then
+    diagnostic_status=0
+    cmd_build nativeartifacts --version 1.2.3 --diagnostic-native \
+        --target "$HOST_PLATFORM" --jobs 1 > "$WORK/diagnostic.json" \
+        2> "$WORK/diagnostic.stderr" || diagnostic_status=$?
+    if [[ "$diagnostic_status" -ne 0 ]] || ! jq -e '
+        .exit_code == 0 and .details.build_purpose == "diagnostic-native" and
+        .details.publishable == false and .details.total == 1 and
+        .details.success == 1 and .details.failed == 0 and
+        (.details.manifest_path | type == "string" and length > 0)
+    ' "$WORK/diagnostic.json" >/dev/null; then
+        cat "$WORK/diagnostic.stderr" >&2
+        printf 'FAIL: actual diagnostic compilation/collection/publication boundary (exit %s)\n' "$diagnostic_status" >&2
+        exit 1
+    fi
+    diagnostic_run=$(jq -er '.details.run_id' "$WORK/diagnostic.json") || exit 1
+    # cmd_build keeps its build-state root local to that invocation. Initialize
+    # the fixture caller before using the public workspace lookup afterward.
+    build_state_init || exit 1
+    diagnostic_workspace=$(build_state_workspace nativeartifacts 1.2.3 "$diagnostic_run") || exit 1
+    diagnostic_target=$(jq -ce '.target_statuses[] | .result' "$diagnostic_workspace/state.json") || exit 1
+    _act_target_result_available "$diagnostic_target" diagnostic-native true || exit 1
+    if _act_target_result_available "$diagnostic_target" release true ||
+       _act_target_result_available "$diagnostic_target"; then
+        printf 'FAIL: diagnostic artifacts crossed the release-purpose boundary\n' >&2
+        exit 1
+    fi
+    diagnostic_manifest=$(jq -er '.details.manifest_path' "$WORK/diagnostic.json") || exit 1
+    jq -e '.build_purpose == "diagnostic-native" and .publishable == false and
+        all(.artifacts[]; .build_purpose == "diagnostic-native" and .publishable == false)' \
+        "$diagnostic_manifest" >/dev/null || exit 1
+    diagnostic_archive=$(jq -er '.resume_artifacts[0].path' <<< "$diagnostic_target") || exit 1
+    # Identical bytes at a replacement inode must not inherit the completed
+    # target's authority. Retain both files; restore the original before the
+    # independent changed-byte probe below.
+    diagnostic_original="$WORK/diagnostic-original-archive"
+    diagnostic_replacement="$WORK/diagnostic-replacement-archive"
+    [[ ! -e "$diagnostic_original" && ! -e "$diagnostic_replacement" ]] || exit 1
+    mv "$diagnostic_archive" "$diagnostic_original" || exit 1
+    cp -p "$diagnostic_original" "$diagnostic_archive" || exit 1
+    [[ "$(_act_sha256 "$diagnostic_archive")" == "$(_act_sha256 "$diagnostic_original")" &&
+       "$(_act_file_identity "$diagnostic_archive")" != "$(_act_file_identity "$diagnostic_original")" ]] || exit 1
+    diagnostic_replaced_receipts=$(_act_result_artifact_receipts "$diagnostic_target") || exit 1
+    jq -e --argjson expected "$(jq -ce '.resume_artifacts | sort_by(.path)' <<< "$diagnostic_target")" '
+        (map(del(.identity)) == ($expected | map(del(.identity)))) and . != $expected
+    ' <<< "$diagnostic_replaced_receipts" >/dev/null || exit 1
+    if _act_target_result_available "$diagnostic_target" diagnostic-native true; then
+        printf 'FAIL: same-purpose diagnostic accepted a replacement archive inode\n' >&2
+        exit 1
+    fi
+    mv "$diagnostic_archive" "$diagnostic_replacement" || exit 1
+    mv "$diagnostic_original" "$diagnostic_archive" || exit 1
+    _act_target_result_available "$diagnostic_target" diagnostic-native true || exit 1
+    printf '\nfixture corruption\n' >> "$diagnostic_archive" || exit 1
+    if _act_target_result_available "$diagnostic_target" diagnostic-native true; then
+        printf 'FAIL: same-purpose diagnostic accepted changed archive bytes\n' >&2
+        exit 1
+    fi
+    printf 'PASS: actual diagnostic build collects only its own purpose, stays nonpublishable and rejects replaced inodes and changed bytes\n'
+    exit 0
+fi
 if $GO_ENVIRONMENT_ONLY; then
     # Exercise the actual resolver and compiler without starting a native worker.
     # This focused mode is also usable when host disk admission prevents the full
@@ -355,6 +444,8 @@ else
         printf 'FAIL: native build command exited %s\n' "$STATUS" >&2
         exit 1
     fi
+    # cmd_build scopes its state root; initialize the standalone reader too.
+    build_state_init || exit 1
     build_state_get nativeartifacts 1.2.3 > "$WORK/checkpoint.json" || exit 1
 fi
 mkdir -p "$WORK/provenance" || exit 1

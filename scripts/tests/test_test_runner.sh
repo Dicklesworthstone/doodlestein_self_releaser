@@ -88,6 +88,57 @@ if shutil.which("bats"):
 else:
     print("NOTE: Bats execution unavailable; discovery was checked, runtime not qualified", flush=True)
 
+# The oldest test waits for the third test. With two slots, the third must
+# start when the second finishes, rather than waiting for the oldest PID.
+# Record actual overlap under a file lock so a fix cannot simply exceed two.
+actor = work / "slot-actor.py"
+actor.write_text('''import fcntl, json, pathlib, sys, time
+root, name = pathlib.Path(sys.argv[1]), sys.argv[2]
+state = root / "slot-state.json"
+def change(delta):
+    with state.open("a+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.seek(0)
+        data = json.loads(f.read() or '{"active":0,"peak":0,"started":0}')
+        data["active"] += delta
+        data["peak"] = max(data["peak"], data["active"])
+        data["started"] += int(delta > 0)
+        f.seek(0)
+        f.truncate()
+        json.dump(data, f)
+change(1)
+try:
+    if name == "first":
+        (root / "slot-first-started").touch()
+        deadline = time.monotonic() + 5
+        while not (root / "slot-third-started").exists():
+            if time.monotonic() >= deadline:
+                raise SystemExit(27)
+            time.sleep(0.02)
+    elif name == "second":
+        time.sleep(0.2)
+    else:
+        deadline = time.monotonic() + 5
+        while not (root / "slot-first-started").exists():
+            if time.monotonic() >= deadline:
+                raise SystemExit(28)
+            time.sleep(0.02)
+        (root / "slot-third-started").touch()
+finally:
+    change(-1)
+''')
+import shlex
+for index, name in enumerate(("first", "second", "third")):
+    (tests / ("test_slot_%d.sh" % index)).write_text(
+        '#!/usr/bin/env bash\nexec ' + shlex.join([sys.executable, str(actor), str(work), name]) + '\n')
+result = run("slot-reuse", ["--shell-only", "--filter", "test_slot_*", "--parallel", "2"], 0)
+summary = json.loads(result.stdout)
+slot_state = json.loads((work / "slot-state.json").read_text())
+check("finished slot is reused while the oldest test is still running",
+      summary["tests_run"] == 3 and summary["tests_passed"] == 3)
+check("slot reuse keeps the configured concurrency and reaps every test",
+      slot_state == {"active": 0, "peak": 2, "started": 3})
+
 # Both processes execute the same file in the same checkout. Synchronization
 # makes the second writer replace the first writer's daily log on the old
 # runner before either process classifies its output.

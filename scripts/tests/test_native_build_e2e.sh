@@ -14,6 +14,8 @@
 #   DSR_E2E_VERBOSE   - Enable detailed logging
 #   DSR_E2E_TIMEOUT   - Build timeout in seconds (default 300)
 #   DSR_E2E_KEEP_ARTIFACTS - Don't clean up after tests
+#   DSR_E2E_DARWIN_SSH_HOST - SSH host for the real Darwin build (default mmini)
+#   DSR_E2E_HOSTS_FILE - Private hosts configuration for this live E2E test only
 #   DEBUG             - Keep temp directories for debugging
 
 set -uo pipefail
@@ -22,6 +24,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DSR_CMD="$PROJECT_ROOT/dsr"
 FIXTURES_DIR="$SCRIPT_DIR/fixtures"
+DARWIN_SSH_HOST="${DSR_E2E_DARWIN_SSH_HOST:-mmini}"
+# Do not export DSR_HOSTS_FILE for the entire suite: fixture-based tests need
+# their own hosts.yaml. Promote this opt-in only inside the live E2E process;
+# normal DSR host validation and admission still apply to the selected file.
+if [[ -n "${DSR_E2E_HOSTS_FILE:-}" ]]; then
+    export DSR_HOSTS_FILE="$DSR_E2E_HOSTS_FILE"
+fi
+if [[ ! "$DARWIN_SSH_HOST" =~ ^([[:alnum:]_.-]+@)?[[:alnum:]][[:alnum:]._-]*$ ]]; then
+    printf 'Invalid Darwin SSH host: expected an SSH alias or user@hostname\n' >&2
+    exit 2
+fi
 
 # Source the test harness
 # shellcheck source=tests/helpers/test_harness.bash
@@ -83,7 +96,15 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: stable
-      - run: go build -o mock_go_tool .
+      - run: |
+          go build -p 2 -o mock_go_tool .
+          test "$(./mock_go_tool)" = "mock_go_tool v0.1.0"
+          tar -czf mock_go_tool-linux-amd64.tar.gz mock_go_tool
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mock_go_tool-linux-amd64
+          path: mock_go_tool-linux-amd64.tar.gz
+          if-no-files-found: error
 YAML
 
     # Initialize git
@@ -103,7 +124,7 @@ create_tool_config() {
     if [[ -z "$build_cmd" ]]; then
         case "$language" in
             rust) build_cmd="cargo build --release" ;;
-            go)   build_cmd="go build -o $binary_name ." ;;
+            go)   build_cmd="go build -p 2 -o $binary_name ." ;;
             *)    build_cmd="echo build" ;;
         esac
     fi
@@ -134,6 +155,33 @@ YAML
 
 setup_test_environment() {
     harness_setup
+    # Native admission consumes hosts.yaml even when SSH itself is reachable.
+    # Use the harness's real host definitions rather than an incomplete config.
+    harness_create_config
+
+    # This suite builds Go on each live host. Declaring the capability makes
+    # admission probe the real toolchain; an empty capability list cannot
+    # satisfy the native build's --require go contract.
+    cat > "$DSR_CONFIG_DIR/hosts.yaml" << YAML
+hosts:
+  trj:
+    platform: linux/amd64
+    connection: local
+    capabilities:
+      - go
+  mmini:
+    platform: darwin/arm64
+    connection: ssh
+    ssh_host: "$DARWIN_SSH_HOST"
+    capabilities:
+      - go
+  wlap:
+    platform: windows/amd64
+    connection: ssh
+    ssh_host: wlap
+    capabilities:
+      - go
+YAML
 
     # Create main config in DSR_CONFIG_DIR (not XDG)
     mkdir -p "$DSR_CONFIG_DIR"
@@ -577,18 +625,35 @@ test_only_native_flag() {
     tool_dir=$(setup_mock_rust_tool)
     create_tool_config "mock_rust_tool" "$tool_dir" "rust" "mock_rust_tool"
 
+    # Preview routing must not depend on live workers or mutate their health
+    # state. Keep the real configuration and detect any attempted SSH probe.
+    local original_path="$PATH"
+    local probe_bin="$TEST_TMPDIR/preview-bin"
+    export DSR_PREVIEW_SSH_MARKER="$TEST_TMPDIR/preview-ssh-attempted"
+    mkdir -p "$probe_bin"
+    cat > "$probe_bin/ssh" <<'SH'
+#!/usr/bin/env bash
+printf 'unexpected preview SSH probe\n' >> "$DSR_PREVIEW_SSH_MARKER"
+exit 1
+SH
+    chmod +x "$probe_bin/ssh"
+    export PATH="$probe_bin:$PATH"
+
     local output exit_code=0
     output=$(timeout 30 "$DSR_CMD" build mock_rust_tool --only-native --dry-run 2>&1) || exit_code=$?
 
     # Should only have native targets (darwin/windows), not linux
     if [[ "$exit_code" -eq 0 ]] && \
        [[ "$output" == *"Filtered to native targets"* ]] && \
-       [[ "$output" == *"[dry-run] Would execute build"* ]]; then
+       [[ "$output" == *"[dry-run] Would execute build"* ]] && \
+       [[ ! -e "$DSR_PREVIEW_SSH_MARKER" ]]; then
         log_pass "--only-native filters to native targets (exit: $exit_code)"
     else
         log_fail "--only-native dry-run plan failed (exit: $exit_code, output: $output)"
     fi
 
+    PATH="$original_path"
+    unset DSR_PREVIEW_SSH_MARKER
     cleanup_test_environment
 }
 
@@ -856,13 +921,13 @@ test_live_build_darwin_native() {
     fi
 
     # Check SSH access to mmini
-    if ! timeout 5 ssh -o BatchMode=yes -o ConnectTimeout=3 mmini 'echo ok' &>/dev/null; then
+    if ! timeout 5 ssh -o BatchMode=yes -o ConnectTimeout=3 "$DARWIN_SSH_HOST" 'echo ok' &>/dev/null; then
         log_skip "Skipped (SSH to mmini unavailable)"
         return
     fi
 
     # Check Go toolchain on mmini
-    if ! timeout 5 ssh -o BatchMode=yes -o ConnectTimeout=3 mmini 'command -v go' &>/dev/null; then
+    if ! timeout 5 ssh -o BatchMode=yes -o ConnectTimeout=3 "$DARWIN_SSH_HOST" 'command -v go' &>/dev/null; then
         log_skip "Skipped (Go not available on mmini)"
         return
     fi
@@ -907,11 +972,15 @@ test_live_build_windows_native() {
     _scp_test=$(mktemp)
     echo "test" > "$_scp_test"
     if ! timeout 10 scp -o BatchMode=yes -o ConnectTimeout=3 "$_scp_test" wlap:/tmp/dsr_scp_test &>/dev/null; then
-        rm -f "$_scp_test"
+        if [[ -z "${DSR_E2E_KEEP_ARTIFACTS:-}" ]]; then
+            rm -f "$_scp_test"
+        fi
         log_skip "Skipped (SCP to wlap unavailable)"
         return
     fi
-    rm -f "$_scp_test"
+    if [[ -z "${DSR_E2E_KEEP_ARTIFACTS:-}" ]]; then
+        rm -f "$_scp_test"
+    fi
     # Note: remote /tmp/dsr_scp_test left for OS cleanup (cross-platform rm is complex)
 
     setup_test_environment
@@ -926,8 +995,11 @@ test_live_build_windows_native() {
         timeout 60 "$DSR_CMD" build mock_go_tool --target windows/amd64 --sync-only 2>&1) || \
         sync_preflight_exit=$?
     if [[ "$sync_preflight_exit" -ne 0 ]] || [[ "$sync_preflight_output" == *"Source sync failed"* ]]; then
+        printf '%s\n' "$sync_preflight_output"
         cleanup_test_environment
-        log_skip "Skipped (source sync to wlap unavailable)"
+        # SSH and SCP succeeded above. A pipeline failure on an available
+        # host is a failed live test, not an unavailable-host skip.
+        log_fail "Windows source sync failed with exit code: $sync_preflight_exit"
         return
     fi
 

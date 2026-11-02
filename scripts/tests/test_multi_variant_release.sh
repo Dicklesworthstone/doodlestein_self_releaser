@@ -55,9 +55,14 @@ source "$ROOT/src/build_state.sh"
 source "$ROOT/src/git_ops.sh"
 # shellcheck source=../../src/github.sh
 source "$ROOT/src/github.sh"
+# shellcheck source=../../src/signing.sh
+source "$ROOT/src/signing.sh"
 # Load the complete production command functions without dispatching the CLI.
 # shellcheck disable=SC1090
-source <(awk '/^(cmd_build|cmd_release|_release_file_size|_release_sha256|_release_require_publishable_artifacts|_dispatch_load_config|_dispatch_is_true)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$COMMAND_FILE") || exit 1
+source <(awk '/^(cmd_build|cmd_release|_release_file_size|_release_sha256|_release_require_publishable_artifacts|_release_sbom_policy|_release_contract_create_nonce|_source_release_read_private_receipt|_dispatch_load_config|_dispatch_is_true|_dispatch_join_lines)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$COMMAND_FILE") || exit 1
+# Ordinary releases validate and retain their checksum inventory in a subshell.
+# shellcheck disable=SC1090
+source <(awk '/^_release_prepare_ordinary_checksums\(\) \(/{copy=1} copy{print} copy && /^\)/{copy=0}' "$COMMAND_FILE") || exit 1
 # The envelope contains a JSON heredoc whose closing brace is not a shell
 # function boundary; its following section divider marks the end instead.
 # shellcheck disable=SC1090
@@ -204,23 +209,53 @@ act_orchestrate_build() {
 gh_check() { return 0; }
 gh_check_token() { return 0; }
 _gh_resolve_token() { printf 'fixture-token\n'; }
-gh_create_release() {
+gh_create_release() (
     printf 'CREATE %s\n' "$*" >> "$CALLS"
     $REMOTE_ENABLED || return 8
     [[ "$1" == example/variantdemo && "$2" == v1.2.3 ]] || return 4
-    cat "$WORK/release.json"
-}
+    # Keep production POST construction and private response retention. Only
+    # the GitHub network transport is replaced by this offline fixture.
+    source "$ROOT/src/github.sh"
+    gh_check() { return 0; }
+    _gh_api_with_gh() {
+        [[ "$1" == repos/example/variantdemo/releases && "$2" == POST ]] || return 8
+        jq --argjson request "$3" '. + $request | .assets=[]' \
+            "$WORK/release.json" > "$WORK/release.next" || return 8
+        mv "$WORK/release.next" "$WORK/release.json" || return 8
+        cat "$WORK/release.json"
+    }
+    gh_create_release "$@"
+)
 gh_api() {
     printf 'API %s\n' "$*" >> "$CALLS"
     $REMOTE_ENABLED || return 8
-    case "$1" in
+    local endpoint="$1" method=GET data=""
+    shift
+    while (($#)); do
+        case "$1" in
+            --method) method="$2"; shift 2 ;;
+            --data) data="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    if [[ "$method" == PATCH ]]; then
+        [[ "$endpoint" == repos/example/variantdemo/releases/9 ]] || return 8
+        [[ "$data" == '{"draft":false}' || "$data" == '{"draft":true}' ]] || return 8
+        jq --argjson patch "$data" '. + $patch' "$WORK/release.json" > "$WORK/release.next" || return 8
+        mv "$WORK/release.next" "$WORK/release.json" || return 8
+    elif [[ "$method" != GET ]]; then
+        return 8
+    fi
+    case "$endpoint" in
+        repos/example/variantdemo/git/ref/tags/v1.2.3)
+            jq -nc --arg sha "$SOURCE_SHA" '{object:{type:"commit",sha:$sha}}'
+            ;;
         repos/example/variantdemo/releases/9/assets\?per_page=100\&page=*)
-            local page="${1##*page=}"
+            local page="${endpoint##*page=}"
             [[ "$page" =~ ^[1-9][0-9]*$ ]] || return 4
             jq --argjson page "$page" '.[(($page-1)*100):($page*100)]' "$WORK/inventory.json"
             ;;
         repos/example/variantdemo/releases/9|repos/example/variantdemo/releases/tags/v1.2.3)
-            [[ " $* " != *' --method '* ]] || return 8
             jq --slurpfile assets "$WORK/inventory.json" '.assets=$assets[0]' "$WORK/release.json"
             ;;
         *) return 8 ;;
@@ -389,12 +424,24 @@ run_refusal 'different bytes cannot occupy another variant upload alias' \
 
 DSR_SHARED_COMPAT='${name}-${os}-${arch}' yq '.install_script_compat=strenv(DSR_SHARED_COMPAT)' \
     "$WORK/reviewed-config.yaml" > "$WORK/config/repos.d/variantdemo.yaml" || exit 1
+# Packaging, not publication, must put compatibility aliases in the inventory.
+# Build a separate inventory under this naming policy and retain the original.
+SHARED_OUTPUT="$WORK/shared-output"
+ORIGINAL_RUN="$RUN"
+RUN=44444444-4444-4444-8444-444444444444
+DRY_RUN=false
+run_code 'shared compatibility aliases are packaged into a fresh inventory' 0 "$WORK/shared-build" \
+    cmd_build variantdemo --version 1.2.3 --no-sync --output-dir "$SHARED_OUTPUT"
+RUN="$ORIGINAL_RUN"
+SHARED_MANIFEST="$SHARED_OUTPUT/variantdemo-v1.2.3-manifest.json"
+[[ -f "$SHARED_MANIFEST" ]] || exit 1
+SHARED_BEFORE=$(snapshot "$SHARED_OUTPUT") || exit 1
 DRY_RUN=true
 : > "$CALLS"
 run_code 'a shared compatibility name belongs to the configured primary variant' 0 "$WORK/shared-compat-plan" \
-    cmd_release variantdemo 1.2.3 --artifacts "$OUTPUT"
+    cmd_release variantdemo 1.2.3 --artifacts "$SHARED_OUTPUT"
 check 'shared compatibility planning never reaches GitHub' test ! -s "$CALLS"
-check 'shared compatibility planning preserves artifact evidence' test "$BEFORE" = "$(snapshot "$OUTPUT")"
+check 'shared compatibility planning preserves artifact evidence' test "$SHARED_BEFORE" = "$(snapshot "$SHARED_OUTPUT")"
 check 'GNU owns shared compatibility names and musl retains its own names' jq -e \
     --arg gnu "$GNU_TRIPLE" --arg musl "$MUSL_TRIPLE" \
     --arg shared "variantdemo-${PLATFORM//\//-}.tar.gz" '
@@ -406,8 +453,8 @@ check 'GNU owns shared compatibility names and musl retains its own names' jq -e
     ([$a[]|.sha256 as $sha|.upload_names[]|{name:.,sha:$sha}] |
         group_by(.name)|all(.[]; (map(.sha)|unique|length)==1))' "$WORK/shared-compat-plan.json"
 mkdir "$WORK/reversed-manifest" || exit 1
-cp -p "$OUTPUT/"* "$WORK/reversed-manifest/" || exit 1
-jq '.artifacts|=reverse' "$MANIFEST" > "$WORK/reversed-manifest/variantdemo-v1.2.3-manifest.json" || exit 1
+cp -p "$SHARED_OUTPUT/"* "$WORK/reversed-manifest/" || exit 1
+jq '.artifacts|=reverse' "$SHARED_MANIFEST" > "$WORK/reversed-manifest/variantdemo-v1.2.3-manifest.json" || exit 1
 run_code 'manifest ordering cannot reassign shared compatibility ownership' 0 "$WORK/reversed-plan" \
     cmd_release variantdemo 1.2.3 --artifacts "$WORK/reversed-manifest"
 check 'shared names keep the same digest after manifest reversal' jq -e \

@@ -287,9 +287,26 @@ test_stream_separation_doctor() {
     status=$(exec_status)
     local stderr_output
     stderr_output=$(exec_stderr)
+    local output
+    output=$(exec_stdout)
 
-    # On success, stderr should be empty
-    if [[ "$status" -eq 0 ]]; then
+    # A degraded diagnosis must be explicit, never reported as healthy success.
+    if [[ "$status" -eq 0 ]] && jq -e '.status == "partial"' <<< "$output" >/dev/null 2>&1; then
+        if jq -e '.exit_code == 0 and .details.overall_status == "degraded" and
+            .details.errors == 0 and .details.warnings > 0' <<< "$output" >/dev/null &&
+            [[ "$stderr_output" == *'[WARN]'* ]] && [[ "$stderr_output" != *'[ERROR]'* ]]; then
+            pass "doctor reports degraded warnings as partial, without hiding diagnostics"
+        else
+            fail "doctor partial status must match its warning-only diagnosis"
+        fi
+    elif [[ "$status" -eq 0 ]]; then
+        if ! jq -e '.status == "success" and .exit_code == 0 and
+            .details.overall_status == "healthy" and .details.errors == 0 and
+            .details.warnings == 0' <<< "$output" >/dev/null; then
+            fail "doctor success must represent a healthy diagnosis"
+            harness_teardown
+            return
+        fi
         if [[ -z "$stderr_output" || "$stderr_output" =~ ^[[:space:]]*$ ]]; then
             pass "doctor --json has empty stderr on success"
         else
@@ -302,7 +319,12 @@ test_stream_separation_doctor() {
             fi
         fi
     else
-        pass "doctor exited non-zero (stderr allowed)"
+        if jq -e --argjson code "$status" '.status == "error" and .exit_code == $code and
+            .details.overall_status == "unhealthy" and .details.errors > 0' <<< "$output" >/dev/null; then
+            pass "doctor non-zero exit matches an explicit unhealthy diagnosis"
+        else
+            fail "doctor non-zero exit must match its error envelope"
+        fi
     fi
 
     harness_teardown
