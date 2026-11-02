@@ -791,6 +791,25 @@ The native worker still enforces the requested target's output and architecture.
 Retained failed result/log files must agree with the old host and frozen source;
 completed artifacts and result files must still verify. Replacement staging and
 its pinned dependency closure are verified before an atomic state transition.
+
+New strict native worker receipts carry `scheduled_source` with the original
+`run_id`, `git_sha`, `git_ref`, assigned `host`, and snapshot `root`. Relocation
+requires this exact object to match the retained run context. The assignment records
+which frozen source the worker was given; it does not assert that source admission
+or compilation ran. A host-capacity or host-readiness refusal, or a failed Go
+backend, can therefore retain its truthful outcome and still move to an approved
+replacement host. When either Rust source identity field is recorded, both
+`DSR_RELEASE_GIT_SHA` and `DSR_RELEASE_GIT_REF` must match that assignment.
+Older receipts without `scheduled_source` still require both source identity fields.
+
+The retained worker receipt must report `failed`, `error`, or `timeout`, with an
+integer exit code from 1 through 255, excluding interruption and termination
+codes 130 and 143. Its target must be recorded as failed in run state. Its outcome
+must match the saved result after accounting for coordinator-added attempt and
+log/result path metadata. The coordinator annotations `execution_started`,
+`resume_reused`, and `retry_limit_exceeded` must be absent or `true`; other outcome
+fields must agree. Relocation preserves the original receipt and its refusal,
+failure, or timeout classification.
 The run records the prior context, replacement host platform, configuration
 delta, source archive/manifest hashes, and prior attempt hashes; the next worker
 uses the next attempt number.

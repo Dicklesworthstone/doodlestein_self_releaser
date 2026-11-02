@@ -73,9 +73,9 @@ jobs:
           set -euo pipefail
           if [[ "$RUNNER_OS" == Linux ]]; then
             sudo apt-get update
-            sudo apt-get install -y --no-install-recommends jq xz-utils golang-go minisign zip unzip msitools wixl
+            sudo apt-get install -y --no-install-recommends jq xz-utils golang-go minisign zip unzip msitools wixl rsync
           else
-            for tool in jq xz go minisign; do
+            for tool in jq xz go minisign rsync; do
               command -v "$tool" >/dev/null || brew install "$tool"
             done
             if ! command -v timeout >/dev/null && ! command -v gtimeout >/dev/null; then brew install coreutils; fi
@@ -147,6 +147,12 @@ jobs:
           bash scripts/tests/test_act_runner.sh --worker-admission-cancel-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/admission-cancellation.log"
           bash scripts/tests/test_act_orchestration.sh --dispatch-stdin-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/dispatch-stdin.log"
           bash scripts/tests/test_act_orchestration.sh --capacity-resume-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/capacity-resume.log"
+          test -z "$(git status --porcelain)"
+      - name: Recover refused and failed native targets on approved replacement hosts
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/tests/test_act_orchestration.sh --relocation-recovery-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/relocation-recovery.log"
           test -z "$(git status --porcelain)"
       - name: Validate native and workflow companion artifact admission
         shell: bash

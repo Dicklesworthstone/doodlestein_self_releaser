@@ -2064,6 +2064,433 @@ if [[ "${1:-}" == --capacity-resume-only ]]; then
     exit $?
 fi
 
+# Exercise reviewed relocation with receipts emitted by the real public build,
+# including successful sibling artifacts and failures before recipe execution.
+# Source snapshots, native Go compilation, collection, state and locks are real;
+# health/slot decisions are controlled local boundaries, not host qualification.
+test_relocation_recovery() {
+    local project_root dependency
+    project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" || return 1
+    for dependency in python3 git jq yq go rsync tar gzip; do
+        command -v "$dependency" >/dev/null || {
+            printf 'Missing relocation integration dependency: %s\n' "$dependency" >&2
+            return 77
+        }
+    done
+    python3 - "$project_root" <<'PY'
+from collections import Counter
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import subprocess
+import sys
+import tempfile
+
+project = Path(os.environ.get('DSR_TEST_RELOCATION_PROJECT', sys.argv[1]))
+root = Path(tempfile.mkdtemp(prefix='dsr-relocation-recovery-'))
+print('Retained relocation recovery evidence: ' + str(root), flush=True)
+systems = {'Linux': 'linux', 'Darwin': 'darwin'}
+architectures = {'x86_64': 'amd64', 'aarch64': 'arm64', 'arm64': 'arm64'}
+if platform.system() not in systems or platform.machine() not in architectures:
+    print('Relocation fixture requires Linux or macOS on AMD64 or ARM64', flush=True)
+    raise SystemExit(77)
+native = systems[platform.system()] + '/' + architectures[platform.machine()]
+failed = 'linux/arm64' if native != 'linux/arm64' else 'linux/amd64'
+checks = failures = 0
+
+
+def check(label, valid):
+    global checks, failures
+    checks += 1
+    failures += not valid
+    print(('PASS: ' if valid else 'FAIL: ') + label, flush=True)
+    return valid
+
+
+def read(path):
+    return json.loads(path.read_text())
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def save(path, value):
+    path.write_text(json.dumps(value) + '\n')
+
+
+def events(case):
+    path = case / 'recipe-events'
+    return path.read_text().splitlines() if path.exists() else []
+
+
+driver = root / 'driver.sh'
+driver.write_text(r'''#!/usr/bin/env bash
+set -uo pipefail
+for module in logging config build_state act_runner artifact_naming git_ops packaging sbom slsa; do
+    source "$RELOC_PROJECT/src/$module.sh" || exit 1
+done
+export SCRIPT_DIR="$RELOC_PROJECT" JSON_MODE=true DRY_RUN=false VERBOSE=false DSR_VERSION=fixture
+declare -A _DSR_LOADED_MODULES=([packaging]=1 [artifact_naming]=1 [sbom]=1)
+source <(awk '/^(_dsr_require|cmd_build)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$RELOC_PROJECT/dsr") || exit 1
+source <(awk '/^json_envelope\(\) \{/{copy=1} copy{print} copy && /^# ====/{exit}' "$RELOC_PROJECT/dsr") || exit 1
+host_health_is_ready() {
+    printf 'HEALTH %s\n' "$*" >> "$RELOC_CASE/boundaries"
+    # Source admission succeeds; this host becomes unavailable when its real
+    # native runner checks readiness immediately before preparing the recipe.
+    if [[ "$RELOC_MODE" == readiness && "$RELOC_PHASE" == first && "$1" == original &&
+          " ${FUNCNAME[*]} " == *' act_run_native_build '* ]]; then return 1; fi
+}
+selector_acquire_slot() {
+    printf 'SLOT %s\n' "$*" >> "$RELOC_CASE/boundaries"
+    if [[ "$RELOC_MODE" == capacity && "$RELOC_PHASE" == first && "$1" == original ]]; then return 2; fi
+}
+selector_release_slot() { :; }
+if [[ "$RELOC_MODE" == timeout && "$RELOC_PHASE" == first ]]; then
+    act_run_native_build() (
+        # Reload the real backend, then shorten only the deliberately sleeping
+        # target's timeout. The completed sibling retains the normal budget.
+        source "$RELOC_PROJECT/src/act_runner.sh" || exit 1
+        [[ "$2" != "$RELOC_FAILED_TARGET" ]] || _ACT_BUILD_TIMEOUT=1
+        act_run_native_build "$@"
+    )
+fi
+if [[ "$RELOC_PHASE" == compare ]]; then
+    _act_relocation_receipt_matches "$RELOC_CASE/large-worker.json" "$(cat "$RELOC_CASE/large-state.json")"
+    exit $?
+fi
+if [[ "$RELOC_PHASE" == spoof ]]; then
+    mkdir -p "$RELOC_CASE/spoof" || exit 1
+    : > "$RELOC_CASE/spoof/worker.log"
+    _act_build_orchestration_target() {
+        jq -nc '{status:"failed",exit_code:17,scheduled_source:{run_id:"spoof",git_sha:"spoof",
+            git_ref:"spoof",host:"spoof",root:"spoof"}}'
+        return 17
+    }
+    _act_run_target_worker relocfixture 1.0.0 "$RELOC_RUN" "$RELOC_FAILED_TARGET" 1 \
+        "$RELOC_CASE/spoof/worker.log" "$RELOC_CASE/spoof/worker.json" true '{}' \
+        "$RELOC_ROOTS" "$RELOC_SHA" v1.0.0 original release </dev/null
+    exit $?
+fi
+args=(--version 1.0.0 --jobs 2 --output-dir "$RELOC_CASE/output")
+if [[ "$RELOC_PHASE" != first ]]; then
+    args+=(--resume="$RELOC_RUN" --resume-target-host "$RELOC_REQUEST"
+           --resume-target-host-approval "$RELOC_CASE/approval.json")
+fi
+cmd_build relocfixture "${args[@]}"
+''')
+
+
+def fixture(name, mode, sequential=False):
+    case = root / name
+    for directory in ('config/repos.d', 'source', 'state', 'cache'):
+        (case / directory).mkdir(parents=True)
+    targets = [native, failed] + (['windows/amd64'] if sequential else [])
+    (case / 'source/go.mod').write_text('module example.invalid/relocfixture\n\ngo 1.20\n')
+    (case / 'source/main.go').write_text('package main\nimport "runtime"\nfunc main(){println(runtime.GOOS+"/"+runtime.GOARCH)}\n')
+    (case / 'source/build.sh').write_text(r'''#!/usr/bin/env bash
+set -uo pipefail
+target="$GOOS/$GOARCH"
+printf '%s\n' "$target" >> "$RELOC_EVENTS" || exit 1
+if grep -Fxq "$target" "$RELOC_FAILURES"; then
+    if [[ "$RELOC_RECIPE_MODE" == timeout ]]; then sleep 20; else exit 17; fi
+fi
+binary=relocfixture
+[[ "$GOOS" != windows ]] || binary+=.exe
+# Strict snapshots contain tracked source without a .git directory. This
+# fixture records runtime target identity, not automatic parent VCS metadata.
+go build -buildvcs=false -trimpath -o "$binary" .
+''')
+    for args in (['init', '-q', '-b', 'main'], ['add', '.'],
+                 ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                  '-c', 'commit.gpgsign=false', 'commit', '-qm', 'relocation fixture'], ['tag', 'v1.0.0']):
+        subprocess.run(['git', '-C', str(case / 'source')] + args, check=True)
+    sha = subprocess.check_output(['git', '-C', str(case / 'source'), 'rev-parse', 'HEAD'], text=True).strip()
+    (case / 'config/config.yaml').write_text('schema_version: "1.0.0"\n')
+    (case / 'config/repos.yaml').write_text('tools: {}\n')
+    save(case / 'config/hosts.yaml', dict(schema_version='1.0.0', hosts={
+        host: dict(platform=native, connection='local', concurrency=2, build_root=str(case / host))
+        for host in ('completed', 'original', 'replacement', 'second')},
+        platform_mapping={target: 'completed' if target == native else 'original' for target in targets}))
+    names = {target: 'relocfixture-' + target.replace('/', '-') + ('.exe' if target.startswith('windows/') else '')
+             for target in targets}
+    config = dict(tool_name='relocfixture', repo='fixture/relocfixture', local_path=str(case / 'source'),
+        language='go', binary_name='relocfixture', targets=targets, build_cmd='bash build.sh',
+        act_job_map={target: None for target in targets},
+        cross_compile={target: {'host': 'completed' if target == native else 'original'} for target in targets},
+        release_contract=dict(checksum_sidecar='sha256', exact_primary_assets=names),
+        env=dict(PATH=os.environ['PATH'], CGO_ENABLED='0', GOENV='off', GOTOOLCHAIN='local', GOPROXY='off',
+                 GOSUMDB='off', GOMAXPROCS='2', GOCACHE=str(root / 'go-cache'),
+                 RELOC_EVENTS=str(case / 'recipe-events'), RELOC_FAILURES=str(case / 'failures'),
+                 RELOC_RECIPE_MODE=mode))
+    save(case / 'config/repos.d/relocfixture.yaml', config)
+    (case / 'failures').write_text('\n'.join(targets[1:]) + '\n')
+    env = dict(os.environ, RELOC_PROJECT=str(project), RELOC_CASE=str(case), RELOC_MODE=mode,
+        RELOC_FAILED_TARGET=failed, RELOC_SHA=sha, DSR_CONFIG_DIR=str(case / 'config'),
+        DSR_CONFIG_FILE=str(case / 'config/config.yaml'), DSR_REPOS_FILE=str(case / 'config/repos.yaml'),
+        DSR_HOSTS_FILE=str(case / 'config/hosts.yaml'), DSR_STATE_DIR=str(case / 'state'),
+        DSR_CACHE_DIR=str(case / 'cache'), ACT_CONFIG_DIR=str(case / 'config'),
+        ACT_REPOS_DIR=str(case / 'config/repos.d'), ACT_LOGS_DIR=str(case / 'logs'),
+        ACT_ARTIFACTS_DIR=str(case / 'artifacts'), DSR_DISABLE_HOST_SELECTOR='1', DSR_RETRY_MAX='4',
+        RCH_DISABLED='1', RCH_CARGO_WRAPPER_BYPASS='1', NO_COLOR='1')
+    for key in ('RCH_REQUIRE_REMOTE', 'DSR_BUILD_LOCK_HELD_BY_CALLER', 'DSR_RUN_ID', 'DSR_STRICT_BUILD_ROOT'):
+        env.pop(key, None)
+    return case, env, targets
+
+
+def invoke(case, env, phase, label=None, preflight_exit=None):
+    label = label or phase
+    with (case / (label + '.stdout')).open('wb') as out, (case / (label + '.stderr')).open('wb') as err:
+        result = subprocess.run(['bash', str(driver)], env=dict(env, RELOC_PHASE=phase),
+            stdin=subprocess.DEVNULL, stdout=out, stderr=err, timeout=180)
+    if phase == 'spoof':
+        return result.returncode, read(case / 'spoof/worker.json')
+    if phase == 'compare':
+        return result.returncode, {}
+    try:
+        value = read(case / (label + '.stdout'))
+    except (ValueError, OSError):
+        value = {}
+    if preflight_exit is not None and not value:
+        # Existing source/status validation can return before cmd_build's JSON
+        # envelope. Assert its precise refusal and diagnostic, without changing
+        # that separate CLI contract as part of relocation coverage.
+        check(case.name + '/' + label + ': public preflight retains its explicit refusal',
+              result.returncode == preflight_exit and bool((case / (label + '.stderr')).read_text().strip()))
+    else:
+        check(case.name + '/' + label + ': public command emits one structured result',
+              isinstance(value, dict) and value.get('command') == 'build' and value.get('exit_code') == result.returncode)
+    return result.returncode, value
+
+
+def state_file(case, run):
+    return case / 'state/builds/relocfixture/1.0.0' / run / 'state.json'
+
+
+def scheduled(state, target):
+    host = state['context']['target_hosts'][target]
+    return dict(run_id=state['run_id'], git_sha=state['git_sha'], git_ref=state['git_ref'],
+                host=host, root=state['context']['source_roots'][host])
+
+
+def seed(name, mode, sequential=False):
+    case, env, targets = fixture(name, mode, sequential)
+    code, value = invoke(case, env, 'first')
+    details = value.get('details', {})
+    if not check(name + ': real build retains one completed sibling and actual failed targets',
+                 code == 1 and details.get('success') == 1 and details.get('failed') == len(targets) - 1):
+        print((case / 'first.stderr').read_text()[-5000:], flush=True)
+        raise AssertionError('Initial native fixture did not reach the intended outcomes')
+    env['RELOC_RUN'] = details['run_id']
+    path = state_file(case, env['RELOC_RUN'])
+    state = read(path)
+    (case / 'first.state.json').write_bytes(path.read_bytes())
+    check(name + ': checkpoint and exact worker attempt receipts are authoritative',
+          state['status'] == 'partial' and all(row['attempts'] == 1 for row in state['target_statuses'].values()) and
+          all(read(Path(row['result_path'])).get('scheduled_source') == scheduled(state, target)
+              for target, row in state['target_statuses'].items()))
+    failed_receipt = read(Path(state['target_statuses'][failed]['result_path']))
+    expected_status = {'capacity': 'failed', 'readiness': 'error', 'timeout': 'timeout', 'executed': 'failed'}[mode]
+    check(name + ': raw producer retains truthful refusal/failure outcome',
+          failed_receipt['status'] == expected_status and failed_receipt['backend_started'] == (mode != 'capacity') and
+          failed_receipt['exit_code'] == {'capacity': 2, 'readiness': 4, 'timeout': 5, 'executed': 6}[mode] and
+          (failed not in events(case) if mode in ('capacity', 'readiness') else failed in events(case)))
+    sibling = Path(state['target_statuses'][native]['result']['artifact_path'])
+    execution = subprocess.run([str(sibling)], capture_output=True, text=True)
+    check(name + ': retained sibling is a genuinely compiled executable for this coordinator',
+          execution.returncode == 0 and (execution.stdout + execution.stderr).strip() == native)
+    return case, env, targets, state
+
+
+def approve(case, env, target, replacement, label):
+    config_path = case / 'config/repos.d/relocfixture.yaml'
+    prior = case / (label + '.prior.yaml')
+    prior.write_bytes(config_path.read_bytes())
+    config = read(config_path)
+    config['cross_compile'][target]['host'] = replacement
+    save(config_path, config)
+    save(case / 'approval.json', dict(run_id=env['RELOC_RUN'], target=target, new_host=replacement,
+        prior_repo_config_path=str(prior), prior_repo_config_sha256=digest(prior),
+        repo_config_sha256=digest(config_path), hosts_config_sha256=digest(case / 'config/hosts.yaml')))
+    env['RELOC_REQUEST'] = target + '=' + replacement
+
+
+def retained(state):
+    paths = []
+    for row in state['target_statuses'].values():
+        paths.extend([Path(row['result_path']), Path(row['log_path'])])
+        if row['status'] == 'completed':
+            paths.extend(Path(item['path']) for item in row['result']['resume_artifacts'])
+    return {path: (digest(path), path.stat().st_ino) for path in paths}
+
+
+def unchanged(before):
+    return all(path.is_file() and (digest(path), path.stat().st_ino) == value for path, value in before.items())
+
+
+def refuse(case, env, label, mutate, expected_exit=4):
+    path = state_file(case, env['RELOC_RUN'])
+    state = read(path)
+    receipt = Path(state['target_statuses'][failed]['result_path'])
+    success = Path(state['target_statuses'][native]['result']['artifact_path'])
+    owned = [path, receipt, success, case / 'approval.json', case / 'config/repos.d/relocfixture.yaml',
+             case / 'source/main.go']
+    originals = {p: p.read_bytes() for p in owned}
+    for index, (p, contents) in enumerate(originals.items()):
+        (case / (label + '.before-' + str(index))).write_bytes(contents)
+    before_events = events(case)
+    mutate(path, receipt, success)
+    injected = {p: p.read_bytes() for p in owned}
+    code, result = invoke(case, env, 'resume', label, preflight_exit=expected_exit)
+    check(label + ': refused before source staging, recipe execution, or checkpoint mutation',
+          code == expected_exit and events(case) == before_events and not (case / 'replacement').exists() and
+          all(p.read_bytes() == contents for p, contents in injected.items()))
+    for p, contents in originals.items():
+        p.write_bytes(contents)
+
+
+def mutate_evidence(transform):
+    def change(path, receipt, unused):
+        state, body = read(path), read(receipt)
+        transform(body)
+        save(receipt, body)
+        for key in ('scheduled_source', 'build_influence_env', 'status', 'exit_code', 'backend_started'):
+            if key in body:
+                state['target_statuses'][failed]['result'][key] = body[key]
+            else:
+                state['target_statuses'][failed]['result'].pop(key, None)
+        save(path, state)
+    return change
+
+
+for mode in ('capacity', 'readiness', 'executed', 'timeout'):
+    case, env, targets, initial = seed(mode, mode)
+    evidence = retained(initial)
+    approve(case, env, failed, 'replacement', 'replacement')
+    if mode == 'capacity':
+        large = read(Path(initial['target_statuses'][failed]['result_path']))
+        large['retained_detail'] = 'x' * 160000
+        save(case / 'large-worker.json', large)
+        save(case / 'large-state.json', dict(large, execution_started=True, retry_limit_exceeded=True))
+        code, unused = invoke(case, env, 'compare', 'large-receipt-matches')
+        check('large receipts compare through stdin without the executable argument-size limit', code == 0)
+        large['retained_detail'] += 'changed'
+        save(case / 'large-state.json', dict(large, execution_started=True))
+        code, unused = invoke(case, env, 'compare', 'large-receipt-drift')
+        check('large substantive receipt drift remains a refusal', code != 0)
+        for field, replacement in (('run_id', '00000000-0000-4000-8000-000000000000'),
+                                   ('git_sha', 'f' * 40), ('git_ref', 'v9.9.9'),
+                                   ('host', 'other'), ('root', str(case / 'unbound'))):
+            refuse(case, env, 'wrong-scheduled-' + field,
+                   mutate_evidence(lambda body, key=field, value=replacement:
+                       body.setdefault('scheduled_source', {}).__setitem__(key, value)))
+        refuse(case, env, 'missing-source-binding', mutate_evidence(lambda body: body.pop('scheduled_source', None)))
+        refuse(case, env, 'contradictory-partial-rust-source', mutate_evidence(lambda body:
+            body.__setitem__('build_influence_env', {'DSR_RELEASE_GIT_SHA': 'f' * 40})))
+        for field in ('execution_started', 'resume_reused', 'retry_limit_exceeded'):
+            def bad_annotation(path, unused_receipt, unused_success, key=field):
+                state = read(path)
+                state['target_statuses'][failed]['result'][key] = 'true'
+                save(path, state)
+            refuse(case, env, 'invalid-annotation-' + field, bad_annotation)
+        for exit_code in (0, 1.5, 130, 143):
+            refuse(case, env, 'invalid-failure-exit-' + str(exit_code),
+                   mutate_evidence(lambda body, value=exit_code: body.__setitem__('exit_code', value)))
+        refuse(case, env, 'cancelled-receipt', mutate_evidence(lambda body: body.__setitem__('status', 'cancelled')))
+        for status in ('running', 'cancelled'):
+            def invalid_state(path, unused_receipt, unused_success, value=status):
+                state = read(path)
+                if value == 'running': state['target_statuses'][failed]['status'] = value
+                else: state['status'] = value
+                save(path, state)
+            refuse(case, env, 'ineligible-state-' + status, invalid_state)
+        def mismatched_state(path, unused_receipt, unused_success):
+            state = read(path)
+            state['target_statuses'][failed]['result']['error'] = 'different retained observation'
+            save(path, state)
+        refuse(case, env, 'receipt-state-drift', mismatched_state)
+        def invalid_approval(unused_path, unused_receipt, unused_success):
+            approval = read(case / 'approval.json'); approval['repo_config_sha256'] = 'f' * 64
+            save(case / 'approval.json', approval)
+        refuse(case, env, 'invalid-approval', invalid_approval)
+        def global_config(unused_path, unused_receipt, unused_success):
+            config_path = case / 'config/repos.d/relocfixture.yaml'
+            config = read(config_path); config['build_cmd'] = 'exit 19'; save(config_path, config)
+            approval = read(case / 'approval.json'); approval['repo_config_sha256'] = digest(config_path)
+            save(case / 'approval.json', approval)
+        refuse(case, env, 'global-config-drift', global_config)
+        def dirty_source(unused_path, unused_receipt, unused_success):
+            with (case / 'source/main.go').open('ab') as out: out.write(b'\n// changed source\n')
+        refuse(case, env, 'source-drift', dirty_source, expected_exit=1)
+        def changed_success(unused_path, unused_receipt, success):
+            with success.open('ab') as out: out.write(b'changed retained artifact\n')
+        refuse(case, env, 'completed-artifact-drift', changed_success)
+        env['RELOC_ROOTS'] = json.dumps(initial['context']['source_roots'])
+        code, spoofed = invoke(case, env, 'spoof')
+        check('backend cannot replace its immutable strict dispatch source binding',
+              code == 17 and spoofed.get('scheduled_source') == scheduled(initial, failed))
+    (case / 'failures').write_text('')
+    before = events(case)
+    code, resumed = invoke(case, env, 'resume')
+    state = read(state_file(case, env['RELOC_RUN']))
+    check(mode + ': reviewed public relocation completes the original UUID',
+          code == 0 and resumed.get('details', {}).get('run_id') == initial['run_id'] and
+          state['status'] == 'completed' and state['context']['target_hosts'][failed] == 'replacement')
+    check(mode + ': only the failed target compiles again and receives attempt two',
+          events(case) == before + [failed] and state['target_statuses'][failed]['attempts'] == 2 and
+          state['target_statuses'][native] == initial['target_statuses'][native] and unchanged(evidence))
+    replacement_result = state['target_statuses'][failed]['result']
+    check(mode + ': replacement receipt binds the new host to the same frozen source',
+          replacement_result.get('scheduled_source') == scheduled(state, failed) and
+          len(state.get('relocations', [])) == 1 and
+          state['relocations'][0]['prior_target'] == initial['target_statuses'][failed])
+    manifest = case / 'output/relocfixture-v1.0.0-manifest.json'
+    manifest_value = read(manifest) if manifest.exists() else {}
+    check(mode + ': publication manifest covers both verified source-bound target artifacts',
+          manifest_value.get('publishable') is True and manifest_value.get('run_id') == initial['run_id'] and
+          manifest_value.get('source', {}).get('git_sha') == initial['git_sha'] and
+          manifest_value.get('summary') == dict(total=2, success=2, failed=0) and
+          all(digest(case / 'output' / row['name']) == row['sha256'] for row in manifest_value.get('artifacts', [])))
+
+# Two failed targets can move in successive reviewed invocations. The second
+# approval binds the first relocation's configuration, and neither completed
+# target is compiled again while the remaining target advances to attempt 3.
+case, env, targets, initial = seed('sequential', 'executed', True)
+evidence = retained(initial)
+approve(case, env, failed, 'replacement', 'first-relocation')
+(case / 'failures').write_text('windows/amd64\n')
+code, result = invoke(case, env, 'resume', 'first-relocation')
+middle = read(state_file(case, env['RELOC_RUN']))
+check('first sequential relocation retains partial outcome of the other failed target',
+      code == 1 and middle['status'] == 'partial' and
+      middle['target_statuses'][failed]['status'] == 'completed' and
+      middle['target_statuses']['windows/amd64']['status'] == 'failed')
+middle_evidence = retained(middle)
+approve(case, env, 'windows/amd64', 'second', 'second-relocation')
+(case / 'failures').write_text('')
+before = events(case)
+code, result = invoke(case, env, 'resume', 'second-relocation')
+final = read(state_file(case, env['RELOC_RUN']))
+check('second sequential relocation completes only the remaining target in the same run',
+      code == 0 and final['run_id'] == initial['run_id'] and final['status'] == 'completed' and
+      events(case) == before + ['windows/amd64'] and
+      final['target_statuses']['windows/amd64']['attempts'] == 3 and
+      final['target_statuses'][native] == initial['target_statuses'][native] and
+      final['target_statuses'][failed] == middle['target_statuses'][failed] and
+      len(final.get('relocations', [])) == 2 and unchanged(evidence) and unchanged(middle_evidence))
+(root / 'summary.json').write_text(json.dumps(dict(checks=checks, failures=failures, native=native)) + '\n')
+print('Relocation recovery: %d checks, %d failures' % (checks, failures), flush=True)
+raise SystemExit(bool(failures))
+PY
+}
+
+if [[ "${1:-}" == --relocation-recovery-only ]]; then
+    test_relocation_recovery
+    exit $?
+fi
+
 # Exercise the real worker and owned process groups without requiring a native
 # compiler, Docker, SSH, or null-device type checks. Resistant descendants must
 # stop before a live worker releases capacity or publishes interruption.
@@ -6364,7 +6791,7 @@ test_failed_target_relocation() (
         '{status:"success",host:"trj",platform:"linux/amd64",task_key:"linux/amd64",build_purpose:"release",publishable:true,artifact_path:$path,collected_sha256:$hash}')
     printf '%s\n' "$receipt" > "$good_sidecar"
     failure=$(jq -nc --arg sha "$sha" --arg target "$failed_target" \
-        '{status:"failed",host:"wlap",platform:$target,build_purpose:"release",publishable:true,
+        '{status:"failed",exit_code:17,host:"wlap",platform:$target,build_purpose:"release",publishable:true,
           build_influence_env:{DSR_RELEASE_GIT_SHA:$sha,DSR_RELEASE_GIT_REF:"v-relocation"}}')
     printf '%s\n' "$failure" > "$result"
     old_hash=$(_act_sha256 "$result")
@@ -6874,6 +7301,14 @@ if test_capacity_resume_accounting; then
 else
     fail "capacity refusal accounting exhausted retries or trusted backend classification"
 fi
+
+relocation_test_status=0
+test_relocation_recovery || relocation_test_status=$?
+case "$relocation_test_status" in
+    0) pass "reviewed relocation uses genuine worker receipts and preserves completed target evidence" ;;
+    77) skip "relocation integration requires Go and its local fixture dependencies" ;;
+    *) fail "reviewed relocation rejected genuine target outcomes or lost receipt/source authority" ;;
+esac
 
 if test_worker_group_lifecycle; then
     pass "owned target groups drain before receipts and capacity release"

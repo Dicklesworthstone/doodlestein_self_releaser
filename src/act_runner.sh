@@ -12943,6 +12943,14 @@ _act_run_target_worker() {
     slot_task="${slot_task//@/-}"
     local slot_id="${run_id}-${slot_task}-attempt-${attempt}"
     local slot_requested=false backend_started=false
+    local scheduled_source=null
+    if [[ "$strict_release_contract" == "true" ]]; then
+        # Record the source assigned to this worker even if capacity or host
+        # admission refuses it. This is not evidence that a compiler ran.
+        scheduled_source=$(jq -nc --arg run "$run_id" --arg sha "$release_git_sha" \
+            --arg ref "$release_git_ref" --arg host "$host" --argjson roots "$source_roots_json" \
+            '{run_id:$run,git_sha:$sha,git_ref:$ref,host:$host,root:$roots[$host]}') || return 4
+    fi
 
     _act_write_worker_result() {
         local body="$1"
@@ -12954,12 +12962,15 @@ _act_run_target_worker() {
             --arg platform "$target" --arg host "$host" --arg triple "$selected_triple" \
             --argjson source_sync "$source_sync_receipt" \
             --argjson backend_started "$backend_started" \
+            --argjson scheduled_source "$scheduled_source" \
             '. + {build_purpose: $purpose, publishable: ($purpose == "release"), task_key:$task_key,
                   backend_started:$backend_started} |
              if (.status // "") | IN("success", "ok", "passed") then .
              else . + {platform:$platform,host:(.host // $host)} +
                   (if $triple == "" then {} else {target_triple:$triple} end) end |
-             if $source_sync == null then . else .source_sync = $source_sync end' \
+             if $source_sync == null then . else .source_sync = $source_sync end |
+             if $scheduled_source == null then del(.scheduled_source)
+             else .scheduled_source = $scheduled_source end' \
             <<< "$body") || return 4
         (
             umask 077
@@ -13222,6 +13233,25 @@ _act_relocation_source_inventory() {
     printf '%s\n' "$records"
 }
 
+# The immutable worker receipt omits annotations added by the coordinator.
+# Compare every substantive field, allowing only the known true annotations
+# from worker collection, recovered-success reuse and retry-limit reporting.
+_act_relocation_receipt_matches() {
+    local path="$1" saved="$2"
+    jq -se --slurpfile saved /dev/stdin '
+        def annotations:
+            . as $result |
+            all(["execution_started","resume_reused","retry_limit_exceeded"][];
+                . as $key | ($result | has($key) | not) or $result[$key] == true);
+        def receipt:
+            del(.log_path,.result_path,.attempt,.execution_started,.resume_reused,.retry_limit_exceeded);
+        length == 1 and ($saved | length == 1) and ($saved[0] as $saved | .[0] |
+            type == "object" and ($saved | type == "object") and
+            annotations and ($saved | annotations) and
+            (receipt == ($saved | receipt)))
+    ' "$path" <<< "$saved" >/dev/null
+}
+
 _act_relocate_failed_target() {
     local tool="$1" version="$2" run_id="$3" before="$4" request="$5" approval_file="$6"
     local target="${request%%=*}" host="${request#*=}" old_host configured_host host_platform
@@ -13230,6 +13260,7 @@ _act_relocate_failed_target() {
     local prior_result prior_log result_hash log_hash
     local approval prior_config prior_config_hash prior_json current_json projection
     local source_inventory dependency_checkouts replacement_path replacement_root
+    local source_sha source_ref source_root
     [[ "$request" == *=* && "$target" =~ ^[a-z]+/[a-z0-9]+$ &&
        "$host" =~ ^[A-Za-z0-9_-]+$ ]] || return 4
     local relocation_triples
@@ -13290,16 +13321,37 @@ _act_relocate_failed_target() {
     prior_log=$(jq -er --arg target "$target" '.target_statuses[$target].log_path | strings' <<< "$before") || return 4
     [[ -f "$prior_result" && ! -L "$prior_result" && -f "$prior_log" && ! -L "$prior_log" ]] || return 4
     jq -e --arg target "$target" --arg host "$old_host" \
-        '.platform == $target and .host == $host and .status == "failed" and .build_purpose == "release" and .publishable == true' \
+        '.platform == $target and .host == $host and
+         (.status | IN("failed","error","timeout")) and
+         (.exit_code | type == "number" and floor == . and . > 0 and . <= 255) and
+         (.exit_code != 130 and .exit_code != 143) and
+         .build_purpose == "release" and .publishable == true' \
         "$prior_result" >/dev/null || return 4
     result_hash=$(_act_sha256 "$prior_result") || return 4
     log_hash=$(_act_sha256 "$prior_log") || return 4
     [[ "$result_hash" =~ ^[0-9a-f]{64}$ && "$log_hash" =~ ^[0-9a-f]{64}$ ]] || return 4
     result=$(jq -c --arg target "$target" '.target_statuses[$target].result' <<< "$before") || return 4
-    [[ "$(jq -cS 'del(.log_path,.result_path,.attempt)' "$prior_result")" == \
-       "$(jq -cS 'del(.log_path,.result_path,.attempt)' <<< "$result")" ]] || return 4
-    jq -e --arg sha "$(jq -r '.git_sha' <<< "$before")" --arg ref "$(jq -r '.git_ref' <<< "$before")" \
-        '.build_influence_env.DSR_RELEASE_GIT_SHA == $sha and .build_influence_env.DSR_RELEASE_GIT_REF == $ref' \
+    _act_relocation_receipt_matches "$prior_result" "$result" || return 4
+    source_sha=$(jq -er '.git_sha | strings | select(test("^[0-9a-f]{40}$"))' <<< "$before") || return 4
+    source_ref=$(jq -er '.git_ref | strings | select(length > 0)' <<< "$before") || return 4
+    source_root=$(jq -er --arg host "$old_host" \
+        '.context.source_roots[$host] | strings | select(length > 0)' <<< "$before") || return 4
+    # Strict Rust attempts may also attest their compiler environment. Keep
+    # that evidence mandatory for older receipts, and reject any contradiction
+    # when the worker's scheduled source supplies the non-Rust/refusal binding.
+    jq -e --arg run "$run_id" --arg sha "$source_sha" --arg ref "$source_ref" \
+        --arg host "$old_host" --arg root "$source_root" '
+        (.build_influence_env == null or (.build_influence_env | type == "object")) and
+        (if has("scheduled_source") then
+            .scheduled_source == {run_id:$run,git_sha:$sha,git_ref:$ref,host:$host,root:$root} and
+            ((.build_influence_env // {}) as $env |
+                if ($env | has("DSR_RELEASE_GIT_SHA") or has("DSR_RELEASE_GIT_REF")) then
+                    $env.DSR_RELEASE_GIT_SHA == $sha and $env.DSR_RELEASE_GIT_REF == $ref
+                else true end)
+         else
+            .build_influence_env.DSR_RELEASE_GIT_SHA == $sha and
+            .build_influence_env.DSR_RELEASE_GIT_REF == $ref
+         end)' \
         "$prior_result" >/dev/null || return 4
     # An unavailable successful artifact is not permission to silently rebuild
     # or relocate it. Preserve all successful receipt identities before staging.
@@ -13309,8 +13361,7 @@ _act_relocate_failed_target() {
         [[ -n "$result" ]] && _act_target_result_available "$result" release true || return 4
         if [[ -n "$result_path" ]]; then
             [[ -f "$result_path" && ! -L "$result_path" ]] || return 4
-            [[ "$(jq -cS 'del(.log_path,.result_path,.attempt)' "$result_path")" == \
-               "$(jq -cS 'del(.log_path,.result_path,.attempt)' <<< "$result")" ]] || return 4
+            _act_relocation_receipt_matches "$result_path" "$result" || return 4
         fi
     done < <(jq -c '.target_statuses[] | select(.status == "completed")' <<< "$before")
     repo_hash=$(_act_sha256 "$config_file") || return 4
