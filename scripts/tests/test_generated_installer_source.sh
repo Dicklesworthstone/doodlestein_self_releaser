@@ -12,6 +12,8 @@ GIT_REAL=$(command -v git)
 GO_REAL=$(command -v go)
 export GIT_REAL GO_REAL
 TEMP=$(mktemp -d "${TMPDIR:-/tmp}/dsr-installer-source.XXXXXXXX") || exit 1
+# Installer output admission rejects symlink ancestors, including macOS /var.
+TEMP=$(cd "$TEMP" && pwd -P) || exit 1
 trap '[[ "${DSR_TEST_KEEP_TEMP:-0}" == 1 ]] || rm -rf -- "$TEMP"' EXIT
 export HOME="$TEMP/home" GIT_CONFIG_GLOBAL="$TEMP/gitconfig" GIT_CONFIG_NOSYSTEM=1
 export DSR_GH_TOKEN='' GITHUB_TOKEN='' GH_TOKEN=''
@@ -225,7 +227,11 @@ check() {
 }
 equal() { [[ "$1" == "$2" ]]; }
 no_source() { ! grep -Eq '^(git|go) ' "$CALLS"; }
-no_http() { ! grep -Eq '^(curl|gh) ' "$CALLS"; }
+no_http() {
+    # Reading a stored credential is local; API and transport calls are not.
+    awk '/^curl / || (/^gh / && $0 != "gh auth token --hostname github.com") { bad=1 }
+         END { exit bad }' "$CALLS"
+}
 source_json() {
     jq -es --arg commit "$1" --arg path "$CASE/install/app" '
         length == 1 and (.[0] | .status == "success" and .method == "source" and
@@ -515,7 +521,11 @@ BOOTSTRAP_MODE=unavailable PATH="$TEMP/no-go" run_case bootstrap-unavailable dis
 check 'unavailable compiler distribution fails clearly' equal "$status" 8
 check 'unavailable compiler installs no partial application' test ! -e "$CASE/install/app"
 BOOTSTRAP_MODE=timeout PATH="$TEMP/no-go" run_case bootstrap-timeout discovery-fail \
-    --from-source --version v2.0.0 --install-toolchain --source-timeout 1
+    --from-source --version v2.0.0 --install-toolchain --source-timeout 10
+# The configured deadline also bounds prerequisite Git operations. Give the
+# real local fetch time to complete, then require the 20-second delivery stall
+# above to be interrupted specifically at the compiler-bootstrap boundary.
+check 'bootstrap timeout reaches compiler distribution' grep -Fq 'curl https://go.dev/dl/?mode=json&include=all' "$CALLS"
 check 'compiler bootstrap obeys source command timeout' equal "$status" 5
 check 'timed-out compiler installs no partial application' test ! -e "$CASE/install/app"
 check 'bootstrap timeout retains diagnostics' test -n "$(find "$CASE/tmp" -name toolchain.log.timeout -print)"

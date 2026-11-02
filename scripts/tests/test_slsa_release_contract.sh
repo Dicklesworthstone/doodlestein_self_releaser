@@ -21,7 +21,7 @@ import tempfile
 
 root = Path(sys.argv[1])
 module = Path(os.environ.get('SLSA_REMOTE_TEST_MODULE', root / 'src/slsa_remote.sh'))
-work = Path(tempfile.mkdtemp(prefix='dsr-release-contract-'))
+work = Path(tempfile.mkdtemp(prefix='dsr-release-contract-')).resolve(strict=True)
 print('Evidence: ' + str(work), flush=True)
 passed = failed = calls = 0
 pin = '1' * 40

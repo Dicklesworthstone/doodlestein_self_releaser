@@ -48,6 +48,9 @@ source "$ROOT/src/act_runner.sh"
 source "$ROOT/src/artifact_naming.sh"
 # shellcheck source=../../src/host_selector.sh
 source "$ROOT/src/host_selector.sh"
+# Direct native calls use the same real admission checks as the CLI loader.
+# shellcheck source=../../src/host_health.sh
+source "$ROOT/src/host_health.sh"
 
 PASS=0 FAIL=0 STATUS=0
 check() {

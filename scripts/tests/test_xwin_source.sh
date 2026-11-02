@@ -4,7 +4,8 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 source "$ROOT/src/xwin_source.sh"
 WORK=$(mktemp -d)
-trap 'rm -rf -- "$WORK"' EXIT
+WORK=$(cd "$WORK" && pwd -P) || exit 1
+trap 'if [[ "${DSR_TEST_KEEP_TEMP:-0}" != 1 ]]; then rm -rf -- "$WORK"; fi' EXIT
 PASS=0 FAIL=0
 ok() { printf 'PASS %s\n' "$1"; PASS=$((PASS + 1)); }
 bad() { printf 'FAIL %s\n' "$1" >&2; FAIL=$((FAIL + 1)); }

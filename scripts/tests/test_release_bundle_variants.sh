@@ -9,6 +9,7 @@ for dependency in jq python3 sha256sum flock; do
     command -v "$dependency" >/dev/null || { printf 'Missing dependency: %s\n' "$dependency" >&2; exit 3; }
 done
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/dsr-bundle-variants.XXXXXXXX") || exit 1
+WORK=$(cd "$WORK" && pwd -P) || exit 1
 printf 'Retained test evidence: %s\n' "$WORK"
 passed=0 failed=0 status=0
 check() {

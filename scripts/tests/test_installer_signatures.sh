@@ -456,7 +456,8 @@ test_offline_mode_fails_for_missing_archive() {
         return
     fi
 
-    exec_run "$installer" --offline "$TEST_TMPDIR/nonexistent.tar.gz" --non-interactive
+    # Pin the version so the failure reaches archive admission, not latest discovery.
+    exec_run "$installer" --version v1.2.3 --offline "$TEST_TMPDIR/nonexistent.tar.gz" --non-interactive
     local status
     status=$(exec_status)
 
@@ -483,10 +484,9 @@ test_offline_mode_error_message() {
 
     exec_run "$installer" --offline "$TEST_TMPDIR/missing.tar.gz" --non-interactive
 
-    # Note: installer has template vars (${name}) that may cause unbound var errors
-    # This is acceptable - we test the logic separately
-    if exec_stderr_contains "not found" || exec_stderr_contains "Offline archive" || exec_stderr_contains "unbound variable"; then
-        pass "offline mode shows error message (may be template var or archive error)"
+    # An unversioned offline request must fail before attempting latest discovery.
+    if [[ $(exec_status) -ne 0 ]] && exec_stderr_contains "Offline installation requires --version; latest cannot be resolved without network"; then
+        pass "unversioned offline mode reports its required version"
     else
         fail "offline mode should show error"
         echo "stderr: $(exec_stderr)"

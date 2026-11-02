@@ -9,6 +9,8 @@ for dependency in jq sha256sum; do
     command -v "$dependency" >/dev/null || { printf 'Missing dependency: %s\n' "$dependency" >&2; exit 3; }
 done
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/dsr-slsa-variants.XXXXXXXX") || exit 1
+# Compare published paths against the physical path of our owned fixture root.
+WORK=$(cd "$WORK" && pwd -P) || exit 1
 printf 'Retained test evidence: %s\n' "$WORK"
 mkdir -p "$WORK/assets" "$WORK/proofs" "$WORK/manifests" || exit 1
 PIN=1111111111111111111111111111111111111111

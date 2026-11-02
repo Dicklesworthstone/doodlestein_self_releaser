@@ -22,6 +22,9 @@ if ! compgen -G "$musl_libdir/libstd-*.rlib" >/dev/null; then
     printf 'SKIP: x86_64-unknown-linux-musl Rust standard library unavailable\n'; exit 0
 fi
 mkdir -p "$work/config/repos.d" "$work/home" "$work/remote" "$work/transports" "$work/payload-gnu" "$work/payload-musl"
+# Preserve the compiler installation when isolating the installer's home.
+# Otherwise rustup looks for a new default toolchain in the empty fixture HOME.
+export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 export HOME="$work/home" DSR_CONFIG_DIR="$work/config" DSR_INSTALLER_DIR="$work/generated" NO_COLOR=1
 export REMOTE="$work/remote" CALLS="$work/calls" MOCK_LIBC=gnu WITHHELD_TRIPLE=''
 cat > "$work/demo.rs" <<'RUST'

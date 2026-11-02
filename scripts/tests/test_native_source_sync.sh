@@ -855,8 +855,15 @@ fn main() {
         .is_ok_and(|marker| Path::new(&marker).exists()) {
         panic!("deliberate genuine musl compilation failure for strict resume");
     }
-    let out = env::var("OUT_DIR").unwrap();
-    let release = Path::new(&out).ancestors().nth(3).unwrap();
+    // Cargo's build-script directory depth is not a stable output contract.
+    // Write the additional release artifact beside the selected executable.
+    let target_dir = env::var("CARGO_TARGET_DIR").unwrap();
+    let mut release = Path::new(&target_dir).to_path_buf();
+    if env::var("CARGO_BUILD_TARGET").is_ok_and(|selected| !selected.is_empty()) {
+        release.push(&target);
+    }
+    release.push(env::var("PROFILE").unwrap());
+    fs::create_dir_all(&release).unwrap();
     fs::write(release.join("release-notes.txt"), "Reviewed strict variant release notes\n").unwrap();
 }
 RUST

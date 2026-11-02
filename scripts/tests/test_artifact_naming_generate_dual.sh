@@ -19,6 +19,14 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+# Exercise unconfigured naming independently of the developer/worker registry.
+# Retain this private fixture for diagnostics; never read or modify real config.
+TEST_CONFIG_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/dsr-dual-naming.XXXXXXXX") || exit 1
+export DSR_CONFIG_DIR="$TEST_CONFIG_ROOT"
+export DSR_CONFIG_FILE="$TEST_CONFIG_ROOT/config.yaml"
+export DSR_REPOS_FILE="$TEST_CONFIG_ROOT/repos.yaml"
+export DSR_HOSTS_FILE="$TEST_CONFIG_ROOT/hosts.yaml"
+
 # Verbosity levels
 VERBOSE=0
 JSON_OUTPUT=0
@@ -155,10 +163,12 @@ assert_valid_json() {
 
 CURRENT_PHASE=""
 PHASE_START_TIME=0
+PHASE_START_FAILURES=0
 
 start_phase() {
     CURRENT_PHASE="$1"
     PHASE_START_TIME=$(($(date +%s) * 1000))
+    PHASE_START_FAILURES=$FAIL_COUNT
     if [[ $JSON_OUTPUT -eq 0 ]]; then
         echo "" >&2
         echo "[$(log_timestamp)] === Phase: $CURRENT_PHASE ===" >&2
@@ -171,6 +181,9 @@ end_phase() {
     local end_time
     end_time=$(($(date +%s) * 1000))
     local duration=$((end_time - PHASE_START_TIME))
+    if (( FAIL_COUNT > PHASE_START_FAILURES )); then
+        status="fail"
+    fi
 
     PHASE_RESULTS+=("{\"name\":\"$CURRENT_PHASE\",\"status\":\"$status\",\"tests\":$tests_in_phase,\"duration_ms\":$duration}")
 
@@ -548,6 +561,7 @@ print_summary() {
 
         printf '{"test":"artifact_naming_generate_dual","phases":%s,"result":"%s","total_tests":%d,"passed":%d,"failed":%d,"total_duration_ms":%d}\n' \
             "$phases_json" "$result_status" "$TEST_COUNT" "$PASS_COUNT" "$FAIL_COUNT" "$total_duration"
+        [[ $FAIL_COUNT -eq 0 ]]
     else
         echo "" >&2
         echo "==========================================" >&2

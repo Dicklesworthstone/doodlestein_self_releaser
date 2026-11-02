@@ -17,7 +17,8 @@ import sys
 import tempfile
 
 root = Path(sys.argv[1])
-work = Path(tempfile.mkdtemp(prefix='dsr-resume-regression-'))
+# Output admission rejects symlink ancestors; normalize only our owned root.
+work = Path(tempfile.mkdtemp(prefix='dsr-resume-regression-')).resolve(strict=True)
 print('Evidence: ' + str(work), flush=True)
 passed = 0
 

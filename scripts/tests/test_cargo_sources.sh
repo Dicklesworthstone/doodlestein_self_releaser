@@ -20,7 +20,9 @@ passed = failed = 0
 
 class Fixture:
     def __init__(self, root):
-        self.root = Path(root)
+        # macOS tempfile roots may use /var, a symlink to /private/var.
+        # The fixture itself must satisfy the production no-symlink root gate.
+        self.root = Path(root).resolve(strict=True)
         self.home = self.root / 'cargo home'
         self.registry = self.home / 'registry/src/example-123/dep-1.2.3'
         self.git = self.home / 'git/checkouts/helper-123/abcdef0'

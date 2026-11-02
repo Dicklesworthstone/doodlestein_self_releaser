@@ -170,7 +170,7 @@ def open_inputs(pid):
                     opened.add(str(selected))
             except (OSError, ValueError):
                 pass
-    except FileNotFoundError:
+    except (FileNotFoundError, PermissionError):
         pass
     return opened
 
@@ -190,7 +190,7 @@ def invoke(output, *options, observe=False, cancel=False, **kwargs):
                     counters = dict(line.split(': ', 1) for line in
                                     (Path('/proc') / str(process.pid) / 'io').read_text().splitlines())
                     read_bytes = max(read_bytes, int(counters['rchar']))
-                except FileNotFoundError:
+                except (FileNotFoundError, PermissionError):
                     pass
                 if cancel and peak >= 2 and not sent:
                     process.send_signal(signal.SIGTERM)
@@ -284,6 +284,8 @@ check('coalescing refuses a conflicting logical receipt before output exists', c
 # Interrupt actual simultaneous reads in a held completed workspace. Every
 # thread belongs to the same process and must drain before it releases its lock.
 code, failure, interrupted_observation = invoke(output, '--resume', '--jobs', '4', observe=True, cancel=True)
+(work / 'interruption.json').write_bytes(encoded(dict(
+    returncode=code, response=failure, observation=interrupted_observation)))
 check('SIGTERM during parallel reads is reported as interrupted',
       code == 5 and interrupted_observation['signal_sent'] and failure['exit_code'] == 5)
 check('cancellation preserves all retained output identities and bytes', snapshot(output) == before)

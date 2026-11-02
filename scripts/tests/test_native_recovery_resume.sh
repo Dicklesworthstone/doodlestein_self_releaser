@@ -427,7 +427,7 @@ def observe_copy(output, jobs=4, resume=False, cancel=False, selected_module=Non
                             writable.add(str(selected))
                     except (OSError, ValueError, StopIteration):
                         pass
-            except FileNotFoundError:
+            except (FileNotFoundError, PermissionError):
                 pass
             peak = max(peak, len(writable))
             if cancel and len(writable) >= 2 and not sent:

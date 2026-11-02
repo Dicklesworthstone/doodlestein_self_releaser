@@ -5,7 +5,9 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 source "$ROOT/src/slsa.sh"
 source "$ROOT/src/slsa_remote.sh"
-WORK=$(mktemp -d)
+WORK=$(mktemp -d) || exit 1
+# macOS temporary roots may traverse /var; only canonicalize our owned fixture root.
+WORK=$(cd "$WORK" && pwd -P) || exit 1
 trap 'rm -rf -- "$WORK"' EXIT
 mkdir -p "$WORK/bin" "$WORK/tmp"
 export PATH="$WORK/bin:$PATH" TMPDIR="$WORK/tmp"

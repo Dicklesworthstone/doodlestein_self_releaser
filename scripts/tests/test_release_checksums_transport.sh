@@ -23,7 +23,7 @@ import time
 from urllib.parse import urlparse
 
 root=Path(sys.argv[1])
-work=Path(tempfile.mkdtemp(prefix='dsr-checksum-transport-'))
+work=Path(tempfile.mkdtemp(prefix='dsr-checksum-transport-')).resolve(strict=True)
 print('Retained evidence: '+str(work),flush=True)
 passed=0
 trace=[]

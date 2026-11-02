@@ -111,7 +111,7 @@ shift
 ACT_REPOS_DIR=$DSR_TEST_CONFIGS
 _act_is_windows_host() { return 1; }
 _act_is_local_host() { return 0; }
-_act_ssh_exec() { bash -e -c "$2"; }
+_act_ssh_exec() { bash -e -s <<< "$2"; }
 "$@"
 '''
 counter = 0
@@ -231,9 +231,19 @@ result, target, receipt = cached('nightly', command)
 check('intermediate cache builds with explicit nightly over a stable default',
       result.returncode == 0 and marker_value(target / 'debug/cache-probe') == '42')
 compilers = receipt.get('contract', {}).get('compilers', {})
+nightly_cargo_launcher = nightly_root / 'bin/cargo'
+nightly_cargo_executable = nightly_cargo_launcher
+if nightly_cargo_launcher.read_bytes().startswith(b'#!'):
+    # RCH installs a toolchain launcher beside the original native executable.
+    # Independently bind both files rather than mistaking the launcher for Cargo.
+    assert b'# rch toolchain cargo wrapper' in nightly_cargo_launcher.read_bytes()
+    nightly_cargo_executable = nightly_root / 'bin/cargo-rch-real'
+    assert not nightly_cargo_executable.read_bytes().startswith(b'#!')
 check('cache receipt binds the actual selected Cargo and rustc executable bytes',
-      compilers.get('cargo', {}).get('executable_sha256') == digest(nightly_root / 'bin/cargo') and
+      compilers.get('cargo', {}).get('executable_sha256') == digest(nightly_cargo_executable) and
       compilers.get('rustc', {}).get('executable_sha256') == digest(nightly_rustc))
+check('cache receipt also binds the selected toolchain launcher bytes',
+      compilers.get('cargo', {}).get('toolchain_launcher', {}).get('sha256') == digest(nightly_cargo_launcher))
 check('cache records selected nightly versions and the effective Rustup environment',
       '-nightly' in receipt.get('contract', {}).get('cargo', '') and
       receipt.get('contract', {}).get('rustc') == nightly_version and
@@ -277,7 +287,7 @@ wrapper.chmod(0o700)
 result, target, refused_receipt = cached('unknown-wrapper', command, dict(nightly_env, RUSTC=str(wrapper)))
 check('matching-version compiler scripts remain outside the cache authority contract',
       result.returncode != 0 and not target.exists() and not refused_receipt and
-      'unrecognized selected compiler script' in result.stderr)
+      'unresolved or changed compiler executable: rustc' in result.stderr)
 
 linker = work / 'target-linker'
 linker.write_text('#!/bin/sh\nexec ' + shlex.quote(shutil.which('cc')) + ' "$@"\n')

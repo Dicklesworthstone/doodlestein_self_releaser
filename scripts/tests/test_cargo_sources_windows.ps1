@@ -76,7 +76,17 @@ function Invoke-Program {
     $process = [Diagnostics.Process]::Start($info)
     try {
         $stdout = $process.StandardOutput.ReadToEndAsync(); $stderr = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit(120000)) { $process.Kill($true); throw ('Fixture process timed out: ' + $Executable) }
+        if (-not $process.WaitForExit(120000)) {
+            $process.Kill($true)
+            $null = $process.WaitForExit(5000)
+            foreach ($capture in @($stdout, $stderr)) {
+                if (-not $capture.Wait(5000)) { continue }
+                $detail = $capture.GetAwaiter().GetResult()
+                if ($detail.Length -gt 4096) { $detail = $detail.Substring($detail.Length - 4096) }
+                [Console]::Error.WriteLine($detail)
+            }
+            throw ('Fixture process timed out: ' + $Executable + ' ' + ($Arguments -join ' '))
+        }
         $result = @{Code=$process.ExitCode;Out=$stdout.GetAwaiter().GetResult();Err=$stderr.GetAwaiter().GetResult()}
         if (-not $ExpectFailure -and $result.Code -ne 0) { throw ('Fixture command failed: ' + $Executable + ' ' + ($Arguments -join ' ') + "`n" + $result.Err) }
         return $result
@@ -389,6 +399,7 @@ if (-not $sourceBashPath) {
         else { (Get-Command bash -CommandType Application | Select-Object -First 1).Source }
 }
 if (-not (Test-Path -LiteralPath $sourceBashPath -PathType Leaf)) { throw 'Git Bash is required; pass -BashPath explicitly.' }
+$null = Invoke-Program $sourceBashPath @('-c','command -v jq >/dev/null && jq --version')
 $oldCargoHome = [Environment]::GetEnvironmentVariable('CARGO_HOME')
 $oldWrapper = [Environment]::GetEnvironmentVariable('RUSTC_WRAPPER')
 $oldWorkspaceWrapper = [Environment]::GetEnvironmentVariable('RUSTC_WORKSPACE_WRAPPER')

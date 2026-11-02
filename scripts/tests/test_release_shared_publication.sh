@@ -349,8 +349,19 @@ class SharedIntegrityTests(unittest.TestCase):
         for name in ('checksums.sha256', 'checksums.sha256.minisig', 'release-integrity.json',
                      'release-integrity.json.minisig', 'LICENSE.minisig', 'license', 'RELEASE-INTEGRITY.JSON'):
             with self.subTest(name=name):
-                original = self.rows[2]['name']; self.rows[2]['name'] = name
-                (self.assets/original).rename(self.assets/name); self.write_manifest()
+                original_row = self.rows[2].copy()
+                original = original_row['name']
+                alias = (name == 'license' and (self.assets/name).exists()
+                         and (self.assets/name).samefile(self.assets/'LICENSE'))
+                # On case-insensitive volumes, do not overwrite LICENSE with
+                # runtime.json. Bind both colliding names to its actual bytes;
+                # the manifest must still be refused before signing.
+                if alias:
+                    self.rows[2] = dict(self.rows[1], name=name)
+                else:
+                    self.rows[2]['name'] = name
+                    (self.assets/original).rename(self.assets/name)
+                self.write_manifest()
                 for arguments in ((), ('--dry-run',)):
                     result = self.integrity('prepare', *arguments)
                     self.assertEqual(result.returncode,4,result.stderr)
@@ -358,7 +369,14 @@ class SharedIntegrityTests(unittest.TestCase):
                     self.assertFalse(result.stdout)
                 self.assertFalse(self.proofs.exists())
                 self.assertFalse((self.root/'signer-calls').exists())
-                (self.assets/name).rename(self.assets/original); self.rows[2]['name']=original; self.write_manifest()
+                if not alias:
+                    (self.assets/name).rename(self.assets/original)
+                self.rows[2] = original_row
+                self.write_manifest()
+                self.assertEqual(hashlib.sha256((self.assets/'LICENSE').read_bytes()).hexdigest(),
+                                 self.rows[1]['sha256'])
+                self.assertEqual(hashlib.sha256((self.assets/original).read_bytes()).hexdigest(),
+                                 original_row['sha256'])
 
     def test_secret_key_may_not_overlap_a_shared_payload(self):
         result = self.integrity('prepare', secret=self.assets/'LICENSE')

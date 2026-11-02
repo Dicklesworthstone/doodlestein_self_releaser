@@ -6,6 +6,8 @@ for tool in jq sha256sum; do command -v "$tool" >/dev/null || { echo "SKIP: $too
 source "$ROOT/src/slsa.sh" || exit 1
 source "$ROOT/src/release_payloads.sh" || exit 1
 TEMP=$(mktemp -d "${TMPDIR:-/tmp}/dsr-slsa-release.XXXXXXXX") || exit 1
+# Compare published paths against the physical path of our owned fixture root.
+TEMP=$(cd "$TEMP" && pwd -P) || exit 1
 trap 'rm -rf -- "$TEMP"' EXIT
 mkdir -p "$TEMP/assets" "$TEMP/proofs" "$TEMP/modified" "$TEMP/bin"
 printf 'linux executable\n' > "$TEMP/assets/app-v1-linux"
@@ -218,7 +220,7 @@ check 'manifest-backed verification refuses a diagnostic declaration' equal "$st
 cat "$manifest" "$manifest" > "$TEMP/modified/multiple.json"
 run slsa_generate_manifest "$TEMP/modified/multiple.json" "$TEMP/assets" --repository example/app --output "$TEMP/proofs/multiple"
 check 'multiple manifest documents rejected' equal "$status" 4
-ln -s "$manifest" "$TEMP/modified/link.json"
+command ln -s "$manifest" "$TEMP/modified/link.json"
 run slsa_generate_manifest "$TEMP/modified/link.json" "$TEMP/assets" --repository example/app --output "$TEMP/proofs/linked-manifest"
 check 'linked manifest rejected' equal "$status" 4
 run slsa_generate_manifest "$manifest" "$TEMP/assets" --repository example/app --output "$TEMP/assets/app-linux"
@@ -239,7 +241,7 @@ check 'optional-fields manifest still verifies actual bytes' equal "$status" 0
 # Distinct names pointing to the same inode still require distinct subjects.
 cp "$TEMP/assets/app-linux" "$TEMP/retained-linux"
 mv "$TEMP/assets/app-linux" "$TEMP/alias-before-link"
-ln -s "$TEMP/retained-linux" "$TEMP/assets/app-linux"
+command ln -s "$TEMP/retained-linux" "$TEMP/assets/app-linux"
 run slsa_generate_manifest "$manifest" "$TEMP/assets" --repository example/app --output "$TEMP/proofs/linked-asset"
 check 'linked artifact cannot satisfy a manifest subject' test "$status" -ne 0
 mv -f "$TEMP/alias-before-link" "$TEMP/assets/app-linux"

@@ -4,7 +4,7 @@
 # No live push, repository deletion, source compilation or installer execution.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P) || exit 1
-exec python3 -I -S - "$ROOT" <<'PY'
+exec python3 -I -S - "$ROOT" "$BASH" <<'PY'
 import fcntl
 import hashlib
 import json
@@ -87,6 +87,8 @@ if 'push' in args and code==0 and os.environ.get('RECOVERY_MODE')=='lost-ack':
 raise SystemExit(code)
 ''')
 for p in bins.iterdir(): p.chmod(0o755)
+# Keep the supported outer Bash when the fixture prioritizes system tools.
+(bins / 'bash').symlink_to(Path(sys.argv[2]).resolve(strict=True))
 
 def setup(label, member='SHA256SUMS.txt'):
     global cases

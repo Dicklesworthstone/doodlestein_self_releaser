@@ -47,6 +47,9 @@ def check(label, condition):
         print('FAIL: ' + label, flush=True)
 
 env = dict(os.environ)
+if shutil.which('rustup') and not env.get('RUSTUP_HOME'):
+    # Isolate Git credentials without hiding the installed compiler from rustup.
+    env['RUSTUP_HOME'] = subprocess.check_output(['rustup', 'show', 'home'], text=True).strip()
 for name in list(env):
     if (name.lower().endswith('_proxy') or name.startswith('GIT_') or
             name in ('DSR_GH_TOKEN', 'GITHUB_TOKEN', 'GH_TOKEN', 'GH_HOST',
@@ -500,7 +503,7 @@ compiler_contracts() (
     bun() {
         printf '%s\n' "$@" >> "$base/bun.args"
         if [[ "$1" == --version ]]; then printf 'bun fixture\n'
-        elif [[ "$1" == build ]]; then printf 'fixture executable\n' > "$base/output/bin/fixture"; fi
+        elif [[ "$1" == build ]]; then printf 'fixture executable\n' > "$base/output/fixture"; fi
     }
     local output code=0
     if [[ "$kind" == rust ]]; then
@@ -520,7 +523,7 @@ for fault in missing empty link; do
     check "Cargo success without a usable output is rejected: $fault" equal "$(compiler_contracts rust "$fault" 2>/dev/null)" '6:'
 done
 result=$(compiler_contracts bun)
-check 'Bun resolves the package bin entry' equal "$result" "0:$TEMP/bun-ok/output/bin/fixture"
+check 'Bun resolves the package bin entry' equal "$result" "0:$TEMP/bun-ok/output/fixture"
 check 'Bun dependency lockfile is enforced' grep -qx -- --frozen-lockfile "$TEMP/bun-ok/bun.args"
 check 'Bun compiles an executable rather than JS output' grep -qx -- --compile "$TEMP/bun-ok/bun.args"
 check 'Bun uses its literal selected entry' grep -qx './src/cli.ts' "$TEMP/bun-ok/bun.args"

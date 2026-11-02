@@ -10,6 +10,8 @@ done
 REAL_GIT=$(command -v git); REAL_GO=$(command -v go)
 export REAL_GIT REAL_GO
 TEMP=$(mktemp -d "${TMPDIR:-/tmp}/dsr-installer-freshness.XXXXXXXX") || exit 1
+# Installer output admission rejects symlink ancestors, including macOS /var.
+TEMP=$(cd "$TEMP" && pwd -P) || exit 1
 trap '[[ "${DSR_TEST_KEEP_TEMP:-0}" == 1 ]] || rm -rf -- "$TEMP"' EXIT
 export HOME="$TEMP/home" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$TEMP/gitconfig"
 export DSR_GH_TOKEN='' GITHUB_TOKEN='' GH_TOKEN=''

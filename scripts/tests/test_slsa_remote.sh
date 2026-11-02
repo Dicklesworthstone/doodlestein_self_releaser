@@ -6,7 +6,9 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 for tool in jq sha256sum; do command -v "$tool" >/dev/null || { echo "SKIP: $tool required"; exit 0; }; done
 source "$ROOT/src/slsa.sh" || exit 1
 source "$ROOT/src/slsa_remote.sh" || exit 1
-WORK=$(mktemp -d)
+WORK=$(mktemp -d) || exit 1
+# macOS temporary roots may traverse /var; only canonicalize our owned fixture root.
+WORK=$(cd "$WORK" && pwd -P) || exit 1
 trap 'rm -rf -- "$WORK"' EXIT
 mkdir -p "$WORK/assets" "$WORK/remote" "$WORK/bin" "$WORK/proofs"
 mkdir "$WORK/tmp"
@@ -147,7 +149,7 @@ refresh_proof() {
         "$WORK/inventory.json" > "$WORK/changed"
     cp "$WORK/changed" "$WORK/inventory.json"
 }
-BASE=(--repo owner/demo --tag v1.2.3 --sha "$PIN" --builder dsr:test --public-key "$WORK/trusted.pub" --targets windows/arm64,linux/amd64)
+BASE=(--repo owner/demo --tag v1.2.3 --sha "$PIN" --builder dsr:test --public-key "$WORK/trusted.pub" --targets 'windows/arm64,linux/amd64')
 reset_remote
 expect 'signed complete remote release verifies' 0 slsa_verify_remote "${BASE[@]}"
 check 'single authenticated receipt binds immutable source/asset identities' jq -es --arg pin "$PIN" \
@@ -279,7 +281,7 @@ for phase in statement signature; do
     COUNT=$(wc -l < "$WORK/upload.calls")
     MODE=normal
     expect "retry recovers lost $phase acknowledgement" 0 publish
-    check 'recovery never repeats an accepted upload' test "$(wc -l < "$WORK/upload.calls")" = 2
+    check 'recovery never repeats an accepted upload' test "$(wc -l < "$WORK/upload.calls")" -eq 2
     if [[ "$phase" == signature ]]; then
         check 'completed pair needs no new uploads after lost acknowledgement' test "$COUNT" = "$(wc -l < "$WORK/upload.calls")"
     fi

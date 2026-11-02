@@ -10,6 +10,8 @@ dsr_test_groups() {
     # another worker's mutable results. Each gets its own keys and shell state.
     for group in "${groups[@]}"; do
         worker=$(mktemp -d "${TMPDIR:-/tmp}/dsr-test-$group.XXXXXXXX") || return 1
+        # Strict filesystem tests need a physical root (macOS /var is a symlink).
+        worker=$(cd "$worker" && pwd -P) || return 1
         cp -a -- "$fixture_root/." "$worker/" || return 1
         workers+=("$worker")
     done

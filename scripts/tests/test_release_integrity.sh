@@ -7,8 +7,9 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 NATIVE_MINISIGN=$(command -v minisign || true)
 export RI_NATIVE_MINISIGN="$NATIVE_MINISIGN"
-WORK=$(mktemp -d)
-trap 'rm -rf -- "$WORK"' EXIT
+WORK=$(mktemp -d) || exit 1
+WORK=$(cd "$WORK" && pwd -P) || exit 1
+trap '[[ "${DSR_TEST_KEEP_TEMP:-0}" == 1 ]] || rm -rf -- "$WORK"' EXIT
 trap 'exit 5' HUP INT TERM
 mkdir -p "$WORK/bin" "$WORK/cases"
 if ! python3 -c 'from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey' 2>/dev/null; then
@@ -229,7 +230,11 @@ verify_remote() {
 capture() { status=0; "$@" > "$CASE/out" 2> "$CASE/err" || status=$?; }
 add_payloads() { local name; for name in a.tar.gz b.tar.xz compat.tar.gz; do remote_add "$ART/$name" "$name" >/dev/null || return; done; }
 nonzero() { [[ "$1" -ne 0 ]]; }
-no_public_proofs() { [[ "$(find "$PROOFS" -maxdepth 1 -type f | wc -l)" == 0 ]]; }
+no_public_proofs() {
+    local count
+    count=$(find "$PROOFS" -maxdepth 1 -type f | wc -l) || return 1
+    [[ "$count" -eq 0 ]]
+}
 
 fixture_private_payload() {
     local hash size

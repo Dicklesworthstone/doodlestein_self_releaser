@@ -8,6 +8,8 @@ case "$#:${1:-}" in
 esac
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-install-integrity.XXXXXXXX") || exit 1
+# Installer output admission rejects symlink ancestors, including macOS /var.
+work=$(cd "$work" && pwd -P) || exit 1
 trap '[[ "${DSR_TEST_KEEP_TEMP:-0}" == 1 ]] || rm -rf -- "$work"' EXIT
 passed=0 failed=0
 check() {
@@ -1046,6 +1048,9 @@ ARCHIVES
         INSTALL_BASH="$legacy_bash" run_install
         check "duplicate archive member is rejected under Bash $legacy_version" blocked
         check 'legacy duplicate rejection names the member' grep -q 'Duplicate archive member: demo' "$case_dir/err"
+        # The adversarial legacy case must not feed later positive installs.
+        cp "$work/normal-nested.tar.gz" "$REMOTE/$asset"
+        set_manifest "$(sha256sum < "$REMOTE/$asset" | awk '{print $1}')  $asset"
     fi
 else
     echo 'SKIP: python3 unavailable for adversarial archive construction'
@@ -1207,16 +1212,19 @@ chmod +x "$work/new-platform/uname"
 for host in 'Linux:armv7l:linux/armv7:armv7-unknown-linux-gnueabihf' \
     'FreeBSD:amd64:freebsd/amd64:x86_64-unknown-freebsd'; do
     IFS=: read -r fixture_os fixture_arch fixture_target fixture_triple <<< "$host"
+    fixture_libc=()
+    # A simulated Linux uname on Darwin cannot probe a real Linux libc.
+    [[ "$fixture_os" != Linux ]] || fixture_libc=(--libc gnu)
     platform_asset="demo-1.2.3-${fixture_target%/*}-${fixture_target#*/}.tar.gz"
     tar -czf "$REMOTE/$platform_asset" -C "$work/payload" demo || exit 1
     platform_hash=$(sha256sum < "$REMOTE/$platform_asset" | awk '{print $1}')
     set_manifest "$platform_hash  $platform_asset"
-    DSR_TEST_HOST_OS="$fixture_os" DSR_TEST_HOST_ARCH="$fixture_arch" PATH="$work/new-platform:$PATH" run_install
+    DSR_TEST_HOST_OS="$fixture_os" DSR_TEST_HOST_ARCH="$fixture_arch" PATH="$work/new-platform:$PATH" run_install "${fixture_libc[@]}"
     check "$fixture_target installs its verified platform archive" success
     check "$fixture_target selects its compiler triple" grep -q "Target: $fixture_triple" "$case_dir/err"
     check "$fixture_target installed bytes retain their checksum" cmp -s "$work/payload/demo" "$case_dir/bin/demo"
     set_manifest "$(printf '%064d' 0)  $platform_asset"
-    DSR_TEST_HOST_OS="$fixture_os" DSR_TEST_HOST_ARCH="$fixture_arch" PATH="$work/new-platform:$PATH" run_install
+    DSR_TEST_HOST_OS="$fixture_os" DSR_TEST_HOST_ARCH="$fixture_arch" PATH="$work/new-platform:$PATH" run_install "${fixture_libc[@]}"
     check "$fixture_target still refuses incorrect checksums" blocked
 done
 set_manifest "$(sha256sum < "$REMOTE/$asset" | awk '{print $1}')  $asset"

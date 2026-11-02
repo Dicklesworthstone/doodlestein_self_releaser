@@ -36,6 +36,7 @@ TEMP_DIR=""
 
 setup() {
     TEMP_DIR=$(mktemp -d)
+    TEMP_DIR=$(cd "$TEMP_DIR" && pwd -P) || return 1
     export XDG_CONFIG_HOME="$TEMP_DIR/config"
     export XDG_CACHE_HOME="$TEMP_DIR/cache"
     export DSR_CONFIG_DIR="$TEMP_DIR/config/dsr"

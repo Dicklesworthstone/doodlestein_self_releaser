@@ -5,7 +5,7 @@
 # DSR_TEST_SYNC_MODULE selects the unchanged incumbent for before/after runs.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
-exec python3 -I -S - "$ROOT" <<'PY'
+exec python3 -I -S - "$ROOT" "$BASH" <<'PY'
 import hashlib, json, os, pathlib, shutil, signal, subprocess, sys, tempfile, time
 P = pathlib.Path
 root = P(sys.argv[1])
@@ -82,6 +82,9 @@ if os.environ.get('SYNC_PHASE')=='after-issue': subprocess.run([sys.executable,s
 print('https://github.com/owner/a/issues/1')
 ''')
 for p in bin_dir.iterdir(): p.chmod(0o755)
+# Preserve the selected supported interpreter across the isolated PATH below;
+# macOS /bin/bash is older than DSR's minimum supported version.
+(bin_dir/'bash').symlink_to(P(sys.argv[2]).resolve(strict=True))
 
 counter=0
 

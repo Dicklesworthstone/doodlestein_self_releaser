@@ -6,6 +6,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 source "$ROOT/src/release_bundle.sh"
 _rb_require || exit $?
 WORK=$(mktemp -d)
+WORK=$(cd "$WORK" && pwd -P) || exit 1
 trap 'rm -rf -- "$WORK"' EXIT
 PASS=0 FAIL=0
 ok() { printf 'PASS %s\n' "$1"; PASS=$((PASS+1)); }

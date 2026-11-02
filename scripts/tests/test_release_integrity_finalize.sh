@@ -9,8 +9,11 @@ RI_HARNESS_ONLY=true source "$HERE/test_release_integrity.sh"
 source "${DSR_TEST_GROUPS_MODULE:-$ROOT/scripts/test_groups.sh}"
 # shellcheck source=src/release_finalize.sh
 source "${RF_TEST_MODULE:-$ROOT/src/release_finalize.sh}"
+# Load real outbox identity helpers before the explicit transport fixtures.
+# Lazy loading during finalization would otherwise replace those fixtures.
+source "$ROOT/src/dispatch.sh" || exit 1
 FI_MODE='' FI_PUBLIC="$WORK/public" FI_SECRET="$WORK/private"
-SBOMS='' FI_READS='' FI_REQUIRE=true
+SBOMS='' FI_REQUIRE=true
 _sbr_context() {
     printf 'read\n' >> "$CASE/reads"
     if [[ "$FI_MODE" == manifest-before-snapshot ]]; then
@@ -29,7 +32,7 @@ _sbr_inventory_sha256() {
 # The uploader boundary returns its documented receipt, with real selected files
 # and retained IDs. Its internal resume behavior has its own separate suite.
 release_upload_payloads() {
-    local root="$1" manifest='' repo='' tag='' sha='' dry=false selection context inventory entry name
+    local root="$1" manifest='' repo='' tag='' sha='' dry=false selection context inventory name
     shift
     while (($#)); do
         case "$1" in
@@ -203,7 +206,7 @@ fi_worker_abort() { exit 17; }
 fi_worker_nonzero() { check 'worker assertion before failing exit' true; return 17; }
 fi_worker_empty() { :; }
 fi_worker_bad_counts() { checks=1 failures=2; }
-fi_worker_later() { sleep 1; check 'later worker completes' true; printf done > "$FI_REAP_MARKER"; }
+fi_worker_later() { sleep 1; check 'later worker completes' true; printf 'done' > "$FI_REAP_MARKER"; }
 fi_expect_group_status() {
     local expected=$1 observed=0; shift
     (checks=0 failures=0; dsr_test_groups "$@") || observed=$?
@@ -217,6 +220,8 @@ fi_expect_all_reaped() {
 fi_completion_cases() {
 new_fi_case complete
 capture signed --upload-payloads
+# status is assigned by capture() in the sourced integrity harness.
+# shellcheck disable=SC2154
 check 'one invocation signs before payload upload and finalizes a draft' test "$status" -eq 0
 check 'ready draft result distinguishes authenticated bundle from unsigned SBOMs' jq -e '.status=="ready" and .integrity.authenticated and .integrity.release.draft and .verification.status=="verified"' "$CASE/out"
 check 'signature preparation precedes first payload uploader call' test "$(head -1 "$CASE/events")" = payload-upload
@@ -351,14 +356,14 @@ check 'malformed signature receipt cannot promote release' never_promoted
 release_publish_integrity() { _ri_execute publish "$@"; }
 
 new_fi_case manifest-race
-FI_MODE=manifest-before-snapshot
+FI_MODE='manifest-before-snapshot'
 capture signed --upload-payloads --promote
 check 'changed valid build manifest after planning is rejected' test "$status" -eq 2
 check 'changed plan causes no signatures' test ! -s "$CASE/signs"
 check 'changed plan causes no uploads' test ! -s "$CASE/events"
 
 new_fi_case post-upload-manifest
-FI_MODE=manifest-after-payloads
+FI_MODE='manifest-after-payloads'
 capture signed --upload-payloads --promote
 check 'manifest mutation after payload upload blocks the next stage' test "$status" -eq 2
 check 'post-upload manifest mutation prevents signature metadata uploads' test ! -s "$CASE/uploads"
