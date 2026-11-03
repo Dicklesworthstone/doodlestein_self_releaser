@@ -3959,6 +3959,75 @@ _act_zig_shim_prefix_sh() {
 chmod 755 '$shim_dir_q/cargo'; "
 }
 
+# Check the new, build-writable PATH directory before selecting the observer
+# interpreter. Only shell builtins run here: an added python3 must not be able
+# to impersonate the very verifier that would reject it. The subshell confines
+# shell-specific glob options and inherited glob filters to this check.
+_act_zig_shim_bootstrap_guard_sh() {
+    local shim_dir="${1:-}" shim_dir_q
+    [[ -n "$shim_dir" ]] || return 0
+    printf -v shim_dir_q '%q' "$shim_dir"
+    printf '_dsr_expected_shim_dir=%s\n' "$shim_dir_q"
+    cat <<'DSR_ZIG_BOOTSTRAP_SH'
+(
+    set +f
+    unset GLOBIGNORE || exit 86
+    if test -n "${ZSH_VERSION:-}"; then
+        setopt nonomatch
+    elif test -n "${BASH_VERSION:-}"; then
+        shopt -u failglob
+    fi
+    if ! test -d "$_dsr_expected_shim_dir" || test -L "$_dsr_expected_shim_dir" ||
+       ! test -r "$_dsr_expected_shim_dir" || ! test -x "$_dsr_expected_shim_dir"; then
+        printf '[dsr] toolchain identity: generated DSR Cargo shim directory is not a readable plain directory\n' >&2
+        exit 86
+    fi
+    for _dsr_shim_entry in "$_dsr_expected_shim_dir"/* "$_dsr_expected_shim_dir"/.[!.]* "$_dsr_expected_shim_dir"/..?*; do
+        if test -e "$_dsr_shim_entry" || test -L "$_dsr_shim_entry"; then
+            case "$_dsr_shim_entry" in
+                "$_dsr_expected_shim_dir/cargo") ;;
+                *) printf '[dsr] toolchain identity: unexpected entry in generated DSR Cargo shim directory: %s\n' "$_dsr_shim_entry" >&2; exit 86 ;;
+            esac
+        fi
+    done
+) || exit 86
+DSR_ZIG_BOOTSTRAP_SH
+}
+
+# Resolve Python once to an absolute executable outside the generated shim
+# directory, and execute that same selection for the capability check and the
+# observer body. Repeating a bare PATH lookup would permit a late python3 file
+# to replace a successfully checked interpreter.
+_act_toolchain_python_prefix_sh() {
+    local shim_dir="${1:-}" shim_dir_q
+    _act_zig_shim_bootstrap_guard_sh "$shim_dir" || return $?
+    printf -v shim_dir_q '%q' "$shim_dir"
+    printf '_dsr_tool_shim_dir=%s\n' "$shim_dir_q"
+    cat <<'DSR_TOOL_PYTHON_SH'
+dsr_tool_python=
+for dsr_tool_candidate in python3 python3.14 python3.13 python3.12 python3.11; do
+    dsr_tool_path=$(command -v "$dsr_tool_candidate") || continue
+    case "$dsr_tool_path" in /*) ;; *) continue ;; esac
+    if test -n "$_dsr_tool_shim_dir"; then
+        dsr_tool_parent=$(CDPATH= cd -P "${dsr_tool_path%/*}" && pwd -P) || exit 86
+        dsr_tool_shim_parent=$(CDPATH= cd -P "$_dsr_tool_shim_dir" && pwd -P) || exit 86
+        if test "$dsr_tool_parent" = "$dsr_tool_shim_parent"; then
+            printf '[dsr] toolchain identity: Python cannot be selected from the generated DSR Cargo shim directory\n' >&2
+            exit 86
+        fi
+    fi
+    if "$dsr_tool_path" -I -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then
+        dsr_tool_python=$dsr_tool_path
+        break
+    fi
+done
+if test -z "$dsr_tool_python"; then
+    printf '[dsr] toolchain identity: Python 3.11+ is required for executable attestation\n' >&2
+    exit 86
+fi
+DSR_TOOL_PYTHON_SH
+}
+
 # Highest NUL-delimited GLIBC_x.y[.z] version-string token in <file>. Version
 # needs in an ELF live in .dynstr as exact NUL-terminated tokens, so a NUL to
 # newline conversion plus a whole-line match reads them portably (no objdump
@@ -8999,18 +9068,18 @@ _act_ssh_exec_unix_program() {
 # remain in the run's fresh target directory; no cached output is collected on
 # failure. Python owns the advisory lock through build and output detachment.
 _act_strict_cargo_cache_script() {
-    local cache_root="$1" cache_contract="$2" command="$3"
+    local cache_root="$1" cache_contract="$2" command="$3" zig_shim_dir="${4:-}"
     local root_q contract_q command_q selection_script
     printf -v root_q '%q' "$cache_root"
     printf -v contract_q '%q' "$cache_contract"
     printf -v command_q '%q' "$command"
-    selection_script=$(_act_toolchain_identity_script context /dev/null "$command") || return $?
+    selection_script=$(_act_toolchain_identity_script context /dev/null "$command" "" "" "" "$zig_shim_dir") || return $?
     # Assignment preserves an inherited export attribute. Clear it before
     # collecting the potentially large observation, so only fd3 carries it.
     printf 'unset dsr_cache_context || exit $?\n'
     printf 'dsr_cache_context=$(\n%s\n) || exit $?\n' "$selection_script"
     # tomllib needs Python 3.11+; see _act_toolchain_identity_script.
-    printf '%s\n' 'dsr_tool_python=python3; for dsr_tool_candidate in python3 python3.14 python3.13 python3.12 python3.11; do if command -v "$dsr_tool_candidate" >/dev/null 2>&1 && "$dsr_tool_candidate" -I -c '\''import sys; sys.exit(sys.version_info < (3, 11))'\'' 2>/dev/null; then dsr_tool_python=$dsr_tool_candidate; break; fi; done'
+    _act_toolchain_python_prefix_sh "$zig_shim_dir" || return $?
     # Environment entries have the same single-argument limit as exec argv on
     # Linux. Keep the observation on an inherited input descriptor instead.
     printf 'unset DSR_CARGO_TOOLCHAIN_CONTEXT || exit $?\n'
@@ -9127,6 +9196,12 @@ excluded = {'CARGO_HOME', 'CARGO_TARGET_DIR', 'CARGO_BUILD_BUILD_DIR',
 influences = {k: v for k, v in probe_env.items() if k not in excluded and
               (k.startswith(('CARGO_', 'RUST', 'XWIN_')) or
                re.search(r'(^|_)(CC|CXX|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET)($|_)', k))}
+shim_selection = selected_identity.get('selection', {}).get('dsr_cargo_shim')
+if shim_selection is not None:
+    for variable, field in (('DSR_RUST_TARGET', 'rust_target'), ('DSR_ZIG_TARGET', 'zig_target'),
+                            ('DSR_LINUX_GLIBC_FLOOR', 'glibc_floor')):
+        require(probe_env.get(variable) == shim_selection[field], 'generated shim dispatch context changed')
+        influences[variable] = shim_selection[field]
 tools = {}
 for name in ('CC', 'CXX', 'AR', 'LD'):
     argv = shlex.split(probe_env.get(name, {'CC': 'cc', 'CXX': 'c++', 'AR': 'ar', 'LD': 'ld'}[name]))
@@ -9152,6 +9227,15 @@ contract = {'schema': 2, 'source_freshness': 'nightly-content-no-build-scripts-v
 # Include actual target/linker/plugin bytes without the fresh source cwd: two
 # immutable copies of the same project can still reuse eligible intermediates.
 contract['toolchain'] = {key: selected_identity[key] for key in ('target_triple', 'linker_variable', 'tools')}
+if shim_selection is not None:
+    # Only the generated launcher's per-run location is ephemeral. The full
+    # path remains in the coordinator-held executable observation; the cache
+    # key retains its verified bytes/kind and explicit target/floor influences.
+    # This is cache key material, not a substitute toolchain identity receipt.
+    contract['toolchain']['tools'] = dict(contract['toolchain']['tools'])
+    shim_key = dict(contract['toolchain']['tools']['dsr_cargo_shim'])
+    del shim_key['selected_path']
+    contract['toolchain']['tools']['dsr_cargo_shim'] = shim_key
 with open('Cargo.toml', 'rb') as manifest:
     contract['profiles'] = tomllib.load(manifest).get('profile', {})
 contract['cargo_config'] = {name: digest(name) for name in ('.cargo/config', '.cargo/config.toml')
@@ -9229,18 +9313,29 @@ PY
 # Apple /usr/bin compiler launchers, its dispatch target and content digest.
 # Internal metadata mode runs locked/offline metadata with the same selection;
 # context mode passes selected executable authority to the intermediate cache.
-# Args: mode output_json build_cmd extra_tools(space-separated) receipt_pin expected_cwd
+# Args: mode output_json build_cmd extra_tools(space-separated) receipt_pin expected_cwd zig_shim_dir
 _act_toolchain_identity_script() {
     local mode="$1" output="$2" build_cmd="$3" extra_tools="${4:-}" receipt_pin="${5:-}" expected_cwd="${6:-}"
+    local zig_shim_dir="${7:-}" zig_shim_hash="" shim_dir_q shim_hash_q
     local output_q command_q extra_q pin_q cwd_q python_q=python3
     [[ "$mode" == record || "$mode" == verify || "$mode" == read || "$mode" == metadata || "$mode" == context || "$mode" == target ]] || return 4
     [[ "$output" == /* && "$output" != *..* ]] || return 4
     [[ -z "$expected_cwd" || ( "$expected_cwd" == /* && "$expected_cwd" != *..* ) ]] || return 4
+    if [[ -n "$zig_shim_dir" ]]; then
+        [[ "$zig_shim_dir" == /* && "$zig_shim_dir" != *..* ]] || return 4
+        # Derive authority from the controller's generator, never from worker
+        # bytes or a build-controlled environment variable. Preserve the exact
+        # trailing newline materialized by _act_zig_shim_prefix_sh.
+        zig_shim_hash=$(_act_zig_cargo_shim_sh | _act_sha256 /dev/stdin) || return 4
+        [[ "$zig_shim_hash" =~ ^[0-9a-f]{64}$ ]] || return 4
+    fi
     printf -v output_q '%q' "$output"
     printf -v command_q '%q' "$build_cmd"
     printf -v extra_q '%q' "$extra_tools"
     printf -v pin_q '%q' "$receipt_pin"
     printf -v cwd_q '%q' "$expected_cwd"
+    printf -v shim_dir_q '%q' "$zig_shim_dir"
+    printf -v shim_hash_q '%q' "$zig_shim_hash"
     # Target-only planning runs on the coordinator without invoking any build
     # tools or reading its Cargo configuration. The configured PATH may be a
     # remote host path, so use the coordinator's absolute Python interpreter.
@@ -9251,14 +9346,14 @@ _act_toolchain_identity_script() {
         # Attesting a Cargo configuration needs tomllib (Python 3.11+), but a
         # login shell can put an older python3 first (macOS path_helper puts
         # /usr/bin/python3 3.9 ahead of Homebrew). Prefer a new enough one.
-        printf '%s\n' 'dsr_tool_python=python3; for dsr_tool_candidate in python3 python3.14 python3.13 python3.12 python3.11; do if command -v "$dsr_tool_candidate" >/dev/null 2>&1 && "$dsr_tool_candidate" -I -c '\''import sys; sys.exit(sys.version_info < (3, 11))'\'' 2>/dev/null; then dsr_tool_python=$dsr_tool_candidate; break; fi; done'
+        _act_toolchain_python_prefix_sh "$zig_shim_dir" || return $?
         python_q='"$dsr_tool_python"'
     fi
-    printf '%s -I - %s %s %s %s %s %s <<\x27DSR_TOOLCHAIN_IDENTITY_PY\x27\n' "$python_q" "$mode" "$output_q" "$command_q" "$extra_q" "$pin_q" "$cwd_q"
+    printf '%s -I - %s %s %s %s %s %s %s %s <<\x27DSR_TOOLCHAIN_IDENTITY_PY\x27\n' "$python_q" "$mode" "$output_q" "$command_q" "$extra_q" "$pin_q" "$cwd_q" "$shim_dir_q" "$shim_hash_q"
     cat <<'PY'
 import hashlib, json, os, pathlib, re, shlex, shutil, stat, subprocess, sys
 
-mode, output, command, extra, receipt_pin, expected_cwd = sys.argv[1:7]
+mode, output, command, extra, receipt_pin, expected_cwd, zig_shim_dir, zig_shim_hash = sys.argv[1:9]
 
 def fail(message):
     sys.stderr.write('[dsr] toolchain identity: ' + message + '\n')
@@ -9378,7 +9473,8 @@ def shell_word(raw, variables=()):
 
 
 def influences(name):
-    return name in ('PATH', 'DSR_TARGET_TRIPLE') or name.startswith(('CARGO_', 'RUST', 'XWIN_')) or bool(re.search(
+    return name in ('PATH', 'DSR_TARGET_TRIPLE', 'DSR_RUST_TARGET', 'DSR_ZIG_TARGET',
+                    'DSR_LINUX_GLIBC_FLOOR') or name.startswith(('CARGO_', 'RUST', 'XWIN_')) or bool(re.search(
         r'(^|_)(CC|CXX|CPP|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET)($|_)', name))
 
 
@@ -10053,6 +10149,83 @@ if mode == 'target':
 cargo_effective_environment(cargo_config, cargo_config_receipts, probe_env)
 
 
+# DSR's generated glibc-floor launcher is an additional attested input, not
+# Cargo or a Rustup reference. Check it before any compiler version execution,
+# then perform normal executable identity checks under the PATH it delegates
+# to. The actual build retains the original PATH and therefore still goes
+# through cargo-zigbuild. An unknown script at this position never executes.
+zig_shim_record = None
+zig_shim_file = None
+zig_shim_parent = None
+
+
+def verify_zig_shim():
+    if zig_shim_record is None:
+        return
+    try:
+        zig_shim_file.seek(0)
+        observed = hashlib.sha256(zig_shim_file.read(65537)).hexdigest()
+        named = os.stat(zig_shim_path, follow_symlinks=False)
+        parent = os.stat(zig_shim_dir, follow_symlinks=False)
+        if (receipt_identity(zig_shim_before) != receipt_identity(os.fstat(zig_shim_file.fileno())) or
+                receipt_identity(zig_shim_before) != receipt_identity(named) or
+                (parent.st_dev, parent.st_ino) != (zig_shim_parent_before.st_dev, zig_shim_parent_before.st_ino) or
+                observed != zig_shim_hash or set(os.listdir(zig_shim_parent)) != {'cargo'}):
+            fail('generated DSR Cargo shim changed during toolchain observation')
+    except OSError as error:
+        fail('cannot verify generated DSR Cargo shim: ' + str(error))
+
+
+if zig_shim_dir:
+    try:
+        shim_directory = pathlib.Path(zig_shim_dir)
+        zig_shim_path = shim_directory / 'cargo'
+        path_entries = probe_env.get('PATH', '').split(os.pathsep)
+        if (path_entries[0] != zig_shim_dir or
+                shutil.which('cargo', path=probe_env.get('PATH')) != str(zig_shim_path)):
+            fail('generated DSR Cargo shim is not the selected first PATH entry')
+        if any(any(char in entry for char in '*?[') for entry in path_entries):
+            fail('globbed PATH entries are outside generated DSR Cargo shim attestation')
+        # Match POSIX IFS splitting and the launcher's concatenation exactly:
+        # one trailing empty field is dropped by shell field splitting;
+        # initial empties collapse, but later empties retain current-directory
+        # lookup. Dropping those would attest a different Cargo or plugin.
+        split_entries = path_entries[:-1] if path_entries[-1] == '' else path_entries
+        delegated_path = ''
+        for entry in split_entries:
+            if entry != zig_shim_dir:
+                delegated_path += (os.pathsep if delegated_path else '') + entry
+        if any(pathlib.Path(entry).resolve() == shim_directory.resolve()
+               for entry in delegated_path.split(os.pathsep) if entry):
+            fail('recursive alias of generated DSR Cargo shim directory on PATH')
+        if any(probe_env.get(name) != os.environ.get(name) for name in (
+                'DSR_RUST_TARGET', 'DSR_ZIG_TARGET', 'DSR_LINUX_GLIBC_FLOOR')):
+            fail('build_cmd cannot override generated DSR Cargo shim target selection')
+        floor = probe_env.get('DSR_LINUX_GLIBC_FLOOR', '')
+        if (not re.fullmatch(r'[0-9]+\.[0-9]+', floor) or
+                not selection['target'].endswith('-linux-gnu') or
+                probe_env.get('DSR_RUST_TARGET') != selection['target'] or
+                probe_env.get('DSR_ZIG_TARGET') != selection['target'] + '.' + floor):
+            fail('generated DSR Cargo shim target/floor does not match the admitted build')
+        zig_shim_parent = os.open(shim_directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        zig_shim_parent_before = os.fstat(zig_shim_parent)
+        fd = os.open('cargo', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=zig_shim_parent)
+        zig_shim_file = os.fdopen(fd, 'rb')
+        zig_shim_before = os.fstat(zig_shim_file.fileno())
+        if (not stat.S_ISREG(zig_shim_before.st_mode) or
+                zig_shim_before.st_uid != os.geteuid() or
+                zig_shim_before.st_mode & 0o022 or not os.access(zig_shim_path, os.X_OK) or
+                zig_shim_before.st_size > 65536 or
+                hashlib.sha256(zig_shim_file.read(65537)).hexdigest() != zig_shim_hash):
+            fail('generated DSR Cargo shim does not match the trusted generator bytes or ownership')
+        zig_shim_record = {'program': 'cargo', 'selected_path': str(zig_shim_path),
+                           'selected_sha256': zig_shim_hash, 'selected_kind': 'script', 'version': ''}
+        verify_zig_shim()
+        probe_env['PATH'] = delegated_path
+    except (OSError, RuntimeError) as error:
+        fail('cannot admit generated DSR Cargo shim: ' + str(error))
+
+
 def run(argv, required=True, timeout=60):
     try:
         result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=probe_env)
@@ -10288,6 +10461,8 @@ cargo_version_args = (['+' + selection['toolchain']] if explicit_toolchain else 
 compiler = probe_env.get('RUSTC') or probe_env.get('CARGO_BUILD_RUSTC') or cargo_config['build'].get('rustc') or 'rustc'
 tools = {'cargo': identity('cargo', 'cargo', cargo_version_args, 'cargo'),
          'rustc': identity('rustc', compiler, ['-vV'], 'rustc')}
+if zig_shim_record is not None:
+    tools['dsr_cargo_shim'] = zig_shim_record
 if not triple:
     triple = next((line.split(': ', 1)[1] for line in tools['rustc']['version'].splitlines()
                    if line.startswith('host: ')), '')
@@ -10312,21 +10487,31 @@ if default_linker:
 # the build through (cargo-zigbuild and zig for the portable glibc floor).
 plugins = set(cargo_commands)
 plugins.update(name[len('cargo-'):] for name in extra.split() if name.startswith('cargo-'))
+if zig_shim_record is not None:
+    plugins.add('zigbuild')
 for sub in sorted(plugins):
     program = 'cargo-' + sub
+    if zig_shim_record is not None and sub == 'zigbuild' and not shutil.which(program, path=probe_env.get('PATH')):
+        fail('generated DSR Cargo shim requires cargo-zigbuild on the delegated PATH')
     if shutil.which(program, path=probe_env.get('PATH')):
         tools[program] = identity(program, program, ['--version'], program, required=False)
-for name in sorted(set(extra.split())):
+for name in sorted(set(extra.split()) | ({'zig'} if zig_shim_record is not None else set())):
     if not name.startswith('cargo-') and name not in tools:
-        record = identity(name, name, ['version' if name == 'zig' else '--version'], required=False)
+        record = identity(name, name, ['version' if name == 'zig' else '--version'],
+                          required=zig_shim_record is not None and name == 'zig')
         if record:
             tools[name] = record
+verify_zig_shim()
 result = {'schema_version': 1, 'cwd': os.getcwd(), 'target_triple': triple,
           'linker_variable': linker_variable if probe_env.get(linker_variable) else None, 'tools': tools,
           'selection': {'rustup_toolchain': selection['toolchain'],
                         'cargo_commands': cargo_commands,
                         'cargo_config': cargo_config_receipts,
                         'cargo_target': cargo_target_receipt}}
+if zig_shim_record is not None:
+    result['selection']['dsr_cargo_shim'] = {
+        'rust_target': probe_env['DSR_RUST_TARGET'], 'zig_target': probe_env['DSR_ZIG_TARGET'],
+        'glibc_floor': probe_env['DSR_LINUX_GLIBC_FLOOR']}
 
 # Metadata admission uses the same cfg/compiler validation as the build.
 if mode == 'metadata':
@@ -10336,6 +10521,7 @@ if mode == 'metadata':
                                   timeout=300))
     except ValueError as error:
         fail('invalid selected Cargo metadata: ' + str(error))
+    verify_zig_shim()
     json.dump(metadata, sys.stdout, sort_keys=True)
     sys.stdout.write('\n')
     sys.exit(0)
@@ -10721,6 +10907,7 @@ act_run_native_build() {
     local strict_private_cargo_cache=false strict_cargo_seed_json='null' strict_toolchain_receipt=""
     local strict_toolchain_record_cmd="" strict_toolchain_run_prefix="" strict_toolchain_effective_build=""
     local strict_toolchain_extra="" strict_toolchain_pin_json="" strict_toolchain_identity_json=""
+    local strict_toolchain_shim_dir=""
     local strict_cargo_context_json='null' strict_dependency_sources_json='null' strict_windows_toolchain_json='null'
     local strict_sources_verification=""
     local build_influence_env_json='{}'
@@ -11508,11 +11695,15 @@ EOF
             if [[ -n "$zig_shim_dir" ]]; then
                 cargo_home_prefix+=$(_act_zig_shim_prefix_sh "$zig_shim_dir")
                 env_exports+="export PATH='${zig_shim_dir}':\"\$PATH\"; "
+                if $strict_rust_build; then
+                    strict_toolchain_shim_dir="$zig_shim_dir"
+                fi
             fi
         fi
         local effective_build="$build_cmd"
         if [[ -n "$strict_cache_root" ]]; then
-            effective_build=$(_act_strict_cargo_cache_script "$strict_cache_root" "$strict_cache_contract" "$build_cmd") || return 4
+            effective_build=$(_act_strict_cargo_cache_script "$strict_cache_root" "$strict_cache_contract" "$build_cmd" \
+                "$strict_toolchain_shim_dir") || return 4
         fi
         if [[ -n "$strict_toolchain_receipt" ]]; then
             # Keep the original observation at the coordinator, outside the
@@ -11521,7 +11712,8 @@ EOF
             local toolchain_record
             [[ -n "$rust_zig_target" ]] && strict_toolchain_extra="cargo-zigbuild zig"
             toolchain_record=$(_act_toolchain_identity_script record \
-                "$strict_toolchain_receipt" "$build_cmd" "$strict_toolchain_extra" "" "$remote_path") || return 4
+                "$strict_toolchain_receipt" "$build_cmd" "$strict_toolchain_extra" "" "$remote_path" \
+                "$strict_toolchain_shim_dir") || return 4
             strict_toolchain_record_cmd="set -e; $cargo_home_prefix$cd_cmd; $env_exports$toolchain_record"$'\n'
             strict_toolchain_run_prefix="set -e; $cd_cmd; $env_exports"
             strict_toolchain_effective_build="$effective_build"
@@ -11643,7 +11835,8 @@ EOF
            strict_toolchain_pin_json=$(jq -c '.pin' <<< "$toolchain_observation_json") && \
            strict_toolchain_identity_json=$(jq -c '.identity' <<< "$toolchain_observation_json") && \
            toolchain_verify=$(_act_toolchain_identity_script verify "$strict_toolchain_receipt" \
-                "$build_cmd" "$strict_toolchain_extra" "$strict_toolchain_pin_json" "$remote_path"); then
+                "$build_cmd" "$strict_toolchain_extra" "$strict_toolchain_pin_json" "$remote_path" \
+                "$strict_toolchain_shim_dir"); then
             # Restore heredoc terminator newlines dropped by command substitution.
             remote_cmd="$strict_toolchain_run_prefix$toolchain_verify"$'\n'"$strict_toolchain_effective_build"$'\n'"$toolchain_verify"$'\n'
         else

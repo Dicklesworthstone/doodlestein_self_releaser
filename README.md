@@ -1316,6 +1316,17 @@ cross toolchain (`CARGO_TARGET_<T>_LINKER` / `CC_<t>`) or build commands that
 already invoke `zigbuild`, `xwin`, or `cross` — but an explicitly configured
 `linux_glibc_floor` is still enforced on those binaries.
 
+Strict Unix builds attest the generated Cargo shim separately from the actual
+Cargo, rustc and rustup executables it delegates to. The expected shim hash is
+derived from DSR's generator; changed bytes, links or unexpected files in its
+directory stop admission before a toolchain probe can use them. The original
+receipt binds the target and glibc floor and is checked again before and after
+compilation. The build still runs through cargo-zigbuild and Zig, whose
+executable identities are also retained. `strict_cargo_cache_root` uses this
+same verified dispatch and separates cache entries by target and floor, while
+allowing identical generated shims in fresh source stages to reuse eligible
+intermediates.
+
 ### gnu and musl variants of one platform
 
 A platform may list several target triples when a release ships, for example,

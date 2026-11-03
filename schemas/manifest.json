@@ -716,6 +716,32 @@
             }
           }
         }
+      }, {
+        "if": {
+          "anyOf": [
+            {"required": ["selection"], "properties": {"selection": {"required": ["dsr_cargo_shim"]}}},
+            {"required": ["tools"], "properties": {"tools": {"required": ["dsr_cargo_shim"]}}}
+          ]
+        },
+        "then": {
+          "required": ["selection"],
+          "properties": {
+            "cwd": {"pattern": "^/"},
+            "selection": {"required": ["dsr_cargo_shim"]},
+            "tools": {
+              "required": ["dsr_cargo_shim", "cargo-zigbuild", "zig"],
+              "properties": {
+                "dsr_cargo_shim": {
+                  "properties": {
+                    "program": {"const": "cargo"},
+                    "selected_kind": {"const": "script"},
+                    "version": {"const": ""}
+                  }
+                }
+              }
+            }
+          }
+        }
       }],
       "properties": {
         "schema_version": {"const": 1},
@@ -733,6 +759,26 @@
               "items": {"type": "string", "pattern": "^[a-z][a-z0-9-]*$"}
             },
             "cargo_target": {"$ref": "#/$defs/cargo_target_observation"},
+            "dsr_cargo_shim": {
+              "type": "object",
+              "description": "Target and glibc floor delegated by the separately byte-verified DSR Cargo shim; underlying Cargo, rustup, cargo-zigbuild and Zig retain their executable identities.",
+              "required": ["rust_target", "zig_target", "glibc_floor"],
+              "additionalProperties": false,
+              "properties": {
+                "rust_target": {
+                  "type": "string", "pattern": "^[A-Za-z0-9_]+(-[A-Za-z0-9_]+)*-linux-gnu$",
+                  "not": {"pattern": "[^A-Za-z0-9_-]"}
+                },
+                "zig_target": {
+                  "type": "string", "pattern": "^[A-Za-z0-9_]+(-[A-Za-z0-9_]+)*-linux-gnu\\.[0-9]+\\.[0-9]+$",
+                  "not": {"pattern": "[^A-Za-z0-9_.-]"}
+                },
+                "glibc_floor": {
+                  "type": "string", "pattern": "^[0-9]+\\.[0-9]+$",
+                  "not": {"pattern": "[^0-9.]"}
+                }
+              }
+            },
             "cargo_config": {
               "type": "array",
               "items": {

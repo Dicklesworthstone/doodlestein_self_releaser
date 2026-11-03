@@ -11,6 +11,7 @@ on:
       - scripts/tests/test_cargo_cache.sh
       - scripts/tests/test_native_single_archives.sh
       - scripts/tests/test_strict_cargo_private_cache.sh
+      - scripts/tests/test_toolchain_identity.sh
       - .github/workflows/native-archive-regression.yml
   workflow_dispatch:
 permissions:
@@ -49,6 +50,37 @@ jobs:
           mkdir -p "$RUNNER_TEMP/dsr-test-bin"
           GOBIN="$RUNNER_TEMP/dsr-test-bin" go install github.com/mikefarah/yq/v4@v4.47.1
           echo "$RUNNER_TEMP/dsr-test-bin" >> "$GITHUB_PATH"
+      # This gate runs the generated floor shim through genuine Rustup/Cargo
+      # and Zig on macOS, producing both Linux GNU architectures at glibc 2.28.
+      - name: Qualify macOS to Linux glibc-floor toolchain identity
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          RUSTUP_TOOLCHAIN: nightly-2026-08-31
+          PIP_DISABLE_PIP_VERSION_CHECK: '1'
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          command -v rustup
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          rustup target add --toolchain "$RUSTUP_TOOLCHAIN" \
+            x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+          dsr_test_venv="$RUNNER_TEMP/dsr-zig-shim-qualification"
+          python3 -m venv "$dsr_test_venv"
+          "$dsr_test_venv/bin/python3" -m pip install \
+            'cargo-zigbuild==0.24.0' 'ziglang==0.17.0'
+          dsr_test_zig=$("$dsr_test_venv/bin/python3" -c \
+            'from pathlib import Path; import ziglang; print(Path(ziglang.__file__).with_name("zig"))')
+          test -x "$dsr_test_zig"
+          if [[ ! -e "$dsr_test_venv/bin/zig" ]]; then
+            ln -s "$dsr_test_zig" "$dsr_test_venv/bin/zig"
+          fi
+          export PATH="$dsr_test_venv/bin:$PATH"
+          cargo-zigbuild --version
+          zig version
+          bash -n scripts/tests/test_toolchain_identity.sh
+          bash scripts/tests/test_toolchain_identity.sh --rustup-dispatch-only
+          bash scripts/tests/test_toolchain_identity.sh --zig-shim-only
       - name: Validate actual native archive collection and receipts
         shell: bash
         run: |

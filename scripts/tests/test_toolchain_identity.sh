@@ -7,8 +7,10 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 MODE=all
 if [[ "${1:-}" == --rustup-dispatch-only && $# == 1 ]]; then
     MODE=rustup-dispatch
+elif [[ "${1:-}" == --zig-shim-only && $# == 1 ]]; then
+    MODE=zig-shim
 elif (( $# != 0 )); then
-    printf 'Usage: %s [--rustup-dispatch-only]\n' "$0" >&2
+    printf 'Usage: %s [--rustup-dispatch-only|--zig-shim-only]\n' "$0" >&2
     exit 4
 fi
 for tool in python3 bash cargo rustc rustup cc jq; do
@@ -19,6 +21,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import subprocess
@@ -113,7 +116,7 @@ environment['CARGO_BUILD_TARGET'] = host
 # executing it, and give descendants closed stdin. A fault-injected Python
 # version probe must not consume later program text from the interpreter pipe.
 program = '''source "$1" || exit $?;
-dsr_identity_program=$(_act_toolchain_identity_script "$2" "$3" "$4" "" "$5" "$6") || exit $?
+dsr_identity_program=$(_act_toolchain_identity_script "$2" "$3" "$4" "" "$5" "$6" "$7") || exit $?
 printf '{\\n%s\\n} </dev/null\\n' "$dsr_identity_program" | bash'''
 counter = 0
 receipt_pins = {}
@@ -185,7 +188,8 @@ check('production target checkpoint retains the large receipt without exec argv 
           'target_statuses', {}).get('linux/amd64', {}).get('result') == large_target)
 
 
-def probe(command, env=None, mode='record', receipt=None, pin=None, cwd=None, expected_cwd=None, timeout=120):
+def probe(command, env=None, mode='record', receipt=None, pin=None, cwd=None, expected_cwd=None,
+          timeout=120, zig_shim_dir=''):
     global counter
     counter += 1
     if receipt is None:
@@ -194,7 +198,7 @@ def probe(command, env=None, mode='record', receipt=None, pin=None, cwd=None, ex
     # that held value, never rebase it from a compiler-writable pathname.
     held_pin = receipt_pins.get(str(receipt), {}) if pin is None else pin
     result = run(['bash', '-o', 'pipefail', '-c', program, '_', module, mode, receipt, command,
-                  json.dumps(held_pin), expected_cwd or project], cwd=cwd or project,
+                  json.dumps(held_pin), expected_cwd or project, zig_shim_dir], cwd=cwd or project,
                  env=env or environment, timeout=timeout)
     data = {}
     if result.returncode == 0 and mode == 'record':
@@ -226,7 +230,8 @@ dispatch_bin.mkdir()
 proxy_cargo = dispatch_bin / 'cargo'
 shutil.copy2(Path(shutil.which('rustup')).resolve(), proxy_cargo)
 os.link(proxy_cargo, dispatch_bin / 'rustc')
-for name in ('bash', 'python3', 'cat', 'dirname', 'date', 'jq', 'cc', 'c++', 'as', 'ld', 'ar', 'xcrun', 'xcodebuild'):
+for name in ('bash', 'python3', 'cat', 'dirname', 'date', 'jq', 'cc', 'c++', 'as', 'ld', 'ar',
+             'xcrun', 'xcodebuild', 'sha256sum', 'shasum', 'awk', 'cargo-zigbuild', 'zig'):
     executable = shutil.which(name)
     if executable:
         (dispatch_bin / name).symlink_to(executable)
@@ -351,6 +356,263 @@ shutil.copy2(real_toolchain_executable('rustc', alternate_sysroot / 'bin/rustc')
 
 if mode == 'rustup-dispatch':
     print(str(passed) + ' passed; ' + str(failed) + ' failed')
+    sys.exit(1 if failed else 0)
+
+
+# These are real generated-launcher/Rustup/Cargo/Zig runs, including GNU
+# cross-linking on a macOS host when this same suite is run there. No test
+# command impersonates a compiler or returns a fabricated version string.
+# The dedicated qualification flag requires both Linux standard libraries;
+# existing full-suite users without Zig retain an explicit dependency skip.
+zig_dependencies = all(shutil.which(name) for name in ('cargo-zigbuild', 'zig'))
+zig_targets = ('x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu')
+zig_stdlibs = all((selected / 'lib/rustlib' / target / 'lib').is_dir() for target in zig_targets)
+if mode == 'zig-shim' and not (zig_dependencies and zig_stdlibs):
+    print('Missing qualification dependencies: cargo-zigbuild >=0.23, Zig, and installed '
+          'x86_64/aarch64-unknown-linux-gnu Rust standard libraries', file=sys.stderr)
+    sys.exit(3)
+if zig_dependencies and zig_stdlibs:
+    shim_dir = work / 'glibc-floor-shim'
+    staging = '''source "$1" || exit $?;
+_act_zig_shim_prefix_sh "$2" | bash'''
+    require(['bash', '-o', 'pipefail', '-c', staging, '_', module, shim_dir], env=environment)
+    shim = shim_dir / 'cargo'
+    generated = run(['bash', '-c', 'source "$1"; _act_zig_cargo_shim_sh', '_', module], env=environment)
+    check('staged glibc-floor Cargo shim is byte-identical to the generator including newline',
+          generated.returncode == 0 and shim.read_bytes() == generated.stdout.encode())
+    shim_digest = digest(shim)
+
+    def shim_environment(target, label, direct=False):
+        base = direct_env if direct else dispatch_env
+        # Exercise the launcher's exact empty-field and repeated-directory
+        # removal; the delegated compiler must see the same PATH as the probe.
+        return dict(base, PATH=str(shim_dir) + '::' + base['PATH'] + ':' + str(shim_dir) + ':',
+                    CARGO_BUILD_TARGET=target, DSR_RUST_TARGET=target,
+                    DSR_ZIG_TARGET=target + '.2.28', DSR_LINUX_GLIBC_FLOOR='2.28',
+                    CARGO_TARGET_DIR=str(work / label))
+
+    def linux_output(output, target):
+        path = output / target / 'debug/identity-probe'
+        if not path.is_file():
+            return False
+        data = path.read_bytes()
+        machine = 62 if target.startswith('x86_64-') else 183
+        versions = [tuple(map(int, token[6:].decode().split('.'))) for token in data.split(b'\x00')
+                    if re.fullmatch(rb'GLIBC_[0-9]+\.[0-9]+(?:\.[0-9]+)?', token)]
+        return (data[:5] == b'\x7fELF\x02' and data[5] == 1 and
+                int.from_bytes(data[18:20], 'little') == machine and
+                bool(versions) and
+                all(version + (0,) * (3 - len(version)) <= (2, 28, 0) for version in versions))
+
+    for target in zig_targets:
+        env = shim_environment(target, 'zig-proxy-' + target)
+        env['RUSTUP_TOOLCHAIN'] = 'fixture-default'
+        command = 'cargo +fixture-selected build --quiet --locked --offline --target ' + target
+        before, observed, receipt = probe(command, env, zig_shim_dir=shim_dir)
+        prebuild, _, _ = probe(command, env, mode='verify', receipt=receipt, zig_shim_dir=shim_dir)
+        compiled = build(command, env) if before.returncode == prebuild.returncode == 0 else before
+        after, _, _ = probe(command, env, mode='verify', receipt=receipt, zig_shim_dir=shim_dir)
+        if compiled.returncode:
+            (work / ('zig-build-' + target + '.log')).write_text(compiled.stdout + compiled.stderr)
+        check('genuine Zig floor build with Rustup +toolchain records, compiles and verifies ' + target,
+              before.returncode == prebuild.returncode == compiled.returncode == after.returncode == 0 and
+              linux_output(Path(env['CARGO_TARGET_DIR']), target))
+        check('shim and actual Rustup/Cargo/compiler/plugin bytes are independently retained for ' + target,
+              observed.get('tools', {}).get('dsr_cargo_shim') == {
+                  'program': 'cargo', 'selected_path': str(shim), 'selected_sha256': shim_digest,
+                  'selected_kind': 'script', 'version': ''} and
+              expected_tool(observed, 'cargo', selected / 'bin/cargo') and
+              expected_tool(observed, 'rustc', selected / 'bin/rustc') and
+              observed.get('selection', {}).get('dsr_cargo_shim') == {
+                  'rust_target': target, 'zig_target': target + '.2.28', 'glibc_floor': '2.28'} and
+              observed.get('tools', {}).get('cargo', {}).get('rustup_resolver', {}).get('sha256') == digest(home_manager) and
+              all(name in observed.get('tools', {}) for name in ('cargo-zigbuild', 'zig')))
+
+    target = zig_targets[0]
+    command = 'cargo build --quiet --locked --offline --target=' + target
+    direct_shim_env = shim_environment(target, 'zig-direct', direct=True)
+    direct_before, direct_observed, direct_receipt = probe(command, direct_shim_env, zig_shim_dir=shim_dir)
+    direct_compiled = build(command, direct_shim_env) if direct_before.returncode == 0 else direct_before
+    direct_after, _, _ = probe(command, direct_shim_env, mode='verify', receipt=direct_receipt, zig_shim_dir=shim_dir)
+    check('genuine direct Cargo underneath the DSR shim builds the GNU floor without a Rustup manager',
+          direct_before.returncode == direct_compiled.returncode == direct_after.returncode == 0 and
+          expected_tool(direct_observed, 'cargo', selected / 'bin/cargo') and
+          'rustup_resolver' not in direct_observed.get('tools', {}).get('cargo', {}) and
+          linux_output(Path(direct_shim_env['CARGO_TARGET_DIR']), target))
+
+    env = shim_environment(target, 'zig-refusals')
+    baseline, _, receipt = probe(command, env, zig_shim_dir=shim_dir)
+    metadata, _, _ = probe(command, env, mode='metadata', zig_shim_dir=shim_dir)
+    context, _, _ = probe(command, env, mode='context', zig_shim_dir=shim_dir)
+    context_row = json.loads(context.stdout) if context.returncode == 0 else {}
+    check('shim metadata and strict cache context use the real Cargo dispatch PATH',
+          baseline.returncode == metadata.returncode == context.returncode == 0 and
+          Path(context_row.get('identity', {}).get('tools', {}).get('cargo', {}).get('selected_path', '')) == proxy_cargo and
+          str(shim_dir) not in context_row.get('environment', {}).get('PATH', '').split(os.pathsep))
+
+    # Freeze the real programs before an attacker adds an interpreter in the
+    # writable PATH directory. Regenerating under that PATH would not exercise
+    # the coordinator's original, already-issued verification program.
+    emit_verify = '''source "$1" || exit $?;
+_act_toolchain_identity_script verify "$2" "$3" '' "$4" "$5" "$6"'''
+    frozen_verify = require(['bash', '-c', emit_verify, '_', module, receipt, command,
+                             json.dumps(receipt_pins[str(receipt)]), project, shim_dir], env=environment)
+    shadow_cache = work / 'bootstrap-cache'
+    shadow_cache.mkdir(mode=0o700)
+    emit_cache = '''source "$1" || exit $?;
+_act_strict_cargo_cache_script "$2" '{}' "$3" "$4"'''
+    frozen_cache = require(['bash', '-c', emit_cache, '_', module, shadow_cache, command, shim_dir], env=environment)
+    shadow_python = shim_dir / 'python3'
+    interpreter_marker = work / 'untrusted-shim-python-executed'
+    shadow_python.write_text('#!/bin/sh\nprintf ran > ' + shlex.quote(str(interpreter_marker)) + '\nexit 0\n')
+    shadow_python.chmod(0o755)
+    for label, frozen in (('pinned post-build verifier', frozen_verify), ('strict-cache interpreter', frozen_cache)):
+        refused = run([shutil.which('bash'), '-c', frozen], cwd=project, env=dict(env, GLOBIGNORE='*'))
+        check('injected shim-directory Python cannot impersonate the ' + label,
+              refused.returncode != 0 and not interpreter_marker.exists() and
+              'unexpected entry in generated DSR Cargo shim directory' in refused.stderr)
+    shadow_python.rename(work / 'retained-untrusted-shim-python')
+    floor_changed_env = dict(env, DSR_ZIG_TARGET=target + '.2.27', DSR_LINUX_GLIBC_FLOOR='2.27')
+    floor_changed, _, _ = probe(command, floor_changed_env, mode='verify', receipt=receipt, zig_shim_dir=shim_dir)
+    check('changing the floor with unchanged shim and compiler bytes invalidates the pinned observation',
+          floor_changed.returncode != 0 and 'changed during the build' in floor_changed.stderr)
+
+    # An interior empty field means current-directory lookup in the actual
+    # POSIX shim. A probe that drops it would attest dispatch-bin/cargo while
+    # the launcher executes this different, genuine Rustup proxy path.
+    empty_bin = work / 'empty-path-bin'
+    empty_bin.mkdir()
+    cwd_cargo = project / 'cargo'
+    os.link(proxy_cargo, cwd_cargo)
+    empty_env = shim_environment(target, 'zig-empty-path')
+    empty_env['PATH'] = str(shim_dir) + ':' + str(empty_bin) + '::' + str(dispatch_bin)
+    empty_before, empty_observed, empty_receipt = probe(command, empty_env, zig_shim_dir=shim_dir)
+    empty_build = build(command, empty_env) if empty_before.returncode == 0 else empty_before
+    empty_after, _, _ = probe(command, empty_env, mode='verify', receipt=empty_receipt, zig_shim_dir=shim_dir)
+    check('interior empty PATH field attests the same genuine current-directory Cargo used by the shim',
+          empty_before.returncode == empty_build.returncode == empty_after.returncode == 0 and
+          empty_observed.get('tools', {}).get('cargo', {}).get('selected_path') == str(cwd_cargo) and
+          expected_tool(empty_observed, 'cargo', selected / 'bin/cargo') and
+          linux_output(Path(empty_env['CARGO_TARGET_DIR']), target))
+    cwd_cargo.rename(work / 'retained-current-directory-cargo')
+
+    swap_env = shim_environment(target, 'zig-postbuild-swap')
+    swap_command = command + " && printf '%s\\n' '#!/bin/sh' 'exit 0' > " + shlex.quote(str(shim))
+    swap_before, _, swap_receipt = probe(swap_command, swap_env, zig_shim_dir=shim_dir)
+    swap_build = build(swap_command, swap_env) if swap_before.returncode == 0 else swap_before
+    swap_after, _, _ = probe(swap_command, swap_env, mode='verify', receipt=swap_receipt, zig_shim_dir=shim_dir)
+    check('successful genuine Zig compile cannot publish after replacing its shim during the build',
+          swap_before.returncode == swap_build.returncode == 0 and swap_after.returncode != 0 and
+          linux_output(Path(swap_env['CARGO_TARGET_DIR']), target) and
+          'trusted generator bytes' in swap_after.stderr)
+    shim.rename(work / 'retained-postbuild-zig-shim')
+    require(['bash', '-o', 'pipefail', '-c', staging, '_', module, shim_dir], env=environment)
+
+    # Never execute a substituted shim, even its version branch, and never
+    # admit new bytes because the compiler-writable file says it is DSR's.
+    shim.rename(work / 'retained-original-zig-shim')
+    marker = work / 'untrusted-zig-shim-executed'
+    shim.write_text('#!/bin/sh\nprintf ran > ' + shlex.quote(str(marker)) + '\nexit 0\n')
+    shim.chmod(0o755)
+    for probe_mode in ('record', 'verify', 'metadata', 'context'):
+        refused, _, refused_receipt = probe(command, env, mode=probe_mode,
+                                           receipt=receipt if probe_mode == 'verify' else None,
+                                           zig_shim_dir=shim_dir)
+        check('unexpected DSR shim replacement refuses before execution in ' + probe_mode,
+              refused.returncode != 0 and not marker.exists() and
+              'trusted generator bytes' in refused.stderr and
+              (probe_mode == 'verify' or not refused_receipt.exists()))
+    shim.rename(work / 'retained-untrusted-zig-shim')
+    (work / 'retained-original-zig-shim').rename(shim)
+    restored, _, _ = probe(command, env, mode='verify', receipt=receipt, zig_shim_dir=shim_dir)
+    check('restored exact generated shim retains the original pinned observation', restored.returncode == 0)
+
+    for variable in ('DSR_RUST_TARGET', 'DSR_ZIG_TARGET', 'DSR_LINUX_GLIBC_FLOOR'):
+        refused, _, _ = probe(variable + '= ' + command, env, zig_shim_dir=shim_dir)
+        check('command cannot disable glibc-floor dispatch by overriding ' + variable,
+              refused.returncode != 0 and 'cannot override generated DSR Cargo shim' in refused.stderr)
+        missing = dict(env)
+        missing.pop(variable)
+        refused, _, _ = probe(command, missing, zig_shim_dir=shim_dir)
+        check('missing glibc-floor dispatch selector fails closed: ' + variable,
+              refused.returncode != 0 and 'target/floor' in refused.stderr)
+    wrong_path = dict(env, PATH=dispatch_env['PATH'] + ':' + str(shim_dir))
+    refused, _, _ = probe(command, wrong_path, zig_shim_dir=shim_dir)
+    check('removing the DSR shim from the selected PATH position refuses admission',
+          refused.returncode != 0 and 'selected first PATH entry' in refused.stderr)
+    shim.rename(work / 'retained-zig-shim-symlink-target')
+    shim.symlink_to(work / 'retained-zig-shim-symlink-target')
+    refused, _, _ = probe(command, env, zig_shim_dir=shim_dir)
+    check('a byte-identical symlink replacement is not the generated regular shim',
+          refused.returncode != 0 and 'cannot admit generated DSR Cargo shim' in refused.stderr)
+    shim.rename(work / 'retained-zig-shim-symlink')
+    (work / 'retained-zig-shim-symlink-target').rename(shim)
+
+    # The recognized wrapper cannot conceal replacement of the real compiler.
+    compiler_before_swap = digest(compiler)
+    with compiler.open('ab') as stream:
+        stream.write(b'changed underlying compiler after Zig admission\n')
+    refused, _, _ = probe(command, env, mode='verify', receipt=receipt, zig_shim_dir=shim_dir)
+    # A changed signed Mach-O may be refused by the OS at its version probe;
+    # Linux can reach the final byte comparison. Both must refuse the same
+    # original valid observation, with independently confirmed byte drift.
+    check('underlying compiler replacement invalidates the original shim receipt',
+          baseline.returncode == 0 and digest(compiler) != compiler_before_swap and refused.returncode != 0)
+    compiler.rename(work / 'retained-zig-drift-rustc')
+    shutil.copy2(real_toolchain_executable('rustc', alternate_sysroot / 'bin/rustc'), compiler)
+
+    if '-nightly' in require([selected / 'bin/cargo', '-V']):
+        cache_root = work / 'zig-cache'
+        cache_root.mkdir(mode=0o700)
+        cache_env = shim_environment(target, 'zig-cached-output')
+        cache_command = 'cargo +fixture-selected build --quiet --locked --offline --target ' + target
+        cache_program = '''source "$1" || exit $?;
+_act_strict_cargo_cache_script "$2" '{}' "$3" "$4" | bash'''
+        before_cache, _, cache_receipt = probe(cache_command, cache_env, zig_shim_dir=shim_dir)
+        cached_build = run(['bash', '-o', 'pipefail', '-c', cache_program, '_', module,
+                            cache_root, cache_command, shim_dir], cwd=project, env=cache_env, timeout=240)
+        after_cache, _, _ = probe(cache_command, cache_env, mode='verify', receipt=cache_receipt,
+                                  zig_shim_dir=shim_dir)
+        (work / 'zig-cache.log').write_text(cached_build.stdout + cached_build.stderr)
+        check('strict intermediate cache probes underlying Cargo while the real build still uses Zig floor shim',
+              before_cache.returncode == cached_build.returncode == after_cache.returncode == 0 and
+              linux_output(Path(cache_env['CARGO_TARGET_DIR']), target) and
+              'DSR_CARGO_CACHE namespace=' in cached_build.stdout)
+        first_cache_file = Path(cache_env['CARGO_TARGET_DIR'] + '.cache-receipt.json')
+        first_cache = json.loads(first_cache_file.read_text()) if first_cache_file.is_file() else {}
+        relocated = work / 'cache-relocated-source'
+        shutil.copytree(project, relocated)
+        for label, floor in (('same-floor', '2.28'), ('different-floor', '2.27')):
+            next_shim = work / ('cache-' + label + '-shim')
+            require(['bash', '-o', 'pipefail', '-c', staging, '_', module, next_shim], env=environment)
+            next_env = dict(cache_env, PATH=str(next_shim) + ':' + dispatch_env['PATH'],
+                            DSR_ZIG_TARGET=target + '.' + floor, DSR_LINUX_GLIBC_FLOOR=floor,
+                            CARGO_TARGET_DIR=str(work / ('zig-cached-' + label)))
+            next_before, _, next_receipt = probe(cache_command, next_env, cwd=relocated,
+                                                 expected_cwd=relocated, zig_shim_dir=next_shim)
+            next_build = run(['bash', '-o', 'pipefail', '-c', cache_program, '_', module,
+                              cache_root, cache_command, next_shim], cwd=relocated, env=next_env, timeout=240)
+            next_after, _, _ = probe(cache_command, next_env, mode='verify', receipt=next_receipt,
+                                     cwd=relocated, expected_cwd=relocated, zig_shim_dir=next_shim)
+            next_cache_file = Path(next_env['CARGO_TARGET_DIR'] + '.cache-receipt.json')
+            next_cache = json.loads(next_cache_file.read_text()) if next_cache_file.is_file() else {}
+            (work / ('zig-cache-' + label + '.log')).write_text(next_build.stdout + next_build.stderr)
+            same_namespace = first_cache.get('namespace') == next_cache.get('namespace')
+            check('fresh source and generated shim retain cache policy: ' + label,
+                  next_before.returncode == next_build.returncode == next_after.returncode == 0 and
+                  bool(first_cache.get('namespace')) and bool(next_cache.get('namespace')) and
+                  same_namespace == (label == 'same-floor') and
+                  next_cache.get('contract', {}).get('environment', {}).get('DSR_LINUX_GLIBC_FLOOR') == floor and
+                  linux_output(Path(next_env['CARGO_TARGET_DIR']), target))
+    elif mode == 'zig-shim':
+        check('dedicated Zig shim qualification requires nightly for the strict-cache regression', False)
+    else:
+        print('SKIP glibc-floor intermediate cache requires nightly Cargo/rustc', flush=True)
+else:
+    print('SKIP generated Zig shim regression requires real Zig/Cargo plugin and both GNU target stdlibs', flush=True)
+
+if mode == 'zig-shim':
+    print(f'Zig shim qualification: {passed} passed, {failed} failed; fixtures retained at {work}', flush=True)
     sys.exit(1 if failed else 0)
 
 
