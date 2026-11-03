@@ -167,6 +167,13 @@ explicit ownership options. It does not depend on bsdtar supporting GNU
 `--mode`. Full source receipts still match exactly; the separate archive check
 requires the canonical published permissions and ownership.
 
+Strict native packaging retains the original member receipts for binaries,
+generated workspace companions and staged includes. Each private file must
+still match its frozen identity, contents and permissions when its public
+archive representation is admitted. Singleton contract staging also retains
+the original exclusive output receipt and rechecks it after validation, so a
+replacement archive cannot establish a new accepted identity or digest.
+
 Existing prebuilt archives reused without reconstruction retain their exact
 compressed bytes. This change does not rewrite previously published assets.
 Checksums, manifests and signatures for newly created archives bind the final

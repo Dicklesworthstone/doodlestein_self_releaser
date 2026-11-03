@@ -881,8 +881,11 @@ _act_workspace_include_path_is_symlink_free() {
 # Keep its original inode open while checking bytes and permissions twice;
 # later members and the archiver must not redefine an earlier member's bytes.
 # Empty companion files are valid, unlike empty executable/archive streams.
+# Strict collection supplies its original receipt and private mode as well:
+# extending the receipt must not establish a new identity after that handoff.
 _act_workspace_member_receipt() (
     local artifact_dir="$1" member="$2"
+    local collection_receipt="${3:-}" collection_mode="${4:-}"
     local path="$artifact_dir/$member" identity sha size mode
     local final_identity final_sha final_size final_mode
 
@@ -919,10 +922,24 @@ _act_workspace_member_receipt() (
        "$identity" == "$(_act_file_identity "$path")" && "$mode" == "$final_mode" &&
        "$size" == "$final_size" && "$sha" == "$final_sha" ]] || return 4
 
-    jq -ncS --arg path "$path" --arg member "$member" --arg sha256 "${sha,,}" \
+    local receipt
+    receipt=$(jq -ncS --arg path "$path" --arg member "$member" --arg sha256 "${sha,,}" \
         --argjson size_bytes "$size" --arg identity "$identity" --arg mode "$mode" \
         '{path:$path, member:$member, sha256:$sha256, size_bytes:$size_bytes,
-          identity:$identity, mode:$mode}'
+          identity:$identity, mode:$mode}') || return 4
+    if [[ -n "$collection_receipt" ]]; then
+        case "$collection_mode" in
+            600) collection_mode=-rw------- ;;
+            700) collection_mode=-rwx------ ;;
+            *) return 4 ;;
+        esac
+        jq -e --argjson collected "$collection_receipt" --arg mode "$collection_mode" '
+            .path == $collected.path and .sha256 == $collected.sha256 and
+            .size_bytes == $collected.size_bytes and .identity == $collected.identity and
+            .mode == $mode
+        ' <<< "$receipt" >/dev/null || return 4
+    fi
+    printf '%s\n' "$receipt"
 )
 
 _act_release_tree_file_metadata() {
@@ -2040,49 +2057,21 @@ _act_stage_contract_primary() {
         _log_error "Refusing existing release contract staging destination: $staged_path"
         return 4
     fi
-    # Noclobber supplies O_EXCL for destination creation. Keep that inode open
-    # while copying so a same-user rename/symlink race cannot redirect bytes to
-    # another file between the existence check and the copy.
-    if ! (
-        set -C
-        umask 077
-        exec 9> "$staged_path" || exit 4
-        if $source_is_contract_asset; then
-            cat -- "$source_path" >&9 || exit 4
-            if [[ -x "$source_path" && "$staged_format" == "none" ]]; then
-                chmod 700 /dev/fd/9 || exit 4
-            else
-                chmod 600 /dev/fd/9 || exit 4
-            fi
-        else case "$staged_format" in
-            none)
-                cat -- "$source_path" >&9 || exit 4
-                if [[ -x "$source_path" ]]; then
-                    chmod 700 /dev/fd/9 || exit 4
-                else
-                    chmod 600 /dev/fd/9 || exit 4
-                fi
-                ;;
-            tar.gz)
-                _act_stream_workspace_tar_gz "$(dirname "$source_path")" \
-                    "$(basename "$source_path")" >&9 || exit 4
-                chmod 600 /dev/fd/9 || exit 4
-                ;;
-            tar.xz)
-                _act_stream_workspace_tar_xz "$(dirname "$source_path")" \
-                    "$(basename "$source_path")" >&9 || exit 4
-                chmod 600 /dev/fd/9 || exit 4
-                ;;
-            zip)
-                _act_stream_workspace_zip "$(dirname "$source_path")" \
-                    "$(basename "$source_path")" >&9 || exit 4
-                chmod 600 /dev/fd/9 || exit 4
-                ;;
-            *) exit 4 ;;
-        esac
-        fi
-        exec 9>&-
-    ); then
+    local staged_collection_receipt="" staged_collection_mode=600
+    local -a staged_producer=()
+    if $source_is_contract_asset || [[ "$staged_format" == "none" ]]; then
+        # Prebuilt archives keep their exact compressed bytes and their
+        # existing independent admission policy.
+        [[ -x "$source_path" && "$staged_format" == "none" ]] && staged_collection_mode=700
+        staged_producer=(_act_stream_local_file "$source_path")
+    else
+        staged_producer=(_act_stream_workspace_archive "$staged_format" \
+            "$(dirname "$source_path")" "$(basename "$source_path")")
+    fi
+    # Bind the exclusive destination before validation, just as workspace
+    # collection does. A later valid archive must not replace this receipt.
+    if ! staged_collection_receipt=$(_act_collect_stream_exclusive \
+        "$staged_path" "$staged_collection_mode" "${staged_producer[@]}"); then
         _log_error "Unable to stage release primary for $target"
         return 4
     fi
@@ -2137,6 +2126,14 @@ _act_stage_contract_primary() {
        [[ "$source_identity_before" != "$source_identity_after" ]] ||
        [[ "$staged_identity_before" != "$staged_identity_after" ]]; then
         _log_error "Unable to identify release primary after staging: $source_path"
+        return 4
+    fi
+    if ! jq -e --arg path "$staged_path" --arg sha256 "${staged_sha,,}" \
+            --argjson size_bytes "$staged_size" --arg identity "$staged_identity_after" '
+            .path == $path and .sha256 == $sha256 and
+            .size_bytes == $size_bytes and .identity == $identity
+        ' <<< "$staged_collection_receipt" >/dev/null; then
+        _log_error "Staged release primary changed after its exclusive collection: $staged_path"
         return 4
     fi
 
@@ -12267,12 +12264,13 @@ EOF
             local artifact_filename
             artifact_filename=$(basename "$remote_artifact_path")
             local this_artifact_path="$artifact_dir/$artifact_filename"
-            local ordinary_member_collected=false workspace_member_receipt=""
+            local member_collected=false workspace_member_receipt=""
+            local collection_receipt="" collection_mode=""
 
             _log_info "Downloading artifact: ${host}:${remote_artifact_path}"
             local scp_output
             if $strict_native_build; then
-                local collection_receipt="" collection_mode=700
+                collection_mode=700
                 [[ "$platform" == windows/* ]] && collection_mode=600
                 if _act_is_local_host "$host"; then
                     local copy_src="$remote_artifact_path"
@@ -12332,6 +12330,7 @@ EOF
                     if _act_collected_glibc_within_floor "$this_artifact_path" "$rust_glibc_floor_enforced"; then
                         local_artifact_paths+=("$this_artifact_path")
                         strict_collection_receipts+=("$collection_receipt")
+                        member_collected=true
                     else
                         echo "Collected artifact exceeds glibc floor $rust_glibc_floor_enforced: $this_artifact_path" >> "$log_file"
                         download_failed=true
@@ -12372,7 +12371,7 @@ EOF
                     fi
                     if _act_accept_collected_binary "$this_artifact_path" "$platform" "$language" "$rust_glibc_floor_enforced"; then
                         local_artifact_paths+=("$this_artifact_path")
-                        ordinary_member_collected=true
+                        member_collected=true
                     else
                         echo "Collected artifact failed $platform validation: $this_artifact_path" >> "$log_file"
                         download_failed=true
@@ -12394,7 +12393,7 @@ EOF
                 fi
                 if _act_accept_collected_binary "$this_artifact_path" "$platform" "$language" "$rust_glibc_floor_enforced"; then
                     local_artifact_paths+=("$this_artifact_path")
-                    ordinary_member_collected=true
+                    member_collected=true
                 else
                     echo "Collected artifact failed $platform validation: $this_artifact_path" >> "$log_file"
                     download_failed=true
@@ -12422,7 +12421,7 @@ EOF
                         fi
                         if _act_accept_collected_binary "$this_artifact_path" "$platform" "$language" "$rust_glibc_floor_enforced"; then
                             local_artifact_paths+=("$this_artifact_path")
-                            ordinary_member_collected=true
+                            member_collected=true
                         else
                             echo "Collected artifact failed $platform validation: $this_artifact_path" >> "$log_file"
                             download_failed=true
@@ -12442,9 +12441,10 @@ EOF
                     download_failed=true
                 fi
             fi
-            if $ordinary_member_collected && [[ -n "$workspace_binaries" ]]; then
+            if $member_collected && [[ -n "$workspace_binaries" ]]; then
                 if workspace_member_receipt=$(_act_workspace_member_receipt \
-                        "$artifact_dir" "$artifact_filename"); then
+                        "$artifact_dir" "$artifact_filename" \
+                        "$collection_receipt" "$collection_mode"); then
                     workspace_member_receipts+=("$workspace_member_receipt")
                 else
                     _log_error "Unable to freeze collected workspace member: $this_artifact_path"
@@ -12501,7 +12501,14 @@ EOF
             if $coordinator_windows_family && \
                [[ "$archive_file" == verify-components.sh || \
                   "$archive_file" == ft-windows-amd64.component-manifest.json ]]; then
-                local_artifact_paths+=("$artifact_dir/$archive_file")
+                if archive_file_receipt=$(_act_workspace_member_receipt \
+                        "$artifact_dir" "$archive_file"); then
+                    local_artifact_paths+=("$artifact_dir/$archive_file")
+                    workspace_member_receipts+=("$archive_file_receipt")
+                else
+                    _log_error "Unable to freeze coordinator workspace member: $archive_file"
+                    download_failed=true
+                fi
                 continue
             fi
             if ! _act_is_safe_basename "$archive_file" || \
@@ -12537,8 +12544,12 @@ EOF
                         _act_stream_remote_unix_file \
                         "$ssh_destination" "$archive_file_remote") || archive_file_receipt=""
                 fi
-                if [[ -n "$archive_file_receipt" ]]; then
+                if [[ -n "$archive_file_receipt" ]] && \
+                   { [[ -z "$workspace_binaries" ]] || \
+                     workspace_member_receipt=$(_act_workspace_member_receipt \
+                         "$artifact_dir" "$archive_file" "$archive_file_receipt" "$archive_file_mode"); }; then
                     local_artifact_paths+=("$archive_file_local")
+                    [[ -z "$workspace_binaries" ]] || workspace_member_receipts+=("$workspace_member_receipt")
                 else
                     _log_error "Failed to collect workspace archive member $archive_file from $host:$archive_file_remote"
                     download_failed=true
@@ -12753,8 +12764,6 @@ EOF
 
             local staged_workspace_includes=""
             local workspace_include_revision=""
-            local emit_workspace_include_receipts=false
-            $strict_native_build || emit_workspace_include_receipts=true
             if [[ -z "$archive_ext" ]]; then
                 :
             elif $strict_native_build; then
@@ -12771,7 +12780,7 @@ EOF
             if ! staged_workspace_includes=$(
                 _act_stage_workspace_include_files \
                     "$config_file" "$local_path" "$artifact_dir" "$workspace_include_revision" \
-                    "$emit_workspace_include_receipts"
+                    true
             ); then
                 _log_error "Failed to stage configured workspace companion files for $platform"
                 jq -nc --arg platform "$platform" \
@@ -12783,20 +12792,16 @@ EOF
             local staged_include staged_include_record
             while IFS= read -r staged_include_record; do
                 [[ -n "$staged_include_record" ]] || continue
-                if $emit_workspace_include_receipts; then
-                    if ! staged_include=$(jq -er '.member | select(type == "string" and length > 0)' \
-                            <<< "$staged_include_record"); then
-                        _log_error "Workspace companion receipt is invalid for $platform"
-                        jq -nc --arg platform "$platform" \
-                            '{status:"failed",exit_code:7,platform:$platform,
-                              artifact_path:"",artifact_paths:[],additional_artifacts:[],
-                              error:"Workspace companion receipt is invalid"}'
-                        return 7
-                    fi
-                    workspace_member_receipts+=("$staged_include_record")
-                else
-                    staged_include="$staged_include_record"
+                if ! staged_include=$(jq -er '.member | select(type == "string" and length > 0)' \
+                        <<< "$staged_include_record"); then
+                    _log_error "Workspace companion receipt is invalid for $platform"
+                    jq -nc --arg platform "$platform" \
+                        '{status:"failed",exit_code:7,platform:$platform,
+                          artifact_path:"",artifact_paths:[],additional_artifacts:[],
+                          error:"Workspace companion receipt is invalid"}'
+                    return 7
                 fi
+                workspace_member_receipts+=("$staged_include_record")
                 archive_files+=("$staged_include")
             done <<< "$staged_workspace_includes"
             _log_info "Workspace archive members: ${archive_files[*]}"
@@ -12861,15 +12866,19 @@ EOF
                 local validate_workspace_architecture=false
                 case "$language" in rust|go) validate_workspace_architecture=true ;; esac
                 if [[ -n "$archive_receipt" ]] && \
-                   { ! _act_validate_workspace_archive \
+                   ! _act_validate_workspace_archive \
                          "$archive_path" "$archive_ext" "$platform" "$config_file" \
-                         "$validate_workspace_architecture" || \
-                     ! _act_validate_workspace_member_receipts \
-                         "$archive_path" "$archive_ext" "$artifact_dir" \
-                         "${workspace_member_receipts[@]}"; }; then
-                    _log_error "Workspace archive does not match its configured members and collection receipts for $platform"
+                         "$validate_workspace_architecture"; then
+                    _log_error "Workspace archive does not match its configured members for $platform"
                     archive_receipt=""
                 fi
+            fi
+            if [[ -n "$archive_receipt" ]] && \
+               ! _act_validate_workspace_member_receipts \
+                   "$archive_path" "$archive_ext" "$artifact_dir" \
+                   "${workspace_member_receipts[@]}"; then
+                _log_error "Workspace archive does not match its frozen member receipts for $platform"
+                archive_receipt=""
             fi
             # Member validators must not replace/rewrite the archive that the
             # exclusive producer accepted, even with another valid archive.

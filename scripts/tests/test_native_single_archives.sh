@@ -160,10 +160,10 @@ for name in ('app','app.exe','app.EXE'):
 # Extract the actual native branch: no hand-maintained alternate implementation.
 # The isolated-run override must contain this exact production block and is
 # reported separately; it is not evidence of executing the complete coordinator.
+source = module.read_text()
 if os.environ.get('DSR_TEST_NATIVE_PACKAGE_BLOCK'):
     block = Path(os.environ['DSR_TEST_NATIVE_PACKAGE_BLOCK']).read_text()
 else:
-    source = module.read_text()
     begin = '        # Package workspace binaries into a single tarball\n'
     # Stop at the next outer result branch. Readiness and timeout handling
     # are outside this archive-only fixture; retain the whole success block.
@@ -172,6 +172,14 @@ else:
         raise AssertionError('native packaging block is ambiguous or unavailable')
     start = source.index(begin)
     block = source[start:source.index(end, start)]
+
+# Exercise the production strict companion collection and failure handoff as
+# well as packaging, so a test cannot manufacture the receipt the runner lost.
+collect_begin = '        # Collect configured non-binary package members separately from the\n'
+collect_end = '        # Package workspace binaries into a single tarball\n'
+if source.count(collect_begin) != 1 or source.count(collect_end) != 1:
+    raise AssertionError('native companion collection block is ambiguous or unavailable')
+collection_block = source[source.index(collect_begin):source.index(collect_end)]
 
 driver = work / 'package-driver.sh'
 driver.write_text(r'''#!/usr/bin/env bash
@@ -184,6 +192,50 @@ artifact_naming_generate_dual_for_tool() {
     jq -cn --arg name "$(jq -r --arg target "$platform" '.release_contract.exact_primary_assets[$target]' "$config_file")" \
         '{versioned:$name,compat:$name,same:true}'
 }
+_test_mutate_companion() {
+    python3 - "$1" "$DSR_TEST_COMPANION_MUTATION" "$DSR_TEST_COMPANION_PROOF" <<'MUTATE'
+import hashlib
+import json
+from pathlib import Path
+import stat
+import sys
+path=Path(sys.argv[1])
+def snapshot():
+    info=path.stat()
+    return {'inode':info.st_ino,'mode':stat.S_IMODE(info.st_mode),'size':info.st_size,
+            'sha256':hashlib.sha256(path.read_bytes()).hexdigest()}
+before=snapshot()
+if sys.argv[2]=='content':
+    original=path.read_bytes()
+    replacement=original.replace(b'original',b'REPLACED',1)
+    assert replacement!=original and len(replacement)==len(original)
+    path.write_bytes(replacement)
+elif sys.argv[2]=='mode':
+    path.chmod(0o750 if before['mode'] & 0o111 else 0o640)
+elif sys.argv[2]=='inode':
+    payload=path.read_bytes()
+    path.rename(path.with_name(path.name+'.retained-original'))
+    with path.open('xb') as output:
+        output.write(payload)
+    path.chmod(before['mode'])
+else:
+    raise AssertionError('unknown companion mutation')
+Path(sys.argv[3]).write_text(json.dumps({'before':before,'after':snapshot()}))
+MUTATE
+}
+definition=$(declare -f _act_collect_stream_exclusive) || exit 98
+eval "${definition/#_act_collect_stream_exclusive /_test_real_collect }"
+_act_collect_stream_exclusive() {
+    local receipt
+    receipt=$(_test_real_collect "$@") || return $?
+    printf '%s\n' "$receipt" >> "$DSR_TEST_COLLECTION_LOG"
+    if [[ "$DSR_TEST_COMPANION_PHASE" == handoff &&
+          "$1" == "$artifact_dir/$DSR_TEST_COMPANION_MEMBER" ]]; then
+        _test_mutate_companion "$1" || return $?
+    fi
+    # This remains the original collector's receipt even after the fault.
+    printf '%s\n' "$receipt"
+}
 _test_native_packaging() {
     local config_file="$2" local_path="$3" release_git_sha="$4"
     local platform="$5" artifact_dir="$6" compiled="$7"
@@ -195,7 +247,11 @@ _test_native_packaging() {
     local collected_sha256='' collected_size_bytes=0 collected_identity=''
     local workspace_binaries binary_name bin receipt
     local local_artifact_path=''
-    local -a local_artifact_paths=() strict_collection_receipts=()
+    local -a local_artifact_paths=() strict_collection_receipts=() workspace_member_receipts=()
+    local -a additional_artifact_receipts=()
+    local host=act language=go build_env='' build_profile=release ssh_destination=''
+    local artifact_source_root="$DSR_TEST_ARCHIVE_INPUTS" output_stage_root='' additional_json='[]'
+    local download_failed=false
     workspace_binaries=$(_act_workspace_binaries_for_target "$config_file" "$platform") || return $?
     binary_name=$(jq -r '.binary_name' "$config_file") || return 4
     bin="$binary_name"
@@ -205,9 +261,14 @@ _test_native_packaging() {
     receipt=$(_act_collect_stream_exclusive "$artifact_dir/$bin" "$mode" _act_stream_local_file "$compiled") || return $?
     local_artifact_paths=("$artifact_dir/$bin")
     strict_collection_receipts=("$receipt")
+    workspace_member_receipts+=("$(_act_workspace_member_receipt "$artifact_dir" "$bin" "$receipt" "$mode")") || return $?
     printf '%s\n' "$receipt" > "$artifact_dir/binary-collection.json"
     if [[ ${DSR_TEST_TAMPER_COLLECTED:-0} == 1 ]]; then
         printf changed >> "$artifact_dir/$bin"
+    fi
+''' + collection_block + r'''
+    if [[ "$DSR_TEST_COMPANION_PHASE" == prearchive && "$status" == success ]]; then
+        _test_mutate_companion "$artifact_dir/$DSR_TEST_COMPANION_MEMBER" || return $?
     fi
 ''' + block + r'''
     jq -nc --arg status "$status" --argjson exit_code "$exit_code" \
@@ -395,8 +456,10 @@ def metadata_gate_regressions():
             check(fmt+' rejects '+field+' metadata without rewriting evidence',before == metadata_snapshot(bad))
 
 counter=0
+generated_companions={'metadata.json':(b'{"release":"original"}\n',0o600),
+                      'verify.sh':(b'#!/bin/sh\nprintf "original verifier\\n"\n',0o700)}
 
-def package(config,target,expected=0,preexisting=False,tamper=False):
+def package(config,target,expected=0,preexisting=False,tamper=False,companion_fault=None):
     global counter
     counter+=1
     folder=work/('case-'+str(counter)); folder.mkdir()
@@ -406,6 +469,10 @@ def package(config,target,expected=0,preexisting=False,tamper=False):
     # Bind the production config reader to this exact case, never the user's
     # release registry. JSON is valid YAML and retains identical contract bytes.
     (config_dir/'repos.d/app.yaml').write_bytes(cf.read_bytes())
+    inputs=folder/'generated-inputs'; inputs.mkdir()
+    for name,(data,mode) in generated_companions.items():
+        (inputs/name).write_bytes(data)
+        (inputs/name).chmod(mode)
     path=folder/config['release_contract']['exact_primary_assets'][target]
     prior=None
     if preexisting:
@@ -413,7 +480,14 @@ def package(config,target,expected=0,preexisting=False,tamper=False):
         prior=(sha(path),path.stat().st_ino)
     p=subprocess.run(['bash',str(driver),str(module),str(cf),str(repo),revision,target,str(folder),str(fixtures[target])],
                      env=dict(os.environ,DSR_CONFIG_DIR=str(config_dir),
-                              DSR_TEST_TAMPER_COLLECTED=str(int(tamper))),capture_output=True,timeout=90)
+                              DSR_TEST_TAMPER_COLLECTED=str(int(tamper)),DSR_TEST_ARCHIVE_INPUTS=str(inputs),
+                              DSR_TEST_COLLECTION_LOG=str(folder/'collection-handoffs.jsonl'),
+                              DSR_TEST_COMPANION_PROOF=str(folder/'companion-mutation.json'),
+                              DSR_TEST_COMPANION_PHASE=companion_fault[0] if companion_fault else '',
+                              DSR_TEST_COMPANION_MEMBER=companion_fault[1] if companion_fault else '',
+                              DSR_TEST_COMPANION_MUTATION=companion_fault[2] if companion_fault else ''),capture_output=True,timeout=90)
+    (folder/'package.stdout').write_bytes(p.stdout)
+    (folder/'package.stderr').write_bytes(p.stderr)
     if p.returncode!=expected:
         raise AssertionError(f'package expected {expected}, got {p.returncode}: {p.stdout.decode()}\n{p.stderr.decode()}')
     result=json.loads(p.stdout)
@@ -453,6 +527,61 @@ for target,binary in fixtures.items():
         old=(sha(thin),thin.stat().st_ino)
         shell('_act_validate_workspace_archive',thin,fmt,target,cf,rc=4)
         check('old executable-only archive is refused without repair',old==(sha(thin),thin.stat().st_ino))
+
+# Generated data and scripts need custody separate from native executable and
+# Git include receipts. Mutations at the collector return cannot be adopted as
+# a new baseline; mutations after member freezing must also block packaging.
+for fmt in ('tar.gz','tar.xz','zip'):
+    cfg=copy.deepcopy(base)
+    asset='companion-custody.'+fmt
+    cfg['release_contract']['exact_primary_assets'][host]=asset
+    cfg['workspace_archive_files']={host:[{'name':name,'executable':bool(mode & 0o111)}
+                                        for name,(_,mode) in generated_companions.items()]}
+    result,cf,folder=package(cfg,host)
+    expected=dict(committed,app=(local_binary.read_bytes(),0o755))
+    expected.update({name:(data,0o755 if mode & 0o111 else 0o644)
+                     for name,(data,mode) in generated_companions.items()})
+    check(fmt+' strict collection packages original generated scripts and data',
+          read_archive(Path(result['artifact_path']),fmt)==expected)
+    handoffs=[json.loads(row) for row in (folder/'collection-handoffs.jsonl').read_text().splitlines()]
+    for name,(data,mode) in generated_companions.items():
+        receipt=next(row for row in handoffs if row['path']==str(folder/name))
+        info=(folder/name).stat()
+        check(fmt+' generated '+name+' retains its original exclusive collection identity',
+              receipt['sha256']==hashlib.sha256(data).hexdigest()==sha(folder/name) and
+              receipt['size_bytes']==info.st_size and stat.S_IMODE(info.st_mode)==mode and
+              receipt['identity'] in (f'gnu:{info.st_dev}:{info.st_ino}',f'bsd:{info.st_ino}'))
+    faults=[('prearchive',name,'content') for name in generated_companions]
+    if fmt=='tar.gz':
+        faults += [('handoff',name,'content') for name in generated_companions]
+        faults += [(phase,name,mutation) for phase in ('handoff','prearchive')
+                   for name,mutation in (('metadata.json','inode'),('verify.sh','mode'))]
+    for phase,name,mutation in faults:
+        result,cf,folder=package(cfg,host,expected=7,companion_fault=(phase,name,mutation))
+        proof=json.loads((folder/'companion-mutation.json').read_text())
+        handoffs=[json.loads(row) for row in (folder/'collection-handoffs.jsonl').read_text().splitlines()]
+        receipt=next(row for row in handoffs if row['path']==str(folder/name))
+        changed_field={'content':'sha256','mode':'mode','inode':'inode'}[mutation]
+        unchanged_fields=set(proof['before'])-{changed_field}
+        label=fmt+' '+phase+' '+name+' '+mutation
+        check(label+' changes only the intended custody field after real collection',
+              proof['before']['sha256']==receipt['sha256'] and
+              proof['before'][changed_field]!=proof['after'][changed_field] and
+              all(proof['before'][key]==proof['after'][key] for key in unchanged_fields))
+        check(label+' cannot advertise a completed primary and leaves the compiler output intact',
+              result['artifact_path']=='' and not result['collected_sha256'] and
+              (folder/'app').read_bytes()==local_binary.read_bytes())
+        if phase=='handoff':
+            check(label+' is refused before archive production instead of rebasing the receipt',
+                  not (folder/asset).exists())
+        else:
+            archive=folder/asset
+            archived=read_archive(archive,fmt)
+            archive_receipt=next(row for row in handoffs if row['path']==str(archive))
+            check(label+' reaches a genuine successful writer with unchanged binary and Git includes',
+                  archive_receipt['sha256']==sha(archive) and archived['app']==expected['app'] and
+                  all(archived[include]==expected[include] for include in committed) and
+                  archived[name][0]==(folder/name).read_bytes())
 
 # Direct writer coverage uses deliberately private and noncanonical inputs.
 # Checking the original inode, ctime and mode also rejects implementations
@@ -558,11 +687,63 @@ for fmt in ('tar.gz', 'tar.xz', 'zip'):
                      'collected_identity': receipt['identity']}
     environment = dict(os.environ, DSR_CONFIG_DIR=str(config_dir),
                        ACT_REPOS_DIR=str(config_dir/'repos.d'), ACT_ARTIFACTS_DIR=str(folder/'artifacts'))
-    stage_program = 'umask 077; source "$1"; source "$(dirname "$1")/config.sh"; shift; _act_stage_contract_primary "$@"'
-    def stage(result, run_id):
+    stage_program = r'''
+umask 077
+source "$1" || exit $?
+source "$(dirname "$1")/config.sh" || exit $?
+source "$(dirname "$1")/packaging.sh" || exit $?
+if [[ "$DSR_TEST_REPLACE_STAGED" == 1 ]]; then
+    definition=$(declare -f _act_validate_release_archive_metadata) || exit 98
+    eval "${definition/#_act_validate_release_archive_metadata /_test_real_metadata }"
+    _act_validate_release_archive_metadata() {
+        _test_real_metadata "$@" || return $?
+        # The genuine metadata gate succeeds first. Replace only the gzip
+        # header and output inode; executable bytes and metadata remain valid.
+        python3 - "$1" "$DSR_TEST_REPLACEMENT_PROOF" <<'REPLACE'
+import hashlib
+import json
+from pathlib import Path
+import sys
+path,report=map(Path,sys.argv[1:])
+original=path.read_bytes()
+before={'inode':path.stat().st_ino,'sha256':hashlib.sha256(original).hexdigest()}
+assert original[:2]==b'\x1f\x8b'
+replacement=bytearray(original)
+replacement[4]^=1
+path.rename(path.with_name(path.name+'.retained-original'))
+with path.open('xb') as stream:
+    stream.write(replacement)
+path.chmod(0o600)
+after={'inode':path.stat().st_ino,'sha256':hashlib.sha256(replacement).hexdigest()}
+report.write_text(json.dumps({'path':str(path),'before':before,'after':after}))
+REPLACE
+    }
+fi
+shift
+_act_stage_contract_primary "$@"
+'''
+    def stage(result, run_id, replace=False):
+        proof=folder/'staged-replacement.json'
         process = subprocess.run(['bash', '-c', stage_program, '_', str(module), 'app', 'v1.2.3',
                                   run_id, host, json.dumps(result), json.dumps(contract)],
-                                 env=environment, capture_output=True, timeout=60)
+                                 env=dict(environment,DSR_TEST_REPLACE_STAGED=str(int(replace)),
+                                          DSR_TEST_REPLACEMENT_PROOF=str(proof)),capture_output=True,timeout=60)
+        (folder/(run_id+'.stdout')).write_bytes(process.stdout)
+        (folder/(run_id+'.stderr')).write_bytes(process.stderr)
+        if replace:
+            evidence=json.loads(proof.read_text())
+            replaced=Path(evidence['path'])
+            check('singleton substitution followed genuine production and metadata validation',
+                  evidence['before']['inode']!=evidence['after']['inode'] and
+                  evidence['before']['sha256']!=evidence['after']['sha256'] and
+                  read_archive(replaced,fmt)=={'app':(local_binary.read_bytes(),0o755)})
+            shell('_act_validate_release_archive_metadata',replaced,fmt)
+            check('singleton refuses changed output against its original held receipt',
+                  process.returncode==4 and process.stdout==b'' and
+                  b'changed after its exclusive collection' in process.stderr)
+            check('singleton output substitution leaves private source unchanged',
+                  metadata_snapshot(collected/'app')==source_snapshot)
+            return None
         if process.returncode:
             raise AssertionError('singleton staging failed: '+process.stderr.decode())
         return json.loads(process.stdout)
@@ -577,6 +758,8 @@ for fmt in ('tar.gz', 'tar.xz', 'zip'):
     check(fmt+' singleton receipt binds the normalized archive',
           staged['staged_sha256'] == sha(archive) and staged['staged_size_bytes'] == archive.stat().st_size)
     shell('_act_validate_target_archive', archive, fmt, 'app', host)
+    if fmt=='tar.gz':
+        stage(source_result,'custody-replaced-output',replace=True)
     receipt = json.loads(shell('_act_collect_stream_exclusive', collected/('app.'+fmt), '600',
                                '_act_stream_local_file', archive))
     source_result = {'artifact_path': receipt['path'], 'artifact_paths': [receipt['path']],
