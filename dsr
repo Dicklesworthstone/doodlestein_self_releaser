@@ -14323,6 +14323,8 @@ EOF
 }
 
 cmd_prune() {
+    # Keep build-custody descriptors and signal cleanup inside this invocation.
+    (
     # The global --dry-run (dsr -n prune) must never delete either.
     local dry_run="${DRY_RUN:-false}"
     local max_age_days=30
@@ -14374,6 +14376,8 @@ OPTIONS:
         --force         Skip confirmation prompt
 
 A build run that `latest` points to is always kept (it is what resume uses).
+Build checkpoints with retained source roots or unverifiable state are kept.
+Busy or unverifiable build leases also prevent checkpoint pruning.
 
 EXAMPLES:
     dsr prune --dry-run
@@ -14435,6 +14439,14 @@ EOF
     local bytes_freed=0
     local pruned_items=()
     local errors=()
+    local retained_build_paths=()
+
+    _prune_retain_build() {
+        local path="$1" reason="$2"
+        retained_build_paths+=("$(jq -nc --arg path "$path" --arg reason "$reason" \
+            '{path:$path,reason:$reason}')")
+        $JSON_MODE || log_info "Retaining build checkpoint: $path ($reason)"
+    }
 
     _prune_record() {
         local path="$1"
@@ -14561,18 +14573,74 @@ EOF
                  done | sort -rn)
     fi
 
-    # Prune old build runs beyond keep_last: every run directory, whatever
-    # its ID scheme, except the one `latest` points to.
+    # A build worker can outlive its coordinator, and an explicit resume need
+    # not be the run selected by `latest`. Hold the same inherited leases as
+    # build before selecting or removing checkpoints. Source-root references
+    # must outlive their protected snapshots; ordinary pruning cannot reclaim
+    # those external caches or discard the only record of their ownership.
     if [[ -d "$state_dir/builds" ]]; then
-        local tool_dir version_dir latest_run
+        _dsr_require build_state
+        _dsr_require git_ops
+        # Do not initialize directories during dry-run, or reuse a caller's
+        # module root when this command selected a different state directory.
+        local _BUILD_STATE_DIR="$state_dir/builds"
+        local tool_dir version_dir latest_run tool version tag lease_version
+        local lease_rc state checkpoint_ok
+        local -a lease_versions=() acquired_versions=()
+        _prune_release_build_leases() {
+            local held_version release_status=0
+            for held_version in ${acquired_versions[@]+"${acquired_versions[@]}"}; do
+                build_lock_release "$tool" "$held_version" || release_status=1
+            done
+            return "$release_status"
+        }
+        trap 'exit 5' HUP INT TERM
         for tool_dir in "$state_dir/builds"/*; do
             [[ -d "$tool_dir" && ! -L "$tool_dir" ]] || continue
             for version_dir in "$tool_dir"/*; do
                 [[ -d "$version_dir" && ! -L "$version_dir" ]] || continue
+                tool="${tool_dir##*/}" version="${version_dir##*/}"
+                if [[ ! "$tool" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$ ||
+                      ! "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$ ]] ||
+                   ! tag=$(git_ops_version_to_tag "$version"); then
+                    _prune_retain_build "$version_dir" invalid_state
+                    continue
+                fi
+                # cmd_build holds the canonical tag lease, while the native
+                # coordinator may retain the original unprefixed version in
+                # its checkpoint namespace. Both must be free and held here.
+                lease_versions=("$tag")
+                [[ "$tag" == "$version" ]] || lease_versions+=("$version")
+                acquired_versions=() lease_rc=0
+                for lease_version in "${lease_versions[@]}"; do
+                    if $dry_run; then
+                        _build_lock_probe "$tool_dir/$lease_version/.lock" || lease_rc=$?
+                    elif build_lock_acquire "$tool" "$lease_version"; then
+                        acquired_versions+=("$lease_version")
+                        trap '_prune_release_build_leases >&2' EXIT
+                    else
+                        lease_rc=$?
+                    fi
+                    [[ "$lease_rc" == 0 ]] || break
+                done
+                checkpoint_ok=true
+                if [[ "$lease_rc" != 0 ]]; then
+                    _prune_retain_build "$version_dir" build_custody
+                    checkpoint_ok=false
+                fi
                 latest_run=""
-                [[ -L "$version_dir/latest" ]] && latest_run=$(readlink "$version_dir/latest" 2>/dev/null)
+                if $checkpoint_ok && [[ -e "$version_dir/latest" || -L "$version_dir/latest" ]]; then
+                    if [[ ! -L "$version_dir/latest" ]] ||
+                       ! latest_run=$(readlink "$version_dir/latest" 2>/dev/null) ||
+                       [[ ! "$latest_run" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ||
+                          ! -d "$version_dir/$latest_run" || -L "$version_dir/$latest_run" ]]; then
+                        _prune_retain_build "$version_dir" invalid_state
+                        checkpoint_ok=false
+                    fi
+                fi
 
                 local run_dirs=()
+                if $checkpoint_ok; then
                 while IFS= read -r line; do
                     run_dirs+=("$line")
                 done < <(
@@ -14593,9 +14661,36 @@ EOF
                     local run_mtime
                     run_mtime=$(_prune_mtime_epoch "$run_dir")
                     if [[ "$run_mtime" -le "$cutoff_epoch" ]]; then
-                        _prune_consider "$run_dir"
+                        if ! state=$(build_state_get "$tool" "$version" "${run_dir##*/}") ||
+                           ! jq -e '
+                              def sync_receipt:
+                                . == null or (type == "object" and has("source_roots") and
+                                  (.source_roots | type == "object"));
+                              (if has("context") then .context | type == "object" and
+                                (if has("source_sync") then .source_sync | sync_receipt else true end)
+                               else true end) and
+                              (if has("source_sync_history") then .source_sync_history |
+                                type == "array" and all(.[]; type == "object" and has("receipt") and
+                                  (.receipt | sync_receipt))
+                               else true end)
+                            ' <<< "$state" >/dev/null 2>&1; then
+                            _prune_retain_build "$run_dir" invalid_state
+                        elif ! jq -e 'all(.. | objects | select(has("source_roots")) | .source_roots;
+                            type == "object" and length == 0)' <<< "$state" >/dev/null 2>&1; then
+                            _prune_retain_build "$run_dir" source_roots
+                        else
+                            _prune_consider "$run_dir"
+                        fi
                     fi
                 done
+                fi
+                if ! _prune_release_build_leases; then
+                    _prune_error E051 "Build custody changed during checkpoint pruning" "$version_dir"
+                    # Leave EXIT cleanup armed and do not admit another
+                    # version after losing a held lease's identity.
+                    break 2
+                fi
+                trap - EXIT
             done
         done
     fi
@@ -14607,9 +14702,10 @@ EOF
         done < <(find "$cache_dir" -mindepth 1 -maxdepth 1 -mtime +"$max_age_days" 2>/dev/null)
     fi
 
-    local pruned_json errors_json details_json
+    local pruned_json errors_json retained_build_json details_json
     pruned_json=$(printf '%s\n' "${pruned_items[@]}" | jq -sc '.' 2>/dev/null || echo "[]")
     errors_json=$(printf '%s\n' "${errors[@]}" | jq -sc '.' 2>/dev/null || echo "[]")
+    retained_build_json=$(printf '%s\n' ${retained_build_paths[@]+"${retained_build_paths[@]}"} | jq -sc '.')
 
     local status="success"
     local exit_code=0
@@ -14629,10 +14725,12 @@ EOF
             --argjson pruned_count "$pruned_count" \
             --argjson bytes_freed "$bytes_freed" \
             --argjson pruned_paths "$pruned_json" \
+            --argjson retained_build_paths "$retained_build_json" \
             --argjson errors "$errors_json" \
             '{state_dir: $state_dir, dry_run: $dry_run, cutoff_days: $cutoff_days, keep_last: $keep_last,
               keep_releases: $keep_releases, kept_for_releases: $kept_for_releases,
-              pruned_count: $pruned_count, bytes_freed: $bytes_freed, pruned_paths: $pruned_paths, errors: $errors}')
+              pruned_count: $pruned_count, bytes_freed: $bytes_freed, pruned_paths: $pruned_paths,
+              retained_build_paths: $retained_build_paths, errors: $errors}')
         json_envelope "prune" "$status" "$exit_code" "$details_json"
     else
         if $dry_run; then
@@ -14642,7 +14740,10 @@ EOF
         fi
     fi
 
-    return $exit_code
+    # Exit this private subshell while its locals remain in scope for EXIT
+    # cleanup, including after a lease-release error or a cancellation signal.
+    exit "$exit_code"
+    )
 }
 
 # ============================================================================

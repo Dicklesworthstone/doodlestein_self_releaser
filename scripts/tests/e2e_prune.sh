@@ -35,6 +35,19 @@ skip() { ((TESTS_SKIPPED++)); echo "${YELLOW}SKIP${NC}: $1"; }
 # Helper: Create test state directory structure
 # ============================================================================
 
+write_prune_run_state() {
+    local path="$1" tool="$2" version="$3" run="$4"
+    local roots="${5:-}" history="${6:-}"
+    [[ -n "$roots" ]] || roots='{}'
+    [[ -n "$history" ]] || history='[]'
+    jq -nc --arg tool "$tool" --arg version "$version" --arg run "$run" \
+        --argjson roots "$roots" --argjson history "$history" \
+        '{tool:$tool,version:$version,run_id:$run,status:"completed",
+          created_at:"2025-01-01T00:00:00Z",updated_at:"2025-01-01T00:00:00Z",
+          targets:[],target_statuses:{},hosts:{},
+          context:{source_roots:$roots},source_sync_history:$history}' > "$path"
+}
+
 seed_state_fixtures() {
     local max_age="${1:-45}"  # Days ago for old items (default: 45)
 
@@ -70,12 +83,11 @@ seed_state_fixtures() {
     echo '{"tool": "test-tool", "version": "v1.0.0"}' > "$state_dir/manifests/test-tool-v1.0.0.json"
     echo "binary data" > "$state_dir/artifacts/test-tool/v1.0.0/test-tool-linux-amd64"
     echo "binary data" > "$state_dir/artifacts/test-tool/v1.1.0/test-tool-linux-amd64"
-    echo "run state" > "$state_dir/builds/test-tool/v1.0.0/run-001/state.json"
-    echo "run state" > "$state_dir/builds/test-tool/v1.0.0/run-002/state.json"
-    echo "run state" > "$state_dir/builds/test-tool/v1.0.0/run-003/state.json"
-    echo "run state" > "$state_dir/builds/test-tool/v1.0.0/run-004/state.json"
-    echo "run state" > "$state_dir/builds/test-tool/v1.0.0/run-005/state.json"
-    echo "run state" > "$state_dir/builds/test-tool/v1.0.0/run-006/state.json"
+    local run
+    for run in run-001 run-002 run-003 run-004 run-005 run-006; do
+        write_prune_run_state "$state_dir/builds/test-tool/v1.0.0/$run/state.json" \
+            test-tool v1.0.0 "$run" || return 1
+    done
     echo "old cache" > "$cache_dir/old-cache/data"
     echo "recent cache" > "$cache_dir/recent-cache/data"
 
@@ -354,7 +366,7 @@ seed_real_layout() {
     for run in 11111111-1111-4111-8111-111111111111 22222222-2222-4222-8222-222222222222 \
         33333333-3333-4333-8333-333333333333 44444444-4444-4444-8444-444444444444; do
         mkdir -p "$s/builds/tool/v1.0.0/$run"
-        echo '{}' > "$s/builds/tool/v1.0.0/$run/state.json"
+        write_prune_run_state "$s/builds/tool/v1.0.0/$run/state.json" tool v1.0.0 "$run" || return 1
     done
     ln -s 11111111-1111-4111-8111-111111111111 "$s/builds/tool/v1.0.0/latest"
     # Oldest first; tool-v2.0.0 and run 4444... stay recent.
@@ -427,6 +439,356 @@ test_prune_global_dry_run_deletes_nothing() {
         fail "global --dry-run prune must not delete"
         diff <(echo "$before") <(echo "$after") | head -5
     fi
+    harness_teardown
+}
+
+# Inspect real entries without following symlinks. Ignore access times, which
+# readers may update; retain content, inode, permissions and modification time.
+prune_tree_inventory() {
+    python3 - "$@" <<'PY'
+import hashlib, json, os, pathlib, stat, sys
+rows = []
+for argument in sys.argv[1:]:
+    root = pathlib.Path(argument)
+    if not os.path.lexists(root):
+        rows.append([str(root), 'missing'])
+        continue
+    for path in [root] + sorted(root.rglob('*')):
+        info = path.lstat()
+        data = (os.readlink(path) if stat.S_ISLNK(info.st_mode) else
+                hashlib.sha256(path.read_bytes()).hexdigest() if stat.S_ISREG(info.st_mode) else '')
+        rows.append([str(path), info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+                     info.st_nlink, info.st_mtime_ns, data])
+print(json.dumps(rows, separators=(',', ':')))
+PY
+}
+
+seed_prune_old_run() {
+    local tool="$1" version="$2" run="$3" roots="${4:-}" history="${5:-}"
+    local directory="$DSR_STATE_DIR/builds/$tool/$version/$run"
+    mkdir -p "$directory" || return 1
+    write_prune_run_state "$directory/state.json" "$tool" "$version" "$run" "$roots" "$history" || return 1
+    python3 - "$directory" <<'PY'
+import os, sys, time
+old = time.time() - 60 * 86400
+os.utime(sys.argv[1], (old, old))
+PY
+}
+
+seed_prune_pair() {
+    local tool="$1" version="$2"
+    seed_prune_old_run "$tool" "$version" old-run || return 1
+    seed_prune_old_run "$tool" "$version" latest-run || return 1
+    ln -s latest-run "$DSR_STATE_DIR/builds/$tool/$version/latest"
+}
+
+prune_reported_path() {
+    exec_stdout | jq -e --arg path "$1" \
+        'any(.details.pruned_paths[]?; .path == $path)' >/dev/null
+}
+
+prune_reported_retention() {
+    exec_stdout | jq -e --arg path "$1" --arg reason "$2" \
+        'any(.details.retained_build_paths[]?; .path == $path and .reason == $reason)' >/dev/null
+}
+
+prune_case_result() {
+    local label="$1"
+    shift
+    if [[ $# -eq 0 ]]; then
+        pass "$label"
+    else
+        fail "$label: $*"
+        echo "stderr: $(exec_stderr | tail -10)"
+    fi
+}
+
+wait_prune_marker() {
+    python3 - "$1" <<'PY'
+import pathlib, sys, time
+marker = pathlib.Path(sys.argv[1])
+deadline = time.monotonic() + 10
+while not marker.exists() and time.monotonic() < deadline:
+    time.sleep(0.02)
+sys.exit(0 if marker.exists() else 1)
+PY
+}
+
+# Real kernel custody from the same helpers used by builds. In inherited mode
+# the coordinator releases its own descriptor and exits before prune starts.
+# The orphaned worker remains the sole lease holder until the test releases it.
+start_prune_lease() {
+    local mode="$1" control="$2" tool="$3" version="$4"
+    mkdir -p "$control" || return 1
+    mkfifo "$control/release" || return 1
+    (
+        # shellcheck source=../../src/logging.sh
+        source "$PROJECT_ROOT/src/logging.sh" || exit 1
+        # shellcheck source=../../src/build_state.sh
+        source "$PROJECT_ROOT/src/build_state.sh" || exit 1
+        build_state_init || exit 1
+        build_lock_acquire "$tool" "$version" || exit 1
+        if [[ "$mode" == inherited ]]; then
+            (
+                exec 8<> "$control/release"
+                : > "$control/ready"
+                IFS= read -r -t 30 <&8 || exit 1
+                local descriptor
+                for descriptor in "${_BUILD_LOCK_FDS[@]}"; do
+                    [[ -z "$descriptor" ]] || _build_lock_close_fd "$descriptor" || exit 1
+                done
+                : > "$control/done"
+            ) &
+            printf '%s\n' "$!" > "$control/worker.pid"
+            build_lock_release "$tool" "$version" || exit 1
+            exit 0
+        fi
+        exec 8<> "$control/release"
+        : > "$control/ready"
+        IFS= read -r -t 30 <&8 || exit 1
+        build_lock_release "$tool" "$version" || exit 1
+        : > "$control/done"
+    ) > "$control/holder.log" 2>&1 &
+    PRUNE_COORDINATOR_PID=$!
+    wait_prune_marker "$control/ready" || return 1
+    if [[ "$mode" == inherited ]]; then
+        wait "$PRUNE_COORDINATOR_PID" || return 1
+    fi
+}
+
+release_prune_gate() {
+    python3 - "$1/release" <<'PY'
+import os, sys
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_NONBLOCK)
+try:
+    os.write(fd, b'release\n')
+finally:
+    os.close(fd)
+PY
+}
+
+release_prune_lease() {
+    release_prune_gate "$1" || return 1
+    wait_prune_marker "$1/done"
+}
+
+try_prune_build_lease() {
+    bash -c '
+        source "$1/src/logging.sh" && source "$1/src/build_state.sh" && build_state_init || exit 1
+        status=0
+        build_lock_acquire "$2" "$3" || status=$?
+        [[ "$status" != 0 ]] || build_lock_release "$2" "$3" || exit 1
+        exit "$status"
+    ' _ "$PROJECT_ROOT" "$1" "$2"
+}
+
+test_prune_holds_custody_until_removal_finishes() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_minimal_config
+    seed_prune_pair guarded-tool v1.0.0
+    local directory="$DSR_STATE_DIR/builds/guarded-tool/v1.0.0"
+    local control="$TEST_TMPDIR/removal" real_rm prune_pid status problems=()
+    real_rm=$(command -v rm)
+    mkdir -p "$control/bin"
+    mkfifo "$control/release"
+    # Pause only this fixture's actual deletion. Every invocation ultimately
+    # delegates its exact arguments to real rm; lock acquisition is unmodified.
+    cat > "$control/bin/rm" <<'SH'
+#!/usr/bin/env bash
+if [[ "$#" == 2 && "$1" == -rf && "$2" == "$DSR_PRUNE_STOP_PATH" ]]; then
+    exec 8<> "$DSR_PRUNE_GATE/release"
+    printf '%s\n' "$@" > "$DSR_PRUNE_GATE/arguments"
+    : > "$DSR_PRUNE_GATE/ready"
+    IFS= read -r -t 30 <&8 || exit 1
+fi
+exec "$DSR_PRUNE_REAL_RM" "$@"
+SH
+    chmod +x "$control/bin/rm"
+    env PATH="$control/bin:$PATH" DSR_PRUNE_STOP_PATH="$directory/old-run" \
+        DSR_PRUNE_GATE="$control" DSR_PRUNE_REAL_RM="$real_rm" \
+        "$DSR_CMD" --json prune --max-age 30 --keep-last 0 --force \
+        > "$control/prune.stdout" 2> "$control/prune.stderr" &
+    prune_pid=$!
+    if wait_prune_marker "$control/ready"; then
+        [[ -d "$directory/old-run" ]] || problems+=("deletion did not pause before removing the run")
+        status=0
+        try_prune_build_lease guarded-tool v1.0.0 > "$control/during.log" 2>&1 || status=$?
+        [[ "$status" -eq 2 ]] || problems+=("build acquired custody during deletion (status $status)")
+    else
+        problems+=("prune never reached the actual removal boundary")
+    fi
+    release_prune_gate "$control" || problems+=("could not resume actual removal")
+    wait "$prune_pid" || problems+=("prune failed after release")
+    [[ ! -e "$directory/old-run" && -d "$directory/latest-run" ]] || problems+=("eligible removal/latest retention failed")
+    jq -e --arg path "$directory/old-run" 'any(.details.pruned_paths[]?; .path == $path)' \
+        "$control/prune.stdout" >/dev/null || problems+=("completed removal not reported")
+    try_prune_build_lease guarded-tool v1.0.0 > "$control/after.log" 2>&1 || problems+=("prune left custody held after completion")
+    prune_case_result "prune holds the real build lease through actual removal" "${problems[@]}"
+    if [[ ${#problems[@]} -gt 0 ]]; then
+        cat "$control/prune.stderr" "$control/during.log" "$control/after.log" 2>/dev/null
+    fi
+    harness_teardown
+}
+
+test_prune_build_custody() {
+    ((TESTS_RUN++))
+    local mode="$1" version="$2" locked_version="$3"
+    harness_setup
+    seed_minimal_config
+    seed_prune_pair active-tool "$version"
+    seed_prune_pair idle-tool v1.0.0
+    local directory="$DSR_STATE_DIR/builds/active-tool/$version"
+    local idle="$DSR_STATE_DIR/builds/idle-tool/v1.0.0/old-run"
+    local control="$TEST_TMPDIR/custody" before after problems=()
+    if ! start_prune_lease "$mode" "$control" active-tool "$locked_version"; then
+        fail "Could not establish real $mode build custody for $locked_version"
+        harness_teardown
+        return
+    fi
+    before=$(prune_tree_inventory "$DSR_STATE_DIR/builds")
+    exec_run "$DSR_CMD" --json --dry-run prune --max-age 30 --keep-last 0 --force
+    after=$(prune_tree_inventory "$DSR_STATE_DIR/builds")
+    [[ "$(exec_status)" -eq 0 && "$before" == "$after" ]] || problems+=("dry-run changed custody or state")
+    prune_reported_retention "$directory" build_custody || problems+=("dry-run did not report held custody")
+    ! prune_reported_path "$directory/old-run" || problems+=("dry-run selected the held run")
+    prune_reported_path "$idle" || problems+=("dry-run missed the unrelated eligible run")
+
+    before=$(prune_tree_inventory "$directory/old-run")
+    exec_run "$DSR_CMD" --json prune --max-age 30 --keep-last 0 --force
+    after=$(prune_tree_inventory "$directory/old-run")
+    [[ "$(exec_status)" -eq 0 && "$before" == "$after" ]] || problems+=("held run changed or disappeared")
+    prune_reported_retention "$directory" build_custody || problems+=("held custody not reported")
+    [[ ! -e "$idle" ]] && prune_reported_path "$idle" || problems+=("unrelated eligible run was not pruned")
+    ! prune_reported_path "$directory/old-run" || problems+=("held run reported as pruned")
+
+    release_prune_lease "$control" || problems+=("fixture could not release custody")
+    [[ "$mode" == inherited ]] || wait "$PRUNE_COORDINATOR_PID" || problems+=("coordinator did not exit cleanly")
+    exec_run "$DSR_CMD" --json prune --max-age 30 --keep-last 0 --force
+    [[ "$(exec_status)" -eq 0 && ! -e "$directory/old-run" ]] &&
+        prune_reported_path "$directory/old-run" || problems+=("released ordinary run was not pruned")
+    [[ -d "$directory/latest-run" ]] || problems+=("latest run was removed")
+    prune_case_result "prune respects $mode custody for $version via $locked_version" "${problems[@]}"
+    harness_teardown
+}
+
+test_prune_dry_run_custody_is_read_only() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_minimal_config
+    seed_prune_pair fresh-tool 1.0.0
+    seed_prune_pair free-tool v1.0.0
+    local before after problems=()
+    if ! bash -c '
+        source "$1/src/logging.sh" && source "$1/src/build_state.sh" &&
+        build_state_init && build_lock_acquire free-tool v1.0.0 && build_lock_release free-tool v1.0.0
+    ' _ "$PROJECT_ROOT" > "$TEST_TMPDIR/free-lease.log" 2>&1; then
+        fail "Could not establish a real released build lease"
+        harness_teardown
+        return
+    fi
+    before=$(prune_tree_inventory "$DSR_STATE_DIR" "$DSR_CACHE_DIR")
+    exec_run "$DSR_CMD" --json --dry-run prune --max-age 30 --keep-last 0 --force
+    after=$(prune_tree_inventory "$DSR_STATE_DIR" "$DSR_CACHE_DIR")
+    [[ "$(exec_status)" -eq 0 && "$before" == "$after" ]] || problems+=("dry-run wrote state or lease metadata")
+    prune_reported_path "$DSR_STATE_DIR/builds/fresh-tool/1.0.0/old-run" || problems+=("fresh eligible run not listed")
+    prune_reported_path "$DSR_STATE_DIR/builds/free-tool/v1.0.0/old-run" || problems+=("released eligible run not listed")
+    prune_case_result "dry-run probes absent and released leases without filesystem changes" "${problems[@]}"
+    harness_teardown
+}
+
+test_prune_retains_source_roots() {
+    ((TESTS_RUN++))
+    local location="$1"
+    harness_setup
+    seed_minimal_config
+    seed_prune_pair strict-tool v1.0.0
+    seed_prune_pair idle-tool v1.0.0
+    local snapshot="$TEST_TMPDIR/strict-snapshots" roots history='[]' current='{}'
+    local directory="$DSR_STATE_DIR/builds/strict-tool/v1.0.0/old-run"
+    local idle="$DSR_STATE_DIR/builds/idle-tool/v1.0.0/old-run" before after problems=()
+    (umask 077; mkdir -p "$snapshot/run/source" "$snapshot/run/.cargo-home/registry")
+    printf 'protected release source\n' > "$snapshot/.sbh-protect"
+    printf '[package]\nname = "retained"\nversion = "1.0.0"\n' > "$snapshot/run/source/Cargo.toml"
+    printf 'irreplaceable pinned offline cache\n' > "$snapshot/run/.cargo-home/registry/pinned-source"
+    chmod 600 "$snapshot/.sbh-protect" "$snapshot/run/source/Cargo.toml" "$snapshot/run/.cargo-home/registry/pinned-source"
+    roots=$(jq -nc --arg root "$snapshot/run/source" '{builder:$root}')
+    if [[ "$location" == context ]]; then
+        current="$roots"
+    else
+        history=$(jq -nc --argjson roots "$roots" \
+            '[{recorded_at:"2025-01-01T00:00:00Z",receipt:{source_roots:$roots}}]')
+    fi
+    write_prune_run_state "$directory/state.json" strict-tool v1.0.0 old-run "$current" "$history"
+    before=$(prune_tree_inventory "$directory" "$snapshot")
+    exec_run "$DSR_CMD" --json prune --max-age 30 --keep-last 0 --force
+    after=$(prune_tree_inventory "$directory" "$snapshot")
+    [[ "$(exec_status)" -eq 0 && "$before" == "$after" ]] || problems+=("checkpoint or protected snapshot changed")
+    prune_reported_retention "$directory" source_roots || problems+=("$location source roots not reported")
+    ! prune_reported_path "$directory" || problems+=("source-bound run reported as pruned")
+    [[ ! -e "$idle" ]] && prune_reported_path "$idle" || problems+=("ordinary eligible run was not pruned")
+    prune_case_result "prune retains completed non-latest $location source custody and offline cache" "${problems[@]}"
+    harness_teardown
+}
+
+test_prune_retains_unverifiable_state() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_minimal_config
+    seed_prune_pair idle-tool v1.0.0
+    local version_dir="$DSR_STATE_DIR/builds/unsafe-tool/v1.0.0" run before after problems=() retained_paths=()
+    local linked_state="$TEST_TMPDIR/linked-state.json"
+    for run in malformed wrong-identity linked missing missing-receipt malformed-history; do
+        seed_prune_old_run unsafe-tool v1.0.0 "$run"
+        retained_paths+=("$version_dir/$run")
+    done
+    printf '{"tool":' > "$version_dir/malformed/state.json"
+    write_prune_run_state "$version_dir/wrong-identity/state.json" unsafe-tool v1.0.0 unrelated-run
+    write_prune_run_state "$version_dir/missing-receipt/state.json" unsafe-tool v1.0.0 missing-receipt \
+        '{}' '[{"recorded_at":"2025-01-01T00:00:00Z"}]'
+    write_prune_run_state "$version_dir/malformed-history/state.json" unsafe-tool v1.0.0 malformed-history '{}' '{}'
+    # Retain the fixture's original states instead of deleting them to create
+    # the symlink and absent-state cases.
+    mv "$version_dir/linked/state.json" "$linked_state"
+    ln -s "$linked_state" "$version_dir/linked/state.json"
+    mv "$version_dir/missing/state.json" "$TEST_TMPDIR/missing-state.json"
+    python3 - "$version_dir/linked" "$version_dir/missing" <<'PY'
+import os, sys, time
+old = time.time() - 60 * 86400
+for path in sys.argv[1:]:
+    os.utime(path, (old, old))
+PY
+    before=$(prune_tree_inventory "${retained_paths[@]}" "$linked_state")
+    exec_run "$DSR_CMD" --json prune --max-age 30 --keep-last 0 --force
+    [[ "$(exec_status)" -eq 0 ]] || problems+=("prune failed")
+    # Actual pruning may create the version's lease; compare the retained
+    # checkpoints individually rather than treating custody creation as damage.
+    for run in malformed wrong-identity linked missing missing-receipt malformed-history; do
+        [[ -d "$version_dir/$run" ]] || problems+=("$run checkpoint was removed")
+        prune_reported_retention "$version_dir/$run" invalid_state || problems+=("$run refusal not reported")
+        ! prune_reported_path "$version_dir/$run" || problems+=("$run checkpoint reported as pruned")
+    done
+    after=$(prune_tree_inventory "${retained_paths[@]}" "$linked_state")
+    [[ "$before" == "$after" ]] || problems+=("unverifiable checkpoint bytes or identity changed")
+    [[ ! -e "$DSR_STATE_DIR/builds/idle-tool/v1.0.0/old-run" ]] &&
+        prune_reported_path "$DSR_STATE_DIR/builds/idle-tool/v1.0.0/old-run" || problems+=("ordinary eligible run was not pruned")
+    prune_case_result "prune retains malformed, mismatched, linked, missing and incomplete-history checkpoints" "${problems[@]}"
+    harness_teardown
+}
+
+test_prune_allows_explicit_no_sync_history() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_minimal_config
+    seed_prune_pair ordinary-tool v1.0.0
+    local directory="$DSR_STATE_DIR/builds/ordinary-tool/v1.0.0" problems=()
+    write_prune_run_state "$directory/old-run/state.json" ordinary-tool v1.0.0 old-run \
+        '{}' '[{"recorded_at":"2025-01-01T00:00:00Z","receipt":null}]'
+    exec_run "$DSR_CMD" --json prune --max-age 30 --keep-last 0 --force
+    [[ "$(exec_status)" -eq 0 && ! -e "$directory/old-run" ]] || problems+=("ordinary no-sync run was not pruned")
+    prune_reported_path "$directory/old-run" || problems+=("ordinary no-sync removal not reported")
+    [[ -d "$directory/latest-run" ]] || problems+=("latest run was removed")
+    prune_case_result "prune removes an ordinary completed run with an explicit null source-sync receipt" "${problems[@]}"
     harness_teardown
 }
 
@@ -607,6 +969,18 @@ test_prune_removes_old_logs
 test_prune_respects_keep_last
 test_prune_real_layout_keeps_releases_and_latest
 test_prune_global_dry_run_deletes_nothing
+
+echo ""
+echo "Build Custody and Snapshot Retention Tests:"
+test_prune_holds_custody_until_removal_finishes
+test_prune_build_custody coordinator v1.0.0 v1.0.0
+test_prune_build_custody inherited v1.0.0 v1.0.0
+test_prune_build_custody coordinator 1.0.0 v1.0.0
+test_prune_dry_run_custody_is_read_only
+test_prune_retains_source_roots context
+test_prune_retains_source_roots history
+test_prune_retains_unverifiable_state
+test_prune_allows_explicit_no_sync_history
 
 echo ""
 echo "Error Handling Tests:"

@@ -2064,6 +2064,32 @@ Artifact sets are `artifacts/<tool>-<tag>/` with their `<tool>-<tag>-manifest.js
 a set is published when `releases/<tool>-<tag>-upload.json` exists. The build run
 `latest` points to is always kept. The global `--dry-run` applies.
 
+Build checkpoint pruning acquires the same tool/version lease used by builds
+and holds it through selection and removal. Both the stored version and its
+canonical tag are covered when they differ, such as `1.2.3` and `v1.2.3`.
+A busy lease, including one inherited by a worker after its coordinator exits,
+or unverifiable lease metadata keeps that version's checkpoints. Dry-run only
+probes existing leases; it creates no build lease or checkpoint and reports a
+current observation, not a reservation for a later invocation.
+
+Checkpoints with recorded source roots are retained, including roots in source
+sync history and relocation evidence. Strict snapshots and their private Cargo
+caches live outside the ordinary state/cache directories and may be protected
+from external cleanup. Removing the checkpoint first would orphan those caches
+and discard recovery evidence. This command does not reclaim the snapshots;
+their recorded paths alone do not establish the directory custody required for
+automatic deletion. Malformed, mismatched or linked checkpoints and ambiguous
+`latest` entries are also retained. These guards apply even with `--keep-last 0`
+or `--force`.
+
+JSON results report these additional exclusions in `retained_build_paths`, an
+array of `{path, reason}` objects. `build_custody` identifies a busy or
+unverifiable build lease, `source_roots` identifies retained source references,
+and `invalid_state` identifies an unverifiable checkpoint or resume selection.
+These exclusions are successful skips; deletion or lease-release errors still
+produce a partial result. The ownership checks apply to build checkpoints;
+the existing artifact, log, manifest and cache retention policies are separate.
+
 **Exit codes:**
 - `0`: Prune completed successfully
 - `1`: Partial cleanup (some files couldn't be deleted)

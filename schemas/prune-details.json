@@ -48,6 +48,11 @@
       "items": { "$ref": "#/$defs/pruned_item" },
       "description": "List of pruned files"
     },
+    "retained_build_paths": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/retained_build_item" },
+      "description": "Build checkpoints or version directories excluded by ownership and state checks, in addition to ordinary age, latest and keep-last retention"
+    },
     "errors": {
       "type": "array",
       "items": { "$ref": "#/$defs/prune_error" },
@@ -55,6 +60,18 @@
     }
   },
   "$defs": {
+    "retained_build_item": {
+      "type": "object",
+      "required": ["path", "reason"],
+      "properties": {
+        "path": { "type": "string" },
+        "reason": {
+          "type": "string",
+          "enum": ["build_custody", "source_roots", "invalid_state"]
+        }
+      },
+      "additionalProperties": false
+    },
     "pruned_item": {
       "type": "object",
       "required": ["path", "size_bytes"],
