@@ -36,6 +36,36 @@ repack_with_changed_copy_metadata() (
     }
     packaging_repack_archive "$@"
 )
+change_archive_container_bytes() {
+    python3 - "$@" <<'PY'
+import io
+from pathlib import Path
+import sys
+import tarfile
+import zipfile
+
+source, destination = map(Path, sys.argv[1:3])
+fmt = sys.argv[3]
+if fmt == 'tar.gz':
+    data = bytearray(source.read_bytes())
+    assert data[:2] == b'\x1f\x8b' and not data[3] & 2
+    # Change only gzip's timestamp; the compressed payload and CRC stay valid.
+    data[4:8] = (int.from_bytes(data[4:8], 'little') ^ 1).to_bytes(4, 'little')
+    destination.write_bytes(data)
+elif fmt == 'tar.xz':
+    with tarfile.open(source, 'r:xz') as incoming:
+        rows = [(member, incoming.extractfile(member).read()) for member in incoming]
+    with tarfile.open(destination, 'w:xz', format=tarfile.PAX_FORMAT) as outgoing:
+        for member, data in rows:
+            member.mtime = int(member.mtime) + 1
+            member.pax_headers.pop('mtime', None)
+            outgoing.addfile(member, io.BytesIO(data))
+else:
+    destination.write_bytes(source.read_bytes())
+    with zipfile.ZipFile(destination, 'a') as archive:
+        archive.comment = b'copy changed the container without changing its payload'
+PY
+}
 
 for tool in tar gzip xz cmp stat; do
     command -v "$tool" >/dev/null || { printf 'Missing dependency: %s\n' "$tool" >&2; exit 3; }
@@ -199,6 +229,59 @@ PY
     expect_success "$format matching legacy private include remains accepted" \
         packaging_repack_archive "$legacy_private" "$format" "$dir/legacy-copy.$format" "$format" "$work/private" helper
     expect_equal "$format matching legacy private include retains original archive bytes" "$legacy_private" "$dir/legacy-copy.$format"
+
+    # Equal payloads and canonical permissions do not prove a byte-for-byte
+    # prebuilt copy. Exercise both admission policies with valid containers
+    # whose timestamps or ZIP comment changed during the final copy.
+    canonical_container="$dir/canonical-container.$format"
+    legacy_container="$dir/legacy-container.$format"
+    if change_archive_container_bytes "$canonical" "$canonical_container" "$format" && \
+       change_archive_container_bytes "$legacy_private" "$legacy_container" "$format"; then
+        expect_success "$format changed canonical container retains exact payload and public metadata" \
+            _pkg_archive_matches_payload "$canonical_container" "$format" "$work/private" $'NOTICE\nhelper' normalized
+        expect_success "$format changed legacy container retains exact payload and executable bits" \
+            _pkg_archive_matches_payload "$legacy_container" "$format" "$work/private" helper
+        for copy_case in canonical-exact canonical-private legacy-private; do
+            copy_source="$canonical"
+            changed_container="$canonical_container"
+            copy_includes=()
+            case "$copy_case" in
+                canonical-private) copy_includes=("$work/private" helper NOTICE) ;;
+                legacy-private)
+                    copy_source="$legacy_private"
+                    changed_container="$legacy_container"
+                    copy_includes=("$work/private" helper)
+                    ;;
+            esac
+            if cmp -s "$copy_source" "$changed_container"; then
+                fail "$format $copy_case fixture changes authoritative container bytes"
+            else
+                pass "$format $copy_case fixture changes authoritative container bytes"
+            fi
+            copy_source_before="$dir/source-before-$copy_case"
+            cp "$copy_source" "$copy_source_before"
+            copy_source_inode=$(inode "$copy_source" 2>/dev/null || true)
+            copy_destination="$dir/guarded-$copy_case.$format"
+            printf 'previous destination for %s\n' "$copy_case" > "$copy_destination"
+            cp "$copy_destination" "$dir/sentinel-$copy_case"
+            copy_destination_inode=$(inode "$copy_destination" 2>/dev/null || true)
+            expect_invalid "$format $copy_case rejects changed compressed copy bytes" \
+                repack_with_changed_copy_metadata "$changed_container" "$copy_source" "$format" \
+                    "$copy_destination" "$format" "${copy_includes[@]}"
+            expect_equal "$format $copy_case failure preserves previous destination bytes" \
+                "$dir/sentinel-$copy_case" "$copy_destination"
+            [[ -n "$copy_destination_inode" && "$(inode "$copy_destination" 2>/dev/null)" == "$copy_destination_inode" ]] && \
+                pass "$format $copy_case failure preserves destination inode" || \
+                fail "$format $copy_case failure preserves destination inode"
+            expect_equal "$format $copy_case failure preserves authoritative source bytes" \
+                "$copy_source_before" "$copy_source"
+            [[ -n "$copy_source_inode" && "$(inode "$copy_source" 2>/dev/null)" == "$copy_source_inode" ]] && \
+                pass "$format $copy_case failure preserves authoritative source inode" || \
+                fail "$format $copy_case failure preserves authoritative source inode"
+        done
+    else
+        fail "$format changed-container fixture creation"
+    fi
     private_mode=$(stat -c '%a' "$work/private/helper" 2>/dev/null || stat -f '%Lp' "$work/private/helper")
     [[ "$private_mode" == 700 ]] && pass "$format original private include stays 0700" || fail "$format original private include mode: $private_mode"
     expect_equal "$format original private include bytes stay unchanged" "$work/private/helper" "$work/plain/helper"

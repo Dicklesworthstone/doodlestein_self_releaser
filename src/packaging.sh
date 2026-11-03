@@ -996,6 +996,14 @@ packaging_repack_archive() (
         _pkg_log_error "Repacked archive payload does not match source: $dest"
         return 4
     fi
+    # A same-format copy retains the producer's complete byte authority.
+    # Equal payloads and canonical modes cannot authorize different archive
+    # headers or compression bytes, which would invalidate its attestations.
+    if [[ "$src_format" == "$dest_format" && "$added_includes" -eq 0 ]] && \
+       ! cmp -s "$src" "$staged"; then
+        _pkg_log_error "Prebuilt archive copy differs from authoritative source bytes: $dest"
+        return 4
+    fi
     [[ ! -L "$dest" && ( ! -e "$dest" || -f "$dest" ) ]] || return 4
     mv -f -- "$staged" "$dest" || return 4
 )
