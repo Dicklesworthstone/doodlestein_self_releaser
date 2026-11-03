@@ -54,12 +54,12 @@ try:
             subprocess.run([cc, "-O2", str(c), "-o", str(incoming / n)], check=True)
         else:
             (incoming / n).write_text("#!/bin/sh\nexit %d\n" % status)
-        (incoming / n).chmod(0o755 if n == "app" else 0o751)
+        (incoming / n).chmod(0o700 if n == "app" else 0o751)
     check("native fixture executable runs before packaging", subprocess.run([str(incoming / "helper")]).returncode == 17)
     with zipfile.ZipFile(incoming / "producer.zip", "w", compression=zipfile.ZIP_DEFLATED) as z:
         info = zipfile.ZipInfo("demo.exe", (2021, 1, 2, 3, 4, 6))
         info.create_system = 3
-        info.external_attr = (stat.S_IFREG | 0o755) << 16
+        info.external_attr = (stat.S_IFREG | 0o700) << 16
         z.writestr(info, b"archived producer payload\n")
     manifest = work / "producer.json"
     assets = []
@@ -121,14 +121,23 @@ try:
     check("prebuilt same-format archive is byte-for-byte authoritative", (dist / "demo-windows.zip").read_bytes() == (incoming / "producer.zip").read_bytes())
     check("archive aliases are byte-identical", (dist / "demo-linux.tgz").read_bytes() == (dist / "demo-linux.tar.gz").read_bytes())
     check("aliases do not hardlink mutable producer files", (dist / "demo").stat().st_ino != (incoming / "app").stat().st_ino)
+    check("archive normalization retains original producer permissions",
+          stat.S_IMODE((incoming / "app").stat().st_mode) == 0o700 and
+          stat.S_IMODE((incoming / "helper").stat().st_mode) == 0o751)
     for filename in ("demo-linux.tar.gz", "demo-linux.tar.xz"):
         with tarfile.open(dist / filename) as t:
             check(filename + " has exactly flat binary members", sorted(t.getnames()) == ["demo", "helper"])
             check(filename + " preserves helper bytes and executable bits", t.extractfile("helper").read() == (incoming / "helper").read_bytes() and t.getmember("helper").mode & 0o111 == 0o111)
+            check(filename + " publishes exact executable modes and anonymous root ownership",
+                  all((m.mode, m.uid, m.gid, m.uname, m.gname) == (0o755, 0, 0, "", "") for m in t))
     with zipfile.ZipFile(dist / "demo-linux.zip") as z:
         check("ZIP carries both binary payloads, not an archive wrapper", sorted(z.namelist()) == ["demo", "helper"] and z.read("demo") == (incoming / "app").read_bytes())
+        check("ZIP publishes exact executable modes", all(stat.S_IMODE(m.external_attr >> 16) == 0o755 for m in z.infolist()))
     with tarfile.open(dist / "demo-windows.tar.xz") as t:
         check("cross-format conversion extracts rather than nests the ZIP", t.getnames() == ["demo.exe"] and t.extractfile("demo.exe").read() == b"archived producer payload\n")
+        member = t.getmember("demo.exe")
+        check("new cross-format archive normalizes the private prebuilt member",
+              (member.mode, member.uid, member.gid, member.uname, member.gname) == (0o755, 0, 0, "", ""))
     inode = (dist / "demo-linux.tar.gz").stat().st_ino
     first = (out / "release/result.json").read_bytes()
     incoming.rename(work / "offline-producer")

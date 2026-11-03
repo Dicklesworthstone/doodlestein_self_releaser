@@ -188,28 +188,44 @@ _act_stream_remote_windows_file() {
         -o StrictHostKeyChecking=accept-new "$ssh_destination" "$command"
 }
 
+# Collection modes belong to private evidence, not published archive members.
+# Normalize fresh copies behind a private directory at the archive boundary;
+# the original collection receipts and exclusive output descriptor stay intact.
+_act_stream_workspace_archive() {
+    local format="$1" artifact_dir="$2"
+    shift 2
+    if ! declare -F packaging_stream_archive &>/dev/null; then
+        local module_dir
+        module_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" || return 3
+        # shellcheck source=SCRIPTDIR/packaging.sh
+        source "$module_dir/packaging.sh" || return 3
+    fi
+    packaging_stream_archive "$format" "$artifact_dir" "$artifact_dir" "$@"
+}
+
 _act_stream_workspace_tar_gz() {
-    local artifact_dir="$1"
-    shift
-    (
-        set -o pipefail
-        (cd "$artifact_dir" && COPYFILE_DISABLE=1 tar --no-xattrs -cf - "$@") | gzip -c
-    )
+    _act_stream_workspace_archive tar.gz "$@"
 }
 
 _act_stream_workspace_tar_xz() {
-    local artifact_dir="$1"
-    shift
-    (
-        set -o pipefail
-        (cd "$artifact_dir" && COPYFILE_DISABLE=1 tar --no-xattrs -cf - "$@") | xz -c
-    )
+    _act_stream_workspace_archive tar.xz "$@"
 }
 
 _act_stream_workspace_zip() {
-    local artifact_dir="$1"
-    shift
-    (cd "$artifact_dir" && zip -q - "$@")
+    _act_stream_workspace_archive zip "$@"
+}
+
+# Inspect fresh archive headers before accepting their collection receipt.
+# Prebuilt archives retain their byte authority and use the existing validators.
+_act_validate_release_archive_metadata() {
+    local archive="$1" format="$2"
+    if ! declare -F _pkg_archive_inspect &>/dev/null; then
+        local module_dir
+        module_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" || return 3
+        # shellcheck source=SCRIPTDIR/packaging.sh
+        source "$module_dir/packaging.sh" || return 3
+    fi
+    _pkg_archive_inspect normalized "$archive" "$format"
 }
 
 # Resolve the native workspace archive format from the per-repository build
@@ -1390,6 +1406,13 @@ _act_validate_workspace_member_receipts() {
         expected_sha=$(jq -er '.sha256' <<< "$expected") || return 4
         expected_size=$(jq -er '.size_bytes' <<< "$expected") || return 4
         expected_mode=$(jq -er '.mode' <<< "$expected") || return 4
+        # The source receipt above must still match exactly, including private
+        # permissions. Only the archive representation uses public modes.
+        if [[ "$expected_mode" == *[xst]* ]]; then
+            expected_mode=-rwxr-xr-x
+        else
+            expected_mode=-rw-r--r--
+        fi
         actual_mode=$(_act_archive_member_mode "$archive" "$format" "$member") || return 4
         [[ "$actual_mode" == "$expected_mode" ]] || return 4
         if command -v sha256sum &>/dev/null; then
@@ -2041,29 +2064,18 @@ _act_stage_contract_primary() {
                 fi
                 ;;
             tar.gz)
-                command -v tar &>/dev/null || exit 4
-                (
-                    set -o pipefail
-                    (cd "$(dirname "$source_path")" && \
-                        COPYFILE_DISABLE=1 tar --no-xattrs -cf - \
-                            "$(basename "$source_path")") | gzip -c
-                ) >&9 || exit 4
+                _act_stream_workspace_tar_gz "$(dirname "$source_path")" \
+                    "$(basename "$source_path")" >&9 || exit 4
                 chmod 600 /dev/fd/9 || exit 4
                 ;;
             tar.xz)
-                command -v tar &>/dev/null || exit 4
-                (
-                    set -o pipefail
-                    (cd "$(dirname "$source_path")" && \
-                        COPYFILE_DISABLE=1 tar --no-xattrs -cf - \
-                            "$(basename "$source_path")") | xz -c
-                ) >&9 || exit 4
+                _act_stream_workspace_tar_xz "$(dirname "$source_path")" \
+                    "$(basename "$source_path")" >&9 || exit 4
                 chmod 600 /dev/fd/9 || exit 4
                 ;;
             zip)
-                command -v zip &>/dev/null || exit 4
-                (cd "$(dirname "$source_path")" && \
-                    zip -q - "$(basename "$source_path")") >&9 || exit 4
+                _act_stream_workspace_zip "$(dirname "$source_path")" \
+                    "$(basename "$source_path")" >&9 || exit 4
                 chmod 600 /dev/fd/9 || exit 4
                 ;;
             *) exit 4 ;;
@@ -2095,6 +2107,7 @@ _act_stage_contract_primary() {
             return 4
         fi
     else
+        _act_validate_release_archive_metadata "$staged_path" "$staged_format" || return 4
         if ! _act_validate_target_archive \
             "$staged_path" "$staged_format" "$expected_input_name" "$target"; then
             return 4
@@ -12816,6 +12829,11 @@ EOF
                             "${archive_files[@]}") || archive_receipt=""
                         ;;
                 esac
+            fi
+            if [[ -n "$archive_receipt" ]] && \
+               ! _act_validate_release_archive_metadata "$archive_path" "$archive_ext"; then
+                _log_error "Workspace archive metadata is not normalized for publication: $platform"
+                archive_receipt=""
             fi
             if $strict_native_build; then
                 if [[ -n "$archive_receipt" ]] && \

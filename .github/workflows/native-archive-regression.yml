@@ -8,6 +8,8 @@ on:
       - src/cargo_cache.sh
       - src/cargo_sources.sh
       - src/config.sh
+      - src/packaging.sh
+      - scripts/tests/test_act_runner_native.sh
       - scripts/tests/test_cargo_cache.sh
       - scripts/tests/test_native_single_archives.sh
       - scripts/tests/test_strict_cargo_private_cache.sh
@@ -37,14 +39,15 @@ jobs:
           set -euo pipefail
           if [[ "$RUNNER_OS" == Linux ]]; then
             sudo apt-get update
-            sudo apt-get install -y --no-install-recommends jq clang lld xz-utils zip unzip python3 cargo rustc
+            sudo apt-get install -y --no-install-recommends jq clang lld xz-utils zip unzip python3 cargo rustc libarchive-tools minisign
           else
-            for tool in jq xz go; do
+            for tool in jq xz go minisign; do
               command -v "$tool" >/dev/null || brew install "$tool"
             done
             python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null || brew install python
             command -v cargo >/dev/null || brew install rust
             if (( BASH_VERSINFO[0] < 4 )); then brew install bash; fi
+            command -v gtar >/dev/null || brew install gnu-tar
             echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
           fi
           mkdir -p "$RUNNER_TEMP/dsr-test-bin"
@@ -94,4 +97,8 @@ jobs:
           bash -n scripts/tests/test_strict_cargo_private_cache.sh
           bash scripts/tests/test_cargo_cache.sh
           bash scripts/tests/test_strict_cargo_private_cache.sh
-          bash scripts/tests/test_native_single_archives.sh
+          # Both writers must produce real normalized archives on both hosts.
+          # The BSD lane uses macOS's native tar there, not GNU tar in disguise.
+          DSR_TEST_TAR=gnu bash scripts/tests/test_native_single_archives.sh
+          DSR_TEST_TAR=bsd bash scripts/tests/test_native_single_archives.sh
+          bash scripts/tests/test_act_runner_native.sh --archive-delivery-only

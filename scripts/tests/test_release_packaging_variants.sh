@@ -437,14 +437,15 @@ for arch in ("amd64", "arm64"):
             with zipfile.ZipFile(dist / row["name"]) as archive:
                 names = archive.namelist()
                 payload = archive.read(member["path"])
-                bits = (archive.getinfo(member["path"]).external_attr >> 16) & 0o111
+                mode = stat.S_IMODE(archive.getinfo(member["path"]).external_attr >> 16)
         else:
             with tarfile.open(dist / row["name"]) as archive:
                 names = archive.getnames()
                 payload = archive.extractfile(member["path"]).read()
-                bits = archive.getmember(member["path"]).mode & 0o111
-        check(arch + " exact bytes/member/mode survive " + row["archive_format"],
-              names == [member["path"]] and payload == source.read_bytes() and bits == (source.stat().st_mode & 0o111))
+                mode = archive.getmember(member["path"]).mode
+        expected_mode = 0o755 if original[source.name][1] & 0o111 else 0o644
+        check(arch + " exact bytes/member and canonical mode survive " + row["archive_format"],
+              names == [member["path"]] and payload == source.read_bytes() and mode == expected_mode)
     check(arch + " alias is byte-identical but is not another compiler task",
           sha(dist / "alias-0.tar.gz") == sha(dist / "package-0.tar.gz") and exported["summary"]["total"] == 3)
     check(arch + " producer payloads and permissions were not mutated",

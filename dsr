@@ -4072,12 +4072,15 @@ EOF
     }
 
     # A prebuilt companion satisfies include_files only when its bytes and
-    # executable bits match the configured source. Validate the complete
-    # archive before reporting missing members; callers must observe failure
-    # instead of treating an unreadable or conflicting archive as complete.
+    # executable bits match the configured source, or a fully normalized
+    # archive carries the declared 0755 representation of that executable.
+    # Legacy prebuilt archives retain exact execution-mask equality. Validate
+    # the complete archive before reporting missing members; callers must
+    # observe failure instead of treating a conflicting archive as complete.
     _build_archive_missing_includes() (
         local tool="$1" archive="$2" archive_format="$3" repo_path="$4"
         local include configured payload source_bits archive_bits
+        local archive_is_normalized=unchecked
         local -a includes=() missing=()
         configured=$(_build_get_include_files "$tool") || return 4
         while IFS= read -r include; do
@@ -4121,6 +4124,16 @@ EOF
                 fi
                 source_bits=$(_pkg_executable_bits "$repo_path/$include") || return 4
                 archive_bits=$(_pkg_executable_bits "$payload/$include") || return 4
+                if [[ "$source_bits" != "$archive_bits" && "$source_bits" != 0 &&
+                      "$archive_bits" == "$((0111))" ]]; then
+                    if [[ "$archive_is_normalized" == unchecked ]]; then
+                        archive_is_normalized=false
+                        if _pkg_archive_inspect normalized "$archive" "$archive_format" >/dev/null 2>&1; then
+                            archive_is_normalized=true
+                        fi
+                    fi
+                    [[ "$archive_is_normalized" != true ]] || source_bits=$((0111))
+                fi
                 if [[ "$source_bits" != "$archive_bits" ]]; then
                     log_error "Configured include executable bits for $tool differ from the prebuilt archive: $include"
                     return 4

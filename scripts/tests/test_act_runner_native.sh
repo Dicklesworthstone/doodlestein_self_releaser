@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_act_runner_native.sh - Unit tests for act_runner.sh native build SSH logic
 #
-# Usage: ./test_act_runner_native.sh [--typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --workspace-archives-only | --failure-evidence-only | --env-precedence-only]
+# Usage: ./test_act_runner_native.sh [--typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --workspace-archives-only | --failure-evidence-only | --env-precedence-only | --archive-delivery-only]
 #
 # Tests native build SSH command construction with mocks.
 # Covers: command construction, path handling, env vars, SCP, error handling.
@@ -604,11 +604,9 @@ def build(context, label, fault='none', operation='native', attempt=1, path=None
         rows = [row for row in process.stdout.splitlines() if row.startswith(b'{')]
         result = json.loads(rows[-1]) if rows else {}
         save(result_file, result)
-    # Native declared non-binary members deliberately receive private modes
-    # during collection; their archive must preserve those collected modes.
+    # Declared non-binary members stay private during collection. Published
+    # archive modes are normalized independently of those retained sources.
     expected = dict(includes, **payloads)
-    expected['metadata.json'] = (payloads['metadata.json'][0], 0o600)
-    expected['verify.sh'] = (payloads['verify.sh'][0], 0o700)
     return process.returncode, result, expected
 
 
@@ -626,18 +624,24 @@ def accepted(context, label, outcome):
     code, result, expected = outcome
     paths = result.get('artifact_paths', [])
     good = code == 0 and result.get('status') == 'success' and len(paths) == 1
+    private_companions_intact = False
     if good:
         archive = Path(paths[0])
         good = archive_members(archive) == expected
         good = good and result.get('collected_sha256') == hashlib.sha256(archive.read_bytes()).hexdigest()
         good = good and result.get('collected_size_bytes') == archive.stat().st_size
         good = good and bool(result.get('collected_identity'))
+        private_companions_intact = all(
+            stat.S_IMODE((archive.parent / member).stat().st_mode) == mode and
+            (archive.parent / member).read_bytes() == expected[member][0]
+            for member, mode in (('metadata.json', 0o600), ('verify.sh', 0o700)))
         # Execute the actual collected Bash payloads; no machine-code-shaped
         # header or architecture validator is substituted for script support.
         for binary in ('app', 'helper'):
             ran = subprocess.run([str(archive.parent / binary)], capture_output=True, timeout=10)
             good = good and ran.returncode == 0 and ran.stdout == (binary + ':' + label + '\n').encode()
-    check(label + ': real native Bash build produces one complete archive with frozen bytes and modes', good)
+    check(label + ': real native Bash build produces one complete archive with frozen bytes and normalized modes', good)
+    check(label + ': normalization preserves private collected companion bytes and modes', private_companions_intact)
     return result
 
 
@@ -788,6 +792,192 @@ PY
 
 if [[ "${1:-}" == --workspace-archives-only ]]; then
     test_native_workspace_archives
+    exit $?
+fi
+
+# Verify actual archive bytes through production checksum/signing functions and
+# the generated installer. Keys are ephemeral; every install is offline. No
+# signing, checksum, archive or installer implementation is substituted.
+test_native_archive_delivery() {
+    local dependency
+    for dependency in python3 yq jq tar gzip xz zip unzip minisign; do
+        command -v "$dependency" >/dev/null || { printf 'Missing archive delivery dependency: %s\n' "$dependency" >&2; return 3; }
+    done
+    python3 - "$PROJECT_ROOT" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import zipfile
+
+root = Path(sys.argv[1])
+module = Path(os.environ.get('DSR_TEST_ACT_RUNNER', str(root / 'src/act_runner.sh')))
+work = Path(tempfile.mkdtemp(prefix='dsr-native-archive-delivery-')).resolve()
+print('Retained real archive delivery evidence: ' + str(work), flush=True)
+checks = 0
+operations = 0
+
+
+def check(label, condition):
+    global checks
+    if not condition:
+        raise AssertionError(label)
+    checks += 1
+    print('PASS: ' + label, flush=True)
+
+
+def invoke(label, arguments, env=None, expected=0):
+    global operations
+    operations += 1
+    result = subprocess.run(list(map(str, arguments)), capture_output=True, timeout=90, env=env)
+    (work / ('%03d.stdout' % operations)).write_bytes(result.stdout)
+    (work / ('%03d.stderr' % operations)).write_bytes(result.stderr)
+    if result.returncode != expected:
+        raise AssertionError(label + ': exit %d, expected %d\n%s' % (
+            result.returncode, expected, result.stderr.decode(errors='replace')))
+    check(label, True)
+    return result
+
+
+def api(label, source, *arguments, env=None):
+    return invoke(label, ['bash', '-c', 'source "$1" || exit $?; shift; "$@"',
+                         '_', source, *arguments], env=env)
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+host_os = platform.system().lower()
+host_arch = {'x86_64': 'amd64', 'aarch64': 'arm64', 'arm64': 'arm64'}.get(platform.machine())
+if host_os not in ('linux', 'darwin') or host_arch is None:
+    raise SystemExit('Archive delivery integration requires a Linux/macOS amd64/arm64 host')
+payload = work / 'payload'
+payload.mkdir(mode=0o700)
+contents = {'delivery': (b'#!/bin/sh\nprintf "delivery 1.2.3\\n"\n', 0o700),
+            'helper': (b'#!/bin/sh\nprintf "helper 1.2.3\\n"\n', 0o700),
+            'NOTICE': (b'Archive delivery fixture: redistribution permitted.\n', 0o600)}
+for name, (data, mode) in contents.items():
+    (payload / name).write_bytes(data)
+    (payload / name).chmod(mode)
+before = {name: (sha(payload / name), (payload / name).stat().st_ino,
+                 stat.S_IMODE((payload / name).stat().st_mode)) for name in contents}
+private = work / 'ephemeral.key'
+public = work / 'ephemeral.pub'
+invoke('generate real ephemeral Minisign key', ['minisign', '-G', '-W', '-s', private, '-p', public])
+key = public.read_text().splitlines()[1]
+
+for fmt, producer in (('tar.gz', '_act_stream_workspace_tar_gz'),
+                      ('tar.xz', '_act_stream_workspace_tar_xz'),
+                      ('zip', '_act_stream_workspace_zip')):
+    case = work / fmt
+    assets = case / 'assets'
+    assets.mkdir(parents=True, mode=0o700)
+    config = case / 'config'
+    (config / 'repos.d').mkdir(parents=True)
+    env = dict(os.environ, DSR_CONFIG_DIR=str(config), DSR_INSTALLER_DIR=str(case / 'generated'), NO_COLOR='1')
+    asset_name = 'delivery-1.2.3-%s-%s.%s' % (host_os, host_arch, fmt)
+    archive = assets / asset_name
+    receipt = api(fmt + ': produce real native archive with held receipt', module,
+        '_act_collect_stream_exclusive', archive, '600', producer, payload, *contents, env=env)
+    receipt = json.loads(receipt.stdout)
+    check(fmt + ': frozen archive hash and size match actual final bytes',
+          receipt['sha256'] == sha(archive) and receipt['size_bytes'] == archive.stat().st_size)
+    if fmt == 'zip':
+        with zipfile.ZipFile(archive) as package:
+            observed = {m.filename: (package.read(m), stat.S_IMODE(m.external_attr >> 16))
+                        for m in package.infolist()}
+    else:
+        with tarfile.open(archive) as package:
+            entries = package.getmembers()
+            observed = {m.name: (package.extractfile(m).read(), m.mode) for m in entries}
+            check(fmt + ': tar members have anonymous numeric root ownership',
+                  all((m.uid, m.gid, m.uname, m.gname) == (0, 0, '', '') for m in entries))
+    check(fmt + ': generated members have normalized modes and original bytes',
+          observed == {name: (data, 0o755 if mode & 0o111 else 0o644)
+                       for name, (data, mode) in contents.items()})
+    checksum = Path(str(archive) + '.sha256')
+    signature = Path(str(archive) + '.minisig')
+    api(fmt + ': production checksum generation', root / 'src/checksum_sync.sh',
+        'checksum_generate', assets, '--output', checksum, env=env)
+    api(fmt + ': production strict checksum verification', root / 'src/checksum_sync.sh',
+        'checksum_verify', checksum, assets, '--strict', env=env)
+    api(fmt + ': production signing with real Minisign', root / 'src/signing.sh',
+        'signing_sign_exact', archive, signature, private, key,
+        'DSR archive normalization integration', sha(archive), env=env)
+    api(fmt + ': production exact signature verification', root / 'src/signing.sh',
+        'signing_verify_exact', archive, signature, key, env=env)
+    frozen = (sha(archive), archive.stat().st_ino, sha(checksum), sha(signature))
+    (config / 'repos.d/delivery.yaml').write_text(json.dumps({
+        'tool_name': 'delivery', 'repo': 'example/delivery', 'binary_name': 'delivery',
+        'language': 'bash', 'workspace_binaries': ['delivery', 'helper'],
+        'archive_format': fmt, 'artifact_naming': '${name}-${version}-${os}-${arch}',
+        'minisign_pubkey': key}))
+    generated = api(fmt + ': generate actual signed installer', root / 'src/install_gen.sh',
+        'install_gen_create', 'delivery', env=env)
+    installer = Path(generated.stdout.decode().strip())
+    invoke(fmt + ': generated installer parses', ['bash', '-n', installer])
+    cache = case / 'cache'
+    # Seed the real installer cache helper with the already verified artifact;
+    # subsequent main invocations run cache-only, with no network fallback.
+    invoke(fmt + ': retain verified bytes with generated cache helper', [
+        'bash', '-c', 'source "$1" --help >/dev/null || exit $?; _CACHE_DIR="$2"; '
+        '_cache_put "$3" v1.2.3 "$4" "$5"', '_', installer, cache, archive,
+        host_os + '/' + host_arch, fmt], env=env)
+    prefix = case / 'installed'
+    install_args = ['bash', installer, '--version', 'v1.2.3', '--offline',
+                    '--cache-dir', cache, '--dir', prefix, '--non-interactive',
+                    '--require-signatures', '--json', '--no-skills']
+    installed = invoke(fmt + ': install complete family from signed offline cache', install_args, env=env)
+    check(fmt + ': generated installer reports both actual payload hashes',
+          json.loads(installed.stdout)['status'] == 'success' and
+          {row['name']: row['sha256'] for row in json.loads(installed.stdout)['binaries']} ==
+          {name: sha(payload / name) for name in ('delivery', 'helper')})
+    for name in ('delivery', 'helper'):
+        check(fmt + ': installed ' + name + ' bytes and permissions are usable',
+              (prefix / name).read_bytes() == contents[name][0] and
+              stat.S_IMODE((prefix / name).stat().st_mode) == 0o755)
+        invoked = invoke(fmt + ': execute installed ' + name, [prefix / name])
+        check(fmt + ': installed ' + name + ' executes expected program',
+              invoked.stdout == (name + ' 1.2.3\n').encode())
+    check(fmt + ': checksum/signing/install leave archive and sidecars unchanged',
+          frozen == (sha(archive), archive.stat().st_ino, sha(checksum), sha(signature)))
+
+    cached = cache / 'delivery/v1.2.3' / (host_os + '-' + host_arch + '.' + fmt)
+    installed_before = {name: (sha(prefix / name), (prefix / name).stat().st_ino)
+                        for name in ('delivery', 'helper')}
+    # A changed payload must fail checksums before installation; recomputing a
+    # matching checksum still cannot authorize bytes under the old signature.
+    with cached.open('ab') as stream:
+        stream.write(b'changed after signing\n')
+    rejected = subprocess.run(list(map(str, install_args)), capture_output=True, timeout=90, env=env)
+    (case / 'checksum-refusal.stderr').write_bytes(rejected.stderr)
+    check(fmt + ': signed offline installer rejects altered archive checksum',
+          rejected.returncode != 0 and b'Checksum mismatch' in rejected.stderr)
+    Path(str(cached) + '.sha256').write_text(sha(cached) + '  ' + asset_name + '\n')
+    rejected = subprocess.run(list(map(str, install_args)), capture_output=True, timeout=90, env=env)
+    (case / 'signature-refusal.stderr').write_bytes(rejected.stderr)
+    check(fmt + ': recomputed checksum cannot bypass real signature rejection',
+          rejected.returncode != 0 and b'Signature verification FAILED' in rejected.stderr)
+    check(fmt + ': rejected archives leave installed family bytes and inodes intact',
+          installed_before == {name: (sha(prefix / name), (prefix / name).stat().st_ino)
+                               for name in ('delivery', 'helper')})
+
+check('all delivery paths preserve private source modes, inodes and bytes', before == {
+    name: (sha(payload / name), (payload / name).stat().st_ino,
+           stat.S_IMODE((payload / name).stat().st_mode)) for name in contents})
+print('Native archive delivery: %d checks passed; real Minisign and offline generated installers' % checks, flush=True)
+PY
+}
+
+if [[ "${1:-}" == --archive-delivery-only ]]; then
+    test_native_archive_delivery
     exit $?
 fi
 

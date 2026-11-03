@@ -414,7 +414,7 @@ def materialize(base, records, work, build):
             members = sorted(members + add_companions(base, item, payload, proof))
             if build:
                 helper("packaging", "packaging_build_archive", fmt, dest, payload, *members)
-            helper("packaging", "_pkg_archive_matches_payload", dest, fmt, payload, "\n".join(members))
+            helper("packaging", "_pkg_archive_matches_payload", dest, fmt, payload, "\n".join(members), "normalized")
         else:
             source = base / "source/artifacts" / item["source"]
             original = records[item["source"]]["archive_format"]
@@ -429,7 +429,10 @@ def materialize(base, records, work, build):
                         helper("packaging", "packaging_build_archive", fmt, dest, payload, *members.split("\n"))
                     else:
                         helper("packaging", "packaging_repack_archive", source, original, dest, fmt)
-                helper("packaging", "_pkg_archive_matches_payload", dest, fmt, payload, members)
+                # New archives publish canonical permissions. An unchanged
+                # prebuilt archive retains its exact source bytes and modes.
+                mode_policy = "normalized" if added or original != fmt else "exact"
+                helper("packaging", "_pkg_archive_matches_payload", dest, fmt, payload, members, mode_policy)
             elif build:
                 copy_payload(source, dest)
             if (original == fmt and not added) or original in RAW:
