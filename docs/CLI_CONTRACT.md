@@ -538,6 +538,14 @@ dsr build --repo <name> [--targets <list>] [--version <tag>]
 | `--sync-only` | false | Sync selected build hosts without compiling; exit 1 if any host fails |
 | `--diagnostic-native` | false | Build explicit native targets under strict source/family checks, with non-publishable diagnostic provenance |
 
+Native build environment lookup follows launcher export order: a platform's
+`cross_compile.<platform>.env` overrides global `env`, including an explicit
+empty value. Rust target derivation, glibc toolchain selection, and artifact
+path resolution use that same effective value. An empty Cargo target still
+uses the existing configured/default target derivation when enabled. Explicit
+native variant conflicts continue to stop dispatch, and policy checks retain
+all declarations so a later value cannot hide an earlier remote-build requirement.
+
 Native Go builds derive `GOOS` and `GOARCH` from the requested platform;
 the `armv7` alias resolves to `GOARCH=arm` and `GOARM=7`.
 Platform-specific `cross_compile.<platform>.env` values override global `env`

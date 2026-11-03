@@ -8564,21 +8564,28 @@ act_get_configured_target_triples() {
     ' <<< "$document" || return 4
 }
 
-# Get a single environment variable value from newline-delimited KEY=VALUE pairs.
+# Get the effective value from ordered, newline-delimited KEY=VALUE pairs.
+# Platform overrides follow global declarations, and the launchers export them
+# in that order. Keep all declarations for policy checks, but read the last
+# matching assignment here, including an explicitly empty value.
 # Usage: act_get_build_env_value <build_env> <key>
 act_get_build_env_value() {
     local build_env="$1"
     local key="$2"
-    local env_pair
+    local env_pair value="" found=false
 
     while IFS= read -r env_pair; do
         [[ -z "$env_pair" ]] && continue
         if [[ "$env_pair" == "$key="* ]]; then
-            printf '%s\n' "${env_pair#*=}"
-            return 0
+            value="${env_pair#*=}"
+            found=true
         fi
     done <<< "$build_env"
 
+    if [[ "$found" == true ]]; then
+        printf '%s\n' "$value"
+        return 0
+    fi
     return 1
 }
 

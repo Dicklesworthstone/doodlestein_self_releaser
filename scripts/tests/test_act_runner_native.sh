@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_act_runner_native.sh - Unit tests for act_runner.sh native build SSH logic
 #
-# Usage: ./test_act_runner_native.sh [--typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --workspace-archives-only | --failure-evidence-only]
+# Usage: ./test_act_runner_native.sh [--typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --workspace-archives-only | --failure-evidence-only | --env-precedence-only]
 #
 # Tests native build SSH command construction with mocks.
 # Covers: command construction, path handling, env vars, SCP, error handling.
@@ -1897,10 +1897,10 @@ echo "0" > "$SCP_EXIT_CODE_FILE"
 echo "0" > "$RAW_SSH_EXIT_CODE_FILE"
 echo "0" > "$RSYNC_EXIT_CODE_FILE"
 
-# Source the module under test. The focused failure-evidence lane can compare
-# an archived src/ tree with the working module without undoing either tree.
+# Focused regression lanes can compare an archived src/ tree with the working
+# module without undoing either tree.
 # shellcheck source=../../src/act_runner.sh
-source "${DSR_NATIVE_FAILURE_MODULE:-$SRC_DIR/act_runner.sh}"
+source "${DSR_NATIVE_ENV_MODULE:-${DSR_NATIVE_FAILURE_MODULE:-$SRC_DIR/act_runner.sh}}"
 # This suite controls host state and SSH command construction. Real host-health
 # qualification belongs to its integration suite; admission regressions above
 # explicitly exercise healthy, unhealthy, and missing implementations.
@@ -6068,6 +6068,187 @@ test_go_native_launch_overrides_ambient_target() {
     fi
 }
 
+# Real YAML parsing, environment assembly, target admission and collector path
+# selection; no Cargo command, SSH request, compiler, or signing is executed.
+test_build_env_precedence() {
+    log_test "Build environment: platform overrides agree with ordered shell exports"
+    if ! type -P yq >/dev/null; then
+        log_fail "Environment precedence integration requires the real yq executable"
+        return 3
+    fi
+    local fixture="$MOCK_DIR/env-precedence" scenario pairs actual oracle code oracle_code expected
+    local environment exported target derived artifact floor checked_env selected result status
+    local command='cargo build --locked --release --bin asupersync --features cli'
+    mkdir -p "$fixture"
+
+    # Bypass this file's config mock only inside these calls. The production
+    # resolver consumes the YAML documents below through the installed yq.
+    _test_env_real_config() (
+        yq() { command yq "$@"; }
+        "$@"
+    )
+    for scenario in duplicate empty literal missing; do
+        expected=0
+        case "$scenario" in
+            duplicate) pairs=$'DSR_TEST_ENV_VALUE=global\n\nDSR_TEST_ENV_VALUE=platform' ;;
+            empty) pairs=$'DSR_TEST_ENV_VALUE=global\nDSR_TEST_ENV_VALUE=' ;;
+            literal) pairs=$'DSR_TEST_ENV_VALUE=global\nDSR_TEST_ENV_VALUE= keep=every byte = end ' ;;
+            missing) pairs=$'DSR_TEST_ENV_VALUE_SUFFIX=near-key\nPREFIX_DSR_TEST_ENV_VALUE=near-key'; expected=1 ;;
+        esac
+        code=0 oracle_code=0
+        actual=$(act_get_build_env_value "$pairs" DSR_TEST_ENV_VALUE) || code=$?
+        oracle=$(
+            unset DSR_TEST_ENV_VALUE
+            while IFS= read -r binding; do
+                [[ -z "$binding" ]] || export "$binding"
+            done <<< "$pairs"
+            [[ "${DSR_TEST_ENV_VALUE+x}" == x ]] || exit 1
+            printf '%s' "$DSR_TEST_ENV_VALUE"
+        ) || oracle_code=$?
+        if [[ "$code" -eq "$expected" && "$code" -eq "$oracle_code" && "$actual" == "$oracle" ]]; then
+            log_pass "$scenario getter preserves shell value and set-versus-absent status"
+        else
+            log_fail "$scenario getter disagrees with exports: getter=[$actual]/$code shell=[$oracle]/$oracle_code"
+        fi
+    done
+
+    pairs=$'GOBIN=/global/bin\nGOBIN=/platform/bin=tools with spaces'
+    artifact=$(act_get_remote_artifact_path go /remote/source "$pairs" tool linux/arm64)
+    if [[ "$artifact" == '/platform/bin=tools with spaces/tool' ]]; then
+        log_pass "Go collector honors the same final GOBIN binding"
+    else
+        log_fail "Go collector selected an overridden GOBIN: $artifact"
+    fi
+
+    cat > "$ACT_REPOS_DIR/env-precedence-arm.yaml" <<'YAML'
+language: rust
+env:
+  CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+  CARGO_TARGET_DIR: /global/output
+  DSR_TEST_ENV_VALUE: global
+cross_compile:
+  linux/arm64:
+    env:
+      CARGO_BUILD_TARGET: aarch64-unknown-linux-gnu
+      CARGO_TARGET_DIR: /platform/output=arm with spaces
+      DSR_TEST_ENV_VALUE: ' keep=every byte = end '
+YAML
+    status=0
+    environment=$(_test_env_real_config act_get_build_env env-precedence-arm linux/arm64) || status=$?
+    printf '%s\n' "$environment" > "$fixture/arm-environment"
+    exported=$(
+        while IFS= read -r binding; do
+            [[ -z "$binding" ]] || export "$binding"
+        done <<< "$environment"
+        jq -nc --arg target "${CARGO_BUILD_TARGET:-}" --arg dir "${CARGO_TARGET_DIR:-}" \
+            --arg literal "${DSR_TEST_ENV_VALUE:-}" '{target:$target,dir:$dir,literal:$literal}'
+    )
+    printf '%s\n' "$exported" > "$fixture/arm-shell-exports.json"
+    if [[ "$status" -eq 0 ]] && jq -e '
+            .target == "aarch64-unknown-linux-gnu" and
+            .dir == "/platform/output=arm with spaces" and
+            .literal == " keep=every byte = end "' <<< "$exported" >/dev/null; then
+        log_pass "Real YAML assembles global then platform bindings with literal values intact"
+    else
+        log_fail "Real YAML environment did not reach shell exports: status=$status exported=$exported"
+    fi
+    target=$(act_get_build_env_value "$environment" CARGO_BUILD_TARGET)
+    derived=$(act_get_build_env_value "$environment" DSR_TARGET_TRIPLE)
+    if [[ "$target" == aarch64-unknown-linux-gnu && "$derived" == "$target" ]]; then
+        log_pass "Unlisted ARM target derives the effective platform compiler identity"
+    else
+        log_fail "ARM compiler identity disagrees with exports: target=$target derived=$derived"
+    fi
+    artifact=$(act_get_remote_artifact_path rust /remote/source "$environment" asupersync linux/arm64)
+    printf '%s\n' "$artifact" > "$fixture/arm-artifact-path"
+    if [[ "$artifact" == '/platform/output=arm with spaces/aarch64-unknown-linux-gnu/release/asupersync' ]]; then
+        log_pass "Rust collector uses the platform target directory and ARM triple"
+    else
+        log_fail "Rust collector selected overridden output: $artifact"
+    fi
+    floor=$(_test_env_real_config _act_linux_glibc_floor env-precedence-arm linux/arm64 \
+        "$ACT_REPOS_DIR/env-precedence-arm.yaml" "$environment" "$command")
+    checked_env="$environment"$'\n'"DSR_RUST_TARGET=$target"$'\n'"DSR_ZIG_TARGET=$target.$floor"$'\n'"DSR_LINUX_GLIBC_FLOOR=$floor"
+    printf '%s\n' "$checked_env" > "$fixture/arm-qualified-environment"
+    status=0
+    _act_validate_native_target_command "$command" "$checked_env" "$target" \
+        > "$fixture/arm-admission.stdout" 2> "$fixture/arm-admission.stderr" || status=$?
+    printf '%s\n' "$status" > "$fixture/arm-admission.status"
+    if [[ "$floor" == 2.28 && "$status" -eq 0 && "$target" == aarch64-unknown-linux-gnu ]]; then
+        log_pass "Real target admission accepts the ARM command with the existing glibc floor"
+    else
+        log_fail "Valid ARM command was refused or misrouted: target=$target floor=$floor status=$status"
+    fi
+    status=0
+    _act_validate_native_target_command "$command --target x86_64-unknown-linux-gnu" \
+        "$environment" aarch64-unknown-linux-gnu >/dev/null 2>&1 || status=$?
+    if [[ "$status" -eq 4 ]]; then
+        log_pass "An explicit wrong-architecture command remains refused"
+    else
+        log_fail "Wrong-architecture command escaped target admission: $status"
+    fi
+
+    status=0
+    selected=$(_test_env_real_config act_get_build_env env-precedence-arm linux/arm64 \
+        aarch64-unknown-linux-gnu) || status=$?
+    if [[ "$status" -eq 0 && "$(act_get_build_env_value "$selected" CARGO_BUILD_TARGET)" == aarch64-unknown-linux-gnu &&
+          "$(grep -c '^CARGO_BUILD_TARGET=' <<< "$selected")" -eq 1 ]]; then
+        log_pass "Explicit admitted ARM variant keeps one compiler target binding"
+    else
+        log_fail "Admitted ARM variant lost its target authority: status=$status env=$selected"
+    fi
+    cat > "$ACT_REPOS_DIR/env-precedence-conflict.yaml" <<'YAML'
+language: rust
+target_triples:
+  linux/arm64: [aarch64-unknown-linux-gnu, aarch64-unknown-linux-musl]
+env:
+  CARGO_BUILD_TARGET: aarch64-unknown-linux-gnu
+YAML
+    for selected in aarch64-unknown-linux-musl x86_64-unknown-linux-gnu; do
+        status=0
+        result=$(_test_env_real_config act_get_build_env env-precedence-conflict linux/arm64 \
+            "$selected" 2>/dev/null) || status=$?
+        if [[ "$status" -eq 4 && -z "$result" ]]; then
+            log_pass "Conflicting or undeclared selected variant remains refused: $selected"
+        else
+            log_fail "Selected variant bypassed configured authority: $selected status=$status"
+        fi
+    done
+    cat > "$ACT_REPOS_DIR/env-precedence-empty.yaml" <<'YAML'
+language: rust
+env:
+  CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+cross_compile:
+  linux/arm64:
+    env:
+      CARGO_BUILD_TARGET: ''
+YAML
+    environment=$(_test_env_real_config act_get_build_env env-precedence-empty linux/arm64)
+    if [[ "$(act_get_build_env_value "$environment" CARGO_BUILD_TARGET)" == aarch64-unknown-linux-gnu &&
+          "$(act_get_build_env_value "$environment" DSR_TARGET_TRIPLE)" == aarch64-unknown-linux-gnu ]]; then
+        log_pass "Empty platform target enables normal ARM target derivation"
+    else
+        log_fail "Empty platform target retained an overridden compiler identity: $environment"
+    fi
+    cat > "$ACT_REPOS_DIR/env-precedence-policy.yaml" <<'YAML'
+language: rust
+env:
+  RCH_REQUIRE_REMOTE: '1'
+cross_compile:
+  linux/arm64:
+    env:
+      RCH_REQUIRE_REMOTE: '0'
+YAML
+    environment=$(_test_env_real_config act_get_build_env env-precedence-policy linux/arm64)
+    status=0
+    dsr_native_rch_environment_policy linux/arm64 "$environment" >/dev/null 2>&1 || status=$?
+    if [[ "$status" -eq 4 && "$(grep -c '^RCH_REQUIRE_REMOTE=' <<< "$environment")" -eq 2 ]]; then
+        log_pass "Retained declarations preserve remote-only policy refusal after a later false binding"
+    else
+        log_fail "Environment resolution lost the remote-only refusal: status=$status env=$environment"
+    fi
+}
+
 test_rust_derives_build_target_and_dsr_env() {
     log_test "Rust: CARGO_BUILD_TARGET and DSR_TARGET_* derived from the platform"
     reset_state
@@ -6590,6 +6771,12 @@ test_windows_private_cache_collection() {
 }
 
 main() {
+    if [[ "${1:-}" == --env-precedence-only ]]; then
+        test_build_env_precedence || return $?
+        printf 'Build environment precedence tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return $?
+    fi
     if [[ "${1:-}" == --failure-evidence-only ]]; then
         test_native_failure_evidence
         printf 'Native failure evidence tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
@@ -6842,6 +7029,7 @@ main() {
     test_go_armv7_native_launch
     test_go_rejects_conflicting_targets
     test_go_native_launch_overrides_ambient_target
+    test_build_env_precedence
     test_rust_derives_build_target_and_dsr_env
     test_rust_derive_build_target_opt_out
     test_windows_rejects_posix_source_root
