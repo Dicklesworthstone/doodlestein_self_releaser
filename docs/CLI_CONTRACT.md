@@ -1393,6 +1393,36 @@ Quoted literals, the effective `$CARGO_BUILD_TARGET`, and compound commands
 with a common Cargo selection are supported. DSR records Cargo and rustc
 paths, SHA-256 digests and verbose versions, the selected target linker,
 named Cargo plugins, and `cargo-zigbuild`/`zig` when DSR routes through them.
+Explicit GNU ABI requests such as
+`cargo +nightly zigbuild --target=x86_64-unknown-linux-gnu.2.28` retain
+`x86_64-unknown-linux-gnu` as their Rust target, configuration lookup key and
+artifact directory. The exact requested `zig_target`, `rust_target` and
+`glibc_floor` are retained separately in `selection.cargo_zigbuild`, matching
+`selection.dsr_cargo_shim`. Only a direct `zigbuild` command with a literal
+GNU target and `MAJOR.MINOR` suffix receives this interpretation; other
+subcommands, non-GNU targets, malformed versions and conflicting command-list
+selections refuse admission. Both `--target VALUE` and `--target=VALUE` work.
+
+Strict explicit versioned Zig builds use the same generated Cargo dispatcher
+as managed glibc-floor builds. Its exact generator bytes are verified before
+tool lookup; it preserves explicit Zig arguments and pins the absolute Zig
+executable selected on the delegated PATH. Caller `CARGO_ZIGBUILD_*` dispatch
+overrides, including empty values, are refused. Cargo global-option prefixes
+and `+toolchain` retain their argument boundaries. Record, cache and pre/post
+build verification require this dispatcher; metadata-only admission uses
+ordinary locked/offline Cargo metadata and does not compile through Zig.
+Changing the requested floor, dispatcher, plugin or compiler invalidates the
+held receipt. The exact ABI request also remains in the strict cache key.
+
+The requested Zig version is separate from the configured
+`linux_glibc_floor` ceiling on collected ELF requirements. A request for
+2.17 may satisfy a configured 2.28 ceiling; the actual collected bytes must
+still pass that ceiling. The
+[cargo-zigbuild documentation](https://github.com/rust-cross/cargo-zigbuild/tree/v0.24.0#specify-glibc-version)
+describes suffix handling and cautions that Zig can fall back for invalid
+versions. An identity receipt therefore records the request and does not
+claim that the final binary meets it without the existing artifact checks.
+
 Explicit `RUSTC`/`CARGO_BUILD_RUSTC` executables and compiler wrappers retain
 their own identities; arbitrary scripts are not mislabeled as rustup's
 compiler. Proven rustup proxies and Apple `/usr/bin` compiler launchers also

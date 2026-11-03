@@ -742,6 +742,21 @@
             }
           }
         }
+      }, {
+        "if": {
+          "required": ["selection"],
+          "properties": {"selection": {"required": ["cargo_zigbuild"]}}
+        },
+        "then": {
+          "properties": {
+            "cwd": {"pattern": "^/"},
+            "target_triple": {"$ref": "#/$defs/toolchain_identity/properties/selection/properties/dsr_cargo_shim/properties/rust_target"},
+            "selection": {
+              "required": ["dsr_cargo_shim"],
+              "properties": {"cargo_commands": {"contains": {"const": "zigbuild"}}}
+            }
+          }
+        }
       }],
       "properties": {
         "schema_version": {"const": 1},
@@ -759,6 +774,10 @@
               "items": {"type": "string", "pattern": "^[a-z][a-z0-9-]*$"}
             },
             "cargo_target": {"$ref": "#/$defs/cargo_target_observation"},
+            "cargo_zigbuild": {
+              "$ref": "#/$defs/toolchain_identity/properties/selection/properties/dsr_cargo_shim",
+              "description": "Exact GNU target and requested glibc version from an explicit cargo zigbuild invocation, retained separately from its canonical Rust target and enforced through the byte-verified DSR dispatcher. The requested version is not a claim about the resulting ELF requirements."
+            },
             "dsr_cargo_shim": {
               "type": "object",
               "description": "Target and glibc floor delegated by the separately byte-verified DSR Cargo shim; underlying Cargo, rustup, cargo-zigbuild and Zig retain their executable identities.",

@@ -56,11 +56,11 @@ def refuse(message):
 namespace['fail'] = refuse
 
 
-def invoke(command, cfg=True, mode='record'):
+def invoke(command, cfg=True, mode='record', environment=None):
     namespace.update(command=command, mode=mode,
                      cargo_config={'build': {}, 'alias': {}, 'target':
                                    {'cfg(unix)': {'rustflags': []}} if cfg else {}})
-    with patch.dict(os.environ, {'CARGO_BUILD_TARGET': TRIPLE}, clear=True):
+    with patch.dict(os.environ, {'CARGO_BUILD_TARGET': TRIPLE} if environment is None else environment, clear=True):
         return namespace['invocation_selection']()
 
 
@@ -155,6 +155,75 @@ class InvocationBoundaryTests(unittest.TestCase):
                         'command cargo build --locked', 'cargo --color never build --release'):
             with self.subTest(command=command):
                 self.assertEqual(invoke(command)[0]['target'], TRIPLE)
+
+    def test_explicit_zig_targets_preserve_the_request_and_select_the_rust_target(self):
+        for target in (TRIPLE, 'aarch64-unknown-linux-gnu'):
+            for spelling in ('--target ', '--target='):
+                command = 'cargo +nightly --quiet zigbuild ' + spelling + target + '.2.17'
+                environment = {'CARGO_BUILD_TARGET': target, 'DSR_TARGET_TRIPLE': target,
+                               'DSR_LINUX_GLIBC_FLOOR': '2.28'}
+                with self.subTest(command=command):
+                    selected = invoke(command, environment=environment)[0]
+                    self.assertEqual(selected['target'], target)
+                    self.assertEqual(selected['cargo_zigbuild'], {
+                        'rust_target': target, 'zig_target': target + '.2.17', 'glibc_floor': '2.17'})
+                    # The declared output ceiling does not rewrite a request
+                    # for an older, more portable GNU ABI.
+                    self.assertEqual(selected['environment']['DSR_LINUX_GLIBC_FLOOR'], '2.28')
+
+    def test_version_suffix_is_not_a_generic_target_rewrite(self):
+        for command in ('cargo build --target ' + TRIPLE + '.2.28',
+                        'cargo zigbuild --target ' + TRIPLE + '.2..28',
+                        'cargo zigbuild --target ' + TRIPLE + '.2.28.0',
+                        'cargo zigbuild --target ' + TRIPLE + '.2',
+                        'cargo zigbuild --target x86_64-unknown-linux-musl.2.28',
+                        'cargo zigbuild --target aarch64-apple-darwin.2.28'):
+            with self.subTest(command=command), self.assertRaises(Refused):
+                invoke(command)
+        with self.assertRaisesRegex(Refused, 'versioned targets'):
+            invoke('cargo zigbuild', environment={'CARGO_BUILD_TARGET': TRIPLE + '.2.28'})
+
+    def test_explicit_zig_conflicting_tasks_and_floors_are_refused(self):
+        first = 'cargo zigbuild --target ' + TRIPLE + '.2.28'
+        for command in (first + ' && cargo zigbuild --target ' + TRIPLE + '.2.17',
+                        first + ' && cargo build --target ' + TRIPLE,
+                        first + ' --target ' + TRIPLE + '.2.17',
+                        'cargo zigbuild --target aarch64-unknown-linux-gnu.2.28',
+                        'DSR_TARGET_TRIPLE=elsewhere cargo zigbuild --target ' + TRIPLE + '.2.28',
+                        'CARGO_BUILD_TARGET=elsewhere cargo zigbuild --target ' + TRIPLE + '.2.28'):
+            with self.subTest(command=command), self.assertRaises(Refused):
+                invoke(command)
+        self.assertEqual(invoke(first + ' && ' + first)[0]['target'], TRIPLE)
+
+    def test_actual_coordinator_selection_and_matrix_guard_agree(self):
+        program = '''source "$1" || exit $?;
+_act_validate_native_target_command "$2" "$3" "$4" || exit $?;
+_act_explicit_zigbuild_selection "$2" "$3"'''
+        for target in (TRIPLE, 'aarch64-unknown-linux-gnu'):
+            command = 'cargo +selected --offline zigbuild --target=' + target + '.2.28'
+            environment = 'CARGO_BUILD_TARGET=' + target + '\nDSR_TARGET_TRIPLE=' + target
+            result = subprocess.run(['bash', '-c', program, '_', str(MODULE), command,
+                                     environment, target], text=True, capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), {
+                'rust_target': target, 'zig_target': target + '.2.28', 'glibc_floor': '2.28'})
+
+    def test_worker_shell_startup_cannot_execute_during_coordinator_planning(self):
+        work = Path(tempfile.mkdtemp(prefix='dsr-zig-coordinator-')).resolve()
+        marker = work / 'worker-startup-ran-on-coordinator'
+        startup = work / 'worker-startup.sh'
+        startup.write_text('printf ran > ' + shlex.quote(str(marker)) + '\n')
+        command = 'cargo zigbuild --target=' + TRIPLE + '.2.28'
+        environment = ('CARGO_BUILD_TARGET=' + TRIPLE + '\nDSR_TARGET_TRIPLE=' + TRIPLE +
+                       '\nBASH_ENV=' + str(startup))
+        program = '''source "$1" || exit $?;
+_act_validate_native_target_command "$2" "$3" "$4" || exit $?;
+_act_explicit_zigbuild_selection "$2" "$3"'''
+        result = subprocess.run(['bash', '-c', program, '_', str(MODULE), command, environment,
+                                 TRIPLE], text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['rust_target'], TRIPLE)
+        self.assertFalse(marker.exists())
 
 
 class ZigShimAdmissionTests(unittest.TestCase):
@@ -378,6 +447,20 @@ class ZigShimAdmissionTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 self.assert_refused(self.observe(mode), 'configured Rustup dispatch overrides')
 
+    def test_explicit_zig_requires_authenticated_dispatch_for_record_and_cache(self):
+        command = 'cargo zigbuild --target=' + TRIPLE + '.2.28'
+        for mode in ('record', 'context'):
+            with self.subTest(mode=mode):
+                bare = emit(mode, command, receipt=self.receipt)
+                self.assert_refused(self.observe(script=bare), 'requires the generated DSR Cargo shim')
+                managed = emit(mode, command, self.shim_dir, self.receipt)
+                self.assert_refused(self.observe(script=managed), 'configured Rustup dispatch overrides')
+        # Metadata is ordinary Cargo metadata and never launches a Zig build.
+        metadata = emit('metadata', command, receipt=self.receipt)
+        self.assert_refused(self.observe(script=metadata), 'configured Rustup dispatch overrides')
+        wrong = emit('record', 'cargo zigbuild --target=' + TRIPLE + '.2.17', self.shim_dir, self.receipt)
+        self.assert_refused(self.observe(script=wrong), 'explicit Zig target/floor does not match')
+
     def transport_environment(self):
         """Capture launcher argv/environment only; never emulate a Rust build."""
         directory = self.project / 'delegated tools'
@@ -412,7 +495,17 @@ class ZigShimAdmissionTests(unittest.TestCase):
                           ['zigbuild', '--target', target + '.2.28', '--release']),
                          (['+fixture-selected', 'build', '--target=' + target, '--locked'],
                           ['+fixture-selected', 'zigbuild', '--target=' + target + '.2.28', '--locked']),
-                         (['build', '--release'], ['zigbuild', '--target', target + '.2.28', '--release']))
+                         (['build', '--release'], ['zigbuild', '--target', target + '.2.28', '--release']),
+                         (['+fixture-selected', '--quiet', '--color', 'never', 'build', '--offline'],
+                          ['+fixture-selected', '--quiet', '--color', 'never', 'zigbuild',
+                           '--target', target + '.2.28', '--offline']),
+                         (['build', '--release', '--', '--target', 'application-argument'],
+                          ['zigbuild', '--target', target + '.2.28', '--release', '--',
+                           '--target', 'application-argument']),
+                         (['--offline', 'zigbuild', '--target', target + '.2.28', '--release'],
+                          ['--offline', 'zigbuild', '--target', target + '.2.28', '--release']),
+                         (['+fixture-selected', '--color=never', 'zigbuild', '--target=' + target + '.2.28'],
+                          ['+fixture-selected', '--color=never', 'zigbuild', '--target=' + target + '.2.28']))
                 for argv, expected in cases:
                     sequence += 1
                     with self.subTest(target=target, version=version, argv=argv):

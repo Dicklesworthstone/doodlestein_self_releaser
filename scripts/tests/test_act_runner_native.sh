@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_act_runner_native.sh - Unit tests for act_runner.sh native build SSH logic
 #
-# Usage: ./test_act_runner_native.sh [--typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --workspace-archives-only | --failure-evidence-only | --env-precedence-only | --archive-delivery-only]
+# Usage: ./test_act_runner_native.sh [--typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --workspace-archives-only | --failure-evidence-only | --env-precedence-only | --archive-delivery-only | --zig-dispatch-only]
 #
 # Tests native build SSH command construction with mocks.
 # Covers: command construction, path handling, env vars, SCP, error handling.
@@ -6744,6 +6744,54 @@ test_strict_rust_linux_glibc_floor_rejects_newer_glibc() {
     fi
 }
 
+test_strict_explicit_zig_dispatch_and_output_ceiling() {
+    log_test "Strict explicit Zig: coordinator stages verified dispatch and preserves the output ceiling"
+    local platform triple suffix requirement result status cmd shim_dir
+    for platform in linux/amd64 linux/arm64; do
+        triple=$(_act_default_rust_target_triple "$platform")
+        for requirement in 2.17 2.39; do
+            reset_state
+            MOCK_LANGUAGE=rust
+            MOCK_BINARY_NAME=tool
+            MOCK_BUILD_CMD="cargo +selected --quiet zigbuild --locked --release --target=$triple.2.17"
+            MOCK_GLIBC_FLOOR=2.28
+            MOCK_ARTIFACT_KIND="elf-${platform#linux/}"
+            MOCK_PLATFORM_ENV="CARGO_BUILD_TARGET=$triple"
+            suffix="${platform//\//-}-$requirement"
+            MOCK_SSH_STREAM_FILE="$MOCK_DIR/explicit-zig-$suffix"
+            write_mock_artifact "$MOCK_SSH_STREAM_FILE"
+            printf '\0GLIBC_%s\0' "$requirement" >> "$MOCK_SSH_STREAM_FILE"
+            status=0
+            result=$(_run_strict_linux_rust_build "$platform" 2>/dev/null) || status=$?
+            cmd=$(get_ssh_capture)
+            shim_dir="/remote/.dsr-release-snapshots/tool-run/.dsr-bin-${platform//\//-}"
+            if [[ "$cmd" == *"cat > '$shim_dir/cargo'"* &&
+                  "$cmd" == *"export PATH='$shim_dir':\"\$PATH\""* &&
+                  "$cmd" == *"DSR_ZIG_TARGET=$triple.2.17"* &&
+                  "$cmd" == *"$MOCK_BUILD_CMD"* ]] &&
+               jq -e --arg triple "$triple" '
+                   .target_triple == $triple and
+                   .build_influence_env.CARGO_BUILD_TARGET == $triple and
+                   .build_influence_env.DSR_ZIG_TARGET == ($triple + ".2.17") and
+                   .build_influence_env.DSR_LINUX_GLIBC_FLOOR == "2.17"' <<< "$result" >/dev/null; then
+                log_pass "$platform explicit command retains its floor and receives the staged dispatcher"
+            else
+                log_fail "$platform explicit dispatcher missing or changed selectors: status=$status result=$result"
+            fi
+            if [[ "$requirement" == 2.17 && "$status" -eq 0 ]] &&
+               jq -e '.status == "success" and (.artifact_paths | length) == 1' <<< "$result" >/dev/null; then
+                log_pass "$platform lower requested ABI is admitted under the configured 2.28 ceiling"
+            elif [[ "$requirement" == 2.39 && "$status" -eq 7 ]] &&
+                 jq -e '.status == "failed" and .artifact_paths == [] and .collected_sha256 == null' \
+                    <<< "$result" >/dev/null; then
+                log_pass "$platform explicit request cannot authorize output above the configured 2.28 ceiling"
+            else
+                log_fail "$platform explicit Zig output ceiling failed: requirement=$requirement status=$status result=$result"
+            fi
+        done
+    done
+}
+
 test_rust_linux_glibc_floor_enforced_for_owned_toolchain() {
     log_test "Rust linux: an explicit floor is enforced even when build_cmd owns zigbuild"
     reset_state
@@ -6961,6 +7009,18 @@ test_windows_private_cache_collection() {
 }
 
 main() {
+    if [[ "${1:-}" == --zig-dispatch-only ]]; then
+        test_rust_linux_glibc_floor_shim_injected
+        test_rust_linux_glibc_floor_native_opt_out
+        test_rust_linux_glibc_floor_skips_musl
+        test_strict_rust_linux_glibc_floor_shim_outside_snapshot
+        test_strict_rust_linux_glibc_floor_rejects_newer_glibc
+        test_strict_explicit_zig_dispatch_and_output_ceiling
+        test_rust_linux_glibc_floor_enforced_for_owned_toolchain
+        printf 'Native Zig dispatch tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return $?
+    fi
     if [[ "${1:-}" == --env-precedence-only ]]; then
         test_build_env_precedence || return $?
         printf 'Build environment precedence tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
@@ -7232,6 +7292,7 @@ main() {
     test_output_stage_builds_and_collects_privately
     test_strict_rust_linux_glibc_floor_shim_outside_snapshot
     test_strict_rust_linux_glibc_floor_rejects_newer_glibc
+    test_strict_explicit_zig_dispatch_and_output_ceiling
     test_rust_linux_glibc_floor_enforced_for_owned_toolchain
 
     # Summary

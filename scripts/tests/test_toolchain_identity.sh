@@ -469,6 +469,92 @@ _act_zig_shim_prefix_sh "$2" | bash'''
           'rustup_resolver' not in direct_observed.get('tools', {}).get('cargo', {}) and
           linux_output(Path(direct_shim_env['CARGO_TARGET_DIR']), target))
 
+    # Issue #37: the plugin's GNU ABI suffix is not a Rust target. Real cfg
+    # probing, metadata, compilation and collection must all use the plain
+    # target while preserving the exact explicit request in pinned evidence.
+    explicit_project = work / 'explicit-zig-project'
+    shutil.copytree(project, explicit_project)
+    (explicit_project / '.cargo').mkdir()
+    (explicit_project / '.cargo/config.toml').write_text(
+        '[target.\'cfg(unix)\']\nrustflags=["-C", "debuginfo=0"]\n')
+    explicit_observations = []
+    collect_program = '''source "$1" || exit $?;
+config_get_target_triples_json() { _act_default_rust_target_triple "$2" | jq -Rsc 'split("\\n")[:-1]'; }
+IFS= read -r result || exit 1;
+_act_native_result_target_triple fixture "$result"'''
+    # The config fixture below is a declared target allow-list, never compiler
+    # evidence. The worker receipt itself comes from the actual observer.
+    for index, target in enumerate(zig_targets):
+        env = shim_environment(target, 'explicit-zig-output-' + target)
+        marker = work / ('explicit-zig-shadow-' + target)
+        env.update(PYTHONPATH=str(python_shadow), PYTHONDONTWRITEBYTECODE='1',
+                   DSR_TEST_ZIG_SHADOW_MARKER=str(marker))
+        spelling = '--target=' if index else '--target '
+        command = 'cargo +fixture-selected --quiet zigbuild --locked --offline ' + spelling + target + '.2.28'
+        metadata_env = dict(env, PATH=dispatch_env['PATH'])
+        metadata, _, _ = probe(command, metadata_env, mode='metadata', cwd=explicit_project,
+                                expected_cwd=explicit_project)
+        bare, _, bare_receipt = probe(command, metadata_env, cwd=explicit_project, expected_cwd=explicit_project)
+        bare_context, _, _ = probe(command, metadata_env, mode='context', cwd=explicit_project,
+                                   expected_cwd=explicit_project)
+        check('metadata-only permits ordinary Cargo but explicit Zig record/cache require the dispatcher: ' + target,
+              metadata.returncode == 0 and bare.returncode != 0 and bare_context.returncode != 0 and
+              not bare_receipt.exists() and 'requires the generated DSR Cargo shim' in bare.stderr and
+              'requires the generated DSR Cargo shim' in bare_context.stderr)
+        before, observed, receipt = probe(command, env, cwd=explicit_project,
+                                           expected_cwd=explicit_project, zig_shim_dir=shim_dir)
+        prebuild, _, _ = probe(command, env, mode='verify', receipt=receipt,
+                              cwd=explicit_project, expected_cwd=explicit_project, zig_shim_dir=shim_dir)
+        compiled = run(['bash', '-c', command], cwd=explicit_project, env=env) \
+            if before.returncode == prebuild.returncode == 0 else before
+        after, _, _ = probe(command, env, mode='verify', receipt=receipt,
+                           cwd=explicit_project, expected_cwd=explicit_project, zig_shim_dir=shim_dir)
+        (work / ('explicit-zig-build-' + target + '.log')).write_text(compiled.stdout + compiled.stderr)
+        check('genuine explicit Zig command records, compiles and verifies with cfg tables: ' + target,
+              before.returncode == prebuild.returncode == compiled.returncode == after.returncode == 0 and
+              linux_output(Path(env['CARGO_TARGET_DIR']), target) and not marker.exists())
+        requested = {'rust_target': target, 'zig_target': target + '.2.28', 'glibc_floor': '2.28'}
+        cfg = observed.get('selection', {}).get('cargo_target', {})
+        check('explicit target retains request, canonical cfg target and actual Zig bytes: ' + target,
+              observed.get('target_triple') == target and
+              observed.get('selection', {}).get('cargo_zigbuild') == requested and
+              observed.get('selection', {}).get('dsr_cargo_shim') == requested and
+              cfg.get('cfg_probe', {}).get('target_triple') == target and
+              cfg.get('matched_cfg') == ['cfg(unix)'] and
+              observed.get('tools', {}).get('zig', {}).get('selected_sha256') == digest(dispatch_bin / 'zig'))
+        row = {'platform': 'linux/amd64' if index == 0 else 'linux/arm64', 'target_triple': target,
+               'build_influence_env': {'CARGO_BUILD_TARGET': target, 'DSR_TARGET_TRIPLE': target},
+               'cargo_isolation': {'toolchain': observed}}
+        collected = run(['bash', '-c', collect_program, '_', module], input=json.dumps(row) + '\n')
+        check('production collector accepts the actual explicit Zig receipt: ' + target,
+              collected.returncode == 0 and collected.stdout.strip() == target)
+        explicit_observations.append(row)
+        next_env = dict(env, DSR_ZIG_TARGET=target + '.2.27', DSR_LINUX_GLIBC_FLOOR='2.27')
+        changed, _, _ = probe(command.replace('.2.28', '.2.27'), next_env, mode='verify', receipt=receipt,
+                             cwd=explicit_project, expected_cwd=explicit_project, zig_shim_dir=shim_dir)
+        check('unchanged Cargo and canonical target cannot hide an explicit floor change: ' + target,
+              changed.returncode != 0 and 'changed during the build' in changed.stderr)
+
+    # Actual Linux observations coexist with explicit synthetic macOS/Windows
+    # records at the collector boundary. This does not qualify those hosts.
+    for platform, target in (('darwin/arm64', 'aarch64-apple-darwin'),
+                             ('windows/amd64', 'x86_64-pc-windows-msvc')):
+        explicit_observations.append({'platform': platform, 'target_triple': target,
+            'build_influence_env': {'CARGO_BUILD_TARGET': target, 'DSR_TARGET_TRIPLE': target},
+            'cargo_isolation': {'toolchain': {'target_triple': target}}})
+    mixed = [run(['bash', '-c', collect_program, '_', module], input=json.dumps(row) + '\n')
+             for row in explicit_observations]
+    check('mixed-platform collection retains each canonical native identity without leaking the GNU suffix',
+          all(result.returncode == 0 and result.stdout.strip() == row['target_triple']
+              for row, result in zip(explicit_observations, mixed)))
+    inconsistent = json.loads(json.dumps(explicit_observations[0]))
+    inconsistent['cargo_isolation']['toolchain']['target_triple'] += '.2.28'
+    refused = run(['bash', '-c', collect_program, '_', module], input=json.dumps(inconsistent) + '\n')
+    check('collector continues refusing a suffixed or substituted Rust identity',
+          refused.returncode != 0 and not refused.stdout)
+
+    target = zig_targets[0]
+    command = 'cargo build --quiet --locked --offline --target=' + target
     env = shim_environment(target, 'zig-refusals')
     baseline, _, receipt = probe(command, env, zig_shim_dir=shim_dir)
     metadata, _, _ = probe(command, env, mode='metadata', zig_shim_dir=shim_dir)
@@ -633,6 +719,33 @@ _act_strict_cargo_cache_script "$2" '{}' "$3" "$4" | bash'''
                   same_namespace == (label == 'same-floor') and
                   next_cache.get('contract', {}).get('environment', {}).get('DSR_LINUX_GLIBC_FLOOR') == floor and
                   linux_output(Path(next_env['CARGO_TARGET_DIR']), target))
+        explicit_cache_keys = {}
+        for label, floor in (('first', '2.28'), ('changed-floor', '2.27'), ('relocated', '2.28')):
+            next_env = dict(shim_environment(target, 'explicit-cached-' + label),
+                            DSR_ZIG_TARGET=target + '.' + floor, DSR_LINUX_GLIBC_FLOOR=floor)
+            next_project = relocated if label == 'relocated' else project
+            next_command = 'cargo +fixture-selected --quiet zigbuild --locked --offline --target=' + target + '.' + floor
+            before, _, next_receipt = probe(next_command, next_env, cwd=next_project,
+                                              expected_cwd=next_project, zig_shim_dir=shim_dir)
+            compiled = run(['bash', '-o', 'pipefail', '-c', cache_program, '_', module,
+                            cache_root, next_command, shim_dir], cwd=next_project, env=next_env, timeout=240)
+            after, _, _ = probe(next_command, next_env, mode='verify', receipt=next_receipt,
+                               cwd=next_project, expected_cwd=next_project, zig_shim_dir=shim_dir)
+            (work / ('explicit-zig-cache-' + label + '.log')).write_text(compiled.stdout + compiled.stderr)
+            cache_file = Path(next_env['CARGO_TARGET_DIR'] + '.cache-receipt.json')
+            cached = json.loads(cache_file.read_text()) if cache_file.is_file() else {}
+            explicit_cache_keys[label] = cached.get('namespace')
+            check('genuine explicit Zig cache retains the canonical target and exact ABI request: ' + label,
+                  before.returncode == compiled.returncode == after.returncode == 0 and
+                  linux_output(Path(next_env['CARGO_TARGET_DIR']), target) and
+                  cached.get('contract', {}).get('toolchain', {}).get('target_triple') == target and
+                  cached.get('contract', {}).get('toolchain', {}).get('cargo_zigbuild') == {
+                      'rust_target': target, 'zig_target': target + '.' + floor, 'glibc_floor': floor})
+        check('explicit Zig cache reuses relocated identical requests and separates changed floors',
+              bool(explicit_cache_keys['first']) and
+              explicit_cache_keys['first'] == explicit_cache_keys['relocated'] and
+              bool(explicit_cache_keys['changed-floor']) and
+              explicit_cache_keys['first'] != explicit_cache_keys['changed-floor'])
     elif mode == 'zig-shim':
         check('dedicated Zig shim qualification requires nightly for the strict-cache regression', False)
     else:

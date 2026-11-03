@@ -3862,7 +3862,8 @@ _act_linux_glibc_floor_enforced() {
 
 # The cargo shim placed first on PATH by Linux Rust builds (ordinary and
 # strict) when the glibc floor is active. `cargo build` becomes `cargo
-# zigbuild --target <triple>.<floor>`; every other cargo invocation passes
+# zigbuild --target <triple>.<floor>`. An explicit `cargo zigbuild` retains
+# its arguments and uses the same pinned Zig dispatch; other subcommands pass
 # through untouched. Requires cargo-zigbuild >= 0.23.0 on the build host —
 # older releases hand rustc's aarch64 `--fix-cortex-a53-843419` erratum flag
 # to zig unfiltered and the link fails (issue #10).
@@ -3890,13 +3891,30 @@ _dsr_toolchain=
 case "${1:-}" in
   +*) _dsr_toolchain=$1; shift ;;
 esac
-if [ "${1:-}" != build ] || [ -z "${DSR_ZIG_TARGET:-}" ] || [ -z "${DSR_RUST_TARGET:-}" ]; then
+# Cargo's reviewed global options may precede the subcommand. Keep their
+# exact argument boundaries; a prefix must not bypass the Zig dispatcher.
+_dsr_subcommand=
+_dsr_subcommand_index=0
+_dsr_skip_value=0
+for _dsr_arg in "$@"; do
+  _dsr_subcommand_index=$((_dsr_subcommand_index + 1))
+  if [ "$_dsr_skip_value" -eq 1 ]; then
+    _dsr_skip_value=0
+    continue
+  fi
+  case "$_dsr_arg" in
+    -Z|--color) _dsr_skip_value=1 ;;
+    -v|-vv|--verbose|-q|--quiet|--locked|--offline|--frozen|-Z*|--color=*) ;;
+    *) _dsr_subcommand=$_dsr_arg; break ;;
+  esac
+done
+if { [ "$_dsr_subcommand" != build ] && [ "$_dsr_subcommand" != zigbuild ]; } ||
+   [ -z "${DSR_ZIG_TARGET:-}" ] || [ -z "${DSR_RUST_TARGET:-}" ]; then
   if [ -n "$_dsr_toolchain" ]; then
     exec cargo "$_dsr_toolchain" "$@"
   fi
   exec cargo "$@"
 fi
-shift
 if ! command -v cargo-zigbuild >/dev/null 2>&1 || ! command -v zig >/dev/null 2>&1; then
   echo "[dsr] portable glibc floor ${DSR_LINUX_GLIBC_FLOOR:-} needs cargo-zigbuild and zig on this build host (cargo install cargo-zigbuild); set linux_glibc_floor: native in the repo config to build against the host glibc instead" >&2
   exit 4
@@ -3906,7 +3924,7 @@ fi
 # must use the same Zig executable that strict toolchain identity measures.
 # Refuse caller overrides rather than silently measuring a different linker.
 if [ "${CARGO_ZIGBUILD_ZIG_COMMAND+x}${CARGO_ZIGBUILD_ZIG_COMMAND_ARGS+x}${CARGO_ZIGBUILD_PYTHON_PATH+x}${CARGO_ZIGBUILD_ZIG_PATH+x}${CARGO_ZIGBUILD_ZIG_VERSION+x}" ]; then
-  echo "[dsr] generated DSR Cargo shim does not accept Zig dispatch overrides; select zig on PATH or use an explicit cargo zigbuild command" >&2
+  echo "[dsr] generated DSR Cargo shim does not accept Zig dispatch overrides; select zig on PATH" >&2
   exit 4
 fi
 _dsr_zig_path=$(command -v zig)
@@ -3937,14 +3955,43 @@ if [ "$_dsr_zb_major" -eq 0 ] && [ "$_dsr_zb_minor" -lt 23 ]; then
   echo "[dsr] cargo-zigbuild ${_dsr_zb_version:-unknown} is too old for reliable cross-linking (aarch64 --fix-cortex-a53-843419 filtering needs >= 0.23.0); run: cargo install cargo-zigbuild" >&2
   exit 4
 fi
+# Explicit Zig commands own their target/floor. Pin the same executable as
+# managed `cargo build`, without rewriting any of the caller's arguments.
+if [ "$_dsr_subcommand" = zigbuild ]; then
+  if [ -n "$_dsr_toolchain" ]; then
+    exec cargo "$_dsr_toolchain" "$@"
+  fi
+  exec cargo "$@"
+fi
 _dsr_expect_target=0
 _dsr_have_target=0
+_dsr_index=0
+for _dsr_arg in "$@"; do
+  _dsr_index=$((_dsr_index + 1))
+  [ "$_dsr_index" -gt "$_dsr_subcommand_index" ] || continue
+  case "$_dsr_arg" in
+    --) break ;;
+    --target|--target=*) _dsr_have_target=1 ;;
+  esac
+done
 _dsr_count=$#
 _dsr_index=0
+_dsr_after_separator=0
 while [ "$_dsr_index" -lt "$_dsr_count" ]; do
   _dsr_arg=$1
   shift
   _dsr_index=$((_dsr_index + 1))
+  if [ "$_dsr_index" -eq "$_dsr_subcommand_index" ]; then
+    set -- "$@" zigbuild
+    if [ "$_dsr_have_target" -eq 0 ]; then
+      set -- "$@" --target "$DSR_ZIG_TARGET"
+    fi
+    continue
+  fi
+  if [ "$_dsr_after_separator" -eq 1 ]; then
+    set -- "$@" "$_dsr_arg"
+    continue
+  fi
   if [ "$_dsr_expect_target" -eq 1 ]; then
     _dsr_expect_target=0
     if [ "$_dsr_arg" = "$DSR_RUST_TARGET" ]; then
@@ -3954,13 +4001,15 @@ while [ "$_dsr_index" -lt "$_dsr_count" ]; do
     continue
   fi
   case "$_dsr_arg" in
+    --)
+      _dsr_after_separator=1
+      set -- "$@" "$_dsr_arg"
+      ;;
     --target)
-      _dsr_have_target=1
       _dsr_expect_target=1
       set -- "$@" "$_dsr_arg"
       ;;
     --target=*)
-      _dsr_have_target=1
       _dsr_value=${_dsr_arg#--target=}
       if [ "$_dsr_value" = "$DSR_RUST_TARGET" ]; then
         _dsr_value=$DSR_ZIG_TARGET
@@ -3972,13 +4021,10 @@ while [ "$_dsr_index" -lt "$_dsr_count" ]; do
       ;;
   esac
 done
-if [ "$_dsr_have_target" -ne 1 ]; then
-  set -- --target "$DSR_ZIG_TARGET" "$@"
-fi
 if [ -n "$_dsr_toolchain" ]; then
-  exec cargo "$_dsr_toolchain" zigbuild "$@"
+  exec cargo "$_dsr_toolchain" "$@"
 fi
-exec cargo zigbuild "$@"
+exec cargo "$@"
 DSR_ZIG_SHIM_SCRIPT
 }
 
@@ -9300,6 +9346,11 @@ contract = {'schema': 2, 'source_freshness': 'nightly-content-no-build-scripts-v
 # Include actual target/linker/plugin bytes without the fresh source cwd: two
 # immutable copies of the same project can still reuse eligible intermediates.
 contract['toolchain'] = {key: selected_identity[key] for key in ('target_triple', 'linker_variable', 'tools')}
+explicit_zig_selection = selected_identity.get('selection', {}).get('cargo_zigbuild')
+if explicit_zig_selection is not None:
+    # A shared Rust target must not collapse two explicit GNU ABI requests
+    # into the same cache namespace after target canonicalization.
+    contract['toolchain']['cargo_zigbuild'] = explicit_zig_selection
 if shim_selection is not None:
     # Only the generated launcher's per-run location is ephemeral. The full
     # path remains in the coordinator-held executable observation; the cache
@@ -9391,7 +9442,7 @@ _act_toolchain_identity_script() {
     local mode="$1" output="$2" build_cmd="$3" extra_tools="${4:-}" receipt_pin="${5:-}" expected_cwd="${6:-}"
     local zig_shim_dir="${7:-}" zig_shim_hash="" shim_dir_q shim_hash_q
     local output_q command_q extra_q pin_q cwd_q python_q=python3
-    [[ "$mode" == record || "$mode" == verify || "$mode" == read || "$mode" == metadata || "$mode" == context || "$mode" == target ]] || return 4
+    [[ "$mode" == record || "$mode" == verify || "$mode" == read || "$mode" == metadata || "$mode" == context || "$mode" == target || "$mode" == selection ]] || return 4
     [[ "$output" == /* && "$output" != *..* ]] || return 4
     [[ -z "$expected_cwd" || ( "$expected_cwd" == /* && "$expected_cwd" != *..* ) ]] || return 4
     if [[ -n "$zig_shim_dir" ]]; then
@@ -9412,7 +9463,7 @@ _act_toolchain_identity_script() {
     # Target-only planning runs on the coordinator without invoking any build
     # tools or reading its Cargo configuration. The configured PATH may be a
     # remote host path, so use the coordinator's absolute Python interpreter.
-    if [[ "$mode" == target ]]; then
+    if [[ "$mode" == target || "$mode" == selection ]]; then
         python_q=$(command -v python3) || return 4
         printf -v python_q '%q' "$python_q"
     else
@@ -9962,7 +10013,7 @@ def cargo_configuration():
 
 
 cargo_config, cargo_config_receipts = (({'build': {}, 'target': {}, 'alias': {}}, [])
-                                     if mode == 'target' else cargo_configuration())
+                                     if mode in ('target', 'selection') else cargo_configuration())
 
 
 def joined_shell_lines(text):
@@ -10185,7 +10236,25 @@ def invocation_selection():
         target = targets[0] if targets else env.get('CARGO_BUILD_TARGET', cargo_config['build'].get('target', ''))
         if not isinstance(target, str) or (target and not re.fullmatch(r'[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+)+(?:\.[0-9.]+)?', target)):
             fail('Cargo target must be a literal target triple, not a dynamic or JSON target')
+        zigbuild = None
+        if '.' in target:
+            # cargo-zigbuild removes this GNU ABI suffix before invoking Cargo
+            # and rustc. It is not part of the Rust target or output directory
+            # (issue #37). Preserve its exact spelling as separate authority;
+            # never normalize an arbitrary Cargo command or malformed suffix.
+            matched = re.fullmatch(r'([A-Za-z0-9_]+(?:-[A-Za-z0-9_]+)*-linux-gnu)\.([0-9]+\.[0-9]+)', target)
+            if subcommand != 'zigbuild' or not targets or not matched:
+                fail('versioned targets require cargo zigbuild --target <GNU Rust triple>.<MAJOR.MINOR>')
+            rust_target, floor = matched.groups()
+            zigbuild = {'rust_target': rust_target, 'zig_target': target, 'glibc_floor': floor}
+            target = rust_target
+            for name in ('CARGO_BUILD_TARGET', 'DSR_TARGET_TRIPLE'):
+                if os.environ.get(name) and os.environ[name] != target:
+                    fail('explicit Zig target contradicts the native task ' + name)
+                if env.get(name) != os.environ.get(name):
+                    fail('build_cmd cannot override the explicit Zig native task target environment')
         selection = {'toolchain': toolchain, 'target': target,
+                     'cargo_zigbuild': zigbuild,
                      'environment': {name: value for name, value in env.items() if influences(name)}}
         # An explicit + selector has higher priority than RUSTUP_TOOLCHAIN.
         selection['environment']['RUSTUP_TOOLCHAIN'] = toolchain or ''
@@ -10205,6 +10274,13 @@ def invocation_selection():
 
 selection, probe_env, explicit_toolchain, cargo_commands, assigned_environment = invocation_selection()
 
+if mode == 'selection':
+    # Coordinator-only intent, before staging or compiler lookup. The worker
+    # repeats this parser and must attest the generated dispatcher itself.
+    json.dump(selection['cargo_zigbuild'], sys.stdout, sort_keys=True)
+    sys.stdout.write('\n')
+    sys.exit(0)
+
 if mode == 'target':
     # This is a selection check, not executable or binary ABI attestation.
     # Never run the command: all task variants are checked before the first
@@ -10220,6 +10296,12 @@ if mode == 'target':
 
 
 cargo_effective_environment(cargo_config, cargo_config_receipts, probe_env)
+
+# Metadata runs ordinary locked/offline Cargo without compiling through Zig.
+# Every executable build/cache observation of a versioned Zig command instead
+# requires the controller-generated, hash-verified dispatcher below.
+if selection['cargo_zigbuild'] is not None and not zig_shim_dir and mode != 'metadata':
+    fail('explicit versioned cargo zigbuild requires the generated DSR Cargo shim')
 
 
 # DSR's generated glibc-floor launcher is an additional attested input, not
@@ -10287,6 +10369,10 @@ if zig_shim_dir:
                 probe_env.get('DSR_RUST_TARGET') != selection['target'] or
                 probe_env.get('DSR_ZIG_TARGET') != selection['target'] + '.' + floor):
             fail('generated DSR Cargo shim target/floor does not match the admitted build')
+        if 'zigbuild' in cargo_commands and selection['cargo_zigbuild'] != {
+                'rust_target': selection['target'], 'zig_target': probe_env['DSR_ZIG_TARGET'],
+                'glibc_floor': floor}:
+            fail('explicit Zig target/floor does not match the generated DSR Cargo shim')
         zig_shim_parent = os.open(shim_directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         zig_shim_parent_before = os.fstat(zig_shim_parent)
         fd = os.open('cargo', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=zig_shim_parent)
@@ -10592,6 +10678,8 @@ if zig_shim_record is not None:
     result['selection']['dsr_cargo_shim'] = {
         'rust_target': probe_env['DSR_RUST_TARGET'], 'zig_target': probe_env['DSR_ZIG_TARGET'],
         'glibc_floor': probe_env['DSR_LINUX_GLIBC_FLOOR']}
+if selection['cargo_zigbuild'] is not None:
+    result['selection']['cargo_zigbuild'] = selection['cargo_zigbuild']
 
 # Metadata admission uses the same cfg/compiler validation as the build.
 if mode == 'metadata':
@@ -10698,8 +10786,25 @@ _act_validate_native_target_command() {
     done <<< "$build_env"
     script=$(_act_toolchain_identity_script target /dev/null "$build_cmd") || return 4
     local actual
-    actual=$(env -i "${pairs[@]}" "$BASH" -c "$script") || return 4
+    # The configured environment belongs to the worker. In particular its
+    # BASH_ENV must remain data, never a coordinator startup program.
+    actual=$(env -i "${pairs[@]}" "$BASH" -p -c "$script") || return 4
     [[ "$actual" == "$selected_triple" ]] || return 4
+}
+
+# Read only the explicit versioned Zig invocation on the coordinator. No
+# local Cargo configuration or executable is consulted; worker observation
+# repeats the selection and authenticates the staged shim before dispatch.
+_act_explicit_zigbuild_selection() {
+    local build_cmd="$1" build_env="$2" script pair
+    local -a pairs=()
+    while IFS= read -r pair; do
+        [[ -z "$pair" ]] && continue
+        [[ "$pair" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || return 4
+        pairs+=("$pair")
+    done <<< "$build_env"
+    script=$(_act_toolchain_identity_script selection /dev/null "$build_cmd") || return 4
+    env -i "${pairs[@]}" "$BASH" -p -c "$script"
 }
 
 # Run native build on remote host via SSH
@@ -11011,6 +11116,19 @@ act_run_native_build() {
     local nonstrict_sibling_relatives=()
     if [[ "$language" == "rust" && -n "$remote_path_override" ]]; then
         strict_rust_build=true
+        if ! _act_is_windows_host "$host"; then
+            local explicit_zig_selection
+            explicit_zig_selection=$(_act_explicit_zigbuild_selection "$build_cmd" "$build_env") || return 4
+            if [[ "$explicit_zig_selection" != null ]]; then
+                rust_floor_triple=$(jq -er '.rust_target' <<< "$explicit_zig_selection") || return 4
+                rust_zig_target=$(jq -er '.zig_target' <<< "$explicit_zig_selection") || return 4
+                rust_glibc_floor=$(jq -er '.glibc_floor' <<< "$explicit_zig_selection") || return 4
+                build_env+=$'\n'"DSR_RUST_TARGET=$rust_floor_triple"
+                build_env+=$'\n'"DSR_ZIG_TARGET=$rust_zig_target"
+                build_env+=$'\n'"DSR_LINUX_GLIBC_FLOOR=$rust_glibc_floor"
+                _log_info "Attesting explicit cargo zigbuild target $rust_zig_target with the generated Zig dispatcher"
+            fi
+        fi
         if [[ -n "$release_git_sha" || -n "$release_git_ref" ]]; then
             if [[ ! "$release_git_sha" =~ ^[0-9a-f]{40}$ || \
                   "$release_git_sha" =~ ^0{40}$ || \

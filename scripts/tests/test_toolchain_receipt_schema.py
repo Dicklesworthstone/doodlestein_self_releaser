@@ -139,6 +139,13 @@ def shim_observation(triple=TRIPLE, floor='2.28'):
     return result
 
 
+def explicit_zig_observation(triple=TRIPLE, floor='2.28'):
+    result = shim_observation(triple, floor)
+    result['selection']['cargo_commands'] = ['zigbuild']
+    result['selection']['cargo_zigbuild'] = deepcopy(result['selection']['dsr_cargo_shim'])
+    return result
+
+
 class ToolchainReceiptSchemaTests(unittest.TestCase):
     def accepted(self, observation):
         errors = list(VALIDATOR.iter_errors(manifest(observation)))
@@ -364,6 +371,38 @@ class ToolchainReceiptSchemaTests(unittest.TestCase):
                 result = shim_observation()
                 result['selection']['dsr_cargo_shim'][field] = value
                 self.rejected(result)
+
+    def test_explicit_zig_target_requires_the_same_complete_dispatch_evidence(self):
+        for triple in (TRIPLE, 'aarch64-unknown-linux-gnu'):
+            result = explicit_zig_observation(triple, '2.17')
+            self.accepted(result)
+            for missing in ('cargo', 'rustc', 'cargo-zigbuild', 'zig', 'dsr_cargo_shim'):
+                changed = deepcopy(result)
+                del changed['tools'][missing]
+                self.rejected(changed)
+            changed = deepcopy(result)
+            del changed['selection']['dsr_cargo_shim']
+            self.rejected(changed)
+            changed = deepcopy(result)
+            changed['selection']['cargo_commands'] = ['build']
+            self.rejected(changed)
+
+    def test_explicit_zig_target_shape_cannot_replace_the_canonical_target(self):
+        for field in ('rust_target', 'zig_target', 'glibc_floor'):
+            changed = explicit_zig_observation()
+            del changed['selection']['cargo_zigbuild'][field]
+            self.rejected(changed)
+        for field, value in (('rust_target', TRIPLE + '.2.28'), ('rust_target', TRIPLE + '\n'),
+                             ('zig_target', TRIPLE + '.2..28'), ('zig_target', TRIPLE + '.2.28.0'),
+                             ('zig_target', 'aarch64-apple-darwin.2.28'),
+                             ('glibc_floor', 'native'), ('glibc_floor', 2.28), ('unknown', True)):
+            changed = explicit_zig_observation()
+            changed['selection']['cargo_zigbuild'][field] = value
+            self.rejected(changed)
+        for target in (TRIPLE + '.2.28', TRIPLE + '\n', 'aarch64-apple-darwin'):
+            changed = explicit_zig_observation()
+            changed['target_triple'] = target
+            self.rejected(changed)
 
     def test_dispatch_pins_are_closed_and_complete(self):
         for name in ('rustup_resolver', 'toolchain_launcher'):
