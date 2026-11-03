@@ -404,9 +404,35 @@ _act_zig_shim_prefix_sh "$2" | bash'''
                 bool(versions) and
                 all(version + (0,) * (3 - len(version)) <= (2, 28, 0) for version in versions))
 
+    # Exercise the genuine plugin's Python-first discovery independently of
+    # Cargo compilation. This adversarial module intentionally spoofs only
+    # the version used by discovery, then refuses every real Zig operation.
+    # Keep it outside the Cargo project; PYTHONPATH exposes the same ambiguity
+    # as a source-local ziglang.py without changing the build's source inputs.
+    python_shadow = work / 'unobserved-zig-python'
+    python_shadow.mkdir()
+    zig_version = require(['zig', 'version'], env=environment)
+    (python_shadow / 'ziglang.py').write_text(
+        'import os, pathlib, sys\n'
+        'pathlib.Path(os.environ["DSR_TEST_ZIG_SHADOW_MARKER"]).write_text("unobserved Zig module executed")\n'
+        'if sys.argv[1:] == ["version"]:\n'
+        '    print(' + repr(zig_version) + ')\n'
+        'else:\n'
+        '    raise SystemExit(97)\n')
+    shadow_marker = work / 'unmanaged-zig-python-executed'
+    shadow_environment = dict(environment, PYTHONPATH=str(python_shadow), PYTHONDONTWRITEBYTECODE='1',
+                              DSR_TEST_ZIG_SHADOW_MARKER=str(shadow_marker))
+    shadow_dispatch = run(['cargo-zigbuild', 'zig', 'ar', '--', '--version'],
+                          cwd=project, env=shadow_environment)
+    check('genuine cargo-zigbuild can select an unobserved Python module despite Zig on PATH',
+          shadow_dispatch.returncode == 97 and shadow_marker.is_file())
+
     for target in zig_targets:
         env = shim_environment(target, 'zig-proxy-' + target)
         env['RUSTUP_TOOLCHAIN'] = 'fixture-default'
+        build_shadow_marker = work / ('managed-zig-python-' + target)
+        env.update(PYTHONPATH=str(python_shadow), PYTHONDONTWRITEBYTECODE='1',
+                   DSR_TEST_ZIG_SHADOW_MARKER=str(build_shadow_marker))
         command = 'cargo +fixture-selected build --quiet --locked --offline --target ' + target
         before, observed, receipt = probe(command, env, zig_shim_dir=shim_dir)
         prebuild, _, _ = probe(command, env, mode='verify', receipt=receipt, zig_shim_dir=shim_dir)
@@ -417,6 +443,9 @@ _act_zig_shim_prefix_sh "$2" | bash'''
         check('genuine Zig floor build with Rustup +toolchain records, compiles and verifies ' + target,
               before.returncode == prebuild.returncode == compiled.returncode == after.returncode == 0 and
               linux_output(Path(env['CARGO_TARGET_DIR']), target))
+        check('generated shim uses the attested Zig without importing the shadow module for ' + target,
+              before.returncode == prebuild.returncode == compiled.returncode == after.returncode == 0 and
+              not build_shadow_marker.exists())
         check('shim and actual Rustup/Cargo/compiler/plugin bytes are independently retained for ' + target,
               observed.get('tools', {}).get('dsr_cargo_shim') == {
                   'program': 'cargo', 'selected_path': str(shim), 'selected_sha256': shim_digest,

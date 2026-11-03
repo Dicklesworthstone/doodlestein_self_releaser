@@ -24,12 +24,12 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = Path(os.environ.get('DSR_TEST_ACT_RUNNER', str(ROOT / 'src/act_runner.sh')))
 TRIPLE = 'x86_64-unknown-linux-gnu'
-EMIT = 'source "$1" || exit $?; _act_toolchain_identity_script "$2" "$3" "$4" "" "" ""'
+EMIT = 'source "$1" || exit $?; _act_toolchain_identity_script "$2" "$3" "$4" "" "" "" "$5"'
 
 
-def emit(mode, command):
+def emit(mode, command, shim_dir='', receipt='/tmp/dsr-unused-receipt.json'):
     return subprocess.run(['bash', '-o', 'pipefail', '-c', EMIT, '_', str(MODULE),
-                           mode, '/tmp/dsr-unused-receipt.json', command],
+                           mode, str(receipt), command, str(shim_dir)],
                           capture_output=True, text=True, check=True, timeout=30).stdout
 
 
@@ -155,6 +155,340 @@ class InvocationBoundaryTests(unittest.TestCase):
                         'command cargo build --locked', 'cargo --color never build --release'):
             with self.subTest(command=command):
                 self.assertEqual(invoke(command)[0]['target'], TRIPLE)
+
+
+class ZigShimAdmissionTests(unittest.TestCase):
+    """Exercise actual generated admission before any compiler is available.
+
+    These are filesystem, command-selection and PATH tests. They deliberately
+    stop before executable identity and cannot qualify a Cargo/Zig build; that
+    remains the job of test_toolchain_identity.sh --zig-shim-only on a host
+    with genuine Rustup, Cargo, Zig and the two Linux standard libraries.
+    """
+
+    zig_selectors = ('CARGO_ZIGBUILD_ZIG_COMMAND', 'CARGO_ZIGBUILD_ZIG_COMMAND_ARGS',
+                     'CARGO_ZIGBUILD_PYTHON_PATH', 'CARGO_ZIGBUILD_ZIG_PATH',
+                     'CARGO_ZIGBUILD_ZIG_VERSION')
+
+    def setUp(self):
+        self.work = Path(tempfile.mkdtemp(prefix='dsr-zig-admission-')).resolve()
+        self.project = self.work / 'source'
+        self.project.mkdir()
+        self.shim_dir = self.work / 'shim'
+        self.receipt = self.work / 'receipt.json'
+        staging = subprocess.run(
+            ['bash', '-o', 'pipefail', '-c',
+             'source "$1" || exit $?; _act_zig_shim_prefix_sh "$2" | bash',
+             '_', str(MODULE), str(self.shim_dir)],
+            capture_output=True, text=True, check=True, timeout=30)
+        self.assertEqual(staging.stdout, '')
+        self.shim = self.shim_dir / 'cargo'
+        self.generator = subprocess.run(
+            ['bash', '-c', 'source "$1" || exit $?; _act_zig_cargo_shim_sh', '_', str(MODULE)],
+            capture_output=True, check=True, timeout=30).stdout
+        self.environment = {name: value for name, value in os.environ.items()
+                            if not name.startswith(('CARGO_', 'RUST', 'DSR_'))}
+        self.environment.update(CARGO_HOME=str(self.work / 'cargo-home'),
+                                CARGO_BUILD_TARGET=TRIPLE, DSR_RUST_TARGET=TRIPLE,
+                                DSR_ZIG_TARGET=TRIPLE + '.2.28', DSR_LINUX_GLIBC_FLOOR='2.28',
+                                PATH=str(self.shim_dir) + os.pathsep + os.environ['PATH'])
+
+    def admission(self, target=TRIPLE, path=None, shim=True):
+        """Run the emitted Python through shim admission, before tool probes.
+
+        Keep the generated argv (including the controller-derived hash) and
+        every preceding production statement. Expose only the already-observed
+        pre-compiler state; never replace a tool or fabricate its version.
+        """
+        command = 'cargo +fixture-selected build --release --locked --target ' + target
+        script = emit('record', command, self.shim_dir if shim else '', self.receipt)
+        header, body = script.split("<<'DSR_TOOLCHAIN_IDENTITY_PY'\n", 1)
+        argv = shlex.split(header.splitlines()[-1].strip())[2:]
+        module = ast.parse(body.rsplit('\nDSR_TOOLCHAIN_IDENTITY_PY', 1)[0])
+        prefix = []
+        for node in module.body:
+            if isinstance(node, ast.FunctionDef) and node.name == 'run':
+                break
+            prefix.append(node)
+        else:
+            self.fail('generated observer has no pre-compiler admission boundary')
+        environment = dict(self.environment, CARGO_BUILD_TARGET=target,
+                           DSR_RUST_TARGET=target, DSR_ZIG_TARGET=target + '.2.28')
+        if path is not None:
+            environment['PATH'] = path
+        namespace = {'__name__': '__main__'}
+        previous = Path.cwd()
+        try:
+            os.chdir(self.project)
+            with patch.dict(os.environ, environment, clear=True), patch.object(sys, 'argv', argv):
+                exec(compile(ast.Module(body=prefix, type_ignores=[]), str(MODULE), 'exec'), namespace)
+            return {key: namespace[key] for key in ('zig_shim_record', 'selection', 'probe_env')}
+        finally:
+            os.chdir(previous)
+            if namespace.get('zig_shim_file') is not None:
+                namespace['zig_shim_file'].close()
+            if namespace.get('zig_shim_parent') is not None:
+                os.close(namespace['zig_shim_parent'])
+            self.assertFalse(self.receipt.exists(), 'admission alone must not publish compiler evidence')
+
+    def observe(self, mode='record', environment=None, script=None, prefix=''):
+        # An intentional dispatch override is the final pre-compiler sentinel.
+        # Exact shims reach it; malformed shims must fail earlier. No installed
+        # Rust or Zig command can run even when one exists on the test host.
+        environment = dict(environment or self.environment, RUSTUP_FORCE_ARG0='rustup')
+        script = script or emit(mode, 'cargo build --release --locked --target ' + TRIPLE,
+                                self.shim_dir, self.receipt)
+        return subprocess.run(['bash', '-c', prefix + script], cwd=self.project,
+                              env=environment, text=True, capture_output=True, timeout=30)
+
+    def assert_refused(self, result, message):
+        self.assertEqual(result.returncode, 86, result.stderr)
+        self.assertIn(message, result.stderr)
+        self.assertEqual(result.stdout, '')
+        self.assertFalse(self.receipt.exists())
+
+    def test_exact_generator_bytes_and_underlying_dispatch_for_both_linux_architectures(self):
+        self.assertEqual(self.shim.read_bytes(), self.generator)
+        for target in (TRIPLE, 'aarch64-unknown-linux-gnu'):
+            with self.subTest(target=target):
+                observed = self.admission(target)
+                self.assertEqual(observed['zig_shim_record'], {
+                    'program': 'cargo', 'selected_path': str(self.shim),
+                    'selected_sha256': hashlib.sha256(self.generator).hexdigest(),
+                    'selected_kind': 'script', 'version': ''})
+                self.assertEqual(observed['selection']['toolchain'], 'fixture-selected')
+                self.assertEqual(observed['selection']['target'], target)
+                self.assertEqual(observed['probe_env']['PATH'], os.environ['PATH'])
+
+    def test_delegated_path_preserves_posix_empty_fields_and_removes_only_exact_shim_entries(self):
+        first, second = str(self.work / 'first'), str(self.work / 'second')
+        shim = str(self.shim_dir)
+        for path, expected in ((shim + '::' + first, first),
+                               (shim + ':' + first + '::' + second, first + '::' + second),
+                               (shim + ':' + first + ':', first),
+                               (shim + ':' + first + '::', first + ':'),
+                               (shim + ':' + first + ':' + shim + ':' + second, first + ':' + second)):
+            with self.subTest(path=path):
+                self.assertEqual(self.admission(path=path)['probe_env']['PATH'], expected)
+
+    def test_mixed_platform_selection_does_not_carry_linux_shim_authority_to_native_targets(self):
+        # Deterministic selection matrix only, not a mixed release execution.
+        for target, shim in ((TRIPLE, True), ('aarch64-apple-darwin', False),
+                             ('aarch64-unknown-linux-gnu', True), ('x86_64-pc-windows-msvc', False),
+                             ('x86_64-apple-darwin', False)):
+            with self.subTest(target=target):
+                path = self.environment['PATH'] if shim else os.environ['PATH']
+                observed = self.admission(target, path=path, shim=shim)
+                self.assertEqual(observed['selection']['target'], target)
+                self.assertEqual(observed['zig_shim_record'] is not None, shim)
+                self.assertEqual(observed['probe_env']['PATH'], os.environ['PATH'])
+
+    def test_substituted_shim_cannot_rebase_controller_hash_or_execute_a_version_probe(self):
+        frozen = {mode: emit(mode, 'cargo build --target ' + TRIPLE, self.shim_dir, self.receipt)
+                  for mode in ('record', 'metadata', 'context')}
+        marker = self.work / 'substituted-shim-executed'
+        self.shim.write_text('#!/bin/sh\nprintf ran > ' + shlex.quote(str(marker)) + '\nexit 0\n')
+        environment = dict(self.environment, DSR_ZIG_SHIM_SHA256=hashlib.sha256(self.shim.read_bytes()).hexdigest())
+        for mode, script in frozen.items():
+            with self.subTest(mode=mode):
+                self.assert_refused(self.observe(mode, environment, script), 'trusted generator bytes')
+                self.assertFalse(marker.exists())
+
+    def test_byte_identical_symlink_and_writable_shim_are_refused(self):
+        original = self.work / 'original-cargo'
+        self.shim.rename(original)
+        self.shim.symlink_to(original)
+        self.assert_refused(self.observe(), 'cannot admit generated DSR Cargo shim')
+        self.shim.rename(self.work / 'retained-symlink')
+        original.rename(self.shim)
+        self.shim.chmod(0o777)
+        self.assert_refused(self.observe(), 'trusted generator bytes or ownership')
+
+    def test_unexpected_directory_entries_refuse_before_interpreter_selection_even_with_glob_options(self):
+        frozen = emit('record', 'cargo build --target ' + TRIPLE, self.shim_dir, self.receipt)
+        for index, name in enumerate(('python3', '.hidden', '..hidden')):
+            with self.subTest(entry=name):
+                marker = self.work / ('interpreter-executed-' + str(index))
+                extra = self.shim_dir / name
+                extra.write_text('#!/bin/sh\nprintf ran > ' + shlex.quote(str(marker)) + '\nexit 0\n')
+                extra.chmod(0o755)
+                result = self.observe(script=frozen,
+                                      prefix="set -f; shopt -s failglob nullglob; GLOBIGNORE='*';\n")
+                self.assert_refused(result, 'unexpected entry in generated DSR Cargo shim directory')
+                self.assertFalse(marker.exists())
+                extra.rename(self.work / ('retained-extra-' + str(index)))
+
+    def test_python_alias_of_modified_shim_cannot_impersonate_observer_or_strict_cache(self):
+        scripts = {mode: emit(mode, 'cargo build --target ' + TRIPLE, self.shim_dir, self.receipt)
+                   for mode in ('record', 'verify', 'metadata', 'context')}
+        cache_root = self.work / 'cache'
+        cache_root.mkdir(mode=0o700)
+        scripts['cache'] = subprocess.run(
+            ['bash', '-c', 'source "$1" || exit $?; _act_strict_cargo_cache_script "$2" \'{}\' "$3" "$4"',
+             '_', str(MODULE), str(cache_root), 'cargo build --target ' + TRIPLE, str(self.shim_dir)],
+            capture_output=True, text=True, check=True, timeout=30).stdout
+        for index, link in enumerate(('symlink', 'hardlink')):
+            directory = self.work / ('interpreter-alias-' + link)
+            directory.mkdir()
+            alias = directory / 'python3'
+            if link == 'symlink':
+                alias.symlink_to(self.shim)
+            else:
+                os.link(self.shim, alias)
+            marker = self.work / ('aliased-shim-executed-' + str(index))
+            # Freeze the trusted program first, then mutate the only allowed
+            # directory entry. The delegated Python name aliases that same
+            # inode, bypassing a check based only on its lexical parent.
+            self.shim.write_text('#!/bin/sh\nprintf ran > ' + shlex.quote(str(marker)) + '\nexit 0\n')
+            environment = dict(self.environment,
+                               PATH=str(self.shim_dir) + ':' + str(directory) + ':' + os.environ['PATH'])
+            for mode, script in scripts.items():
+                with self.subTest(link=link, mode=mode):
+                    self.assert_refused(self.observe(environment=environment, script=script), 'Python cannot')
+                    self.assertFalse(marker.exists())
+                    self.assertEqual(list(cache_root.iterdir()), [])
+
+    def test_external_python_symlink_still_reaches_the_real_precompiler_guard(self):
+        directory = self.work / 'trusted-python'
+        directory.mkdir()
+        (directory / 'python3').symlink_to(Path(sys.executable).resolve())
+        environment = dict(self.environment,
+                           PATH=str(self.shim_dir) + ':' + str(directory) + ':' + os.environ['PATH'])
+        self.assert_refused(self.observe(environment=environment), 'configured Rustup dispatch overrides')
+
+    def test_path_substitution_globs_and_recursive_aliases_are_refused(self):
+        alias = self.work / 'alias'
+        alias.symlink_to(self.shim_dir, target_is_directory=True)
+        for path, message in ((os.environ['PATH'] + ':' + str(self.shim_dir), 'selected first PATH entry'),
+                              (self.environment['PATH'] + ':glob-*', 'globbed PATH entries'),
+                              (self.environment['PATH'] + ':' + str(alias), 'recursive alias')):
+            with self.subTest(path=path):
+                self.assert_refused(self.observe(environment=dict(self.environment, PATH=path)), message)
+
+    def test_target_floor_changes_refuse_before_compiler_execution(self):
+        for field, value in (('DSR_RUST_TARGET', 'aarch64-unknown-linux-gnu'),
+                             ('DSR_ZIG_TARGET', TRIPLE + '.2.29'),
+                             ('DSR_LINUX_GLIBC_FLOOR', ''), ('DSR_LINUX_GLIBC_FLOOR', '2.28.0')):
+            with self.subTest(field=field, value=value):
+                self.assert_refused(self.observe(environment=dict(self.environment, **{field: value})),
+                                    'target/floor does not match')
+
+    def test_exact_shim_reaches_same_precompiler_dispatch_guard_in_identity_metadata_and_cache_context(self):
+        for mode in ('record', 'metadata', 'context'):
+            with self.subTest(mode=mode):
+                self.assert_refused(self.observe(mode), 'configured Rustup dispatch overrides')
+
+    def transport_environment(self):
+        """Capture launcher argv/environment only; never emulate a Rust build."""
+        directory = self.project / 'delegated tools'
+        directory.mkdir()
+        cargo = directory / 'cargo'
+        cargo.write_text('#!' + sys.executable + '\n' +
+                         'import json, os, pathlib, sys\n' +
+                         'pathlib.Path(os.environ["DSR_FIXTURE_CAPTURE"]).write_text(json.dumps({' +
+                         '"argv":sys.argv[1:], "PATH":os.environ["PATH"], ' +
+                         '"zig":{k:os.environ.get(k) for k in ' + repr(self.zig_selectors) + '}}))\n')
+        # The plugin fixture exercises only the launcher's version gate. It is
+        # never supplied to the identity observer as compiler/plugin evidence.
+        plugin = directory / 'cargo-zigbuild'
+        plugin.write_text('#!/bin/sh\nprintf probed > "$DSR_FIXTURE_PLUGIN_MARKER"\n'
+                          'printf "cargo-zigbuild %s\\n" "$DSR_FIXTURE_PLUGIN_VERSION"\n')
+        zig = directory / 'zig'
+        zig.write_text('#!/bin/sh\nprintf executed > "$DSR_FIXTURE_ZIG_MARKER"\nexit 97\n')
+        for path in (cargo, plugin, zig):
+            path.chmod(0o755)
+        return directory, dict(self.environment,
+                               PATH=str(self.shim_dir) + ':' + str(directory) + ':' + os.environ['PATH'],
+                               DSR_FIXTURE_PLUGIN_VERSION='0.24.0',
+                               DSR_FIXTURE_PLUGIN_MARKER=str(self.work / 'plugin-probed'),
+                               DSR_FIXTURE_ZIG_MARKER=str(self.work / 'zig-executed'))
+
+    def test_generated_build_dispatch_pins_path_zig_and_preserves_target_arguments(self):
+        directory, environment = self.transport_environment()
+        sequence = 0
+        for target in (TRIPLE, 'aarch64-unknown-linux-gnu'):
+            for version in ('0.23.4', '0.24.0'):
+                cases = ((['build', '--target', target, '--release'],
+                          ['zigbuild', '--target', target + '.2.28', '--release']),
+                         (['+fixture-selected', 'build', '--target=' + target, '--locked'],
+                          ['+fixture-selected', 'zigbuild', '--target=' + target + '.2.28', '--locked']),
+                         (['build', '--release'], ['zigbuild', '--target', target + '.2.28', '--release']))
+                for argv, expected in cases:
+                    sequence += 1
+                    with self.subTest(target=target, version=version, argv=argv):
+                        capture = self.work / ('dispatch-' + str(sequence) + '.json')
+                        # Relative delegated entries and spaces must resolve to
+                        # the same absolute Zig identity as the observer sees.
+                        path = str(self.shim_dir) + ':' + directory.name + ':' + os.environ['PATH']
+                        env = dict(environment, PATH=path, CARGO_BUILD_TARGET=target,
+                                   DSR_RUST_TARGET=target, DSR_ZIG_TARGET=target + '.2.28',
+                                   DSR_FIXTURE_PLUGIN_VERSION=version, DSR_FIXTURE_CAPTURE=str(capture))
+                        result = subprocess.run([str(self.shim), *argv], cwd=self.project, env=env,
+                                                text=True, capture_output=True, timeout=30)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        captured = json.loads(capture.read_text())
+                        self.assertEqual(captured['argv'], expected)
+                        self.assertEqual(captured['PATH'], directory.name + ':' + os.environ['PATH'])
+                        self.assertEqual(captured['zig'], {
+                            'CARGO_ZIGBUILD_ZIG_COMMAND': str(directory / 'zig'),
+                            'CARGO_ZIGBUILD_ZIG_COMMAND_ARGS': None,
+                            'CARGO_ZIGBUILD_PYTHON_PATH': '/dev/null',
+                            'CARGO_ZIGBUILD_ZIG_PATH': str(directory / 'zig'),
+                            'CARGO_ZIGBUILD_ZIG_VERSION': None})
+                        self.assertFalse(Path(environment['DSR_FIXTURE_ZIG_MARKER']).exists())
+
+    def test_generated_nonbuild_dispatch_preserves_cargo_arguments_without_zig_controls(self):
+        directory, environment = self.transport_environment()
+        for index, argv in enumerate((['metadata', '--no-deps'], ['--version'],
+                                     ['+fixture-selected', 'metadata', '--format-version=1'])):
+            with self.subTest(argv=argv):
+                capture = self.work / ('passthrough-' + str(index) + '.json')
+                result = subprocess.run([str(self.shim), *argv], cwd=self.project,
+                                        env=dict(environment, DSR_FIXTURE_CAPTURE=str(capture)),
+                                        text=True, capture_output=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                captured = json.loads(capture.read_text())
+                self.assertEqual(captured['argv'], argv)
+                self.assertEqual(captured['PATH'], str(directory) + ':' + os.environ['PATH'])
+                self.assertEqual(captured['zig'], dict.fromkeys(self.zig_selectors))
+                self.assertFalse(Path(environment['DSR_FIXTURE_PLUGIN_MARKER']).exists())
+                self.assertFalse(Path(environment['DSR_FIXTURE_ZIG_MARKER']).exists())
+
+    def test_external_zig_selectors_including_empty_values_refuse_before_plugin_or_cargo(self):
+        _, environment = self.transport_environment()
+        for index, name in enumerate(self.zig_selectors):
+            for value_index, value in enumerate(('', '/untrusted/zig')):
+                with self.subTest(name=name, value=value):
+                    capture = self.work / ('refused-dispatch-' + str(index) + '-' + str(value_index) + '.json')
+                    env = dict(environment, **{name: value}, DSR_FIXTURE_CAPTURE=str(capture))
+                    result = subprocess.run([str(self.shim), 'build', '--target', TRIPLE],
+                                            cwd=self.project, env=env, text=True,
+                                            capture_output=True, timeout=30)
+                    self.assertNotEqual(result.returncode, 0, result.stderr)
+                    self.assertIn('Zig', result.stderr)
+                    self.assertFalse(capture.exists())
+                    self.assertFalse(Path(environment['DSR_FIXTURE_PLUGIN_MARKER']).exists())
+                    self.assertFalse(Path(environment['DSR_FIXTURE_ZIG_MARKER']).exists())
+                    for mode in ('record', 'metadata', 'context'):
+                        self.assert_refused(self.observe(mode, dict(self.environment, **{name: value})), 'Zig')
+
+    def test_command_scoped_zig_selectors_cannot_override_observed_dispatch(self):
+        for name in self.zig_selectors:
+            for value in ('', '/untrusted/zig'):
+                with self.subTest(name=name, value=value):
+                    script = emit('record', name + '=' + shlex.quote(value) + ' cargo build --target ' + TRIPLE,
+                                  self.shim_dir, self.receipt)
+                    self.assert_refused(self.observe(script=script), 'Zig')
+
+    def test_new_zig_selector_policy_does_not_apply_without_the_generated_shim(self):
+        target = 'aarch64-apple-darwin'
+        script = emit('record', 'cargo build --target ' + target, receipt=self.receipt)
+        for name in self.zig_selectors:
+            with self.subTest(name=name):
+                environment = dict(self.environment, PATH=os.environ['PATH'], CARGO_BUILD_TARGET=target,
+                                   **{name: '/caller-owned/zig'})
+                self.assert_refused(self.observe(environment=environment, script=script),
+                                    'configured Rustup dispatch overrides')
 
 
 class CargoCompatibilityTests(unittest.TestCase):
