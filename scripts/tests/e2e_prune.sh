@@ -482,6 +482,47 @@ seed_prune_pair() {
     ln -s latest-run "$DSR_STATE_DIR/builds/$tool/$version/latest"
 }
 
+# Canonical current output plus its supported adjacent manifest. Bind completed
+# publication markers to the actual manifest bytes; pending outputs deliberately
+# retain an older valid manifest so its presence cannot grant prune authority.
+seed_prune_artifact_set() {
+    local tool="$1" tag="$2" publication="${3:-completed}"
+    local set_name="$tool-$tag" purpose=release publishable=true
+    local directory="$DSR_STATE_DIR/artifacts/$set_name" manifest digest
+    local run=22222222-2222-4222-8222-222222222222 sha=1111111111111111111111111111111111111111
+    [[ "$publication" != nonpublishable ]] || { purpose=diagnostic-native; publishable=false; }
+    (umask 077; mkdir -p "$directory") || return 1
+    printf 'retained release payload for %s\n' "$set_name" > "$directory/payload"
+    manifest="$directory/$set_name-manifest.json"
+    jq -nc --arg tool "$tool" --arg tag "$tag" --arg run "$run" --arg sha "$sha" \
+        --arg purpose "$purpose" --argjson publishable "$publishable" \
+        '{tool:$tool,version:$tag,run_id:$run,source:{git_sha:$sha},status:"success",
+          build_purpose:$purpose,publishable:$publishable,summary:{total:1,success:1,failed:0},
+          artifacts:[{name:"payload",path:"payload",target:"linux/amd64"}]}' > "$manifest" || return 1
+    cp "$manifest" "$DSR_STATE_DIR/artifacts/$set_name-manifest.json" || return 1
+    digest=$(python3 - "$manifest" <<'PY'
+import hashlib, pathlib, sys
+print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+) || return 1
+    if [[ "$publication" != legacy ]]; then
+        jq -nc --arg publication "$publication" --arg run "$run" --arg sha "$sha" \
+            --arg purpose "$purpose" --argjson publishable "$publishable" \
+            --arg manifest "$set_name-manifest.json" --arg digest "$digest" '
+            {publication_schema:1,run_id:$run,git_sha:$sha,build_purpose:$purpose} +
+            (if $publication == "pending" then {publication_status:"pending",publishable:false}
+             else {publication_status:"completed",publishable:$publishable,
+                   manifest_name:$manifest,manifest_sha256:$digest} end)
+          ' > "$directory/.dsr-build-purpose.json" || return 1
+    fi
+    python3 - "$directory" "$DSR_STATE_DIR/artifacts/$set_name-manifest.json" <<'PY'
+import os, sys, time
+old = time.time() - 60 * 86400
+for path in sys.argv[1:]:
+    os.utime(path, (old, old))
+PY
+}
+
 prune_reported_path() {
     exec_stdout | jq -e --arg path "$1" \
         'any(.details.pruned_paths[]?; .path == $path)' >/dev/null
@@ -490,6 +531,11 @@ prune_reported_path() {
 prune_reported_retention() {
     exec_stdout | jq -e --arg path "$1" --arg reason "$2" \
         'any(.details.retained_build_paths[]?; .path == $path and .reason == $reason)' >/dev/null
+}
+
+prune_reported_artifact_retention() {
+    exec_stdout | jq -e --arg path "$1" --arg reason "$2" \
+        'any(.details.retained_artifact_paths[]?; .path == $path and .reason == $reason)' >/dev/null
 }
 
 prune_case_result() {
@@ -584,10 +630,19 @@ try_prune_build_lease() {
 
 test_prune_holds_custody_until_removal_finishes() {
     ((TESTS_RUN++))
+    local kind="${1:-checkpoint}"
     harness_setup
     seed_minimal_config
-    seed_prune_pair guarded-tool v1.0.0
-    local directory="$DSR_STATE_DIR/builds/guarded-tool/v1.0.0"
+    local directory stop_path
+    if [[ "$kind" == artifact ]]; then
+        seed_prune_artifact_set guarded-tool v1.0.0
+        directory="$DSR_STATE_DIR/artifacts/guarded-tool-v1.0.0"
+        stop_path="$directory-manifest.json"
+    else
+        seed_prune_pair guarded-tool v1.0.0
+        directory="$DSR_STATE_DIR/builds/guarded-tool/v1.0.0"
+        stop_path="$directory/old-run"
+    fi
     local control="$TEST_TMPDIR/removal" real_rm prune_pid status problems=()
     real_rm=$(command -v rm)
     mkdir -p "$control/bin"
@@ -596,7 +651,7 @@ test_prune_holds_custody_until_removal_finishes() {
     # delegates its exact arguments to real rm; lock acquisition is unmodified.
     cat > "$control/bin/rm" <<'SH'
 #!/usr/bin/env bash
-if [[ "$#" == 2 && "$1" == -rf && "$2" == "$DSR_PRUNE_STOP_PATH" ]]; then
+if [[ "$#" == 2 && ( "$1" == -rf || "$1" == -f ) && "$2" == "$DSR_PRUNE_STOP_PATH" ]]; then
     exec 8<> "$DSR_PRUNE_GATE/release"
     printf '%s\n' "$@" > "$DSR_PRUNE_GATE/arguments"
     : > "$DSR_PRUNE_GATE/ready"
@@ -605,26 +660,38 @@ fi
 exec "$DSR_PRUNE_REAL_RM" "$@"
 SH
     chmod +x "$control/bin/rm"
-    env PATH="$control/bin:$PATH" DSR_PRUNE_STOP_PATH="$directory/old-run" \
+    env PATH="$control/bin:$PATH" DSR_PRUNE_STOP_PATH="$stop_path" \
         DSR_PRUNE_GATE="$control" DSR_PRUNE_REAL_RM="$real_rm" \
         "$DSR_CMD" --json prune --max-age 30 --keep-last 0 --force \
         > "$control/prune.stdout" 2> "$control/prune.stderr" &
     prune_pid=$!
     if wait_prune_marker "$control/ready"; then
-        [[ -d "$directory/old-run" ]] || problems+=("deletion did not pause before removing the run")
+        [[ -e "$stop_path" ]] || problems+=("deletion did not pause before removing its subject")
+        if [[ "$kind" == artifact ]]; then
+            [[ ! -e "$directory" ]] || problems+=("sidecar boundary did not follow artifact directory removal")
+        fi
         status=0
         try_prune_build_lease guarded-tool v1.0.0 > "$control/during.log" 2>&1 || status=$?
         [[ "$status" -eq 2 ]] || problems+=("build acquired custody during deletion (status $status)")
+        if [[ "$kind" == artifact ]]; then
+            status=0
+            try_prune_build_lease guarded-tool 1.0.0 > "$control/during-bare.log" 2>&1 || status=$?
+            [[ "$status" -eq 2 ]] || problems+=("bare-version build acquired custody during sidecar deletion (status $status)")
+        fi
     else
         problems+=("prune never reached the actual removal boundary")
     fi
     release_prune_gate "$control" || problems+=("could not resume actual removal")
     wait "$prune_pid" || problems+=("prune failed after release")
-    [[ ! -e "$directory/old-run" && -d "$directory/latest-run" ]] || problems+=("eligible removal/latest retention failed")
-    jq -e --arg path "$directory/old-run" 'any(.details.pruned_paths[]?; .path == $path)' \
+    [[ ! -e "$stop_path" ]] || problems+=("eligible removal failed")
+    [[ "$kind" == artifact || -d "$directory/latest-run" ]] || problems+=("latest run was removed")
+    jq -e --arg path "$stop_path" 'any(.details.pruned_paths[]?; .path == $path)' \
         "$control/prune.stdout" >/dev/null || problems+=("completed removal not reported")
     try_prune_build_lease guarded-tool v1.0.0 > "$control/after.log" 2>&1 || problems+=("prune left custody held after completion")
-    prune_case_result "prune holds the real build lease through actual removal" "${problems[@]}"
+    if [[ "$kind" == artifact ]]; then
+        try_prune_build_lease guarded-tool 1.0.0 > "$control/after-bare.log" 2>&1 || problems+=("prune left bare-version custody held after completion")
+    fi
+    prune_case_result "prune holds the real build lease through actual $kind removal" "${problems[@]}"
     if [[ ${#problems[@]} -gt 0 ]]; then
         cat "$control/prune.stderr" "$control/during.log" "$control/after.log" 2>/dev/null
     fi
@@ -669,6 +736,162 @@ test_prune_build_custody() {
         prune_reported_path "$directory/old-run" || problems+=("released ordinary run was not pruned")
     [[ -d "$directory/latest-run" ]] || problems+=("latest run was removed")
     prune_case_result "prune respects $mode custody for $version via $locked_version" "${problems[@]}"
+    harness_teardown
+}
+
+test_prune_artifact_build_custody() {
+    ((TESTS_RUN++))
+    local mode="$1" locked_version="$2"
+    harness_setup
+    seed_minimal_config
+    seed_prune_pair active-tool "$locked_version"
+    seed_prune_artifact_set active-tool v1.0.0
+    seed_prune_artifact_set idle-tool v2.0.0
+    local active="$DSR_STATE_DIR/artifacts/active-tool-v1.0.0"
+    local idle="$DSR_STATE_DIR/artifacts/idle-tool-v2.0.0"
+    local control="$TEST_TMPDIR/artifact-custody" before after problems=()
+    if ! start_prune_lease "$mode" "$control" active-tool "$locked_version"; then
+        fail "Could not establish real $mode artifact custody for $locked_version"
+        harness_teardown
+        return
+    fi
+    before=$(prune_tree_inventory "$DSR_STATE_DIR" "$DSR_CACHE_DIR")
+    exec_run "$DSR_CMD" --json --dry-run prune --max-age 30 --keep-last 0 --force
+    after=$(prune_tree_inventory "$DSR_STATE_DIR" "$DSR_CACHE_DIR")
+    [[ "$(exec_status)" -eq 0 && "$before" == "$after" ]] || problems+=("artifact dry-run changed state or custody")
+    prune_reported_artifact_retention "$active" build_custody || problems+=("held artifact custody not reported in dry-run")
+    ! prune_reported_path "$active" && ! prune_reported_path "$active-manifest.json" || problems+=("dry-run selected held artifacts")
+    prune_reported_path "$idle" && prune_reported_path "$idle-manifest.json" || problems+=("dry-run missed an unrelated completed artifact set")
+
+    before=$(prune_tree_inventory "$active" "$active-manifest.json")
+    exec_run "$DSR_CMD" --json prune --max-age 30 --keep-last 0 --force
+    after=$(prune_tree_inventory "$active" "$active-manifest.json")
+    [[ "$(exec_status)" -eq 0 && "$before" == "$after" ]] || problems+=("held artifact bytes or identity changed")
+    prune_reported_artifact_retention "$active" build_custody || problems+=("held artifact custody not reported")
+    ! prune_reported_path "$active" && ! prune_reported_path "$active-manifest.json" || problems+=("held artifacts reported as pruned")
+    [[ ! -e "$idle" && ! -e "$idle-manifest.json" ]] &&
+        prune_reported_path "$idle" && prune_reported_path "$idle-manifest.json" || problems+=("unrelated completed artifact set was not removed")
+
+    release_prune_lease "$control" || problems+=("fixture could not release custody")
+    [[ "$mode" == inherited ]] || wait "$PRUNE_COORDINATOR_PID" || problems+=("coordinator did not exit cleanly")
+    exec_run "$DSR_CMD" --json prune --max-age 30 --keep-last 0 --force
+    [[ "$(exec_status)" -eq 0 && ! -e "$active" && ! -e "$active-manifest.json" ]] &&
+        prune_reported_path "$active" && prune_reported_path "$active-manifest.json" || problems+=("released completed artifact set was not removed")
+    prune_case_result "prune preserves complete artifacts under $mode $locked_version custody" "${problems[@]}"
+    harness_teardown
+}
+
+test_prune_retains_pending_artifact_publication() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_minimal_config
+    local publication directory before after problems=() protected=()
+    for publication in pending nonpublishable; do
+        seed_prune_artifact_set "$publication-tool" v1.0.0 "$publication"
+        directory="$DSR_STATE_DIR/artifacts/$publication-tool-v1.0.0"
+        protected+=("$directory" "$directory-manifest.json")
+    done
+    seed_prune_artifact_set idle-tool v2.0.0
+    local idle="$DSR_STATE_DIR/artifacts/idle-tool-v2.0.0"
+    before=$(prune_tree_inventory "$DSR_STATE_DIR" "$DSR_CACHE_DIR")
+    exec_run "$DSR_CMD" --json --dry-run prune --max-age 30 --keep-last 0 --force
+    after=$(prune_tree_inventory "$DSR_STATE_DIR" "$DSR_CACHE_DIR")
+    [[ "$(exec_status)" -eq 0 && "$before" == "$after" ]] || problems+=("pending artifact dry-run changed the filesystem")
+    for publication in pending nonpublishable; do
+        directory="$DSR_STATE_DIR/artifacts/$publication-tool-v1.0.0"
+        prune_reported_artifact_retention "$directory" publication_pending || problems+=("$publication output not retained in dry-run")
+        ! prune_reported_path "$directory" && ! prune_reported_path "$directory-manifest.json" || problems+=("$publication output selected in dry-run")
+    done
+    before=$(prune_tree_inventory "${protected[@]}")
+    exec_run "$DSR_CMD" --json prune --max-age 30 --keep-last 0 --force
+    after=$(prune_tree_inventory "${protected[@]}")
+    [[ "$(exec_status)" -eq 0 && "$before" == "$after" ]] || problems+=("pending/nonpublishable output changed without a lease")
+    for publication in pending nonpublishable; do
+        directory="$DSR_STATE_DIR/artifacts/$publication-tool-v1.0.0"
+        prune_reported_artifact_retention "$directory" publication_pending || problems+=("$publication output retention not reported")
+        ! prune_reported_path "$directory" && ! prune_reported_path "$directory-manifest.json" || problems+=("$publication output reported as pruned")
+    done
+    [[ ! -e "$idle" && ! -e "$idle-manifest.json" ]] &&
+        prune_reported_path "$idle" && prune_reported_path "$idle-manifest.json" || problems+=("unrelated completed output was not removed")
+    prune_case_result "prune retains pending and nonpublishable artifacts despite an old valid manifest" "${problems[@]}"
+    harness_teardown
+}
+
+test_prune_retains_unbound_artifact_ownership() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_minimal_config
+    local name directory old_directory before after problems=() directories=() protected=()
+    for name in conflict run-conflict source-conflict malformed-manifest malformed-identity; do
+        seed_prune_artifact_set "$name-tool" v1.0.0 legacy
+        directories+=("$DSR_STATE_DIR/artifacts/$name-tool-v1.0.0")
+    done
+    directory="$DSR_STATE_DIR/artifacts/conflict-tool-v1.0.0"
+    jq '.version = "v2.0.0"' "$directory-manifest.json" > "$TEST_TMPDIR/conflicting-owner.json"
+    mv "$TEST_TMPDIR/conflicting-owner.json" "$directory-manifest.json"
+    directory="$DSR_STATE_DIR/artifacts/run-conflict-tool-v1.0.0"
+    jq '.run_id = "33333333-3333-4333-8333-333333333333"' "$directory-manifest.json" > "$TEST_TMPDIR/conflicting-run.json"
+    mv "$TEST_TMPDIR/conflicting-run.json" "$directory-manifest.json"
+    directory="$DSR_STATE_DIR/artifacts/source-conflict-tool-v1.0.0"
+    jq '.source.git_sha = ("2" * 40)' "$directory-manifest.json" > "$TEST_TMPDIR/conflicting-source.json"
+    mv "$TEST_TMPDIR/conflicting-source.json" "$directory-manifest.json"
+    directory="$DSR_STATE_DIR/artifacts/malformed-identity-tool-v1.0.0"
+    jq '.run_id = [] | .source.git_sha = {}' "$directory-manifest.json" > "$TEST_TMPDIR/malformed-identity.json"
+    cp "$TEST_TMPDIR/malformed-identity.json" "$directory/malformed-identity-tool-v1.0.0-manifest.json"
+    cp "$TEST_TMPDIR/malformed-identity.json" "$directory-manifest.json"
+    printf '{"tool":' > "$DSR_STATE_DIR/artifacts/malformed-manifest-tool-v1.0.0/malformed-manifest-tool-v1.0.0-manifest.json"
+    for name in malformed-marker unbound-marker; do
+        seed_prune_artifact_set "$name-tool" v1.0.0
+        directories+=("$DSR_STATE_DIR/artifacts/$name-tool-v1.0.0")
+    done
+    printf '{"publication_schema":' > "$DSR_STATE_DIR/artifacts/malformed-marker-tool-v1.0.0/.dsr-build-purpose.json"
+    directory="$DSR_STATE_DIR/artifacts/unbound-marker-tool-v1.0.0"
+    jq '.manifest_sha256 = ("0" * 64)' "$directory/.dsr-build-purpose.json" > "$TEST_TMPDIR/unbound-marker.json"
+    mv "$TEST_TMPDIR/unbound-marker.json" "$directory/.dsr-build-purpose.json"
+    # Completed metadata cannot authorize pruning a custom output, a retained
+    # quarantine, or a worker's UUID directory under the artifact root.
+    for name in custom-output 44444444-4444-4444-8444-444444444444 worker-tool-v1.0.0.stale-20250101; do
+        seed_prune_artifact_set worker-tool v1.0.0
+        old_directory="$DSR_STATE_DIR/artifacts/worker-tool-v1.0.0"
+        directory="$DSR_STATE_DIR/artifacts/$name"
+        mv "$old_directory" "$directory"
+        mv "$old_directory-manifest.json" "$directory-manifest.json"
+        directories+=("$directory")
+    done
+    for directory in "${directories[@]}"; do
+        protected+=("$directory" "$directory-manifest.json")
+    done
+    seed_prune_artifact_set idle-tool v2.0.0
+    local idle="$DSR_STATE_DIR/artifacts/idle-tool-v2.0.0"
+    before=$(prune_tree_inventory "${protected[@]}")
+    exec_run "$DSR_CMD" --json prune --max-age 30 --keep-last 0 --force
+    after=$(prune_tree_inventory "${protected[@]}")
+    [[ "$(exec_status)" -eq 0 && "$before" == "$after" ]] || problems+=("unbound artifact bytes or identity changed")
+    for directory in "${directories[@]}"; do
+        prune_reported_artifact_retention "$directory" artifact_ownership || problems+=("ownership refusal missing for ${directory##*/}")
+        ! prune_reported_path "$directory" && ! prune_reported_path "$directory-manifest.json" || problems+=("unbound set reported as pruned: ${directory##*/}")
+    done
+    [[ ! -e "$idle" && ! -e "$idle-manifest.json" ]] &&
+        prune_reported_path "$idle" && prune_reported_path "$idle-manifest.json" || problems+=("unrelated completed artifact set was not removed")
+    prune_case_result "prune retains conflicting, malformed, unbound and noncanonical artifact ownership" "${problems[@]}"
+    harness_teardown
+}
+
+test_prune_completed_artifact_publication() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_minimal_config
+    seed_prune_artifact_set completed-tool v1.0.0 completed
+    seed_prune_artifact_set legacy-tool v1.0.0 legacy
+    local name directory problems=()
+    exec_run "$DSR_CMD" --json prune --max-age 30 --keep-last 0 --force
+    [[ "$(exec_status)" -eq 0 ]] || problems+=("prune failed")
+    for name in completed-tool-v1.0.0 legacy-tool-v1.0.0; do
+        directory="$DSR_STATE_DIR/artifacts/$name"
+        [[ ! -e "$directory" && ! -e "$directory-manifest.json" ]] &&
+            prune_reported_path "$directory" && prune_reported_path "$directory-manifest.json" || problems+=("eligible set was not removed: $name")
+    done
+    prune_case_result "prune removes completed manifest-bound and legacy canonical artifact sets" "${problems[@]}"
     harness_teardown
 }
 
@@ -981,6 +1204,16 @@ test_prune_retains_source_roots context
 test_prune_retains_source_roots history
 test_prune_retains_unverifiable_state
 test_prune_allows_explicit_no_sync_history
+
+echo ""
+echo "Artifact Custody and Publication Tests:"
+test_prune_holds_custody_until_removal_finishes artifact
+test_prune_artifact_build_custody coordinator v1.0.0
+test_prune_artifact_build_custody inherited v1.0.0
+test_prune_artifact_build_custody coordinator 1.0.0
+test_prune_retains_pending_artifact_publication
+test_prune_retains_unbound_artifact_ownership
+test_prune_completed_artifact_publication
 
 echo ""
 echo "Error Handling Tests:"

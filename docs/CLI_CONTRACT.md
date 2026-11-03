@@ -2069,6 +2069,29 @@ Artifact sets are `artifacts/<tool>-<tag>/` with their `<tool>-<tag>-manifest.js
 a set is published when `releases/<tool>-<tag>-upload.json` exists. The build run
 `latest` points to is always kept. The global `--dry-run` applies.
 
+Artifact pruning requires a regular manifest that is not a symbolic link at
+`artifacts/<tool>-<tag>/<tool>-<tag>-manifest.json` or the adjacent
+`artifacts/<tool>-<tag>-manifest.json`. Its tool and canonical version must match
+the set name; when both manifests exist, their owner and recorded run/source
+identities must agree. Custom, quarantined, worker UUID and other unidentified
+directories are retained. A build-purpose marker must describe completed,
+publishable release output and bind the internal manifest's digest, run ID and
+source commit. Pending or non-publishable output is retained even when an older
+manifest remains in the directory. Legacy sets without a purpose marker remain
+eligible when their manifest ownership is valid.
+
+For an eligible artifact set, prune acquires both the canonical tag lease and
+the possible unprefixed version lease, then verifies that the directory,
+manifests and purpose marker still match its initial observation. The leases
+remain held through removal of both the directory and adjacent manifest.
+Busy or unverifiable leases and changed observations retain the complete set.
+The age, per-tool keep-last and published-release retention policies still
+apply. `retained_artifact_paths` reports additional exclusions as `{path, reason}`:
+`build_custody` for unavailable leases, `publication_pending` for unfinished or
+non-publishable output, and `artifact_ownership` for unknown, conflicting or
+changed ownership evidence. The path identifies the directory, or the adjacent
+manifest when the directory is absent.
+
 Build checkpoint pruning acquires the same tool/version lease used by builds
 and holds it through selection and removal. Both the stored version and its
 canonical tag are covered when they differ, such as `1.2.3` and `v1.2.3`.
@@ -2092,8 +2115,12 @@ array of `{path, reason}` objects. `build_custody` identifies a busy or
 unverifiable build lease, `source_roots` identifies retained source references,
 and `invalid_state` identifies an unverifiable checkpoint or resume selection.
 These exclusions are successful skips; deletion or lease-release errors still
-produce a partial result. The ownership checks apply to build checkpoints;
-the existing artifact, log, manifest and cache retention policies are separate.
+produce a partial result. The build leases coordinate artifact/checkpoint
+cleanup with builds and fallback runs. Standalone release and native recovery
+operations use separate custody mechanisms. Custom outputs outside
+`state/artifacts`, logs, files in `state/manifests` and ordinary cache entries
+remain governed by their existing retention policies. These checks do not
+establish that every recorded recovery input is reclaimable.
 
 **Exit codes:**
 - `0`: Prune completed successfully

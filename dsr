@@ -14322,6 +14322,97 @@ _prune_log_file() {
 EOF
 }
 
+# Describe only the canonical artifact sets whose build lease can be named
+# from their manifests. Return 2 for unfinished/non-publishable output and 1
+# for unknown ownership. The observation is compared again under that lease
+# so a replacement generation cannot inherit an old set's pruning decision.
+_prune_artifact_snapshot() {
+    local directory="$1" set_name="${1##*/}"
+    local manifest marker="$1/.dsr-build-purpose.json"
+    local owner="" identity digest document current_owner tag
+    local directory_identity="" directory_mtime=0 marker_identity="" marker_digest=""
+    local marker_status observations='[]'
+
+    [[ ! -L "$directory" && ( ! -e "$directory" || -d "$directory" ) ]] || return 1
+    if [[ -d "$directory" ]]; then
+        directory_identity=$(_build_state_file_identity "$directory") || return 1
+        directory_mtime=$(_prune_mtime_epoch "$directory")
+    fi
+    if [[ -e "$marker" || -L "$marker" ]]; then
+        [[ -f "$marker" && ! -L "$marker" ]] || return 1
+        marker_identity=$(_build_state_file_identity "$marker") || return 1
+        marker_digest=$(_release_sha256 "$marker") || return 1
+        marker_status=$(jq -ers '
+            if length == 1 and (.[0] | type == "object" and
+                .publication_schema == 1 and (.publication_status | IN("pending", "completed")) and
+                (.build_purpose | type == "string" and length > 0) and
+                (.publishable | type == "boolean") and
+                (.run_id | type == "string" and test("^[0-9a-fA-F-]{36}$")) and
+                (.git_sha | type == "string" and test("^[0-9a-f]{40}$")))
+            then .[0] | if .publication_status == "pending" or .publishable != true or
+                .build_purpose != "release" then "pending" else "completed" end
+            else error("invalid publication receipt") end' "$marker" 2>/dev/null) || return 1
+        [[ "$marker_status" != pending ]] || return 2
+        _release_require_publishable_artifacts "$directory" \
+            "$directory/$set_name-manifest.json" false >/dev/null 2>&1 || return 1
+    fi
+
+    for manifest in "$directory/$set_name-manifest.json" "$directory-manifest.json"; do
+        [[ -e "$manifest" || -L "$manifest" ]] || continue
+        [[ -f "$manifest" && ! -L "$manifest" ]] || return 1
+        identity=$(_build_state_file_identity "$manifest") || return 1
+        digest=$(_release_sha256 "$manifest") || return 1
+        document=$(jq -ces '
+            def safe_name: type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$");
+            def optional_identity: . == null or (type == "string" and length > 0);
+            if length == 1 and (.[0] | type == "object" and
+                (.tool | safe_name) and (.version | safe_name) and
+                (.run_id | optional_identity) and
+                (.source == null or (.source | type == "object")) and
+                (.source.git_sha | optional_identity))
+            then .[0] else error("invalid artifact owner") end' "$manifest" 2>/dev/null) || return 1
+        # A failed/partial legacy manifest is not authority to discard output
+        # that a later build invocation may resume.
+        jq -e '(if has("status") then .status == "success" else true end) and
+            (if has("publishable") then .publishable == true else true end) and
+            (if has("build_purpose") then .build_purpose == "release" else true end)' \
+            <<< "$document" >/dev/null || return 2
+        tag=$(git_ops_version_to_tag "$(jq -r '.version' <<< "$document")") || return 1
+        [[ "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$ &&
+           "$set_name" == "$(jq -r '.tool' <<< "$document")-$tag" ]] || return 1
+        current_owner=$(jq -c --arg tag "$tag" \
+            '{tool,tag:$tag,run_id:(.run_id // null),git_sha:(.source.git_sha // null)}' \
+            <<< "$document") || return 1
+        [[ -z "$owner" || "$owner" == "$current_owner" ]] || return 1
+        owner="$current_owner"
+        [[ ! -L "$manifest" && "$identity" == "$(_build_state_file_identity "$manifest")" &&
+           "$digest" == "$(_release_sha256 "$manifest")" ]] || return 1
+        observations=$(jq -nc --argjson entries "$observations" --arg path "$manifest" \
+            --arg identity "$identity" --arg digest "$digest" \
+            '$entries + [{path:$path,identity:$identity,sha256:$digest}]') || return 1
+        [[ -n "$directory_identity" ]] || directory_mtime=$(_prune_mtime_epoch "$manifest")
+    done
+    [[ -n "$owner" ]] || return 1
+    if [[ -n "$directory_identity" ]]; then
+        [[ -d "$directory" && ! -L "$directory" &&
+           "$directory_identity" == "$(_build_state_file_identity "$directory")" &&
+           "$directory_mtime" == "$(_prune_mtime_epoch "$directory")" ]] || return 1
+    else
+        [[ ! -e "$directory" && ! -L "$directory" ]] || return 1
+    fi
+    if [[ -n "$marker_identity" ]]; then
+        [[ ! -L "$marker" && "$marker_identity" == "$(_build_state_file_identity "$marker")" &&
+           "$marker_digest" == "$(_release_sha256 "$marker")" ]] || return 1
+    else
+        [[ ! -e "$marker" && ! -L "$marker" ]] || return 1
+    fi
+    jq -nc --argjson owner "$owner" --argjson manifests "$observations" \
+        --arg directory_identity "$directory_identity" --argjson mtime "$directory_mtime" \
+        --arg marker_identity "$marker_identity" --arg marker_digest "$marker_digest" \
+        '$owner + {manifests:$manifests,directory_identity:$directory_identity,mtime:$mtime,
+          marker_identity:$marker_identity,marker_sha256:$marker_digest}'
+}
+
 cmd_prune() {
     # Keep build-custody descriptors and signal cleanup inside this invocation.
     (
@@ -14377,7 +14468,8 @@ OPTIONS:
 
 A build run that `latest` points to is always kept (it is what resume uses).
 Build checkpoints with retained source roots or unverifiable state are kept.
-Busy or unverifiable build leases also prevent checkpoint pruning.
+Busy or unverifiable build leases prevent artifact-set and checkpoint pruning.
+Unfinished artifact sets and outputs with unknown ownership are kept.
 
 EXAMPLES:
     dsr prune --dry-run
@@ -14440,6 +14532,54 @@ EOF
     local pruned_items=()
     local errors=()
     local retained_build_paths=()
+    local retained_artifact_paths=()
+
+    # Artifact sets and checkpoints share the build's inherited kernel lease.
+    # Keep the descriptor registry in this shell until each complete removal
+    # finishes; a subshell acquisition would release custody too early.
+    if [[ -d "$state_dir/artifacts" || -d "$state_dir/builds" ]]; then
+        _dsr_require build_state || return 3
+        _dsr_require git_ops || return 3
+    fi
+    local _BUILD_STATE_DIR="$state_dir/builds"
+    local lease_tool="" custody_failed=false
+    local -a acquired_versions=()
+    _prune_acquire_build_leases() {
+        lease_tool="$1"
+        shift
+        local lease_version lease_rc
+        acquired_versions=()
+        for lease_version in "$@"; do
+            if $dry_run; then
+                _build_lock_probe "$_BUILD_STATE_DIR/$lease_tool/$lease_version/.lock" || return $?
+            elif build_lock_acquire "$lease_tool" "$lease_version"; then
+                acquired_versions+=("$lease_version")
+                trap '_prune_release_build_leases >&2' EXIT
+            else
+                lease_rc=$?
+                return "$lease_rc"
+            fi
+        done
+    }
+    _prune_release_build_leases() {
+        local held_version release_status=0
+        for held_version in ${acquired_versions[@]+"${acquired_versions[@]}"}; do
+            build_lock_release "$lease_tool" "$held_version" || release_status=1
+        done
+        if [[ "$release_status" == 0 ]]; then
+            acquired_versions=()
+            trap - EXIT
+        fi
+        return "$release_status"
+    }
+    trap 'exit 5' HUP INT TERM
+
+    _prune_retain_artifact() {
+        local path="$1" reason="$2"
+        retained_artifact_paths+=("$(jq -nc --arg path "$path" --arg reason "$reason" \
+            '{path:$path,reason:$reason}')")
+        $JSON_MODE || log_info "Retaining artifact set: $path ($reason)"
+    }
 
     _prune_retain_build() {
         local path="$1" reason="$2"
@@ -14526,34 +14666,37 @@ EOF
     # published, recorded as releases/<tool>-<tag>-upload.json.
     local kept_for_releases=0
     if [[ -d "$state_dir/artifacts" ]]; then
-        local entry set_name set_tool set_manifest set_mtime
-        local -A set_seen=() set_group=() set_time=()
+        local entry set_name set_directory set_path set_mtime set_snapshot snapshot_rc
+        local -A set_seen=() set_group=() set_time=() set_observation=()
         while IFS= read -r -d '' entry; do
             set_name="${entry##*/}"
-            [[ -f "$entry" && "$set_name" == *-manifest.json ]] && set_name="${set_name%-manifest.json}"
-            [[ -d "$entry" || -f "$entry" ]] || continue
+            [[ ! -d "$entry" && "$set_name" == *-manifest.json ]] && set_name="${set_name%-manifest.json}"
+            if [[ -z "$set_name" ]]; then
+                _prune_retain_artifact "$entry" artifact_ownership
+                continue
+            fi
             [[ -z "${set_seen[$set_name]:-}" ]] || continue
             set_seen["$set_name"]=1
-            set_tool=""
-            for set_manifest in "$state_dir/artifacts/$set_name-manifest.json" \
-                "$state_dir/artifacts/$set_name"/*-manifest.json; do
-                [[ -f "$set_manifest" && ! -L "$set_manifest" ]] || continue
-                set_tool=$(jq -r '.tool // empty | strings' "$set_manifest" 2>/dev/null) && [[ -n "$set_tool" ]] && break
-            done
-            if [[ -z "$set_tool" && "$set_name" =~ ^(.+)-v?[0-9]+\.[0-9]+ ]]; then
-                set_tool="${BASH_REMATCH[1]}"
-            fi
-            set_group["$set_name"]="${set_tool:-$set_name}"
-            if [[ -e "$state_dir/artifacts/$set_name" ]]; then
-                set_mtime=$(_prune_mtime_epoch "$state_dir/artifacts/$set_name")
+            set_directory="$state_dir/artifacts/$set_name"
+            set_path="$set_directory"
+            [[ -e "$set_path" || -L "$set_path" ]] || set_path="$set_directory-manifest.json"
+            if set_snapshot=$(_prune_artifact_snapshot "$set_directory"); then
+                set_group["$set_name"]=$(jq -r '.tool' <<< "$set_snapshot")
+                set_time["$set_name"]=$(jq -r '.mtime' <<< "$set_snapshot")
+                set_observation["$set_name"]="$set_snapshot"
             else
-                set_mtime=$(_prune_mtime_epoch "$state_dir/artifacts/$set_name-manifest.json")
+                snapshot_rc=$?
+                if [[ "$snapshot_rc" == 2 ]]; then
+                    _prune_retain_artifact "$set_path" publication_pending
+                else
+                    _prune_retain_artifact "$set_path" artifact_ownership
+                fi
             fi
-            set_time["$set_name"]="$set_mtime"
-        done < <(find "$state_dir/artifacts" -mindepth 1 -maxdepth 1 \( -type d -o -type f \) -print0 2>/dev/null)
+        done < <(find "$state_dir/artifacts" -mindepth 1 -maxdepth 1 \( -type d -o -type f -o -type l \) -print0 2>/dev/null)
 
         local -A group_kept=()
-        local group
+        local group artifact_tag artifact_ok
+        local -a artifact_leases=()
         while IFS=' ' read -r set_mtime set_name; do
             [[ -n "$set_name" ]] || continue
             group="${set_group[$set_name]}"
@@ -14564,10 +14707,53 @@ EOF
                 kept_for_releases=$((kept_for_releases + 1))
                 continue
             fi
-            [[ -d "$state_dir/artifacts/$set_name" && ! -L "$state_dir/artifacts/$set_name" ]] &&
-                _prune_consider "$state_dir/artifacts/$set_name"
-            [[ -f "$state_dir/artifacts/$set_name-manifest.json" ]] &&
-                _prune_consider "$state_dir/artifacts/$set_name-manifest.json"
+            set_directory="$state_dir/artifacts/$set_name"
+            set_path="$set_directory"
+            [[ -e "$set_path" || -L "$set_path" ]] || set_path="$set_directory-manifest.json"
+            artifact_tag=$(jq -r '.tag' <<< "${set_observation[$set_name]}")
+            artifact_leases=("$artifact_tag")
+            # Manifests normalize away the original version spelling. Cover
+            # both possible checkpoint namespaces, even with a v-prefixed
+            # manifest, and always take the canonical lease first.
+            [[ ! "${artifact_tag#v}" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$ ]] ||
+                artifact_leases+=("${artifact_tag#v}")
+            artifact_ok=true
+            if ! _prune_acquire_build_leases "$group" "${artifact_leases[@]}"; then
+                _prune_retain_artifact "$set_path" build_custody
+                artifact_ok=false
+            elif set_snapshot=$(_prune_artifact_snapshot "$set_directory"); then
+                if [[ "$set_snapshot" != "${set_observation[$set_name]}" ]]; then
+                    _prune_retain_artifact "$set_path" artifact_ownership
+                    artifact_ok=false
+                fi
+            else
+                snapshot_rc=$?
+                if [[ "$snapshot_rc" == 2 ]]; then
+                    _prune_retain_artifact "$set_path" publication_pending
+                else
+                    _prune_retain_artifact "$set_path" artifact_ownership
+                fi
+                artifact_ok=false
+            fi
+            if $artifact_ok; then
+                if $keep_releases && [[ -e "$state_dir/releases/$set_name-upload.json" ]]; then
+                    kept_for_releases=$((kept_for_releases + 1))
+                else
+                    if [[ -d "$set_directory" ]]; then
+                        _prune_consider "$set_directory" || artifact_ok=false
+                    fi
+                    # Preserve the sidecar if directory removal failed, and
+                    # retain custody until both members have been removed.
+                    if $artifact_ok && [[ -f "$set_directory-manifest.json" ]]; then
+                        _prune_consider "$set_directory-manifest.json"
+                    fi
+                fi
+            fi
+            if ! _prune_release_build_leases; then
+                _prune_error E051 "Build custody changed during artifact pruning" "$set_path"
+                custody_failed=true
+                break
+            fi
         done < <(for set_name in "${!set_time[@]}"; do
                      printf '%s %s\n' "${set_time[$set_name]}" "$set_name"
                  done | sort -rn)
@@ -14578,23 +14764,10 @@ EOF
     # build before selecting or removing checkpoints. Source-root references
     # must outlive their protected snapshots; ordinary pruning cannot reclaim
     # those external caches or discard the only record of their ownership.
-    if [[ -d "$state_dir/builds" ]]; then
-        _dsr_require build_state
-        _dsr_require git_ops
-        # Do not initialize directories during dry-run, or reuse a caller's
-        # module root when this command selected a different state directory.
-        local _BUILD_STATE_DIR="$state_dir/builds"
-        local tool_dir version_dir latest_run tool version tag lease_version
-        local lease_rc state checkpoint_ok
-        local -a lease_versions=() acquired_versions=()
-        _prune_release_build_leases() {
-            local held_version release_status=0
-            for held_version in ${acquired_versions[@]+"${acquired_versions[@]}"}; do
-                build_lock_release "$tool" "$held_version" || release_status=1
-            done
-            return "$release_status"
-        }
-        trap 'exit 5' HUP INT TERM
+    if ! $custody_failed && [[ -d "$state_dir/builds" ]]; then
+        local tool_dir version_dir latest_run tool version tag
+        local state checkpoint_ok
+        local -a lease_versions=()
         for tool_dir in "$state_dir/builds"/*; do
             [[ -d "$tool_dir" && ! -L "$tool_dir" ]] || continue
             for version_dir in "$tool_dir"/*; do
@@ -14611,20 +14784,8 @@ EOF
                 # its checkpoint namespace. Both must be free and held here.
                 lease_versions=("$tag")
                 [[ "$tag" == "$version" ]] || lease_versions+=("$version")
-                acquired_versions=() lease_rc=0
-                for lease_version in "${lease_versions[@]}"; do
-                    if $dry_run; then
-                        _build_lock_probe "$tool_dir/$lease_version/.lock" || lease_rc=$?
-                    elif build_lock_acquire "$tool" "$lease_version"; then
-                        acquired_versions+=("$lease_version")
-                        trap '_prune_release_build_leases >&2' EXIT
-                    else
-                        lease_rc=$?
-                    fi
-                    [[ "$lease_rc" == 0 ]] || break
-                done
                 checkpoint_ok=true
-                if [[ "$lease_rc" != 0 ]]; then
+                if ! _prune_acquire_build_leases "$tool" "${lease_versions[@]}"; then
                     _prune_retain_build "$version_dir" build_custody
                     checkpoint_ok=false
                 fi
@@ -14688,24 +14849,25 @@ EOF
                     _prune_error E051 "Build custody changed during checkpoint pruning" "$version_dir"
                     # Leave EXIT cleanup armed and do not admit another
                     # version after losing a held lease's identity.
+                    custody_failed=true
                     break 2
                 fi
-                trap - EXIT
             done
         done
     fi
 
     # Prune cache entries
-    if [[ -d "$cache_dir" ]]; then
+    if ! $custody_failed && [[ -d "$cache_dir" ]]; then
         while IFS= read -r path; do
             _prune_consider "$path"
         done < <(find "$cache_dir" -mindepth 1 -maxdepth 1 -mtime +"$max_age_days" 2>/dev/null)
     fi
 
-    local pruned_json errors_json retained_build_json details_json
+    local pruned_json errors_json retained_build_json retained_artifact_json details_json
     pruned_json=$(printf '%s\n' "${pruned_items[@]}" | jq -sc '.' 2>/dev/null || echo "[]")
     errors_json=$(printf '%s\n' "${errors[@]}" | jq -sc '.' 2>/dev/null || echo "[]")
     retained_build_json=$(printf '%s\n' ${retained_build_paths[@]+"${retained_build_paths[@]}"} | jq -sc '.')
+    retained_artifact_json=$(printf '%s\n' ${retained_artifact_paths[@]+"${retained_artifact_paths[@]}"} | jq -sc '.')
 
     local status="success"
     local exit_code=0
@@ -14726,11 +14888,13 @@ EOF
             --argjson bytes_freed "$bytes_freed" \
             --argjson pruned_paths "$pruned_json" \
             --argjson retained_build_paths "$retained_build_json" \
+            --argjson retained_artifact_paths "$retained_artifact_json" \
             --argjson errors "$errors_json" \
             '{state_dir: $state_dir, dry_run: $dry_run, cutoff_days: $cutoff_days, keep_last: $keep_last,
               keep_releases: $keep_releases, kept_for_releases: $kept_for_releases,
               pruned_count: $pruned_count, bytes_freed: $bytes_freed, pruned_paths: $pruned_paths,
-              retained_build_paths: $retained_build_paths, errors: $errors}')
+              retained_build_paths: $retained_build_paths, retained_artifact_paths: $retained_artifact_paths,
+              errors: $errors}')
         json_envelope "prune" "$status" "$exit_code" "$details_json"
     else
         if $dry_run; then

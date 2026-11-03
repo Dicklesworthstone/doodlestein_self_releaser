@@ -53,6 +53,11 @@
       "items": { "$ref": "#/$defs/retained_build_item" },
       "description": "Build checkpoints or version directories excluded by ownership and state checks, in addition to ordinary age, latest and keep-last retention"
     },
+    "retained_artifact_paths": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/retained_artifact_item" },
+      "description": "Artifact directories or adjacent manifests retained because build custody, publication completion or canonical ownership could not be established"
+    },
     "errors": {
       "type": "array",
       "items": { "$ref": "#/$defs/prune_error" },
@@ -60,6 +65,18 @@
     }
   },
   "$defs": {
+    "retained_artifact_item": {
+      "type": "object",
+      "required": ["path", "reason"],
+      "properties": {
+        "path": { "type": "string" },
+        "reason": {
+          "type": "string",
+          "enum": ["build_custody", "artifact_ownership", "publication_pending"]
+        }
+      },
+      "additionalProperties": false
+    },
     "retained_build_item": {
       "type": "object",
       "required": ["path", "reason"],
