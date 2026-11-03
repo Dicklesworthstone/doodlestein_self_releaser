@@ -781,9 +781,14 @@ The approval file is a regular JSON file with these required fields:
   "prior_repo_config_path": "/path/to/retained-original-repo.yaml",
   "prior_repo_config_sha256": "<original-invocation-config-sha256>",
   "repo_config_sha256": "<reviewed-current-repo-config-sha256>",
-  "hosts_config_sha256": "<reviewed-hosts.yaml-sha256>"
+  "hosts_config_sha256": "<reviewed-active-hosts-config-sha256>"
 }
 ```
+
+`hosts_config_sha256` binds the active host configuration selected by
+`DSR_HOSTS_FILE`, falling back to `${DSR_CONFIG_DIR:-$HOME/.config/dsr}/hosts.yaml`
+when that override is empty or unset. Relocation staging and subsequent retries
+recheck this same configuration. Changed bytes prevent an ordinary resume.
 
 The operator must establish the prior config's provenance from the original
 invocation receipt. DSR checks actual file hashes and permits only the selected

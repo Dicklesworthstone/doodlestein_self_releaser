@@ -2077,7 +2077,7 @@ test_relocation_recovery() {
             return 77
         }
     done
-    python3 - "$project_root" <<'PY'
+    python3 - "$project_root" "${1:-all}" <<'PY'
 from collections import Counter
 import hashlib
 import json
@@ -2089,6 +2089,7 @@ import sys
 import tempfile
 
 project = Path(os.environ.get('DSR_TEST_RELOCATION_PROJECT', sys.argv[1]))
+hosts_only = sys.argv[2] == '--relocation-hosts-only'
 root = Path(tempfile.mkdtemp(prefix='dsr-relocation-recovery-'))
 print('Retained relocation recovery evidence: ' + str(root), flush=True)
 systems = {'Linux': 'linux', 'Darwin': 'darwin'}
@@ -2157,6 +2158,18 @@ if [[ "$RELOC_MODE" == timeout && "$RELOC_PHASE" == first ]]; then
         act_run_native_build "$@"
     )
 fi
+if [[ "${RELOC_MUTATE_HOSTS_AFTER_SYNC:-0}" == 1 && "$RELOC_PHASE" != first ]]; then
+    act_sync_sources() (
+        # Execute real immutable staging, then model a concurrent edit of the
+        # active hosts configuration before relocation commits its checkpoint.
+        source "$RELOC_PROJECT/src/act_runner.sh" || exit 1
+        local sync_result
+        sync_result=$(act_sync_sources "$@") || exit $?
+        printf '%s\n' "$sync_result" > "$RELOC_CASE/sync-before-host-drift.json" || exit 1
+        yq -i '.hosts.replacement.concurrency = 3' "$DSR_HOSTS_FILE" || exit 1
+        printf '%s\n' "$sync_result"
+    )
+fi
 if [[ "$RELOC_PHASE" == compare ]]; then
     _act_relocation_receipt_matches "$RELOC_CASE/large-worker.json" "$(cat "$RELOC_CASE/large-state.json")"
     exit $?
@@ -2176,14 +2189,17 @@ if [[ "$RELOC_PHASE" == spoof ]]; then
 fi
 args=(--version 1.0.0 --jobs 2 --output-dir "$RELOC_CASE/output")
 if [[ "$RELOC_PHASE" != first ]]; then
-    args+=(--resume="$RELOC_RUN" --resume-target-host "$RELOC_REQUEST"
-           --resume-target-host-approval "$RELOC_CASE/approval.json")
+    args+=(--resume="$RELOC_RUN")
+    if [[ "$RELOC_PHASE" != ordinary-resume ]]; then
+        args+=(--resume-target-host "$RELOC_REQUEST"
+               --resume-target-host-approval "$RELOC_CASE/approval.json")
+    fi
 fi
 cmd_build relocfixture "${args[@]}"
 ''')
 
 
-def fixture(name, mode, sequential=False):
+def fixture(name, mode, sequential=False, hosts_mode='default'):
     case = root / name
     for directory in ('config/repos.d', 'source', 'state', 'cache'):
         (case / directory).mkdir(parents=True)
@@ -2210,10 +2226,13 @@ go build -buildvcs=false -trimpath -o "$binary" .
     sha = subprocess.check_output(['git', '-C', str(case / 'source'), 'rev-parse', 'HEAD'], text=True).strip()
     (case / 'config/config.yaml').write_text('schema_version: "1.0.0"\n')
     (case / 'config/repos.yaml').write_text('tools: {}\n')
-    save(case / 'config/hosts.yaml', dict(schema_version='1.0.0', hosts={
+    hosts_path = case / ('config/hosts.yaml' if hosts_mode == 'default' else 'active hosts.yaml')
+    save(hosts_path, dict(schema_version='1.0.0', hosts={
         host: dict(platform=native, connection='local', concurrency=2, build_root=str(case / host))
         for host in ('completed', 'original', 'replacement', 'second')},
         platform_mapping={target: 'completed' if target == native else 'original' for target in targets}))
+    if hosts_mode == 'custom-mirrored':
+        (case / 'config/hosts.yaml').write_bytes(hosts_path.read_bytes())
     names = {target: 'relocfixture-' + target.replace('/', '-') + ('.exe' if target.startswith('windows/') else '')
              for target in targets}
     config = dict(tool_name='relocfixture', repo='fixture/relocfixture', local_path=str(case / 'source'),
@@ -2230,7 +2249,7 @@ go build -buildvcs=false -trimpath -o "$binary" .
     env = dict(os.environ, RELOC_PROJECT=str(project), RELOC_CASE=str(case), RELOC_MODE=mode,
         RELOC_FAILED_TARGET=failed, RELOC_SHA=sha, DSR_CONFIG_DIR=str(case / 'config'),
         DSR_CONFIG_FILE=str(case / 'config/config.yaml'), DSR_REPOS_FILE=str(case / 'config/repos.yaml'),
-        DSR_HOSTS_FILE=str(case / 'config/hosts.yaml'), DSR_STATE_DIR=str(case / 'state'),
+        DSR_HOSTS_FILE=str(hosts_path), DSR_STATE_DIR=str(case / 'state'),
         DSR_CACHE_DIR=str(case / 'cache'), ACT_CONFIG_DIR=str(case / 'config'),
         ACT_REPOS_DIR=str(case / 'config/repos.d'), ACT_LOGS_DIR=str(case / 'logs'),
         ACT_ARTIFACTS_DIR=str(case / 'artifacts'), DSR_DISABLE_HOST_SELECTOR='1', DSR_RETRY_MAX='4',
@@ -2275,8 +2294,8 @@ def scheduled(state, target):
                 host=host, root=state['context']['source_roots'][host])
 
 
-def seed(name, mode, sequential=False):
-    case, env, targets = fixture(name, mode, sequential)
+def seed(name, mode, sequential=False, hosts_mode='default'):
+    case, env, targets = fixture(name, mode, sequential, hosts_mode)
     code, value = invoke(case, env, 'first')
     details = value.get('details', {})
     if not check(name + ': real build retains one completed sibling and actual failed targets',
@@ -2313,7 +2332,7 @@ def approve(case, env, target, replacement, label):
     save(config_path, config)
     save(case / 'approval.json', dict(run_id=env['RELOC_RUN'], target=target, new_host=replacement,
         prior_repo_config_path=str(prior), prior_repo_config_sha256=digest(prior),
-        repo_config_sha256=digest(config_path), hosts_config_sha256=digest(case / 'config/hosts.yaml')))
+        repo_config_sha256=digest(config_path), hosts_config_sha256=digest(Path(env['DSR_HOSTS_FILE']))))
     env['RELOC_REQUEST'] = target + '=' + replacement
 
 
@@ -2365,7 +2384,7 @@ def mutate_evidence(transform):
     return change
 
 
-for mode in ('capacity', 'readiness', 'executed', 'timeout'):
+for mode in (() if hosts_only else ('capacity', 'readiness', 'executed', 'timeout')):
     case, env, targets, initial = seed(mode, mode)
     evidence = retained(initial)
     approve(case, env, failed, 'replacement', 'replacement')
@@ -2454,40 +2473,118 @@ for mode in ('capacity', 'readiness', 'executed', 'timeout'):
           manifest_value.get('summary') == dict(total=2, success=2, failed=0) and
           all(digest(case / 'output' / row['name']) == row['sha256'] for row in manifest_value.get('artifacts', [])))
 
-# Two failed targets can move in successive reviewed invocations. The second
-# approval binds the first relocation's configuration, and neither completed
-# target is compiled again while the remaining target advances to attempt 3.
-case, env, targets, initial = seed('sequential', 'executed', True)
-evidence = retained(initial)
-approve(case, env, failed, 'replacement', 'first-relocation')
-(case / 'failures').write_text('windows/amd64\n')
-code, result = invoke(case, env, 'resume', 'first-relocation')
-middle = read(state_file(case, env['RELOC_RUN']))
-check('first sequential relocation retains partial outcome of the other failed target',
-      code == 1 and middle['status'] == 'partial' and
-      middle['target_statuses'][failed]['status'] == 'completed' and
-      middle['target_statuses']['windows/amd64']['status'] == 'failed')
-middle_evidence = retained(middle)
-approve(case, env, 'windows/amd64', 'second', 'second-relocation')
-(case / 'failures').write_text('')
-before = events(case)
-code, result = invoke(case, env, 'resume', 'second-relocation')
-final = read(state_file(case, env['RELOC_RUN']))
-check('second sequential relocation completes only the remaining target in the same run',
-      code == 0 and final['run_id'] == initial['run_id'] and final['status'] == 'completed' and
-      events(case) == before + ['windows/amd64'] and
-      final['target_statuses']['windows/amd64']['attempts'] == 3 and
-      final['target_statuses'][native] == initial['target_statuses'][native] and
-      final['target_statuses'][failed] == middle['target_statuses'][failed] and
-      len(final.get('relocations', [])) == 2 and unchanged(evidence) and unchanged(middle_evidence))
+if not hosts_only:
+    # Two failed targets can move in successive reviewed invocations. The second
+    # approval binds the first relocation's configuration, and neither completed
+    # target is compiled again while the remaining target advances to attempt 3.
+    case, env, targets, initial = seed('sequential', 'executed', True)
+    evidence = retained(initial)
+    approve(case, env, failed, 'replacement', 'first-relocation')
+    (case / 'failures').write_text('windows/amd64\n')
+    code, result = invoke(case, env, 'resume', 'first-relocation')
+    middle = read(state_file(case, env['RELOC_RUN']))
+    check('first sequential relocation retains partial outcome of the other failed target',
+          code == 1 and middle['status'] == 'partial' and
+          middle['target_statuses'][failed]['status'] == 'completed' and
+          middle['target_statuses']['windows/amd64']['status'] == 'failed')
+    middle_evidence = retained(middle)
+    approve(case, env, 'windows/amd64', 'second', 'second-relocation')
+    (case / 'failures').write_text('')
+    before = events(case)
+    code, result = invoke(case, env, 'resume', 'second-relocation')
+    final = read(state_file(case, env['RELOC_RUN']))
+    check('second sequential relocation completes only the remaining target in the same run',
+          code == 0 and final['run_id'] == initial['run_id'] and final['status'] == 'completed' and
+          events(case) == before + ['windows/amd64'] and
+          final['target_statuses']['windows/amd64']['attempts'] == 3 and
+          final['target_statuses'][native] == initial['target_statuses'][native] and
+          final['target_statuses'][failed] == middle['target_statuses'][failed] and
+          len(final.get('relocations', [])) == 2 and unchanged(evidence) and unchanged(middle_evidence))
+
+# Host selection, health and transport honor DSR_HOSTS_FILE. Approval and later
+# resume must bind those same bytes, even when an unrelated default file exists.
+for hosts_mode in ('default', 'custom-absent'):
+    case, env, targets, initial = seed('hosts-' + hosts_mode, 'executed', hosts_mode=hosts_mode)
+    evidence, before_events = retained(initial), events(case)
+    approve(case, env, failed, 'replacement', 'relocation')
+    active_hosts = Path(env['DSR_HOSTS_FILE'])
+    reviewed_hash = digest(active_hosts)
+    if hosts_mode == 'default':
+        env.pop('DSR_HOSTS_FILE')  # The supported default remains a valid authority.
+        (case / 'failures').write_text('')
+    code, value = invoke(case, env, 'resume')
+    state = read(state_file(case, env['RELOC_RUN']))
+    relocated = check(hosts_mode + ': reviewed active hosts configuration permits real relocation',
+        code == (0 if hosts_mode == 'default' else 1) and
+        state['status'] == ('completed' if hosts_mode == 'default' else 'partial') and
+        state['context']['target_hosts'][failed] == 'replacement' and
+        state.get('relocations', [{}])[-1].get('hosts_config_sha256') == reviewed_hash and
+        events(case) == before_events + [failed] and unchanged(evidence))
+    if hosts_mode == 'custom-absent':
+        check('custom hosts relocation does not require or create the default hosts file',
+              not (case / 'config/hosts.yaml').exists())
+        if relocated:
+            # Content identity permits another path to the same reviewed bytes.
+            alias = case / 'active hosts alias.yaml'
+            alias.symlink_to(active_hosts)
+            env['DSR_HOSTS_FILE'] = str(alias)
+            (case / 'config/hosts.yaml').write_text('unrelated inactive configuration\n')
+            before_events = events(case)
+            partial_evidence = retained(state)
+            (case / 'failures').write_text('')
+            code, value = invoke(case, env, 'ordinary-resume', 'same-hosts-alias')
+            check('ordinary resume accepts an alias of reviewed hosts bytes and ignores inactive default drift',
+                  code == 0 and events(case) == before_events + [failed] and unchanged(partial_evidence) and
+                  read(state_file(case, env['RELOC_RUN']))['status'] == 'completed' and
+                  read(state_file(case, env['RELOC_RUN']))['target_statuses'][failed]['attempts'] == 3)
+
+for timing in ('before-sync', 'after-sync', 'ordinary-resume'):
+    case, env, targets, initial = seed('hosts-drift-' + timing, 'executed', hosts_mode='custom-mirrored')
+    approve(case, env, failed, 'replacement', 'relocation')
+    active_hosts, default_hosts = Path(env['DSR_HOSTS_FILE']), case / 'config/hosts.yaml'
+    approved_hash = digest(default_hosts)
+    if timing == 'ordinary-resume':
+        # Keep the replacement's recipe failing so a later ordinary retry has
+        # real pending work and a persisted, approved relocation to protect.
+        code, value = invoke(case, env, 'resume', 'retained-relocation')
+        partial = read(state_file(case, env['RELOC_RUN']))
+        check('host drift fixture retains a real failed replacement attempt and reviewed relocation',
+              code == 1 and partial['status'] == 'partial' and
+              partial['target_statuses'][failed]['attempts'] == 2 and
+              partial.get('relocations', [{}])[-1].get('hosts_config_sha256') == approved_hash)
+    path = state_file(case, env['RELOC_RUN'])
+    before_state, before_events = path.read_bytes(), events(case)
+    evidence = retained(read(path))
+    if timing == 'after-sync':
+        env['RELOC_MUTATE_HOSTS_AFTER_SYNC'] = '1'
+    else:
+        hosts = read(active_hosts)
+        hosts['hosts']['replacement']['concurrency'] = 3
+        save(active_hosts, hosts)
+    (case / 'failures').write_text('')
+    phase = 'ordinary-resume' if timing == 'ordinary-resume' else 'resume'
+    code, value = invoke(case, env, phase, 'changed-active-hosts', preflight_exit=4)
+    check(timing + ': changed active hosts refuse without another recipe or checkpoint transition',
+          code == 4 and path.read_bytes() == before_state and events(case) == before_events and
+          unchanged(evidence) and digest(default_hosts) == approved_hash and digest(active_hosts) != approved_hash)
+    if timing == 'before-sync':
+        check('unreviewed active hosts are refused before replacement source staging',
+              not (case / 'replacement').exists())
+    elif timing == 'after-sync':
+        sync_path = case / 'sync-before-host-drift.json'
+        staged = read(sync_path) if sync_path.exists() else {}
+        check('post-staging active hosts drift is checked after genuine immutable source synchronization',
+              staged.get('status') == 'success' and staged.get('target_hosts') == {failed: 'replacement'} and
+              all(Path(path).is_dir() for path in staged.get('source_roots', {}).values()))
+
 (root / 'summary.json').write_text(json.dumps(dict(checks=checks, failures=failures, native=native)) + '\n')
 print('Relocation recovery: %d checks, %d failures' % (checks, failures), flush=True)
 raise SystemExit(bool(failures))
 PY
 }
 
-if [[ "${1:-}" == --relocation-recovery-only ]]; then
-    test_relocation_recovery
+if [[ "${1:-}" == --relocation-recovery-only || "${1:-}" == --relocation-hosts-only ]]; then
+    test_relocation_recovery "$1"
     exit $?
 fi
 

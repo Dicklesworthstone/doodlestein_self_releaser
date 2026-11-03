@@ -13918,7 +13918,10 @@ _act_relocation_receipt_matches() {
 _act_relocate_failed_target() {
     local tool="$1" version="$2" run_id="$3" before="$4" request="$5" approval_file="$6"
     local target="${request%%=*}" host="${request#*=}" old_host configured_host host_platform
-    local config_file="$ACT_REPOS_DIR/${tool}.yaml" hosts_file="${DSR_CONFIG_DIR:-$HOME/.config/dsr}/hosts.yaml"
+    local config_file="$ACT_REPOS_DIR/${tool}.yaml"
+    # Bind the configuration used by host selection, readiness and transport.
+    # An inactive default file cannot authorize changes to an override file.
+    local hosts_file="${DSR_HOSTS_FILE:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/hosts.yaml}"
     local entry result result_path sync_json roots hosts receipt repo_hash hosts_hash
     local prior_result prior_log result_hash log_hash
     local approval prior_config prior_config_hash prior_json current_json projection
@@ -14587,7 +14590,7 @@ act_orchestrate_build() {
                 <<< "$resume_state" >/dev/null; then
                 if [[ "$(_act_sha256 "$ACT_REPOS_DIR/${tool_name}.yaml")" != \
                       "$(jq -r '.relocations[-1].repo_config_sha256' <<< "$resume_state")" ||
-                      "$(_act_sha256 "${DSR_CONFIG_DIR:-$HOME/.config/dsr}/hosts.yaml")" != \
+                      "$(_act_sha256 "${DSR_HOSTS_FILE:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/hosts.yaml}")" != \
                       "$(jq -r '.relocations[-1].hosts_config_sha256' <<< "$resume_state")" ]]; then
                     _log_error "Configuration changed after the approved relocation"
                     _act_release_orchestration_lock
