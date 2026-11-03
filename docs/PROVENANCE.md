@@ -28,6 +28,17 @@ does not invent a build start time. The complete manifest is bound by SHA256;
 private environment values and build-local paths are not copied into the public
 statement. Retain the original manifest bytes to audit that evidence.
 
+Each artifact's recorded `target_triple` is also retained in the public
+`dsr_evidence.artifacts` entry, including installer aliases. This applies to
+ordinary singleton builds and to one act workflow producing several GNU/musl
+variants; a `required_variants` plan is not needed to preserve that identity.
+Build task counts still follow the recorded execution: several workflow
+artifacts do not create additional native tasks. A producer that omitted a
+compiler identity remains untyped. These fields describe producer evidence,
+not an independent inspection of the executable ABI. Signed snapshot installers
+can therefore compare an explicit compiler recipe with each artifact's signed
+identity and refuse ambiguous or mixed compiler selections.
+
 The core manifest schema does not require repository ownership. `--repository`
 therefore supplies an explicit `owner/repo` binding, recorded as caller-supplied.
 When `source.repository` is present, it must match that selection as either
