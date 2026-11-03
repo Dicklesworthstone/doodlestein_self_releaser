@@ -1327,6 +1327,16 @@ same verified dispatch and separates cache entries by target and floor, while
 allowing identical generated shims in fresh source stages to reuse eligible
 intermediates.
 
+The generated shim pins cargo-zigbuild to the Zig executable on its delegated
+PATH, including with plugin versions that otherwise prefer Python's `ziglang`
+package. It rejects externally supplied `CARGO_ZIGBUILD_ZIG_COMMAND`,
+`CARGO_ZIGBUILD_ZIG_COMMAND_ARGS`, `CARGO_ZIGBUILD_PYTHON_PATH`,
+`CARGO_ZIGBUILD_ZIG_PATH`, and `CARGO_ZIGBUILD_ZIG_VERSION`, including empty
+values. Put the intended Zig executable on PATH; use an explicit
+`cargo zigbuild` build command when the repository owns Zig dispatch.
+Interpreter aliases back to the staged Cargo shim are rejected before the
+identity observer starts, including symlinks and hard links outside its directory.
+
 ### gnu and musl variants of one platform
 
 A platform may list several target triples when a release ships, for example,

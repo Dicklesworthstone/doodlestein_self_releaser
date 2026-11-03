@@ -3891,6 +3891,31 @@ if ! command -v cargo-zigbuild >/dev/null 2>&1 || ! command -v zig >/dev/null 2>
   echo "[dsr] portable glibc floor ${DSR_LINUX_GLIBC_FLOOR:-} needs cargo-zigbuild and zig on this build host (cargo install cargo-zigbuild); set linux_glibc_floor: native in the repo config to build against the host glibc instead" >&2
   exit 4
 fi
+# cargo-zigbuild prefers Python's ziglang package over PATH's zig in 0.23,
+# and 0.24 also accepts a cached command/argument override. The managed shim
+# must use the same Zig executable that strict toolchain identity measures.
+# Refuse caller overrides rather than silently measuring a different linker.
+if [ "${CARGO_ZIGBUILD_ZIG_COMMAND+x}${CARGO_ZIGBUILD_ZIG_COMMAND_ARGS+x}${CARGO_ZIGBUILD_PYTHON_PATH+x}${CARGO_ZIGBUILD_ZIG_PATH+x}${CARGO_ZIGBUILD_ZIG_VERSION+x}" ]; then
+  echo "[dsr] generated DSR Cargo shim does not accept Zig dispatch overrides; select zig on PATH or use an explicit cargo zigbuild command" >&2
+  exit 4
+fi
+_dsr_zig_path=$(command -v zig)
+case "$_dsr_zig_path" in
+  /*) ;;
+  *) _dsr_zig_path="$(pwd -P)/$_dsr_zig_path" ;;
+esac
+if [ ! -f "$_dsr_zig_path" ] || [ ! -x "$_dsr_zig_path" ]; then
+  echo "[dsr] generated DSR Cargo shim needs a Zig executable on the delegated PATH" >&2
+  exit 4
+fi
+# /dev/null cannot execute, so the older Python-first resolver falls through
+# to the pinned binary. Newer plugins use the same absolute command directly.
+# Keep these derived settings inside the build; the parent observer/cache
+# environment is unchanged, and the generator hash binds this dispatch rule.
+CARGO_ZIGBUILD_PYTHON_PATH=/dev/null
+CARGO_ZIGBUILD_ZIG_PATH=$_dsr_zig_path
+CARGO_ZIGBUILD_ZIG_COMMAND=$_dsr_zig_path
+export CARGO_ZIGBUILD_PYTHON_PATH CARGO_ZIGBUILD_ZIG_PATH CARGO_ZIGBUILD_ZIG_COMMAND
 _dsr_zb_version=$(cargo-zigbuild --version 2>/dev/null | awk "{print \$2}")
 _dsr_zb_major=${_dsr_zb_version%%.*}
 _dsr_zb_rest=${_dsr_zb_version#*.}
@@ -4011,8 +4036,12 @@ for dsr_tool_candidate in python3 python3.14 python3.13 python3.12 python3.11; d
     if test -n "$_dsr_tool_shim_dir"; then
         dsr_tool_parent=$(CDPATH= cd -P "${dsr_tool_path%/*}" && pwd -P) || exit 86
         dsr_tool_shim_parent=$(CDPATH= cd -P "$_dsr_tool_shim_dir" && pwd -P) || exit 86
-        if test "$dsr_tool_parent" = "$dsr_tool_shim_parent"; then
-            printf '[dsr] toolchain identity: Python cannot be selected from the generated DSR Cargo shim directory\n' >&2
+        # A PATH entry outside the shim directory can still be a symlink or
+        # hardlink to its cargo file. Reject that alias before executing even
+        # the Python capability probe; normal interpreter symlinks stay valid.
+        if test "$dsr_tool_parent" = "$dsr_tool_shim_parent" ||
+           test "$dsr_tool_path" -ef "$_dsr_tool_shim_dir/cargo"; then
+            printf '[dsr] toolchain identity: Python cannot be selected from or alias the generated DSR Cargo shim directory\n' >&2
             exit 86
         fi
     fi
@@ -10235,6 +10264,13 @@ if zig_shim_dir:
         if any(probe_env.get(name) != os.environ.get(name) for name in (
                 'DSR_RUST_TARGET', 'DSR_ZIG_TARGET', 'DSR_LINUX_GLIBC_FLOOR')):
             fail('build_cmd cannot override generated DSR Cargo shim target selection')
+        zig_overrides = sorted(name for name in (
+            'CARGO_ZIGBUILD_ZIG_COMMAND', 'CARGO_ZIGBUILD_ZIG_COMMAND_ARGS',
+            'CARGO_ZIGBUILD_PYTHON_PATH', 'CARGO_ZIGBUILD_ZIG_PATH',
+            'CARGO_ZIGBUILD_ZIG_VERSION') if name in probe_env)
+        if zig_overrides:
+            fail('generated DSR Cargo shim does not accept Zig dispatch overrides: ' +
+                 ', '.join(zig_overrides))
         floor = probe_env.get('DSR_LINUX_GLIBC_FLOOR', '')
         if (not re.fullmatch(r'[0-9]+\.[0-9]+', floor) or
                 not selection['target'].endswith('-linux-gnu') or
