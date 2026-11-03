@@ -4908,6 +4908,37 @@ _act_git_sync_excludes() {
         done
 }
 
+# A receiver must own its source root and existing Git administration. Do not
+# repair an operator checkout with chown or override Git's safe.directory
+# policy: a prior root rsync may have imported a controller-only numeric UID.
+# The same POSIX program runs locally and through the Unix SSH login shell.
+_act_source_sync_prepare_sh() {
+    local source_path="$1"
+    printf "dsr_source_path='%s'\n" "${source_path//\'/\'\\\'\'}"
+    cat <<'SH'
+dsr_source_uid=$(id -u) || exit 4
+for dsr_source_entry in "$dsr_source_path" "$dsr_source_path/.git"; do
+    if [ -e "$dsr_source_entry" ] || [ -L "$dsr_source_entry" ]; then
+        if [ -L "$dsr_source_entry" ]; then
+            printf '[act] Refusing source sync through symlink: %s\n' "$dsr_source_entry" >&2
+            exit 4
+        fi
+        dsr_source_owner=$(stat -c %u -- "$dsr_source_entry" 2>/dev/null) ||
+            dsr_source_owner=$(stat -f %u "$dsr_source_entry" 2>/dev/null) || {
+                printf '[act] Cannot verify source ownership: %s\n' "$dsr_source_entry" >&2
+                exit 4
+            }
+        if [ "$dsr_source_owner" != "$dsr_source_uid" ]; then
+            printf '[act] Source ownership mismatch: %s belongs to UID %s; build account uses UID %s. Use a fresh owned source stage or repair this checkout before retrying.\n' \
+                "$dsr_source_entry" "$dsr_source_owner" "$dsr_source_uid" >&2
+            exit 4
+        fi
+    fi
+done
+mkdir -p -- "$dsr_source_path" || exit 4
+SH
+}
+
 # Sync source code to remote host via rsync
 # Usage: _act_sync_source <host> <local_path> <remote_path> [extra_excludes...]
 # Returns: 0 on success, non-zero on failure
@@ -4992,12 +5023,16 @@ _act_sync_source() (
             return 0
         fi
 
-        mkdir -p "$remote_path"
+        local prepare_command
+        prepare_command=$(_act_source_sync_prepare_sh "$remote_path") || return 4
+        sh -c "$prepare_command" || return 4
         local sync_cmd_output sync_cmd_status
         # Equal size and timestamp do not prove equal source bytes (for
         # example, rapid checkouts or restored timestamps). A successful sync
         # must replace those stale files before the host becomes buildable.
-        sync_cmd_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" rsync -az --checksum --delete \
+        # Keep modes, links, timestamps and byte comparison; numeric ownership
+        # belongs to the receiving build account, not the controller machine.
+        sync_cmd_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" rsync -az --no-owner --no-group --checksum --delete \
             "${exclude_args[@]}" \
             "$local_path/" "$remote_path/" 2>&1)
         sync_cmd_status=$?
@@ -5035,9 +5070,20 @@ _act_sync_source() (
         # sure the full remote path exists first (mirrors the local-host and
         # tar-fallback branches). Without this, a missing per-version parent dir
         # makes the whole sync fail with "No such file or directory".
-        if ! _act_remote_mkdir "$host" "$remote_path"; then
-            _log_error "failed to create remote directory $remote_path on $host"
-            return 1
+        if _act_is_windows_host "$host"; then
+            if ! _act_remote_mkdir "$host" "$remote_path"; then
+                _log_error "failed to create remote directory $remote_path on $host"
+                return 1
+            fi
+        else
+            local prepare_command
+            prepare_command=$(_act_source_sync_prepare_sh "$remote_path") || return 4
+            if ! _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh -n \
+                -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o StrictHostKeyChecking=accept-new \
+                "$ssh_destination" "$prepare_command"; then
+                _log_error "failed to prepare owned source directory $remote_path on $host"
+                return 1
+            fi
         fi
 
         # Use rsync for efficient sync. Windows receivers still drop the
@@ -5050,7 +5096,7 @@ _act_sync_source() (
             sync_attempts=3
         fi
         for (( sync_attempt = 1; sync_attempt <= sync_attempts; sync_attempt++ )); do
-            sync_cmd_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" rsync -az --checksum --delete \
+            sync_cmd_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" rsync -az --no-owner --no-group --checksum --delete \
                 "${rsync_io_opts[@]}" \
                 "${exclude_args[@]}" \
                 -e "$rsync_transport" \
@@ -5086,7 +5132,7 @@ _act_sync_source() (
         # Create remote directory and extract. Windows OpenSSH hands the remote
         # command to cmd.exe, so POSIX `%q` escaping is invalid there. Pass one
         # validated cmd command as a single ssh argument instead.
-        local mkdir_cmd remote_extract_cmd
+        local remote_extract_cmd
         if _act_is_windows_host "$host"; then
             local win_path
             win_path=$(_act_windows_cmd_path "$remote_path")
@@ -5103,8 +5149,10 @@ _act_sync_source() (
             # exists, making the sender fail with a misleading Write error.
             remote_extract_cmd="tar xzf - -C $remote_path"
         else
-            mkdir_cmd="mkdir -p \"$remote_path\" && cd \"$remote_path\""
-            remote_extract_cmd="$mkdir_cmd && tar xzf -"
+            remote_extract_cmd=$(_act_source_sync_prepare_sh "$remote_path") || return 4
+            # GNU tar and macOS bsdtar otherwise restore archive UIDs when
+            # the receiving SSH account is root, just as rsync -a does.
+            remote_extract_cmd+=$'\n''tar --no-same-owner -xzf - -C "$dsr_source_path"'
         fi
 
         local sync_cmd_output sync_cmd_status

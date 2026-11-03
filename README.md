@@ -219,6 +219,15 @@ before compilation, including explicitly pinned hosts. Recipes that select an
 executable path, wrapper, or nondefault toolchain keep their existing build
 context checks instead of being judged against an unrelated ambient compiler.
 
+Unix source synchronization preserves file contents, permissions and links,
+while newly transferred files belong to the account receiving the build over
+SSH. This also applies to root workers and the tar fallback, so a macOS
+controller's numeric UID is not imported into a Linux checkout. An existing
+destination or `.git` entry owned by another account stops synchronization
+with the path and both UIDs in the error. Select a fresh build stage or repair
+that checkout's ownership before retrying; DSR does not add Git
+`safe.directory` exceptions or change ownership of existing projects.
+
 Release snapshots and isolated Rust builds are staged under `/var/tmp` on Linux hosts and
 `/private/tmp` on macOS — never `/tmp`, which is frequently a RAM-backed tmpfs that a multi-GB
 source tree plus Cargo target will exhaust. Set `build_root` on a host to stage somewhere else

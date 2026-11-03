@@ -7,6 +7,7 @@ on:
       - src/xwin_source.sh
       - src/config.sh
       - scripts/tests/test_unix_snapshot_batch.sh
+      - scripts/tests/test_native_source_sync.sh
       - .github/workflows/snapshot-regression.yml
   workflow_dispatch:
 permissions:
@@ -32,7 +33,7 @@ jobs:
           set -euo pipefail
           if [[ "$RUNNER_OS" == Linux ]]; then
             sudo apt-get update
-            sudo apt-get install -y --no-install-recommends python3 git tar mawk grep coreutils dash jq golang-go ripgrep
+            sudo apt-get install -y --no-install-recommends python3 git tar mawk grep coreutils dash jq golang-go ripgrep rsync
           else
             command -v python3 >/dev/null || brew install python
             command -v git >/dev/null || brew install git
@@ -55,3 +56,19 @@ jobs:
           bash -n src/xwin_source.sh
           bash -n scripts/tests/test_unix_snapshot_batch.sh
           bash scripts/tests/test_unix_snapshot_batch.sh
+      - name: Verify source sync ownership with the ordinary worker account
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/tests/test_native_source_sync.sh
+          bash scripts/tests/test_native_source_sync.sh --ownership-only
+      # The transport adapter runs a real rsync receiver and tar extractor.
+      # A real root process is needed to exercise foreign controller UIDs and
+      # mismatched repository ownership, without changing Git's trust policy.
+      - name: Verify root and unprivileged receivers with foreign source ownership
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -n env PATH="$PATH" TMPDIR=/tmp DSR_TEST_REQUIRE_FOREIGN_IDS=1 \
+            bash scripts/tests/test_native_source_sync.sh --ownership-only

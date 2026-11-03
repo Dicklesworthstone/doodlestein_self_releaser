@@ -7,6 +7,8 @@
 # Use --strict-mixed-protocol-only for mixed-platform receipt/selection controls;
 # this mode never claims a Darwin compiler or artifact execution.
 # Use --git-selection-only for genuine Git/rsync selection without a compiler.
+# Use --ownership-only for actual rsync/tar/Git source ownership checks. Running
+# as root with a full UID map also covers UID 501 and a non-root SSH receiver.
 # Use --windows-source-links-only for real Git archives and PowerShell regular
 # copy materialization. On Unix this proves the receiver logic, not NTFS.
 set -uo pipefail
@@ -573,6 +575,230 @@ POWERSHELL
         -FixtureRoot "$work" -BackendPath "$backend"
 )
 
+test_source_ownership() (
+    local dependency work
+    for dependency in bash git jq python3 rsync tar; do
+        command -v "$dependency" >/dev/null 2>&1 || {
+            printf 'SKIP: source ownership requires %s\n' "$dependency"
+            return 77
+        }
+    done
+    work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-source-ownership.XXXXXXXX") || return 1
+    printf 'Source ownership evidence: %s\n' "$work"
+    python3 - "$work" "${DSR_TEST_ACT_RUNNER:-$ROOT/src/act_runner.sh}" "$ROOT" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import stat
+import subprocess
+import sys
+
+work = Path(sys.argv[1])
+runner = Path(sys.argv[2])
+root = Path(sys.argv[3])
+os.umask(0o022)
+work.chmod(0o755)
+environment = {key: value for key, value in os.environ.items()
+               if not key.upper().startswith(('GIT_', 'SUDO_'))}
+environment.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=str(work / 'global.gitconfig'),
+                   GIT_AUTHOR_NAME='Source ownership fixture', GIT_AUTHOR_EMAIL='fixture@example.invalid',
+                   GIT_COMMITTER_NAME='Source ownership fixture', GIT_COMMITTER_EMAIL='fixture@example.invalid',
+                   DSR_CONFIG_DIR=str(work / 'config'), DSR_STATE_DIR=str(work / 'state'),
+                   DSR_CACHE_DIR=str(work / 'cache'), DSR_HOSTS_FILE=str(work / 'no-hosts.yaml'),
+                   NO_COLOR='1')
+(work / 'global.gitconfig').write_text('[user]\n\tname = Ownership fixture\n')
+transport = work / 'transport'
+transport.mkdir()
+ssh = transport / 'ssh'
+# Only the network is replaced: this executes the actual rsync server/tar,
+# Git importer and build commands with the selected receiver's real UID.
+ssh.write_text('''#!/usr/bin/env python3
+import os, sys
+args = sys.argv[1:]
+while args and args[0].startswith('-'):
+    args = args[2:] if args[0] in ('-o', '-p', '-l') else args[1:]
+host, args = args[0], args[1:]
+if host not in ('fixture-owned-rsync', 'fixture-owned-tar'):
+    raise SystemExit(255)
+uid, gid = int(os.environ['DSR_TEST_RECEIVER_UID']), int(os.environ['DSR_TEST_RECEIVER_GID'])
+if uid != os.geteuid() or gid != os.getegid():
+    os.setgroups([])
+    os.setgid(gid)
+    os.setuid(uid)
+command = ' '.join(args)
+if host == 'fixture-owned-tar' and command == 'command -v rsync >/dev/null 2>&1':
+    raise SystemExit(1)
+os.execv('/bin/sh', ['sh', '-c', command])
+''')
+ssh.chmod(0o755)
+environment['PATH'] = str(transport) + os.pathsep + environment['PATH']
+passes = failures = 0
+
+def check(label, condition):
+    global passes, failures
+    print(('PASS: ' if condition else 'FAIL: ') + label, flush=True)
+    if condition:
+        passes += 1
+    else:
+        failures += 1
+
+def run(argv, *, env=None, uid=None, gid=None, cwd=None):
+    def receive_as():
+        if uid is not None and (uid != os.geteuid() or gid != os.getegid()):
+            os.setgroups([])
+            os.setgid(gid)
+            os.setuid(uid)
+    return subprocess.run(argv, env=env or environment, cwd=cwd,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, preexec_fn=receive_as if uid is not None else None)
+
+def module(body, *arguments, env=None):
+    return run(['bash', '-c', 'source "$1" || exit; source "$2" || exit; shift 2; ' + body,
+                'source-ownership', str(runner), str(root / 'src/git_ops.sh'), *map(str, arguments)], env=env)
+
+source = work / 'controller-source'
+source.mkdir()
+(source / 'payload.txt').write_text('source bytes\n')
+(source / 'build.sh').write_text('#!/bin/sh\nset -eu\ngit config --local dsr.fixture verified\n'
+                                 'git rev-parse --verify HEAD\ncat payload.txt\n')
+(source / 'build.sh').chmod(0o755)
+(source / 'payload-link').symlink_to('payload.txt')
+for args in [('init', '-q', '--initial-branch=main'), ('add', '.'), ('commit', '-qm', 'ownership fixture')]:
+    result = run(['git', '-C', str(source), *args])
+    if result.returncode:
+        raise RuntimeError(result.stderr)
+context_result = module('git_ops_export_build_context "$1" "$2"', source, work / 'context')
+if context_result.returncode:
+    raise RuntimeError(context_result.stderr)
+context = json.loads(context_result.stdout)
+context_path = work / 'context.json'
+context_path.write_text(json.dumps(context))
+
+current_uid, current_gid = os.geteuid(), os.getegid()
+foreign_ids = False
+if current_uid == 0:
+    probe = work / 'uid-probe'
+    probe.write_text('UID capability probe\n')
+    try:
+        os.chown(probe, 501, 501)
+        switched = run(['id', '-u'], uid=502, gid=502)
+        foreign_ids = switched.returncode == 0 and switched.stdout.strip() == '502'
+    except (OSError, subprocess.SubprocessError) as error:
+        print('SKIP: UID 501 and non-root receiver controls require chown/setuid capability: ' + str(error))
+else:
+    print('SKIP: root receiver and foreign ownership controls require running this mode as root')
+if os.environ.get('DSR_TEST_REQUIRE_FOREIGN_IDS') == '1' and not foreign_ids:
+    raise RuntimeError('Required UID 501/root/non-root ownership qualification is unavailable')
+
+if foreign_ids:
+    # Model the real macOS source account. The sender reads the ordinary
+    # working bytes; the exported authenticated Git bundle remains separate.
+    for path in [*source.rglob('*'), source]:
+        os.chown(path, 501, 501, follow_symlinks=False)
+
+def fingerprint(root):
+    result = {}
+    for path in [root, *sorted(root.rglob('*'))]:
+        info = path.lstat()
+        payload = os.readlink(path) if path.is_symlink() else (
+            hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else '')
+        result[str(path.relative_to(root))] = (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode), payload)
+    return result
+
+source_before = fingerprint(source)
+global_before = (work / 'global.gitconfig').read_bytes()
+receivers = [('root' if current_uid == 0 else 'worker', current_uid, current_gid)]
+if foreign_ids:
+    receivers.append(('nonroot', 502, 502))
+for label, uid, gid in receivers:
+    for host in ('fixture-owned-rsync', 'fixture-owned-tar'):
+        name = label + '-' + host.rsplit('-', 1)[1]
+        parent = work / name
+        parent.mkdir()
+        if uid != current_uid:
+            os.chown(parent, uid, gid)
+        destination = parent / 'source'
+        selected = dict(environment, DSR_TEST_RECEIVER_UID=str(uid), DSR_TEST_RECEIVER_GID=str(gid))
+        result = module('_act_sync_source "$1" "$2" "$3"', host, source, destination, env=selected)
+        (work / (name + '.sync.log')).write_text(result.stdout + result.stderr)
+        check(name + ' source transfer succeeds', result.returncode == 0)
+        if result.returncode:
+            continue
+        check(name + ' source root belongs to receiving account', destination.stat().st_uid == uid)
+        check(name + ' source root uses receiving group', destination.stat().st_gid == gid)
+        check(name + ' regular inputs belong to receiving account',
+              all((destination / p).stat().st_uid == uid for p in ('build.sh', 'payload.txt')))
+        check(name + ' regular inputs use receiving group',
+              all((destination / p).stat().st_gid == gid for p in ('build.sh', 'payload.txt')))
+        check(name + ' executable permission is preserved', stat.S_IMODE((destination / 'build.sh').stat().st_mode) == 0o755)
+        check(name + ' ordinary permission is preserved', stat.S_IMODE((destination / 'payload.txt').stat().st_mode) == 0o644)
+        check(name + ' source bytes match', (destination / 'payload.txt').read_bytes() == (source / 'payload.txt').read_bytes())
+        check(name + ' symlink remains a link with the original target',
+              (destination / 'payload-link').is_symlink() and os.readlink(destination / 'payload-link') == 'payload.txt')
+        check(name + ' symlink belongs to receiving account and group',
+              ((destination / 'payload-link').lstat().st_uid, (destination / 'payload-link').lstat().st_gid) == (uid, gid))
+        check(name + ' controller Git metadata is excluded', not (destination / '.git').exists())
+        restored = module('context=$(cat "$4") || exit; _act_restore_ordinary_git_context "$1" "$2" "$context" "$3"',
+                          host, destination, 'source', context_path, env=selected)
+        (work / (name + '.restore.log')).write_text(restored.stdout + restored.stderr)
+        check(name + ' authenticated Git context restores', restored.returncode == 0)
+        built = run([str(destination / 'build.sh')], cwd=destination, env=selected, uid=uid, gid=gid)
+        (work / (name + '.build.log')).write_text(built.stdout + built.stderr)
+        check(name + ' build can use git config --local and exact source HEAD',
+              built.returncode == 0 and built.stdout == context['git_sha'] + '\nsource bytes\n')
+        safe = run(['git', '-C', str(destination), 'config', '--local', '--get-all', 'safe.directory'],
+                   env=selected, uid=uid, gid=gid)
+        check(name + ' no safe.directory exception is installed', safe.returncode == 1)
+
+        # A retry must not follow an operator-selected destination link into
+        # another project. Neither the link nor the foreign tree is modified.
+        other = parent / 'unrelated'
+        other.mkdir()
+        (other / 'sentinel').write_text('unrelated project\n')
+        alias = parent / 'alias'
+        alias.symlink_to(other, target_is_directory=True)
+        rejected = module('_act_sync_source "$1" "$2" "$3"', host, source, alias, env=selected)
+        check(name + ' destination symlink refuses before transfer',
+              rejected.returncode != 0 and 'Refusing source sync through symlink' in rejected.stderr)
+        check(name + ' refused transfer preserves unrelated project',
+              (other / 'sentinel').is_file() and (other / 'sentinel').read_text() == 'unrelated project\n'
+              and not (other / 'payload.txt').exists())
+
+        if foreign_ids:
+            for entry_name in ('source-root', 'git-dir'):
+                polluted = parent / ('polluted-' + entry_name)
+                polluted.mkdir()
+                (polluted / 'sentinel').write_text('must not change\n')
+                os.chown(polluted, uid, gid)
+                initialized = run(['git', '-C', str(polluted), 'init', '-q', '--initial-branch=main'],
+                                  env=selected, uid=uid, gid=gid)
+                configured = run(['git', '-C', str(polluted), 'config', '--local', 'dsr.fixture', 'owned'],
+                                 env=selected, uid=uid, gid=gid)
+                check(name + ' ' + entry_name + ' fixture is initially a usable owned repository',
+                      initialized.returncode == 0 and configured.returncode == 0)
+                foreign = polluted if entry_name == 'source-root' else polluted / '.git'
+                os.chown(foreign, 501, 501)
+                unsafe = run(['git', '-C', str(polluted), 'rev-parse', '--is-inside-work-tree'],
+                             env=selected, uid=uid, gid=gid)
+                check(name + ' Git itself rejects foreign-owned ' + entry_name,
+                      unsafe.returncode != 0 and 'dubious ownership' in unsafe.stderr.lower())
+                before = fingerprint(polluted)
+                rejected = module('_act_sync_source "$1" "$2" "$3"', host, source, polluted, env=selected)
+                check(name + ' refuses foreign-owned ' + entry_name + ' with UID/path diagnosis',
+                      rejected.returncode != 0 and 'Source ownership mismatch' in rejected.stderr
+                      and str(foreign) in rejected.stderr and 'UID 501' in rejected.stderr
+                      and ('UID ' + str(uid)) in rejected.stderr)
+                check(name + ' preserves foreign-owned ' + entry_name + ' without repair', fingerprint(polluted) == before)
+
+check('all transfers preserve controller source ownership, modes and bytes', fingerprint(source) == source_before)
+check('all transfers preserve global Git configuration', (work / 'global.gitconfig').read_bytes() == global_before)
+print('Source ownership: %d passed, %d failed' % (passes, failures))
+raise SystemExit(1 if failures else 0)
+PY
+)
+
 test_git_source_selection() (
     local dependency work source_root destination mode output status
     local selection_passes=0 selection_failures=0
@@ -732,6 +958,10 @@ if [[ "${1:-}" == --git-selection-only ]]; then
     test_git_source_selection
     exit $?
 fi
+if [[ "${1:-}" == --ownership-only ]]; then
+    test_source_ownership
+    exit $?
+fi
 if [[ $# -eq 0 ]]; then
     windows_links_status=0
     test_windows_source_links || windows_links_status=$?
@@ -739,6 +969,9 @@ if [[ $# -eq 0 ]]; then
     git_selection_status=0
     test_git_source_selection || git_selection_status=$?
     [[ "$git_selection_status" == 0 || "$git_selection_status" == 77 ]] || exit "$git_selection_status"
+    ownership_status=0
+    test_source_ownership || ownership_status=$?
+    [[ "$ownership_status" == 0 || "$ownership_status" == 77 ]] || exit "$ownership_status"
 fi
 
 for dependency in bash rustc cargo git jq yq rsync python3 tar; do
