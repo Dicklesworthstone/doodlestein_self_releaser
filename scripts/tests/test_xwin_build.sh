@@ -4,6 +4,7 @@
 # download or Windows execution is claimed.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
+ROOT=${XWIN_TEST_ROOT:-$ROOT}
 source "$ROOT/src/xwin_build.sh"
 # Actual filesystem/selector regression tests, without substituting a compiler
 # or an SDK verifier. This mode proves path binding only; it does not build,
@@ -284,7 +285,15 @@ case "$mode" in
     cache-wipe)
         [[ -d "$CARGO_HOME/registry" && ! -L "$CARGO_HOME/registry" && ! -L "$CARGO_HOME/git" &&
            ! -e "$CARGO_HOME/credentials.toml" ]] || exit 96
-        source_file="$CARGO_HOME/registry/src/probe.c"
+        registry=index.crates.io-1949cf8c6b5b557f
+        archive="$CARGO_HOME/registry/cache/$registry/cache-probe-1.0.0.crate"
+        [[ -f "$archive" && ! -e "$CARGO_HOME/registry/src" && ! -e "$CARGO_HOME/git" &&
+           ! -e "$CARGO_HOME/registry/cache/$registry/unrelated-9.0.0.crate" ]] || exit 96
+        # Cargo protocol fixture: model unpacking a locked download. Only the
+        # later LLVM C compilation and PE link are genuine compiler commands.
+        mkdir -p "$CARGO_HOME/registry/src/$registry" || exit 96
+        tar -xzf "$archive" -C "$CARGO_HOME/registry/src/$registry" || exit 96
+        source_file="$CARGO_HOME/registry/src/$registry/cache-probe-1.0.0/probe.c"
         cmp -s "$source_file" probe.c || exit 96
         # Retire this suite's generated seed paths after the runner prepared
         # the private home and before the real compiler reads it. Checked
@@ -343,6 +352,98 @@ jq -cn --arg root "$WORK" --arg sdk "$(_xwt_hash "$WORK/sdk.tar.xz")" --arg head
 MANIFEST="$WORK/manifest.json"
 CACHE="$WORK/cache"
 BUILD=(bash "$ROOT/scripts/xwin-build.sh" --manifest "$MANIFEST" --project "$WORK/project" --bin probe --cache-dir "$CACHE" --offline)
+ordinary_cache_tests() {
+    local registry=index.crates.io-1949cf8c6b5b557f archive checksum lock_hash
+    mkdir -p "$WORK/ambient-cache/registry/cache/$registry" \
+        "$WORK/ambient-cache/registry/index/$registry/.cache/ca/ch" \
+        "$WORK/ambient-cache/registry/src/$registry/unrelated-9.0.0" \
+        "$WORK/ambient-cache/git/db" "$WORK/crate/cache-probe-1.0.0/src" \
+        "$WORK/project/src" "$WORK/locked-project/src" || exit 1
+    touch "$WORK/ambient-cache/test-owned"
+    cp "$WORK/project/probe.c" "$WORK/crate/cache-probe-1.0.0/probe.c" || exit 1
+    printf '[package]\nname="cache-probe"\nversion="1.0.0"\nedition="2021"\n' \
+        > "$WORK/crate/cache-probe-1.0.0/Cargo.toml"
+    printf 'pub fn answer() -> u32 { 42 }\n' > "$WORK/crate/cache-probe-1.0.0/src/lib.rs"
+    archive="$WORK/ambient-cache/registry/cache/$registry/cache-probe-1.0.0.crate"
+    tar -czf "$archive" -C "$WORK/crate" cache-probe-1.0.0 || exit 1
+    checksum=$(_xwt_hash "$archive") || exit 1
+    # A complete offline Cargo download fixture, usable by real host Cargo as
+    # well as the explicitly declared xwin protocol fixture above.
+    python3 - "$WORK/ambient-cache/registry/index/$registry" "$checksum" <<'PY' || exit 1
+from pathlib import Path
+import json
+import sys
+index = Path(sys.argv[1])
+record = {'name': 'cache-probe', 'vers': '1.0.0', 'deps': [], 'cksum': sys.argv[2], 'features': {}, 'yanked': False}
+(index / 'config.json').write_text(json.dumps({'dl': 'https://static.crates.io/crates'}))
+(index / '.cache/ca/ch/cache-probe').write_bytes(
+    b'\x03\x02\x00\x00\x00etag: "local-cache-fixture"\x001.0.0\x00' + json.dumps(record).encode() + b'\x00')
+PY
+    printf 'unrelated download\n' > "$WORK/ambient-cache/registry/cache/$registry/unrelated-9.0.0.crate"
+    # This source-only package has no same-name archive, so unscoped seeding
+    # still inspects the linked entry. It is absent from the build's lockfile.
+    mkdir "$WORK/ambient-cache/registry/src/$registry/source-only-2.0.0" || exit 1
+    ln -s "$WORK/project" "$WORK/ambient-cache/registry/src/$registry/source-only-2.0.0/external" || exit 1
+    printf 'unrelated Git cache bytes\n' > "$WORK/ambient-cache/git/db/input"
+    printf 'not inherited\n' > "$WORK/ambient-cache/credentials.toml"
+    printf 'not inherited\n' > "$WORK/ambient-cache/config.toml"
+    cp "$WORK/project/Cargo.lock" "$WORK/original.lock" || exit 1
+    cp "$WORK/project/Cargo.toml" "$WORK/original.toml" || exit 1
+    printf '\n[dependencies]\ncache-probe="=1.0.0"\n' >> "$WORK/project/Cargo.toml"
+    printf 'fn main() { println!("{}", cache_probe::answer()); }\n' > "$WORK/project/src/main.rs"
+    cat > "$WORK/project/Cargo.lock" <<TOML
+version = 3
+[[package]]
+name = "probe"
+version = "0.1.0"
+dependencies = ["cache-probe"]
+[[package]]
+name = "cache-probe"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "$checksum"
+TOML
+    cp "$WORK/project/Cargo.toml" "$WORK/project/Cargo.lock" "$WORK/locked-project/" || exit 1
+    cp "$WORK/project/src/main.rs" "$WORK/locked-project/src/" || exit 1
+    lock_hash=$(_xwt_hash "$WORK/project/Cargo.lock") || exit 1
+    printf 'cache-wipe\n' > "$WORK/project/mode"
+    assert 'ordinary locked build excludes unrelated unsafe sources and compiles after ambient cache retirement' \
+        "${BUILD[@]}" --run-dir "$WORK/cache-wipe" --cargo-cache "$WORK/ambient-cache"
+    assert 'fixture actually retired the original registry path' test ! -e "$WORK/ambient-cache/registry"
+    assert 'fixture actually retired the original git cache path' test ! -e "$WORK/ambient-cache/git"
+    assert 'ordinary seed binds the required lockfile and only its selected downloads' jq -e --arg hash "$lock_hash" \
+        '.cargo_cache.seed.selection.kind=="cargo-lock-downloads" and
+         .cargo_cache.seed.selection.lockfile_sha256==$hash and
+         .cargo_cache.seed.selection.registry_packages==1 and .cargo_cache.seed.selection.git_revisions==[] and
+         .cargo_cache.seed.file_count==3' "$WORK/cache-wipe/result.json"
+    assert 'selected archive retains its lock checksum in the private copy' bash -c \
+        '[[ "$(sha256sum "$1" | cut -d" " -f1)" == "$2" ]]' _ \
+        "$WORK/cache-wipe/cargo-home/registry/cache/$registry/cache-probe-1.0.0.crate" "$checksum"
+    assert 'seed and newly expanded dependency inventories retained' jq -e \
+        '.cargo_cache.mode=="private-copy" and .cargo_cache.final.file_count==7 and
+         (.cargo_cache.seed.inventory_sha256 != .cargo_cache.final.inventory_sha256) and
+         .artifact.machine=="IMAGE_FILE_MACHINE_ARM64"' "$WORK/cache-wipe/result.json"
+    assert 'completed private cache verifies independently' cargo_cache_verify \
+        "$WORK/cache-wipe/cargo-home" "$WORK/cache-wipe/cargo-cache-final.json"
+    # Only the selected archive becomes unsafe. An unrelated link must no
+    # longer reject preparation, while a selected linked input must still fail.
+    mkdir -p "$WORK/unsafe-cache-source/registry/cache/$registry" || exit 1
+    ln -s "$WORK/crate/cache-probe-1.0.0/probe.c" \
+        "$WORK/unsafe-cache-source/registry/cache/$registry/cache-probe-1.0.0.crate" || exit 1
+    reject 'selected linked archive fails before any compiler runs' 7 "${BUILD[@]}" \
+        --run-dir "$WORK/unsafe-cache" --cargo-cache "$WORK/unsafe-cache-source"
+    assert 'unsafe selected archive never starts compilation' test ! -e "$WORK/unsafe-cache/build.log"
+    assert 'unsafe selected archive never emits a successful result' test ! -e "$WORK/unsafe-cache/result.json"
+    cp "$WORK/original.lock" "$WORK/project/Cargo.lock" || exit 1
+    cp "$WORK/original.toml" "$WORK/project/Cargo.toml" || exit 1
+    printf 'normal\n' > "$WORK/project/mode"
+}
+if [[ "${1:-}" == --cache-lock-selection-tests ]]; then
+    ordinary_cache_tests
+    printf '\nPinned Windows lock selection: %s passed, %s failed\n' "$PASS" "$FAIL"
+    [[ "$FAIL" == 0 ]]
+    exit $?
+fi
 RUSTFLAGS='bad ambient flags' RUSTC_WRAPPER=/not/a/wrapper CC=/not/a/compiler UNRELATED_SECRET=not-retained \
     "${BUILD[@]}" --run-dir "$WORK/good" > "$WORK/success.json" 2> "$WORK/good.stderr" || {
         cat "$WORK/good.stderr" >&2; cat "$WORK/good/build.log" >&2; exit 1;
@@ -369,7 +470,8 @@ assert 'lowercase pinned sysroot was never renamed' test ! -e "$WORK/input/sdk/l
 assert 'original source archive still matches pinned hash' bash -c '[[ "$(sha256sum "$1"|cut -d" " -f1)" == "$(jq -r .sysroot.sha256 "$2")" ]]' _ "$WORK/sdk.tar.xz" "$MANIFEST"
 assert 'unseeded build records an empty private cache' jq -e \
     '.cargo_cache.mode=="private-copy" and .cargo_cache.seed.file_count==0 and .cargo_cache.final.file_count==0 and
-     (.cargo_cache.seed|has("selection")|not)' "$WORK/success.json"
+     .cargo_cache.seed.selection.kind=="cargo-lock-downloads" and
+     .cargo_cache.seed.selection.registry_packages==0 and .cargo_cache.seed.selection.git_revisions==[]' "$WORK/success.json"
 jq '.target="x86_64-pc-windows-msvc"' "$MANIFEST" > "$WORK/manifest-x64.json" || exit 1
 X64_BUILD=(bash "$ROOT/scripts/xwin-build.sh" --manifest "$WORK/manifest-x64.json" \
     --project "$WORK/project" --bin probe --cache-dir "$CACHE" --offline)
@@ -434,27 +536,7 @@ reject 'x64 lane refuses a successful compiler that emitted ARM64' 7 \
 assert 'opposite-architecture x64 attempt records failure without result' bash -c '
     [[ ! -e "$1/result.json" ]] && jq -e ".status==\"failed\" and .exit_code==7" "$1/failure.json"' _ "$WORK/wrong-x64"
 printf 'normal\n' > "$WORK/project/mode"
-mkdir -p "$WORK/ambient-cache/registry/src" "$WORK/ambient-cache/git/db"
-touch "$WORK/ambient-cache/test-owned"
-cp "$WORK/project/probe.c" "$WORK/ambient-cache/registry/src/probe.c"
-printf 'git cache bytes\n' > "$WORK/ambient-cache/git/db/input"
-printf 'not inherited\n' > "$WORK/ambient-cache/credentials.toml"
-printf 'not inherited\n' > "$WORK/ambient-cache/config.toml"
-printf 'cache-wipe\n' > "$WORK/project/mode"
-assert 'real ARM64 compilation survives original Cargo cache paths disappearing' \
-    "${BUILD[@]}" --run-dir "$WORK/cache-wipe" --cargo-cache "$WORK/ambient-cache"
-assert 'fixture actually retired the original registry path' test ! -e "$WORK/ambient-cache/registry"
-assert 'fixture actually retired the original git cache path' test ! -e "$WORK/ambient-cache/git"
-assert 'seed and newly resolved dependency inventories retained' jq -e \
-    '.cargo_cache.mode=="private-copy" and .cargo_cache.seed.file_count==2 and .cargo_cache.final.file_count==3 and
-     (.cargo_cache.seed.inventory_sha256 != .cargo_cache.final.inventory_sha256) and .artifact.machine=="IMAGE_FILE_MACHINE_ARM64"' \
-    "$WORK/cache-wipe/result.json"
-assert 'completed private cache verifies independently' cargo_cache_verify \
-    "$WORK/cache-wipe/cargo-home" "$WORK/cache-wipe/cargo-cache-final.json"
-mkdir -p "$WORK/ambient-cache/registry"
-ln -s "$WORK/project" "$WORK/ambient-cache/registry/escape"
-reject 'unsafe seed fails before any compiler runs' 7 "${BUILD[@]}" --run-dir "$WORK/unsafe-cache" --cargo-cache "$WORK/ambient-cache"
-assert 'unsafe seed never starts compilation' test ! -e "$WORK/unsafe-cache/build.log"
+ordinary_cache_tests
 reject 'occupied run directory is never overwritten' 2 "${BUILD[@]}" --run-dir "$WORK/good"
 # Stall the actual preparation subprocess boundary, not the compiler, to
 # prove large cache copies have their own deadline and cancellation handling.
