@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_act_runner_native.sh - Unit tests for act_runner.sh native build SSH logic
 #
-# Usage: ./test_act_runner_native.sh [--typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --workspace-archives-only]
+# Usage: ./test_act_runner_native.sh [--typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --workspace-archives-only | --failure-evidence-only]
 #
 # Tests native build SSH command construction with mocks.
 # Covers: command construction, path handling, env vars, SCP, error handling.
@@ -105,8 +105,12 @@ _act_prepare_windows_nonstrict_cargo_home() {
         receipt_sha256:("3"*64),inventory_sha256:("4"*64),file_count:0,size_bytes:0,caches:[]}'
 }
 _act_finish_windows_private_cargo_home() {
-    jq -nc --arg home "$2" '{mode:"inventory",cargo_home:$home,
-        receipt_sha256:("5"*64),inventory_sha256:("4"*64),file_count:0,size_bytes:0,caches:[]}'
+    local native_execution=false
+    if [[ "${1:-}" == --native-execution ]]; then native_execution=true; shift; fi
+    jq -nc --arg home "$2" --argjson native_execution "$native_execution" '
+        {mode:"inventory",cargo_home:$home,
+         receipt_sha256:("5"*64),inventory_sha256:("4"*64),file_count:0,size_bytes:0,caches:[]}
+        | if $native_execution then {command_exit_code:0,receipt:.} else . end'
 }
 if [[ "${DSR_ATTEMPT_MKTEMP_FAIL:-}" == logs ]]; then
     mktemp() {
@@ -1893,8 +1897,10 @@ echo "0" > "$SCP_EXIT_CODE_FILE"
 echo "0" > "$RAW_SSH_EXIT_CODE_FILE"
 echo "0" > "$RSYNC_EXIT_CODE_FILE"
 
-# Source the module under test
-source "$SRC_DIR/act_runner.sh"
+# Source the module under test. The focused failure-evidence lane can compare
+# an archived src/ tree with the working module without undoing either tree.
+# shellcheck source=../../src/act_runner.sh
+source "${DSR_NATIVE_FAILURE_MODULE:-$SRC_DIR/act_runner.sh}"
 # This suite controls host state and SSH command construction. Real host-health
 # qualification belongs to its integration suite; admission regressions above
 # explicitly exercise healthy, unhealthy, and missing implementations.
@@ -2019,6 +2025,55 @@ _act_ssh_exec() {
     fi
     local exit_code
     exit_code=$(cat "$SSH_EXIT_CODE_FILE")
+    # Controlled transport outcomes for the failure-evidence integration lane.
+    # The native entry point, log ownership, validation and collector remain
+    # real. No compiler, SSH connection, or signing operation runs here.
+    if [[ -n "${MOCK_NATIVE_EVENT_FILE:-}" ]]; then
+        if [[ "$2" == '# DSR_UNIX_BUILD_GUARD'* ]]; then
+            printf 'build_execution %s\n' "${3:-0}" >> "$MOCK_NATIVE_EVENT_FILE"
+            printf 'controlled build stdout\n'
+            printf 'controlled build stderr\n' >&2
+            return "${MOCK_NATIVE_BUILD_EXIT_CODE:-0}"
+        elif [[ "$cmd" == *'dsr_verified_sources='* && "$cmd" != *DSR_PRIVATE_CACHE_SEED* ]]; then
+            printf 'source_verification %s\n' "${3:-0}" >> "$MOCK_NATIVE_EVENT_FILE"
+            printf 'controlled source verifier stdout\n'
+            printf 'controlled source verifier stderr\n' >&2
+            return "${MOCK_SOURCE_VERIFY_EXIT_CODE:-0}"
+        elif [[ "$cmd" == *DSR_TOOLCHAIN_IDENTITY_PY* && "$cmd" == *'-I - record '* ]]; then
+            printf 'toolchain_observation %s\n' "${3:-0}" >> "$MOCK_NATIVE_EVENT_FILE"
+            printf 'controlled toolchain observer stderr\n' >&2
+            case "${MOCK_NATIVE_OBSERVER_RESULT:-valid}" in
+                timeout) return 124 ;;
+                transport_error) return 255 ;;
+                malformed) printf '{"unexpected":"observation"}\n'; return 0 ;;
+            esac
+        elif [[ "$cmd" == *DSR_PRIVATE_CACHE_SEED* && "$cmd" != *DSR_PRIVATE_CACHE_COMPARE* ]]; then
+            printf 'cargo_final_verification %s\n' "${3:-0}" >> "$MOCK_NATIVE_EVENT_FILE"
+            printf 'controlled Cargo final verifier stderr\n' >&2
+            case "${MOCK_NATIVE_FINAL_CARGO_RESULT:-valid}" in
+                timeout) return 124 ;;
+                transport_error) return 4 ;;
+                malformed) printf '{"unexpected":"cache inventory"}\n'; return 0 ;;
+            esac
+        elif [[ "$cmd" == *DSR_TOOLCHAIN_IDENTITY_PY* && "$cmd" == *'-I - read '* ]]; then
+            printf 'toolchain_final_verification %s\n' "${3:-0}" >> "$MOCK_NATIVE_EVENT_FILE"
+            printf 'controlled toolchain final verifier stderr\n' >&2
+            case "${MOCK_NATIVE_FINAL_TOOLCHAIN_RESULT:-valid}" in
+                timeout) return 124 ;;
+                mismatch)
+                    jq '.tools.rustc.selected_sha256 = ("6" * 64)' "$MOCK_DIR/toolchain-observation.json"
+                    return $?
+                    ;;
+            esac
+        elif [[ "$cmd" =~ ^cat\ \'/[^\']+\.cache-receipt\.json\'$ ]]; then
+            printf 'cache_receipt_verification %s\n' "${3:-0}" >> "$MOCK_NATIVE_EVENT_FILE"
+            printf 'controlled cache receipt stderr\n' >&2
+            if [[ "${MOCK_NATIVE_CACHE_RECEIPT_RESULT:-valid}" == malformed ]]; then
+                jq -nc '{namespace:("a"*64),final_output_policy:"not-detached"}'
+                return $?
+            fi
+        fi
+    fi
     if [[ "$cmd" == *'dsr_verified_sources='* && "$cmd" != *DSR_PRIVATE_CACHE_SEED* &&
           -n "${MOCK_SOURCE_VERIFY_EXIT_CODE:-}" ]]; then
         return "$MOCK_SOURCE_VERIFY_EXIT_CODE"
@@ -3783,15 +3838,22 @@ test_windows_strict_dependency_sources_final_gate() {
         status=0
         result=$(
             _act_finish_windows_private_cargo_home() {
+                local native_execution=false
+                if [[ "${1:-}" == --native-execution ]]; then native_execution=true; shift; fi
                 jq -nc --arg host "$1" --arg home "$2" --arg seed "$3" \
                     --arg source "${4-}" --argjson sources "${5-null}" \
                     --arg command "${6-}" --arg environment "${7-}" --argjson context "${8-null}" \
                     '{host:$host,home:$home,seed:$seed,source:$source,sources:$sources,
                       command:$command,environment:$environment,context:$context}' > "$finish_args"
-                [[ "$boundary" != changed ]] || return 7
-                jq -nc --arg home "$2" '{schema_version:1,mode:"inventory",cargo_home:$home,
+                if [[ "$boundary" == changed ]]; then
+                    [[ "$native_execution" != true ]] || printf '{"command_exit_code":7,"receipt":null}\n'
+                    return 7
+                fi
+                jq -nc --arg home "$2" --argjson native_execution "$native_execution" '
+                    {schema_version:1,mode:"inventory",cargo_home:$home,
                     receipt_path:($home + ".final.json"),receipt_sha256:("1"*64),
-                    inventory_sha256:("2"*64),caches:["git","registry"],file_count:6,size_bytes:256}'
+                    inventory_sha256:("2"*64),caches:["git","registry"],file_count:6,size_bytes:256}
+                    | if $native_execution then {command_exit_code:0,receipt:.} else . end'
             }
             act_run_native_build tool windows/amd64 v1.0.0 \
                 12345678-1234-4234-8234-123456789abc "$source_root"
@@ -3843,16 +3905,23 @@ test_unix_strict_dependency_sources_final_gate() {
         status=0
         result=$(
             _act_finish_unix_private_cargo_home() {
+                local native_execution=false
+                if [[ "${1:-}" == --native-execution ]]; then native_execution=true; shift; fi
                 jq -nc --arg host "$1" --arg home "$2" --arg seed "$3" \
                     --arg source "${4-}" --argjson sources "${5-null}" \
                     '{host:$host,home:$home,seed:$seed,source:$source,sources:$sources}' > "$finish_args"
                 # The compiler transport reports success in both cases. The
                 # independent finish request must still be authoritative when
                 # a remote command skips its own verification postlude.
-                [[ "$boundary" != changed ]] || return 7
-                jq -nc --arg home "$2" '{schema_version:1,mode:"inventory",cargo_home:$home,
+                if [[ "$boundary" == changed ]]; then
+                    [[ "$native_execution" != true ]] || printf '{"command_exit_code":7,"receipt":null}\n'
+                    return 7
+                fi
+                jq -nc --arg home "$2" --argjson native_execution "$native_execution" '
+                    {schema_version:1,mode:"inventory",cargo_home:$home,
                     receipt_path:($home + ".final.json"),receipt_sha256:("1"*64),
-                    inventory_sha256:("2"*64),caches:["git","registry"],file_count:6,size_bytes:256}'
+                    inventory_sha256:("2"*64),caches:["git","registry"],file_count:6,size_bytes:256}
+                    | if $native_execution then {command_exit_code:0,receipt:.} else . end'
             }
             act_run_native_build tool darwin/arm64 v1.0.0 source-final "$source_root"
         ) 2>/dev/null || status=$?
@@ -5484,6 +5553,207 @@ test_ssh_timeout_json_status() {
     fi
 }
 
+# Exercise the complete native entry point through its retained log and JSON
+# result. Only configuration/remote responses use this suite's existing
+# fixtures; this lane does not claim Rust compilation, real SSH, or signing.
+test_native_failure_evidence() {
+    log_test "Native failure evidence: distinguish preparation from build execution"
+    local scenario case_dir result code expected_code expected_status phase raw kind
+    local dispatched budget transport expected_events observed_events log_file diagnostic
+    local _ACT_SYNC_TIMEOUT=13 _ACT_BUILD_TIMEOUT=29
+    for scenario in source_timeout source_error observer_timeout observer_transport_error \
+                    observer_malformed build_timeout build_error success \
+                    ordinary_timeout ordinary_error ordinary_success \
+                    cargo_final_timeout cargo_final_transport_error cargo_final_malformed toolchain_final_timeout \
+                    toolchain_final_mismatch cache_receipt_malformed; do
+        case_dir="$MOCK_DIR/failure-evidence-$scenario"
+        mkdir -p "$case_dir/logs" "$case_dir/artifacts"
+        phase=build_execution raw=0 kind=null dispatched=true budget=29 transport=39
+        expected_code=0 expected_status=success
+        expected_events=$'source_verification 13\ntoolchain_observation 13\nbuild_execution 39'
+        diagnostic='controlled build stderr'
+        case "$scenario" in
+            source_timeout|source_error)
+                phase=source_verification dispatched=false budget=13 transport=13
+                expected_events='source_verification 13'
+                diagnostic='controlled source verifier stderr'
+                ;;
+            observer_*)
+                phase=toolchain_observation dispatched=false budget=13 transport=13
+                expected_events=$'source_verification 13\ntoolchain_observation 13'
+                diagnostic='controlled toolchain observer stderr'
+                ;;
+            ordinary_*) expected_events='build_execution 39' ;;
+            cargo_final_*)
+                phase=cargo_final_verification budget=13 transport=13
+                expected_events+=$'\ncargo_final_verification 13'
+                diagnostic='controlled Cargo final verifier stderr'
+                ;;
+            toolchain_final_*)
+                phase=toolchain_final_verification budget=30 transport=30
+                expected_events+=$'\ncargo_final_verification 13\ntoolchain_final_verification 30'
+                diagnostic='controlled toolchain final verifier stderr'
+                ;;
+            cache_receipt_*)
+                phase=cache_receipt_verification budget=30 transport=30
+                expected_events+=$'\ncargo_final_verification 13\ntoolchain_final_verification 30\ncache_receipt_verification 30'
+                diagnostic='controlled cache receipt stderr'
+                ;;
+            success) expected_events+=$'\ncargo_final_verification 13\ntoolchain_final_verification 30' ;;
+        esac
+        case "$scenario" in
+            *_timeout) raw=124 kind=command expected_code=5 expected_status=timeout ;;
+            observer_transport_error) raw=255 kind=command expected_code=6 expected_status=failed ;;
+            observer_malformed) raw=0 kind=validation expected_code=6 expected_status=failed ;;
+            cargo_final_transport_error) raw=4 kind=command expected_code=6 expected_status=failed ;;
+            cargo_final_malformed|toolchain_final_mismatch|cache_receipt_malformed)
+                raw=0 kind=validation expected_code=6 expected_status=failed ;;
+            *_error) raw=7 kind=command expected_code=6 expected_status=failed ;;
+        esac
+        code=0
+        (
+            # Each case owns fresh capture paths; retain all cases without
+            # clearing an earlier attempt's files or changing operator state.
+            RCH_REQUIRE_REMOTE=0
+            export ACT_LOGS_DIR="$case_dir/logs" ACT_ARTIFACTS_DIR="$case_dir/artifacts"
+            SSH_ARGS_FILE="$case_dir/ssh-args"
+            SCP_ARGS_FILE="$case_dir/scp-args"
+            RAW_SSH_ARGS_FILE="$case_dir/raw-ssh-args"
+            SSH_EXIT_CODE_FILE="$case_dir/ssh-status"
+            SCP_EXIT_CODE_FILE="$case_dir/scp-status"
+            RAW_SSH_EXIT_CODE_FILE="$case_dir/raw-ssh-status"
+            printf '0\n' > "$SSH_EXIT_CODE_FILE"
+            printf '0\n' > "$SCP_EXIT_CODE_FILE"
+            printf '0\n' > "$RAW_SSH_EXIT_CODE_FILE"
+            : > "$ACT_REPOS_DIR/tool.yaml"
+            MOCK_LOCAL_PATH=/local/path/tool
+            MOCK_LANGUAGE=rust
+            MOCK_BINARY_NAME=tool
+            MOCK_BUILD_CMD='cargo build --release --locked --bin tool'
+            MOCK_ARTIFACT_KIND=elf-arm64
+            MOCK_NATIVE_EVENT_FILE="$case_dir/events"
+            MOCK_NATIVE_OBSERVER_RESULT=valid
+            MOCK_NATIVE_BUILD_EXIT_CODE=0
+            MOCK_NATIVE_FINAL_CARGO_RESULT=valid
+            MOCK_NATIVE_FINAL_TOOLCHAIN_RESULT=valid
+            MOCK_NATIVE_CACHE_RECEIPT_RESULT=valid
+            MOCK_SOURCE_VERIFY_EXIT_CODE=0
+            MOCK_SSH_STREAM_FILE="$case_dir/controlled-arm64-header"
+            SDK_COMMAND_FILE="$case_dir/build-program"
+            write_mock_artifact "$MOCK_SSH_STREAM_FILE"
+            _log_error() { printf '%s\n' "$*" >&2; }
+            local source_root=/remote/failure-evidence/source
+            case "$scenario" in
+                source_timeout) MOCK_SOURCE_VERIFY_EXIT_CODE=124 ;;
+                source_error) MOCK_SOURCE_VERIFY_EXIT_CODE=7 ;;
+                observer_timeout) MOCK_NATIVE_OBSERVER_RESULT=timeout ;;
+                observer_transport_error) MOCK_NATIVE_OBSERVER_RESULT=transport_error ;;
+                observer_malformed) MOCK_NATIVE_OBSERVER_RESULT=malformed ;;
+                build_timeout|ordinary_timeout) MOCK_NATIVE_BUILD_EXIT_CODE=124 ;;
+                build_error|ordinary_error) MOCK_NATIVE_BUILD_EXIT_CODE=7 ;;
+                cargo_final_timeout) MOCK_NATIVE_FINAL_CARGO_RESULT=timeout ;;
+                cargo_final_transport_error) MOCK_NATIVE_FINAL_CARGO_RESULT=transport_error ;;
+                cargo_final_malformed) MOCK_NATIVE_FINAL_CARGO_RESULT=malformed ;;
+                toolchain_final_timeout) MOCK_NATIVE_FINAL_TOOLCHAIN_RESULT=timeout ;;
+                toolchain_final_mismatch) MOCK_NATIVE_FINAL_TOOLCHAIN_RESULT=mismatch ;;
+                cache_receipt_malformed)
+                    MOCK_STRICT_CARGO_CACHE_ROOT=/remote/private-build-cache
+                    MOCK_NATIVE_CACHE_RECEIPT_RESULT=malformed
+                    ;;
+            esac
+            if [[ "$scenario" == ordinary_* ]]; then
+                MOCK_LANGUAGE=go
+                MOCK_BUILD_CMD='go build -o tool'
+                source_root=''
+            fi
+            act_run_native_build tool linux/arm64 v1.0.0 failure-evidence \
+                "$source_root" '' '' fixture
+        ) > "$case_dir/stdout" 2> "$case_dir/stderr" || code=$?
+        printf '%s\n' "$code" > "$case_dir/exit-code"
+        if jq -se 'length == 1 and (.[0] | type == "object")' \
+                "$case_dir/stdout" >/dev/null 2>&1; then
+            log_pass "$scenario returns exactly one JSON result on stdout"
+        else
+            log_fail "$scenario leaked diagnostics or did not return one JSON result: $case_dir/stdout"
+        fi
+        # Keep inspecting the terminal result on the old implementation too,
+        # so a before/after run proves more than its existing stdout leak.
+        result=$(tail -1 "$case_dir/stdout")
+        if [[ "$code" -eq "$expected_code" ]] && jq -e \
+                --arg status "$expected_status" --argjson code "$expected_code" \
+                '.status == $status and .exit_code == $code' <<< "$result" >/dev/null 2>&1; then
+            log_pass "$scenario keeps the required public status and exit code"
+        else
+            log_fail "$scenario returned unexpected status/code: process=$code result=$(jq -c '{status,exit_code}' <<< "$result" 2>/dev/null)"
+        fi
+        if jq -e --arg phase "$phase" --argjson raw "$raw" --arg kind "$kind" \
+                --argjson dispatched "$dispatched" --argjson budget "$budget" \
+                --argjson transport "$transport" '
+                .native_execution == {
+                    phase:$phase, timeout_seconds:$budget, transport_timeout_seconds:$transport,
+                    command_exit_code:$raw, failure_kind:(if $kind == "null" then null else $kind end),
+                    build_program_dispatched:$dispatched}' <<< "$result" >/dev/null 2>&1; then
+            log_pass "$scenario identifies the measured phase, raw outcome and actual deadline"
+        else
+            log_fail "$scenario lost or misattributed native execution evidence: $(jq -c '.native_execution' <<< "$result" 2>/dev/null)"
+        fi
+        observed_events=$(cat "$case_dir/events" 2>/dev/null || true)
+        if [[ "$observed_events" == "$expected_events" ]]; then
+            log_pass "$scenario dispatches only the admitted stages with their own budgets"
+        else
+            log_fail "$scenario dispatched unexpected stages: $observed_events"
+        fi
+        if { [[ "$dispatched" == false ]] && ! grep -q '^UNIX_GUARD_TIMEOUT:' "$case_dir/ssh-args"; } ||
+           { [[ "$dispatched" == true ]] && grep -q '^UNIX_GUARD_TIMEOUT:39$' "$case_dir/ssh-args"; }; then
+            log_pass "$scenario build dispatch evidence matches the transport trace"
+        else
+            log_fail "$scenario build dispatch evidence disagrees with the transport trace"
+        fi
+        if [[ "$expected_status" != success ]]; then
+            if [[ ! -s "$case_dir/raw-ssh-args" && ! -s "$case_dir/scp-args" ]] &&
+               jq -e '.artifact_path == "" and .artifact_paths == [] and
+                   .additional_artifacts == [] and .collected_sha256 == null and
+                   .collected_identity == null' <<< "$result" >/dev/null 2>&1; then
+                log_pass "$scenario refuses artifact collection after failure"
+            else
+                log_fail "$scenario exposed an artifact or reached collection after failure"
+            fi
+        elif [[ -s "$case_dir/raw-ssh-args" || -s "$case_dir/scp-args" ]] &&
+             jq -e '.artifact_paths | length == 1' <<< "$result" >/dev/null 2>&1; then
+            log_pass "$scenario preserves successful architecture-checked fixture collection"
+        else
+            log_fail "$scenario did not preserve the successful collection path"
+        fi
+        log_file=$(jq -r '.log_file // ""' <<< "$result" 2>/dev/null)
+        if [[ "$log_file" == "$case_dir/logs/"* && -f "$log_file" ]] &&
+           grep -Fxq "$diagnostic" "$log_file" &&
+           [[ "$(stat -c '%a' "$log_file" 2>/dev/null || stat -f '%Lp' "$log_file")" == 600 ]]; then
+            log_pass "$scenario retains original stderr in its private attempt log"
+        else
+            log_fail "$scenario lost original stderr or private log ownership: $log_file"
+        fi
+        if [[ "$scenario" == observer_malformed ]]; then
+            if grep -Fxq '{"unexpected":"observation"}' "$log_file"; then
+                log_pass "malformed observer output is retained for diagnosis"
+            else
+                log_fail "malformed observer output disappeared from the attempt log"
+            fi
+        fi
+        if [[ "$scenario" == cargo_final_* || "$scenario" == toolchain_final_* || "$scenario" == cache_receipt_* ]]; then
+            if jq -e --argjson sources "$(_test_native_dependency_sources)" '
+                    (.cargo_isolation | type == "object") and
+                    .cargo_isolation.dependency_cache.seed.receipt_sha256 == ("1" * 64) and
+                    .cargo_isolation.dependency_sources == $sources and
+                    .native_execution.build_program_dispatched == true and
+                    .native_execution.phase != "build_execution"' <<< "$result" >/dev/null 2>&1; then
+                log_pass "$scenario preserves the preparation receipt after a successful build command"
+            else
+                log_fail "$scenario discarded preparation evidence or mislabeled a post-build refusal"
+            fi
+        fi
+    done
+}
+
 test_scp_failure_returns_7() {
     log_test "Error: SCP failure returns exit code 7"
     reset_state
@@ -6320,6 +6590,12 @@ test_windows_private_cache_collection() {
 }
 
 main() {
+    if [[ "${1:-}" == --failure-evidence-only ]]; then
+        test_native_failure_evidence
+        printf 'Native failure evidence tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return $?
+    fi
     if [[ "${1:-}" == --windows-guard-only ]]; then
         test_windows_build_guard_transport_and_timeout_validation
         test_windows_rust_isolation_receipt_matches_command
@@ -6543,6 +6819,7 @@ main() {
     test_ssh_failure_json_status
     test_ssh_timeout_returns_5
     test_ssh_timeout_json_status
+    test_native_failure_evidence
     test_scp_failure_returns_7
     test_scp_failure_empty_artifact_path
     test_missing_config_returns_4

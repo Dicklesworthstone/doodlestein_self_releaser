@@ -2241,6 +2241,40 @@ EOF
 
 cmd_build() {
     (
+    # Keep this projection within the build command so callers that load that
+    # command alone retain its complete public receipt handling.
+    _dsr_build_target_details() {
+        # Native workers measure elapsed seconds; preserve that evidence in the
+        # public millisecond field unless a finer-grained measurement exists.
+        jq -c '[.targets[]? | select(type == "object" and (.platform | type == "string")) |
+        {platform, host: (.host // ""), method: (.method // "native"),
+         status: (if (.status // "") | IN("success", "ok", "passed") then "success"
+                  elif .status == "timeout" then "timeout"
+                  elif .status == "skipped" then "skipped" else "failed" end)}
+        + (if (.artifact_path | type) == "string" then {artifact_path} else {} end)
+        + (if (.artifact_paths | type) == "array" then {artifact_paths} else {} end)
+        + (if (.target_triple | type) == "string" then {target_triple} else {} end)
+        + (if (.task_key | type) == "string" then {task_key} else {} end)
+        + (if (.stage | type) == "string" then {stage} else {} end)
+        + (if (.execution_started | type) == "boolean" then {execution_started} else {} end)
+        + (if (.backend_started | type) == "boolean" then {backend_started} else {} end)
+        + (if (.source_sync | type) == "object" then {source_sync} else {} end)
+        + (if (.build_influence_env | type) == "object" then {build_influence_env} else {} end)
+        + (if (.cargo_isolation | type) == "object" then {cargo_isolation} else {} end)
+        + (if (.native_execution | type) == "object" then {native_execution} else {} end)
+        + (if (.log_file | type) == "string" then {log_file} else {} end)
+        + (if (.log_path | type) == "string" then {log_path} else {} end)
+        + (if (.result_path | type) == "string" then {result_path} else {} end)
+        + (if (.attempt | type) == "number" then {attempt} else {} end)
+        + (if (.exit_code | type) == "number" then {exit_code} else {} end)
+        + (if (.worker_exit_code | type) == "number" then {worker_exit_code} else {} end)
+        + (if (.receipt_source | type) == "string" then {receipt_source} else {} end)
+        + (if (.error | type) == "string" then {error} else {} end)
+        + (if (.duration_ms | type) == "number" then {duration_ms: (.duration_ms | floor)}
+           elif (.duration_seconds | type) == "number" then {duration_ms: (.duration_seconds * 1000 | floor)}
+           else {} end)]' <<< "$1"
+    }
+
     # Keep the coordinator's lock and cleanup local to this invocation, even
     # when a caller sources the CLI or already owns the fallback build lock.
     trap - EXIT
@@ -4925,30 +4959,7 @@ EOF
         local target_results_json build_repo
         build_repo=$(act_get_repo "$tool_name" 2>/dev/null || true)
         [[ -z "$build_repo" || "$build_repo" == */* ]] || build_repo="Dicklesworthstone/$build_repo"
-        target_results_json=$(jq -c '[.targets[]? | select(type == "object" and (.platform | type == "string")) |
-            {platform, host: (.host // ""), method: (.method // "native"),
-             status: (if (.status // "") | IN("success", "ok", "passed") then "success"
-                      elif .status == "timeout" then "timeout"
-                      elif .status == "skipped" then "skipped" else "failed" end)}
-            + (if (.artifact_path | type) == "string" then {artifact_path} else {} end)
-            + (if (.artifact_paths | type) == "array" then {artifact_paths} else {} end)
-            + (if (.target_triple | type) == "string" then {target_triple} else {} end)
-            + (if (.task_key | type) == "string" then {task_key} else {} end)
-            + (if (.stage | type) == "string" then {stage} else {} end)
-            + (if (.execution_started | type) == "boolean" then {execution_started} else {} end)
-            + (if (.backend_started | type) == "boolean" then {backend_started} else {} end)
-            + (if (.source_sync | type) == "object" then {source_sync} else {} end)
-            + (if (.build_influence_env | type) == "object" then {build_influence_env} else {} end)
-            + (if (.cargo_isolation | type) == "object" then {cargo_isolation} else {} end)
-            + (if (.log_path | type) == "string" then {log_path} else {} end)
-            + (if (.result_path | type) == "string" then {result_path} else {} end)
-            + (if (.attempt | type) == "number" then {attempt} else {} end)
-            + (if (.exit_code | type) == "number" then {exit_code} else {} end)
-            + (if (.worker_exit_code | type) == "number" then {worker_exit_code} else {} end)
-            + (if (.receipt_source | type) == "string" then {receipt_source} else {} end)
-            + (if (.error | type) == "string" then {error} else {} end)
-            + (if (.duration_ms | type) == "number" then {duration_ms: (.duration_ms | floor)} else {} end)]' \
-            <<< "$result" 2>/dev/null) || target_results_json='[]'
+        target_results_json=$(_dsr_build_target_details "$result" 2>/dev/null) || target_results_json='[]'
         build_details=$(jq -n \
             --arg tool "$tool_name" --arg version "$version" --arg repo "$build_repo" \
             --arg build_purpose "$build_purpose" --arg targets "$target_list" \

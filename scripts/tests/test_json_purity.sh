@@ -5,12 +5,14 @@
 # stderr is empty on successful runs (stream separation).
 #
 # Run: ./scripts/tests/test_json_purity.sh
+# Run --build-target-details-only for the public target projection regressions
+# without host, compiler, signing, network, or yq dependencies.
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-DSR_CMD="$PROJECT_ROOT/dsr"
+DSR_CMD="${DSR_CLI_TEST_SCRIPT:-$PROJECT_ROOT/dsr}"
 
 # Source the test harness
 source "$PROJECT_ROOT/tests/helpers/test_harness.bash"
@@ -450,6 +452,164 @@ test_error_response_structure() {
 }
 
 # ============================================================================
+# Tests: Public Build Target Evidence
+# ============================================================================
+
+# Run the production projection used by cmd_build, not a copy of its jq filter.
+# The supplied worker results are explicit fixtures: these assertions cover
+# public JSON retention and units, not compilation or the native supervisor.
+test_build_target_details() {
+    local failures_before="$TESTS_FAILED" fixture actual
+    ((TESTS_RUN++))
+    if ! command -v jq >/dev/null 2>&1; then
+        fail "public build target evidence requires jq"
+        return 1
+    fi
+    # shellcheck disable=SC1090 # Load the exact production projection below.
+    if ! source <(awk '
+        /^    _dsr_build_target_details\(\) \{/ { copy=1 }
+        copy { print }
+        copy && /^    \}/ { exit }
+    ' "$DSR_CMD") || ! declare -F _dsr_build_target_details >/dev/null; then
+        fail "production public build target projection is available"
+        return 1
+    fi
+    fixture='{
+      "targets": [
+        {
+          "platform":"linux/arm64", "host":"arm-builder", "method":"native",
+          "status":"timeout", "exit_code":5, "duration_seconds":37,
+          "log_file":"/fixture/native/build.log",
+          "log_path":"/fixture/worker/linux-arm64.attempt-1.log",
+          "native_execution":{
+            "phase":"build_execution", "timeout_seconds":3600,
+            "transport_timeout_seconds":3610, "command_exit_code":124,
+            "failure_kind":"command", "build_program_dispatched":true
+          }
+        },
+        {
+          "platform":"linux/amd64", "host":"native-builder", "method":"native",
+          "status":"success", "exit_code":0, "duration_seconds":0,
+          "native_execution":{
+            "phase":"build_execution", "timeout_seconds":3600,
+            "transport_timeout_seconds":3610, "command_exit_code":0,
+            "failure_kind":null, "build_program_dispatched":true
+          }
+        },
+        {
+          "platform":"darwin/arm64", "host":"mac-builder", "method":"native",
+          "status":"success", "duration_ms":12.75, "duration_seconds":99
+        },
+        {
+          "platform":"windows/amd64", "host":"windows-builder", "method":"native",
+          "status":"success", "duration_ms":0, "duration_seconds":99
+        },
+        {
+          "platform":"freebsd/amd64", "host":"", "method":"native", "status":"skipped"
+        },
+        {
+          "platform":"linux/armv7", "host":"arm-builder", "method":"native",
+          "status":"failed", "native_execution":null,
+          "log_file":null, "duration_seconds":"unknown"
+        },
+        {
+          "platform":"darwin/amd64", "host":"source-builder", "method":"native",
+          "status":"timeout", "exit_code":5,
+          "native_execution":{
+            "phase":"source_verification", "timeout_seconds":300,
+            "transport_timeout_seconds":300, "command_exit_code":124,
+            "failure_kind":"command", "build_program_dispatched":false
+          }
+        }
+      ]
+    }'
+    if ! actual=$(_dsr_build_target_details "$fixture") ||
+       ! jq -e 'type == "array" and length == 7' <<< "$actual" >/dev/null; then
+        fail "production projection returns all supplied target rows"
+        return 1
+    fi
+    pass "production projection returns all supplied target rows"
+
+    ((TESTS_RUN++))
+    if jq -e --argjson original "$fixture" '
+        .[0].status == "timeout" and .[0].exit_code == 5 and
+        .[0].native_execution == $original.targets[0].native_execution and
+        .[0].native_execution.command_exit_code == 124
+    ' <<< "$actual" >/dev/null; then
+        pass "timeout evidence retains the raw command outcome separately from the DSR exit code"
+    else
+        fail "timeout evidence must survive the public projection unchanged"
+    fi
+
+    ((TESTS_RUN++))
+    if jq -e --argjson original "$fixture" '
+        .[6].status == "timeout" and .[6].exit_code == 5 and
+        .[6].native_execution == $original.targets[6].native_execution and
+        .[6].native_execution.build_program_dispatched == false
+    ' <<< "$actual" >/dev/null; then
+        pass "source-verification timeout keeps its phase and unstarted build boundary"
+    else
+        fail "pre-build timeout must not become compilation evidence"
+    fi
+
+    ((TESTS_RUN++))
+    if jq -e --argjson original "$fixture" '
+        .[0].log_file == $original.targets[0].log_file and
+        .[0].log_path == $original.targets[0].log_path and
+        .[0].log_file != .[0].log_path
+    ' <<< "$actual" >/dev/null; then
+        pass "public target retains both distinct native and orchestration log paths"
+    else
+        fail "native log_file must not disappear or replace the worker log_path"
+    fi
+
+    ((TESTS_RUN++))
+    if jq -e '.[0].duration_ms == 37000 and .[1].duration_ms == 0' \
+        <<< "$actual" >/dev/null; then
+        pass "native seconds convert to milliseconds, including a measured zero"
+    else
+        fail "37 native seconds must report 37000 milliseconds and zero must remain zero"
+    fi
+
+    ((TESTS_RUN++))
+    if jq -e '.[2].duration_ms == 12 and .[3].duration_ms == 0' \
+        <<< "$actual" >/dev/null; then
+        pass "existing milliseconds take precedence, are floored, and preserve zero"
+    else
+        fail "numeric milliseconds must take precedence over native seconds"
+    fi
+
+    ((TESTS_RUN++))
+    if jq -e --argjson original "$fixture" '
+        .[1].status == "success" and .[1].exit_code == 0 and
+        .[1].native_execution == $original.targets[1].native_execution and
+        .[1].native_execution.failure_kind == null
+    ' <<< "$actual" >/dev/null; then
+        pass "successful native execution evidence remains complete without a fabricated failure"
+    else
+        fail "successful native execution evidence must survive unchanged"
+    fi
+
+    ((TESTS_RUN++))
+    if jq -e '
+        .[4].status == "skipped" and
+        all(.[4:6][]; (has("native_execution") or has("duration_ms") or
+                       has("log_file") or has("log_path")) | not)
+    ' <<< "$actual" >/dev/null; then
+        pass "skipped and unobserved results acquire no invented timing, log, or execution evidence"
+    else
+        fail "missing or invalid evidence must remain absent"
+    fi
+
+    [[ "$TESTS_FAILED" -eq "$failures_before" ]]
+}
+
+if [[ "${1:-}" == --build-target-details-only ]]; then
+    test_build_target_details
+    exit "$?"
+fi
+
+# ============================================================================
 # Cleanup
 # ============================================================================
 
@@ -494,6 +654,10 @@ test_command_field_repos
 echo ""
 echo "Error Response Structure:"
 test_error_response_structure
+
+echo ""
+echo "Public Build Target Evidence:"
+test_build_target_details
 
 echo ""
 echo "=========================================="

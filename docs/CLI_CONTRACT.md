@@ -1028,6 +1028,31 @@ available toolchain identities, and the strict Windows Cargo context summary.
 The values agree with the durable target result and manifest build-environment
 receipt. Failed attempts retain the evidence available before failure;
 unattempted targets do not receive fabricated provenance.
+
+Native results also retain `native_execution`: the observed `phase`, configured
+`timeout_seconds` and `transport_timeout_seconds`, original `command_exit_code`,
+`failure_kind` (`command`, `validation`, or null), and
+`build_program_dispatched`. The source-verification and toolchain-observation
+phases use the sync budget; the final build program uses the build budget, with
+transport cleanup grace recorded separately. A successful observation whose
+receipt fails validation retains command exit zero and a `failure_kind` of
+`"validation"`. A timeout return is still normalized to target status `timeout`
+and DSR exit 5, with raw exit 124 retained. That code alone does not prove that
+the host supervisor fired: inspect the private native attempt `log_file`, which
+is distinct from the coordinator worker transcript at `log_path`.
+
+`build_program_dispatched: false` means the final build transport was not called.
+True records dispatch only; source/toolchain checks inside the guarded program
+can still refuse execution before Cargo or rustc starts. Successful post-build
+verification leaves the build-command observation intact; failed post-build
+verification records its own phase. A later archive or collection failure does
+not turn a successful command into a compiler failure. Earlier admission
+refusals without an execution observation omit this object.
+Native per-target `duration_seconds` is converted to `duration_ms` in public
+JSON when a millisecond measurement is absent; an existing millisecond value,
+including zero, takes precedence. This elapsed time includes native preparation
+and verification and is not a compiler-only timing.
+
 Native targets build on the host their source was synced to. Manifest artifacts
 and build-environment receipts retain the native task's selected triple; flat
 raw payload names are qualified when needed, while archive members keep the

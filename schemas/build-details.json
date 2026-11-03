@@ -52,6 +52,41 @@
     }
   },
   "$defs": {
+    "native_execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase", "timeout_seconds", "transport_timeout_seconds", "command_exit_code", "failure_kind", "build_program_dispatched"],
+      "description": "Most recent native execution boundary, or the later verification boundary that refused the result. This is observed command/transport evidence, not proof that Cargo or rustc ran or that a timeout supervisor fired.",
+      "properties": {
+        "phase": {
+          "enum": ["source_verification", "toolchain_observation", "build_preparation", "build_execution", "cargo_final_verification", "toolchain_final_verification", "cache_receipt_verification"]
+        },
+        "timeout_seconds": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Configured phase deadline, not measured elapsed time; null when this boundary has no applicable configured deadline"
+        },
+        "transport_timeout_seconds": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Configured transport deadline, which can include host-supervisor cleanup grace"
+        },
+        "command_exit_code": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 255,
+          "description": "Original observed command/transport exit before DSR normalization; zero with a validation failure means the returned evidence was refused, and null means no such command result was observed"
+        },
+        "failure_kind": {
+          "enum": ["command", "validation", null],
+          "description": "Whether the command failed or its evidence was refused; null when this boundary succeeded, even if later artifact collection fails"
+        },
+        "build_program_dispatched": {
+          "type": "boolean",
+          "description": "Whether the final guarded build program was sent to the execution transport. True does not prove that its pre-build checks passed or that Cargo or rustc started"
+        }
+      }
+    },
     "build_target": {
       "type": "object",
       "required": ["platform", "host", "method", "status"],
@@ -95,7 +130,7 @@
         "duration_ms": {
           "type": "integer",
           "minimum": 0,
-          "description": "Build duration"
+          "description": "Per-target elapsed time, converted from native duration_seconds when no millisecond measurement exists; not compiler-only timing"
         },
         "artifact_path": {
           "type": "string",
@@ -109,6 +144,13 @@
         "log_path": {
           "type": "string",
           "description": "Path to build log"
+        },
+        "log_file": {
+          "type": "string",
+          "description": "Private native attempt log, distinct from the coordinator worker transcript at log_path"
+        },
+        "native_execution": {
+          "$ref": "#/$defs/native_execution"
         },
         "result_path": {
           "type": "string",

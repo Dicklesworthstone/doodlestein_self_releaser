@@ -6299,8 +6299,42 @@ EOF
 # Preserve its initial receipt, then observe the final inventory; equality to
 # the seed is deliberately not required. Linked/special/config-bearing cache
 # state, or a changed seed receipt, prevents artifact collection.
+# Preserve the transport observation separately from the coordinator's receipt
+# validation. Existing callers still receive only the validated receipt; the
+# native runner requests the internal envelope to retain the original exit.
+_act_finish_private_cargo_home_receipt() {
+    local host="$1" command="$2" cargo_home="$3" capture_execution="$4"
+    local summary receipt="" command_exit=0 result_exit=0
+    summary=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT") || command_exit=$?
+    result_exit="$command_exit"
+    if [[ $command_exit -eq 0 ]]; then
+        receipt=$(jq -ce --arg home "$cargo_home" '
+            select(type == "object" and .schema_version == 1 and .mode == "inventory" and
+                .cargo_home == $home and .receipt_path == ($home + ".final.json") and
+                (.receipt_sha256 | test("^[0-9a-f]{64}$")) and
+                (.inventory_sha256 | test("^[0-9a-f]{64}$")))
+        ' <<< "$summary") || result_exit=$?
+    fi
+    if [[ "$capture_execution" == true ]]; then
+        if [[ $result_exit -ne 0 && -n "$summary" ]]; then
+            printf '%s\n' "$summary" >&2
+        fi
+        [[ $result_exit -eq 0 ]] || receipt=""
+        jq -nc --argjson command_exit "$command_exit" --argjson receipt "${receipt:-null}" \
+            '{command_exit_code: $command_exit, receipt: $receipt}' || return 4
+    elif [[ $result_exit -eq 0 ]]; then
+        printf '%s\n' "$receipt"
+    fi
+    return "$result_exit"
+}
+
 _act_finish_unix_private_cargo_home() {
-    local host="$1" cargo_home="$2" seed_digest="$3" command summary source_verification=""
+    local capture_execution=false
+    if [[ "${1:-}" == --native-execution ]]; then
+        capture_execution=true
+        shift
+    fi
+    local host="$1" cargo_home="$2" seed_digest="$3" command source_verification=""
     [[ $# == 3 || $# == 5 ]] || return 4
     [[ "$cargo_home" =~ ^/[A-Za-z0-9_./+-]+$ && "$cargo_home" != *..* &&
        "$seed_digest" =~ ^[0-9a-f]{64}$ ]] || return 4
@@ -6338,13 +6372,7 @@ _dsr_verify_cache_seed
 printf '%s\\n' "\$dsr_final_summary"
 EOF
 )"
-    summary=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT") || return $?
-    jq -ce --arg home "$cargo_home" '
-        select(type == "object" and .schema_version == 1 and .mode == "inventory" and
-            .cargo_home == $home and .receipt_path == ($home + ".final.json") and
-            (.receipt_sha256 | test("^[0-9a-f]{64}$")) and
-            (.inventory_sha256 | test("^[0-9a-f]{64}$")))
-    ' <<< "$summary"
+    _act_finish_private_cargo_home_receipt "$host" "$command" "$cargo_home" "$capture_execution"
 }
 
 _act_windows_cargo_cache_runtime() {
@@ -6706,8 +6734,13 @@ EOF
 }
 
 _act_finish_windows_private_cargo_home() {
+    local capture_execution=false
+    if [[ "${1:-}" == --native-execution ]]; then
+        capture_execution=true
+        shift
+    fi
     [[ $# == 3 || $# == 5 || $# == 8 ]] || return 4
-    local host="$1" cargo_home="$2" seed_digest="$3" script command summary source_verification
+    local host="$1" cargo_home="$2" seed_digest="$3" script command source_verification
     local context_verification="" context_fingerprint context_receipt_digest context_json
     [[ "$cargo_home" =~ ^[A-Za-z]:/[A-Za-z0-9_./+-]+$ && "$cargo_home" != *..* &&
        "$seed_digest" =~ ^[0-9a-f]{64}$ ]] || return 4
@@ -6747,13 +6780,7 @@ exit 0
 EOF
 )"
     command=$(_act_windows_cache_command "$host" "$cargo_home" "$script") || return $?
-    summary=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT") || return $?
-    jq -ce --arg home "$cargo_home" '
-        select(type == "object" and .schema_version == 1 and .mode == "inventory" and
-            .cargo_home == $home and .receipt_path == ($home + ".final.json") and
-            (.receipt_sha256 | test("^[0-9a-f]{64}$")) and
-            (.inventory_sha256 | test("^[0-9a-f]{64}$")))
-    ' <<< "$summary"
+    _act_finish_private_cargo_home_receipt "$host" "$command" "$cargo_home" "$capture_execution"
 }
 
 _act_strict_cargo_metadata_json() {
@@ -10673,6 +10700,19 @@ _act_stage_cleanup_on_signal() {
     exit "$signal_status"
 }
 
+# Retain native execution boundaries in the attempt's private log. These are
+# coordinator observations: dispatching the final program does not prove that
+# Cargo or a compiler started, and a command returning 124 does not by itself
+# establish that a watchdog expired. Callers keep these diagnostic writes best
+# effort so a log write failure cannot bypass the ordinary stage cleanup.
+_act_log_native_execution() {
+    local log_file="$1" event="$2" phase="$3" timeout_seconds="$4"
+    local transport_timeout_seconds="$5" command_exit_code="$6" dispatched="$7"
+    printf '[dsr] native_execution phase=%s event=%s timeout_seconds=%s transport_timeout_seconds=%s command_exit_code=%s build_program_dispatched=%s\n' \
+        "$phase" "$event" "$timeout_seconds" "$transport_timeout_seconds" \
+        "$command_exit_code" "$dispatched" | tee -a "$log_file" >&2
+}
+
 act_run_native_build() {
     local tool_name="$1"
     local platform="$2"
@@ -11773,6 +11813,8 @@ EOF
     # Ordinary Rust builds: create the stage root with a private copy of
     # the dependency caches before the build command runs (issue #15).
     local exit_code=0
+    local native_execution_phase="" native_execution_timeout=null native_execution_transport_timeout=null
+    local native_execution_exit=null native_execution_failure_kind="" native_build_program_dispatched=false
     local nonstrict_private_cargo_cache=false nonstrict_cargo_seed_json="" nonstrict_seed_home=""
     local cargo_finish=_act_finish_unix_private_cargo_home
     _act_is_windows_host "$host" && cargo_finish=_act_finish_windows_private_cargo_home
@@ -11785,11 +11827,11 @@ EOF
         fi
         if _act_is_windows_host "$host"; then
             nonstrict_cargo_seed_json=$("$nonstrict_prepare" "$host" \
-                "$nonstrict_prepare_root" "$nonstrict_stage_root" "$nonstrict_cargo_home" 2>"$log_file") || \
+                "$nonstrict_prepare_root" "$nonstrict_stage_root" "$nonstrict_cargo_home" 2>>"$log_file") || \
                 nonstrict_prepare_status=$?
         else
             nonstrict_cargo_seed_json=$("$nonstrict_prepare" "$host" \
-                "$nonstrict_prepare_root" "$nonstrict_stage_root" "$nonstrict_cargo_home" "$remote_path" 2>"$log_file") || \
+                "$nonstrict_prepare_root" "$nonstrict_stage_root" "$nonstrict_cargo_home" "$remote_path" 2>>"$log_file") || \
                 nonstrict_prepare_status=$?
         fi
         [[ -s "$log_file" ]] && cat "$log_file" >&2
@@ -11805,18 +11847,40 @@ EOF
     fi
 
     if [[ $exit_code -eq 0 && -n "$strict_sources_verification" ]]; then
-        _act_ssh_exec "$host" "$strict_sources_verification" "$_ACT_SYNC_TIMEOUT" 2>&1 | tee "$log_file"
+        native_execution_phase=source_verification
+        native_execution_timeout="$_ACT_SYNC_TIMEOUT"
+        native_execution_transport_timeout="$_ACT_SYNC_TIMEOUT"
+        _act_log_native_execution "$log_file" start "$native_execution_phase" \
+            "$native_execution_timeout" "$native_execution_transport_timeout" null false || true
+        _act_ssh_exec "$host" "$strict_sources_verification" "$_ACT_SYNC_TIMEOUT" 2>&1 | tee -a "$log_file" >&2
         exit_code=${PIPESTATUS[0]}
+        native_execution_exit="$exit_code"
+        [[ $exit_code -eq 0 ]] || native_execution_failure_kind="command"
+        _act_log_native_execution "$log_file" finish "$native_execution_phase" \
+            "$native_execution_timeout" "$native_execution_transport_timeout" "$native_execution_exit" false || true
     fi
 
     if [[ $exit_code -eq 0 && -n "$strict_toolchain_record_cmd" ]]; then
-        local toolchain_observation_json toolchain_verify
+        local toolchain_observation_json toolchain_observation_raw toolchain_verify
+        local toolchain_observation_status=0
         # Source authentication precedes this actual observation. The build
         # re-probes in its own execution shell before AND after the compiler;
         # a new login-shell selection must match the coordinator-held baseline.
-        if toolchain_observation_json=$(_act_ssh_exec "$host" "$strict_toolchain_record_cmd" \
-                "$_ACT_SYNC_TIMEOUT" 2> >(tee -a "$log_file" >&2)) && \
-           toolchain_observation_json=$(jq -ce --arg target "$selected_triple" '
+        native_execution_phase=toolchain_observation
+        native_execution_timeout="$_ACT_SYNC_TIMEOUT"
+        native_execution_transport_timeout="$_ACT_SYNC_TIMEOUT"
+        _act_log_native_execution "$log_file" start "$native_execution_phase" \
+            "$native_execution_timeout" "$native_execution_transport_timeout" null false || true
+        toolchain_observation_raw=$(_act_ssh_exec "$host" "$strict_toolchain_record_cmd" \
+            "$_ACT_SYNC_TIMEOUT" 2> >(tee -a "$log_file" >&2)) || toolchain_observation_status=$?
+        native_execution_exit="$toolchain_observation_status"
+        _act_log_native_execution "$log_file" finish "$native_execution_phase" \
+            "$native_execution_timeout" "$native_execution_transport_timeout" "$native_execution_exit" false || true
+        if [[ $toolchain_observation_status -ne 0 ]]; then
+            native_execution_failure_kind="command"
+            exit_code="$toolchain_observation_status"
+            _log_error "Toolchain observation returned $toolchain_observation_status; refusing compiler launch"
+        elif toolchain_observation_json=$(jq -ce --arg target "$selected_triple" '
                 select(type == "object" and
                     (.pin | type == "object" and (keys | sort) == ["identity", "sha256"] and
                         (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
@@ -11831,7 +11895,7 @@ EOF
                             (.selected_path | type == "string" and startswith("/")) and
                             (.selected_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
                             (.version | type == "string" and length > 0)))))
-            ' <<< "$toolchain_observation_json") && \
+            ' <<< "$toolchain_observation_raw") && \
            strict_toolchain_pin_json=$(jq -c '.pin' <<< "$toolchain_observation_json") && \
            strict_toolchain_identity_json=$(jq -c '.identity' <<< "$toolchain_observation_json") && \
            toolchain_verify=$(_act_toolchain_identity_script verify "$strict_toolchain_receipt" \
@@ -11841,7 +11905,11 @@ EOF
             remote_cmd="$strict_toolchain_run_prefix$toolchain_verify"$'\n'"$strict_toolchain_effective_build"$'\n'"$toolchain_verify"$'\n'
         else
             _log_error "Original toolchain observation or receipt pin invalid; refusing compiler launch"
+            native_execution_failure_kind=validation
             exit_code=4
+        fi
+        if [[ $exit_code -ne 0 && -n "$toolchain_observation_raw" ]]; then
+            printf '%s\n' "$toolchain_observation_raw" | tee -a "$log_file" >&2
         fi
     fi
 
@@ -11855,6 +11923,11 @@ EOF
             guarded_build_status=$?
         if [[ $guarded_build_status -ne 0 ]]; then
             exit_code=$guarded_build_status
+            native_execution_phase=build_preparation
+            native_execution_timeout=null
+            native_execution_transport_timeout=null
+            native_execution_exit=null
+            native_execution_failure_kind=validation
         else
             build_transport_timeout=$((_ACT_BUILD_TIMEOUT + 10))
         fi
@@ -11872,71 +11945,177 @@ EOF
     # Execute on remote host
     # Use PIPESTATUS to capture the actual command exit code, not tee's
     if [[ $exit_code -eq 0 ]]; then
-        if $nonstrict_private_cargo_cache || [[ -n "$strict_toolchain_record_cmd" ]]; then
-            _act_ssh_exec "$host" "$remote_cmd" "$build_transport_timeout" 2>&1 | tee -a "$log_file"
-        else
-            _act_ssh_exec "$host" "$remote_cmd" "$build_transport_timeout" 2>&1 | tee "$log_file"
-        fi
+        native_execution_phase=build_execution
+        native_execution_timeout="$_ACT_BUILD_TIMEOUT"
+        native_execution_transport_timeout="$build_transport_timeout"
+        native_build_program_dispatched=true
+        _act_log_native_execution "$log_file" start "$native_execution_phase" \
+            "$native_execution_timeout" "$native_execution_transport_timeout" null true || true
+        _act_ssh_exec "$host" "$remote_cmd" "$build_transport_timeout" 2>&1 | tee -a "$log_file" >&2
         exit_code=${PIPESTATUS[0]}
+        native_execution_exit="$exit_code"
+        [[ $exit_code -eq 0 ]] || native_execution_failure_kind="command"
+        _act_log_native_execution "$log_file" finish "$native_execution_phase" \
+            "$native_execution_timeout" "$native_execution_transport_timeout" "$native_execution_exit" true || true
     fi
+    # A rejected final receipt must not replace the valid preparation record:
+    # the failure result still needs that record to emit its diagnostic JSON.
+    local verified_cargo_isolation_json
     if [[ $exit_code -eq 0 ]] && $nonstrict_private_cargo_cache; then
-        local nonstrict_cargo_final_json nonstrict_cargo_seed_digest
+        local nonstrict_cargo_final_json nonstrict_cargo_seed_digest nonstrict_cargo_finish_result
+        local nonstrict_cargo_finish_status=null nonstrict_cargo_command_exit=null
         nonstrict_cargo_seed_digest=$(jq -er '.receipt_sha256' <<< "$nonstrict_cargo_seed_json") || exit_code=4
-        if [[ $exit_code -eq 0 ]] && \
-           nonstrict_cargo_final_json=$("$cargo_finish" \
-               "$host" "$nonstrict_seed_home" "$nonstrict_cargo_seed_digest"); then
-            cargo_isolation_json=$(jq --argjson final "$nonstrict_cargo_final_json" \
-                '.dependency_cache.final = $final' <<< "$cargo_isolation_json") || exit_code=4
-        else
+        if [[ $exit_code -eq 0 ]]; then
+            _act_log_native_execution "$log_file" start cargo_final_verification \
+                "$_ACT_SYNC_TIMEOUT" "$_ACT_SYNC_TIMEOUT" null true || true
+            nonstrict_cargo_finish_status=0
+            nonstrict_cargo_finish_result=$("$cargo_finish" --native-execution \
+                "$host" "$nonstrict_seed_home" "$nonstrict_cargo_seed_digest" \
+                2> >(tee -a "$log_file" >&2)) || nonstrict_cargo_finish_status=$?
+            if ! nonstrict_cargo_command_exit=$(jq -er '
+                    .command_exit_code | select(type == "number" and floor == . and . >= 0 and . <= 255)
+                ' <<< "$nonstrict_cargo_finish_result" 2>/dev/null); then
+                nonstrict_cargo_command_exit=null
+                [[ $nonstrict_cargo_finish_status -ne 0 ]] || nonstrict_cargo_finish_status=4
+            fi
+            _act_log_native_execution "$log_file" finish cargo_final_verification \
+                "$_ACT_SYNC_TIMEOUT" "$_ACT_SYNC_TIMEOUT" "$nonstrict_cargo_command_exit" true || true
+            if [[ $nonstrict_cargo_finish_status -eq 0 ]]; then
+                if nonstrict_cargo_final_json=$(jq -ce '.receipt | select(type == "object")' \
+                        <<< "$nonstrict_cargo_finish_result") && \
+                   verified_cargo_isolation_json=$(jq --argjson final "$nonstrict_cargo_final_json" \
+                        '.dependency_cache.final = $final' <<< "$cargo_isolation_json"); then
+                    cargo_isolation_json="$verified_cargo_isolation_json"
+                else
+                    exit_code=4
+                fi
+            else
+                exit_code="$nonstrict_cargo_finish_status"
+            fi
+        fi
+        if [[ $exit_code -ne 0 ]]; then
             _log_error "Private Cargo cache failed final verification; refusing artifact collection"
-            exit_code=4
+            native_execution_phase=cargo_final_verification
+            native_execution_timeout="$_ACT_SYNC_TIMEOUT"
+            native_execution_transport_timeout="$_ACT_SYNC_TIMEOUT"
+            native_execution_exit="$nonstrict_cargo_command_exit"
+            native_execution_failure_kind=validation
+            [[ "$nonstrict_cargo_command_exit" == null || "$nonstrict_cargo_command_exit" == 0 ]] || \
+                native_execution_failure_kind="command"
         fi
     fi
     if [[ $exit_code -eq 0 ]] && $strict_private_cargo_cache; then
-        local strict_cargo_final_json strict_cargo_seed_digest
+        local strict_cargo_final_json strict_cargo_seed_digest strict_cargo_finish_result
+        local strict_cargo_finish_status=null strict_cargo_command_exit=null
         strict_cargo_seed_digest=$(jq -er '.receipt_sha256' <<< "$strict_cargo_seed_json") || exit_code=4
         local strict_cargo_finish_args=("$host" "$strict_cargo_home" "$strict_cargo_seed_digest")
         strict_cargo_finish_args+=("$remote_path" "$strict_dependency_sources_json")
         if _act_is_windows_host "$host"; then
             strict_cargo_finish_args+=("$build_cmd" "$build_env" "$strict_cargo_context_json")
         fi
-        if [[ $exit_code -eq 0 ]] && \
-           strict_cargo_final_json=$("$cargo_finish" "${strict_cargo_finish_args[@]}"); then
-            cargo_isolation_json=$(jq --argjson final "$strict_cargo_final_json" \
-                '.dependency_cache.final = $final' <<< "$cargo_isolation_json") || exit_code=4
-        else
+        if [[ $exit_code -eq 0 ]]; then
+            _act_log_native_execution "$log_file" start cargo_final_verification \
+                "$_ACT_SYNC_TIMEOUT" "$_ACT_SYNC_TIMEOUT" null true || true
+            strict_cargo_finish_status=0
+            strict_cargo_finish_result=$("$cargo_finish" --native-execution "${strict_cargo_finish_args[@]}" \
+                2> >(tee -a "$log_file" >&2)) || strict_cargo_finish_status=$?
+            if ! strict_cargo_command_exit=$(jq -er '
+                    .command_exit_code | select(type == "number" and floor == . and . >= 0 and . <= 255)
+                ' <<< "$strict_cargo_finish_result" 2>/dev/null); then
+                strict_cargo_command_exit=null
+                [[ $strict_cargo_finish_status -ne 0 ]] || strict_cargo_finish_status=4
+            fi
+            _act_log_native_execution "$log_file" finish cargo_final_verification \
+                "$_ACT_SYNC_TIMEOUT" "$_ACT_SYNC_TIMEOUT" "$strict_cargo_command_exit" true || true
+            if [[ $strict_cargo_finish_status -eq 0 ]]; then
+                if strict_cargo_final_json=$(jq -ce '.receipt | select(type == "object")' \
+                        <<< "$strict_cargo_finish_result") && \
+                   verified_cargo_isolation_json=$(jq --argjson final "$strict_cargo_final_json" \
+                        '.dependency_cache.final = $final' <<< "$cargo_isolation_json"); then
+                    cargo_isolation_json="$verified_cargo_isolation_json"
+                else
+                    exit_code=4
+                fi
+            else
+                exit_code="$strict_cargo_finish_status"
+            fi
+        fi
+        if [[ $exit_code -ne 0 ]]; then
             _log_error "Strict Cargo cache or dependency sources failed final verification; refusing artifact collection"
-            exit_code=4
+            native_execution_phase=cargo_final_verification
+            native_execution_timeout="$_ACT_SYNC_TIMEOUT"
+            native_execution_transport_timeout="$_ACT_SYNC_TIMEOUT"
+            native_execution_exit="$strict_cargo_command_exit"
+            native_execution_failure_kind=validation
+            [[ "$strict_cargo_command_exit" == null || "$strict_cargo_command_exit" == 0 ]] || \
+                native_execution_failure_kind="command"
         fi
     fi
     if [[ $exit_code -eq 0 && -n "$strict_toolchain_receipt" ]]; then
         # Never let a post-build pathname read redefine the pre-build baseline.
         # Secure collection requires the original held byte/inode pin and the
         # exact original observation, including cwd and selected target.
-        local toolchain_identity_json="" toolchain_read
+        local toolchain_identity_json="" toolchain_read toolchain_read_status=null
         if toolchain_read=$(_act_toolchain_identity_script read "$strict_toolchain_receipt" \
-                "$build_cmd" "$strict_toolchain_extra" "$strict_toolchain_pin_json" "$remote_path") && \
-           toolchain_identity_json=$(_act_ssh_exec "$host" "$toolchain_read"$'\n' 30) && \
-           cargo_isolation_json=$(_act_bind_toolchain_identity "$cargo_isolation_json" \
-                "$strict_toolchain_identity_json" "$toolchain_identity_json"); then
-            :
+                "$build_cmd" "$strict_toolchain_extra" "$strict_toolchain_pin_json" "$remote_path"); then
+            _act_log_native_execution "$log_file" start toolchain_final_verification 30 30 null true || true
+            toolchain_read_status=0
+            toolchain_identity_json=$(_act_ssh_exec "$host" "$toolchain_read"$'\n' 30 \
+                2> >(tee -a "$log_file" >&2)) || toolchain_read_status=$?
+            _act_log_native_execution "$log_file" finish toolchain_final_verification 30 30 "$toolchain_read_status" true || true
+            if [[ $toolchain_read_status -eq 0 ]]; then
+                if verified_cargo_isolation_json=$(_act_bind_toolchain_identity "$cargo_isolation_json" \
+                        "$strict_toolchain_identity_json" "$toolchain_identity_json"); then
+                    cargo_isolation_json="$verified_cargo_isolation_json"
+                else
+                    exit_code=4
+                fi
+            else
+                exit_code="$toolchain_read_status"
+            fi
         else
-            _log_error "Strict toolchain identity receipt missing or invalid; refusing artifact collection"
             exit_code=4
+        fi
+        if [[ $exit_code -ne 0 ]]; then
+            _log_error "Strict toolchain identity receipt missing or invalid; refusing artifact collection"
+            native_execution_phase=toolchain_final_verification
+            native_execution_timeout=30
+            native_execution_transport_timeout=30
+            native_execution_exit="$toolchain_read_status"
+            native_execution_failure_kind=validation
+            [[ "$toolchain_read_status" == null || "$toolchain_read_status" == 0 ]] || \
+                native_execution_failure_kind="command"
         fi
     fi
     if [[ $exit_code -eq 0 && -n "$strict_cache_root" ]]; then
-        local cache_receipt
-        if cache_receipt=$(_act_ssh_exec "$host" \
-                "cat '${strict_cargo_target_dir}.cache-receipt.json'" 30) && \
-           jq -e '.namespace | test("^[0-9a-f]{64}$")' <<< "$cache_receipt" >/dev/null && \
+        local cache_receipt cache_receipt_status=0
+        _act_log_native_execution "$log_file" start cache_receipt_verification 30 30 null true || true
+        cache_receipt=$(_act_ssh_exec "$host" \
+            "cat '${strict_cargo_target_dir}.cache-receipt.json'" 30 \
+            2> >(tee -a "$log_file" >&2)) || cache_receipt_status=$?
+        _act_log_native_execution "$log_file" finish cache_receipt_verification 30 30 "$cache_receipt_status" true || true
+        if [[ $cache_receipt_status -ne 0 ]]; then
+            exit_code="$cache_receipt_status"
+        elif jq -e '.namespace | test("^[0-9a-f]{64}$")' <<< "$cache_receipt" >/dev/null && \
            jq -e '.final_output_policy == "fresh-run-target-detached-under-custody"' \
                 <<< "$cache_receipt" >/dev/null; then
-            cargo_isolation_json=$(jq --argjson receipt "$cache_receipt" \
-                '.intermediate_cache.receipt = $receipt' <<< "$cargo_isolation_json") || exit_code=4
+            if verified_cargo_isolation_json=$(jq --argjson receipt "$cache_receipt" \
+                    '.intermediate_cache.receipt = $receipt' <<< "$cargo_isolation_json"); then
+                cargo_isolation_json="$verified_cargo_isolation_json"
+            else
+                exit_code=4
+            fi
         else
-            _log_error "Strict Cargo cache receipt missing or invalid; refusing artifact collection"
             exit_code=4
+        fi
+        if [[ $exit_code -ne 0 ]]; then
+            _log_error "Strict Cargo cache receipt missing or invalid; refusing artifact collection"
+            native_execution_phase=cache_receipt_verification
+            native_execution_timeout=30
+            native_execution_transport_timeout=30
+            native_execution_exit="$cache_receipt_status"
+            native_execution_failure_kind=validation
+            [[ $cache_receipt_status -eq 0 ]] || native_execution_failure_kind="command"
         fi
     fi
 
@@ -11956,6 +12135,7 @@ EOF
 
     # Determine result
     local status local_artifact_path="" local_artifact_paths=()
+    local native_execution_error=""
     local additional_artifact_receipts=()
     local collected_sha256="" collected_size_bytes=0 collected_identity=""
     local strict_collection_receipts=()
@@ -12680,11 +12860,21 @@ EOF
         status="failed"
         exit_code=4
     elif [[ $exit_code -eq 124 ]]; then
-        _log_error "Build timed out on $host after ${_ACT_BUILD_TIMEOUT}s"
+        native_execution_error="Native ${native_execution_phase:-execution} on $host returned exit 124 (configured phase timeout ${native_execution_timeout}s, transport timeout ${native_execution_transport_timeout}s); inspect $log_file for the command or deadline diagnostic"
+        _log_error "$native_execution_error"
         status="timeout"
         exit_code=5
     else
-        _log_error "Build failed on $host with exit code $exit_code"
+        if [[ -n "$native_execution_phase" && -n "$native_execution_failure_kind" ]]; then
+            if [[ "$native_execution_failure_kind" == validation ]]; then
+                native_execution_error="Native $native_execution_phase validation failed on $host (command exit $native_execution_exit); refusing further build or collection work"
+            else
+                native_execution_error="Native $native_execution_phase on $host returned exit $native_execution_exit"
+            fi
+            _log_error "$native_execution_error"
+        else
+            _log_error "Build failed on $host with exit code $exit_code"
+        fi
         status="failed"
         exit_code=6
     fi
@@ -12719,9 +12909,17 @@ EOF
         --argjson collected_size_bytes "$collected_size_bytes" \
         --arg collected_identity "$collected_identity" \
         --argjson build_influence_env "$build_influence_env_json" \
+        --arg execution_phase "$native_execution_phase" \
+        --arg execution_timeout "$native_execution_timeout" \
+        --arg execution_transport_timeout "$native_execution_transport_timeout" \
+        --argjson execution_exit "$native_execution_exit" \
+        --arg execution_failure_kind "$native_execution_failure_kind" \
+        --argjson build_program_dispatched "$native_build_program_dispatched" \
+        --arg execution_error "$native_execution_error" \
         --arg storage_error "$native_storage_error" \
         --arg log_file "$log_file" \
-        'input as $cargo_isolation | {
+        'def seconds: if test("^[1-9][0-9]*$") then tonumber else null end;
+        input as $cargo_isolation | {
             tool: $tool,
             platform: $platform,
             host: $host,
@@ -12739,7 +12937,18 @@ EOF
             build_influence_env: $build_influence_env,
             cargo_isolation: $cargo_isolation,
             log_file: $log_file
-        } + (if $storage_error == "" then {} else
+        } + (if $execution_phase == "" then {} else
+               {native_execution: {
+                   phase: $execution_phase,
+                   timeout_seconds: ($execution_timeout | seconds),
+                   transport_timeout_seconds: ($execution_transport_timeout | seconds),
+                   command_exit_code: $execution_exit,
+                   failure_kind: (if $execution_failure_kind == "" then null else $execution_failure_kind end),
+                   build_program_dispatched: $build_program_dispatched
+               }} end)
+          + (if $execution_error == "" then {} else
+               {stage: $execution_phase, error: $execution_error} end)
+          + (if $storage_error == "" then {} else
                {stage:"host_readiness",error:$storage_error} end)' <<< "$cargo_isolation_json" || return 4
 
     return "$exit_code"
