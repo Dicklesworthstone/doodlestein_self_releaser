@@ -1125,7 +1125,12 @@ download candidates can still refuse preparation. A lockfile without Git
 dependencies does not inspect the Git cache. Selection conservatively covers
 all lockfile packages, not a minimal
 target/feature graph, and selected Git databases/indexes retain their history.
-Ordinary native builds copy the `registry` and `git` caches.
+Ordinary native Unix and Windows builds also select downloads from the source
+workspace's `Cargo.lock` when it exists. An existing malformed or linked lockfile
+refuses preparation; only an absent lockfile permits the unscoped private cache
+snapshot. The selected lockfile digest is retained in the seed receipt. Ordinary
+builds may fetch missing dependencies into their private home and do not gain
+strict source-authentication authority from this cache selection.
 Metadata and target attempts never compile through ambient cache symlinks or
 Windows junctions. Strict metadata admits a retained seed only after successful
 locked offline resolution and source authentication; retained seeds contain

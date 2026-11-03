@@ -6788,22 +6788,47 @@ EOF
 
 _act_prepare_windows_nonstrict_cargo_home() {
     local host="$1" source_root="$2" stage_root="$3" cargo_home="$4" script command summary path
+    local source_root_q
     for path in "$stage_root" "$cargo_home"; do
         [[ "$path" =~ ^[A-Za-z]:/[A-Za-z0-9_./+-]+$ && "$path" != *..* ]] || return 4
     done
     [[ "$stage_root" == */dsr-build-* && "$cargo_home" == "$stage_root/"* ]] || return 4
+    source_root="${source_root//\\//}"
+    if [[ "$source_root" =~ ^/([A-Za-z])/(.*)$ ]]; then
+        source_root="${BASH_REMATCH[1]}:/${BASH_REMATCH[2]}"
+    fi
+    [[ "$source_root" =~ ^[A-Za-z]:/ && "$source_root" != *[[:cntrl:]]* ]] || return 4
+    source_root_q="${source_root//\'/\'\'}"
     script=$(_act_windows_cargo_cache_runtime) || return $?
     script+=$'\n'"$(cat <<EOF
 \$ErrorActionPreference='Stop'
+\$dsrSource=Get-DsrCacheFullPath '$source_root_q'
+\$dsrSourceGuards=Open-DsrCachePathGuard \$dsrSource
+try {
+# A present but invalid lock must fail the existing held-file checks, never
+# become permission to import unrelated ambient sources and Git checkouts.
+# Enumerating the guarded root distinguishes absence from inaccessible or
+# linked lockfiles without suppressing a filesystem error.
+\$dsrLockfile=''
+foreach (\$dsrEntry in (Get-DsrCacheChildren \$dsrSource)) {
+    if ([StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFileName(\$dsrEntry), 'Cargo.lock')) {
+        \$dsrLockfile=\$dsrEntry
+    }
+}
 \$dsrParent=Split-Path -Parent '$stage_root'
 [IO.Directory]::CreateDirectory(\$dsrParent) | Out-Null
 if (Get-Item -LiteralPath '$stage_root' -Force -ErrorAction SilentlyContinue) { throw 'Rust isolation path already exists' }
 [IO.Directory]::CreateDirectory('$stage_root') | Out-Null
 \$dsrAmbient=if (\$env:CARGO_HOME) { \$env:CARGO_HOME } else { Join-Path \$env:USERPROFILE '.cargo' }
 if (-not (Get-Item -LiteralPath \$dsrAmbient -Force -ErrorAction SilentlyContinue)) { \$dsrAmbient='' }
-\$dsrSummary=Invoke-DsrCargoCache -Operation snapshot -First \$dsrAmbient -Second '$cargo_home'
+if (\$dsrLockfile) {
+    \$dsrSummary=Invoke-DsrCargoCache -Operation snapshot -First \$dsrAmbient -Second '$cargo_home' -Lockfile \$dsrLockfile
+} else {
+    \$dsrSummary=Invoke-DsrCargoCache -Operation snapshot -First \$dsrAmbient -Second '$cargo_home'
+}
 Assert-DsrCargoHome -Path '$cargo_home'
 \$dsrSummary | ConvertTo-Json -Compress -Depth 100
+} finally { foreach (\$dsrGuard in \$dsrSourceGuards) { \$dsrGuard.Dispose() } }
 exit 0
 EOF
 )"
