@@ -85,7 +85,7 @@ log_error() { log_info "$@"; }
 log_debug() { :; }
 log_set_tool() { :; }
 _dsr_require() {
-    case "$1" in artifact_naming|packaging) return 0 ;; *) return 3 ;; esac
+    case "$1" in artifact_naming|packaging|build_state) return 0 ;; *) return 3 ;; esac
 }
 check() {
     local label="$1"; shift

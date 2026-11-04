@@ -13,6 +13,9 @@ source "$PROJECT_ROOT/src/artifact_naming.sh"
 source "$PROJECT_ROOT/src/act_runner.sh"
 source "$PROJECT_ROOT/src/signing.sh"
 source "$PROJECT_ROOT/src/sbom.sh"
+# Publication custody uses the real inherited kernel leases. The lazy loader
+# below is a fixture, so load their implementation explicitly as the CLI does.
+source "$PROJECT_ROOT/src/build_state.sh"
 # Exercise the production outbox even though lazy module loading below is a
 # fixture. Only its HTTP boundary is replaced, alongside release asset uploads.
 # shellcheck source=/dev/null
@@ -407,6 +410,300 @@ run_test() {
     else
         FAIL=$((FAIL+1)); printf 'FAIL: %s\n' "$name"
     fi
+}
+
+# Keep the output old without regenerating checksum files during publication.
+# The actual prune command must be able to select it by age when no lease is
+# held. The fixture alias is only for existing network helpers; cmd_release
+# receives the real canonical directory, never that alias.
+release_custody_setup() {
+    setup "$1"
+    export DSR_CACHE_DIR="$CASE/cache"
+    RELEASE_CUSTODY_ARTIFACTS="$DSR_STATE_DIR/artifacts/tool-v1.2.3"
+    mkdir -p "$DSR_STATE_DIR/artifacts" "$DSR_CACHE_DIR" || return 1
+    mv "$CASE/artifacts" "$RELEASE_CUSTODY_ARTIFACTS" || return 1
+    ln -s "$RELEASE_CUSTODY_ARTIFACTS" "$CASE/artifacts" || return 1
+    manifest payload.bin || return 1
+    cp "$CASE/artifacts/tool-v1.2.3-manifest.json" "$RELEASE_CUSTODY_ARTIFACTS-manifest.json" || return 1
+    local digest
+    digest=$(_gh_asset_sha256 "$CASE/artifacts/payload.bin") || return 1
+    printf '%s  payload.bin\n' "$digest" > "$CASE/artifacts/SHA256SUMS" || return 1
+    printf '%s  payload.bin\n' "$digest" > "$CASE/artifacts/payload.bin.sha256" || return 1
+    python3 - "$RELEASE_CUSTODY_ARTIFACTS" "$RELEASE_CUSTODY_ARTIFACTS-manifest.json" <<'PY'
+import os, sys, time
+old = time.time() - 60 * 86400
+for path in sys.argv[1:]:
+    os.utime(path, (old, old))
+PY
+}
+
+release_custody_inventory() {
+    python3 - "$@" <<'PY'
+import hashlib, json, os, pathlib, sys
+rows = []
+for name in sys.argv[1:]:
+    root = pathlib.Path(name)
+    paths = [root] + (sorted(root.rglob('*')) if root.is_dir() else [])
+    for path in paths:
+        if not path.exists() and not path.is_symlink():
+            rows.append([str(path), None])
+            continue
+        info = path.lstat()
+        content = (os.readlink(path) if path.is_symlink() else
+                   hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else '')
+        rows.append([str(path), info.st_dev, info.st_ino, info.st_mode,
+                     info.st_uid, info.st_gid, info.st_mtime_ns, content])
+print(json.dumps(rows, sort_keys=True))
+PY
+}
+
+release_custody_wait_for() {
+    local marker="$1" attempt
+    for ((attempt=0; attempt<200; attempt++)); do
+        [[ ! -f "$marker" ]] || return 0
+        sleep 0.025
+    done
+    printf 'Timed out waiting for %s\n' "$marker" >&2
+    return 1
+}
+
+release_custody_open_gate() {
+    # Nonblocking open also makes a failed observer bounded: no test can hang
+    # trying to release a worker that has already exited.
+    python3 - "$1" <<'PY'
+import os, sys
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_NONBLOCK)
+try:
+    os.write(fd, b'continue\n')
+finally:
+    os.close(fd)
+PY
+}
+
+release_custody_try_acquire() (
+    local version="$1" result=0
+    build_state_init || return 1
+    build_lock_acquire tool "$version" || result=$?
+    if [[ "$result" == 0 ]]; then
+        build_lock_release tool "$version" || return 1
+    fi
+    return "$result"
+)
+
+release_custody_start_holder() {
+    local version="$1" mode="$2"
+    mkfifo "$CASE/holder-gate" || return 1
+    (
+        build_state_init || exit 1
+        build_lock_acquire tool "$version" || exit 1
+        if [[ "$mode" == inherited ]]; then
+            (
+                exec 8<> "$CASE/holder-gate"
+                : > "$CASE/holder-ready"
+                IFS= read -r -t 30 _release_gate <&8
+            ) &
+            # Closing only this coordinator's descriptor leaves the worker's
+            # inherited open description locked after the coordinator exits.
+            build_lock_release tool "$version" || exit 1
+        else
+            exec 8<> "$CASE/holder-gate"
+            : > "$CASE/holder-ready"
+            IFS= read -r -t 30 _release_gate <&8 || exit 1
+            build_lock_release tool "$version" || exit 1
+        fi
+    ) > "$CASE/holder.log" 2>&1 &
+    RELEASE_CUSTODY_HOLDER_PID=$!
+    if [[ "$mode" == inherited ]]; then
+        wait "$RELEASE_CUSTODY_HOLDER_PID" || return 1
+    fi
+    release_custody_wait_for "$CASE/holder-ready"
+}
+
+release_custody_stop_holder() {
+    local version="$1" mode="$2" attempt
+    release_custody_open_gate "$CASE/holder-gate" || return 1
+    if [[ "$mode" != inherited ]]; then
+        wait "$RELEASE_CUSTODY_HOLDER_PID" || return 1
+    fi
+    for ((attempt=0; attempt<200; attempt++)); do
+        if _build_lock_probe "$DSR_STATE_DIR/builds/tool/$version/.lock"; then return 0; fi
+        sleep 0.025
+    done
+    return 1
+}
+
+release_custody_result() {
+    (($# == 0)) && return 0
+    printf 'Custody regression: %s\n' "$@" >&2
+    return 1
+}
+
+test_release_keeps_artifacts_during_publication() {
+    release_custody_setup custody_prune || return 1
+    local publisher status=0 probe_status=0 prune_status=0 before after problems=()
+    mkfifo "$CASE/scan-gate" || return 1
+    # Pause only the existing GitHub boundary, after real local admission and
+    # checksum validation. No network request or lease operation is mocked.
+    _release_contract_scan_release_by_tag() {
+        printf 'SCAN %s %s\n' "$1" "$2" >> "$CALLS"
+        if [[ ! -e "$CASE/scan-ready" ]]; then
+            exec 8<> "$CASE/scan-gate"
+            : > "$CASE/scan-ready"
+            IFS= read -r -t 30 _release_gate <&8 || return 8
+            exec 8>&-
+        fi
+        jq -nc --slurpfile release "$CASE/release.json" '{count:1,release:$release[0]}'
+    }
+    cmd_release tool 1.2.3 --artifacts "$RELEASE_CUSTODY_ARTIFACTS" --resume --no-dispatch \
+        > "$CASE/stdout" 2> "$CASE/stderr" &
+    publisher=$!
+    if release_custody_wait_for "$CASE/scan-ready"; then
+        release_custody_try_acquire v1.2.3 > "$CASE/canonical.log" 2>&1 || probe_status=$?
+        [[ "$probe_status" == 2 ]] || problems+=("canonical lease available during publication: $probe_status")
+        probe_status=0
+        release_custody_try_acquire 1.2.3 > "$CASE/bare.log" 2>&1 || probe_status=$?
+        [[ "$probe_status" == 2 ]] || problems+=("bare lease available during publication: $probe_status")
+        before=$(release_custody_inventory "$RELEASE_CUSTODY_ARTIFACTS" "$RELEASE_CUSTODY_ARTIFACTS-manifest.json")
+        "$PROJECT_ROOT/dsr" --json --state-dir "$DSR_STATE_DIR" --cache-dir "$DSR_CACHE_DIR" \
+            prune --max-age 30 --keep-last 0 --no-keep-releases --force \
+            > "$CASE/prune.stdout" 2> "$CASE/prune.stderr" || prune_status=$?
+        after=$(release_custody_inventory "$RELEASE_CUSTODY_ARTIFACTS" "$RELEASE_CUSTODY_ARTIFACTS-manifest.json")
+        [[ "$prune_status" == 0 && "$before" == "$after" ]] || problems+=("prune changed active publication inputs")
+        jq -e --arg path "$RELEASE_CUSTODY_ARTIFACTS" '
+            any(.details.retained_artifact_paths[]?; .path==$path and .reason=="build_custody") and
+            all(.details.pruned_paths[]?; .path!=$path and .path!=($path+"-manifest.json"))
+        ' "$CASE/prune.stdout" >/dev/null || problems+=("prune did not report complete artifact retention")
+        release_custody_open_gate "$CASE/scan-gate" || problems+=("could not release publication observer")
+    else
+        problems+=("publication never reached its network boundary")
+    fi
+    wait "$publisher" || status=$?
+    [[ "$status" == 0 ]] && jq -es 'length==1 and .[0].command=="release" and
+        .[0].exit_code==0 and .[0].details.success==4' "$CASE/stdout" >/dev/null ||
+        problems+=("publication failed after retained inputs were released")
+    release_custody_try_acquire v1.2.3 > "$CASE/canonical-after.log" 2>&1 || problems+=("canonical lease remained held")
+    release_custody_try_acquire 1.2.3 > "$CASE/bare-after.log" 2>&1 || problems+=("bare lease remained held")
+    release_custody_result "${problems[@]}"
+}
+
+release_custody_busy_case() {
+    local version="$1" mode="$2" forged_flag="$3" status=0 probe_status=0 before after problems=()
+    release_custody_setup "custody_busy_${version}_${mode}_${forged_flag}" || return 1
+    release_custody_start_holder "$version" "$mode" || return 1
+    if [[ "$forged_flag" == true ]]; then export DSR_BUILD_LOCK_HELD_BY_CALLER=1;
+    else unset DSR_BUILD_LOCK_HELD_BY_CALLER; fi
+    before=$(release_custody_inventory "$RELEASE_CUSTODY_ARTIFACTS" "$RELEASE_CUSTODY_ARTIFACTS-manifest.json")
+    cmd_release tool 1.2.3 --artifacts "$RELEASE_CUSTODY_ARTIFACTS" --resume --no-dispatch \
+        > "$CASE/stdout" 2> "$CASE/stderr" || status=$?
+    after=$(release_custody_inventory "$RELEASE_CUSTODY_ARTIFACTS" "$RELEASE_CUSTODY_ARTIFACTS-manifest.json")
+    [[ "$status" == 2 ]] || problems+=("busy $version $mode custody returned $status")
+    [[ ! -s "$CALLS" && "$before" == "$after" ]] || problems+=("busy publication reached the API or changed inputs")
+    if [[ "$version" == 1.2.3 ]]; then
+        _build_lock_probe "$DSR_STATE_DIR/builds/tool/v1.2.3/.lock" || probe_status=$?
+        [[ "$probe_status" == 0 ]] || problems+=("partial acquisition leaked the canonical lease")
+    fi
+    release_custody_stop_holder "$version" "$mode" || problems+=("fixture custody did not release")
+    release_custody_try_acquire v1.2.3 > "$CASE/canonical-after.log" 2>&1 || problems+=("canonical lease remained held")
+    release_custody_try_acquire 1.2.3 > "$CASE/bare-after.log" 2>&1 || problems+=("bare lease remained held")
+    release_custody_result "${problems[@]}"
+}
+
+test_release_refuses_busy_canonical_custody() { release_custody_busy_case v1.2.3 coordinator false; }
+test_release_refuses_busy_bare_custody() { release_custody_busy_case 1.2.3 coordinator false; }
+test_release_refuses_inherited_worker_custody() { release_custody_busy_case v1.2.3 inherited false; }
+test_release_caller_flag_cannot_bypass_custody() { release_custody_busy_case v1.2.3 coordinator true; }
+
+test_release_borrows_fallback_custody_without_releasing_it() {
+    release_custody_setup custody_fallback || return 1
+    build_state_init || return 1
+    build_lock_acquire tool v1.2.3 || return 1
+    local before after output status=0 probe_status=0 problems=()
+    before=$(release_custody_inventory "$DSR_STATE_DIR/builds/tool/v1.2.3")
+    trap 'printf "caller exit\n" >> "$CASE/caller-exit"' EXIT
+    trap -p EXIT > "$CASE/caller-trap.before"
+    export DSR_BUILD_LOCK_HELD_BY_CALLER=1
+    # This is fallback's actual call form: the registered lease descriptor is
+    # inherited by a command substitution, while its acquiring shell survives.
+    output=$(cmd_release tool 1.2.3 --artifacts "$RELEASE_CUSTODY_ARTIFACTS" --resume --no-dispatch \
+        2> "$CASE/stderr") || status=$?
+    printf '%s\n' "$output" > "$CASE/stdout"
+    trap -p EXIT > "$CASE/caller-trap.after"
+    cmp -s "$CASE/caller-trap.before" "$CASE/caller-trap.after" && [[ ! -e "$CASE/caller-exit" ]] ||
+        problems+=("release replaced or ran its caller's exit trap")
+    after=$(release_custody_inventory "$DSR_STATE_DIR/builds/tool/v1.2.3")
+    [[ "$status" == 0 && "$before" == "$after" ]] || problems+=("borrowed publication failed or rewrote ancestor custody")
+    jq -es 'length==1 and .[0].command=="release" and .[0].exit_code==0 and
+        .[0].details.success==4' "$CASE/stdout" >/dev/null || problems+=("borrowed release did not emit one successful result")
+    _build_lock_probe "$DSR_STATE_DIR/builds/tool/v1.2.3/.lock" || probe_status=$?
+    [[ "$probe_status" == 2 ]] || problems+=("release dropped the ancestor lease")
+    probe_status=0
+    _build_lock_probe "$DSR_STATE_DIR/builds/tool/1.2.3/.lock" || probe_status=$?
+    [[ "$probe_status" == 0 ]] || problems+=("release leaked its newly acquired bare lease")
+    build_lock_release tool v1.2.3 || problems+=("ancestor could not release its own lease")
+    release_custody_result "${problems[@]}"
+}
+
+test_release_cleanup_failure_emits_one_error() {
+    release_custody_setup custody_cleanup_failure || return 1
+    # Change real custody metadata at the existing API boundary. The original
+    # kernel lease remains held; cleanup must refuse to close an unverified
+    # descriptor and report that failure before emitting its final result.
+    _release_contract_scan_release_by_tag() {
+        printf 'SCAN %s %s\n' "$1" "$2" >> "$CALLS"
+        local lock_file="$DSR_STATE_DIR/builds/tool/v1.2.3/.lock"
+        if [[ -f "$lock_file" && ! -e "$CASE/original-custody" ]]; then
+            cp "$lock_file" "$CASE/original-custody" || return 8
+            printf 'changed fixture custody record\n' > "$lock_file" || return 8
+        fi
+        jq -nc --slurpfile release "$CASE/release.json" '{count:1,release:$release[0]}'
+    }
+    local status=0 probe_status=0 problems=()
+    cmd_release tool 1.2.3 --artifacts "$RELEASE_CUSTODY_ARTIFACTS" --resume --no-dispatch \
+        > "$CASE/stdout" 2> "$CASE/stderr" || status=$?
+    [[ "$status" == 4 ]] || problems+=("unverifiable cleanup returned $status")
+    jq -es 'length==1 and .[0].command=="release" and .[0].status=="error" and
+        .[0].exit_code==4 and .[0].details.success==4 and .[0].details.stage=="build_custody" and
+        (.[0].details.error | type=="string" and length>0)' "$CASE/stdout" >/dev/null ||
+        problems+=("cleanup failure did not emit one accurate error result")
+    if [[ -f "$CASE/original-custody" ]] &&
+       [[ "$(cat "$DSR_STATE_DIR/builds/tool/v1.2.3/.lock")" == 'changed fixture custody record' ]]; then
+        # Restore only this test's original metadata so the real probe can
+        # check that exiting the private release shell closed its lease.
+        cp "$CASE/original-custody" "$DSR_STATE_DIR/builds/tool/v1.2.3/.lock" || return 1
+        _build_lock_probe "$DSR_STATE_DIR/builds/tool/v1.2.3/.lock" || probe_status=$?
+        [[ "$probe_status" == 0 ]] || problems+=("cleanup failure leaked a live descriptor")
+    else
+        problems+=("release rewrote changed custody metadata")
+    fi
+    release_custody_result "${problems[@]}"
+}
+
+test_release_early_failure_releases_owned_custody() {
+    release_custody_setup custody_failed_input || return 1
+    printf 'changed after manifest creation\n' >> "$CASE/artifacts/payload.bin"
+    local status=0 version probe_status problems=()
+    cmd_release tool 1.2.3 --artifacts "$RELEASE_CUSTODY_ARTIFACTS" --resume --no-dispatch \
+        > "$CASE/stdout" 2> "$CASE/stderr" || status=$?
+    [[ "$status" == 4 && ! -s "$CALLS" ]] || problems+=("invalid input was not refused before the API")
+    for version in v1.2.3 1.2.3; do
+        [[ -f "$DSR_STATE_DIR/builds/tool/$version/.lock.lease" ]] || problems+=("input was read without $version custody")
+        probe_status=0
+        _build_lock_probe "$DSR_STATE_DIR/builds/tool/$version/.lock" || probe_status=$?
+        [[ "$probe_status" == 0 ]] || problems+=("failed admission left $version custody held")
+    done
+    release_custody_result "${problems[@]}"
+}
+
+test_release_dry_run_creates_no_build_custody() {
+    release_custody_setup custody_dry_run || return 1
+    local before after status=0
+    before=$(release_custody_inventory "$DSR_STATE_DIR" "$DSR_CACHE_DIR")
+    DRY_RUN=true cmd_release tool 1.2.3 --artifacts "$RELEASE_CUSTODY_ARTIFACTS" --resume --no-dispatch \
+        > "$CASE/stdout" 2> "$CASE/stderr" || status=$?
+    after=$(release_custody_inventory "$DSR_STATE_DIR" "$DSR_CACHE_DIR")
+    [[ "$status" == 0 && "$before" == "$after" && ! -s "$CALLS" ]] &&
+        jq -es 'length==1 and .[0].command=="release" and .[0].status=="dry_run" and .[0].exit_code==0' \
+            "$CASE/stdout" >/dev/null
 }
 
 test_saved_name_missing_remotely_is_uploaded() {
@@ -1592,7 +1889,10 @@ test_promotion_rejects_digestless_remote_byte_drift() {
     promotion_setup promotion_changed_remote || return 1
     jq 'map(.digest=null)' "$CASE/inventory.json" > "$CASE/inventory.next" &&
         mv "$CASE/inventory.next" "$CASE/inventory.json" || return 1
-    printf 'fake payload\n' > "$CASE/remote/100"
+    # The mock remote copied the frozen upload's read-only mode. Make only
+    # these remote fixture bytes writable before injecting the intended drift.
+    chmod u+w "$CASE/remote/100" || return 1
+    printf 'fake payload\n' > "$CASE/remote/100" || return 1
     run_release --resume --publish-draft
     [[ $STATUS -eq 1 ]] && grep -q '^DOWNLOAD ' "$CALLS" &&
         ! grep -q '^CREATE\|^POST \|^PUBLISH\|^DISPATCH' "$CALLS" &&
@@ -2279,7 +2579,13 @@ test_sbom_missing_aggregate_blocks_publication() {
         jq -e '.draft==true' "$CASE/release.json" >/dev/null
 }
 
-for test in test_saved_name_missing_remotely_is_uploaded test_identical_remote_is_reused_without_deletion \
+for test in test_release_keeps_artifacts_during_publication \
+    test_release_refuses_busy_canonical_custody test_release_refuses_busy_bare_custody \
+    test_release_refuses_inherited_worker_custody test_release_caller_flag_cannot_bypass_custody \
+    test_release_borrows_fallback_custody_without_releasing_it \
+    test_release_cleanup_failure_emits_one_error \
+    test_release_early_failure_releases_owned_custody test_release_dry_run_creates_no_build_custody \
+    test_saved_name_missing_remotely_is_uploaded test_identical_remote_is_reused_without_deletion \
     test_saved_name_with_changed_remote_fails_closed test_legacy_digestless_assets_are_hashed \
     test_unavailable_inventory_is_not_success test_failed_resume_lookup_never_creates \
     test_draft_resume_does_not_dispatch_or_verify_upgrade test_named_upload_emits_one_json_envelope \

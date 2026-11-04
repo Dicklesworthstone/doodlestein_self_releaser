@@ -117,6 +117,7 @@ set -uo pipefail
 source "$ROOT/src/github.sh"
 source "$ROOT/src/config.sh"
 source "$ROOT/src/git_ops.sh"
+source "$ROOT/src/build_state.sh"
 source "$ROOT/src/act_runner.sh"
 source "${DSR_TEST_SIGNING_MODULE:-$ROOT/src/signing.sh}"
 source "$ROOT/src/artifact_naming.sh"
@@ -164,7 +165,6 @@ if [[ "$1" == create || "$1" == fallback ]]; then
     if [[ "$mode" == create ]]; then
         cmd_release app 1.2.3 --draft --no-dispatch "$@"
     else
-        source "$ROOT/src/build_state.sh"
         # These are only quality/build execution boundaries. Every source,
         # checkpoint, manifest, signature, custody and publication gate is real.
         _check_repo() { printf '{"status":"ok"}\n'; }

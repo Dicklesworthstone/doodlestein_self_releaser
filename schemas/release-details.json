@@ -18,6 +18,18 @@
       "type": "string",
       "description": "Git tag name"
     },
+    "stage": {
+      "type": "string",
+      "description": "Failure stage when available; build_custody identifies blocked artifact ownership or failed lease cleanup"
+    },
+    "lease_version": {
+      "type": "string",
+      "description": "Version namespace whose custody prevented publication"
+    },
+    "error": {
+      "type": "string",
+      "description": "Error explanation when publication admission or cleanup failed"
+    },
     "release_id": {
       "type": "integer",
       "description": "GitHub release ID"

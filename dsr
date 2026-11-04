@@ -7656,6 +7656,11 @@ EOF
 }
 
 cmd_release() {
+    # Own newly acquired descriptors and cleanup without replacing a caller's
+    # traps. Fallback's inherited descriptors remain owned by its coordinator.
+    (
+    trap - EXIT
+    trap 'exit 5' HUP INT TERM
     local tool_name=""
     local version=""
     local artifacts_dir=""
@@ -7821,6 +7826,7 @@ EXAMPLES:
 EXIT CODES:
     0  - Release created successfully
     1  - Some assets failed to upload
+    2  - Build or release custody is busy
     3  - Authentication error
     4  - Invalid arguments
     7  - Release creation failed
@@ -7911,7 +7917,13 @@ EOF
 
     # Normalize version tag
     local tag
-    tag=$(git_ops_version_to_tag "$version")
+    tag=$(git_ops_version_to_tag "$version") || return 4
+    if [[ ! "$tool_name" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$ ||
+          ! "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$ ||
+          ! "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$ ]]; then
+        log_error "Release requires a safe tool/version custody namespace"
+        return 4
+    fi
 
     local release_contract_json="null"
     local release_contract_enabled=false
@@ -7973,6 +7985,56 @@ EOF
     local state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
     if [[ -z "$artifacts_dir" ]]; then
         artifacts_dir="$state_dir/artifacts/${tool_name}-${tag}"
+    fi
+
+    # Publication consumes the same files that build collection and prune own.
+    # Reserve both version spellings before the first artifact/manifest read.
+    # An environment flag is not custody: fallback must pass a verifiable
+    # inherited registry entry and its original open kernel-lease description.
+    local release_custody_state_dir="$state_dir/builds"
+    local -a release_owned_versions=() release_lease_versions=("$tag")
+    local release_lease_version release_custody_rc release_custody_cleanup
+    _release_cleanup_build_custody() {
+        local _BUILD_STATE_DIR="$1" custody_tool="$2" held_version cleanup_status=0
+        shift 2
+        for held_version in "$@"; do
+            build_lock_release "$custody_tool" "$held_version" || cleanup_status=1
+        done
+        return "$cleanup_status"
+    }
+    if ! $DRY_RUN; then
+        _dsr_require build_state || return 3
+        local _BUILD_STATE_DIR="$release_custody_state_dir"
+        [[ ! "${tag#v}" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$ ]] ||
+            release_lease_versions+=("${tag#v}")
+        for release_lease_version in "${release_lease_versions[@]}"; do
+            release_custody_rc=0
+            build_lock_borrow "$tool_name" "$release_lease_version" || release_custody_rc=$?
+            if [[ "$release_custody_rc" == 1 ]]; then
+                release_custody_rc=0
+                if build_lock_acquire "$tool_name" "$release_lease_version"; then
+                    release_owned_versions+=("$release_lease_version")
+                    # Freeze every cleanup argument: an early return may
+                    # unwind locals before this private shell's EXIT trap.
+                    printf -v release_custody_cleanup '%q ' _release_cleanup_build_custody \
+                        "$release_custody_state_dir" "$tool_name" "${release_owned_versions[@]}"
+                    # shellcheck disable=SC2064 # Deliberately freeze %q-quoted custody arguments.
+                    trap "$release_custody_cleanup >&2" EXIT
+                else
+                    release_custody_rc=$?
+                    [[ "$release_custody_rc" == 2 ]] || release_custody_rc=4
+                fi
+            fi
+            if [[ "$release_custody_rc" != 0 ]]; then
+                log_error "Release build custody is busy or unverifiable for $tool_name $release_lease_version"
+                $JSON_MODE && json_envelope release error "$release_custody_rc" \
+                    "$(jq -nc --arg repo "$repo" --arg version "$version" --arg tag "$tag" \
+                        --arg lease_version "$release_lease_version" \
+                        '{repo:$repo,version:$version,tag:$tag,stage:"build_custody",
+                          lease_version:$lease_version,error:"Release build custody is busy or unverifiable"}')"
+                return "$release_custody_rc"
+            fi
+        done
     fi
 
     if [[ ! -d "$artifacts_dir" ]]; then
@@ -10031,6 +10093,21 @@ EOF
         rm -f "$upload_state_file"
     fi
 
+    # Freeze output paths while custody is still held, then check cleanup
+    # before emitting success. EXIT remains armed if ownership has changed.
+    local release_artifacts_path release_custody_error=""
+    release_artifacts_path=$(cd "$artifacts_dir" && pwd -P) || return 4
+    if _release_cleanup_build_custody "$release_custody_state_dir" "$tool_name" \
+        ${release_owned_versions[@]+"${release_owned_versions[@]}"} >&2; then
+        release_owned_versions=()
+        trap - EXIT
+    else
+        release_custody_error="Release finished but its build custody could not be released"
+        log_error "$release_custody_error"
+        status=error
+        exit_code=4
+    fi
+
     # Output
     if $JSON_MODE; then
         local details
@@ -10044,8 +10121,9 @@ EOF
             --arg create_response "$create_response" \
             --arg create_response_dir "$create_response_dir" \
             --arg staging_receipt "$ordinary_intent" \
+            --arg custody_error "$release_custody_error" \
             --argjson staged "$ordinary_owned" \
-            --arg artifacts_dir "$(cd "$artifacts_dir" && pwd -P)" \
+            --arg artifacts_dir "$release_artifacts_path" \
             --argjson draft "$draft" \
             --argjson promotion_requested "$publish_draft" \
             --argjson prerelease "$prerelease" \
@@ -10100,11 +10178,12 @@ EOF
                     repos: (if $dispatch_repos == "" then [] else ($dispatch_repos | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))) end),
                     results: $dispatch_results
                 }
-            }')
+            } + (if $custody_error == "" then {} else
+                {stage:"build_custody",error:$custody_error} end)')
         json_envelope "release" "$status" "$exit_code" "$details"
     else
         echo ""
-        if [[ $failed_count -eq 0 ]]; then
+        if [[ $exit_code -eq 0 ]]; then
             log_ok "Release $tag complete: $success_count asset(s) uploaded"
         else
             log_error "Release $tag incomplete: $success_count uploaded, $failed_count failed"
@@ -10114,12 +10193,12 @@ EOF
         if $draft && [[ -n "$create_response" ]]; then
             local finalize_command
             printf -v finalize_command 'TMPDIR=%q dsr release finalize %q %q --artifacts %q --create-response %q --no-dispatch' \
-                "$create_response_dir" "$tool_name" "$version" "$(cd "$artifacts_dir" && pwd -P)" "$create_response"
+                "$create_response_dir" "$tool_name" "$version" "$release_artifacts_path" "$create_response"
             log_info "Finalize: $finalize_command"
         elif $draft && $ordinary_owned; then
             local resume_command
             printf -v resume_command 'dsr release %q %q --artifacts %q --resume' \
-                "$tool_name" "$version" "$(cd "$artifacts_dir" && pwd -P)"
+                "$tool_name" "$version" "$release_artifacts_path"
             if $sbom_enabled; then
                 printf -v resume_command '%s --sbom-format %q' "$resume_command" "$sbom_format"
             fi
@@ -10152,6 +10231,7 @@ EOF
     fi
 
     return $exit_code
+    )
 }
 
 # ============================================================================
