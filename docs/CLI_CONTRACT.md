@@ -1435,16 +1435,22 @@ GNU target and `MAJOR.MINOR` suffix receives this interpretation; other
 subcommands, non-GNU targets, malformed versions and conflicting command-list
 selections refuse admission. Both `--target VALUE` and `--target=VALUE` work.
 
-Strict explicit versioned Zig builds use the same generated Cargo dispatcher
-as managed glibc-floor builds. Its exact generator bytes are verified before
+Strict explicit Zig builds, including unversioned GNU and musl targets, use
+the same generated Cargo dispatcher as managed glibc-floor builds.
+An unversioned invocation retains the plain target in both `rust_target` and
+`zig_target`, with `glibc_floor: null`; DSR adds no ABI suffix or floor.
+Its exact generator bytes are verified before
 tool lookup; it preserves explicit Zig arguments and pins the absolute Zig
 executable selected on the delegated PATH. Caller `CARGO_ZIGBUILD_*` dispatch
 overrides, including empty values, are refused. Cargo global-option prefixes
 and `+toolchain` retain their argument boundaries. Record, cache and pre/post
 build verification require this dispatcher; metadata-only admission uses
 ordinary locked/offline Cargo metadata and does not compile through Zig.
-Changing the requested floor, dispatcher, plugin or compiler invalidates the
-held receipt. The exact ABI request also remains in the strict cache key.
+Changing the requested target or floor, dispatcher, plugin or compiler
+invalidates the held receipt. The exact request, including an absent floor,
+also remains in the strict cache key. This binding prevents cargo-zigbuild's
+Python-first discovery from executing an unobserved `ziglang` module even
+when a different, hash-verified Zig executable is available on PATH.
 
 The requested Zig version is separate from the configured
 `linux_glibc_floor` ceiling on collected ELF requirements. A request for

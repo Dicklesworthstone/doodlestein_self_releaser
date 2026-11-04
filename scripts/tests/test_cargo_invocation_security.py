@@ -183,6 +183,38 @@ class InvocationBoundaryTests(unittest.TestCase):
         with self.assertRaisesRegex(Refused, 'versioned targets'):
             invoke('cargo zigbuild', environment={'CARGO_BUILD_TARGET': TRIPLE + '.2.28'})
 
+    def test_unversioned_zig_targets_request_dispatch_without_a_glibc_floor(self):
+        for target in (TRIPLE, 'aarch64-unknown-linux-gnu', 'x86_64-unknown-linux-musl',
+                       'aarch64-unknown-linux-musl', 'aarch64-apple-darwin'):
+            environment = {'CARGO_BUILD_TARGET': target, 'DSR_TARGET_TRIPLE': target,
+                           'DSR_LINUX_GLIBC_FLOOR': '2.28'}
+            for spelling in ('--target ', '--target='):
+                command = 'cargo +nightly --quiet zigbuild --locked ' + spelling + target
+                with self.subTest(command=command):
+                    selected = invoke(command, environment=environment)[0]
+                    self.assertEqual(selected['target'], target)
+                    self.assertEqual(selected['cargo_zigbuild'], {
+                        'rust_target': target, 'zig_target': target, 'glibc_floor': None})
+                    self.assertEqual(selected['environment']['DSR_LINUX_GLIBC_FLOOR'], '2.28')
+            with self.subTest(target=target, command='ordinary Cargo'):
+                self.assertIsNone(invoke('cargo build --locked --target ' + target,
+                                         environment=environment)[0]['cargo_zigbuild'])
+
+    def test_unversioned_zig_cannot_share_an_incompatible_dispatch_receipt(self):
+        first = 'cargo zigbuild --target ' + TRIPLE
+        for command in (first + ' && cargo build --target ' + TRIPLE,
+                        first + ' && ' + first + '.2.28',
+                        first + ' --target x86_64-unknown-linux-musl',
+                        'cargo zigbuild --target aarch64-unknown-linux-gnu',
+                        'CARGO_BUILD_TARGET=elsewhere ' + first,
+                        'DSR_TARGET_TRIPLE=elsewhere ' + first):
+            with self.subTest(command=command), self.assertRaises(Refused):
+                invoke(command)
+        self.assertEqual(invoke(first + ' && ' + first)[0]['cargo_zigbuild'], {
+            'rust_target': TRIPLE, 'zig_target': TRIPLE, 'glibc_floor': None})
+        with self.assertRaisesRegex(Refused, 'requires a literal target'):
+            invoke('cargo zigbuild', environment={})
+
     def test_explicit_zig_conflicting_tasks_and_floors_are_refused(self):
         first = 'cargo zigbuild --target ' + TRIPLE + '.2.28'
         for command in (first + ' && cargo zigbuild --target ' + TRIPLE + '.2.17',
@@ -199,14 +231,16 @@ class InvocationBoundaryTests(unittest.TestCase):
         program = '''source "$1" || exit $?;
 _act_validate_native_target_command "$2" "$3" "$4" || exit $?;
 _act_explicit_zigbuild_selection "$2" "$3"'''
-        for target in (TRIPLE, 'aarch64-unknown-linux-gnu'):
-            command = 'cargo +selected --offline zigbuild --target=' + target + '.2.28'
+        for target, floor in ((TRIPLE, '2.28'), ('aarch64-unknown-linux-gnu', '2.28'),
+                              (TRIPLE, None), ('x86_64-unknown-linux-musl', None)):
+            zig_target = target + '.' + floor if floor else target
+            command = 'cargo +selected --offline zigbuild --target=' + zig_target
             environment = 'CARGO_BUILD_TARGET=' + target + '\nDSR_TARGET_TRIPLE=' + target
             result = subprocess.run(['bash', '-c', program, '_', str(MODULE), command,
                                      environment, target], text=True, capture_output=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout), {
-                'rust_target': target, 'zig_target': target + '.2.28', 'glibc_floor': '2.28'})
+                'rust_target': target, 'zig_target': zig_target, 'glibc_floor': floor})
 
     def test_worker_shell_startup_cannot_execute_during_coordinator_planning(self):
         work = Path(tempfile.mkdtemp(prefix='dsr-zig-coordinator-')).resolve()
@@ -262,14 +296,14 @@ class ZigShimAdmissionTests(unittest.TestCase):
                                 DSR_ZIG_TARGET=TRIPLE + '.2.28', DSR_LINUX_GLIBC_FLOOR='2.28',
                                 PATH=str(self.shim_dir) + os.pathsep + os.environ['PATH'])
 
-    def admission(self, target=TRIPLE, path=None, shim=True):
+    def admission(self, target=TRIPLE, path=None, shim=True, command=None, floor='2.28'):
         """Run the emitted Python through shim admission, before tool probes.
 
         Keep the generated argv (including the controller-derived hash) and
         every preceding production statement. Expose only the already-observed
         pre-compiler state; never replace a tool or fabricate its version.
         """
-        command = 'cargo +fixture-selected build --release --locked --target ' + target
+        command = command or 'cargo +fixture-selected build --release --locked --target ' + target
         script = emit('record', command, self.shim_dir if shim else '', self.receipt)
         header, body = script.split("<<'DSR_TOOLCHAIN_IDENTITY_PY'\n", 1)
         argv = shlex.split(header.splitlines()[-1].strip())[2:]
@@ -282,7 +316,8 @@ class ZigShimAdmissionTests(unittest.TestCase):
         else:
             self.fail('generated observer has no pre-compiler admission boundary')
         environment = dict(self.environment, CARGO_BUILD_TARGET=target,
-                           DSR_RUST_TARGET=target, DSR_ZIG_TARGET=target + '.2.28')
+                           DSR_RUST_TARGET=target, DSR_ZIG_TARGET=target + '.' + floor if floor else target,
+                           DSR_LINUX_GLIBC_FLOOR=floor or '')
         if path is not None:
             environment['PATH'] = path
         namespace = {'__name__': '__main__'}
@@ -339,6 +374,18 @@ class ZigShimAdmissionTests(unittest.TestCase):
                                (shim + ':' + first + ':' + shim + ':' + second, first + ':' + second)):
             with self.subTest(path=path):
                 self.assertEqual(self.admission(path=path)['probe_env']['PATH'], expected)
+
+    def test_unversioned_zig_has_exact_shim_custody_and_no_implicit_floor(self):
+        for target in (TRIPLE, 'aarch64-unknown-linux-gnu', 'x86_64-unknown-linux-musl'):
+            command = 'cargo +fixture-selected --quiet zigbuild --target=' + target
+            with self.subTest(target=target):
+                observed = self.admission(target, command=command, floor=None)
+                self.assertEqual(observed['selection']['cargo_zigbuild'], {
+                    'rust_target': target, 'zig_target': target, 'glibc_floor': None})
+                self.assertEqual(observed['zig_shim_record']['selected_sha256'],
+                                 hashlib.sha256(self.generator).hexdigest())
+                self.assertEqual(observed['probe_env']['PATH'], os.environ['PATH'])
+                self.assertEqual(observed['probe_env']['DSR_LINUX_GLIBC_FLOOR'], '')
 
     def test_mixed_platform_selection_does_not_carry_linux_shim_authority_to_native_targets(self):
         # Deterministic selection matrix only, not a mixed release execution.
@@ -461,6 +508,33 @@ class ZigShimAdmissionTests(unittest.TestCase):
         wrong = emit('record', 'cargo zigbuild --target=' + TRIPLE + '.2.17', self.shim_dir, self.receipt)
         self.assert_refused(self.observe(script=wrong), 'explicit Zig target/floor does not match')
 
+    def test_unversioned_zig_requires_dispatch_and_rejects_floor_or_shim_substitution(self):
+        for target in (TRIPLE, 'x86_64-unknown-linux-musl'):
+            command = 'cargo zigbuild --target=' + target
+            environment = dict(self.environment, CARGO_BUILD_TARGET=target, DSR_RUST_TARGET=target,
+                               DSR_ZIG_TARGET=target, DSR_LINUX_GLIBC_FLOOR='')
+            for mode in ('record', 'context'):
+                with self.subTest(target=target, mode=mode):
+                    bare = emit(mode, command, receipt=self.receipt)
+                    self.assert_refused(self.observe(script=bare, environment=environment),
+                                        'requires the generated DSR Cargo shim')
+                    managed = emit(mode, command, self.shim_dir, self.receipt)
+                    self.assert_refused(self.observe(script=managed, environment=environment),
+                                        'configured Rustup dispatch overrides')
+                    wrong_floor = dict(environment, DSR_LINUX_GLIBC_FLOOR='2.28')
+                    self.assert_refused(self.observe(script=managed, environment=wrong_floor),
+                                        'target/floor does not match')
+                    for name in self.zig_selectors:
+                        self.assert_refused(self.observe(script=managed, environment=dict(environment, **{name: ''})),
+                                            'does not accept Zig dispatch overrides')
+            ordinary = emit('record', 'cargo build --target=' + target, self.shim_dir, self.receipt)
+            self.assert_refused(self.observe(script=ordinary, environment=environment),
+                                'target/floor does not match')
+        marker = self.work / 'modified-unversioned-shim-executed'
+        self.shim.write_text('#!/bin/sh\nprintf ran > ' + shlex.quote(str(marker)) + '\nexit 0\n')
+        self.assert_refused(self.observe(script=managed, environment=environment), 'trusted generator bytes')
+        self.assertFalse(marker.exists())
+
     def transport_environment(self):
         """Capture launcher argv/environment only; never emulate a Rust build."""
         directory = self.project / 'delegated tools'
@@ -546,6 +620,21 @@ class ZigShimAdmissionTests(unittest.TestCase):
                 self.assertEqual(captured['zig'], dict.fromkeys(self.zig_selectors))
                 self.assertFalse(Path(environment['DSR_FIXTURE_PLUGIN_MARKER']).exists())
                 self.assertFalse(Path(environment['DSR_FIXTURE_ZIG_MARKER']).exists())
+
+    def test_unversioned_generated_dispatch_preserves_exact_caller_target_arguments(self):
+        directory, environment = self.transport_environment()
+        for index, target in enumerate((TRIPLE, 'aarch64-unknown-linux-gnu', 'x86_64-unknown-linux-musl')):
+            argv = ['+fixture-selected', '--quiet', 'zigbuild', '--locked', '--target=' + target]
+            capture = self.work / ('unversioned-dispatch-' + str(index) + '.json')
+            env = dict(environment, CARGO_BUILD_TARGET=target, DSR_RUST_TARGET=target,
+                       DSR_ZIG_TARGET=target, DSR_LINUX_GLIBC_FLOOR='', DSR_FIXTURE_CAPTURE=str(capture))
+            result = subprocess.run([str(self.shim), *argv], cwd=self.project, env=env,
+                                    text=True, capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            captured = json.loads(capture.read_text())
+            self.assertEqual(captured['argv'], argv)
+            self.assertEqual(captured['zig']['CARGO_ZIGBUILD_ZIG_COMMAND'], str(directory / 'zig'))
+            self.assertEqual(captured['zig']['CARGO_ZIGBUILD_PYTHON_PATH'], '/dev/null')
 
     def test_external_zig_selectors_including_empty_values_refuse_before_plugin_or_cargo(self):
         _, environment = self.transport_environment()

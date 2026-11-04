@@ -391,7 +391,7 @@ _act_zig_shim_prefix_sh "$2" | bash'''
                     DSR_ZIG_TARGET=target + '.2.28', DSR_LINUX_GLIBC_FLOOR='2.28',
                     CARGO_TARGET_DIR=str(work / label))
 
-    def linux_output(output, target):
+    def linux_output(output, target, floor=(2, 28, 0)):
         path = output / target / 'debug/identity-probe'
         if not path.is_file():
             return False
@@ -401,8 +401,9 @@ _act_zig_shim_prefix_sh "$2" | bash'''
                     if re.fullmatch(rb'GLIBC_[0-9]+\.[0-9]+(?:\.[0-9]+)?', token)]
         return (data[:5] == b'\x7fELF\x02' and data[5] == 1 and
                 int.from_bytes(data[18:20], 'little') == machine and
-                bool(versions) and
-                all(version + (0,) * (3 - len(version)) <= (2, 28, 0) for version in versions))
+                ((not versions) if target.endswith('-linux-musl') else bool(versions)) and
+                (floor is None or
+                 all(version + (0,) * (3 - len(version)) <= floor for version in versions)))
 
     # Exercise the genuine plugin's Python-first discovery independently of
     # Cargo compilation. This adversarial module intentionally spoofs only
@@ -534,6 +535,54 @@ _act_native_result_target_triple fixture "$result"'''
                              cwd=explicit_project, expected_cwd=explicit_project, zig_shim_dir=shim_dir)
         check('unchanged Cargo and canonical target cannot hide an explicit floor change: ' + target,
               changed.returncode != 0 and 'changed during the build' in changed.stderr)
+
+    # Unversioned GNU and musl invoke the same plugin discovery code. Keep
+    # the requested target unchanged and report no requested glibc floor;
+    # actual linking must still use the independently observed Zig binary.
+    unversioned_targets = list(zig_targets)
+    musl_target = 'x86_64-unknown-linux-musl'
+    if (selected / 'lib/rustlib' / musl_target / 'lib').is_dir():
+        unversioned_targets.append(musl_target)
+    else:
+        print('SKIP genuine musl Zig dispatch requires installed x86_64-unknown-linux-musl stdlib', flush=True)
+    for target in unversioned_targets:
+        env = dict(shim_environment(target, 'unversioned-zig-output-' + target),
+                   DSR_ZIG_TARGET=target, DSR_LINUX_GLIBC_FLOOR='')
+        marker = work / ('unversioned-zig-shadow-' + target)
+        env.update(PYTHONPATH=str(python_shadow), PYTHONDONTWRITEBYTECODE='1',
+                   DSR_TEST_ZIG_SHADOW_MARKER=str(marker))
+        command = 'cargo +fixture-selected --quiet zigbuild --locked --offline --target=' + target
+        bare_env = dict(env, PATH=dispatch_env['PATH'])
+        bare, _, bare_receipt = probe(command, bare_env)
+        bare_context, _, _ = probe(command, bare_env, mode='context')
+        check('unversioned Zig cannot record/cache an unobserved Python dispatch: ' + target,
+              bare.returncode != 0 and bare_context.returncode != 0 and not bare_receipt.exists() and
+              'requires the generated DSR Cargo shim' in bare.stderr and not marker.exists())
+        before, observed, receipt = probe(command, env, zig_shim_dir=shim_dir)
+        prebuild, _, _ = probe(command, env, mode='verify', receipt=receipt, zig_shim_dir=shim_dir)
+        compiled = build(command, env) if before.returncode == prebuild.returncode == 0 else before
+        after, _, _ = probe(command, env, mode='verify', receipt=receipt, zig_shim_dir=shim_dir)
+        (work / ('unversioned-zig-build-' + target + '.log')).write_text(compiled.stdout + compiled.stderr)
+        requested = {'rust_target': target, 'zig_target': target, 'glibc_floor': None}
+        check('genuine unversioned Zig compiles and verifies without importing shadow Python: ' + target,
+              before.returncode == prebuild.returncode == compiled.returncode == after.returncode == 0 and
+              linux_output(Path(env['CARGO_TARGET_DIR']), target, floor=None) and not marker.exists())
+        check('unversioned target retains null floor, exact shim and actual toolchain/Zig bytes: ' + target,
+              observed.get('target_triple') == target and
+              observed.get('selection', {}).get('cargo_zigbuild') == requested and
+              observed.get('selection', {}).get('dsr_cargo_shim') == requested and
+              observed.get('tools', {}).get('dsr_cargo_shim', {}).get('selected_sha256') == shim_digest and
+              observed.get('tools', {}).get('zig', {}).get('selected_sha256') == digest(dispatch_bin / 'zig') and
+              expected_tool(observed, 'cargo', selected / 'bin/cargo') and
+              expected_tool(observed, 'rustc', selected / 'bin/rustc'))
+        with shim.open('ab') as stream:
+            stream.write(b'# unversioned build cannot authorize modified dispatcher bytes\n')
+        changed, _, _ = probe(command, env, mode='verify', receipt=receipt, zig_shim_dir=shim_dir)
+        check('successful unversioned build still refuses a modified shim: ' + target,
+              before.returncode == compiled.returncode == after.returncode == 0 and
+              changed.returncode != 0 and 'trusted generator bytes' in changed.stderr)
+        shim.rename(work / ('retained-unversioned-drift-shim-' + target))
+        require(['bash', '-o', 'pipefail', '-c', staging, '_', module, shim_dir], env=environment)
 
     # Actual Linux observations coexist with explicit synthetic macOS/Windows
     # records at the collector boundary. This does not qualify those hosts.
@@ -746,6 +795,31 @@ _act_strict_cargo_cache_script "$2" '{}' "$3" "$4" | bash'''
               explicit_cache_keys['first'] == explicit_cache_keys['relocated'] and
               bool(explicit_cache_keys['changed-floor']) and
               explicit_cache_keys['first'] != explicit_cache_keys['changed-floor'])
+        unversioned_cache_keys = {}
+        for next_target in (zig_targets[0], musl_target):
+            if next_target not in unversioned_targets:
+                continue
+            next_env = dict(shim_environment(next_target, 'unversioned-cached-' + next_target),
+                            DSR_ZIG_TARGET=next_target, DSR_LINUX_GLIBC_FLOOR='')
+            next_command = 'cargo +fixture-selected --quiet zigbuild --locked --offline --target=' + next_target
+            before, _, next_receipt = probe(next_command, next_env, zig_shim_dir=shim_dir)
+            compiled = run(['bash', '-o', 'pipefail', '-c', cache_program, '_', module,
+                            cache_root, next_command, shim_dir], cwd=project, env=next_env, timeout=240)
+            after, _, _ = probe(next_command, next_env, mode='verify', receipt=next_receipt,
+                               zig_shim_dir=shim_dir)
+            (work / ('unversioned-zig-cache-' + next_target + '.log')).write_text(compiled.stdout + compiled.stderr)
+            cache_file = Path(next_env['CARGO_TARGET_DIR'] + '.cache-receipt.json')
+            cached = json.loads(cache_file.read_text()) if cache_file.is_file() else {}
+            unversioned_cache_keys[next_target] = cached.get('namespace')
+            check('genuine unversioned Zig cache binds exact target and empty floor environment: ' + next_target,
+                  before.returncode == compiled.returncode == after.returncode == 0 and
+                  linux_output(Path(next_env['CARGO_TARGET_DIR']), next_target, floor=None) and
+                  cached.get('contract', {}).get('environment', {}).get('DSR_LINUX_GLIBC_FLOOR') == '' and
+                  cached.get('contract', {}).get('toolchain', {}).get('cargo_zigbuild') == {
+                      'rust_target': next_target, 'zig_target': next_target, 'glibc_floor': None})
+        check('unversioned Zig cache cannot reuse an explicitly qualified GNU ABI namespace',
+              bool(unversioned_cache_keys.get(zig_targets[0])) and
+              unversioned_cache_keys[zig_targets[0]] != explicit_cache_keys['first'])
     elif mode == 'zig-shim':
         check('dedicated Zig shim qualification requires nightly for the strict-cache regression', False)
     else:

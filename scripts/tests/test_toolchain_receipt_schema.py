@@ -132,7 +132,7 @@ def shim_observation(triple=TRIPLE, floor='2.28'):
     result = resolver_observation()
     result['target_triple'] = triple
     result['selection']['dsr_cargo_shim'] = {
-        'rust_target': triple, 'zig_target': triple + '.' + floor, 'glibc_floor': floor}
+        'rust_target': triple, 'zig_target': triple + '.' + floor if floor else triple, 'glibc_floor': floor}
     result['tools'].update({name: executable(name) for name in ('cargo-zigbuild', 'zig')})
     result['tools']['dsr_cargo_shim'] = dict(executable('cargo'),
         selected_path='/var/tmp/run/.dsr-bin-linux/cargo', selected_kind='script', version='')
@@ -403,6 +403,31 @@ class ToolchainReceiptSchemaTests(unittest.TestCase):
             changed = explicit_zig_observation()
             changed['target_triple'] = target
             self.rejected(changed)
+
+    def test_unversioned_zig_preserves_null_floor_and_complete_dispatch_evidence(self):
+        for triple in (TRIPLE, 'aarch64-unknown-linux-gnu', 'x86_64-unknown-linux-musl',
+                       'aarch64-unknown-linux-musl', 'aarch64-apple-darwin'):
+            with self.subTest(triple=triple):
+                original = explicit_zig_observation(triple, None)
+                self.accepted(original)
+                for missing in ('cargo', 'rustc', 'cargo-zigbuild', 'zig', 'dsr_cargo_shim'):
+                    changed = deepcopy(original)
+                    del changed['tools'][missing]
+                    self.rejected(changed)
+                for missing in ('cargo_zigbuild', 'dsr_cargo_shim'):
+                    changed = deepcopy(original)
+                    del changed['selection'][missing]
+                    self.rejected(changed)
+                changed = deepcopy(original)
+                changed['selection']['cargo_commands'] = ['build']
+                self.rejected(changed)
+                for key in ('cargo_zigbuild', 'dsr_cargo_shim'):
+                    for field, value in (('glibc_floor', ''), ('glibc_floor', 'native'),
+                                         ('glibc_floor', '2.28'), ('zig_target', triple + '.2.28'),
+                                         ('zig_target', triple + '\n'), ('rust_target', triple + '.2.28')):
+                        changed = deepcopy(original)
+                        changed['selection'][key][field] = value
+                        self.rejected(changed)
 
     def test_dispatch_pins_are_closed_and_complete(self):
         for name in ('rustup_resolver', 'toolchain_launcher'):

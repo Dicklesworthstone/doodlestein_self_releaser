@@ -727,7 +727,19 @@
           "required": ["selection"],
           "properties": {
             "cwd": {"pattern": "^/"},
-            "selection": {"required": ["dsr_cargo_shim"]},
+            "selection": {
+              "required": ["dsr_cargo_shim"],
+              "allOf": [{
+                "if": {"properties": {"dsr_cargo_shim": {
+                  "required": ["glibc_floor"],
+                  "properties": {"glibc_floor": {"type": "null"}}
+                }}},
+                "then": {
+                  "required": ["cargo_zigbuild"],
+                  "properties": {"cargo_commands": {"contains": {"const": "zigbuild"}}}
+                }
+              }]
+            },
             "tools": {
               "required": ["dsr_cargo_shim", "cargo-zigbuild", "zig"],
               "properties": {
@@ -748,6 +760,14 @@
           "properties": {"selection": {"required": ["cargo_zigbuild"]}}
         },
         "then": {
+          "allOf": [{
+            "if": {"properties": {"selection": {"properties": {"cargo_zigbuild": {
+              "required": ["glibc_floor"], "properties": {"glibc_floor": {"type": "string"}}
+            }}}}},
+            "then": {"properties": {"target_triple": {
+              "pattern": "^[A-Za-z0-9_]+(-[A-Za-z0-9_]+)*-linux-gnu$"
+            }}}
+          }],
           "properties": {
             "cwd": {"pattern": "^/"},
             "target_triple": {"$ref": "#/$defs/toolchain_identity/properties/selection/properties/dsr_cargo_shim/properties/rust_target"},
@@ -776,25 +796,36 @@
             "cargo_target": {"$ref": "#/$defs/cargo_target_observation"},
             "cargo_zigbuild": {
               "$ref": "#/$defs/toolchain_identity/properties/selection/properties/dsr_cargo_shim",
-              "description": "Exact GNU target and requested glibc version from an explicit cargo zigbuild invocation, retained separately from its canonical Rust target and enforced through the byte-verified DSR dispatcher. The requested version is not a claim about the resulting ELF requirements."
+              "description": "Exact target from an explicit cargo zigbuild invocation, enforced through the byte-verified DSR dispatcher. A requested GNU glibc version is retained separately from the canonical Rust target; unversioned targets record a null floor and are not rewritten. The request is not a claim about the resulting binary's ABI requirements."
             },
             "dsr_cargo_shim": {
               "type": "object",
-              "description": "Target and glibc floor delegated by the separately byte-verified DSR Cargo shim; underlying Cargo, rustup, cargo-zigbuild and Zig retain their executable identities.",
+              "description": "Target and optional glibc floor delegated by the separately byte-verified DSR Cargo shim; underlying Cargo, rustup, cargo-zigbuild and Zig retain their executable identities. A null floor requires an explicit unversioned zigbuild invocation.",
               "required": ["rust_target", "zig_target", "glibc_floor"],
               "additionalProperties": false,
+              "oneOf": [{
+                "properties": {
+                  "rust_target": {"pattern": "^[A-Za-z0-9_]+(-[A-Za-z0-9_]+)*-linux-gnu$"},
+                  "zig_target": {"pattern": "^[A-Za-z0-9_]+(-[A-Za-z0-9_]+)*-linux-gnu\\.[0-9]+\\.[0-9]+$"},
+                  "glibc_floor": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$", "not": {"pattern": "[^0-9.]"}}
+                }
+              }, {
+                "properties": {
+                  "zig_target": {"pattern": "^[A-Za-z0-9_]+(-[A-Za-z0-9_]+)+$"},
+                  "glibc_floor": {"type": "null"}
+                }
+              }],
               "properties": {
                 "rust_target": {
-                  "type": "string", "pattern": "^[A-Za-z0-9_]+(-[A-Za-z0-9_]+)*-linux-gnu$",
+                  "type": "string", "pattern": "^[A-Za-z0-9_]+(-[A-Za-z0-9_]+)+$",
                   "not": {"pattern": "[^A-Za-z0-9_-]"}
                 },
                 "zig_target": {
-                  "type": "string", "pattern": "^[A-Za-z0-9_]+(-[A-Za-z0-9_]+)*-linux-gnu\\.[0-9]+\\.[0-9]+$",
+                  "type": "string",
                   "not": {"pattern": "[^A-Za-z0-9_.-]"}
                 },
                 "glibc_floor": {
-                  "type": "string", "pattern": "^[0-9]+\\.[0-9]+$",
-                  "not": {"pattern": "[^0-9.]"}
+                  "type": ["string", "null"]
                 }
               }
             },
