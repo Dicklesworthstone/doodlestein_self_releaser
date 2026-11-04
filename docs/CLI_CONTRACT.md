@@ -1403,6 +1403,10 @@ Quoted literals, the effective `$CARGO_BUILD_TARGET`, and compound commands
 with a common Cargo selection are supported. DSR records Cargo and rustc
 paths, SHA-256 digests and verbose versions, the selected target linker,
 named Cargo plugins, and `cargo-zigbuild`/`zig` when DSR routes through them.
+Configuration validation uses this same command-selection parser for literal
+GNU ABI requests, so `config validate`, build, and release admit the supported
+explicit form before staging. Configured target maps and target environment
+variables keep plain Rust identities; they never acquire a glibc suffix.
 Explicit GNU ABI requests such as
 `cargo +nightly zigbuild --target=x86_64-unknown-linux-gnu.2.28` retain
 `x86_64-unknown-linux-gnu` as their Rust target, configuration lookup key and
