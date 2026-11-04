@@ -415,9 +415,8 @@ EOF
 
 check_cli_verdict() {
     local label="$1" updater_status="$2" expected_status="$3" text="$4" diagnostic="$5" version="${6-1.2.3}"
-    local TEST_NAME="upgrade-verdict-$label"
     ((TESTS_RUN++))
-    harness_setup
+    TEST_NAME="upgrade-verdict-$label" harness_setup
     setup_module
     make_verdict_tool "$text" "$diagnostic" "$updater_status"
     local PATH="$TEST_TMPDIR/bin:$PATH"
@@ -480,8 +479,7 @@ test_cli_process_status_and_output_agree() {
 
 test_real_timeout_after_positive_output_fails() {
     ((TESTS_RUN++))
-    local TEST_NAME=upgrade-verdict-timeout
-    harness_setup
+    TEST_NAME=upgrade-verdict-timeout harness_setup
     setup_module
     if ! command -v timeout >/dev/null && ! command -v gtimeout >/dev/null; then
         skip "real upgrade timeout requires timeout or gtimeout"
@@ -549,6 +547,186 @@ EOF
         fail "verify upgrade dry run: ${problems[*]}"
     fi
     harness_teardown
+}
+
+# The CLI, repository configuration, selection, source-build helper and updater
+# verdict are real. Only the Go compiler and updater executables are fixtures;
+# their separate receipts show which executable was selected and run.
+make_bulk_upgrade_fixtures() {
+    export DSR_UPGRADE_BULK_ROOT="$TEST_TMPDIR"
+    mkdir -p "$TEST_TMPDIR/source checkout"
+    printf 'module example.invalid/upgrade-fixture\n' > "$TEST_TMPDIR/source checkout/go.mod"
+    printf 'package main\nfunc main() {}\n' > "$TEST_TMPDIR/source checkout/main.go"
+    printf '%s\n' upgrade > "$TEST_TMPDIR/check.verb"
+    cat > "$TEST_TMPDIR/installed-updater" << 'EOF'
+#!/usr/bin/env bash
+if [[ $# -eq 1 && "$1" == --help ]]; then
+    printf '%s\n' "${0##*/}" >> "$DSR_UPGRADE_BULK_ROOT/help.calls"
+    if [[ "${0##*/}" == bulk-passive ]]; then
+        printf 'Commands: inspect\n'
+    else
+        printf 'Commands: upgrade\n'
+    fi
+    exit 0
+fi
+[[ "${0##*/}" != bulk-passive ]] || exit 65
+IFS= read -r verb < "$DSR_UPGRADE_BULK_ROOT/check.verb"
+[[ $# -eq 2 && "$1" == "$verb" && "$2" == --check ]] || exit 64
+printf 'installed\n' >> "$DSR_UPGRADE_BULK_ROOT/check.calls"
+printf 'Latest version: 1.2.3\nUpdate available\n'
+EOF
+    cat > "$TEST_TMPDIR/built-updater" << 'EOF'
+#!/usr/bin/env bash
+IFS= read -r verb < "$DSR_UPGRADE_BULK_ROOT/check.verb"
+[[ $# -eq 2 && "$1" == "$verb" && "$2" == --check ]] || exit 64
+printf 'built\n' >> "$DSR_UPGRADE_BULK_ROOT/check.calls"
+printf 'Latest version: 1.2.3\nUpdate available\n'
+EOF
+    cat > "$TEST_TMPDIR/bin/go" << 'EOF'
+#!/usr/bin/env bash
+[[ "$PWD" == "$DSR_UPGRADE_BULK_ROOT/source checkout" && $# -eq 4 &&
+   "$1" == build && "$2" == -o && "$4" == . ]] || exit 64
+printf 'build\n' >> "$DSR_UPGRADE_BULK_ROOT/build.calls"
+[[ ! -f "$DSR_UPGRADE_BULK_ROOT/fail-build" ]] || exit 32
+cat "$DSR_UPGRADE_BULK_ROOT/built-updater" > "$3" || exit 1
+chmod 700 "$3"
+EOF
+    chmod +x "$TEST_TMPDIR/installed-updater" "$TEST_TMPDIR/bin/go"
+}
+
+make_bulk_upgrade_config() {
+    local tool="$1" binary="$2" explicit="$3"
+    printf 'tool_name: %s\nbinary_name: %s\nlocal_path: %s\nrepo: test/%s\n' \
+        "$tool" "$binary" "$TEST_TMPDIR/source checkout" "$tool" > "$TEST_TMPDIR/repos.d/$tool.yaml"
+    if [[ "$explicit" == true ]]; then
+        printf 'upgrade_check_args: [update, --check]\n' >> "$TEST_TMPDIR/repos.d/$tool.yaml"
+    fi
+}
+
+test_cli_all_selection_and_options() {
+    local scenario
+    for scenario in version-mismatch version-match explicit-missing-dry explicit-source-dry \
+            explicit-source-live requested-source-installed requested-source-missing alias-fallback \
+            mixed-capabilities no-updaters no-updaters-dry empty missing-source source-build-fails; do
+        ((TESTS_RUN++))
+        TEST_NAME="upgrade-all-$scenario" harness_setup
+        setup_module
+        make_bulk_upgrade_fixtures
+        local PATH="$TEST_TMPDIR/bin:$PATH"
+        local -a options=() problems=() flags=()
+        local expected=0 checks=0 builds=0 helps=0 selected='' dry=false plan=false
+        local mode output calls attempt=0
+        case "$scenario" in
+            version-mismatch|version-match)
+                make_bulk_upgrade_config bulk-check bulk-check true
+                cp -p "$TEST_TMPDIR/installed-updater" "$TEST_TMPDIR/bin/bulk-check"
+                printf '%s\n' update > "$TEST_TMPDIR/check.verb"
+                checks=1 selected=installed
+                options=(--version v1.2.3)
+                if [[ "$scenario" == version-mismatch ]]; then
+                    options=(--version 9.9.9)
+                    expected=1
+                fi
+                ;;
+            explicit-missing-dry|explicit-source-dry|explicit-source-live)
+                make_bulk_upgrade_config bulk-source bulk-source true
+                printf '%s\n' update > "$TEST_TMPDIR/check.verb"
+                if [[ "$scenario" == explicit-source-live ]]; then
+                    checks=1 builds=1 selected=built
+                    options=(--version 1.2.3)
+                else
+                    dry=true plan=true options=(--dry-run)
+                    [[ "$scenario" != explicit-source-dry ]] || options+=(--build-from-source)
+                fi
+                ;;
+            requested-source-installed|requested-source-missing|source-build-fails)
+                make_bulk_upgrade_config bulk-passive bulk-passive false
+                if [[ "$scenario" == requested-source-installed ]]; then
+                    cp -p "$TEST_TMPDIR/installed-updater" "$TEST_TMPDIR/bin/bulk-passive"
+                fi
+                options=(--build-from-source --version 1.2.3)
+                checks=1 builds=1 selected=built
+                if [[ "$scenario" == source-build-fails ]]; then
+                    printf 'fail\n' > "$TEST_TMPDIR/fail-build"
+                    expected=1 checks=0
+                fi
+                ;;
+            alias-fallback)
+                make_bulk_upgrade_config bulk-alias absent-configured-binary false
+                cp -p "$TEST_TMPDIR/installed-updater" "$TEST_TMPDIR/bin/bulk-alias"
+                options=(--version 1.2.3)
+                checks=1 helps=1 selected=installed
+                ;;
+            mixed-capabilities|no-updaters|no-updaters-dry)
+                make_bulk_upgrade_config bulk-passive bulk-passive false
+                cp -p "$TEST_TMPDIR/installed-updater" "$TEST_TMPDIR/bin/bulk-passive"
+                helps=1
+                if [[ "$scenario" == mixed-capabilities ]]; then
+                    make_bulk_upgrade_config bulk-check bulk-check true
+                    cp -p "$TEST_TMPDIR/installed-updater" "$TEST_TMPDIR/bin/bulk-check"
+                    printf '%s\n' update > "$TEST_TMPDIR/check.verb"
+                    checks=1 selected=installed
+                else
+                    expected=1
+                    if [[ "$scenario" == no-updaters-dry ]]; then
+                        dry=true options=(--dry-run)
+                    fi
+                fi
+                ;;
+            empty) expected=1 ;;
+            missing-source)
+                make_bulk_upgrade_config bulk-source bulk-source true
+                printf 'local_path: %s\nupgrade_check_args: [update, --check]\n' \
+                    "$TEST_TMPDIR/nonexistent" > "$TEST_TMPDIR/repos.d/bulk-source.yaml"
+                expected=1
+                ;;
+        esac
+        for mode in plain json; do
+            flags=()
+            [[ "$mode" != json ]] || flags=(--json)
+            exec_run "$PROJECT_ROOT/dsr" ${flags[@]+"${flags[@]}"} verify upgrade --all \
+                ${options[@]+"${options[@]}"}
+            output=$(exec_stdout)
+            cp "$_EXEC_STDOUT_FILE" "$TEST_TMPDIR/$mode.stdout"
+            cp "$_EXEC_STDERR_FILE" "$TEST_TMPDIR/$mode.stderr"
+            [[ "$(exec_status)" == "$expected" ]] || problems+=("$mode exited $(exec_status)")
+            attempt=$((attempt + 1))
+            for calls in check build help; do
+                local count=0 wanted=0
+                [[ ! -f "$TEST_TMPDIR/$calls.calls" ]] || count=$(wc -l < "$TEST_TMPDIR/$calls.calls")
+                case "$calls" in check) wanted=$checks ;; build) wanted=$builds ;; help) wanted=$helps ;; esac
+                [[ "$count" -eq $((wanted * attempt)) ]] || problems+=("$mode $calls invocations: $count")
+            done
+            if [[ "$mode" == json ]]; then
+                jq -es --argjson code "$expected" --argjson dry "$dry" '
+                    length == 1 and (.[0] | .command == "verify-upgrade" and .exit_code == $code and
+                        .status == (if $code == 0 then "success" else "error" end) and
+                        .details.mode == "all" and .details.dry_run == $dry)
+                ' <<< "$output" >/dev/null || problems+=("JSON verdict disagrees")
+            fi
+            if [[ "$expected" != 0 ]] &&
+               grep -qiE 'verification PASSED for|All upgrade verifications passed' "$TEST_TMPDIR/$mode.stderr"; then
+                problems+=("$mode claimed verification passed")
+            fi
+            if $plan; then
+                grep -q 'Would build bulk-source from source' "$TEST_TMPDIR/$mode.stderr" ||
+                    problems+=("$mode omitted selected source build")
+                grep -q 'Would run: .* update --check' "$TEST_TMPDIR/$mode.stderr" ||
+                    problems+=("$mode omitted configured update check")
+            fi
+        done
+        if ((checks > 0)) && [[ -f "$TEST_TMPDIR/check.calls" ]]; then
+            [[ "$(sort -u "$TEST_TMPDIR/check.calls")" == "$selected" ]] ||
+                problems+=("wrong updater executable selected")
+        fi
+        if [[ ${#problems[@]} -eq 0 ]]; then
+            pass "bulk upgrade plain/JSON selection and options: $scenario"
+        else
+            fail "bulk upgrade $scenario: ${problems[*]}"
+        fi
+        unset DSR_UPGRADE_BULK_ROOT
+        harness_teardown
+    done
 }
 
 # ============================================================================
@@ -854,6 +1032,7 @@ test_cli_json_failure_is_one_envelope_from_one_run
 test_cli_process_status_and_output_agree
 test_real_timeout_after_positive_output_fails
 test_cli_dry_run_runs_and_builds_nothing
+test_cli_all_selection_and_options
 
 echo ""
 echo "Repository Finding Tests:"

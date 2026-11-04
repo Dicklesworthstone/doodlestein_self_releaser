@@ -210,18 +210,27 @@ upgrade_verify_tool() {
 }
 
 # Verify upgrade command for all tools
-# Args: [--build-from-source]
+# Args: [--version <ver>] [--build-from-source] [--dry-run]
 upgrade_verify_all() {
     local build_from_source=false
     local dry_run=false
+    local version=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --version|-V)
+                [[ $# -ge 2 ]] || return 4
+                version="$2"; shift 2 ;;
             --build-from-source) build_from_source=true; shift ;;
             --dry-run) dry_run=true; shift ;;
             *) shift ;;
         esac
     done
+
+    local -a args=()
+    [[ -z "$version" ]] || args+=(--version "$version")
+    $build_from_source && args+=(--build-from-source)
+    $dry_run && args+=(--dry-run)
 
     local repos_dir="${ACT_REPOS_DIR:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.d}"
     local results=()
@@ -241,15 +250,22 @@ upgrade_verify_all() {
 
         tool_name=$(basename "$config_file" .yaml)
 
-        # Check if tool has upgrade capability
+        # Explicit selection does not depend on an installed executable. The
+        # single-tool verifier builds a missing binary or honors a requested
+        # source build, then validates the configured command and its result.
         local has_upgrade=false
-        local binary_name
-        binary_name=$(_upgrade_tool_binary_name "$tool_name")
-        if command -v "$binary_name" &>/dev/null; then
+        local binary_name bin_path=""
+        if $build_from_source || _upgrade_has_explicit_check_args "$tool_name"; then
+            has_upgrade=true
+        else
+            binary_name=$(_upgrade_tool_binary_name "$tool_name")
+            bin_path=$(command -v "$binary_name" 2>/dev/null || true)
+            if [[ -z "$bin_path" && "$binary_name" != "$tool_name" ]]; then
+                bin_path=$(command -v "$tool_name" 2>/dev/null || true)
+            fi
             # Capture --help before searching it: `--help | grep -q` lets a
             # long help text SIGPIPE the tool and pipefail hides the match.
-            if _upgrade_has_explicit_check_args "$tool_name" ||
-                    grep -q "upgrade" <<< "$("$binary_name" --help 2>&1)"; then
+            if [[ -n "$bin_path" ]] && grep -q "upgrade" <<< "$("$bin_path" --help 2>&1)"; then
                 has_upgrade=true
             fi
         fi
@@ -261,12 +277,7 @@ upgrade_verify_all() {
             continue
         fi
 
-        local args=""
-        $build_from_source && args+=" --build-from-source"
-        $dry_run && args+=" --dry-run"
-
-        # shellcheck disable=SC2086
-        if upgrade_verify_tool "$tool_name" $args; then
+        if upgrade_verify_tool "$tool_name" ${args[@]+"${args[@]}"}; then
             ((passed++))
             results+=("$(jq -nc --arg tool "$tool_name" '{tool: $tool, status: "passed"}')")
         else
@@ -276,8 +287,16 @@ upgrade_verify_all() {
     done
 
     # Summary
-    log_info "Upgrade verification complete: $passed passed, $failed failed, $skipped skipped"
+    if $dry_run; then
+        log_info "Upgrade verification complete: $passed planned, $failed failed, $skipped skipped"
+    else
+        log_info "Upgrade verification complete: $passed passed, $failed failed, $skipped skipped"
+    fi
 
+    if ((passed == 0 && failed == 0)); then
+        log_error "No upgrade checks were selected"
+        return 1
+    fi
     [[ $failed -eq 0 ]]
 }
 
