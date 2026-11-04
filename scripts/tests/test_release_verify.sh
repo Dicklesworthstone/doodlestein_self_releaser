@@ -12,7 +12,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-DSR_CMD="$PROJECT_ROOT/dsr"
+DSR_CMD="${DSR_TEST_COMMAND_FILE:-$PROJECT_ROOT/dsr}"
 
 # Source the test harness
 source "$PROJECT_ROOT/tests/helpers/test_harness.bash"
@@ -684,6 +684,9 @@ create_strict_verify_fix_mock_gh() {
                 ;;
             api)
                 local endpoint="${2:-}"
+                if [[ -n "${VERIFY_FIX_CUSTODY_ROOT:-}" ]]; then
+                    _verify_fix_custody_boundary "$endpoint" || return $?
+                fi
                 local method="GET" api_arg accept_octet_stream=false
                 shift 2
                 while [[ $# -gt 0 ]]; do
@@ -866,6 +869,9 @@ create_strict_verify_fix_mock_gh() {
     }
 
     curl() {
+        if [[ -n "${VERIFY_FIX_CUSTODY_ROOT:-}" ]]; then
+            _verify_fix_custody_boundary upload || return $?
+        fi
         local url="" data_arg="" content_type="" output="" header_file="" arg
         while [[ $# -gt 0 ]]; do
             arg="$1"
@@ -2665,6 +2671,9 @@ create_ordinary_verify_repair_mock() {
                 [[ "${2:-}" == token ]] && { printf 'release-fixture-token\n'; return 0; }
                 ;;
             api)
+                if [[ -n "${VERIFY_FIX_CUSTODY_ROOT:-}" ]]; then
+                    _verify_fix_custody_boundary "${2:-}" || return $?
+                fi
                 case "${2:-}" in
                     repos/testuser/test-tool/releases/tags/v1.0.0|repos/TestUser/Test-Tool/releases/tags/v1.0.0)
                         _ordinary_repair_release_json
@@ -2728,6 +2737,9 @@ create_ordinary_verify_repair_mock() {
         return 1
     }
     curl() {
+        if [[ -n "${VERIFY_FIX_CUSTODY_ROOT:-}" ]]; then
+            _verify_fix_custody_boundary upload || return $?
+        fi
         local output="" headers="" body="" url="" authorization="" argument
         while [[ $# -gt 0 ]]; do
             argument="$1"; shift
@@ -2789,6 +2801,383 @@ remove_ordinary_verify_repair_mock() {
     unset -f gh curl _ordinary_repair_release_json
     unset ORDINARY_REPAIR_ROOT ORDINARY_REPAIR_MODE
 }
+
+# Exercise real repair and prune commands with real inherited kernel leases.
+# Only the existing GitHub transport fixtures pause or inject owner-record drift.
+_verify_fix_custody_boundary() {
+    local phase="$1" version status
+    printf '%s\n' "$phase" >> "$VERIFY_FIX_CUSTODY_ROOT/network"
+    if [[ "${VERIFY_FIX_CUSTODY_CHECK_HELD:-false}" == true ]]; then
+        for version in v1.0.0 1.0.0; do
+            status=0
+            _build_lock_probe "$DSR_STATE_DIR/builds/test-tool/$version/.lock" || status=$?
+            if [[ "$status" != 2 ]]; then
+                printf '%s %s %s\n' "$phase" "$version" "$status" >> "$VERIFY_FIX_CUSTODY_ROOT/unheld"
+            fi
+        done
+    fi
+    if [[ "$phase" == upload && "${VERIFY_FIX_CUSTODY_DRIFT:-false}" == true &&
+          ! -e "$VERIFY_FIX_CUSTODY_ROOT/original-owner" ]]; then
+        local owner="$DSR_STATE_DIR/builds/test-tool/v1.0.0/.lock"
+        cp "$owner" "$VERIFY_FIX_CUSTODY_ROOT/original-owner" || return 9
+        printf 'changed repair fixture owner\n' > "$owner" || return 9
+    fi
+    if [[ "$phase" == upload && "${VERIFY_FIX_CUSTODY_PAUSE:-false}" == true &&
+          ! -e "$VERIFY_FIX_CUSTODY_ROOT/ready" ]]; then
+        exec 8<> "$VERIFY_FIX_CUSTODY_ROOT/gate"
+        : > "$VERIFY_FIX_CUSTODY_ROOT/ready"
+        IFS= read -r -t 40 _verify_fix_custody_gate <&8 || return 9
+        exec 8>&-
+    fi
+}
+
+_verify_fix_custody_setup() {
+    local flavor="${1:-ordinary}"
+    harness_setup
+    VERIFY_FIX_CUSTODY_ROOT="$TEST_TMPDIR/custody"
+    mkdir -p "$VERIFY_FIX_CUSTODY_ROOT"
+    : > "$VERIFY_FIX_CUSTODY_ROOT/network"
+    export VERIFY_FIX_CUSTODY_ROOT
+    export -f _verify_fix_custody_boundary
+    if [[ "$flavor" == strict ]]; then
+        seed_strict_verify_fixture
+        STRICT_VERIFY_ASSETS=$(jq -c 'map(select(.name != "test-tool.sbom.spdx.json"))' \
+            <<< "$STRICT_VERIFY_ASSETS") || return 1
+        export STRICT_VERIFY_ASSETS
+        unset STRICT_FIX_UPLOAD_MODE STRICT_FIX_MUTATE_LOCAL_ON_RELEASE_ID
+        create_strict_verify_fix_mock_gh true
+    else
+        seed_repos_config
+        seed_ordinary_verify_repair complete || return 1
+        create_ordinary_verify_repair_mock
+    fi
+}
+
+_verify_fix_custody_run() {
+    DSR_GH_TOKEN=release-fixture-token GITHUB_TOKEN=ci-fixture-token \
+        GH_TOKEN=ambient-fixture-token GH_HOST=enterprise.fixture.invalid \
+        GH_MAX_RETRIES=1 GH_RETRY_DELAY=0 "$DSR_CMD" "$@"
+}
+
+_verify_fix_custody_probe() (
+    source "$PROJECT_ROOT/src/build_state.sh"
+    _build_lock_probe "$DSR_STATE_DIR/builds/test-tool/$1/.lock"
+)
+
+_verify_fix_custody_wait() {
+    local marker="$1" attempt
+    for ((attempt=0; attempt<400; attempt++)); do
+        [[ ! -e "$marker" ]] || return 0
+        sleep 0.025
+    done
+    return 1
+}
+
+_verify_fix_custody_open_gate() {
+    python3 - "$1" <<'PY'
+import os, sys
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_NONBLOCK)
+try:
+    os.write(fd, b'continue\n')
+finally:
+    os.close(fd)
+PY
+}
+
+_verify_fix_custody_inventory() {
+    python3 - "$@" <<'PY'
+import hashlib, json, os, pathlib, sys
+rows = []
+for arg in sys.argv[1:]:
+    root = pathlib.Path(arg)
+    for p in [root] + sorted(root.rglob('*')):
+        if not p.exists() and not p.is_symlink():
+            rows.append([str(p), 'missing'])
+            continue
+        st = p.lstat()
+        data = (os.readlink(p) if p.is_symlink() else
+                hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else '')
+        rows.append([str(p), st.st_dev, st.st_ino, st.st_mode, st.st_uid,
+                     st.st_gid, st.st_mtime_ns, data])
+print(json.dumps(rows, sort_keys=True))
+PY
+}
+
+_verify_fix_custody_finish() {
+    local flavor="$1" label="$2"
+    shift 2
+    if [[ $# -eq 0 ]]; then
+        pass "$label"
+    else
+        fail "$label"
+        printf '  %s\n' "$@"
+        [[ ! -f "$VERIFY_FIX_CUSTODY_ROOT/stderr" ]] || tail -20 "$VERIFY_FIX_CUSTODY_ROOT/stderr"
+    fi
+    if [[ "$flavor" == strict ]]; then
+        remove_strict_verify_mock_gh
+        unset -f _strict_fix_release_json
+    else
+        remove_ordinary_verify_repair_mock
+    fi
+    unset VERIFY_FIX_CUSTODY_ROOT VERIFY_FIX_CUSTODY_CHECK_HELD VERIFY_FIX_CUSTODY_PAUSE
+    unset VERIFY_FIX_CUSTODY_DRIFT
+    harness_teardown
+}
+
+_verify_fix_custody_prune_case() {
+    local flavor="$1"
+    ((TESTS_RUN++))
+    if [[ "$HAS_YQ" != true ]]; then skip "yq required for repair custody"; return 0; fi
+    _verify_fix_custody_setup "$flavor" || { fail "repair custody fixture setup"; return 0; }
+    local directory="$DSR_STATE_DIR/artifacts/test-tool-v1.0.0"
+    local repair_pid status=0 prune_status=0 before after version problems=()
+    cp "$directory/test-tool-v1.0.0-manifest.json" "$directory-manifest.json"
+    python3 - "$directory" "$directory-manifest.json" <<'PY'
+import os, sys
+for path in sys.argv[1:]:
+    os.utime(path, (946684800, 946684800))
+PY
+    mkfifo "$VERIFY_FIX_CUSTODY_ROOT/gate"
+    export VERIFY_FIX_CUSTODY_CHECK_HELD=true VERIFY_FIX_CUSTODY_PAUSE=true
+    _verify_fix_custody_run --json release verify test-tool v1.0.0 --fix \
+        > "$VERIFY_FIX_CUSTODY_ROOT/stdout" 2> "$VERIFY_FIX_CUSTODY_ROOT/stderr" &
+    repair_pid=$!
+    if _verify_fix_custody_wait "$VERIFY_FIX_CUSTODY_ROOT/ready"; then
+        before=$(_verify_fix_custody_inventory "$directory" "$directory-manifest.json")
+        "$DSR_CMD" --json prune --force --max-age 1 --keep-last 0 --no-keep-releases \
+            > "$VERIFY_FIX_CUSTODY_ROOT/prune.stdout" 2> "$VERIFY_FIX_CUSTODY_ROOT/prune.stderr" || prune_status=$?
+        after=$(_verify_fix_custody_inventory "$directory" "$directory-manifest.json")
+        [[ "$prune_status" == 0 && "$before" == "$after" ]] || problems+=("prune changed active repair inputs")
+        jq -e --arg path "$directory" '
+            any(.details.retained_artifact_paths[]?; .path == $path and .reason == "build_custody") and
+            all(.details.pruned_paths[]?; .path != $path and .path != ($path + "-manifest.json"))
+        ' "$VERIFY_FIX_CUSTODY_ROOT/prune.stdout" >/dev/null || problems+=("prune did not report complete-set custody retention")
+        _verify_fix_custody_open_gate "$VERIFY_FIX_CUSTODY_ROOT/gate" || problems+=("could not release upload boundary")
+    else
+        problems+=("repair never reached upload with both leases held")
+    fi
+    wait "$repair_pid" || status=$?
+    [[ "$status" == 0 ]] && jq -es 'length == 1 and .[0].status == "success" and
+        .[0].exit_code == 0 and .[0].details.verification.missing == 0' \
+        "$VERIFY_FIX_CUSTODY_ROOT/stdout" >/dev/null || problems+=("repair did not succeed after prune retained its inputs")
+    [[ ! -s "$VERIFY_FIX_CUSTODY_ROOT/unheld" ]] || problems+=("a remote observation or upload lacked custody")
+    for version in v1.0.0 1.0.0; do
+        _verify_fix_custody_probe "$version" || problems+=("repair leaked $version custody")
+    done
+    if [[ "$flavor" == strict ]]; then
+        [[ -f "${STRICT_VERIFY_PRIMARY_PATH}.sha256" && "$(cat "$STRICT_FIX_DRAFT_FILE")" == true ]] ||
+            problems+=("strict repair did not materialize its sidecar and retain draft state")
+    fi
+    _verify_fix_custody_finish "$flavor" "$flavor repair keeps its complete artifact set through upload and final observations" ${problems[@]+"${problems[@]}"}
+}
+
+test_verify_fix_keeps_artifacts_during_upload() { _verify_fix_custody_prune_case ordinary; }
+test_strict_fix_keeps_artifacts_during_upload() { _verify_fix_custody_prune_case strict; }
+
+_verify_fix_custody_busy_case() {
+    local version="$1" mode="$2" flavor="${3:-ordinary}"
+    ((TESTS_RUN++))
+    if [[ "$HAS_YQ" != true ]]; then skip "yq required for repair custody"; return 0; fi
+    _verify_fix_custody_setup "$flavor" || { fail "repair custody fixture setup"; return 0; }
+    local holder status=0 probe_status=0 attempt before after problems=()
+    # Invalid bytes must never be inspected while a builder owns either alias.
+    printf '{incomplete builder manifest\n' > "$DSR_STATE_DIR/artifacts/test-tool-v1.0.0/test-tool-v1.0.0-manifest.json"
+    before=$(_verify_fix_custody_inventory "$DSR_STATE_DIR/artifacts")
+    mkfifo "$VERIFY_FIX_CUSTODY_ROOT/holder-gate"
+    (
+        source "$PROJECT_ROOT/src/logging.sh"
+        source "$PROJECT_ROOT/src/build_state.sh"
+        _BUILD_STATE_DIR="$DSR_STATE_DIR/builds"
+        build_lock_acquire test-tool "$version" || exit 1
+        if [[ "$mode" == inherited ]]; then
+            (
+                exec 8<> "$VERIFY_FIX_CUSTODY_ROOT/holder-gate"
+                : > "$VERIFY_FIX_CUSTODY_ROOT/holder-ready"
+                IFS= read -r -t 40 _verify_fix_holder_gate <&8 || exit 1
+                : > "$VERIFY_FIX_CUSTODY_ROOT/holder-finished"
+            ) &
+            build_lock_release test-tool "$version" || exit 1
+        else
+            exec 8<> "$VERIFY_FIX_CUSTODY_ROOT/holder-gate"
+            : > "$VERIFY_FIX_CUSTODY_ROOT/holder-ready"
+            IFS= read -r -t 40 _verify_fix_holder_gate <&8 || exit 1
+            build_lock_release test-tool "$version" || exit 1
+        fi
+    ) > "$VERIFY_FIX_CUSTODY_ROOT/holder.log" 2>&1 &
+    holder=$!
+    [[ "$mode" != inherited ]] || wait "$holder" || problems+=("coordinator did not release its own descriptor")
+    if _verify_fix_custody_wait "$VERIFY_FIX_CUSTODY_ROOT/holder-ready"; then
+        _verify_fix_custody_probe "$version" || probe_status=$?
+        [[ "$probe_status" == 2 ]] || problems+=("fixture lacks a genuine $mode lease")
+        DSR_BUILD_LOCK_HELD_BY_CALLER=1 _verify_fix_custody_run --json release verify test-tool v1.0.0 --fix \
+            > "$VERIFY_FIX_CUSTODY_ROOT/stdout" 2> "$VERIFY_FIX_CUSTODY_ROOT/stderr" || status=$?
+        [[ "$status" == 2 ]] && jq -es 'length == 1 and .[0].exit_code == 2 and
+            .[0].status == "error" and .[0].details.stage == "build_custody"' \
+            "$VERIFY_FIX_CUSTODY_ROOT/stdout" >/dev/null || problems+=("busy repair did not return one custody error before local admission")
+        after=$(_verify_fix_custody_inventory "$DSR_STATE_DIR/artifacts")
+        [[ "$before" == "$after" && ! -s "$VERIFY_FIX_CUSTODY_ROOT/network" ]] ||
+            problems+=("busy repair reached artifacts or the remote release")
+        if [[ "$version" == 1.0.0 ]]; then
+            _verify_fix_custody_probe v1.0.0 || problems+=("failed bare acquisition leaked canonical custody")
+        fi
+        probe_status=0
+        _verify_fix_custody_probe "$version" || probe_status=$?
+        [[ "$probe_status" == 2 ]] || problems+=("repair changed the independent holder's custody")
+        _verify_fix_custody_open_gate "$VERIFY_FIX_CUSTODY_ROOT/holder-gate" || problems+=("could not release fixture holder")
+    else
+        problems+=("fixture holder never became ready")
+    fi
+    if [[ "$mode" != inherited ]]; then
+        wait "$holder" || problems+=("fixture holder did not release")
+    else
+        _verify_fix_custody_wait "$VERIFY_FIX_CUSTODY_ROOT/holder-finished" || problems+=("inherited worker did not finish")
+    fi
+    for ((attempt=0; attempt<200; attempt++)); do
+        _verify_fix_custody_probe "$version" && break
+        sleep 0.025
+    done
+    _verify_fix_custody_probe "$version" || problems+=("fixture lease remained busy after release")
+    _verify_fix_custody_finish "$flavor" "$flavor repair respects $version custody held by $mode" ${problems[@]+"${problems[@]}"}
+}
+
+test_verify_fix_refuses_busy_canonical_custody() { _verify_fix_custody_busy_case v1.0.0 coordinator; }
+test_verify_fix_refuses_busy_bare_custody() { _verify_fix_custody_busy_case 1.0.0 coordinator; }
+test_verify_fix_refuses_inherited_worker_custody() { _verify_fix_custody_busy_case v1.0.0 inherited; }
+test_strict_fix_refuses_busy_custody() { _verify_fix_custody_busy_case v1.0.0 coordinator strict; }
+
+test_verify_fix_releases_custody_after_local_error() {
+    ((TESTS_RUN++))
+    if [[ "$HAS_YQ" != true ]]; then skip "yq required for repair custody"; return 0; fi
+    _verify_fix_custody_setup ordinary || { fail "repair custody fixture setup"; return 0; }
+    local status=0 version problems=()
+    printf '{incomplete builder manifest\n' > "$DSR_STATE_DIR/artifacts/test-tool-v1.0.0/test-tool-v1.0.0-manifest.json"
+    _verify_fix_custody_run --json release verify test-tool v1.0.0 --fix \
+        > "$VERIFY_FIX_CUSTODY_ROOT/stdout" 2> "$VERIFY_FIX_CUSTODY_ROOT/stderr" || status=$?
+    [[ "$status" == 4 && ! -s "$VERIFY_FIX_CUSTODY_ROOT/network" ]] || problems+=("local admission did not fail before remote access")
+    for version in v1.0.0 1.0.0; do
+        [[ -f "$DSR_STATE_DIR/builds/test-tool/$version/.lock.lease" ]] || problems+=("repair never acquired $version custody")
+        _verify_fix_custody_probe "$version" || problems+=("early return leaked $version custody")
+    done
+    _verify_fix_custody_finish ordinary "repair releases both owned leases after failed local admission" ${problems[@]+"${problems[@]}"}
+}
+
+test_verify_read_only_and_dry_run_create_no_custody() {
+    ((TESTS_RUN++))
+    if [[ "$HAS_YQ" != true ]]; then skip "yq required for repair custody"; return 0; fi
+    _verify_fix_custody_setup ordinary || { fail "repair custody fixture setup"; return 0; }
+    local status=0 before after problems=()
+    before=$(_verify_fix_custody_inventory "$DSR_STATE_DIR/artifacts")
+    _verify_fix_custody_run --json release verify test-tool v1.0.0 \
+        > "$VERIFY_FIX_CUSTODY_ROOT/read-only.stdout" 2> "$VERIFY_FIX_CUSTODY_ROOT/stderr" || status=$?
+    [[ "$status" == 1 && ! -e "$DSR_STATE_DIR/builds" ]] || problems+=("read-only verification created custody or changed its result")
+    status=0
+    _verify_fix_custody_run --json --dry-run release verify test-tool v1.0.0 --fix \
+        > "$VERIFY_FIX_CUSTODY_ROOT/dry-run.stdout" 2>> "$VERIFY_FIX_CUSTODY_ROOT/stderr" || status=$?
+    [[ "$status" == 1 && ! -e "$DSR_STATE_DIR/builds" ]] || problems+=("dry-run repair created custody or changed its result")
+    after=$(_verify_fix_custody_inventory "$DSR_STATE_DIR/artifacts")
+    [[ "$before" == "$after" && ! -s "$ORDINARY_REPAIR_ROOT/uploads" ]] || problems+=("nonmutating verification changed local or remote assets")
+    _verify_fix_custody_finish ordinary "read-only verification and dry-run repair never create build leases" ${problems[@]+"${problems[@]}"}
+}
+
+_verify_fix_custody_cleanup_case() {
+    local output_mode="$1"
+    ((TESTS_RUN++))
+    if [[ "$HAS_YQ" != true ]]; then skip "yq required for repair custody"; return 0; fi
+    _verify_fix_custody_setup ordinary || { fail "repair custody fixture setup"; return 0; }
+    local status=0 problems=() args=()
+    [[ "$output_mode" != json ]] || args+=(--json)
+    export VERIFY_FIX_CUSTODY_DRIFT=true
+    _verify_fix_custody_run ${args[@]+"${args[@]}"} release verify test-tool v1.0.0 --fix \
+        > "$VERIFY_FIX_CUSTODY_ROOT/stdout" 2> "$VERIFY_FIX_CUSTODY_ROOT/stderr" || status=$?
+    [[ "$status" == 4 && -s "$VERIFY_FIX_CUSTODY_ROOT/original-owner" ]] || problems+=("unverifiable cleanup did not fail after a real upload")
+    if [[ "$output_mode" == json ]]; then
+        jq -es 'length == 1 and .[0].command == "release-verify" and .[0].status == "error" and
+            .[0].exit_code == 4 and .[0].details.stage == "build_custody" and
+            .[0].details.verification.missing == 0' "$VERIFY_FIX_CUSTODY_ROOT/stdout" >/dev/null ||
+            problems+=("cleanup failure emitted success or lost the verified repair result")
+    elif grep -q 'Verification: PASSED' "$VERIFY_FIX_CUSTODY_ROOT/stdout" "$VERIFY_FIX_CUSTODY_ROOT/stderr"; then
+        problems+=("plain output reported success after failed custody cleanup")
+    fi
+    [[ "$(cat "$DSR_STATE_DIR/builds/test-tool/v1.0.0/.lock")" == 'changed repair fixture owner' ]] ||
+        problems+=("repair rewrote the changed owner record")
+    # Restore only this fixture's original metadata so the actual kernel probe
+    # can establish that process exit also released the inherited descriptor.
+    cp "$VERIFY_FIX_CUSTODY_ROOT/original-owner" "$DSR_STATE_DIR/builds/test-tool/v1.0.0/.lock"
+    _verify_fix_custody_probe v1.0.0 || problems+=("canonical lease survived process exit")
+    _verify_fix_custody_probe 1.0.0 || problems+=("owned bare lease leaked after cleanup failure")
+    _verify_fix_custody_finish ordinary "$output_mode repair refuses success when its owner record changes" ${problems[@]+"${problems[@]}"}
+}
+
+test_verify_fix_cleanup_failure_json() { _verify_fix_custody_cleanup_case json; }
+test_verify_fix_cleanup_failure_plain() { _verify_fix_custody_cleanup_case plain; }
+
+_verify_fix_custody_borrow_case() {
+    local mode="$1" expected_status=0
+    ((TESTS_RUN++))
+    if [[ "$HAS_YQ" != true ]]; then skip "yq required for repair custody"; return 0; fi
+    _verify_fix_custody_setup ordinary || { fail "repair custody fixture setup"; return 0; }
+    local status=0 problems=()
+    if [[ "$mode" == local_error ]]; then
+        expected_status=4
+        printf '{incomplete builder manifest\n' > "$DSR_STATE_DIR/artifacts/test-tool-v1.0.0/test-tool-v1.0.0-manifest.json"
+    fi
+    # Initialize an actual caller-owned registry before the unmodified CLI
+    # starts. The command's private subshell inherits those open descriptions,
+    # as fallback's command substitutions do. Do not export a fake registry or
+    # replace any lock, manifest, repair, or command-dispatch implementation.
+    cat > "$VERIFY_FIX_CUSTODY_ROOT/caller.sh" <<'BASH'
+unset BASH_ENV
+source "$DSR_PROJECT_ROOT/src/logging.sh"
+source "$DSR_PROJECT_ROOT/src/build_state.sh"
+_BUILD_STATE_DIR="$DSR_STATE_DIR/builds"
+build_lock_acquire test-tool v1.0.0 || exit 91
+cp "$DSR_STATE_DIR/builds/test-tool/v1.0.0/.lock" "$VERIFY_FIX_CUSTODY_ROOT/caller-owner" || exit 91
+if [[ "$VERIFY_FIX_CALLER_BARE" == true ]]; then
+    build_lock_acquire test-tool 1.0.0 || exit 91
+    cp "$DSR_STATE_DIR/builds/test-tool/1.0.0/.lock" "$VERIFY_FIX_CUSTODY_ROOT/caller-bare-owner" || exit 91
+fi
+_verify_fix_caller_exit() {
+    local probe=0
+    trap -p EXIT > "$VERIFY_FIX_CUSTODY_ROOT/caller-trap.after"
+    cmp -s "$VERIFY_FIX_CUSTODY_ROOT/caller-trap.before" "$VERIFY_FIX_CUSTODY_ROOT/caller-trap.after" || return 92
+    cmp -s "$VERIFY_FIX_CUSTODY_ROOT/caller-owner" "$DSR_STATE_DIR/builds/test-tool/v1.0.0/.lock" || return 92
+    _build_lock_probe "$DSR_STATE_DIR/builds/test-tool/v1.0.0/.lock" || probe=$?
+    [[ "$probe" == 2 ]] || return 92
+    probe=0
+    _build_lock_probe "$DSR_STATE_DIR/builds/test-tool/1.0.0/.lock" || probe=$?
+    if [[ "$VERIFY_FIX_CALLER_BARE" == true ]]; then
+        [[ "$probe" == 2 ]] && cmp -s "$VERIFY_FIX_CUSTODY_ROOT/caller-bare-owner" \
+            "$DSR_STATE_DIR/builds/test-tool/1.0.0/.lock" || return 92
+        build_lock_release test-tool 1.0.0 || return 92
+    else
+        [[ "$probe" == 0 ]] || return 92
+    fi
+    build_lock_release test-tool v1.0.0 || return 92
+    : > "$VERIFY_FIX_CUSTODY_ROOT/caller-preserved"
+}
+trap _verify_fix_caller_exit EXIT
+trap -p EXIT > "$VERIFY_FIX_CUSTODY_ROOT/caller-trap.before"
+BASH
+    local caller_bare=false
+    [[ "$mode" != local_error ]] || caller_bare=true
+    BASH_ENV="$VERIFY_FIX_CUSTODY_ROOT/caller.sh" VERIFY_FIX_CALLER_BARE="$caller_bare" \
+        _verify_fix_custody_run --json release verify test-tool v1.0.0 --fix \
+        > "$VERIFY_FIX_CUSTODY_ROOT/stdout" 2> "$VERIFY_FIX_CUSTODY_ROOT/stderr" || status=$?
+    [[ "$status" == "$expected_status" && -f "$VERIFY_FIX_CUSTODY_ROOT/caller-preserved" ]] ||
+        problems+=("repair replaced caller ownership, its trap, or the expected command result")
+    if [[ "$mode" == success ]]; then
+        jq -es 'length == 1 and .[0].status == "success" and .[0].exit_code == 0' \
+            "$VERIFY_FIX_CUSTODY_ROOT/stdout" >/dev/null || problems+=("borrowed repair did not complete its actual upload")
+    else
+        [[ ! -s "$VERIFY_FIX_CUSTODY_ROOT/network" ]] || problems+=("failed local admission reached remote assets")
+    fi
+    _verify_fix_custody_probe v1.0.0 || problems+=("caller could not release canonical custody")
+    _verify_fix_custody_probe 1.0.0 || problems+=("bare custody remained held after caller exit")
+    _verify_fix_custody_finish ordinary "repair preserves registered caller custody and traps on $mode" ${problems[@]+"${problems[@]}"}
+}
+
+test_verify_fix_borrows_registered_caller_custody() { _verify_fix_custody_borrow_case success; }
+test_verify_fix_borrows_both_leases_on_early_error() { _verify_fix_custody_borrow_case local_error; }
 
 _verify_ordinary_repair_case() {
     local mode="$1" expected_status="$2" label="$3"
@@ -3281,6 +3670,18 @@ test_verify_fix_reads_paginated_inventory
 test_verify_fix_reports_latest_inventory_coherently
 test_verify_fix_dry_run_uploads_nothing
 test_verify_fix_reports_not_found_locally
+test_verify_fix_keeps_artifacts_during_upload
+test_strict_fix_keeps_artifacts_during_upload
+test_verify_fix_refuses_busy_canonical_custody
+test_verify_fix_refuses_busy_bare_custody
+test_verify_fix_refuses_inherited_worker_custody
+test_strict_fix_refuses_busy_custody
+test_verify_fix_releases_custody_after_local_error
+test_verify_read_only_and_dry_run_create_no_custody
+test_verify_fix_cleanup_failure_json
+test_verify_fix_cleanup_failure_plain
+test_verify_fix_borrows_registered_caller_custody
+test_verify_fix_borrows_both_leases_on_early_error
 
 echo ""
 echo "=========================================="

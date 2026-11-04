@@ -885,12 +885,13 @@ dsr release --repo <name> --version <tag> [--draft] [--prerelease] [--dispatch]
 | `--no-sbom` | false | Disable automatic generation without discarding retained public metadata |
 | `--sbom-format` | `sbom.format`, default `spdx` | Select `spdx` or `cyclonedx` and enable generation |
 
-Binary publication and strict draft finalization hold the same kernel leases
-used by build collection and artifact pruning, from before the first
-artifact/manifest read through upload or finalization and final verification.
+Binary publication, strict draft finalization, and `release verify --fix` hold
+the same kernel leases used by build collection and artifact pruning, from
+before the first artifact/manifest read through upload, repair or finalization
+and final verification.
 Both the canonical tag and possible original version
 namespace are protected, such as `v1.2.3` and `1.2.3`. Another build, publisher or
-inherited worker holding either lease blocks publication with exit `2`;
+inherited worker holding either lease blocks the operation with exit `2`;
 unverifiable custody refuses with exit `4`. Tool/version components contain at
 most 128 letters, digits, `.`, `_`, `+` or `-`, starting with a letter or digit.
 
@@ -901,8 +902,9 @@ It releases only leases it acquired itself, including on early errors, and
 preserves the caller's ownership and traps. Checked cleanup occurs before the
 final result; cleanup failure reports an error even if uploads completed.
 Custody refusals and cleanup failures identify `details.stage: "build_custody"`
-with an error message. Global `--dry-run` performs no lease creation,
-acquisition or borrowing, so its plan is an observation rather than a reservation.
+with an error message. Global `--dry-run` and verification without `--fix`
+perform no lease creation, acquisition or borrowing, so their observations do
+not reserve the artifact set.
 
 New ordinary releases are created as private drafts. DSR freezes every selected
 asset name, size, and SHA-256, including the manifest, generated checksums, and
@@ -926,7 +928,9 @@ required name, size, hash, and uploaded asset ID against one complete, fresh
 paginated inventory, including on reruns where no names appear missing.
 Empty or invalid local manifests cannot authorize repair. Release identity and local
 manifest or payload changes prevent success. A nominal upload acknowledgement
-cannot remove an asset from the missing list. Repair failures appear in
+cannot remove an asset from the missing list. Ordinary and strict repair hold
+artifact custody through the complete local and remote rechecks, including
+strict checksum-sidecar materialization. Repair failures appear in
 `details.repair.errors` when present; normal verification and dry-run output keep
 their existing shape.
 
@@ -2162,9 +2166,10 @@ and `invalid_state` identifies an unverifiable checkpoint or resume selection.
 These exclusions are successful skips; deletion or lease-release errors still
 produce a partial result. The build leases coordinate artifact/checkpoint
 cleanup with builds, fallback runs and standalone binary `dsr release` calls.
-The strict `dsr release finalize` command also holds these leases, including
-while a concurrent prune uses `--no-keep-releases`: that option changes retention
-policy and cannot override active custody. Native recovery and the standalone
+Strict `dsr release finalize` and mutating `dsr release verify --fix` also hold
+these leases, including while a concurrent prune uses `--no-keep-releases`:
+that option changes retention policy and cannot override active custody.
+Native recovery and the standalone
 library finalizer use separate custody mechanisms. Custom outputs outside
 `state/artifacts`, logs, files in `state/manifests` and ordinary cache entries
 remain governed by their existing retention policies. These checks do not

@@ -10547,6 +10547,11 @@ cmd_release_dispatch() {
 # ============================================================================
 
 cmd_release_verify() {
+    # Repair may borrow an acquiring caller's build leases. Keep owned cleanup and
+    # signal handlers private so the caller retains its descriptors and traps.
+    (
+    trap - EXIT
+    trap 'exit 5' HUP INT TERM
     local tool_name=""
     local version=""
     local verify_checksums=false
@@ -10602,8 +10607,9 @@ EXAMPLES:
 EXIT CODES:
     0  - All assets verified
     1  - Some assets missing or mismatched
+    2  - Repair artifact custody is busy
     3  - Authentication error
-    4  - Invalid arguments
+    4  - Invalid arguments or unverifiable repair custody
     7  - Release not found
 EOF
                 return 0
@@ -10689,6 +10695,61 @@ EOF
     # Reject local diagnostic/mixed authority before any remote lookup or repair.
     local state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
     local artifacts_dir="$state_dir/artifacts/${tool_name}-${tag}"
+
+    # Repair consumes the same manifest and payloads as publication and can
+    # materialize strict sidecars. Protect the complete set from collection
+    # and pruning before inspecting any of it, through the final rechecks.
+    local repair_custody_state_dir="$state_dir/builds"
+    local -a repair_owned_versions=() repair_lease_versions=("$tag")
+    local repair_lease_version repair_custody_rc repair_custody_cleanup
+    _release_verify_cleanup_build_custody() {
+        local _BUILD_STATE_DIR="$1" custody_tool="$2" held_version cleanup_status=0
+        shift 2
+        for held_version in "$@"; do
+            build_lock_release "$custody_tool" "$held_version" || cleanup_status=1
+        done
+        return "$cleanup_status"
+    }
+    if $fix_missing && { [[ ! "$tool_name" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$ ||
+                           ! "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$ ||
+                           ! "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$ ]]; }; then
+        log_error "Release repair requires a safe tool/version custody namespace"
+        return 4
+    fi
+    if $fix_missing && ! ${DRY_RUN:-false}; then
+        _dsr_require build_state || return 3
+        local _BUILD_STATE_DIR="$repair_custody_state_dir"
+        [[ ! "${tag#v}" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$ ]] ||
+            repair_lease_versions+=("${tag#v}")
+        for repair_lease_version in "${repair_lease_versions[@]}"; do
+            repair_custody_rc=0
+            build_lock_borrow "$tool_name" "$repair_lease_version" || repair_custody_rc=$?
+            if [[ "$repair_custody_rc" == 1 ]]; then
+                repair_custody_rc=0
+                if build_lock_acquire "$tool_name" "$repair_lease_version"; then
+                    repair_owned_versions+=("$repair_lease_version")
+                    # Freeze arguments before early returns unwind locals.
+                    printf -v repair_custody_cleanup '%q ' _release_verify_cleanup_build_custody \
+                        "$repair_custody_state_dir" "$tool_name" "${repair_owned_versions[@]}"
+                    # shellcheck disable=SC2064 # Deliberately freeze %q-quoted custody arguments.
+                    trap "$repair_custody_cleanup >&2" EXIT
+                else
+                    repair_custody_rc=$?
+                    [[ "$repair_custody_rc" == 2 ]] || repair_custody_rc=4
+                fi
+            fi
+            if [[ "$repair_custody_rc" != 0 ]]; then
+                log_error "Release repair build custody is busy or unverifiable for $tool_name $repair_lease_version"
+                $JSON_MODE && json_envelope release-verify error "$repair_custody_rc" \
+                    "$(jq -nc --arg repo "$repo" --arg version "$version" --arg tag "$tag" \
+                        --arg lease_version "$repair_lease_version" \
+                        '{repo:$repo,version:$version,tag:$tag,stage:"build_custody",
+                          lease_version:$lease_version,error:"Release repair build custody is busy or unverifiable"}')"
+                return "$repair_custody_rc"
+            fi
+        done
+    fi
+
     local manifest_file="$artifacts_dir/${tool_name}-${tag}-manifest.json"
     if [[ ! -f "$manifest_file" ]]; then
         manifest_file="$state_dir/artifacts/${tool_name}-${tag}-manifest.json"
@@ -11410,6 +11471,20 @@ EOF
         exit_code=1
     fi
 
+    # All local and remote checks are complete. Release only owned leases and
+    # report cleanup failure before success; borrowed caller custody stays held.
+    local repair_custody_error=""
+    if _release_verify_cleanup_build_custody "$repair_custody_state_dir" "$tool_name" \
+        ${repair_owned_versions[@]+"${repair_owned_versions[@]}"} >&2; then
+        repair_owned_versions=()
+        trap - EXIT
+    else
+        repair_custody_error="Release verification finished but its repair build custody could not be released"
+        log_error "$repair_custody_error"
+        status=error
+        exit_code=4
+    fi
+
     # Output
     if $JSON_MODE; then
         local details
@@ -11434,6 +11509,7 @@ EOF
             --argjson dry_run "${DRY_RUN:-false}" \
             --argjson planned_fixes "$(printf '%s\n' ${planned_fixes[@]+"${planned_fixes[@]}"} | jq -Rsc 'split("\n") | map(select(length > 0))')" \
             --argjson repair_errors "$(printf '%s\n' ${ordinary_repair_errors[@]+"${ordinary_repair_errors[@]}"} | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+            --arg custody_error "$repair_custody_error" \
             --argjson duration "$duration" \
             '{
                 repo: $repo,
@@ -11468,7 +11544,8 @@ EOF
                      (if ($repair_errors | length) > 0 then {errors: $repair_errors} else {} end))
                     else null end),
                 duration_seconds: $duration
-            }')
+            } + (if $custody_error == "" then {} else
+                {stage:"build_custody",error:$custody_error} end)')
         json_envelope "release-verify" "$status" "$exit_code" "$details"
     else
         echo ""
@@ -11538,6 +11615,7 @@ EOF
     fi
 
     return $exit_code
+    )
 }
 
 cmd_fallback() {
