@@ -3097,6 +3097,57 @@ act_artifact_zip_is_wrapper() {
     [[ "$method" == "act" && "$path" == *.zip ]]
 }
 
+# Give collection and manifest admission the same exact, validated ZIP
+# members. A copied transport is inspected before extraction, so member names
+# are never interpreted as unzip patterns and duplicate paths, links, CRC
+# failures and excessive expansion cannot disappear behind version filtering.
+_act_artifact_zip_payloads() {
+    local zip_file="$1" version="$2" module_dir before after work receipt members member name
+    local -a zip_paths=() matching=()
+    local -A names=()
+    if ! declare -F packaging_extract_payload &>/dev/null; then
+        module_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" || return 3
+        # shellcheck source=SCRIPTDIR/packaging.sh
+        source "$module_dir/packaging.sh" || return 3
+    fi
+    before=$(_act_result_artifact_receipts "$(jq -nc --arg path "$zip_file" \
+        '{artifact_paths:[$path]}')") || return 4
+    work=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/dsr-act-zip.XXXXXXXX") || return 4
+    mkdir -m 700 "$work/payload" || return 4
+    receipt=$(_act_collect_stream_exclusive "$work/transport.zip" 600 \
+        _act_stream_local_file "$zip_file") || return 4
+    jq -e --argjson copy "$receipt" \
+        '.[0].sha256 == $copy.sha256 and .[0].size_bytes == $copy.size_bytes' \
+        <<< "$before" >/dev/null || return 4
+    packaging_extract_payload "$work/transport.zip" zip "$work/payload" || return 4
+    members=$(packaging_payload_members "$work/transport.zip" zip) || return 4
+    [[ -n "$members" ]] || return 4
+    while IFS= read -r member; do
+        zip_paths+=("$work/payload/$member")
+        if [[ "$member" == *"$version"* || "$member" == *"${version#v}"* ]]; then
+            matching+=("$work/payload/$member")
+        fi
+    done <<< "$members"
+    if [[ ${#matching[@]} -gt 0 ]]; then zip_paths=("${matching[@]}"); fi
+    for member in "${zip_paths[@]}"; do
+        name="${member##*/}"
+        if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ || "$name" == *..* ||
+              -n "${names[${name,,}]:-}" ]]; then
+            _log_error "Workflow ZIP has an unsafe or ambiguous release name: $name"
+            return 4
+        fi
+        names["${name,,}"]=1
+        [[ -f "$member" && ! -L "$member" ]] || return 4
+    done
+    after=$(_act_result_artifact_receipts "$(jq -nc --arg path "$zip_file" \
+        '{artifact_paths:[$path]}')") || return 4
+    [[ "$before" == "$after" ]] || {
+        _log_error "Workflow ZIP changed during collection: $zip_file"
+        return 4
+    }
+    printf '%s\0' "${zip_paths[@]}" | jq -Rsc 'split("\u0000")[:-1]'
+}
+
 # Collect artifacts from act run
 # Usage: act_collect_artifacts <artifact_dir> <output_dir>
 act_collect_artifacts() {
@@ -16545,137 +16596,16 @@ act_generate_manifest() {
         seen_names["$name"]="$sha"
     }
 
-    _act_sha256_zip_entry() {
-        local zip_file="$1"
-        local entry="$2"
-
-        if command -v sha256sum &>/dev/null; then
-            unzip -p "$zip_file" "$entry" 2>/dev/null | sha256sum | awk '{print $1}'
-            return 0
-        fi
-
-        if command -v shasum &>/dev/null; then
-            unzip -p "$zip_file" "$entry" 2>/dev/null | shasum -a 256 | awk '{print $1}'
-            return 0
-        fi
-
-        return 3
-    }
-
-    _act_zip_entry_size() {
-        local zip_file="$1"
-        local entry="$2"
-        unzip -p "$zip_file" "$entry" 2>/dev/null | wc -c | tr -d ' '
-    }
-
     _act_manifest_add_zip_entries() {
         local zip_file="$1"
         local target="$2"
-        local version_tag="$manifest_version"
-        local version_stripped="${manifest_version#v}"
-
-        if ! command -v unzip &>/dev/null; then
-            _log_warn "unzip not available; treating $zip_file as artifact"
-            _act_manifest_add_file "$zip_file" "$target"
-            return $?
-        fi
-
-        local entries
-        entries=$(unzip -Z1 "$zip_file" 2>/dev/null)
-        if [[ -z "$entries" ]]; then
-            _log_warn "No entries found in zip artifact: $zip_file"
-            return 0
-        fi
-
-        local -a matched_entries=()
-        while IFS= read -r entry; do
-            [[ -z "$entry" || "$entry" == */ ]] && continue
-            if [[ "$entry" == *"$version_tag"* || "$entry" == *"$version_stripped"* ]]; then
-                matched_entries+=("$entry")
-            fi
-        done <<< "$entries"
-
-        local -a use_entries=()
-        if [[ ${#matched_entries[@]} -gt 0 ]]; then
-            use_entries=("${matched_entries[@]}")
-        else
-            while IFS= read -r entry; do
-                [[ -z "$entry" || "$entry" == */ ]] && continue
-                use_entries+=("$entry")
-            done <<< "$entries"
-        fi
-
-        local entry
-        for entry in "${use_entries[@]}"; do
-            local name
-            name=$(basename "$entry")
-
-            case "$name" in
-                *.minisig|*.sig|*.sha256|*.sha512|SHA256SUMS*|*.sbom.*|*.intoto.jsonl)
-                    continue
-                    ;;
-            esac
-
-            local seen_key="${zip_file}::${entry}"
-            for seen in "${seen_paths[@]}"; do
-                [[ "$seen" == "$seen_key" ]] && continue 2
-            done
-            # Same name-collision dedup as the on-disk path. Without it a
-            # matrix workflow whose zip artifact bundles every platform
-            # would emit one manifest entry per orchestration target.
-            if [[ -n "${seen_names[$name]:-}" ]]; then
-                continue
-            fi
-
-            local sha size format
-            sha=$(_act_sha256_zip_entry "$zip_file" "$entry" 2>/dev/null || echo "")
-            size=$(_act_zip_entry_size "$zip_file" "$entry")
-            format=$(_act_archive_format "$name")
-
-            if [[ -z "$sha" ]]; then
-                _log_warn "Unable to compute SHA256 for artifact: $zip_file::$entry"
-                continue
-            fi
-            if [[ -z "$size" || "$size" -le 0 ]]; then
-                _log_warn "Unable to determine size for artifact: $zip_file::$entry"
-                continue
-            fi
-
-            # Filename-derived target overrides the orchestration target
-            # (matrix workflow under one act job ⇒ unreliable per-target).
-            local entry_target="$target"
-            local inferred_target
-            inferred_target=$(_act_infer_target_from_name "$name")
-            if [[ -n "$inferred_target" ]]; then
-                entry_target="$inferred_target"
-            fi
-            local target_triple
-            target_triple=$(_act_manifest_target_triple "$entry_target" "$name") || return 4
-
-            local artifact_json
-            artifact_json=$(jq -nc \
-                --arg name "$name" \
-                --arg target "$entry_target" \
-                --arg target_triple "$target_triple" \
-                --arg sha "$sha" \
-                --argjson size "$size" \
-                --arg format "$format" \
-                '{
-                    name: $name,
-                    target: $target,
-                    target_triple: $target_triple,
-                    sha256: $sha,
-                    size_bytes: $size,
-                    archive_format: $format,
-                    signed: false,
-                    signature_file: ""
-                }')
-
-            artifacts+=("$artifact_json")
-            # shellcheck disable=SC2190 # Indexed array; separate functions use an associative array with this name.
-            seen_paths+=("$seen_key")
-            seen_names["$name"]="$sha"
-        done
+        local payloads file
+        payloads=$(_act_artifact_zip_payloads "$zip_file" "$manifest_version") || return 4
+        while IFS= read -r -d '' file; do
+            # The ordinary file path already preserves compiler variants,
+            # infers matrix targets and rejects same-name different bytes.
+            _act_manifest_add_file "$file" "$target" || return $?
+        done < <(jq -j '.[] | ., "\u0000"' <<< "$payloads")
     }
 
     while IFS= read -r target_json; do

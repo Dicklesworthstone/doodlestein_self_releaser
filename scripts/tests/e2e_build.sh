@@ -9,6 +9,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+PROJECT_ROOT="${DSR_BUILD_TEST_ROOT:-$PROJECT_ROOT}"
 DSR_CMD="$PROJECT_ROOT/dsr"
 
 # Source the test harness
@@ -512,19 +513,15 @@ test_build_real_with_docker() {
 # Use the public CLI when host reservations are available. Some hosted Linux
 # runners expose outer /proc PIDs to an inner Bash PID namespace. As in the
 # native-source-sync integration suite, substitute only slot acquisition and
-# release after a real failure plus independent namespace evidence. This
-# fixture already simulates act/Docker execution; packaging remains real.
+# release after independent namespace evidence and a failed probe or a slot
+# record that identifies a different /proc PID. This fixture already simulates
+# act/Docker execution; packaging remains real.
 run_lane_build() (
     local capacity_status=0 host_pid line namespace_line="" module
+    local namespace_mismatch=false
     local -a namespace_pids=()
     # shellcheck source=../../src/host_selector.sh
     source "$PROJECT_ROOT/src/host_selector.sh"
-    selector_acquire_slot act-local packaging-probe > "$TEST_TMPDIR/capacity.out" \
-        2> "$TEST_TMPDIR/capacity.log" || capacity_status=$?
-    if [[ "$capacity_status" -eq 0 ]]; then
-        selector_release_slot act-local packaging-probe || return $?
-        exec "$DSR_CMD" --json build "$@"
-    fi
     if [[ -r /proc/self/stat && -r /proc/self/status ]]; then
         read -r host_pid _ < /proc/self/stat
         while IFS= read -r line; do
@@ -532,14 +529,30 @@ run_lane_build() (
         done < /proc/self/status
         read -r -a namespace_pids <<< "$namespace_line"
     fi
-    if [[ "$capacity_status" -ne 3 || ${#namespace_pids[@]} -lt 2 ||
-          "${host_pid:-}" == "$BASHPID" || "${namespace_pids[0]:-}" != "${host_pid:-}" ||
-          "${namespace_pids[${#namespace_pids[@]}-1]:-}" != "$BASHPID" ]]; then
+    if [[ ${#namespace_pids[@]} -ge 2 && "${host_pid:-}" != "$BASHPID" &&
+          "${namespace_pids[0]:-}" == "${host_pid:-}" &&
+          "${namespace_pids[${#namespace_pids[@]}-1]:-}" == "$BASHPID" ]]; then
+        namespace_mismatch=true
+    fi
+    selector_acquire_slot act-local packaging-probe > "$TEST_TMPDIR/capacity.out" \
+        2> "$TEST_TMPDIR/capacity.log" || capacity_status=$?
+    if [[ "$capacity_status" -eq 0 ]]; then
+        if $namespace_mismatch; then
+            # A small inner PID can name an unrelated outer process. Preserve
+            # the actual successful reservation as evidence before releasing it.
+            _sel_slot_record "$_SELECTOR_LOCKS_DIR/act-local/packaging-probe.lock" \
+                act-local packaging-probe > "$TEST_TMPDIR/capacity-record.json" || return $?
+            jq -e --argjson inner "$BASHPID" --argjson outer "$host_pid" \
+                '.pid == $inner and .pid != $outer' "$TEST_TMPDIR/capacity-record.json" >/dev/null || return 4
+        fi
+        selector_release_slot act-local packaging-probe || return $?
+        if ! $namespace_mismatch; then exec "$DSR_CMD" --json build "$@"; fi
+    elif [[ "$capacity_status" -ne 3 ]] || ! $namespace_mismatch; then
         echo "FAIL: lane capacity probe failed without PID namespace evidence ($capacity_status)" >&2
         cat "$TEST_TMPDIR/capacity.log" >&2
         return "$capacity_status"
     fi
-    echo "BOUNDARY: proven /proc PID namespace mismatch; substituting act-local slot acquisition/release" >&2
+    echo "BOUNDARY: proven /proc PID $host_pid != Bash PID $BASHPID (probe status $capacity_status); substituting act-local slot acquisition/release" >&2
     for module in logging config build_state act_runner artifact_naming git_ops packaging; do
         # shellcheck source=/dev/null
         source "$PROJECT_ROOT/src/$module.sh" || return $?
@@ -1668,6 +1681,255 @@ test_build_json_envelope_structure() {
     harness_teardown
 }
 
+# Run real collection, manifest, packaging and publication over genuine ZIPs.
+# Docker/act execution is a declared boundary fixture. The existing lane
+# helper uses real host reservations unless it proves a PID namespace mismatch.
+_test_build_workflow_zip_case() {
+    local scenario="$1" expected=0 manifest_expected=0 status manifest_status=0
+    local output manifest source_sha run_id path name
+    local -a problems=() producer_receipts=()
+    harness_setup
+    export DEBUG=1
+    output="$TEST_TMPDIR/output"
+    manifest="$output/lane-tool-v1.2.3-manifest.json"
+    seed_lane_archive_fixture "$TEST_TMPDIR/source"
+    yq -i '.include_files=[]' "$DSR_CONFIG_DIR/repos.d/lane-tool.yaml" || return 1
+    if [[ "$scenario" == matrix ]]; then
+        yq -i '.targets=["linux/amd64","darwin/arm64","windows/amd64"] |
+            .act_job_map={"linux/amd64":"build","darwin/arm64":"build","windows/amd64":"build"} |
+            .archive_format={"linux":"tar.gz","darwin":"tar.gz","windows":"zip"}' \
+            "$DSR_CONFIG_DIR/repos.d/lane-tool.yaml" || return 1
+    fi
+    export WORKFLOW_ZIP_CASE="$scenario" WORKFLOW_ZIP_INPUT="$TEST_TMPDIR/producer"
+    export WORKFLOW_ZIP_OUTPUT="$output" WORKFLOW_ZIP_VICTIM="$TEST_TMPDIR/retained-file"
+    mkdir -p "$WORKFLOW_ZIP_INPUT/assets" "$WORKFLOW_ZIP_INPUT/uploads" || return 1
+    printf 'retained independent bytes\n' > "$WORKFLOW_ZIP_VICTIM"
+    python3 - "$WORKFLOW_ZIP_INPUT" "$scenario" <<'PY' || return 1
+import gzip
+import io
+from pathlib import Path
+import stat
+import sys
+import tarfile
+import warnings
+import zipfile
+
+root, mode = Path(sys.argv[1]), sys.argv[2]
+targets = [('linux/amd64', 'linux-amd64', 'tar.gz')]
+if mode == 'matrix':
+    targets += [('darwin/arm64', 'darwin-arm64', 'tar.gz'),
+                ('windows/amd64', 'windows-amd64', 'zip')]
+
+def release_archive(target, fmt, changed=False):
+    data = ('#!/bin/sh\necho ' + target + ('-changed' if changed else '') + '\n').encode()
+    payload = io.BytesIO()
+    if fmt == 'zip':
+        with zipfile.ZipFile(payload, 'w', compression=zipfile.ZIP_STORED) as archive:
+            member = zipfile.ZipInfo('lane-tool.exe')
+            member.create_system = 3
+            member.external_attr = (stat.S_IFREG | 0o755) << 16
+            archive.writestr(member, data)
+        return payload.getvalue()
+    with tarfile.open(fileobj=payload, mode='w') as archive:
+        member = tarfile.TarInfo('lane-tool')
+        member.mode, member.size, member.mtime = 0o755, len(data), 1
+        archive.addfile(member, io.BytesIO(data))
+    return gzip.compress(payload.getvalue(), mtime=1)
+
+assets = []
+for target, suffix, fmt in targets:
+    name = 'lane-tool-1.2.3-' + suffix + '.' + fmt
+    data = release_archive(target, fmt)
+    (root / 'assets' / name).write_bytes(data)
+    assets.append((name, data))
+uploads = 2 if mode in ('identical', 'different', 'matrix') else 1
+for index in range(uploads):
+    path = root / 'uploads' / ('upload-' + str(index) + '.zip')
+    with zipfile.ZipFile(path, 'w', compression=zipfile.ZIP_STORED) as archive:
+        for name, data in assets:
+            if mode == 'different' and index == 1:
+                data = release_archive('linux/amd64', 'tar.gz', True)
+            member_name = ('release[stable]/' if mode == 'literal-path' else '') + name
+            member = zipfile.ZipInfo(member_name)
+            member.create_system = 3
+            member.external_attr = ((stat.S_IFLNK if mode == 'linked-member' else stat.S_IFREG) | 0o644) << 16
+            archive.writestr(member, data)
+            if mode == 'duplicate-member':
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore', UserWarning)
+                    archive.writestr(member, data)
+            if mode == 'ambiguous-name':
+                archive.writestr('other/' + name, data)
+        if mode == 'ignored-corruption':
+            archive.writestr('unselected-note.txt', b'transport CRC must still be verified')
+    if mode == 'ignored-corruption':
+        data = bytearray(path.read_bytes())
+        position = data.index(b'transport CRC must still be verified')
+        data[position] ^= 1
+        path.write_bytes(data)
+PY
+    mock_command_script act "$(cat <<'SH'
+if [[ "${1:-}" == --version ]]; then echo 'act version 0.2.87'; exit 0; fi
+artifact_dir=""; previous=""
+for argument in "$@"; do
+    if [[ "$previous" == --artifact-server-path ]]; then artifact_dir="$argument"; break; fi
+    previous="$argument"
+done
+[[ -n "$artifact_dir" ]] || exit 0
+mkdir -p "$artifact_dir" || exit 1
+cp "$WORKFLOW_ZIP_INPUT/uploads/"*.zip "$artifact_dir/" || exit 1
+name=lane-tool-1.2.3-linux-amd64.tar.gz
+case "$WORKFLOW_ZIP_CASE" in
+    destination-link)
+        ln -s "$WORKFLOW_ZIP_VICTIM" "$WORKFLOW_ZIP_OUTPUT/$name" || exit 1 ;;
+    destination-conflict)
+        cp "$WORKFLOW_ZIP_VICTIM" "$WORKFLOW_ZIP_OUTPUT/$name" || exit 1 ;;
+esac
+SH
+)" || return 1
+    case "$scenario" in
+        different|duplicate-member|ambiguous-name|ignored-corruption|linked-member)
+            expected=1; manifest_expected=4 ;;
+        destination-link|destination-conflict) expected=1 ;;
+    esac
+    exec_run run_lane_build lane-tool --version 1.2.3 --jobs 2 --output-dir "$output"
+    status=$(exec_status)
+    [[ "$status" == "$expected" ]] || problems+=("public exit $status, expected $expected")
+    if [[ "$expected" == 0 ]]; then
+        exec_stdout | jq -e '.status=="success" and .details.publishable==true and
+            (.details.manifest_path|length>0)' >/dev/null || problems+=("no public success receipt")
+        lane_publication_matches "$output" "$manifest" true || problems+=("release admission failed")
+        if ! python3 - "$WORKFLOW_ZIP_INPUT/assets" "$output" "$manifest" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+source, output, manifest = map(Path, sys.argv[1:])
+document = json.loads(manifest.read_text())
+rows = {row['name']: row for row in document['artifacts']}
+assert len(rows) == len(document['artifacts']) == 2 * len(list(source.iterdir()))
+for payload in source.iterdir():
+    assert (output / payload.name).read_bytes() == payload.read_bytes()
+    row = rows[payload.name]
+    target = ('darwin/arm64' if 'darwin-arm64' in payload.name else
+              'windows/amd64' if 'windows-amd64' in payload.name else 'linux/amd64')
+    assert row['target'] == target
+    alias = payload.name.replace('-1.2.3-', '-')
+    assert rows[alias]['target'] == target and (output / alias).read_bytes() == payload.read_bytes()
+for row in rows.values():
+    data = (output / row['name']).read_bytes()
+    assert hashlib.sha256(data).hexdigest() == row['sha256'] and len(data) == row['size_bytes']
+PY
+        then
+            problems+=("final payload hashes, aliases or target ownership differ")
+        fi
+    else
+        exec_stdout | jq -e '.status=="partial" and .details.publishable==false and
+            .details.manifest_path==""' >/dev/null || problems+=("refusal advertises a manifest")
+        lane_publication_matches "$output" "$manifest" false || problems+=("refusal remains publishable")
+        exec_stderr | grep -Eq 'Artifact name collision|Archive admission failed|ambiguous release name' || \
+            problems+=("expected ZIP admission boundary was not reached")
+        if [[ "$scenario" == destination-link || "$scenario" == destination-conflict ]]; then
+            [[ "$(cat "$WORKFLOW_ZIP_VICTIM")" == 'retained independent bytes' ]] || problems+=("external file was overwritten")
+            cmp -s "$WORKFLOW_ZIP_VICTIM" "$output/lane-tool-1.2.3-linux-amd64.tar.gz" || \
+                problems+=("existing destination was overwritten")
+        elif [[ "$scenario" != different ]]; then
+            [[ ! -e "$output/lane-tool-1.2.3-linux-amd64.tar.gz" ]] || problems+=("invalid transport emitted a payload")
+        fi
+    fi
+    ((TESTS_RUN++))
+    if [[ ${#problems[@]} == 0 ]]; then pass "public workflow ZIP collection ($scenario)"
+    else
+        fail "public workflow ZIP collection ($scenario): ${problems[*]}"
+        exec_stderr
+    fi
+
+    # Independently regenerate from the actual immutable worker receipts.
+    # Public collection cannot hide a permissive or inconsistent manifest path.
+    while IFS= read -r -d '' path; do producer_receipts+=("$path"); done < <(
+        find "$DSR_STATE_DIR/builds" -path '*/results/*.attempt-1.json' -print0)
+    problems=()
+    if [[ ${#producer_receipts[@]} == 0 ]]; then
+        problems+=("no actual worker receipts")
+    else
+        source_sha=$(git -C "$TEST_TMPDIR/source" rev-parse HEAD)
+        run_id=$(exec_stdout | jq -r '.details.run_id')
+        jq -cs --arg sha "$source_sha" --arg run "$run_id" '
+            {tool:"lane-tool",version:"1.2.3",run_id:$run,git_sha:$sha,git_ref:"v1.2.3",
+             status:"success",summary:{total:length,success:length,failed:0},targets:.}
+        ' "${producer_receipts[@]}" > "$TEST_TMPDIR/manifest-input.json" || return 1
+        if [[ "$manifest_expected" != 0 ]]; then
+            printf 'retained manifest bytes\n' > "$TEST_TMPDIR/independent-manifest.json"
+        fi
+        bash -c 'source "$1/src/act_runner.sh" || exit $?; act_generate_manifest "$(cat "$2")" "$3"' _ \
+            "$PROJECT_ROOT" "$TEST_TMPDIR/manifest-input.json" "$TEST_TMPDIR/independent-manifest.json" \
+            > "$TEST_TMPDIR/independent-manifest.stdout" 2> "$TEST_TMPDIR/independent-manifest.stderr" || manifest_status=$?
+        [[ "$manifest_status" == "$manifest_expected" ]] || \
+            problems+=("independent manifest exit $manifest_status, expected $manifest_expected")
+        if [[ "$manifest_expected" == 0 ]]; then
+            jq -e '.status=="success" and .publishable==true and
+                (.artifacts|length>0) and (.artifacts|map(.name)|unique|length)==(.artifacts|length)' \
+                "$TEST_TMPDIR/independent-manifest.json" >/dev/null || problems+=("independent manifest invalid")
+        else
+            [[ "$(cat "$TEST_TMPDIR/independent-manifest.json")" == 'retained manifest bytes' ]] || \
+                problems+=("failed admission replaced existing manifest")
+            grep -Eq 'same release name and different bytes|Archive admission failed|ambiguous release name' \
+                "$TEST_TMPDIR/independent-manifest.stderr" || problems+=("independent manifest refused at an unrelated boundary")
+        fi
+    fi
+    ((TESTS_RUN++))
+    if [[ ${#problems[@]} == 0 ]]; then pass "independent ZIP manifest admission ($scenario)"
+    else
+        fail "independent ZIP manifest admission ($scenario): ${problems[*]}"
+        cat "$TEST_TMPDIR/independent-manifest.stderr" 2>/dev/null
+    fi
+    printf 'Retained workflow ZIP evidence: %s\n' "$TEST_TMPDIR"
+    harness_teardown
+}
+
+test_build_workflow_zip_admission() {
+    local evidence scenario pid count passed failed skipped
+    local -a pids=() scenarios=(single identical matrix literal-path different duplicate-member
+        ambiguous-name ignored-corruption linked-member destination-link destination-conflict)
+    if [[ "$HAS_YQ" != true ]] || ! command -v python3 &>/dev/null || ! command -v unzip &>/dev/null; then
+        ((TESTS_RUN++)); skip 'yq, Python and unzip required for workflow ZIP admission'; return 0
+    fi
+    evidence=$(mktemp -d "${TMPDIR:-/tmp}/dsr-workflow-zip-tests.XXXXXXXX") || return 1
+    printf 'Workflow ZIP logs: %s\n' "$evidence"
+    # Cases own separate Git repositories, mock executables, state and output.
+    # Only independent invocations overlap; each case retains its gate order.
+    for scenario in "${scenarios[@]}"; do
+        (
+            TESTS_RUN=0 TESTS_PASSED=0 TESTS_FAILED=0 TESTS_SKIPPED=0
+            _test_build_workflow_zip_case "$scenario" || { ((TESTS_RUN++)); fail "fixture setup ($scenario)"; }
+            printf '%s %s %s %s\n' "$TESTS_RUN" "$TESTS_PASSED" "$TESTS_FAILED" "$TESTS_SKIPPED" \
+                > "$evidence/$scenario.counts"
+        ) > "$evidence/$scenario.log" 2>&1 &
+        pids+=("$!")
+        if [[ ${#pids[@]} == 4 ]]; then
+            for pid in "${pids[@]}"; do wait "$pid" || true; done
+            pids=()
+        fi
+    done
+    for pid in "${pids[@]}"; do wait "$pid" || true; done
+    for scenario in "${scenarios[@]}"; do
+        cat "$evidence/$scenario.log"
+        if read -r count passed failed skipped < "$evidence/$scenario.counts"; then
+            TESTS_RUN=$((TESTS_RUN + count)); TESTS_PASSED=$((TESTS_PASSED + passed))
+            TESTS_FAILED=$((TESTS_FAILED + failed)); TESTS_SKIPPED=$((TESTS_SKIPPED + skipped))
+        else
+            ((TESTS_RUN++)); fail "workflow ZIP case did not finish ($scenario)"
+        fi
+    done
+}
+
+if [[ "${1:-}" == --workflow-zip-only ]]; then
+    test_build_workflow_zip_admission
+    printf '\nWorkflow ZIP admission: %s passed, %s failed, %s skipped\n' "$TESTS_PASSED" "$TESTS_FAILED" "$TESTS_SKIPPED"
+    [[ "$TESTS_FAILED" == 0 ]]
+    exit $?
+fi
+
 # ============================================================================
 # Cleanup
 # ============================================================================
@@ -1721,6 +1983,7 @@ test_build_completes_lane_archive_with_include_files
 test_build_refuses_attested_thin_lane_archive
 test_build_checks_prebuilt_include_contract
 test_build_validates_prebuilt_archives_without_includes
+test_build_workflow_zip_admission
 test_build_packages_each_target_triple_variant
 test_build_names_unproduced_target_triple_variant
 test_build_refuses_secondary_variant_include_conflict

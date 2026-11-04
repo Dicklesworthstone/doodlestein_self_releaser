@@ -3562,67 +3562,48 @@ EOF
     _build_collect_artifact_zip() {
         local zip_path="$1"
         local tag_filter="$2"
-        local version_stripped="${tag_filter#v}"
-
-        if ! command -v unzip &>/dev/null; then
-            log_error "unzip required to extract act artifacts: $zip_path"
+        local payloads file dest_name dest_path prior mode
+        if ! payloads=$(_act_artifact_zip_payloads "$zip_path" "$tag_filter"); then
+            log_error "Failed to admit workflow artifact ZIP: $zip_path"
             collect_failed=true
             return 1
         fi
-
-        local entries
-        entries=$(unzip -Z1 "$zip_path" 2>/dev/null)
-        if [[ -z "$entries" ]]; then
-            log_error "Failed to read zip entries: $zip_path"
-            collect_failed=true
-            return 1
-        fi
-
-        local -a matched_entries=()
-        while IFS= read -r entry; do
-            [[ -z "$entry" ]] && continue
-            [[ "$entry" == */ ]] && continue
-            if [[ "$entry" == *"$tag_filter"* || "$entry" == *"$version_stripped"* ]]; then
-                matched_entries+=("$entry")
-            fi
-        done <<< "$entries"
-
-        local -a use_entries=()
-        if [[ ${#matched_entries[@]} -gt 0 ]]; then
-            use_entries=("${matched_entries[@]}")
-        else
-            while IFS= read -r entry; do
-                [[ -z "$entry" ]] && continue
-                [[ "$entry" == */ ]] && continue
-                use_entries+=("$entry")
-            done <<< "$entries"
-        fi
-
-        local entry
-        for entry in "${use_entries[@]}"; do
-            local dest_name dest_path
-            dest_name=$(basename "$entry")
+        while IFS= read -r -d '' file; do
+            dest_name="${file##*/}"
             dest_path="$output_dir/$dest_name"
-
-            if [[ -n "${collected_names[$dest_name]:-}" ]]; then
+            prior="${collected_names[$dest_name]:-}"
+            if [[ -n "$prior" && -n "${verified_additional_receipts:-}" ]] &&
+               jq -e --arg path "$prior" 'has($path)' <<< "$verified_additional_receipts" >/dev/null; then
+                log_error "Workflow artifact collides with a declared additional producer: $dest_name"
+                collision_count=$((collision_count + 1))
+                collect_failed=true
+                continue
+            fi
+            # Repeated act uploads may carry the same matrix payload. Reuse
+            # only the exact regular bytes already collected; never truncate
+            # a conflicting, linked or externally redirected destination.
+            if [[ -e "$dest_path" || -L "$dest_path" ]]; then
+                if [[ -f "$dest_path" && ! -L "$dest_path" ]] && cmp -s "$dest_path" "$file"; then
+                    log_info "Duplicate workflow artifact (same content): $dest_name"
+                    collected_names["$dest_name"]="$file"
+                    continue
+                fi
                 log_error "Artifact name collision: $dest_name (from $zip_path)"
                 collision_count=$((collision_count + 1))
                 collect_failed=true
                 continue
             fi
-
-            if [[ -f "$dest_path" ]]; then
-                log_warn "Overwriting existing artifact: $dest_name"
-            fi
-
-            if unzip -p "$zip_path" "$entry" > "$dest_path" 2>/dev/null; then
-                collected_names["$dest_name"]="$zip_path::$entry"
+            mode=600
+            [[ ! -x "$file" ]] || mode=700
+            if _act_collect_stream_exclusive "$dest_path" "$mode" _act_stream_local_file "$file" >/dev/null &&
+               cmp -s "$dest_path" "$file"; then
+                collected_names["$dest_name"]="$file"
                 collected_count=$((collected_count + 1))
             else
-                log_error "Failed to extract $entry from $zip_path"
+                log_error "Failed to collect $dest_name from $zip_path without clobbering"
                 collect_failed=true
             fi
-        done
+        done < <(jq -j '.[] | ., "\u0000"' <<< "$payloads")
     }
 
     local -a extra_manifest_entries=()
