@@ -393,6 +393,126 @@ test_cli_json_failure_is_one_envelope_from_one_run() {
     harness_teardown
 }
 
+# Only the updater executable is a fixture. The CLI, timeout, output capture,
+# version selection and verdict are production code in both output modes.
+make_verdict_tool() {
+    printf '%s' "$1" > "$TEST_TMPDIR/check.stdout"
+    printf '%s' "$2" > "$TEST_TMPDIR/check.stderr"
+    printf '%s\n' "$3" > "$TEST_TMPDIR/check.result"
+    export DSR_UPGRADE_TEST_ROOT="$TEST_TMPDIR"
+    cat > "$TEST_TMPDIR/bin/cli-verdict" << 'EOF'
+#!/usr/bin/env bash
+[[ $# -eq 2 && "$1" == upgrade && "$2" == --check ]] || exit 64
+printf 'run\n' >> "$DSR_UPGRADE_TEST_ROOT/check.calls"
+cat "$DSR_UPGRADE_TEST_ROOT/check.stdout"
+cat "$DSR_UPGRADE_TEST_ROOT/check.stderr" >&2
+result=$(cat "$DSR_UPGRADE_TEST_ROOT/check.result")
+[[ "$result" != timeout ]] || exec sleep 10
+exit "$result"
+EOF
+    chmod +x "$TEST_TMPDIR/bin/cli-verdict"
+}
+
+check_cli_verdict() {
+    local label="$1" updater_status="$2" expected_status="$3" text="$4" diagnostic="$5" version="${6-1.2.3}"
+    local TEST_NAME="upgrade-verdict-$label"
+    ((TESTS_RUN++))
+    harness_setup
+    setup_module
+    make_verdict_tool "$text" "$diagnostic" "$updater_status"
+    local PATH="$TEST_TMPDIR/bin:$PATH"
+    local output mode calls=0 problems=() expected_verdict=failed expected_envelope=error found=false
+    local -a flags=() version_args=()
+    if [[ "$expected_status" == 0 ]]; then
+        expected_verdict=passed expected_envelope=success found=true
+    fi
+    [[ -z "$version" ]] || version_args=(--version "$version")
+    for mode in plain json; do
+        flags=()
+        [[ "$mode" != json ]] || flags=(--json)
+        exec_run "$PROJECT_ROOT/dsr" ${flags[@]+"${flags[@]}"} verify upgrade cli-verdict \
+            ${version_args[@]+"${version_args[@]}"}
+        output=$(exec_stdout)
+        cp "$_EXEC_STDOUT_FILE" "$TEST_TMPDIR/$mode.stdout"
+        cp "$_EXEC_STDERR_FILE" "$TEST_TMPDIR/$mode.stderr"
+        [[ "$(exec_status)" == "$expected_status" ]] || problems+=("$mode exited $(exec_status)")
+        calls=$((calls + 1))
+        [[ -f "$TEST_TMPDIR/check.calls" && "$(wc -l < "$TEST_TMPDIR/check.calls")" -eq "$calls" ]] ||
+            problems+=("$mode did not invoke the updater exactly once")
+        if [[ "$mode" == json ]]; then
+            jq -es --arg verdict "$expected_verdict" --arg status "$expected_envelope" \
+                --argjson code "$expected_status" --argjson updater "$updater_status" --argjson found "$found" \
+                --arg version "$version" '
+                length == 1 and (.[0] | .command == "verify-upgrade" and
+                    .status == $status and .exit_code == $code and .details.tool == "cli-verdict" and
+                    .details.status == $verdict and .details.found_asset == $found and
+                    .details.exit_code == $updater and
+                    .details.expected_version == (if $version == "" then null else $version end))
+            ' <<< "$output" >/dev/null || problems+=("JSON verdict or updater status disagrees")
+        elif [[ "$expected_status" != 0 ]] &&
+             grep -qi 'verification.*passed' "$TEST_TMPDIR/plain.stderr"; then
+            problems+=("plain output claimed verification passed")
+        fi
+    done
+    if [[ ${#problems[@]} -eq 0 ]]; then
+        pass "plain and JSON upgrade verification agree: $label"
+    else
+        fail "upgrade verdict $label: ${problems[*]}"
+    fi
+    unset DSR_UPGRADE_TEST_ROOT
+    harness_teardown
+}
+
+test_cli_process_status_and_output_agree() {
+    check_cli_verdict positive-then-failure 41 1 \
+        $'Latest version: 1.2.3\nUpdate available\n' $'Error: signature validation failed\n'
+    check_cli_verdict current-version-before-mismatch 41 1 \
+        $'Current version: 1.0.0\nLatest version: 1.2.3\n' $'Error: no suitable release asset for this platform\n'
+    check_cli_verdict contradictory-zero-exit 0 1 \
+        $'Latest version: 1.2.3\nUpdate available\n' $'Error: asset not found\n'
+    check_cli_verdict no-update-before-failure 43 1 \
+        $'Latest version: 1.2.3\nAlready up to date\n' $'Error: upstream lookup failed\n'
+    check_cli_verdict healthy-update 0 0 $'Latest version: 1.2.3\nUpdate available\n' ''
+    check_cli_verdict healthy-no-update 0 0 $'Latest version: 1.2.3\nNo update available\n' ''
+    check_cli_verdict healthy-generic 0 0 $'Check completed.\n' '' ''
+    check_cli_verdict healthy-silent 0 0 '' '' ''
+}
+
+test_real_timeout_after_positive_output_fails() {
+    ((TESTS_RUN++))
+    local TEST_NAME=upgrade-verdict-timeout
+    harness_setup
+    setup_module
+    if ! command -v timeout >/dev/null && ! command -v gtimeout >/dev/null; then
+        skip "real upgrade timeout requires timeout or gtimeout"
+        harness_teardown
+        return 0
+    fi
+    make_verdict_tool $'Latest version: 1.2.3\nUpdate available\n' '' timeout
+    local PATH="$TEST_TMPDIR/bin:$PATH" UPGRADE_VERIFY_TIMEOUT=1
+    local problems=() output
+    exec_run upgrade_verify_tool cli-verdict --version 1.2.3
+    [[ "$(exec_status)" == 1 ]] || problems+=("plain timeout exited $(exec_status)")
+    cp "$_EXEC_STDOUT_FILE" "$TEST_TMPDIR/plain.stdout"
+    cp "$_EXEC_STDERR_FILE" "$TEST_TMPDIR/plain.stderr"
+    exec_run upgrade_verify_json cli-verdict --version 1.2.3
+    [[ "$(exec_status)" == 1 ]] || problems+=("JSON timeout exited $(exec_status)")
+    output=$(exec_stdout)
+    jq -es 'length == 1 and (.[0] | .status == "failed" and .found_asset == false and
+        .exit_code == 124 and .latest_version == "1.2.3" and .expected_version == "1.2.3" and
+        (.output | contains("Update available")))' <<< "$output" >/dev/null ||
+        problems+=("JSON timeout did not retain the actual timeout result")
+    [[ -f "$TEST_TMPDIR/check.calls" && "$(wc -l < "$TEST_TMPDIR/check.calls")" -eq 2 ]] ||
+        problems+=("timeout verification repeated the updater")
+    if [[ ${#problems[@]} -eq 0 ]]; then
+        pass "real updater timeout cannot become success from earlier positive output"
+    else
+        fail "upgrade timeout verdict: ${problems[*]}"
+    fi
+    unset DSR_UPGRADE_TEST_ROOT
+    harness_teardown
+}
+
 test_cli_dry_run_runs_and_builds_nothing() {
     ((TESTS_RUN++))
     harness_setup
@@ -731,6 +851,8 @@ test_json_error_for_missing_tool
 test_json_uses_configured_check_args
 test_json_reports_exact_version_mismatch
 test_cli_json_failure_is_one_envelope_from_one_run
+test_cli_process_status_and_output_agree
+test_real_timeout_after_positive_output_fails
 test_cli_dry_run_runs_and_builds_nothing
 
 echo ""

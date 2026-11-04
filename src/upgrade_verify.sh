@@ -145,8 +145,16 @@ upgrade_verify_tool() {
         output=$("$bin_path" "${check_args[@]}" 2>&1) || exit_code=$?
     fi
 
-    # Parse output
-    local found_asset=false
+    # Informational output can precede a failed request or a timeout. Check the
+    # actual process result before announcing an update or accepting its version.
+    if ! _upgrade_check_succeeded "$exit_code" "$output"; then
+        log_error "Upgrade verification FAILED for $tool_name"
+        log_error "Exit code: $exit_code"
+        log_error "Output: $output"
+        [[ -n "$built_tmpdir" ]] && rm -rf "$built_tmpdir"
+        return 1
+    fi
+
     local current_version=""
     local latest_version=""
 
@@ -154,20 +162,10 @@ upgrade_verify_tool() {
     # Here-strings keep `grep -q` from SIGPIPE-ing a writer of large output,
     # which pipefail would turn into a missed match.
     if grep -qi "found.*asset\|download.*available\|update.*available" <<< "$output"; then
-        found_asset=true
         log_ok "$tool_name update check: Found update"
     elif grep -qi "up.to.date\|no update\|already.*latest" <<< "$output"; then
-        found_asset=true
         log_ok "$tool_name update check: Up to date"
-    elif grep -qi "no suitable release asset\|asset not found\|failed to find" <<< "$output"; then
-        found_asset=false
-        log_error "$tool_name update check: Asset naming mismatch"
-        log_error "Output: $output"
-        [[ -n "$built_tmpdir" ]] && rm -rf "$built_tmpdir"
-        return 1
-    elif [[ $exit_code -eq 0 ]]; then
-        # Exit 0 usually means success
-        found_asset=true
+    else
         log_ok "$tool_name update check: Completed successfully"
     fi
 
@@ -207,15 +205,8 @@ upgrade_verify_tool() {
     # Cleanup built binary tmpdir
     [[ -n "$built_tmpdir" ]] && rm -rf "$built_tmpdir"
 
-    if $found_asset; then
-        log_ok "Upgrade verification PASSED for $tool_name on $platform"
-        return 0
-    else
-        log_error "Upgrade verification FAILED for $tool_name on $platform"
-        log_error "Exit code: $exit_code"
-        log_error "Output: $output"
-        return 1
-    fi
+    log_ok "Upgrade verification PASSED for $tool_name on $platform"
+    return 0
 }
 
 # Verify upgrade command for all tools
@@ -306,7 +297,7 @@ upgrade_verify_json() {
     done
 
     local status=0
-    local output exit_code platform
+    local output exit_code=0 platform
 
     platform="$(uname -s | tr '[:upper:]' '[:lower:]')/$(uname -m)"
 
@@ -360,10 +351,7 @@ upgrade_verify_json() {
         local found_asset=false
         local latest_version
         latest_version=$(_upgrade_extract_latest_version "$output")
-        if grep -qi "up.to.date\|no update\|already.*latest\|current version\|found.*asset\|download.*available\|update.*available" <<< "$output"; then
-            found_asset=true
-            status=0
-        elif [[ ${exit_code:-0} -eq 0 ]]; then
+        if _upgrade_check_succeeded "$exit_code" "$output"; then
             found_asset=true
             status=0
         else
@@ -423,6 +411,16 @@ upgrade_verify_json() {
 # ============================================================================
 # Internal Helpers
 # ============================================================================
+
+# Both output modes use the updater's process result as a prerequisite. Keep
+# the established zero-exit generic/no-update behavior, but an explicit asset
+# lookup failure must win over any earlier positive informational output.
+_upgrade_check_succeeded() {
+    local exit_code="$1" output="$2" match_status=0
+    [[ "$exit_code" == 0 ]] || return 1
+    grep -qi "no suitable release asset\|asset not found\|failed to find" <<< "$output" || match_status=$?
+    [[ "$match_status" == 1 ]]
+}
 
 # Extract the version identified as latest (or update-available) from tool
 # output. Prefer a line containing "latest" so a preceding current-version
@@ -605,5 +603,5 @@ _upgrade_build_tool() {
 
 # Export functions
 export -f upgrade_verify_tool upgrade_verify_all upgrade_verify_json
-export -f _upgrade_extract_latest_version _upgrade_check_args _upgrade_has_explicit_check_args
+export -f _upgrade_check_succeeded _upgrade_extract_latest_version _upgrade_check_args _upgrade_has_explicit_check_args
 export -f _upgrade_tool_binary_name _upgrade_find_repo_dir _upgrade_build_tool
