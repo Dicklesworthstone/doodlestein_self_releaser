@@ -39,7 +39,9 @@ declare -gA DSR_CONFIG
 # Optional Unix split-storage contract (#38). The host's own `build_root` is
 # where every snapshot, isolated target and output stage lands (act_runner
 # defaults them to /var/tmp without it), so it is the volume the contract
-# admits; the contract itself carries only the root floor, never a second path.
+# admits; the contract never carries a second path. An explicitly authorized
+# build_min_free_bytes opts only that build root into a percentage exception,
+# with a floor of at least 20 GiB. Omission preserves the default policy.
 # The root filesystem (system, Cargo home) stays visible and, above the error
 # percentage, is admitted only as a warning while its free space meets
 # root_min_free_bytes. Emits {build_root, root_min_free_bytes}. Return 1 when
@@ -66,12 +68,16 @@ config_unix_storage_json() {
         "$hosts_file") || return 4
     [[ "$(jq -c '.unix_storage' <<< "$value" 2>/dev/null)" != null ]] || return 1
     jq -e '
-        (.unix_storage | type == "object" and keys == ["root_min_free_bytes"] and
-            (.root_min_free_bytes | type == "number" and . == floor and . >= 1073741824)) and
+        (.unix_storage | type == "object" and
+            (keys == ["root_min_free_bytes"] or keys == ["build_min_free_bytes","root_min_free_bytes"]) and
+            (.root_min_free_bytes | type == "number" and . == floor and . >= 1073741824) and
+            (if has("build_min_free_bytes") then
+                (.build_min_free_bytes | type == "number" and . == floor and . >= 21474836480 and . <= 9007199254740991)
+             else true end)) and
         (.build_root | type == "string" and test("^/[A-Za-z0-9._/-]+$") and
             (test("(^|/)\\.\\.?(/|$)") | not) and (test("//") | not) and (rtrimstr("/") != ""))
     ' <<< "$value" >/dev/null || return 4
-    jq -c '{build_root: (.build_root | rtrimstr("/")), root_min_free_bytes: .unix_storage.root_min_free_bytes}' <<< "$value"
+    jq -c '.unix_storage + {build_root: (.build_root | rtrimstr("/"))}' <<< "$value"
 }
 
 # Optional Windows split-storage contract. The source and private Cargo home
@@ -1122,7 +1128,7 @@ config_validate_targets() {
 
 # Additional release files have literal, globally unique names. Their declared
 # format is build policy, not a value an untrusted producer receipt may choose.
-# This pure normalizer is shared by configuration preflight and producer readers.
+# This pure normalizer is shared by configuration preflight and native readers.
 config_normalize_additional_artifacts_json() {
     local raw="${1:-null}" context="${2:-workspace_additional_artifacts}" normalized
     local act_jobs="${3:-null}"
@@ -1161,11 +1167,10 @@ config_normalize_additional_artifacts_json() {
             if (.value | length) == 0 then .
             elif $act_jobs != null and ($act_jobs | type) != "object"
             then refuse("act_job_map must be a platform mapping")
-            else $act_jobs[$platform] as $job |
-                if $job != null and ($job | type) != "string"
-                then refuse($platform + " requires a string or null act job selector, received " + ($job | tojson))
-                elif ($job | type) == "string" and ($job | test("[\u0000-\u001f\u007f]"))
-                then refuse($platform + " has control characters in its act job selector")
+            else ($act_jobs[$platform] // "") as $job |
+                if $job != "" and $job != "null"
+                then refuse($platform + " assigns additional artifacts to act job " + ($job | tojson) +
+                    "; additional artifacts require a native producer (set act_job_map[" + $platform + "]: null)")
                 else . end
             end
         ) | from_entries |

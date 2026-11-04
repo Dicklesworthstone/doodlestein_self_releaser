@@ -467,11 +467,12 @@ selector_get_candidates() {
     # Get healthy hosts
     local healthy_hosts
     declare -F host_health_get_healthy_hosts &>/dev/null || return 3
-    if [[ -n "$capability" ]]; then
-        healthy_hosts=$(host_health_get_healthy_hosts --for-capability "$capability" --json) || return $?
-    else
-        healthy_hosts=$(host_health_get_healthy_hosts --json) || return $?
-    fi
+    local -a health_args=(--json)
+    [[ -z "$capability" ]] || health_args+=(--for-capability "$capability")
+    # Validate the whole inventory, but probe only hosts that can be selected.
+    # An unrelated platform's SSH/toolchain latency must not stall this target.
+    [[ -z "$os" ]] || health_args+=(--for-os "$os")
+    healthy_hosts=$(host_health_get_healthy_hosts "${health_args[@]}") || return $?
 
     if ! jq -es 'length == 1 and (.[0] | type == "array" and all(.[];
         type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._+\\-]{0,199}$") and

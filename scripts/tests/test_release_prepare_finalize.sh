@@ -6,6 +6,9 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 DSR_PREPARE_FIXTURES_ONLY=true source "$HERE/test_release_prepare.sh"
 # shellcheck source=src/release_finalize.sh
 source "${FINALIZER_TEST_MODULE:-$ROOT/src/release_finalize.sh}"
+# Keep the real outbox identity helpers loaded before replacing the explicit
+# delivery boundary below, so lazy loading cannot overwrite those fixtures.
+source "$ROOT/src/dispatch.sh" || exit 1
 
 _rup_require() { :; }
 _rup_check_files() {
@@ -178,6 +181,8 @@ new_pipeline() {
 }
 pipeline() {
     RC=0
+    # Assertions loaded from test_release_prepare.sh consume these globals.
+    # shellcheck disable=SC2034
     OUT=$(release_finalize "$CASE/artifacts" --repo acme/tool --tag v1.2.3 --sha "$SHA" \
         --state-dir "$CASE/finalize" --output-dir "$CASE/meta" "$@" 2> "$CASE/diagnostics") || RC=$?
 }
@@ -308,13 +313,16 @@ check count UPLOAD 1
 # the request between preflight and the preparation engine's own state binding.
 new_pipeline
 printf 'original notes\n' > "$CASE/notes"
-auth_definition=$(declare -f _sbr_require)
-_sbr_require() { printf 'changed notes\n' > "$CASE/notes"; }
-create_pipeline --release-notes-file "$CASE/notes"
+RC=0
+OUT=$(
+    _sbr_require() { printf 'changed notes\n' > "$CASE/notes"; }
+    create_pipeline --release-notes-file "$CASE/notes"
+    printf '%s\n' "$OUT"
+    exit "$RC"
+) || RC=$?
 check assert_rc 0
 check jq -e '.body=="original notes\n"' "$CASE/release"
 check posts 1
-eval "$auth_definition"
 create_pipeline --release-notes-file "$CASE/notes"
 check assert_rc 2
 check posts 1
@@ -367,24 +375,29 @@ check jq -e .draft "$CASE/release"
 
 # Release identity is rechecked before the payload boundary, not only afterward.
 new_pipeline
-save_definition=$(declare -f _rf_save)
-_rf_save() {
-    local file="$1" state="$2" result
-    # Use the unchanged production implementation, then inject an outside tag move.
-    result=$(_fixture_save "$@") || return $?
-    if [[ -e "$CASE/drift-before-payload" ]] && jq -e '.payload_plan!=null' <<< "$state" >/dev/null; then
-        printf '%s\n' "$OTHER" > "$CASE/sha"
-    fi
-    printf '%s\n' "$result"
-}
-# Function cloning is test setup, not a source-code transformation.
-eval "${save_definition/_rf_save ()/_fixture_save ()}"
 touch "$CASE/drift-before-payload"
-create_pipeline
+RC=0
+OUT=$(
+    _rf_save() {
+        local state="$2" result
+        # Reload the real implementation only inside this call's subshell.
+        # The parent fixture and production helpers remain unchanged.
+        result=$(
+            source "$_RELEASE_FINALIZE_DIR/release_finalize_core.sh" || exit $?
+            _rf_save "$@"
+        ) || return $?
+        if [[ -e "$CASE/drift-before-payload" ]] && jq -e '.payload_plan!=null' <<< "$state" >/dev/null; then
+            printf '%s\n' "$OTHER" > "$CASE/sha"
+        fi
+        printf '%s\n' "$result"
+    }
+    create_pipeline
+    printf '%s\n' "$OUT"
+    exit "$RC"
+) || RC=$?
 check assert_rc 7
 check posts 1
 check count PAYLOAD 0
-eval "$save_definition"
 
 new_pipeline
 create_pipeline --tool tool --dispatch-repos acme/checksums

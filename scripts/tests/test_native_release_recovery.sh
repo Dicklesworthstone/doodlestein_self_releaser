@@ -26,7 +26,7 @@ import zipfile
 
 root = Path(sys.argv[1])
 module = root / 'src/release_recover_native.sh'
-work = Path(tempfile.mkdtemp(prefix='dsr-native-recovery-'))
+work = Path(tempfile.mkdtemp(prefix='dsr-native-recovery-')).resolve(strict=True)
 print('Evidence directory: ' + str(work), flush=True)
 source, assets, states = work / 'source', work / 'artifacts', work / 'states'
 for directory in (source, assets, states):
@@ -72,6 +72,17 @@ commit = git('rev-parse', 'HEAD')
 git('tag', 'v1.2.3')
 platforms = ['linux/amd64', 'linux/arm64', 'darwin/amd64', 'darwin/arm64',
              'windows/amd64', 'windows/arm64', 'windows/386']
+native_platform = '/'.join(run(['go', 'env', 'GOHOSTOS', 'GOHOSTARCH']).decode().split())
+assert native_platform in platforms, 'No runnable fixture for host: ' + native_platform
+
+
+def native_output(release_root, release_manifest):
+    artifacts = [a for a in release_manifest['artifacts']
+                 if a['target'] == native_platform and a['archive_format'] == 'binary']
+    assert len(artifacts) == 1, 'Expected one raw executable for ' + native_platform
+    return run([str(release_root / 'artifacts' / artifacts[0]['name'])]).decode().strip()
+
+
 state = dict(tool='demo', version='1.2.3', run_id=str(uuid.uuid4()), status='failed',
              git_sha=commit, git_ref='refs/tags/v1.2.3', targets=platforms, target_statuses={},
              context=dict(build_purpose='release', publishable=True, build_tasks=[],
@@ -156,7 +167,7 @@ for artifact in manifest['artifacts']:
     exact &= recovered.read_bytes() == original.read_bytes() and recovered.stat().st_ino != original.stat().st_ino
     exact &= sha(recovered.read_bytes()) == artifact['sha256'] and recovered.stat().st_size == artifact['size_bytes']
 check('all raw bytes match their own worker receipts without hardlinks', exact)
-check('recovered Linux executable runs with the expected target', run([str(release / 'artifacts/demo-linux_amd64')]).decode().strip() == 'linux/amd64')
+check('recovered host executable runs with the expected target', native_output(release, manifest) == native_platform)
 check('source tag and checkout stay untouched', git('rev-parse', 'refs/tags/v1.2.3') == commit and not git('status', '--porcelain'))
 check('build time comes from completed checkpoints, not the recovery clock',
       manifest['built_at'] == max(s['updated_at'] for s in state['target_statuses'].values()))
@@ -336,7 +347,7 @@ if status == 0:
               Path(checkpoint['target_statuses'][a['target']]['result']['artifact_path']).read_bytes()
               for a in recovered_manifest['artifacts']))
     check('recovered checkpoint executable runs without rebuilding',
-          run([str(recovered / 'artifacts/demo-linux_amd64')]).decode().strip() == 'linux/amd64')
+          native_output(recovered, recovered_manifest) == native_platform)
 else:
     print((work / ('run-%d.stderr' % counter)).read_text(), file=sys.stderr)
 status, response, destination, _ = invoke(checkpoint, arguments=['--dry-run'])
@@ -491,12 +502,17 @@ if status == 0:
     check('compressed bytes and worker hashes are preserved exactly without hardlinks', exact)
     check('all workspace executables and nested or empty companions are retained', complete)
     check('archive inventories carry independent member digests', inventories)
-    linux = next(a for a in packaged_manifest['artifacts'] if a['target'] == 'linux/amd64')
-    with tarfile.open(packaged_output / 'release/artifacts' / linux['name']) as archive:
-        executable = work / 'recovered-workspace-demo'
-        executable.write_bytes(archive.extractfile('bin/demo').read())
+    native = next(a for a in packaged_manifest['artifacts'] if a['target'] == native_platform)
+    executable = work / ('recovered-workspace-demo.exe' if native_platform.startswith('windows/')
+                         else 'recovered-workspace-demo')
+    if native['archive_format'] == 'zip':
+        with zipfile.ZipFile(packaged_output / 'release/artifacts' / native['name']) as archive:
+            executable.write_bytes(archive.read('bin/demo.exe'))
+    else:
+        with tarfile.open(packaged_output / 'release/artifacts' / native['name']) as archive:
+            executable.write_bytes(archive.extractfile('bin/demo').read())
     executable.chmod(0o700)
-    check('recovered workspace executable actually runs', run([str(executable)]).decode().strip() == 'linux/amd64')
+    check('recovered workspace executable actually runs', run([str(executable)]).decode().strip() == native_platform)
 else:
     print((work / ('run-%d.stderr' % counter)).read_text(), file=sys.stderr)
 status, response, destination, _ = invoke(packaged, arguments=['--dry-run'])
@@ -618,8 +634,8 @@ if status == 0:
           (multi_release / 'artifacts/install-helper.sh').stat().st_mode & 0o111 == helper.stat().st_mode & 0o111)
     check('complete multi-file source state is retained unchanged',
           (multi_release / 'inputs/state.json').read_bytes() == multi_state_path.read_bytes())
-    check('both raw and archived Linux outputs remain independently usable',
-          run([str(multi_release / 'artifacts/demo-linux_amd64')]).decode().strip() == 'linux/amd64' and
+    check('recovered host output runs and the independent Linux archive remains attributed',
+          native_output(multi_release, multi_manifest) == native_platform and
           any(a['target'] == 'linux/amd64' and a['archive_format'] == 'tar.gz' for a in multi_manifest['artifacts']))
 else:
     print((work / ('run-%d.stderr' % counter)).read_text(), file=sys.stderr)

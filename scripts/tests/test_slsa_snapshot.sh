@@ -8,7 +8,11 @@ source "$ROOT/src/slsa_remote.sh"
 WORK=$(mktemp -d) || exit 1
 # macOS temporary roots may traverse /var; only canonicalize our owned fixture root.
 WORK=$(cd "$WORK" && pwd -P) || exit 1
-trap 'rm -rf -- "$WORK"' EXIT
+if [[ "${DSR_RETAIN_TEST_EVIDENCE:-0}" == 1 ]]; then
+    trap 'printf "Retained test evidence: %s\n" "$WORK" >&2' EXIT
+else
+    trap 'rm -rf -- "$WORK"' EXIT
+fi
 mkdir -p "$WORK/bin" "$WORK/tmp"
 export PATH="$WORK/bin:$PATH" TMPDIR="$WORK/tmp"
 cat > "$WORK/bin/minisign" <<'SIGNER'
