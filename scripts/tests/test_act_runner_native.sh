@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_act_runner_native.sh - Unit tests for act_runner.sh native build SSH logic
 #
-# Usage: ./test_act_runner_native.sh [--typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --workspace-archives-only]
+# Usage: ./test_act_runner_native.sh [--typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --workspace-archives-only | --failure-evidence-only | --env-precedence-only | --archive-delivery-only | --zig-dispatch-only]
 #
 # Tests native build SSH command construction with mocks.
 # Covers: command construction, path handling, env vars, SCP, error handling.
@@ -105,8 +105,12 @@ _act_prepare_windows_nonstrict_cargo_home() {
         receipt_sha256:("3"*64),inventory_sha256:("4"*64),file_count:0,size_bytes:0,caches:[]}'
 }
 _act_finish_windows_private_cargo_home() {
-    jq -nc --arg home "$2" '{mode:"inventory",cargo_home:$home,
-        receipt_sha256:("5"*64),inventory_sha256:("4"*64),file_count:0,size_bytes:0,caches:[]}'
+    local native_execution=false
+    if [[ "${1:-}" == --native-execution ]]; then native_execution=true; shift; fi
+    jq -nc --arg home "$2" --argjson native_execution "$native_execution" '
+        {mode:"inventory",cargo_home:$home,
+         receipt_sha256:("5"*64),inventory_sha256:("4"*64),file_count:0,size_bytes:0,caches:[]}
+        | if $native_execution then {command_exit_code:0,receipt:.} else . end'
 }
 if [[ "${DSR_ATTEMPT_MKTEMP_FAIL:-}" == logs ]]; then
     mktemp() {
@@ -600,11 +604,9 @@ def build(context, label, fault='none', operation='native', attempt=1, path=None
         rows = [row for row in process.stdout.splitlines() if row.startswith(b'{')]
         result = json.loads(rows[-1]) if rows else {}
         save(result_file, result)
-    # Native declared non-binary members deliberately receive private modes
-    # during collection; their archive must preserve those collected modes.
+    # Declared non-binary members stay private during collection. Published
+    # archive modes are normalized independently of those retained sources.
     expected = dict(includes, **payloads)
-    expected['metadata.json'] = (payloads['metadata.json'][0], 0o600)
-    expected['verify.sh'] = (payloads['verify.sh'][0], 0o700)
     return process.returncode, result, expected
 
 
@@ -622,18 +624,24 @@ def accepted(context, label, outcome):
     code, result, expected = outcome
     paths = result.get('artifact_paths', [])
     good = code == 0 and result.get('status') == 'success' and len(paths) == 1
+    private_companions_intact = False
     if good:
         archive = Path(paths[0])
         good = archive_members(archive) == expected
         good = good and result.get('collected_sha256') == hashlib.sha256(archive.read_bytes()).hexdigest()
         good = good and result.get('collected_size_bytes') == archive.stat().st_size
         good = good and bool(result.get('collected_identity'))
+        private_companions_intact = all(
+            stat.S_IMODE((archive.parent / member).stat().st_mode) == mode and
+            (archive.parent / member).read_bytes() == expected[member][0]
+            for member, mode in (('metadata.json', 0o600), ('verify.sh', 0o700)))
         # Execute the actual collected Bash payloads; no machine-code-shaped
         # header or architecture validator is substituted for script support.
         for binary in ('app', 'helper'):
             ran = subprocess.run([str(archive.parent / binary)], capture_output=True, timeout=10)
             good = good and ran.returncode == 0 and ran.stdout == (binary + ':' + label + '\n').encode()
-    check(label + ': real native Bash build produces one complete archive with frozen bytes and modes', good)
+    check(label + ': real native Bash build produces one complete archive with frozen bytes and normalized modes', good)
+    check(label + ': normalization preserves private collected companion bytes and modes', private_companions_intact)
     return result
 
 
@@ -784,6 +792,192 @@ PY
 
 if [[ "${1:-}" == --workspace-archives-only ]]; then
     test_native_workspace_archives
+    exit $?
+fi
+
+# Verify actual archive bytes through production checksum/signing functions and
+# the generated installer. Keys are ephemeral; every install is offline. No
+# signing, checksum, archive or installer implementation is substituted.
+test_native_archive_delivery() {
+    local dependency
+    for dependency in python3 yq jq tar gzip xz zip unzip minisign; do
+        command -v "$dependency" >/dev/null || { printf 'Missing archive delivery dependency: %s\n' "$dependency" >&2; return 3; }
+    done
+    python3 - "$PROJECT_ROOT" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import zipfile
+
+root = Path(sys.argv[1])
+module = Path(os.environ.get('DSR_TEST_ACT_RUNNER', str(root / 'src/act_runner.sh')))
+work = Path(tempfile.mkdtemp(prefix='dsr-native-archive-delivery-')).resolve()
+print('Retained real archive delivery evidence: ' + str(work), flush=True)
+checks = 0
+operations = 0
+
+
+def check(label, condition):
+    global checks
+    if not condition:
+        raise AssertionError(label)
+    checks += 1
+    print('PASS: ' + label, flush=True)
+
+
+def invoke(label, arguments, env=None, expected=0):
+    global operations
+    operations += 1
+    result = subprocess.run(list(map(str, arguments)), capture_output=True, timeout=90, env=env)
+    (work / ('%03d.stdout' % operations)).write_bytes(result.stdout)
+    (work / ('%03d.stderr' % operations)).write_bytes(result.stderr)
+    if result.returncode != expected:
+        raise AssertionError(label + ': exit %d, expected %d\n%s' % (
+            result.returncode, expected, result.stderr.decode(errors='replace')))
+    check(label, True)
+    return result
+
+
+def api(label, source, *arguments, env=None):
+    return invoke(label, ['bash', '-c', 'source "$1" || exit $?; shift; "$@"',
+                         '_', source, *arguments], env=env)
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+host_os = platform.system().lower()
+host_arch = {'x86_64': 'amd64', 'aarch64': 'arm64', 'arm64': 'arm64'}.get(platform.machine())
+if host_os not in ('linux', 'darwin') or host_arch is None:
+    raise SystemExit('Archive delivery integration requires a Linux/macOS amd64/arm64 host')
+payload = work / 'payload'
+payload.mkdir(mode=0o700)
+contents = {'delivery': (b'#!/bin/sh\nprintf "delivery 1.2.3\\n"\n', 0o700),
+            'helper': (b'#!/bin/sh\nprintf "helper 1.2.3\\n"\n', 0o700),
+            'NOTICE': (b'Archive delivery fixture: redistribution permitted.\n', 0o600)}
+for name, (data, mode) in contents.items():
+    (payload / name).write_bytes(data)
+    (payload / name).chmod(mode)
+before = {name: (sha(payload / name), (payload / name).stat().st_ino,
+                 stat.S_IMODE((payload / name).stat().st_mode)) for name in contents}
+private = work / 'ephemeral.key'
+public = work / 'ephemeral.pub'
+invoke('generate real ephemeral Minisign key', ['minisign', '-G', '-W', '-s', private, '-p', public])
+key = public.read_text().splitlines()[1]
+
+for fmt, producer in (('tar.gz', '_act_stream_workspace_tar_gz'),
+                      ('tar.xz', '_act_stream_workspace_tar_xz'),
+                      ('zip', '_act_stream_workspace_zip')):
+    case = work / fmt
+    assets = case / 'assets'
+    assets.mkdir(parents=True, mode=0o700)
+    config = case / 'config'
+    (config / 'repos.d').mkdir(parents=True)
+    env = dict(os.environ, DSR_CONFIG_DIR=str(config), DSR_INSTALLER_DIR=str(case / 'generated'), NO_COLOR='1')
+    asset_name = 'delivery-1.2.3-%s-%s.%s' % (host_os, host_arch, fmt)
+    archive = assets / asset_name
+    receipt = api(fmt + ': produce real native archive with held receipt', module,
+        '_act_collect_stream_exclusive', archive, '600', producer, payload, *contents, env=env)
+    receipt = json.loads(receipt.stdout)
+    check(fmt + ': frozen archive hash and size match actual final bytes',
+          receipt['sha256'] == sha(archive) and receipt['size_bytes'] == archive.stat().st_size)
+    if fmt == 'zip':
+        with zipfile.ZipFile(archive) as package:
+            observed = {m.filename: (package.read(m), stat.S_IMODE(m.external_attr >> 16))
+                        for m in package.infolist()}
+    else:
+        with tarfile.open(archive) as package:
+            entries = package.getmembers()
+            observed = {m.name: (package.extractfile(m).read(), m.mode) for m in entries}
+            check(fmt + ': tar members have anonymous numeric root ownership',
+                  all((m.uid, m.gid, m.uname, m.gname) == (0, 0, '', '') for m in entries))
+    check(fmt + ': generated members have normalized modes and original bytes',
+          observed == {name: (data, 0o755 if mode & 0o111 else 0o644)
+                       for name, (data, mode) in contents.items()})
+    checksum = Path(str(archive) + '.sha256')
+    signature = Path(str(archive) + '.minisig')
+    api(fmt + ': production checksum generation', root / 'src/checksum_sync.sh',
+        'checksum_generate', assets, '--output', checksum, env=env)
+    api(fmt + ': production strict checksum verification', root / 'src/checksum_sync.sh',
+        'checksum_verify', checksum, assets, '--strict', env=env)
+    api(fmt + ': production signing with real Minisign', root / 'src/signing.sh',
+        'signing_sign_exact', archive, signature, private, key,
+        'DSR archive normalization integration', sha(archive), env=env)
+    api(fmt + ': production exact signature verification', root / 'src/signing.sh',
+        'signing_verify_exact', archive, signature, key, env=env)
+    frozen = (sha(archive), archive.stat().st_ino, sha(checksum), sha(signature))
+    (config / 'repos.d/delivery.yaml').write_text(json.dumps({
+        'tool_name': 'delivery', 'repo': 'example/delivery', 'binary_name': 'delivery',
+        'language': 'bash', 'workspace_binaries': ['delivery', 'helper'],
+        'archive_format': fmt, 'artifact_naming': '${name}-${version}-${os}-${arch}',
+        'minisign_pubkey': key}))
+    generated = api(fmt + ': generate actual signed installer', root / 'src/install_gen.sh',
+        'install_gen_create', 'delivery', env=env)
+    installer = Path(generated.stdout.decode().strip())
+    invoke(fmt + ': generated installer parses', ['bash', '-n', installer])
+    cache = case / 'cache'
+    # Seed the real installer cache helper with the already verified artifact;
+    # subsequent main invocations run cache-only, with no network fallback.
+    invoke(fmt + ': retain verified bytes with generated cache helper', [
+        'bash', '-c', 'source "$1" --help >/dev/null || exit $?; _CACHE_DIR="$2"; '
+        '_cache_put "$3" v1.2.3 "$4" "$5"', '_', installer, cache, archive,
+        host_os + '/' + host_arch, fmt], env=env)
+    prefix = case / 'installed'
+    install_args = ['bash', installer, '--version', 'v1.2.3', '--offline',
+                    '--cache-dir', cache, '--dir', prefix, '--non-interactive',
+                    '--require-signatures', '--json', '--no-skills']
+    installed = invoke(fmt + ': install complete family from signed offline cache', install_args, env=env)
+    check(fmt + ': generated installer reports both actual payload hashes',
+          json.loads(installed.stdout)['status'] == 'success' and
+          {row['name']: row['sha256'] for row in json.loads(installed.stdout)['binaries']} ==
+          {name: sha(payload / name) for name in ('delivery', 'helper')})
+    for name in ('delivery', 'helper'):
+        check(fmt + ': installed ' + name + ' bytes and permissions are usable',
+              (prefix / name).read_bytes() == contents[name][0] and
+              stat.S_IMODE((prefix / name).stat().st_mode) == 0o755)
+        invoked = invoke(fmt + ': execute installed ' + name, [prefix / name])
+        check(fmt + ': installed ' + name + ' executes expected program',
+              invoked.stdout == (name + ' 1.2.3\n').encode())
+    check(fmt + ': checksum/signing/install leave archive and sidecars unchanged',
+          frozen == (sha(archive), archive.stat().st_ino, sha(checksum), sha(signature)))
+
+    cached = cache / 'delivery/v1.2.3' / (host_os + '-' + host_arch + '.' + fmt)
+    installed_before = {name: (sha(prefix / name), (prefix / name).stat().st_ino)
+                        for name in ('delivery', 'helper')}
+    # A changed payload must fail checksums before installation; recomputing a
+    # matching checksum still cannot authorize bytes under the old signature.
+    with cached.open('ab') as stream:
+        stream.write(b'changed after signing\n')
+    rejected = subprocess.run(list(map(str, install_args)), capture_output=True, timeout=90, env=env)
+    (case / 'checksum-refusal.stderr').write_bytes(rejected.stderr)
+    check(fmt + ': signed offline installer rejects altered archive checksum',
+          rejected.returncode != 0 and b'Checksum mismatch' in rejected.stderr)
+    Path(str(cached) + '.sha256').write_text(sha(cached) + '  ' + asset_name + '\n')
+    rejected = subprocess.run(list(map(str, install_args)), capture_output=True, timeout=90, env=env)
+    (case / 'signature-refusal.stderr').write_bytes(rejected.stderr)
+    check(fmt + ': recomputed checksum cannot bypass real signature rejection',
+          rejected.returncode != 0 and b'Signature verification FAILED' in rejected.stderr)
+    check(fmt + ': rejected archives leave installed family bytes and inodes intact',
+          installed_before == {name: (sha(prefix / name), (prefix / name).stat().st_ino)
+                               for name in ('delivery', 'helper')})
+
+check('all delivery paths preserve private source modes, inodes and bytes', before == {
+    name: (sha(payload / name), (payload / name).stat().st_ino,
+           stat.S_IMODE((payload / name).stat().st_mode)) for name in contents})
+print('Native archive delivery: %d checks passed; real Minisign and offline generated installers' % checks, flush=True)
+PY
+}
+
+if [[ "${1:-}" == --archive-delivery-only ]]; then
+    test_native_archive_delivery
     exit $?
 fi
 
@@ -1893,8 +2087,10 @@ echo "0" > "$SCP_EXIT_CODE_FILE"
 echo "0" > "$RAW_SSH_EXIT_CODE_FILE"
 echo "0" > "$RSYNC_EXIT_CODE_FILE"
 
-# Source the module under test
-source "$SRC_DIR/act_runner.sh"
+# Focused regression lanes can compare an archived src/ tree with the working
+# module without undoing either tree.
+# shellcheck source=../../src/act_runner.sh
+source "${DSR_NATIVE_ENV_MODULE:-${DSR_NATIVE_FAILURE_MODULE:-$SRC_DIR/act_runner.sh}}"
 # This suite controls host state and SSH command construction. Real host-health
 # qualification belongs to its integration suite; admission regressions above
 # explicitly exercise healthy, unhealthy, and missing implementations.
@@ -2019,6 +2215,55 @@ _act_ssh_exec() {
     fi
     local exit_code
     exit_code=$(cat "$SSH_EXIT_CODE_FILE")
+    # Controlled transport outcomes for the failure-evidence integration lane.
+    # The native entry point, log ownership, validation and collector remain
+    # real. No compiler, SSH connection, or signing operation runs here.
+    if [[ -n "${MOCK_NATIVE_EVENT_FILE:-}" ]]; then
+        if [[ "$2" == '# DSR_UNIX_BUILD_GUARD'* ]]; then
+            printf 'build_execution %s\n' "${3:-0}" >> "$MOCK_NATIVE_EVENT_FILE"
+            printf 'controlled build stdout\n'
+            printf 'controlled build stderr\n' >&2
+            return "${MOCK_NATIVE_BUILD_EXIT_CODE:-0}"
+        elif [[ "$cmd" == *'dsr_verified_sources='* && "$cmd" != *DSR_PRIVATE_CACHE_SEED* ]]; then
+            printf 'source_verification %s\n' "${3:-0}" >> "$MOCK_NATIVE_EVENT_FILE"
+            printf 'controlled source verifier stdout\n'
+            printf 'controlled source verifier stderr\n' >&2
+            return "${MOCK_SOURCE_VERIFY_EXIT_CODE:-0}"
+        elif [[ "$cmd" == *DSR_TOOLCHAIN_IDENTITY_PY* && "$cmd" == *'-I - record '* ]]; then
+            printf 'toolchain_observation %s\n' "${3:-0}" >> "$MOCK_NATIVE_EVENT_FILE"
+            printf 'controlled toolchain observer stderr\n' >&2
+            case "${MOCK_NATIVE_OBSERVER_RESULT:-valid}" in
+                timeout) return 124 ;;
+                transport_error) return 255 ;;
+                malformed) printf '{"unexpected":"observation"}\n'; return 0 ;;
+            esac
+        elif [[ "$cmd" == *DSR_PRIVATE_CACHE_SEED* && "$cmd" != *DSR_PRIVATE_CACHE_COMPARE* ]]; then
+            printf 'cargo_final_verification %s\n' "${3:-0}" >> "$MOCK_NATIVE_EVENT_FILE"
+            printf 'controlled Cargo final verifier stderr\n' >&2
+            case "${MOCK_NATIVE_FINAL_CARGO_RESULT:-valid}" in
+                timeout) return 124 ;;
+                transport_error) return 4 ;;
+                malformed) printf '{"unexpected":"cache inventory"}\n'; return 0 ;;
+            esac
+        elif [[ "$cmd" == *DSR_TOOLCHAIN_IDENTITY_PY* && "$cmd" == *'-I - read '* ]]; then
+            printf 'toolchain_final_verification %s\n' "${3:-0}" >> "$MOCK_NATIVE_EVENT_FILE"
+            printf 'controlled toolchain final verifier stderr\n' >&2
+            case "${MOCK_NATIVE_FINAL_TOOLCHAIN_RESULT:-valid}" in
+                timeout) return 124 ;;
+                mismatch)
+                    jq '.tools.rustc.selected_sha256 = ("6" * 64)' "$MOCK_DIR/toolchain-observation.json"
+                    return $?
+                    ;;
+            esac
+        elif [[ "$cmd" =~ ^cat\ \'/[^\']+\.cache-receipt\.json\'$ ]]; then
+            printf 'cache_receipt_verification %s\n' "${3:-0}" >> "$MOCK_NATIVE_EVENT_FILE"
+            printf 'controlled cache receipt stderr\n' >&2
+            if [[ "${MOCK_NATIVE_CACHE_RECEIPT_RESULT:-valid}" == malformed ]]; then
+                jq -nc '{namespace:("a"*64),final_output_policy:"not-detached"}'
+                return $?
+            fi
+        fi
+    fi
     if [[ "$cmd" == *'dsr_verified_sources='* && "$cmd" != *DSR_PRIVATE_CACHE_SEED* &&
           -n "${MOCK_SOURCE_VERIFY_EXIT_CODE:-}" ]]; then
         return "$MOCK_SOURCE_VERIFY_EXIT_CODE"
@@ -3783,15 +4028,22 @@ test_windows_strict_dependency_sources_final_gate() {
         status=0
         result=$(
             _act_finish_windows_private_cargo_home() {
+                local native_execution=false
+                if [[ "${1:-}" == --native-execution ]]; then native_execution=true; shift; fi
                 jq -nc --arg host "$1" --arg home "$2" --arg seed "$3" \
                     --arg source "${4-}" --argjson sources "${5-null}" \
                     --arg command "${6-}" --arg environment "${7-}" --argjson context "${8-null}" \
                     '{host:$host,home:$home,seed:$seed,source:$source,sources:$sources,
                       command:$command,environment:$environment,context:$context}' > "$finish_args"
-                [[ "$boundary" != changed ]] || return 7
-                jq -nc --arg home "$2" '{schema_version:1,mode:"inventory",cargo_home:$home,
+                if [[ "$boundary" == changed ]]; then
+                    [[ "$native_execution" != true ]] || printf '{"command_exit_code":7,"receipt":null}\n'
+                    return 7
+                fi
+                jq -nc --arg home "$2" --argjson native_execution "$native_execution" '
+                    {schema_version:1,mode:"inventory",cargo_home:$home,
                     receipt_path:($home + ".final.json"),receipt_sha256:("1"*64),
-                    inventory_sha256:("2"*64),caches:["git","registry"],file_count:6,size_bytes:256}'
+                    inventory_sha256:("2"*64),caches:["git","registry"],file_count:6,size_bytes:256}
+                    | if $native_execution then {command_exit_code:0,receipt:.} else . end'
             }
             act_run_native_build tool windows/amd64 v1.0.0 \
                 12345678-1234-4234-8234-123456789abc "$source_root"
@@ -3843,16 +4095,23 @@ test_unix_strict_dependency_sources_final_gate() {
         status=0
         result=$(
             _act_finish_unix_private_cargo_home() {
+                local native_execution=false
+                if [[ "${1:-}" == --native-execution ]]; then native_execution=true; shift; fi
                 jq -nc --arg host "$1" --arg home "$2" --arg seed "$3" \
                     --arg source "${4-}" --argjson sources "${5-null}" \
                     '{host:$host,home:$home,seed:$seed,source:$source,sources:$sources}' > "$finish_args"
                 # The compiler transport reports success in both cases. The
                 # independent finish request must still be authoritative when
                 # a remote command skips its own verification postlude.
-                [[ "$boundary" != changed ]] || return 7
-                jq -nc --arg home "$2" '{schema_version:1,mode:"inventory",cargo_home:$home,
+                if [[ "$boundary" == changed ]]; then
+                    [[ "$native_execution" != true ]] || printf '{"command_exit_code":7,"receipt":null}\n'
+                    return 7
+                fi
+                jq -nc --arg home "$2" --argjson native_execution "$native_execution" '
+                    {schema_version:1,mode:"inventory",cargo_home:$home,
                     receipt_path:($home + ".final.json"),receipt_sha256:("1"*64),
-                    inventory_sha256:("2"*64),caches:["git","registry"],file_count:6,size_bytes:256}'
+                    inventory_sha256:("2"*64),caches:["git","registry"],file_count:6,size_bytes:256}
+                    | if $native_execution then {command_exit_code:0,receipt:.} else . end'
             }
             act_run_native_build tool darwin/arm64 v1.0.0 source-final "$source_root"
         ) 2>/dev/null || status=$?
@@ -5484,6 +5743,207 @@ test_ssh_timeout_json_status() {
     fi
 }
 
+# Exercise the complete native entry point through its retained log and JSON
+# result. Only configuration/remote responses use this suite's existing
+# fixtures; this lane does not claim Rust compilation, real SSH, or signing.
+test_native_failure_evidence() {
+    log_test "Native failure evidence: distinguish preparation from build execution"
+    local scenario case_dir result code expected_code expected_status phase raw kind
+    local dispatched budget transport expected_events observed_events log_file diagnostic
+    local _ACT_SYNC_TIMEOUT=13 _ACT_BUILD_TIMEOUT=29
+    for scenario in source_timeout source_error observer_timeout observer_transport_error \
+                    observer_malformed build_timeout build_error success \
+                    ordinary_timeout ordinary_error ordinary_success \
+                    cargo_final_timeout cargo_final_transport_error cargo_final_malformed toolchain_final_timeout \
+                    toolchain_final_mismatch cache_receipt_malformed; do
+        case_dir="$MOCK_DIR/failure-evidence-$scenario"
+        mkdir -p "$case_dir/logs" "$case_dir/artifacts"
+        phase=build_execution raw=0 kind=null dispatched=true budget=29 transport=39
+        expected_code=0 expected_status=success
+        expected_events=$'source_verification 13\ntoolchain_observation 13\nbuild_execution 39'
+        diagnostic='controlled build stderr'
+        case "$scenario" in
+            source_timeout|source_error)
+                phase=source_verification dispatched=false budget=13 transport=13
+                expected_events='source_verification 13'
+                diagnostic='controlled source verifier stderr'
+                ;;
+            observer_*)
+                phase=toolchain_observation dispatched=false budget=13 transport=13
+                expected_events=$'source_verification 13\ntoolchain_observation 13'
+                diagnostic='controlled toolchain observer stderr'
+                ;;
+            ordinary_*) expected_events='build_execution 39' ;;
+            cargo_final_*)
+                phase=cargo_final_verification budget=13 transport=13
+                expected_events+=$'\ncargo_final_verification 13'
+                diagnostic='controlled Cargo final verifier stderr'
+                ;;
+            toolchain_final_*)
+                phase=toolchain_final_verification budget=30 transport=30
+                expected_events+=$'\ncargo_final_verification 13\ntoolchain_final_verification 30'
+                diagnostic='controlled toolchain final verifier stderr'
+                ;;
+            cache_receipt_*)
+                phase=cache_receipt_verification budget=30 transport=30
+                expected_events+=$'\ncargo_final_verification 13\ntoolchain_final_verification 30\ncache_receipt_verification 30'
+                diagnostic='controlled cache receipt stderr'
+                ;;
+            success) expected_events+=$'\ncargo_final_verification 13\ntoolchain_final_verification 30' ;;
+        esac
+        case "$scenario" in
+            *_timeout) raw=124 kind=command expected_code=5 expected_status=timeout ;;
+            observer_transport_error) raw=255 kind=command expected_code=6 expected_status=failed ;;
+            observer_malformed) raw=0 kind=validation expected_code=6 expected_status=failed ;;
+            cargo_final_transport_error) raw=4 kind=command expected_code=6 expected_status=failed ;;
+            cargo_final_malformed|toolchain_final_mismatch|cache_receipt_malformed)
+                raw=0 kind=validation expected_code=6 expected_status=failed ;;
+            *_error) raw=7 kind=command expected_code=6 expected_status=failed ;;
+        esac
+        code=0
+        (
+            # Each case owns fresh capture paths; retain all cases without
+            # clearing an earlier attempt's files or changing operator state.
+            RCH_REQUIRE_REMOTE=0
+            export ACT_LOGS_DIR="$case_dir/logs" ACT_ARTIFACTS_DIR="$case_dir/artifacts"
+            SSH_ARGS_FILE="$case_dir/ssh-args"
+            SCP_ARGS_FILE="$case_dir/scp-args"
+            RAW_SSH_ARGS_FILE="$case_dir/raw-ssh-args"
+            SSH_EXIT_CODE_FILE="$case_dir/ssh-status"
+            SCP_EXIT_CODE_FILE="$case_dir/scp-status"
+            RAW_SSH_EXIT_CODE_FILE="$case_dir/raw-ssh-status"
+            printf '0\n' > "$SSH_EXIT_CODE_FILE"
+            printf '0\n' > "$SCP_EXIT_CODE_FILE"
+            printf '0\n' > "$RAW_SSH_EXIT_CODE_FILE"
+            : > "$ACT_REPOS_DIR/tool.yaml"
+            MOCK_LOCAL_PATH=/local/path/tool
+            MOCK_LANGUAGE=rust
+            MOCK_BINARY_NAME=tool
+            MOCK_BUILD_CMD='cargo build --release --locked --bin tool'
+            MOCK_ARTIFACT_KIND=elf-arm64
+            MOCK_NATIVE_EVENT_FILE="$case_dir/events"
+            MOCK_NATIVE_OBSERVER_RESULT=valid
+            MOCK_NATIVE_BUILD_EXIT_CODE=0
+            MOCK_NATIVE_FINAL_CARGO_RESULT=valid
+            MOCK_NATIVE_FINAL_TOOLCHAIN_RESULT=valid
+            MOCK_NATIVE_CACHE_RECEIPT_RESULT=valid
+            MOCK_SOURCE_VERIFY_EXIT_CODE=0
+            MOCK_SSH_STREAM_FILE="$case_dir/controlled-arm64-header"
+            SDK_COMMAND_FILE="$case_dir/build-program"
+            write_mock_artifact "$MOCK_SSH_STREAM_FILE"
+            _log_error() { printf '%s\n' "$*" >&2; }
+            local source_root=/remote/failure-evidence/source
+            case "$scenario" in
+                source_timeout) MOCK_SOURCE_VERIFY_EXIT_CODE=124 ;;
+                source_error) MOCK_SOURCE_VERIFY_EXIT_CODE=7 ;;
+                observer_timeout) MOCK_NATIVE_OBSERVER_RESULT=timeout ;;
+                observer_transport_error) MOCK_NATIVE_OBSERVER_RESULT=transport_error ;;
+                observer_malformed) MOCK_NATIVE_OBSERVER_RESULT=malformed ;;
+                build_timeout|ordinary_timeout) MOCK_NATIVE_BUILD_EXIT_CODE=124 ;;
+                build_error|ordinary_error) MOCK_NATIVE_BUILD_EXIT_CODE=7 ;;
+                cargo_final_timeout) MOCK_NATIVE_FINAL_CARGO_RESULT=timeout ;;
+                cargo_final_transport_error) MOCK_NATIVE_FINAL_CARGO_RESULT=transport_error ;;
+                cargo_final_malformed) MOCK_NATIVE_FINAL_CARGO_RESULT=malformed ;;
+                toolchain_final_timeout) MOCK_NATIVE_FINAL_TOOLCHAIN_RESULT=timeout ;;
+                toolchain_final_mismatch) MOCK_NATIVE_FINAL_TOOLCHAIN_RESULT=mismatch ;;
+                cache_receipt_malformed)
+                    MOCK_STRICT_CARGO_CACHE_ROOT=/remote/private-build-cache
+                    MOCK_NATIVE_CACHE_RECEIPT_RESULT=malformed
+                    ;;
+            esac
+            if [[ "$scenario" == ordinary_* ]]; then
+                MOCK_LANGUAGE=go
+                MOCK_BUILD_CMD='go build -o tool'
+                source_root=''
+            fi
+            act_run_native_build tool linux/arm64 v1.0.0 failure-evidence \
+                "$source_root" '' '' fixture
+        ) > "$case_dir/stdout" 2> "$case_dir/stderr" || code=$?
+        printf '%s\n' "$code" > "$case_dir/exit-code"
+        if jq -se 'length == 1 and (.[0] | type == "object")' \
+                "$case_dir/stdout" >/dev/null 2>&1; then
+            log_pass "$scenario returns exactly one JSON result on stdout"
+        else
+            log_fail "$scenario leaked diagnostics or did not return one JSON result: $case_dir/stdout"
+        fi
+        # Keep inspecting the terminal result on the old implementation too,
+        # so a before/after run proves more than its existing stdout leak.
+        result=$(tail -1 "$case_dir/stdout")
+        if [[ "$code" -eq "$expected_code" ]] && jq -e \
+                --arg status "$expected_status" --argjson code "$expected_code" \
+                '.status == $status and .exit_code == $code' <<< "$result" >/dev/null 2>&1; then
+            log_pass "$scenario keeps the required public status and exit code"
+        else
+            log_fail "$scenario returned unexpected status/code: process=$code result=$(jq -c '{status,exit_code}' <<< "$result" 2>/dev/null)"
+        fi
+        if jq -e --arg phase "$phase" --argjson raw "$raw" --arg kind "$kind" \
+                --argjson dispatched "$dispatched" --argjson budget "$budget" \
+                --argjson transport "$transport" '
+                .native_execution == {
+                    phase:$phase, timeout_seconds:$budget, transport_timeout_seconds:$transport,
+                    command_exit_code:$raw, failure_kind:(if $kind == "null" then null else $kind end),
+                    build_program_dispatched:$dispatched}' <<< "$result" >/dev/null 2>&1; then
+            log_pass "$scenario identifies the measured phase, raw outcome and actual deadline"
+        else
+            log_fail "$scenario lost or misattributed native execution evidence: $(jq -c '.native_execution' <<< "$result" 2>/dev/null)"
+        fi
+        observed_events=$(cat "$case_dir/events" 2>/dev/null || true)
+        if [[ "$observed_events" == "$expected_events" ]]; then
+            log_pass "$scenario dispatches only the admitted stages with their own budgets"
+        else
+            log_fail "$scenario dispatched unexpected stages: $observed_events"
+        fi
+        if { [[ "$dispatched" == false ]] && ! grep -q '^UNIX_GUARD_TIMEOUT:' "$case_dir/ssh-args"; } ||
+           { [[ "$dispatched" == true ]] && grep -q '^UNIX_GUARD_TIMEOUT:39$' "$case_dir/ssh-args"; }; then
+            log_pass "$scenario build dispatch evidence matches the transport trace"
+        else
+            log_fail "$scenario build dispatch evidence disagrees with the transport trace"
+        fi
+        if [[ "$expected_status" != success ]]; then
+            if [[ ! -s "$case_dir/raw-ssh-args" && ! -s "$case_dir/scp-args" ]] &&
+               jq -e '.artifact_path == "" and .artifact_paths == [] and
+                   .additional_artifacts == [] and .collected_sha256 == null and
+                   .collected_identity == null' <<< "$result" >/dev/null 2>&1; then
+                log_pass "$scenario refuses artifact collection after failure"
+            else
+                log_fail "$scenario exposed an artifact or reached collection after failure"
+            fi
+        elif [[ -s "$case_dir/raw-ssh-args" || -s "$case_dir/scp-args" ]] &&
+             jq -e '.artifact_paths | length == 1' <<< "$result" >/dev/null 2>&1; then
+            log_pass "$scenario preserves successful architecture-checked fixture collection"
+        else
+            log_fail "$scenario did not preserve the successful collection path"
+        fi
+        log_file=$(jq -r '.log_file // ""' <<< "$result" 2>/dev/null)
+        if [[ "$log_file" == "$case_dir/logs/"* && -f "$log_file" ]] &&
+           grep -Fxq "$diagnostic" "$log_file" &&
+           [[ "$(stat -c '%a' "$log_file" 2>/dev/null || stat -f '%Lp' "$log_file")" == 600 ]]; then
+            log_pass "$scenario retains original stderr in its private attempt log"
+        else
+            log_fail "$scenario lost original stderr or private log ownership: $log_file"
+        fi
+        if [[ "$scenario" == observer_malformed ]]; then
+            if grep -Fxq '{"unexpected":"observation"}' "$log_file"; then
+                log_pass "malformed observer output is retained for diagnosis"
+            else
+                log_fail "malformed observer output disappeared from the attempt log"
+            fi
+        fi
+        if [[ "$scenario" == cargo_final_* || "$scenario" == toolchain_final_* || "$scenario" == cache_receipt_* ]]; then
+            if jq -e --argjson sources "$(_test_native_dependency_sources)" '
+                    (.cargo_isolation | type == "object") and
+                    .cargo_isolation.dependency_cache.seed.receipt_sha256 == ("1" * 64) and
+                    .cargo_isolation.dependency_sources == $sources and
+                    .native_execution.build_program_dispatched == true and
+                    .native_execution.phase != "build_execution"' <<< "$result" >/dev/null 2>&1; then
+                log_pass "$scenario preserves the preparation receipt after a successful build command"
+            else
+                log_fail "$scenario discarded preparation evidence or mislabeled a post-build refusal"
+            fi
+        fi
+    done
+}
+
 test_scp_failure_returns_7() {
     log_test "Error: SCP failure returns exit code 7"
     reset_state
@@ -5798,6 +6258,187 @@ test_go_native_launch_overrides_ambient_target() {
     fi
 }
 
+# Real YAML parsing, environment assembly, target admission and collector path
+# selection; no Cargo command, SSH request, compiler, or signing is executed.
+test_build_env_precedence() {
+    log_test "Build environment: platform overrides agree with ordered shell exports"
+    if ! type -P yq >/dev/null; then
+        log_fail "Environment precedence integration requires the real yq executable"
+        return 3
+    fi
+    local fixture="$MOCK_DIR/env-precedence" scenario pairs actual oracle code oracle_code expected
+    local environment exported target derived artifact floor checked_env selected result status
+    local command='cargo build --locked --release --bin asupersync --features cli'
+    mkdir -p "$fixture"
+
+    # Bypass this file's config mock only inside these calls. The production
+    # resolver consumes the YAML documents below through the installed yq.
+    _test_env_real_config() (
+        yq() { command yq "$@"; }
+        "$@"
+    )
+    for scenario in duplicate empty literal missing; do
+        expected=0
+        case "$scenario" in
+            duplicate) pairs=$'DSR_TEST_ENV_VALUE=global\n\nDSR_TEST_ENV_VALUE=platform' ;;
+            empty) pairs=$'DSR_TEST_ENV_VALUE=global\nDSR_TEST_ENV_VALUE=' ;;
+            literal) pairs=$'DSR_TEST_ENV_VALUE=global\nDSR_TEST_ENV_VALUE= keep=every byte = end ' ;;
+            missing) pairs=$'DSR_TEST_ENV_VALUE_SUFFIX=near-key\nPREFIX_DSR_TEST_ENV_VALUE=near-key'; expected=1 ;;
+        esac
+        code=0 oracle_code=0
+        actual=$(act_get_build_env_value "$pairs" DSR_TEST_ENV_VALUE) || code=$?
+        oracle=$(
+            unset DSR_TEST_ENV_VALUE
+            while IFS= read -r binding; do
+                [[ -z "$binding" ]] || export "$binding"
+            done <<< "$pairs"
+            [[ "${DSR_TEST_ENV_VALUE+x}" == x ]] || exit 1
+            printf '%s' "$DSR_TEST_ENV_VALUE"
+        ) || oracle_code=$?
+        if [[ "$code" -eq "$expected" && "$code" -eq "$oracle_code" && "$actual" == "$oracle" ]]; then
+            log_pass "$scenario getter preserves shell value and set-versus-absent status"
+        else
+            log_fail "$scenario getter disagrees with exports: getter=[$actual]/$code shell=[$oracle]/$oracle_code"
+        fi
+    done
+
+    pairs=$'GOBIN=/global/bin\nGOBIN=/platform/bin=tools with spaces'
+    artifact=$(act_get_remote_artifact_path go /remote/source "$pairs" tool linux/arm64)
+    if [[ "$artifact" == '/platform/bin=tools with spaces/tool' ]]; then
+        log_pass "Go collector honors the same final GOBIN binding"
+    else
+        log_fail "Go collector selected an overridden GOBIN: $artifact"
+    fi
+
+    cat > "$ACT_REPOS_DIR/env-precedence-arm.yaml" <<'YAML'
+language: rust
+env:
+  CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+  CARGO_TARGET_DIR: /global/output
+  DSR_TEST_ENV_VALUE: global
+cross_compile:
+  linux/arm64:
+    env:
+      CARGO_BUILD_TARGET: aarch64-unknown-linux-gnu
+      CARGO_TARGET_DIR: /platform/output=arm with spaces
+      DSR_TEST_ENV_VALUE: ' keep=every byte = end '
+YAML
+    status=0
+    environment=$(_test_env_real_config act_get_build_env env-precedence-arm linux/arm64) || status=$?
+    printf '%s\n' "$environment" > "$fixture/arm-environment"
+    exported=$(
+        while IFS= read -r binding; do
+            [[ -z "$binding" ]] || export "$binding"
+        done <<< "$environment"
+        jq -nc --arg target "${CARGO_BUILD_TARGET:-}" --arg dir "${CARGO_TARGET_DIR:-}" \
+            --arg literal "${DSR_TEST_ENV_VALUE:-}" '{target:$target,dir:$dir,literal:$literal}'
+    )
+    printf '%s\n' "$exported" > "$fixture/arm-shell-exports.json"
+    if [[ "$status" -eq 0 ]] && jq -e '
+            .target == "aarch64-unknown-linux-gnu" and
+            .dir == "/platform/output=arm with spaces" and
+            .literal == " keep=every byte = end "' <<< "$exported" >/dev/null; then
+        log_pass "Real YAML assembles global then platform bindings with literal values intact"
+    else
+        log_fail "Real YAML environment did not reach shell exports: status=$status exported=$exported"
+    fi
+    target=$(act_get_build_env_value "$environment" CARGO_BUILD_TARGET)
+    derived=$(act_get_build_env_value "$environment" DSR_TARGET_TRIPLE)
+    if [[ "$target" == aarch64-unknown-linux-gnu && "$derived" == "$target" ]]; then
+        log_pass "Unlisted ARM target derives the effective platform compiler identity"
+    else
+        log_fail "ARM compiler identity disagrees with exports: target=$target derived=$derived"
+    fi
+    artifact=$(act_get_remote_artifact_path rust /remote/source "$environment" asupersync linux/arm64)
+    printf '%s\n' "$artifact" > "$fixture/arm-artifact-path"
+    if [[ "$artifact" == '/platform/output=arm with spaces/aarch64-unknown-linux-gnu/release/asupersync' ]]; then
+        log_pass "Rust collector uses the platform target directory and ARM triple"
+    else
+        log_fail "Rust collector selected overridden output: $artifact"
+    fi
+    floor=$(_test_env_real_config _act_linux_glibc_floor env-precedence-arm linux/arm64 \
+        "$ACT_REPOS_DIR/env-precedence-arm.yaml" "$environment" "$command")
+    checked_env="$environment"$'\n'"DSR_RUST_TARGET=$target"$'\n'"DSR_ZIG_TARGET=$target.$floor"$'\n'"DSR_LINUX_GLIBC_FLOOR=$floor"
+    printf '%s\n' "$checked_env" > "$fixture/arm-qualified-environment"
+    status=0
+    _act_validate_native_target_command "$command" "$checked_env" "$target" \
+        > "$fixture/arm-admission.stdout" 2> "$fixture/arm-admission.stderr" || status=$?
+    printf '%s\n' "$status" > "$fixture/arm-admission.status"
+    if [[ "$floor" == 2.28 && "$status" -eq 0 && "$target" == aarch64-unknown-linux-gnu ]]; then
+        log_pass "Real target admission accepts the ARM command with the existing glibc floor"
+    else
+        log_fail "Valid ARM command was refused or misrouted: target=$target floor=$floor status=$status"
+    fi
+    status=0
+    _act_validate_native_target_command "$command --target x86_64-unknown-linux-gnu" \
+        "$environment" aarch64-unknown-linux-gnu >/dev/null 2>&1 || status=$?
+    if [[ "$status" -eq 4 ]]; then
+        log_pass "An explicit wrong-architecture command remains refused"
+    else
+        log_fail "Wrong-architecture command escaped target admission: $status"
+    fi
+
+    status=0
+    selected=$(_test_env_real_config act_get_build_env env-precedence-arm linux/arm64 \
+        aarch64-unknown-linux-gnu) || status=$?
+    if [[ "$status" -eq 0 && "$(act_get_build_env_value "$selected" CARGO_BUILD_TARGET)" == aarch64-unknown-linux-gnu &&
+          "$(grep -c '^CARGO_BUILD_TARGET=' <<< "$selected")" -eq 1 ]]; then
+        log_pass "Explicit admitted ARM variant keeps one compiler target binding"
+    else
+        log_fail "Admitted ARM variant lost its target authority: status=$status env=$selected"
+    fi
+    cat > "$ACT_REPOS_DIR/env-precedence-conflict.yaml" <<'YAML'
+language: rust
+target_triples:
+  linux/arm64: [aarch64-unknown-linux-gnu, aarch64-unknown-linux-musl]
+env:
+  CARGO_BUILD_TARGET: aarch64-unknown-linux-gnu
+YAML
+    for selected in aarch64-unknown-linux-musl x86_64-unknown-linux-gnu; do
+        status=0
+        result=$(_test_env_real_config act_get_build_env env-precedence-conflict linux/arm64 \
+            "$selected" 2>/dev/null) || status=$?
+        if [[ "$status" -eq 4 && -z "$result" ]]; then
+            log_pass "Conflicting or undeclared selected variant remains refused: $selected"
+        else
+            log_fail "Selected variant bypassed configured authority: $selected status=$status"
+        fi
+    done
+    cat > "$ACT_REPOS_DIR/env-precedence-empty.yaml" <<'YAML'
+language: rust
+env:
+  CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+cross_compile:
+  linux/arm64:
+    env:
+      CARGO_BUILD_TARGET: ''
+YAML
+    environment=$(_test_env_real_config act_get_build_env env-precedence-empty linux/arm64)
+    if [[ "$(act_get_build_env_value "$environment" CARGO_BUILD_TARGET)" == aarch64-unknown-linux-gnu &&
+          "$(act_get_build_env_value "$environment" DSR_TARGET_TRIPLE)" == aarch64-unknown-linux-gnu ]]; then
+        log_pass "Empty platform target enables normal ARM target derivation"
+    else
+        log_fail "Empty platform target retained an overridden compiler identity: $environment"
+    fi
+    cat > "$ACT_REPOS_DIR/env-precedence-policy.yaml" <<'YAML'
+language: rust
+env:
+  RCH_REQUIRE_REMOTE: '1'
+cross_compile:
+  linux/arm64:
+    env:
+      RCH_REQUIRE_REMOTE: '0'
+YAML
+    environment=$(_test_env_real_config act_get_build_env env-precedence-policy linux/arm64)
+    status=0
+    dsr_native_rch_environment_policy linux/arm64 "$environment" >/dev/null 2>&1 || status=$?
+    if [[ "$status" -eq 4 && "$(grep -c '^RCH_REQUIRE_REMOTE=' <<< "$environment")" -eq 2 ]]; then
+        log_pass "Retained declarations preserve remote-only policy refusal after a later false binding"
+    else
+        log_fail "Environment resolution lost the remote-only refusal: status=$status env=$environment"
+    fi
+}
+
 test_rust_derives_build_target_and_dsr_env() {
     log_test "Rust: CARGO_BUILD_TARGET and DSR_TARGET_* derived from the platform"
     reset_state
@@ -6103,6 +6744,54 @@ test_strict_rust_linux_glibc_floor_rejects_newer_glibc() {
     fi
 }
 
+test_strict_explicit_zig_dispatch_and_output_ceiling() {
+    log_test "Strict explicit Zig: coordinator stages verified dispatch and preserves the output ceiling"
+    local platform triple suffix requirement result status cmd shim_dir
+    for platform in linux/amd64 linux/arm64; do
+        triple=$(_act_default_rust_target_triple "$platform")
+        for requirement in 2.17 2.39; do
+            reset_state
+            MOCK_LANGUAGE=rust
+            MOCK_BINARY_NAME=tool
+            MOCK_BUILD_CMD="cargo +selected --quiet zigbuild --locked --release --target=$triple.2.17"
+            MOCK_GLIBC_FLOOR=2.28
+            MOCK_ARTIFACT_KIND="elf-${platform#linux/}"
+            MOCK_PLATFORM_ENV="CARGO_BUILD_TARGET=$triple"
+            suffix="${platform//\//-}-$requirement"
+            MOCK_SSH_STREAM_FILE="$MOCK_DIR/explicit-zig-$suffix"
+            write_mock_artifact "$MOCK_SSH_STREAM_FILE"
+            printf '\0GLIBC_%s\0' "$requirement" >> "$MOCK_SSH_STREAM_FILE"
+            status=0
+            result=$(_run_strict_linux_rust_build "$platform" 2>/dev/null) || status=$?
+            cmd=$(get_ssh_capture)
+            shim_dir="/remote/.dsr-release-snapshots/tool-run/.dsr-bin-${platform//\//-}"
+            if [[ "$cmd" == *"cat > '$shim_dir/cargo'"* &&
+                  "$cmd" == *"export PATH='$shim_dir':\"\$PATH\""* &&
+                  "$cmd" == *"DSR_ZIG_TARGET=$triple.2.17"* &&
+                  "$cmd" == *"$MOCK_BUILD_CMD"* ]] &&
+               jq -e --arg triple "$triple" '
+                   .target_triple == $triple and
+                   .build_influence_env.CARGO_BUILD_TARGET == $triple and
+                   .build_influence_env.DSR_ZIG_TARGET == ($triple + ".2.17") and
+                   .build_influence_env.DSR_LINUX_GLIBC_FLOOR == "2.17"' <<< "$result" >/dev/null; then
+                log_pass "$platform explicit command retains its floor and receives the staged dispatcher"
+            else
+                log_fail "$platform explicit dispatcher missing or changed selectors: status=$status result=$result"
+            fi
+            if [[ "$requirement" == 2.17 && "$status" -eq 0 ]] &&
+               jq -e '.status == "success" and (.artifact_paths | length) == 1' <<< "$result" >/dev/null; then
+                log_pass "$platform lower requested ABI is admitted under the configured 2.28 ceiling"
+            elif [[ "$requirement" == 2.39 && "$status" -eq 7 ]] &&
+                 jq -e '.status == "failed" and .artifact_paths == [] and .collected_sha256 == null' \
+                    <<< "$result" >/dev/null; then
+                log_pass "$platform explicit request cannot authorize output above the configured 2.28 ceiling"
+            else
+                log_fail "$platform explicit Zig output ceiling failed: requirement=$requirement status=$status result=$result"
+            fi
+        done
+    done
+}
+
 test_rust_linux_glibc_floor_enforced_for_owned_toolchain() {
     log_test "Rust linux: an explicit floor is enforced even when build_cmd owns zigbuild"
     reset_state
@@ -6320,6 +7009,30 @@ test_windows_private_cache_collection() {
 }
 
 main() {
+    if [[ "${1:-}" == --zig-dispatch-only ]]; then
+        test_rust_linux_glibc_floor_shim_injected
+        test_rust_linux_glibc_floor_native_opt_out
+        test_rust_linux_glibc_floor_skips_musl
+        test_strict_rust_linux_glibc_floor_shim_outside_snapshot
+        test_strict_rust_linux_glibc_floor_rejects_newer_glibc
+        test_strict_explicit_zig_dispatch_and_output_ceiling
+        test_rust_linux_glibc_floor_enforced_for_owned_toolchain
+        printf 'Native Zig dispatch tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return $?
+    fi
+    if [[ "${1:-}" == --env-precedence-only ]]; then
+        test_build_env_precedence || return $?
+        printf 'Build environment precedence tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return $?
+    fi
+    if [[ "${1:-}" == --failure-evidence-only ]]; then
+        test_native_failure_evidence
+        printf 'Native failure evidence tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return $?
+    fi
     if [[ "${1:-}" == --windows-guard-only ]]; then
         test_windows_build_guard_transport_and_timeout_validation
         test_windows_rust_isolation_receipt_matches_command
@@ -6543,6 +7256,7 @@ main() {
     test_ssh_failure_json_status
     test_ssh_timeout_returns_5
     test_ssh_timeout_json_status
+    test_native_failure_evidence
     test_scp_failure_returns_7
     test_scp_failure_empty_artifact_path
     test_missing_config_returns_4
@@ -6565,6 +7279,7 @@ main() {
     test_go_armv7_native_launch
     test_go_rejects_conflicting_targets
     test_go_native_launch_overrides_ambient_target
+    test_build_env_precedence
     test_rust_derives_build_target_and_dsr_env
     test_rust_derive_build_target_opt_out
     test_windows_rejects_posix_source_root
@@ -6577,6 +7292,7 @@ main() {
     test_output_stage_builds_and_collects_privately
     test_strict_rust_linux_glibc_floor_shim_outside_snapshot
     test_strict_rust_linux_glibc_floor_rejects_newer_glibc
+    test_strict_explicit_zig_dispatch_and_output_ceiling
     test_rust_linux_glibc_floor_enforced_for_owned_toolchain
 
     # Summary

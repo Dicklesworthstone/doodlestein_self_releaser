@@ -128,6 +128,24 @@ def resolver_observation():
     return result
 
 
+def shim_observation(triple=TRIPLE, floor='2.28'):
+    result = resolver_observation()
+    result['target_triple'] = triple
+    result['selection']['dsr_cargo_shim'] = {
+        'rust_target': triple, 'zig_target': triple + '.' + floor if floor else triple, 'glibc_floor': floor}
+    result['tools'].update({name: executable(name) for name in ('cargo-zigbuild', 'zig')})
+    result['tools']['dsr_cargo_shim'] = dict(executable('cargo'),
+        selected_path='/var/tmp/run/.dsr-bin-linux/cargo', selected_kind='script', version='')
+    return result
+
+
+def explicit_zig_observation(triple=TRIPLE, floor='2.28'):
+    result = shim_observation(triple, floor)
+    result['selection']['cargo_commands'] = ['zigbuild']
+    result['selection']['cargo_zigbuild'] = deepcopy(result['selection']['dsr_cargo_shim'])
+    return result
+
+
 class ToolchainReceiptSchemaTests(unittest.TestCase):
     def accepted(self, observation):
         errors = list(VALIDATOR.iter_errors(manifest(observation)))
@@ -306,6 +324,110 @@ class ToolchainReceiptSchemaTests(unittest.TestCase):
         self.accepted(result)
         result['tools']['cargo']['sysroot_resolver'] = None
         self.accepted(result)
+
+    def test_glibc_shim_receipt_preserves_underlying_executable_evidence(self):
+        for triple in ('x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu'):
+            for floor in ('2.17', '2.28'):
+                with self.subTest(triple=triple, floor=floor):
+                    result = shim_observation(triple, floor)
+                    self.accepted(result)
+                    for tool in ('cargo', 'rustc', 'cargo-zigbuild', 'zig', 'dsr_cargo_shim'):
+                        changed = deepcopy(result)
+                        del changed['tools'][tool]
+                        self.rejected(changed)
+
+    def test_glibc_shim_selection_and_bytes_are_atomic(self):
+        result = shim_observation()
+        for missing in ('rust_target', 'zig_target', 'glibc_floor'):
+            with self.subTest(missing=missing):
+                changed = deepcopy(result)
+                del changed['selection']['dsr_cargo_shim'][missing]
+                self.rejected(changed)
+        for missing in ('selection', 'dsr_cargo_shim'):
+            with self.subTest(missing=missing):
+                changed = deepcopy(result)
+                if missing == 'selection':
+                    del changed['selection']
+                else:
+                    del changed['selection'][missing]
+                self.rejected(changed)
+        for field, value in (('selected_kind', 'executable'), ('selected_sha256', 'bad'),
+                             ('selected_path', 'relative/cargo'), ('program', 'rustup')):
+            with self.subTest(field=field, value=value):
+                changed = deepcopy(result)
+                changed['tools']['dsr_cargo_shim'][field] = value
+                self.rejected(changed)
+
+    def test_glibc_shim_selection_is_closed_and_literal(self):
+        for field, value in (
+                ('rust_target', 'x86_64-unknown-linux-gnu.2.28'),
+                ('rust_target', 'aarch64-apple-darwin'), ('rust_target', TRIPLE + '\n'),
+                ('zig_target', TRIPLE), ('zig_target', TRIPLE + '.2.28\n'),
+                ('zig_target', 'x86_64-unknown-linux-musl.2.28'),
+                ('glibc_floor', 'native'), ('glibc_floor', '2.28\n'),
+                ('glibc_floor', '2'), ('glibc_floor', 2.28),
+                ('glibc_floor', '${FLOOR}'), ('unknown', True)):
+            with self.subTest(field=field, value=value):
+                result = shim_observation()
+                result['selection']['dsr_cargo_shim'][field] = value
+                self.rejected(result)
+
+    def test_explicit_zig_target_requires_the_same_complete_dispatch_evidence(self):
+        for triple in (TRIPLE, 'aarch64-unknown-linux-gnu'):
+            result = explicit_zig_observation(triple, '2.17')
+            self.accepted(result)
+            for missing in ('cargo', 'rustc', 'cargo-zigbuild', 'zig', 'dsr_cargo_shim'):
+                changed = deepcopy(result)
+                del changed['tools'][missing]
+                self.rejected(changed)
+            changed = deepcopy(result)
+            del changed['selection']['dsr_cargo_shim']
+            self.rejected(changed)
+            changed = deepcopy(result)
+            changed['selection']['cargo_commands'] = ['build']
+            self.rejected(changed)
+
+    def test_explicit_zig_target_shape_cannot_replace_the_canonical_target(self):
+        for field in ('rust_target', 'zig_target', 'glibc_floor'):
+            changed = explicit_zig_observation()
+            del changed['selection']['cargo_zigbuild'][field]
+            self.rejected(changed)
+        for field, value in (('rust_target', TRIPLE + '.2.28'), ('rust_target', TRIPLE + '\n'),
+                             ('zig_target', TRIPLE + '.2..28'), ('zig_target', TRIPLE + '.2.28.0'),
+                             ('zig_target', 'aarch64-apple-darwin.2.28'),
+                             ('glibc_floor', 'native'), ('glibc_floor', 2.28), ('unknown', True)):
+            changed = explicit_zig_observation()
+            changed['selection']['cargo_zigbuild'][field] = value
+            self.rejected(changed)
+        for target in (TRIPLE + '.2.28', TRIPLE + '\n', 'aarch64-apple-darwin'):
+            changed = explicit_zig_observation()
+            changed['target_triple'] = target
+            self.rejected(changed)
+
+    def test_unversioned_zig_preserves_null_floor_and_complete_dispatch_evidence(self):
+        for triple in (TRIPLE, 'aarch64-unknown-linux-gnu', 'x86_64-unknown-linux-musl',
+                       'aarch64-unknown-linux-musl', 'aarch64-apple-darwin'):
+            with self.subTest(triple=triple):
+                original = explicit_zig_observation(triple, None)
+                self.accepted(original)
+                for missing in ('cargo', 'rustc', 'cargo-zigbuild', 'zig', 'dsr_cargo_shim'):
+                    changed = deepcopy(original)
+                    del changed['tools'][missing]
+                    self.rejected(changed)
+                for missing in ('cargo_zigbuild', 'dsr_cargo_shim'):
+                    changed = deepcopy(original)
+                    del changed['selection'][missing]
+                    self.rejected(changed)
+                changed = deepcopy(original)
+                changed['selection']['cargo_commands'] = ['build']
+                self.rejected(changed)
+                for key in ('cargo_zigbuild', 'dsr_cargo_shim'):
+                    for field, value in (('glibc_floor', ''), ('glibc_floor', 'native'),
+                                         ('glibc_floor', '2.28'), ('zig_target', triple + '.2.28'),
+                                         ('zig_target', triple + '\n'), ('rust_target', triple + '.2.28')):
+                        changed = deepcopy(original)
+                        changed['selection'][key][field] = value
+                        self.rejected(changed)
 
     def test_dispatch_pins_are_closed_and_complete(self):
         for name in ('rustup_resolver', 'toolchain_launcher'):

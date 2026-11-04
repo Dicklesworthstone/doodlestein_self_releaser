@@ -9,6 +9,7 @@ param(
     [string]$BashPath,
     [string]$GeneratedScriptPath,
     [switch]$InitializeBackendOnly,
+    [switch]$OrdinarySelectionOnly,
     [switch]$InjectMalformedMetadata
 )
 
@@ -263,7 +264,7 @@ ordinary|finish)
     # distinguished return code prevents any host access or simulated summary.
     _act_windows_cache_command() { printf '%s\n' "$3" >&3; return 75; }
     if [[ "$1" == ordinary ]]; then
-        _act_prepare_windows_nonstrict_cargo_home fixture-host "$2" "$2/dsr-build-ordinary" "$2/dsr-build-ordinary/c"
+        _act_prepare_windows_nonstrict_cargo_home fixture-host "${4:-$2}" "$2/dsr-build-ordinary" "$2/dsr-build-ordinary/c"
     elif [[ -n "${4:-}" ]]; then
         _act_finish_windows_private_cargo_home fixture-host "$2" "$3" "$4" "$5" 'cargo build' '' "$6"
     else
@@ -277,7 +278,12 @@ esac
     $module = (Resolve-Path -LiteralPath (Join-Path (Split-Path -Parent $BackendPath) 'act_runner.sh')).Path.Replace('\','/')
     $generatorPath = if ($script:WindowsHost) { $Path.Replace('\','/') } else { 'C:/dsr-cache-fixture' }
     $generatorArguments = @('-c', $generator, '_', $module, $Operation, $generatorPath, $Argument)
-    if ($Operation -eq 'finish' -and $null -ne $Admission) {
+    if ($Operation -eq 'ordinary' -and $SourceRoot) {
+        # Retain the real source suffix, including spaces/apostrophes, so the
+        # actual Bash generator must quote it before the Linux path mapping.
+        $generatorSource = if ($script:WindowsHost) { $SourceRoot.Replace('\','/') } else { 'C:' + $SourceRoot }
+        $generatorArguments += $generatorSource
+    } elseif ($Operation -eq 'finish' -and $null -ne $Admission) {
         $generatorSource = if ($script:WindowsHost) { $SourceRoot.Replace('\','/') } else { 'C:/dsr-cache-source' }
         $generatorArguments += @($generatorSource,
             ($Admission.dependency_sources | ConvertTo-Json -Compress -Depth 100),
@@ -289,7 +295,11 @@ esac
         # The generator accepts Windows paths only. Map its one fixture root
         # literal for Linux engine validation; Windows executes its exact text.
         $body = $body.Replace('C:/dsr-cache-fixture', $Path)
-        if ($SourceRoot) { $body = $body.Replace('C:/dsr-cache-source', $SourceRoot) }
+        if ($SourceRoot) {
+            $quotedSource = $SourceRoot.Replace("'", "''")
+            $mappedSource = if ($Operation -eq 'ordinary') { 'C:' + $quotedSource } else { 'C:/dsr-cache-source' }
+            $body = $body.Replace($mappedSource, $quotedSource)
+        }
     }
     $programPath = Join-Path $script:Work ('generated-' + [Guid]::NewGuid().ToString('N') + '.ps1')
     Write-FixtureText $programPath $body
@@ -320,6 +330,105 @@ function New-CacheFixture {
     Write-FixtureText (Join-Path $ambient 'credentials.toml') 'DO-NOT-COPY'
     Write-FixtureText (Join-Path $ambient 'bin/cargo.exe') 'DO-NOT-COPY'
     return [pscustomobject]@{ Root = $caseRoot; Ambient = $ambient; Private = $private }
+}
+
+$git = (Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+if ($BashPath) {
+    $script:BashExecutable = $BashPath
+} elseif ($script:WindowsHost) {
+    $script:BashExecutable = Join-Path (Split-Path -Parent (Split-Path -Parent $git)) 'bin/bash.exe'
+    if (-not (Test-Path -LiteralPath $script:BashExecutable -PathType Leaf)) {
+        throw 'Git Bash is required for generated Windows orchestration tests; pass -BashPath explicitly.'
+    }
+} else {
+    $script:BashExecutable = (Get-Command bash -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+}
+
+# The production ordinary generator must use the actual project lockfile, not
+# the new stage's empty directory. Archive bytes here are synthetic: these
+# checks prove selection and custody, not that a crate would compile.
+$ordinaryIncomingHome = [Environment]::GetEnvironmentVariable('CARGO_HOME', 'Process')
+try {
+    $f = New-CacheFixture 'ordinary-selected'
+    $ordinarySource = Join-Path $f.Root "project's source"
+    $ordinaryStageParent = Join-Path $f.Root 'staging'
+    $selectedArchive = Join-Path $f.Ambient 'registry/cache/example/probe-1.0.0.crate'
+    $selectedHash = Get-Digest $selectedArchive
+    $ordinaryLock = Join-Path $ordinarySource 'Cargo.lock'
+    Write-FixtureText $ordinaryLock ("version = 4`n[[package]]`nname = `"probe`"`nversion = `"1.0.0`"`n" +
+        "source = `"registry+https://example.invalid/index`"`nchecksum = `"$selectedHash`"`n")
+    Write-FixtureText (Join-Path $f.Ambient 'registry/cache/example/unrelated-9.9.9.crate') 'unrelated download'
+    Write-FixtureText (Join-Path $f.Ambient 'git/checkouts/unrelated/revision/.git') 'gitdir: /unrelated/objects'
+    $env:CARGO_HOME = $f.Ambient
+    $ordinary = Invoke-GeneratedCacheProgram ordinary $ordinaryStageParent '' -SourceRoot $ordinarySource
+    $ordinarySummary = ConvertFrom-Json $ordinary.Out
+    Assert-Check 'ordinary generated seed binds the separate source Cargo.lock, including quoted source paths' (
+        $ordinarySummary.selection.kind -ceq 'cargo-lock-downloads' -and
+        $ordinarySummary.selection.lockfile_sha256 -ceq (Get-Digest $ordinaryLock) -and
+        $ordinarySummary.selection.registry_packages -eq 1)
+    $ordinaryPrivateArchive = Join-Path $ordinarySummary.cargo_home 'registry/cache/example/probe-1.0.0.crate'
+    Assert-Check 'ordinary selected archive keeps the locked checksum' ((Get-Digest $ordinaryPrivateArchive) -ceq $selectedHash)
+    Assert-Check 'ordinary seed ignores unrelated downloads and damaged extracted checkouts' (
+        -not (Test-Path -LiteralPath (Join-Path $ordinarySummary.cargo_home 'registry/cache/example/unrelated-9.9.9.crate')) -and
+        -not (Test-Path -LiteralPath (Join-Path $ordinarySummary.cargo_home 'registry/src')) -and
+        -not (Test-Path -LiteralPath (Join-Path $ordinarySummary.cargo_home 'git')))
+    Assert-Check 'ordinary selected seed does not import ambient configuration or credentials' (
+        -not (Test-Path -LiteralPath (Join-Path $ordinarySummary.cargo_home 'config.toml')) -and
+        -not (Test-Path -LiteralPath (Join-Path $ordinarySummary.cargo_home 'credentials.toml')))
+    Write-FixtureText $selectedArchive 'operator changed the original archive'
+    $null = Invoke-DsrCargoCache -Operation verify -First $ordinarySummary.cargo_home -Second $ordinarySummary.receipt_path
+    Assert-Check 'ordinary selected bytes survive in-place ambient mutation' ((Get-Digest $ordinaryPrivateArchive) -ceq $selectedHash)
+    $finished = Invoke-GeneratedCacheProgram finish $ordinarySummary.cargo_home $ordinarySummary.receipt_sha256
+    $final = ConvertFrom-Json $finished.Out
+    $null = Invoke-DsrCargoCache -Operation verify -First $ordinarySummary.cargo_home -Second $final.receipt_path
+    Assert-Check 'ordinary selected seed keeps its authority through independent Finish' (
+        $final.mode -ceq 'inventory' -and (Get-Digest $ordinarySummary.receipt_path) -ceq $ordinarySummary.receipt_sha256)
+
+    $f = New-CacheFixture 'ordinary-lockless'
+    $ordinarySource = Join-Path $f.Root 'source'
+    $null = [IO.Directory]::CreateDirectory($ordinarySource)
+    $env:CARGO_HOME = $f.Ambient
+    $ordinary = Invoke-GeneratedCacheProgram ordinary (Join-Path $f.Root 'staging') '' -SourceRoot $ordinarySource
+    $ordinarySummary = ConvertFrom-Json $ordinary.Out
+    Assert-Check 'ordinary project without Cargo.lock retains the existing unscoped private snapshot' (
+        $null -eq $ordinarySummary.PSObject.Properties['selection'] -and $ordinarySummary.file_count -eq 3 -and
+        (Test-Path -LiteralPath (Join-Path $ordinarySummary.cargo_home 'registry/src/example/probe-1.0.0/src/lib.rs')))
+
+    foreach ($kind in @('malformed', 'directory', 'linked')) {
+        $f = New-CacheFixture ('ordinary-lock-' + $kind)
+        $ordinarySource = Join-Path $f.Root 'source'
+        $ordinaryLock = Join-Path $ordinarySource 'Cargo.lock'
+        $ordinaryStageParent = Join-Path $f.Root 'staging'
+        $null = [IO.Directory]::CreateDirectory($ordinarySource)
+        if ($kind -eq 'malformed') {
+            Write-FixtureText $ordinaryLock "version = 4`n[[package`n"
+        } elseif ($kind -eq 'directory') {
+            $null = [IO.Directory]::CreateDirectory($ordinaryLock)
+        } else {
+            $outside = Join-Path $f.Root 'outside'
+            $null = [IO.Directory]::CreateDirectory($outside)
+            Write-FixtureText (Join-Path $outside 'sentinel') 'unchanged outside source'
+            $linkKind = if ($script:WindowsHost) { 'Junction' } else { 'SymbolicLink' }
+            $null = New-Item -ItemType $linkKind -Path $ordinaryLock -Target $outside
+        }
+        $env:CARGO_HOME = $f.Ambient
+        $failed = Invoke-GeneratedCacheProgram ordinary $ordinaryStageParent '' -SourceRoot $ordinarySource -ExpectFailure
+        Assert-Check "ordinary $kind Cargo.lock is refused instead of falling back to unscoped copying" (
+            $failed.Code -ne 0 -and $failed.Err -match 'Cargo.lock|cache entry')
+        Assert-Check "ordinary $kind lock refusal publishes no private cache receipt" (
+            -not (Test-Path -LiteralPath (Join-Path $ordinaryStageParent 'dsr-build-ordinary/c/.dsr-cache-seed.json')))
+        if ($kind -eq 'linked') {
+            Assert-Check 'ordinary linked lock refusal leaves the external target unchanged' (
+                [IO.File]::ReadAllText((Join-Path $outside 'sentinel')) -ceq 'unchanged outside source')
+        }
+    }
+} finally {
+    [Environment]::SetEnvironmentVariable('CARGO_HOME', $ordinaryIncomingHome, 'Process')
+}
+if ($OrdinarySelectionOnly) {
+    $proof = if ($script:WindowsHost) { 'native Windows storage' } else { 'portable PowerShell semantics / Linux handles' }
+    Write-Output "$script:Checks ordinary selection checks passed ($proof); no compiler was invoked."
+    exit 0
 }
 
 $f = New-CacheFixture 'snapshot'
@@ -592,17 +701,6 @@ Assert-Check 'legitimate sparse registry control-name records survive seed and f
 # A genuine Git dependency is warmed once, then both upstream and ambient cache
 # paths disappear. Cargo must compile from a fresh private copy while offline.
 $cargo = (Get-Command cargo -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
-$git = (Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
-if ($BashPath) {
-    $script:BashExecutable = $BashPath
-} elseif ($script:WindowsHost) {
-    $script:BashExecutable = Join-Path (Split-Path -Parent (Split-Path -Parent $git)) 'bin/bash.exe'
-    if (-not (Test-Path -LiteralPath $script:BashExecutable -PathType Leaf)) {
-        throw 'Git Bash is required for generated Windows orchestration tests; pass -BashPath explicitly.'
-    }
-} else {
-    $script:BashExecutable = (Get-Command bash -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
-}
 $cargoCase = Join-Path $script:Work 'real-cargo'
 $ambient = Join-Path $cargoCase 'ambient cargo'
 $dependency = Join-Path $cargoCase 'dependency'
@@ -768,12 +866,18 @@ try {
 
     $ordinaryRoot = Join-Path $cargoCase 'ordinary'
     $null = [IO.Directory]::CreateDirectory($ordinaryRoot)
+    Write-FixtureText (Join-Path $ordinaryRoot 'Cargo.lock') ([IO.File]::ReadAllText($sourceLock))
     Write-FixtureText (Join-Path $seedHome 'config.toml') "[build]`nrustc-wrapper=`"forbidden-ambient-wrapper`"`n"
     $env:CARGO_HOME = $seedHome
     $ordinary = Invoke-GeneratedCacheProgram ordinary $ordinaryRoot ''
     $ordinarySummary = ConvertFrom-Json $ordinary.Out
     Assert-Check 'generated ordinary preparation creates a private cache in its build stage' (
         $ordinarySummary.mode -eq 'private-copy' -and $ordinarySummary.cargo_home.EndsWith('/dsr-build-ordinary/c'))
+    Assert-Check 'real ordinary seed selects the locked Git database without ambient checkouts' (
+        $ordinarySummary.selection.kind -ceq 'cargo-lock-downloads' -and
+        $ordinarySummary.selection.git_revisions -contains $revision -and
+        (Test-Path -LiteralPath (Join-Path $ordinarySummary.cargo_home 'git/db')) -and
+        -not (Test-Path -LiteralPath (Join-Path $ordinarySummary.cargo_home 'git/checkouts')))
     Assert-Check 'generated ordinary preparation omits ambient compiler configuration' (
         -not (Test-Path -LiteralPath (Join-Path $ordinarySummary.cargo_home 'config.toml')))
     [IO.Directory]::Move($seedHome, (Join-Path $cargoCase 'retained ordinary ambient'))

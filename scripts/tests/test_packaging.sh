@@ -123,6 +123,144 @@ cmp -s "$PAYLOAD/mcp-agent-mail" "$EXTRACT_XZ/mcp-agent-mail" && \
     log_fail "executable bit preserved through tar.xz"
 
 # ---------------------------------------------------------------------------
+log_test "published metadata is independent of private collection permissions"
+
+PRIVATE_PAYLOAD="$TEMP_DIR/private-payload"
+mkdir -m 700 "$PRIVATE_PAYLOAD"
+mkdir -m 700 "$PRIVATE_PAYLOAD/docs"
+printf 'private executable\n' > "$PRIVATE_PAYLOAD/tool"
+printf 'group executable\n' > "$PRIVATE_PAYLOAD/helper"
+printf 'ordinary companion\n' > "$PRIVATE_PAYLOAD/docs/guide with spaces"
+: > "$PRIVATE_PAYLOAD/NOTICE"
+chmod 0700 "$PRIVATE_PAYLOAD/tool"
+chmod 0610 "$PRIVATE_PAYLOAD/helper"
+chmod 0600 "$PRIVATE_PAYLOAD/docs/guide with spaces" "$PRIVATE_PAYLOAD/NOTICE"
+# A source hardlink is safe when copied read-only into a distinct private inode.
+ln "$PRIVATE_PAYLOAD/tool" "$PRIVATE_PAYLOAD/alias"
+python3 - "$PRIVATE_PAYLOAD" "$TEMP_DIR/private-metadata.json" <<'PY'
+import hashlib, json, os, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+snapshot = {}
+for path in root.rglob('*'):
+    if path.is_file():
+        info = path.stat()
+        snapshot[str(path)] = [info.st_dev, info.st_ino, info.st_mode, info.st_nlink,
+                              info.st_uid, info.st_gid, info.st_mtime_ns,
+                              hashlib.sha256(path.read_bytes()).hexdigest()]
+pathlib.Path(sys.argv[2]).write_text(json.dumps(snapshot))
+PY
+
+for format in tar.gz tar.xz zip; do
+    if [[ "$format" == zip ]] && { ! command -v zip &>/dev/null || ! command -v unzip &>/dev/null; }; then
+        log_skip "zip tools unavailable for private metadata normalization"
+        continue
+    fi
+    normalized="$TEMP_DIR/private.$format"
+    if (umask 077; packaging_build_archive "$format" "$normalized" "$PRIVATE_PAYLOAD" tool helper alias NOTICE docs); then
+        log_pass "$format packages private files under restrictive umask"
+    else
+        log_fail "$format packages private files under restrictive umask"
+        continue
+    fi
+    if python3 - "$normalized" "$format" <<'PY'
+import stat, struct, sys, tarfile, zipfile
+path, fmt = sys.argv[1:]
+expected = {'tool': 0o755, 'helper': 0o755, 'alias': 0o755,
+            'NOTICE': 0o644, 'docs/guide with spaces': 0o644}
+if fmt == 'zip':
+    with zipfile.ZipFile(path) as archive:
+        assert len(archive.infolist()) == len(expected)
+        assert set(archive.namelist()) == set(expected)
+        for member in archive.infolist():
+            assert member.create_system == 3
+            assert member.external_attr >> 16 == stat.S_IFREG | expected[member.filename]
+            extra = member.extra
+            while extra:
+                field, length = struct.unpack('<HH', extra[:4])
+                assert field not in (0x000d, 0x5855, 0x7855, 0x7875), 'host ownership extra field'
+                extra = extra[4 + length:]
+else:
+    with tarfile.open(path) as archive:
+        assert len(archive.getmembers()) == len(expected)
+        assert set(archive.getnames()) == set(expected)
+        for member in archive:
+            assert member.isfile(), (member.name, member.type)
+            assert member.mode == expected[member.name], (member.name, oct(member.mode))
+            assert member.uid == member.gid == 0
+            assert member.uname == member.gname == ''
+PY
+    then log_pass "$format has exact public modes and no host ownership";
+    else log_fail "$format has exact public modes and no host ownership"; fi
+
+    cp "$normalized" "$TEMP_DIR/private-original.$format"
+    ln "$normalized" "$TEMP_DIR/private-inode-$format"
+    if packaging_build_archive "$format" "$normalized" "$PRIVATE_PAYLOAD" tool helper alias NOTICE docs && \
+       [[ "$normalized" -ef "$TEMP_DIR/private-inode-$format" ]] && \
+       cmp -s "$normalized" "$TEMP_DIR/private-original.$format"; then
+        log_pass "$format retry reuses normalized bytes and inode for private inputs"
+    else
+        log_fail "$format retry reuses normalized bytes and inode for private inputs"
+    fi
+
+    # Admission of freshly produced archives must use the declared mapping,
+    # while prebuilt comparisons keep their exact executable-bit semantics.
+    private_members=$(packaging_payload_members "$normalized" "$format")
+    _pkg_archive_matches_payload "$normalized" "$format" "$PRIVATE_PAYLOAD" "$private_members" normalized && \
+        log_pass "$format new output matches canonical publication policy" || \
+        log_fail "$format new output matches canonical publication policy"
+    if _pkg_archive_matches_payload "$normalized" "$format" "$PRIVATE_PAYLOAD" "$private_members" 2>/dev/null; then
+        log_fail "$format prebuilt executable-mask policy remains exact"
+    else
+        log_pass "$format prebuilt executable-mask policy remains exact"
+    fi
+done
+
+# This old-format producer archive is deliberately unnormalized. Neither the
+# existing-destination fast path nor same-format copy is a republishing command.
+tar -czf "$TEMP_DIR/private-prebuilt.tar.gz" -C "$PRIVATE_PAYLOAD" tool
+ln "$TEMP_DIR/private-prebuilt.tar.gz" "$TEMP_DIR/private-prebuilt-inode"
+if packaging_build_archive tar.gz "$TEMP_DIR/private-prebuilt.tar.gz" "$PRIVATE_PAYLOAD" tool && \
+   [[ "$TEMP_DIR/private-prebuilt.tar.gz" -ef "$TEMP_DIR/private-prebuilt-inode" ]]; then
+    log_pass "existing verified private-mode archive retains its exact inode and bytes"
+else
+    log_fail "existing verified private-mode archive retains its exact inode and bytes"
+fi
+if packaging_repack_archive "$TEMP_DIR/private-prebuilt.tar.gz" tar.gz "$TEMP_DIR/private-prebuilt-copy.tar.gz" tar.gz && \
+   cmp -s "$TEMP_DIR/private-prebuilt.tar.gz" "$TEMP_DIR/private-prebuilt-copy.tar.gz"; then
+    log_pass "same-format prebuilt copy is not silently normalized"
+else
+    log_fail "same-format prebuilt copy is not silently normalized"
+fi
+if packaging_repack_archive "$TEMP_DIR/private-prebuilt.tar.gz" tar.gz "$TEMP_DIR/private-converted.tar.xz" tar.xz && \
+   _pkg_archive_matches_payload "$TEMP_DIR/private-converted.tar.xz" tar.xz "$PRIVATE_PAYLOAD" tool normalized; then
+    log_pass "new cross-format archive normalizes a private executable"
+else
+    log_fail "new cross-format archive normalizes a private executable"
+fi
+cp "$TEMP_DIR/private-converted.tar.xz" "$TEMP_DIR/private-converted-original.tar.xz"
+ln "$TEMP_DIR/private-converted.tar.xz" "$TEMP_DIR/private-converted-inode"
+if packaging_repack_archive "$TEMP_DIR/private-prebuilt.tar.gz" tar.gz "$TEMP_DIR/private-converted.tar.xz" tar.xz && \
+   [[ "$TEMP_DIR/private-converted.tar.xz" -ef "$TEMP_DIR/private-converted-inode" ]] && \
+   cmp -s "$TEMP_DIR/private-converted.tar.xz" "$TEMP_DIR/private-converted-original.tar.xz"; then
+    log_pass "cross-format retry reuses normalized private-source bytes and inode"
+else
+    log_fail "cross-format retry reuses normalized private-source bytes and inode"
+fi
+if python3 - "$TEMP_DIR/private-metadata.json" <<'PY'
+import hashlib, json, os, pathlib, sys
+for path, expected in json.loads(pathlib.Path(sys.argv[1]).read_text()).items():
+    info = os.stat(path)
+    actual = [info.st_dev, info.st_ino, info.st_mode, info.st_nlink,
+              info.st_uid, info.st_gid, info.st_mtime_ns,
+              hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()]
+    assert actual == expected, path
+PY
+then log_pass "collection bytes, modes, owners and identities remain unchanged";
+else log_fail "collection bytes, modes, owners and identities remain unchanged"; fi
+[[ -z "$(find "$TEMP_DIR" -name '.dsr-archive.*' -print)" ]] && \
+    log_pass "private normalization staging is cleaned" || log_fail "private normalization staging is cleaned"
+
+# ---------------------------------------------------------------------------
 log_test "packaging_build_archive input validation"
 
 packaging_build_archive tar.gz "$TEMP_DIR/bad.tar.gz" "$PAYLOAD" "../etc/passwd" 2>/dev/null && \
@@ -175,7 +313,7 @@ cp "$ATOMIC_DIR/previous" "$ATOMIC_DIR/release.tar.gz"
 if (
     tar() {
         if [[ "${1:-}" == "--no-xattrs" ]]; then
-            printf 'partial archive\n' > "$3"
+            printf 'partial archive\n'
             return 42
         fi
         command tar "$@"
@@ -192,7 +330,7 @@ cmp -s "$ATOMIC_DIR/previous" "$ATOMIC_DIR/release.tar.gz" && \
 if (
     tar() {
         if [[ "${1:-}" == "--no-xattrs" ]]; then
-            printf 'not an archive\n' > "$3"
+            printf 'not an archive\n'
             return 0
         fi
         command tar "$@"
@@ -946,7 +1084,111 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-log_test "dsr raw executable staging preserves names, companions and modes"
+log_test "dsr include preflight accepts verified public modes from private sources"
+
+if declare -F run_build_package_with_repo >/dev/null; then
+    CLI_PRIVATE="$TEMP_DIR/cli-private-includes"
+    mkdir -p "$CLI_PRIVATE"
+    printf 'private executable\n' > "$CLI_PRIVATE/rano"
+    printf 'private companion executable\n' > "$CLI_PRIVATE/helper"
+    printf 'license text\n' > "$CLI_PRIVATE/LICENSE"
+    printf 'readme text\n' > "$CLI_PRIVATE/README.md"
+    chmod 0700 "$CLI_PRIVATE/rano" "$CLI_PRIVATE/helper"
+    chmod 0600 "$CLI_PRIVATE/LICENSE" "$CLI_PRIVATE/README.md"
+    for conflict in ordinary executable changed; do
+        mkdir -p "$TEMP_DIR/cli-$conflict"
+        cp -p "$CLI_PRIVATE/"* "$TEMP_DIR/cli-$conflict/"
+    done
+    chmod 0600 "$TEMP_DIR/cli-ordinary/helper"
+    chmod 0700 "$TEMP_DIR/cli-executable/LICENSE"
+    printf 'different companion bytes\n' > "$TEMP_DIR/cli-changed/helper"
+
+    for cli_format in tar.gz tgz tar.xz zip; do
+        if [[ "$cli_format" == zip ]] && \
+            { ! command -v zip >/dev/null || ! command -v unzip >/dev/null; }; then
+            log_skip "CLI zip include preflight requires zip and unzip"
+            continue
+        fi
+        cli_out="$TEMP_DIR/cli-$cli_format"
+        mkdir -p "$cli_out"
+        cli_name="rano-0.2.1-x86_64-unknown-linux-gnu.$cli_format"
+        cli_archive="$cli_out/$cli_name"
+        if ! packaging_build_archive "$cli_format" "$cli_archive" "$CLI_PRIVATE" rano helper LICENSE README.md; then
+            log_fail "$cli_format creates CLI private-include fixture"
+            continue
+        fi
+        cp "$cli_archive" "$cli_out/prior"
+        ln "$cli_archive" "$cli_out/prior-inode"
+        if run_build_package_with_repo "$cli_format" "$cli_archive" "$cli_out" \
+                "$cli_name" "$CLI_PRIVATE" "$cli_out/warnings.log" "" helper && \
+           [[ "$cli_archive" -ef "$cli_out/prior-inode" ]] && \
+           cmp -s "$cli_archive" "$cli_out/prior"; then
+            log_pass "$cli_format CLI reuses normalized private includes without changing bytes or inode"
+        else
+            log_fail "$cli_format CLI reuses normalized private includes without changing bytes or inode"
+        fi
+        for conflict in ordinary executable changed; do
+            if run_build_package_with_repo "$cli_format" "$cli_archive" "$cli_out" \
+                    "$cli_name" "$TEMP_DIR/cli-$conflict" "$cli_out/$conflict.log" "" helper; then
+                log_fail "$cli_format CLI refuses $conflict include conflict"
+            else
+                log_pass "$cli_format CLI refuses $conflict include conflict"
+            fi
+        done
+        cli_legacy="$cli_out/legacy.$cli_format"
+        python3 - "$CLI_PRIVATE" "$cli_legacy" "$cli_format" <<'PY'
+import pathlib, sys, tarfile, zipfile
+root, dest, fmt = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+names = ('rano', 'helper', 'LICENSE', 'README.md')
+if fmt == 'zip':
+    with zipfile.ZipFile(dest, 'w') as archive:
+        for name in names:
+            info = zipfile.ZipInfo(name)
+            info.create_system = 3
+            mode = 0o775 if name == 'helper' else 0o755 if name == 'rano' else 0o644
+            info.external_attr = (0o100000 | mode) << 16
+            archive.writestr(info, (root / name).read_bytes())
+else:
+    with tarfile.open(dest, 'w:xz' if fmt == 'tar.xz' else 'w:gz') as archive:
+        for name in names:
+            info = archive.gettarinfo(str(root / name), arcname=name)
+            info.mode = 0o775 if name == 'helper' else 0o755 if name == 'rano' else 0o644
+            info.uid = info.gid = 0
+            info.uname = info.gname = ''
+            with (root / name).open('rb') as stream:
+                archive.addfile(info, stream)
+PY
+        if ! packaging_validate_archive "$cli_legacy" "$cli_format"; then
+            log_fail "$cli_format creates a valid legacy include fixture"
+            continue
+        fi
+        if run_build_package_with_repo "$cli_format" "$cli_legacy" "$cli_out" \
+                "$cli_name" "$CLI_PRIVATE" "$cli_out/legacy.log" "" helper; then
+            log_fail "$cli_format CLI preserves exact masks for unnormalized legacy archives"
+        else
+            log_pass "$cli_format CLI preserves exact masks for unnormalized legacy archives"
+        fi
+        cmp -s "$cli_archive" "$cli_out/prior" && \
+            log_pass "$cli_format include refusals preserve the previous release archive" || \
+            log_fail "$cli_format include refusals preserve the previous release archive"
+    done
+    if python3 - "$CLI_PRIVATE" <<'PY'
+import pathlib, stat, sys
+root = pathlib.Path(sys.argv[1])
+for name in ('rano', 'helper', 'LICENSE', 'README.md'):
+    assert stat.S_IMODE((root / name).stat().st_mode) == (0o700 if name in ('rano', 'helper') else 0o600)
+PY
+    then
+        log_pass "CLI include checks leave original private modes unchanged"
+    else
+        log_fail "CLI include checks leave original private modes unchanged"
+    fi
+else
+    log_fail "CLI include preflight helpers unavailable"
+fi
+
+# ---------------------------------------------------------------------------
+log_test "dsr raw executable staging preserves payloads with normalized published modes"
 
 if [[ -f "$EXTRACTED" ]] && bash -n "$EXTRACTED" 2>/dev/null; then
     # shellcheck disable=SC1090
@@ -984,12 +1226,13 @@ if [[ -f "$EXTRACTED" ]] && bash -n "$EXTRACTED" 2>/dev/null; then
             cmp -s "$RAW_ROOT/collected-linux-amd64" "$raw_extract/rano" && \
             cmp -s "$RAW_ROOT/includes/docs/NOTICE" "$raw_extract/docs/NOTICE" && \
             cmp -s "$RAW_ROOT/includes/legal/NOTICE" "$raw_extract/legal/NOTICE" && \
-            [[ "$(_pkg_executable_bits "$raw_extract/rano")" == "$((8#761 & 0111))" && \
-               "$(_pkg_executable_bits "$raw_extract/docs/NOTICE")" == "$((8#754 & 0111))" && \
-               "$(_pkg_executable_bits "$raw_extract/legal/NOTICE")" == "$((8#645 & 0111))" ]]; then
-            log_pass "$raw_format preserves every payload byte and executable bit"
+            _pkg_archive_inspect normalized "$raw_archive" "$raw_format" && \
+            [[ "$(_pkg_executable_bits "$raw_extract/rano")" == "$((0111))" && \
+               "$(_pkg_executable_bits "$raw_extract/docs/NOTICE")" == "$((0111))" && \
+               "$(_pkg_executable_bits "$raw_extract/legal/NOTICE")" == "$((0111))" ]]; then
+            log_pass "$raw_format preserves payload bytes and publishes every executable as 0755"
         else
-            log_fail "$raw_format preserves every payload byte and executable bit"
+            log_fail "$raw_format preserves payload bytes and publishes every executable as 0755"
         fi
         cp -p "$raw_archive" "$RAW_ROOT/prior-$raw_format"
         chmod 0761 "$RAW_ROOT/includes/rano"

@@ -38,19 +38,26 @@ root = pathlib.Path(sys.argv[1])
 files = {'tool': b'#!/bin/sh\necho reproducible\n', 'LICENSE': b'license\n',
          'docs/' + 'long-' * 24 + 'guide with spaces': b'guide\n' * 4096}
 before = {}
+alternate_owner = os.geteuid() == 0
 for lane, order, mtime in [('one', files, 1000000000), ('two', reversed(files), 1900000000)]:
     for name in order:
         p = root / lane / name
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(files[name])
-        p.chmod((0o4755 if lane == 'one' else 0o755) if name == 'tool' else (0o640 if lane == 'one' else 0o600))
-        if lane == 'two' and os.geteuid() == 0:
-            os.chown(p, 12345, 12346)
+        p.chmod((0o4755 if lane == 'one' else 0o700) if name == 'tool' else (0o640 if lane == 'one' else 0o600))
+        if lane == 'two' and alternate_owner:
+            try:
+                os.chown(p, 12345, 12346)
+            except OSError as error:
+                print('SKIP alternate source ownership: ' + str(error), file=sys.stderr)
+                (root / 'ownership-unavailable').write_text(str(error))
+                alternate_owner = False
         os.utime(p, (mtime, mtime))
         s = p.stat()
         before[str(p)] = [s.st_mode, s.st_uid, s.st_gid, s.st_mtime_ns]
 (root / 'before.json').write_text(json.dumps(before))
 PY
+[[ ! -f "$work/ownership-unavailable" ]] || skipped=$((skipped + 1))
 
 build_one() (export SOURCE_DATE_EPOCH=1700000001 TZ=UTC; umask 022; packaging_build_archive "$1" "$2" "$work/one" tool docs LICENSE)
 build_two() (export SOURCE_DATE_EPOCH=1700000001 TZ=Pacific/Kiritimati; umask 077; packaging_build_archive "$1" "$2" "$work/two" LICENSE docs tool tool)
@@ -105,6 +112,13 @@ PY
         "$ROOT/src/packaging.sh" "$format" "$first" "$work/one"
     [[ -n "$before" && "$(inode "$first" 2>/dev/null)" == "$before" ]] && \
         pass "$format verified reuse retains inode" || fail "$format verified reuse retains inode"
+    private_before=$(inode "$second" 2>/dev/null || true)
+    run_ok "$format changed epoch reuses normalized private-source archive" \
+        env SOURCE_DATE_EPOCH=1 bash -c 'source "$1"; packaging_build_archive "$2" "$3" "$4" tool docs LICENSE' _ \
+        "$ROOT/src/packaging.sh" "$format" "$second" "$work/two"
+    [[ -n "$private_before" && "$(inode "$second" 2>/dev/null)" == "$private_before" ]] && \
+        pass "$format normalized private-source reuse retains inode" || fail "$format normalized private-source reuse retains inode"
+    equal "$format normalized private-source reuse preserves compressed bytes" "$first" "$second"
     run_ok "$format producer archive remains authoritative" \
         env SOURCE_DATE_EPOCH=2 bash -c 'source "$1"; packaging_repack_archive "$2" "$3" "$4" "$3"' _ \
         "$ROOT/src/packaging.sh" "$first" "$format" "$dir/alias.$format"

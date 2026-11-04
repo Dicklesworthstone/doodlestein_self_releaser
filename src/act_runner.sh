@@ -188,28 +188,44 @@ _act_stream_remote_windows_file() {
         -o StrictHostKeyChecking=accept-new "$ssh_destination" "$command"
 }
 
+# Collection modes belong to private evidence, not published archive members.
+# Normalize fresh copies behind a private directory at the archive boundary;
+# the original collection receipts and exclusive output descriptor stay intact.
+_act_stream_workspace_archive() {
+    local format="$1" artifact_dir="$2"
+    shift 2
+    if ! declare -F packaging_stream_archive &>/dev/null; then
+        local module_dir
+        module_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" || return 3
+        # shellcheck source=SCRIPTDIR/packaging.sh
+        source "$module_dir/packaging.sh" || return 3
+    fi
+    packaging_stream_archive "$format" "$artifact_dir" "$artifact_dir" "$@"
+}
+
 _act_stream_workspace_tar_gz() {
-    local artifact_dir="$1"
-    shift
-    (
-        set -o pipefail
-        (cd "$artifact_dir" && COPYFILE_DISABLE=1 tar --no-xattrs -cf - "$@") | gzip -c
-    )
+    _act_stream_workspace_archive tar.gz "$@"
 }
 
 _act_stream_workspace_tar_xz() {
-    local artifact_dir="$1"
-    shift
-    (
-        set -o pipefail
-        (cd "$artifact_dir" && COPYFILE_DISABLE=1 tar --no-xattrs -cf - "$@") | xz -c
-    )
+    _act_stream_workspace_archive tar.xz "$@"
 }
 
 _act_stream_workspace_zip() {
-    local artifact_dir="$1"
-    shift
-    (cd "$artifact_dir" && zip -q - "$@")
+    _act_stream_workspace_archive zip "$@"
+}
+
+# Inspect fresh archive headers before accepting their collection receipt.
+# Prebuilt archives retain their byte authority and use the existing validators.
+_act_validate_release_archive_metadata() {
+    local archive="$1" format="$2"
+    if ! declare -F _pkg_archive_inspect &>/dev/null; then
+        local module_dir
+        module_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" || return 3
+        # shellcheck source=SCRIPTDIR/packaging.sh
+        source "$module_dir/packaging.sh" || return 3
+    fi
+    _pkg_archive_inspect normalized "$archive" "$format"
 }
 
 # Resolve the native workspace archive format from the per-repository build
@@ -865,8 +881,11 @@ _act_workspace_include_path_is_symlink_free() {
 # Keep its original inode open while checking bytes and permissions twice;
 # later members and the archiver must not redefine an earlier member's bytes.
 # Empty companion files are valid, unlike empty executable/archive streams.
+# Strict collection supplies its original receipt and private mode as well:
+# extending the receipt must not establish a new identity after that handoff.
 _act_workspace_member_receipt() (
     local artifact_dir="$1" member="$2"
+    local collection_receipt="${3:-}" collection_mode="${4:-}"
     local path="$artifact_dir/$member" identity sha size mode
     local final_identity final_sha final_size final_mode
 
@@ -903,10 +922,24 @@ _act_workspace_member_receipt() (
        "$identity" == "$(_act_file_identity "$path")" && "$mode" == "$final_mode" &&
        "$size" == "$final_size" && "$sha" == "$final_sha" ]] || return 4
 
-    jq -ncS --arg path "$path" --arg member "$member" --arg sha256 "${sha,,}" \
+    local receipt
+    receipt=$(jq -ncS --arg path "$path" --arg member "$member" --arg sha256 "${sha,,}" \
         --argjson size_bytes "$size" --arg identity "$identity" --arg mode "$mode" \
         '{path:$path, member:$member, sha256:$sha256, size_bytes:$size_bytes,
-          identity:$identity, mode:$mode}'
+          identity:$identity, mode:$mode}') || return 4
+    if [[ -n "$collection_receipt" ]]; then
+        case "$collection_mode" in
+            600) collection_mode=-rw------- ;;
+            700) collection_mode=-rwx------ ;;
+            *) return 4 ;;
+        esac
+        jq -e --argjson collected "$collection_receipt" --arg mode "$collection_mode" '
+            .path == $collected.path and .sha256 == $collected.sha256 and
+            .size_bytes == $collected.size_bytes and .identity == $collected.identity and
+            .mode == $mode
+        ' <<< "$receipt" >/dev/null || return 4
+    fi
+    printf '%s\n' "$receipt"
 )
 
 _act_release_tree_file_metadata() {
@@ -1390,6 +1423,13 @@ _act_validate_workspace_member_receipts() {
         expected_sha=$(jq -er '.sha256' <<< "$expected") || return 4
         expected_size=$(jq -er '.size_bytes' <<< "$expected") || return 4
         expected_mode=$(jq -er '.mode' <<< "$expected") || return 4
+        # The source receipt above must still match exactly, including private
+        # permissions. Only the archive representation uses public modes.
+        if [[ "$expected_mode" == *[xst]* ]]; then
+            expected_mode=-rwxr-xr-x
+        else
+            expected_mode=-rw-r--r--
+        fi
         actual_mode=$(_act_archive_member_mode "$archive" "$format" "$member") || return 4
         [[ "$actual_mode" == "$expected_mode" ]] || return 4
         if command -v sha256sum &>/dev/null; then
@@ -2017,60 +2057,21 @@ _act_stage_contract_primary() {
         _log_error "Refusing existing release contract staging destination: $staged_path"
         return 4
     fi
-    # Noclobber supplies O_EXCL for destination creation. Keep that inode open
-    # while copying so a same-user rename/symlink race cannot redirect bytes to
-    # another file between the existence check and the copy.
-    if ! (
-        set -C
-        umask 077
-        exec 9> "$staged_path" || exit 4
-        if $source_is_contract_asset; then
-            cat -- "$source_path" >&9 || exit 4
-            if [[ -x "$source_path" && "$staged_format" == "none" ]]; then
-                chmod 700 /dev/fd/9 || exit 4
-            else
-                chmod 600 /dev/fd/9 || exit 4
-            fi
-        else case "$staged_format" in
-            none)
-                cat -- "$source_path" >&9 || exit 4
-                if [[ -x "$source_path" ]]; then
-                    chmod 700 /dev/fd/9 || exit 4
-                else
-                    chmod 600 /dev/fd/9 || exit 4
-                fi
-                ;;
-            tar.gz)
-                command -v tar &>/dev/null || exit 4
-                (
-                    set -o pipefail
-                    (cd "$(dirname "$source_path")" && \
-                        COPYFILE_DISABLE=1 tar --no-xattrs -cf - \
-                            "$(basename "$source_path")") | gzip -c
-                ) >&9 || exit 4
-                chmod 600 /dev/fd/9 || exit 4
-                ;;
-            tar.xz)
-                command -v tar &>/dev/null || exit 4
-                (
-                    set -o pipefail
-                    (cd "$(dirname "$source_path")" && \
-                        COPYFILE_DISABLE=1 tar --no-xattrs -cf - \
-                            "$(basename "$source_path")") | xz -c
-                ) >&9 || exit 4
-                chmod 600 /dev/fd/9 || exit 4
-                ;;
-            zip)
-                command -v zip &>/dev/null || exit 4
-                (cd "$(dirname "$source_path")" && \
-                    zip -q - "$(basename "$source_path")") >&9 || exit 4
-                chmod 600 /dev/fd/9 || exit 4
-                ;;
-            *) exit 4 ;;
-        esac
-        fi
-        exec 9>&-
-    ); then
+    local staged_collection_receipt="" staged_collection_mode=600
+    local -a staged_producer=()
+    if $source_is_contract_asset || [[ "$staged_format" == "none" ]]; then
+        # Prebuilt archives keep their exact compressed bytes and their
+        # existing independent admission policy.
+        [[ -x "$source_path" && "$staged_format" == "none" ]] && staged_collection_mode=700
+        staged_producer=(_act_stream_local_file "$source_path")
+    else
+        staged_producer=(_act_stream_workspace_archive "$staged_format" \
+            "$(dirname "$source_path")" "$(basename "$source_path")")
+    fi
+    # Bind the exclusive destination before validation, just as workspace
+    # collection does. A later valid archive must not replace this receipt.
+    if ! staged_collection_receipt=$(_act_collect_stream_exclusive \
+        "$staged_path" "$staged_collection_mode" "${staged_producer[@]}"); then
         _log_error "Unable to stage release primary for $target"
         return 4
     fi
@@ -2095,6 +2096,7 @@ _act_stage_contract_primary() {
             return 4
         fi
     else
+        _act_validate_release_archive_metadata "$staged_path" "$staged_format" || return 4
         if ! _act_validate_target_archive \
             "$staged_path" "$staged_format" "$expected_input_name" "$target"; then
             return 4
@@ -2124,6 +2126,14 @@ _act_stage_contract_primary() {
        [[ "$source_identity_before" != "$source_identity_after" ]] ||
        [[ "$staged_identity_before" != "$staged_identity_after" ]]; then
         _log_error "Unable to identify release primary after staging: $source_path"
+        return 4
+    fi
+    if ! jq -e --arg path "$staged_path" --arg sha256 "${staged_sha,,}" \
+            --argjson size_bytes "$staged_size" --arg identity "$staged_identity_after" '
+            .path == $path and .sha256 == $sha256 and
+            .size_bytes == $size_bytes and .identity == $identity
+        ' <<< "$staged_collection_receipt" >/dev/null; then
+        _log_error "Staged release primary changed after its exclusive collection: $staged_path"
         return 4
     fi
 
@@ -3087,6 +3097,57 @@ act_artifact_zip_is_wrapper() {
     [[ "$method" == "act" && "$path" == *.zip ]]
 }
 
+# Give collection and manifest admission the same exact, validated ZIP
+# members. A copied transport is inspected before extraction, so member names
+# are never interpreted as unzip patterns and duplicate paths, links, CRC
+# failures and excessive expansion cannot disappear behind version filtering.
+_act_artifact_zip_payloads() {
+    local zip_file="$1" version="$2" module_dir before after work receipt members member name
+    local -a zip_paths=() matching=()
+    local -A names=()
+    if ! declare -F packaging_extract_payload &>/dev/null; then
+        module_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" || return 3
+        # shellcheck source=SCRIPTDIR/packaging.sh
+        source "$module_dir/packaging.sh" || return 3
+    fi
+    before=$(_act_result_artifact_receipts "$(jq -nc --arg path "$zip_file" \
+        '{artifact_paths:[$path]}')") || return 4
+    work=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/dsr-act-zip.XXXXXXXX") || return 4
+    mkdir -m 700 "$work/payload" || return 4
+    receipt=$(_act_collect_stream_exclusive "$work/transport.zip" 600 \
+        _act_stream_local_file "$zip_file") || return 4
+    jq -e --argjson copy "$receipt" \
+        '.[0].sha256 == $copy.sha256 and .[0].size_bytes == $copy.size_bytes' \
+        <<< "$before" >/dev/null || return 4
+    packaging_extract_payload "$work/transport.zip" zip "$work/payload" || return 4
+    members=$(packaging_payload_members "$work/transport.zip" zip) || return 4
+    [[ -n "$members" ]] || return 4
+    while IFS= read -r member; do
+        zip_paths+=("$work/payload/$member")
+        if [[ "$member" == *"$version"* || "$member" == *"${version#v}"* ]]; then
+            matching+=("$work/payload/$member")
+        fi
+    done <<< "$members"
+    if [[ ${#matching[@]} -gt 0 ]]; then zip_paths=("${matching[@]}"); fi
+    for member in "${zip_paths[@]}"; do
+        name="${member##*/}"
+        if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ || "$name" == *..* ||
+              -n "${names[${name,,}]:-}" ]]; then
+            _log_error "Workflow ZIP has an unsafe or ambiguous release name: $name"
+            return 4
+        fi
+        names["${name,,}"]=1
+        [[ -f "$member" && ! -L "$member" ]] || return 4
+    done
+    after=$(_act_result_artifact_receipts "$(jq -nc --arg path "$zip_file" \
+        '{artifact_paths:[$path]}')") || return 4
+    [[ "$before" == "$after" ]] || {
+        _log_error "Workflow ZIP changed during collection: $zip_file"
+        return 4
+    }
+    printf '%s\0' "${zip_paths[@]}" | jq -Rsc 'split("\u0000")[:-1]'
+}
+
 # Collect artifacts from act run
 # Usage: act_collect_artifacts <artifact_dir> <output_dir>
 act_collect_artifacts() {
@@ -3850,9 +3911,11 @@ _act_linux_glibc_floor_enforced() {
     printf '%s\n' "$floor"
 }
 
-# The cargo shim placed first on PATH by Linux Rust builds (ordinary and
-# strict) when the glibc floor is active. `cargo build` becomes `cargo
-# zigbuild --target <triple>.<floor>`; every other cargo invocation passes
+# The cargo shim placed first on PATH when a Linux glibc floor is active,
+# or when a strict Unix build explicitly invokes cargo-zigbuild. `cargo
+# build` becomes `cargo zigbuild --target <triple>.<floor>`. An explicit
+# `cargo zigbuild` retains its arguments, including an unversioned target,
+# and uses the same pinned Zig dispatch; other subcommands pass
 # through untouched. Requires cargo-zigbuild >= 0.23.0 on the build host —
 # older releases hand rustc's aarch64 `--fix-cortex-a53-843419` erratum flag
 # to zig unfiltered and the link fails (issue #10).
@@ -3861,7 +3924,7 @@ _act_linux_glibc_floor_enforced() {
 _act_zig_cargo_shim_sh() {
     cat <<'DSR_ZIG_SHIM_SCRIPT'
 #!/bin/sh
-# dsr cargo shim: portable glibc floor for Linux Rust release builds.
+# dsr cargo shim: pinned Zig dispatch for Rust release builds.
 set -e
 _dsr_shim_dir=${0%/*}
 _dsr_clean_path=
@@ -3880,17 +3943,59 @@ _dsr_toolchain=
 case "${1:-}" in
   +*) _dsr_toolchain=$1; shift ;;
 esac
-if [ "${1:-}" != build ] || [ -z "${DSR_ZIG_TARGET:-}" ] || [ -z "${DSR_RUST_TARGET:-}" ]; then
+# Cargo's reviewed global options may precede the subcommand. Keep their
+# exact argument boundaries; a prefix must not bypass the Zig dispatcher.
+_dsr_subcommand=
+_dsr_subcommand_index=0
+_dsr_skip_value=0
+for _dsr_arg in "$@"; do
+  _dsr_subcommand_index=$((_dsr_subcommand_index + 1))
+  if [ "$_dsr_skip_value" -eq 1 ]; then
+    _dsr_skip_value=0
+    continue
+  fi
+  case "$_dsr_arg" in
+    -Z|--color) _dsr_skip_value=1 ;;
+    -v|-vv|--verbose|-q|--quiet|--locked|--offline|--frozen|-Z*|--color=*) ;;
+    *) _dsr_subcommand=$_dsr_arg; break ;;
+  esac
+done
+if { [ "$_dsr_subcommand" != build ] && [ "$_dsr_subcommand" != zigbuild ]; } ||
+   [ -z "${DSR_ZIG_TARGET:-}" ] || [ -z "${DSR_RUST_TARGET:-}" ]; then
   if [ -n "$_dsr_toolchain" ]; then
     exec cargo "$_dsr_toolchain" "$@"
   fi
   exec cargo "$@"
 fi
-shift
 if ! command -v cargo-zigbuild >/dev/null 2>&1 || ! command -v zig >/dev/null 2>&1; then
-  echo "[dsr] portable glibc floor ${DSR_LINUX_GLIBC_FLOOR:-} needs cargo-zigbuild and zig on this build host (cargo install cargo-zigbuild); set linux_glibc_floor: native in the repo config to build against the host glibc instead" >&2
+  echo "[dsr] generated DSR Cargo shim needs cargo-zigbuild and zig on this build host (cargo install cargo-zigbuild)" >&2
   exit 4
 fi
+# cargo-zigbuild prefers Python's ziglang package over PATH's zig in 0.23,
+# and 0.24 also accepts a cached command/argument override. The managed shim
+# must use the same Zig executable that strict toolchain identity measures.
+# Refuse caller overrides rather than silently measuring a different linker.
+if [ "${CARGO_ZIGBUILD_ZIG_COMMAND+x}${CARGO_ZIGBUILD_ZIG_COMMAND_ARGS+x}${CARGO_ZIGBUILD_PYTHON_PATH+x}${CARGO_ZIGBUILD_ZIG_PATH+x}${CARGO_ZIGBUILD_ZIG_VERSION+x}" ]; then
+  echo "[dsr] generated DSR Cargo shim does not accept Zig dispatch overrides; select zig on PATH" >&2
+  exit 4
+fi
+_dsr_zig_path=$(command -v zig)
+case "$_dsr_zig_path" in
+  /*) ;;
+  *) _dsr_zig_path="$(pwd -P)/$_dsr_zig_path" ;;
+esac
+if [ ! -f "$_dsr_zig_path" ] || [ ! -x "$_dsr_zig_path" ]; then
+  echo "[dsr] generated DSR Cargo shim needs a Zig executable on the delegated PATH" >&2
+  exit 4
+fi
+# /dev/null cannot execute, so the older Python-first resolver falls through
+# to the pinned binary. Newer plugins use the same absolute command directly.
+# Keep these derived settings inside the build; the parent observer/cache
+# environment is unchanged, and the generator hash binds this dispatch rule.
+CARGO_ZIGBUILD_PYTHON_PATH=/dev/null
+CARGO_ZIGBUILD_ZIG_PATH=$_dsr_zig_path
+CARGO_ZIGBUILD_ZIG_COMMAND=$_dsr_zig_path
+export CARGO_ZIGBUILD_PYTHON_PATH CARGO_ZIGBUILD_ZIG_PATH CARGO_ZIGBUILD_ZIG_COMMAND
 _dsr_zb_version=$(cargo-zigbuild --version 2>/dev/null | awk "{print \$2}")
 _dsr_zb_major=${_dsr_zb_version%%.*}
 _dsr_zb_rest=${_dsr_zb_version#*.}
@@ -3902,14 +4007,43 @@ if [ "$_dsr_zb_major" -eq 0 ] && [ "$_dsr_zb_minor" -lt 23 ]; then
   echo "[dsr] cargo-zigbuild ${_dsr_zb_version:-unknown} is too old for reliable cross-linking (aarch64 --fix-cortex-a53-843419 filtering needs >= 0.23.0); run: cargo install cargo-zigbuild" >&2
   exit 4
 fi
+# Explicit Zig commands own their target/floor. Pin the same executable as
+# managed `cargo build`, without rewriting any of the caller's arguments.
+if [ "$_dsr_subcommand" = zigbuild ]; then
+  if [ -n "$_dsr_toolchain" ]; then
+    exec cargo "$_dsr_toolchain" "$@"
+  fi
+  exec cargo "$@"
+fi
 _dsr_expect_target=0
 _dsr_have_target=0
+_dsr_index=0
+for _dsr_arg in "$@"; do
+  _dsr_index=$((_dsr_index + 1))
+  [ "$_dsr_index" -gt "$_dsr_subcommand_index" ] || continue
+  case "$_dsr_arg" in
+    --) break ;;
+    --target|--target=*) _dsr_have_target=1 ;;
+  esac
+done
 _dsr_count=$#
 _dsr_index=0
+_dsr_after_separator=0
 while [ "$_dsr_index" -lt "$_dsr_count" ]; do
   _dsr_arg=$1
   shift
   _dsr_index=$((_dsr_index + 1))
+  if [ "$_dsr_index" -eq "$_dsr_subcommand_index" ]; then
+    set -- "$@" zigbuild
+    if [ "$_dsr_have_target" -eq 0 ]; then
+      set -- "$@" --target "$DSR_ZIG_TARGET"
+    fi
+    continue
+  fi
+  if [ "$_dsr_after_separator" -eq 1 ]; then
+    set -- "$@" "$_dsr_arg"
+    continue
+  fi
   if [ "$_dsr_expect_target" -eq 1 ]; then
     _dsr_expect_target=0
     if [ "$_dsr_arg" = "$DSR_RUST_TARGET" ]; then
@@ -3919,13 +4053,15 @@ while [ "$_dsr_index" -lt "$_dsr_count" ]; do
     continue
   fi
   case "$_dsr_arg" in
+    --)
+      _dsr_after_separator=1
+      set -- "$@" "$_dsr_arg"
+      ;;
     --target)
-      _dsr_have_target=1
       _dsr_expect_target=1
       set -- "$@" "$_dsr_arg"
       ;;
     --target=*)
-      _dsr_have_target=1
       _dsr_value=${_dsr_arg#--target=}
       if [ "$_dsr_value" = "$DSR_RUST_TARGET" ]; then
         _dsr_value=$DSR_ZIG_TARGET
@@ -3937,13 +4073,10 @@ while [ "$_dsr_index" -lt "$_dsr_count" ]; do
       ;;
   esac
 done
-if [ "$_dsr_have_target" -ne 1 ]; then
-  set -- --target "$DSR_ZIG_TARGET" "$@"
-fi
 if [ -n "$_dsr_toolchain" ]; then
-  exec cargo "$_dsr_toolchain" zigbuild "$@"
+  exec cargo "$_dsr_toolchain" "$@"
 fi
-exec cargo zigbuild "$@"
+exec cargo "$@"
 DSR_ZIG_SHIM_SCRIPT
 }
 
@@ -3957,6 +4090,79 @@ _act_zig_shim_prefix_sh() {
     _act_zig_cargo_shim_sh
     printf '%s' "DSR_ZIG_SHIM_EOF
 chmod 755 '$shim_dir_q/cargo'; "
+}
+
+# Check the new, build-writable PATH directory before selecting the observer
+# interpreter. Only shell builtins run here: an added python3 must not be able
+# to impersonate the very verifier that would reject it. The subshell confines
+# shell-specific glob options and inherited glob filters to this check.
+_act_zig_shim_bootstrap_guard_sh() {
+    local shim_dir="${1:-}" shim_dir_q
+    [[ -n "$shim_dir" ]] || return 0
+    printf -v shim_dir_q '%q' "$shim_dir"
+    printf '_dsr_expected_shim_dir=%s\n' "$shim_dir_q"
+    cat <<'DSR_ZIG_BOOTSTRAP_SH'
+(
+    set +f
+    unset GLOBIGNORE || exit 86
+    if test -n "${ZSH_VERSION:-}"; then
+        setopt nonomatch
+    elif test -n "${BASH_VERSION:-}"; then
+        shopt -u failglob
+    fi
+    if ! test -d "$_dsr_expected_shim_dir" || test -L "$_dsr_expected_shim_dir" ||
+       ! test -r "$_dsr_expected_shim_dir" || ! test -x "$_dsr_expected_shim_dir"; then
+        printf '[dsr] toolchain identity: generated DSR Cargo shim directory is not a readable plain directory\n' >&2
+        exit 86
+    fi
+    for _dsr_shim_entry in "$_dsr_expected_shim_dir"/* "$_dsr_expected_shim_dir"/.[!.]* "$_dsr_expected_shim_dir"/..?*; do
+        if test -e "$_dsr_shim_entry" || test -L "$_dsr_shim_entry"; then
+            case "$_dsr_shim_entry" in
+                "$_dsr_expected_shim_dir/cargo") ;;
+                *) printf '[dsr] toolchain identity: unexpected entry in generated DSR Cargo shim directory: %s\n' "$_dsr_shim_entry" >&2; exit 86 ;;
+            esac
+        fi
+    done
+) || exit 86
+DSR_ZIG_BOOTSTRAP_SH
+}
+
+# Resolve Python once to an absolute executable outside the generated shim
+# directory, and execute that same selection for the capability check and the
+# observer body. Repeating a bare PATH lookup would permit a late python3 file
+# to replace a successfully checked interpreter.
+_act_toolchain_python_prefix_sh() {
+    local shim_dir="${1:-}" shim_dir_q
+    _act_zig_shim_bootstrap_guard_sh "$shim_dir" || return $?
+    printf -v shim_dir_q '%q' "$shim_dir"
+    printf '_dsr_tool_shim_dir=%s\n' "$shim_dir_q"
+    cat <<'DSR_TOOL_PYTHON_SH'
+dsr_tool_python=
+for dsr_tool_candidate in python3 python3.14 python3.13 python3.12 python3.11; do
+    dsr_tool_path=$(command -v "$dsr_tool_candidate") || continue
+    case "$dsr_tool_path" in /*) ;; *) continue ;; esac
+    if test -n "$_dsr_tool_shim_dir"; then
+        dsr_tool_parent=$(CDPATH= cd -P "${dsr_tool_path%/*}" && pwd -P) || exit 86
+        dsr_tool_shim_parent=$(CDPATH= cd -P "$_dsr_tool_shim_dir" && pwd -P) || exit 86
+        # A PATH entry outside the shim directory can still be a symlink or
+        # hardlink to its cargo file. Reject that alias before executing even
+        # the Python capability probe; normal interpreter symlinks stay valid.
+        if test "$dsr_tool_parent" = "$dsr_tool_shim_parent" ||
+           test "$dsr_tool_path" -ef "$_dsr_tool_shim_dir/cargo"; then
+            printf '[dsr] toolchain identity: Python cannot be selected from or alias the generated DSR Cargo shim directory\n' >&2
+            exit 86
+        fi
+    fi
+    if "$dsr_tool_path" -I -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then
+        dsr_tool_python=$dsr_tool_path
+        break
+    fi
+done
+if test -z "$dsr_tool_python"; then
+    printf '[dsr] toolchain identity: Python 3.11+ is required for executable attestation\n' >&2
+    exit 86
+fi
+DSR_TOOL_PYTHON_SH
 }
 
 # Highest NUL-delimited GLIBC_x.y[.z] version-string token in <file>. Version
@@ -4908,6 +5114,37 @@ _act_git_sync_excludes() {
         done
 }
 
+# A receiver must own its source root and existing Git administration. Do not
+# repair an operator checkout with chown or override Git's safe.directory
+# policy: a prior root rsync may have imported a controller-only numeric UID.
+# The same POSIX program runs locally and through the Unix SSH login shell.
+_act_source_sync_prepare_sh() {
+    local source_path="$1"
+    printf "dsr_source_path='%s'\n" "${source_path//\'/\'\\\'\'}"
+    cat <<'SH'
+dsr_source_uid=$(id -u) || exit 4
+for dsr_source_entry in "$dsr_source_path" "$dsr_source_path/.git"; do
+    if [ -e "$dsr_source_entry" ] || [ -L "$dsr_source_entry" ]; then
+        if [ -L "$dsr_source_entry" ]; then
+            printf '[act] Refusing source sync through symlink: %s\n' "$dsr_source_entry" >&2
+            exit 4
+        fi
+        dsr_source_owner=$(stat -c %u -- "$dsr_source_entry" 2>/dev/null) ||
+            dsr_source_owner=$(stat -f %u "$dsr_source_entry" 2>/dev/null) || {
+                printf '[act] Cannot verify source ownership: %s\n' "$dsr_source_entry" >&2
+                exit 4
+            }
+        if [ "$dsr_source_owner" != "$dsr_source_uid" ]; then
+            printf '[act] Source ownership mismatch: %s belongs to UID %s; build account uses UID %s. Use a fresh owned source stage or repair this checkout before retrying.\n' \
+                "$dsr_source_entry" "$dsr_source_owner" "$dsr_source_uid" >&2
+            exit 4
+        fi
+    fi
+done
+mkdir -p -- "$dsr_source_path" || exit 4
+SH
+}
+
 # Sync source code to remote host via rsync
 # Usage: _act_sync_source <host> <local_path> <remote_path> [extra_excludes...]
 # Returns: 0 on success, non-zero on failure
@@ -4992,12 +5229,16 @@ _act_sync_source() (
             return 0
         fi
 
-        mkdir -p "$remote_path"
+        local prepare_command
+        prepare_command=$(_act_source_sync_prepare_sh "$remote_path") || return 4
+        sh -c "$prepare_command" || return 4
         local sync_cmd_output sync_cmd_status
         # Equal size and timestamp do not prove equal source bytes (for
         # example, rapid checkouts or restored timestamps). A successful sync
         # must replace those stale files before the host becomes buildable.
-        sync_cmd_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" rsync -az --checksum --delete \
+        # Keep modes, links, timestamps and byte comparison; numeric ownership
+        # belongs to the receiving build account, not the controller machine.
+        sync_cmd_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" rsync -az --no-owner --no-group --checksum --delete \
             "${exclude_args[@]}" \
             "$local_path/" "$remote_path/" 2>&1)
         sync_cmd_status=$?
@@ -5035,9 +5276,20 @@ _act_sync_source() (
         # sure the full remote path exists first (mirrors the local-host and
         # tar-fallback branches). Without this, a missing per-version parent dir
         # makes the whole sync fail with "No such file or directory".
-        if ! _act_remote_mkdir "$host" "$remote_path"; then
-            _log_error "failed to create remote directory $remote_path on $host"
-            return 1
+        if _act_is_windows_host "$host"; then
+            if ! _act_remote_mkdir "$host" "$remote_path"; then
+                _log_error "failed to create remote directory $remote_path on $host"
+                return 1
+            fi
+        else
+            local prepare_command
+            prepare_command=$(_act_source_sync_prepare_sh "$remote_path") || return 4
+            if ! _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh -n \
+                -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o StrictHostKeyChecking=accept-new \
+                "$ssh_destination" "$prepare_command"; then
+                _log_error "failed to prepare owned source directory $remote_path on $host"
+                return 1
+            fi
         fi
 
         # Use rsync for efficient sync. Windows receivers still drop the
@@ -5050,7 +5302,7 @@ _act_sync_source() (
             sync_attempts=3
         fi
         for (( sync_attempt = 1; sync_attempt <= sync_attempts; sync_attempt++ )); do
-            sync_cmd_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" rsync -az --checksum --delete \
+            sync_cmd_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" rsync -az --no-owner --no-group --checksum --delete \
                 "${rsync_io_opts[@]}" \
                 "${exclude_args[@]}" \
                 -e "$rsync_transport" \
@@ -5086,7 +5338,7 @@ _act_sync_source() (
         # Create remote directory and extract. Windows OpenSSH hands the remote
         # command to cmd.exe, so POSIX `%q` escaping is invalid there. Pass one
         # validated cmd command as a single ssh argument instead.
-        local mkdir_cmd remote_extract_cmd
+        local remote_extract_cmd
         if _act_is_windows_host "$host"; then
             local win_path
             win_path=$(_act_windows_cmd_path "$remote_path")
@@ -5103,8 +5355,10 @@ _act_sync_source() (
             # exists, making the sender fail with a misleading Write error.
             remote_extract_cmd="tar xzf - -C $remote_path"
         else
-            mkdir_cmd="mkdir -p \"$remote_path\" && cd \"$remote_path\""
-            remote_extract_cmd="$mkdir_cmd && tar xzf -"
+            remote_extract_cmd=$(_act_source_sync_prepare_sh "$remote_path") || return 4
+            # GNU tar and macOS bsdtar otherwise restore archive UIDs when
+            # the receiving SSH account is root, just as rsync -a does.
+            remote_extract_cmd+=$'\n''tar --no-same-owner -xzf - -C "$dsr_source_path"'
         fi
 
         local sync_cmd_output sync_cmd_status
@@ -6182,8 +6436,42 @@ EOF
 # Preserve its initial receipt, then observe the final inventory; equality to
 # the seed is deliberately not required. Linked/special/config-bearing cache
 # state, or a changed seed receipt, prevents artifact collection.
+# Preserve the transport observation separately from the coordinator's receipt
+# validation. Existing callers still receive only the validated receipt; the
+# native runner requests the internal envelope to retain the original exit.
+_act_finish_private_cargo_home_receipt() {
+    local host="$1" command="$2" cargo_home="$3" capture_execution="$4"
+    local summary receipt="" command_exit=0 result_exit=0
+    summary=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT") || command_exit=$?
+    result_exit="$command_exit"
+    if [[ $command_exit -eq 0 ]]; then
+        receipt=$(jq -ce --arg home "$cargo_home" '
+            select(type == "object" and .schema_version == 1 and .mode == "inventory" and
+                .cargo_home == $home and .receipt_path == ($home + ".final.json") and
+                (.receipt_sha256 | test("^[0-9a-f]{64}$")) and
+                (.inventory_sha256 | test("^[0-9a-f]{64}$")))
+        ' <<< "$summary") || result_exit=$?
+    fi
+    if [[ "$capture_execution" == true ]]; then
+        if [[ $result_exit -ne 0 && -n "$summary" ]]; then
+            printf '%s\n' "$summary" >&2
+        fi
+        [[ $result_exit -eq 0 ]] || receipt=""
+        jq -nc --argjson command_exit "$command_exit" --argjson receipt "${receipt:-null}" \
+            '{command_exit_code: $command_exit, receipt: $receipt}' || return 4
+    elif [[ $result_exit -eq 0 ]]; then
+        printf '%s\n' "$receipt"
+    fi
+    return "$result_exit"
+}
+
 _act_finish_unix_private_cargo_home() {
-    local host="$1" cargo_home="$2" seed_digest="$3" command summary source_verification=""
+    local capture_execution=false
+    if [[ "${1:-}" == --native-execution ]]; then
+        capture_execution=true
+        shift
+    fi
+    local host="$1" cargo_home="$2" seed_digest="$3" command source_verification=""
     [[ $# == 3 || $# == 5 ]] || return 4
     [[ "$cargo_home" =~ ^/[A-Za-z0-9_./+-]+$ && "$cargo_home" != *..* &&
        "$seed_digest" =~ ^[0-9a-f]{64}$ ]] || return 4
@@ -6221,13 +6509,7 @@ _dsr_verify_cache_seed
 printf '%s\\n' "\$dsr_final_summary"
 EOF
 )"
-    summary=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT") || return $?
-    jq -ce --arg home "$cargo_home" '
-        select(type == "object" and .schema_version == 1 and .mode == "inventory" and
-            .cargo_home == $home and .receipt_path == ($home + ".final.json") and
-            (.receipt_sha256 | test("^[0-9a-f]{64}$")) and
-            (.inventory_sha256 | test("^[0-9a-f]{64}$")))
-    ' <<< "$summary"
+    _act_finish_private_cargo_home_receipt "$host" "$command" "$cargo_home" "$capture_execution"
 }
 
 _act_windows_cargo_cache_runtime() {
@@ -6558,22 +6840,47 @@ EOF
 
 _act_prepare_windows_nonstrict_cargo_home() {
     local host="$1" source_root="$2" stage_root="$3" cargo_home="$4" script command summary path
+    local source_root_q
     for path in "$stage_root" "$cargo_home"; do
         [[ "$path" =~ ^[A-Za-z]:/[A-Za-z0-9_./+-]+$ && "$path" != *..* ]] || return 4
     done
     [[ "$stage_root" == */dsr-build-* && "$cargo_home" == "$stage_root/"* ]] || return 4
+    source_root="${source_root//\\//}"
+    if [[ "$source_root" =~ ^/([A-Za-z])/(.*)$ ]]; then
+        source_root="${BASH_REMATCH[1]}:/${BASH_REMATCH[2]}"
+    fi
+    [[ "$source_root" =~ ^[A-Za-z]:/ && "$source_root" != *[[:cntrl:]]* ]] || return 4
+    source_root_q="${source_root//\'/\'\'}"
     script=$(_act_windows_cargo_cache_runtime) || return $?
     script+=$'\n'"$(cat <<EOF
 \$ErrorActionPreference='Stop'
+\$dsrSource=Get-DsrCacheFullPath '$source_root_q'
+\$dsrSourceGuards=Open-DsrCachePathGuard \$dsrSource
+try {
+# A present but invalid lock must fail the existing held-file checks, never
+# become permission to import unrelated ambient sources and Git checkouts.
+# Enumerating the guarded root distinguishes absence from inaccessible or
+# linked lockfiles without suppressing a filesystem error.
+\$dsrLockfile=''
+foreach (\$dsrEntry in (Get-DsrCacheChildren \$dsrSource)) {
+    if ([StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFileName(\$dsrEntry), 'Cargo.lock')) {
+        \$dsrLockfile=\$dsrEntry
+    }
+}
 \$dsrParent=Split-Path -Parent '$stage_root'
 [IO.Directory]::CreateDirectory(\$dsrParent) | Out-Null
 if (Get-Item -LiteralPath '$stage_root' -Force -ErrorAction SilentlyContinue) { throw 'Rust isolation path already exists' }
 [IO.Directory]::CreateDirectory('$stage_root') | Out-Null
 \$dsrAmbient=if (\$env:CARGO_HOME) { \$env:CARGO_HOME } else { Join-Path \$env:USERPROFILE '.cargo' }
 if (-not (Get-Item -LiteralPath \$dsrAmbient -Force -ErrorAction SilentlyContinue)) { \$dsrAmbient='' }
-\$dsrSummary=Invoke-DsrCargoCache -Operation snapshot -First \$dsrAmbient -Second '$cargo_home'
+if (\$dsrLockfile) {
+    \$dsrSummary=Invoke-DsrCargoCache -Operation snapshot -First \$dsrAmbient -Second '$cargo_home' -Lockfile \$dsrLockfile
+} else {
+    \$dsrSummary=Invoke-DsrCargoCache -Operation snapshot -First \$dsrAmbient -Second '$cargo_home'
+}
 Assert-DsrCargoHome -Path '$cargo_home'
 \$dsrSummary | ConvertTo-Json -Compress -Depth 100
+} finally { foreach (\$dsrGuard in \$dsrSourceGuards) { \$dsrGuard.Dispose() } }
 exit 0
 EOF
 )"
@@ -6589,8 +6896,13 @@ EOF
 }
 
 _act_finish_windows_private_cargo_home() {
+    local capture_execution=false
+    if [[ "${1:-}" == --native-execution ]]; then
+        capture_execution=true
+        shift
+    fi
     [[ $# == 3 || $# == 5 || $# == 8 ]] || return 4
-    local host="$1" cargo_home="$2" seed_digest="$3" script command summary source_verification
+    local host="$1" cargo_home="$2" seed_digest="$3" script command source_verification
     local context_verification="" context_fingerprint context_receipt_digest context_json
     [[ "$cargo_home" =~ ^[A-Za-z]:/[A-Za-z0-9_./+-]+$ && "$cargo_home" != *..* &&
        "$seed_digest" =~ ^[0-9a-f]{64}$ ]] || return 4
@@ -6630,13 +6942,7 @@ exit 0
 EOF
 )"
     command=$(_act_windows_cache_command "$host" "$cargo_home" "$script") || return $?
-    summary=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT") || return $?
-    jq -ce --arg home "$cargo_home" '
-        select(type == "object" and .schema_version == 1 and .mode == "inventory" and
-            .cargo_home == $home and .receipt_path == ($home + ".final.json") and
-            (.receipt_sha256 | test("^[0-9a-f]{64}$")) and
-            (.inventory_sha256 | test("^[0-9a-f]{64}$")))
-    ' <<< "$summary"
+    _act_finish_private_cargo_home_receipt "$host" "$command" "$cargo_home" "$capture_execution"
 }
 
 _act_strict_cargo_metadata_json() {
@@ -8420,21 +8726,28 @@ act_get_configured_target_triples() {
     ' <<< "$document" || return 4
 }
 
-# Get a single environment variable value from newline-delimited KEY=VALUE pairs.
+# Get the effective value from ordered, newline-delimited KEY=VALUE pairs.
+# Platform overrides follow global declarations, and the launchers export them
+# in that order. Keep all declarations for policy checks, but read the last
+# matching assignment here, including an explicitly empty value.
 # Usage: act_get_build_env_value <build_env> <key>
 act_get_build_env_value() {
     local build_env="$1"
     local key="$2"
-    local env_pair
+    local env_pair value="" found=false
 
     while IFS= read -r env_pair; do
         [[ -z "$env_pair" ]] && continue
         if [[ "$env_pair" == "$key="* ]]; then
-            printf '%s\n' "${env_pair#*=}"
-            return 0
+            value="${env_pair#*=}"
+            found=true
         fi
     done <<< "$build_env"
 
+    if [[ "$found" == true ]]; then
+        printf '%s\n' "$value"
+        return 0
+    fi
     return 1
 }
 
@@ -8951,18 +9264,18 @@ _act_ssh_exec_unix_program() {
 # remain in the run's fresh target directory; no cached output is collected on
 # failure. Python owns the advisory lock through build and output detachment.
 _act_strict_cargo_cache_script() {
-    local cache_root="$1" cache_contract="$2" command="$3"
+    local cache_root="$1" cache_contract="$2" command="$3" zig_shim_dir="${4:-}"
     local root_q contract_q command_q selection_script
     printf -v root_q '%q' "$cache_root"
     printf -v contract_q '%q' "$cache_contract"
     printf -v command_q '%q' "$command"
-    selection_script=$(_act_toolchain_identity_script context /dev/null "$command") || return $?
+    selection_script=$(_act_toolchain_identity_script context /dev/null "$command" "" "" "" "$zig_shim_dir") || return $?
     # Assignment preserves an inherited export attribute. Clear it before
     # collecting the potentially large observation, so only fd3 carries it.
     printf 'unset dsr_cache_context || exit $?\n'
     printf 'dsr_cache_context=$(\n%s\n) || exit $?\n' "$selection_script"
     # tomllib needs Python 3.11+; see _act_toolchain_identity_script.
-    printf '%s\n' 'dsr_tool_python=python3; for dsr_tool_candidate in python3 python3.14 python3.13 python3.12 python3.11; do if command -v "$dsr_tool_candidate" >/dev/null 2>&1 && "$dsr_tool_candidate" -I -c '\''import sys; sys.exit(sys.version_info < (3, 11))'\'' 2>/dev/null; then dsr_tool_python=$dsr_tool_candidate; break; fi; done'
+    _act_toolchain_python_prefix_sh "$zig_shim_dir" || return $?
     # Environment entries have the same single-argument limit as exec argv on
     # Linux. Keep the observation on an inherited input descriptor instead.
     printf 'unset DSR_CARGO_TOOLCHAIN_CONTEXT || exit $?\n'
@@ -9079,6 +9392,16 @@ excluded = {'CARGO_HOME', 'CARGO_TARGET_DIR', 'CARGO_BUILD_BUILD_DIR',
 influences = {k: v for k, v in probe_env.items() if k not in excluded and
               (k.startswith(('CARGO_', 'RUST', 'XWIN_')) or
                re.search(r'(^|_)(CC|CXX|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET)($|_)', k))}
+shim_selection = selected_identity.get('selection', {}).get('dsr_cargo_shim')
+if shim_selection is not None:
+    for variable, field in (('DSR_RUST_TARGET', 'rust_target'), ('DSR_ZIG_TARGET', 'zig_target'),
+                            ('DSR_LINUX_GLIBC_FLOOR', 'glibc_floor')):
+        # An explicit unversioned command requests no glibc floor. Preserve
+        # null in its identity while binding the actual empty environment
+        # value; never manufacture a versioned target for cache admission.
+        expected = '' if shim_selection[field] is None else shim_selection[field]
+        require(probe_env.get(variable, '') == expected, 'generated shim dispatch context changed')
+        influences[variable] = expected
 tools = {}
 for name in ('CC', 'CXX', 'AR', 'LD'):
     argv = shlex.split(probe_env.get(name, {'CC': 'cc', 'CXX': 'c++', 'AR': 'ar', 'LD': 'ld'}[name]))
@@ -9104,6 +9427,20 @@ contract = {'schema': 2, 'source_freshness': 'nightly-content-no-build-scripts-v
 # Include actual target/linker/plugin bytes without the fresh source cwd: two
 # immutable copies of the same project can still reuse eligible intermediates.
 contract['toolchain'] = {key: selected_identity[key] for key in ('target_triple', 'linker_variable', 'tools')}
+explicit_zig_selection = selected_identity.get('selection', {}).get('cargo_zigbuild')
+if explicit_zig_selection is not None:
+    # A shared Rust target must not collapse two explicit GNU ABI requests
+    # into the same cache namespace after target canonicalization.
+    contract['toolchain']['cargo_zigbuild'] = explicit_zig_selection
+if shim_selection is not None:
+    # Only the generated launcher's per-run location is ephemeral. The full
+    # path remains in the coordinator-held executable observation; the cache
+    # key retains its verified bytes/kind and explicit target/floor influences.
+    # This is cache key material, not a substitute toolchain identity receipt.
+    contract['toolchain']['tools'] = dict(contract['toolchain']['tools'])
+    shim_key = dict(contract['toolchain']['tools']['dsr_cargo_shim'])
+    del shim_key['selected_path']
+    contract['toolchain']['tools']['dsr_cargo_shim'] = shim_key
 with open('Cargo.toml', 'rb') as manifest:
     contract['profiles'] = tomllib.load(manifest).get('profile', {})
 contract['cargo_config'] = {name: digest(name) for name in ('.cargo/config', '.cargo/config.toml')
@@ -9181,36 +9518,47 @@ PY
 # Apple /usr/bin compiler launchers, its dispatch target and content digest.
 # Internal metadata mode runs locked/offline metadata with the same selection;
 # context mode passes selected executable authority to the intermediate cache.
-# Args: mode output_json build_cmd extra_tools(space-separated) receipt_pin expected_cwd
+# Args: mode output_json build_cmd extra_tools(space-separated) receipt_pin expected_cwd zig_shim_dir
 _act_toolchain_identity_script() {
     local mode="$1" output="$2" build_cmd="$3" extra_tools="${4:-}" receipt_pin="${5:-}" expected_cwd="${6:-}"
+    local zig_shim_dir="${7:-}" zig_shim_hash="" shim_dir_q shim_hash_q
     local output_q command_q extra_q pin_q cwd_q python_q=python3
-    [[ "$mode" == record || "$mode" == verify || "$mode" == read || "$mode" == metadata || "$mode" == context || "$mode" == target ]] || return 4
+    [[ "$mode" == record || "$mode" == verify || "$mode" == read || "$mode" == metadata || "$mode" == context || "$mode" == target || "$mode" == selection ]] || return 4
     [[ "$output" == /* && "$output" != *..* ]] || return 4
     [[ -z "$expected_cwd" || ( "$expected_cwd" == /* && "$expected_cwd" != *..* ) ]] || return 4
+    if [[ -n "$zig_shim_dir" ]]; then
+        [[ "$zig_shim_dir" == /* && "$zig_shim_dir" != *..* ]] || return 4
+        # Derive authority from the controller's generator, never from worker
+        # bytes or a build-controlled environment variable. Preserve the exact
+        # trailing newline materialized by _act_zig_shim_prefix_sh.
+        zig_shim_hash=$(_act_zig_cargo_shim_sh | _act_sha256 /dev/stdin) || return 4
+        [[ "$zig_shim_hash" =~ ^[0-9a-f]{64}$ ]] || return 4
+    fi
     printf -v output_q '%q' "$output"
     printf -v command_q '%q' "$build_cmd"
     printf -v extra_q '%q' "$extra_tools"
     printf -v pin_q '%q' "$receipt_pin"
     printf -v cwd_q '%q' "$expected_cwd"
+    printf -v shim_dir_q '%q' "$zig_shim_dir"
+    printf -v shim_hash_q '%q' "$zig_shim_hash"
     # Target-only planning runs on the coordinator without invoking any build
     # tools or reading its Cargo configuration. The configured PATH may be a
     # remote host path, so use the coordinator's absolute Python interpreter.
-    if [[ "$mode" == target ]]; then
+    if [[ "$mode" == target || "$mode" == selection ]]; then
         python_q=$(command -v python3) || return 4
         printf -v python_q '%q' "$python_q"
     else
         # Attesting a Cargo configuration needs tomllib (Python 3.11+), but a
         # login shell can put an older python3 first (macOS path_helper puts
         # /usr/bin/python3 3.9 ahead of Homebrew). Prefer a new enough one.
-        printf '%s\n' 'dsr_tool_python=python3; for dsr_tool_candidate in python3 python3.14 python3.13 python3.12 python3.11; do if command -v "$dsr_tool_candidate" >/dev/null 2>&1 && "$dsr_tool_candidate" -I -c '\''import sys; sys.exit(sys.version_info < (3, 11))'\'' 2>/dev/null; then dsr_tool_python=$dsr_tool_candidate; break; fi; done'
+        _act_toolchain_python_prefix_sh "$zig_shim_dir" || return $?
         python_q='"$dsr_tool_python"'
     fi
-    printf '%s -I - %s %s %s %s %s %s <<\x27DSR_TOOLCHAIN_IDENTITY_PY\x27\n' "$python_q" "$mode" "$output_q" "$command_q" "$extra_q" "$pin_q" "$cwd_q"
+    printf '%s -I - %s %s %s %s %s %s %s %s <<\x27DSR_TOOLCHAIN_IDENTITY_PY\x27\n' "$python_q" "$mode" "$output_q" "$command_q" "$extra_q" "$pin_q" "$cwd_q" "$shim_dir_q" "$shim_hash_q"
     cat <<'PY'
 import hashlib, json, os, pathlib, re, shlex, shutil, stat, subprocess, sys
 
-mode, output, command, extra, receipt_pin, expected_cwd = sys.argv[1:7]
+mode, output, command, extra, receipt_pin, expected_cwd, zig_shim_dir, zig_shim_hash = sys.argv[1:9]
 
 def fail(message):
     sys.stderr.write('[dsr] toolchain identity: ' + message + '\n')
@@ -9330,7 +9678,8 @@ def shell_word(raw, variables=()):
 
 
 def influences(name):
-    return name in ('PATH', 'DSR_TARGET_TRIPLE') or name.startswith(('CARGO_', 'RUST', 'XWIN_')) or bool(re.search(
+    return name in ('PATH', 'DSR_TARGET_TRIPLE', 'DSR_RUST_TARGET', 'DSR_ZIG_TARGET',
+                    'DSR_LINUX_GLIBC_FLOOR') or name.startswith(('CARGO_', 'RUST', 'XWIN_')) or bool(re.search(
         r'(^|_)(CC|CXX|CPP|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET)($|_)', name))
 
 
@@ -9745,7 +10094,7 @@ def cargo_configuration():
 
 
 cargo_config, cargo_config_receipts = (({'build': {}, 'target': {}, 'alias': {}}, [])
-                                     if mode == 'target' else cargo_configuration())
+                                     if mode in ('target', 'selection') else cargo_configuration())
 
 
 def joined_shell_lines(text):
@@ -9968,7 +10317,33 @@ def invocation_selection():
         target = targets[0] if targets else env.get('CARGO_BUILD_TARGET', cargo_config['build'].get('target', ''))
         if not isinstance(target, str) or (target and not re.fullmatch(r'[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+)+(?:\.[0-9.]+)?', target)):
             fail('Cargo target must be a literal target triple, not a dynamic or JSON target')
+        zigbuild = None
+        if '.' in target:
+            # cargo-zigbuild removes this GNU ABI suffix before invoking Cargo
+            # and rustc. It is not part of the Rust target or output directory
+            # (issue #37). Preserve its exact spelling as separate authority;
+            # never normalize an arbitrary Cargo command or malformed suffix.
+            matched = re.fullmatch(r'([A-Za-z0-9_]+(?:-[A-Za-z0-9_]+)*-linux-gnu)\.([0-9]+\.[0-9]+)', target)
+            if subcommand != 'zigbuild' or not targets or not matched:
+                fail('versioned targets require cargo zigbuild --target <GNU Rust triple>.<MAJOR.MINOR>')
+            rust_target, floor = matched.groups()
+            zigbuild = {'rust_target': rust_target, 'zig_target': target, 'glibc_floor': floor}
+            target = rust_target
+        elif subcommand == 'zigbuild':
+            # Python-first Zig discovery is also used for ordinary GNU and
+            # musl targets. Their linker must be the separately observed Zig,
+            # without inventing a glibc floor or rewriting the caller's argv.
+            if not target:
+                fail('explicit cargo zigbuild requires a literal target or configured CARGO_BUILD_TARGET')
+            zigbuild = {'rust_target': target, 'zig_target': target, 'glibc_floor': None}
+        if zigbuild is not None:
+            for name in ('CARGO_BUILD_TARGET', 'DSR_TARGET_TRIPLE'):
+                if os.environ.get(name) and os.environ[name] != target:
+                    fail('explicit Zig target contradicts the native task ' + name)
+                if env.get(name) != os.environ.get(name):
+                    fail('build_cmd cannot override the explicit Zig native task target environment')
         selection = {'toolchain': toolchain, 'target': target,
+                     'cargo_zigbuild': zigbuild,
                      'environment': {name: value for name, value in env.items() if influences(name)}}
         # An explicit + selector has higher priority than RUSTUP_TOOLCHAIN.
         selection['environment']['RUSTUP_TOOLCHAIN'] = toolchain or ''
@@ -9988,6 +10363,13 @@ def invocation_selection():
 
 selection, probe_env, explicit_toolchain, cargo_commands, assigned_environment = invocation_selection()
 
+if mode == 'selection':
+    # Coordinator-only intent, before staging or compiler lookup. The worker
+    # repeats this parser and must attest the generated dispatcher itself.
+    json.dump(selection['cargo_zigbuild'], sys.stdout, sort_keys=True)
+    sys.stdout.write('\n')
+    sys.exit(0)
+
 if mode == 'target':
     # This is a selection check, not executable or binary ABI attestation.
     # Never run the command: all task variants are checked before the first
@@ -10003,6 +10385,104 @@ if mode == 'target':
 
 
 cargo_effective_environment(cargo_config, cargo_config_receipts, probe_env)
+
+# Metadata runs ordinary locked/offline Cargo without compiling through Zig.
+# Every executable build/cache observation of an explicit Zig command instead
+# requires the controller-generated, hash-verified dispatcher below.
+if selection['cargo_zigbuild'] is not None and not zig_shim_dir and mode != 'metadata':
+    fail('explicit cargo zigbuild requires the generated DSR Cargo shim')
+
+
+# DSR's generated Zig launcher is an additional attested input, not
+# Cargo or a Rustup reference. Check it before any compiler version execution,
+# then perform normal executable identity checks under the PATH it delegates
+# to. The actual build retains the original PATH and therefore still goes
+# through cargo-zigbuild. An unknown script at this position never executes.
+zig_shim_record = None
+zig_shim_file = None
+zig_shim_parent = None
+
+
+def verify_zig_shim():
+    if zig_shim_record is None:
+        return
+    try:
+        zig_shim_file.seek(0)
+        observed = hashlib.sha256(zig_shim_file.read(65537)).hexdigest()
+        named = os.stat(zig_shim_path, follow_symlinks=False)
+        parent = os.stat(zig_shim_dir, follow_symlinks=False)
+        if (receipt_identity(zig_shim_before) != receipt_identity(os.fstat(zig_shim_file.fileno())) or
+                receipt_identity(zig_shim_before) != receipt_identity(named) or
+                (parent.st_dev, parent.st_ino) != (zig_shim_parent_before.st_dev, zig_shim_parent_before.st_ino) or
+                observed != zig_shim_hash or set(os.listdir(zig_shim_parent)) != {'cargo'}):
+            fail('generated DSR Cargo shim changed during toolchain observation')
+    except OSError as error:
+        fail('cannot verify generated DSR Cargo shim: ' + str(error))
+
+
+if zig_shim_dir:
+    try:
+        shim_directory = pathlib.Path(zig_shim_dir)
+        zig_shim_path = shim_directory / 'cargo'
+        path_entries = probe_env.get('PATH', '').split(os.pathsep)
+        if (path_entries[0] != zig_shim_dir or
+                shutil.which('cargo', path=probe_env.get('PATH')) != str(zig_shim_path)):
+            fail('generated DSR Cargo shim is not the selected first PATH entry')
+        if any(any(char in entry for char in '*?[') for entry in path_entries):
+            fail('globbed PATH entries are outside generated DSR Cargo shim attestation')
+        # Match POSIX IFS splitting and the launcher's concatenation exactly:
+        # one trailing empty field is dropped by shell field splitting;
+        # initial empties collapse, but later empties retain current-directory
+        # lookup. Dropping those would attest a different Cargo or plugin.
+        split_entries = path_entries[:-1] if path_entries[-1] == '' else path_entries
+        delegated_path = ''
+        for entry in split_entries:
+            if entry != zig_shim_dir:
+                delegated_path += (os.pathsep if delegated_path else '') + entry
+        if any(pathlib.Path(entry).resolve() == shim_directory.resolve()
+               for entry in delegated_path.split(os.pathsep) if entry):
+            fail('recursive alias of generated DSR Cargo shim directory on PATH')
+        if any(probe_env.get(name) != os.environ.get(name) for name in (
+                'DSR_RUST_TARGET', 'DSR_ZIG_TARGET', 'DSR_LINUX_GLIBC_FLOOR')):
+            fail('build_cmd cannot override generated DSR Cargo shim target selection')
+        zig_overrides = sorted(name for name in (
+            'CARGO_ZIGBUILD_ZIG_COMMAND', 'CARGO_ZIGBUILD_ZIG_COMMAND_ARGS',
+            'CARGO_ZIGBUILD_PYTHON_PATH', 'CARGO_ZIGBUILD_ZIG_PATH',
+            'CARGO_ZIGBUILD_ZIG_VERSION') if name in probe_env)
+        if zig_overrides:
+            fail('generated DSR Cargo shim does not accept Zig dispatch overrides: ' +
+                 ', '.join(zig_overrides))
+        floor = probe_env.get('DSR_LINUX_GLIBC_FLOOR', '')
+        explicit_zig = selection['cargo_zigbuild']
+        unversioned_zig = explicit_zig is not None and explicit_zig['glibc_floor'] is None
+        expected_zig_target = selection['target'] if unversioned_zig else selection['target'] + '.' + floor
+        if (probe_env.get('DSR_RUST_TARGET') != selection['target'] or
+                probe_env.get('DSR_ZIG_TARGET') != expected_zig_target or
+                (unversioned_zig and floor) or
+                (not unversioned_zig and (not re.fullmatch(r'[0-9]+\.[0-9]+', floor) or
+                                         not selection['target'].endswith('-linux-gnu')))):
+            fail('generated DSR Cargo shim target/floor does not match the admitted build')
+        if 'zigbuild' in cargo_commands and explicit_zig != {
+                'rust_target': selection['target'], 'zig_target': probe_env['DSR_ZIG_TARGET'],
+                'glibc_floor': floor or None}:
+            fail('explicit Zig target/floor does not match the generated DSR Cargo shim')
+        zig_shim_parent = os.open(shim_directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        zig_shim_parent_before = os.fstat(zig_shim_parent)
+        fd = os.open('cargo', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=zig_shim_parent)
+        zig_shim_file = os.fdopen(fd, 'rb')
+        zig_shim_before = os.fstat(zig_shim_file.fileno())
+        if (not stat.S_ISREG(zig_shim_before.st_mode) or
+                zig_shim_before.st_uid != os.geteuid() or
+                zig_shim_before.st_mode & 0o022 or not os.access(zig_shim_path, os.X_OK) or
+                zig_shim_before.st_size > 65536 or
+                hashlib.sha256(zig_shim_file.read(65537)).hexdigest() != zig_shim_hash):
+            fail('generated DSR Cargo shim does not match the trusted generator bytes or ownership')
+        zig_shim_record = {'program': 'cargo', 'selected_path': str(zig_shim_path),
+                           'selected_sha256': zig_shim_hash, 'selected_kind': 'script', 'version': ''}
+        verify_zig_shim()
+        probe_env['PATH'] = delegated_path
+    except (OSError, RuntimeError) as error:
+        fail('cannot admit generated DSR Cargo shim: ' + str(error))
 
 
 def run(argv, required=True, timeout=60):
@@ -10240,6 +10720,8 @@ cargo_version_args = (['+' + selection['toolchain']] if explicit_toolchain else 
 compiler = probe_env.get('RUSTC') or probe_env.get('CARGO_BUILD_RUSTC') or cargo_config['build'].get('rustc') or 'rustc'
 tools = {'cargo': identity('cargo', 'cargo', cargo_version_args, 'cargo'),
          'rustc': identity('rustc', compiler, ['-vV'], 'rustc')}
+if zig_shim_record is not None:
+    tools['dsr_cargo_shim'] = zig_shim_record
 if not triple:
     triple = next((line.split(': ', 1)[1] for line in tools['rustc']['version'].splitlines()
                    if line.startswith('host: ')), '')
@@ -10264,21 +10746,33 @@ if default_linker:
 # the build through (cargo-zigbuild and zig for the portable glibc floor).
 plugins = set(cargo_commands)
 plugins.update(name[len('cargo-'):] for name in extra.split() if name.startswith('cargo-'))
+if zig_shim_record is not None:
+    plugins.add('zigbuild')
 for sub in sorted(plugins):
     program = 'cargo-' + sub
+    if zig_shim_record is not None and sub == 'zigbuild' and not shutil.which(program, path=probe_env.get('PATH')):
+        fail('generated DSR Cargo shim requires cargo-zigbuild on the delegated PATH')
     if shutil.which(program, path=probe_env.get('PATH')):
         tools[program] = identity(program, program, ['--version'], program, required=False)
-for name in sorted(set(extra.split())):
+for name in sorted(set(extra.split()) | ({'zig'} if zig_shim_record is not None else set())):
     if not name.startswith('cargo-') and name not in tools:
-        record = identity(name, name, ['version' if name == 'zig' else '--version'], required=False)
+        record = identity(name, name, ['version' if name == 'zig' else '--version'],
+                          required=zig_shim_record is not None and name == 'zig')
         if record:
             tools[name] = record
+verify_zig_shim()
 result = {'schema_version': 1, 'cwd': os.getcwd(), 'target_triple': triple,
           'linker_variable': linker_variable if probe_env.get(linker_variable) else None, 'tools': tools,
           'selection': {'rustup_toolchain': selection['toolchain'],
                         'cargo_commands': cargo_commands,
                         'cargo_config': cargo_config_receipts,
                         'cargo_target': cargo_target_receipt}}
+if zig_shim_record is not None:
+    result['selection']['dsr_cargo_shim'] = {
+        'rust_target': probe_env['DSR_RUST_TARGET'], 'zig_target': probe_env['DSR_ZIG_TARGET'],
+        'glibc_floor': probe_env.get('DSR_LINUX_GLIBC_FLOOR') or None}
+if selection['cargo_zigbuild'] is not None:
+    result['selection']['cargo_zigbuild'] = selection['cargo_zigbuild']
 
 # Metadata admission uses the same cfg/compiler validation as the build.
 if mode == 'metadata':
@@ -10288,6 +10782,7 @@ if mode == 'metadata':
                                   timeout=300))
     except ValueError as error:
         fail('invalid selected Cargo metadata: ' + str(error))
+    verify_zig_shim()
     json.dump(metadata, sys.stdout, sort_keys=True)
     sys.stdout.write('\n')
     sys.exit(0)
@@ -10384,8 +10879,26 @@ _act_validate_native_target_command() {
     done <<< "$build_env"
     script=$(_act_toolchain_identity_script target /dev/null "$build_cmd") || return 4
     local actual
-    actual=$(env -i "${pairs[@]}" "$BASH" -c "$script") || return 4
+    # The configured environment belongs to the worker. In particular its
+    # BASH_ENV must remain data, never a coordinator startup program.
+    actual=$(env -i "${pairs[@]}" "$BASH" -p -c "$script") || return 4
     [[ "$actual" == "$selected_triple" ]] || return 4
+}
+
+# Read only the explicit Zig invocation on the coordinator; an unversioned
+# target retains a null glibc floor. No
+# local Cargo configuration or executable is consulted; worker observation
+# repeats the selection and authenticates the staged shim before dispatch.
+_act_explicit_zigbuild_selection() {
+    local build_cmd="$1" build_env="$2" script pair
+    local -a pairs=()
+    while IFS= read -r pair; do
+        [[ -z "$pair" ]] && continue
+        [[ "$pair" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || return 4
+        pairs+=("$pair")
+    done <<< "$build_env"
+    script=$(_act_toolchain_identity_script selection /dev/null "$build_cmd") || return 4
+    env -i "${pairs[@]}" "$BASH" -p -c "$script"
 }
 
 # Run native build on remote host via SSH
@@ -10437,6 +10950,19 @@ _act_stage_cleanup_on_signal() {
         _act_remove_build_stage_root "$_ACT_SIGNAL_STAGE_HOST" "$stage_root" 2>/dev/null
     done
     exit "$signal_status"
+}
+
+# Retain native execution boundaries in the attempt's private log. These are
+# coordinator observations: dispatching the final program does not prove that
+# Cargo or a compiler started, and a command returning 124 does not by itself
+# establish that a watchdog expired. Callers keep these diagnostic writes best
+# effort so a log write failure cannot bypass the ordinary stage cleanup.
+_act_log_native_execution() {
+    local log_file="$1" event="$2" phase="$3" timeout_seconds="$4"
+    local transport_timeout_seconds="$5" command_exit_code="$6" dispatched="$7"
+    printf '[dsr] native_execution phase=%s event=%s timeout_seconds=%s transport_timeout_seconds=%s command_exit_code=%s build_program_dispatched=%s\n' \
+        "$phase" "$event" "$timeout_seconds" "$transport_timeout_seconds" \
+        "$command_exit_code" "$dispatched" | tee -a "$log_file" >&2
 }
 
 act_run_native_build() {
@@ -10673,6 +11199,7 @@ act_run_native_build() {
     local strict_private_cargo_cache=false strict_cargo_seed_json='null' strict_toolchain_receipt=""
     local strict_toolchain_record_cmd="" strict_toolchain_run_prefix="" strict_toolchain_effective_build=""
     local strict_toolchain_extra="" strict_toolchain_pin_json="" strict_toolchain_identity_json=""
+    local strict_toolchain_shim_dir=""
     local strict_cargo_context_json='null' strict_dependency_sources_json='null' strict_windows_toolchain_json='null'
     local strict_sources_verification=""
     local build_influence_env_json='{}'
@@ -10683,6 +11210,19 @@ act_run_native_build() {
     local nonstrict_sibling_relatives=()
     if [[ "$language" == "rust" && -n "$remote_path_override" ]]; then
         strict_rust_build=true
+        if ! _act_is_windows_host "$host"; then
+            local explicit_zig_selection
+            explicit_zig_selection=$(_act_explicit_zigbuild_selection "$build_cmd" "$build_env") || return 4
+            if [[ "$explicit_zig_selection" != null ]]; then
+                rust_floor_triple=$(jq -er '.rust_target' <<< "$explicit_zig_selection") || return 4
+                rust_zig_target=$(jq -er '.zig_target' <<< "$explicit_zig_selection") || return 4
+                rust_glibc_floor=$(jq -er '.glibc_floor // ""' <<< "$explicit_zig_selection") || return 4
+                build_env+=$'\n'"DSR_RUST_TARGET=$rust_floor_triple"
+                build_env+=$'\n'"DSR_ZIG_TARGET=$rust_zig_target"
+                build_env+=$'\n'"DSR_LINUX_GLIBC_FLOOR=$rust_glibc_floor"
+                _log_info "Attesting explicit cargo zigbuild target $rust_zig_target with the generated Zig dispatcher"
+            fi
+        fi
         if [[ -n "$release_git_sha" || -n "$release_git_ref" ]]; then
             if [[ ! "$release_git_sha" =~ ^[0-9a-f]{40}$ || \
                   "$release_git_sha" =~ ^0{40}$ || \
@@ -11448,23 +11988,27 @@ EOF
         # sibling names may not start with a dot.
         # A strict build must leave its source snapshot byte-identical, so its
         # shim lives in the snapshot parent beside .cargo-home and the
-        # per-platform target directories, named per platform so concurrent
-        # targets of one snapshot never share (or race on) a shim.
+        # per-target directories. Include the selected variant so GNU and
+        # musl tasks of one platform never share (or race on) a shim.
         if [[ -n "$rust_zig_target" ]]; then
             local zig_shim_dir=""
             if $nonstrict_rust_isolate; then
                 zig_shim_dir="${nonstrict_stage_root}/.dsr-bin"
             elif $strict_rust_build; then
-                zig_shim_dir="${remote_path%/*}/.dsr-bin-${platform//\//-}"
+                zig_shim_dir="${remote_path%/*}/.dsr-bin-${native_target_slug}"
             fi
             if [[ -n "$zig_shim_dir" ]]; then
                 cargo_home_prefix+=$(_act_zig_shim_prefix_sh "$zig_shim_dir")
                 env_exports+="export PATH='${zig_shim_dir}':\"\$PATH\"; "
+                if $strict_rust_build; then
+                    strict_toolchain_shim_dir="$zig_shim_dir"
+                fi
             fi
         fi
         local effective_build="$build_cmd"
         if [[ -n "$strict_cache_root" ]]; then
-            effective_build=$(_act_strict_cargo_cache_script "$strict_cache_root" "$strict_cache_contract" "$build_cmd") || return 4
+            effective_build=$(_act_strict_cargo_cache_script "$strict_cache_root" "$strict_cache_contract" "$build_cmd" \
+                "$strict_toolchain_shim_dir") || return 4
         fi
         if [[ -n "$strict_toolchain_receipt" ]]; then
             # Keep the original observation at the coordinator, outside the
@@ -11473,7 +12017,8 @@ EOF
             local toolchain_record
             [[ -n "$rust_zig_target" ]] && strict_toolchain_extra="cargo-zigbuild zig"
             toolchain_record=$(_act_toolchain_identity_script record \
-                "$strict_toolchain_receipt" "$build_cmd" "$strict_toolchain_extra" "" "$remote_path") || return 4
+                "$strict_toolchain_receipt" "$build_cmd" "$strict_toolchain_extra" "" "$remote_path" \
+                "$strict_toolchain_shim_dir") || return 4
             strict_toolchain_record_cmd="set -e; $cargo_home_prefix$cd_cmd; $env_exports$toolchain_record"$'\n'
             strict_toolchain_run_prefix="set -e; $cd_cmd; $env_exports"
             strict_toolchain_effective_build="$effective_build"
@@ -11533,6 +12078,8 @@ EOF
     # Ordinary Rust builds: create the stage root with a private copy of
     # the dependency caches before the build command runs (issue #15).
     local exit_code=0
+    local native_execution_phase="" native_execution_timeout=null native_execution_transport_timeout=null
+    local native_execution_exit=null native_execution_failure_kind="" native_build_program_dispatched=false
     local nonstrict_private_cargo_cache=false nonstrict_cargo_seed_json="" nonstrict_seed_home=""
     local cargo_finish=_act_finish_unix_private_cargo_home
     _act_is_windows_host "$host" && cargo_finish=_act_finish_windows_private_cargo_home
@@ -11545,11 +12092,11 @@ EOF
         fi
         if _act_is_windows_host "$host"; then
             nonstrict_cargo_seed_json=$("$nonstrict_prepare" "$host" \
-                "$nonstrict_prepare_root" "$nonstrict_stage_root" "$nonstrict_cargo_home" 2>"$log_file") || \
+                "$nonstrict_prepare_root" "$nonstrict_stage_root" "$nonstrict_cargo_home" 2>>"$log_file") || \
                 nonstrict_prepare_status=$?
         else
             nonstrict_cargo_seed_json=$("$nonstrict_prepare" "$host" \
-                "$nonstrict_prepare_root" "$nonstrict_stage_root" "$nonstrict_cargo_home" "$remote_path" 2>"$log_file") || \
+                "$nonstrict_prepare_root" "$nonstrict_stage_root" "$nonstrict_cargo_home" "$remote_path" 2>>"$log_file") || \
                 nonstrict_prepare_status=$?
         fi
         [[ -s "$log_file" ]] && cat "$log_file" >&2
@@ -11565,18 +12112,40 @@ EOF
     fi
 
     if [[ $exit_code -eq 0 && -n "$strict_sources_verification" ]]; then
-        _act_ssh_exec "$host" "$strict_sources_verification" "$_ACT_SYNC_TIMEOUT" 2>&1 | tee "$log_file"
+        native_execution_phase=source_verification
+        native_execution_timeout="$_ACT_SYNC_TIMEOUT"
+        native_execution_transport_timeout="$_ACT_SYNC_TIMEOUT"
+        _act_log_native_execution "$log_file" start "$native_execution_phase" \
+            "$native_execution_timeout" "$native_execution_transport_timeout" null false || true
+        _act_ssh_exec "$host" "$strict_sources_verification" "$_ACT_SYNC_TIMEOUT" 2>&1 | tee -a "$log_file" >&2
         exit_code=${PIPESTATUS[0]}
+        native_execution_exit="$exit_code"
+        [[ $exit_code -eq 0 ]] || native_execution_failure_kind="command"
+        _act_log_native_execution "$log_file" finish "$native_execution_phase" \
+            "$native_execution_timeout" "$native_execution_transport_timeout" "$native_execution_exit" false || true
     fi
 
     if [[ $exit_code -eq 0 && -n "$strict_toolchain_record_cmd" ]]; then
-        local toolchain_observation_json toolchain_verify
+        local toolchain_observation_json toolchain_observation_raw toolchain_verify
+        local toolchain_observation_status=0
         # Source authentication precedes this actual observation. The build
         # re-probes in its own execution shell before AND after the compiler;
         # a new login-shell selection must match the coordinator-held baseline.
-        if toolchain_observation_json=$(_act_ssh_exec "$host" "$strict_toolchain_record_cmd" \
-                "$_ACT_SYNC_TIMEOUT" 2> >(tee -a "$log_file" >&2)) && \
-           toolchain_observation_json=$(jq -ce --arg target "$selected_triple" '
+        native_execution_phase=toolchain_observation
+        native_execution_timeout="$_ACT_SYNC_TIMEOUT"
+        native_execution_transport_timeout="$_ACT_SYNC_TIMEOUT"
+        _act_log_native_execution "$log_file" start "$native_execution_phase" \
+            "$native_execution_timeout" "$native_execution_transport_timeout" null false || true
+        toolchain_observation_raw=$(_act_ssh_exec "$host" "$strict_toolchain_record_cmd" \
+            "$_ACT_SYNC_TIMEOUT" 2> >(tee -a "$log_file" >&2)) || toolchain_observation_status=$?
+        native_execution_exit="$toolchain_observation_status"
+        _act_log_native_execution "$log_file" finish "$native_execution_phase" \
+            "$native_execution_timeout" "$native_execution_transport_timeout" "$native_execution_exit" false || true
+        if [[ $toolchain_observation_status -ne 0 ]]; then
+            native_execution_failure_kind="command"
+            exit_code="$toolchain_observation_status"
+            _log_error "Toolchain observation returned $toolchain_observation_status; refusing compiler launch"
+        elif toolchain_observation_json=$(jq -ce --arg target "$selected_triple" '
                 select(type == "object" and
                     (.pin | type == "object" and (keys | sort) == ["identity", "sha256"] and
                         (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
@@ -11591,16 +12160,21 @@ EOF
                             (.selected_path | type == "string" and startswith("/")) and
                             (.selected_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
                             (.version | type == "string" and length > 0)))))
-            ' <<< "$toolchain_observation_json") && \
+            ' <<< "$toolchain_observation_raw") && \
            strict_toolchain_pin_json=$(jq -c '.pin' <<< "$toolchain_observation_json") && \
            strict_toolchain_identity_json=$(jq -c '.identity' <<< "$toolchain_observation_json") && \
            toolchain_verify=$(_act_toolchain_identity_script verify "$strict_toolchain_receipt" \
-                "$build_cmd" "$strict_toolchain_extra" "$strict_toolchain_pin_json" "$remote_path"); then
+                "$build_cmd" "$strict_toolchain_extra" "$strict_toolchain_pin_json" "$remote_path" \
+                "$strict_toolchain_shim_dir"); then
             # Restore heredoc terminator newlines dropped by command substitution.
             remote_cmd="$strict_toolchain_run_prefix$toolchain_verify"$'\n'"$strict_toolchain_effective_build"$'\n'"$toolchain_verify"$'\n'
         else
             _log_error "Original toolchain observation or receipt pin invalid; refusing compiler launch"
+            native_execution_failure_kind=validation
             exit_code=4
+        fi
+        if [[ $exit_code -ne 0 && -n "$toolchain_observation_raw" ]]; then
+            printf '%s\n' "$toolchain_observation_raw" | tee -a "$log_file" >&2
         fi
     fi
 
@@ -11614,6 +12188,11 @@ EOF
             guarded_build_status=$?
         if [[ $guarded_build_status -ne 0 ]]; then
             exit_code=$guarded_build_status
+            native_execution_phase=build_preparation
+            native_execution_timeout=null
+            native_execution_transport_timeout=null
+            native_execution_exit=null
+            native_execution_failure_kind=validation
         else
             build_transport_timeout=$((_ACT_BUILD_TIMEOUT + 10))
         fi
@@ -11631,71 +12210,177 @@ EOF
     # Execute on remote host
     # Use PIPESTATUS to capture the actual command exit code, not tee's
     if [[ $exit_code -eq 0 ]]; then
-        if $nonstrict_private_cargo_cache || [[ -n "$strict_toolchain_record_cmd" ]]; then
-            _act_ssh_exec "$host" "$remote_cmd" "$build_transport_timeout" 2>&1 | tee -a "$log_file"
-        else
-            _act_ssh_exec "$host" "$remote_cmd" "$build_transport_timeout" 2>&1 | tee "$log_file"
-        fi
+        native_execution_phase=build_execution
+        native_execution_timeout="$_ACT_BUILD_TIMEOUT"
+        native_execution_transport_timeout="$build_transport_timeout"
+        native_build_program_dispatched=true
+        _act_log_native_execution "$log_file" start "$native_execution_phase" \
+            "$native_execution_timeout" "$native_execution_transport_timeout" null true || true
+        _act_ssh_exec "$host" "$remote_cmd" "$build_transport_timeout" 2>&1 | tee -a "$log_file" >&2
         exit_code=${PIPESTATUS[0]}
+        native_execution_exit="$exit_code"
+        [[ $exit_code -eq 0 ]] || native_execution_failure_kind="command"
+        _act_log_native_execution "$log_file" finish "$native_execution_phase" \
+            "$native_execution_timeout" "$native_execution_transport_timeout" "$native_execution_exit" true || true
     fi
+    # A rejected final receipt must not replace the valid preparation record:
+    # the failure result still needs that record to emit its diagnostic JSON.
+    local verified_cargo_isolation_json
     if [[ $exit_code -eq 0 ]] && $nonstrict_private_cargo_cache; then
-        local nonstrict_cargo_final_json nonstrict_cargo_seed_digest
+        local nonstrict_cargo_final_json nonstrict_cargo_seed_digest nonstrict_cargo_finish_result
+        local nonstrict_cargo_finish_status=null nonstrict_cargo_command_exit=null
         nonstrict_cargo_seed_digest=$(jq -er '.receipt_sha256' <<< "$nonstrict_cargo_seed_json") || exit_code=4
-        if [[ $exit_code -eq 0 ]] && \
-           nonstrict_cargo_final_json=$("$cargo_finish" \
-               "$host" "$nonstrict_seed_home" "$nonstrict_cargo_seed_digest"); then
-            cargo_isolation_json=$(jq --argjson final "$nonstrict_cargo_final_json" \
-                '.dependency_cache.final = $final' <<< "$cargo_isolation_json") || exit_code=4
-        else
+        if [[ $exit_code -eq 0 ]]; then
+            _act_log_native_execution "$log_file" start cargo_final_verification \
+                "$_ACT_SYNC_TIMEOUT" "$_ACT_SYNC_TIMEOUT" null true || true
+            nonstrict_cargo_finish_status=0
+            nonstrict_cargo_finish_result=$("$cargo_finish" --native-execution \
+                "$host" "$nonstrict_seed_home" "$nonstrict_cargo_seed_digest" \
+                2> >(tee -a "$log_file" >&2)) || nonstrict_cargo_finish_status=$?
+            if ! nonstrict_cargo_command_exit=$(jq -er '
+                    .command_exit_code | select(type == "number" and floor == . and . >= 0 and . <= 255)
+                ' <<< "$nonstrict_cargo_finish_result" 2>/dev/null); then
+                nonstrict_cargo_command_exit=null
+                [[ $nonstrict_cargo_finish_status -ne 0 ]] || nonstrict_cargo_finish_status=4
+            fi
+            _act_log_native_execution "$log_file" finish cargo_final_verification \
+                "$_ACT_SYNC_TIMEOUT" "$_ACT_SYNC_TIMEOUT" "$nonstrict_cargo_command_exit" true || true
+            if [[ $nonstrict_cargo_finish_status -eq 0 ]]; then
+                if nonstrict_cargo_final_json=$(jq -ce '.receipt | select(type == "object")' \
+                        <<< "$nonstrict_cargo_finish_result") && \
+                   verified_cargo_isolation_json=$(jq --argjson final "$nonstrict_cargo_final_json" \
+                        '.dependency_cache.final = $final' <<< "$cargo_isolation_json"); then
+                    cargo_isolation_json="$verified_cargo_isolation_json"
+                else
+                    exit_code=4
+                fi
+            else
+                exit_code="$nonstrict_cargo_finish_status"
+            fi
+        fi
+        if [[ $exit_code -ne 0 ]]; then
             _log_error "Private Cargo cache failed final verification; refusing artifact collection"
-            exit_code=4
+            native_execution_phase=cargo_final_verification
+            native_execution_timeout="$_ACT_SYNC_TIMEOUT"
+            native_execution_transport_timeout="$_ACT_SYNC_TIMEOUT"
+            native_execution_exit="$nonstrict_cargo_command_exit"
+            native_execution_failure_kind=validation
+            [[ "$nonstrict_cargo_command_exit" == null || "$nonstrict_cargo_command_exit" == 0 ]] || \
+                native_execution_failure_kind="command"
         fi
     fi
     if [[ $exit_code -eq 0 ]] && $strict_private_cargo_cache; then
-        local strict_cargo_final_json strict_cargo_seed_digest
+        local strict_cargo_final_json strict_cargo_seed_digest strict_cargo_finish_result
+        local strict_cargo_finish_status=null strict_cargo_command_exit=null
         strict_cargo_seed_digest=$(jq -er '.receipt_sha256' <<< "$strict_cargo_seed_json") || exit_code=4
         local strict_cargo_finish_args=("$host" "$strict_cargo_home" "$strict_cargo_seed_digest")
         strict_cargo_finish_args+=("$remote_path" "$strict_dependency_sources_json")
         if _act_is_windows_host "$host"; then
             strict_cargo_finish_args+=("$build_cmd" "$build_env" "$strict_cargo_context_json")
         fi
-        if [[ $exit_code -eq 0 ]] && \
-           strict_cargo_final_json=$("$cargo_finish" "${strict_cargo_finish_args[@]}"); then
-            cargo_isolation_json=$(jq --argjson final "$strict_cargo_final_json" \
-                '.dependency_cache.final = $final' <<< "$cargo_isolation_json") || exit_code=4
-        else
+        if [[ $exit_code -eq 0 ]]; then
+            _act_log_native_execution "$log_file" start cargo_final_verification \
+                "$_ACT_SYNC_TIMEOUT" "$_ACT_SYNC_TIMEOUT" null true || true
+            strict_cargo_finish_status=0
+            strict_cargo_finish_result=$("$cargo_finish" --native-execution "${strict_cargo_finish_args[@]}" \
+                2> >(tee -a "$log_file" >&2)) || strict_cargo_finish_status=$?
+            if ! strict_cargo_command_exit=$(jq -er '
+                    .command_exit_code | select(type == "number" and floor == . and . >= 0 and . <= 255)
+                ' <<< "$strict_cargo_finish_result" 2>/dev/null); then
+                strict_cargo_command_exit=null
+                [[ $strict_cargo_finish_status -ne 0 ]] || strict_cargo_finish_status=4
+            fi
+            _act_log_native_execution "$log_file" finish cargo_final_verification \
+                "$_ACT_SYNC_TIMEOUT" "$_ACT_SYNC_TIMEOUT" "$strict_cargo_command_exit" true || true
+            if [[ $strict_cargo_finish_status -eq 0 ]]; then
+                if strict_cargo_final_json=$(jq -ce '.receipt | select(type == "object")' \
+                        <<< "$strict_cargo_finish_result") && \
+                   verified_cargo_isolation_json=$(jq --argjson final "$strict_cargo_final_json" \
+                        '.dependency_cache.final = $final' <<< "$cargo_isolation_json"); then
+                    cargo_isolation_json="$verified_cargo_isolation_json"
+                else
+                    exit_code=4
+                fi
+            else
+                exit_code="$strict_cargo_finish_status"
+            fi
+        fi
+        if [[ $exit_code -ne 0 ]]; then
             _log_error "Strict Cargo cache or dependency sources failed final verification; refusing artifact collection"
-            exit_code=4
+            native_execution_phase=cargo_final_verification
+            native_execution_timeout="$_ACT_SYNC_TIMEOUT"
+            native_execution_transport_timeout="$_ACT_SYNC_TIMEOUT"
+            native_execution_exit="$strict_cargo_command_exit"
+            native_execution_failure_kind=validation
+            [[ "$strict_cargo_command_exit" == null || "$strict_cargo_command_exit" == 0 ]] || \
+                native_execution_failure_kind="command"
         fi
     fi
     if [[ $exit_code -eq 0 && -n "$strict_toolchain_receipt" ]]; then
         # Never let a post-build pathname read redefine the pre-build baseline.
         # Secure collection requires the original held byte/inode pin and the
         # exact original observation, including cwd and selected target.
-        local toolchain_identity_json="" toolchain_read
+        local toolchain_identity_json="" toolchain_read toolchain_read_status=null
         if toolchain_read=$(_act_toolchain_identity_script read "$strict_toolchain_receipt" \
-                "$build_cmd" "$strict_toolchain_extra" "$strict_toolchain_pin_json" "$remote_path") && \
-           toolchain_identity_json=$(_act_ssh_exec "$host" "$toolchain_read"$'\n' 30) && \
-           cargo_isolation_json=$(_act_bind_toolchain_identity "$cargo_isolation_json" \
-                "$strict_toolchain_identity_json" "$toolchain_identity_json"); then
-            :
+                "$build_cmd" "$strict_toolchain_extra" "$strict_toolchain_pin_json" "$remote_path"); then
+            _act_log_native_execution "$log_file" start toolchain_final_verification 30 30 null true || true
+            toolchain_read_status=0
+            toolchain_identity_json=$(_act_ssh_exec "$host" "$toolchain_read"$'\n' 30 \
+                2> >(tee -a "$log_file" >&2)) || toolchain_read_status=$?
+            _act_log_native_execution "$log_file" finish toolchain_final_verification 30 30 "$toolchain_read_status" true || true
+            if [[ $toolchain_read_status -eq 0 ]]; then
+                if verified_cargo_isolation_json=$(_act_bind_toolchain_identity "$cargo_isolation_json" \
+                        "$strict_toolchain_identity_json" "$toolchain_identity_json"); then
+                    cargo_isolation_json="$verified_cargo_isolation_json"
+                else
+                    exit_code=4
+                fi
+            else
+                exit_code="$toolchain_read_status"
+            fi
         else
-            _log_error "Strict toolchain identity receipt missing or invalid; refusing artifact collection"
             exit_code=4
+        fi
+        if [[ $exit_code -ne 0 ]]; then
+            _log_error "Strict toolchain identity receipt missing or invalid; refusing artifact collection"
+            native_execution_phase=toolchain_final_verification
+            native_execution_timeout=30
+            native_execution_transport_timeout=30
+            native_execution_exit="$toolchain_read_status"
+            native_execution_failure_kind=validation
+            [[ "$toolchain_read_status" == null || "$toolchain_read_status" == 0 ]] || \
+                native_execution_failure_kind="command"
         fi
     fi
     if [[ $exit_code -eq 0 && -n "$strict_cache_root" ]]; then
-        local cache_receipt
-        if cache_receipt=$(_act_ssh_exec "$host" \
-                "cat '${strict_cargo_target_dir}.cache-receipt.json'" 30) && \
-           jq -e '.namespace | test("^[0-9a-f]{64}$")' <<< "$cache_receipt" >/dev/null && \
+        local cache_receipt cache_receipt_status=0
+        _act_log_native_execution "$log_file" start cache_receipt_verification 30 30 null true || true
+        cache_receipt=$(_act_ssh_exec "$host" \
+            "cat '${strict_cargo_target_dir}.cache-receipt.json'" 30 \
+            2> >(tee -a "$log_file" >&2)) || cache_receipt_status=$?
+        _act_log_native_execution "$log_file" finish cache_receipt_verification 30 30 "$cache_receipt_status" true || true
+        if [[ $cache_receipt_status -ne 0 ]]; then
+            exit_code="$cache_receipt_status"
+        elif jq -e '.namespace | test("^[0-9a-f]{64}$")' <<< "$cache_receipt" >/dev/null && \
            jq -e '.final_output_policy == "fresh-run-target-detached-under-custody"' \
                 <<< "$cache_receipt" >/dev/null; then
-            cargo_isolation_json=$(jq --argjson receipt "$cache_receipt" \
-                '.intermediate_cache.receipt = $receipt' <<< "$cargo_isolation_json") || exit_code=4
+            if verified_cargo_isolation_json=$(jq --argjson receipt "$cache_receipt" \
+                    '.intermediate_cache.receipt = $receipt' <<< "$cargo_isolation_json"); then
+                cargo_isolation_json="$verified_cargo_isolation_json"
+            else
+                exit_code=4
+            fi
         else
-            _log_error "Strict Cargo cache receipt missing or invalid; refusing artifact collection"
             exit_code=4
+        fi
+        if [[ $exit_code -ne 0 ]]; then
+            _log_error "Strict Cargo cache receipt missing or invalid; refusing artifact collection"
+            native_execution_phase=cache_receipt_verification
+            native_execution_timeout=30
+            native_execution_transport_timeout=30
+            native_execution_exit="$cache_receipt_status"
+            native_execution_failure_kind=validation
+            [[ $cache_receipt_status -eq 0 ]] || native_execution_failure_kind="command"
         fi
     fi
 
@@ -11715,6 +12400,7 @@ EOF
 
     # Determine result
     local status local_artifact_path="" local_artifact_paths=()
+    local native_execution_error=""
     local additional_artifact_receipts=()
     local collected_sha256="" collected_size_bytes=0 collected_identity=""
     local strict_collection_receipts=()
@@ -11790,12 +12476,13 @@ EOF
             local artifact_filename
             artifact_filename=$(basename "$remote_artifact_path")
             local this_artifact_path="$artifact_dir/$artifact_filename"
-            local ordinary_member_collected=false workspace_member_receipt=""
+            local member_collected=false workspace_member_receipt=""
+            local collection_receipt="" collection_mode=""
 
             _log_info "Downloading artifact: ${host}:${remote_artifact_path}"
             local scp_output
             if $strict_native_build; then
-                local collection_receipt="" collection_mode=700
+                collection_mode=700
                 [[ "$platform" == windows/* ]] && collection_mode=600
                 if _act_is_local_host "$host"; then
                     local copy_src="$remote_artifact_path"
@@ -11855,6 +12542,7 @@ EOF
                     if _act_collected_glibc_within_floor "$this_artifact_path" "$rust_glibc_floor_enforced"; then
                         local_artifact_paths+=("$this_artifact_path")
                         strict_collection_receipts+=("$collection_receipt")
+                        member_collected=true
                     else
                         echo "Collected artifact exceeds glibc floor $rust_glibc_floor_enforced: $this_artifact_path" >> "$log_file"
                         download_failed=true
@@ -11895,7 +12583,7 @@ EOF
                     fi
                     if _act_accept_collected_binary "$this_artifact_path" "$platform" "$language" "$rust_glibc_floor_enforced"; then
                         local_artifact_paths+=("$this_artifact_path")
-                        ordinary_member_collected=true
+                        member_collected=true
                     else
                         echo "Collected artifact failed $platform validation: $this_artifact_path" >> "$log_file"
                         download_failed=true
@@ -11917,7 +12605,7 @@ EOF
                 fi
                 if _act_accept_collected_binary "$this_artifact_path" "$platform" "$language" "$rust_glibc_floor_enforced"; then
                     local_artifact_paths+=("$this_artifact_path")
-                    ordinary_member_collected=true
+                    member_collected=true
                 else
                     echo "Collected artifact failed $platform validation: $this_artifact_path" >> "$log_file"
                     download_failed=true
@@ -11945,7 +12633,7 @@ EOF
                         fi
                         if _act_accept_collected_binary "$this_artifact_path" "$platform" "$language" "$rust_glibc_floor_enforced"; then
                             local_artifact_paths+=("$this_artifact_path")
-                            ordinary_member_collected=true
+                            member_collected=true
                         else
                             echo "Collected artifact failed $platform validation: $this_artifact_path" >> "$log_file"
                             download_failed=true
@@ -11965,9 +12653,10 @@ EOF
                     download_failed=true
                 fi
             fi
-            if $ordinary_member_collected && [[ -n "$workspace_binaries" ]]; then
+            if $member_collected && [[ -n "$workspace_binaries" ]]; then
                 if workspace_member_receipt=$(_act_workspace_member_receipt \
-                        "$artifact_dir" "$artifact_filename"); then
+                        "$artifact_dir" "$artifact_filename" \
+                        "$collection_receipt" "$collection_mode"); then
                     workspace_member_receipts+=("$workspace_member_receipt")
                 else
                     _log_error "Unable to freeze collected workspace member: $this_artifact_path"
@@ -12024,7 +12713,14 @@ EOF
             if $coordinator_windows_family && \
                [[ "$archive_file" == verify-components.sh || \
                   "$archive_file" == ft-windows-amd64.component-manifest.json ]]; then
-                local_artifact_paths+=("$artifact_dir/$archive_file")
+                if archive_file_receipt=$(_act_workspace_member_receipt \
+                        "$artifact_dir" "$archive_file"); then
+                    local_artifact_paths+=("$artifact_dir/$archive_file")
+                    workspace_member_receipts+=("$archive_file_receipt")
+                else
+                    _log_error "Unable to freeze coordinator workspace member: $archive_file"
+                    download_failed=true
+                fi
                 continue
             fi
             if ! _act_is_safe_basename "$archive_file" || \
@@ -12060,8 +12756,12 @@ EOF
                         _act_stream_remote_unix_file \
                         "$ssh_destination" "$archive_file_remote") || archive_file_receipt=""
                 fi
-                if [[ -n "$archive_file_receipt" ]]; then
+                if [[ -n "$archive_file_receipt" ]] && \
+                   { [[ -z "$workspace_binaries" ]] || \
+                     workspace_member_receipt=$(_act_workspace_member_receipt \
+                         "$artifact_dir" "$archive_file" "$archive_file_receipt" "$archive_file_mode"); }; then
                     local_artifact_paths+=("$archive_file_local")
+                    [[ -z "$workspace_binaries" ]] || workspace_member_receipts+=("$workspace_member_receipt")
                 else
                     _log_error "Failed to collect workspace archive member $archive_file from $host:$archive_file_remote"
                     download_failed=true
@@ -12276,8 +12976,6 @@ EOF
 
             local staged_workspace_includes=""
             local workspace_include_revision=""
-            local emit_workspace_include_receipts=false
-            $strict_native_build || emit_workspace_include_receipts=true
             if [[ -z "$archive_ext" ]]; then
                 :
             elif $strict_native_build; then
@@ -12294,7 +12992,7 @@ EOF
             if ! staged_workspace_includes=$(
                 _act_stage_workspace_include_files \
                     "$config_file" "$local_path" "$artifact_dir" "$workspace_include_revision" \
-                    "$emit_workspace_include_receipts"
+                    true
             ); then
                 _log_error "Failed to stage configured workspace companion files for $platform"
                 jq -nc --arg platform "$platform" \
@@ -12306,20 +13004,16 @@ EOF
             local staged_include staged_include_record
             while IFS= read -r staged_include_record; do
                 [[ -n "$staged_include_record" ]] || continue
-                if $emit_workspace_include_receipts; then
-                    if ! staged_include=$(jq -er '.member | select(type == "string" and length > 0)' \
-                            <<< "$staged_include_record"); then
-                        _log_error "Workspace companion receipt is invalid for $platform"
-                        jq -nc --arg platform "$platform" \
-                            '{status:"failed",exit_code:7,platform:$platform,
-                              artifact_path:"",artifact_paths:[],additional_artifacts:[],
-                              error:"Workspace companion receipt is invalid"}'
-                        return 7
-                    fi
-                    workspace_member_receipts+=("$staged_include_record")
-                else
-                    staged_include="$staged_include_record"
+                if ! staged_include=$(jq -er '.member | select(type == "string" and length > 0)' \
+                        <<< "$staged_include_record"); then
+                    _log_error "Workspace companion receipt is invalid for $platform"
+                    jq -nc --arg platform "$platform" \
+                        '{status:"failed",exit_code:7,platform:$platform,
+                          artifact_path:"",artifact_paths:[],additional_artifacts:[],
+                          error:"Workspace companion receipt is invalid"}'
+                    return 7
                 fi
+                workspace_member_receipts+=("$staged_include_record")
                 archive_files+=("$staged_include")
             done <<< "$staged_workspace_includes"
             _log_info "Workspace archive members: ${archive_files[*]}"
@@ -12353,6 +13047,11 @@ EOF
                         ;;
                 esac
             fi
+            if [[ -n "$archive_receipt" ]] && \
+               ! _act_validate_release_archive_metadata "$archive_path" "$archive_ext"; then
+                _log_error "Workspace archive metadata is not normalized for publication: $platform"
+                archive_receipt=""
+            fi
             if $strict_native_build; then
                 if [[ -n "$archive_receipt" ]] && \
                    ! _act_validate_workspace_archive_release_tree_includes \
@@ -12379,15 +13078,19 @@ EOF
                 local validate_workspace_architecture=false
                 case "$language" in rust|go) validate_workspace_architecture=true ;; esac
                 if [[ -n "$archive_receipt" ]] && \
-                   { ! _act_validate_workspace_archive \
+                   ! _act_validate_workspace_archive \
                          "$archive_path" "$archive_ext" "$platform" "$config_file" \
-                         "$validate_workspace_architecture" || \
-                     ! _act_validate_workspace_member_receipts \
-                         "$archive_path" "$archive_ext" "$artifact_dir" \
-                         "${workspace_member_receipts[@]}"; }; then
-                    _log_error "Workspace archive does not match its configured members and collection receipts for $platform"
+                         "$validate_workspace_architecture"; then
+                    _log_error "Workspace archive does not match its configured members for $platform"
                     archive_receipt=""
                 fi
+            fi
+            if [[ -n "$archive_receipt" ]] && \
+               ! _act_validate_workspace_member_receipts \
+                   "$archive_path" "$archive_ext" "$artifact_dir" \
+                   "${workspace_member_receipts[@]}"; then
+                _log_error "Workspace archive does not match its frozen member receipts for $platform"
+                archive_receipt=""
             fi
             # Member validators must not replace/rewrite the archive that the
             # exclusive producer accepted, even with another valid archive.
@@ -12439,11 +13142,21 @@ EOF
         status="failed"
         exit_code=4
     elif [[ $exit_code -eq 124 ]]; then
-        _log_error "Build timed out on $host after ${_ACT_BUILD_TIMEOUT}s"
+        native_execution_error="Native ${native_execution_phase:-execution} on $host returned exit 124 (configured phase timeout ${native_execution_timeout}s, transport timeout ${native_execution_transport_timeout}s); inspect $log_file for the command or deadline diagnostic"
+        _log_error "$native_execution_error"
         status="timeout"
         exit_code=5
     else
-        _log_error "Build failed on $host with exit code $exit_code"
+        if [[ -n "$native_execution_phase" && -n "$native_execution_failure_kind" ]]; then
+            if [[ "$native_execution_failure_kind" == validation ]]; then
+                native_execution_error="Native $native_execution_phase validation failed on $host (command exit $native_execution_exit); refusing further build or collection work"
+            else
+                native_execution_error="Native $native_execution_phase on $host returned exit $native_execution_exit"
+            fi
+            _log_error "$native_execution_error"
+        else
+            _log_error "Build failed on $host with exit code $exit_code"
+        fi
         status="failed"
         exit_code=6
     fi
@@ -12478,9 +13191,17 @@ EOF
         --argjson collected_size_bytes "$collected_size_bytes" \
         --arg collected_identity "$collected_identity" \
         --argjson build_influence_env "$build_influence_env_json" \
+        --arg execution_phase "$native_execution_phase" \
+        --arg execution_timeout "$native_execution_timeout" \
+        --arg execution_transport_timeout "$native_execution_transport_timeout" \
+        --argjson execution_exit "$native_execution_exit" \
+        --arg execution_failure_kind "$native_execution_failure_kind" \
+        --argjson build_program_dispatched "$native_build_program_dispatched" \
+        --arg execution_error "$native_execution_error" \
         --arg storage_error "$native_storage_error" \
         --arg log_file "$log_file" \
-        'input as $cargo_isolation | {
+        'def seconds: if test("^[1-9][0-9]*$") then tonumber else null end;
+        input as $cargo_isolation | {
             tool: $tool,
             platform: $platform,
             host: $host,
@@ -12498,7 +13219,18 @@ EOF
             build_influence_env: $build_influence_env,
             cargo_isolation: $cargo_isolation,
             log_file: $log_file
-        } + (if $storage_error == "" then {} else
+        } + (if $execution_phase == "" then {} else
+               {native_execution: {
+                   phase: $execution_phase,
+                   timeout_seconds: ($execution_timeout | seconds),
+                   transport_timeout_seconds: ($execution_transport_timeout | seconds),
+                   command_exit_code: $execution_exit,
+                   failure_kind: (if $execution_failure_kind == "" then null else $execution_failure_kind end),
+                   build_program_dispatched: $build_program_dispatched
+               }} end)
+          + (if $execution_error == "" then {} else
+               {stage: $execution_phase, error: $execution_error} end)
+          + (if $storage_error == "" then {} else
                {stage:"host_readiness",error:$storage_error} end)' <<< "$cargo_isolation_json" || return 4
 
     return "$exit_code"
@@ -13255,7 +13987,10 @@ _act_relocation_receipt_matches() {
 _act_relocate_failed_target() {
     local tool="$1" version="$2" run_id="$3" before="$4" request="$5" approval_file="$6"
     local target="${request%%=*}" host="${request#*=}" old_host configured_host host_platform
-    local config_file="$ACT_REPOS_DIR/${tool}.yaml" hosts_file="${DSR_CONFIG_DIR:-$HOME/.config/dsr}/hosts.yaml"
+    local config_file="$ACT_REPOS_DIR/${tool}.yaml"
+    # Bind the configuration used by host selection, readiness and transport.
+    # An inactive default file cannot authorize changes to an override file.
+    local hosts_file="${DSR_HOSTS_FILE:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/hosts.yaml}"
     local entry result result_path sync_json roots hosts receipt repo_hash hosts_hash
     local prior_result prior_log result_hash log_hash
     local approval prior_config prior_config_hash prior_json current_json projection
@@ -13924,7 +14659,7 @@ act_orchestrate_build() {
                 <<< "$resume_state" >/dev/null; then
                 if [[ "$(_act_sha256 "$ACT_REPOS_DIR/${tool_name}.yaml")" != \
                       "$(jq -r '.relocations[-1].repo_config_sha256' <<< "$resume_state")" ||
-                      "$(_act_sha256 "${DSR_CONFIG_DIR:-$HOME/.config/dsr}/hosts.yaml")" != \
+                      "$(_act_sha256 "${DSR_HOSTS_FILE:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/hosts.yaml}")" != \
                       "$(jq -r '.relocations[-1].hosts_config_sha256' <<< "$resume_state")" ]]; then
                     _log_error "Configuration changed after the approved relocation"
                     _act_release_orchestration_lock
@@ -15879,137 +16614,16 @@ act_generate_manifest() {
         seen_names["$name"]="$sha"
     }
 
-    _act_sha256_zip_entry() {
-        local zip_file="$1"
-        local entry="$2"
-
-        if command -v sha256sum &>/dev/null; then
-            unzip -p "$zip_file" "$entry" 2>/dev/null | sha256sum | awk '{print $1}'
-            return 0
-        fi
-
-        if command -v shasum &>/dev/null; then
-            unzip -p "$zip_file" "$entry" 2>/dev/null | shasum -a 256 | awk '{print $1}'
-            return 0
-        fi
-
-        return 3
-    }
-
-    _act_zip_entry_size() {
-        local zip_file="$1"
-        local entry="$2"
-        unzip -p "$zip_file" "$entry" 2>/dev/null | wc -c | tr -d ' '
-    }
-
     _act_manifest_add_zip_entries() {
         local zip_file="$1"
         local target="$2"
-        local version_tag="$manifest_version"
-        local version_stripped="${manifest_version#v}"
-
-        if ! command -v unzip &>/dev/null; then
-            _log_warn "unzip not available; treating $zip_file as artifact"
-            _act_manifest_add_file "$zip_file" "$target"
-            return $?
-        fi
-
-        local entries
-        entries=$(unzip -Z1 "$zip_file" 2>/dev/null)
-        if [[ -z "$entries" ]]; then
-            _log_warn "No entries found in zip artifact: $zip_file"
-            return 0
-        fi
-
-        local -a matched_entries=()
-        while IFS= read -r entry; do
-            [[ -z "$entry" || "$entry" == */ ]] && continue
-            if [[ "$entry" == *"$version_tag"* || "$entry" == *"$version_stripped"* ]]; then
-                matched_entries+=("$entry")
-            fi
-        done <<< "$entries"
-
-        local -a use_entries=()
-        if [[ ${#matched_entries[@]} -gt 0 ]]; then
-            use_entries=("${matched_entries[@]}")
-        else
-            while IFS= read -r entry; do
-                [[ -z "$entry" || "$entry" == */ ]] && continue
-                use_entries+=("$entry")
-            done <<< "$entries"
-        fi
-
-        local entry
-        for entry in "${use_entries[@]}"; do
-            local name
-            name=$(basename "$entry")
-
-            case "$name" in
-                *.minisig|*.sig|*.sha256|*.sha512|SHA256SUMS*|*.sbom.*|*.intoto.jsonl)
-                    continue
-                    ;;
-            esac
-
-            local seen_key="${zip_file}::${entry}"
-            for seen in "${seen_paths[@]}"; do
-                [[ "$seen" == "$seen_key" ]] && continue 2
-            done
-            # Same name-collision dedup as the on-disk path. Without it a
-            # matrix workflow whose zip artifact bundles every platform
-            # would emit one manifest entry per orchestration target.
-            if [[ -n "${seen_names[$name]:-}" ]]; then
-                continue
-            fi
-
-            local sha size format
-            sha=$(_act_sha256_zip_entry "$zip_file" "$entry" 2>/dev/null || echo "")
-            size=$(_act_zip_entry_size "$zip_file" "$entry")
-            format=$(_act_archive_format "$name")
-
-            if [[ -z "$sha" ]]; then
-                _log_warn "Unable to compute SHA256 for artifact: $zip_file::$entry"
-                continue
-            fi
-            if [[ -z "$size" || "$size" -le 0 ]]; then
-                _log_warn "Unable to determine size for artifact: $zip_file::$entry"
-                continue
-            fi
-
-            # Filename-derived target overrides the orchestration target
-            # (matrix workflow under one act job ⇒ unreliable per-target).
-            local entry_target="$target"
-            local inferred_target
-            inferred_target=$(_act_infer_target_from_name "$name")
-            if [[ -n "$inferred_target" ]]; then
-                entry_target="$inferred_target"
-            fi
-            local target_triple
-            target_triple=$(_act_manifest_target_triple "$entry_target" "$name") || return 4
-
-            local artifact_json
-            artifact_json=$(jq -nc \
-                --arg name "$name" \
-                --arg target "$entry_target" \
-                --arg target_triple "$target_triple" \
-                --arg sha "$sha" \
-                --argjson size "$size" \
-                --arg format "$format" \
-                '{
-                    name: $name,
-                    target: $target,
-                    target_triple: $target_triple,
-                    sha256: $sha,
-                    size_bytes: $size,
-                    archive_format: $format,
-                    signed: false,
-                    signature_file: ""
-                }')
-
-            artifacts+=("$artifact_json")
-            # shellcheck disable=SC2190 # Indexed array; separate functions use an associative array with this name.
-            seen_paths+=("$seen_key")
-            seen_names["$name"]="$sha"
-        done
+        local payloads file
+        payloads=$(_act_artifact_zip_payloads "$zip_file" "$manifest_version") || return 4
+        while IFS= read -r -d '' file; do
+            # The ordinary file path already preserves compiler variants,
+            # infers matrix targets and rejects same-name different bytes.
+            _act_manifest_add_file "$file" "$target" || return $?
+        done < <(jq -j '.[] | ., "\u0000"' <<< "$payloads")
     }
 
     while IFS= read -r target_json; do

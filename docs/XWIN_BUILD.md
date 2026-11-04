@@ -37,9 +37,10 @@ package; `--bin NAME` is mandatory. The build always uses `--release`,
 CLI target override. The project must have a
 regular `Cargo.toml` and `Cargo.lock`. `--timeout SECONDS` bounds compilation
 (default 3600; range 1..86400). `--cache-dir DIR` selects the prepared-view
-cache. Build execution also requires Python 3.9+, GNU timeout, and util-linux
-setsid on a Linux host. Release mode additionally requires Git and Python
-3.11+ for TOML-based lockfile authentication; Cargo.lock v3 and v4 are supported.
+cache. Build execution also requires Python 3.11+ for lockfile-scoped cache
+selection, GNU timeout, and util-linux setsid on a Linux host. Git is required
+for source-pinned releases and for selecting cached Git dependencies in either
+mode. Cargo.lock v3 and v4 are supported.
 
 ### Select Cargo features
 
@@ -83,18 +84,21 @@ compiler feature sets must agree; incompatible workspace feature resolution
 still fails admission.
 
 `--offline` requests Cargo's offline behavior. Without it, Cargo may fetch
-locked dependencies. `--cargo-cache` is optional. Source-pinned releases select
-downloads using the staged, committed `Cargo.lock`: checksum-matching crate
-archives, corresponding registry index records, and Git databases containing
-locked commits. Ambient extracted registry sources and Git checkouts are never
-copied. Cargo recreates them in the private home, and the existing source
-authentication gate verifies them against locked archives and Git objects.
-Unrelated cached links, archives, and working copies cannot become release
-inputs or block preparation; a lockfile without Git dependencies does not open
-the Git cache. Selection covers all packages in the lockfile rather than only
-the chosen target/features; selected Git databases retain their full history.
-Ordinary builds copy the supplied `registry/` and `git/` trees. Both modes create
-a fresh, independently owned Cargo home before any Cargo invocation.
+locked dependencies. `--cargo-cache` is optional. Every pinned build requires
+`Cargo.lock`, invokes Cargo with `--locked`, and selects cache downloads using
+that lockfile. Source-pinned releases use the staged, committed copy. Selection
+retains checksum-matching crate archives, corresponding registry index records,
+and Git databases containing locked commits. Ambient extracted registry sources
+are excluded. Exact submodule-bearing Git checkouts are retained when needed
+for offline reconstruction. Cargo recreates other sources in the private home.
+In release mode, the existing source authentication gate verifies them against locked archives
+and Git objects. Unrelated cached links, archives, and working copies cannot
+become inputs or block preparation; a lockfile without Git dependencies does
+not open the Git cache. Selection covers all packages in the lockfile rather
+than only the chosen target/features; selected Git databases retain their full history.
+Both modes create a fresh, independently owned Cargo home before any Cargo
+invocation. Ordinary builds retain their existing source-authentication scope;
+cache selection does not give them source-pinned release authority.
 These are byte copies, not symlinks or source
 hardlinks: deleting the original cache or writing its files in place cannot
 change the prepared copy. Top-level Cargo configuration, credentials, binaries,
@@ -108,8 +112,8 @@ retaining references outside the private home. Detected changes during copying
 fail preparation; use a quiescent cache or omit `--cargo-cache` to start empty.
 An empty cache normally needs network access, so combining it with `--offline`
 requires dependencies already supplied by reviewed project configuration.
-Preparation needs disk space for the selected downloads in release mode or
-complete cache trees in ordinary mode; it does not use copy-on-write storage.
+Preparation needs disk space for the selected downloads and any required
+submodule checkouts; it does not use copy-on-write storage.
 `--timeout` also bounds each cache preparation/inventory command separately.
 Cancellation reaches its process group; diagnostics are retained in
 `run/cargo-cache-seed.log` and `run/cargo-cache-final.log`.
@@ -117,7 +121,7 @@ Cancellation reaches its process group; diagnostics are retained in
 Cargo can legitimately download, unpack, or maintain files in its private
 home. The result's `cargo_cache` field therefore retains separate seed and
 final inventory summaries, including receipt SHA-256, inventory SHA-256,
-file count and byte count. Source-pinned seed summaries also retain `selection`,
+file count and byte count. Both modes' seed summaries also retain `selection`,
 including the lockfile SHA-256, registry-package count, and Git revisions; final
 inventories describe the expanded private home without claiming that selection.
 The release manifest retains the same field under

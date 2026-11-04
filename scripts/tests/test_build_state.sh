@@ -120,16 +120,20 @@ test_build_lock_info() {
 # only flock discovery to be unavailable, exercising the production macOS
 # fcntl fallback without substituting lock acquisition or release behavior.
 test_build_lock_custody() {
-  python3 - "$PROJECT_ROOT" <<'PY'
+  python3 - "$PROJECT_ROOT" "${1:-all}" <<'PY'
+import errno
+import fcntl
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 
 project = Path(sys.argv[1])
+borrow_only = sys.argv[2] == 'borrow'
 root = Path(tempfile.mkdtemp(prefix='dsr-build-custody-'))
 print('Retained build custody fixture: ' + str(root), flush=True)
 checks = 0
@@ -152,6 +156,33 @@ def until(predicate, seconds=12):
     raise AssertionError('fixture barrier timed out')
 
 
+def inventory(path):
+    if not path.exists():
+        return None
+    entries = []
+    for item in sorted([path, *path.rglob('*')]):
+        info = item.lstat()
+        payload = (os.readlink(item) if stat.S_ISLNK(info.st_mode) else
+                   item.read_bytes() if stat.S_ISREG(info.st_mode) else None)
+        entries.append((str(item.relative_to(path)), info.st_dev, info.st_ino,
+                        info.st_mode, info.st_nlink, info.st_size,
+                        info.st_mtime_ns, info.st_ctime_ns, payload))
+    return entries
+
+
+def independently_free(path):
+    # This observer opens a separate description in the Python controller;
+    # none of the Bash owner's descriptors or registry are inherited here.
+    with path.open('r+b') as stream:
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in (errno.EAGAIN, errno.EACCES):
+                return False
+            raise
+    return True
+
+
 driver = root / 'driver.sh'
 driver.write_text(r'''#!/usr/bin/env bash
 set -uo pipefail
@@ -164,6 +195,22 @@ if [[ "$BACKEND" == python ]]; then
         if [[ "${1:-}" == -v && "${2:-}" == flock ]]; then return 1; fi
         builtin command "$@"
     }
+fi
+registry_snapshot() {
+    declare -p _BUILD_LOCK_PATHS _BUILD_LOCK_FDS _BUILD_LOCK_IDENTITIES \
+        _BUILD_LOCK_OWNERS _BUILD_LOCK_RECORDS _BUILD_LOCK_REGISTRY_READY _BUILD_STATE_DIR
+}
+borrow_without_registry_changes() {
+    local before status=0
+    before=$(registry_snapshot) || return 110
+    build_lock_borrow task v1 || status=$?
+    [[ "$(registry_snapshot)" == "$before" ]] || return 111
+    return "$status"
+}
+if [[ "$ACTION" == borrow-absent ]]; then
+    # Exercise the no-registry path before initialization can create anything.
+    borrow_without_registry_changes
+    exit $?
 fi
 build_state_init || exit 91
 barrier() {
@@ -190,6 +237,85 @@ participant() {
     return "$status"
 }
 case "$ACTION" in
+    borrow-unregistered)
+        borrow_without_registry_changes
+        exit $?
+        ;;
+    borrow)
+        build_lock_acquire task v1 || exit 112
+        printf 'ready\n' > "$FIXTURE/owner.ready"
+        barrier "$FIXTURE/start" || exit 113
+        borrow_without_registry_changes || exit 114
+        (
+            borrow_without_registry_changes || exit 115
+            status=0; build_lock_release task v1 || status=$?
+            [[ "$status" == 1 ]] || exit 116
+            printf 'ready\n' > "$FIXTURE/child.ready"
+            barrier "$FIXTURE/release-child"
+        ) & child=$!
+        barrier "$FIXTURE/child.ready" || exit 117
+        printf 'ready\n' > "$FIXTURE/borrow.ready"
+        barrier "$FIXTURE/release-parent" || exit 118
+        build_lock_release task v1 || exit 119
+        printf 'ready\n' > "$FIXTURE/parent-released"
+        wait "$child" || exit 120
+        ;;
+    borrow-fault)
+        build_lock_acquire task v1 || exit 121
+        descriptor=''
+        for index in "${!_BUILD_LOCK_PATHS[@]}"; do
+            if [[ "${_BUILD_LOCK_PATHS[$index]}" == "$DSR_STATE_DIR/builds/task/v1/.lock" ]]; then
+                descriptor="${_BUILD_LOCK_FDS[$index]}"
+                break
+            fi
+        done
+        [[ "$descriptor" =~ ^[0-9]{1,3}$ ]] || exit 122
+        case "$FAULT" in
+            closed) _build_lock_close_fd "$descriptor" || exit 123 ;;
+            reused-other)
+                _build_lock_close_fd "$descriptor" || exit 123
+                eval 'exec '"$descriptor"'<> "$FIXTURE/unrelated"' || exit 124
+                printf 'caller:' >&"$descriptor" || exit 125
+                ;;
+            reopened-held)
+                # Retain the genuine held description, but replace the
+                # registered FD with an independent open of the SAME inode.
+                exec 80<&"$descriptor" || exit 126
+                _build_lock_close_fd "$descriptor" || exit 123
+                eval 'exec '"$descriptor"'<> "$DSR_STATE_DIR/builds/task/v1/.lock.lease"' || exit 124
+                ;;
+            reopened-free)
+                _build_lock_close_fd "$descriptor" || exit 123
+                eval 'exec '"$descriptor"'<> "$DSR_STATE_DIR/builds/task/v1/.lock.lease"' || exit 124
+                ;;
+            unlocked)
+                python3 - "$descriptor" <<'UNLOCK'
+import fcntl, sys
+fcntl.flock(int(sys.argv[1]), fcntl.LOCK_UN)
+UNLOCK
+                [[ "$?" == 0 ]] || exit 127
+                ;;
+        esac
+        printf 'ready\n' > "$FIXTURE/holder.ready"
+        barrier "$FIXTURE/start" || exit 128
+        status=0; borrow_without_registry_changes || status=$?
+        printf '%s\n' "$status" > "$FIXTURE/borrow.result"
+        [[ "$status" == 4 ]] || exit 129
+        if [[ "$FAULT" != closed ]]; then
+            { : <&"$descriptor"; } || exit 130
+        fi
+        barrier "$FIXTURE/release" || exit 131
+        case "$FAULT" in
+            closed) ;;
+            reused-other) printf 'after\n' >&"$descriptor" || exit 132 ;;
+            reopened-held)
+                eval 'exec '"$descriptor"'<&80' || exit 133
+                exec 80>&-
+                build_lock_release task v1 || exit 134
+                ;;
+            *) build_lock_release task v1 || exit 134 ;;
+        esac
+        ;;
     basic)
         exec 10<> "$FIXTURE/caller-a" 11<> "$FIXTURE/caller-b"
         printf 'first:' >&10; printf 'second:' >&11
@@ -252,6 +378,102 @@ def run(case, backend, action, **extra):
 
 
 for backend in ('flock', 'python'):
+    case = root / (backend + '-borrow-absent')
+    case.mkdir()
+    absent = run(case, backend, 'borrow-absent')
+    check(case.name + ': no registry returns 1 without initializing a namespace',
+          absent.returncode == 1 and not (case / 'state').exists())
+
+    case = root / (backend + '-borrow')
+    case.mkdir()
+    with open(case / 'stdout', 'wb') as out, open(case / 'stderr', 'wb') as err:
+        owner = subprocess.Popen(['bash', str(driver)], env=environment(case, backend, 'borrow'),
+                                 stdin=subprocess.DEVNULL, stdout=out, stderr=err)
+        try:
+            until(lambda: (case / 'owner.ready').exists() or owner.poll() is not None)
+            check(case.name + ': genuine owner acquired custody',
+                  (case / 'owner.ready').exists() and owner.poll() is None)
+            before = inventory(case / 'state')
+            unregistered = run(case, backend, 'borrow-unregistered')
+            check(case.name + ': a busy pathname alone cannot grant borrowing',
+                  unregistered.returncode == 1 and inventory(case / 'state') == before)
+            (case / 'start').write_text('continue\n')
+            until(lambda: (case / 'borrow.ready').exists() or owner.poll() is not None)
+            check(case.name + ': owning shell and inherited child borrow without changing custody',
+                  (case / 'borrow.ready').exists() and owner.poll() is None and
+                  inventory(case / 'state') == before)
+            lease = case / 'state/builds/task/v1/.lock.lease'
+            check(case.name + ': independent acquisition stays excluded after borrowing',
+                  not independently_free(lease) and run(case, backend, 'acquire').returncode == 2)
+            (case / 'release-parent').write_text('continue\n')
+            until(lambda: (case / 'parent-released').exists() or owner.poll() is not None)
+            check(case.name + ': acquiring parent remains releasable while borrowed child retains exclusion',
+                  (case / 'parent-released').exists() and owner.poll() is None and
+                  not independently_free(lease) and inventory(case / 'state') == before)
+        finally:
+            for name in ('start', 'release-parent', 'release-child'):
+                (case / name).write_text('continue\n')
+            owner.wait(timeout=10)
+        check(case.name + ': final borrower exit frees custody for another owner',
+              owner.returncode == 0 and independently_free(lease) and
+              run(case, backend, 'acquire').returncode == 0)
+
+    for fault in ('metadata-changed', 'metadata-replaced', 'lease-replaced',
+                  'closed', 'reused-other', 'reopened-free', 'reopened-held', 'unlocked'):
+        case = root / (backend + '-borrow-' + fault)
+        case.mkdir()
+        namespace = case / 'state/builds/task/v1'
+        metadata, lease = namespace / '.lock', namespace / '.lock.lease'
+        retained = namespace / '.retained-original'
+        with open(case / 'stdout', 'wb') as out, open(case / 'stderr', 'wb') as err:
+            owner = subprocess.Popen(['bash', str(driver)],
+                env=environment(case, backend, 'borrow-fault', FAULT=fault),
+                stdin=subprocess.DEVNULL, stdout=out, stderr=err)
+            original = None
+            try:
+                until(lambda: (case / 'holder.ready').exists() or owner.poll() is not None)
+                check(case.name + ': genuine descriptor fault fixture is ready',
+                      (case / 'holder.ready').exists() and owner.poll() is None)
+                if fault in ('metadata-changed', 'metadata-replaced'):
+                    original = metadata.read_bytes()
+                    fields = original.decode().split()
+                    fields[2] = 'different-run'
+                    if fault == 'metadata-replaced':
+                        metadata.rename(retained)
+                    metadata.write_text(' '.join(fields) + '\n')
+                elif fault == 'lease-replaced':
+                    lease.rename(retained)
+                    lease.touch()
+                before = inventory(case / 'state')
+                (case / 'start').write_text('continue\n')
+                until(lambda: (case / 'borrow.result').exists() or owner.poll() is not None)
+                check(case.name + ': unverifiable custody returns 4 without rewriting evidence or registry',
+                      (case / 'borrow.result').read_text().strip() == '4' and
+                      owner.poll() is None and inventory(case / 'state') == before)
+                held = fault in ('metadata-changed', 'metadata-replaced', 'reopened-held')
+                check(case.name + ': refusal preserves the actual kernel lease state',
+                      independently_free(lease) == (not held) and
+                      (fault != 'lease-replaced' or not independently_free(retained)) and
+                      (fault != 'reused-other' or independently_free(case / 'unrelated')))
+            finally:
+                if original is not None:
+                    if fault == 'metadata-replaced':
+                        metadata.rename(namespace / '.retained-replacement')
+                        retained.rename(metadata)
+                    else:
+                        metadata.write_bytes(original)
+                elif fault == 'lease-replaced' and retained.exists():
+                    lease.rename(namespace / '.retained-replacement')
+                    retained.rename(lease)
+                for name in ('start', 'release'):
+                    (case / name).write_text('continue\n')
+                owner.wait(timeout=10)
+            check(case.name + ': refusal leaves caller descriptors and original release responsibility intact',
+                  owner.returncode == 0 and independently_free(lease) and
+                  (fault != 'reused-other' or (case / 'unrelated').read_text() == 'caller:after\n'))
+
+    if borrow_only:
+        continue
     case = root / (backend + '-basic')
     case.mkdir()
     with open(case / 'stdout', 'wb') as out, open(case / 'stderr', 'wb') as err:
@@ -1574,6 +1796,11 @@ trap cleanup EXIT
 
 if [[ "${1:-}" == --lock-custody-only ]]; then
   test_build_lock_custody
+  exit $?
+fi
+
+if [[ "${1:-}" == --lock-borrow-only ]]; then
+  test_build_lock_custody borrow
   exit $?
 fi
 

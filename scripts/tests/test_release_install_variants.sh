@@ -131,7 +131,7 @@ def sign(proof):
                         "-t", "dsr installer variant test"], check=True, capture_output=True, timeout=30)
 
 
-def make_snapshot(label, variants=(gnu, musl), explicit=True, with_data=False):
+def make_snapshot(label, variants=(gnu, musl), explicit=True, with_data=False, workflow=False, legacy=False):
     base = work / label
     base.mkdir()
     snapshot = base / "snapshot"
@@ -191,6 +191,17 @@ def make_snapshot(label, variants=(gnu, musl), explicit=True, with_data=False):
         rows.append(dict(name=foreign.name, target="windows/arm64", target_triple="aarch64-pc-windows-msvc",
                          archive_format="none", sha256=digest(foreign), size_bytes=foreign.stat().st_size))
         environments.append(dict(target="windows/arm64", target_triple="aarch64-pc-windows-msvc", method="native", host="fixture"))
+    if workflow:
+        assert not explicit and not with_data and not legacy
+        # Ordinary act output has one routing task for both compiler variants.
+        # Artifact identities remain explicit without a required_variants plan.
+        environments = [dict(target=target, method="act", host="fixture")]
+    if legacy:
+        assert not explicit and len(variants) == 1 and not with_data
+        # A legacy producer actually omitted compiler evidence. Do not model
+        # compatibility by asking the mapper to discard recorded identities.
+        for row in rows + environments:
+            row.pop("target_triple", None)
     manifest = dict(schema_version="1.0.0", tool="app", version=tag, source=dict(git_sha=pin, git_ref="refs/tags/" + tag, dependencies=[]),
                     run_id="12345678-1234-4123-8123-123456789abc", built_at="2026-10-10T01:02:03Z", status="success",
                     requested_targets=sorted({e["target"] for e in environments}),
@@ -546,7 +557,58 @@ singleton_proof = load(singleton / "release.intoto.jsonl")
 check("explicit singleton compiler identity survives the public mapper", all(a.get("target_triple") == gnu for a in singleton_proof["dsr_evidence"]["artifacts"]))
 check("singleton identity does not invent extra compiler tasks", "build_tasks" not in singleton_proof["dsr_evidence"])
 install("singleton-typed", singleton, recipe_for(0, gnu))
-legacy, _ = make_snapshot("legacy", (gnu,), explicit=False)
+ordinary_singletons = {}
+for abi, triple in (("gnu", gnu), ("musl", musl)):
+    ordinary, ordinary_producer = make_snapshot("ordinary-singleton-" + abi, (triple,), explicit=False)
+    ordinary_singletons[abi] = ordinary
+    statement = load(ordinary / "release.intoto.jsonl")
+    check("ordinary " + abi + " producer has no variant-plan extension", "required_variants" not in load(ordinary_producer))
+    check("ordinary " + abi + " public statement retains recorded compiler evidence",
+          all(a.get("target_triple") == triple for a in statement["dsr_evidence"]["artifacts"]) and
+          "build_tasks" not in statement["dsr_evidence"])
+    typed, typed_prefix = install("ordinary-singleton-" + abi + "-typed", ordinary, recipe_for(0, triple))
+    check("ordinary " + abi + " installation binds all exact archive and alias bytes",
+          typed.get("status") == "installed" and typed.get("target_triple") == triple and
+          all(e.get("target_triple") == triple for e in typed.get("executables", [])) and
+          (typed_prefix / "current/bin/app").read_bytes() == (ordinary / "artifacts/alias-0").read_bytes())
+    install("ordinary-singleton-" + abi + "-wrong", ordinary, recipe_for(0, musl if triple == gnu else gnu), expected=4)
+
+workflow, workflow_producer = make_snapshot("ordinary-workflow", explicit=False, workflow=True)
+statement = load(workflow / "release.intoto.jsonl")
+check("ordinary workflow keeps both artifact ABIs with one recorded task",
+      load(workflow_producer)["summary"] == dict(total=1, success=1, failed=0) and
+      "required_variants" not in load(workflow_producer) and "build_tasks" not in statement["dsr_evidence"] and
+      {a.get("target_triple") for a in statement["dsr_evidence"]["artifacts"]} == {gnu, musl})
+untyped, untyped_prefix = install("ordinary-workflow-untyped", workflow, recipe_for(0), expected=4)
+check("workflow ambiguity cannot create installation state", not untyped_prefix.exists() and not Path(str(untyped_prefix) + ".lock").exists())
+mixed = recipe_for(0, gnu)
+mixed["executables"][2]["artifact"] = "alias-1"
+install("ordinary-workflow-mixed", workflow, mixed, expected=4)
+untyped_mixed = copy.deepcopy(mixed)
+untyped_mixed.pop("target_triple")
+_, mixed_prefix = install("ordinary-workflow-untyped-mixed", workflow, untyped_mixed, expected=4)
+check("workflow omission cannot authorize a mixed ABI family", not mixed_prefix.exists())
+workflow_contract = save(work / "ordinary-workflow-contract.json", dict(schema_version=1,
+    required_assets=[{k: a[k] for k in ("name", "target", "target_triple", "archive_format")}
+                     for a in load(workflow_producer)["artifacts"]]))
+workflow_active, workflow_prefix = install("ordinary-workflow-gnu", workflow, recipe_for(0, gnu),
+                                         extra=("--release-contract", workflow_contract))
+check("workflow output satisfies independently typed asset policy without a variant-plan extension",
+      workflow_active.get("status") == "installed" and workflow_active.get("target_triple") == gnu and
+      all(e.get("target_triple") == gnu for e in workflow_active.get("executables", [])))
+if workflow_active.get("status") == "installed":
+    before = state(workflow_prefix)
+    install("ordinary-workflow-mixed-replacement", workflow, mixed, workflow_prefix, 4,
+            ("--replace", "--release-contract", workflow_contract))
+    check("workflow mixed ABI refusal preserves every active generation inode", state(workflow_prefix) == before)
+    workflow_next, _ = install("ordinary-workflow-musl", workflow, recipe_for(1, musl), workflow_prefix,
+                              extra=("--replace", "--release-contract", workflow_contract))
+    check("workflow compiler switch replaces the complete family with exact musl bytes",
+          workflow_next.get("status") == "installed" and workflow_next.get("target_triple") == musl and
+          all(e.get("target_triple") == musl for e in workflow_next.get("executables", [])) and
+          (workflow_prefix / "current/bin/app").read_bytes() == (workflow / "artifacts/alias-1").read_bytes())
+
+legacy, _ = make_snapshot("legacy", (gnu,), explicit=False, legacy=True)
 check("legacy singleton statement keeps the existing field shape", all("target_triple" not in a for a in load(legacy / "release.intoto.jsonl")["dsr_evidence"]["artifacts"]))
 legacy_result, legacy_prefix = install("legacy-untyped", legacy, recipe_for(0))
 check("legacy installation remains untyped without fabricated compiler identity", "target_triple" not in legacy_result and
@@ -691,7 +753,10 @@ else:
     print("Dependent dual-compiler installer checks not reached because generation failed", flush=True)
 
 for label, selected_snapshot, selected_recipe in (("legacy-generated", legacy, recipe_for(0)),
-                                                 ("singleton-generated", singleton, recipe_for(0, gnu))):
+                                                 ("singleton-generated", singleton, recipe_for(0, gnu)),
+                                                 ("ordinary-gnu-generated", ordinary_singletons["gnu"], recipe_for(0, gnu)),
+                                                 ("ordinary-musl-generated", ordinary_singletons["musl"], recipe_for(0, musl)),
+                                                 ("workflow-generated", workflow, recipe_for(1, musl))):
     generated, script = generate(label, policy_for([selected_recipe]))
     if generated.get("status") != "generated":
         continue
@@ -702,7 +767,8 @@ for label, selected_snapshot, selected_recipe in (("legacy-generated", legacy, r
     if "target_triple" not in selected_recipe:
         generated_install("legacy-cannot-invent-compiler", script, selected_snapshot, selected_prefix, ("--target-triple", gnu), 4)
     else:
-        generated_install("singleton-cannot-override-compiler", script, selected_snapshot, selected_prefix, ("--target-triple", musl), 4)
+        other_triple = musl if selected_recipe["target_triple"] == gnu else gnu
+        generated_install(label + "-cannot-override-compiler", script, selected_snapshot, selected_prefix, ("--target-triple", other_triple), 4)
     check(label + " rejects overrides without changing active bytes", state(selected_prefix) == before)
 
 for mutation in ("duplicate-compiler", "implicit-and-explicit", "duplicate-implicit", "missing-platform", "foreign-platform",

@@ -538,6 +538,14 @@ dsr build --repo <name> [--targets <list>] [--version <tag>]
 | `--sync-only` | false | Sync selected build hosts without compiling; exit 1 if any host fails |
 | `--diagnostic-native` | false | Build explicit native targets under strict source/family checks, with non-publishable diagnostic provenance |
 
+Native build environment lookup follows launcher export order: a platform's
+`cross_compile.<platform>.env` overrides global `env`, including an explicit
+empty value. Rust target derivation, glibc toolchain selection, and artifact
+path resolution use that same effective value. An empty Cargo target still
+uses the existing configured/default target derivation when enabled. Explicit
+native variant conflicts continue to stop dispatch, and policy checks retain
+all declarations so a later value cannot hide an earlier remote-build requirement.
+
 Native Go builds derive `GOOS` and `GOARCH` from the requested platform;
 the `armv7` alias resolves to `GOARCH=arm` and `GOARM=7`.
 Platform-specific `cross_compile.<platform>.env` values override global `env`
@@ -773,9 +781,14 @@ The approval file is a regular JSON file with these required fields:
   "prior_repo_config_path": "/path/to/retained-original-repo.yaml",
   "prior_repo_config_sha256": "<original-invocation-config-sha256>",
   "repo_config_sha256": "<reviewed-current-repo-config-sha256>",
-  "hosts_config_sha256": "<reviewed-hosts.yaml-sha256>"
+  "hosts_config_sha256": "<reviewed-active-hosts-config-sha256>"
 }
 ```
+
+`hosts_config_sha256` binds the active host configuration selected by
+`DSR_HOSTS_FILE`, falling back to `${DSR_CONFIG_DIR:-$HOME/.config/dsr}/hosts.yaml`
+when that override is empty or unset. Relocation staging and subsequent retries
+recheck this same configuration. Changed bytes prevent an ordinary resume.
 
 The operator must establish the prior config's provenance from the original
 invocation receipt. DSR checks actual file hashes and permits only the selected
@@ -872,6 +885,27 @@ dsr release --repo <name> --version <tag> [--draft] [--prerelease] [--dispatch]
 | `--no-sbom` | false | Disable automatic generation without discarding retained public metadata |
 | `--sbom-format` | `sbom.format`, default `spdx` | Select `spdx` or `cyclonedx` and enable generation |
 
+Binary publication, strict draft finalization, and `release verify --fix` hold
+the same kernel leases used by build collection and artifact pruning, from
+before the first artifact/manifest read through upload, repair or finalization
+and final verification.
+Both the canonical tag and possible original version
+namespace are protected, such as `v1.2.3` and `1.2.3`. Another build, publisher or
+inherited worker holding either lease blocks the operation with exit `2`;
+unverifiable custody refuses with exit `4`. Tool/version components contain at
+most 128 letters, digits, `.`, `_`, `+` or `-`, starting with a letter or digit.
+
+Fallback may lend its existing lease through the inherited descriptor registry.
+The release command verifies the descriptor, stable lease inode, owner record
+and actual kernel custody; an environment flag alone cannot bypass acquisition.
+It releases only leases it acquired itself, including on early errors, and
+preserves the caller's ownership and traps. Checked cleanup occurs before the
+final result; cleanup failure reports an error even if uploads completed.
+Custody refusals and cleanup failures identify `details.stage: "build_custody"`
+with an error message. Global `--dry-run` and verification without `--fix`
+perform no lease creation, acquisition or borrowing, so their observations do
+not reserve the artifact set.
+
 New ordinary releases are created as private drafts. DSR freezes every selected
 asset name, size, and SHA-256, including the manifest, generated checksums, and
 selected metadata sidecars. It verifies the complete remote inventory and
@@ -894,7 +928,9 @@ required name, size, hash, and uploaded asset ID against one complete, fresh
 paginated inventory, including on reruns where no names appear missing.
 Empty or invalid local manifests cannot authorize repair. Release identity and local
 manifest or payload changes prevent success. A nominal upload acknowledgement
-cannot remove an asset from the missing list. Repair failures appear in
+cannot remove an asset from the missing list. Ordinary and strict repair hold
+artifact custody through the complete local and remote rechecks, including
+strict checksum-sidecar materialization. Repair failures appear in
 `details.repair.errors` when present; normal verification and dry-run output keep
 their existing shape.
 
@@ -939,6 +975,13 @@ complete frozen input plan, and actual GitHub bytes. It uploads only missing
 assets and publishes an owned draft whose original intent was public, including
 after an interrupted publish response. It refuses ambiguous, changed, or lost
 creation custody. Upload journals alone never authorize publication.
+
+Verified uploads and reused assets update a private, atomic upload receipt at
+`$DSR_STATE_DIR/releases/<tool>-<tag>-upload.json`. Successful publication keeps
+this receipt so `prune --keep-releases` continues to retain the local artifact
+set. Drafts and partial uploads retain their receipts too, preserving inputs for
+finalization or retry. Resume still verifies the actual remote assets; a saved
+receipt never authorizes skipping verification or publishing a draft.
 
 An explicitly requested draft remains private when a later `--resume` omits
 `--draft`; an unrelated existing draft also remains private. Existing public
@@ -1028,6 +1071,31 @@ available toolchain identities, and the strict Windows Cargo context summary.
 The values agree with the durable target result and manifest build-environment
 receipt. Failed attempts retain the evidence available before failure;
 unattempted targets do not receive fabricated provenance.
+
+Native results also retain `native_execution`: the observed `phase`, configured
+`timeout_seconds` and `transport_timeout_seconds`, original `command_exit_code`,
+`failure_kind` (`command`, `validation`, or null), and
+`build_program_dispatched`. The source-verification and toolchain-observation
+phases use the sync budget; the final build program uses the build budget, with
+transport cleanup grace recorded separately. A successful observation whose
+receipt fails validation retains command exit zero and a `failure_kind` of
+`"validation"`. A timeout return is still normalized to target status `timeout`
+and DSR exit 5, with raw exit 124 retained. That code alone does not prove that
+the host supervisor fired: inspect the private native attempt `log_file`, which
+is distinct from the coordinator worker transcript at `log_path`.
+
+`build_program_dispatched: false` means the final build transport was not called.
+True records dispatch only; source/toolchain checks inside the guarded program
+can still refuse execution before Cargo or rustc starts. Successful post-build
+verification leaves the build-command observation intact; failed post-build
+verification records its own phase. A later archive or collection failure does
+not turn a successful command into a compiler failure. Earlier admission
+refusals without an execution observation omit this object.
+Native per-target `duration_seconds` is converted to `duration_ms` in public
+JSON when a millisecond measurement is absent; an existing millisecond value,
+including zero, takes precedence. This elapsed time includes native preparation
+and verification and is not a compiler-only timing.
+
 Native targets build on the host their source was synced to. Manifest artifacts
 and build-environment receipts retain the native task's selected triple; flat
 raw payload names are qualified when needed, while archive members keep the
@@ -1092,7 +1160,12 @@ download candidates can still refuse preparation. A lockfile without Git
 dependencies does not inspect the Git cache. Selection conservatively covers
 all lockfile packages, not a minimal
 target/feature graph, and selected Git databases/indexes retain their history.
-Ordinary native builds copy the `registry` and `git` caches.
+Ordinary native Unix and Windows builds also select downloads from the source
+workspace's `Cargo.lock` when it exists. An existing malformed or linked lockfile
+refuses preparation; only an absent lockfile permits the unscoped private cache
+snapshot. The selected lockfile digest is retained in the seed receipt. Ordinary
+builds may fetch missing dependencies into their private home and do not gain
+strict source-authentication authority from this cache selection.
 Metadata and target attempts never compile through ambient cache symlinks or
 Windows junctions. Strict metadata admits a retained seed only after successful
 locked offline resolution and source authentication; retained seeds contain
@@ -1360,6 +1433,46 @@ Quoted literals, the effective `$CARGO_BUILD_TARGET`, and compound commands
 with a common Cargo selection are supported. DSR records Cargo and rustc
 paths, SHA-256 digests and verbose versions, the selected target linker,
 named Cargo plugins, and `cargo-zigbuild`/`zig` when DSR routes through them.
+Configuration validation uses this same command-selection parser for literal
+GNU ABI requests, so `config validate`, build, and release admit the supported
+explicit form before staging. Configured target maps and target environment
+variables keep plain Rust identities; they never acquire a glibc suffix.
+Explicit GNU ABI requests such as
+`cargo +nightly zigbuild --target=x86_64-unknown-linux-gnu.2.28` retain
+`x86_64-unknown-linux-gnu` as their Rust target, configuration lookup key and
+artifact directory. The exact requested `zig_target`, `rust_target` and
+`glibc_floor` are retained separately in `selection.cargo_zigbuild`, matching
+`selection.dsr_cargo_shim`. Only a direct `zigbuild` command with a literal
+GNU target and `MAJOR.MINOR` suffix receives this interpretation; other
+subcommands, non-GNU targets, malformed versions and conflicting command-list
+selections refuse admission. Both `--target VALUE` and `--target=VALUE` work.
+
+Strict explicit Zig builds, including unversioned GNU and musl targets, use
+the same generated Cargo dispatcher as managed glibc-floor builds.
+An unversioned invocation retains the plain target in both `rust_target` and
+`zig_target`, with `glibc_floor: null`; DSR adds no ABI suffix or floor.
+Its exact generator bytes are verified before
+tool lookup; it preserves explicit Zig arguments and pins the absolute Zig
+executable selected on the delegated PATH. Caller `CARGO_ZIGBUILD_*` dispatch
+overrides, including empty values, are refused. Cargo global-option prefixes
+and `+toolchain` retain their argument boundaries. Record, cache and pre/post
+build verification require this dispatcher; metadata-only admission uses
+ordinary locked/offline Cargo metadata and does not compile through Zig.
+Changing the requested target or floor, dispatcher, plugin or compiler
+invalidates the held receipt. The exact request, including an absent floor,
+also remains in the strict cache key. This binding prevents cargo-zigbuild's
+Python-first discovery from executing an unobserved `ziglang` module even
+when a different, hash-verified Zig executable is available on PATH.
+
+The requested Zig version is separate from the configured
+`linux_glibc_floor` ceiling on collected ELF requirements. A request for
+2.17 may satisfy a configured 2.28 ceiling; the actual collected bytes must
+still pass that ceiling. The
+[cargo-zigbuild documentation](https://github.com/rust-cross/cargo-zigbuild/tree/v0.24.0#specify-glibc-version)
+describes suffix handling and cautions that Zig can fall back for invalid
+versions. An identity receipt therefore records the request and does not
+claim that the final binary meets it without the existing artifact checks.
+
 Explicit `RUSTC`/`CARGO_BUILD_RUSTC` executables and compiler wrappers retain
 their own identities; arbitrary scripts are not mislabeled as rustup's
 compiler. Proven rustup proxies and Apple `/usr/bin` compiler launchers also
@@ -1998,8 +2111,69 @@ dsr prune [--dry-run] [--max-age <days>] [--keep-last <n>] [--force]
 | `--force` | false | Skip confirmation prompt |
 
 Artifact sets are `artifacts/<tool>-<tag>/` with their `<tool>-<tag>-manifest.json`;
-a set is published when `releases/<tool>-<tag>-upload.json` exists. The build run
-`latest` points to is always kept. The global `--dry-run` applies.
+`--keep-releases` retains a set when `releases/<tool>-<tag>-upload.json` exists.
+Publication keeps that private upload receipt after success. A partial upload
+or completed draft also keeps its receipt, so this retention test conservatively
+protects recovery inputs without asserting that the release is public. Prune
+does not contact GitHub or reconstruct missing historical receipts. The build
+run `latest` points to is always kept. The global `--dry-run` applies.
+
+Artifact pruning requires a regular manifest that is not a symbolic link at
+`artifacts/<tool>-<tag>/<tool>-<tag>-manifest.json` or the adjacent
+`artifacts/<tool>-<tag>-manifest.json`. Its tool and canonical version must match
+the set name; when both manifests exist, their owner and recorded run/source
+identities must agree. Custom, quarantined, worker UUID and other unidentified
+directories are retained. A build-purpose marker must describe completed,
+publishable release output and bind the internal manifest's digest, run ID and
+source commit. Pending or non-publishable output is retained even when an older
+manifest remains in the directory. Legacy sets without a purpose marker remain
+eligible when their manifest ownership is valid.
+
+For an eligible artifact set, prune acquires both the canonical tag lease and
+the possible unprefixed version lease, then verifies that the directory,
+manifests and purpose marker still match its initial observation. The leases
+remain held through removal of both the directory and adjacent manifest.
+Busy or unverifiable leases and changed observations retain the complete set.
+The age, per-tool keep-last and published-release retention policies still
+apply. `retained_artifact_paths` reports additional exclusions as `{path, reason}`:
+`build_custody` for unavailable leases, `publication_pending` for unfinished or
+non-publishable output, and `artifact_ownership` for unknown, conflicting or
+changed ownership evidence. The path identifies the directory, or the adjacent
+manifest when the directory is absent.
+
+Build checkpoint pruning acquires the same tool/version lease used by builds
+and holds it through selection and removal. Both the stored version and its
+canonical tag are covered when they differ, such as `1.2.3` and `v1.2.3`.
+A busy lease, including one inherited by a worker after its coordinator exits,
+or unverifiable lease metadata keeps that version's checkpoints. Dry-run only
+probes existing leases; it creates no build lease or checkpoint and reports a
+current observation, not a reservation for a later invocation.
+
+Checkpoints with recorded source roots are retained, including roots in source
+sync history and relocation evidence. Strict snapshots and their private Cargo
+caches live outside the ordinary state/cache directories and may be protected
+from external cleanup. Removing the checkpoint first would orphan those caches
+and discard recovery evidence. This command does not reclaim the snapshots;
+their recorded paths alone do not establish the directory custody required for
+automatic deletion. Malformed, mismatched or linked checkpoints and ambiguous
+`latest` entries are also retained. These guards apply even with `--keep-last 0`
+or `--force`.
+
+JSON results report these additional exclusions in `retained_build_paths`, an
+array of `{path, reason}` objects. `build_custody` identifies a busy or
+unverifiable build lease, `source_roots` identifies retained source references,
+and `invalid_state` identifies an unverifiable checkpoint or resume selection.
+These exclusions are successful skips; deletion or lease-release errors still
+produce a partial result. The build leases coordinate artifact/checkpoint
+cleanup with builds, fallback runs and standalone binary `dsr release` calls.
+Strict `dsr release finalize` and mutating `dsr release verify --fix` also hold
+these leases, including while a concurrent prune uses `--no-keep-releases`:
+that option changes retention policy and cannot override active custody.
+Native recovery and the standalone
+library finalizer use separate custody mechanisms. Custom outputs outside
+`state/artifacts`, logs, files in `state/manifests` and ordinary cache entries
+remain governed by their existing retention policies. These checks do not
+establish that every recorded recovery input is reclaimable.
 
 **Exit codes:**
 - `0`: Prune completed successfully

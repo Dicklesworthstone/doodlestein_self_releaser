@@ -8,9 +8,12 @@ on:
       - src/cargo_cache.sh
       - src/cargo_sources.sh
       - src/config.sh
+      - src/packaging.sh
+      - scripts/tests/test_act_runner_native.sh
       - scripts/tests/test_cargo_cache.sh
       - scripts/tests/test_native_single_archives.sh
       - scripts/tests/test_strict_cargo_private_cache.sh
+      - scripts/tests/test_toolchain_identity.sh
       - .github/workflows/native-archive-regression.yml
   workflow_dispatch:
 permissions:
@@ -36,19 +39,51 @@ jobs:
           set -euo pipefail
           if [[ "$RUNNER_OS" == Linux ]]; then
             sudo apt-get update
-            sudo apt-get install -y --no-install-recommends jq clang lld xz-utils zip unzip python3 cargo rustc
+            sudo apt-get install -y --no-install-recommends jq clang lld xz-utils zip unzip python3 cargo rustc libarchive-tools minisign
           else
-            for tool in jq xz go; do
+            for tool in jq xz go minisign; do
               command -v "$tool" >/dev/null || brew install "$tool"
             done
             python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null || brew install python
             command -v cargo >/dev/null || brew install rust
             if (( BASH_VERSINFO[0] < 4 )); then brew install bash; fi
+            command -v gtar >/dev/null || brew install gnu-tar
             echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
           fi
           mkdir -p "$RUNNER_TEMP/dsr-test-bin"
           GOBIN="$RUNNER_TEMP/dsr-test-bin" go install github.com/mikefarah/yq/v4@v4.47.1
           echo "$RUNNER_TEMP/dsr-test-bin" >> "$GITHUB_PATH"
+      # This gate runs the generated floor shim through genuine Rustup/Cargo
+      # and Zig on macOS, producing both Linux GNU architectures at glibc 2.28.
+      - name: Qualify macOS to Linux glibc-floor toolchain identity
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          RUSTUP_TOOLCHAIN: nightly-2026-08-31
+          PIP_DISABLE_PIP_VERSION_CHECK: '1'
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          command -v rustup
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          rustup target add --toolchain "$RUSTUP_TOOLCHAIN" \
+            x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+          dsr_test_venv="$RUNNER_TEMP/dsr-zig-shim-qualification"
+          python3 -m venv "$dsr_test_venv"
+          "$dsr_test_venv/bin/python3" -m pip install \
+            'cargo-zigbuild==0.24.0' 'ziglang==0.17.0'
+          dsr_test_zig=$("$dsr_test_venv/bin/python3" -c \
+            'from pathlib import Path; import ziglang; print(Path(ziglang.__file__).with_name("zig"))')
+          test -x "$dsr_test_zig"
+          if [[ ! -e "$dsr_test_venv/bin/zig" ]]; then
+            ln -s "$dsr_test_zig" "$dsr_test_venv/bin/zig"
+          fi
+          export PATH="$dsr_test_venv/bin:$PATH"
+          cargo-zigbuild --version
+          zig version
+          bash -n scripts/tests/test_toolchain_identity.sh
+          bash scripts/tests/test_toolchain_identity.sh --rustup-dispatch-only
+          bash scripts/tests/test_toolchain_identity.sh --zig-shim-only
       - name: Validate actual native archive collection and receipts
         shell: bash
         run: |
@@ -62,4 +97,8 @@ jobs:
           bash -n scripts/tests/test_strict_cargo_private_cache.sh
           bash scripts/tests/test_cargo_cache.sh
           bash scripts/tests/test_strict_cargo_private_cache.sh
-          bash scripts/tests/test_native_single_archives.sh
+          # Both writers must produce real normalized archives on both hosts.
+          # The BSD lane uses macOS's native tar there, not GNU tar in disguise.
+          DSR_TEST_TAR=gnu bash scripts/tests/test_native_single_archives.sh
+          DSR_TEST_TAR=bsd bash scripts/tests/test_native_single_archives.sh
+          bash scripts/tests/test_act_runner_native.sh --archive-delivery-only

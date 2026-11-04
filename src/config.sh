@@ -17,8 +17,13 @@
 
 set -uo pipefail
 
+# Preserve the source module's location for exported validators too. Their
+# BASH_SOURCE becomes "environment" in a child shell and must never make its
+# current working directory an authority for loading the native parser.
+_DSR_CONFIG_MODULE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || { return 3 2>/dev/null || exit 3; }
+export _DSR_CONFIG_MODULE_DIR
 # shellcheck source=src/platforms.sh
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/platforms.sh" || { return 3 2>/dev/null || exit 3; }
+source "$_DSR_CONFIG_MODULE_DIR/platforms.sh" || { return 3 2>/dev/null || exit 3; }
 
 # XDG directories with defaults (respect existing env vars for testing)
 DSR_CONFIG_DIR="${DSR_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/dsr}"
@@ -1550,11 +1555,11 @@ config_validate_target_triples() {
     done < <(jq -r 'keys[]' <<< "$mapping_json")
 }
 
-# A Zig glibc floor is not a Rust target identity (GH #37). A literal selector
-# such as --target x86_64-unknown-linux-gnu.2.28 compiles, but cannot agree with
-# the plain triple pinned by the native worker and its collection receipt.
-# Refuse that configuration before source staging, metadata or compilation;
-# never strip the suffix from a retained receipt to make collection pass.
+# A Zig glibc floor is not a Rust target identity (GH #37). Keep target maps
+# and environment identities plain. The native observer can separately bind
+# an explicit cargo-zigbuild ABI request to that Rust target; reuse its command
+# parser before admitting such a request through the public configuration gate.
+# Never strip a suffix from configured identities or retained worker receipts.
 # This is a literal-selector check, not shell evaluation. Dynamically assembled
 # selectors remain subject to the existing native command/receipt validators.
 _config_gnu_target_selector_rows_json() {
@@ -1564,9 +1569,9 @@ _config_gnu_target_selector_rows_json() {
             elif type == "array" then to_entries[] | . as $entry |
                 $entry.value | identities($path+"["+($entry.key|tostring)+"]")
             else empty end;
-        def scope($path):
+        def scope($path; $command_active):
             . as $scope |
-            (if .build_cmd | type == "string" then
+            (if $command_active and (.build_cmd | type == "string") then
                 {path:($path+"build_cmd"),value:.build_cmd,kind:"command"}
              else empty end),
             (if $scope.env | type == "object" then
@@ -1575,11 +1580,21 @@ _config_gnu_target_selector_rows_json() {
                 . as $entry | .value | identities($path+"env."+$entry.key)
              else empty end),
             (if $path != "" then .target | identities($path+"target") else empty end);
+        def all_commands_overridden:
+            . as $config |
+            if (.targets | type == "array" and length > 0) and
+               (.cross_compile | type == "object") then
+                all(.targets[]; . as $platform |
+                    $config.cross_compile[$platform].build_cmd |
+                    if type == "string" then length > 0 else false end)
+            else false end;
         if type != "object" then error("expected tool configuration object") else
-            [scope(""),
+            # Per-platform commands replace the global recipe. Do not make an
+            # unused global recipe a new restriction on a fully explicit matrix.
+            [scope(""; (all_commands_overridden | not)),
              (if .cross_compile | type == "object" then
                  .cross_compile | to_entries[] | select(.value|type=="object") |
-                 . as $entry | .value | scope("cross_compile["+($entry.key|tojson)+"].")
+                 . as $entry | .value | scope("cross_compile["+($entry.key|tojson)+"]."; true)
               else empty end),
              (if .target_triples | type == "object" then
                  .target_triples | to_entries[] | . as $entry |
@@ -1638,15 +1653,35 @@ _config_reject_gnu_target_suffix() {
     local tool="$1" path="$2" value="$3" triple floor
     if [[ "$value" =~ ^([A-Za-z0-9_+-]+(-[A-Za-z0-9_+-]+)*-linux-gnu[a-z0-9_]*)\.([0-9]+\.[0-9]+)$ ]]; then
         triple=${BASH_REMATCH[1]}; floor=${BASH_REMATCH[3]}
-        _cfg_log_error "$tool $path: unsupported glibc-qualified target $triple.$floor; use plain $triple and linux_glibc_floor: \"$floor\" with cargo build (not an explicit cargo zigbuild target suffix)"
+        _cfg_log_error "$tool $path: glibc-qualified target $triple.$floor cannot be a Rust identity; use plain $triple with linux_glibc_floor: \"$floor\", or a direct cargo zigbuild --target $triple.$floor build command"
         return 4
     fi
+}
+
+# Selection mode reads literal command intent without running Cargo, reading
+# project/ambient Cargo configuration or trusting a worker receipt. Source the
+# authoritative parser in a private privileged shell so inherited functions and
+# BASH_ENV cannot replace it; command bytes enter this child over stdin, not as
+# shell source or another exec argument. Keep its detailed
+# diagnostics private because command arguments can contain secrets.
+_config_validate_explicit_zigbuild_command() {
+    local command="$1" selection
+    [[ "${_DSR_CONFIG_MODULE_DIR:-}" == /* ]] || return 4
+    selection=$(printf '%s\0' "$command" | "$BASH" -p -c '
+        IFS= read -r -d "" command || exit 4
+        source "$1/act_runner.sh" || exit 4
+        _act_explicit_zigbuild_selection "$command" ""
+    ' _ "$_DSR_CONFIG_MODULE_DIR" 2>/dev/null) || return 4
+    jq -e 'type == "object" and
+        (.rust_target | type == "string" and test("^[A-Za-z0-9_]+(-[A-Za-z0-9_]+)*-linux-gnu$")) and
+        (.glibc_floor | type == "string" and test("^[0-9]+\\.[0-9]+$")) and
+        .zig_target == (.rust_target + "." + .glibc_floor)' <<< "$selection" >/dev/null
 }
 
 # repos.d is the native build authority. Only registry-only tools are read from
 # repos.yaml here; unrelated tools and non-build strings are not selectors.
 config_validate_gnu_target_suffixes() {
-    local toolname="${1:-}" config_file document rows row path value kind tokens word target_next
+    local toolname="${1:-}" config_file document rows row path value kind tokens word target_next explicit_zig
     [[ -n "$toolname" ]] || return 4
     config_file="${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.d/$toolname.yaml"
     if [[ -f "$config_file" ]]; then
@@ -1676,18 +1711,28 @@ config_validate_gnu_target_suffixes() {
             tokens=$(_config_literal_target_words "$value" | jq -Rs 'split("\u0000")[:-1]') || {
                 _cfg_log_error "$toolname $path: malformed literal target command"; return 4;
             }
-            target_next=false
-            jq -j '.[] + "\u0000"' <<< "$tokens" | while IFS= read -r -d '' word; do
+            target_next=false explicit_zig=false
+            while IFS= read -r -d '' word; do
                 if [[ "$target_next" == true ]]; then
-                    _config_reject_gnu_target_suffix "$toolname" "$path" "$word" || return 4
+                    if [[ "$word" =~ -linux-gnu[a-z0-9_]*\. ]]; then
+                        explicit_zig=true
+                    fi
                 fi
                 target_next=false
                 case "$word" in
                     --target) target_next=true ;;
-                    --target=*|CARGO_BUILD_TARGET=*|DSR_TARGET_TRIPLE=*)
+                    --target=*)
+                        if [[ "${word#*=}" =~ -linux-gnu[a-z0-9_]*\. ]]; then
+                            explicit_zig=true
+                        fi ;;
+                    CARGO_BUILD_TARGET=*|DSR_TARGET_TRIPLE=*)
                         _config_reject_gnu_target_suffix "$toolname" "$path" "${word#*=}" || return 4 ;;
                 esac
-            done || return 4
+            done < <(jq -j '.[] + "\u0000"' <<< "$tokens")
+            if $explicit_zig && ! _config_validate_explicit_zigbuild_command "$value"; then
+                _cfg_log_error "$toolname $path: glibc-qualified selectors require one consistent direct cargo zigbuild --target <GNU Rust triple>.<MAJOR.MINOR> selection; keep target identities plain and use linux_glibc_floor for the collected ELF ceiling"
+                return 4
+            fi
         fi
     done <<< "$rows"
 }
@@ -1829,6 +1874,7 @@ export -f config_get_tool_field config_get_install_script_compat config_get_inst
 export -f config_get_artifact_naming config_get_target_triple config_get_arch_alias
 export -f _config_target_triples_json config_get_target_triples config_get_target_triples_json config_validate_target_triples
 export -f _config_gnu_target_selector_rows_json config_validate_gnu_target_suffixes
+export -f _config_validate_explicit_zigbuild_command
 export -f _config_literal_target_words _config_reject_gnu_target_suffix
 export -f config_get_linux_libc_fallback
 export -f config_get_release_contract_json config_validate_release_contract config_validate_targets

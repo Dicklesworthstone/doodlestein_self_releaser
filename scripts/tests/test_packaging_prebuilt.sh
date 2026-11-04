@@ -24,6 +24,48 @@ expect_invalid() {
     [[ $rc -eq 4 && ! -s "$work/stdout" ]] && pass "$label" || fail "$label: expected 4, got $rc"
 }
 expect_equal() { cmp -s "$2" "$3" && pass "$1" || fail "$1"; }
+repack_with_changed_copy_metadata() (
+    local replacement="$1" original="$2"
+    shift
+    cp() {
+        if [[ $# -eq 3 && "$1" == -- && "$2" == "$original" ]]; then
+            command cp -- "$replacement" "$3"
+        else
+            command cp "$@"
+        fi
+    }
+    packaging_repack_archive "$@"
+)
+change_archive_container_bytes() {
+    python3 - "$@" <<'PY'
+import io
+from pathlib import Path
+import sys
+import tarfile
+import zipfile
+
+source, destination = map(Path, sys.argv[1:3])
+fmt = sys.argv[3]
+if fmt == 'tar.gz':
+    data = bytearray(source.read_bytes())
+    assert data[:2] == b'\x1f\x8b' and not data[3] & 2
+    # Change only gzip's timestamp; the compressed payload and CRC stay valid.
+    data[4:8] = (int.from_bytes(data[4:8], 'little') ^ 1).to_bytes(4, 'little')
+    destination.write_bytes(data)
+elif fmt == 'tar.xz':
+    with tarfile.open(source, 'r:xz') as incoming:
+        rows = [(member, incoming.extractfile(member).read()) for member in incoming]
+    with tarfile.open(destination, 'w:xz', format=tarfile.PAX_FORMAT) as outgoing:
+        for member, data in rows:
+            member.mtime = int(member.mtime) + 1
+            member.pax_headers.pop('mtime', None)
+            outgoing.addfile(member, io.BytesIO(data))
+else:
+    destination.write_bytes(source.read_bytes())
+    with zipfile.ZipFile(destination, 'a') as archive:
+        archive.comment = b'copy changed the container without changing its payload'
+PY
+}
 
 for tool in tar gzip xz cmp stat; do
     command -v "$tool" >/dev/null || { printf 'Missing dependency: %s\n' "$tool" >&2; exit 3; }
@@ -39,6 +81,19 @@ cp "$work/input/docs/guide.txt" "$work/extras/docs/guide.txt"
 printf 'additional notice\n' > "$work/extras/NOTICE"
 printf 'mode-sensitive companion\n' > "$work/extras/helper"
 chmod 0654 "$work/extras/helper"
+mkdir -p "$work/private" "$work/plain" "$work/executable" "$work/changed" "$work/legacy"
+printf '#!/bin/sh\nprintf "private helper\\n"\n' > "$work/private/helper"
+printf 'ordinary companion\n' > "$work/private/NOTICE"
+chmod 0700 "$work/private/helper"
+chmod 0600 "$work/private/NOTICE"
+cp "$work/private/helper" "$work/plain/helper"
+chmod 0600 "$work/plain/helper"
+cp "$work/private/NOTICE" "$work/executable/NOTICE"
+chmod 0700 "$work/executable/NOTICE"
+printf 'different helper bytes\n' > "$work/changed/helper"
+chmod 0700 "$work/changed/helper"
+cp "$work/private/helper" "$work/legacy/helper"
+chmod 0775 "$work/legacy/helper"
 
 for format in tar.gz tar.xz zip; do
     if [[ "$format" == zip ]] && { ! command -v zip >/dev/null || ! command -v unzip >/dev/null; }; then
@@ -72,7 +127,9 @@ for format in tar.gz tar.xz zip; do
         expect_equal "$format retains binary payload" "$work/input/tool" "$dir/extracted/tool"
         expect_equal "$format includes new notice once" "$work/extras/NOTICE" "$dir/extracted/NOTICE"
         mode=$(stat -c '%a' "$dir/extracted/helper" 2>/dev/null || stat -f '%Lp' "$dir/extracted/helper")
-        [[ "$mode" == 654 ]] && pass "$format retains exact include executable bits" || fail "$format include mode: $mode"
+        [[ "$mode" == 755 ]] && pass "$format normalizes new include executable mode" || fail "$format include mode: $mode"
+        source_mode=$(stat -c '%a' "$work/extras/helper" 2>/dev/null || stat -f '%Lp' "$work/extras/helper")
+        [[ "$source_mode" == 654 ]] && pass "$format preserves source include mode" || fail "$format source include mode: $source_mode"
         actual=$(packaging_payload_members "$extended" "$format")
         [[ "$actual" == $'LICENSE\nNOTICE\ndocs/guide.txt\nhelper\ntool' ]] && \
             pass "$format exact complete member set" || fail "$format complete member set"
@@ -80,6 +137,154 @@ for format in tar.gz tar.xz zip; do
         fail "$format extended archive extraction"
     fi
     expect_equal "$format never changes producer archive" "$source_archive" "$dir/original"
+
+    # An ordinary native archive already carries its private include as 0755.
+    # The subsequent packaging pass must recognize that exact representation,
+    # not reject or recompress it merely because the source remains 0700.
+    canonical="$dir/canonical.$format"
+    canonical_copy="$dir/canonical-copy.$format"
+    expect_success "$format creates canonical archive from private includes" \
+        packaging_build_archive "$format" "$canonical" "$work/private" helper NOTICE
+    expect_success "$format private-include fixture has canonical metadata" \
+        _pkg_archive_inspect normalized "$canonical" "$format"
+    expect_success "$format reuses canonical member with original private include" \
+        packaging_repack_archive "$canonical" "$format" "$canonical_copy" "$format" "$work/private" helper NOTICE
+    expect_equal "$format canonical include round trip preserves compressed bytes" "$canonical" "$canonical_copy"
+    canonical_inode=$(inode "$canonical_copy" 2>/dev/null || true)
+    expect_success "$format repeated canonical private include is idempotent" \
+        packaging_repack_archive "$canonical" "$format" "$canonical_copy" "$format" "$work/private" helper helper NOTICE
+    [[ -n "$canonical_inode" && "$(inode "$canonical_copy" 2>/dev/null)" == "$canonical_inode" ]] && \
+        pass "$format canonical include retry preserves destination inode" || fail "$format canonical include retry preserves destination inode"
+
+    printf 'previous canonical destination\n' > "$dir/canonical-guarded.$format"
+    cp "$dir/canonical-guarded.$format" "$dir/canonical-sentinel"
+    expect_invalid "$format ordinary include cannot satisfy canonical executable" \
+        packaging_repack_archive "$canonical" "$format" "$dir/canonical-guarded.$format" "$format" "$work/plain" helper
+    expect_invalid "$format executable include cannot satisfy canonical ordinary file" \
+        packaging_repack_archive "$canonical" "$format" "$dir/canonical-guarded.$format" "$format" "$work/executable" NOTICE
+    expect_invalid "$format canonical metadata cannot hide differing include bytes" \
+        packaging_repack_archive "$canonical" "$format" "$dir/canonical-guarded.$format" "$format" "$work/changed" helper
+
+    # Copy corruption must not reuse an earlier normalization decision. Keep
+    # the payload and all executable bits identical, changing only the public
+    # mode so the final archive admission must inspect the copied headers.
+    changed_metadata="$dir/changed-metadata.$format"
+    if python3 - "$canonical" "$changed_metadata" "$format" <<'PY'
+import io
+import stat
+import sys
+import tarfile
+import zipfile
+
+source, destination, fmt = sys.argv[1:]
+if fmt == 'zip':
+    with zipfile.ZipFile(source) as incoming, zipfile.ZipFile(destination, 'w') as outgoing:
+        for member in incoming.infolist():
+            data = incoming.read(member)
+            if member.filename == 'helper':
+                member.external_attr = (stat.S_IFREG | 0o775) << 16
+            outgoing.writestr(member, data)
+else:
+    with tarfile.open(source) as incoming, tarfile.open(destination, 'w:' + ('gz' if fmt == 'tar.gz' else 'xz')) as outgoing:
+        for member in incoming.getmembers():
+            data = incoming.extractfile(member).read()
+            if member.name == 'helper':
+                member.mode = 0o775
+            outgoing.addfile(member, io.BytesIO(data))
+PY
+    then
+        expect_invalid "$format revalidates canonical metadata after copying" \
+            repack_with_changed_copy_metadata "$changed_metadata" "$canonical" "$format" \
+                "$dir/canonical-guarded.$format" "$format" "$work/private" helper NOTICE
+        expect_equal "$format metadata-only copy failure preserves destination" \
+            "$dir/canonical-sentinel" "$dir/canonical-guarded.$format"
+    else
+        fail "$format changed-metadata fixture creation"
+    fi
+
+    # A 0775 legacy member has the same execution mask as canonical 0755 but
+    # does not qualify for normalization-aware reuse. Exact legacy masks remain
+    # accepted separately; neither fixture is rewritten during a same-format copy.
+    legacy="$dir/legacy.$format"
+    legacy_private="$dir/legacy-private.$format"
+    case "$format" in
+        tar.gz)
+            tar -czf "$legacy" -C "$work/legacy" helper
+            tar -czf "$legacy_private" -C "$work/private" helper
+            ;;
+        tar.xz)
+            tar -cJf "$legacy" -C "$work/legacy" helper
+            tar -cJf "$legacy_private" -C "$work/private" helper
+            ;;
+        zip)
+            (cd "$work/legacy" && zip -q -0 "$legacy" helper)
+            (cd "$work/private" && zip -q -0 "$legacy_private" helper)
+            ;;
+    esac
+    expect_invalid "$format legacy fixture is not canonical despite full execution mask" \
+        _pkg_archive_inspect normalized "$legacy" "$format"
+    expect_invalid "$format unnormalized prebuilt retains exact include-mask policy" \
+        packaging_repack_archive "$legacy" "$format" "$dir/canonical-guarded.$format" "$format" "$work/private" helper
+    expect_equal "$format include refusals preserve previous destination" "$dir/canonical-sentinel" "$dir/canonical-guarded.$format"
+    expect_success "$format matching legacy private include remains accepted" \
+        packaging_repack_archive "$legacy_private" "$format" "$dir/legacy-copy.$format" "$format" "$work/private" helper
+    expect_equal "$format matching legacy private include retains original archive bytes" "$legacy_private" "$dir/legacy-copy.$format"
+
+    # Equal payloads and canonical permissions do not prove a byte-for-byte
+    # prebuilt copy. Exercise both admission policies with valid containers
+    # whose timestamps or ZIP comment changed during the final copy.
+    canonical_container="$dir/canonical-container.$format"
+    legacy_container="$dir/legacy-container.$format"
+    if change_archive_container_bytes "$canonical" "$canonical_container" "$format" && \
+       change_archive_container_bytes "$legacy_private" "$legacy_container" "$format"; then
+        expect_success "$format changed canonical container retains exact payload and public metadata" \
+            _pkg_archive_matches_payload "$canonical_container" "$format" "$work/private" $'NOTICE\nhelper' normalized
+        expect_success "$format changed legacy container retains exact payload and executable bits" \
+            _pkg_archive_matches_payload "$legacy_container" "$format" "$work/private" helper
+        for copy_case in canonical-exact canonical-private legacy-private; do
+            copy_source="$canonical"
+            changed_container="$canonical_container"
+            copy_includes=()
+            case "$copy_case" in
+                canonical-private) copy_includes=("$work/private" helper NOTICE) ;;
+                legacy-private)
+                    copy_source="$legacy_private"
+                    changed_container="$legacy_container"
+                    copy_includes=("$work/private" helper)
+                    ;;
+            esac
+            if cmp -s "$copy_source" "$changed_container"; then
+                fail "$format $copy_case fixture changes authoritative container bytes"
+            else
+                pass "$format $copy_case fixture changes authoritative container bytes"
+            fi
+            copy_source_before="$dir/source-before-$copy_case"
+            cp "$copy_source" "$copy_source_before"
+            copy_source_inode=$(inode "$copy_source" 2>/dev/null || true)
+            copy_destination="$dir/guarded-$copy_case.$format"
+            printf 'previous destination for %s\n' "$copy_case" > "$copy_destination"
+            cp "$copy_destination" "$dir/sentinel-$copy_case"
+            copy_destination_inode=$(inode "$copy_destination" 2>/dev/null || true)
+            expect_invalid "$format $copy_case rejects changed compressed copy bytes" \
+                repack_with_changed_copy_metadata "$changed_container" "$copy_source" "$format" \
+                    "$copy_destination" "$format" "${copy_includes[@]}"
+            expect_equal "$format $copy_case failure preserves previous destination bytes" \
+                "$dir/sentinel-$copy_case" "$copy_destination"
+            [[ -n "$copy_destination_inode" && "$(inode "$copy_destination" 2>/dev/null)" == "$copy_destination_inode" ]] && \
+                pass "$format $copy_case failure preserves destination inode" || \
+                fail "$format $copy_case failure preserves destination inode"
+            expect_equal "$format $copy_case failure preserves authoritative source bytes" \
+                "$copy_source_before" "$copy_source"
+            [[ -n "$copy_source_inode" && "$(inode "$copy_source" 2>/dev/null)" == "$copy_source_inode" ]] && \
+                pass "$format $copy_case failure preserves authoritative source inode" || \
+                fail "$format $copy_case failure preserves authoritative source inode"
+        done
+    else
+        fail "$format changed-container fixture creation"
+    fi
+    private_mode=$(stat -c '%a' "$work/private/helper" 2>/dev/null || stat -f '%Lp' "$work/private/helper")
+    [[ "$private_mode" == 700 ]] && pass "$format original private include stays 0700" || fail "$format original private include mode: $private_mode"
+    expect_equal "$format original private include bytes stay unchanged" "$work/private/helper" "$work/plain/helper"
 
     printf 'previous destination\n' > "$dir/guarded.$format"
     cp "$dir/guarded.$format" "$dir/sentinel"

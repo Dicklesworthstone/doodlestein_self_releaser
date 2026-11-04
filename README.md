@@ -219,6 +219,15 @@ before compilation, including explicitly pinned hosts. Recipes that select an
 executable path, wrapper, or nondefault toolchain keep their existing build
 context checks instead of being judged against an unrelated ambient compiler.
 
+Unix source synchronization preserves file contents, permissions and links,
+while newly transferred files belong to the account receiving the build over
+SSH. This also applies to root workers and the tar fallback, so a macOS
+controller's numeric UID is not imported into a Linux checkout. An existing
+destination or `.git` entry owned by another account stops synchronization
+with the path and both UIDs in the error. Select a fresh build stage or repair
+that checkout's ownership before retrying; DSR does not add Git
+`safe.directory` exceptions or change ownership of existing projects.
+
 Release snapshots and isolated Rust builds are staged under `/var/tmp` on Linux hosts and
 `/private/tmp` on macOS — never `/tmp`, which is frequently a RAM-backed tmpfs that a multi-GB
 source tree plus Cargo target will exhaust. Set `build_root` on a host to stage somewhere else
@@ -1306,6 +1315,27 @@ triples, and dsr applies no shim for platforms whose env carries an operator
 cross toolchain (`CARGO_TARGET_<T>_LINKER` / `CC_<t>`) or build commands that
 already invoke `zigbuild`, `xwin`, or `cross` — but an explicitly configured
 `linux_glibc_floor` is still enforced on those binaries.
+
+Strict Unix builds attest the generated Cargo shim separately from the actual
+Cargo, rustc and rustup executables it delegates to. The expected shim hash is
+derived from DSR's generator; changed bytes, links or unexpected files in its
+directory stop admission before a toolchain probe can use them. The original
+receipt binds the target and glibc floor and is checked again before and after
+compilation. The build still runs through cargo-zigbuild and Zig, whose
+executable identities are also retained. `strict_cargo_cache_root` uses this
+same verified dispatch and separates cache entries by target and floor, while
+allowing identical generated shims in fresh source stages to reuse eligible
+intermediates.
+
+The generated shim pins cargo-zigbuild to the Zig executable on its delegated
+PATH, including with plugin versions that otherwise prefer Python's `ziglang`
+package. It rejects externally supplied `CARGO_ZIGBUILD_ZIG_COMMAND`,
+`CARGO_ZIGBUILD_ZIG_COMMAND_ARGS`, `CARGO_ZIGBUILD_PYTHON_PATH`,
+`CARGO_ZIGBUILD_ZIG_PATH`, and `CARGO_ZIGBUILD_ZIG_VERSION`, including empty
+values. Put the intended Zig executable on PATH; use an explicit
+`cargo zigbuild` build command when the repository owns Zig dispatch.
+Interpreter aliases back to the staged Cargo shim are rejected before the
+identity observer starts, including symlinks and hard links outside its directory.
 
 ### gnu and musl variants of one platform
 

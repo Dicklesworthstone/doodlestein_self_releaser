@@ -7,6 +7,7 @@
 #   - Workspace isolation (unique run_id directories)
 #   - Resume from partial builds
 #   - Inherited build custody across coordinator loss
+#   - Verified borrowing of a caller's inherited build custody
 #
 # Usage:
 #   source build_state.sh
@@ -407,6 +408,50 @@ build_lock_acquire() {
   _BUILD_LOCK_RECORDS[$index]="$record"
   log_info "Acquired build custody for $tool $version"
   return 0
+}
+
+# Borrow custody already held by this shell or an ancestor. The registry is
+# inherited by Bash children, not exported as an environment assertion. Verify
+# the original open description as well as its path and exact owner record;
+# a busy pathname alone could belong to a different process after replacement.
+# Return 1 for no registered lease, 4 for unverifiable custody, and 0 only for
+# verified custody. Never close the descriptor or change its acquiring owner.
+build_lock_borrow() {
+  local tool="$1" version="$2" lock_file index descriptor identity record owner probe_status
+  [[ "$tool" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$ &&
+     "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$ ]] || return 4
+  [[ -n "$_BUILD_STATE_DIR" ]] || return 1
+  lock_file=$(_build_get_lock_file "$tool" "$version")
+  for index in "${!_BUILD_LOCK_PATHS[@]}"; do
+    [[ "${_BUILD_LOCK_PATHS[$index]}" == "$lock_file" ]] || continue
+    descriptor="${_BUILD_LOCK_FDS[$index]:-}"
+    identity="${_BUILD_LOCK_IDENTITIES[$index]:-}"
+    record="${_BUILD_LOCK_RECORDS[$index]:-}"
+    owner="${_BUILD_LOCK_OWNERS[$index]:-}"
+    if [[ ! "$descriptor" =~ ^[0-9]{1,3}$ || ! "$identity" =~ ^[0-9]+:[0-9]+$ ||
+          ! "$owner" =~ ^[1-9][0-9]*$ ||
+          "$record" != "$owner "* || -L "$lock_file.lease" ||
+          "$(_build_state_file_identity "$lock_file.lease")" != "$identity" ||
+          "$(_build_state_fd_identity "$descriptor")" != "$identity" ||
+          "$(_build_lock_record "$lock_file" "$identity")" != "$record" ]]; then
+      log_error "Cannot borrow changed build custody for $tool $version"
+      return 4
+    fi
+    probe_status=0
+    _build_lock_probe "$lock_file" || probe_status=$?
+    # The independent open must be excluded, while the registered original
+    # description must still hold the lease. Neither operation unlocks it.
+    if [[ "$probe_status" != 2 ]] || ! _build_state_wait_lock "$descriptor" 0 ||
+       [[ -L "$lock_file.lease" ||
+          "$(_build_state_file_identity "$lock_file.lease")" != "$identity" ||
+          "$(_build_state_fd_identity "$descriptor")" != "$identity" ||
+          "$(_build_lock_record "$lock_file" "$identity")" != "$record" ]]; then
+      log_error "Cannot verify inherited build custody for $tool $version"
+      return 4
+    fi
+    return 0
+  done
+  return 1
 }
 
 build_lock_release() {

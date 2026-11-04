@@ -247,7 +247,7 @@ def consume(incoming, size):
     require(not incoming.read(1), 'archive member exceeds declared size')
 
 
-def inspect(source, fmt, check_content):
+def inspect(source, fmt, check_content, normalized=False):
     records, paths, total = {}, {}, 0
     if fmt == 'zip':
         zip_directory_budget(source, os.fstat(source.fileno()).st_size)
@@ -261,6 +261,17 @@ def inspect(source, fmt, check_content):
                 require(kind in (0, stat.S_IFDIR if directory else stat.S_IFREG), 'linked or special ZIP member')
                 require(not (entry.external_attr & 0x10) or directory, 'ZIP directory attributes disagree')
                 row = admit(records, paths, entry.filename, directory, entry.file_size, mode)
+                if normalized:
+                    require(not directory and kind == stat.S_IFREG and
+                            row['mode'] in (0o644, 0o755), 'noncanonical published ZIP mode')
+                    extra = entry.extra
+                    while extra:
+                        require(len(extra) >= 4, 'truncated ZIP extra field')
+                        tag, length = struct.unpack('<HH', extra[:4])
+                        require(length <= len(extra) - 4, 'truncated ZIP extra field')
+                        require(tag not in (0x000d, 0x5855, 0x7855, 0x7875),
+                                'published ZIP contains host ownership metadata')
+                        extra = extra[4 + length:]
                 total += row['size']
                 require(total <= total_limit, 'expanded archive bytes exceed budget')
             if check_content:
@@ -277,6 +288,11 @@ def inspect(source, fmt, check_content):
                 for entry in archive:
                     require((entry.isfile() or entry.isdir()) and not entry.issparse(), 'linked, sparse or special tar member')
                     row = admit(records, paths, entry.name, entry.isdir(), entry.size, entry.mode)
+                    if normalized:
+                        require(entry.isfile() and entry.mode in (0o644, 0o755),
+                                'noncanonical published tar mode')
+                        require(entry.uid == entry.gid == 0 and entry.uname == entry.gname == '',
+                                'noncanonical published tar ownership')
                     total += row['size']
                     require(total <= total_limit, 'expanded archive bytes exceed budget')
                     if check_content and not entry.isdir():
@@ -292,7 +308,7 @@ def inspect(source, fmt, check_content):
 
 try:
     action, path, fmt = sys.argv[1:]
-    require(action in ('list', 'validate'), 'invalid archive operation')
+    require(action in ('list', 'validate', 'normalized'), 'invalid archive operation')
     if fmt == 'tar.xz' and lzma is None:
         print('ERROR: Archive admission requires Python XZ support', file=sys.stderr)
         sys.exit(3)
@@ -312,7 +328,7 @@ try:
                 (fmt == 'zip' and magic[:4] in (b'PK\x03\x04', b'PK\x05\x06', b'PK\x07\x08')),
                 'archive bytes differ from declared format')
         source.seek(0)
-        rows = inspect(source, fmt, action == 'validate')
+        rows = inspect(source, fmt, action != 'list', action == 'normalized')
         require(identity(before) == identity(os.fstat(source.fileno())) ==
                 identity(os.stat(path, follow_symlinks=False)), 'archive changed during admission')
     if action == 'list':
@@ -413,12 +429,165 @@ _pkg_executable_bits() {
     printf '%s\n' "$((8#$mode & 0111))"
 }
 
+# Stream a newly constructed release archive from private normalized copies.
+# The caller owns the output descriptor and its receipt/publication checks.
+# Collection files are never chmodded, chowned, linked, or moved. In particular,
+# a private 0700 executable becomes a 0755 archive member, not a 0744 member.
+# Keep this separate from prebuilt archive reuse, whose exact bytes are evidence.
+packaging_stream_archive() (
+    set -o pipefail
+    local format="$1" payload_dir="$2" staging_parent="$3"
+    shift 3
+    [[ $# -gt 0 && -d "$payload_dir" && ! -L "$payload_dir" &&
+       -d "$staging_parent" && ! -L "$staging_parent" ]] || return 4
+    unset TAR_OPTIONS ZIPOPT GZIP XZ_OPT XZ_DEFAULTS
+    command -v python3 &>/dev/null || return 3
+    local member tar_version
+    local -a tar_options=()
+    case "$format" in
+        tar.gz|tgz|tar.xz)
+            command -v tar &>/dev/null || return 3
+            tar_version=$(tar --version 2>/dev/null) || return 4
+            case "$tar_version" in
+                *'GNU tar'*)
+                    tar_options=(--no-xattrs --no-acls --no-selinux
+                        --owner=0 --group=0 --numeric-owner)
+                    ;;
+                *bsdtar*)
+                    # macOS bsdtar releases do not all implement --mode.
+                    tar_options=(--no-xattrs --no-acls --no-fflags
+                        --uid 0 --gid 0 --uname '' --gname '')
+                    ;;
+                *) _pkg_log_error 'Release archives require GNU tar or bsdtar'; return 3 ;;
+            esac
+            if [[ "$format" == tar.xz ]]; then
+                command -v xz &>/dev/null || return 3
+            else
+                command -v gzip &>/dev/null || return 3
+            fi
+            ;;
+        zip) command -v zip &>/dev/null || return 3 ;;
+        *) return 4 ;;
+    esac
+    for member in "$@"; do
+        packaging_member_is_safe "$member" && [[ "$member" != */ ]] || return 4
+    done
+    local workdir
+    umask 077
+    staging_parent=$(cd "$staging_parent" && pwd -P) || return 4
+    workdir=$(mktemp -d "$staging_parent/.dsr-archive.XXXXXXXX") || return 4
+    trap 'rm -rf -- "$workdir"' EXIT
+    trap 'exit 5' HUP INT TERM
+    chmod 700 "$workdir" || return 4
+    mkdir "$workdir/payload" || return 4
+    printf '%s\0' "$@" > "$workdir/members" || return 4
+
+    # Walk each source through directory descriptors, refusing symlinks even
+    # if a path changes after shell validation. A bounded copy holds the source
+    # inode and checks its identity, bytes, mode and ownership metadata before
+    # admitting the staged copy. Read-only hardlinked sources remain supported;
+    # every output member gets its own exclusively created regular inode.
+    python3 -I - "$payload_dir" "$workdir/payload" "$@" <<'PY' || return 4
+import contextlib
+import os
+import stat
+import sys
+
+
+def identity(value):
+    return (value.st_dev, value.st_ino, value.st_mode, value.st_nlink,
+            value.st_uid, value.st_gid, value.st_size,
+            value.st_mtime_ns, value.st_ctime_ns)
+
+
+try:
+    source_root, staging_root, *names = sys.argv[1:]
+    if not names or len(set(names)) != len(names):
+        raise ValueError('empty or duplicate archive member selection')
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    with contextlib.ExitStack() as roots:
+        source = os.open(source_root, flags)
+        roots.callback(os.close, source)
+        staging = os.open(staging_root, flags)
+        roots.callback(os.close, staging)
+        if stat.S_IMODE(os.fstat(staging).st_mode) != 0o700:
+            raise ValueError('archive staging directory is not private')
+        for name in names:
+            if (not name or name.startswith(('/', '-')) or
+                    any(ord(c) < 32 or ord(c) == 127 or c in '\\:' for c in name) or
+                    any(part in ('', '.', '..') for part in name.split('/'))):
+                raise ValueError('unsafe archive member')
+            with contextlib.ExitStack() as handles:
+                incoming_parent, outgoing_parent = source, staging
+                parts = name.split('/')
+                for component in parts[:-1]:
+                    incoming_parent = os.open(component, flags, dir_fd=incoming_parent)
+                    handles.callback(os.close, incoming_parent)
+                    try:
+                        os.mkdir(component, 0o700, dir_fd=outgoing_parent)
+                    except FileExistsError:
+                        pass
+                    outgoing_parent = os.open(component, flags, dir_fd=outgoing_parent)
+                    handles.callback(os.close, outgoing_parent)
+                incoming_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                      dir_fd=incoming_parent)
+                incoming = handles.enter_context(os.fdopen(incoming_fd, 'rb'))
+                before = os.fstat(incoming_fd)
+                if not stat.S_ISREG(before.st_mode):
+                    raise ValueError('archive source is not a regular file: ' + name)
+                outgoing_fd = os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                      0o600, dir_fd=outgoing_parent)
+                outgoing = handles.enter_context(os.fdopen(outgoing_fd, 'wb'))
+                remaining = before.st_size
+                while remaining:
+                    data = incoming.read(min(1048576, remaining))
+                    if not data:
+                        raise ValueError('archive source was truncated: ' + name)
+                    outgoing.write(data)
+                    remaining -= len(data)
+                if incoming.read(1):
+                    raise ValueError('archive source grew while staging: ' + name)
+                outgoing.flush()
+                after = os.fstat(incoming_fd)
+                named = os.stat(parts[-1], dir_fd=incoming_parent, follow_symlinks=False)
+                if identity(before) != identity(after) or identity(before) != identity(named):
+                    raise ValueError('archive source changed while staging: ' + name)
+                os.fchmod(outgoing_fd, 0o755 if before.st_mode & 0o111 else 0o644)
+                os.utime(outgoing_fd, ns=(before.st_atime_ns, before.st_mtime_ns))
+except (OSError, ValueError) as error:
+    print('ERROR: Release archive staging failed: ' + str(error), file=sys.stderr)
+    sys.exit(4)
+PY
+
+    case "$format" in
+        tar.gz|tgz)
+            (cd "$workdir/payload" && COPYFILE_DISABLE=1 tar "${tar_options[@]}" -cf - \
+                --null -T "$workdir/members") | gzip -c || return 4
+            ;;
+        tar.xz)
+            (cd "$workdir/payload" && COPYFILE_DISABLE=1 tar "${tar_options[@]}" -cf - \
+                --null -T "$workdir/members") | xz -c || return 4
+            ;;
+        zip)
+            (cd "$workdir/payload" && zip -q -X - "$@") || return 4
+            ;;
+    esac
+)
+
 # Return 0 for equal file sets, contents and executable bits, 1 for a payload
 # mismatch, or 3/4 for a dependency/validation failure. Archive timestamps,
-# compression settings and ownership deliberately do not define equality.
+# compression settings and ownership deliberately do not define equality for
+# prebuilt archives. The normalized policy admits freshly created output and
+# its later reuse: the source still matches byte-for-byte, and every published
+# member must have exact canonical metadata, including 0755/0644 output modes.
 _pkg_archive_matches_payload() (
-    local archive="$1" format="$2" payload="$3" expected="$4"
+    local archive="$1" format="$2" payload="$3" expected="$4" mode_policy="${5:-exact}"
     local actual workdir member source_bits archive_bits
+    case "$mode_policy" in
+        exact) ;;
+        normalized) _pkg_archive_inspect normalized "$archive" "$format" || return $? ;;
+        *) return 4 ;;
+    esac
     actual=$(packaging_payload_members "$archive" "$format") || return $?
     [[ -n "$expected" && "$actual" == "$expected" ]] || return 1
     workdir=$(mktemp -d "${TMPDIR:-/tmp}/dsr-payload-check.XXXXXXXX") || return 4
@@ -431,6 +600,9 @@ _pkg_archive_matches_payload() (
         cmp -s "$payload/$member" "$workdir/$member" || return 1
         source_bits=$(_pkg_executable_bits "$payload/$member") || return $?
         archive_bits=$(_pkg_executable_bits "$workdir/$member") || return $?
+        if [[ "$mode_policy" == normalized && "$source_bits" != 0 ]]; then
+            source_bits=$((0111))
+        fi
         [[ "$source_bits" == "$archive_bits" ]] || return 1
     done <<< "$expected"
 )
@@ -507,7 +679,7 @@ def write_tar(output, root, names, epoch):
             with source_file(root, name) as (incoming, info):
                 member = tarfile.TarInfo(name)
                 member.size = info.st_size
-                member.mode = 0o644 | (info.st_mode & 0o111)
+                member.mode = 0o755 if info.st_mode & 0o111 else 0o644
                 member.mtime = epoch
                 member.uid = member.gid = 0
                 member.uname = member.gname = ''
@@ -527,7 +699,7 @@ def write_zip(output, root, names, epoch):
                 member = zipfile.ZipInfo(name, date_time=date)
                 member.create_system = 3
                 member.compress_type = zipfile.ZIP_DEFLATED
-                member.external_attr = (stat.S_IFREG | 0o644 | (info.st_mode & 0o111)) << 16
+                member.external_attr = (stat.S_IFREG | (0o755 if info.st_mode & 0o111 else 0o644)) << 16
                 member.file_size = info.st_size
                 with archive.open(member, 'w', force_zip64=info.st_size >= zipfile.ZIP64_LIMIT) as outgoing:
                     remaining = info.st_size
@@ -578,6 +750,7 @@ packaging_build_archive() (
     local archive_path="$2"
     local payload_dir="$3"
     shift 3
+    unset TAR_OPTIONS ZIPOPT UNZIP UNZIPOPT GZIP XZ_OPT XZ_DEFAULTS
 
     [[ $# -gt 0 ]] || return 4
     [[ -d "$payload_dir" && ! -L "$payload_dir" ]] || return 4
@@ -627,7 +800,8 @@ packaging_build_archive() (
     members=$(_pkg_selected_payload_members "$payload_dir" "$@") || return $?
     [[ -n "$members" ]] || return 4
     if [[ -f "$archive_path" ]] && \
-       _pkg_archive_matches_payload "$archive_path" "$format" "$payload_dir" "$members" 2>/dev/null; then
+       { _pkg_archive_matches_payload "$archive_path" "$format" "$payload_dir" "$members" 2>/dev/null || \
+         _pkg_archive_matches_payload "$archive_path" "$format" "$payload_dir" "$members" normalized 2>/dev/null; }; then
         _pkg_log_info "Reusing verified archive without recompression: $archive_path"
         return 0
     fi
@@ -641,22 +815,15 @@ packaging_build_archive() (
         printf '%s\n' "$members" > "$workdir/members" || return 4
         _pkg_reproducible_archive "$format" "$staged" "$payload_dir" "$workdir/members" || return $?
     else
-        case "$format" in
-            tar.gz|tgz)
-                COPYFILE_DISABLE=1 tar --no-xattrs -czf "$staged" \
-                    -C "$payload_dir" "$@" || return 4
-                ;;
-            tar.xz)
-                COPYFILE_DISABLE=1 tar --no-xattrs -cJf "$staged" \
-                    -C "$payload_dir" "$@" || return 4
-                ;;
-            zip)
-                (cd "$payload_dir" && zip -q -r -X "$staged" "$@") || return 4
-                ;;
-        esac
+        local -a selected_members=()
+        while IFS= read -r member; do
+            selected_members+=("$member")
+        done <<< "$members"
+        packaging_stream_archive "$format" "$payload_dir" "$workdir" \
+            "${selected_members[@]}" > "$staged" || return $?
     fi
 
-    if ! _pkg_archive_matches_payload "$staged" "$format" "$payload_dir" "$members"; then
+    if ! _pkg_archive_matches_payload "$staged" "$format" "$payload_dir" "$members" normalized; then
         _pkg_log_error "Archive payload verification failed: $archive_path"
         return 4
     fi
@@ -666,7 +833,8 @@ packaging_build_archive() (
 
 # Rebuild an existing archive in a different format, independently: extract
 # the source payload, build the destination format from the payload files,
-# then prove both archives carry identical files, bytes and executable bits.
+# then prove both archives carry identical files and bytes with canonical
+# published permissions for the source files' executable/nonexecutable roles.
 # Same-format source archives are authoritative and copied byte-for-byte,
 # never recompressed. Equivalent existing cross-format destinations are reused.
 # Optional trailing arguments `<include_root> <include>...` stage configured
@@ -676,8 +844,9 @@ packaging_build_archive() (
 # archive, and a payload-preserving repack then shipped that archive without
 # the LICENSE the previous release carried, silently. Includes are subject to
 # the same member-safety rules as extracted payload members. An existing
-# member satisfies an include only when its bytes and executable bits match;
-# it is never overwritten. Only genuinely missing includes require rebuilding.
+# member satisfies an include only when its bytes and executable bits match,
+# or a fully canonical archive carries the declared 0755 representation of an
+# executable source. It is never overwritten. Only missing includes require rebuilding.
 # Thus prebuilt archives that already satisfy the include contract retain their
 # exact compressed bytes, including when the include list contains duplicates.
 packaging_repack_archive() (
@@ -689,6 +858,7 @@ packaging_repack_archive() (
     shift 4
     [[ $# -eq 0 ]] || shift
     local -a includes=("$@")
+    unset TAR_OPTIONS ZIPOPT UNZIP UNZIPOPT GZIP XZ_OPT XZ_DEFAULTS
 
     _pkg_validate_epoch || return $?
     [[ -f "$src" && ! -L "$src" ]] || return 4
@@ -728,6 +898,7 @@ packaging_repack_archive() (
 
     local include include_parent include_bits payload_bits include_mode
     local added_includes=0
+    local source_is_normalized=unchecked
     for include in "${includes[@]}"; do
         if ! packaging_member_is_safe "$include"; then
             _pkg_log_error "Refusing unsafe include member: $include"
@@ -750,6 +921,21 @@ packaging_repack_archive() (
                 return 4
             fi
             payload_bits=$(_pkg_executable_bits "$payload/$include") || return $?
+            # Native collection may have already published this exact include
+            # with canonical 0755 metadata while its original stays private
+            # (0700). Accept that mapping only for a fully normalized source
+            # archive, never for arbitrary legacy/prebuilt execution masks.
+            # The byte comparison above remains mandatory in either case.
+            if [[ "$include_bits" != "$payload_bits" && "$include_bits" != 0 &&
+                  "$payload_bits" == "$((0111))" ]]; then
+                if [[ "$source_is_normalized" == unchecked ]]; then
+                    source_is_normalized=false
+                    if _pkg_archive_inspect normalized "$src" "$src_format" >/dev/null 2>&1; then
+                        source_is_normalized=true
+                    fi
+                fi
+                [[ "$source_is_normalized" != true ]] || include_bits=$((0111))
+            fi
             if [[ "$include_bits" != "$payload_bits" ]]; then
                 _pkg_log_error "Include executable bits differ from the archive payload: $include"
                 return 4
@@ -767,6 +953,11 @@ packaging_repack_archive() (
         members+=("$include")
         added_includes=$((added_includes + 1))
     done
+    local staged_mode_policy=exact
+    # When an include matched through the canonical mode mapping, the actual
+    # reused/copied archive must still satisfy that policy. An earlier check
+    # of the source cannot authorize changed ownership or permission headers.
+    [[ "$source_is_normalized" != true ]] || staged_mode_policy=normalized
     if [[ "$added_includes" -gt 0 ]]; then
         # The parity contract now covers payload members plus includes.
         src_members=$(printf '%s\n' "${members[@]}" | LC_ALL=C sort)
@@ -774,26 +965,43 @@ packaging_repack_archive() (
 
     if [[ "$added_includes" -gt 0 ]]; then
         if [[ -f "$dest" ]] && \
-           _pkg_archive_matches_payload "$dest" "$dest_format" "$payload" "$src_members" 2>/dev/null; then
+           { _pkg_archive_matches_payload "$dest" "$dest_format" "$payload" "$src_members" 2>/dev/null || \
+             _pkg_archive_matches_payload "$dest" "$dest_format" "$payload" "$src_members" normalized 2>/dev/null; }; then
             _pkg_log_info "Reusing verified archive that already carries the configured includes: $dest"
             return 0
         fi
         packaging_build_archive "$dest_format" "$staged" "$payload" "${members[@]}" || return $?
+        staged_mode_policy=normalized
     elif [[ "$src_format" == "$dest_format" ]]; then
         if [[ -f "$dest" ]] && cmp -s "$src" "$dest"; then
+            if [[ "$staged_mode_policy" == normalized ]] &&
+               ! _pkg_archive_matches_payload "$dest" "$dest_format" "$payload" "$src_members" normalized; then
+                _pkg_log_error "Reused archive no longer satisfies canonical include metadata: $dest"
+                return 4
+            fi
             _pkg_log_info "Reusing byte-identical prebuilt archive: $dest"
             return 0
         fi
         cp -- "$src" "$staged" || return 4
     elif [[ -f "$dest" ]] && \
-         _pkg_archive_matches_payload "$dest" "$dest_format" "$payload" "$src_members" 2>/dev/null; then
+         { _pkg_archive_matches_payload "$dest" "$dest_format" "$payload" "$src_members" 2>/dev/null || \
+           _pkg_archive_matches_payload "$dest" "$dest_format" "$payload" "$src_members" normalized 2>/dev/null; }; then
         _pkg_log_info "Reusing verified cross-format archive without recompression: $dest"
         return 0
     else
         packaging_build_archive "$dest_format" "$staged" "$payload" "${members[@]}" || return $?
+        staged_mode_policy=normalized
     fi
-    if ! _pkg_archive_matches_payload "$staged" "$dest_format" "$payload" "$src_members"; then
+    if ! _pkg_archive_matches_payload "$staged" "$dest_format" "$payload" "$src_members" "$staged_mode_policy"; then
         _pkg_log_error "Repacked archive payload does not match source: $dest"
+        return 4
+    fi
+    # A same-format copy retains the producer's complete byte authority.
+    # Equal payloads and canonical modes cannot authorize different archive
+    # headers or compression bytes, which would invalidate its attestations.
+    if [[ "$src_format" == "$dest_format" && "$added_includes" -eq 0 ]] && \
+       ! cmp -s "$src" "$staged"; then
+        _pkg_log_error "Prebuilt archive copy differs from authoritative source bytes: $dest"
         return 4
     fi
     [[ ! -L "$dest" && ( ! -e "$dest" || -f "$dest" ) ]] || return 4

@@ -33,8 +33,8 @@ It does not compile, sign, upload, create releases or promote drafts.
 ```
 
 Each artifact selects either `members` or `source`. `members` builds an archive
-from explicitly renamed **flat regular files**, preserving their executable
-bits. The sources must be manifest-declared raw payloads, not archives. Known
+from explicitly renamed **flat regular files**, preserving which files are
+executable. The sources must be manifest-declared raw payloads, not archives. Known
 archive signatures masquerading as raw members are also refused. Every member
 must have the same target as its output; packaging cannot relabel platforms.
 
@@ -150,6 +150,48 @@ resume refusal and preservation of completed bytes across retries. Host
 readiness and slot admission are controlled; this test does not qualify a remote
 host or a compiler toolchain.
 
+## Published archive metadata
+
+Newly constructed native and generic release archives use explicit public
+permissions. A regular file with any executable bit becomes `0755`; every
+other regular file becomes `0644`. Setuid, setgid and sticky bits are removed.
+Tar members have numeric owner/group IDs `0/0` and empty user/group names.
+ZIP members carry the same normalized Unix permissions and omit host ownership
+extra fields. This applies to gzip, XZ and ZIP creation, including singleton
+contract staging, format conversion and `SOURCE_DATE_EPOCH` builds.
+
+Private collection files keep their original permissions, bytes and inode
+identities. The archive writer makes fresh copies behind a `0700` staging
+directory, normalizes those copies, then runs GNU tar or macOS bsdtar with
+explicit ownership options. It does not depend on bsdtar supporting GNU
+`--mode`. Full source receipts still match exactly; the separate archive check
+requires the canonical published permissions and ownership.
+
+Strict native packaging retains the original member receipts for binaries,
+generated workspace companions and staged includes. Each private file must
+still match its frozen identity, contents and permissions when its public
+archive representation is admitted. Singleton contract staging also retains
+the original exclusive output receipt and rechecks it after validation, so a
+replacement archive cannot establish a new accepted identity or digest.
+
+Existing prebuilt archives reused without reconstruction retain their exact
+compressed bytes. This change does not rewrite previously published assets.
+Checksums, manifests and signatures for newly created archives bind the final
+normalized bytes through the existing release pipeline.
+
+Run the real archive implementation regressions and signed installer check:
+
+```bash
+DSR_TEST_TAR=gnu bash scripts/tests/test_native_single_archives.sh
+DSR_TEST_TAR=bsd bash scripts/tests/test_native_single_archives.sh
+bash scripts/tests/test_act_runner_native.sh --archive-delivery-only
+```
+
+The archive tests inspect stored header fields, extract and execute payloads,
+verify private source metadata is unchanged, and reject archiver failures.
+The delivery check uses a temporary Minisign key and generated offline-cache
+installers; it exercises checksum and signature rejection without publishing.
+
 ## Describe and execute
 
 ```bash
@@ -212,8 +254,9 @@ Helpers have a 900-second timeout and their owned process groups are terminated
 on interruption or failure. Common ambient compressor-option variables are
 scrubbed. Tools, host and local storage remain trusted: compressor executables
 are not attested, and this is neither a sandbox nor a signed provenance service.
-Executable bits are preserved while setuid/setgid and unusual write permissions
-are not propagated. Archive container bytes are not promised to reproduce across
+Executability is preserved with canonical `0755`/`0644` member permissions;
+setuid/setgid and unusual write permissions are not propagated. Archive container
+bytes are not promised to reproduce across
 different hosts/tool versions; completed output hashes are pinned and verified.
 Provide temporary space for source copies, extraction and final archives. There
 is no streaming extraction quota or distributed/power-loss transaction guarantee.
@@ -265,7 +308,7 @@ interpreter or archive module returns dependency code `3`.
 The reproducible writer streams regular payload files in byte-sorted name
 order. It emits only the selected files, with parent directories implicit.
 Tar uses PAX format, uid/gid zero, empty owner/group names, the selected epoch,
-and mode `0644 | original executable bits`. Gzip has a fixed compression level
+and mode `0755` for executable files or `0644` for other files. Gzip has a fixed compression level
 and no embedded temporary filename; XZ has a fixed preset and checksum mode.
 ZIP uses DEFLATE, Unix file modes, and a UTC-derived DOS timestamp rounded down
 to two-second precision; epochs before 1980 are represented as 1980-01-01.
@@ -280,7 +323,9 @@ remain unchanged, including their inodes, when only the epoch changes. To compar
 independent builds, use separate fresh output locations; this option does not
 rewrite previously admitted or signed bytes. Matching configured include files
 already present in a producer are verified by content and executable bits, not
-added again. Missing includes trigger a new archive; conflicting includes fail
+added again. A fully normalized archive may represent a private executable
+include as `0755`; its bytes must still match exactly. Legacy archives retain
+exact execution-mask equality. Missing includes trigger a new archive; conflicting includes fail
 without overwriting either producer or prior destination.
 
 This is reproducible *packaging*, not proof of reproducible compilation or native

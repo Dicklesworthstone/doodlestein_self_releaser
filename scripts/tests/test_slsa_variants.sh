@@ -148,6 +148,28 @@ for arch in amd64 arm64; do
         "$manifest" > "$WORK/manifests/legacy-$arch.json"
     run bash "$MODULE" generate-manifest "$WORK/manifests/legacy-$arch.json" "$WORK/assets" --repository example/app --output "$WORK/proofs/legacy-$arch"
     check "$arch legacy singleton and partial environment remain supported" test "$status" -eq 0
+    if [[ "$status" -eq 0 ]]; then
+        check "$arch untyped producer does not gain compiler identities" jq -e '
+            .dsr_evidence | (has("build_tasks") | not) and
+            all(.artifacts[]; has("target_triple") | not)' "$WORK/proofs/legacy-$arch"
+    fi
+
+    # Ordinary native manifests declare artifact compiler identities without
+    # required_variants. A singleton is still typed even though its platform
+    # needs only one task; the mapper must not erase that producer evidence.
+    jq 'del(.artifacts[2], .build_environments[1]) |
+        .summary={total:2,success:2,failed:0}' \
+        "$manifest" > "$WORK/manifests/singleton-$arch.json"
+    run bash "$MODULE" generate-manifest "$WORK/manifests/singleton-$arch.json" "$WORK/assets" --repository example/app --output "$WORK/proofs/singleton-$arch"
+    check "$arch ordinary singleton plus Windows produces provenance" test "$status" -eq 0
+    if [[ "$status" -eq 0 ]]; then
+        check "$arch singleton retains every explicit artifact compiler identity" jq -e \
+            --slurpfile manifest "$WORK/manifests/singleton-$arch.json" '
+            (.dsr_evidence.artifacts | map({name,target,target_triple}) | sort_by(.name)) ==
+            ($manifest[0].artifacts | map({name,target,target_triple}) | sort_by(.name))' "$WORK/proofs/singleton-$arch"
+        check "$arch singleton does not invent additional build tasks" jq -e \
+            '.dsr_evidence | has("build_tasks") | not' "$WORK/proofs/singleton-$arch"
+    fi
 
     # Workflow-produced ABI families must not be relabeled as native builds.
     jq --arg p "$platform" '.summary={total:2,success:2,failed:0} |
@@ -157,6 +179,10 @@ for arch in amd64 arm64; do
     check "$arch one workflow producing both ABIs remains one task" test "$status" -eq 0
     if [[ "$status" -eq 0 ]]; then
         check "$arch workflow provenance invents no native task receipt" jq -e '.dsr_evidence | has("build_tasks") | not' "$WORK/proofs/workflow-$arch"
+        check "$arch workflow retains every artifact and alias compiler identity" jq -e \
+            --slurpfile manifest "$WORK/manifests/workflow-$arch.json" '
+            (.dsr_evidence.artifacts | map({name,target,target_triple}) | sort_by(.name)) ==
+            ($manifest[0].artifacts | map({name,target,target_triple}) | sort_by(.name))' "$WORK/proofs/workflow-$arch"
     fi
 done
 printf 'Results: %s passed, %s failed\nEvidence: %s\n' "$passed" "$failed" "$WORK"
