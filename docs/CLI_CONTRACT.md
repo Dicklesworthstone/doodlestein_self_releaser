@@ -885,9 +885,10 @@ dsr release --repo <name> --version <tag> [--draft] [--prerelease] [--dispatch]
 | `--no-sbom` | false | Disable automatic generation without discarding retained public metadata |
 | `--sbom-format` | `sbom.format`, default `spdx` | Select `spdx` or `cyclonedx` and enable generation |
 
-Binary publication holds the same kernel leases used by build collection and
-artifact pruning, from before the first artifact/manifest read through upload
-and final verification. Both the canonical tag and possible original version
+Binary publication and strict draft finalization hold the same kernel leases
+used by build collection and artifact pruning, from before the first
+artifact/manifest read through upload or finalization and final verification.
+Both the canonical tag and possible original version
 namespace are protected, such as `v1.2.3` and `1.2.3`. Another build, publisher or
 inherited worker holding either lease blocks publication with exit `2`;
 unverifiable custody refuses with exit `4`. Tool/version components contain at
@@ -2161,8 +2162,10 @@ and `invalid_state` identifies an unverifiable checkpoint or resume selection.
 These exclusions are successful skips; deletion or lease-release errors still
 produce a partial result. The build leases coordinate artifact/checkpoint
 cleanup with builds, fallback runs and standalone binary `dsr release` calls.
-Dedicated finalization and native recovery commands use separate custody
-mechanisms. Custom outputs outside
+The strict `dsr release finalize` command also holds these leases, including
+while a concurrent prune uses `--no-keep-releases`: that option changes retention
+policy and cannot override active custody. Native recovery and the standalone
+library finalizer use separate custody mechanisms. Custom outputs outside
 `state/artifacts`, logs, files in `state/manifests` and ordinary cache entries
 remain governed by their existing retention policies. These checks do not
 establish that every recorded recovery input is reclaimable.

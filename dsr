@@ -7004,6 +7004,11 @@ _release_finalize_observe() {
 }
 
 cmd_release_finalize() {
+    # Finalization may inherit fallback's build leases. Isolate owned cleanup
+    # so it cannot replace the acquiring caller's traps or release its custody.
+    (
+    trap - EXIT
+    trap 'exit 5' HUP INT TERM
     local tool="" version="" response="" artifacts="" no_dispatch=false
     local usage="Usage: dsr release finalize <tool> <version> [--artifacts <dir>] --create-response /abs/path/dsr-api-response.XXXXXXXX --no-dispatch"
     while (($#)); do
@@ -7095,6 +7100,61 @@ EOF
     local state_dir manifest
     state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
     [[ -n "$artifacts" ]] || artifacts="$state_dir/artifacts/$tool-$tag"
+
+    # The original POST response proves which release may be finalized, but
+    # only the shared build leases protect its local files from concurrent
+    # collection or pruning. Reserve them before inspecting the artifact path.
+    local finalize_custody_state_dir="$state_dir/builds"
+    local -a finalize_owned_versions=() finalize_lease_versions=("$tag")
+    local finalize_lease_version finalize_custody_rc finalize_custody_cleanup
+    _release_finalize_cleanup_build_custody() {
+        local _BUILD_STATE_DIR="$1" custody_tool="$2" held_version cleanup_status=0
+        shift 2
+        for held_version in "$@"; do
+            build_lock_release "$custody_tool" "$held_version" || cleanup_status=1
+        done
+        return "$cleanup_status"
+    }
+    if [[ ! "$tool" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$ ||
+          ! "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$ ]]; then
+        log_error "Strict finalization requires a safe tool/version custody namespace"
+        return 4
+    fi
+    if ! $DRY_RUN; then
+        _dsr_require build_state || return 3
+        local _BUILD_STATE_DIR="$finalize_custody_state_dir"
+        [[ ! "${tag#v}" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$ ]] ||
+            finalize_lease_versions+=("${tag#v}")
+        for finalize_lease_version in "${finalize_lease_versions[@]}"; do
+            finalize_custody_rc=0
+            build_lock_borrow "$tool" "$finalize_lease_version" || finalize_custody_rc=$?
+            if [[ "$finalize_custody_rc" == 1 ]]; then
+                finalize_custody_rc=0
+                if build_lock_acquire "$tool" "$finalize_lease_version"; then
+                    finalize_owned_versions+=("$finalize_lease_version")
+                    # Freeze cleanup arguments before an early return can
+                    # unwind this command's dynamically scoped local values.
+                    printf -v finalize_custody_cleanup '%q ' _release_finalize_cleanup_build_custody \
+                        "$finalize_custody_state_dir" "$tool" "${finalize_owned_versions[@]}"
+                    # shellcheck disable=SC2064 # Deliberately freeze %q-quoted custody arguments.
+                    trap "$finalize_custody_cleanup >&2" EXIT
+                else
+                    finalize_custody_rc=$?
+                    [[ "$finalize_custody_rc" == 2 ]] || finalize_custody_rc=4
+                fi
+            fi
+            if [[ "$finalize_custody_rc" != 0 ]]; then
+                log_error "Strict finalization build custody is busy or unverifiable for $tool $finalize_lease_version"
+                $JSON_MODE && json_envelope release-finalize error "$finalize_custody_rc" \
+                    "$(jq -nc --arg repo "$repo" --arg version "$version" --arg tag "$tag" \
+                        --arg lease_version "$finalize_lease_version" \
+                        '{repo:$repo,version:$version,tag:$tag,stage:"build_custody",
+                          lease_version:$lease_version,error:"Strict finalization build custody is busy or unverifiable"}')"
+                return "$finalize_custody_rc"
+            fi
+        done
+    fi
+
     if [[ ! -d "$artifacts" ]] || ! artifacts=$(cd -- "$artifacts" && pwd -P); then
         log_error "Strict finalization requires an existing artifact directory"
         return 4
@@ -7190,9 +7250,24 @@ EOF
         _source_release_restore_draft "$repo" "$release_id" "$metadata" || true
         return 7
     fi
+    # Final verification and its durable receipt are complete. Check owned
+    # cleanup before reporting success; inherited caller custody stays held.
+    if ! _release_finalize_cleanup_build_custody "$finalize_custody_state_dir" "$tool" \
+        ${finalize_owned_versions[@]+"${finalize_owned_versions[@]}"} >&2; then
+        log_error "Strict finalization finished but its build custody could not be released"
+        $JSON_MODE && json_envelope release-finalize error 4 \
+            "$(jq -nc --arg repo "$repo" --arg version "$version" --arg tag "$tag" \
+                --arg receipt "$final_output" --argjson id "$release_id" \
+                '{repo:$repo,version:$version,tag:$tag,release_id:$id,receipt:$receipt,
+                  stage:"build_custody",error:"Strict finalization finished but its build custody could not be released"}')"
+        return 4
+    fi
+    finalize_owned_versions=()
+    trap - EXIT
     log_ok "Strict release finalized and verified: $(jq -r '.html_url' <<< "$observed")"
     $JSON_MODE && json_envelope "release-finalize" "success" 0 "$(jq -nc --arg receipt "$final_output" --argjson id "$release_id" '{receipt:$receipt,release_id:$id}')"
     return 0
+    )
 }
 
 _source_release_resume_receipt_matches() {

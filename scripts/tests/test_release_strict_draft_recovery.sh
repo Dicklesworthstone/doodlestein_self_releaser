@@ -5,12 +5,15 @@ set -euo pipefail
 ROOT="${DSR_TEST_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)}"
 python3 - "$ROOT" <<'PY'
 import hashlib
+import errno
+import fcntl
 import json
 import os
 from pathlib import Path
 import re
 import signal
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -87,6 +90,19 @@ elif endpoint=='repos/owner/app/git/ref/tags/v1.2.3':
     moved=control.get('tag_drift_always') or (control.get('tag_drift_after_publish') and not r['draft'])
     print(json.dumps({'object':{'type':'commit','sha':'f'*40 if moved else os.environ['SOURCE_SHA']}}))
 elif endpoint=='repos/owner/app/releases/9':
+    pending=list((c/'state/releases').glob('app-v1.2.3-finalization-pending.*'))
+    if '--method' not in args and pending:
+        if control.get('pause_finalizer') and not (c/'finalizer-paused').exists():
+            (c/'finalizer-paused').write_text(str(pending[0]))
+            deadline=time.monotonic()+30
+            while not (c/'continue-finalizer').exists():
+                if time.monotonic()>deadline:sys.exit(92)
+                time.sleep(0.02)
+        if control.get('change_finalizer_lease') and not (c/'original-finalizer-lease').exists():
+            lock=c/'state/builds/app/v1.2.3/.lock'
+            if lock.is_file() and not lock.is_symlink():
+                (c/'original-finalizer-lease').write_bytes(lock.read_bytes())
+                lock.write_text('changed fixture custody record\n')
     if '--method' in args:
         patch=json.loads(args[args.index('--data')+1])
         if patch.get('draft') is False and control.get('fail_publish'):
@@ -442,8 +458,241 @@ def test_fallback_recovery():
         check('unrelated draft '+('retry' if resume else 'creation')+' is not adopted',
               result.returncode!=0 and not mutations(rows))
 
+def test_strict_finalization_custody():
+    names=('prune','canonical','bare','inherited','caller-flag','fallback',
+           'early-error','dry-run','cleanup-error')
+    selected=os.environ.get('DSR_TEST_STRICT_CUSTODY_CASE','')
+    if selected and (selected not in names or os.environ.get('DSR_TEST_STRICT_CUSTODY_ONLY')!='1'):
+        raise AssertionError('Select a known custody case together with DSR_TEST_STRICT_CUSTODY_ONLY=1')
+
+    def inventory(*roots):
+        rows=[]
+        for root_path in roots:
+            paths=[root_path]+(sorted(root_path.rglob('*')) if root_path.is_dir() else [])
+            for path in paths:
+                if not path.exists() and not path.is_symlink():
+                    rows.append((str(path),None));continue
+                info=path.lstat()
+                content=(os.readlink(path) if stat.S_ISLNK(info.st_mode) else
+                         hashlib.sha256(path.read_bytes()).hexdigest() if stat.S_ISREG(info.st_mode) else '')
+                rows.append((str(path),info.st_dev,info.st_ino,info.st_mode,info.st_nlink,
+                             info.st_uid,info.st_gid,info.st_mtime_ns,info.st_ctime_ns,content))
+        return rows
+
+    def lease_available(c,version):
+        lease=c/'state/builds/app'/version/'.lock.lease'
+        if not lease.exists():return True
+        with lease.open('r+b') as stream:
+            try:fcntl.flock(stream,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except OSError as error:
+                if error.errno in (errno.EAGAIN,errno.EACCES):return False
+                raise
+        return True
+
+    def until(predicate,seconds=20):
+        deadline=time.monotonic()+seconds
+        while not predicate():
+            if time.monotonic()>=deadline:raise AssertionError('Strict custody fixture barrier timed out')
+            time.sleep(0.02)
+
+    def prepare(label):
+        c,env,_,_=setup('custody-'+label,{'absent':True})
+        created=subprocess.run(['bash','-c',script,'fixture','create'],env=env,capture_output=True,text=True)
+        (c/'producer.stdout').write_text(created.stdout);(c/'producer.stderr').write_text(created.stderr)
+        check(label+' actual signed draft producer succeeds',created.returncode==0)
+        details=json.loads(created.stdout)['details']
+        response=Path(details['create_response']);env['TMPDIR']=details['finalization_tmpdir']
+        # Retain the completed producer's closed lease history separately so
+        # this standalone finalizer's own acquisitions are directly observable.
+        if (c/'state/builds').exists():(c/'state/builds').rename(c/'producer-build-custody')
+        (c/'cache').mkdir()
+        (c/'requests.jsonl').write_text('')
+        return c,env,response
+
+    def run_finalizer(c,env,response,driver=script,extra=()):
+        args=(['bash','-c',driver,'fixture','run','false'] if driver==script else
+              ['bash','-c',driver,'fixture'])
+        result=subprocess.run(args+['app','1.2.3','--create-response',str(response),'--no-dispatch']+
+                              list(extra),env=env,capture_output=True,text=True,timeout=40)
+        (c/'finalizer.stdout').write_text(result.stdout);(c/'finalizer.stderr').write_text(result.stderr)
+        return result
+
+    holder_script=r'''
+set -uo pipefail
+source "$ROOT/src/build_state.sh"
+fixture_barrier() {
+    local count=0
+    while [[ ! -e "$CASE/$1" ]]; do
+        ((count+=1)); ((count<=1500)) || return 93
+        sleep 0.02
+    done
+}
+build_state_init || exit $?
+build_lock_acquire app "$1" || exit $?
+if [[ "$2" == inherited ]]; then
+    (
+        : > "$CASE/holder-ready"
+        fixture_barrier holder-release || exit $?
+        : > "$CASE/holder-finished"
+    ) &
+    fixture_barrier holder-ready || exit $?
+    build_lock_release app "$1" || exit $?
+else
+    : > "$CASE/holder-ready"
+    fixture_barrier holder-release || exit $?
+    build_lock_release app "$1" || exit $?
+fi
+'''
+    common=script.split('if [[ "$1" == create || "$1" == fallback ]]; then',1)[0]
+    borrowed_driver=common+r'''
+JSON_MODE=true
+build_state_init || exit $?
+build_lock_acquire app v1.2.3 || exit $?
+trap 'printf "caller exit\n" >> "$CASE/caller-exit"' EXIT
+trap -p EXIT > "$CASE/caller-trap.before"
+caller_snapshot() {
+    declare -p _BUILD_LOCK_PATHS _BUILD_LOCK_FDS _BUILD_LOCK_IDENTITIES \
+        _BUILD_LOCK_OWNERS _BUILD_LOCK_RECORDS
+    _build_state_file_identity "$DSR_STATE_DIR/builds/app/v1.2.3/.lock"
+    _build_state_file_identity "$DSR_STATE_DIR/builds/app/v1.2.3/.lock.lease"
+    cat "$DSR_STATE_DIR/builds/app/v1.2.3/.lock"
+}
+caller_snapshot > "$CASE/caller-custody.before"
+export DSR_BUILD_LOCK_HELD_BY_CALLER=1
+result=$(cmd_release_finalize "$@")
+status=$?
+printf '%s\n' "$result"
+trap -p EXIT > "$CASE/caller-trap.after"
+caller_snapshot > "$CASE/caller-custody.after"
+[[ ! -e "$CASE/caller-exit" ]] || exit 94
+probe=0; _build_lock_probe "$DSR_STATE_DIR/builds/app/v1.2.3/.lock" || probe=$?
+[[ "$probe" == 2 ]] || exit 95
+probe=0; _build_lock_probe "$DSR_STATE_DIR/builds/app/1.2.3/.lock" || probe=$?
+[[ "$probe" == 0 ]] || exit 96
+build_lock_release app v1.2.3 || exit 97
+exit "$status"
+'''
+
+    for name in names:
+        if selected and name!=selected:continue
+        c,env,response=prepare(name)
+        artifacts=c/'state/artifacts/app-v1.2.3'
+        if name=='prune':
+            sidecar=artifacts.with_name(artifacts.name+'-manifest.json')
+            sidecar.write_bytes((artifacts/'app-v1.2.3-manifest.json').read_bytes())
+            old=time.time()-60*86400
+            for path in (artifacts,sidecar):os.utime(path,(old,old))
+            control=json.loads((c/'control.json').read_text());control['pause_finalizer']=True
+            (c/'control.json').write_text(json.dumps(control))
+            before=inventory(artifacts,sidecar)
+            args=['bash','-c',script,'fixture','run','false','app','1.2.3',
+                  '--create-response',str(response),'--no-dispatch']
+            with (c/'finalizer.stdout').open('w') as out,(c/'finalizer.stderr').open('w') as err:
+                publisher=subprocess.Popen(args,env=env,stdout=out,stderr=err)
+                try:
+                    until(lambda:(c/'finalizer-paused').exists() or publisher.poll() is not None)
+                    check('active finalizer reaches actual pending-receipt boundary',(c/'finalizer-paused').exists())
+                    # Retention policy is deliberately disabled. Active custody
+                    # must still protect a selected old release from deletion.
+                    pruned=subprocess.run([str(root/'dsr'),'--json','--state-dir',str(c/'state'),
+                        '--cache-dir',str(c/'cache'),'prune','--max-age','30','--keep-last','0',
+                        '--no-keep-releases','--force'],env=env,capture_output=True,text=True,timeout=15)
+                    (c/'prune.stdout').write_text(pruned.stdout);(c/'prune.stderr').write_text(pruned.stderr)
+                    retained=inventory(artifacts,sidecar)==before
+                finally:
+                    (c/'continue-finalizer').write_text('continue\n')
+                    status=publisher.wait(timeout=30)
+            check('prune preserves complete active finalization inputs',pruned.returncode==0 and retained)
+            details=json.loads(pruned.stdout)['details']
+            check('prune reports active finalizer build custody',
+                  any(row['path']==str(artifacts) and row['reason']=='build_custody'
+                      for row in details['retained_artifact_paths']) and
+                  all(row['path'] not in (str(artifacts),str(sidecar)) for row in details['pruned_paths']))
+            check('protected strict finalization publishes successfully',status==0 and
+                  json.loads((c/'remote.json').read_text())['draft'] is False)
+        elif name in ('canonical','bare','inherited','caller-flag'):
+            version='1.2.3' if name=='bare' else 'v1.2.3'
+            mode='inherited' if name=='inherited' else 'coordinator'
+            before=inventory(artifacts)
+            if name=='caller-flag':env['DSR_BUILD_LOCK_HELD_BY_CALLER']='1'
+            with (c/'holder.stdout').open('w') as out,(c/'holder.stderr').open('w') as err:
+                holder=subprocess.Popen(['bash','-c',holder_script,'fixture',version,mode],env=env,stdout=out,stderr=err)
+                try:
+                    until(lambda:(c/'holder-ready').exists() or holder.poll() is not None)
+                    check(name+' genuine lease holder is ready',(c/'holder-ready').exists())
+                    if mode=='inherited':
+                        check('inherited worker retains custody after coordinator exit',
+                              holder.wait(timeout=10)==0 and not lease_available(c,version))
+                    driver=(common+'\nJSON_MODE=true\ncmd_release_finalize "$@"\n' if name=='canonical' else script)
+                    result=run_finalizer(c,env,response,driver)
+                finally:
+                    (c/'holder-release').write_text('continue\n')
+                    holder.wait(timeout=10)
+                    if mode=='inherited':until(lambda:(c/'holder-finished').exists() and lease_available(c,version))
+            check(name+' contention blocks finalization before the API',result.returncode==2 and
+                  not (c/'requests.jsonl').read_text() and inventory(artifacts)==before and
+                  json.loads((c/'remote.json').read_text())['draft'] is True)
+            if name=='canonical':
+                envelope=json.loads(result.stdout)
+                check('canonical contention emits exactly one precise JSON refusal',
+                      envelope['command']=='release-finalize' and envelope['status']=='error' and
+                      envelope['exit_code']==2 and envelope['details']['stage']=='build_custody' and
+                      envelope['details']['lease_version']=='v1.2.3' and
+                      isinstance(envelope['details']['error'],str) and bool(envelope['details']['error']))
+        elif name=='fallback':
+            result=run_finalizer(c,env,response,borrowed_driver)
+            check('inherited fallback custody permits strict finalization',result.returncode==0 and
+                  json.loads(result.stdout)['status']=='success' and
+                  json.loads((c/'remote.json').read_text())['draft'] is False)
+            check('borrowed finalizer preserves caller registry inode and owner record',
+                  (c/'caller-custody.before').read_bytes()==(c/'caller-custody.after').read_bytes())
+            check('borrowed finalizer preserves and does not prematurely run caller EXIT trap',
+                  (c/'caller-trap.before').read_bytes()==(c/'caller-trap.after').read_bytes() and
+                  (c/'caller-exit').read_text()=='caller exit\n')
+        elif name=='early-error':
+            with (artifacts/'payload.tar.gz').open('ab') as stream:stream.write(b'changed after signed publication\n')
+            result=run_finalizer(c,env,response)
+            check('invalid signed input is refused before the API',result.returncode==4 and
+                  not (c/'requests.jsonl').read_text())
+            check('early refusal acquired both leases before artifact admission',
+                  all((c/'state/builds/app'/version/'.lock.lease').is_file() for version in ('v1.2.3','1.2.3')))
+        elif name=='dry-run':
+            before=inventory(c/'state',c/'cache')
+            result=subprocess.run(['bash','-c',script,'fixture','run','true','app','1.2.3',
+                '--create-response',str(response),'--no-dispatch'],env=env,capture_output=True,text=True,timeout=40)
+            (c/'finalizer.stdout').write_text(result.stdout);(c/'finalizer.stderr').write_text(result.stderr)
+            requests=[json.loads(line) for line in (c/'requests.jsonl').read_text().splitlines()]
+            check('dry-run verifies its plan without custody or persistent state changes',result.returncode==0 and
+                  inventory(c/'state',c/'cache')==before and
+                  not any('--post' in row or '--method' in row or row[0]=='upload-boundary' for row in requests))
+        else:
+            control=json.loads((c/'control.json').read_text());control['change_finalizer_lease']=True
+            (c/'control.json').write_text(json.dumps(control))
+            result=run_finalizer(c,env,response,common+'\nJSON_MODE=true\ncmd_release_finalize "$@"\n')
+            check('cleanup fault changes actual held finalizer metadata',(c/'original-finalizer-lease').is_file() and
+                  (c/'state/builds/app/v1.2.3/.lock').read_text()=='changed fixture custody record\n')
+            envelope=json.loads(result.stdout)
+            details=envelope.get('details',{});receipt=Path(details.get('receipt',''));record={}
+            if receipt.parent==c/'state/releases' and receipt.is_file() and not receipt.is_symlink():
+                record=json.loads(receipt.read_text())
+            check('unverifiable cleanup emits exactly one error with its completed publication receipt',
+                  result.returncode==4 and 'Strict release finalized and verified:' not in result.stderr and
+                  envelope['command']=='release-finalize' and envelope['status']=='error' and
+                  envelope['exit_code']==4 and details.get('stage')=='build_custody' and
+                  isinstance(details.get('error'),str) and bool(details['error']) and
+                  details.get('release_id')==9 and record.get('status')=='success' and
+                  record.get('release_id')==9 and record.get('release',{}).get('draft') is False)
+        check(name+' leaves no independently held finalizer lease',
+              lease_available(c,'v1.2.3') and lease_available(c,'1.2.3'))
+
+
 if os.environ.get('DSR_TEST_STRICT_FALLBACK_ONLY')=='1':
     test_fallback_recovery()
+    print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
+    raise SystemExit(0)
+
+test_strict_finalization_custody()
+if os.environ.get('DSR_TEST_STRICT_CUSTODY_ONLY')=='1':
     print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
     raise SystemExit(0)
 
