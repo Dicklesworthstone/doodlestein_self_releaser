@@ -971,6 +971,13 @@ assets and publishes an owned draft whose original intent was public, including
 after an interrupted publish response. It refuses ambiguous, changed, or lost
 creation custody. Upload journals alone never authorize publication.
 
+Verified uploads and reused assets update a private, atomic upload receipt at
+`$DSR_STATE_DIR/releases/<tool>-<tag>-upload.json`. Successful publication keeps
+this receipt so `prune --keep-releases` continues to retain the local artifact
+set. Drafts and partial uploads retain their receipts too, preserving inputs for
+finalization or retry. Resume still verifies the actual remote assets; a saved
+receipt never authorizes skipping verification or publishing a draft.
+
 An explicitly requested draft remains private when a later `--resume` omits
 `--draft`; an unrelated existing draft also remains private. Existing public
 releases without staged creation custody retain ordinary upload behavior.
@@ -2099,8 +2106,12 @@ dsr prune [--dry-run] [--max-age <days>] [--keep-last <n>] [--force]
 | `--force` | false | Skip confirmation prompt |
 
 Artifact sets are `artifacts/<tool>-<tag>/` with their `<tool>-<tag>-manifest.json`;
-a set is published when `releases/<tool>-<tag>-upload.json` exists. The build run
-`latest` points to is always kept. The global `--dry-run` applies.
+`--keep-releases` retains a set when `releases/<tool>-<tag>-upload.json` exists.
+Publication keeps that private upload receipt after success. A partial upload
+or completed draft also keeps its receipt, so this retention test conservatively
+protects recovery inputs without asserting that the release is public. Prune
+does not contact GitHub or reconstruct missing historical receipts. The build
+run `latest` points to is always kept. The global `--dry-run` applies.
 
 Artifact pruning requires a regular manifest that is not a symbolic link at
 `artifacts/<tool>-<tag>/<tool>-<tag>-manifest.json` or the adjacent

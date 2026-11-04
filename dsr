@@ -9381,8 +9381,9 @@ EOF
     local -A uploaded_sha_set=()
 
     _release_save_state() (
-        # Keep the previous journal on a failed write. Journals are diagnostic
-        # receipts, never an authorization to skip remote content verification.
+        # Keep the previous journal on a failed write. These private receipts
+        # also retain release artifacts during pruning, including after success.
+        # They never authorize skipping remote content verification.
         local state_parent="${upload_state_file%/*}" temporary cleanup
         [[ -d "$state_parent" && ! -L "$state_parent" && ! -L "$upload_state_file" ]] || return 1
         [[ ! -e "$upload_state_file" || -f "$upload_state_file" ]] || return 1
@@ -10069,10 +10070,9 @@ EOF
         log_warn "Dispatch enabled but no target repos configured"
     fi
 
-    # Clean up upload state on success
-    if [[ $failed_count -eq 0 ]]; then
-        rm -f "$upload_state_file"
-    fi
+    # Keep the upload receipt after success too: prune --keep-releases uses
+    # its presence to retain this artifact set. Drafts and partial uploads need
+    # the same retention for later verification and recovery.
 
     # Freeze output paths while custody is still held, then check cleanup
     # before emitting success. EXIT remains armed if ownership has changed.

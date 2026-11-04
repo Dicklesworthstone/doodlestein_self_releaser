@@ -706,6 +706,113 @@ test_release_dry_run_creates_no_build_custody() {
             "$CASE/stdout" >/dev/null
 }
 
+release_retention_receipt_is_private() {
+    local receipt="$DSR_STATE_DIR/releases/tool-v1.2.3-upload.json" mode
+    [[ -f "$receipt" && ! -L "$receipt" ]] || return 1
+    mode=$(stat -c '%a' "$receipt" 2>/dev/null || stat -f '%Lp' "$receipt") || return 1
+    [[ "$mode" == 600 ]] && jq -e '
+        .schema=="dsr.release_upload_receipt.v1" and .repo=="owner/repo" and
+        .tag=="v1.2.3" and .release_id==9 and (.uploaded|length)==4 and
+        all(.uploaded[]; (.sha256|test("^[0-9a-f]{64}$")) and (.remote_id|type=="number"))
+    ' "$receipt" >/dev/null
+}
+
+release_retention_newer_sets() {
+    # Make the completed release older than the five sets kept by default.
+    # These are ordinary owned fixtures; no publication marker is fabricated.
+    python3 - "$RELEASE_CUSTODY_ARTIFACTS" <<'PY'
+import json, pathlib, shutil, sys
+original = pathlib.Path(sys.argv[1])
+manifest = json.loads((original / 'tool-v1.2.3-manifest.json').read_text())
+for patch in range(4, 9):
+    tag = 'v1.2.' + str(patch)
+    directory = original.with_name('tool-' + tag)
+    directory.mkdir()
+    for name in ('payload.bin', 'payload.bin.sha256', 'SHA256SUMS'):
+        shutil.copy2(original / name, directory / name)
+    content = json.dumps(dict(manifest, version=tag)) + '\n'
+    (directory / ('tool-' + tag + '-manifest.json')).write_text(content)
+    directory.with_name(directory.name + '-manifest.json').write_text(content)
+PY
+}
+
+release_retention_completed_case() {
+    local draft="$1" status=0 before after phase receipt problems=()
+    release_custody_setup "retention_completed_$draft" || return 1
+    jq --argjson draft "$draft" '.draft=$draft' "$CASE/release.json" > "$CASE/release.next" &&
+        mv "$CASE/release.next" "$CASE/release.json" || return 1
+    cmd_release tool 1.2.3 --artifacts "$RELEASE_CUSTODY_ARTIFACTS" --resume --no-dispatch \
+        > "$CASE/stdout" 2> "$CASE/stderr" || status=$?
+    [[ "$status" == 0 ]] && jq -e --argjson draft "$draft" '
+        .exit_code==0 and .details.draft==$draft and .details.success==4 and .details.failed==0
+    ' "$CASE/stdout" >/dev/null || return 1
+    release_retention_receipt_is_private || problems+=("completed publication lost its private upload receipt")
+    release_retention_newer_sets || return 1
+    receipt="$DSR_STATE_DIR/releases/tool-v1.2.3-upload.json"
+    before=$(release_custody_inventory "$RELEASE_CUSTODY_ARTIFACTS" \
+        "$RELEASE_CUSTODY_ARTIFACTS-manifest.json" "$receipt")
+    for phase in dry-run force; do
+        status=0
+        # Keep the real defaults: thirty days, five newest sets, and retention
+        # for release uploads. The old completed set must survive both passes.
+        "$PROJECT_ROOT/dsr" --json --state-dir "$DSR_STATE_DIR" --cache-dir "$DSR_CACHE_DIR" \
+            prune "--$phase" > "$CASE/prune-$phase.stdout" 2> "$CASE/prune-$phase.stderr" || status=$?
+        after=$(release_custody_inventory "$RELEASE_CUSTODY_ARTIFACTS" \
+            "$RELEASE_CUSTODY_ARTIFACTS-manifest.json" "$receipt")
+        [[ "$status" == 0 && "$before" == "$after" ]] || problems+=("$phase changed completed publication inputs")
+        jq -e '.details.keep_last==5 and .details.keep_releases==true and
+            .details.kept_for_releases==1 and .details.pruned_count==0' \
+            "$CASE/prune-$phase.stdout" >/dev/null || problems+=("$phase did not apply default release retention")
+    done
+    status=0
+    "$PROJECT_ROOT/dsr" --json --state-dir "$DSR_STATE_DIR" --cache-dir "$DSR_CACHE_DIR" \
+        prune --no-keep-releases --force > "$CASE/prune-explicit.stdout" 2> "$CASE/prune-explicit.stderr" || status=$?
+    [[ "$status" == 0 && ! -e "$RELEASE_CUSTODY_ARTIFACTS" &&
+        ! -e "$RELEASE_CUSTODY_ARTIFACTS-manifest.json" ]] || problems+=("explicit release pruning did not remove the old set")
+    jq -e --arg path "$RELEASE_CUSTODY_ARTIFACTS" '
+        .details.keep_releases==false and .details.pruned_count==2 and
+        ([.details.pruned_paths[].path]|sort)==([$path,($path+"-manifest.json")]|sort)
+    ' "$CASE/prune-explicit.stdout" >/dev/null || problems+=("explicit pruning did not remove exactly the old artifact set")
+    release_custody_result "${problems[@]}"
+}
+
+test_release_retains_completed_publication_for_default_prune() { release_retention_completed_case false; }
+test_release_retains_completed_draft_for_default_prune() { release_retention_completed_case true; }
+
+test_release_retained_receipt_never_authorizes_resume() {
+    release_custody_setup retention_resume || return 1
+    local status=0 remote_id problems=()
+    cmd_release tool 1.2.3 --artifacts "$RELEASE_CUSTODY_ARTIFACTS" --resume --no-dispatch \
+        > "$CASE/stdout" 2> "$CASE/stderr" || status=$?
+    [[ "$status" == 0 ]] || return 1
+    release_retention_receipt_is_private || problems+=("completed publication did not retain its receipt")
+    : > "$CALLS"
+    status=0
+    cmd_release tool 1.2.3 --artifacts "$RELEASE_CUSTODY_ARTIFACTS" --resume --no-dispatch \
+        > "$CASE/repeated.stdout" 2> "$CASE/repeated.stderr" || status=$?
+    [[ "$status" == 0 ]] && ! grep -q '^POST\|^CREATE\|--method DELETE' "$CALLS" &&
+        grep -q 'assets?per_page=100&page=1 --no-cache' "$CALLS" &&
+        jq -e '.details.success==4 and .details.failed==0' "$CASE/repeated.stdout" >/dev/null ||
+        problems+=("resume did not freshly verify and reuse the completed remote inventory")
+    release_retention_receipt_is_private || problems+=("verified resume lost the private retention receipt")
+    remote_id=$(jq -er '.[] | select(.name=="payload.bin") | .id' "$CASE/inventory.json") || return 1
+    # Corrupt only the mock remote copy and omit its digest, forcing real
+    # download hashing even though the completed upload receipt still exists.
+    chmod u+w "$CASE/remote/$remote_id" || return 1
+    printf 'fake payload\n' > "$CASE/remote/$remote_id" || return 1
+    jq 'map(if .name=="payload.bin" then .digest=null else . end)' "$CASE/inventory.json" > "$CASE/inventory.next" &&
+        mv "$CASE/inventory.next" "$CASE/inventory.json" || return 1
+    : > "$CALLS"
+    status=0
+    cmd_release tool 1.2.3 --artifacts "$RELEASE_CUSTODY_ARTIFACTS" --resume --no-dispatch \
+        > "$CASE/changed.stdout" 2> "$CASE/changed.stderr" || status=$?
+    [[ "$status" == 1 ]] && grep -Fxq "DOWNLOAD owner/repo $remote_id" "$CALLS" &&
+        ! grep -q '^POST\|^CREATE\|^PUBLISH\|--method DELETE' "$CALLS" &&
+        jq -e '.exit_code==1 and .details.failed>0' "$CASE/changed.stdout" >/dev/null ||
+        problems+=("retained receipt hid changed remote bytes or permitted destructive repair")
+    release_custody_result "${problems[@]}"
+}
+
 test_saved_name_missing_remotely_is_uploaded() {
     setup missing
     journal payload.bin
@@ -1443,7 +1550,7 @@ test_release_dispatch_explicit_config_false_prevents_delivery() {
 test_release_dispatch_rechecks_publication_between_destinations() {
     setup dispatch_between_destinations
     export DSR_DISPATCH_REPOS=owner/a,owner/b
-    DISPATCH_MODE=draft-after-first
+    DISPATCH_MODE='draft-after-first'
     run_release --resume
     local outbox
     outbox=$(jq -r '.details.dispatch.outbox_file // empty' "$CASE/stdout")
@@ -2585,6 +2692,8 @@ for test in test_release_keeps_artifacts_during_publication \
     test_release_borrows_fallback_custody_without_releasing_it \
     test_release_cleanup_failure_emits_one_error \
     test_release_early_failure_releases_owned_custody test_release_dry_run_creates_no_build_custody \
+    test_release_retains_completed_publication_for_default_prune \
+    test_release_retains_completed_draft_for_default_prune test_release_retained_receipt_never_authorizes_resume \
     test_saved_name_missing_remotely_is_uploaded test_identical_remote_is_reused_without_deletion \
     test_saved_name_with_changed_remote_fails_closed test_legacy_digestless_assets_are_hashed \
     test_unavailable_inventory_is_not_success test_failed_resume_lookup_never_creates \
