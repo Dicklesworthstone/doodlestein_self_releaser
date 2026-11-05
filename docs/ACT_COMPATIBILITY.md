@@ -189,6 +189,66 @@ act_matrix:
 
 dsr will pass each key/value as `--matrix key:value` when invoking act for that target.
 
+#### Shared jobs with additional release assets
+
+A single matrix job can produce the primary archive and typed companions for
+several configured targets. Each owner needs its own `act_matrix` filters:
+
+```yaml
+act_job_map:
+  linux/amd64: release
+  linux/arm64: release
+act_matrix:
+  linux/amd64: {target: x86_64-unknown-linux-gnu}
+  linux/arm64: {target: aarch64-unknown-linux-gnu}
+workspace_additional_artifacts:
+  linux/amd64:
+    - {name: linux-amd64-metadata.json, format: json}
+  linux/arm64:
+    - {name: linux-arm64-metadata.json, format: json}
+```
+
+The workflow's `release` job must have a literal `strategy.matrix`, using
+scalar axes, `include` rows, `exclude` rows, or an include-only matrix. DSR
+expands that matrix before starting act and requires each configured owner to
+select exactly one distinct cell. This check includes peers outside the
+requested CLI subset and peers without additional artifacts. Strings, integers
+and booleans are supported; dynamic expressions, nested values, missing filter
+keys, overlapping owners, and selections that match zero or multiple cells
+require a different configuration. Typed companion producers still use one
+target triple per platform.
+
+Peers that have no additional artifacts receive the same matrix and argument
+binding with a primary-only payload plan. Selecting such a peer alone retains
+the shared job's ownership checks and rejects undeclared uploads.
+
+This follows [act's matrix selection rules](https://nektosact.com/usage/index.html#specifying-matrix),
+including its treatment of missing keys and repeated filters. Keep shared-job
+matrix filters in `act_matrix`: `--matrix` in a user or invocation `.actrc`
+would broaden the CLI selection, so DSR refuses it for these jobs. Additional
+platform flags cannot change their job, workflow, working directory or artifact
+destination, or add matrix values.
+
+Each worker retains its selected cell and a SHA-256 of the complete configured
+argument vector in the existing payload plan. Manifest admission resolves the
+plan again and refuses changed selections or arguments. Transport ZIPs, extracted
+primaries and typed companions retain independent inventories for each target;
+existing architecture, content, collision and resume checks still apply.
+
+DSR passes image mappings, matrix values, secret-file paths and env-file paths
+as literal arguments, including spaces and colons. `linux_arm64_flags` entries
+use shell-style quoting only to group arguments; they never expand variables,
+globs or command substitutions. For example:
+
+```yaml
+act_overrides:
+  secrets_file: /opt/release keys/act.secrets
+  env_file: /opt/release config/build.env
+  linux_arm64_flags:
+    - "--container-architecture linux/arm64"
+    - "--container-options '--label=release lane'"
+```
+
 ### Detecting act Environment
 
 ```yaml

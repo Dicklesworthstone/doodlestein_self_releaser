@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_act_runner.sh - Unit tests for act_runner.sh module
 #
-# Usage: ./test_act_runner.sh [--workflow-isolation-only | --worker-admission-cancel-only | --typed-companions-only]
+# Usage: ./test_act_runner.sh [--workflow-isolation-only | --worker-admission-cancel-only | --typed-companions-only | --shared-matrix-only]
 #
 # Tests act integration functions without actually running Docker
 
@@ -1079,7 +1079,7 @@ act_get_job_for_target() {
         linux/386) printf 'retry\n' ;;
     esac
 }
-act_get_flags() { printf '%s\n' '-P ubuntu-latest=fixture'; }
+act_get_flags() { printf '%s\n' '["-P","ubuntu-latest=fixture"]'; }
 # Sibling Bash workers inherit $$, even though their BASHPID values differ.
 # Freeze only the naming clock so the old timestamp+$$ collision is certain.
 date() {
@@ -1272,7 +1272,7 @@ PY
 
 test_typed_workflow_companions() {
     log_test "Actual act workers preserve typed companions and both evidence inventories"
-    if python3 - "$SRC_DIR/act_runner.sh" <<'PY'
+    if python3 - "$SRC_DIR/act_runner.sh" "${1:-all}" <<'PY'
 import copy
 import hashlib
 import io
@@ -1324,8 +1324,27 @@ source.mkdir()
 (source / "workflow.yml").write_text("name: typed transport fixture\non: push\njobs:\n"
     "  build-amd64:\n    runs-on: ubuntu-latest\n    steps: []\n"
     "  build-arm64:\n    runs-on: ubuntu-latest\n    steps: []\n")
+matrix_rows = [dict(target="linux/" + a, flavor="release build", enabled=(a == "amd64"),
+                    abi="gnu:2.28", literal='$(unexecuted) * "quoted"') for a in arches]
+matrix_definitions = {
+    "matrix": dict(target=[r["target"] for r in matrix_rows], flavor=["release build"],
+                   include=[{k: v for k, v in r.items() if k != "flavor"} for r in matrix_rows]),
+    "matrix-include": dict(include=matrix_rows),
+    "matrix-exclude": dict(target=[r["target"] for r in matrix_rows], flavor=["release build", "debug"],
+                           exclude=[dict(flavor="debug")], include=matrix_rows),
+    "matrix-duplicate": dict(include=[*matrix_rows, matrix_rows[0]]),
+    "matrix-missing-key": dict(include=[matrix_rows[0], dict(unrelated="row")]),
+    "matrix-dynamic": "${{ fromJSON(needs.setup.outputs.matrix) }}",
+    "matrix-expression-value": dict(target=["${{ needs.setup.outputs.target }}"]),
+    "matrix-nested-value": dict(target=[dict(os="linux", arch="amd64")]),
+    "matrix-empty": {},
+    "matrix-extra-cell": dict(target=[r["target"] for r in matrix_rows], flavor=["release build", "debug"]),
+}
+for label, matrix in matrix_definitions.items():
+    save(source / (label + ".yml"), dict(name="literal shared matrix fixture", on="push", jobs={
+        "build-matrix": {"runs-on": "ubuntu-latest", "strategy": {"matrix": matrix}, "steps": []}}))
 (source / "README").write_text("Owned synthetic workflow fixture; no compilation or payload execution.\n")
-for command in (("init", "--initial-branch=main"), ("add", "README", "workflow.yml"),
+for command in (("init", "--initial-branch=main"), ("add", "."),
                 ("-c", "user.name=DSR fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "fixture"),
                 ("tag", "v1.0.0")):
     subprocess.run(["git", "-C", str(source), *command], check=True, capture_output=True)
@@ -1390,8 +1409,14 @@ if args == ["--version"]:
     print("act version 0.2.86")
     raise SystemExit(0)
 job = args[args.index("-j") + 1]
-assert job.startswith("build-")
-arch = job[len("build-"):]
+if job == "build-matrix":
+    selections = [args[i + 1] for i, arg in enumerate(args[:-1]) if arg == "--matrix"]
+    selected = [value.split(":", 1)[1] for value in selections if value.startswith("target:")]
+    assert len(selected) == 1 and selected[0] in ("linux/amd64", "linux/arm64"), selections
+    arch = selected[0].split("/")[1]
+else:
+    assert job.startswith("build-")
+    arch = job[len("build-"):]
 uploads = Path(args[args.index("--artifact-server-path") + 1])
 (case / (arch + ".launch.json")).write_text(json.dumps({"argv": args, "uploads": str(uploads)}))
 if os.environ.get("DSR_TYPED_ACT_BARRIER") == "1":
@@ -1492,7 +1517,8 @@ def environment(case, concurrent=False):
         DSR_CONFIG_FILE=str(case / "config/config.yaml"), DSR_REPOS_FILE=str(case / "config/repos.yaml"),
         DSR_HOSTS_FILE=str(case / "config/hosts.yaml"), DSR_STATE_DIR=str(case / "state"),
         DSR_CACHE_DIR=str(case / "cache"), ACT_ARTIFACTS_DIR=str(case / "artifacts"),
-        ACT_LOGS_DIR=str(case / "logs"), ACT_TIMEOUT="25", NO_COLOR="1")
+        ACT_LOGS_DIR=str(case / "logs"), ACT_TIMEOUT="25", NO_COLOR="1",
+        DSR_TYPED_RC="--matrix=target:linux/arm64")
     return env
 
 def launch(case, arch="amd64", concurrent=False):
@@ -1532,6 +1558,139 @@ act_generate_manifest "$(cat "$2")" "$3"
     check(label + ": real manifest admission has expected outcome",
           completed.returncode == expected and (output.is_file() if expected == 0 else not output.exists()))
     return output if completed.returncode == 0 else None
+
+def shared_matrix(config, workflow="matrix.yml"):
+    config["workflow"] = workflow
+    config["act_job_map"] = {"linux/" + a: "build-matrix" for a in arches}
+    config["act_matrix"] = {r["target"]: copy.deepcopy(r) for r in matrix_rows}
+    config["act_overrides"].update(secrets_file=str(root / "release keys/token file"),
+                                   env_file=str(root / "release env/build vars.env"),
+                                   linux_arm64_flags=["--container-options '--label=release lane'"])
+
+matrix_case = make_case("shared-matrix-success", change=shared_matrix)
+matrix_processes = {a: launch(matrix_case, a, True) for a in arches}
+matrix_results = {}
+try:
+    for arch, process in matrix_processes.items():
+        status, result = finish(matrix_case, arch, process)
+        require(arch + ": shared matrix job completes through the actual worker", status == 0 and result.get("status") == "success")
+        matrix_results[arch] = result
+        actual_args = json.loads((matrix_case / (arch + ".launch.json")).read_text())["argv"]
+        check(arch + ": selected matrix values remain single literal argv elements",
+              all(actual_args.count("--matrix") == len(matrix_rows[0]) and value in actual_args for value in (
+                  "target:linux/" + arch, "flavor:release build", "abi:gnu:2.28",
+                  "enabled:" + ("true" if arch == "amd64" else "false"), 'literal:$(unexecuted) * "quoted"')))
+        check(arch + ": configured files retain spaces in actual argv",
+              actual_args[actual_args.index("--secret-file") + 1] == str(root / "release keys/token file") and
+              actual_args[actual_args.index("--env-file") + 1] == str(root / "release env/build vars.env"))
+        configured_args = actual_args[actual_args.index("-P"):-2]
+        args_digest = hashlib.sha256((json.dumps(configured_args, ensure_ascii=False, separators=(",", ":")) + "\n").encode()).hexdigest()
+        check(arch + ": worker receipt binds its selected cell and exact configured arguments",
+              result.get("workflow_payload_plan", {}).get("matrix", {}).get("cell") ==
+              next(r for r in matrix_rows if r["target"] == "linux/" + arch) and
+              result.get("workflow_payload_plan", {}).get("act_arguments_sha256") == args_digest and
+              "act_arguments" not in result.get("workflow_payload_plan", {}))
+        check(arch + ": completed matrix output can be reused without executing the workflow again", reusable(matrix_case, result))
+    check("shared matrix jobs retain independent transport and payload directories",
+          all(len({matrix_results[a][field] for a in arches}) == 2 for field in ("workflow_artifact_dir", "workflow_payload_dir", "log_file")))
+    check("quoted platform override remains one option value in actual argv",
+          "--label=release lane" in json.loads((matrix_case / "arm64.launch.json").read_text())["argv"])
+    matrix_manifest = manifest(matrix_case, list(matrix_results.values()), "shared-matrix")
+    require("shared matrix manifest includes both targets and every typed companion", matrix_manifest is not None and
+            {r["name"] for r in json.loads(matrix_manifest.read_text())["artifacts"]} ==
+            {name for a in arches for name in (primary(a), compat(a), metadata(a), runtime(a))})
+    changed_matrix = json.loads((matrix_case / "config/repos.d/typedact.yaml").read_text())
+    changed_matrix["act_matrix"]["linux/amd64"].pop("abi")
+    save(matrix_case / "config/repos.d/typedact.yaml", changed_matrix)
+    manifest(matrix_case, list(matrix_results.values()), "changed-selector", 4)
+finally:
+    for process in matrix_processes.values():
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.communicate(timeout=10)
+
+def primary_only_peer(config):
+    shared_matrix(config)
+    config["workspace_additional_artifacts"].pop("linux/arm64")
+
+peer_case = make_case("shared-primary-only-peer", change=primary_only_peer)
+peer_uploads = json.loads((peer_case / "uploads.json").read_text())
+peer_uploads["arm64"] = peer_uploads["arm64"][:1]
+save(peer_case / "uploads.json", peer_uploads)
+status, peer_result = finish(peer_case, "arm64", launch(peer_case, "arm64"))
+require("a shared-job peer without companions can run alone with a complete primary ownership plan",
+        status == 0 and peer_result.get("status") == "success" and peer_result.get("additional_artifacts") == [] and
+        peer_result.get("workflow_payload_plan", {}).get("matrix", {}).get("cell") == matrix_rows[1])
+check("primary-only peer retains argument binding and reusable complete inventories",
+      len(peer_result.get("workflow_payload_plan", {}).get("act_arguments_sha256", "")) == 64 and reusable(peer_case, peer_result))
+manifest(peer_case, [peer_result], "primary-only-peer")
+peer_config = json.loads((peer_case / "config/repos.d/typedact.yaml").read_text())
+peer_config["act_overrides"]["env_file"] = str(root / "different release env/build vars.env")
+save(peer_case / "config/repos.d/typedact.yaml", peer_config)
+manifest(peer_case, [peer_result], "changed-primary-peer-arguments", 4)
+
+for label in ("matrix-include", "matrix-exclude"):
+    selected_case = make_case(label, change=lambda c, name=label: shared_matrix(c, name + ".yml"))
+    status, selected_result = finish(selected_case, "amd64", launch(selected_case))
+    check(label + ": static include/exclude selects the exact cell through a real act subprocess",
+          status == 0 and selected_result.get("workflow_payload_plan", {}).get("matrix", {}).get("cell") == matrix_rows[0])
+
+def invalid_shared(config, mode):
+    shared_matrix(config)
+    if mode.startswith("matrix-"):
+        config["workflow"] = mode + ".yml"
+        if mode == "matrix-extra-cell":
+            config["act_matrix"] = {"linux/" + a: dict(target="linux/" + a) for a in arches}
+    elif mode == "overlapping":
+        config["act_matrix"]["linux/arm64"] = copy.deepcopy(config["act_matrix"]["linux/amd64"])
+    elif mode == "unfiltered-peer":
+        config["act_matrix"].pop("linux/arm64")
+    elif mode == "untyped-overlapping-peer":
+        config["workspace_additional_artifacts"]["linux/arm64"] = []
+        config["act_matrix"].pop("linux/arm64")
+    elif mode == "unknown-key":
+        config["act_matrix"]["linux/amd64"]["typo"] = "ignored by act"
+    elif mode == "extra-matrix-flag":
+        config["act_overrides"]["linux_arm64_flags"].append("--matrix target:linux/amd64")
+    elif mode == "changed-job-flag":
+        config["act_overrides"]["linux_arm64_flags"].append("-j build-amd64")
+    elif mode == "bundled-job-flag":
+        config["act_overrides"]["linux_arm64_flags"].append("-vj build-amd64")
+    elif mode == "malformed-flags":
+        config["act_overrides"]["linux_arm64_flags"].append("--container-options 'unfinished")
+    elif mode == "malformed-filter":
+        config["act_matrix"]["linux/arm64"]["target"] = ["linux/arm64"]
+    else:
+        raise AssertionError(mode)
+
+for mode in ("matrix-duplicate", "matrix-missing-key", "matrix-dynamic", "matrix-expression-value", "matrix-nested-value",
+             "matrix-empty", "matrix-extra-cell", "overlapping", "unfiltered-peer", "untyped-overlapping-peer", "unknown-key",
+             "extra-matrix-flag", "changed-job-flag", "bundled-job-flag", "malformed-flags", "malformed-filter"):
+    rejected = make_case("shared-reject-" + mode, change=lambda c, name=mode: invalid_shared(c, name))
+    status, refused = finish(rejected, "amd64", launch(rejected))
+    check(mode + ": invalid shared matrix rejects before any act subprocess, including an unselected peer",
+          status == 4 and not (rejected / "requests.jsonl").exists() and not refused.get("resume_artifacts"))
+
+for label, relative, content in (("home", ".actrc", "--matrix target:linux/arm64\n"),
+                                 ("xdg", ".config/act/actrc", "${DSR_TYPED_RC}\n")):
+    rejected = make_case("shared-actrc-" + label, change=shared_matrix)
+    rc = rejected / "home" / relative
+    rc.parent.mkdir(parents=True, exist_ok=True)
+    rc.write_text(content)
+    status, refused = finish(rejected, "amd64", launch(rejected))
+    check(label + ": ambient actrc cannot broaden admitted matrix filters before act starts",
+          status == 4 and not (rejected / "requests.jsonl").exists() and not refused.get("resume_artifacts"))
+
+rejected = make_case("shared-primary-peer-actrc", change=primary_only_peer)
+(rejected / "home/.actrc").write_text("--matrix target:linux/amd64\n")
+status, refused = finish(rejected, "arm64", launch(rejected, "arm64"))
+check("a selected primary-only peer refuses ambient matrix broadening before any act subprocess",
+      status == 4 and not (rejected / "requests.jsonl").exists() and not refused.get("resume_artifacts"))
+
+if sys.argv[2] == "matrix":
+    save(root / "summary.json", dict(checks=checks, failures=failures))
+    print("Shared act matrix: %d checks, %d failures" % (checks, len(failures)), flush=True)
+    sys.exit(bool(failures))
 
 case = make_case("concurrent-success")
 processes = {a: launch(case, a, True) for a in arches}
@@ -2234,7 +2393,7 @@ source "$1"
 act_check() { return 0; }
 act_platform_uses_act() { return 0; }
 act_get_job_for_target() { printf 'fixture\\n'; }
-act_get_flags() { printf '%s\\n' '-P ubuntu-latest=fixture'; }
+act_get_flags() { printf '%s\\n' '["-P","ubuntu-latest=fixture"]'; }
 ACT_REPO_WORKFLOW=workflow.yml
 ACT_REPO_LOCAL_PATH=$2
 _act_run_target_worker fixture v1 22222222-2222-4222-8222-222222222222 \\
@@ -2768,6 +2927,11 @@ main() {
     fi
     if [[ "${1:-}" == "--typed-companions-only" ]]; then
         test_typed_workflow_companions
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return
+    fi
+    if [[ "${1:-}" == "--shared-matrix-only" ]]; then
+        test_typed_workflow_companions matrix
         [[ "$FAIL_COUNT" -eq 0 ]]
         return
     fi

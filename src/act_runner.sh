@@ -448,13 +448,137 @@ _act_validate_additional_artifact() {
     fi
 }
 
+# A shared workflow job can own several targets only when its literal matrix
+# selects one distinct cell per owner. Match act v0.2.86's axis/include/exclude
+# expansion and CLI filtering, including its treatment of a missing filter key:
+# act ignores that key, so such a row must never establish exclusive ownership.
+_act_workflow_matrix_plan_json() {
+    local config_file="$1" workflow_file="$2" job="$3" owners="$4" arguments="$5" documents
+    [[ -f "$workflow_file" ]] || { _log_error "Shared workflow job requires a readable workflow: $workflow_file"; return 4; }
+    documents=$(
+        yq -o=json -I=0 '.' "$config_file" || exit 4
+        yq -o=json -I=0 '.' "$workflow_file" || exit 4
+    ) || return 4
+    # Keep complete workflow/configuration documents on stdin, not in a shell
+    # argument: large release workflows must not hit the per-argument limit.
+    python3 -c '
+import itertools, json, re, sys
+
+def fail(message):
+    sys.stderr.write("[act] Shared workflow matrix: " + message + "\n")
+    raise SystemExit(4)
+
+def key(value):
+    return isinstance(value, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", value)
+
+def scalar(value):
+    if isinstance(value, str):
+        return bool(value) and "${{" not in value and not re.search(r"[\x00-\x1f\x7f]", value)
+    return type(value) is bool or (type(value) is int and -(2**53) < value < 2**53)
+
+def rendered(value):
+    return value if isinstance(value, str) else json.dumps(value, separators=(",", ":"))
+
+def equal(left, right):
+    return type(left) is type(right) and left == right
+
+try:
+    config, workflow = [json.loads(line) for line in sys.stdin if line.strip()]
+    job, owners, arguments = sys.argv[1], json.loads(sys.argv[2]), json.loads(sys.argv[3])
+    definition = workflow["jobs"][job]["strategy"]["matrix"]
+    if not isinstance(definition, dict) or not definition:
+        fail("job " + job + " requires a nonempty literal strategy.matrix")
+    axes = {name: values for name, values in definition.items() if name not in ("include", "exclude")}
+    size = 1
+    for name, values in axes.items():
+        if not key(name) or not isinstance(values, list) or not values or not all(map(scalar, values)):
+            fail("matrix axes require literal scalar arrays: " + str(name))
+        size *= len(values)
+        if size > 256:
+            fail("matrix expands beyond 256 cells")
+    includes, excludes = definition.get("include", []), definition.get("exclude", [])
+    for kind, entries in (("include", includes), ("exclude", excludes)):
+        if not isinstance(entries, list) or len(entries) > 256 or any(
+                not isinstance(row, dict) or not all(key(k) and scalar(v) for k, v in row.items())
+                for row in entries):
+            fail(kind + " requires literal scalar mappings")
+    if any(any(name not in axes for name in row) for row in excludes):
+        fail("exclude names a nonexistent matrix axis")
+    rows = [dict(zip(axes, values)) for values in itertools.product(*axes.values())] if axes else []
+    rows = [row for row in rows if not any(exclude and all(equal(row[k], v) for k, v in exclude.items())
+                                          for exclude in excludes)]
+    extras = []
+    for include in includes:
+        matched = False
+        for row in rows:
+            if all(k not in axes or equal(row[k], v) for k, v in include.items()):
+                row.update(include)
+                matched = True
+        if not matched:
+            extras.append(include)
+    rows.extend(extras)
+    if not rows:
+        rows = [{}]  # act still schedules an empty matrix after full exclusion.
+    if len(rows) > 256:
+        fail("matrix expands beyond 256 cells")
+    configured = config.get("act_matrix", {})
+    if not isinstance(configured, dict):
+        fail("act_matrix must map each shared job owner to its literal filters")
+    selections, occupied = {}, set()
+    for owner in owners:
+        filters = configured.get(owner)
+        if not isinstance(filters, dict) or not filters or not all(key(k) and scalar(v) for k, v in filters.items()):
+            fail("every shared job owner needs nonempty literal act_matrix filters: " + owner)
+        filters = {k: rendered(v) for k, v in filters.items()}
+        # The managed matrix arguments are appended last by act_get_flags.
+        # Repeated CLI matrix values form a union in act, so an extra platform
+        # flag cannot silently broaden a target to include a peers cell.
+        argv = arguments[owner]
+        actual = []
+        index = 0
+        while index < len(argv):
+            option = argv[index]
+            if option == "--matrix":
+                index += 1
+                if index == len(argv):
+                    fail("matrix option is missing its value: " + owner)
+                actual.append(argv[index])
+            elif option.startswith("--matrix="):
+                actual.append(option.split("=", 1)[1])
+            elif re.match(r"^--(job|workflows|directory|artifact-server-path|eventpath|list|dryrun|graph)(=|$)", option) or \
+                    re.match(r"^-[jWCelng]", option) or option == "--" or \
+                    (option.startswith("-") and not option.startswith("--") and len(option) > 2 and
+                     option[1] not in "Psa"):
+                # Bundled boolean short flags can hide a later selector,
+                # e.g. -vj JOB. Require separate flags unless the first short
+                # option consumes the rest as one platform/secret/actor value.
+                fail("platform flags cannot replace a shared workflow selection: " + owner)
+            index += 1
+        if sorted(actual) != sorted(k + ":" + v for k, v in filters.items()):
+            fail("additional --matrix flags conflict with configured ownership: " + owner)
+        selected = [(i, row) for i, row in enumerate(rows)
+                    if all(k not in row or rendered(row[k]) == v for k, v in filters.items())]
+        if len(selected) != 1 or any(k not in selected[0][1] for k in filters):
+            fail("filters must select exactly one complete cell for " + owner)
+        index, cell = selected[0]
+        if index in occupied:
+            fail("shared job owners select the same cell: " + owner)
+        occupied.add(index)
+        selections[owner] = {"filters": filters, "cell": cell}
+    print(json.dumps(selections, sort_keys=True, separators=(",", ":")))
+except (KeyError, TypeError, ValueError) as exc:
+    fail("invalid literal workflow/configuration: " + str(exc))
+' "$job" "$owners" "$arguments" <<< "$documents" || return 4
+}
+
 # Opted-in workflow producers must own one physical target and one unambiguous
 # release naming family. Resolve the whole configuration before any job starts;
-# a selected subset cannot hide a second owner of the same job or asset name.
+# a selected subset cannot hide an overlapping shared matrix or asset name.
 _act_workflow_payload_plans_json() {
     local tool="$1" version="$2" config_file="$ACT_REPOS_DIR/$1.yaml"
     local configured document enabled module_dir target job owners triples triple format names binaries binary repo_path
     local primary compat outputs plan plans='{}' primary_owners='[]' all_names='{}'
+    local owner flags arguments_sha256 workflow matrix_plan matrix_plans='{}' argument_plans='{}'
     configured=$(_act_workspace_additional_artifacts_json "$config_file") || return 4
     document=$(_config_read_single_mapping_json "$config_file") || return 4
     enabled=$(jq -c --argjson configured "$configured" '
@@ -470,6 +594,13 @@ _act_workflow_payload_plans_json() {
         _log_error "Workflow additional artifacts require their owners in the configured targets: $enabled"
         return 4
     fi
+    # A companion-free peer of a shared job still owns a matrix cell. Give
+    # every owner the same primary/argv/matrix contract so a selected subset
+    # cannot fall back to unbound legacy collection or ambient actrc filters.
+    enabled=$(jq -c --argjson enabled "$enabled" '
+        . as $doc | [$enabled[] | $doc.act_job_map[.]] as $jobs |
+        [.targets[] | . as $target | select($jobs | index($doc.act_job_map[$target]))]
+    ' <<< "$document") || return 4
     if ! declare -F artifact_naming_generate_dual_for_tool &>/dev/null; then
         module_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" || return 3
         # shellcheck source=SCRIPTDIR/artifact_naming.sh
@@ -479,9 +610,18 @@ _act_workflow_payload_plans_json() {
         job=$(jq -r --arg target "$target" '.act_job_map[$target]' <<< "$document") || return 4
         owners=$(jq -c --arg job "$job" '. as $doc | [.targets[] | select($doc.act_job_map[.] == $job)]' \
             <<< "$document") || return 4
-        if [[ "$(jq length <<< "$owners")" != 1 ]]; then
-            _log_error "Workflow job '$job' for $target has ambiguous target owners $owners; use a distinct job per typed companion producer"
-            return 4
+        while IFS= read -r owner; do
+            jq -e --arg owner "$owner" 'has($owner)' <<< "$argument_plans" >/dev/null && continue
+            flags=$(act_get_flags "$tool" "$owner") || return 4
+            argument_plans=$(jq -c --arg owner "$owner" --argjson flags "$flags" \
+                '. + {($owner):$flags}' <<< "$argument_plans") || return 4
+        done < <(jq -r '.[]' <<< "$owners")
+        if [[ "$(jq length <<< "$owners")" -gt 1 ]] && \
+           ! jq -e --arg target "$target" 'has($target)' <<< "$matrix_plans" >/dev/null; then
+            workflow=$(jq -r '.workflow // ".github/workflows/release.yml"' <<< "$document") || return 4
+            matrix_plan=$(_act_workflow_matrix_plan_json "$config_file" "$repo_path/$workflow" \
+                "$job" "$owners" "$argument_plans") || return 4
+            matrix_plans=$(jq -c --argjson matrix "$matrix_plan" '. + $matrix' <<< "$matrix_plans") || return 4
         fi
         triples=$(config_get_target_triples_json "$tool" "$target") || return 4
         if [[ "$(jq length <<< "$triples")" -gt 1 ]]; then
@@ -553,17 +693,22 @@ _act_workflow_payload_plans_json() {
         done <<< "$binaries"
         binaries=$(printf '%s\n' "${members[@]}" | jq -Rsc 'split("\n")[:-1]') || return 4
         outputs=$(jq -cn --arg primary "$primary" --arg compat "$compat" --arg format "$format" \
-            --argjson companions "$(jq -c --arg target "$target" '.[$target]' <<< "$configured")" '
+            --argjson companions "$(jq -c --arg target "$target" '.[$target] // []' <<< "$configured")" '
             ([$primary,$compat] | unique | map({key:.,value:{role:"primary",format:$format,required:(. == $primary)}}) |
              from_entries) as $primaries |
             $primaries + ($primaries | to_entries | map({key:(.key + ".sha256"),value:{role:"checksum",format:"file",required:false}}) | from_entries) +
             ($companions | map({key:.name,value:{role:"additional",format:.format,required:true}}) | from_entries)
         ') || return 4
+        flags=$(jq -c --arg target "$target" '.[$target]' <<< "$argument_plans") || return 4
+        arguments_sha256=$(_act_sha256 /dev/stdin <<< "$flags") || return 4
         plan=$(jq -cn --arg target "$target" --arg job "$job" --arg version "$version" \
             --arg primary "$primary" --arg compat "$compat" --arg format "$format" \
             --argjson binaries "$binaries" --argjson outputs "$outputs" \
+            --arg arguments_sha256 "$arguments_sha256" \
+            --argjson matrix "$(jq -c --arg target "$target" '.[$target] // null' <<< "$matrix_plans")" \
             '{target:$target,job:$job,version:$version,primary:$primary,compat:$compat,
-              archive_format:$format,binaries:$binaries,outputs:$outputs}') || return 4
+              archive_format:$format,binaries:$binaries,outputs:$outputs,
+              act_arguments_sha256:$arguments_sha256,matrix:$matrix}') || return 4
         plans=$(jq -c --arg target "$target" --argjson plan "$plan" '. + {($target):$plan}' <<< "$plans") || return 4
     done < <(jq -r '.[]' <<< "$enabled")
     printf '%s\n' "$plans"
@@ -615,13 +760,13 @@ _act_validate_workflow_payload_result() {
     actual=$(_act_result_artifact_receipts "$result") || return 4
     [[ "$actual" == "$inventory" ]] || { _log_error "Workflow transport or payload bytes differ from their collection inventory"; return 4; }
     paths='[]' additional='[]'
-    local seen='[]'
+    local payload_names_json='[]'
     while IFS= read -r -d '' path; do
         [[ "$path" == "$payload" ]] && continue
         [[ -f "$path" && ! -L "$path" && "${path%/*}" == "$payload" ]] || return 4
         name="${path##*/}"
         row=$(jq -ce --arg name "$name" '.outputs[$name] // error("undeclared workflow payload: " + $name)' <<< "$plan") || return 4
-        seen=$(jq -c --arg name "$name" '. + [$name]' <<< "$seen") || return 4
+        payload_names_json=$(jq -c --arg name "$name" '. + [$name]' <<< "$payload_names_json") || return 4
         role=$(jq -r '.role' <<< "$row") || return 4
         format=$(jq -r '.format' <<< "$row") || return 4
         row=$(jq -ce --arg path "$path" '.[] | select(.path == $path)' <<< "$inventory") || return 4
@@ -652,7 +797,7 @@ PY
             fi
         fi
     done < <(find "$payload" -print0)
-    if ! jq -en --argjson seen "$seen" --argjson plan "$plan" --argjson result "$result" \
+    if ! jq -en --argjson seen "$payload_names_json" --argjson plan "$plan" --argjson result "$result" \
         --argjson paths "$paths" --argjson additional "$additional" '
         ($seen | map(ascii_downcase) | length == (unique | length)) and
         (([$plan.outputs | to_entries[] | select(.value.required) | .key] - $seen) | length == 0) and
@@ -2776,6 +2921,39 @@ _act_runner_image_config_present() {
     return 1
 }
 
+# act appends repeated --matrix options from its user/invocation actrc files;
+# they widen the allowed values instead of being replaced by command-line
+# filters. Shared-job ownership therefore requires those filters in the DSR
+# configuration alone. Read without executing any configuration shell text.
+_act_shared_matrix_config_admission() {
+    python3 -I - <<'PY'
+import os, pathlib, re, sys
+
+home = pathlib.Path(os.environ.get('HOME', str(pathlib.Path.home())))
+locations = [home / '.actrc', home / '.config/act/actrc',
+             home / 'Library/Application Support/act/actrc', pathlib.Path.cwd() / '.actrc']
+for variable in ('XDG_CONFIG_HOME', 'APPDATA', 'LOCALAPPDATA'):
+    if os.environ.get(variable):
+        locations.append(pathlib.Path(os.environ[variable]) / 'act/actrc')
+try:
+    for path in dict.fromkeys(locations):
+        if not path.exists():
+            continue
+        with path.open(encoding='utf-8') as stream:
+            for line in stream:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                line = re.sub(r'\$(?:\{([^}]+)\}|([A-Za-z0-9_]+))',
+                              lambda match: os.environ.get(match[1] or match[2], ''), line)
+                if re.search(r'(^|\s)--matrix(?:=|\s|$)', line):
+                    raise ValueError('move actrc --matrix filters into act_matrix for shared workflow jobs: ' + str(path))
+except (OSError, ValueError) as exc:
+    sys.stderr.write('[act] Shared workflow matrix: ' + str(exc) + '\n')
+    raise SystemExit(4)
+PY
+}
+
 # Run a workflow via act
 # Usage: act_run_workflow <repo_path> <workflow> [job] [event] [version] [extra_args...]
 # Returns: exit code (0=success, 1=partial, 6=build failed, 3=dependency error)
@@ -2794,6 +2972,9 @@ act_run_workflow() {
     if [[ ! -f "$workflow_path" ]]; then
         _log_error "Workflow not found: $workflow_path"
         return 4
+    fi
+    if [[ "${_ACT_SHARED_WORKFLOW_MATRIX:-false}" == true ]]; then
+        _act_shared_matrix_config_admission || return 4
     fi
 
     # A timestamp and $$ are shared by sibling Bash workers and quick
@@ -3229,73 +3410,78 @@ act_platform_uses_act() {
 
 # Get act flags for a tool/platform combination
 # Usage: act_get_flags <tool_name> <platform>
-# Returns: Array of act flags as space-separated string
+# Returns: JSON array of literal argv elements; never flatten and split it.
 act_get_flags() {
     local tool_name="$1"
     local platform="$2"
     local config_file="$ACT_REPOS_DIR/${tool_name}.yaml"
 
     if [[ ! -f "$config_file" ]]; then
-        echo ""
+        _log_error "Repo config not found: $config_file"
         return 4
     fi
 
-    local flags=()
+    yq -o=json -I=0 '.' "$config_file" | python3 -c '
+import json, re, shlex, sys
 
-    # Get platform-specific image override
-    local image
-    image=$(yq -r '.act_overrides.platform_image // ""' "$config_file" 2>/dev/null)
-    if [[ -n "$image" ]]; then
-        flags+=("-P ubuntu-latest=$image")
-    fi
+def fail(message):
+    sys.stderr.write("[act] Invalid workflow arguments: " + message + "\n")
+    raise SystemExit(4)
 
-    # Get secrets file if specified
-    local secrets_file
-    secrets_file=$(yq -r '.act_overrides.secrets_file // ""' "$config_file" 2>/dev/null)
-    if [[ -n "$secrets_file" ]]; then
-        flags+=("--secret-file $secrets_file")
-    fi
+def literal(value):
+    return isinstance(value, str) and not re.search(r"[\x00-\x1f\x7f]", value)
 
-    # Get env file if specified
-    local env_file
-    env_file=$(yq -r '.act_overrides.env_file // ""' "$config_file" 2>/dev/null)
-    if [[ -n "$env_file" ]]; then
-        flags+=("--env-file $env_file")
-    fi
-
-    # Platform-specific flags
-    if [[ "$platform" == "linux/arm64" ]]; then
-        # Check for ARM64 specific overrides
-        local arm64_flags
-        arm64_flags=$(yq -r '.act_overrides.linux_arm64_flags[]? // ""' "$config_file" 2>/dev/null)
-        if [[ -n "$arm64_flags" ]]; then
-            while IFS= read -r flag; do
-                flags+=("$flag")
-            done <<< "$arm64_flags"
-        fi
-    fi
-
-    # Matrix filtering for targeted builds (optional)
-    # Example:
-    # act_matrix:
-    #   "linux/amd64":
-    #     os: ubuntu-latest
-    #     target: linux/amd64
-    local matrix_entries
-    matrix_entries=$(yq -r '
-        .act_matrix."'"$platform"'" // {} |
-        to_entries |
-        .[] |
-        select(.value != null and .value != "") |
-        .key + ":" + (.value | tostring)
-    ' "$config_file" 2>/dev/null)
-    if [[ -n "$matrix_entries" ]]; then
-        while IFS= read -r entry; do
-            [[ -n "$entry" ]] && flags+=("--matrix $entry")
-        done <<< "$matrix_entries"
-    fi
-
-    echo "${flags[*]}"
+try:
+    document = json.load(sys.stdin)
+    if not isinstance(document, dict):
+        fail("expected one repository configuration mapping")
+    overrides = document.get("act_overrides", {})
+    if overrides is None:
+        overrides = {}
+    if not isinstance(overrides, dict):
+        fail("act_overrides must be a mapping")
+    arguments = []
+    for field, flag in (("platform_image", "-P"), ("secrets_file", "--secret-file"), ("env_file", "--env-file")):
+        value = overrides.get(field)
+        if value is None or value == "":
+            continue
+        if not literal(value):
+            fail(field + " must be a literal string without control characters")
+        arguments.extend((flag, "ubuntu-latest=" + value if field == "platform_image" else value))
+    if sys.argv[1] == "linux/arm64":
+        flags = overrides.get("linux_arm64_flags", [])
+        if flags is None:
+            flags = []
+        if not isinstance(flags, list) or not all(literal(value) for value in flags):
+            fail("linux_arm64_flags must be a list of literal option strings")
+        for value in flags:
+            # Quoting groups option values; it never executes shell syntax or
+            # expands environment variables, command substitutions or globs.
+            arguments.extend(shlex.split(value))
+    matrix = document.get("act_matrix", {})
+    if matrix is None:
+        matrix = {}
+    if not isinstance(matrix, dict):
+        fail("act_matrix must be a mapping")
+    filters = matrix.get(sys.argv[1], {})
+    if filters is None:
+        filters = {}
+    if not isinstance(filters, dict):
+        fail("target act_matrix filters must be a mapping")
+    for name, value in filters.items():
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", name):
+            fail("matrix keys must be literal identifiers")
+        if value is None or value == "":
+            continue
+        if type(value) is bool or type(value) is int:
+            value = json.dumps(value)
+        if not literal(value) or "${{" in value:
+            fail("matrix values must be literal strings, integers or booleans")
+        arguments.extend(("--matrix", name + ":" + value))
+    print(json.dumps(arguments, separators=(",", ":")))
+except (TypeError, ValueError) as exc:
+    fail(str(exc))
+' "$platform" || return 4
 }
 
 # Get all targets for a tool
@@ -13607,17 +13793,34 @@ _act_build_orchestration_target() {
             jq -nc '{status: "error", exit_code: 4, error: "Strict release targets must use native builds"}'
             return 4
         fi
-        local job workflow local_path extra_flags workflow_plans workflow_plan materialized
+        local job workflow local_path extra_flags arguments_sha256 workflow_plans workflow_plan materialized flag
+        local _ACT_SHARED_WORKFLOW_MATRIX=false
         workflow_plans=$(_act_workflow_payload_plans_json "$tool_name" "$version") || return 4
         workflow_plan=$(jq -c --arg target "$target" '.[$target] // null' <<< "$workflow_plans") || return 4
+        if jq -e '.matrix != null' <<< "$workflow_plan" >/dev/null; then
+            _ACT_SHARED_WORKFLOW_MATRIX=true
+        fi
         job=$(act_get_job_for_target "$tool_name" "$target")
         workflow="$ACT_REPO_WORKFLOW"
         local_path="$ACT_REPO_LOCAL_PATH"
-        extra_flags=$(act_get_flags "$tool_name" "$target")
+        extra_flags=$(act_get_flags "$tool_name" "$target" | jq -c .) || return 4
+        arguments_sha256=$(_act_sha256 /dev/stdin <<< "$extra_flags") || return 4
+        if [[ "$workflow_plan" != null ]] && ! jq -e --arg arguments "$arguments_sha256" \
+                '.act_arguments_sha256 == $arguments' <<< "$workflow_plan" >/dev/null; then
+            _log_error "Workflow arguments changed after payload ownership admission"
+            return 4
+        fi
         _log_info "Method: act (job=$job)"
 
         local act_args=()
-        [[ -n "$extra_flags" ]] && read -ra act_args <<< "$extra_flags"
+        if ! jq -e 'type == "array" and all(.[]; type == "string" and (contains("\u0000") | not))' \
+                <<< "$extra_flags" >/dev/null; then
+            _log_error "Invalid workflow argument vector"
+            return 4
+        fi
+        while IFS= read -r -d '' flag; do
+            act_args+=("$flag")
+        done < <(jq -j '.[] | ., "\u0000"' <<< "$extra_flags")
         full_output=$(act_run_workflow \
             "$local_path" "$workflow" "$job" "push" "$version" \
             "${act_args[@]}" 2>&1) || exit_code=$?

@@ -3452,9 +3452,8 @@ echo ""
 echo "== act_get_flags (matrix) =="
 
 matrix_flags=$(act_get_flags "testool" "linux/amd64")
-if [[ "$matrix_flags" == *"-P ubuntu-latest=catthehacker/ubuntu:full-22.04"* ]] && \
-   [[ "$matrix_flags" == *"--matrix os:ubuntu-latest"* ]] && \
-   [[ "$matrix_flags" == *"--matrix target:linux/amd64"* ]]; then
+if jq -e '. == ["-P", "ubuntu-latest=catthehacker/ubuntu:full-22.04",
+    "--matrix", "os:ubuntu-latest", "--matrix", "target:linux/amd64"]' <<< "$matrix_flags" >/dev/null; then
     pass "act_get_flags includes platform image and matrix filters"
 else
     fail "act_get_flags missing platform image or matrix filters: $matrix_flags"
@@ -4451,7 +4450,7 @@ act_zero_artifact_check() {
         ACT_REPO_WORKFLOW=".github/workflows/release.yml" ACT_REPO_LOCAL_PATH="$TEMP_DIR"
         act_platform_uses_act() { return 0; }
         act_get_job_for_target() { printf 'build-linux\n'; }
-        act_get_flags() { :; }
+        act_get_flags() { printf '[]\n'; }
         act_run_workflow() {
             jq -nc --argjson count "$count_json" \
                 '{status:"success",exit_code:0,artifact_count:$count}'
