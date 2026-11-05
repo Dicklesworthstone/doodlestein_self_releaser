@@ -4344,13 +4344,18 @@ test_strict_windows_bare_name_retry_uses_fresh_destination() {
             "C:/build/.dsr-release-snapshots/tool-run/source" 2>/dev/null
     )
 
-    local collected_path attempt_count retained_count
+    local collected_path attempt_count retained_count retained_path
     collected_path=$(jq -r '.artifact_path // empty' <<< "$result")
     attempt_count=$(wc -l < "$attempts_file" | tr -d ' ')
     retained_count=$(find "$ACT_ARTIFACTS_DIR" -path '*23456789-1234-4234-8234-123456789abc*' \
         -type f -name 'tool.exe' | wc -l | tr -d ' ')
+    retained_path=$(find "$ACT_ARTIFACTS_DIR" -path '*23456789-1234-4234-8234-123456789abc*/retry.*/tool.exe' \
+        -type f)
     if [[ "$attempt_count" -eq 2 && "$retained_count" -eq 2 && \
-          "$collected_path" == */retry.*/tool.exe && "$(get_scp_args)" == *"/build.ps1"* ]] && \
+          "$collected_path" == */tool.exe && "$collected_path" != */retry.*/* && \
+          -f "$retained_path" && "$(cat "$retained_path")" == 'partial exe attempt' && \
+          "$(get_scp_args)" == *"/build.ps1"* ]] && \
+       cmp -s "$collected_path" "$complete_file" && \
        jq -e '.status == "success" and (.collected_sha256 | test("^[0-9a-f]{64}$"))' \
            <<< "$result" >/dev/null; then
         log_pass "Strict Windows retry retained partial evidence and streamed the bare-name executable"
@@ -7111,6 +7116,15 @@ main() {
         test_scp_rust_artifact_path_with_cargo_build_target
         test_scp_rust_artifact_path_with_custom_profile
         printf 'Ordinary Rust output tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return $?
+    fi
+    if [[ "${1:-}" == --collection-retry-only ]]; then
+        test_strict_collector_keeps_symlink_victim_unchanged
+        test_strict_collector_rejects_partial_producer_failure
+        test_strict_collection_loop_streams_every_remote_artifact
+        test_strict_windows_bare_name_retry_uses_fresh_destination
+        printf 'Native collection retry tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
         [[ "$FAIL_COUNT" -eq 0 ]]
         return $?
     fi

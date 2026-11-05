@@ -12412,8 +12412,32 @@ EOF
                     if fallback_dir=$(mktemp -d "$artifact_dir/retry.XXXXXXXX") && \
                        chmod 700 "$fallback_dir" && \
                        [[ -d "$fallback_dir" && ! -L "$fallback_dir" ]]; then
-                        this_artifact_path="$fallback_dir/$artifact_filename"
-                        if _act_is_windows_host "$host"; then
+                        # Workspace receipts and archive members use the
+                        # canonical basename in artifact_dir. Keep failed
+                        # first-attempt bytes under retry/, then let the same
+                        # exclusive collector create a fresh canonical file.
+                        # A no-clobber rename preserves the diagnostic inode;
+                        # replacement or failure never licenses an overwrite.
+                        local retained_attempt="$fallback_dir/$artifact_filename"
+                        local failed_identity="" failed_sha="" failed_size="" retry_ready=false
+                        if [[ ! -e "$this_artifact_path" && ! -L "$this_artifact_path" ]]; then
+                            retry_ready=true
+                        elif [[ -f "$this_artifact_path" && ! -L "$this_artifact_path" ]] && \
+                             failed_identity=$(_act_file_identity "$this_artifact_path") && \
+                             failed_sha=$(_act_sha256 "$this_artifact_path") && \
+                             failed_size=$(_act_file_size "$this_artifact_path") && \
+                             mv -n -- "$this_artifact_path" "$retained_attempt" && \
+                             [[ ! -e "$this_artifact_path" && ! -L "$this_artifact_path" &&
+                                -f "$retained_attempt" && ! -L "$retained_attempt" ]] && \
+                             [[ "$(_act_file_identity "$retained_attempt")" == "$failed_identity" &&
+                                "$(_act_sha256 "$retained_attempt")" == "$failed_sha" &&
+                                "$(_act_file_size "$retained_attempt")" == "$failed_size" ]]; then
+                            retry_ready=true
+                            _log_info "Retained failed collection attempt: $retained_attempt"
+                        fi
+                        if ! $retry_ready; then
+                            _log_error "Cannot preserve failed collection before bare-name retry: $this_artifact_path"
+                        elif _act_is_windows_host "$host"; then
                             collection_receipt=$(_act_collect_stream_exclusive \
                                 "$this_artifact_path" "$collection_mode" \
                                 _act_stream_remote_windows_file \

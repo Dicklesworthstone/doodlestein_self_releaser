@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Real native archive-branch, Git-source and collection-receipt regressions.
 # No remote build execution, signing or GitHub publication is claimed.
+# --remote-retry-only exercises bare Windows output collection and packaging.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 3; }
-python3 - "$ROOT" <<'PY'
+case "$#:${1:-}" in 0:|1:--remote-retry-only) ;; *) echo "Usage: $0 [--remote-retry-only]" >&2; exit 4 ;; esac
+python3 - "$ROOT" "${1:-}" <<'PY'
 #!/usr/bin/env python3
 """Exercise the real native packaging block and its collection validators.
 
@@ -30,6 +32,7 @@ import tempfile
 import zipfile
 
 root = Path(sys.argv[1])
+retry_only = sys.argv[2] == '--remote-retry-only'
 module = Path(os.environ.get('DSR_TEST_ACT_RUNNER', str(root / 'src/act_runner.sh')))
 for tool in ('bash','git','jq','cc','tar','gzip','zip','unzip','xz'):
     if not shutil.which(tool):
@@ -180,6 +183,10 @@ collect_end = '        # Package workspace binaries into a single tarball\n'
 if source.count(collect_begin) != 1 or source.count(collect_end) != 1:
     raise AssertionError('native companion collection block is ambiguous or unavailable')
 collection_block = source[source.index(collect_begin):source.index(collect_end)]
+binary_begin = '        # Determine which binaries to download\n'
+if source.count(binary_begin) != 1:
+    raise AssertionError('native binary collection block is ambiguous or unavailable')
+binary_collection_block = source[source.index(binary_begin):source.index(collect_begin)]
 
 driver = work / 'package-driver.sh'
 driver.write_text(r'''#!/usr/bin/env bash
@@ -258,13 +265,62 @@ _test_native_packaging() {
     [[ "$platform" != windows/* ]] || bin="${binary_name%.exe}.exe"
     local mode=700
     [[ "$platform" != windows/* ]] || mode=600
-    receipt=$(_act_collect_stream_exclusive "$artifact_dir/$bin" "$mode" _act_stream_local_file "$compiled") || return $?
-    local_artifact_paths=("$artifact_dir/$bin")
-    strict_collection_receipts=("$receipt")
-    workspace_member_receipts+=("$(_act_workspace_member_receipt "$artifact_dir" "$bin" "$receipt" "$mode")") || return $?
-    printf '%s\n' "$receipt" > "$artifact_dir/binary-collection.json"
-    if [[ ${DSR_TEST_TAMPER_COLLECTED:-0} == 1 ]]; then
-        printf changed >> "$artifact_dir/$bin"
+    if [[ -n "${DSR_TEST_NATIVE_RETRY:-}" ]]; then
+        # Execute the real Unix-side Windows cross-build collection branch.
+        # Only SSH delivery is local; source selection, held destinations,
+        # fallback, archive construction and custody validation stay real.
+        host=fixture-remote ssh_destination=fixture-remote
+        local rust_glibc_floor_enforced=''
+        _act_is_local_host() { return 1; }
+        _act_is_windows_host() { return 1; }
+        ssh() {
+            local command="${!#}" result=0
+            printf '%s\n' "$command" >> "$artifact_dir/transport.log"
+            if [[ "$command" == *".exe'" && "$DSR_TEST_NATIVE_RETRY" != present ]]; then
+                if [[ "$DSR_TEST_NATIVE_RETRY" == missing ]]; then
+                    bash -c "$command" || result=$?
+                else
+                    printf 'partial first attempt\n'
+                    result=23
+                fi
+                python3 - "$artifact_dir" "$command" <<'ATTEMPT'
+import hashlib, json, shlex, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+path = root / Path(shlex.split(sys.argv[2])[-1]).name
+info = path.stat()
+with (root / 'failed-attempts.jsonl').open('a') as output:
+    output.write(json.dumps(dict(name=path.name, sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        size=info.st_size, device=info.st_dev, inode=info.st_ino)) + '\n')
+ATTEMPT
+            elif [[ "$DSR_TEST_NATIVE_RETRY" == fail ]]; then
+                printf 'partial fallback attempt\n'
+                result=24
+            else
+                bash -c "$command" || result=$?
+            fi
+            return "$result"
+        }
+        if [[ "$DSR_TEST_NATIVE_RETRY" == collision ]]; then
+            mv() {
+                command mv "$@" || return $?
+                if [[ $# -eq 4 && "$1" == -n && "$2" == -- && "$3" == "$artifact_dir/app.exe" ]]; then
+                    # A different writer takes the canonical path after
+                    # retirement. Exclusive collection must not replace it.
+                    (set -C; printf 'another canonical owner\n' > "$3") || return 1
+                fi
+            }
+        fi
+''' + binary_collection_block + r'''
+    else
+        receipt=$(_act_collect_stream_exclusive "$artifact_dir/$bin" "$mode" _act_stream_local_file "$compiled") || return $?
+        local_artifact_paths=("$artifact_dir/$bin")
+        strict_collection_receipts=("$receipt")
+        workspace_member_receipts+=("$(_act_workspace_member_receipt "$artifact_dir" "$bin" "$receipt" "$mode")") || return $?
+        printf '%s\n' "$receipt" > "$artifact_dir/binary-collection.json"
+        if [[ ${DSR_TEST_TAMPER_COLLECTED:-0} == 1 ]]; then
+            printf changed >> "$artifact_dir/$bin"
+        fi
     fi
 ''' + collection_block + r'''
     if [[ "$DSR_TEST_COMPANION_PHASE" == prearchive && "$status" == success ]]; then
@@ -352,6 +408,32 @@ if clang:
         binary = work / 'linux-arm64'
         command([clang,'--target=aarch64-linux-gnu','-fuse-ld=lld','-nostdlib','-Wl,-e,main',source_c,'-o',binary])
         fixtures['linux/arm64'] = binary
+
+def compile_pe64(input_source, output):
+    obj = output.with_suffix('.obj')
+    if clang and shutil.which('lld-link'):
+        command([clang, '--target=x86_64-pc-windows-msvc', '-c', input_source, '-o', obj])
+        command([shutil.which('lld-link'), '/entry:main', '/subsystem:console', '/nodefaultlib',
+                 '/out:'+str(output), obj])
+        return True
+    # GNU binutils can also compile/link this freestanding C fixture as PE64.
+    # This uses real COFF objects and a real PE linker, never a fabricated header.
+    linker, copier = shutil.which('ld'), shutil.which('objcopy')
+    if host == 'linux/amd64' and linker and copier:
+        emulations = command([linker, '-V']).stdout
+        if b'i386pep' in emulations:
+            elf = output.with_suffix('.o')
+            command([cc, '-c', '-ffreestanding', '-fno-asynchronous-unwind-tables',
+                     '-fno-stack-protector', input_source, '-o', elf])
+            command([copier, '--remove-section=.comment', '-O', 'pe-x86-64', elf, obj])
+            command([linker, '-m', 'i386pep', '-e', 'main', '--subsystem', 'console', '-o', output, obj])
+            return True
+    return False
+
+if 'windows/amd64' not in fixtures:
+    binary = work / 'windows-amd64.exe'
+    if compile_pe64(source_c, binary):
+        fixtures['windows/amd64'] = binary
 for target in ('linux/amd64','linux/arm64','darwin/amd64','darwin/arm64','windows/amd64','windows/arm64'):
     if target not in fixtures:
         skipped += 1
@@ -459,7 +541,7 @@ counter=0
 generated_companions={'metadata.json':(b'{"release":"original"}\n',0o600),
                       'verify.sh':(b'#!/bin/sh\nprintf "original verifier\\n"\n',0o700)}
 
-def package(config,target,expected=0,preexisting=False,tamper=False,companion_fault=None):
+def package(config,target,expected=0,preexisting=False,tamper=False,companion_fault=None,remote_retry=None):
     global counter
     counter+=1
     folder=work/('case-'+str(counter)); folder.mkdir()
@@ -473,6 +555,10 @@ def package(config,target,expected=0,preexisting=False,tamper=False,companion_fa
     for name,(data,mode) in generated_companions.items():
         (inputs/name).write_bytes(data)
         (inputs/name).chmod(mode)
+    if remote_retry:
+        for name, compiled in remote_retry['binaries'].items():
+            output_name = name + '.exe' if remote_retry['mode'] == 'present' else name
+            (inputs/output_name).write_bytes(compiled.read_bytes())
     path=folder/config['release_contract']['exact_primary_assets'][target]
     prior=None
     if preexisting:
@@ -481,6 +567,7 @@ def package(config,target,expected=0,preexisting=False,tamper=False,companion_fa
     p=subprocess.run(['bash',str(driver),str(module),str(cf),str(repo),revision,target,str(folder),str(fixtures[target])],
                      env=dict(os.environ,DSR_CONFIG_DIR=str(config_dir),
                               DSR_TEST_TAMPER_COLLECTED=str(int(tamper)),DSR_TEST_ARCHIVE_INPUTS=str(inputs),
+                              DSR_TEST_NATIVE_RETRY=remote_retry['mode'] if remote_retry else '',
                               DSR_TEST_COLLECTION_LOG=str(folder/'collection-handoffs.jsonl'),
                               DSR_TEST_COMPANION_PROOF=str(folder/'companion-mutation.json'),
                               DSR_TEST_COMPANION_PHASE=companion_fault[0] if companion_fault else '',
@@ -497,6 +584,119 @@ def package(config,target,expected=0,preexisting=False,tamper=False,companion_fa
     if prior:
         check('existing archive is not replaced or rewritten',prior==(sha(path),path.stat().st_ino))
     return result,cf,folder
+
+def remote_retry_regressions():
+    target = 'windows/amd64'
+    if target not in fixtures:
+        if retry_only:
+            raise SystemExit('Windows retry acceptance requires a real PE compiler/linker')
+        print('SKIP Windows retry archives: no real PE compiler/linker', flush=True)
+        return
+    helper_source = work / 'retry-helper.c'
+    helper_source.write_text('int main(void) { return 29; }\n')
+    helper = work / 'retry-helper.exe'
+    if not compile_pe64(helper_source, helper):
+        raise SystemExit('Windows retry family requires a real PE compiler/linker')
+    primary = fixtures[target]
+    check('retry family uses distinct genuinely linked PE executables',sha(primary) != sha(helper))
+    shell('_act_validate_target_binary',primary,target)
+    shell('_act_validate_target_binary',helper,target)
+    before = {str(path):metadata_snapshot(path) for path in (primary,helper)}
+    config = {'binary_name':'app','targets':[target], 'include_files':list(committed),
+              'release_contract':{'exact_primary_assets':{target:'app-windows-amd64.zip'}}}
+
+    def retained_attempts(folder, expected):
+        rows = [json.loads(row) for row in (folder/'failed-attempts.jsonl').read_text().splitlines()]
+        check('each failed first attempt has independent retained evidence',len(rows)==expected)
+        for row in rows:
+            matches = list(folder.glob('retry.*/'+row['name']))
+            check('failed '+row['name']+' has one private diagnostic path',len(matches)==1)
+            path = matches[0]
+            info = path.stat()
+            check('failed '+row['name']+' retains its original bytes, size and inode',
+                  sha(path)==row['sha256'] and info.st_size==row['size'] and
+                  (info.st_dev,info.st_ino)==(row['device'],row['inode']))
+        return rows
+
+    def stage(result, cfg, folder, expected):
+        environment = dict(os.environ,DSR_CONFIG_DIR=str(folder/'config'),
+                           ACT_REPOS_DIR=str(folder/'config/repos.d'),ACT_ARTIFACTS_DIR=str(folder/'staged'))
+        program = 'source "$1" && source "$(dirname "$1")/config.sh" && shift && _act_stage_contract_primary "$@"'
+        process = subprocess.run(['bash','-c',program,'_',str(module),'app','v1.2.3',
+                                  'retained-native-retry',target,json.dumps(result),
+                                  json.dumps(cfg['release_contract'])],env=environment,capture_output=True,timeout=30)
+        (folder/'stage.stdout').write_bytes(process.stdout)
+        (folder/'stage.stderr').write_bytes(process.stderr)
+        check('independent release admission returns '+str(expected),process.returncode==expected)
+        if expected:
+            check('incorrect fallback binary has no admitted release primary',process.stdout==b'' and
+                  not list((folder/'staged').rglob('*.zip')))
+        else:
+            staged = json.loads(process.stdout)
+            check('independent admission preserves exact completed ZIP bytes',
+                  Path(staged['artifact_path']).read_bytes()==Path(result['artifact_path']).read_bytes())
+
+    for mode, family in (('missing',False),('partial',False),('partial',True),('present',True)):
+        cfg = copy.deepcopy(config)
+        binaries = {'app':primary}
+        if family:
+            cfg['workspace_binaries']=['app','helper']
+            binaries['helper']=helper
+        result,cf,folder=package(cfg,target,remote_retry={'mode':mode,'binaries':binaries})
+        label = mode + (' family' if family else ' singleton')
+        expected=dict(committed)
+        expected.update({name+'.exe':(path.read_bytes(),0o644) for name,path in binaries.items()})
+        check(label+' packages each exact executable and pinned companion',
+              read_archive(Path(result['artifact_path']),'zip')==expected)
+        handoffs=[json.loads(row) for row in (folder/'collection-handoffs.jsonl').read_text().splitlines()]
+        for name,compiled in binaries.items():
+            canonical=folder/(name+'.exe')
+            receipt=next(row for row in handoffs if row['path']==str(canonical))
+            info=canonical.stat()
+            check(label+' binds '+name+' to its accepted canonical bytes and inode',
+                  receipt['sha256']==sha(compiled)==sha(canonical) and
+                  receipt['size_bytes']==info.st_size and
+                  receipt['identity'] in (f'gnu:{info.st_dev}:{info.st_ino}',f'bsd:{info.st_ino}'))
+        if mode != 'present':
+            retained_attempts(folder,len(binaries))
+            check(label+' performs exactly one suffix retry per executable',
+                  len((folder/'transport.log').read_text().splitlines())==2*len(binaries))
+        else:
+            check('complete .exe outputs need no fallback or retired evidence',
+                  not (folder/'failed-attempts.jsonl').exists() and
+                  len((folder/'transport.log').read_text().splitlines())==len(binaries))
+        shell('_act_validate_workspace_archive',result['artifact_path'],'zip',target,cf)
+        stage(result,cfg,folder,0)
+
+    for mode in ('fail','collision'):
+        result,_,folder=package(config,target,expected=7,remote_retry={'mode':mode,'binaries':{'app':primary}})
+        retained_attempts(folder,1)
+        check(mode+' cannot expose a completed archive or native receipt',
+              result['artifact_path']=='' and result['collected_sha256']=='' and
+              not (folder/'app-windows-amd64.zip').exists())
+        expected = b'partial fallback attempt\n' if mode=='fail' else b'another canonical owner\n'
+        check(mode+' retains unaccepted canonical bytes without overwriting them',
+              (folder/'app.exe').read_bytes()==expected)
+        if mode=='collision':
+            check('a newly occupied canonical path refuses before fallback transport',
+                  len((folder/'transport.log').read_text().splitlines())==1)
+
+    result,_,folder=package(config,target,remote_retry={'mode':'wrong','binaries':{'app':local_binary}})
+    retained_attempts(folder,1)
+    check('wrong-OS control reaches real ZIP production with exact collected bytes',
+          read_archive(Path(result['artifact_path']),'zip')['app.exe'][0]==local_binary.read_bytes())
+    stage(result,config,folder,4)
+    check('wrong-OS refusal reaches the PE architecture gate',
+          b'not a complete PE executable' in (folder/'stage.stderr').read_bytes())
+    package(config,target,expected=7,preexisting=True,
+            remote_retry={'mode':'partial','binaries':{'app':primary}})
+    check('retry and refusal cases never modify compiler-produced input executables',
+          before=={str(path):metadata_snapshot(path) for path in (primary,helper)})
+
+remote_retry_regressions()
+if retry_only:
+    print(f'Native Windows collection retries: {passed} passed, {skipped} unavailable-toolchain skips; fixtures: {work}')
+    raise SystemExit(0)
 
 for target,binary in fixtures.items():
     for fmt in ('tar.gz','tar.xz','zip'):
