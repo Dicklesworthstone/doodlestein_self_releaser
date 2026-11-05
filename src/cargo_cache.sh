@@ -774,14 +774,32 @@ def locked_selection(source, lockfile, roots=None):
                         continue
                     for checkout in children('git/checkouts/' + database):
                         checkout_path = 'git/checkouts/' + database + '/' + checkout
-                        admin = (roots.location(checkout_path + '/.git') if roots is not None else
-                                 os.path.join(source, checkout_path, '.git'))
-                        if os.path.islink(admin) or not os.path.isdir(admin):
+                        # These are optional routing candidates, not selected
+                        # inputs yet. Interrupted or unrelated checkouts may
+                        # have no .git directory, a gitdir file or a link. Do
+                        # not follow/read them just to look for a locked HEAD.
+                        try:
+                            checkout_fd = source_directory(source, checkout_path, roots)
+                        except FileNotFoundError:
                             continue
-                        head = git_probe(admin, ['rev-parse', '--verify', 'HEAD']).strip()
-                        if head == revision.encode('ascii'):
-                            add(checkout_path)
-                            link_checkouts.add(checkout_path)
+                        try:
+                            try:
+                                admin_info = os.stat('.git', dir_fd=checkout_fd, follow_symlinks=False)
+                            except FileNotFoundError:
+                                continue
+                            if not stat.S_ISDIR(admin_info.st_mode):
+                                continue
+                            admin = (roots.location(checkout_path + '/.git') if roots is not None else
+                                     os.path.join(source, checkout_path, '.git'))
+                            head = git_probe(admin, ['rev-parse', '--verify', 'HEAD']).strip()
+                            if directory_identity(admin_info) != directory_identity(
+                                    os.stat('.git', dir_fd=checkout_fd, follow_symlinks=False)):
+                                raise Failure('checkout administration changed during selection: ' + checkout_path)
+                            if head == revision.encode('ascii'):
+                                add(checkout_path)
+                                link_checkouts.add(checkout_path)
+                        finally:
+                            os.close(checkout_fd)
     scope = {'kind': 'cargo-lock-downloads', 'lockfile_sha256': hashlib.sha256(raw).hexdigest(),
              'registry_packages': len(archives), 'git_revisions': sorted(revisions)}
     if roots is not None:

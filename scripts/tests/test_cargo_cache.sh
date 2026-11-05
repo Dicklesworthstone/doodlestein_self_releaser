@@ -538,6 +538,48 @@ class LockedCacheTests(unittest.TestCase):
         self.write_lock([{'name': 'helper', 'version': '1.0.0', 'source': 'git+https://example.invalid/helper#' + sha}])
         return checkout, child
 
+    def unusable_checkout_routes(self, checkout):
+        routes = []
+        for kind in ('missing', 'empty-directory', 'invalid-head', 'gitdir-file', 'linked', 'dangling', 'fifo'):
+            candidate = checkout.parent / ('unrelated-' + kind)
+            candidate.mkdir()
+            admin = candidate / '.git'
+            if kind in ('empty-directory', 'invalid-head'):
+                admin.mkdir()
+                if kind == 'invalid-head':
+                    (admin / 'HEAD').write_text('not a Git revision\n')
+            elif kind == 'gitdir-file':
+                admin.write_text('gitdir: ' + str(checkout / '.git') + '\n')
+            elif kind == 'linked':
+                admin.symlink_to(checkout / '.git', target_is_directory=True)
+            elif kind == 'dangling':
+                admin.symlink_to(self.root / 'absent-administration', target_is_directory=True)
+            elif kind == 'fifo':
+                os.mkfifo(admin)
+            routes.append(candidate)
+        return routes
+
+    @unittest.skipUnless(shutil.which('git'), 'Git not installed')
+    def test_locked_submodule_seed_ignores_unusable_unselected_checkout_routes(self):
+        checkout, _ = self.submodule_checkout()
+        clean = self.scoped(home=self.root / 'clean private home')
+        routes = self.unusable_checkout_routes(checkout)
+        selected = self.scoped()
+        self.assertEqual(json.loads(Path(clean['receipt_path']).read_bytes())['inventory'],
+                         json.loads(Path(selected['receipt_path']).read_bytes())['inventory'])
+        for candidate in routes:
+            self.assertFalse(self.copied(candidate).exists())
+        self.invoke('verify', self.home, selected['receipt_path'])
+
+    @unittest.skipUnless(shutil.which('git'), 'Git not installed')
+    def test_locked_submodule_seed_still_refuses_selected_nested_gitdir_pointer(self):
+        _, child = self.submodule_checkout()
+        retained = self.root / 'retained nested administration'
+        (child / '.git').rename(retained)
+        (child / '.git').write_text('gitdir: ' + str(retained) + '\n')
+        self.scoped(7)
+        self.assertFalse(self.home.exists())
+
     def assert_submodule_link_seed(self, relocated=False):
         checkout, child = self.submodule_checkout()
         if relocated:
@@ -677,23 +719,61 @@ class LockedCacheTests(unittest.TestCase):
         fetched = subprocess.run(['cargo', 'fetch'], cwd=project, env=env, capture_output=True, timeout=90)
         self.assertEqual(fetched.returncode, 0, fetched.stderr.decode())
         self.lock = project / 'Cargo.lock'
+        ambient_checkout = next((ambient / 'git/checkouts').glob('*/*/Cargo.toml')).parent
+        routes = self.unusable_checkout_routes(ambient_checkout)
         home = self.root / 'submodule-private-home'
         seed = self.scoped(source=ambient, home=home)
+        for candidate in routes:
+            self.assertFalse((home / candidate.relative_to(ambient)).exists())
         checkout = next((home / 'git/checkouts').glob('*/*/Cargo.toml')).parent
         self.assertEqual(os.readlink(checkout / 'crate/LICENSE'), '../LICENSE')
         self.assertEqual(os.readlink(checkout / 'deps/child/crate/LICENSE'), '../LICENSE')
         self.assertTrue((checkout / 'deps/child/.git/objects').is_dir())
         self.invoke('verify', home, seed['receipt_path'])
+        # Optional routes cannot stand in for a missing required checkout.
+        # A bare parent database cannot reconstruct the nested repositories
+        # offline, even when another candidate points at a valid admin dir.
+        ambient_checkout.rename(self.root / 'retained required checkout')
+        incomplete = self.root / 'incomplete-submodule-home'
+        self.scoped(source=ambient, home=incomplete)
+        self.assertFalse((incomplete / 'git/checkouts').exists())
         ambient.rename(self.root / 'retained-cargo-home')
         upstream.rename(self.root / 'retained-parent-upstream')
         child.rename(self.root / 'retained-child-upstream')
+        incomplete_env = dict(env, CARGO_HOME=str(incomplete))
+        missing = subprocess.run(['cargo', 'metadata', '--locked', '--offline', '--all-features',
+                                  '--format-version=1'], cwd=project, env=incomplete_env,
+                                 capture_output=True, timeout=30)
+        self.assertNotEqual(missing.returncode, 0, missing.stdout.decode())
+        self.assertFalse((self.root / 'submodule-target/debug/seed-consumer').exists())
         env['CARGO_HOME'] = str(home)
+        metadata = subprocess.run(['cargo', 'metadata', '--locked', '--offline', '--all-features',
+                                   '--format-version=1'], cwd=project, env=env, capture_output=True, timeout=30)
+        self.assertEqual(metadata.returncode, 0, metadata.stderr.decode())
+        metadata_path = self.root / 'submodule-metadata.json'
+        metadata_path.write_bytes(metadata.stdout)
+        source_receipt = self.root / 'submodule-sources.json'
+        sources = Path(ACT_RUNNER).with_name('cargo_sources.sh')
+        authenticate = ['bash', str(sources), 'capture-workspace', str(metadata_path),
+                        str(source_receipt), str(self.lock)]
+        admitted = subprocess.run(authenticate, env=env, capture_output=True, timeout=30)
+        self.assertEqual(admitted.returncode, 0, admitted.stderr.decode())
+        proof = json.loads(source_receipt.read_bytes())['authentication']['packages'][0]
+        self.assertEqual(proof['commit'], revision)
+        self.assertTrue(proof['submodules'])
         built = subprocess.run(['cargo', 'run', '--locked', '--offline', '--quiet'],
                                cwd=project, env=env, capture_output=True, timeout=90)
         self.assertEqual(built.returncode, 0, built.stderr.decode())
         self.assertEqual(built.stdout.strip(), b'42')
         final = self.invoke('inventory', home, self.root / 'submodule-final.json')
         self.invoke('verify', home, final['receipt_path'])
+        authenticate[2] = 'verify-workspace'
+        verified = subprocess.run(authenticate, env=env, capture_output=True, timeout=30)
+        self.assertEqual(verified.returncode, 0, verified.stderr.decode())
+        (checkout / 'deps/child/value.rs').write_text('pub fn value() -> u32 { 99 }\n')
+        refused = subprocess.run(authenticate, env=env, capture_output=True, timeout=30)
+        self.assertEqual(refused.returncode, 7, refused.stderr.decode())
+        self.assertFalse(refused.stdout)
 
     @unittest.skipUnless(shutil.which('git'), 'Git not installed')
     def test_only_locked_git_database_is_copied_and_can_recreate_checkout(self):
