@@ -296,9 +296,16 @@ _hh_get_host_config() {
     _hh_normalize_host_config "$hostname" "$raw"
 }
 
-# List hosts with yq fallback
+# List enabled hosts, optionally restricted to an OS and declared capability.
+# Validate every configured host before returning any names, including hosts
+# outside the requested scope. Selection must avoid irrelevant remote probes
+# without hiding an invalid inventory or losing YAML capability aliases.
+# Usage: _hh_list_hosts [os] [capability]
 _hh_list_hosts() {
+    local os="${1:-}" capability="${2:-}"
     local hosts names name host_config result=""
+    [[ $# -le 2 && ( -z "$os" || "$os" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ) &&
+       ( -z "$capability" || "$capability" =~ ^[A-Za-z0-9_][A-Za-z0-9_.+-]*$ ) ]] || return 4
     if command -v yq &>/dev/null; then
         hosts=$(_hh_read_hosts_json) || return $?
         names=$(jq -r 'keys[]' <<< "$hosts") || return 4
@@ -306,14 +313,28 @@ _hh_list_hosts() {
             [[ -n "$name" ]] || continue
             host_config=$(jq -c --arg name "$name" '.[$name]' <<< "$hosts") || return 4
             host_config=$(_hh_normalize_host_config "$name" "$host_config") || return $?
-            if jq -e '.enabled == true' <<< "$host_config" >/dev/null; then
+            if jq -e --arg os "$os" --arg capability "$capability" '
+                .enabled == true and
+                ($os == "" or (.platform | split("/")[0]) == $os) and
+                ($capability == "" or (.capabilities | index($capability)) != null)
+            ' <<< "$host_config" >/dev/null; then
                 result+="$name"$'\n'
             fi
         done <<< "$names"
     else
         # Capture the complete result so a later malformed entry cannot leave
         # an apparently successful partial list on stdout.
-        result=$(_hh_list_hosts_fallback) || return $?
+        names=$(_hh_list_hosts_fallback) || return $?
+        while IFS= read -r name; do
+            [[ -n "$name" ]] || continue
+            host_config=$(_hh_get_host_config "$name") || return $?
+            if jq -e --arg os "$os" --arg capability "$capability" '
+                ($os == "" or (.platform | split("/")[0]) == $os) and
+                ($capability == "" or (.capabilities | index($capability)) != null)
+            ' <<< "$host_config" >/dev/null; then
+                result+="$name"$'\n'
+            fi
+        done <<< "$names"
     fi
     [[ -z "$result" ]] || printf '%s\n' "${result%$'\n'}"
     return 0
@@ -1939,6 +1960,7 @@ _hh_print_result() {
 
 # Check all configured hosts
 # Usage: host_health_check_all [--no-cache] [--json] [--fail-unhealthy]
+#        [--for-os <os>] [--for-capability <capability>]
 # Returns 4 for an invalid host configuration. With --fail-unhealthy, also 1
 # when an enabled host is unhealthy (the report is still printed); without
 # it, unhealthy hosts are data, not a failure of the check.
@@ -1946,22 +1968,29 @@ host_health_check_all() {
     local use_cache=true
     local json_mode=false
     local fail_unhealthy=false
+    local os="" capability=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --no-cache) use_cache=false; shift ;;
             --json) json_mode=true; shift ;;
             --fail-unhealthy) fail_unhealthy=true; shift ;;
-            *) shift ;;
+            --for-os)
+                [[ $# -ge 2 && "$2" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]] || return 4
+                os="$2"; shift 2 ;;
+            --for-capability)
+                [[ $# -ge 2 && "$2" =~ ^[A-Za-z0-9_][A-Za-z0-9_.+-]*$ ]] || return 4
+                capability="$2"; shift 2 ;;
+            *) _hh_log_error "Unknown health selection option: $1"; return 4 ;;
         esac
     done
 
     config_load 2>/dev/null || true
 
     local hosts hosts_status=0
-    hosts=$(_hh_list_hosts | tr '\n' ' ') || hosts_status=$?
+    hosts=$(_hh_list_hosts "$os" "$capability") || hosts_status=$?
 
-    if [[ $hosts_status -ne 0 || -z "$hosts" ]]; then
+    if [[ $hosts_status -ne 0 || ( -z "$hosts" && -z "$os" && -z "$capability" ) ]]; then
         local message="No hosts configured"
         [[ $hosts_status -eq 0 ]] || message="Invalid host configuration or missing YAML parser"
         if $json_mode; then
@@ -2043,21 +2072,27 @@ host_health_check_all() {
 }
 
 # Get list of healthy hosts
-# Usage: host_health_get_healthy_hosts [--for-capability <cap>] [--json]
+# Usage: host_health_get_healthy_hosts [--for-os <os>] [--for-capability <cap>] [--json]
 host_health_get_healthy_hosts() {
     local capability=""
     local json_mode=false
+    local health_args=(--json)
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --for-capability) capability="$2"; shift 2 ;;
+            --for-capability)
+                [[ $# -ge 2 && "$2" =~ ^[A-Za-z0-9_][A-Za-z0-9_.+-]*$ ]] || return 4
+                capability="$2"; health_args+=(--for-capability "$capability"); shift 2 ;;
+            --for-os)
+                [[ $# -ge 2 && "$2" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]] || return 4
+                health_args+=(--for-os "$2"); shift 2 ;;
             --json) json_mode=true; shift ;;
-            *) shift ;;
+            *) _hh_log_error "Unknown health selection option: $1"; return 4 ;;
         esac
     done
 
     local all_results
-    if ! all_results=$(host_health_check_all --json); then
+    if ! all_results=$(host_health_check_all "${health_args[@]}"); then
         _hh_log_error "Cannot select healthy hosts from an invalid host configuration"
         return 4
     fi
