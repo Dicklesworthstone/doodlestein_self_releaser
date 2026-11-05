@@ -577,6 +577,9 @@ the positive duration in seconds and the same five-second escalation. It
 preserves shell functions, argument boundaries and inherited descriptors.
 An unavailable timer or lost watchdog refuses the operation instead of
 allowing it to continue without a deadline.
+Host-health probes, installer canaries and upgrade verification use the same
+owned deadline supervisor. Their configured time limits still apply without
+GNU timeout, and a probe's early success text cannot override its timeout status.
 Queued tasks that have never run report
 `status: "skipped"` and `attempt: 0`, without a log or result path. They remain
 pending in run state, so exact-run resume starts their first attempt while

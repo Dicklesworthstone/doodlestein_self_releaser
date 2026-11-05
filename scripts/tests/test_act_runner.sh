@@ -1932,9 +1932,9 @@ if [[ "$mode" == wrapper_lost ]]; then
             "$case_dir" "$selected_timeout"
     }
 elif [[ "$mode" == watchdog_lost ]]; then
-    watchdog_definition=$(declare -f _act_timeout_watchdog)
-    eval "${watchdog_definition/_act_timeout_watchdog /_fixture_timeout_watchdog }"
-    _act_timeout_watchdog() {
+    watchdog_definition=$(declare -f _dsr_timeout_watchdog)
+    eval "${watchdog_definition/_dsr_timeout_watchdog /_fixture_timeout_watchdog }"
+    _dsr_timeout_watchdog() {
         printf '%s\n' "$BASHPID" > "$case_dir/watchdog.pid"
         _fixture_timeout_watchdog "$@"
     }

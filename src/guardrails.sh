@@ -7,6 +7,7 @@
 #   - Safe deletion helpers (allowlisted directories)
 #   - Safe temp directory creation
 #   - NO_COLOR support
+#   - Owned command deadlines, including hosts without GNU timeout
 #
 # Usage:
 #   source guardrails.sh
@@ -14,6 +15,7 @@
 #   path=$(resolve_path "$user_input")
 #   safe_rm "$path"
 #   tmpdir=$(safe_tmpdir "dsr-build")
+#   run_with_timeout 30 command arg...
 
 set -uo pipefail
 
@@ -79,6 +81,265 @@ EOF
     return $EXIT_DEPENDENCY_ERROR
   fi
   return $EXIT_SUCCESS
+}
+
+# ============================================================================
+# Owned Command Deadlines
+# ============================================================================
+
+_dsr_timeout_cmd() {
+    if command -v timeout >/dev/null 2>&1; then
+        printf '%s\n' timeout
+    elif command -v gtimeout >/dev/null 2>&1; then
+        printf '%s\n' gtimeout
+    fi
+    return 0
+}
+
+# The timer reports deadlines over its private pipe, never to a reusable PID.
+# The live group anchor owns every termination signal, including cleanup of
+# this timer and its sleeps. Its stdin is separate from the command's input.
+_dsr_timeout_watchdog() {
+    local seconds="$1" control=""
+    trap '' INT TERM HUP PIPE
+    printf 'ready\n' || return 4
+    IFS= read -r control && [[ "$control" == start ]] || return 4
+    if command sleep "$seconds"; then
+        printf 'deadline\n' || return 4
+        if command sleep 5; then
+            printf 'force\n' || return 4
+        else
+            printf 'error\n' || return 4
+        fi
+    else
+        printf 'error\n' || return 4
+    fi
+    # Keep the writer alive until the anchor retires the group: Bash closes
+    # the result descriptor when a coprocess finishes.
+    IFS= read -r control || true
+}
+
+# A GNU timeout leader can exit before a resistant descendant, abandoning its
+# kill-after timer. Keep timeout --foreground and all ordinary descendants in
+# the group of this live anchor. The portable engine uses that same ownership.
+_dsr_timeout_group() {
+    local input_fd="$1" output_fd="$2" timeout_command="$3" seconds="$4"
+    shift 4
+    [[ "$input_fd" =~ ^[0-9]+$ && "$output_fd" =~ ^[0-9]+$ ]] || return 4
+    local group_pid="$BASHPID" child="" finished=false cancelled=false
+    local control="" running="" status=0 read_status=0
+    local watchdog_read="" watchdog_write="" watchdog_pid="" watchdog_message="" expired=false
+    local -a _DSR_TIMEOUT_WATCHDOG=()
+    local _DSR_TIMEOUT_WATCHDOG_PID=""
+    set +m
+    trap - EXIT
+    trap 'cancelled=true' INT TERM HUP PIPE
+    if ! IFS= read -r control || [[ "$control" != start ]] || $cancelled; then
+        return 130
+    fi
+    if [[ -z "$timeout_command" ]]; then
+        coproc _DSR_TIMEOUT_WATCHDOG {
+            eval "exec ${input_fd}<&- ${output_fd}>&-"
+            _dsr_timeout_watchdog "$seconds"
+        }
+        watchdog_read="${_DSR_TIMEOUT_WATCHDOG[0]:-}"
+        watchdog_write="${_DSR_TIMEOUT_WATCHDOG[1]:-}"
+        watchdog_pid="${_DSR_TIMEOUT_WATCHDOG_PID:-}"
+        if [[ ! "$watchdog_read" =~ ^[0-9]+$ || ! "$watchdog_write" =~ ^[0-9]+$ ||
+              ! "$watchdog_pid" =~ ^[1-9][0-9]*$ ]] ||
+           ! IFS= read -r -u "$watchdog_read" watchdog_message ||
+           [[ "$watchdog_message" != ready ]] || $cancelled; then
+            trap '' INT TERM HUP PIPE
+            kill -KILL -- "-$group_pid" 2>/dev/null || true
+            return 4
+        fi
+    fi
+    (
+        eval "exec ${input_fd}<&- ${output_fd}>&-"
+        if [[ -n "$timeout_command" ]]; then
+            exec "$timeout_command" --foreground --kill-after=5 "$seconds" "$@"
+        else
+            # External commands replace this PID so an intermediate shell
+            # cannot hide a still-running, TERM-resistant command leader.
+            case "$(type -t -- "$1")" in
+                function|builtin) "$@" ;;
+                *) exec "$@" ;;
+            esac
+        fi
+    ) <&"$input_fd" >&"$output_fd" &
+    child=$!
+    eval "exec ${input_fd}<&- ${output_fd}>&-"
+    if [[ -n "$watchdog_write" ]] && ! printf 'start\n' >&"$watchdog_write"; then
+        cancelled=true
+    fi
+    while ! $cancelled; do
+        if ! $finished; then
+            running=$(jobs -pr)
+            case $'\n'"$running"$'\n' in
+                *$'\n'"$child"$'\n'*) ;;
+                *)
+                    wait "$child" || status=$?
+                    $expired && status=124
+                    finished=true
+                    printf 'exit:%s\n' "$status" || break
+                    ;;
+            esac
+        fi
+        if ! $finished && [[ -n "$watchdog_read" ]]; then
+            watchdog_message=""
+            case $'\n'"$running"$'\n' in
+                *$'\n'"$watchdog_pid"$'\n'*)
+                    if IFS= read -r -t 0 -u "$watchdog_read"; then
+                        IFS= read -r -u "$watchdog_read" watchdog_message || watchdog_message=error
+                    fi
+                    ;;
+                *) watchdog_message=error ;;
+            esac
+            case "$watchdog_message" in
+                '') ;;
+                deadline)
+                    expired=true
+                    trap '' INT TERM HUP PIPE
+                    kill -TERM -- "-$group_pid" 2>/dev/null || true
+                    ;;
+                *)
+                    if [[ "$watchdog_message" == force ]]; then
+                        status=137
+                    else
+                        printf '%s\n' '[dsr] Portable timeout watchdog could not maintain its deadline' >&2
+                        status=125
+                    fi
+                    finished=true
+                    printf 'exit:%s\n' "$status" || true
+                    break
+                    ;;
+            esac
+        fi
+        read_status=0
+        IFS= read -r -t 0.1 control || read_status=$?
+        # EOF also drains the group after the waiting shell is killed or lost.
+        if (( read_status == 0 || read_status == 1 )); then
+            break
+        fi
+        (( read_status > 128 )) || break
+    done
+    trap '' INT TERM HUP PIPE
+    kill -TERM -- "-$group_pid" 2>/dev/null || true
+    if ! $finished; then
+        # Finish within the outer worker's cancellation grace.
+        command sleep 2
+    fi
+    # The anchor is still the live leader; its process-group ID cannot be reused.
+    kill -KILL -- "-$group_pid" 2>/dev/null || true
+    return 4
+}
+
+# Private entry point lets existing callers retain their timer-selection hook.
+# Resolve it INSIDE the waiting subshell so the parent-lifetime channel always
+# belongs to the process that selected the engine and actually waits for it.
+_dsr_run_with_timeout() (
+    [[ $# -ge 3 ]] || return 4
+    local selector="$1" seconds="$2" cmd
+    shift 2
+    if [[ ! "$seconds" =~ ^[0-9]+([.][0-9]+)?$ || -z "${seconds//[0.]/}" ]]; then
+        printf '[dsr] Timeout requires a positive duration in seconds: %s\n' "$seconds" >&2
+        return 4
+    fi
+    cmd=$("$selector") || return 3
+    # GNU timeout cannot execute an unexported shell function or builtin.
+    # The forked portable engine retains their real definitions and environment.
+    case "$(type -t -- "$1")" in function|builtin) cmd="" ;; esac
+    if [[ -z "$cmd" ]] &&
+       { ! command -v sleep >/dev/null 2>&1 || ! type -P sleep >/dev/null 2>&1; }; then
+        printf '%s\n' '[dsr] sleep is required to supervise commands without timeout or gtimeout' >&2
+        return 3
+    fi
+
+    # Reserve unused descriptors for real streams. Coprocess fd0/fd1 carry
+    # control/status only. Numeric eval redirections retain Bash 4.0 support.
+    local input_fd="" output_fd="" candidate_fd
+    for ((candidate_fd = 10; candidate_fd < 63; candidate_fd++)); do
+        if { : <&"$candidate_fd"; } 2>/dev/null; then
+            continue
+        fi
+        if [[ -z "$input_fd" ]]; then
+            eval "exec ${candidate_fd}<&0" || return 4
+            input_fd=$candidate_fd
+        else
+            eval "exec ${candidate_fd}>&1" || return 4
+            output_fd=$candidate_fd
+            break
+        fi
+    done
+    [[ -n "$input_fd" && -n "$output_fd" ]] || return 4
+
+    local timeout_pid="" result_fd="" control_fd="" guard_status=0
+    local cancel_status=0 launch_pending=false monitor=false
+    local message="" result=4 protocol_valid=false
+    local -a _DSR_TIMEOUT_GROUP=()
+    local _DSR_TIMEOUT_GROUP_PID=""
+    _dsr_timeout_drain() {
+        if [[ "$control_fd" =~ ^[0-9]+$ ]]; then
+            eval "exec ${control_fd}>&-"
+            control_fd=""
+        fi
+        if [[ "$timeout_pid" =~ ^[1-9][0-9]*$ ]]; then
+            guard_status=0
+            wait "$timeout_pid" 2>/dev/null || guard_status=$?
+            timeout_pid=""
+        fi
+        if [[ "$result_fd" =~ ^[0-9]+$ ]]; then
+            eval "exec ${result_fd}<&-"
+            result_fd=""
+        fi
+    }
+    _dsr_timeout_cancel() {
+        (( cancel_status != 0 )) || cancel_status=$1
+        $launch_pending && return 0
+        trap '' INT TERM HUP PIPE
+        _dsr_timeout_drain
+        exit "$cancel_status"
+    }
+    trap '_dsr_timeout_cancel 130' INT
+    trap '_dsr_timeout_cancel 143' TERM
+    trap '_dsr_timeout_cancel 129' HUP
+    trap '_dsr_timeout_cancel 141' PIPE
+    [[ $- != *m* ]] || monitor=true
+    set -m
+    launch_pending=true
+    coproc _DSR_TIMEOUT_GROUP {
+        _dsr_timeout_group "$input_fd" "$output_fd" "$cmd" "$seconds" "$@"
+    }
+    timeout_pid="${_DSR_TIMEOUT_GROUP_PID:-}"
+    result_fd="${_DSR_TIMEOUT_GROUP[0]:-}"
+    control_fd="${_DSR_TIMEOUT_GROUP[1]:-}"
+    launch_pending=false
+    $monitor || set +m
+    eval "exec ${input_fd}<&- ${output_fd}>&-"
+    if (( cancel_status != 0 )); then
+        _dsr_timeout_cancel "$cancel_status"
+    fi
+    if [[ "$control_fd" =~ ^[0-9]+$ && "$result_fd" =~ ^[0-9]+$ ]] &&
+       printf 'start\n' >&"$control_fd" &&
+       IFS= read -r -u "$result_fd" message &&
+       [[ "$message" =~ ^exit:([0-9]{1,3})$ ]] &&
+       (( 10#${BASH_REMATCH[1]} <= 255 )); then
+        result=$((10#${BASH_REMATCH[1]}))
+        protocol_valid=true
+    fi
+    _dsr_timeout_drain
+    if ! $protocol_valid; then
+        result=$guard_status
+        [[ "$result" -ne 0 ]] || result=4
+    fi
+    return "$result"
+)
+
+# Usage: run_with_timeout <positive-seconds> <command> [args...]
+# Completion retains command status; deadline exits are 124 or escalated 137.
+# Missing dependencies/invalid bounds refuse before launching the command.
+run_with_timeout() {
+    _dsr_run_with_timeout _dsr_timeout_cmd "$@"
 }
 
 # ============================================================================
@@ -479,5 +740,7 @@ export -f safe_tmpdir
 export -f is_color_disabled color
 export -f is_non_interactive confirm
 export -f dsr_native_rch_policy dsr_native_rch_environment_policy
+export -f run_with_timeout _dsr_timeout_cmd _dsr_run_with_timeout
+export -f _dsr_timeout_group _dsr_timeout_watchdog
 
 export EXIT_SUCCESS EXIT_DEPENDENCY_ERROR EXIT_INVALID_ARGS

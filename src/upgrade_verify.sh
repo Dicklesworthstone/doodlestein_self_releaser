@@ -17,6 +17,9 @@
 #   - logging.sh (for log_info, log_error, etc.)
 #   - config.sh (for repos config)
 
+# shellcheck source=src/guardrails.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/guardrails.sh" || { return 3 2>/dev/null || exit 3; }
+
 # ============================================================================
 # Configuration
 # ============================================================================
@@ -130,20 +133,7 @@ upgrade_verify_tool() {
         return 0
     fi
 
-    local timeout_cmd=""
-    if command -v timeout &>/dev/null; then
-        timeout_cmd="timeout"
-    elif command -v gtimeout &>/dev/null; then
-        timeout_cmd="gtimeout"
-    else
-        log_warn "timeout command not available; running upgrade check without timeout"
-    fi
-
-    if [[ -n "$timeout_cmd" ]]; then
-        output=$("$timeout_cmd" "$UPGRADE_VERIFY_TIMEOUT" "$bin_path" "${check_args[@]}" 2>&1) || exit_code=$?
-    else
-        output=$("$bin_path" "${check_args[@]}" 2>&1) || exit_code=$?
-    fi
+    output=$(run_with_timeout "$UPGRADE_VERIFY_TIMEOUT" "$bin_path" "${check_args[@]}" 2>&1) || exit_code=$?
 
     # Informational output can precede a failed request or a timeout. Check the
     # actual process result before announcing an update or accepting its version.
@@ -352,20 +342,7 @@ upgrade_verify_json() {
         local -a check_args=()
         mapfile -t check_args <<< "$check_args_output"
 
-        local timeout_cmd=""
-        if command -v timeout &>/dev/null; then
-            timeout_cmd="timeout"
-        elif command -v gtimeout &>/dev/null; then
-            timeout_cmd="gtimeout"
-        else
-            log_warn "timeout command not available; running upgrade check without timeout"
-        fi
-
-        if [[ -n "$timeout_cmd" ]]; then
-            output=$("$timeout_cmd" "$UPGRADE_VERIFY_TIMEOUT" "$bin_path" "${check_args[@]}" 2>&1) || exit_code=$?
-        else
-            output=$("$bin_path" "${check_args[@]}" 2>&1) || exit_code=$?
-        fi
+        output=$(run_with_timeout "$UPGRADE_VERIFY_TIMEOUT" "$bin_path" "${check_args[@]}" 2>&1) || exit_code=$?
 
         local found_asset=false
         local latest_version

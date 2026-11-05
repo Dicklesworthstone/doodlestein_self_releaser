@@ -24,6 +24,10 @@ set -uo pipefail
 # Resolve dependencies relative to this module, independent of caller globals.
 _HH_PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# Health admission must remain bounded before the build runner is loaded.
+# shellcheck source=src/guardrails.sh
+source "$_HH_PROJECT_ROOT/src/guardrails.sh" || { return 3 2>/dev/null || exit 3; }
+
 # Source config if not already loaded
 if ! declare -p DSR_CONFIG &>/dev/null 2>&1; then
     source "$_HH_PROJECT_ROOT/src/config.sh"
@@ -346,15 +350,7 @@ _hh_timeout_cmd() {
 }
 
 _hh_run_with_timeout() {
-    local seconds="$1"
-    shift
-    local cmd
-    cmd=$(_hh_timeout_cmd)
-    if [[ -n "$cmd" ]]; then
-        "$cmd" "$seconds" "$@"
-    else
-        "$@"
-    fi
+    _dsr_run_with_timeout _hh_timeout_cmd "$@"
 }
 
 # Colors for output (if not disabled)

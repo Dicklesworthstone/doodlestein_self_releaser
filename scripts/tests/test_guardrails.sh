@@ -341,6 +341,171 @@ test_confirm_uses_default_in_ci() {
   fi
 }
 
+test_command_deadline_consumers() {
+  if ! command -v python3 >/dev/null || ! command -v jq >/dev/null; then
+    printf '%s\n' 'SKIP: command deadline integration requires python3 and jq'
+    return
+  fi
+  ((TESTS_RUN++))
+  if python3 - "$PROJECT_ROOT/src" <<'PY'
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+module = Path(sys.argv[1])
+root = Path(tempfile.mkdtemp(prefix="dsr-command-deadlines-"))
+print("Retained command deadline fixture: " + str(root), flush=True)
+checks = 0
+failures = 0
+
+def check(label, valid):
+    global checks, failures
+    checks += 1
+    failures += not valid
+    print(("PASS " if valid else "FAIL ") + label, flush=True)
+
+probe = """#!/usr/bin/env python3
+import os, pathlib, sys, time
+case = pathlib.Path(os.environ["DSR_DEADLINE_CASE"])
+with (case / "calls").open("a") as out:
+    out.write("called\\n")
+print("Latest version: 1.2.3\\nUpdate available", flush=True)
+if os.environ["DSR_DEADLINE_MODE"] == "slow":
+    time.sleep(2)
+(case / "completed").write_text("completed\\n")
+"""
+driver = r'''
+source "$1/logging.sh" || exit 90
+source "$1/host_health.sh" || exit 90
+source "$1/canary.sh" || exit 90
+source "$1/upgrade_verify.sh" || exit 90
+if [[ "$2" == portable ]]; then
+    _dsr_timeout_cmd() { printf ''; }
+    _hh_timeout_cmd() { printf ''; }
+    _canary_timeout_cmd() { printf ''; }
+fi
+# Only configuration lookup is replaced. The real verification entry points,
+# subprocess execution, deadline ownership and JSON verdicts are exercised.
+_upgrade_tool_binary_name() { printf '%s\n' timeout-probe; }
+_upgrade_check_args() { printf '%s\n' upgrade --check; }
+UPGRADE_VERIFY_TIMEOUT=1
+case "$3" in
+    health)
+        _HH_SSH_TIMEOUT=1
+        _hh_check_connectivity fixture ssh fixture
+        ;;
+    canary) _canary_run_with_timeout 1 timeout-probe ;;
+    upgrade_plain) upgrade_verify_tool fixture --version 1.2.3 ;;
+    upgrade_json) upgrade_verify_json fixture --version 1.2.3 ;;
+esac
+'''
+for engine in ("system", "portable"):
+    for consumer in ("health", "canary", "upgrade_plain", "upgrade_json"):
+        for mode in ("quick", "slow"):
+            label = engine + "/" + consumer + "/" + mode
+            case = root / (engine + "-" + consumer + "-" + mode)
+            (case / "bin").mkdir(parents=True)
+            for name in ("ssh", "timeout-probe"):
+                executable = case / "bin" / name
+                executable.write_text(probe)
+                executable.chmod(0o755)
+            env = dict(os.environ, DSR_DEADLINE_CASE=str(case), DSR_DEADLINE_MODE=mode,
+                       PATH=str(case / "bin") + os.pathsep + os.environ["PATH"], NO_COLOR="1")
+            result = subprocess.run(["bash", "-c", driver, "_", str(module), engine, consumer],
+                                    env=env, input="", text=True, capture_output=True, timeout=8)
+            (case / "stdout").write_text(result.stdout)
+            (case / "stderr").write_text(result.stderr)
+            expected = 0 if mode == "quick" else (124 if consumer == "canary" else 1)
+            check(label + ": actual completion/deadline status", result.returncode == expected)
+            check(label + ": one invocation and no post-deadline work",
+                  (case / "calls").is_file() and (case / "calls").read_text() == "called\n" and
+                  (case / "completed").exists() == (mode == "quick"))
+            if consumer == "health":
+                report = json.loads(result.stdout)
+                check(label + ": health admission follows probe result",
+                      report["reachable"] == (mode == "quick"))
+            elif consumer == "upgrade_json":
+                report = json.loads(result.stdout)
+                check(label + ": positive text cannot override a timeout",
+                      report["status"] == ("passed" if mode == "quick" else "failed") and
+                      report["found_asset"] == (mode == "quick") and
+                      report["exit_code"] == (0 if mode == "quick" else 124) and
+                      report["latest_version"] == "1.2.3")
+
+# Public callers may wrap a transport in an unexported function. GNU timeout
+# cannot execute that function, so exercise the actual inherited definition.
+public_driver = r'''
+source "$1/guardrails.sh" || exit 90
+if [[ "$2" == portable ]]; then _dsr_timeout_cmd() { printf ''; }; fi
+secret_value='retained local value'
+payload() { printf '<%s> <%s>\n' "$secret_value" "$1"; cat; return 23; }
+run_with_timeout 1 payload 'space argument'
+'''
+for engine in ("system", "portable"):
+    result = subprocess.run(["bash", "-c", public_driver, "_", str(module), engine],
+                            input="original stdin\n", text=True, capture_output=True, timeout=5)
+    check(engine + ": public API preserves unexported function, arguments, stdin and status",
+          result.returncode == 23 and
+          result.stdout == "<retained local value> <space argument>\noriginal stdin\n")
+    function_deadline = subprocess.run(["bash", "-c", r'''
+source "$1/guardrails.sh" || exit 90
+if [[ "$2" == portable ]]; then _dsr_timeout_cmd() { printf ''; }; fi
+payload() { sleep 2; printf 'late\n'; }
+run_with_timeout 0.2 payload
+''', "_", str(module), engine], capture_output=True, text=True, timeout=8)
+    check(engine + ": unexported function cannot run beyond its deadline",
+          function_deadline.returncode == 124 and function_deadline.stdout == "")
+    builtin = subprocess.run(["bash", "-c", r'''
+source "$1/guardrails.sh" || exit 90
+if [[ "$2" == portable ]]; then _dsr_timeout_cmd() { printf ''; }; fi
+run_with_timeout 1 printf '<%s>\n' 'space argument' ''
+''', "_", str(module), engine], capture_output=True, text=True, timeout=5)
+    check(engine + ": public API preserves shell builtin arguments",
+          builtin.returncode == 0 and builtin.stdout == "<space argument>\n<>\n")
+    sleep_override = subprocess.run(["bash", "-c", r'''
+source "$1/guardrails.sh" || exit 90
+if [[ "$2" == portable ]]; then _dsr_timeout_cmd() { printf ''; }; fi
+sleep() { printf 'caller sleep must not control the deadline\n' >&2; return 0; }
+run_with_timeout 1 bash -c 'command sleep 0.1; printf "completed\n"'
+''', "_", str(module), engine], capture_output=True, text=True, timeout=5)
+    check(engine + ": internal clock bypasses caller backoff functions",
+          sleep_override.returncode == 0 and sleep_override.stdout == "completed\n" and
+          "caller sleep" not in sleep_override.stderr)
+    for duration in ("0", "0.00", "-1", "bad", "1m"):
+        refused = subprocess.run(["bash", "-c", r'''
+source "$1/guardrails.sh" || exit 90
+if [[ "$2" == portable ]]; then _dsr_timeout_cmd() { printf ''; }; fi
+run_with_timeout "$3" printf 'must not start\n'
+''', "_", str(module), engine, duration], capture_output=True, text=True, timeout=5)
+        check(engine + ": invalid deadline refuses before execution: " + duration,
+              refused.returncode == 4 and refused.stdout == "")
+
+empty_path = root / "no-executables"
+empty_path.mkdir()
+missing_sleep = subprocess.run(["bash", "-c", r'''
+source "$1/guardrails.sh" || exit 90
+sleep() { return 0; }
+payload() { printf 'must not start\n'; }
+PATH="$2"
+run_with_timeout 1 payload
+''', "_", str(module), str(empty_path)], capture_output=True, text=True, timeout=5)
+check("a sleep function cannot replace the missing external clock",
+      missing_sleep.returncode == 3 and missing_sleep.stdout == "" and
+      "sleep is required" in missing_sleep.stderr)
+
+print("Command deadline integration: %d checks, %d failures" % (checks, failures), flush=True)
+raise SystemExit(bool(failures))
+PY
+  then
+    pass "Host admission, canaries and upgrade verification enforce owned deadlines"
+  else
+    fail "Command deadline consumer integration"
+  fi
+}
+
 # Cleanup
 cleanup() {
   rm -rf "$TEMP_DIR"
@@ -387,6 +552,9 @@ test_color_returns_empty_when_disabled
 test_is_non_interactive_with_ci
 test_is_non_interactive_with_flag
 test_confirm_uses_default_in_ci
+
+# Real public consumers with and without GNU timeout
+test_command_deadline_consumers
 
 echo ""
 echo "=========================================="

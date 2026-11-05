@@ -14,6 +14,9 @@
 
 # shellcheck disable=SC2034  # Variables may be used by sourcing scripts
 
+# shellcheck source=src/guardrails.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/guardrails.sh" || { return 3 2>/dev/null || exit 3; }
+
 # ============================================================================
 # Configuration
 # ============================================================================
@@ -59,15 +62,7 @@ _canary_timeout_cmd() {
 }
 
 _canary_run_with_timeout() {
-    local seconds="$1"
-    shift
-    local cmd
-    cmd=$(_canary_timeout_cmd)
-    if [[ -n "$cmd" ]]; then
-        "$cmd" "$seconds" "$@"
-    else
-        "$@"
-    fi
+    _dsr_run_with_timeout _canary_timeout_cmd "$@"
 }
 
 # Shell-escape a string for safe remote execution (single-quote strategy)
