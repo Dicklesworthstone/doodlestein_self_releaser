@@ -41,7 +41,7 @@ runtime = work / "runtime"
 runtime.mkdir()
 for name, variable in (("release_install.sh", "RELEASE_INSTALL_TEST_MODULE"), ("slsa.sh", "SLSA_TEST_MODULE"),
                        ("slsa_remote.sh", "SLSA_REMOTE_TEST_MODULE"), ("packaging.sh", "PACKAGING_TEST_MODULE"),
-                       ("platforms.sh", "PLATFORMS_TEST_MODULE")):
+                       ("platforms.sh", "PLATFORMS_TEST_MODULE"), ("guardrails.sh", "GUARDRAILS_TEST_MODULE")):
     shutil.copy2(os.environ.get(variable, root / "src" / name), runtime / name)
 
 
@@ -634,7 +634,7 @@ if first.get("status") == "installed":
 shutil.copy2(os.environ.get("INSTALL_GEN_RELEASE_TEST_MODULE", root / "src/install_gen_release.sh"),
              runtime / "install_gen_release.sh")
 offline_stubs = []
-for module_name in ("sbom_release.sh", "sbom.sh", "github.sh"):
+for module_name in ("sbom_release.sh", "sbom.sh", "github.sh", "secrets.sh"):
     original = root / "src" / module_name
     if original.is_file():
         shutil.copy2(original, runtime / module_name)

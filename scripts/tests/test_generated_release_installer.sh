@@ -5,7 +5,7 @@
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 DSR_ONLINE_FIXTURES_ONLY=true source "$HERE/test_release_install_fetch.sh"
-for module in install_gen_release packaging; do
+for module in install_gen_release packaging secrets; do
     cp "$ROOT/src/$module.sh" "$INSTALL/src/" || exit 1
 done
 # The transport closure is explicitly substituted; it does not test gh/curl.
@@ -36,7 +36,7 @@ refresh_remote
 jq 'map(if .id==1 then .name="demo-linux.tar.gz" else . end)' "$CASE/inventory.json" > "$CASE/updated.json"
 cp "$CASE/updated.json" "$CASE/inventory.json"
 fetch > "$CASE/snapshot-result.json" || exit 1
-python3 - "$INSTALL" "$CASE" "$PIN" <<'PY'
+python3 - "$INSTALL" "$CASE" "$PIN" "$ROOT" <<'PY'
 import base64
 import copy
 import hashlib
@@ -50,6 +50,7 @@ import sys
 import time
 
 install, case, pin = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+project = Path(sys.argv[4])
 engine = install / "src/release_install.sh"
 policy_file = case / "policy.json"
 script = case / "install.sh"
@@ -128,7 +129,35 @@ p = subprocess.run(["bash", str(script), "--inspect"], capture_output=True, time
 inspect = json.loads(p.stdout)
 check("inspection emits selected trust policy without authentication", p.returncode == 0 and not inspect["authenticated"] and inspect["policy"]["source_sha"] == pin)
 check("embedded module inventory binds actual source bytes", all(digest(install / "src" / n) == h for n, h in inspect["engines"].items()))
+check("standalone inventory includes authentication deadlines and credential helpers",
+      {"guardrails.sh", "secrets.sh"} <= set(inspect["engines"]))
 check("generation starts no release installation", not prefix.exists())
+# Generate with the complete unmodified production transport closure too. The
+# larger online suite below replaces HTTP transport explicitly; it must not
+# conceal a missing source-relative dependency in a distributable installer.
+production_script = case / "production-install.sh"
+production = subprocess.run(["bash", str(project / "src/install_gen_release.sh"), "--policy", str(policy_file),
+    "--public-key", str(key), "--output", str(production_script)], capture_output=True, timeout=30)
+check("complete production engines generate a standalone installer", production.returncode == 0)
+if production.returncode:
+    raise AssertionError(production.stderr)
+production_bundle = json.loads(base64.b64decode(production_script.read_text().split("BUNDLE = '", 1)[1].split("'", 1)[0]))
+production_modules = case / "production-modules"
+production_modules.mkdir()
+for name, record in production_bundle["modules"].items():
+    (production_modules / name).write_bytes(base64.b64decode(record["content"]))
+clean_env = {k: v for k, v in os.environ.items() if not k.startswith("BASH_FUNC_") and k not in ("BASH_ENV", "ENV")}
+loaded = subprocess.run(["bash", "-c", 'source "$1/github.sh" && source "$1/slsa_remote.sh" && '
+    'declare -F secrets_get_gh_token >/dev/null && declare -F run_with_timeout >/dev/null && '
+    'declare -F dsr_lock_fd >/dev/null && declare -F gh_download_release_asset >/dev/null',
+    "_", str(production_modules)], env=clean_env, capture_output=True, timeout=10)
+check("bundled real GitHub adapter loads its complete credential and deadline closure", loaded.returncode == 0)
+production_prefix = case / "production-prefix"
+production_install = subprocess.run(["bash", str(production_script), "--prefix", str(production_prefix),
+    "--snapshot", str(snapshot), "--dry-run"], env=clean_env, capture_output=True, timeout=30)
+check("complete production standalone engine authenticates offline without a DSR installation",
+      production_install.returncode == 0 and json.loads(production_install.stdout).get("authenticated") is True and
+      not production_prefix.exists())
 # Detach the generation environment. All following installs must use embedded
 # engines, not any original path, external policy or external public key file.
 offline_install = case / "offline-engine"

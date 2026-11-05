@@ -82,9 +82,10 @@ def matches(v, pattern):
     return isinstance(v, str) and re.fullmatch(pattern, v) is not None
 
 
-MODULES = ("release_install.sh", "slsa_remote.sh", "slsa.sh", "platforms.sh", "packaging.sh", "sbom_release.sh", "sbom.sh", "github.sh")
+MODULES = ("release_install.sh", "slsa_remote.sh", "slsa.sh", "platforms.sh", "packaging.sh",
+           "sbom_release.sh", "sbom.sh", "github.sh", "guardrails.sh", "secrets.sh")
 # No module code or policy value is interpolated into executable Python/shell.
-# The only substitution is an ASCII base64-encoded JSON literal.
+# Substitutions are the fixed engine inventory and ASCII base64-encoded data.
 BOOTSTRAP = r'''#!/usr/bin/env bash
 # Pinned authenticated release installer. Trust this script's distribution.
 # Embedded checksums detect corruption; they do not authenticate this script.
@@ -168,7 +169,7 @@ try:
     need(hashlib.sha256(blob).hexdigest() == BUNDLE_SHA256, "embedded installer data is damaged", 7)
     bundle = json.loads(blob)
     policy = bundle["policy"]
-    expected = {"release_install.sh", "slsa_remote.sh", "slsa.sh", "platforms.sh", "packaging.sh", "sbom_release.sh", "sbom.sh", "github.sh"}
+    expected = set(__DSR_RELEASE_MODULE_NAMES__)
     need(set(bundle["modules"]) == expected, "embedded engine inventory changed", 7)
     modules = {}
     for name, record in bundle["modules"].items():
@@ -360,7 +361,9 @@ try:
         value["recipes"] = sorted(normalized, key=lambda r: (r["target"], r.get("target_triple", "")))
         inventory = {name: dict(content=base64.b64encode(data).decode(), sha256=hashlib.sha256(data).hexdigest()) for name, data in sources.items()}
         bundle = canonical(dict(policy=value, public_key=lines[1], modules=inventory))
-        script = BOOTSTRAP.replace("__DSR_RELEASE_BUNDLE__", base64.b64encode(bundle).decode()).replace("__DSR_RELEASE_BUNDLE_SHA256__", hashlib.sha256(bundle).hexdigest())
+        script = (BOOTSTRAP.replace("__DSR_RELEASE_BUNDLE__", base64.b64encode(bundle).decode())
+                  .replace("__DSR_RELEASE_BUNDLE_SHA256__", hashlib.sha256(bundle).hexdigest())
+                  .replace("__DSR_RELEASE_MODULE_NAMES__", repr(MODULES)))
         ast.parse(script.split("<<'DSR_RELEASE_INSTALLER_PY'\n", 1)[1].rsplit("\nDSR_RELEASE_INSTALLER_PY", 1)[0])
         staged = work / "install.sh"
         staged.write_text(script, encoding="utf-8")
