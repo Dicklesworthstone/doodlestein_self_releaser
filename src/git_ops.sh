@@ -18,6 +18,11 @@
 
 set -uo pipefail
 
+# Exported Git operations can run in a fresh Bash child, where an imported
+# function no longer has its original BASH_SOURCE location for lazy loading.
+_GIT_OPS_MODULE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || return 3
+export _GIT_OPS_MODULE_DIR
+
 # =========================================================================
 # Helpers
 # =========================================================================
@@ -554,7 +559,7 @@ git_ops_remove_build_worktree() {
 git_ops_materialize_source() (
   [[ $# -ge 3 && $# -le 5 ]] || return 4
   local source="$1" sha="$2" destination="$3" tag="${4:-}" repo="${5:-}"
-  local object="" local_source=false transport=local-objects observed="" token="" submodules
+  local object="" local_source=false transport=local-objects observed="" token="" submodules repositories
   [[ "$sha" =~ ^[0-9a-f]{40}$ && "$sha" != 0000000000000000000000000000000000000000 &&
      "$destination" == /* && ! -e "$destination" && ! -L "$destination" ]] || return 4
   [[ -z "$repo" || "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 4
@@ -622,23 +627,51 @@ git_ops_materialize_source() (
     fi
   fi
   submodules=$(_git_ops_build_git -C "$destination" ls-tree -r "$sha" | awk '$1 == "160000" {print}') || return 4
-  if [[ -n "$submodules" ]]; then
-    log_error "Isolated source currently requires a repository without Git submodules"
-    return 4
-  fi
   _git_ops_build_git -C "$destination" update-ref --no-deref HEAD "$sha" || return 4
   _git_ops_build_git -C "$destination" read-tree --reset -u HEAD || return 4
+  if [[ -n "$submodules" ]]; then
+    # Reuse the native source reader's authenticated parent-gitlink graph.
+    # Child objects must already be locally available; URLs never authorize
+    # network access, and no checkout/index/ref in SOURCE is modified.
+    _git_ops_load_source_reader || return 3
+    source_git_materialize_submodules "$source" "$sha" "$destination" || return 4
+  fi
   if [[ -n "$repo" ]]; then
     _git_ops_build_git -C "$destination" config --local remote.origin.url "https://github.com/$repo.git" || return 4
   fi
   _git_ops_build_git -C "$destination" fsck --connectivity-only --no-reflogs --no-dangling || return 4
   git_ops_verify_materialized_source "$destination" "$sha" "$tag" || return 4
+  repositories=$(git_ops_materialized_repositories_json "$destination" "$sha") || return 4
   jq -nc --arg root "$destination" --arg sha "$sha" --arg tag "$tag" \
-    --arg object "$object" --arg transport "$transport" \
-    '{source_root:$root,git_sha:$sha,git_ref:$tag,tag_object:$object,transport:$transport}'
+    --arg object "$object" --arg transport "$transport" --argjson repositories "$repositories" '
+    {source_root:$root,git_sha:$sha,git_ref:$tag,tag_object:$object,transport:$transport}
+    + ([$repositories[] | select(.path != "")] | if length > 0 then {submodules:.} else {} end)'
 )
 
-git_ops_verify_materialized_source() {
+_git_ops_load_source_reader() {
+  declare -F source_git_materialized_repositories_json >/dev/null && return 0
+  [[ -n "${_GIT_OPS_MODULE_DIR:-}" ]] || return 3
+  # shellcheck source=SCRIPTDIR/xwin_source.sh
+  source "$_GIT_OPS_MODULE_DIR/xwin_source.sh"
+}
+
+# Return the complete pinned repository graph of a private checkout. The
+# shared reader authenticates every parent commit/tree and hashes child bytes
+# directly, independently of ignore settings, filters or index stat caches.
+git_ops_materialized_repositories_json() {
+  [[ $# == 2 ]] || return 4
+  local source="$1" sha="$2" submodules
+  [[ "$sha" =~ ^[0-9a-f]{40}$ && "$sha" != 0000000000000000000000000000000000000000 ]] || return 4
+  submodules=$(_git_ops_build_git -C "$source" ls-tree -r "$sha" | awk '$1 == "160000" {print}') || return 4
+  if [[ -z "$submodules" ]]; then
+    jq -nc --arg sha "$sha" '[{path:"",git_sha:$sha}]'
+    return $?
+  fi
+  _git_ops_load_source_reader || return 3
+  source_git_materialized_repositories_json "$source" "$sha"
+}
+
+_git_ops_verify_materialized_repository() {
   local source="$1" sha="$2" tag="${3:-}" untracked
   [[ -d "$source" && ! -L "$source" && -d "$source/.git" && ! -L "$source/.git" ]] || return 4
   source=$(cd "$source" && pwd -P) || return 4
@@ -651,6 +684,18 @@ git_ops_verify_materialized_source() {
     _git_ops_build_git -C "$source" diff-files --quiet -- || return 4
   untracked=$(_git_ops_build_git -C "$source" ls-files --others --exclude-standard) || return 4
   [[ -z "$untracked" ]] || return 4
+}
+
+git_ops_verify_materialized_source() {
+  [[ $# == 2 || $# == 3 ]] || return 4
+  local source="$1" sha="$2" tag="${3:-}" repositories repository path revision
+  _git_ops_verify_materialized_repository "$source" "$sha" "$tag" || return 4
+  repositories=$(git_ops_materialized_repositories_json "$source" "$sha") || return 4
+  while IFS= read -r repository; do
+    path=$(jq -r .path <<< "$repository") || return 4
+    revision=$(jq -r .git_sha <<< "$repository") || return 4
+    _git_ops_verify_materialized_repository "$source/$path" "$revision" || return 4
+  done < <(jq -c '.[] | select(.path != "")' <<< "$repositories")
 }
 
 # Export a portable Git context without copying hooks, configuration, credentials
@@ -953,7 +998,8 @@ export -f git_ops_tag_exists git_ops_tag_sha git_ops_list_tags
 export -f git_ops_current_branch git_ops_head_sha
 export -f git_ops_get_build_info git_ops_validate_for_build
 export -f git_ops_create_build_worktree git_ops_remove_build_worktree
-export -f git_ops_materialize_source git_ops_verify_materialized_source
+export -f git_ops_materialize_source git_ops_verify_materialized_source git_ops_materialized_repositories_json
+export -f _git_ops_load_source_reader _git_ops_verify_materialized_repository
 export -f _git_ops_build_git _git_ops_build_sha256 _git_ops_build_refs
 export -f git_ops_export_build_context git_ops_restore_build_context git_ops_build_context_powershell
 export -f git_ops_verify_build_context

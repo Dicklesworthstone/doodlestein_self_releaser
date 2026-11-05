@@ -11661,7 +11661,7 @@ cmd_fallback() {
     local configured_dependencies='[]'
     # Runtime-only source paths stay inside this fallback invocation. They do
     # not rewrite configuration or change the hashes frozen in build receipts.
-    local _ACT_ISOLATED_SOURCE_TOOL="" _ACT_ISOLATED_SOURCE_PATHS='{}'
+    local _ACT_ISOLATED_SOURCE_TOOL="" _ACT_ISOLATED_SOURCE_PATHS='{}' _ACT_ISOLATED_SOURCE_IDENTITY=null
     local build_only=false skip_checks=false resume=false
     local dry_run="$DRY_RUN" output_dir_explicit=false
     local resume_selector="latest" resume_run_id="" resume_state="" reuse_completed=false
@@ -12058,12 +12058,13 @@ EOF
         [[ "$(jq -r '.status' <<< "$resume_state")" == completed ]] && reuse_completed=true
     fi
 
-    if $isolate_source && $resume && [[ "$contract" == null ]]; then
+    _fallback_resume_source_admission() {
         local dependency_identity resume_identity_filter saved_result saved_path resume_identity_ok=true
         dependency_identity=$(jq -c 'map({relative_path,git_sha})' <<< "$configured_dependencies") || return 4
         resume_identity_filter='
             def same_source:
-                if . == null or (.git_context == null and .sibling_git_contexts == null)
+                if $identity != null then .source_materialization == $identity
+                elif . == null or (.git_context == null and .sibling_git_contexts == null)
                 then ($dependencies | length) == 0
                 else .git_context.git_sha == $sha and
                     (.sibling_git_contexts | type) == "object" and
@@ -12074,13 +12075,14 @@ EOF
         # Context can be refreshed while old successful target receipts remain.
         # Check every retained identity before cmd_build can reuse any of them.
         if ! jq -e --arg sha "$expected_sha" --argjson dependencies "$dependency_identity" \
+            --argjson identity "$_ACT_ISOLATED_SOURCE_IDENTITY" \
             "$resume_identity_filter"'
                 (.context.source_sync | same_source) and
                 all((.source_sync_history // [])[]; .receipt | same_source) and
                 all((.target_statuses // {})[];
                     if .status == "completed" or (.result.status == "success" or .result.status == "ok" or .result.status == "passed")
                     then .result.source_sync | same_source else true end) and
-                (if .status == "completed" and ($dependencies | length) > 0
+                (if .status == "completed" and (($dependencies | length) > 0 or $identity != null)
                  then . as $state |
                     all((.context.build_tasks // [.targets[] | {key:.}])[];
                         $state.target_statuses[.key].result.source_sync | same_source)
@@ -12097,6 +12099,7 @@ EOF
             if [[ ! -f "$saved_path" || -L "$saved_path" ]] ||
                ! saved_result=$(jq -sce 'select(length == 1 and (.[0] | type) == "object") | .[0]' "$saved_path") ||
                ! jq -e --arg sha "$expected_sha" --argjson dependencies "$dependency_identity" \
+                    --argjson identity "$_ACT_ISOLATED_SOURCE_IDENTITY" \
                     "$resume_identity_filter"'
                         if .status == "success" or .status == "ok" or .status == "passed"
                         then .source_sync | same_source else true end
@@ -12105,10 +12108,10 @@ EOF
             fi
         done < <(jq -r '(.target_statuses // {})[] | .result_path // empty' <<< "$resume_state")
         if ! $resume_identity_ok; then
-            _fallback_result 4 resume "Isolated source dependencies differ from the checkpoint or lack original target evidence; start a new build"
+            _fallback_result 4 resume "Isolated source dependencies or submodule graph differ from the checkpoint or lack original target evidence; start a new build"
             return 4
         fi
-    fi
+    }
 
     if $isolate_source; then
         local source_parent source_directory original_source="$local_path" source_rc=0
@@ -12146,10 +12149,20 @@ EOF
             source_paths=$(jq -c --arg old "$dependency_path" --arg new "$materialized_path" \
                 '.[$old]=$new' <<< "$source_paths") || return 4
             isolated_dependencies=$(jq -c --argjson dependency "$dependency" --arg path "$materialized_path" \
-                '. + [$dependency + {local_path:$path}]' <<< "$isolated_dependencies") || return 4
+                --argjson materialized "$dependency_receipt" '
+                . + [$dependency + {local_path:$path} +
+                    (if $materialized.submodules == null then {} else {submodules:$materialized.submodules} end)]
+            ' <<< "$isolated_dependencies") || return 4
         done < <(jq -c '.[]' <<< "$configured_dependencies")
         source_materialization=$(jq -c --argjson dependencies "$isolated_dependencies" \
             '. + {dependencies:$dependencies}' <<< "$source_materialization") || return 4
+        _ACT_ISOLATED_SOURCE_IDENTITY=$(jq -c '
+            {git_sha,submodules:((.submodules // []) | sort_by(.path)),
+             dependencies:[.dependencies[] | {relative_path,git_sha,
+                 submodules:((.submodules // []) | sort_by(.path))}] | sort_by(.relative_path)} |
+            if (.submodules | length) > 0 or any(.dependencies[]; (.submodules | length) > 0)
+            then . else null end
+        ' <<< "$source_materialization") || return 4
         printf '%s\n' "$source_materialization" > "$source_directory/.dsr/source.json" || return 4
         _ACT_ISOLATED_SOURCE_TOOL="$tool_name"
         _ACT_ISOLATED_SOURCE_PATHS="$source_paths"
@@ -12170,6 +12183,13 @@ EOF
             fi
         done < <(jq -c '.[]' <<< "$isolated_dependencies")
         log_info "Using isolated release source: $local_path"
+    fi
+
+    # Compare the fresh, path-independent graph before any old artifact can be
+    # reused. New act-only runs retain this same identity in source-sync state
+    # and target receipts, so a skipped native transfer is not missing custody.
+    if $isolate_source && $resume && [[ "$contract" == null ]]; then
+        _fallback_resume_source_admission || return 4
     fi
 
     _fallback_verify_completed_source() {

@@ -571,13 +571,13 @@ except (KeyError, TypeError, ValueError) as exc:
 ' "$job" "$owners" "$arguments" <<< "$documents" || return 4
 }
 
-# Opted-in workflow producers must own one physical target and one unambiguous
-# release naming family. Resolve the whole configuration before any job starts;
+# Opted-in workflow producers own one physical target and every configured
+# compiler variant's naming family. Resolve the whole configuration before any job starts;
 # a selected subset cannot hide an overlapping shared matrix or asset name.
 _act_workflow_payload_plans_json() {
     local tool="$1" version="$2" config_file="$ACT_REPOS_DIR/$1.yaml"
     local configured document enabled module_dir target job owners triples triple format names binaries binary repo_path
-    local primary compat outputs plan plans='{}' primary_owners='[]' all_names='{}'
+    local family families configured_format outputs plan plans='{}' primary_owners='[]' all_names='{}'
     local owner flags arguments_sha256 workflow matrix_plan matrix_plans='{}' argument_plans='{}'
     configured=$(_act_workspace_additional_artifacts_json "$config_file") || return 4
     document=$(_config_read_single_mapping_json "$config_file") || return 4
@@ -623,36 +623,36 @@ _act_workflow_payload_plans_json() {
                 "$job" "$owners" "$argument_plans") || return 4
             matrix_plans=$(jq -c --argjson matrix "$matrix_plan" '. + $matrix' <<< "$matrix_plans") || return 4
         fi
-        triples=$(config_get_target_triples_json "$tool" "$target") || return 4
-        if [[ "$(jq length <<< "$triples")" -gt 1 ]]; then
-            _log_error "Workflow job '$job' for $target declares multiple target triples; typed companion producers require one target variant"
-            return 4
-        fi
     done < <(jq -r '.[]' <<< "$enabled")
 
     # Include unselected and native targets when checking release-name owners.
     while IFS= read -r target; do
-        format=$(jq -r --arg os "${target%/*}" '
+        configured_format=$(jq -r --arg os "${target%/*}" '
             if (.archive_format | type) == "object" then .archive_format[$os] // ""
             elif (.archive_format | type) == "string" then .archive_format else "" end
         ' <<< "$document") || return 4
-        if [[ "$format" == binary && "$target" == windows/* ]]; then
-            format=exe
-        elif [[ "$format" == none || "$format" == binary ]]; then
-            format=none
-        else
-            format=$(_act_workspace_archive_format "$config_file" "$target") || return 4
-        fi
         triples=$(config_get_target_triples_json "$tool" "$target") || return 4
-        [[ "$triples" != '[]' ]] || triples='[""]'
+        if [[ "$triples" == '[]' ]]; then
+            triple=$(artifact_naming_artifact_variant "$tool" "${target%/*}" "${target#*/}" "") || return 4
+            triples=$(jq -cn --arg triple "${triple%%$'\t'*}" '[$triple]') || return 4
+        fi
         while IFS= read -r triple; do
+            if [[ "$configured_format" == binary && "$target" == windows/* ]]; then
+                format=exe
+            elif [[ "$configured_format" == none || "$configured_format" == binary ]]; then
+                format=none
+            else
+                format=$(_act_workspace_archive_format "$config_file" "$target" release "$triple") || return 4
+            fi
             names=$(artifact_naming_generate_dual_for_tool "$tool" "$version" "${target%/*}" "${target#*/}" \
                 "$format" "$repo_path" release "$triple") || return 4
-            primary_owners=$(jq -c --arg target "$target" --argjson names "$names" \
-                '. + ([$names.versioned, $names.compat] | unique | map({target:$target,name:.}))' \
+            primary_owners=$(jq -c --arg target "$target" --arg triple "$triple" --argjson names "$names" \
+                '. + ([$names.versioned, $names.compat] | unique | map({target:$target,target_triple:$triple,name:.}))' \
                 <<< "$primary_owners") || return 4
-            all_names=$(jq -c --arg target "$target" --argjson names "$names" \
-                '. + {($target):$names}' <<< "$all_names") || return 4
+            family=$(jq -cn --arg triple "$triple" --arg format "$format" --argjson names "$names" \
+                '{target_triple:$triple,primary:$names.versioned,compat:$names.compat,archive_format:$format}') || return 4
+            all_names=$(jq -c --arg target "$target" --argjson family "$family" \
+                '.[$target] = ((.[$target] // []) + [$family])' <<< "$all_names") || return 4
         done < <(jq -r '.[]' <<< "$triples")
     done < <(jq -r '.targets[]' <<< "$document")
     if ! jq -en --argjson primary "$primary_owners" --argjson additional "$configured" '
@@ -664,23 +664,25 @@ _act_workflow_payload_plans_json() {
     fi
     while IFS= read -r target; do
         job=$(jq -r --arg target "$target" '.act_job_map[$target]' <<< "$document") || return 4
-        names=$(jq -c --arg target "$target" '.[$target]' <<< "$all_names") || return 4
-        if ! jq -en --arg target "$target" --argjson owners "$primary_owners" --argjson names "$names" '
-            [$names.versioned, $names.compat] | map(ascii_downcase) as $own |
-            all($owners[] | select(.target != $target); (.name | ascii_downcase) as $name |
-                ($own | index($name)) == null)
+        families=$(jq -c --arg target "$target" '.[$target]' <<< "$all_names") || return 4
+        if ! jq -en --arg target "$target" --argjson owners "$primary_owners" --argjson families "$families" '
+            all($families[]; . as $family |
+                ([$family.primary, $family.compat] | unique) as $names |
+                ($names | map(ascii_downcase)) as $own |
+                ($own | length == (unique | length)) and
+                all($owners[] | select(.target != $target or .target_triple != $family.target_triple);
+                    (.name | ascii_downcase) as $name | ($own | index($name)) == null))
         ' >/dev/null; then
-            _log_error "Workflow job '$job' for $target has ambiguous primary names; include the platform in artifact_naming and install_script_compat"
+            _log_error "Workflow job '$job' for $target has ambiguous primary or alias names; include the platform and variant in artifact_naming and install_script_compat (for example \${target_triple})"
             return 4
         fi
-        format=$(_act_workspace_archive_format "$config_file" "$target") || return 4
-        primary=$(jq -r '.versioned' <<< "$names") || return 4
-        compat=$(jq -r '.compat' <<< "$names") || return 4
-        if [[ "$primary" != "$compat" && "${primary,,}" == "${compat,,}" ]]; then
-            _log_error "Workflow job '$job' for $target has primary names that differ only by case"
+        if ! jq -e 'all(.[]; .archive_format == "tar.gz" or .archive_format == "tar.xz" or .archive_format == "zip")' \
+            <<< "$families" >/dev/null; then
+            _log_error "Workflow typed payloads require archived primaries for $target"
             return 4
         fi
-        binaries=$(_act_workspace_binaries_for_target "$config_file" "$target") || return 4
+        triple=$(jq -r '.[0].target_triple' <<< "$families") || return 4
+        binaries=$(_act_workspace_binaries_for_target "$config_file" "$target" release "$triple") || return 4
         [[ -n "$binaries" ]] || binaries=$(jq -r --arg tool "$tool" '.binary_name // $tool' <<< "$document") || return 4
         local -a members=()
         while IFS= read -r binary; do
@@ -692,22 +694,24 @@ _act_workflow_payload_plans_json() {
             members+=("$binary")
         done <<< "$binaries"
         binaries=$(printf '%s\n' "${members[@]}" | jq -Rsc 'split("\n")[:-1]') || return 4
-        outputs=$(jq -cn --arg primary "$primary" --arg compat "$compat" --arg format "$format" \
+        outputs=$(jq -cn --argjson families "$families" \
             --argjson companions "$(jq -c --arg target "$target" '.[$target] // []' <<< "$configured")" '
-            ([$primary,$compat] | unique | map({key:.,value:{role:"primary",format:$format,required:(. == $primary)}}) |
-             from_entries) as $primaries |
-            $primaries + ($primaries | to_entries | map({key:(.key + ".sha256"),value:{role:"checksum",format:"file",required:false}}) | from_entries) +
+            ([$families[] | . as $family | ([$family.primary,$family.compat] | unique)[] |
+                {key:.,value:{role:"primary",format:$family.archive_format,required:(. == $family.primary),
+                              target_triple:$family.target_triple}}] | from_entries) as $primaries |
+            $primaries + ($primaries | to_entries | map({key:(.key + ".sha256"),
+                value:{role:"checksum",format:"file",required:false,target_triple:.value.target_triple}}) | from_entries) +
             ($companions | map({key:.name,value:{role:"additional",format:.format,required:true}}) | from_entries)
         ') || return 4
         flags=$(jq -c --arg target "$target" '.[$target]' <<< "$argument_plans") || return 4
         arguments_sha256=$(_act_sha256 /dev/stdin <<< "$flags") || return 4
         plan=$(jq -cn --arg target "$target" --arg job "$job" --arg version "$version" \
-            --arg primary "$primary" --arg compat "$compat" --arg format "$format" \
+            --argjson families "$families" \
             --argjson binaries "$binaries" --argjson outputs "$outputs" \
             --arg arguments_sha256 "$arguments_sha256" \
             --argjson matrix "$(jq -c --arg target "$target" '.[$target] // null' <<< "$matrix_plans")" \
-            '{target:$target,job:$job,version:$version,primary:$primary,compat:$compat,
-              archive_format:$format,binaries:$binaries,outputs:$outputs,
+            '{target:$target,job:$job,version:$version,primaries:$families,
+              binaries:$binaries,outputs:$outputs,
               act_arguments_sha256:$arguments_sha256,matrix:$matrix}') || return 4
         plans=$(jq -c --arg target "$target" --argjson plan "$plan" '. + {($target):$plan}' <<< "$plans") || return 4
     done < <(jq -r '.[]' <<< "$enabled")
@@ -720,7 +724,7 @@ _act_workflow_payload_plans_json() {
 # first, including CRC/trailer, path, link and expansion checks.
 _act_validate_workflow_primary() {
     local file="$1" plan="$2" format target members binary size mode executable
-    format=$(jq -r '.archive_format' <<< "$plan") || return 4
+    format=$(jq -er --arg name "${file##*/}" '.outputs[$name] | select(.role == "primary") | .format' <<< "$plan") || return 4
     target=$(jq -r '.target' <<< "$plan") || return 4
     packaging_validate_archive "$file" "$format" || return 4
     members=$(packaging_payload_members "$file" "$format") || return 4
@@ -743,6 +747,7 @@ _act_validate_workflow_primary() {
 # choose the owner, declared content type or compiler variant.
 _act_validate_workflow_payload_result() {
     local result="$1" plan="$2" payload inventory actual paths additional name path row role format sha size identity
+    local primary compat
     payload=$(jq -er '.workflow_payload_dir | strings | select(length > 0)' <<< "$result") || return 4
     if ! jq -e --argjson plan "$plan" '
         .method == "act" and .platform == $plan.target and .job == $plan.job and
@@ -807,6 +812,16 @@ PY
         _log_error "Workflow result is missing required primaries or companions, or has contradictory payload receipts"
         return 4
     fi
+    # Optional aliases refer to the same final archive, not merely another
+    # executable of the same architecture. Bind each one to its own variant
+    # so swapped GNU/musl aliases cannot acquire an authoritative receipt.
+    while IFS=$'\t' read -r primary compat; do
+        [[ "$primary" != "$compat" && -f "$payload/$compat" ]] || continue
+        if ! cmp -s -- "$payload/$primary" "$payload/$compat"; then
+            _log_error "Workflow alias $compat differs from its configured primary $primary"
+            return 4
+        fi
+    done < <(jq -r '.primaries[] | [.primary,.compat] | @tsv' <<< "$plan")
     actual=$(_act_result_artifact_receipts "$result") || return 4
     [[ "$actual" == "$inventory" ]] || return 4
 }
@@ -6003,14 +6018,18 @@ _act_validate_no_absolute_cargo_paths() {
 # committed manifests, including ignored/hidden ones, so quoted keys and
 # escaped or multiline TOML strings have the same meaning as they do to Cargo.
 _act_validate_isolated_cargo_paths() {
-    local source="$1" manifest document
-    while IFS= read -r -d '' manifest; do
+    local source="$1" manifest document repositories repository relative revision
+    revision=$(_git_ops_build_git -C "$source" rev-parse --verify 'HEAD^{commit}') || return 4
+    repositories=$(git_ops_materialized_repositories_json "$source" "$revision") || return 4
+    while IFS= read -r relative; do
+        repository="$source${relative:+/$relative}"
+        _git_ops_build_git -C "$repository" ls-files -z | while IFS= read -r -d '' manifest; do
         case "$manifest" in
             Cargo.toml|*/Cargo.toml|.cargo/config|*/.cargo/config|.cargo/config.toml|*/.cargo/config.toml) ;;
             *) continue ;;
         esac
-        if [[ -L "$source/$manifest" ]] ||
-           ! document=$(yq -p=toml -o=json -I=0 '.' "$source/$manifest" 2>/dev/null) ||
+        if [[ -L "$repository/$manifest" ]] ||
+           ! document=$(yq -p=toml -o=json -I=0 '.' "$repository/$manifest" 2>/dev/null) ||
            ! jq -es '
                 length == 1 and
                 all(.[0] | .. | objects | to_entries[] |
@@ -6018,10 +6037,11 @@ _act_validate_isolated_cargo_paths() {
                     .value | .. | strings;
                     (test("^([/\\\\]|[A-Za-z]:)") | not))
             ' <<< "$document" >/dev/null; then
-            _log_error "Isolated Cargo source requires relative paths and TOML-capable yq: $manifest"
+            _log_error "Isolated Cargo source requires relative paths and TOML-capable yq: ${relative:+$relative/}$manifest"
             return 4
         fi
-    done < <(_git_ops_build_git -C "$source" ls-files -z)
+        done || return 4
+    done < <(jq -r '.[].path' <<< "$repositories")
 }
 
 _act_normalize_cargo_path() {
@@ -7745,6 +7765,7 @@ _act_verify_strict_source_roots() {
 _act_export_ordinary_git_contexts() {
     local config_file="$1" local_path="$2" context_parent="$3"
     local sources='[]' contexts='[]' item relative source context count index
+    local revision repositories repository child_path child_relative child_context child_source
     local tool_name="${config_file##*/}"
     tool_name="${tool_name%.yaml}"
     local sibling_names_seen=' source cargo-home '
@@ -7780,12 +7801,36 @@ _act_export_ordinary_git_contexts() {
         fi
         contexts=$(jq -c --argjson item "$item" --argjson context "$context" \
             '. + [$item + {context:$context}]' <<< "$contexts") || return 4
+        if [[ "${_ACT_ISOLATED_SOURCE_TOOL:-}" == "$tool_name" && "$context" != null ]]; then
+            revision=$(jq -r .git_sha <<< "$context") || return 4
+            git_ops_verify_materialized_source "$source" "$revision" || return 4
+            repositories=$(git_ops_materialized_repositories_json "$source" "$revision") || return 4
+            contexts=$(jq -c --arg relative "$relative" --arg revision "$revision" '
+                map(if .relative_path == $relative then . + {isolated_git_sha:$revision} else . end)
+            ' <<< "$contexts") || return 4
+            while IFS= read -r repository; do
+                child_path=$(jq -r .path <<< "$repository") || return 4
+                revision=$(jq -r .git_sha <<< "$repository") || return 4
+                child_relative="$relative/$child_path"
+                child_source="$source/$child_path"
+                # Context bundles live in a separate retained evidence tree;
+                # the destination hierarchy follows already admitted Git paths.
+                mkdir -p -- "$context_parent/${child_relative%/*}" || return 4
+                child_context=$(git_ops_export_build_context "$child_source" "$context_parent/$child_relative") || return 4
+                [[ "$(jq -r .git_sha <<< "$child_context")" == "$revision" ]] || return 4
+                contexts=$(jq -c --arg path "$child_source" --arg relative "$child_relative" \
+                    --arg revision "$revision" --argjson context "$child_context" '
+                    . + [{relative_path:$relative,local_path:$path,context:$context,
+                          isolated_git_sha:$revision,submodule:true}]
+                ' <<< "$contexts") || return 4
+            done < <(jq -c '.[] | select(.path != "")' <<< "$repositories")
+        fi
     done < <(jq -c '.[]' <<< "$sources")
     printf '%s\n' "$contexts"
 }
 
 _act_verify_ordinary_git_contexts() {
-    local contexts="$1" item source context
+    local contexts="$1" item source context revision
     while IFS= read -r item; do
         source=$(jq -r .local_path <<< "$item") || return 4
         [[ -d "$source" && ! -L "$source" ]] || return 4
@@ -7793,6 +7838,10 @@ _act_verify_ordinary_git_contexts() {
         if [[ "$context" != null ]] && ! git_ops_verify_build_context "$source" "$context"; then
             _log_error "Controller Git HEAD, branch, or tags changed during source transfer: $source"
             return 4
+        fi
+        revision=$(jq -r '.isolated_git_sha // ""' <<< "$item") || return 4
+        if [[ -n "$revision" && "$(jq -r '.submodule // false' <<< "$item")" == false ]]; then
+            git_ops_verify_materialized_source "$source" "$revision" || return 4
         fi
     done < <(jq -c '.[]' <<< "$contexts")
 }
@@ -7835,9 +7884,18 @@ _act_prepare_ordinary_source_root() {
 # Git helper validates the transferred bundle before creating a private .git.
 _act_restore_ordinary_git_context() {
     local host="$1" source_root="$2" context="$3" relative="$4"
-    local bundle remote_bundle remote_context command restored destination
+    local bundle remote_bundle remote_context command restored destination boundary context_name
     bundle=$(jq -r .bundle_path <<< "$context") || return 4
-    remote_bundle="${source_root%/*}/.dsr-context-${relative}.bundle"
+    boundary="${source_root%/*}"
+    context_name="$relative"
+    if [[ "$relative" == */* ]]; then
+        [[ "$source_root" == */"$relative" ]] || return 4
+        boundary="${source_root%/"$relative"}"
+        context_name="submodule-$(_act_sha256 /dev/stdin <<< "$relative")" || return 4
+    fi
+    # Child bundles stay beside the overall source stage, not inside a parent
+    # repository where they would become untracked compiler inputs.
+    remote_bundle="$boundary/.dsr-context-${context_name}.bundle"
     remote_context=$(jq -c --arg path "$remote_bundle" '.bundle_path=$path' <<< "$context") || return 4
     if _act_is_local_host "$host"; then
         (umask 077; set -C; cat "$bundle" > "$remote_bundle") || return 4
@@ -7948,7 +8006,6 @@ _act_sync_sibling_crates() {
             sync_failed=true
             continue
         fi
-
         # Rewrite absolute path to relative in remote Cargo.toml
         # e.g., path = "/dp/asupersync" → path = "../asupersync"
         # Was previously hardcoded to the literal hostname "wlap" —
@@ -8001,6 +8058,7 @@ act_sync_sources() {
     local targets_arg=()
     local strict_release=false
     local stage_ordinary=false ordinary_stage_id="" ordinary_contexts='[]' primary_git_context=null sibling_git_contexts='{}'
+    local submodule_git_contexts='{}' isolated_identity=null
     local strict_run_id=""
     local strict_git_sha=""
 
@@ -8060,6 +8118,9 @@ act_sync_sources() {
         _log_error "Local path not found: $local_path"
         echo '{"status":"error","error":"Local path not found"}'
         return 4
+    fi
+    if [[ "${_ACT_ISOLATED_SOURCE_TOOL:-}" == "$tool_name" ]]; then
+        isolated_identity="${_ACT_ISOLATED_SOURCE_IDENTITY:-null}"
     fi
 
     local release_contract_json="null"
@@ -8287,7 +8348,9 @@ act_sync_sources() {
 
     if [[ ${#hosts_to_sync[@]} -eq 0 ]]; then
         _log_info "No build locations need source sync"
-        echo '{"status":"skipped","synced":0,"hosts":[],"source_roots":{},"target_hosts":{}}'
+        jq -nc --argjson identity "$isolated_identity" '
+            {status:"skipped",synced:0,hosts:[],source_roots:{},target_hosts:{}} +
+            (if $identity == null then {} else {source_materialization:$identity} end)' || return 4
         return 0
     fi
 
@@ -8306,7 +8369,9 @@ act_sync_sources() {
             return 4
         fi
         primary_git_context=$(jq -c '.[0].context | del(.bundle_path)' <<< "$ordinary_contexts") || return 4
-        sibling_git_contexts=$(jq -c '[.[] | select(.relative_path != "source" and .context != null) |
+        sibling_git_contexts=$(jq -c '[.[] | select(.relative_path != "source" and .context != null and .submodule != true) |
+            {key:.relative_path,value:(.context | del(.bundle_path))}] | from_entries' <<< "$ordinary_contexts") || return 4
+        submodule_git_contexts=$(jq -c '[.[] | select(.submodule == true) |
             {key:.relative_path,value:(.context | del(.bundle_path))}] | from_entries' <<< "$ordinary_contexts") || return 4
     fi
 
@@ -8338,7 +8403,7 @@ act_sync_sources() {
     for i in "${!hosts_to_sync[@]}"; do
         local host="${hosts_to_sync[$i]}"
         local remote_path="${host_paths[$i]}"
-        local restored_primary=null restored_siblings='{}'
+        local restored_primary=null restored_siblings='{}' restored_submodules='{}'
 
         # Capture each host's full sync transcript so failures can report the
         # underlying cause (in the log and in the per-host JSON) instead of a
@@ -8423,7 +8488,10 @@ act_sync_sources() {
                             sync_ok=false
                             break
                         fi
-                        if [[ "$context_relative" == source ]]; then
+                        if [[ "$(jq -r '.submodule // false' <<< "$context_entry")" == true ]]; then
+                            restored_submodules=$(jq -c --arg name "$context_relative" --argjson receipt "$restored_context" \
+                                '.[$name]=$receipt' <<< "$restored_submodules") || return 4
+                        elif [[ "$context_relative" == source ]]; then
                             restored_primary="$restored_context"
                         else
                             restored_siblings=$(jq -c --arg name "$context_relative" --argjson receipt "$restored_context" \
@@ -8447,9 +8515,11 @@ act_sync_sources() {
                 results+=("$(jq -nc --arg host "$host" --arg path "$remote_path" \
                     --arg configured_path "${configured_host_paths[$i]}" --argjson staged "$stage_ordinary" \
                     --argjson context "$restored_primary" --argjson siblings "$restored_siblings" \
+                    --argjson submodules "$restored_submodules" \
                     '{host:$host,path:$path,status:"success"} +
                      (if $staged then {configured_path:$configured_path,git_context:$context,
-                       sibling_git_contexts:$siblings} else {} end)')")
+                       sibling_git_contexts:$siblings} else {} end) +
+                     (if ($submodules | length) > 0 then {submodule_git_contexts:$submodules} else {} end)')")
                 source_root_entries+=("$(jq -nc --arg host "$host" --arg path "$remote_path" \
                     '{key: $host, value: $path}')")
             else
@@ -8516,6 +8586,8 @@ act_sync_sources() {
         --argjson staged_ordinary "$stage_ordinary" \
         --argjson git_context "$primary_git_context" \
         --argjson sibling_git_contexts "$sibling_git_contexts" \
+        --argjson submodule_git_contexts "$submodule_git_contexts" \
+        --argjson identity "$isolated_identity" \
         '{
             status: $status,
             synced: $synced,
@@ -8525,7 +8597,12 @@ act_sync_sources() {
             source_roots: $source_roots,
             target_hosts: $target_hosts
         } + (if $staged_ordinary then {staged_ordinary:true,git_context:$git_context,
-            sibling_git_contexts:$sibling_git_contexts} else {} end)'
+            sibling_git_contexts:$sibling_git_contexts} else {} end) +
+            (if ($submodule_git_contexts | length) > 0 then {submodule_git_contexts:$submodule_git_contexts} else {} end) |
+            if $identity == null then . else
+                .source_materialization=$identity |
+                .hosts |= map(if .status == "success" then . + {source_materialization:$identity} else . end)
+            end'
 
     if [[ $failed -gt 0 ]]; then
         return 1
@@ -14525,6 +14602,21 @@ _act_relocate_failed_target() {
     build_state_get "$tool" "$version" "$run_id"
 }
 
+# Select the existing per-target synchronization receipt. Act-only builds need
+# no native host transfer, but retain the same admitted private source graph
+# before their first attempt so a later retry cannot bless legacy artifacts.
+_act_target_source_sync_json() {
+    local receipt="$1" method="$2" host="${3:-}"
+    if [[ -z "$receipt" || "$receipt" == null ]]; then
+        printf 'null\n'
+    elif [[ "$method" == act ]]; then
+        jq -c 'if .source_materialization == null then null else
+            {status:"success",source_materialization} end' <<< "$receipt"
+    else
+        jq -ce --arg host "$host" '.hosts[] | select(.host == $host)' <<< "$receipt"
+    fi
+}
+
 # Ordinary synchronization selects the hosts and paths a build may use. It is
 # not a source-content attestation: a failed transfer must never authorize a
 # worker merely because an older checkout is still present at that path.
@@ -14534,6 +14626,27 @@ _act_validate_source_sync_receipt() {
       def text: type == "string" and length > 0 and (test("[[:cntrl:]]") | not);
       def host: type == "string" and test("^[A-Za-z0-9_-]+$");
       def path: gsub("\\\\";"/") | if test("^[A-Za-z]:/") then ascii_downcase else . end;
+      def submodule_name:
+        type == "string" and (split("/") | length > 1 and
+          all(.[]; test("^[A-Za-z0-9_+@~#,=()\\[\\] .-]+$") and
+            (startswith("-") | not) and (contains("..") | not) and . != "." and
+            (ascii_downcase != ".git")));
+      def sha: type == "string" and test("^[0-9a-f]{40}$") and . != ("0" * 40);
+      def graph:
+        type == "array" and length <= 255 and
+        ([.[].path] | length == (unique | length)) and
+        all(.[]; type == "object" and (keys == ["git_sha","git_tree","path"]) and
+          (.git_sha | sha) and (.git_tree | sha) and
+          (.path | type == "string" and ("source/" + . | submodule_name)));
+      def materialization:
+        type == "object" and (keys == ["dependencies","git_sha","submodules"]) and
+        (.git_sha | sha) and (.submodules | graph) and
+        (.dependencies | type == "array" and
+          ([.[].relative_path] | length == (unique | length)) and
+          all(.[]; type == "object" and (keys == ["git_sha","relative_path","submodules"]) and
+            (.relative_path | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and
+              (contains("..") | not) and (ascii_downcase != "source")) and
+            (.git_sha | sha) and (.submodules | graph)));
       def context:
         type == "object" and
         (.git_sha | type == "string" and test("^[0-9a-f]{40}$") and . != ("0" * 40)) and
@@ -14567,11 +14680,29 @@ _act_validate_source_sync_receipt() {
         elif $failed == 0 then .status == "success"
         elif $success == 0 then .status == "failed"
         else .status == "partial" end) |
+      select(if has("source_materialization") then .source_materialization | materialization else true end) |
+      select(all(.hosts[] | select(.status == "success");
+        (.source_materialization // null) == ($receipt.source_materialization // null))) |
       select(if has("staged_ordinary") then
         .staged_ordinary == true and (.git_context | context) and
+        (if .source_materialization == null then true else
+          .git_context.git_sha == .source_materialization.git_sha and
+          ([.sibling_git_contexts | to_entries[] | {relative_path:.key,git_sha:.value.git_sha}] | sort_by(.relative_path)) ==
+            ([.source_materialization.dependencies[] | {relative_path,git_sha}] | sort_by(.relative_path)) and
+          ([.submodule_git_contexts | to_entries[] | {path:.key,git_sha:.value.git_sha}] | sort_by(.path)) ==
+            ([.source_materialization.submodules[] | {path:("source/" + .path),git_sha}] +
+             [.source_materialization.dependencies[] | .relative_path as $base | .submodules[] |
+               {path:($base + "/" + .path),git_sha}] | sort_by(.path))
+          end) and
         (.sibling_git_contexts | type == "object" and all(to_entries[];
           (.key | test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and (contains("..") | not)) and
           (.value | context))) and
+        (if has("submodule_git_contexts") then
+          .submodule_git_contexts | type == "object" and all(to_entries[];
+            (.key | split("/")[0]) as $root |
+            (.key | submodule_name) and (.value | context) and
+            ($root == "source" or ($receipt.sibling_git_contexts | has($root))))
+          else true end) and
         all(.hosts[] | select(.status == "success"); . as $row |
           (.git_context | context) and
           ((.git_context | del(.bundle_path,.source_root)) == $receipt.git_context) and
@@ -14582,7 +14713,14 @@ _act_validate_source_sync_receipt() {
           all(.sibling_git_contexts | to_entries[]; . as $sibling |
             (.value | context) and (.value.bundle_path | text) and
             ((.value | del(.bundle_path,.source_root)) == $receipt.sibling_git_contexts[$sibling.key]) and
-            ((.value.source_root | path) == (($row.path | sub("/source$";"")) + "/" + .key | path))))
+            ((.value.source_root | path) == (($row.path | sub("/source$";"")) + "/" + .key | path))) and
+          ((.submodule_git_contexts // {} | keys) == ($receipt.submodule_git_contexts // {} | keys)) and
+          (if has("submodule_git_contexts") then
+            .submodule_git_contexts | type == "object" and all(to_entries[]; . as $child |
+              (.value | context) and (.value.bundle_path | text) and
+              ((.value | del(.bundle_path,.source_root)) == $receipt.submodule_git_contexts[$child.key]) and
+              ((.value.source_root | path) == (($row.path | sub("/source$";"")) + "/" + .key | path)))
+            else true end))
         else true end) |
       $receipt
     ' <<< "$receipt"
@@ -15640,10 +15778,10 @@ act_orchestrate_build() {
             host=$(jq -r --arg target "$target" '.[$target] // empty' <<< "$target_hosts_json" 2>/dev/null)
             [[ -n "$host" ]] || host=$(act_get_native_host "$target" "$tool_name")
         fi
-        local target_sync_receipt=null
-        if [[ -n "$source_sync_json" ]] && ! act_platform_uses_act "$tool_name" "$target"; then
-            target_sync_receipt=$(jq -ce --arg host "$host" '.hosts[] | select(.host == $host)' \
-                <<< "$source_sync_json") || {
+        local target_sync_receipt=null target_sync_method=native
+        if [[ -n "$source_sync_json" ]]; then
+            if act_platform_uses_act "$tool_name" "$target"; then target_sync_method=act; fi
+            target_sync_receipt=$(_act_target_source_sync_json "$source_sync_json" "$target_sync_method" "$host") || {
                 _act_refuse_retained_target "Source synchronization receipt became unavailable for $task_key" "$prior_attempts"
                 break
             }
@@ -16713,7 +16851,10 @@ act_generate_manifest() {
     verified_workflow_files=$(jq -c --argjson plans "$workflow_plans" '[.targets[] |
         select(.method == "act" and $plans[.platform] != null and
                (.status == "success" or .status == "ok" or .status == "passed")) |
-        .platform as $target | .artifact_paths[] | {key:.,value:$target}] | from_entries' <<< "$result_json") || return 4
+        .platform as $target | .artifact_paths[] | . as $path |
+        {key:$path,value:{target:$target,
+            target_triple:($plans[$target].outputs[$path | split("/") | last].target_triple //
+                error("workflow primary lacks a configured variant"))}}] | from_entries' <<< "$result_json") || return 4
     if ! declare -F artifact_naming_artifact_variant &>/dev/null; then
         # shellcheck source=SCRIPTDIR/artifact_naming.sh
         source "$manifest_module_dir/artifact_naming.sh" || return 3
@@ -16845,7 +16986,7 @@ act_generate_manifest() {
         fi
         if jq -e --arg path "$file" 'has($path)' <<< "$verified_workflow_files" >/dev/null; then
             authoritative_workflow=true
-            [[ "$(jq -r --arg path "$file" '.[$path]' <<< "$verified_workflow_files")" == "$target" ]] || return 4
+            [[ "$(jq -r --arg path "$file" '.[$path].target' <<< "$verified_workflow_files")" == "$target" ]] || return 4
         fi
 
         case "$name" in
@@ -16938,7 +17079,10 @@ act_generate_manifest() {
         local target_triple
         if [[ "$native_result" == true && -n "$declared_triple" ]]; then
             target_triple="$declared_triple"
-        elif $literal_additional || $authoritative_workflow; then
+        elif $authoritative_workflow; then
+            target_triple=$(jq -er --arg path "$file" '.[$path].target_triple | strings | select(length > 0)' \
+                <<< "$verified_workflow_files") || return 4
+        elif $literal_additional; then
             target_triple=$(_act_manifest_target_triple "$target" "") || return 4
         else
             target_triple=$(_act_manifest_target_triple "$target" "$name") || return 4

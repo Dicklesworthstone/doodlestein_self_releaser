@@ -501,9 +501,11 @@ or absent developer checkout does not prevent automatic fallback. Available
 objects and the matching tag are copied without modifying the checkout; when
 they are unavailable, the materializer fetches the exact tag from the configured
 GitHub repository and refuses a mismatched commit. Configured sibling sources
-must be locally available at their pinned revisions. The ordinary isolated-source
-restrictions still apply, including the refusal of unpinned dependencies,
-unsupported absolute Cargo paths and top-level Git submodules. Every retry
+must be locally available at their pinned revisions. Initialized project and
+sibling submodules are copied recursively from their parent gitlink commits;
+their pinned objects must also be available locally. The ordinary isolated-source
+restrictions still apply, including the refusal of unpinned dependencies and
+unsupported absolute Cargo paths. Every retry
 materializes a fresh source tree; it does not reuse a modified prior copy.
 The attempt journal records `isolate_source` and preserves it across retries.
 Older attempts without that field retain the original checkout mode and still
@@ -1969,26 +1971,49 @@ Quality checks, build workers, archive includes, and release verification all
 use the private source. Configured sibling crates must have exact `revision`
 pins and distinct `relative_path` names; their committed sources are copied
 beside the main source and checked again at every fallback boundary. Unpinned
-siblings and Git submodules are refused. Existing strict source and artifact
-admission rules still apply.
+siblings are refused. Initialized Git submodules in the main repository or a
+pinned sibling are supported recursively. Each parent's authenticated gitlink
+selects the child commit; a newer or dirty child checkout cannot replace those
+committed bytes. Ordinary absorbed submodules with administration contained in
+their parent's `modules` directory and self-contained child `.git` directories
+are accepted. Private children receive independent object stores, detached
+HEADs and fresh configuration, preserving the developer's child refs, index,
+configuration and work. Submodule URLs are never fetched, including when the
+main release tag was fetched; absent child checkouts or missing pinned objects
+remain errors. External administrative pointers, alternates and linked object
+stores are refused. This uses the existing authenticated source reader with
+Python 3.9+ and limits of 100000 tree entries, 256 repositories and 16 nested
+submodule levels per source graph. Existing strict source and artifact admission
+rules still apply.
 Cargo manifests and configuration must use relative dependency/workspace
-paths. Isolation parses committed TOML with yq before quality checks and
+paths. Isolation parses committed TOML throughout the root and child repositories
+with yq before quality checks and
 refuses absolute paths, including escaped and multiline spellings, rather
 than rewriting files covered by the pinned commit. A yq version with TOML
 input support is required when these files are present.
 
+Every fallback boundary verifies child HEADs, indexes and committed bytes
+again, independently of parent submodule-ignore settings. Ordinary native
+staging restores a separate Git context for each selected child, so child
+build scripts can read their exact pinned Git metadata. Source-sync receipts
+retain these contexts in `submodule_git_contexts`, separately from configured
+sibling identities, and validate their paths and identities on every receiver.
+
 Each retry creates a fresh controller source copy while resuming the selected
 build UUID and its original output directory. Source copies and partial failed
 materializations are retained for inspection; `details.source_materialization`
-records the private root, source/tag identities, transfer method, and pinned
-dependencies. `--dry-run` plans isolation without creating directories or
+records the private root, source/tag identities, transfer method, pinned
+dependencies and selected submodule commits/trees. `--dry-run` plans isolation without creating directories or
 fetching. `--build-only` remains offline when the pinned source objects are
 available locally; otherwise source materialization itself requires GitHub.
-For an ordinary build with pinned siblings, resume also requires matching
-original synchronization evidence and successful target receipts, including
-retained history and sidecars. Changed dependency pins or older checkpoints
-without that evidence require a new build; existing artifacts cannot be
-relabeled with a newly materialized dependency revision.
+For an ordinary build with pinned siblings or submodules, resume also requires
+matching original synchronization evidence and successful target receipts,
+including retained history and sidecars. Submodule-bearing runs retain their
+path-independent main, sibling and recursive child identities in the existing
+source-sync checkpoint and each target receipt, including act-only runs that
+need no native transfer. Changed pins or older checkpoints without that graph
+evidence require a new build and exit 4; existing artifacts cannot be relabeled
+with a newly materialized dependency or child revision.
 
 ---
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Committed-source admission for manifest-backed Windows x64/ARM64 builds
 # and the native coordinator's authenticated recursive source archives.
-# No checkout mutation, network access, or tag writes. Native legacy archive
-# comparison observes export attributes without making them source authority.
+# Original checkouts are never changed. Native legacy archive comparison
+# observes export attributes without making them source authority.
 
 xwin_source_snapshot() {
     [[ $# == 6 ]] || return 4
@@ -43,6 +43,23 @@ source_archive_matches_git() {
     [[ $# == 2 ]] || return 4
     command -v python3 >/dev/null && command -v git >/dev/null || return 3
     _xws_source native-archive-check "$@"
+}
+
+# Populate only the authenticated gitlink children of an already materialized
+# private root. Each child receives independent objects/configuration and the
+# commit selected by its parent, regardless of the developer child's HEAD.
+source_git_materialize_submodules() {
+    [[ $# == 3 ]] || return 4
+    command -v python3 >/dev/null && command -v git >/dev/null || return 3
+    _xws_source materialize-submodules "$@"
+}
+
+# Verify committed bytes and storage for a complete private repository graph.
+# Return root/child paths and pins for Git-context and Cargo-path consumers.
+source_git_materialized_repositories_json() {
+    [[ $# == 2 ]] || return 4
+    command -v python3 >/dev/null && command -v git >/dev/null || return 3
+    _xws_source materialized-repositories "$@"
 }
 
 _xws_source() {
@@ -455,6 +472,112 @@ def git_environment():
     environment.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
                        GIT_NO_REPLACE_OBJECTS="1", GIT_NO_LAZY_FETCH="1", GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", LC_ALL="C")
     return environment
+
+def private_repository_graph(project, commit):
+    require(re.fullmatch(r"[0-9a-f]{40}", commit) is not None and commit != "0" * 40,
+            "expected an explicit SHA-1 source commit")
+    return inspect_repository(plain_directory(project), commit, git_environment(), {}, native=True)
+
+def materialize_submodules(project, commit, destination):
+    selection = private_repository_graph(project, commit)
+    destination = plain_directory(destination)
+    environment = git_environment()
+
+    def populate(selected, root):
+        for name, child in selected["children"]:
+            path = root / name
+            if os.path.lexists(path):
+                plain_directory(path)
+                require(not any(path.iterdir()), "private submodule destination is not empty: " + name)
+            else:
+                plain_directory(path.parent)
+                path.mkdir(mode=0o700)
+            admin = path / ".git"
+            admin.mkdir(mode=0o700)
+            template = admin / "dsr-empty-template"
+            template.mkdir(mode=0o700)
+            command = ["git", "-c", "protocol.allow=never", "-c", "core.hooksPath=" + os.devnull,
+                       "-c", "core.fsmonitor=false", "-C", str(path)]
+            def git(*args):
+                return subprocess.run(command + list(args), env=environment, check=True,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
+            git("init", "-q", "--template=" + str(template))
+            git("config", "--local", "core.autocrlf", "false")
+            git("config", "--local", "core.eol", "lf")
+            producer = subprocess.Popen(child["command"] + ["pack-objects", "--stdout", "--revs"],
+                                        env=environment, stdin=subprocess.PIPE,
+                                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            consumer = None
+            try:
+                consumer = subprocess.Popen(command + ["index-pack", "--stdin", "--strict"],
+                                            env=environment, stdin=producer.stdout,
+                                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                producer.stdout.close()
+                producer.stdin.write((child["commit"] + "\n").encode("ascii"))
+                producer.stdin.close()
+                _, error = consumer.communicate(timeout=300)
+                require(consumer.returncode == 0 and producer.wait(timeout=300) == 0,
+                        "cannot copy pinned submodule objects: " + name + " " + error.decode(errors="replace"))
+            finally:
+                for process in (consumer, producer):
+                    if process is not None and process.poll() is None:
+                        process.terminate()
+                        process.wait()
+                if not producer.stdin.closed:
+                    producer.stdin.close()
+                if not producer.stdout.closed:
+                    producer.stdout.close()
+            git("update-ref", "--no-deref", "HEAD", child["commit"])
+            git("read-tree", "--reset", "-u", "HEAD")
+            git("fsck", "--connectivity-only", "--no-reflogs", "--no-dangling")
+            populate(child, path)
+    populate(selection, destination)
+
+def materialized_repositories(project, commit):
+    selection = private_repository_graph(project, commit)
+    repositories = []
+
+    def verify_selected(selected, prefix=""):
+        root = Path(selected["project"])
+        require(not prefix or (re.fullmatch(r"[A-Za-z0-9_./+@~#,=()\[\] -]+", prefix) is not None
+                               and ".." not in prefix),
+                "private submodule path cannot be transported safely: " + prefix)
+        # A private copy never depends on the developer's modules directory,
+        # an absorbed pointer, shared alternates, or a mutable working index.
+        plain_directory(root / ".git")
+        for directory in selected["directories"]:
+            plain_directory(root / directory)
+        for name, mode, oid in selected["entries"]:
+            path = root / name
+            plain_directory(path.parent)
+            before = path.lstat()
+            if mode == "120000":
+                require(stat.S_ISLNK(before.st_mode), "private source link changed type: " + name)
+                raw = os.fsencode(os.readlink(path))
+                digest = hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest()
+            else:
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                with os.fdopen(fd, "rb") as stream:
+                    held = os.fstat(stream.fileno())
+                    require(stat.S_ISREG(held.st_mode) and
+                            (held.st_dev, held.st_ino) == (before.st_dev, before.st_ino),
+                            "private source file changed type: " + name)
+                    require(bool(held.st_mode & stat.S_IXUSR) == (mode == "100755"),
+                            "private source executable mode changed: " + name)
+                    digest = hashlib.sha1(b"blob " + str(held.st_size).encode() + b"\0")
+                    for block in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(block)
+                    digest = digest.hexdigest()
+            after = path.lstat()
+            require((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) ==
+                    (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns),
+                    "private source changed while reading: " + name)
+            require(digest == oid, "private source differs from its pinned Git blob: " + name)
+        repositories.append({"path": prefix, "git_sha": selected["commit"], "git_tree": selected["tree"]})
+        for name, child in selected["children"]:
+            verify_selected(child, prefix + ("/" if prefix else "") + name)
+    verify_selected(selection)
+    return repositories
 
 def inspect_project(project, commit, tag, repo, budget):
     require(isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit) and commit != "0" * 40, "expected an explicit SHA-1 source commit")
@@ -881,6 +1004,12 @@ try:
         sys.exit(native_archive_check(*sys.argv[2:]))
     if mode == "native-export":
         native_export(*sys.argv[2:])
+        sys.exit(0)
+    if mode == "materialize-submodules":
+        materialize_submodules(*sys.argv[2:])
+        sys.exit(0)
+    if mode == "materialized-repositories":
+        print(json.dumps(materialized_repositories(*sys.argv[2:]), sort_keys=True, separators=(",", ":")))
         sys.exit(0)
     if mode == "verify":
         root, receipt = map(Path, sys.argv[2:])

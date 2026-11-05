@@ -215,8 +215,38 @@ select exactly one distinct cell. This check includes peers outside the
 requested CLI subset and peers without additional artifacts. Strings, integers
 and booleans are supported; dynamic expressions, nested values, missing filter
 keys, overlapping owners, and selections that match zero or multiple cells
-require a different configuration. Typed companion producers still use one
-target triple per platform.
+require a different configuration. One selected cell may produce several
+compiler variants of its platform; the cell must upload every declared primary.
+
+For example, a cell that builds both GNU and musl archives can use:
+
+```yaml
+target_triples:
+  linux/amd64: [x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl]
+artifact_naming: '${name}-${version}-${target_triple}'
+install_script_compat: '${name}-${target_triple}'
+archive_format: tar.gz
+workspace_additional_artifacts:
+  linux/amd64:
+    - {name: linux-amd64-metadata.json, format: json}
+    - {name: linux-amd64-runtime.zip, format: zip}
+```
+
+Each variant owns a distinct required primary archive and optional installer
+alias. Names must remain unique across variants, platforms and companions,
+including case-insensitive comparisons. A supplied alias must contain the
+same bytes as its corresponding primary. DSR validates every archive's
+configured executables and architecture, retains the original compressed
+bytes, and binds each primary, alias and checksum to its configured target
+triple. Missing variants or contradictory aliases fail collection.
+
+The metadata and runtime ZIP in this example remain platform-level assets,
+collected once. As with native `workspace_additional_artifacts`, the ordinary
+manifest assigns these shared assets to the platform's first configured
+triple; that ownership does not describe the metadata's ABI. Manifest admission
+reconstructs the complete plan, so changed variants, names, ordering or file
+identities invalidate retained evidence. Strict multi-variant release contracts
+continue to require their existing native compiler and source receipts.
 
 Peers that have no additional artifacts receive the same matrix and argument
 binding with a primary-only payload plan. Selecting such a peer alone retains

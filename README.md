@@ -1087,7 +1087,12 @@ absent: available Git objects are copied locally; otherwise DSR fetches and
 verifies the exact GitHub tag. Quality checks, compilation and publication all
 use the private source. The developer checkout is preserved. Pinned sibling
 dependencies use the same isolated-source rules as `dsr fallback --isolate-source`;
-unavailable or changed identities block the release. Each retry gets a fresh
+initialized project and sibling submodules are copied at their parent-pinned
+commits, including nested modules. Their Git objects must be locally available:
+DSR does not fetch submodule URLs or change developer child checkouts. Private
+copies retain child Git metadata for native builds, and child source changes or
+absolute Cargo paths block publication. Unavailable or changed identities block
+the release. Each retry gets a fresh
 source copy while retaining its verified build checkpoint and output directory.
 Attempts started before this source-isolation behavior retain their original
 checkout mode on retry, including its clean, matching-checkout requirement.

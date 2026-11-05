@@ -15,6 +15,255 @@ source "$SRC_DIR/logging.sh"
 # shellcheck source=../../src/git_ops.sh
 source "$SRC_DIR/git_ops.sh"
 
+# Actual Git object transfer and private working trees; no network, compiler,
+# source deletion, or mutable checkout bytes stand in for the selected pins.
+test_materialized_submodules() {
+  python3 - "$SRC_DIR" "${DSR_TEST_GIT_OPS_MODULE:-$SRC_DIR/git_ops.sh}" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+modules, module = map(Path, sys.argv[1:])
+work = Path(tempfile.mkdtemp(prefix='dsr-isolated-submodules-'))
+print('Retained isolated submodule evidence: ' + str(work), flush=True)
+checks = failures = 0
+
+def check(label, valid):
+    global checks, failures
+    checks += 1
+    failures += not valid
+    print(('PASS: ' if valid else 'FAIL: ') + label, flush=True)
+
+def git(root, *args):
+    return subprocess.check_output(['git', '-c', 'user.name=DSR Fixture',
+        '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false',
+        '-c', 'core.hooksPath=/dev/null', '-C', str(root), *args], stderr=subprocess.PIPE).decode().strip()
+
+def repository(path, text):
+    path.mkdir(parents=True)
+    git(path, 'init', '-q', '-b', 'main')
+    (path / 'source.txt').write_text(text + '\n')
+    (path / '.gitignore').write_text('target/\n')
+    git(path, 'add', '.')
+    git(path, 'commit', '-qm', 'initial')
+    return git(path, 'rev-parse', 'HEAD')
+
+def link(parent, name, pin):
+    with (parent / '.gitmodules').open('a') as stream:
+        stream.write('[submodule "' + name + '"]\n\tpath = ' + name +
+                     '\n\turl = https://must-not-fetch.invalid/' + name + '.git\n')
+    git(parent, 'add', '.gitmodules')
+    git(parent, 'update-index', '--add', '--cacheinfo', '160000,' + pin + ',' + name)
+    git(parent, 'commit', '-qm', 'pin child')
+    return git(parent, 'rev-parse', 'HEAD')
+
+def fixture(label, absorbed=False):
+    root = work / label / 'developer'
+    repository(root, 'root release')
+    child = root / 'vendor/library'
+    repository(child, 'library release')
+    leaf = child / 'nested/leaf'
+    leaf_sha = repository(leaf, 'leaf release')
+    child_sha = link(child, 'nested/leaf', leaf_sha)
+    sha = link(root, 'vendor/library', child_sha)
+    git(root, 'tag', '-a', 'v1.2.3', '-m', 'release')
+    if absorbed:
+        git(root, 'submodule', 'absorbgitdirs')
+    return root, sha, child, child_sha, leaf, leaf_sha
+
+def capture(root):
+    result = {}
+    for path in sorted(root.rglob('*')):
+        if path.is_symlink():
+            result[str(path.relative_to(root))] = ('link', os.readlink(path))
+        elif path.is_file():
+            info = path.stat()
+            result[str(path.relative_to(root))] = (info.st_mode, info.st_size,
+                hashlib.sha256(path.read_bytes()).hexdigest())
+    return result
+
+def call(root, label, *args):
+    result = subprocess.run(['bash', '-c', 'source "$1/logging.sh"; source "$2"; shift 2; "$@"',
+        '_', str(modules), str(module), *map(str, args)], text=True, capture_output=True, timeout=30)
+    (root.parent / (label + '.stdout')).write_text(result.stdout)
+    (root.parent / (label + '.stderr')).write_text(result.stderr)
+    (root.parent / (label + '.exit')).write_text(str(result.returncode) + '\n')
+    return result
+
+def transport(root, private, sha, child_sha, leaf_sha, materialized):
+    config = root.parent / 'config'
+    (config / 'repos.d').mkdir(parents=True)
+    stages = root.parent / 'stages'
+    stages.mkdir()
+    (config / 'hosts.yaml').write_text(json.dumps({'hosts': {'fixture': {
+        'platform': 'linux/amd64', 'connection': 'local', 'enabled': True,
+        'build_root': str(stages), 'capabilities': []}}}))
+    (config / 'repos.d/tool.yaml').write_text(json.dumps(dict(repo='owner/tool',
+        local_path=str(root), language='go', binary_name='tool', targets=['linux/amd64'],
+        hosts={'linux/amd64': 'fixture'}, act_job_map={'linux/amd64': None})))
+    identity = dict(git_sha=sha, submodules=materialized['submodules'], dependencies=[])
+    env = dict(os.environ, ACT_CONFIG_DIR=str(config), DSR_CONFIG_DIR=str(config),
+        ACT_REPOS_DIR=str(config / 'repos.d'), DSR_HOSTS_FILE=str(config / 'hosts.yaml'),
+        DSR_STATE_DIR=str(root.parent / 'state'), DSR_DISABLE_HOST_SELECTOR='1',
+        _ACT_ISOLATED_SOURCE_TOOL='tool', _ACT_ISOLATED_SOURCE_PATHS=json.dumps({str(root): str(private)}),
+        _ACT_ISOLATED_SOURCE_IDENTITY=json.dumps(identity))
+    program = '''source "$1/logging.sh"; source "$1/config.sh"; source "$1/act_runner.sh"; source "$2"
+shift 2
+# Machine capacity is a controlled boundary; source selection, rsync, Git
+# context import, and final source-sync receipt admission are production code.
+host_health_is_ready() { return 0; }
+_act_native_writable_paths_ready() { return 0; }
+"$@"
+'''
+    def run(label, *args):
+        result = subprocess.run(['bash', '-c', program, '_', str(modules), str(module), *args],
+            env=env, text=True, capture_output=True, timeout=45)
+        (root.parent / (label + '.stdout')).write_text(result.stdout)
+        (root.parent / (label + '.stderr')).write_text(result.stderr)
+        return result
+    result = run('ordinary-sync', 'act_sync_sources', 'tool', '--stage-ordinary')
+    check('ordinary staging transports real nested child repositories', result.returncode == 0)
+    if result.returncode:
+        return
+    receipt = json.loads(result.stdout)
+    stage = Path(receipt['source_roots']['fixture'])
+    expected = {'source/vendor/library': child_sha, 'source/vendor/library/nested/leaf': leaf_sha}
+    check('source-sync receipt binds each child context separately from sibling dependencies',
+          receipt.get('sibling_git_contexts') == {} and
+          {name: context['git_sha'] for name, context in receipt.get('submodule_git_contexts', {}).items()} == expected)
+    check('native synchronization retains the original path-independent graph for every target receipt',
+          receipt.get('source_materialization') == identity and
+          receipt['hosts'][0].get('source_materialization') == identity)
+    check('native staged root and children retain exact pinned Git identities and clean source bytes',
+          git(stage, 'rev-parse', 'HEAD') == sha and not git(stage, 'status', '--porcelain') and
+          git(stage / 'vendor/library', 'rev-parse', 'HEAD') == child_sha and
+          git(stage / 'vendor/library/nested/leaf', 'rev-parse', 'HEAD') == leaf_sha and
+          (stage / 'vendor/library/nested/leaf/source.txt').read_text() == 'leaf release\n')
+    tasks = json.dumps([dict(platform='linux/amd64', method='native')])
+    result = run('admit-sync', '_act_validate_source_sync_receipt', json.dumps(receipt), tasks)
+    check('actual native admission accepts the complete recursive transport receipt', result.returncode == 0)
+    for mode in ('changed-pin', 'missing-child', 'escaped-child', 'wrong-root', 'changed-identity', 'missing-identity'):
+        damaged = json.loads(json.dumps(receipt))
+        if mode == 'changed-pin':
+            damaged['hosts'][0]['submodule_git_contexts']['source/vendor/library']['git_sha'] = 'f' * 40
+        elif mode == 'missing-child':
+            damaged['hosts'][0]['submodule_git_contexts'].pop('source/vendor/library')
+        elif mode == 'wrong-root':
+            damaged['hosts'][0]['submodule_git_contexts']['source/vendor/library']['source_root'] = str(stage.parent / 'other')
+        elif mode == 'changed-identity':
+            for document in (damaged, damaged['hosts'][0]):
+                document['source_materialization']['submodules'][0]['git_sha'] = 'f' * 40
+        elif mode == 'missing-identity':
+            damaged['hosts'][0].pop('source_materialization')
+        else:
+            for document in (damaged, damaged['hosts'][0]):
+                document['submodule_git_contexts']['source/../outside'] = document['submodule_git_contexts'].pop('source/vendor/library')
+        check(mode + ': actual native admission refuses altered child context evidence',
+              run('admit-' + mode, '_act_validate_source_sync_receipt', json.dumps(damaged), tasks).returncode != 0)
+
+for layout in ('self-contained', 'absorbed'):
+    root, sha, child, child_sha, leaf, leaf_sha = fixture(layout, layout == 'absorbed')
+    for source in (root, child, leaf):
+        (source / 'source.txt').write_text('later committed work\n')
+        git(source, 'add', 'source.txt')
+        git(source, 'commit', '-qm', 'later work')
+        (source / 'source.txt').write_text('staged developer work\n')
+        git(source, 'add', 'source.txt')
+        (source / 'source.txt').write_text('unstaged developer work\n')
+        (source / 'private.txt').write_text('untracked developer work\n')
+        git(source, 'config', 'credential.helper', '!must-not-copy-credentials')
+    before = capture(root)
+    private = root.parent / 'private'
+    result = call(root, 'materialize', 'git_ops_materialize_source', root, sha, private, 'v1.2.3', 'owner/tool')
+    check(layout + ': pinned root and nested children materialize from Git objects', result.returncode == 0)
+    check(layout + ': every original object, ref, index, configuration and working byte remains unchanged', capture(root) == before)
+    if result.returncode != 0:
+        continue
+    receipt = json.loads(result.stdout)
+    check(layout + ': receipt records both parent-selected child commits',
+          {(row['path'], row['git_sha']) for row in receipt.get('submodules', [])} ==
+          {('vendor/library', child_sha), ('vendor/library/nested/leaf', leaf_sha)})
+    for relative, pin, content in (('', sha, 'root release\n'), ('vendor/library', child_sha, 'library release\n'),
+                                   ('vendor/library/nested/leaf', leaf_sha, 'leaf release\n')):
+        selected = private / relative
+        check(layout + ': independent pinned checkout ' + (relative or 'root'),
+              (selected / '.git').is_dir() and not (selected / '.git').is_symlink()
+              and git(selected, 'rev-parse', 'HEAD') == pin
+              and (selected / 'source.txt').read_text() == content
+              and not (selected / 'private.txt').exists()
+              and 'must-not-copy-credentials' not in (selected / '.git/config').read_text())
+    for name, selected, pin in (('plain', private / 'vendor/library/nested/leaf', leaf_sha),
+                                ('recursive', private, sha)):
+        check(layout + ': exported verification works in a fresh Bash child for ' + name + ' source',
+              call(root, 'verify-exported-' + name, 'bash', '-c',
+                   'set -uo pipefail; git_ops_verify_materialized_source "$@"',
+                   '_', selected, pin).returncode == 0)
+    if layout == 'absorbed':
+        transport(root, private, sha, child_sha, leaf_sha, receipt)
+    root.rename(root.parent / 'developer-unavailable')
+    check(layout + ': recursive verification remains usable without the developer checkout',
+          call(root, 'verify-independent', 'git_ops_verify_materialized_source', private, sha, 'v1.2.3').returncode == 0)
+    original = private / 'vendor/library/nested/leaf/source.txt'
+    info = original.stat()
+    original.write_text('evil release\n')
+    os.utime(original, ns=(info.st_atime_ns, info.st_mtime_ns))
+    git(private, 'config', 'submodule.vendor/library.ignore', 'all')
+    git(private / 'vendor/library', 'config', 'submodule.nested/leaf.ignore', 'all')
+    git(private / 'vendor/library/nested/leaf', 'update-index', '--assume-unchanged', 'source.txt')
+    check(layout + ': recursive boundary refuses hidden child byte drift despite ignored parent status',
+          call(root, 'verify-tampered', 'git_ops_verify_materialized_source', private, sha, 'v1.2.3').returncode == 4)
+
+for mode in ('missing-child', 'external-admin', 'alternates', 'linked-objects', 'wrong-object-type'):
+    root, sha, child, child_sha, leaf, leaf_sha = fixture(mode)
+    if mode == 'missing-child':
+        leaf.rename(root.parent / 'missing-leaf')
+    elif mode == 'external-admin':
+        outside = root.parent / 'outside.git'
+        (leaf / '.git').rename(outside)
+        (leaf / '.git').write_text('gitdir: ' + str(outside) + '\n')
+    elif mode == 'alternates':
+        (leaf / '.git/objects/info/alternates').write_text(str(child / '.git/objects') + '\n')
+    elif mode == 'linked-objects':
+        outside = root.parent / 'objects'
+        (leaf / '.git/objects').rename(outside)
+        (leaf / '.git/objects').symlink_to(outside, target_is_directory=True)
+    else:
+        oid = git(child, 'rev-parse', 'HEAD:source.txt')
+        git(root, 'update-index', '--cacheinfo', '160000,' + oid + ',vendor/library')
+        git(root, 'commit', '-qm', 'invalid child type')
+        sha = git(root, 'rev-parse', 'HEAD')
+    before = capture(root)
+    result = call(root, mode, 'git_ops_materialize_source', root, sha, root.parent / 'private')
+    check(mode + ': refuses unusable child custody without changing the source',
+          result.returncode == 4 and capture(root) == before)
+
+root, sha, child, child_sha, leaf, leaf_sha = fixture('child-identity')
+private = root.parent / 'private'
+result = call(root, 'materialize', 'git_ops_materialize_source', root, sha, private)
+if result.returncode == 0:
+    selected = private / 'vendor/library/nested/leaf'
+    git(selected, 'commit', '--allow-empty', '-qm', 'same bytes but another commit')
+    git(private, 'config', 'submodule.vendor/library.ignore', 'all')
+    git(private / 'vendor/library', 'config', 'submodule.nested/leaf.ignore', 'all')
+    check('child HEAD cannot change even when its tree and visible parent status are unchanged',
+          call(root, 'verify-head', 'git_ops_verify_materialized_source', private, sha).returncode == 4)
+else:
+    check('child identity fixture materializes', False)
+
+print('Isolated submodules: checks=%d failures=%d' % (checks, failures), flush=True)
+sys.exit(bool(failures))
+PY
+}
+
+if [[ "${1:-}" == --materialized-source-tests ]]; then
+  test_materialized_submodules
+  exit $?
+fi
+
 # Test state
 TEMP_DIR=""
 TEST_REPO=""
@@ -420,6 +669,9 @@ main() {
   run_test "validate_for_build_missing_tag" test_validate_for_build_missing_tag
   run_test "validate_for_build_dirty" test_validate_for_build_dirty
   run_test "validate_for_build_allow_dirty" test_validate_for_build_allow_dirty
+
+  echo ""
+  run_test "materialized_submodules" test_materialized_submodules
 
   teardown
 

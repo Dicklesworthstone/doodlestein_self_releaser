@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_act_runner.sh - Unit tests for act_runner.sh module
 #
-# Usage: ./test_act_runner.sh [--workflow-isolation-only | --worker-admission-cancel-only | --typed-companions-only | --shared-matrix-only]
+# Usage: ./test_act_runner.sh [--workflow-isolation-only | --worker-admission-cancel-only | --typed-companions-only | --shared-matrix-only | --workflow-variants-only]
 #
 # Tests act integration functions without actually running Docker
 
@@ -1567,6 +1567,252 @@ def shared_matrix(config, workflow="matrix.yml"):
                                    env_file=str(root / "release env/build vars.env"),
                                    linux_arm64_flags=["--container-options '--label=release lane'"])
 
+def variant_companions():
+    def variant_triple(arch, libc):
+        return triples[arch].rsplit("-", 1)[0] + "-" + libc
+
+    def variant_name(arch, libc, alias=False):
+        return "typedact-" + ("" if alias else "1.0.0-") + variant_triple(arch, libc) + ".tar.gz"
+
+    # Distinct inert ELF payloads exercise the production archive/machine
+    # validators. They are not compiler or libc-execution qualification.
+    for arch in arches:
+        with tarfile.open(fixtures / primary(arch), "r:gz") as archive:
+            header = archive.extractfile("typedact").read()
+        for libc in ("gnu", "musl"):
+            name = variant_name(arch, libc)
+            data = header + ("owned variant " + libc + "\n").encode()
+            with tarfile.open(fixtures / name, "w:gz") as archive:
+                member = tarfile.TarInfo("typedact")
+                member.size, member.mode, member.mtime = len(data), 0o755, 0
+                archive.addfile(member, io.BytesIO(data))
+            (fixtures / (name + ".sha256")).write_text(digest(fixtures / name) + "  " + name + "\n")
+
+    def configure(config):
+        shared_matrix(config)
+        config["target_triples"] = {"linux/" + a: [variant_triple(a, libc) for libc in ("gnu", "musl")] for a in arches}
+        config["artifact_naming"] = "${name}-${version}-${target_triple}"
+        config["install_script_compat"] = "${name}-${target_triple}"
+
+    def variant_case(label, mode="valid", change=None):
+        def changed(config):
+            configure(config)
+            if change:
+                change(config)
+        case = make_case("variants-" + label, change=changed)
+        uploads = json.loads((case / "uploads.json").read_text())
+        for arch in arches:
+            members = []
+            for libc in ("gnu", "musl"):
+                name, alias = variant_name(arch, libc), variant_name(arch, libc, True)
+                members.extend([dict(name="dist/" + name, source=str(fixtures / name)),
+                                dict(name="dist/" + alias, source=str(fixtures / name)),
+                                dict(name="dist/" + name + ".sha256", source=str(fixtures / (name + ".sha256")))])
+            if mode == "no-aliases":
+                members = [r for r in members if Path(r["name"]).name not in
+                           (variant_name(arch, "gnu", True), variant_name(arch, "musl", True))]
+            elif mode == "missing-musl":
+                members = [r for r in members if "musl" not in r["name"]]
+            elif mode == "swapped-alias":
+                members[4]["source"] = str(fixtures / variant_name(arch, "gnu"))
+            elif mode == "wrong-musl-machine":
+                members[3]["source"] = str(fixtures / variant_name("arm64" if arch == "amd64" else "amd64", "musl"))
+            elif mode == "wrong-musl-checksum":
+                members[5]["source"] = str(fixtures / (variant_name(arch, "gnu") + ".sha256"))
+            elif mode == "unknown-variant":
+                members.append(dict(name="typedact-1.0.0-unknown-triple.tar.gz", source=str(fixtures / variant_name(arch, "gnu"))))
+            uploads[arch][0]["members"] = members
+        save(case / "uploads.json", uploads)
+        return case
+
+    case = variant_case("complete")
+    processes = {a: launch(case, a, True) for a in arches}
+    results = {}
+    try:
+        for arch, process in processes.items():
+            status, result = finish(case, arch, process)
+            require(arch + ": one owned matrix cell collects both configured variants and companions",
+                    status == 0 and result.get("status") == "success")
+            results[arch] = result
+            payload = Path(result["workflow_payload_dir"])
+            plan = result["workflow_payload_plan"]
+            check(arch + ": primary families and individual outputs bind every declared triple",
+                  [r["target_triple"] for r in plan.get("primaries", [])] ==
+                  [variant_triple(arch, libc) for libc in ("gnu", "musl")] and
+                  all(plan["outputs"][variant_name(arch, libc, alias)]["target_triple"] == variant_triple(arch, libc)
+                      for libc in ("gnu", "musl") for alias in (False, True)))
+            check(arch + ": every primary, alias and sidecar retains exact producer bytes",
+                  all((payload / variant_name(arch, libc, alias)).read_bytes() ==
+                      (fixtures / variant_name(arch, libc)).read_bytes()
+                      for libc in ("gnu", "musl") for alias in (False, True)) and
+                  all((payload / (variant_name(arch, libc) + ".sha256")).read_bytes() ==
+                      (fixtures / (variant_name(arch, libc) + ".sha256")).read_bytes() for libc in ("gnu", "musl")))
+            check(arch + ": shared JSON and final ZIP companions are collected once",
+                  {Path(r["path"]).name for r in result["additional_artifacts"]} == {metadata(arch), runtime(arch)} and
+                  len(result["additional_artifacts"]) == 2 and len(result["artifact_paths"]) == 6)
+            check(arch + ": complete variant inventories remain reusable", reusable(case, result))
+    finally:
+        for process in processes.values():
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.communicate(timeout=10)
+    output = manifest(case, list(results.values()), "complete")
+    require("variant manifest is admitted", output is not None)
+    records = json.loads(output.read_text())["artifacts"]
+    expected = {variant_name(a, libc, alias): ("linux/" + a, variant_triple(a, libc), digest(fixtures / variant_name(a, libc)))
+                for a in arches for libc in ("gnu", "musl") for alias in (False, True)}
+    expected.update({name: ("linux/" + a, triples[a], digest(fixtures / name))
+                     for a in arches for name in (metadata(a), runtime(a))})
+    check("manifest retains exact variant identity and digest for all primaries, aliases and platform companions",
+          len(records) == len(expected) and
+          {r["name"]: (r["target"], r["target_triple"], r["sha256"]) for r in records} == expected)
+    proof = subprocess.run(["bash", "-c", 'source "$1/slsa.sh"; _slsa_manifest_statement "$2" owner/typedact dsr:typed-variant-fixture',
+                            "_", str(module.parent), str(output)], env=environment(case), capture_output=True, timeout=20)
+    (case / "statement.json").write_bytes(proof.stdout)
+    (case / "statement.stderr").write_bytes(proof.stderr)
+    check("SLSA binds every variant and shared companion to its retained digest",
+          proof.returncode == 0 and
+          {r["name"]: r["digest"]["sha256"] for r in json.loads(proof.stdout)["subject"]} ==
+          {name: value[2] for name, value in expected.items()})
+
+    changed = json.loads((case / "config/repos.d/typedact.yaml").read_text())
+    original_config = copy.deepcopy(changed)
+    changed["target_triples"]["linux/amd64"].reverse()
+    save(case / "config/repos.d/typedact.yaml", changed)
+    manifest(case, list(results.values()), "changed-variant-order", 4)
+    save(case / "config/repos.d/typedact.yaml", original_config)
+    forged = copy.deepcopy(results["amd64"])
+    forged["workflow_payload_plan"]["outputs"][variant_name("amd64", "musl")]["target_triple"] = triples["amd64"]
+    manifest(case, [forged], "forged-variant-binding", 4)
+    selected = Path(results["amd64"]["workflow_payload_dir"]) / variant_name("amd64", "musl")
+    held = case / "original-musl-primary.tar.gz"
+    selected.rename(held)
+    selected.write_bytes(held.read_bytes())
+    try:
+        check("same-byte replacement of a secondary variant invalidates the frozen inventory", not reusable(case, results["amd64"]))
+        manifest(case, list(results.values()), "replaced-musl-primary", 4)
+    finally:
+        selected.rename(case / "replacement-musl-primary.tar.gz")
+        held.rename(selected)
+    check("restoring the exact secondary variant identity restores reuse", reusable(case, results["amd64"]))
+
+    def dedicated_job(config):
+        config["targets"] = ["linux/amd64"]
+        config["workflow"] = "workflow.yml"
+        config["act_job_map"] = {"linux/amd64": "build-amd64"}
+        config["act_matrix"] = {}
+        config["target_triples"].pop("linux/arm64")
+        config["workspace_additional_artifacts"].pop("linux/arm64")
+
+    optional = variant_case("optional-aliases", "no-aliases", dedicated_job)
+    status, result = finish(optional, "amd64", launch(optional))
+    require("a dedicated non-matrix job retains both required variants while omitting optional aliases",
+            status == 0 and len(result.get("artifact_paths", [])) == 4 and
+            result["workflow_payload_plan"]["matrix"] is None and result["job"] == "build-amd64")
+    # Reuse the actual immutable worker output at the orchestration boundary.
+    # The production build command performs collection, manifests, packaging,
+    # installer aliases, checksums and durable build-state completion.
+    manifest(optional, [result], "before-packaging")
+    build = r'''set -uo pipefail
+root="$1"
+inventory="$2"
+destination="$3"
+for component in config act_runner artifact_naming packaging build_state git_ops; do
+    source "$root/src/$component.sh" || exit $?
+done
+source <(awk '/^(cmd_build|_dispatch_load_config|_dispatch_is_true|_dispatch_join_lines)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$root/dsr") || exit $?
+source <(awk '/^json_envelope\(\) \{/{copy=1} copy{print} copy && /^# ====/{exit}' "$root/dsr") || exit $?
+export JSON_MODE=true DRY_RUN=false VERBOSE=false DSR_VERSION=fixture
+log_info() { printf '%s\n' "$*" >&2; }
+log_ok() { log_info "$@"; }
+log_warn() { log_info "$@"; }
+log_error() { log_info "$@"; }
+log_debug() { :; }
+log_set_tool() { :; }
+_dsr_require() {
+    case "$1" in artifact_naming|packaging|build_state) return 0 ;; *) return 3 ;; esac
+}
+act_orchestrate_build() {
+    local tool="$1" version="$2" run result requested_run="44444444-4444-4444-8444-444444444444"
+    shift 2
+    while (($#)); do
+        case "$1" in
+            --run-id|--resume-run-id) [[ -z "$2" ]] || requested_run="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    run=$(DSR_RUN_ID="$requested_run" build_state_create "$tool" "$version" linux/amd64) || return 4
+    build_state_update_status "$tool" "$version" running "$run" || return 4
+    result=$(jq -c --arg run "$run" '.run_id=$run' "$inventory") || return 4
+    build_state_update_target "$tool" "$version" linux/amd64 completed \
+        "$(jq -c '{result:.targets[0]}' <<< "$result")" "$run" || return 4
+    printf '%s\n' "$result"
+}
+cmd_build typedact --version v1.0.0 --target linux/amd64 --no-sync --output-dir "$destination"
+'''
+    destination = optional / "release-output"
+    completed = subprocess.run(["bash", "-c", build, "_", str(module.parent.parent),
+                                str(optional / "before-packaging-inventory.json"), str(destination)],
+                               env=environment(optional), capture_output=True, timeout=45)
+    (optional / "build.stdout").write_bytes(completed.stdout)
+    (optional / "build.stderr").write_bytes(completed.stderr)
+    final_manifest = destination / "typedact-v1.0.0-manifest.json"
+    require("production build packaging completes from the frozen multi-variant worker",
+            completed.returncode == 0 and final_manifest.is_file())
+    final_records = json.loads(final_manifest.read_text())["artifacts"]
+    check("build emits both missing installer aliases with exact variant identity and original archive bytes",
+          len(final_records) == 6 and
+          {r["name"]: (r["target"], r["target_triple"], r["sha256"]) for r in final_records} ==
+          {name: value for name, value in expected.items() if value[0] == "linux/amd64"} and
+          all((destination / variant_name("amd64", libc, alias)).read_bytes() ==
+              (fixtures / variant_name("amd64", libc)).read_bytes()
+              for libc in ("gnu", "musl") for alias in (False, True)))
+    envelope = json.loads(completed.stdout)
+    state = optional / "state/builds/typedact/v1.0.0" / envelope["details"]["run_id"] / "state.json"
+    check("build retains checksum sidecars and records completed publication state",
+          envelope["status"] == "success" and json.loads(state.read_text())["status"] == "completed" and
+          all((destination / (variant_name("amd64", libc) + ".sha256")).read_bytes() ==
+              (fixtures / (variant_name("amd64", libc) + ".sha256")).read_bytes() for libc in ("gnu", "musl")))
+
+    peer = variant_case("primary-only-peer", change=lambda c: c["workspace_additional_artifacts"].pop("linux/arm64"))
+    peer_uploads = json.loads((peer / "uploads.json").read_text())
+    peer_uploads["arm64"] = peer_uploads["arm64"][:1]
+    save(peer / "uploads.json", peer_uploads)
+    status, peer_result = finish(peer, "arm64", launch(peer, "arm64"))
+    require("a selected companion-free matrix peer still owns both variant families",
+            status == 0 and len(peer_result.get("workflow_payload_plan", {}).get("primaries", [])) == 2 and
+            peer_result.get("additional_artifacts") == [] and len(peer_result.get("artifact_paths", [])) == 6)
+    manifest(peer, [peer_result], "primary-only-peer")
+
+    default = make_case("variants-default-triple", change=lambda c: c.pop("target_triples"))
+    status, default_result = finish(default, "amd64", launch(default))
+    require("an existing workflow without target_triples keeps its default primary family",
+            status == 0 and default_result.get("workflow_payload_plan", {}).get("primaries", [{}])[0].get("target_triple") == triples["amd64"])
+    manifest(default, [default_result], "default-triple")
+    for mode in ("missing-musl", "swapped-alias", "wrong-musl-machine", "wrong-musl-checksum", "unknown-variant"):
+        rejected = variant_case(mode, mode)
+        status, result = finish(rejected, "amd64", launch(rejected))
+        check(mode + ": an incomplete or contradictory variant never receives successful collection evidence",
+              status != 0 and result.get("status") not in ("success", "ok", "passed") and not result.get("resume_artifacts"))
+    for label, change in (
+        ("shared-primary-name", lambda c: c.update(artifact_naming="${name}-${version}-${os}-${arch}")),
+        ("shared-alias-name", lambda c: c.update(install_script_compat="${name}-${os}-${arch}")),
+        ("unselected-peer-collision", lambda c: c["target_triples"].update({"linux/arm64": [triples["amd64"]]})),
+        ("companion-secondary-collision", lambda c: c["workspace_additional_artifacts"]["linux/arm64"].append(
+            dict(name=variant_name("amd64", "musl"), format="tar.gz"))),
+    ):
+        rejected = variant_case(label, change=change)
+        status, result = finish(rejected, "amd64", launch(rejected))
+        check(label + ": invalid variant ownership refuses before any act subprocess",
+              status == 4 and not (rejected / "requests.jsonl").exists() and not result.get("resume_artifacts"))
+
+if sys.argv[2] in ("all", "variants"):
+    variant_companions()
+if sys.argv[2] == "variants":
+    save(root / "summary.json", dict(checks=checks, failures=failures))
+    print("Typed workflow variants: %d checks, %d failures" % (checks, len(failures)), flush=True)
+    sys.exit(bool(failures))
+
 matrix_case = make_case("shared-matrix-success", change=shared_matrix)
 matrix_processes = {a: launch(matrix_case, a, True) for a in arches}
 matrix_results = {}
@@ -2932,6 +3178,11 @@ main() {
     fi
     if [[ "${1:-}" == "--shared-matrix-only" ]]; then
         test_typed_workflow_companions matrix
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return
+    fi
+    if [[ "${1:-}" == "--workflow-variants-only" ]]; then
+        test_typed_workflow_companions variants
         [[ "$FAIL_COUNT" -eq 0 ]]
         return
     fi

@@ -123,6 +123,9 @@ qg_run_checks() {
         sibling=$(_act_release_source_dependency_checkouts_json tool | jq -r '.[0].local_path') || return 4
         printf 'mutated sibling\n' >> "$sibling/src.txt"
     fi
+    if [[ -n "${QUALITY_MUTATES_PINNED_CHILD:-}" ]]; then
+        printf 'mutated child\n' >> "${quality_source%/*}/$QUALITY_MUTATES_PINNED_CHILD"
+    fi
     return "$QUALITY_RC"
 }
 signing_is_enabled() { [[ "$SIGN_ENABLED" == true ]]; }
@@ -150,6 +153,7 @@ signing_sign_batch() {
         if [[ "$SIGN_MODE" == mutate ]]; then printf 'mutated\n' >> "$1"; fi
         if [[ "$SIGN_MODE" == manifest ]]; then printf '\n' >> "$OUT/tool-v1.2.3-manifest.json"; fi
         if [[ "$SIGN_MODE" == source ]]; then printf 'mutated by signer\n' >> "$(act_get_local_path tool)/src.txt"; fi
+        if [[ "$SIGN_MODE" == submodule ]]; then printf 'mutated by signer\n' >> "$(act_get_local_path tool)/vendor/library/src.txt"; fi
         if [[ "$SIGN_MODE" == tag ]]; then git -C "$(act_get_local_path tool)" tag -f v1.2.3 "$OTHER_SHA" >/dev/null; fi
     fi
     return "$SIGN_RC"
@@ -198,6 +202,16 @@ cmd_build() {
         contexts=$(mktemp -d "$CASE/contexts.XXXXXXXX") || return 4
         _act_export_ordinary_git_contexts "$ACT_REPOS_DIR/tool.yaml" "$source" "$contexts" \
             > "$CASE/build-contexts.json" || return 4
+        if [[ "${_ACT_ISOLATED_SOURCE_IDENTITY:-null}" != null ]]; then
+            local sync tasks
+            # Exercise the real act-only synchronization and per-target
+            # receipt producers. The fixture compiler remains the boundary.
+            sync=$(act_sync_sources tool --stage-ordinary -- linux/amd64 darwin/arm64) || return 4
+            tasks='[{"platform":"linux/amd64","method":"act"},{"platform":"darwin/arm64","method":"act"}]'
+            sync=$(_act_validate_source_sync_receipt "$sync" "$tasks") || return 4
+            printf '%s\n' "$sync" > "$CASE/build-source-sync.json"
+            _act_target_source_sync_json "$sync" act > "$CASE/build-target-source-sync.json" || return 4
+        fi
     fi
     local out="" arg
     while (($#)); do
@@ -207,6 +221,15 @@ cmd_build() {
     if [[ "$CONTRACT" != null && -e "$out" ]]; then return 4; fi
     mkdir -p "$out" || return 4
     printf 'daemon bytes\n' > "$out/daemon"
+    if [[ -n "${BUILD_FROM_PINNED_CHILD:-}" ]]; then
+        local selected_source selected_child
+        selected_source=$(act_get_local_path tool) || return 4
+        selected_child="${selected_source%/*}/$BUILD_FROM_PINNED_CHILD"
+        # A shell fixture build embeds actual selected Git metadata and source
+        # bytes in its artifact. It does not claim native compiler execution.
+        git -C "$selected_child" rev-parse HEAD > "$out/daemon" || return 4
+        cat "$selected_child/src.txt" >> "$out/daemon" || return 4
+    fi
     printf 'worker bytes\n' > "$out/worker"
     mkdir -p "$out/diagnostics" || return 4
     printf 'unrelated\n' > "$out/diagnostics/tool-obsolete"
@@ -248,6 +271,11 @@ cmd_build() {
             ;;
     esac
     if [[ "$BUILD_MUTATES_SOURCE" == true ]]; then printf 'mutated by build\n' >> "$(act_get_local_path tool)/src.txt"; fi
+    if [[ -n "${BUILD_MUTATES_PINNED_CHILD:-}" ]]; then
+        local private_source
+        private_source=$(act_get_local_path tool) || return 4
+        printf 'mutated by build\n' >> "${private_source%/*}/$BUILD_MUTATES_PINNED_CHILD"
+    fi
     printf '{"child":"build"}\n'
     if [[ "$SIGNAL_PHASE" == build ]]; then kill -TERM "$BASHPID"; fi
     return "$BUILD_RC"
@@ -266,6 +294,8 @@ setup() {
     export SIGNING_PRIVATE_KEY="$CASE/keys/minisign.key" SIGNING_PUBLIC_KEY="$CASE/keys/minisign.pub"
     SIGN_MODE=valid SCAN_RC=0 RELEASE_EXISTS=false QUALITY_MUTATES_SOURCE=false BUILD_MUTATES_SOURCE=false
     QUALITY_MUTATES_SIBLING=false
+    QUALITY_MUTATES_PINNED_CHILD='' BUILD_MUTATES_PINNED_CHILD=''
+    BUILD_FROM_PINNED_CHILD=''
     OTHER_SHA="" REMOTE_TAG_MODE=valid RELEASE_RESULT_MODE=public
     RUN=11111111-1111-4111-8111-111111111111 SOURCE_SHA=0000000000000000000000000000000000000000
     TARGETS='linux/amd64 darwin/arm64'
@@ -1020,6 +1050,129 @@ test_isolated_source_pinned_siblings() {
             "$CASE/build-contexts.json" >/dev/null
 }
 
+test_isolated_source_submodules() {
+    local mode="$1" parent child pin snapshot expected=0 selected index_before source_before parent_index
+    setup "isolated-submodules-${2:-$mode}"; isolated_fixture || return 1
+    parent="$CASE/source"
+    if [[ "$mode" == sibling ]]; then
+        parent="$CASE/dependency"
+        mkdir "$parent"
+        git -C "$parent" init -q -b main || return 1
+        printf 'sibling root\n' > "$parent/src.txt"
+    fi
+    child="$parent/vendor/library"
+    mkdir -p "$child"
+    git -C "$child" init -q -b main || return 1
+    printf 'pinned child source\n' > "$child/src.txt"
+    if [[ "$mode" == absolute ]]; then
+        printf '[dependencies]\nlocal = { path = "%s" }\n' "$CASE/source" > "$child/Cargo.toml"
+    fi
+    git -C "$child" add . || return 1
+    git -C "$child" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm child || return 1
+    pin=$(git -C "$child" rev-parse HEAD) || return 1
+    printf '[submodule "vendor/library"]\n\tpath = vendor/library\n\turl = https://must-not-fetch.invalid/library.git\n' > "$parent/.gitmodules"
+    git -C "$parent" add src.txt .gitmodules || return 1
+    git -C "$parent" update-index --add --cacheinfo "160000,$pin,vendor/library" || return 1
+    git -C "$parent" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm parent || return 1
+    if [[ "$mode" == sibling ]]; then
+        jq --arg path "$parent" --arg revision "$(git -C "$parent" rev-parse HEAD)" \
+            '.sibling_crates=[{relative_path:"dependency",local_path:$path,revision:$revision}]' \
+            "$ACT_REPOS_DIR/tool.yaml" > "$CASE/submodule-config.json" || return 1
+        mv "$CASE/submodule-config.json" "$ACT_REPOS_DIR/tool.yaml"
+    else
+        SOURCE_SHA=$(git -C "$parent" rev-parse HEAD) || return 1
+        git -C "$parent" -c user.name=Fixture -c user.email=fixture@example.invalid tag -fam release v1.2.3 >/dev/null || return 1
+    fi
+    printf 'staged child developer work\n' > "$child/src.txt"
+    git -C "$child" add src.txt || return 1
+    printf 'unstaged child developer work\n' > "$child/src.txt"
+    printf 'private child work\n' > "$child/untracked.txt"
+    index_before=$(_release_sha256 "$child/.git/index") || return 1
+    parent_index=$(_release_sha256 "$parent/.git/index") || return 1
+    source_before=$(_release_sha256 "$child/src.txt") || return 1
+    BUILD_FROM_PINNED_CHILD='source/vendor/library'
+    [[ "$mode" != sibling ]] || BUILD_FROM_PINNED_CHILD='dependency/vendor/library'
+    case "$mode" in
+        absolute) expected=4 ;;
+        quality) QUALITY_MUTATES_PINNED_CHILD='source/vendor/library/src.txt'; expected=4 ;;
+        build) BUILD_MUTATES_PINNED_CHILD='source/vendor/library/src.txt'; expected=6 ;;
+        signing) SIGN_MODE=submodule; expected=6 ;;
+    esac
+    run_fallback --expected-sha "$SOURCE_SHA" --isolate-source
+    [[ "$RC" == "$expected" ]] && one_result || return 1
+    [[ "$(_release_sha256 "$child/.git/index")" == "$index_before" &&
+       "$(_release_sha256 "$parent/.git/index")" == "$parent_index" &&
+       "$(_release_sha256 "$child/src.txt")" == "$source_before" &&
+       "$(cat "$child/untracked.txt")" == 'private child work' ]] || return 1
+    if [[ "$expected" != 0 ]]; then
+        ! grep -q '^RELEASE ' "$CALLS" || return 1
+        [[ "$mode" != absolute ]] || ! grep -q '^CHECK\|^BUILD ' "$CALLS"
+        return $?
+    fi
+    snapshot=$(jq -r '.details.source_materialization.source_root' "$CASE/stdout") || return 1
+    selected="$snapshot/vendor/library"
+    [[ "$mode" != sibling ]] || selected="${snapshot%/*}/dependency/vendor/library"
+    [[ "$(git -C "$selected" rev-parse HEAD)" == "$pin" &&
+       "$(cat "$selected/src.txt")" == 'pinned child source' && ! -e "$selected/untracked.txt" ]] || return 1
+    [[ "$(cat "$OUT/daemon")" == "$pin"$'\n''pinned child source' ]] || return 1
+    if [[ "$mode" == sibling ]]; then
+        jq -e --arg pin "$pin" 'any(.details.source_materialization.dependencies[].submodules[];
+            .path == "vendor/library" and .git_sha == $pin)' "$CASE/stdout" >/dev/null || return 1
+    fi
+    jq -e --arg pin "$pin" 'any(.[]; .submodule == true and .context.git_sha == $pin)' \
+        "$CASE/build-contexts.json" >/dev/null || return 1
+    grep -Fqx "RELEASE_SOURCE $snapshot" "$CALLS"
+}
+
+test_isolated_source_submodule_resume() {
+    local mode="$1" fixture_mode=root before
+    [[ "$mode" != sibling ]] || fixture_mode=sibling
+    test_isolated_source_submodules "$fixture_mode" "resume-$mode" || return 1
+    before=$(jq -r '.details.source_materialization.source_root' "$CASE/stdout") || return 1
+    checkpoint completed
+    jq --slurpfile sync "$CASE/build-source-sync.json" --slurpfile target "$CASE/build-target-source-sync.json" '
+        .context.source_sync=$sync[0] |
+        .source_sync_history=[{receipt:$sync[0]}] |
+        .target_statuses={"linux/amd64":{status:"completed",result:{status:"success",method:"act",source_sync:$target[0]}},
+                          "darwin/arm64":{status:"completed",result:{status:"success",method:"act",source_sync:$target[0]}}}
+    ' "$CASE/checkpoint.json" > "$CASE/graph-checkpoint.json" || return 1
+    mv "$CASE/graph-checkpoint.json" "$CASE/checkpoint.json"
+    local filter='.'
+    case "$mode" in
+        partial) filter='.status="partial" | .target_statuses["darwin/arm64"]={status:"failed"}' ;;
+        pending) filter='.status="failed" | .target_statuses |= with_entries(.value={status:"pending"})' ;;
+        legacy) filter='del(.context.source_sync.source_materialization) | .source_sync_history[].receipt |= del(.source_materialization) | .target_statuses[].result.source_sync |= del(.source_materialization)' ;;
+        context) filter='del(.context.source_sync.source_materialization)' ;;
+        history) filter='.source_sync_history[0].receipt.source_materialization.submodules[0].git_sha=("f"*40)' ;;
+        embedded) filter='.target_statuses["linux/amd64"].result.source_sync.source_materialization.submodules[0].git_tree=("f"*40)' ;;
+        missing-target) filter='del(.target_statuses["linux/amd64"].result.source_sync)' ;;
+        sidecar)
+            jq -nc --slurpfile source "$CASE/build-target-source-sync.json" '
+                {status:"success",source_sync:$source[0]} |
+                .source_sync.source_materialization.submodules[0].git_sha=("f"*40)
+            ' > "$CASE/retained-result.json" || return 1
+            filter='.target_statuses["linux/amd64"].result_path=$path'
+            ;;
+    esac
+    jq --arg path "$CASE/retained-result.json" "$filter" "$CASE/checkpoint.json" > "$CASE/selected-checkpoint.json" || return 1
+    mv "$CASE/selected-checkpoint.json" "$CASE/checkpoint.json"
+    : > "$CALLS"
+    run_fallback --expected-sha "$SOURCE_SHA" --isolate-source "--resume=$RUN"
+    case "$mode" in
+        matching|sibling|partial|pending)
+            [[ "$RC" == 0 ]] && one_result || return 1
+            [[ "$(jq -r '.details.source_materialization.source_root' "$CASE/stdout")" != "$before" ]] || return 1
+            if [[ "$mode" == partial || "$mode" == pending ]]; then grep -q '^BUILD ' "$CALLS"
+            else ! grep -q '^BUILD ' "$CALLS"; fi
+            ;;
+        *)
+            [[ "$RC" == 4 ]] && one_result || return 1
+            jq -e '.details.phase == "resume" and (.details.error | contains("submodule graph"))' "$CASE/stdout" >/dev/null &&
+                ! grep -q '^CHECK\|^BUILD\|^RELEASE ' "$CALLS"
+            ;;
+    esac
+}
+
 test_isolated_source_drift() {
     setup "isolated-drift-$1"; isolated_fixture || return 1
     local source_before expected=6
@@ -1271,6 +1424,8 @@ for mode in missing empty short zero duplicate version; do run_test test_expecte
 for mode in flag config resume build-only; do run_test test_isolated_source_preserves_checkout "$mode"; done
 run_test test_isolated_source_retries_fresh
 for mode in pinned unpinned mutated absolute; do run_test test_isolated_source_pinned_siblings "$mode"; done
+for mode in root sibling quality build signing absolute; do run_test test_isolated_source_submodules "$mode"; done
+for mode in matching sibling partial pending legacy context history embedded missing-target sidecar; do run_test test_isolated_source_submodule_resume "$mode"; done
 for mode in quality build signing; do run_test test_isolated_source_drift "$mode"; done
 for mode in absolute quoted hidden relative; do run_test test_isolated_source_cargo_paths "$mode"; done
 for mode in matching partial variants pending changed removed history embedded sidecar missing; do run_test test_isolated_source_sibling_resume "$mode"; done
