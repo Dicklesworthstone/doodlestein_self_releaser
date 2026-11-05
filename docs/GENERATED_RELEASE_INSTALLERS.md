@@ -225,8 +225,8 @@ status and exit code remain authoritative. Without `--json`, it prints the
 engine's JSON generation receipt directly.
 
 The generator reads the existing DSR installation's `release_install.sh`,
-`slsa_remote.sh`, `slsa.sh`, `platforms.sh`, `packaging.sh`, `sbom_release.sh`, `sbom.sh`, and
-`github.sh`. It snapshots and hashes their complete source files, validates each
+`slsa_remote.sh`, `slsa.sh`, `platforms.sh`, `packaging.sh`, `sbom_release.sh`, `sbom.sh`,
+`github.sh`, `guardrails.sh`, and `secrets.sh`. It snapshots and hashes their complete source files, validates each
 recipe using that captured installation engine, checks generated Python/Bash
 syntax, and refuses input drift. All policy and engine data are base64-encoded
 JSON, not shell substitutions or executable policy text. Literal metacharacters
@@ -271,7 +271,7 @@ pipeline. The selected prefix's parent must already exist. The generated script
 selects the physical host automatically and installs all companions from its
 sole recipe or the explicit `--target-triple` choice. Its runtime options are deliberately limited to:
 
-- `--prefix DIR`, `--snapshot DIR`, `--target-triple TRIPLE`, and `--timeout SECONDS`.
+- `--prefix DIR`, `--snapshot DIR`, `--target-triple TRIPLE`, `--timeout SECONDS`, and `--download-jobs N`.
 - `--replace`, `--allow-draft`, `--dry-run`, `--inspect`, and `--help`.
 
 The default is online `--fetch` behavior from the existing engine: authenticate
@@ -281,6 +281,13 @@ There is no runtime override for repository, version, source commit, builder,
 key, target matrix, recipe contents, or build pins. Compiler selection only
 chooses among fixed embedded recipes. A failed download or signature check
 cannot fall back to unsigned binaries, a different release or source execution.
+
+For online installation, `--download-jobs N` admits up to **1..32** concurrent
+payload downloads after proof authentication and complete inventory preflight;
+the default is **1**. The captured fetch engine owns and drains every worker on
+failure or cancellation. This option changes only download scheduling, not the
+embedded policy, signed asset checks or installed generation identity. It is
+invalid with `--snapshot`.
 
 Use `--snapshot /absolute/snapshot` for offline operation. This option is exclusive
 with draft consent and never requests network access, even to repair missing

@@ -50,6 +50,13 @@ handled exits. `--timeout` also bounds the entire fetch helper, with the same
 owned-process cancellation and cleanup limits as verification/extraction. A
 failed fetch cannot alter the active generation.
 
+Add `--download-jobs N` with `--fetch` to download up to **1..32** payload assets
+at once; the default remains **1**. The shared fetch engine authenticates the
+proof and validates the entire asset inventory before starting its bounded
+worker pool. Changing this scheduling limit changes neither trust policy nor
+generation identity. The same whole-release authentication and cancellation
+rules still apply. `--download-jobs` is rejected with `--snapshot`.
+
 The result includes a `download` observation for online mode, without private
 temporary paths or credentials. `remote_current` remains `false`: an observation
 made during fetch is not a continuing promise that GitHub state has not changed.

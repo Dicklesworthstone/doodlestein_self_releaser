@@ -4,7 +4,7 @@
 _SLSA_REMOTE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 # shellcheck source=src/platforms.sh
 source "$_SLSA_REMOTE_DIR/platforms.sh" || { return 3 2>/dev/null || exit 3; }
-if ! declare -F dsr_lock_fd >/dev/null; then
+if ! declare -F dsr_lock_fd >/dev/null || ! declare -F _dsr_timeout_group >/dev/null; then
     # shellcheck source=src/guardrails.sh
     source "$_SLSA_REMOTE_DIR/guardrails.sh" || { return 3 2>/dev/null || exit 3; }
 fi
@@ -285,12 +285,171 @@ except (OSError, ValueError, TypeError, KeyError) as error:
 PY
 }
 
+# A bounded set of independently supervised transfers. The existing timeout
+# anchor owns each process group until its control channel closes and the group
+# is drained. Only this coordinator publishes completed bodies into the fetch
+# checkpoint; workers cannot race its inventory checks or expose partial files.
+_slr_parallel_payloads() (
+    local repo="$1" inventory="$2" rows="$3" work="$4" cache="$5" jobs="$6" proof="$7"
+    local row name asset hash body pool="$4/transfers" reused=0 downloaded=0
+    local next=0 active=0 index pid descriptor input_fd output_fd message status running ready
+    local cancelled=false launch_pending=false
+    local -a names=() assets=() hashes=() pids=() readers=() writers=()
+    command -v mkfifo >/dev/null && command -v sleep >/dev/null || return 3
+    [[ "${SBOM_REMOTE_TIMEOUT:-900}" =~ ^[1-9][0-9]{0,4}$ ]] || return 4
+    mkdir "$pool" || return 1
+
+    _slr_pool_drain() {
+        local slot fd
+        # Close every lifetime channel before waiting: all owned groups begin
+        # cancellation together, rather than one grace period per transfer.
+        for slot in "${!writers[@]}"; do
+            fd=${writers[$slot]}
+            eval "exec ${fd}>&-"
+            unset 'writers[slot]'
+        done
+        for slot in "${!pids[@]}"; do
+            wait "${pids[$slot]}" 2>/dev/null || true
+            unset 'pids[slot]'
+        done
+        for slot in "${!readers[@]}"; do
+            fd=${readers[$slot]}
+            eval "exec ${fd}<&-"
+            unset 'readers[slot]'
+        done
+    }
+    _slr_pool_cancel() {
+        cancelled=true
+        # Do not lose ownership in the fork-to-$! assignment window.
+        $launch_pending || exit 5
+    }
+    _slr_pool_fd() {
+        local candidate
+        for ((candidate=10; candidate<256; candidate++)); do
+            if { : <&"$candidate"; } 2>/dev/null; then continue; fi
+            eval "exec ${candidate}<>/dev/null" || return 1
+            descriptor=$candidate
+            return 0
+        done
+        _slsa_log 'No file descriptor available for parallel release acquisition'
+        return 3
+    }
+    _slr_pool_transport() {
+        # This function exists only in the pool's fork. Its caller must be the
+        # command inside the selected live timeout anchor, not an environment
+        # request to omit supervision. Avoid _sbr_run's separate nested groups:
+        # the outer anchor already owns this whole download and its deadline.
+        [[ "${_slr_transfer_anchor:-}" =~ ^[1-9][0-9]*$ &&
+           "${group_pid:-}" == "$_slr_transfer_anchor" && "$BASHPID" != "$group_pid" ]] || return 4
+        local transport_status=0
+        "$@" || transport_status=$?
+        ((transport_status < 128)) || transport_status=5
+        return "$transport_status"
+    }
+    trap '_slr_pool_drain' EXIT
+    trap '_slr_pool_cancel' HUP INT TERM PIPE
+    # Scope job control to this subshell. Each background anchor has a distinct
+    # group; its helper turns job control off for the command it supervises.
+    set -m
+
+    while IFS= read -r row; do
+        name=$(jq -r .name <<< "$row") || return 1
+        if [[ -n "$cache" && -e "$cache/artifacts/$name" ]]; then
+            ln -- "$cache/artifacts/$name" "$work/payloads/$name" || return 1
+            reused=$((reused+1))
+            continue
+        fi
+        asset=$(_sbr_named_asset "$inventory" "$name") || return $?
+        hash=$(jq -r .sha256 <<< "$row") || return 1
+        names+=("$name"); assets+=("$asset"); hashes+=("$hash")
+    done <<< "$rows"
+
+    while ((next < ${#names[@]} || active > 0)); do
+        while ((next < ${#names[@]} && active < jobs)); do
+            index=$next
+            mkfifo "$pool/$index.control" "$pool/$index.result" || return 1
+            _slr_pool_fd || return $?; writers[$index]=$descriptor
+            eval "exec ${descriptor}<>\"\$pool/\$index.control\"" || return 1
+            _slr_pool_fd || return $?; readers[$index]=$descriptor
+            eval "exec ${descriptor}<>\"\$pool/\$index.result\"" || return 1
+            _slr_pool_fd || return $?; input_fd=$descriptor
+            eval "exec ${input_fd}</dev/null" || return 1
+            _slr_pool_fd || return $?; output_fd=$descriptor
+            eval "exec ${output_fd}>\"\$pool/\$index.body\"" || return 1
+            launch_pending=true
+            (
+                local _slr_transfer_anchor=$BASHPID
+                # The anchor keeps only directional FIFO ends on stdin/stdout.
+                # No worker may retain another worker's lifetime write end.
+                for descriptor in "${writers[@]}" "${readers[@]}"; do
+                    eval "exec ${descriptor}>&-"
+                done
+                _dsr_timeout_group "$input_fd" "$output_fd" '' "${SBOM_REMOTE_TIMEOUT:-900}" \
+                    _sbr_download "$repo" "${assets[$index]}" "${hashes[$index]}" "$work" false _slr_pool_transport
+            ) < "$pool/$index.control" > "$pool/$index.result" &
+            pids[$index]=$!
+            launch_pending=false
+            eval "exec ${input_fd}<&- ${output_fd}>&-"
+            $cancelled && return 5
+            printf 'start\n' >&"${writers[$index]}" || return 1
+            next=$((next+1)); active=$((active+1))
+        done
+
+        ready=false
+        running=$(jobs -pr)
+        for index in "${!pids[@]}"; do
+            message=''
+            if IFS= read -r -t 0 -u "${readers[$index]}"; then
+                IFS= read -r -u "${readers[$index]}" message || return 7
+                [[ "$message" =~ ^exit:([0-9]{1,3})$ ]] || return 7
+                status=$((10#${BASH_REMATCH[1]}))
+                ((status <= 255)) || return 7
+            else
+                # An anchor that exits without its completion message never
+                # authorizes an artifact, even if a body file happens to exist.
+                pid=${pids[$index]}
+                case $'\n'"$running"$'\n' in *$'\n'"$pid"$'\n'*) continue ;; esac
+                _slsa_log 'Parallel release transfer ended without a completion result'
+                return 7
+            fi
+            ready=true
+            descriptor=${writers[$index]}
+            eval "exec ${descriptor}>&-"
+            unset 'writers[index]'
+            wait "${pids[$index]}" 2>/dev/null || true
+            unset 'pids[index]'
+            descriptor=${readers[$index]}
+            eval "exec ${descriptor}<&-"
+            unset 'readers[index]'
+            active=$((active-1))
+            if ((status != 0)); then
+                ((status != 124 && status < 128)) || status=5
+                return "$status"
+            fi
+            body=$(cat "$pool/$index.body") || return 7
+            [[ "$body" == "$work/"* && "$body" != *$'\n'* && -f "$body" && ! -L "$body" ]] || return 7
+            name=${names[$index]}
+            if [[ -n "$cache" ]]; then
+                _slr_fetch_checkpoint commit "$cache" "$work/fetch-selection.json" "$proof" "$body" "$name" || return $?
+                body="$cache/artifacts/$name"
+            fi
+            ln -- "$body" "$work/payloads/$name" || return 1
+            downloaded=$((downloaded+1))
+        done
+        # Completion channels avoid ordered waits: a slow first asset cannot
+        # prevent another completed payload from being retained or its slot reused.
+        $ready || sleep 0.02
+    done
+    jq -cn --argjson reused "$reused" --argjson downloaded "$downloaded" \
+        '{reused_payloads:$reused,downloaded_payloads:$downloaded}' > "$work/acquisition.json"
+)
+
 # Always hash downloaded payload bytes, even when GitHub advertises a digest.
 # The API digest remains a consistency check; a mismatch never downgrades to
 # trusting a different read. No candidate executable is run.
 _slr_payloads() {
     local repo="$1" inventory="$2" proof="$3" work="$4" names actual rows row name asset hash body
-    local cache="${5:-}" reused=0 downloaded=0
+    local cache="${5:-}" jobs="${6:-1}" reused=0 downloaded=0
     names=$(jq -c '[.subject[].name]|sort' "$proof") || return 7
     actual=$(_sbr_payload_names "$inventory") || return $?
     # The SBOM scanner deliberately excludes LICENSE/text/JSON metadata.
@@ -323,6 +482,10 @@ _slr_payloads() {
         # A corrupt cache is evidence to inspect, never a repair instruction.
         _slr_fetch_checkpoint prepare "$cache" "$work/fetch-selection.json" "$proof" || return $?
     fi
+    if ((jobs > 1)); then
+        _slr_parallel_payloads "$repo" "$inventory" "$rows" "$work" "$cache" "$jobs" "$proof"
+        return $?
+    fi
     while IFS= read -r row; do
         name=$(jq -r .name <<< "$row") || return 1
         hash=$(jq -r .sha256 <<< "$row") || return 1
@@ -349,7 +512,7 @@ _slr_payloads() {
 _slr_verify_remote() {
     local policy="$1" key="$2" work="$3" repo tag sha builder name context inventory asset signature_asset proof signature
     local proof_hash signature_hash expected final_context final_inventory inventory_hash
-    local cache="${5:-}" resume_key
+    local cache="${5:-}" jobs="${6:-1}" resume_key
     repo=$(jq -r .repo "$policy"); tag=$(jq -r .tag "$policy"); sha=$(jq -r .source_sha "$policy")
     builder=$(jq -r .builder "$policy"); name=$(jq -r .statement_name "$policy")
     context=$(_sbr_context "$repo" "$tag" "$work") || return $?
@@ -373,7 +536,7 @@ _slr_verify_remote() {
               public_key_sha256:$key,context:$context,inventory:$inventory,
               statement_sha256:$proof,signature_sha256:$signature}' > "$work/fetch-selection.json" || return 1
     fi
-    _slr_payloads "$repo" "$inventory" "$proof" "$work" "$cache" || return $?
+    _slr_payloads "$repo" "$inventory" "$proof" "$work" "$cache" "$jobs" || return $?
     slsa_verify_release "$proof" "$work/payloads" --builder "$builder" --public-key "$key" --signature "$signature" \
         --source-repository "https://github.com/$repo" --source-commit "$sha" || return $?
     final_inventory=$(_sbr_inventory "$repo" "$(jq -r .release.id <<< "$context")" "$work") || return $?
@@ -595,7 +758,7 @@ _slr_execute() (
     set -uo pipefail
     umask 077
     local action="$1" local_proof='' local_signature='' root='' dry=false output=''
-    local resume=false cache='' completed=false
+    local resume=false cache='' completed=false jobs=1
     shift
     if [[ "$action" == publish ]]; then
         [[ $# -ge 2 ]] || return 4
@@ -626,10 +789,12 @@ _slr_execute() (
             --release-contract) contract=$2 ;;
             --signature) [[ "$action" == publish ]] || return 4; local_signature=$2 ;;
             --output-dir) [[ "$action" == fetch ]] || return 4; output=$2 ;;
+            --jobs) [[ "$action" == fetch || "$action" == verify ]] || return 4; jobs=$2 ;;
             *) return 4 ;;
         esac
         shift 2
     done
+    [[ "$jobs" =~ ^([1-9]|[12][0-9]|3[0-2])$ ]] || return 4
     if [[ "$action" == contract ]]; then
         for option in "${!seen[@]}"; do
             case "$option" in --release-contract|--targets) ;; *) return 4 ;; esac
@@ -737,7 +902,7 @@ _slr_execute() (
             _slr_verify_snapshot "$work/policy.json" "$work/trusted.pub" "$output" "$work" > "$work/completed.json" || return $?
         fi
         _sbr_require || return $?
-        _slr_verify_remote "$work/policy.json" "$work/trusted.pub" "$work" true "$cache" > "$work/remote.json" || return $?
+        _slr_verify_remote "$work/policy.json" "$work/trusted.pub" "$work" true "$cache" "$jobs" > "$work/remote.json" || return $?
         cp -- "$work/remote.json" "$work/snapshot/download.json" || return 1
         _slr_verify_snapshot "$work/policy.json" "$work/trusted.pub" "$work/snapshot" "$work" > "$work/local.json" || return $?
         if [[ "$completed" == true ]]; then
@@ -753,7 +918,7 @@ _slr_execute() (
              if $resumed then .+{resumable:true,checkpoint:$cache,acquisition:$acquisition[0]} else . end' > "$work/result.json" || return 1
     else
         _sbr_require || return $?
-        _slr_verify_remote "$work/policy.json" "$work/trusted.pub" "$work" > "$work/result.json" || return $?
+        _slr_verify_remote "$work/policy.json" "$work/trusted.pub" "$work" false '' "$jobs" > "$work/result.json" || return $?
     fi
     [[ "$(_slsa_sha256 "$public")" == "$key_hash" && "$(_slsa_sha256 "$work/trusted.pub")" == "$key_hash" ]] || return 7
     if [[ -n "$contract" ]]; then
@@ -802,9 +967,10 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
                 '       [--statement-name release.intoto.jsonl] [--statement-sha256 SHA256]' \
                 '       [--manifest-sha256 SHA256] [--invocation-id ID]' \
                 '       [--release-contract FILE] (exact independently selected assets and compiler variants)' \
+                '       [--jobs 1..32] (verify-release/fetch-release only; default: 1)' \
                 'Publish: publish-release STATEMENT ARTIFACTS (same required policy options)' \
                 '         [--signature FILE] [--dry-run]' \
-                'Fetch: fetch-release --output-dir DIR [--resume] (same required policy options)' \
+                'Fetch: fetch-release --output-dir DIR [--resume] [--jobs 1..32] (same required policy options)' \
                 '       --resume retains complete authenticated payloads and rechecks the same release on retry' \
                 'Offline: verify-snapshot DIR (same required policy options; no network)' \
                 'Describe: describe-contract --release-contract FILE --targets PLATFORM,... (no authentication or writes)' \

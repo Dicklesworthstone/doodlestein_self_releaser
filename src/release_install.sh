@@ -415,11 +415,15 @@ try:
     parser.add_argument("--replace", action="store_true", help="Permit switching an existing managed installation")
     parser.add_argument("--dry-run", action="store_true", help="Authenticate and extract without changing installation state")
     parser.add_argument("--timeout", type=int, default=900, help="Per verification/extraction helper timeout, 1..86400 seconds")
+    parser.add_argument("--download-jobs", type=int, help="With --fetch: concurrent payload downloads, 1..32 (default: 1)")
     flags = [a.split("=", 1)[0] for a in sys.argv[2:] if a.startswith("--")]
     need(len(flags) == len(set(flags)), "duplicate installation option", 4)
     args = parser.parse_args(sys.argv[2:])
     need(1 <= args.timeout <= 86400, "timeout must be 1..86400", 4)
     need(not args.allow_draft or args.fetch, "--allow-draft requires --fetch", 4)
+    if args.download_jobs is not None:
+        need(args.fetch, "--download-jobs requires --fetch", 4)
+        need(1 <= args.download_jobs <= 32, "download jobs must be 1..32", 4)
     snapshot = None if args.fetch else plain(args.snapshot, "dir")
     recipe_file = plain(args.recipe, "file")
     public = plain(args.public_key, "file")
@@ -461,8 +465,9 @@ try:
         fetched = None
         if args.fetch:
             snapshot = work / "snapshot"
+            scheduling = [] if args.download_jobs is None else ["--jobs", str(args.download_jobs)]
             output = helper(["bash", str(module / "slsa_remote.sh"), "fetch-release", "--output-dir", str(snapshot),
-                             "--public-key", str(work / "trusted.pub"), *policy], work, network=True)
+                             "--public-key", str(work / "trusted.pub"), *policy, *scheduling], work, network=True)
             fetched = json.loads(output, object_pairs_hook=pairs)
             need(isinstance(fetched, dict) and fetched.get("kind") == "dsr-slsa-fetch" and
                  fetched.get("status") == "verified" and fetched.get("authenticated") is True and

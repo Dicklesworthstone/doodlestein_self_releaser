@@ -65,6 +65,10 @@ _sbr_download() {
 }
 gh_download_release_asset() {
     trace "download $2"
+    if [[ "$MODE" == parallel-* && "$2" =~ ^[123]$ ]]; then
+        parallel_body "$2" "$3"
+        return $?
+    fi
     [[ "$MODE" != network-failure ]] || return 8
     [[ "$MODE" != interrupted ]] || return 5
     if [[ "$MODE" == late-failure && "$2" == 3 ]]; then
@@ -85,6 +89,86 @@ gh_download_release_asset() {
     fi
     if [[ "$MODE" == changed-key && "$2" == 3 ]]; then printf 'changed\n' >> "$CASE/key.pub"; fi
     if [[ "$MODE" == corrupt-body && "$2" == 3 ]]; then printf corrupt >> "$3"; fi
+}
+parallel_body() {
+    # Real concurrent child processes and filesystem barriers, with no timing
+    # speedup assertion. Only this explicit transport fixture is substituted.
+    python3 - "$CASE" "$MODE" "$1" "$2" <<'PY'
+import fcntl
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+case, mode, asset, output = Path(sys.argv[1]), sys.argv[2], sys.argv[3], Path(sys.argv[4])
+state = case / "parallel.json"
+
+def record(event):
+    with (case / "parallel.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        data = json.loads(state.read_text()) if state.exists() else dict(active=[], peak=0, events=[])
+        if event == "start":
+            data["active"].append(asset)
+            data["peak"] = max(data["peak"], len(data["active"]))
+        elif asset in data["active"]:
+            data["active"].remove(asset)
+        data["events"].append(dict(asset=asset, event=event, pid=os.getpid(), group=os.getpgrp()))
+        state.write_text(json.dumps(data))
+
+def until(path):
+    deadline = time.monotonic() + 8
+    while not path.exists():
+        assert time.monotonic() < deadline, "parallel transport barrier was not satisfied: " + str(path)
+        time.sleep(.01)
+
+def interrupted(signum, frame):
+    raise SystemExit(128 + signum)
+
+for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(sig, interrupted)
+
+record("start")
+(case / ("started-" + asset)).touch()
+try:
+    if mode == "parallel-queue":
+        if asset == "1":
+            until(case / "started-3")
+        elif asset == "2":
+            until(case / "started-1")
+        else:
+            assert (case / "snapshot.partial/artifacts/demo-linux-alias").is_file(), "ready sibling was not retained before refilling its slot"
+    elif mode in ("parallel-failure", "parallel-cancel"):
+        if mode == "parallel-failure" and asset == "2":
+            until(case / "resistant-1.ready")
+            until(case / "resistant-1.active")
+            raise SystemExit(8)
+        if mode == "parallel-failure" or asset != "1":
+            marker = case / ("resistant-" + asset)
+            # This ordinary descendant deliberately ignores TERM and retains
+            # inherited custody descriptors. The production anchor must reap
+            # its entire group before the destination lock can be acquired.
+            child = subprocess.Popen([sys.executable, "-c",
+                "import os,signal,sys,time\nfrom pathlib import Path\n"
+                "signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+                "Path(sys.argv[1]+'.group').write_text(str(os.getpgrp()))\n"
+                "Path(sys.argv[1]+'.pid').write_text(str(os.getpid()))\n"
+                "for counter in range(600):\n"
+                " Path(sys.argv[1]+'.heartbeat').write_text(str(counter))\n"
+                " if counter==0: Path(sys.argv[1]+'.ready').touch()\n"
+                " if counter==2: Path(sys.argv[1]+'.active').touch()\n"
+                " time.sleep(.05)\n", str(marker)], close_fds=False)
+            until(Path(str(marker) + ".ready"))
+            (case / ("blocked-" + asset)).touch()
+            while True:
+                time.sleep(.1)
+    shutil.copyfile(case / "remote" / asset, output)
+finally:
+    record("end")
+PY
 }
 new_case() {
     CASE="$WORK/$1"; MODE=normal
@@ -128,6 +212,7 @@ fetch() { policy slsa_fetch_release --output-dir "$CASE/snapshot" "$@"; }
 verify() { policy slsa_verify_snapshot "$CASE/snapshot" "$@"; }
 [[ "${DSR_SNAPSHOT_FIXTURES_ONLY:-false}" != true ]] || return 0
 
+if [[ "${DSR_SNAPSHOT_PARALLEL_ONLY:-0}" != 1 ]]; then
 if [[ "${DSR_SNAPSHOT_RESUME_ONLY:-0}" != 1 ]]; then
 new_case success
 expect 'existing remote verification keeps its original behavior' 0 policy slsa_verify_remote
@@ -423,5 +508,177 @@ expect 'same selection resumes after actual process cancellation' 0 fetch --resu
 check 'process-cancelled resume keeps completed inode and downloads only the unfinished payload' bash -c \
     '[[ $(stat -c %i "$1/snapshot/artifacts/demo-linux") == $(jq -r .inode "$1/interruption.json") ]] &&
      jq -e '\''.acquisition=={reused_payloads:2,downloaded_payloads:1}'\'' "$1/result"' _ "$CASE"
+fi
+
+if [[ "${DSR_SNAPSHOT_RESUME_ONLY:-0}" != 1 ]]; then
+# Retain the explicit GitHub/signature boundary fixtures, but run the genuine
+# downloader with the pool's production process-group supervision.
+# Load their exact declarations in isolation so fixture metadata APIs stay put.
+production_transport=$(
+    source "$ROOT/src/sbom.sh" || exit
+    # shellcheck source=src/sbom_release.sh
+    source "${DSR_SNAPSHOT_TRANSPORT_SOURCE:-$ROOT/src/sbom_release.sh}" || exit
+    declare -f _sbr_run _sbr_download _sbr_asset_digest _sbom_hash _sbom_log
+) || exit 1
+eval "$production_transport"
+new_case parallel-queue
+MODE=parallel-queue
+expect 'two transfer slots complete a shared-barrier release' 0 fetch --resume --jobs 2
+check 'workers overlap, respect the cap, and refill a slot before the first asset completes' jq -e \
+    '.peak==2 and .active==[] and
+     ([.events[]|select(.event=="start")|.asset]|sort)==["1","2","3"] and
+     ([.events[]|(.asset+":"+.event)] | index("3:start") < index("1:end"))' "$CASE/parallel.json"
+check 'parallel acquisition preserves complete payload counts' jq -e \
+    '.authenticated and .acquisition=={reused_payloads:0,downloaded_payloads:3}' "$CASE/result"
+check 'parallel collection retains exact signed bytes' cmp -s "$CASE/remote/3" "$CASE/snapshot/artifacts/demo-windows.exe"
+MODE=normal
+: > "$CASE/calls"
+expect 'completed resume permits a different scheduling bound' 0 fetch --resume --jobs 3
+check 'changed scheduling does not redownload completed assets' jq -e \
+    '.acquisition=={reused_payloads:3,downloaded_payloads:0}' "$CASE/result"
+check 'completed parallel resume requests only proof documents' bash -c \
+    '[[ $(grep -c "^download " "$1") == 2 ]] && ! grep -Eq "^download [123]$" "$1"' _ "$CASE/calls"
+
+new_case parallel-verify
+expect 'remote verification uses the same bounded acquisition path' 0 policy slsa_verify_remote --jobs 2
+check 'parallel remote verification returns a complete authenticated verdict' jq -e \
+    '.kind=="dsr-slsa-remote-verification" and .authenticated and .artifact_count==3' "$CASE/result"
+check 'parallel verification does not publish a snapshot' test ! -e "$CASE/snapshot"
+
+new_case parallel-preflight
+jq 'map(if .id==3 then .size+=1 else . end)' "$CASE/inventory.json" > "$CASE/bad-inventory"
+cp "$CASE/bad-inventory" "$CASE/inventory.json"
+expect 'parallel acquisition preflights every advertised asset before starting workers' 7 fetch --resume --jobs 3
+check 'invalid final asset starts no payload worker' bash -c '! grep -Eq "^download [123]$" "$1"' _ "$CASE/calls"
+
+new_case parallel-cache
+MODE=late-failure
+expect 'a failed parallel fetch retains earlier completed assets' 8 fetch --resume --jobs 2
+check 'failed parallel fetch publishes no complete snapshot' test ! -e "$CASE/snapshot"
+MODE=normal
+retained_payloads=("$CASE/snapshot.partial/artifacts/"*)
+check 'failed parallel fetch keeps at least one fully completed payload' test -f "${retained_payloads[0]}"
+chmod 600 "${retained_payloads[0]}" || exit 1
+printf corrupt >> "${retained_payloads[0]}" || exit 1
+: > "$CASE/calls"
+expect 'parallel resume checks every retained payload before requesting a missing body' 7 fetch --resume --jobs 3
+check 'corrupt retained bytes start no parallel payload workers' bash -c '! grep -Eq "^download [123]$" "$1"' _ "$CASE/calls"
+
+for scenario in failure cancel launch-window; do
+    new_case "parallel-$scenario"
+    (
+        export CASE MODE="parallel-$scenario"
+        [[ "$scenario" != launch-window ]] || MODE=parallel-cancel
+        export -f trace _sbr_require _sbr_run _sbr_context _sbr_inventory _sbr_named_asset _sbr_payload_names \
+            _sbr_asset_digest _sbr_inventory_sha256 _sbr_download gh_download_release_asset parallel_body _sbom_hash _sbom_log
+        python3 - "$ROOT/src/slsa_remote.sh" "$CASE" "$PIN" "$scenario" <<'PY'
+import fcntl
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+module, case, pin, scenario = sys.argv[1], Path(sys.argv[2]), sys.argv[3], sys.argv[4]
+arguments = ["--resume", "--jobs", "2", "--output-dir", str(case / "snapshot"),
+           "--repo", "owner/demo", "--tag", "v1.2.3", "--sha", pin, "--builder", "dsr:test",
+           "--targets", "linux/amd64,windows/arm64", "--public-key", str(case / "key.pub")]
+command = ["bash", module, "fetch-release", *arguments]
+if scenario == "launch-window":
+    # Freeze the old nested adapter after its transport fork but before its
+    # cleanup trap. A correct pool reuses its existing anchor and never enters
+    # this window for payloads; proof downloads still use the ordinary adapter.
+    driver = r"""source "$1" || exit; shift
+set -T
+trap 'if [[ "$BASH_COMMAND" == "worker=\$!" && "${1-}" == gh_download_release_asset && "${3-}" =~ ^[123]$ ]]; then : > "$CASE/nested-window"; command sleep 8; fi' DEBUG
+slsa_fetch_release "$@"
+"""
+    command = ["bash", "-c", driver, "snapshot-launch-window", module, *arguments]
+
+with (case / "owned.stdout").open("wb") as out, (case / "owned.stderr").open("wb") as err:
+    process = subprocess.Popen(command, stdout=out, stderr=err, start_new_session=True)
+    try:
+        if scenario != "failure":
+            deadline = time.monotonic() + 12
+            blocked = case / ("blocked-2" if scenario == "launch-window" else "blocked-3")
+            while not blocked.exists():
+                assert process.poll() is None and time.monotonic() < deadline, "parallel fetch never reached its blocked transport"
+                time.sleep(.02)
+            if scenario == "cancel":
+                assert (case / "snapshot.partial/artifacts/demo-linux").is_file(), "completed progress was not retained"
+            heartbeat = case / "resistant-2.heartbeat"
+            before_beat = heartbeat.read_bytes()
+            time.sleep(.2)
+            assert heartbeat.read_bytes() != before_beat, "cancellation fixture never produced a live resistant writer"
+            before = (case / "calls").read_bytes()
+            competing = subprocess.run(command, capture_output=True, timeout=8)
+            assert competing.returncode == 2 and not competing.stdout, "competing resume escaped the destination lock"
+            assert before == (case / "calls").read_bytes(), "competing resume started remote work"
+            os.killpg(process.pid, signal.SIGTERM)
+        code = process.wait(timeout=15)
+        assert code in ((8,) if scenario == "failure" else (-signal.SIGTERM, 5, 128 + signal.SIGTERM)), "unexpected parallel outcome: " + str(code)
+        assert not (case / "owned.stdout").read_bytes(), "incomplete parallel fetch emitted success"
+        assert not (case / "snapshot").exists(), "incomplete release became visible"
+        if scenario == "failure":
+            assert not (case / "started-3").exists(), "failed worker allowed another queued download to start"
+        markers = list(case.glob("resistant-*.pid"))
+        assert markers, "cancellation test did not create resistant descendants"
+        deadline = time.monotonic() + 6
+        while True:
+            with (case / "snapshot.lock").open("rb") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    beats = {p: p.with_suffix(".heartbeat").read_bytes() for p in markers}
+                    time.sleep(.2)
+                    assert all(p.with_suffix(".heartbeat").read_bytes() == beat for p, beat in beats.items()), "owned descendants kept writing after destination custody was released"
+                    break
+                except BlockingIOError:
+                    assert time.monotonic() < deadline, "owned descendants retained destination custody"
+            time.sleep(.02)
+        assert not any(p.name.endswith(".exe") for p in (case / "snapshot.partial/artifacts").iterdir()), "interrupted body entered checkpoint"
+        (case / "settled.json").write_text(json.dumps(dict(exit_code=code, descendants=len(markers),
+                                                        legacy_fork_window=(case / "nested-window").exists())))
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+        # A broken implementation can escape into a separate transport group.
+        # Stop only freshly created fixture writers proven still active by their
+        # private heartbeat; never select an unrelated process via a census.
+        beats = {p: p.read_bytes() for p in case.glob("resistant-*.heartbeat")}
+        time.sleep(.15)
+        for p, beat in beats.items():
+            if p.read_bytes() != beat:
+                try:
+                    os.killpg(int(p.with_suffix(".group").read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+PY
+    ) > "$CASE/owned-test.log" 2>&1
+    CODE=$?
+    check "parallel $scenario settles owned process groups before releasing custody" test "$CODE" = 0
+    [[ "$CODE" == 0 ]] || cat "$CASE/owned-test.log" "$CASE/owned.stderr"
+    MODE=normal
+    : > "$CASE/calls"
+    expect "same release resumes after parallel $scenario" 0 fetch --resume --jobs 2
+    check 'recovery produces every authenticated asset' jq -e \
+        '.authenticated and .acquisition.reused_payloads+.acquisition.downloaded_payloads==3' "$CASE/result"
+done
+
+new_case parallel-options
+for value in 0 33 -1 01 1.5 invalid; do
+    expect "invalid parallelism $value is rejected" 4 fetch --jobs "$value"
+done
+expect 'duplicate parallelism is rejected' 4 fetch --jobs 2 --jobs 3
+expect 'offline verification rejects remote scheduling options' 4 policy slsa_verify_snapshot "$CASE/assets" --jobs 2
+expect 'publishing rejects remote scheduling options' 4 policy slsa_publish_release "$CASE/remote/4" "$CASE/assets" --jobs 2
+check 'invalid concurrency options perform no remote work' test ! -s "$CASE/calls"
+expect 'download executor must be a declared function' 4 _sbr_download owner/demo \
+    "$(jq -c '.[]|select(.id==1)' "$CASE/inventory.json")" "$(_slsa_sha256 "$CASE/remote/1")" "$CASE" false bash
+check 'internal pool transport cannot be selected outside its owned scope' bash -c \
+    'source "$1"; ! declare -F _slr_pool_transport >/dev/null' _ "$ROOT/src/slsa_remote.sh"
+fi
 printf '\nSLSA release snapshots: %s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" == 0 ]]

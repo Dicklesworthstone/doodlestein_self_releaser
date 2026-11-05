@@ -112,6 +112,41 @@ changing a shared inode invalidates both views. The checkpoint is cooperating
 writer recovery storage, not a separate cryptographic trust anchor or protection
 against arbitrary same-user filesystem changes.
 
+## Download independent assets concurrently
+
+Add `--jobs N` to `fetch-release` or `verify-release` to download up to `N`
+signed payloads at once. The default is `1`; accepted values are `1` through
+`32`. For example, a resumable four-worker acquisition uses:
+
+```bash
+bash src/slsa_remote.sh fetch-release --resume --jobs 4 \
+  --repo OWNER/REPO --tag v1.2.3 --sha "$REVIEWED_SOURCE_COMMIT" \
+  --builder "$TRUSTED_BUILDER_ID" --public-key /srv/keys/release.pub \
+  --targets linux/amd64,darwin/arm64,windows/arm64 \
+  --output-dir /srv/downloads/tool-v1.2.3
+```
+
+The statement and signature are authenticated first. All payload names, sizes
+and advertised digests, plus every retained checkpoint payload, are checked
+before any parallel payload transfer starts. Each worker downloads by the
+selected numeric asset ID into private staging and verifies the full body.
+The coordinator then retains each completed asset and fills its available
+slot; a slow earlier asset does not hold up a completed sibling or an available
+download slot. The existing complete local verification and final remote
+identity checks still run before exposing a snapshot.
+
+A failed worker stops new scheduling. Its remaining owned transfer groups are
+cancelled and drained before acquisition returns. Interruption uses the same
+group supervision, including ordinary descendants that ignore `TERM`; no
+incomplete transfer is admitted to the checkpoint. `SBOM_REMOTE_TIMEOUT`
+continues to bound transfers. Select concurrency for the available bandwidth,
+disk throughput and API limits; it does not relax the signed payload-size limit.
+
+Scheduling is not part of release identity. A retry can change `--jobs` while
+retaining the same source, signer, policy, asset inventory and checkpoint.
+The `acquisition` counts retain their existing meaning. Offline
+`verify-snapshot` and publication do not accept this download scheduling option.
+
 ## Offline verification
 
 ```bash
@@ -175,3 +210,12 @@ an actual fetch process group while its last transfer is blocked, exclude a
 competing resume, and reuse the completed files after cancellation. Select just
 those cases with `DSR_SNAPSHOT_RESUME_ONLY=1`; no live network or native Ed25519
 claim is made by the transport and signer fixtures.
+
+`DSR_SNAPSHOT_PARALLEL_ONLY=1` selects the concurrent acquisition cases. They
+exercise the production downloader, process-group supervision, checkpointing
+and final admission with explicit GitHub/signature fixtures. Filesystem barriers
+prove actual worker overlap, the concurrency cap and reuse of a free slot while
+an earlier transfer is blocked. Failure and cancellation cases include
+`TERM`-resistant descendants and verify that they stop before destination custody
+is released. These are scheduling and lifecycle checks, not a live-network
+throughput benchmark.

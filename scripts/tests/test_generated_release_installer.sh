@@ -174,12 +174,19 @@ try:
         p = subprocess.run([str(prefix / "current/bin" / n)], capture_output=True, timeout=5)
         check("test executes installed native " + n, p.returncode == 0 and p.stdout == b"generated-native-fixture\n")
     before = pointer()
+    parallel = run(extra=("--download-jobs", "2", "--dry-run"), piped=True)
+    check("streamed standalone installer accepts bounded parallel download scheduling without changing generation",
+          parallel["status"] == "planned" and parallel["authenticated"] and
+          parallel["generation"] == first["generation"] and pointer() == before)
     again = run(extra=("--snapshot", str(snapshot)))
     check("offline retry selects the same signed generation", again["generation"] == first["generation"] and not again["activated"] and pointer() == before)
     calls = (case / "calls").read_bytes()
     for args in (("--public-key", "/other/key"), ("--sha", "b"*40), ("--repo", "other/repo"),
                  ("--targets", "linux/amd64"), ("--files", "/other/data.json"), ("--from-source",),
-                 ("--version", "v2.0.0"), ("--timeout", "1", "--timeout", "2")):
+                 ("--version", "v2.0.0"), ("--timeout", "1", "--timeout", "2"),
+                 ("--download-jobs", "0"), ("--download-jobs", "33"), ("--download-jobs", "many"),
+                 ("--download-jobs", "2", "--download-jobs", "3"),
+                 ("--snapshot", str(snapshot), "--download-jobs", "1")):
         run(4, extra=args)
     check("runtime cannot weaken embedded policy or execute source fallback", (case / "calls").read_bytes() == calls and pointer() == before)
     # Even the platform not installed locally must remain complete and signed.

@@ -91,6 +91,12 @@ check("network to complete generation requires one invocation", first["status"] 
 identity = active()
 again = run()
 check("fresh download reuses identical generation and pointer", again["generation"] == first["generation"] and not again["activated"] and active() == identity)
+before_parallel = len(calls())
+parallel = run(extra=("--download-jobs", "2", "--dry-run"))
+check("parallel installation authenticates the same complete release and generation", parallel["status"] == "planned" and
+      parallel["authenticated"] and parallel["generation"] == first["generation"] and active() == identity and
+      sorted(c for c in calls()[before_parallel:] if c.startswith("download ")) ==
+      ["download 1", "download 2", "download 3", "download 4", "download 5"])
 check("online helper staging is cleaned", not list(case.glob(".dsr-install-*")))
 # Make a separately retained snapshot through the actual SLSA CLI, not a fake
 # downloaded directory. Offline and online must select the same generation.
@@ -105,6 +111,10 @@ check("offline mode performs no remote operations", calls() == before)
 check("online and offline trust the same generation identity", offline["generation"] == first["generation"] and "download" not in offline and active() == identity)
 # Policies and target checks cannot be bypassed before doing any network work.
 run(4, origin=("--snapshot", str(snapshot)), extra=("--allow-draft",))
+for jobs in ("0", "33", "-1", "many"):
+    run(4, extra=("--download-jobs", jobs))
+run(4, extra=("--download-jobs", "2", "--download-jobs", "3"))
+run(4, origin=("--snapshot", str(snapshot)), extra=("--download-jobs", "1"))
 run(4, extra=("--snapshot", str(snapshot)))
 original_recipe = recipe.read_bytes()
 value = json.loads(original_recipe)

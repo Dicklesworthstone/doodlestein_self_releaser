@@ -222,9 +222,12 @@ _sbr_asset_digest() {
 
 # Always download documents, even when the API advertises their digest: the
 # content must satisfy the document contract too. Body bytes never enter Bash.
+# An internal caller that already owns the complete transfer group may supply
+# its scoped runner function. Ordinary callers retain _sbr_run supervision.
 _sbr_download() {
     local repo="$1" asset="$2" expected="$3" workdir="$4" is_document="${5:-true}"
-    local size id directory file actual_size status
+    local runner="${6:-_sbr_run}" size id directory file actual_size status
+    [[ "$runner" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && declare -F "$runner" >/dev/null || return 4
     _sbr_asset_digest "$asset" "$expected" || return $?
     size=$(jq -r '.size' <<< "$asset") || return 8
     id=$(jq -r '.id' <<< "$asset") || return 8
@@ -233,7 +236,7 @@ _sbr_download() {
     fi
     directory=$(mktemp -d "$workdir/download.XXXXXXXX") || return 1
     file="$directory/body"
-    if _sbr_run gh_download_release_asset "$repo" "$id" "$file" >/dev/null; then :; else
+    if "$runner" gh_download_release_asset "$repo" "$id" "$file" >/dev/null; then :; else
         status=$?
         [[ "$status" -ne 5 ]] || return 5
         [[ "$status" -ne 3 ]] || return 3
