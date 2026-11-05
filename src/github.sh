@@ -54,20 +54,28 @@ else
     _GH_RED='' _GH_GREEN='' _GH_YELLOW='' _GH_BLUE='' _GH_NC=''
 fi
 
-_gh_log_info()  { echo "${_GH_BLUE}[github]${_GH_NC} $*" >&2; }
+_gh_log_info()  { echo "${_GH_BLUE:-}[github]${_GH_NC:-} $*" >&2; }
 _gh_log_ok()    { echo "${_GH_GREEN}[github]${_GH_NC} $*" >&2; }
 _gh_log_warn()  { echo "${_GH_YELLOW:-}[github]${_GH_NC:-} $*" >&2; }
 _gh_log_error() { echo "${_GH_RED:-}[github]${_GH_NC:-} $*" >&2; }
-_gh_log_debug() { [[ "${GH_DEBUG:-}" == "1" ]] && echo "${_GH_BLUE}[github:debug]${_GH_NC} $*" >&2; }
+_gh_log_debug() { [[ "${GH_DEBUG:-}" == "1" ]] && echo "${_GH_BLUE:-}[github:debug]${_GH_NC:-} $*" >&2; }
 
 # Initialize cache directory
 gh_init_cache() {
     mkdir -p "$GH_CACHE_DIR"
 }
 
-# Check if gh CLI is available and authenticated
-# Returns: 0 if ready, 1 for curl fallback, or gh's cancellation/auth status.
-gh_check() {
+# JSON requests and standalone credential checks use a positive finite bound.
+_gh_api_timeout() {
+    local seconds="${GH_API_TIMEOUT:-60}"
+    if [[ ! "$seconds" =~ ^[1-9][0-9]{0,5}$ ]]; then
+        _gh_log_error "GH_API_TIMEOUT requires a positive integer number of seconds"
+        return 4
+    fi
+    printf '%s\n' "$seconds"
+}
+
+_gh_check_cli_auth() {
     local status=0
     if ! command -v gh &>/dev/null; then
         _gh_log_warn "gh CLI not found, falling back to curl"
@@ -78,7 +86,7 @@ gh_check() {
     if ((status != 0)); then
         # Cancellation is not evidence that another credential transport
         # should be tried. Preserve gh's explicit cancellation/auth statuses.
-        if ((status == 2 || status == 4 || status >= 128)); then
+        if ((status == 2 || status == 3 || status == 4 || status >= 124)); then
             return "$status"
         fi
         _gh_log_warn "gh CLI not authenticated, falling back to curl"
@@ -86,6 +94,14 @@ gh_check() {
     fi
 
     return 0
+}
+
+# Public preflight callers need the same bound even outside gh_api. Attempts
+# already own an outer deadline and call the internal probe directly.
+gh_check() {
+    local timeout
+    timeout=$(_gh_api_timeout) || return $?
+    run_with_timeout "$timeout" _gh_check_cli_auth
 }
 
 # Resolve the canonical DSR_GH_TOKEN / GITHUB_TOKEN / GH_TOKEN / public-GitHub
@@ -108,13 +124,68 @@ _gh_resolve_token() {
 # in secrets.sh) were rejected even though the upload path could have
 # used them.
 gh_check_token() {
-    if ! _gh_resolve_token >/dev/null; then
+    local timeout status=0
+    timeout=$(_gh_api_timeout) || return $?
+    run_with_timeout "$timeout" _gh_resolve_token >/dev/null || status=$?
+    if ((status != 0)); then
+        if ((status != 3)); then
+            return "$status"
+        fi
         _gh_log_error "No GitHub token available (DSR_GH_TOKEN / GITHUB_TOKEN / GH_TOKEN unset and gh CLI not authenticated)"
         _gh_log_info "Either run: gh auth login"
         _gh_log_info "Or set: export DSR_GH_TOKEN=<your-token>"
         return 3
     fi
     return 0
+}
+
+# Keep this heredoc outside a conditional in exported gh_api: Bash's function
+# serializer can otherwise import it successfully but move shell statements
+# into the Python input when a child shell executes response retention.
+_gh_response_retention_directory() {
+    python3 -I - "$1" <<'PY'
+import os
+import stat
+import sys
+
+if not __debug__:
+    raise SystemExit(4)
+directory = os.path.abspath(sys.argv[1])
+try:
+    assert os.path.realpath(directory) == directory
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        parent = os.fstat(fd)
+        assert stat.S_ISDIR(parent.st_mode) and parent.st_uid == os.geteuid()
+        assert stat.S_IMODE(parent.st_mode) & 0o777 == 0o700
+    finally:
+        os.close(fd)
+except (OSError, AssertionError):
+    raise SystemExit(4)
+PY
+}
+
+# One complete attempt runs under the supervisor. Transport metadata crosses
+# its subshell through a private file; the original response bytes stay in
+# their existing mktemp file for strict draft-creation custody.
+_gh_api_attempt() {
+    local endpoint="$1" method="$2" data="$3" no_cache="$4"
+    local response_file="$5" metadata_file="$6" status=0 transport=auth
+    _gh_check_cli_auth 2>/dev/null || status=$?
+    if ((status == 0)); then
+        transport=gh
+        _gh_api_with_gh "$endpoint" "$method" "$data" "$no_cache" > "$response_file" || status=$?
+    elif ((status == 1)); then
+        transport=curl
+        status=0
+        _gh_api_with_curl "$endpoint" "$method" "$data" "$no_cache" > "$response_file" || status=$?
+    fi
+    jq -nc --arg transport "$transport" --arg http_code "${_GH_LAST_HTTP_CODE:-}" \
+        --arg etag "${_GH_LAST_ETAG:-}" --arg retry_after "${_GH_LAST_RETRY_AFTER:-}" \
+        --arg remaining "${_GH_LAST_RATE_REMAINING:-}" --arg reset "${_GH_LAST_RATE_RESET:-}" \
+        '{transport:$transport,http_code:$http_code,etag:$etag,retry_after:$retry_after,
+          remaining:$remaining,reset:$reset}' > "$metadata_file" || return 8
+    return "$status"
 }
 
 # Generate cache key from endpoint
@@ -266,7 +337,8 @@ gh_api() (
         _gh_log_error "GitHub API endpoint must be a relative public-GitHub path"
         return 4
     fi
-    local max_attempts="${GH_MAX_RETRIES:-3}" retry_delay="${GH_RETRY_DELAY:-5}"
+    local max_attempts="${GH_MAX_RETRIES:-3}" retry_delay="${GH_RETRY_DELAY:-5}" api_timeout
+    api_timeout=$(_gh_api_timeout) || return $?
     if [[ ! "$max_attempts" =~ ^([1-9]|10)$ || ! "$retry_delay" =~ ^[0-9]{1,4}$ ]]; then
         _gh_log_error "Invalid API retry configuration"
         return 4
@@ -290,27 +362,7 @@ gh_api() (
             return 4
         fi
         command -v python3 >/dev/null 2>&1 || return 3
-        if ! python3 -I - "${TMPDIR:-/tmp}" <<'PY'
-import os
-import stat
-import sys
-
-if not __debug__:
-    raise SystemExit(4)
-directory = os.path.abspath(sys.argv[1])
-try:
-    assert os.path.realpath(directory) == directory
-    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        parent = os.fstat(fd)
-        assert stat.S_ISDIR(parent.st_mode) and parent.st_uid == os.geteuid()
-        assert stat.S_IMODE(parent.st_mode) & 0o777 == 0o700
-    finally:
-        os.close(fd)
-except (OSError, AssertionError):
-    raise SystemExit(4)
-PY
-        then
+        if ! _gh_response_retention_directory "${TMPDIR:-/tmp}"; then
             _gh_log_error "Response retention requires an owner-only, unlinked TMPDIR"
             return 4
         fi
@@ -331,15 +383,20 @@ PY
     fi
 
     # Try gh CLI first, then curl
-    local response="" response_file cleanup_command
+    local response="" response_file metadata_file cleanup_command
     local exit_code using_curl rate_limited
     local retries=0
     response_file=$(mktemp "${TMPDIR:-/tmp}/dsr-api-response.XXXXXXXX") || return 8
+    metadata_file=""
     printf -v cleanup_command 'rm -f -- %q' "$response_file"
     # Freeze the safely quoted local path before the subshell EXIT trap runs.
     # shellcheck disable=SC2064
     trap "$cleanup_command" EXIT
     trap 'exit 5' INT TERM
+    metadata_file=$(mktemp "${TMPDIR:-/tmp}/dsr-api-metadata.XXXXXXXX") || return 8
+    printf -v cleanup_command 'rm -f -- %q %q' "$response_file" "$metadata_file"
+    # shellcheck disable=SC2064
+    trap "$cleanup_command" EXIT
 
     while [[ $retries -lt $max_attempts ]]; do
         _GH_LAST_HTTP_CODE=""
@@ -347,17 +404,33 @@ PY
         _GH_LAST_RETRY_AFTER=""
         _GH_LAST_RATE_REMAINING=""
         _GH_LAST_RATE_RESET=""
-        # Do not use response=$(transport): that subshell discards HTTP/ETag
-        # metadata, turns 304 into empty success, and loses retry classification.
+        # Clear both files before an attempt so an interrupted retry cannot
+        # reuse a prior response or rejection status to repeat a mutation.
+        : > "$response_file" || return 8
+        : > "$metadata_file" || return 8
         exit_code=0
         using_curl=false
-        if gh_check 2>/dev/null; then
-            _gh_api_with_gh "$endpoint" "$method" "$data" "$no_cache" > "$response_file" || exit_code=$?
-        else
-            gh_check_token || return 3
-            using_curl=true
-            _gh_api_with_curl "$endpoint" "$method" "$data" "$no_cache" > "$response_file" || exit_code=$?
+        run_with_timeout "$api_timeout" _gh_api_attempt "$endpoint" "$method" "$data" \
+            "$no_cache" "$response_file" "$metadata_file" || exit_code=$?
+        # Cancellation and supervisor failures are terminal even if partial
+        # response text resembles a rate limit or a successful draft creation.
+        if ((exit_code == 2 || exit_code == 3 || exit_code == 4 || exit_code >= 124)); then
+            cat -- "$response_file"
+            return "$exit_code"
         fi
+        if ! jq -es 'length == 1 and (.[0] | type == "object" and
+            (.transport | IN("auth","gh","curl")) and
+            ([.http_code,.etag,.retry_after,.remaining,.reset] | all(.[]; type == "string")))' \
+            "$metadata_file" >/dev/null; then
+            _gh_log_error "GitHub attempt ended without complete transport metadata"
+            return 8
+        fi
+        [[ "$(jq -r .transport "$metadata_file")" != curl ]] || using_curl=true
+        _GH_LAST_HTTP_CODE=$(jq -r .http_code "$metadata_file") || return 8
+        _GH_LAST_ETAG=$(jq -r .etag "$metadata_file") || return 8
+        _GH_LAST_RETRY_AFTER=$(jq -r .retry_after "$metadata_file") || return 8
+        _GH_LAST_RATE_REMAINING=$(jq -r .remaining "$metadata_file") || return 8
+        _GH_LAST_RATE_RESET=$(jq -r .reset "$metadata_file") || return 8
         response=$(cat "$response_file") || return 8
 
         # A failed write may already have reached GitHub. Only an explicit
@@ -417,6 +490,7 @@ PY
                     return 8
                 fi
                 # Keep the exact mktemp file and its private descriptor identity.
+                rm -f -- "$metadata_file" || return 8
                 trap - EXIT
             fi
             echo "$response"
@@ -452,7 +526,7 @@ _gh_download_asset_attempt() {
     local repo="$1" asset_id="$2" staged_file="$3" connect_timeout="$4" timeout="$5"
     local status=0 token=""
     printf 'auth\n' > "$staged_file.transport" || return 4
-    gh_check 2>/dev/null || status=$?
+    _gh_check_cli_auth 2>/dev/null || status=$?
     if ((status == 0)); then
         printf 'gh\n' > "$staged_file.transport" || return 4
         secrets_run_gh api "repos/$repo/releases/assets/$asset_id" --hostname github.com \
@@ -819,9 +893,8 @@ _gh_api_with_curl() {
     local url="https://api.github.com/$endpoint"
     # Resolve via the shared cascade so DSR_GH_TOKEN and `gh auth token`
     # work on this path too, not just bare $GITHUB_TOKEN. The callers
-    # have already been gated through gh_check_token, so an empty result
-    # here means the token was revoked mid-run — bail out instead of
-    # sending "Authorization: Bearer " (which 401s with a confusing body).
+    # own the entire authentication/transfer deadline. Resolve once within
+    # that attempt and refuse an empty token before sending a request.
     local gh_token
     if ! gh_token=$(_gh_resolve_token); then
         _GH_LAST_HTTP_CODE=""
@@ -832,7 +905,7 @@ _gh_api_with_curl() {
         -s
         -S
         --connect-timeout 15
-        --max-time 60
+        --max-time "${GH_API_TIMEOUT:-60}"
         -X "$method"
         -H "Accept: application/vnd.github+json"
         -H "Authorization: Bearer $gh_token"
@@ -1919,6 +1992,11 @@ gh_clear_cache() {
 
 # Export functions
 export -f gh_init_cache gh_check gh_check_token _gh_resolve_token gh_api
+export -f _gh_api_timeout _gh_check_cli_auth _gh_api_attempt _gh_api_with_gh _gh_api_with_curl
+export -f _gh_response_retention_directory
+export -f _gh_cache_key _gh_get_cache _gh_get_cache_raw _gh_get_etag _gh_set_cache _gh_is_rate_limited
+export -f _gh_log_info _gh_log_debug
+export GH_CACHE_DIR GH_CACHE_TTL
 export -f gh_download_release_asset
 export -f _gh_download_asset_attempt _gh_publish_download _gh_response_header _gh_retry_pause
 export -f _gh_log_warn _gh_log_error

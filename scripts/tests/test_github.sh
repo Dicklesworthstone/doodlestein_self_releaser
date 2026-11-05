@@ -455,10 +455,11 @@ run_credential_routing_tests() {
 
 test_api_retains_original_draft_response() (
   local private="$TEMP_DIR/private" result
+  local DSR_GH_TOKEN=retention-fixture-token
   local wire_response=$'{\n  "id": 9, "tag_name": "v1.2.3", "name": "v1.2.3",\n  "body": "owned", "draft": true, "prerelease": false, "assets": []\n}\n\n'
   mkdir -m 700 "$private" || return 1
   export TMPDIR="$private"
-  gh_check() { return 0; }
+  gh() { return 0; }
   _gh_api_with_gh() {
     printf '%s' "$wire_response"
   }
@@ -480,11 +481,12 @@ PY
 
 test_api_retention_rejects_unsafe_directories_and_operations() (
   local private="$TEMP_DIR/private" linked="$TEMP_DIR/linked" shared="$TEMP_DIR/shared"
+  local DSR_GH_TOKEN=retention-fixture-token
   local data='{"tag_name":"v1.2.3","name":"v1.2.3","body":"owned","draft":true,"prerelease":false}'
   mkdir -m 700 "$private" "$shared" || return 1
   chmod 775 "$shared" || return 1
   ln -s "$private" "$linked" || return 1
-  gh_check() { return 0; }
+  gh() { return 0; }
   _gh_api_with_gh() { printf 'unexpected transport\n' >> "$TEMP_DIR/transport"; return 99; }
   local directory
   for directory in "$linked" "$shared"; do
@@ -497,11 +499,12 @@ test_api_retention_rejects_unsafe_directories_and_operations() (
 )
 
 test_api_retention_rejects_malformed_or_unrelated_responses() (
+  local DSR_GH_TOKEN=retention-fixture-token
   local data='{"tag_name":"v1.2.3","name":"v1.2.3","body":"owned","draft":true,"prerelease":false}'
-  local response index=0 private
-  gh_check() { return 0; }
-  _gh_api_with_gh() { printf '%s\n' "$response"; }
-  for response in 'not JSON' '[]' \
+  local wire_response index=0 private
+  gh() { return 0; }
+  _gh_api_with_gh() { printf '%s\n' "$wire_response"; }
+  for wire_response in 'not JSON' '[]' \
       '{"id":9,"tag_name":"wrong","name":"v1.2.3","body":"owned","draft":true,"prerelease":false,"assets":[]}' \
       '{"id":9,"tag_name":"v1.2.3","name":"v1.2.3","body":"owned","draft":true,"prerelease":false,"assets":[{}]}'; do
     index=$((index + 1))
@@ -514,8 +517,8 @@ test_api_retention_rejects_malformed_or_unrelated_responses() (
   # Even valid-looking bytes do not establish custody after a failed POST.
   private="$TEMP_DIR/failed-post"
   mkdir -m 700 "$private" || return 1
-  response='{"id":9,"tag_name":"v1.2.3","name":"v1.2.3","body":"owned","draft":true,"prerelease":false,"assets":[]}'
-  _gh_api_with_gh() { printf '%s\n' "$response"; return 22; }
+  wire_response='{"id":9,"tag_name":"v1.2.3","name":"v1.2.3","body":"owned","draft":true,"prerelease":false,"assets":[]}'
+  _gh_api_with_gh() { printf '%s\n' "$wire_response"; return 22; }
   local status=0
   TMPDIR="$private" gh_api repos/owner/app/releases --post "$data" --retain-response >/dev/null || status=$?
   local -a receipts=("$private"/dsr-api-response.????????)
@@ -823,6 +826,204 @@ test_api_rejects_missing_option_values() (
     [[ $status -eq 4 ]] || return 1
   done
 )
+
+# Exercise real supervised authentication and requests, including the public
+# monitoring command. Only the external gh/curl and credential boundary are
+# fixtures; original response retention, cache and retry logic remain real.
+test_api_enforces_complete_request_deadlines() {
+  python3 - "$GITHUB_MODULE" "$SRC_DIR/../dsr" "$TEMP_DIR" <<'PY' 2>&1
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+module, cli, root = sys.argv[1], sys.argv[2], Path(sys.argv[3])
+driver = r'''
+source "$1" || exit $?
+export GH_API_TIMEOUT=1 GH_MAX_RETRIES=3 GH_RETRY_DELAY=0
+export DSR_GH_TOKEN=fixture-token GITHUB_TOKEN='' GH_TOKEN=''
+export DSR_TEST_API_PHASE="$2" DSR_TEST_API_CASE="$3"
+export TMPDIR="$3" GH_CACHE_DIR="$3/cache"
+mkdir "$GH_CACHE_DIR" || exit 90
+stall() {
+    printf 'started\n' >> "$DSR_TEST_API_CASE/started"
+    command sleep 3
+    printf 'escaped\n' >> "$DSR_TEST_API_CASE/escaped"
+}
+gh() {
+    if [[ "${1:-} ${2:-}" == 'auth status' ]]; then
+        printf 'auth\n' >> "$DSR_TEST_API_CASE/auth"
+        case "$DSR_TEST_API_PHASE" in
+            auth|cli-auth) stall; return 0 ;;
+            cli-cancel) return 130 ;;
+            cli-required) return 4 ;;
+            token|curl|preflight-token) return 1 ;;
+            *) return 0 ;;
+        esac
+    fi
+    printf 'request\n' >> "$DSR_TEST_API_CASE/requests"
+    printf '{"id":9,"tag_name":"v1.2.3","name":"v1.2.3","body":"owned","draft":true,"prerelease":false,"assets":[]}\n\n'
+    [[ "$DSR_TEST_API_PHASE" != gh ]] || stall
+}
+if [[ "$2" == token || "$2" == preflight-token ]]; then
+    secrets_get_gh_token() { stall; printf fixture-token; }
+fi
+curl() {
+    printf 'request\n' >> "$DSR_TEST_API_CASE/requests"
+    printf 'HTTP/2 200\r\nETag: fixture\r\n\r\n{"ok":true}\n'
+    [[ "$DSR_TEST_API_PHASE" != curl ]] || stall
+}
+case "$2" in
+    cli-*)
+        export -f gh stall
+        "$5" --json check fixture/project
+        ;;
+    preflight-auth) DSR_TEST_API_PHASE=auth gh_check ;;
+    preflight-token) gh_check_token ;;
+    *)
+        args=(repos/fixture/project/releases --no-cache)
+        if [[ "$4" == POST ]]; then
+            args+=(--post '{"tag_name":"v1.2.3","name":"v1.2.3","body":"owned","draft":true,"prerelease":false}' --retain-response)
+        elif [[ "$4" != GET ]]; then
+            args+=(--method "$4" --data '{}')
+        fi
+        gh_api "${args[@]}"
+        ;;
+esac
+'''
+cases = [(phase, method, 124) for phase in ('auth', 'token', 'gh', 'curl') for method in ('GET', 'POST')]
+cases += [('gh', 'PATCH', 124), ('gh', 'DELETE', 124),
+          ('preflight-auth', 'GET', 124), ('preflight-token', 'GET', 124),
+          ('cli-auth', 'GET', 8), ('cli-cancel', 'GET', 5), ('cli-required', 'GET', 3)]
+for phase, method, expected in cases:
+    case = root / (phase + '-' + method)
+    case.mkdir(mode=0o700)
+    env = dict(os.environ, DSR_CONFIG_DIR=str(case / 'config'),
+               DSR_STATE_DIR=str(case / 'state'), DSR_CACHE_DIR=str(case / 'cache-root'), NO_COLOR='1')
+    started = time.monotonic()
+    result = subprocess.run(['bash', '-c', driver, '_', module, phase, str(case), method, cli],
+                            env=env, capture_output=True, text=True, timeout=8)
+    elapsed = time.monotonic() - started
+    (case / 'result.json').write_text(json.dumps({'status': result.returncode, 'elapsed': elapsed}))
+    (case / 'stdout').write_text(result.stdout)
+    (case / 'stderr').write_text(result.stderr)
+    assert result.returncode == expected, (phase, method, result.returncode, result.stderr)
+    # The outer eight-second watchdog also covers CLI startup and scheduler
+    # delays. The production deadline must supply the exact status and kill
+    # the blocked operation before it can continue, even on a busy runner.
+    assert not (case / 'escaped').exists(), (phase, method)
+    assert not list(case.glob('dsr-api-response.*')), (phase, method, 'retained unknown outcome')
+    assert not list(case.glob('dsr-api-metadata.*')), (phase, method, 'leaked transport metadata')
+    assert not list((case / 'cache').glob('*.json')), (phase, method, 'cached failed request')
+    if phase not in ('cli-cancel', 'cli-required'):
+        assert (case / 'started').read_text() == 'started\n', (phase, method, 'repeated attempt')
+    if phase in ('gh', 'curl'):
+        assert (case / 'requests').read_text() == 'request\n', (phase, method, 'repeated request')
+    else:
+        assert not (case / 'requests').exists(), (phase, method, 'unexpected credential fallback')
+    if phase.startswith('cli-'):
+        response = json.loads(result.stdout)
+        assert response['status'] == 'error' and response['exit_code'] == expected, response
+        assert (case / 'auth').read_text() == 'auth\n', (phase, 'repeated authentication')
+print('Complete API deadlines: %d public request/preflight cases passed' % len(cases))
+PY
+}
+
+test_api_rejects_invalid_deadlines_before_credentials() (
+  local value status
+  gh() { printf 'unexpected call\n' >> "$TEMP_DIR/auth.calls"; return 0; }
+  for value in 0 -1 1s 1.5 1000000 bad; do
+    status=0
+    GH_API_TIMEOUT="$value" gh_api repos/fixture/project --no-cache >/dev/null 2>&1 || status=$?
+    assert_equals 4 "$status" "invalid API deadline $value" || return 1
+  done
+  [[ ! -e "$TEMP_DIR/auth.calls" ]]
+)
+
+# Public exported adapters must carry the complete supervisor, credential,
+# cache and metadata dependency graph into an unrelated working directory.
+test_exported_api_scenario() (
+  local scenario="$1" expected_attempts="$2" status=0 count key
+  local endpoint='repos/fixture/project/releases' expected='{"fresh":true}'
+  export DSR_TEST_API_EXPORT_CASE="$scenario" DSR_TEST_API_EXPORT_DIR="$TEMP_DIR"
+  export DSR_GH_TOKEN=exported-api-fixture GITHUB_TOKEN='' GH_TOKEN=''
+  export GH_API_TIMEOUT=5 GH_MAX_RETRIES=3 GH_RETRY_DELAY=0 TMPDIR="$TEMP_DIR"
+  : > "$TEMP_DIR/exported.calls"
+  if [[ "$scenario" == curl-304 ]]; then
+    expected='{"cached":true}'
+    key=$(_gh_cache_key "$endpoint")
+    printf '%s\n' "$expected" | _gh_set_cache "$endpoint" 'W/"old"'
+    printf '0\nW/"old"\n' > "$GH_CACHE_DIR/$key.meta"
+  fi
+  gh() {
+    if [[ "${1:-} ${2:-}" == 'auth status' ]]; then
+      [[ "$DSR_TEST_API_EXPORT_CASE" == gh-success || "$DSR_TEST_API_EXPORT_CASE" == retain-post ]]
+      return $?
+    fi
+    printf 'REQUEST\n' >> "$DSR_TEST_API_EXPORT_DIR/exported.calls"
+    if [[ "$DSR_TEST_API_EXPORT_CASE" == retain-post ]]; then
+      printf '{\n  "id":9,"tag_name":"v1.2.3","name":"v1.2.3",\n  "body":"owned","draft":true,"prerelease":false,"assets":[]\n}\n\n'
+    else
+      printf '{"fresh":true}\n'
+    fi
+  }
+  curl() {
+    local count
+    printf 'REQUEST\n' >> "$DSR_TEST_API_EXPORT_DIR/exported.calls"
+    count=$(grep -c '^REQUEST$' "$DSR_TEST_API_EXPORT_DIR/exported.calls")
+    if [[ "$DSR_TEST_API_EXPORT_CASE" == curl-304 ]]; then
+      [[ "$*" == *'If-None-Match: W/"old"'* ]] || return 91
+      printf 'HTTP/2 304\r\nETag: W/"fresh"\r\n\r\n'
+    elif [[ "$DSR_TEST_API_EXPORT_CASE" == curl-retry && "$count" == 1 ]]; then
+      printf 'HTTP/2 503\r\n\r\n{"message":"unavailable"}'
+    else
+      printf 'HTTP/2 200\r\nETag: W/"fresh"\r\n\r\n{"fresh":true}'
+    fi
+  }
+  export -f gh curl
+  local -a args=("$endpoint")
+  if [[ "$scenario" == retain-post ]]; then
+    args+=(--post '{"tag_name":"v1.2.3","name":"v1.2.3","body":"owned","draft":true,"prerelease":false}' --retain-response)
+  fi
+  bash -u -c 'cd "$1" || exit; shift; gh_api "$@"' exported-api "$TEMP_DIR" "${args[@]}" \
+    > "$TEMP_DIR/exported.stdout" 2> "$TEMP_DIR/exported.stderr" || status=$?
+  assert_equals 0 "$status" "exported API status" || return 1
+  count=$(grep -c '^REQUEST$' "$TEMP_DIR/exported.calls") || true
+  assert_equals "$expected_attempts" "$count" "exported API attempts" || return 1
+  ! grep -Eq 'command not found|unbound variable|No such file or directory' "$TEMP_DIR/exported.stderr" || return 1
+  [[ -z "$(find "$TEMP_DIR" -maxdepth 1 -name 'dsr-api-metadata.*' -print -quit)" ]] || return 1
+  if [[ "$scenario" == retain-post ]]; then
+    local -a originals=("$TEMP_DIR"/dsr-api-response.????????)
+    [[ ${#originals[@]} -eq 1 && -f "${originals[0]}" ]] || return 1
+    cmp "${originals[0]}" <(printf '{\n  "id":9,"tag_name":"v1.2.3","name":"v1.2.3",\n  "body":"owned","draft":true,"prerelease":false,"assets":[]\n}\n\n')
+  else
+    assert_equals "$expected" "$(cat "$TEMP_DIR/exported.stdout")" "exported response" || return 1
+    assert_equals "$expected" "$(_gh_get_cache "$endpoint")" "exported cached response" || return 1
+    if [[ "$scenario" == curl-* ]]; then
+      assert_equals 'W/"fresh"' "$(_gh_get_etag "$endpoint")" "exported ETag" || return 1
+    fi
+    [[ -z "$(find "$TEMP_DIR" -maxdepth 1 -name 'dsr-api-response.*' -print -quit)" ]]
+  fi
+)
+
+run_exported_api_regressions() {
+  run_test api_exported_gh test_exported_api_scenario gh-success 1
+  run_test api_exported_curl_304 test_exported_api_scenario curl-304 1
+  run_test api_exported_curl_retry test_exported_api_scenario curl-retry 2
+  run_test api_exported_original_post test_exported_api_scenario retain-post 1
+}
+
+run_api_deadline_regressions() {
+  run_test api_complete_request_deadlines test_api_enforces_complete_request_deadlines
+  run_test api_rejects_invalid_deadlines_before_credentials test_api_rejects_invalid_deadlines_before_credentials
+  run_test api_retains_original_draft_response test_api_retains_original_draft_response
+  run_test api_retention_rejects_unsafe_directories_and_operations test_api_retention_rejects_unsafe_directories_and_operations
+  run_test api_retention_rejects_malformed_or_unrelated_responses test_api_retention_rejects_malformed_or_unrelated_responses
+  run_exported_api_regressions
+  run_api_retry_regressions
+}
 
 test_download_release_asset_uses_authenticated_gh() {
   local destination="$TEMP_DIR/gh-asset.bin"
@@ -2214,6 +2415,12 @@ main() {
   echo "=== github.sh Tests ==="
   echo ""
 
+  if [[ "${1:-}" == --api-deadline-only ]]; then
+    run_api_deadline_regressions
+    printf 'API deadlines and custody: %s passed, %s failed\n' "$TESTS_PASSED" "$TESTS_FAILED"
+    [[ "$TESTS_FAILED" -eq 0 ]]
+    exit $?
+  fi
   if [[ "${1:-}" == --api-retry-only ]]; then
     run_api_retry_regressions
     printf 'API retries: %s passed, %s failed\n' "$TESTS_PASSED" "$TESTS_FAILED"
@@ -2291,6 +2498,9 @@ main() {
   echo "API Argument Parsing:"
   run_test "api_rejects_empty_endpoint" test_api_rejects_empty_endpoint
   run_test "api_rejects_unknown_option" test_api_rejects_unknown_option
+  run_test api_complete_request_deadlines test_api_enforces_complete_request_deadlines
+  run_test api_rejects_invalid_deadlines_before_credentials test_api_rejects_invalid_deadlines_before_credentials
+  run_exported_api_regressions
   run_test "api_retains_original_draft_response" test_api_retains_original_draft_response
   run_test "api_retention_rejects_unsafe_directories_and_operations" test_api_retention_rejects_unsafe_directories_and_operations
   run_test "api_retention_rejects_malformed_or_unrelated_responses" test_api_retention_rejects_malformed_or_unrelated_responses

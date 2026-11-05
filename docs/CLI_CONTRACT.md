@@ -464,7 +464,14 @@ also includes the nonempty `queued_job_ids` array and measures
 - `0`: No throttling detected
 - `1`: Throttling detected (triggers fallback recommendation)
 - `3`: gh auth missing
+- `4`: Invalid request deadline configuration
+- `5`: Authentication interrupted
 - `8`: GitHub API error for a repo (listed in `details.skipped`), with no throttling seen elsewhere
+
+Authentication preflight is bounded by `GH_API_TIMEOUT` (60 seconds by default).
+A stalled credential helper returns exit 8; interruption returns exit 5 without
+trying another authentication transport. Each subsequent GitHub API attempt
+has the same deadline, covering authentication, token lookup, and the request.
 
 ---
 
@@ -2232,6 +2239,7 @@ Structured error codes for programmatic handling:
 | `DSR_GH_TOKEN` | | Highest-priority GitHub API token for DSR |
 | `GITHUB_TOKEN` | | GitHub API token, after `DSR_GH_TOKEN` |
 | `GH_TOKEN` | | GitHub API token, after `DSR_GH_TOKEN` and `GITHUB_TOKEN` |
+| `GH_API_TIMEOUT` | 60 | Positive integer seconds per complete JSON API attempt or standalone authentication check (maximum 999999) |
 | `DSR_SLACK_WEBHOOK` | config `notifications.slack_webhook` | Slack incoming webhook for `--notify slack` |
 | `DSR_DISCORD_WEBHOOK` | config `notifications.discord_webhook` | Discord webhook for `--notify discord` |
 | `DSR_NOTIFY_TIMEOUT` | 20 | Seconds allowed per webhook delivery |
@@ -2246,6 +2254,14 @@ redirect these public-GitHub operations. The caller's environment and saved
 logins are unchanged. A rejected explicit token is not replaced with another
 account's credential. The sourceable `gh_api` adapter accepts relative API
 paths rather than absolute URLs that could change the request's host.
+
+The sourceable `gh_api` adapter returns 124 when its complete attempt exceeds
+`GH_API_TIMEOUT`. A deadline, cancellation, or lost mutation response never
+authorizes replaying that mutation. Confirmed rate-limit rejections retain the
+existing bounded retry policy; each retry gets its own attempt deadline.
+Successful draft creation still retains the original response bytes when
+requested, while an interrupted attempt cannot leave an accepted creation
+receipt or cached response.
 
 A webhook delivery that fails (an HTTP error such as a revoked webhook's 404, or
 a timeout) is reported and is not recorded as sent, so the next occurrence of
