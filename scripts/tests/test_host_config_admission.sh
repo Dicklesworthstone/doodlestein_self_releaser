@@ -19,6 +19,7 @@ export DSR_REPOS_FILE="$DSR_CONFIG_DIR/repos.yaml"
 mkdir -p "$DSR_CONFIG_DIR" "$DSR_CACHE_DIR" "$DSR_STATE_DIR" || exit 1
 # Run the exact same public admission matrix against an unchanged module when
 # collecting a baseline; the default always exercises the checkout under test.
+# shellcheck source=src/host_health.sh
 source "${DSR_TEST_HOST_HEALTH_MODULE:-$PROJECT_ROOT/src/host_health.sh}"
 
 RUN=0 PASSED=0 FAILED=0 SKIPPED=0
@@ -353,6 +354,219 @@ selection_error() {
     reject 4 host_health_get_healthy_hosts --json
 }
 
+# Exercise selection through the real configuration, health, cache and selector
+# modules. Only the external SSH transport is controlled; every contacted route
+# is recorded, including failed connectivity. No real remote host is contacted.
+selection_scope_fixture() {
+    cat > "$DSR_HOSTS_FILE" <<'YAML'
+hosts:
+  primary:
+    platform: linux/amd64
+    connection: ssh
+    ssh_host: primary-route
+    concurrency: 1
+    capabilities:
+      - go
+  backup:
+    platform: linux/amd64
+    connection: ssh
+    ssh_host: backup-route
+    concurrency: 1
+    capabilities:
+      - go
+  other-os:
+    platform: darwin/arm64
+    connection: ssh
+    ssh_host: other-os-route
+    capabilities:
+      - go
+  other-tool:
+    platform: linux/amd64
+    connection: ssh
+    ssh_host: other-tool-route
+    capabilities:
+      - rust
+  disabled:
+    platform: linux/amd64
+    connection: ssh
+    ssh_host: disabled-route
+    enabled: false
+    capabilities:
+      - go
+YAML
+    SCOPE_TRACE="$TEST_ROOT/scope-probes-$RUN"
+    SCOPE_FAILURE="${1:-backup}"
+    SCOPE_DISK=$(jq -nc '{requested_paths:[],roles:(["root","home","build_root","cargo_home","temp"] | map(
+        . as $role | (if $role == "root" then "/" else "/fixture/" + $role end) as $path |
+        {role:$role,path:$path,probe_path:$path,filesystem_id:"10",capacity_group:"filesystem:10",
+         available_bytes:192199786496,total_bytes:3958241859993,usage_percent:96}))}') || return 1
+    # shellcheck disable=SC2317
+    _hh_run_with_timeout() {
+        [[ $# -eq 11 && "$2" == ssh && "$3" == -n ]] || return 91
+        local route="${10}" command="${11}"
+        printf '%s\n' "$route" >> "$SCOPE_TRACE" || return 92
+        case "$route" in
+            primary-route|backup-route) ;;
+            *) return 1 ;;
+        esac
+        if [[ "$SCOPE_FAILURE" == all || "$route" == "$SCOPE_FAILURE-route" ]]; then
+            return 1
+        fi
+        case "$command" in
+            'echo ok') printf 'ok\n' ;;
+            *DSR_UNIX_WRITABLE_PY*)
+                if [[ "$route" == primary-route && "$SCOPE_FAILURE" == low-space ]]; then
+                    jq '.roles |= map(.available_bytes=2147483648)' <<< "$SCOPE_DISK"
+                else
+                    printf '%s\n' "$SCOPE_DISK"
+                fi
+                ;;
+            'go version 2>/dev/null')
+                [[ "$route" != primary-route || "$SCOPE_FAILURE" != missing-tool ]] || return 1
+                printf 'go version go1.25.0 linux/amd64\n' ;;
+            'date +%s') date +%s ;;
+            *) return 93 ;;
+        esac
+    }
+    # shellcheck source=src/host_selector.sh
+    source "$PROJECT_ROOT/src/host_selector.sh"
+}
+
+selection_scope_routes() {
+    [[ -f "$SCOPE_TRACE" ]] || return 1
+    [[ $(LC_ALL=C sort -u "$SCOPE_TRACE") == "$1" ]]
+}
+
+selection_scope_target() {
+    selection_scope_fixture || return 1
+    local chosen
+    chosen=$(selector_choose_host --target linux/amd64 --capability go) || return 1
+    [[ "$chosen" == primary ]] || return 1
+    selection_scope_routes $'backup-route\nprimary-route'
+}
+
+selection_scope_os() {
+    selection_scope_fixture || return 1
+    local chosen
+    chosen=$(selector_choose_host --target linux/amd64) || return 1
+    [[ "$chosen" == primary ]] || return 1
+    selection_scope_routes $'backup-route\nother-tool-route\nprimary-route'
+}
+
+selection_scope_capability() {
+    selection_scope_fixture || return 1
+    local hosts
+    hosts=$(host_health_get_healthy_hosts --for-capability go --json) || return 1
+    [[ $(jq -c . <<< "$hosts") == '["primary"]' ]] || return 1
+    selection_scope_routes $'backup-route\nother-os-route\nprimary-route'
+}
+
+selection_scope_failover() {
+    selection_scope_fixture "$1" || return 1
+    local chosen
+    chosen=$(selector_choose_host --target linux/amd64 --capability go --prefer primary) || return 1
+    [[ "$chosen" == backup ]] || return 1
+    selection_scope_routes $'backup-route\nprimary-route'
+}
+
+selection_scope_unhealthy() {
+    selection_scope_fixture all || return 1
+    reject 1 selector_choose_host --target linux/amd64 --capability go || return 1
+    selection_scope_routes $'backup-route\nprimary-route'
+}
+
+selection_scope_fleet() {
+    selection_scope_fixture || return 1
+    local report status=0
+    report=$(host_health_check_all --json --fail-unhealthy) || status=$?
+    [[ $status -eq 1 ]] || return 1
+    jq -e '.summary.total == 4 and .summary.healthy == 1 and .summary.unhealthy == 3 and
+        (.hosts | map(.hostname) | sort) == ["backup","other-os","other-tool","primary"]' \
+        <<< "$report" >/dev/null || return 1
+    selection_scope_routes $'backup-route\nother-os-route\nother-tool-route\nprimary-route'
+}
+
+selection_scope_empty() {
+    selection_scope_fixture || return 1
+    local hosts report
+    hosts=$(host_health_get_healthy_hosts --json "$@") || return 1
+    [[ $(jq -c . <<< "$hosts") == '[]' ]] || return 1
+    report=$(host_health_check_all --json --fail-unhealthy "$@") || return 1
+    jq -e '.hosts == [] and .summary.total == 0 and .summary.unhealthy == 0' <<< "$report" >/dev/null || return 1
+    [[ ! -e "$SCOPE_TRACE" ]]
+}
+
+selection_scope_invalid_option() {
+    selection_scope_fixture || return 1
+    reject 4 host_health_get_healthy_hosts --json "$@" || return 1
+    reject 4 host_health_check_all --json "$@" || return 1
+    [[ ! -e "$SCOPE_TRACE" ]]
+}
+
+selection_scope_invalid_host() {
+    selection_scope_fixture || return 1
+    # Append after all valid hosts so a streaming implementation would already
+    # have emitted/probed candidates before discovering this unrelated error.
+    printf '  invalid-elsewhere:\n    platform: darwin/arm64\n    enabled: %s\n    capabilities: go\n' \
+        "$1" >> "$DSR_HOSTS_FILE" || return 1
+    reject 4 selector_choose_host --target linux/amd64 --capability go || return 1
+    [[ ! -e "$SCOPE_TRACE" ]]
+}
+
+selection_scope_aliases() {
+    selection_scope_fixture || return 1
+    cat > "$DSR_HOSTS_FILE" <<'YAML'
+go-tools: &go_tools
+  - go
+hosts:
+  primary:
+    platform: linux/amd64
+    connection: ssh
+    ssh_host: primary-route
+    concurrency: 1
+    capabilities: *go_tools
+  other-os:
+    platform: darwin/arm64
+    connection: ssh
+    ssh_host: other-os-route
+    capabilities: *go_tools
+YAML
+    local chosen
+    chosen=$(selector_choose_host --target linux/amd64 --capability go) || return 1
+    [[ "$chosen" == primary ]] || return 1
+    selection_scope_routes primary-route
+}
+
+run_selection_scope_tests() {
+    if ! $HAVE_YQ; then
+        echo 'SKIP: install Mike Farah yq v4 for scoped selection integration tests'
+        SKIPPED=$((SKIPPED + 1))
+        return 0
+    fi
+    run_test 'native selector probes only the requested OS and declared capability' selection_scope_target
+    run_test 'OS-only selection still checks every eligible toolchain host' selection_scope_os
+    run_test 'capability-only selection checks that capability on every OS' selection_scope_capability
+    run_test 'unscoped fleet health still observes and reports unhealthy hosts' selection_scope_fleet
+    run_test 'an unreachable preferred host routes to its healthy eligible backup' selection_scope_failover primary
+    run_test 'a preferred host missing the requested tool routes to a qualified backup' selection_scope_failover missing-tool
+    run_test 'a preferred host below the disk floor routes to an admitted backup' selection_scope_failover low-space
+    run_test 'selection refuses when every eligible host is unreachable' selection_scope_unhealthy
+    run_test 'an OS with no configured builders produces an empty inventory without probing' selection_scope_empty --for-os windows
+    run_test 'an absent capability produces an empty inventory without probing' selection_scope_empty --for-capability bun
+    run_test 'disjoint OS and capability scopes produce no probes' selection_scope_empty --for-os darwin --for-capability rust
+    run_test 'missing OS scope fails before probing' selection_scope_invalid_option --for-os
+    run_test 'empty OS scope fails before probing' selection_scope_invalid_option --for-os ''
+    run_test 'an option cannot be interpreted as an OS scope' selection_scope_invalid_option --for-os --json
+    run_test 'malformed OS scope fails before probing' selection_scope_invalid_option --for-os 'linux/amd64'
+    run_test 'missing capability scope fails before probing' selection_scope_invalid_option --for-capability
+    run_test 'empty capability scope fails before probing' selection_scope_invalid_option --for-capability ''
+    run_test 'malformed capability scope fails before probing' selection_scope_invalid_option --for-capability 'go rust'
+    run_test 'unknown scope option fails before probing' selection_scope_invalid_option --unknown
+    run_test 'malformed out-of-scope host blocks selection before any probe' selection_scope_invalid_host true
+    run_test 'malformed disabled host still blocks selection before any probe' selection_scope_invalid_host false
+    run_test 'capability aliases resolve before scoped host selection' selection_scope_aliases
+}
+
 capacity_fixture() {
     local usage="$1" available="$2" slots="${3-1}"
     cat > "$DSR_HOSTS_FILE" <<'YAML'
@@ -512,6 +726,13 @@ if [[ "${1:-}" == --capacity-only ]]; then
     exit $?
 fi
 
+if [[ "${1:-}" == --selection-only ]]; then
+    run_selection_scope_tests
+    printf '\nScoped host selection: %s passed, %s failed, %s skipped\n' "$PASSED" "$FAILED" "$SKIPPED"
+    [[ $FAILED -eq 0 ]]
+    exit $?
+fi
+
 run_test 'normalization defaults apply only to missing fields' normal_defaults
 run_test 'typed capabilities, SSH route and explicit false survive normalization' normal_values
 for invalid in 'null' '[]' '{}' 'false' \
@@ -544,6 +765,7 @@ run_test 'cache writes replace atomically and never truncate a held prior receip
 run_test 'linked cache destinations are neither followed nor replaced' cache_symlink_refusal
 run_test 'cache paths reject traversal labels' reject 4 _hh_cache_file ../outside
 run_test 'host selection propagates configuration errors instead of returning an empty success' selection_error
+run_selection_scope_tests
 run_capacity_tests
 if command -v go >/dev/null 2>&1; then
     run_test 'real local toolchain is admitted and require-go succeeds' live_local
