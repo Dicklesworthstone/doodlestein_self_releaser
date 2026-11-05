@@ -2140,6 +2140,7 @@ if match is None:
 sys.stdout.write(match[1].replace("\x27\x27", "\x27"))
 ') || return 1
         fi
+        decoded="${decoded#\[Console\]::OutputEncoding=\[Text.UTF8Encoding\]::new\(\)\; }"
         decoded="${decoded#\$ProgressPreference=\'SilentlyContinue\'; }"
         if [[ "$decoded" == "\$ErrorActionPreference='Stop'; \$c=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('"* ]]; then
             inner="${decoded#*FromBase64String(\'}"
@@ -4421,6 +4422,14 @@ test_unix_fallback_to_local_path() {
 
 test_windows_build_guard_transport_and_timeout_validation() {
     log_test "Windows guard: literal source survives transport and invalid deadlines fail"
+    local utf8_command utf8_payload
+    utf8_command=$(_act_windows_encoded_powershell "Write-Output '日本語'" pwsh)
+    utf8_payload=$(printf '%s' "${utf8_command##* }" | base64 -d | iconv -f UTF-16LE -t UTF-8)
+    if [[ "$utf8_payload" == '[Console]::OutputEncoding=[Text.UTF8Encoding]::new(); '* ]]; then
+        log_pass "Windows wrapper explicitly emits UTF-8 instead of inherited console bytes"
+    else
+        log_fail "Windows wrapper omitted UTF-8 output encoding"
+    fi
     local script=$'Write-Output '\''日本語 '\'''\'' quoted'\''\nexit 37'
     local guard encoded decoded bad rejected=true
     guard=$(_act_windows_build_guard_script 30 "$script") || {

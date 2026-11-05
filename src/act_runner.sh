@@ -4177,8 +4177,11 @@ _act_windows_encoded_powershell() {
         _log_error "iconv and base64 are required to encode a Windows PowerShell command"
         return 3
     fi
+    # SSH transports bytes: the inherited Windows console code page otherwise
+    # corrupts non-ASCII Cargo metadata before the Unix caller can parse JSON.
+    # Set this in the wrapper so file-backed and compressed scripts agree.
     # Progress records would otherwise reach stderr as CLIXML noise over ssh.
-    payload="\$ProgressPreference='SilentlyContinue'; $script"
+    payload="[Console]::OutputEncoding=[Text.UTF8Encoding]::new(); \$ProgressPreference='SilentlyContinue'; $script"
     encoded=$(printf '%s' "$payload" | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\r\n') || return 4
     # Windows shell launchers can truncate commands at 8191 characters. Keep
     # headroom for the executable/options and transport wrapper. Compression
