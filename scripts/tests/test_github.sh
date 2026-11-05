@@ -2095,6 +2095,167 @@ test_upload_rejects_source_mutation_during_snapshot() (
     [[ -z "$(find "$TMPDIR" -mindepth 1 -print -quit)" ]]
 )
 
+# Keep the real credential cascade, supervisor, upload snapshot and recovery
+# checks. Only gh/curl are offline fixtures. A stopped POST may already own a
+# complete remote asset; it must not report success or replay until a new call
+# independently verifies that retained asset.
+test_upload_bounds_credentials_and_transfers() {
+  python3 - "$GITHUB_MODULE" "$TEMP_DIR" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+module, root = sys.argv[1], Path(sys.argv[2])
+payload = b'release-payload\x00\x01\xff\n'
+asset = {'id': 42, 'name': 'asset+build.tar.gz', 'state': 'uploaded',
+         'size': len(payload), 'digest': 'sha256:' + hashlib.sha256(payload).hexdigest()}
+driver = r'''
+source "$1" || exit $?
+case_dir="$2" phase="$3"
+export GH_API_TIMEOUT=15 GH_UPLOAD_TIMEOUT=1 GH_MAX_RETRIES=3 GH_RETRY_DELAY=0
+[[ "$phase" != token ]] || GH_API_TIMEOUT=1
+export TMPDIR="$case_dir/staging" GH_CACHE_DIR="$case_dir/cache"
+unset DSR_GH_TOKEN GITHUB_TOKEN GH_TOKEN
+stall() {
+    printf 'started\n' >> "$case_dir/started"
+    ( command sleep 30; printf 'descendant escaped\n' >> "$case_dir/escaped" ) &
+    command sleep 30
+    printf 'worker escaped\n' >> "$case_dir/escaped"
+}
+gh() {
+    case "${1:-} ${2:-}" in
+        'auth token')
+            printf 'token\n' >> "$case_dir/auth"
+            [[ "$phase" != token ]] || stall
+            printf 'fixture-token\n'
+            ;;
+        'auth status') return 0 ;;
+        'api repos/owner/repo/releases/9/assets?per_page=100&page=1')
+            printf 'GET\n' >> "$case_dir/requests"
+            cat "$case_dir/remote.json"
+            ;;
+        *) return 90 ;;
+    esac
+}
+curl() {
+    local output='' headers='' snapshot='' argument previous=''
+    for argument in "$@"; do
+        case "$previous" in
+            -o) output="$argument" ;;
+            -D) headers="$argument" ;;
+            --data-binary) snapshot="${argument#@}" ;;
+        esac
+        previous="$argument"
+    done
+    printf 'POST\n' >> "$case_dir/requests"
+    [[ "$phase" != resume && -n "$output" && -n "$headers" &&
+       "$snapshot" != "$case_dir/asset+build.tar.gz" ]] || return 91
+    cmp -s "$snapshot" "$case_dir/asset+build.tar.gz" || return 92
+    printf 'HTTP/2 201\r\n\r\n' > "$headers"
+    if [[ "$phase" == post ]]; then
+        printf '{"id":' > "$output"
+    else
+        cp "$snapshot" "$case_dir/remote.payload" || return 93
+        jq -s '.' "$case_dir/receipt.json" > "$case_dir/remote.json" || return 94
+        cat "$case_dir/receipt.json" > "$output"
+    fi
+    printf '201'
+    case "$phase" in
+        post-cancel) return 130 ;;
+        post-supervisor) return 125 ;;
+        *) stall ;;
+    esac
+}
+gh_upload_asset_named 'https://uploads.github.com/repos/owner/repo/releases/9/assets{?name,label}' \
+    "$case_dir/asset+build.tar.gz" 'asset+build.tar.gz'
+'''
+
+
+def run(case, phase):
+    result = subprocess.run(['bash', '-c', driver, 'upload-deadline', module, str(case), phase],
+                            capture_output=True, text=True, timeout=60,
+                            env=dict(os.environ, NO_COLOR='1'))
+    (case / (phase + '.stdout')).write_text(result.stdout)
+    (case / (phase + '.stderr')).write_text(result.stderr)
+    return result
+
+
+for phase, status in (('token', 124), ('post', 124), ('post-committed', 124),
+                      ('post-cancel', 130), ('post-supervisor', 125)):
+    case = root / phase
+    case.mkdir(mode=0o700)
+    (case / 'staging').mkdir(mode=0o700)
+    (case / 'cache').mkdir(mode=0o700)
+    (case / 'asset+build.tar.gz').write_bytes(payload)
+    (case / 'remote.json').write_text('[]\n')
+    (case / 'receipt.json').write_text(json.dumps(asset) + '\n')
+    result = run(case, phase)
+    assert result.returncode == status, (phase, result.returncode, result.stderr)
+    assert not result.stdout, (phase, 'stopped upload emitted a receipt', result.stdout)
+    assert not (case / 'escaped').exists(), (phase, 'upload worker survived its deadline')
+    assert not list((case / 'staging').iterdir()), (phase, 'private staging leaked')
+    assert (case / 'asset+build.tar.gz').read_bytes() == payload, (phase, 'local bytes changed')
+    if phase == 'token':
+        assert (case / 'auth').read_text() == 'token\n', 'credential lookup retried'
+        assert not (case / 'requests').exists(), 'request followed a credential deadline'
+    else:
+        assert (case / 'requests').read_text() == 'GET\nPOST\n', (phase, 'request was replayed')
+    if phase in ('token', 'post'):
+        assert json.loads((case / 'remote.json').read_text()) == []
+    else:
+        retained = (case / 'remote.json').read_bytes()
+        assert json.loads(retained) == [asset]
+        assert (case / 'remote.payload').read_bytes() == payload
+        recovered = run(case, 'resume')
+        assert recovered.returncode == 0, (phase, recovered.stderr)
+        assert json.loads(recovered.stdout) == asset, (phase, recovered.stdout)
+        assert (case / 'remote.json').read_bytes() == retained, (phase, 'remote evidence changed')
+        assert (case / 'remote.payload').read_bytes() == payload, (phase, 'remote bytes changed')
+        assert (case / 'requests').read_text() == 'GET\nPOST\nGET\n', (phase, 'resume repeated POST')
+        assert not list((case / 'staging').iterdir()), (phase, 'resume staging leaked')
+    if phase in ('token', 'post', 'post-committed'):
+        assert (case / 'started').read_text() == 'started\n', (phase, 'blocked operation repeated')
+print('Upload deadlines: five stopped operations and three byte-verified recoveries passed')
+PY
+}
+
+test_upload_rejects_invalid_auth_deadlines() (
+  local asset="$TEMP_DIR/asset" value status
+  printf 'payload\n' > "$asset"
+  gh() { printf 'auth called\n' >> "$TEMP_DIR/network"; return 1; }
+  curl() { printf 'post called\n' >> "$TEMP_DIR/network"; return 1; }
+  for value in 0 -1 1s 1.5 1000000 bad; do
+    status=0
+    GH_API_TIMEOUT="$value" gh_upload_asset_named \
+      'https://uploads.github.com/repos/owner/repo/releases/9/assets' "$asset" asset \
+      >/dev/null 2>&1 || status=$?
+    assert_equals 4 "$status" "invalid upload authentication deadline $value" || return 1
+  done
+  [[ ! -e "$TEMP_DIR/network" ]]
+)
+
+run_upload_deadline_regressions() {
+  run_test upload_bounds_credentials_and_transfers test_upload_bounds_credentials_and_transfers
+  run_test upload_rejects_invalid_auth_deadlines test_upload_rejects_invalid_auth_deadlines
+  local scenario status posts downloads
+  while read -r scenario status posts downloads; do
+    run_test "upload_$scenario" test_release_upload_scenario "$scenario" "$status" "$posts" "$downloads"
+  done <<'UPLOAD_DEADLINE_COMPATIBILITY'
+fresh 0 1 0
+existing 0 0 0
+legacy 0 0 1
+lost-response 0 1 0
+retry-503 0 2 0
+retry-after 0 2 0
+long-cooldown 8 1 0
+raced-conflict 7 1 0
+no-token 3 0 0
+UPLOAD_DEADLINE_COMPATIBILITY
+}
+
 test_compare_rejects_missing_args() {
   ! gh_compare "owner/repo" "" "head" 2>/dev/null
   ! gh_compare "owner/repo" "base" "" 2>/dev/null
@@ -2441,6 +2602,12 @@ main() {
     [[ "$TESTS_FAILED" -eq 0 ]]
     exit $?
   fi
+  if [[ "${1:-}" == --upload-deadline-only ]]; then
+    run_upload_deadline_regressions
+    printf 'Upload deadlines and recovery: %s passed, %s failed\n' "$TESTS_PASSED" "$TESTS_FAILED"
+    [[ "$TESTS_FAILED" -eq 0 ]]
+    exit $?
+  fi
   if [[ "${1:-}" == --credential-routing-only ]]; then
     run_credential_routing_tests
     printf 'Credential routing: %s passed, %s failed\n' "$TESTS_PASSED" "$TESTS_FAILED"
@@ -2590,6 +2757,8 @@ API_SCENARIOS
   run_test "upload_rejects_unsafe_inputs_before_auth" test_upload_rejects_unsafe_inputs_before_auth
   run_test "upload_rejects_invalid_retry_configuration" test_upload_rejects_invalid_retry_configuration
   run_test "upload_rejects_source_mutation_during_snapshot" test_upload_rejects_source_mutation_during_snapshot
+  run_test "upload_bounds_credentials_and_transfers" test_upload_bounds_credentials_and_transfers
+  run_test "upload_rejects_invalid_auth_deadlines" test_upload_rejects_invalid_auth_deadlines
   local scenario expected_status expected_posts expected_downloads
   while read -r scenario expected_status expected_posts expected_downloads; do
     run_test "upload_$scenario" test_release_upload_scenario \

@@ -1553,12 +1553,13 @@ _gh_validate_upload_inventory() {
 # On an ambiguous POST failure, reconcile by name AND content before retrying.
 # No remote assets are deleted or replaced, including incomplete starter assets.
 # GH_MAX_RETRIES bounds POST attempts (1..10); GH_UPLOAD_TIMEOUT bounds each
-# POST in seconds (default 900). A subshell scopes cleanup/signal traps locally.
+# POST process and its descendants in seconds (default 900). GH_API_TIMEOUT
+# also bounds credential resolution. A subshell scopes cleanup/signal traps.
 gh_upload_asset_named() (
     local upload_url="${1:-}" file_path="${2:-}" upload_name="${3:-}"
     local content_type="${4:-application/octet-stream}"
     local max_attempts="${GH_MAX_RETRIES:-3}" retry_delay="${GH_RETRY_DELAY:-5}"
-    local timeout="${GH_UPLOAD_TIMEOUT:-900}"
+    local timeout="${GH_UPLOAD_TIMEOUT:-900}" auth_timeout
     local repo release_id token workdir sha snapshot_sha size asset response
     local attempt=0 status http_code curl_status retryable headers paused rate_limited
 
@@ -1582,6 +1583,7 @@ gh_upload_asset_named() (
         return 4
     fi
     retry_delay=$((10#$retry_delay))
+    auth_timeout=$(_gh_api_timeout) || return $?
     if ! command -v curl &>/dev/null || ! command -v jq &>/dev/null; then
         _gh_log_error "curl and jq are required for verified asset uploads"
         return 3
@@ -1591,10 +1593,14 @@ gh_upload_asset_named() (
     upload_inventory=$(_signing_release_manifest_snapshot "$file_path") || return $?
     sha=$(_gh_asset_sha256 "$file_path") || return $?
     _gh_validate_upload_inventory "$upload_inventory" "$file_path" "$upload_name" "$sha" || return $?
-    token=$(_gh_resolve_token) || {
-        _gh_log_error "No GitHub token available for asset upload"
-        return 3
-    }
+    status=0
+    token=$(run_with_timeout "$auth_timeout" _gh_resolve_token) || status=$?
+    if ((status != 0)); then
+        if ((status == 3)); then
+            _gh_log_error "No GitHub token available for asset upload"
+        fi
+        return "$status"
+    fi
     umask 077
     workdir=$(mktemp -d "${TMPDIR:-/tmp}/dsr-asset-upload.XXXXXXXX") || return 4
     # A direct function return can pop locals before the subshell EXIT trap.
@@ -1637,7 +1643,7 @@ gh_upload_asset_named() (
         # A successful lookup is not permission to upload after the source
         # manifest changes. Recheck immediately before every network write.
         _gh_validate_upload_inventory "$upload_inventory" "$file_path" "$upload_name" "$sha" || return $?
-        http_code=$(curl -sS --connect-timeout 15 --max-time "$timeout" \
+        http_code=$(run_with_timeout "$timeout" curl -sS --connect-timeout 15 --max-time "$timeout" \
             -X POST \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer $token" \
@@ -1646,6 +1652,13 @@ gh_upload_asset_named() (
             --data-binary "@$workdir/payload" \
             -D "$workdir/headers" -o "$workdir/response" -w '%{http_code}' \
             "$upload_url") || curl_status=$?
+        # A stopped supervisor or cancelled transport is terminal, even when
+        # partial output resembles a complete response. A later invocation
+        # independently reconciles the remote bytes before attempting a POST.
+        if ((curl_status == 2 || curl_status == 3 || curl_status == 4 || curl_status >= 124)); then
+            _gh_log_error "Asset upload stopped (exit $curl_status); re-run to reconcile remote bytes: $upload_name"
+            return "$curl_status"
+        fi
         response=$(cat "$workdir/response" 2>/dev/null) || response=""
         headers=$(cat "$workdir/headers") || return 8
         _GH_LAST_RETRY_AFTER=$(_gh_response_header retry-after "$headers")
