@@ -877,6 +877,15 @@ _act_workspace_include_path_is_symlink_free() {
     [[ ! -L "$cursor/$remainder" ]]
 }
 
+# macOS answers stat on /dev/fd/N with the descriptor's access (-r--------), not
+# the file's mode. Callers fence identity around this read, so the path names
+# the same inode as the held descriptor.
+_act_held_file_mode() {
+    local descriptor="$1" path="$2"
+    [[ "$(uname -s)" != Darwin ]] || descriptor=$path
+    stat -L -c %A "$descriptor" 2>/dev/null || stat -L -f %Sp "$descriptor" 2>/dev/null
+}
+
 # Freeze a member as soon as collection/staging hands it to the coordinator.
 # Keep its original inode open while checking bytes and permissions twice;
 # later members and the archiver must not redefine an earlier member's bytes.
@@ -896,7 +905,7 @@ _act_workspace_member_receipt() (
     exec 8< "$path" || return 4
     identity=$(_act_file_identity /dev/fd/8) || return 4
     [[ "$(_act_file_identity "$path")" == "$identity" ]] || return 4
-    mode=$(stat -L -c %A /dev/fd/8 2>/dev/null || stat -L -f %Sp /dev/fd/8 2>/dev/null) || return 4
+    mode=$(_act_held_file_mode /dev/fd/8 "$path") || return 4
     size=$(stat -L -c %s /dev/fd/8 2>/dev/null || stat -L -f %z /dev/fd/8 2>/dev/null) || return 4
     # A fresh read descriptor for each digest avoids relying on whether a
     # /dev/fd reopen shares the original offset (as it can on macOS).
@@ -910,7 +919,7 @@ _act_workspace_member_receipt() (
     _act_workspace_include_path_is_symlink_free "$artifact_dir" "$member" || return 4
     [[ -f "$path" && ! -L "$path" ]] || return 4
     final_identity=$(_act_file_identity "$path") || return 4
-    final_mode=$(stat -L -c %A /dev/fd/8 2>/dev/null || stat -L -f %Sp /dev/fd/8 2>/dev/null) || return 4
+    final_mode=$(_act_held_file_mode /dev/fd/8 "$path") || return 4
     final_size=$(stat -L -c %s /dev/fd/8 2>/dev/null || stat -L -f %z /dev/fd/8 2>/dev/null) || return 4
     exec 9< "$path" || return 4
     [[ "$(_act_file_identity /dev/fd/9)" == "$identity" ]] || return 4
