@@ -411,6 +411,73 @@ check('delegated compiler byte drift refuses the original proxy/manager observat
 compiler.rename(work / 'retained-dispatch-drift-rustc')
 shutil.copy2(real_toolchain_executable('rustc', alternate_sysroot / 'bin/rustc'), compiler)
 
+# Genuine Cargo searches CARGO_HOME/bin first unless PATH already contains it.
+# These explicitly synthetic drivers record which path Cargo selected and
+# forward to the real Cargo/compiler above; their version strings are never
+# substituted for compiler identity or used to qualify a genuine Zig build.
+plugin_home = work / 'plugin-home'
+plugin_bin = plugin_home / 'bin'
+plugin_bin.mkdir(parents=True)
+plugin_path = work / 'plugin-path'
+plugin_path.mkdir()
+plugin_marker = work / 'plugin-dispatch.log'
+home_plugin = plugin_bin / 'cargo-dsrprobe'
+path_plugin = plugin_path / 'cargo-dsrprobe'
+for plugin, label in ((home_plugin, 'home'), (path_plugin, 'path')):
+    plugin.write_text('#!/bin/sh\n'
+                      'if [ "${1:-}" = --version ]; then printf "DSR dispatch fixture 1.0\\n"; exit 0; fi\n'
+                      '[ "${1:-}" = dsrprobe ] || exit 4\nshift\n'
+                      'printf "%s\\n" ' + label + ' >> "$DSR_TEST_PLUGIN_MARKER"\n'
+                      'exec cargo build "$@"\n')
+    plugin.chmod(0o755)
+plugin_env = dict(dispatch_env, CARGO_HOME=str(plugin_home),
+                  PATH=str(plugin_path) + os.pathsep + dispatch_env['PATH'],
+                  CARGO_TARGET_DIR=str(work / 'plugin-output'),
+                  DSR_TEST_PLUGIN_MARKER=str(plugin_marker))
+plugin_command = 'cargo dsrprobe --quiet --locked --offline'
+plugin_before, plugin_observed, plugin_receipt = probe(plugin_command, plugin_env)
+plugin_build = build(plugin_command, plugin_env)
+plugin_after, _, _ = probe(plugin_command, plugin_env, mode='verify', receipt=plugin_receipt)
+check('genuine Cargo prefers its home plugin and compiles through that driver offline',
+      plugin_build.returncode == 0 and plugin_marker.read_text() == 'home\n' and
+      require([work / 'plugin-output' / host / 'debug/identity-probe']) == '42')
+check('the strict receipt and verification bind the home plugin actually selected by Cargo',
+      plugin_before.returncode == plugin_after.returncode == 0 and
+      expected_tool(plugin_observed, 'cargo-dsrprobe', home_plugin))
+with path_plugin.open('a') as stream:
+    stream.write('# changed lower-priority PATH driver\n')
+irrelevant_drift, _, _ = probe(plugin_command, plugin_env, mode='verify', receipt=plugin_receipt)
+check('a shadowed PATH plugin cannot replace the selected home plugin in verification',
+      plugin_before.returncode == 0 and irrelevant_drift.returncode == 0)
+with home_plugin.open('a') as stream:
+    stream.write('# changed selected home driver with the same version\n')
+plugin_drift, _, _ = probe(plugin_command, plugin_env, mode='verify', receipt=plugin_receipt)
+check('selected home-plugin byte drift refuses despite unchanged version and PATH driver',
+      plugin_before.returncode == 0 and plugin_drift.returncode != 0)
+home_plugin.rename(work / 'retained-home-plugin')
+path_before, path_observed, path_receipt = probe(plugin_command, plugin_env)
+path_build = build(plugin_command, plugin_env)
+check('Cargo and the observer both fall back to PATH when no executable home plugin exists',
+      path_before.returncode == path_build.returncode == 0 and
+      expected_tool(path_observed, 'cargo-dsrprobe', path_plugin) and
+      plugin_marker.read_text() == 'home\npath\n')
+(work / 'retained-home-plugin').rename(home_plugin)
+plugin_shadow, _, _ = probe(plugin_command, plugin_env, mode='verify', receipt=path_receipt)
+check('a newly created home plugin cannot reuse a receipt pinned to a PATH plugin',
+      path_before.returncode == 0 and plugin_shadow.returncode != 0)
+for index, spelling in enumerate((str(plugin_bin), str(plugin_home) + '//./bin/')):
+    ordered_marker = work / ('ordered-plugin-' + str(index) + '.log')
+    ordered_env = dict(plugin_env,
+                       PATH=str(plugin_path) + os.pathsep + spelling + os.pathsep + dispatch_env['PATH'],
+                       DSR_TEST_PLUGIN_MARKER=str(ordered_marker))
+    ordered_before, ordered_observed, ordered_receipt = probe(plugin_command, ordered_env)
+    ordered_build = build(plugin_command, ordered_env)
+    ordered_after, _, _ = probe(plugin_command, ordered_env, mode='verify', receipt=ordered_receipt)
+    check('explicit Cargo home/bin PATH position agrees with genuine dispatch and verification: ' + spelling,
+          ordered_before.returncode == ordered_build.returncode == ordered_after.returncode == 0 and
+          ordered_marker.read_text() == 'path\n' and
+          expected_tool(ordered_observed, 'cargo-dsrprobe', path_plugin))
+
 if mode == 'rustup-dispatch':
     print(str(passed) + ' passed; ' + str(failed) + ' failed')
     sys.exit(1 if failed else 0)

@@ -3833,7 +3833,59 @@ if { [ "$_dsr_subcommand" != build ] && [ "$_dsr_subcommand" != zigbuild ]; } ||
   fi
   exec cargo "$@"
 fi
-if ! command -v cargo-zigbuild >/dev/null 2>&1 || ! command -v zig >/dev/null 2>&1; then
+# Compare Rust Path components without resolving symlinks or parent segments.
+# An explicit home/bin PATH entry keeps its position, even with /./ or //.
+_dsr_cargo_path_key() (
+  set -f
+  _dsr_key=
+  case "$1" in /*) _dsr_key=/ ;; .|./*) _dsr_key=. ;; esac
+  IFS=/
+  for _dsr_component in $1; do
+    case "$_dsr_component" in
+      ""|.) ;;
+      *) case "$_dsr_key" in
+           ""|/) _dsr_key=$_dsr_key$_dsr_component ;;
+           *) _dsr_key=$_dsr_key/$_dsr_component ;;
+         esac ;;
+    esac
+  done
+  printf '%s\n' "$_dsr_key"
+)
+if [ -n "${CARGO_HOME:-}" ]; then
+  _dsr_cargo_home=$CARGO_HOME
+  case "$_dsr_cargo_home" in /*) ;; *) _dsr_cargo_home="$(pwd -P)/$_dsr_cargo_home" ;; esac
+elif [ -n "${HOME:-}" ]; then
+  _dsr_cargo_home=$HOME/.cargo
+else
+  # Cargo uses the passwd entry for both an absent and an empty HOME.
+  # Python is already a worker dependency; never guess a relative Cargo home.
+  _dsr_cargo_home=$(python3 -I -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir + "/.cargo")') || {
+    echo "[dsr] cannot resolve the default Cargo home for Zig plugin selection" >&2
+    exit 4
+  }
+fi
+_dsr_cargo_bin_key=$(_dsr_cargo_path_key "$_dsr_cargo_home/bin")
+_dsr_cargo_bin_on_path=0
+_dsr_remaining_path=$PATH
+while :; do
+  _dsr_dir=${_dsr_remaining_path%%:*}
+  if [ "$(_dsr_cargo_path_key "$_dsr_dir")" = "$_dsr_cargo_bin_key" ]; then
+    _dsr_cargo_bin_on_path=1
+    break
+  fi
+  case "$_dsr_remaining_path" in
+    *:*) _dsr_remaining_path=${_dsr_remaining_path#*:} ;;
+    *) break ;;
+  esac
+done
+_dsr_zigbuild_path=$_dsr_cargo_home/bin/cargo-zigbuild
+# Cargo prepends its bin directory only when PATH does not already contain it.
+# The version admission must inspect the same plugin Cargo will execute.
+if [ "$_dsr_cargo_bin_on_path" -eq 1 ] ||
+   [ ! -f "$_dsr_zigbuild_path" ] || [ ! -x "$_dsr_zigbuild_path" ]; then
+  _dsr_zigbuild_path=$(command -v cargo-zigbuild) || _dsr_zigbuild_path=
+fi
+if [ -z "$_dsr_zigbuild_path" ] || ! command -v zig >/dev/null 2>&1; then
   echo "[dsr] generated DSR Cargo shim needs cargo-zigbuild and zig on this build host (cargo install cargo-zigbuild)" >&2
   exit 4
 fi
@@ -3862,7 +3914,7 @@ CARGO_ZIGBUILD_PYTHON_PATH=/dev/null
 CARGO_ZIGBUILD_ZIG_PATH=$_dsr_zig_path
 CARGO_ZIGBUILD_ZIG_COMMAND=$_dsr_zig_path
 export CARGO_ZIGBUILD_PYTHON_PATH CARGO_ZIGBUILD_ZIG_PATH CARGO_ZIGBUILD_ZIG_COMMAND
-_dsr_zb_version=$(cargo-zigbuild --version 2>/dev/null | awk "{print \$2}")
+_dsr_zb_version=$("$_dsr_zigbuild_path" --version 2>/dev/null | awk "{print \$2}")
 _dsr_zb_major=${_dsr_zb_version%%.*}
 _dsr_zb_rest=${_dsr_zb_version#*.}
 _dsr_zb_minor=${_dsr_zb_rest%%.*}
@@ -10512,8 +10564,35 @@ rch_shim_hash = '015f36047d1b732ada59b8644f7fde5e327803a11e56d571d2603af25c970ed
 rch_toolchain_hash = 'd5966567e177ce968f272848ab8e249da3d9bfca40f90237480e1fbe6bd9d2d0'
 rch_shim_v6_hash = '171e35f834fb8f900f85bd9ee22a659b3e710973dc3922d9579d055d560982e5'
 
-def identity(name, program, version_args, rustup_tool=None, required=True):
-    selected = shutil.which(program, path=probe_env.get('PATH'))
+def cargo_plugin_path(program):
+    # Cargo prepends its home/bin only when that directory is absent from PATH.
+    # Compare Rust Path components, not realpaths: /./ and repeated slashes
+    # compare equally, while relative entries, symlinks and /../ stay distinct.
+    def path_key(value):
+        prefix = '/' if value.startswith('/') else '.' if value == '.' or value.startswith('./') else ''
+        return (prefix, *(part for part in value.split('/') if part not in ('', '.')))
+
+    home = probe_env.get('CARGO_HOME')
+    if home:
+        if not os.path.isabs(home):
+            home = os.path.join(os.getcwd(), home)
+    else:
+        import pwd
+        user_home = probe_env.get('HOME') or pwd.getpwuid(os.getuid()).pw_dir
+        home = os.path.join(user_home, '.cargo')
+    home_bin = os.path.join(home, 'bin')
+    search = probe_env['PATH'].split(os.pathsep) if 'PATH' in probe_env else []
+    if not any(path_key(entry) == path_key(home_bin) for entry in search):
+        search.insert(0, home_bin)
+    for directory in search:
+        candidate = os.path.join(directory, program)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def identity(name, program, version_args, rustup_tool=None, required=True, cargo_plugin=False):
+    selected = cargo_plugin_path(program) if cargo_plugin else shutil.which(program, path=probe_env.get('PATH'))
     if not selected:
         if required:
             fail('required executable not found on the build PATH: ' + program)
@@ -10660,10 +10739,10 @@ if zig_shim_record is not None:
     plugins.add('zigbuild')
 for sub in sorted(plugins):
     program = 'cargo-' + sub
-    if zig_shim_record is not None and sub == 'zigbuild' and not shutil.which(program, path=probe_env.get('PATH')):
-        fail('generated DSR Cargo shim requires cargo-zigbuild on the delegated PATH')
-    if shutil.which(program, path=probe_env.get('PATH')):
-        tools[program] = identity(program, program, ['--version'], program, required=False)
+    if zig_shim_record is not None and sub == 'zigbuild' and not cargo_plugin_path(program):
+        fail('generated DSR Cargo shim requires cargo-zigbuild in Cargo home or on the delegated PATH')
+    if cargo_plugin_path(program):
+        tools[program] = identity(program, program, ['--version'], program, required=False, cargo_plugin=True)
 for name in sorted(set(extra.split()) | ({'zig'} if zig_shim_record is not None else set())):
     if not name.startswith('cargo-') and name not in tools:
         record = identity(name, name, ['version' if name == 'zig' else '--version'],

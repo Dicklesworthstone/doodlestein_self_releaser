@@ -663,6 +663,82 @@ class ZigShimAdmissionTests(unittest.TestCase):
                             'CARGO_ZIGBUILD_ZIG_VERSION': None})
                         self.assertFalse(Path(environment['DSR_FIXTURE_ZIG_MARKER']).exists())
 
+    def test_generated_shim_checks_the_plugin_cargo_home_will_select(self):
+        directory, environment = self.transport_environment()
+        home_bin = Path(environment['CARGO_HOME']) / 'bin'
+        home_bin.mkdir(parents=True)
+        home_marker = self.work / 'home-plugin-probed'
+        home_plugin = home_bin / 'cargo-zigbuild'
+        home_plugin.write_text('#!/bin/sh\nprintf probed > ' + shlex.quote(str(home_marker)) +
+                               '\nprintf "cargo-zigbuild 0.24.0\\n"\n')
+        home_plugin.chmod(0o755)
+        capture = self.work / 'home-plugin-dispatch.json'
+        result = subprocess.run([str(self.shim), 'build', '--target', TRIPLE], cwd=self.project,
+                                env=dict(environment, DSR_FIXTURE_CAPTURE=str(capture)),
+                                text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(home_marker.exists())
+        self.assertFalse(Path(environment['DSR_FIXTURE_PLUGIN_MARKER']).exists())
+        self.assertEqual(json.loads(capture.read_text())['argv'],
+                         ['zigbuild', '--target', TRIPLE + '.2.28'])
+
+        for index, spelling in enumerate((str(home_bin), str(home_bin.parent) + '//./bin/')):
+            ordered_marker = self.work / ('ordered-plugin-' + str(index))
+            ordered_env = dict(environment,
+                               PATH=str(self.shim_dir) + ':' + str(directory) + ':' + spelling + ':' + os.environ['PATH'],
+                               DSR_FIXTURE_CAPTURE=str(capture),
+                               DSR_FIXTURE_PLUGIN_MARKER=str(ordered_marker))
+            result = subprocess.run([str(self.shim), 'build', '--target', TRIPLE], cwd=self.project,
+                                    env=ordered_env, text=True, capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(ordered_marker.exists(), spelling)
+
+        # A plugin need not also be on PATH when Cargo can find it in its
+        # home. This still exercises only launcher transport/version admission.
+        (directory / 'cargo-zigbuild').rename(self.work / 'retained-path-plugin')
+        result = subprocess.run([str(self.shim), 'build', '--target', TRIPLE], cwd=self.project,
+                                env=dict(environment, DSR_FIXTURE_CAPTURE=str(capture)),
+                                text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_plugin_lookup_uses_passwd_home_when_home_is_unset_or_empty(self):
+        import pwd
+        directory, environment = self.transport_environment()
+        expected_home = os.path.join(pwd.getpwuid(os.getuid()).pw_dir, '.cargo')
+        # Execute the generated resolver prefix itself, stopping before version
+        # admission. This observes its path computation without a fake compiler
+        # or adding a plugin to the account's real Cargo home.
+        prefix = self.shim.read_text().split('if [ -z "$_dsr_zigbuild_path" ]', 1)[0]
+        self.assertNotEqual(prefix, self.shim.read_text())
+        prefix += '\nprintf "%s\\n" "$_dsr_cargo_home"\n'
+        program = 'cargo-dsr-home-' + self.work.name
+        decoy = self.project / '.cargo/bin' / program
+        decoy.parent.mkdir(parents=True)
+        decoy.write_text('#!/bin/sh\nexit 97\n')
+        decoy.chmod(0o755)
+        selected = directory / program
+        selected.write_text('#!/bin/sh\nexit 0\n')
+        selected.chmod(0o755)
+        for home in (None, ''):
+            with self.subTest(HOME=home):
+                env = dict(environment)
+                env.pop('CARGO_HOME', None)
+                if home is None:
+                    env.pop('HOME', None)
+                else:
+                    env['HOME'] = home
+                result = subprocess.run(['sh', '-c', prefix, str(self.shim), 'build'], cwd=self.project,
+                                        env=env, text=True, capture_output=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), expected_home)
+                previous_cwd = Path.cwd()
+                try:
+                    os.chdir(self.project)
+                    with patch.dict(namespace, {'probe_env': env}):
+                        self.assertEqual(namespace['cargo_plugin_path'](program), str(selected))
+                finally:
+                    os.chdir(previous_cwd)
+
     def test_generated_nonbuild_dispatch_preserves_cargo_arguments_without_zig_controls(self):
         directory, environment = self.transport_environment()
         for index, argv in enumerate((['metadata', '--no-deps'], ['--version'],
