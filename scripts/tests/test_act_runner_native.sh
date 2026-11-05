@@ -3752,7 +3752,7 @@ test_windows_strict_rust_forces_out_of_snapshot_target_dir() {
             --arg home "$expected_home" --argjson sources "$(_test_native_dependency_sources)" \
             --argjson toolchain "$expected_toolchain" \
             '.build_influence_env.CARGO_HOME == $home and
-             ($home | startswith("C:/build/.dsr-release-snapshots/tool-run/.cargo-home-windows-amd64-")) and
+             ($home | startswith("C:/build/.dsr-release-snapshots/tool-run/.c-")) and
              .cargo_isolation.cache_reuse == [] and
              .cargo_isolation.dependency_cache.seed.mode == "private-copy" and
              .cargo_isolation.dependency_cache.seed.selection.kind == "cargo-lock-downloads" and
@@ -4056,7 +4056,7 @@ test_windows_strict_dependency_sources_final_gate() {
                  .command == "cargo build --release" and
                  (.home as $home | .environment | contains("CARGO_HOME=" + $home)) and
                  .context.fingerprint == ("5"*64) and .context.receipt_sha256 == ("6"*64) and
-                 (.home | startswith("C:/build/windows-source-final/.cargo-home-windows-amd64-"))' \
+                 (.home | startswith("C:/build/windows-source-final/.c-"))' \
                 "$finish_args" >/dev/null; then
             log_fail "Strict Windows $boundary finish did not receive held source authority"
         elif [[ "$boundary" == admitted && "$status" -eq 0 && "$raw_ssh" == *'File]::OpenRead'* &&

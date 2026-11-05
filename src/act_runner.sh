@@ -6509,6 +6509,17 @@ _act_windows_cache_command() {
     fi
 }
 
+_act_windows_cargo_home_name() {
+    # Retain the full per-attempt UUID while saving Windows/libgit2 path budget.
+    # Other callers keep their existing names; no attempt identity is truncated.
+    local suffix="$1"
+    if [[ "$suffix" =~ ^windows-(amd64|arm64)-([0-9a-f]{32})$ ]]; then
+        printf '.c-%s' "${BASH_REMATCH[2]}"
+    else
+        printf '.cargo-home-%s' "$suffix"
+    fi
+}
+
 _act_windows_private_cargo_home_script() {
     local source_root="$1" suffix="$2"
     # Match the Unix ASCII path contract independently of coordinator locale.
@@ -6535,7 +6546,7 @@ _act_windows_private_cargo_home_script() {
 \$dsrSourceGuards.Add((Open-DsrCacheEntry \$dsrLockfile))
 \$dsrSourceParent=Split-Path -Parent \$dsrPhysicalSource
 \$dsrSeedHome=Join-Path \$dsrSourceParent '.cargo-home'
-\$dsrStrictHome=Join-Path \$dsrSourceParent '.cargo-home-$suffix'
+\$dsrStrictHome=Join-Path \$dsrSourceParent '$(_act_windows_cargo_home_name "$suffix")'
 \$dsrSeedPending=\$false
 if (Get-Item -LiteralPath \$dsrSeedHome -Force -ErrorAction SilentlyContinue) {
     Assert-DsrCargoHome -Path \$dsrSeedHome
@@ -6639,7 +6650,7 @@ _act_prepare_windows_private_cargo_home() {
     fi
     # Retain the requested attempt identity even when the host resolves a
     # physical source parent. A valid receipt cannot authorize another home.
-    if ! summary=$(jq -cse --arg name ".cargo-home-$suffix" '
+    if ! summary=$(jq -cse --arg name "$(_act_windows_cargo_home_name "$suffix")" '
         select(length == 1) | .[0] |
         select(type == "object" and .schema_version == 1 and .mode == "private-copy" and
             (.cargo_home | type == "string" and test("^[A-Za-z]:/[A-Za-z0-9_./+-]+$") and
@@ -6652,7 +6663,7 @@ _act_prepare_windows_private_cargo_home() {
                 (.fingerprint | test("^[0-9a-f]{64}$")) and
                 (.receipt_sha256 | test("^[0-9a-f]{64}$"))))
     ' <<< "$summary"); then
-        _log_error "Strict Windows Cargo cache preparation returned invalid private attempt evidence on $host (expected .cargo-home-$suffix)"
+        _log_error "Strict Windows Cargo cache preparation returned invalid private attempt evidence on $host (expected $(_act_windows_cargo_home_name "$suffix"))"
         return 4
     fi
     printf '%s\n' "$summary"
