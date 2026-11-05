@@ -67,6 +67,17 @@ gh_download_release_asset() {
     trace "download $2"
     [[ "$MODE" != network-failure ]] || return 8
     [[ "$MODE" != interrupted ]] || return 5
+    if [[ "$MODE" == late-failure && "$2" == 3 ]]; then
+        printf 'incomplete transport bytes\n' > "$3"
+        return 8
+    fi
+    if [[ "$MODE" == late-interrupted && "$2" == 3 ]]; then return 5; fi
+    if [[ "$MODE" == blocked-body && "$2" == 3 ]]; then
+        printf 'uncommitted transfer\n' > "$3"
+        : > "$CASE/body-blocked"
+        sleep 30
+        return 8
+    fi
     cp "$CASE/remote/$2" "$3" || return 8
     if [[ "$MODE" == changed-tag && "$2" == 3 ]]; then
         jq '.tag_commit=("b"*40)' "$CASE/context.json" > "$CASE/changed"
@@ -117,6 +128,7 @@ fetch() { policy slsa_fetch_release --output-dir "$CASE/snapshot" "$@"; }
 verify() { policy slsa_verify_snapshot "$CASE/snapshot" "$@"; }
 [[ "${DSR_SNAPSHOT_FIXTURES_ONLY:-false}" != true ]] || return 0
 
+if [[ "${DSR_SNAPSHOT_RESUME_ONLY:-0}" != 1 ]]; then
 new_case success
 expect 'existing remote verification keeps its original behavior' 0 policy slsa_verify_remote
 check 'ordinary verification retains no caller snapshot' test ! -e "$CASE/snapshot"
@@ -220,5 +232,196 @@ expect 'symlink output ancestor is rejected' 4 policy slsa_fetch_release --outpu
 expect 'relative output path is rejected' 4 policy slsa_fetch_release --output-dir relative
 expect 'duplicate output selections are rejected' 4 fetch --output-dir "$CASE/other"
 check 'invalid output selections perform no network reads' test ! -s "$CASE/calls"
+fi
+
+new_case resumable
+MODE=late-failure
+expect 'resumable fetch retains authenticated progress after a late transport failure' 8 fetch --resume
+check 'interrupted fetch exposes no complete snapshot' test ! -e "$CASE/snapshot"
+check 'checkpoint contains only complete first-platform payloads' bash -c \
+    '[[ -f "$1/selection.json" && -f "$1/artifacts/demo-linux" && -f "$1/artifacts/demo-linux-alias" && ! -e "$1/artifacts/demo-windows.exe" ]]' \
+    _ "$CASE/snapshot.partial"
+check 'incomplete transfer bytes never enter the retained namespace' test \
+    "$(find "$CASE/snapshot.partial/artifacts" -mindepth 1 -maxdepth 1 -type f | wc -l)" = 2
+PARTIAL_BEFORE=$(stat -c %i "$CASE/snapshot.partial/artifacts/demo-linux")
+SELECTION_HASH=$(_slsa_sha256 "$CASE/snapshot.partial/selection.json")
+: > "$CASE/calls"
+expect 'retained progress requires explicit resume mode' 2 fetch
+check 'omitted resume causes no remote calls' test ! -s "$CASE/calls"
+MODE=normal
+expect 'retry authenticates the statement and downloads only missing payloads' 0 fetch --resume
+check 'retry reuses both complete payloads and downloads the missing one' jq -e \
+    '.resumable and .acquisition=={reused_payloads:2,downloaded_payloads:1}' "$CASE/result"
+check 'retry downloads fresh proof/signature and only the unfinished target' bash -c \
+    '[[ $(grep -c "^download " "$1") == 3 ]] && ! grep -Eq "^download [12]$" "$1"' _ "$CASE/calls"
+check 'retry preserves the selected completed file inode' test "$PARTIAL_BEFORE" = "$(stat -c %i "$CASE/snapshot/artifacts/demo-linux")"
+check 'retry preserves its original checkpoint selection bytes' test "$SELECTION_HASH" = "$(_slsa_sha256 "$CASE/snapshot.partial/selection.json")"
+expect 'resumed snapshot remains independently verifiable offline' 0 verify
+HASH=$(jq -r .snapshot_sha256 "$CASE/result")
+BEFORE=$(stat -c %i "$CASE/snapshot")
+DOWNLOAD_BEFORE=$(stat -c %i "$CASE/snapshot/download.json")
+: > "$CASE/calls"
+expect 'completed resume reauthenticates the same generation without payload downloads' 0 fetch --resume
+check 'completed resume retains the same authenticated identity and reuses every payload' jq -e --arg hash "$HASH" \
+    '.snapshot_sha256==$hash and .acquisition=={reused_payloads:3,downloaded_payloads:0}' "$CASE/result"
+check 'completed retry still obtains current proof and signature' test "$(grep -c '^download ' "$CASE/calls")" = 2
+check 'completed retry does not replace its snapshot or historical receipt' bash -c \
+    '[[ $(stat -c %i "$1") == "$2" && $(stat -c %i "$1/download.json") == "$3" ]]' _ "$CASE/snapshot" "$BEFORE" "$DOWNLOAD_BEFORE"
+chmod 600 "$CASE/snapshot/artifacts/demo-windows.exe" || exit 1
+printf corrupt >> "$CASE/snapshot/artifacts/demo-windows.exe" || exit 1
+: > "$CASE/calls"
+expect 'completed resume refuses changed output without repair' 1 fetch --resume
+check 'invalid completed output prevents all remote calls' test ! -s "$CASE/calls"
+
+for drift in cached-bytes unexpected-file linked-file linked-directory linked-selection policy key inventory release statement signature tag; do
+    new_case "resume-$drift"
+    MODE=late-interrupted
+    expect 'transport interruption retains only fully authenticated payloads' 5 fetch --resume
+    MODE=normal
+    PARTIAL_BEFORE=$(stat -c %i "$CASE/snapshot.partial/artifacts/demo-linux")
+    extra=()
+    case "$drift" in
+        cached-bytes)
+            chmod 600 "$CASE/snapshot.partial/artifacts/demo-linux-alias" || exit 1
+            printf corrupt >> "$CASE/snapshot.partial/artifacts/demo-linux-alias" || exit 1 ;;
+        unexpected-file) printf unrelated > "$CASE/snapshot.partial/artifacts/.unexpected" ;;
+        linked-file)
+            mv "$CASE/snapshot.partial/artifacts/demo-linux" "$CASE/held-payload"
+            ln -s "$CASE/held-payload" "$CASE/snapshot.partial/artifacts/demo-linux" ;;
+        linked-directory)
+            mv "$CASE/snapshot.partial/artifacts" "$CASE/held-artifacts"
+            ln -s "$CASE/held-artifacts" "$CASE/snapshot.partial/artifacts" ;;
+        linked-selection)
+            mv "$CASE/snapshot.partial/selection.json" "$CASE/held-selection.json"
+            ln -s "$CASE/held-selection.json" "$CASE/snapshot.partial/selection.json" ;;
+        policy) extra=(--manifest-sha256 "$(_slsa_sha256 "$CASE/build.json")") ;;
+        key) printf 'another public comment\n' >> "$CASE/key.pub" ;;
+        inventory)
+            jq 'map(if .id==3 then .id=30 else . end)' "$CASE/inventory.json" > "$CASE/new-inventory"
+            cp "$CASE/new-inventory" "$CASE/inventory.json" ;;
+        release)
+            jq '.release.draft=true' "$CASE/context.json" > "$CASE/new-context"
+            cp "$CASE/new-context" "$CASE/context.json" ;;
+        statement)
+            jq '.predicate.runDetails.metadata.invocationId="22222222-2222-4222-8222-222222222222"' \
+                "$CASE/remote/4" > "$CASE/new-proof"
+            cp "$CASE/new-proof" "$CASE/remote/4"
+            sign_fixture "$CASE/remote/4" "$CASE/remote/5"
+            refresh_remote ;;
+        signature) printf '\n' >> "$CASE/remote/5"; refresh_remote ;;
+        tag)
+            jq '.tag_commit=("b"*40)' "$CASE/context.json" > "$CASE/new-context"
+            cp "$CASE/new-context" "$CASE/context.json" ;;
+    esac
+    : > "$CASE/calls"
+    expect "resume refuses changed $drift before fetching missing payloads" 7 fetch --resume "${extra[@]}"
+    check 'changed checkpoint or release never authorizes partial output' test ! -e "$CASE/snapshot"
+    check 'checkpoint rejection requests no payload body' bash -c \
+        '! grep -Eq "^download (1|2|3|30)$" "$1"' _ "$CASE/calls"
+    if [[ "$drift" != linked-file ]]; then
+        check 'refusal retains original payload instead of replacing it' test "$PARTIAL_BEFORE" = \
+            "$(stat -c %i "$CASE/snapshot.partial/artifacts/demo-linux")"
+    fi
+done
+
+new_case resume-untrusted
+printf invalid > "$CASE/remote/5"
+refresh_remote
+expect 'unauthenticated proof cannot establish a resumable checkpoint' 1 fetch --resume
+check 'invalid proof persists no reusable payload selection' test ! -e "$CASE/snapshot.partial"
+check 'invalid proof requests no payload bytes' bash -c '! grep -Eq "^download [123]$" "$1"' _ "$CASE/calls"
+new_case resume-unowned
+mkdir "$CASE/snapshot.partial"
+printf unowned > "$CASE/snapshot.partial/operator-file"
+expect 'resume never adopts an unrelated partial directory' 7 fetch --resume
+check 'unrelated checkpoint content remains intact' test "$(cat "$CASE/snapshot.partial/operator-file")" = unowned
+check 'unrelated checkpoint requests no payload bytes' bash -c '! grep -Eq "^download [123]$" "$1"' _ "$CASE/calls"
+new_case resume-options
+expect 'resume is not accepted as a remote verification flag' 4 policy slsa_verify_remote --resume
+expect 'duplicate resume selection is rejected' 4 fetch --resume --resume
+check 'invalid resume options make no remote calls' test ! -s "$CASE/calls"
+new_case resume-cli
+# Exercise the public executable entry point with the same explicit transport
+# boundary fixtures. Only the isolated child receives these exported functions.
+(
+    export CASE MODE
+    export -f trace _sbr_require _sbr_run _sbr_context _sbr_inventory _sbr_named_asset _sbr_payload_names \
+        _sbr_asset_digest _sbr_inventory_sha256 _sbr_download gh_download_release_asset
+    MODE=late-failure
+    policy bash "$ROOT/src/slsa_remote.sh" fetch-release --resume --output-dir "$CASE/snapshot" \
+        > "$CASE/cli-first.json" 2> "$CASE/cli-first.log"
+    code=$?
+    [[ "$code" == 8 ]] || exit 1
+    MODE=normal
+    policy bash "$ROOT/src/slsa_remote.sh" fetch-release --resume --output-dir "$CASE/snapshot" \
+        > "$CASE/cli-second.json" 2> "$CASE/cli-second.log" || exit 1
+) > "$CASE/cli-setup.log" 2>&1
+CODE=$?
+check 'standalone fetch CLI resumes a late transport failure' test "$CODE" = 0
+check 'standalone CLI emits no partial success and reuses prior payloads' bash -c \
+    '[[ ! -s "$1/cli-first.json" ]] && jq -e '\''.kind=="dsr-slsa-fetch" and .authenticated and .acquisition=={reused_payloads:2,downloaded_payloads:1}'\'' "$1/cli-second.json"' _ "$CASE"
+new_case resume-cancelled
+(
+    export CASE MODE=blocked-body
+    export -f trace _sbr_require _sbr_run _sbr_context _sbr_inventory _sbr_named_asset _sbr_payload_names \
+        _sbr_asset_digest _sbr_inventory_sha256 _sbr_download gh_download_release_asset
+    python3 - "$ROOT/src/slsa_remote.sh" "$CASE" "$PIN" <<'PY'
+import fcntl
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+module, case, pin = sys.argv[1], Path(sys.argv[2]), sys.argv[3]
+command = ["bash", module, "fetch-release", "--resume", "--output-dir", str(case / "snapshot"),
+           "--repo", "owner/demo", "--tag", "v1.2.3", "--sha", pin, "--builder", "dsr:test",
+           "--targets", "linux/amd64,windows/arm64", "--public-key", str(case / "key.pub")]
+with (case / "cancelled.stdout").open("wb") as out, (case / "cancelled.stderr").open("wb") as err:
+    process = subprocess.Popen(command, stdout=out, stderr=err, start_new_session=True)
+    try:
+        deadline = time.monotonic() + 15
+        while not (case / "body-blocked").exists():
+            assert process.poll() is None and time.monotonic() < deadline, "fetch did not reach the blocked final payload"
+            time.sleep(.02)
+        payload = case / "snapshot.partial/artifacts/demo-linux"
+        assert payload.is_file() and not (case / "snapshot").exists(), "completed progress was not retained"
+        before = (case / "calls").read_bytes()
+        competing = subprocess.run(command, capture_output=True, timeout=10)
+        assert competing.returncode == 2 and not competing.stdout, "competing resume escaped the destination lock"
+        assert (case / "calls").read_bytes() == before, "competing resume performed remote work"
+        # Signal this invocation's owned foreground process group, as terminal
+        # cancellation would. No saved PID or unrelated process is selected.
+        os.killpg(process.pid, signal.SIGTERM)
+        code = process.wait(timeout=10)
+        assert code in (-signal.SIGTERM, 5, 128 + signal.SIGTERM), "cancellation reported success"
+        deadline = time.monotonic() + 5
+        while True:
+            with (case / "snapshot.lock").open("rb") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    assert time.monotonic() < deadline, "cancelled transport retained the destination lock"
+            time.sleep(.02)
+        assert not (case / "cancelled.stdout").read_bytes(), "cancelled fetch emitted a success object"
+        assert not (case / "snapshot.partial/artifacts/demo-windows.exe").exists(), "partial body entered checkpoint"
+        (case / "interruption.json").write_text(json.dumps(dict(exit_code=code, inode=payload.stat().st_ino)))
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+PY
+) > "$CASE/interruption.log" 2>&1
+CODE=$?
+check 'actual cancellation retains complete files and releases exclusive resume custody' test "$CODE" = 0
+[[ "$CODE" == 0 ]] || cat "$CASE/interruption.log"
+: > "$CASE/calls"
+expect 'same selection resumes after actual process cancellation' 0 fetch --resume
+check 'process-cancelled resume keeps completed inode and downloads only the unfinished payload' bash -c \
+    '[[ $(stat -c %i "$1/snapshot/artifacts/demo-linux") == $(jq -r .inode "$1/interruption.json") ]] &&
+     jq -e '\''.acquisition=={reused_payloads:2,downloaded_payloads:1}'\'' "$1/result"' _ "$CASE"
 printf '\nSLSA release snapshots: %s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" == 0 ]]
