@@ -1536,6 +1536,27 @@ rechecks metadata compatibility, including when it copies an already admitted
 download seed; a successful check with one compiler does not authorize another.
 The snapshot and retained seed remain unchanged when a later target refuses.
 
+Unix metadata uses the selected Rust target and the attested compiler host.
+For a cross build, both Cargo platform projections contribute to the admitted
+dependency inventory, including dependencies used by host build scripts and
+procedural macros. Shared package and workspace identities must agree; a
+missing or changed host dependency refuses admission just like a target
+dependency. The host projection can conservatively include extra host inputs.
+An unrelated platform's registry download is no longer required solely to
+populate an otherwise unused all-platform metadata graph.
+
+The exact pinned-local-source check remains in force. If a local package in
+`Cargo.lock` is absent from the projected inventory, DSR also obtains Cargo's
+complete unfiltered metadata. Builds with nonempty Rust flags retain the full
+graph: Cargo can apply flags differently to target code and host dependencies,
+even when an explicit target matches the compiler host. Compiler wrappers or
+effective script launchers, Cargo subcommands other than `build`, generated
+Zig builds, and unstable or host-specific Cargo settings also retain the
+complete graph. Nonempty Cargo configuration `paths` overrides and a Python
+runtime without `tomllib` retain the original unfiltered behavior too. Those
+cases still require the full offline dependency inventory. No local package
+record is invented from the configured checkout list.
+
 The opt-in `strict_cargo_cache_root` path uses the same selection for version
 and capability checks, dependency metadata, and the cache namespace. Explicit
 `+toolchain`, `RUSTC`, `CARGO_BUILD_RUSTC`, tracked compiler configuration, and

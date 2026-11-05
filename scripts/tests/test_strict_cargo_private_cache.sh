@@ -6,8 +6,10 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 MODE=all
 if [[ "${1:-}" == --locked-downloads-only && $# == 1 ]]; then
     MODE=locked-downloads
+elif [[ "${1:-}" == --target-metadata-only && $# == 1 ]]; then
+    MODE=target-metadata
 elif (( $# != 0 )); then
-    printf 'Usage: %s [--locked-downloads-only]\n' "$0" >&2
+    printf 'Usage: %s [--locked-downloads-only|--target-metadata-only]\n' "$0" >&2
     exit 4
 fi
 for tool in python3 bash git cargo rustc jq yq; do
@@ -15,13 +17,17 @@ for tool in python3 bash git cargo rustc jq yq; do
 done
 python3 -I - "$ROOT" "$MODE" <<'PY'
 import functools
+import ast
+import copy
 import hashlib
 import http.server
 import io
 import json
 import os
+import pathlib
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -134,12 +140,60 @@ download.write_bytes(crate_bytes.getvalue())
     '[dependencies]\ncache_dependency={git="' + dependency.as_uri() + '",rev="' + revision + '"}\n'
     'registry_dependency={version="=1.0.0",registry="fixture"}\n')
 (source / 'src/main.rs').write_text('fn main() { println!("{}:{}", cache_dependency::value(), registry_dependency::value()); }\n')
+# A coordinator may have only its target's downloads. Keep the index and lock
+# complete, but make the Windows-only crate unavailable after warming Cargo.
+for package, value in (('windows_dependency', 43), ('host_dependency', 42)):
+    payload = io.BytesIO()
+    with tarfile.open(fileobj=payload, mode='w:gz') as archive:
+        for name, text in {
+            'Cargo.toml': '[package]\nname="' + package + '"\nversion="1.0.0"\nedition="2021"\n',
+            'src/lib.rs': 'pub fn value() -> u32 { ' + str(value) + ' }\n',
+        }.items():
+            data = text.encode()
+            entry = tarfile.TarInfo(package + '-1.0.0/' + name)
+            entry.size, entry.mode = len(data), 0o644
+            archive.addfile(entry, io.BytesIO(data))
+    entry = registry / 'index' / package[:2] / package[2:4] / package
+    entry.parent.mkdir(parents=True)
+    entry.write_text(json.dumps({'name': package, 'vers': '1.0.0', 'deps': [],
+        'cksum': hashlib.sha256(payload.getvalue()).hexdigest(), 'features': {}, 'yanked': False}) + '\n')
+    package_download = registry / 'crates' / package / '1.0.0/download'
+    package_download.parent.mkdir(parents=True)
+    package_download.write_bytes(payload.getvalue())
+platform_source = work / 'platform-template/source'
+(platform_source / 'src').mkdir(parents=True)
+shutil.copytree(source / '.cargo', platform_source / '.cargo')
+(platform_source / 'Cargo.toml').write_text(
+    '[package]\nname="cache-probe"\nversion="1.0.0"\nedition="2021"\n'
+    '[dependencies]\nregistry_dependency={version="=1.0.0",registry="fixture"}\n'
+    '[target.\'cfg(windows)\'.dependencies]\n'
+    'windows_dependency={version="=1.0.0",registry="fixture"}\n')
+(platform_source / 'src/main.rs').write_text('fn main() { println!("{}", registry_dependency::value()); }\n')
+platform_ambient = work / 'platform-ambient'
+platform_environment = dict(environment, CARGO_HOME=str(platform_ambient))
+cross_source = work / 'cross-template/source'
+shutil.copytree(platform_source, cross_source)
+with (cross_source / 'Cargo.toml').open('a') as manifest:
+    manifest.write('\n[build-dependencies]\nplatform_build={path="build-helper"}\n')
+(cross_source / 'build-helper/src').mkdir(parents=True)
+(cross_source / 'build-helper/Cargo.toml').write_text(
+    '[package]\nname="platform_build"\nversion="1.0.0"\nedition="2021"\n'
+    '[target.\'cfg(target_env="gnu")\'.dependencies]\n'
+    'host_dependency={version="=1.0.0",registry="fixture"}\n')
+(cross_source / 'build-helper/src/lib.rs').write_text('pub fn value() -> u32 { host_dependency::value() }\n')
+(cross_source / 'build.rs').write_text('fn main() { println!("cargo:rustc-env=DSR_HOST_VALUE={}", platform_build::value()); }\n')
+(cross_source / 'src/main.rs').write_text(
+    'fn main() { println!("{}:{}", registry_dependency::value(), env!("DSR_HOST_VALUE")); }\n')
 try:
     require(['cargo', 'metadata', '--format-version', '1'], env=environment, cwd=source)
+    require(['cargo', 'metadata', '--format-version', '1'], env=platform_environment, cwd=platform_source)
+    require(['cargo', 'metadata', '--format-version', '1'], env=platform_environment, cwd=cross_source)
 finally:
     server.shutdown()
     server.server_close()
     server_thread.join()
+next(platform_ambient.glob('registry/cache/*/windows_dependency-1.0.0.crate')).rename(work / 'held-windows.crate')
+next(platform_ambient.glob('registry/src/*/windows_dependency-1.0.0')).rename(work / 'held-windows-source')
 registry_file = next(ambient.glob('registry/cache/*/registry_dependency-1.0.0.crate'))
 registry_bytes = registry_file.read_bytes()
 unrelated_marker = ambient / 'registry/cache/fixture/payload.crate'
@@ -187,19 +241,24 @@ def isolated_source(label):
     return destination
 
 
-def admission_build(label, fixture_source, successful=True, expected='42:42', env=None):
+def admission_build(label, fixture_source, successful=True, expected='42:42', env=None, build_triple=None,
+                    configured_env=None):
     sentinel = work / (label + '-compiler-started')
     probe = work / (label + '-private-home')
-    (configs / 'cache-probe.yaml').write_text(json.dumps({
+    configuration = {
         'tool_name': 'cache-probe', 'repo': 'fixture/cache-probe', 'local_path': str(fixture_source),
         'language': 'rust', 'binary_name': 'cache-probe', 'build_profile': 'debug',
         'linux_glibc_floor': 'native',
         'build_cmd': ('printf started > "$DSR_SOURCE_SENTINEL"; '
                       'printf "%s\\n" "$CARGO_HOME" > "$DSR_CACHE_PROBE"; '
                       'cargo build --quiet --locked --offline --target "$CARGO_BUILD_TARGET"'),
-        'env': {'CARGO_BUILD_TARGET': triple, 'DSR_SOURCE_SENTINEL': str(sentinel),
+        'env': {'CARGO_BUILD_TARGET': build_triple or triple, 'DSR_SOURCE_SENTINEL': str(sentinel),
                 'DSR_CACHE_PROBE': str(probe)},
-    }))
+    }
+    configuration['env'].update(configured_env or {})
+    if build_triple:
+        configuration['target_triples'] = {target: build_triple}
+    (configs / 'cache-probe.yaml').write_text(json.dumps(configuration))
     result = shell('act_run_native_build', 'cache-probe', target, 'v1.0.0', label,
                    str(fixture_source), env=env)
     rows = [line for line in result.stdout.splitlines() if line.startswith(b'{')]
@@ -256,6 +315,389 @@ def refused_download(label, damage):
         check('the required Git database is still absent before native admission',
               not (fixture_ambient / 'git/db').exists())
     admission_build(label, fixture_source, successful=False, env=fixture_env)
+
+
+def target_metadata_checks():
+    direct_target = work / 'platform-direct-target'
+    require(['cargo', 'build', '--quiet', '--release', '--locked', '--offline', '--target', triple],
+            env=dict(platform_environment, CARGO_TARGET_DIR=str(direct_target)), cwd=platform_source)
+    check('real offline release compilation needs no inactive Windows download',
+          require([direct_target / triple / 'release/cache-probe']).strip() == '42')
+    unfiltered = invoke(['cargo', 'metadata', '--locked', '--offline', '--all-features', '--format-version=1'],
+                        env=platform_environment, cwd=platform_source)
+    check('unfiltered real Cargo metadata requires the absent Windows crate',
+          unfiltered.returncode != 0 and b'windows_dependency' in unfiltered.stderr and b'offline' in unfiltered.stderr)
+
+    def copy_source(label):
+        destination = work / ('platform-' + label) / 'source'
+        shutil.copytree(platform_source, destination)
+        return destination
+
+    selections = [
+        ('command-target', 'cargo build --target ' + triple, 'CARGO_BUILD_TARGET=x86_64-pc-windows-msvc'),
+        ('command-equals', 'cargo build --target=' + triple, ''),
+        ('configured-target', 'cargo build', 'CARGO_BUILD_TARGET=' + triple),
+        ('tracked-target', 'cargo build', ''),
+        ('compiler-default', 'cargo build', ''),
+    ]
+    if triple.endswith('-linux-gnu'):
+        selections.append(('explicit-abi', 'cargo zigbuild --target=' + triple + '.2.17',
+                           'CARGO_BUILD_TARGET=' + triple))
+    for label, command, configured in selections:
+        fixture_source = copy_source(label)
+        selected_environment = platform_environment
+        expected_packages = {'cache-probe', 'registry_dependency'}
+        if label == 'explicit-abi':
+            refused = shell('_act_strict_cargo_metadata_json', 'cache-fixture', str(copy_source(label + '-missing')),
+                            command, configured, env=platform_environment)
+            check('Cargo plugin admission preserves unfiltered missing-download refusal',
+                  refused.returncode != 0 and not refused.stdout and b'windows_dependency' in refused.stderr)
+            fixture_ambient = work / 'explicit-abi-ambient'
+            shutil.copytree(platform_ambient, fixture_ambient)
+            original_archive = next(fixture_ambient.glob('registry/cache/*')) / 'windows_dependency-1.0.0.crate'
+            shutil.copyfile(work / 'held-windows.crate', original_archive)
+            selected_environment = dict(platform_environment, CARGO_HOME=str(fixture_ambient))
+            expected_packages.add('windows_dependency')
+        if label in ('command-target', 'tracked-target'):
+            selected = 'x86_64-pc-windows-msvc' if label == 'command-target' else triple
+            with (fixture_source / '.cargo/config.toml').open('a') as config:
+                config.write('\n[build]\ntarget=' + json.dumps(selected) + '\n')
+        result = shell('_act_strict_cargo_metadata_json', 'cache-fixture', str(fixture_source),
+                       command, configured, env=selected_environment)
+        (work / (label + '.stdout')).write_bytes(result.stdout)
+        (work / (label + '.stderr')).write_bytes(result.stderr)
+        check(label + ' resolves the selected target through the real strict metadata gate', result.returncode == 0)
+        metadata = json.loads(result.stdout)['metadata']
+        check(label + ' authenticates the admitted Cargo dependency closure',
+              {package['name'] for package in metadata['packages']} == expected_packages and
+              shell('_act_validate_cargo_metadata_source_closure', str(fixture_source), '[]',
+                    json.dumps(metadata), env=platform_environment).returncode == 0)
+        home = next(fixture_source.parent.glob('.cargo-home-metadata-*'))
+        evidence = json.loads((home / '.dsr-cargo-sources.json').read_bytes())
+        check(label + ' retains archive and lock authentication for its active dependency',
+              evidence['authentication']['lockfile_sha256'] == digest(fixture_source / 'Cargo.lock') and
+              len(evidence['authentication']['packages']) == len(expected_packages) - 1 and
+              all(proof['basis'] == 'lockfile-crate-sha256' for proof in evidence['authentication']['packages']) and
+              bool(list(home.glob('registry/src/*/windows_dependency-*'))) == ('windows_dependency' in expected_packages))
+        if label == 'command-target':
+            seed_receipt = fixture_source.parent / '.cargo-home/.dsr-cache-seed.json'
+            held_seed = digest(seed_receipt)
+            other_target = shell('_act_strict_cargo_metadata_json', 'cache-fixture', str(fixture_source),
+                'cargo build --target x86_64-pc-windows-msvc', 'CARGO_BUILD_TARGET=' + triple,
+                env=platform_environment)
+            check('a warm Unix seed cannot authorize the now-active missing Windows dependency',
+                  other_target.returncode != 0 and not other_target.stdout and
+                  b'windows_dependency' in other_target.stderr and digest(seed_receipt) == held_seed)
+
+    fixture_source = copy_source('native-build')
+    report, home = admission_build('target-metadata-native', fixture_source, expected='42', env=platform_environment)
+    sources = report['cargo_isolation']['dependency_sources']
+    check('native compilation and collection retain only authenticated selected-target sources',
+          sources['authentication']['locked_archive_packages'] == 1 and
+          sources['metadata_sha256'] == digest(home / '.dsr-cargo-metadata.json') and
+          sources['sha256'] == digest(home / '.dsr-cargo-sources.json'))
+    selected_source = next(home.glob('registry/src/*/registry_dependency-1.0.0/src/lib.rs'))
+    selected_source.write_bytes(selected_source.read_bytes() + b'\n// changed after compilation\n')
+    finished = shell('_act_finish_unix_private_cargo_home', 'cache-fixture', str(home),
+                     report['cargo_isolation']['dependency_cache']['seed']['receipt_sha256'],
+                     str(fixture_source), json.dumps(sources), env=platform_environment)
+    check('independent final admission still refuses mutation of an active dependency',
+          finished.returncode != 0 and not finished.stdout)
+
+    for damage in ('missing', 'corrupt'):
+        fixture_source = copy_source('required-' + damage)
+        fixture_ambient = work / ('platform-ambient-' + damage)
+        shutil.copytree(platform_ambient, fixture_ambient)
+        required_archive = next(fixture_ambient.glob('registry/cache/*/registry_dependency-1.0.0.crate'))
+        if damage == 'missing':
+            required_archive.rename(work / 'held-required-platform.crate')
+        else:
+            required_archive.write_bytes(b'not the lock-selected archive\n')
+        fixture_environment = dict(environment, CARGO_HOME=str(fixture_ambient))
+        refused = shell('_act_strict_cargo_metadata_json', 'cache-fixture', str(fixture_source),
+                         'cargo build --target ' + triple, '', env=fixture_environment)
+        check('target filtering cannot admit an active ' + damage + ' archive from its extracted source',
+              refused.returncode != 0 and not refused.stdout and
+              not (fixture_source.parent / '.cargo-home').exists())
+        admission_build('target-metadata-required-' + damage, fixture_source, successful=False, env=fixture_environment)
+
+
+def local_target_metadata_checks():
+    def pin(path):
+        require(['git', '-C', path, 'init', '-q'])
+        require(['git', '-C', path, 'add', '.'])
+        require(['git', '-C', path, '-c', 'user.name=DSR Test', '-c',
+                 'user.email=dsr@example.invalid', 'commit', '-qm', 'conditional local dependency'])
+        return {'relative_path': path.name, 'local_path': str(path),
+                'git_sha': require(['git', '-C', path, 'rev-parse', 'HEAD']).strip()}
+
+    def assert_roots(label, fixture, selected_environment, pins, expected):
+        direct = invoke(['cargo', 'metadata', '--locked', '--offline', '--all-features',
+                         '--filter-platform', triple, '--format-version=1'], cwd=fixture, env=selected_environment)
+        check(label + ' real target projection omits the inactive local checkout',
+              direct.returncode == 0 and not expected.intersection(
+                  package['name'] for package in json.loads(direct.stdout)['packages']))
+        complete = shell('_act_strict_cargo_metadata_json', 'cache-fixture', str(fixture),
+                         'cargo build --target ' + triple, '', env=selected_environment)
+        if complete.returncode:
+            print(complete.stderr.decode(), flush=True)
+        check(label + ' retains complete Cargo-authored local package evidence',
+              complete.returncode == 0 and expected <= {
+                  package['name'] for package in json.loads(complete.stdout)['metadata']['packages']})
+        snapshot = json.loads(complete.stdout)
+        admitted = shell('_act_validate_cargo_metadata_source_closure', snapshot['source_root'],
+                         json.dumps(pins), json.dumps(snapshot['metadata']), env=selected_environment)
+        check(label + ' preserves exact pinned sibling admission', admitted.returncode == 0)
+        refused = shell('_act_validate_cargo_metadata_source_closure', snapshot['source_root'],
+                        json.dumps(pins[:-1]), json.dumps(snapshot['metadata']), env=selected_environment)
+        check(label + ' still refuses an unpinned inactive local checkout', refused.returncode != 0)
+        extra = dict(pins[0], relative_path='absent-checkout')
+        refused = shell('_act_validate_cargo_metadata_source_closure', snapshot['source_root'],
+                        json.dumps(pins + [extra]), json.dumps(snapshot['metadata']), env=selected_environment)
+        check(label + ' still refuses a pinned sibling absent from Cargo metadata', refused.returncode != 0)
+
+    for kind in ('path', 'patch'):
+        parent = work / ('local-target-' + kind)
+        fixture = parent / 'source'
+        windows = parent / 'local_windows'
+        transitive = parent / 'local_transitive'
+        for path in (fixture, windows, transitive):
+            (path / 'src').mkdir(parents=True)
+        (fixture / 'Cargo.toml').write_text(
+            '[package]\nname="local-probe"\nversion="1.0.0"\nedition="2021"\n'
+            '[target.\'cfg(windows)\'.dependencies]\n' +
+            ('local_windows={path="../local_windows"}\n' if kind == 'path' else
+             'local_windows="=1.0.0"\n[patch.crates-io]\nlocal_windows={path="../local_windows"}\n'))
+        (fixture / 'src/main.rs').write_text('fn main() {}\n')
+        (windows / 'Cargo.toml').write_text(
+            '[package]\nname="local_windows"\nversion="1.0.0"\nedition="2021"\n'
+            '[dependencies]\nlocal_transitive={path="../local_transitive"}\n')
+        (windows / 'src/lib.rs').write_text('pub fn value() -> u32 { local_transitive::value() }\n')
+        (transitive / 'Cargo.toml').write_text(
+            '[package]\nname="local_transitive"\nversion="1.0.0"\nedition="2021"\n')
+        (transitive / 'src/lib.rs').write_text('pub fn value() -> u32 { 42 }\n')
+        pins = [pin(windows), pin(transitive)]
+        selected_environment = dict(environment, CARGO_HOME=str(work / ('local-ambient-' + kind)))
+        require(['cargo', 'generate-lockfile', '--offline'], cwd=fixture, env=selected_environment)
+        assert_roots('inactive local ' + kind, fixture, selected_environment, pins,
+                     {'local_windows', 'local_transitive'})
+
+    parent = work / 'local-target-override'
+    fixture = parent / 'source'
+    override = parent / 'windows-override'
+    shutil.copytree(platform_source, fixture)
+    (override / 'src').mkdir(parents=True)
+    (override / 'Cargo.toml').write_text(
+        '[package]\nname="windows_dependency"\nversion="1.0.0"\nedition="2021"\n')
+    (override / 'src/lib.rs').write_text('pub fn value() -> u32 { 43 }\n')
+    configuration = fixture / '.cargo/config.toml'
+    configuration.write_text('paths=["../windows-override"]\n' + configuration.read_text())
+    fixture_ambient = work / 'local-ambient-override'
+    shutil.copytree(platform_ambient, fixture_ambient)
+    original_archive = next(fixture_ambient.glob('registry/cache/*')) / 'windows_dependency-1.0.0.crate'
+    shutil.copyfile(work / 'held-windows.crate', original_archive)
+    selected_environment = dict(environment, CARGO_HOME=str(fixture_ambient))
+    lock_before = digest(fixture / 'Cargo.lock')
+    assert_roots('inactive config path override', fixture, selected_environment,
+                 [pin(override)], {'windows_dependency'})
+    check('config path override preserves its original registry lockfile identity',
+          digest(fixture / 'Cargo.lock') == lock_before)
+
+
+def cross_target_metadata_checks():
+    if not triple.endswith('-linux-gnu'):
+        print('SKIP GNU-to-musl host dependency regression: requires a GNU Rust host', flush=True)
+        return
+    cross_triple = triple.removesuffix('-gnu') + '-musl'
+    target_libdir = Path(require(['rustc', '--print', 'target-libdir', '--target', cross_triple]).strip())
+    if not any(target_libdir.glob('libstd-*')):
+        print('SKIP GNU-to-musl host dependency regression: install the musl Rust target', flush=True)
+        return
+
+    def projection(selected, fixture=cross_source, env=platform_environment):
+        return invoke(['cargo', 'metadata', '--locked', '--offline', '--all-features', '--format-version=1',
+                       '--filter-platform', selected], cwd=fixture, env=env)
+
+    documents = {}
+    for selected in (cross_triple, triple):
+        result = projection(selected)
+        check('real Cargo metadata resolves the ' + selected + ' projection offline', result.returncode == 0)
+        documents[selected] = json.loads(result.stdout)
+        (work / ('metadata-' + selected + '.json')).write_bytes(result.stdout)
+    check('target-only Cargo metadata omits a required GNU build dependency from the musl graph',
+          'host_dependency' not in {package['name'] for package in documents[cross_triple]['packages']} and
+          'host_dependency' in {package['name'] for package in documents[triple]['packages']})
+
+    # Exercise the production collector/merger with actual Cargo documents.
+    # Only its subprocess boundary is replaced for call counts and malformed
+    # second-observation controls; compilation and source custody below are real.
+    generated = shell('_act_toolchain_identity_script', 'metadata', '/dev/null', 'cargo build')
+    check('the real identity generator exposes the metadata collector', generated.returncode == 0)
+    body = generated.stdout.decode().split("<<'DSR_TOOLCHAIN_IDENTITY_PY'\n", 1)[1].rsplit('\nDSR_TOOLCHAIN_IDENTITY_PY', 1)[0]
+    functions = [node for node in ast.parse(body).body if isinstance(node, ast.FunctionDef) and
+                 node.name in ('cargo_metadata_index', 'cargo_merge_metadata', 'cargo_target_metadata')]
+    calls = []
+
+    def observed(argv, **kwargs):
+        selected = argv[argv.index('--filter-platform') + 1]
+        calls.append(selected)
+        return json.dumps(documents[selected])
+
+    def refusal(message):
+        raise ValueError(message)
+
+    namespace = dict(json=json, re=re, pathlib=pathlib, hashlib=hashlib, run=observed, fail=refusal)
+    exec(compile(ast.Module(body=functions, type_ignores=[]), '<production Cargo metadata>', 'exec'), namespace)
+    compiler_version = require(['rustc', '-vV'])
+    native = namespace['cargo_target_metadata'](['cargo'], triple, compiler_version, cross_source)
+    check('native metadata executes exactly one projection with the compiler host',
+          calls == [triple] and native == documents[triple])
+    calls.clear()
+    combined = namespace['cargo_target_metadata'](['cargo'], cross_triple, compiler_version, cross_source)
+    combine = namespace['cargo_merge_metadata']
+    check('cross metadata executes target and attested-host projections exactly once', calls == [cross_triple, triple])
+    check('metadata graph union is deterministic and retains the host source',
+          combined == combine(documents[triple], documents[cross_triple]) and
+          {package['name'] for package in combined['packages']} ==
+          {'cache-probe', 'platform_build', 'registry_dependency', 'host_dependency'})
+
+    for damage in ('package', 'manifest', 'workspace', 'root', 'duplicate-package', 'duplicate-node', 'missing-node', 'edge'):
+        altered = copy.deepcopy(documents[triple])
+        shared = next(package for package in altered['packages'] if package['name'] == 'cache-probe')
+        if damage == 'package':
+            shared['version'] = '2.0.0'
+        elif damage == 'manifest':
+            shared['manifest_path'] = str(work / 'unrelated/Cargo.toml')
+        elif damage == 'workspace':
+            altered['workspace_root'] = str(work / 'unrelated')
+        elif damage == 'root':
+            altered['resolve']['root'] = 'different-package'
+        elif damage == 'duplicate-package':
+            altered['packages'].append(copy.deepcopy(shared))
+        elif damage == 'duplicate-node':
+            altered['resolve']['nodes'].append(copy.deepcopy(altered['resolve']['nodes'][0]))
+        elif damage == 'missing-node':
+            missing = next(package['id'] for package in altered['packages'] if package['name'] == 'host_dependency')
+            altered['resolve']['nodes'] = [node for node in altered['resolve']['nodes'] if node['id'] != missing]
+        else:
+            owner = next(node for node in altered['resolve']['nodes'] if node['id'] == shared['id'])
+            owner['deps'][0]['changed'] = True
+        rejected = False
+        try:
+            combine(documents[cross_triple], altered)
+        except ValueError:
+            rejected = True
+        check('target/host union refuses changed or incomplete ' + damage + ' evidence', rejected)
+
+    def copy_source(label):
+        fixture = work / ('cross-' + label) / 'source'
+        shutil.copytree(cross_source, fixture)
+        return fixture
+
+    fixture_source = copy_source('native-build')
+    report, home = admission_build('cross-host-metadata', fixture_source, env=platform_environment, build_triple=cross_triple)
+    check('actual musl compilation uses the selected cross target', report.get('target_triple') == cross_triple)
+    held = json.loads((home / '.dsr-cargo-sources.json').read_bytes())
+    host_package = next(package for package in held['packages'] if package['name'] == 'host_dependency')
+    check('GNU host-only crate has lockfile archive authentication in the musl attempt',
+          any(proof['package_id'] == host_package['package_id'] and proof['basis'] == 'lockfile-crate-sha256'
+              for proof in held['authentication']['packages']))
+    host_file = Path(host_package['root']) / 'src/lib.rs'
+    host_file.write_bytes(host_file.read_bytes() + b'\n// changed host build input\n')
+    sources = report['cargo_isolation']['dependency_sources']
+    finished = shell('_act_finish_unix_private_cargo_home', 'cache-fixture', str(home),
+                     report['cargo_isolation']['dependency_cache']['seed']['receipt_sha256'],
+                     str(fixture_source), json.dumps(sources), env=platform_environment)
+    check('independent musl artifact admission refuses mutation of the GNU host dependency',
+          finished.returncode != 0 and not finished.stdout)
+
+    for damage in ('missing', 'corrupt'):
+        fixture_source = copy_source('host-' + damage)
+        fixture_ambient = work / ('cross-ambient-' + damage)
+        shutil.copytree(platform_ambient, fixture_ambient)
+        host_archive = next(fixture_ambient.glob('registry/cache/*/host_dependency-1.0.0.crate'))
+        if damage == 'missing':
+            host_archive.rename(work / 'held-cross-host.crate')
+        else:
+            host_archive.write_bytes(b'not the lock-selected host archive\n')
+        fixture_environment = dict(environment, CARGO_HOME=str(fixture_ambient))
+        refused = shell('_act_strict_cargo_metadata_json', 'cache-fixture', str(fixture_source),
+                        'cargo build --target ' + cross_triple, '', env=fixture_environment)
+        check('the complete target/host gate refuses the ' + damage + ' host archive before seed admission',
+              refused.returncode != 0 and not refused.stdout and
+              not (fixture_source.parent / '.cargo-home').exists())
+        admission_build('cross-host-' + damage, fixture_source, successful=False,
+                        env=fixture_environment, build_triple=cross_triple)
+
+
+def flagged_host_metadata_checks():
+    targets = [triple]
+    if triple.endswith('-linux-gnu'):
+        cross_triple = triple.removesuffix('-gnu') + '-musl'
+        target_libdir = Path(require(['rustc', '--print', 'target-libdir', '--target', cross_triple]).strip())
+        if any(target_libdir.glob('libstd-*')):
+            targets.append(cross_triple)
+    for selected in targets:
+        label = 'flagged-host-' + ('native' if selected == triple else 'cross')
+        fixture = work / label / 'source'
+        shutil.copytree(cross_source, fixture)
+        (fixture / 'build-helper/Cargo.toml').write_text(
+            '[package]\nname="platform_build"\nversion="1.0.0"\nedition="2021"\n'
+            '[target.\'cfg(not(dsr_custom))\'.dependencies]\n'
+            'host_dependency={version="=1.0.0",registry="fixture"}\n')
+        fixture_ambient = work / (label + '-ambient')
+        shutil.copytree(platform_ambient, fixture_ambient)
+        original_archive = next(fixture_ambient.glob('registry/cache/*')) / 'windows_dependency-1.0.0.crate'
+        shutil.copyfile(work / 'held-windows.crate', original_archive)
+        selected_environment = dict(environment, CARGO_HOME=str(fixture_ambient),
+                                    CARGO_BUILD_TARGET=selected, RUSTFLAGS='--cfg dsr_custom')
+        require(['cargo', 'generate-lockfile', '--offline'], cwd=fixture, env=selected_environment)
+        projected = set()
+        for projected_target in sorted({selected, triple}):
+            document = json.loads(require(['cargo', 'metadata', '--locked', '--offline', '--all-features',
+                                          '--filter-platform', projected_target, '--format-version=1'],
+                                         cwd=fixture, env=selected_environment))
+            projected.update(package['name'] for package in document['packages'])
+        check(label + ' target and host projections both omit the actual host input',
+              'host_dependency' not in projected)
+        direct_target = work / (label + '-direct-target')
+        require(['cargo', 'build', '--quiet', '--locked', '--offline', '--target', selected],
+                cwd=fixture, env=dict(selected_environment, CARGO_TARGET_DIR=str(direct_target)))
+        check(label + ' real explicit-target compilation consumes the omitted host dependency',
+              require([direct_target / selected / 'debug/cache-probe']).strip() == '42:42')
+        complete = shell('_act_strict_cargo_metadata_json', 'cache-fixture', str(fixture),
+                         'cargo build --target ' + selected,
+                         'CARGO_BUILD_TARGET=' + selected + '\nRUSTFLAGS=--cfg dsr_custom',
+                         env=selected_environment)
+        if complete.returncode:
+            print(complete.stderr.decode(), flush=True)
+        check(label + ' conservatively restores full Cargo source evidence',
+              complete.returncode == 0 and 'host_dependency' in {
+                  package['name'] for package in json.loads(complete.stdout)['metadata']['packages']})
+        report, home = admission_build(label, fixture, env=selected_environment, build_triple=selected,
+                                       configured_env={'RUSTFLAGS': '--cfg dsr_custom'})
+        held = json.loads((home / '.dsr-cargo-sources.json').read_bytes())
+        host_package = next(package for package in held['packages'] if package['name'] == 'host_dependency')
+        check(label + ' authenticates the host archive before native compilation',
+              any(proof['package_id'] == host_package['package_id'] and proof['basis'] == 'lockfile-crate-sha256'
+                  for proof in held['authentication']['packages']))
+        host_file = Path(host_package['root']) / 'src/lib.rs'
+        host_file.write_bytes(host_file.read_bytes() + b'\n// changed flagged build host input\n')
+        finished = shell('_act_finish_unix_private_cargo_home', 'cache-fixture', str(home),
+                         report['cargo_isolation']['dependency_cache']['seed']['receipt_sha256'],
+                         str(fixture), json.dumps(report['cargo_isolation']['dependency_sources']),
+                         env=selected_environment)
+        check(label + ' independently refuses a changed host source after compilation',
+              finished.returncode != 0 and not finished.stdout)
+
+
+target_metadata_checks()
+local_target_metadata_checks()
+cross_target_metadata_checks()
+flagged_host_metadata_checks()
+if mode == 'target-metadata':
+    print(f'Native target metadata: {checks} assertions passed; real offline compilation and local transport.', flush=True)
+    raise SystemExit(0)
 
 
 ambient.rename(work / 'warmed-ambient')

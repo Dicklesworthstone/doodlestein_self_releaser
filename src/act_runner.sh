@@ -10670,14 +10670,162 @@ if zig_shim_record is not None:
 if selection['cargo_zigbuild'] is not None:
     result['selection']['cargo_zigbuild'] = selection['cargo_zigbuild']
 
-# Metadata admission uses the same cfg/compiler validation as the build.
-if mode == 'metadata':
+def cargo_metadata_index(rows, keys, label):
+    if not isinstance(rows, list):
+        fail('invalid Cargo metadata ' + label)
+    indexed = {}
+    for row in rows:
+        if not isinstance(row, dict) or any(not isinstance(row.get(key), str) or not row[key] for key in keys):
+            fail('invalid Cargo metadata ' + label)
+        key = tuple(row[field] for field in keys)
+        if key in indexed:
+            fail('duplicate Cargo metadata ' + label)
+        indexed[key] = row
+    return indexed
+
+
+def cargo_merge_metadata(target, host):
+    # --filter-platform is a target projection, not Cargo's host/target unit
+    # graph. Build scripts and proc macros can need dependencies selected by
+    # the compiler host's cfg even when producing a different target's binary.
+    graphs = []
+    for document in (target, host):
+        if not isinstance(document, dict) or document.get('version') != 1 or not isinstance(document.get('resolve'), dict):
+            fail('complete Cargo metadata v1 required for target/host union')
+        packages = cargo_metadata_index(document.get('packages'), ('id',), 'packages')
+        nodes = cargo_metadata_index(document['resolve'].get('nodes'), ('id',), 'resolve nodes')
+        for key, node in nodes.items():
+            if key not in packages:
+                fail('Cargo metadata resolve node has no package')
+            for field in ('dependencies', 'features'):
+                values = node.get(field)
+                if (not isinstance(values, list) or any(not isinstance(value, str) for value in values) or
+                        len(set(values)) != len(values)):
+                    fail('invalid Cargo metadata node ' + field)
+            dependencies = cargo_metadata_index(node.get('deps'), ('name', 'pkg'), 'dependency edges')
+            if (any((dependency,) not in nodes for dependency in node['dependencies']) or
+                    set(node['dependencies']) != {edge['pkg'] for edge in dependencies.values()}):
+                fail('incomplete Cargo metadata dependency graph')
+            for edge in dependencies.values():
+                if not isinstance(edge.get('dep_kinds'), list) or any(not isinstance(kind, dict) for kind in edge['dep_kinds']):
+                    fail('invalid Cargo metadata dependency kinds')
+        graphs.append((packages, nodes))
+    if ({key: value for key, value in target.items() if key not in ('packages', 'resolve')} !=
+            {key: value for key, value in host.items() if key not in ('packages', 'resolve')} or
+            {key: value for key, value in target['resolve'].items() if key != 'nodes'} !=
+            {key: value for key, value in host['resolve'].items() if key != 'nodes'}):
+        fail('Cargo target/host metadata workspace identity changed')
+    packages, nodes = (dict(rows) for rows in graphs[0])
+    for key, package in graphs[1][0].items():
+        if key in packages and packages[key] != package:
+            fail('Cargo target/host metadata package identity changed: ' + package['id'])
+        packages[key] = package
+    for key, node in graphs[1][1].items():
+        if key not in nodes:
+            nodes[key] = node
+            continue
+        previous = nodes[key]
+        if ({field: value for field, value in previous.items() if field not in ('dependencies', 'features', 'deps')} !=
+                {field: value for field, value in node.items() if field not in ('dependencies', 'features', 'deps')}):
+            fail('Cargo target/host metadata resolve identity changed')
+        merged = dict(previous)
+        for field in ('dependencies', 'features'):
+            merged[field] = sorted(set(previous[field]) | set(node[field]))
+        edges = cargo_metadata_index(previous['deps'], ('name', 'pkg'), 'dependency edges')
+        for edge_key, edge in cargo_metadata_index(node['deps'], ('name', 'pkg'), 'dependency edges').items():
+            if edge_key in edges:
+                old_edge = edges[edge_key]
+                if ({field: value for field, value in old_edge.items() if field != 'dep_kinds'} !=
+                        {field: value for field, value in edge.items() if field != 'dep_kinds'}):
+                    fail('Cargo target/host metadata dependency edge changed')
+                kinds = {json.dumps(kind, sort_keys=True) for kind in old_edge['dep_kinds'] + edge['dep_kinds']}
+                edge = dict(edge, dep_kinds=[json.loads(kind) for kind in sorted(kinds)])
+            edges[edge_key] = edge
+        merged['deps'] = [edges[edge_key] for edge_key in sorted(edges)]
+        nodes[key] = merged
+    return dict(target, packages=[packages[key] for key in sorted(packages)],
+                resolve=dict(target['resolve'], nodes=[nodes[key] for key in sorted(nodes)]))
+
+
+def cargo_target_metadata(argv, target, compiler_version, source_root, configurations=(), complete_graph=False):
+    host = next((line.split(': ', 1)[1] for line in compiler_version.splitlines() if line.startswith('host: ')), '')
+    if not re.fullmatch(r'[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+)+', host):
+        fail('selected compiler did not report a valid host for Cargo metadata')
+
+    def projection(platform):
+        selected = ['--filter-platform', platform] if platform else []
+        try:
+            return json.loads(run(argv + ['metadata', '--locked', '--offline', '--all-features',
+                                  *selected, '--format-version=1',
+                                  '--manifest-path', str(source_root / 'Cargo.toml')], timeout=300))
+        except ValueError as error:
+            fail('invalid selected Cargo metadata: ' + str(error))
+
+    if complete_graph:
+        # With an explicit target (even the host triple), Cargo suppresses
+        # target Rust flags for build scripts/proc macros. Metadata projections
+        # do not model that split. Host-specific flags can distort the host
+        # projection too. Wrappers/plugins can inject the same changes, so
+        # preserve the original complete graph for these compilation contexts.
+        return projection(None)
+
+    # The source-root gate covers every pinned local checkout, including ones
+    # used only by another platform. Keep its original complete observation
+    # when a projection would hide one; never invent local package authority.
     try:
-        metadata = json.loads(run(cargo_argv + ['metadata', '--locked', '--offline', '--all-features',
-                                   '--format-version=1', '--manifest-path', str(pathlib.Path.cwd() / 'Cargo.toml')],
-                                  timeout=300))
-    except ValueError as error:
-        fail('invalid selected Cargo metadata: ' + str(error))
+        import tomllib
+    except ImportError:
+        return projection(None)
+    try:
+        for configuration in configurations:
+            raw = pathlib.Path(configuration['path']).read_bytes()
+            if hashlib.sha256(raw).hexdigest() != configuration['sha256']:
+                fail('Cargo configuration changed during metadata admission')
+            if tomllib.loads(raw.decode('utf-8')).get('paths'):
+                # Legacy path overrides retain registry identities in the
+                # lockfile, so local lock entries cannot inventory them.
+                return projection(None)
+        lock = tomllib.loads((source_root / 'Cargo.lock').read_text(encoding='utf-8'))
+        if not isinstance(lock.get('package'), list) or any(not isinstance(row, dict) for row in lock['package']):
+            fail('invalid Cargo lockfile package inventory')
+        local = cargo_metadata_index([row for row in lock['package'] if 'source' not in row],
+                                     ('name', 'version'), 'local lockfile packages')
+    except (OSError, ValueError, UnicodeError) as error:
+        fail('cannot inventory local Cargo sources: ' + str(error))
+
+    metadata = projection(target)
+    # The host projection is deliberately conservative: it can include normal
+    # host dependencies as well as build/proc-macro dependencies. Never omit an
+    # actual host input merely to minimize a cross-build's authenticated set.
+    if host != target:
+        metadata = cargo_merge_metadata(metadata, projection(host))
+    observed = cargo_metadata_index([package for package in metadata['packages'] if package.get('source') is None],
+                                    ('name', 'version'), 'local metadata packages')
+    if not local.keys() <= observed.keys():
+        # These builds deliberately retain the old all-platform download
+        # requirements so exact local-root admission remains unchanged.
+        metadata = cargo_merge_metadata(metadata, projection(None))
+    return metadata
+
+
+# Metadata admission uses the same compiler and Rust target as the build,
+# including its host dependencies without fetching every unrelated platform.
+if mode == 'metadata':
+    metadata_flags = (any(value for name, value in probe_env.items() if name.endswith('RUSTFLAGS')) or
+                      cargo_config['build'].get('rustflags') or
+                      any(values.get('rustflags') for values in cargo_config['target'].values()))
+    metadata_complete = (metadata_flags or
+                         any(probe_env.get(name) for name in ('RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER',
+                             'CARGO_BUILD_RUSTC_WRAPPER', 'CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER')) or
+                         any(cargo_config['build'].get(name) for name in ('rustc-wrapper', 'rustc-workspace-wrapper')) or
+                         any(tools[name].get('resolved_kind', tools[name]['selected_kind']) == 'script'
+                             for name in ('cargo', 'rustc')) or
+                         any(subcommand != 'build' for subcommand in cargo_commands) or
+                         cargo_config.get('unsupported_cfg_context') or
+                         any(value for name, value in probe_env.items() if name.startswith('CARGO_UNSTABLE_')) or
+                         probe_env.get('DSR_ZIG_TARGET') or zig_shim_record is not None)
+    metadata = cargo_target_metadata(cargo_argv, triple, tools['rustc']['version'],
+                                     pathlib.Path.cwd(), cargo_config_receipts, bool(metadata_complete))
     verify_zig_shim()
     json.dump(metadata, sys.stdout, sort_keys=True)
     sys.stdout.write('\n')
