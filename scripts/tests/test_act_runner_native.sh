@@ -4503,6 +4503,12 @@ test_windows_build_guard_transport_and_timeout_validation() {
         else
             log_fail "Staging changed source bytes or lost bounded held-file transport"
         fi
+        if [[ "$staged_guard" == *'| ForEach-Object { [Console]::Error.WriteLine($_) }'* &&
+              "$staged_guard" == *"if (\$LASTEXITCODE -ne 0) { throw 'Launcher security scan failed' }"* ]]; then
+            log_pass "Scanner diagnostics stay off protocol stdout and failures remain fatal"
+        else
+            log_fail "Scanner diagnostics pollute protocol stdout or failure gate is missing"
+        fi
     done
 }
 
