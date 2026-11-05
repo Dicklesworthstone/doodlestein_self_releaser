@@ -9,8 +9,10 @@ if [[ "${1:-}" == --rustup-dispatch-only && $# == 1 ]]; then
     MODE=rustup-dispatch
 elif [[ "${1:-}" == --zig-shim-only && $# == 1 ]]; then
     MODE=zig-shim
+elif [[ "${1:-}" == --quoted-invocation-only && $# == 1 ]]; then
+    MODE=quoted-invocation
 elif (( $# != 0 )); then
-    printf 'Usage: %s [--rustup-dispatch-only|--zig-shim-only]\n' "$0" >&2
+    printf 'Usage: %s [--rustup-dispatch-only|--zig-shim-only|--quoted-invocation-only]\n' "$0" >&2
     exit 4
 fi
 for tool in python3 bash cargo rustc rustup cc jq; do
@@ -220,6 +222,61 @@ def expected_tool(data, name, expected):
     record = data.get('tools', {}).get(name, {})
     return record.get('resolved_path', record.get('selected_path')) == str(expected) and \
         record.get('resolved_sha256', record.get('selected_sha256')) == digest(expected)
+
+
+if mode in ('all', 'quoted-invocation'):
+    quoted_project = work / 'quoted-invocation'
+    (quoted_project / 'src').mkdir(parents=True)
+    (quoted_project / 'Cargo.toml').write_text(
+        '[package]\nname="quoted-invocation"\nversion="1.0.0"\nedition="2021"\n'
+        '[features]\nfirst=[]\nsecond=[]\n')
+    (quoted_project / 'build.rs').write_text('''fn main() {
+    let flags = std::env::var("CARGO_ENCODED_RUSTFLAGS").unwrap();
+    println!("cargo:rustc-env=QUOTED_FLAGS={}", flags.replace('\\u{1f}', " "));
+}
+''')
+    (quoted_project / 'src/main.rs').write_text('''fn main() {
+    assert_eq!(env!("QUOTED_FLAGS"), "-C opt-level=2");
+    assert!(cfg!(all(feature="first", feature="second")));
+    println!("quoted flags and features");
+}
+''')
+    require(['cargo', 'generate-lockfile', '--offline'], cwd=quoted_project, env=environment)
+    for index, command in enumerate((
+            'RUSTFLAGS="-C opt-level=2" cargo build --locked --offline --features="first second"',
+            "env RUSTFLAGS='-C opt-level=2' cargo build --locked --offline --features='first second'",
+            r'RUSTFLAGS=-C\ opt-level=2 cargo build --locked --offline --features=first\ second')):
+        quoted_env = dict(environment, CARGO_TARGET_DIR=str(work / ('quoted-output-' + str(index))))
+        metadata, _, _ = probe(command, quoted_env, mode='metadata', cwd=quoted_project,
+                               expected_cwd=quoted_project)
+        before, identity, receipt = probe(command, quoted_env, cwd=quoted_project,
+                                          expected_cwd=quoted_project)
+        compiled = run(['bash', '-c', command], cwd=quoted_project, env=quoted_env)
+        binary = Path(quoted_env['CARGO_TARGET_DIR']) / host / 'debug/quoted-invocation'
+        executed = run([binary]) if compiled.returncode == 0 else None
+        verified, _, _ = probe(command, quoted_env, mode='verify', receipt=receipt,
+                               cwd=quoted_project, expected_cwd=quoted_project)
+        check('real quoted Cargo command compiles offline with exact flags and both features: ' + str(index),
+              compiled.returncode == 0 and executed is not None and executed.returncode == 0 and
+              executed.stdout.strip() == 'quoted flags and features')
+        check('quoted command shares genuine locked metadata admission: ' + str(index),
+              metadata.returncode == 0 and
+              json.loads(metadata.stdout).get('workspace_root') == str(quoted_project))
+        check('quoted command records its actual compiler flags before building: ' + str(index),
+              before.returncode == 0 and identity.get('selection', {}).get('cargo_target', {}).get(
+                  'rustflags') == ['-C', 'opt-level=2'])
+        check('quoted command retains its pinned identity after the build: ' + str(index),
+              before.returncode == 0 and verified.returncode == 0)
+        drifted, _, _ = probe(command.replace('opt-level=2', 'opt-level=3'), quoted_env,
+                              mode='verify', receipt=receipt, cwd=quoted_project,
+                              expected_cwd=quoted_project)
+        check('changed quoted flags cannot reuse the original identity receipt: ' + str(index),
+              before.returncode == 0 and drifted.returncode != 0 and
+              'build toolchain changed during the build' in drifted.stderr)
+
+if mode == 'quoted-invocation':
+    print(str(passed) + ' passed; ' + str(failed) + ' failed')
+    sys.exit(1 if failed else 0)
 
 
 # Reuse the owned compiler copies and read-only library link above. Proxy

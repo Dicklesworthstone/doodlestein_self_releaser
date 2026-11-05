@@ -85,6 +85,65 @@ def facts(arch='x86_64', system='linux'):
 
 
 class InvocationBoundaryTests(unittest.TestCase):
+    def test_inline_quoted_flags_keep_the_complete_environment_value(self):
+        for prefix in ('RUSTFLAGS="-C opt-level=2"', "RUSTFLAGS='-C opt-level=2'",
+                       r'RUSTFLAGS=-C\ opt-level=2', 'RUSTFLAGS="-C "opt-level=2',
+                       'env RUSTFLAGS="-C opt-level=2"',
+                       'RUSTFLAGS="-C \\\nopt-level=2"'):
+            with self.subTest(prefix=prefix):
+                selected, environment, *_ = invoke(prefix + ' cargo build --release --locked')
+                self.assertEqual(environment['RUSTFLAGS'], '-C opt-level=2')
+                self.assertEqual(selected['environment']['RUSTFLAGS'], '-C opt-level=2')
+                self.assertEqual(selected['target'], TRIPLE)
+
+    def test_adjacent_quoted_features_keep_later_selectors(self):
+        target = 'aarch64-apple-darwin'
+        for features in ('--features="first second"', "--features='first second'",
+                         '--features="first "second', r'--features=first\ second',
+                         '--features="first second"\\\n'):
+            with self.subTest(features=features):
+                self.assertEqual(invoke('cargo build ' + features + ' --target=' + target)[0]['target'],
+                                 target)
+                with self.assertRaisesRegex(Refused, 'multiple Cargo targets'):
+                    invoke('cargo build ' + features + ' --target=' + target + ' --target=' + TRIPLE)
+
+    def test_literal_word_tokenization_agrees_with_real_bash(self):
+        # Bash supplies the expected argument bytes. This tests shell syntax,
+        # not a substituted Cargo/compiler implementation or a build claim.
+        for literal in ('RUSTFLAGS="-C opt-level=2"', '--features="first second"',
+                        '--features="first "second', r'--features=first\ second',
+                        r"'quoted '\''apostrophe'", '"literal "\'$HOME*?[]\'',
+                        r'embedded\#hash plain#hash', '"" \'\'',
+                        'first\\\nsecond', '"first\nsecond"', "'first\\\nsecond'",
+                        'first # unmatched " and trailing backslash \\\n'):
+            with self.subTest(literal=literal):
+                observed = subprocess.run(['bash', '-c', "printf '%s\\0' " + literal],
+                                          capture_output=True, check=True, timeout=10).stdout
+                expected = observed[:-1].decode().split('\0')
+                actual = [namespace['shell_word'](word) for word in namespace['cargo_shell_words'](literal)
+                          if word != '\n']
+                self.assertEqual(actual, expected)
+
+    def test_quoted_segments_do_not_enable_shell_evaluation(self):
+        for command in ('RUSTFLAGS="$(printf hidden)" cargo build',
+                        'RUSTFLAGS="`printf hidden`" cargo build',
+                        'RUSTFLAGS="-C "$(printf hidden) cargo build',
+                        'RUSTFLAGS="${RUSTFLAGS:=hidden}" cargo build',
+                        'RUSTFLAGS=-C* cargo build',
+                        'cargo build --features="$(printf hidden)"',
+                        'cargo build --features=first*',
+                        'cargo build --features="unfinished',
+                        'cargo build \\'):
+            with self.subTest(command=command), self.assertRaises(Refused):
+                invoke(command)
+
+    def test_comments_and_newlines_preserve_command_boundaries(self):
+        self.assertEqual(invoke('cargo build # unmatched " and \\\ncargo build')[0]['target'], TRIPLE)
+        with self.assertRaisesRegex(Refused, 'conflicting Cargo'):
+            invoke('cargo build # comment ends despite backslash \\\ncargo build --target=aarch64-apple-darwin')
+        with self.assertRaisesRegex(Refused, 'background Cargo'):
+            invoke('cargo build &\nprintf done')
+
     def test_cfg_refuses_unstable_options_before_and_after_subcommand(self):
         for mode in ('record', 'verify', 'metadata', 'context'):
             for command in ('cargo -Zhost-config build', 'cargo build -Zhost-config',

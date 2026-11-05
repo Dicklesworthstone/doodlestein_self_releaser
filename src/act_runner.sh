@@ -9565,7 +9565,7 @@ _act_toolchain_identity_script() {
     fi
     printf '%s -I - %s %s %s %s %s %s %s %s <<\x27DSR_TOOLCHAIN_IDENTITY_PY\x27\n' "$python_q" "$mode" "$output_q" "$command_q" "$extra_q" "$pin_q" "$cwd_q" "$shim_dir_q" "$shim_hash_q"
     cat <<'PY'
-import hashlib, json, os, pathlib, re, shlex, shutil, stat, subprocess, sys
+import hashlib, json, os, pathlib, re, shutil, stat, subprocess, sys
 
 mode, output, command, extra, receipt_pin, expected_cwd, zig_shim_dir, zig_shim_hash = sys.argv[1:9]
 
@@ -9646,7 +9646,7 @@ if mode == 'read':
 
 def shell_word(raw, variables=()):
     # Read a bounded shell word without evaluating code. Quotes and ordinary
-    # escapes are preserved by shlex's non-POSIX lexer. Only explicitly known
+    # escapes are preserved by cargo_shell_words. Only explicitly known
     # environment substitutions are admitted, never command substitution,
     # globs, shell parameter operators or a second round of word splitting.
     value, quote, index = '', '', 0
@@ -10106,30 +10106,60 @@ cargo_config, cargo_config_receipts = (({'build': {}, 'target': {}, 'alias': {}}
                                      if mode in ('target', 'selection') else cargo_configuration())
 
 
-def joined_shell_lines(text):
-    result, quote, index = '', '', 0
+def cargo_shell_words(text):
+    # Keep shell quoting until shell_word validates each literal argument.
+    # shlex(posix=False) only recognizes quotes at the start of a word, so it
+    # splits common forms such as RUSTFLAGS="-C opt-level=2" or
+    # --features="one two". POSIX mode loses the quote/escape evidence needed
+    # to distinguish literal dollars and globs from active shell expansion.
+    tokens, word, quote, index = [], [], '', 0
     while index < len(text):
         char = text[index]
-        if char == '\\' and quote != "'" and index + 1 < len(text):
+        if char == '\\' and quote != "'":
+            if index + 1 == len(text):
+                fail('unfinished escape in Cargo invocation')
             if text[index + 1] != '\n':
-                result += text[index:index + 2]
+                word.extend(text[index:index + 2])
             index += 2
             continue
-        if char in "\"'" and (not quote or quote == char):
-            quote = '' if quote else char
-        result += char
+        if quote:
+            word.append(char)
+            if char == quote:
+                quote = ''
+        elif char in "\"'":
+            word.append(char)
+            quote = char
+        elif char in ' \t\r\n;&|()<>':
+            if word:
+                tokens.append(''.join(word))
+                word = []
+            if char == '\n':
+                tokens.append(char)
+            elif char in ';&|()<>':
+                end = index + 1
+                while end < len(text) and text[end] in ';&|()<>':
+                    end += 1
+                tokens.append(text[index:end])
+                index = end
+                continue
+        elif char == '#' and not word:
+            # A comment starts at a word boundary, not within an argument or
+            # quote. Do not join escaped newlines inside the discarded comment.
+            end = text.find('\n', index)
+            index = len(text) if end == -1 else end
+            continue
+        else:
+            word.append(char)
         index += 1
-    return result
+    if quote:
+        fail('unfinished quote in Cargo invocation')
+    if word:
+        tokens.append(''.join(word))
+    return tokens
 
 
 def invocation_selection():
-    try:
-        lexer = shlex.shlex(joined_shell_lines(command), posix=False, punctuation_chars=';&|()<>\n')
-        lexer.whitespace = ' \t\r'
-        lexer.whitespace_split = True
-        tokens = list(lexer)
-    except ValueError as error:
-        fail('cannot read Cargo invocation: ' + str(error))
+    tokens = cargo_shell_words(command)
     # Simple foreground command lists are the boundary. Even a stateless
     # marker can mutate the caller through a parameter-assignment/arithmetic
     # expansion, so inspect all words, including redirection operands.
