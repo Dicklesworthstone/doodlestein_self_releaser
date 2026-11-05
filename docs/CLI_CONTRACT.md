@@ -495,7 +495,20 @@ dsr watch [--interval <seconds>] [--auto-fallback] [--notify <method>]
 Automatic fallback requires an explicit `v`-prefixed version tag and the
 workflow run's full source SHA. The watcher passes both to `fallback`; missing
 or ambiguous source identity never falls back to detecting a version from the
-current checkout.
+current checkout. It also passes `--isolate-source`: quality checks, builds and
+publication use a private materialization of that exact commit. A newer, dirty
+or absent developer checkout does not prevent automatic fallback. Available
+objects and the matching tag are copied without modifying the checkout; when
+they are unavailable, the materializer fetches the exact tag from the configured
+GitHub repository and refuses a mismatched commit. Configured sibling sources
+must be locally available at their pinned revisions. The ordinary isolated-source
+restrictions still apply, including the refusal of unpinned dependencies,
+unsupported absolute Cargo paths and top-level Git submodules. Every retry
+materializes a fresh source tree; it does not reuse a modified prior copy.
+The attempt journal records `isolate_source` and preserves it across retries.
+Older attempts without that field retain the original checkout mode and still
+require a clean checkout at the selected commit. This keeps existing native
+checkpoints' branch/source bindings valid; retries never silently change them.
 
 Each attempt retains its output and terminal exit status under
 `watch-attempts/`, and its build outputs under `watch-artifacts/<run-id>/`.

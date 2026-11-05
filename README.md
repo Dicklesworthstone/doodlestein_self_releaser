@@ -1081,6 +1081,17 @@ the repo's configured tool at the run's version tag; repos with no dsr tool
 are reported, never guessed. `dsr --dry-run watch --auto-fallback` shows which
 fallbacks would start.
 
+Automatic fallback builds a private copy of the workflow's exact tagged commit.
+Your checkout can be on a newer commit, contain staged or untracked work, or be
+absent: available Git objects are copied locally; otherwise DSR fetches and
+verifies the exact GitHub tag. Quality checks, compilation and publication all
+use the private source. The developer checkout is preserved. Pinned sibling
+dependencies use the same isolated-source rules as `dsr fallback --isolate-source`;
+unavailable or changed identities block the release. Each retry gets a fresh
+source copy while retaining its verified build checkpoint and output directory.
+Attempts started before this source-isolation behavior retain their original
+checkout mode on retry, including its clean, matching-checkout requirement.
+
 `--notify` takes a comma-separated list of `terminal`, `slack`, `discord`,
 `desktop`, `agent_mail` (or `all`/`none`). Fallbacks started by the watcher
 report their outcome through the same channels. Slack and Discord webhooks come
