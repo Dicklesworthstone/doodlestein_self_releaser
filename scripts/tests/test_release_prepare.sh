@@ -321,21 +321,46 @@ check assert_rc 1
 check posts 0
 eval "$save_definition"
 
-# Real cross-process flock: losers may retry, but never send another POST.
-new_case; touch "$CASE/post-slow"
-pids=()
-for n in 1 2 3 4; do
-    (release_prepare --repo acme/tool --tag v1.2.3 --sha "$SHA" --state-dir "$CASE/state" > "$CASE/out.$n" 2> "$CASE/err.$n"; printf '%s\n' "$?" > "$CASE/rc.$n") &
-    pids+=("$!")
+# Use an actual executable path without flock, not a replacement lock function.
+portable_path="$TMP/portable-bin"
+unavailable_path="$TMP/no-lock-bin"
+mkdir "$portable_path" "$unavailable_path"
+for tool in jq git python3 cat cp mkdir mktemp mv chmod sha256sum shasum wc sleep; do
+    executable=$(type -P "$tool") || continue
+    ln -s "$executable" "$portable_path/$tool"
+    [[ "$tool" == python3 ]] || ln -s "$executable" "$unavailable_path/$tool"
 done
-for pid in "${pids[@]}"; do wait "$pid" || true; done
-check posts 1
-check test "$(grep -l '^0$' "$CASE"/rc.* | wc -l)" -ge 1
-for n in 1 2 3 4; do
-    check jq -es 'length==1 and (.[0].exit_code==0 or .[0].exit_code==2)' "$CASE/out.$n"
-done
-run
+new_case
+PATH="$portable_path" run
 check assert_rc 0
 check posts 1
+PATH="$portable_path" run
+check assert_rc 0
+check posts 1
+new_case
+PATH="$unavailable_path" run
+check assert_rc 3
+check test ! -e "$CASE/state"
+check test ! -s "$CASE/calls"
+
+# Real cross-process locks: losers may retry, but never send another POST.
+# Repeat the same publication race using the macOS-compatible Python backend.
+for backend_path in "$PATH" "$portable_path"; do
+    new_case; touch "$CASE/post-slow"
+    pids=()
+    for n in 1 2 3 4; do
+        (PATH="$backend_path" release_prepare --repo acme/tool --tag v1.2.3 --sha "$SHA" --state-dir "$CASE/state" > "$CASE/out.$n" 2> "$CASE/err.$n"; printf '%s\n' "$?" > "$CASE/rc.$n") &
+        pids+=("$!")
+    done
+    for pid in "${pids[@]}"; do wait "$pid" || true; done
+    check posts 1
+    check test "$(grep -l '^0$' "$CASE"/rc.* | wc -l)" -ge 1
+    for n in 1 2 3 4; do
+        check jq -es 'length==1 and (.[0].exit_code==0 or .[0].exit_code==2)' "$CASE/out.$n"
+    done
+    PATH="$backend_path" run
+    check assert_rc 0
+    check posts 1
+done
 printf '%s checks: %s passed, %s failed. Fixtures retained at %s\n' "$TOTAL" "$PASSED" "$FAILED" "$TMP"
 ((FAILED==0))

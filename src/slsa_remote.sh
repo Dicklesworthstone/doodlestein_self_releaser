@@ -4,6 +4,10 @@
 _SLSA_REMOTE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 # shellcheck source=src/platforms.sh
 source "$_SLSA_REMOTE_DIR/platforms.sh" || { return 3 2>/dev/null || exit 3; }
+if ! declare -F dsr_lock_fd >/dev/null; then
+    # shellcheck source=src/guardrails.sh
+    source "$_SLSA_REMOTE_DIR/guardrails.sh" || { return 3 2>/dev/null || exit 3; }
+fi
 
 _slr_require() {
     # Public SLSA functions may be exported by a parent shell without their
@@ -510,11 +514,12 @@ _slr_execute() (
     fi
     if [[ "$action" == snapshot ]]; then _slr_require local || return $?; else _slr_require || return $?; fi
     if [[ "$action" == fetch ]]; then
-        command -v flock >/dev/null && command -v python3 >/dev/null || return 3
+        command -v python3 >/dev/null || return 3
+        dsr_lock_available || return $?
         _slr_path "$output" && _slr_path "$output.lock" && [[ -d "${output%/*}/" ]] || return 4
         [[ ! -e "$output.lock" || -f "$output.lock" ]] || return 4
         exec 9>> "$output.lock" || return 1
-        flock -n 9 || return 2
+        dsr_lock_fd 9 0 || return 2
         [[ ! -e "$output" && ! -L "$output" ]] || { _slsa_log 'Snapshot already exists; use verify-snapshot'; return 2; }
         work=$(mktemp -d "${output%/*}/.dsr-fetch.XXXXXXXX") || return 1
     else

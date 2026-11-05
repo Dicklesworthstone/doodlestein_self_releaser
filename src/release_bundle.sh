@@ -5,13 +5,18 @@
 _RELEASE_BUNDLE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 # shellcheck source=src/platforms.sh
 source "$_RELEASE_BUNDLE_DIR/platforms.sh" || { return 3 2>/dev/null || exit 3; }
+if ! declare -F dsr_lock_fd >/dev/null; then
+    # shellcheck source=src/guardrails.sh
+    source "$_RELEASE_BUNDLE_DIR/guardrails.sh" || { return 3 2>/dev/null || exit 3; }
+fi
 
 _rb_log() { printf '[release-bundle] %s\n' "$*" >&2; }
 _rb_require() {
     local tool
-    for tool in jq flock python3 find cp mv mktemp; do
+    for tool in jq python3 find cp mv mktemp; do
         command -v "$tool" >/dev/null || { _rb_log "Missing dependency: $tool"; return 3; }
     done
+    dsr_lock_available || return $?
     if ! declare -F _slsa_manifest_statement >/dev/null; then
         # shellcheck source=src/slsa.sh
         source "$_RELEASE_BUNDLE_DIR/slsa.sh" || return 3
@@ -299,7 +304,7 @@ release_bundle() (
     _rb_path "$output/lock" || return 2
     [[ ! -e "$output/lock" || -f "$output/lock" ]] || return 2
     exec 8>> "$output/lock" || return 1
-    flock -n 8 || { _rb_log 'Build-set collection is already active'; return 2; }
+    dsr_lock_fd 8 0 || { _rb_log 'Build-set collection is already active'; return 2; }
     work=$(mktemp -d "$output/.collect.XXXXXXXX") || return 1
     trap 'rm -rf -- "$work"' EXIT
     trap 'exit 5' HUP INT TERM

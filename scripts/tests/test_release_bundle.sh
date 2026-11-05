@@ -173,6 +173,24 @@ contended() (
 )
 run_code 'concurrent collection refuses an occupied lock' 2 contended
 
+# Collection and recovery also work on coordinators with Python but no flock.
+portable_path="$WORK/portable-bin"
+mkdir "$portable_path"
+for tool in bash jq python3 find cp mv mktemp mkdir chmod sha256sum shasum awk wc cat ln rm date basename dirname sort sed stat cmp; do
+    executable=$(type -P "$tool") || continue
+    ln -s "$executable" "$portable_path/$tool"
+done
+portable_collect() ( PATH="$portable_path"; collect "$@"; )
+run_code 'no-flock coordinator assembles the complete release' 0 portable_collect "$WORK/plan.json" "$WORK/portable-bundle"
+assert 'portable collection preserves the complete verified inventory' jq -e '.status=="verified" and .publishable and (.targets|length)==3' "$WORK/result.json"
+run_code 'no-flock coordinator resumes its verified bundle' 0 portable_collect "$WORK/plan.json" "$WORK/portable-bundle"
+portable_contended() (
+    exec 9>> "$WORK/portable-bundle/lock"
+    flock -n 9 || return 99
+    portable_collect "$WORK/plan.json" "$WORK/portable-bundle"
+)
+run_code 'portable collection honors an existing util-linux lock' 2 portable_contended
+
 make_fixture "$WORK/large"
 jq '.build_environments[0].source_inventory=[range(0;2200)|{path:("src/file-"+(.|tostring)),sha256:("a"*64)}]' \
     "$WORK/large/windows/manifest.json" > "$WORK/large/windows/large.json"

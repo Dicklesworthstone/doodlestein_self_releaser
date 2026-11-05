@@ -341,6 +341,159 @@ test_confirm_uses_default_in_ci() {
   fi
 }
 
+test_descriptor_lock_backends() {
+  ((TESTS_RUN++))
+  if python3 - "$PROJECT_ROOT/src/guardrails.sh" <<'PY'
+import fcntl
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+module = Path(sys.argv[1])
+root = Path(tempfile.mkdtemp(prefix="dsr-descriptor-locks-"))
+print("Retained descriptor lock fixture: " + str(root), flush=True)
+bash = shutil.which("bash")
+python = shutil.which("python3")
+portable = root / "portable-bin"
+portable.mkdir()
+(portable / "python3").symlink_to(python)
+empty = root / "empty-bin"
+empty.mkdir()
+checks = 0
+
+def check(label, valid):
+    global checks
+    if not valid:
+        raise AssertionError(label)
+    checks += 1
+    print("PASS " + label, flush=True)
+
+def until(predicate, seconds=5):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.02)
+    raise AssertionError("fixture barrier timed out")
+
+driver = r'''
+source "$1" || exit 90
+PATH="$2"
+dsr_lock_available || exit $?
+exec 9>> "$3" || exit 91
+dsr_lock_fd 9 "$4" || exit $?
+if [[ "$5" == hold ]]; then
+    printf 'locked\n' > "$6"
+    read -r _
+elif [[ "$5" == child ]]; then
+    "$7" - "$6" "$8" <<'CHILD' &
+import os, pathlib, sys, time
+os.fstat(9)
+pathlib.Path(sys.argv[1]).write_text("inherited\n")
+deadline = time.monotonic() + 8
+while not pathlib.Path(sys.argv[2]).exists() and time.monotonic() < deadline:
+    time.sleep(0.02)
+CHILD
+    wait "$!"
+fi
+'''
+
+def arguments(path, lock, seconds="0", action="probe", ready="", stop=""):
+    return [bash, "-c", driver, "lock-fixture", str(module), path,
+            str(lock), seconds, action, str(ready), python, str(stop)]
+
+def contender(path, lock, seconds="0"):
+    return subprocess.run(arguments(path, lock, seconds), capture_output=True,
+                          text=True, timeout=4)
+
+paths = {"python": str(portable)}
+if shutil.which("flock"):
+    paths["flock"] = os.environ["PATH"]
+
+for backend, path in paths.items():
+    for action in ("hold", "child"):
+        case = root / (backend + "-" + action)
+        case.mkdir()
+        lock, ready, stop = (case / name for name in ("lock", "ready", "stop"))
+        with (case / "stderr").open("wb") as diagnostics:
+            owner = subprocess.Popen(arguments(path, lock, action=action,
+                                               ready=ready, stop=stop),
+                                     stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                     stderr=diagnostics)
+            try:
+                until(ready.exists)
+                original_inode = lock.stat().st_ino
+                for other, other_path in paths.items():
+                    probe = contender(other_path, lock)
+                    check(backend + "/" + action + ": independent " + other + " process is excluded",
+                          probe.returncode == 1 and probe.stdout == "")
+                if action == "hold":
+                    began = time.monotonic()
+                    timed = contender(path, lock, "1")
+                    elapsed = time.monotonic() - began
+                    check(backend + ": timed contention expires without acquiring",
+                          timed.returncode == 1 and 0.8 <= elapsed < 3)
+                owner.kill()
+                owner.wait(timeout=3)
+                if action == "child":
+                    probe = contender(path, lock)
+                    check(backend + ": inherited child keeps the lease after coordinator crash",
+                          probe.returncode == 1)
+                    stop.write_text("release\n")
+                until(lambda: contender(path, lock).returncode == 0)
+                check(backend + "/" + action + ": last close releases the same lock inode",
+                      lock.stat().st_ino == original_inode)
+            finally:
+                stop.write_text("release\n")
+                if owner.poll() is None:
+                    owner.kill()
+                owner.wait(timeout=3)
+                owner.stdin.close()
+
+# A caller cannot start a transaction without a usable kernel-lock backend.
+missing = subprocess.run([bash, "-c", r'''
+source "$1" || exit 90
+PATH="$2"
+dsr_lock_available || exit $?
+printf 'must not mutate\n'
+''', "missing-backend", str(module), str(empty)], capture_output=True, text=True, timeout=3)
+check("missing lock backends refuse before mutation",
+      missing.returncode == 3 and missing.stdout == "")
+broken = root / "broken-python"
+broken.mkdir()
+(broken / "python3").write_text("#!/bin/sh\nexit 1\n")
+(broken / "python3").chmod(0o755)
+unusable = subprocess.run([bash, "-c", r'''
+source "$1" || exit 90
+PATH="$2"
+dsr_lock_available || exit $?
+printf 'must not mutate\n'
+''', "unusable-backend", str(module), str(broken)], capture_output=True, text=True, timeout=3)
+check("an unusable Python fcntl backend refuses before mutation",
+      unusable.returncode == 3 and unusable.stdout == "")
+
+# Exported users need the same standalone dependency closure as sourced users.
+exported = subprocess.run([bash, "-c", r'''
+source "$1" || exit 90
+PATH="$2"
+"$3" -c 'dsr_lock_available && { exec 9>> "$1"; dsr_lock_fd 9 0; }' child "$4"
+''', "exported-lock", str(module), str(portable), bash, str(root / "exported.lock")],
+    cwd=str(root), capture_output=True, text=True, timeout=3)
+check("child Bash can use the exported Python lock backend outside the repository",
+      exported.returncode == 0 and exported.stdout == "" and exported.stderr == "")
+print("Descriptor lock integration: %d checks, 0 failures" % checks, flush=True)
+PY
+  then
+    pass "Kernel locks retain exclusion through helper exit and coordinator loss"
+  else
+    fail "Descriptor lock backend integration"
+  fi
+}
+
 test_command_deadline_consumers() {
   if ! command -v python3 >/dev/null || ! command -v jq >/dev/null; then
     printf '%s\n' 'SKIP: command deadline integration requires python3 and jq'
@@ -555,6 +708,9 @@ test_confirm_uses_default_in_ci
 
 # Real public consumers with and without GNU timeout
 test_command_deadline_consumers
+
+# The same inherited lock domain with util-linux or Python, including crashes.
+test_descriptor_lock_backends
 
 echo ""
 echo "=========================================="

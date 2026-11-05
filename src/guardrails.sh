@@ -8,6 +8,7 @@
 #   - Safe temp directory creation
 #   - NO_COLOR support
 #   - Owned command deadlines, including hosts without GNU timeout
+#   - Inherited descriptor locks, including hosts without util-linux flock
 #
 # Usage:
 #   source guardrails.sh
@@ -16,6 +17,7 @@
 #   safe_rm "$path"
 #   tmpdir=$(safe_tmpdir "dsr-build")
 #   run_with_timeout 30 command arg...
+#   dsr_lock_fd 9 0
 
 set -uo pipefail
 
@@ -81,6 +83,66 @@ EOF
     return $EXIT_DEPENDENCY_ERROR
   fi
   return $EXIT_SUCCESS
+}
+
+# ============================================================================
+# Inherited Descriptor Locks
+# ============================================================================
+
+# Check before creating transaction state or making a remote mutation. Python's
+# standard-library flock is available on macOS without util-linux. Never fall
+# back to PID files or lock directories: both backends use the same kernel lock.
+dsr_lock_available() {
+    if command -v flock >/dev/null 2>&1; then
+        return 0
+    fi
+    if command -v python3 >/dev/null 2>&1 && python3 -c 'import fcntl' 2>/dev/null; then
+        return 0
+    fi
+    printf '%s\n' '[dsr-lock] State updates require flock or Python 3 with fcntl' >&2
+    return 3
+}
+
+# Lock an inherited descriptor, not a pathname that may be replaced. The owning
+# shell keeps it open for the entire transaction, and transport/build children
+# inherit it. The lock is released only when the last holder closes its copy.
+# Never explicitly unlock or unlink a sidecar: surviving children may still be
+# working. A zero timeout is nonblocking. Acquisition failure never switches
+# backends, so unsupported filesystems and broken locks fail closed.
+dsr_lock_fd() {
+    local fd="${1:-}" timeout="${2:-0}"
+    [[ "$fd" =~ ^[0-9]{1,6}$ && "$timeout" =~ ^[0-9]{1,6}$ ]] || return 4
+    if command -v flock >/dev/null 2>&1; then
+        if [[ "$timeout" == 0 ]]; then
+            flock -x -n "$fd"
+        else
+            flock -x -w "$timeout" "$fd"
+        fi
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 - "$fd" "$timeout" <<'PY'
+import errno
+import fcntl
+import sys
+import time
+
+fd, timeout = int(sys.argv[1]), int(sys.argv[2])
+deadline = time.monotonic() + timeout
+while True:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+    except OSError as exc:
+        if exc.errno not in (errno.EACCES, errno.EAGAIN):
+            raise
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            sys.exit(1)
+        time.sleep(min(0.05, remaining))
+PY
+    else
+        printf '%s\n' '[dsr-lock] State updates require flock or Python 3 with fcntl' >&2
+        return 3
+    fi
 }
 
 # ============================================================================
@@ -740,6 +802,7 @@ export -f safe_tmpdir
 export -f is_color_disabled color
 export -f is_non_interactive confirm
 export -f dsr_native_rch_policy dsr_native_rch_environment_policy
+export -f dsr_lock_available dsr_lock_fd
 export -f run_with_timeout _dsr_timeout_cmd _dsr_run_with_timeout
 export -f _dsr_timeout_group _dsr_timeout_watchdog
 

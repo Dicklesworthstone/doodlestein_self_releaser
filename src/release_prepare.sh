@@ -3,6 +3,10 @@
 # Never create/move tags, publish, edit, delete, or upload release assets.
 
 _RELEASE_PREPARE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+if ! declare -F dsr_lock_fd >/dev/null; then
+    # shellcheck source=src/guardrails.sh
+    source "$_RELEASE_PREPARE_DIR/guardrails.sh" || { return 3 2>/dev/null || exit 3; }
+fi
 
 _rp_log() { printf '[release-prepare] %s\n' "$*" >&2; }
 
@@ -11,9 +15,8 @@ _rp_require() {
         # shellcheck source=src/sbom_release.sh
         source "$_RELEASE_PREPARE_DIR/sbom_release.sh" || return 3
     fi
-    command -v flock >/dev/null && command -v gh >/dev/null || {
-        _rp_log 'flock and gh are required'; return 3;
-    }
+    command -v gh >/dev/null || { _rp_log 'gh is required'; return 3; }
+    dsr_lock_available || return $?
     _sbr_require
 }
 
@@ -199,7 +202,7 @@ _rp_execute() (
     mkdir -p -- "$session" || return 1
     [[ ! -L "$session/lock" && ( ! -e "$session/lock" || -f "$session/lock" ) ]] || return 2
     exec 9>> "$session/lock" || return 1
-    flock -n 9 || { _rp_log 'Draft preparation is already active'; return 2; }
+    dsr_lock_fd 9 0 || { _rp_log 'Draft preparation is already active'; return 2; }
     file="$session/state.json"
     [[ ! -L "$file" && ( ! -e "$file" || -f "$file" ) ]] || return 2
     if [[ -e "$file" ]]; then

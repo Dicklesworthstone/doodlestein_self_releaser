@@ -2,6 +2,11 @@
 # Repository dispatch (bd-1jt.3.7). Acceptance means HTTP 204, NOT that a
 # downstream workflow ran. A lost POST acknowledgement is never blindly replayed.
 
+if ! declare -F dsr_lock_fd >/dev/null; then
+    # shellcheck source=src/guardrails.sh
+    source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/guardrails.sh" || { return 3 2>/dev/null || exit 3; }
+fi
+
 _dp_log_error() { printf '[dispatch:ERROR] %s\n' "$*" >&2; }
 _dp_log_info() { printf '[dispatch] %s\n' "$*" >&2; }
 
@@ -457,7 +462,7 @@ _dp_release_outbox() (
     key=$(_dp_digest_text "$identity") || return $?
     [[ -n "$root" && "$root" != *[[:cntrl:]]* && "$root" != *\\* && ! -L "$root" ]] || return 4
     if [[ "$inspect" != true ]]; then
-        command -v flock >/dev/null || { _dp_log_error 'flock is required for persistent dispatch'; return 3; }
+        dsr_lock_available || return $?
         mkdir -p -- "$root" || return 1
     fi
     [[ -d "$root" ]] || return 4
@@ -470,7 +475,7 @@ _dp_release_outbox() (
         # A fixed descriptor is confined to this subshell. Keep it inherited by
         # transport children: killing the parent must not unlock a live POST.
         exec 9>> "$session/lock" || return 1
-        flock -n 9 || { _dp_log_error "Dispatch already active: $file"; return 2; }
+        dsr_lock_fd 9 0 || { _dp_log_error "Dispatch already active: $file"; return 2; }
         work=$(mktemp -d "$session/.work.XXXXXXXX") || return 1
     fi
     trap '[[ -z "$work" ]] || rm -rf -- "$work"' EXIT

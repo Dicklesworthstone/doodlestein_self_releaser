@@ -4,6 +4,10 @@
 # A verified SBOM inventory is byte-integrity evidence, not a signed build claim.
 
 _RELEASE_FINALIZE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+if ! declare -F dsr_lock_fd >/dev/null; then
+    # shellcheck source=src/guardrails.sh
+    source "$_RELEASE_FINALIZE_DIR/guardrails.sh" || { return 3 2>/dev/null || exit 3; }
+fi
 
 _rf_log() { printf '[release-finalize] %s\n' "$*" >&2; }
 
@@ -681,7 +685,7 @@ _rf_execute() (
                      (if $promote then "promote without changing latest" else "retain release mode" end)])}'
         return $?
     fi
-    command -v flock >/dev/null || { _rf_log 'flock is required'; return 3; }
+    dsr_lock_available || return $?
     [[ -n "$state_dir" ]] || state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/release-finalize"
     [[ "$state_dir" != *[[:cntrl:]]* && "$state_dir" != *\\* && ! -L "$state_dir" ]] || return 4
     _rf_require || return $?
@@ -696,7 +700,7 @@ _rf_execute() (
     mkdir -p -- "$session" || return 1
     [[ ! -L "$session/lock" && ( ! -e "$session/lock" || -f "$session/lock" ) ]] || return 2
     exec 8>> "$session/lock" || return 1
-    flock -n 8 || { _rf_log 'Release finalization is already active'; return 2; }
+    dsr_lock_fd 8 0 || { _rf_log 'Release finalization is already active'; return 2; }
     work=$(mktemp -d "$session/.work.XXXXXXXX") || return 1
     printf -v cleanup 'rm -rf -- %q' "$work"
     # shellcheck disable=SC2064

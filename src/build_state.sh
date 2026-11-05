@@ -20,6 +20,11 @@
 
 set -uo pipefail
 
+if ! declare -F dsr_lock_fd >/dev/null; then
+  # shellcheck source=src/guardrails.sh
+  source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/guardrails.sh" || { return 3 2>/dev/null || exit 3; }
+fi
+
 # State directory
 _BUILD_STATE_DIR="${_BUILD_STATE_DIR:-}"
 
@@ -58,38 +63,7 @@ _build_state_sha256() {
 # that does not implement flock. Never unlink a lock sidecar: that would create
 # a second lock domain while another process still holds the old inode.
 _build_state_wait_lock() {
-  local fd="$1" timeout="$2"
-  if command -v flock &>/dev/null; then
-    if [[ "$timeout" == 0 ]]; then
-      flock -x -n "$fd"
-    else
-      flock -x -w "$timeout" "$fd"
-    fi
-  elif command -v python3 &>/dev/null; then
-    python3 - "$fd" "$timeout" <<'PY'
-import errno
-import fcntl
-import sys
-import time
-
-fd, timeout = int(sys.argv[1]), int(sys.argv[2])
-deadline = time.monotonic() + timeout
-while True:
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        break
-    except OSError as exc:
-        if exc.errno not in (errno.EACCES, errno.EAGAIN):
-            raise
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            sys.exit(1)
-        time.sleep(min(0.05, remaining))
-PY
-  else
-    log_error "State updates require flock or Python 3 with fcntl"
-    return 1
-  fi
+  dsr_lock_fd "$1" "$2"
 }
 
 _build_state_file_identity() {

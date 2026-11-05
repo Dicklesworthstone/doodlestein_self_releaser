@@ -2,6 +2,10 @@
 # Manifest-bound payload publication (bd-1jt.3.1 / bd-1jt.3.10).
 # Existing release/tag only. No clobber, deletion, promotion, or signing.
 _RELEASE_PAYLOADS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+if ! declare -F dsr_lock_fd >/dev/null; then
+    # shellcheck source=src/guardrails.sh
+    source "$_RELEASE_PAYLOADS_DIR/guardrails.sh" || { return 3 2>/dev/null || exit 3; }
+fi
 
 _rup_log() { printf '[release-payloads] %s\n' "$*" >&2; }
 _rup_require() {
@@ -222,7 +226,7 @@ release_upload_payloads() (
             '{kind:"dsr-release-payload-publication",status:"planned",dry_run:true,repo:$repo,plan:$plan}'
         return $?
     fi
-    command -v flock >/dev/null || return 3
+    dsr_lock_available || return $?
     _sbr_require || return $?
     if ! declare -F gh_upload_asset_named >/dev/null; then
         # shellcheck source=src/github.sh
@@ -253,7 +257,7 @@ release_upload_payloads() (
     mkdir -p -- "$session" || return 1
     [[ ! -L "$session/lock" && ( ! -e "$session/lock" || -f "$session/lock" ) ]] || return 2
     exec 7>> "$session/lock" || return 1
-    flock -n 7 || { _rup_log 'Payload publication is already active'; return 2; }
+    dsr_lock_fd 7 0 || { _rup_log 'Payload publication is already active'; return 2; }
     # State staging must be beside the destination, which may not share /tmp's FS.
     local state_work
     state_work=$(mktemp -d "$session/.work.XXXXXXXX") || return 1
