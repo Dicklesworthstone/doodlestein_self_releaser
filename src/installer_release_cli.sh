@@ -131,16 +131,16 @@ def emit(details, code, raw=None):
 
 
 try:
-    if action not in ("generate-release", "install", "describe-recipe"):
+    if action not in ("generate-release", "install", "describe-recipe", "describe-host"):
         raise Failure("unknown authenticated installer action", 4)
     # Preserve exact values and duplicate options for the engine's strict
     # parser. Only the public global dry-run flag needs translation.
     arguments = ["--dry-run" if value == "-n" else value for value in arguments]
-    if dry_run and action != "describe-recipe" and "--dry-run" not in arguments:
+    if dry_run and action not in ("describe-recipe", "describe-host") and "--dry-run" not in arguments:
         arguments.append("--dry-run")
     script = module / ("install_gen_release.sh" if action == "generate-release" else "release_install.sh")
     command = ["bash", str(script)]
-    if action == "describe-recipe":
+    if action in ("describe-recipe", "describe-host"):
         command.append(action)
     command.extend(arguments)
     environment = {key: value for key, value in os.environ.items()
@@ -165,10 +165,15 @@ try:
             sys.exit(0)
         raise Failure("authenticated installer did not return one complete JSON result", code or 7)
     expected = ("dsr-release-installer-generation" if action == "generate-release" else
+                "dsr-install-host" if action == "describe-host" and code == 0 else
                 "dsr-install-recipe" if action == "describe-recipe" and code == 0 else "dsr-release-install")
     if not isinstance(details, dict) or details.get("kind") != expected:
         raise Failure("unexpected authenticated installer result", 7)
-    if action == "describe-recipe" and code == 0:
+    if action == "describe-host" and code == 0:
+        if (details.get("authenticated") is not False or not isinstance(details.get("target"), str) or
+                details.get("libc") not in (None, "unknown", "gnu", "musl")):
+            raise Failure("invalid host description", 7)
+    elif action == "describe-recipe" and code == 0:
         if details.get("authenticated") is not False or not isinstance(details.get("recipe"), dict):
             raise Failure("invalid recipe description", 7)
     elif type(details.get("exit_code")) is not int or details["exit_code"] != code:

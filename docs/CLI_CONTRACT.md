@@ -1680,6 +1680,8 @@ dsr installer generate-release --policy /absolute/policy.json \
 
 dsr installer describe-recipe --recipe /absolute/recipe.json
 
+dsr installer describe-host
+
 dsr installer install --snapshot /absolute/snapshot \
   --recipe /absolute/recipe.json --prefix /absolute/prefix \
   --repo OWNER/TOOL --tag v1.2.3 --sha "$SOURCE_SHA" \
@@ -1692,6 +1694,11 @@ either a complete local `--snapshot` or explicit `--fetch`; it authenticates the
 complete signed inventory before installing the recipe's executable and runtime
 data set. Changing an existing managed generation requires `--replace`.
 Recipe inspection validates policy and reports `authenticated: false`.
+Host inspection reports the physical platform and, on Linux, GNU/musl runtime
+evidence without reading credentials, downloading assets, or changing an installation. An
+unknown C runtime is reported as `libc: "unknown"`. Generated release installers
+use this shared observation to choose between an embedded standard GNU/musl
+recipe pair; unresolved or nonstandard matrices require `--target-triple`.
 See [authenticated installation](RELEASE_INSTALLATION.md) for the snapshot,
 recipe, independent contract and activation requirements.
 
@@ -1705,8 +1712,8 @@ and authenticates the exact release. A plan is an observation, not a reservation
 execution repeats the validation and concurrency checks.
 
 With global `--json`, the command emits one standard envelope with
-`command: "installer"`. `details.action` identifies `generate-release`, `install`
-or `describe-recipe`; all authoritative engine fields remain in `details`,
+`command: "installer"`. `details.action` identifies `generate-release`, `install`,
+`describe-recipe` or `describe-host`; all authoritative engine fields remain in `details`,
 including `status`, `activated`, `authenticated` and any reported error. The
 envelope exit code matches the process result. A successful plan has outer
 `status: "success"` and `details.status: "planned"`; it does not claim activation

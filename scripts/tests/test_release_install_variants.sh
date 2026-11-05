@@ -17,6 +17,7 @@ from pathlib import Path
 import platform
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -109,10 +110,11 @@ else:
     print("Signer mode: real Minisign", flush=True)
 
 
-def invoke(command, expected=0, label="command"):
+def invoke(command, expected=0, label="command", selected_env=None):
     global calls
     calls += 1
-    result = subprocess.run(list(map(str, command)), env=env, capture_output=True, timeout=45)
+    result = subprocess.run(list(map(str, command)), env=env if selected_env is None else selected_env,
+                            capture_output=True, timeout=45)
     (work / ("%03d.stdout" % calls)).write_bytes(result.stdout)
     (work / ("%03d.stderr" % calls)).write_bytes(result.stderr)
     check(label + " exit=" + str(expected), result.returncode == expected)
@@ -668,11 +670,11 @@ def generate(label, policy, output=None, expected=0):
     return value, output
 
 
-def generated_install(label, script, selected_snapshot, prefix, extra=(), expected=0, streamed=False):
+def generated_install(label, script, selected_snapshot, prefix, extra=(), expected=0, streamed=False, selected_env=None):
     command = ["bash", str(script), "--snapshot", str(selected_snapshot), "--prefix", str(prefix), *extra]
     if streamed:
         command = ["bash", "-c", 'cat -- "$1" | bash -s -- "${@:2}"', "_", *command[1:]]
-    result = invoke(command, expected, label)
+    result = invoke(command, expected, label, selected_env)
     value = json.loads(result.stdout)
     check(label + " standalone result agrees with process", value.get("kind") == "dsr-release-install" and value.get("exit_code") == result.returncode)
     if expected:
@@ -680,6 +682,57 @@ def generated_install(label, script, selected_snapshot, prefix, extra=(), expect
     else:
         check(label + " standalone result preserves offline authentication scope", value.get("authenticated") is True and value.get("remote_current") is False)
     return value
+
+
+def libc_fixture(label, glibc=None, interpreter=None, elf_class=2, byte_order=1, malformed=False):
+    # Substitute only the running host's confstr/ELF observations. The real
+    # ELF parser, generated bootstrap, signed mapper/verifier and activation
+    # execute unchanged. No fixture pretends to run a musl/native compiler.
+    folder = work / ("host-" + label)
+    folder.mkdir()
+    image = folder / "python-elf"
+    endian = "<" if byte_order == 1 else ">"
+    ident = b"\x7fELF" + bytes((elf_class, byte_order, 1)) + b"\0" * 9
+    path = (interpreter or "/unknown/runtime").encode() + (b"" if malformed else b"\0")
+    if elf_class == 2:
+        header = struct.pack(endian + "HHIQQQIHHHHHH", 3, 62, 1, 0, 64, 0, 0, 64, 56, 1, 0, 0, 0)
+        program = struct.pack(endian + "IIQQQQQQ", 3, 4, 120, 0, 0, len(path), len(path), 1)
+    else:
+        header = struct.pack(endian + "HHIIIIIHHHHHH", 3, 3, 1, 0, 52, 0, 0, 52, 32, 1, 0, 0, 0)
+        program = struct.pack(endian + "IIIIIIII", 3, 84, 0, 0, len(path), len(path), 4, 1)
+    image.write_bytes(ident + header + program + path)
+    (folder / "sitecustomize.py").write_text(
+        "# TEST ONLY: local host observations, never a production verification replacement.\n"
+        "import builtins, os\n"
+        "original_confstr = os.confstr\n"
+        "os.confstr = lambda key: " + repr(glibc) + " if key == 'CS_GNU_LIBC_VERSION' else original_confstr(key)\n"
+        "original_open = builtins.open\n"
+        "def observed_open(path, *args, **kwargs):\n"
+        "    return original_open(" + repr(str(image)) + " if path == '/proc/self/exe' else path, *args, **kwargs)\n"
+        "builtins.open = observed_open\n")
+    return dict(env, PYTHONPATH=str(folder))
+
+
+unknown_host = libc_fixture("unknown")
+gnu_host = libc_fixture("gnu", glibc="glibc 2.39", interpreter="/lib/ld-musl-x86_64.so.1")
+musl_host = libc_fixture("musl", interpreter="/lib/ld-musl-" + cpu + ".so.1")
+for label, observed_env, family, method in (
+    ("actual-runtime", env, None, None),
+    ("gnu-with-alternate-musl-loader", gnu_host, "gnu", "confstr"),
+    ("musl-interpreter", musl_host, "musl", "elf-interpreter"),
+    ("musl-32-big-endian", libc_fixture("musl-32", interpreter="/lib/ld-musl-i386.so.1", elf_class=1, byte_order=2), "musl", "elf-interpreter"),
+    ("unknown-runtime", unknown_host, "unknown", None),
+    ("malformed-interpreter", libc_fixture("malformed", interpreter="/lib/ld-musl-x86_64.so.1", malformed=True), "unknown", None),
+):
+    observed = json.loads(invoke(["bash", runtime / "release_install.sh", "describe-host"],
+                                label=label + " description", selected_env=observed_env).stdout)
+    check(label + " host query reports local evidence without authenticating a release",
+          observed.get("kind") == "dsr-install-host" and observed.get("target") == target and
+          observed.get("authenticated") is False and
+          (family is None or observed.get("libc") == family) and
+          (method is None or observed.get("libc_evidence", {}).get("method") == method))
+    if label == "actual-runtime":
+        actual_host = observed
 
 
 matrix_policy = policy_for([recipe_for(1, musl), recipe_for(0, gnu)])
@@ -698,8 +751,28 @@ if generated.get("status") == "generated":
     check("recipe and executable ordering reuse the identical generated script", regenerated.get("reused") is True and
           (digest(standalone), standalone.stat().st_ino) == script_identity)
     selected_prefix = work / "standalone-prefix"
-    generated_install("standalone-ambiguous", standalone, snapshot, selected_prefix, expected=4)
+    generated_install("standalone-ambiguous", standalone, snapshot, selected_prefix, expected=4, selected_env=unknown_host)
     check("ambiguous compiler selection creates no persistent installation state", not selected_prefix.exists() and not Path(str(selected_prefix) + ".lock").exists())
+    for label, observed_env, triple in (("gnu", gnu_host, gnu), ("musl", musl_host, musl)):
+        automatic_prefix = work / ("automatic-" + label)
+        automatic = generated_install("automatic-" + label, standalone, snapshot, automatic_prefix, selected_env=observed_env)
+        check("automatic " + label + " chooses the matching embedded complete recipe",
+              automatic.get("target_triple") == triple and automatic.get("selection", {}).get("mode") == "automatic-libc" and
+              automatic.get("selection", {}).get("libc") == label and automatic.get("activated") is True and
+              {p.name for p in (automatic_prefix / "current/bin").iterdir()} == {"app", "alias", "helper"})
+        original_state = state(automatic_prefix)
+        explicit = generated_install("automatic-" + label + "-explicit-retry", standalone, snapshot, automatic_prefix,
+                                     ("--target-triple", triple), selected_env=unknown_host)
+        check("automatic and explicit " + label + " selections retain the same generation and inodes",
+              explicit.get("generation") == automatic.get("generation") and not explicit.get("activated") and
+              explicit.get("selection", {}).get("mode") == "explicit" and state(automatic_prefix) == original_state)
+    if actual_host.get("libc") in ("gnu", "musl"):
+        automatic = generated_install("automatic-real-runtime-plan", standalone, snapshot, work / "actual-runtime-prefix",
+                                      ("--dry-run",))
+        check("real running C library selects its matching authenticated recipe",
+              automatic.get("target_triple") == {"gnu": gnu, "musl": musl}[actual_host["libc"]] and
+              automatic.get("selection", {}).get("evidence") == actual_host.get("libc_evidence") and
+              not (work / "actual-runtime-prefix").exists())
     for label, selector in (("unknown", cpu + "-unknown-linux-other"), ("empty", ""), ("unsafe", "../gnu"), ("control", "gnu\n")):
         generated_install("standalone-" + label, standalone, snapshot, selected_prefix, ("--target-triple", selector), 4)
         check("unavailable/malformed " + label + " does not choose a fallback", not selected_prefix.exists())
@@ -734,6 +807,8 @@ if generated.get("status") == "generated":
         check("valid embedded selector does not authorize differently signed bytes", state(selected_prefix) == before)
     before = state(selected_prefix)
     generated_install("standalone-unselected-corrupt", standalone, broken, selected_prefix, ("--target-triple", gnu, "--replace"), 1)
+    generated_install("automatic-unselected-corrupt", standalone, broken, selected_prefix, ("--replace",), 1,
+                      selected_env=gnu_host)
     check("generated selector cannot narrow complete snapshot authentication", state(selected_prefix) == before)
     for flag in ("--repo", "--sha", "--builder", "--public-key", "--recipe"):
         generated_install("standalone-trust-override-" + flag[2:], standalone, snapshot, selected_prefix,

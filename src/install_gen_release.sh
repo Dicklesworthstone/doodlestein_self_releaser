@@ -98,7 +98,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import platform
 import re
 import signal
 import stat
@@ -111,6 +110,7 @@ BUNDLE_SHA256 = '__DSR_RELEASE_BUNDLE_SHA256__'
 child = None
 interrupted = False
 result = None
+engine_started = False
 
 class Failure(Exception):
     def __init__(self, message, code=4):
@@ -150,7 +150,7 @@ try:
     parser = Parser(description="Install the fixed signed release embedded in this installer.", allow_abbrev=False)
     parser.add_argument("--prefix", help="Managed installation prefix with an existing parent")
     parser.add_argument("--snapshot", help="Use a complete local snapshot, without any network access")
-    parser.add_argument("--target-triple", help="Choose an exact embedded compiler variant; required when this host has several recipes")
+    parser.add_argument("--target-triple", help="Choose an exact embedded compiler variant; otherwise match a standard GNU/musl pair to the host libc")
     parser.add_argument("--replace", action="store_true")
     parser.add_argument("--allow-draft", action="store_true", help="Explicitly permit a draft when fetching")
     parser.add_argument("--dry-run", action="store_true", help="Authenticate and stage only; online by default")
@@ -188,22 +188,6 @@ try:
         snapshot = plain(args.snapshot)
         need(snapshot.is_dir(), "snapshot must be a directory")
         need(snapshot != prefix and prefix not in snapshot.parents and snapshot not in prefix.parents, "prefix overlaps snapshot")
-    os_name = {"Linux": "linux", "Darwin": "darwin", "FreeBSD": "freebsd"}.get(platform.system())
-    arch = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64", "i386": "386", "i686": "386",
-            "armv7": "armv7", "armv7l": "armv7", "armv7hl": "armv7"}.get(platform.machine().lower())
-    need(os_name is not None and arch is not None, "unsupported installation host", 3)
-    target = os_name + "/" + arch
-    selected = [r for r in policy["recipes"] if r["target"] == target]
-    need(selected, "this installer has no recipe for this host", 3)
-    if args.target_triple is not None:
-        # A selection can only choose a policy embedded at generation time.
-        # It cannot rewrite an untyped recipe, override a pinned compiler or
-        # fall back to whichever file happens to be present in the release.
-        selected = [r for r in selected if r.get("target_triple") == args.target_triple]
-        need(len(selected) == 1, "compiler variant is not embedded for this host")
-    elif len(selected) != 1:
-        raise Failure("this host requires --target-triple; choose one of: " +
-                      ", ".join(r["target_triple"] for r in selected))
     os.umask(0o077)
     need(not interrupted, "installation interrupted", 5)
     with tempfile.TemporaryDirectory(prefix=".dsr-installer-", dir=prefix.parent) as temporary:
@@ -211,6 +195,49 @@ try:
         for name, data in modules.items():
             (work / name).write_bytes(data)
             (work / name).chmod(0o400)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("BASH_FUNC_") and k not in ("BASH_ENV", "ENV")}
+        # Share host/ABI detection with the actual installation engine. This
+        # bounded local query reads no policy, credentials or payload bytes.
+        child = subprocess.Popen(["bash", str(work / "release_install.sh"), "describe-host"],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 env=env, start_new_session=True)
+        try:
+            host_bytes, diagnostics = child.communicate(timeout=min(args.timeout, 10))
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
+            raise Failure("installation host inspection timed out", 5)
+        need(not interrupted, "installation interrupted", 5)
+        need(child.returncode == 0, "installation host inspection failed", 3)
+        host = json.loads(host_bytes)
+        need(isinstance(host, dict) and host.get("kind") == "dsr-install-host" and
+             host.get("authenticated") is False and isinstance(host.get("target"), str) and
+             host.get("libc") in (None, "unknown", "gnu", "musl"), "invalid installation host observation", 7)
+        child = None
+        target = host["target"]
+        selected = [r for r in policy["recipes"] if r["target"] == target]
+        need(selected, "this installer has no recipe for this host", 3)
+        selection = dict(mode="single-recipe", target=target)
+        if args.target_triple is not None:
+            # Select only an embedded recipe. An explicit choice never falls
+            # back to whichever asset happens to remain available remotely.
+            selected = [r for r in selected if r.get("target_triple") == args.target_triple]
+            need(len(selected) == 1, "compiler variant is not embedded for this host")
+            selection["mode"] = "explicit"
+        elif len(selected) != 1:
+            cpu = {"linux/amd64": "x86_64", "linux/arm64": "aarch64",
+                   "linux/386": "i686", "linux/armv7": "armv7"}.get(target)
+            suffix = "eabihf" if target == "linux/armv7" else ""
+            standard = {libc: str(cpu) + "-unknown-linux-" + libc + suffix for libc in ("gnu", "musl")}
+            choices = {r.get("target_triple") for r in selected}
+            if cpu is not None and choices == set(standard.values()) and host["libc"] in standard:
+                selected = [r for r in selected if r["target_triple"] == standard[host["libc"]]]
+                selection.update(mode="automatic-libc", libc=host["libc"], evidence=host.get("libc_evidence"))
+            else:
+                raise Failure("cannot select this compiler matrix automatically; use --target-triple with one of: " +
+                              ", ".join(r["target_triple"] for r in selected))
+        if "target_triple" in selected[0]:
+            selection["target_triple"] = selected[0]["target_triple"]
         (work / "recipe.json").write_text(json.dumps(selected[0]) + "\n")
         (work / "trusted.pub").write_text("untrusted comment: generated installer pinned key\n" + bundle["public_key"] + "\n")
         command = ["bash", str(work / "release_install.sh"), "--prefix", str(prefix), "--recipe", str(work / "recipe.json"),
@@ -230,10 +257,10 @@ try:
         for flag in ("replace", "dry_run", "allow_draft"):
             if getattr(args, flag):
                 command.append("--" + flag.replace("_", "-"))
-        env = {k: v for k, v in os.environ.items() if not k.startswith("BASH_FUNC_") and k not in ("BASH_ENV", "ENV")}
         need(not interrupted, "installation interrupted", 5)
         with (work / "result.json").open("wb") as out:
             child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=out, env=env, start_new_session=True)
+            engine_started = True
             # A signal between spawn and assignment cannot expose a success:
             # forward any already-recorded interruption as soon as owned.
             if interrupted:
@@ -244,13 +271,14 @@ try:
         result = json.loads(raw)
         need(isinstance(result, dict) and result.get("kind") == "dsr-release-install" and
              type(result.get("exit_code")) is int and result["exit_code"] == rc, "invalid installation result", 7)
+        result["selection"] = selection
         print(json.dumps(result, sort_keys=True))
         sys.exit(rc)
 except (Failure, OSError, ValueError, TypeError, KeyError) as error:
     code = getattr(error, "code", 7)
     print("[release-installer] " + str(error), file=sys.stderr)
     # Never turn an acknowledged activation into an asserted non-activation.
-    activated = result.get("activated", False) if isinstance(result, dict) else None if child is not None else False
+    activated = result.get("activated", False) if isinstance(result, dict) else None if engine_started else False
     print(json.dumps(dict(kind="dsr-release-install", status="error", exit_code=code, activated=activated, error=str(error))))
     sys.exit(code)
 finally:

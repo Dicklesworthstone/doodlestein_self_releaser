@@ -19,6 +19,7 @@ import re
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -117,6 +118,76 @@ def name(value):
 
 def member(value):
     return isinstance(value, str) and len(value) <= 1024 and all(name(p) for p in value.split("/"))
+
+
+def elf_interpreter(executable):
+    # Read only the running interpreter's bounded ELF headers. Do not execute
+    # ldd, scan unrelated installed loaders, or inspect a downloaded payload.
+    with open(executable, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        ident = stream.read(16)
+        if len(ident) != 16 or ident[:4] != b"\x7fELF" or ident[4] not in (1, 2) or ident[5] not in (1, 2):
+            return None
+        endian = "<" if ident[5] == 1 else ">"
+        header_format = endian + ("HHIIIIIHHHHHH" if ident[4] == 1 else "HHIQQQIHHHHHH")
+        header = struct.unpack(header_format, stream.read(struct.calcsize(header_format)))
+        offset, width, count = header[4], header[8], header[9]
+        program_format = endian + ("IIIIIIII" if ident[4] == 1 else "IIQQQQQQ")
+        if width != struct.calcsize(program_format) or not 0 < count <= 256 or offset + width * count > info.st_size:
+            return None
+        selected = None
+        for index in range(count):
+            stream.seek(offset + index * width)
+            entry = struct.unpack(program_format, stream.read(width))
+            if entry[0] != 3:  # PT_INTERP
+                continue
+            if selected is not None:
+                return None
+            start, size = (entry[1], entry[4]) if ident[4] == 1 else (entry[2], entry[5])
+            if not 2 <= size <= 4096 or start + size > info.st_size:
+                return None
+            stream.seek(start)
+            value = stream.read(size)
+            if len(value) != size or not value.endswith(b"\0") or b"\0" in value[:-1]:
+                return None
+            selected = value[:-1].decode("utf-8")
+            if not selected.startswith("/") or any(ord(c) < 32 or ord(c) == 127 for c in selected):
+                return None
+        after = os.fstat(stream.fileno())
+        if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) != (
+                after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            return None
+        return selected
+
+
+def installation_host():
+    operating_system = {"Linux": "linux", "Darwin": "darwin", "FreeBSD": "freebsd"}.get(platform.system())
+    architecture = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64", "i386": "386", "i686": "386",
+                    "armv7": "armv7", "armv7l": "armv7", "armv7hl": "armv7"}.get(platform.machine().lower())
+    target = str(operating_system) + "/" + str(architecture)
+    need(re.fullmatch(PLATFORM_PATTERN, target), "unsupported installation host", 3)
+    libc, evidence = None, None
+    if operating_system == "linux":
+        libc = "unknown"
+        try:
+            version = os.confstr("CS_GNU_LIBC_VERSION")
+        except (AttributeError, ValueError, OSError):
+            version = None
+        if isinstance(version, str) and re.fullmatch(r"glibc [0-9]+(?:\.[0-9]+)+", version):
+            libc, evidence = "gnu", dict(method="confstr", value=version)
+        else:
+            try:
+                # /proc identifies this running executable even if Python was
+                # launched through a virtualenv or its pathname was renamed.
+                executable = "/proc/self/exe" if Path("/proc/self/exe").is_file() else sys.executable
+                interpreter = elf_interpreter(executable)
+            except (OSError, ValueError, struct.error, UnicodeError):
+                interpreter = None
+            if interpreter is not None and re.fullmatch(r"ld-musl-[A-Za-z0-9_-]+\.so\.1", Path(interpreter).name):
+                libc, evidence = "musl", dict(method="elf-interpreter", value=interpreter)
+    return dict(kind="dsr-install-host", target=target, libc=libc, libc_evidence=evidence, authenticated=False)
 
 
 def data_directories(files):
@@ -305,6 +376,11 @@ try:
     class Parser(argparse.ArgumentParser):
         def error(self, message):
             raise Failure(message, 4)
+    if sys.argv[2:3] == ["describe-host"]:
+        parser = Parser(description="Describe the installation platform and running Linux C library; no writes or network.", allow_abbrev=False)
+        parser.parse_args(sys.argv[3:])
+        print(canonical(installation_host()).decode(), end="")
+        sys.exit(0)
     if sys.argv[2:3] == ["describe-recipe"]:
         parser = Parser(description="Validate and normalize an installation recipe; no authentication or writes.", allow_abbrev=False)
         parser.add_argument("--recipe", required=True)
@@ -362,11 +438,8 @@ try:
         need(contract_file.stat().st_size <= 1048576, "release contract exceeds size limit", 4)
         contract_pin = digest(contract_file)
     need(public.stat().st_size <= 8192, "public key exceeds size limit", 4)
-    operating_system = {"Linux": "linux", "Darwin": "darwin", "FreeBSD": "freebsd"}.get(platform.system())
-    architecture = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64", "i386": "386", "i686": "386",
-                    "armv7": "armv7", "armv7l": "armv7", "armv7hl": "armv7"}.get(platform.machine().lower())
-    need(operating_system is not None and architecture is not None, "unsupported installation host", 3)
-    need(selected["target"] == operating_system + "/" + architecture, "recipe target is not the installation host", 4)
+    host = installation_host()
+    need(selected["target"] == host["target"], "recipe target is not the installation host", 4)
     for executable in ("bash", "jq", "minisign"):
         need(shutil.which(executable), "missing dependency: " + executable, 3)
     os.umask(0o077)

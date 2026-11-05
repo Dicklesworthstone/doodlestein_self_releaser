@@ -141,7 +141,22 @@ release `targets` list; these are recipe fragments, not a complete policy:
 ]
 ```
 
-On a host with several embedded recipes, the consumer must select one:
+When the embedded Linux recipes are the standard GNU/musl pair for the host
+architecture, the generated installer automatically selects the recipe matching
+the running host C library. This works for AMD64, ARM64, i686 and ARMv7 hard-float
+triples. The shared installation engine observes GNU libc through `confstr`;
+otherwise it reads the bounded ELF interpreter header of its running Python
+process to recognize musl. It does not run a downloaded executable or `ldd`,
+and the mere presence of an alternate loader cannot select a different ABI.
+
+Inspect the same local observation without downloading or writing anything:
+
+```bash
+dsr installer describe-host
+```
+
+An unknown runtime or any other ambiguous compiler matrix still requires an
+explicit selection. The consumer can always select an exact embedded recipe:
 
 ```bash
 bash demo-v1.2.3.sh --prefix /home/alice/.local/demo \
@@ -152,10 +167,18 @@ This option only chooses an already embedded recipe for the actual host. It
 cannot rewrite the recipe, invent a compiler identity for an untyped recipe,
 change its artifact names, or relax the embedded signer/source/build policy.
 There is no filename-based guessing, first-entry default, or automatic libc
-fallback. An omitted ambiguous selection or an unknown variant fails before
-installation staging or network acquisition. A sole typed recipe selects its
-fixed variant by default; an untyped singleton preserves legacy behavior.
+fallback after a missing or invalid asset. An unresolved ambiguous selection or
+an unknown variant fails before payload staging or network acquisition. A sole
+typed recipe selects its fixed variant by default; an untyped singleton
+preserves legacy behavior. Runtime detection distinguishes GNU from musl; it
+does not establish a minimum glibc version or every executable's ABI compatibility.
 ARM64 uses `linux/arm64` and the corresponding `aarch64-unknown-linux-*` triples.
+
+The standalone result's `selection` records whether the recipe was fixed,
+explicitly chosen, or selected automatically, including the local libc evidence
+for an automatic choice. An automatic choice and an explicit choice of the same
+recipe produce the same authenticated generation. Detection does not weaken
+the signed compiler identity or complete-release checks below.
 
 The same optional recipe field works directly with `src/release_install.sh`.
 After authenticating the **complete snapshot**, the engine requires an explicit

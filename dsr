@@ -16101,7 +16101,7 @@ cmd_installer() {
 
     case "$subcmd" in
         generate|validate) ;;
-        generate-release|install|describe-recipe)
+        generate-release|install|describe-recipe|describe-host)
             _dsr_require installer_release_cli
             installer_release_cli "$subcmd" "$@"
             return $?
@@ -16117,6 +16117,7 @@ USAGE:
     dsr installer generate-release --policy FILE --public-key FILE --output FILE [--dry-run]
     dsr installer install (--snapshot DIR | --fetch) --recipe FILE --prefix DIR [release policy...]
     dsr installer describe-recipe --recipe FILE [--release-contract FILE --targets LIST]
+    dsr installer describe-host
 
 DESCRIPTION:
     Writes <output-dir>/<tool>/install.sh from repos.d/<tool>.yaml: platform
@@ -16140,7 +16141,9 @@ DESCRIPTION:
     strict engine options. --json wraps its authoritative result in one envelope.
     Generator dry-run validates without writing output or its lock. Installation
     dry-run authenticates and extracts without changing the prefix; --fetch still
-    downloads the complete signed snapshot. describe-recipe is always read-only.
+    downloads the complete signed snapshot. describe-recipe and describe-host are
+    read-only; describe-host reports the local platform and Linux C library used
+    for automatic GNU/musl selection by generated release installers.
 
 EXIT CODES:
     0  - All installers generated/valid

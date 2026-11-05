@@ -196,9 +196,15 @@ def install_args(source=first, destination=prefix, selected=recipe_file, key=pub
             "--tag", tag, "--sha", pin, "--builder", builder, "--targets", ",".join(targets), "--public-key", key]
 
 
-for action in ("generate-release", "install", "describe-recipe"):
+for action in ("generate-release", "install", "describe-recipe", "describe-host"):
     help_result = invoke(action, ["--help"], prefix=["--dry-run"], label=action + " help")
     check(action + " help is data without an authentication claim", "usage:" in help_result["help"] and "authenticated" not in help_result)
+
+host = invoke("describe-host", [], prefix=["--dry-run"], label="host preflight")
+check("public host inspection describes only the local platform without authentication",
+      host["kind"] == "dsr-install-host" and host["target"] == target and host["authenticated"] is False and
+      host["libc"] in (None, "unknown", "gnu", "musl"))
+invoke("describe-host", ["--target-triple", triple], expected=4, label="host description rejects invented selection")
 
 described = invoke("describe-recipe", ["--recipe", recipe_file], label="recipe preflight")
 check("public recipe inspection retains normalized compiler and data selectors",
