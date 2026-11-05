@@ -36,6 +36,7 @@ if [[ "$repo" == owner/b ]]; then
         cooldown) code=429; extra=$'Retry-After: 86400\r\n' ;;
         unknown-cooldown) code=429; extra=$'Retry-After: Wed, 21 Oct 2030 07:28:00 GMT\r\n' ;;
         elapsed) code=429; extra=$'Retry-After: 0\r\n' ;;
+        stall) sleep 4 ;;
     esac
 fi
 if [[ "${DP_MODE:-}" == mutate ]]; then
@@ -56,6 +57,7 @@ fi
 printf 'lookup\n' >> "$DP_CASE/auth-lookups"
 lookups=$(wc -l < "$DP_CASE/auth-lookups")
 if (( lookups == ${DP_AUTH_FAIL_AT:-0} )); then exit 1; fi
+if (( lookups == ${DP_AUTH_STALL_AT:-0} )); then sleep 4; fi
 printf '%s' fixture-token
 GH
 chmod +x "$WORK/bin/curl" "$WORK/bin/gh"
@@ -71,7 +73,7 @@ check() {
 new_case() {
     CASE="$WORK/cases/$1"; mkdir "$CASE"
     export DP_CASE="$CASE" DSR_STATE_DIR="$CASE/state" DSR_GH_TOKEN=fixture-token
-    unset DP_MODE DP_AUTH_FAIL_AT DP_PREPARE_FAIL DP_STDIN_CONSUMER DRY_RUN
+    unset DP_MODE DP_AUTH_FAIL_AT DP_AUTH_STALL_AT DP_PREPARE_FAIL DP_STDIN_CONSUMER DRY_RUN
     : > "$CASE/calls.jsonl"
 }
 capture() { status=0; "$@" > "$CASE/out" 2> "$CASE/err" || status=$?; }
@@ -411,6 +413,51 @@ for lookup in 2 3; do
          .[1].receipt.attempts==1 and .[1].outcome=="accepted" and
          .[1].resend_uncertain==false' "$STATE"
 done
+
+for lookup in 1 2 3; do
+    new_case "auth-deadline-$lookup"
+    export DP_AUTH_STALL_AT="$lookup"
+    started=$SECONDS
+    DISPATCH_TIMEOUT=1 capture with_rotating_auth release --repos owner/a
+    elapsed=$((SECONDS-started))
+    check "auth deadline $lookup returns within its bound" test "$elapsed" -lt 4
+    check "auth deadline $lookup preserves the dependency error" test "$status" -eq 3
+    check "auth deadline $lookup starts no POST" test "$(count)" -eq 0
+    STATE=$(state_path)
+    if [[ "$lookup" == 1 ]]; then
+        check 'preflight timeout leaves the outbox pending' jq -e \
+            '.deliveries[0].history==[]' "$STATE"
+    else
+        check "auth deadline $lookup records a known-unsent intent" jq -e \
+            '.deliveries[0].history[-1] | .outcome=="blocked" and
+             .receipt.attempts==0 and .receipt.exit_code==3 and .receipt.http_status==null' "$STATE"
+    fi
+    unset DP_AUTH_STALL_AT
+    capture with_rotating_auth release --repos owner/a
+    check "auth deadline $lookup releases the lock and permits ordinary retry" test "$status" -eq 0
+    check "auth deadline $lookup recovery sends exactly one POST" test "$(count)" -eq 1
+    check "auth deadline $lookup needs no uncertain resend authorization" jq -e \
+        '.deliveries[0].history[-1] | .outcome=="accepted" and .resend_uncertain==false' "$STATE"
+done
+
+new_case transport-deadline
+export DP_MODE=stall
+DISPATCH_TIMEOUT=1 capture release
+check 'transport deadline preserves delivery uncertainty' test "$status" -eq 8
+check 'transport deadline attempts each destination once' test "$(count)" -eq 2
+STATE=$(state_path)
+accepted_before=$(jq -Sc '.deliveries[0]' "$STATE")
+check 'transport deadline preserves the accepted peer and attempted receipt' jq -e \
+    '[.deliveries[].history[-1].outcome]==["accepted","uncertain"] and
+     .deliveries[1].history[-1].receipt.attempts==1' "$STATE"
+unset DP_MODE
+capture release
+check 'transport deadline can be inspected after releasing custody' test "$status" -eq 8
+check 'ordinary restart does not replay a timed-out POST' test "$(count)" -eq 2
+capture release --retry-uncertain
+check 'explicit recovery retries the timed-out destination' test "$status" -eq 0
+check 'explicit recovery does not resend accepted work' test "$(count)" -eq 3
+check 'accepted peer evidence survives deadline and recovery' test "$(jq -Sc '.deliveries[0]' "$STATE")" = "$accepted_before"
 
 new_case preflight-after-accepted-peer
 export DP_AUTH_FAIL_AT=5

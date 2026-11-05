@@ -2,7 +2,7 @@
 # Repository dispatch (bd-1jt.3.7). Acceptance means HTTP 204, NOT that a
 # downstream workflow ran. A lost POST acknowledgement is never blindly replayed.
 
-if ! declare -F dsr_lock_fd >/dev/null; then
+if ! declare -F dsr_lock_fd >/dev/null || ! declare -F run_with_timeout >/dev/null; then
     # shellcheck source=src/guardrails.sh
     source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/guardrails.sh" || { return 3 2>/dev/null || exit 3; }
 fi
@@ -33,7 +33,7 @@ _dp_body() {
     }
 }
 
-_dp_get_token() (
+_dp_resolve_token() (
     set +x
     local token="${DSR_GH_TOKEN:-${GITHUB_TOKEN:-${GH_TOKEN:-}}}"
     if [[ -z "$token" ]] && command -v secrets_get_gh_token >/dev/null; then
@@ -44,6 +44,28 @@ _dp_get_token() (
     fi
     [[ "$token" =~ ^[A-Za-z0-9_.-]+$ ]] || return 3
     printf '%s' "$token"
+)
+
+# Credential helpers can block before curl's own deadline starts. Bound the
+# entire lookup, including an inherited secrets function or gh's keychain
+# access, while retaining the dependency failure that proves no POST ran.
+_dp_get_token() (
+    set +x
+    local seconds="${DISPATCH_TIMEOUT:-30}" status=0
+    _dp_int "$seconds" 1 600 || return 4
+    # Explicit credentials are validated entirely by shell builtins; there
+    # is no external helper to supervise in this common path.
+    if [[ -n "${DSR_GH_TOKEN:-${GITHUB_TOKEN:-${GH_TOKEN:-}}}" ]]; then
+        _dp_resolve_token
+        return $?
+    fi
+    run_with_timeout "$seconds" _dp_resolve_token || status=$?
+    if (( status != 0 )); then
+        if (( status == 124 || status == 137 )); then
+            _dp_log_error "GitHub credential lookup exceeded ${seconds}s"
+        fi
+        return 3
+    fi
 )
 
 dispatch_check_auth() {
@@ -70,6 +92,7 @@ _dp_http() (
     local repo="$1" body="$2" dir="$3" token
     token=$(_dp_get_token) || return 3
     printf 'header = "Authorization: Bearer %s"\n' "$token" |
+        run_with_timeout "${DISPATCH_TIMEOUT:-30}" \
         curl -q --config - --silent --show-error --proto '=https' \
             --connect-timeout 10 --max-time "${DISPATCH_TIMEOUT:-30}" \
             --retry 0 --max-redirs 0 --request POST \
@@ -657,7 +680,7 @@ dispatch_release_json() (
     return "$rc"
 )
 
-export -f _dp_log_error _dp_log_info _dp_repo _dp_int _dp_body _dp_get_token
+export -f _dp_log_error _dp_log_info _dp_repo _dp_int _dp_body _dp_resolve_token _dp_get_token
 export -f _dp_config _dp_http _dp_header _dp_result _dp_blocked_result _dp_deliver _dp_repos
 export -f _dp_digest_text _dp_state_hash _dp_release_plan _dp_outbox_identity _dp_state_valid _dp_state_write
 export -f _dp_outbox_summary _dp_release_outbox

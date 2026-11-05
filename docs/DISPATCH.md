@@ -176,7 +176,7 @@ Settings (all validated before requests):
 | `DISPATCH_MAX_RETRIES` | `3` | Total attempts per transport invocation, from 1 to 10. |
 | `DISPATCH_RETRY_DELAY` | `5` | Base backoff in seconds, from 0 to 60. |
 | `DISPATCH_MAX_WAIT` | `120` | Maximum individual retry wait, from 0 to 3600 seconds. |
-| `DISPATCH_TIMEOUT` | `30` | Curl request deadline, from 1 to 600 seconds. |
+| `DISPATCH_TIMEOUT` | `30` | Deadline for each credential lookup and each HTTP transport, from 1 to 600 seconds. |
 | `DISPATCH_PARALLELISM` | `4` | Maximum workers for explicit generic batch `--parallel`, from 1 to 32. |
 
 Release outbox sends are serial. Generic batch concurrency is opt-in. The token
@@ -187,6 +187,15 @@ replaced by a different authenticated `gh` account. Requests are pinned to
 are disabled. Credentials are passed through stdin configuration, not argv.
 Response and transport-error bodies are not copied into diagnostics because an
 upstream server can echo credentials or sensitive payload data.
+
+The deadline covers stored-credential and secrets-helper processes as well as
+curl, including on hosts without GNU `timeout`. A credential lookup that times
+out returns dependency error 3 before starting a POST. Pending work remains
+pending; an existing delivery intent records a blocked receipt with no new
+HTTP attempt and can be retried normally. If the transport has started when
+its deadline expires, delivery remains uncertain (exit 8), even if no HTTP
+status was returned. It is never replayed automatically. Each lookup and
+transport has its own deadline; this setting is not a whole-release deadline.
 
 ## API and structured output
 

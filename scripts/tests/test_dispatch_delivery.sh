@@ -47,6 +47,7 @@ case "${DP_MODE:-success}" in
     secondary) code=429 ;;
     mixed) [[ "$repo" != owner/b ]] || code=422 ;;
     delay) sleep 0.15 ;;
+    stall) sleep 4 ;;
 esac
 printf 'HTTP/2 %s\r\n%s\r\n' "$code" "$extra" > "$headers"
 printf '%s' '{"message":"fixture"}' > "$output"
@@ -60,6 +61,7 @@ printf '%s\n' "$*" >> "$DP_TEST_CASE/gh-calls"
 if [[ "${DP_READ_STDIN:-false}" == true ]]; then
     cat > "$DP_TEST_CASE/stdin-$BASHPID"
 fi
+if [[ "${DP_AUTH_STALL:-false}" == true ]]; then sleep 4; fi
 printf '%s' 'stored-token'
 GH
 chmod +x "$WORK/bin/curl" "$WORK/bin/gh"
@@ -76,7 +78,7 @@ new_case() {
     CASE="$WORK/cases/$1"; mkdir "$CASE"; export DP_TEST_CASE="$CASE"
     export DSR_STATE_DIR="$CASE/state"
     : > "$CASE/calls"; : > "$CASE/argv"; : > "$CASE/gh-calls"
-    unset DP_MODE DP_READ_STDIN DRY_RUN
+    unset DP_MODE DP_READ_STDIN DP_AUTH_STALL DRY_RUN
     export DSR_GH_TOKEN=dsr-explicit GITHUB_TOKEN=github-other GH_TOKEN=gh-other
 }
 capture() { status=0; "$@" > "$CASE/out" 2> "$CASE/err" || status=$?; }
@@ -186,6 +188,47 @@ DISPATCH_MAX_RETRIES=0 capture dispatch_event owner/repo release
 check 'zero retries cannot become false success' test "$status" -eq 4
 DISPATCH_TIMEOUT=garbage capture dispatch_event owner/repo release
 check 'invalid timeout rejected before transport' test "$status" -eq 4
+
+# Real blocked child processes must respect the deadline before curl starts.
+# The finite four-second fixture also completes against the incumbent, which
+# then incorrectly sends the POST and reports success instead of a refusal.
+new_case auth-deadline
+unset DSR_GH_TOKEN GITHUB_TOKEN GH_TOKEN
+export DP_AUTH_STALL=true
+started=$SECONDS
+DISPATCH_TIMEOUT=1 capture dispatch_event owner/repo release
+elapsed=$((SECONDS-started))
+check 'stored credential lookup respects the configured deadline' test "$elapsed" -lt 4
+check 'timed-out credential lookup returns a dependency failure' test "$status" -eq 3
+check 'timed-out credential lookup performs no POST' test "$(count)" -eq 0
+check 'timed-out credential lookup retains a known-unsent receipt' jq -e \
+    '.outcome=="blocked" and .attempts==0 and .exit_code==3 and .http_status==null' "$CASE/out"
+check 'credential timeout explains which operation expired' contains "$CASE/err" 'credential lookup exceeded 1s'
+
+new_case helper-deadline
+unset DSR_GH_TOKEN GITHUB_TOKEN GH_TOKEN
+stalled_secrets() (
+    secrets_get_gh_token() { sleep 4; printf '%s' helper-token; }
+    dispatch_event owner/repo release
+)
+started=$SECONDS
+DISPATCH_TIMEOUT=1 capture stalled_secrets
+elapsed=$((SECONDS-started))
+check 'inherited secrets helper respects the configured deadline' test "$elapsed" -lt 4
+check 'stalled secrets helper remains a dependency error' test "$status" -eq 3
+check 'stalled secrets helper never falls through to another credential or POST' test "$(count)" -eq 0
+check 'stalled secrets helper never calls gh' test ! -s "$CASE/gh-calls"
+
+new_case transport-deadline
+export DP_MODE=stall
+started=$SECONDS
+DISPATCH_TIMEOUT=1 capture dispatch_event owner/repo release
+elapsed=$((SECONDS-started))
+check 'transport process respects the external deadline' test "$elapsed" -lt 4
+check 'transport deadline returns uncertain delivery' test "$status" -eq 8
+check 'transport deadline never blindly replays a started POST' test "$(count)" -eq 1
+check 'transport deadline retains its attempted request' jq -e \
+    '.outcome=="uncertain" and .attempts==1 and .exit_code==8 and .http_status==null' "$CASE/out"
 
 new_case batch-invalid
 capture dispatch_batch release --repos 'owner/valid,../invalid' --payload '{}'
