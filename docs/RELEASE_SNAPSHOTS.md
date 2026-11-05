@@ -48,14 +48,69 @@ Symlink path components and occupied destinations are rejected. Preparation is
 private staging beside that path, and the complete directory is exposed with
 one same-filesystem rename. An adjacent `DESTINATION.lock` serializes cooperating
 writers and is intentionally retained. Never remove it to bypass a live owner.
-Failures expose no complete snapshot; repeating a failed fetch downloads again.
-An existing snapshot is not overwritten or silently repaired: use offline
-verification, or select a different new destination for another download.
+Failures expose no complete snapshot. By default, repeating a failed fetch
+downloads again. An existing snapshot is not overwritten or silently repaired:
+use offline verification, or opt into the resumable fetch described below from
+the first invocation.
 
 Fetch needs Bash, jq, Minisign, Python 3, flock, the ordinary GitHub transport
 dependencies and a usable GitHub credential. The source release must already
 have manifest-backed signed provenance; unsigned releases cannot use this path.
 The ordinary `verify-release` and `publish-release` operations are unchanged.
+
+## Resume an interrupted download
+
+For a large release, add `--resume` to the first fetch and repeat the identical
+selection after a connection failure or interruption:
+
+```bash
+bash src/slsa_remote.sh fetch-release --resume \
+  --repo OWNER/REPO --tag v1.2.3 --sha "$REVIEWED_SOURCE_COMMIT" \
+  --builder "$TRUSTED_BUILDER_ID" --public-key /srv/keys/release.pub \
+  --targets linux/amd64,darwin/arm64,windows/arm64 \
+  --output-dir /srv/downloads/tool-v1.2.3
+```
+
+This mode retains verified progress in the private sibling directory
+`/srv/downloads/tool-v1.2.3.partial`. Its `selection.json` binds the independently
+selected policy and public-key bytes to the authenticated statement/signature,
+repository, release, tag commit and complete numeric asset inventory. Its
+`artifacts/` directory contains only fully downloaded payloads that match their
+signed size and SHA-256. An incomplete individual transfer never enters that
+namespace; its next attempt starts from byte zero.
+
+Every retry reads the current release and tag, downloads and authenticates the
+statement/signature again, and requires that same frozen release generation.
+It rehashes **every** retained payload before downloading any missing payload.
+It then downloads only the missing assets by their numeric IDs, repeats the
+complete release and local snapshot verification, and exposes the finished
+snapshot with the existing atomic directory rename. A failed last target can
+therefore preserve all previously verified targets without accepting a partial
+release as success.
+
+Changed policy, key bytes, release mode, tag, statement, signature or asset
+inventory refuses reuse. Corrupt, linked, extra or unrelated checkpoint files
+are refused without repair or replacement. Use a different new output path for
+a genuinely different release generation. The existing destination lock covers
+both modes; leaving off `--resume` when a checkpoint exists is an error rather
+than a second independent download into the same destination.
+
+A successful resumable fetch retains its checkpoint. Repeating the same
+`--resume` command authenticates the completed snapshot before contacting
+GitHub, verifies current remote identity, and returns the same snapshot identity
+without replacing its files or historical `download.json`. With an intact
+checkpoint, no payload is downloaded again; the small statement and signature
+are still fetched. The result's `acquisition.reused_payloads` and
+`acquisition.downloaded_payloads` distinguish checked local bytes from new HTTP
+body reads. All payload bytes are authenticated against the selected signed
+statement, including reused bytes; reuse is not a fresh download claim.
+
+Checkpoint payloads and the completed snapshot share private read-only file
+inodes to avoid duplicating a multi-gigabyte release. Both namespaces remain
+subject to byte verification on retry. Keep this managed storage private;
+changing a shared inode invalidates both views. The checkpoint is cooperating
+writer recovery storage, not a separate cryptographic trust anchor or protection
+against arbitrary same-user filesystem changes.
 
 ## Offline verification
 
@@ -104,7 +159,8 @@ The host, tools, trusted-key selection and local cooperating-writer storage
 remain trusted. This is not a sandbox against a privileged filesystem writer or
 a power-loss/distributed transaction guarantee. The existing remote timeouts and
 advertised-size admission limits apply; they are not streaming disk quotas
-against a server lying about response sizes. Partial downloads are not resumed.
+against a server lying about response sizes. Resumable fetch reuses complete
+verified files; it does not continue an individual transfer from a byte offset.
 
 Run `bash scripts/tests/test_slsa_snapshot.sh`. It exercises the complete SLSA
 mapper, remote policy/verifier and local snapshot admission with real filesystem
@@ -112,4 +168,10 @@ operations and hashes. GitHub transport and Minisign are explicit hash-bound
 fixtures, not live HTTP or native Ed25519 acceptance tests. It covers exact-byte
 retention, offline CLI use, moved tags, drifted keys, incomplete downloads,
 independent policy pins, corrupt last-target payloads, forged receipts, linked or
-extra files, collisions, limits and occupied destinations.
+extra files, collisions, limits and occupied destinations. Its resumable cases
+exercise a late transport failure, retained payload inodes, missing-only retries,
+completed retries, and cache/policy/key/release/inventory drift. They also cancel
+an actual fetch process group while its last transfer is blocked, exclude a
+competing resume, and reuse the completed files after cancellation. Select just
+those cases with `DSR_SNAPSHOT_RESUME_ONLY=1`; no live network or native Ed25519
+claim is made by the transport and signer fixtures.

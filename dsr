@@ -1647,6 +1647,7 @@ _watch_load_triggered() {
                     (.status | IN("starting", "running", "succeeded", "failed", "blocked")) and
                     (.started_epoch | integer and . >= 0) and
                     (.next_retry_at == null or (.next_retry_at | integer and . >= 0)) and
+                    ((has("isolate_source") | not) or (.isolate_source | type == "boolean")) and
                     (.resume_run_id | type == "string" and
                         (. == "" or test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")))
                 )
@@ -1761,14 +1762,19 @@ _watch_run_attempt() (
     local run_id="$1" attempt="$2" directory="$3" tool="$4" version="$5" sha="$6" output="$7" resume="$8"
     # The launcher acquired this descriptor before publishing the journal.
     # Keep it inherited by fallback and its descendants until they all exit.
-    local attempt_fd="$9" rc=0 temporary finished
+    local attempt_fd="$9" isolate_source="${10}" rc=0 temporary finished
     # The worker must outlive --once without keeping the watcher mutex held.
     _watch_release_lock
     trap - EXIT
     trap 'exit 5' HUP INT TERM
     [[ "$attempt_fd" =~ ^[0-9]+$ ]] || return 4
-    local -a args=(--non-interactive --json fallback "$tool" --version "$version"
-        --expected-sha "$sha" --output-dir "$output")
+    [[ "$isolate_source" == true || "$isolate_source" == false ]] || return 4
+    # A queued workflow names a release commit, not the developer checkout's
+    # current HEAD. Materialize that commit privately so unattended fallback
+    # works after the checkout advances or acquires staged/untracked work.
+    local -a args=(--non-interactive --json fallback "$tool" --version "$version" --expected-sha "$sha")
+    [[ "$isolate_source" != true ]] || args+=(--isolate-source)
+    args+=(--output-dir "$output")
     [[ -z "$resume" ]] || args+=("--resume=$resume")
     export DSR_RUN_ID="watch-$run_id-$attempt"
     # The worker reports the terminal event only after its completion receipt
@@ -1809,7 +1815,9 @@ _watch_run_attempt() (
 
 _watch_launch_attempt() (
     local run_id="$1" tool="$2" repo="$3" version="$4" sha="$5" attempt="$6" resume="$7"
+    local isolate_source="$8"
     local state directory now timestamp attempt_fd output="$_WATCH_STATE_DIR/watch-artifacts/$run_id"
+    [[ "$isolate_source" == true || "$isolate_source" == false ]] || return 4
     mkdir -p -- "$_WATCH_STATE_DIR/watch-attempts" "$_WATCH_STATE_DIR/watch-artifacts" || return 4
     [[ ! -L "$_WATCH_STATE_DIR/watch-attempts" && ! -L "$_WATCH_STATE_DIR/watch-artifacts" ]] || return 4
     directory=$(mktemp -d "$_WATCH_STATE_DIR/watch-attempts/$run_id.XXXXXXXX") || return 4
@@ -1820,10 +1828,11 @@ _watch_launch_attempt() (
     state=$(_watch_load_triggered) || return 4
     state=$(jq -c --arg id "$run_id" --arg tool "$tool" --arg repo "$repo" --arg version "$version" \
         --arg sha "$sha" --arg directory "${directory##*/}" --arg resume "$resume" --arg timestamp "$timestamp" \
-        --argjson attempt "$attempt" --argjson now "$now" '
+        --argjson attempt "$attempt" --argjson now "$now" --argjson isolate_source "$isolate_source" '
         .runs[$id] = $timestamp | .last_check = $timestamp |
         .attempts[$id] = {attempt:$attempt,attempt_id:$directory,tool:$tool,repo:$repo,version:$version,
-            head_sha:$sha,status:"running",started_epoch:$now,next_retry_at:null,resume_run_id:$resume}
+            head_sha:$sha,status:"running",started_epoch:$now,next_retry_at:null,resume_run_id:$resume,
+            isolate_source:$isolate_source}
     ' <<< "$state") || return 4
     _watch_save_triggered "$state" || return 4
     local fallback_log="$_WATCH_STATE_DIR/fallback-${run_id}.log"
@@ -1839,7 +1848,7 @@ _watch_launch_attempt() (
         # Close in the background supervisor too, before invoking the worker
         # subshell; otherwise that waiting supervisor would retain the mutex.
         _watch_release_lock
-        _watch_run_attempt "$run_id" "$attempt" "$directory" "$tool" "$version" "$sha" "$output" "$resume" "$attempt_fd"
+        _watch_run_attempt "$run_id" "$attempt" "$directory" "$tool" "$version" "$sha" "$output" "$resume" "$attempt_fd" "$isolate_source"
     ) >> "$fallback_log" 2>&1 &
     log_info "Fallback started (PID: $!, attempt: $attempt, log: $fallback_log)"
 )
@@ -1916,7 +1925,7 @@ _watch_iteration() {
     fi
 
     # Process each throttled run
-    local run run_id repo tool_name ref sha record attempt resume outcome next_retry
+    local run run_id repo tool_name ref sha record attempt resume outcome next_retry isolate_source
     while IFS= read -r run; do
         run_id=$(jq -r '.run_id // empty | tostring' <<< "$run")
         [[ "$run_id" =~ ^[1-9][0-9]{0,15}$ ]] || { log_error "Invalid throttled run ID"; return 8; }
@@ -1926,7 +1935,7 @@ _watch_iteration() {
         sha=$(jq -r '.head_sha // ""' <<< "$run")
 
         record=$(jq -c --arg id "$run_id" '.attempts[$id] // null' <<< "$state") || return 4
-        attempt=1; resume=""
+        attempt=1; resume=""; isolate_source=true
         if [[ "$record" != null ]]; then
             if ! jq -e --arg tool "$tool_name" --arg repo "$repo" --arg version "$ref" --arg sha "$sha" '
                 .tool == $tool and .repo == $repo and .version == $version and .head_sha == $sha
@@ -1941,6 +1950,10 @@ _watch_iteration() {
             next_retry=$(jq -r '.next_retry_at // 0' <<< "$record")
             ((now >= next_retry)) || continue
             attempt=$((attempt + 1))
+            # An older checkpoint may bind a branch checkout rather than a
+            # detached source. Keep the recorded mode for every retry; changing
+            # it would invalidate successful native targets' source receipts.
+            isolate_source=$(jq -r '.isolate_source // false' <<< "$record") || return 4
         elif jq -e --arg id "$run_id" '.runs[$id] != null' <<< "$state" >/dev/null; then
             log_debug "Run $run_id has legacy trigger history; automatic replay blocked"
             continue
@@ -1997,7 +2010,7 @@ _watch_iteration() {
                 return 4
             fi
             log_info "Starting fallback for $tool_name (run $run_id, attempt $attempt)..."
-            _watch_launch_attempt "$run_id" "$tool_name" "$repo" "$ref" "$sha" "$attempt" "$resume" || return $?
+            _watch_launch_attempt "$run_id" "$tool_name" "$repo" "$ref" "$sha" "$attempt" "$resume" "$isolate_source" || return $?
             state=$(_watch_load_triggered) || return 4
             triggered_count=$((triggered_count + 1))
         fi
@@ -2091,6 +2104,8 @@ BEHAVIOR:
     - Polls every configured repo's release workflow for throttled runs
       (dsr check), at the configured threshold_seconds
     - Automatic fallbacks require an explicit v-prefixed version tag and SHA
+    - Builds that commit in a private source tree, preserving local work;
+      fetches the pinned tag if it is not available locally
     - Retains running/completed/failed attempts across watcher restarts
     - Retries failed attempts with exponential cooldown, up to the limit;
       resumes only a checkpoint matching this run's exact source and output

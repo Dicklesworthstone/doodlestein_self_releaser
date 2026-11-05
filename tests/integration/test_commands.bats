@@ -631,6 +631,10 @@ case "$1" in
         [[ "$2" == --json && "$3" == fallback ]] || exit 99
         printf '%s\0' "$@" >> "$TEST_TMPDIR/fallback.args"
         printf 'started\n' >> "$TEST_TMPDIR/fallback.starts"
+        if [[ -n "${DSR_WATCH_FIXTURE_FALLBACK:-}" ]]; then
+            shift 3
+            exec bash "$DSR_WATCH_FIXTURE_FALLBACK" "$@"
+        fi
         deadline=$((SECONDS + 60))
         while [[ -n "${DSR_WATCH_FIXTURE_WAIT:-}" && ! -e "$DSR_WATCH_FIXTURE_WAIT" ]]; do
             ((SECONDS < deadline)) || exit 98
@@ -672,6 +676,165 @@ _watch_run_json() {
     jq -nc --arg sha "${1:-1111111111111111111111111111111111111111}" '
         {details:{throttled:[{run_id:12345,repo:"Dicklesworthstone/ntm",tool:"ntm",
             head_branch:"v1.2.3",head_sha:$sha}]}}'
+}
+
+# Drive the real watcher, fallback coordinator, Git materializer, source checks,
+# build lock and artifact admission. Only expensive build/quality commands and
+# remote publication are fixture boundaries; no external release is created.
+_watch_isolated_pipeline_fixture() {
+    harness_create_config
+    mkdir -p "$TEST_TMPDIR/developer-source" "$DSR_CONFIG_DIR/repos.d"
+    git init -q -b main "$TEST_TMPDIR/developer-source"
+    printf 'tagged release source\n' > "$TEST_TMPDIR/developer-source/source.txt"
+    git -C "$TEST_TMPDIR/developer-source" add source.txt
+    git -C "$TEST_TMPDIR/developer-source" -c user.name='DSR test' \
+        -c user.email='dsr-test@example.invalid' commit -qm release
+    git -C "$TEST_TMPDIR/developer-source" tag v1.2.3
+    export DSR_WATCH_PINNED_SHA
+    DSR_WATCH_PINNED_SHA=$(git -C "$TEST_TMPDIR/developer-source" rev-parse HEAD)
+    jq -nc --arg path "$TEST_TMPDIR/developer-source" \
+        '{tool_name:"ntm",repo:"Dicklesworthstone/ntm",local_path:$path,language:"go",
+          binary_name:"ntm",targets:["linux/amd64"],workflow:"release.yml"}' \
+        > "$DSR_CONFIG_DIR/repos.d/ntm.yaml"
+    export DSR_WATCH_FIXTURE_FALLBACK="$TEST_TMPDIR/real-fallback"
+    cat > "$DSR_WATCH_FIXTURE_FALLBACK" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+root="${DSR_ROUTING_TEST_ROOT:-$DSR_PROJECT_ROOT}"
+for module in config act_runner git_ops build_state signing sbom; do
+    source "$root/src/$module.sh" || exit 3
+done
+source <(awk '/^(_release_file_size|_release_sha256|_release_require_publishable_artifacts|_release_sbom_policy|cmd_fallback)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$root/dsr") || exit 3
+JSON_MODE=true DRY_RUN=false
+log_info() { printf '%s\n' "$*" >&2; }
+log_warn() { log_info "$@"; }
+log_error() { log_info "$@"; }
+log_ok() { log_info "$@"; }
+log_debug() { :; }
+log_set_tool() { :; }
+_dsr_require() { :; }
+notify_event() { :; }
+signing_wanted() { return 1; }
+signing_is_enabled() { return 1; }
+_check_repo() { printf '{"status":"throttled","queued_count":1}\n'; return 1; }
+gh_resolve_tag_sha() { printf '%s\n' "$DSR_WATCH_PINNED_SHA"; }
+json_envelope() {
+    jq -nc --arg command "$1" --arg status "$2" --argjson code "$3" --argjson details "$4" \
+        '{command:$command,status:$status,exit_code:$code,details:$details}'
+}
+git() {
+    local -a arguments=("$@")
+    local index argument fetch=false
+    for argument in "$@"; do
+        [[ "$argument" != fetch ]] || fetch=true
+    done
+    if ! $fetch; then command git "$@"; return $?; fi
+    for index in "${!arguments[@]}"; do
+        if [[ "${arguments[$index]}" == https://github.com/Dicklesworthstone/ntm.git ]]; then
+            [[ -n "${DSR_WATCH_REMOTE_SOURCE:-}" ]] || return 99
+            arguments[$index]="$DSR_WATCH_REMOTE_SOURCE"
+            printf 'fetch\n' >> "$TEST_TMPDIR/source-transports"
+            command git -c protocol.file.allow=always "${arguments[@]}"
+            return $?
+        fi
+    done
+    command git "$@"
+}
+qg_run_checks() {
+    [[ "$2" == --work-dir ]] || return 4
+    printf '%s\n' "$3" > "$TEST_TMPDIR/quality-source"
+    [[ "$3" != "$TEST_TMPDIR/developer-source" &&
+       "$(git -C "$3" rev-parse HEAD)" == "$DSR_WATCH_PINNED_SHA" ]] || return 4
+    [[ "${DSR_WATCH_MUTATE_PRIVATE:-false}" != true ]] || printf 'changed\n' >> "$3/source.txt"
+}
+cmd_build() {
+    local source out="" arg
+    source=$(act_get_local_path ntm) || return 4
+    while (($#)); do
+        arg="$1"; shift
+        if [[ "$arg" == --output-dir ]]; then out="$1"; shift; fi
+    done
+    mkdir -p "$out" || return 4
+    cp "$source/source.txt" "$out/ntm" || return 6
+    printf '%s\n' "$source" > "$TEST_TMPDIR/build-source"
+    jq -nc --arg source "$DSR_WATCH_PINNED_SHA" --arg sha "$(_release_sha256 "$out/ntm")" \
+        --argjson size "$(_release_file_size "$out/ntm")" \
+        '{tool:"ntm",version:"v1.2.3",status:"success",build_purpose:"release",publishable:true,
+          run_id:"11111111-1111-4111-8111-111111111111",source:{git_sha:$source,git_ref:"v1.2.3"},
+          summary:{total:1,success:1,failed:0},artifacts:[{name:"ntm",sha256:$sha,size_bytes:$size}]}' \
+        > "$out/ntm-v1.2.3-manifest.json"
+}
+cmd_release() {
+    act_get_local_path ntm > "$TEST_TMPDIR/release-source" || return 4
+    printf '%s\n' '{"command":"release","status":"success","exit_code":0,"details":{"repo":"Dicklesworthstone/ntm","tag":"v1.2.3","release_id":9,"draft":false}}'
+}
+cmd_fallback "$@"
+EOF
+}
+
+@test "watch source isolation releases the tagged commit while preserving ongoing developer work" {
+    _watch_isolated_pipeline_fixture
+    local checkout="$TEST_TMPDIR/developer-source" before_head before_index before_source attempt snapshot
+    printf 'later committed work\n' > "$checkout/source.txt"
+    git -C "$checkout" -c user.name='DSR test' -c user.email='dsr-test@example.invalid' commit -qam later
+    printf 'staged work\n' > "$checkout/source.txt"
+    git -C "$checkout" add source.txt
+    printf 'unstaged work\n' >> "$checkout/source.txt"
+    printf 'untracked work\n' > "$checkout/private.txt"
+    before_head=$(git -C "$checkout" rev-parse HEAD)
+    before_index=$(git hash-object "$checkout/.git/index")
+    before_source=$(git hash-object "$checkout/source.txt")
+
+    run _routing_watch "$(_watch_run_json "$DSR_WATCH_PINNED_SHA")" --auto-fallback
+    assert_equal "0" "$status"
+    _watch_completed
+    attempt=$(jq -r '.attempts["12345"].attempt_id' "$DSR_STATE_DIR/triggered.json")
+    jq -e '.exit_code == 0' "$DSR_STATE_DIR/watch-attempts/$attempt/completion.json"
+    jq -e '.status == "success" and .details.isolated_source and
+        .details.source_materialization.transport == "local-objects" and .details.phases.release == "success"' \
+        "$DSR_STATE_DIR/watch-attempts/$attempt/result.json"
+    snapshot=$(cat "$TEST_TMPDIR/build-source")
+    assert_equal "$snapshot" "$(cat "$TEST_TMPDIR/quality-source")"
+    assert_equal "$snapshot" "$(cat "$TEST_TMPDIR/release-source")"
+    assert_equal 'tagged release source' "$(cat "$DSR_STATE_DIR/watch-artifacts/12345/ntm")"
+    assert_equal "$DSR_WATCH_PINNED_SHA" "$(git -C "$snapshot" rev-parse HEAD)"
+    [[ ! -e "$snapshot/private.txt" ]]
+    assert_equal "$before_head" "$(git -C "$checkout" rev-parse HEAD)"
+    assert_equal "$before_index" "$(git hash-object "$checkout/.git/index")"
+    assert_equal "$before_source" "$(git hash-object "$checkout/source.txt")"
+    assert_equal 'untracked work' "$(cat "$checkout/private.txt")"
+}
+
+@test "watch source isolation fetches an absent checkout through the pinned tag transport" {
+    _watch_isolated_pipeline_fixture
+    export DSR_WATCH_REMOTE_SOURCE="$TEST_TMPDIR/source-server"
+    mv "$TEST_TMPDIR/developer-source" "$DSR_WATCH_REMOTE_SOURCE"
+    run _routing_watch "$(_watch_run_json "$DSR_WATCH_PINNED_SHA")" --auto-fallback
+    assert_equal "0" "$status"
+    _watch_completed
+    local attempt
+    attempt=$(jq -r '.attempts["12345"].attempt_id' "$DSR_STATE_DIR/triggered.json")
+    jq -e '.exit_code == 0' "$DSR_STATE_DIR/watch-attempts/$attempt/completion.json"
+    jq -e '.status == "success" and .details.source_materialization.transport == "github"' \
+        "$DSR_STATE_DIR/watch-attempts/$attempt/result.json"
+    assert_equal fetch "$(cat "$TEST_TMPDIR/source-transports")"
+    assert_equal 'tagged release source' "$(cat "$DSR_STATE_DIR/watch-artifacts/12345/ntm")"
+    [[ ! -e "$TEST_TMPDIR/developer-source" ]]
+}
+
+@test "watch source isolation blocks publication when quality changes the private source" {
+    _watch_isolated_pipeline_fixture
+    export DSR_WATCH_MUTATE_PRIVATE=true
+    run _routing_watch "$(_watch_run_json "$DSR_WATCH_PINNED_SHA")" --auto-fallback
+    assert_equal "0" "$status"
+    _watch_completed
+    local attempt
+    attempt=$(jq -r '.attempts["12345"].attempt_id' "$DSR_STATE_DIR/triggered.json")
+    jq -e '.exit_code == 4' "$DSR_STATE_DIR/watch-attempts/$attempt/completion.json"
+    jq -e '.exit_code == 4 and .details.phase == "build" and .details.isolated_source' \
+        "$DSR_STATE_DIR/watch-attempts/$attempt/result.json"
+    [[ ! -e "$TEST_TMPDIR/build-source" && ! -e "$TEST_TMPDIR/release-source" ]]
+    assert_equal 'tagged release source' "$(cat "$TEST_TMPDIR/developer-source/source.txt")"
 }
 
 # Use a real commit and the production checkpoint writer. Only the watcher
@@ -797,9 +960,10 @@ EOF
     _watch_completed
     jq -Rse --arg output "$DSR_STATE_DIR/watch-artifacts/12345" 'split("\u0000") ==
         ["--non-interactive", "--json", "fallback", "ntm", "--version", "v1.2.3",
-         "--expected-sha", "1111111111111111111111111111111111111111", "--output-dir", $output, ""]' \
+         "--expected-sha", "1111111111111111111111111111111111111111", "--isolate-source", "--output-dir", $output, ""]' \
         "$TEST_TMPDIR/fallback.args"
     jq -e '.runs["12345"] != null' "$DSR_STATE_DIR/triggered.json"
+    jq -e '.attempts["12345"].isolate_source == true' "$DSR_STATE_DIR/triggered.json"
 }
 
 @test "nullable routing: watch refuses automatic publication without a version tag" {
@@ -923,6 +1087,57 @@ EOF
     _watch_completed
     jq -Rse --arg resume "--resume=$checkpoint" 'split("\u0000") | index($resume) != null' "$TEST_TMPDIR/fallback.args"
     jq -e --arg run "$checkpoint" '.attempts["12345"] | .attempt == 2 and .resume_run_id == $run' "$DSR_STATE_DIR/triggered.json"
+}
+
+@test "watch source isolation preserves legacy checkpoint mode through repeated retries" {
+    harness_create_config
+    local check_json checkpoint=12345678-1234-1234-1234-123456789abc state_dir
+    check_json=$(_watch_run_json)
+    DSR_WATCH_FIXTURE_STATUS=6 run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal "0" "$status"
+    _watch_completed
+    state_dir="$DSR_STATE_DIR/builds/ntm/v1.2.3/$checkpoint"
+    mkdir -p "$state_dir" "$DSR_STATE_DIR/watch-artifacts/12345"
+    jq -nc --arg run "$checkpoint" --arg output "$DSR_STATE_DIR/watch-artifacts/12345" '
+        {tool:"ntm",version:"v1.2.3",run_id:$run,status:"failed",git_ref:"main",
+         git_sha:"1111111111111111111111111111111111111111",context:{output_dir:$output}}' > "$state_dir/state.json"
+    # Records from before source isolation have no mode field. Keep the exact
+    # saved checkpoint so the production fallback can honor its branch identity.
+    jq 'del(.attempts["12345"].isolate_source)' "$DSR_STATE_DIR/triggered.json" > "$TEST_TMPDIR/legacy-watch.json"
+    mv "$TEST_TMPDIR/legacy-watch.json" "$DSR_STATE_DIR/triggered.json"
+    sleep 1
+    DSR_WATCH_FIXTURE_STATUS=6 run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal "0" "$status"
+    _watch_completed
+    jq -e --arg run "$checkpoint" '.attempts["12345"] |
+        .attempt == 2 and .resume_run_id == $run and .isolate_source == false' "$DSR_STATE_DIR/triggered.json"
+    sleep 2
+    run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal "0" "$status"
+    _watch_completed
+    jq -e --arg run "$checkpoint" '.attempts["12345"] |
+        .attempt == 3 and .resume_run_id == $run and .isolate_source == false' "$DSR_STATE_DIR/triggered.json"
+    jq -Rse --arg resume "--resume=$checkpoint" 'split("\u0000") |
+        (map(select(. == "--isolate-source")) | length) == 1 and
+        (map(select(. == $resume)) | length) == 2' "$TEST_TMPDIR/fallback.args"
+    jq -e '.git_ref == "main"' "$state_dir/state.json"
+}
+
+@test "watch source isolation rejects nonboolean saved source modes before retry" {
+    harness_create_config
+    local check_json value
+    check_json=$(_watch_run_json)
+    DSR_WATCH_FIXTURE_STATUS=6 run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal "0" "$status"
+    _watch_completed
+    for value in null '"true"' 1 '{}'; do
+        jq --argjson value "$value" '.attempts["12345"].isolate_source=$value' \
+            "$DSR_STATE_DIR/triggered.json" > "$TEST_TMPDIR/invalid-mode.json"
+        mv "$TEST_TMPDIR/invalid-mode.json" "$DSR_STATE_DIR/triggered.json"
+        run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+        assert_equal "4" "$status"
+        assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    done
 }
 
 @test "watch partial recovery resumes a mixed-success checkpoint instead of unrelated latest" {
