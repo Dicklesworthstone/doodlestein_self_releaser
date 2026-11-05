@@ -319,7 +319,7 @@ test_api_rejects_unknown_option() {
 # at their external CLI/HTTP boundary. All credentials are explicit fixtures;
 # no real login, network request, or account setting is inspected or changed.
 test_credential_transport_routing() (
-  local selected="$1" transport="$2" expected status=0 result before after
+  local selected="$1" requested_transport="$2" expected status=0 result before after
   local calls="$TEMP_DIR/credential-calls" destination="$TEMP_DIR/credential-asset"
   local GH_MAX_RETRIES=1 GH_RETRY_DELAY=0
   source "$SRC_DIR/secrets.sh"
@@ -361,7 +361,7 @@ test_credential_transport_routing() (
         return 0 ;;
       'auth status')
         printf 'STATUS %s %s\n' "$host" "$token" >> "$calls"
-        [[ "$selected" != none && "$transport" != curl && "$token" != fixture-invalid ]] ;;
+        [[ "$selected" != none && "$requested_transport" != curl && "$token" != fixture-invalid ]] ;;
       api\ *)
         printf 'GH %s %s\n' "$host" "$token" >> "$calls"
         if [[ "$2" == */releases/assets/* ]]; then printf 'credential-payload\000\001'
@@ -370,9 +370,10 @@ test_credential_transport_routing() (
     esac
   }
   curl() {
-    local token='' output='' argument previous='' url=''
+    local token='' output='' argument previous='' url='' writeout=false
     for argument in "$@"; do
       [[ "$previous" != -o ]] || output="$argument"
+      [[ "$previous" != -w ]] || writeout=true
       if [[ "$argument" == 'Authorization: Bearer '* ]]; then token="${argument#Authorization: Bearer }"; fi
       [[ "$argument" != https://* ]] || url="$argument"
       previous="$argument"
@@ -382,6 +383,7 @@ test_credential_transport_routing() (
       printf 'HTTP/2 401\r\n\r\n{"message":"Bad credentials"}'
     elif [[ -n "$output" ]]; then
       printf 'credential-payload\000\001' > "$output"
+      if $writeout; then printf '200'; fi
     else
       printf 'HTTP/2 200\r\n\r\n{"authenticated":true}'
     fi
@@ -401,7 +403,7 @@ test_credential_transport_routing() (
   cmp "$destination" <(printf 'credential-payload\000\001') || return 1
   after="${DSR_GH_TOKEN-unset}|${GITHUB_TOKEN-unset}|${GH_TOKEN-unset}|$GH_HOST|$GH_REPO"
   [[ "$before" == "$after" ]] || return 1
-  if [[ "$transport" == gh ]]; then
+  if [[ "$requested_transport" == gh ]]; then
     [[ $(grep -Fc "GH github.com $expected" "$calls") -eq 2 ]] || return 1
     ! grep -q '^CURL ' "$calls" || return 1
   else
@@ -852,7 +854,7 @@ test_download_release_asset_uses_token_curl_fallback() {
 
   gh() { return 1; }
   curl() {
-    local output="" arg
+    local output="" arg writeout=false
     printf '%s\n' "$*" > "$curl_log"
     while [[ $# -gt 0 ]]; do
       arg="$1"
@@ -860,10 +862,14 @@ test_download_release_asset_uses_token_curl_fallback() {
       if [[ "$arg" == "-o" && $# -gt 0 ]]; then
         output="$1"
         shift
+      elif [[ "$arg" == "-w" && $# -gt 0 ]]; then
+        writeout=true
+        shift
       fi
     done
     [[ -n "$output" ]] || return 4
     printf 'curl-binary-bytes\002' > "$output"
+    if $writeout; then printf '200'; fi
   }
 
   local status=0
@@ -918,12 +924,15 @@ test_download_release_asset_retries_with_fresh_staging_bytes() {
 
   gh() { return 1; }
   curl() {
-    local output="" arg attempts=0
+    local output="" arg attempts=0 writeout=false
     while [[ $# -gt 0 ]]; do
       arg="$1"
       shift
       if [[ "$arg" == "-o" && $# -gt 0 ]]; then
         output="$1"
+        shift
+      elif [[ "$arg" == "-w" && $# -gt 0 ]]; then
+        writeout=true
         shift
       fi
     done
@@ -934,9 +943,11 @@ test_download_release_asset_retries_with_fresh_staging_bytes() {
     printf '%s\n' "$attempts" > "$attempts_file"
     if [[ $attempts -eq 1 ]]; then
       printf 'partial first response' > "$output"
+      if $writeout; then printf '503'; fi
       return 22
     fi
     printf 'complete second response\003' > "$output"
+    if $writeout; then printf '200'; fi
   }
 
   local status=0
@@ -948,6 +959,382 @@ test_download_release_asset_retries_with_fresh_staging_bytes() {
     [[ "$(sort -u "$staging_paths_file" | wc -l | tr -d '[:space:]')" -eq 2 ]] &&
     [[ "$(cat "$destination")" == $'complete second response\003' ]] &&
     [[ -z "$(find "$TEMP_DIR" -maxdepth 1 -name '.dsr-asset-download.*' -print -quit)" ]]
+}
+
+# ============================================================================
+# Tests: Bounded Binary Downloads
+# ============================================================================
+
+test_download_transport_scenario() (
+  local scenario="$1" expected_status="$2" expected_attempts="$3"
+  local destination="$TEMP_DIR/download.bin" calls="$TEMP_DIR/download.calls"
+  local paths="$TEMP_DIR/download.paths" status=0 attempts
+  local GH_MAX_RETRIES=3 GH_RETRY_DELAY=0 GH_DOWNLOAD_TIMEOUT=5 GH_DOWNLOAD_CONNECT_TIMEOUT=2
+  local GH_MAX_RETRY_WAIT=2
+  export DSR_GH_TOKEN=download-fixture-token GITHUB_TOKEN='' GH_TOKEN=''
+  : > "$calls"
+  : > "$paths"
+  gh() {
+    if [[ "${1:-} ${2:-}" == 'auth status' ]]; then
+      printf 'AUTH\n' >> "$calls"
+      case "$scenario" in
+        auth-cancel) return 130 ;;
+        auth-required) return 4 ;;
+        cli-*) return 0 ;;
+        *) return 1 ;;
+      esac
+    fi
+    printf 'ATTEMPT\n' >> "$calls"
+    printf 'partial\000response'
+    case "$scenario" in
+      cli-cancel) return 130 ;;
+      cli-user-cancel) return 2 ;;
+      cli-auth) return 4 ;;
+      *) return 1 ;;
+    esac
+  }
+  curl() {
+    local output='' headers='' previous='' argument code=200 result=0 count=0 writeout=false
+    printf '%s\n' "$*" >> "$TEMP_DIR/download.arguments"
+    for argument in "$@"; do
+      case "$previous" in
+        -o) output="$argument" ;;
+        -D) headers="$argument" ;;
+        -w) writeout=true ;;
+      esac
+      previous="$argument"
+    done
+    [[ -n "$output" ]] || return 4
+    printf 'ATTEMPT\n' >> "$calls"
+    printf '%s\n' "$output" >> "$paths"
+    count=$(grep -c '^ATTEMPT$' "$calls")
+    if ((count == 1)); then
+      case "$scenario" in
+        curl-unauthorized) code=401; result=22 ;;
+        curl-forbidden) code=403; result=22 ;;
+        curl-not-found) code=404; result=22 ;;
+        curl-503|pause-cancel) code=503; result=22 ;;
+        curl-network) code=000; result=56 ;;
+        curl-partial) code=000; result=18 ;;
+        curl-cancel) code=000; result=130 ;;
+        curl-write-error) code=200; result=23 ;;
+        curl-429|cooldown|invalid-cooldown) code=429; result=22 ;;
+        curl-403-rate) code=403; result=22 ;;
+        missing-status) code='' ;;
+        destination-appeared) mkdir "$destination" || return 4 ;;
+      esac
+    fi
+    if [[ -n "$headers" ]]; then
+      printf 'HTTP/2 %s\r\n' "$code" > "$headers"
+      case "$scenario" in
+        curl-429|curl-403-rate) printf 'Retry-After: 0\r\n' >> "$headers" ;;
+        cooldown) printf 'Retry-After: 3600\r\n' >> "$headers" ;;
+        invalid-cooldown) printf 'Retry-After: tomorrow\r\n' >> "$headers" ;;
+      esac
+      printf '\r\n' >> "$headers"
+    fi
+    if ((result == 0)); then printf 'complete\000\377binary\n\n' > "$output"
+    else printf 'partial\000response' > "$output"; fi
+    if $writeout; then printf '%s' "$code"; fi
+    return "$result"
+  }
+  if [[ "$scenario" == pause-cancel ]]; then
+    _gh_retry_pause() { return 5; }
+  fi
+  gh_download_release_asset owner/repo 48 "$destination" \
+    > "$TEMP_DIR/download.stdout" 2> "$TEMP_DIR/download.stderr" || status=$?
+  assert_equals "$expected_status" "$status" "download exit status" || return 1
+  attempts=$(grep -c '^ATTEMPT$' "$calls") || true
+  assert_equals "$expected_attempts" "$attempts" "download attempts" || return 1
+  [[ ! -s "$TEMP_DIR/download.stdout" ]] || return 1
+  [[ -z "$(find "$TEMP_DIR" -maxdepth 1 -name '.dsr-asset-download.*' -print -quit)" ]] || return 1
+  if ((expected_status == 0)); then
+    cmp "$destination" <(printf 'complete\000\377binary\n\n') || return 1
+  elif [[ "$scenario" == destination-appeared ]]; then
+    [[ -d "$destination" && -z "$(find "$destination" -mindepth 1 -print -quit)" ]] || return 1
+  else
+    [[ ! -e "$destination" && ! -L "$destination" ]] || return 1
+  fi
+  if [[ "$scenario" == auth-* ]]; then
+    assert_equals 1 "$(grep -c '^AUTH$' "$calls")" "authentication attempts" || return 1
+  fi
+  if [[ -f "$TEMP_DIR/download.arguments" ]]; then
+    grep -Fq -- '--connect-timeout 2 --max-time 5' "$TEMP_DIR/download.arguments" || return 1
+    assert_equals "$expected_attempts" "$(sort -u "$paths" | wc -l | tr -d '[:space:]')" \
+      "fresh private staging for every transfer" || return 1
+  fi
+)
+
+test_download_publication_race() (
+  local collision="$1" destination="$TEMP_DIR/published.bin" python_bin status=0
+  local GH_MAX_RETRIES=1 GH_RETRY_DELAY=0
+  export DSR_GH_TOKEN=publication-fixture-token
+  python_bin=$(type -P python3) || return 1
+  mkdir "$TEMP_DIR/other" || return 1
+  gh() {
+    [[ "${1:-} ${2:-}" != 'auth status' ]] || return 0
+    printf 'downloaded\000payload\377\n'
+  }
+  python3() {
+    [[ $# -eq 3 && "$1" == - ]] || return 91
+    printf 'publication\n' > "$TEMP_DIR/publication.calls"
+    case "$collision" in
+      directory) mkdir "$3" || return 92 ;;
+      symlink) ln -s "$TEMP_DIR/other" "$3" || return 92 ;;
+      regular) printf 'existing caller bytes\n' > "$3" ;;
+      *) return 93 ;;
+    esac
+    # The real Python interpreter executes production os.link after the race.
+    "$python_bin" "$@"
+  }
+  gh_download_release_asset owner/repo 50 "$destination" \
+    > "$TEMP_DIR/publication.stdout" 2> "$TEMP_DIR/publication.stderr" || status=$?
+  assert_equals 1 "$status" "atomic publication collision" || return 1
+  [[ -s "$TEMP_DIR/publication.calls" && ! -s "$TEMP_DIR/publication.stdout" ]] || return 1
+  grep -Fq 'File exists' "$TEMP_DIR/publication.stderr" || return 1
+  case "$collision" in
+    directory) [[ -d "$destination" && -z "$(find "$destination" -mindepth 1 -print -quit)" ]] || return 1 ;;
+    symlink)
+      [[ -L "$destination" && "$(readlink "$destination")" == "$TEMP_DIR/other" ]] || return 1
+      [[ -z "$(find "$TEMP_DIR/other" -mindepth 1 -print -quit)" ]] || return 1 ;;
+    regular) cmp "$destination" <(printf 'existing caller bytes\n') || return 1 ;;
+  esac
+  [[ -z "$(find "$TEMP_DIR" -maxdepth 1 -name '.dsr-asset-download.*' -print -quit)" ]]
+)
+
+test_download_requires_python_before_authentication() (
+  local status=0
+  command() {
+    [[ "${1:-} ${2:-}" != '-v python3' ]] || return 1
+    builtin command "$@"
+  }
+  gh() { printf 'unexpected authentication\n' >> "$TEMP_DIR/auth.calls"; return 0; }
+  mktemp() { printf 'unexpected staging\n' >> "$TEMP_DIR/staging.calls"; return 1; }
+  gh_download_release_asset owner/repo 51 "$TEMP_DIR/unavailable.bin" \
+    > "$TEMP_DIR/unavailable.stdout" 2> "$TEMP_DIR/unavailable.stderr" || status=$?
+  assert_equals 3 "$status" "missing publication runtime" || return 1
+  grep -Fq 'Python 3 is required' "$TEMP_DIR/unavailable.stderr" || return 1
+  [[ ! -e "$TEMP_DIR/auth.calls" && ! -e "$TEMP_DIR/staging.calls" &&
+     ! -e "$TEMP_DIR/unavailable.bin" && ! -s "$TEMP_DIR/unavailable.stdout" ]]
+)
+
+test_download_supports_relative_hyphen_paths() (
+  local destination
+  export DSR_GH_TOKEN=relative-path-fixture-token
+  cd "$TEMP_DIR" || return 1
+  mkdir ./-directory || return 1
+  gh() {
+    [[ "${1:-} ${2:-}" != 'auth status' ]] || return 0
+    printf 'relative\000payload\377\n\n'
+  }
+  for destination in relative.bin -leading.bin '-directory/-leading name.bin'; do
+    gh_download_release_asset owner/repo 52 "$destination" || return 1
+    cmp "./$destination" <(printf 'relative\000payload\377\n\n') || return 1
+  done
+  [[ -z "$(find . -name '.dsr-asset-download.*' -print -quit)" ]]
+)
+
+test_exported_download_scenario() (
+  local scenario="$1" expected_status="$2" expected_attempts="$3" status=0 attempts
+  local destination="$TEMP_DIR/exported.bin"
+  export DSR_TEST_DOWNLOAD_CASE="$scenario" DSR_TEST_DOWNLOAD_DIR="$TEMP_DIR"
+  export DSR_GH_TOKEN=exported-download-fixture GITHUB_TOKEN='' GH_TOKEN=''
+  export GH_MAX_RETRIES=3 GH_RETRY_DELAY=0 GH_DOWNLOAD_TIMEOUT=5 GH_DOWNLOAD_CONNECT_TIMEOUT=2
+  export GH_MAX_RETRY_WAIT=2
+  : > "$TEMP_DIR/exported.calls"
+  if [[ "$scenario" == invalid-config ]]; then GH_DOWNLOAD_TIMEOUT=0; fi
+  gh() {
+    if [[ "${1:-} ${2:-}" == 'auth status' ]]; then
+      printf 'AUTH\n' >> "$DSR_TEST_DOWNLOAD_DIR/exported.calls"
+      case "$DSR_TEST_DOWNLOAD_CASE" in
+        gh-success|cli-cancel) return 0 ;;
+        cli-auth) return 4 ;;
+        *) return 1 ;;
+      esac
+    fi
+    printf 'ATTEMPT\n' >> "$DSR_TEST_DOWNLOAD_DIR/exported.calls"
+    printf 'exported\000payload\377\n\n'
+    [[ "$DSR_TEST_DOWNLOAD_CASE" != cli-cancel ]] || return 130
+  }
+  curl() {
+    local output='' headers='' argument previous='' count result=0 code=200
+    for argument in "$@"; do
+      case "$previous" in
+        -o) output="$argument" ;;
+        -D) headers="$argument" ;;
+      esac
+      previous="$argument"
+    done
+    [[ -n "$output" && -n "$headers" ]] || return 91
+    printf 'ATTEMPT\n' >> "$DSR_TEST_DOWNLOAD_DIR/exported.calls"
+    count=$(grep -c '^ATTEMPT$' "$DSR_TEST_DOWNLOAD_DIR/exported.calls")
+    case "$DSR_TEST_DOWNLOAD_CASE" in
+      curl-retry) if ((count == 1)); then code=000; result=56; fi ;;
+      curl-auth) code=401; result=22 ;;
+      curl-malformed) code='' ;;
+      *) return 92 ;;
+    esac
+    printf 'HTTP/2 %s\r\n\r\n' "$code" > "$headers"
+    printf 'exported\000payload\377\n\n' > "$output"
+    printf '%s' "$code"
+    return "$result"
+  }
+  export -f gh curl
+  bash -u -c 'cd "$1" && gh_download_release_asset owner/repo 53 "$2"' \
+    exported-download "$TEMP_DIR" "$destination" \
+    > "$TEMP_DIR/exported.stdout" 2> "$TEMP_DIR/exported.stderr" || status=$?
+  assert_equals "$expected_status" "$status" "exported download status" || return 1
+  attempts=$(grep -c '^ATTEMPT$' "$TEMP_DIR/exported.calls") || true
+  assert_equals "$expected_attempts" "$attempts" "exported transfer attempts" || return 1
+  [[ ! -s "$TEMP_DIR/exported.stdout" ]] || return 1
+  ! grep -Eq 'command not found|unbound variable|No such file or directory' "$TEMP_DIR/exported.stderr" || return 1
+  if ((expected_status == 0)); then
+    cmp "$destination" <(printf 'exported\000payload\377\n\n') || return 1
+  else
+    [[ ! -e "$destination" ]] || return 1
+  fi
+  if [[ "$scenario" == invalid-config ]]; then
+    [[ ! -s "$TEMP_DIR/exported.calls" ]] || return 1
+  fi
+  [[ -z "$(find "$TEMP_DIR" -maxdepth 1 -name '.dsr-asset-download.*' -print -quit)" ]]
+)
+
+test_download_rejects_invalid_configuration() (
+  local option value status
+  gh() { printf 'unexpected authentication\n' >> "$TEMP_DIR/auth.calls"; return 0; }
+  while read -r option value; do
+    # Dynamic locals configure the sourced adapter; printf -v selects one knob.
+    # shellcheck disable=SC2034
+    local GH_MAX_RETRIES=3 GH_RETRY_DELAY=0 GH_DOWNLOAD_TIMEOUT=5 GH_DOWNLOAD_CONNECT_TIMEOUT=2
+    printf -v "$option" '%s' "$value"
+    status=0
+    gh_download_release_asset owner/repo 48 "$TEMP_DIR/invalid.bin" >/dev/null 2>&1 || status=$?
+    assert_equals 4 "$status" "invalid $option=$value" || return 1
+    [[ ! -e "$TEMP_DIR/auth.calls" && ! -e "$TEMP_DIR/invalid.bin" ]] || return 1
+  done <<'INVALID_DOWNLOAD_CONFIGURATION'
+GH_MAX_RETRIES 0
+GH_MAX_RETRIES 11
+GH_RETRY_DELAY -1
+GH_RETRY_DELAY 10000
+GH_DOWNLOAD_TIMEOUT 0
+GH_DOWNLOAD_TIMEOUT 1s
+GH_DOWNLOAD_TIMEOUT 1000000
+GH_DOWNLOAD_CONNECT_TIMEOUT 0
+GH_DOWNLOAD_CONNECT_TIMEOUT 1.5
+INVALID_DOWNLOAD_CONFIGURATION
+)
+
+# ============================================================================
+# Tests: Download Deadlines
+# ============================================================================
+
+test_download_bounds_authentication_and_transfers() {
+  python3 - "$GITHUB_MODULE" "$TEMP_DIR" <<'PY'
+import json
+import pathlib
+import subprocess
+import sys
+import time
+
+module, root = sys.argv[1], pathlib.Path(sys.argv[2])
+script = r'''
+source "$1" || exit $?
+case_dir="$2" phase="$3"
+GH_MAX_RETRIES=3 GH_RETRY_DELAY=0 GH_DOWNLOAD_TIMEOUT=1 GH_DOWNLOAD_CONNECT_TIMEOUT=1
+DSR_GH_TOKEN=download-fixture-token
+stall() {
+  printf 'started\n' >> "$case_dir/started"
+  sleep 3
+  printf 'escaped\n' >> "$case_dir/escaped"
+}
+gh() {
+  if [[ "${1:-} ${2:-}" == 'auth status' ]]; then
+    [[ "$phase" != auth ]] || stall
+    [[ "$phase" == auth || "$phase" == gh ]]
+  else
+    printf 'partial\000body'
+    stall
+  fi
+}
+if [[ "$phase" == token ]]; then
+  _gh_resolve_token() { stall; printf 'fixture-token'; }
+fi
+curl() {
+  local output='' argument previous=''
+  for argument in "$@"; do
+    [[ "$previous" != -o ]] || output="$argument"
+    previous="$argument"
+  done
+  printf 'partial\000body' > "$output"
+  [[ "$phase" != curl ]] || stall
+  printf '200'
+}
+gh_download_release_asset owner/repo 49 "$case_dir/destination"
+'''
+for phase in ('auth', 'gh', 'curl', 'token'):
+    case = root / phase
+    case.mkdir()
+    started = time.monotonic()
+    result = subprocess.run(['bash', '-c', script, 'download-deadline', module, str(case), phase],
+                            capture_output=True, timeout=8)
+    elapsed = time.monotonic() - started
+    (case / 'result.json').write_text(json.dumps({'status': result.returncode, 'elapsed': elapsed}))
+    (case / 'stdout').write_bytes(result.stdout)
+    (case / 'stderr').write_bytes(result.stderr)
+    assert result.returncode == 124, (phase, result.returncode, result.stderr)
+    assert elapsed < 2.5, (phase, elapsed)
+    assert (case / 'started').read_text() == 'started\n', phase
+    assert not result.stdout, (phase, result.stdout)
+    assert not (case / 'destination').exists(), phase
+    assert not (case / 'escaped').exists(), phase
+    assert not list(case.glob('.dsr-asset-download.*')), phase
+PY
+}
+
+run_asset_download_regressions() {
+  local scenario status attempts
+  while read -r scenario status attempts; do
+    run_test "download_$scenario" test_download_transport_scenario "$scenario" "$status" "$attempts"
+  done <<'DOWNLOAD_SCENARIOS'
+cli-cancel 130 1
+cli-user-cancel 2 1
+cli-auth 4 1
+auth-cancel 130 0
+auth-required 4 0
+curl-unauthorized 22 1
+curl-forbidden 22 1
+curl-not-found 22 1
+curl-503 0 2
+curl-network 0 2
+curl-partial 0 2
+curl-cancel 130 1
+curl-write-error 23 1
+curl-429 0 2
+curl-403-rate 0 2
+cooldown 8 1
+invalid-cooldown 8 1
+pause-cancel 5 1
+missing-status 8 1
+destination-appeared 1 1
+DOWNLOAD_SCENARIOS
+  run_test "download_rejects_invalid_configuration" test_download_rejects_invalid_configuration
+  run_test "download_bounds_authentication_and_transfers" test_download_bounds_authentication_and_transfers
+  run_test "download_publication_directory_race" test_download_publication_race directory
+  run_test "download_publication_symlink_race" test_download_publication_race symlink
+  run_test "download_publication_regular_file_race" test_download_publication_race regular
+  run_test "download_requires_python_before_authentication" test_download_requires_python_before_authentication
+  run_test "download_supports_relative_hyphen_paths" test_download_supports_relative_hyphen_paths
+  while read -r scenario status attempts; do
+    run_test "download_exported_$scenario" test_exported_download_scenario "$scenario" "$status" "$attempts"
+  done <<'EXPORTED_DOWNLOAD_SCENARIOS'
+gh-success 0 1
+curl-retry 0 2
+curl-auth 22 1
+curl-malformed 8 1
+cli-auth 4 0
+cli-cancel 130 1
+invalid-config 4 0
+EXPORTED_DOWNLOAD_SCENARIOS
 }
 
 # ============================================================================
@@ -1833,6 +2220,20 @@ main() {
     [[ "$TESTS_FAILED" -eq 0 ]]
     exit $?
   fi
+  if [[ "${1:-}" == --asset-download-only ]]; then
+    run_test "download_release_asset_uses_authenticated_gh" test_download_release_asset_uses_authenticated_gh
+    run_test "download_release_asset_uses_token_curl_fallback" test_download_release_asset_uses_token_curl_fallback
+    run_test "download_release_asset_failure_leaves_no_destination" test_download_release_asset_failure_leaves_no_destination
+    run_test "download_release_asset_retries_with_fresh_staging_bytes" test_download_release_asset_retries_with_fresh_staging_bytes
+    run_asset_download_regressions
+    run_test "download_verifies_legacy_uploaded_bytes" test_release_upload_scenario legacy 0 0 1
+    run_test "download_rejects_corrupt_legacy_uploaded_bytes" test_release_upload_scenario legacy-corrupt 7 0 1
+    run_test "download_exhausts_failed_legacy_verification" test_release_upload_scenario legacy-download-fails 8 0 3
+    run_test "download_verifies_receipt_without_digest" test_release_upload_scenario missing-digest 0 1 1
+    printf 'Asset downloads: %s passed, %s failed\n' "$TESTS_PASSED" "$TESTS_FAILED"
+    [[ "$TESTS_FAILED" -eq 0 ]]
+    exit $?
+  fi
   if [[ "${1:-}" == --credential-routing-only ]]; then
     run_credential_routing_tests
     printf 'Credential routing: %s passed, %s failed\n' "$TESTS_PASSED" "$TESTS_FAILED"
@@ -1931,6 +2332,7 @@ API_SCENARIOS
   run_test "download_release_asset_uses_token_curl_fallback" test_download_release_asset_uses_token_curl_fallback
   run_test "download_release_asset_failure_leaves_no_destination" test_download_release_asset_failure_leaves_no_destination
   run_test "download_release_asset_retries_with_fresh_staging_bytes" test_download_release_asset_retries_with_fresh_staging_bytes
+  run_asset_download_regressions
 
   echo ""
   echo "Clear Cache:"

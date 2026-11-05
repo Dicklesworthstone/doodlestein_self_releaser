@@ -23,6 +23,13 @@ if ! declare -F secrets_get_gh_token >/dev/null || ! declare -F secrets_run_gh >
     source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/secrets.sh" || { return 3 2>/dev/null || exit 3; }
 fi
 
+# Resolve source-relative dependencies before exported functions enter child
+# shells, where BASH_SOURCE is "environment" and the working directory varies.
+if ! declare -F run_with_timeout >/dev/null; then
+    # shellcheck source=src/guardrails.sh
+    source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/guardrails.sh" || { return 3 2>/dev/null || exit 3; }
+fi
+
 # Cache configuration
 GH_CACHE_DIR="${DSR_CACHE_DIR:-$HOME/.cache/dsr}/github"
 GH_CACHE_TTL="${GH_CACHE_TTL:-60}"  # seconds
@@ -49,8 +56,8 @@ fi
 
 _gh_log_info()  { echo "${_GH_BLUE}[github]${_GH_NC} $*" >&2; }
 _gh_log_ok()    { echo "${_GH_GREEN}[github]${_GH_NC} $*" >&2; }
-_gh_log_warn()  { echo "${_GH_YELLOW}[github]${_GH_NC} $*" >&2; }
-_gh_log_error() { echo "${_GH_RED}[github]${_GH_NC} $*" >&2; }
+_gh_log_warn()  { echo "${_GH_YELLOW:-}[github]${_GH_NC:-} $*" >&2; }
+_gh_log_error() { echo "${_GH_RED:-}[github]${_GH_NC:-} $*" >&2; }
 _gh_log_debug() { [[ "${GH_DEBUG:-}" == "1" ]] && echo "${_GH_BLUE}[github:debug]${_GH_NC} $*" >&2; }
 
 # Initialize cache directory
@@ -59,14 +66,21 @@ gh_init_cache() {
 }
 
 # Check if gh CLI is available and authenticated
-# Returns: 0 if ready, 3 if not
+# Returns: 0 if ready, 1 for curl fallback, or gh's cancellation/auth status.
 gh_check() {
+    local status=0
     if ! command -v gh &>/dev/null; then
         _gh_log_warn "gh CLI not found, falling back to curl"
         return 1
     fi
 
-    if ! secrets_run_gh auth status --hostname github.com &>/dev/null 2>&1; then
+    secrets_run_gh auth status --hostname github.com &>/dev/null 2>&1 || status=$?
+    if ((status != 0)); then
+        # Cancellation is not evidence that another credential transport
+        # should be tried. Preserve gh's explicit cancellation/auth statuses.
+        if ((status == 2 || status == 4 || status >= 128)); then
+            return "$status"
+        fi
         _gh_log_warn "gh CLI not authenticated, falling back to curl"
         return 1
     fi
@@ -432,20 +446,71 @@ PY
 # bypasses JSON caching while retaining the adapter's authenticated gh/curl
 # transport cascade. A same-directory staging file plus hard link prevents a
 # failed transfer from leaving partial destination bytes or clobbering a caller.
+# One bounded download attempt includes authentication and token lookup, not
+# just the binary transfer. Transport metadata never shares the binary stream.
+_gh_download_asset_attempt() {
+    local repo="$1" asset_id="$2" staged_file="$3" connect_timeout="$4" timeout="$5"
+    local status=0 token=""
+    printf 'auth\n' > "$staged_file.transport" || return 4
+    gh_check 2>/dev/null || status=$?
+    if ((status == 0)); then
+        printf 'gh\n' > "$staged_file.transport" || return 4
+        secrets_run_gh api "repos/$repo/releases/assets/$asset_id" --hostname github.com \
+            -H "Accept: application/octet-stream" \
+            -H "Cache-Control: no-cache, no-store, max-age=0" \
+            -H "Pragma: no-cache" > "$staged_file" 2>/dev/null
+    elif ((status == 1)); then
+        printf 'curl\n' > "$staged_file.transport" || return 4
+        token=$(_gh_resolve_token) || return $?
+        curl -fLsS --connect-timeout "$connect_timeout" --max-time "$timeout" \
+            -H "Accept: application/octet-stream" \
+            -H "Authorization: Bearer $token" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Cache-Control: no-cache, no-store, max-age=0" \
+            -H "Pragma: no-cache" \
+            -D "$staged_file.headers" -w '%{http_code}' -o "$staged_file" \
+            "https://api.github.com/repos/$repo/releases/assets/$asset_id" > "$staged_file.http"
+    else
+        return "$status"
+    fi
+}
+
+# Keep publication in a separate helper so Bash can safely serialize the
+# exported downloader without a heredoc nested in a conditional command.
+_gh_publish_download() {
+    python3 - "$1" "$2" <<'PY'
+import os
+import sys
+
+try:
+    os.link(sys.argv[1], sys.argv[2], follow_symlinks=False)
+except OSError as error:
+    print(f"[github] Cannot publish downloaded asset: {error}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+# Download exact binary bytes without exposing partial files at destination.
+# GH_DOWNLOAD_TIMEOUT bounds each complete auth/transfer attempt (default 900s),
+# with a separate curl connection bound (GH_DOWNLOAD_CONNECT_TIMEOUT, 15s).
+# Python 3 is required for literal, atomic no-clobber publication via os.link.
 gh_download_release_asset() {
-    local repo="$1"
-    local asset_id="$2"
-    local destination="$3"
-    local destination_parent staging_dir staged_file token=""
-    local status=0 attempt=0
-    local max_attempts="$GH_MAX_RETRIES"
-    local retry_delay="$GH_RETRY_DELAY"
+    local repo="${1:-}"
+    local asset_id="${2:-}"
+    local destination="${3:-}"
+    local destination_parent staging_dir staged_file
+    local status=0 attempt=0 transport http_code headers retryable rate_limited
+    local max_attempts="${GH_MAX_RETRIES:-3}"
+    local retry_delay="${GH_RETRY_DELAY:-5}"
+    local timeout="${GH_DOWNLOAD_TIMEOUT:-900}" connect_timeout="${GH_DOWNLOAD_CONNECT_TIMEOUT:-15}"
+    local _GH_LAST_RETRY_AFTER="" _GH_LAST_RATE_REMAINING="" _GH_LAST_RATE_RESET=""
 
     if [[ ! "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ || \
           ! "$asset_id" =~ ^[1-9][0-9]*$ || -z "$destination" ]]; then
         _gh_log_error "Invalid release asset download arguments"
         return 4
     fi
+    [[ "$destination" == /* ]] || destination="./$destination"
     destination_parent="${destination%/*}"
     [[ "$destination_parent" == "$destination" ]] && destination_parent="."
     if [[ ! -d "$destination_parent" || -L "$destination_parent" || \
@@ -454,8 +519,16 @@ gh_download_release_asset() {
         return 4
     fi
 
-    [[ "$max_attempts" =~ ^[1-9][0-9]*$ ]] || max_attempts=1
-    [[ "$retry_delay" =~ ^[0-9]+$ ]] || retry_delay=0
+    if [[ ! "$max_attempts" =~ ^([1-9]|10)$ || ! "$retry_delay" =~ ^[0-9]{1,4}$ ||
+          ! "$timeout" =~ ^[1-9][0-9]{0,5}$ || ! "$connect_timeout" =~ ^[1-9][0-9]{0,4}$ ]]; then
+        _gh_log_error "Invalid download retry/timeout configuration"
+        return 4
+    fi
+    retry_delay=$((10#$retry_delay))
+    if ! command -v python3 >/dev/null 2>&1; then
+        _gh_log_error "Python 3 is required for atomic release asset downloads"
+        return 3
+    fi
 
     while ((attempt < max_attempts)); do
         attempt=$((attempt + 1))
@@ -464,22 +537,20 @@ gh_download_release_asset() {
             "$destination_parent/.dsr-asset-download.XXXXXX") || return 4
         staged_file="$staging_dir/asset"
 
-        if gh_check 2>/dev/null; then
-            secrets_run_gh api "repos/$repo/releases/assets/$asset_id" --hostname github.com \
-                -H "Accept: application/octet-stream" \
-                -H "Cache-Control: no-cache, no-store, max-age=0" \
-                -H "Pragma: no-cache" > "$staged_file" 2>/dev/null || status=$?
-        else
-            token=$(_gh_resolve_token) || status=$?
-            if [[ $status -eq 0 ]]; then
-                curl -fLsS \
-                    -H "Accept: application/octet-stream" \
-                    -H "Authorization: Bearer $token" \
-                    -H "X-GitHub-Api-Version: 2022-11-28" \
-                    -H "Cache-Control: no-cache, no-store, max-age=0" \
-                    -H "Pragma: no-cache" \
-                    -o "$staged_file" \
-                    "https://api.github.com/repos/$repo/releases/assets/$asset_id" || status=$?
+        run_with_timeout "$timeout" _gh_download_asset_attempt "$repo" "$asset_id" \
+            "$staged_file" "$connect_timeout" "$timeout" || status=$?
+        transport=$(cat "$staged_file.transport" 2>/dev/null) || transport=""
+        http_code="" headers=""
+        _GH_LAST_RETRY_AFTER="" _GH_LAST_RATE_REMAINING="" _GH_LAST_RATE_RESET=""
+        if [[ "$transport" == curl ]]; then
+            http_code=$(cat "$staged_file.http" 2>/dev/null) || http_code=""
+            headers=$(cat "$staged_file.headers" 2>/dev/null) || headers=""
+            _GH_LAST_RETRY_AFTER=$(_gh_response_header retry-after "$headers")
+            _GH_LAST_RATE_REMAINING=$(_gh_response_header x-ratelimit-remaining "$headers")
+            _GH_LAST_RATE_RESET=$(_gh_response_header x-ratelimit-reset "$headers")
+            if ((status == 0)) && [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+                status=22
+                [[ "$http_code" =~ ^[1-5][0-9][0-9]$ ]] || status=8
             fi
         fi
 
@@ -490,18 +561,43 @@ gh_download_release_asset() {
             break
         fi
 
-        rm -f -- "$staged_file"
+        rm -f -- "$staged_file" "$staged_file.headers" "$staged_file.http" "$staged_file.transport"
         rmdir -- "$staging_dir" 2>/dev/null || true
-        if ((attempt < max_attempts && retry_delay > 0)); then
-            sleep "$retry_delay"
+        # gh's cancellation/authentication statuses and supervisor failures
+        # must survive unchanged. Only an ordinary CLI failure or a known
+        # transient curl/HTTP error can justify another read attempt.
+        retryable=false rate_limited=false
+        if [[ "$transport" == gh && "$status" == 1 ]]; then
+            retryable=true
+        elif [[ "$transport" == curl ]]; then
+            case "$status" in
+                5|6|7|16|18|28|35|52|55|56|92|95) retryable=true ;;
+                22)
+                    if [[ "$http_code" == 429 ]] ||
+                       { [[ "$http_code" == 403 ]] &&
+                         [[ -n "$_GH_LAST_RETRY_AFTER" || "$_GH_LAST_RATE_REMAINING" == 0 ]]; }; then
+                        retryable=true rate_limited=true
+                    elif [[ "$http_code" =~ ^(408|5[0-9][0-9])$ ]]; then
+                        retryable=true
+                    fi
+                    ;;
+            esac
+        fi
+        $retryable || break
+        if ((attempt < max_attempts)); then
+            _gh_retry_pause "$retry_delay" "$attempt" "$rate_limited" || { status=$?; break; }
         fi
     done
 
-    if [[ $status -eq 0 ]] && ! ln "$staged_file" "$destination"; then
-        status=1
+    if [[ $status -eq 0 ]]; then
+        # os.link treats the destination literally. ln (and some BSD link
+        # implementations) can descend into a directory created during a race.
+        if ! _gh_publish_download "$staged_file" "$destination"; then
+            status=1
+        fi
     fi
 
-    rm -f -- "$staged_file"
+    rm -f -- "$staged_file" "$staged_file.headers" "$staged_file.http" "$staged_file.transport"
     rmdir -- "$staging_dir" 2>/dev/null || true
     if [[ $status -eq 0 ]]; then
         return 0
@@ -1824,6 +1920,8 @@ gh_clear_cache() {
 # Export functions
 export -f gh_init_cache gh_check gh_check_token _gh_resolve_token gh_api
 export -f gh_download_release_asset
+export -f _gh_download_asset_attempt _gh_publish_download _gh_response_header _gh_retry_pause
+export -f _gh_log_warn _gh_log_error
 export -f gh_get_immutable_tag_ruleset_receipt
 export -f gh_workflow_runs gh_workflow_active_runs gh_workflow_run gh_releases gh_latest_release
 export -f gh_create_release gh_upload_asset gh_upload_asset_named gh_upload_asset_dual
