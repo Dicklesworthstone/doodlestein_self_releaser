@@ -580,6 +580,36 @@ __CONTRACT_ASSET_CASES__
     return 4
 }
 
+# Ordinary native Rust matrices publish colliding secondary names with the
+# full compiler triple. Workflow jobs do not own that naming rule. This table
+# is frozen from the same per-platform act_job_map routing used by the build.
+_native_variant_platform() {
+    case "$1" in
+__NATIVE_VARIANT_CASES__
+    esac
+    return 1
+}
+
+# Match _act_native_variant_artifact_name's suffix placement, including raw
+# names and sidecars. The caller has already established native ownership,
+# a configured nonprimary target, and a collision with the primary name.
+_qualified_native_asset_name() {
+    local name="$1" base="$1" ext=""
+    case "$name" in
+        *.tar.gz) ext=.tar.gz; base="${name%.tar.gz}" ;;
+        *.tar.xz) ext=.tar.xz; base="${name%.tar.xz}" ;;
+        *.tgz) ext=.tgz; base="${name%.tgz}" ;;
+        *.zip) ext=.zip; base="${name%.zip}" ;;
+        *.exe) ext=.exe; base="${name%.exe}" ;;
+        *.minisig|*.sha256|*.sha512|*.sig)
+            ext=".${name##*.}"
+            base=$(_qualified_native_asset_name "${name%.*}") || return $?
+            printf '%s%s\n' "$base" "$ext"
+            return 0 ;;
+    esac
+    printf '%s-%s%s\n' "$base" "$_TARGET_TRIPLE" "$ext"
+}
+
 _apply_artifact_pattern() {
     local pattern="$1"
     local os="$2"
@@ -653,8 +683,12 @@ _variant_asset_name() {
     if [[ "$_TARGET_TRIPLE" != "$primary" ]]; then
         primary_name=$(_TARGET_TRIPLE="$primary" _apply_artifact_pattern "$ARTIFACT_NAMING" "$os" "$arch" "$version" "$format") || return $?
         if [[ "$name" == "$primary_name" ]]; then
-            _log_error "Artifact naming does not distinguish $_TARGET_TRIPLE from primary $primary; use a target-qualified pattern"
-            return 4
+            if _native_variant_platform "$os/$arch"; then
+                name=$(_qualified_native_asset_name "$name") || return $?
+            else
+                _log_error "Artifact naming does not distinguish $_TARGET_TRIPLE from primary $primary; use a target-qualified pattern"
+                return 4
+            fi
         fi
     fi
     printf '%s\n' "$name"
@@ -2397,6 +2431,36 @@ _install_gen_libc_independent_go_cases() {
     done <<< "$platforms"
 }
 
+# Only native Rust builds expand a platform into independently compiled
+# variants. Read the selected repository file, not a global same-named entry.
+# act_get_job_for_target uses this exact platform key: absent/null/empty and
+# the literal string "null" select native; a named job selects the workflow.
+_install_gen_native_variant_cases() {
+    local config_file="$1" language="$2" strict_contract="$3" platforms platform
+    [[ "$language" == rust && "$strict_contract" == false ]] || return 0
+    command -v yq >/dev/null && command -v jq >/dev/null || return 0
+    if ! platforms=$(yq -o=json -I=0 '.' "$config_file" | jq -crs '
+        if length != 1 or (.[0] | type != "object") then error("invalid repo config") else .[0] end |
+        . as $config |
+        if .act_job_map != null and (.act_job_map | type) != "object"
+        then error("act_job_map must be a platform mapping") else . end |
+        (.target_triples // {} | to_entries[]) |
+        select((.value | type) == "array" and (.value | length) > 1) |
+        .key as $platform | $config.act_job_map[$platform] as $job |
+        if $job == null or $job == "" or $job == "null" then $platform
+        elif ($job | type) == "string" and ($job | test("[\u0000-\u001f\u007f]") | not) then empty
+        else error("invalid workflow job selector for " + $platform) end
+    '); then
+        log_error "Cannot resolve native variant naming from the workflow routing configuration"
+        return 4
+    fi
+    while IFS= read -r platform; do
+        [[ -n "$platform" ]] || continue
+        [[ "$platform" =~ ^[a-z0-9]+/[a-z0-9_]+$ ]] || return 4
+        printf '        %s) return 0 ;;\n' "$platform"
+    done <<< "$platforms"
+}
+
 # The build contract accepts one archive format for every OS or an OS map.
 # Resolve that shape before embedding shell literals. `binary` describes raw
 # release bytes: Unix asset names have no extension, Windows names use .exe.
@@ -2551,7 +2615,7 @@ install_gen_create() {
     # Extract values
     local repo binary_name language workflow_path local_path
     local archive_linux archive_darwin archive_windows archive_freebsd archive_formats
-    local artifact_naming linux_libc_fallback=none workspace_binary_cases libc_independent_go_cases
+    local artifact_naming linux_libc_fallback=none workspace_binary_cases libc_independent_go_cases native_variant_cases
     local contract_model strict_release_contract=false contract_asset_cases=''
     local source_subdir source_entry source_package source_engine toolchain_engine field value output_observation
 
@@ -2721,6 +2785,8 @@ install_gen_create() {
 
     libc_independent_go_cases=$(_install_gen_libc_independent_go_cases \
         "$config_file" "$language" "$strict_release_contract") || return $?
+    native_variant_cases=$(_install_gen_native_variant_cases \
+        "$config_file" "$language" "$strict_release_contract") || return $?
 
     # The minisign public key the installer verifies against. Releases signed
     # by dsr ship .minisig files; an installer generated without the key
@@ -2825,6 +2891,7 @@ install_gen_create() {
     template="${template//__MINISIGN_PUBKEY__/$minisign_pubkey}"
     template="${template//__TARGET_TRIPLE_CASES__/$target_triple_cases}"
     template="${template//__LIBC_INDEPENDENT_GO_CASES__/"$libc_independent_go_cases"}"
+    template="${template//__NATIVE_VARIANT_CASES__/"$native_variant_cases"}"
     template="${template//__ARCH_ALIAS_CASES__/$arch_alias_cases}"
     template="${template//__WORKSPACE_BINARY_CASES__/"$workspace_binary_cases"}"
     template="${template//__SOURCE_LANGUAGE__/"$language"}"
