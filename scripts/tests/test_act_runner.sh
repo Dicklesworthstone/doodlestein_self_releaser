@@ -1782,12 +1782,15 @@ PY
 }
 
 test_timeout_owned_groups() {
-    log_test "Real timeout groups retain descendants until cleanup"
+    log_test "Real GNU and portable timeout groups retain descendants until cleanup"
     if python3 - "${DSR_TEST_ACT_RUNNER:-$SRC_DIR/act_runner.sh}" <<'PY'
 import ctypes
+import hashlib
+import itertools
 import json
 import os
 from pathlib import Path
+import select
 import signal
 import subprocess
 import sys
@@ -1812,9 +1815,39 @@ def check(label, valid):
 
 
 def alive(pid):
-    state = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)],
-                           capture_output=True, text=True).stdout.strip()
-    return bool(state and not state.startswith('Z'))
+    try:
+        # Orphaned owned children remain waitable under subreaping. Observe
+        # their exit without freeing a PID that cleanup might still inspect.
+        if os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+            return False
+    except (AttributeError, ChildProcessError):
+        pass
+    try:
+        os.kill(pid, 0)
+        if hasattr(os, 'pidfd_open'):
+            fd = os.pidfd_open(pid)
+            try:
+                events = select.poll()
+                events.register(fd, select.POLLIN)
+                return not events.poll(0)
+            finally:
+                os.close(fd)
+    except ProcessLookupError:
+        return False
+    # BSD has no pidfds. Refuse unavailable process observations instead of
+    # treating ps's empty stdout on a broken /proc mount as proof of exit.
+    result = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        raise RuntimeError('cannot observe owned process: ' + result.stderr.strip())
+    state = result.stdout.strip()
+    if not state:
+        raise RuntimeError('empty process state for a live owned PID')
+    return not state.startswith('Z')
 
 
 def until(predicate, seconds=5):
@@ -1833,12 +1866,33 @@ def fixture_signals():
 
 
 probe = root / 'probe.py'
-probe.write_text(r'''import json, os, pathlib, signal, subprocess, sys, time
+probe.write_text(r'''import json, os, pathlib, select, signal, subprocess, sys, time
 case = pathlib.Path(sys.argv[1])
 def alive(pid):
-    state = subprocess.run(['ps','-o','stat=','-p',str(pid)],
-                           capture_output=True,text=True).stdout.strip()
-    return bool(state and not state.startswith('Z'))
+    try:
+        os.kill(pid, 0)
+        if hasattr(os, 'pidfd_open'):
+            fd = os.pidfd_open(pid)
+            try:
+                events = select.poll()
+                events.register(fd, select.POLLIN)
+                return not events.poll(0)
+            finally:
+                os.close(fd)
+    except ProcessLookupError:
+        return False
+    result = subprocess.run(['ps','-o','stat=','-p',str(pid)],
+                            capture_output=True,text=True)
+    if result.returncode != 0:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        raise RuntimeError('cannot observe owned process: ' + result.stderr.strip())
+    state = result.stdout.strip()
+    if not state:
+        raise RuntimeError('empty process state for a live owned PID')
+    return not state.startswith('Z')
 if sys.argv[2] == 'child':
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
@@ -1865,7 +1919,26 @@ wait "$child"
 driver = root / 'driver.bash'
 driver.write_text(r'''set -uo pipefail
 source "$1" || exit 90
-case_dir="$2" mode="$3" probe="$4" leader="$5"
+case_dir="$2" mode="$3" probe="$4" leader="$5" engine="$6"
+if [[ "$engine" == portable ]]; then
+    _act_timeout_cmd() { printf ''; }
+fi
+if [[ "$mode" == wrapper_lost ]]; then
+    selected_timeout=$(_act_timeout_cmd)
+    _act_timeout_cmd() {
+        # This helper runs in command substitution. Replacing that child
+        # makes getppid identify the actual managed wrapper, without ps.
+        exec python3 -c 'import os,pathlib,sys; (pathlib.Path(sys.argv[1])/"wrapper.pid").write_text(str(os.getppid())); print(sys.argv[2])' \
+            "$case_dir" "$selected_timeout"
+    }
+elif [[ "$mode" == watchdog_lost ]]; then
+    watchdog_definition=$(declare -f _act_timeout_watchdog)
+    eval "${watchdog_definition/_act_timeout_watchdog /_fixture_timeout_watchdog }"
+    _act_timeout_watchdog() {
+        printf '%s\n' "$BASHPID" > "$case_dir/watchdog.pid"
+        _fixture_timeout_watchdog "$@"
+    }
+fi
 ACT_LOGS_DIR="$case_dir/logs"
 mkdir "$ACT_LOGS_DIR"
 seconds=30
@@ -1894,12 +1967,15 @@ fi
 ''')
 sentinel = subprocess.Popen(['sleep', '90'], start_new_session=True)
 try:
-    for mode, expected in (('completed', 17), ('deadline', 124),
-                           ('resistant_deadline', 137), ('cancel', 143), ('interrupt', 130),
-                           ('hangup', 129), ('wrapper_lost', 137),
-                           ('worker_cancel', 130), ('worker_deadline', 124),
-                           ('worker_completed', 17)):
-        case = root / mode
+    cases = (('completed', 17), ('deadline', 124),
+             ('resistant_deadline', 137), ('cancel', 143), ('interrupt', 130),
+             ('hangup', 129), ('wrapper_lost', 137),
+             ('worker_cancel', 130), ('worker_deadline', 124), ('worker_completed', 17))
+    for engine, (mode, expected) in itertools.chain(
+            itertools.product(('system', 'portable'), cases),
+            [('portable', ('watchdog_lost', 125))]):
+        label = engine + ': ' + mode
+        case = root / (engine + '-' + mode)
         case.mkdir()
         process = None
         child = None
@@ -1908,7 +1984,7 @@ try:
             started = time.monotonic()
             try:
                 process = subprocess.Popen(['bash', str(driver), str(module), str(case),
-                                            mode, str(probe), str(leader)],
+                                            mode, str(probe), str(leader), engine],
                                            stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                                            start_new_session=True, preexec_fn=fixture_signals)
                 if not until(lambda: (case / 'descendant.json').exists() and
@@ -1916,7 +1992,7 @@ try:
                     raise RuntimeError('command descendant did not start')
                 owned = json.loads((case / 'descendant.json').read_text())
                 child, group = owned['pid'], owned['pgid']
-                check(mode + ': exercise an owned nested group',
+                check(label + ': exercise an owned nested group',
                       group != process.pid and os.getpgid(process.pid) == process.pid)
                 if mode == 'cancel':
                     os.killpg(process.pid, signal.SIGTERM)
@@ -1930,26 +2006,30 @@ try:
                     # The group anchor is a direct child of the managed
                     # timeout wrapper. Kill that exact parent, not a PID found
                     # by name, to exercise the parent-lifetime channel.
-                    owner = int(subprocess.check_output(
-                        ['ps', '-o', 'ppid=', '-p', str(group)], text=True).strip())
+                    owner = int((case / 'wrapper.pid').read_text())
                     check('lost wrapper belongs to this invocation',
                           owner != process.pid and os.getpgid(owner) == process.pid)
                     os.kill(owner, signal.SIGKILL)
+                elif mode == 'watchdog_lost':
+                    timer = int((case / 'watchdog.pid').read_text())
+                    if os.getpgid(timer) != group:
+                        raise AssertionError('portable timer escaped its owned anchor group')
+                    os.kill(timer, signal.SIGKILL)
                 status = process.wait(timeout=12)
-                check(mode + ': preserve actual exit status ' + str(expected), status == expected)
+                check(label + ': preserve actual exit status ' + str(expected), status == expected)
                 drained = until(lambda: not alive(child), 4) if mode == 'wrapper_lost' else not alive(child)
-                check(mode + ': no running descendant after managed completion', drained)
-                check(mode + ': cleanup is bounded', time.monotonic() - started < 10)
+                check(label + ': no running descendant after managed completion', drained)
+                check(label + ': cleanup is bounded', time.monotonic() - started < 10)
                 if mode.startswith('worker_'):
                     receipt = json.loads((case / 'attempt.json').read_text())
                     released = json.loads((case / 'released.json').read_text())
-                    check(mode + ': slot release follows descendant cleanup', released['alive'] == [])
-                    check(mode + ': immutable receipt records actual failed attempt',
+                    check(label + ': slot release follows descendant cleanup', released['alive'] == [])
+                    check(label + ': immutable receipt records actual failed attempt',
                           receipt.get('status') == 'failed' and receipt.get('exit_code') == expected and
                           receipt.get('platform') == 'linux/amd64' and not receipt.get('resume_artifacts'))
-                check(mode + ': unrelated process survives', sentinel.poll() is None)
+                check(label + ': unrelated process survives', sentinel.poll() is None)
             except Exception as error:
-                check(mode + ': ' + str(error), False)
+                check(label + ': ' + str(error), False)
             finally:
                 # The fixture exclusively created these sessions/groups. With
                 # Linux subreaping, exited anchors also stay unreusable until
@@ -1974,7 +2054,10 @@ try:
     io_driver = root / 'io.bash'
     io_driver.write_text(r'''set -uo pipefail
 source "$1" || exit 90
-case_dir="$2" monitor="$3"
+case_dir="$2" monitor="$3" engine="$4"
+if [[ "$engine" == portable ]]; then
+    _act_timeout_cmd() { printf ''; }
+fi
 [[ "$monitor" != on ]] || set -m
 exec 10< "$case_dir/fd-input" 11> "$case_dir/fd-output"
 coproc FOREIGN_TIMEOUT_TEST {
@@ -2003,29 +2086,57 @@ printf 'acknowledged\n' >&"$foreign_write"
 wait "$foreign_pid" || exit 94
 exit 37
 ''')
-    for monitor in ('on', 'off'):
-        case = root / ('streams-' + monitor)
+    for engine, monitor in itertools.product(('system', 'portable'), ('on', 'off')):
+        label = engine + ': ' + monitor
+        case = root / ('streams-' + engine + '-' + monitor)
         case.mkdir()
         (case / 'fd-input').write_text('fd-input\n')
-        result = subprocess.run(['bash', str(io_driver), str(module), str(case), monitor],
+        result = subprocess.run(['bash', str(io_driver), str(module), str(case), monitor, engine],
                                 input='real-stdin\n', text=True, capture_output=True, timeout=10,
                                 preexec_fn=fixture_signals)
         (case / 'stdout').write_text(result.stdout)
         (case / 'stderr').write_text(result.stderr)
-        check(monitor + ': preserve status, monitor, signal trap and foreign coprocess', result.returncode == 37)
-        check(monitor + ': preserve argument boundaries and stdin/stdout',
+        check(label + ': preserve status, monitor, signal trap and foreign coprocess', result.returncode == 37)
+        check(label + ': preserve argument boundaries and stdin/stdout',
               result.stdout == 'arg1=<space argument> arg2=<> arg3=<$literal>\nreal-stdin\nfd-input\n')
-        check(monitor + ': preserve an occupied output descriptor',
+        check(label + ': preserve an occupied output descriptor',
               (case / 'fd-output').read_text() == 'fd-output\n')
-        check(monitor + ': preserve real stderr', 'real-stderr\n' in result.stderr)
+        check(label + ': preserve real stderr', 'real-stderr\n' in result.stderr)
+        payload = b'large stdin with binary bytes\x00\xff\n' * 65536
+        large = subprocess.run(['bash', '-c', r'''source "$1"
+if [[ "$2" == portable ]]; then _act_timeout_cmd() { printf ''; }; fi
+_act_run_with_timeout 5 python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())'
+''', '_', str(module), engine], input=payload, capture_output=True, timeout=10)
+        check(label + ': large binary stdin is streamed unchanged',
+              large.returncode == 0 and large.stdout.strip().decode() == hashlib.sha256(payload).hexdigest())
     fallback = subprocess.run(['bash', '-c', r'''source "$1"
 _act_timeout_cmd() { printf ''; }
 payload() { printf 'fallback:<%s>\n' "$1"; cat; return 23; }
 _act_run_with_timeout 1 payload 'space argument'
 ''', '_', str(module)], input='fallback stdin\n', text=True, capture_output=True, timeout=5)
-    check('missing timeout preserves direct function status', fallback.returncode == 23)
-    check('missing timeout preserves direct function arguments and streams',
+    check('portable timeout preserves direct function status', fallback.returncode == 23)
+    check('portable timeout preserves direct function arguments and streams',
           fallback.stdout == 'fallback:<space argument>\nfallback stdin\n')
+    missing_sleep = subprocess.run(['bash', '-c', r'''source "$1"
+_act_timeout_cmd() { printf ''; }
+command() {
+    if [[ "${1:-}" == -v && "${2:-}" == sleep ]]; then return 1; fi
+    builtin command "$@"
+}
+payload() { printf 'must not start\n'; }
+_act_run_with_timeout 1 payload
+''', '_', str(module)], text=True, capture_output=True, timeout=5)
+    check('missing portable timer dependency refuses before the payload',
+          missing_sleep.returncode == 3 and missing_sleep.stdout == '' and
+          'sleep is required' in missing_sleep.stderr)
+    for duration in ('', '0', '0.00', '-1', 'bad', '1m'):
+        invalid = subprocess.run(['bash', '-c', r'''source "$1"
+_act_timeout_cmd() { printf ''; }
+payload() { printf 'must not start\n'; }
+_act_run_with_timeout "$2" payload
+''', '_', str(module), duration], text=True, capture_output=True, timeout=5)
+        check('portable timeout rejects invalid bound ' + repr(duration),
+              invalid.returncode == 4 and invalid.stdout == '')
 finally:
     if sentinel.poll() is None:
         sentinel.terminate()
@@ -2650,6 +2761,11 @@ PY
 
 # Main
 main() {
+    if [[ "${1:-}" == "--owned-timeouts-only" ]]; then
+        test_timeout_owned_groups
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return
+    fi
     if [[ "${1:-}" == "--typed-companions-only" ]]; then
         test_typed_workflow_companions
         [[ "$FAIL_COUNT" -eq 0 ]]

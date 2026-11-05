@@ -2454,7 +2454,8 @@ _act_validate_contract_source_identity() {
     return 0
 }
 
-# Timeout helper (supports GNU timeout and coreutils gtimeout)
+# Prefer GNU timeout/coreutils gtimeout; the owned group also has a portable
+# watchdog for coordinators where neither executable is installed.
 _ACT_TIMEOUT_CMD=""
 _act_timeout_cmd() {
     if [[ -n "$_ACT_TIMEOUT_CMD" ]]; then
@@ -2473,16 +2474,45 @@ _act_timeout_cmd() {
     echo "$_ACT_TIMEOUT_CMD"
 }
 
+# The portable timer never signals a PID. It reports deadlines to the live
+# process-group anchor, which alone owns termination. Keep the timer and its
+# sleeps in that same group so completion/cancellation also retires them.
+# Its private stdin is a lease, not the command's input or the caller's lease.
+_act_timeout_watchdog() {
+    local seconds="$1" control=""
+    trap '' INT TERM HUP PIPE
+    printf 'ready\n' || return 4
+    IFS= read -r control && [[ "$control" == start ]] || return 4
+    if sleep "$seconds"; then
+        printf 'deadline\n' || return 4
+        if sleep 5; then
+            printf 'force\n' || return 4
+        else
+            printf 'error\n' || return 4
+        fi
+    else
+        printf 'error\n' || return 4
+    fi
+    # Retain the writer until the anchor retires the entire owned group. A
+    # completed coprocess would otherwise make Bash close its result fd.
+    IFS= read -r control || true
+}
+
 # GNU timeout normally leaves its process group as soon as the command leader
 # exits, even when a descendant ignored TERM. Its pending --kill-after timer
 # then disappears with it. Keep our own live group anchor and use --foreground
 # so timeout and every ordinary descendant remain in the group we still own.
+# Without GNU timeout (notably on macOS), the same anchor enforces the deadline
+# using a private timer channel instead of silently running without a bound.
 _act_timeout_group() {
     local input_fd="$1" output_fd="$2" timeout_command="$3" seconds="$4"
     shift 4
     [[ "$input_fd" =~ ^[0-9]+$ && "$output_fd" =~ ^[0-9]+$ ]] || return 4
     local group_pid="$BASHPID" child="" finished=false cancelled=false
     local control="" running="" status=0 read_status=0
+    local watchdog_read="" watchdog_write="" watchdog_pid="" watchdog_message="" expired=false
+    local -a _ACT_TIMEOUT_WATCHDOG=()
+    local _ACT_TIMEOUT_WATCHDOG_PID=""
     set +m
     trap - EXIT
     trap 'cancelled=true' INT TERM HUP PIPE
@@ -2490,14 +2520,45 @@ _act_timeout_group() {
     if ! IFS= read -r control || [[ "$control" != start ]] || $cancelled; then
         return 130
     fi
+    if [[ -z "$timeout_command" ]]; then
+        coproc _ACT_TIMEOUT_WATCHDOG {
+            eval "exec ${input_fd}<&- ${output_fd}>&-"
+            _act_timeout_watchdog "$seconds"
+        }
+        watchdog_read="${_ACT_TIMEOUT_WATCHDOG[0]:-}"
+        watchdog_write="${_ACT_TIMEOUT_WATCHDOG[1]:-}"
+        watchdog_pid="${_ACT_TIMEOUT_WATCHDOG_PID:-}"
+        if [[ ! "$watchdog_read" =~ ^[0-9]+$ || ! "$watchdog_write" =~ ^[0-9]+$ ||
+              ! "$watchdog_pid" =~ ^[1-9][0-9]*$ ]] ||
+           ! IFS= read -r -u "$watchdog_read" watchdog_message ||
+           [[ "$watchdog_message" != ready ]] || $cancelled; then
+            trap '' INT TERM HUP PIPE
+            kill -KILL -- "-$group_pid" 2>/dev/null || true
+            return 4
+        fi
+    fi
     (
         # Only fd0/fd1 are inherited by the command for these streams. In
         # particular it must not retain the anchor's parent-lifetime reader.
         eval "exec ${input_fd}<&- ${output_fd}>&-"
-        exec "$timeout_command" --foreground --kill-after=5 "$seconds" "$@"
+        if [[ -n "$timeout_command" ]]; then
+            exec "$timeout_command" --foreground --kill-after=5 "$seconds" "$@"
+        else
+            # Retain Bash functions as well as external commands, argument
+            # boundaries and every caller-owned descriptor on the fallback.
+            # Execute external programs in this PID so an intermediate shell
+            # cannot die on TERM and hide a still-running resistant leader.
+            case "$(type -t -- "$1")" in
+                function|builtin) "$@" ;;
+                *) exec "$@" ;;
+            esac
+        fi
     ) <&"$input_fd" >&"$output_fd" &
     child=$!
     eval "exec ${input_fd}<&- ${output_fd}>&-"
+    if [[ -n "$watchdog_write" ]] && ! printf 'start\n' >&"$watchdog_write"; then
+        cancelled=true
+    fi
     while ! $cancelled; do
         if ! $finished; then
             running=$(jobs -pr)
@@ -2505,8 +2566,42 @@ _act_timeout_group() {
                 *$'\n'"$child"$'\n'*) ;;
                 *)
                     wait "$child" || status=$?
+                    $expired && status=124
                     finished=true
                     printf 'exit:%s\n' "$status" || break
+                    ;;
+            esac
+        fi
+        if ! $finished && [[ -n "$watchdog_read" ]]; then
+            watchdog_message=""
+            case $'\n'"$running"$'\n' in
+                *$'\n'"$watchdog_pid"$'\n'*)
+                    if IFS= read -r -t 0 -u "$watchdog_read"; then
+                        IFS= read -r -u "$watchdog_read" watchdog_message || watchdog_message=error
+                    fi
+                    ;;
+                *) watchdog_message=error ;;
+            esac
+            case "$watchdog_message" in
+                '') ;;
+                deadline)
+                    expired=true
+                    # Ignore our own group TERM; the actual command was
+                    # launched before these dispositions changed. The timer
+                    # already ignores TERM and supplies the five-second cap.
+                    trap '' INT TERM HUP PIPE
+                    kill -TERM -- "-$group_pid" 2>/dev/null || true
+                    ;;
+                *)
+                    if [[ "$watchdog_message" == force ]]; then
+                        status=137
+                    else
+                        _log_error "Portable timeout watchdog could not maintain its deadline"
+                        status=125
+                    fi
+                    finished=true
+                    printf 'exit:%s\n' "$status" || true
+                    break
                     ;;
             esac
         fi
@@ -2536,8 +2631,16 @@ _act_run_with_timeout() (
     local cmd
     cmd=$(_act_timeout_cmd)
     if [[ -z "$cmd" ]]; then
-        "$@"
-        return
+        # Every caller supplies seconds, not GNU timeout duration suffixes.
+        # Reject an absent/zero/invalid bound before launching any command.
+        if [[ ! "$seconds" =~ ^[0-9]+([.][0-9]+)?$ || -z "${seconds//[0.]/}" ]]; then
+            _log_error "Portable timeout requires a positive duration in seconds: $seconds"
+            return 4
+        fi
+        if ! command -v sleep >/dev/null 2>&1; then
+            _log_error "sleep is required to supervise commands without timeout or gtimeout"
+            return 3
+        fi
     fi
 
     # Coprocess stdin/stdout carry only control/status. Reserve unused numeric
@@ -3028,10 +3131,10 @@ act_run_workflow() {
     local timeout_cmd
     timeout_cmd=$(_act_timeout_cmd)
     if [[ -z "$timeout_cmd" ]]; then
-        _log_warn "timeout command not available; running act without timeout"
+        _log_info "GNU timeout not available; supervising act with the portable deadline"
     fi
-    # timeout creates a separate process group. The shared wrapper forwards
-    # orchestration cancellation into that group and waits for escalation.
+    # The shared wrapper owns a separate process group, forwards orchestration
+    # cancellation into it, and waits for escalation with either timer engine.
     if [[ -n "$isolated_home" ]]; then
         HOME="$isolated_home" \
         XDG_CONFIG_HOME="$isolated_home/.config" \
