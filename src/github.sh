@@ -318,7 +318,7 @@ PY
 
     # Try gh CLI first, then curl
     local response="" response_file cleanup_command
-    local exit_code using_curl
+    local exit_code using_curl rate_limited
     local retries=0
     response_file=$(mktemp "${TMPDIR:-/tmp}/dsr-api-response.XXXXXXXX") || return 8
     printf -v cleanup_command 'rm -f -- %q' "$response_file"
@@ -345,6 +345,25 @@ PY
             _gh_api_with_curl "$endpoint" "$method" "$data" "$no_cache" > "$response_file" || exit_code=$?
         fi
         response=$(cat "$response_file") || return 8
+
+        # A failed write may already have reached GitHub. Only an explicit
+        # 403/429 rejection can authorize another attempt; arbitrary release
+        # text mentioning rate limits is never evidence that a POST failed.
+        rate_limited=false
+        if ((exit_code != 0)); then
+            if [[ "${_GH_LAST_HTTP_CODE:-}" == 429 ]] ||
+               { [[ "${_GH_LAST_HTTP_CODE:-}" == 403 ]] &&
+                 { [[ -n "${_GH_LAST_RETRY_AFTER:-}" || "${_GH_LAST_RATE_REMAINING:-}" == 0 ]] ||
+                   _gh_is_rate_limited "$response"; }; }; then
+                rate_limited=true
+            elif [[ "$method" == GET && -z "${_GH_LAST_HTTP_CODE:-}" ]] &&
+                 _gh_is_rate_limited "$response"; then
+                # gh's JSON-only transport does not expose response headers. A
+                # reported rate limit may retry a read, but not a mutation whose
+                # rejection status and server cooldown cannot be established.
+                rate_limited=true
+            fi
+        fi
 
         # Check for rate limit
         if [[ $exit_code -eq 0 ]]; then
@@ -388,16 +407,12 @@ PY
             fi
             echo "$response"
             return 0
-        elif _gh_is_rate_limited "$response" ||
+        elif $rate_limited ||
              { [[ "$method" == "GET" ]] &&
                { [[ "${_GH_LAST_HTTP_CODE:-}" =~ ^(408|429|5[0-9][0-9])$ ]] ||
                  { $using_curl && [[ -z "${_GH_LAST_HTTP_CODE:-}" && $exit_code -ne 3 ]]; }; }; }; then
             retries=$((retries + 1))
             if [[ $retries -lt $max_attempts ]]; then
-                local rate_limited=false
-                if [[ "${_GH_LAST_HTTP_CODE:-}" == "429" ]] || _gh_is_rate_limited "$response"; then
-                    rate_limited=true
-                fi
                 _gh_retry_pause "$retry_delay" "$retries" "$rate_limited" || return $?
             fi
         else
@@ -842,18 +857,14 @@ _gh_retry_pause() {
     sleep "$wait_time" || return 5
 }
 
-# Check if response indicates rate limiting
+# Recognize GitHub's top-level rate-limit error, not arbitrary payload text.
+# This classifies the body only; mutation retries also require an HTTP status.
 _gh_is_rate_limited() {
     local response="$1"
-    # Here-string, not `echo | grep -q`: grep's early exit can SIGPIPE the
-    # writer of a large response body and pipefail would hide the match.
-    if grep -qi "rate limit" <<< "$response"; then
-        return 0
-    fi
-    if echo "$response" | jq -e '.message | test("rate limit"; "i")' &>/dev/null 2>&1; then
-        return 0
-    fi
-    return 1
+    jq -es 'length == 1 and (.[0] | type == "object" and
+        any(.message, .error; type == "string" and
+            test("^(API rate limit exceeded|rate limit exceeded|You have exceeded (a secondary|the) rate limit)([[:space:][:punct:]]|$)"; "i")))' \
+        <<< "$response" >/dev/null 2>&1
 }
 
 # ============================================================================

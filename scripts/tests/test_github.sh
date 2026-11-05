@@ -8,12 +8,13 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_DIR="$(cd "$SCRIPT_DIR/../../src" && pwd)"
+GITHUB_MODULE="${DSR_TEST_GITHUB_MODULE:-$SRC_DIR/github.sh}"
 
 # Source the module under test
 # shellcheck source=../../src/logging.sh
 source "$SRC_DIR/logging.sh"
 # shellcheck source=../../src/github.sh
-source "$SRC_DIR/github.sh"
+source "$GITHUB_MODULE"
 
 # Test state
 TEMP_DIR=""
@@ -234,6 +235,26 @@ test_rate_limit_not_detected_unrelated() {
   ! _gh_is_rate_limited '{"message": "Not Found"}'
 }
 
+test_rate_limit_errors_are_structured() {
+  local response padding
+  for response in \
+      '{"message":"Forbidden","body":"API rate limit exceeded"}' \
+      '{"message":"Resource not accessible: rate limit documentation"}' \
+      '{"message":"API rate limit exceededly"}' \
+      '{"message":["API rate limit exceeded"]}' \
+      '{"error":{"message":"API rate limit exceeded"}}' \
+      'not JSON: API rate limit exceeded' \
+      $'{"message":"API rate limit exceeded"}\n{}'; do
+    ! _gh_is_rate_limited "$response" || return 1
+  done
+  _gh_is_rate_limited '{"message":"You have exceeded a secondary rate limit. Please wait a few minutes before you try again."}' || return 1
+  # Large bodies must not hide a real error behind a pipefail/SIGPIPE result,
+  # nor turn unrelated payload text into permission to repeat a mutation.
+  printf -v padding '%200000s' ''
+  _gh_is_rate_limited "{\"message\":\"API rate limit exceeded\",\"details\":\"$padding\"}" || return 1
+  ! _gh_is_rate_limited "{\"message\":\"Forbidden\",\"details\":\"${padding}rate limit\"}"
+}
+
 # ============================================================================
 # Tests: Token Validation
 # ============================================================================
@@ -317,7 +338,8 @@ test_credential_transport_routing() (
     invalid) export DSR_GH_TOKEN=fixture-invalid GH_TOKEN=fixture-gh; expected='fixture-invalid' ;;
     standalone)
       unset -f secrets_get_gh_token secrets_run_gh
-      source "$SRC_DIR/github.sh"
+      # shellcheck source=../../src/github.sh
+      source "$GITHUB_MODULE"
       export DSR_GH_TOKEN=fixture-dsr
       expected='fixture-dsr' ;;
     *) return 4 ;;
@@ -404,7 +426,8 @@ test_api_rejects_external_endpoints() (
 
 test_exported_credential_helpers() (
   local result
-  source "$SRC_DIR/github.sh"
+  # shellcheck source=../../src/github.sh
+  source "$GITHUB_MODULE"
   export DSR_GH_TOKEN=fixture-dsr GITHUB_TOKEN=fixture-github GH_TOKEN=fixture-gh
   export GH_HOST=enterprise.fixture.invalid
   gh() { printf '%s|%s\n' "$GH_HOST" "$GH_TOKEN"; }
@@ -550,6 +573,7 @@ test_api_transport_scenario() (
   local scenario="$1" expected_status="$2" expected_attempts="$3"
   local fixture="$TEMP_DIR/api" endpoint='repos/owner/repo/releases/9'
   local calls="$fixture/calls" attempts="$fixture/attempts" key
+  local failure_http='' failure_headers='' failure_body='' expected_sleep=''
   mkdir -p "$fixture/tmp" || return 1
   : > "$calls"; printf '0\n' > "$attempts"
   local TMPDIR="$fixture/tmp" GH_MAX_RETRIES=3 GH_RETRY_DELAY=0 GH_MAX_RETRY_WAIT=300
@@ -557,6 +581,36 @@ test_api_transport_scenario() (
   unset DSR_GH_TOKEN GH_TOKEN
   gh() { return 1; }
   sleep() { printf 'SLEEP %s\n' "$1" >> "$calls"; }
+  case "$scenario" in
+    retry-503-rate-text|post-503-rate-text|patch-503-rate-text|delete-503-rate-text)
+      failure_http=503
+      failure_body='{"message":"Service unavailable","body":"Release adds rate limit recovery"}'
+      [[ "$scenario" != retry-503-rate-text ]] || expected_sleep=0 ;;
+    post-503-rate-message)
+      failure_http=503; failure_body='{"message":"API rate limit exceeded"}' ;;
+    post-403-unrelated-rate-text)
+      failure_http=403
+      failure_body='{"message":"Resource not accessible","body":"API rate limit exceeded"}' ;;
+    post-403-unrelated-rate-message)
+      failure_http=403; failure_body='{"message":"Resource not accessible: rate limit documentation"}' ;;
+    post-403-rate-limit)
+      failure_http=403; failure_body='{"message":"API rate limit exceeded"}'; expected_sleep=60 ;;
+    post-403-secondary-rate-limit)
+      failure_http=403; failure_body='{"message":"You have exceeded a secondary rate limit."}'; expected_sleep=60 ;;
+    post-403-retry-after|post-429-retry-after)
+      failure_http="${scenario:5:3}"
+      failure_headers=$'Retry-After: 7\r\n'; failure_body='{"message":"slow down"}'; expected_sleep=7 ;;
+    post-403-rate-reset)
+      failure_http=403; failure_body='{"message":"slow down"}'; expected_sleep=7
+      failure_headers=$'X-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 1700000007\r\n'
+      date() { if [[ "$*" == +%s ]]; then printf '1700000000\n'; else command date "$@"; fi; } ;;
+    post-429-message-free)
+      failure_http=429; failure_body='{}'; expected_sleep=60 ;;
+    post-429-long-cooldown)
+      failure_http=429; failure_headers=$'Retry-After: 3600\r\n'; failure_body='{}' ;;
+    post-429-invalid-cooldown)
+      failure_http=429; failure_headers=$'Retry-After: invalid\r\n'; failure_body='{}' ;;
+  esac
   key=$(_gh_cache_key "$endpoint")
   case "$scenario" in
     conditional-304|uncached-304|corrupt-304|mutation-no-etag)
@@ -569,11 +623,18 @@ test_api_transport_scenario() (
     local count
     printf 'CURL %s\n' "$*" >> "$calls"
     read -r count < "$attempts"; count=$((count + 1)); printf '%s\n' "$count" > "$attempts"
+    if [[ -n "$failure_http" && "$count" -eq 1 ]]; then
+      printf 'HTTP/2 %s\r\n%s\r\n%s' "$failure_http" "$failure_headers" "$failure_body"
+      return 0
+    fi
     case "$scenario" in
       conditional-304|uncached-304|missing-304|corrupt-304)
         printf 'HTTP/2 304\r\nETag: W/"fresh"\r\n\r\n'; return 0 ;;
       retry-network|post-network)
         if ((count == 1)); then printf 'partial'; return 56; fi ;;
+      post-network-rate-text)
+        printf 'HTTP/2 429\r\nRetry-After: 7\r\n\r\n{"message":"API rate limit exceeded"}'
+        return 56 ;;
       retry-503|post-503)
         if ((count == 1)); then printf 'HTTP/2 503\r\n\r\n{"message":"Unavailable"}'; return 0; fi ;;
       rate-limit)
@@ -612,10 +673,12 @@ test_api_transport_scenario() (
     printf 'HTTP/2 200\r\nETag:W/"fresh"\r\n\r\n{"fresh":true}'
   }
   local -a args=("$endpoint")
+  local method=GET
   case "$scenario" in
     uncached-304) args+=(--no-cache) ;;
-    post-503|post-network|mutation-no-etag) args+=(--post '{}') ;;
-    delete-204) args+=(--method DELETE) ;;
+    post-*|mutation-no-etag) args+=(--post '{}'); method=POST ;;
+    patch-*) args+=(--method PATCH --data '{}'); method=PATCH ;;
+    delete-*) args+=(--method DELETE); method=DELETE ;;
   esac
   local result status=0 count cached
   result=$(gh_api "${args[@]}" 2> "$fixture/stderr") || status=$?
@@ -635,9 +698,16 @@ test_api_transport_scenario() (
     [[ -z "$result" ]] || return 1
   elif ((status == 0)); then
     [[ "$result" == '{"fresh":true}' ]] || return 1
-    if [[ "$scenario" != mutation-no-etag ]]; then
+    if [[ "$method" == GET ]]; then
       [[ "$(_gh_get_etag "$endpoint")" == 'W/"fresh"' ]] || return 1
     fi
+  elif [[ -n "$failure_body" && "$status" -eq 22 ]]; then
+    [[ "$result" == "$failure_body" ]] || return 1
+  fi
+  if [[ -n "$expected_sleep" ]]; then
+    grep -Fxq "SLEEP $expected_sleep" "$calls" || return 1
+  elif [[ -n "$failure_http" || "$scenario" == post-network-rate-text ]]; then
+    ! grep -q '^SLEEP ' "$calls" || return 1
   fi
   case "$scenario" in
     rate-limit) grep -Fxq 'SLEEP 60' "$calls" || return 1 ;;
@@ -650,6 +720,98 @@ test_api_transport_scenario() (
   fi
   [[ -z "$(find "$fixture/tmp" -mindepth 1 -print -quit)" ]]
 )
+
+# gh emits JSON without HTTP status/headers. Exercise its real adapter and
+# credential wrapper, replacing only the external CLI. A failed write must
+# retain the original status and body, even if that body reports a rate limit.
+test_api_gh_retry_scenario() (
+  local scenario="$1" expected_status="$2" expected_attempts="$3"
+  local fixture="$TEMP_DIR/gh-api" endpoint='repos/owner/repo/releases/9'
+  local failure_body='{"message":"API rate limit exceeded"}' failure_status=1 method=POST
+  local result status=0 count
+  mkdir -p "$fixture/tmp" || return 1
+  printf '0\n' > "$fixture/attempts"
+  : > "$fixture/calls"
+  local TMPDIR="$fixture/tmp" GH_MAX_RETRIES=3 GH_RETRY_DELAY=0 GH_MAX_RETRY_WAIT=300
+  local DSR_GH_TOKEN='fixture-token'
+  case "$scenario" in
+    get-rate-limit) method=GET ;;
+    get-unrelated-rate-text)
+      method=GET; failure_body='{"message":"Forbidden","body":"API rate limit exceeded"}' ;;
+    post-lost-response)
+      failure_body='{"id":9,"body":"Release adds rate limit recovery"}' ;;
+    post-cli-interrupted) failure_status=130 ;;
+    post-cli-auth) failure_status=4 ;;
+  esac
+  sleep() { printf 'SLEEP %s\n' "$1" >> "$fixture/calls"; }
+  gh() {
+    if [[ "$1 ${2:-}" == 'auth status' ]]; then return 0; fi
+    [[ "$1" == api && "$2" == "$endpoint" ]] || return 99
+    printf 'GH %s\n' "$*" >> "$fixture/calls"
+    local attempt
+    read -r attempt < "$fixture/attempts"
+    attempt=$((attempt + 1)); printf '%s\n' "$attempt" > "$fixture/attempts"
+    if ((attempt == 1)); then
+      printf '%s\n' "$failure_body"
+      return "$failure_status"
+    fi
+    printf '{"fresh":true}\n'
+  }
+  local -a args=("$endpoint")
+  [[ "$method" != POST ]] || args+=(--post '{}')
+  result=$(gh_api "${args[@]}" 2> "$fixture/stderr") || status=$?
+  read -r count < "$fixture/attempts"
+  if [[ "$status" != "$expected_status" || "$count" != "$expected_attempts" ]]; then
+    printf 'FAIL gh %s: status=%s requests=%s expected=%s/%s\n' \
+      "$scenario" "$status" "$count" "$expected_status" "$expected_attempts"
+    cat "$fixture/stderr"
+    return 1
+  fi
+  if ((status == 0)); then
+    [[ "$result" == '{"fresh":true}' ]] || return 1
+    grep -Fxq 'SLEEP 60' "$fixture/calls" || return 1
+  else
+    [[ "$result" == "$failure_body" ]] || return 1
+    ! grep -q '^SLEEP ' "$fixture/calls" || return 1
+    ! _gh_get_cache "$endpoint" >/dev/null || return 1
+  fi
+  [[ -z "$(find "$fixture/tmp" -mindepth 1 -print -quit)" ]]
+)
+
+run_api_retry_regressions() {
+  run_test rate_limit_errors_are_structured test_rate_limit_errors_are_structured
+  local scenario status attempts
+  while read -r scenario status attempts; do
+    run_test "api_$scenario" test_api_transport_scenario "$scenario" "$status" "$attempts"
+  done <<'API_RETRY_SCENARIOS'
+retry-503-rate-text 0 2
+post-503-rate-text 22 1
+patch-503-rate-text 22 1
+delete-503-rate-text 22 1
+post-503-rate-message 22 1
+post-403-unrelated-rate-text 22 1
+post-403-unrelated-rate-message 22 1
+post-403-rate-limit 0 2
+post-403-secondary-rate-limit 0 2
+post-403-retry-after 0 2
+post-403-rate-reset 0 2
+post-429-message-free 0 2
+post-429-retry-after 0 2
+post-429-long-cooldown 8 1
+post-429-invalid-cooldown 8 1
+post-network-rate-text 56 1
+API_RETRY_SCENARIOS
+  while read -r scenario status attempts; do
+    run_test "api_gh_$scenario" test_api_gh_retry_scenario "$scenario" "$status" "$attempts"
+  done <<'API_GH_RETRY_SCENARIOS'
+post-rate-limit 1 1
+post-lost-response 1 1
+post-cli-interrupted 130 1
+post-cli-auth 4 1
+get-rate-limit 0 2
+get-unrelated-rate-text 1 1
+API_GH_RETRY_SCENARIOS
+}
 
 test_api_rejects_missing_option_values() (
   local flag status
@@ -1665,6 +1827,12 @@ main() {
   echo "=== github.sh Tests ==="
   echo ""
 
+  if [[ "${1:-}" == --api-retry-only ]]; then
+    run_api_retry_regressions
+    printf 'API retries: %s passed, %s failed\n' "$TESTS_PASSED" "$TESTS_FAILED"
+    [[ "$TESTS_FAILED" -eq 0 ]]
+    exit $?
+  fi
   if [[ "${1:-}" == --credential-routing-only ]]; then
     run_credential_routing_tests
     printf 'Credential routing: %s passed, %s failed\n' "$TESTS_PASSED" "$TESTS_FAILED"
@@ -1758,6 +1926,7 @@ empty-get 8 1
 delete-204 0 1
 mutation-no-etag 0 1
 API_SCENARIOS
+  run_api_retry_regressions
   run_test "download_release_asset_uses_authenticated_gh" test_download_release_asset_uses_authenticated_gh
   run_test "download_release_asset_uses_token_curl_fallback" test_download_release_asset_uses_token_curl_fallback
   run_test "download_release_asset_failure_leaves_no_destination" test_download_release_asset_failure_leaves_no_destination
