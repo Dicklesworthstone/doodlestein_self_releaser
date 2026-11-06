@@ -5759,10 +5759,8 @@ _release_contract_preflight() {
         --arg tag "$tag" \
         --argjson expected_count "$expected_count" \
         --argjson expected_manifest_count "$expected_manifest_count" \
-        --argjson base_additional "$base_additional_json" \
         --argjson expected_dependencies "$expected_dependencies_json" \
-        --argjson identities "$contract_targets_json" \
-        --argjson contract "$contract_json" '
+        '
         .tool == $tool and
         .version == $tag and
         (.source | type == "object") and
@@ -5777,13 +5775,6 @@ _release_contract_preflight() {
         (.artifacts | type == "array") and
         (.artifacts | length == $expected_manifest_count) and
         ([.artifacts[].name] | unique | length) == $expected_manifest_count and
-        ([.artifacts[] | select(.target != "additional") | . as $artifact |
-          $identities[] | select(.platform == $artifact.target and
-            ((.require_triple | not) or .target_triple == $artifact.target_triple)) |
-          {key: .key, value: $artifact.name}] | from_entries) ==
-            $contract.exact_primary_assets and
-        ([.artifacts[] | select(.target == "additional") | .name] | sort) ==
-            $base_additional and
         all(.artifacts[];
             (.target | type == "string") and
             (.name | type == "string") and
@@ -5796,6 +5787,8 @@ _release_contract_preflight() {
     fi
     local strict_manifest_json
     strict_manifest_json=$(jq -c '.' "$manifest_file") || return 4
+    _act_validate_contract_asset_bindings "$tool_name" "$strict_manifest_json" \
+        "$contract_json" "$contract_targets_json" || return 4
     _act_validate_contract_variant_inventory "$tool_name" "$strict_manifest_json" "$contract_json" || return 4
 
     local -a primary_targets=()
@@ -6099,7 +6092,7 @@ _release_contract_preflight() {
     done
 
     local additional_name additional_path additional_sha additional_size
-    local additional_manifest_sha additional_manifest_size
+    local additional_manifest_sha additional_manifest_size additional_manifest_record
     while IFS= read -r additional_name; do
         [[ -n "$additional_name" ]] || {
             log_error "Release contract contains an empty additional asset name"
@@ -6119,14 +6112,10 @@ _release_contract_preflight() {
             log_error "Could not determine size for additional asset: $additional_path"
             return 4
         }
-        additional_manifest_sha=$(jq -r --arg name "$additional_name" '
-            .artifacts[] | select(.target == "additional" and .name == $name) |
-            .sha256
-        ' "$manifest_file")
-        additional_manifest_size=$(jq -r --arg name "$additional_name" '
-            .artifacts[] | select(.target == "additional" and .name == $name) |
-            .size_bytes
-        ' "$manifest_file")
+        additional_manifest_record=$(jq -ce --arg name "$additional_name" \
+            '.artifacts[] | select(.name == $name)' "$manifest_file") || return 4
+        additional_manifest_sha=$(jq -r '.sha256' <<< "$additional_manifest_record") || return 4
+        additional_manifest_size=$(jq -r '.size_bytes' <<< "$additional_manifest_record") || return 4
         if [[ "$additional_sha" != "$additional_manifest_sha" || \
               "$additional_size" != "$additional_manifest_size" ]]; then
             log_error "Additional asset does not match its build-manifest receipt: $additional_name"
@@ -6137,7 +6126,9 @@ _release_contract_preflight() {
             --arg path "$additional_path" \
             --arg sha256 "$additional_sha" \
             --argjson size_bytes "$additional_size" \
-            '{target: "additional", name: $name, path: $path, sha256: $sha256, size_bytes: $size_bytes, kind: "additional"}')")
+            --argjson record "$additional_manifest_record" '
+            {target:$record.target, name:$name, path:$path, sha256:$sha256, size_bytes:$size_bytes, kind:"additional"} +
+            (if $record | has("target_triple") then {target_triple:$record.target_triple} else {} end)')")
 
         sidecar="${additional_path}.sha256"
         if jq -e --arg name "${additional_name}.sha256" '
@@ -6311,7 +6302,7 @@ _release_contract_preflight() {
 
     local planned_additional_names contracted_additional_names
     planned_additional_names=$(printf '%s\n' "${planned_assets[@]}" | jq -sr \
-        '[.[] | select(.target == "additional") | .name] | sort | join("\n")') || return 4
+        '[.[] | select(.target == "additional" or .kind == "additional") | .name] | sort | join("\n")') || return 4
     contracted_additional_names=$(jq -r \
         '(.exact_additional_assets // []) | sort | join("\n")' \
         <<< "$contract_json") || return 4
@@ -8383,19 +8374,23 @@ EOF
     local -A release_upload_plan=() release_artifact_triples=()
     _release_plan_upload_names() {
         local -A claimants=() rank=() sha_of=() artifact_candidates=()
-        local -A companion_targets=()
+        local -A companion_targets=() companion_triples=() companion_explicit=()
         local -a order=()
         local a_name a_sha a_target a_format a_triple variant triple how primary candidate configured
-        local companion_json companion_rows companion_name companion_target
-        companion_json=$(config_get_additional_artifacts_json "$tool_name") || {
+        local companion_json companion_rows companion_name companion_target companion_triple companion_has_triple
+        companion_json=$(config_get_additional_artifact_owners_json "$tool_name") || {
             log_error "Cannot validate additional artifact ownership for $tool_name"
             return 4
         }
         companion_rows=$(jq -r 'to_entries[] | .key as $target |
-            .value[] | [.name, $target] | @tsv' <<< "$companion_json") || return 4
-        while IFS=$'\t' read -r companion_name companion_target; do
+            .value[] | [.name, $target, (if .owner_target_triple == "" then "-" else .owner_target_triple end),
+                (has("target_triple") | tostring)] | @tsv' <<< "$companion_json") || return 4
+        while IFS=$'\t' read -r companion_name companion_target companion_triple companion_has_triple; do
             [[ -n "$companion_name" ]] || continue
             companion_targets["$companion_name"]="$companion_target"
+            [[ "$companion_triple" != "-" ]] || companion_triple=""
+            companion_triples["$companion_name"]="$companion_triple"
+            companion_explicit["$companion_name"]="$companion_has_triple"
         done <<< "$companion_rows"
         while IFS=$'\t' read -r a_name a_sha a_target a_format a_triple; do
             [[ "$a_target" == "-" ]] && a_target=""
@@ -8432,10 +8427,14 @@ EOF
                 return 4
             fi
             if [[ -n "$companion_target" ]]; then
-                # Native companions belong to their configured platform's
-                # first variant. Their names are literal data: ABI words in a
-                # JSON/NOTICE/archive name do not select a compiler variant.
-                primary=$(jq -r '.[0] // empty' <<< "$configured") || return 4
+                # Resolve compiler ownership only from the declaration. An
+                # untyped companion keeps its first-variant owner; explicit
+                # companions require the exact retained selector.
+                primary="${companion_triples[$a_name]}"
+                if [[ "${companion_explicit[$a_name]}" == true && "$a_triple" != "$primary" ]]; then
+                    log_error "Additional artifact $a_name must retain its configured target_triple $primary"
+                    return 4
+                fi
                 if [[ -n "$a_triple" && -n "$primary" && "$a_triple" != "$primary" ]]; then
                     log_error "Additional artifact $a_name must belong to the primary configured target_triple $primary, not $a_triple"
                     return 4

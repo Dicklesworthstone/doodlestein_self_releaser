@@ -1159,8 +1159,9 @@ config_normalize_additional_artifacts_json() {
             elif (.value | type) != "array" then refuse($platform + " requires an array")
             else .value |= map(
                 if type == "string" then {name:., format:"file"}
-                elif type == "object" and keys == ["format", "name"] then .
-                else refuse($platform + " requires names or exact {name,format} declarations") end |
+                elif type == "object" and
+                     (keys == ["format", "name"] or keys == ["format", "name", "target_triple"]) then .
+                else refuse($platform + " requires names or {name,format,target_triple?} declarations") end |
                 .format as $format |
                 if (.name | safe_name | not)
                 then refuse($platform + " has an unsafe artifact name: " + (.name | tojson))
@@ -1169,6 +1170,10 @@ config_normalize_additional_artifacts_json() {
                 elif ($format | type) != "string" or
                      (["file","binary","json","zip","tar.gz","tar.xz","msi"] | index($format)) == null
                 then refuse($platform + " has an unsupported format for " + .name + ": " + (.format | tojson))
+                elif has("target_triple") and
+                     (.target_triple | type != "string" or
+                      (test("^[A-Za-z0-9][A-Za-z0-9._-]*$") | not) or contains(".."))
+                then refuse($platform + " has an invalid target_triple for " + .name)
                 else . end
             ) end |
             if (.value | length) == 0 then .
@@ -1194,12 +1199,44 @@ config_normalize_additional_artifacts_json() {
     printf '%s\n' "$normalized"
 }
 
+# Bind each literal companion to a configured producer, independently of its
+# filename. Preserve an explicit target_triple as content policy; an omitted
+# selector retains the existing first-variant producer without inventing an
+# explicit compiler claim on shared strict-contract metadata.
+config_resolve_additional_artifact_owners_json() {
+    local normalized="$1" mapping="${2:-null}" resolved
+    if ! resolved=$(jq -ce --argjson mapping "$mapping" '
+        def triple: type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]*$") and
+            (contains("..") | not);
+        def variants:
+            if . == null then []
+            elif triple then [.]
+            elif type == "array" and length > 0 and all(.[]; triple) and
+                 length == (unique | length) then .
+            else error("invalid configured companion target variants") end;
+        (if $mapping == null then {} else $mapping end) as $m |
+        if ($m | type) != "object" then error("target_triples must be a platform mapping") else . end |
+        to_entries | map(.key as $platform |
+            ($m[$platform] | variants) as $variants |
+            .value |= map(
+                if has("target_triple") and
+                   (.target_triple as $triple | ($variants | index($triple)) == null)
+                then error("additional artifact " + .name + " has an unconfigured target_triple for " + $platform)
+                else . + {owner_target_triple:(.target_triple // $variants[0] // "")} end
+            )) | from_entries
+    ' <<< "$normalized" 2>&1); then
+        _cfg_log_error "Invalid additional artifact ownership: $resolved"
+        return 4
+    fi
+    printf '%s\n' "$resolved"
+}
+
 # repos.d is the native build authority, including an absent declaration. Only
 # registry-only tools are read from repos.yaml, matching native selector policy.
 # False and malformed mappings must never disappear through a defaulting
 # operator before the shared normalizer sees them.
 config_get_additional_artifacts_json() {
-    local toolname="${1:-}" document raw="null" act_jobs="null"
+    local toolname="${1:-}" document raw="null" act_jobs="null" normalized mapping
     local tool_config="${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.d/${toolname}.yaml"
     [[ -n "$toolname" ]] || return 4
     if [[ -f "$tool_config" ]]; then
@@ -1216,7 +1253,20 @@ config_get_additional_artifacts_json() {
         ' <<< "$document") || return 4
         act_jobs=$(jq -c --arg tool "$toolname" '.tools[$tool].act_job_map' <<< "$document") || return 4
     fi
-    config_normalize_additional_artifacts_json "$raw" "workspace_additional_artifacts for $toolname" "$act_jobs"
+    normalized=$(config_normalize_additional_artifacts_json "$raw" \
+        "workspace_additional_artifacts for $toolname" "$act_jobs") || return 4
+    if jq -e 'any(.[][]; has("target_triple"))' <<< "$normalized" >/dev/null; then
+        mapping=$(_config_target_triples_json "$toolname") || return 4
+        config_resolve_additional_artifact_owners_json "$normalized" "$mapping" >/dev/null || return 4
+    fi
+    printf '%s\n' "$normalized"
+}
+
+config_get_additional_artifact_owners_json() {
+    local normalized mapping
+    normalized=$(config_get_additional_artifacts_json "$1") || return 4
+    mapping=$(_config_target_triples_json "$1") || return 4
+    config_resolve_additional_artifact_owners_json "$normalized" "$mapping"
 }
 
 # Exact release identities follow native task identities. A singleton retains

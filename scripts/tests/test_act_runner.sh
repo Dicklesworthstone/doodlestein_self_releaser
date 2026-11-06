@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_act_runner.sh - Unit tests for act_runner.sh module
 #
-# Usage: ./test_act_runner.sh [--workflow-isolation-only | --worker-admission-cancel-only | --typed-companions-only | --shared-matrix-only | --workflow-variants-only]
+# Usage: ./test_act_runner.sh [--workflow-isolation-only | --worker-admission-cancel-only | --typed-companions-only | --shared-matrix-only | --workflow-variants-only | --variant-companions-only]
 #
 # Tests act integration functions without actually running Docker
 
@@ -1567,7 +1567,7 @@ def shared_matrix(config, workflow="matrix.yml"):
                                    env_file=str(root / "release env/build vars.env"),
                                    linux_arm64_flags=["--container-options '--label=release lane'"])
 
-def variant_companions():
+def variant_companions(bound=False):
     def variant_triple(arch, libc):
         return triples[arch].rsplit("-", 1)[0] + "-" + libc
 
@@ -1593,13 +1593,16 @@ def variant_companions():
         config["target_triples"] = {"linux/" + a: [variant_triple(a, libc) for libc in ("gnu", "musl")] for a in arches}
         config["artifact_naming"] = "${name}-${version}-${target_triple}"
         config["install_script_compat"] = "${name}-${target_triple}"
+        if bound:
+            for arch in arches:
+                config["workspace_additional_artifacts"]["linux/" + arch][1]["target_triple"] = variant_triple(arch, "musl")
 
     def variant_case(label, mode="valid", change=None):
         def changed(config):
             configure(config)
             if change:
                 change(config)
-        case = make_case("variants-" + label, change=changed)
+        case = make_case(("bound-variants-" if bound else "variants-") + label, change=changed)
         uploads = json.loads((case / "uploads.json").read_text())
         for arch in arches:
             members = []
@@ -1650,6 +1653,11 @@ def variant_companions():
             check(arch + ": shared JSON and final ZIP companions are collected once",
                   {Path(r["path"]).name for r in result["additional_artifacts"]} == {metadata(arch), runtime(arch)} and
                   len(result["additional_artifacts"]) == 2 and len(result["artifact_paths"]) == 6)
+            if bound:
+                check(arch + ": explicit runtime ownership is retained in the plan and immutable receipt",
+                      plan["outputs"][runtime(arch)].get("target_triple") == variant_triple(arch, "musl") and
+                      next(r for r in result["additional_artifacts"] if Path(r["path"]).name == runtime(arch)).get("target_triple") ==
+                      variant_triple(arch, "musl") and "target_triple" not in plan["outputs"][metadata(arch)])
             check(arch + ": complete variant inventories remain reusable", reusable(case, result))
     finally:
         for process in processes.values():
@@ -1661,7 +1669,7 @@ def variant_companions():
     records = json.loads(output.read_text())["artifacts"]
     expected = {variant_name(a, libc, alias): ("linux/" + a, variant_triple(a, libc), digest(fixtures / variant_name(a, libc)))
                 for a in arches for libc in ("gnu", "musl") for alias in (False, True)}
-    expected.update({name: ("linux/" + a, triples[a], digest(fixtures / name))
+    expected.update({name: ("linux/" + a, variant_triple(a, "musl") if bound and name == runtime(a) else triples[a], digest(fixtures / name))
                      for a in arches for name in (metadata(a), runtime(a))})
     check("manifest retains exact variant identity and digest for all primaries, aliases and platform companions",
           len(records) == len(expected) and
@@ -1681,6 +1689,20 @@ def variant_companions():
     save(case / "config/repos.d/typedact.yaml", changed)
     manifest(case, list(results.values()), "changed-variant-order", 4)
     save(case / "config/repos.d/typedact.yaml", original_config)
+    if bound:
+        changed = copy.deepcopy(original_config)
+        changed["workspace_additional_artifacts"]["linux/amd64"][1]["target_triple"] = triples["amd64"]
+        save(case / "config/repos.d/typedact.yaml", changed)
+        manifest(case, list(results.values()), "changed-companion-owner", 4)
+        save(case / "config/repos.d/typedact.yaml", original_config)
+        for change in ("wrong", "missing"):
+            forged = copy.deepcopy(results["amd64"])
+            row = next(r for r in forged["additional_artifacts"] if Path(r["path"]).name == runtime("amd64"))
+            if change == "wrong":
+                row["target_triple"] = triples["amd64"]
+            else:
+                del row["target_triple"]
+            manifest(case, [forged], change + "-companion-receipt-owner", 4)
     forged = copy.deepcopy(results["amd64"])
     forged["workflow_payload_plan"]["outputs"][variant_name("amd64", "musl")]["target_triple"] = triples["amd64"]
     manifest(case, [forged], "forged-variant-binding", 4)
@@ -1805,10 +1827,26 @@ cmd_build typedact --version v1.0.0 --target linux/amd64 --no-sync --output-dir 
         status, result = finish(rejected, "amd64", launch(rejected))
         check(label + ": invalid variant ownership refuses before any act subprocess",
               status == 4 and not (rejected / "requests.jsonl").exists() and not result.get("resume_artifacts"))
+    if bound:
+        missing = variant_case("missing-owned-runtime")
+        uploads = json.loads((missing / "uploads.json").read_text())
+        for wrapper in uploads["amd64"]:
+            wrapper["members"] = [r for r in wrapper["members"] if Path(r["name"]).name != runtime("amd64")]
+        save(missing / "uploads.json", uploads)
+        status, result = finish(missing, "amd64", launch(missing))
+        check("a missing explicitly owned runtime cannot be replaced by the complete GNU and musl primaries",
+              status != 0 and result.get("status") != "success")
+        unknown = variant_case("unknown-companion-owner", change=lambda c:
+            c["workspace_additional_artifacts"]["linux/amd64"][1].update(target_triple="aarch64-unknown-linux-musl"))
+        status, result = finish(unknown, "amd64", launch(unknown))
+        check("an unconfigured companion compiler refuses before workflow execution",
+              status == 4 and not (unknown / "requests.jsonl").exists())
 
 if sys.argv[2] in ("all", "variants"):
     variant_companions()
-if sys.argv[2] == "variants":
+if sys.argv[2] in ("all", "variant-companions"):
+    variant_companions(True)
+if sys.argv[2] in ("variants", "variant-companions"):
     save(root / "summary.json", dict(checks=checks, failures=failures))
     print("Typed workflow variants: %d checks, %d failures" % (checks, len(failures)), flush=True)
     sys.exit(bool(failures))
@@ -3183,6 +3221,11 @@ main() {
     fi
     if [[ "${1:-}" == "--workflow-variants-only" ]]; then
         test_typed_workflow_companions variants
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return
+    fi
+    if [[ "${1:-}" == "--variant-companions-only" ]]; then
+        test_typed_workflow_companions variant-companions
         [[ "$FAIL_COUNT" -eq 0 ]]
         return
     fi

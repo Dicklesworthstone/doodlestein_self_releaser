@@ -1159,6 +1159,43 @@ test_literal_companion_conflicting_abi_words_keep_primary_variant() {
             .target_triple == "x86_64-unknown-linux-musl")' "$CASE/stdout" >/dev/null
 }
 
+test_literal_companion_explicit_secondary_variant_is_published() {
+    setup literal_companion_explicit_secondary
+    literal_companion_fixture runtime-gnu.zip \
+        '["x86_64-unknown-linux-gnu","x86_64-unknown-linux-musl"]' || return 1
+    # Publication uses the configured selector, never the misleading literal
+    # basename. Byte/format admission belongs to the producer fixture; this
+    # command test exercises real ownership and upload-name planning.
+    jq '(.workspace_additional_artifacts["linux/amd64"][0]).target_triple="x86_64-unknown-linux-musl"' \
+        "$ACT_REPOS_DIR/tool.yaml" > "$CASE/config.next" &&
+        mv "$CASE/config.next" "$ACT_REPOS_DIR/tool.yaml" || return 1
+    jq '(.artifacts[] | select(.name == "runtime-gnu.zip")).target_triple="x86_64-unknown-linux-musl"' \
+        "$CASE/artifacts/tool-v1.2.3-manifest.json" > "$CASE/manifest.next" &&
+        mv "$CASE/manifest.next" "$CASE/artifacts/tool-v1.2.3-manifest.json" || return 1
+    literal_companion_run_plan || return 1
+    [[ $STATUS -eq 0 && "$(planned_names runtime-gnu.zip)" == '["runtime-gnu.zip"]' ]] &&
+        jq -e 'any(.details.plan.artifacts[]; .name == "runtime-gnu.zip" and
+            .target == "linux/amd64" and .target_triple == "x86_64-unknown-linux-musl")' \
+            "$CASE/stdout" >/dev/null
+}
+
+test_literal_companion_explicit_variant_drift_is_rejected() {
+    local observed
+    for observed in x86_64-unknown-linux-gnu absent; do
+        setup "literal_companion_explicit_drift_$observed"
+        literal_companion_fixture runtime.json '["x86_64-unknown-linux-musl"]' || return 1
+        jq '(.workspace_additional_artifacts["linux/amd64"][0]).target_triple="x86_64-unknown-linux-musl"' \
+            "$ACT_REPOS_DIR/tool.yaml" > "$CASE/config.next" &&
+            mv "$CASE/config.next" "$ACT_REPOS_DIR/tool.yaml" || return 1
+        jq --arg observed "$observed" '(.artifacts[] | select(.name == "runtime.json")) |=
+            (if $observed == "absent" then del(.target_triple) else .target_triple=$observed end)' \
+            "$CASE/artifacts/tool-v1.2.3-manifest.json" > "$CASE/manifest.next" &&
+            mv "$CASE/manifest.next" "$CASE/artifacts/tool-v1.2.3-manifest.json" || return 1
+        literal_companion_run_plan || return 1
+        [[ $STATUS -eq 4 ]] && grep -q 'target_triple' "$CASE/stderr" || return 1
+    done
+}
+
 test_literal_companion_go_singleton_needs_no_triple() {
     setup literal_companion_go
     literal_companion_fixture abi-gnu-vs-musl.json '[]' || return 1
@@ -2707,6 +2744,7 @@ for test in test_release_keeps_artifacts_during_publication \
     test_shared_variant_names_upload_without_collision \
     test_literal_companion_unknown_abi_word_keeps_owner \
     test_literal_companion_conflicting_abi_words_keep_primary_variant \
+    test_literal_companion_explicit_secondary_variant_is_published test_literal_companion_explicit_variant_drift_is_rejected \
     test_literal_companion_go_singleton_needs_no_triple test_literal_companion_archive_never_derives_primary_aliases \
     test_literal_companion_wrong_platform_is_rejected test_literal_companion_nonprimary_configured_variant_is_rejected \
     test_literal_companion_unconfigured_variant_is_rejected test_literal_companion_multivariant_missing_triple_is_rejected \

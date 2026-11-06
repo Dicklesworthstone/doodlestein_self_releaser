@@ -373,7 +373,7 @@ _act_workspace_archive_files_json() {
 
 _act_workspace_additional_artifacts_json() {
     local config_file="$1"
-    local target="${2:-}" raw normalized module_dir act_jobs
+    local target="${2:-}" with_owners="${3:-false}" raw normalized module_dir act_jobs mapping owners
     [[ -f "$config_file" && ! -L "$config_file" ]] || return 4
     command -v yq &>/dev/null || return 3
     if ! declare -F config_normalize_additional_artifacts_json &>/dev/null; then
@@ -383,9 +383,18 @@ _act_workspace_additional_artifacts_json() {
     fi
     raw=$(DSR_TARGET_PLATFORM="$target" _config_read_single_mapping_json "$config_file") || return 4
     act_jobs=$(jq -c '.act_job_map' <<< "$raw") || return 4
+    mapping=$(jq -c '.target_triples' <<< "$raw") || return 4
     raw=$(jq -c '.workspace_additional_artifacts' <<< "$raw") || return 4
     normalized=$(config_normalize_additional_artifacts_json "$raw" \
         "workspace_additional_artifacts in $config_file" "$act_jobs") || return 4
+    if [[ "$with_owners" == true ]] || jq -e 'any(.[][]; has("target_triple"))' <<< "$normalized" >/dev/null; then
+        if [[ "$mapping" == null ]]; then
+            local config_tool="${config_file##*/}"
+            mapping=$(_config_target_triples_json "${config_tool%.yaml}") || return 4
+        fi
+        owners=$(config_resolve_additional_artifact_owners_json "$normalized" "$mapping") || return 4
+        [[ "$with_owners" != true ]] || normalized="$owners"
+    fi
     if [[ -z "$target" ]]; then
         printf '%s\n' "$normalized"
     else
@@ -579,7 +588,7 @@ _act_workflow_payload_plans_json() {
     local configured document enabled module_dir target job owners triples triple format names binaries binary repo_path
     local family families configured_format outputs plan plans='{}' primary_owners='[]' all_names='{}'
     local owner flags arguments_sha256 workflow matrix_plan matrix_plans='{}' argument_plans='{}'
-    configured=$(_act_workspace_additional_artifacts_json "$config_file") || return 4
+    configured=$(_act_workspace_additional_artifacts_json "$config_file" "" true) || return 4
     document=$(_config_read_single_mapping_json "$config_file") || return 4
     enabled=$(jq -c --argjson configured "$configured" '
         . as $doc | [$configured | to_entries[] | select(.value | length > 0) |
@@ -701,7 +710,9 @@ _act_workflow_payload_plans_json() {
                               target_triple:$family.target_triple}}] | from_entries) as $primaries |
             $primaries + ($primaries | to_entries | map({key:(.key + ".sha256"),
                 value:{role:"checksum",format:"file",required:false,target_triple:.value.target_triple}}) | from_entries) +
-            ($companions | map({key:.name,value:{role:"additional",format:.format,required:true}}) | from_entries)
+            ($companions | map({key:.name,value:({role:"additional",format:.format,required:true,
+                owner_target_triple:.owner_target_triple} +
+                (if has("target_triple") then {target_triple:.target_triple} else {} end))}) | from_entries)
         ') || return 4
         flags=$(jq -c --arg target "$target" '.[$target]' <<< "$argument_plans") || return 4
         arguments_sha256=$(_act_sha256 /dev/stdin <<< "$flags") || return 4
@@ -778,6 +789,9 @@ _act_validate_workflow_payload_result() {
         sha=$(jq -r '.sha256' <<< "$row"); size=$(jq -r '.size_bytes' <<< "$row"); identity=$(jq -r '.identity' <<< "$row")
         _act_validate_additional_artifact "$path" "$(jq -r '.target' <<< "$plan")" "$format" "$sha" "$size" "$identity" || return 4
         if [[ "$role" == additional ]]; then
+            row=$(jq -c --arg name "$name" --argjson plan "$plan" '
+                . + ($plan.outputs[$name] | if has("target_triple")
+                    then {target_triple:.target_triple} else {} end)' <<< "$row") || return 4
             additional=$(jq -c --argjson row "$row" '. + [$row]' <<< "$additional") || return 4
         else
             paths=$(jq -c --arg path "$path" '. + [$path]' <<< "$paths") || return 4
@@ -887,6 +901,9 @@ _act_materialize_workflow_payloads() {
             [[ "$format" != binary ]] || mode=700
             receipt=$(_act_collect_stream_exclusive "$payload/$name" "$mode" _act_stream_local_file "$path") || return 4
             if [[ "$role" == additional ]]; then
+                receipt=$(jq -c --arg name "$name" --argjson plan "$plan" '
+                    . + ($plan.outputs[$name] | if has("target_triple")
+                        then {target_triple:.target_triple} else {} end)' <<< "$receipt") || return 4
                 additional=$(jq -c --argjson receipt "$receipt" '. + [$receipt]' <<< "$additional") || return 4
             else
                 paths=$(jq -c --arg path "$payload/$name" '. + [$path]' <<< "$paths") || return 4
@@ -908,11 +925,11 @@ _act_materialize_workflow_payloads() {
 
 # Reconstruct additional-artifact ownership from trusted configuration before
 # manifest admission. This also refuses missing, extra or repeated receipts and
-# prevents later variants from taking ownership of platform-level companions.
+# binds each declared companion to its configured compiler or first producer.
 # Return a path-keyed map with trusted names/formats and the verified receipts.
 _act_additional_artifact_receipts_json() {
     local tool="$1" result_json="$2" configured target_json target triple specs
-    local receipts names expected triples row name path format sha size identity complete primary_paths
+    local receipts names expected row name path format sha size identity complete primary_paths binding
     local verified='{}' workflow_plans workflow_plan
     jq -e '.targets | type == "array" and all(.[]; type == "object")' \
         <<< "$result_json" >/dev/null || return 4
@@ -920,7 +937,7 @@ _act_additional_artifact_receipts_json() {
         if ((.artifact_paths // []) | length) > 0 then .artifact_paths[]
         else (.artifact_path // "" | split(",")[]) end | select(length > 0)]' \
         <<< "$result_json") || return 4
-    configured=$(_act_workspace_additional_artifacts_json "$ACT_REPOS_DIR/$tool.yaml") || return 4
+    configured=$(_act_workspace_additional_artifacts_json "$ACT_REPOS_DIR/$tool.yaml" "" true) || return 4
     workflow_plans=$(_act_workflow_payload_plans_json "$tool" "$(jq -r '.version // ""' <<< "$result_json")") || return 4
     while IFS= read -r target_json; do
         target=$(jq -er '.platform // .target | strings' <<< "$target_json") || return 4
@@ -928,10 +945,8 @@ _act_additional_artifact_receipts_json() {
         triple=$(jq -r '.target_triple // ""' <<< "$target_json") || return 4
         if [[ "$(jq -r '.method // ""' <<< "$target_json")" != act && -n "$triple" ]] &&
            [[ "$(jq 'length' <<< "$specs")" -gt 0 ]]; then
-            triples=$(config_get_target_triples_json "$tool" "$target") || return 4
-            if [[ "$triple" != "$(jq -r '.[0] // ""' <<< "$triples")" ]]; then
-                specs='[]'
-            fi
+            specs=$(jq -c --arg triple "$triple" \
+                'map(select(.owner_target_triple == "" or .owner_target_triple == $triple))' <<< "$specs") || return 4
         fi
         receipts=$(jq -ce '(if has("additional_artifacts") then .additional_artifacts else [] end) |
             if type == "array" and all(.[];
@@ -966,7 +981,15 @@ _act_additional_artifact_receipts_json() {
                 _log_error "Additional artifact is also claimed as a primary payload: $path"
                 return 4
             fi
-            format=$(jq -er --arg name "$name" '.[] | select(.name == $name) | .format' <<< "$specs") || return 4
+            binding=$(jq -ce --arg name "$name" '.[] | select(.name == $name)' <<< "$specs") || return 4
+            if ! jq -en --argjson binding "$binding" --argjson receipt "$row" '
+                ($binding | has("target_triple")) == ($receipt | has("target_triple")) and
+                $binding.target_triple == $receipt.target_triple
+            ' >/dev/null; then
+                _log_error "Additional artifact receipt has a different compiler owner: $name"
+                return 4
+            fi
+            format=$(jq -er '.format' <<< "$binding") || return 4
             sha=$(jq -r '.sha256' <<< "$row") || return 4
             size=$(jq -r '.size_bytes' <<< "$row") || return 4
             identity=$(jq -r '.identity' <<< "$row") || return 4
@@ -976,8 +999,9 @@ _act_additional_artifact_receipts_json() {
                 return 4
             fi
             verified=$(jq -c --arg path "$path" --arg name "$name" --arg format "$format" \
-                --arg target "$target" --argjson receipt "$row" \
-                '. + {($path): ($receipt + {name:$name, declared_format:$format, target:$target})}' \
+                --arg target "$target" --argjson receipt "$row" --argjson binding "$binding" \
+                '. + {($path): ($receipt + {name:$name, declared_format:$format, target:$target,
+                    owner_target_triple:$binding.owner_target_triple})}' \
                 <<< "$verified") || return 4
         done < <(jq -c '.[]' <<< "$receipts")
     done < <(jq -c '.targets[]' <<< "$result_json")
@@ -11440,7 +11464,7 @@ act_run_native_build() {
     # Validate every configured additional-artifact declaration before source
     # staging or compiler invocation, even when only one platform was selected.
     local additional_json
-    if ! additional_json=$(_act_workspace_additional_artifacts_json "$config_file" "$platform"); then
+    if ! additional_json=$(_act_workspace_additional_artifacts_json "$config_file" "$platform" true); then
         jq -nc --arg platform "$platform" \
             '{platform:$platform, status:"error", exit_code:4,
               error:"Invalid workspace_additional_artifacts configuration; see the rejected declaration above"}'
@@ -13227,13 +13251,8 @@ EOF
         local additional_receipt additional_format additional_mode
         local additional_sha additional_size additional_identity
         if [[ -n "$selected_triple" ]]; then
-            local additional_owner_triples
-            additional_owner_triples=$(act_get_configured_target_triples "$tool_name" "$platform") || return 4
-            # Platform-level companions have one producer. Additional assets
-            # from later variants cannot duplicate or replace its receipt.
-            if [[ "$selected_triple" != "${additional_owner_triples%%$'\n'*}" ]]; then
-                additional_json='[]'
-            fi
+            additional_json=$(jq -c --arg triple "$selected_triple" \
+                'map(select(.owner_target_triple == $triple))' <<< "$additional_json") || return 4
         fi
         while IFS= read -r additional_spec; do
             additional_name=$(jq -r '.name' <<< "$additional_spec") || return 4
@@ -13311,6 +13330,9 @@ EOF
                 download_failed=true
                 continue
             fi
+            additional_receipt=$(jq -c --argjson spec "$additional_spec" '
+                . + ($spec | if has("target_triple") then {target_triple:.target_triple} else {} end)
+            ' <<< "$additional_receipt") || return 4
             additional_artifact_receipts+=("$additional_receipt")
         done < <(jq -c '.[]' <<< "$additional_json")
 
@@ -16114,7 +16136,14 @@ _act_native_result_target_triple() {
 # The optional artifact array checks the inventory after file collection.
 _act_validate_native_matrix_result_inventory() {
     local tool="$1" result="$2" artifacts="${3:-null}"
-    local platforms platform configured rows requested complete=false matrix=false
+    local platforms platform configured rows requested companion_names complete=false matrix=false
+    if [[ "$artifacts" != null ]]; then
+        companion_names=$(config_get_additional_artifacts_json "$tool") || return 4
+        artifacts=$(jq -c --argjson companions "$companion_names" '
+            [$companions[][] | .name] as $names |
+            map(select(.name as $name | ($names | index($name)) == null))
+        ' <<< "$artifacts") || return 4
+    fi
     [[ "$(jq -r '.status // ""' <<< "$result")" == success ]] && complete=true
     platforms=$(jq -r '
         [(.targets // [])[] | select(.method == "native") | .platform] +
@@ -16172,7 +16201,12 @@ _act_validate_native_matrix_result_inventory() {
 # before any remote release mutation. These projected rows describe declared
 # receipts only; they do not manufacture new execution or artifact evidence.
 _act_validate_native_manifest_inventory() {
-    local tool="$1" manifest="$2" inventory artifacts native_rows row
+    local tool="$1" manifest="$2" inventory artifacts native_rows row companion_names
+    companion_names=$(config_get_additional_artifacts_json "$tool") || return 4
+    manifest=$(jq -c --argjson companions "$companion_names" '
+        [$companions[][] | .name] as $names |
+        .artifacts |= map(select(.name as $name | ($names | index($name)) == null))
+    ' <<< "$manifest") || return 4
     if jq -e '.build_environments == null and .requested_targets == null' \
         <<< "$manifest" >/dev/null; then
         # Legacy native manifests can still declare their artifact variants.
@@ -16246,7 +16280,7 @@ _act_validate_contract_variant_inventory() {
     if ! jq -e 'any(.[]; .require_triple == true)' <<< "$identities" >/dev/null; then
         return 0
     fi
-    if ! jq -e --argjson identities "$identities" '
+    if ! jq -e --argjson identities "$identities" --argjson contract "$contract" '
         . as $manifest |
         ($manifest.build_environments // null) as $environments |
         ($manifest.artifacts // []) as $artifacts |
@@ -16259,7 +16293,8 @@ _act_validate_contract_variant_inventory() {
             [$environments[] | select(.target == $wanted.platform and
                 .target_triple == $wanted.target_triple)] as $matches |
             [$artifacts[] | select(.target == $wanted.platform and
-                .target_triple == $wanted.target_triple)] as $primaries |
+                .target_triple == $wanted.target_triple and
+                .name == $contract.exact_primary_assets[$wanted.key])] as $primaries |
             ($matches | length) == 1 and ($primaries | length) == 1 and
             ($matches[0] | .method == "native" and
                 (.host | type == "string" and length > 0) and
@@ -16275,6 +16310,55 @@ _act_validate_contract_variant_inventory() {
         return 4
     fi
     _act_validate_native_manifest_inventory "$tool" "$manifest"
+}
+
+# Primary and additional are contract roles, not platform labels: an explicitly
+# variant-owned companion is still additional release content. Resolve this
+# closed inventory once for both manifest generation and publication preflight.
+_act_contract_asset_bindings_json() {
+    local tool="$1" contract="$2" identities="$3" companions
+    companions=$(config_get_additional_artifact_owners_json "$tool") || return 4
+    jq -cen --argjson contract "$contract" --argjson identities "$identities" \
+        --argjson companions "$companions" '
+        [$identities[] | . as $identity |
+            {name:$contract.exact_primary_assets[.key], target:.platform, role:"primary",
+             require_triple:.require_triple, target_triple:.target_triple}] +
+        [($contract.exact_additional_assets // [])[] |
+            select((endswith(".sha256") or endswith(".minisig") or
+                . == "SHA256SUMS" or . == "SHA256SUMS.txt" or . == "checksums.txt") | not) |
+            . as $name |
+            [$companions | to_entries[] | .key as $platform | .value[] |
+                select(.name == $name and has("target_triple")) |
+                {target:$platform,target_triple:.target_triple,require_triple:true,
+                 archive_format:(if .format == "zip" or .format == "tar.gz" or .format == "tar.xz"
+                    then .format else "binary" end)}] as $owners |
+            if ($owners | length) > 1 then error("multiple configured companion owners")
+            else {name:$name,role:"additional"} +
+                ($owners[0] // {target:"additional",require_triple:false}) end] |
+        if any(.[]; (.name | type) != "string") or (map(.name) | length != (unique | length))
+        then error("invalid exact release inventory") else . end
+    '
+}
+
+_act_validate_contract_asset_bindings() {
+    local tool="$1" manifest="$2" contract="$3" identities="$4" bindings
+    bindings=$(_act_contract_asset_bindings_json "$tool" "$contract" "$identities") || return 4
+    if ! jq -e --argjson bindings "$bindings" '
+        .artifacts as $actual |
+        ($actual | type == "array" and length == ($bindings | length)) and
+        ([$actual[].name] | sort) == ($bindings | map(.name) | sort) and
+        all($bindings[]; . as $wanted |
+            [$actual[] | select(.name == $wanted.name)] as $matches |
+            ($matches | length) == 1 and $matches[0].target == $wanted.target and
+            (if $wanted.target == "additional" then ($matches[0] | has("target_triple") | not)
+             elif $wanted.require_triple then $matches[0].target_triple == $wanted.target_triple
+             else true end) and
+            (if $wanted | has("archive_format")
+             then $matches[0].archive_format == $wanted.archive_format else true end))
+    ' <<< "$manifest" >/dev/null 2>&1; then
+        _log_error "Manifest asset names or compiler owners differ from the exact release contract"
+        return 4
+    fi
 }
 
 # Flat release directories cannot retain two native payloads named `tool`.
@@ -16609,7 +16693,7 @@ _act_generate_contract_manifest() {
 
     local additional_name additional_matches additional_receipt additional_path
     local additional_sha additional_size additional_identity_before additional_identity_after
-    local additional_format additional_json
+    local additional_format additional_json additional_binding
     while IFS= read -r additional_name; do
         [[ -n "$additional_name" ]] || continue
         _act_is_safe_basename "$additional_name" || return 4
@@ -16637,6 +16721,7 @@ _act_generate_contract_manifest() {
             _log_error "Additional artifact has no configured and validated producer: $additional_name"
             return 4
         fi
+        additional_binding=$(jq -c --arg path "$additional_path" '.[$path]' <<< "$verified_additional") || return 4
         [[ -f "$additional_path" && ! -L "$additional_path" &&
            "$(basename "$additional_path")" == "$additional_name" ]] || return 4
         additional_sha=$(jq -r '.sha256' <<< "$additional_receipt") || return 4
@@ -16659,18 +16744,25 @@ _act_generate_contract_manifest() {
            "$(_act_file_size "$additional_path")" == "$additional_size" ]] || return 4
         additional_format=$(_act_archive_format "$additional_name")
         [[ "$additional_format" != "none" ]] || additional_format="binary"
+        if jq -e 'has("target_triple")' <<< "$additional_binding" >/dev/null; then
+            additional_format=$(jq -r 'if .declared_format == "zip" or
+                .declared_format == "tar.gz" or .declared_format == "tar.xz"
+                then .declared_format else "binary" end' <<< "$additional_binding") || return 4
+        fi
         additional_json=$(jq -nc \
             --arg name "$additional_name" --arg sha "$additional_sha" \
-            --argjson size "$additional_size" --arg format "$additional_format" '
+            --argjson size "$additional_size" --arg format "$additional_format" \
+            --argjson binding "$additional_binding" '
             {
                 name: $name,
-                target: "additional",
                 sha256: $sha,
                 size_bytes: $size,
                 archive_format: $format,
                 signed: false,
                 signature_file: ""
-            }
+            } + (if $binding | has("target_triple")
+                 then {target:$binding.target,target_triple:$binding.target_triple}
+                 else {target:"additional"} end)
         ') || return 4
         artifacts+=("$additional_json")
     done < <(jq -r '.[]' <<< "$base_additional_json")
@@ -16729,20 +16821,7 @@ _act_generate_contract_manifest() {
         return 4
     fi
 
-    if ! jq -e --argjson contract "$contract_json" --argjson identities "$contract_targets_json" \
-        --argjson base_additional "$base_additional_json" '
-        (.artifacts | length) ==
-            (($contract.exact_primary_assets | length) + ($base_additional | length)) and
-        ([.artifacts[] | select(.target != "additional") | . as $artifact |
-          $identities[] | select(.platform == $artifact.target and
-            ((.require_triple | not) or .target_triple == $artifact.target_triple)) |
-          {key: .key, value: $artifact.name}] | from_entries) ==
-            $contract.exact_primary_assets and
-        ([.artifacts[] | select(.target == "additional") | .name] | sort) ==
-            $base_additional and
-        ([.artifacts[].name] | length) ==
-            ([.artifacts[].name] | unique | length)
-    ' <<< "$manifest" >/dev/null 2>&1; then
+    if ! _act_validate_contract_asset_bindings "$tool" "$manifest" "$contract_json" "$contract_targets_json"; then
         _log_error "Final manifest does not match the release contract"
         return 4
     fi
@@ -17047,6 +17126,11 @@ act_generate_manifest() {
                 _log_error "Additional artifact changed after format validation: $file"
                 return 4
             fi
+            if jq -e 'has("target_triple")' <<< "$additional_receipt" >/dev/null; then
+                format=$(jq -r 'if .declared_format == "zip" or
+                    .declared_format == "tar.gz" or .declared_format == "tar.xz"
+                    then .declared_format else "none" end' <<< "$additional_receipt") || return 4
+            fi
         fi
         if [[ -n "${seen_names[$name]:-}" ]]; then
             if $literal_additional || jq -e --arg name "$name" \
@@ -17077,13 +17161,19 @@ act_generate_manifest() {
             target="$inferred_target"
         fi
         local target_triple
-        if [[ "$native_result" == true && -n "$declared_triple" ]]; then
+        if $literal_additional; then
+            target_triple=$(jq -r '.owner_target_triple' <<< "$additional_receipt") || return 4
+            if [[ -n "$target_triple" && "$native_result" == true && -n "$declared_triple" &&
+                  "$target_triple" != "$declared_triple" ]]; then
+                _log_error "Additional artifact compiler owner differs from its native producer: $name"
+                return 4
+            fi
+            [[ -n "$target_triple" ]] || target_triple=$(_act_manifest_target_triple "$target" "") || return 4
+        elif [[ "$native_result" == true && -n "$declared_triple" ]]; then
             target_triple="$declared_triple"
         elif $authoritative_workflow; then
             target_triple=$(jq -er --arg path "$file" '.[$path].target_triple | strings | select(length > 0)' \
                 <<< "$verified_workflow_files") || return 4
-        elif $literal_additional; then
-            target_triple=$(_act_manifest_target_triple "$target" "") || return 4
         else
             target_triple=$(_act_manifest_target_triple "$target" "$name") || return 4
         fi

@@ -248,6 +248,36 @@ reconstructs the complete plan, so changed variants, names, ordering or file
 identities invalidate retained evidence. Strict multi-variant release contracts
 continue to require their existing native compiler and source receipts.
 
+Companions that differ by compiler variant can declare an exact selector in
+the same array:
+
+```yaml
+workspace_additional_artifacts:
+  linux/amd64:
+    - {name: linux-metadata.json, format: json}
+    - {name: runtime-gnu.zip, format: zip, target_triple: x86_64-unknown-linux-gnu}
+    - {name: runtime-musl.zip, format: zip, target_triple: x86_64-unknown-linux-musl}
+```
+
+Each explicit `target_triple` must appear in that platform's configured
+`target_triples`. Null, empty, unknown and foreign-platform selectors fail
+before the producer starts. Names remain globally unique, including across
+variants. Native tasks collect only their own declared files; untyped files
+keep their first-variant producer. A workflow's selected cell must upload all
+declared companions alongside every primary. The configured selector, literal
+name, declared format, digest, size and file identity stay bound through
+collection and manifest admission. A filename containing `gnu` or `musl`
+cannot override the declaration.
+
+For strict releases, list both runtime names in `exact_additional_assets` as
+usual. Explicitly selected companions retain the physical platform and
+`target_triple` in the manifest and upload plan. Untyped strict companions keep
+`target: "additional"` without a compiler identity. Primary coverage is checked
+against `exact_primary_assets`; an extra runtime file cannot satisfy a missing
+primary. Signed installer recipes can select the matching runtime archive in
+their `files` list, and the existing installer rejects a runtime owned by a
+different compiler variant.
+
 Peers that have no additional artifacts receive the same matrix and argument
 binding with a primary-only payload plan. Selecting such a peer alone retains
 the shared job's ownership checks and rejects undeclared uploads.

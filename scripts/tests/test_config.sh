@@ -1552,6 +1552,72 @@ YAML
   ! config_get_additional_artifacts_json contract-tool >/dev/null 2>&1
 }
 
+test_additional_artifact_variant_ownership() {
+  release_contract_test_deps_available || return 1
+  config_init >/dev/null
+  write_contract_tool_config <<'YAML'
+targets: [linux/amd64]
+target_triples:
+  linux/amd64: [x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl]
+workspace_additional_artifacts:
+  linux/amd64:
+    - {name: notes.json, format: json}
+    - {name: runtime.zip, format: zip, target_triple: x86_64-unknown-linux-musl}
+YAML
+  local normalized owners
+  normalized=$(config_get_additional_artifacts_json contract-tool) || return 1
+  jq -e '.["linux/amd64"] == [
+      {name:"notes.json",format:"json"},
+      {name:"runtime.zip",format:"zip",target_triple:"x86_64-unknown-linux-musl"}]' \
+      <<< "$normalized" >/dev/null || return 1
+  owners=$(config_resolve_additional_artifact_owners_json \
+      "$normalized" '{"linux/amd64":["x86_64-unknown-linux-gnu","x86_64-unknown-linux-musl"]}') || return 1
+  jq -e '.["linux/amd64"] | .[0].owner_target_triple == "x86_64-unknown-linux-gnu" and
+      (.[0] | has("target_triple") | not) and
+      .[1].owner_target_triple == "x86_64-unknown-linux-musl" and
+      .[1].target_triple == "x86_64-unknown-linux-musl"' <<< "$owners" >/dev/null || return 1
+  owners=$(config_resolve_additional_artifact_owners_json \
+      "$normalized" '{"linux/amd64":["x86_64-unknown-linux-musl","x86_64-unknown-linux-gnu"]}') || return 1
+  jq -e 'all(.["linux/amd64"][]; .owner_target_triple == "x86_64-unknown-linux-musl")' \
+      <<< "$owners" >/dev/null
+}
+
+test_additional_artifact_variant_rejects_unconfigured_selectors() {
+  release_contract_test_deps_available || return 1
+  config_init >/dev/null
+  local selector status
+  for selector in null false '""' '"unknown-linux-musl"' '"aarch64-unknown-linux-musl"' \
+      '["x86_64-unknown-linux-musl"]' '"x86_64-unknown-linux-musl\n"'; do
+    write_contract_tool_config <<YAML
+targets: [linux/amd64]
+target_triples:
+  linux/amd64: [x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl]
+workspace_additional_artifacts:
+  linux/amd64:
+    - {name: runtime.zip, format: zip, target_triple: $selector}
+YAML
+    status=0
+    config_get_additional_artifacts_json contract-tool > "$TEMP_DIR/output" 2> "$TEMP_DIR/error" || status=$?
+    [[ "$status" == 4 && ! -s "$TEMP_DIR/output" ]] || return 1
+  done
+  write_contract_tool_config <<'YAML'
+targets: [linux/amd64]
+workspace_additional_artifacts:
+  linux/amd64:
+    - {name: runtime.zip, format: zip, target_triple: x86_64-unknown-linux-musl}
+YAML
+  ! config_get_additional_artifacts_json contract-tool >/dev/null 2>&1 || return 1
+  write_contract_tool_config <<'YAML'
+targets: [linux/amd64]
+target_triples: {linux/amd64: [x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl]}
+workspace_additional_artifacts:
+  linux/amd64:
+    - {name: Runtime.zip, format: zip, target_triple: x86_64-unknown-linux-gnu}
+    - {name: runtime.zip, format: zip, target_triple: x86_64-unknown-linux-musl}
+YAML
+  ! config_get_additional_artifacts_json contract-tool >/dev/null 2>&1
+}
+
 test_additional_artifact_configuration_accepts_native_and_act_producers() {
   release_contract_test_deps_available || return 0
   config_init >/dev/null
@@ -1837,6 +1903,8 @@ main() {
   run_test "additional_artifact_declarations_preserve_metadata_namespace" test_additional_artifact_declarations_preserve_metadata_namespace
   run_test "additional_artifact_registry_and_explicit_repo_precedence" test_additional_artifact_registry_and_explicit_repo_precedence
   run_test "additional_artifact_configuration_rejects_duplicate_yaml_keys" test_additional_artifact_configuration_rejects_duplicate_yaml_keys
+  run_test "additional_artifact_variant_ownership" test_additional_artifact_variant_ownership
+  run_test "additional_artifact_variant_rejects_unconfigured_selectors" test_additional_artifact_variant_rejects_unconfigured_selectors
   run_test "additional_artifact_configuration_accepts_native_and_act_producers" test_additional_artifact_configuration_accepts_native_and_act_producers
   run_test "additional_artifact_configuration_rejects_malformed_producer" test_additional_artifact_configuration_rejects_malformed_producer
   run_test "config_validate_checks_all_additional_artifact_declarations" test_config_validate_checks_all_additional_artifact_declarations
