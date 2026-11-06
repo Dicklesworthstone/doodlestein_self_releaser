@@ -214,8 +214,8 @@ The `details` field contains command-specific data:
     "tag": "v1.2.3",
     "release_url": "https://github.com/owner/ntm/releases/tag/v1.2.3",
     "draft": true,
-    "create_response": "/private/scratch/dsr-create-custody.ABCDEF12/dsr-api-response.GHIJKLMN",
-    "finalization_tmpdir": "/private/scratch/dsr-create-custody.ABCDEF12",
+    "create_response": "/private/state/dsr/releases/dsr-create-custody.ABCDEF12/dsr-api-response.GHIJKLMN",
+    "finalization_tmpdir": "/private/state/dsr/releases/dsr-create-custody.ABCDEF12",
     "artifacts_dir": "/srv/releases/ntm-v1.2.3",
     "assets_uploaded": [
       {
@@ -230,7 +230,14 @@ The `details` field contains command-specific data:
 }
 ```
 
-Strict draft creation preserves the original successful POST response. Pass
+Strict draft creation preserves the original successful POST response and its
+frozen signed asset plan in an owner-only child of `$DSR_STATE_DIR/releases`.
+This custody does not depend on the caller's temporary directory surviving a
+reboot or cleanup. A missing state parent is created privately; a linked,
+foreign-owned, or group/world-writable release-state directory is refused before
+POST. Allocation failure never falls back to temporary storage. Strict fallback
+keeps its existing private child beneath the build-bound publication handoff.
+Pass
 `details.create_response` to `dsr release finalize` and set `TMPDIR` to
 `details.finalization_tmpdir`. Pass `--artifacts` with `details.artifacts_dir`
 when the producer used a custom output directory. Finalization resolves that

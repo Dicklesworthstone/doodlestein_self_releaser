@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Real Git, private descriptors, signed local plans and signed remote-byte
-# verification. Only GitHub's HTTP/download boundary uses isolated fixtures.
+# verification. GitHub credentials and HTTP/download delivery use isolated fixtures.
 set -euo pipefail
 ROOT="${DSR_TEST_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)}"
 python3 - "$ROOT" <<'PY'
@@ -156,6 +156,7 @@ gh_download_release_asset() { test ! -e "$3" && cp "$CASE/bytes/$2" "$3"; }
 mktemp() {
     if [[ "${FAIL_PENDING:-false}" == true && "$*" == *finalization-pending* ]]; then return 1; fi
     if [[ "${FAIL_FINAL:-false}" == true && "$*" == *-finalized.* ]]; then return 1; fi
+    if [[ "${FAIL_CREATION_CUSTODY:-false}" == true && "$*" == *dsr-create-custody.* ]]; then return 1; fi
     command mktemp "$@"
 }
 DRY_RUN=false
@@ -168,6 +169,10 @@ if [[ "$1" == create || "$1" == fallback ]]; then
     source "$ROOT/src/github.sh"
     gh_check() { return 0; }
     gh_check_token() { return 0; }
+    # The real adapter now authenticates inside each timed request attempt.
+    # Route that credential boundary to the same explicit HTTP fixture; never
+    # depend on a developer's logged-in account to exercise draft creation.
+    _gh_check_cli_auth() { return 0; }
     gh_download_release_asset() { test ! -e "$3" && cp "$CASE/bytes/$2" "$3"; }
     _gh_api_with_gh() {
         case "$2" in
@@ -691,7 +696,8 @@ if os.environ.get('DSR_TEST_STRICT_FALLBACK_ONLY')=='1':
     print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
     raise SystemExit(0)
 
-test_strict_finalization_custody()
+if os.environ.get('DSR_TEST_STRICT_CREATION_ONLY')!='1':
+    test_strict_finalization_custody()
 if os.environ.get('DSR_TEST_STRICT_CUSTODY_ONLY')=='1':
     print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
     raise SystemExit(0)
@@ -699,6 +705,10 @@ if os.environ.get('DSR_TEST_STRICT_CUSTODY_ONLY')=='1':
 # Execute the complete producer-to-consumer handoff. The response's name,
 # bytes, permissions and directory come from production creation, not setup().
 c,env,_,_=setup('creation-handoff',{'absent':True})
+# Existing release state may be readable by other users; preserve that parent
+# while allocating the irreplaceable POST response in a new private child.
+(c/'state/releases').mkdir(mode=0o755)
+(c/'state/releases').chmod(0o755)
 r=subprocess.run(['bash','-c',script,'fixture','create'],env=env,capture_output=True,text=True)
 (c/'create.log').write_text(r.stdout+r.stderr)
 check('strict draft creation terminal0',r.returncode==0)
@@ -718,6 +728,10 @@ del wrong['assets_uploaded'][0]['download_url']
 check('asset schema still requires download URL',bool(list(validator.iter_errors(wrong))))
 response=Path(result['details']['create_response'])
 private=Path(result['details']['finalization_tmpdir'])
+check('direct creation custody survives independently of caller temporary storage',
+      private.parent==c/'state/releases' and
+      re.fullmatch(r'dsr-create-custody\.[A-Za-z0-9]{8}',private.name) is not None and
+      stat.S_IMODE(private.parent.stat().st_mode)==0o755)
 check('creation exposes original response in owner-only storage',response.parent==private and
       private.stat().st_mode & 0o777==0o700 and response.stat().st_mode & 0o777==0o600)
 raw=response.read_bytes();before=response.stat()
@@ -727,12 +741,53 @@ check('creation retains actual empty nonce-bound POST bytes',original['assets']=
       re.search(r'<!-- dsr-create-nonce:[0-9a-f]{64} -->$',original['body']) is not None)
 requests=[json.loads(line) for line in (c/'requests.jsonl').read_text().splitlines()]
 check('creation makes exactly one POST',sum('--post' in q for q in requests)==1)
+# Simulate loss of the original temporary namespace without deleting evidence.
+# The public response must still locate the exact original inode for a later
+# process; a copied response or a new remote GET cannot replace that authority.
+caller_temporary=Path(env['TMPDIR'])
+caller_temporary.rename(c/'retained-caller-temporary')
+check('caller temporary directory is gone while original creation custody remains',
+      not caller_temporary.exists() and response.read_bytes()==raw and response.stat().st_ino==before.st_ino)
 env['TMPDIR']=str(private)
 r,patches=invoke(c,env,response)
 check('captured creation response feeds unchanged finalizer',r.returncode==0)
 check('handoff retains original descriptor identity',response.read_bytes()==raw and response.stat().st_ino==before.st_ino)
 check('handoff publishes only its owned signed draft',json.loads((c/'remote.json').read_text())['draft'] is False and
       all(q[0]=='repos/owner/app/releases/9' for q in patches))
+
+for label in ('state-file','state-link','state-writable','allocation-failure',
+              'override-outside-state','override-missing','override-link'):
+    c,env,_,_=setup('creation-custody-'+label,{'absent':True})
+    releases=c/'state/releases'
+    if label=='state-file':
+        releases.write_text('preserved unrelated state\n')
+    elif label=='state-link':
+        releases.symlink_to(c/'tmp',target_is_directory=True)
+    elif label=='state-writable':
+        releases.mkdir();releases.chmod(0o777)
+    elif label=='allocation-failure':
+        env['FAIL_CREATION_CUSTODY']='true'
+    elif label=='override-outside-state':
+        env['_DSR_STRICT_CREATE_CUSTODY_PARENT']=env['TMPDIR']
+    elif label=='override-missing':
+        env['_DSR_STRICT_CREATE_CUSTODY_PARENT']=str(releases/'missing-handoff')
+    else:
+        releases.mkdir()
+        (releases/'linked-handoff').symlink_to(c/'tmp',target_is_directory=True)
+        env['_DSR_STRICT_CREATE_CUSTODY_PARENT']=str(releases/'linked-handoff')
+    r=subprocess.run(['bash','-c',script,'fixture','create'],env=env,capture_output=True,text=True)
+    (c/'create.log').write_text(r.stdout+r.stderr)
+    rows=[json.loads(line) for line in (c/'requests.jsonl').read_text().splitlines()]
+    check(label+' refuses strict creation without temporary-storage fallback',r.returncode==4 and
+          'Cannot preserve private strict creation custody before POST' in r.stderr)
+    check(label+' never creates or uploads a remote draft',
+          not any('--post' in row or '--method' in row or row[0]=='upload-boundary' for row in rows) and
+          json.loads((c/'control.json').read_text())['absent'] is True and
+          not list((c/'tmp').glob('dsr-create-custody.*')))
+
+if os.environ.get('DSR_TEST_STRICT_CREATION_ONLY')=='1':
+    print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
+    raise SystemExit(0)
 
 # Custom build outputs must flow through the real producer and consumer with
 # the same signed preflight. A symlink alias is supported by canonicalizing its

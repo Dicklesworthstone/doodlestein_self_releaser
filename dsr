@@ -7735,6 +7735,37 @@ EOF
     return 0
 }
 
+# The original strict draft POST response is irreplaceable finalization
+# authority. Keep it in release state, independently of the caller's TMPDIR.
+# Fallback may select its already prepared private handoff beneath that state;
+# this chooses storage only and never supplies creation or recovery authority.
+_release_strict_creation_parent() {
+    python3 -I - "$1" "${2:-}" <<'PY'
+import os
+from pathlib import Path
+import stat
+import sys
+
+try:
+    os.umask(0o077)
+    root = Path(sys.argv[1]).absolute()
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    selected = root
+    if sys.argv[2]:
+        selected = Path(sys.argv[2])
+        if not selected.is_absolute() or selected.parent.resolve(strict=True) != root.resolve(strict=True):
+            raise ValueError('fallback creation custody must remain beneath release state')
+    for parent in (root, selected):
+        info = parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+            raise ValueError('creation custody parent must be an owned directory without group/world write access')
+    print(selected.resolve(strict=True))
+except (OSError, ValueError) as error:
+    print('Cannot preserve private strict creation custody before POST: ' + str(error), file=sys.stderr)
+    sys.exit(4)
+PY
+}
+
 cmd_release() {
     # Own newly acquired descriptors and cleanup without replacing a caller's
     # traps. Fallback's inherited descriptors remain owned by its coordinator.
@@ -9145,8 +9176,13 @@ EOF
     local create_status=0 create_response="" create_response_dir=""
     local strict_creation_intent="" strict_creation_proof=""
     if $release_contract_enabled; then
-        create_response_dir=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/dsr-create-custody.XXXXXXXX") || return 4
-        create_response_dir=$(cd "$create_response_dir" && pwd -P) || return 4
+        local strict_custody_parent
+        strict_custody_parent=$(_release_strict_creation_parent "$state_dir/releases" \
+            "${_DSR_STRICT_CREATE_CUSTODY_PARENT:-}") || return 4
+        if ! create_response_dir=$(umask 077; mktemp -d "$strict_custody_parent/dsr-create-custody.XXXXXXXX"); then
+            log_error "Cannot preserve private strict creation custody before POST"
+            return 4
+        fi
         strict_creation_intent=$(jq -nc --arg repo "$repo" --arg tool "$tool_name" --arg tag "$tag" \
             --arg artifacts_dir "$(cd "$artifacts_dir" && pwd -P)" --argjson plan "$release_contract_plan" \
             '{schema_version:"dsr.strict_creation_intent.v1",repo:$repo,tool:$tool,tag:$tag,
@@ -12820,7 +12856,8 @@ EOF
                 # Canonicalize the existing --artifacts value, preserving the
                 # explicitly selected publication options after that pair.
                 release_args[3]="$strict_artifacts"
-                release_result=$(TMPDIR="$strict_handoff" JSON_MODE=true cmd_release "${release_args[@]}") || rc=$?
+                release_result=$(_DSR_STRICT_CREATE_CUSTODY_PARENT="$strict_handoff" \
+                    TMPDIR="$strict_handoff" JSON_MODE=true cmd_release "${release_args[@]}") || rc=$?
                 _fallback_strict_capture || custody_rc=$?
                 if [[ $custody_rc -ne 0 ]] || { [[ $rc -eq 0 ]] && ! $strict_custody_ready; }; then
                     publication_recovery=$(jq -c '.status="blocked"' <<< "$publication_recovery")
