@@ -159,8 +159,8 @@ Add `source_files` to an archive entry in the packaging recipe:
       "archive_format": "tar.xz",
       "source": "producer-linux-amd64.tar.xz",
       "source_files": [
-        {"source": "LICENSE", "path": "LICENSE"},
-        {"source": "docs/README.md", "path": "README.md"},
+        {"source": "LICENSE", "path": "share/demo/LICENSE"},
+        {"source": "docs/README.md", "path": "share/demo/docs/README.md"},
         {"source": "install.sh", "path": "install.sh"},
         {"source": "minisign.pub", "path": "minisign.pub"}
       ]
@@ -223,11 +223,17 @@ untracked files, and working-copy edits cannot substitute companion bytes.
 No tag is created or moved, no checkout is changed, and no object is downloaded.
 Missing local objects require restoring the reviewed source first.
 
-Companion source paths may have up to 16 safe segments and 1,024 characters;
-archive destinations are safe flat basenames of at most 128 characters. There
-are at most 256 distinct source companions. Links, submodules, directories,
-traversal, case-colliding destinations, and collisions with explicit binary
-members are refused. Regular Git modes `100644` and `100755` determine exact
+Companion source paths and archive destinations may have up to 16 safe segments
+and 1,024 characters, with at most 128 characters per segment. Parent
+directories such as `share/demo` are created in the private archive payload.
+There are at most 256 distinct source companions. Selected Git files must be
+regular files; links, submodules and directory sources are refused. Absolute
+paths, traversal, empty or dot segments and backslashes are refused. Binary
+members and source companions share a case-insensitive destination namespace,
+including implicit directories: `share` cannot be both a file and a parent,
+and `Share/LICENSE` cannot coexist with `share/README.md`. Existing prebuilt
+parents must have exactly the selected spelling and be plain directories.
+Regular Git modes `100644` and `100755` determine exact
 non-executable/executable companion modes; empty regular files are supported.
 
 For prebuilt archives, missing companions cause a new derivative archive.

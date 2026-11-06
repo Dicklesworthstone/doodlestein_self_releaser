@@ -255,6 +255,57 @@ try:
     check("Git proof binds nested paths and executable modes", {f["source"] for f in proof["files"]} == set(committed) and
           any(f["git_mode"] == "100755" and f["source"] == "install.sh" for f in proof["files"]) and
           sum(o["name"].startswith("tree-") for o in proof["objects"]) == 2)
+    # Build an actual runnable application layout from a producer executable
+    # plus exact-commit data. No working-tree file supplies the runtime data.
+    runtime_source = work / "runtime-producer"
+    runtime_source.mkdir()
+    runtime_app = b'#!/bin/sh\ncd "$(dirname "$0")/.." || exit 1\nexec cat share/demo/docs/README.md\n'
+    (runtime_source / "app").write_bytes(runtime_app)
+    (runtime_source / "app").chmod(0o755)
+    runtime_manifest = work / "runtime-producer.json"
+    manifest_for(runtime_source, runtime_manifest)
+    pins[runtime_manifest] = sha(runtime_manifest)
+    runtime_paths = {"LICENSE": "share/demo/LICENSE", "docs/README.md": "share/demo/docs/README.md",
+                     "install.sh": "libexec/setup", "EMPTY": "share/demo/empty"}
+    runtime_includes = [dict(source=s, path=p) for s, p in runtime_paths.items()]
+    runtime_recipe = dict(schema_version=1, artifacts=[dict(name="runtime." + fmt, target="linux/amd64",
+        archive_format=fmt, members=[dict(source="app", path="bin/demo")], source_files=runtime_includes)
+        for fmt in ("tar.gz", "tar.xz", "zip")])
+    runtime_out = work / "runtime-layout"
+    runtime = run(runtime_out, selected=runtime_recipe, producer=(runtime_manifest, runtime_source))
+    runtime_expected = {runtime_paths[s]: (b, 0o111 if s == "install.sh" else 0) for s, b in committed.items()}
+    runtime_expected["bin/demo"] = (runtime_app, 0o111)
+    for fmt in ("tar.gz", "tar.xz", "zip"):
+        packaged = Path(runtime["artifacts_dir"]) / ("runtime." + fmt)
+        check(fmt + " runtime layout keeps exact Git files, empty data and executable modes", payload(packaged) == runtime_expected)
+        destination = work / ("runtime-extracted-" + fmt)
+        destination.mkdir()
+        subprocess.run(["bash", "-c", 'source "$1/src/packaging.sh"; packaging_extract_payload "$2" "$3" "$4"',
+                        "_", str(root), str(packaged), fmt, str(destination)], capture_output=True, check=True)
+        executed = subprocess.run([str(destination / "bin/demo")], capture_output=True)
+        check(fmt + " installed layout runs with authenticated relative runtime data",
+              executed.returncode == 0 and executed.stdout == committed["docs/README.md"])
+    runtime_before = {str(p.relative_to(runtime_out)): (p.stat().st_ino, sha(p)) for p in runtime_out.rglob("*") if p.is_file()}
+    for fmt in ("tar.xz", "zip"):
+        ready = work / ("nested-ready-" + fmt)
+        ready.mkdir()
+        ready_file = ready / ("ready." + fmt)
+        archive(ready_file, [(n, b, 0o644 | x) for n, (b, x) in runtime_expected.items()])
+        ready_manifest = work / ("nested-ready-" + fmt + ".json")
+        manifest_for(ready, ready_manifest)
+        ready_recipe = dict(schema_version=1, artifacts=[dict(name="ready." + fmt, target="linux/amd64",
+            archive_format=fmt, source="ready." + fmt, source_files=runtime_includes)])
+        kept = run(work / ("nested-ready-output-" + fmt), selected=ready_recipe, producer=(ready_manifest, ready))
+        check(fmt + " complete nested prebuilt layout preserves original compressed bytes",
+              sha(Path(kept["artifacts_dir"]) / ready_file.name) == sha(ready_file))
+        for label, member in (("parent-case", ("Share/demo/other", b"other", 0o644)),
+                              ("parent-file", ("share", b"not a directory", 0o644)),
+                              ("leaf-directory", ("share/demo/LICENSE/", b"", 0o755))):
+            archive(ready_file, [("bin/demo", runtime_app, 0o755), member])
+            manifest_for(ready, ready_manifest)
+            refused = work / ("nested-" + fmt + "-" + label)
+            run(refused, 4, selected=ready_recipe, producer=(ready_manifest, ready))
+            check(label + " cannot replace a nested producer path", not (refused / "release").exists())
     legacy = copy.deepcopy(recipe)
     for artifact in legacy["artifacts"]:
         del artifact["source_files"]
@@ -285,6 +336,9 @@ try:
         ("empty-source-list", lambda a: a.update(source_files=[])),
         ("case-collision", lambda a: a.update(source_files=[dict(source="LICENSE", path="LICENSE"), dict(source="EMPTY", path="license")])),
         ("producer-collision", lambda a: a.update(source_files=[dict(source="LICENSE", path="DEMO")])),
+        ("member-parent-collision", lambda a: a.update(source_files=[dict(source="LICENSE", path="demo/LICENSE")])),
+        ("companion-parent-collision", lambda a: a.update(source_files=[dict(source="LICENSE", path="share"), dict(source="EMPTY", path="share/empty")])),
+        ("companion-parent-case", lambda a: a.update(source_files=[dict(source="LICENSE", path="Share/LICENSE"), dict(source="EMPTY", path="share/empty")])),
     ):
         bad = copy.deepcopy(recipe)
         change(bad["artifacts"][-1])
@@ -344,6 +398,11 @@ try:
     incoming.rename(work / "offline-producer")
     manifest.rename(work / "offline-manifest")
     checkout.rename(work / "offline-source")
+    runtime_source.rename(work / "offline-runtime-producer")
+    runtime_manifest.rename(work / "offline-runtime-manifest")
+    run(runtime_out, selected=runtime_recipe, source_repo=False, producer=(runtime_manifest, runtime_source))
+    check("nested layout retries without source or producer and preserves all retained evidence", runtime_before ==
+          {str(p.relative_to(runtime_out)): (p.stat().st_ino, sha(p)) for p in runtime_out.rglob("*") if p.is_file()})
     pipeline('_rf_packaging_source_preflight', plan_file, '', out, pipeline_work)
     check('completed-package retry defers to retained Git proof rather than the missing checkout', True)
     run(out, source_repo=False)
@@ -353,5 +412,8 @@ try:
     check("offline resume revalidates evidence without rewriting any file", snapshots == after)
     print(f"Source companion integration: {passed} assertions passed", flush=True)
 finally:
-    shutil.rmtree(work)
+    if os.environ.get("DSR_RETAIN_TEST_EVIDENCE") == "1":
+        print("Retained test evidence: " + str(work), flush=True)
+    else:
+        shutil.rmtree(work)
 PY

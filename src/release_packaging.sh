@@ -51,8 +51,25 @@ def match(value, pattern):
 def name(value):
     return match(value, r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}") and ".." not in value
 
-def source_path(value):
+def relative_path(value):
     return isinstance(value, str) and len(value) <= 1024 and len(value.split("/")) <= 16 and all(name(p) for p in value.split("/"))
+
+def member_namespace(paths):
+    # Implicit parent directories own names too. Compare each prefix rather
+    # than just complete filenames so Lib/a and lib/b cannot split a layout
+    # differently on case-sensitive and case-insensitive consumers.
+    namespace = {}
+    for selected_path in paths:
+        need(relative_path(selected_path), "invalid archive member path", 4)
+        parts = selected_path.split("/")
+        for index in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:index])
+            directory = index < len(parts)
+            previous = namespace.get(prefix.lower())
+            if previous is not None:
+                need(previous[0] == prefix and previous[1] and directory,
+                     "colliding archive member or directory: " + prefix, 4)
+            namespace[prefix.lower()] = (prefix, directory)
 
 def path(value):
     need(isinstance(value, str) and value.startswith("/") and value != "/" and
@@ -134,13 +151,10 @@ def recipe(value):
         else:
             need(item["archive_format"] in ARCHIVES and isinstance(item["members"], list) and
                  1 <= len(item["members"]) <= 256, "members require an archive format", 4)
-            paths = []
             for member in item["members"]:
                 need(isinstance(member, dict) and set(member) == {"source", "path"} and
-                     name(member["source"]) and name(member["path"]), "archive members must be safe flat names", 4)
-                paths.append(member["path"].lower())
+                     name(member["source"]) and relative_path(member["path"]), "invalid archive member mapping", 4)
                 sources.add((member["source"], item["target"]))
-            need(len(set(paths)) == len(paths), "colliding archive member names", 4)
             item["members"].sort(key=lambda m: m["path"])
         # One producer name cannot satisfy contradictory compiler selections.
         # A repeated source with an untyped legacy output does not erase a
@@ -155,17 +169,14 @@ def recipe(value):
         if "source_files" in item:
             need(item["archive_format"] in ARCHIVES and isinstance(item["source_files"], list) and
                  1 <= len(item["source_files"]) <= 256, "source_files requires a nonempty archive companion list", 4)
-            paths = []
             for member in item["source_files"]:
                 need(isinstance(member, dict) and set(member) == {"source", "path"} and
-                     source_path(member["source"]) and name(member["path"]), "invalid source companion mapping", 4)
-                paths.append(member["path"].lower())
+                     relative_path(member["source"]) and relative_path(member["path"]), "invalid source companion mapping", 4)
             # Producer members are never replaced by a source file, even if
             # their contents happen to match. Prebuilt includes are checked
             # against the extracted payload when its actual inventory is known.
-            paths += [m["path"].lower() for m in item.get("members", [])]
-            need(len(paths) == len(set(paths)), "colliding companion/member names", 4)
             item["source_files"].sort(key=lambda m: m["path"])
+        member_namespace([m["path"] for m in item.get("members", []) + item.get("source_files", [])])
     need(len(outputs) <= 256 and len({a["name"].lower() for a in outputs}) == len(outputs),
          "colliding or excessive output/alias names", 4)
     value["artifacts"].sort(key=lambda a: a["name"])
@@ -372,19 +383,46 @@ def companion_proof(base, create=False):
     return dict(kind="git-commit-source-files", schema_version=1, git_sha=args.sha, files=files,
                 objects=[dict(name=k, sha256=hashlib.sha256(v).hexdigest(), size_bytes=len(v)) for k, v in sorted(cached.items())])
 
-def add_companions(base, item, payload, proof):
+def member_destination(payload, selected_path, directories):
+    # Only the private, already admitted payload is traversed. Cache each
+    # directory inventory once, keeping a large prebuilt archive from being
+    # rescanned for every requested companion. Actual path types are checked
+    # again before descending; existing files are never overwritten.
+    current = payload
+    parts = selected_path.split("/")
+    for index, part in enumerate(parts):
+        if current not in directories:
+            entries = {}
+            for entry in current.iterdir():
+                entries.setdefault(entry.name.lower(), []).append(entry)
+            directories[current] = entries
+        entries = directories[current]
+        matches = entries.get(part.lower(), [])
+        need(not matches or (len(matches) == 1 and matches[0].name == part),
+             "archive path aliases an existing name: " + selected_path, 4)
+        destination = current / part
+        if index == len(parts) - 1:
+            if not matches:
+                entries[part.lower()] = [destination]
+            return destination, bool(matches)
+        if matches:
+            need(not destination.is_symlink() and destination.is_dir(),
+                 "archive parent is not a plain directory: " + selected_path, 4)
+        else:
+            destination.mkdir(mode=0o700)
+            entries[part.lower()] = [destination]
+            directories[destination] = {}
+        current = destination
+
+def add_companions(base, item, payload, proof, directories):
     added = []
     evidence = {f["source"]: f for f in (proof or {}).get("files", [])}
     for member in item.get("source_files", []):
         record = evidence[member["source"]]
-        dest = payload / member["path"]
-        # Includes are flat; a different case or a directory cannot satisfy
-        # one. Never overwrite a producer's existing member, even on retry.
-        matches = [p for p in payload.iterdir() if p.name.lower() == member["path"].lower()]
+        dest, exists = member_destination(payload, member["path"], directories)
         expected_bits = 0o111 if record["git_mode"] == "100755" else 0
-        if matches:
-            need(len(matches) == 1 and matches[0].name == member["path"] and
-                 matches[0].is_file() and not matches[0].is_symlink() and
+        if exists:
+            need(dest.is_file() and not dest.is_symlink() and
                  digest(dest) == record["sha256"] and bits(dest) == expected_bits,
                  "companion conflicts with producer archive: " + member["path"], 4)
         else:
@@ -401,6 +439,7 @@ def materialize(base, records, work, build):
         fmt = item["archive_format"]
         payload = work / ("payload-%d" % index)
         payload.mkdir()
+        directories = {}
         if "members" in item:
             members = []
             for member in item["members"]:
@@ -409,9 +448,11 @@ def materialize(base, records, work, build):
                     magic = f.read(512)
                 need(not (magic.startswith((b"\x1f\x8b", b"\xfd7zXZ\x00", b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")) or
                           magic[257:262] == b"ustar"), "archive bytes cannot masquerade as a raw member", 4)
-                copy_payload(source, payload / member["path"])
+                member_file, exists = member_destination(payload, member["path"], directories)
+                need(not exists, "archive member destination already exists", 4)
+                copy_payload(source, member_file)
                 members.append(member["path"])
-            members = sorted(members + add_companions(base, item, payload, proof))
+            members = sorted(members + add_companions(base, item, payload, proof, directories))
             if build:
                 helper("packaging", "packaging_build_archive", fmt, dest, payload, *members)
             helper("packaging", "_pkg_archive_matches_payload", dest, fmt, payload, "\n".join(members), "normalized")
@@ -422,7 +463,7 @@ def materialize(base, records, work, build):
             if original in ARCHIVES:
                 helper("packaging", "packaging_extract_payload", source, original, payload)
                 members = helper("packaging", "packaging_payload_members", source, original)
-                added = add_companions(base, item, payload, proof)
+                added = add_companions(base, item, payload, proof, directories)
                 members = "\n".join(sorted(members.split("\n") + added))
                 if build:
                     if added:

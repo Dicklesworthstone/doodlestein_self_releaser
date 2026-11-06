@@ -33,8 +33,10 @@ It does not compile, sign, upload, create releases or promote drafts.
 ```
 
 Each artifact selects either `members` or `source`. `members` builds an archive
-from explicitly renamed **flat regular files**, preserving which files are
-executable. The sources must be manifest-declared raw payloads, not archives. Known
+from explicitly mapped regular files, preserving which files are executable.
+Destinations may be nested relative paths such as `bin/demo` and
+`libexec/helper`; their parent directories are created inside the private
+payload. The sources must be manifest-declared raw payloads, not archives. Known
 archive signatures masquerading as raw members are also refused. Every member
 must have the same target as its output; packaging cannot relabel platforms.
 
@@ -47,13 +49,48 @@ compression, member safety, file bytes and executable bits using the existing
 supported. `binary` and `none` represent raw files.
 
 `aliases` creates separate byte-identical copies of its primary. It does not
-point into a mutable producer directory. All names are safe basenames of at
-most 128 characters; output/alias names and archive member names must be unique
-ignoring ASCII case. There are at most 256 output names including aliases.
+point into a mutable producer directory. Producer, output and alias names are
+safe basenames of at most 128 characters. Archive member destinations allow
+up to 16 safe segments and 1,024 characters in total, with at most 128
+characters per segment. Absolute paths, empty or dot segments, backslashes,
+traversal and links are refused. Output/alias names are unique ignoring ASCII
+case. Within each archive, binary members and source companions share one
+namespace, including their implicit parent directories: `Bin/demo` and
+`bin/helper`, or a file `share` and a file `share/LICENSE`, conflict. There are
+at most 256 output names including aliases.
 Suffixes must agree with declared archive formats. Unknown fields, duplicate
 JSON keys, explicit null lists, missing input assets and unconsumed producer
 assets are errors. A source may participate in several independent outputs.
 The recipe is an exact inventory, not an instruction to glob a directory.
+
+For a complete application layout, map verified executable outputs and pinned
+Git source files explicitly:
+
+```json
+{
+  "name": "demo-linux-amd64.tar.xz",
+  "target": "linux/amd64",
+  "archive_format": "tar.xz",
+  "members": [
+    {"source": "demo", "path": "bin/demo"},
+    {"source": "helper", "path": "libexec/helper"}
+  ],
+  "source_files": [
+    {"source": "LICENSE", "path": "share/demo/LICENSE"},
+    {"source": "docs/README.md", "path": "share/demo/docs/README.md"}
+  ]
+}
+```
+
+This is one entry in the recipe's `artifacts` array. Supply `--source-repo` to
+the packaging command (or `--packaging-source-repo` to the finalizer) when
+selecting source companions. Source files come from the selected release
+commit, including their executable bits; working-copy contents never supply
+these bytes. Nested layouts use the same archive admission, complete output
+inventory and retained retry evidence as flat layouts. A complete prebuilt
+archive whose selected companions already match keeps its exact compressed
+bytes. See [source companion custody](PACKAGED_RELEASE_FINALIZATION.md#include-license-and-other-files-from-the-exact-release-commit)
+for the source selection and retry contract.
 
 ## Shared release payloads
 

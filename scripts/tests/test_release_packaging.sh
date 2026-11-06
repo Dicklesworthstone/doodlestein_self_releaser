@@ -138,6 +138,27 @@ try:
         member = t.getmember("demo.exe")
         check("new cross-format archive normalizes the private prebuilt member",
               (member.mode, member.uid, member.gid, member.uname, member.gname) == (0o755, 0, 0, "", ""))
+    nested = copy.deepcopy(selected)
+    for item in nested["artifacts"]:
+        if "members" in item:
+            item["members"][0]["path"] = "bin/demo"
+            item["members"][1]["path"] = "libexec/helper"
+    write(work / "nested.json", nested)
+    nested_result = run(work / "nested", recipe=work / "nested.json")
+    nested_dist = Path(nested_result["artifacts_dir"])
+    for fmt in ("tar.gz", "tar.xz", "zip"):
+        extracted = work / ("nested-extracted-" + fmt)
+        extracted.mkdir()
+        p = subprocess.run(["bash", "-c", 'source "$1/src/packaging.sh"; packaging_extract_payload "$2" "$3" "$4"',
+                            "_", str(root), str(nested_dist / ("demo-linux." + fmt)), fmt, str(extracted)], capture_output=True)
+        check(fmt + " preserves the reviewed executable directory layout", p.returncode == 0 and
+              sorted(str(p.relative_to(extracted)) for p in extracted.rglob("*") if p.is_file()) == ["bin/demo", "libexec/helper"])
+        check(fmt + " nested executable has original bytes and runs", (extracted / "libexec/helper").read_bytes() ==
+              (incoming / "helper").read_bytes() and subprocess.run([str(extracted / "libexec/helper")]).returncode == 17)
+    nested_held = {p.name: (p.stat().st_ino, sha(p)) for p in nested_dist.iterdir()}
+    run(work / "nested", recipe=work / "nested.json")
+    check("nested recipe retry preserves every completed archive and alias", nested_held ==
+          {p.name: (p.stat().st_ino, sha(p)) for p in nested_dist.iterdir()})
     inode = (dist / "demo-linux.tar.gz").stat().st_ino
     first = (out / "release/result.json").read_bytes()
     incoming.rename(work / "offline-producer")
@@ -161,6 +182,17 @@ try:
         ("case-collision", lambda p: p["artifacts"][0].update(aliases=["DEMO-LINUX.TAR.gz"])),
         ("traversal", lambda p: p["artifacts"][0]["members"][0].update(path="../escape")),
         ("member-collision", lambda p: p["artifacts"][0]["members"][1].update(path="DEMO")),
+        ("directory-case-collision", lambda p: p["artifacts"][0].update(members=[
+            dict(source="app", path="Bin/demo"), dict(source="helper", path="bin/helper")])),
+        ("file-directory-collision", lambda p: p["artifacts"][0].update(members=[
+            dict(source="app", path="bin"), dict(source="helper", path="bin/helper")])),
+        ("directory-file-collision", lambda p: p["artifacts"][0].update(members=[
+            dict(source="app", path="bin/demo"), dict(source="helper", path="bin")])),
+        ("absolute-member", lambda p: p["artifacts"][0]["members"][0].update(path="/bin/demo")),
+        ("empty-path-component", lambda p: p["artifacts"][0]["members"][0].update(path="bin//demo")),
+        ("dot-path-component", lambda p: p["artifacts"][0]["members"][0].update(path="bin/./demo")),
+        ("windows-path-separator", lambda p: p["artifacts"][0]["members"][0].update(path="bin\\demo")),
+        ("excessive-path-depth", lambda p: p["artifacts"][0]["members"][0].update(path="a/" * 16 + "demo")),
         ("extension-mismatch", lambda p: p["artifacts"][0].update(archive_format="zip")),
         ("explicit-null", lambda p: p["artifacts"][0].update(aliases=None)),
         ("shell-command", lambda p: p["artifacts"][0].update(command="echo unsafe")),
@@ -266,5 +298,8 @@ except Exception:
     print("Retained failing fixtures: " + str(work), file=sys.stderr)
     raise
 else:
-    shutil.rmtree(work)
+    if os.environ.get("DSR_RETAIN_TEST_EVIDENCE") == "1":
+        print("Retained test evidence: " + str(work), flush=True)
+    else:
+        shutil.rmtree(work)
 PY
