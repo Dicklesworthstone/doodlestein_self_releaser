@@ -271,7 +271,7 @@ pipeline. The selected prefix's parent must already exist. The generated script
 selects the physical host automatically and installs all companions from its
 sole recipe or the explicit `--target-triple` choice. Its runtime options are deliberately limited to:
 
-- `--prefix DIR`, `--snapshot DIR`, `--target-triple TRIPLE`, `--timeout SECONDS`, and `--download-jobs N`.
+- `--prefix DIR`, `--snapshot DIR`, `--target-triple TRIPLE`, `--timeout SECONDS`, `--download-jobs N`, and `--download-cache DIR`.
 - `--replace`, `--allow-draft`, `--dry-run`, `--inspect`, and `--help`.
 
 The default is online `--fetch` behavior from the existing engine: authenticate
@@ -288,6 +288,41 @@ the default is **1**. The captured fetch engine owns and drains every worker on
 failure or cancellation. This option changes only download scheduling, not the
 embedded policy, signed asset checks or installed generation identity. It is
 invalid with `--snapshot`.
+
+For large releases or an unreliable connection, select persistent download
+storage explicitly:
+
+```bash
+bash demo-v1.2.3.sh --prefix /home/alice/.local/demo \
+  --download-cache /home/alice/.cache/dsr/demo-v1.2.3 --download-jobs 4
+```
+
+Repeat this command after interruption. `--download-cache DIR` selects one exact
+snapshot destination with an existing parent; the engine retains its completed
+verified payloads in `DIR.partial` and serializes acquisition through `DIR.lock`.
+These paths must be canonical, free of symlinks, and separate from the managed
+installation and selected policy inputs. The new cache is private. A completed
+retry reauthenticates the cached snapshot and current remote proof, downloads
+only missing payloads, and preserves the original snapshot files. A changed
+release generation, policy, key or inventory, or corrupt cache, fails without
+repair or replacement. Use a new cache destination for a different release.
+
+The cache binds the embedded policy and key bytes, not the temporary directory
+where the script unpacks its engines. It therefore works across streamed
+executions and changes in `--download-jobs`. Its `download.acquisition` result
+reports reused and newly downloaded payload counts. Cache storage and these
+observations do not affect the installed generation identity. The engine still
+authenticates every platform and compiler variant before installation.
+
+Explicit `--download-cache` also persists completed downloads during
+`--dry-run`, so a preview can prepare downloads for an installation. This can
+write the cache, checkpoint and cache lock; it never creates the installation
+prefix, installation lock or active pointer. Without the option, acquisition
+remains temporary. A complete cache may later be selected as `--snapshot DIR`
+for deliberate offline installation. The two options cannot be combined, and
+online cache use never falls back to offline success after a network failure.
+See [the installation cache contract](RELEASE_INSTALLATION.md#retain-downloads-across-attempts)
+for the complete recovery and path rules.
 
 Use `--snapshot /absolute/snapshot` for offline operation. This option is exclusive
 with draft consent and never requests network access, even to repair missing

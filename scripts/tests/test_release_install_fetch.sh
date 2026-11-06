@@ -31,6 +31,8 @@ export DSR_ONLINE_CASE="$CASE" DSR_GH_TOKEN=fixture-token GH_ENTERPRISE_TOKEN=mu
 [[ "${DSR_ONLINE_FIXTURES_ONLY:-false}" != true ]] || return 0
 python3 - "$INSTALL" "$CASE" "$PIN" <<'PY'
 import copy
+import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -56,8 +58,8 @@ def check(label, yes):
     checks += 1
     print("PASS " + label, flush=True)
 
-def command(extra=(), dest=prefix, origin=("--fetch",)):
-    return ["bash", str(script), *origin, "--recipe", str(recipe), "--prefix", str(dest), *policy, *extra]
+def command(extra=(), dest=prefix, origin=("--fetch",), selected_policy=policy, selected_recipe=recipe):
+    return ["bash", str(script), *origin, "--recipe", str(selected_recipe), "--prefix", str(dest), *selected_policy, *extra]
 
 def run(expected=0, **kw):
     p = subprocess.run(command(**kw), capture_output=True, timeout=30)
@@ -77,6 +79,12 @@ def calls():
 def active():
     p = prefix / "current"
     return (p.lstat().st_ino, os.readlink(p))
+
+def payload_identity(directory):
+    return {p.name: (p.stat().st_ino, hashlib.sha256(p.read_bytes()).hexdigest()) for p in directory.iterdir()}
+
+def payload_calls(since):
+    return [c for c in calls()[since:] if c in ("download 1", "download 2", "download 3")]
 
 # This suite needs no compiler fixtures: the installer never executes even
 # these deliberately non-executable producer byte fixtures.
@@ -98,6 +106,133 @@ check("parallel installation authenticates the same complete release and generat
       sorted(c for c in calls()[before_parallel:] if c.startswith("download ")) ==
       ["download 1", "download 2", "download 3", "download 4", "download 5"])
 check("online helper staging is cleaned", not list(case.glob(".dsr-install-*")))
+# Persistent acquisition must use the actual resumable verifier. An interrupted
+# full release never becomes a partial successful installation, and a retry
+# must preserve the complete signed payloads already retained on disk.
+cache = case / "download cache"
+cache_flags = ("--download-cache", str(cache))
+(case / "mode").write_text("late-failure\n")
+run(8, extra=(*cache_flags, "--dry-run"), dest=case / "initial-cache-plan")
+retained = Path(str(cache) + ".partial") / "artifacts"
+kept = payload_identity(retained)
+check("late online failure retains only complete authenticated payloads", set(kept) == {"demo-linux", "demo-linux-alias"} and
+      not cache.exists() and not (case / "initial-cache-plan").exists() and
+      not (case / "initial-cache-plan.lock").exists() and active() == identity)
+(case / "mode").write_text("normal\n")
+before_resume = len(calls())
+resumed = run(extra=(*cache_flags, "--download-jobs", "2"))
+check("installer retry downloads only missing payload and retains existing inodes", payload_calls(before_resume) == ["download 3"] and
+      all(payload_identity(retained)[name] == saved for name, saved in kept.items()))
+check("cache and scheduling do not change generation identity", resumed["generation"] == first["generation"] and
+      not resumed["activated"] and active() == identity and resumed["download"]["cache"] == str(cache) and
+      resumed["download"]["resumable"] and
+      resumed["download"]["acquisition"] == dict(reused_payloads=2, downloaded_payloads=1))
+complete = payload_identity(cache / "artifacts")
+historical = (cache / "download.json").read_bytes()
+before_resume = len(calls())
+cached = run(extra=(*cache_flags, "--dry-run"), dest=case / "cache-preview")
+check("completed cache retry reauthenticates current proof without redownloading payloads", not payload_calls(before_resume) and
+      [c for c in calls()[before_resume:] if c.startswith("download ")] == ["download 4", "download 5"] and
+      cached["download"]["acquisition"] == dict(reused_payloads=3, downloaded_payloads=0))
+check("cached planning preserves snapshot and creates no installation state", cached["status"] == "planned" and
+      cached["generation"] == first["generation"] and not (case / "cache-preview").exists() and
+      not (case / "cache-preview.lock").exists() and payload_identity(cache / "artifacts") == complete and
+      (cache / "download.json").read_bytes() == historical)
+# Adding an independently correct pin still changes the frozen selection. A
+# different key comment leaves cryptographic verification valid, but changes
+# the exact key bytes bound by the existing checkpoint contract.
+before_refusals = len(calls())
+run(7, extra=(*cache_flags, "--statement-sha256", hashlib.sha256((case / "remote/4").read_bytes()).hexdigest()))
+key_bytes = (case / "key.pub").read_bytes()
+(case / "key.pub").write_bytes(key_bytes + b"different local key comment\n")
+run(7, extra=cache_flags)
+(case / "key.pub").write_bytes(key_bytes)
+inventory_bytes = (case / "inventory.json").read_bytes()
+inventory = json.loads(inventory_bytes)
+inventory[0]["id"] += 100
+(case / "inventory.json").write_text(json.dumps(inventory))
+run(7, extra=cache_flags)
+(case / "inventory.json").write_bytes(inventory_bytes)
+check("cache selection key and inventory drift cannot trigger payload replacement", not payload_calls(before_refusals) and
+      payload_identity(cache / "artifacts") == complete and active() == identity)
+damaged = cache / "artifacts/demo-windows.exe"
+intact = damaged.read_bytes()
+damaged.chmod(0o600)
+damaged.write_bytes(intact + b"corrupt")
+before_corruption = len(calls())
+run(1, extra=cache_flags)
+check("unused cached platform corruption is refused before networking and is never repaired", len(calls()) == before_corruption and
+      damaged.read_bytes() == intact + b"corrupt" and active() == identity)
+damaged.write_bytes(intact)
+damaged.chmod(0o400)
+# A completed cache remains online policy, never a silent fallback after an
+# unavailable release. Explicit offline use still authenticates its bytes.
+(case / "mode").write_text("network-failure\n")
+run(8, extra=cache_flags)
+before_offline_cache = len(calls())
+from_cache = run(origin=("--snapshot", str(cache)))
+check("explicit snapshot mode can install cached bytes without any remote calls", len(calls()) == before_offline_cache and
+      from_cache["generation"] == first["generation"] and "download" not in from_cache)
+(case / "mode").write_text("normal\n")
+# All persistent cache names must be disjoint from installation state and
+# policy inputs before any network request or cache lock is created.
+before_paths = len(calls())
+for cache_path, selected_prefix in ((prefix, prefix), (case, prefix), (prefix / "cache", prefix),
+                                    (case / "overlap", case / "overlap.partial"),
+                                    (case / "overlap", case / "overlap.lock"),
+                                    (Path(str(prefix) + ".lock"), prefix), (recipe, prefix)):
+    run(4, extra=("--download-cache", str(cache_path)), dest=selected_prefix)
+protected_key = case / "selected.lock"
+protected_key.write_bytes(key_bytes)
+key_policy = list(policy)
+key_policy[key_policy.index("--public-key") + 1] = str(protected_key)
+run(4, extra=("--download-cache", str(case / "selected")), selected_policy=key_policy)
+partial_input = case / "protected.partial"
+partial_input.mkdir()
+partial_recipe = partial_input / "recipe.json"
+partial_recipe.write_bytes(recipe.read_bytes())
+run(4, extra=("--download-cache", str(case / "protected")), selected_recipe=partial_recipe)
+run(4, extra=("--download-cache", "relative-cache"))
+run(4, extra=(*cache_flags, *cache_flags))
+run(4, origin=("--snapshot", str(cache)), extra=cache_flags)
+(case / "linked.partial").symlink_to(retained.parent, target_is_directory=True)
+run(7, extra=("--download-cache", str(case / "linked")))
+check("invalid cache namespaces have no network or installation side effects", len(calls()) == before_paths and
+      protected_key.read_bytes() == key_bytes and partial_recipe.read_bytes() == recipe.read_bytes() and
+      not (case / "overlap.lock").exists() and not (case / "protected.lock").exists() and active() == identity)
+# Exercise real installer cancellation after two checkpoint commits, with a
+# second CLI attempting the same destination while its transfer is blocked.
+cancel_cache = case / "cancel-cache"
+cancel_flags = ("--download-cache", str(cancel_cache))
+(case / "mode").write_text("blocked-body\n")
+process = subprocess.Popen(command(extra=cancel_flags), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+try:
+    until = time.monotonic() + 10
+    while time.monotonic() < until and not (case / "body-blocked").exists() and process.poll() is None:
+        time.sleep(.025)
+    check("cached installer reaches an actual incomplete transfer", (case / "body-blocked").exists())
+    cancelled_payloads = Path(str(cancel_cache) + ".partial") / "artifacts"
+    cancelled_kept = payload_identity(cancelled_payloads)
+    check("only complete payloads are retained before cancellation", set(cancelled_kept) == {"demo-linux", "demo-linux-alias"})
+    before_competitor = len(calls())
+    run(2, extra=cancel_flags)
+    check("competing cached installer fails before remote acquisition", len(calls()) == before_competitor)
+    process.send_signal(signal.SIGTERM)
+    out, err = process.communicate(timeout=10)
+    check("cached cancellation reports its actual unactivated interrupted state", process.returncode == 5 and
+          json.loads(out)["exit_code"] == 5 and not json.loads(out)["activated"] and not cancel_cache.exists())
+    with Path(str(cancel_cache) + ".lock").open("rb") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        check("owned transfer releases cache custody before installer returns", payload_identity(cancelled_payloads) == cancelled_kept)
+finally:
+    if process.poll() is None:
+        process.kill()
+        process.wait()
+(case / "mode").write_text("normal\n")
+before_resume = len(calls())
+after_cancel = run(extra=cancel_flags)
+check("cancelled installer reuses retained payloads on retry", payload_calls(before_resume) == ["download 3"] and
+      after_cancel["download"]["acquisition"] == dict(reused_payloads=2, downloaded_payloads=1) and active() == identity)
 # Make a separately retained snapshot through the actual SLSA CLI, not a fake
 # downloaded directory. Offline and online must select the same generation.
 snapshot = case / "snapshot"

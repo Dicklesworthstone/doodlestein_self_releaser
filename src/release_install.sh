@@ -416,6 +416,7 @@ try:
     parser.add_argument("--dry-run", action="store_true", help="Authenticate and extract without changing installation state")
     parser.add_argument("--timeout", type=int, default=900, help="Per verification/extraction helper timeout, 1..86400 seconds")
     parser.add_argument("--download-jobs", type=int, help="With --fetch: concurrent payload downloads, 1..32 (default: 1)")
+    parser.add_argument("--download-cache", help="With --fetch: retain and resume this exact snapshot path, including during --dry-run")
     flags = [a.split("=", 1)[0] for a in sys.argv[2:] if a.startswith("--")]
     need(len(flags) == len(set(flags)), "duplicate installation option", 4)
     args = parser.parse_args(sys.argv[2:])
@@ -424,16 +425,30 @@ try:
     if args.download_jobs is not None:
         need(args.fetch, "--download-jobs requires --fetch", 4)
         need(1 <= args.download_jobs <= 32, "download jobs must be 1..32", 4)
+    need(args.download_cache is None or args.fetch, "--download-cache requires --fetch", 4)
     snapshot = None if args.fetch else plain(args.snapshot, "dir")
+    download_cache = None if args.download_cache is None else plain(args.download_cache)
     recipe_file = plain(args.recipe, "file")
     public = plain(args.public_key, "file")
     contract_file = None if args.release_contract is None else plain(args.release_contract, "file")
     prefix = plain(args.prefix)
     plain(prefix.parent, "dir")
-    for input_path in (recipe_file, public, *(() if snapshot is None else (snapshot,)),
-                       *(() if contract_file is None else (contract_file,))):
+    input_paths = (recipe_file, public, *(() if snapshot is None else (snapshot,)),
+                   *(() if contract_file is None else (contract_file,)))
+    for input_path in input_paths:
         need(prefix != input_path and prefix not in input_path.parents and input_path not in prefix.parents,
              "installation prefix overlaps selected inputs", 4)
+    if download_cache is not None:
+        plain(download_cache.parent, "dir")
+        # The fetch engine owns all three persistent names. Check the entire
+        # namespace before it creates a lock or retains any downloaded bytes.
+        # A cache is one exact release selection, never an input to repair.
+        cache_paths = (download_cache, plain(str(download_cache) + ".partial"), plain(str(download_cache) + ".lock"))
+        protected_paths = (prefix, plain(str(prefix) + ".lock"), *input_paths)
+        for cache_path in cache_paths:
+            for protected in protected_paths:
+                need(cache_path != protected and cache_path not in protected.parents and protected not in cache_path.parents,
+                     "download cache overlaps installation state or selected inputs", 4)
     selected = recipe(load(recipe_file, 1048576))
     recipe_pin = digest(recipe_file)
     key_pin = digest(public)
@@ -464,10 +479,11 @@ try:
             policy += ["--release-contract", str(held_contract)]
         fetched = None
         if args.fetch:
-            snapshot = work / "snapshot"
+            snapshot = work / "snapshot" if download_cache is None else download_cache
             scheduling = [] if args.download_jobs is None else ["--jobs", str(args.download_jobs)]
+            recovery = [] if download_cache is None else ["--resume"]
             output = helper(["bash", str(module / "slsa_remote.sh"), "fetch-release", "--output-dir", str(snapshot),
-                             "--public-key", str(work / "trusted.pub"), *policy, *scheduling], work, network=True)
+                             "--public-key", str(work / "trusted.pub"), *policy, *scheduling, *recovery], work, network=True)
             fetched = json.loads(output, object_pairs_hook=pairs)
             need(isinstance(fetched, dict) and fetched.get("kind") == "dsr-slsa-fetch" and
                  fetched.get("status") == "verified" and fetched.get("authenticated") is True and
@@ -503,6 +519,12 @@ try:
                  observation.get("signature", {}).get("sha256") == verified["signature_sha256"] and
                  observation.get("build_manifest_sha256") == verified["build_manifest_sha256"] and
                  observation.get("invocation_id") == verified["invocation_id"], "download and local authentication disagree")
+            if download_cache is not None:
+                acquisition = fetched.get("acquisition")
+                need(fetched.get("resumable") is True and fetched.get("checkpoint") == str(download_cache) + ".partial" and
+                     isinstance(acquisition, dict) and set(acquisition) == {"reused_payloads", "downloaded_payloads"} and
+                     all(type(count) is int and count >= 0 for count in acquisition.values()) and
+                     sum(acquisition.values()) == len(verified["artifacts"]), "invalid resumable download handoff")
         records = {a["name"]: a for a in verified["artifacts"]}
         # The physical platform is not a compiler/ABI selection. Authenticate
         # first, then compare the recipe to the signed records themselves.
@@ -621,6 +643,8 @@ try:
             # and a subsequent re-download select the same installed bytes.
             result["download"] = dict(kind=fetched["kind"], snapshot_sha256=verified["snapshot_sha256"],
                                       verification=observation)
+            if download_cache is not None:
+                result["download"].update(cache=str(download_cache), resumable=True, acquisition=acquisition)
         if not args.dry_run:
             lock_path = plain(str(prefix) + ".lock")
             lockfd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)

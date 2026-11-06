@@ -157,6 +157,7 @@ try:
     parser.add_argument("--inspect", action="store_true", help="Print embedded policy and engine hashes, without authentication or writes")
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--download-jobs", type=int, help="Online only: concurrent payload downloads, 1..32 (default: 1)")
+    parser.add_argument("--download-cache", help="Online only: retain and resume this exact snapshot path, including during --dry-run")
     flags = [a.split("=", 1)[0] for a in sys.argv[1:] if a.startswith("--")]
     need(len(flags) == len(set(flags)), "duplicate installer option")
     args = parser.parse_args()
@@ -166,6 +167,7 @@ try:
              ".." not in args.target_triple, "invalid compiler variant")
     need(1 <= args.timeout <= 86400, "timeout must be 1..86400")
     need(not args.allow_draft or args.snapshot is None, "--allow-draft is online-only")
+    need(args.download_cache is None or args.snapshot is None, "--download-cache is online-only")
     if args.download_jobs is not None:
         need(args.snapshot is None, "--download-jobs is online-only")
         need(1 <= args.download_jobs <= 32, "download jobs must be 1..32")
@@ -251,6 +253,8 @@ try:
         command += ["--snapshot", args.snapshot] if args.snapshot is not None else ["--fetch"]
         if args.download_jobs is not None:
             command += ["--download-jobs", str(args.download_jobs)]
+        if args.download_cache is not None:
+            command += ["--download-cache", args.download_cache]
         if "release_contract" in policy:
             # This is fixed publisher-selected policy, never read from the
             # downloaded snapshot and never overridable by a runtime option.

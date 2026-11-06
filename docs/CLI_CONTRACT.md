@@ -1704,6 +1704,18 @@ recipe pair; unresolved or nonstandard matrices require `--target-triple`.
 See [authenticated installation](RELEASE_INSTALLATION.md) for the snapshot,
 recipe, independent contract and activation requirements.
 
+With `--fetch`, `--download-cache DIR` opts into the shared resumable acquisition
+engine. `DIR` is the exact persistent snapshot destination and its parent must
+exist. The destination, adjacent `.partial` checkpoint and `.lock` must be
+canonical and disjoint from the installation and policy inputs. Retries authenticate current remote proof
+and every retained payload before downloading missing assets. Changed policy,
+key, release generation or inventory refuses reuse; no cache is silently
+repaired or treated as offline authority. The result's `download.acquisition`
+reports reused and newly downloaded payload counts outside generation identity.
+The option is rejected with `--snapshot`; generated standalone release installers
+accept the same runtime option. With explicit cache selection, `--dry-run` may
+write download storage and its lock while leaving installation state unchanged.
+
 Both global `--dry-run` and command-local `--dry-run` are supported for
 `generate-release` and `install`. Generation validates the policy, key, captured
 engines, recipes, resulting script and existing-output conflict before returning

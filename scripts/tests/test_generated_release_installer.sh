@@ -178,6 +178,35 @@ try:
     check("streamed standalone installer accepts bounded parallel download scheduling without changing generation",
           parallel["status"] == "planned" and parallel["authenticated"] and
           parallel["generation"] == first["generation"] and pointer() == before)
+    # Each streamed execution unpacks into a different private directory. The
+    # persistent checkpoint must bind embedded policy/key bytes, not those
+    # transient paths, and reuse actual previously authenticated payloads.
+    cache = case / "standalone-download-cache"
+    cache_flags = ("--download-cache", str(cache))
+    (case / "mode").write_text("late-failure\n")
+    run(8, extra=cache_flags, piped=True)
+    partial = Path(str(cache) + ".partial")
+    kept = {p.name: (p.stat().st_ino, digest(p)) for p in (partial / "artifacts").iterdir()}
+    checkpoint = (partial / "selection.json").read_bytes()
+    check("streamed failure retains complete signed payloads without activating", set(kept) == {"demo-linux.tar.gz", "demo-linux-alias"} and
+          not cache.exists() and pointer() == before)
+    (case / "mode").write_text("normal\n")
+    before_cache = len((case / "calls").read_text().splitlines())
+    resumed = run(extra=(*cache_flags, "--download-jobs", "2", "--dry-run"), piped=True, dest=case / "cache-fill-preview")
+    transfers = [c for c in (case / "calls").read_text().splitlines()[before_cache:] if c.startswith("download ")]
+    check("detached generated retry downloads only proof and missing payload", transfers == ["download 4", "download 5", "download 3"] and
+          resumed["download"]["acquisition"] == dict(reused_payloads=2, downloaded_payloads=1))
+    check("generated cache survives changing unpack directories and worker count", (partial / "selection.json").read_bytes() == checkpoint and
+          all(((partial / "artifacts" / name).stat().st_ino, digest(partial / "artifacts" / name)) == saved for name, saved in kept.items()) and
+          resumed["generation"] == first["generation"] and resumed["status"] == "planned" and
+          not (case / "cache-fill-preview").exists() and not (case / "cache-fill-preview.lock").exists() and pointer() == before)
+    before_cache = len((case / "calls").read_text().splitlines())
+    cached_plan = run(extra=(*cache_flags, "--dry-run"), piped=True, dest=case / "cached-plan-prefix")
+    check("generated cached planning reauthenticates without payload downloads or prefix writes",
+          [c for c in (case / "calls").read_text().splitlines()[before_cache:] if c.startswith("download ")] == ["download 4", "download 5"] and
+          cached_plan["download"]["acquisition"] == dict(reused_payloads=3, downloaded_payloads=0) and
+          cached_plan["download"]["cache"] == str(cache) and cached_plan["status"] == "planned" and
+          not (case / "cached-plan-prefix").exists() and not (case / "cached-plan-prefix.lock").exists())
     again = run(extra=("--snapshot", str(snapshot)))
     check("offline retry selects the same signed generation", again["generation"] == first["generation"] and not again["activated"] and pointer() == before)
     calls = (case / "calls").read_bytes()
@@ -186,7 +215,9 @@ try:
                  ("--version", "v2.0.0"), ("--timeout", "1", "--timeout", "2"),
                  ("--download-jobs", "0"), ("--download-jobs", "33"), ("--download-jobs", "many"),
                  ("--download-jobs", "2", "--download-jobs", "3"),
-                 ("--snapshot", str(snapshot), "--download-jobs", "1")):
+                 ("--snapshot", str(snapshot), "--download-jobs", "1"),
+                 ("--snapshot", str(snapshot), *cache_flags), (*cache_flags, *cache_flags),
+                 ("--download-cache", str(prefix)), ("--download-cache", "relative-cache")):
         run(4, extra=args)
     check("runtime cannot weaken embedded policy or execute source fallback", (case / "calls").read_bytes() == calls and pointer() == before)
     # Even the platform not installed locally must remain complete and signed.
@@ -198,6 +229,7 @@ try:
     payload.write_bytes(old)
     (case / "mode").write_text("network-failure\n")
     run(8)
+    run(8, extra=cache_flags, piped=True)
     check("online failure cannot silently fall back to unverified local data", pointer() == before)
     run(extra=("--snapshot", str(snapshot)))
     (case / "mode").write_text("normal\n")

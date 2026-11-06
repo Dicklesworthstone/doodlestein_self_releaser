@@ -57,13 +57,66 @@ worker pool. Changing this scheduling limit changes neither trust policy nor
 generation identity. The same whole-release authentication and cancellation
 rules still apply. `--download-jobs` is rejected with `--snapshot`.
 
+### Retain downloads across attempts
+
+Add `--download-cache DIR` to keep the exact snapshot and resume its acquisition
+after a failed connection, timeout or interrupted installation:
+
+```bash
+dsr installer install --fetch \
+  --download-cache /home/alice/.cache/dsr/demo-v1.2.3 --download-jobs 4 \
+  --recipe /srv/policies/demo-install.json --prefix /home/alice/.local/demo \
+  --repo OWNER/REPO --tag v1.2.3 --sha "$REVIEWED_SOURCE_COMMIT" \
+  --builder "$TRUSTED_BUILDER_ID" --public-key /srv/keys/release.pub \
+  --targets linux/amd64,darwin/arm64,windows/arm64
+```
+
+`DIR` is one exact retained snapshot destination, with an existing parent. It
+is not a root under which the installer discovers or selects a release. On the
+first attempt select a new path; the shared fetch engine manages `DIR.partial`
+for completed payloads and `DIR.lock` for exclusive acquisition. All three
+paths must be canonical absolute paths without symlinks and must not overlap
+the installation prefix or its lock, recipe, public key or release contract.
+New cache storage is private. The installer does not delete or repair an
+existing cache or substitute a new release under the same path.
+
+Repeat the command with the same independent release policy and key bytes.
+The existing [resumable fetch](RELEASE_SNAPSHOTS.md#resume-an-interrupted-download)
+authenticates the current remote proof, checks the frozen release and complete
+inventory, and rehashes every retained payload before requesting missing ones.
+Only complete, verified payloads survive an interrupted transfer; a partially
+downloaded individual file starts again from byte zero. Changed policy, key,
+release identity or inventory, and corrupt or unrelated retained files, refuse
+reuse. Choose another new destination for a different release generation;
+`--replace` only authorizes changing the installed generation.
+
+A completed retry still checks current GitHub state and fetches the small
+statement/signature pair. It never treats a saved success receipt as
+authentication or silently switches to offline mode after a network failure.
+Installation then performs the same full offline authentication and private
+payload staging as any other fetch. A new prefix or download worker count does
+not change the cache's release selection or the authenticated generation.
+
+With an explicitly selected cache, **`--dry-run` can create and update download
+storage**, including its checkpoint and lock. It still creates no installation
+prefix, installation lock or active pointer. Completed downloads remain useful
+for the subsequent real install. Without `--download-cache`, fetch staging
+remains temporary and each retry downloads again.
+
+The online result's `download` object adds `cache`, `resumable: true`, and
+`acquisition.reused_payloads` / `acquisition.downloaded_payloads`. Reused counts
+describe locally reauthenticated payloads, not fresh HTTP body reads. Cache
+paths and acquisition counts are excluded from generation identity. To use a
+completed cache deliberately without network access, pass its exact `DIR` as
+`--snapshot DIR`; `--download-cache` is rejected with `--snapshot`.
+
 The result includes a `download` observation for online mode, without private
 temporary paths or credentials. `remote_current` remains `false`: an observation
 made during fetch is not a continuing promise that GitHub state has not changed.
 Re-downloading the same release or selecting an equivalent offline snapshot
 produces the same generation identity; transport receipts are not part of that
-identity. Every online retry fetches again rather than trusting a cached success.
-Use the separate `fetch-release` command to keep an offline snapshot permanently.
+identity. The separate `fetch-release` command can also retain a snapshot without
+installing it.
 
 The public command delegates to the same strict `src/release_install.sh` engine.
 Use `dsr installer install --help` for its complete argument list. It accepts no
