@@ -84,11 +84,17 @@ json_mode, dry = sys.argv[1]=='true', sys.argv[2]=='true'
 args = sys.argv[3:]
 assert not any(a in ('-c','--checksums','--verify-checksums') or a.startswith('--checksum-') for a in args), 'old checksum sampler called'
 assert args[:2] == ['app','1.2.3'], args
+if 'selected_artifacts' in spec:
+    assert args[2:4] == ['--artifacts',spec['selected_artifacts']], args
 repair = '--fix' in args
 log=base/'metadata.jsonl'
 previous = [json.loads(r) for r in log.read_text().splitlines()] if log.exists() else []
 phase = 'repair' if repair else 'after' if previous else 'before'
 with log.open('a') as f: f.write(json.dumps(dict(phase=phase,dry_run=dry,argv=args))+'\n')
+if phase=='before' and 'artifacts_alias' in spec:
+    alias=Path(spec['artifacts_alias'])
+    alias.rename(alias.with_name(alias.name+'.retained'))
+    alias.symlink_to(spec['other_artifacts'],target_is_directory=True)
 if spec.get('metadata_mode')=='malformed':
     print('not JSON'); sys.exit(0)
 if repair and spec.get('metadata_mode')=='cancel-repair':
@@ -232,6 +238,47 @@ def execute(label, expected=0, extra=(), mutate=None, dry=False, mode=None, chec
         if 'verification_evidence_dir' in value['details']:
             check(label+': persisted outer result matches stdout',json.loads((Path(value['details']['verification_evidence_dir'])/'result.json').read_text())==value)
     return base,spec,env,value
+
+def test_custom_artifact_selection():
+    for label,fix,dry,expected in [('custom-read-only',False,False,0),
+                                   ('custom-repair',True,False,0),
+                                   ('custom-dry-run',True,True,1)]:
+        base,spec,env=fixture(label)
+        selected=base/'custom signed artifacts';selected.mkdir()
+        other=base/'different artifacts';other.mkdir()
+        alias=base/'selected alias';alias.symlink_to(selected,target_is_directory=True)
+        spec.update(selected_artifacts=str(selected.resolve()),artifacts_alias=str(alias),other_artifacts=str(other))
+        if fix:spec['missing_row']=spec['assets'].pop(4)
+        save(base/'fixture.json',spec)
+        extra=['--artifacts',str(alias)]+(['--fix'] if fix else [])
+        result=subprocess.run(command(extra,dry),env=env,capture_output=True,timeout=120)
+        (base/'stdout').write_bytes(result.stdout);(base/'stderr').write_bytes(result.stderr)
+        check(label+' preserves checksum verification status',result.returncode==expected)
+        rows=calls(base,'metadata.jsonl')
+        check(label+' forwards one canonical artifact selection to every metadata call',
+              [row['phase'] for row in rows]==(['before','repair'] if dry else
+                  ['before','repair','after'] if fix else ['before','after']) and
+              all(row['argv'][2:4]==['--artifacts',str(selected.resolve())] for row in rows) and
+              alias.resolve()==other.resolve())
+        check(label+' preserves repair write policy',(base/'repair-write').exists()==(fix and not dry))
+        if not dry:
+            check(label+' verifies every eligible checksum after artifact selection',
+                  json.loads(result.stdout)['details']['checksums']['verified_count']==5)
+    for label,kind in [('missing-artifact-selection','missing'),('non-directory-selection','file'),
+                       ('empty-artifact-selection','empty')]:
+        base,spec,env=fixture(label)
+        path=base/'selected'
+        if kind=='file':path.write_text('not a directory\n')
+        argument='' if kind=='empty' else str(path)
+        result=subprocess.run(command(['--artifacts',argument,'--fix']),env=env,capture_output=True,timeout=20)
+        check(label+' refuses before metadata or remote acquisition',result.returncode==4 and
+              not calls(base,'metadata.jsonl') and not calls(base,'http.jsonl'))
+
+
+test_custom_artifact_selection()
+if os.environ.get('DSR_TEST_VERIFY_CUSTOM_ARTIFACTS_ONLY')=='1':
+    print(json.dumps({'checks':passed,'passed':True,'fixtures':str(work)}),flush=True)
+    raise SystemExit(0)
 
 base,spec,env,value=execute('full-five')
 envelope_schema=json.loads((root/'schemas/envelope.json').read_text())

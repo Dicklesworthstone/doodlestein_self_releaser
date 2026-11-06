@@ -3180,7 +3180,7 @@ test_verify_fix_borrows_registered_caller_custody() { _verify_fix_custody_borrow
 test_verify_fix_borrows_both_leases_on_early_error() { _verify_fix_custody_borrow_case local_error; }
 
 _verify_ordinary_repair_case() {
-    local mode="$1" expected_status="$2" label="$3"
+    local mode="$1" expected_status="$2" label="$3" custom_artifacts="${4:-false}"
     ((TESTS_RUN++))
     if [[ "$HAS_YQ" != true ]]; then
         skip "yq required for repos.yaml parsing"
@@ -3193,12 +3193,19 @@ _verify_ordinary_repair_case() {
         harness_teardown
         return 0
     fi
+    local -a artifact_options=()
+    if [[ "$custom_artifacts" == true ]]; then
+        local selected="$TEST_TMPDIR/custom signed artifacts"
+        mv "$DSR_STATE_DIR/artifacts/test-tool-v1.0.0" "$selected" || return 1
+        ln -s "$selected" "$TEST_TMPDIR/selected artifacts" || return 1
+        artifact_options=(--artifacts "$TEST_TMPDIR/selected artifacts")
+    fi
     create_ordinary_verify_repair_mock
     DSR_GH_TOKEN=release-fixture-token GITHUB_TOKEN=ci-fixture-token \
         GH_TOKEN=ambient-fixture-token GH_HOST=enterprise.fixture.invalid \
         GH_MAX_RETRIES=1 GH_RETRY_DELAY=0 \
         PATH="$TEST_TMPDIR/bin:$PATH" exec_run \
-        "$DSR_CMD" --json release verify test-tool v1.0.0 --fix
+        "$DSR_CMD" --json release verify test-tool v1.0.0 --fix ${artifact_options[@]+"${artifact_options[@]}"}
     local status expected_posts=1 report_filter='true'
     status=$(exec_status)
     case "$mode" in
@@ -3307,6 +3314,45 @@ test_verify_fix_attempts_upload() {
 test_verify_fix_uses_selected_github_identity() {
     _verify_ordinary_repair_case complete 0 \
         "ordinary repair verifies final assets using the selected public-GitHub identity"
+}
+
+test_verify_fix_uses_custom_artifacts() {
+    _verify_ordinary_repair_case complete 0 \
+        "ordinary repair uploads and verifies the selected custom artifacts through a directory alias" true
+}
+
+test_verify_custom_manifest_identity() {
+    ((TESTS_RUN++))
+    if [[ "$HAS_YQ" != true ]]; then
+        skip "yq required for repos.yaml parsing"
+        return 0
+    fi
+    harness_setup
+    seed_repos_config
+    seed_ordinary_verify_repair complete || return 1
+    local selected="$TEST_TMPDIR/different artifacts" mutation status failures=0
+    mkdir -p "$selected" || return 1
+    for mutation in '.tool = "other-tool"' '.version = "v9.9.9"' '.status = "failed"'; do
+        jq "$mutation" "$DSR_STATE_DIR/artifacts/test-tool-v1.0.0/test-tool-v1.0.0-manifest.json" \
+            > "$selected/test-tool-v1.0.0-manifest.json" || return 1
+        create_ordinary_verify_repair_mock
+        DSR_GH_TOKEN=release-fixture-token GH_MAX_RETRIES=1 GH_RETRY_DELAY=0 \
+            PATH="$TEST_TMPDIR/bin:$PATH" exec_run \
+            "$DSR_CMD" --json release verify test-tool v1.0.0 --fix --artifacts "$selected"
+        status=$(exec_status)
+        if [[ "$status" != 4 || -s "$ORDINARY_REPAIR_ROOT/uploads" ]] ||
+           ! exec_stderr_contains "Selected manifest does not describe a successful build"; then
+            failures=$((failures+1))
+            exec_stderr
+        fi
+    done
+    if [[ "$failures" == 0 ]]; then
+        pass "explicit ordinary selection rejects contradictory tool, version and build status without default fallback"
+    else
+        fail "explicit ordinary selection must bind its own manifest to the requested successful release"
+    fi
+    remove_ordinary_verify_repair_mock
+    harness_teardown
 }
 
 test_verify_fix_requires_remote_asset_after_upload() {
@@ -3655,6 +3701,8 @@ test_strict_fix_final_get_rejects_postcheck_asset_flip
 test_strict_fix_dry_run_leaves_draft_and_sidecars_untouched
 test_verify_fix_attempts_upload
 test_verify_fix_uses_selected_github_identity
+test_verify_fix_uses_custom_artifacts
+test_verify_custom_manifest_identity
 test_verify_fix_requires_remote_asset_after_upload
 test_verify_fix_rejects_changed_remote_bytes
 test_verify_fix_rejects_replaced_asset_id

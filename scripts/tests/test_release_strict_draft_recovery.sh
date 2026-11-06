@@ -33,7 +33,7 @@ source = Path(os.environ.get('DSR_TEST_COMMAND_FILE', str(root / 'dsr'))).read_t
 names = re.findall(r'^(_release_[A-Za-z0-9_]+)\(\) \{', source, re.M)
 names += ['_source_release_read_private_receipt', '_source_release_metadata_matches',
           '_source_release_restore_draft', '_source_release_identity',
-          '_source_release_inputs_match', 'cmd_release_finalize', 'cmd_release', 'cmd_fallback']
+          '_source_release_inputs_match', 'cmd_release_finalize', 'cmd_release', 'cmd_release_verify', 'cmd_fallback']
 functions = work / 'functions.sh'
 functions.write_text('\n'.join(re.search(r'^' + re.escape(n) + r'\(\) \{\n.*?^\}', source, re.M | re.S).group(0) for n in names))
 print('Fixtures: ' + str(work), flush=True)
@@ -161,7 +161,7 @@ mktemp() {
 }
 DRY_RUN=false
 JSON_MODE=false
-if [[ "$1" == create || "$1" == fallback ]]; then
+if [[ "$1" == create || "$1" == fallback || "$1" == verify ]]; then
     mode="$1"
     shift
     # Retain the real API adapter and creation producer. Only HTTP transport
@@ -185,6 +185,9 @@ if [[ "$1" == create || "$1" == fallback ]]; then
     JSON_MODE=true
     if [[ "$mode" == create ]]; then
         cmd_release app 1.2.3 --draft --no-dispatch "$@"
+    elif [[ "$mode" == verify ]]; then
+        DRY_RUN="$1"; shift
+        cmd_release_verify app 1.2.3 "$@"
     else
         # These are only quality/build execution boundaries. Every source,
         # checkpoint, manifest, signature, custody and publication gate is real.
@@ -691,6 +694,102 @@ exit "$status"
               lease_available(c,'v1.2.3') and lease_available(c,'1.2.3'))
 
 
+def test_custom_artifact_repair():
+    missing='payload.tar.gz.minisig'
+    c,env,_,_=setup('custom-artifact-repair',{'absent':True,'fail_upload_name':missing})
+    default=c/'state/artifacts/app-v1.2.3'
+    artifacts=c/'custom signed artifacts'
+    default.rename(artifacts)
+    selected=c/'selected artifacts'
+    selected.symlink_to(artifacts,target_is_directory=True)
+
+    def requests():
+        return [json.loads(line) for line in (c/'requests.jsonl').read_text().splitlines()]
+
+    def mutations(rows):
+        return [row for row in rows if '--post' in row or '--method' in row or row[0]=='upload-boundary']
+
+    def inventory(directory):
+        return {str(path.relative_to(directory)):(path.stat().st_ino,path.stat().st_mtime_ns,
+                hashlib.sha256(path.read_bytes()).hexdigest())
+                for path in directory.rglob('*') if path.is_file() and not path.is_symlink()}
+
+    def verify(label,options=(),dry=False):
+        start=len(requests())
+        result=subprocess.run(['bash','-c',script,'fixture','verify',str(dry).lower(),*options],
+                              env=env,capture_output=True,text=True)
+        (c/(label+'.stdout')).write_text(result.stdout)
+        (c/(label+'.stderr')).write_text(result.stderr)
+        return result,requests()[start:]
+
+    created=subprocess.run(['bash','-c',script,'fixture','create','--artifacts',str(selected)],
+                           env=env,capture_output=True,text=True)
+    (c/'create.stdout').write_text(created.stdout)
+    (c/'create.stderr').write_text(created.stderr)
+    check('custom repair begins with an actual interrupted strict draft',created.returncode!=0 and
+          json.loads((c/'remote.json').read_text())['draft'] is True and
+          sum('--post' in row for row in requests())==1)
+    details=json.loads(created.stdout)['details']
+    response=Path(details['create_response'])
+    original=response.read_bytes();original_inode=response.stat().st_ino
+    check('interrupted producer preserves custom output and original creation authority',
+          details['artifacts_dir']==str(artifacts) and not default.exists() and response.is_file())
+
+    before=inventory(artifacts)
+    state_before=inventory(c/'state')
+    result,rows=verify('preview',['--artifacts',str(selected),'--fix'],dry=True)
+    report=json.loads(result.stdout) if result.stdout.strip() else {}
+    check('custom repair preview selects the actual missing signed asset',result.returncode==1 and
+          report.get('details',{}).get('repair')=={'dry_run':True,'uploads':[missing]})
+    check('custom repair preview leaves remote assets and retained files unchanged',not mutations(rows) and
+          inventory(artifacts)==before and inventory(c/'state')==state_before)
+
+    # A valid default tree must not rescue an explicitly invalid selection.
+    shutil.copytree(artifacts,default)
+    unrelated=c/'different artifacts';unrelated.mkdir()
+    file_path=c/'artifact-file';file_path.write_text('not a directory\n')
+    linked=c/'linked manifest';linked.mkdir()
+    (linked/'app-v1.2.3-manifest.json').symlink_to(artifacts/'app-v1.2.3-manifest.json')
+    for label,path in [('missing-directory',c/'absent'),('non-directory',file_path),
+                       ('different-directory',unrelated),('linked-manifest',linked)]:
+        result,rows=verify(label,['--artifacts',str(path),'--fix'])
+        check(label+' refuses before remote lookup without default fallback',result.returncode==4 and not rows)
+    default.rename(c/'retained default artifacts')
+
+    control=json.loads((c/'control.json').read_text());control.pop('fail_upload_name')
+    (c/'control.json').write_text(json.dumps(control))
+    result,rows=verify('repair',['--artifacts',str(selected),'--fix'])
+    check('custom artifact repair verifies the complete signed draft',result.returncode==0 and
+          json.loads(result.stdout)['details']['assets']['missing']==[] and
+          json.loads((c/'remote.json').read_text())['draft'] is True)
+    check('custom artifact repair uploads only the missing original bytes',
+          [row[2] for row in rows if row[0]=='upload-boundary']==[missing] and
+          all(row[0]=='upload-boundary' for row in mutations(rows)) and
+          not default.exists() and inventory(artifacts)==before)
+    check('custom repair retains the producer original response identity',
+          response.read_bytes()==original and response.stat().st_ino==original_inode)
+
+    env['TMPDIR']=details['finalization_tmpdir']
+    finalized,patches=invoke(c,env,response,flags=['app','1.2.3','--artifacts',str(selected),
+        '--create-response',str(response),'--no-dispatch'])
+    check('unchanged finalizer publishes the repaired custom-output draft',finalized.returncode==0 and
+          json.loads((c/'remote.json').read_text())['draft'] is False and
+          len(patches)==1 and patches[0][0]=='repos/owner/app/releases/9')
+    check('complete custom recovery never recreates its release or creation authority',
+          sum('--post' in row for row in requests())==1 and response.read_bytes()==original and
+          response.stat().st_ino==original_inode)
+
+    shutil.copytree(artifacts,default)
+    result,rows=verify('default-read-only')
+    check('default artifact lookup still verifies a complete strict release',result.returncode==0 and
+          json.loads(result.stdout)['details']['manifest_found'] is True and not mutations(rows))
+
+
+if os.environ.get('DSR_TEST_STRICT_CUSTOM_REPAIR_ONLY')=='1':
+    test_custom_artifact_repair()
+    print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
+    raise SystemExit(0)
+
 if os.environ.get('DSR_TEST_STRICT_FALLBACK_ONLY')=='1':
     test_fallback_recovery()
     print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
@@ -701,6 +800,9 @@ if os.environ.get('DSR_TEST_STRICT_CREATION_ONLY')!='1':
 if os.environ.get('DSR_TEST_STRICT_CUSTODY_ONLY')=='1':
     print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
     raise SystemExit(0)
+
+if os.environ.get('DSR_TEST_STRICT_CREATION_ONLY')!='1':
+    test_custom_artifact_repair()
 
 # Execute the complete producer-to-consumer handoff. The response's name,
 # bytes, permissions and directory come from production creation, not setup().

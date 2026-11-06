@@ -10623,6 +10623,8 @@ cmd_release_verify() {
     trap 'exit 5' HUP INT TERM
     local tool_name=""
     local version=""
+    local artifacts_dir=""
+    local artifacts_explicit=false
     local verify_checksums=false
     local fix_missing=false
 
@@ -10635,6 +10637,15 @@ cmd_release_verify() {
                 ;;
             --version|-V)
                 version="$2"
+                shift 2
+                ;;
+            --artifacts)
+                if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
+                    log_error "--artifacts requires an artifact directory"
+                    return 4
+                fi
+                artifacts_dir="$2"
+                artifacts_explicit=true
                 shift 2
                 ;;
             --verify-checksums|-c)
@@ -10656,6 +10667,7 @@ USAGE:
 OPTIONS:
     -t, --tool <name>       Tool to verify (or first positional arg)
     -V, --version <ver>     Version to verify (or second positional arg)
+    --artifacts <dir>      Existing artifact directory containing its own build manifest
     -c, --verify-checksums  Download assets and verify SHA256 checksums
     --fix                   Re-upload missing assets (strict contracts require a draft)
     --dry-run               With --fix, list the uploads without performing them
@@ -10763,7 +10775,9 @@ EOF
 
     # Reject local diagnostic/mixed authority before any remote lookup or repair.
     local state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
-    local artifacts_dir="$state_dir/artifacts/${tool_name}-${tag}"
+    if ! $artifacts_explicit; then
+        artifacts_dir="$state_dir/artifacts/${tool_name}-${tag}"
+    fi
 
     # Repair consumes the same manifest and payloads as publication and can
     # materialize strict sidecars. Protect the complete set from collection
@@ -10819,8 +10833,18 @@ EOF
         done
     fi
 
+    if $artifacts_explicit; then
+        if [[ ! -d "$artifacts_dir" ]] || ! artifacts_dir=$(cd -- "$artifacts_dir" && pwd -P); then
+            log_error "Selected artifact directory must already exist: $artifacts_dir"
+            return 4
+        fi
+    fi
     local manifest_file="$artifacts_dir/${tool_name}-${tag}-manifest.json"
-    if [[ ! -f "$manifest_file" ]]; then
+    if $artifacts_explicit && [[ ! -f "$manifest_file" ]]; then
+        log_error "Selected artifact directory requires its own build manifest: $manifest_file"
+        return 4
+    fi
+    if ! $artifacts_explicit && [[ ! -f "$manifest_file" ]]; then
         manifest_file="$state_dir/artifacts/${tool_name}-${tag}-manifest.json"
     fi
     if [[ -d "$artifacts_dir" ]]; then
@@ -10829,6 +10853,16 @@ EOF
     elif [[ -f "$manifest_file" ]] || $release_contract_enabled; then
         _release_require_publishable_artifacts "${manifest_file%/*}" "$manifest_file" \
             "$release_contract_enabled" || return 4
+    fi
+    if $artifacts_explicit && ! jq -es --arg tool "$tool_name" --arg tag "$tag" '
+        length == 1 and (.[0] |
+            (.tool == null or .tool == $tool) and
+            (.version == null or (.version | ltrimstr("v")) == ($tag | ltrimstr("v"))) and
+            (.status == null or .status == "success") and
+            (.summary.failed == null or .summary.failed == 0))
+    ' "$manifest_file" >/dev/null; then
+        log_error "Selected manifest does not describe a successful build of $tool_name $tag"
+        return 4
     fi
 
     # Record start time
@@ -11129,7 +11163,7 @@ EOF
             fi
         else
             for planned_fix in ${assets_to_fix[@]+"${assets_to_fix[@]}"}; do
-                if [[ -f "$state_dir/artifacts/${tool_name}-${tag}/$planned_fix" ]]; then
+                if [[ -f "$artifacts_dir/$planned_fix" ]]; then
                     planned_fixes+=("$planned_fix")
                 else
                     log_warn "  Not found locally: $planned_fix"
@@ -11148,10 +11182,6 @@ EOF
                 log_info "Attempting to re-upload ${#assets_to_fix[@]} missing or mismatched asset(s)..."
             fi
         fi
-        if ! $release_contract_enabled; then
-            artifacts_dir="$state_dir/artifacts/${tool_name}-${tag}"
-        fi
-
         if $release_contract_enabled; then
             local expected_assets_json strict_fix_failed=false
             local upload_result=""

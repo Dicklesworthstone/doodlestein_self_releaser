@@ -176,6 +176,8 @@ def metadata(phase, fix=False):
     if dry_run:
         command.append('--dry-run')
     command += ['release', 'verify', args.tool, args.version]
+    if args.artifacts is not None:
+        command += ['--artifacts', args.artifacts]
     if fix:
         command.append('--fix')
     code, path = run(command, phase)
@@ -308,6 +310,7 @@ try:
     parser.add_argument('selection', nargs='*', metavar='TOOL VERSION')
     parser.add_argument('--tool', '-t')
     parser.add_argument('--version', '-V')
+    parser.add_argument('--artifacts', help='Existing artifact directory containing its own build manifest')
     parser.add_argument('--verify-checksums', '--checksums', '-c', action='store_true', dest='verify_checksums')
     parser.add_argument('--fix', action='store_true')
     parser.add_argument('--checksum-mode', choices=('aggregate','sidecars'), default='aggregate')
@@ -336,6 +339,16 @@ try:
          'A safe tool name is required', 4)
     need(isinstance(args.version, str) and re.fullmatch(r'v?[0-9]+\.[0-9]+\.[0-9]+(?:[+-][A-Za-z0-9.+-]+)?', args.version),
          'An explicit version tag is required', 4)
+    if args.artifacts is not None:
+        need(bool(args.artifacts), '--artifacts requires an artifact directory', 4)
+        try:
+            selected_artifacts = Path(args.artifacts).resolve(strict=True)
+        except (OSError, RuntimeError):
+            raise Failure('Selected artifact directory must already exist', 4)
+        need(selected_artifacts.is_dir(), 'Selected artifact directory must already exist', 4)
+        # Freeze a directory alias once: every metadata/repair observation must
+        # consume the same selected directory throughout the checksum audit.
+        args.artifacts = str(selected_artifacts)
     need(cli.is_absolute() and cli.is_file(), 'The original dsr CLI is unavailable', 3)
     for dependency in ('release_checksums.sh', 'checksum_sync.sh'):
         need((module / dependency).is_file(), 'Required checksum module is unavailable: ' + dependency, 3)

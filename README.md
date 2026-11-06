@@ -910,16 +910,19 @@ command. Recovery cannot reconstruct creation custody from public release
 metadata. A lost or unsuccessful POST response may leave an observable draft,
 but does not supply finalization custody.
 Use `dsr release verify TOOL VERSION --fix` to repair missing draft assets
-(add `--dry-run` to list the uploads without performing them). Once
-all signed assets verify, finalize through DSR:
+(add `--dry-run` to list the uploads without performing them). For custom build
+output, pass `--artifacts "/path/to/signed artifacts"` using the creation result's
+`details.artifacts_dir`. Verification, repair, and complete checksum audits use
+that directory and its own build manifest; an explicit selection never falls
+back to artifacts in the default state directory. Once all signed assets
+verify, finalize through DSR:
 
 ```bash
 TMPDIR=/private/scratch dsr release finalize TOOL VERSION --create-response /private/scratch/dsr-api-response.ABCDEF12 --no-dispatch
 ```
 
-For custom build output, add `--artifacts "/path/to/signed artifacts"` using
-the creation result's `details.artifacts_dir`. Without this option, finalization
-uses `$DSR_STATE_DIR/artifacts/<tool>-<tag>`. The selected directory must already
+Use the same `--artifacts` selection for finalization. Without this option,
+finalization uses `$DSR_STATE_DIR/artifacts/<tool>-<tag>`. The selected directory must already
 exist; directory symlinks resolve to their physical path before the same signed
 asset, source, and custody checks run.
 

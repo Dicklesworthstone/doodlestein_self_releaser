@@ -958,6 +958,31 @@ An upload, inventory, source, or publication failure suppresses dispatch and
 upgrade hooks. A failed publication can be returned to draft only while its
 current nonce and metadata still prove ownership.
 
+`dsr release verify TOOL VERSION --artifacts DIR` selects an existing local
+artifact directory for manifest verification, `--fix` repair, and complete
+`--checksums` / `--verify-checksums` audits. Directory aliases resolve to their
+physical path. An explicit selection requires its own
+`<tool>-<tag>-manifest.json`; it never falls back to a default-state manifest or
+payload. Declared tool/version identity and successful-build fields must not
+contradict the selected release. Omitting `--artifacts` retains the existing
+default directory and legacy sidecar-manifest lookup.
+
+For interrupted publication from custom output, use the same directory in
+creation, repair, and finalization:
+
+```bash
+dsr release verify demo 1.2.3 --artifacts '/srv/build outputs/demo' --fix --dry-run
+dsr release verify demo 1.2.3 --artifacts '/srv/build outputs/demo' --fix
+```
+
+The complete-checksum supervisor resolves the selection once and forwards that
+same path to its metadata checks before and after auditing and to any requested
+repair. Retargeting the original directory alias cannot redirect a later phase.
+The selected artifact directory and the audit's `--checksum-output-dir` have
+separate purposes: the former holds the original build output and manifest;
+the latter holds downloaded verification evidence. Dry-run repair does not
+create an artifact directory, materialize sidecars, or upload files.
+
 Ordinary `dsr release verify TOOL VERSION --fix` binds repair to the observed
 GitHub release ID and a validated local manifest. It uploads through the shared
 verified upload helper and never clobbers existing assets. It verifies every
