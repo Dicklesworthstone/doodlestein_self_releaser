@@ -21,6 +21,8 @@ ACT_ARTIFACTS_DIR="${ACT_ARTIFACTS_DIR:-${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME
 ACT_LOGS_DIR="${ACT_LOGS_DIR:-${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/logs/$(date +%Y-%m-%d)/builds}"
 ACT_TIMEOUT="${ACT_TIMEOUT:-3600}"  # 1 hour default
 ACT_MIN_VERSION="${ACT_MIN_VERSION:-0.2.86}"
+_ACT_RUNNER_MODULE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || return 3
+export _ACT_RUNNER_MODULE_DIR
 
 # Colors for output (if not disabled)
 if [[ -z "${NO_COLOR:-}" && -t 2 ]]; then
@@ -2993,6 +2995,55 @@ except (OSError, ValueError) as exc:
 PY
 }
 
+# Keep source projection optional for existing single-repository callers and
+# minimal runner installations. Configured sibling workflows load one shared
+# planner for coordinator admission and the actual execution boundary.
+_act_load_source_layout() {
+    declare -F act_source_plan >/dev/null && return 0
+    # shellcheck source=SCRIPTDIR/act_source.sh
+    source "$_ACT_RUNNER_MODULE_DIR/act_source.sh"
+}
+
+_act_source_plan_for_tool() {
+    local tool="$1" target="$2" checkouts repo workflow job arguments
+    checkouts=$(_act_release_source_dependency_checkouts_json "$tool") || return 4
+    [[ "$checkouts" != '[]' ]] || { printf 'null\n'; return 0; }
+    _act_load_source_layout || return 3
+    repo=$(act_get_local_path "$tool") || return 4
+    workflow=$(yq -r '.workflow // ".github/workflows/release.yml"' "$ACT_REPOS_DIR/$tool.yaml") || return 4
+    job=$(act_get_job_for_target "$tool" "$target") || return 4
+    arguments=$(act_get_flags "$tool" "$target") || return 4
+    act_source_plan "$repo" "$workflow" "$job" "$checkouts" "$arguments"
+}
+
+# A planned sibling graph requires original evidence on every successful
+# attempt. Matching artifact bytes alone cannot replace a missing source
+# receipt, and a rewritten local receipt cannot change the admitted identity.
+_act_validate_workflow_source_result() {
+    local result="$1" expected="${2:-}" layout identity
+    layout=$(jq -c '.source_layout // null' <<< "$result") || return 4
+    if [[ -n "$expected" ]]; then
+        identity=$(jq -cS '.identity // null' <<< "$layout") || return 4
+        [[ "$identity" == "$(jq -cS . <<< "$expected")" ]] || {
+            _log_error "Workflow result lacks its admitted pinned source layout"
+            return 4
+        }
+    fi
+    [[ "$layout" != null ]] || return 0
+    _act_load_source_layout && act_source_verify "$layout"
+}
+
+_act_validate_workflow_source_results() {
+    local tool="$1" result="$2" row target plan
+    while IFS= read -r row; do
+        target=$(jq -r .platform <<< "$row") || return 4
+        plan=$(_act_source_plan_for_tool "$tool" "$target") || return 4
+        plan=$(jq -c '.identity // null' <<< "$plan") || return 4
+        _act_validate_workflow_source_result "$row" "$plan" || return 4
+    done < <(jq -c '.targets[] | select(.method == "act" and
+        (.status == "success" or .status == "ok" or .status == "passed"))' <<< "$result")
+}
+
 # Run a workflow via act
 # Usage: act_run_workflow <repo_path> <workflow> [job] [event] [version] [extra_args...]
 # Returns: exit code (0=success, 1=partial, 6=build failed, 3=dependency error)
@@ -3016,6 +3067,26 @@ act_run_workflow() {
         _act_shared_matrix_config_admission || return 4
     fi
 
+    local source_plan=null source_layout=null projected_workflow="$workflow"
+    if [[ -n "${_ACT_WORKFLOW_SOURCE_TOOL:-}" ]]; then
+        local source_checkouts source_arguments
+        source_checkouts=$(_act_release_source_dependency_checkouts_json "$_ACT_WORKFLOW_SOURCE_TOOL") || return 4
+        if [[ "$source_checkouts" != '[]' ]]; then
+            _act_load_source_layout || return 3
+            source_arguments=$(printf '%s\0' "${extra_args[@]}" | jq -Rsc 'split("\u0000")[:-1]') || return 4
+            [[ ${#extra_args[@]} -gt 0 ]] || source_arguments='[]'
+            source_plan=$(act_source_plan "$repo_path" "$workflow" "$job" "$source_checkouts" "$source_arguments") || return 4
+            if [[ -n "${_ACT_WORKFLOW_SOURCE_PLAN:-}" ]] &&
+               [[ "$(jq -cS .identity <<< "$source_plan")" != "$(jq -cS . <<< "$_ACT_WORKFLOW_SOURCE_PLAN")" ]]; then
+                _log_error "Workflow source layout changed after task admission"
+                return 4
+            fi
+        elif [[ -n "${_ACT_WORKFLOW_SOURCE_PLAN:-}" && "$_ACT_WORKFLOW_SOURCE_PLAN" != null ]]; then
+            _log_error "Pinned workflow sources disappeared after task admission"
+            return 4
+        fi
+    fi
+
     # A timestamp and $$ are shared by sibling Bash workers and quick
     # retries. Reserve a fresh private upload directory atomically, then use
     # its allocated identity for this invocation's independently owned log.
@@ -3032,10 +3103,17 @@ act_run_workflow() {
         return 1
     fi
 
+    if [[ "$source_plan" != null ]]; then
+        source_layout=$(act_source_materialize "$source_plan" \
+            "${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/act-sources") || return 4
+        projected_workflow=$(jq -r .projected_workflow <<< "$source_layout") || return 4
+        repo_path=$(jq -r .root <<< "$source_layout") || return 4
+    fi
+
     # Build act command
     local act_cmd=(
         act
-        -W "$workflow"
+        -W "$projected_workflow"
         --artifact-server-path "$artifact_dir"
     )
 
@@ -3072,7 +3150,7 @@ act_run_workflow() {
     fi
 
     local isolated_home=""
-    if _act_workflow_needs_writable_parent "$workflow_path"; then
+    if [[ "$source_layout" == null ]] && _act_workflow_needs_writable_parent "$workflow_path"; then
         isolated_home=$(_act_prepare_isolated_home) || return 1
         _log_warn "Workflow writes outside repo root; using isolated act config without --bind"
         _log_info "Isolated act home: $isolated_home"
@@ -3107,6 +3185,10 @@ act_run_workflow() {
     if [[ -z "$timeout_cmd" ]]; then
         _log_info "GNU timeout not available; supervising act with the portable deadline"
     fi
+    if [[ "$source_layout" != null ]] && ! act_source_verify "$source_layout"; then
+        _log_error "Pinned workflow source evidence changed before execution"
+        return 4
+    fi
     # The shared wrapper owns a separate process group, forwards orchestration
     # cancellation into it, and waits for escalation with either timer engine.
     if [[ -n "$isolated_home" ]]; then
@@ -3122,6 +3204,12 @@ act_run_workflow() {
             2>&1 | tee -a "$log_file"
     fi
     local exit_code=${PIPESTATUS[0]}
+    local source_valid=true
+    if [[ "$source_layout" != null ]] && ! act_source_verify "$source_layout"; then
+        _log_error "Pinned workflow source evidence changed during execution"
+        source_valid=false
+        exit_code=4
+    fi
 
     local end_time
     end_time=$(date +%s)
@@ -3131,7 +3219,9 @@ act_run_workflow() {
     local artifact_count status
     artifact_count=$(find "$artifact_dir" -type f 2>/dev/null | wc -l)
 
-    if [[ "$exit_code" -eq 0 ]]; then
+    if ! $source_valid; then
+        status="failed"
+    elif [[ "$exit_code" -eq 0 ]]; then
         _log_ok "Workflow completed successfully in ${duration}s"
         status="success"
     elif [[ "$exit_code" -eq 124 ]]; then
@@ -3155,6 +3245,7 @@ act_run_workflow() {
         --arg artifact_dir "$artifact_dir" \
         --argjson artifact_count "$artifact_count" \
         --arg log_file "$log_file" \
+        --argjson source_layout "$source_layout" \
         '{
             run_id: $run_id,
             workflow: $workflow,
@@ -3165,7 +3256,7 @@ act_run_workflow() {
             artifact_dir: $artifact_dir,
             artifact_count: $artifact_count,
             log_file: $log_file
-        }'
+        } + (if $source_layout == null then {} else {source_layout:$source_layout} end)'
 
     return "$exit_code"
 }
@@ -13781,6 +13872,7 @@ _act_target_result_available() {
     _act_build_purpose_matches "$result_json" "$purpose" "$require_purpose" || return 1
     jq -e '(.status == "success" or .status == "ok" or .status == "passed")' \
         <<< "$result_json" &>/dev/null || return 1
+    _act_validate_workflow_source_result "$result_json" "${4:-}" || return 1
     local expected actual
     expected=$(jq -ceS '
         .resume_artifacts |
@@ -13797,7 +13889,7 @@ _act_target_result_available() {
 _act_build_task_plan() {
     local tool="$1" version="$2" platforms_json="$3" strict="$4"
     local platform method triples triple key environment command command_template language binary_name
-    local plan='[]' config_file="$ACT_REPOS_DIR/${tool}.yaml"
+    local plan='[]' config_file="$ACT_REPOS_DIR/${tool}.yaml" workflow_source
     _act_workflow_payload_plans_json "$tool" "$version" >/dev/null || return 4
     language=$(yq -r '.language // ""' "$config_file") || return 4
     binary_name=$(yq -r '.binary_name // ""' "$config_file") || return 4
@@ -13828,9 +13920,15 @@ _act_build_task_plan() {
                     <<< "$plan") || return 4
             done <<< "$triples"
         else
+            workflow_source=null
+            if [[ "$method" == act ]]; then
+                workflow_source=$(_act_source_plan_for_tool "$tool" "$platform") || return 4
+                workflow_source=$(jq -c '.identity // null' <<< "$workflow_source") || return 4
+            fi
             plan=$(jq -c --arg key "$platform" --arg platform "$platform" \
-                --arg triple "$triples" --arg method "$method" \
-                '. + [{key:$key, platform:$platform, target_triple:$triple, method:$method}]' \
+                --arg triple "$triples" --arg method "$method" --argjson source "$workflow_source" \
+                '. + [{key:$key, platform:$platform, target_triple:$triple, method:$method} +
+                    (if $source == null then {} else {workflow_source:$source} end)]' \
                 <<< "$plan") || return 4
         fi
     done < <(jq -r '.[]' <<< "$platforms_json")
@@ -13861,6 +13959,7 @@ _act_build_orchestration_target() {
     local release_git_ref="${9:-}"
     local bound_host="${10:-}"
     local selected_triple="${11:-}"
+    local _ACT_WORKFLOW_SOURCE_PLAN="${12:-}" _ACT_WORKFLOW_SOURCE_TOOL="$tool_name"
 
     local host="${bound_host:-act-local}" remote_path_override="" ordinary_source_root=""
     if [[ "$strict_release_contract" == "true" ]]; then
@@ -13903,6 +14002,10 @@ _act_build_orchestration_target() {
         workflow="$ACT_REPO_WORKFLOW"
         local_path="$ACT_REPO_LOCAL_PATH"
         extra_flags=$(act_get_flags "$tool_name" "$target" | jq -c .) || return 4
+        if [[ -z "$_ACT_WORKFLOW_SOURCE_PLAN" ]]; then
+            _ACT_WORKFLOW_SOURCE_PLAN=$(_act_source_plan_for_tool "$tool_name" "$target") || return 4
+            _ACT_WORKFLOW_SOURCE_PLAN=$(jq -c '.identity // null' <<< "$_ACT_WORKFLOW_SOURCE_PLAN") || return 4
+        fi
         arguments_sha256=$(_act_sha256 /dev/stdin <<< "$extra_flags") || return 4
         if [[ "$workflow_plan" != null ]] && ! jq -e --arg arguments "$arguments_sha256" \
                 '.act_arguments_sha256 == $arguments' <<< "$workflow_plan" >/dev/null; then
@@ -13933,6 +14036,12 @@ _act_build_orchestration_target() {
         fi
         result=$(jq -c --arg target "$target" --arg method "act" --arg host "$host" \
             '. + {platform: $target, method: $method, host: $host}' <<< "$result")
+        if [[ "$exit_code" -eq 0 ]] &&
+           ! _act_validate_workflow_source_result "$result" "$_ACT_WORKFLOW_SOURCE_PLAN"; then
+            exit_code=4
+            result=$(jq -c '.status="failed" | .exit_code=4 |
+                .error="Workflow result does not retain the admitted pinned source layout"' <<< "$result") || return 4
+        fi
         # A workflow that exits 0 but uploads nothing gives the release no
         # binary; packaging would only warn and the build would still exit 0
         # (bd-1ldf).  A missing count is treated as zero: fail closed.
@@ -14131,6 +14240,7 @@ _act_run_target_worker() {
     local build_purpose="${14:-release}"
     local selected_triple="${15:-}" task_key="${16:-$target}"
     local source_sync_receipt="${17:-}"
+    local workflow_source_plan="${18:-null}"
     [[ -n "$source_sync_receipt" ]] || source_sync_receipt=null
 
     local host="${bound_host:-act-local}"
@@ -14315,7 +14425,7 @@ _act_run_target_worker() {
         _act_run_target_group "$log_path" _act_build_orchestration_target \
             "$tool_name" "$version" "$run_id" "$target" \
             "$strict_release_contract" "$release_contract_json" "$source_roots_json" \
-            "$release_git_sha" "$release_git_ref" "$host" "$selected_triple"
+            "$release_git_sha" "$release_git_ref" "$host" "$selected_triple" "$workflow_source_plan"
     }
     worker_pid="${_ACT_TARGET_GROUP_PID:-}"
     worker_result_fd="${_ACT_TARGET_GROUP[0]:-}"
@@ -15632,7 +15742,8 @@ act_orchestrate_build() {
             if [[ -n "$persisted_result" ]] && \
                _act_matrix_result_matches "$persisted_result" "$target" "$selected_triple" && \
                [[ "$(jq -r '.task_key // ""' <<< "$persisted_result")" == "$task_key" ]] && \
-               _act_target_result_available "$persisted_result" "$build_purpose" "$strict_release_contract"; then
+               _act_target_result_available "$persisted_result" "$build_purpose" "$strict_release_contract" \
+                    "$(jq -c '.workflow_source // null' <<< "$task_json")"; then
                 final_results["$task_key"]=$(jq -c '. + {resume_reused: true}' <<< "$persisted_result")
                 _log_info "Resume: reusing completed target $task_key"
                 continue
@@ -15646,7 +15757,8 @@ act_orchestrate_build() {
                 fi
                 if _act_matrix_result_matches "$recovered_result" "$target" "$selected_triple" &&
                    [[ "$(jq -r '.task_key // ""' <<< "$recovered_result")" == "$task_key" ]] &&
-                   _act_target_result_available "$recovered_result" "$build_purpose" "$strict_release_contract"; then
+                   _act_target_result_available "$recovered_result" "$build_purpose" "$strict_release_contract" \
+                        "$(jq -c '.workflow_source // null' <<< "$task_json")"; then
                     recovered_status=completed
                 elif jq -e --arg task_key "$task_key" --arg platform "$target" \
                         --arg triple "$selected_triple" '
@@ -15880,7 +15992,8 @@ act_orchestrate_build() {
         _act_run_target_worker "$tool_name" "$version" "$run_id" "$target" "$attempt" \
             "$log_path" "$result_path" "$strict_release_contract" \
             "$release_contract_json" "$source_roots_json" "$git_sha" "$git_ref" "$host" "$build_purpose" \
-            "$selected_triple" "$task_key" "$target_sync_receipt" </dev/null &
+            "$selected_triple" "$task_key" "$target_sync_receipt" \
+            "$(jq -c '.workflow_source // null' <<< "$task_json")" </dev/null &
         worker_pids+=("$!")
         worker_output_paths+=("$output_paths")
         worker_targets+=("$task_key")
@@ -16924,6 +17037,7 @@ act_generate_manifest() {
     fi
     config_validate_target_triples "$tool" || return 4
     _act_validate_native_matrix_result_inventory "$tool" "$result_json" || return 4
+    _act_validate_workflow_source_results "$tool" "$result_json" || return 4
     local verified_additional verified_workflow_files workflow_plans
     verified_additional=$(_act_additional_artifact_receipts_json "$tool" "$result_json") || return 4
     workflow_plans=$(_act_workflow_payload_plans_json "$tool" "$version") || return 4
@@ -17333,6 +17447,8 @@ act_generate_manifest() {
 # Export functions for use by other scripts
 export -f act_check_prereqs act_check act_version_is_supported act_list_jobs act_get_runner act_can_run
 export -f act_run_workflow act_collect_artifacts act_analyze_workflow act_cleanup
+export -f _act_load_source_layout _act_source_plan_for_tool _act_validate_workflow_source_result
+export -f _act_validate_workflow_source_results
 export -f act_load_repo_config act_get_job_for_target act_platform_uses_act
 export -f act_get_flags act_get_targets act_get_native_host act_get_build_strategy
 export -f _act_native_host_capability

@@ -202,15 +202,28 @@ cmd_build() {
         contexts=$(mktemp -d "$CASE/contexts.XXXXXXXX") || return 4
         _act_export_ordinary_git_contexts "$ACT_REPOS_DIR/tool.yaml" "$source" "$contexts" \
             > "$CASE/build-contexts.json" || return 4
-        if [[ "${_ACT_ISOLATED_SOURCE_IDENTITY:-null}" != null ]]; then
-            local sync tasks
+        if [[ "${_ACT_ISOLATED_SOURCE_IDENTITY:-null}" != null ]] &&
+           act_platform_uses_act tool linux/amd64; then
+            local sync tasks source_plan source_layout=null
             # Exercise the real act-only synchronization and per-target
             # receipt producers. The fixture compiler remains the boundary.
+            tasks=$(_act_build_task_plan tool 1.2.3 '["linux/amd64","darwin/arm64"]' false) || return 4
             sync=$(act_sync_sources tool --stage-ordinary -- linux/amd64 darwin/arm64) || return 4
-            tasks='[{"platform":"linux/amd64","method":"act"},{"platform":"darwin/arm64","method":"act"}]'
             sync=$(_act_validate_source_sync_receipt "$sync" "$tasks") || return 4
             printf '%s\n' "$sync" > "$CASE/build-source-sync.json"
             _act_target_source_sync_json "$sync" act > "$CASE/build-target-source-sync.json" || return 4
+            source_plan=$(_act_source_plan_for_tool tool linux/amd64) || return 4
+            if [[ "$source_plan" != null ]]; then
+                _act_load_source_layout || return 4
+                source_layout=$(act_source_materialize "$source_plan" "$CASE/workflow-sources") || return 4
+                # Both fixture targets select this one literal workflow job.
+                # Preserve the real projection evidence rather than inventing
+                # a successful source-layout receipt at the compiler boundary.
+                jq -e --argjson identity "$(jq -c .identity <<< "$source_layout")" \
+                    'all(.[]; .workflow_source == $identity)' <<< "$tasks" >/dev/null || return 4
+            fi
+            printf '%s\n' "$tasks" > "$CASE/build-tasks.json"
+            printf '%s\n' "$source_layout" > "$CASE/build-source-layout.json"
         fi
     fi
     local out="" arg
@@ -311,6 +324,20 @@ completed_fixture() {
     git -C "$CASE/source" init -q
     printf 'source code\n' > "$CASE/source/src.txt"
     git -C "$CASE/source" add src.txt
+    if [[ "${1:-}" == workflow ]]; then
+        mkdir -p "$CASE/source/.github/workflows" || return 1
+        cat > "$CASE/source/.github/workflows/release.yml" <<'YAML'
+name: Fixture release
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: test -f src.txt
+YAML
+        git -C "$CASE/source" add .github/workflows/release.yml || return 1
+    fi
     git -C "$CASE/source" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm source
     SOURCE_SHA=$(git -C "$CASE/source" rev-parse HEAD)
     cmd_build tool --version 1.2.3 --output-dir "$OUT" >/dev/null
@@ -935,16 +962,36 @@ test_expected_source_argument_refusal() {
 # Run isolated-source cases through the actual configuration/path consumers,
 # including strict dependency projection and ordinary Git-context export.
 isolated_fixture() {
-    completed_fixture
+    completed_fixture workflow || return 1
     git -C "$CASE/source" -c user.name=Fixture -c user.email=fixture@example.invalid \
         tag -am release v1.2.3 || return 1
     export DSR_CONFIG_DIR="$CASE" DSR_REPOS_FILE="$CASE/repos.yaml"
     jq -nc --arg path "$CASE/source" \
-        '{repo:"owner/tool",local_path:$path,language:"go",binary_name:"tool"}' > "$ACT_REPOS_DIR/tool.yaml"
+        '{repo:"owner/tool",local_path:$path,language:"go",binary_name:"tool",
+          workflow:".github/workflows/release.yml",targets:["linux/amd64","darwin/arm64"],
+          act_job_map:{"linux/amd64":"build","darwin/arm64":"build"}}' > "$ACT_REPOS_DIR/tool.yaml"
     # shellcheck source=/dev/null
     source <(awk '/^(config_get_tool_field|_config_read_single_mapping_json|_config_canonicalize_release_source_dependency_checkouts_json|_config_get_release_source_dependency_checkouts_json|config_get_release_source_dependencies_json)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$ROOT/src/config.sh")
     # shellcheck source=/dev/null
-    source <(awk '/^(_act_materialized_source_path|act_get_local_path|act_load_repo_config|_act_release_source_dependencies_json|_act_release_source_dependency_checkouts_json|_act_export_ordinary_git_contexts|_act_validate_isolated_cargo_paths|_act_sync_sibling_crates)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$ROOT/src/act_runner.sh")
+    source <(awk '/^(_act_materialized_source_path|act_get_local_path|act_load_repo_config|act_platform_uses_act|_act_release_source_dependencies_json|_act_release_source_dependency_checkouts_json|_act_export_ordinary_git_contexts|_act_validate_isolated_cargo_paths|_act_sync_sibling_crates)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$ROOT/src/act_runner.sh")
+}
+
+# The mock compiler retains production source plans and materialized layouts.
+# Seed only the checkpoint envelope here, so resume admission must verify that
+# original evidence against the new attempt's freshly resolved task identities.
+isolated_workflow_checkpoint() {
+    checkpoint completed
+    jq --slurpfile sync "$CASE/build-source-sync.json" \
+        --slurpfile target "$CASE/build-target-source-sync.json" \
+        --slurpfile tasks "$CASE/build-tasks.json" \
+        --slurpfile layout "$CASE/build-source-layout.json" '
+        .context.source_sync=$sync[0] | .context.build_tasks=$tasks[0] |
+        .source_sync_history=[{receipt:$sync[0]}] |
+        .target_statuses=($tasks[0] | map({key:.key,value:{status:"completed",result:
+            ({status:"success",method:.method,platform:.platform,source_sync:$target[0]} +
+             if $layout[0] == null then {} else {source_layout:$layout[0]} end)}}) | from_entries)
+    ' "$CASE/checkpoint.json" > "$CASE/workflow-checkpoint.json" || return 1
+    mv "$CASE/workflow-checkpoint.json" "$CASE/checkpoint.json"
 }
 
 test_isolated_source_preserves_checkout() {
@@ -1009,7 +1056,7 @@ test_isolated_source_retries_fresh() {
 }
 
 test_isolated_source_pinned_siblings() {
-    setup "isolated-sibling-$1"; isolated_fixture || return 1
+    setup "isolated-sibling-${2:-$1}"; isolated_fixture || return 1
     mkdir "$CASE/sibling"
     git -C "$CASE/sibling" init -q
     printf 'pinned dependency\n' > "$CASE/sibling/src.txt"
@@ -1043,11 +1090,86 @@ test_isolated_source_pinned_siblings() {
     snapshot=$(jq -r '.details.source_materialization.source_root' "$CASE/stdout")
     dependency="${snapshot%/*}/dependency"
     [[ "$(cat "$dependency/src.txt")" == 'pinned dependency' ]] || return 1
+    jq -e --arg sha "$SOURCE_SHA" --arg revision "$revision" \
+        '.source_materialization == {git_sha:$sha,submodules:[],
+            dependencies:[{relative_path:"dependency",git_sha:$revision,submodules:[]}]}' \
+        "$CASE/build-source-sync.json" >/dev/null || return 1
+    jq -e --slurpfile sync "$CASE/build-source-sync.json" \
+        '.status == "success" and .source_materialization == $sync[0].source_materialization' \
+        "$CASE/build-target-source-sync.json" >/dev/null || return 1
     jq -e --arg path "$dependency" --arg revision "$revision" \
         '.[0].local_path == $path and .[0].git_sha == $revision' "$CASE/build-dependencies.json" >/dev/null &&
         jq -e --arg path "$dependency" --arg revision "$revision" \
             'any(.[]; .relative_path == "dependency" and .local_path == $path and .context.git_sha == $revision)' \
             "$CASE/build-contexts.json" >/dev/null
+}
+
+test_isolated_source_sibling_graph_resume() {
+    local mode="$1" before filter='.'
+    test_isolated_source_pinned_siblings pinned "resume-graph-$mode" || return 1
+    before=$(jq -r '.details.source_materialization.source_root' "$CASE/stdout") || return 1
+    isolated_workflow_checkpoint || return 1
+    case "$mode" in
+        partial) filter='.status="partial" | .target_statuses["darwin/arm64"]={status:"failed"}' ;;
+        pending) filter='.status="failed" | .target_statuses |= with_entries(.value={status:"pending"})' ;;
+        context) filter='del(.context.source_sync.source_materialization)' ;;
+        history) filter='.source_sync_history[0].receipt.source_materialization.dependencies[0].git_sha=("f"*40)' ;;
+        embedded) filter='.target_statuses["linux/amd64"].result.source_sync.source_materialization.dependencies[0].git_sha=("f"*40)' ;;
+        missing-target) filter='del(.target_statuses["linux/amd64"].result.source_sync)' ;;
+        sidecar)
+            jq -nc --slurpfile source "$CASE/build-target-source-sync.json" '
+                {status:"success",source_sync:$source[0]} |
+                .source_sync.source_materialization.dependencies[0].git_sha=("f"*40)
+            ' > "$CASE/retained-sibling-result.json" || return 1
+            filter='.target_statuses["linux/amd64"].result_path=$path'
+            ;;
+        removed)
+            jq '.sibling_crates=[]' "$ACT_REPOS_DIR/tool.yaml" > "$CASE/removed-sibling-config.json" || return 1
+            mv "$CASE/removed-sibling-config.json" "$ACT_REPOS_DIR/tool.yaml"
+            ;;
+        layout-missing) filter='del(.target_statuses["linux/amd64"].result.source_layout)' ;;
+        layout-identity) filter='.target_statuses["linux/amd64"].result.source_layout.identity.workflow_sha256=("f"*64)' ;;
+        layout-method-missing) filter='del(.target_statuses["linux/amd64"].result.source_layout,.target_statuses["linux/amd64"].result.method)' ;;
+        layout-method-native) filter='del(.target_statuses["linux/amd64"].result.source_layout) | .target_statuses["linux/amd64"].result.method="native"' ;;
+        layout-plan-missing) filter='del(.context.build_tasks)' ;;
+        layout-bytes)
+            printf '\n' >> "$(jq -r .projected_workflow "$CASE/build-source-layout.json")" || return 1
+            ;;
+        layout-sidecar-matching|layout-sidecar-missing|layout-sidecar-identity)
+            jq '.target_statuses["linux/amd64"].result' "$CASE/checkpoint.json" \
+                > "$CASE/retained-sibling-result.json" || return 1
+            local sidecar_filter='.'
+            if [[ "$mode" == layout-sidecar-missing ]]; then
+                # A method label cannot downgrade the task's current source
+                # requirement, even when the embedded result remains valid.
+                sidecar_filter='del(.source_layout) | .method="native"'
+            elif [[ "$mode" == layout-sidecar-identity ]]; then
+                sidecar_filter='.source_layout.identity.dependencies[0].git_sha=("f"*40)'
+            fi
+            jq "$sidecar_filter" "$CASE/retained-sibling-result.json" \
+                > "$CASE/selected-sibling-result.json" || return 1
+            mv "$CASE/selected-sibling-result.json" "$CASE/retained-sibling-result.json"
+            filter='.target_statuses["linux/amd64"].result_path=$path'
+            ;;
+    esac
+    jq --arg path "$CASE/retained-sibling-result.json" "$filter" "$CASE/checkpoint.json" \
+        > "$CASE/selected-sibling-checkpoint.json" || return 1
+    mv "$CASE/selected-sibling-checkpoint.json" "$CASE/checkpoint.json"
+    : > "$CALLS"
+    run_fallback --expected-sha "$SOURCE_SHA" --isolate-source "--resume=$RUN"
+    case "$mode" in
+        matching|partial|pending|layout-sidecar-matching)
+            [[ "$RC" == 0 ]] && one_result || return 1
+            [[ "$(jq -r '.details.source_materialization.source_root' "$CASE/stdout")" != "$before" ]] || return 1
+            if [[ "$mode" == partial || "$mode" == pending ]]; then grep -q '^BUILD ' "$CALLS"
+            else ! grep -q '^BUILD ' "$CALLS"; fi
+            ;;
+        *)
+            [[ "$RC" == 4 ]] && one_result || return 1
+            jq -e '.details.phase == "resume"' "$CASE/stdout" >/dev/null &&
+                ! grep -q '^CHECK\|^BUILD\|^RELEASE ' "$CALLS"
+            ;;
+    esac
 }
 
 test_isolated_source_submodules() {
@@ -1129,14 +1251,7 @@ test_isolated_source_submodule_resume() {
     [[ "$mode" != sibling ]] || fixture_mode=sibling
     test_isolated_source_submodules "$fixture_mode" "resume-$mode" || return 1
     before=$(jq -r '.details.source_materialization.source_root' "$CASE/stdout") || return 1
-    checkpoint completed
-    jq --slurpfile sync "$CASE/build-source-sync.json" --slurpfile target "$CASE/build-target-source-sync.json" '
-        .context.source_sync=$sync[0] |
-        .source_sync_history=[{receipt:$sync[0]}] |
-        .target_statuses={"linux/amd64":{status:"completed",result:{status:"success",method:"act",source_sync:$target[0]}},
-                          "darwin/arm64":{status:"completed",result:{status:"success",method:"act",source_sync:$target[0]}}}
-    ' "$CASE/checkpoint.json" > "$CASE/graph-checkpoint.json" || return 1
-    mv "$CASE/graph-checkpoint.json" "$CASE/checkpoint.json"
+    isolated_workflow_checkpoint || return 1
     local filter='.'
     case "$mode" in
         partial) filter='.status="partial" | .target_statuses["darwin/arm64"]={status:"failed"}' ;;
@@ -1224,15 +1339,18 @@ test_isolated_source_sibling_resume() {
     git -C "$CASE/sibling" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm dependency
     local revision receipt
     revision=$(git -C "$CASE/sibling" rev-parse HEAD)
+    # This compatibility fixture describes an old native-host receipt, whose
+    # exact Git pins can remain sufficient when there are no nested children.
+    # An act result with siblings must instead retain its workflow projection.
     jq --arg path "$CASE/sibling" --arg revision "$revision" \
-        '.sibling_crates=[{relative_path:"dependency",local_path:$path,revision:$revision}]' \
+        '.sibling_crates=[{relative_path:"dependency",local_path:$path,revision:$revision}] | .act_job_map={}' \
         "$ACT_REPOS_DIR/tool.yaml" > "$CASE/sibling-config.json"
     mv "$CASE/sibling-config.json" "$ACT_REPOS_DIR/tool.yaml"
     receipt=$(jq -nc --arg sha "$SOURCE_SHA" --arg revision "$revision" \
         '{git_context:{git_sha:$sha},sibling_git_contexts:{dependency:{git_sha:$revision}}}')
     jq --argjson receipt "$receipt" '
         .context.source_sync=$receipt | .source_sync_history=[{receipt:$receipt}] |
-        .target_statuses=(.targets | map({key:.,value:{status:"completed",result:{status:"success",source_sync:$receipt}}}) | from_entries)
+        .target_statuses=(.targets | map({key:.,value:{status:"completed",result:{status:"success",method:"native",source_sync:$receipt}}}) | from_entries)
     ' "$CASE/checkpoint.json" > "$CASE/source-state.json"
     mv "$CASE/source-state.json" "$CASE/checkpoint.json"
     case "$1" in
@@ -1263,7 +1381,7 @@ test_isolated_source_sibling_resume() {
             config_digest=$(_release_sha256 "$ACT_REPOS_DIR/tool.yaml")
             jq --argjson tasks "$tasks" --arg digest "$config_digest" --argjson receipt "$receipt" '
                 .context.build_tasks=$tasks | .context.native_matrix_config_sha256=$digest |
-                .target_statuses=($tasks | map({key:.key,value:{status:"completed",result:{status:"success",source_sync:$receipt}}}) | from_entries)
+                .target_statuses=($tasks | map({key:.key,value:{status:"completed",result:{status:"success",method:"native",source_sync:$receipt}}}) | from_entries)
             ' "$CASE/checkpoint.json" > "$CASE/revised-state.json"
             printf 'third variant bytes\n' > "$OUT/variant"
             jq --argjson tasks "$tasks" --arg sha "$(_release_sha256 "$OUT/variant")" \
@@ -1424,6 +1542,13 @@ for mode in missing empty short zero duplicate version; do run_test test_expecte
 for mode in flag config resume build-only; do run_test test_isolated_source_preserves_checkout "$mode"; done
 run_test test_isolated_source_retries_fresh
 for mode in pinned unpinned mutated absolute; do run_test test_isolated_source_pinned_siblings "$mode"; done
+for mode in matching partial pending context history embedded missing-target sidecar removed; do
+    run_test test_isolated_source_sibling_graph_resume "$mode"
+done
+for mode in layout-missing layout-identity layout-method-missing layout-method-native layout-plan-missing \
+    layout-bytes layout-sidecar-matching layout-sidecar-missing layout-sidecar-identity; do
+    run_test test_isolated_source_sibling_graph_resume "$mode"
+done
 for mode in root sibling quality build signing absolute; do run_test test_isolated_source_submodules "$mode"; done
 for mode in matching sibling partial pending legacy context history embedded missing-target sidecar; do run_test test_isolated_source_submodule_resume "$mode"; done
 for mode in quality build signing; do run_test test_isolated_source_drift "$mode"; done

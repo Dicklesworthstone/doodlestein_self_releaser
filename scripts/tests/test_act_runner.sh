@@ -1806,7 +1806,8 @@ cmd_build typedact --version v1.0.0 --target linux/amd64 --no-sync --output-dir 
             peer_result.get("additional_artifacts") == [] and len(peer_result.get("artifact_paths", [])) == 6)
     manifest(peer, [peer_result], "primary-only-peer")
 
-    default = make_case("variants-default-triple", change=lambda c: c.pop("target_triples"))
+    default = make_case(("bound-variants-" if bound else "variants-") + "default-triple",
+                        change=lambda c: c.pop("target_triples"))
     status, default_result = finish(default, "amd64", launch(default))
     require("an existing workflow without target_triples keeps its default primary family",
             status == 0 and default_result.get("workflow_payload_plan", {}).get("primaries", [{}])[0].get("target_triple") == triples["amd64"])

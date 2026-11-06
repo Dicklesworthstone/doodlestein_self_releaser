@@ -327,6 +327,68 @@ act_overrides:
     path: target/release/${{ matrix.binary_name }}
 ```
 
+## Pinned sibling sources in workflow builds
+
+Ordinary Linux workflow targets can use the same pinned `sibling_crates`
+configuration as isolated fallback and native source staging:
+
+```yaml
+sibling_crates:
+  - local_path: /data/projects/shared_library
+    relative_path: shared_library
+    revision: 0123456789abcdef0123456789abcdef01234567 # replace with the exact commit
+```
+
+For each act attempt, DSR creates a fresh private repository at that commit,
+including locally available submodules selected by authenticated parent
+gitlinks. A dirty developer checkout or a child checked out at a different
+commit cannot supply replacement bytes. The private repositories have their
+own Git metadata and receive no developer configuration, credentials, hooks,
+or shared object stores. Missing pinned objects are refused; submodule URLs
+are not fetched.
+
+DSR keeps the main repository's normal act working directory and mounts each
+private sibling read-only at its configured `../relative_path`. On Unix, act
+uses the absolute `--directory` path inside its container. DSR derives the
+mount destination from that path. Cargo manifests and source files keep their
+original relative paths.
+
+The runner writes a per-attempt workflow projection outside the repository
+and outside the artifact upload directory. It adds the sibling mounts to
+`jobs.<job>.container.volumes` for the selected job and its local `needs`
+dependencies. Act passes these volumes to both the job container and Docker
+actions. Existing image, environment, credentials, and nonconflicting volumes
+are preserved. For jobs without a container declaration, the projection keeps
+the configured runner image and preserves the effective `--container-options`
+from act's XDG, home, invocation-directory, and CLI argument order. Existing
+job-level container options retain their precedence. Workflows must direct
+writable build outputs outside the read-only sibling repositories.
+
+Admission refuses layouts whose meaning cannot be preserved before running
+act: selected reusable workflow jobs; expression-valued whole container
+declarations, options, or volumes; volumes that overlap a source mount;
+Docker mount, tmpfs, workdir, or privilege overrides; act directory, workflow,
+job, bind, reuse, or checkout overrides; and `-self-hosted` execution that
+would bypass container mounts. Main and mount paths must be canonical Unix
+paths without colons, backslashes, or control characters. Spaces remain
+literal path characters. Unrelated reusable jobs are allowed when the selected
+job does not depend on them.
+
+The scheduler's `workflow_source` task identity binds the original workflow
+hash, effective act arguments and container configuration, selected jobs, and
+sibling pins. Each result's `source_layout` receipt also retains the projected
+workflow hash, literal read-only mounts, and complete private sibling/submodule
+graph. DSR reconstructs the projection from the original workflow and verifies
+the private graph before execution, after execution, at manifest admission,
+and before reusing completed output. A changed plan refuses resume; missing or
+changed retained source evidence cannot authorize reuse. Failed attempts and
+their private sources remain available for inspection.
+
+This projection targets act's container runner. Its Git selection, custody,
+projection, scheduler, and resume boundaries have local fixture coverage;
+real act parser/image-selection checks do not substitute for a live Docker
+build on the configured host.
+
 ## Using the Compatibility Matrix
 
 The `act_runner.sh` module provides functions to query the compatibility matrix:

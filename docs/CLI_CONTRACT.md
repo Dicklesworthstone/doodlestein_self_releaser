@@ -2011,6 +2011,25 @@ build scripts can read their exact pinned Git metadata. Source-sync receipts
 retain these contexts in `submodule_git_contexts`, separately from configured
 sibling identities, and validate their paths and identities on every receiver.
 
+Ordinary act workflow targets also receive configured pinned siblings. Each
+attempt materializes independent private sibling repositories and projects the
+workflow's selected job and local `needs` jobs with literal read-only container
+volumes beside the main workspace. Docker actions inherit the same volumes.
+The original workflow, Cargo manifests, and developer checkouts are unchanged.
+Existing runner images and effective container options are preserved; ambiguous
+container declarations, reusable selected jobs, conflicting path/mount options,
+and host execution that bypasses mounts are refused before execution. See
+[pinned workflow sources](ACT_COMPATIBILITY.md#pinned-sibling-sources-in-workflow-builds)
+for the supported shapes.
+
+The existing build checkpoint records a `workflow_source` identity in each
+affected task, including the original workflow hash and sibling pins. Target
+results retain `source_layout` evidence with the projected workflow hash and
+recursive private graph. Both execution boundaries, manifest admission, and
+resumed output reuse verify this evidence. Changing the pinned source or
+workflow requires a new run; a successful receipt without its original layout
+evidence cannot authorize reuse.
+
 Each retry creates a fresh controller source copy while resuming the selected
 build UUID and its original output directory. Source copies and partial failed
 materializations are retained for inspection; `details.source_materialization`

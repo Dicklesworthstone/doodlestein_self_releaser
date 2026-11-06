@@ -12060,16 +12060,28 @@ EOF
     _fallback_resume_source_admission() {
         local dependency_identity resume_identity_filter saved_result saved_path resume_identity_ok=true
         dependency_identity=$(jq -c 'map({relative_path,git_sha})' <<< "$configured_dependencies") || return 4
+        # Native Git-context receipts already bind sibling-only pins. Nested
+        # submodule graphs require their full materialization evidence; a
+        # conflicting or no-longer-selected graph must never fall through to
+        # the simpler pin comparison.
         resume_identity_filter='
-            def same_source:
-                if $identity != null then .source_materialization == $identity
-                elif . == null or (.git_context == null and .sibling_git_contexts == null)
+            def same_pinned_sources:
+                if . == null or (.git_context == null and .sibling_git_contexts == null)
                 then ($dependencies | length) == 0
                 else .git_context.git_sha == $sha and
                     (.sibling_git_contexts | type) == "object" and
                     ([.sibling_git_contexts | to_entries[] |
                         {relative_path:.key,git_sha:.value.git_sha}] | sort_by(.relative_path)) == $dependencies
                 end;
+            def same_source:
+                if $identity != null then
+                    if .source_materialization != null then .source_materialization == $identity
+                    elif ($identity.submodules | length) == 0 and
+                         all($identity.dependencies[]; (.submodules | length) == 0)
+                    then same_pinned_sources
+                    else false end
+                elif .source_materialization != null then false
+                else same_pinned_sources end;
         '
         # Context can be refreshed while old successful target receipts remain.
         # Check every retained identity before cmd_build can reuse any of them.
@@ -12159,7 +12171,7 @@ EOF
             {git_sha,submodules:((.submodules // []) | sort_by(.path)),
              dependencies:[.dependencies[] | {relative_path,git_sha,
                  submodules:((.submodules // []) | sort_by(.path))}] | sort_by(.relative_path)} |
-            if (.submodules | length) > 0 or any(.dependencies[]; (.submodules | length) > 0)
+            if (.submodules | length) > 0 or (.dependencies | length) > 0
             then . else null end
         ' <<< "$source_materialization") || return 4
         printf '%s\n' "$source_materialization" > "$source_directory/.dsr/source.json" || return 4
@@ -12194,6 +12206,7 @@ EOF
     _fallback_verify_completed_source() {
         local current_sha source_status target_list targets_json
         local tasks_json strict_tasks=false matrix_digest=""
+        local task task_key workflow_identity retained_target retained_result retained_path
         local -a configured_targets=()
         current_sha=$(git -C "$local_path" rev-parse --verify HEAD) || return 1
         source_status=$(git -C "$local_path" status --porcelain --untracked-files=all) || return 1
@@ -12210,11 +12223,40 @@ EOF
         jq -e --arg sha "$current_sha" --argjson targets "$targets_json" \
             --argjson tasks "$tasks_json" --arg matrix_digest "$matrix_digest" '
             .git_sha == $sha and .targets == $targets and
-            (if .context.build_tasks == null then all($tasks[]; .key == .platform)
+            (if .context.build_tasks == null then
+                all($tasks[]; .key == .platform and .workflow_source == null)
              else .context.build_tasks == $tasks end) and
             (if $matrix_digest == "" then true
              else .context.native_matrix_config_sha256 == $matrix_digest end)
-        ' <<< "$resume_state" >/dev/null
+        ' <<< "$resume_state" >/dev/null || return 1
+        # Completed fallback bypasses the worker scheduler. Require the same
+        # original workflow/layout custody here against the freshly resolved
+        # task, including any successful sidecar independently of its embedded
+        # result. Missing task metadata cannot turn a graph build into a legacy
+        # single-repository success.
+        while IFS= read -r task; do
+            task_key=$(jq -r '.key' <<< "$task") || return 1
+            workflow_identity=$(jq -c '.workflow_source // null' <<< "$task") || return 1
+            retained_target=$(jq -c --arg key "$task_key" '.target_statuses[$key] // null' \
+                <<< "$resume_state") || return 1
+            retained_result=$(jq -c '.result // null' <<< "$retained_target") || return 1
+            if [[ "$workflow_identity" != null ]] ||
+               jq -e '.source_layout != null' <<< "$retained_result" >/dev/null; then
+                jq -e '.status == "success" or .status == "ok" or .status == "passed"' \
+                    <<< "$retained_result" >/dev/null || return 1
+                _act_validate_workflow_source_result "$retained_result" "$workflow_identity" || return 1
+            fi
+            retained_path=$(jq -r '.result_path // empty' <<< "$retained_target") || return 1
+            [[ -n "$retained_path" && ( -e "$retained_path" || -L "$retained_path" ) ]] || continue
+            [[ -f "$retained_path" && ! -L "$retained_path" ]] || return 1
+            retained_result=$(jq -sce 'select(length == 1 and (.[0] | type) == "object") | .[0]' \
+                "$retained_path") || return 1
+            if jq -e '.status == "success" or .status == "ok" or .status == "passed"' \
+                    <<< "$retained_result" >/dev/null; then
+                _act_validate_workflow_source_result "$retained_result" "$workflow_identity" || return 1
+            fi
+        done < <(jq -c '.[]' <<< "$tasks_json")
+        return 0
     }
     if $reuse_completed; then
         # A replacement ref must not reinterpret the source named by receipts.
