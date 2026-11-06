@@ -4,6 +4,15 @@
 # the projected workflow without claiming a live Docker build.
 set -uo pipefail
 
+DSR_TEST_ACT_SOURCE_GIT_ONLY=false
+if [[ $# == 1 && $1 == --git-environment-only ]]; then
+    DSR_TEST_ACT_SOURCE_GIT_ONLY=true
+elif [[ $# != 0 ]]; then
+    printf 'Usage: %s [--git-environment-only]\n' "$0" >&2
+    exit 4
+fi
+export DSR_TEST_ACT_SOURCE_GIT_ONLY
+
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 SRC_DIR=$(cd "$SCRIPT_DIR/../../src" && pwd -P)
 export SRC_DIR
@@ -159,10 +168,45 @@ check('materialization retains developer HEAD, index, working bytes, and workflo
 check('custody verification accepts unchanged recursive source graph',
       call('verify', 'act_source_verify "$1"', json.dumps(receipt)).returncode == 0)
 
+# Materialize the mount destination as a fixture, without a Docker daemon.
+# Git's own ownership test boundary exercises its real protected-config and
+# safe.directory checks even when this executor cannot change UID/groups.
+mounted = Path(mount['destination'])
+mirror = call('git-destination-fixture', '_act_source_load_git && git_ops_materialize_source "$@"',
+              sibling, sibling_sha, mounted)
+check('exact container destination fixture materializes the same pinned Git graph', mirror.returncode == 0)
+
+def git_in_runner(root, settings, *arguments):
+    runner_env = {key: value for key, value in env.items() if not key.startswith('GIT_CONFIG_')}
+    runner_env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null', GIT_TEST_ASSUME_DIFFERENT_OWNER='1')
+    runner_env.update({key: str(value) for key, value in settings.items()})
+    return subprocess.run(['git', '-C', str(root), *arguments], env=runner_env, capture_output=True, text=True)
+
+plain = git_in_runner(mounted, {}, 'rev-parse', 'HEAD')
+check('real Git rejects the foreign-owner boundary without projected trust',
+      plain.returncode == 128 and 'dubious ownership' in plain.stderr)
+trusted = projected['jobs']['build']['container'].get('env', {})
+check('projection trusts only the exact mounted root and recursive Git child', trusted == {
+      'GIT_CONFIG_COUNT': '2', 'GIT_CONFIG_KEY_0': 'safe.directory', 'GIT_CONFIG_VALUE_0': str(mounted),
+      'GIT_CONFIG_KEY_1': 'safe.directory', 'GIT_CONFIG_VALUE_1': str(mounted / 'vendor/child')})
+for label, path, sha in (('root', mounted, sibling_sha), ('child', mounted / 'vendor/child', child_sha)):
+    observed = git_in_runner(path, trusted, 'rev-parse', 'HEAD')
+    check('real Git reads the pinned ' + label + ' at the foreign-owner boundary',
+          observed.returncode == 0 and observed.stdout.strip() == sha)
+unrelated = git_in_runner(main, trusted, 'rev-parse', 'HEAD')
+check('scoped trust still refuses an unrelated foreign-owner repository',
+      unrelated.returncode == 128 and 'dubious ownership' in unrelated.stderr)
+check('Git projection never changes developer or private Git configuration',
+      snapshot(main) == before_main and snapshot(sibling) == before_sibling and
+      'safe.directory' not in (private / '.git/config').read_text())
+expression_source = [dict(checkouts[0], local_path=str(sibling) + '${{ matrix.source }}')]
+check('literal source paths cannot introduce act expressions into scoped Git environment',
+      make_plan('expression-source-path', source=expression_source).returncode == 4)
+
 for index, argv in enumerate((['--directory=/tmp'], ['-C/tmp'], ['--workflows=other.yml'], ['-Wother.yml'],
     ['--bind'], ['--no-skip-checkout'], ['--reuse'], ['--job=other'], ['--container-options', '--mount type=bind,source=/tmp,target=/source'],
     ['--container-options=--volume /tmp:/source'], ['--container-options=--workdir /tmp'],
-    ['--container-options=--tmpfs /tmp'])):
+    ['--container-options=--tmpfs /tmp'], ['--container-options=-itv/tmp:/source'])):
     check('pre-execution refusal of conflicting act argv ' + repr(argv), make_plan('argv-' + str(index), argv).returncode == 4)
 for index, argv in enumerate((['-P', 'ubuntu-latest=-self-hosted'], ['-Pubuntu-latest=-SELF-HOSTED'],
                              ['--platform=ubuntu-latest=-self-hosted'],
@@ -176,6 +220,42 @@ check('ambient actrc mount override is refused before staging', make_plan('ambie
 (home / '.actrc').write_text('-P ubuntu-latest=-self-hosted\n')
 check('ambient host execution cannot bypass private mounts', make_plan('ambient-host').returncode == 4)
 (home / '.actrc').write_text(saved_rc)
+(home / '.actrc').write_text('--env GIT_CONFIG_COUNT=0\n')
+check('ambient actrc Git array override is refused instead of silently replaced', make_plan('ambient-git-env').returncode == 4)
+(home / '.actrc').write_text(saved_rc)
+
+for index, argv in enumerate((['--env', 'GIT_CONFIG_COUNT=0'], ['--env=GIT_CONFIG_KEY_0=safe.directory'],
+    ['--env=GIT_CONFIG_PARAMETERS=x'], ['--container-options=--env GIT_CONFIG_COUNT=0'],
+    ['--container-options=-eGIT_CONFIG_COUNT=0'], ['--container-options=-iteGIT_CONFIG_COUNT=0'],
+    ['--container-options=--env-file /tmp/settings'])):
+    check('pre-execution refusal of conflicting external Git configuration ' + repr(argv),
+          make_plan('git-env-argv-' + str(index), argv).returncode == 4)
+env_file = work / 'runner.env'
+env_file.write_text('MESSAGE="GIT_CONFIG_COUNT=0 is literal message text"\n')
+file_plan = make_plan('plain-env-file', ['--env-file', str(env_file)])
+check('unrelated act environment files retain their literal contents', file_plan.returncode == 0 and
+      env_file.read_text() == 'MESSAGE="GIT_CONFIG_COUNT=0 is literal message text"\n')
+file_receipt = call('plain-env-materialize', 'act_source_materialize "$@"', file_plan.stdout, state / 'env-sources')
+check('environment-file digest is bound through source materialization', file_receipt.returncode == 0 and
+      json.loads(file_receipt.stdout)['identity'].get('act_env_file_sha256') == hashlib.sha256(env_file.read_bytes()).hexdigest())
+env_file.write_text('MESSAGE="changed value"\n')
+check('environment file drift invalidates retained source admission',
+      call('changed-env-verify', 'act_source_verify "$1"', file_receipt.stdout).returncode == 4)
+env_file.write_text('export GIT_CONFIG_COUNT=0\n')
+check('dotenv Git configuration is refused before projection',
+      make_plan('dotenv-git-env', ['--env-file=' + str(env_file)]).returncode == 4)
+for label, content in (('CR-only dotenv', 'MESSAGE=kept\rGIT_CONFIG_COUNT=0\r'),
+                       ('Unicode-spaced dotenv', '\u00a0export\u00a0GIT_CONFIG_COUNT=0\n')):
+    env_file.write_text(content)
+    check(label + ' cannot hide a Git environment override',
+          make_plan(label, ['--env-file', str(env_file)]).returncode == 4)
+yaml_env = work / 'runner-env.yaml'
+yaml_env.write_text('MESSAGE: "GIT_CONFIG_COUNT=0 is literal message text"\n')
+check('unrelated YAML environment values are admitted from their captured bytes',
+      make_plan('yaml-literal-env', ['--env-file', str(yaml_env)]).returncode == 0)
+yaml_env.write_text('"GIT_CONFIG_\\u0043OUNT": "0"\n')
+check('escaped YAML Git environment keys cannot shadow projected trust',
+      make_plan('yaml-git-env', ['--env-file', str(yaml_env)]).returncode == 4)
 
 def variant(label, mutate, expected=True):
     changed = copy.deepcopy(document)
@@ -200,6 +280,61 @@ variant('dynamic container options refused', lambda doc: doc['jobs']['build'].up
 variant('conflicting sibling volume refused', lambda doc: doc['jobs']['build'].update(container={'volumes': ['/tmp:' + str(main.parent)]}), False)
 variant('selected reusable dependency refused', lambda doc: doc['jobs']['build'].update(needs=['unrelated']), False)
 variant('checkout source override refused', lambda doc: doc['jobs']['build']['steps'][0].update({'with': {'ref': 'other'}}), False)
+
+for label, setting in (
+    ('dynamic Git configuration refused', {'GIT_CONFIG_COUNT': '${{ matrix.count }}'}),
+    ('orphan Git configuration refused', {'GIT_CONFIG_KEY_0': 'core.quotePath'}),
+    ('incomplete Git configuration refused', {'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.quotePath'}),
+    ('unsupported Git parameter injection refused', {'GIT_CONFIG_PARAMETERS': "'safe.directory'='*'"})):
+    variant(label, lambda doc, value=setting: doc['jobs']['build'].update(env=value), False)
+variant('step-level dynamic config cannot shadow pinned Git trust',
+        lambda doc: doc['jobs']['build']['steps'][1].update(env={'GIT_CONFIG_COUNT': '${{ matrix.count }}'}), False)
+variant('container-level dynamic config cannot shadow pinned Git trust',
+        lambda doc: doc['jobs']['build'].update(container={'env': {'GIT_CONFIG_COUNT': '${{ matrix.count }}'}}), False)
+
+configured = copy.deepcopy(document)
+configured['env'].update(GIT_CONFIG_COUNT='2', GIT_CONFIG_KEY_0='fixture.value', GIT_CONFIG_VALUE_0='workflow',
+                         GIT_CONFIG_KEY_1='safe.directory', GIT_CONFIG_VALUE_1=str(main), GIT_CONFIG_GLOBAL='/dev/null')
+configured['jobs']['build']['env'] = {'GIT_CONFIG_VALUE_0': 'job', 'PRESERVED': '${{ matrix.target }}'}
+configured['jobs']['build']['container'] = {'env': {'GIT_CONFIG_VALUE_0': 'container', 'CONTAINER_VALUE': 'kept'}}
+configured['jobs']['build']['steps'][1]['env'] = {'GIT_CONFIG_VALUE_0': 'step', 'STEP_VALUE': 'kept'}
+(main / workflow).write_text(json.dumps(configured))
+configured_plan = make_plan('configured-git-plan')
+configured_copy = call('configured-git-copy', 'act_source_materialize "$@"', configured_plan.stdout, state / 'configured-source')
+check('literal Git arrays survive workflow job container and step precedence', configured_copy.returncode == 0)
+if configured_copy.returncode == 0:
+    configured_receipt = json.loads(configured_copy.stdout)
+    actual = json.loads(Path(configured_receipt['projected_workflow']).read_text())
+    container_env = dict(actual['env'], **actual['jobs']['build']['env'])
+    container_env.update(actual['jobs']['build']['container']['env'])
+    step_env = dict(container_env, **actual['jobs']['build']['steps'][1]['env'])
+    check('original environment and non-Git expressions remain unchanged', actual['env'] == configured['env'] and
+          actual['jobs']['build']['env'] == configured['jobs']['build']['env'] and
+          container_env['CONTAINER_VALUE'] == 'kept' and step_env['STEP_VALUE'] == 'kept')
+    for label, settings, expected_value in (('container', container_env, 'container'), ('step', step_env, 'step')):
+        observed = git_in_runner(mounted, settings, 'config', '--get', 'fixture.value')
+        head = git_in_runner(mounted / 'vendor/child', settings, 'rev-parse', 'HEAD')
+        check('real Git preserves ' + label + ' settings alongside exact recursive trust', observed.returncode == 0 and
+              observed.stdout.strip() == expected_value and head.returncode == 0 and head.stdout.strip() == child_sha)
+    check('configured Git projection passes independent reconstruction and custody checks',
+          call('configured-git-verify', 'act_source_verify "$1"', configured_copy.stdout).returncode == 0)
+    operator_trust = git_in_runner(main, container_env, 'rev-parse', 'HEAD')
+    check('an existing explicit operator trust entry is preserved without reset',
+          operator_trust.returncode == 0 and operator_trust.stdout.strip() == project_sha)
+    forged_git = copy.deepcopy(configured_receipt)
+    projected_path = Path(forged_git['projected_workflow'])
+    actual['jobs']['build']['container']['env']['GIT_CONFIG_VALUE_2'] = '*'
+    projected_path.write_text(json.dumps(actual))
+    forged_git['projected_workflow_sha256'] = hashlib.sha256(projected_path.read_bytes()).hexdigest()
+    (projected_path.parent / 'source-layout.json').write_text(json.dumps(forged_git))
+    check('rewriting projection hashes cannot widen DSR Git trust to a wildcard',
+          call('configured-git-forgery', 'act_source_verify "$1"', json.dumps(forged_git)).returncode == 4)
+(main / workflow).write_text(json.dumps(document))
+
+if os.environ['DSR_TEST_ACT_SOURCE_GIT_ONLY'] == 'true':
+    print('act source Git environment: %d passed, %d failed; ownership boundary simulated, no live Docker execution' %
+          (checks - failures, failures), flush=True)
+    raise SystemExit(bool(failures))
 
 # This fixture replaces only act/Docker execution. Production runner planning,
 # private Git selection, workflow writing, receipt admission, artifact counting,

@@ -364,25 +364,44 @@ from act's XDG, home, invocation-directory, and CLI argument order. Existing
 job-level container options retain their precedence. Workflows must direct
 writable build outputs outside the read-only sibling repositories.
 
+Git must also admit these repositories when the container runs as a different
+user from the coordinator. DSR projects `safe.directory` entries for each exact
+mounted repository, including nested submodules, through the job container's
+Git environment. It preserves complete literal `GIT_CONFIG_COUNT`,
+`GIT_CONFIG_KEY_n`, and `GIT_CONFIG_VALUE_n` arrays from workflow, job, container,
+and step environments, including intentional operator trust entries. DSR adds
+no wildcard or ancestor trust and changes no host or repository Git config.
+Step-specific arrays receive the same exact source directories.
+
+Dynamic or incomplete Git arrays cannot preserve that admission reliably and
+are refused. Git array overrides in act arguments, actrc files, act environment
+files, or Docker environment options are also refused; put a complete literal
+array in the workflow environment instead. Unrelated environment values retain
+their existing precedence. Docker `--env-file` options are refused because their
+effective Git overrides cannot be bound to this projection.
+
 Admission refuses layouts whose meaning cannot be preserved before running
 act: selected reusable workflow jobs; expression-valued whole container
 declarations, options, or volumes; volumes that overlap a source mount;
 Docker mount, tmpfs, workdir, or privilege overrides; act directory, workflow,
 job, bind, reuse, or checkout overrides; and `-self-hosted` execution that
 would bypass container mounts. Main and mount paths must be canonical Unix
-paths without colons, backslashes, or control characters. Spaces remain
-literal path characters. Unrelated reusable jobs are allowed when the selected
-job does not depend on them.
+paths without act expressions, colons, backslashes, or control characters.
+Spaces remain literal path characters. Unrelated reusable jobs are allowed
+when the selected job does not depend on them.
 
 The scheduler's `workflow_source` task identity binds the original workflow
 hash, effective act arguments and container configuration, selected jobs, and
-sibling pins. Each result's `source_layout` receipt also retains the projected
-workflow hash, literal read-only mounts, and complete private sibling/submodule
-graph. DSR reconstructs the projection from the original workflow and verifies
+sibling pins, together with the Git projection policy and the selected act
+environment file's digest. Each result's `source_layout` receipt also retains
+the projected workflow hash, literal read-only mounts, and complete private
+sibling/submodule graph. DSR reconstructs the projection from the original workflow and verifies
 the private graph before execution, after execution, at manifest admission,
 and before reusing completed output. A changed plan refuses resume; missing or
 changed retained source evidence cannot authorize reuse. Failed attempts and
 their private sources remain available for inspection.
+Changing the selected environment file invalidates retained admission. Older
+receipts without the Git projection policy cannot authorize completed reuse.
 
 This projection targets act's container runner. Its Git selection, custody,
 projection, scheduler, and resume boundaries have local fixture coverage;

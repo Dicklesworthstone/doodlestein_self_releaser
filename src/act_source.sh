@@ -93,6 +93,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shlex
 import stat
+import subprocess
 import sys
 
 class Refused(Exception):
@@ -116,14 +117,88 @@ def literal(value):
     return isinstance(value, str) and not any(ord(c) < 32 or ord(c) == 127 for c in value)
 
 def absolute(value):
-    require(literal(value) and value.startswith('/') and ':' not in value and '\\' not in value,
-            'source mounts require literal Unix paths without colon or control characters')
+    require(literal(value) and value.startswith('/') and ':' not in value and '\\' not in value and '${{' not in value,
+            'source mounts require literal Unix paths without act expressions, colon, or control characters')
     require(str(PurePosixPath(value)) == value and '..' not in PurePosixPath(value).parts,
             'source mount path must be canonical: ' + value)
     return value
 
 def overlaps(left, right):
     return left == right or left.startswith(right.rstrip('/') + '/') or right.startswith(left.rstrip('/') + '/')
+
+def git_config_variable(name):
+    return name in ('GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS') or name.startswith(('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_'))
+
+def reject_external_git_environment(value):
+    name = value.partition('=')[0]
+    require(not git_config_variable(name),
+            'pinned source Git configuration cannot be overridden by act or Docker environment options; '
+            'put complete literal GIT_CONFIG_COUNT/KEY_n/VALUE_n entries in workflow, job, or step env')
+
+def environment(value, label):
+    require(value is None or isinstance(value, dict), label + ' must be a literal environment mapping')
+    value = value or {}
+    require(all(isinstance(name, str) for name in value), label + ' names must be strings')
+    return value
+
+def git_environment(value, directories):
+    selected = {name: setting for name, setting in value.items() if git_config_variable(name)}
+    require('GIT_CONFIG_PARAMETERS' not in selected,
+            'pinned source Git configuration requires the documented GIT_CONFIG_COUNT/KEY_n/VALUE_n form, '
+            'not GIT_CONFIG_PARAMETERS')
+    normalized = {}
+    for name, setting in selected.items():
+        if isinstance(setting, bool):
+            setting = str(setting).lower()
+        elif isinstance(setting, int):
+            setting = str(setting)
+        require(literal(setting) and '${{' not in setting,
+                'pinned source Git configuration requires literal values: ' + name)
+        normalized[name] = setting
+    count = normalized.get('GIT_CONFIG_COUNT', '0')
+    require(re.fullmatch(r'0|[1-9][0-9]{0,3}', count) is not None,
+            'pinned source Git configuration requires a literal nonnegative GIT_CONFIG_COUNT below 10000')
+    count = int(count)
+    expected = {'GIT_CONFIG_COUNT'} if selected else set()
+    for index in range(count):
+        expected.update(('GIT_CONFIG_KEY_' + str(index), 'GIT_CONFIG_VALUE_' + str(index)))
+    require(set(selected) == expected,
+            'pinned source Git configuration requires a complete contiguous config array with no orphan entries')
+    for index in range(count):
+        require(normalized['GIT_CONFIG_KEY_' + str(index)] != '', 'Git config array keys must not be empty')
+    # Keep any intentional operator trust entries. Add no wildcard, reset, or
+    # ancestor directory: Git's protected command scope admits only each
+    # authenticated repository mounted into this particular workflow attempt.
+    for index, directory in enumerate(directories, count):
+        normalized['GIT_CONFIG_KEY_' + str(index)] = 'safe.directory'
+        normalized['GIT_CONFIG_VALUE_' + str(index)] = directory
+    normalized['GIT_CONFIG_COUNT'] = str(count + len(directories))
+    return normalized
+
+def environment_file(root, value):
+    if not value:
+        return dict(path='', sha256=None)
+    path = Path(value)
+    path = (root / path).absolute() if not path.is_absolute() else path
+    if not path.exists() and not path.is_symlink():
+        return dict(path=str(path), sha256=None)
+    content = regular(path)
+    # YAML permits escaped key names. Ask the existing configuration parser
+    # for decoded keys; dotenv has literal identifiers, so a conservative
+    # definition check also refuses ambiguous multiline definitions. Never
+    # retain these potentially secret values in the source-layout receipt.
+    if path.suffix in ('.yaml', '.yml'):
+        parsed = subprocess.run(['yq', '-p=yaml', '-o=json', '.', '-'], input=content,
+                                check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        names = environment(json.loads(parsed.stdout), 'act environment file')
+        require(not any(git_config_variable(name) for name in names),
+                'act environment files cannot define Git config arrays for pinned sources; use literal workflow/job env')
+    else:
+        require(re.search(r'(?:\A|[\r\n])[^\S\n]*(?:export[^\S\n]+)?'
+                          r'GIT_CONFIG_(?:COUNT|PARAMETERS|KEY_[A-Za-z0-9_.]*|VALUE_[A-Za-z0-9_.]*)'
+                          r'[^\S\n]*[:=]', content.decode('utf-8')) is None,
+                'act environment files cannot define Git config arrays for pinned sources; use literal workflow/job env')
+    return dict(path=str(path), sha256=digest(content))
 
 def expand_go_environment(value):
     # act expands environment references, not shell quoting or substitutions.
@@ -158,16 +233,36 @@ def options(value):
     # Expressions may expand into a mount or workdir switch. They cannot be
     # admitted from the unexpanded YAML and are not rewritten or evaluated.
     require('${{' not in value, 'dynamic container options cannot bind a pinned source layout')
-    for arg in shlex.split(value):
+    arguments = shlex.split(value)
+    position = 0
+    while position < len(arguments):
+        arg = arguments[position]
         name = arg.split('=', 1)[0]
+        short = arg[1:] if arg.startswith('-') and not arg.startswith('--') else ''
+        # Docker's Boolean short flags can precede an option taking a value,
+        # e.g. -iteGIT_CONFIG_COUNT=0 or -itv/source:/destination.
+        short = short.lstrip('ditP')
         require(name not in ('--volume', '--mount', '--tmpfs', '--volumes-from', '--workdir', '--privileged') and
-                not (arg.startswith('-v') and not arg.startswith('--')) and
-                not (arg.startswith('-w') and not arg.startswith('--')),
+                not short.startswith(('v', 'w')),
                 'container options may not override mounts, workdir, or privilege: ' + name)
+        require(name != '--env-file',
+                'container --env-file cannot bind pinned source Git configuration; use workflow/job env')
+        if name == '--env' or short.startswith('e'):
+            if short.startswith('e') and len(short) > 1:
+                setting = short[1:].lstrip('=')
+            elif '=' in arg:
+                setting = arg.partition('=')[2]
+            else:
+                position += 1
+                require(position < len(arguments), 'container environment option requires a value')
+                setting = arguments[position]
+            reject_external_git_environment(setting)
+        position += 1
     return value
 
 def act_options(arguments):
     effective = ''
+    env_file = '.env'
     # act v0.2.86 supplies these Docker mappings before applying repeated -P
     # values. Its runs-on label selection stops at the first mapped label.
     platforms = {name: 'act-default-container' for name in
@@ -187,6 +282,16 @@ def act_options(arguments):
                 require(position < len(arguments), '--container-options requires a value')
                 value = arguments[position]
             effective = options(value)
+        elif name in ('--env', '--env-file'):
+            if not equal:
+                position += 1
+                require(position < len(arguments), name + ' requires a value')
+                value = arguments[position]
+            if name == '--env':
+                reject_external_git_environment(value)
+            else:
+                require(literal(value), 'act environment file must be a literal path')
+                env_file = value
         elif name in ('--platform', '-P') or (arg.startswith('-P') and len(arg) > 2):
             if arg.startswith('-P') and len(arg) > 2:
                 value = arg[2:].lstrip('=')
@@ -199,7 +304,7 @@ def act_options(arguments):
                     'invalid act runner image mapping')
             platforms[platform.lower()] = image
         position += 1
-    return effective, platforms
+    return effective, platforms, env_file
 
 def select_jobs(document, job):
     jobs = document.get('jobs')
@@ -307,24 +412,64 @@ def plan(repo, workflow, job, checkouts, arguments, document):
     require(len(set(name.lower() for name in names)) == len(names), 'duplicate sibling mount destination')
     require(isinstance(arguments, list) and all(isinstance(arg, str) for arg in arguments), 'invalid act argv')
     ambient, evidence = configuration()
-    effective, platforms = act_options(ambient + arguments)
+    effective, platforms, env_file = act_options(ambient + arguments)
+    env_evidence = environment_file(root, env_file)
     selected = select_jobs(document, job)
     protected = [str(root)] + [str(root.parent / name) for name in names]
     containers = {name: check_job(document['jobs'][name], effective, protected, platforms) for name in selected}
+    # Refuse ambiguous static shadows before any private source is staged.
+    # act merges workflow, job, CLI, container, then step environment values.
+    # CLI/env-file config arrays were refused above; literal YAML arrays can
+    # be preserved under that same precedence and extended without clobbering.
+    for name, container in containers.items():
+        spec = document['jobs'][name]
+        base = dict(environment(document.get('env'), 'workflow env'))
+        base.update(environment(spec.get('env'), 'job env'))
+        base.update(environment(container.get('env'), 'container env'))
+        git_environment(base, [])
+        for step in spec.get('steps', []):
+            git_environment(dict(base, **environment(step.get('env'), 'step env')), [])
     identity = dict(schema_version=1, workflow=workflow, workflow_sha256=digest(original), job=job,
                     jobs=selected, dependencies=[dict(relative_path=row['relative_path'], git_sha=row['git_sha'])
                         for row in checkouts], act_arguments_sha256=digest(canonical(ambient + arguments)),
-                    container_config_sha256=digest(canonical(containers)))
+                    container_config_sha256=digest(canonical(containers)),
+                    git_environment_policy=1, act_env_file_sha256=env_evidence['sha256'])
     return dict(identity=identity, root=str(root), original_workflow=str(workflow_path),
-                checkouts=checkouts, document=document, containers=containers, actrc=evidence)
+                checkouts=checkouts, document=document, containers=containers, actrc=evidence,
+                act_env_file=env_evidence)
 
-def project_document(original, containers, mounts):
+def project_document(original, containers, mounts, dependencies):
     document = copy.deepcopy(original)
+    require(len(mounts) == len(dependencies), 'incomplete pinned Git directory projection')
+    directories = []
+    for mount, dependency in zip(mounts, dependencies):
+        for repository in dependency['repositories']:
+            relative = repository['path']
+            require(isinstance(relative, str) and (relative == '' or
+                    (str(PurePosixPath(relative)) == relative and not relative.startswith('/') and
+                     '..' not in PurePosixPath(relative).parts)), 'invalid mounted Git repository path')
+            directory = absolute(str(Path(mount['destination']) / relative))
+            require(directory not in directories, 'duplicate mounted Git repository')
+            directories.append(directory)
     for name, container in containers.items():
         container = copy.deepcopy(container)
         container['volumes'] = container.get('volumes', []) + [
             row['source'] + ':' + row['destination'] + ':ro' for row in mounts]
-        document['jobs'][name]['container'] = container
+        spec = document['jobs'][name]
+        base = dict(environment(document.get('env'), 'workflow env'))
+        base.update(environment(spec.get('env'), 'job env'))
+        base.update(environment(container.get('env'), 'container env'))
+        container['env'] = dict(environment(container.get('env'), 'container env'))
+        container['env'].update(git_environment(base, directories))
+        # Step settings override container settings in act. Preserve each
+        # complete literal step array and append the same exact source roots;
+        # unrelated step variables and expressions remain unchanged.
+        for step in spec.get('steps', []):
+            step_env = environment(step.get('env'), 'step env')
+            if any(git_config_variable(key) for key in step_env):
+                step['env'] = dict(step_env)
+                step['env'].update(git_environment(dict(base, **step_env), directories))
+        spec['container'] = container
     return document
 
 def project(value, dependencies, directory):
@@ -347,13 +492,14 @@ def project(value, dependencies, directory):
                     path.chmod(stat.S_IMODE(mode) | 0o555)
                 elif stat.S_ISREG(mode):
                     path.chmod(stat.S_IMODE(mode) | 0o444 | (0o111 if mode & 0o111 else 0))
-    document = project_document(value['document'], value['containers'], mounts)
+    document = project_document(value['document'], value['containers'], mounts, dependencies)
     projected = directory / 'workflow.yml'
     with projected.open('xb') as stream:
         stream.write(canonical(document))
     receipt = dict(schema_version=1, identity=value['identity'], root=value['root'],
                    original_workflow=value['original_workflow'], projected_workflow=str(projected),
                    projected_workflow_sha256=digest(projected.read_bytes()), actrc=value['actrc'],
+                   act_env_file=value['act_env_file'],
                    dependencies=dependencies, mounts=mounts, containers=value['containers'])
     with (directory / 'source-layout.json').open('xb') as stream:
         stream.write(canonical(receipt))
@@ -369,13 +515,18 @@ def verify(receipt, original):
     require(json.loads(regular(projected.parent / 'source-layout.json')) == receipt, 'source layout receipt changed')
     _, current_config = configuration()
     require(current_config == receipt['actrc'], 'act configuration changed after source admission')
+    require(identity.get('git_environment_policy') == 1, 'source layout lacks scoped Git configuration')
+    env_evidence = receipt['act_env_file']
+    require(environment_file(Path(receipt['root']), env_evidence['path']) == env_evidence and
+            env_evidence['sha256'] == identity['act_env_file_sha256'],
+            'act environment file changed after source admission')
     require([dict(relative_path=row['relative_path'], git_sha=row['git_sha']) for row in receipt['dependencies']] ==
             identity['dependencies'], 'source layout dependencies differ from admitted pins')
     document = json.loads(regular(projected))
     require(digest(canonical(receipt['containers'])) == identity['container_config_sha256'],
             'effective container configuration changed after task admission')
     require(sorted(receipt['containers']) == identity['jobs'], 'projection job ownership changed')
-    require(document == project_document(original, receipt['containers'], receipt['mounts']),
+    require(document == project_document(original, receipt['containers'], receipt['mounts'], receipt['dependencies']),
             'projected workflow no longer preserves the original workflow and admitted container layout')
     require(len(receipt['mounts']) == len(receipt['dependencies']), 'source layout has incomplete mounts')
     for row, mount in zip(receipt['dependencies'], receipt['mounts']):
@@ -403,7 +554,7 @@ try:
         raise Refused('unknown source layout operation')
     if result is not None:
         sys.stdout.buffer.write(canonical(result))
-except (Refused, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+except (Refused, OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError) as exc:
     sys.stderr.write('[act] Pinned sibling source layout refused: ' + str(exc) + '\n')
     raise SystemExit(4)
 PY

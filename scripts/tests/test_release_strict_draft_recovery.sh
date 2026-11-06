@@ -756,7 +756,7 @@ check('handoff publishes only its owned signed draft',json.loads((c/'remote.json
       all(q[0]=='repos/owner/app/releases/9' for q in patches))
 
 for label in ('state-file','state-link','state-writable','allocation-failure',
-              'override-outside-state','override-missing','override-link'):
+              'override-outside-state','override-missing','override-parent-traversal','override-link'):
     c,env,_,_=setup('creation-custody-'+label,{'absent':True})
     releases=c/'state/releases'
     if label=='state-file':
@@ -771,6 +771,8 @@ for label in ('state-file','state-link','state-writable','allocation-failure',
         env['_DSR_STRICT_CREATE_CUSTODY_PARENT']=env['TMPDIR']
     elif label=='override-missing':
         env['_DSR_STRICT_CREATE_CUSTODY_PARENT']=str(releases/'missing-handoff')
+    elif label=='override-parent-traversal':
+        env['_DSR_STRICT_CREATE_CUSTODY_PARENT']=str(releases/'..')
     else:
         releases.mkdir()
         (releases/'linked-handoff').symlink_to(c/'tmp',target_is_directory=True)

@@ -7753,7 +7753,8 @@ try:
     selected = root
     if sys.argv[2]:
         selected = Path(sys.argv[2])
-        if not selected.is_absolute() or selected.parent.resolve(strict=True) != root.resolve(strict=True):
+        if (not selected.is_absolute() or selected.parent.resolve(strict=True) != root.resolve(strict=True) or
+                selected.resolve(strict=True).parent != root.resolve(strict=True)):
             raise ValueError('fallback creation custody must remain beneath release state')
     for parent in (root, selected):
         info = parent.lstat()
