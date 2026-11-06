@@ -14609,7 +14609,7 @@ _act_relocate_failed_target() {
     local hosts_file="${DSR_HOSTS_FILE:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/hosts.yaml}"
     local entry result result_path sync_json roots hosts receipt repo_hash hosts_hash
     local prior_result prior_log result_hash log_hash
-    local approval prior_config prior_config_hash prior_json current_json projection
+    local approval prior_config prior_config_hash prior_json current_json projection prior_bytes current_bytes
     local source_inventory dependency_checkouts replacement_path replacement_root
     local source_sha source_ref source_root
     [[ "$request" == *=* && "$target" =~ ^[a-z]+/[a-z0-9]+$ &&
@@ -14631,10 +14631,29 @@ _act_relocate_failed_target() {
                    type == "string" and test("^[0-9a-f]{64}$")))' "$approval_file") || return 4
     prior_config=$(jq -er '.prior_repo_config_path | strings' <<< "$approval") || return 4
     [[ -f "$prior_config" && ! -L "$prior_config" ]] || return 4
-    prior_config_hash=$(_act_sha256 "$prior_config") || return 4
+    # Preserve trailing newlines while capturing each configuration once.
+    # Hash and parse those same bytes so a reopened path cannot substitute an
+    # unreviewed document between digest admission and delta comparison.
+    prior_bytes=$(cat -- "$prior_config" && printf '.') || return 4
+    prior_bytes="${prior_bytes%.}"
+    prior_config_hash=$(printf '%s' "$prior_bytes" | _act_sha256 /dev/stdin) || return 4
     [[ "$prior_config_hash" == "$(jq -r '.prior_repo_config_sha256' <<< "$approval")" ]] || return 4
-    prior_json=$(yq -o=json '.' "$prior_config") || return 4
-    current_json=$(yq -o=json '.' "$config_file") || return 4
+    # Bash cannot retain NUL bytes; malformed input must not acquire the hash
+    # of its stripped representation as the claimed prior on-disk document.
+    [[ "$(_act_sha256 "$prior_config")" == "$prior_config_hash" ]] || return 4
+    # A mixed native matrix freezes the whole configuration, including this
+    # singleton's route. An explicit relocation may replace that digest only
+    # when the reviewed prior configuration is the one retained by this run.
+    if jq -e 'any(.context.build_tasks[]?; .key != .platform)' <<< "$before" >/dev/null &&
+       [[ "$prior_config_hash" != "$(jq -r '.context.native_matrix_config_sha256 // ""' <<< "$before")" ]]; then
+        _log_error "Relocation approval does not bind the retained native matrix configuration"
+        return 4
+    fi
+    prior_json=$(printf '%s' "$prior_bytes" | yq -p=yaml -o=json '.' -) || return 4
+    current_bytes=$(cat -- "$config_file" && printf '.') || return 4
+    current_bytes="${current_bytes%.}"
+    repo_hash=$(printf '%s' "$current_bytes" | _act_sha256 /dev/stdin) || return 4
+    current_json=$(printf '%s' "$current_bytes" | yq -p=yaml -o=json '.' -) || return 4
     # Only the failed target's explicit command/environment/routing may differ.
     # Global source/profile/contract and every completed target stay identical.
     projection='del(.cross_compile[$target].host,.cross_compile[$target].build_cmd,.cross_compile[$target].env,.hosts[$target])'
@@ -14715,7 +14734,6 @@ _act_relocate_failed_target() {
             _act_relocation_receipt_matches "$result_path" "$result" || return 4
         fi
     done < <(jq -c '.target_statuses[] | select(.status == "completed")' <<< "$before")
-    repo_hash=$(_act_sha256 "$config_file") || return 4
     hosts_hash=$(_act_sha256 "$hosts_file") || return 4
     [[ "$repo_hash" == "$(jq -r '.repo_config_sha256' <<< "$approval")" &&
        "$hosts_hash" == "$(jq -r '.hosts_config_sha256' <<< "$approval")" ]] || return 4
@@ -15390,9 +15408,15 @@ act_orchestrate_build() {
                 _act_release_orchestration_lock
                 return 4
             fi
+            # Keep the task inventory fixed even for relocation. The full
+            # matrix digest includes singleton host routes, so an explicit
+            # reviewed relocation validates its narrowly permitted config
+            # delta below before atomically replacing that digest with the
+            # host/source bindings. Ordinary resume still requires equality.
             if [[ "$(jq -cS '.context.build_tasks // null' <<< "$resume_state")" != \
                   "$(jq -cS . <<< "$build_tasks_json")" ]] || \
-               [[ "$(jq -r '.context.native_matrix_config_sha256 // ""' <<< "$resume_state")" != \
+               [[ -z "$resume_target_host" &&
+                  "$(jq -r '.context.native_matrix_config_sha256 // ""' <<< "$resume_state")" != \
                   "$native_matrix_config_sha256" ]]; then
                 _log_error "Resume build task plan or native matrix configuration changed"
                 _act_release_orchestration_lock

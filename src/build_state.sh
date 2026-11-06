@@ -912,10 +912,20 @@ build_state_relocate_failed_target() {
       if . != $before or .target_statuses[$target].status != "failed" or
          (.status == "completed" or .status == "cancelled")
       then error("relocation state changed or target is not failed")
+      elif any(.context.build_tasks[]?; .key != .platform) and
+         (((.context.native_matrix_config_sha256 | type == "string" and
+               test("^[0-9a-f]{64}$")) | not) or
+          (($receipt.repo_config_sha256 | type == "string" and
+               test("^[0-9a-f]{64}$")) | not) or
+          $receipt.approval.prior_repo_config_sha256 != .context.native_matrix_config_sha256)
+      then error("relocation approval does not bind the retained native matrix configuration")
       else
         .relocations = ((.relocations // []) + [$receipt]) |
         .context.target_hosts[$target] = $host |
-        .context.source_roots = $roots
+        .context.source_roots = $roots |
+        if any(.context.build_tasks[]?; .key != .platform) then
+          .context.native_matrix_config_sha256 = $receipt.repo_config_sha256
+        else . end
       end'
 }
 

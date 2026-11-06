@@ -2068,10 +2068,14 @@ fi
 # including successful sibling artifacts and failures before recipe execution.
 # Source snapshots, native Go compilation, collection, state and locks are real;
 # health/slot decisions are controlled local boundaries, not host qualification.
+# --relocation-matrix-only instead uses explicit ELF/PE header producers and a
+# Cargo metadata adapter. It tests the mixed task/state/manifest protocol, not
+# native Rust compilation, libc compatibility, or Windows execution.
 test_relocation_recovery() {
     local project_root dependency
     project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" || return 1
     for dependency in python3 git jq yq go rsync tar gzip; do
+        [[ "$dependency" != go || "${1:-}" != --relocation-matrix-only ]] || continue
         command -v "$dependency" >/dev/null || {
             printf 'Missing relocation integration dependency: %s\n' "$dependency" >&2
             return 77
@@ -2090,6 +2094,7 @@ import tempfile
 
 project = Path(os.environ.get('DSR_TEST_RELOCATION_PROJECT', sys.argv[1]))
 hosts_only = sys.argv[2] == '--relocation-hosts-only'
+matrix_only = sys.argv[2] == '--relocation-matrix-only'
 root = Path(tempfile.mkdtemp(prefix='dsr-relocation-recovery-'))
 print('Retained relocation recovery evidence: ' + str(root), flush=True)
 systems = {'Linux': 'linux', 'Darwin': 'darwin'}
@@ -2099,6 +2104,9 @@ if platform.system() not in systems or platform.machine() not in architectures:
     raise SystemExit(77)
 native = systems[platform.system()] + '/' + architectures[platform.machine()]
 failed = 'linux/arm64' if native != 'linux/arm64' else 'linux/amd64'
+gnu, musl = 'x86_64-unknown-linux-gnu', 'x86_64-unknown-linux-musl'
+if matrix_only:
+    native, failed = 'linux/amd64', 'windows/amd64'
 checks = failures = 0
 
 
@@ -2127,6 +2135,52 @@ def events(case):
     return path.read_text().splitlines() if path.exists() else []
 
 
+matrix_producer = root / 'matrix-producer.py'
+matrix_producer.write_text(r'''import hashlib, json, os, platform, struct, sys
+from pathlib import Path
+case, target, triple, host, phase, sha, ref = Path(sys.argv[1]), *sys.argv[2:]
+triple = triple or 'x86_64-pc-windows-msvc'
+key = target + ('@' + triple if target.startswith('linux/') else '')
+with (case / 'recipe-events').open('a') as stream:
+    stream.write(key + '\n')
+result = dict(platform=target, target_triple=triple, method='native', host=host,
+              build_influence_env=dict(CARGO_BUILD_TARGET=triple, DSR_TARGET_TRIPLE=triple,
+                  DSR_RELEASE_GIT_SHA=sha, DSR_RELEASE_GIT_REF=ref),
+              # These are controlled protocol fields, not compiler attestation.
+              # The actual manifest still enforces their exact source/triple binding.
+              cargo_isolation=dict(mode='strict-release-snapshot', toolchain=dict(target_triple=triple)))
+if target in (case / 'failures').read_text().splitlines():
+    result.update(status='failed', exit_code=6, error='explicit matrix producer failure')
+else:
+    output = case / 'matrix-payloads' / phase / key.replace('/', '-')
+    output.mkdir(parents=True, exist_ok=True)
+    path = output / ('relocfixture.exe' if target.startswith('windows/') else 'relocfixture')
+    if target.startswith('linux/'):
+        content = bytearray(64)
+        content[:7] = b'\x7fELF\x02\x01\x01'
+        struct.pack_into('<HH', content, 16, 2, 62)
+    else:
+        content = bytearray(96)
+        content[:2] = b'MZ'
+        struct.pack_into('<I', content, 60, 64)
+        content[64:68] = b'PE\x00\x00'
+        struct.pack_into('<H', content, 68, 0x8664)
+        struct.pack_into('<H', content, 88, 0x020b)
+    content += ('controlled header fixture: ' + triple + '\n').encode()
+    with path.open('xb') as stream:
+        stream.write(content)
+    path.chmod(0o700)
+    stat = path.stat()
+    identity = ('gnu:%d:%d' % (stat.st_dev, stat.st_ino) if platform.system() == 'Linux'
+                else 'bsd:%d' % stat.st_ino)
+    result.update(status='success', exit_code=0, artifact_path=str(path), artifact_paths=[str(path)],
+                  collected_sha256=hashlib.sha256(content).hexdigest(),
+                  collected_size_bytes=len(content), collected_identity=identity)
+print(json.dumps(result), flush=True)
+raise SystemExit(result['exit_code'])
+''')
+
+
 driver = root / 'driver.sh'
 driver.write_text(r'''#!/usr/bin/env bash
 set -uo pipefail
@@ -2149,6 +2203,16 @@ selector_acquire_slot() {
     if [[ "$RELOC_MODE" == capacity && "$RELOC_PHASE" == first && "$1" == original ]]; then return 2; fi
 }
 selector_release_slot() { :; }
+if [[ "$RELOC_MODE" == matrix ]]; then
+    _act_validate_strict_target_cargo_source_closure() {
+        printf 'CARGO-CLOSURE %s %s\n' "$2" "$4" >> "$RELOC_CASE/boundaries"
+        if [[ "${RELOC_REJECT_REPLACEMENT_CLOSURE:-0}" == 1 && "$4" == replacement ]]; then return 4; fi
+    }
+    act_run_native_build() {
+        python3 "$RELOC_MATRIX_PRODUCER" "$RELOC_CASE" "$2" "${9:-}" "$8" \
+            "$RELOC_PHASE" "$6" "$7"
+    }
+fi
 if [[ "$RELOC_MODE" == timeout && "$RELOC_PHASE" == first ]]; then
     act_run_native_build() (
         # Reload the real backend, then shorten only the deliberately sleeping
@@ -2172,6 +2236,14 @@ if [[ "${RELOC_MUTATE_HOSTS_AFTER_SYNC:-0}" == 1 && "$RELOC_PHASE" != first ]]; 
 fi
 if [[ "$RELOC_PHASE" == compare ]]; then
     _act_relocation_receipt_matches "$RELOC_CASE/large-worker.json" "$(cat "$RELOC_CASE/large-state.json")"
+    exit $?
+fi
+if [[ "$RELOC_PHASE" == matrix-state-transition ]]; then
+    build_state_init || exit 1
+    before=$(build_state_get relocfixture 1.0.0 "$RELOC_RUN") || exit 1
+    build_state_relocate_failed_target relocfixture 1.0.0 "$RELOC_RUN" "$before" \
+        "$RELOC_FAILED_TARGET" replacement "$(jq -c '.context.source_roots' <<< "$before")" \
+        "$(cat "$RELOC_CASE/matrix-transition.json")"
     exit $?
 fi
 if [[ "$RELOC_PHASE" == spoof ]]; then
@@ -2219,6 +2291,11 @@ binary=relocfixture
 # fixture records runtime target identity, not automatic parent VCS metadata.
 go build -buildvcs=false -trimpath -o "$binary" .
 ''')
+    if matrix_only:
+        (case / 'source/Cargo.toml').write_text('[package]\nname="relocfixture"\nversion="1.0.0"\nedition="2021"\n')
+        (case / 'source/Cargo.lock').write_text('version = 4\n\n[[package]]\nname = "relocfixture"\nversion = "1.0.0"\n')
+        (case / 'source/src').mkdir()
+        (case / 'source/src/main.rs').write_text('fn main() {}\n')
     for args in (['init', '-q', '-b', 'main'], ['add', '.'],
                  ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
                   '-c', 'commit.gpgsign=false', 'commit', '-qm', 'relocation fixture'], ['tag', 'v1.0.0']):
@@ -2244,6 +2321,13 @@ go build -buildvcs=false -trimpath -o "$binary" .
                  GOSUMDB='off', GOMAXPROCS='2', GOCACHE=str(root / 'go-cache'),
                  RELOC_EVENTS=str(case / 'recipe-events'), RELOC_FAILURES=str(case / 'failures'),
                  RELOC_RECIPE_MODE=mode))
+    if matrix_only:
+        config.update(language='rust', build_cmd='cargo build --release --locked --offline',
+            target_triples={native: [gnu, musl], failed: 'x86_64-pc-windows-msvc'},
+            env={'PATH': os.environ['PATH']},
+            release_contract=dict(checksum_sidecar='sha256', exact_primary_assets={
+                native + '@' + gnu: 'relocfixture-gnu', native + '@' + musl: 'relocfixture-musl',
+                failed: 'relocfixture-windows.exe'}))
     save(case / 'config/repos.d/relocfixture.yaml', config)
     (case / 'failures').write_text('\n'.join(targets[1:]) + '\n')
     env = dict(os.environ, RELOC_PROJECT=str(project), RELOC_CASE=str(case), RELOC_MODE=mode,
@@ -2253,6 +2337,7 @@ go build -buildvcs=false -trimpath -o "$binary" .
         DSR_CACHE_DIR=str(case / 'cache'), ACT_CONFIG_DIR=str(case / 'config'),
         ACT_REPOS_DIR=str(case / 'config/repos.d'), ACT_LOGS_DIR=str(case / 'logs'),
         ACT_ARTIFACTS_DIR=str(case / 'artifacts'), DSR_DISABLE_HOST_SELECTOR='1', DSR_RETRY_MAX='4',
+        RELOC_MATRIX_PRODUCER=str(matrix_producer),
         RCH_DISABLED='1', RCH_CARGO_WRAPPER_BYPASS='1', NO_COLOR='1')
     for key in ('RCH_REQUIRE_REMOTE', 'DSR_BUILD_LOCK_HELD_BY_CALLER', 'DSR_RUN_ID', 'DSR_STRICT_BUILD_ROOT'):
         env.pop(key, None)
@@ -2266,7 +2351,7 @@ def invoke(case, env, phase, label=None, preflight_exit=None):
             stdin=subprocess.DEVNULL, stdout=out, stderr=err, timeout=180)
     if phase == 'spoof':
         return result.returncode, read(case / 'spoof/worker.json')
-    if phase == 'compare':
+    if phase in ('compare', 'matrix-state-transition'):
         return result.returncode, {}
     try:
         value = read(case / (label + '.stdout'))
@@ -2289,7 +2374,8 @@ def state_file(case, run):
 
 
 def scheduled(state, target):
-    host = state['context']['target_hosts'][target]
+    task = next(row for row in state['context']['build_tasks'] if row['key'] == target)
+    host = state['context']['target_hosts'][task['platform']]
     return dict(run_id=state['run_id'], git_sha=state['git_sha'], git_ref=state['git_ref'],
                 host=host, root=state['context']['source_roots'][host])
 
@@ -2353,7 +2439,8 @@ def refuse(case, env, label, mutate, expected_exit=4):
     path = state_file(case, env['RELOC_RUN'])
     state = read(path)
     receipt = Path(state['target_statuses'][failed]['result_path'])
-    success = Path(state['target_statuses'][native]['result']['artifact_path'])
+    success_key = native + '@' + gnu if matrix_only else native
+    success = Path(state['target_statuses'][success_key]['result']['artifact_path'])
     owned = [path, receipt, success, case / 'approval.json', case / 'config/repos.d/relocfixture.yaml',
              case / 'source/main.go']
     originals = {p: p.read_bytes() for p in owned}
@@ -2384,7 +2471,143 @@ def mutate_evidence(transform):
     return change
 
 
-for mode in (() if hosts_only else ('capacity', 'readiness', 'executed', 'timeout')):
+if matrix_only:
+    case, env, targets = fixture('mixed-matrix', 'matrix')
+    code, first = invoke(case, env, 'first')
+    details = first.get('details', {})
+    if not check('mixed matrix: production dispatch retains two completed variants and one failed singleton',
+                 code == 1 and details.get('success') == 2 and details.get('failed') == 1):
+        print((case / 'first.stderr').read_text()[-6000:], flush=True)
+        raise AssertionError('Controlled matrix producer did not reach the intended outcomes')
+    env['RELOC_RUN'] = details['run_id']
+    path = state_file(case, env['RELOC_RUN'])
+    initial = read(path)
+    (case / 'first.state.json').write_bytes(path.read_bytes())
+    expected_keys = [native + '@' + gnu, native + '@' + musl, failed]
+    check('mixed matrix: exact task identities and original full configuration digest are frozen',
+          [row['key'] for row in initial['context']['build_tasks']] == expected_keys and
+          initial['context']['native_matrix_config_sha256'] == digest(case / 'config/repos.d/relocfixture.yaml') and
+          all(row['attempts'] == 1 for row in initial['target_statuses'].values()) and
+          all(read(Path(row['result_path'])).get('scheduled_source') == scheduled(initial, key)
+              for key, row in initial['target_statuses'].items()))
+    evidence = retained(initial)
+    approve(case, env, failed, 'replacement', 'replacement')
+    config_path = case / 'config/repos.d/relocfixture.yaml'
+    approved_hash = digest(config_path)
+    check('mixed matrix: reviewed singleton relocation changes the full configuration digest',
+          approved_hash != initial['context']['native_matrix_config_sha256'])
+
+    def unrelated_variant_config(unused_path, unused_receipt, unused_success):
+        config = read(config_path)
+        config['cross_compile'][native]['env'] = {'RUSTFLAGS': '-C opt-level=1'}
+        save(config_path, config)
+        approval = read(case / 'approval.json')
+        approval['repo_config_sha256'] = digest(config_path)
+        save(case / 'approval.json', approval)
+    refuse(case, env, 'matrix-unrelated-variant-change', unrelated_variant_config)
+
+    def substituted_prior_config(unused_path, unused_receipt, unused_success):
+        approval = read(case / 'approval.json')
+        prior = read(Path(approval['prior_repo_config_path']))
+        prior['build_profile'] = 'substituted-profile'
+        substituted = case / 'substituted-prior.yaml'
+        save(substituted, prior)
+        config = read(config_path)
+        config['build_profile'] = 'substituted-profile'
+        save(config_path, config)
+        approval.update(prior_repo_config_path=str(substituted), prior_repo_config_sha256=digest(substituted),
+                        repo_config_sha256=digest(config_path))
+        save(case / 'approval.json', approval)
+    refuse(case, env, 'matrix-substituted-prior-configuration', substituted_prior_config)
+
+    original_request = env['RELOC_REQUEST']
+    env['RELOC_REQUEST'] = native + '=replacement'
+    def ambiguous_platform(unused_path, unused_receipt, unused_success):
+        approval = read(case / 'approval.json')
+        approval['target'] = native
+        save(case / 'approval.json', approval)
+    refuse(case, env, 'matrix-ambiguous-platform-relocation', ambiguous_platform)
+    env['RELOC_REQUEST'] = original_request
+
+    # The atomic state API must reject an unbound/malformed digest even when
+    # called directly with an otherwise current compare-and-swap snapshot.
+    for label, old_hash, new_hash in (
+            ('stale-old-digest', 'f' * 64, approved_hash),
+            ('invalid-new-digest', initial['context']['native_matrix_config_sha256'], 'invalid')):
+        save(case / 'matrix-transition.json', dict(repo_config_sha256=new_hash,
+            approval=dict(prior_repo_config_sha256=old_hash)))
+        before = path.read_bytes()
+        code, unused = invoke(case, env, 'matrix-state-transition', label)
+        check('mixed matrix: atomic transition refuses ' + label,
+              code != 0 and path.read_bytes() == before and unchanged(evidence))
+        # Preserve the observed counterexample when replaying an older module,
+        # then restore only this fixture checkpoint for the next independent case.
+        (case / (label + '.observed-state.json')).write_bytes(path.read_bytes())
+        path.write_bytes(before)
+
+    # Failure after genuine local source staging must not advance either the
+    # host assignment or the configuration digest. The later retry can reuse
+    # that verified immutable snapshot without overwriting it.
+    before_state, before_events = path.read_bytes(), events(case)
+    env['RELOC_REJECT_REPLACEMENT_CLOSURE'] = '1'
+    code, unused = invoke(case, env, 'resume', 'matrix-failed-source-admission', preflight_exit=4)
+    check('mixed matrix: failed relocation leaves checkpoint, attempts and successful siblings unchanged',
+          code == 4 and path.read_bytes() == before_state and events(case) == before_events and unchanged(evidence))
+    check('mixed matrix: controlled replacement Cargo refusal follows actual source staging',
+          (case / 'replacement').is_dir() and
+          ('CARGO-CLOSURE ' + failed + ' replacement') in (case / 'boundaries').read_text().splitlines())
+    env.pop('RELOC_REJECT_REPLACEMENT_CLOSURE')
+
+    # Keep the replacement recipe failing once: this proves a later ordinary
+    # resume consumes the atomically updated matrix digest without new approval.
+    code, resumed = invoke(case, env, 'resume', 'matrix-relocation')
+    middle = read(path)
+    relocated = check('mixed matrix: approved singleton relocation advances the original run',
+          code == 1 and resumed.get('details', {}).get('run_id') == initial['run_id'] and
+          middle['status'] == 'partial' and middle['context']['target_hosts'][failed] == 'replacement' and
+          middle['context']['native_matrix_config_sha256'] == approved_hash and
+          len(middle.get('relocations', [])) == 1 and
+          middle['relocations'][0]['prior_context']['native_matrix_config_sha256'] ==
+              initial['context']['native_matrix_config_sha256'] and
+          middle['relocations'][0]['prior_target'] == initial['target_statuses'][failed])
+    check('mixed matrix: only the failed singleton receives another worker attempt',
+          events(case) == before_events + [failed] and middle['target_statuses'][failed]['attempts'] == 2 and
+          all(middle['target_statuses'][key] == initial['target_statuses'][key] for key in expected_keys[:2]) and
+          unchanged(evidence))
+    if relocated:
+        partial_evidence = retained(middle)
+        original_config, before_state, before_events = config_path.read_bytes(), path.read_bytes(), events(case)
+        config = read(config_path)
+        config['cross_compile'][failed]['env'] = {'RUSTFLAGS': '-C opt-level=2'}
+        save(config_path, config)
+        code, unused = invoke(case, env, 'ordinary-resume', 'matrix-post-relocation-drift', preflight_exit=4)
+        check('mixed matrix: later unapproved recipe drift refuses without checkpoint or worker changes',
+              code == 4 and path.read_bytes() == before_state and events(case) == before_events and
+              unchanged(partial_evidence))
+        config_path.write_bytes(original_config)
+        (case / 'failures').write_text('')
+        code, result = invoke(case, env, 'ordinary-resume', 'matrix-completion')
+        final = read(path)
+        check('mixed matrix: unchanged ordinary resume completes only the relocated singleton',
+              code == 0 and result.get('details', {}).get('run_id') == initial['run_id'] and
+              final['status'] == 'completed' and events(case) == before_events + [failed] and
+              final['target_statuses'][failed]['attempts'] == 3 and
+              all(final['target_statuses'][key] == initial['target_statuses'][key] for key in expected_keys[:2]) and
+              unchanged(evidence) and unchanged(partial_evidence))
+        manifest_path = case / 'output/relocfixture-v1.0.0-manifest.json'
+        manifest = read(manifest_path) if manifest_path.exists() else {}
+        expected_triples = sorted([gnu, musl, 'x86_64-pc-windows-msvc'])
+        check('mixed matrix: resumed manifest retains all three exact variants and their original hosts',
+              manifest.get('publishable') is True and manifest.get('run_id') == initial['run_id'] and
+              manifest.get('summary') == dict(total=3, success=3, failed=0) and
+              sorted(row.get('target_triple', '') for row in manifest.get('artifacts', [])) == expected_triples and
+              sorted(row.get('target_triple', '') for row in manifest.get('build_environments', [])) == expected_triples and
+              all(row['host'] == ('replacement' if row['target'] == failed else 'completed')
+                  for row in manifest.get('build_environments', [])) and
+              all(digest(case / 'output' / row['name']) == row['sha256'] for row in manifest.get('artifacts', [])))
+
+
+for mode in (() if hosts_only or matrix_only else ('capacity', 'readiness', 'executed', 'timeout')):
     case, env, targets, initial = seed(mode, mode)
     evidence = retained(initial)
     approve(case, env, failed, 'replacement', 'replacement')
@@ -2473,7 +2696,7 @@ for mode in (() if hosts_only else ('capacity', 'readiness', 'executed', 'timeou
           manifest_value.get('summary') == dict(total=2, success=2, failed=0) and
           all(digest(case / 'output' / row['name']) == row['sha256'] for row in manifest_value.get('artifacts', [])))
 
-if not hosts_only:
+if not hosts_only and not matrix_only:
     # Two failed targets can move in successive reviewed invocations. The second
     # approval binds the first relocation's configuration, and neither completed
     # target is compiled again while the remaining target advances to attempt 3.
@@ -2503,7 +2726,7 @@ if not hosts_only:
 
 # Host selection, health and transport honor DSR_HOSTS_FILE. Approval and later
 # resume must bind those same bytes, even when an unrelated default file exists.
-for hosts_mode in ('default', 'custom-absent'):
+for hosts_mode in (() if matrix_only else ('default', 'custom-absent')):
     case, env, targets, initial = seed('hosts-' + hosts_mode, 'executed', hosts_mode=hosts_mode)
     evidence, before_events = retained(initial), events(case)
     approve(case, env, failed, 'replacement', 'relocation')
@@ -2538,7 +2761,7 @@ for hosts_mode in ('default', 'custom-absent'):
                   read(state_file(case, env['RELOC_RUN']))['status'] == 'completed' and
                   read(state_file(case, env['RELOC_RUN']))['target_statuses'][failed]['attempts'] == 3)
 
-for timing in ('before-sync', 'after-sync', 'ordinary-resume'):
+for timing in (() if matrix_only else ('before-sync', 'after-sync', 'ordinary-resume')):
     case, env, targets, initial = seed('hosts-drift-' + timing, 'executed', hosts_mode='custom-mirrored')
     approve(case, env, failed, 'replacement', 'relocation')
     active_hosts, default_hosts = Path(env['DSR_HOSTS_FILE']), case / 'config/hosts.yaml'
@@ -2583,7 +2806,8 @@ raise SystemExit(bool(failures))
 PY
 }
 
-if [[ "${1:-}" == --relocation-recovery-only || "${1:-}" == --relocation-hosts-only ]]; then
+if [[ "${1:-}" == --relocation-recovery-only || "${1:-}" == --relocation-hosts-only ||
+      "${1:-}" == --relocation-matrix-only ]]; then
     test_relocation_recovery "$1"
     exit $?
 fi
@@ -7404,6 +7628,13 @@ case "$relocation_test_status" in
     0) pass "reviewed relocation uses genuine worker receipts and preserves completed target evidence" ;;
     77) skip "relocation integration requires Go and its local fixture dependencies" ;;
     *) fail "reviewed relocation rejected genuine target outcomes or lost receipt/source authority" ;;
+esac
+relocation_matrix_status=0
+test_relocation_recovery --relocation-matrix-only || relocation_matrix_status=$?
+case "$relocation_matrix_status" in
+    0) pass "reviewed singleton relocation preserves completed native variants and updates their matrix configuration binding" ;;
+    77) skip "mixed relocation integration requires its local fixture dependencies" ;;
+    *) fail "mixed native matrix could not safely relocate its failed singleton target" ;;
 esac
 
 if test_worker_group_lifecycle; then

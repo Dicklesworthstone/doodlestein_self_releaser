@@ -808,6 +808,13 @@ cancelled runs and diagnostic builds are refused.
 Platform-level host relocation also requires the selected platform to have one
 configured triple. A multi-variant platform uses the existing same-host resume,
 which retries only failed variants and retains successful sibling receipts.
+A failed singleton platform may relocate when other platforms in the run have
+multiple variants. Its approval must bind the prior configuration to the run's
+saved matrix configuration digest. The reviewed replacement digest advances
+atomically with the host and source bindings; completed variant receipts and
+the exact task inventory stay unchanged. Failed admission or staging cannot
+advance that digest, and later resumes still refuse unapproved configuration
+changes.
 The approval file is a regular JSON file with these required fields:
 
 ```json

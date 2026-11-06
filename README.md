@@ -1454,6 +1454,11 @@ its successful sibling to compile again. All variants must succeed before the
 build produces a publishable manifest. Same-host selective resume is supported
 for the matrix; platform-level failed-target host relocation requires a
 singleton platform.
+A failed singleton can use approved host relocation in a run that also contains
+GNU/musl variants. The completed variants keep their original receipts and
+artifacts. The approval binds the original matrix configuration, and the new
+configuration digest is saved atomically with the replacement host and source
+bindings; subsequent unapproved configuration changes still prevent resume.
 
 With `--parallel`, two targets on one host whose build writes the same
 in-tree file (for example `go build -o tool ./cmd/tool`) no longer overwrite
