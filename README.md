@@ -1332,6 +1332,12 @@ cross toolchain (`CARGO_TARGET_<T>_LINKER` / `CC_<t>`) or build commands that
 already invoke `zigbuild`, `xwin`, or `cross` — but an explicitly configured
 `linux_glibc_floor` is still enforced on those binaries.
 
+The automatic exemption requires an actual `cargo zigbuild`, `cargo xwin`, or
+`cross build` command. Package names, feature names, comments, and printed
+messages mentioning those tools retain the default floor. A command sequence
+that also runs ordinary `cargo build` retains the floor as well; commands whose
+compiler routing cannot be determined safely keep the default protection.
+
 Strict Unix builds attest the generated Cargo shim separately from the actual
 Cargo, rustc and rustup executables it delegates to. The expected shim hash is
 derived from DSR's generator; changed bytes, links or unexpected files in its

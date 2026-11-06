@@ -4049,11 +4049,30 @@ _act_linux_glibc_floor() {
        act_get_build_env_value "$build_env" "CC_${triple_lower}" &>/dev/null; then
         return 1
     fi
-    case "$build_cmd" in
-        *zigbuild*|*xwin*|*"cross build"*) return 1 ;;
-    esac
+    if _act_linux_command_owns_toolchain "$build_cmd" "$build_env"; then
+        return 1
+    fi
 
     printf '%s\n' "$floor"
+}
+
+# Only an actual compiler command can exempt the default GNU ABI floor. The
+# same quote/comment/command-position parser used by strict Cargo admission
+# distinguishes a plugin invocation from package names, messages and comments.
+# An opaque shell command cannot prove ownership, so keep the default floor.
+_act_linux_command_owns_toolchain() {
+    local build_cmd="$1" build_env="$2" script pair route
+    local -a pairs=()
+    while IFS= read -r pair; do
+        [[ -z "$pair" ]] && continue
+        [[ "$pair" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || return 1
+        pairs+=("$pair")
+    done <<< "$build_env"
+    script=$(_act_toolchain_identity_script routing /dev/null "$build_cmd") || return 1
+    # Worker environment values remain data, including BASH_ENV and PATH.
+    # Stream the generated observer rather than adding another large argv.
+    route=$(env -i "${pairs[@]}" "$BASH" -p -s <<< "$script" 2>/dev/null) || return 1
+    [[ "$route" == owned ]]
 }
 
 # The floor a collected Linux Rust artifact is held to after the build.
@@ -9828,12 +9847,14 @@ PY
 # Apple /usr/bin compiler launchers, its dispatch target and content digest.
 # Internal metadata mode runs locked/offline metadata with the same selection;
 # context mode passes selected executable authority to the intermediate cache.
+# Routing mode only classifies compiler commands for the default glibc floor;
+# it neither observes a toolchain nor creates a build identity receipt.
 # Args: mode output_json build_cmd extra_tools(space-separated) receipt_pin expected_cwd zig_shim_dir
 _act_toolchain_identity_script() {
     local mode="$1" output="$2" build_cmd="$3" extra_tools="${4:-}" receipt_pin="${5:-}" expected_cwd="${6:-}"
     local zig_shim_dir="${7:-}" zig_shim_hash="" shim_dir_q shim_hash_q
     local output_q command_q extra_q pin_q cwd_q python_q=python3
-    [[ "$mode" == record || "$mode" == verify || "$mode" == read || "$mode" == metadata || "$mode" == context || "$mode" == target || "$mode" == selection ]] || return 4
+    [[ "$mode" == record || "$mode" == verify || "$mode" == read || "$mode" == metadata || "$mode" == context || "$mode" == target || "$mode" == selection || "$mode" == routing ]] || return 4
     [[ "$output" == /* && "$output" != *..* ]] || return 4
     [[ -z "$expected_cwd" || ( "$expected_cwd" == /* && "$expected_cwd" != *..* ) ]] || return 4
     if [[ -n "$zig_shim_dir" ]]; then
@@ -9851,10 +9872,10 @@ _act_toolchain_identity_script() {
     printf -v cwd_q '%q' "$expected_cwd"
     printf -v shim_dir_q '%q' "$zig_shim_dir"
     printf -v shim_hash_q '%q' "$zig_shim_hash"
-    # Target-only planning runs on the coordinator without invoking any build
+    # Command planning runs on the coordinator without invoking any build
     # tools or reading its Cargo configuration. The configured PATH may be a
     # remote host path, so use the coordinator's absolute Python interpreter.
-    if [[ "$mode" == target || "$mode" == selection ]]; then
+    if [[ "$mode" == target || "$mode" == selection || "$mode" == routing ]]; then
         python_q=$(command -v python3) || return 4
         printf -v python_q '%q' "$python_q"
     else
@@ -10404,7 +10425,7 @@ def cargo_configuration():
 
 
 cargo_config, cargo_config_receipts = (({'build': {}, 'target': {}, 'alias': {}}, [])
-                                     if mode in ('target', 'selection') else cargo_configuration())
+                                     if mode in ('target', 'selection', 'routing') else cargo_configuration())
 
 
 def cargo_shell_words(text):
@@ -10553,6 +10574,12 @@ def invocation_selection():
                 fail('env options around Cargo are unsupported; configure the build environment')
             program = shell_word(words[cursor])
             cursor += 1
+        # Routing is coordinator-only intent, not executable attestation. A
+        # literal Cargo/cross path owns its own dispatch, while strict receipt
+        # modes still require the original direct `cargo` invocation below.
+        route_program = pathlib.PurePosixPath(program).name
+        if mode == 'routing' and route_program in ('cargo', 'cross'):
+            program = 'cargo'
         if program != 'cargo':
             if pathlib.PurePosixPath(program).name == 'cargo' or \
                     (program in ('rustup', 'sh', 'bash', 'zsh', 'dash', 'env', 'exec', 'eval', 'source', '.') and
@@ -10616,6 +10643,9 @@ def invocation_selection():
         if cursor >= len(argv) or not re.fullmatch(r'[a-z][a-z0-9-]*', argv[cursor]):
             fail('a direct Cargo subcommand is required for strict toolchain attestation')
         subcommand = argv[cursor]
+        if mode == 'routing':
+            commands.append(route_program + ':' + subcommand)
+            continue
         if subcommand in cargo_config['alias']:
             fail('Cargo alias cannot be attested as a direct compiler invocation: ' + subcommand)
         if subcommand == 'rustc' and '--' in argv:
@@ -10688,6 +10718,15 @@ def invocation_selection():
         # An explicit + selector has higher priority than RUSTUP_TOOLCHAIN.
         selection['environment']['RUSTUP_TOOLCHAIN'] = toolchain or ''
         selections.append((selection, env, explicit_toolchain))
+    if mode == 'routing':
+        owned = {'cargo:zigbuild', 'cargo:xwin', 'cross:build'}
+        # Metadata preparation does not choose a compiler. A plain Cargo
+        # build anywhere in a mixed command list still needs the floor shim.
+        preparation = {'cargo:' + name for name in (
+            'fetch', 'generate-lockfile', 'locate-project', 'metadata',
+            'pkgid', 'read-manifest', 'tree', 'verify-project')}
+        routes = set(commands)
+        return not context_change and bool(routes & owned) and not routes - owned - preparation
     if context_change:
         fail('Cargo context changes inside build_cmd (' + context_change +
              '); configure its environment/cwd outside the command')
@@ -10700,6 +10739,10 @@ def invocation_selection():
         env['RUSTUP_TOOLCHAIN'] = selection['toolchain']
     return selection, env, any(row[2] for row in selections), sorted(set(commands)), sorted(assigned_environment)
 
+
+if mode == 'routing':
+    sys.stdout.write('owned\n' if invocation_selection() else 'default\n')
+    sys.exit(0)
 
 selection, probe_env, explicit_toolchain, cargo_commands, assigned_environment = invocation_selection()
 

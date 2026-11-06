@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_act_runner_native.sh - Unit tests for act_runner.sh native build SSH logic
 #
-# Usage: ./test_act_runner_native.sh [--typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --workspace-archives-only | --failure-evidence-only | --env-precedence-only | --archive-delivery-only | --zig-dispatch-only]
+# Usage: ./test_act_runner_native.sh [--typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --workspace-archives-only | --failure-evidence-only | --env-precedence-only | --archive-delivery-only | --zig-dispatch-only | --glibc-routing-only]
 #
 # Tests native build SSH command construction with mocks.
 # Covers: command construction, path handling, env vars, SCP, error handling.
@@ -6700,6 +6700,64 @@ test_rust_linux_glibc_floor_shim_injected() {
     fi
 }
 
+test_rust_linux_glibc_floor_command_positions() {
+    log_test "Rust linux: only real toolchain invocations exempt the default floor"
+    reset_state
+    local build_env='CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu'
+    local command floor enforced status
+    local -a default_commands=(
+        'cargo build --release -p xwindow'
+        'cargo build --release --features=zigbuild'
+        'cargo build --release --features "cross build"'
+        'printf "%s\n" "cargo zigbuild" && cargo build --release'
+        'cargo build --release # cross build is not invoked'
+        'LABEL=zigbuild cargo build --release'
+        'env LABEL=xwin cargo build --release'
+        'cargo build --release >zigbuild.log'
+        'command -v xwin; cargo build --release'
+        'cargo build --release && cargo xwin build --release'
+        'sh -c "cargo zigbuild --release"'
+        $'cat <<EOF\ncross build\nEOF\ncargo build --release'
+    )
+    for command in "${default_commands[@]}"; do
+        status=0
+        floor=$(_act_linux_glibc_floor tool linux/amd64 "$ACT_REPOS_DIR/tool.yaml" \
+            "$build_env" "$command") || status=$?
+        enforced=$(_act_linux_glibc_floor_enforced tool linux/amd64 "$ACT_REPOS_DIR/tool.yaml" \
+            "$build_env" "$command") || status=$?
+        if [[ "$status" -eq 0 && "$floor" == 2.28 && "$enforced" == 2.28 ]]; then
+            log_pass "Default shim and output ceiling retained for: $command"
+        else
+            log_fail "Incidental or opaque command suppressed the floor: status=$status floor=$floor enforced=$enforced command=$command"
+        fi
+    done
+
+    local -a owned_commands=(
+        'cargo zigbuild --release'
+        'cargo +stable --offline --color never zigbuild --release'
+        "'cargo' --color='never' 'zigbuild' --release"
+        'command -- cargo +stable -vv zigbuild --release'
+        'env LABEL=value cargo xwin build --release'
+        '/opt/toolchain/cargo xwin build --release'
+        'cross build --release'
+        'cross +stable --color=never build --release'
+        'cargo metadata --format-version=1 && cargo zigbuild --release'
+        $'cargo zi\\\ngbuild --release'
+    )
+    for command in "${owned_commands[@]}"; do
+        status=0
+        floor=$(_act_linux_glibc_floor tool linux/amd64 "$ACT_REPOS_DIR/tool.yaml" \
+            "$build_env" "$command") || status=$?
+        enforced=$(MOCK_GLIBC_FLOOR=2.28 _act_linux_glibc_floor_enforced \
+            tool linux/amd64 "$ACT_REPOS_DIR/tool.yaml" "$build_env" "$command") || status=$?
+        if [[ "$status" -eq 1 && -z "$floor" && "$enforced" == 2.28 ]]; then
+            log_pass "Owned toolchain keeps dispatch and explicit output ceiling: $command"
+        else
+            log_fail "Owned toolchain routing changed: status=$status floor=$floor enforced=$enforced command=$command"
+        fi
+    done
+}
+
 test_rust_linux_glibc_floor_native_opt_out() {
     log_test "Rust linux: linux_glibc_floor: native disables the shim"
     reset_state
@@ -6923,6 +6981,52 @@ test_strict_rust_linux_glibc_floor_rejects_newer_glibc() {
     else
         log_fail "Strict build accepted a binary above its glibc floor: status=$status result=$result errors=$errors"
     fi
+}
+
+test_strict_rust_linux_glibc_floor_ignores_incidental_tokens() {
+    log_test "Strict Rust linux: incidental words cannot admit an incompatible ELF"
+    local command requirement result status capture index=0
+    local -a commands=(
+        'cargo build --locked --release -p xwindow'
+        'cargo build --locked --release --features=zigbuild'
+        'printf "%s\n" "cross build"; cargo build --locked --release'
+        'cargo build --locked --release # cargo zigbuild is a comment'
+    )
+    for command in "${commands[@]}"; do
+        ((index+=1))
+        for requirement in 2.17 2.39; do
+            reset_state
+            MOCK_LANGUAGE=rust
+            MOCK_BINARY_NAME=tool
+            MOCK_BUILD_CMD="$command"
+            MOCK_ARTIFACT_KIND=elf-amd64
+            MOCK_PLATFORM_ENV='CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu'
+            MOCK_SSH_STREAM_FILE="$MOCK_DIR/glibc-routing-$index-$requirement"
+            write_mock_artifact "$MOCK_SSH_STREAM_FILE"
+            printf '\0GLIBC_%s\0' "$requirement" >> "$MOCK_SSH_STREAM_FILE"
+            status=0
+            result=$(_run_strict_linux_rust_build linux/amd64 2>/dev/null) || status=$?
+            capture=$(get_ssh_capture)
+            if [[ "$capture" == *'export "DSR_ZIG_TARGET=x86_64-unknown-linux-gnu.2.28"'* &&
+                  "$capture" == *"DSR_ZIG_SHIM_EOF"* ]] &&
+               jq -e '.build_influence_env.DSR_LINUX_GLIBC_FLOOR == "2.28"' \
+                   <<< "$result" >/dev/null; then
+                log_pass "Incidental command $index receives the default compiler route for GLIBC_$requirement"
+            else
+                log_fail "Incidental command $index lost the default route: status=$status result=$result"
+            fi
+            if [[ "$requirement" == 2.17 && "$status" -eq 0 ]] &&
+               jq -e '.status == "success" and (.artifact_paths | length) == 1' <<< "$result" >/dev/null; then
+                log_pass "Incidental command $index retains compatible output"
+            elif [[ "$requirement" == 2.39 && "$status" -eq 7 ]] &&
+                 jq -e '.status == "failed" and .artifact_paths == [] and .collected_sha256 == null' \
+                     <<< "$result" >/dev/null; then
+                log_pass "Incidental command $index withholds output above the default ceiling"
+            else
+                log_fail "Incidental command $index admitted the wrong output: requirement=$requirement status=$status result=$result"
+            fi
+        done
+    done
 }
 
 test_strict_explicit_zig_dispatch_and_output_ceiling() {
@@ -7190,12 +7294,21 @@ test_windows_private_cache_collection() {
 }
 
 main() {
+    if [[ "${1:-}" == --glibc-routing-only ]]; then
+        test_rust_linux_glibc_floor_command_positions
+        test_strict_rust_linux_glibc_floor_ignores_incidental_tokens
+        printf 'Native glibc routing tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return $?
+    fi
     if [[ "${1:-}" == --zig-dispatch-only ]]; then
         test_rust_linux_glibc_floor_shim_injected
+        test_rust_linux_glibc_floor_command_positions
         test_rust_linux_glibc_floor_native_opt_out
         test_rust_linux_glibc_floor_skips_musl
         test_strict_rust_linux_glibc_floor_shim_outside_snapshot
         test_strict_rust_linux_glibc_floor_rejects_newer_glibc
+        test_strict_rust_linux_glibc_floor_ignores_incidental_tokens
         test_strict_explicit_zig_dispatch_and_output_ceiling
         test_rust_linux_glibc_floor_enforced_for_owned_toolchain
         printf 'Native Zig dispatch tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
@@ -7489,6 +7602,7 @@ main() {
     test_rust_derive_build_target_opt_out
     test_windows_rejects_posix_source_root
     test_rust_linux_glibc_floor_shim_injected
+    test_rust_linux_glibc_floor_command_positions
     test_rust_linux_glibc_floor_native_opt_out
     test_rust_linux_glibc_floor_skips_musl
     test_rust_linux_glibc_floor_skips_operator_linker
@@ -7497,6 +7611,7 @@ main() {
     test_output_stage_builds_and_collects_privately
     test_strict_rust_linux_glibc_floor_shim_outside_snapshot
     test_strict_rust_linux_glibc_floor_rejects_newer_glibc
+    test_strict_rust_linux_glibc_floor_ignores_incidental_tokens
     test_strict_explicit_zig_dispatch_and_output_ceiling
     test_rust_linux_glibc_floor_enforced_for_owned_toolchain
 
