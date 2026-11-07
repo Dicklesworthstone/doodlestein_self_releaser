@@ -837,12 +837,13 @@ build_state_set_context() {
     --arg sha "$git_sha" --arg ref "$git_ref" \
     --argjson source_roots "$source_roots_json" \
     --argjson target_hosts "$target_hosts_json" \
-    --argjson source_sync "$source_sync_json" \
+    --slurpfile source_sync /dev/stdin \
     --arg build_purpose "$build_purpose" \
     --argjson build_tasks "$build_tasks_json" \
     --arg native_matrix_config_sha256 "$native_matrix_config_sha256" \
     --arg output_dir "$output_dir" --argjson parallel_jobs "$parallel_jobs" \
     --arg now "$now" '
+      ($source_sync | select(length == 1) | .[0]) as $source_sync |
       .git_sha = $sha |
       .git_ref = $ref |
       .context = {
@@ -860,7 +861,7 @@ build_state_set_context() {
         .[$task.key] = {status: "pending", attempts: 0})) |
       .source_sync_history = (if $source_sync == null then []
         else [{recorded_at: $now, receipt: $source_sync}] end) |
-      .updated_at = $now'
+      .updated_at = $now' <<< "$source_sync_json"
 }
 
 # Refresh an ordinary run's sync admission evidence without changing completed
@@ -870,13 +871,13 @@ build_state_set_context() {
 build_state_set_source_sync() {
   local tool="$1" version="$2" run_id="$3" source_sync_json="$4"
   local source_roots_json="$5" target_hosts_json="$6" tool_dir state_file now
-  if ! jq -en --argjson receipt "$source_sync_json" \
-      --argjson roots "$source_roots_json" --argjson hosts "$target_hosts_json" '
+  if ! jq -es --argjson roots "$source_roots_json" --argjson hosts "$target_hosts_json" '
+        length == 1 and (.[0] as $receipt |
         ($receipt == null or ($receipt | type == "object")) and
         ($roots | type == "object") and all($roots[]; type == "string" and length > 0) and
         ($hosts | type == "object") and all($hosts[]; type == "string" and length > 0) and
-        ($receipt == null or ($receipt.source_roots == $roots and $receipt.target_hosts == $hosts))
-      ' >/dev/null 2>&1; then
+        ($receipt == null or ($receipt.source_roots == $roots and $receipt.target_hosts == $hosts)))
+      ' <<< "$source_sync_json" >/dev/null 2>&1; then
     log_error "Invalid source-sync context for run $run_id"
     return 1
   fi
@@ -885,8 +886,9 @@ build_state_set_source_sync() {
   [[ -f "$state_file" ]] || return 1
   now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
   _build_state_jq_update "$state_file" \
-    --argjson source_sync "$source_sync_json" --argjson roots "$source_roots_json" \
+    --slurpfile source_sync /dev/stdin --argjson roots "$source_roots_json" \
     --argjson hosts "$target_hosts_json" --arg now "$now" '
+      ($source_sync | select(length == 1) | .[0]) as $source_sync |
       if .status == "completed" or .status == "cancelled"
       then error("cannot refresh source sync for a terminal run")
       else
@@ -896,7 +898,7 @@ build_state_set_source_sync() {
         .source_sync_history = ((.source_sync_history // []) +
           [{recorded_at: $now, receipt: $source_sync}]) |
         .updated_at = $now
-      end'
+      end' <<< "$source_sync_json"
 }
 
 # Atomically replace only a failed target's host binding, preserving its attempt

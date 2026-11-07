@@ -7933,8 +7933,9 @@ _act_export_ordinary_git_contexts() {
                 return 4
             fi
         fi
-        contexts=$(jq -c --argjson item "$item" --argjson context "$context" \
-            '. + [$item + {context:$context}]' <<< "$contexts") || return 4
+        contexts=$(jq -c --argjson item "$item" --slurpfile context /dev/fd/3 \
+            '($context | if length == 1 then .[0] else error("exactly one Git context required") end) as $context |
+             . + [$item + {context:$context}]' 3<<< "$context" <<< "$contexts") || return 4
         if [[ "${_ACT_ISOLATED_SOURCE_TOOL:-}" == "$tool_name" && "$context" != null ]]; then
             revision=$(jq -r .git_sha <<< "$context") || return 4
             git_ops_verify_materialized_source "$source" "$revision" || return 4
@@ -7953,10 +7954,11 @@ _act_export_ordinary_git_contexts() {
                 child_context=$(git_ops_export_build_context "$child_source" "$context_parent/$child_relative") || return 4
                 [[ "$(jq -r .git_sha <<< "$child_context")" == "$revision" ]] || return 4
                 contexts=$(jq -c --arg path "$child_source" --arg relative "$child_relative" \
-                    --arg revision "$revision" --argjson context "$child_context" '
+                    --arg revision "$revision" --slurpfile context /dev/fd/3 '
+                    ($context | if length == 1 then .[0] else error("exactly one Git context required") end) as $context |
                     . + [{relative_path:$relative,local_path:$path,context:$context,
                           isolated_git_sha:$revision,submodule:true}]
-                ' <<< "$contexts") || return 4
+                ' 3<<< "$child_context" <<< "$contexts") || return 4
             done < <(jq -c '.[] | select(.path != "")' <<< "$repositories")
         fi
     done < <(jq -c '.[]' <<< "$sources")
@@ -8047,11 +8049,11 @@ _act_restore_ordinary_git_context() {
             -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$bundle" \
             "$destination:$remote_bundle" </dev/null || return 4
         script=$(git_ops_build_context_powershell "$win_source" "$remote_context") || return 4
-        command=$(_act_windows_encoded_powershell "$script" pwsh) || return 4
+        command=$(_act_windows_source_command "$host" "$win_source" "$script") || return 4
         restored=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT" </dev/null) || return 4
     else
         destination=$(_act_get_ssh_destination "$host") || return 4
-        local script quoted_script quoted_source quoted_context
+        local script quoted_source quoted_context
         command="set -e; set -C; umask 077; test -d '${source_root%/*}'; test ! -L '${source_root%/*}'; cat > '$remote_bundle'"
         _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
             -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$destination" "$command" \
@@ -8061,18 +8063,20 @@ _act_restore_ordinary_git_context() {
         printf -v quoted_source '%q' "$source_root"
         printf -v quoted_context '%q' "$remote_context"
         script+=$'\n'"git_ops_restore_build_context $quoted_source $quoted_context"
-        # The SSH login shell need not be Bash. Use POSIX quoting for its
-        # outer argument; only the explicit Bash interpreter reads the script.
-        quoted_script="'${script//\'/\'\\\'\'}'"
-        command="bash -c $quoted_script"
+        # The SSH login shell need not be Bash. Both the outer SSH program
+        # and the explicit Bash importer must stream: a nested `bash -c`
+        # would reintroduce the exec limit for a large tag inventory. Parse
+        # the complete importer before running it and isolate its stdin.
+        printf -v command "bash -s <<'DSR_ORDINARY_GIT_CONTEXT'\n{\n%s\n} </dev/null\nDSR_ORDINARY_GIT_CONTEXT\n" "$script"
         restored=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT" </dev/null) || return 4
     fi
     # Logs belong on stderr; the importer returns exactly one JSON receipt.
-    jq -sce --argjson expected "$remote_context" --arg root "$source_root" '
+    jq -sce --slurpfile expected /dev/fd/3 --arg root "$source_root" '
         def path: gsub("\\\\";"/") | if test("^[A-Za-z]:/") then ascii_downcase else . end;
+        ($expected | if length == 1 then .[0] else error("exactly one Git context required") end) as $expected |
         select(length == 1) | .[0] | select((del(.source_root)) == $expected) |
         select((.source_root | path) == ($root | path)) | .source_root=$root' \
-        <<< "$restored"
+        3<<< "$remote_context" <<< "$restored"
 }
 
 # Sync sibling crates and patch Cargo.toml for remote builds
@@ -8623,13 +8627,15 @@ act_sync_sources() {
                             break
                         fi
                         if [[ "$(jq -r '.submodule // false' <<< "$context_entry")" == true ]]; then
-                            restored_submodules=$(jq -c --arg name "$context_relative" --argjson receipt "$restored_context" \
-                                '.[$name]=$receipt' <<< "$restored_submodules") || return 4
+                            restored_submodules=$(jq -c --arg name "$context_relative" --slurpfile receipt /dev/fd/3 \
+                                '($receipt | if length == 1 then .[0] else error("exactly one Git context receipt required") end) as $receipt |
+                                 .[$name]=$receipt' 3<<< "$restored_context" <<< "$restored_submodules") || return 4
                         elif [[ "$context_relative" == source ]]; then
                             restored_primary="$restored_context"
                         else
-                            restored_siblings=$(jq -c --arg name "$context_relative" --argjson receipt "$restored_context" \
-                                '.[$name]=$receipt' <<< "$restored_siblings") || return 4
+                            restored_siblings=$(jq -c --arg name "$context_relative" --slurpfile receipt /dev/fd/3 \
+                                '($receipt | if length == 1 then .[0] else error("exactly one Git context receipt required") end) as $receipt |
+                                 .[$name]=$receipt' 3<<< "$restored_context" <<< "$restored_siblings") || return 4
                         fi
                     else
                         host_sync_output="Git context import failed for $context_relative: $import_output"
@@ -8646,14 +8652,18 @@ act_sync_sources() {
 
             if $sync_ok; then
                 synced=$((synced + 1))
-                results+=("$(jq -nc --arg host "$host" --arg path "$remote_path" \
+                local success_result
+                success_result=$(jq -nc --arg host "$host" --arg path "$remote_path" \
                     --arg configured_path "${configured_host_paths[$i]}" --argjson staged "$stage_ordinary" \
-                    --argjson context "$restored_primary" --argjson siblings "$restored_siblings" \
-                    --argjson submodules "$restored_submodules" \
-                    '{host:$host,path:$path,status:"success"} +
+                    --slurpfile contexts /dev/fd/3 \
+                    '($contexts | if length == 3 then . else error("exactly three Git context documents required") end) as $contexts |
+                     $contexts[0] as $context | $contexts[1] as $siblings | $contexts[2] as $submodules |
+                     {host:$host,path:$path,status:"success"} +
                      (if $staged then {configured_path:$configured_path,git_context:$context,
                        sibling_git_contexts:$siblings} else {} end) +
-                     (if ($submodules | length) > 0 then {submodule_git_contexts:$submodules} else {} end)')")
+                     (if ($submodules | length) > 0 then {submodule_git_contexts:$submodules} else {} end)' \
+                    3<<< "$restored_primary"$'\n'"$restored_siblings"$'\n'"$restored_submodules") || return 4
+                results+=("$success_result")
                 source_root_entries+=("$(jq -nc --arg host "$host" --arg path "$remote_path" \
                     '{key: $host, value: $path}')")
             else
@@ -8714,15 +8724,15 @@ act_sync_sources() {
         --argjson synced "$synced" \
         --argjson failed "$failed" \
         --argjson duration "$total_duration" \
-        --argjson hosts "$results_json" \
+        --slurpfile contexts /dev/fd/3 \
         --argjson source_roots "$source_roots_json" \
         --argjson target_hosts "$target_hosts_json" \
         --argjson staged_ordinary "$stage_ordinary" \
-        --argjson git_context "$primary_git_context" \
-        --argjson sibling_git_contexts "$sibling_git_contexts" \
-        --argjson submodule_git_contexts "$submodule_git_contexts" \
         --argjson identity "$isolated_identity" \
-        '{
+        '($contexts | if length == 4 then . else error("exactly four source-sync documents required") end) as $contexts |
+        $contexts[0] as $hosts | $contexts[1] as $git_context |
+        $contexts[2] as $sibling_git_contexts | $contexts[3] as $submodule_git_contexts |
+        {
             status: $status,
             synced: $synced,
             failed: $failed,
@@ -8736,7 +8746,7 @@ act_sync_sources() {
             if $identity == null then . else
                 .source_materialization=$identity |
                 .hosts |= map(if .status == "success" then . + {source_materialization:$identity} else . end)
-            end'
+            end' 3<<< "$results_json"$'\n'"$primary_git_context"$'\n'"$sibling_git_contexts"$'\n'"$submodule_git_contexts" || return 4
 
     if [[ $failed -gt 0 ]]; then
         return 1
@@ -14308,10 +14318,11 @@ _act_run_target_worker() {
         # Leave successful identities untouched for the artifact/matrix checks.
         body=$(jq -c --arg purpose "$build_purpose" --arg task_key "$task_key" \
             --arg platform "$target" --arg host "$host" --arg triple "$selected_triple" \
-            --argjson source_sync "$source_sync_receipt" \
+            --slurpfile source_sync /dev/fd/3 \
             --argjson backend_started "$backend_started" \
             --argjson scheduled_source "$scheduled_source" \
-            '. + {build_purpose: $purpose, publishable: ($purpose == "release"), task_key:$task_key,
+            '($source_sync | if length == 1 then .[0] else error("exactly one source-sync receipt required") end) as $source_sync |
+             . + {build_purpose: $purpose, publishable: ($purpose == "release"), task_key:$task_key,
                   backend_started:$backend_started} |
              if (.status // "") | IN("success", "ok", "passed") then .
              else . + {platform:$platform,host:(.host // $host)} +
@@ -14319,7 +14330,7 @@ _act_run_target_worker() {
              if $source_sync == null then . else .source_sync = $source_sync end |
              if $scheduled_source == null then del(.scheduled_source)
              else .scheduled_source = $scheduled_source end' \
-            <<< "$body") || return 4
+            3<<< "$source_sync_receipt" <<< "$body") || return 4
         (
             umask 077
             set -o noclobber
@@ -14341,11 +14352,12 @@ _act_run_target_worker() {
     if [[ "$source_sync_receipt" != null ]] &&
        [[ "$(jq -r '.status' <<< "$source_sync_receipt")" != success ]]; then
         local source_failure
-        source_failure=$(jq -nc --arg target "$target" --arg host "$host" \
-            --arg triple "$selected_triple" --argjson sync "$source_sync_receipt" \
-            '{platform:$target, host:$host, method:"native", status:"failed", exit_code:1,
+        source_failure=$(jq -c --arg target "$target" --arg host "$host" \
+            --arg triple "$selected_triple" \
+            '. as $sync | {platform:$target, host:$host, method:"native", status:"failed", exit_code:1,
               stage:"source_sync", target_triple:(if $triple == "" then null else $triple end),
-              error:("Source synchronization failed for " + $host + ": " + ($sync.error // "transfer failed"))}') || return 4
+              error:("Source synchronization failed for " + $host + ": " + ($sync.error // "transfer failed"))}' \
+            <<< "$source_sync_receipt") || return 4
         jq -r '.error' <<< "$source_failure" >> "$log_path"
         _act_write_worker_result "$source_failure" || return 4
         return 1
@@ -15400,10 +15412,10 @@ act_orchestrate_build() {
             done < <(jq -c '.target_statuses[]?' <<< "$resume_state")
             resume_requested_targets_json=$(for target in $targets; do printf '%s\n' "$target"; done | \
                 jq -Rsc 'split("\n") | map(select(length > 0))')
-            if ! jq -en --argjson state "$resume_state" --arg run_id "$requested_run_id" \
+            if ! jq -e --arg run_id "$requested_run_id" \
                 --argjson requested "$resume_requested_targets_json" \
-                '$state.run_id == $run_id and $state.targets == $requested and
-                 ($state.status != "completed" and $state.status != "cancelled")' >/dev/null 2>&1; then
+                '.run_id == $run_id and .targets == $requested and
+                 (.status != "completed" and .status != "cancelled")' <<< "$resume_state" >/dev/null 2>&1; then
                 _log_error "Resume state target set or status does not match this request"
                 _act_release_orchestration_lock
                 return 4
@@ -16225,8 +16237,9 @@ act_orchestrate_build() {
         --argjson failed "$fail_count" \
         --arg purpose "$build_purpose" \
         --argjson requested_targets "$requested_targets_json" \
-        --argjson source_sync "${source_sync_json:-null}" \
-        '{
+        --slurpfile source_sync /dev/fd/3 \
+        '($source_sync | if length == 1 then .[0] else error("exactly one source-sync receipt required") end) as $source_sync |
+        {
             tool: $tool,
             build_purpose: $purpose,
             publishable: ($purpose == "release"),
@@ -16245,7 +16258,8 @@ act_orchestrate_build() {
                 success: $success,
                 failed: $failed
             }
-        } + (if $error == "" then {} else {error:$error} end)') || return 4
+        } + (if $error == "" then {} else {error:$error} end)' \
+        3<<< "${source_sync_json:-null}") || return 4
     _act_bind_orchestration_targets "$summary_json" "$results_json" || return 4
 
     return "$overall_exit_code"
@@ -16342,8 +16356,9 @@ _act_validate_native_matrix_result_inventory() {
             act_platform_uses_act "$tool" "$platform" && continue
         fi
         matrix=true
-        if ! jq -en --argjson rows "$rows" --argjson configured "$configured" \
+        if ! jq -es --argjson configured "$configured" \
             --arg platform "$platform" --argjson complete "$complete" '
+                length == 1 and (.[0] as $rows |
                 ($rows | map(.target_triple) | unique | length) == ($rows | length) and
                 all($rows[];
                     (.target_triple as $triple | $configured | index($triple) != null) and
@@ -16351,17 +16366,18 @@ _act_validate_native_matrix_result_inventory() {
                 (if $complete then
                     ($rows | map(.target_triple) | sort) == ($configured | sort) and
                     all($rows[]; .status == "success" or .status == "ok" or .status == "passed")
-                 else true end)
-            ' >/dev/null; then
+                 else true end))
+            ' <<< "$rows" >/dev/null; then
             _log_error "Native matrix result is incomplete, duplicated, or inconsistent for $tool $platform"
             return 4
         fi
-        if [[ "$artifacts" != null ]] && ! jq -en --argjson rows "$rows" \
+        if [[ "$artifacts" != null ]] && ! jq -es \
             --argjson artifacts "$artifacts" --arg platform "$platform" '
+                length == 1 and (.[0] as $rows |
                 all($rows[] | select(.status == "success" or .status == "ok" or .status == "passed");
                     .target_triple as $triple |
-                    any($artifacts[]; .target == $platform and .target_triple == $triple))
-            ' >/dev/null; then
+                    any($artifacts[]; .target == $platform and .target_triple == $triple)))
+            ' <<< "$rows" >/dev/null; then
             _log_error "Native matrix payload is missing for $tool $platform"
             return 4
         fi

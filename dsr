@@ -3258,11 +3258,12 @@ EOF
             log_error "Source sync failed or returned incomplete host evidence"
             if $JSON_MODE; then
                 local sync_error_json
-                if ! sync_error_json=$(jq -nc \
+                if ! sync_error_json=$(jq -cse \
                     --arg error "Source sync failed or returned incomplete host evidence" \
-                    --argjson sync "${sync_json:-null}" \
                     --argjson exit_code "$sync_exit" \
-                    '{error: $error, sync: $sync, sync_exit_code: $exit_code}' 2>/dev/null); then
+                    'if length == 1 then {error: $error, sync: .[0], sync_exit_code: $exit_code}
+                     else error("exactly one source-sync receipt required") end' \
+                    <<< "${sync_json:-null}" 2>/dev/null); then
                     sync_error_json='{"error":"Source sync failed or returned incomplete host evidence"}'
                 fi
                 json_envelope "build" "error" 1 "$sync_error_json"
@@ -5094,12 +5095,13 @@ EOF
         build_details=$(jq -n \
             --arg tool "$tool_name" --arg version "$version" --arg repo "$build_repo" \
             --arg build_purpose "$build_purpose" --arg targets "$target_list" \
-            --argjson results "$target_results_json" --arg run_id "$result_run_id" \
-            --argjson source_sync "$(jq -c '.source_sync // null' <<< "$result")" \
-            --argjson coordinator_error "$(jq -c '.error // null' <<< "$result")" \
+            --slurpfile observed /dev/fd/3 --arg run_id "$result_run_id" \
             --argjson total "$total" --argjson success "$success" --argjson failed "$failed" \
             --argjson duration "$duration" --arg output_dir "$output_dir" \
             --arg manifest "$authoritative_manifest" '
+            ($observed | if length == 2 then . else error("exactly two build result documents required") end) as $observed |
+            $observed[0] as $results | ($observed[1].source_sync // null) as $source_sync |
+            ($observed[1].error // null) as $coordinator_error |
             {tool: $tool, repo: $repo, version: $version, build_purpose: $build_purpose,
              publishable: ($build_purpose == "release" and $manifest != ""), run_id: $run_id,
              source_sync: $source_sync,
@@ -5111,7 +5113,8 @@ EOF
              duration_seconds: $duration, total_build_time_ms: ($duration * 1000),
              output_dir: $output_dir, manifest_path: $manifest}
             + (if ($coordinator_error | type) == "string" and $coordinator_error != ""
-               then {error: $coordinator_error} else {} end)') || return 4
+               then {error: $coordinator_error} else {} end)' \
+            3<<< "$target_results_json"$'\n'"$result") || return 4
         json_envelope "build" "$final_status" "$final_exit" "$build_details"
     else
         echo ""
@@ -12546,7 +12549,8 @@ EOF
         return 6
     fi
     if $reuse_completed && ! jq -e --arg run "$resume_run_id" \
-        --argjson state "$resume_state" '
+        --slurpfile state /dev/fd/3 '
+            ($state | if length == 1 then .[0] else error("exactly one resumed build state required") end) as $state |
             .run_id == $run and .source.git_sha == $state.git_sha and
             .summary.total == (($state.context.build_tasks // $state.targets) | length) and
             (. as $manifest | all(($state.context.build_tasks // [])[];
@@ -12554,7 +12558,7 @@ EOF
                     . as $task | any($manifest.artifacts[];
                         .target == $task.platform and .target_triple == $task.target_triple)
                 else true end))
-        ' <<< "$manifest_json" >/dev/null; then
+        ' 3<<< "$resume_state" <<< "$manifest_json" >/dev/null; then
         _fallback_result 6 verification "Manifest does not belong to the completed build run"
         return 6
     fi

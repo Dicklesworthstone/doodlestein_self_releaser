@@ -10,6 +10,7 @@ on:
       - scripts/tests/test_act_runner.sh
       - scripts/tests/test_act_orchestration.sh
       - scripts/tests/test_build_state.sh
+      - scripts/tests/test_git_build_context.sh
       - scripts/tests/test_act_build_cmd_tokens.sh
       - scripts/tests/test_act_runner_native.sh
       - scripts/tests/test_config.sh
@@ -73,7 +74,7 @@ jobs:
           set -euo pipefail
           if [[ "$RUNNER_OS" == Linux ]]; then
             sudo apt-get update
-            sudo apt-get install -y --no-install-recommends jq xz-utils golang-go minisign zip unzip msitools wixl rsync
+            sudo apt-get install -y --no-install-recommends jq xz-utils golang-go minisign zip unzip msitools wixl rsync python3
           else
             for tool in jq xz go minisign rsync; do
               command -v "$tool" >/dev/null || brew install "$tool"
@@ -85,6 +86,18 @@ jobs:
           mkdir -p "$RUNNER_TEMP/dsr-test-bin"
           GOBIN="$RUNNER_TEMP/dsr-test-bin" go install github.com/mikefarah/yq/v4@v4.47.1
           echo "$RUNNER_TEMP/dsr-test-bin" >> "$GITHUB_PATH"
+      - name: Validate large Git inventories and source context transport
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v python3 >/dev/null
+          bash -n dsr
+          bash -n src/git_ops.sh
+          bash -n src/act_runner.sh
+          bash -n src/build_state.sh
+          bash -n scripts/tests/test_git_build_context.sh
+          bash scripts/tests/test_git_build_context.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/git-build-context.log"
+          test -z "$(git status --porcelain)"
       - name: Install pinned Bun for genuine source-family compilation
         if: runner.os == 'Linux'
         shell: bash

@@ -2,7 +2,7 @@
 # Real Git objects/ref transport; fixtures are retained for inspection.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
-for dependency in git jq tar; do
+for dependency in git jq tar python3; do
   command -v "$dependency" >/dev/null 2>&1 || { printf 'SKIP: requires %s\n' "$dependency"; exit 0; }
 done
 # shellcheck source=../../src/git_ops.sh
@@ -290,5 +290,165 @@ if command -v pwsh >/dev/null 2>&1; then
     "$(git -C "$WORK/ps-crlf" describe --tags --always --dirty 2>/dev/null)" "$CRLF_DESCRIBE"
   check 'PowerShell CRLF staging preserves source bytes' cmp "$WORK/crlf-source/lines.txt" "$WORK/ps-crlf/lines.txt"
 fi
+
+# Thousands of real tag refs cross Linux's 128 KiB per-argument limit. Exercise
+# the actual export/import, SSH program, and state transports with that data.
+# The SSH adapter only maps a named fixture host to a local login shell; Git,
+# bundle admission, generated programs, and checkpoint mutations are genuine.
+git clone -q --no-tags "$WORK/source" "$WORK/large-source" || exit 1
+LARGE_SHA=$(git -C "$WORK/large-source" rev-parse HEAD) || exit 1
+git -C "$WORK/large-source" -c user.name=DSR -c user.email=test@example.invalid \
+  tag -a large-annotated -m 'raw tag object must survive' || exit 1
+for ((tag_index=0; tag_index<2400; tag_index++)); do
+  printf 'create refs/tags/large-release-%04d %s\n' "$tag_index" "$LARGE_SHA"
+done | git -C "$WORK/large-source" update-ref --stdin || exit 1
+git -C "$WORK/large-source" pack-refs --all || exit 1
+STATUS=0
+LARGE_CONTEXT=$(git_ops_export_build_context "$WORK/large-source" "$WORK/large-context") || STATUS=$?
+check 'large real tag inventory exports without an oversized exec argument' equal "$STATUS" 0
+((STATUS == 0)) || exit 1
+printf '%s\n' "$LARGE_CONTEXT" > "$WORK/large-context.json" || exit 1
+check 'fixture tag inventory exceeds the 128 KiB Linux argument ceiling' \
+  test "$(jq -c .tags <<< "$LARGE_CONTEXT" | wc -c)" -gt 131072
+check 'all 2401 raw tag refs remain in the exported context' jq -e '.tags | length == 2401' <<< "$LARGE_CONTEXT"
+check 'large controller context verifies exactly' git_ops_verify_build_context "$WORK/large-source" "$LARGE_CONTEXT"
+copy_source "$WORK/large-source" "$WORK/large-local" || exit 1
+restore large-local "$LARGE_CONTEXT"
+check 'large context restores real local Git history' equal "$STATUS" 0
+check 'local restore preserves every tag, HEAD, branch, and normalization setting' \
+  git_ops_verify_build_context "$WORK/large-local" "$LARGE_CONTEXT"
+refused large-missing-tag "$(jq -c 'del(.tags["refs/tags/large-release-0000"])' <<< "$LARGE_CONTEXT")"
+refused large-wrong-hash "$(jq -c '.bundle_sha256=("0"*64)' <<< "$LARGE_CONTEXT")"
+refused large-multiple-documents "$LARGE_CONTEXT $LARGE_CONTEXT"
+
+# PowerShell payload construction also used to put the entire context in argv.
+STATUS=0
+git_ops_build_context_powershell "$WORK/large-ps" "$LARGE_CONTEXT" > "$WORK/large-import.ps1" || STATUS=$?
+check 'large PowerShell importer generation succeeds' equal "$STATUS" 0
+check 'PowerShell importer retains its large embedded context' test "$(wc -c < "$WORK/large-import.ps1")" -gt 131072
+
+# shellcheck source=../../src/act_runner.sh
+source "$ROOT/src/act_runner.sh" || exit 1
+mkdir "$WORK/large-bin" || exit 1
+cat > "$WORK/large-bin/ssh" <<'SSH'
+#!/usr/bin/env bash
+set -uo pipefail
+LC_ALL=C
+for argument; do
+  (( ${#argument} < 65536 )) || exit 98
+done
+null_stdin=false
+while (($#)); do
+  case "$1" in
+    -o) shift 2 ;;
+    -T) shift ;;
+    -n) null_stdin=true; shift ;;
+    -*) exit 97 ;;
+    *) break ;;
+  esac
+done
+[[ $# == 2 && "$1" == fixture-tags ]] || exit 97
+shift
+if [[ "$1" == 'exec "$SHELL" -s' ]]; then
+  printf 'stream\n' >> "$DSR_FIXTURE_SSH_LOG"
+fi
+export SHELL="$DSR_FIXTURE_LOGIN_SHELL"
+if $null_stdin; then exec "$SHELL" -c "$1" </dev/null; fi
+exec "$SHELL" -c "$1"
+SSH
+chmod +x "$WORK/large-bin/ssh" || exit 1
+# Host resolution is the fixture boundary; the production transport stays live.
+_act_is_local_host() { return 1; }
+_act_is_windows_host() { return 1; }
+_act_get_ssh_destination() { printf 'fixture-tags\n'; }
+export PATH="$WORK/large-bin:$PATH"
+export DSR_FIXTURE_SSH_LOG="$WORK/large-ssh.log"
+: > "$DSR_FIXTURE_SSH_LOG"
+LOGIN_SHELLS=("$(command -v bash)" "$(command -v sh)")
+if command -v zsh >/dev/null 2>&1; then LOGIN_SHELLS+=("$(command -v zsh)"); fi
+for login_shell in "${LOGIN_SHELLS[@]}"; do
+  shell_name="${login_shell##*/}"
+  export DSR_FIXTURE_LOGIN_SHELL="$login_shell"
+  mkdir "$WORK/large-remote-$shell_name" || exit 1
+  copy_source "$WORK/large-source" "$WORK/large-remote-$shell_name/source" || exit 1
+  STATUS=0
+  _act_restore_ordinary_git_context fixture-tags "$WORK/large-remote-$shell_name/source" \
+    "$LARGE_CONTEXT" source > "$WORK/large-remote-$shell_name.receipt.json" \
+    2> "$WORK/large-remote-$shell_name.log" || STATUS=$?
+  check "large SSH restore executes through the $shell_name login shell" equal "$STATUS" 0
+  if ((STATUS != 0)); then cat "$WORK/large-remote-$shell_name.log" >&2; fi
+  check "$shell_name remote restore preserves the complete source identity" \
+    git_ops_verify_build_context "$WORK/large-remote-$shell_name/source" "$LARGE_CONTEXT"
+  check "$shell_name emits exactly one complete Git receipt" jq -es \
+    --slurpfile expected "$WORK/large-context.json" \
+    'length == 1 and (.[0] | .git_sha == $expected[0].git_sha and
+      .git_ref == $expected[0].git_ref and .tags == $expected[0].tags)' \
+    "$WORK/large-remote-$shell_name.receipt.json"
+done
+check 'each remote importer uses the bounded SSH stdin path' \
+  equal "$(wc -l < "$DSR_FIXTURE_SSH_LOG" | tr -d ' ')" "${#LOGIN_SHELLS[@]}"
+
+# Capture the real context in an ordinary receipt and exercise production state
+# transactions. No native compiler or remote build-host readiness is simulated.
+# shellcheck source=../../src/build_state.sh
+source "$ROOT/src/build_state.sh" || exit 1
+log_info() { printf '[state-test] %s\n' "$*" >&2; }
+log_error() { printf '[state-test] %s\n' "$*" >&2; }
+log_debug() { :; }
+export DSR_STATE_DIR="$WORK/large-state"
+build_state_init || exit 1
+LARGE_RUN=$(DSR_RUN_ID=large-tags build_state_create large-tags v1.0.0 linux/amd64) || exit 1
+LARGE_ROOTS=$(jq -nc --arg root "$WORK/large-local" '{"fixture-tags":$root}') || exit 1
+LARGE_HOSTS='{"linux/amd64":"fixture-tags"}'
+LARGE_SYNC=$(jq -c --argjson roots "$LARGE_ROOTS" --argjson hosts "$LARGE_HOSTS" \
+  '{status:"success",staged_ordinary:true,synced:1,failed:0,git_context:.,source_roots:$roots,target_hosts:$hosts}' \
+  <<< "$LARGE_CONTEXT") || exit 1
+printf '%s\n' "$LARGE_SYNC" > "$WORK/large-sync.json" || exit 1
+check 'initial checkpoint persists a source receipt larger than argv permits' \
+  build_state_set_context large-tags v1.0.0 "$LARGE_RUN" "$LARGE_SHA" main \
+  "$LARGE_ROOTS" "$WORK/large-output" 1 "$LARGE_HOSTS" release '' '' "$LARGE_SYNC"
+LARGE_EXTRA=$(jq -c '{attempts:1,result:{status:"failed",stage:"source_sync",source_sync:.}}' \
+  <<< "$LARGE_SYNC") || exit 1
+check 'target attempt checkpoint retains its large source receipt' \
+  build_state_update_target large-tags v1.0.0 linux/amd64 failed "$LARGE_EXTRA" "$LARGE_RUN"
+check 'resume refresh persists the complete large receipt' \
+  build_state_set_source_sync large-tags v1.0.0 "$LARGE_RUN" "$LARGE_SYNC" "$LARGE_ROOTS" "$LARGE_HOSTS"
+LARGE_STATE=$(build_state_get large-tags v1.0.0 "$LARGE_RUN") || exit 1
+check 'checkpoint and attempt history retain exact full receipts' jq -e \
+  --slurpfile receipt "$WORK/large-sync.json" \
+  '.context.source_sync == $receipt[0] and (.source_sync_history | length == 2) and
+   all(.source_sync_history[]; .receipt == $receipt[0]) and
+   .target_statuses["linux/amd64"].result.source_sync == $receipt[0]' <<< "$LARGE_STATE"
+STATUS=0
+build_state_set_source_sync large-tags v1.0.0 "$LARGE_RUN" "$LARGE_SYNC $LARGE_SYNC" \
+  "$LARGE_ROOTS" "$LARGE_HOSTS" > "$WORK/large-state-refusal.out" \
+  2> "$WORK/large-state-refusal.log" || STATUS=$?
+check 'multiple large receipt documents are refused' equal "$STATUS" 1
+check 'refused receipt refresh leaves the checkpoint unchanged' \
+  equal "$(build_state_get large-tags v1.0.0 "$LARGE_RUN")" "$LARGE_STATE"
+
+# Feed the genuine large receipt through both native matrix admission checks.
+# Configured variant selection is the fixture; no worker execution is claimed.
+config_get_target_triples_json() { printf '["x86_64-unknown-linux-gnu","x86_64-unknown-linux-musl"]\n'; }
+config_get_additional_artifacts_json() { printf '{}\n'; }
+LARGE_MATRIX=$(jq -c '. as $sync |
+  {status:"success",requested_targets:["linux/amd64"],summary:{total:2,success:2,failed:0},
+   targets:(["x86_64-unknown-linux-gnu","x86_64-unknown-linux-musl"] |
+     map({platform:"linux/amd64",method:"native",status:"success",target_triple:.,
+          task_key:("linux/amd64@"+.),source_sync:$sync}))}' <<< "$LARGE_SYNC") || exit 1
+LARGE_ARTIFACTS='[{"target":"linux/amd64","target_triple":"x86_64-unknown-linux-gnu"},{"target":"linux/amd64","target_triple":"x86_64-unknown-linux-musl"}]'
+check 'matrix admission accepts complete variants with large source receipts' \
+  _act_validate_native_matrix_result_inventory large-tags "$LARGE_MATRIX" "$LARGE_ARTIFACTS"
+STATUS=0
+_act_validate_native_matrix_result_inventory large-tags "$LARGE_MATRIX" \
+  "$(jq -c '.[0:1]' <<< "$LARGE_ARTIFACTS")" > "$WORK/large-matrix-refusal.out" \
+  2> "$WORK/large-matrix-refusal.log" || STATUS=$?
+check 'large matrix admission still rejects missing variant artifacts' equal "$STATUS" 4
+
+git -C "$WORK/large-source" tag large-after-export || exit 1
+STATUS=0
+git_ops_verify_build_context "$WORK/large-source" "$LARGE_CONTEXT" \
+  > "$WORK/large-verify-refusal.out" 2> "$WORK/large-verify-refusal.log" || STATUS=$?
+check 'large context still refuses controller tag movement' equal "$STATUS" 4
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 ((FAIL == 0))

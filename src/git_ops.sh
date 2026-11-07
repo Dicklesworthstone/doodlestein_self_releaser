@@ -808,9 +808,13 @@ git_ops_verify_build_context() {
   ref=$(_git_ops_build_git -C "$source" symbolic-ref -q HEAD) || ref=''
   tags=$(_git_ops_build_refs "$source") || return 4
   endings=$(_git_ops_build_line_endings "$source") || return 4
-  jq -e --arg sha "$sha" --arg ref "$ref" --argjson tags "$tags" --argjson endings "$endings" \
-    '.git_sha == $sha and .git_ref == $ref and .tags == $tags and
-     .core_autocrlf == $endings.core_autocrlf and .core_eol == $endings.core_eol' <<< "$context" >/dev/null || {
+  # A complete tag inventory can exceed the per-argument exec limit. Keep
+  # that authority on a descriptor instead of putting it in jq's argv.
+  jq -e --arg sha "$sha" --arg ref "$ref" --slurpfile tags /dev/fd/3 --argjson endings "$endings" \
+    '($tags | if length == 1 then .[0] else error("exactly one tag inventory required") end) as $tags |
+     .git_sha == $sha and .git_ref == $ref and .tags == $tags and
+     .core_autocrlf == $endings.core_autocrlf and .core_eol == $endings.core_eol' \
+    3<<< "$tags" <<< "$context" >/dev/null || {
     printf '[git-context] Source HEAD, branch, tags, or line-ending settings changed after export; retry with a stable source\n' >&2; return 4;
   }
 }
@@ -843,7 +847,10 @@ git_ops_export_build_context() (
   }
   heads=$(_git_ops_build_git bundle list-heads "$bundle" |
     jq -Rn '[inputs | split(" ") | {key: .[1], value: .[0]}] | from_entries') || return 4
-  jq -e --arg sha "$sha" --argjson tags "$tags" '. == ($tags + {HEAD: $sha})' <<< "$heads" >/dev/null || {
+  jq -e --arg sha "$sha" --slurpfile tags /dev/fd/3 '
+    ($tags | if length == 1 then .[0] else error("exactly one tag inventory required") end) as $tags |
+    . == ($tags + {HEAD: $sha})' \
+    3<<< "$tags" <<< "$heads" >/dev/null || {
     printf '[git-context] Source HEAD or tags changed during bundle creation; retry with a stable source\n' >&2; return 4;
   }
   after_ref=$(_git_ops_build_git -C "$source" symbolic-ref -q HEAD) || after_ref=''
@@ -855,8 +862,11 @@ git_ops_export_build_context() (
   _git_ops_validate_build_context_source "$source" || return 4
   local digest
   digest=$(_git_ops_build_sha256 "$bundle") || return 4
-  jq -cn --arg sha "$sha" --arg ref "$ref" --arg bundle "$bundle" --arg digest "$digest" --argjson tags "$tags" --argjson endings "$endings" \
-    '{git_sha:$sha,git_ref:$ref,bundle_path:$bundle,bundle_sha256:$digest,tags:$tags} + $endings'
+  jq -cn --arg sha "$sha" --arg ref "$ref" --arg bundle "$bundle" --arg digest "$digest" \
+    --slurpfile tags /dev/fd/3 --argjson endings "$endings" \
+    '($tags | if length == 1 then .[0] else error("exactly one tag inventory required") end) as $tags |
+     {git_sha:$sha,git_ref:$ref,bundle_path:$bundle,bundle_sha256:$digest,tags:$tags} + $endings' \
+    3<<< "$tags"
 )
 
 # git_ops_restore_build_context FRESH_SOURCE CONTEXT_JSON -> restored receipt.
@@ -885,7 +895,10 @@ git_ops_restore_build_context() (
   done < <(jq -r 'keys[]' <<< "$tags")
   heads=$(_git_ops_build_git bundle list-heads "$bundle" |
     jq -Rn '[inputs | split(" ") | {key: .[1], value: .[0]}] | from_entries') || return 4
-  jq -e --arg sha "$sha" --argjson tags "$tags" '. == ($tags + {HEAD:$sha})' <<< "$heads" >/dev/null || return 4
+  jq -e --arg sha "$sha" --slurpfile tags /dev/fd/3 '
+    ($tags | if length == 1 then .[0] else error("exactly one tag inventory required") end) as $tags |
+    . == ($tags + {HEAD:$sha})' \
+    3<<< "$tags" <<< "$heads" >/dev/null || return 4
   # Reserve .git exclusively before invoking init; concurrent restoration fails.
   mkdir -m 700 -- "$source/.git" || return 4
   mkdir -m 700 -- "$source/.git/dsr-empty-template" || return 4
@@ -904,7 +917,10 @@ git_ops_restore_build_context() (
   _git_ops_build_git -C "$source" update-index -q --refresh >/dev/null 2>&1 || refresh_status=$?
   [[ "$refresh_status" == 0 || "$refresh_status" == 1 ]] || return 4
   [[ "$(_git_ops_build_git -C "$source" rev-parse --verify 'HEAD^{commit}')" == "$sha" ]] || return 4
-  jq -e --argjson tags "$tags" '. == $tags' <<< "$(_git_ops_build_refs "$source")" >/dev/null || return 4
+  jq -e --slurpfile tags /dev/fd/3 '
+    ($tags | if length == 1 then .[0] else error("exactly one tag inventory required") end) as $tags |
+    . == $tags' \
+    3<<< "$tags" <<< "$(_git_ops_build_refs "$source")" >/dev/null || return 4
   [[ "$(_git_ops_build_sha256 "$bundle")" == "$digest" ]] || return 4
   jq -c --arg root "$source" '. + {source_root:$root}' <<< "$context"
 )
@@ -914,7 +930,9 @@ git_ops_restore_build_context() (
 git_ops_build_context_powershell() {
   [[ $# == 2 ]] || return 4
   local payload
-  payload=$(jq -cn --arg source "$1" --argjson context "$2" '{source:$source,context:$context}' |
+  payload=$(jq -cse --arg source "$1" '
+    if length == 1 then {source:$source,context:.[0]}
+    else error("exactly one Git context object required") end' <<< "$2" |
     base64 | tr -d '\r\n') || return 4
   printf '$payload = "%s"\n' "$payload"
   cat <<'PS'
