@@ -1283,11 +1283,20 @@ build_state_pending_hosts() {
   # available, while still reading older host-named target inventories.
   jq -r "$filters"'
     . as $s |
-    (if (.context.task_host_overrides // {} | length) > 0 then [effective_task_hosts[]]
-     else (((.hosts // {}) | keys) + [(.context.target_hosts // {})[]] +
-       [.targets[]? | select(contains("/") | not)]) end | unique)[] as $host |
-    ($s.hosts[$host].status // "pending") as $status |
-    select($status == "pending" or $status == "running") | $host
+    # This is an unfinished-work projection, like pending_targets. It includes
+    # failed/exhausted tasks; build_state_resume applies the compiler budget.
+    if (.context.task_host_overrides // {} | length) > 0 then
+      effective_task_hosts as $routes |
+      [.context.build_tasks[].key as $key |
+       ($s.target_statuses[$key] // {}) as $entry |
+       select(($entry.status == "completed" and ($entry.result | type) == "object" and
+         ($entry.result | length) > 0) | not) | $routes[$key]] | unique[]
+    else
+      (((.hosts // {}) | keys) + [(.context.target_hosts // {})[]] +
+        [.targets[]? | select(contains("/") | not)] | unique)[] as $host |
+      ($s.hosts[$host].status // "pending") as $status |
+      select($status == "pending" or $status == "running") | $host
+    end
   ' <<< "$state"
 }
 
@@ -1706,18 +1715,36 @@ build_state_resume() {
       then .exceeded += [$target]
       else .retryable += [$target] end
     )) as $target_plan |
+    # Host summaries are historical aggregate telemetry. After a task moves to
+    # an already used host, historical completion and retry counts cannot
+    # suppress the remaining compiler allowance of its assigned tasks.
+    (if (.context.task_host_overrides // {} | length) > 0 then
+      effective_task_hosts as $routes |
+      def routed($keys): [$keys[] | $routes[.]] | unique;
+      {
+        completed: (routed($target_plan.completed) -
+          routed($target_plan.retryable + $target_plan.exceeded)),
+        failed: routed([tasks[].key | select($s.target_statuses[.].status == "failed")]),
+        pending: routed([$target_plan.retryable[] | select($s.target_statuses[.].status != "failed")]),
+        retryable: routed([$target_plan.retryable[] | select($s.target_statuses[.].status == "failed")]),
+        exceeded: (routed($target_plan.exceeded) - routed($target_plan.retryable)),
+        process: routed($target_plan.retryable)
+      }
+     else {completed: $completed, failed: $failed, pending: $pending,
+           retryable: $retryable, exceeded: $exceeded, process: (($pending + $retryable) | unique)}
+     end) as $host_plan |
     {
       can_resume: true,
       tool: $s.tool,
       version: $s.version,
       run_id: $s.run_id,
       current_status: $s.status,
-      completed_hosts: $completed,
-      failed_hosts: $failed,
-      pending_hosts: $pending,
-      retryable_hosts: $retryable,
-      exceeded_retry_limit: $exceeded,
-      hosts_to_process: (($pending + $retryable) | unique),
+      completed_hosts: $host_plan.completed,
+      failed_hosts: $host_plan.failed,
+      pending_hosts: $host_plan.pending,
+      retryable_hosts: $host_plan.retryable,
+      exceeded_retry_limit: $host_plan.exceeded,
+      hosts_to_process: $host_plan.process,
       completed_targets: $target_plan.completed,
       targets_to_process: $target_plan.retryable,
       exceeded_target_retry_limit: $target_plan.exceeded,

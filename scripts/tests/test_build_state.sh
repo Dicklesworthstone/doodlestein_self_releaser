@@ -1852,6 +1852,61 @@ check('unused platform default is absent from processing lists and source roots'
       'original' not in pending.stdout.splitlines() and
       'original' not in state['context']['source_roots'] and 'original' in state['hosts'])
 
+reused, state = fixture('reuse-completed-host')
+state['hosts']['stable'] = dict(status='completed', retry_count=999)
+write(state_path(reused), state)
+retained = copy.deepcopy(state)
+state = relocate(reused, state, musl, 'stable')
+plan, pending = call(reused, 'resume'), call(reused, 'pending')
+check('a completed destination with historical retries still processes the relocated failed variant',
+      plan.returncode == 0 and pending.returncode == 0 and
+      json.loads(plan.stdout)['hosts_to_process'] == ['stable'] and
+      json.loads(plan.stdout)['retryable_hosts'] == ['stable'] and
+      json.loads(plan.stdout)['completed_hosts'] == ['original'] and
+      json.loads(plan.stdout)['exceeded_retry_limit'] == [] and
+      json.loads(plan.stdout)['targets_to_process'] == [musl] and
+      pending.stdout.splitlines() == ['stable'], plan)
+check('task-derived host planning preserves completed sibling receipts and historical host telemetry',
+      state['hosts'] == retained['hosts'] and
+      state['target_statuses'] == retained['target_statuses'] and
+      read(state_path(reused)) == state)
+exhausted = call(reused, 'resume', budget=2)
+check('a reused host cannot restore an exhausted variant compiler budget',
+      exhausted.returncode == 0 and
+      json.loads(exhausted.stdout)['hosts_to_process'] == [] and
+      json.loads(exhausted.stdout)['exceeded_retry_limit'] == ['stable'] and
+      json.loads(exhausted.stdout)['exceeded_target_retry_limit'] == [musl], exhausted)
+for status in ('pending', 'running'):
+    state['target_statuses'][musl]['status'] = status
+    write(state_path(reused), state)
+    plan, pending = call(reused, 'resume'), call(reused, 'pending')
+    check('a relocated ' + status + ' variant appears in the effective host plan',
+          plan.returncode == 0 and pending.returncode == 0 and
+          json.loads(plan.stdout)['pending_hosts'] == ['stable'] and
+          json.loads(plan.stdout)['hosts_to_process'] == ['stable'] and
+          json.loads(plan.stdout)['completed_hosts'] == ['original'] and
+          pending.stdout.splitlines() == ['stable'], plan)
+
+shared, state = fixture('shared-host-retry-budgets', failed=(gnu, musl))
+state['hosts']['stable'] = dict(status='completed', retry_count=999)
+write(state_path(shared), state)
+retained = copy.deepcopy(state)
+state = relocate(shared, state, gnu, 'stable')
+state = relocate(shared, state, musl, 'stable')
+plan = call(shared, 'resume', budget=2)
+check('one exhausted task does not exclude a shared host with another retryable task',
+      plan.returncode == 0 and
+      json.loads(plan.stdout)['hosts_to_process'] == ['stable'] and
+      json.loads(plan.stdout)['retryable_hosts'] == ['stable'] and
+      json.loads(plan.stdout)['exceeded_retry_limit'] == [] and
+      json.loads(plan.stdout)['targets_to_process'] == [gnu] and
+      json.loads(plan.stdout)['exceeded_target_retry_limit'] == [musl], plan)
+check('shared-host eligibility preserves exact task attempts, host telemetry and both approvals',
+      state['target_statuses'] == retained['target_statuses'] and
+      state['hosts'] == retained['hosts'] and len(state['relocations']) == 2 and
+      state['context']['task_host_overrides'] == {gnu:'stable', musl:'stable'} and
+      read(state_path(shared)) == state)
+
 large, state = fixture('large-receipts')
 state['target_statuses'][musl]['result']['captured_output'] = 'retained compiler metadata\n' * 8192
 write(Path(state['target_statuses'][musl]['result_path']), state['target_statuses'][musl]['result'])
