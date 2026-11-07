@@ -14734,13 +14734,19 @@ _act_relocate_failed_target() {
     build_state_validate_task_host_overrides "$before" || return 4
     effective_hosts=$(build_state_effective_task_hosts "$before") || return 4
     if $plan_only; then
-        local planned_tasks plan_targets plan_validation_error
+        local planned_tasks plan_targets plan_validation_error plan_target
         plan_targets=$(jq -ce '.targets | arrays' <<< "$before") || return 4
         if ! plan_validation_error=$(dsr_platform_validate_targets_json \
                 "$plan_targets" "relocation plan targets for $tool" 2>&1); then
             _log_error "$plan_validation_error"
             return 4
         fi
+        while IFS= read -r plan_target; do
+            if act_platform_uses_act "$tool" "$plan_target"; then
+                _log_error "Strict relocation plan target $plan_target cannot use act"
+                return 4
+            fi
+        done < <(jq -r '.[]' <<< "$plan_targets")
         planned_tasks=$(_act_build_task_plan "$tool" "$version" "$plan_targets" true) || return 4
         if ! jq -en --slurpfile prior /dev/fd/3 --slurpfile planned /dev/fd/4 '
             ($prior | length == 1) and ($planned | length == 1) and

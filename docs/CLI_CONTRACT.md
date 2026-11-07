@@ -945,8 +945,13 @@ task's effective host. An ordinary resume retains the approved assignment withou
 requiring the relocation flags again. Repeated relocation preserves every old
 attempt and approval; hosts no longer assigned any task leave the active source
 plan while their historical receipts remain available. Relocation does not reset
-compiler retry budgets. Dry-run resumes report the retained per-task hosts without
-staging sources or starting workers.
+compiler retry budgets. Strict dry-run resumes report every retained task in its
+original order, including variants before the first relocation, with its exact
+triple and effective host. They use the checkpoint's task routes without selecting
+platform defaults. Ordinary resume previews validate the source tag, current task
+inventory and matrix recipe, plus the latest reviewed repository and active-host
+configuration hashes after a relocation. A changed binding refuses the preview
+without staging sources or starting workers.
 
 Adding `--dry-run` to a relocation request runs local admission against the
 observed checkpoint: exact task and run identity, complete configured task

@@ -2405,7 +2405,7 @@ fi
 # including successful sibling artifacts and failures before recipe execution.
 # Source snapshots, native Go compilation, collection, state and locks are real;
 # health/slot decisions are controlled local boundaries, not host qualification.
-# --relocation-matrix-only and --relocation-variant-only use explicit ELF/PE
+# --relocation-matrix-only, --relocation-variant-only and --relocation-preview-only use explicit ELF/PE
 # header producers and a Cargo metadata adapter. They test the task, source,
 # checkpoint and manifest protocol, not native Rust compilation, libc
 # compatibility, or Windows execution.
@@ -2414,7 +2414,8 @@ test_relocation_recovery() {
     project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" || return 1
     for dependency in python3 git jq yq go rsync tar gzip; do
         if [[ "$dependency" == go &&
-              ( "${1:-}" == --relocation-matrix-only || "${1:-}" == --relocation-variant-only ) ]]; then continue; fi
+              ( "${1:-}" == --relocation-matrix-only || "${1:-}" == --relocation-variant-only ||
+                "${1:-}" == --relocation-preview-only ) ]]; then continue; fi
         command -v "$dependency" >/dev/null || {
             printf 'Missing relocation integration dependency: %s\n' "$dependency" >&2
             return 77
@@ -2434,7 +2435,8 @@ import tempfile
 project = Path(os.environ.get('DSR_TEST_RELOCATION_PROJECT', sys.argv[1]))
 hosts_only = sys.argv[2] == '--relocation-hosts-only'
 variant_only = sys.argv[2] == '--relocation-variant-only'
-matrix_only = variant_only or sys.argv[2] == '--relocation-matrix-only'
+preview_only = sys.argv[2] == '--relocation-preview-only'
+matrix_only = variant_only or preview_only or sys.argv[2] == '--relocation-matrix-only'
 root = Path(tempfile.mkdtemp(prefix='dsr-relocation-recovery-'))
 print('Retained relocation recovery evidence: ' + str(root), flush=True)
 systems = {'Linux': 'linux', 'Darwin': 'darwin'}
@@ -2663,6 +2665,31 @@ if [[ "$RELOC_PHASE" == relocation-dry-run ]]; then
         act_get_native_host "$@"
     )
 fi
+if [[ "${RELOC_PREVIEW_GUARDS:-0}" == 1 ]]; then
+    _reloc_preview_forbidden() {
+        printf '%s\n' "$1" >> "$RELOC_CASE/preview-forbidden"
+        return 95
+    }
+    eval "$(declare -f act_get_native_host | sed '1s/act_get_native_host/_reloc_preview_configured_host/')"
+    act_get_native_host() {
+        if [[ "${RELOC_PREVIEW_SINGLETON:-0}" == 1 && "${DSR_DISABLE_HOST_SELECTOR:-0}" == 1 ]]; then
+            _reloc_preview_configured_host "$@"
+        else
+            _reloc_preview_forbidden native-host-selection
+        fi
+    }
+    selector_choose_host() { _reloc_preview_forbidden host-selector; }
+    selector_acquire_slot() { _reloc_preview_forbidden host-capacity; }
+    host_health_is_ready() { _reloc_preview_forbidden host-health; }
+    act_sync_sources() { _reloc_preview_forbidden source-sync; }
+    _act_verify_strict_source_roots() { _reloc_preview_forbidden source-verification; }
+    _act_validate_strict_task_sources() { _reloc_preview_forbidden task-source-admission; }
+    _act_validate_strict_cargo_source_closure() { _reloc_preview_forbidden cargo-metadata; }
+    _act_source_plan_for_tool() { _reloc_preview_forbidden workflow-source-plan; }
+    act_run_native_build() { _reloc_preview_forbidden native-build; }
+    build_lock_acquire() { _reloc_preview_forbidden build-lock; }
+    build_state_init() { _reloc_preview_forbidden state-initialization; }
+fi
 args=(--version 1.0.0 --jobs 2 --output-dir "$RELOC_CASE/output")
 if [[ "$RELOC_PHASE" != first ]]; then
     args+=(--resume="$RELOC_RUN")
@@ -2877,6 +2904,169 @@ def mutate_evidence(transform):
                 state['target_statuses'][failed]['result'].pop(key, None)
         save(path, state)
     return change
+
+
+if preview_only:
+    # Reuse one genuine run for every preview, its accepted route, and the
+    # completed-publication boundary. Only the compiler/metadata decisions are
+    # controlled; state, source staging, worker receipts and artifacts are real.
+    case, env, targets = fixture('strict-resume-preview', 'matrix')
+    gnu_key, musl_key = native + '@' + gnu, native + '@' + musl
+    (case / 'failures').write_text(musl_key + '\n' + failed + '\n')
+    code, first = invoke(case, env, 'first')
+    details = first.get('details', {})
+    if not check('preview: production dispatch retains a completed variant and both failed task kinds',
+                 code == 1 and details.get('success') == 1 and details.get('failed') == 2):
+        print((case / 'first.stderr').read_text()[-6000:], flush=True)
+        raise AssertionError('Preview fixture did not reach the intended outcomes')
+    env['RELOC_RUN'] = details['run_id']
+    path = state_file(case, env['RELOC_RUN'])
+    initial = read(path)
+    (case / 'first.state.json').write_bytes(path.read_bytes())
+    config_path = case / 'config/repos.d/relocfixture.yaml'
+    hosts_path = Path(env['DSR_HOSTS_FILE'])
+    approval_path = case / 'approval.json'
+    marker = case / 'output/.dsr-build-purpose.json'
+    sibling_artifact = Path(initial['target_statuses'][gnu_key]['result']['artifact_path'])
+    approve(case, env, musl_key, 'replacement', 'preview-qualified')
+    initial_routes = {gnu_key:'completed', musl_key:'completed', failed:'original'}
+
+    def inventory():
+        rows = {}
+        for name in ('source', 'config', 'state', 'cache', 'logs', 'artifacts', 'output',
+                     'completed', 'original', 'replacement', 'second', 'matrix-payloads'):
+            base = case / name
+            if not base.exists():
+                continue
+            for item in [base] + sorted(base.rglob('*')):
+                relative = item.relative_to(case)
+                observed = item.lstat()
+                value = (observed.st_ino, observed.st_mtime_ns)
+                if item.is_symlink():
+                    value += ('link', os.readlink(item))
+                elif item.is_file():
+                    value += ('file', digest(item))
+                else:
+                    value += ('directory',)
+                rows[str(relative)] = value
+        rows['approval.json'] = (approval_path.stat().st_ino, approval_path.stat().st_mtime_ns,
+                                 digest(approval_path))
+        return rows
+
+    def change_json(item, transform):
+        value = read(item)
+        transform(value)
+        save(item, value)
+
+    def preview(label, phase='relocation-dry-run', expected=0, routes=None,
+                mutate=None, request=None, singleton=False):
+        owned = [path, config_path, hosts_path, approval_path, marker, sibling_artifact]
+        originals = {item:item.read_bytes() for item in owned}
+        original_request = env['RELOC_REQUEST']
+        try:
+            if request is not None:
+                env['RELOC_REQUEST'] = request
+                selector, destination = request.rsplit('=', 1)
+                change_json(approval_path, lambda value: value.update(target=selector, new_host=destination))
+            if mutate is not None:
+                mutate()
+            before = inventory()
+            before_events = events(case)
+            boundaries = observations(case, 'boundaries')
+            preview_env = dict(env, RELOC_PREVIEW_GUARDS='1', DSR_DISABLE_HOST_SELECTOR='0',
+                               RELOC_PREVIEW_SINGLETON='1' if singleton else '0')
+            code, value = invoke(case, preview_env, phase, label,
+                                 preflight_exit=expected if expected else None)
+            rows = value.get('details', {}).get('targets', [])
+            current = read(path)
+            tasks = current['context']['build_tasks']
+            relocation_valid = True
+            if expected == 0 and phase == 'relocation-dry-run':
+                selector, destination = env['RELOC_REQUEST'].rsplit('=', 1)
+                plan = value.get('details', {}).get('relocation', {})
+                relocation_valid = isinstance(plan, dict) and all(plan.get(key) == item for key, item in
+                    dict(status='planned', validation='local', run_id=current['run_id'],
+                         task_key=selector, old_host=scheduled(current, selector)['host'], new_host=destination,
+                         git_sha=current['git_sha'], git_ref=current['git_ref'],
+                         repo_config_sha256=digest(config_path), hosts_config_sha256=digest(hosts_path)).items())
+            check(label + ': reports the admitted ordered task plan or its precise refusal',
+                  code == expected and (expected != 0 or
+                    (value.get('details', {}).get('mode') == 'dry_run' and relocation_valid and
+                     [row.get('task_key') for row in rows] == [task['key'] for task in tasks] and
+                     {row.get('task_key'):row.get('target_triple') for row in rows} ==
+                         {task['key']:task['target_triple'] for task in tasks} and
+                     {row.get('task_key'):row.get('host') for row in rows} == routes)))
+            check(label + ': does not select or probe workers, prepare sources, acquire locks or change retained bytes',
+                  not observations(case, 'preview-forbidden') and inventory() == before and
+                  events(case) == before_events and observations(case, 'boundaries') == boundaries)
+        finally:
+            for item, contents in originals.items():
+                item.write_bytes(contents)
+            env['RELOC_REQUEST'] = original_request
+
+    preview('preview-initial-matrix', phase='ordinary-dry-run', routes=initial_routes)
+    preview('preview-qualified-route', routes=dict(initial_routes, **{musl_key:'replacement'}))
+    for label, selector, destination in (
+            ('ambiguous-platform', native, 'replacement'),
+            ('completed-sibling', gnu_key, 'replacement'),
+            ('unknown-triple', native + '@unknown', 'replacement'),
+            ('unchanged-host', musl_key, 'completed')):
+        preview('preview-' + label, expected=4, request=selector + '=' + destination)
+    preview('preview-stale-approval', expected=4,
+            mutate=lambda: change_json(approval_path, lambda value: value.update(repo_config_sha256='f' * 64)))
+    preview('preview-matrix-recipe-drift', phase='ordinary-dry-run', expected=4,
+            mutate=lambda: change_json(config_path,
+                lambda value: value['cross_compile'][native].update(env={'RUSTFLAGS':'-C opt-level=1'})))
+    preview('preview-task-order-drift', phase='ordinary-dry-run', expected=4,
+            mutate=lambda: change_json(config_path,
+                lambda value: value['target_triples'].__setitem__(native, [musl, gnu])))
+    preview('preview-source-ref-drift', phase='ordinary-dry-run', expected=4,
+            mutate=lambda: change_json(path, lambda value: value.update(git_ref='v9.9.9')))
+    preview('preview-backend-drift', phase='ordinary-dry-run', expected=4,
+            mutate=lambda: change_json(config_path,
+                lambda value: value['act_job_map'].__setitem__(native, 'release')))
+    check('preview: changed backend is rejected before ordinary workflow source planning',
+          'Strict resume target ' + native + ' cannot use act' in
+              (case / 'preview-backend-drift.stderr').read_text())
+    preview('preview-completed-artifact-drift', expected=4,
+            mutate=lambda: sibling_artifact.write_bytes(sibling_artifact.read_bytes() + b'changed'))
+    preview('preview-singleton-cross-build', singleton=True,
+            routes=dict(initial_routes, **{failed:'replacement'}),
+            mutate=lambda: approve(case, env, failed, 'replacement', 'preview-singleton'))
+
+    # Establish a real approved override and another failed attempt. Subsequent
+    # previews must use that route even with live/default selection forbidden.
+    code, moved = invoke(case, env, 'resume', 'preview-retain-approved-route')
+    middle = read(path)
+    if not check('preview: actual relocation establishes the reviewed failed-task route',
+                 code == 1 and middle['context'].get('task_host_overrides') == {musl_key:'replacement'} and
+                 middle['target_statuses'][musl_key]['attempts'] == 2 and len(middle.get('relocations', [])) == 1):
+        print((case / 'preview-retain-approved-route.stderr').read_text()[-6000:], flush=True)
+        raise AssertionError('Preview fixture did not retain the approved route')
+    moved_routes = dict(initial_routes, **{musl_key:'replacement'})
+    preview('preview-retained-route', phase='ordinary-dry-run', routes=moved_routes)
+    preview('preview-approved-recipe-drift', phase='ordinary-dry-run', expected=4,
+            mutate=lambda: change_json(config_path,
+                lambda value: value['cross_compile'][native].update(env={'RUSTFLAGS':'-C opt-level=1'})))
+    preview('preview-approved-hosts-drift', phase='ordinary-dry-run', expected=4,
+            mutate=lambda: change_json(hosts_path,
+                lambda value: value['hosts']['replacement'].update(concurrency=3)))
+    preview('preview-second-qualified-route', routes=dict(moved_routes, **{musl_key:'second'}),
+            mutate=lambda: approve(case, env, musl_key, 'second', 'preview-second'))
+
+    (case / 'failures').write_text('')
+    code, completed = invoke(case, env, 'ordinary-resume', 'preview-complete-build')
+    final = read(path)
+    if not check('preview: ordinary execution reaches genuine completed publication',
+                 code == 0 and final['status'] == 'completed' and read(marker).get('publishable') is True):
+        print((case / 'preview-complete-build.stderr').read_text()[-6000:], flush=True)
+        raise AssertionError('Preview fixture did not complete publication')
+    preview('preview-interrupted-publication', phase='ordinary-dry-run', routes=moved_routes,
+            mutate=lambda: change_json(marker,
+                lambda value: value.update(publication_status='pending', publishable=False)))
+    (root / 'summary.json').write_text(json.dumps(dict(checks=checks, failures=failures, native=native)) + '\n')
+    print('Strict resume previews: %d checks, %d failures' % (checks, failures), flush=True)
+    raise SystemExit(bool(failures))
 
 
 if matrix_only and not variant_only:
@@ -3621,7 +3811,8 @@ PY
 }
 
 if [[ "${1:-}" == --relocation-recovery-only || "${1:-}" == --relocation-hosts-only ||
-      "${1:-}" == --relocation-matrix-only || "${1:-}" == --relocation-variant-only ]]; then
+      "${1:-}" == --relocation-matrix-only || "${1:-}" == --relocation-variant-only ||
+      "${1:-}" == --relocation-preview-only ]]; then
     test_relocation_recovery "$1"
     exit $?
 fi
@@ -8471,6 +8662,13 @@ case "$relocation_variant_status" in
     0) pass "reviewed exact-variant relocation preserves siblings, recipe custody and retry budgets across repeated resume" ;;
     77) skip "qualified variant relocation integration requires its local fixture dependencies" ;;
     *) fail "qualified native variant relocation lost task, source, retry or manifest authority" ;;
+esac
+relocation_preview_status=0
+test_relocation_recovery --relocation-preview-only || relocation_preview_status=$?
+case "$relocation_preview_status" in
+    0) pass "strict resume previews validate exact approved task routes without worker access or state changes" ;;
+    77) skip "strict resume preview integration requires its local fixture dependencies" ;;
+    *) fail "strict resume previews changed evidence or admitted an invalid task, recipe or relocation" ;;
 esac
 
 if test_worker_group_lifecycle; then

@@ -703,6 +703,11 @@ selection are disabled. Remote source/Cargo admission and capacity checks happen
 during execution, which rereads the checkpoint under its lock. A plan does not
 reserve a host or reset an exhausted retry budget.
 
+An ordinary strict `--resume --dry-run` also lists every native task in its
+retained order, including both GNU and musl before the first relocation. It uses
+the saved task assignments directly and refuses changes to the source tag,
+ordered task inventory, matrix recipe, or previously reviewed configuration.
+
 For native performance measurements of a tool with a strict release contract,
 use an explicit diagnostic build:
 

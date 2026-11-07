@@ -3119,25 +3119,86 @@ EOF
     if $dry_run; then
         local planned_targets='[]' planned_relocation='null'
         local planned_host planned_method
-        for target in $target_list; do
-            if act_platform_uses_act "$tool_name" "$target"; then
-                planned_host="local"
-                planned_method="act"
-            else
-                planned_host=$(act_get_native_host "$target" "$tool_name" 2>/dev/null || true)
-                if [[ -z "$planned_host" ]]; then
-                    log_error "No native build host is configured for target '$target'"
+        local planned_repo_hash="" planned_hosts_hash=""
+        local planned_hosts_file="${DSR_HOSTS_FILE:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/hosts.yaml}"
+        _dsr_build_preview_error() {
+            local error="$1" details
+            log_error "$error"
+            if $JSON_MODE; then
+                details=$(jq -nc --arg repo "$ACT_REPO_GITHUB" --arg version "$tag" \
+                    --arg error "$error" --arg request "$resume_target_host" '
+                    {repo:$repo,version:$version,targets:[],error:$error} |
+                    if $request == "" then . else . + {requested_relocation:$request} end') || return 4
+                json_envelope "build" "error" 4 "$details"
+            fi
+        }
+        if $resume && $build_release_contract_enabled; then
+            # Strict resumes already own their routes. Validate the current
+            # recipe against every frozen task before looking up default hosts,
+            # including a matrix that has never needed a relocation.
+            local planned_tasks planned_matrix_hash=""
+            for target in $target_list; do
+                if act_platform_uses_act "$tool_name" "$target"; then
+                    _dsr_build_preview_error "Strict resume target $target cannot use act"
                     return 4
                 fi
-                planned_method="native"
+            done
+            planned_repo_hash=$(_act_sha256 "$ACT_REPOS_DIR/${tool_name}.yaml") || return 4
+            if [[ ! "$planned_repo_hash" =~ ^[0-9a-f]{64}$ ]] ||
+               ! planned_tasks=$(_act_build_task_plan "$tool_name" "$version" \
+                    "$requested_resume_targets_json" true); then
+                _dsr_build_preview_error "Strict resume task plan is invalid"
+                return 4
             fi
-            planned_targets=$(jq -nc \
-                --argjson targets "$planned_targets" \
-                --arg platform "$target" \
-                --arg host "$planned_host" \
-                --arg method "$planned_method" \
-                '$targets + [{platform: $platform, host: $host, method: $method, status: "skipped"}]')
-        done
+            if [[ "$build_source_ref" != "$tag" ]] ||
+               ! jq -e 'all(.[]; .method == "native")' <<< "$planned_tasks" >/dev/null ||
+               [[ "$(jq -cS . <<< "$planned_tasks")" != \
+                  "$(jq -cS '.context.build_tasks' <<< "$resume_state")" ]]; then
+                _dsr_build_preview_error "Strict resume task plan or source tag changed"
+                return 4
+            fi
+            if [[ -n "$resume_target_host" ]] ||
+               jq -e '(.relocations // [] | length) > 0' <<< "$resume_state" >/dev/null; then
+                planned_hosts_hash=$(_act_sha256 "$planned_hosts_file") || return 4
+                [[ "$planned_hosts_hash" =~ ^[0-9a-f]{64}$ ]] || return 4
+            fi
+            if [[ -z "$resume_target_host" ]]; then
+                if jq -e 'any(.[]; .key != .platform)' <<< "$planned_tasks" >/dev/null; then
+                    planned_matrix_hash="$planned_repo_hash"
+                fi
+                if [[ "$(jq -r '.context.native_matrix_config_sha256 // ""' <<< "$resume_state")" != \
+                      "$planned_matrix_hash" ]]; then
+                    _dsr_build_preview_error "Strict resume native matrix configuration changed"
+                    return 4
+                fi
+                if [[ -n "$planned_hosts_hash" ]] &&
+                   { [[ "$planned_repo_hash" != "$(jq -r '.relocations[-1].repo_config_sha256' <<< "$resume_state")" ]] ||
+                     [[ "$planned_hosts_hash" != "$(jq -r '.relocations[-1].hosts_config_sha256' <<< "$resume_state")" ]]; }; then
+                    _dsr_build_preview_error "Configuration changed after the approved relocation"
+                    return 4
+                fi
+            fi
+        else
+            for target in $target_list; do
+                if act_platform_uses_act "$tool_name" "$target"; then
+                    planned_host="local"
+                    planned_method="act"
+                else
+                    planned_host=$(act_get_native_host "$target" "$tool_name" 2>/dev/null || true)
+                    if [[ -z "$planned_host" ]]; then
+                        log_error "No native build host is configured for target '$target'"
+                        return 4
+                    fi
+                    planned_method="native"
+                fi
+                planned_targets=$(jq -nc \
+                    --argjson targets "$planned_targets" \
+                    --arg platform "$target" \
+                    --arg host "$planned_host" \
+                    --arg method "$planned_method" \
+                    '$targets + [{platform: $platform, host: $host, method: $method, status: "skipped"}]')
+            done
+        fi
 
         if [[ -n "$resume_target_host" ]]; then
             # Read the same local evidence as execution, but stop before source
@@ -3158,9 +3219,17 @@ EOF
             fi
         fi
 
+        if [[ -n "$planned_repo_hash" ]] &&
+           { [[ "$(_act_sha256 "$ACT_REPOS_DIR/${tool_name}.yaml")" != "$planned_repo_hash" ]] ||
+             { [[ -n "$planned_hosts_hash" ]] &&
+               [[ "$(_act_sha256 "$planned_hosts_file")" != "$planned_hosts_hash" ]]; }; }; then
+            _dsr_build_preview_error "Configuration changed while preparing the strict resume preview"
+            return 4
+        fi
+
         # A retained or proposed route belongs to its task, not every task
         # sharing the platform. Project all siblings from the same checkpoint.
-        if $resume && { [[ "$planned_relocation" != null ]] ||
+        if $resume && { $build_release_contract_enabled || [[ "$planned_relocation" != null ]] ||
             jq -e '.context | has("task_host_overrides")' <<< "$resume_state" >/dev/null; }; then
             local planned_task_hosts
             planned_task_hosts=$(build_state_effective_task_hosts "$resume_state") || return 4
@@ -3200,24 +3269,31 @@ EOF
         fi
 
         if $JSON_MODE; then
-            json_envelope "build" "success" 0 "$(jq -nc \
+            local planned_details
+            planned_details=$(jq -nc \
                 --arg repo "$ACT_REPO_GITHUB" \
                 --arg tool "$tool_name" \
                 --arg version "$tag" \
-                --argjson targets "$planned_targets" \
+                --slurpfile targets /dev/fd/3 \
                 --arg output_dir "$output_dir" \
                 --argjson parallel_jobs "$parallel_jobs" \
                 --arg resume_run_id "$resume_run_id" \
                 --argjson no_sync "$no_sync" \
                 --argjson sync_only "$sync_only" \
                 --arg purpose "$build_purpose" \
-                --argjson relocation "$planned_relocation" \
-                '{repo: $repo, tool: $tool, version: $version, targets: $targets,
+                --slurpfile relocation /dev/fd/4 \
+                '($targets | if length == 1 and (.[0] | type == "array") then .[0]
+                    else error("exactly one planned task array required") end) as $targets |
+                 ($relocation | if length == 1 and (.[0] == null or (.[0] | type == "object")) then .[0]
+                    else error("exactly one optional relocation plan required") end) as $relocation |
+                 {repo: $repo, tool: $tool, version: $version, targets: $targets,
                   build_purpose: $purpose, publishable: ($purpose == "release"),
                   output_dir: $output_dir, parallel_jobs: $parallel_jobs,
                   resume_run_id: $resume_run_id, no_sync: $no_sync,
                   sync_only: $sync_only, mode: "dry_run"} |
-                  if $relocation == null then . else . + {relocation:$relocation} end')"
+                  if $relocation == null then . else . + {relocation:$relocation} end' \
+                3<<< "$planned_targets" 4<<< "$planned_relocation") || return 4
+            json_envelope "build" "success" 0 "$planned_details"
         fi
         return 0
     fi
