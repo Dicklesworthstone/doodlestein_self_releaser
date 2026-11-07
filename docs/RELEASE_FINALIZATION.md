@@ -370,6 +370,30 @@ whether promotion was attempted. A reconciled transport failure is recorded even
 when re-reading proves the release was successfully published. Errors do not copy
 raw promotion API responses or credentials into diagnostics.
 
+### Cancellation and process lifetime
+
+The library entry point and its build-set/build-plan commands handle interrupt,
+termination and hangup by stopping new work, draining their owned local process
+groups, and returning one interruption result with exit code `5`. The release
+session lock remains held while publication descendants are stopped. Cleanup
+allows a bounded grace period, then kills remaining owned descendants, including
+commands that ignore termination. An abruptly lost caller also closes the work's
+lifetime channel and triggers cleanup; a caller that has already exited cannot
+emit a result.
+
+Cancellation cannot recall an upload or promotion already accepted by GitHub.
+Rerun the same pinned command to reconcile retained state against fresh remote
+evidence. The finalizer does not report a completed release merely because an
+interrupted transport had started a request.
+
+Sourced callers retain their signal traps, job-control setting and input stream.
+Interactive signing retains access to the controlling terminal, including
+encrypted Minisign key prompts. Terminal ownership returns to the caller after
+normal completion or cancellation; an invocation already running in the
+background does not take the terminal from another foreground job.
+Ctrl-Z during a supervised foreground phase requests cancellation with exit
+code `5`.
+
 ## Scope and requirements
 
 This is an explicit finalization entry point, not an implicit change to `dsr release`.
@@ -377,6 +401,8 @@ It composes the existing library APIs; manifest-bound payload uploading is opt-i
 A complete local inventory requires Syft only when scans are missing. Runtime
 requirements include Bash 4+, jq, SHA256 tooling, `flock`, and the existing GitHub
 transport dependencies. Publishing a draft requires the GitHub CLI (`gh`).
+When a controlling terminal is attached, Python 3 is also required to preserve
+terminal ownership during supervised work; it is checked before publication.
 
 Without `--require-signatures`, evidence establishes equality with the selected
 inventory, not cryptographic authenticity. With it, the signed payload/checksum

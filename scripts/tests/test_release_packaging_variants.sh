@@ -161,6 +161,7 @@ def shared_payload_cases():
                      "packaging.sh", "release_packaging_pipeline.sh"):
         shutil.copy2(root / "src" / filename, cli / filename)
     (cli / "release_finalize_core.sh").write_text('''#!/usr/bin/env bash
+source "$DSR_FINALIZER_FIXTURE_CORE" || { return 3 2>/dev/null || exit 3; }
 _rf_log() { printf '%s\\n' "$*" >&2; }
 release_finalize() {
     local root=$1 manifest='' repo=''
@@ -178,7 +179,8 @@ release_finalize() {
     printf '{"kind":"dsr-release-finalization-result","status":"ready","exit_code":0,"fixture":true,"authenticated":false}\\n'
 }
 ''')
-    env = dict(os.environ, DSR_PACKAGE_FIXTURE=str(cli))
+    env = dict(os.environ, DSR_PACKAGE_FIXTURE=str(cli),
+               DSR_FINALIZER_FIXTURE_CORE=str(root / "src/release_finalize_core.sh"))
     base, incoming, manifest, recipe, plan = shared_fixture("shared")
     original, selection = read(manifest), read(plan)
     original_bytes = {p.name: (sha(p), stat.S_IMODE(p.stat().st_mode)) for p in incoming.iterdir()}
@@ -554,6 +556,7 @@ for source, filename in ((finalizer, "release_finalize.sh"), (packager, "release
 for filename in ("release_bundle.sh", "slsa.sh", "platforms.sh", "packaging.sh", "release_packaging_pipeline.sh"):
     shutil.copy2(root / "src" / filename, cli / filename)
 (cli / "release_finalize_core.sh").write_text('''#!/usr/bin/env bash
+source "$DSR_FINALIZER_FIXTURE_CORE" || { return 3 2>/dev/null || exit 3; }
 _rf_log() { printf '%s\\n' "$*" >&2; }
 release_finalize() {
     local root=$1 manifest='' repo=''
@@ -569,7 +572,8 @@ release_finalize() {
     printf '{"kind":"dsr-release-finalization-result","status":"ready","exit_code":0,"fixture":true,"authenticated":false}\\n'
 }
 ''')
-env = dict(os.environ, DSR_PACKAGE_FIXTURE=str(cli))
+env = dict(os.environ, DSR_PACKAGE_FIXTURE=str(cli),
+           DSR_FINALIZER_FIXTURE_CORE=str(root / "src/release_finalize_core.sh"))
 command = ["bash", cli / "release_finalize.sh", "--build-set", base / "plan.json",
            "--bundle-dir", base / "finalizer-bundle", "--packaging-recipe", base / "recipe.json"]
 handoff = json.loads(invoke(command, env=env).stdout)

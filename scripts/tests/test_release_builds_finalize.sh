@@ -74,8 +74,11 @@ jq -cn --arg manifest "$manifest" '{command:"build",status:"success",exit_code:0
 ''')
     (repo/'src/release_finalize_core.sh').write_text(r'''#!/usr/bin/env bash
 CORE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+source "$FIXTURE_PRODUCTION_FINALIZER"
 source "$CORE_DIR/slsa.sh"
-release_finalize() {
+# Keep the real result wrapper and process supervisor. Only the network engine
+# is replaced, after checking the actual complete collector output below.
+_rf_execute() {
     local root=$1 manifest='' repo='' tag='' sha='' promoted=false
     jq -cn --args '$ARGS.positional' -- "$@" >> "$FIXTURE_FINALIZE_CALLS"
     shift
@@ -91,9 +94,28 @@ release_finalize() {
     _slsa_manifest_statement "$manifest" "$repo" fixture:finalizer > "$FIXTURE_PROOF" || return 99
     _slsa_release_assets "$FIXTURE_PROOF" "$root" || return 99
     case "$(cat "$FIXTURE_FINALIZE_MODE")" in
-        fail) printf '{"kind":"dsr-release-finalization-result","status":"error","exit_code":7,"error":"publication fixture failure"}\n'; return 7 ;;
+        fail) printf 'publication fixture failure\n' >&2; printf '{"kind":"dsr-release-finalization-result","status":"error","exit_code":7,"error":"publication fixture failure"}\n'; return 7 ;;
         malformed) printf '{}\n'; return 0 ;;
         planned) printf '{"kind":"dsr-release-finalization-result","status":"planned","exit_code":0}\n'; return 0 ;;
+        slow)
+            python3 - "$FIXTURE_FINALIZE_MODE" <<'CHILD'
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+path = Path(sys.argv[1])
+for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(sig, signal.SIG_IGN)
+Path(str(path)+'.pid').write_text(str(os.getpid()))
+deadline = time.monotonic() + 20
+while not Path(str(path)+'.allow').exists():
+    if time.monotonic() >= deadline:
+        raise SystemExit(94)
+    time.sleep(.02)
+Path(str(path)+'.published').write_text('late publication')
+CHILD
+            ;;
     esac
     jq -cn --argjson promoted "$promoted" '{kind:"dsr-release-finalization-result",status:(if $promoted then "published" else "ready" end),
         exit_code:0,dry_run:false,promotion_attempted:$promoted,verification:{fixture:true}}'
@@ -115,7 +137,8 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then printf 'Original finalizer help\n'; f
     # The copied build path above is a process fixture. Keep its ambient policy
     # explicit; the production required-remote refusal is exercised below.
     env=dict(os.environ,RCH_REQUIRE_REMOTE='0',FIXTURE_BUILD_CALLS=str(calls),FIXTURE_FINALIZE_CALLS=str(finalcalls),
-             FIXTURE_FINALIZE_MODE=str(mode),FIXTURE_PROOF=str(work/'proof.json'))
+             FIXTURE_FINALIZE_MODE=str(mode),FIXTURE_PROOF=str(work/'proof.json'),
+             FIXTURE_PRODUCTION_FINALIZER=str(root/'src/release_finalize_core.sh'))
     entry=repo/'src/release_finalize.sh'; output=work/'execution'
     def command(directory=output, selected=planfile):
         return ['bash',str(entry),'--build-plan',str(selected),'--build-dir',str(directory)]
@@ -198,9 +221,34 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then printf 'Original finalizer help\n'; f
     sourced=['bash','-c','source "$1"; trap ": caller trap" TERM; before=$(trap -p TERM); release_finalize_build_plan --build-plan "$2" --build-dir "$3"; rc=$?; [[ $(trap -p TERM) == "$before" ]] || exit 99; exit "$rc"','_',str(entry),str(planfile),str(output)]
     run(custom=sourced)
     check('sourced build-plan API preserves caller traps',calls.read_bytes()==before)
-    for invalid in ('malformed','planned'):
-        mode.write_text(invalid); run(expected=7)
+    # The real result wrapper rejects malformed raw engine output with exit 1;
+    # the build handoff separately rejects a well-formed planned result with 7.
+    for invalid, expected in (('malformed',1),('planned',7)):
+        mode.write_text(invalid); result=run(expected=expected)
+        check('invalid publication output cannot complete the build handoff',result['status']=='error')
     mode.write_text('good')
+    # Cancellation must also reach a finalizer that starts after all builds
+    # completed. The old wrapper only forwarded signals to the compiler phase.
+    before_builds=calls.read_bytes()
+    for selected_signal, route in ((signal.SIGTERM,command()), (signal.SIGINT,sourced)):
+        selected_mode=work/('publication-cancel-'+selected_signal.name)
+        selected_mode.write_text('slow')
+        selected_env=dict(env,FIXTURE_FINALIZE_MODE=str(selected_mode))
+        pidfile=Path(str(selected_mode)+'.pid')
+        with open(str(selected_mode)+'.out','wb') as out, open(str(selected_mode)+'.err','wb') as err:
+            proc=subprocess.Popen(route,env=selected_env,stdout=out,stderr=err,start_new_session=True)
+            deadline=time.monotonic()+12
+            while time.monotonic()<deadline and not pidfile.exists() and proc.poll() is None: time.sleep(.02)
+            check('completed builds reach the running publication transport',pidfile.exists())
+            proc.send_signal(selected_signal); code=proc.wait(timeout=12)
+        report=load(Path(str(selected_mode)+'.out'))
+        check('combined publication cancellation returns one interrupted envelope',code==5 and report['exit_code']==5)
+        child=Path('/proc')/pidfile.read_text().strip()/'stat'
+        check('combined cancellation stops resistant publication descendant',not child.exists() or child.read_text().split(') ',1)[1].split()[0]=='Z')
+        Path(str(selected_mode)+'.allow').touch(); time.sleep(.1)
+        check('combined cancellation cannot publish after returning',not Path(str(selected_mode)+'.published').exists())
+        run()
+        check('publication cancellation preserves completed builds for retry',calls.read_bytes()==before_builds)
     before_final=finalcalls.read_bytes()
     payload=output/'completed/linux/artifacts/demo-linux-amd64'; saved=payload.read_bytes();payload.write_bytes(b'corrupt')
     run(expected=7)

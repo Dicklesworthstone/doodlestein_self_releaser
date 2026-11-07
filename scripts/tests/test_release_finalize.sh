@@ -10,6 +10,7 @@ trap 'exit 5' HUP INT TERM
 mkdir -p "$WORK/bin" "$WORK/cases"
 export PATH="$WORK/bin:$PATH"
 export RF_SHA=1111111111111111111111111111111111111111
+export RF_TEST_REPO_ROOT="$ROOT"
 trace() { printf '%s\n' "$*" >> "$RF_CASE/calls"; }
 _sbr_require() { trace auth; [[ "${RF_MODE:-}" != noauth ]] || return 3; }
 _sbr_run() { "$@"; }
@@ -42,6 +43,7 @@ fixture_local_verify() {
 sbom_generate_artifacts() {
     trace generate
     [[ "${RF_MODE:-}" != generate-fail ]] || return 6
+    if [[ "${RF_MODE:-}" == cancel-generate ]]; then finalize-cancel-probe || return $?; fi
     local root="$1" format="$3" out="$5" ext=spdx sha doc_sha
     [[ "$format" != cyclonedx ]] || ext=cdx
     mkdir -p "$out"
@@ -79,10 +81,24 @@ fixture_receipt() {
         manifest:{name:("sbom-manifest."+$ext+".json"),asset_id:3,sha256:$sha},artifact_count:1,
         asset_inventory_sha256:$inv,verification_policy:"expected-manifest-sha256"}'
 }
+fixture_inner_timeout() { run_with_timeout 30 finalize-cancel-probe; }
+fixture_nested_transport() { run_with_timeout 30 fixture_inner_timeout; }
+fixture_adapter_transport() (
+    # Keep the production adapter and nested deadline ownership. Only the
+    # transport's actual work is a fixture; no GitHub request is made here.
+    source "$RF_TEST_REPO_ROOT/src/sbom_release.sh" || return 3
+    _sbom_log() { printf '[fixture-sbom] %s\n' "$*" >&2; }
+    SBOM_REMOTE_TIMEOUT=30 _sbr_run fixture_inner_timeout
+)
 sbom_publish_artifacts() {
     trace publish
     [[ "${RF_MODE:-}" != publish-fail ]] || return 7
     [[ "${RF_MODE:-}" != publish-false-success ]] || { printf '{}\n'; return 0; }
+    case "${RF_MODE:-}" in
+        cancel-publish) finalize-cancel-probe || return $? ;;
+        cancel-nested) fixture_nested_transport || return $? ;;
+        cancel-adapter) fixture_adapter_transport || return $? ;;
+    esac
     local root="$1" format="$7" out="$9" ext=spdx file records='' i=0 hash
     [[ "$format" != cyclonedx ]] || ext=cdx
     mkdir -p "$RF_CASE/remote"
@@ -114,6 +130,7 @@ sbom_verify_release() {
 }
 export -f trace _sbr_require _sbr_run _sbr_context _sbr_inventory _sbr_inventory_sha256
 export -f fixture_local_verify fixture_receipt sbom_generate_artifacts sbom_verify_artifacts sbom_publish_artifacts sbom_verify_release
+export -f fixture_inner_timeout fixture_nested_transport fixture_adapter_transport
 cat > "$WORK/bin/gh" <<'SH'
 #!/usr/bin/env bash
 set -uo pipefail
@@ -124,6 +141,7 @@ cp "$body" "$RF_CASE/patch.json"
 [[ "$*" == 'api --hostname github.com --method PATCH repos/owner/tool/releases/42 --input '* ]] || exit 9
 jq -e '.=={draft:false,make_latest:"false"}' "$body" >/dev/null || exit 9
 case "${RF_MODE:-}" in patch-fail) exit 1 ;; patch-noop) echo '{}'; exit 0 ;; esac
+if [[ "${RF_MODE:-}" == cancel-promote ]]; then finalize-cancel-probe || exit $?; fi
 jq '.release.draft=false' "$RF_CASE/context.json" > "$RF_CASE/next.json"
 mv "$RF_CASE/next.json" "$RF_CASE/context.json"
 if [[ "${RF_MODE:-}" == patch-drift ]]; then
@@ -134,6 +152,34 @@ fi
 cat "$RF_CASE/context.json"
 SH
 chmod +x "$WORK/bin/gh"
+cat > "$WORK/bin/finalize-cancel-probe" <<'PY'
+#!/usr/bin/env python3
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+# The transport child has no inherited lock descriptor and resists graceful
+# termination. Only its owner's group drain can stop the late mutation.
+child = subprocess.Popen([sys.executable, '-c', r'''
+import os
+from pathlib import Path
+import signal
+import time
+case = Path(os.environ['RF_CASE'])
+for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(sig, signal.SIG_IGN)
+(case/'transport.pid').write_text(str(os.getpid()))
+deadline = time.monotonic() + 20
+while not (case/'allow-late-mutation').exists():
+    if time.monotonic() >= deadline:
+        raise SystemExit(94)
+    time.sleep(.02)
+(case/'late-mutation').write_text('a cancelled transport still published')
+'''], close_fds=True)
+child.wait()
+PY
+chmod +x "$WORK/bin/finalize-cancel-probe"
 cat > "$WORK/bin/curl" <<'SH'
 #!/usr/bin/env bash
 set -uo pipefail
@@ -457,6 +503,368 @@ capture handoff
 check 'mismatched old outbox is not silently upgraded or resent' test "$status" -eq 2
 check 'mismatched old outbox prevents promotion' test "$(count patch)" -eq 0
 check 'mismatched old outbox creates no extra events' test "$(count 'post owner/a'),$(count 'post owner/b')" = '1,1'
+
+for scenario in cli:TERM:generate cli:INT:publish sourced:TERM:promote sourced:INT:generate cli:KILL:publish \
+    cli:TERM:nested cli:KILL:nested sourced:TERM:adapter; do
+    new_case "cancel-${scenario//:/-}"
+    export RF_MODE="cancel-${scenario##*:}"
+    check "$scenario cancellation drains transport descendants before releasing state custody" \
+        python3 - "$MODULE" "$CASE" "$scenario" <<'PY'
+import fcntl
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+module, directory, scenario = sys.argv[1:]
+case = Path(directory)
+route, selected_signal, phase = scenario.split(':')
+arguments = [str(case/'artifacts'), '--repo', 'owner/tool', '--tag', 'v1.0.0',
+             '--sha', os.environ['RF_SHA'], '--output-dir', str(case/'meta'), '--promote']
+if route == 'sourced':
+    driver = r'''
+source "$1" || exit 90
+shift
+trap ': caller signal trap' HUP INT TERM PIPE
+trap ': caller exit trap' EXIT
+before=$(trap -p HUP INT TERM PIPE EXIT)
+before_mask=$(umask)
+before_options=$-
+release_finalize "$@"
+rc=$?
+[[ $(trap -p HUP INT TERM PIPE EXIT) == "$before" && $(umask) == "$before_mask" && $- == "$before_options" ]] || exit 99
+exit "$rc"
+'''
+    command = ['bash', '-c', driver, '_', module, *arguments]
+else:
+    command = ['bash', module, *arguments]
+(case/'tmp').mkdir()
+env = dict(os.environ, TMPDIR=str(case/'tmp'))
+pidfile = case/'transport.pid'
+child = None
+proc = None
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        stat = Path('/proc')/str(pid)/'stat'
+        return not stat.exists() or stat.read_text().split(') ', 1)[1].split()[0] != 'Z'
+    except (ProcessLookupError, FileNotFoundError):
+        return False
+
+try:
+    with (case/'cancel.out').open('wb') as out, (case/'cancel.err').open('wb') as err:
+        proc = subprocess.Popen(command, env=env, stdout=out, stderr=err, start_new_session=True)
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline and not pidfile.exists() and proc.poll() is None:
+            time.sleep(.02)
+        assert pidfile.exists(), 'finalizer did not reach the transport: ' + (case/'cancel.err').read_text()
+        child = int(pidfile.read_text())
+        locks = list((case/'state/release-finalize').glob('*/lock'))
+        assert len(locks) == 1, 'release session lock was not acquired'
+        with locks[0].open('a') as lock:
+            proc.send_signal(getattr(signal, 'SIG'+selected_signal))
+            deadline = time.monotonic() + 12
+            while time.monotonic() < deadline:
+                released = False
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    pass
+                else:
+                    assert not alive(child), 'release lock became free while an upload descendant was still live'
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+                    released = True
+                if proc.poll() is not None:
+                    if selected_signal != 'KILL':
+                        assert not alive(child), 'public finalization returned before its transport finished draining'
+                        break
+                    # A killed caller has no return boundary. Its independent
+                    # anchors may still be retiring after the transport dies.
+                    if not alive(child) and released:
+                        break
+                time.sleep(.01)
+            code = proc.wait(timeout=1)
+            assert not alive(child), 'a cancelled transport survived the owner'
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock, fcntl.LOCK_UN)
+    if selected_signal == 'KILL':
+        assert code == -signal.SIGKILL, 'owner-death fixture did not kill its waiter'
+    else:
+        result = json.loads((case/'cancel.out').read_text())
+        assert code == 5 and result['exit_code'] == 5 and result['status'] == 'error', (code, result)
+        assert result['error'] == 'Release finalization interrupted', result
+    (case/'allow-late-mutation').touch()
+    time.sleep(.1)
+    assert not (case/'late-mutation').exists(), 'publication continued after cancellation'
+    assert json.loads((case/'context.json').read_text())['release']['draft'] is True, 'cancelled work promoted the release'
+    state = json.loads(next((case/'state/release-finalize').glob('*/state.json')).read_text())
+    assert state['phase'] != 'published', 'cancellation falsely recorded successful publication'
+finally:
+    if proc is not None and proc.poll() is None:
+        proc.kill()
+        proc.wait()
+    if child is not None and alive(child):
+        os.kill(child, signal.SIGKILL)
+PY
+    unset RF_MODE
+    capture run_finalize --promote
+    check "$scenario cancellation retains a resumable verified release session" test "$status" -eq 0
+done
+
+new_case cancel-before-launch
+check 'an interrupt during supervisor setup prevents all publication work and preserves caller traps' \
+    bash -c '
+source "$1" || exit 90
+trap ": caller signal trap" HUP INT TERM PIPE
+trap ": caller exit trap" EXIT
+before=$(trap -p HUP INT TERM PIPE EXIT)
+type() {
+    if [[ "$*" == "-P sleep" ]]; then kill -TERM "$BASHPID"; fi
+    builtin type "$@"
+}
+_rf_execute() { : > "$RF_CASE/unexpected-engine"; return 91; }
+release_finalize fixture > "$RF_CASE/cancel.out"
+rc=$?
+[[ $rc == 5 && ! -e "$RF_CASE/unexpected-engine" && $(trap -p HUP INT TERM PIPE EXIT) == "$before" ]] || exit 1
+jq -es "length==1 and (.[0]|.kind==\"dsr-release-finalization-result\" and .exit_code==5 and .status==\"error\")" "$RF_CASE/cancel.out"
+' _ "$MODULE"
+
+new_case sourced-input
+check 'the sourced finalizer preserves stdin scripts, data streams and payload exit status' \
+    python3 - "$MODULE" <<'PY'
+import json
+import subprocess
+import sys
+
+module = sys.argv[1]
+script = r'''
+set -uo pipefail
+source "$1" || exit 90
+release_finalize "$RF_CASE/artifacts" --repo owner/tool --tag v1.0.0 --sha "$RF_SHA" --dry-run
+rc=$?
+printf 'caller continued\n' >&2
+exit "$rc"
+'''
+result = subprocess.run(['bash', '-s', '--', module], input=script, text=True,
+                        capture_output=True, timeout=10)
+assert result.returncode == 0, (result.returncode, result.stderr)
+assert json.loads(result.stdout)['status'] == 'planned', result.stdout
+assert result.stderr == 'caller continued\n', result.stderr
+script = r'''
+set -uo pipefail
+source "$1" || exit 90
+_rf_execute() {
+    local payload
+    IFS= read -r payload || return 91
+    jq -cn --arg payload "$payload" '{kind:"dsr-release-finalization-result",status:"error",exit_code:23,payload:$payload}'
+    return 23
+}
+release_finalize fixture
+'''
+data = 'spaces, $literal and ; shell punctuation'
+result = subprocess.run(['bash', '-c', script, '_', module], input=data+'\n', text=True,
+                        capture_output=True, timeout=10)
+assert result.returncode == 23, (result.returncode, result.stderr)
+report = json.loads(result.stdout)
+assert report['exit_code'] == 23 and report['payload'] == data, report
+PY
+
+check 'a completion message split across read deadlines preserves the actual worker exit' \
+    bash -c '
+source "$1" || exit 90
+printf() {
+    case "$1" in
+        exit:*) builtin printf "exit:"; command sleep 0.2; builtin printf "%s\n" "$2" ;;
+        *) builtin printf "$@" ;;
+    esac
+}
+reject() { return 4; }
+rc=0
+_rf_run_owned 1 reject || rc=$?
+[[ $rc == 4 ]]
+' _ "$MODULE"
+
+# Keep an interactive session controller alive when killing the public caller:
+# killing the PTY session leader would send SIGHUP and mask lease-EOF defects.
+# The payload models an encrypted-key prompt, not cryptographic signing.
+test_finalization_tty() {
+    python3 - "$MODULE" "$CASE" <<'PY'
+import json
+import os
+from pathlib import Path
+import pty
+import select
+import signal
+import subprocess
+import sys
+import time
+
+module, directory = sys.argv[1:]
+driver = r'''
+set -uo pipefail
+source "$1" || exit 90
+if [[ "$RF_TTY_MONITOR" == on ]]; then set -m; else set +m; fi
+trap ': caller suspension trap' TSTP
+printf '%s\n' "$BASHPID" > "$RF_CASE/owner.pid"
+snapshot() {
+    local flags="$-" suspension
+    suspension=$(trap -p TSTP)
+    set +m
+    python3 -c 'import json,os,sys
+from pathlib import Path
+path,pid,flags,suspension=sys.argv[1:]; pid=int(pid)
+fd=os.open("/dev/tty",os.O_RDWR|os.O_NOCTTY)
+Path(path).write_text(json.dumps(dict(pid=pid,pgrp=os.getpgid(pid),foreground=os.tcgetpgrp(fd),monitor="m" in flags,suspension=suspension)))
+os.close(fd)' "$RF_CASE/$1.json" "$BASHPID" "$flags" "$suspension"
+    [[ "$flags" != *m* ]] || set -m
+    return 0
+}
+tty_payload() {
+    exec 3<>/dev/tty || return 91
+    printf '%s\n' "$BASHPID" > "$RF_CASE/payload.pid"
+    python3 -c 'import os,signal,sys,time
+from pathlib import Path
+for sig in (signal.SIGTERM,signal.SIGHUP,signal.SIGINT): signal.signal(sig,signal.SIG_IGN)
+Path(sys.argv[1]).write_text(str(os.getpid()))
+while True: time.sleep(.1)' "$RF_CASE/resistant.pid" &
+    while [[ ! -s "$RF_CASE/resistant.pid" ]]; do command sleep .01; done
+    printf 'Fixture password prompt: ' >&3
+    : > "$RF_CASE/ready"
+    local reply=''
+    IFS= read -r reply <&3 || return 92
+    [[ "$reply" == fixture-only ]] || return 93
+    printf '%s\n' '{"kind":"dsr-release-finalization-result","status":"complete","exit_code":0,"reply_received":true}'
+}
+_rf_execute() {
+    printf '%s\n' "$BASHPID" > "$RF_CASE/engine.pid"
+    _rf_run_owned 2 tty_payload
+}
+if [[ "$RF_TTY_EVENT" == missing-python ]]; then
+    command() {
+        [[ "$*" != '-v python3' ]] || return 1
+        builtin command "$@"
+    }
+fi
+snapshot before
+rc=0
+release_finalize fixture > "$RF_CASE/result.json" || rc=$?
+snapshot after
+printf '%s\n' "$rc" > "$RF_CASE/rc"
+exit "$rc"
+'''
+
+def processes():
+    rows = subprocess.check_output(['ps', '-e', '-o', 'pid=,ppid=,pgid=,stat='], text=True)
+    return {int(pid): (int(parent), int(group), state)
+            for pid, parent, group, state in (row.split() for row in rows.splitlines())}
+
+def active(pids):
+    current = processes()
+    return {pid for pid in pids if pid in current and current[pid][2][0] not in ('Z', 'X')}
+
+for monitor in ('off', 'on'):
+    for event in ('success', 'ctrl-c', 'ctrl-z', 'pid-term', 'owner-kill', 'missing-python'):
+        case = Path(directory) / (monitor + '-' + event)
+        case.mkdir()
+        env = {key: value for key, value in os.environ.items()
+               if key not in ('BASH_ENV', 'ENV') and not key.startswith('BASH_FUNC_')}
+        env.update(RF_CASE=str(case), RF_TTY_MODULE=module, RF_TTY_DRIVER=driver,
+                   RF_TTY_MONITOR=monitor, RF_TTY_EVENT=event, HISTFILE='/dev/null',
+                   PS1='FINALIZE_PTY> ', PS2='CONTINUE> ', TERM='dumb')
+        shell, terminal = pty.fork()
+        if shell == 0:
+            os.execvpe('bash', ['bash', '--noprofile', '--norc', '-i'], env)
+        transcript, owned = bytearray(), set()
+
+        def pump():
+            if select.select([terminal], [], [], .02)[0]:
+                try:
+                    transcript.extend(os.read(terminal, 65536))
+                except OSError:
+                    pass
+
+        def until(predicate, seconds=12):
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                if predicate():
+                    return True
+                pump()
+            return bool(predicate())
+
+        try:
+            assert until(lambda: b'FINALIZE_PTY> ' in transcript), 'session controller did not start'
+            os.write(terminal, b'bash -c "$RF_TTY_DRIVER" _ "$RF_TTY_MODULE"\n')
+            if event != 'missing-python':
+                assert until(lambda: (case/'ready').exists()), 'nested terminal reader did not start'
+                owner, engine, payload = (int((case/(name+'.pid')).read_text())
+                                          for name in ('owner', 'engine', 'payload'))
+                table = processes()
+                owned = {owner}
+                while True:
+                    descendants = {pid for pid, row in table.items() if row[0] in owned} - owned
+                    if not descendants:
+                        break
+                    owned.update(descendants)
+                assert len({table[pid][1] for pid in (owner, engine, payload)}) == 3, 'nested groups are not isolated'
+                assert os.tcgetpgrp(terminal) == table[payload][1], 'password reader does not own foreground'
+                if event == 'success':
+                    os.write(terminal, b'fixture-only\n')
+                elif event in ('ctrl-c', 'ctrl-z'):
+                    os.write(terminal, b'\x03' if event == 'ctrl-c' else b'\x1a')
+                else:
+                    os.kill(owner, signal.SIGTERM if event == 'pid-term' else signal.SIGKILL)
+                if event == 'owner-kill':
+                    assert until(lambda: os.tcgetpgrp(terminal) == shell), 'session controller did not reclaim foreground'
+                    os.write(terminal, b'\n')
+                    assert until(lambda: not active(owned)), 'lease EOF left an owned descendant alive'
+                    assert not (case/'rc').exists() and not (case/'result.json').read_text().strip(), 'dead owner reported success'
+                    print('PASS PTY ' + case.name, flush=True)
+                    continue
+            assert until(lambda: (case/'rc').exists()), 'public finalization did not return'
+            code = int((case/'rc').read_text())
+            result = json.loads((case/'result.json').read_text())
+            expected = 0 if event == 'success' else 3 if event == 'missing-python' else 5
+            assert code == expected and result['exit_code'] == expected, (code, result)
+            assert result['kind'] == 'dsr-release-finalization-result', result
+            if event == 'success':
+                assert result.get('reply_received') is True, result
+            elif event == 'missing-python':
+                assert not (case/'engine.pid').exists() and not (case/'ready').exists(), 'missing dependency admitted work'
+            else:
+                assert result['status'] == 'error' and result['error'] == 'Release finalization interrupted', result
+            before, after = (json.loads((case/(phase+'.json')).read_text()) for phase in ('before', 'after'))
+            assert before == after and before['monitor'] == (monitor == 'on'), (before, after)
+            assert before['foreground'] == before['pgrp'], 'caller did not regain its terminal'
+            assert not active(owned - {before['pid']}), 'owned work survived public return'
+            assert until(lambda: os.tcgetpgrp(terminal) == shell), 'launching shell lost its terminal'
+            print('PASS PTY ' + case.name, flush=True)
+        except Exception as error:
+            raise AssertionError(case.name + ': ' + str(error)) from error
+        finally:
+            (case/'transcript').write_bytes(transcript)
+            for pid in active(owned):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            try:
+                os.write(terminal, b'exit\n')
+            except OSError:
+                pass
+            if not until(lambda: os.waitpid(shell, os.WNOHANG)[0] == shell, 2):
+                os.kill(shell, signal.SIGKILL)
+                os.waitpid(shell, 0)
+            os.close(terminal)
+PY
+}
+
+new_case terminal-lifecycle
+check 'terminal prompts, interrupts and owner death preserve foreground, monitor mode and descendant custody' \
+    test_finalization_tty
 
 new_case handoff-concurrent
 pids=()

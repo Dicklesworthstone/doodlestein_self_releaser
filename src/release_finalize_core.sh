@@ -11,6 +11,292 @@ fi
 
 _rf_log() { printf '[release-finalize] %s\n' "$*" >&2; }
 
+# Password readers may open /dev/tty even when stdin is a pipe. Transfer only
+# a terminal the caller already owns, and never reclaim it from another job.
+# Python is needed only on this interactive path; no terminal modes or password
+# bytes pass through this helper. Run it with shell monitor mode disabled.
+_rf_terminal() {
+    python3 -I -S - "$@" <<'PY'
+import errno
+import os
+import signal
+import sys
+
+action, group, previous = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+terminal = None
+try:
+    signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+    terminal = os.open('/dev/tty', os.O_RDWR | os.O_NOCTTY)
+    foreground = os.tcgetpgrp(terminal)
+    if action == 'current':
+        print(foreground if foreground == os.getpgrp() else 0)
+    elif action == 'take':
+        if foreground != previous:
+            raise RuntimeError('controlling terminal ownership changed before finalization')
+        os.tcsetpgrp(terminal, group)
+    elif action == 'restore':
+        if foreground == group:
+            os.tcsetpgrp(terminal, previous)
+    else:
+        raise RuntimeError('invalid terminal ownership operation')
+except OSError as error:
+    if error.errno in (errno.ENXIO, errno.ENODEV, errno.ENOTTY, errno.ENOENT) and action != 'take':
+        if action == 'current':
+            print(0)
+    else:
+        print('[release-finalize] Could not maintain controlling terminal ownership: '+str(error), file=sys.stderr)
+        sys.exit(1)
+except (ValueError, RuntimeError) as error:
+    print('[release-finalize] '+str(error), file=sys.stderr)
+    sys.exit(1)
+finally:
+    if terminal is not None:
+        os.close(terminal)
+PY
+}
+
+# A nested timeout/transport owns another process group. Its inherited lock
+# keeps this invocation alive even if an intermediate shell dies before that
+# group finishes draining. The waiter uses a distinct open description, never
+# upgrades the inherited lock or reopens a pathname after running tool code.
+_rf_wait_lease() {
+    if command -v flock >/dev/null 2>&1; then
+        flock -x "$1"
+    else
+        python3 -I -S - "$1" <<'PY'
+import fcntl
+import sys
+fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX)
+PY
+    fi
+}
+
+# A live group leader owns termination, just like the command supervisor in
+# guardrails.sh. The private input pipe is a lifetime lease: EOF also cancels
+# work when its waiting shell disappears. Never signal a saved PID after its
+# leader has exited, and never let a publication command inherit this pipe.
+_rf_owned_group() {
+    local _rf_group_input="$1" _rf_group_output="$2" _rf_group_grace="$3" _rf_group_terminal="$4" _rf_group_wait="$5"
+    shift 5
+    local _rf_group_pid="$BASHPID" _rf_group_child='' _rf_group_done=false
+    local _rf_group_cancelled=false _rf_group_message='' _rf_group_running=''
+    local _rf_group_status=0 _rf_group_read=0 _rf_group_started
+    set +m
+    eval "exec ${_rf_group_wait}>&-"
+    trap - EXIT
+    # A reclaimed terminal must not stop the anchor along with a background
+    # password reader; it still needs to notice lease EOF and drain its group.
+    trap '_rf_group_cancelled=true' HUP INT TERM PIPE TTIN TTOU TSTP
+    if ! IFS= read -r _rf_group_message || [[ "$_rf_group_message" != start ]] || $_rf_group_cancelled; then
+        if ((_rf_group_terminal > 0)); then
+            _rf_terminal restore "$_rf_group_pid" "$_rf_group_terminal" || true
+        fi
+        return 5
+    fi
+    (
+        eval "exec ${_rf_group_input}<&- ${_rf_group_output}>&-"
+        # Bash defers this trap while a foreground child supervisor drains.
+        # The lifetime lease below also covers descendants behind subshells
+        # whose own signal disposition lets them exit before that drain.
+        trap 'exit 5' HUP INT TERM
+        "$@"
+    ) <&"$_rf_group_input" >&"$_rf_group_output" &
+    _rf_group_child=$!
+    eval "exec ${_rf_group_input}<&- ${_rf_group_output}>&-"
+    while ! $_rf_group_cancelled; do
+        if ! $_rf_group_done; then
+            _rf_group_running=$(jobs -pr; jobs -ps)
+            case $'\n'"$_rf_group_running"$'\n' in
+                *$'\n'"$_rf_group_child"$'\n'*) ;;
+                *)
+                    wait "$_rf_group_child" || _rf_group_status=$?
+                    _rf_group_done=true
+                    printf 'exit:%s\n' "$_rf_group_status" || break
+                    ;;
+            esac
+        fi
+        _rf_group_read=0
+        IFS= read -r -t 0.1 _rf_group_message || _rf_group_read=$?
+        (( _rf_group_read != 0 && _rf_group_read != 1 && _rf_group_read > 128 )) || break
+    done
+    # With terminal custody, Ctrl-C/Ctrl-Z reach this group, not its waiter.
+    # Cancel rather than leave an invisible stopped job holding release locks.
+    if $_rf_group_cancelled && ! $_rf_group_done; then printf 'exit:5\n' || true; fi
+    trap '' HUP INT TERM PIPE TTIN TTOU TSTP
+    kill -TERM -- "-$_rf_group_pid" 2>/dev/null || true
+    _rf_group_started=$SECONDS
+    while ! $_rf_group_done && ((SECONDS - _rf_group_started < _rf_group_grace)); do
+        # A stopped child still owns resources. Do not enter a blocking wait
+        # for it: keep the grace bound and reach the final group KILL.
+        _rf_group_running=$(jobs -pr; jobs -ps)
+        case $'\n'"$_rf_group_running"$'\n' in
+            *$'\n'"$_rf_group_child"$'\n'*) command sleep 0.1 ;;
+            *) wait "$_rf_group_child" 2>/dev/null || true; _rf_group_done=true ;;
+        esac
+    done
+    if ((_rf_group_terminal > 0)); then
+        _rf_terminal restore "$_rf_group_pid" "$_rf_group_terminal" || true
+    fi
+    # The anchor still owns this group, including TERM-resistant descendants.
+    # A lock inherited by the anchor remains held through this final signal.
+    kill -KILL -- "-$_rf_group_pid" 2>/dev/null || true
+    return 1
+}
+
+# Run in the calling shell so a PID-directed interrupt reaches the waiter.
+# Preserve the sourced API's traps, job-control setting and input streams.
+# Every local is prefixed: the locked phase intentionally inherits the engine's
+# dynamically scoped release selection and must not have it shadowed here.
+_rf_run_owned() {
+    [[ $# -ge 2 && "$1" =~ ^[1-9][0-9]*$ ]] || return 4
+    local _rf_owner_grace="$1"
+    shift
+    local _rf_owner_input='' _rf_owner_output='' _rf_owner_fd
+    local _rf_owner_pid='' _rf_owner_result='' _rf_owner_control=''
+    local _rf_owner_cancelled=false _rf_owner_monitor=false _rf_owner_valid=false
+    local _rf_owner_traps _rf_owner_message='' _rf_owner_fragment='' _rf_owner_status=1 _rf_owner_guard=0 _rf_owner_read=0
+    local _rf_owner_terminal=0 _rf_owner_setup=0
+    local _rf_owner_lease='' _rf_owner_inherited='' _rf_owner_wait='' _rf_owner_open=''
+    local -a _RF_OWNED_GROUP=()
+    local _RF_OWNED_GROUP_PID=''
+    _rf_owner_traps=$(trap -p HUP INT TERM PIPE)
+    trap '_rf_owner_cancelled=true' HUP INT TERM PIPE
+    # A signal during descriptor/dependency setup belongs to the surrounding
+    # result wrapper. Carry it across the trap handoff before authorizing work.
+    [[ "${_rf_result_cancelled:-false}" != true ]] || _rf_owner_cancelled=true
+    [[ $- != *m* ]] || _rf_owner_monitor=true
+    # Otherwise Bash's own foreground-command bookkeeping would undo a tty
+    # transfer when the Python helper exits. Restore the caller's mode last.
+    set +m
+    if ! type -P sleep >/dev/null || ! dsr_lock_available; then
+        _rf_owner_setup=3
+    else
+        _rf_owner_lease=$(mktemp -d "${TMPDIR:-/tmp}/dsr-finalize-lease.XXXXXXXX") || _rf_owner_setup=1
+    fi
+    if ((_rf_owner_setup == 0)); then
+        for ((_rf_owner_fd=10; _rf_owner_fd<63; _rf_owner_fd++)); do
+            if { : <&"$_rf_owner_fd"; } 2>/dev/null; then continue; fi
+            if [[ -z "$_rf_owner_input" ]]; then
+                # Both forms duplicate fd 0. Bash 5.2 can crash on eval's <&0
+                # inside a function reading its script from standard input.
+                eval "exec ${_rf_owner_fd}>&0" || { _rf_owner_setup=1; break; }
+                _rf_owner_input=$_rf_owner_fd
+            elif [[ -z "$_rf_owner_output" ]]; then
+                eval "exec ${_rf_owner_fd}>&1" || { _rf_owner_setup=1; break; }
+                _rf_owner_output=$_rf_owner_fd
+            elif [[ -z "$_rf_owner_inherited" ]]; then
+                printf -v _rf_owner_open 'exec %s<>%q' "$_rf_owner_fd" "$_rf_owner_lease/lock"
+                eval "$_rf_owner_open" || { _rf_owner_setup=1; break; }
+                _rf_owner_inherited=$_rf_owner_fd
+            else
+                printf -v _rf_owner_open 'exec %s<>%q' "$_rf_owner_fd" "$_rf_owner_lease/lock"
+                eval "$_rf_owner_open" || { _rf_owner_setup=1; break; }
+                _rf_owner_wait=$_rf_owner_fd
+                break
+            fi
+        done
+        [[ -n "$_rf_owner_input" && -n "$_rf_owner_output" && -n "$_rf_owner_inherited" && -n "$_rf_owner_wait" ]] || _rf_owner_setup=1
+        if ((_rf_owner_setup == 0)); then
+            [[ "/dev/fd/$_rf_owner_inherited" -ef "/dev/fd/$_rf_owner_wait" ]] || _rf_owner_setup=1
+            dsr_lock_fd "$_rf_owner_inherited" 0 || _rf_owner_setup=1
+        fi
+    fi
+    if ((_rf_owner_setup == 0)) && ! $_rf_owner_cancelled && { : </dev/tty; } 2>/dev/null; then
+        if ! command -v python3 >/dev/null; then
+            _rf_log 'Interactive finalization requires Python 3 for controlling terminal ownership'
+            _rf_owner_setup=3
+        else
+            _rf_owner_terminal=$(_rf_terminal current 0 0) || _rf_owner_setup=$?
+            [[ "$_rf_owner_terminal" =~ ^[0-9]+$ ]] || { _rf_owner_terminal=0; _rf_owner_setup=1; }
+        fi
+    fi
+    if ((_rf_owner_setup == 0)) && ! $_rf_owner_cancelled; then
+        set -m
+        coproc _RF_OWNED_GROUP {
+            _rf_owned_group "$_rf_owner_input" "$_rf_owner_output" "$_rf_owner_grace" "$_rf_owner_terminal" "$_rf_owner_wait" "$@"
+        }
+        _rf_owner_pid="${_RF_OWNED_GROUP_PID:-}"
+        _rf_owner_result="${_RF_OWNED_GROUP[0]:-}"
+        _rf_owner_control="${_RF_OWNED_GROUP[1]:-}"
+        set +m
+    fi
+    [[ -z "$_rf_owner_input" ]] || eval "exec ${_rf_owner_input}<&-"
+    [[ -z "$_rf_owner_output" ]] || eval "exec ${_rf_owner_output}>&-"
+    if ((_rf_owner_setup == 0)) && ! $_rf_owner_cancelled &&
+       [[ "$_rf_owner_control" =~ ^[0-9]+$ && "$_rf_owner_result" =~ ^[0-9]+$ && "$_rf_owner_pid" =~ ^[1-9][0-9]*$ ]]; then
+        if ((_rf_owner_terminal > 0)); then
+            _rf_terminal take "$_rf_owner_pid" "$_rf_owner_terminal" || _rf_owner_setup=$?
+        fi
+    fi
+    if ((_rf_owner_setup == 0)) && ! $_rf_owner_cancelled &&
+       [[ "$_rf_owner_control" =~ ^[0-9]+$ && "$_rf_owner_result" =~ ^[0-9]+$ ]] && printf 'start\n' >&"$_rf_owner_control"; then
+        # Bash may resume a blocked read after running a signal trap. A short
+        # read deadline makes the cancellation flag authoritative immediately.
+        while ! $_rf_owner_cancelled; do
+            _rf_owner_read=0
+            _rf_owner_fragment=''
+            IFS= read -r -t 0.1 -u "$_rf_owner_result" _rf_owner_fragment || _rf_owner_read=$?
+            # A timed read can consume part of a line before its alarm fires.
+            # Retain those bytes so an ordinary child exit never becomes the
+            # anchor's cleanup status merely because the receipt was split.
+            _rf_owner_message+="$_rf_owner_fragment"
+            ((${#_rf_owner_message} <= 8)) || break
+            if ((_rf_owner_read == 0)); then
+                if [[ "$_rf_owner_message" =~ ^exit:([0-9]{1,3})$ ]] &&
+                   ((10#${BASH_REMATCH[1]} <= 255)); then
+                    _rf_owner_status=$((10#${BASH_REMATCH[1]}))
+                    _rf_owner_valid=true
+                fi
+                break
+            fi
+            ((_rf_owner_read > 128)) || break
+        done
+    fi
+    # Closing the lease asks the live leader to drain its own group. Retain
+    # our inherited locks until it finishes; repeated signals cannot skip wait.
+    trap '' HUP INT TERM PIPE
+    if [[ "$_rf_owner_control" =~ ^[0-9]+$ ]]; then
+        eval "exec ${_rf_owner_control}>&-"
+    fi
+    if [[ "$_rf_owner_pid" =~ ^[1-9][0-9]*$ ]]; then
+        wait "$_rf_owner_pid" 2>/dev/null || _rf_owner_guard=$?
+    fi
+    if [[ "$_rf_owner_result" =~ ^[0-9]+$ ]]; then
+        eval "exec ${_rf_owner_result}<&-"
+    fi
+    if [[ -n "$_rf_owner_inherited" ]]; then
+        eval "exec ${_rf_owner_inherited}>&-"
+    fi
+    if [[ -n "$_rf_owner_wait" ]]; then
+        # Closing our old description leaves only owned descendants holding
+        # its lock. This blocks until nested anchors have stopped their groups,
+        # including when their local drain outlasts our primary group's grace.
+        _rf_wait_lease "$_rf_owner_wait" || _rf_owner_setup=1
+        eval "exec ${_rf_owner_wait}>&-"
+    fi
+    if [[ -n "$_rf_owner_lease" ]]; then
+        rm -f -- "$_rf_owner_lease/lock"
+        rmdir -- "$_rf_owner_lease" || _rf_owner_setup=1
+    fi
+    # The anchor also restores custody if this shell is killed. This backup
+    # covers interruption between the transfer and the start-token handshake.
+    if ((_rf_owner_terminal > 0)) && [[ "$_rf_owner_pid" =~ ^[1-9][0-9]*$ ]]; then
+        _rf_terminal restore "$_rf_owner_pid" "$_rf_owner_terminal" || _rf_owner_setup=1
+    fi
+    if $_rf_owner_cancelled; then
+        _rf_owner_status=5
+    elif ((_rf_owner_setup != 0)); then
+        _rf_owner_status=$_rf_owner_setup
+    elif ! $_rf_owner_valid; then
+        _rf_owner_status=$_rf_owner_guard
+        ((_rf_owner_status != 0)) || _rf_owner_status=1
+    fi
+    $_rf_owner_monitor && set -m
+    trap - HUP INT TERM PIPE
+    eval "$_rf_owner_traps"
+    return "$_rf_owner_status"
+}
+
 _rf_require() {
     if ! declare -F sbom_publish_artifacts >/dev/null || ! declare -F sbom_verify_release >/dev/null; then
         # shellcheck source=src/sbom_release.sh
@@ -492,7 +778,9 @@ _rf_dispatch_guard() {
         false "$_RF_GUARD_MANIFEST" "$_RF_GUARD_WORK"
 }
 
-_rf_execute() (
+# The owned runner supplies the private child shell. A further subshell here
+# would let its intermediary exit before this lock-owning waiter has drained.
+_rf_execute() {
     set -uo pipefail
     umask 077
     local root='' repo='' tag='' sha='' format=spdx output_dir='' state_dir=''
@@ -706,6 +994,15 @@ _rf_execute() (
     # shellcheck disable=SC2064
     trap "$cleanup" EXIT
     trap 'exit 5' HUP INT TERM
+    # Keep the lock-owning shell and group anchor alive until every local
+    # publication process has stopped, including a resistant upload child.
+    # The outer supervisor allows this shorter drain to finish on cancellation.
+    _rf_run_owned 5 _rf_execute_locked
+}
+
+# Called only after _rf_execute has validated the selection and acquired its
+# session lock. The forked worker inherits that frozen scope and descriptor.
+_rf_execute_locked() {
     file="$session/state.json"
     oldhash=$(_rf_file_state "$file") || return $?
     if [[ "$oldhash" != absent ]]; then
@@ -1110,37 +1407,60 @@ _rf_execute() (
          verification:$verification,dispatch:$dispatch,payloads:$payloads,integrity:$integrity,preparation:$preparation} |
          if $provenance==null then . else .+{provenance:$provenance} end' || return 1
     return "$dispatch_rc"
-)
+}
 
 # Exactly one result even on failure, preserving the process exit. No live API
 # response body or token is included in diagnostics.
-release_finalize() (
-    local work result='' rc=0 error='' start=$SECONDS cleanup
+_rf_result() {
+    local _rf_result_stage="$1" _rf_result_grace="$2"
+    shift 2
+    local _rf_result_work _rf_result_rc=0 _rf_result_error='' _rf_result_start=$SECONDS
+    local _rf_result_traps _rf_result_cancelled=false _rf_result_emit=0
     command -v jq >/dev/null || return 3
-    umask 077
-    work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-finalize-result.XXXXXXXX") || return 1
-    printf -v cleanup 'rm -rf -- %q' "$work"
-    # shellcheck disable=SC2064
-    trap "$cleanup" EXIT
-    trap 'exit 5' HUP INT TERM
-    result=$(_rf_execute "$@" 2> "$work/diagnostics") || rc=$?
-    if ((rc == 0)); then
-        jq -e -s 'length==1 and (.[0]|.kind=="dsr-release-finalization-result" and .exit_code==0)' <<< "$result" >/dev/null || rc=1
+    _rf_result_work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-finalize-result.XXXXXXXX") || return 1
+    _rf_result_traps=$(trap -p HUP INT TERM PIPE)
+    trap '_rf_result_cancelled=true' HUP INT TERM PIPE
+    _rf_run_owned "$_rf_result_grace" "$@" > "$_rf_result_work/result.json" 2> "$_rf_result_work/diagnostics" || _rf_result_rc=$?
+    if $_rf_result_cancelled; then _rf_result_rc=5; fi
+    if ((_rf_result_rc == 0)) &&
+       ! jq -e -s 'length==1 and (.[0]|.kind=="dsr-release-finalization-result" and .exit_code==0)' \
+           "$_rf_result_work/result.json" >/dev/null 2>&1; then
+        if [[ -n "$_rf_result_stage" ]]; then _rf_result_rc=7; else _rf_result_rc=1; fi
     fi
-    if ((rc != 0)); then
-        error=$(head -c 8192 "$work/diagnostics") || return 1
-        [[ -n "$error" ]] || error="Release finalization failed (exit $rc)"
-        if jq -e -s --argjson rc "$rc" 'length==1 and (.[0]|.kind=="dsr-release-finalization-result" and .exit_code==$rc)' <<< "$result" >/dev/null 2>&1; then
-            jq -c --arg error "$error" --argjson duration "$((SECONDS-start))" '.+{error:$error,duration_seconds:$duration}' <<< "$result" || return 1
+    _rf_result_error=$(head -c 8192 "$_rf_result_work/diagnostics") || _rf_result_rc=1
+    [[ -n "$_rf_result_error" ]] || _rf_result_error="Release finalization failed (exit $_rf_result_rc)"
+    if jq -e -s --argjson rc "$_rf_result_rc" 'length==1 and (.[0]|.kind=="dsr-release-finalization-result" and .exit_code==$rc)' \
+        "$_rf_result_work/result.json" >/dev/null 2>&1; then
+        if [[ -n "$_rf_result_stage" ]]; then
+            cat "$_rf_result_work/result.json" > "$_rf_result_work/envelope" || _rf_result_emit=$?
         else
-            jq -nc --arg error "$error" --argjson rc "$rc" --argjson duration "$((SECONDS-start))" \
-                '{kind:"dsr-release-finalization-result",status:"error",exit_code:$rc,error:$error,duration_seconds:$duration}' || return 1
+            jq -c --arg error "$_rf_result_error" --argjson rc "$_rf_result_rc" --argjson duration "$((SECONDS-_rf_result_start))" \
+                '.+{duration_seconds:$duration} | if $rc==0 then . else .+{error:$error} end' \
+                "$_rf_result_work/result.json" > "$_rf_result_work/envelope" || _rf_result_emit=$?
         fi
     else
-        jq -c --argjson duration "$((SECONDS-start))" '.+{duration_seconds:$duration}' <<< "$result" || return 1
+        jq -nc --arg error "$_rf_result_error" --argjson rc "$_rf_result_rc" --argjson duration "$((SECONDS-_rf_result_start))" \
+            --arg stage "$_rf_result_stage" \
+            '{kind:"dsr-release-finalization-result",status:"error",exit_code:$rc,error:$error,duration_seconds:$duration} |
+             if $stage=="" then . else .+{stage:$stage} end' > "$_rf_result_work/envelope" || _rf_result_emit=$?
     fi
-    return "$rc"
-)
+    if $_rf_result_cancelled || ((_rf_result_rc == 5)); then
+        _rf_result_rc=5
+        jq -nc --argjson duration "$((SECONDS-_rf_result_start))" --arg stage "$_rf_result_stage" \
+            '{kind:"dsr-release-finalization-result",status:"error",exit_code:5,error:"Release finalization interrupted",duration_seconds:$duration} |
+             if $stage=="" then . else .+{stage:$stage} end' > "$_rf_result_work/envelope" || _rf_result_emit=$?
+    fi
+    if ((_rf_result_emit == 0)); then
+        cat "$_rf_result_work/envelope" || _rf_result_emit=$?
+    fi
+    rm -rf -- "$_rf_result_work"
+    trap - HUP INT TERM PIPE
+    eval "$_rf_result_traps"
+    ((_rf_result_emit == 0)) || return 1
+    return "$_rf_result_rc"
+}
+
+release_finalize() { _rf_result '' 8 _rf_execute "$@"; }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     case "${1:-}" in
@@ -1153,6 +1473,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
                 'Provenance: --require-provenance --provenance-builder ID (requires a signature policy and build manifest)' \
                 'Prepared only: --prepared-signatures --integrity-dir DIR --public-key FILE (never signs; build manifest optional unless uploading)' \
                 'Handoff: --tool NAME --dispatch-repos OWNER/A,OWNER/B [--dispatch-run-id ID] [--dispatch-state-dir DIR] [--retry-uncertain]' \
+                'Interactive terminals require Python 3 to preserve signing prompts and terminal ownership.' \
                 'Default: attach and verify SBOMs, retaining draft mode. --promote explicitly publishes the draft.' \
                 'Without --upload-payloads, payloads must already exist. Signatures require explicit policy; no build-provenance claim.' ;;
         *) release_finalize "$@"; exit $? ;;

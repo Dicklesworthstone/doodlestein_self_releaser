@@ -118,8 +118,11 @@ cp "$ROOT/src/release_finalize.sh" "$WORK/cli/release_finalize.sh"
 cp "$ROOT/src/release_bundle.sh" "$WORK/cli/release_bundle.sh"
 cp "$ROOT/src/slsa.sh" "$WORK/cli/slsa.sh"
 cp "$ROOT/src/platforms.sh" "$WORK/cli/platforms.sh"
+export DSR_FINALIZER_FIXTURE_CORE="$ROOT/src/release_finalize_core.sh"
 cat > "$WORK/cli/release_finalize_core.sh" <<'SH'
 #!/usr/bin/env bash
+# Keep the real supervision/result layer around the explicit routing fixture.
+source "$DSR_FINALIZER_FIXTURE_CORE" || { return 3 2>/dev/null || exit 3; }
 release_finalize() { jq -cn --args '{legacy_args:$ARGS.positional}' -- "$@"; }
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then printf 'existing finalizer help\n'; fi
 SH

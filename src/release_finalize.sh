@@ -322,44 +322,15 @@ _rf_build_set_execute() {
     return "$rc"
 }
 
-# The sourced legacy release_finalize API is unchanged. The build-set API is
-# explicit and returns exactly one envelope, including collection failures.
+# Share the direct finalizer's process ownership and single-result contract.
+# The longer outer grace allows the build controller or the locked publication
+# phase to finish draining their own groups before this wrapper can exit.
 _rf_build_set_result() {
-    local work rc=0 worker cleanup interrupted=false
-    command -v jq >/dev/null || return 3
-    umask 077
-    work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-build-set-result.XXXXXXXX") || return 1
-    printf -v cleanup 'rm -rf -- %q' "$work"
-    # shellcheck disable=SC2064
-    trap "$cleanup" EXIT
-    _rf_build_set_execute "$@" > "$work/result.json" 2> "$work/diagnostics" &
-    worker=$!
-    _rf_build_set_cancel() {
-        trap '' HUP INT TERM
-        interrupted=true
-        kill -TERM "$worker" 2>/dev/null || true
-    }
-    trap _rf_build_set_cancel HUP INT TERM
-    wait "$worker" || rc=$?
-    if [[ "$interrupted" == true ]]; then
-        wait "$worker" 2>/dev/null || true
-        rc=5
-    fi
-    if jq -es --argjson rc "$rc" 'length==1 and (.[0]|.kind=="dsr-release-finalization-result" and .exit_code==$rc)' \
-        "$work/result.json" >/dev/null 2>&1; then
-        cat "$work/result.json"
-    else
-        ((rc != 0)) || rc=7
-        head -c 8192 "$work/diagnostics" > "$work/error" || return 1
-        jq -cn --argjson rc "$rc" --rawfile error "$work/error" \
-            '{kind:"dsr-release-finalization-result",status:"error",exit_code:$rc,stage:"build-set",
-              error:(if $error=="" then "Build-set finalization failed" else $error end)}' || return 1
-    fi
-    return "$rc"
+    _rf_result build-set 11 _rf_build_set_execute "$@"
 }
 
-release_finalize_build_set() ( _rf_build_set_result "$@"; )
-release_finalize_build_plan() ( _rf_build_set_result "$@"; )
+release_finalize_build_set() { _rf_build_set_result "$@"; }
+release_finalize_build_plan() { _rf_build_set_result "$@"; }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     case "${1:-}" in
