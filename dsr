@@ -7135,9 +7135,61 @@ _release_finalize_observe() {
 }
 
 cmd_release_finalize() {
-    # Finalization may inherit fallback's build leases. Isolate owned cleanup
-    # so it cannot replace the acquiring caller's traps or release its custody.
-    (
+    # Stay in the public calling shell: a signal addressed to the CLI must
+    # close the worker's lifetime lease and wait for every owned descendant.
+    # Buffer output until that drain so cancellation cannot leak a partial or
+    # stale success envelope. Never replace a caller's EXIT/build-lock cleanup.
+    local _release_finalize_result_work='' _release_finalize_result_rc=0
+    local _release_finalize_result_emit=0 _release_finalize_result_traps
+    local _release_finalize_receipt_dir="${TMPDIR:-/tmp}"
+    local _rf_result_cancelled=false _rf_control_tmpdir=''
+    _release_finalize_result_traps=$(trap -p HUP INT TERM PIPE)
+    trap '_rf_result_cancelled=true' HUP INT TERM PIPE
+    if ! _dsr_require release_finalize_core || ! declare -F _rf_run_owned >/dev/null; then
+        _release_finalize_result_rc=3
+    # TMPDIR identifies the retained creation-response directory here. Even a
+    # removed control file would mutate its metadata during a read-only plan.
+    # Keep supervision scratch separate without changing that input authority.
+    elif ! _release_finalize_result_work=$(umask 077; mktemp -d "/tmp/dsr-strict-finalize.XXXXXXXX"); then
+        _release_finalize_result_rc=1
+    elif ! $_rf_result_cancelled; then
+        _rf_control_tmpdir="$_release_finalize_result_work"
+        _rf_run_owned 8 _release_finalize_execute "$@" \
+            > "$_release_finalize_result_work/stdout" \
+            2> "$_release_finalize_result_work/stderr" || _release_finalize_result_rc=$?
+    fi
+    # Publication work has drained. Make final result emission one operation;
+    # a repeated signal cannot interrupt cleanup or emit a second envelope.
+    trap '' HUP INT TERM PIPE
+    if $_rf_result_cancelled || ((_release_finalize_result_rc == 5)); then
+        _release_finalize_result_rc=5
+        log_error "Strict release finalization interrupted"
+        if $JSON_MODE; then
+            json_envelope release-finalize error 5 \
+                '{"stage":"interrupted","error":"Strict release finalization interrupted"}' || _release_finalize_result_emit=$?
+        fi
+    elif [[ -n "$_release_finalize_result_work" ]]; then
+        [[ ! -f "$_release_finalize_result_work/stderr" ]] ||
+            cat "$_release_finalize_result_work/stderr" >&2 || _release_finalize_result_emit=$?
+        [[ ! -f "$_release_finalize_result_work/stdout" ]] ||
+            cat "$_release_finalize_result_work/stdout" || _release_finalize_result_emit=$?
+    fi
+    if [[ -n "$_release_finalize_result_work" ]]; then
+        # Interrupted dry-run verification may leave private downloads. Its
+        # owned processes have drained; none of the original custody inputs
+        # live in this newly created workspace.
+        rm -rf -- "$_release_finalize_result_work" || _release_finalize_result_emit=1
+    fi
+    trap - HUP INT TERM PIPE
+    eval "$_release_finalize_result_traps"
+    ((_release_finalize_result_emit == 0)) || return 1
+    return "$_release_finalize_result_rc"
+}
+
+# The public supervisor supplies this private child shell. Keep acquisition
+# and cleanup in this same shell so inherited fallback custody remains owned
+# by its caller, while leases acquired here can be released after the drain.
+_release_finalize_execute() {
     trap - EXIT
     trap 'exit 5' HUP INT TERM
     local tool="" version="" response="" artifacts="" no_dispatch=false
@@ -7170,6 +7222,8 @@ OPTIONS:
 
 Finalization re-verifies every signed asset, the source tag and the release
 contract, then publishes the draft. See README "strict releases".
+Interrupted finalization drains its local publication processes before returning
+exit 5. Controlling-terminal ownership requires Python 3 for interactive use.
 EOF
                 return 0 ;;
             -*) log_error "Unsupported strict finalization option: $1"; log_info "$usage"; return 4 ;;
@@ -7286,6 +7340,56 @@ EOF
         done
     fi
 
+    local finalize_operation_rc=0 finalize_completion final_output release_id observed_url
+    # A dry-run may verify bytes and signatures, but its temporary downloads
+    # must not change the retained creation directory's metadata. The private
+    # POST response is still admitted against its original caller-supplied dir.
+    if $DRY_RUN; then
+        local TMPDIR="$_release_finalize_result_work"
+    fi
+    # This inner anchor inherits the build leases acquired above. It retains
+    # them even if a transport closes its own descriptors or a nested timeout
+    # outlives an intermediate shell. Never release custody before its barrier.
+    _rf_run_owned 5 _release_finalize_execute_locked || finalize_operation_rc=$?
+    ((finalize_operation_rc == 0)) || return "$finalize_operation_rc"
+    finalize_completion=$(jq -ce -s --argjson dry "$DRY_RUN" '
+        select(length == 1) | .[0] |
+        select((.release_id | type == "number" and floor == . and . > 0) and
+            (if $dry then .status == "dry_run"
+             else .status == "success" and
+                 (.receipt | type == "string" and length > 0) and
+                 (.html_url | type == "string") end))
+    ' "$_release_finalize_result_work/completion.json") || return 7
+    release_id=$(jq -r '.release_id' <<< "$finalize_completion") || return 7
+    if $DRY_RUN; then
+        log_info "Verified strict finalization plan for owned release ID $release_id"
+        $JSON_MODE && json_envelope "release-finalize" "dry_run" 0 "$(jq -nc --argjson id "$release_id" '{release_id:$id}')"
+        return 0
+    fi
+    final_output=$(jq -r '.receipt' <<< "$finalize_completion") || return 7
+    observed_url=$(jq -r '.html_url' <<< "$finalize_completion") || return 7
+    # Final verification and its durable receipt are complete. Check owned
+    # cleanup before reporting success; inherited caller custody stays held.
+    if ! _release_finalize_cleanup_build_custody "$finalize_custody_state_dir" "$tool" \
+        ${finalize_owned_versions[@]+"${finalize_owned_versions[@]}"} >&2; then
+        log_error "Strict finalization finished but its build custody could not be released"
+        $JSON_MODE && json_envelope release-finalize error 4 \
+            "$(jq -nc --arg repo "$repo" --arg version "$version" --arg tag "$tag" \
+                --arg receipt "$final_output" --argjson id "$release_id" \
+                '{repo:$repo,version:$version,tag:$tag,release_id:$id,receipt:$receipt,
+                  stage:"build_custody",error:"Strict finalization finished but its build custody could not be released"}')"
+        return 4
+    fi
+    finalize_owned_versions=()
+    trap - EXIT
+    log_ok "Strict release finalized and verified: $observed_url"
+    $JSON_MODE && json_envelope "release-finalize" "success" 0 "$(jq -nc --arg receipt "$final_output" --argjson id "$release_id" '{receipt:$receipt,release_id:$id}')"
+    return 0
+}
+
+# All strict source, signature, POST-custody and publication gates run beneath
+# the lock-owning anchor. Selection is inherited from the acquiring shell.
+_release_finalize_execute_locked() {
     if [[ ! -d "$artifacts" ]] || ! artifacts=$(cd -- "$artifacts" && pwd -P); then
         log_error "Strict finalization requires an existing artifact directory"
         return 4
@@ -7294,7 +7398,7 @@ EOF
     local frozen plan saved metadata release_id receipt_sha receipt_dir scan observed
     # Recovery authority is the original private POST response retained by the
     # GitHub adapter, not a tag lookup, upload journal, or caller-supplied ID.
-    receipt_dir="${TMPDIR:-/tmp}"
+    receipt_dir="$_release_finalize_receipt_dir"
     frozen=$(_source_release_read_private_receipt "$response" "$receipt_dir" "" "" "dsr-api-response.") || return 4
     saved=$(jq -c '.record' <<< "$frozen") || return 4
     receipt_sha=$(jq -r '.sha256' <<< "$frozen") || return 4
@@ -7327,9 +7431,9 @@ EOF
     _release_contract_verify_remote_tag_identity "$repo" "$tag" "$(jq -r '.git_sha' <<< "$plan")" || return 7
     _release_contract_verify_tag_ruleset_receipt "$(jq -c '.tag_ruleset_receipt' <<< "$plan")" || return 7
     if $DRY_RUN; then
-        log_info "Verified strict finalization plan for owned release ID $release_id"
-        $JSON_MODE && json_envelope "release-finalize" "dry_run" 0 "$(jq -nc --argjson id "$release_id" '{release_id:$id}')"
-        return 0
+        jq -nc --argjson id "$release_id" '{status:"dry_run",release_id:$id}' \
+            > "$_release_finalize_result_work/completion.json"
+        return $?
     fi
     local output final_output
     mkdir -p "$state_dir/releases" || return 7
@@ -7381,24 +7485,10 @@ EOF
         _source_release_restore_draft "$repo" "$release_id" "$metadata" || true
         return 7
     fi
-    # Final verification and its durable receipt are complete. Check owned
-    # cleanup before reporting success; inherited caller custody stays held.
-    if ! _release_finalize_cleanup_build_custody "$finalize_custody_state_dir" "$tool" \
-        ${finalize_owned_versions[@]+"${finalize_owned_versions[@]}"} >&2; then
-        log_error "Strict finalization finished but its build custody could not be released"
-        $JSON_MODE && json_envelope release-finalize error 4 \
-            "$(jq -nc --arg repo "$repo" --arg version "$version" --arg tag "$tag" \
-                --arg receipt "$final_output" --argjson id "$release_id" \
-                '{repo:$repo,version:$version,tag:$tag,release_id:$id,receipt:$receipt,
-                  stage:"build_custody",error:"Strict finalization finished but its build custody could not be released"}')"
-        return 4
-    fi
-    finalize_owned_versions=()
-    trap - EXIT
-    log_ok "Strict release finalized and verified: $(jq -r '.html_url' <<< "$observed")"
-    $JSON_MODE && json_envelope "release-finalize" "success" 0 "$(jq -nc --arg receipt "$final_output" --argjson id "$release_id" '{receipt:$receipt,release_id:$id}')"
-    return 0
-    )
+    jq -nc --arg receipt "$final_output" --argjson id "$release_id" \
+        --arg url "$(jq -r '.html_url' <<< "$observed")" \
+        '{status:"success",receipt:$receipt,release_id:$id,html_url:$url}' \
+        > "$_release_finalize_result_work/completion.json"
 }
 
 _source_release_resume_receipt_matches() {

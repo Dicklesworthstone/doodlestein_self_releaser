@@ -938,6 +938,15 @@ Recovery requires Python 3 for bounded, no-follow descriptor validation of the
 private receipt and its directory; device, inode, and byte identity remain
 fixed through publication.
 
+Interrupting strict finalization stops its owned local verification and
+promotion processes before the command returns. Build custody remains held
+through cleanup. The command returns exit code `5` and, with `--json`, one
+interruption error. If the CLI itself is killed, its independent supervisors
+still drain the work before releasing custody.
+Keep the original creation response and retry the same finalization command
+to reconcile the release against fresh evidence. A request already accepted by
+GitHub may have completed even when its local transport was interrupted.
+
 ### `dsr installer`
 
 Generate the `curl | bash` installer for a tool from its `repos.d/<tool>.yaml`:

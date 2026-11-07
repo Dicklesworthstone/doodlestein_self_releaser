@@ -171,7 +171,7 @@ _rf_run_owned() {
     if ! type -P sleep >/dev/null || ! dsr_lock_available; then
         _rf_owner_setup=3
     else
-        _rf_owner_lease=$(mktemp -d "${TMPDIR:-/tmp}/dsr-finalize-lease.XXXXXXXX") || _rf_owner_setup=1
+        _rf_owner_lease=$(mktemp -d "${_rf_control_tmpdir:-${TMPDIR:-/tmp}}/dsr-finalize-lease.XXXXXXXX") || _rf_owner_setup=1
     fi
     if ((_rf_owner_setup == 0)); then
         for ((_rf_owner_fd=10; _rf_owner_fd<63; _rf_owner_fd++)); do

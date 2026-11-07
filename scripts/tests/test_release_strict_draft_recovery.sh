@@ -33,7 +33,7 @@ source = Path(os.environ.get('DSR_TEST_COMMAND_FILE', str(root / 'dsr'))).read_t
 names = re.findall(r'^(_release_[A-Za-z0-9_]+)\(\) \{', source, re.M)
 names += ['_source_release_read_private_receipt', '_source_release_metadata_matches',
           '_source_release_restore_draft', '_source_release_identity',
-          '_source_release_inputs_match', 'cmd_release_finalize', 'cmd_release', 'cmd_release_verify', 'cmd_fallback']
+          '_source_release_inputs_match', 'cmd_release_finalize', 'cmd_release', 'cmd_release_verify', 'cmd_fallback', 'main']
 functions = work / 'functions.sh'
 functions.write_text('\n'.join(re.search(r'^' + re.escape(n) + r'\(\) \{\n.*?^\}', source, re.M | re.S).group(0) for n in names))
 print('Fixtures: ' + str(work), flush=True)
@@ -59,7 +59,7 @@ contract = {'checksum_sidecar':'sha256','minisign_public_key_file':'minisign.pub
             'exact_additional_assets':['SHA256SUMS','SHA256SUMS.minisig']}
 
 api = r'''
-import hashlib, json, os, time
+import hashlib, json, os, signal, time
 from pathlib import Path
 import sys
 c=Path(os.environ['CASE']); args=sys.argv[1:]; endpoint=args[0]
@@ -105,6 +105,17 @@ elif endpoint=='repos/owner/app/releases/9':
                 lock.write_text('changed fixture custody record\n')
     if '--method' in args:
         patch=json.loads(args[args.index('--data')+1])
+        if patch.get('draft') is False and control.get('pause_promotion'):
+            # Model an exec transport which retains no build/supervisor fds
+            # and needs escalation to stop. Only the explicit fixture gate
+            # permits the remote publication mutation below.
+            signal.signal(signal.SIGTERM,signal.SIG_IGN)
+            os.closerange(3,1024)
+            (c/'promotion.pid').write_text(str(os.getpid()))
+            deadline=time.monotonic()+40
+            while not (c/'continue-promotion').exists():
+                if time.monotonic()>deadline:sys.exit(92)
+                time.sleep(0.02)
         if patch.get('draft') is False and control.get('fail_publish'):
             print('Controlled publication failure',file=sys.stderr);sys.exit(1)
         r.update(patch)
@@ -145,7 +156,14 @@ log_ok() { log_info "$@"; }
 log_warn() { log_info "$@"; }
 log_debug() { :; }
 log_set_tool() { :; }
-_dsr_require() { :; }
+log_set_level_from_flags() { :; }
+log_set_command() { :; }
+log_init() { :; }
+log_session_finished() { :; }
+_dsr_load_all_modules() { :; }
+_dsr_require() {
+    case "$1" in release_finalize_core) source "$ROOT/src/release_finalize_core.sh" ;; esac
+}
 _dispatch_load_config() { printf 'false|||\n'; }
 _dispatch_is_true() { [[ "$1" == true ]]; }
 json_envelope() { jq -nc --arg command "$1" --arg status "$2" --argjson exit_code "$3" --argjson details "$4" '{command:$command,status:$status,exit_code:$exit_code,details:$details}'; }
@@ -161,7 +179,10 @@ mktemp() {
 }
 DRY_RUN=false
 JSON_MODE=false
-if [[ "$1" == create || "$1" == fallback || "$1" == verify ]]; then
+VERBOSE=false
+QUIET=false
+NON_INTERACTIVE=false
+if [[ "$1" == create || "$1" == fallback || "$1" == verify || "$1" == public-finalize ]]; then
     mode="$1"
     shift
     # Retain the real API adapter and creation producer. Only HTTP transport
@@ -188,6 +209,37 @@ if [[ "$1" == create || "$1" == fallback || "$1" == verify ]]; then
     elif [[ "$mode" == verify ]]; then
         DRY_RUN="$1"; shift
         cmd_release_verify app 1.2.3 "$@"
+    elif [[ "$mode" == public-finalize ]]; then
+        # Exercise the real public dispatcher, API adapter, timeout ownership,
+        # signed verification and build leases. Only remote bytes are local.
+        if [[ "${BORROW_BUILD_CUSTODY:-false}" == true ]]; then
+            build_state_init || exit $?
+            build_lock_acquire app v1.2.3 || exit $?
+            trap 'printf "caller exit\n" >> "$CASE/caller-exit"' EXIT
+            trap -p EXIT > "$CASE/caller-trap.before"
+            caller_snapshot() {
+                declare -p _BUILD_LOCK_PATHS _BUILD_LOCK_FDS _BUILD_LOCK_IDENTITIES \
+                    _BUILD_LOCK_OWNERS _BUILD_LOCK_RECORDS
+                _build_state_file_identity "$DSR_STATE_DIR/builds/app/v1.2.3/.lock"
+                _build_state_file_identity "$DSR_STATE_DIR/builds/app/v1.2.3/.lock.lease"
+                cat "$DSR_STATE_DIR/builds/app/v1.2.3/.lock"
+            }
+            caller_snapshot > "$CASE/caller-custody.before"
+        fi
+        main --json release finalize "$@"
+        status=$?
+        if [[ "${BORROW_BUILD_CUSTODY:-false}" == true ]]; then
+            trap -p EXIT > "$CASE/caller-trap.after"
+            caller_snapshot > "$CASE/caller-custody.after"
+            printf '%s\n' "$status" > "$CASE/public-return"
+            count=0
+            while [[ ! -e "$CASE/release-caller" ]]; do
+                ((count+=1)); ((count<=1500)) || exit 93
+                sleep 0.02
+            done
+            build_lock_release app v1.2.3 || exit 94
+        fi
+        exit "$status"
     else
         # These are only quality/build execution boundaries. Every source,
         # checkpoint, manifest, signature, custody and publication gate is real.
@@ -551,7 +603,7 @@ else
     build_lock_release app "$1" || exit $?
 fi
 '''
-    common=script.split('if [[ "$1" == create || "$1" == fallback ]]; then',1)[0]
+    common=script.split('\nif [[ "$1" == create',1)[0]
     borrowed_driver=common+r'''
 JSON_MODE=true
 build_state_init || exit $?
@@ -694,6 +746,152 @@ exit "$status"
               lease_available(c,'v1.2.3') and lease_available(c,'1.2.3'))
 
 
+def test_public_finalizer_lifecycle():
+    names=('success','term','kill','borrowed-success','borrowed-term','borrowed-kill','relative-success')
+    selected=os.environ.get('DSR_TEST_STRICT_CLI_CASE','')
+    if selected and (selected not in names or os.environ.get('DSR_TEST_STRICT_CLI_ONLY')!='1'):
+        raise AssertionError('Select a known CLI case together with DSR_TEST_STRICT_CLI_ONLY=1')
+    driver=work/'fixture-driver.sh';driver.write_text(script)
+
+    def until(predicate,seconds=30):
+        deadline=time.monotonic()+seconds
+        while not predicate():
+            if time.monotonic()>=deadline:raise AssertionError('Public finalizer fixture barrier timed out')
+            time.sleep(0.02)
+
+    def live(pid):
+        if pid is None:return False
+        result=subprocess.run(['ps','-o','stat=','-p',str(pid)],capture_output=True,text=True)
+        return result.returncode==0 and bool(result.stdout.strip()) and not result.stdout.lstrip().startswith('Z')
+
+    def lease_available(c,version):
+        lease=c/'state/builds/app'/version/'.lock.lease'
+        if not lease.exists():return True
+        with lease.open('r+b') as stream:
+            try:fcntl.flock(stream,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except OSError as error:
+                if error.errno in (errno.EAGAIN,errno.EACCES):return False
+                raise
+        return True
+
+    def published(c):
+        try:return json.loads((c/'remote.json').read_text())['draft'] is False
+        except (OSError,ValueError):return False
+
+    for name in names:
+        if selected and name!=selected:continue
+        borrowed=name.startswith('borrowed-')
+        action=name.rsplit('-',1)[-1]
+        c,env,_,_=setup('public-cli-'+name,{'absent':True})
+        created=subprocess.run(['bash',str(driver),'create'],env=env,capture_output=True,text=True,timeout=40)
+        (c/'producer.stdout').write_text(created.stdout);(c/'producer.stderr').write_text(created.stderr)
+        check(name+' CLI fixture uses the actual signed draft producer',created.returncode==0)
+        details=json.loads(created.stdout)['details']
+        response=Path(details['create_response']);env['TMPDIR']=details['finalization_tmpdir']
+        if (c/'state/builds').exists():(c/'state/builds').rename(c/'producer-build-custody')
+        controls=json.loads((c/'control.json').read_text())
+        controls['pause_promotion']=action!='success'
+        (c/'control.json').write_text(json.dumps(controls))
+        (c/'requests.jsonl').write_text('')
+        env.update(GH_MAX_RETRIES='1',GH_API_TIMEOUT='30',BORROW_BUILD_CUSTODY=str(borrowed).lower())
+        if name=='relative-success':env['DSR_STATE_DIR']='state'
+        # Retain a small, credential-free replay recipe for independent review.
+        replay_keys=('ROOT','FUNCTIONS','CASE','SOURCE_SHA','DSR_CONFIG_DIR','DSR_STATE_DIR',
+                     'TMPDIR','DSR_MINISIGN_KEY','NO_COLOR','PATH','GH_MAX_RETRIES',
+                     'GH_API_TIMEOUT','BORROW_BUILD_CUSTODY')
+        (c/'env.json').write_text(json.dumps({key:env[key] for key in replay_keys if key in env}))
+        args=['bash',str(driver),'public-finalize','app','1.2.3',
+              '--create-response',str(response),'--no-dispatch']
+        (c/'argv.json').write_text(json.dumps(args))
+        with (c/'finalizer.stdout').open('w') as out,(c/'finalizer.stderr').open('w') as err:
+            publisher=subprocess.Popen(args,cwd=c,env=env,stdout=out,stderr=err,start_new_session=True)
+            transport=None
+            try:
+                if action!='success':
+                    until(lambda:((c/'promotion.pid').exists() and (c/'promotion.pid').read_text().strip().isdigit()) or
+                          publisher.poll() is not None)
+                    check(name+' actual CLI reaches the resistant promotion transport',(c/'promotion.pid').exists())
+                    transport=int((c/'promotion.pid').read_text())
+                    check(name+' both build leases protect the live promotion',live(transport) and
+                          all(not lease_available(c,version) for version in ('v1.2.3','1.2.3')))
+                    os.kill(publisher.pid,signal.SIGTERM if action=='term' else signal.SIGKILL)
+
+                released_while_live=False
+                deadline=time.monotonic()+25
+                while True:
+                    active=live(transport)
+                    available=[lease_available(c,version) for version in ('v1.2.3','1.2.3')]
+                    if active and any(available):released_while_live=True
+                    if action=='kill':
+                        complete=publisher.poll() is not None and all(available)
+                    elif borrowed:
+                        complete=(c/'public-return').exists() or publisher.poll() is not None
+                    else:
+                        complete=publisher.poll() is not None
+                    if complete:break
+                    if time.monotonic()>=deadline:raise AssertionError(name+' public command did not retire bounded work')
+                    time.sleep(0.02)
+                # Record at the first observed public return/custody release,
+                # before permitting a still-live baseline transport to mutate.
+                alive_at_return=live(transport)
+                observation={'public_status':publisher.poll(),'transport_alive_at_return':alive_at_return,
+                             'lease_available':available,'released_while_transport_live':released_while_live}
+                (c/'continue-promotion').write_text('public command has returned\n')
+                if alive_at_return:
+                    until(lambda:published(c) or not live(transport),seconds=5)
+                else:
+                    time.sleep(0.1)
+                observation['published_after_return']=published(c)
+                (c/'return-observation.json').write_text(json.dumps(observation))
+                check(name+' promotion is dead at public return or custody release',not alive_at_return)
+                check(name+' build custody never releases ahead of live promotion',not released_while_live)
+                if borrowed and action!='kill':
+                    check(name+' borrowed canonical lease remains caller-owned after return',
+                          not available[0] and available[1] and
+                          (c/'caller-custody.before').read_bytes()==(c/'caller-custody.after').read_bytes())
+                    check(name+' caller EXIT trap is preserved and has not run',
+                          (c/'caller-trap.before').read_bytes()==(c/'caller-trap.after').read_bytes() and
+                          not (c/'caller-exit').exists())
+                else:
+                    check(name+' independent finalizer leases are released',all(available))
+                (c/'release-caller').write_text('release borrowed fixture lease\n')
+                status=publisher.wait(timeout=5)
+                if action=='kill':
+                    check(name+' caller loss leaves the draft resumable without promotion',status==-signal.SIGKILL and
+                          not published(c) and list((c/'state/releases').glob('app-v1.2.3-finalization-pending.*')) and
+                          not list((c/'state/releases').glob('app-v1.2.3-finalized.*')))
+                else:
+                    result=json.loads((c/'finalizer.stdout').read_text())
+                    expected=0 if action=='success' else 5
+                    check(name+' actual dispatcher returns one correctly classified JSON envelope',
+                          status==expected and result['command']=='release-finalize' and
+                          result['exit_code']==expected and result['status']==('success' if expected==0 else 'error'))
+                    if action=='success':
+                        receipt=Path(result['details']['receipt'])
+                        if not receipt.is_absolute():receipt=c/receipt
+                        check(name+' normal publication retains its verified completion receipt',published(c) and
+                              json.loads(receipt.read_text())['status']=='success' and
+                              json.loads(receipt.read_text())['release']['draft'] is False)
+                    else:
+                        check(name+' cancellation leaves the original receipt and resumable draft',not published(c) and
+                              response.is_file() and list((c/'state/releases').glob('app-v1.2.3-finalization-pending.*')) and
+                              not list((c/'state/releases').glob('app-v1.2.3-finalized.*')))
+                check(name+' no build lease survives the completed caller',
+                      all(lease_available(c,version) for version in ('v1.2.3','1.2.3')))
+            finally:
+                (c/'continue-promotion').write_text('fixture cleanup\n')
+                (c/'release-caller').write_text('fixture cleanup\n')
+                # A failing baseline can orphan private process groups. Limit
+                # cleanup to this fixture's newly created, unique session.
+                rows=subprocess.check_output(['ps','-eo','pid=,sid='],text=True).splitlines()
+                for row in rows:
+                    pid,sid=map(int,row.split())
+                    if sid==publisher.pid:
+                        try:os.kill(pid,signal.SIGKILL)
+                        except ProcessLookupError:pass
+                publisher.wait(timeout=5)
+
+
 def test_custom_artifact_repair():
     missing='payload.tar.gz.minisig'
     c,env,_,_=setup('custom-artifact-repair',{'absent':True,'fail_upload_name':missing})
@@ -785,6 +983,11 @@ def test_custom_artifact_repair():
           json.loads(result.stdout)['details']['manifest_found'] is True and not mutations(rows))
 
 
+if os.environ.get('DSR_TEST_STRICT_CLI_ONLY')=='1':
+    test_public_finalizer_lifecycle()
+    print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
+    raise SystemExit(0)
+
 if os.environ.get('DSR_TEST_STRICT_CUSTOM_REPAIR_ONLY')=='1':
     test_custom_artifact_repair()
     print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
@@ -803,6 +1006,7 @@ if os.environ.get('DSR_TEST_STRICT_CUSTODY_ONLY')=='1':
 
 if os.environ.get('DSR_TEST_STRICT_CREATION_ONLY')!='1':
     test_custom_artifact_repair()
+    test_public_finalizer_lifecycle()
 
 # Execute the complete producer-to-consumer handoff. The response's name,
 # bytes, permissions and directory come from production creation, not setup().

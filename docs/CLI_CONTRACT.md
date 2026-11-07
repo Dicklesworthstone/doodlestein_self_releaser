@@ -991,6 +991,21 @@ with an error message. Global `--dry-run` and verification without `--fix`
 perform no lease creation, acquisition or borrowing, so their observations do
 not reserve the artifact set.
 
+Strict `dsr release finalize` supervises both its public command and its
+lock-owning publication phase. HUP, INT and TERM stop new work, drain owned
+local process groups, and return exit code `5`. JSON mode emits one
+`release-finalize` error envelope after cleanup; partial or completed output
+from an interrupted worker cannot become a success response. Build custody
+remains held until publication descendants stop, including transports behind
+nested timeout helpers. Loss of the waiting CLI also triggers cleanup, though
+an already-killed caller cannot emit a result. Sourced callers retain their
+signal traps and borrowed fallback leases.
+
+Cancellation cannot recall a request GitHub has already accepted. The original
+private creation response and pending finalization evidence remain available;
+retrying the same command rechecks exact local and remote evidence before
+reporting success or attempting promotion again.
+
 New ordinary releases are created as private drafts. DSR freezes every selected
 asset name, size, and SHA-256, including the manifest, generated checksums, and
 selected metadata sidecars. It verifies the complete remote inventory and
