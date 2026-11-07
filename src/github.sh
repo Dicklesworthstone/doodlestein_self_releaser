@@ -1673,12 +1673,15 @@ gh_upload_asset_named() (
 
         retryable=false paused=false rate_limited=false
         if [[ "$http_code" == "429" ]] ||
-           { [[ "$http_code" == "403" ]] && _gh_is_rate_limited "$response"; }; then
+           { [[ "$http_code" == "403" ]] &&
+             { [[ -n "$_GH_LAST_RETRY_AFTER" || "$_GH_LAST_RATE_REMAINING" == "0" ]] ||
+               _gh_is_rate_limited "$response"; }; }; then
+            # GitHub's headers establish a rejected, rate-limited write even
+            # when its error body has no recognized message. Share the JSON
+            # and download adapters' policy before classifying an auth error.
             rate_limited=true
         fi
-        if ((curl_status != 0)) || [[ "$http_code" =~ ^(408|429|5[0-9][0-9])$ ]]; then
-            retryable=true
-        elif [[ "$http_code" == "403" ]] && _gh_is_rate_limited "$response"; then
+        if $rate_limited || ((curl_status != 0)) || [[ "$http_code" =~ ^(408|5[0-9][0-9])$ ]]; then
             retryable=true
         elif [[ "$http_code" == "401" || "$http_code" == "403" ]]; then
             _gh_log_error "GitHub rejected upload authorization for $upload_name"

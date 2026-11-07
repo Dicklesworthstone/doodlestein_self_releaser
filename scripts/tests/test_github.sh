@@ -1697,6 +1697,13 @@ test_release_upload_scenario() (
   unset DSR_GH_TOKEN GITHUB_TOKEN GH_TOKEN
   unset -f artifact_naming_generate_dual_for_tool 2>/dev/null || true
   sleep() { printf 'SLEEP %s\n' "$1" >> "$calls"; }
+  date() {
+    if [[ "$scenario" == retry-403-reset && "$*" == '+%s' ]]; then
+      printf '1700000000\n'
+    else
+      command date "$@"
+    fi
+  }
 
   fixture_asset() {
     jq -nc --arg name "${1:-asset+build.tar.gz}" --arg digest "sha256:$digest" --argjson size "$size" \
@@ -1782,16 +1789,29 @@ test_release_upload_scenario() (
       lost-response) code=000; rc=56 ;;
       raced-match|raced-conflict) code=422 ;;
       starter-after-502) code=502; asset=$(jq -c '.state = "starter"' <<< "$asset") ;;
-      retry-503|retry-429|retry-403|retry-after|long-cooldown)
+      retry-503|retry-429|retry-403|retry-after|long-cooldown|retry-403-after|retry-403-reset|long-403-cooldown|invalid-403-after|invalid-403-reset)
         if ((count == 1)); then
           printf '{"message":"API rate limit exceeded"}\n' > "$output"
           case "$scenario" in
             retry-after) printf 'HTTP/2 429\r\nRetry-After: 7\r\n\r\n' > "$header_file" ;;
             long-cooldown) printf 'HTTP/2 429\r\nRetry-After: 3600\r\n\r\n' > "$header_file" ;;
+            retry-403-after|retry-403-reset|long-403-cooldown|invalid-403-after|invalid-403-reset)
+              # An HTTP rejection and its headers are authoritative even when
+              # GitHub's body has no recognized English rate-limit message.
+              printf '{"message":"Forbidden"}\n' > "$output"
+              case "$scenario" in
+                retry-403-after) printf 'HTTP/2 403\r\nRetry-After: 7\r\n\r\n' > "$header_file" ;;
+                retry-403-reset) printf 'HTTP/2 403\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 1700000011\r\n\r\n' > "$header_file" ;;
+                long-403-cooldown) printf 'HTTP/2 403\r\nRetry-After: 3600\r\n\r\n' > "$header_file" ;;
+                invalid-403-after) printf 'HTTP/2 403\r\nRetry-After: invalid\r\n\r\n' > "$header_file" ;;
+                invalid-403-reset) printf 'HTTP/2 403\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: invalid\r\n\r\n' > "$header_file" ;;
+              esac
+              ;;
           esac
           case "$scenario" in
             retry-503) printf 503 ;; retry-429) printf 429 ;; retry-403) printf 403 ;;
             retry-after|long-cooldown) printf 429 ;;
+            retry-403-after|retry-403-reset|long-403-cooldown|invalid-403-after|invalid-403-reset) printf 403 ;;
           esac
           return 0
         fi
@@ -1799,6 +1819,12 @@ test_release_upload_scenario() (
       exhausted) printf '{"message":"temporary failure"}\n' > "$output"; printf 502; return 0 ;;
       unauthorized) printf '{"message":"Bad credentials"}\n' > "$output"; printf 401; return 0 ;;
       forbidden) printf '{"message":"Resource not accessible"}\n' > "$output"; printf 403; return 0 ;;
+      unauthorized-with-backoff)
+        printf 'HTTP/2 401\r\nRetry-After: 7\r\n\r\n' > "$header_file"
+        printf '{"message":"Bad credentials"}\n' > "$output"; printf 401; return 0 ;;
+      forbidden-with-capacity)
+        printf 'HTTP/2 403\r\nX-RateLimit-Remaining: 1\r\nX-RateLimit-Reset: 1700000011\r\n\r\n' > "$header_file"
+        printf '{"message":"Resource not accessible"}\n' > "$output"; printf 403; return 0 ;;
       unconfirmed-422) printf '{}\n' > "$output"; printf 422; return 0 ;;
       empty-204) printf 204; return 0 ;;
       bad-name) asset=$(jq -c '.name = "wrong-name"' <<< "$asset") ;;
@@ -1869,10 +1895,23 @@ test_release_upload_scenario() (
   fi
   case "$scenario" in
     retry-429|retry-403) grep -Fxq 'SLEEP 60' "$calls" || return 1 ;;
-    retry-after) grep -Fxq 'SLEEP 7' "$calls" || return 1 ;;
-    long-cooldown)
+    retry-after|retry-403-after) grep -Fxq 'SLEEP 7' "$calls" || return 1 ;;
+    retry-403-reset) grep -Fxq 'SLEEP 11' "$calls" || return 1 ;;
+    long-cooldown|long-403-cooldown|invalid-403-after|invalid-403-reset)
       ! grep -q '^SLEEP ' "$calls" || return 1
       # Rate limited: no reconciliation GET may bypass the cooldown.
+      [[ $(grep -c '^GET ' "$calls") -eq 1 ]] || return 1
+      ;;
+  esac
+  case "$scenario" in
+    retry-403-after|retry-403-reset)
+      # The cooldown protects reconciliation reads as well as the next POST.
+      awk '/^POST / {posts++} /^SLEEP / {paused=1}
+           /^GET / && posts == 1 && !paused {exit 1}' "$calls" || return 1
+      [[ $(grep -c '^SLEEP ' "$calls") -eq 1 ]] || return 1
+      ;;
+    forbidden|unauthorized|unauthorized-with-backoff|forbidden-with-capacity)
+      ! grep -q '^SLEEP ' "$calls" || return 1
       [[ $(grep -c '^GET ' "$calls") -eq 1 ]] || return 1
       ;;
   esac
@@ -2251,6 +2290,15 @@ lost-response 0 1 0
 retry-503 0 2 0
 retry-after 0 2 0
 long-cooldown 8 1 0
+retry-403-after 0 2 0
+retry-403-reset 0 2 0
+long-403-cooldown 8 1 0
+invalid-403-after 8 1 0
+invalid-403-reset 8 1 0
+forbidden 3 1 0
+unauthorized 3 1 0
+unauthorized-with-backoff 3 1 0
+forbidden-with-capacity 3 1 0
 raced-conflict 7 1 0
 no-token 3 0 0
 UPLOAD_DEADLINE_COMPATIBILITY
@@ -2788,10 +2836,17 @@ retry-429 0 2 0
 retry-403 0 2 0
 retry-after 0 2 0
 long-cooldown 8 1 0
+retry-403-after 0 2 0
+retry-403-reset 0 2 0
+long-403-cooldown 8 1 0
+invalid-403-after 8 1 0
+invalid-403-reset 8 1 0
 exhausted 8 3 0
 starter-after-502 7 1 0
 unauthorized 3 1 0
 forbidden 3 1 0
+unauthorized-with-backoff 3 1 0
+forbidden-with-capacity 3 1 0
 unconfirmed-422 7 1 0
 empty-204 7 1 0
 bad-name 7 1 0
