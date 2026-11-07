@@ -210,7 +210,9 @@ _sel_process_start() {
             return 1
         fi
         local -a fields=()
-        read -r -a fields <<< "${info##*) }"
+        # Signal cleanup can run inside a caller's `IFS= read`. /proc fields
+        # are space-delimited regardless of that temporary input setting.
+        IFS=' ' read -r -a fields <<< "${info##*) }"
         [[ ${#fields[@]} -ge 20 && "${fields[19]}" =~ ^[0-9]+$ ]] || return 4
         case "${fields[0]}" in Z|X) return 1 ;; esac
         printf 'proc:%s\n' "${fields[19]}"

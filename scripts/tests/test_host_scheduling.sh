@@ -85,6 +85,25 @@ expect 'configured limit parsed' 0 1 selector_get_limit alpha
 expect 'disabled host has no capacity' 0 0 selector_get_limit disabled
 expect 'explicit zero is retained' 0 0 selector_get_limit paused
 expect 'synthetic act host uses default' 0 2 selector_get_limit act-local
+
+# A worker interrupted inside `IFS= read` executes its signal/EXIT cleanup
+# with that temporary IFS still active. Release must authenticate the actual
+# owner independently of the caller's splitting rules, without orphaning its
+# capacity lease. Exercise acquire/release, not just the process-stat helper.
+inherited_ifs_lease() (
+    local delimiter="$1" label="$2" DSR_STATE_DIR="$work/ifs-$2"
+    selector_acquire_slot gamma held >/dev/null 2>&1 || return $?
+    [[ -f "$_SELECTOR_LOCKS_DIR/gamma/held.lock" ]] || return 1
+    IFS="$delimiter" selector_release_slot gamma held >/dev/null 2>&1 || return $?
+    [[ ! -e "$_SELECTOR_LOCKS_DIR/gamma/held.lock" ]] || return 1
+    IFS="$delimiter" selector_acquire_slot gamma reacquired >/dev/null 2>&1 || return $?
+    IFS="$delimiter" selector_release_slot gamma reacquired >/dev/null 2>&1 || return $?
+    [[ ! -e "$_SELECTOR_LOCKS_DIR/gamma/reacquired.lock" ]] || return 1
+    printf '%s\n' "$label"
+)
+expect 'empty caller IFS cannot strand an owned host slot' 0 empty inherited_ifs_lease '' empty
+expect 'non-whitespace caller IFS permits real slot acquisition and release' 0 colon inherited_ifs_lease : colon
+
 expect 'choose configured local with capacity' 0 alpha selector_choose_host --target linux/amd64
 expect 'capability passed through health provider' 0 gamma selector_choose_host --target linux/amd64 --capability rust
 expect 'explicit preference with capacity' 0 gamma selector_choose_host --target linux/amd64 --prefer gamma
