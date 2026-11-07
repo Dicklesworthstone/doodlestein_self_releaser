@@ -168,6 +168,8 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/tests/test_act_orchestration.sh --relocation-recovery-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/relocation-recovery.log"
+          bash scripts/tests/test_act_orchestration.sh --relocation-matrix-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/relocation-matrix.log"
+          bash scripts/tests/test_act_orchestration.sh --relocation-variant-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/relocation-variant.log"
           test -z "$(git status --porcelain)"
       - name: Validate native and workflow companion artifact admission
         shell: bash

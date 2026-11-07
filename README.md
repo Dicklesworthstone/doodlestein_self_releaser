@@ -670,6 +670,21 @@ source and dependency archives on the replacement before updating run state.
 A retry may reuse an already staged canonical snapshot only after full byte
 verification; partial or mismatched staging is refused without overwriting it.
 
+For a platform with multiple native variants, select the exact failed task:
+
+```bash
+dsr build example --version v1.2.3 --resume=<run-id> \
+  --resume-target-host linux/amd64@x86_64-unknown-linux-musl=linux-backup \
+  --resume-target-host-approval /path/to/reviewed-variant-relocation.json
+```
+
+Set the approval's `target` to the full `linux/amd64@x86_64-unknown-linux-musl`
+key. This route requires unchanged repository configuration and a configured
+replacement host with the same platform. A completed GNU sibling keeps its
+original host and artifacts. Later ordinary resumes retain the approved task
+assignment, and further moves preserve the original retry budget and attempt
+history.
+
 For native performance measurements of a tool with a strict release contract,
 use an explicit diagnostic build:
 
@@ -1479,8 +1494,9 @@ Resume reuses each completed variant only when its recorded files still match,
 and refuses a changed matrix configuration; a failed variant does not force
 its successful sibling to compile again. All variants must succeed before the
 build produces a publishable manifest. Same-host selective resume is supported
-for the matrix; platform-level failed-target host relocation requires a
-singleton platform.
+for the matrix. An exact `platform@triple` selector can relocate one failed
+variant without changing the platform-wide recipe or rebuilding its completed
+siblings; a bare platform relocation requires a singleton platform.
 A failed singleton can use approved host relocation in a run that also contains
 GNU/musl variants. The completed variants keep their original receipts and
 artifacts. The approval binds the original matrix configuration, and the new

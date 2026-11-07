@@ -605,7 +605,7 @@ dsr build --repo <name> [--targets <list>] [--version <tag>]
 | `--parallel[=N]` | off (bound 2 when enabled) | Run independent targets concurrently |
 | `--jobs` | 1 | Explicit concurrency bound from 1 through 32 |
 | `--resume[=RUN_ID]` | off | Reuse verified completed targets and retry incomplete targets |
-| `--resume-target-host TARGET=HOST` | off | Relocate one failed native target during a strict release resume |
+| `--resume-target-host TARGET[@TRIPLE]=HOST` | off | Relocate one failed native task during a strict release resume; qualify a variant by its exact triple |
 | `--resume-target-host-approval FILE` | required with relocation | Operator-reviewed JSON binding the run, target, replacement host and configuration hashes |
 | `--output-dir` | state directory | Artifact collection directory, bound into resume state |
 | `--no-sync` | false | Skip ordinary source sync (forbidden by strict release contracts) |
@@ -859,9 +859,12 @@ requirements, while plain source directories can synchronize without Git.
 Relocation requires the original controller to have released the build lock,
 the selected target to be failed, and no target to be running. Completed or
 cancelled runs and diagnostic builds are refused.
-Platform-level host relocation also requires the selected platform to have one
-configured triple. A multi-variant platform uses the existing same-host resume,
-which retries only failed variants and retains successful sibling receipts.
+Platform-level host relocation requires the selected platform to have one
+configured triple. For a multi-variant platform, select the failed task with
+`TARGET@TRIPLE=HOST`, for example
+`linux/amd64@x86_64-unknown-linux-musl=linux-backup`. The qualified selector must
+match one retained native task exactly. A bare platform is ambiguous and is
+refused for a variant matrix.
 A failed singleton platform may relocate when other platforms in the run have
 multiple variants. Its approval must bind the prior configuration to the run's
 saved matrix configuration digest. The reviewed replacement digest advances
@@ -889,10 +892,17 @@ when that override is empty or unset. Relocation staging and subsequent retries
 recheck this same configuration. Changed bytes prevent an ordinary resume.
 
 The operator must establish the prior config's provenance from the original
-invocation receipt. DSR checks actual file hashes and permits only the selected
-target's `cross_compile` host, build command, environment, and legacy `hosts`
-entry to differ. Global settings and all other target settings must match.
-The current recipe must resolve the selected target to the replacement host.
+invocation receipt. For a qualified variant, `target` in the approval is the
+complete `TARGET@TRIPLE` key. The prior and current repository configuration
+hashes must be identical: relocation changes only that task's host assignment,
+not its recipe, environment, triple, or platform-wide default. The replacement
+must be configured with the same physical platform as the selected task.
+Completed siblings retain their original hosts, artifacts and attempt receipts.
+
+For an unqualified singleton, DSR checks actual file hashes and permits only
+the selected target's `cross_compile` host, build command, environment, and legacy
+`hosts` entry to differ. Global settings and all other target settings must match.
+The current recipe must resolve that singleton to the replacement host.
 Its platform may differ from the artifact target when `cross_compile[TARGET].host`
 explicitly selects it and the target has a nonempty build command, including an
 inherited global `build_cmd`. This supports Linux-hosted Linux ARM64 and Windows
@@ -924,6 +934,15 @@ failure, or timeout classification.
 The run records the prior context, replacement host platform, configuration
 delta, source archive/manifest hashes, and prior attempt hashes; the next worker
 uses the next attempt number.
+Qualified assignments are saved in `context.task_host_overrides` and checked
+against the complete approved relocation history on every resume. Source and
+dependency checks, dispatch, public target results and manifest entries use each
+task's effective host. An ordinary resume retains the approved assignment without
+requiring the relocation flags again. Repeated relocation preserves every old
+attempt and approval; hosts no longer assigned any task leave the active source
+plan while their historical receipts remain available. Relocation does not reset
+compiler retry budgets. Dry-run resumes report the retained per-task hosts without
+staging sources or starting workers.
 After an interrupted staging attempt, only an exactly verified canonical
 snapshot may be reused. Partial snapshots are retained and refused, not merged
 or overwritten. No successful target is rebuilt by relocation admission.

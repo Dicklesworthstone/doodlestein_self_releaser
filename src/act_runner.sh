@@ -7281,6 +7281,7 @@ _act_validate_strict_cargo_source_closure() {
 # several targets share one immutable source root and download seed.
 _act_validate_strict_target_cargo_source_closure() {
     local tool="$1" platform="$2" version="$3" host="$4" source_root="$5" dependencies="$6"
+    local selected_triple="${7:-}"
     local build_cmd build_env binary_name target_triple command_template configured selected target_slug
     command_template=$(act_get_build_cmd "$tool" "$platform") || return 4
     binary_name=$(yq -r '.binary_name // ""' "$ACT_REPOS_DIR/${tool}.yaml") || return 4
@@ -7288,7 +7289,12 @@ _act_validate_strict_target_cargo_source_closure() {
     # Preserve singleton environment selection, including existing explicit
     # compiler overrides. Every matrix variant must be admitted independently:
     # target-conditional Cargo dependencies can differ between GNU and musl.
-    [[ "$configured" == *$'\n'* ]] || configured=""
+    if [[ -n "$selected_triple" ]]; then
+        grep -Fxq -- "$selected_triple" <<< "$configured" || return 4
+        configured="$selected_triple"
+    else
+        [[ "$configured" == *$'\n'* ]] || configured=""
+    fi
     while IFS= read -r selected; do
         build_env=$(act_get_build_env "$tool" "$platform" "$selected") || return 4
         target_triple=$(act_get_build_env_value "$build_env" CARGO_BUILD_TARGET 2>/dev/null || true)
@@ -8199,6 +8205,7 @@ act_sync_sources() {
     local submodule_git_contexts='{}' isolated_identity=null
     local strict_run_id=""
     local strict_git_sha=""
+    local selected_target_hosts=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -8218,6 +8225,11 @@ act_sync_sources() {
             --git-sha)
                 [[ $# -ge 2 ]] || { echo '{"status":"error","error":"--git-sha requires a value"}'; return 4; }
                 strict_git_sha="$2"
+                shift 2
+                ;;
+            --target-hosts-json)
+                [[ $# -ge 2 && -z "$selected_target_hosts" ]] || return 4
+                selected_target_hosts="$2"
                 shift 2
                 ;;
             --)
@@ -8316,6 +8328,21 @@ act_sync_sources() {
         done
     fi
 
+    if [[ -n "$selected_target_hosts" ]]; then
+        $strict_release || return 4
+        local selected_targets selected_target selected_host
+        # shellcheck disable=SC2086  # one configured target per word
+        selected_targets=$(printf '%s\n' $targets | jq -Rsc 'split("\n") | map(select(length > 0)) | sort') || return 4
+        jq -es --argjson targets "$selected_targets" '
+          length == 1 and (.[0] | type == "object" and (keys | sort) == $targets and
+            all(.[]; type == "string" and test("^[A-Za-z0-9_-]+$")))
+        ' <<< "$selected_target_hosts" >/dev/null || return 4
+        for selected_target in $targets; do
+            selected_host=$(jq -r --arg target "$selected_target" '.[$target]' <<< "$selected_target_hosts") || return 4
+            [[ "$(_act_get_host_field "$selected_host" platform)" == "$selected_target" ]] || return 4
+        done
+    fi
+
     # Find each unique build location that needs a source snapshot. Legacy act
     # runs use the working tree; strict act runs receive a local tracked-only root.
     local hosts_to_sync=()
@@ -8332,7 +8359,11 @@ act_sync_sources() {
             host="act"
             remote_path="$local_path"
         else
-            host=$(act_get_native_host "$target" "$tool_name")
+            if [[ -n "$selected_target_hosts" ]]; then
+                host=$(jq -r --arg target "$target" '.[$target]' <<< "$selected_target_hosts") || return 4
+            else
+                host=$(act_get_native_host "$target" "$tool_name")
+            fi
             remote_path=$(yq -r '.host_paths.'"$host"' // ""' "$config_file" 2>/dev/null)
             [[ -n "$remote_path" ]] || remote_path="$local_path"
         fi
@@ -13936,8 +13967,8 @@ _act_target_result_available() {
     [[ "$actual" == "$expected" ]]
 }
 
-# Expand only native Rust variants. Platform identity remains the routing and
-# release-contract authority; task identity distinguishes independent attempts.
+# Expand only native Rust variants. Platforms retain their default routes and
+# release contracts; task keys identify attempts and approved host assignments.
 # Validate the entire matrix before launching its first compiler.
 _act_build_task_plan() {
     local tool="$1" version="$2" platforms_json="$3" strict="$4"
@@ -14614,7 +14645,8 @@ _act_relocation_receipt_matches() {
 
 _act_relocate_failed_target() {
     local tool="$1" version="$2" run_id="$3" before="$4" request="$5" approval_file="$6"
-    local target="${request%%=*}" host="${request#*=}" old_host configured_host host_platform
+    local task_key="${request%%=*}" host="${request#*=}" old_host configured_host host_platform
+    local target="${task_key%%@*}" selected_triple="" qualified=false effective_hosts
     local config_file="$ACT_REPOS_DIR/${tool}.yaml"
     # Bind the configuration used by host selection, readiness and transport.
     # An inactive default file cannot authorize changes to an override file.
@@ -14626,18 +14658,32 @@ _act_relocate_failed_target() {
     local source_sha source_ref source_root
     [[ "$request" == *=* && "$target" =~ ^[a-z]+/[a-z0-9]+$ &&
        "$host" =~ ^[A-Za-z0-9_-]+$ ]] || return 4
+    build_state_validate_task_host_overrides "$before" || return 4
+    effective_hosts=$(build_state_effective_task_hosts "$before") || return 4
+    if [[ "$task_key" != "$target" ]]; then
+        qualified=true
+        selected_triple="${task_key#*@}"
+        [[ "$selected_triple" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && "$selected_triple" != *..* ]] || return 4
+        jq -e --arg key "$task_key" --arg target "$target" --arg triple "$selected_triple" '
+          [.context.build_tasks[]? | select(.key == $key and .platform == $target and
+            .target_triple == $triple and .method == "native")] | length == 1
+        ' <<< "$before" >/dev/null || return 4
+    fi
     local relocation_triples
     relocation_triples=$(act_get_configured_target_triples "$tool" "$target") || return 4
-    if [[ "$relocation_triples" == *$'\n'* ]] || jq -e --arg target "$target" '
+    if $qualified; then
+        grep -Fxq -- "$selected_triple" <<< "$relocation_triples" || return 4
+    elif [[ "$relocation_triples" == *$'\n'* ]] || jq -e --arg target "$target" '
         any(.context.build_tasks[]?; .platform == $target and .key != $target)
     ' <<< "$before" >/dev/null; then
-        _log_error "Platform-only relocation cannot move a variant matrix; resume its failed variants on the bound host"
+        _log_error "Platform-only relocation is ambiguous; select the exact platform@triple task"
         return 4
     fi
-    old_host=$(jq -er --arg target "$target" '.context.target_hosts[$target] | strings' <<< "$before") || return 4
+    old_host=$(jq -er --arg key "$task_key" '.[$key] | strings' <<< "$effective_hosts") || return 4
     [[ "$host" != "$old_host" ]] || return 4
     [[ -f "$approval_file" && ! -L "$approval_file" ]] || return 4
-    approval=$(jq -ce --arg target "$target" --arg host "$host" --arg run "$run_id" '
+    approval=$(jq -ces --arg target "$task_key" --arg host "$host" --arg run "$run_id" '
+        select(length == 1 and (.[0] | type == "object")) | .[0] |
         select(.run_id == $run and .target == $target and .new_host == $host) |
         select(all([.prior_repo_config_sha256,.repo_config_sha256,.hosts_config_sha256][];
                    type == "string" and test("^[0-9a-f]{64}$")))' "$approval_file") || return 4
@@ -14666,21 +14712,32 @@ _act_relocate_failed_target() {
     current_bytes="${current_bytes%.}"
     repo_hash=$(printf '%s' "$current_bytes" | _act_sha256 /dev/stdin) || return 4
     current_json=$(printf '%s' "$current_bytes" | yq -p=yaml -o=json '.' -) || return 4
-    # Only the failed target's explicit command/environment/routing may differ.
-    # Global source/profile/contract and every completed target stay identical.
-    projection='del(.cross_compile[$target].host,.cross_compile[$target].build_cmd,.cross_compile[$target].env,.hosts[$target])'
-    [[ "$(jq -cS --arg target "$target" "$projection" <<< "$prior_json")" == \
-       "$(jq -cS --arg target "$target" "$projection" <<< "$current_json")" ]] || return 4
-    jq -e --arg target "$target" '
+    if $qualified; then
+        # A platform recipe belongs to all its variants. Moving one task
+        # changes only its checkpoint route, never the shared configuration.
+        [[ "$repo_hash" == "$prior_config_hash" ]] || return 4
+    else
+        # Only the failed singleton's explicit command/environment/routing may differ.
+        # Global source/profile/contract and every completed target stay identical.
+        projection='del(.cross_compile[$target].host,.cross_compile[$target].build_cmd,.cross_compile[$target].env,.hosts[$target])'
+        [[ "$(jq -cS --arg target "$target" "$projection" <<< "$prior_json")" == \
+           "$(jq -cS --arg target "$target" "$projection" <<< "$current_json")" ]] || return 4
+    fi
+    jq -e --arg target "$task_key" '
       .context.build_purpose == "release" and .context.publishable == true and
       .status != "completed" and .status != "cancelled" and
       .target_statuses[$target].status == "failed" and
       all(.target_statuses[]; .status != "running")
     ' <<< "$before" >/dev/null || return 4
     act_platform_uses_act "$tool" "$target" && return 4
-    configured_host=$(act_get_native_host "$target" "$tool") || return 4
-    [[ "$configured_host" == "$host" ]] || return 4
-    host_platform=$(_act_get_host_platform "$host") || return 4
+    if $qualified; then
+        host_platform=$(_act_get_host_field "$host" platform) || return 4
+        [[ "$host_platform" == "$target" ]] || return 4
+    else
+        configured_host=$(act_get_native_host "$target" "$tool") || return 4
+        [[ "$configured_host" == "$host" ]] || return 4
+        host_platform=$(_act_get_host_platform "$host") || return 4
+    fi
     if [[ "$host_platform" != "$target" ]]; then
         # A native worker executes on its host OS while producing the requested
         # target, just as act_run_native_build does for an initial cross build.
@@ -14699,8 +14756,8 @@ _act_relocate_failed_target() {
         fi
         _log_info "Relocating $target to configured cross-build host $host ($host_platform)"
     fi
-    prior_result=$(jq -er --arg target "$target" '.target_statuses[$target].result_path | strings' <<< "$before") || return 4
-    prior_log=$(jq -er --arg target "$target" '.target_statuses[$target].log_path | strings' <<< "$before") || return 4
+    prior_result=$(jq -er --arg target "$task_key" '.target_statuses[$target].result_path | strings' <<< "$before") || return 4
+    prior_log=$(jq -er --arg target "$task_key" '.target_statuses[$target].log_path | strings' <<< "$before") || return 4
     [[ -f "$prior_result" && ! -L "$prior_result" && -f "$prior_log" && ! -L "$prior_log" ]] || return 4
     jq -e --arg target "$target" --arg host "$old_host" \
         '.platform == $target and .host == $host and
@@ -14709,10 +14766,15 @@ _act_relocate_failed_target() {
          (.exit_code != 130 and .exit_code != 143) and
          .build_purpose == "release" and .publishable == true' \
         "$prior_result" >/dev/null || return 4
+    if $qualified; then
+        jq -e --arg key "$task_key" --arg triple "$selected_triple" '
+          .task_key == $key and .target_triple == $triple and .method == "native"
+        ' "$prior_result" >/dev/null || return 4
+    fi
     result_hash=$(_act_sha256 "$prior_result") || return 4
     log_hash=$(_act_sha256 "$prior_log") || return 4
     [[ "$result_hash" =~ ^[0-9a-f]{64}$ && "$log_hash" =~ ^[0-9a-f]{64}$ ]] || return 4
-    result=$(jq -c --arg target "$target" '.target_statuses[$target].result' <<< "$before") || return 4
+    result=$(jq -c --arg target "$task_key" '.target_statuses[$target].result' <<< "$before") || return 4
     _act_relocation_receipt_matches "$prior_result" "$result" || return 4
     source_sha=$(jq -er '.git_sha | strings | select(test("^[0-9a-f]{40}$"))' <<< "$before") || return 4
     source_ref=$(jq -er '.git_ref | strings | select(length > 0)' <<< "$before") || return 4
@@ -14749,8 +14811,12 @@ _act_relocate_failed_target() {
     hosts_hash=$(_act_sha256 "$hosts_file") || return 4
     [[ "$repo_hash" == "$(jq -r '.repo_config_sha256' <<< "$approval")" &&
        "$hosts_hash" == "$(jq -r '.hosts_config_sha256' <<< "$approval")" ]] || return 4
+    local sync_args=()
+    if $qualified; then
+        sync_args=(--target-hosts-json "$(jq -cn --arg target "$target" --arg host "$host" '{($target):$host}')")
+    fi
     if ! sync_json=$(act_sync_sources "$tool" --strict-release --run-id "$run_id" \
-        --git-sha "$(jq -r '.git_sha' <<< "$before")" -- "$target"); then
+        --git-sha "$(jq -r '.git_sha' <<< "$before")" "${sync_args[@]}" -- "$target"); then
         # A previous attempt may have finished immutable staging before a
         # later verification or state write failed. Reuse only the complete
         # canonical snapshot whose archive, manifest and checkout all verify
@@ -14769,41 +14835,50 @@ _act_relocate_failed_target() {
       .target_hosts == {($target): $host} and
       (.source_roots | keys) == [$host]
     ' <<< "$sync_json" >/dev/null || return 4
-    hosts=$(jq -c --arg target "$target" --arg host "$host" '.context.target_hosts + {($target): $host}' <<< "$before") || return 4
-    roots=$(jq -cn --argjson prior "$(jq -c '.context.source_roots' <<< "$before")" \
-        --argjson added "$(jq -c '.source_roots' <<< "$sync_json")" --argjson hosts "$hosts" \
-        '($prior + $added) | with_entries(select(.key as $key | $hosts | any(. == $key)))') || return 4
+    hosts=$(jq -c --arg target "$task_key" --arg host "$host" '. + {($target): $host}' <<< "$effective_hosts") || return 4
+    roots=$(jq -cn --slurpfile prior /dev/fd/3 --slurpfile added /dev/fd/4 \
+        --slurpfile hosts /dev/fd/5 '
+        def one: if length == 1 then .[0] else error("exactly one source input required") end;
+        ($prior | one | .context.source_roots) as $prior |
+        ($added | one | .source_roots) as $added | ($hosts | one) as $hosts |
+        if any($added | to_entries[]; . as $new | ($prior | has($new.key)) and $prior[$new.key] != $new.value)
+        then error("replacement source root changes existing host custody") else
+        ($prior + $added) | with_entries(select(.key as $key | $hosts | any(. == $key))) end' \
+        3<<< "$before" 4<<< "$sync_json" 5<<< "$hosts") || return 4
     _act_verify_strict_source_roots "$tool" "$(jq -r '.git_sha' <<< "$before")" "$roots" || return 4
+    dependency_checkouts='[]'
     if [[ "$ACT_REPO_LANGUAGE" == "rust" ]]; then
         dependency_checkouts=$(_act_release_source_dependency_checkouts_json "$tool") || return 4
-        _act_validate_strict_target_cargo_source_closure "$tool" "$target" "$version" "$host" \
-            "$(jq -r --arg host "$host" '.[$host]' <<< "$roots")" \
-            "$dependency_checkouts" || return 4
     fi
+    _act_validate_strict_task_sources "$tool" "$version" "$run_id" "$roots" "$hosts" \
+        "$(jq -c '.context.build_tasks' <<< "$before")" "$dependency_checkouts" || return 4
     source_inventory=$(_act_relocation_source_inventory "$tool" "$(jq -r '.git_sha' <<< "$before")") || return 4
     [[ "$(_act_sha256 "$config_file")" == "$repo_hash" &&
        "$(_act_sha256 "$hosts_file")" == "$hosts_hash" &&
        "$(_act_sha256 "$prior_result")" == "$result_hash" &&
        "$(_act_sha256 "$prior_log")" == "$log_hash" ]] || return 4
-    receipt=$(jq -cn --arg target "$target" --arg old "$old_host" --arg new "$host" --arg host_platform "$host_platform" \
+    receipt=$(jq -cn --arg target "$task_key" --arg platform "$target" --arg triple "$selected_triple" \
+        --arg old "$old_host" --arg new "$host" --arg host_platform "$host_platform" \
         --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg repo_hash "$repo_hash" \
         --arg hosts_hash "$hosts_hash" --arg result_hash "$result_hash" --arg log_hash "$log_hash" \
-        --argjson prior "$before" --argjson sync "$sync_json" '
+        --slurpfile prior /dev/fd/3 --slurpfile sync /dev/fd/4 --slurpfile approval /dev/fd/5 \
+        --slurpfile prior_config /dev/fd/6 --slurpfile current_config /dev/fd/7 --slurpfile inventory /dev/fd/8 '
+        def one: if length == 1 then .[0] else error("exactly one relocation document required") end;
+        ($prior | one) as $prior | ($sync | one) as $sync | ($approval | one) as $approval |
+        ($prior_config | one) as $old_config | ($current_config | one) as $new_config | ($inventory | one) as $inventory |
         {target: $target, old_host: $old, new_host: $new, new_host_platform: $host_platform, at: $now,
          git_sha: $prior.git_sha, git_ref: $prior.git_ref,
          prior_target: $prior.target_statuses[$target], prior_context: $prior.context,
          repo_config_sha256: $repo_hash, hosts_config_sha256: $hosts_hash,
          prior_result_sha256: $result_hash, prior_log_sha256: $log_hash,
-         verified_source_sync: $sync}') || return 4
-    receipt=$(jq -c --argjson approval "$approval" --argjson old "$prior_json" --argjson new "$current_json" \
-        --argjson inventory "$source_inventory" \
-        --arg target "$target" '. + {approval: $approval,
-          verified_source_inventory: $inventory,
-          configuration_delta: {prior: $old.cross_compile[$target], replacement: $new.cross_compile[$target],
-            prior_host: $old.hosts[$target], replacement_host: $new.hosts[$target]}}' \
-        <<< "$receipt") || return 4
+         verified_source_sync: $sync, approval: $approval, verified_source_inventory: $inventory,
+         configuration_delta: {prior: $old_config.cross_compile[$platform], replacement: $new_config.cross_compile[$platform],
+           prior_host: $old_config.hosts[$platform], replacement_host: $new_config.hosts[$platform]}} |
+        if $triple == "" then . else . + {task_key:$target,platform:$platform,target_triple:$triple} end
+        ' 3<<< "$before" 4<<< "$sync_json" 5<<< "$approval" 6<<< "$prior_json" \
+          7<<< "$current_json" 8<<< "$source_inventory") || return 4
     build_state_relocate_failed_target "$tool" "$version" "$run_id" "$before" \
-        "$target" "$host" "$roots" "$receipt" || return 4
+        "$task_key" "$host" "$roots" "$receipt" || return 4
     build_state_get "$tool" "$version" "$run_id"
 }
 
@@ -14931,6 +15006,68 @@ _act_validate_source_sync_receipt() {
     ' <<< "$receipt"
 }
 
+# Validate source custody using the effective task routes. A platform default
+# can remain in the checkpoint after every variant has moved away from it, so
+# platform hosts are not an authority for the active source-root set.
+_act_validate_strict_task_sources() {
+    local tool="$1" version="$2" run_id="$3" roots="$4" hosts="$5" tasks="$6"
+    local dependencies="$7" validate_cargo="${8:-true}"
+    local expected_hosts actual_hosts source_host configured_path expected_root actual_root
+    local task platform triple key
+    if ! _act_is_uuid "$run_id" ||
+       ! expected_hosts=$(jq -cen --slurpfile hosts /dev/fd/3 --slurpfile tasks /dev/fd/4 '
+         def one: if length == 1 then .[0] else error("exactly one route document required") end;
+         ($hosts | one) as $hosts | ($tasks | one) as $tasks |
+         if ($hosts | type == "object") and ($tasks | type == "array" and length > 0) and
+            (($hosts | keys) == ([$tasks[].key] | sort)) and
+            all($hosts[]; type == "string" and test("^[A-Za-z0-9_-]+$"))
+         then [$hosts[]] | unique | sort else error("invalid effective task routes") end
+       ' 3<<< "$hosts" 4<<< "$tasks") ||
+       ! actual_hosts=$(jq -ces '
+         if length == 1 and (.[0] | type == "object" and all(.[]; type == "string" and length > 0))
+         then .[0] | keys | sort else error("invalid source roots") end
+       ' <<< "$roots") || [[ "$actual_hosts" != "$expected_hosts" ]]; then
+        _log_error "Invalid or incomplete strict source roots for effective task hosts"
+        jq -nc --arg tool "$tool" --arg error "Invalid or incomplete strict source roots" \
+            '{tool: $tool, status: "error", summary: {total: 0, success: 0, failed: 0}, error: $error, targets: []}'
+        return 4
+    fi
+    while IFS= read -r source_host; do
+        configured_path=$(yq -r '.host_paths.'"$source_host"' // ""' \
+            "$ACT_REPOS_DIR/${tool}.yaml" 2>/dev/null) || return 4
+        [[ -n "$configured_path" ]] || configured_path="$ACT_REPO_LOCAL_PATH"
+        if ! expected_root=$(_act_strict_source_root_path "$configured_path" "$tool" "$run_id" "$source_host"); then
+            jq -nc --arg tool "$tool" --arg error "Invalid canonical strict source root" \
+                '{tool: $tool, status: "error", summary: {total: 0, success: 0, failed: 0}, error: $error, targets: []}'
+            return 4
+        fi
+        actual_root=$(jq -r --arg host "$source_host" '.[$host]' <<< "$roots") || return 4
+        if [[ "$actual_root" != "$expected_root" ]]; then
+            _log_error "Strict source root for $source_host is not the canonical fresh path"
+            jq -nc --arg tool "$tool" --arg error "Noncanonical strict source root" \
+                '{tool: $tool, status: "error", summary: {total: 0, success: 0, failed: 0}, error: $error, targets: []}'
+            return 4
+        fi
+        [[ "$validate_cargo" == true && "$ACT_REPO_LANGUAGE" == rust ]] || continue
+        while IFS= read -r task; do
+            platform=$(jq -r '.platform' <<< "$task") || return 4
+            key=$(jq -r '.key' <<< "$task") || return 4
+            triple=""
+            if [[ "$key" != "$platform" ]]; then
+                triple=$(jq -er '.target_triple | strings | select(length > 0)' <<< "$task") || return 4
+            fi
+            if ! _act_validate_strict_target_cargo_source_closure "$tool" "$platform" "$version" \
+                    "$source_host" "$actual_root" "$dependencies" "$triple"; then
+                _log_error "Strict Cargo source closure validation failed for $key on $source_host"
+                jq -nc --arg tool "$tool" --arg error "Cargo source closure does not match pinned dependencies" \
+                    '{tool: $tool, status: "error", summary: {total: 0, success: 0, failed: 0}, error: $error, targets: []}'
+                return 4
+            fi
+        done < <(jq -c --arg host "$source_host" --slurpfile hosts /dev/fd/3 \
+            '.[] | select($hosts[0][.key] == $host)' 3<<< "$hosts" <<< "$tasks")
+    done < <(jq -r '.[]' <<< "$expected_hosts")
+}
+
 act_orchestrate_build() {
     local tool_name="$1"
     local version="$2"
@@ -14938,7 +15075,7 @@ act_orchestrate_build() {
     local targets_arg=()
     local supplied_git_sha="" supplied_git_ref=""
     local supplied_run_id="" source_roots_json="{}"
-    local target_hosts_json='{}'
+    local target_hosts_json='{}' effective_task_hosts_json='{}'
     local source_sync_json="" source_sync_supplied=false no_source_sync_gate=false
     local parallel_jobs=1 resume_run=false supplied_output_dir=""
     local resume_target_host=""
@@ -15215,78 +15352,25 @@ act_orchestrate_build() {
         git_sha="$supplied_git_sha"
         git_ref="$supplied_git_ref"
 
-        # Source synchronization is the host-selection authority. Re-running
-        # the capacity selector here or in workers can select an unsynced host.
-        local expected_native_hosts_json actual_source_hosts_json requested_host_targets
-        # shellcheck disable=SC2086  # one configured target per word
-        requested_host_targets=$(printf '%s\n' $targets | jq -Rsc 'split("\n") | map(select(length > 0)) | sort')
-        if ! expected_native_hosts_json=$(jq -ce --argjson targets "$requested_host_targets" '
-            if type == "object" and (keys | sort) == $targets and
-               all(.[]; type == "string" and test("^[A-Za-z0-9_-]+$"))
-            then [.[]] | unique | sort else error("invalid target host bindings") end
-        ' <<< "$target_hosts_json"); then
+        # Freeze the source-synchronizer's platform routes. A resumed run's
+        # effective task routes are loaded only from its locked checkpoint.
+        if ! jq -en --slurpfile hosts /dev/fd/3 --slurpfile tasks /dev/fd/4 '
+            def one: if length == 1 then .[0] else error("exactly one route document required") end;
+            ($hosts | one) as $hosts | ($tasks | one) as $tasks |
+            ($hosts | type == "object") and
+            (($hosts | keys) == ([$tasks[].platform] | unique | sort)) and
+            all($hosts[]; type == "string" and test("^[A-Za-z0-9_-]+$"))
+        ' 3<<< "$target_hosts_json" 4<<< "$build_tasks_json" >/dev/null; then
             _log_error "Missing or invalid strict target host bindings"
             jq -nc --arg tool "$tool_name" \
                 '{tool: $tool, status: "error", summary: {total: 0, success: 0, failed: 0}, error: "Missing or invalid strict target host bindings", targets: []}'
             return 4
         fi
-        if ! _act_is_uuid "$supplied_run_id" || \
-           ! actual_source_hosts_json=$(jq -c 'if type == "object" and all(.[]; type == "string" and length > 0) then keys | sort else error("invalid source roots") end' \
-                <<< "$source_roots_json" 2>/dev/null) || \
-           ! jq -en --argjson expected "$expected_native_hosts_json" --argjson actual "$actual_source_hosts_json" \
-                '$expected == $actual' >/dev/null 2>&1; then
-            jq -nc --arg tool "$tool_name" --arg error "Invalid or incomplete strict source roots" \
-                '{tool: $tool, status: "error", summary: {total: 0, success: 0, failed: 0}, error: $error, targets: []}'
-            return 4
+        if ! $resume_run; then
+            effective_task_hosts_json=$(jq -cn --slurpfile hosts /dev/fd/3 \
+                'input | map({key:.key,value:$hosts[0][.platform]}) | from_entries' \
+                3<<< "$target_hosts_json" <<< "$build_tasks_json") || return 4
         fi
-
-        local source_host configured_host_path expected_source_root actual_source_root
-        while IFS= read -r source_host; do
-            [[ -n "$source_host" ]] || continue
-            configured_host_path=""
-            if [[ "$source_host" != "act" ]]; then
-                configured_host_path=$(yq -r '.host_paths.'"$source_host"' // ""' \
-                    "$ACT_REPOS_DIR/${tool_name}.yaml" 2>/dev/null)
-            fi
-            [[ -n "$configured_host_path" ]] || configured_host_path="$ACT_REPO_LOCAL_PATH"
-            if ! expected_source_root=$(_act_strict_source_root_path \
-                "$configured_host_path" "$tool_name" "$supplied_run_id" "$source_host"); then
-                jq -nc --arg tool "$tool_name" --arg error "Invalid canonical strict source root" \
-                    '{tool: $tool, status: "error", summary: {total: 0, success: 0, failed: 0}, error: $error, targets: []}'
-                return 4
-            fi
-            actual_source_root=$(jq -r --arg host "$source_host" '.[$host]' <<< "$source_roots_json")
-            if [[ "$actual_source_root" != "$expected_source_root" ]]; then
-                _log_error "Strict source root for $source_host is not the canonical fresh path"
-                jq -nc --arg tool "$tool_name" --arg error "Noncanonical strict source root" \
-                    '{tool: $tool, status: "error", summary: {total: 0, success: 0, failed: 0}, error: $error, targets: []}'
-                return 4
-            fi
-            # A failed host need not remain reachable to replace it. The
-            # locked transition below verifies the replacement's complete
-            # source and Cargo closure before changing state. Still validate
-            # this host when any other target retains its source authority.
-            if [[ -n "$resume_target_host" ]] && jq -en \
-                --argjson hosts "$target_hosts_json" --arg host "$source_host" \
-                --arg target "${resume_target_host%%=*}" \
-                '[$hosts | to_entries[] | select(.value == $host) | .key] == [$target]' >/dev/null; then
-                continue
-            fi
-            if [[ "$ACT_REPO_LANGUAGE" == "rust" ]]; then
-                local metadata_target
-                while IFS= read -r metadata_target; do
-                    if ! _act_validate_strict_target_cargo_source_closure \
-                            "$tool_name" "$metadata_target" "$version" "$source_host" \
-                            "$actual_source_root" "$source_dependency_checkouts_json"; then
-                        _log_error "Strict Cargo source closure validation failed for $metadata_target on $source_host"
-                        jq -nc --arg tool "$tool_name" --arg error "Cargo source closure does not match pinned dependencies" \
-                            '{tool: $tool, status: "error", summary: {total: 0, success: 0, failed: 0}, error: $error, targets: []}'
-                        return 4
-                    fi
-                done < <(jq -r --arg host "$source_host" \
-                    'to_entries[] | select(.value == $host) | .key' <<< "$target_hosts_json")
-            fi
-        done < <(jq -r '.[]' <<< "$expected_native_hosts_json")
     else
         git_sha="$supplied_git_sha"
         git_ref="$supplied_git_ref"
@@ -15356,6 +15440,20 @@ act_orchestrate_build() {
             local resume_state resume_requested_targets_json
             if ! resume_state=$(build_state_get "$tool_name" "$version" "$requested_run_id" 2>/dev/null); then
                 _log_error "Resume state not found for run $requested_run_id"
+                _act_release_orchestration_lock
+                return 4
+            fi
+            # Authenticate the complete relocation chain before deriving a
+            # route or touching a source/cache on any worker. The CLI's
+            # earlier read is only an observation; this checkpoint is locked.
+            if ! build_state_validate_task_host_overrides "$resume_state"; then
+                _log_error "Resume task host overrides have no valid relocation history"
+                _act_release_orchestration_lock
+                return 4
+            fi
+            if $strict_release_contract &&
+               ! effective_task_hosts_json=$(build_state_effective_task_hosts "$resume_state"); then
+                _log_error "Resume effective task host routes are invalid"
                 _act_release_orchestration_lock
                 return 4
             fi
@@ -15457,6 +15555,20 @@ act_orchestrate_build() {
                 return 4
             fi
             run_id="$requested_run_id"
+            if $strict_release_contract; then
+                local validate_resume_cargo=true
+                # Relocation admits every active source after the reviewed
+                # approval and replacement staging, before its atomic write.
+                # The old failed host may be unreachable; this pass checks
+                # canonical custody without attempting worker preparation.
+                [[ -n "$resume_target_host" ]] && validate_resume_cargo=false
+                if ! _act_validate_strict_task_sources "$tool_name" "$version" "$run_id" \
+                        "$source_roots_json" "$effective_task_hosts_json" "$build_tasks_json" \
+                        "$source_dependency_checkouts_json" "$validate_resume_cargo"; then
+                    _act_release_orchestration_lock
+                    return 4
+                fi
+            fi
             if [[ -n "$resume_target_host" ]]; then
                 if ! $strict_release_contract ||
                    ! resume_state=$(_act_relocate_failed_target "$tool_name" "$version" \
@@ -15467,6 +15579,10 @@ act_orchestrate_build() {
                 fi
                 source_roots_json=$(jq -c '.context.source_roots' <<< "$resume_state")
                 target_hosts_json=$(jq -c '.context.target_hosts' <<< "$resume_state")
+                if ! effective_task_hosts_json=$(build_state_effective_task_hosts "$resume_state"); then
+                    _act_release_orchestration_lock
+                    return 4
+                fi
             fi
             if ! $strict_release_contract; then
                 if ! $source_sync_supplied; then
@@ -15507,6 +15623,13 @@ act_orchestrate_build() {
                 _act_release_orchestration_lock
                 return 4
             fi
+            if $strict_release_contract &&
+               ! _act_validate_strict_task_sources "$tool_name" "$version" "$requested_run_id" \
+                    "$source_roots_json" "$effective_task_hosts_json" "$build_tasks_json" \
+                    "$source_dependency_checkouts_json"; then
+                _act_release_orchestration_lock
+                return 4
+            fi
             if ! run_id=$(DSR_RUN_ID="$requested_run_id" \
                 build_state_create "$tool_name" "$version" "${targets// /,}") || \
                [[ "$run_id" != "$requested_run_id" ]] || ! _act_is_uuid "$run_id" || \
@@ -15528,6 +15651,12 @@ act_orchestrate_build() {
         return 4
     else
         run_id="$requested_run_id"
+        if $strict_release_contract &&
+           ! _act_validate_strict_task_sources "$tool_name" "$version" "$run_id" \
+                "$source_roots_json" "$effective_task_hosts_json" "$build_tasks_json" \
+                "$source_dependency_checkouts_json"; then
+            return 4
+        fi
     fi
 
     _log_info "Run ID: $run_id"
@@ -16008,7 +16137,7 @@ act_orchestrate_build() {
             # Freeze fallback selection too when synchronization was opted out.
             :
         elif $strict_release_contract; then
-            host=$(jq -er --arg target "$target" '.[$target]' <<< "$target_hosts_json") || {
+            host=$(jq -er --arg task "$task_key" '.[$task]' <<< "$effective_task_hosts_json") || {
                 _act_refuse_retained_target "Strict target host binding became unavailable for $task_key" "$prior_attempts"
                 break
             }

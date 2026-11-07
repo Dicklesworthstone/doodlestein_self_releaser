@@ -2617,8 +2617,9 @@ OPTIONS:
     -p, --parallel[=N]     Build targets concurrently (default bound: 2)
         --jobs <N>         Explicit target concurrency bound (1-32)
     -r, --resume[=RUN_ID]  Resume latest or selected interrupted build
-    --resume-target-host TARGET=HOST
-                          Relocate one failed strict native target; retain prior attempts
+    --resume-target-host TARGET[@TRIPLE]=HOST
+                          Relocate one failed strict native task; retain prior attempts
+                          Use @TRIPLE to select one variant without changing its recipe
     --resume-target-host-approval FILE
                           Required operator-approved prior/current configuration hashes
     --allow-dirty          Allow building with uncommitted changes
@@ -2980,6 +2981,10 @@ EOF
             log_error "No resumable build state found for $tool_name $version ($resume_selector)"
             return 4
         fi
+        if ! build_state_validate_task_host_overrides "$resume_state"; then
+            log_error "Resume task hosts do not match approved relocation history"
+            return 4
+        fi
         resume_run_id=$(jq -r '.run_id // empty' <<< "$resume_state")
         if ! _act_build_purpose_matches "$(jq -c '.context // {}' <<< "$resume_state")" \
             "$build_purpose" "$build_release_contract_enabled"; then
@@ -3078,6 +3083,18 @@ EOF
                 --arg method "$planned_method" \
                 '$targets + [{platform: $platform, host: $host, method: $method, status: "skipped"}]')
         done
+
+        # A retained variant route belongs to its task, not every task sharing
+        # the physical platform. Show the approved assignments on a read-only
+        # resume without collapsing the completed sibling onto its new host.
+        if $resume && jq -e '.context | has("task_host_overrides")' <<< "$resume_state" >/dev/null; then
+            local planned_task_hosts
+            planned_task_hosts=$(build_state_effective_task_hosts "$resume_state") || return 4
+            planned_targets=$(jq -ce --slurpfile hosts /dev/fd/3 '
+                .context.build_tasks | map({platform, task_key: .key, target_triple,
+                    host: $hosts[0][.key], method, status: "skipped"})
+            ' 3<<< "$planned_task_hosts" <<< "$resume_state") || return 4
+        fi
 
         log_info "[dry-run] Would execute build:"
         log_info "  Tool:       $tool_name"

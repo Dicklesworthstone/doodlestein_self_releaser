@@ -103,7 +103,7 @@
         },
         "target_triple": {
           "type": "string",
-          "description": "Explicit native compiler target triple; platform remains the host-routing identity"
+          "description": "Explicit native compiler target triple; qualified task identities may retain an approved host assignment independently of sibling variants"
         },
         "host": {
           "type": "string",

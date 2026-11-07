@@ -2405,14 +2405,16 @@ fi
 # including successful sibling artifacts and failures before recipe execution.
 # Source snapshots, native Go compilation, collection, state and locks are real;
 # health/slot decisions are controlled local boundaries, not host qualification.
-# --relocation-matrix-only instead uses explicit ELF/PE header producers and a
-# Cargo metadata adapter. It tests the mixed task/state/manifest protocol, not
-# native Rust compilation, libc compatibility, or Windows execution.
+# --relocation-matrix-only and --relocation-variant-only use explicit ELF/PE
+# header producers and a Cargo metadata adapter. They test the task, source,
+# checkpoint and manifest protocol, not native Rust compilation, libc
+# compatibility, or Windows execution.
 test_relocation_recovery() {
     local project_root dependency
     project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" || return 1
     for dependency in python3 git jq yq go rsync tar gzip; do
-        [[ "$dependency" != go || "${1:-}" != --relocation-matrix-only ]] || continue
+        if [[ "$dependency" == go &&
+              ( "${1:-}" == --relocation-matrix-only || "${1:-}" == --relocation-variant-only ) ]]; then continue; fi
         command -v "$dependency" >/dev/null || {
             printf 'Missing relocation integration dependency: %s\n' "$dependency" >&2
             return 77
@@ -2431,7 +2433,8 @@ import tempfile
 
 project = Path(os.environ.get('DSR_TEST_RELOCATION_PROJECT', sys.argv[1]))
 hosts_only = sys.argv[2] == '--relocation-hosts-only'
-matrix_only = sys.argv[2] == '--relocation-matrix-only'
+variant_only = sys.argv[2] == '--relocation-variant-only'
+matrix_only = variant_only or sys.argv[2] == '--relocation-matrix-only'
 root = Path(tempfile.mkdtemp(prefix='dsr-relocation-recovery-'))
 print('Retained relocation recovery evidence: ' + str(root), flush=True)
 systems = {'Linux': 'linux', 'Darwin': 'darwin'}
@@ -2486,7 +2489,8 @@ result = dict(platform=target, target_triple=triple, method='native', host=host,
               # These are controlled protocol fields, not compiler attestation.
               # The actual manifest still enforces their exact source/triple binding.
               cargo_isolation=dict(mode='strict-release-snapshot', toolchain=dict(target_triple=triple)))
-if target in (case / 'failures').read_text().splitlines():
+failed_tasks = (case / 'failures').read_text().splitlines()
+if target in failed_tasks or key in failed_tasks:
     result.update(status='failed', exit_code=6, error='explicit matrix producer failure')
 else:
     output = case / 'matrix-payloads' / phase / key.replace('/', '-')
@@ -2541,9 +2545,11 @@ selector_acquire_slot() {
 }
 selector_release_slot() { :; }
 if [[ "$RELOC_MODE" == matrix ]]; then
-    _act_validate_strict_target_cargo_source_closure() {
-        printf 'CARGO-CLOSURE %s %s\n' "$2" "$4" >> "$RELOC_CASE/boundaries"
-        if [[ "${RELOC_REJECT_REPLACEMENT_CLOSURE:-0}" == 1 && "$4" == replacement ]]; then return 4; fi
+    _act_validate_strict_cargo_source_closure() {
+        local selected
+        selected=$(act_get_build_env_value "$5" CARGO_BUILD_TARGET) || return 4
+        printf 'CARGO-CLOSURE %s %s\n' "$selected" "$1" >> "$RELOC_CASE/boundaries"
+        if [[ "${RELOC_REJECT_REPLACEMENT_CLOSURE:-0}" == 1 && "$1" == replacement ]]; then return 4; fi
     }
     act_run_native_build() {
         python3 "$RELOC_MATRIX_PRODUCER" "$RELOC_CASE" "$2" "${9:-}" "$8" \
@@ -2599,11 +2605,12 @@ fi
 args=(--version 1.0.0 --jobs 2 --output-dir "$RELOC_CASE/output")
 if [[ "$RELOC_PHASE" != first ]]; then
     args+=(--resume="$RELOC_RUN")
-    if [[ "$RELOC_PHASE" != ordinary-resume ]]; then
+    if [[ "$RELOC_PHASE" != ordinary-resume && "$RELOC_PHASE" != ordinary-dry-run ]]; then
         args+=(--resume-target-host "$RELOC_REQUEST"
                --resume-target-host-approval "$RELOC_CASE/approval.json")
     fi
 fi
+if [[ "$RELOC_PHASE" == ordinary-dry-run ]]; then DRY_RUN=true; fi
 cmd_build relocfixture "${args[@]}"
 ''')
 
@@ -2712,7 +2719,8 @@ def state_file(case, run):
 
 def scheduled(state, target):
     task = next(row for row in state['context']['build_tasks'] if row['key'] == target)
-    host = state['context']['target_hosts'][task['platform']]
+    host = state['context'].get('task_host_overrides', {}).get(target,
+        state['context']['target_hosts'][task['platform']])
     return dict(run_id=state['run_id'], git_sha=state['git_sha'], git_ref=state['git_ref'],
                 host=host, root=state['context']['source_roots'][host])
 
@@ -2750,9 +2758,10 @@ def approve(case, env, target, replacement, label):
     config_path = case / 'config/repos.d/relocfixture.yaml'
     prior = case / (label + '.prior.yaml')
     prior.write_bytes(config_path.read_bytes())
-    config = read(config_path)
-    config['cross_compile'][target]['host'] = replacement
-    save(config_path, config)
+    if '@' not in target:
+        config = read(config_path)
+        config['cross_compile'][target]['host'] = replacement
+        save(config_path, config)
     save(case / 'approval.json', dict(run_id=env['RELOC_RUN'], target=target, new_host=replacement,
         prior_repo_config_path=str(prior), prior_repo_config_sha256=digest(prior),
         repo_config_sha256=digest(config_path), hosts_config_sha256=digest(Path(env['DSR_HOSTS_FILE']))))
@@ -2808,7 +2817,7 @@ def mutate_evidence(transform):
     return change
 
 
-if matrix_only:
+if matrix_only and not variant_only:
     case, env, targets = fixture('mixed-matrix', 'matrix')
     code, first = invoke(case, env, 'first')
     details = first.get('details', {})
@@ -2892,7 +2901,7 @@ if matrix_only:
           code == 4 and path.read_bytes() == before_state and events(case) == before_events and unchanged(evidence))
     check('mixed matrix: controlled replacement Cargo refusal follows actual source staging',
           (case / 'replacement').is_dir() and
-          ('CARGO-CLOSURE ' + failed + ' replacement') in (case / 'boundaries').read_text().splitlines())
+          'CARGO-CLOSURE x86_64-pc-windows-msvc replacement' in (case / 'boundaries').read_text().splitlines())
     env.pop('RELOC_REJECT_REPLACEMENT_CLOSURE')
 
     # Keep the replacement recipe failing once: this proves a later ordinary
@@ -2941,6 +2950,210 @@ if matrix_only:
               sorted(row.get('target_triple', '') for row in manifest.get('build_environments', [])) == expected_triples and
               all(row['host'] == ('replacement' if row['target'] == failed else 'completed')
                   for row in manifest.get('build_environments', [])) and
+              all(digest(case / 'output' / row['name']) == row['sha256'] for row in manifest.get('artifacts', [])))
+
+
+if variant_only:
+    case, env, targets = fixture('qualified-variant', 'matrix')
+    gnu_key, musl_key = native + '@' + gnu, native + '@' + musl
+    expected_keys, sibling_keys = [gnu_key, musl_key, failed], [gnu_key, failed]
+    (case / 'failures').write_text(musl_key + '\n')
+    code, first = invoke(case, env, 'first')
+    details = first.get('details', {})
+    if not check('qualified variant: production dispatch retains two completed siblings and one failed variant',
+                 code == 1 and details.get('success') == 2 and details.get('failed') == 1):
+        print((case / 'first.stderr').read_text()[-6000:], flush=True)
+        raise AssertionError('Controlled variant producer did not reach the intended outcomes')
+    env['RELOC_RUN'] = details['run_id']
+    path = state_file(case, env['RELOC_RUN'])
+    initial = read(path)
+    (case / 'first.state.json').write_bytes(path.read_bytes())
+    config_path = case / 'config/repos.d/relocfixture.yaml'
+    original_hash = digest(config_path)
+    check('qualified variant: immutable task inventory binds all actual worker receipts to their initial hosts',
+          [row['key'] for row in initial['context']['build_tasks']] == expected_keys and
+          initial['context']['native_matrix_config_sha256'] == original_hash and
+          all(row['attempts'] == 1 for row in initial['target_statuses'].values()) and
+          all(read(Path(row['result_path'])).get('scheduled_source') == scheduled(initial, key)
+              for key, row in initial['target_statuses'].items()))
+    evidence = retained(initial)
+    approve(case, env, musl_key, 'replacement', 'first-variant-move')
+    check('qualified variant: reviewed approval leaves repository configuration byte-identical',
+          digest(config_path) == original_hash and
+          read(case / 'approval.json')['prior_repo_config_sha256'] == original_hash and
+          read(case / 'approval.json')['repo_config_sha256'] == original_hash)
+
+    def refuse_variant(label, mutate, phase='resume', request=None):
+        receipt = Path(initial['target_statuses'][musl_key]['result_path'])
+        success = Path(initial['target_statuses'][gnu_key]['result']['artifact_path'])
+        owned = [path, receipt, success, case / 'approval.json', config_path,
+                 Path(env['DSR_HOSTS_FILE']), case / 'source/src/main.rs']
+        originals = {item:item.read_bytes() for item in owned}
+        before_events, original_request = events(case), env['RELOC_REQUEST']
+        try:
+            if request is not None:
+                env['RELOC_REQUEST'] = request
+                selector, destination = request.rsplit('=', 1)
+                approval = read(case / 'approval.json')
+                approval.update(target=selector, new_host=destination)
+                save(case / 'approval.json', approval)
+            mutate(path, receipt, success)
+            injected = {item:item.read_bytes() for item in owned}
+            code, unused = invoke(case, env, phase, label, preflight_exit=4)
+            check(label + ': refuses before new source staging, compiler execution or checkpoint mutation',
+                  code == 4 and events(case) == before_events and not (case / 'replacement').exists() and
+                  all(item.read_bytes() == value for item, value in injected.items()))
+        finally:
+            for item, value in originals.items():
+                item.write_bytes(value)
+            env['RELOC_REQUEST'] = original_request
+
+    for label, selector, destination in (
+            ('ambiguous-platform', native, 'replacement'),
+            ('completed-sibling', gnu_key, 'replacement'),
+            ('unknown-triple', native + '@x86_64-unknown-linux-unknown', 'replacement'),
+            ('two-triple-separators', musl_key + '@extra', 'replacement'),
+            ('unsafe-triple', native + '@../../escape', 'replacement'),
+            ('unconfigured-host', musl_key, 'missing'),
+            ('unchanged-host', musl_key, 'completed')):
+        refuse_variant('qualified-' + label, lambda *unused: None, request=selector + '=' + destination)
+
+    def changed_recipe(unused_path, unused_receipt, unused_success):
+        config = read(config_path)
+        config['cross_compile'][native]['env'] = {'RUSTFLAGS': '-C opt-level=1'}
+        save(config_path, config)
+        approval = read(case / 'approval.json')
+        approval['repo_config_sha256'] = digest(config_path)
+        save(case / 'approval.json', approval)
+    refuse_variant('qualified-changed-shared-recipe', changed_recipe)
+
+    def wrong_platform(unused_path, unused_receipt, unused_success):
+        hosts_path = Path(env['DSR_HOSTS_FILE'])
+        hosts = read(hosts_path)
+        hosts['hosts']['replacement']['platform'] = 'linux/arm64'
+        save(hosts_path, hosts)
+        approval = read(case / 'approval.json')
+        approval['hosts_config_sha256'] = digest(hosts_path)
+        save(case / 'approval.json', approval)
+    refuse_variant('qualified-cross-platform-host', wrong_platform)
+    refuse_variant('qualified-corrupt-completed-sibling',
+        lambda unused_path, unused_receipt, success: success.write_bytes(success.read_bytes() + b'corrupt'))
+    refuse_variant('qualified-dirty-source',
+        lambda *unused: (case / 'source/src/main.rs').write_text('fn main() { panic!("dirty"); }\n'))
+    for label, overrides in (
+            ('null', None), ('list', []),
+            ('unknown-task', {native + '@unknown':'replacement'}),
+            ('bare-platform', {native:'replacement'}),
+            ('unapproved-existing-host', {musl_key:'original'}),
+            ('unapproved-completed-sibling', {gnu_key:'replacement'})):
+        def forged_override(state_path, unused_receipt, unused_success, value=overrides):
+            state = read(state_path)
+            state['context']['task_host_overrides'] = value
+            save(state_path, state)
+        refuse_variant('qualified-forged-' + label, forged_override, phase='ordinary-resume')
+
+    # Only the Cargo metadata decision is controlled. The immutable replacement
+    # tree is genuinely staged before this refusal, while admission remains atomic.
+    before_state, before_events = path.read_bytes(), events(case)
+    env['RELOC_REJECT_REPLACEMENT_CLOSURE'] = '1'
+    code, unused = invoke(case, env, 'resume', 'qualified-failed-source-admission', preflight_exit=4)
+    check('qualified variant: failed source admission preserves checkpoint, attempts and sibling bytes',
+          code == 4 and path.read_bytes() == before_state and events(case) == before_events and unchanged(evidence))
+    check('qualified variant: controlled closure refusal follows genuine replacement source staging',
+          any(item.is_file() for item in (case / 'replacement').rglob('main.rs')) and
+          ('CARGO-CLOSURE ' + musl + ' replacement') in (case / 'boundaries').read_text().splitlines())
+    env.pop('RELOC_REJECT_REPLACEMENT_CLOSURE')
+
+    # The selected variant still fails on its first replacement attempt.
+    code, resumed = invoke(case, env, 'resume', 'qualified-relocation')
+    middle = read(path)
+    relocated = check('qualified variant: one approved task override preserves the original run and recipe',
+          code == 1 and resumed.get('details', {}).get('run_id') == initial['run_id'] and
+          middle['status'] == 'partial' and
+          middle['context'].get('task_host_overrides') == {musl_key:'replacement'} and
+          middle['context']['target_hosts'] == initial['context']['target_hosts'] and
+          middle['context']['native_matrix_config_sha256'] == original_hash and digest(config_path) == original_hash and
+          len(middle.get('relocations', [])) == 1 and
+          middle['relocations'][0].get('task_key') == musl_key and
+          middle['relocations'][0].get('target_triple') == musl and
+          middle['relocations'][0]['prior_target'] == initial['target_statuses'][musl_key])
+    check('qualified variant: only the selected task consumes a second attempt',
+          events(case) == before_events + [musl_key] and middle['target_statuses'][musl_key]['attempts'] == 2 and
+          all(middle['target_statuses'][key] == initial['target_statuses'][key] for key in sibling_keys) and
+          unchanged(evidence))
+    check('qualified variant: replacement source admission never evaluates the completed GNU sibling there',
+          ('CARGO-CLOSURE ' + gnu + ' replacement') not in (case / 'boundaries').read_text().splitlines())
+    if relocated:
+        partial_evidence = retained(middle)
+        before_state, before_events = path.read_bytes(), events(case)
+        code, preview = invoke(case, env, 'ordinary-dry-run', 'qualified-dry-run')
+        rows = preview.get('details', {}).get('targets', [])
+        expected_hosts = {gnu_key:'completed', musl_key:'replacement', failed:'original'}
+        check('qualified variant: ordinary dry-run reports split effective hosts without mutating the checkpoint',
+              code == 0 and isinstance(rows, list) and len(rows) == 3 and
+              {row.get('task_key'):row.get('host') for row in rows} == expected_hosts and
+              {row.get('task_key'):row.get('target_triple') for row in rows} ==
+                  {gnu_key:gnu, musl_key:musl, failed:'x86_64-pc-windows-msvc'} and
+              path.read_bytes() == before_state and events(case) == before_events and unchanged(partial_evidence))
+
+        forged = read(path)
+        forged['context']['task_host_overrides'][musl_key] = 'original'
+        save(path, forged)
+        injected = path.read_bytes()
+        code, unused = invoke(case, env, 'ordinary-resume', 'qualified-forged-replay', preflight_exit=4)
+        check('qualified variant: approved history cannot authorize a different later task route',
+              code == 4 and path.read_bytes() == injected and events(case) == before_events and unchanged(partial_evidence))
+        path.write_bytes(before_state)
+
+        code, ordinary = invoke(case, env, 'ordinary-resume', 'qualified-ordinary-failure')
+        failed_again = read(path)
+        check('qualified variant: ordinary resume reuses the approved host and consumes the third attempt',
+              code == 1 and ordinary.get('details', {}).get('run_id') == initial['run_id'] and
+              failed_again['target_statuses'][musl_key]['attempts'] == 3 and
+              failed_again['context']['task_host_overrides'] == {musl_key:'replacement'} and
+              events(case) == before_events + [musl_key] and
+              read(Path(failed_again['target_statuses'][musl_key]['result_path']))['scheduled_source'] ==
+                  scheduled(failed_again, musl_key) and
+              all(failed_again['target_statuses'][key] == initial['target_statuses'][key] for key in sibling_keys) and
+              unchanged(evidence) and unchanged(partial_evidence))
+        failed_evidence = retained(failed_again)
+        approve(case, env, musl_key, 'second', 'second-variant-move')
+        (case / 'failures').write_text('')
+        before_events = events(case)
+        code, result = invoke(case, env, 'resume', 'qualified-completion')
+        final = read(path)
+        check('qualified variant: second relocation completes the same task with its original retry budget',
+              code == 0 and result.get('details', {}).get('run_id') == initial['run_id'] and
+              final['status'] == 'completed' and final['target_statuses'][musl_key]['attempts'] == 4 and
+              events(case) == before_events + [musl_key] and
+              final['context']['task_host_overrides'] == {musl_key:'second'} and
+              final['context']['target_hosts'] == initial['context']['target_hosts'] and
+              final['context']['native_matrix_config_sha256'] == original_hash and digest(config_path) == original_hash and
+              len(final.get('relocations', [])) == 2 and
+              final['relocations'][1]['old_host'] == 'replacement' and
+              final['relocations'][1]['prior_target'] == failed_again['target_statuses'][musl_key] and
+              all(final['target_statuses'][key] == initial['target_statuses'][key] for key in sibling_keys) and
+              unchanged(evidence) and unchanged(partial_evidence) and unchanged(failed_evidence))
+        check('qualified variant: active source custody drops only the unused intermediate destination',
+              set(final['context']['source_roots']) == {'completed', 'original', 'second'} and
+              'replacement' in final['relocations'][1]['prior_context']['source_roots'] and
+              read(Path(final['target_statuses'][musl_key]['result_path']))['scheduled_source'] ==
+                  scheduled(final, musl_key))
+        rows = result.get('details', {}).get('targets', [])
+        check('qualified variant: final public output reports each actual execution host',
+              isinstance(rows, list) and len(rows) == 3 and
+              {row.get('task_key'):row.get('host') for row in rows} ==
+                  {gnu_key:'completed', musl_key:'second', failed:'original'})
+        manifest_path = case / 'output/relocfixture-v1.0.0-manifest.json'
+        manifest = read(manifest_path) if manifest_path.exists() else {}
+        expected_triples = sorted([gnu, musl, 'x86_64-pc-windows-msvc'])
+        check('qualified variant: final manifest binds every retained artifact to its exact variant and real host',
+              manifest.get('publishable') is True and manifest.get('run_id') == initial['run_id'] and
+              manifest.get('summary') == dict(total=3, success=3, failed=0) and
+              sorted(row.get('target_triple', '') for row in manifest.get('artifacts', [])) == expected_triples and
+              sorted(row.get('target_triple', '') for row in manifest.get('build_environments', [])) == expected_triples and
+              {row['target_triple']:row['host'] for row in manifest.get('build_environments', [])} ==
+                  {gnu:'completed', musl:'second', 'x86_64-pc-windows-msvc':'original'} and
               all(digest(case / 'output' / row['name']) == row['sha256'] for row in manifest.get('artifacts', [])))
 
 
@@ -3144,7 +3357,7 @@ PY
 }
 
 if [[ "${1:-}" == --relocation-recovery-only || "${1:-}" == --relocation-hosts-only ||
-      "${1:-}" == --relocation-matrix-only ]]; then
+      "${1:-}" == --relocation-matrix-only || "${1:-}" == --relocation-variant-only ]]; then
     test_relocation_recovery "$1"
     exit $?
 fi
@@ -7980,6 +8193,13 @@ case "$relocation_matrix_status" in
     0) pass "reviewed singleton relocation preserves completed native variants and updates their matrix configuration binding" ;;
     77) skip "mixed relocation integration requires its local fixture dependencies" ;;
     *) fail "mixed native matrix could not safely relocate its failed singleton target" ;;
+esac
+relocation_variant_status=0
+test_relocation_recovery --relocation-variant-only || relocation_variant_status=$?
+case "$relocation_variant_status" in
+    0) pass "reviewed exact-variant relocation preserves siblings, recipe custody and retry budgets across repeated resume" ;;
+    77) skip "qualified variant relocation integration requires its local fixture dependencies" ;;
+    *) fail "qualified native variant relocation lost task, source, retry or manifest authority" ;;
 esac
 
 if test_worker_group_lifecycle; then
