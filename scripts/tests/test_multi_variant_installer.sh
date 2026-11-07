@@ -121,8 +121,8 @@ MOCK_LIBC=gnu run_install
 check 'GNU host selects GNU although musl is listed first' installed gnu
 MOCK_LIBC=musl run_install
 check 'nonzero stderr musl ldd selects musl' installed musl
-gnu_cache="$cache/demo/v1.2.3/linux-amd64-x86_64-unknown-linux-gnu.tar.gz"
-musl_cache="$cache/demo/v1.2.3/linux-amd64-x86_64-unknown-linux-musl.tar.gz"
+gnu_cache="$cache/demo/example/demo/v1.2.3/linux-amd64-x86_64-unknown-linux-gnu/tar.gz/demo-1.2.3-x86_64-unknown-linux-gnu.tar.gz/payload"
+musl_cache="$cache/demo/example/demo/v1.2.3/linux-amd64-x86_64-unknown-linux-musl/tar.gz/demo-1.2.3-x86_64-unknown-linux-musl.tar.gz/payload"
 check 'GNU cached under selected full triple' cmp -s "$gnu_cache" "$REMOTE/demo-1.2.3-x86_64-unknown-linux-gnu.tar.gz"
 check 'musl cached independently under its full triple' cmp -s "$musl_cache" "$REMOTE/demo-1.2.3-x86_64-unknown-linux-musl.tar.gz"
 before=$(wc -l < "$CALLS")
@@ -165,7 +165,7 @@ cache="$work/explicit-fallback-cache"
 MOCK_LIBC=gnu WITHHELD_TRIPLE=gnu run_install
 check 'explicit GNU-to-musl availability fallback installs actual musl executable' installed musl
 check 'fallback cache uses the selected musl identity' cmp -s \
-    "$cache/demo/v1.2.3/linux-amd64-x86_64-unknown-linux-musl.tar.gz" "$REMOTE/demo-1.2.3-x86_64-unknown-linux-musl.tar.gz"
+    "$cache/demo/example/demo/v1.2.3/linux-amd64-x86_64-unknown-linux-musl/tar.gz/demo-1.2.3-x86_64-unknown-linux-musl.tar.gz/payload" "$REMOTE/demo-1.2.3-x86_64-unknown-linux-musl.tar.gz"
 before=$(wc -l < "$CALLS")
 MOCK_LIBC=gnu run_install --offline
 check 'explicit fallback can reuse its own verified musl cache offline' installed musl

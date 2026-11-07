@@ -158,6 +158,37 @@ install_source_build owner/repo refs/tags/v1.2.3 go app ./new-build \
   --allow-build --install-toolchain --timeout 3600
 ```
 
+## Repository-bound release caches
+
+Ordinary installers reuse a cached release only for the same configured tool,
+repository, exact release tag, platform/compiler variant, archive format and
+literal asset name. A checksum sidecar authenticates the cached bytes against
+that sidecar; it cannot establish which repository originally supplied them.
+Keeping these identities in separate cache paths prevents another repository
+with the same tool name and version from supplying a cache hit. Changing an
+exact asset name within the same release also selects a separate cache entry.
+Each asset owns its payload and sidecars in a separate directory, including
+when a literal payload name ends in `.sha256` or `.minisig`.
+
+Verified archives and their checksum/signature evidence remain reusable with
+`--offline --version TAG`. Different repositories and asset names can share
+`--cache-dir` without replacing each other's entries. Every reuse still checks
+the actual payload checksum and the configured Minisign policy, and a failed
+integrity check remains terminal rather than triggering a different download.
+
+Older tool/version/platform-only caches are retained but are not automatically
+adopted because they do not record this origin selection. An online install
+populates the bound cache; a subsequent offline install reuses it. An explicit
+`--offline ARCHIVE` remains an independent local selection and requires its
+matching checksum evidence and any configured signature.
+
+The focused regression runs actual generated installers against distinct
+archive bytes with a shared cache; only the remote transport is a fixture:
+
+```bash
+bash scripts/tests/test_generated_installer_integrity.sh --cache-identity-only
+```
+
 ## Installation transactions and concurrent installers
 
 Generated ordinary installers serialize changes to each installation directory.

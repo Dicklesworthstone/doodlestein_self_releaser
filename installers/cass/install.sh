@@ -1939,12 +1939,18 @@ _get_archive_format() {
 # CACHE FUNCTIONS
 # ============================================================================
 
-# Get cache path for a specific version/platform
+# A checksum proves the cached bytes match their sidecar, not which repository
+# supplied them. Bind cache selection to the exact repository, release asset,
+# platform/ABI and interpretation before consulting any locally saved evidence.
+# Each asset owns its sidecars, so another asset ending in .sha256 or .minisig
+# cannot overwrite its evidence. Unscoped older entries are not adopted.
 _cache_path() {
     local version="$1"
     local platform="$2"
     local format="$3"
-    echo "${_CACHE_DIR}/${TOOL_NAME}/${version}/${platform//\//-}.${format}"
+    local asset="${4:-}"
+    [[ "$asset" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ && "$asset" != *..* ]] || return 4
+    echo "${_CACHE_DIR}/${TOOL_NAME}/${REPO}/${version}/${platform//\//-}/${format}/${asset}/payload"
 }
 
 # Check if cached archive exists
@@ -1952,8 +1958,9 @@ _cache_get() {
     local version="$1"
     local platform="$2"
     local format="$3"
+    local asset="$4"
     local cache_file
-    cache_file=$(_cache_path "$version" "$platform" "$format")
+    cache_file=$(_cache_path "$version" "$platform" "$format" "$asset") || return $?
 
     if [[ -f "$cache_file" && ! -L "$cache_file" && -s "$cache_file" ]]; then
         _log_info "Using cached archive: $cache_file"
@@ -1970,8 +1977,9 @@ _cache_put() (
     local version="$2"
     local platform="$3"
     local format="$4"
+    local asset="$5"
     local cache_file
-    cache_file=$(_cache_path "$version" "$platform" "$format")
+    cache_file=$(_cache_path "$version" "$platform" "$format" "$asset") || return $?
     local cache_dir
     cache_dir=$(dirname "$cache_file")
 
@@ -3310,7 +3318,7 @@ main() {
         if [[ -n "$_OFFLINE_ARCHIVE" ]]; then
             _copy_local_archive "$_OFFLINE_ARCHIVE" "$archive_file" || return $?
             _log_info "Using offline archive: $_OFFLINE_ARCHIVE"
-        elif cached_file=$(_cache_get "$_VERSION" "$cache_platform" "$format"); then
+        elif cached_file=$(_cache_get "$_VERSION" "$cache_platform" "$format" "$asset_name"); then
             _copy_local_archive "$cached_file" "$archive_file" || return $?
         elif $_OFFLINE_MODE; then
             _log_warn "Offline mode: no cached archive for $TOOL_NAME $_VERSION ($_TARGET_TRIPLE)"
@@ -3368,7 +3376,7 @@ main() {
         esac
     fi
     if ! $_OFFLINE_MODE; then
-        _cache_put "$archive_file" "$_VERSION" "$cache_platform" "$format" || \
+        _cache_put "$archive_file" "$_VERSION" "$cache_platform" "$format" "$asset_name" || \
             _log_warn "Could not cache verified archive"
     fi
 

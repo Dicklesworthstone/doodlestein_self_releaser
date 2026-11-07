@@ -189,7 +189,7 @@ for tool in bv cass ntm; do
     check "$tool installed executable runs" "$case_dir/bin/$tool" --version
     check "$tool downloads its preserved release asset name" grep -Fxq "https://github.com/$route/$asset" "$case_dir/transport.log"
     check "$tool downloads checksum evidence by default" grep -Fxq "https://github.com/$route/$asset.sha256" "$case_dir/transport.log"
-    cached="$cache/$tool/v1.2.3/$os-$arch.tar.gz"
+    cached="$cache/$tool/Dicklesworthstone/$repository/v1.2.3/$os-$arch/tar.gz/$asset/payload"
     check "$tool caches the verified archive" cmp -s "$archive" "$cached"
     check "$tool caches checksum evidence" cmp -s "$archive.sha256" "$cached.sha256"
 
@@ -205,12 +205,12 @@ for tool in bv cass ntm; do
     run_install missing "$work/$tool-missing-cache" missing
     check "$tool default installation rejects missing release checksums" blocked
     check "$tool missing-checksum failure identifies the integrity requirement" grep -q 'No release checksums available' "$case_dir/err"
-    check "$tool never caches an unverified download" test ! -e "$work/$tool-missing-cache/$tool/v1.2.3/$os-$arch.tar.gz"
+    check "$tool never caches an unverified download" test ! -e "$work/$tool-missing-cache/$tool/Dicklesworthstone/$repository/v1.2.3/$os-$arch/tar.gz/$asset/payload"
 
     run_install tampered "$work/$tool-tampered-cache" tampered
     check "$tool default installation rejects an altered valid archive" blocked
     check "$tool tampered download fails at checksum verification" grep -q 'Checksum mismatch' "$case_dir/err"
-    check "$tool never caches a tampered download" test ! -e "$work/$tool-tampered-cache/$tool/v1.2.3/$os-$arch.tar.gz"
+    check "$tool never caches a tampered download" test ! -e "$work/$tool-tampered-cache/$tool/Dicklesworthstone/$repository/v1.2.3/$os-$arch/tar.gz/$asset/payload"
 
     run_install local-missing "$work/$tool-local-missing-cache" offline --offline "$work/remote/missing/$route/$asset"
     check "$tool offline archive requires checksum evidence" blocked

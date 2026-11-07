@@ -3,8 +3,8 @@
 # Real tar archives and SHA256; only remote transports/minisign failure are fixtures.
 set -uo pipefail
 case "$#:${1:-}" in
-    0:|1:--static-go-only|1:--static-go-routing-only|1:--strict-contracts-only|1:--credential-routing-only) ;;
-    *) printf 'Usage: %s [--static-go-only|--static-go-routing-only|--strict-contracts-only|--credential-routing-only]\n' "$0" >&2; exit 4 ;;
+    0:|1:--static-go-only|1:--static-go-routing-only|1:--strict-contracts-only|1:--credential-routing-only|1:--cache-identity-only) ;;
+    *) printf 'Usage: %s [--static-go-only|--static-go-routing-only|--strict-contracts-only|--credential-routing-only|--cache-identity-only]\n' "$0" >&2; exit 4 ;;
 esac
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-install-integrity.XXXXXXXX") || exit 1
@@ -147,8 +147,111 @@ else
     legacy_bash='' legacy_version=''
 fi
 success() { [[ $status -eq 0 && -x "$case_dir/bin/demo" ]] && jq -es 'length == 1 and .[0].status == "success"' "$case_dir/out" >/dev/null; }
-blocked() { [[ $status -ne 0 && ! -e "$case_dir/bin/demo" && ! -e "$case_dir/cache/demo/v1.2.3/$os-$arch.tar.gz" ]]; }
+blocked() { [[ $status -ne 0 && ! -e "$case_dir/bin/demo" && ! -e "$case_dir/cache/demo/example/demo/v1.2.3/$os-$arch/tar.gz/$asset/payload" ]]; }
 set_manifest() { printf '%s\n' "$1" > "$REMOTE/checksums.sha256"; }
+
+# Two installers may use the same tool/version/platform labels while selecting
+# different repositories or literal release names. Exercise the complete public
+# generated scripts with distinct real archives and one shared download cache.
+test_installer_cache_identity() {
+    local identity_root="$work/cache-identity" identity_config="$DSR_CONFIG_DIR/repos.d/cache-demo.yaml"
+    local shared_cache="$work/cache-identity/cache" label configured_repo pattern generated
+    local first_installer second_installer renamed_installer identity_case identity_status
+    local identity_asset="cache-demo-1.2.3-$os-$arch.tar.gz" renamed_asset="cache-demo-1.2.3-$os-$arch.tar.gz.sha256"
+    local REMOTE CALLS CURL_FAIL=0 GH_FAIL=1
+    export REMOTE CALLS CURL_FAIL GH_FAIL
+    mkdir -p "$identity_root" || return 1
+    for label in first second renamed; do
+        mkdir -p "$identity_root/$label/payload" || return 1
+        printf '#!/bin/sh\nprintf "%%s\\n" "%s repository bytes"\n' "$label" > "$identity_root/$label/payload/demo"
+        chmod 755 "$identity_root/$label/payload/demo" || return 1
+        configured_repo=example/cache-first
+        pattern='${name}-${version}-${os}-${arch}'
+        [[ "$label" == first ]] || configured_repo=example/cache-second
+        if [[ "$label" == renamed ]]; then
+            # A valid literal payload name can look like another payload's
+            # checksum sidecar. Their cached namespaces must remain disjoint.
+            pattern='${name}-${version}-${os}-${arch}.${ext}.sha256'
+            generated="$renamed_asset"
+        else
+            generated="$identity_asset"
+        fi
+        tar -czf "$identity_root/$label/$generated" -C "$identity_root/$label/payload" demo || return 1
+        printf '%s  %s\n' "$(sha256sum < "$identity_root/$label/$generated" | awk '{print $1}')" "$generated" \
+            > "$identity_root/$label/$generated.sha256"
+        cat > "$identity_config" <<CONFIG
+tool_name: cache-demo
+repo: $configured_repo
+binary_name: demo
+language: rust
+artifact_naming: $pattern
+CONFIG
+        generated=$(_IG_OUTPUT_DIR="$identity_root/generated-$label" install_gen_create cache-demo \
+            --config-dir "$DSR_CONFIG_DIR" 2> "$identity_root/$label/generation.log") || return 1
+        case "$label" in
+            first) first_installer="$generated" ;;
+            second) second_installer="$generated" ;;
+            renamed) renamed_installer="$generated" ;;
+        esac
+    done
+    cache_identity_install() {
+        local label="$1" selected="$2" origin="$3"; shift 3
+        identity_case="$identity_root/$label"
+        mkdir -p "$identity_case" || return 1
+        REMOTE="$identity_root/$origin" CALLS="$identity_case/calls"
+        : > "$CALLS"
+        identity_status=0
+        bash "$selected" --version v1.2.3 --dir "$identity_case/bin" --cache-dir "$shared_cache" \
+            --non-interactive --json --no-skills "$@" > "$identity_case/out" 2> "$identity_case/err" || identity_status=$?
+    }
+    cache_identity_success() {
+        [[ "$identity_status" == 0 ]] &&
+            jq -es 'length == 1 and .[0].status == "success"' "$identity_case/out" >/dev/null &&
+            cmp -s "$identity_root/$1/payload/demo" "$identity_case/bin/demo"
+    }
+    cache_identity_refused() {
+        [[ "$identity_status" != 0 && ! -e "$identity_case/bin/demo" ]] &&
+            jq -es 'length == 1 and .[0].status == "error"' "$identity_case/out" >/dev/null
+    }
+
+    cache_identity_install first-online "$first_installer" first
+    check 'first repository installs and populates the shared cache' cache_identity_success first
+    check 'first repository payload is acquired from its own release URL' \
+        grep -qF "https://github.com/example/cache-first/releases/download/v1.2.3/$identity_asset" "$CALLS"
+    cache_identity_install second-offline-missing "$second_installer" second --offline
+    check 'another repository cannot install the first repository cache offline' cache_identity_refused
+    check 'foreign offline cache refusal makes no network request' test ! -s "$CALLS"
+    cache_identity_install second-online "$second_installer" second
+    check 'same tool and version from another repository installs that repository bytes' cache_identity_success second
+    check 'foreign cache cannot suppress acquisition from the selected repository' \
+        grep -qF "https://github.com/example/cache-second/releases/download/v1.2.3/$identity_asset" "$CALLS"
+    for label in first second; do
+        if [[ "$label" == first ]]; then generated="$first_installer"; else generated="$second_installer"; fi
+        cache_identity_install "$label-offline" "$generated" "$label" --offline
+        check "$label repository retains its own verified offline cache" cache_identity_success "$label"
+        check "$label repository offline reuse makes no network request" test ! -s "$CALLS"
+    done
+    cache_identity_install renamed-offline-missing "$renamed_installer" renamed --offline
+    check 'a different exact asset cannot reuse the previous asset cache offline' cache_identity_refused
+    check 'unavailable exact asset makes no offline network request' test ! -s "$CALLS"
+    cache_identity_install renamed-online "$renamed_installer" renamed
+    check 'new exact asset name on the same repository is acquired and installed' cache_identity_success renamed
+    check 'prior asset cache cannot suppress acquisition of the selected literal asset' \
+        grep -qF "https://github.com/example/cache-second/releases/download/v1.2.3/$renamed_asset" "$CALLS"
+    cache_identity_install renamed-offline "$renamed_installer" renamed --offline
+    check 'renamed exact asset retains verified offline reuse' cache_identity_success renamed
+    check 'renamed exact asset offline reuse makes no network request' test ! -s "$CALLS"
+    cache_identity_install second-offline-after-rename "$second_installer" second --offline
+    check 'sidecar-shaped payload name cannot overwrite the prior asset evidence' cache_identity_success second
+    check 'previous literal asset reuse remains offline' test ! -s "$CALLS"
+}
+
+if [[ "${1:-}" == --cache-identity-only ]]; then
+    test_installer_cache_identity || exit 1
+    printf 'Installer cache identity: %s passed, %s failed\n' "$passed" "$failed"
+    [[ $failed -eq 0 ]]
+    exit $?
+fi
 
 # The generated entry point must use one account for discovery, payloads,
 # checksums, signatures and freshness. Only the CLI/HTTP boundary is fake;
@@ -372,7 +475,7 @@ SH
                 check "$label installs only the checksum-verified protocol fixture" \
                     cmp -s "$work/payload/demo" "$routing_case/bin/demo"
                 check "$label uses the portable cache namespace" cmp -s "$REMOTE/$routing_asset" \
-                    "$routing_case/cache/go-routing/v1.2.3/linux-$arch-cgo-disabled.tar.gz"
+                    "$routing_case/cache/go-routing/example/go-routing/v1.2.3/linux-$arch-cgo-disabled/tar.gz/$routing_asset/payload"
                 ;;
         esac
     done
@@ -488,7 +591,7 @@ SH
     check 'CGO-disabled Go release installs on a musl host' static_success
     check 'static Go selection needs no libc probe or compiler' bash -c '! grep -q "^libc \|compiler" "$1"' _ "$CALLS"
     check 'static Go archive uses a cache separate from generic GNU artifacts' \
-        cmp -s "$REMOTE/$static_asset" "$static_cache/portable-go/v1.2.3/linux-$arch-cgo-disabled.tar.gz"
+        cmp -s "$REMOTE/$static_asset" "$static_cache/portable-go/example/portable-go/v1.2.3/linux-$arch-cgo-disabled/tar.gz/$static_asset/payload"
     for MOCK_GO_LIBC in gnu unknown musl; do
         static_install --offline
         check "verified static Go cache installs with $MOCK_GO_LIBC libc" static_success
@@ -504,7 +607,7 @@ SH
     static_install
     check 'musl install acquires the configured Go release instead of adopting an old generic cache' static_success
     check 'legacy cache selection cannot suppress release acquisition' grep -q "$static_asset" "$CALLS"
-    printf 'corruption\n' >> "$static_cache/portable-go/v1.2.3/linux-$arch-cgo-disabled.tar.gz"
+    printf 'corruption\n' >> "$static_cache/portable-go/example/portable-go/v1.2.3/linux-$arch-cgo-disabled/tar.gz/$static_asset/payload"
     static_install --offline
     check 'corrupted portable Go cache still fails integrity verification' static_blocked 1
     check 'corrupted offline Go cache starts no fallback transport' test ! -s "$CALLS"
@@ -648,9 +751,9 @@ test_strict_contract_installers() {
     check 'strict downloads use only exact names and their sidecars' \
         test "$(sed -E 's#^curl .*/##; s/^gh //' "$CALLS" | LC_ALL=C sort -u)" = \
         $'Full.tar.gz\nFull.tar.gz.sha256\nLite\nLite.sha256'
-    cache_base="$strict_cache/strict-demo/v1.2.3/linux-$arch-$cpu-unknown-linux"
-    check 'GNU cache stores the real exact-name archive' cmp -s "$REMOTE/Full.tar.gz" "$cache_base-gnu.tar.gz"
-    check 'musl cache stores raw bytes in its own target and format' cmp -s "$REMOTE/Lite" "$cache_base-musl.none"
+    cache_base="$strict_cache/strict-demo/example/strict-demo/v1.2.3/linux-$arch-$cpu-unknown-linux"
+    check 'GNU cache stores the real exact-name archive' cmp -s "$REMOTE/Full.tar.gz" "$cache_base-gnu/tar.gz/Full.tar.gz/payload"
+    check 'musl cache stores raw bytes in its own target and format' cmp -s "$REMOTE/Lite" "$cache_base-musl/none/Lite/payload"
     before=$(wc -l < "$CALLS")
     for libc in gnu musl; do
         strict_install --libc "$libc" --offline
@@ -660,10 +763,10 @@ test_strict_contract_installers() {
     check 'strict offline cache makes no transport calls' test "$(wc -l < "$CALLS")" -eq "$before"
     local shared_cache="$strict_cache" gnu_only
     strict_cache="$strict_root/gnu-only-cache"
-    gnu_only="$strict_cache/strict-demo/v1.2.3/linux-$arch-$cpu-unknown-linux-gnu.tar.gz"
+    gnu_only="$strict_cache/strict-demo/example/strict-demo/v1.2.3/linux-$arch-$cpu-unknown-linux-gnu/tar.gz/Full.tar.gz/payload"
     mkdir -p "${gnu_only%/*}" || return 1
-    cp "$cache_base-gnu.tar.gz" "$gnu_only" || return 1
-    cp "$cache_base-gnu.tar.gz.sha256" "$gnu_only.sha256" || return 1
+    cp "$cache_base-gnu/tar.gz/Full.tar.gz/payload" "$gnu_only" || return 1
+    cp "$cache_base-gnu/tar.gz/Full.tar.gz/payload.sha256" "$gnu_only.sha256" || return 1
     strict_install --libc musl --offline
     check 'an explicit musl request cannot borrow a verified GNU cache entry' test "$strict_status" -ne 0 -a ! -e "$strict_case_dir/bin/syncfixture"
     check 'missing offline variant makes no transport request' test "$(wc -l < "$CALLS")" -eq "$before"
@@ -685,7 +788,7 @@ test_strict_contract_installers() {
     strict_auto_install
     check 'strict checksum failure blocks installation despite available fallback' test "$strict_status" -ne 0 -a ! -e "$strict_case_dir/bin/syncfixture"
     check 'strict integrity failure never requests the other variant' test "$(grep -c Lite "$CALLS" || true)" -eq 0
-    check 'strict integrity failure publishes no reusable cache payload' test ! -e "$strict_case_dir/cache/strict-demo/v1.2.3/linux-$arch-$cpu-unknown-linux-gnu.tar.gz"
+    check 'strict integrity failure publishes no reusable cache payload' test ! -e "$strict_case_dir/cache/strict-demo/example/strict-demo/v1.2.3/linux-$arch-$cpu-unknown-linux-gnu/tar.gz/Full.tar.gz/payload"
     cp "$strict_root/good.sha256" "$REMOTE/Full.tar.gz.sha256" || return 1
 
     jq '.minisign_pubkey="RWTRzlfQB0VAo0r4gvzjiptFkA9w/VNamRJSxtMaclvkt88+QlEMjQmw"' \
@@ -711,7 +814,7 @@ STRICT_SIGNER
     check 'strict acquisition fallback changes from GNU archive to raw musl format' test "$strict_status" -eq 0
     check 'strict fallback installs exactly the musl executable' cmp -s "$strict_root/musl/syncfixture" "$strict_case_dir/bin/syncfixture"
     check 'strict fallback cache retains the selected raw musl bytes' cmp -s "$REMOTE/Lite" \
-        "$strict_case_dir/cache/strict-demo/v1.2.3/linux-$arch-$cpu-unknown-linux-musl.none"
+        "$strict_case_dir/cache/strict-demo/example/strict-demo/v1.2.3/linux-$arch-$cpu-unknown-linux-musl/none/Lite/payload"
     mv "$strict_root/unavailable.tar.gz" "$REMOTE/Full.tar.gz" || return 1
 
     # Generation failures leave the previous usable script intact.
@@ -809,7 +912,7 @@ else
     # Not "SKIP:" — run-all-tests.sh would mark the whole file skipped.
     echo 'note: no pre-4 bash (set DSR_TEST_LEGACY_BASH); legacy-installer cases not run'
 fi
-check 'verified cache retains checksum evidence' test -s "$cache/demo/v1.2.3/$os-$arch.tar.gz.sha256"
+check 'verified cache retains checksum evidence' test -s "$cache/demo/example/demo/v1.2.3/$os-$arch/tar.gz/$asset/payload.sha256"
 run_install --cache-dir "$cache" --offline
 check 'verified cached archive works offline' success
 before=$(wc -l < "$CALLS")
@@ -859,7 +962,7 @@ mv "$REMOTE/$asset.sha256" "$work/malformed-sidecar"
 # Replace the cached archive with another valid tarball; extraction alone would succeed.
 printf '#!/usr/bin/env bash\necho wrong-version\n' > "$work/payload/demo"
 tar -czf "$work/changed.tar.gz" -C "$work/payload" demo
-cp "$work/changed.tar.gz" "$cache/demo/v1.2.3/$os-$arch.tar.gz"
+cp "$work/changed.tar.gz" "$cache/demo/example/demo/v1.2.3/$os-$arch/tar.gz/$asset/payload"
 before=$(wc -l < "$CALLS")
 run_install --cache-dir "$cache" --offline
 check 'tampered cache is rehashed before extraction' test "$status" -ne 0
@@ -1340,6 +1443,7 @@ else
     echo 'note: archive-format generation cases require yq and jq'
 fi
 
+test_installer_cache_identity || exit 1
 test_strict_contract_installers || exit 1
 # The strict refusal cases deliberately install a failing verifier. Retain its
 # evidence outside PATH before the genuine Minisign/Go qualification below.
