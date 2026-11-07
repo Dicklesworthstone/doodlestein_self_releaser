@@ -859,7 +859,10 @@ requirements, while plain source directories can synchronize without Git.
 
 Relocation requires the original controller to have released the build lock,
 the selected target to be failed, and no target to be running. Completed or
-cancelled runs and diagnostic builds are refused.
+cancelled runs and diagnostic builds are refused. Relocation cannot be combined
+with `--sync-only`. After acquiring the build lock, the CLI rereads and validates
+the checkpoint before preparing sources or changing output state; a checkpoint
+that changed since the initial read is refused.
 Platform-level host relocation requires the selected platform to have one
 configured triple. For a multi-variant platform, select the failed task with
 `TARGET@TRIPLE=HOST`, for example
@@ -897,7 +900,7 @@ invocation receipt. For a qualified variant, `target` in the approval is the
 complete `TARGET@TRIPLE` key. The prior and current repository configuration
 hashes must be identical: relocation changes only that task's host assignment,
 not its recipe, environment, triple, or platform-wide default. The replacement
-must be configured with the same physical platform as the selected task.
+must be enabled and configured with the same physical platform as the selected task.
 Completed siblings retain their original hosts, artifacts and attempt receipts.
 
 For an unqualified singleton, DSR checks actual file hashes and permits only
@@ -987,7 +990,10 @@ eligibility; the original attempt counts and compiler retry budget still apply.
 
 After an interrupted staging attempt, only an exactly verified canonical
 snapshot may be reused. Partial snapshots are retained and refused, not merged
-or overwritten. No successful target is rebuilt by relocation admission.
+or overwritten. Reuse repeats host capability and writable-path admission before
+snapshot inspection or Cargo metadata preparation; an existing snapshot cannot
+override a current host or storage refusal. No successful target is rebuilt by
+relocation admission.
 
 `--diagnostic-native` requires an enabled strict release contract and an explicit
 nonempty, unique subset of its native targets. The clean tagged source, pinned

@@ -2822,6 +2822,7 @@ EOF
     fi
     if [[ -n "$resume_target_host" || -n "$resume_target_host_approval" ]]; then
         if ! $resume || ! $build_release_contract_enabled ||
+           $sync_only ||
            [[ "$build_purpose" != "release" || -z "$resume_target_host" || -z "$resume_target_host_approval" ]]; then
             log_error "Target relocation requires a strict release resume and its approval file"
             if $JSON_MODE; then
@@ -2830,6 +2831,21 @@ EOF
                     --arg request "$resume_target_host" \
                     '{repo:$repo,version:$version,targets:[],
                       error:"Target relocation requires a strict release resume and its approval file",
+                      requested_relocation:$request}')"
+            fi
+            return 4
+        fi
+        local relocation_selector="${resume_target_host%%=*}" relocation_host="${resume_target_host#*=}"
+        if [[ "$resume_target_host" != *=* ||
+              ! "$relocation_selector" =~ ^[a-z]+/[a-z0-9]+(@[A-Za-z0-9][A-Za-z0-9._-]*)?$ ||
+              "$relocation_selector" == *..* || ! "$relocation_host" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            log_error "Relocation requires PLATFORM=HOST or PLATFORM@TARGET_TRIPLE=HOST"
+            if $JSON_MODE; then
+                json_envelope "build" "error" 4 "$(jq -nc \
+                    --arg repo "$ACT_REPO_GITHUB" --arg version "$version" \
+                    --arg request "$resume_target_host" \
+                    '{repo:$repo,version:$version,targets:[],
+                      error:"Relocation requires PLATFORM=HOST or PLATFORM@TARGET_TRIPLE=HOST",
                       requested_relocation:$request}')"
             fi
             return 4
@@ -3236,6 +3252,18 @@ EOF
         fi
         local DSR_BUILD_LOCK_HELD_BY_CALLER=1
         export DSR_BUILD_LOCK_HELD_BY_CALLER
+        if $resume; then
+            # The initial checkpoint read supports argument validation and dry
+            # runs. Re-admit the same checkpoint under the coordinator lock before
+            # source preparation or output-state changes can use its routes.
+            local admitted_resume_state
+            if ! admitted_resume_state=$(build_state_get "$tool_name" "$version" "$resume_run_id") ||
+               ! build_state_validate_task_host_overrides "$admitted_resume_state" ||
+               [[ "$(jq -cS . <<< "$admitted_resume_state")" != "$(jq -cS . <<< "$resume_state")" ]]; then
+                log_error "Resume checkpoint changed before build-lock admission"
+                return 4
+            fi
+        fi
     fi
 
     if $build_release_contract_enabled; then

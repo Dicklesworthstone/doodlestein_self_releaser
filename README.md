@@ -668,7 +668,8 @@ target's host, command, or environment may change. Completed target settings,
 artifacts, and old attempt receipts are retained. DSR verifies the same frozen
 source and dependency archives on the replacement before updating run state.
 A retry may reuse an already staged canonical snapshot only after full byte
-verification; partial or mismatched staging is refused without overwriting it.
+verification and fresh host capability and writable-path admission; partial or
+mismatched staging is refused without overwriting it.
 
 For a platform with multiple native variants, select the exact failed task:
 
@@ -679,7 +680,7 @@ dsr build example --version v1.2.3 --resume=<run-id> \
 ```
 
 Set the approval's `target` to the full `linux/amd64@x86_64-unknown-linux-musl`
-key. This route requires unchanged repository configuration and a configured
+key. This route requires unchanged repository configuration and an enabled configured
 replacement host with the same platform. A completed GNU sibling keeps its
 original host and artifacts. Later ordinary resumes retain the approved task
 assignment, and further moves preserve the original retry budget and attempt

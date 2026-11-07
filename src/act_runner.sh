@@ -3955,6 +3955,23 @@ _act_get_host_platform() {
     esac
 }
 
+# An explicit per-task relocation uses the active hosts configuration, never
+# a selector fallback or an unconfigured SSH alias. Repository recipes remain
+# unchanged, so this route must run on the task's own platform.
+_act_validate_relocation_host() {
+    local platform="$1" host="$2"
+    local hosts_file="${DSR_HOSTS_FILE:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/hosts.yaml}" document
+    [[ "$platform" =~ ^[a-z]+/[a-z0-9]+$ && "$host" =~ ^[A-Za-z0-9_-]+$ &&
+       -f "$hosts_file" && ! -L "$hosts_file" ]] || return 4
+    document=$(yq -o=json -I=0 '.' "$hosts_file") || return 4
+    jq -se --arg platform "$platform" --arg host "$host" '
+        length == 1 and (.[0] | type == "object" and
+          (.hosts | type == "object") and
+          (.hosts[$host] | type == "object" and .platform == $platform and
+            (if has("enabled") then .enabled == true else true end)))
+    ' <<< "$document" >/dev/null
+}
+
 # Per-host staging root for build snapshots (hosts.yaml `build_root`).
 # Used for strict release snapshots and for ordinary Rust isolation roots, so
 # a host whose /tmp or /var/tmp is RAM-backed or too small can point builds at
@@ -8199,13 +8216,14 @@ _act_sync_sibling_crates() {
 act_sync_sources() {
     local tool_name="$1"
     shift
-    local targets_arg=()
+    local targets_arg=() target
     local strict_release=false
     local stage_ordinary=false ordinary_stage_id="" ordinary_contexts='[]' primary_git_context=null sibling_git_contexts='{}'
     local submodule_git_contexts='{}' isolated_identity=null
     local strict_run_id=""
     local strict_git_sha=""
     local selected_target_hosts=""
+    local admission_only=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -8232,6 +8250,10 @@ act_sync_sources() {
                 selected_target_hosts="$2"
                 shift 2
                 ;;
+            --admission-only)
+                admission_only=true
+                shift
+                ;;
             --)
                 shift
                 targets_arg+=("$@")
@@ -8252,6 +8274,10 @@ act_sync_sources() {
     if $stage_ordinary && $strict_release; then
         _log_error "Ordinary source staging cannot replace a strict snapshot"
         echo '{"status":"error","error":"Conflicting source staging modes"}'
+        return 4
+    fi
+    if $admission_only && ! $strict_release; then
+        _log_error "Source admission without staging requires strict release inputs"
         return 4
     fi
 
@@ -8339,7 +8365,7 @@ act_sync_sources() {
         ' <<< "$selected_target_hosts" >/dev/null || return 4
         for selected_target in $targets; do
             selected_host=$(jq -r --arg target "$selected_target" '.[$target]' <<< "$selected_target_hosts") || return 4
-            [[ "$(_act_get_host_field "$selected_host" platform)" == "$selected_target" ]] || return 4
+            _act_validate_relocation_host "$selected_target" "$selected_host" || return 4
         done
     fi
 
@@ -8514,6 +8540,14 @@ act_sync_sources() {
             return 4
         fi
     done
+
+    # Recovery may reuse an already verified immutable snapshot after a
+    # transfer failure. Reuse still needs these same capability and path
+    # budgets before Cargo metadata creates its private writable context.
+    if $admission_only; then
+        [[ ${#hosts_to_sync[@]} -gt 0 ]] || return 4
+        return 0
+    fi
 
     if [[ ${#hosts_to_sync[@]} -eq 0 ]]; then
         _log_info "No build locations need source sync"
@@ -14763,11 +14797,15 @@ _act_relocate_failed_target() {
         _log_error "Relocation approval does not bind the retained native matrix configuration"
         return 4
     fi
-    prior_json=$(printf '%s' "$prior_bytes" | yq -p=yaml -o=json '.' -) || return 4
+    prior_json=$(printf '%s' "$prior_bytes" | yq -p=yaml -o=json '.' - | jq -ces '
+        if length == 1 and (.[0] | type == "object") then .[0]
+        else error("exactly one prior repository configuration required") end') || return 4
     current_bytes=$(cat -- "$config_file" && printf '.') || return 4
     current_bytes="${current_bytes%.}"
     repo_hash=$(printf '%s' "$current_bytes" | _act_sha256 /dev/stdin) || return 4
-    current_json=$(printf '%s' "$current_bytes" | yq -p=yaml -o=json '.' -) || return 4
+    current_json=$(printf '%s' "$current_bytes" | yq -p=yaml -o=json '.' - | jq -ces '
+        if length == 1 and (.[0] | type == "object") then .[0]
+        else error("exactly one repository configuration required") end') || return 4
     if $qualified; then
         # A platform recipe belongs to all its variants. Moving one task
         # changes only its checkpoint route, never the shared configuration.
@@ -14787,8 +14825,8 @@ _act_relocate_failed_target() {
     ' <<< "$before" >/dev/null || return 4
     act_platform_uses_act "$tool" "$target" && return 4
     if $qualified; then
-        host_platform=$(_act_get_host_field "$host" platform) || return 4
-        [[ "$host_platform" == "$target" ]] || return 4
+        _act_validate_relocation_host "$target" "$host" || return 4
+        host_platform="$target"
     else
         configured_host=$(act_get_native_host "$target" "$tool") || return 4
         [[ "$configured_host" == "$host" ]] || return 4
@@ -14866,7 +14904,8 @@ _act_relocate_failed_target() {
     done < <(jq -c '.target_statuses[] | select(.status == "completed")' <<< "$before")
     hosts_hash=$(_act_sha256 "$hosts_file") || return 4
     [[ "$repo_hash" == "$(jq -r '.repo_config_sha256' <<< "$approval")" &&
-       "$hosts_hash" == "$(jq -r '.hosts_config_sha256' <<< "$approval")" ]] || return 4
+       "$hosts_hash" == "$(jq -r '.hosts_config_sha256' <<< "$approval")" &&
+       "$(_act_sha256 "$config_file")" == "$repo_hash" ]] || return 4
     if $plan_only; then
         # This is an observation of local inputs. Execution repeats admission
         # under its build lock before source staging and worker preparation.
@@ -14894,6 +14933,11 @@ _act_relocate_failed_target() {
         # later verification or state write failed. Reuse only the complete
         # canonical snapshot whose archive, manifest and checkout all verify
         # against the pinned source; never merge into a partial destination.
+        # A transfer error is not authority to bypass a current host or disk
+        # refusal. Re-run the identical admission plan before snapshot probes
+        # and before the writable Cargo metadata context can be prepared.
+        act_sync_sources "$tool" --strict-release --admission-only --run-id "$run_id" \
+            --git-sha "$source_sha" "${sync_args[@]}" -- "$target" >/dev/null || return 4
         replacement_path=$(yq -r '.host_paths.'"$host"' // ""' "$config_file") || return 4
         [[ -n "$replacement_path" ]] || replacement_path="$ACT_REPO_LOCAL_PATH"
         replacement_root=$(_act_strict_source_root_path "$replacement_path" "$tool" "$run_id" "$host") || return 4
@@ -14903,10 +14947,12 @@ _act_relocate_failed_target() {
             '{status:"success",failed:0,reused_verified_snapshot:true,
               target_hosts:{($target):$host},source_roots:$roots}') || return 4
     fi
-    jq -e --arg target "$target" --arg host "$host" '
+    jq -se --arg target "$target" --arg host "$host" '
+      length == 1 and (.[0] |
       .status == "success" and .failed == 0 and
       .target_hosts == {($target): $host} and
-      (.source_roots | keys) == [$host]
+      (.source_roots | type == "object" and keys == [$host]) and
+      (.source_roots[$host] | type == "string" and length > 0))
     ' <<< "$sync_json" >/dev/null || return 4
     hosts=$(jq -c --arg target "$task_key" --arg host "$host" '. + {($target): $host}' <<< "$effective_hosts") || return 4
     roots=$(jq -cn --slurpfile prior /dev/fd/3 --slurpfile added /dev/fd/4 \
