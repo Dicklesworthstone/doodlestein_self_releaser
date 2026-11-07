@@ -1075,6 +1075,7 @@ Continuous monitoring daemon.
 ```bash
 dsr watch                                       # Default: check every 60s
 dsr watch --interval 30 --auto-fallback         # Auto-trigger on throttle
+dsr watch --auto-fallback --max-concurrent 4    # Admit up to four fallback pipelines
 dsr watch --notify desktop                      # Desktop notifications
 ```
 
@@ -1083,6 +1084,15 @@ throttled release run once. With it, each run starts one `dsr fallback` for
 the repo's configured tool at the run's version tag; repos with no dsr tool
 are reported, never guessed. `dsr --dry-run watch --auto-fallback` shows which
 fallbacks would start.
+
+The watcher admits at most two fallback pipelines at once by default;
+`--max-concurrent` accepts 1–32. Excess runs wait for a later poll without
+creating a build or consuming a retry attempt. Active workers retain their
+slots across `--once` calls and watcher restarts, until their descendants exit
+and the completion receipt is verified. Lowering the limit lets existing work
+finish before admitting more. Each admitted build still follows the configured
+per-host concurrency limits. Deferred runs must still be observed as throttled
+when a slot becomes available; retries must keep their original source identity.
 
 Automatic fallback builds a private copy of the workflow's exact tagged commit.
 Your checkout can be on a newer commit, contain staged or untracked work, or be

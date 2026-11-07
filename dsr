@@ -1592,6 +1592,7 @@ _WATCH_BACKOFF_INITIAL=60    # 1 minute initial backoff
 _WATCH_BACKOFF_MAX=3600      # 1 hour max backoff
 _WATCH_MAX_ATTEMPTS=3
 _WATCH_RETRY_DELAY=60
+_WATCH_MAX_CONCURRENT=2
 
 # Internal state
 _WATCH_RUNNING=false
@@ -1874,12 +1875,18 @@ _watch_iteration() {
     local dry_run="$1"
     local auto_fallback="${2:-false}"
     local triggered_count=0
-    local state now
+    local state now active_count
+    _WATCH_DEFERRED_COUNT=0
     if ! $dry_run; then
         _watch_reconcile_attempts || return $?
     fi
     state=$(_watch_load_triggered) || { log_error "Cannot read watcher recovery state"; return 4; }
     now=$(date +%s) || return 4
+    # Reconciliation releases a slot only after the attempt's inherited lock
+    # is free and its completion is admitted. This counts workers surviving a
+    # --once invocation or watcher restart, including their live descendants.
+    active_count=$(jq '[.attempts[] | select(.status == "starting" or .status == "running")] | length' \
+        <<< "$state") || return 4
 
     log_info "Running throttle check..."
 
@@ -1992,9 +1999,16 @@ _watch_iteration() {
                 ${#fallback_args[@]} -eq 0 || ! "$sha" =~ ^[0-9a-f]{40}$ ||
                 "$sha" == 0000000000000000000000000000000000000000 ]]; then
             log_warn "Run $run_id has no unambiguous version tag and source commit; automatic fallback blocked"
+        elif ((active_count >= _WATCH_MAX_CONCURRENT)); then
+            # Keep an unstarted run unclaimed, and a failed run's retry budget
+            # unchanged. A later fresh throttle observation must still admit
+            # its identity before it can use a released slot.
+            _WATCH_DEFERRED_COUNT=$((_WATCH_DEFERRED_COUNT + 1))
+            log_info "Deferring fallback for $tool_name (run $run_id): $active_count/$_WATCH_MAX_CONCURRENT watch slots occupied"
         elif $dry_run; then
             log_info "[DRY RUN] Would trigger fallback for $tool_name${fallback_args[*]:+ ${fallback_args[*]}} (run $run_id)"
             triggered_count=$((triggered_count + 1))
+            active_count=$((active_count + 1))
         else
             local output="$_WATCH_STATE_DIR/watch-artifacts/$run_id"
             if ((attempt > 1)); then
@@ -2013,6 +2027,7 @@ _watch_iteration() {
             _watch_launch_attempt "$run_id" "$tool_name" "$repo" "$ref" "$sha" "$attempt" "$resume" "$isolate_source" || return $?
             state=$(_watch_load_triggered) || return 4
             triggered_count=$((triggered_count + 1))
+            active_count=$((active_count + 1))
         fi
     done <<< "$throttled_runs"
 
@@ -2033,6 +2048,7 @@ cmd_watch() {
     trap - EXIT
     local _WATCH_LOCK_FD="" _WATCH_RUNNING=false
     local _WATCH_MAX_ATTEMPTS=3 _WATCH_RETRY_DELAY=60
+    local _WATCH_MAX_CONCURRENT=2 _WATCH_DEFERRED_COUNT=0
     local interval=$_WATCH_DEFAULT_INTERVAL
     local daemon_mode=false
     # The global --dry-run (dsr -n watch) never starts a fallback either.
@@ -2053,11 +2069,12 @@ cmd_watch() {
                 auto_fallback=true
                 shift
                 ;;
-            --max-attempts|--retry-delay)
+            --max-attempts|--retry-delay|--max-concurrent)
                 [[ $# -ge 2 ]] || { log_error "$1 requires a value"; return 4; }
                 case "$1" in
                     --max-attempts) _WATCH_MAX_ATTEMPTS="$2" ;;
                     --retry-delay) _WATCH_RETRY_DELAY="$2" ;;
+                    --max-concurrent) _WATCH_MAX_CONCURRENT="$2" ;;
                 esac
                 shift 2
                 ;;
@@ -2094,6 +2111,7 @@ OPTIONS:
     --auto-fallback        Start `dsr fallback` for each throttled release run
     --max-attempts <N>     Maximum fallback attempts per run (1-10, default: 3)
     --retry-delay <sec>    Initial retry cooldown (1-3600, default: 60)
+    --max-concurrent <N>   Active watcher fallbacks at once (1-32, default: 2)
     --daemon, -d           Run in background (daemon mode)
     --dry-run, -n          Check but don't trigger fallbacks (also the global -n)
     --once, -1             Single check and exit
@@ -2107,6 +2125,8 @@ BEHAVIOR:
     - Builds that commit in a private source tree, preserving local work;
       fetches the pinned tag if it is not available locally
     - Retains running/completed/failed attempts across watcher restarts
+    - Defers excess fallbacks without consuming their retry budgets;
+      running workers keep their slots across --once calls and restarts
     - Retries failed attempts with exponential cooldown, up to the limit;
       resumes only a checkpoint matching this run's exact source and output
     - Never replays a successful run or an attempt with an unknown outcome
@@ -2154,6 +2174,10 @@ EOF
           ! "$_WATCH_RETRY_DELAY" =~ ^[1-9][0-9]{0,3}$ ]] ||
        ((_WATCH_RETRY_DELAY > 3600)); then
         log_error "Watch requires 1-10 attempts and a retry delay of 1-3600 seconds"
+        return 4
+    fi
+    if [[ ! "$_WATCH_MAX_CONCURRENT" =~ ^([1-9]|[12][0-9]|3[0-2])$ ]]; then
+        log_error "Watch requires 1-32 concurrent fallbacks"
         return 4
     fi
 
@@ -2208,7 +2232,12 @@ EOF
                 --argjson state "$state" \
                 --argjson auto_fallback "$auto_fallback" \
                 --argjson dry_run "$dry_run" \
-                '{mode: $mode, auto_fallback: $auto_fallback, dry_run: $dry_run, triggered_state: $state}')"
+                --argjson max_concurrent "$_WATCH_MAX_CONCURRENT" \
+                --argjson deferred "$_WATCH_DEFERRED_COUNT" \
+                '{mode: $mode, auto_fallback: $auto_fallback, dry_run: $dry_run, triggered_state: $state,
+                  max_concurrent: $max_concurrent, deferred_count: $deferred,
+                  active_attempts: ([($state.attempts // {})[] |
+                    select(.status == "starting" or .status == "running")] | length)}')"
         fi
 
         return $result

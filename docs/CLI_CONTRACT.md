@@ -496,6 +496,7 @@ dsr watch [--interval <seconds>] [--auto-fallback] [--notify <method>]
 | `--auto-fallback` | false | Auto-trigger fallback on throttle |
 | `--max-attempts` | 3 | Maximum attempts per observed run, from 1 through 10 |
 | `--retry-delay` | 60 | Initial retry cooldown in seconds, from 1 through 3600 |
+| `--max-concurrent` | 2 | Active watcher fallback pipelines, from 1 through 32 |
 | `--once` | false | Check once using the same exclusive lock and recovery journal |
 | `--notify` | none | Notification: slack\|discord\|desktop\|none |
 
@@ -532,6 +533,24 @@ ambiguous checkpoints block automatic recovery. Successful runs are never
 replayed. Legacy timestamp-only history and workers lost without a completion
 receipt require manual recovery; their publication outcome cannot safely be
 inferred.
+
+Admission is bounded across the retained attempt journal, rather than separately
+for each poll. A running attempt occupies its slot until its inherited kernel
+lock is free and its terminal receipt is admitted. A still-running descendant
+keeps that slot even when the parent has written a completion receipt. This
+applies to workers surviving a watcher restart or `--once` invocation. Reducing
+`--max-concurrent` does not cancel existing workers; it defers new admission
+until the active count falls below the new limit. Existing per-host build limits
+continue to apply independently.
+
+Deferral does not create an attempt, reserve output, or consume a failed run's
+retry budget. The next poll must still observe the run as throttled before
+starting it, and retries must keep their original source identity. A dry run budgets its
+planned starts against the same limit without writing recovery state. JSON
+once results include `details.max_concurrent`, `details.active_attempts` (the
+retained active work), and `details.deferred_count` (eligible runs deferred for
+capacity during this poll).
+
 Terminal fallback notifications are sent only after the worker has saved its
 completion receipt; detailed phase output remains in the attempt's `result.json`
 and the run's `fallback-<run-id>.log`.

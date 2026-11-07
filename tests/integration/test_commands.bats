@@ -11,6 +11,7 @@ load ../helpers/test_harness.bash
 
 # Setup and teardown hooks (required since bats.config.bash doesn't auto-load from subdirs)
 setup() {
+    bats_require_minimum_version 1.5.0
     harness_setup
 }
 
@@ -678,6 +679,12 @@ _watch_run_json() {
             head_branch:"v1.2.3",head_sha:$sha}]}}'
 }
 
+_watch_multiple_runs_json() {
+    _watch_run_json | jq '.details.throttled[0] as $first |
+        .details.throttled = [range(0;3) as $n | $first +
+            {run_id:($first.run_id + $n), head_branch:("v1.2." + (3 + $n | tostring))}]'
+}
+
 # Drive the real watcher, fallback coordinator, Git materializer, source checks,
 # build lock and artifact admission. Only expensive build/quality commands and
 # remote publication are fixture boundaries; no external release is created.
@@ -1038,6 +1045,116 @@ EOF
     jq -e '.attempts["12345"] | .status == "failed" and .attempt == 1 and .next_retry_at > .finished_epoch' \
         "$DSR_STATE_DIR/triggered.json"
     [[ "$(wc -l < "$TEST_TMPDIR/fallback.starts")" -eq 1 ]]
+}
+
+@test "watch admission bounds active fallbacks across restarts and launches deferred runs after completion" {
+    harness_create_config
+    local check_json first_state first_status second_state second_status deadline
+    check_json=$(_watch_multiple_runs_json)
+    DSR_WATCH_FIXTURE_WAIT="$TEST_TMPDIR/finish-child" run --separate-stderr _routing_watch "$check_json" --auto-fallback
+    first_status=$status
+    first_state=$(cat "$DSR_STATE_DIR/triggered.json")
+    DSR_WATCH_FIXTURE_WAIT="$TEST_TMPDIR/finish-child" run --separate-stderr _routing_watch "$check_json" --auto-fallback --max-concurrent 1
+    second_status=$status
+    second_state=$(cat "$DSR_STATE_DIR/triggered.json")
+    local second_output=$output
+    # Release real workers even when the incumbent over-admits the matrix.
+    touch "$TEST_TMPDIR/finish-child"
+    _watch_completed 12345
+    _watch_completed 12346
+    assert_equal "0" "$first_status"
+    assert_equal "0" "$second_status"
+    jq -e '.attempts | keys == ["12345", "12346"]' <<< "$first_state"
+    [[ "$first_state" == "$second_state" ]]
+    jq -e '.details | .max_concurrent == 1 and .active_attempts == 2 and .deferred_count == 1' \
+        <<< "$second_output"
+    [[ ! -e "$DSR_STATE_DIR/watch-artifacts/12347" ]]
+    deadline=$((SECONDS + 10))
+    while ((SECONDS < deadline)); do
+        run _routing_watch "$check_json" --auto-fallback
+        assert_equal "0" "$status"
+        jq -e '.attempts["12347"] != null' "$DSR_STATE_DIR/triggered.json" >/dev/null && break
+        sleep 0.05
+    done
+    _watch_completed 12347
+    run _routing_watch "$check_json" --auto-fallback
+    assert_equal "0" "$status"
+    jq -e '.attempts | length == 3 and all(.[]; .status == "succeeded" and .attempt == 1)' \
+        "$DSR_STATE_DIR/triggered.json"
+    [[ "$(wc -l < "$TEST_TMPDIR/fallback.starts")" -eq 3 ]]
+}
+
+@test "watch admission defers failed retries without consuming their attempt budget" {
+    harness_create_config
+    local first_json second_json both_json saved
+    first_json=$(_watch_run_json)
+    second_json=$(_watch_multiple_runs_json | jq '.details.throttled = [.details.throttled[1]]')
+    both_json=$(_watch_multiple_runs_json | jq '.details.throttled = .details.throttled[:2]')
+    DSR_WATCH_FIXTURE_STATUS=8 run --separate-stderr _routing_watch "$first_json" --auto-fallback --retry-delay 1 --max-concurrent 1
+    assert_equal "0" "$status"
+    _watch_completed 12345
+    DSR_WATCH_FIXTURE_WAIT="$TEST_TMPDIR/finish-child" run --separate-stderr _routing_watch "$second_json" --auto-fallback --retry-delay 1 --max-concurrent 1
+    assert_equal "0" "$status"
+    saved=$(jq -c '.attempts["12345"]' "$DSR_STATE_DIR/triggered.json")
+    sleep 1
+    run --separate-stderr _routing_watch "$both_json" --auto-fallback --retry-delay 1 --max-concurrent 1
+    local observed_status=$status observed_output=$output
+    touch "$TEST_TMPDIR/finish-child"
+    _watch_completed 12346
+    assert_equal "0" "$observed_status"
+    [[ "$(jq -c '.attempts["12345"]' "$DSR_STATE_DIR/triggered.json")" == "$saved" ]]
+    jq -e '.details | .max_concurrent == 1 and .active_attempts == 1 and .deferred_count == 1' \
+        <<< "$observed_output"
+    [[ "$(wc -l < "$TEST_TMPDIR/fallback.starts")" -eq 2 ]]
+}
+
+@test "watch admission honors live descendant locks even after a completion receipt exists" {
+    harness_create_config
+    local check_json directory holder deadline=$((SECONDS + 10))
+    check_json=$(_watch_multiple_runs_json)
+    run _routing_watch "$(_watch_run_json)" --auto-fallback --max-concurrent 1
+    assert_equal "0" "$status"
+    _watch_completed
+    directory="$DSR_STATE_DIR/watch-attempts/$(jq -r '.attempts["12345"].attempt_id' "$DSR_STATE_DIR/triggered.json")"
+    # Hold the actual kernel lock through a separate process. A finished
+    # parent's receipt cannot release a slot still owned by a descendant.
+    bash -c 'exec 9>> "$1/active.lock"; flock -x 9 || exit; touch "$2";
+        while [[ ! -e "$3" ]]; do sleep 0.05; done' _ "$directory" \
+        "$TEST_TMPDIR/held" "$TEST_TMPDIR/release-held" &
+    holder=$!
+    while [[ ! -e "$TEST_TMPDIR/held" ]] && ((SECONDS < deadline)); do sleep 0.05; done
+    run --separate-stderr _routing_watch "$check_json" --auto-fallback --max-concurrent 1
+    local observed_status=$status observed_output=$output
+    touch "$TEST_TMPDIR/release-held"
+    wait "$holder"
+    assert_equal "0" "$observed_status"
+    jq -e '.details | .active_attempts == 1 and .deferred_count == 2 and
+        (.triggered_state.attempts | keys == ["12345"])' <<< "$observed_output"
+    [[ "$(wc -l < "$TEST_TMPDIR/fallback.starts")" -eq 1 ]]
+}
+
+@test "watch admission plans only available slots without changing recovery state" {
+    harness_create_config
+    local check_json
+    check_json=$(_watch_multiple_runs_json)
+    run --separate-stderr _routing_watch "$check_json" --auto-fallback --dry-run
+    assert_equal "0" "$status"
+    [[ "$(printf '%s\n' "$stderr" | grep -c 'Would trigger fallback')" -eq 2 ]]
+    jq -e '.details | .max_concurrent == 2 and .active_attempts == 0 and .deferred_count == 1' <<< "$output"
+    [[ ! -e "$DSR_STATE_DIR/triggered.json" && ! -e "$DSR_STATE_DIR/watch.lock" &&
+       ! -e "$DSR_STATE_DIR/watch-attempts" && ! -e "$TEST_TMPDIR/fallback.args" ]]
+}
+
+@test "watch admission refuses invalid concurrency before running children" {
+    harness_create_config
+    local value
+    for value in 0 33 -1 01 1.5 invalid ''; do
+        run _routing_watch "$(_watch_run_json)" --auto-fallback --max-concurrent "$value"
+        assert_equal "4" "$status"
+        [[ ! -e "$TEST_TMPDIR/watch-check.started" && ! -e "$TEST_TMPDIR/fallback.args" ]]
+    done
+    run _routing_watch "$(_watch_run_json)" --auto-fallback --max-concurrent
+    assert_equal "4" "$status"
 }
 
 @test "watch recovery refuses source identity changes and legacy unknown outcomes" {
