@@ -15792,7 +15792,7 @@ act_orchestrate_build() {
 
     local task_json task_key selected_triple
     local dispatch_index deferred_tasks=0 pending_task_count=0
-    local -a dispatch_tasks=() pending_task_indices=()
+    local -a dispatch_tasks=() pending_task_indices=() dispatch_hosts=()
     # Keep a bounded queue of original task ordinals. A target waiting for an
     # occupied output must not prevent later tasks on independent hosts from
     # using free worker capacity. The fixed ordinal, not dispatch order, names
@@ -16002,8 +16002,12 @@ act_orchestrate_build() {
             _act_fail_coordinator "Refusing to overwrite an existing target attempt receipt"
             break
         fi
-        host="act-local"
-        if $strict_release_contract; then
+        host="${dispatch_hosts[$dispatch_index]:-act-local}"
+        if [[ -n "${dispatch_hosts[$dispatch_index]:-}" ]]; then
+            # Deferral changes launch order, never the source-bound host.
+            # Freeze fallback selection too when synchronization was opted out.
+            :
+        elif $strict_release_contract; then
             host=$(jq -er --arg target "$target" '.[$target]' <<< "$target_hosts_json") || {
                 _act_refuse_retained_target "Strict target host binding became unavailable for $task_key" "$prior_attempts"
                 break
@@ -16015,6 +16019,7 @@ act_orchestrate_build() {
             host=$(jq -r --arg target "$target" '.[$target] // empty' <<< "$target_hosts_json" 2>/dev/null)
             [[ -n "$host" ]] || host=$(act_get_native_host "$target" "$tool_name")
         fi
+        dispatch_hosts[$dispatch_index]="$host"
         local target_sync_receipt=null target_sync_method=native
         if [[ -n "$source_sync_json" ]]; then
             if act_platform_uses_act "$tool_name" "$target"; then target_sync_method=act; fi
@@ -16046,13 +16051,53 @@ act_orchestrate_build() {
                     pending_task_indices+=("$dispatch_index")
                     pending_task_count=$((pending_task_count + 1))
                     deferred_tasks=$((deferred_tasks + 1))
-                    # A full pass without dispatch/reuse means every queued
-                    # task is blocked by an owned worker. Wait for one actual
+                    # Nothing in this pass could dispatch immediately. This
+                    # output is held by an owned worker, so wait for one actual
                     # completion rather than spin or reserve empty attempts.
                     if (( deferred_tasks >= pending_task_count )); then
                         _act_reap_one_worker || interrupted=true
                         deferred_tasks=0
                     fi
+                    $interrupted && break
+                    continue
+                fi
+            fi
+        fi
+
+        # A worker queued on a saturated host still consumes --parallel-jobs.
+        # Prefer another pending target that can use its host now, after all
+        # resume/source admission above and before reserving this attempt.
+        # Stop scanning after one blocked pass: the existing worker performs
+        # bounded, ownership-checked acquisition even if every host is busy.
+        if (( parallel_jobs > 1 && pending_task_count > 0 && deferred_tasks < pending_task_count )) &&
+           { [[ "$target_sync_receipt" == null ]] || [[ "$(jq -r '.status' <<< "$target_sync_receipt")" == success ]]; } &&
+           declare -F selector_get_limit >/dev/null && declare -F selector_has_capacity >/dev/null; then
+            local host_limit="" host_busy=false host_workers=0 capacity_index capacity_status=0
+            if host_limit=$(selector_get_limit "$host" 2>/dev/null) &&
+               [[ "$host_limit" =~ ^[0-9]+$ ]]; then
+                if (( active_workers > 0 )); then
+                    for ((capacity_index = 0; capacity_index < ${#worker_hosts[@]}; capacity_index++)); do
+                        [[ -z "${worker_reaped[$capacity_index]:-}" &&
+                           "${worker_hosts[$capacity_index]}" == "$host" ]] || continue
+                        host_workers=$((host_workers + 1))
+                    done
+                fi
+                # An owned worker may not have published its lease yet. Count
+                # that reservation separately, never add it to observed usage
+                # (which normally already includes the same worker's lease).
+                if (( host_workers >= host_limit )); then
+                    host_busy=true
+                else
+                    # A hint must not wait behind the host mutex. Errors or an
+                    # unavailable probe fall through to real worker admission.
+                    DSR_SELECTOR_LOCK_TIMEOUT=0 selector_has_capacity "$host" >/dev/null 2>&1 || capacity_status=$?
+                    [[ "$capacity_status" -ne 1 ]] || host_busy=true
+                fi
+                if $host_busy; then
+                    _log_info "Host $host is at capacity for $task_key; deferring it while independent targets run"
+                    pending_task_indices+=("$dispatch_index")
+                    pending_task_count=$((pending_task_count + 1))
+                    deferred_tasks=$((deferred_tasks + 1))
                     $interrupted && break
                     continue
                 fi

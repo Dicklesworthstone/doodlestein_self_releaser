@@ -5,6 +5,7 @@
 # Run --dispatch-stdin-only for the issue #48 scheduler regression without
 # compiler, Docker, SSH, or host-health fixtures. --output-queue-only exercises
 # deferred shared outputs, independent hosts, cancellation and exact-run resume.
+# --host-capacity-only covers the same queue with real one-slot host leases.
 
 set -uo pipefail
 
@@ -31,7 +32,7 @@ test_parallel_output_queue() {
     for required_tool in python3 jq yq; do
         command -v "$required_tool" >/dev/null || { echo "Missing test dependency: $required_tool" >&2; return 77; }
     done
-    python3 - "$project_root" "${DSR_TEST_ACT_RUNNER:-$project_root/src/act_runner.sh}" <<'PY'
+    python3 - "$project_root" "${DSR_TEST_ACT_RUNNER:-$project_root/src/act_runner.sh}" "${1:-all}" <<'PY'
 import hashlib
 import json
 import os
@@ -43,7 +44,12 @@ import tempfile
 import time
 import uuid
 
-project, module = map(Path, sys.argv[1:])
+project, module = map(Path, sys.argv[1:3])
+selection = sys.argv[3]
+lookup_adapter = os.environ.get('DSR_TEST_SELECTOR_LOOKUP_ADAPTER')
+if lookup_adapter:
+    print('TEST-ONLY PID namespace lookup adapter: ' + lookup_adapter +
+          '; production ownership lookup is not qualified by this run', flush=True)
 root = Path(tempfile.mkdtemp(prefix='dsr-output-queue-'))
 print('Retained output queue fixtures: ' + str(root), flush=True)
 checks = failures = 0
@@ -77,13 +83,33 @@ def until(process, predicate):
     return predicate()
 
 
+def stopped(row):
+    if lookup_adapter:
+        observation = subprocess.run(['bash', '-c', 'source "$1" && _sel_process_start "$2"',
+                                      'namespace-observer', lookup_adapter, str(row['pid'])],
+                                     capture_output=True, text=True, timeout=10)
+        return observation.returncode == 1 or (observation.returncode == 0 and
+                observation.stdout.strip() != 'proc:' + row['start_ticks'])
+    return subprocess.run(['ps', '-p', str(row['pid']), '-o', 'stat='],
+                          capture_output=True).stdout.strip() in (b'', b'Z')
+
+
 producer = root / 'producer.py'
 producer.write_text(r'''import json, os, sys, time
 from pathlib import Path
-case, target, host, phase, mode = Path(sys.argv[1]), *sys.argv[2:]
+case, target, host, phase, mode, route = Path(sys.argv[1]), *sys.argv[2:]
 targets = json.loads((case / 'targets.json').read_text())
 def event(state):
-    row = dict(target=target, state=state, phase=phase, pid=os.getpid(),
+    leases = []
+    for path in (case / 'state/selector/locks' / host).glob('*.lock'):
+        try:
+            leases.append(json.loads(path.read_text()))
+        except FileNotFoundError:
+            pass
+    owned = any(('-' + target.replace('/', '-') + '-attempt-') in row['run_id'] for row in leases)
+    row = dict(target=target, host=host, state=state, phase=phase, pid=os.getpid(), lease=owned,
+               start_ticks=Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19]
+                   if Path('/proc/self/stat').exists() else '',
                stage=os.environ.get('DSR_NATIVE_OUTPUT_STAGE'), at=time.monotonic_ns())
     fd = os.open(case / 'events.jsonl', os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
     try:
@@ -91,7 +117,8 @@ def event(state):
     finally:
         os.close(fd)
 event('start')
-if phase == 'first' and (target == targets[0] or (mode == 'cancel' and target == targets[-1])):
+if phase == 'first' and (target == targets[0] or
+        ((mode == 'cancel' or route == 'capacity') and target == targets[-1])):
     while not (case / 'release').exists():
         time.sleep(0.02)
 failed = phase == 'first' and mode == 'retry' and target == targets[1]
@@ -116,25 +143,58 @@ source "$DSR_QUEUE_PROJECT/src/config.sh" || exit
 source "$DSR_QUEUE_PROJECT/src/build_state.sh" || exit
 source "$DSR_QUEUE_MODULE" || exit
 source "$DSR_QUEUE_PROJECT/src/host_selector.sh" || exit
+# Opt-in executor adaptation is explicit and applies only to process lookup;
+# normal runs retain the production selector and every test uses real leases.
+if [[ -n "${DSR_TEST_SELECTOR_LOOKUP_ADAPTER:-}" ]]; then
+    source "$DSR_TEST_SELECTOR_LOOKUP_ADAPTER" || exit
+fi
+source <(declare -f selector_has_capacity | sed '1s/selector_has_capacity/_fixture_has_capacity/')
+selector_has_capacity() {
+    printf '%s\n' "$1" >> "$DSR_QUEUE_CASE/$DSR_QUEUE_PHASE.capacity-probes"
+    _fixture_has_capacity "$@"
+}
 act_run_native_build() {
     _act_run_with_timeout 45 python3 "$DSR_QUEUE_PRODUCER" "$DSR_QUEUE_CASE" \
-        "$2" "$8" "$DSR_QUEUE_PHASE" "$DSR_QUEUE_MODE"
+        "$2" "$8" "$DSR_QUEUE_PHASE" "$DSR_QUEUE_MODE" "$DSR_QUEUE_ROUTE"
 }
 args=(--run-id "$DSR_QUEUE_RUN")
 [[ "$DSR_QUEUE_PHASE" != resume ]] || args=(--resume-run-id "$DSR_QUEUE_RUN")
 act_orchestrate_build queuefixture 1.0.0 --parallel-jobs 2 --no-source-sync-gate \
     --output-dir "$DSR_QUEUE_CASE/output" "${args[@]}"
 ''')
+holder = root / 'holder.sh'
+holder.write_text(r'''#!/usr/bin/env bash
+set -uo pipefail
+source "$DSR_QUEUE_PROJECT/src/host_selector.sh" || exit
+if [[ -n "${DSR_TEST_SELECTOR_LOOKUP_ADAPTER:-}" ]]; then
+    source "$DSR_TEST_SELECTOR_LOOKUP_ADAPTER" || exit
+fi
+release() {
+    selector_release_slot shared external-shared
+    selector_release_slot independent external-independent
+}
+trap release EXIT
+trap 'exit 130' INT TERM HUP
+selector_acquire_slot shared external-shared || exit
+selector_acquire_slot independent external-independent || exit
+printf 'held\n' > "$DSR_QUEUE_CASE/holders.ready"
+deadline=$((SECONDS + 60))
+while [[ ! -f "$DSR_QUEUE_CASE/release-holders" ]]; do
+    (( SECONDS < deadline )) || exit 4
+    sleep 0.02
+done
+''')
 
 
 def invoke(case, env, targets, mode, phase):
     env = dict(env, DSR_QUEUE_PHASE=phase)
     workspace = case / 'state/builds/queuefixture/1.0.0' / env['DSR_QUEUE_RUN']
+    prior_leases = {path: path.read_bytes() for path in (case / 'state/selector/locks').rglob('*.lock')}
     with open(case / (phase + '.stdout'), 'wb') as out, open(case / (phase + '.stderr'), 'wb') as err:
         process = subprocess.Popen(['bash', str(driver)], env=env, stdin=subprocess.DEVNULL,
                                    stdout=out, stderr=err, start_new_session=True)
         try:
-            if phase == 'first':
+            if phase == 'first' and mode != 'busy':
                 started = lambda target: any(row['target'] == target and row['state'] == 'start'
                                              for row in events(case))
                 check(case.name + ': first conflicting target reaches its barrier', until(process, lambda: started(targets[0])))
@@ -164,17 +224,27 @@ def invoke(case, env, targets, mode, phase):
                     os.killpg(process.pid, signal.SIGKILL)
                     process.wait(timeout=5)
     result, state = read(case / (phase + '.stdout')), read(workspace / 'state.json')
-    expected = 130 if phase == 'first' and mode == 'cancel' else 1 if phase == 'first' and mode == 'retry' else 0
+    expected = 130 if phase == 'first' and mode == 'cancel' else 1 if phase == 'first' and mode == 'retry' \
+        else 6 if phase == 'first' and mode == 'busy' else 0
+    if code != expected:
+        print((case / (phase + '.stderr')).read_text()[-8000:], file=sys.stderr, flush=True)
+        print(json.dumps(result), file=sys.stderr, flush=True)
     check(case.name + '/' + phase + ': aggregate retains the actual outcome',
           code == expected and result['exit_code'] == code and result['run_id'] == env['DSR_QUEUE_RUN'])
     check(case.name + '/' + phase + ': results preserve configured task order',
           [row['task_key'] for row in result['targets']] == targets)
-    check(case.name + '/' + phase + ': every real host slot has been released',
-          not list((case / 'state/selector/locks').rglob('*.lock')))
+    check(case.name + '/' + phase + ': every worker slot is released and existing external leases are unchanged',
+          {path: path.read_bytes() for path in (case / 'state/selector/locks').rglob('*.lock')} == prior_leases)
     return result, state, workspace
 
 
-for route, mode in (('windows', 'success'), ('external', 'retry'), ('external', 'cancel')):
+cases = [('windows', 'success'), ('external', 'retry'), ('external', 'cancel')]
+capacity_cases = [('capacity', mode) for mode in ('success', 'retry', 'cancel', 'busy')]
+if selection == '--host-capacity-only':
+    cases = capacity_cases
+elif selection != '--output-queue-only':
+    cases += capacity_cases
+for route, mode in cases:
     case = root / (route + '-' + mode)
     for directory in ('config/repos.d', 'source', 'output'):
         (case / directory).mkdir(parents=True)
@@ -188,21 +258,56 @@ for route, mode in (('windows', 'success'), ('external', 'retry'), ('external', 
                   cross_compile={target: {'host': host} for target, host in hosts.items()})
     if route == 'external':
         config['env'] = {'GOBIN': str(case / 'shared-bin')}
+    elif route == 'capacity':
+        # Rust output paths are isolated by the runner. The only blocker in
+        # this case is the actual host lease, not a shared-output fixture.
+        config['language'] = 'rust'
+        config['build_cmd'] = 'cargo build --release'
     (case / 'config/repos.d/queuefixture.yaml').write_text(json.dumps(config))
     (case / 'config/hosts.yaml').write_text(json.dumps(dict(platform_mapping=hosts, hosts={
-        'shared': dict(platform=targets[0], connection='local', concurrency=3),
-        'independent': dict(platform=targets[-1], connection='local', concurrency=3)})))
+        'shared': dict(platform=targets[0], connection='local', concurrency=1 if route == 'capacity' else 3),
+        'independent': dict(platform=targets[-1], connection='local', concurrency=1 if mode == 'busy' else 3)})))
     env = {key: value for key, value in os.environ.items()
            if key not in ('BASH_ENV', 'ENV') and not key.startswith('BASH_FUNC_')}
     env.update(DSR_QUEUE_PROJECT=str(project), DSR_QUEUE_MODULE=str(module), DSR_QUEUE_PRODUCER=str(producer),
-               DSR_QUEUE_CASE=str(case), DSR_QUEUE_RUN=str(uuid.uuid4()), DSR_QUEUE_MODE=mode,
+               DSR_QUEUE_CASE=str(case), DSR_QUEUE_RUN=str(uuid.uuid4()), DSR_QUEUE_MODE=mode, DSR_QUEUE_ROUTE=route,
                DSR_CONFIG_DIR=str(case / 'config'), DSR_HOSTS_FILE=str(case / 'config/hosts.yaml'),
                ACT_REPOS_DIR=str(case / 'config/repos.d'), DSR_STATE_DIR=str(case / 'state'),
                DSR_CACHE_DIR=str(case / 'cache'), ACT_LOGS_DIR=str(case / 'logs'),
                ACT_ARTIFACTS_DIR=str(case / 'artifacts'), DSR_BUILD_LOCK_HELD_BY_CALLER='0',
                DSR_DISABLE_HOST_SELECTOR='1', NO_COLOR='1')
+    if mode == 'busy':
+        env.update(DSR_SELECTOR_WAIT_TIMEOUT='1', DSR_RETRY_MAX='1')
+        with open(case / 'holders.log', 'wb') as out:
+            holding = subprocess.Popen(['bash', str(holder)], env=env, stdin=subprocess.DEVNULL,
+                                       stdout=out, stderr=out, start_new_session=True)
+            try:
+                if not until(holding, lambda: (case / 'holders.ready').exists()):
+                    raise AssertionError('external real host leases were not acquired')
+                result, state, workspace = invoke(case, env, targets, mode, 'first')
+            finally:
+                (case / 'release-holders').write_text('release external leases\n')
+                holding.wait(timeout=10)
+        check(case.name + ': a full externally busy pass reaches bounded worker capacity refusals',
+              not events(case) and all(row['stage'] == 'host_capacity' and row['exit_code'] == 2 and
+                  not row['backend_started'] and 'no build slot' in row['error'] for row in result['targets']) and
+              all(state['target_statuses'][target]['attempts'] == 1 and
+                  state['target_statuses'][target]['host_capacity_failures'] == 1 for target in targets))
+        check(case.name + ': external holders release only their own leases',
+              holding.returncode == 0 and not list((case / 'state/selector/locks').rglob('*.lock')))
+        env['DSR_SELECTOR_WAIT_TIMEOUT'] = '5'
+        resumed, after, _ = invoke(case, env, targets, mode, 'resume')
+        check(case.name + ': exact-run resume retains compiler allowance after capacity-only attempts',
+              [row['attempt'] for row in resumed['targets']] == [2, 2, 2] and
+              all(row['status'] == 'success' and not row.get('retry_limit_exceeded') for row in resumed['targets']) and
+              all(after['target_statuses'][target]['host_capacity_failures'] == 1 for target in targets) and
+              sorted(row['target'] for row in events(case, 'resume') if row['state'] == 'start') == sorted(targets))
+        continue
     result, state, workspace = invoke(case, env, targets, mode, 'first')
     timeline = events(case)
+    check(case.name + ': every backend starts under its real bound-host lease',
+          bool(timeline) and all(row['lease'] and row['host'] == hosts[row['target']]
+                                 for row in timeline if row['state'] == 'start'))
     starts = {row['target']: row['at'] for row in timeline if row['state'] == 'start'}
     ends = {row['target']: row['at'] for row in timeline if row['state'] == 'end'}
     if mode == 'cancel':
@@ -212,9 +317,8 @@ for route, mode in (('windows', 'success'), ('external', 'retry'), ('external', 
               result['targets'][1]['status'] == 'skipped' and not result['targets'][1]['execution_started'] and
               state['target_statuses'][targets[1]]['status'] == 'pending' and
               len(list(workspace.glob('results/*.json'))) == 2)
-        check(case.name + ': every started descendant stops before the coordinator returns', all(
-            subprocess.run(['ps', '-p', str(row['pid']), '-o', 'stat='], capture_output=True).stdout.strip() in (b'', b'Z')
-            for row in timeline if row['state'] == 'start'))
+        check(case.name + ': every started descendant stops before the coordinator returns',
+              bool(timeline) and all(stopped(row) for row in timeline if row['state'] == 'start'))
         continue
     check(case.name + ': independent work overlaps while conflicting outputs remain serialized',
           set(starts) == set(targets) and len(timeline) == 6 and starts[targets[1]] >= ends[targets[0]] and
@@ -239,6 +343,9 @@ for route, mode in (('windows', 'success'), ('external', 'retry'), ('external', 
           all(row.get('resume_reused') for index, row in enumerate(resumed['targets'])
               if mode != 'retry' or index != 1) and
           all(hashlib.sha256(path.read_bytes()).hexdigest() == digest for path, digest in retained.items()))
+    if route == 'capacity' and mode == 'success':
+        check(case.name + ': completed resume performs no capacity hint or lease acquisition',
+              not (case / 'resume.capacity-probes').exists() and not events(case, 'resume'))
 
 (root / 'summary.json').write_text(json.dumps(dict(checks=checks, failures=failures)) + '\n')
 print('Output queue: %d checks, %d failures' % (checks, failures), flush=True)
@@ -246,8 +353,8 @@ raise SystemExit(bool(failures))
 PY
 }
 
-if [[ "${1:-}" == --output-queue-only ]]; then
-    test_parallel_output_queue
+if [[ "${1:-}" == --output-queue-only || "${1:-}" == --host-capacity-only ]]; then
+    test_parallel_output_queue "$1"
     exit $?
 fi
 
