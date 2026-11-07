@@ -685,6 +685,23 @@ original host and artifacts. Later ordinary resumes retain the approved task
 assignment, and further moves preserve the original retry budget and attempt
 history.
 
+Preview that exact move with the same approval file:
+
+```bash
+dsr --json build example --version v1.2.3 --resume=<run-id> --dry-run \
+  --resume-target-host linux/amd64@x86_64-unknown-linux-musl=linux-backup \
+  --resume-target-host-approval /path/to/reviewed-variant-relocation.json
+```
+
+The preview validates local approval, configuration, task history and retained
+artifact evidence. JSON includes `details.relocation` with the old and proposed
+hosts and `validation: "local"`; `details.targets` shows every task, including
+unchanged siblings. It creates no build lock, source snapshot or worker attempt
+and preserves the checkpoint, artifacts and Git index. Host probes and dynamic
+selection are disabled. Remote source/Cargo admission and capacity checks happen
+during execution, which rereads the checkpoint under its lock. A plan does not
+reserve a host or reset an exhausted retry budget.
+
 For native performance measurements of a tool with a strict release contract,
 use an explicit diagnostic build:
 

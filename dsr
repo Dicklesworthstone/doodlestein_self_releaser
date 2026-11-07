@@ -2722,6 +2722,19 @@ EOF
         return 4
     fi
 
+    if $dry_run; then
+        # This command already runs in a subshell: these overrides cannot
+        # escape into a later live build. Planning must not probe workers,
+        # refresh health caches or write Git's optional index updates.
+        local DSR_DISABLE_HOST_SELECTOR=1
+        export DSR_DISABLE_HOST_SELECTOR
+        git() {
+            GIT_OPTIONAL_LOCKS=0 GIT_NO_LAZY_FETCH=1 GIT_TERMINAL_PROMPT=0 \
+                command git -c protocol.allow=never -c core.fsmonitor=false \
+                    -c core.hooksPath=/dev/null "$@"
+        }
+    fi
+
     # Load tool config
     if ! act_load_repo_config "$tool_name"; then
         log_error "Tool '$tool_name' not found in repos.d"
@@ -2746,9 +2759,21 @@ EOF
         return 4
     fi
 
-    # Check for dirty working tree
+    # Check for dirty working tree. The live helper explicitly refreshes
+    # the index, so a preview uses Git's read-only status projection instead.
     if ! $allow_dirty; then
-        if git_ops_is_dirty "$local_path"; then
+        local source_is_dirty=false
+        if $dry_run; then
+            local dry_source_status
+            if ! dry_source_status=$(git -C "$local_path" status --porcelain --untracked-files=no 2>/dev/null); then
+                log_error "Could not inspect source tree for the build plan"
+                return 4
+            fi
+            [[ -z "$dry_source_status" ]] || source_is_dirty=true
+        elif git_ops_is_dirty "$local_path"; then
+            source_is_dirty=true
+        fi
+        if $source_is_dirty; then
             log_error "Working tree has uncommitted changes in $local_path"
             log_info "Commit changes or use --allow-dirty to override"
             return 1
@@ -2799,6 +2824,14 @@ EOF
         if ! $resume || ! $build_release_contract_enabled ||
            [[ "$build_purpose" != "release" || -z "$resume_target_host" || -z "$resume_target_host_approval" ]]; then
             log_error "Target relocation requires a strict release resume and its approval file"
+            if $JSON_MODE; then
+                json_envelope "build" "error" 4 "$(jq -nc \
+                    --arg repo "$ACT_REPO_GITHUB" --arg version "$version" \
+                    --arg request "$resume_target_host" \
+                    '{repo:$repo,version:$version,targets:[],
+                      error:"Target relocation requires a strict release resume and its approval file",
+                      requested_relocation:$request}')"
+            fi
             return 4
         fi
     fi
@@ -2983,6 +3016,12 @@ EOF
         fi
         if ! build_state_validate_task_host_overrides "$resume_state"; then
             log_error "Resume task hosts do not match approved relocation history"
+            if $JSON_MODE; then
+                json_envelope "build" "error" 4 "$(jq -nc \
+                    --arg repo "$ACT_REPO_GITHUB" --arg version "$tag" \
+                    '{repo:$repo,version:$version,targets:[],
+                      error:"Resume task hosts do not match approved relocation history"}')"
+            fi
             return 4
         fi
         resume_run_id=$(jq -r '.run_id // empty' <<< "$resume_state")
@@ -3062,7 +3101,7 @@ EOF
     fi
 
     if $dry_run; then
-        local planned_targets='[]'
+        local planned_targets='[]' planned_relocation='null'
         local planned_host planned_method
         for target in $target_list; do
             if act_platform_uses_act "$tool_name" "$target"; then
@@ -3084,12 +3123,40 @@ EOF
                 '$targets + [{platform: $platform, host: $host, method: $method, status: "skipped"}]')
         done
 
-        # A retained variant route belongs to its task, not every task sharing
-        # the physical platform. Show the approved assignments on a read-only
-        # resume without collapsing the completed sibling onto its new host.
-        if $resume && jq -e '.context | has("task_host_overrides")' <<< "$resume_state" >/dev/null; then
+        if [[ -n "$resume_target_host" ]]; then
+            # Read the same local evidence as execution, but stop before source
+            # staging, remote admission, locks, or checkpoint mutation.
+            if ! planned_relocation=$(_act_relocate_failed_target "$tool_name" "$version" \
+                "$resume_run_id" "$resume_state" "$resume_target_host" \
+                "$resume_target_host_approval" --plan); then
+                log_error "Requested relocation did not pass local validation"
+                if $JSON_MODE; then
+                    json_envelope "build" "error" 4 "$(jq -nc \
+                        --arg repo "$ACT_REPO_GITHUB" --arg version "$tag" \
+                        --arg request "$resume_target_host" \
+                        '{repo:$repo,version:$version,targets:[],
+                          error:"Requested relocation did not pass local validation",
+                          requested_relocation:$request}')"
+                fi
+                return 4
+            fi
+        fi
+
+        # A retained or proposed route belongs to its task, not every task
+        # sharing the platform. Project all siblings from the same checkpoint.
+        if $resume && { [[ "$planned_relocation" != null ]] ||
+            jq -e '.context | has("task_host_overrides")' <<< "$resume_state" >/dev/null; }; then
             local planned_task_hosts
             planned_task_hosts=$(build_state_effective_task_hosts "$resume_state") || return 4
+            if [[ "$planned_relocation" != null ]]; then
+                planned_task_hosts=$(jq -ce --slurpfile plan /dev/fd/3 '
+                    if ($plan | length) != 1 or $plan[0].status != "planned" or
+                       $plan[0].validation != "local" or
+                       .[$plan[0].task_key] != $plan[0].old_host
+                    then error("relocation plan does not bind the retained task")
+                    else .[$plan[0].task_key] = $plan[0].new_host end
+                ' 3<<< "$planned_relocation" <<< "$planned_task_hosts") || return 4
+            fi
             planned_targets=$(jq -ce --slurpfile hosts /dev/fd/3 '
                 .context.build_tasks | map({platform, task_key: .key, target_triple,
                     host: $hosts[0][.key], method, status: "skipped"})
@@ -3104,6 +3171,10 @@ EOF
         log_info "  Concurrency: $parallel_jobs"
         log_info "  Purpose:    $build_purpose"
         $resume && log_info "  Resume run: $resume_run_id"
+        if [[ "$planned_relocation" != null ]]; then
+            log_info "  Relocation: $(jq -r '.task_key + ": " + .old_host + " -> " + .new_host' <<< "$planned_relocation")"
+            log_info "  Validation: local evidence; host admission repeats during execution"
+        fi
         if $sync_only; then
             log_info "  Source sync: planned (sync only; no build)"
         elif $no_sync; then
@@ -3124,11 +3195,13 @@ EOF
                 --argjson no_sync "$no_sync" \
                 --argjson sync_only "$sync_only" \
                 --arg purpose "$build_purpose" \
+                --argjson relocation "$planned_relocation" \
                 '{repo: $repo, tool: $tool, version: $version, targets: $targets,
                   build_purpose: $purpose, publishable: ($purpose == "release"),
                   output_dir: $output_dir, parallel_jobs: $parallel_jobs,
                   resume_run_id: $resume_run_id, no_sync: $no_sync,
-                  sync_only: $sync_only, mode: "dry_run"}')"
+                  sync_only: $sync_only, mode: "dry_run"} |
+                  if $relocation == null then . else . + {relocation:$relocation} end')"
         fi
         return 0
     fi

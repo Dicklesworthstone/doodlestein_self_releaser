@@ -2602,15 +2602,28 @@ if [[ "$RELOC_PHASE" == spoof ]]; then
         "$RELOC_ROOTS" "$RELOC_SHA" v1.0.0 original release </dev/null
     exit $?
 fi
+if [[ "$RELOC_PHASE" == relocation-dry-run ]]; then
+    # The public preview must disable selection itself; the ordinary fixture
+    # environment must not conceal a selector call or its cache/lease writes.
+    unset DSR_DISABLE_HOST_SELECTOR
+    act_get_native_host() (
+        if [[ "${DSR_DISABLE_HOST_SELECTOR:-0}" != 1 ]]; then
+            printf 'UNGUARDED-SELECTOR %s\n' "$*" >> "$RELOC_CASE/boundaries"
+            return 4
+        fi
+        source "$RELOC_PROJECT/src/act_runner.sh" || exit 1
+        act_get_native_host "$@"
+    )
+fi
 args=(--version 1.0.0 --jobs 2 --output-dir "$RELOC_CASE/output")
 if [[ "$RELOC_PHASE" != first ]]; then
     args+=(--resume="$RELOC_RUN")
     if [[ "$RELOC_PHASE" != ordinary-resume && "$RELOC_PHASE" != ordinary-dry-run ]]; then
         args+=(--resume-target-host "$RELOC_REQUEST"
-               --resume-target-host-approval "$RELOC_CASE/approval.json")
+               --resume-target-host-approval "${RELOC_APPROVAL:-$RELOC_CASE/approval.json}")
     fi
 fi
-if [[ "$RELOC_PHASE" == ordinary-dry-run ]]; then DRY_RUN=true; fi
+if [[ "$RELOC_PHASE" == ordinary-dry-run || "$RELOC_PHASE" == relocation-dry-run ]]; then DRY_RUN=true; fi
 cmd_build relocfixture "${args[@]}"
 ''')
 
@@ -2983,6 +2996,23 @@ if variant_only:
           read(case / 'approval.json')['prior_repo_config_sha256'] == original_hash and
           read(case / 'approval.json')['repo_config_sha256'] == original_hash)
 
+    approval_prior_path = Path(read(case / 'approval.json')['prior_repo_config_path'])
+
+    def preview_snapshot():
+        # Include state directory metadata so even a create/remove lock cycle
+        # is observable. Reads may update access times, which are not custody.
+        state_root = case / 'state'
+        paths = set(retained(initial)) | {path, state_root, config_path, approval_prior_path,
+            case / 'approval.json', Path(env['DSR_HOSTS_FILE']), case / 'source/src/main.rs',
+            case / 'source/.git/index', case / 'recipe-events', case / 'boundaries'} | set(state_root.rglob('*'))
+        snapshot = {}
+        for item in paths:
+            info = item.lstat()
+            payload = os.readlink(item) if item.is_symlink() else item.read_bytes() if item.is_file() else None
+            snapshot[item] = (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                              info.st_mtime_ns, info.st_ctime_ns, payload)
+        return snapshot
+
     def refuse_variant(label, mutate, phase='resume', request=None):
         receipt = Path(initial['target_statuses'][musl_key]['result_path'])
         success = Path(initial['target_statuses'][gnu_key]['result']['artifact_path'])
@@ -2999,10 +3029,19 @@ if variant_only:
                 save(case / 'approval.json', approval)
             mutate(path, receipt, success)
             injected = {item:item.read_bytes() for item in owned}
-            code, unused = invoke(case, env, phase, label, preflight_exit=4)
+            preview_before = preview_snapshot() if phase == 'relocation-dry-run' else None
+            code, refusal = invoke(case, env, phase, label, preflight_exit=4)
             check(label + ': refuses before new source staging, compiler execution or checkpoint mutation',
                   code == 4 and events(case) == before_events and not (case / 'replacement').exists() and
                   all(item.read_bytes() == value for item, value in injected.items()))
+            if preview_before is not None:
+                check(label + ': preview refusal preserves file identity, metadata, locks and host boundaries',
+                      preview_snapshot() == preview_before)
+                error = refusal.get('details', {}).get('error')
+                check(label + ': preview refusal retains a structured actionable build error',
+                      refusal.get('command') == 'build' and refusal.get('status') == 'error' and
+                      refusal.get('exit_code') == 4 and
+                      isinstance(error, str) and bool(error.strip()))
         finally:
             for item, value in originals.items():
                 item.write_bytes(value)
@@ -3051,6 +3090,61 @@ if variant_only:
             state['context']['task_host_overrides'] = value
             save(state_path, state)
         refuse_variant('qualified-forged-' + label, forged_override, phase='ordinary-resume')
+
+    # Exercise the same reviewed admission as live relocation. A preview may
+    # read local evidence, but it must not acquire locks, select/probe a host,
+    # stage source, run Cargo metadata or reserve an attempt.
+    preview_before, before_events = preview_snapshot(), events(case)
+    code, preview = invoke(case, env, 'relocation-dry-run', 'qualified-requested-preview')
+    details = preview.get('details', {})
+    plan, rows = details.get('relocation', {}), details.get('targets', [])
+    expected_plan = dict(status='planned', validation='local', run_id=initial['run_id'],
+        task_key=musl_key, platform=native, target_triple=musl, old_host='completed',
+        new_host='replacement', new_host_platform=native, git_sha=initial['git_sha'],
+        git_ref=initial['git_ref'], repo_config_sha256=original_hash,
+        hosts_config_sha256=digest(Path(env['DSR_HOSTS_FILE'])))
+    check('qualified variant: requested preview returns the locally validated exact relocation',
+          code == 0 and isinstance(plan, dict) and
+          all(plan.get(key) == value for key, value in expected_plan.items()))
+    check('qualified variant: requested preview changes only the selected task in its proposed routes',
+          isinstance(rows, list) and len(rows) == 3 and
+          {row.get('task_key'):row.get('host') for row in rows} ==
+              {gnu_key:'completed', musl_key:'replacement', failed:'original'} and
+          {row.get('task_key'):row.get('target_triple') for row in rows} ==
+              {gnu_key:gnu, musl_key:musl, failed:'x86_64-pc-windows-msvc'})
+    check('qualified variant: requested preview leaves state, artifacts, locks, source and host boundaries untouched',
+          preview_snapshot() == preview_before and events(case) == before_events and
+          not (case / 'replacement').exists())
+
+    missing_approval = case / 'nonexistent-approval.json'
+    env['RELOC_APPROVAL'] = str(missing_approval)
+    try:
+        refuse_variant('qualified-preview-missing-approval', lambda *unused: None, phase='relocation-dry-run')
+        check('qualified variant: preview does not create a missing approval file', not missing_approval.exists())
+    finally:
+        env.pop('RELOC_APPROVAL')
+    refuse_variant('qualified-preview-malformed-selector', lambda *unused: None,
+        phase='relocation-dry-run', request=musl_key + '@extra=replacement')
+    refuse_variant('qualified-preview-changed-shared-recipe', changed_recipe, phase='relocation-dry-run')
+    refuse_variant('qualified-preview-corrupt-completed-sibling',
+        lambda unused_path, unused_receipt, success: success.write_bytes(success.read_bytes() + b'corrupt-preview'),
+        phase='relocation-dry-run')
+    refuse_variant('qualified-preview-forged-overrides',
+        lambda *args: forged_override(*args, value={musl_key:'original'}), phase='relocation-dry-run')
+
+    def invalid_preview_counters(state_path, unused_receipt, unused_success):
+        state = read(state_path)
+        entry = state['target_statuses'][musl_key]
+        entry.update(source_sync_failures=entry['attempts'], host_readiness_failures=1, host_capacity_failures=0)
+        save(state_path, state)
+    refuse_variant('qualified-preview-impossible-attempt-counters', invalid_preview_counters,
+        phase='relocation-dry-run')
+
+    def omitted_preview_task(state_path, unused_receipt, unused_success):
+        state = read(state_path)
+        state['context']['build_tasks'] = [task for task in state['context']['build_tasks'] if task['key'] != gnu_key]
+        save(state_path, state)
+    refuse_variant('qualified-preview-omitted-completed-task', omitted_preview_task, phase='relocation-dry-run')
 
     # Only the Cargo metadata decision is controlled. The immutable replacement
     # tree is genuinely staged before this refusal, while admission remains atomic.

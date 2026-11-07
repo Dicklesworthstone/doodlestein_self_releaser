@@ -604,6 +604,7 @@ dsr build --repo <name> [--targets <list>] [--version <tag>]
 | `--version` | HEAD | Version/tag to build |
 | `--parallel[=N]` | off (bound 2 when enabled) | Run independent targets concurrently |
 | `--jobs` | 1 | Explicit concurrency bound from 1 through 32 |
+| `--dry-run` | false | Validate local build inputs and print a plan; a requested relocation requires its approval and reports proposed task routes |
 | `--resume[=RUN_ID]` | off | Reuse verified completed targets and retry incomplete targets |
 | `--resume-target-host TARGET[@TRIPLE]=HOST` | off | Relocate one failed native task during a strict release resume; qualify a variant by its exact triple |
 | `--resume-target-host-approval FILE` | required with relocation | Operator-reviewed JSON binding the run, target, replacement host and configuration hashes |
@@ -943,6 +944,47 @@ attempt and approval; hosts no longer assigned any task leave the active source
 plan while their historical receipts remain available. Relocation does not reset
 compiler retry budgets. Dry-run resumes report the retained per-task hosts without
 staging sources or starting workers.
+
+Adding `--dry-run` to a relocation request runs local admission against the
+observed checkpoint: exact task and run identity, complete configured task
+inventory, valid attempt counters and relocation history, approval/configuration
+hashes, failed receipt identity, and retained completed artifacts. Missing or
+invalid local evidence refuses the request with exit 4; JSON reports a build
+error. A successful JSON plan adds `details.relocation`:
+
+```json
+{
+  "status": "planned",
+  "validation": "local",
+  "run_id": "<original-run-uuid>",
+  "task_key": "linux/amd64@x86_64-unknown-linux-musl",
+  "platform": "linux/amd64",
+  "target_triple": "x86_64-unknown-linux-musl",
+  "old_host": "linux-primary",
+  "new_host": "linux-backup",
+  "new_host_platform": "linux/amd64",
+  "git_sha": "<retained-40-hex-source-sha>",
+  "git_ref": "v1.2.3",
+  "repo_config_sha256": "<reviewed-current-repo-config-sha256>",
+  "hosts_config_sha256": "<reviewed-active-hosts-config-sha256>"
+}
+```
+
+The target list projects all retained tasks with their `task_key`,
+`target_triple` and proposed effective host; only the selected task changes.
+For a singleton, the plan uses its platform task key and recorded target triple,
+which may be empty. A preview does not acquire the build lock, change state or
+receipts, stage sources, prepare Cargo, reserve capacity or start a worker.
+Its Git checks disable optional index updates, lazy fetching, hooks and fsmonitor;
+the initial cleanliness check avoids the live helper's explicit index refresh.
+Host selection uses static configuration without health probes or cache updates.
+
+Local planning observes files without a reservation. A later live resume rereads
+and validates the checkpoint under the build lock, verifies all required source
+snapshots, and performs remote admission before dispatch. A successful preview
+does not prove remote availability, source/Cargo admission, or remaining retry
+eligibility; the original attempt counts and compiler retry budget still apply.
+
 After an interrupted staging attempt, only an exactly verified canonical
 snapshot may be reused. Partial snapshots are retained and refused, not merged
 or overwritten. No successful target is rebuilt by relocation admission.

@@ -28,6 +28,10 @@
       "items": { "$ref": "#/$defs/build_target" },
       "description": "Per-target build results"
     },
+    "relocation": {
+      "$ref": "#/$defs/relocation_plan",
+      "description": "Proposed task relocation after local dry-run validation; does not reserve capacity or attest remote source admission"
+    },
     "manifest_path": {
       "type": "string",
       "description": "Path to build manifest JSON"
@@ -52,6 +56,33 @@
     }
   },
   "$defs": {
+    "relocation_plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "validation", "run_id", "task_key", "platform", "target_triple", "old_host", "new_host", "new_host_platform", "git_sha", "git_ref", "repo_config_sha256", "hosts_config_sha256"],
+      "properties": {
+        "status": { "const": "planned" },
+        "validation": { "const": "local" },
+        "run_id": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$"
+        },
+        "task_key": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Retained platform or platform@triple task identity"
+        },
+        "platform": { "type": "string", "pattern": "^[a-z]+/[a-z0-9]+$" },
+        "target_triple": { "type": "string" },
+        "old_host": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" },
+        "new_host": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" },
+        "new_host_platform": { "type": "string", "pattern": "^[a-z]+/[a-z0-9]+$" },
+        "git_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "git_ref": { "type": "string", "minLength": 1 },
+        "repo_config_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "hosts_config_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
     "native_execution": {
       "type": "object",
       "additionalProperties": false,

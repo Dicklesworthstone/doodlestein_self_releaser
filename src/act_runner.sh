@@ -14644,6 +14644,19 @@ _act_relocation_receipt_matches() {
 }
 
 _act_relocate_failed_target() {
+    if [[ $# -lt 6 || $# -gt 7 ||
+          ( $# -eq 7 && "${7:-}" != "--plan" ) ]]; then
+        _log_error "Failed-target relocation expects six arguments and optional --plan"
+        return 4
+    fi
+    local plan_only=false
+    if [[ $# -eq 7 ]]; then
+        plan_only=true
+        # Capacity selection can probe hosts and update its health cache.
+        # A local plan uses static configured routes; live admission repeats
+        # its normal host selection under the build lock.
+        local -x DSR_DISABLE_HOST_SELECTOR=1
+    fi
     local tool="$1" version="$2" run_id="$3" before="$4" request="$5" approval_file="$6"
     local task_key="${request%%=*}" host="${request#*=}" old_host configured_host host_platform
     local target="${task_key%%@*}" selected_triple="" qualified=false effective_hosts
@@ -14658,8 +14671,51 @@ _act_relocate_failed_target() {
     local source_sha source_ref source_root
     [[ "$request" == *=* && "$target" =~ ^[a-z]+/[a-z0-9]+$ &&
        "$host" =~ ^[A-Za-z0-9_-]+$ ]] || return 4
+    if $plan_only; then
+        if ! _act_is_uuid "$run_id" || ! jq -es \
+            --arg tool "$tool" --arg version "$version" --arg run "$run_id" '
+            length == 1 and (.[0] | type == "object" and
+              .tool == $tool and .version == $version and .run_id == $run)
+        ' <<< "$before" >/dev/null; then
+            _log_error "Relocation plan checkpoint belongs to a different tool, version, or run"
+            return 4
+        fi
+        # The live coordinator checks every target before calling relocation.
+        # A standalone plan must apply the same local attempt-history rules.
+        if ! jq -e '
+            def counter($key): if has($key) then .[$key] else 0 end;
+            def safe_counter: type == "number" and floor == . and . >= 0 and . <= 9007199254740991;
+            .target_statuses | type == "object" and all(.[]; type == "object" and (
+                counter("attempts") as $all | counter("source_sync_failures") as $sync |
+                counter("host_readiness_failures") as $readiness |
+                counter("host_capacity_failures") as $capacity |
+                ($all | safe_counter) and ($sync | safe_counter) and
+                ($readiness | safe_counter) and ($capacity | safe_counter) and
+                ($sync + $readiness + $capacity) <= $all))
+        ' <<< "$before" >/dev/null; then
+            _log_error "Relocation plan has invalid source synchronization/readiness/capacity/build attempt counters"
+            return 4
+        fi
+    fi
     build_state_validate_task_host_overrides "$before" || return 4
     effective_hosts=$(build_state_effective_task_hosts "$before") || return 4
+    if $plan_only; then
+        local planned_tasks plan_targets plan_validation_error
+        plan_targets=$(jq -ce '.targets | arrays' <<< "$before") || return 4
+        if ! plan_validation_error=$(dsr_platform_validate_targets_json \
+                "$plan_targets" "relocation plan targets for $tool" 2>&1); then
+            _log_error "$plan_validation_error"
+            return 4
+        fi
+        planned_tasks=$(_act_build_task_plan "$tool" "$version" "$plan_targets" true) || return 4
+        if ! jq -en --slurpfile prior /dev/fd/3 --slurpfile planned /dev/fd/4 '
+            ($prior | length == 1) and ($planned | length == 1) and
+            ($prior[0].context.build_tasks == $planned[0])
+        ' 3<<< "$before" 4<<< "$planned_tasks" >/dev/null; then
+            _log_error "Relocation plan build task inventory differs from the current configuration"
+            return 4
+        fi
+    fi
     if [[ "$task_key" != "$target" ]]; then
         qualified=true
         selected_triple="${task_key#*@}"
@@ -14811,6 +14867,23 @@ _act_relocate_failed_target() {
     hosts_hash=$(_act_sha256 "$hosts_file") || return 4
     [[ "$repo_hash" == "$(jq -r '.repo_config_sha256' <<< "$approval")" &&
        "$hosts_hash" == "$(jq -r '.hosts_config_sha256' <<< "$approval")" ]] || return 4
+    if $plan_only; then
+        # This is an observation of local inputs. Execution repeats admission
+        # under its build lock before source staging and worker preparation.
+        jq -cn --arg run "$run_id" --arg key "$task_key" --arg platform "$target" \
+            --arg old "$old_host" --arg new "$host" --arg host_platform "$host_platform" \
+            --arg sha "$source_sha" --arg ref "$source_ref" --arg repo_hash "$repo_hash" \
+            --arg hosts_hash "$hosts_hash" '
+            input | .context.build_tasks | map(select(.key == $key)) |
+            if length == 1 and (.[0].target_triple | type == "string")
+            then .[0] else error("relocation task has no retained target triple") end |
+            {status:"planned",run_id:$run,task_key:$key,platform:$platform,
+             target_triple:.target_triple,old_host:$old,new_host:$new,new_host_platform:$host_platform,
+             git_sha:$sha,git_ref:$ref,repo_config_sha256:$repo_hash,hosts_config_sha256:$hosts_hash,
+             validation:"local"}
+        ' <<< "$before" || return 4
+        return 0
+    fi
     local sync_args=()
     if $qualified; then
         sync_args=(--target-hosts-json "$(jq -cn --arg target "$target" --arg host "$host" '{($target):$host}')")
