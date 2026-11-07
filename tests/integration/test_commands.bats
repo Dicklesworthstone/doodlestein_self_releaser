@@ -685,6 +685,37 @@ _watch_multiple_runs_json() {
             {run_id:($first.run_id + $n), head_branch:("v1.2." + (3 + $n | tostring))}]'
 }
 
+# Recovery may outlive the queue entry that originally authorized fallback.
+# Exercise the real authenticated GitHub adapter with only its HTTP boundary
+# replaced, retaining each request so uncached status reads are observable.
+_mock_watch_upstream_run() {
+    printf '%s\n' "$1" > "$TEST_TMPDIR/watch-upstream.json"
+    export GH_MAX_RETRIES=1 GH_RETRY_DELAY=0
+    mock_command_script "gh" "$(cat <<'SCRIPT'
+if [[ "$1" == auth ]]; then
+    [[ "${2:-}" != token ]] || printf '%s\n' 'dsr-offline-integration-fixture'
+    exit 0
+fi
+if [[ "$1" == api && "$2" == repos/Dicklesworthstone/ntm/actions/runs/12345 ]]; then
+    printf '%s\n' "$*" >> "$TEST_TMPDIR/watch-upstream.calls"
+    [[ "${DSR_WATCH_UPSTREAM_ERROR:-false}" != true ]] || exit 1
+    cat "$TEST_TMPDIR/watch-upstream.json"
+    exit 0
+fi
+printf 'Unexpected watcher API call: %s\n' "$*" >&2
+exit 99
+SCRIPT
+)"
+}
+
+_watch_upstream_run_json() {
+    jq -nc --arg status "${1:-completed}" --arg conclusion "${2-failure}" \
+        --arg sha "${3:-1111111111111111111111111111111111111111}" '
+        {id:12345,repository:{full_name:"Dicklesworthstone/ntm"},
+         head_branch:"v1.2.3",head_sha:$sha,status:$status,run_attempt:1,
+         conclusion:(if $conclusion == "" then null else $conclusion end)}'
+}
+
 # Drive the real watcher, fallback coordinator, Git materializer, source checks,
 # build lock and artifact admission. Only expensive build/quality commands and
 # remote publication are fixture boundaries; no external release is created.
@@ -752,6 +783,11 @@ qg_run_checks() {
     printf '%s\n' "$3" > "$TEST_TMPDIR/quality-source"
     [[ "$3" != "$TEST_TMPDIR/developer-source" &&
        "$(git -C "$3" rev-parse HEAD)" == "$DSR_WATCH_PINNED_SHA" ]] || return 4
+    if [[ "${DSR_WATCH_FIXTURE_QUALITY_FAIL_ONCE:-false}" == true &&
+          ! -e "$TEST_TMPDIR/quality-first-failure" ]]; then
+        printf 'failed\n' > "$TEST_TMPDIR/quality-first-failure"
+        return 1
+    fi
     [[ "${DSR_WATCH_MUTATE_PRIVATE:-false}" != true ]] || printf 'changed\n' >> "$3/source.txt"
 }
 cmd_build() {
@@ -1027,6 +1063,177 @@ EOF
     jq -e '.attempts["12345"] | .status == "failed" and .attempt == 2 and .exit_code == 8' \
         "$DSR_STATE_DIR/triggered.json"
     [[ "$(wc -l < "$TEST_TMPDIR/fallback.starts")" -eq 2 ]]
+}
+
+@test "watch terminal recovery resumes its exact checkpoint after upstream failure leaves the queue" {
+    harness_create_config
+    mkdir -p "$DSR_CONFIG_DIR/repos.d"
+    printf 'repo: Dicklesworthstone/ntm\n' > "$DSR_CONFIG_DIR/repos.d/ntm.yaml"
+    local sha check_json checkpoint=12345678-1234-1234-1234-123456789abc
+    local unrelated=12345678-1234-1234-1234-123456789abd checkpoint_file before payload
+    sha=$(_watch_checkpoint_source_sha)
+    check_json=$(_watch_run_json "$sha")
+    DSR_WATCH_FIXTURE_STATUS=1 run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal "0" "$status"
+    _watch_completed
+    _watch_seed_mixed_checkpoint "$checkpoint" "$DSR_STATE_DIR/watch-artifacts/12345" "$sha"
+    _watch_seed_mixed_checkpoint "$unrelated" "$TEST_TMPDIR/unrelated-output" "$sha"
+    checkpoint_file="$DSR_STATE_DIR/builds/ntm/v1.2.3/$checkpoint/state.json"
+    before=$(cat "$checkpoint_file")
+    payload=$(cat "$DSR_STATE_DIR/watch-artifacts/12345/ntm-linux-amd64")
+    _mock_watch_upstream_run "$(_watch_upstream_run_json completed failure "$sha")"
+    sleep 1
+    run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --retry-delay 1
+    assert_equal "0" "$status"
+    _watch_completed
+    jq -e --arg run "$checkpoint" '.attempts["12345"] |
+        .attempt == 2 and .resume_run_id == $run and .isolate_source == true' "$DSR_STATE_DIR/triggered.json"
+    jq -Rse --arg resume "--resume=$checkpoint" 'split("\u0000") | index($resume) != null' "$TEST_TMPDIR/fallback.args"
+    assert_equal 2 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    grep -q 'Cache-Control: no-cache, no-store, max-age=0' "$TEST_TMPDIR/watch-upstream.calls"
+    assert_equal "$before" "$(cat "$checkpoint_file")"
+    assert_equal "$payload" "$(cat "$DSR_STATE_DIR/watch-artifacts/12345/ntm-linux-amd64")"
+    run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --retry-delay 1
+    assert_equal "0" "$status"
+    jq -e '.attempts["12345"] | .status == "succeeded" and .attempt == 2' "$DSR_STATE_DIR/triggered.json"
+    assert_equal 2 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/watch-upstream.calls" | tr -d ' ')"
+}
+
+@test "watch terminal recovery refuses active successful cancelled and unverified upstream runs" {
+    harness_create_config
+    mkdir -p "$DSR_CONFIG_DIR/repos.d"
+    printf 'repo: Dicklesworthstone/ntm\n' > "$DSR_CONFIG_DIR/repos.d/ntm.yaml"
+    DSR_WATCH_FIXTURE_STATUS=8 run _routing_watch "$(_watch_run_json)" --auto-fallback --retry-delay 1
+    assert_equal "0" "$status"
+    _watch_completed
+    # Reconcile the actual completion without granting permission to retry.
+    run _routing_watch '{"details":{"throttled":[]}}' --retry-delay 1
+    assert_equal "0" "$status"
+    local before candidate upstream_state conclusion mutation request_count
+    before=$(cat "$DSR_STATE_DIR/triggered.json")
+    _mock_watch_upstream_run "$(_watch_upstream_run_json)"
+    sleep 1
+    for candidate in 'in_progress:' 'queued:' 'waiting:' 'completed:success' \
+        'completed:cancelled' 'completed:action_required' 'completed:skipped' \
+        'completed:neutral' 'completed:stale'; do
+        upstream_state="${candidate%%:*}"; conclusion="${candidate#*:}"
+        _watch_upstream_run_json "$upstream_state" "$conclusion" > "$TEST_TMPDIR/watch-upstream.json"
+        run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --retry-delay 1
+        assert_equal "0" "$status"
+        assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+        assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    done
+    for mutation in '.id=12346' '.head_sha="2222222222222222222222222222222222222222"' \
+        '.head_branch="v1.2.4"' '.repository.full_name="another/repository"' \
+        'del(.repository)' '.status="unrecognized"' '.conclusion=null'; do
+        _watch_upstream_run_json | jq "$mutation" > "$TEST_TMPDIR/watch-upstream.json"
+        run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --retry-delay 1
+        assert_equal "0" "$status"
+        assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+        assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    done
+    printf 'invalid JSON\n' > "$TEST_TMPDIR/watch-upstream.json"
+    run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --retry-delay 1
+    assert_equal "0" "$status"
+    assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+    _watch_upstream_run_json > "$TEST_TMPDIR/watch-upstream.json"
+    DSR_WATCH_UPSTREAM_ERROR=true run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --retry-delay 1
+    assert_equal "0" "$status"
+    assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+    request_count=$(wc -l < "$TEST_TMPDIR/watch-upstream.calls" | tr -d ' ')
+    assert_equal 18 "$request_count"
+    printf 'repo: another/repository\n' > "$DSR_CONFIG_DIR/repos.d/ntm.yaml"
+    run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --retry-delay 1
+    assert_equal "0" "$status"
+    assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+    assert_equal "$request_count" "$(wc -l < "$TEST_TMPDIR/watch-upstream.calls" | tr -d ' ')"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    [[ ! -e "$DSR_STATE_DIR/watch-artifacts/12345" ]]
+}
+
+@test "watch terminal recovery retains cooldown and does not spend attempts on skipped polls" {
+    harness_create_config
+    mkdir -p "$DSR_CONFIG_DIR/repos.d"
+    printf 'repo: Dicklesworthstone/ntm\n' > "$DSR_CONFIG_DIR/repos.d/ntm.yaml"
+    _mock_watch_upstream_run "$(_watch_upstream_run_json)"
+    DSR_WATCH_FIXTURE_STATUS=8 run _routing_watch "$(_watch_run_json)" --auto-fallback --retry-delay 3600
+    assert_equal "0" "$status"
+    _watch_completed
+    run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --retry-delay 3600
+    assert_equal "0" "$status"
+    jq -e '.attempts["12345"] | .status == "failed" and .attempt == 1 and
+        .next_retry_at == .finished_epoch + 3600' "$DSR_STATE_DIR/triggered.json"
+    local before
+    before=$(cat "$DSR_STATE_DIR/triggered.json")
+    run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --retry-delay 3600
+    assert_equal "0" "$status"
+    assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    [[ ! -e "$TEST_TMPDIR/watch-upstream.calls" ]]
+}
+
+@test "watch terminal recovery honors report-only dry-run and the attempt budget" {
+    harness_create_config
+    mkdir -p "$DSR_CONFIG_DIR/repos.d"
+    printf 'repo: Dicklesworthstone/ntm\n' > "$DSR_CONFIG_DIR/repos.d/ntm.yaml"
+    DSR_WATCH_FIXTURE_STATUS=8 run _routing_watch "$(_watch_run_json)" --auto-fallback --retry-delay 1 --max-attempts 2
+    assert_equal "0" "$status"
+    _watch_completed
+    _mock_watch_upstream_run "$(_watch_upstream_run_json completed timed_out)"
+    run _routing_watch '{"details":{"throttled":[]}}' --retry-delay 1 --max-attempts 2
+    assert_equal "0" "$status"
+    local before
+    before=$(cat "$DSR_STATE_DIR/triggered.json")
+    sleep 1
+    run _routing_watch '{"details":{"throttled":[]}}' --retry-delay 1 --max-attempts 2
+    assert_equal "0" "$status"
+    [[ ! -e "$TEST_TMPDIR/watch-upstream.calls" ]]
+    run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --dry-run --retry-delay 1 --max-attempts 2
+    assert_equal "0" "$status"
+    assert_contains "$output" "[DRY RUN] Would trigger fallback"
+    assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    DSR_WATCH_FIXTURE_STATUS=8 run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --retry-delay 1 --max-attempts 2
+    assert_equal "0" "$status"
+    _watch_completed
+    run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --retry-delay 1 --max-attempts 2
+    assert_equal "0" "$status"
+    jq -e '.attempts["12345"] | .status == "failed" and .attempt == 2 and .exit_code == 8' "$DSR_STATE_DIR/triggered.json"
+    assert_equal 2 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    # Exactly one read for the plan and one for the real retry; an exhausted
+    # attempt budget does not issue more status reads or start another child.
+    assert_equal 2 "$(wc -l < "$TEST_TMPDIR/watch-upstream.calls" | tr -d ' ')"
+}
+
+@test "watch terminal recovery completes the pinned fallback pipeline after a transient quality failure" {
+    command -v yq >/dev/null || skip "yq required for the real fallback pipeline"
+    _watch_isolated_pipeline_fixture
+    export DSR_WATCH_FIXTURE_QUALITY_FAIL_ONCE=true
+    local check_json attempt
+    check_json=$(_watch_run_json "$DSR_WATCH_PINNED_SHA")
+    run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal "0" "$status"
+    _watch_completed
+    attempt=$(jq -r '.attempts["12345"].attempt_id' "$DSR_STATE_DIR/triggered.json")
+    jq -e '.exit_code == 6' "$DSR_STATE_DIR/watch-attempts/$attempt/completion.json"
+    jq -e '.command == "fallback" and .details.phase == "checks"' "$DSR_STATE_DIR/watch-attempts/$attempt/result.json"
+    [[ ! -e "$DSR_STATE_DIR/watch-artifacts/12345" && ! -e "$TEST_TMPDIR/release-source" ]]
+    _mock_watch_upstream_run "$(_watch_upstream_run_json completed startup_failure "$DSR_WATCH_PINNED_SHA")"
+    sleep 1
+    run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --retry-delay 1
+    assert_equal "0" "$status"
+    _watch_completed
+    attempt=$(jq -r '.attempts["12345"].attempt_id' "$DSR_STATE_DIR/triggered.json")
+    jq -e '.exit_code == 0' "$DSR_STATE_DIR/watch-attempts/$attempt/completion.json"
+    jq -e --arg sha "$DSR_WATCH_PINNED_SHA" '.command == "fallback" and .exit_code == 0 and
+        .details.expected_sha == $sha and .details.isolated_source == true and
+        .details.phases.release == "success"' "$DSR_STATE_DIR/watch-attempts/$attempt/result.json"
+    cmp "$TEST_TMPDIR/developer-source/source.txt" "$DSR_STATE_DIR/watch-artifacts/12345/ntm"
+    [[ "$(cat "$TEST_TMPDIR/build-source")" != "$TEST_TMPDIR/developer-source" ]]
+    assert_equal "$(cat "$TEST_TMPDIR/build-source")" "$(cat "$TEST_TMPDIR/release-source")"
+    assert_equal "$DSR_WATCH_PINNED_SHA" "$(git -C "$TEST_TMPDIR/developer-source" rev-parse HEAD)"
+    assert_equal 2 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
 }
 
 @test "watch recovery preserves cooldown and does not hold the watcher lock in its child" {

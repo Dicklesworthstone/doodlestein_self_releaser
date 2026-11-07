@@ -1869,6 +1869,66 @@ _watch_jittered_sleep() {
 # so each is announced once per watcher rather than on every poll.
 declare -A _WATCH_REPORTED=()
 
+# A fallback can fail before the upstream workflow leaves the throttled list.
+# Its durable retry remains useful if that exact workflow later fails too.
+# Absence from the queue alone is never permission to retry: refresh the
+# original run without caches, and leave successful, cancelled, active and
+# unreadable upstream runs alone. These candidates still pass the ordinary
+# cooldown, attempt budget and exact-checkpoint gates below.
+_watch_terminal_retry_runs() {
+    local state="$1" check_output="$2" now="$3" candidates candidate record
+    local run_id tool repo configured_repo observed conclusion
+    candidates=$(printf '%s\n' "$state" "$check_output" | jq -sc \
+        --argjson now "$now" --argjson maximum "$_WATCH_MAX_ATTEMPTS" '
+        . as $inputs | ($inputs[1].details.throttled | map(.run_id | tostring)) as $observed |
+        $inputs[0].attempts | to_entries[] | . as $entry |
+        select(.value.status == "failed" and .value.attempt < $maximum and
+            (.value.exit_code | type == "number" and floor == . and . > 0 and . <= 255) and
+            $now >= (.value.next_retry_at // 0) and ($observed | index($entry.key) | not)) |
+        {run_id:.key,record:.value}') || return 4
+    [[ -n "$candidates" ]] || return 0
+    while IFS= read -r candidate; do
+        run_id=$(jq -r .run_id <<< "$candidate") || return 4
+        record=$(jq -c .record <<< "$candidate") || return 4
+        tool=$(jq -r .tool <<< "$record") || return 4
+        repo=$(jq -r .repo <<< "$record") || return 4
+        if ! configured_repo=$(act_get_repo "$tool") || [[ -z "$configured_repo" ]]; then
+            log_warn "Cannot retry run $run_id: its tool configuration is unavailable"
+            continue
+        fi
+        [[ "$configured_repo" == */* ]] || configured_repo="Dicklesworthstone/$configured_repo"
+        if [[ "$configured_repo" != "$repo" ]]; then
+            log_warn "Cannot retry run $run_id: its configured repository has changed"
+            continue
+        fi
+        if ! observed=$(gh_api "repos/$repo/actions/runs/$run_id" --no-cache); then
+            log_warn "Cannot verify upstream run $run_id; retaining the failed fallback for a later check"
+            continue
+        fi
+        if ! jq -es --arg run "$run_id" --argjson record "$record" '
+            length == 1 and (.[0] | type == "object" and
+                (.id | type == "number" and floor == . and . > 0 and . <= 9007199254740991) and
+                (.id | tostring) == $run and .repository.full_name == $record.repo and
+                .head_branch == $record.version and .head_sha == $record.head_sha and
+                (.status | type == "string") and
+                (.conclusion | type == "null" or type == "string"))
+        ' <<< "$observed" >/dev/null 2>&1; then
+            log_warn "Upstream identity is missing or changed for run $run_id; automatic retry withheld"
+            continue
+        fi
+        if ! jq -e '.status == "completed" and
+                (.conclusion | IN("failure", "timed_out", "startup_failure"))' \
+                <<< "$observed" >/dev/null; then
+            log_debug "Run $run_id is not a completed upstream failure; retaining its failed fallback"
+            continue
+        fi
+        conclusion=$(jq -r .conclusion <<< "$observed") || return 4
+        jq -nc --arg run "$run_id" --argjson record "$record" --arg conclusion "$conclusion" '
+            {run_id:$run,tool:$record.tool,repo:$record.repo,head_branch:$record.version,
+             head_sha:$record.head_sha,retry_reason:"upstream_failure",upstream_conclusion:$conclusion}' || return 4
+    done <<< "$candidates"
+}
+
 # Main watch loop iteration
 # Args: dry_run auto_fallback
 _watch_iteration() {
@@ -1926,13 +1986,21 @@ _watch_iteration() {
         return 8
     fi
 
+    if $auto_fallback; then
+        local terminal_retries
+        terminal_retries=$(_watch_terminal_retry_runs "$state" "$check_output" "$now") || return $?
+        if [[ -n "$terminal_retries" ]]; then
+            throttled_runs="${throttled_runs:+$throttled_runs$'\n'}$terminal_retries"
+        fi
+    fi
+
     if [[ -z "$throttled_runs" ]]; then
         log_ok "No throttled runs detected"
         return 0
     fi
 
-    # Process each throttled run
-    local run run_id repo tool_name ref sha record attempt resume outcome next_retry isolate_source
+    # Process new throttled runs and source-verified terminal recovery candidates.
+    local run run_id repo tool_name ref sha record attempt resume outcome next_retry isolate_source retry_reason
     while IFS= read -r run; do
         run_id=$(jq -r '.run_id // empty | tostring' <<< "$run")
         [[ "$run_id" =~ ^[1-9][0-9]{0,15}$ ]] || { log_error "Invalid throttled run ID"; return 8; }
@@ -1969,8 +2037,13 @@ _watch_iteration() {
             continue
         fi
 
-        log_warn "Throttled run detected: $run_id ($repo)"
-        if [[ "${DSR_NOTIFY_ENABLED:-false}" == "true" ]]; then
+        retry_reason=$(jq -r '.retry_reason // ""' <<< "$run") || return 4
+        if [[ "$retry_reason" == upstream_failure ]]; then
+            log_info "Failed fallback is eligible for recovery: upstream run $run_id ($repo) completed with $(jq -r .upstream_conclusion <<< "$run")"
+        else
+            log_warn "Throttled run detected: $run_id ($repo)"
+        fi
+        if [[ "$retry_reason" != upstream_failure && "${DSR_NOTIFY_ENABLED:-false}" == "true" ]]; then
             notify_event "watch.throttled" "warn" \
                 "Throttle detected" \
                 "Repo $repo run $run_id exceeded threshold" \
@@ -2001,7 +2074,7 @@ _watch_iteration() {
             log_warn "Run $run_id has no unambiguous version tag and source commit; automatic fallback blocked"
         elif ((active_count >= _WATCH_MAX_CONCURRENT)); then
             # Keep an unstarted run unclaimed, and a failed run's retry budget
-            # unchanged. A later fresh throttle observation must still admit
+            # unchanged. A later fresh upstream observation must still admit
             # its identity before it can use a released slot.
             _WATCH_DEFERRED_COUNT=$((_WATCH_DEFERRED_COUNT + 1))
             log_info "Deferring fallback for $tool_name (run $run_id): $active_count/$_WATCH_MAX_CONCURRENT watch slots occupied"
@@ -2129,6 +2202,8 @@ BEHAVIOR:
       running workers keep their slots across --once calls and restarts
     - Retries failed attempts with exponential cooldown, up to the limit;
       resumes only a checkpoint matching this run's exact source and output
+    - A completed upstream failure can also resume a failed fallback after
+      leaving the queue; successful, cancelled or active runs cannot
     - Never replays a successful run or an attempt with an unknown outcome
     - --once uses the same lock and recovery state as continuous mode
     - Uses jittered intervals to avoid thundering herd

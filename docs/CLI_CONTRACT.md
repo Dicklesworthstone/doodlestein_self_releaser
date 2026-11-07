@@ -524,12 +524,24 @@ Each attempt retains its output and terminal exit status under
 `watch-attempts/`, and its build outputs under `watch-artifacts/<run-id>/`.
 `triggered.json` records running, succeeded, failed, or blocked outcomes across
 watcher restarts. Failed attempts can retry while the same source run remains
-throttled, with an exponential cooldown capped at one hour. A retry resumes
-only a unique build UUID matching the exact tool, tag, source SHA, and private
-output directory. A `partial` build with both successful and failed targets is
+throttled, with an exponential cooldown capped at one hour. They can also retry
+after that upstream run leaves the queue and an uncached GitHub observation
+confirms it completed with `failure`, `timed_out`, or `startup_failure`. This
+recovery requires the original run ID, repository, version tag and source SHA,
+and the tool must still be configured for that repository. A missing queue entry
+alone never authorizes a retry. Active, successful, cancelled, approval-pending,
+skipped or otherwise unverified upstream runs do not authorize this recovery;
+failed reads and identity changes preserve the failed attempt without consuming
+its retry budget. Report-only mode does not query or launch these retries, and
+dry-run can describe an eligible retry without changing its journal or outputs.
+
+A retry resumes only a unique build UUID matching the exact tool, tag, source SHA,
+and private output directory. A `partial` build with both successful and failed targets is
 eligible for this recovery; fallback validates and reuses successful target
 artifacts while retrying the remaining targets. Cancelled, mismatched, or
-ambiguous checkpoints block automatic recovery. Successful runs are never
+ambiguous checkpoints block automatic recovery. When an earlier attempt failed
+before creating either a checkpoint or its output directory, the retry may start
+the same pinned build afresh. Successful runs are never
 replayed. Legacy timestamp-only history and workers lost without a completion
 receipt require manual recovery; their publication outcome cannot safely be
 inferred.
@@ -544,9 +556,10 @@ until the active count falls below the new limit. Existing per-host build limits
 continue to apply independently.
 
 Deferral does not create an attempt, reserve output, or consume a failed run's
-retry budget. The next poll must still observe the run as throttled before
-starting it, and retries must keep their original source identity. A dry run budgets its
-planned starts against the same limit without writing recovery state. JSON
+retry budget. The next poll must revalidate either a currently throttled run or
+an eligible terminal upstream failure before starting it; retries must keep their
+original source identity. A dry run budgets its planned starts against the same
+limit without writing recovery state. JSON
 once results include `details.max_concurrent`, `details.active_attempts` (the
 retained active work), and `details.deferred_count` (eligible runs deferred for
 capacity during this poll).
