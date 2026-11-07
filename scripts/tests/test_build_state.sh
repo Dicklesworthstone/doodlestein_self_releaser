@@ -1581,6 +1581,292 @@ test_native_matrix_resume_tasks() {
   ! build_state_resume matrix-state v1.0.0 "$run_id" >/dev/null 2>&1
 }
 
+# State-layer proof only: real checkpoint transactions and coordinator leases,
+# with explicit retained receipt/source fixtures. No compiler or remote host is
+# substituted for a successful build; orchestration tests own those boundaries.
+test_failed_variant_relocation_state() {
+  python3 - "$PROJECT_ROOT" "$TEMP_DIR" <<'PY'
+import copy
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+project, temporary = map(Path, sys.argv[1:])
+work = temporary / 'variant-relocation'
+work.mkdir()
+checks = 0
+gnu = 'linux/amd64@x86_64-unknown-linux-gnu'
+musl = 'linux/amd64@x86_64-unknown-linux-musl'
+windows = 'windows/amd64'
+tool, version, run = 'variant-state', 'v1.0.0', 'retained-run'
+digest = '1' * 64
+
+def check(label, value, result=None):
+    global checks
+    if not value:
+        if result is not None:
+            print(result.stderr[-3000:], file=sys.stderr)
+        raise AssertionError(label)
+    checks += 1
+    print('PASS: ' + label, flush=True)
+
+def write(path, value):
+    path.write_text(json.dumps(value) + '\n')
+
+def read(path):
+    return json.loads(path.read_text())
+
+def fingerprint(path):
+    info = path.stat()
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_mtime_ns,
+            info.st_ctime_ns, path.read_bytes())
+
+driver = work / 'driver.sh'
+driver.write_text(r'''#!/usr/bin/env bash
+set -uo pipefail
+log_info() { :; }; log_warn() { :; }; log_debug() { :; }
+log_error() { printf '%s\n' "$*" >&2; }
+source "$PROJECT/src/guardrails.sh" || exit 90
+source "$MODULE" || exit 91
+build_state_init || exit 92
+case "$1" in
+  relocate|relocate_unframed)
+    IFS= read -r before || exit 93
+    IFS= read -r roots || exit 93
+    IFS= read -r receipt || exit 93
+    if [[ "$1" == relocate_unframed ]]; then
+      roots="$roots"$'\n'"$receipt"
+      receipt=""
+    fi
+    build_lock_acquire "$TOOL" "$VERSION" || exit 94
+    status=0
+    build_state_relocate_failed_target "$TOOL" "$VERSION" "$RUN" "$before" "$2" "$3" "$roots" "$receipt" || status=$?
+    build_lock_release "$TOOL" "$VERSION" || exit 95
+    exit "$status" ;;
+  failed_attempt)
+    extra=$(cat)
+    build_state_update_target "$TOOL" "$VERSION" "$2" failed "$extra" "$RUN" ;;
+  project) state=$(cat); build_state_effective_task_hosts "$state" ;;
+  authority) state=$(cat); build_state_validate_task_host_overrides "$state" ;;
+  resume) build_state_resume "$TOOL" "$VERSION" "$RUN" ;;
+  pending) build_state_pending_hosts "$TOOL" "$VERSION" "$RUN" ;;
+esac
+''')
+
+def call(case, action, *args, documents=(), budget=3):
+    env = dict(os.environ, PROJECT=str(project), CASE=str(case), TOOL=tool,
+               VERSION=version, RUN=run, DSR_STATE_DIR=str(case / 'state'),
+               DSR_RETRY_MAX=str(budget),
+               MODULE=os.environ.get('DSR_TEST_BUILD_STATE_MODULE', str(project / 'src/build_state.sh')))
+    return subprocess.run(['bash', str(driver), action, *args], env=env,
+                          input=''.join(json.dumps(item) + '\n' for item in documents),
+                          capture_output=True, text=True, timeout=15)
+
+def state_path(case):
+    return case / 'state/builds' / tool / version / run / 'state.json'
+
+def fixture(name, failed=(musl,)):
+    case = work / name
+    path = state_path(case)
+    path.parent.mkdir(parents=True)
+    tasks = [dict(key=gnu, platform='linux/amd64', target_triple='x86_64-unknown-linux-gnu', method='native'),
+             dict(key=musl, platform='linux/amd64', target_triple='x86_64-unknown-linux-musl', method='native'),
+             dict(key=windows, platform=windows, target_triple='x86_64-pc-windows-msvc', method='native')]
+    entries = {}
+    for index, task in enumerate(tasks):
+        payload, log, receipt = (case / (str(index) + suffix) for suffix in ('.payload', '.log', '.json'))
+        payload.write_bytes(('retained bytes for ' + task['key']).encode())
+        log.write_text('retained worker log\n')
+        outcome = dict(status='failed' if task['key'] in failed else 'success',
+                       platform=task['platform'], task_key=task['key'], target_triple=task['target_triple'],
+                       host='stable' if task['key'] == windows else 'original',
+                       build_purpose='release', publishable=True, artifact_path=str(payload),
+                       sha256=hashlib.sha256(payload.read_bytes()).hexdigest())
+        write(receipt, outcome)
+        entries[task['key']] = dict(status='failed' if task['key'] in failed else 'completed',
+                                   attempts=5 if task['key'] == musl else 1, result=outcome,
+                                   log_path=str(log), result_path=str(receipt))
+        if task['key'] == musl:
+            entries[task['key']].update(source_sync_failures=1, host_readiness_failures=1, host_capacity_failures=1)
+    state = dict(tool=tool, version=version, run_id=run, status='partial',
+                 created_at='2026-01-01T00:00:00Z', updated_at='2026-01-01T00:00:00Z',
+                 git_sha='a' * 40, git_ref=version, targets=['linux/amd64', windows],
+                 hosts={'original': {'status':'failed', 'retry_count':0}}, target_statuses=entries,
+                 context=dict(build_purpose='release', publishable=True, build_tasks=tasks,
+                              native_matrix_config_sha256=digest, source_sync=None, parallel_jobs=2,
+                              output_dir=str(case / 'output'),
+                              target_hosts={'linux/amd64':'original', windows:'stable'},
+                              source_roots={host:str(case / 'sources' / host) for host in ('original','stable')}))
+    write(path, state)
+    path.chmod(0o600)
+    return case, state
+
+def admission(case, before, key=musl, host='replacement', config_hash=None, host_platform=None):
+    context = before['context']
+    task = next(row for row in context['build_tasks'] if row['key'] == key)
+    old = context.get('task_host_overrides', {}).get(key, context['target_hosts'][task['platform']])
+    config_hash = config_hash or context['native_matrix_config_sha256']
+    root = context['source_roots'].get(host, str(case / 'sources' / host))
+    prior = before['target_statuses'][key]
+    approval = dict(run_id=run, target=key, new_host=host,
+                    prior_repo_config_sha256=context['native_matrix_config_sha256'],
+                    repo_config_sha256=config_hash, hosts_config_sha256='2' * 64)
+    receipt = dict(target=key, task_key=key, platform=task['platform'], target_triple=task['target_triple'],
+                   old_host=old, new_host=host, new_host_platform=host_platform or task['platform'],
+                   git_sha=before['git_sha'], git_ref=before['git_ref'], prior_target=copy.deepcopy(prior),
+                   prior_context=copy.deepcopy(context), approval=approval,
+                   repo_config_sha256=config_hash, hosts_config_sha256='2' * 64,
+                   prior_result_sha256=hashlib.sha256(Path(prior['result_path']).read_bytes()).hexdigest(),
+                   prior_log_sha256=hashlib.sha256(Path(prior['log_path']).read_bytes()).hexdigest(),
+                   verified_source_sync=dict(status='success', failed=0,
+                       target_hosts={task['platform']:host}, source_roots={host:root}),
+                   verified_source_inventory=[dict(path='source', git_sha=before['git_sha'],
+                       archive_sha256='3' * 64, manifest_sha256='4' * 64)])
+    effective = {row['key']:context.get('task_host_overrides', {}).get(row['key'], context['target_hosts'][row['platform']])
+                 for row in context['build_tasks']}
+    effective[key] = host
+    roots = dict(context['source_roots'], **{host:root})
+    roots = {name:value for name,value in roots.items() if name in effective.values()}
+    return roots, receipt
+
+def relocate(case, before, key=musl, host='replacement', **options):
+    roots, receipt = admission(case, before, key, host, **options)
+    result = call(case, 'relocate', key, host, documents=(before, roots, receipt))
+    check('approved relocation commits ' + key + ' to ' + host, result.returncode == 0, result)
+    after = read(state_path(case))
+    check('approved history is valid after ' + host,
+          call(case, 'authority', documents=(after,)).returncode == 0)
+    return after
+
+case, before = fixture('qualified')
+evidence = {path:fingerprint(path) for path in case.iterdir() if path.is_file()}
+after = relocate(case, before)
+check('qualified move preserves platform map, ordered inventory, all attempts and successful siblings',
+      after['context']['target_hosts'] == before['context']['target_hosts'] and
+      after['context']['build_tasks'] == before['context']['build_tasks'] and
+      after['context']['native_matrix_config_sha256'] == digest and
+      after['target_statuses'] == before['target_statuses'] and
+      after['context']['task_host_overrides'] == {musl:'replacement'} and
+      all(fingerprint(path) == saved for path,saved in evidence.items()))
+plan = call(case, 'resume', budget=2)
+check('relocation cannot refund the two consumed compiler attempts', plan.returncode == 0 and
+      json.loads(plan.stdout)['exceeded_target_retry_limit'] == [musl] and
+      json.loads(plan.stdout)['targets_to_process'] == [], plan)
+plan = call(case, 'resume', budget=3)
+check('remaining budget resumes only the failed exact task', plan.returncode == 0 and
+      json.loads(plan.stdout)['targets_to_process'] == [musl], plan)
+retry = copy.deepcopy(after['target_statuses'][musl])
+retry['attempts'] += 1
+retry['result']['host'] = 'replacement'
+retry['result_path'] = str(case / 'replacement-attempt.json')
+retry['log_path'] = str(case / 'replacement-attempt.log')
+write(Path(retry['result_path']), retry['result'])
+Path(retry['log_path']).write_text('replacement compiler failed\n')
+recorded = call(case, 'failed_attempt', musl, documents=(retry,))
+check('repeated relocation follows a retained failed attempt on the current replacement',
+      recorded.returncode == 0, recorded)
+failed_replacement = read(state_path(case))
+again = relocate(case, failed_replacement, host='second')
+check('repeated move retains both approvals and only removes the unused replacement source root',
+      len(again['relocations']) == 2 and again['relocations'][1]['old_host'] == 'replacement' and
+      set(again['context']['source_roots']) == {'original','stable','second'} and
+      again['target_statuses'] == failed_replacement['target_statuses'] and
+      all(fingerprint(path) == saved for path,saved in evidence.items()))
+plan = call(case, 'resume', budget=3)
+check('a second move preserves the additional consumed compiler attempt', plan.returncode == 0 and
+      json.loads(plan.stdout)['exceeded_target_retry_limit'] == [musl], plan)
+
+for label, mutate in (
+    ('missing history', lambda s:s.pop('relocations')),
+    ('removed override', lambda s:s['context'].pop('task_host_overrides')),
+    ('null override', lambda s:s['context'].__setitem__('task_host_overrides', None)),
+    ('forged already-staged route', lambda s:s['context']['task_host_overrides'].__setitem__(musl, 'original')),
+    ('reordered history', lambda s:s['relocations'].reverse()),
+    ('unapproved destination', lambda s:s['relocations'][-1]['approval'].__setitem__('new_host', 'original')),
+    ('contradictory failed host', lambda s:s['relocations'][-1]['prior_target']['result'].__setitem__('host', 'original')),
+    ('changed retained source', lambda s:s['context']['source_roots'].__setitem__('original', '/changed'))):
+    forged = copy.deepcopy(again); mutate(forged); write(state_path(case), forged)
+    saved = fingerprint(state_path(case))
+    result = call(case, 'resume')
+    check('ordinary resume refuses ' + label + ' without rewriting custody',
+          result.returncode != 0 and fingerprint(state_path(case)) == saved, result)
+write(state_path(case), before)
+roots, receipt = admission(case, before)
+saved = fingerprint(state_path(case))
+unframed = call(case, 'relocate_unframed', musl, 'replacement', documents=(before, roots, receipt))
+check('each streamed relocation argument must contain exactly one document',
+      unframed.returncode != 0 and fingerprint(state_path(case)) == saved, unframed)
+
+for label, mutate in (
+    ('stale snapshot', lambda b,r,p:b.__setitem__('updated_at', 'stale')),
+    ('wrong failed receipt', lambda b,r,p:p['prior_target'].__setitem__('attempts', 0)),
+    ('changed recipe', lambda b,r,p:(p.__setitem__('repo_config_sha256', '5'*64), p['approval'].__setitem__('repo_config_sha256', '5'*64))),
+    ('wrong source pin', lambda b,r,p:p.__setitem__('git_sha', 'b'*40)),
+    ('missing successful sibling root', lambda b,r,p:r.pop('original')),
+    ('replaced successful sibling root', lambda b,r,p:r.__setitem__('original', '/changed')),
+    ('cross-platform qualified host', lambda b,r,p:p.__setitem__('new_host_platform', 'darwin/arm64'))):
+    saved = fingerprint(state_path(case)); selected = copy.deepcopy(before)
+    roots, receipt = admission(case, selected); mutate(selected, roots, receipt)
+    result = call(case, 'relocate', musl, 'replacement', documents=(selected, roots, receipt))
+    check('atomic relocation refuses ' + label, result.returncode != 0 and fingerprint(state_path(case)) == saved, result)
+
+projected = call(case, 'project', documents=({'context':before['context']},))
+check('initial projection needs context only', projected.returncode == 0 and
+      json.loads(projected.stdout) == {gnu:'original', musl:'original', windows:'stable'}, projected)
+singleton = copy.deepcopy(before); singleton['context']['build_tasks'][2]['target_triple'] += '+native'
+check('singleton backend compiler identity retains plus support', call(case, 'project', documents=(singleton,)).returncode == 0)
+for label, mutate in (
+    ('explicit null', lambda s:s['context'].__setitem__('task_host_overrides', None)),
+    ('unknown task', lambda s:s['context'].__setitem__('task_host_overrides', {'linux/amd64@unknown':'replacement'})),
+    ('bare platform', lambda s:s['context'].__setitem__('task_host_overrides', {'linux/amd64':'replacement'})),
+    ('missing platform host', lambda s:s['context']['target_hosts'].pop(windows)),
+    ('qualified act task', lambda s:s['context']['build_tasks'][0].__setitem__('method', 'act'))):
+    invalid = copy.deepcopy(before); mutate(invalid)
+    check('projection refuses ' + label, call(case, 'project', documents=(invalid,)).returncode != 0)
+for triple in ('x86_64-unknown-linux-gnu+extra', 'x86_64..gnu', '_x86_64-unknown-linux-gnu'):
+    invalid = copy.deepcopy(before)
+    invalid['context']['build_tasks'][0].update(target_triple=triple, key='linux/amd64@'+triple)
+    check('projection follows configured triple rules for ' + triple, call(case, 'project', documents=(invalid,)).returncode != 0)
+
+for order in ('singleton-first', 'qualified-first'):
+    mixed, state = fixture(order, failed=(musl, windows))
+    steps = [(windows, 'cross', dict(config_hash='6'*64, host_platform='linux/amd64')),
+             (musl, 'replacement', {})]
+    if order == 'qualified-first':steps.reverse()
+    for key, host, options in steps:state = relocate(mixed, state, key, host, **options)
+    check(order + ' preserves singleton cross-build policy and qualified recipe custody',
+          state['context']['task_host_overrides'] == {musl:'replacement'} and
+          state['context']['target_hosts'][windows] == 'cross' and
+          state['context']['native_matrix_config_sha256'] == '6'*64)
+
+retired, state = fixture('all-variants-moved', failed=(gnu, musl))
+state = relocate(retired, state, gnu, 'first')
+state = relocate(retired, state, musl, 'second')
+plan, pending = call(retired, 'resume'), call(retired, 'pending')
+check('unused platform default is absent from processing lists and source roots',
+      plan.returncode == 0 and pending.returncode == 0 and
+      'original' not in json.loads(plan.stdout)['hosts_to_process'] and
+      'original' not in pending.stdout.splitlines() and
+      'original' not in state['context']['source_roots'] and 'original' in state['hosts'])
+
+large, state = fixture('large-receipts')
+state['target_statuses'][musl]['result']['captured_output'] = 'retained compiler metadata\n' * 8192
+write(Path(state['target_statuses'][musl]['result_path']), state['target_statuses'][musl]['result'])
+write(state_path(large), state)
+_, proof = admission(large, state)
+check('large state and relocation receipt each exceed one Linux argv string',
+      len(json.dumps(state).encode()) > 131072 and len(json.dumps(proof).encode()) > 131072)
+after = relocate(large, state)
+check('streamed compare-and-swap preserves large failed receipts without truncation',
+      after['target_statuses'] == state['target_statuses'] and
+      after['relocations'][0]['prior_target'] == state['target_statuses'][musl])
+print(json.dumps(dict(checks=checks, passed=True, fixtures=str(work))), flush=True)
+PY
+}
+
 test_source_sync_context_refresh() {
   local run_id partial repaired roots hosts before after
   run_id=$(build_state_create sync-context v1.0.0 linux/amd64,linux/arm64) || return 1
@@ -1813,6 +2099,13 @@ if [[ "${1:-}" == --capacity-budget-only ]]; then
   exit $?
 fi
 
+if [[ "${1:-}" == --variant-relocation-only ]]; then
+  run_state_regression "qualified relocation preserves receipts, history, routing and attempt budget" test_failed_variant_relocation_state
+  echo "Tests run: $TESTS_RUN  Passed: $TESTS_PASSED  Failed: $TESTS_FAILED"
+  [[ $TESTS_FAILED -eq 0 ]]
+  exit $?
+fi
+
 # ============================================================================
 # Run All Tests
 # ============================================================================
@@ -1884,6 +2177,7 @@ run_state_regression "resume uses one checkpoint even when latest moves mid-read
 run_state_regression "resume maps real hosts and rejects empty target completion evidence" test_resume_host_routing_and_target_evidence
 run_state_regression "resume rejects malformed target/host inventories and counters" test_resume_rejects_malformed_inventory
 run_state_regression "native variant checkpoints resume only failed tasks and reject duplicate identities" test_native_matrix_resume_tasks
+run_state_regression "qualified relocation preserves receipts, history, routing and attempt budget" test_failed_variant_relocation_state
 run_state_regression "source-sync refresh preserves completed artifacts and records repair/opt-out history" test_source_sync_context_refresh
 run_state_regression "source-sync failures preserve the compiler retry allowance without double counting" test_source_sync_compiler_retry_budget
 run_state_regression "host-readiness refusals preserve compiler retries and real build failures exhaust them" test_host_readiness_compiler_retry_budget

@@ -817,7 +817,7 @@ build_state_set_context() {
         (.target_triple | type == "string") and
         (.method == "act" or .method == "native") and
         (.key == .platform or (.method == "native" and
-          (.target_triple | test("^[A-Za-z0-9_][A-Za-z0-9_.-]*$")) and
+          (.target_triple | test("^[A-Za-z0-9][A-Za-z0-9._-]*$") and (contains("..") | not)) and
           .key == (.platform + "@" + .target_triple)))) and
       ([$tasks[].platform] | unique | sort) == ($platforms | unique | sort) and
       (if any($tasks[]; .key != .platform) then $digest | test("^[0-9a-f]{64}$")
@@ -901,16 +901,179 @@ build_state_set_source_sync() {
       end' <<< "$source_sync_json"
 }
 
+# Shared jq definitions keep initial host projection and retained-state
+# admission on the same task identity rules. No state or receipt bytes enter
+# the jq program or its argv; callers stream those documents separately.
+_build_state_task_host_filters() {
+  cat <<'JQ'
+    def task_host_overrides:
+      if type != "object" then error("invalid build context")
+      elif has("task_host_overrides") then
+        .task_host_overrides |
+        if type == "object" then . else error("invalid task host overrides") end
+      else {} end;
+    def effective_task_hosts:
+      .context as $context |
+      ($context | task_host_overrides) as $overrides |
+      $context.build_tasks as $tasks |
+      $context.target_hosts as $hosts |
+      if ($tasks | type != "array" or length == 0) or
+         ([$tasks[].key] | unique | length) != ($tasks | length) or
+         (all($tasks[];
+           (.platform | type == "string" and test("^[a-z]+/[a-z0-9]+$")) and
+           (.target_triple | type == "string") and
+           (.method == "native" or .method == "act") and
+           (.key == .platform or (.method == "native" and
+             (.target_triple | test("^[A-Za-z0-9][A-Za-z0-9._-]*$") and (contains("..") | not)) and
+             .key == (.platform + "@" + .target_triple)))) | not) or
+         ($hosts | type != "object") or
+         ($hosts | keys | sort) != ([$tasks[].platform] | unique | sort) or
+         (all($hosts[]; type == "string" and test("^[A-Za-z0-9_-]+$")) | not) or
+         (all($overrides | to_entries[];
+           . as $override |
+           (.value | type == "string" and test("^[A-Za-z0-9_-]+$")) and
+           any($tasks[]; .key == $override.key and .key != .platform and .method == "native")) | not)
+      then error("invalid task host bindings")
+      else reduce $tasks[] as $task ({};
+        .[$task.key] = ($overrides[$task.key] // $hosts[$task.platform]))
+      end;
+    def normalized_task_context:
+      . + {task_host_overrides: task_host_overrides};
+    def valid_relocation_counter($key):
+      (if has($key) then .[$key] else 0 end) |
+      type == "number" and floor == . and . >= 0 and . <= 9007199254740991;
+    def relocated_task_context($state; $receipt):
+      . as $prior |
+      ({context: $prior} | effective_task_hosts) as $old_hosts |
+      [$prior.build_tasks[] | select(.key == $receipt.target)] as $matches |
+      $matches[0] as $task |
+      if ($matches | length) != 1 or $task.method != "native" or
+         $prior.build_tasks != $state.context.build_tasks or
+         ($receipt.new_host | type != "string" or (test("^[A-Za-z0-9_-]+$") | not)) or
+         $receipt.old_host != $old_hosts[$task.key] or $receipt.new_host == $receipt.old_host or
+         $receipt.git_sha != $state.git_sha or $receipt.git_ref != $state.git_ref or
+         ($state.git_sha | type != "string" or (test("^[0-9a-f]{40}$") | not)) or
+         ($state.git_ref | type != "string" or length == 0) or
+         $receipt.prior_target.status != "failed" or
+         (all(["attempts", "source_sync_failures", "host_readiness_failures", "host_capacity_failures"][];
+           . as $key | $receipt.prior_target | valid_relocation_counter($key)) | not) or
+         (($receipt.prior_target.source_sync_failures // 0) +
+          ($receipt.prior_target.host_readiness_failures // 0) +
+          ($receipt.prior_target.host_capacity_failures // 0)) > ($receipt.prior_target.attempts // 0) or
+         $receipt.approval.run_id != $state.run_id or
+         $receipt.approval.target != $task.key or $receipt.approval.new_host != $receipt.new_host or
+         (all([$prior.native_matrix_config_sha256, $receipt.repo_config_sha256,
+               $receipt.hosts_config_sha256, $receipt.prior_result_sha256, $receipt.prior_log_sha256][];
+           type == "string" and test("^[0-9a-f]{64}$")) | not) or
+         $receipt.approval.prior_repo_config_sha256 != $prior.native_matrix_config_sha256 or
+         $receipt.approval.repo_config_sha256 != $receipt.repo_config_sha256 or
+         $receipt.approval.hosts_config_sha256 != $receipt.hosts_config_sha256 or
+         ($task.key != $task.platform and
+           ($receipt.task_key != $task.key or $receipt.platform != $task.platform or
+            $receipt.target_triple != $task.target_triple or
+            $receipt.prior_target.result.host != $receipt.old_host or
+            $receipt.prior_target.result.platform != $task.platform or
+            $receipt.prior_target.result.task_key != $task.key or
+            $receipt.prior_target.result.target_triple != $task.target_triple or
+            $receipt.new_host_platform != $task.platform or
+            $receipt.repo_config_sha256 != $prior.native_matrix_config_sha256)) or
+         $receipt.verified_source_sync.status != "success" or $receipt.verified_source_sync.failed != 0 or
+         $receipt.verified_source_sync.target_hosts != {($task.platform): $receipt.new_host} or
+         ($receipt.verified_source_sync.source_roots | type != "object" or keys != [$receipt.new_host]) or
+         ($receipt.verified_source_sync.source_roots[$receipt.new_host] | type != "string" or length == 0) or
+         ($prior.source_roots | type != "object") or
+         (all($prior.source_roots[]; type == "string" and length > 0) | not) or
+         ($prior.source_roots | keys | sort) != ([$old_hosts[]] | unique | sort) or
+         (($prior.source_roots | has($receipt.new_host)) and
+           $prior.source_roots[$receipt.new_host] != $receipt.verified_source_sync.source_roots[$receipt.new_host]) or
+         ($receipt.verified_source_inventory | type != "array" or length == 0) or
+         ([$receipt.verified_source_inventory[].path] | length) !=
+           ([$receipt.verified_source_inventory[].path] | unique | length) or
+         (all($receipt.verified_source_inventory[];
+           (.path | type == "string" and length > 0) and
+           (.git_sha | type == "string" and test("^[0-9a-f]{40}$")) and
+           all([.archive_sha256, .manifest_sha256][];
+             type == "string" and test("^[0-9a-f]{64}$"))) | not) or
+         (any($receipt.verified_source_inventory[]; .path == "source" and .git_sha == $state.git_sha) | not)
+      then error("relocation history does not bind task, recipe and source custody")
+      else
+        (if $task.key == $task.platform then .target_hosts[$task.key] = $receipt.new_host
+         else .task_host_overrides = (task_host_overrides + {($task.key): $receipt.new_host}) end) |
+        .native_matrix_config_sha256 = $receipt.repo_config_sha256 |
+        ({context: .} | effective_task_hosts) as $new_hosts |
+        .source_roots = (($prior.source_roots + $receipt.verified_source_sync.source_roots) |
+          with_entries(select(.key as $host | $new_hosts | any(. == $host))))
+      end;
+    def admit_task_host_history:
+      . as $state |
+      (if has("relocations") then .relocations else [] end) as $history |
+      if ($history | type) != "array" then error("invalid relocation history")
+      elif ((.context // {}) | has("task_host_overrides")) or
+           any($history[]; ((.target // "") | contains("@")) or
+             ((.task_key // "") | contains("@")))
+      then
+        effective_task_hosts as $hosts |
+        (.context | task_host_overrides) as $overrides |
+        if ($overrides | length) == 0 and
+           (any($history[]; ((.target // "") | contains("@")) or
+             ((.task_key // "") | contains("@"))) | not) then $state
+        elif ($history | length) == 0 then
+          error("task host overrides lack relocation history")
+        elif ($history[0].prior_context | task_host_overrides | length) != 0 then
+          error("relocation history starts with an unproved task override")
+        else
+          (reduce $history[] as $receipt ($history[0].prior_context;
+            if (normalized_task_context) != ($receipt.prior_context | normalized_task_context)
+            then error("relocation context history is inconsistent")
+            else relocated_task_context($state; $receipt) end)) as $expected |
+          if ($expected | normalized_task_context) == ($state.context | normalized_task_context)
+          then $state else error("task host overrides differ from approved relocation history") end
+        end
+      else . end;
+JQ
+}
+
+# Project only the supplied context. Initial strict admission uses this before
+# a checkpoint exists; stored overrides additionally require history admission.
+# Args: state_json (with context.build_tasks, target_hosts, optional overrides)
+build_state_effective_task_hosts() {
+  local state="$1" filters
+  filters=$(_build_state_task_host_filters) || return 1
+  jq -ce -s "$filters"'
+    if length == 1 then .[0] | effective_task_hosts
+    else error("exactly one build context required") end
+  ' <<< "$state"
+}
+
+# Shape alone cannot authorize a persisted route. Replay reviewed relocations
+# before using overrides on resume, including when an override was removed or
+# changed to another already-staged host. This does not read remote systems.
+build_state_validate_task_host_overrides() {
+  local state="$1" filters
+  filters=$(_build_state_task_host_filters) || return 1
+  jq -ce -s "$filters"'
+    if length == 1 then .[0] | admit_task_host_history | true
+    else error("exactly one build checkpoint required") end
+  ' <<< "$state" >/dev/null
+}
+
 # Atomically replace only a failed target's host binding, preserving its attempt
 # history and every completed target. Caller holds the orchestration lock.
 build_state_relocate_failed_target() {
   local tool="$1" version="$2" run_id="$3" before="$4" target="$5"
-  local host="$6" roots="$7" receipt="$8" tool_dir state_file
+  local host="$6" roots="$7" receipt="$8" tool_dir state_file filters
   tool_dir=$(_build_get_tool_dir "$tool" "$version")
   state_file="$tool_dir/$run_id/state.json"
+  filters=$(_build_state_task_host_filters) || return 1
+  # Before/receipt include retained result and relocation histories. Separate
+  # input descriptors avoid the OS single-argument limit while preserving each
+  # argument's document boundary; one input cannot supply another's receipt.
   _build_state_jq_update "$state_file" \
-    --argjson before "$before" --arg target "$target" --arg host "$host" \
-    --argjson roots "$roots" --argjson receipt "$receipt" '
+    --slurpfile before /dev/fd/3 --slurpfile roots /dev/fd/4 --slurpfile receipt /dev/fd/5 \
+    --arg target "$target" --arg host "$host" "$filters"'
+      def one: if length == 1 then .[0] else error("exactly one relocation input required") end;
+      ($before | one) as $before | ($roots | one) as $roots | ($receipt | one) as $receipt |
+      . as $state |
       if . != $before or .target_statuses[$target].status != "failed" or
          (.status == "completed" or .status == "cancelled")
       then error("relocation state changed or target is not failed")
@@ -921,6 +1084,17 @@ build_state_relocate_failed_target() {
                test("^[0-9a-f]{64}$")) | not) or
           $receipt.approval.prior_repo_config_sha256 != .context.native_matrix_config_sha256)
       then error("relocation approval does not bind the retained native matrix configuration")
+      elif $target | contains("@") then
+        if .context.build_purpose != "release" or .context.publishable != true or
+           any(.target_statuses[]; .status == "running") or
+           $receipt.target != $target or $receipt.new_host != $host or
+           $receipt.prior_context != .context or $receipt.prior_target != .target_statuses[$target]
+        then error("qualified relocation does not bind the retained failed task")
+        else
+          (.context | relocated_task_context($state; $receipt)) as $next |
+          if $roots != $next.source_roots then error("relocation changed retained source custody")
+          else .context = $next | .relocations = ((.relocations // []) + [$receipt]) end
+        end
       else
         .relocations = ((.relocations // []) + [$receipt]) |
         .context.target_hosts[$target] = $host |
@@ -928,7 +1102,7 @@ build_state_relocate_failed_target() {
         if any(.context.build_tasks[]?; .key != .platform) then
           .context.native_matrix_config_sha256 = $receipt.repo_config_sha256
         else . end
-      end'
+      end | admit_task_host_history' 3<<< "$before" 4<<< "$roots" 5<<< "$receipt"
 }
 
 # Add artifact to build state
@@ -1100,15 +1274,18 @@ build_state_pending_hosts() {
   local version="$2"
   local run_id="${3:-latest}"
 
-  local state
+  local state filters
   state=$(build_state_get "$tool" "$version" "$run_id" 2>/dev/null) || return 1
+  build_state_validate_task_host_overrides "$state" || return 1
+  filters=$(_build_state_task_host_filters) || return 1
 
   # Target platforms are not host names. Use explicit host routing where
   # available, while still reading older host-named target inventories.
-  jq -r '
+  jq -r "$filters"'
     . as $s |
-    (((.hosts // {}) | keys) + [(.context.target_hosts // {})[]] +
-      [.targets[]? | select(contains("/") | not)] | unique)[] as $host |
+    (if (.context.task_host_overrides // {} | length) > 0 then [effective_task_hosts[]]
+     else (((.hosts // {}) | keys) + [(.context.target_hosts // {})[]] +
+       [.targets[]? | select(contains("/") | not)]) end | unique)[] as $host |
     ($s.hosts[$host].status // "pending") as $status |
     select($status == "pending" or $status == "running") | $host
   ' <<< "$state"
@@ -1452,9 +1629,15 @@ build_state_resume() {
     echo '{"error": "Invalid retry configuration", "can_resume": false}'
     return 1
   fi
+  if ! build_state_validate_task_host_overrides "$state"; then
+    log_error "Cannot resume task host bindings without matching relocation history"
+    echo '{"error": "Invalid task host relocation history", "can_resume": false}'
+    return 1
+  fi
 
-  local plan
-  if ! plan=$(jq -ce --argjson retry_max "$((10#$BUILD_RETRY_MAX))" '
+  local plan filters
+  filters=$(_build_state_task_host_filters) || return 1
+  if ! plan=$(jq -ce --argjson retry_max "$((10#$BUILD_RETRY_MAX))" "$filters"'
     def counter($key): if has($key) then .[$key] else 0 end;
     def valid_counter($key):
       counter($key) | type == "number" and floor == . and . >= 0 and . <= 9007199254740991;
@@ -1488,7 +1671,7 @@ build_state_resume() {
          (all(tasks[]; (.target_triple | type == "string") and
            (.method == "act" or .method == "native") and
            (.key == .platform or (.method == "native" and
-             (.target_triple | test("^[A-Za-z0-9_][A-Za-z0-9_.-]*$")) and
+             (.target_triple | test("^[A-Za-z0-9][A-Za-z0-9._-]*$") and (contains("..") | not)) and
              .key == (.platform + "@" + .target_triple)))) | not)) or
        (.context.build_tasks != null and
          (if any(tasks[]; .key != .platform)
@@ -1500,8 +1683,9 @@ build_state_resume() {
        (all((.context.target_hosts // {})[]; type == "string" and length > 0) | not)
     then error("invalid or non-resumable checkpoint") else . end |
     # No further build_state_get/readlink calls: latest may now name a new run.
-    (((.hosts | keys) + [(.context.target_hosts // {})[]] +
-      [.targets[] | select(contains("/") | not)]) | unique |
+    (if (.context.task_host_overrides // {} | length) > 0 then [effective_task_hosts[]]
+     else ((.hosts | keys) + [(.context.target_hosts // {})[]] +
+       [.targets[] | select(contains("/") | not)]) end | unique |
       map(. as $host | {name: $host, entry: ($s.hosts[$host] // {})})) as $hosts |
     [$hosts[] | select(.entry.status == "completed") | .name] as $completed |
     [$hosts[] | select(.entry.status == "failed") | .name] as $failed |
