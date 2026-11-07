@@ -379,9 +379,16 @@ attempt. Each subsequent inventory check rehashes those bytes and requires the
 same ID/name/size/digest; an observed asset disappearing or changing identity
 stops the attempt. The existing strict finalizer independently downloads and
 cryptographically verifies complete signed pairs again before and after
-publication. This automatic route requires fewer than 100 contracted assets,
-including signatures and checksum sidecars, matching the finalizer's bounded
-inventory proof.
+publication. Strict creation, verification, finalization, and recovery all read
+the complete paginated assets endpoint; the release metadata's embedded asset
+list is not treated as complete. An exact 100-asset page requires the next page,
+including an empty terminal page at exact page boundaries. A failed or malformed
+later page, duplicate ID, or case-insensitive name collision blocks publication.
+Each observation is bounded to 100 pages of 100 assets and must reach a short
+terminal page within that bound. Private creation and recovery receipts retain
+their 1 MiB size limit, so the recoverable matrix also depends on plan size and
+asset-name lengths. Large plans and inventories stream through verification
+without relying on the operating system's command-line argument size limit.
 
 Publication happens only through `release finalize --no-dispatch` using the
 original POST response and canonical artifact directory. Fallback validates the

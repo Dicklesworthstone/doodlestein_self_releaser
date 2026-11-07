@@ -6509,11 +6509,11 @@ _release_contract_preflight() {
         --arg manifest_file "$manifest_file" \
         --arg manifest_sha256 "$manifest_sha_after" \
         --arg git_sha "$head_sha" \
-        --argjson dependencies "$expected_dependencies_json" \
-        --argjson contract "$contract_json" \
+        --slurpfile dependencies /dev/fd/3 \
+        --slurpfile contract /dev/fd/4 \
         --argjson minisign_public_key "$minisign_public_key_json" \
         --argjson tag_ruleset_receipt "$tag_ruleset_receipt_json" \
-        --argjson assets "$assets_json" \
+        --slurpfile assets /dev/fd/5 \
         '{
             tool: $tool,
             tag: $tag,
@@ -6521,12 +6521,12 @@ _release_contract_preflight() {
             manifest_file: $manifest_file,
             manifest_sha256: $manifest_sha256,
             git_sha: $git_sha,
-            dependencies: $dependencies,
-            contract: $contract,
+            dependencies: $dependencies[0],
+            contract: $contract[0],
             minisign_public_key: $minisign_public_key,
             tag_ruleset_receipt: $tag_ruleset_receipt,
-            assets: $assets
-        }'
+            assets: $assets[0]
+        }' 3<<< "$expected_dependencies_json" 4<<< "$contract_json" 5<<< "$assets_json"
 }
 
 # Re-fetch the repository-owned immutable-tag policy and require byte-for-byte
@@ -6607,6 +6607,43 @@ _release_contract_verify_remote_tag_identity() {
 
 # Fetch a release and require its remote asset names and byte sizes to match the
 # preflight plan exactly. expected_draft is true, false, or any.
+# Bind complete paginated inventory to stable release metadata. GitHub's
+# embedded assets may be truncated; every embedded row must still agree with
+# the authoritative listing, but it never establishes that listing's extent.
+_release_contract_observe_remote_inventory() {
+    local repo="$1" release_id="$2" before inventory after
+    before=$(gh_api "repos/$repo/releases/$release_id" --no-cache) || return 1
+    if ! jq -es --argjson id "$release_id" '
+        length == 1 and (.[0] | type == "object" and .id == $id and
+        (.assets | type == "array") and (.draft | type == "boolean"))
+    ' <<< "$before" >/dev/null 2>&1; then
+        log_error "GitHub returned invalid release metadata before inventory verification"
+        return 1
+    fi
+    inventory=$(gh_release_asset_inventory "$repo" "$release_id") || return 1
+    after=$(gh_api "repos/$repo/releases/$release_id" --no-cache) || return 1
+    if ! jq -cse --slurpfile before /dev/fd/3 --slurpfile inventory /dev/fd/4 '
+        def identity: {id,tag_name,name,body,draft,prerelease,target_commitish,upload_url};
+        def record: {id,name,state,size,digest};
+        def embedded_matches($by_id):
+            (.assets | type == "array") and
+            (([.assets[].id] | unique | length) == (.assets | length)) and
+            all(.assets[]; . as $row | ($row | record) == $by_id[($row.id | tostring)]);
+        if length == 1 and ($before | length) == 1 and ($inventory | length) == 1 then
+            .[0] as $after |
+            ($inventory[0] | map({key:(.id | tostring),value:(record)}) | from_entries) as $by_id |
+            if ($after | type == "object") and
+               ($before[0] | identity) == ($after | identity) and
+               ($before[0] | embedded_matches($by_id)) and ($after | embedded_matches($by_id))
+            then $after + {assets:$inventory[0]}
+            else error("release changed during inventory verification") end
+        else error("invalid release inventory observation") end
+    ' 3<<< "$before" 4<<< "$inventory" <<< "$after"; then
+        log_error "GitHub release metadata or embedded asset identities changed during inventory verification"
+        return 1
+    fi
+}
+
 _release_contract_verify_remote_assets() {
     local repo="$1"
     local release_id="$2"
@@ -6624,7 +6661,7 @@ _release_contract_verify_remote_assets() {
         log_error "Expected release tag is required for strict remote verification"
         return 1
     fi
-    release_json=$(gh_api "repos/$repo/releases/$release_id" --no-cache 2>/dev/null) || {
+    release_json=$(_release_contract_observe_remote_inventory "$repo" "$release_id") || {
         log_error "Could not fetch draft release for remote verification"
         return 1
     }
@@ -6680,25 +6717,22 @@ _release_contract_verify_remote_assets() {
         return 1
     fi
 
-    if ! jq -en \
-        --argjson expected "$expected_assets_json" \
-        --argjson actual "$(jq -c '.assets' <<< "$release_json")" '
+    if ! jq -e --slurpfile expected /dev/fd/3 '
         def normalized_expected:
             map({name: .name, size_bytes: .size_bytes, digest: ("sha256:" + .sha256)}) |
             sort_by(.name, .size_bytes, .digest);
         def normalized_actual:
             map({name: .name, size_bytes: .size, digest: .digest}) |
             sort_by(.name, .size_bytes, .digest);
-        ($expected | normalized_expected) == ($actual | normalized_actual)
-    ' >/dev/null 2>&1; then
+        ($expected | length) == 1 and
+        ($expected[0] | normalized_expected) == (.assets | normalized_actual)
+    ' 3<<< "$expected_assets_json" <<< "$release_json" >/dev/null 2>&1; then
         local comparison
-        comparison=$(jq -nc \
-            --argjson expected "$expected_assets_json" \
-            --argjson actual "$(jq -c '.assets' <<< "$release_json")" '
+        comparison=$(jq -c --slurpfile expected /dev/fd/3 '
             {
-                expected: ($expected | map({name, size_bytes}) | sort_by(.name)),
-                actual: ($actual | map({name, size_bytes: .size}) | sort_by(.name))
-            }')
+                expected: ($expected[0] | map({name, size_bytes}) | sort_by(.name)),
+                actual: (.assets | map({name, size_bytes: .size}) | sort_by(.name))
+            }' 3<<< "$expected_assets_json" <<< "$release_json")
         log_error "Remote release assets do not match the exact contract: $comparison"
         return 1
     fi
@@ -6711,14 +6745,11 @@ _release_contract_verify_remote_assets() {
         fi
 
         local release_json_after=""
-        release_json_after=$(gh_api "repos/$repo/releases/$release_id" \
-            --no-cache 2>/dev/null) || {
+        release_json_after=$(_release_contract_observe_remote_inventory "$repo" "$release_id") || {
             log_error "Could not re-fetch release after remote signature verification"
             return 1
         }
-        if ! jq -en \
-            --argjson before "$release_json" \
-            --argjson after "$release_json_after" '
+        if ! jq -e --slurpfile before /dev/fd/3 '
             def identity:
                 {
                     id,
@@ -6727,10 +6758,12 @@ _release_contract_verify_remote_assets() {
                     name,
                     body,
                     prerelease,
+                    target_commitish,
+                    upload_url,
                     assets: ([.assets[] | {id, name, size, state, digest}] | sort_by(.id))
                 };
-            ($before | identity) == ($after | identity)
-        ' >/dev/null 2>&1; then
+            ($before[0] | identity) == (. | identity)
+        ' 3<<< "$release_json" <<< "$release_json_after" >/dev/null 2>&1; then
             log_error "GitHub release changed during remote signature verification"
             return 1
         fi
@@ -7196,17 +7229,9 @@ PY
 
 _release_finalize_observe() {
     local repo="$1" id="$2" plan="$3" draft="$4" tag="$5" metadata="$6"
-    local observed inventory
+    local observed
     observed=$(_release_contract_verify_remote_assets "$repo" "$id" "$plan" "$draft" "$tag" "$metadata") || return 7
     _source_release_metadata_matches "$observed" "$metadata" "$id" "$draft" || return 7
-    inventory=$(gh_api "repos/$repo/releases/$id/assets?per_page=100&page=1" --no-cache) || return 7
-    # This bounded recovery route admits fewer than 100 exact assets. A full
-    # page is ambiguous and must use a separately qualified paginated route.
-    jq -es --argjson observed "$observed" '
-        def records: map({id,name,state,size,digest}) | sort_by(.id);
-        length == 1 and (.[0] | type == "array" and length < 100 and
-        (records == ($observed.assets | records)))
-    ' <<< "$inventory" >/dev/null || return 7
     printf '%s\n' "$observed"
 }
 
@@ -7503,7 +7528,8 @@ _release_finalize_execute_locked() {
        "$(_gh_asset_sha256 "$config")" == "$config_sha" ]] || return 4
     _source_release_inputs_match "$config" "$config_sha" "$response" "$receipt_sha" "$registry" "$registry_sha" || return 4
     current_plan=$(_release_contract_preflight "$tool" "$tag" "$repo" "$path" "$artifacts" "$manifest" "$contract" verify) || return 4
-    jq -en --argjson a "$plan" --argjson b "$current_plan" '$a == $b' >/dev/null || return 4
+    jq -e --slurpfile expected /dev/fd/3 '. == $expected[0]' \
+        3<<< "$plan" <<< "$current_plan" >/dev/null || return 4
     _release_contract_verify_remote_tag_identity "$repo" "$tag" "$(jq -r '.git_sha' <<< "$plan")" || return 7
     _release_contract_verify_tag_ruleset_receipt "$(jq -c '.tag_ruleset_receipt' <<< "$plan")" || return 7
     if $DRY_RUN; then
@@ -7516,9 +7542,10 @@ _release_finalize_execute_locked() {
     [[ -d "$state_dir/releases" && ! -L "$state_dir/releases" ]] || return 7
     output=$(umask 077; mktemp "$state_dir/releases/$tool-$tag-finalization-pending.XXXXXXXX") || return 7
     jq -n --arg repo "$repo" --arg tag "$tag" --argjson id "$release_id" \
-        --arg response "$response" --arg sha "$receipt_sha" --argjson plan "$plan" \
+        --arg response "$response" --arg sha "$receipt_sha" --slurpfile plan /dev/fd/3 \
         --arg config_sha "$config_sha" --arg registry_sha "$registry_sha" --argjson metadata "$metadata" \
-        '{schema:"dsr.strict_finalization_receipt.v1",status:"pending",repo:$repo,tag:$tag,release_id:$id,create_response:$response,create_response_sha256:$sha,config_sha256:$config_sha,registry_sha256:$registry_sha,plan:$plan,metadata:$metadata}' > "$output" || return 7
+        '{schema:"dsr.strict_finalization_receipt.v1",status:"pending",repo:$repo,tag:$tag,release_id:$id,create_response:$response,create_response_sha256:$sha,config_sha256:$config_sha,registry_sha256:$registry_sha,plan:$plan[0],metadata:$metadata}' \
+        3<<< "$plan" > "$output" || return 7
     jq -e '.status == "pending"' "$output" >/dev/null || return 7
     # Re-observe all remote bytes and the complete original nonce-bound
     # metadata immediately before changing only this proven draft's state.
@@ -7528,7 +7555,8 @@ _release_finalize_execute_locked() {
        "$(_gh_asset_sha256 "$config")" == "$config_sha" ]] || return 4
     _source_release_inputs_match "$config" "$config_sha" "$response" "$receipt_sha" "$registry" "$registry_sha" || return 4
     current_plan=$(_release_contract_preflight "$tool" "$tag" "$repo" "$path" "$artifacts" "$manifest" "$contract" verify) || return 4
-    jq -en --argjson a "$plan" --argjson b "$current_plan" '$a == $b' >/dev/null || return 4
+    jq -e --slurpfile expected /dev/fd/3 '. == $expected[0]' \
+        3<<< "$plan" <<< "$current_plan" >/dev/null || return 4
     _release_contract_verify_remote_tag_identity "$repo" "$tag" "$(jq -r '.git_sha' <<< "$plan")" || return 7
     _release_contract_verify_tag_ruleset_receipt "$(jq -c '.tag_ruleset_receipt' <<< "$plan")" || return 7
     _source_release_identity "$repo" "$path" "$tag" "$(jq -r '.git_sha' <<< "$plan")" || return 4
@@ -7542,7 +7570,8 @@ _release_finalize_execute_locked() {
        "$(_gh_asset_sha256 "$config")" == "$config_sha" ]] || valid=false
     _source_release_inputs_match "$config" "$config_sha" "$response" "$receipt_sha" "$registry" "$registry_sha" || valid=false
     current_plan=$(_release_contract_preflight "$tool" "$tag" "$repo" "$path" "$artifacts" "$manifest" "$contract" verify) || valid=false
-    jq -en --argjson a "$plan" --argjson b "${current_plan:-null}" '$a == $b' >/dev/null || valid=false
+    jq -e --slurpfile expected /dev/fd/3 '. == $expected[0]' \
+        3<<< "$plan" <<< "${current_plan:-null}" >/dev/null || valid=false
     _release_contract_verify_remote_tag_identity "$repo" "$tag" "$(jq -r '.git_sha' <<< "$plan")" || valid=false
     _release_contract_verify_tag_ruleset_receipt "$(jq -c '.tag_ruleset_receipt' <<< "$plan")" || valid=false
     _source_release_identity "$repo" "$path" "$tag" "$(jq -r '.git_sha' <<< "$plan")" || valid=false
@@ -7556,8 +7585,9 @@ _release_finalize_execute_locked() {
         return 7
     }
     if ! jq -n --arg repo "$repo" --arg tag "$tag" --argjson id "$release_id" \
-        --arg response "$response" --arg sha "$receipt_sha" --argjson plan "$plan" \
-        --arg pending "$output" --argjson release "$observed" '{schema:"dsr.strict_finalization_receipt.v1",status:"success",repo:$repo,tag:$tag,release_id:$id,create_response:$response,create_response_sha256:$sha,pending_receipt:$pending,plan:$plan,release:$release}' > "$final_output"; then
+        --arg response "$response" --arg sha "$receipt_sha" --slurpfile plan /dev/fd/3 \
+        --arg pending "$output" --slurpfile release /dev/fd/4 '{schema:"dsr.strict_finalization_receipt.v1",status:"success",repo:$repo,tag:$tag,release_id:$id,create_response:$response,create_response_sha256:$sha,pending_receipt:$pending,plan:$plan[0],release:$release[0]}' \
+        3<<< "$plan" 4<<< "$observed" > "$final_output"; then
         _source_release_restore_draft "$repo" "$release_id" "$metadata" || true
         return 7
     fi
@@ -9147,20 +9177,29 @@ EOF
                 --argjson promotion_requested "$publish_draft" \
                 --argjson prerelease "$prerelease" \
                 --argjson file_count "$file_count" \
-                --argjson artifacts "$plan_artifacts_json" \
-                --argjson extra "$plan_extra_json" \
+                --slurpfile artifacts /dev/fd/3 \
+                --slurpfile extra /dev/fd/4 \
                 --argjson strict "$release_contract_enabled" \
                 --argjson installer "$installer_report" \
                 --argjson sbom "$ordinary_sbom_report" \
-                --argjson contract_assets "$(if $release_contract_enabled; then jq -c '[.assets[].name]' <<< "$release_contract_plan"; else echo '[]'; fi)" \
-                '{tool: $tool, version: $version, tag: $version, repo: $repo,
+                --slurpfile contract_assets /dev/fd/5 \
+                'if ($artifacts | length) == 1 and ($extra | length) == 1 and
+                    ($contract_assets | length) == 1 then
+                 $artifacts[0] as $artifacts | $extra[0] as $extra |
+                 $contract_assets[0] as $contract_assets |
+                 {tool: $tool, version: $version, tag: $version, repo: $repo,
                   artifacts_dir: $artifacts_dir, draft: $draft, prerelease: $prerelease,
                   promotion_requested: $promotion_requested,
                   file_count: $file_count, mode: "dry_run", dry_run: true,
                   plan: (if $strict then {strict: true, assets: $contract_assets}
                          else {strict: false, artifacts: $artifacts, additional_files: $extra,
                                generated: ["SHA256SUMS", "<name>.sha256 per uploaded name"]} end),
-                  installer_check: $installer, sbom:$sbom}')"
+                  installer_check: $installer, sbom:$sbom}
+                 else error("Invalid release plan report inputs") end' \
+                3<<< "$plan_artifacts_json" 4<<< "$plan_extra_json" \
+                5< <(if $release_contract_enabled; then
+                    jq -c '[.assets[].name]' <<< "$release_contract_plan"
+                else printf '[]\n'; fi))"
         fi
         return 0
     fi
@@ -9457,16 +9496,16 @@ EOF
             log_error "Cannot preserve private strict creation custody before POST"
             return 4
         fi
-        strict_creation_intent=$(jq -nc --arg repo "$repo" --arg tool "$tool_name" --arg tag "$tag" \
-            --arg artifacts_dir "$(cd "$artifacts_dir" && pwd -P)" --argjson plan "$release_contract_plan" \
+        strict_creation_intent=$(jq -c --arg repo "$repo" --arg tool "$tool_name" --arg tag "$tag" \
+            --arg artifacts_dir "$(cd "$artifacts_dir" && pwd -P)" \
             '{schema_version:"dsr.strict_creation_intent.v1",repo:$repo,tool:$tool,tag:$tag,
-              artifacts_dir:$artifacts_dir,plan:$plan}') || return 4
+              artifacts_dir:$artifacts_dir,plan:.}' <<< "$release_contract_plan") || return 4
         (umask 077; set -C; printf '%s\n' "$strict_creation_intent" > \
             "$create_response_dir/creation-intent.json") || return 4
         strict_creation_proof=$(_source_release_read_private_receipt \
             "$create_response_dir/creation-intent.json" "$create_response_dir" "" "" "creation-intent.") || return 4
-        jq -en --argjson proof "$strict_creation_proof" --argjson intent "$strict_creation_intent" \
-            '$proof.record == $intent' >/dev/null || return 4
+        jq -e --slurpfile intent /dev/fd/3 '.record == $intent[0]' \
+            3<<< "$strict_creation_intent" <<< "$strict_creation_proof" >/dev/null || return 4
         release_args+=" --retain-response"
     else
         command -v python3 >/dev/null 2>&1 || { log_error "Private release creation custody requires python3"; return 3; }
@@ -9810,11 +9849,11 @@ EOF
         # shellcheck disable=SC2064 # expand now: $cleanup is a %q-quoted command
         trap "$cleanup" EXIT
         trap 'exit 5' INT TERM
-        jq -nc --arg repo "$repo" --arg tag "$tag" --argjson release_id "$release_id" \
+        printf '%s\n' "${uploaded_assets[@]}" | jq -sc \
+            --arg repo "$repo" --arg tag "$tag" --argjson release_id "$release_id" \
             --arg run_id "${DSR_RUN_ID:-unknown}" \
-            --argjson uploaded "$(printf '%s\n' "${uploaded_assets[@]}" | jq -sc '.')" \
             '{schema:"dsr.release_upload_receipt.v1",repo:$repo,tag:$tag,
-              release_id:$release_id,run_id:$run_id,uploaded:$uploaded}' > "$temporary" || return 1
+              release_id:$release_id,run_id:$run_id,uploaded:.}' > "$temporary" || return 1
         [[ -s "$temporary" ]] && jq -es 'length==1 and (.[0]|type=="object")' "$temporary" >/dev/null || return 1
         mv -f -- "$temporary" "$upload_state_file"
     )
@@ -10057,10 +10096,9 @@ EOF
                     --argjson release "$release_contract_metadata_json" \
                     '. + {release: $release}' <<< "$current_release_contract_plan") || \
                     current_release_contract_plan=""
-                if jq -en \
-                    --argjson frozen "$release_contract_plan" \
-                    --argjson current "$current_release_contract_plan" \
-                    '$frozen == $current' >/dev/null 2>&1; then
+                if jq -e --slurpfile frozen /dev/fd/3 \
+                    '$frozen[0] == .' 3<<< "$release_contract_plan" \
+                    <<< "$current_release_contract_plan" >/dev/null 2>&1; then
                     publish_preflight_valid=true
                 else
                     _release_record_failed "publish-preflight" \
@@ -10525,8 +10563,8 @@ EOF
             --argjson draft "$draft" \
             --argjson promotion_requested "$publish_draft" \
             --argjson prerelease "$prerelease" \
-            --argjson uploaded "$(printf '%s\n' "${uploaded_assets[@]}" | jq -sc '.')" \
-            --argjson failed "$(printf '%s\n' "${failed_assets[@]}" | jq -sc '.')" \
+            --slurpfile uploaded /dev/fd/3 \
+            --slurpfile failed /dev/fd/4 \
             --arg verification "$verification_status" \
             --argjson tag_ruleset_receipt "$release_contract_tag_ruleset_receipt" \
             --argjson total "$total_files" \
@@ -10577,7 +10615,9 @@ EOF
                     results: $dispatch_results
                 }
             } + (if $custody_error == "" then {} else
-                {stage:"build_custody",error:$custody_error} end)')
+                {stage:"build_custody",error:$custody_error} end)' \
+            3< <(printf '%s\n' "${uploaded_assets[@]}") \
+            4< <(printf '%s\n' "${failed_assets[@]}"))
         json_envelope "release" "$status" "$exit_code" "$details"
     else
         echo ""
@@ -11629,10 +11669,9 @@ EOF
                repaired_contract_plan=$(_release_contract_preflight \
                 "$tool_name" "$tag" "$repo" "$local_path" "$artifacts_dir" \
                 "$manifest_file" "$release_contract_json" verify) && \
-               jq -en \
-                --argjson frozen "$release_contract_plan" \
-                --argjson current "$repaired_contract_plan" \
-                '$frozen == $current' >/dev/null 2>&1 && \
+               jq -e --slurpfile frozen /dev/fd/3 \
+                '$frozen[0] == .' 3<<< "$release_contract_plan" \
+                <<< "$repaired_contract_plan" >/dev/null 2>&1 && \
                _release_contract_verify_remote_tag_identity \
                 "$repo" "$tag" "$(jq -r '.git_sha' <<< "$release_contract_plan")" && \
                _release_contract_verify_remote_assets \
@@ -11868,22 +11907,29 @@ EOF
             --arg release_url "$release_url" \
             --argjson manifest_found "$manifest_exists" \
             --argjson expected_count "${#expected_assets[@]}" \
-            --argjson present "$(printf '%s\n' "${present_assets[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
-            --argjson missing "$(printf '%s\n' "${missing_assets[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
-            --argjson extra "$(printf '%s\n' "${extra_assets[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
-            --argjson size_mismatches "$(printf '%s\n' "${size_mismatches[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
-            --argjson digest_mismatches "$(printf '%s\n' "${digest_mismatches[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+            --rawfile present /dev/fd/3 \
+            --rawfile missing /dev/fd/4 \
+            --rawfile extra /dev/fd/5 \
+            --rawfile size_mismatches /dev/fd/6 \
+            --rawfile digest_mismatches /dev/fd/7 \
             --argjson remote_records_valid "$strict_remote_records_valid" \
             --argjson tag_ruleset_receipt "$strict_tag_ruleset_receipt" \
-            --argjson checksum_verified "$(printf '%s\n' "${verified_checksums[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
-            --argjson checksum_errors "$(printf '%s\n' "${checksum_errors[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+            --rawfile checksum_verified /dev/fd/8 \
+            --rawfile checksum_errors /dev/fd/9 \
             --argjson fix_requested "$fix_missing" \
             --argjson dry_run "${DRY_RUN:-false}" \
-            --argjson planned_fixes "$(printf '%s\n' ${planned_fixes[@]+"${planned_fixes[@]}"} | jq -Rsc 'split("\n") | map(select(length > 0))')" \
-            --argjson repair_errors "$(printf '%s\n' ${ordinary_repair_errors[@]+"${ordinary_repair_errors[@]}"} | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+            --rawfile planned_fixes /dev/fd/10 \
+            --rawfile repair_errors /dev/fd/11 \
             --arg custody_error "$repair_custody_error" \
             --argjson duration "$duration" \
-            '{
+            'def names: split("\n") | map(select(length > 0));
+            ($present | names) as $present | ($missing | names) as $missing |
+            ($extra | names) as $extra | ($size_mismatches | names) as $size_mismatches |
+            ($digest_mismatches | names) as $digest_mismatches |
+            ($checksum_verified | names) as $checksum_verified |
+            ($checksum_errors | names) as $checksum_errors |
+            ($planned_fixes | names) as $planned_fixes | ($repair_errors | names) as $repair_errors |
+            {
                 repo: $repo,
                 version: $version,
                 tag: $tag,
@@ -11917,7 +11963,16 @@ EOF
                     else null end),
                 duration_seconds: $duration
             } + (if $custody_error == "" then {} else
-                {stage:"build_custody",error:$custody_error} end)')
+                {stage:"build_custody",error:$custody_error} end)' \
+            3< <(printf '%s\n' "${present_assets[@]}") \
+            4< <(printf '%s\n' "${missing_assets[@]}") \
+            5< <(printf '%s\n' "${extra_assets[@]}") \
+            6< <(printf '%s\n' "${size_mismatches[@]}") \
+            7< <(printf '%s\n' "${digest_mismatches[@]}") \
+            8< <(printf '%s\n' "${verified_checksums[@]}") \
+            9< <(printf '%s\n' "${checksum_errors[@]}") \
+            10< <(printf '%s\n' ${planned_fixes[@]+"${planned_fixes[@]}"}) \
+            11< <(printf '%s\n' ${ordinary_repair_errors[@]+"${ordinary_repair_errors[@]}"}))
         json_envelope "release-verify" "$status" "$exit_code" "$details"
     else
         echo ""
@@ -12828,9 +12883,9 @@ EOF
         local expected candidate proof count=0
         jq -e '(.exact_primary_assets | length) as $primaries |
             ($primaries * 2 + (if has("minisign_public_key_file") then $primaries else 0 end) +
-             ((.exact_additional_assets // []) | length) + ((.build_manifest_assets // []) | length)) < 100' \
+             ((.exact_additional_assets // []) | length) + ((.build_manifest_assets // []) | length)) < 10000' \
             <<< "$contract" >/dev/null || {
-            log_error "Automatic strict recovery requires fewer than 100 contracted assets"
+            log_error "Automatic strict recovery exceeds the bounded release inventory"
             return 4
         }
         strict_build_run=$(jq -er '.run_id | select(type == "string" and
@@ -12904,8 +12959,8 @@ EOF
             [[ "$proof" == "$strict_custody_proof" ]] || return 4
             plan=$(_release_contract_preflight "$tool_name" "$tag" "$repo" "$local_path" \
                 "$strict_artifacts" "$strict_manifest" "$contract" verify) || return 4
-            jq -en --argjson plan "$plan" --argjson expected "$strict_plan" \
-                '$plan == $expected' >/dev/null || return 4
+            jq -e --slurpfile expected /dev/fd/3 \
+                '. == $expected[0]' 3<<< "$strict_plan" <<< "$plan" >/dev/null || return 4
             _source_release_identity "$repo" "$local_path" "$tag" "$(jq -r '.git_sha' <<< "$strict_plan")" || return 4
         fi
     }
@@ -12940,15 +12995,16 @@ EOF
             "$strict_custody" "" "" "dsr-api-response.") || return 4
         creation=$(jq -c '.record' <<< "$strict_creation_proof") || return 4
         saved=$(jq -c '.record' <<< "$strict_response_proof") || return 4
-        if ! jq -en --argjson creation "$creation" --argjson response "$saved" \
-            --argjson intent "$(jq -c '.record' <<< "$strict_intent_proof")" '
+        if ! jq -en --slurpfile creation /dev/fd/3 --slurpfile response /dev/fd/4 \
+            --slurpfile intent /dev/fd/5 '
+            $creation[0] as $creation | $response[0] as $response | $intent[0].record as $intent |
             $creation.plan as $p | $p.release as $m |
             $creation.schema_version == "dsr.strict_creation_intent.v1" and
             $creation.repo == $intent.repo and $creation.tool == $intent.tool and
             $creation.tag == $intent.tag and $creation.artifacts_dir == $intent.artifacts_dir and
             $p.repo == $intent.repo and $p.tool == $intent.tool and $p.tag == $intent.tag and
             $p.git_sha == $intent.git_sha and $p.manifest_sha256 == $intent.manifest_sha256 and
-            ($p.assets | type == "array" and length > 0 and length < 100) and
+            ($p.assets | type == "array" and length > 0 and length < 10000) and
             $m.requested_draft == false and $m.tag_name == $intent.tag and $m.name == $intent.tag and
             $m.target_commitish == $intent.git_sha and ($m.prerelease | type == "boolean") and
             ($m.body | type == "string" and test("<!-- dsr-create-nonce:[0-9a-f]{64} -->$")) and
@@ -12960,19 +13016,20 @@ EOF
             $response.upload_url == ("https://uploads.github.com/repos/" + $intent.repo +
                 "/releases/" + ($response.id|tostring) + "/assets{?name,label}") and
             ($response.html_url | type == "string" and startswith("https://github.com/" + $intent.repo + "/releases/"))
-        ' >/dev/null; then
+        ' 3<<< "$creation" 4<<< "$saved" 5<<< "$strict_intent_proof" >/dev/null; then
             log_error "Strict creation custody does not match this build's frozen publication intent"
             return 4
         fi
         strict_plan=$(jq -c '.plan | del(.release)' <<< "$creation") || return 4
         strict_metadata=$(jq -c '.plan.release | del(.requested_draft)' <<< "$creation") || return 4
         strict_release_id=$(jq -r '.id' <<< "$saved") || return 4
-        binding=$(jq -nc --argjson intent "$strict_intent_proof" --argjson creation "$strict_creation_proof" \
-            --argjson response "$strict_response_proof" --arg path "$strict_response" \
+        binding=$(jq -nc --slurpfile intent /dev/fd/3 --slurpfile creation /dev/fd/4 \
+            --slurpfile response /dev/fd/5 --arg path "$strict_response" \
             --arg creation_path "$strict_creation" --argjson id "$strict_release_id" '
             {schema_version:"dsr.strict_fallback_custody.v1",release_id:$id,create_response:$path,
              creation_intent:$creation_path,
-             intent:($intent|del(.record)),creation:($creation|del(.record)),response:($response|del(.record))}') || return 4
+             intent:($intent[0]|del(.record)),creation:($creation[0]|del(.record)),response:($response[0]|del(.record))}' \
+            3<<< "$strict_intent_proof" 4<<< "$strict_creation_proof" 5<<< "$strict_response_proof") || return 4
         if [[ ! -e "$strict_handoff/custody.json" && ! -L "$strict_handoff/custody.json" ]]; then
             (umask 077; set -C; printf '%s\n' "$binding" > "$strict_handoff/custody.json") || return 4
         fi
@@ -12992,17 +13049,15 @@ EOF
         _fallback_strict_inputs_match || return 4
         scan=$(_release_contract_scan_release_by_tag "$repo" "$tag") || return 7
         jq -e --argjson id "$strict_release_id" '.count == 1 and .release.id == $id' <<< "$scan" >/dev/null || return 7
-        observed=$(gh_api "repos/$repo/releases/$strict_release_id" --no-cache) || return 7
+        observed=$(_release_contract_observe_remote_inventory "$repo" "$strict_release_id") || return 7
         _source_release_metadata_matches "$observed" "$strict_metadata" "$strict_release_id" any || return 7
-        inventory=$(gh_api "repos/$repo/releases/$strict_release_id/assets?per_page=100&page=1" --no-cache) || return 7
-        if ! jq -en --argjson observed "$observed" --argjson inventory "$inventory" \
-            --argjson plan "$strict_plan" --argjson seen "$strict_seen_assets" \
+        inventory=$(jq -c '.assets' <<< "$observed") || return 7
+        if ! jq -e --slurpfile plan /dev/fd/3 --slurpfile seen /dev/fd/4 \
             --arg repo "$repo" --argjson id "$strict_release_id" '
-            def records: map({id,name,state,size,digest}) | sort_by(.id);
+            . as $observed | .assets as $inventory | $plan[0] as $plan | $seen[0] as $seen |
             $observed.upload_url == ("https://uploads.github.com/repos/" + $repo +
                 "/releases/" + ($id|tostring) + "/assets{?name,label}") and
-            ($inventory | type == "array" and length < 100) and
-            ($inventory | records) == ($observed.assets | records) and
+            ($inventory | type == "array" and length < 10000) and
             ([$inventory[].id] | unique | length) == ($inventory|length) and
             ([$inventory[].name] | unique | length) == ($inventory|length) and
             all($seen[]; . as $previous |
@@ -13012,7 +13067,7 @@ EOF
                 .state == "uploaded" and
                 ([$plan.assets[] | select(.name == $asset.name and .size_bytes == $asset.size and
                     ("sha256:" + .sha256) == $asset.digest)] | length) == 1)
-        ' >/dev/null; then
+        ' 3<<< "$strict_plan" 4<<< "$strict_seen_assets" <<< "$observed" >/dev/null; then
             log_error "Owned strict draft has extra, incomplete, duplicate, or changed remote assets"
             return 7
         fi
@@ -13039,12 +13094,12 @@ EOF
             jq -e --arg sha "sha256:$sha" --argjson size "$size" \
                 '.digest == $sha and .size == $size' <<< "$asset" >/dev/null || return 7
         done < <(jq -c '.[]' <<< "$inventory")
-        after=$(gh_api "repos/$repo/releases/$strict_release_id" --no-cache) || return 7
+        after=$(_release_contract_observe_remote_inventory "$repo" "$strict_release_id") || return 7
         _source_release_metadata_matches "$after" "$strict_metadata" "$strict_release_id" any || return 7
-        jq -en --argjson before "$observed" --argjson after "$after" '
+        jq -e --slurpfile before /dev/fd/3 '
             def identity: {id,tag_name,name,body,prerelease,target_commitish,draft,upload_url,
                 assets:([.assets[]|{id,name,state,size,digest}]|sort_by(.id))};
-            ($before|identity) == ($after|identity)' >/dev/null || return 7
+            ($before[0]|identity) == (. |identity)' 3<<< "$observed" <<< "$after" >/dev/null || return 7
         strict_observed="$after"
         strict_seen_assets="$inventory"
     }
@@ -13091,13 +13146,14 @@ EOF
         final_receipt=$(jq -r '.details.receipt' <<< "$final_result") || return 7
         final_proof=$(_source_release_read_private_receipt "$final_receipt" "$state_dir/releases" \
             "$tool_name" "$tag" "$tool_name-$tag-finalized.") || return 7
-        jq -en --argjson proof "$final_proof" --argjson plan "$strict_plan" \
+        jq -e --slurpfile plan /dev/fd/3 \
             --arg repo "$repo" --arg tag "$tag" --argjson id "$strict_release_id" \
             --arg response "$strict_response" --arg sha "$(jq -r '.sha256' <<< "$strict_response_proof")" '
-            $proof.record | .schema == "dsr.strict_finalization_receipt.v1" and .status == "success" and
+            $plan[0] as $plan | .record | .schema == "dsr.strict_finalization_receipt.v1" and .status == "success" and
             .repo == $repo and .tag == $tag and .release_id == $id and
             .create_response == $response and .create_response_sha256 == $sha and
-            .plan == $plan and .release.id == $id and .release.draft == false' >/dev/null || return 7
+            .plan == $plan and .release.id == $id and .release.draft == false' \
+            3<<< "$strict_plan" <<< "$final_proof" >/dev/null || return 7
         _fallback_strict_inputs_match || return 4
         publication_recovery=$(jq -c --arg receipt "$final_receipt" \
             '. + {status:"finalized",finalization_receipt:$receipt}' <<< "$publication_recovery") || return 4

@@ -2044,6 +2044,12 @@ recoverable custody and does not claim publication. Preserve the complete state
 and original output directory. Automatic strict recovery inherits the
 finalizer's configuration restrictions, documented in the
 [recovery guide](NATIVE_RELEASE_RECOVERY.md#resume-an-interrupted-strict-fallback-publication).
+Strict inventory verification and recovery paginate the complete assets
+endpoint, including the terminal page after an exact multiple of 100 assets.
+Later-page errors, malformed records, and duplicate IDs or case-insensitive names
+block publication. The observation limit is 100 pages, with a required short
+terminal page; the existing 1 MiB private receipt limit still bounds recoverable
+plans.
 
 Fallback accepts the same `--sbom`, `--no-sbom`, and `--sbom-format` policy as
 ordinary release and forwards it to publication. Build-only runs do not scan.

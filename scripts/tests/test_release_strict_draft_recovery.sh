@@ -31,11 +31,16 @@ os.umask(0o077)
 work = Path(tempfile.mkdtemp(prefix='dsr-strict-finalize-')).resolve()
 source = Path(os.environ.get('DSR_TEST_COMMAND_FILE', str(root / 'dsr'))).read_text()
 names = re.findall(r'^(_release_[A-Za-z0-9_]+)\(\) \{', source, re.M)
-names += ['_source_release_read_private_receipt', '_source_release_metadata_matches',
+names += ['json_envelope', '_source_release_read_private_receipt', '_source_release_metadata_matches',
           '_source_release_restore_draft', '_source_release_identity',
           '_source_release_inputs_match', 'cmd_release_finalize', 'cmd_release', 'cmd_release_verify', 'cmd_fallback', 'main']
 functions = work / 'functions.sh'
-functions.write_text('\n'.join(re.search(r'^' + re.escape(n) + r'\(\) \{\n.*?^\}', source, re.M | re.S).group(0) for n in names))
+extracted=[]
+for name in names:
+    # The real envelope contains a column-zero JSON brace in its heredoc.
+    ending=r'^EOF\n\}' if name=='json_envelope' else r'^\}'
+    extracted.append(re.search(r'^'+re.escape(name)+r'\(\) \{\n.*?'+ending,source,re.M|re.S).group(0))
+functions.write_text('\n'.join(extracted))
 print('Fixtures: ' + str(work), flush=True)
 checks = 0
 
@@ -75,9 +80,14 @@ if endpoint=='upload-boundary':
     if control.get('fail_upload_name')==name:
         print('Controlled upload failure',file=sys.stderr);sys.exit(1)
     (c/'bytes'/str(aid)).write_bytes(data)
-    asset={'id':aid,'name':name,'state':'uploaded','size':len(data),'digest':'sha256:'+hashlib.sha256(data).hexdigest()}
+    asset={'id':aid,'name':name,'state':'uploaded','size':len(data),'digest':'sha256:'+hashlib.sha256(data).hexdigest(),
+           'browser_download_url':'https://github.com/owner/app/releases/download/v1.2.3/'+name}
     r['assets'].append(asset);(c/'remote.json').write_text(json.dumps(r));print(json.dumps(asset))
     if control.get('lost_upload_name')==name:sys.exit(1)
+elif endpoint=='checksum-download':
+    matches=[a for a in r['assets'] if a.get('browser_download_url')==args[1]]
+    if len(matches)!=1:sys.exit(89)
+    Path(args[2]).write_bytes((c/'bytes'/str(matches[0]['id'])).read_bytes())
 elif endpoint=='repos/owner/app/releases' and '--post' in args:
     request=json.loads(args[args.index('--post')+1])
     r=dict(request,id=9,assets=[],upload_url='https://uploads.github.com/repos/owner/app/releases/9/assets{?name,label}',
@@ -131,11 +141,31 @@ elif endpoint=='repos/owner/app/releases/9':
         p=c/'config/repos.d/app.yaml';p.write_text(p.read_text()+'\n')
     if count==2 and control.get('registry_appears'):
         (c/'config/repos.yaml').write_text(json.dumps({'tools':{'app':{'release_contract':{}}}}))
-    (c/'control.json').write_text(json.dumps(control));print(json.dumps(r))
+    (c/'control.json').write_text(json.dumps(control))
+    observed=dict(r,assets=r['assets'][:100])
+    if control.get('embedded_fault')=='duplicate':observed['assets']+=observed['assets'][:1]
+    if control.get('embedded_fault')=='malformed' and observed['assets']:
+        observed['assets'][0]=dict(observed['assets'][0],size='invalid')
+    print(json.dumps(observed))
 elif endpoint.startswith('repos/owner/app/releases/9/assets?'):
-    assets=list(r['assets'])
+    page=int(endpoint.rsplit('page=',1)[1]);assets=list(r['assets'])
+    if page==1:
+        control['inventories']=control.get('inventories',0)+1
+        (c/'control.json').write_text(json.dumps(control))
     if control.get('hidden_asset') or (control.get('post_hidden_asset') and not r['draft']):assets.append(dict(assets[0],id=999,name='hidden.bin'))
-    print(json.dumps([] if 'page=2' in endpoint else assets))
+    fault=control.get('inventory_fault')
+    if fault=='missing-last':assets=assets[:-1]
+    if fault=='extra':assets.append(dict(assets[0],id=999999,name='unselected.bin'))
+    if fault=='late-change' and control.get('inventories',0)>1:
+        assets[-1]=dict(assets[-1],id=999998)
+    selected=assets[(page-1)*100:page*100]
+    if page==2:
+        if fault=='failed-page':sys.exit(91)
+        if fault=='malformed-page':selected={'message':'not an asset page'}
+        if fault=='duplicate-id':selected=[dict(assets[0])]+selected[1:]
+        if fault=='duplicate-name':selected=[dict(assets[0],id=999997)]+selected[1:]
+        if fault=='case-alias':selected=[dict(assets[0],id=999997,name=assets[0]['name'].upper())]+selected[1:]
+    print(json.dumps(selected))
 else:print('Unexpected API '+endpoint,file=sys.stderr);sys.exit(89)
 '''
 
@@ -166,7 +196,6 @@ _dsr_require() {
 }
 _dispatch_load_config() { printf 'false|||\n'; }
 _dispatch_is_true() { [[ "$1" == true ]]; }
-json_envelope() { jq -nc --arg command "$1" --arg status "$2" --argjson exit_code "$3" --argjson details "$4" '{command:$command,status:$status,exit_code:$exit_code,details:$details}'; }
 gh_check() { return 0; }
 gh_check_token() { return 0; }
 gh_api() { python3 "$CASE/api.py" "$@"; }
@@ -179,6 +208,7 @@ mktemp() {
 }
 DRY_RUN=false
 JSON_MODE=false
+DSR_VERSION=fixture
 VERBOSE=false
 QUIET=false
 NON_INTERACTIVE=false
@@ -207,6 +237,10 @@ if [[ "$1" == create || "$1" == fallback || "$1" == verify || "$1" == public-fin
     if [[ "$mode" == create ]]; then
         cmd_release app 1.2.3 --draft --no-dispatch "$@"
     elif [[ "$mode" == verify ]]; then
+        curl() {
+            [[ $# == 4 && "$1" == -sL && "$3" == -o ]] || return 89
+            python3 "$CASE/api.py" checksum-download "$2" "$4"
+        }
         DRY_RUN="$1"; shift
         cmd_release_verify app 1.2.3 "$@"
     elif [[ "$mode" == public-finalize ]]; then
@@ -273,11 +307,13 @@ else
 fi
 '''
 
-def setup(label, controls=None):
+def setup(label, controls=None, extra_assets=0, long_names=False):
     c=work/label;shutil.copytree(base,c)
     for name in ['tmp','config/repos.d','state/artifacts/app-v1.2.3','bytes']:(c/name).mkdir(parents=True)
     (c/'api.py').write_text(api);(c/'requests.jsonl').write_text('');(c/'control.json').write_text(json.dumps(controls or {}))
-    (c/'config/repos.d/app.yaml').write_text(json.dumps({'tool_name':'app','repo':'owner/app','local_path':str(c/'repo'),'targets':['linux/amd64'],'release_contract':contract}))
+    extra_names=['companion-%03d-%s.txt'%(i,'x'*220 if long_names else 'data') for i in range(extra_assets)]
+    selected_contract=dict(contract,exact_additional_assets=contract['exact_additional_assets']+extra_names)
+    (c/'config/repos.d/app.yaml').write_text(json.dumps({'tool_name':'app','repo':'owner/app','local_path':str(c/'repo'),'targets':['linux/amd64'],'release_contract':selected_contract}))
     artifacts=c/'state/artifacts/app-v1.2.3'
     # A real tar archive; this test does not claim a native binary build.
     subprocess.run(['tar','-czf',str(artifacts/'payload.tar.gz'),'-C',str(c/'repo'),'README.md'],check=True)
@@ -286,6 +322,11 @@ def setup(label, controls=None):
               'build_purpose':'release','publishable':True,'requested_targets':['linux/amd64'],
               'status':'success','summary':{'total':1,'success':1,'failed':0},
               'artifacts':[{'name':'payload.tar.gz','target':'linux/amd64','sha256':hashlib.sha256(payload).hexdigest(),'size_bytes':len(payload),'build_purpose':'release','publishable':True}]}
+    for name in extra_names:
+        data=('Authenticated release companion: '+name+'\n').encode()
+        (artifacts/name).write_bytes(data)
+        manifest['artifacts'].append(dict(name=name,target='additional',sha256=hashlib.sha256(data).hexdigest(),
+                                         size_bytes=len(data),build_purpose='release',publishable=True))
     (artifacts/'app-v1.2.3-manifest.json').write_text(json.dumps(manifest))
     original={'id':9,'tag_name':'v1.2.3','name':'v1.2.3','target_commitish':sha,'draft':True,'prerelease':False,'assets':[],
               'body':'Release 1.2.3\n\n<!-- dsr-create-nonce:'+'1'*64+' -->',
@@ -301,7 +342,8 @@ def setup(label, controls=None):
     plan=json.loads((c/'plan.json').read_text());remote=dict(original,assets=[])
     for i,a in enumerate(plan['assets'],100):
         shutil.copyfile(a['path'],c/'bytes'/str(i))
-        remote['assets'].append({'id':i,'name':a['name'],'state':'uploaded','size':a['size_bytes'],'digest':'sha256:'+a['sha256']})
+        remote['assets'].append({'id':i,'name':a['name'],'state':'uploaded','size':a['size_bytes'],'digest':'sha256:'+a['sha256'],
+                                'browser_download_url':'https://github.com/owner/app/releases/download/v1.2.3/'+a['name']})
     (c/'remote.json').write_text(json.dumps(remote))
     (c/'requests.jsonl').write_text('')
     return c,env,response,original
@@ -323,12 +365,12 @@ def prepare_cases(cases):
         prepared=list(pool.map(lambda case: setup(*case),cases))
     return zip(cases,prepared)
 
-def test_fallback_recovery():
+def test_fallback_recovery(pagination_only=False):
     run_id='11111111-1111-4111-8111-111111111111'
     missing='payload.tar.gz.sha256'
 
-    def prepare(label,controls=None,custom=False):
-        c,env,_,_=setup('fallback-'+label,dict(absent=True,**(controls or {})))
+    def prepare(label,controls=None,custom=False,extra_assets=0,long_names=False):
+        c,env,_,_=setup('fallback-'+label,dict(absent=True,**(controls or {})),extra_assets,long_names)
         # copytree preserves the base Git index's cached stat data. Refresh
         # this new fixture checkout so diff-index sees its actual clean tree.
         subprocess.run(['git','-C',str(c/'repo'),'update-index','--refresh'],check=True)
@@ -361,11 +403,13 @@ def test_fallback_recovery():
         (c/(name+'.stderr')).write_text(result.stderr)
         return result,requests(c)[before:]
 
-    def interrupt_upload(label,custom=False):
-        c,env,output=prepare(label,{'fail_upload_name':missing},custom)
+    def interrupt_upload(label,custom=False,extra_assets=0,long_names=False):
+        c,env,output=prepare(label,{'fail_upload_name':missing},custom,extra_assets,long_names)
         result,rows=invoke_fallback(c,env,output)
         check(label+' initial publication interrupted',result.returncode!=0)
         details=json.loads(result.stdout)['details']
+        if details.get('publication_recovery',{}).get('status')!='ready':
+            print(result.stderr[-6000:],file=sys.stderr,flush=True)
         check(label+' original custody retained in durable handoff',
               details['publication_recovery']['status']=='ready' and
               details['publication_recovery']['build_run_id']==run_id and
@@ -373,6 +417,57 @@ def test_fallback_recovery():
               len([row for row in rows if '--post' in row])==1 and
               json.loads((c/'remote.json').read_text())['draft'] is True)
         return c,env,output,details['publication_recovery']
+
+    if pagination_only:
+        # 201 assets, including a real signed aggregate and primary pair. Long
+        # literal names make the actual frozen preflight/creation plan exceed
+        # the single-argument limit independently of GitHub response padding.
+        missing='SHA256SUMS.minisig'
+        c,env,output,recovery=interrupt_upload('paginated-201',extra_assets=196,long_names=True)
+        response=Path(recovery['create_response']);original=response.read_bytes();inode=response.stat().st_ino
+        creation=response.parent/'creation-intent.json'
+        selected=json.loads(creation.read_text())['plan']
+        check('large strict preflight and creation preserve the complete streamed plan',
+              len(selected['assets'])==201 and len(json.dumps(selected).encode())>131072)
+        check('interrupted large draft has exactly two full pages before repair',
+              len(json.loads((c/'remote.json').read_text())['assets'])==200)
+        for fault in ['failed-page','malformed-page','extra','duplicate-id','duplicate-name','case-alias']:
+            (c/'control.json').write_text(json.dumps({'inventory_fault':fault}))
+            result,rows=invoke_fallback(c,env,output,True,label='refused-'+fault)
+            check('large recovery refuses '+fault+' without remote mutation or compiler retry',
+                  result.returncode!=0 and not mutations(rows) and
+                  (c/'build-calls').read_text().splitlines().count('build')==1 and
+                  response.read_bytes()==original and response.stat().st_ino==inode)
+        (c/'control.json').write_text('{}')
+        result,rows=invoke_fallback(c,env,output,True,label='large-resumed')
+        if result.returncode:
+            raise AssertionError('large strict resume: '+result.stderr[-6000:])
+        details=json.loads(result.stdout)['details']
+        receipt=json.loads(Path(details['publication_recovery']['finalization_receipt']).read_text())
+        check('large recovery uploads only the missing signed asset and publishes the original ID',
+              [row[2] for row in rows if row[0]=='upload-boundary']==[missing] and
+              not any('--post' in row for row in rows) and receipt['release_id']==9 and
+              receipt['release']['draft'] is False and len(receipt['release']['assets'])==201)
+        check('large recovery observes all pages including empty page three at the exact200 boundary',
+              any(row[0].endswith('assets?per_page=100&page=3') for row in requests(c)))
+        check('large recovery retains complete plan, original custody and the single successful build',
+              len(receipt['plan']['assets'])==201 and response.read_bytes()==original and
+              response.stat().st_ino==inode and (c/'build-calls').read_text().splitlines().count('build')==1)
+        for fault in ['missing-last','failed-page','malformed-page','extra','duplicate-id','duplicate-name',
+                      'case-alias','late-change']:
+            (c/'control.json').write_text(json.dumps({'inventory_fault':fault}))
+            start=len(requests(c))
+            result,_=invoke(c,dict(env,TMPDIR=recovery['finalization_tmpdir']),response)
+            rows=requests(c)[start:]
+            check('complete large finalization refuses '+fault+' before publication',
+                  result.returncode!=0 and not mutations(rows))
+        for fault in ['duplicate','malformed']:
+            (c/'control.json').write_text(json.dumps({'embedded_fault':fault}))
+            start=len(requests(c))
+            result,_=invoke(c,dict(env,TMPDIR=recovery['finalization_tmpdir']),response)
+            check('large finalization refuses '+fault+' embedded metadata',
+                  result.returncode!=0 and not mutations(requests(c)[start:]))
+        return
 
     for label,options,configured,expected in [
             ('explicit-sbom',['--sbom'],False,4),
@@ -892,6 +987,125 @@ def test_public_finalizer_lifecycle():
                 publisher.wait(timeout=5)
 
 
+def test_large_release_reporting():
+    # Exercise the actual output blocks independently of compilation or HTTP.
+    # Each populated name array exceeds one external-process argument while
+    # every individual asset name remains below the filesystem's 255-byte cap.
+    directory=work/'large-reporting';directory.mkdir()
+    selected=['payload-%03d-'%index+'x'*220+'.tar.gz' for index in range(601)]
+    extras=[name+'.sha256' for name in selected]
+    check('large reporting fixture has 601 legal names and exceeds 128 KiB per array',
+          len(selected)==601 and max(map(len,extras))<255 and len(json.dumps(selected).encode())>131072)
+    (directory/'names').write_text('\n'.join(selected)+'\n')
+    (directory/'extra').write_text('\n'.join(extras)+'\n')
+    plan=[{'name':name,'size_bytes':8,'sha256':'1'*64,'upload_names':[name]} for name in selected]
+    (directory/'artifacts').write_text(''.join(json.dumps(entry)+'\n' for entry in plan))
+    (directory/'contract').write_text(json.dumps({'assets':[{'name':name} for name in selected]}))
+    envelope=re.search(r'^json_envelope\(\) \{\n.*?^EOF\n\}',source,re.M|re.S).group(0)
+    verify=re.search(r'^cmd_release_verify\(\) \{\n.*?^\}',source,re.M|re.S).group(0)
+    verify_block=re.search(r'^    # Output\n    if \$JSON_MODE; then\n(.*?)^    else\n',verify,re.M|re.S).group(1)
+    release=re.search(r'^cmd_release\(\) \{\n.*?^\}',source,re.M|re.S).group(0)
+    dry_block=re.search(r'^        if \$JSON_MODE; then\n            local plan_artifacts_json=.*?^        fi$',release,re.M|re.S).group(0)
+    prefix='set -euo pipefail\nDSR_VERSION=fixture\nlog_warn() { printf "%s\\n" "$*" >&2; }\n'+envelope+'\n'
+    common=r'''
+emit_report() {
+    local tool_name=app repo=owner/app version=1.2.3 tag=v1.2.3 release_id=9
+    local release_url=https://github.com/owner/app/releases/tag/v1.2.3
+    local manifest_exists=true strict_remote_records_valid=true strict_tag_ruleset_receipt=null
+    local fix_missing=false DRY_RUN=false JSON_MODE=true status=success exit_code=0 duration=12
+    local repair_custody_error='' artifacts_dir=/fixture/artifacts requested_draft=true
+    local publish_draft=false prerelease=false release_contract_enabled=true file_count=601
+    local installer_report='{"status":"skipped","reason":"fixture"}'
+    local ordinary_sbom_report='{"enabled":false,"status":"disabled","published":false}'
+    local release_contract_plan
+    local -a expected_assets=() present_assets=() missing_assets=() extra_assets=()
+    local -a size_mismatches=() digest_mismatches=() verified_checksums=() checksum_errors=()
+    local -a planned_fixes=() ordinary_repair_errors=() plan_artifacts=() plan_extra=()
+    mapfile -t expected_assets < "$REPORT_CASE/names"
+    case "$1" in
+        empty) expected_assets=() ;;
+        success)
+            present_assets=("${expected_assets[@]}")
+            verified_checksums=("${expected_assets[@]:0:3}") ;;
+        mismatch)
+            status=incomplete; exit_code=1; strict_remote_records_valid=false
+            present_assets=("${expected_assets[@]}")
+            extra_assets=("${expected_assets[@]/#/unexpected-}")
+            size_mismatches=("${expected_assets[@]}")
+            digest_mismatches=("${expected_assets[@]}")
+            checksum_errors=("${expected_assets[@]:0:3}") ;;
+        repair)
+            status=error; exit_code=4; fix_missing=true; strict_remote_records_valid=false
+            missing_assets=("${expected_assets[@]}")
+            planned_fixes=("${expected_assets[@]}")
+            ordinary_repair_errors=("${expected_assets[@]}" '' $'first\nsecond\n')
+            repair_custody_error='Fixture custody changed' ;;
+        strict|ordinary)
+            DRY_RUN=true
+            release_contract_plan=$(cat "$REPORT_CASE/contract")
+            if [[ "$1" == ordinary ]]; then
+                release_contract_enabled=false; file_count=1203
+                mapfile -t plan_artifacts < "$REPORT_CASE/artifacts"
+                mapfile -t plan_extra < "$REPORT_CASE/extra"
+                plan_extra+=("${plan_extra[0]}")
+            fi ;;
+        *) return 91 ;;
+    esac
+'''
+    verify_driver=directory/'verify.sh'
+    verify_driver.write_text(prefix+common+verify_block+'\n}\nemit_report "$1"\n')
+    dry_driver=directory/'dry.sh'
+    dry_driver.write_text(prefix+common+dry_block+'\n}\nemit_report "$1"\n')
+    env=dict(os.environ,REPORT_CASE=str(directory))
+
+    for mode in ['empty','success','mismatch','repair']:
+        result=subprocess.run(['bash',str(verify_driver),mode],env=env,capture_output=True,text=True,timeout=20)
+        (directory/(mode+'.stdout')).write_text(result.stdout)
+        (directory/(mode+'.stderr')).write_text(result.stderr)
+        check(mode+' actual verification report completes without argument-size failure',result.returncode==0)
+        data=json.loads(result.stdout)
+        names=[] if mode=='empty' else selected
+        present=names if mode in ['success','mismatch'] else []
+        missing=names if mode=='repair' else []
+        extra=['unexpected-'+name for name in names] if mode=='mismatch' else []
+        mismatches=names if mode=='mismatch' else []
+        expected={'repo':'owner/app','version':'1.2.3','tag':'v1.2.3','release_id':9,
+                  'release_url':'https://github.com/owner/app/releases/tag/v1.2.3','manifest_found':True,
+                  'verification':{'expected':len(names),'present':len(present),'missing':len(missing),
+                      'extra':len(extra),'size_mismatches':len(mismatches),'digest_mismatches':len(mismatches),
+                      'remote_records_valid':mode not in ['mismatch','repair'],'tag_ruleset_receipt':None},
+                  'assets':{'present':present,'missing':missing,'extra':extra,
+                      'size_mismatches':mismatches,'digest_mismatches':mismatches},
+                  'checksums':{'verified':names[:3] if mode=='success' else [],
+                               'errors':names[:3] if mode=='mismatch' else []},
+                  'repair':{'dry_run':False,'uploads':names,'errors':names+['first','second']} if mode=='repair' else None,
+                  'duration_seconds':12}
+        if mode=='repair':expected.update(stage='build_custody',error='Fixture custody changed')
+        check(mode+' report preserves exact keys counts arrays checksums repair and empty-line semantics',
+              data['command']=='release-verify' and
+              data['status']==({'mismatch':'incomplete','repair':'error'}.get(mode,'success')) and
+              data['exit_code']==({'mismatch':1,'repair':4}.get(mode,0)) and data['details']==expected)
+
+    for mode in ['strict','ordinary']:
+        result=subprocess.run(['bash',str(dry_driver),mode],env=env,capture_output=True,text=True,timeout=20)
+        (directory/(mode+'.stdout')).write_text(result.stdout)
+        (directory/(mode+'.stderr')).write_text(result.stderr)
+        check(mode+' actual dry-run report completes without argument-size failure',result.returncode==0)
+        data=json.loads(result.stdout)
+        expected={'tool':'app','version':'v1.2.3','tag':'v1.2.3','repo':'owner/app',
+                  'artifacts_dir':'/fixture/artifacts','draft':True,'prerelease':False,
+                  'promotion_requested':False,'file_count':601 if mode=='strict' else 1203,
+                  'mode':'dry_run','dry_run':True,
+                  'plan':({'strict':True,'assets':selected} if mode=='strict' else
+                          {'strict':False,'artifacts':plan,'additional_files':extras,
+                           'generated':['SHA256SUMS','<name>.sha256 per uploaded name']}),
+                  'installer_check':{'status':'skipped','reason':'fixture'},
+                  'sbom':{'enabled':False,'status':'disabled','published':False}}
+        check(mode+' dry-run report preserves complete exact plan and metadata',
+              data['command']=='release' and data['status']=='dry_run' and data['exit_code']==0 and
+              data['details']==expected)
+
+
 def test_custom_artifact_repair():
     missing='payload.tar.gz.minisig'
     c,env,_,_=setup('custom-artifact-repair',{'absent':True,'fail_upload_name':missing})
@@ -981,7 +1195,22 @@ def test_custom_artifact_repair():
     result,rows=verify('default-read-only')
     check('default artifact lookup still verifies a complete strict release',result.returncode==0 and
           json.loads(result.stdout)['details']['manifest_found'] is True and not mutations(rows))
+    result,rows=verify('strict-checksums',['--verify-checksums'])
+    check('strict complete inventory retains real checksum and payload download URLs',result.returncode==0 and
+          json.loads(result.stdout)['details']['checksums']['verified']==['payload.tar.gz'] and
+          json.loads(result.stdout)['details']['checksums']['errors']==[] and
+          len([row for row in rows if row[0]=='checksum-download'])==2 and not mutations(rows))
 
+
+if os.environ.get('DSR_TEST_STRICT_REPORTING_ONLY')=='1':
+    test_large_release_reporting()
+    print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
+    raise SystemExit(0)
+
+if os.environ.get('DSR_TEST_STRICT_PAGINATION_ONLY')=='1':
+    test_fallback_recovery(pagination_only=True)
+    print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
+    raise SystemExit(0)
 
 if os.environ.get('DSR_TEST_STRICT_CLI_ONLY')=='1':
     test_public_finalizer_lifecycle()
@@ -1007,6 +1236,7 @@ if os.environ.get('DSR_TEST_STRICT_CUSTODY_ONLY')=='1':
 if os.environ.get('DSR_TEST_STRICT_CREATION_ONLY')!='1':
     test_custom_artifact_repair()
     test_public_finalizer_lifecycle()
+    test_large_release_reporting()
 
 # Execute the complete producer-to-consumer handoff. The response's name,
 # bytes, permissions and directory come from production creation, not setup().
@@ -1214,5 +1444,6 @@ for (label,controls),(c,env,response,_) in prepare_cases([('post-metadata-drift'
     check(label+' pending record retained',len(list((c/'state/releases').glob('*finalization-pending.*')))==1)
 
 test_fallback_recovery()
+test_fallback_recovery(pagination_only=True)
 print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
 PY

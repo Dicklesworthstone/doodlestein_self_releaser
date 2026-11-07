@@ -1419,6 +1419,68 @@ _gh_asset_sha256() {
     printf '%s\n' "$hash"
 }
 
+# Read a complete, uncached release asset inventory. Page records stream to one
+# validator, so neither a large API response nor the aggregate occupies an
+# external-process argument. A failed later page never exposes a partial list.
+# The 100-page bound includes the required empty page after an exact multiple
+# of 100 assets. Returned rows retain stable identities and an API-provided
+# browser download URL when present; unrelated uploader metadata is omitted.
+# Returns: 0 complete, 3 dependency/auth, 4 invalid arguments, 5 interrupted,
+# 7 duplicate identities, 8 unavailable/malformed/incomplete inventory.
+gh_release_asset_inventory() (
+    local repo="${1:-}" release_id="${2:-}" inventory status=0
+    if [[ ! "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ||
+          ! "$release_id" =~ ^[1-9][0-9]{0,15}$ ]]; then
+        _gh_log_error "Invalid repository or release ID for asset inventory"
+        return 4
+    fi
+    command -v jq >/dev/null || return 3
+    jq -en --argjson id "$release_id" '$id <= 9007199254740991' >/dev/null || return 4
+    inventory=$(
+        set -o pipefail
+        (
+            local page=1 response count request_status
+            while ((page <= 100)); do
+                request_status=0
+                response=$(gh_api "repos/$repo/releases/$release_id/assets?per_page=100&page=$page" \
+                    --no-cache) || request_status=$?
+                if ((request_status != 0)); then
+                    _gh_log_error "Cannot read release asset inventory for $repo/$release_id (page $page)"
+                    case "$request_status" in 3|5) return "$request_status" ;; 130|143) return 5 ;; *) return 8 ;; esac
+                fi
+                if ! jq -es '
+                    def id: type == "number" and floor == . and . > 0 and . <= 9007199254740991;
+                    def name: type == "string" and length > 0 and . != "." and . != ".." and
+                        (test("[/\\\\\\x00-\\x1f\\x7f]") | not);
+                    length == 1 and (.[0] | type == "array" and length <= 100 and all(.[];
+                        type == "object" and (.id | id) and (.name | name) and
+                        (.state == "uploaded" or .state == "starter") and
+                        (.size | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
+                        (.digest == null or (.digest | type == "string")) and
+                        (.browser_download_url == null or (.browser_download_url | type == "string"))))
+                ' <<< "$response" >/dev/null 2>&1; then
+                    _gh_log_error "Invalid release asset inventory for $repo/$release_id (page $page)"
+                    return 8
+                fi
+                jq -c '.[] | {id,name,state,size,digest} +
+                    (if has("browser_download_url") then {browser_download_url} else {} end)' \
+                    <<< "$response" || return 8
+                count=$(jq -r 'length' <<< "$response") || return 8
+                ((count == 100)) || return 0
+                page=$((page + 1))
+            done
+            _gh_log_error "Release inventory exceeded the 100-page safety limit"
+            return 8
+        ) | {
+            jq -cse 'if (map(.id) | unique | length) == length and
+                           (map(.name | ascii_downcase) | unique | length) == length
+                then sort_by(.id) else error("duplicate release asset name or ID") end' || exit 7
+        }
+    ) || status=$?
+    [[ "$status" -eq 0 ]] || return "$status"
+    printf '%s\n' "$inventory"
+)
+
 # Search the complete, uncached release inventory, not the truncated embedded
 # .assets array. Return 0 + one asset, 1 for absence, 7 for ambiguity, 8 for an
 # unavailable/incomplete inventory. Never interpret a failed GET as absence.
@@ -2019,6 +2081,7 @@ export -f _gh_log_warn _gh_log_error
 export -f gh_get_immutable_tag_ruleset_receipt
 export -f gh_workflow_runs gh_workflow_active_runs gh_workflow_run gh_releases gh_latest_release
 export -f gh_create_release gh_upload_asset gh_upload_asset_named gh_upload_asset_dual
+export -f gh_release_asset_inventory
 export -f gh_compare gh_tags gh_repo
 export -f gh_resolve_tag_sha gh_repository_dispatch
 export -f gh_clear_cache

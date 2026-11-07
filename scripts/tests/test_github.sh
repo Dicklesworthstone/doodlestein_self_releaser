@@ -1674,6 +1674,129 @@ test_upload_asset_encodes_plus_in_filename() {
 # Only the network boundary is replaced. The production adapter executes all
 # hashing, snapshotting, pagination, receipt checks, reconciliation and retries.
 # A subshell contains fixture functions/env so subsequent tests use real code.
+test_release_inventory_scenario() (
+  local scenario="$1" expected_status="$2" expected_pages="$3" status=0 output count=101
+  case "$scenario" in
+    empty) count=0 ;; short) count=7 ;; exact-100) count=100 ;;
+    exact-200) count=200 ;; large) count=601 ;; starter) count=1 ;;
+  esac
+  python3 - "$TEMP_DIR" "$scenario" "$count" <<'PY'
+import json
+from pathlib import Path
+import sys
+root, scenario, count = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+records = [dict(id=i + 1, name=('payload-' + 'x' * 180 + '-%04d.bin' % i if scenario == 'large'
+                               else 'payload-%04d.bin' % i), state='uploaded', size=i + 1,
+                digest='sha256:' + 'a' * 64,
+                browser_download_url='https://github.com/owner/repo/releases/download/v1.2.3/payload-%04d.bin'%i,
+                uploader={'description': 'large API metadata' * 120})
+           for i in range(count)]
+if scenario == 'starter':
+    records[0].update(state='starter', size=0, digest=None)
+if scenario in ('duplicate-id', 'duplicate-name', 'case-alias', 'unsafe-name', 'invalid-size',
+                'invalid-id', 'invalid-state', 'invalid-digest'):
+    key, value = {
+        'duplicate-id': ('id', records[0]['id']),
+        'duplicate-name': ('name', records[0]['name']),
+        'case-alias': ('name', records[0]['name'].upper()),
+        'unsafe-name': ('name', '../outside'),
+        'invalid-size': ('size', -1),
+        'invalid-id': ('id', 9007199254740992),
+        'invalid-state': ('state', 'unknown'),
+        'invalid-digest': ('digest', {'untrusted': True}),
+    }[scenario]
+    records[100][key] = value
+(root / 'expected.json').write_text(json.dumps([
+    {key: row[key] for key in ('id', 'name', 'state', 'size', 'digest', 'browser_download_url')} for row in records]))
+for page in range(1, count // 100 + 2):
+    value = records[(page - 1) * 100:page * 100]
+    if page == 2 and scenario == 'malformed-page':
+        value = {'message': 'not an asset page'}
+    if page == 2 and scenario == 'oversized-page':
+        value = records
+    (root / ('page-%d.json' % page)).write_text(json.dumps(value))
+if scenario == 'multiple-documents':
+    with (root / 'page-2.json').open('a') as output:
+        output.write('\n[]\n')
+PY
+  : > "$TEMP_DIR/requests"
+  gh_api() {
+    local endpoint="$1" page="${1##*page=}"
+    [[ $# -eq 2 && "$2" == --no-cache &&
+       "$endpoint" == "repos/owner/repo/releases/42/assets?per_page=100&page=$page" &&
+       "$page" =~ ^[1-9][0-9]*$ ]] || return 89
+    printf '%s\n' "$page" >> "$TEMP_DIR/requests"
+    if [[ "$page" == 2 ]]; then
+      case "$scenario" in
+        failed-page) return 22 ;; interrupted-page) return 130 ;; auth-page) return 3 ;;
+      esac
+    fi
+    if [[ "$scenario" == unterminated ]]; then
+      jq -nc --argjson page "$page" '[range(($page - 1) * 100; $page * 100) |
+        {id:(. + 1),name:("payload-" + tostring),state:"uploaded",size:1,digest:null}]'
+    else
+      cat "$TEMP_DIR/page-$page.json"
+    fi
+  }
+  output=$(gh_release_asset_inventory owner/repo 42) || status=$?
+  [[ "$status" == "$expected_status" && "$(wc -l < "$TEMP_DIR/requests" | tr -d '[:space:]')" == "$expected_pages" ]] || return 1
+  if [[ "$status" == 0 ]]; then
+    jq -e --slurpfile expected "$TEMP_DIR/expected.json" '. == $expected[0]' <<< "$output" >/dev/null || return 1
+    if [[ "$scenario" == large ]]; then
+      [[ ${#output} -gt 131072 && "$(wc -c < "$TEMP_DIR/page-1.json")" -gt 131072 ]] || return 1
+    fi
+  else
+    [[ -z "$output" ]] || return 1
+  fi
+)
+
+test_release_inventory_rejects_invalid_identity() (
+  local repo id status
+  gh_api() { printf 'unexpected request\n' >> "$TEMP_DIR/requests"; return 89; }
+  for repo in '' owner 'owner/repo/extra' 'owner/repo?query'; do
+    status=0
+    gh_release_asset_inventory "$repo" 42 > "$TEMP_DIR/output" || status=$?
+    [[ "$status" == 4 && ! -s "$TEMP_DIR/output" ]] || return 1
+  done
+  for id in '' 0 -1 01 '1/extra' 9007199254740992; do
+    status=0
+    gh_release_asset_inventory owner/repo "$id" > "$TEMP_DIR/output" || status=$?
+    [[ "$status" == 4 && ! -s "$TEMP_DIR/output" ]] || return 1
+  done
+  [[ ! -e "$TEMP_DIR/requests" ]]
+)
+
+run_release_inventory_tests() {
+  local scenario status pages
+  while read -r scenario status pages; do
+    run_test "release_inventory_$scenario" test_release_inventory_scenario "$scenario" "$status" "$pages"
+  done <<'INVENTORY_CASES'
+empty 0 1
+short 0 1
+exact-100 0 2
+complete-101 0 2
+exact-200 0 3
+large 0 7
+starter 0 1
+failed-page 8 2
+interrupted-page 5 2
+auth-page 3 2
+malformed-page 8 2
+oversized-page 8 2
+multiple-documents 8 2
+duplicate-id 7 2
+duplicate-name 7 2
+case-alias 7 2
+unsafe-name 8 2
+invalid-size 8 2
+invalid-id 8 2
+invalid-state 8 2
+invalid-digest 8 2
+unterminated 8 100
+INVENTORY_CASES
+  run_test release_inventory_invalid_identity test_release_inventory_rejects_invalid_identity
+}
+
 test_release_upload_scenario() (
   local scenario="$1" expected_status="$2" expected_posts="$3" expected_downloads="${4:-0}"
   local fixture="$TEMP_DIR/upload"
@@ -2624,6 +2747,13 @@ main() {
   echo "=== github.sh Tests ==="
   echo ""
 
+  if [[ "${1:-}" == --release-inventory-only ]]; then
+    run_release_inventory_tests
+    printf 'Release inventories: %s passed, %s failed\n' "$TESTS_PASSED" "$TESTS_FAILED"
+    [[ "$TESTS_FAILED" -eq 0 ]]
+    exit $?
+  fi
+
   if [[ "${1:-}" == --api-deadline-only ]]; then
     run_api_deadline_regressions
     printf 'API deadlines and custody: %s passed, %s failed\n' "$TESTS_PASSED" "$TESTS_FAILED"
@@ -2802,6 +2932,7 @@ API_SCENARIOS
 
   echo ""
   echo "Verified Release Uploads:"
+  run_release_inventory_tests
   run_test "upload_rejects_unsafe_inputs_before_auth" test_upload_rejects_unsafe_inputs_before_auth
   run_test "upload_rejects_invalid_retry_configuration" test_upload_rejects_invalid_retry_configuration
   run_test "upload_rejects_source_mutation_during_snapshot" test_upload_rejects_source_mutation_during_snapshot
