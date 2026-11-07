@@ -1628,12 +1628,17 @@ _watch_release_lock() {
 # the result of the old child, so migrating them must never replay a release.
 _watch_load_triggered() {
     if [[ ! -e "$_WATCH_TRIGGERED_FILE" && ! -L "$_WATCH_TRIGGERED_FILE" ]]; then
-        printf '%s\n' '{"schema_version":2,"runs":{},"attempts":{},"last_check":null}'
+        printf '%s\n' '{"schema_version":2,"runs":{},"attempts":{},"pending":{},"last_check":null}'
         return 0
     fi
     [[ -f "$_WATCH_TRIGGERED_FILE" && ! -L "$_WATCH_TRIGGERED_FILE" ]] || return 4
     jq -ces '
         def integer: type == "number" and floor == .;
+        def source_identity:
+            (.tool | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]*$")) and
+            (.repo | type == "string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) and
+            (.version | type == "string" and test("^v[0-9]+\\.[0-9]+\\.[0-9]+([.+-][0-9A-Za-z.+-]*)?$")) and
+            (.head_sha | type == "string" and test("^[0-9a-f]{40}$"));
         if length == 1 and (.[0] | type == "object" and
             (.runs | type == "object" and all(.[]; type == "string")) and
             ((.attempts // {}) | type == "object" and all(to_entries[];
@@ -1641,10 +1646,7 @@ _watch_load_triggered() {
                 (.value | type == "object" and
                     (.attempt | integer and . >= 1 and . <= 10) and
                     (.attempt_id | type == "string" and test("^[1-9][0-9]{0,15}\\.[A-Za-z0-9]{8}$")) and
-                    (.tool | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]*$")) and
-                    (.repo | type == "string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) and
-                    (.version | type == "string" and test("^v[0-9]+\\.[0-9]+\\.[0-9]+([.+-][0-9A-Za-z.+-]*)?$")) and
-                    (.head_sha | type == "string" and test("^[0-9a-f]{40}$")) and
+                    source_identity and
                     (.status | IN("starting", "running", "succeeded", "failed", "blocked")) and
                     (.started_epoch | integer and . >= 0) and
                     (.next_retry_at == null or (.next_retry_at | integer and . >= 0)) and
@@ -1652,8 +1654,17 @@ _watch_load_triggered() {
                     (.resume_run_id | type == "string" and
                         (. == "" or test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")))
                 )
-            )))
-        then .[0] + {schema_version:2, attempts:(.[0].attempts // {})}
+            )) and
+            (. as $state | (if has("pending") then .pending else {} end) |
+                type == "object" and all(to_entries[];
+                    (.key | test("^[1-9][0-9]{0,15}$")) and
+                    ($state.runs[.key] == null) and (($state.attempts // {})[.key] == null) and
+                    (.value | type == "object" and
+                        (keys == ["head_sha","isolate_source","queued_epoch","repo","tool","version"]) and
+                        source_identity and .head_sha != "0000000000000000000000000000000000000000" and
+                        .isolate_source == true and
+                        (.queued_epoch | integer and . >= 0 and . <= 9007199254740991)))))
+        then .[0] + {schema_version:2, attempts:(.[0].attempts // {}), pending:(.[0].pending // {})}
         else error("invalid watcher state; refusing to lose deduplication") end
     ' "$_WATCH_TRIGGERED_FILE" 2>/dev/null
 }
@@ -1830,7 +1841,7 @@ _watch_launch_attempt() (
     state=$(jq -c --arg id "$run_id" --arg tool "$tool" --arg repo "$repo" --arg version "$version" \
         --arg sha "$sha" --arg directory "${directory##*/}" --arg resume "$resume" --arg timestamp "$timestamp" \
         --argjson attempt "$attempt" --argjson now "$now" --argjson isolate_source "$isolate_source" '
-        .runs[$id] = $timestamp | .last_check = $timestamp |
+        del(.pending[$id]) | .runs[$id] = $timestamp | .last_check = $timestamp |
         .attempts[$id] = {attempt:$attempt,attempt_id:$directory,tool:$tool,repo:$repo,version:$version,
             head_sha:$sha,status:"running",started_epoch:$now,next_retry_at:null,resume_run_id:$resume,
             isolate_source:$isolate_source}
@@ -1869,40 +1880,52 @@ _watch_jittered_sleep() {
 # so each is announced once per watcher rather than on every poll.
 declare -A _WATCH_REPORTED=()
 
+_watch_configured_repo_matches() {
+    local tool="$1" repo="$2" run_id="$3" configured_repo
+    if ! configured_repo=$(act_get_repo "$tool") || [[ -z "$configured_repo" ]]; then
+        log_warn "Cannot recover run $run_id: its tool configuration is unavailable"
+        return 1
+    fi
+    [[ "$configured_repo" == */* ]] || configured_repo="Dicklesworthstone/$configured_repo"
+    if [[ "$configured_repo" != "$repo" ]]; then
+        log_warn "Cannot recover run $run_id: its configured repository has changed"
+        return 1
+    fi
+    return 0
+}
+
 # A fallback can fail before the upstream workflow leaves the throttled list.
-# Its durable retry remains useful if that exact workflow later fails too.
+# A capacity-deferred release can leave that list before its first attempt.
+# Both remain recoverable if that exact workflow later fails too.
 # Absence from the queue alone is never permission to retry: refresh the
 # original run without caches, and leave successful, cancelled, active and
 # unreadable upstream runs alone. These candidates still pass the ordinary
 # cooldown, attempt budget and exact-checkpoint gates below.
 _watch_terminal_retry_runs() {
     local state="$1" check_output="$2" now="$3" candidates candidate record
-    local run_id tool repo configured_repo observed conclusion
+    local include_pending="${4:-true}"
+    local run_id tool repo observed conclusion pending
     candidates=$(printf '%s\n' "$state" "$check_output" | jq -sc \
-        --argjson now "$now" --argjson maximum "$_WATCH_MAX_ATTEMPTS" '
+        --argjson now "$now" --argjson maximum "$_WATCH_MAX_ATTEMPTS" --argjson include_pending "$include_pending" '
         . as $inputs | ($inputs[1].details.throttled | map(.run_id | tostring)) as $observed |
-        $inputs[0].attempts | to_entries[] | . as $entry |
-        select(.value.status == "failed" and .value.attempt < $maximum and
-            (.value.exit_code | type == "number" and floor == . and . > 0 and . <= 255) and
-            $now >= (.value.next_retry_at // 0) and ($observed | index($entry.key) | not)) |
-        {run_id:.key,record:.value}') || return 4
+        [($inputs[0].attempts | to_entries[] | . as $entry |
+          select(.value.status == "failed" and .value.attempt < $maximum and
+              (.value.exit_code | type == "number" and floor == . and . > 0 and . <= 255) and
+              $now >= (.value.next_retry_at // 0) and ($observed | index($entry.key) | not)) |
+          {run_id:.key,record:.value,pending:false}),
+         (($inputs[0].pending // {}) | to_entries | sort_by(.value.queued_epoch,.key)[] | . as $entry |
+          select($include_pending and ($observed | index($entry.key) | not)) |
+          {run_id:.key,record:.value,pending:true})] | .[]') || return 4
     [[ -n "$candidates" ]] || return 0
     while IFS= read -r candidate; do
         run_id=$(jq -r .run_id <<< "$candidate") || return 4
         record=$(jq -c .record <<< "$candidate") || return 4
         tool=$(jq -r .tool <<< "$record") || return 4
         repo=$(jq -r .repo <<< "$record") || return 4
-        if ! configured_repo=$(act_get_repo "$tool") || [[ -z "$configured_repo" ]]; then
-            log_warn "Cannot retry run $run_id: its tool configuration is unavailable"
-            continue
-        fi
-        [[ "$configured_repo" == */* ]] || configured_repo="Dicklesworthstone/$configured_repo"
-        if [[ "$configured_repo" != "$repo" ]]; then
-            log_warn "Cannot retry run $run_id: its configured repository has changed"
-            continue
-        fi
+        pending=$(jq -r .pending <<< "$candidate") || return 4
+        _watch_configured_repo_matches "$tool" "$repo" "$run_id" || continue
         if ! observed=$(gh_api "repos/$repo/actions/runs/$run_id" --no-cache); then
-            log_warn "Cannot verify upstream run $run_id; retaining the failed fallback for a later check"
+            log_warn "Cannot verify upstream run $run_id; retaining its fallback candidate for a later check"
             continue
         fi
         if ! jq -es --arg run "$run_id" --argjson record "$record" '
@@ -1919,7 +1942,18 @@ _watch_terminal_retry_runs() {
         if ! jq -e '.status == "completed" and
                 (.conclusion | IN("failure", "timed_out", "startup_failure"))' \
                 <<< "$observed" >/dev/null; then
-            log_debug "Run $run_id is not a completed upstream failure; retaining its failed fallback"
+            # A never-started candidate no longer needs a fallback after a
+            # proven success or cancellation. Return the disposition to the
+            # lock-owning caller; this subprocess must not race its journal.
+            if [[ "$pending" == true ]] && jq -e '.status == "completed" and
+                    (.conclusion | IN("success", "cancelled"))' <<< "$observed" >/dev/null; then
+                conclusion=$(jq -r .conclusion <<< "$observed") || return 4
+                jq -nc --arg run "$run_id" --argjson record "$record" --arg conclusion "$conclusion" '
+                    {run_id:$run,tool:$record.tool,repo:$record.repo,head_branch:$record.version,
+                     head_sha:$record.head_sha,retry_reason:"upstream_resolved",upstream_conclusion:$conclusion}' || return 4
+            else
+                log_debug "Run $run_id is not a completed upstream failure; retaining its fallback candidate"
+            fi
             continue
         fi
         conclusion=$(jq -r .conclusion <<< "$observed") || return 4
@@ -1987,8 +2021,11 @@ _watch_iteration() {
     fi
 
     if $auto_fallback; then
-        local terminal_retries
-        terminal_retries=$(_watch_terminal_retry_runs "$state" "$check_output" "$now") || return $?
+        local terminal_retries include_pending=true
+        # Waiting candidates cannot launch while every slot is occupied.
+        # Avoid polling each original run until fresh admission is possible.
+        ((active_count < _WATCH_MAX_CONCURRENT)) || include_pending=false
+        terminal_retries=$(_watch_terminal_retry_runs "$state" "$check_output" "$now" "$include_pending") || return $?
         if [[ -n "$terminal_retries" ]]; then
             throttled_runs="${throttled_runs:+$throttled_runs$'\n'}$terminal_retries"
         fi
@@ -1999,8 +2036,19 @@ _watch_iteration() {
         return 0
     fi
 
+    # Keep an older deferred release ahead of newly observed work. Preserve
+    # the upstream order otherwise; pending identity is checked again below.
+    if jq -e '.pending | length > 0' <<< "$state" >/dev/null; then
+        throttled_runs=$(printf '%s\n' "$state" "$throttled_runs" | jq -sc '
+            .[0].pending as $pending | .[1:] | to_entries |
+            sort_by(. as $entry | $pending[.value.run_id | tostring] as $saved |
+                if $saved == null then [1,0,$entry.key]
+                else [0,$saved.queued_epoch,$entry.key] end) | .[].value') || return 4
+    fi
+
     # Process new throttled runs and source-verified terminal recovery candidates.
-    local run run_id repo tool_name ref sha record attempt resume outcome next_retry isolate_source retry_reason
+    local run run_id repo tool_name ref sha record pending_record bound_record
+    local attempt resume outcome next_retry isolate_source retry_reason
     while IFS= read -r run; do
         run_id=$(jq -r '.run_id // empty | tostring' <<< "$run")
         [[ "$run_id" =~ ^[1-9][0-9]{0,15}$ ]] || { log_error "Invalid throttled run ID"; return 8; }
@@ -2010,14 +2058,18 @@ _watch_iteration() {
         sha=$(jq -r '.head_sha // ""' <<< "$run")
 
         record=$(jq -c --arg id "$run_id" '.attempts[$id] // null' <<< "$state") || return 4
+        pending_record=$(jq -c --arg id "$run_id" '.pending[$id] // null' <<< "$state") || return 4
+        bound_record="$record"
+        [[ "$bound_record" != null ]] || bound_record="$pending_record"
+        if [[ "$bound_record" != null ]] && ! jq -e \
+            --arg tool "$tool_name" --arg repo "$repo" --arg version "$ref" --arg sha "$sha" '
+                .tool == $tool and .repo == $repo and .version == $version and .head_sha == $sha
+            ' <<< "$bound_record" >/dev/null; then
+            log_error "Observed identity changed for run $run_id; automatic fallback blocked"
+            continue
+        fi
         attempt=1; resume=""; isolate_source=true
         if [[ "$record" != null ]]; then
-            if ! jq -e --arg tool "$tool_name" --arg repo "$repo" --arg version "$ref" --arg sha "$sha" '
-                .tool == $tool and .repo == $repo and .version == $version and .head_sha == $sha
-            ' <<< "$record" >/dev/null; then
-                log_error "Observed identity changed for run $run_id; automatic retry blocked"
-                continue
-            fi
             outcome=$(jq -r '.status' <<< "$record")
             attempt=$(jq -r '.attempt' <<< "$record")
             [[ "$outcome" == failed ]] || continue
@@ -2033,13 +2085,27 @@ _watch_iteration() {
             log_debug "Run $run_id has legacy trigger history; automatic replay blocked"
             continue
         fi
+        if [[ "$pending_record" != null ]]; then
+            _watch_configured_repo_matches "$tool_name" "$repo" "$run_id" || continue
+        fi
         if ! $auto_fallback && [[ -n "${_WATCH_REPORTED[$run_id]:-}" ]]; then
             continue
         fi
 
         retry_reason=$(jq -r '.retry_reason // ""' <<< "$run") || return 4
+        if $auto_fallback && [[ "$retry_reason" == upstream_resolved ]]; then
+            [[ "$pending_record" != null ]] || return 4
+            if $dry_run; then
+                log_info "[DRY RUN] Would retire deferred run $run_id: its upstream workflow completed with $(jq -r .upstream_conclusion <<< "$run")"
+            else
+                state=$(jq -c --arg id "$run_id" 'del(.pending[$id])' <<< "$state") || return 4
+                _watch_save_triggered "$state" || return 4
+                log_info "Retired deferred run $run_id: its upstream workflow completed with $(jq -r .upstream_conclusion <<< "$run")"
+            fi
+            continue
+        fi
         if [[ "$retry_reason" == upstream_failure ]]; then
-            log_info "Failed fallback is eligible for recovery: upstream run $run_id ($repo) completed with $(jq -r .upstream_conclusion <<< "$run")"
+            log_info "Fallback is eligible for recovery: upstream run $run_id ($repo) completed with $(jq -r .upstream_conclusion <<< "$run")"
         else
             log_warn "Throttled run detected: $run_id ($repo)"
         fi
@@ -2073,9 +2139,16 @@ _watch_iteration() {
                 "$sha" == 0000000000000000000000000000000000000000 ]]; then
             log_warn "Run $run_id has no unambiguous version tag and source commit; automatic fallback blocked"
         elif ((active_count >= _WATCH_MAX_CONCURRENT)); then
-            # Keep an unstarted run unclaimed, and a failed run's retry budget
-            # unchanged. A later fresh upstream observation must still admit
-            # its identity before it can use a released slot.
+            # Retain a never-started source identity without claiming an
+            # attempt or output. A later fresh observation must still admit
+            # it, including if this original workflow has since failed.
+            if ! $dry_run && [[ "$record" == null && "$pending_record" == null ]]; then
+                state=$(jq -c --arg id "$run_id" --arg tool "$tool_name" --arg repo "$repo" \
+                    --arg version "$ref" --arg sha "$sha" --argjson now "$now" '
+                    .pending[$id] = {tool:$tool,repo:$repo,version:$version,head_sha:$sha,
+                        isolate_source:true,queued_epoch:$now}' <<< "$state") || return 4
+                _watch_save_triggered "$state" || return 4
+            fi
             _WATCH_DEFERRED_COUNT=$((_WATCH_DEFERRED_COUNT + 1))
             log_info "Deferring fallback for $tool_name (run $run_id): $active_count/$_WATCH_MAX_CONCURRENT watch slots occupied"
         elif $dry_run; then
@@ -2198,12 +2271,15 @@ BEHAVIOR:
     - Builds that commit in a private source tree, preserving local work;
       fetches the pinned tag if it is not available locally
     - Retains running/completed/failed attempts across watcher restarts
-    - Defers excess fallbacks without consuming their retry budgets;
-      running workers keep their slots across --once calls and restarts
+    - Retains excess releases with their exact source identity, without an
+      attempt; older pending releases are admitted before new arrivals
+    - Running workers keep their slots across --once calls and restarts;
+      pending upstream runs are refreshed once capacity is available
     - Retries failed attempts with exponential cooldown, up to the limit;
       resumes only a checkpoint matching this run's exact source and output
-    - A completed upstream failure can also resume a failed fallback after
-      leaving the queue; successful, cancelled or active runs cannot
+    - A completed upstream failure can start a pending release or resume a
+      failed fallback after leaving the queue; active/unknown runs cannot
+    - Exact upstream success/cancellation retires never-started candidates
     - Never replays a successful run or an attempt with an unknown outcome
     - --once uses the same lock and recovery state as continuous mode
     - Uses jittered intervals to avoid thundering herd

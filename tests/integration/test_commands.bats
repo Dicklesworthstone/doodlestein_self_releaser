@@ -680,9 +680,29 @@ _watch_run_json() {
 }
 
 _watch_multiple_runs_json() {
-    _watch_run_json | jq '.details.throttled[0] as $first |
+    _watch_run_json "$@" | jq '.details.throttled[0] as $first |
         .details.throttled = [range(0;3) as $n | $first +
             {run_id:($first.run_id + $n), head_branch:("v1.2." + (3 + $n | tostring))}]'
+}
+
+# Obtain a pending candidate from a real capacity-bound watch invocation,
+# then complete its unrelated worker. No recovery state is synthesized.
+_watch_pending_fixture() {
+    harness_create_config
+    mkdir -p "$DSR_CONFIG_DIR/repos.d"
+    printf 'repo: Dicklesworthstone/ntm\n' > "$DSR_CONFIG_DIR/repos.d/ntm.yaml"
+    local check_json first_status
+    check_json=$(_watch_multiple_runs_json | jq '.details.throttled |= [.[1], .[0]]')
+    DSR_WATCH_FIXTURE_WAIT="$DSR_STATE_DIR/finish-child" \
+        run --separate-stderr _routing_watch "$check_json" --auto-fallback --max-concurrent 1
+    first_status=$status
+    touch "$DSR_STATE_DIR/finish-child"
+    _watch_completed 12346
+    assert_equal 0 "$first_status"
+    run --separate-stderr _routing_watch '{"details":{"throttled":[]}}'
+    assert_equal 0 "$status"
+    jq -e '.pending["12345"] != null and .attempts["12345"] == null and
+        .attempts["12346"].status == "succeeded"' "$DSR_STATE_DIR/triggered.json"
 }
 
 # Recovery may outlive the queue entry that originally authorized fallback.
@@ -1254,8 +1274,241 @@ EOF
     [[ "$(wc -l < "$TEST_TMPDIR/fallback.starts")" -eq 1 ]]
 }
 
+@test "watch pending recovery starts a deferred pinned release after upstream failure leaves the queue" {
+    command -v yq >/dev/null || skip "yq required for the real fallback pipeline"
+    _watch_isolated_pipeline_fixture
+    local check_json queued first_status first_state
+    check_json=$(_watch_multiple_runs_json "$DSR_WATCH_PINNED_SHA" |
+        jq '.details.throttled |= [.[1], .[0]]')
+    DSR_WATCH_FIXTURE_FALLBACK='' DSR_WATCH_FIXTURE_WAIT="$TEST_TMPDIR/finish-child" \
+        run --separate-stderr _routing_watch "$check_json" --auto-fallback --max-concurrent 1
+    first_status=$status
+    first_state=$(cat "$DSR_STATE_DIR/triggered.json")
+    queued=false
+    [[ -e "$DSR_STATE_DIR/watch-artifacts/12345" ]] || queued=true
+    # Release the actual worker even when the unchanged watcher lost the
+    # pending candidate; the later empty inventory must recover that release.
+    touch "$TEST_TMPDIR/finish-child"
+    _watch_completed 12346
+    assert_equal 0 "$first_status"
+    _mock_watch_upstream_run "$(_watch_upstream_run_json completed failure "$DSR_WATCH_PINNED_SHA")"
+    run --separate-stderr _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --max-concurrent 1
+    assert_equal 0 "$status"
+    jq -e '.attempts["12345"] | .attempt == 1 and .resume_run_id == "" and .isolate_source == true' \
+        "$DSR_STATE_DIR/triggered.json"
+    _watch_completed 12345
+    jq -e --arg sha "$DSR_WATCH_PINNED_SHA" '.pending["12345"] |
+        .tool == "ntm" and .repo == "Dicklesworthstone/ntm" and .version == "v1.2.3" and
+        .head_sha == $sha and .isolate_source == true and (.queued_epoch | type == "number")' <<< "$first_state"
+    jq -e '.attempts["12345"] == null and .runs["12345"] == null' <<< "$first_state"
+    [[ "$queued" == true ]]
+    jq -e '.pending["12345"] == null' "$DSR_STATE_DIR/triggered.json"
+    jq -Rse 'split("\u0000") | all(.[]; startswith("--resume=") | not)' "$TEST_TMPDIR/fallback.args"
+    assert_equal 2 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    local attempt private_source
+    attempt=$(jq -r '.attempts["12345"].attempt_id' "$DSR_STATE_DIR/triggered.json")
+    jq -e '.exit_code == 0' "$DSR_STATE_DIR/watch-attempts/$attempt/completion.json"
+    private_source=$(cat "$TEST_TMPDIR/build-source")
+    [[ "$private_source" != "$TEST_TMPDIR/developer-source" ]]
+    assert_equal "$DSR_WATCH_PINNED_SHA" "$(git -C "$private_source" rev-parse HEAD)"
+    assert_equal 'tagged release source' "$(cat "$DSR_STATE_DIR/watch-artifacts/12345/ntm")"
+    grep -q 'Cache-Control: no-cache, no-store, max-age=0' "$TEST_TMPDIR/watch-upstream.calls"
+}
+
+@test "watch pending recovery refuses unknown upstream identity and changed configuration" {
+    _watch_pending_fixture
+    local before candidate upstream_state conclusion mutation requests
+    before=$(cat "$DSR_STATE_DIR/triggered.json")
+    _mock_watch_upstream_run "$(_watch_upstream_run_json)"
+    for candidate in 'in_progress:' 'queued:' 'waiting:' 'completed:action_required' \
+        'completed:neutral' 'completed:skipped' 'completed:unrecognized' 'completed:'; do
+        upstream_state="${candidate%%:*}"; conclusion="${candidate#*:}"
+        _watch_upstream_run_json "$upstream_state" "$conclusion" > "$TEST_TMPDIR/watch-upstream.json"
+        run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --max-concurrent 1
+        assert_equal 0 "$status"
+        assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+    done
+    for mutation in '.id=12346' '.head_sha="2222222222222222222222222222222222222222"' \
+        '.head_branch="v1.2.4"' '.repository.full_name="another/repository"' 'del(.repository)'; do
+        _watch_upstream_run_json | jq "$mutation" > "$TEST_TMPDIR/watch-upstream.json"
+        run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --max-concurrent 1
+        assert_equal 0 "$status"
+        assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+    done
+    printf 'invalid JSON\n' > "$TEST_TMPDIR/watch-upstream.json"
+    run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --max-concurrent 1
+    assert_equal 0 "$status"
+    assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+    _watch_upstream_run_json > "$TEST_TMPDIR/watch-upstream.json"
+    DSR_WATCH_UPSTREAM_ERROR=true run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --max-concurrent 1
+    assert_equal 0 "$status"
+    assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+    requests=$(wc -l < "$TEST_TMPDIR/watch-upstream.calls" | tr -d ' ')
+    for mutation in '.details.throttled[0].tool="other"' \
+        '.details.throttled[0].repo="another/repository"' \
+        '.details.throttled[0].head_branch="v1.2.4"' \
+        '.details.throttled[0].head_sha="2222222222222222222222222222222222222222"'; do
+        run _routing_watch "$(_watch_run_json | jq "$mutation")" --auto-fallback --max-concurrent 1
+        assert_equal 0 "$status"
+        assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+    done
+    printf 'repo: another/repository\n' > "$DSR_CONFIG_DIR/repos.d/ntm.yaml"
+    run _routing_watch "$(_watch_run_json)" --auto-fallback --max-concurrent 1
+    assert_equal 0 "$status"
+    assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+    run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --max-concurrent 1
+    assert_equal 0 "$status"
+    assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+    mv "$DSR_CONFIG_DIR/repos.d/ntm.yaml" "$TEST_TMPDIR/removed-ntm.yaml"
+    run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --max-concurrent 1
+    assert_equal 0 "$status"
+    assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+    assert_equal "$requests" "$(wc -l < "$TEST_TMPDIR/watch-upstream.calls" | tr -d ' ')"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    [[ ! -e "$DSR_STATE_DIR/watch-artifacts/12345" ]]
+}
+
+@test "watch pending recovery retires successful and cancelled runs before another launch" {
+    local conclusion state requests first_status
+    for conclusion in success cancelled; do
+        export DSR_STATE_DIR="$TEST_TMPDIR/state-$conclusion"
+        _watch_pending_fixture
+        _mock_watch_upstream_run "$(_watch_upstream_run_json completed "$conclusion")"
+        DSR_WATCH_FIXTURE_WAIT="$DSR_STATE_DIR/finish-next" run --separate-stderr _routing_watch \
+            "$(_watch_multiple_runs_json | jq '.details.throttled = [.details.throttled[2]]')" \
+            --auto-fallback --max-concurrent 1
+        first_status=$status
+        state=$(cat "$DSR_STATE_DIR/triggered.json")
+        touch "$DSR_STATE_DIR/finish-next"
+        _watch_completed 12347
+        assert_equal 0 "$first_status"
+        jq -e '.pending == {} and .runs["12345"] == null and .attempts["12345"] == null and
+            .attempts["12347"].attempt == 1' <<< "$state"
+        [[ ! -e "$DSR_STATE_DIR/watch-artifacts/12345" ]]
+        requests=$(wc -l < "$TEST_TMPDIR/watch-upstream.calls" | tr -d ' ')
+        run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --max-concurrent 1
+        assert_equal 0 "$status"
+        assert_equal "$requests" "$(wc -l < "$TEST_TMPDIR/watch-upstream.calls" | tr -d ' ')"
+        jq -e '.pending == {} and (.attempts | keys) == ["12346","12347"]' "$DSR_STATE_DIR/triggered.json"
+    done
+}
+
+@test "watch pending recovery keeps full-capacity polls and planning read only" {
+    harness_create_config
+    mkdir -p "$DSR_CONFIG_DIR/repos.d"
+    printf 'repo: Dicklesworthstone/ntm\n' > "$DSR_CONFIG_DIR/repos.d/ntm.yaml"
+    local check_json before first_status requests observed_status observed_output stderr=""
+    check_json=$(_watch_multiple_runs_json | jq '.details.throttled |= [.[1], .[0]]')
+    DSR_WATCH_FIXTURE_WAIT="$TEST_TMPDIR/finish-child" \
+        run --separate-stderr _routing_watch "$check_json" --auto-fallback --max-concurrent 1
+    first_status=$status
+    before=$(cat "$DSR_STATE_DIR/triggered.json")
+    _mock_watch_upstream_run "$(_watch_upstream_run_json)"
+    run --separate-stderr _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --max-concurrent 1
+    observed_status=$status; observed_output=$output
+    local full_state
+    full_state=$(cat "$DSR_STATE_DIR/triggered.json")
+    touch "$TEST_TMPDIR/finish-child"
+    _watch_completed 12346
+    assert_equal 0 "$first_status"
+    assert_equal 0 "$observed_status"
+    assert_equal "$before" "$full_state"
+    [[ ! -e "$TEST_TMPDIR/watch-upstream.calls" ]]
+    jq -e '.details.active_attempts == 1 and (.details.triggered_state.pending | keys) == ["12345"]' <<< "$observed_output"
+    # Established report-only completion reconciliation is allowed. It may
+    # not admit or retire the pending candidate, and never queries its run.
+    run _routing_watch '{"details":{"throttled":[]}}' --max-concurrent 1
+    assert_equal 0 "$status"
+    before=$(cat "$DSR_STATE_DIR/triggered.json")
+    run --separate-stderr _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --dry-run --max-concurrent 1
+    assert_equal 0 "$status"
+    assert_contains "$stderr" "[DRY RUN] Would trigger fallback"
+    assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+    requests=$(wc -l < "$TEST_TMPDIR/watch-upstream.calls" | tr -d ' ')
+    run _routing_watch "$(_watch_run_json)" --max-concurrent 1
+    assert_equal 0 "$status"
+    assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+    assert_equal "$requests" "$(wc -l < "$TEST_TMPDIR/watch-upstream.calls" | tr -d ' ')"
+    _watch_upstream_run_json completed success > "$TEST_TMPDIR/watch-upstream.json"
+    run --separate-stderr _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --dry-run --max-concurrent 1
+    assert_equal 0 "$status"
+    assert_contains "$stderr" "[DRY RUN] Would retire deferred run"
+    assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    [[ ! -e "$DSR_STATE_DIR/watch-artifacts/12345" ]]
+}
+
+@test "watch pending recovery admits older deferred work before new arrivals within the limit" {
+    _watch_pending_fixture
+    _mock_watch_upstream_run "$(_watch_upstream_run_json completed timed_out)"
+    local first_status state
+    DSR_WATCH_FIXTURE_WAIT="$TEST_TMPDIR/finish-next" run --separate-stderr _routing_watch \
+        "$(_watch_multiple_runs_json | jq '.details.throttled = [.details.throttled[2]]')" \
+        --auto-fallback --max-concurrent 1
+    first_status=$status
+    state=$(cat "$DSR_STATE_DIR/triggered.json")
+    touch "$TEST_TMPDIR/finish-next"
+    _watch_completed 12345
+    assert_equal 0 "$first_status"
+    jq -e '.attempts["12345"].attempt == 1 and .pending["12345"] == null and
+        .pending["12347"] != null and .attempts["12347"] == null and .runs["12347"] == null' <<< "$state"
+    assert_equal 2 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    run _routing_watch "$(_watch_multiple_runs_json | jq '.details.throttled = [.details.throttled[2]]')" \
+        --auto-fallback --max-concurrent 1
+    assert_equal 0 "$status"
+    _watch_completed 12347
+    jq -e '.pending == {} and .attempts["12347"].attempt == 1' "$DSR_STATE_DIR/triggered.json"
+    assert_equal 3 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+}
+
+@test "watch pending recovery rejects malformed or already-claimed candidates and migrates absent queues" {
+    _watch_pending_fixture
+    local valid invalid mutation before_count
+    valid=$(cat "$DSR_STATE_DIR/triggered.json")
+    before_count=$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')
+    for mutation in '.pending=null' '.pending=[]' '.pending["12345"].queued_epoch=-1' \
+        '.pending["12345"].queued_epoch=1.5' '.pending["12345"].isolate_source=false' \
+        '.pending["12345"].head_sha="0000000000000000000000000000000000000000"' \
+        '.pending["12345"].attempt=0' '.pending["12345"].resume_run_id="11111111-1111-4111-8111-111111111111"' \
+        '.pending["../invalid"]=.pending["12345"]' '.pending["12346"]=.pending["12345"]' \
+        '.runs["12345"]="2000-01-01T00:00:00Z"' '.attempts["12345"]=.attempts["12346"]' \
+        'del(.pending["12345"].repo)' '.pending["12345"].tool="../invalid"'; do
+        invalid=$(jq "$mutation" <<< "$valid")
+        printf '%s\n' "$invalid" > "$DSR_STATE_DIR/triggered.json"
+        run _routing_watch "$(_watch_run_json)" --auto-fallback
+        assert_equal 4 "$status"
+        assert_equal "$invalid" "$(cat "$DSR_STATE_DIR/triggered.json")"
+        assert_equal "$before_count" "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    done
+    valid=$(jq 'del(.pending)' <<< "$valid")
+    printf '%s\n' "$valid" > "$DSR_STATE_DIR/triggered.json"
+    run --separate-stderr _routing_watch '{"details":{"throttled":[]}}'
+    assert_equal 0 "$status"
+    jq -e '.details.triggered_state.pending == {} and
+        .details.triggered_state.attempts["12346"].status == "succeeded"' <<< "$output"
+    assert_equal "$valid" "$(cat "$DSR_STATE_DIR/triggered.json")"
+}
+
+@test "watch pending recovery refuses existing output without inventing a resume checkpoint" {
+    _watch_pending_fixture
+    _mock_watch_upstream_run "$(_watch_upstream_run_json completed startup_failure)"
+    local before
+    before=$(cat "$DSR_STATE_DIR/triggered.json")
+    mkdir -p "$DSR_STATE_DIR/watch-artifacts/12345"
+    printf 'unclaimed payload\n' > "$DSR_STATE_DIR/watch-artifacts/12345/retained.bin"
+    run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --max-concurrent 1
+    assert_equal 4 "$status"
+    assert_contains "$output" "Unclaimed watcher artifact directory already exists"
+    assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    assert_equal 'unclaimed payload' "$(cat "$DSR_STATE_DIR/watch-artifacts/12345/retained.bin")"
+    [[ ! -e "$DSR_STATE_DIR/builds/ntm/v1.2.3" ]]
+}
+
 @test "watch admission bounds active fallbacks across restarts and launches deferred runs after completion" {
     harness_create_config
+    mkdir -p "$DSR_CONFIG_DIR/repos.d"
+    printf 'repo: Dicklesworthstone/ntm\n' > "$DSR_CONFIG_DIR/repos.d/ntm.yaml"
     local check_json first_state first_status second_state second_status deadline
     check_json=$(_watch_multiple_runs_json)
     DSR_WATCH_FIXTURE_WAIT="$TEST_TMPDIR/finish-child" run --separate-stderr _routing_watch "$check_json" --auto-fallback

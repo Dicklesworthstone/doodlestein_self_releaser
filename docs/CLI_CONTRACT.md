@@ -556,10 +556,23 @@ until the active count falls below the new limit. Existing per-host build limits
 continue to apply independently.
 
 Deferral does not create an attempt, reserve output, or consume a failed run's
-retry budget. The next poll must revalidate either a currently throttled run or
-an eligible terminal upstream failure before starting it; retries must keep their
-original source identity. A dry run budgets its planned starts against the same
-limit without writing recovery state. JSON
+retry budget. Never-started candidates persist in `triggered.json.pending`, bound
+to their original run ID, tool, repository, version tag, source SHA and source
+isolation mode. Older pending candidates take priority over newly observed work.
+Once capacity is available, a pending run must be freshly observed as throttled
+or independently confirmed as the same terminal upstream failure before its
+first attempt starts. It uses no resume checkpoint. An existing unclaimed output
+directory still blocks admission. Pending candidates absent from the throttle
+inventory are not individually queried while all slots are occupied.
+
+An uncached, identity-matching upstream success or cancellation retires a pending
+candidate without creating an attempt. Active, unknown or unavailable observations
+retain it; changed source identity, missing tool configuration or a remapped
+repository cannot authorize a launch. Failed attempts retain their existing retry and
+checkpoint rules. Report-only mode adds, admits and retires no pending candidates;
+it retains the established reconciliation of already-started attempts. A dry run
+budgets its planned starts against the same limit without writing recovery state.
+JSON
 once results include `details.max_concurrent`, `details.active_attempts` (the
 retained active work), and `details.deferred_count` (eligible runs deferred for
 capacity during this poll).

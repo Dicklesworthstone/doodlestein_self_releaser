@@ -1096,17 +1096,20 @@ fallbacks would start.
 
 The watcher admits at most two fallback pipelines at once by default;
 `--max-concurrent` accepts 1–32. Excess runs wait for a later poll without
-creating a build or consuming a retry attempt. Active workers retain their
+creating a build or consuming a retry attempt. Their repository, tag and source
+SHA are retained across restarts, and older waiting releases take priority over
+new arrivals. Active workers retain their
 slots across `--once` calls and watcher restarts, until their descendants exit
 and the completion receipt is verified. Lowering the limit lets existing work
 finish before admitting more. Each admitted build still follows the configured
 per-host concurrency limits. Deferred runs require a fresh upstream observation
 when a slot becomes available; retries must keep their original source identity.
-A failed fallback may also retry after its original workflow leaves the queue
-and an uncached lookup confirms `failure`, `timed_out`, or `startup_failure`.
-Successful, cancelled, active, or unverified upstream runs cannot authorize that
-recovery. The original source, cooldown, attempt budget, and exact checkpoint
-requirements still apply.
+A pending release may start, or a failed fallback may retry, after its original
+workflow leaves the queue and an uncached lookup confirms `failure`, `timed_out`,
+or `startup_failure`. Pending runs are refreshed once capacity is available;
+an exact success or cancellation removes a never-started candidate without an
+attempt. Active or unverified upstream runs remain pending. Existing attempts
+keep their source, cooldown, attempt budget, and exact checkpoint requirements.
 
 Automatic fallback builds a private copy of the workflow's exact tagged commit.
 Your checkout can be on a newer commit, contain staged or untracked work, or be
