@@ -3,7 +3,8 @@
 #
 # These tests verify the orchestration layer that coordinates act + SSH builds
 # Run --dispatch-stdin-only for the issue #48 scheduler regression without
-# compiler, Docker, SSH, or host-health fixtures.
+# compiler, Docker, SSH, or host-health fixtures. --output-queue-only exercises
+# deferred shared outputs, independent hosts, cancellation and exact-run resume.
 
 set -uo pipefail
 
@@ -20,6 +21,235 @@ SKIP=0
 pass() { echo -e "${GREEN}✓${NC} $1"; ((PASS++)); }
 fail() { echo -e "${RED}✗${NC} $1"; ((FAIL++)); }
 skip() { echo -e "${YELLOW}○${NC} $1"; ((SKIP++)); }
+
+# Exercise output-conflict scheduling with the real planner, coordinator,
+# workers, process groups, host slots and checkpoints. Only compilation is a
+# controlled subprocess; barriers prove event order without timing a build.
+test_parallel_output_queue() {
+    local project_root required_tool
+    project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" || return 1
+    for required_tool in python3 jq yq; do
+        command -v "$required_tool" >/dev/null || { echo "Missing test dependency: $required_tool" >&2; return 77; }
+    done
+    python3 - "$project_root" "${DSR_TEST_ACT_RUNNER:-$project_root/src/act_runner.sh}" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+project, module = map(Path, sys.argv[1:])
+root = Path(tempfile.mkdtemp(prefix='dsr-output-queue-'))
+print('Retained output queue fixtures: ' + str(root), flush=True)
+checks = failures = 0
+
+
+def check(label, condition):
+    global checks, failures
+    checks += 1
+    failures += not condition
+    print(('PASS ' if condition else 'FAIL ') + label, flush=True)
+
+
+def read(path):
+    return json.loads(path.read_text())
+
+
+def events(case, phase='first'):
+    path = case / 'events.jsonl'
+    return [row for row in map(json.loads, path.read_text().splitlines())
+            if row['phase'] == phase] if path.exists() else []
+
+
+def until(process, predicate):
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        if process.poll() is not None:
+            break
+        time.sleep(0.02)
+    return predicate()
+
+
+producer = root / 'producer.py'
+producer.write_text(r'''import json, os, sys, time
+from pathlib import Path
+case, target, host, phase, mode = Path(sys.argv[1]), *sys.argv[2:]
+targets = json.loads((case / 'targets.json').read_text())
+def event(state):
+    row = dict(target=target, state=state, phase=phase, pid=os.getpid(),
+               stage=os.environ.get('DSR_NATIVE_OUTPUT_STAGE'), at=time.monotonic_ns())
+    fd = os.open(case / 'events.jsonl', os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, (json.dumps(row) + '\n').encode())
+    finally:
+        os.close(fd)
+event('start')
+if phase == 'first' and (target == targets[0] or (mode == 'cancel' and target == targets[-1])):
+    while not (case / 'release').exists():
+        time.sleep(0.02)
+failed = phase == 'first' and mode == 'retry' and target == targets[1]
+result = dict(platform=target, method='native', host=host,
+              status='failed' if failed else 'success', exit_code=9 if failed else 0)
+if failed:
+    result['error'] = 'controlled compiler failure after deferred dispatch'
+else:
+    artifact = case / 'output' / (phase + '-' + target.replace('/', '-') + '.bin')
+    with artifact.open('xb') as out:
+        out.write(('scheduler fixture: ' + target + '\n').encode())
+    result.update(artifact_path=str(artifact), artifact_paths=[str(artifact)])
+event('end')
+print(json.dumps(result), flush=True)
+raise SystemExit(result['exit_code'])
+''')
+driver = root / 'driver.sh'
+driver.write_text(r'''#!/usr/bin/env bash
+set -uo pipefail
+source "$DSR_QUEUE_PROJECT/src/logging.sh" || exit
+source "$DSR_QUEUE_PROJECT/src/config.sh" || exit
+source "$DSR_QUEUE_PROJECT/src/build_state.sh" || exit
+source "$DSR_QUEUE_MODULE" || exit
+source "$DSR_QUEUE_PROJECT/src/host_selector.sh" || exit
+act_run_native_build() {
+    _act_run_with_timeout 45 python3 "$DSR_QUEUE_PRODUCER" "$DSR_QUEUE_CASE" \
+        "$2" "$8" "$DSR_QUEUE_PHASE" "$DSR_QUEUE_MODE"
+}
+args=(--run-id "$DSR_QUEUE_RUN")
+[[ "$DSR_QUEUE_PHASE" != resume ]] || args=(--resume-run-id "$DSR_QUEUE_RUN")
+act_orchestrate_build queuefixture 1.0.0 --parallel-jobs 2 --no-source-sync-gate \
+    --output-dir "$DSR_QUEUE_CASE/output" "${args[@]}"
+''')
+
+
+def invoke(case, env, targets, mode, phase):
+    env = dict(env, DSR_QUEUE_PHASE=phase)
+    workspace = case / 'state/builds/queuefixture/1.0.0' / env['DSR_QUEUE_RUN']
+    with open(case / (phase + '.stdout'), 'wb') as out, open(case / (phase + '.stderr'), 'wb') as err:
+        process = subprocess.Popen(['bash', str(driver)], env=env, stdin=subprocess.DEVNULL,
+                                   stdout=out, stderr=err, start_new_session=True)
+        try:
+            if phase == 'first':
+                started = lambda target: any(row['target'] == target and row['state'] == 'start'
+                                             for row in events(case))
+                check(case.name + ': first conflicting target reaches its barrier', until(process, lambda: started(targets[0])))
+                check(case.name + ': later independent host starts before the blocked output is released',
+                      until(process, lambda: started(targets[-1])))
+                checkpoint = read(workspace / 'state.json')
+                (case / 'queued.state.json').write_text(json.dumps(checkpoint) + '\n')
+                pending = checkpoint['target_statuses'][targets[1]]
+                check(case.name + ': deferred target stays pending with zero attempts',
+                      pending['status'] == 'pending' and pending['attempts'] == 0 and not pending.get('result'))
+                check(case.name + ': deferral creates no immutable log, result or capacity lease',
+                      not list(workspace.glob('logs/002-*.log')) and not list(workspace.glob('results/002-*.json')) and
+                      not list((case / 'state/selector/locks').rglob('*-' + targets[1].replace('/', '-') + '-attempt-*.lock')))
+                check(case.name + ': conflicting backend has not started or staged a different output',
+                      not started(targets[1]) and all(row['stage'] == '0' for row in events(case)))
+                if mode == 'cancel':
+                    process.send_signal(signal.SIGTERM)
+                else:
+                    (case / 'release').write_text('release the first output\n')
+            code = process.wait(timeout=35)
+        finally:
+            if process.poll() is None:
+                process.send_signal(signal.SIGTERM)
+                try:
+                    process.wait(timeout=8)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=5)
+    result, state = read(case / (phase + '.stdout')), read(workspace / 'state.json')
+    expected = 130 if phase == 'first' and mode == 'cancel' else 1 if phase == 'first' and mode == 'retry' else 0
+    check(case.name + '/' + phase + ': aggregate retains the actual outcome',
+          code == expected and result['exit_code'] == code and result['run_id'] == env['DSR_QUEUE_RUN'])
+    check(case.name + '/' + phase + ': results preserve configured task order',
+          [row['task_key'] for row in result['targets']] == targets)
+    check(case.name + '/' + phase + ': every real host slot has been released',
+          not list((case / 'state/selector/locks').rglob('*.lock')))
+    return result, state, workspace
+
+
+for route, mode in (('windows', 'success'), ('external', 'retry'), ('external', 'cancel')):
+    case = root / (route + '-' + mode)
+    for directory in ('config/repos.d', 'source', 'output'):
+        (case / directory).mkdir(parents=True)
+    targets = ['windows/amd64', 'windows/arm64', 'linux/amd64'] if route == 'windows' else [
+        'linux/amd64', 'linux/arm64', 'darwin/arm64']
+    (case / 'targets.json').write_text(json.dumps(targets))
+    hosts = {target: 'shared' if target != targets[-1] else 'independent' for target in targets}
+    config = dict(tool_name='queuefixture', repo='fixture/queuefixture', language='go',
+                  local_path=str(case / 'source'), binary_name='fixture', targets=targets,
+                  build_cmd='go build -o fixture ./cmd/fixture', act_job_map={target: None for target in targets},
+                  cross_compile={target: {'host': host} for target, host in hosts.items()})
+    if route == 'external':
+        config['env'] = {'GOBIN': str(case / 'shared-bin')}
+    (case / 'config/repos.d/queuefixture.yaml').write_text(json.dumps(config))
+    (case / 'config/hosts.yaml').write_text(json.dumps(dict(platform_mapping=hosts, hosts={
+        'shared': dict(platform=targets[0], connection='local', concurrency=3),
+        'independent': dict(platform=targets[-1], connection='local', concurrency=3)})))
+    env = {key: value for key, value in os.environ.items()
+           if key not in ('BASH_ENV', 'ENV') and not key.startswith('BASH_FUNC_')}
+    env.update(DSR_QUEUE_PROJECT=str(project), DSR_QUEUE_MODULE=str(module), DSR_QUEUE_PRODUCER=str(producer),
+               DSR_QUEUE_CASE=str(case), DSR_QUEUE_RUN=str(uuid.uuid4()), DSR_QUEUE_MODE=mode,
+               DSR_CONFIG_DIR=str(case / 'config'), DSR_HOSTS_FILE=str(case / 'config/hosts.yaml'),
+               ACT_REPOS_DIR=str(case / 'config/repos.d'), DSR_STATE_DIR=str(case / 'state'),
+               DSR_CACHE_DIR=str(case / 'cache'), ACT_LOGS_DIR=str(case / 'logs'),
+               ACT_ARTIFACTS_DIR=str(case / 'artifacts'), DSR_BUILD_LOCK_HELD_BY_CALLER='0',
+               DSR_DISABLE_HOST_SELECTOR='1', NO_COLOR='1')
+    result, state, workspace = invoke(case, env, targets, mode, 'first')
+    timeline = events(case)
+    starts = {row['target']: row['at'] for row in timeline if row['state'] == 'start'}
+    ends = {row['target']: row['at'] for row in timeline if row['state'] == 'end'}
+    if mode == 'cancel':
+        check(case.name + ': cancellation retains only the two actually started attempts',
+              set(starts) == {targets[0], targets[-1]} and
+              [row['attempt'] for row in result['targets']] == [1, 0, 1] and
+              result['targets'][1]['status'] == 'skipped' and not result['targets'][1]['execution_started'] and
+              state['target_statuses'][targets[1]]['status'] == 'pending' and
+              len(list(workspace.glob('results/*.json'))) == 2)
+        check(case.name + ': every started descendant stops before the coordinator returns', all(
+            subprocess.run(['ps', '-p', str(row['pid']), '-o', 'stat='], capture_output=True).stdout.strip() in (b'', b'Z')
+            for row in timeline if row['state'] == 'start'))
+        continue
+    check(case.name + ': independent work overlaps while conflicting outputs remain serialized',
+          set(starts) == set(targets) and len(timeline) == 6 and starts[targets[1]] >= ends[targets[0]] and
+          starts[targets[-1]] < ends[targets[0]])
+    check(case.name + ': original ordinal is retained in every immutable receipt path', all(
+        Path(row['result_path']).name.startswith('%03d-%s.attempt-1.' % (index + 1, target.replace('/', '-'))) and
+        Path(row['log_path']).name.startswith('%03d-%s.attempt-1.' % (index + 1, target.replace('/', '-'))) and
+        row['attempt'] == 1 and state['target_statuses'][target]['attempts'] == 1
+        for index, (target, row) in enumerate(zip(targets, result['targets']))))
+    retained = {path: hashlib.sha256(path.read_bytes()).hexdigest()
+                for pattern in ('results/*.json', 'logs/*.log') for path in workspace.glob(pattern)}
+    resumed, after, _ = invoke(case, env, targets, mode, 'resume')
+    expected_attempts = [1, 2, 1] if mode == 'retry' else [1, 1, 1]
+    check(case.name + ': resume keeps exact task ordinals and reruns only the failed compiler',
+          [row['attempt'] for row in resumed['targets']] == expected_attempts and
+          [after['target_statuses'][target]['attempts'] for target in targets] == expected_attempts and
+          [row['target'] for row in events(case, 'resume') if row['state'] == 'start'] ==
+          ([targets[1]] if mode == 'retry' else []) and
+          all(row['status'] == 'success' for row in resumed['targets']) and
+          after['status'] == 'targets-complete')
+    check(case.name + ': successful outputs are reused and old immutable evidence is unchanged',
+          all(row.get('resume_reused') for index, row in enumerate(resumed['targets'])
+              if mode != 'retry' or index != 1) and
+          all(hashlib.sha256(path.read_bytes()).hexdigest() == digest for path, digest in retained.items()))
+
+(root / 'summary.json').write_text(json.dumps(dict(checks=checks, failures=failures)) + '\n')
+print('Output queue: %d checks, %d failures' % (checks, failures), flush=True)
+raise SystemExit(bool(failures))
+PY
+}
+
+if [[ "${1:-}" == --output-queue-only ]]; then
+    test_parallel_output_queue
+    exit $?
+fi
 
 # Exercise the real task stream, worker wrapper, timeout, immutable receipts,
 # state transitions and resume admission. Normal cases replace only native
@@ -7543,7 +7773,7 @@ EOF
     done
     # Replay each timeline: the two colliding targets never overlap, the
     # unrelated target (launched first) runs alongside them, and nothing was
-    # staged. A waiting target does hold back targets listed after it.
+    # staged. The barrier suite also covers an unrelated target listed last.
     local first second third
     for case_name in windows gobin; do
         if [[ "$case_name" == windows ]]; then
@@ -7566,6 +7796,14 @@ if test_parallel_shared_output_serialization; then
 else
     fail "unstageable shared outputs ran concurrently or blocked unrelated targets"
 fi
+
+output_queue_status=0
+test_parallel_output_queue || output_queue_status=$?
+case "$output_queue_status" in
+    0) pass "deferred output collisions leave independent hosts runnable and preserve retry and cancellation receipts" ;;
+    77) skip "output queue barriers require Python, jq and yq" ;;
+    *) fail "output collision queue blocked independent hosts or changed durable attempt identity" ;;
+esac
 
 # A target whose host is at its concurrency limit must queue for a slot for up
 # to one build timeout instead of failing after the selector's short default

@@ -15791,13 +15791,34 @@ act_orchestrate_build() {
     trap _act_cancel_parallel_workers INT TERM HUP
 
     local task_json task_key selected_triple
+    local dispatch_index deferred_tasks=0 pending_task_count=0
+    local -a dispatch_tasks=() pending_task_indices=()
+    # Keep a bounded queue of original task ordinals. A target waiting for an
+    # occupied output must not prevent later tasks on independent hosts from
+    # using free worker capacity. The fixed ordinal, not dispatch order, names
+    # every immutable attempt receipt and remains identical on resume.
     while IFS= read -r task_json; do
+        pending_task_indices+=("$pending_task_count")
+        dispatch_tasks+=("$task_json")
+        pending_task_count=$((pending_task_count + 1))
+    done < <(jq -c '.[]' <<< "$build_tasks_json")
+    while (( pending_task_count > 0 )); do
+        dispatch_index="${pending_task_indices[0]}"
+        pending_task_count=$((pending_task_count - 1))
+        # Bash before 4.4 treats expansion of an empty array as unset under
+        # nounset. Avoid both empty length queries and empty tail expansion.
+        if (( pending_task_count > 0 )); then
+            pending_task_indices=("${pending_task_indices[@]:1}")
+        else
+            pending_task_indices=()
+        fi
+        task_json="${dispatch_tasks[$dispatch_index]}"
+        target_index=$((dispatch_index + 1))
         target=$(jq -r '.platform' <<< "$task_json")
         task_key=$(jq -r '.key' <<< "$task_json")
         selected_triple=""
         [[ "$task_key" == "$target" ]] || selected_triple=$(jq -r '.target_triple' <<< "$task_json")
         $interrupted && break
-        target_index=$((target_index + 1))
         local persisted_entry='{}' persisted_result="" persisted_result_path=""
         local prior_attempts=0 prior_build_attempts=0
         if $state_available; then
@@ -15825,6 +15846,7 @@ act_orchestrate_build() {
                     "$(jq -c '.workflow_source // null' <<< "$task_json")"; then
                 final_results["$task_key"]=$(jq -c '. + {resume_reused: true}' <<< "$persisted_result")
                 _log_info "Resume: reusing completed target $task_key"
+                deferred_tasks=0
                 continue
             fi
             local recovered_result="" recovered_status=""
@@ -15888,6 +15910,7 @@ act_orchestrate_build() {
                     if [[ "$recovered_status" == completed ]]; then
                         final_results["$task_key"]="$recovered_result"
                         _log_info "Resume: reconciled completed sidecar for $task_key"
+                        deferred_tasks=0
                         continue
                     fi
                     # Reconciliation accounts for source-sync and readiness
@@ -15965,6 +15988,7 @@ act_orchestrate_build() {
                 fi
                 final_results["$task_key"]="$exhausted_result"
                 _log_warn "Resume: retry limit exceeded for $target"
+                deferred_tasks=0
                 continue
             fi
         fi
@@ -16018,15 +16042,24 @@ act_orchestrate_build() {
                     output_paths=""
                     _log_info "Target $target shares its output path on $host with $output_conflict; building it in a private source copy"
                 else
-                    _log_info "Target $target shares its output path on $host with $output_conflict; waiting for that build to finish"
-                    while [[ -n "$(_act_active_output_conflict "$host" "$output_paths")" ]]; do
-                        _act_reap_one_worker || { interrupted=true; break; }
-                    done
+                    _log_info "Target $target shares its output path on $host with $output_conflict; deferring it while independent targets run"
+                    pending_task_indices+=("$dispatch_index")
+                    pending_task_count=$((pending_task_count + 1))
+                    deferred_tasks=$((deferred_tasks + 1))
+                    # A full pass without dispatch/reuse means every queued
+                    # task is blocked by an owned worker. Wait for one actual
+                    # completion rather than spin or reserve empty attempts.
+                    if (( deferred_tasks >= pending_task_count )); then
+                        _act_reap_one_worker || interrupted=true
+                        deferred_tasks=0
+                    fi
                     $interrupted && break
+                    continue
                 fi
             fi
         fi
 
+        deferred_tasks=0
         # Do not reserve an attempt while waiting on another target's output.
         # Cancellation there must leave queued tasks at zero attempts, without
         # an empty immutable log that would prevent the next resume.
@@ -16064,9 +16097,9 @@ act_orchestrate_build() {
             break
         fi
 
-        # Only this loop may read the remaining JSON task records. Isolate the
-        # whole worker, including capacity selection and all descendants, so
-        # an stdin-reading build or transport cannot silently eat queued tasks.
+        # Keep invocation input owned by the coordinator. Isolate the whole
+        # worker, including capacity selection and all descendants, so an
+        # stdin-reading build or transport receives EOF instead of caller input.
         DSR_NATIVE_OUTPUT_STAGE="$output_stage" \
         _act_run_target_worker "$tool_name" "$version" "$run_id" "$target" "$attempt" \
             "$log_path" "$result_path" "$strict_release_contract" \
@@ -16095,7 +16128,7 @@ act_orchestrate_build() {
             _act_reap_one_worker || interrupted=true
             $interrupted && break
         fi
-    done < <(jq -c '.[]' <<< "$build_tasks_json")
+    done
 
     while (( active_workers > 0 )); do
         _act_reap_one_worker || interrupted=true

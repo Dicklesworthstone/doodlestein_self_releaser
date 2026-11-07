@@ -618,6 +618,10 @@ toolchain.
 
 Target logs and result receipts are isolated by task and attempt. Aggregation
 is deterministic in requested-platform order, then configured triple order.
+Targets that share a native output path use private source copies when supported.
+When those outputs cannot be isolated, only the conflicting targets wait;
+independent queued targets continue within the configured job limit. Deferral
+does not reserve an attempt or change the target's log identity and result order.
 Workers start with stdin connected to the null device; only the coordinator
 reads the queued task records. A worker failure or timeout does not discard
 later tasks. Cancellation stops dispatch, drains started workers, and retains
