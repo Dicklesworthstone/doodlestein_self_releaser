@@ -842,7 +842,7 @@ _verify_checksum() {
         fi
         manifest="$file.checksums.download"
         local found=false
-        for candidate in "$asset.sha256" checksums.sha256 \
+        for candidate in "$asset.sha256" checksums.sha256 SHA256SUMS \
             "${TOOL_NAME}-${_VERSION#v}-SHA256SUMS.txt" SHA256SUMS.txt checksums.txt; do
             if _fetch_release_asset "$candidate" "$manifest"; then
                 found=true

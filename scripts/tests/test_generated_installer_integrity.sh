@@ -952,6 +952,34 @@ run_install --prefer-gh
 check 'gh success never bypasses checksum mismatch' blocked
 CURL_FAIL=0
 set_manifest "$hash  $asset"
+mv "$REMOTE/checksums.sha256" "$work/alternate-checksum-manifest"
+printf '%s  %s\n' "$hash" "$asset" > "$REMOTE/SHA256SUMS"
+run_install
+check 'canonical SHA256SUMS-only release installs through curl' success
+canonical_cache="$case_dir/cache"
+before=$(wc -l < "$CALLS")
+run_install --cache-dir "$canonical_cache" --offline
+check 'canonical aggregate produces reusable exact offline checksum evidence' success
+check 'canonical aggregate cache reuse never calls a transport' test "$(wc -l < "$CALLS")" -eq "$before"
+CURL_FAIL=1
+run_install --prefer-gh
+check 'canonical SHA256SUMS-only release installs through authenticated gh' success
+CURL_FAIL=0
+for mode in wrong-name wrong-hash duplicate; do
+    case "$mode" in
+        wrong-name) printf '%s  not-%s\n' "$hash" "$asset" > "$REMOTE/SHA256SUMS" ;;
+        wrong-hash) printf '%064d  %s\n' 0 "$asset" > "$REMOTE/SHA256SUMS" ;;
+        duplicate) printf '%s  %s\n%s  %s\n' "$hash" "$asset" "$hash" "$asset" > "$REMOTE/SHA256SUMS" ;;
+    esac
+    run_install
+    check "canonical $mode checksum evidence cannot install or populate cache" blocked
+done
+printf '%s  %s\n' "$hash" "$asset" > "$REMOTE/SHA256SUMS"
+set_manifest "invalid earlier manifest"
+run_install
+check 'valid canonical aggregate cannot hide a malformed earlier checksum manifest' blocked
+mv "$REMOTE/SHA256SUMS" "$work/canonical-checksum-manifest"
+set_manifest "$hash  $asset"
 printf '%s\n' "$hash" > "$REMOTE/$asset.sha256"
 run_install
 check 'single raw digest is supported in asset-specific sidecar' success

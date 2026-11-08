@@ -27,6 +27,10 @@
 #   --uninstall        Remove dsr and associated files
 #   -h, --help         Show this help
 #
+# Updates are staged and validated before activation. Previous source checkouts
+# are retained beside --repo-dir in .<name>.install.*/previous-repo. Handled
+# activation failures and signals restore the prior source and launcher.
+#
 
 set -euo pipefail
 shopt -s lastpipe 2>/dev/null || true
@@ -69,6 +73,17 @@ LOCK_DIR=""
 LOCKED=0
 TMP=""
 CLONE_REFS=()
+INSTALL_COMMITTED=0
+INSTALL_REPO_CANDIDATE=""
+INSTALL_REPO_PREVIOUS=""
+INSTALL_REPO_NEW_ID=""
+INSTALL_REPO_OLD_ID=""
+INSTALL_REPO_SWITCH=0
+INSTALL_LINK_STAGE=""
+INSTALL_LINK_NEW_ID=""
+INSTALL_LINK_OLD_ID=""
+INSTALL_LINK_SWITCH=0
+INSTALL_LOCK_ID=""
 
 # ============================================================
 # Usage
@@ -97,6 +112,12 @@ Options:
   --force            Reinstall even if same version exists
   --uninstall        Remove dsr and associated files
   -h, --help         Show this help
+
+Updates retain the previous source in a sibling .<repo-name>.install.*/previous-repo
+directory and any replaced launcher in --dest/.dsr-launcher.*/previous. Acquisition
+and validation do not change the active checkout. Handled activation failures and
+signals restore prior entries; abrupt power loss or SIGKILL can require manual
+recovery from the retained directories.
 
 Environment:
   DSR_DEST           Override install directory (default: ~/.local/bin)
@@ -315,6 +336,8 @@ setup_proxy() {
 resolve_version() {
   # 1. CLI flag
   [[ -n "$VERSION" ]] && return 0
+  # An offline archive determines its own version after staging and validation.
+  [[ -n "$OFFLINE_TARBALL" ]] && return 0
 
   # 2. GitHub API (latest release tag, if releases exist)
   VERSION=$(curl -fsSL --connect-timeout 5 "${PROXY_ARGS[@]}" \
@@ -377,24 +400,63 @@ check_write_permissions() {
   fi
 }
 
+installed_matches_requested_tag() {
+  local top head tag ref
+  top=$(git -C "$REPO_DIR" rev-parse --show-toplevel 2>/dev/null) || return 1
+  [[ "$top" == "$REPO_DIR" ]] || return 1
+  head=$(git -C "$REPO_DIR" rev-parse --verify HEAD 2>/dev/null) || return 1
+  # Main can contain many newer commits with an unchanged DSR_VERSION. Only
+  # an unchanged checkout of the requested local tag can satisfy a pinned
+  # version without acquisition. Missing/unverifiable identities are misses.
+  build_clone_refs
+  for ref in "${CLONE_REFS[@]}"; do
+    tag=$(git -C "$REPO_DIR" rev-parse --verify "refs/tags/$ref^{commit}" 2>/dev/null) || continue
+    if [[ "$tag" == "$head" ]] &&
+       git -C "$REPO_DIR" diff-index --cached --quiet HEAD -- &&
+       git -C "$REPO_DIR" diff-files --quiet --; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 check_existing_install() {
-  if command -v dsr >/dev/null 2>&1; then
-    local current
-    current=$(dsr --version 2>/dev/null | head -1 || echo "unknown")
-    if [ "$FORCE_INSTALL" -eq 0 ] && [ "$VERSION_EXPLICIT" -eq 1 ] && [[ "$current" == *"$VERSION"* ]] && [[ -n "$VERSION" ]]; then
+  local installed="$DEST/$BINARY_NAME" current="" current_version=""
+  if [[ -x "$installed" && ! -d "$installed" ]]; then
+    # Inspect the selected destination, never an unrelated dsr earlier on PATH.
+    # Capture the complete result first so head cannot turn SIGPIPE into a
+    # false failure under pipefail.
+    if command -v timeout >/dev/null 2>&1; then
+      current=$(timeout 10 "$installed" --version 2>/dev/null) || current=""
+    elif command -v gtimeout >/dev/null 2>&1; then
+      current=$(gtimeout 10 "$installed" --version 2>/dev/null) || current=""
+    else
+      current=$("$installed" --version 2>/dev/null) || current=""
+    fi
+    if [[ "$current" =~ ^dsr[[:blank:]]version[[:blank:]]v?([0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?)$ ]]; then
+      current_version="${BASH_REMATCH[1]}"
+    fi
+    # A version label cannot authenticate a newly supplied offline archive.
+    # A different --repo-dir also requires installing that selected source.
+    if [ "$FORCE_INSTALL" -eq 0 ] && [ "$VERSION_EXPLICIT" -eq 1 ] &&
+       [[ -z "$OFFLINE_TARBALL" && -n "$current_version" && "$current_version" == "${VERSION#v}" &&
+          -L "$installed" && "$(readlink "$installed")" == "$REPO_DIR/dsr" ]] &&
+       installed_matches_requested_tag; then
       ok "dsr $VERSION is already installed"
       info "Use --force to reinstall"
+      INSTALL_COMMITTED=1
       # Still run agent configuration (idempotent)
       if [ "$NO_CONFIGURE" -eq 0 ]; then
-        configure_agents
+        configure_agents || warn "Agent configuration did not complete; the installed dsr is unchanged"
       fi
       show_summary
       exit 0
     fi
-    if [ "$FORCE_INSTALL" -eq 0 ] && [ "$VERSION_EXPLICIT" -eq 0 ] && [[ "$current" == *"$VERSION"* ]] && [[ -n "$VERSION" ]]; then
+    if [ "$FORCE_INSTALL" -eq 0 ] && [ "$VERSION_EXPLICIT" -eq 0 ] &&
+       [[ -n "$current_version" && "$current_version" == "${VERSION#v}" ]]; then
       info "Existing dsr version matches; checking the main-branch source clone for updates"
     fi
-    info "Existing dsr found: $current"
+    info "Existing dsr at $installed: ${current:-version unavailable}"
   fi
 }
 
@@ -436,34 +498,54 @@ preflight_checks() {
 LOCK_FILE="/tmp/dsr-installer"
 
 cleanup() {
-  rm -rf "$TMP" 2>/dev/null || true
-  if [ "$LOCKED" -eq 1 ]; then
-    rm -rf "${LOCK_FILE}.d" 2>/dev/null || true
+  local status=$?
+  trap - EXIT
+  # Finish a handled rollback even if another interrupt arrives midway.
+  trap '' HUP INT TERM
+  if [ "$INSTALL_COMMITTED" -eq 0 ]; then
+    if ! rollback_installation; then
+      status=1
+    fi
   fi
+  # Workspaces can contain the previous checkout, a previous launcher, and
+  # acquisition diagnostics. Keep them rather than recursively deleting them.
+  if [[ -n "$TMP" && -d "$TMP" ]]; then
+    if [ "$INSTALL_COMMITTED" -eq 1 ]; then
+      info "Previous source and acquisition files retained at: $TMP"
+    else
+      warn "Installer staging retained for inspection: $TMP"
+    fi
+  fi
+  if [[ -n "$INSTALL_LINK_STAGE" ]]; then
+    info "Launcher recovery files retained at: $INSTALL_LINK_STAGE"
+  fi
+  if [ "$LOCKED" -eq 1 ]; then
+    if [[ -n "$INSTALL_LOCK_ID" && ! -L "$LOCK_DIR" &&
+          "$(install_path_identity "$LOCK_DIR")" == "$INSTALL_LOCK_ID" &&
+          -f "$LOCK_DIR/pid" && ! -L "$LOCK_DIR/pid" &&
+          "$(cat "$LOCK_DIR/pid")" == "$$" ]]; then
+      # Only our own bookkeeping is removed; unexpected entries retain the
+      # lock for inspection instead of being recursively discarded.
+      if ! rm -- "$LOCK_DIR/pid" || ! rmdir -- "$LOCK_DIR"; then
+        warn "Installation lock retained for inspection: $LOCK_DIR"
+      fi
+    else
+      warn "Installation lock ownership changed; leaving it untouched: $LOCK_DIR"
+    fi
+  fi
+  exit "$status"
 }
 
 acquire_lock() {
   LOCK_DIR="${LOCK_FILE}.d"
-  if mkdir "$LOCK_DIR" 2>/dev/null; then
+  if (umask 077; mkdir -- "$LOCK_DIR") 2>/dev/null; then
     LOCKED=1
-    echo $$ >"$LOCK_DIR/pid"
+    INSTALL_LOCK_ID=$(install_path_identity "$LOCK_DIR") || return 1
+    (umask 077; printf '%s\n' "$$" >"$LOCK_DIR/pid") || return 1
   else
-    # Check for stale lock
-    if [ -f "$LOCK_DIR/pid" ]; then
-      local old_pid
-      old_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
-      if [ -n "$old_pid" ] && ! kill -0 "$old_pid" 2>/dev/null; then
-        rm -rf "$LOCK_DIR"
-        if mkdir "$LOCK_DIR" 2>/dev/null; then
-          LOCKED=1
-          echo $$ >"$LOCK_DIR/pid"
-        fi
-      fi
-    fi
-    if [ "$LOCKED" -eq 0 ]; then
-      err "Another dsr installer is running (lock: $LOCK_DIR)"
-      exit 1
-    fi
+    err "Another dsr installer is running or its lock needs inspection: $LOCK_DIR"
+    err "Wait for the active installer; inspect a stopped install before removing its lock."
+    return 1
   fi
 }
 
@@ -477,6 +559,93 @@ DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 DSR_DATA_DIR="${DSR_DATA_DIR:-$DATA_HOME/dsr}"
 REPO_DIR="${REPO_DIR:-${DSR_REPO_DIR:-$DSR_DATA_DIR/repo}}"
 
+install_destination_command() {
+  if [ "$SYSTEM" -eq 1 ]; then
+    sudo -- "$@"
+  else
+    "$@"
+  fi
+}
+
+# lstat identity works for both a checkout directory and a launcher symlink.
+# Do not follow symlinks here: rollback must recognize the exact moved entry.
+install_path_identity() {
+  local path="$1" scope="${2:-source}" identity
+  if [[ "$scope" == destination ]]; then
+    identity=$(install_destination_command stat -c '%d:%i' -- "$path" 2>/dev/null) ||
+      identity=$(install_destination_command stat -f '%d:%i' "$path" 2>/dev/null) || return 1
+  else
+    identity=$(stat -c '%d:%i' -- "$path" 2>/dev/null) ||
+      identity=$(stat -f '%d:%i' "$path" 2>/dev/null) || return 1
+  fi
+  [[ "$identity" =~ ^[0-9]+:[0-9]+$ ]] || return 1
+  printf '%s\n' "$identity"
+}
+
+# Resolve existing ancestors without creating missing children. Overlap checks
+# can then reject an invalid destination before mkdir touches the live source.
+install_absolute_directory() {
+  local path="$1" suffix="" component parent
+  while [[ ! -d "$path" ]]; do
+    [[ ! -e "$path" && ! -L "$path" ]] || return 1
+    component=$(basename -- "$path") || return 1
+    suffix="$component/$suffix"
+    parent=$(dirname -- "$path") || return 1
+    [[ "$parent" != "$path" ]] || return 1
+    path="$parent"
+  done
+  path=$(CDPATH='' cd -P -- "$path" && pwd -P) || return 1
+  while [[ -n "$suffix" ]]; do
+    component="${suffix%%/*}"; suffix="${suffix#*/}"
+    case "$component" in
+      ''|.) ;;
+      ..) path="${path%/*}"; [[ -n "$path" ]] || path=/ ;;
+      *) path="${path%/}/$component" ;;
+    esac
+    # A missing component followed by .. can expose an existing sibling
+    # symlink. Resolve each newly reachable directory before the next step.
+    if [[ -d "$path" ]]; then
+      path=$(CDPATH='' cd -P -- "$path" && pwd -P) || return 1
+    elif [[ -e "$path" || -L "$path" ]]; then
+      return 1
+    fi
+  done
+  printf '%s\n' "$path"
+}
+
+prepare_install_paths() {
+  local leaf selected_repo selected_dest launcher
+  [[ -n "$DEST" && -n "$REPO_DIR" && "$DEST" != *[[:cntrl:]]* &&
+     "$REPO_DIR" != *[[:cntrl:]]* ]] || { err "Invalid installation path"; return 1; }
+  while [[ "$REPO_DIR" == */ && "$REPO_DIR" != / ]]; do REPO_DIR="${REPO_DIR%/}"; done
+  leaf=$(basename -- "$REPO_DIR") || return 1
+  [[ "$leaf" != . && "$leaf" != .. && "$leaf" != / ]] || {
+    err "--repo-dir must name a dedicated source directory"; return 1;
+  }
+  [[ ! -L "$REPO_DIR" ]] || {
+    err "Install source directory is a symlink; select its real path with --repo-dir"; return 1;
+  }
+  selected_repo=$(install_absolute_directory "$REPO_DIR") || {
+    err "Install source path is not a usable directory: $REPO_DIR"; return 1;
+  }
+  selected_dest=$(install_absolute_directory "$DEST") || {
+    err "Launcher destination is not a usable directory: $DEST"; return 1;
+  }
+  launcher="${selected_dest%/}/$BINARY_NAME"
+  if [[ "$selected_dest" == "$selected_repo" || "$selected_dest" == "$selected_repo/"* ||
+        "$selected_repo" == "$launcher" || "$selected_repo" == "$launcher/"* ]]; then
+    err "The launcher and source checkout paths must not overlap"
+    return 1
+  fi
+  if [[ -d "$launcher" ]]; then
+    err "Launcher destination is a directory: $launcher"
+    return 1
+  fi
+  REPO_DIR="$selected_repo"; DEST="$selected_dest"
+  mkdir -p -- "$(dirname "$REPO_DIR")" || return 1
+  if [[ ! -d "$DEST" ]]; then install_destination_command mkdir -p -- "$DEST" || return 1; fi
+}
+
 repo_dir_has_entries() {
   local first_entry
   first_entry=$(find "$1" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)
@@ -484,28 +653,33 @@ repo_dir_has_entries() {
 }
 
 ensure_repo_dir_available() {
-  if [ ! -e "$REPO_DIR" ] || [ -d "$REPO_DIR/.git" ]; then
+  if [ ! -e "$REPO_DIR" ]; then
     return 0
   fi
 
   if [ ! -d "$REPO_DIR" ]; then
     err "Install source path exists but is not a directory: $REPO_DIR"
     err "Choose a different --repo-dir or set DSR_REPO_DIR to a dedicated source directory."
-    exit 1
+    return 1
   fi
 
-  if repo_dir_has_entries "$REPO_DIR"; then
+  # A previous offline install has no .git directory. Its recognizable source
+  # tree is also replaceable, and the entire old directory is always retained.
+  if repo_dir_has_entries "$REPO_DIR" && [[ ! -d "$REPO_DIR/.git" && ! -f "$REPO_DIR/.git" ]] &&
+     ! { [[ -f "$REPO_DIR/dsr" && ! -L "$REPO_DIR/dsr" && -d "$REPO_DIR/src" && ! -L "$REPO_DIR/src" ]] &&
+         grep -q '^DSR_VERSION=' "$REPO_DIR/dsr"; }; then
     err "Install source path exists but is not a git clone: $REPO_DIR"
     err "dsr stores runtime data under $(status_path "$DSR_DATA_DIR"); the source checkout must be a dedicated directory."
     err "Use --repo-dir with an empty directory, or set DSR_REPO_DIR to a dedicated source directory."
-    exit 1
+    return 1
   fi
+  INSTALL_REPO_OLD_ID=$(install_path_identity "$REPO_DIR") || return 1
 }
 
 build_clone_refs() {
   CLONE_REFS=()
 
-  if [ "$VERSION_EXPLICIT" -eq 1 ] && [[ -n "$VERSION" ]]; then
+  if [ "$VERSION_EXPLICIT" -eq 1 ] && [[ -n "$VERSION" && "$VERSION" != main ]]; then
     if [[ "$VERSION" == v* ]]; then
       CLONE_REFS+=("$VERSION")
       [[ "${VERSION#v}" != "$VERSION" ]] && CLONE_REFS+=("${VERSION#v}")
@@ -520,9 +694,10 @@ build_clone_refs() {
 clone_repo_ref() {
   local clone_ref="$1"
   local error_file="$2"
+  local destination="$3"
 
   git clone --quiet --depth 1 --branch "$clone_ref" \
-    "https://github.com/${OWNER}/${REPO}.git" "$REPO_DIR" 2>"$error_file"
+    "https://github.com/${OWNER}/${REPO}.git" "$destination" 2>"$error_file"
 }
 
 print_clone_error() {
@@ -536,93 +711,79 @@ print_clone_error() {
   done < <(sed -n '1,8p' "$error_file")
 }
 
-# Bring an existing install clone to the requested state in place. A clone
-# made with --version is a shallow, detached checkout of a tag whose
-# single-branch refspec only ever re-fetches that same tag, so a plain
-# `git pull` reports "Already up to date" forever (and an explicit --version
-# was ignored). Returns nonzero when the caller should re-clone instead.
-update_existing_clone() {
-  local ref
-  if [ "$VERSION_EXPLICIT" -eq 1 ] && [[ -n "$VERSION" && "$VERSION" != main ]]; then
-    build_clone_refs
-    for ref in "${CLONE_REFS[@]}"; do
-      if git -C "$REPO_DIR" fetch --quiet --depth 1 origin "+refs/tags/$ref:refs/tags/$ref" 2>/dev/null &&
-         git -C "$REPO_DIR" checkout --quiet --detach "refs/tags/$ref" 2>/dev/null; then
-        ok "Switched dsr to $ref"
-        return 0
-      fi
-    done
-    return 1
-  fi
-  # Default installs track main; move a pinned (detached) clone onto it.
-  if ! git -C "$REPO_DIR" symbolic-ref -q HEAD >/dev/null 2>&1; then
-    git -C "$REPO_DIR" fetch --quiet --depth 1 origin "+refs/heads/main:refs/remotes/origin/main" 2>/dev/null || return 1
-    git -C "$REPO_DIR" checkout --quiet -B main refs/remotes/origin/main 2>/dev/null || return 1
-    git -C "$REPO_DIR" config --replace-all remote.origin.fetch "+refs/heads/main:refs/remotes/origin/main" || return 1
-    git -C "$REPO_DIR" branch --quiet --set-upstream-to=origin/main main 2>/dev/null || return 1
-    ok "Moved dsr from a pinned release onto main"
-    return 0
-  fi
-  git -C "$REPO_DIR" pull --quiet --ff-only 2>/dev/null || return 1
-  ok "Updated dsr to latest"
-  return 0
+# Validate the offline transport before extracting anything. One top-level
+# directory is stripped, matching GitHub repository archives. Links and special
+# files cannot redirect extraction outside the private candidate directory.
+validate_source_archive() {
+  local archive="$1" member root="" component normalized line count=0 types=0 duplicates
+  tar -tf "$archive" > "$TMP/archive.members" 2> "$TMP/archive.error" || return 1
+  LC_ALL=C tar -tvf "$archive" > "$TMP/archive.types" 2>> "$TMP/archive.error" || return 1
+  : > "$TMP/archive.paths" || return 1
+  while IFS= read -r member; do
+    count=$((count + 1))
+    [[ -n "$member" && "$member" != /* && "$member" != *[[:cntrl:]]* &&
+       "$member" != *\\* && "$member" != *:* ]] || return 1
+    component="${member%%/*}"
+    [[ -n "$component" && "$component" != .. && "$component" != -* ]] || return 1
+    if [[ -z "$root" ]]; then root="$component"; fi
+    [[ "$component" == "$root" ]] || return 1
+    [[ "$member" == */* ]] || continue
+    normalized="${member#*/}"; normalized="${normalized%/}"
+    [[ -n "$normalized" ]] || continue
+    [[ "$normalized" != -* ]] || return 1
+    case "/$normalized/" in *'/../'*|*'/./'*|*'//'*) return 1 ;; esac
+    printf '%s\n' "$normalized" >> "$TMP/archive.paths" || return 1
+  done < "$TMP/archive.members"
+  while IFS= read -r line; do
+    case "${line:0:1}" in -|d) types=$((types + 1)) ;; *) return 1 ;; esac
+  done < "$TMP/archive.types"
+  ((count > 0 && count == types)) || return 1
+  duplicates=$(LC_ALL=C sort "$TMP/archive.paths" | LC_ALL=C uniq -d) || return 1
+  [[ -z "$duplicates" ]] || return 1
 }
 
 clone_or_update_repo() {
+  ensure_repo_dir_available || return 1
+  # Keep the candidate on the destination filesystem so activation/rollback
+  # use directory renames, not recursive copies into the running installation.
+  TMP=$(mktemp -d "$(dirname "$REPO_DIR")/.${REPO_DIR##*/}.install.XXXXXXXX") || return 1
+  INSTALL_REPO_PREVIOUS="$TMP/previous-repo"
   if [[ -n "$OFFLINE_TARBALL" ]]; then
-    # Offline mode: tarball contains the full repo tree
-    if [ ! -f "$OFFLINE_TARBALL" ]; then
+    if [[ ! -f "$OFFLINE_TARBALL" ]]; then
       err "Offline file not found: $OFFLINE_TARBALL"
-      exit 1
+      return 1
     fi
-    ensure_repo_dir_available
-    mkdir -p "$REPO_DIR"
-    tar -xf "$OFFLINE_TARBALL" -C "$REPO_DIR" --strip-components=1 2>/dev/null \
-      || tar -xzf "$OFFLINE_TARBALL" -C "$REPO_DIR" --strip-components=1 2>/dev/null \
-      || { err "Failed to extract tarball"; exit 1; }
-    ok "Extracted offline tarball to $REPO_DIR"
+    # Freeze the supplied archive once. Listing and extraction must use the
+    # same bytes, and a failed extraction must never be retried over its debris.
+    cp -- "$OFFLINE_TARBALL" "$TMP/source.tar" || return 1
+    if ! validate_source_archive "$TMP/source.tar"; then
+      err "Offline archive is incomplete or contains unsafe source entries"
+      return 1
+    fi
+    INSTALL_REPO_CANDIDATE="$TMP/candidate"
+    mkdir -- "$INSTALL_REPO_CANDIDATE" || return 1
+    if ! tar --no-same-owner --no-same-permissions -xf "$TMP/source.tar" \
+         -C "$INSTALL_REPO_CANDIDATE" --strip-components=1 2> "$TMP/extract.error"; then
+      err "Failed to extract tarball; the previous installation is unchanged"
+      return 1
+    fi
+    ok "Staged offline source in $INSTALL_REPO_CANDIDATE"
     return 0
   fi
 
-  local backup=""
-  if [ -d "$REPO_DIR/.git" ]; then
-    info "Updating existing dsr installation..."
-    if update_existing_clone; then
-      return 0
-    fi
-    # In-place update failed (dirty state, missing ref, etc.) — preserve the
-    # old clone, then re-clone.
-    warn "In-place update failed; preserving existing clone and performing fresh clone..."
-    backup="${REPO_DIR}.bak.$(date +%Y%m%d%H%M%S)"
-    if mv "$REPO_DIR" "$backup" 2>/dev/null; then
-      warn "Existing clone moved to $backup"
-    else
-      err "Could not move existing clone to backup path: $backup"
-      err "Resolve the dirty install clone manually, then rerun with --force if needed."
-      exit 1
-    fi
-  fi
-
-  # Fresh clone
-  ensure_repo_dir_available
-  mkdir -p "$(dirname "$REPO_DIR")"
   info "Cloning dsr from ${OWNER}/${REPO}..."
-
   build_clone_refs
-
-  local clone_ref
-  local clone_error
-  local last_clone_error=""
+  local clone_ref clone_error attempt=0 last_clone_error=""
   for clone_ref in "${CLONE_REFS[@]}"; do
-    clone_error="$TMP/git-clone-${clone_ref//[^A-Za-z0-9_.-]/_}.err"
+    attempt=$((attempt + 1))
+    INSTALL_REPO_CANDIDATE="$TMP/candidate-$attempt"
+    clone_error="$TMP/git-clone-$attempt.err"
     last_clone_error="$clone_error"
-
     if run_with_spinner "Cloning repository ($clone_ref)..." \
-      clone_repo_ref "$clone_ref" "$clone_error"; then
-      ok "Cloned dsr ($clone_ref) to $REPO_DIR"
+      clone_repo_ref "$clone_ref" "$clone_error" "$INSTALL_REPO_CANDIDATE"; then
+      ok "Staged dsr ($clone_ref) in $INSTALL_REPO_CANDIDATE"
       return 0
     fi
-
     if [ "$VERSION_EXPLICIT" -eq 0 ]; then
       break
     fi
@@ -634,71 +795,147 @@ clone_or_update_repo() {
     err "Failed to clone dsr from GitHub"
   fi
   print_clone_error "$last_clone_error"
-  # A failed clone leaves no directory behind: put the working install back
-  # rather than leave dsr pointing at a missing checkout.
-  if [[ -n "$backup" ]] && [ ! -e "$REPO_DIR" ] && mv "$backup" "$REPO_DIR" 2>/dev/null; then
-    warn "Restored the previous install clone; dsr is unchanged"
-  fi
-  exit 1
+  return 1
 }
 
 validate_repo() {
-  # Verify the cloned repo has required structure
-  if [ ! -f "$REPO_DIR/dsr" ]; then
+  local candidate="$INSTALL_REPO_CANDIDATE" version module size mod_count=0
+  if [[ ! -d "$candidate" || -L "$candidate" || ! -f "$candidate/dsr" || -L "$candidate/dsr" ]]; then
     err "Cloned repo is missing dsr entry script"
-    exit 1
+    return 1
   fi
 
-  if [ ! -d "$REPO_DIR/src" ]; then
+  if [[ ! -d "$candidate/src" || -L "$candidate/src" ]]; then
     err "Cloned repo is missing src/ module directory"
-    exit 1
+    return 1
   fi
+  # These modules are required before any command can run. In particular,
+  # config.sh imports platforms.sh even for --version and --help.
+  for module in guardrails logging config platforms; do
+    if [[ ! -s "$candidate/src/$module.sh" || -L "$candidate/src/$module.sh" ]]; then
+      err "Cloned repo is missing required bootstrap module: $module.sh"
+      return 1
+    fi
+  done
 
-  # Must be a bash script
-  if ! head -1 "$REPO_DIR/dsr" | grep -q '#!/usr/bin/env bash'; then
+  if [[ "$(head -1 "$candidate/dsr")" != '#!/usr/bin/env bash' ]] || ! bash -n "$candidate/dsr"; then
     err "dsr entry script is not a valid bash script"
-    exit 1
+    return 1
   fi
 
-  # Must contain DSR_VERSION
-  if ! grep -q 'DSR_VERSION=' "$REPO_DIR/dsr"; then
-    err "dsr entry script is missing DSR_VERSION marker"
-    exit 1
+  # Read the literal marker as data; never source a candidate to validate it.
+  version=$(sed -n 's/^DSR_VERSION="\([^"]*\)"[[:space:]]*$/\1/p' "$candidate/dsr") || return 1
+  if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+    err "dsr entry script is missing a valid DSR_VERSION marker"
+    return 1
+  fi
+  if [ "$VERSION_EXPLICIT" -eq 1 ] && [[ "$VERSION" != main && "${VERSION#v}" != "$version" ]]; then
+    err "Requested version $VERSION does not match staged dsr version $version"
+    return 1
+  fi
+  for module in "$candidate"/src/*.sh; do
+    [[ -e "$module" || -L "$module" ]] || continue
+    if [[ ! -f "$module" || -L "$module" ]] || ! bash -n "$module"; then
+      err "Invalid source module in staged checkout: ${module##*/}"
+      return 1
+    fi
+    mod_count=$((mod_count + 1))
+  done
+  if ((mod_count == 0)); then
+    err "Cloned repo has no shell modules in src/"
+    return 1
   fi
 
-  # Ensure executable
-  chmod +x "$REPO_DIR/dsr"
-
-  local size
-  size=$(wc -c <"$REPO_DIR/dsr" | tr -d ' ')
-  local mod_count
-  mod_count=$(find "$REPO_DIR/src" -name '*.sh' -type f 2>/dev/null | wc -l | tr -d ' ')
-
+  chmod +x "$candidate/dsr" || return 1
+  size=$(wc -c <"$candidate/dsr" | tr -d ' ') || return 1
+  INSTALL_REPO_NEW_ID=$(install_path_identity "$candidate") || return 1
+  if [ "$VERSION_EXPLICIT" -eq 0 ]; then VERSION="$version"; fi
   ok "Repo validation passed ($(( size / 1024 )) KB script, $mod_count modules)"
 }
 
+activate_source() {
+  if [[ -n "$INSTALL_REPO_OLD_ID" ]]; then
+    [[ ! -L "$REPO_DIR" && "$(install_path_identity "$REPO_DIR")" == "$INSTALL_REPO_OLD_ID" ]] || {
+      err "Existing checkout changed during acquisition; refusing replacement"; return 1;
+    }
+  elif [[ -e "$REPO_DIR" || -L "$REPO_DIR" ]]; then
+    err "A source checkout appeared during acquisition; refusing replacement"
+    return 1
+  fi
+  # Set the recovery phase before either rename; a signal can arrive after a
+  # successful rename but before the following shell assignment.
+  INSTALL_REPO_SWITCH=1
+  if [[ -n "$INSTALL_REPO_OLD_ID" ]]; then
+    mv -- "$REPO_DIR" "$INSTALL_REPO_PREVIOUS" || return 1
+  fi
+  [[ ! -e "$REPO_DIR" && ! -L "$REPO_DIR" ]] || return 1
+  mv -- "$INSTALL_REPO_CANDIDATE" "$REPO_DIR" || return 1
+  [[ "$(install_path_identity "$REPO_DIR")" == "$INSTALL_REPO_NEW_ID" ]] || return 1
+}
+
 install_binary() {
-  mkdir -p "$DEST" 2>/dev/null || true
-
   local link_target="$DEST/$BINARY_NAME"
+  if [[ -L "$link_target" && "$(readlink "$link_target")" == "$REPO_DIR/dsr" ]]; then
+    ok "Kept existing launcher $link_target"
+    return 0
+  fi
+  [[ ! -d "$link_target" ]] || return 1
+  INSTALL_LINK_STAGE=$(install_destination_command mktemp -d "$DEST/.dsr-launcher.XXXXXXXX") || return 1
+  install_destination_command ln -s -- "$REPO_DIR/dsr" "$INSTALL_LINK_STAGE/candidate" || return 1
+  INSTALL_LINK_NEW_ID=$(install_path_identity "$INSTALL_LINK_STAGE/candidate" destination) || return 1
+  if [[ -e "$link_target" || -L "$link_target" ]]; then
+    INSTALL_LINK_OLD_ID=$(install_path_identity "$link_target" destination) || return 1
+  fi
+  INSTALL_LINK_SWITCH=1
+  if [[ -n "$INSTALL_LINK_OLD_ID" ]]; then
+    install_destination_command mv -- "$link_target" "$INSTALL_LINK_STAGE/previous" || return 1
+  fi
+  [[ ! -e "$link_target" && ! -L "$link_target" ]] || return 1
+  install_destination_command mv -- "$INSTALL_LINK_STAGE/candidate" "$link_target" || return 1
+  [[ "$(install_path_identity "$link_target" destination)" == "$INSTALL_LINK_NEW_ID" ]] || return 1
+  ok "Linked $link_target → $REPO_DIR/dsr"
+}
 
-  # Remove existing file/link
-  if [ -e "$link_target" ] || [ -L "$link_target" ]; then
-    if [ "$SYSTEM" -eq 1 ]; then
-      sudo rm -f "$link_target"
-    else
-      rm -f "$link_target"
+# Move only entries still owned by this transaction. An unexpected replacement
+# is retained untouched, and the previous version remains available for recovery.
+rollback_installation() {
+  local failed=0 current="" link_target="$DEST/$BINARY_NAME"
+  if [ "$INSTALL_LINK_SWITCH" -eq 1 ]; then
+    current=$(install_path_identity "$link_target" destination 2>/dev/null) || current=""
+    if [[ "$current" == "$INSTALL_LINK_NEW_ID" ]]; then
+      install_destination_command mv -- "$link_target" "$INSTALL_LINK_STAGE/uncommitted" || failed=1
+    elif [[ -n "$current" && "$current" != "$INSTALL_LINK_OLD_ID" ]]; then
+      err "Launcher changed outside this installation; recovery files remain at $INSTALL_LINK_STAGE"
+      failed=1
+    fi
+    if [[ -n "$INSTALL_LINK_OLD_ID" ]] &&
+       [[ "$(install_path_identity "$INSTALL_LINK_STAGE/previous" destination 2>/dev/null)" == "$INSTALL_LINK_OLD_ID" ]]; then
+      if [[ ! -e "$link_target" && ! -L "$link_target" ]]; then
+        install_destination_command mv -- "$INSTALL_LINK_STAGE/previous" "$link_target" || failed=1
+      else
+        failed=1
+      fi
     fi
   fi
-
-  # Create symlink from DEST to the repo
-  if [ "$SYSTEM" -eq 1 ]; then
-    sudo ln -sf "$REPO_DIR/dsr" "$link_target"
-  else
-    ln -sf "$REPO_DIR/dsr" "$link_target"
+  if [ "$INSTALL_REPO_SWITCH" -eq 1 ]; then
+    current=$(install_path_identity "$REPO_DIR" 2>/dev/null) || current=""
+    if [[ "$current" == "$INSTALL_REPO_NEW_ID" ]]; then
+      mv -- "$REPO_DIR" "$TMP/uncommitted-repo" || failed=1
+    elif [[ -n "$current" && "$current" != "$INSTALL_REPO_OLD_ID" ]]; then
+      err "Checkout changed outside this installation; previous source remains at $INSTALL_REPO_PREVIOUS"
+      failed=1
+    fi
+    if [[ -n "$INSTALL_REPO_OLD_ID" ]] &&
+       [[ "$(install_path_identity "$INSTALL_REPO_PREVIOUS" 2>/dev/null)" == "$INSTALL_REPO_OLD_ID" ]]; then
+      if [[ ! -e "$REPO_DIR" && ! -L "$REPO_DIR" ]]; then
+        mv -- "$INSTALL_REPO_PREVIOUS" "$REPO_DIR" || failed=1
+      else
+        failed=1
+      fi
+    fi
+    if [ "$failed" -eq 0 ]; then warn "Restored the previous installation"; fi
   fi
-
-  ok "Linked $link_target → $REPO_DIR/dsr"
+  [ "$failed" -eq 0 ]
 }
 
 # ============================================================
@@ -886,7 +1123,9 @@ install_skill() {
     return 1
   }
 
-  if [[ -f "${script_dir}/SKILL.md" ]]; then
+  if [[ -f "$REPO_DIR/SKILL.md" ]]; then
+    local_skill_path="$REPO_DIR/SKILL.md"
+  elif [[ -f "${script_dir}/SKILL.md" ]]; then
     local_skill_path="${script_dir}/SKILL.md"
   fi
 
@@ -896,14 +1135,14 @@ install_skill() {
   fi
 
   # Secondary: download SKILL.md directly from repo
-  if curl -fsSL "${PROXY_ARGS[@]}" "$skill_md_url" -o "$dest_dir/SKILL.md" 2>/dev/null; then
+  if [[ -z "$OFFLINE_TARBALL" ]] && curl -fsSL "${PROXY_ARGS[@]}" "$skill_md_url" -o "$dest_dir/SKILL.md" 2>/dev/null; then
     ok "Installed dsr skill for $agent_name (from repo)"
     return 0
   fi
 
   # Tertiary: download skill tarball from releases (requires TMP dir)
   local skill_url="https://github.com/${OWNER}/${REPO}/releases/latest/download/skill.tar.gz"
-  if [[ -n "$TMP" ]] && curl -fsSL "${PROXY_ARGS[@]}" "$skill_url" -o "$TMP/skill.tar.gz" 2>/dev/null; then
+  if [[ -z "$OFFLINE_TARBALL" && -n "$TMP" ]] && curl -fsSL "${PROXY_ARGS[@]}" "$skill_url" -o "$TMP/skill.tar.gz" 2>/dev/null; then
     if tar -xzf "$TMP/skill.tar.gz" -C "$dest_dir" 2>/dev/null; then
       ok "Installed dsr skill for $agent_name (from release)"
       return 0
@@ -1191,47 +1430,44 @@ main() {
   # Platform + proxy
   detect_platform
   setup_proxy
+  prepare_install_paths
 
   # Version
   resolve_version
   info "Target version: ${VERSION:-latest}"
 
-  # Preflight
-  preflight_checks
-
-  # Check existing install (may exit early if up-to-date)
-  check_existing_install
-
-  # Acquire lock
+  # Recovery is armed before acquiring ownership or performing any rename.
+  trap cleanup EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   acquire_lock
 
-  # Create temp directory and set cleanup trap
-  TMP=$(mktemp -d "${TMPDIR:-/tmp}/dsr-install.XXXXXX")
-  trap cleanup EXIT
+  # Check the selected installation under the writer lock.
+  check_existing_install
+  preflight_checks
+  check_dependencies
 
-  # Clone or update the repo
+  # Acquire and validate a complete replacement without modifying live source.
   clone_or_update_repo
-
-  # Validate repo structure
   validate_repo
 
-  # Install symlink
+  # Keep both previous entries until the source and launcher are installed.
+  activate_source
   install_binary
-
-  # Check dependencies
-  check_dependencies
+  INSTALL_COMMITTED=1
 
   # Setup config directories
   setup_config_dirs
 
   # Agent detection + skill installation
-  configure_agents
+  configure_agents || warn "Agent configuration did not complete; dsr is installed"
 
   # PATH setup
-  maybe_add_path
+  maybe_add_path || warn "PATH configuration did not complete; dsr is installed at $DEST/$BINARY_NAME"
 
   # Post-install diagnostics
-  run_doctor
+  run_doctor || warn "Post-install diagnostics did not complete; dsr is installed"
 
   # Summary
   show_summary

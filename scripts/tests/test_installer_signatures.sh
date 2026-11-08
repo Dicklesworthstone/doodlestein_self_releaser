@@ -664,6 +664,358 @@ test_root_installer_uses_main_unless_version_explicit() {
     harness_teardown
 }
 
+# Run the public installer against real source trees, Git clones and tarballs.
+# Only the network boundary and named filesystem-failure/signal boundaries are
+# fixtures. The production acquisition, validation, activation and rollback all
+# execute unchanged; no copied transaction helpers are used here.
+test_root_installer_transactions() {
+    ((TESTS_RUN++))
+    harness_setup
+    if ! command -v python3 >/dev/null || ! command -v git >/dev/null; then
+        skip "root installer transaction fixtures require Python 3 and Git"
+        harness_teardown
+        return
+    fi
+    if python3 - "$PROJECT_ROOT" "$TEST_TMPDIR" <<'PY'
+import hashlib
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+
+project, temporary = map(Path, sys.argv[1:])
+installer = Path(os.environ.get('DSR_ROOT_INSTALLER_UNDER_TEST', project / 'install.sh'))
+root = temporary / 'root-installer'
+root.mkdir()
+real_git, real_mv, real_ln = (shutil.which(name) for name in ('git', 'mv', 'ln'))
+checks = 0
+failures = []
+
+def check(label, condition):
+    global checks
+    checks += 1
+    print(('PASS' if condition else 'FAIL') + ': ' + label, flush=True)
+    if not condition:
+        failures.append(label)
+
+def run(command, **options):
+    return subprocess.run(command, text=True, capture_output=True, timeout=25, **options)
+
+def source_tree(path, version='1.2.3', label='new', missing='', invalid=''):
+    (path / 'src').mkdir(parents=True)
+    if missing != 'dsr':
+        entry = '''#!/usr/bin/env bash
+set -uo pipefail
+DSR_VERSION="VERSION_MARKER"
+source_path="${BASH_SOURCE[0]}"
+while [[ -L "$source_path" ]]; do
+  source_dir=$(CDPATH='' cd -P -- "$(dirname "$source_path")" && pwd -P) || exit 1
+  source_path=$(readlink "$source_path") || exit 1
+  [[ "$source_path" == /* ]] || source_path="$source_dir/$source_path"
+done
+source_dir=$(CDPATH='' cd -P -- "$(dirname "$source_path")" && pwd -P) || exit 1
+for module in guardrails logging config platforms current; do
+  source "$source_dir/src/$module.sh" || exit 1
+done
+if [[ "${1:-}" == --version ]]; then printf 'dsr version %s\\n' "$DSR_VERSION"
+else fixture_current; fi
+'''.replace('VERSION_MARKER', version)
+        if invalid == 'entry':
+            entry = 'invalid replacement bytes\n'
+        elif invalid == 'syntax':
+            entry += 'if true; then\n'
+        (path / 'dsr').write_text(entry)
+        (path / 'dsr').chmod(0o755)
+    for module in ('guardrails', 'logging', 'config', 'platforms'):
+        if missing != module:
+            (path / 'src' / (module + '.sh')).write_text('# explicit bootstrap fixture\n:\n')
+    (path / 'src' / 'current.sh').write_text("fixture_current() { printf '%s\\n' '" + label + "'; }\n")
+    if invalid == 'module':
+        (path / 'src' / 'current.sh').write_text('if true; then\n')
+
+def tree_snapshot(path):
+    rows = {}
+    for item in sorted(path.rglob('*')):
+        info = item.lstat()
+        content = (os.readlink(item) if item.is_symlink() else
+                   hashlib.sha256(item.read_bytes()).hexdigest() if item.is_file() else 'directory')
+        rows[str(item.relative_to(path))] = (stat.S_IMODE(info.st_mode), content)
+    return rows
+
+def identity(path):
+    info = path.lstat()
+    return info.st_dev, info.st_ino
+
+def archive(path, source):
+    with tarfile.open(path, 'w:gz') as output:
+        output.add(source, arcname='doodlestein_self_releaser-test')
+    return path
+
+valid = root / 'valid-source'
+source_tree(valid)
+valid_archive = archive(root / 'valid.tar.gz', valid)
+git_environment = os.environ.copy()
+git_environment.update(GIT_AUTHOR_NAME='DSR fixture', GIT_AUTHOR_EMAIL='fixture@example.invalid',
+                       GIT_COMMITTER_NAME='DSR fixture', GIT_COMMITTER_EMAIL='fixture@example.invalid')
+for args in (['-c', 'init.defaultBranch=main', 'init', str(valid)],
+             ['-C', str(valid), 'add', '.'],
+             ['-C', str(valid), 'commit', '-m', 'Fixture release'],
+             ['-C', str(valid), 'tag', 'v1.2.3']):
+    result = run([real_git, *args], env=git_environment)
+    if result.returncode:
+        raise RuntimeError(result.stderr)
+
+def setup(name, old_version='1.2.30', destination=True, old_source=True):
+    case = root / name
+    selected = case / 'repo'
+    target = case / 'bin'
+    task_home = case / 'home'
+    wrappers = case / 'wrappers'
+    for path in (target, task_home, wrappers):
+        path.mkdir(parents=True)
+    if old_source:
+        source_tree(selected, old_version, 'old')
+        (selected / '.git').mkdir()
+        (selected / '.git' / 'preserve').write_text('original Git metadata\n')
+        (selected / 'src' / 'obsolete.sh').write_text('# old release only\n')
+        (selected / 'user-notes').write_text('uncommitted user work\n')
+    if destination:
+        (target / 'dsr').symlink_to(selected / 'dsr')
+    wrappers.joinpath('curl').write_text('''#!/usr/bin/env bash
+printf 'curl invoked\\n' >> "$DSR_FIXTURE_CASE/http.calls"
+exit 22
+''')
+    wrappers.joinpath('mv').write_text('''#!/usr/bin/env bash
+source_path="${@: -2:1}"; destination="${@: -1}"
+case "${DSR_FIXTURE_FAULT:-}" in
+  source-move)
+    if [[ "$source_path" == */candidate && "$destination" == "$DSR_REPO_DIR" ]]; then exit 42; fi ;;
+  launcher-move)
+    if [[ "$source_path" == */.dsr-launcher.*/candidate ]]; then exit 42; fi ;;
+esac
+"$DSR_FIXTURE_REAL_MV" "$@" || exit $?
+if [[ "${DSR_FIXTURE_FAULT:-}" == source-signal && "$source_path" == "$DSR_REPO_DIR" ]]; then
+  kill -TERM "$PPID"
+elif [[ "${DSR_FIXTURE_FAULT:-}" == launcher-signal && "$destination" == */.dsr-launcher.*/previous ]]; then
+  kill -TERM "$PPID"
+fi
+''')
+    wrappers.joinpath('ln').write_text('''#!/usr/bin/env bash
+if [[ "${DSR_FIXTURE_FAULT:-}" == launcher-create && "${@: -1}" == */.dsr-launcher.*/candidate ]]; then exit 42; fi
+exec "$DSR_FIXTURE_REAL_LN" "$@"
+''')
+    wrappers.joinpath('git').write_text('''#!/usr/bin/env bash
+if [[ "$1" == clone && "${DSR_FIXTURE_FAULT:-}" == partial-clone ]]; then
+  mkdir -p -- "${@: -1}"
+  printf 'partial clone fixture\\n' > "${@: -1}/partial"
+  exit 42
+fi
+exec "$DSR_FIXTURE_REAL_GIT" "$@"
+''')
+    for path in wrappers.iterdir():
+        path.chmod(0o755)
+    configuration = task_home / '.gitconfig'
+    configuration.write_text('[url "' + valid.as_uri() + '"]\n'
+                             '\tinsteadOf = https://github.com/Dicklesworthstone/doodlestein_self_releaser.git\n')
+    environment = os.environ.copy()
+    for key in ('REPO_DIR', 'DSR_DEST', 'DSR_REPO_DIR', 'DSR_DATA_DIR', 'GIT_DIR', 'GIT_WORK_TREE'):
+        environment.pop(key, None)
+    environment.update(HOME=str(task_home), DSR_DEST=str(target), DSR_REPO_DIR=str(selected),
+                       XDG_DATA_HOME=str(task_home / 'data'), DSR_FIXTURE_CASE=str(case),
+                       DSR_FIXTURE_REAL_MV=real_mv, DSR_FIXTURE_REAL_LN=real_ln,
+                       DSR_FIXTURE_REAL_GIT=real_git, GIT_CONFIG_GLOBAL=str(configuration),
+                       GIT_CONFIG_NOSYSTEM='1', GIT_ALLOW_PROTOCOL='file', GIT_TRACE=str(case / 'git.trace'),
+                       PATH=str(wrappers) + os.pathsep + os.environ['PATH'])
+    return case, selected, target, environment
+
+def invoke(context, arguments, fault=''):
+    case, selected, target, environment = context
+    environment = dict(environment, DSR_FIXTURE_FAULT=fault)
+    result = run(['bash', str(installer), '--quiet', '--no-gum', '--no-configure', *arguments], env=environment)
+    (case / 'stdout').write_text(result.stdout)
+    (case / 'stderr').write_text(result.stderr)
+    return result
+
+def preserved(label, context, before, old_id, result):
+    case, selected, target, environment = context
+    check(label + ' refuses the update', result.returncode != 0)
+    check(label + ' preserves all previous source bytes/modes', selected.is_dir() and tree_snapshot(selected) == before)
+    check(label + ' restores the original checkout inode', selected.is_dir() and identity(selected) == old_id)
+    check(label + ' leaves the previous launcher runnable', run([str(target / 'dsr')]).stdout.strip() == 'old')
+
+for label, missing, invalid in (
+    ('invalid-entry', '', 'entry'), ('missing-entry', 'dsr', ''),
+    ('missing-bootstrap', 'logging', ''), ('entry-syntax', '', 'syntax'),
+    ('module-syntax', '', 'module'),
+):
+    package = root / (label + '-source')
+    source_tree(package, missing=missing, invalid=invalid)
+    bad_archive = archive(root / (label + '.tar.gz'), package)
+    context = setup(label)
+    before, old_id = tree_snapshot(context[1]), identity(context[1])
+    result = invoke(context, ['--offline', str(bad_archive)])
+    preserved(label, context, before, old_id, result)
+
+truncated = root / 'truncated.tar.gz'
+compressed = valid_archive.read_bytes()
+truncated.write_bytes(compressed[:len(compressed) // 2])
+context = setup('truncated')
+before, old_id = tree_snapshot(context[1]), identity(context[1])
+preserved('truncated archive', context, before, old_id, invoke(context, ['--offline', str(truncated)]))
+
+linked = root / 'linked.tar.gz'
+with tarfile.open(linked, 'w:gz') as output:
+    output.add(valid, arcname='source', filter=lambda entry: None if '/.git' in entry.name else entry)
+    entry = tarfile.TarInfo('source/src/linked.sh')
+    entry.type, entry.linkname = tarfile.SYMTYPE, '/tmp/dsr-outside-fixture'
+    output.addfile(entry)
+context = setup('linked')
+before, old_id = tree_snapshot(context[1]), identity(context[1])
+preserved('linked archive entry', context, before, old_id, invoke(context, ['--offline', str(linked)]))
+
+context = setup('successful-offline')
+case, selected, target, environment = context
+before, old_id = tree_snapshot(selected), identity(selected)
+result = invoke(context, ['--offline', str(valid_archive)])
+check('valid offline replacement succeeds', result.returncode == 0)
+check('new executable uses the complete new module tree', run([str(target / 'dsr')]).stdout.strip() == 'new')
+check('old-only modules do not survive in the active checkout', not (selected / 'src' / 'obsolete.sh').exists())
+backups = list(case.glob('.repo.install.*/previous-repo'))
+check('prior checkout and uncommitted work are retained exactly', len(backups) == 1 and tree_snapshot(backups[0]) == before and identity(backups[0]) == old_id)
+check('offline update performs no HTTP or Git transport', not (case / 'http.calls').exists() and not (case / 'git.trace').exists())
+before = tree_snapshot(selected)
+result = invoke(context, ['--offline', str(valid_archive), '--version', '1.2.3'])
+check('an existing non-Git offline installation can be updated', result.returncode == 0 and tree_snapshot(selected) == before)
+check('same-label offline archive is validated instead of shortcutting', len(list(case.glob('.repo.install.*/previous-repo'))) == 2)
+
+for fault in ('source-move', 'source-signal', 'launcher-move', 'launcher-signal', 'launcher-create'):
+    context = setup(fault, destination=not fault.startswith('launcher'))
+    case, selected, target, environment = context
+    if fault.startswith('launcher'):
+        other = case / 'old-launcher-source'
+        source_tree(other, '1.2.30', 'old')
+        (target / 'dsr').symlink_to(other / 'dsr')
+    before, old_id, old_link = tree_snapshot(selected), identity(selected), identity(target / 'dsr')
+    result = invoke(context, ['--offline', str(valid_archive)], fault)
+    preserved('injected ' + fault, context, before, old_id, result)
+    check(fault + ' preserves the original launcher entry', identity(target / 'dsr') == old_link)
+    if fault.endswith('signal'):
+        check(fault + ' returns the actual TERM status', result.returncode == 143)
+
+context = setup('wrong-version')
+before, old_id = tree_snapshot(context[1]), identity(context[1])
+preserved('version mismatch', context, before, old_id,
+          invoke(context, ['--offline', str(valid_archive), '--version', '9.9.9']))
+
+context = setup('partial-clone')
+before, old_id = tree_snapshot(context[1]), identity(context[1])
+preserved('injected incomplete clone', context, before, old_id,
+          invoke(context, ['--version', '1.2.3'], 'partial-clone'))
+check('failed clone attempts retain acquisition diagnostics', len(list(context[0].glob('.repo.install.*/candidate-*/partial'))) == 2)
+
+context = setup('version-prefix')
+result = invoke(context, ['--version', '1.2.3'])
+check('1.2.30 does not satisfy requested 1.2.3', result.returncode == 0 and run([str(context[2] / 'dsr'), '--version']).stdout.strip() == 'dsr version 1.2.3')
+check('numeric request uses a genuine local Git tag clone', (context[1] / '.git').is_dir() and run([real_git, '-C', str(context[1]), 'describe', '--tags', '--exact-match']).stdout.strip() == 'v1.2.3')
+
+context = setup('exact-noop', old_version='1.2.3')
+for args in (['-c', 'init.defaultBranch=main', 'init', str(context[1])],
+             ['-C', str(context[1]), 'add', '.'],
+             ['-C', str(context[1]), 'commit', '-m', 'Installed tagged source'],
+             ['-C', str(context[1]), 'tag', 'v1.2.3']):
+    result = run([real_git, *args], env=git_environment)
+    if result.returncode:
+        raise RuntimeError(result.stderr)
+before, old_id = tree_snapshot(context[1]), identity(context[1])
+result = invoke(context, ['--version', 'v1.2.3'])
+check('exact selected destination and source version is a no-op', result.returncode == 0 and tree_snapshot(context[1]) == before and identity(context[1]) == old_id)
+trace = (context[0] / 'git.trace').read_text() if (context[0] / 'git.trace').exists() else ''
+check('exact no-op does not acquire source or contact the network', not list(context[0].glob('.repo.install.*')) and ' clone ' not in trace and ' fetch ' not in trace and not (context[0] / 'http.calls').exists())
+
+# The real project can advance main without changing DSR_VERSION. A matching
+# marker must not silently defeat a request to switch back to a release tag.
+(context[1] / 'after-tag').write_text('newer main source with the same version\n')
+for args in (['-C', str(context[1]), 'add', '.'],
+             ['-C', str(context[1]), 'commit', '-m', 'Newer same-version main']):
+    result = run([real_git, *args], env=git_environment)
+    if result.returncode:
+        raise RuntimeError(result.stderr)
+before = tree_snapshot(context[1])
+result = invoke(context, ['--version', 'v1.2.3'])
+check('same version on a different commit does not satisfy a pinned tag', result.returncode == 0 and not (context[1] / 'after-tag').exists() and run([str(context[2] / 'dsr')]).stdout.strip() == 'new')
+backups = list(context[0].glob('.repo.install.*/previous-repo'))
+check('switching back to a tag preserves the later checkout', len(backups) == 1 and tree_snapshot(backups[0]) == before)
+
+context = setup('other-path-install', destination=False, old_source=False)
+case, selected, target, environment = context
+unrelated = case / 'unrelated'
+source_tree(unrelated, '1.2.3', 'other')
+environment['PATH'] = str(unrelated) + os.pathsep + environment['PATH']
+result = invoke(context, ['--version', '1.2.3'])
+check('same-version dsr elsewhere on PATH does not skip the selected destination', result.returncode == 0 and (target / 'dsr').is_symlink() and run([str(target / 'dsr')]).stdout.strip() == 'new')
+
+context = setup('different-repo-selection', destination=False, old_source=False)
+case, selected, target, environment = context
+other = case / 'other-repo'
+source_tree(other, '1.2.3', 'other')
+(target / 'dsr').symlink_to(other / 'dsr')
+other_before = tree_snapshot(other)
+result = invoke(context, ['--version', '1.2.3'])
+check('same version from a different source path does not skip --repo-dir', result.returncode == 0 and os.readlink(target / 'dsr') == str(selected / 'dsr') and tree_snapshot(other) == other_before)
+
+context = setup('overlapping-destination')
+case, selected, target, environment = context
+environment['DSR_DEST'] = str(selected / 'new-directory' / 'bin')
+before, old_id = tree_snapshot(selected), identity(selected)
+result = invoke(context, ['--offline', str(valid_archive)])
+preserved('destination inside active source', context, before, old_id, result)
+check('overlap admission creates no children inside the old checkout', not (selected / 'new-directory').exists())
+
+context = setup('aliased-overlapping-destination')
+case, selected, target, environment = context
+alias = case / 'source-alias'
+alias.symlink_to(selected, target_is_directory=True)
+environment['DSR_DEST'] = str(alias / 'new-directory' / 'bin')
+before, old_id = tree_snapshot(selected), identity(selected)
+result = invoke(context, ['--offline', str(valid_archive)])
+preserved('aliased destination inside active source', context, before, old_id, result)
+check('resolved overlap leaves the existing directory alias untouched', alias.is_symlink() and os.readlink(alias) == str(selected) and not (selected / 'new-directory').exists())
+
+context = setup('missing-parent-aliased-overlap')
+case, selected, target, environment = context
+alias = case / 'source-alias'
+alias.symlink_to(selected, target_is_directory=True)
+environment['DSR_DEST'] = str(case / 'absent' / '..' / 'source-alias' / 'new-directory' / 'bin')
+before, old_id = tree_snapshot(selected), identity(selected)
+result = invoke(context, ['--offline', str(valid_archive)])
+preserved('missing parent before aliased overlap', context, before, old_id, result)
+check('dot-dot admission creates neither missing ancestors nor old-source children', not (case / 'absent').exists() and not (selected / 'new-directory').exists())
+
+context = setup('aliased-bin-directory', destination=False)
+case, selected, target, environment = context
+alias = case / 'bin-alias'
+alias.symlink_to(target, target_is_directory=True)
+environment['DSR_DEST'] = str(alias)
+result = invoke(context, ['--offline', str(valid_archive)])
+check('an independent symlinked bin directory remains supported', result.returncode == 0 and run([str(target / 'dsr')]).stdout.strip() == 'new')
+check('installation preserves the selected bin directory alias', alias.is_symlink() and os.readlink(alias) == str(target))
+
+print(f'Root installer transactions: {checks - len(failures)}/{checks} checks passed', flush=True)
+if failures:
+    print('Fixture diagnostics: ' + str(root), file=sys.stderr)
+    sys.exit(1)
+PY
+    then
+        pass "public root installer stages complete source and preserves prior installations on failure"
+    else
+        fail "public root installer transaction regression"
+    fi
+    harness_teardown
+}
+
 # ============================================================================
 # Tests: Platform Detection
 # ============================================================================
@@ -772,6 +1124,7 @@ echo "Root dsr Installer:"
 test_root_installer_uses_nested_repo_dir_default
 test_root_installer_rejects_occupied_non_git_repo_dir
 test_root_installer_uses_main_unless_version_explicit
+test_root_installer_transactions
 
 echo ""
 echo "Platform Detection:"
