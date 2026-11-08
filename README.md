@@ -1284,9 +1284,25 @@ logs, ordinary caches, checkpoints and source/relocation history. A run must
 have completed every native task, retain its exact successful artifacts, and
 have completed publication into its local artifact set. Running, failed,
 unfinished and diagnostic runs remain available for recovery. The `latest`
-run, recent runs and the configured `--keep-last` runs are always retained.
+run is retained by default; age and the configured `--keep-last` always apply.
 Recorded published releases are also retained by default; add
 `--no-keep-releases` to permit their otherwise eligible snapshots to be retired.
+
+A normal release can have only one build, which remains `latest` within its
+version. Explicitly include those completed runs when retiring old release
+sources:
+
+```bash
+dsr --json prune --snapshots --include-latest --max-age 30 \
+  --keep-last 0 --no-keep-releases --dry-run
+# Remove --dry-run and add --force after reviewing the result.
+```
+
+`--include-latest` is accepted only with `--snapshots`. It retains the
+checkpoint, latest link and collected output; active runs and busy build
+leases remain protected. An included latest run counts toward `--keep-last`,
+so use zero when retiring a version's only completed snapshot. A fresh build
+is required to regenerate retired source snapshots for further compilation.
 
 New strict Unix snapshots carry private ownership receipts created before any
 source is copied. Cleanup verifies the original directory and marker identities,

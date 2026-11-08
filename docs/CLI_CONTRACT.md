@@ -2423,7 +2423,7 @@ the last `dsr check` result (`state/check/last.json`) when it is under a day old
 Clean up old artifacts, logs, and cache to free disk space.
 
 ```bash
-dsr prune [--snapshots] [--dry-run] [--max-age <days>] [--keep-last <n>] [--force]
+dsr prune [--snapshots [--include-latest]] [--dry-run] [--max-age <days>] [--keep-last <n>] [--force]
 ```
 
 | Flag | Default | Description |
@@ -2433,6 +2433,7 @@ dsr prune [--snapshots] [--dry-run] [--max-age <days>] [--keep-last <n>] [--forc
 | `--keep-last` | 5 | Always keep the N most recent artifact sets per tool and build runs per tool/version |
 | `--keep-releases` | true | Never delete artifacts for published releases (`--no-keep-releases` to include them) |
 | `--snapshots` | false | Reclaim only owned Unix snapshots of retired completed native builds, preserving ordinary artifacts, caches, logs and checkpoints |
+| `--include-latest` | false | Consider completed latest snapshots too; requires `--snapshots` and preserves their checkpoints/latest links |
 | `--force` | false | Skip confirmation prompt |
 
 Artifact sets are `artifacts/<tool>-<tag>/` with their `<tool>-<tag>-manifest.json`;
@@ -2441,7 +2442,9 @@ Publication keeps that private upload receipt after success. A partial upload
 or completed draft also keeps its receipt, so this retention test conservatively
 protects recovery inputs without asserting that the release is public. Prune
 does not contact GitHub or reconstruct missing historical receipts. The build
-run `latest` points to is always kept. The global `--dry-run` applies.
+run `latest` points to is kept by default. Snapshot-only `--include-latest`
+can retire its completed sources; ordinary checkpoint deletion never includes
+that run. The global `--dry-run` applies.
 
 Artifact pruning requires a regular manifest that is not a symbolic link at
 `artifacts/<tool>-<tag>/<tool>-<tag>-manifest.json` or the adjacent
@@ -2503,11 +2506,29 @@ establish that every recorded recovery input is reclaimable.
 **Explicit snapshot retirement (`--snapshots`):**
 
 This mode skips ordinary artifact, log, manifest, cache and checkpoint deletion.
-It applies the same age, latest, per-version keep-last and published-release
-retention policies to completed native build runs. Both the canonical tag and
+It applies age, per-version keep-last and published-release retention policies
+to completed native build runs, retaining `latest` by default. Both the canonical tag and
 stored-version leases remain held through host inspection, removal and the
 checkpoint transaction. A descendant still holding either lease prevents
 cleanup. `--force` skips confirmation only.
+
+`--include-latest` permits snapshot retirement for a completed run selected by
+`latest`, including the common case of one successful build per version. It
+does not enable checkpoint deletion or bypass completion, publication, artifact
+or lease admission. Included latest runs participate in the same keep-last
+ordering, so a version with only one run still requires `--keep-last 0`.
+Published-release receipt retention also remains active unless
+`--no-keep-releases` is supplied. For example:
+
+```bash
+dsr --json prune --snapshots --include-latest --max-age 30 \
+  --keep-last 0 --no-keep-releases --dry-run
+```
+
+Both the checkpoint and the latest symlink remain after successful retirement.
+Its collected release output remains available; regenerating removed source
+and compiler caches requires a fresh build. Using `--include-latest` without
+`--snapshots` returns invalid-argument exit 4.
 
 Every target must be completed and its original frozen artifact receipts must
 still verify. The output directory must have a completed publishable release
@@ -2551,7 +2572,7 @@ root contributes zero bytes, and a replacement at the old path is retained.
 No journal or lease metadata is written in either dry-run form. Dry-run checks
 describe the current observation and do not reserve future cleanup.
 
-JSON adds `snapshots_only`, `snapshot_results` and `retained_snapshot_paths`.
+JSON adds `snapshots_only`, `include_latest`, `snapshot_results` and `retained_snapshot_paths`.
 Each result contains `{host, source_root, path, status, size_bytes}`, where
 `path` is the owned parent and `status` is `eligible` in dry-run, `removed`, or
 `already_absent`. Only eligible/removed parents increase `pruned_count` and

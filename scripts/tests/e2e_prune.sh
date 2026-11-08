@@ -4,7 +4,7 @@
 # Tests prune subcommand with real behavior (no mocks).
 # Verifies safety guardrails, dry-run, and JSON output.
 #
-# Run: ./scripts/tests/e2e_prune.sh [--snapshot-only|--snapshot-race-only|--snapshot-boundary-only]
+# Run: ./scripts/tests/e2e_prune.sh [--snapshot-only|--snapshot-race-only|--snapshot-boundary-only|--snapshot-latest-only]
 
 set -uo pipefail
 
@@ -2102,6 +2102,112 @@ BASH
     harness_teardown
 }
 
+test_prune_snapshots_include_latest() {
+    local kind
+    for kind in completed running keep-last age published-release leased; do
+        ((TESTS_RUN++))
+        harness_setup
+        seed_prune_snapshot_config
+        local tool=latest-snapshot version=1.0.0 run=78787878-7878-4878-8878-787878787878
+        local source state latest before after provenance frozen_before frozen_after problems=()
+        local control="$TEST_TMPDIR/latest-lease"
+        local options=(--snapshots --include-latest --max-age 30 --keep-last 0 --no-keep-releases --force)
+        if ! seed_prune_snapshot_run "$tool" "$version" "$run"; then
+            fail "latest snapshot $kind fixture is issued by the production owner helper"
+            harness_teardown
+            continue
+        fi
+        source="$PRUNE_SNAPSHOT_SOURCE" state="$PRUNE_SNAPSHOT_STATE"
+        latest="${state%/$run/state.json}/latest"
+        ln -s "$run" "$latest"
+        mkdir -p "$DSR_STATE_DIR/releases"
+        printf '{"status":"success"}\n' > "$DSR_STATE_DIR/releases/$tool-v1.0.0-upload.json"
+        case "$kind" in
+            running) prune_snapshot_edit_state "$state" '.status="running" | .target_statuses["linux/amd64"].status="running"' ;;
+            keep-last) options+=(--keep-last 1) ;;
+            age) options+=(--max-age 90) ;;
+            published-release) options+=(--keep-releases) ;;
+            leased)
+                if ! start_prune_lease inherited "$control" "$tool" v1.0.0; then
+                    fail "latest snapshot inherited canonical lease could not be acquired"
+                    harness_teardown
+                    continue
+                fi
+                ;;
+        esac
+        provenance=$(jq -cS 'del(.snapshot_cleanup,.updated_at)' "$state")
+        frozen_before=$(prune_snapshot_inventory "$DSR_STATE_DIR/artifacts" "$DSR_STATE_DIR/releases" "$latest")
+        if [[ "$kind" == completed ]]; then
+            before=$(prune_snapshot_inventory "$DSR_CONFIG_DIR" "$DSR_STATE_DIR" "$DSR_CACHE_DIR" "$TEST_TMPDIR/snapshots")
+            exec_run "$DSR_CMD" --json --dry-run prune "${options[@]}"
+            after=$(prune_snapshot_inventory "$DSR_CONFIG_DIR" "$DSR_STATE_DIR" "$DSR_CACHE_DIR" "$TEST_TMPDIR/snapshots")
+            [[ "$(exec_status)" -eq 0 && "$before" == "$after" ]] || problems+=("global latest preview changed retained filesystem metadata")
+            prune_snapshot_reported "$source" eligible || problems+=("global latest preview omitted the retired published snapshot")
+            exec_stdout | jq -e '.details.include_latest == true and .details.dry_run == true' >/dev/null || problems+=("latest preview option was not reported")
+            exec_run "$DSR_CMD" --json prune --dry-run "${options[@]}"
+            after=$(prune_snapshot_inventory "$DSR_CONFIG_DIR" "$DSR_STATE_DIR" "$DSR_CACHE_DIR" "$TEST_TMPDIR/snapshots")
+            [[ "$(exec_status)" -eq 0 && "$before" == "$after" ]] || problems+=("subcommand latest preview changed retained filesystem metadata")
+            prune_snapshot_reported "$source" eligible || problems+=("subcommand latest preview omitted the retired published snapshot")
+        fi
+        before=$(prune_snapshot_inventory "$TEST_TMPDIR/snapshots" "$state")
+        exec_run "$DSR_CMD" --json prune "${options[@]}"
+        cp "$_EXEC_STDOUT_FILE" "$TEST_TMPDIR/latest-$kind-envelope.json" || problems+=("latest outcome envelope could not be retained")
+        [[ "$(exec_status)" -eq 0 ]] || problems+=("include-latest $kind command failed")
+        exec_stdout | jq -e '.details.snapshots_only == true and .details.include_latest == true' >/dev/null || problems+=("explicit latest mode was not reported")
+        frozen_after=$(prune_snapshot_inventory "$DSR_STATE_DIR/artifacts" "$DSR_STATE_DIR/releases" "$latest")
+        [[ "$frozen_before" == "$frozen_after" && "$(readlink "$latest")" == "$run" ]] || problems+=("latest link, completed output or publication provenance changed")
+        if [[ "$kind" == completed ]]; then
+            [[ ! -e "${source%/source}" && -f "$state" ]] || problems+=("eligible latest source was not reclaimed while keeping its checkpoint")
+            prune_snapshot_reported "$source" removed || problems+=("latest cleanup was not reported")
+            exec_stdout | jq -e '.details.pruned_count == 1 and .details.bytes_freed > 0' >/dev/null || problems+=("latest removal accounting was incorrect")
+            [[ "$provenance" == "$(jq -cS 'del(.snapshot_cleanup,.updated_at)' "$state")" ]] || problems+=("latest cleanup rewrote original checkpoint evidence")
+            jq -e --arg source "$source" '.snapshot_cleanup.roots | length == 1 and .[0].source_root == $source and .[0].result.status == "removed"' \
+                "$state" >/dev/null || problems+=("latest cleanup lacks its per-root journal")
+            exec_run "$DSR_CMD" --json prune "${options[@]}"
+            [[ "$(exec_status)" -eq 0 ]] && prune_snapshot_reported "$source" already_absent || problems+=("latest cleanup retry lost its journal despite the retained latest link")
+            exec_stdout | jq -e '.details.pruned_count == 0 and .details.bytes_freed == 0' >/dev/null || problems+=("latest retry double-counted removed bytes")
+        else
+            after=$(prune_snapshot_inventory "$TEST_TMPDIR/snapshots" "$state")
+            [[ "$before" == "$after" ]] || problems+=("include-latest bypassed $kind protection")
+            exec_stdout | jq -e '.details.pruned_count == 0 and .details.bytes_freed == 0' >/dev/null || problems+=("protected latest source was counted as reclaimed")
+            jq -e 'has("snapshot_cleanup") | not' "$state" >/dev/null || problems+=("protected latest source gained a cleanup journal")
+            case "$kind" in
+                running) prune_reported_retention "${state%/state.json}" active_run || problems+=("running latest refusal was not reported") ;;
+                published-release) prune_reported_retention "${state%/state.json}" release_retention || problems+=("latest publication retention was not reported") ;;
+                leased)
+                    prune_reported_retention "${state%/$run/state.json}" build_custody || problems+=("latest canonical descendant custody was not reported")
+                    release_prune_lease "$control" || problems+=("latest descendant did not release its lease")
+                    exec_run "$DSR_CMD" --json prune "${options[@]}"
+                    [[ "$(exec_status)" -eq 0 && ! -e "${source%/source}" ]] || problems+=("latest source was not reclaimed after descendant exit")
+                    prune_snapshot_reported "$source" removed || problems+=("latest post-custody removal was not reported")
+                    ;;
+            esac
+        fi
+        prune_case_result "explicit latest snapshot reclamation handles $kind without weakening retained release custody" "${problems[@]}"
+        harness_teardown
+    done
+}
+
+test_prune_include_latest_requires_snapshots() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_prune_snapshot_config
+    local run=90909090-9090-4090-8090-909090909090 state before after problems=()
+    if ! seed_prune_snapshot_run latest-invalid v1.0.0 "$run"; then
+        fail "latest option refusal fixture is issued by the production owner helper"
+        harness_teardown
+        return
+    fi
+    state="$PRUNE_SNAPSHOT_STATE"
+    ln -s "$run" "${state%/$run/state.json}/latest"
+    before=$(prune_snapshot_inventory "$TEST_TMPDIR/snapshots" "$state" "$DSR_STATE_DIR/artifacts")
+    exec_run "$DSR_CMD" --json prune --include-latest --max-age 30 --keep-last 0 --force
+    after=$(prune_snapshot_inventory "$TEST_TMPDIR/snapshots" "$state" "$DSR_STATE_DIR/artifacts")
+    [[ "$(exec_status)" -eq 4 && "$before" == "$after" ]] || problems+=("ordinary prune accepted include-latest or changed protected source/output")
+    prune_case_result "include-latest requires explicit snapshots-only mode before reclaiming any retained data" "${problems[@]}"
+    harness_teardown
+}
+
 run_snapshot_prune_tests() {
     echo ""
     echo "Explicit Strict Snapshot Reclamation Tests:"
@@ -2119,6 +2225,8 @@ run_snapshot_prune_tests() {
     test_prune_snapshots_descendant_move
     test_prune_snapshots_nested_custody
     test_prune_snapshots_bind_output
+    test_prune_snapshots_include_latest
+    test_prune_include_latest_requires_snapshots
 }
 
 # ============================================================================
@@ -2138,8 +2246,8 @@ echo "=== E2E: dsr prune Tests ==="
 echo ""
 
 case "${1:-}" in
-    ""|--snapshot-only|--snapshot-race-only|--snapshot-boundary-only) ;;
-    *) echo "Usage: $0 [--snapshot-only|--snapshot-race-only|--snapshot-boundary-only]" >&2; exit 2 ;;
+    ""|--snapshot-only|--snapshot-race-only|--snapshot-boundary-only|--snapshot-latest-only) ;;
+    *) echo "Usage: $0 [--snapshot-only|--snapshot-race-only|--snapshot-boundary-only|--snapshot-latest-only]" >&2; exit 2 ;;
 esac
 
 if [[ -z "${1:-}" ]]; then
@@ -2204,6 +2312,9 @@ if [[ "${1:-}" == --snapshot-race-only ]]; then
 elif [[ "${1:-}" == --snapshot-boundary-only ]]; then
     test_prune_snapshots_nested_custody
     test_prune_snapshots_bind_output
+elif [[ "${1:-}" == --snapshot-latest-only ]]; then
+    test_prune_snapshots_include_latest
+    test_prune_include_latest_requires_snapshots
 else
     run_snapshot_prune_tests
 fi

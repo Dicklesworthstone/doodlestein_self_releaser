@@ -18,6 +18,10 @@
       "type": "boolean",
       "description": "Whether only owned retired Unix snapshots were considered, preserving ordinary artifacts, logs, caches and checkpoints"
     },
+    "include_latest": {
+      "type": "boolean",
+      "description": "Whether completed latest runs were explicitly included in snapshot retirement; all retention and build-custody checks still apply"
+    },
     "cutoff_days": {
       "type": "integer",
       "minimum": 0,

@@ -15537,11 +15537,16 @@ cmd_prune() {
     local keep_releases=true
     local force=false
     local snapshots_only=false
+    local include_latest=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --snapshots)
                 snapshots_only=true
+                shift
+                ;;
+            --include-latest)
+                include_latest=true
                 shift
                 ;;
             --dry-run|-n)
@@ -15580,14 +15585,18 @@ OPTIONS:
         --max-age DAYS  Remove items older than DAYS (default: 30)
         --keep-last N   Always keep the N most recent artifact sets per tool
                         and build runs per tool/version (default: 5)
-        --keep-releases Never remove artifacts of a release dsr published (default)
+        --keep-releases Keep artifacts and snapshots of releases dsr published (default)
         --no-keep-releases
-                        Also remove old artifacts of published releases
+                        Include published releases in the selected cleanup mode
         --snapshots     Reclaim only proven owned Unix snapshots of retired
                         completed native builds; preserve artifacts and checkpoints
+        --include-latest
+                        Also consider completed latest runs (requires --snapshots).
+                        Age, keep-last, release retention and build leases still apply
         --force         Skip confirmation prompt
 
-A build run that `latest` points to is always kept (it is what resume uses).
+A build run that `latest` points to is kept unless --snapshots --include-latest
+explicitly admits its source retirement. Its checkpoint and latest link stay.
 Build checkpoints with retained source roots or unverifiable state are kept.
 Busy or unverifiable build leases prevent artifact-set and checkpoint pruning.
 Unfinished artifact sets and outputs with unknown ownership are kept.
@@ -15598,6 +15607,7 @@ EXAMPLES:
     dsr prune --dry-run
     dsr prune --max-age 14 --keep-last 3
     dsr prune --snapshots --dry-run --max-age 14 --keep-last 3
+    dsr prune --snapshots --include-latest --keep-last 0 --no-keep-releases --dry-run
 EOF
                 return 0
                 ;;
@@ -15615,6 +15625,11 @@ EOF
     fi
     if [[ -z "$keep_last" || ! "$keep_last" =~ ^[0-9]+$ ]]; then
         log_error "Invalid --keep-last: $keep_last"
+        return 4
+    fi
+
+    if $include_latest && ! $snapshots_only; then
+        log_error "--include-latest requires --snapshots"
         return 4
     fi
 
@@ -16122,7 +16137,9 @@ EOF
 
                 local idx=0
                 for run_dir in ${run_dirs[@]+"${run_dirs[@]}"}; do
-                    [[ "${run_dir##*/}" == "$latest_run" ]] && continue
+                    if [[ "${run_dir##*/}" == "$latest_run" ]] && ! $include_latest; then
+                        continue
+                    fi
                     idx=$((idx + 1))
                     if [[ $idx -le $keep_last ]]; then
                         continue
@@ -16194,6 +16211,7 @@ EOF
             --arg state_dir "$state_dir" \
             --argjson dry_run "$dry_run" \
             --argjson snapshots_only "$snapshots_only" \
+            --argjson include_latest "$include_latest" \
             --argjson cutoff_days "$max_age_days" \
             --argjson keep_last "$keep_last" \
             --argjson keep_releases "$keep_releases" \
@@ -16207,7 +16225,7 @@ EOF
             --slurpfile snapshot_results /dev/fd/7 \
             --slurpfile retained_snapshot_paths /dev/fd/8 \
             '{state_dir: $state_dir, dry_run: $dry_run, cutoff_days: $cutoff_days, keep_last: $keep_last,
-              snapshots_only: $snapshots_only,
+              snapshots_only: $snapshots_only, include_latest: $include_latest,
               keep_releases: $keep_releases, kept_for_releases: $kept_for_releases,
               pruned_count: $pruned_count, bytes_freed: $bytes_freed, pruned_paths: $pruned_paths[0],
               retained_build_paths: $retained_build_paths[0], retained_artifact_paths: $retained_artifact_paths[0],
