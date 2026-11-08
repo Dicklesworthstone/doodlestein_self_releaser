@@ -525,6 +525,128 @@ test_api_retention_rejects_malformed_or_unrelated_responses() (
   [[ $status -eq 22 && ! -e "${receipts[0]}" ]]
 )
 
+# Exercise actual exec boundaries: a Bash function standing in for gh/curl
+# would accidentally hide the operating system's per-argument size limit.
+# Only HTTP is simulated; serialization, authentication routing, supervision,
+# original-response retention and exact metadata comparisons are production.
+test_large_release_notes() (
+  local transport="$1" entry="$2" response_mode="${3:-valid}" status=0 notes data
+  local private="$TEMP_DIR/private" fixture_bin="$TEMP_DIR/bin"
+  mkdir -m 700 "$private" "$fixture_bin" || return 1
+  export TMPDIR="$private" DSR_LARGE_API_CASE="$TEMP_DIR"
+  export DSR_LARGE_API_TRANSPORT="$transport" DSR_LARGE_API_RESPONSE="$response_mode"
+  export DSR_GH_TOKEN=large-notes-fixture GITHUB_TOKEN='' GH_TOKEN=''
+  local GH_MAX_RETRIES=1 GH_RETRY_DELAY=0 GH_API_TIMEOUT=15
+  unset -f gh curl jq
+  python3 - "$TEMP_DIR" <<'PY'
+import json
+from pathlib import Path
+import sys
+case = Path(sys.argv[1])
+notes = '@literal \\ "quoted" $HOME `data`\n' + ('λ' * 70000) + '\r\n\n'
+assert len(notes.encode()) > 131072
+(case / 'notes').write_bytes(notes.encode())
+(case / 'request.json').write_text(json.dumps(dict(tag_name='v1.2.3', name='v1.2.3',
+    body=notes, draft=True, prerelease=False, target_commitish='1'.zfill(40)), ensure_ascii=False))
+PY
+  [[ $? -eq 0 ]] || return 1
+  cat > "$TEMP_DIR/api.py" <<'PY'
+#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import sys
+case = Path(os.environ['DSR_LARGE_API_CASE'])
+transport = Path(sys.argv[0]).name
+args = sys.argv[1:]
+assert all(len(os.fsencode(arg)) < 131072 for arg in args)
+if transport == 'gh' and args[:2] == ['auth', 'status']:
+    raise SystemExit(0 if os.environ['DSR_LARGE_API_TRANSPORT'] == 'gh' else 1)
+assert transport == os.environ['DSR_LARGE_API_TRANSPORT']
+if transport == 'gh':
+    assert args[:2] == ['api', 'repos/owner/app/releases']
+    assert args[args.index('--input') + 1] == '-'
+else:
+    assert transport == 'curl' and args[-1] == 'https://api.github.com/repos/owner/app/releases'
+    assert args[args.index('--data-binary') + 1] == '@-'
+raw = sys.stdin.buffer.read()
+(case / 'request.bin').write_bytes(raw)
+(case / 'transport-argv.json').write_text(json.dumps(args))
+request = json.loads(raw)
+assert request == json.loads((case / 'request.json').read_text())
+response = dict(request, id=9, assets=[])
+if os.environ['DSR_LARGE_API_RESPONSE'] == 'changed-body':
+    response['body'] += 'unrelated response'
+wire = b' \n' + json.dumps(response, ensure_ascii=False, indent=2).encode() + b'\n\n'
+(case / 'wire.json').write_bytes(wire)
+if transport == 'curl':
+    sys.stdout.buffer.write(b'HTTP/1.1 201 Created\r\nContent-Type: application/json\r\n\r\n')
+sys.stdout.buffer.write(wire)
+PY
+  chmod 755 "$TEMP_DIR/api.py" || return 1
+  ln -s ../api.py "$fixture_bin/gh" || return 1
+  ln -s ../api.py "$fixture_bin/curl" || return 1
+  export PATH="$fixture_bin:$PATH"
+  # A sentinel preserves every trailing newline in the Bash input value.
+  notes=$(cat "$TEMP_DIR/notes"; printf '.') || return 1
+  notes="${notes%.}"
+  data=$(cat "$TEMP_DIR/request.json") || return 1
+  if [[ "$entry" == builder ]]; then
+    gh_create_release owner/app v1.2.3 --body "$notes" --draft --target-commitish "$(printf '%040d' 1)" \
+      --retain-response > "$TEMP_DIR/result.json" 2> "$TEMP_DIR/stderr" || status=$?
+  else
+    gh_api repos/owner/app/releases --post "$data" --retain-response \
+      > "$TEMP_DIR/result.json" 2> "$TEMP_DIR/stderr" || status=$?
+  fi
+  ! grep -q 'Argument list too long' "$TEMP_DIR/stderr" || return 1
+  [[ -s "$TEMP_DIR/request.bin" && -s "$TEMP_DIR/wire.json" ]] || return 1
+  local -a receipts=("$private"/dsr-api-response.????????)
+  if [[ "$response_mode" == changed-body ]]; then
+    [[ $status -eq 8 && ! -e "${receipts[0]}" && ! -s "$TEMP_DIR/result.json" ]] &&
+      grep -q 'Draft POST did not return a valid original creation response' "$TEMP_DIR/stderr"
+    return $?
+  fi
+  [[ $status -eq 0 && ${#receipts[@]} -eq 1 && -f "${receipts[0]}" ]] || return 1
+  cmp "$TEMP_DIR/wire.json" "${receipts[0]}" || return 1
+  python3 - "$TEMP_DIR" "${receipts[0]}" <<'PY'
+import json
+from pathlib import Path
+import stat
+import sys
+case, receipt = map(Path, sys.argv[1:])
+expected = (case / 'notes').read_bytes()
+assert json.loads((case / 'result.json').read_bytes())['body'].encode() == expected
+assert json.loads(receipt.read_bytes())['body'].encode() == expected
+assert stat.S_IMODE(receipt.stat().st_mode) == 0o600 and receipt.stat().st_nlink == 1
+PY
+)
+
+test_release_serializer_failure_never_calls_api() (
+  local partial="${1:-false}" status=0
+  jq() {
+    printf 'Injected release serializer failure\n' >&2
+    $partial && printf '{"tag_name":"unrelated"}'
+    return 61
+  }
+  gh_api() { printf 'unexpected mutation\n' > "$TEMP_DIR/api-called"; return 0; }
+  gh_create_release owner/app v1.2.3 --body 'reviewed notes' --draft \
+    > "$TEMP_DIR/result" 2> "$TEMP_DIR/stderr" || status=$?
+  [[ $status -eq 4 && ! -e "$TEMP_DIR/api-called" && ! -s "$TEMP_DIR/result" ]] &&
+    grep -q 'Injected release serializer failure' "$TEMP_DIR/stderr"
+)
+
+run_release_notes_regressions() {
+  local transport entry
+  for transport in gh curl; do
+    for entry in builder api; do
+      run_test "large_notes_${transport}_${entry}" test_large_release_notes "$transport" "$entry"
+    done
+    run_test "large_notes_${transport}_changed_response" test_large_release_notes "$transport" api changed-body
+  done
+  run_test release_serializer_failure test_release_serializer_failure_never_calls_api false
+  run_test release_serializer_partial_failure test_release_serializer_failure_never_calls_api true
+}
+
 test_api_no_cache_omits_stale_etag_on_curl_fallback() {
   local endpoint="repos/owner/repo/releases/123"
   local curl_log="$TEMP_DIR/no-cache-curl.log"
@@ -2747,6 +2869,13 @@ main() {
   echo "=== github.sh Tests ==="
   echo ""
 
+  if [[ "${1:-}" == --release-notes-only ]]; then
+    run_release_notes_regressions
+    printf 'Release notes: %s passed, %s failed\n' "$TESTS_PASSED" "$TESTS_FAILED"
+    [[ "$TESTS_FAILED" -eq 0 ]]
+    exit $?
+  fi
+
   if [[ "${1:-}" == --release-inventory-only ]]; then
     run_release_inventory_tests
     printf 'Release inventories: %s passed, %s failed\n' "$TESTS_PASSED" "$TESTS_FAILED"
@@ -2849,6 +2978,7 @@ main() {
   run_test "api_retains_original_draft_response" test_api_retains_original_draft_response
   run_test "api_retention_rejects_unsafe_directories_and_operations" test_api_retention_rejects_unsafe_directories_and_operations
   run_test "api_retention_rejects_malformed_or_unrelated_responses" test_api_retention_rejects_malformed_or_unrelated_responses
+  run_release_notes_regressions
   run_test "api_no_cache_omits_stale_etag_on_curl_fallback" test_api_no_cache_omits_stale_etag_on_curl_fallback
   run_test "api_no_cache_sends_headers_on_gh_cli" test_api_no_cache_sends_headers_on_gh_cli
   run_test "api_rejects_missing_option_values" test_api_rejects_missing_option_values

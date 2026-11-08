@@ -480,12 +480,14 @@ gh_api() (
                 echo "$response" | _gh_set_cache "$endpoint" "${_GH_LAST_ETAG:-}"
             fi
             if $retain_response; then
-                if ! jq -es --argjson request "$data" 'length == 1 and (.[0] | type == "object" and
+                if ! jq -es --slurpfile request /dev/fd/3 '
+                    ($request | length) == 1 and length == 1 and ($request[0] as $request | .[0] | type == "object" and
                     (.id | type == "number" and floor == . and . > 0 and . <= 9007199254740991) and
                     .draft == true and .assets == [] and
                     .tag_name == $request.tag_name and .name == $request.name and
                     .body == $request.body and .prerelease == $request.prerelease and
-                    ($request.target_commitish == null or .target_commitish == $request.target_commitish))' "$response_file" >/dev/null; then
+                    ($request.target_commitish == null or .target_commitish == $request.target_commitish))' \
+                    3<<< "$data" "$response_file" >/dev/null; then
                     _gh_log_error "Draft POST did not return a valid original creation response"
                     return 8
                 fi
@@ -928,14 +930,17 @@ _gh_api_with_curl() {
     fi
 
     if [[ -n "$data" ]]; then
-        curl_args+=(-d "$data")
+        # JSON may contain large release notes. Stream the exact request bytes
+        # rather than exposing them to exec's per-argument size limit. Binary
+        # stdin preserves newlines and literal leading @ characters as data.
+        curl_args+=(--data-binary @-)
     fi
 
     local raw headers body status_line http_code etag
     local curl_status=0
     # Preserve trailing header separators on body-less 204/304 responses.
     # Command substitution otherwise strips the final newline in CRLFCRLF.
-    raw=$(curl -D - "${curl_args[@]}" "$url"; curl_status=$?; printf '\034'; exit "$curl_status") || curl_status=$?
+    raw=$(curl -D - "${curl_args[@]}" "$url" < <(printf '%s' "$data"); curl_status=$?; printf '\034'; exit "$curl_status") || curl_status=$?
     raw="${raw%$'\034'}"
     if [[ $curl_status -ne 0 ]]; then
         _GH_LAST_HTTP_CODE=""
@@ -978,7 +983,7 @@ _gh_api_with_curl() {
     _GH_LAST_RATE_REMAINING=$(_gh_response_header x-ratelimit-remaining "$headers")
     _GH_LAST_RATE_RESET=$(_gh_response_header x-ratelimit-reset "$headers")
 
-    echo "$body"
+    printf '%s' "$body"
     [[ "$http_code" == 2* || "$http_code" == "304" ]] && return 0
     return 22
 }
@@ -1378,12 +1383,16 @@ gh_create_release() {
     data=$(jq -n \
         --arg tag "$tag" \
         --arg name "$name" \
-        --arg body "$body" \
+        --rawfile body /dev/fd/3 \
         --argjson draft "$draft" \
         --argjson prerelease "$prerelease" \
         --arg target_commitish "$target_commitish" \
         '{tag_name: $tag, name: $name, body: $body, draft: $draft, prerelease: $prerelease}
-         + if $target_commitish == "" then {} else {target_commitish: $target_commitish} end')
+         + if $target_commitish == "" then {} else {target_commitish: $target_commitish} end' \
+        3< <(printf '%s' "$body")) || {
+        _gh_log_error "Could not serialize the release creation request"
+        return 4
+    }
 
     if $retain_response; then
         gh_api "repos/$repo/releases" --post "$data" --retain-response

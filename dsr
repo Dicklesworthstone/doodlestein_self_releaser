@@ -6924,11 +6924,12 @@ _release_contract_verify_remote_assets() {
     esac
 
     if [[ "$expected_metadata_json" != "null" ]] && ! jq -e \
-        --argjson expected "$expected_metadata_json" '
+        --slurpfile expected /dev/fd/3 '
+            ($expected | length) == 1 and ($expected[0] as $expected |
             .name == $expected.name and
             .body == $expected.body and
-            .prerelease == $expected.prerelease
-        ' <<< "$release_json" >/dev/null 2>&1; then
+            .prerelease == $expected.prerelease)
+        ' 3<<< "$expected_metadata_json" <<< "$release_json" >/dev/null 2>&1; then
         log_error "GitHub release metadata changed during strict verification"
         return 1
     fi
@@ -7340,14 +7341,14 @@ _source_release_identity() {
 
 _source_release_metadata_matches() {
     local observed="$1" expected="$2" release_id="$3" draft="$4"
-    jq -es --argjson expected "$expected" --argjson id "$release_id" --arg draft "$draft" '
-        length == 1 and (.[0] | type == "object" and .id == $id and
+    jq -es --slurpfile expected /dev/fd/3 --argjson id "$release_id" --arg draft "$draft" '
+        ($expected | length) == 1 and length == 1 and ($expected[0] as $expected | .[0] | type == "object" and .id == $id and
         .tag_name == $expected.tag_name and .name == $expected.name and
         .body == $expected.body and .prerelease == $expected.prerelease and
         .target_commitish == $expected.target_commitish and
         (.draft | type == "boolean") and
         ($draft == "any" or (.draft | tostring) == $draft))
-    ' <<< "$observed" >/dev/null 2>&1
+    ' 3<<< "$expected" <<< "$observed" >/dev/null 2>&1
 }
 
 _source_release_observe() {
@@ -7774,9 +7775,10 @@ _release_finalize_execute_locked() {
     output=$(umask 077; mktemp "$state_dir/releases/$tool-$tag-finalization-pending.XXXXXXXX") || return 7
     jq -n --arg repo "$repo" --arg tag "$tag" --argjson id "$release_id" \
         --arg response "$response" --arg sha "$receipt_sha" --slurpfile plan /dev/fd/3 \
-        --arg config_sha "$config_sha" --arg registry_sha "$registry_sha" --argjson metadata "$metadata" \
-        '{schema:"dsr.strict_finalization_receipt.v1",status:"pending",repo:$repo,tag:$tag,release_id:$id,create_response:$response,create_response_sha256:$sha,config_sha256:$config_sha,registry_sha256:$registry_sha,plan:$plan[0],metadata:$metadata}' \
-        3<<< "$plan" > "$output" || return 7
+        --arg config_sha "$config_sha" --arg registry_sha "$registry_sha" --slurpfile metadata /dev/fd/4 \
+        'if ($metadata | length) != 1 then error("invalid finalization metadata") else
+         {schema:"dsr.strict_finalization_receipt.v1",status:"pending",repo:$repo,tag:$tag,release_id:$id,create_response:$response,create_response_sha256:$sha,config_sha256:$config_sha,registry_sha256:$registry_sha,plan:$plan[0],metadata:$metadata[0]} end' \
+        3<<< "$plan" 4<<< "$metadata" > "$output" || return 7
     jq -e '.status == "pending"' "$output" >/dev/null || return 7
     # Re-observe all remote bytes and the complete original nonce-bound
     # metadata immediately before changing only this proven draft's state.
@@ -8125,12 +8127,14 @@ EOF
     fi
     title="$tag (source only)"
     expected=$(jq -n --arg tag "$tag" --arg title "$title" --arg sha "$sha" \
-        --arg nonce "$nonce" --argjson notes "$notes_json" --argjson prerelease "$prerelease" '
+        --arg nonce "$nonce" --slurpfile notes /dev/fd/3 --argjson prerelease "$prerelease" '
+        if ($notes | length) != 1 then error("invalid reviewed release notes") else
         {tag_name:$tag,name:$title,target_commitish:$sha,prerelease:$prerelease,
-         body:($notes.body + "\n\n<!-- dsr-source-only-create:" + $nonce + " -->")}
-    ') || return 4
+         body:($notes[0].body + "\n\n<!-- dsr-source-only-create:" + $nonce + " -->")} end
+    ' 3<<< "$notes_json") || return 4
     if [[ -n "$resume_receipt" ]]; then
-        jq -e --argjson expected "$expected" '.metadata == $expected' <<< "$saved_receipt" >/dev/null || return 4
+        jq -e --slurpfile expected /dev/fd/3 '($expected | length) == 1 and .metadata == $expected[0]' \
+            3<<< "$expected" <<< "$saved_receipt" >/dev/null || return 4
         release=$(jq -c '.release' <<< "$scan") || return 7
         release_id=$(jq -r '.id // empty' <<< "$release") || return 7
         jq -e '.id | type == "number" and floor == . and . > 0 and . <= 9007199254740991' \
@@ -8176,17 +8180,19 @@ EOF
     receipt_dir=$(cd "$receipt_dir" && pwd -P) || return 7
     local receipt="" receipt_record="" receipt_fingerprint=null
     receipt=$(mktemp "$receipt_dir/$tool-$tag.json.XXXXXXXX") || return 7
-    receipt_record=$(jq -n --argjson expected "$expected" --arg repo "$repo" --arg notes_sha "$notes_sha" \
+    receipt_record=$(jq -n --slurpfile expected /dev/fd/3 --arg repo "$repo" --arg notes_sha "$notes_sha" \
         --arg config_sha "$config_sha" --arg registry_sha "$registry_sha" \
         --argjson requested_draft "$requested_draft" --argjson publication "$publication_requested" \
         --arg resumed_from "$resume_receipt" --arg resumed_sha "$saved_sha" \
         --arg release_id "$resume_release_id" --arg tag "$tag" --arg sha "$sha" '
-        {publication_mode:"source-only",repo:$repo,metadata:$expected,notes_sha256:$notes_sha,
+        if ($expected | length) != 1 then error("invalid source-only metadata") else
+        {publication_mode:"source-only",repo:$repo,metadata:$expected[0],notes_sha256:$notes_sha,
          config_sha256:$config_sha,registry_sha256:$registry_sha,requested_draft:$requested_draft,
          publication_requested:$publication,
          resumed_from:$resumed_from,resumed_receipt_sha256:$resumed_sha,status:"pending"}
         + (if $release_id == "" then {} else
-            {release_id:($release_id|tonumber),tag:$tag,git_sha:$sha,asset_count:0} end)') || return 7
+            {release_id:($release_id|tonumber),tag:$tag,git_sha:$sha,asset_count:0} end) end' \
+        3<<< "$expected") || return 7
     receipt_fingerprint=$(_source_release_save_receipt "$receipt" "$receipt_dir" "$tool" "$tag" \
         "$receipt_fingerprint" "$receipt_record") || return 7
     log_info "Retained source-only recovery receipt: $receipt"
@@ -8250,14 +8256,17 @@ EOF
         --arg notes_sha "$notes_sha" --arg config_sha "$config_sha" --arg registry_sha "$registry_sha" \
         --argjson requested_draft "$requested_draft" --argjson publication "$publication_requested" \
         --arg resumed_from "$resume_receipt" --arg resumed_sha "$saved_sha" \
-        --argjson expected "$expected" --argjson release "$release" '
+        --slurpfile expected /dev/fd/3 --slurpfile release /dev/fd/4 '
+        if ([$expected,$release] | all(.[]; length == 1)) then
+        $expected[0] as $expected | $release[0] as $release |
         {publication_mode:"source-only",repo:$repo,tag:$tag,git_sha:$sha,
          notes_sha256:$notes_sha,config_sha256:$config_sha,registry_sha256:$registry_sha,
          metadata:$expected,asset_count:0,release_id:$release.id,
          requested_draft:$requested_draft,publication_requested:$publication,
          resumed_from:$resumed_from,resumed_receipt_sha256:$resumed_sha,
          draft:$release.draft,url:$release.html_url,status:"success"}
-    ') || return 7
+        else error("invalid source-only completion metadata") end
+    ' 3<<< "$expected" 4<<< "$release") || return 7
     if ! _source_release_save_receipt "$receipt" "$receipt_dir" "$tool" "$tag" \
         "$receipt_fingerprint" "$receipt_record" >/dev/null; then
         if $publication_attempted; then _source_release_restore_draft "$repo" "$release_id" "$expected" || true; fi
@@ -8839,7 +8848,7 @@ EOF
         release_contract_metadata_json=$(jq -nc \
             --arg tag_name "$tag" \
             --arg name "$tag" \
-            --arg body "$release_body" \
+            --rawfile body /dev/fd/3 \
             --arg target_commitish "$release_contract_git_sha" \
             --argjson prerelease "$prerelease" \
             --argjson requested_draft "$requested_draft" '
@@ -8850,10 +8859,12 @@ EOF
                 target_commitish: $target_commitish,
                 prerelease: $prerelease,
                 requested_draft: $requested_draft
-            }') || return 4
+            }' 3< <(printf '%s' "$release_body")) || return 4
         release_contract_plan=$(jq -c \
-            --argjson release "$release_contract_metadata_json" \
-            '. + {release: $release}' <<< "$release_contract_plan") || return 4
+            --slurpfile release /dev/fd/3 \
+            'if ($release | length) != 1 then error("invalid release metadata") else
+                . + {release: $release[0]} end' \
+            3<<< "$release_contract_metadata_json" <<< "$release_contract_plan") || return 4
         log_ok "Strict release contract preflight passed"
     fi
 
@@ -9478,7 +9489,8 @@ EOF
             --no-cache 2>/dev/null) || return 1
         if ! jq -e \
             --argjson release_id "$observe_release_id" \
-            --argjson expected "$expected_metadata_json" '
+            --slurpfile expected /dev/fd/3 '
+            ($expected | length) == 1 and ($expected[0] as $expected |
             .id == $release_id and
             .tag_name == $expected.tag_name and
             .name == $expected.name and
@@ -9488,8 +9500,8 @@ EOF
             (.draft | type == "boolean") and
             (.upload_url | type == "string" and length > 0) and
             (.html_url | type == "string" and length > 0) and
-            (.assets | type == "array")
-        ' <<< "$observed_json" >/dev/null 2>&1; then
+            (.assets | type == "array"))
+        ' 3<<< "$expected_metadata_json" <<< "$observed_json" >/dev/null 2>&1; then
             return 1
         fi
         printf '%s\n' "$observed_json"
@@ -9582,21 +9594,28 @@ EOF
         local intent_now response_now
         intent_now=$(_source_release_read_private_receipt "$ordinary_intent" "$ordinary_custody_dir" "" "" "intent.") || return 1
         response_now=$(_source_release_read_private_receipt "$ordinary_response" "$ordinary_custody_dir" "" "" "dsr-api-response.") || return 1
-        jq -en --argjson before "$ordinary_intent_proof" --argjson after "$intent_now" \
-            --argjson original "$ordinary_response_proof" --argjson response "$response_now" \
-            '$before == $after and $original == $response' >/dev/null
+        # Both proofs contain the complete release notes; keep their bytes
+        # off argv while comparing the exact private records and identities.
+        jq -en --slurpfile before /dev/fd/3 --slurpfile after /dev/fd/4 \
+            --slurpfile original /dev/fd/5 --slurpfile response /dev/fd/6 \
+            '([$before,$after,$original,$response] | all(.[]; length == 1)) and
+             $before == $after and $original == $response' \
+            3<<< "$ordinary_intent_proof" 4<<< "$intent_now" \
+            5<<< "$ordinary_response_proof" 6<<< "$response_now" >/dev/null
     }
 
     _release_ordinary_metadata_matches() {
         local observed="$1" expected_draft="$2"
-        jq -en --argjson original "$ordinary_response_proof" --argjson observed "$observed" \
+        jq -en --slurpfile original /dev/fd/3 --slurpfile observed /dev/fd/4 \
             --argjson expected_draft "$expected_draft" --arg repo "$repo" '
             def identity: {id,tag_name,name,body,target_commitish,prerelease,upload_url};
+            ([$original,$observed] | all(.[]; length == 1)) and
+            ($original[0] as $original | $observed[0] as $observed |
             ($observed | type == "object") and $observed.draft == $expected_draft and
             ($observed.html_url | type == "string" and
                 startswith("https://github.com/" + $repo + "/releases/")) and
-            (($observed | identity) == ($original.record | identity))
-        ' >/dev/null 2>&1
+            (($observed | identity) == ($original.record | identity)))
+        ' 3<<< "$ordinary_response_proof" 4<<< "$observed" >/dev/null 2>&1
     }
 
     _release_ordinary_restore_draft() {
@@ -9634,8 +9653,9 @@ EOF
             # Both original files must agree about creation. The response
             # must be the empty draft POST, never a later GET or upload receipt.
             if ! jq -en --arg repo "$repo" --arg tool "$tool_name" --arg tag "$tag" \
-                --argjson id "$release_id" --argjson intent "$intent_proof" --argjson response "$response_proof" '
-                $intent.record as $i | $response.record as $r |
+                --argjson id "$release_id" --slurpfile intent /dev/fd/3 --slurpfile response /dev/fd/4 '
+                ([$intent,$response] | all(.[]; length == 1)) and
+                ($intent[0].record as $i | $response[0].record as $r |
                 $i.schema == "dsr.ordinary_release_intent.v1" and
                 $i.repo == $repo and $i.tool == $tool and $i.tag == $tag and
                 ($i.publish | type == "boolean") and
@@ -9645,8 +9665,8 @@ EOF
                 $r.tag_name == $tag and $r.tag_name == $i.request.tag_name and
                 $r.name == $i.request.name and $r.body == $i.request.body and
                 $r.prerelease == $i.request.prerelease and
-                ($i.request.target_commitish == null or $r.target_commitish == $i.request.target_commitish)
-            ' >/dev/null 2>&1; then
+                ($i.request.target_commitish == null or $r.target_commitish == $i.request.target_commitish))
+            ' 3<<< "$intent_proof" 4<<< "$response_proof" >/dev/null 2>&1; then
                 continue
             fi
             matching=$((matching + 1))
@@ -9666,11 +9686,12 @@ EOF
             return 0
         fi
         if [[ $matching -ne 1 ]] ||
-           ! jq -en --argjson intent "$ordinary_intent_proof" --argjson plan "$ordinary_plan" \
+           ! jq -en --slurpfile intent /dev/fd/3 --slurpfile plan /dev/fd/4 \
                 --arg artifacts "$(cd "$artifacts_dir" && pwd -P)" --arg sha "$release_tag_sha" '
-                $intent.record.assets == $plan and $intent.record.artifacts_dir == $artifacts and
-                ($sha == "" or $intent.record.request.target_commitish == $sha)
-           ' >/dev/null; then
+                ([$intent,$plan] | all(.[]; length == 1)) and
+                ($intent[0].record as $record | $record.assets == $plan[0] and $record.artifacts_dir == $artifacts and
+                ($sha == "" or $record.request.target_commitish == $sha))
+           ' 3<<< "$ordinary_intent_proof" 4<<< "$ordinary_plan" >/dev/null; then
             log_error "Staged release creation custody is ambiguous or its frozen inputs changed"
             return 1
         fi
@@ -9679,9 +9700,12 @@ EOF
             return 1
         fi
         if ! $resume && [[ $create_status -eq 0 ]] &&
-           ! jq -en --argjson before "$original_intent_proof" --argjson after "$ordinary_intent_proof" \
-                --argjson response "$ordinary_response_proof" --argjson reply "$release_json" \
-                '$before == $after and $response.record == $reply' >/dev/null; then
+           ! jq -en --slurpfile before /dev/fd/3 --slurpfile after /dev/fd/4 \
+                --slurpfile response /dev/fd/5 --slurpfile reply /dev/fd/6 \
+                '([$before,$after,$response,$reply] | all(.[]; length == 1)) and
+                 $before == $after and $response[0].record == $reply[0]' \
+                3<<< "$original_intent_proof" 4<<< "$ordinary_intent_proof" \
+                5<<< "$ordinary_response_proof" 6<<< "$release_json" >/dev/null; then
             log_error "Private creation intent or original draft POST response changed during creation"
             return 1
         fi
@@ -9746,14 +9770,18 @@ EOF
             local ordinary_nonce ordinary_request ordinary_intent_json
             ordinary_nonce=$(_release_contract_create_nonce) || return 4
             release_body+=$'\n\n'"<!-- dsr-publication-nonce:$ordinary_nonce -->"
-            ordinary_request=$(jq -nc --arg tag "$tag" --arg body "$release_body" --arg sha "$release_tag_sha" \
+            ordinary_request=$(jq -nc --arg tag "$tag" --rawfile body /dev/fd/3 --arg sha "$release_tag_sha" \
                 --argjson prerelease "$prerelease" '{tag_name:$tag,name:$tag,body:$body,prerelease:$prerelease} +
-                (if $sha == "" then {} else {target_commitish:$sha} end)') || return 4
+                (if $sha == "" then {} else {target_commitish:$sha} end)' \
+                3< <(printf '%s' "$release_body")) || return 4
             ordinary_intent_json=$(jq -nc --arg repo "$repo" --arg tool "$tool_name" --arg tag "$tag" \
                 --arg artifacts "$(cd "$artifacts_dir" && pwd -P)" --arg nonce "$ordinary_nonce" \
-                --argjson request "$ordinary_request" --argjson assets "$ordinary_plan" --argjson draft "$requested_draft" \
-                '{schema:"dsr.ordinary_release_intent.v1",repo:$repo,tool:$tool,tag:$tag,
-                  artifacts_dir:$artifacts,nonce:$nonce,request:$request,assets:$assets,publish:($draft|not)}') || return 4
+                --slurpfile request /dev/fd/3 --slurpfile assets /dev/fd/4 --argjson draft "$requested_draft" \
+                'if ([$request,$assets] | all(.[]; length == 1)) then
+                 {schema:"dsr.ordinary_release_intent.v1",repo:$repo,tool:$tool,tag:$tag,
+                  artifacts_dir:$artifacts,nonce:$nonce,request:$request[0],assets:$assets[0],publish:($draft|not)}
+                 else error("invalid release creation intent") end' \
+                3<<< "$ordinary_request" 4<<< "$ordinary_plan") || return 4
             if ! mkdir -p "$state_dir/releases" || [[ -L "$state_dir/releases" ]] ||
                ! ordinary_custody_dir=$(umask 077; mktemp -d "$state_dir/releases/dsr-publication.$ordinary_custody_prefix.XXXXXXXX") ||
                ! ordinary_custody_dir=$(cd "$ordinary_custody_dir" && pwd -P); then
@@ -9803,8 +9831,9 @@ EOF
            [[ ${#create_responses[@]} -ne 1 || ! -f "${create_responses[0]}" ]] ||
            ! creation_fingerprint=$(_source_release_read_private_receipt \
                 "${create_responses[0]}" "$create_response_dir" "" "" "dsr-api-response.") ||
-           ! jq -en --argjson original "$creation_fingerprint" --argjson reply "$release_json" \
-                '$original.record == $reply' >/dev/null; then
+           ! jq -en --slurpfile original /dev/fd/3 --slurpfile reply /dev/fd/4 \
+                '([$original,$reply] | all(.[]; length == 1)) and $original[0].record == $reply[0]' \
+                3<<< "$creation_fingerprint" 4<<< "$release_json" >/dev/null; then
             log_error "Strict draft creation did not preserve its original private POST response"
             return 7
         fi
@@ -9852,7 +9881,8 @@ EOF
             else
                 log_error "Failed to create release: $release_json"
                 if $JSON_MODE; then
-                    json_envelope "release" "error" 7 "$(jq -nc --arg error "$release_json" '{error: $error}')"
+                    json_envelope "release" "error" 7 "$(jq -nc --rawfile error /dev/fd/3 \
+                        '{error: $error}' 3< <(printf '%s' "$release_json"))"
                 fi
                 return 7
             fi
@@ -9928,7 +9958,8 @@ EOF
 
     if $release_contract_enabled; then
         if ! jq -e \
-            --argjson expected "$release_contract_metadata_json" '
+            --slurpfile expected /dev/fd/3 '
+            ($expected | length) == 1 and ($expected[0] as $expected |
             (.id | type == "number" and floor == . and . > 0) and
             (.upload_url | type == "string" and length > 0) and
             (.html_url | type == "string" and length > 0) and
@@ -9937,8 +9968,8 @@ EOF
             .body == $expected.body and
             .prerelease == $expected.prerelease and
             .draft == true and
-            (.assets | type == "array" and length == 0)
-        ' <<< "$release_json" >/dev/null 2>&1; then
+            (.assets | type == "array" and length == 0))
+        ' 3<<< "$release_contract_metadata_json" <<< "$release_json" >/dev/null 2>&1; then
             log_error "GitHub did not create a new empty draft release for strict upload"
             local observed_owned_release_json=""
             observed_owned_release_json=$(_release_contract_observe_owned_release \
@@ -10324,8 +10355,10 @@ EOF
                 "$tool_name" "$tag" "$repo" "$local_path" "$artifacts_dir" \
                 "$manifest_file" "$release_contract_json" verify); then
                 current_release_contract_plan=$(jq -c \
-                    --argjson release "$release_contract_metadata_json" \
-                    '. + {release: $release}' <<< "$current_release_contract_plan") || \
+                    --slurpfile release /dev/fd/3 \
+                    'if ($release | length) != 1 then error("invalid release metadata") else
+                        . + {release: $release[0]} end' \
+                    3<<< "$release_contract_metadata_json" <<< "$current_release_contract_plan") || \
                     current_release_contract_plan=""
                 if jq -e --slurpfile frozen /dev/fd/3 \
                     '$frozen[0] == .' 3<<< "$release_contract_plan" \
@@ -10625,11 +10658,12 @@ EOF
                 fi
             done
             if ! observed_release=$(gh_api "repos/$repo/releases/$release_id" --no-cache) ||
-               ! jq -ens --argjson expected "$release_json" --argjson observed "$observed_release" '
+               ! jq -en --slurpfile expected /dev/fd/3 --slurpfile observed /dev/fd/4 '
                    def identity: {id,tag_name,upload_url,draft,prerelease};
-                   ($observed | type == "object") and
-                   (($observed | identity) == ($expected | identity))
-               ' >/dev/null 2>&1; then
+                   ([$expected,$observed] | all(.[]; length == 1)) and
+                   ($observed[0] | type == "object") and
+                   (($observed[0] | identity) == ($expected[0] | identity))
+               ' 3<<< "$release_json" 4<<< "$observed_release" >/dev/null 2>&1; then
                 _release_record_failed "release-verification" "Release identity or visibility changed after upload"
                 verification_status="incomplete"
             fi
@@ -10992,19 +11026,23 @@ _dispatch_release_binding() {
             fi
         done < <(jq -c '.[]' <<< "$binding_expected_assets")
         binding=$(jq -nc --arg tag "$dispatch_tag" --arg sha "$dispatch_sha" --arg url "$dispatch_url" \
-            --argjson metadata "$metadata" --argjson assets "$inventory" --argjson expected "$binding_expected_assets" '
+            --slurpfile metadata /dev/fd/3 --argjson assets "$inventory" --argjson expected "$binding_expected_assets" '
+            if ($metadata | length) != 1 then error("invalid release metadata") else
+            $metadata[0] as $metadata |
             {tag:$tag,sha:$sha,release_url:$url,prerelease:$metadata.prerelease,
              assets:[$assets[] | . as $asset | . + {sha256:($expected[] | select(.name == $asset.name) | .sha256)}]}
-        ') || return 7
+            end
+        ' 3<<< "$metadata") || return 7
         # Re-observe after any content downloads; otherwise a replacement on
         # a later page could hide behind an earlier matching asset receipt.
         after_inventory=$(_dispatch_inventory "$dispatch_repo" "$dispatch_id") || return 7
         after_metadata=$(gh_api "repos/$dispatch_repo/releases/$dispatch_id" --no-cache) || return 7
-        jq -en --argjson before "$metadata" --argjson after "$after_metadata" \
+        jq -en --slurpfile before /dev/fd/3 --slurpfile after /dev/fd/4 \
             --argjson assets "$inventory" --argjson current "$after_inventory" '
             def identity: {id,tag_name,draft,prerelease,html_url};
-            ($before | identity) == ($after | identity) and $assets == $current
-        ' >/dev/null || return 7
+            ([$before,$after] | all(.[]; length == 1)) and
+            ($before[0] | identity) == ($after[0] | identity) and $assets == $current
+        ' 3<<< "$metadata" 4<<< "$after_metadata" >/dev/null || return 7
         remote_sha=$(gh_resolve_tag_sha "$dispatch_repo" "$dispatch_tag") || return 7
         [[ "$remote_sha" == "$dispatch_sha" ]] || return 7
         printf '%s\n' "$binding"

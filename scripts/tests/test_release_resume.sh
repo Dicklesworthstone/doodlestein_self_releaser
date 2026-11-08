@@ -189,10 +189,11 @@ gh_create_release() (
     # retention validator. Only GitHub's actual network boundary is replaced.
     source "$PROJECT_ROOT/src/github.sh"
     gh_check() { return 0; }
+    _gh_check_cli_auth() { return 0; }
     _gh_api_with_gh() {
         [[ "$1" == repos/owner/repo/releases && "$2" == POST ]] || return 8
         printf '%s\n' "$3" > "$CASE/create-request.json"
-        jq --argjson request "$3" '. + $request | .assets=[] |
+        jq --slurpfile request "$CASE/create-request.json" '. + $request[0] | .assets=[] |
             .html_url="https://github.com/owner/repo/releases/tag/untagged-0123456789abcdef0123"' \
             "$CASE/release.json" > "$CASE/release.next" || return 8
         mv "$CASE/release.next" "$CASE/release.json" || return 8
@@ -2256,6 +2257,75 @@ test_staged_changed_notes_are_not_published_or_overwritten() {
         jq -e '.body=="Another publisher changed these notes"' "$CASE/release.json" >/dev/null
 }
 
+staged_large_notes_setup() {
+    setup "$1"
+    CREATE_FAIL=false
+    git init -q "$CASE/checkout" &&
+        git -C "$CASE/checkout" -c user.name=t -c user.email=t@example.invalid commit -q --allow-empty -m baseline &&
+        git -C "$CASE/checkout" tag v1.2.2 || return 1
+    # A real Git subject generates more than one exec argument can carry.
+    # No production command, note generator or custody validator is replaced.
+    python3 - "$CASE/commit-message" <<'PY'
+from pathlib import Path
+import sys
+Path(sys.argv[1]).write_text('Reviewed λ change ' * 9000 + 'literal "quote" \\ @file $HOME\n')
+PY
+    [[ $? -eq 0 ]] || return 1
+    git -C "$CASE/checkout" -c user.name=t -c user.email=t@example.invalid commit -q --allow-empty -F "$CASE/commit-message" &&
+        git -C "$CASE/checkout" tag v1.2.3 || return 1
+    STAGED_SOURCE_SHA=$(git -C "$CASE/checkout" rev-parse HEAD) || return 1
+    act_get_local_path() { printf '%s\n' "$CASE/checkout"; }
+    git_ops_tag_exists() { git -C "$1" rev-parse -q --verify "refs/tags/$2" >/dev/null; }
+    git_ops_tag_sha() { git -C "$1" rev-parse --verify "$2^{commit}"; }
+}
+
+test_staged_large_notes_survive_publication_and_resume() {
+    staged_large_notes_setup staged_large_notes || return 1
+    run_release --generate-notes --draft
+    [[ $STATUS -eq 0 ]] || return 1
+    local intent response
+    intent=$(jq -er '.details.staging_receipt' "$CASE/stdout") || return 1
+    local -a responses=("${intent%/*}"/dsr-api-response.????????)
+    [[ ${#responses[@]} -eq 1 ]] || return 1
+    response="${responses[0]}"
+    cp "$intent" "$CASE/original-intent.json" &&
+        cp "$response" "$CASE/original-response.json" || return 1
+    python3 - "$CASE" "$intent" "$response" <<'PY'
+import json
+from pathlib import Path
+import subprocess
+import sys
+case, intent, response = map(Path, sys.argv[1:])
+commits = subprocess.check_output(['git', '-C', str(case / 'checkout'), 'log', '--oneline',
+                                   'v1.2.2..v1.2.3']).decode().rstrip('\n')
+notes = '## Changes since v1.2.2\n\n' + commits + '\n\n<!-- dsr-publication-nonce:' + '1'.zfill(64) + ' -->'
+assert len(notes.encode()) > 131072
+assert json.loads(intent.read_text())['request']['body'] == notes
+assert json.loads(response.read_text())['body'] == notes
+assert json.loads((case / 'release.json').read_text())['body'] == notes
+PY
+    [[ $? -eq 0 ]] || return 1
+    : > "$CALLS"
+    run_release --resume --publish-draft
+    [[ $STATUS -eq 0 ]] && grep -Fxq PUBLISH "$CALLS" && grep -Fxq DISPATCH "$CALLS" &&
+        ! grep -q '^CREATE\|^POST ' "$CALLS" &&
+        cmp "$intent" "$CASE/original-intent.json" &&
+        cmp "$response" "$CASE/original-response.json" || return 1
+    : > "$CALLS"
+    run_release --resume
+    [[ $STATUS -eq 0 ]] && ! grep -q '^CREATE\|^POST \|^PUBLISH\|^RESTORE-DRAFT\|^DISPATCH$' "$CALLS" &&
+        jq -e --slurpfile original "$response" '.body == $original[0].body and .draft == false' \
+            "$CASE/release.json" >/dev/null
+}
+
+test_staged_large_notes_drift_blocks_publication() {
+    staged_large_notes_setup staged_large_notes_drift || return 1
+    UPLOAD_METADATA_DRIFT=true
+    run_release --generate-notes
+    [[ $STATUS -eq 1 ]] && ! grep -q '^PUBLISH\|^RESTORE-DRAFT\|^DISPATCH' "$CALLS" &&
+        jq -e '.body=="Another publisher changed these notes" and .draft==true' "$CASE/release.json" >/dev/null
+}
+
 test_staged_changed_destination_is_not_published() {
     setup staged_wrong_destination
     CREATE_FAIL=false UPLOAD_DESTINATION_DRIFT=true
@@ -2788,6 +2858,7 @@ for test in test_release_keeps_artifacts_during_publication \
     test_staged_already_public_retry_verifies_original_plan test_staged_already_public_retry_refuses_extra_asset \
     test_staged_extra_asset_blocks_first_publication test_staged_missing_selected_sidecar_blocks_publication \
     test_staged_changed_notes_are_not_published_or_overwritten test_staged_postpublish_asset_drift_restores_owned_draft \
+    test_staged_large_notes_survive_publication_and_resume test_staged_large_notes_drift_blocks_publication \
     test_staged_changed_destination_is_not_published test_staged_postpublish_destination_drift_is_not_overwritten \
     test_staged_postpublish_metadata_drift_is_not_overwritten test_staged_lost_original_post_is_never_adopted \
     test_staged_changed_inputs_are_not_adopted_on_resume test_staged_nonprivate_receipt_cannot_authorize_resume \

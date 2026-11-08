@@ -20,7 +20,7 @@ import tempfile
 root = Path(sys.argv[1])
 os.umask(0o077)
 work = Path(tempfile.mkdtemp(prefix='dsr-source-release-'))
-source = (root / 'dsr').read_text()
+source = Path(os.environ.get('DSR_TEST_COMMAND_FILE', str(root / 'dsr'))).read_text()
 names = ['_source_release_identity', '_source_release_metadata_matches',
          '_source_release_observe', '_source_release_restore_draft',
          '_source_release_inputs_match',
@@ -47,7 +47,12 @@ api_source = r'''
 import json, os
 from pathlib import Path
 import sys
-case=Path(os.environ['CASE']); args=sys.argv[1:]; endpoint=args[0]
+case=Path(os.environ['CASE']); args=sys.argv[1:]
+if not args:
+    # A fixture must not reintroduce the argv limit that production avoids.
+    raw=sys.stdin.buffer.read(); assert raw.endswith(b'\0')
+    args=[part.decode() for part in raw[:-1].split(b'\0')]
+endpoint=args[0]
 control=json.loads((case/'control.json').read_text())
 with (case/'requests.jsonl').open('a') as f: f.write(json.dumps(args)+'\n')
 release_file=case/'remote.json'
@@ -159,7 +164,7 @@ log_set_tool() { :; }
 _dsr_require() { :; }
 gh_check() { return 0; }
 gh_check_token() { return 0; }
-gh_api() { python3 "$CASE/api.py" "$@"; }
+gh_api() { python3 "$CASE/api.py" < <(printf '%s\0' "$@" ); }
 JSON_MODE=false
 DRY_RUN="$1"
 command_name="$2"
@@ -186,6 +191,43 @@ for label,control in [('publish',{}),('lost-post',{'lost_post':True}),('lost-pat
     receipts=list((case/'state'/'source-only').glob('*.json.*'))
     assert_ok(label+' separate source receipt',len(receipts)==1 and json.loads(receipts[0].read_text())['publication_mode']=='source-only')
     assert_ok(label+' authoritative inventory observed',sum('/assets?' in r[0] for r in requests)>=2)
+
+# The public input admits reviewed notes up to 1 MiB. Exercise a real file
+# whose UTF-8 bytes exceed exec's 128 KiB argument limit, including literal
+# shell syntax, CRLF and trailing newlines. Git/config/custody remain real.
+for label,control in [('large-notes',{}),('large-notes-lost-post',{'lost_post':True})]:
+    case,repo,config=setup(label,control)
+    notes='@literal "quoted" \\ $HOME `data`\n'+('λ'*70000)+'\r\n\n'
+    (case/'notes.md').write_bytes(notes.encode())
+    assert_ok(label+' fixture exceeds argument limit',len(notes.encode())>131072)
+    proc,requests=invoke(case,dry=True)
+    assert_ok(label+' dry run admits exact notes without mutation',proc.returncode==0
+              and not any('--post' in r or '--method' in r for r in requests)
+              and not (case/'state').exists())
+    flags=['--notes-file',str(case/'notes.md'),'--no-dispatch']
+    proc,requests=invoke(case,flags+['--draft'])
+    assert_ok(label+' creates recoverable draft',proc.returncode==0)
+    remote=json.loads((case/'remote.json').read_text())
+    body=remote['body']; prefix=notes+'\n\n<!-- dsr-source-only-create:'
+    assert_ok(label+' preserves exact reviewed bytes',body.startswith(prefix)
+              and re.fullmatch(r'[0-9a-f]{64} -->',body[len(prefix):]) is not None
+              and remote['draft'] is True and remote['assets']==[])
+    receipts=list((case/'state'/'source-only').glob('*.json.*'))
+    assert_ok(label+' retains private metadata',len(receipts)==1
+              and json.loads(receipts[0].read_text())['metadata']['body']==body
+              and receipts[0].stat().st_mode&0o777==0o600)
+    original=receipts[0]; original_bytes=original.read_bytes()
+    proc,requests=invoke(case,flags+['--resume-receipt',str(original),'--publish-draft'])
+    remote=json.loads((case/'remote.json').read_text())
+    assert_ok(label+' promotes without recreating draft or changing custody',proc.returncode==0
+              and remote['draft'] is False and remote['body']==body and original.read_bytes()==original_bytes
+              and sum('--post' in r for r in requests)==1)
+    previous=len(requests)
+    (case/'notes.md').write_bytes(notes.encode()+b'changed reviewed notes')
+    proc,requests=invoke(case,flags+['--resume-receipt',str(original)])
+    assert_ok(label+' refuses changed notes before mutation',proc.returncode==4
+              and not any('--post' in r or '--method' in r for r in requests[previous:])
+              and original.read_bytes()==original_bytes)
 
 case,repo,config=setup('draft'); proc,requests=invoke(case,['--notes-file',str(case/'notes.md'),'--no-dispatch','--draft','--prerelease'])
 assert_ok('requested draft stays draft',proc.returncode==0 and json.loads((case/'remote.json').read_text())['draft'] is True)
@@ -538,7 +580,8 @@ cli=work/'cli'; (cli/'src').mkdir(parents=True)
 shutil.copyfile(root/'dsr',cli/'dsr')
 for module in (root/'src').glob('*.sh'): shutil.copyfile(module,cli/'src'/module.name)
 with (cli/'src'/'github.sh').open('a') as f:
-    f.write('\ngh_check() { return 0; }\ngh_check_token() { return 0; }\ngh_api() { python3 "$CASE/api.py" "$@"; }\n')
+    f.write('\ngh_check() { return 0; }\ngh_check_token() { return 0; }\n'
+            'gh_api() { python3 "$CASE/api.py" < <(printf \'%s\\0\' "$@"); }\n')
 case,repo,config=setup('real-cli-dry-run')
 env=dict(os.environ,CASE=str(case),DSR_CONFIG_DIR=str(case),DSR_STATE_DIR=str(case/'state'),NO_COLOR='1')
 real_cli=subprocess.run(['bash',str(cli/'dsr'),'--json','--dry-run','release','source-only','app','1.2.3','--notes-file',str(case/'notes.md'),'--no-dispatch'],env=env,capture_output=True,text=True,timeout=60)

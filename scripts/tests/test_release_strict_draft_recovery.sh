@@ -67,7 +67,11 @@ api = r'''
 import hashlib, json, os, signal, time
 from pathlib import Path
 import sys
-c=Path(os.environ['CASE']); args=sys.argv[1:]; endpoint=args[0]
+c=Path(os.environ['CASE']); args=sys.argv[1:]
+if not args:
+    raw=sys.stdin.buffer.read(); assert raw.endswith(b'\0')
+    args=[part.decode() for part in raw[:-1].split(b'\0')]
+endpoint=args[0]
 control=json.loads((c/'control.json').read_text())
 with (c/'requests.jsonl').open('a') as f:f.write(json.dumps(args)+'\n')
 r=json.loads((c/'remote.json').read_text())
@@ -227,8 +231,8 @@ if [[ "$1" == create || "$1" == fallback || "$1" == verify || "$1" == public-fin
     gh_download_release_asset() { test ! -e "$3" && cp "$CASE/bytes/$2" "$3"; }
     _gh_api_with_gh() {
         case "$2" in
-            POST) python3 "$CASE/api.py" "$1" --post "$3" ;;
-            PATCH) python3 "$CASE/api.py" "$1" --method PATCH --data "$3" ;;
+            POST) python3 "$CASE/api.py" < <(printf '%s\0' "$1" --post "$3") ;;
+            PATCH) python3 "$CASE/api.py" < <(printf '%s\0' "$1" --method PATCH --data "$3") ;;
             *) python3 "$CASE/api.py" "$1" ;;
         esac
     }
@@ -308,8 +312,18 @@ else
 fi
 '''
 
-def setup(label, controls=None, extra_assets=0, long_names=False):
+def setup(label, controls=None, extra_assets=0, long_names=False, large_notes=False):
     c=work/label;shutil.copytree(base,c)
+    case_sha=sha
+    if large_notes:
+        # Create actual Git notes, retaining all original Git objects in this
+        # isolated fixture. Source, manifests and signed plans bind the new SHA.
+        message=c/'commit-message'
+        message.write_text('Reviewed λ change '*9000+'literal "quote" \\ @file $HOME\n')
+        for args in [['tag','v1.2.2'],['commit','-q','--allow-empty','-F',str(message)],
+                     ['tag','-f','-a','v1.2.3','-m','large-note fixture'],['update-index','--refresh']]:
+            subprocess.run(['git','-C',str(c/'repo')]+args,check=True,stdout=subprocess.DEVNULL)
+        case_sha=subprocess.check_output(['git','-C',str(c/'repo'),'rev-parse','HEAD'],text=True).strip()
     for name in ['tmp','config/repos.d','state/artifacts/app-v1.2.3','bytes']:(c/name).mkdir(parents=True)
     (c/'api.py').write_text(api);(c/'requests.jsonl').write_text('');(c/'control.json').write_text(json.dumps(controls or {}))
     extra_names=['companion-%03d-%s.txt'%(i,'x'*220 if long_names else 'data') for i in range(extra_assets)]
@@ -319,7 +333,7 @@ def setup(label, controls=None, extra_assets=0, long_names=False):
     # A real tar archive; this test does not claim a native binary build.
     subprocess.run(['tar','-czf',str(artifacts/'payload.tar.gz'),'-C',str(c/'repo'),'README.md'],check=True)
     payload=(artifacts/'payload.tar.gz').read_bytes()
-    manifest={'tool':'app','version':'v1.2.3','source':{'git_sha':sha,'git_ref':'v1.2.3','dependencies':[]},
+    manifest={'tool':'app','version':'v1.2.3','source':{'git_sha':case_sha,'git_ref':'v1.2.3','dependencies':[]},
               'build_purpose':'release','publishable':True,'requested_targets':['linux/amd64'],
               'status':'success','summary':{'total':1,'success':1,'failed':0},
               'artifacts':[{'name':'payload.tar.gz','target':'linux/amd64','sha256':hashlib.sha256(payload).hexdigest(),'size_bytes':len(payload),'build_purpose':'release','publishable':True}]}
@@ -329,13 +343,13 @@ def setup(label, controls=None, extra_assets=0, long_names=False):
         manifest['artifacts'].append(dict(name=name,target='additional',sha256=hashlib.sha256(data).hexdigest(),
                                          size_bytes=len(data),build_purpose='release',publishable=True))
     (artifacts/'app-v1.2.3-manifest.json').write_text(json.dumps(manifest))
-    original={'id':9,'tag_name':'v1.2.3','name':'v1.2.3','target_commitish':sha,'draft':True,'prerelease':False,'assets':[],
+    original={'id':9,'tag_name':'v1.2.3','name':'v1.2.3','target_commitish':case_sha,'draft':True,'prerelease':False,'assets':[],
               'body':'Release 1.2.3\n\n<!-- dsr-create-nonce:'+'1'*64+' -->',
               'upload_url':'https://uploads.github.com/repos/owner/app/releases/9/assets{?name,label}',
               'html_url':'https://github.com/owner/app/releases/tag/untagged-fixture'}
     (c/'remote.json').write_text(json.dumps(original))
     response=c/'tmp/dsr-api-response.ABCDEF12';response.write_text(json.dumps(original));response.chmod(0o600)
-    env=dict(os.environ,ROOT=str(root),FUNCTIONS=str(functions),CASE=str(c),SOURCE_SHA=sha,
+    env=dict(os.environ,ROOT=str(root),FUNCTIONS=str(functions),CASE=str(c),SOURCE_SHA=case_sha,
              DSR_CONFIG_DIR=str(c/'config'),DSR_STATE_DIR=str(c/'state'),TMPDIR=str(c/'tmp'),DSR_MINISIGN_KEY=str(c/'fixture.key'),NO_COLOR='1')
     r=subprocess.run(['bash','-c',script,'fixture','prepare'],env=env,capture_output=True,text=True)
     (c/'prepare.log').write_text(r.stdout+r.stderr)
@@ -356,6 +370,50 @@ def invoke(c,env,response,dry=False,flags=None):
     requests=[json.loads(l) for l in (c/'requests.jsonl').read_text().splitlines()]
     patches=[q for q in requests if '--method' in q]
     return r,patches
+
+
+def test_large_note_creation_and_finalization():
+    c,env,_,_=setup('large-note-creation',{'absent':True},large_notes=True)
+    r=subprocess.run(['bash','-c',script,'fixture','create','--generate-notes'],
+                     env=env,capture_output=True,text=True,timeout=90)
+    (c/'create.log').write_text(r.stdout+r.stderr)
+    check('large notes strict draft creation succeeds',r.returncode==0)
+    details=json.loads(r.stdout)['details']
+    response=Path(details['create_response']); raw=response.read_bytes(); inode=response.stat().st_ino
+    original=json.loads(raw)
+    commits=subprocess.check_output(['git','-C',str(c/'repo'),'log','--oneline','v1.2.2..v1.2.3'],text=True).rstrip('\n')
+    prefix='## Changes since v1.2.2\n\n'+commits+'\n\n<!-- dsr-create-nonce:'
+    check('large notes use real Git bytes above argument limit',len(prefix.encode())>131072
+          and original['body'].startswith(prefix)
+          and re.fullmatch(r'[0-9a-f]{64} -->',original['body'][len(prefix):]) is not None)
+    check('large notes retain original private empty draft response',original['draft'] is True
+          and original['assets']==[] and original['target_commitish']==env['SOURCE_SHA']
+          and stat.S_IMODE(response.stat().st_mode)==0o600)
+    intent=json.loads((response.parent/'creation-intent.json').read_text())
+    check('large notes bind complete frozen creation intent',intent['plan']['release']['body']==original['body'])
+    env['TMPDIR']=details['finalization_tmpdir']
+    r,patches=invoke(c,env,response,dry=True)
+    check('large notes strict finalization dry run is read only',r.returncode==0 and not patches
+          and json.loads((c/'remote.json').read_text())['draft'] is True)
+    remote=json.loads((c/'remote.json').read_text())
+    remote['body']+='unrelated note drift'
+    (c/'remote.json').write_text(json.dumps(remote))
+    r,patches=invoke(c,env,response)
+    check('large notes changed remote body blocks publication',r.returncode==7 and not patches
+          and response.read_bytes()==raw and response.stat().st_ino==inode)
+    remote['body']=original['body']
+    (c/'remote.json').write_text(json.dumps(remote))
+    r,patches=invoke(c,env,response)
+    check('large notes signed strict finalization publishes once',r.returncode==0 and len(patches)==1
+          and json.loads((c/'remote.json').read_text())['draft'] is False)
+    pending=list((c/'state/releases').glob('app-v1.2.3-finalization-pending.*'))
+    final=list((c/'state/releases').glob('app-v1.2.3-finalized.*'))
+    check('large notes survive both durable finalization receipts',len(pending)==1 and len(final)==1
+          and json.loads(pending[0].read_text())['metadata']['body']==original['body']
+          and json.loads(final[0].read_text())['release']['body']==original['body'])
+    requests=[json.loads(line) for line in (c/'requests.jsonl').read_text().splitlines()]
+    check('large notes retain one creation and original custody',sum('--post' in row for row in requests)==1
+          and response.read_bytes()==raw and response.stat().st_ino==inode)
 
 def prepare_cases(cases):
     # Each case has its own repository, signing key copy, state and transport
@@ -1203,6 +1261,11 @@ def test_custom_artifact_repair():
           len([row for row in rows if row[0]=='checksum-download'])==2 and not mutations(rows))
 
 
+if os.environ.get('DSR_TEST_STRICT_LARGE_NOTES_ONLY')=='1':
+    test_large_note_creation_and_finalization()
+    print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
+    raise SystemExit(0)
+
 if os.environ.get('DSR_TEST_STRICT_REPORTING_ONLY')=='1':
     test_large_release_reporting()
     print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
@@ -1241,6 +1304,7 @@ if os.environ.get('DSR_TEST_STRICT_CREATION_ONLY')!='1':
 
 # Execute the complete producer-to-consumer handoff. The response's name,
 # bytes, permissions and directory come from production creation, not setup().
+test_large_note_creation_and_finalization()
 c,env,_,_=setup('creation-handoff',{'absent':True})
 # Existing release state may be readable by other users; preserve that parent
 # while allocating the irreplaceable POST response in a new private child.
