@@ -7318,13 +7318,23 @@ strict_home="\${physical_source_root%/*}/.cargo-home"
 dsr_seed_home=\$strict_home
 strict_home="\${physical_source_root%/*}/.cargo-home-$suffix"
 dsr_seed_pending=false
+# A retained export attribute would put the growing lockfile selection back
+# into exec's environment, which has the same per-string limit as argv.
+unset dsr_seed_summary dsr_private_summary
 if test -e "\$dsr_seed_home" || test -L "\$dsr_seed_home"; then
     _dsr_cargo_home_guard "\$dsr_seed_home"
     dsr_seed_summary=\$(_cargo_cache_run verify "\$dsr_seed_home" "\$dsr_seed_home/.dsr-cache-seed.json")
     dsr_private_summary=\$(_cargo_cache_run snapshot "\$dsr_seed_home" "\$strict_home" "\$physical_source_root/Cargo.lock")
-    python3 -I - "\$dsr_seed_summary" "\$dsr_private_summary" <<'DSR_PRIVATE_CACHE_COMPARE'
-import json, sys
-seed, private = (json.loads(value) for value in sys.argv[1:])
+    python3 -I - 3<<DSR_PRIVATE_CACHE_SEED_INPUT 4<<DSR_PRIVATE_CACHE_ATTEMPT_INPUT <<'DSR_PRIVATE_CACHE_COMPARE'
+\$dsr_seed_summary
+DSR_PRIVATE_CACHE_SEED_INPUT
+\$dsr_private_summary
+DSR_PRIVATE_CACHE_ATTEMPT_INPUT
+import json, os, sys
+with os.fdopen(3) as stream:
+    seed = json.load(stream)
+with os.fdopen(4) as stream:
+    private = json.load(stream)
 if (seed['mode'] != 'private-copy' or private['mode'] != 'private-copy' or
         seed.get('selection', {}).get('kind') != 'cargo-lock-downloads' or
         seed.get('selection') != private.get('selection') or
@@ -7406,10 +7416,16 @@ _act_prepare_unix_private_cargo_home() {
     metadata_body=$(_act_unix_cargo_metadata_body "$build_cmd" "$build_env") || return $?
     command+=$'\n'"$metadata_body"
     command+=$'\n'"$(cat <<'SH'
-python3 -I - "$dsr_private_summary" "$dsr_dependency_sources" <<'DSR_NATIVE_CARGO_PREPARED'
-import json, sys
-summary = json.loads(sys.argv[1])
-summary['dependency_sources'] = json.loads(sys.argv[2])
+python3 -I - 3<<DSR_NATIVE_CARGO_PRIVATE_INPUT 4<<DSR_NATIVE_CARGO_SOURCES_INPUT <<'DSR_NATIVE_CARGO_PREPARED'
+$dsr_private_summary
+DSR_NATIVE_CARGO_PRIVATE_INPUT
+$dsr_dependency_sources
+DSR_NATIVE_CARGO_SOURCES_INPUT
+import json, os
+with os.fdopen(3) as stream:
+    summary = json.load(stream)
+with os.fdopen(4) as stream:
+    summary['dependency_sources'] = json.load(stream)
 print(json.dumps(summary, sort_keys=True, separators=(',', ':')))
 DSR_NATIVE_CARGO_PREPARED
 SH
@@ -7504,6 +7520,7 @@ if test -n '$source_root'; then
         dsr_lockfile='$source_root/Cargo.lock'
     fi
 fi
+unset dsr_seed_summary
 if test -n "\$dsr_lockfile"; then
     dsr_seed_summary=\$(_cargo_cache_run snapshot "\$ambient_home" '$cargo_home' "\$dsr_lockfile")
 else
@@ -7549,8 +7566,11 @@ _act_finish_private_cargo_home_receipt() {
             printf '%s\n' "$summary" >&2
         fi
         [[ $result_exit -eq 0 ]] || receipt=""
-        jq -nc --argjson command_exit "$command_exit" --argjson receipt "${receipt:-null}" \
-            '{command_exit_code: $command_exit, receipt: $receipt}' || return 4
+        jq -nce --argjson command_exit "$command_exit" --slurpfile receipt /dev/fd/3 '
+            ($receipt | if length == 1 then .[0]
+             else error("exactly one private Cargo final receipt required") end) as $receipt |
+            {command_exit_code: $command_exit, receipt: $receipt}' \
+            3<<< "${receipt:-null}" || return 4
     elif [[ $result_exit -eq 0 ]]; then
         printf '%s\n' "$receipt"
     fi
@@ -13594,8 +13614,11 @@ EOF
         [[ -s "$log_file" ]] && cat "$log_file" >&2
         if [[ $nonstrict_prepare_status -eq 0 ]] && \
            nonstrict_seed_home=$(jq -er '.cargo_home' <<< "$nonstrict_cargo_seed_json") && \
-           cargo_isolation_json=$(jq --argjson seed "$nonstrict_cargo_seed_json" \
-               '.dependency_cache = {mode: "private-copy", seed: $seed}' <<< "$cargo_isolation_json"); then
+           cargo_isolation_json=$(jq --slurpfile seed /dev/fd/3 '
+               ($seed | if length == 1 then .[0]
+                else error("exactly one private Cargo seed receipt required") end) as $seed |
+               .dependency_cache = {mode: "private-copy", seed: $seed}' \
+               3<<< "$nonstrict_cargo_seed_json" <<< "$cargo_isolation_json"); then
             nonstrict_private_cargo_cache=true
         else
             _log_error "Unable to prepare a private Cargo dependency cache on $host; not building $platform" 2>&1 | tee -a "$log_file" >&2
@@ -13746,8 +13769,11 @@ EOF
             if [[ $nonstrict_cargo_finish_status -eq 0 ]]; then
                 if nonstrict_cargo_final_json=$(jq -ce '.receipt | select(type == "object")' \
                         <<< "$nonstrict_cargo_finish_result") && \
-                   verified_cargo_isolation_json=$(jq --argjson final "$nonstrict_cargo_final_json" \
-                        '.dependency_cache.final = $final' <<< "$cargo_isolation_json"); then
+                   verified_cargo_isolation_json=$(jq --slurpfile final /dev/fd/3 '
+                        ($final | if length == 1 then .[0]
+                         else error("exactly one private Cargo final receipt required") end) as $final |
+                        .dependency_cache.final = $final' \
+                        3<<< "$nonstrict_cargo_final_json" <<< "$cargo_isolation_json"); then
                     cargo_isolation_json="$verified_cargo_isolation_json"
                 else
                     exit_code=4
@@ -13793,8 +13819,11 @@ EOF
             if [[ $strict_cargo_finish_status -eq 0 ]]; then
                 if strict_cargo_final_json=$(jq -ce '.receipt | select(type == "object")' \
                         <<< "$strict_cargo_finish_result") && \
-                   verified_cargo_isolation_json=$(jq --argjson final "$strict_cargo_final_json" \
-                        '.dependency_cache.final = $final' <<< "$cargo_isolation_json"); then
+                   verified_cargo_isolation_json=$(jq --slurpfile final /dev/fd/3 '
+                        ($final | if length == 1 then .[0]
+                         else error("exactly one private Cargo final receipt required") end) as $final |
+                        .dependency_cache.final = $final' \
+                        3<<< "$strict_cargo_final_json" <<< "$cargo_isolation_json"); then
                     cargo_isolation_json="$verified_cargo_isolation_json"
                 else
                     exit_code=4
@@ -13862,8 +13891,11 @@ EOF
         elif jq -e '.namespace | test("^[0-9a-f]{64}$")' <<< "$cache_receipt" >/dev/null && \
            jq -e '.final_output_policy == "fresh-run-target-detached-under-custody"' \
                 <<< "$cache_receipt" >/dev/null; then
-            if verified_cargo_isolation_json=$(jq --argjson receipt "$cache_receipt" \
-                    '.intermediate_cache.receipt = $receipt' <<< "$cargo_isolation_json"); then
+            if verified_cargo_isolation_json=$(jq --slurpfile receipt /dev/fd/3 '
+                    ($receipt | if length == 1 then .[0]
+                     else error("exactly one intermediate Cargo cache receipt required") end) as $receipt |
+                    .intermediate_cache.receipt = $receipt' \
+                    3<<< "$cache_receipt" <<< "$cargo_isolation_json"); then
                 cargo_isolation_json="$verified_cargo_isolation_json"
             else
                 exit_code=4
