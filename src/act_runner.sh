@@ -5706,6 +5706,402 @@ _act_strict_source_root_path() {
     printf '%s/%s-%s/source\n' "$strict_root" "$tool_name" "$run_id"
 }
 
+# A cleanup path is not deletion authority. Strict Unix producers issue a
+# private receipt before writing source or caches, then retain its exact inode,
+# bytes, directory identity, and configured transport in the build checkpoint.
+_act_strict_snapshot_route() {
+    local host="$1" transport="ssh" destination="" platform hosts_document
+    [[ "$host" =~ ^[A-Za-z0-9_-]+$ ]] || return 4
+    if [[ -n "${DSR_HOSTS_FILE:-}" ]]; then
+        [[ -f "$DSR_HOSTS_FILE" ]] || return 4
+        hosts_document=$(yq -o=json -I=0 '.' "$DSR_HOSTS_FILE" 2>/dev/null) || return 4
+        jq -es 'length == 1 and (.[0] | type == "object" and (.hosts | type == "object"))' \
+            <<< "$hosts_document" >/dev/null || return 4
+    fi
+    if [[ "$host" == act ]]; then
+        # The synthetic act source route is this coordinator's filesystem,
+        # regardless of the workflow container's requested target platform.
+        # It has never required a hosts.act entry in hosts.yaml.
+        local local_os local_arch
+        case "$(uname -s)" in
+            Linux) local_os=linux ;;
+            Darwin) local_os=darwin ;;
+            FreeBSD) local_os=freebsd ;;
+            *) return 4 ;;
+        esac
+        case "$(uname -m)" in
+            x86_64|amd64) local_arch=amd64 ;;
+            aarch64|arm64) local_arch=arm64 ;;
+            i386|i486|i586|i686) local_arch=386 ;;
+            armv7*) local_arch=armv7 ;;
+            *) return 4 ;;
+        esac
+        platform="$local_os/$local_arch"
+    else
+        platform=$(_act_get_host_platform "$host") || return 4
+    fi
+    [[ "$platform" =~ ^[a-z0-9_]+/[a-z0-9_]+$ && "$platform" != windows/* ]] || return 4
+    if _act_is_local_host "$host"; then
+        transport="local"
+    else
+        destination=$(_act_get_ssh_destination "$host") || return 4
+        [[ -n "$destination" && "$destination" != -* ]] || return 4
+    fi
+    jq -nc --arg transport "$transport" --arg destination "$destination" \
+        --arg platform "$platform" \
+        '{transport:$transport,destination:$destination,platform:$platform}'
+}
+
+# Always stream the program. In particular, neither a large cleanup program nor
+# a serialized receipt becomes an SSH command argument. Inspection cannot open
+# multiplex sockets or add/update known-host records.
+_act_strict_snapshot_exec() {
+    local host="$1" program="$2" route="$3" destination output status=0
+    local wrapped
+    wrapped=$'{\n'"$program"$'\n} </dev/null'
+    if [[ "$(jq -r .transport <<< "$route")" == local ]]; then
+        output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" \
+            bash --noprofile --norc -s <<< "$wrapped") || status=$?
+    else
+        destination=$(jq -er .destination <<< "$route") || return 4
+        output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh -T \
+            -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes -o UpdateHostKeys=no \
+            -o ControlMaster=no -o ControlPath=none \
+            "$destination" 'exec "$SHELL" -s' <<< "$wrapped") || status=$?
+    fi
+    if [[ "$status" -ne 0 ]]; then
+        [[ "$status" -eq 4 ]] && return 4
+        _log_error "Strict snapshot worker execution failed on $host (exit $status)"
+        return 8
+    fi
+    [[ ${#output} -le 32768 ]] || return 4
+    jq -ces 'if length == 1 and (.[0] | type == "object") then .[0]
+        else error("Expected exactly one strict snapshot result") end' <<< "$output" || return 4
+}
+
+_act_strict_snapshot_program() {
+    local request="$1" request_q
+    [[ ${#request} -le 32768 ]] || return 4
+    printf -v request_q '%q' "$request"
+    printf "python3 -I - %s <<'DSR_STRICT_SNAPSHOT_PY'\n" "$request_q"
+    cat <<'DSR_STRICT_SNAPSHOT_PY'
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import uuid
+
+OWNER = '.dsr-snapshot-owner.json'
+PROTECT = '.sbh-protect'
+PROTECTION = b'DSR strict release snapshot\n'
+LIMIT = 16384
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+BODY_KEYS = {'schema_version', 'kind', 'tool', 'run_id', 'git_sha', 'host',
+             'source_root', 'path', 'physical_path', 'nonce', 'uid', 'device',
+             'inode', 'route', 'protection_sha256', 'protection_identity'}
+PIN_KEYS = BODY_KEYS | {'receipt_sha256', 'receipt_identity'}
+
+
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        require(key not in result, 'duplicate JSON field')
+        result[key] = value
+    return result
+
+
+def parse(raw):
+    return json.loads(raw, object_pairs_hook=unique_object)
+
+
+def identity(info):
+    return ':'.join(str(value) for value in
+                    (info.st_dev, info.st_ino, info.st_mode, info.st_nlink,
+                     info.st_uid, info.st_gid, info.st_size,
+                     info.st_mtime_ns, info.st_ctime_ns))
+
+
+def directory_identity(info):
+    return (info.st_dev, info.st_ino, info.st_uid, stat.S_IMODE(info.st_mode))
+
+
+def plain_path(path):
+    return (isinstance(path, str) and path.startswith('/') and
+            re.fullmatch(r'[A-Za-z0-9_./:+-]+', path) is not None and
+            '..' not in path and os.path.normpath(path) == path and path != '/')
+
+
+def ancestor(info):
+    require(stat.S_ISDIR(info.st_mode), 'snapshot ancestor is not a directory')
+    require(info.st_uid in (0, os.geteuid()), 'snapshot ancestor has another owner')
+    require(not (info.st_mode & 0o022) or bool(info.st_mode & stat.S_ISVTX),
+            'snapshot ancestor permits untrusted replacement')
+
+
+def open_chain(path, create=False):
+    require(path == '/' or plain_path(path), 'invalid physical snapshot ancestor')
+    current = os.open('/', DIR_FLAGS)
+    try:
+        ancestor(os.fstat(current))
+        for component in path.split('/'):
+            if not component:
+                continue
+            try:
+                child = os.open(component, DIR_FLAGS, dir_fd=current)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(component, 0o700, dir_fd=current)
+                except FileExistsError:
+                    pass
+                child = os.open(component, DIR_FLAGS, dir_fd=current)
+            try:
+                ancestor(os.fstat(child))
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(current)
+            current = child
+        return current
+    except BaseException:
+        os.close(current)
+        raise
+
+
+def read_marker(parent, name, expected_hash=None, expected_identity=None):
+    before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    require(stat.S_ISREG(before.st_mode) and before.st_uid == os.geteuid() and
+            before.st_nlink == 1 and stat.S_IMODE(before.st_mode) == 0o600 and
+            0 < before.st_size <= LIMIT, 'invalid private snapshot marker')
+    descriptor = os.open(name, FILE_FLAGS, dir_fd=parent)
+    try:
+        require(identity(os.fstat(descriptor)) == identity(before),
+                'snapshot marker changed while opening')
+        with os.fdopen(descriptor, 'rb', closefd=False) as stream:
+            raw = stream.read(LIMIT + 1)
+        after = os.fstat(descriptor)
+        named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        require(len(raw) == before.st_size and identity(before) == identity(after) ==
+                identity(named), 'snapshot marker changed while reading')
+    finally:
+        os.close(descriptor)
+    digest = hashlib.sha256(raw).hexdigest()
+    marker_identity = identity(before)
+    require(expected_hash is None or digest == expected_hash,
+            'snapshot marker bytes do not match the retained receipt')
+    require(expected_identity is None or marker_identity == expected_identity,
+            'snapshot marker identity does not match the retained receipt')
+    return raw, digest, marker_identity
+
+
+def write_marker(parent, name, raw):
+    descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                         0o600, dir_fd=parent)
+    try:
+        with os.fdopen(descriptor, 'wb', closefd=False) as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.fsync(parent)
+
+
+def request_identity(value):
+    require(isinstance(value, dict), 'invalid snapshot identity')
+    tool, run = value.get('tool'), value.get('run_id')
+    require(isinstance(tool, str) and
+            re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]{0,127}', tool) is not None and
+            '..' not in tool, 'invalid snapshot tool')
+    require(isinstance(run, str) and
+            re.fullmatch(r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}', run)
+            is not None, 'invalid snapshot run UUID')
+    sha = value.get('git_sha')
+    require(isinstance(sha, str) and re.fullmatch(r'[0-9a-f]{40}', sha) is not None and
+            sha != '0' * 40, 'invalid snapshot source commit')
+    require(isinstance(value.get('host'), str) and
+            re.fullmatch(r'[A-Za-z0-9_-]+', value['host']) is not None,
+            'invalid snapshot host')
+    source = value.get('source_root')
+    require(plain_path(source) and source.endswith('/source'),
+            'invalid snapshot source root')
+    path = os.path.dirname(source)
+    require(os.path.basename(path) == tool + '-' + run,
+            'snapshot directory does not name the requested tool and run')
+    route = value.get('route')
+    require(isinstance(route, dict) and set(route) ==
+            {'transport', 'destination', 'platform'}, 'invalid snapshot route')
+    transport, destination, platform = (route.get('transport'),
+                                       route.get('destination'), route.get('platform'))
+    require((transport == 'local' and destination == '') or
+            (transport == 'ssh' and isinstance(destination, str) and
+             re.fullmatch(r'[A-Za-z0-9_.:@%+-]+', destination) is not None and
+             not destination.startswith('-')), 'invalid snapshot transport')
+    require(isinstance(platform, str) and
+            re.fullmatch(r'[a-z0-9_]+/[a-z0-9_]+', platform) is not None and
+            not platform.startswith('windows/'), 'invalid Unix snapshot platform')
+    return path
+
+
+def validate_body(body):
+    require(isinstance(body, dict) and set(body) == BODY_KEYS,
+            'invalid snapshot ownership receipt fields')
+    path = request_identity(body)
+    require(type(body['schema_version']) is int and body['schema_version'] == 1 and
+            body['kind'] == 'dsr-strict-snapshot-owner' and body['path'] == path and
+            plain_path(body['physical_path']), 'invalid snapshot ownership receipt')
+    require(isinstance(body['nonce'], str) and str(uuid.UUID(body['nonce'])) ==
+            body['nonce'], 'invalid snapshot ownership nonce')
+    require(type(body['uid']) is int and body['uid'] == os.geteuid(),
+            'snapshot receipt belongs to another user')
+    for key in ('device', 'inode'):
+        require(isinstance(body[key], str) and
+                re.fullmatch(r'[0-9]+', body[key]) is not None,
+                'invalid snapshot directory identity')
+    require(int(body['inode']) > 0, 'invalid snapshot directory inode')
+    require(body['protection_sha256'] == hashlib.sha256(PROTECTION).hexdigest() and
+            isinstance(body['protection_identity'], str) and
+            re.fullmatch(r'[0-9]+(?::[0-9]+){8}', body['protection_identity']) is not None,
+            'invalid snapshot protection marker pin')
+
+
+def held_root(parent, name, body):
+    descriptor = os.open(name, DIR_FLAGS, dir_fd=parent)
+    try:
+        info = os.fstat(descriptor)
+        named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        logical = os.stat(body['path'], follow_symlinks=False)
+        require(stat.S_ISDIR(logical.st_mode) and info.st_uid == os.geteuid() and
+                stat.S_IMODE(info.st_mode) == 0o700 and
+                str(info.st_dev) == body['device'] and str(info.st_ino) == body['inode'] and
+                directory_identity(info) == directory_identity(named) ==
+                directory_identity(logical), 'snapshot directory was replaced or exposed')
+        require(os.path.realpath(body['path']) == body['physical_path'],
+                'snapshot logical path now resolves elsewhere')
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def refuse_ram_backed(path):
+    # Preserve the Unix producer's existing disk requirement. Darwin does not
+    # provide these GNU probes; its normal host/path admission remains in force.
+    for command in (['findmnt', '-no', 'FSTYPE', '-T', path],
+                    ['stat', '-f', '-c', '%T', path]):
+        try:
+            result = subprocess.run(command, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, check=False)
+        except FileNotFoundError:
+            continue
+        if result.returncode == 0:
+            filesystem = result.stdout.decode('ascii', errors='replace').splitlines()
+            require(not filesystem or filesystem[0] not in ('tmpfs', 'ramfs'),
+                    'refusing a RAM-backed strict snapshot; configure host build_root')
+            return
+
+
+def observe(request):
+    path = request_identity(request)
+    creating = request['operation'] == 'create'
+    if creating:
+        require(not os.path.lexists(path), 'strict snapshot directory already exists')
+    physical = os.path.realpath(path)
+    require(plain_path(physical), 'invalid resolved snapshot directory')
+    parent = open_chain(os.path.dirname(physical), create=creating)
+    root = None
+    try:
+        name = os.path.basename(physical)
+        if creating:
+            refuse_ram_backed(os.path.dirname(physical))
+            os.mkdir(name, 0o700, dir_fd=parent)
+            os.fsync(parent)
+        root = os.open(name, DIR_FLAGS, dir_fd=parent)
+        info = os.fstat(root)
+        if creating:
+            require(info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o700
+                    and not os.listdir(root), 'new snapshot directory is not private and empty')
+            write_marker(root, PROTECT, PROTECTION)
+            _, protection_sha, protection_identity = read_marker(root, PROTECT)
+            body = {key: request[key] for key in
+                    ('tool', 'run_id', 'git_sha', 'host', 'source_root', 'route')}
+            body.update(schema_version=1, kind='dsr-strict-snapshot-owner',
+                        path=path, physical_path=physical, nonce=str(uuid.uuid4()),
+                        uid=os.geteuid(), device=str(info.st_dev), inode=str(info.st_ino),
+                        protection_sha256=protection_sha,
+                        protection_identity=protection_identity)
+            raw = (json.dumps(body, sort_keys=True, separators=(',', ':')) + '\n').encode()
+            write_marker(root, OWNER, raw)
+        raw, receipt_sha, receipt_identity = read_marker(root, OWNER)
+        body = parse(raw)
+        validate_body(body)
+        require(all(body[key] == request[key] for key in
+                    ('tool', 'run_id', 'git_sha', 'host', 'source_root', 'route')),
+                'snapshot receipt belongs to another source or route')
+        held = held_root(parent, name, body)
+        try:
+            require(directory_identity(os.fstat(held)) == directory_identity(os.fstat(root)),
+                    'snapshot directory changed while reading its receipt')
+        finally:
+            os.close(held)
+        protection, _, _ = read_marker(root, PROTECT, body['protection_sha256'],
+                                       body['protection_identity'])
+        require(protection == PROTECTION, 'invalid snapshot protection contents')
+        return dict(body, receipt_sha256=receipt_sha, receipt_identity=receipt_identity)
+    finally:
+        if root is not None:
+            os.close(root)
+        os.close(parent)
+
+
+try:
+    os.umask(0o077)
+    request = parse(sys.argv[1])
+    require(request.get('operation') in ('create', 'observe'),
+            'invalid snapshot ownership operation')
+    result = observe(request)
+    print(json.dumps(result, sort_keys=True, separators=(',', ':')))
+except (OSError, ValueError, TypeError, KeyError, RuntimeError) as error:
+    print('[dsr] strict snapshot custody: ' + str(error), file=sys.stderr)
+    sys.exit(4)
+DSR_STRICT_SNAPSHOT_PY
+    printf '%s\n' DSR_STRICT_SNAPSHOT_PY
+}
+
+_act_strict_snapshot_owner_request() {
+    local operation="$1" host="$2" source_root="$3" tool="$4" run="$5" sha="$6"
+    local route request program
+    route=$(_act_strict_snapshot_route "$host") || return 4
+    request=$(jq -nc --arg operation "$operation" --arg host "$host" \
+        --arg source_root "$source_root" --arg tool "$tool" --arg run "$run" \
+        --arg sha "$sha" --argjson route "$route" \
+        '{operation:$operation,host:$host,source_root:$source_root,tool:$tool,
+          run_id:$run,git_sha:$sha,route:$route}') || return 4
+    program=$(_act_strict_snapshot_program "$request") || return 4
+    _act_strict_snapshot_exec "$host" "$program" "$route"
+}
+
+# The producer creates a previously absent parent. Observing a directory never
+# retrofits authority onto a legacy snapshot or a manually created cache.
+_act_create_strict_snapshot_owner() {
+    _act_strict_snapshot_owner_request create "$@"
+}
+
+_act_strict_snapshot_owner() {
+    _act_strict_snapshot_owner_request observe "$@"
+}
+
 # Describe Unix write locations as data, never by evaluating recipe text in a
 # coordinator shell. The final launcher applies the last environment assignment.
 # Relative settings belong to the build's actual working directory, not to the
@@ -7369,6 +7765,19 @@ _act_sync_strict_checkout() {
     local remote_path="$4"
     local archive_name="$5"
     local label="$6"
+    local snapshot_owner_pin="${7:-}" observed_owner owner_run_id
+
+    if [[ -n "$snapshot_owner_pin" ]]; then
+        [[ "$archive_name" == source.tar ]] || return 4
+        owner_run_id=$(jq -er '.run_id | strings' <<< "$snapshot_owner_pin") || return 4
+        observed_owner=$(_act_strict_snapshot_owner "$host" "$remote_path" \
+            "$label" "$owner_run_id" "$revision") || return 4
+        if ! jq -es 'length == 2 and .[0] == .[1]' \
+            <<< "$snapshot_owner_pin"$'\n'"$observed_owner" >/dev/null; then
+            _log_error "Strict snapshot ownership changed before source population"
+            return 4
+        fi
+    fi
 
     if ! _act_validate_strict_checkout_at_revision "$local_path" "$revision" "$label" || \
        ! _act_validate_no_absolute_cargo_paths "$local_path" || \
@@ -7414,7 +7823,7 @@ _act_sync_strict_checkout() {
     local remote_manifest="$snapshot_parent/.${archive_name%.tar}.manifest"
     local remote_digest=""
     if _act_is_local_host "$host"; then
-        if $creates_snapshot_parent; then
+        if $creates_snapshot_parent && [[ -z "$snapshot_owner_pin" ]]; then
             if [[ -e "$snapshot_parent" || -L "$snapshot_parent" ]] || \
                ! mkdir -p "$snapshot_grandparent"; then
                 _log_error "Strict release snapshot parent already exists for $label"
@@ -7506,7 +7915,7 @@ _act_sync_strict_checkout() {
         fi
     else
         local remote_cmd parent_setup
-        if $creates_snapshot_parent; then
+        if $creates_snapshot_parent && [[ -z "$snapshot_owner_pin" ]]; then
             parent_setup="mkdir -p '$snapshot_grandparent'; $(_act_ram_backed_guard_sh "$snapshot_grandparent")test ! -e '$snapshot_parent'; test ! -L '$snapshot_parent'; mkdir '$snapshot_parent'; printf '%s\\n' 'DSR strict release snapshot' > '$snapshot_parent/.sbh-protect'"
         else
             parent_setup="test -d '$snapshot_parent'; test ! -L '$snapshot_parent'"
@@ -8584,6 +8993,7 @@ act_sync_sources() {
     local failed=0
     local results=()
     local source_root_entries=()
+    local snapshot_owners_json='{}'
     local start_time
     start_time=$(date +%s)
 
@@ -8613,10 +9023,20 @@ act_sync_sources() {
         # bare "failed" status. The transcript is re-emitted on stderr either
         # way so progress detail is never lost.
         local source_synced=false
-        local host_sync_output=""
+        local host_sync_output="" snapshot_owner_pin="" snapshot_owner_ready=true
         if $strict_release; then
-            if host_sync_output=$(_act_sync_strict_checkout "$host" "$local_path" "$strict_git_sha" \
-                "$remote_path" "source.tar" "$tool_name" 2>&1); then
+            if ! _act_is_windows_host "$host"; then
+                # Retain the issuance pin before any source or cache write.
+                # A later observation cannot adopt a replaced owner marker.
+                if ! snapshot_owner_pin=$(_act_create_strict_snapshot_owner "$host" \
+                    "$remote_path" "$tool_name" "$strict_run_id" "$strict_git_sha"); then
+                    host_sync_output="Cannot issue private strict snapshot ownership for $host"
+                    snapshot_owner_ready=false
+                fi
+            fi
+            if $snapshot_owner_ready && \
+               host_sync_output=$(_act_sync_strict_checkout "$host" "$local_path" "$strict_git_sha" \
+                    "$remote_path" "source.tar" "$tool_name" "$snapshot_owner_pin" 2>&1); then
                 source_synced=true
             fi
         elif $stage_ordinary; then
@@ -8715,6 +9135,22 @@ act_sync_sources() {
                 fi
             fi
 
+            if $sync_ok && [[ -n "$snapshot_owner_pin" ]]; then
+                local observed_snapshot_owner
+                if observed_snapshot_owner=$(_act_strict_snapshot_owner "$host" "$remote_path" \
+                    "$tool_name" "$strict_run_id" "$strict_git_sha") && \
+                   jq -es 'length == 2 and .[0] == .[1]' \
+                        <<< "$snapshot_owner_pin"$'\n'"$observed_snapshot_owner" >/dev/null; then
+                    snapshot_owners_json=$(jq -c --arg host "$host" --slurpfile pin /dev/fd/3 \
+                        'if ($pin | length) == 1 then .[$host]=$pin[0]
+                         else error("Expected exactly one issued snapshot pin") end' \
+                        3<<< "$snapshot_owner_pin" <<< "$snapshot_owners_json") || return 4
+                else
+                    host_sync_output="Strict snapshot ownership changed during source population"
+                    _log_error "$host_sync_output"
+                    sync_ok=false
+                fi
+            fi
             if $sync_ok; then
                 synced=$((synced + 1))
                 local success_result
@@ -8790,11 +9226,14 @@ act_sync_sources() {
         --argjson failed "$failed" \
         --argjson duration "$total_duration" \
         --slurpfile contexts /dev/fd/3 \
+        --slurpfile owners /dev/fd/4 \
         --argjson source_roots "$source_roots_json" \
         --argjson target_hosts "$target_hosts_json" \
         --argjson staged_ordinary "$stage_ordinary" \
         --argjson identity "$isolated_identity" \
         '($contexts | if length == 4 then . else error("exactly four source-sync documents required") end) as $contexts |
+        ($owners | if length == 1 and (.[0] | type == "object") then .[0]
+         else error("Expected exactly one snapshot ownership map") end) as $owners |
         $contexts[0] as $hosts | $contexts[1] as $git_context |
         $contexts[2] as $sibling_git_contexts | $contexts[3] as $submodule_git_contexts |
         {
@@ -8805,13 +9244,15 @@ act_sync_sources() {
             hosts: $hosts,
             source_roots: $source_roots,
             target_hosts: $target_hosts
-        } + (if $staged_ordinary then {staged_ordinary:true,git_context:$git_context,
+        } + (if ($owners | length) > 0 then {snapshot_owners:$owners} else {} end) +
+            (if $staged_ordinary then {staged_ordinary:true,git_context:$git_context,
             sibling_git_contexts:$sibling_git_contexts} else {} end) +
             (if ($submodule_git_contexts | length) > 0 then {submodule_git_contexts:$submodule_git_contexts} else {} end) |
             if $identity == null then . else
                 .source_materialization=$identity |
                 .hosts |= map(if .status == "success" then . + {source_materialization:$identity} else . end)
-            end' 3<<< "$results_json"$'\n'"$primary_git_context"$'\n'"$sibling_git_contexts"$'\n'"$submodule_git_contexts" || return 4
+            end' 3<<< "$results_json"$'\n'"$primary_git_context"$'\n'"$sibling_git_contexts"$'\n'"$submodule_git_contexts" \
+            4<<< "$snapshot_owners_json" || return 4
 
     if [[ $failed -gt 0 ]]; then
         return 1
@@ -15243,6 +15684,7 @@ act_orchestrate_build() {
     local supplied_git_sha="" supplied_git_ref=""
     local supplied_repo_config_sha256=""
     local supplied_run_id="" source_roots_json="{}"
+    local snapshot_owners_json='{}' snapshot_owners_supplied=false
     local target_hosts_json='{}' effective_task_hosts_json='{}'
     local source_sync_json="" source_sync_supplied=false no_source_sync_gate=false
     local parallel_jobs=1 resume_run=false supplied_output_dir=""
@@ -15280,6 +15722,14 @@ act_orchestrate_build() {
             --source-roots-json)
                 [[ $# -ge 2 ]] || { _log_error "--source-roots-json requires a value"; return 4; }
                 source_roots_json="$2"
+                shift 2
+                ;;
+            --snapshot-owners-json)
+                [[ $# -ge 2 && "$snapshot_owners_supplied" == false ]] || {
+                    _log_error "--snapshot-owners-json requires one ownership map"; return 4;
+                }
+                snapshot_owners_json="$2"
+                snapshot_owners_supplied=true
                 shift 2
                 ;;
             --target-hosts-json)
@@ -15339,6 +15789,11 @@ act_orchestrate_build() {
         esac
     done
 
+    if ! jq -es 'length == 1 and (.[0] | type == "object")' \
+        <<< "$snapshot_owners_json" >/dev/null; then
+        _log_error "Snapshot ownership requires exactly one JSON map"
+        return 4
+    fi
     if [[ ! "$parallel_jobs" =~ ^[1-9][0-9]*$ ]] || \
        [[ "$parallel_jobs" -gt 32 ]]; then
         _log_error "Parallel job count must be an integer from 1 through 32"
@@ -15637,6 +16092,21 @@ act_orchestrate_build() {
                 _act_release_orchestration_lock
                 return 4
             fi
+            local retained_snapshot_owners
+            if ! retained_snapshot_owners=$(jq -ce '
+                .tool as $tool | .run_id as $run | .git_sha as $sha |
+                (if (.context | has("snapshot_owners")) then .context.snapshot_owners else {} end) |
+                if type == "object" and all(to_entries[];
+                    .key as $host | .value | type == "object" and
+                    .host == $host and .tool == $tool and .run_id == $run and .git_sha == $sha)
+                then . else error("Invalid retained snapshot ownership map") end' <<< "$resume_state") ||
+               { $snapshot_owners_supplied && ! jq -es 'length == 2 and .[0] == .[1]' \
+                    <<< "$snapshot_owners_json"$'\n'"$retained_snapshot_owners" >/dev/null; }; then
+                _log_error "Resume snapshot ownership differs from the retained checkpoint"
+                _act_release_orchestration_lock
+                return 4
+            fi
+            snapshot_owners_json="$retained_snapshot_owners"
             # Authenticate the complete relocation chain before deriving a
             # route or touching a source/cache on any worker. The CLI's
             # earlier read is only an observation; this checkpoint is locked.
@@ -15830,7 +16300,7 @@ act_orchestrate_build() {
                 ! build_state_set_context "$tool_name" "$version" "$run_id" \
                     "$git_sha" "$git_ref" "$source_roots_json" "$supplied_output_dir" "$parallel_jobs" \
                     "$target_hosts_json" "$build_purpose" "$build_tasks_json" "$native_matrix_config_sha256" \
-                    "${source_sync_json:-null}" "$repo_config_sha256"; then
+                    "${source_sync_json:-null}" "$repo_config_sha256" "$snapshot_owners_json"; then
                 _log_error "Build state could not retain the run context"
                 _act_release_orchestration_lock
                 return 4

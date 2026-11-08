@@ -3615,6 +3615,8 @@ EOF
         fi
         if $build_release_contract_enabled; then
             build_target_hosts_json=$(jq -ce '.target_hosts | objects' <<< "$sync_json") || return 4
+            local build_snapshot_owners_json
+            build_snapshot_owners_json=$(jq -ce '.snapshot_owners // {} | objects' <<< "$sync_json") || return 4
             if ! build_source_roots_json=$(jq -ce '
                 .source_roots |
                 if type == "object" and all(.[]; type == "string" and length > 0)
@@ -3631,6 +3633,7 @@ EOF
                 --run-id "$build_run_id"
                 --source-roots-json "$build_source_roots_json"
                 --target-hosts-json "$build_target_hosts_json"
+                --snapshot-owners-json "$build_snapshot_owners_json"
             )
         fi
 

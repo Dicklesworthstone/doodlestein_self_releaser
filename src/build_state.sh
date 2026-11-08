@@ -781,7 +781,7 @@ build_state_update_target() {
 # Bind a run to the inputs required for an honest resume.
 # Args: tool version run_id git_sha git_ref source_roots_json output_dir
 #       parallel_jobs target_hosts_json build_purpose build_tasks_json matrix_config_sha256
-#       source_sync_json repo_config_sha256
+#       source_sync_json repo_config_sha256 snapshot_owners_json
 build_state_set_context() {
   local tool="$1"
   local version="$2"
@@ -799,6 +799,8 @@ build_state_set_context() {
   local build_tasks_json="${11:-}" native_matrix_config_sha256="${12:-}"
   local source_sync_json="${13:-null}"
   local repo_config_sha256="${14:-}"
+  local snapshot_owners_json="${15:-}"
+  [[ -n "$snapshot_owners_json" ]] || snapshot_owners_json='{}'
   if [[ ! "$repo_config_sha256" =~ ^[0-9a-f]{64}$ ]]; then
     log_error "Build context requires the captured repository configuration digest"
     return 1
@@ -839,6 +841,17 @@ build_state_set_context() {
   jq -e 'type == "object"' <<< "$target_hosts_json" &>/dev/null || return 1
   jq -es 'length == 1 and (.[0] == null or (.[0] | type == "object"))' \
     <<< "$source_sync_json" &>/dev/null || return 1
+  if ! jq -es --arg tool "$tool" --arg run "$run_id" --arg sha "$git_sha" \
+      --slurpfile roots /dev/fd/3 '
+      length == 1 and (.[0] | type == "object" and all(to_entries[];
+        (.key | test("^[A-Za-z0-9_-]+$")) and
+        (.value | type == "object") and
+        .value.tool == $tool and .value.run_id == $run and .value.git_sha == $sha and
+        .value.host == .key and .value.source_root == $roots[0][.key]))
+    ' 3<<< "$source_roots_json" <<< "$snapshot_owners_json" >/dev/null; then
+    log_error "Invalid strict snapshot ownership for run $run_id"
+    return 1
+  fi
   [[ "$parallel_jobs" =~ ^[1-9][0-9]*$ ]] || return 1
   now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
@@ -846,7 +859,7 @@ build_state_set_context() {
     --arg sha "$git_sha" --arg ref "$git_ref" \
     --argjson source_roots "$source_roots_json" \
     --argjson target_hosts "$target_hosts_json" \
-    --slurpfile source_sync /dev/stdin \
+    --slurpfile source_sync /dev/fd/3 --slurpfile snapshot_owners /dev/fd/4 \
     --arg build_purpose "$build_purpose" \
     --argjson build_tasks "$build_tasks_json" \
     --arg native_matrix_config_sha256 "$native_matrix_config_sha256" \
@@ -854,6 +867,7 @@ build_state_set_context() {
     --arg output_dir "$output_dir" --argjson parallel_jobs "$parallel_jobs" \
     --arg now "$now" '
       ($source_sync | select(length == 1) | .[0]) as $source_sync |
+      ($snapshot_owners | select(length == 1) | .[0]) as $snapshot_owners |
       .git_sha = $sha |
       .git_ref = $ref |
       .context = {
@@ -868,11 +882,12 @@ build_state_set_context() {
         output_dir: $output_dir,
         parallel_jobs: $parallel_jobs
       } |
+      if ($snapshot_owners | length) > 0 then .context.snapshot_owners = $snapshot_owners else . end |
       .target_statuses = (reduce $build_tasks[] as $task ({};
         .[$task.key] = {status: "pending", attempts: 0})) |
       .source_sync_history = (if $source_sync == null then []
         else [{recorded_at: $now, receipt: $source_sync}] end) |
-      .updated_at = $now' <<< "$source_sync_json"
+      .updated_at = $now' 3<<< "$source_sync_json" 4<<< "$snapshot_owners_json"
 }
 
 # Refresh an ordinary run's sync admission evidence without changing completed
