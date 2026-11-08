@@ -41,6 +41,7 @@ setup_test_env() {
     TEST_TMPDIR=$(mktemp -d)
     export DSR_CONFIG_DIR="$TEST_TMPDIR/config"
     export DSR_REPOS_FILE="$DSR_CONFIG_DIR/repos.yaml"
+    export DSR_QUALITY_LOG_DIR="$TEST_TMPDIR/quality-logs"
     mkdir -p "$DSR_CONFIG_DIR"
 }
 
@@ -1006,6 +1007,155 @@ test_run_checks_checks_array_content() {
     teardown_test_env
 }
 
+test_run_checks_multiline_programs() {
+    ((TESTS_RUN++))
+    setup_test_env
+    cat > "$DSR_REPOS_FILE" <<'YAML'
+tools:
+  test-tool:
+    required_checks:
+      - |
+        value=$(cat <<'PAYLOAD'
+        first
+        second
+        PAYLOAD
+        )
+        if [[ "$value" == $'first\nsecond' ]]; then
+          printf 'complete-program\n'
+        else
+          exit 9
+        fi
+    checks:
+      - "printf 'ordinary-check\n'"
+YAML
+    local rc=0 required_rc=0 plan_rc=0
+    qg_run_checks test-tool > "$TEST_TMPDIR/result.json" 2> "$TEST_TMPDIR/result.err" || rc=$?
+    qg_run_checks test-tool --skip-checks > "$TEST_TMPDIR/required.json" 2> "$TEST_TMPDIR/required.err" || required_rc=$?
+    qg_run_checks test-tool --dry-run > "$TEST_TMPDIR/planned.json" 2> "$TEST_TMPDIR/planned.err" || plan_rc=$?
+    qg_get_checks test-tool > "$TEST_TMPDIR/commands.json"
+    if [[ "$rc" == 0 && "$required_rc" == 0 && "$plan_rc" == 2 ]] &&
+        jq -e --slurpfile commands "$TEST_TMPDIR/commands.json" '
+            .status == "passed" and .total == 2 and .executed == 2 and
+            [.checks[].command] == $commands[0] and
+            (.checks[0].output_preview | contains("complete-program")) and
+            (.checks[1].output_preview | contains("ordinary-check"))
+        ' "$TEST_TMPDIR/result.json" >/dev/null &&
+        jq -e '.status == "passed" and .total == 1 and .executed == 1' "$TEST_TMPDIR/required.json" >/dev/null &&
+        jq -e --slurpfile commands "$TEST_TMPDIR/commands.json" '
+            .status == "planned" and .executed == 0 and .planned == 2 and
+            [.checks[].command] == $commands[0]
+        ' "$TEST_TMPDIR/planned.json" >/dev/null; then
+        pass "multiline YAML checks execute as exact programs, including required and dry-run selections"
+    else
+        fail "multiline checks were split or changed: actual=$rc required=$required_rc planned=$plan_rc"
+    fi
+    teardown_test_env
+}
+
+test_run_checks_multiline_failure() {
+    ((TESTS_RUN++))
+    setup_test_env
+    cat > "$DSR_REPOS_FILE" <<'YAML'
+tools:
+  test-tool:
+    checks:
+      - |
+        exit 23
+        printf 'must-not-run' > escaped-check
+      - "printf 'later-check'"
+YAML
+    local rc=0
+    qg_run_checks test-tool --work-dir "$TEST_TMPDIR" > "$TEST_TMPDIR/result.json" 2> "$TEST_TMPDIR/result.err" || rc=$?
+    if [[ "$rc" == 1 && ! -e "$TEST_TMPDIR/escaped-check" ]] &&
+        jq -e '.status == "failed" and .total == 2 and .executed == 2 and
+            .failed == 1 and .passed == 1 and .checks[0].exit_code == 23 and
+            (.checks[1].output_preview | contains("later-check"))' "$TEST_TMPDIR/result.json" >/dev/null; then
+        pass "a failed multiline program cannot execute its remaining lines as separate checks"
+    else
+        fail "multiline failure lost its program boundary or exit code: $rc"
+    fi
+    teardown_test_env
+}
+
+test_run_checks_rejects_nul_program() {
+    ((TESTS_RUN++))
+    setup_test_env
+    cat > "$DSR_REPOS_FILE" <<'YAML'
+tools:
+  test-tool:
+    required_checks:
+      - "true\0false"
+YAML
+    local rc=0 skip_rc=0
+    qg_run_checks test-tool > "$TEST_TMPDIR/result.json" 2> "$TEST_TMPDIR/result.err" || rc=$?
+    qg_run_checks test-tool --skip-checks > "$TEST_TMPDIR/required.json" 2> "$TEST_TMPDIR/required.err" || skip_rc=$?
+    if [[ "$rc" == 4 && "$skip_rc" == 4 && ! -d "$DSR_QUALITY_LOG_DIR" ]]; then
+        pass "NUL-containing shell programs are refused before any check executes"
+    else
+        fail "NUL-containing inventory was accepted: actual=$rc required=$skip_rc"
+    fi
+    teardown_test_env
+}
+
+test_run_checks_large_program_receipts() {
+    ((TESTS_RUN++))
+    setup_test_env
+    # A real configured program exceeds Linux's per-argument limit. Its
+    # comment is inert; the executed printf still has an observable result.
+    {
+        printf 'tools:\n  test-tool:\n    checks:\n      - |\n        #'
+        head -c 150000 /dev/zero | tr '\0' x
+        printf '\n        printf large-program-completed\n'
+    } > "$DSR_REPOS_FILE"
+    local rc=0 plan_rc=0 receipt
+    qg_run_checks test-tool > "$TEST_TMPDIR/result.json" 2> "$TEST_TMPDIR/result.err" || rc=$?
+    qg_run_checks test-tool --dry-run > "$TEST_TMPDIR/planned.json" 2> "$TEST_TMPDIR/planned.err" || plan_rc=$?
+    qg_get_checks test-tool > "$TEST_TMPDIR/commands.json"
+    receipt=$(jq -r '.run_dir + "/receipt.json"' "$TEST_TMPDIR/result.json")
+    if [[ "$rc" == 0 && "$plan_rc" == 2 ]] &&
+        jq -e --slurpfile commands "$TEST_TMPDIR/commands.json" '
+            .status == "passed" and .total == 1 and .executed == 1 and
+            [.checks[].command] == $commands[0] and
+            (.checks[0].output_preview | contains("large-program-completed"))
+        ' "$TEST_TMPDIR/result.json" >/dev/null &&
+        jq -e --slurpfile commands "$TEST_TMPDIR/commands.json" '
+            .status == "planned" and .executed == 0 and [.checks[].command] == $commands[0]
+        ' "$TEST_TMPDIR/planned.json" >/dev/null &&
+        cmp -s "$TEST_TMPDIR/result.json" "$receipt" &&
+        bash "$PROJECT_ROOT/scripts/verify_quality_receipt.sh" "$receipt" > "$TEST_TMPDIR/verified.log" 2>&1; then
+        pass "large check programs and aggregate receipts survive execution, planning and independent verification"
+    else
+        fail "large program or retained receipt failed: actual=$rc planned=$plan_rc"
+    fi
+    teardown_test_env
+}
+
+test_run_checks_retains_distinct_receipts() {
+    ((TESTS_RUN++))
+    setup_test_env
+    create_repos_yaml 'tools: {test-tool: {checks: ["true"]}}'
+    local first second rc=0
+    # Keep the timestamp identical to exercise sequential calls in one shell,
+    # as well as subshell workers that inherit the same Bash $$ value.
+    (
+        date() {
+            if [[ "${1:-}" == +%Y%m%dT%H%M%S ]]; then printf '20261108T000000\n'; else command date "$@"; fi
+        }
+        qg_run_checks test-tool > "$TEST_TMPDIR/first.json" 2> "$TEST_TMPDIR/first.err" || exit 1
+        qg_run_checks test-tool > "$TEST_TMPDIR/second.json" 2> "$TEST_TMPDIR/second.err"
+    ) || rc=$?
+    first=$(jq -r .run_dir "$TEST_TMPDIR/first.json")
+    second=$(jq -r .run_dir "$TEST_TMPDIR/second.json")
+    if [[ "$rc" == 0 && "$first" != "$second" ]] &&
+        cmp -s "$TEST_TMPDIR/first.json" "$first/receipt.json" &&
+        cmp -s "$TEST_TMPDIR/second.json" "$second/receipt.json"; then
+        pass "same-second quality runs retain independent immutable command logs and receipts"
+    else
+        fail "a second quality run overwrote the first run's evidence"
+    fi
+    teardown_test_env
+}
+
 # ============================================================================
 # Tests: Exit Codes
 # ============================================================================
@@ -1311,6 +1461,11 @@ main() {
     test_run_checks_tool_name_in_output
     test_run_checks_continues_after_failure
     test_run_checks_checks_array_content
+    test_run_checks_multiline_programs
+    test_run_checks_multiline_failure
+    test_run_checks_rejects_nul_program
+    test_run_checks_large_program_receipts
+    test_run_checks_retains_distinct_receipts
 
     echo ""
     echo "Exit Code Tests:"

@@ -1446,6 +1446,27 @@ Tool configuration lives in two places with distinct roles:
   `tool_name`. A tool with no `repos.d` file validates with a warning — it is
   registry-only and cannot build.
 
+Quality checks in `repos.yaml` may use YAML block strings for complete shell
+programs, including heredocs, functions and conditional statements:
+
+```yaml
+tools:
+  my-tool:
+    required_checks:
+      - |
+        if [[ -f Cargo.lock ]]; then
+          cargo test --locked
+        else
+          exit 1
+        fi
+```
+
+Each array entry runs as one check with its own shell state, exit status and
+complete log. A check receives no input unless it redirects its own stdin.
+Required checks still run with `--skip-checks`; `--dry-run` records the exact
+programs without executing them. Each invocation retains a separate receipt
+and logs, including when several checks run within the same second.
+
 ### Build target derivation and the Linux glibc floor
 
 DSR uses one supported platform contract across configuration, build manifests,

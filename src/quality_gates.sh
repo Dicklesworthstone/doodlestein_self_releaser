@@ -190,7 +190,8 @@ qg_get_checks() {
         checks=$(DSR_TOOL="$tool_name" yq -o=json \
             ".[strenv(DSR_TOOL)] as \$tool | $selector" \
             "$repos_file" 2>/dev/null) || return 4
-        if ! jq -e 'type == "array" and all(.[]; type == "string" and length > 0)' \
+        if ! jq -e 'type == "array" and all(.[]; type == "string" and length > 0 and
+                (contains("\u0000") | not))' \
             <<< "$checks" >/dev/null 2>&1; then
             _qg_log_error "Tool '$tool_name' has an invalid check inventory"
             return 4
@@ -203,7 +204,8 @@ qg_get_checks() {
     checks=$(DSR_TOOL="$tool_name" yq -o=json \
         ".tools[strenv(DSR_TOOL)] as \$tool | $selector" \
         "$repos_file" 2>/dev/null) || return 4
-    if ! jq -e 'type == "array" and all(.[]; type == "string" and length > 0)' \
+    if ! jq -e 'type == "array" and all(.[]; type == "string" and length > 0 and
+            (contains("\u0000") | not))' \
         <<< "$checks" >/dev/null 2>&1; then
         _qg_log_error "Tool '$tool_name' has an invalid check inventory"
         return 4
@@ -231,8 +233,8 @@ _qg_run_single_check() {
 
     if [[ "$dry_run" == "true" ]]; then
         _qg_log_info "(dry-run) Planned, NOT executed: $cmd"
-        jq -nc --arg cmd "$cmd" '{
-            command: $cmd,
+        printf '%s' "$cmd" | jq -Rsc '{
+            command: .,
             status: "planned",
             executed: false,
             passed: false,
@@ -270,7 +272,9 @@ _qg_run_single_check() {
     else
         (eval "$cmd") </dev/null >> "$log_file" 2>&1 || exit_code=$?
     fi
-    echo "# exit_code: $exit_code" >> "$log_file"
+    # Commands are allowed to finish without a newline. Keep the status
+    # trailer on its own line so independent verification can always find it.
+    printf '\n# exit_code: %s\n' "$exit_code" >> "$log_file"
 
     end_ms=$(_qg_now_ms) || return 4
     duration_ms=$((end_ms - start_ms))
@@ -285,8 +289,7 @@ _qg_run_single_check() {
     preview=$(tail -c 1000 "$log_file" | jq -Rs '.')
     log_sha=$(_qg_sha256 "$log_file")
 
-    jq -nc \
-        --arg cmd "$cmd" \
+    printf '%s' "$cmd" | jq -Rsc \
         --arg cwd "$resolved_cwd" \
         --argjson exit_code "$exit_code" \
         --argjson duration_ms "$duration_ms" \
@@ -294,7 +297,7 @@ _qg_run_single_check() {
         --arg log_path "$log_file" \
         --arg log_sha "$log_sha" \
         '{
-            command: $cmd,
+            command: .,
             status: (if $exit_code == 0 then "passed" else "failed" end),
             executed: true,
             passed: ($exit_code == 0),
@@ -453,9 +456,12 @@ EOF
     fi
 
     local repos_file="${DSR_REPOS_FILE:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.yaml}"
-    local run_dir
-    run_dir="${DSR_QUALITY_LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr/quality-logs}/${tool_name}/$(date +%Y%m%dT%H%M%S)-$$"
-    mkdir -p "$run_dir"
+    local run_dir run_parent
+    run_parent="${DSR_QUALITY_LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr/quality-logs}/${tool_name}"
+    mkdir -p -- "$run_parent" || return 4
+    # Multiple calls and subshell workers can share both a timestamp and $$.
+    # Keep each invocation's complete logs and receipt in its own directory.
+    run_dir=$(mktemp -d "$run_parent/$(date +%Y%m%dT%H%M%S)-XXXXXXXX") || return 4
 
     local snapshot_before
     snapshot_before=$(_qg_source_snapshot "${work_dir:-.}")
@@ -472,8 +478,17 @@ EOF
 
     # Materialize the complete command inventory before executing anything.
     # Executed checks must never share the pipe that carries this control data.
-    local check_commands=()
-    mapfile -t check_commands < <(echo "$checks" | jq -r '.[]')
+    local check_commands=() cmd
+    # NUL is rejected in configured programs above. It is therefore a safe
+    # record delimiter, unlike newline: YAML blocks can contain heredocs,
+    # functions, compound statements, and significant trailing newlines.
+    while IFS= read -r -d '' cmd; do
+        check_commands+=("$cmd")
+    done < <(jq -j '.[] | ., "\u0000"' <<< "$checks")
+    if [[ ${#check_commands[@]} -ne "$check_count" ]]; then
+        _qg_log_error "Could not materialize the complete quality check inventory"
+        return 4
+    fi
     for cmd in "${check_commands[@]}"; do
         [[ -z "$cmd" ]] && continue
         idx=$((idx + 1))
@@ -544,7 +559,7 @@ EOF
     config_sha=$(_qg_sha256 "$repos_file")
 
     local result_json
-    result_json=$(jq -nc \
+    result_json=$(jq -c \
         --arg tool "$tool_name" \
         --arg status "$overall" \
         --arg dsr_version "${DSR_VERSION:-unversioned}" \
@@ -554,7 +569,6 @@ EOF
         --arg snap_after "$snapshot_after" \
         --arg run_dir "$run_dir" \
         --argjson dry_run "$dry_run" \
-        --argjson checks "$checks_json" \
         --argjson observed "$observed" \
         --argjson executed "$executed" \
         --argjson passed "$passed" \
@@ -573,7 +587,7 @@ EOF
             source_before: $snap_before,
             source_after: $snap_after,
             run_dir: $run_dir,
-            checks: $checks,
+            checks: .,
             observed: $observed,
             executed: $executed,
             passed: $passed,
@@ -581,10 +595,10 @@ EOF
             planned: $planned,
             total: $total,
             duration_ms: $duration_ms
-        }')
+        }' <<< "$checks_json") || return 4
 
     # Durable aggregate receipt next to the per-check logs.
-    echo "$result_json" > "$run_dir/receipt.json"
+    printf '%s\n' "$result_json" > "$run_dir/receipt.json" || return 4
 
     # Output result
     echo "$result_json"
