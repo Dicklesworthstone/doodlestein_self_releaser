@@ -36,6 +36,33 @@ private signing key. The prepared ordinary command follow-up uses this API, but
 that command patch must be activated separately; adding the API alone does not
 make unsigned publication or fallback's skipped-batch path invoke it.
 
+## Password input for encrypted keys
+
+Every call that creates a signature owns its password input independently of
+the caller's stdin. This includes strict primary, checksum, and manifest
+inventory loops as well as ordinary batch signing. A protected key must not
+consume the next artifact record as its password.
+
+For automation, `DSR_MINISIGN_PASSWORD_FILE` names a caller-owned regular file
+with one hard link, no final symlink, and no group/other permission bits.
+The Python 3 provider opens it without following a symlink or blocking on a
+special file, validates the descriptor against the pathname and checks its
+metadata before and after reading. It accepts one password line with an
+optional LF or CRLF terminator, at most 1022 password bytes, and no NUL or
+embedded line breaks. An explicit blank line is allowed; an empty file is not.
+Frozen bytes feed a private pipe to Minisign. No shell variable, argument,
+environment value, log, or temporary file contains the password. The original
+password file and private key are read-only inputs.
+
+Without this provider, an interactive signer opens its controlling terminal
+separately from the inventory stream. Noninteractive invocations use closed
+input and therefore require the provider for encrypted keys. Existing valid
+signatures remain reusable without credentials; wrong passwords cannot publish
+a new signature. Exact input, pinned public key, manifest snapshot, and atomic
+sidecar publication checks remain the same.
+
+## Verification
+
 Run `bash scripts/tests/test_signing_context.sh`. The key-free tests exercise the
 full production signing module with small byte fixtures, not simulated native
 executables. They reproduce the two-predicate counterexample and test frozen
@@ -43,3 +70,10 @@ context refusal, explicit-root admission, directory/path failures, shell state
 isolation, and cleanup. Four additional tests use genuine Minisign for staged
 manifest mutation/disappearance, retained-signature mutation, and unchanged
 batch signing/verification/resume; these explicitly skip without Minisign.
+
+Run `bash scripts/tests/test_signing.sh --encrypted-only` for real encrypted-key
+coverage, or omit the flag to include the existing signing regression suite.
+The encrypted checks cover inventory stdin, batch retries, credential-free
+signature reuse, incorrect and unsafe password files, isolated Python startup,
+and a real controlling-terminal session. They preserve and independently verify
+the signed bytes; no GitHub publication is performed.

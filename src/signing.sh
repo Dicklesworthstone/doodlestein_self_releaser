@@ -717,6 +717,105 @@ _signing_reuse() {
        "$(_signing_sha256 "$signature")" == "$signature_digest" ]] || return 4
 }
 
+# Give each Minisign invocation its own password input. Release signers often
+# run inside `while read` inventories, so inheriting stdin can consume the next
+# artifact instead of a password. Never load the password into a shell variable,
+# command argument, environment value, or plaintext temporary file.
+_signing_run_minisign() {
+    if [[ -n "${DSR_MINISIGN_PASSWORD_FILE:-}" ]]; then
+        command -v python3 >/dev/null 2>&1 || {
+            _sign_log_error "python3 is required to use DSR_MINISIGN_PASSWORD_FILE"
+            return 3
+        }
+        # The program comes from this heredoc; the enclosing artifact inventory
+        # is never read. Freeze validated bytes before executing the real signer.
+        python3 -I - "$DSR_MINISIGN_PASSWORD_FILE" "$@" <<'PY'
+import os
+import stat
+import sys
+
+def refuse(message):
+    print("[signing] " + message, file=sys.stderr)
+    sys.exit(4)
+
+def identity(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+            info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+path = sys.argv[1]
+if not hasattr(os, "O_NOFOLLOW"):
+    refuse("Password-file signing requires no-follow file support")
+descriptor = None
+try:
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK |
+                         getattr(os, "O_CLOEXEC", 0))
+    before = os.fstat(descriptor)
+    if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid() or
+            before.st_mode & 0o077 or before.st_nlink != 1):
+        refuse("DSR_MINISIGN_PASSWORD_FILE must be an owned private regular file with one link")
+    if not 1 <= before.st_size <= 1024:
+        refuse("Password file must contain one line of at most 1022 password bytes")
+    if identity(os.stat(path, follow_symlinks=False)) != identity(before):
+        refuse("Password file changed while opening it")
+    contents = os.read(descriptor, 1025)
+    if (len(contents) != before.st_size or identity(os.fstat(descriptor)) != identity(before) or
+            identity(os.stat(path, follow_symlinks=False)) != identity(before)):
+        refuse("Password file changed while reading it")
+except OSError:
+    refuse("Cannot safely read DSR_MINISIGN_PASSWORD_FILE; use a private non-symlink regular file")
+finally:
+    if descriptor is not None:
+        os.close(descriptor)
+
+if contents.endswith(b"\r\n"):
+    password = contents[:-2]
+elif contents.endswith(b"\n"):
+    password = contents[:-1]
+else:
+    password = contents
+if len(password) > 1022 or any(byte in password for byte in (b"\0", b"\n", b"\r")):
+    refuse("Password file must contain one line of at most 1022 bytes, without NUL or embedded newlines")
+
+try:
+    reader, writer = os.pipe()
+    # The bounded password fits in a pipe without a concurrent reader. Only
+    # the read end survives as Minisign's stdin; later file changes cannot
+    # change the bytes accepted above, and no descriptor cursor is shared.
+    payload = password + b"\n"
+    if os.write(writer, payload) != len(payload):
+        refuse("Could not prepare private Minisign password input")
+    os.close(writer)
+    os.dup2(reader, 0)
+    if reader != 0:
+        os.close(reader)
+    os.execvp("minisign", ["minisign"] + sys.argv[2:])
+except OSError:
+    refuse("Could not execute Minisign with private password input")
+PY
+        return $?
+    fi
+
+    local password_fd status=0
+    # stderr remains attached to a terminal inside artifact-list loops. stdin
+    # is deliberately not an interactivity signal because it holds that list.
+    if [[ -t 2 && "${NON_INTERACTIVE:-false}" != true &&
+          "${DSR_NON_INTERACTIVE:-false}" != true &&
+          "${JSON_MODE:-false}" != true && -z "${CI:-}" ]]; then
+        if { exec {password_fd}</dev/tty; } 2>/dev/null; then
+            minisign "$@" <&"$password_fd" || status=$?
+            exec {password_fd}<&-
+            return "$status"
+        fi
+    fi
+    # Unencrypted keys work with EOF. Encrypted keys fail immediately instead
+    # of hanging on an unattended job or consuming an unrelated caller stream.
+    minisign "$@" </dev/null || status=$?
+    if ((status != 0)); then
+        _sign_log_error "For encrypted keys without an interactive terminal, set DSR_MINISIGN_PASSWORD_FILE to a private password file"
+    fi
+    return "$status"
+}
+
 # Create one exact detached signature without ever overwriting an existing
 # sidecar. The candidate signature is staged beside its destination, verified
 # with the pinned public key, and only then published with an atomic hard link.
@@ -797,9 +896,9 @@ signing_sign_exact() (
     local minisign_args=(-S -s "$private_key" -m "$snapshot" -x "$staged_signature" -t "$trusted_comment")
     [[ -z "$untrusted_comment" ]] || minisign_args+=(-c "$untrusted_comment")
 
-    # Keep stderr: it carries minisign's "Password:" prompt for an encrypted
-    # key, and hiding it makes signing look hung while it waits for input.
-    if ! minisign "${minisign_args[@]}" >/dev/null; then
+    # Keep stderr for password prompts and actionable credential diagnostics,
+    # while isolating password input from the enclosing artifact inventory.
+    if ! _signing_run_minisign "${minisign_args[@]}" >/dev/null; then
         _sign_log_error "Could not create detached signature: $signature"
         status=4
     elif ! signing_verify_exact "$snapshot" "$staged_signature" "$public_key_token"; then

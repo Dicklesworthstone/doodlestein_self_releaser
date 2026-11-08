@@ -2519,6 +2519,7 @@ Structured error codes for programmatic handling:
 | `DSR_JSON` | false | Force JSON output |
 | `DSR_THRESHOLD` | 600 | Default queue threshold |
 | `DSR_MINISIGN_KEY` | | Path to minisign private key |
+| `DSR_MINISIGN_PASSWORD_FILE` | | Private file containing one Minisign password line; used only when creating signatures, requires Python 3 |
 | `DSR_GH_TOKEN` | | Highest-priority GitHub API token for DSR |
 | `GITHUB_TOKEN` | | GitHub API token, after `DSR_GH_TOKEN` |
 | `GH_TOKEN` | | GitHub API token, after `DSR_GH_TOKEN` and `GITHUB_TOKEN` |
@@ -2526,6 +2527,26 @@ Structured error codes for programmatic handling:
 | `DSR_SLACK_WEBHOOK` | config `notifications.slack_webhook` | Slack incoming webhook for `--notify slack` |
 | `DSR_DISCORD_WEBHOOK` | config `notifications.discord_webhook` | Discord webhook for `--notify discord` |
 | `DSR_NOTIFY_TIMEOUT` | 20 | Seconds allowed per webhook delivery |
+
+`DSR_MINISIGN_PASSWORD_FILE` enables unattended signing with an encrypted
+private key. It is a path, not a password value. The file must be a regular
+non-symlink file owned by the current user, with one hard link and no
+group/other permission bits (use `0600` or `0400`). Its single password line
+may end in LF or CRLF and may contain at most 1022 password bytes. An empty
+file, embedded line breaks or NUL bytes, and oversized input are refused; an
+explicit blank line supplies an empty password. DSR validates the opened
+file's identity and metadata, then supplies frozen bytes on a new private
+pipe for each signature. It never consumes an artifact inventory from the
+caller's stdin or places the password in a shell argument, environment value,
+log, or temporary file.
+
+Without a password file, interactive signing uses a separately opened
+controlling terminal when stderr is a terminal and neither `--non-interactive`,
+`--json`, `DSR_NON_INTERACTIVE=true`, nor `CI` prohibits prompting. Otherwise Minisign
+receives closed input: unencrypted keys work, and encrypted keys fail without
+waiting for terminal input. A valid retained signature is verified and reused
+without opening a password file. Key generation and rotation retain their
+existing input behavior; this variable is a signing credential provider.
 
 DSR's GitHub adapter, release publisher, release repair and authentication
 diagnostics use `DSR_GH_TOKEN`, then `GITHUB_TOKEN`, then `GH_TOKEN`, then

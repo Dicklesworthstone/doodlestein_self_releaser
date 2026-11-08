@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_signing.sh - Unit tests for src/signing.sh
 #
-# Run: ./scripts/tests/test_signing.sh
+# Run: ./scripts/tests/test_signing.sh [--encrypted-only]
 #
 # Real-behavior tests using actual minisign. Skips if minisign is missing.
 # (No-mocks compliant per bd-3py)
@@ -47,10 +47,14 @@ mkdir -p "$DSR_CONFIG_DIR"
 export SIGNING_SECRETS_DIR="$DSR_CONFIG_DIR/secrets"
 export SIGNING_PRIVATE_KEY="$SIGNING_SECRETS_DIR/minisign.key"
 export SIGNING_PUBLIC_KEY="$DSR_CONFIG_DIR/minisign.pub"
+unset DSR_MINISIGN_PASSWORD_FILE
 
+# An alternate module permits running the same real-key regression against an
+# incumbent implementation. It does not replace Minisign or its verification.
+SIGNING_TEST_MODULE="${DSR_TEST_SIGNING_MODULE:-$PROJECT_ROOT/src/signing.sh}"
 # Source module under test
-# shellcheck disable=SC1091
-source "$PROJECT_ROOT/src/signing.sh"
+# shellcheck disable=SC1090,SC1091 # Optional incumbent module for the same regression.
+source "$SIGNING_TEST_MODULE"
 
 cleanup() {
   rm -rf "$TEMP_DIR"
@@ -407,10 +411,328 @@ test_signing_verify_multiple_files_error() {
   run_expect_fail "signing_verify rejects multiple files" signing_verify "$a" "$b" 2>/dev/null
 }
 
+test_signing_encrypted_key_input() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    skip "encrypted-key input tests require python3"
+    return
+  fi
+  local report="$TEMP_DIR/encrypted-results" status=0 line
+  # Keep the optional external fixture for a before/after run with the exact
+  # same encrypted key, password, and artifact inventory.
+  python3 - "$SIGNING_TEST_MODULE" \
+    "${DSR_SIGNING_ENCRYPTED_FIXTURE:-$TEMP_DIR/encrypted}" \
+    "$(command -v minisign)" > "$report" <<'PY' || status=$?
+import hashlib
+import json
+import os
+from pathlib import Path
+import pty
+import secrets
+import select
+import signal
+import subprocess
+import sys
+import termios
+import time
+
+module, directory, real_minisign = sys.argv[1:]
+root = Path(directory)
+root.mkdir(parents=True, exist_ok=True, mode=0o700)
+config = root / "config"
+config.mkdir(exist_ok=True, mode=0o700)
+private = config / "minisign.key"
+public = config / "minisign.pub"
+provider = root / "password file"
+if not provider.exists():
+    provider.write_bytes(secrets.token_hex(24).encode() + b"\n")
+    provider.chmod(0o600)
+password = provider.read_bytes().rstrip(b"\n")
+failures = 0
+
+def check(condition, label):
+    global failures
+    print(("PASS: " if condition else "FAIL: ") + label, flush=True)
+    failures += not condition
+    return bool(condition)
+
+def run(command, *, env=None, data=b"", timeout=40):
+    process = subprocess.Popen(command, env=env, stdin=subprocess.PIPE,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               start_new_session=True)
+    try:
+        out, err = process.communicate(data, timeout=timeout)
+        return subprocess.CompletedProcess(command, process.returncode, out, err)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        out, err = process.communicate()
+        return subprocess.CompletedProcess(command, 124, out, err)
+
+if not private.exists():
+    generated = run([real_minisign, "-G", "-s", str(private), "-p", str(public)],
+                    data=(password + b"\n") * 2)
+    if not check(generated.returncode == 0, "real Minisign generates an encrypted key"):
+        sys.exit(1)
+else:
+    check(public.is_file(), "retained real encrypted-key fixture is available")
+
+# The observer records process metadata and delegates every operation to the
+# real binary without reading or replacing its stdin or successful result.
+observer_dir = root / "observer"
+observer_dir.mkdir(exist_ok=True)
+observer = observer_dir / "minisign"
+audit = root / "minisign-processes.jsonl"
+audit.write_text("")
+observer.write_text("#!" + sys.executable + "\n" + '''import json, os, sys
+with open(os.environ["DSR_TEST_PROCESS_AUDIT"], "a") as output:
+    output.write(json.dumps({"argv": sys.argv, "env": dict(os.environ)}) + "\\n")
+os.execv(os.environ["DSR_TEST_REAL_MINISIGN"], ["minisign"] + sys.argv[1:])
+''')
+observer.chmod(0o700)
+# Do not copy unrelated user credentials into the observer's metadata log.
+env = {"PATH": str(observer_dir) + os.pathsep + os.environ["PATH"],
+       "HOME": str(root), "LANG": "C", "NO_COLOR": "1",
+       "DSR_CONFIG_DIR": str(config), "DSR_MINISIGN_KEY": str(private),
+       "DSR_MINISIGN_PASSWORD_FILE": str(provider), "NON_INTERACTIVE": "true",
+       "DSR_TEST_PROCESS_AUDIT": str(audit), "DSR_TEST_REAL_MINISIGN": real_minisign}
+
+def invoke(arguments, *, overrides=None, data=b"", body=None, trace=False):
+    selected_env = dict(env)
+    for key, value in (overrides or {}).items():
+        if value is None:
+            selected_env.pop(key, None)
+        else:
+            selected_env[key] = str(value)
+    script = 'set -uo pipefail\nsource "$1"\nshift\n'
+    script += body if body is not None else '"$@"'
+    return run(["bash", "-x" if trace else "-c", *( ["-c"] if trace else [] ),
+                script, "encrypted-signing-test", module, *map(str, arguments)],
+               env=selected_env, data=data)
+
+def artifact(name):
+    path = root / name
+    path.write_text("immutable release bytes for " + name + "\n")
+    return path
+
+def signature(path):
+    return Path(str(path) + ".minisig")
+
+def verify(path):
+    return run([real_minisign, "-V", "-p", str(public), "-m", str(path),
+                "-x", str(signature(path))]).returncode == 0
+
+def custody(paths):
+    return {str(path): (path.stat().st_dev, path.stat().st_ino, path.stat().st_mode,
+                        path.stat().st_size, path.stat().st_mtime_ns,
+                        path.stat().st_ctime_ns, hashlib.sha256(path.read_bytes()).hexdigest())
+            for path in paths}
+
+first, second = artifact("loop one.bin"), artifact("loop two.bin")
+inventory = (str(first) + "\n" + str(second) + "\n").encode()
+observed = root / "observed-inventory"
+observed.write_text("")
+before = custody([private, public, provider, first, second])
+loop = invoke([observed], data=inventory, trace=True, body='''
+while IFS= read -r artifact; do
+    signing_sign "$artifact" --trusted-comment "encrypted inventory" || exit $?
+    printf '%s\\n' "$artifact" >> "$1"
+done
+''')
+check(loop.returncode == 0, "encrypted signing succeeds inside a real artifact-list loop")
+check(observed.read_bytes() == inventory, "each signer preserves the complete enclosing stdin inventory")
+check(verify(first) and verify(second), "both loop artifacts have real independently verified signatures")
+check(custody([private, public, provider, first, second]) == before,
+      "encrypted signing preserves key, password, and payload bytes and identities")
+check(password not in loop.stdout + loop.stderr + audit.read_bytes(),
+      "password is absent from stdout, stderr, shell trace, argv, and environment")
+if failures:
+    # The incumbent already provides a decisive real-key counterexample. Do
+    # not turn missing first signatures into dozens of dependent failures.
+    sys.exit(1)
+
+retained = custody([signature(first), signature(second)])
+missing = {"DSR_MINISIGN_PASSWORD_FILE": root / "absent-password",
+           "DSR_MINISIGN_KEY": root / "absent-private-key"}
+single_reuse = invoke(["signing_sign", first, "--trusted-comment", "encrypted inventory"], overrides=missing)
+batch_reuse = invoke(["signing_sign_batch", first, second], overrides=missing)
+check(single_reuse.returncode == 0 and batch_reuse.returncode == 0,
+      "verified single and batch retries need neither password file nor private key")
+check(custody([signature(first), signature(second)]) == retained,
+      "credential-free retries preserve retained signatures byte-for-byte")
+
+third, fourth = artifact("batch one.bin"), artifact("batch two.bin")
+batch = invoke(["signing_sign_batch", third, fourth])
+check(batch.returncode == 0 and verify(third) and verify(fourth),
+      "a real encrypted-key batch signs and verifies every new artifact")
+fifth = artifact("resume batch.bin")
+mixed = invoke(["signing_sign_batch", third, fifth])
+check(mixed.returncode == 0 and verify(third) and verify(fifth),
+      "a partial encrypted-key batch resumes retained and new signatures together")
+
+for label, contents, mode in [("no-final-newline", password, 0o600),
+                              ("CRLF", password + b"\r\n", 0o600),
+                              ("read-only", password + b"\n", 0o400)]:
+    selected = root / (label + "-password")
+    selected.write_bytes(contents)
+    selected.chmod(mode)
+    payload = artifact(label + ".bin")
+    result = invoke(["signing_sign", payload], overrides={"DSR_MINISIGN_PASSWORD_FILE": selected})
+    check(result.returncode == 0 and verify(payload),
+          label + " private password file creates a real verified signature")
+
+startup = root / "python-startup"
+startup.mkdir()
+sentinel = root / "unexpected-python-startup"
+(startup / "sitecustomize.py").write_text(
+    "from pathlib import Path\nPath(" + repr(str(sentinel)) + ").write_text('executed')\n")
+isolated = artifact("isolated-reader.bin")
+# Bypass the Python metadata observer here: only the password reader is under
+# test, and the actual Minisign binary has no Python startup behavior.
+result = invoke(["signing_sign", isolated], overrides={
+    "PATH": os.environ["PATH"], "PYTHONPATH": startup})
+check(result.returncode == 0 and verify(isolated) and not sentinel.exists(),
+      "password reader ignores inherited Python startup hooks")
+
+wrong_provider = root / "wrong-password"
+wrong_provider.write_bytes(b"deliberately incorrect fixture password\n")
+wrong_provider.chmod(0o600)
+wrong = artifact("wrong-password.bin")
+rejected = invoke(["signing_sign", wrong], overrides={"DSR_MINISIGN_PASSWORD_FILE": wrong_provider})
+check(rejected.returncode == 4 and not signature(wrong).exists(),
+      "incorrect password fails without publishing a detached signature")
+wrong_batch = artifact("wrong-batch.bin")
+retained = custody([signature(third)])
+rejected_batch = invoke(["signing_sign_batch", third, wrong_batch],
+                        overrides={"DSR_MINISIGN_PASSWORD_FILE": wrong_provider})
+check(rejected_batch.returncode == 4 and not signature(wrong_batch).exists()
+      and custody([signature(third)]) == retained,
+      "incorrect password preserves retained batch signatures and publishes no new one")
+retry = invoke(["signing_sign", wrong])
+check(retry.returncode == 0 and verify(wrong), "a failed password attempt can retry with the correct provider")
+
+unsigned = artifact("no-provider.bin")
+closed = invoke([unsigned], overrides={"DSR_MINISIGN_PASSWORD_FILE": None},
+                data=b"untouched inventory row\n", body='''
+signing_sign "$1"
+status=$?
+IFS= read -r remaining
+printf '%s\\n' "$remaining"
+exit "$status"
+''')
+check(closed.returncode == 4 and not signature(unsigned).exists()
+      and closed.stdout == b"untouched inventory row\n",
+      "noninteractive encrypted signing fails without consuming caller stdin")
+check(b"DSR_MINISIGN_PASSWORD_FILE" in closed.stderr,
+      "missing unattended password reports the explicit provider setting")
+
+invalid = []
+for label, contents, mode in [("public", password + b"\n", 0o644),
+                              ("empty", b"", 0o600),
+                              ("multiline", password + b"\nsecond\n", 0o600),
+                              ("nul", password + b"\0\n", 0o600),
+                              ("oversized", b"x" * 1023 + b"\n", 0o600)]:
+    path = root / (label + "-provider")
+    path.write_bytes(contents)
+    path.chmod(mode)
+    invalid.append((label, path))
+link = root / "symlink-provider"
+link.symlink_to(provider)
+invalid.append(("symlink", link))
+fifo = root / "fifo-provider"
+os.mkfifo(fifo, 0o600)
+invalid.append(("FIFO", fifo))
+folder = root / "directory-provider"
+folder.mkdir(mode=0o700)
+invalid.append(("directory", folder))
+hardlink_source = root / "hardlink-source"
+hardlink_source.write_bytes(password + b"\n")
+hardlink_source.chmod(0o600)
+hardlink = root / "hardlink-provider"
+os.link(hardlink_source, hardlink)
+invalid.append(("multiply linked", hardlink))
+invalid.append(("missing", root / "missing-provider"))
+for label, path in invalid:
+    payload = artifact(label + "-provider.bin")
+    result = invoke(["signing_sign", payload], overrides={"DSR_MINISIGN_PASSWORD_FILE": path})
+    check(result.returncode == 4 and not signature(payload).exists(),
+          label + " password provider is refused promptly without publishing")
+
+# The terminal is controlling stderr, while stdin remains an artifact stream.
+# This catches a check of `-t 0`, which silently loses interactive loop support.
+tty_artifact = artifact("interactive.bin")
+master, slave = pty.openpty()
+tty_env = dict(env)
+tty_env.pop("DSR_MINISIGN_PASSWORD_FILE")
+tty_env["NON_INTERACTIVE"] = "false"
+script = '''set -uo pipefail
+source "$1"
+signing_sign "$2"
+status=$?
+IFS= read -r remaining
+printf '%s\\n' "$remaining"
+exit "$status"
+'''
+def controlling_terminal():
+    os.setsid()
+    import fcntl
+    fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+
+process = subprocess.Popen(["bash", "-c", script, "tty-signing-test", module, str(tty_artifact)],
+                           env=tty_env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                           stderr=slave, preexec_fn=controlling_terminal)
+os.close(slave)
+process.stdin.write(b"interactive inventory remains\n")
+process.stdin.close()
+terminal_output = b""
+sent = False
+deadline = time.monotonic() + 40
+while process.poll() is None and time.monotonic() < deadline:
+    ready, _, _ = select.select([master], [], [], 0.2)
+    if ready:
+        try:
+            terminal_output += os.read(master, 8192)
+        except OSError:
+            break
+        if b"Password:" in terminal_output and not sent:
+            os.write(master, password + b"\n")
+            sent = True
+if process.poll() is None:
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+output = process.stdout.read()
+os.close(master)
+check(sent and process.returncode == 0 and verify(tty_artifact)
+      and output == b"interactive inventory remains\n",
+      "interactive signing reads a separate controlling terminal and preserves inventory stdin")
+check(password not in terminal_output, "interactive Minisign keeps the password out of terminal output")
+check(custody([private, public, provider, first, second]) == before,
+      "all password failures and retries preserve original signing inputs")
+check(not list(root.rglob("*.dsr-signing.*")) and not list(root.rglob("*.dsr-batch.*")),
+      "successful and failed encrypted signing leave no private staging directories")
+sys.exit(bool(failures))
+PY
+  while IFS= read -r line; do
+    case "$line" in
+      'PASS: '*) ((TESTS_RUN++)); pass "${line#PASS: }" ;;
+      'FAIL: '*) ((TESTS_RUN++)); fail "${line#FAIL: }" ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done < "$report"
+  if ((status != 0)) && ! grep -q '^FAIL: ' "$report"; then
+    ((TESTS_RUN++))
+    fail "encrypted-key regression driver completed (exit $status)"
+  fi
+}
+
 # Main
 echo "Running signing module tests..."
 echo ""
 
+if [[ "${1:-}" == "--encrypted-only" ]]; then
+  test_signing_encrypted_key_input
+else
 test_signing_require_minisign_missing
 test_signing_init_creates_keys
 test_signing_check_valid
@@ -431,6 +753,8 @@ test_signing_exact_rejects_symlink_private_key
 test_signing_sign_missing_key
 test_signing_sign_multiple_files_error
 test_signing_verify_multiple_files_error
+test_signing_encrypted_key_input
+fi
 
 echo ""
 echo "=========================================="

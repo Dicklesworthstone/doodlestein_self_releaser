@@ -492,6 +492,26 @@ one `<primary>.minisig` per contracted primary, and verifies downloaded release
 bytes before publication and during `dsr release verify`. The private key stays
 outside the repository and may be selected with `DSR_MINISIGN_KEY`.
 
+For unattended signing with a password-protected key, set
+`DSR_MINISIGN_PASSWORD_FILE` to a private password file supplied by your secret
+store. The variable contains a path, never the password itself:
+
+```bash
+DSR_MINISIGN_PASSWORD_FILE=/run/user/1000/dsr/minisign-password \
+  dsr --non-interactive fallback mytool --version 1.2.3
+```
+
+The file must be owned by the current user, have no group/other permissions
+(normally `0600` or `0400`), be a regular file rather than a symlink, and have
+one hard link. It contains one password line, with an optional final newline.
+DSR opens and validates it separately for each new signature and supplies the
+password through a private pipe; artifact inventories on stdin remain intact.
+Python 3 is required when this option is used. Keep the file outside source
+and artifact directories. Interactive signing uses a separate terminal when
+available; noninteractive signing never prompts. Verified existing signatures
+can be reused without the password file. This option applies to signing, while
+`dsr signing init` continues to ask for the new key's password interactively.
+
 An exact release contract may include `SHA256SUMS`, `SHA256SUMS.txt`, or the
 legacy `checksums.txt` in `exact_additional_assets`, together with each selected
 aggregate's `.minisig` signature. All three names use the same sorted checksum
