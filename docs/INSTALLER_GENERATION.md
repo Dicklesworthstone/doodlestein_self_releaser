@@ -16,6 +16,106 @@ sourcing the module to select an output root; the default is `./installers`.
 Success prints only the generated installer path to stdout. Diagnostics and
 retained-history paths go to stderr.
 
+## Native Windows installers
+
+Generate a standalone PowerShell installer using the same per-tool configuration:
+
+```bash
+dsr installer generate tool --shell powershell --output-dir ./installers
+dsr installer validate tool --shell powershell --output-dir ./installers
+dsr --json installer generate tool --shell powershell --dry-run
+```
+
+The output is `installers/tool/install.ps1`. The sourced APIs are
+`install_gen_create_powershell tool [--config-dir DIR] [--dry-run]` and
+`install_gen_validate_powershell tool`. An explicit configuration root also owns
+fallback signing configuration and `minisign.pub`; it cannot silently borrow a
+key from another registry. The generator requires `yq`, `jq`, Python 3 and
+PowerShell (`pwsh`). It parses the complete generated program before publication
+and uses the same held-directory, concurrent-writer and previous-file preservation
+rules as the Bash generator. A dry run validates policy and observes the output
+without creating a directory, installer or lock.
+
+At least one Windows target must be declared. Supported targets are
+`windows/amd64`, `windows/arm64` and `windows/386`, with one compiler triple per
+platform. Ordinary release names use DSR's actual publication naming functions,
+including architecture aliases and target triples. Strict contracts select the
+literal `exact_primary_assets` name and its declared format. Configuration is
+embedded as base64-encoded JSON data, never evaluated as PowerShell code.
+
+```yaml
+tool_name: tool
+repo: owner/tool
+binary_name: tool
+targets: [windows/amd64, windows/arm64]
+archive_format: {windows: zip}
+artifact_naming: '${name}-v${version}-${target_triple}'
+workspace_binaries: [tool, tool-worker]
+workspace_binaries_by_target:
+  windows/arm64: [tool]
+```
+
+ZIP and raw executable assets are supported. A raw asset supplies exactly one
+executable; its strict release basename can differ from the installed `.exe`
+name. ZIPs must contain exactly one regular member for every selected executable.
+Per-target workspace lists replace the global family, and an empty list selects
+the primary. The generated family is bounded to 64 executables. Duplicate or
+case-colliding names, reserved Windows device names, unsafe paths, reparse/link
+entries, and a wrong PE machine type are refused before installation. Unselected
+archive members are not installed as additional executables.
+
+Run the generated script in native Windows with PowerShell 7.4 or newer:
+
+```powershell
+.\install.ps1 -Version v1.2.3 -Yes
+.\install.ps1 -Version v1.2.3 -Prefix C:\Tools\tool\bin -CacheDir C:\ToolCache -Yes
+.\install.ps1 -Version v1.2.3 -Prefix C:\Tools\tool\bin -CacheDir C:\ToolCache -Offline -Yes
+```
+
+Online acquisition supports public GitHub release assets. Private release asset
+discovery through GitHub's authenticated asset-ID API is not implemented in this
+generator. Omitting `-Version` selects the latest release online. Offline mode requires an
+explicit version and makes no release lookup, checksum request or signature
+download. The cache binds repository, version, platform, selected asset and
+embedded policy; cached bytes and evidence are rechecked on every installation.
+Cache locations must belong to the current user and reject modification by
+untrusted principals. Payloads and evidence are copied into private staging and
+verified there before extraction. Downloads have a complete-transfer deadline;
+redirects cannot forward credentials to a different host.
+A missing checksum entry, malformed or duplicate checksum record, changed
+payload, missing signature or signature failure stops the attempt. When the
+policy contains a Minisign key, a missing Minisign executable is an error.
+There is no unsigned fallback from a configured key.
+
+The default prefix is `%LOCALAPPDATA%\Programs\TOOL\bin`; it needs no administrator
+installation and does not edit PATH or shell profiles. `-Yes` permits replacing
+existing selected executables. Without it, interactive use asks first, while
+noninteractive CI refuses an overwrite. The complete executable family is staged
+and validated before replacement. A cooperating-writer lock covers the update;
+if a later replacement fails, the transaction restores the earlier files and
+retains failed recovery evidence when it cannot complete restoration. Unrelated
+files in the prefix are preserved. This is a cooperating installation transaction,
+not an atomic switch of every executable or a power-loss durability guarantee.
+
+`-Json` keeps stdout machine-readable and includes the installed executable
+receipts; progress and `-Verbose` diagnostics go to stderr. `-Help` performs no
+download or installation. Windows source builds and agent-skill installation are
+outside this generator's release-asset path. The separate `generate-release`
+authenticated snapshot engine remains a distinct command and policy format.
+
+```bash
+bash scripts/tests/test_install_gen_windows.sh
+bash scripts/tests/test_install_gen_windows_policy.sh
+```
+
+The regression exercises actual generated programs, genuine Go-produced Windows
+PE files, ZIP parsing, Minisign verification, cache and replacement operations.
+Portable PowerShell runs use explicit host/HTTP adapters and a labelled move
+failure injection for rollback; they do not establish native NTFS behavior.
+The policy regression exercises the actual configuration and publication naming
+helpers, explicit signing-key scope, executable-family limits and refusal before
+any existing installer or publication history changes.
+
 ## Executable families from source
 
 The ordinary installer uses the same effective `workspace_binaries` family for

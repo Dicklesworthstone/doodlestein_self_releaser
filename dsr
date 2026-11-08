@@ -17187,7 +17187,7 @@ cmd_installer() {
     local subcmd="${1:-}"
     shift 2>/dev/null || true
     local output_dir="${DSR_INSTALLER_DIR:-$SCRIPT_DIR/installers}"
-    local all=false dry_run="${DRY_RUN:-false}"
+    local all=false dry_run="${DRY_RUN:-false}" installer_shell=bash
     local -a tools=()
 
     case "$subcmd" in
@@ -17204,7 +17204,9 @@ dsr installer - Generate installers and install authenticated releases
 USAGE:
     dsr installer generate <tool>... [--output-dir DIR] [--dry-run]
     dsr installer generate --all [--output-dir DIR] [--dry-run]
+    dsr installer generate <tool>... --shell powershell [--output-dir DIR] [--dry-run]
     dsr installer validate <tool>... [--output-dir DIR]
+    dsr installer validate <tool>... --shell powershell [--output-dir DIR]
     dsr installer generate-release --policy FILE --public-key FILE --output FILE [--dry-run]
     dsr installer install (--snapshot DIR | --fetch) --recipe FILE --prefix DIR [release policy...]
     dsr installer describe-recipe --recipe FILE [--release-contract FILE --targets LIST]
@@ -17222,7 +17224,15 @@ DESCRIPTION:
     Commit each generated install.sh to its tool's repository so the
     documented `curl ... | bash` URL serves it.
 
-    validate checks syntax, ShellCheck and the required safety elements.
+    --shell powershell writes install.ps1 for the configured Windows targets.
+    It selects exact release names, ZIP or raw executables, and complete workspace
+    executable families. Checksums and any configured Minisign key are required;
+    offline installs use only verified cached payloads and evidence. It stages
+    all executables before replacement and preserves the prior files on failure.
+    Windows source compilation and agent-skill installation are not included.
+    Generation and validation require PowerShell (pwsh) on the DSR coordinator.
+
+    validate checks syntax, plus ShellCheck for Bash installers.
 
     generate-release captures an explicit pinned release policy and trust key
     in a standalone authenticated installer. install authenticates the complete
@@ -17258,6 +17268,11 @@ EOF
             --output-dir|-o)
                 [[ $# -ge 2 && -n "$2" ]] || { log_error "$1 requires a directory"; return 4; }
                 output_dir="$2"; shift 2 ;;
+            --shell)
+                [[ $# -ge 2 && ( "$2" == bash || "$2" == powershell ) ]] || {
+                    log_error '--shell requires bash or powershell'; return 4;
+                }
+                installer_shell="$2"; shift 2 ;;
             --dry-run) dry_run=true; shift ;;
             -*) log_error "Unknown option: $1"; return 4 ;;
             *) tools+=("$1"); shift ;;
@@ -17285,11 +17300,20 @@ EOF
     local -a results=()
     for tool in "${tools[@]}"; do
         status=0 path="$output_dir/$tool/install.sh"
+        [[ "$installer_shell" != powershell ]] || path="$output_dir/$tool/install.ps1"
         if [[ ! "$tool" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
             log_error "Invalid tool name: $tool"
             status=4
         elif [[ "$subcmd" == validate ]]; then
-            install_gen_validate "$tool" >&2 || status=$?
+            if [[ "$installer_shell" == powershell ]]; then
+                install_gen_validate_powershell "$tool" >&2 || status=$?
+            else
+                install_gen_validate "$tool" >&2 || status=$?
+            fi
+        elif [[ "$installer_shell" == powershell ]]; then
+            local -a windows_args=()
+            $dry_run && windows_args+=(--dry-run)
+            path=$(install_gen_create_powershell "$tool" "${windows_args[@]}") || status=$?
         elif $dry_run; then
             log_info "[dry-run] Would generate $path"
         else
@@ -17315,7 +17339,8 @@ EOF
         [[ $exit_code -eq 0 ]] || status_word=$([[ $ok -gt 0 ]] && echo partial || echo error)
         json_envelope "installer" "$status_word" "$exit_code" "$(printf '%s\n' "${results[@]}" | jq -sc \
             --arg action "$subcmd" --arg output_dir "$output_dir" --argjson dry_run "$dry_run" \
-            '{action: $action, output_dir: $output_dir, dry_run: $dry_run, installers: .}')"
+            --arg shell "$installer_shell" \
+            '{action: $action, output_dir: $output_dir, shell:$shell, dry_run: $dry_run, installers: .}')"
     else
         [[ "$subcmd" == generate ]] && ! $dry_run && [[ $ok -gt 0 ]] &&
             jq -r 'select(.ok) | .path' <<< "$(printf '%s\n' "${results[@]}")"

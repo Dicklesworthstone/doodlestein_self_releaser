@@ -1022,15 +1022,38 @@ Generate the `curl | bash` installer for a tool from its `repos.d/<tool>.yaml`:
 
 ```bash
 dsr installer generate ntm                 # writes installers/ntm/install.sh
+dsr installer generate tool --shell powershell  # requires declared Windows targets
 dsr installer generate --all --dry-run     # list what would be generated
 dsr installer validate ntm                 # syntax, ShellCheck, safety checks
+dsr installer validate tool --shell powershell  # PowerShell syntax validation
 ```
 
 The default output directory (`installers/` beside dsr, or
 `DSR_INSTALLER_DIR`, or `--output-dir`) is the one `dsr canary` tests. Commit
-each generated `install.sh` to its tool's repository. Regenerate after
+each generated `install.sh` or `install.ps1` to its tool's repository. Regenerate after
 changing a tool's naming, targets, workspace executables, or signing key,
 since these are embedded at generation (see "Installers and Verification").
+
+For native Windows, `--shell powershell` generates a standalone PowerShell 7.4+
+installer from the same repository configuration. It supports declared x64,
+ARM64 and x86 Windows targets, ZIP archives or raw PE executables, exact strict
+asset names, and the complete platform-specific workspace executable family.
+Generation requires `yq`, `jq`, Python 3 and `pwsh` on the DSR coordinator;
+the generated installer needs PowerShell and, when a signing key is configured,
+Minisign on Windows. This release-asset path supports public GitHub releases.
+
+```powershell
+.\install.ps1 -Version v1.2.3 -Yes
+.\install.ps1 -Version v1.2.3 -Offline -Yes -Prefix C:\Tools\tool\bin
+```
+
+The Windows installer requires an exact checksum and verifies every payload
+against any configured Minisign key. Offline mode requires an explicit version
+and uses only cached payloads and verification evidence. It checks every selected
+executable's PE architecture and stages the complete family before replacing an
+existing installation. `-Json` emits a structured result; `-Verbose` writes
+diagnostics to stderr. See [native Windows installers](docs/INSTALLER_GENERATION.md#native-windows-installers)
+for cache, upgrade and supported-format behavior.
 
 The installer accepts the build's scalar `archive_format: tar.xz` or a mapping
 such as `archive_format: {linux: tar.xz, darwin: tar.gz, windows: zip}`. Omitted

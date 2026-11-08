@@ -1922,11 +1922,12 @@ _install_gen_output() (
     command -v python3 >/dev/null || {
         log_error 'Python 3 is required for safe installer publication'; return 3;
     }
-    exec python3 -I - "$BASH" "$@" 3<&0 <<'DSR_INSTALLER_OUTPUT_PY'
+    exec python3 -I - "$BASH" "$@" "${_IG_OUTPUT_SHELL:-bash}" 3<&0 <<'DSR_INSTALLER_OUTPUT_PY'
 import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import stat
 import subprocess
@@ -1992,7 +1993,8 @@ def directory_records(chain):
         records.append(directory_identity(info))
     return records
 
-def read_destination(fd, name='install.sh'):
+def read_destination(fd, name=None):
+    name = name or script_name
     try:
         opened = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
     except FileNotFoundError:
@@ -2013,7 +2015,8 @@ def observe(path):
     try:
         chain, complete = directories(path)
         target, _ = read_destination(chain[-1][2]) if complete else (None, None)
-        return dict(schema_version=1, path=path, directories=directory_records(chain), target=target)
+        return dict(schema_version=1, path=path, script=script_name,
+                    directories=directory_records(chain), target=target)
     finally:
         while len(descriptors) > mark:
             os.close(descriptors.pop())
@@ -2037,16 +2040,31 @@ def check_observation(expected, chain):
 
 def validate_script(data, bash):
     global child
-    need(0 < len(data) <= LIMIT and data.startswith(b'#!/usr/bin/env bash\n') and b'\0' not in data,
-         'Generated installer is empty, excessive, or not a Bash script', 6)
+    need(0 < len(data) <= LIMIT and b'\0' not in data,
+         'Generated installer is empty or excessive', 6)
     env = {k:v for k,v in os.environ.items() if not k.startswith('BASH_FUNC_') and k not in
            ('BASH_ENV', 'ENV', 'SHELLOPTS', 'BASHOPTS')}
-    child = subprocess.Popen([bash, '--noprofile', '--norc', '-n'], stdin=subprocess.PIPE,
+    if interpreter == 'bash':
+        need(data.startswith(b'#!/usr/bin/env bash\n'), 'Generated installer is not a Bash script', 6)
+        command = [bash, '--noprofile', '--norc', '-n']
+    else:
+        need(data.startswith(b'#requires -Version '), 'Generated installer is not a PowerShell script', 6)
+        executable = shutil.which('pwsh')
+        need(executable is not None, 'PowerShell (pwsh) is required to validate a Windows installer', 3)
+        # Parse data, never evaluate generated code or interpolate configuration
+        # into the parser program. stdin is the complete bounded UTF-8 script.
+        command = [executable, '-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+                   '$tokens=$null; $errors=$null; '
+                   '[void][System.Management.Automation.Language.Parser]::ParseInput('
+                   '[Console]::In.ReadToEnd(),[ref]$tokens,[ref]$errors); '
+                   'if ($errors.Count) { $errors | ForEach-Object { '
+                   '[Console]::Error.WriteLine($_.Message) }; exit 1 }']
+    child = subprocess.Popen(command, stdin=subprocess.PIPE,
                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                              env=env, start_new_session=True)
     try:
         child.communicate(data, timeout=30)
-        need(child.returncode == 0, 'Generated installer failed Bash syntax validation; old installer retained', 6)
+        need(child.returncode == 0, 'Generated installer failed syntax validation; old installer retained', 6)
     except subprocess.TimeoutExpired as error:
         raise Failure('Installer syntax validation exceeded its time limit', 5) from error
     finally:
@@ -2068,7 +2086,11 @@ try:
     need(os.name == 'posix' and hasattr(os, 'O_NOFOLLOW') and os.open in os.supports_dir_fd,
          'Safe installer publication requires POSIX directory descriptors', 3)
     bash, mode, root, tool = sys.argv[1:5]
-    need(mode in ('inspect', 'publish') and len(sys.argv) == (5 if mode == 'inspect' else 6),
+    interpreter = sys.argv[-1]
+    need(interpreter in ('bash', 'powershell'), 'Invalid installer interpreter')
+    script_name = 'install.sh' if interpreter == 'bash' else 'install.ps1'
+    extension = 'sh' if interpreter == 'bash' else 'ps1'
+    need(mode in ('inspect', 'publish', 'validate') and len(sys.argv) == (7 if mode == 'publish' else 6),
          'Invalid installer output operation')
     need(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]{0,127}', tool) and '..' not in tool,
          'Invalid installer output identity')
@@ -2077,15 +2099,25 @@ try:
     need('..' not in root.split('/'), 'Installer output root may not contain parent traversal')
     path = os.path.abspath(os.path.join(root, tool))
     need(len(path.split('/')) <= 128, 'Excessive installer output depth')
-    display = root.rstrip('/') + '/' + tool + '/install.sh'
+    display = root.rstrip('/') + '/' + tool + '/' + script_name
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, stop)
     if mode == 'inspect':
         print(json.dumps(observe(path), sort_keys=True, separators=(',', ':')))
+    elif mode == 'validate':
+        chain, complete = directories(path)
+        need(complete, 'Installer output directory does not exist')
+        current, data = read_destination(chain[-1][2])
+        need(current is not None, 'Installer does not exist: ' + script_name)
+        validate_script(data, bash)
+        directory_records(chain)
+        after, _ = read_destination(chain[-1][2])
+        need(after == current, 'Installer changed during syntax validation', 2)
     else:
         expected = parse_token(sys.argv[5])
-        need(isinstance(expected, dict) and set(expected) == {'schema_version', 'path', 'directories', 'target'} and
+        need(isinstance(expected, dict) and set(expected) == {'schema_version', 'path', 'script', 'directories', 'target'} and
              type(expected['schema_version']) is int and expected['schema_version'] == 1 and expected['path'] == path and
+             expected['script'] == script_name and
              isinstance(expected['directories'], list) and 0 < len(expected['directories']) <= 128 and
              all(isinstance(row, list) and len(row) == 5 and all(type(n) is int and n >= 0 for n in row)
                  for row in expected['directories']), 'Invalid installer output observation')
@@ -2120,9 +2152,9 @@ try:
             selected = dict(expected=expected, sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data))
             write_new(stage_fd, 'selection.json', (json.dumps(selected, sort_keys=True) + '\n').encode())
             if previous is not None:
-                write_new(stage_fd, 'previous.sh', previous)
-            write_new(stage_fd, 'candidate.sh', data, 0o755)
-            candidate, candidate_bytes = read_destination(stage_fd, 'candidate.sh')
+                write_new(stage_fd, 'previous.' + extension, previous)
+            write_new(stage_fd, 'candidate.' + extension, data, 0o755)
+            candidate, candidate_bytes = read_destination(stage_fd, 'candidate.' + extension)
             need(candidate_bytes == data and stat.S_IMODE(candidate['identity'][2]) == 0o755,
                  'Staged installer changed before publication', 2)
             check_observation(expected, chain)
@@ -2133,7 +2165,7 @@ try:
             # A last-component symlink appearing after the check is replaced,
             # never followed. Only cooperating writers share the lock; this is
             # not an atomic compare-and-swap against arbitrary same-user edits.
-            os.replace('candidate.sh', 'install.sh', src_dir_fd=stage_fd, dst_dir_fd=output_fd)
+            os.replace('candidate.' + extension, script_name, src_dir_fd=stage_fd, dst_dir_fd=output_fd)
             activated = True
             directory_records(chain)
             published, actual = read_destination(output_fd)
@@ -2954,6 +2986,145 @@ install_gen_create() {
     echo "$output_file"
 }
 
+# Build a Windows policy from the same selected recipe and naming functions as
+# release publication. The runtime receives JSON data, never interpolated code.
+_install_gen_windows_policy() (
+    local config_file="$1" requested="$2" identities tool repo binary config_dir config_tool
+    local document targets platform triple format archive_formats local_path key contract_model
+    local names row plan name policy='{}' version_marker='0.0.0-DSRINSTALLERVERSION'
+    command -v yq >/dev/null && command -v jq >/dev/null || {
+        log_error 'yq and jq are required to generate a PowerShell installer'; return 3;
+    }
+    identities=$(_install_gen_identities "$config_file" "$requested") || return $?
+    IFS=$'\t' read -r tool repo binary <<< "$identities" || return 4
+    _install_gen_workspace_cases "$config_file" "$binary" >/dev/null || return $?
+    config_dir=$(cd "$(dirname "$config_file")/.." && pwd -P) || return 4
+    config_tool="${config_file##*/}"; config_tool="${config_tool%.yaml}"
+    local DSR_CONFIG_DIR="$config_dir" DSR_REPOS_FILE=''
+    # shellcheck source=SCRIPTDIR/config.sh
+    source "$_IG_SCRIPT_DIR/config.sh" || return 3
+    # shellcheck source=SCRIPTDIR/artifact_naming.sh
+    source "$_IG_SCRIPT_DIR/artifact_naming.sh" || return 3
+    export DSR_REPOS_FILE=''
+    document=$(_config_read_single_mapping_json "$config_file") || return 4
+    targets=$(_config_get_tool_targets_json "$config_tool") || return 4
+    dsr_platform_validate_targets_json "$targets" "PowerShell installer targets for $tool" || return 4
+    config_validate_target_triples "$config_tool" || return 4
+    contract_model=$(_install_gen_contract_model "$config_file") || return $?
+    archive_formats=$(_install_gen_archive_formats "$config_file") || return $?
+    local_path=$(jq -r '.local_path // ""' <<< "$document") || return 4
+    key=$(_install_gen_resolve_pubkey "$config_file" "$local_path") || return $?
+    key="${key#*$'\t'}"
+    while IFS= read -r platform; do
+        [[ -n "$platform" ]] || continue
+        names=$(jq -ce --arg platform "$platform" --arg primary "$binary" '
+            (.workspace_binaries_by_target[$platform] // .workspace_binaries // []) |
+            if length == 0 then [$primary] else . end |
+            map(sub("(?i)\\.exe$"; "") + ".exe") |
+            if length <= 64 and all(.[]; test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and
+                (test("(?i)^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\\.|$)") | not) and
+                (contains("..") | not) and length <= 200) and
+                (map(ascii_downcase) | unique | length) == length
+            then . else error("invalid Windows executable family") end
+        ' <<< "$document") || return 4
+        if [[ "$contract_model" != null ]]; then
+            row=$(jq -ce --arg platform "$platform" '
+                [.[] | select(.platform == $platform)] |
+                if length == 1 then .[0] else error("ambiguous Windows contract asset") end
+            ' <<< "$contract_model") || return 4
+            name=$(jq -er .name <<< "$row") || return 4
+            format=$(jq -er .format <<< "$row") || return 4
+            triple=$(jq -er .target_triple <<< "$row") || return 4
+        else
+            format=$(printf '%s\n' "$archive_formats" | cut -f3) || return 4
+            triple=$(config_get_target_triples "$config_tool" "$platform") || return 4
+            [[ "$triple" != *$'\n'* ]] || {
+                log_error "PowerShell installers require one compiler target per Windows platform"; return 4;
+            }
+            [[ -n "$triple" ]] || triple=$(_an_default_target_triple windows "${platform#*/}") || return 4
+            plan=$(artifact_naming_generate_dual_for_tool "$config_tool" "$version_marker" \
+                windows "${platform#*/}" "$format" "$local_path" release "$triple") || return 4
+            name=$(jq -er .versioned <<< "$plan") || return 4
+            # A second real naming invocation disambiguates version tokens
+            # from a coincidental literal marker in a configured asset name.
+            local alternative alternate_name
+            alternative=$(artifact_naming_generate_dual_for_tool "$config_tool" '0.0.0-DSRINSTALLERALTERNATE' \
+                windows "${platform#*/}" "$format" "$local_path" release "$triple") || return 4
+            alternate_name=$(jq -er .versioned <<< "$alternative") || return 4
+            [[ "${name//"$version_marker"/0.0.0-DSRINSTALLERALTERNATE}" == "$alternate_name" ]] || {
+                log_error 'Ambiguous version placeholder in Windows asset name'; return 4;
+            }
+            # shellcheck disable=SC2016 # Runtime JSON token, never evaluated by Bash.
+            name="${name//"$version_marker"/'${version}'}"
+        fi
+        case "$format" in zip) ;; none|exe) format=none ;; *)
+            log_error "PowerShell installers support ZIP and raw Windows executables: $platform uses $format"
+            return 4 ;;
+        esac
+        if [[ "$format" == none && "$(jq length <<< "$names")" != 1 ]]; then
+            log_error "Raw Windows assets cannot contain multiple workspace executables"; return 4
+        fi
+        policy=$(jq -c --arg platform "$platform" --arg name "$name" --arg format "$format" \
+            --arg triple "$triple" --slurpfile binaries /dev/fd/3 '
+            if ($name | gsub("\\$\\{version\\}"; "1.2.3") |
+                test("^[A-Za-z0-9][A-Za-z0-9._+-]{0,239}$") and
+                (contains("..") | not) and
+                (endswith(".") | not) and
+                (test("(?i)^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\\.|$)") | not) and
+                (test("(?i)^(cache\\.json|SHA256SUMS(?:\\.txt)?|checksums\\.(?:sha256|txt))$|(?i)-SHA256SUMS\\.txt$") | not))
+            then .[$platform]={name:$name,format:$format,binaries:$binaries[0],target_triple:$triple}
+            else error("unsafe Windows release basename") end
+        ' 3<<< "$names" <<< "$policy") || return 4
+    done < <(jq -r '.[] | select(startswith("windows/"))' <<< "$targets")
+    jq -ce --arg tool "$tool" --arg repo "$repo" --arg binary "$binary" --arg key "$key" '
+        if length == 0 then error("no Windows targets are configured") else
+            {schema_version:1,tool:$tool,repo:$repo,
+             binary_name:($binary | sub("(?i)\\.exe$"; "") + ".exe"),
+             public_key:$key,platforms:.} end
+    ' <<< "$policy" || return 4
+)
+
+# Generate one standalone native Windows installer; dry-run validates policy
+# and existing output custody without creating any destination or lock.
+install_gen_create_powershell() (
+    local requested="${1:-}" selected_root='' dry_run=false config_file policy tool observation template encoded
+    _install_gen_name "$requested" || return 4
+    shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --config-dir)
+                [[ $# -ge 2 && -d "$2" && "$2" != *[[:cntrl:]]* ]] || return 4
+                selected_root=$(CDPATH='' cd -- "$2" && pwd -P) || return 4
+                shift 2 ;;
+            --dry-run) dry_run=true; shift ;;
+            *) return 4 ;;
+        esac
+    done
+    local _IG_OUTPUT_SHELL=powershell
+    local _IG_CONFIG_DIR="${selected_root:-$_IG_CONFIG_DIR}"
+    local _IG_REPOS_D="$_IG_CONFIG_DIR/repos.d"
+    config_file=$(_install_gen_load_config "$requested" "$selected_root") || return $?
+    policy=$(_install_gen_windows_policy "$config_file" "$requested") || return $?
+    tool=$(jq -er .tool <<< "$policy") || return 4
+    observation=$(_install_gen_output inspect "$_IG_OUTPUT_DIR" "$tool") || return $?
+    if $dry_run; then
+        printf '%s/%s/install.ps1\n' "${_IG_OUTPUT_DIR%/}" "$tool"
+        return 0
+    fi
+    [[ -f "$_IG_SCRIPT_DIR/install_gen_windows.ps1" && ! -L "$_IG_SCRIPT_DIR/install_gen_windows.ps1" ]] || return 3
+    template=$(cat "$_IG_SCRIPT_DIR/install_gen_windows.ps1") || return 3
+    [[ "$template" == *'__DSR_WINDOWS_INSTALL_POLICY_B64__'* ]] || return 3
+    encoded=$(printf '%s' "$policy" | base64 | tr -d '\r\n') || return 3
+    template="${template//__DSR_WINDOWS_INSTALL_POLICY_B64__/"$encoded"}"
+    printf '%s\n' "$template" | _install_gen_output publish "$_IG_OUTPUT_DIR" "$tool" "$observation"
+)
+
+install_gen_validate_powershell() (
+    local tool="${1:-}" _IG_OUTPUT_SHELL=powershell
+    [[ $# == 1 ]] && _install_gen_name "$tool" || return 4
+    _install_gen_output validate "$_IG_OUTPUT_DIR" "$tool"
+)
+
 # Generate installers for all tools in repos.d
 install_gen_all() {
     local config_dirs=("./config/repos.d" "$_IG_REPOS_D")
@@ -3054,3 +3225,4 @@ install_gen_validate() {
 
 # Export functions
 export -f install_gen_create install_gen_all install_gen_validate
+export -f install_gen_create_powershell install_gen_validate_powershell
