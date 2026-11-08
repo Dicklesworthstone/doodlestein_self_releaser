@@ -1268,6 +1268,39 @@ dsr report --repo ntm --json                    # One tool, machine-readable
 Each run lists its command, tool, outcome and duration; failed runs (usage
 errors and interrupts aside) also appear as alerts with their error codes.
 
+### `dsr prune`
+
+Remove old artifacts, logs and ordinary cache entries, or explicitly retire
+finished strict build snapshots and their private Cargo caches:
+
+```bash
+dsr prune --dry-run --max-age 30 --keep-last 5
+dsr prune --snapshots --dry-run --max-age 30 --keep-last 5
+dsr prune --snapshots --max-age 30 --keep-last 5 --force
+```
+
+`--snapshots` considers only source snapshots; it preserves release output,
+logs, ordinary caches, checkpoints and source/relocation history. A run must
+have completed every native task, retain its exact successful artifacts, and
+have completed publication into its local artifact set. Running, failed,
+unfinished and diagnostic runs remain available for recovery. The `latest`
+run, recent runs and the configured `--keep-last` runs are always retained.
+Recorded published releases are also retained by default; add
+`--no-keep-releases` to permit their otherwise eligible snapshots to be retired.
+
+New strict Unix snapshots carry private ownership receipts created before any
+source is copied. Cleanup verifies the original directory and marker identities,
+the configured host route, and both build leases before removing a snapshot.
+It includes retired hosts from synchronization and relocation history.
+Legacy snapshots without those original receipts and native Windows snapshots
+are retained. Snapshot paths alone never authorize deletion.
+
+Cleanup records successful hosts individually. If one SSH host is unavailable,
+the command reports a partial result; retrying resumes the remaining hosts
+without double-counting earlier removals. `--dry-run` and the global `-n`
+inspect the same evidence without creating leases, modifying snapshots or
+writing cleanup records. Use `--json` for per-host results and retention reasons.
+
 ### `dsr version`
 
 Detect a repository's authoritative version and create an annotated release

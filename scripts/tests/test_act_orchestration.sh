@@ -2405,6 +2405,7 @@ fi
 # including successful sibling artifacts and failures before recipe execution.
 # Source snapshots, native Go compilation, collection, state and locks are real;
 # health/slot decisions are controlled local boundaries, not host qualification.
+# --snapshot-owners-only reuses the public strict-sync/checkpoint fixture.
 # --relocation-matrix-only, --relocation-variant-only and --relocation-preview-only use explicit ELF/PE
 # header producers and a Cargo metadata adapter. They test the task, source,
 # checkpoint and manifest protocol, not native Rust compilation, libc
@@ -2415,7 +2416,8 @@ test_relocation_recovery() {
     for dependency in python3 git jq yq go rsync tar gzip; do
         if [[ "$dependency" == go &&
               ( "${1:-}" == --relocation-matrix-only || "${1:-}" == --relocation-variant-only ||
-                "${1:-}" == --relocation-preview-only || "${1:-}" == --recipe-binding-only ) ]]; then continue; fi
+                "${1:-}" == --relocation-preview-only || "${1:-}" == --recipe-binding-only ||
+                "${1:-}" == --snapshot-owners-only ) ]]; then continue; fi
         command -v "$dependency" >/dev/null || {
             printf 'Missing relocation integration dependency: %s\n' "$dependency" >&2
             return 77
@@ -2437,7 +2439,8 @@ hosts_only = sys.argv[2] == '--relocation-hosts-only'
 variant_only = sys.argv[2] == '--relocation-variant-only'
 preview_only = sys.argv[2] == '--relocation-preview-only'
 recipe_only = sys.argv[2] == '--recipe-binding-only'
-matrix_only = variant_only or preview_only or recipe_only or sys.argv[2] == '--relocation-matrix-only'
+snapshot_only = sys.argv[2] == '--snapshot-owners-only'
+matrix_only = variant_only or preview_only or recipe_only or snapshot_only or sys.argv[2] == '--relocation-matrix-only'
 root = Path(tempfile.mkdtemp(prefix='dsr-relocation-recovery-'))
 print('Retained relocation recovery evidence: ' + str(root), flush=True)
 systems = {'Linux': 'linux', 'Darwin': 'darwin'}
@@ -2622,6 +2625,17 @@ if [[ "${RELOC_MUTATE_HOSTS_AFTER_SYNC:-0}" == 1 && "$RELOC_PHASE" != first ]]; 
         printf '%s\n' "$sync_result" > "$RELOC_CASE/sync-before-host-drift.json" || exit 1
         yq -i '.hosts.replacement.concurrency = 3' "$DSR_HOSTS_FILE" || exit 1
         printf '%s\n' "$sync_result"
+    )
+fi
+if [[ "${RELOC_SNAPSHOT_OWNER_FIXTURE:-0}" == 1 ]]; then
+    act_sync_sources() (
+        # Observe the actual public sync result without substituting its
+        # issuer, archive transfer, admission or owner-receipt implementation.
+        source "$RELOC_PROJECT/src/act_runner.sh" || exit 1
+        local output
+        output=$(act_sync_sources "$@") || exit $?
+        printf '%s\n' "$output" > "$RELOC_CASE/owner-sync.json" || exit 1
+        printf '%s\n' "$output"
     )
 fi
 if [[ "$RELOC_PHASE" == compare ]]; then
@@ -2925,6 +2939,69 @@ def mutate_evidence(transform):
         save(path, state)
     return change
 
+
+if snapshot_only:
+    # Native payloads and host health remain the existing labeled fixture
+    # boundaries. Source sync, filesystem custody, CLI forwarding, checkpoint
+    # persistence and exact-run resume are all production operations.
+    for synthetic in (False, True):
+        label = 'builtin-act-owner' if synthetic else 'configured-host-owner'
+        case, env, targets = fixture(label, 'matrix')
+        env['RELOC_SNAPSHOT_OWNER_FIXTURE'] = '1'
+        if synthetic:
+            config_path = case / 'config/repos.d/relocfixture.yaml'
+            config = read(config_path)
+            for target in targets:
+                config['cross_compile'][target]['host'] = 'act'
+            save(config_path, config)
+            env['DSR_STRICT_BUILD_ROOT'] = str(case / 'builtin-act')
+            check(label + ': fixture has no configured act host',
+                  'act' not in read(Path(env['DSR_HOSTS_FILE']))['hosts'])
+        code, first = invoke(case, env, 'first')
+        details = first.get('details', {})
+        if not check(label + ': public build completes both retained variants and records one failed target',
+                     code == 1 and details.get('success') == 2 and details.get('failed') == 1):
+            print((case / 'first.stderr').read_text()[-7000:], flush=True)
+            raise AssertionError('Snapshot owner fixture did not reach its partial build')
+        env['RELOC_RUN'] = details['run_id']
+        path = state_file(case, env['RELOC_RUN'])
+        initial, synced = read(path), read(case / 'owner-sync.json')
+        owners = initial['context'].get('snapshot_owners', {})
+        expected_hosts = ['act'] if synthetic else ['completed', 'original']
+        check(label + ': public sync returns pins and CLI/coordinator retain them exactly',
+              bool(owners) and owners == synced.get('snapshot_owners') and
+              sorted(owners) == expected_hosts and
+              initial['context']['source_roots'] == synced['source_roots'])
+        retained_markers = {}
+        for host, pin in owners.items():
+            snapshot = Path(pin['path'])
+            marker, protection = snapshot / '.dsr-snapshot-owner.json', snapshot / '.sbh-protect'
+            info = snapshot.stat()
+            check(label + '/' + host + ': pin binds actual private root and exact owner marker bytes',
+                  pin['host'] == host and pin['tool'] == 'relocfixture' and
+                  pin['run_id'] == env['RELOC_RUN'] and pin['git_sha'] == initial['git_sha'] and
+                  pin['source_root'] == initial['context']['source_roots'][host] and
+                  pin['device'] == str(info.st_dev) and pin['inode'] == str(info.st_ino) and
+                  info.st_mode & 0o777 == 0o700 and marker.stat().st_mode & 0o777 == 0o600 and
+                  protection.stat().st_mode & 0o777 == 0o600 and
+                  pin['receipt_sha256'] == digest(marker) and
+                  pin['protection_sha256'] == digest(protection) and
+                  read(marker) == {key: value for key, value in pin.items()
+                                   if key not in ('receipt_sha256', 'receipt_identity')} and
+                  protection.read_bytes() == b'DSR strict release snapshot\n')
+            check(label + '/' + host + ': source staging succeeds with the already-issued protection marker',
+                  (snapshot / 'source/main.go').read_bytes() == (case / 'source/main.go').read_bytes() and
+                  (snapshot / '.source.manifest').is_file() and
+                  pin['route'] == dict(transport='local', destination='', platform=(
+                      systems[platform.system()] + '/' + architectures[platform.machine()] if synthetic
+                      else native)))
+            retained_markers.update({p: (digest(p), p.stat().st_ino) for p in (marker, protection)})
+        (case / 'failures').write_text('')
+        code, resumed = invoke(case, env, 'ordinary-resume')
+        check(label + ': exact-run resume preserves original pins and marker bytes/inodes',
+              code == 0 and read(path)['context']['snapshot_owners'] == owners and unchanged(retained_markers))
+    print('Snapshot ownership propagation: %d checks, %d failures' % (checks, failures), flush=True)
+    raise SystemExit(bool(failures))
 
 if recipe_only:
     # Run genuine public partial builds before testing admission. Only the
@@ -3951,7 +4028,8 @@ PY
 
 if [[ "${1:-}" == --relocation-recovery-only || "${1:-}" == --relocation-hosts-only ||
       "${1:-}" == --relocation-matrix-only || "${1:-}" == --relocation-variant-only ||
-      "${1:-}" == --relocation-preview-only || "${1:-}" == --recipe-binding-only ]]; then
+      "${1:-}" == --relocation-preview-only || "${1:-}" == --recipe-binding-only ||
+      "${1:-}" == --snapshot-owners-only ]]; then
     test_relocation_recovery "$1"
     exit $?
 fi

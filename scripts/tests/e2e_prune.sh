@@ -4,7 +4,7 @@
 # Tests prune subcommand with real behavior (no mocks).
 # Verifies safety guardrails, dry-run, and JSON output.
 #
-# Run: ./scripts/tests/e2e_prune.sh
+# Run: ./scripts/tests/e2e_prune.sh [--snapshot-only|--snapshot-race-only|--snapshot-boundary-only]
 
 set -uo pipefail
 
@@ -463,6 +463,34 @@ print(json.dumps(rows, separators=(',', ':')))
 PY
 }
 
+# Snapshot previews must not create cleanup receipts, lease files, logs, or
+# change protected source/cache metadata. Inspect every entry without following
+# directory links; omit only atime, which a read-only probe may legitimately
+# advance on a filesystem mounted without noatime.
+prune_snapshot_inventory() {
+    python3 - "$@" <<'PY'
+import hashlib, json, os, stat, sys
+rows = []
+def visit(path):
+    if not os.path.lexists(path):
+        rows.append([path, 'missing'])
+        return
+    info = os.lstat(path)
+    data = (os.readlink(path) if stat.S_ISLNK(info.st_mode) else
+            hashlib.sha256(open(path, 'rb').read()).hexdigest()
+            if stat.S_ISREG(info.st_mode) else '')
+    rows.append([path, info.st_dev, info.st_ino, info.st_mode, info.st_uid,
+                 info.st_gid, info.st_nlink, info.st_size, info.st_mtime_ns,
+                 info.st_ctime_ns, data])
+    if stat.S_ISDIR(info.st_mode):
+        for name in sorted(os.listdir(path)):
+            visit(os.path.join(path, name))
+for root in sys.argv[1:]:
+    visit(root)
+print(json.dumps(rows, separators=(',', ':')))
+PY
+}
+
 seed_prune_old_run() {
     local tool="$1" version="$2" run="$3" roots="${4:-}" history="${5:-}"
     local directory="$DSR_STATE_DIR/builds/$tool/$version/$run"
@@ -489,7 +517,8 @@ seed_prune_artifact_set() {
     local tool="$1" tag="$2" publication="${3:-completed}"
     local set_name="$tool-$tag" purpose=release publishable=true
     local directory="$DSR_STATE_DIR/artifacts/$set_name" manifest digest
-    local run=22222222-2222-4222-8222-222222222222 sha=1111111111111111111111111111111111111111
+    local run="${4:-22222222-2222-4222-8222-222222222222}"
+    local sha="${5:-1111111111111111111111111111111111111111}"
     [[ "$publication" != nonpublishable ]] || { purpose=diagnostic-native; publishable=false; }
     (umask 077; mkdir -p "$directory") || return 1
     printf 'retained release payload for %s\n' "$set_name" > "$directory/payload"
@@ -1156,6 +1185,943 @@ test_prune_stream_separation() {
 }
 
 # ============================================================================
+# Explicit strict snapshot reclamation
+# ============================================================================
+
+seed_prune_snapshot_config() {
+    seed_minimal_config || return 1
+    cat > "$DSR_CONFIG_DIR/hosts.yaml" <<'YAML'
+hosts:
+  snap_local:
+    platform: linux/amd64
+    connection: local
+  snap_history:
+    platform: linux/amd64
+    connection: local
+  snap_relocated:
+    platform: linux/amd64
+    connection: local
+  snap_remote:
+    platform: linux/amd64
+    connection: ssh
+    ssh_host: snapshot-test-target
+YAML
+}
+
+# Invoke the production issuer and descriptor-relative filesystem implementation
+# in a fresh shell; no source admission, ownership, removal, or lease helper is
+# replaced by the tests. Only the explicit transport test substitutes SSH's
+# network boundary, and still executes its real streamed producer program.
+prune_snapshot_backend() (
+    export DSR_HOSTS_FILE="$DSR_CONFIG_DIR/hosts.yaml"
+    # shellcheck source=../../src/logging.sh
+    source "$PROJECT_ROOT/src/logging.sh" || exit 1
+    # shellcheck source=../../src/act_runner.sh
+    source "$PROJECT_ROOT/src/act_runner.sh" || exit 1
+    "$@"
+)
+
+seed_prune_owned_snapshot() {
+    local tool="$1" run="$2" host="$3"
+    local sha="${4:-1111111111111111111111111111111111111111}"
+    local base="$TEST_TMPDIR/snapshots/$host"
+    mkdir -p "$base" || return 1
+    PRUNE_SNAPSHOT_SOURCE="$base/$tool-$run/source"
+    PRUNE_SNAPSHOT_PIN=$(prune_snapshot_backend _act_create_strict_snapshot_owner \
+        "$host" "$PRUNE_SNAPSHOT_SOURCE" "$tool" "$run" "$sha") || return 1
+    mkdir -p "$PRUNE_SNAPSHOT_SOURCE" "${PRUNE_SNAPSHOT_SOURCE%/source}/.cargo-home/registry" || return 1
+    printf 'frozen source for %s on %s\n' "$tool" "$host" > "$PRUNE_SNAPSHOT_SOURCE/input.rs"
+    printf 'offline cache for %s on %s\n' "$tool" "$host" > "${PRUNE_SNAPSHOT_SOURCE%/source}/.cargo-home/registry/pinned"
+    chmod 600 "$PRUNE_SNAPSHOT_SOURCE/input.rs" "${PRUNE_SNAPSHOT_SOURCE%/source}/.cargo-home/registry/pinned"
+}
+
+seed_prune_snapshot_run() {
+    local tool="$1" version="$2" run="$3" host="${4:-snap_local}"
+    local sha=1111111111111111111111111111111111111111
+    local tag="v${version#v}" output result receipts directory
+    seed_prune_owned_snapshot "$tool" "$run" "$host" "$sha" || return 1
+    seed_prune_artifact_set "$tool" "$tag" completed "$run" "$sha" || return 1
+    output="$DSR_STATE_DIR/artifacts/$tool-$tag"
+    result=$(jq -nc --arg path "$output/payload" --arg host "$host" \
+        '{status:"success",exit_code:0,host:$host,platform:"linux/amd64",
+          task_key:"linux/amd64",method:"native",build_purpose:"release",publishable:true,
+          artifact_path:$path}') || return 1
+    receipts=$(prune_snapshot_backend _act_result_artifact_receipts "$result") || return 1
+    result=$(jq -nc --argjson result "$result" --argjson receipts "$receipts" \
+        '$result + {resume_artifacts:$receipts}') || return 1
+    directory="$DSR_STATE_DIR/builds/$tool/$version/$run"
+    (umask 077; mkdir -p "$directory") || return 1
+    jq -nc --arg tool "$tool" --arg version "$version" --arg run "$run" \
+        --arg sha "$sha" --arg host "$host" --arg root "$PRUNE_SNAPSHOT_SOURCE" \
+        --argjson pin "$PRUNE_SNAPSHOT_PIN" --argjson result "$result" --arg output "$output" '
+        {tool:$tool,version:$version,run_id:$run,status:"completed",git_sha:$sha,git_ref:("v" + ($version | ltrimstr("v"))),
+         created_at:"2025-01-01T00:00:00Z",updated_at:"2025-01-01T00:00:00Z",
+         targets:["linux/amd64"],hosts:{($host):{status:"completed",attempts:1}},
+         target_statuses:{"linux/amd64":{status:"completed",attempts:1,result:$result}},
+         context:{build_purpose:"release",publishable:true,source_roots:{($host):$root},
+           snapshot_owners:{($host):$pin},target_hosts:{"linux/amd64":$host},
+           build_tasks:[{key:"linux/amd64",platform:"linux/amd64",target_triple:"",method:"native"}],
+           source_sync:null,output_dir:$output,parallel_jobs:1},source_sync_history:[],relocations:[]}
+      ' > "$directory/state.json" || return 1
+    python3 - "$directory" <<'PY'
+import os, sys, time
+old = time.time() - 60 * 86400
+os.utime(sys.argv[1], (old, old))
+PY
+    PRUNE_SNAPSHOT_STATE="$directory/state.json"
+}
+
+# Fixture rewrites are deliberate changes made before the public command. Keep
+# their retirement age fixed; the production checkpoint writer is never patched
+# or intercepted.
+prune_snapshot_edit_state() {
+    local file="$1" filter="$2"
+    shift 2
+    local mtime
+    mtime=$(python3 -c 'import os, sys; print(os.stat(os.path.dirname(sys.argv[1])).st_mtime_ns)' "$file") || return 1
+    jq "$@" "$filter" "$file" > "$file.fixture-next" && mv "$file.fixture-next" "$file" || return 1
+    python3 - "$file" "$mtime" <<'PY'
+import os, sys
+directory = os.path.dirname(sys.argv[1])
+os.utime(directory, ns=(os.stat(directory).st_atime_ns, int(sys.argv[2])))
+PY
+}
+
+prune_snapshot_reported() {
+    local source="$1" status="$2"
+    exec_stdout | jq -e --arg source "$source" --arg status "$status" \
+        'any(.details.snapshot_results[]?; .source_root == $source and .status == $status)' >/dev/null
+}
+
+prune_snapshot_retained() {
+    local source="$1" reason="$2"
+    exec_stdout | jq -e --arg source "$source" --arg reason "$reason" \
+        'any(.details.retained_snapshot_paths[]?; .path == $source and .reason == $reason)' >/dev/null
+}
+
+test_prune_snapshots_reclaims_owned_only() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_prune_snapshot_config
+    local tool=snapshot-tool version=v1.0.0 run=33333333-3333-4333-8333-333333333333
+    local source pin state before_state before_other after_other inspection problems=()
+    if ! seed_prune_snapshot_run "$tool" "$version" "$run"; then
+        fail "snapshot fixture is issued by the production owner helper"
+        harness_teardown
+        return
+    fi
+    source="$PRUNE_SNAPSHOT_SOURCE" pin="$PRUNE_SNAPSHOT_PIN" state="$PRUNE_SNAPSHOT_STATE"
+    mkdir -p "$DSR_STATE_DIR/logs/2020-01-01" "$DSR_CACHE_DIR/old-cache"
+    printf 'retained ordinary log\n' > "$DSR_STATE_DIR/logs/2020-01-01/run.log"
+    printf 'retained ordinary cache\n' > "$DSR_CACHE_DIR/old-cache/data"
+    python3 - "$DSR_STATE_DIR/logs/2020-01-01" "$DSR_STATE_DIR/logs/2020-01-01/run.log" "$DSR_CACHE_DIR/old-cache" <<'PY'
+import os, sys, time
+old = time.time() - 60 * 86400
+for path in sys.argv[1:]:
+    os.utime(path, (old, old))
+PY
+    before_state=$(jq -cS 'del(.snapshot_cleanup,.updated_at)' "$state")
+    before_other=$(prune_snapshot_inventory "$DSR_STATE_DIR/artifacts" "$DSR_CACHE_DIR" "$DSR_STATE_DIR/logs/2020-01-01")
+    inspection=$(prune_snapshot_backend _act_reclaim_strict_snapshot snap_local "$pin" inspect) || problems+=("owner inspection refused fixture")
+    exec_run "$DSR_CMD" --json prune --snapshots --max-age 30 --keep-last 0 --force
+    cp "$_EXEC_STDOUT_FILE" "$TEST_TMPDIR/snapshot-success-envelope.json" || problems+=("successful cleanup envelope could not be retained")
+    [[ "$(exec_status)" -eq 0 ]] || problems+=("snapshot prune failed")
+    [[ ! -e "${source%/source}" && ! -L "${source%/source}" ]] || problems+=("owned source and private cache remained")
+    [[ -f "$state" && "$before_state" == "$(jq -cS 'del(.snapshot_cleanup,.updated_at)' "$state")" ]] || problems+=("checkpoint provenance changed")
+    after_other=$(prune_snapshot_inventory "$DSR_STATE_DIR/artifacts" "$DSR_CACHE_DIR" "$DSR_STATE_DIR/logs/2020-01-01")
+    [[ "$before_other" == "$after_other" ]] || problems+=("snapshot-only mode changed artifacts, ordinary cache, or old logs")
+    prune_snapshot_reported "$source" removed || problems+=("removed snapshot was not reported")
+    exec_stdout | jq -e --argjson expected "${inspection:-null}" '
+        .details.snapshots_only == true and .details.pruned_count == 1 and
+        .details.bytes_freed == $expected.size_bytes and .details.bytes_freed > 0 and
+        (.details.pruned_paths | length == 1) and .details.pruned_paths[0].status == "removed"
+      ' >/dev/null || problems+=("removed bytes or explicit snapshot mode was misreported")
+    jq -e --arg source "$source" --argjson pin "$pin" '
+        .snapshot_cleanup.schema_version == 1 and (.snapshot_cleanup.roots | length == 1) and
+        .snapshot_cleanup.roots[0].source_root == $source and
+        .snapshot_cleanup.roots[0].owner_pin == $pin and
+        .snapshot_cleanup.roots[0].result.status == "removed" and
+        (.snapshot_cleanup.retention_mtime | type == "number")
+      ' "$state" >/dev/null || problems+=("per-root cleanup journal lost original ownership")
+    # The checkpoint remains old by its retained selection time even though its
+    # journal write changes the directory mtime. A retry must not charge bytes
+    # again or require that the now-absent receipt be recreated.
+    exec_run "$DSR_CMD" --json prune --snapshots --max-age 30 --keep-last 0 --force
+    [[ "$(exec_status)" -eq 0 ]] && prune_snapshot_reported "$source" already_absent || problems+=("completed cleanup did not replay idempotently")
+    exec_stdout | jq -e '.details.pruned_count == 0 and .details.bytes_freed == 0' >/dev/null || problems+=("repeat cleanup double-counted removed bytes")
+    jq -e '.snapshot_cleanup.roots | length == 1' "$state" >/dev/null || problems+=("repeat cleanup duplicated its journal")
+    prune_case_result "snapshot prune removes only issued source/cache ownership, preserves provenance, and retries without double charging" "${problems[@]}"
+    harness_teardown
+}
+
+test_prune_snapshots_preview_read_only() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_prune_snapshot_config
+    local run=44444444-4444-4444-8444-444444444444 source before after problems=()
+    if ! seed_prune_snapshot_run preview-tool 1.0.0 "$run"; then
+        fail "snapshot preview fixture is issued by the production owner helper"
+        harness_teardown
+        return
+    fi
+    source="$PRUNE_SNAPSHOT_SOURCE"
+    before=$(prune_snapshot_inventory "$DSR_CONFIG_DIR" "$DSR_STATE_DIR" "$DSR_CACHE_DIR" "$TEST_TMPDIR/snapshots")
+    exec_run "$DSR_CMD" --json --dry-run prune --snapshots --max-age 30 --keep-last 0 --force
+    after=$(prune_snapshot_inventory "$DSR_CONFIG_DIR" "$DSR_STATE_DIR" "$DSR_CACHE_DIR" "$TEST_TMPDIR/snapshots")
+    [[ "$(exec_status)" -eq 0 && "$before" == "$after" ]] || problems+=("global preview changed protected bytes or filesystem metadata")
+    prune_snapshot_reported "$source" eligible || problems+=("eligible source was not previewed")
+    exec_stdout | jq -e '.details.snapshots_only == true and .details.dry_run == true and
+        .details.pruned_count == 1 and .details.bytes_freed > 0' >/dev/null || problems+=("preview projection is incomplete")
+    [[ ! -e "$DSR_STATE_DIR/builds/preview-tool/1.0.0/.lock" &&
+       ! -e "$DSR_STATE_DIR/builds/preview-tool/v1.0.0/.lock" ]] || problems+=("preview created a canonical or recorded-version lease")
+    jq -e 'has("snapshot_cleanup") | not' "$PRUNE_SNAPSHOT_STATE" >/dev/null || problems+=("preview wrote cleanup journal")
+    exec_run "$DSR_CMD" --json prune --snapshots --dry-run --max-age 30 --keep-last 0 --force
+    after=$(prune_snapshot_inventory "$DSR_CONFIG_DIR" "$DSR_STATE_DIR" "$DSR_CACHE_DIR" "$TEST_TMPDIR/snapshots")
+    [[ "$(exec_status)" -eq 0 && "$before" == "$after" ]] || problems+=("subcommand preview changed protected bytes or filesystem metadata")
+    prune_snapshot_reported "$source" eligible || problems+=("subcommand preview omitted eligible source")
+    prune_case_result "both snapshot previews leave source, cache, state, config, log and absent lease metadata unchanged" "${problems[@]}"
+    harness_teardown
+}
+
+test_prune_snapshots_historical_roots() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_prune_snapshot_config
+    local tool=history-tool run=55555555-5555-4555-8555-555555555555
+    local state current history relocated original problems=()
+    if ! seed_prune_snapshot_run "$tool" v1.0.0 "$run"; then
+        fail "historical snapshot fixture is issued by the production owner helper"
+        harness_teardown
+        return
+    fi
+    state="$PRUNE_SNAPSHOT_STATE" current="$PRUNE_SNAPSHOT_SOURCE"
+    seed_prune_owned_snapshot "$tool" "$run" snap_history || problems+=("history owner could not be issued")
+    history="$PRUNE_SNAPSHOT_SOURCE"
+    prune_snapshot_edit_state "$state" '.source_sync_history = [{recorded_at:"2025-01-01T00:00:00Z",receipt:{source_roots:{snap_history:$root},snapshot_owners:{snap_history:$pin}}}]' \
+        --arg root "$history" --argjson pin "$PRUNE_SNAPSHOT_PIN" || problems+=("history fixture failed")
+    seed_prune_owned_snapshot "$tool" "$run" snap_relocated || problems+=("relocation owner could not be issued")
+    relocated="$PRUNE_SNAPSHOT_SOURCE"
+    prune_snapshot_edit_state "$state" '.relocations = [{verified_source_sync:{source_roots:{snap_relocated:$root},snapshot_owners:{snap_relocated:$pin}},prior_context:.context}] |
+        .context.source_sync = {source_roots:.context.source_roots,snapshot_owners:.context.snapshot_owners}' \
+        --arg root "$relocated" --argjson pin "$PRUNE_SNAPSHOT_PIN" || problems+=("relocation fixture failed")
+    original=$(jq -cS 'del(.snapshot_cleanup,.updated_at)' "$state")
+    exec_run "$DSR_CMD" --json prune --snapshots --max-age 30 --keep-last 0 --force
+    [[ "$(exec_status)" -eq 0 ]] || problems+=("historical reclaim failed")
+    local source
+    for source in "$current" "$history" "$relocated"; do
+        [[ ! -e "${source%/source}" ]] && prune_snapshot_reported "$source" removed || problems+=("historical root was missed: $source")
+    done
+    exec_stdout | jq -e '.details.pruned_count == 3 and (.details.snapshot_results | length == 3)' >/dev/null || problems+=("duplicate current/source-sync/prior-context references were counted twice")
+    jq -e '.snapshot_cleanup.roots | length == 3' "$state" >/dev/null || problems+=("historical roots were not individually journaled")
+    [[ "$original" == "$(jq -cS 'del(.snapshot_cleanup,.updated_at)' "$state")" ]] || problems+=("historical source and relocation evidence was rewritten")
+    prune_case_result "snapshot reclaim unions current, repeated sync, and prior relocation ownership without losing provenance" "${problems[@]}"
+    harness_teardown
+}
+
+test_prune_snapshots_ownership_refusals() {
+    local kind
+    for kind in legacy nonce root-mode receipt-mode receipt-replaced protection-replaced root-replaced root-link ancestor-link route external-hardlink owner; do
+        ((TESTS_RUN++))
+        harness_setup
+        seed_prune_snapshot_config
+        local tool=unsafe-snapshot run=66666666-6666-4666-8666-666666666666
+        local source parent state before after problems=()
+        if [[ "$kind" == owner && "${EUID:-1}" -ne 0 ]]; then
+            skip "snapshot owner-UID refusal requires permission to create a differently owned fixture"
+            harness_teardown
+            continue
+        fi
+        if ! seed_prune_snapshot_run "$tool" v1.0.0 "$run"; then
+            fail "snapshot $kind fixture is issued by the production owner helper"
+            harness_teardown
+            continue
+        fi
+        source="$PRUNE_SNAPSHOT_SOURCE" parent="${PRUNE_SNAPSHOT_SOURCE%/source}" state="$PRUNE_SNAPSHOT_STATE"
+        case "$kind" in
+            legacy) prune_snapshot_edit_state "$state" 'del(.context.snapshot_owners)' ;;
+            nonce) prune_snapshot_edit_state "$state" '.context.snapshot_owners.snap_local.nonce = "forged-nonce"' ;;
+            root-mode) chmod 755 "$parent" ;;
+            receipt-mode) chmod 644 "$parent/.dsr-snapshot-owner.json" ;;
+            receipt-replaced)
+                cp "$parent/.dsr-snapshot-owner.json" "$parent/receipt-copy"
+                chmod 600 "$parent/receipt-copy"
+                mv "$parent/receipt-copy" "$parent/.dsr-snapshot-owner.json"
+                ;;
+            protection-replaced)
+                cp "$parent/.sbh-protect" "$parent/protection-copy"
+                chmod 600 "$parent/protection-copy"
+                mv "$parent/protection-copy" "$parent/.sbh-protect"
+                ;;
+            root-replaced)
+                mv "$parent" "$parent.original"
+                cp -a "$parent.original" "$parent"
+                ;;
+            root-link)
+                mv "$parent" "$parent.original"
+                ln -s "$parent.original" "$parent"
+                ;;
+            ancestor-link)
+                mv "${parent%/*}" "${parent%/*}.original"
+                ln -s "${parent%/*}.original" "${parent%/*}"
+                ;;
+            route)
+                yq -o=json '.hosts.snap_local.platform = "darwin/arm64"' "$DSR_CONFIG_DIR/hosts.yaml" > "$DSR_CONFIG_DIR/hosts.next"
+                mv "$DSR_CONFIG_DIR/hosts.next" "$DSR_CONFIG_DIR/hosts.yaml"
+                ;;
+            external-hardlink) ln "$source/input.rs" "$TEST_TMPDIR/external-hardlink" ;;
+            owner) chown 65534 "$parent" ;;
+        esac
+        before=$(prune_snapshot_inventory "$TEST_TMPDIR/snapshots" "$state" "$DSR_STATE_DIR/artifacts" "$TEST_TMPDIR/external-hardlink")
+        exec_run "$DSR_CMD" --json prune --snapshots --max-age 30 --keep-last 0 --force
+        after=$(prune_snapshot_inventory "$TEST_TMPDIR/snapshots" "$state" "$DSR_STATE_DIR/artifacts" "$TEST_TMPDIR/external-hardlink")
+        [[ "$(exec_status)" -eq 0 && "$before" == "$after" ]] || problems+=("unsafe $kind ownership was changed or caused destructive work")
+        exec_stdout | jq -e '.details.pruned_count == 0 and .details.bytes_freed == 0' >/dev/null || problems+=("unsafe ownership reported freed bytes")
+        prune_snapshot_retained "$source" snapshot_ownership ||
+            prune_reported_retention "${state%/state.json}" invalid_state || problems+=("unsafe ownership refusal was not reported")
+        jq -e 'has("snapshot_cleanup") | not' "$state" >/dev/null || problems+=("refused root received a cleanup journal")
+        prune_case_result "snapshot reclamation refuses $kind ownership without changing source, output, or checkpoint" "${problems[@]}"
+        # Restore only fixture UID custody so the ordinary harness can clean
+        # its private tree when tests run without DEBUG.
+        [[ "$kind" != owner ]] || chown "${EUID:-0}" "$parent"
+        harness_teardown
+    done
+}
+
+test_prune_snapshots_symlink_contents() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_prune_snapshot_config
+    local run=77777777-7777-4777-8777-777777777777 source outside before after problems=()
+    if ! seed_prune_snapshot_run linked-content v1.0.0 "$run"; then
+        fail "linked-content snapshot fixture is issued by the production owner helper"
+        harness_teardown
+        return
+    fi
+    source="$PRUNE_SNAPSHOT_SOURCE" outside="$TEST_TMPDIR/outside-cache"
+    mkdir "$outside"
+    printf 'unrelated cache must survive\n' > "$outside/valuable"
+    ln -s "$outside" "${source%/source}/.cargo-home/linked-cache"
+    ln -s "$outside/valuable" "$source/linked-file"
+    before=$(prune_snapshot_inventory "$outside")
+    exec_run "$DSR_CMD" --json prune --snapshots --max-age 30 --keep-last 0 --force
+    after=$(prune_snapshot_inventory "$outside")
+    [[ "$(exec_status)" -eq 0 && ! -e "${source%/source}" ]] || problems+=("owned tree with safe unlink-only symlinks was not reclaimed")
+    [[ "$before" == "$after" ]] || problems+=("reclaim followed a source/cache link into unrelated files")
+    prune_snapshot_reported "$source" removed || problems+=("symlink-safe removal was not reported")
+    prune_case_result "snapshot reclaim unlinks source/cache symlinks without following or changing outside targets" "${problems[@]}"
+    harness_teardown
+}
+
+test_prune_snapshots_unfinished_publication() {
+    local kind
+    for kind in running failed pending-output diagnostic missing-marker wrong-run wrong-sha incomplete-target changed-artifact; do
+        ((TESTS_RUN++))
+        harness_setup
+        seed_prune_snapshot_config
+        local run=88888888-8888-4888-8888-888888888888 tool=unfinished-tool
+        local source state output before after problems=()
+        if ! seed_prune_snapshot_run "$tool" v1.0.0 "$run"; then
+            fail "snapshot $kind fixture is issued by the production owner helper"
+            harness_teardown
+            continue
+        fi
+        source="$PRUNE_SNAPSHOT_SOURCE" state="$PRUNE_SNAPSHOT_STATE"
+        output="$DSR_STATE_DIR/artifacts/$tool-v1.0.0"
+        case "$kind" in
+            running|failed) prune_snapshot_edit_state "$state" '.status = $status' --arg status "$kind" ;;
+            pending-output)
+                jq '.publication_status="pending" | .publishable=false' "$output/.dsr-build-purpose.json" > "$output/marker-next"
+                mv "$output/marker-next" "$output/.dsr-build-purpose.json"
+                ;;
+            diagnostic) prune_snapshot_edit_state "$state" '.context.build_purpose="diagnostic-native" | .context.publishable=false' ;;
+            missing-marker) mv "$output/.dsr-build-purpose.json" "$TEST_TMPDIR/missing-marker" ;;
+            wrong-run) prune_snapshot_edit_state "$state" '.run_id="99999999-9999-4999-8999-999999999999"' ;;
+            wrong-sha) prune_snapshot_edit_state "$state" '.git_sha="2222222222222222222222222222222222222222"' ;;
+            incomplete-target) prune_snapshot_edit_state "$state" '.target_statuses["linux/amd64"].status="pending"' ;;
+            changed-artifact) printf 'different successful artifact generation\n' >> "$output/payload" ;;
+        esac
+        before=$(prune_snapshot_inventory "$TEST_TMPDIR/snapshots" "$state" "$DSR_STATE_DIR/artifacts")
+        exec_run "$DSR_CMD" --json prune --snapshots --max-age 30 --keep-last 0 --force
+        after=$(prune_snapshot_inventory "$TEST_TMPDIR/snapshots" "$state" "$DSR_STATE_DIR/artifacts")
+        [[ "$(exec_status)" -eq 0 && "$before" == "$after" ]] || problems+=("unpublishable $kind run lost protected evidence")
+        exec_stdout | jq -e --arg run_path "${state%/state.json}" --arg source "$source" '
+            .details.pruned_count == 0 and .details.bytes_freed == 0 and
+            (any(.details.retained_build_paths[]?; .path == $run_path) or
+             any(.details.retained_snapshot_paths[]?; .path == $source))
+          ' >/dev/null || problems+=("unfinished/unbound publication refusal was not reported")
+        jq -e 'has("snapshot_cleanup") | not' "$state" >/dev/null || problems+=("unfinished run gained cleanup authority")
+        prune_case_result "snapshot reclaim retains $kind run and publication evidence" "${problems[@]}"
+        harness_teardown
+    done
+}
+
+test_prune_snapshots_retention() {
+    local kind
+    for kind in age keep-last latest published-release; do
+        ((TESTS_RUN++))
+        harness_setup
+        seed_prune_snapshot_config
+        local run=99999999-9999-4999-8999-999999999999 tool=retention-tool
+        local source state before after problems=() options=(--max-age 30 --keep-last 0)
+        if ! seed_prune_snapshot_run "$tool" v1.0.0 "$run"; then
+            fail "snapshot $kind retention fixture is issued by the production owner helper"
+            harness_teardown
+            continue
+        fi
+        source="$PRUNE_SNAPSHOT_SOURCE" state="$PRUNE_SNAPSHOT_STATE"
+        case "$kind" in
+            age) options=(--max-age 90 --keep-last 0) ;;
+            keep-last) options=(--max-age 30 --keep-last 1) ;;
+            latest) ln -s "$run" "${state%/$run/state.json}/latest" ;;
+            published-release)
+                mkdir -p "$DSR_STATE_DIR/releases"
+                printf '{"status":"success"}\n' > "$DSR_STATE_DIR/releases/$tool-v1.0.0-upload.json"
+                ;;
+        esac
+        before=$(prune_snapshot_inventory "$TEST_TMPDIR/snapshots" "$state")
+        exec_run "$DSR_CMD" --json prune --snapshots "${options[@]}" --force
+        after=$(prune_snapshot_inventory "$TEST_TMPDIR/snapshots" "$state")
+        [[ "$(exec_status)" -eq 0 && "$before" == "$after" ]] || problems+=("$kind retention failed")
+        exec_stdout | jq -e '.details.pruned_count == 0 and .details.bytes_freed == 0' >/dev/null || problems+=("retained source was charged as reclaimed")
+        if [[ "$kind" == published-release ]]; then
+            prune_reported_retention "${state%/state.json}" release_retention || problems+=("release retention was not explained")
+            exec_run "$DSR_CMD" --json prune --snapshots --max-age 30 --keep-last 0 --no-keep-releases --force
+            [[ "$(exec_status)" -eq 0 && ! -e "${source%/source}" ]] || problems+=("explicit published-release override did not reclaim old source")
+            [[ -f "$DSR_STATE_DIR/releases/$tool-v1.0.0-upload.json" && -f "$state" ]] || problems+=("release override removed provenance")
+        fi
+        prune_case_result "snapshot reclamation honors $kind retention" "${problems[@]}"
+        harness_teardown
+    done
+}
+
+test_prune_snapshots_inherited_custody() {
+    local locked_version
+    for locked_version in 1.0.0 v1.0.0; do
+        ((TESTS_RUN++))
+        harness_setup
+        seed_prune_snapshot_config
+        local tool=custody-snapshot run=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
+        local source state before after control="$TEST_TMPDIR/lease" problems=()
+        if ! seed_prune_snapshot_run "$tool" 1.0.0 "$run"; then
+            fail "snapshot custody fixture is issued by the production owner helper"
+            harness_teardown
+            continue
+        fi
+        source="$PRUNE_SNAPSHOT_SOURCE" state="$PRUNE_SNAPSHOT_STATE"
+        if ! start_prune_lease inherited "$control" "$tool" "$locked_version"; then
+            fail "descendant-only $locked_version build lease could not be acquired"
+            harness_teardown
+            continue
+        fi
+        before=$(prune_snapshot_inventory "$TEST_TMPDIR/snapshots" "$state")
+        exec_run "$DSR_CMD" --json prune --snapshots --max-age 30 --keep-last 0 --force
+        after=$(prune_snapshot_inventory "$TEST_TMPDIR/snapshots" "$state")
+        [[ "$(exec_status)" -eq 0 && "$before" == "$after" ]] || problems+=("descendant-held source or checkpoint was changed")
+        prune_reported_retention "${state%/$run/state.json}" build_custody || problems+=("recorded/canonical build custody refusal was not reported")
+        exec_stdout | jq -e '.details.pruned_count == 0 and .details.bytes_freed == 0' >/dev/null || problems+=("busy snapshot was charged as reclaimed")
+        release_prune_lease "$control" || problems+=("descendant did not release custody")
+        exec_run "$DSR_CMD" --json prune --snapshots --max-age 30 --keep-last 0 --force
+        [[ "$(exec_status)" -eq 0 && ! -e "${source%/source}" ]] || problems+=("retired snapshot was not reclaimed after descendant exit")
+        prune_snapshot_reported "$source" removed || problems+=("post-custody cleanup was not reported")
+        prune_case_result "snapshot cleanup honors inherited $locked_version lease after coordinator exit" "${problems[@]}"
+        harness_teardown
+    done
+}
+
+# This is a transport-boundary fixture, not native-host qualification. The
+# remote issuer/reclaimer are the production streamed programs operating on
+# real private directories. The adapter can make one SSH destination unavailable
+# without replacing owner validation, descriptor walking, journaling, or locks.
+install_prune_snapshot_ssh_boundary() {
+    local directory="$TEST_TMPDIR/ssh-boundary"
+    mkdir -p "$directory/bin" "$directory/control" || return 1
+    cat > "$directory/bin/ssh" <<'BASH'
+#!/usr/bin/env bash
+set -uo pipefail
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o|-p|-l|-i|-F|-J) shift 2 ;;
+        -n|-T|-q|-tt) shift ;;
+        --) shift; break ;;
+        -*) echo "unexpected SSH fixture option: $1" >&2; exit 64 ;;
+        *) break ;;
+    esac
+done
+destination="${1:-}"
+[[ $# -gt 0 ]] && shift
+[[ "$destination" == snapshot-test-target ]] || exit 64
+printf '%s\n' "$destination" >> "$PRUNE_SNAPSHOT_TRANSPORT_CONTROL/calls"
+if [[ -f "$PRUNE_SNAPSHOT_TRANSPORT_CONTROL/unavailable" ]]; then
+    echo 'fixture SSH destination is unavailable' >&2
+    exit 255
+fi
+[[ $# -gt 0 ]] || exit 64
+exec bash -c "$*"
+BASH
+    chmod +x "$directory/bin/ssh" || return 1
+    export PRUNE_SNAPSHOT_TRANSPORT_CONTROL="$directory/control"
+    export PATH="$directory/bin:$PATH"
+}
+
+test_prune_snapshots_partial_transport_retry() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_prune_snapshot_config
+    local original_path="$PATH" tool=partial-tool run=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb
+    local state local_source remote_source before_state local_bytes=0 remote_bytes=0
+    local first_journal outside_before outside_after problems=()
+    install_prune_snapshot_ssh_boundary || problems+=("SSH boundary setup failed")
+    if ! seed_prune_snapshot_run "$tool" v1.0.0 "$run"; then
+        fail "partial snapshot fixture is issued by the production owner helper"
+        export PATH="$original_path"
+        unset PRUNE_SNAPSHOT_TRANSPORT_CONTROL
+        harness_teardown
+        return
+    fi
+    state="$PRUNE_SNAPSHOT_STATE" local_source="$PRUNE_SNAPSHOT_SOURCE"
+    local_bytes=$(prune_snapshot_backend _act_reclaim_strict_snapshot snap_local "$PRUNE_SNAPSHOT_PIN" inspect | jq -er .size_bytes) || problems+=("local owner inspection failed")
+    seed_prune_owned_snapshot "$tool" "$run" snap_remote || problems+=("remote streamed producer failed")
+    remote_source="$PRUNE_SNAPSHOT_SOURCE"
+    remote_bytes=$(prune_snapshot_backend _act_reclaim_strict_snapshot snap_remote "$PRUNE_SNAPSHOT_PIN" inspect | jq -er .size_bytes) || problems+=("remote streamed owner inspection failed")
+    prune_snapshot_edit_state "$state" '.source_sync_history = [{recorded_at:"2025-01-01T00:00:00Z",receipt:{source_roots:{snap_remote:$root},snapshot_owners:{snap_remote:$pin}}}]' \
+        --arg root "$remote_source" --argjson pin "$PRUNE_SNAPSHOT_PIN" || problems+=("remote history fixture failed")
+    before_state=$(jq -cS 'del(.snapshot_cleanup,.updated_at)' "$state")
+    outside_before=$(prune_snapshot_inventory "$DSR_STATE_DIR/artifacts")
+    : > "$PRUNE_SNAPSHOT_TRANSPORT_CONTROL/unavailable"
+    exec_run "$DSR_CMD" --json prune --snapshots --max-age 30 --keep-last 0 --force
+    cp "$_EXEC_STDOUT_FILE" "$TEST_TMPDIR/snapshot-partial-host-envelope.json" || problems+=("partial-host envelope could not be retained")
+    [[ "$(exec_status)" -eq 1 && ! -e "${local_source%/source}" && -d "${remote_source%/source}" ]] || problems+=("partial host failure did not preserve only the unreclaimed source")
+    prune_snapshot_reported "$local_source" removed || problems+=("first host removal was not reported")
+    prune_snapshot_retained "$remote_source" snapshot_transport || problems+=("failed host transport was not distinguished")
+    exec_stdout | jq -e --argjson bytes "$local_bytes" '.details.pruned_count == 1 and .details.bytes_freed == $bytes' >/dev/null || problems+=("partial pass charged bytes from failed host")
+    jq -e --arg source "$local_source" '.snapshot_cleanup.roots | length == 1 and .[0].source_root == $source' "$state" >/dev/null || problems+=("partial pass did not checkpoint its successful root")
+    first_journal=$(jq -cS '.snapshot_cleanup.roots[0]' "$state")
+    mv "$PRUNE_SNAPSHOT_TRANSPORT_CONTROL/unavailable" "$PRUNE_SNAPSHOT_TRANSPORT_CONTROL/unavailable.saved"
+    exec_run "$DSR_CMD" --json prune --snapshots --max-age 30 --keep-last 0 --force
+    [[ "$(exec_status)" -eq 0 && ! -e "${remote_source%/source}" ]] || problems+=("retry did not finish the restored host")
+    prune_snapshot_reported "$local_source" already_absent || problems+=("retry did not replay the successful first-host journal")
+    prune_snapshot_reported "$remote_source" removed || problems+=("retry did not report the remaining host")
+    exec_stdout | jq -e --argjson bytes "$remote_bytes" '.details.pruned_count == 1 and .details.bytes_freed == $bytes' >/dev/null || problems+=("retry double-counted prior host bytes")
+    jq -e '.snapshot_cleanup.roots | length == 2' "$state" >/dev/null || problems+=("retry did not retain both successful cleanup receipts")
+    [[ "$first_journal" == "$(jq -cS --arg source "$local_source" '.snapshot_cleanup.roots[] | select(.source_root==$source)' "$state")" ]] || problems+=("retry rewrote a completed cleanup receipt")
+    [[ "$before_state" == "$(jq -cS 'del(.snapshot_cleanup,.updated_at)' "$state")" ]] || problems+=("partial retry rewrote source or build provenance")
+    outside_after=$(prune_snapshot_inventory "$DSR_STATE_DIR/artifacts")
+    [[ "$outside_before" == "$outside_after" ]] || problems+=("partial retry changed release output")
+    export PATH="$original_path"
+    unset PRUNE_SNAPSHOT_TRANSPORT_CONTROL
+    prune_case_result "partial SSH failure retains per-root progress and retries remaining source without double accounting" "${problems[@]}"
+    harness_teardown
+}
+
+test_prune_snapshots_retained_data_overlap() {
+    local kind
+    for kind in nested-output nested-artifact nested-checkpoint; do
+        ((TESTS_RUN++))
+        harness_setup
+        seed_prune_snapshot_config
+        local run=cccccccc-cccc-4ccc-8ccc-cccccccccccc tool=overlap-tool
+        local original_state_dir="$DSR_STATE_DIR" source parent state output retained_path result receipts
+        local before after problems=()
+        if ! seed_prune_snapshot_run "$tool" v1.0.0 "$run"; then
+            fail "snapshot $kind overlap fixture is issued by the production owner helper"
+            harness_teardown
+            continue
+        fi
+        source="$PRUNE_SNAPSHOT_SOURCE" parent="${PRUNE_SNAPSHOT_SOURCE%/source}" state="$PRUNE_SNAPSHOT_STATE"
+        output="$DSR_STATE_DIR/artifacts/$tool-v1.0.0"
+        retained_path="$output/payload"
+        case "$kind" in
+            nested-output)
+                mv "$output" "$parent/$tool-v1.0.0"
+                mv "$output-manifest.json" "$parent/$tool-v1.0.0-manifest.json"
+                output="$parent/$tool-v1.0.0"
+                retained_path="$output/payload"
+                ;;
+            nested-artifact)
+                retained_path="$source/retained-payload"
+                cp "$output/payload" "$retained_path"
+                ;;
+            nested-checkpoint)
+                mkdir "$parent/retained-state"
+                mv "$DSR_STATE_DIR/builds" "$parent/retained-state/builds"
+                export DSR_STATE_DIR="$parent/retained-state"
+                state="$DSR_STATE_DIR/builds/$tool/v1.0.0/$run/state.json"
+                ;;
+        esac
+        # Keep both the published output and completed target receipt valid.
+        # A refusal must come from overlapping retained data, not stale paths
+        # or deliberately corrupt artifact hashes after the fixture move.
+        result=$(jq -c --arg path "$retained_path" '.target_statuses["linux/amd64"].result |
+            .artifact_path=$path | del(.resume_artifacts)' "$state") || problems+=("completed result fixture could not be read")
+        receipts=$(prune_snapshot_backend _act_result_artifact_receipts "$result") || problems+=("real retained artifact receipt could not be issued")
+        result=$(jq -nc --argjson result "$result" --argjson receipts "$receipts" \
+            '$result + {resume_artifacts:$receipts}') || problems+=("completed result fixture could not be rebound")
+        prune_snapshot_edit_state "$state" '.context.output_dir=$output | .target_statuses["linux/amd64"].result=$result' \
+            --arg output "$output" --argjson result "$result" || problems+=("overlap fixture checkpoint could not be updated")
+        prune_snapshot_backend _act_target_result_available "$result" release true || problems+=("overlap control has unavailable successful output")
+        prune_snapshot_backend _act_reclaim_strict_snapshot snap_local "$PRUNE_SNAPSHOT_PIN" inspect >/dev/null || problems+=("overlap control lacks valid snapshot ownership")
+        # Live custody may create lease files or session logs inside a deliberately
+        # nested state tree. Compare the protected source, original proof, exact
+        # checkpoint and release output independently of those runtime records.
+        before=$(prune_snapshot_inventory "$source" "$parent/.cargo-home" \
+            "$parent/.dsr-snapshot-owner.json" "$parent/.sbh-protect" "$state" "$output" "$output-manifest.json")
+        exec_run "$DSR_CMD" --json prune --snapshots --max-age 30 --keep-last 0 --force
+        after=$(prune_snapshot_inventory "$source" "$parent/.cargo-home" \
+            "$parent/.dsr-snapshot-owner.json" "$parent/.sbh-protect" "$state" "$output" "$output-manifest.json")
+        [[ "$(exec_status)" -eq 0 && -d "$parent" && "$before" == "$after" ]] || problems+=("snapshot cleanup changed overlapping retained data")
+        exec_stdout | jq -e --arg run_path "${state%/state.json}" --arg source "$source" '
+            .details.pruned_count == 0 and .details.bytes_freed == 0 and
+            (any(.details.retained_build_paths[]?; .path == $run_path) or
+             any(.details.retained_snapshot_paths[]?; .path == $source))
+          ' >/dev/null || problems+=("retained-data overlap refusal was not reported")
+        jq -e 'has("snapshot_cleanup") | not' "$state" >/dev/null || problems+=("overlapping root was journaled as reclaimed")
+        export DSR_STATE_DIR="$original_state_dir"
+        prune_case_result "snapshot reclaim retains $kind with valid ownership and completed artifact evidence" "${problems[@]}"
+        harness_teardown
+    done
+}
+
+# One explicit failure-injection boundary: execute the production descriptor
+# walk, payload deletion, retirement proof and marker unlink unchanged, then
+# raise immediately before the final snapshot-root rmdir. Reload the original
+# executor before dispatch so transport, file validation and all other cleanup
+# instructions remain real. This is not a signal-delivery or remote-host test.
+prune_snapshot_interrupt_final_rmdir() (
+    export DSR_HOSTS_FILE="$DSR_CONFIG_DIR/hosts.yaml"
+    # shellcheck source=../../src/logging.sh
+    source "$PROJECT_ROOT/src/logging.sh" || exit 1
+    # shellcheck source=../../src/act_runner.sh
+    source "$PROJECT_ROOT/src/act_runner.sh" || exit 1
+    _act_strict_snapshot_exec() {
+        local interrupted_host="$1" interrupted_program="$2" interrupted_route="$3"
+        local boundary="        os.rmdir(name, dir_fd=parent)" remaining
+        [[ "$interrupted_program" == *"$boundary"* ]] || return 4
+        remaining="${interrupted_program#*"$boundary"}"
+        [[ "$remaining" != *"$boundary"* ]] || return 4
+        interrupted_program="${interrupted_program/"$boundary"/"        raise RuntimeError('fixture final-rmdir interruption')"}"
+        # shellcheck source=../../src/act_runner.sh
+        source "$PROJECT_ROOT/src/act_runner.sh" || return 1
+        _act_strict_snapshot_exec "$interrupted_host" "$interrupted_program" "$interrupted_route"
+    }
+    _act_reclaim_strict_snapshot "$1" "$2" remove
+)
+
+test_prune_snapshots_interrupted_tail() {
+    local kind
+    for kind in retry missing-retirement-proof replaced-root; do
+        ((TESTS_RUN++))
+        harness_setup
+        seed_prune_snapshot_config
+        local run=dddddddd-dddd-4ddd-8ddd-dddddddddddd tool=tail-tool
+        local source parent state receipt before after nonce interruption_status=0 problems=()
+        if ! seed_prune_snapshot_run "$tool" v1.0.0 "$run"; then
+            fail "snapshot $kind tail fixture is issued by the production owner helper"
+            harness_teardown
+            continue
+        fi
+        source="$PRUNE_SNAPSHOT_SOURCE" parent="${PRUNE_SNAPSHOT_SOURCE%/source}" state="$PRUNE_SNAPSHOT_STATE"
+        nonce=$(jq -er .nonce <<< "$PRUNE_SNAPSHOT_PIN") || problems+=("issued pin lacks a nonce")
+        receipt="${parent%/*}/.dsr-snapshot-retirement-$nonce.json"
+        prune_snapshot_interrupt_final_rmdir snap_local "$PRUNE_SNAPSHOT_PIN" \
+            > "$TEST_TMPDIR/tail-interruption.out" 2> "$TEST_TMPDIR/tail-interruption.log" || interruption_status=$?
+        [[ "$interruption_status" -ne 0 &&
+           "$(< "$TEST_TMPDIR/tail-interruption.log")" == *"fixture final-rmdir interruption"* ]] || problems+=("injected final-rmdir boundary was not reached")
+        [[ -d "$parent" && -f "$receipt" && ! -e "$parent/.dsr-snapshot-owner.json" &&
+           ! -e "$parent/.sbh-protect" && ! -e "$source" && ! -e "$parent/.cargo-home" ]] || problems+=("real cleanup did not leave the authenticated empty-root tail")
+        case "$kind" in
+            missing-retirement-proof) mv "$receipt" "$TEST_TMPDIR/retirement-saved.json" ;;
+            replaced-root)
+                mv "$parent" "$parent.original"
+                mkdir -m 700 "$parent"
+                ;;
+        esac
+        before=$(prune_snapshot_inventory "$DSR_CONFIG_DIR" "$DSR_STATE_DIR" "$DSR_CACHE_DIR" \
+            "$TEST_TMPDIR/snapshots" "$TEST_TMPDIR/retirement-saved.json")
+        exec_run "$DSR_CMD" --json --dry-run prune --snapshots --max-age 30 --keep-last 0 --force
+        after=$(prune_snapshot_inventory "$DSR_CONFIG_DIR" "$DSR_STATE_DIR" "$DSR_CACHE_DIR" \
+            "$TEST_TMPDIR/snapshots" "$TEST_TMPDIR/retirement-saved.json")
+        [[ "$(exec_status)" -eq 0 && "$before" == "$after" ]] || problems+=("tail preview changed retained filesystem metadata")
+        if [[ "$kind" == retry ]]; then
+            prune_snapshot_reported "$source" eligible || problems+=("authenticated empty-root tail was not previewed")
+        else
+            prune_snapshot_retained "$source" snapshot_ownership || problems+=("unauthorized markerless tail was not refused in preview")
+        fi
+        before=$(prune_snapshot_inventory "$state" "$DSR_STATE_DIR/artifacts" \
+            "$TEST_TMPDIR/snapshots" "$TEST_TMPDIR/retirement-saved.json")
+        exec_run "$DSR_CMD" --json prune --snapshots --max-age 30 --keep-last 0 --force
+        if [[ "$kind" == retry ]]; then
+            [[ "$(exec_status)" -eq 0 && ! -e "$parent" && ! -e "$receipt" ]] || problems+=("authenticated tail retry did not finish root and sibling-proof removal")
+            prune_snapshot_reported "$source" removed || problems+=("tail completion was not reported")
+            exec_stdout | jq -e '.details.pruned_count == 1 and .details.bytes_freed == 0' >/dev/null || problems+=("tail retry charged already-removed payload bytes")
+            jq -e '.snapshot_cleanup.roots | length == 1 and .[0].result.status == "removed" and .[0].result.size_bytes == 0' \
+                "$state" >/dev/null || problems+=("tail completion was not journaled with its actual remaining bytes")
+        else
+            after=$(prune_snapshot_inventory "$state" "$DSR_STATE_DIR/artifacts" \
+                "$TEST_TMPDIR/snapshots" "$TEST_TMPDIR/retirement-saved.json")
+            [[ "$(exec_status)" -eq 0 && "$before" == "$after" ]] || problems+=("unauthorized markerless root or proof was changed")
+            prune_snapshot_retained "$source" snapshot_ownership || problems+=("unsafe tail refusal was not reported")
+            exec_stdout | jq -e '.details.pruned_count == 0 and .details.bytes_freed == 0' >/dev/null || problems+=("refused tail was counted as removed")
+            jq -e 'has("snapshot_cleanup") | not' "$state" >/dev/null || problems+=("refused tail gained a cleanup journal")
+        fi
+        prune_case_result "snapshot final-rmdir interruption handles $kind with original ownership and exact byte accounting" "${problems[@]}"
+        harness_teardown
+    done
+}
+
+# Observe the first real payload unlink through Linux inotify, then move that
+# still-open child directory outside the owned snapshot. A held descriptor alone
+# must not permit the worker to keep deleting through the moved child. This uses
+# the actual helper and kernel notification; no deletion/check helper is mocked.
+test_prune_snapshots_descendant_move() {
+    ((TESTS_RUN++))
+    if [[ "$(uname -s)" != Linux ]]; then
+        skip "actual descendant-move notification fixture requires Linux inotify"
+        return
+    fi
+    harness_setup
+    seed_prune_snapshot_config
+    local run=eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee tool=moving-child-tool
+    local source parent state before_state before_artifacts after_artifacts race_status=0 problems=()
+    local module="${PRUNE_SNAPSHOT_RACE_MODULE:-$PROJECT_ROOT/src/act_runner.sh}"
+    local control="$TEST_TMPDIR/descendant-race"
+    if ! seed_prune_snapshot_run "$tool" v1.0.0 "$run"; then
+        fail "descendant-move snapshot fixture is issued by the production owner helper"
+        harness_teardown
+        return
+    fi
+    source="$PRUNE_SNAPSHOT_SOURCE" parent="${PRUNE_SNAPSHOT_SOURCE%/source}" state="$PRUNE_SNAPSHOT_STATE"
+    mkdir "$control"
+    printf '%s\n' "$PRUNE_SNAPSHOT_PIN" > "$control/owner-pin.json"
+    if [[ -n "${PRUNE_SNAPSHOT_RACE_MODULE:-}" ]]; then
+        # Explicit counterexample mode can run an immutable earlier helper. Its
+        # supporting imports remain the real current guardrails and platforms.
+        mkdir "$control/module"
+        cp "$module" "$control/module/act_runner.sh" || problems+=("counterexample module could not be copied")
+        ln -s "$PROJECT_ROOT/src/guardrails.sh" "$control/module/guardrails.sh"
+        ln -s "$PROJECT_ROOT/src/platforms.sh" "$control/module/platforms.sh"
+        module="$control/module/act_runner.sh"
+    fi
+    before_state=$(prune_snapshot_inventory "$state")
+    before_artifacts=$(prune_snapshot_inventory "$DSR_STATE_DIR/artifacts")
+    DSR_HOSTS_FILE="$DSR_CONFIG_DIR/hosts.yaml" DSR_SYNC_TIMEOUT=25 \
+        python3 - "$module" "$control/owner-pin.json" "$source" "$control" <<'PY' || race_status=$?
+import ctypes, hashlib, json, os, pathlib, select, signal, subprocess, sys, time
+
+module, pin, source, control = map(pathlib.Path, sys.argv[1:])
+for index in range(1000):
+    (source / ('payload-%04d' % index)).write_text('retained payload %04d\n' % index)
+original = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in source.iterdir()}
+libc = ctypes.CDLL(None, use_errno=True)
+descriptor = libc.inotify_init1(os.O_CLOEXEC | os.O_NONBLOCK)
+if descriptor < 0:
+    raise OSError(ctypes.get_errno(), 'inotify initialization failed')
+if libc.inotify_add_watch(descriptor, os.fsencode(source), 0x00000200) < 0:
+    os.close(descriptor)
+    raise OSError(ctypes.get_errno(), 'inotify payload watch failed')
+relocated = control / 'retained-source'
+moved = False
+at_move = []
+status = None
+process = None
+try:
+    with (control / 'remove.stdout').open('wb') as output, (control / 'remove.stderr').open('wb') as errors:
+        process = subprocess.Popen(['bash', '-c',
+            'source "$1" || exit; _act_reclaim_strict_snapshot snap_local "$(cat "$2")" remove',
+            '_', str(module), str(pin)], stdout=output, stderr=errors, start_new_session=True)
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and process.poll() is None:
+            if select.select([descriptor], [], [], 0.1)[0]:
+                os.read(descriptor, 65536)
+                source.rename(relocated)
+                moved = True
+                at_move = sorted(os.listdir(relocated))
+                break
+        status = process.wait(timeout=35)
+finally:
+    os.close(descriptor)
+    if process is not None and process.poll() is None:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+after = sorted(os.listdir(relocated)) if moved else []
+changed = [name for name in after
+           if hashlib.sha256((relocated / name).read_bytes()).hexdigest() != original.get(name)]
+summary = {'moved': moved, 'remaining_at_move': len(at_move), 'remaining_after': len(after),
+           'helper_exit': status, 'outside_deleted': sorted(set(at_move) - set(after)),
+           'outside_added': sorted(set(after) - set(at_move)), 'changed_bytes': changed}
+(control / 'summary.json').write_text(json.dumps(summary, sort_keys=True) + '\n')
+(control / 'inventory-at-move.json').write_text(json.dumps({name: original[name] for name in at_move}, sort_keys=True) + '\n')
+print(json.dumps({'moved': moved, 'remaining_at_move': len(at_move), 'remaining_after': len(after),
+                  'helper_exit': status, 'outside_deleted': len(summary['outside_deleted']),
+                  'outside_added': len(summary['outside_added']), 'changed_bytes': len(changed)}, sort_keys=True))
+if not moved or not at_move or status != 4 or at_move != after or changed:
+    raise SystemExit(1)
+PY
+    [[ "$race_status" -eq 0 ]] || problems+=("actual moved descendant lost custody or retained files")
+    [[ -d "$parent" && -f "$parent/.dsr-snapshot-owner.json" && -f "$parent/.sbh-protect" ]] || problems+=("refused race discarded snapshot ownership evidence")
+    [[ "$before_state" == "$(prune_snapshot_inventory "$state")" ]] || problems+=("refused race changed its completed checkpoint")
+    after_artifacts=$(prune_snapshot_inventory "$DSR_STATE_DIR/artifacts")
+    [[ "$before_artifacts" == "$after_artifacts" ]] || problems+=("refused race changed release output")
+    jq -e 'has("snapshot_cleanup") | not' "$state" >/dev/null || problems+=("refused race gained a cleanup journal")
+    prune_case_result "actual inotify descendant move stops cleanup without deleting retained outside filenames or bytes" "${problems[@]}"
+    harness_teardown
+}
+
+test_prune_snapshots_nested_custody() {
+    local kind
+    for kind in nested-owner protected-stage nested-retirement; do
+        ((TESTS_RUN++))
+        harness_setup
+        seed_prune_snapshot_config
+        local run=12121212-1212-4212-8212-121212121212 tool=outer-owner
+        local child_run=34343434-3434-4434-8434-343434343434
+        local source parent state pin child_source child_parent child_pin receipt nonce
+        local before after inspect_status=0 interruption_status=0 problems=()
+        if ! seed_prune_snapshot_run "$tool" v1.0.0 "$run"; then
+            fail "snapshot $kind boundary fixture is issued by the production owner helper"
+            harness_teardown
+            continue
+        fi
+        source="$PRUNE_SNAPSHOT_SOURCE" parent="${PRUNE_SNAPSHOT_SOURCE%/source}"
+        state="$PRUNE_SNAPSHOT_STATE" pin="$PRUNE_SNAPSHOT_PIN"
+        if [[ "$kind" == protected-stage ]]; then
+            mkdir -m 700 "$source/protected-stage"
+            printf 'protected ordinary checkout\n' > "$source/protected-stage/.sbh-protect"
+            printf 'independently retained stage bytes\n' > "$source/protected-stage/payload"
+            chmod 600 "$source/protected-stage/.sbh-protect" "$source/protected-stage/payload"
+        else
+            child_source="$source/nested/inner-owner-$child_run/source"
+            child_parent="${child_source%/source}"
+            child_pin=$(prune_snapshot_backend _act_create_strict_snapshot_owner snap_local \
+                "$child_source" inner-owner "$child_run" 2222222222222222222222222222222222222222) || problems+=("independent nested owner could not be issued")
+            mkdir "$child_source"
+            printf 'independent inner run bytes\n' > "$child_source/payload"
+            prune_snapshot_backend _act_reclaim_strict_snapshot snap_local "$child_pin" inspect >/dev/null || problems+=("nested owner control is not independently valid")
+            if [[ "$kind" == nested-retirement ]]; then
+                nonce=$(jq -er .nonce <<< "$child_pin") || problems+=("nested owner nonce unavailable")
+                receipt="${child_parent%/*}/.dsr-snapshot-retirement-$nonce.json"
+                prune_snapshot_interrupt_final_rmdir snap_local "$child_pin" \
+                    > "$TEST_TMPDIR/nested-interruption.out" 2> "$TEST_TMPDIR/nested-interruption.log" || interruption_status=$?
+                [[ "$interruption_status" -ne 0 && -f "$receipt" && -d "$child_parent" &&
+                   ! -e "$child_parent/.dsr-snapshot-owner.json" && ! -e "$child_parent/.sbh-protect" &&
+                   "$(< "$TEST_TMPDIR/nested-interruption.log")" == *"fixture final-rmdir interruption"* ]] || problems+=("nested authenticated retirement tail was not reached")
+                prune_snapshot_backend _act_reclaim_strict_snapshot snap_local "$child_pin" inspect >/dev/null || problems+=("nested retirement proof is not independently valid")
+            fi
+        fi
+        before=$(prune_snapshot_inventory "$parent" "$state" "$DSR_STATE_DIR/artifacts")
+        prune_snapshot_backend _act_reclaim_strict_snapshot snap_local "$pin" inspect \
+            > "$TEST_TMPDIR/outer-inspection.out" 2> "$TEST_TMPDIR/outer-inspection.log" || inspect_status=$?
+        [[ "$inspect_status" -eq 4 ]] || problems+=("outer inspection admitted independent descendant custody")
+        exec_run "$DSR_CMD" --json --dry-run prune --snapshots --max-age 30 --keep-last 0 --force
+        after=$(prune_snapshot_inventory "$parent" "$state" "$DSR_STATE_DIR/artifacts")
+        [[ "$(exec_status)" -eq 0 && "$before" == "$after" ]] || problems+=("boundary preview changed protected evidence")
+        prune_snapshot_retained "$source" snapshot_ownership || problems+=("boundary preview did not retain the outer root")
+        exec_run "$DSR_CMD" --json prune --snapshots --max-age 30 --keep-last 0 --force
+        after=$(prune_snapshot_inventory "$parent" "$state" "$DSR_STATE_DIR/artifacts")
+        [[ "$(exec_status)" -eq 0 && "$before" == "$after" ]] || problems+=("outer cleanup changed independently protected descendant custody")
+        prune_snapshot_retained "$source" snapshot_ownership || problems+=("boundary refusal was not reported")
+        exec_stdout | jq -e '.details.pruned_count == 0 and .details.bytes_freed == 0' >/dev/null || problems+=("protected descendant was charged as reclaimed")
+        jq -e 'has("snapshot_cleanup") | not' "$state" >/dev/null || problems+=("refused ownership boundary gained a cleanup journal")
+        prune_case_result "snapshot reclaim retains $kind without crossing independent descendant custody" "${problems[@]}"
+        harness_teardown
+    done
+}
+
+test_prune_snapshots_bind_output() {
+    ((TESTS_RUN++))
+    if [[ "$(uname -s)" != Linux ]] || ! command -v unshare >/dev/null ||
+       ! command -v mount >/dev/null || ! command -v umount >/dev/null ||
+       ! unshare --user --map-root-user --mount --propagation private --fork -- true >/dev/null 2>&1; then
+        skip "actual bind-output fixture requires an isolated user/mount namespace"
+        return
+    fi
+    harness_setup
+    local namespace_status=0 problems=()
+    # All ownership is issued in the same UID/mount view as the real CLI. A
+    # private namespace keeps the real bind mount isolated and self-contained.
+    (
+        export -f seed_minimal_config seed_prune_snapshot_config seed_prune_owned_snapshot
+        export -f seed_prune_snapshot_run seed_prune_artifact_set prune_snapshot_backend prune_snapshot_inventory
+        unshare --user --map-root-user --mount --propagation private --fork -- bash -s -- "$PROJECT_ROOT" <<'BASH'
+set -uo pipefail
+PROJECT_ROOT="$1"
+DSR_CMD="$PROJECT_ROOT/dsr"
+seed_prune_snapshot_config || exit 1
+tool=bind-output-tool
+run=56565656-5656-4656-8656-565656565656
+seed_prune_snapshot_run "$tool" v1.0.0 "$run" || exit 1
+source="$PRUNE_SNAPSHOT_SOURCE"
+parent="${source%/source}"
+state="$PRUNE_SNAPSHOT_STATE"
+output="$DSR_STATE_DIR/artifacts/$tool-v1.0.0"
+nested="$parent/retained-output"
+mv "$output" "$nested" || exit 1
+mkdir -m 700 "$output" || exit 1
+mount --bind "$nested" "$output" || exit 1
+trap 'umount "$output"' EXIT
+python3 - "$nested" "$output" <<'PY'
+import os, sys
+nested, alias = sys.argv[1:]
+left, right = os.stat(nested), os.stat(alias)
+assert (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+assert os.path.realpath(nested) != os.path.realpath(alias)
+assert os.stat(os.path.join(alias, 'payload')).st_nlink == 1
+PY
+[[ $? -eq 0 ]] || exit 1
+# The move and bind preserve all original publication and target receipts.
+result=$(jq -c '.target_statuses["linux/amd64"].result' "$state") || exit 1
+prune_snapshot_backend _act_target_result_available "$result" release true || exit 1
+prune_snapshot_backend _act_reclaim_strict_snapshot snap_local "$PRUNE_SNAPSHOT_PIN" inspect >/dev/null || exit 1
+before=$(prune_snapshot_inventory "$parent" "$state" "$output" "$output-manifest.json") || exit 1
+"$DSR_CMD" --json --dry-run prune --snapshots --max-age 30 --keep-last 0 --force \
+    > "$TEST_TMPDIR/bind-preview-envelope.json" 2> "$TEST_TMPDIR/bind-preview.stderr" || exit 1
+after=$(prune_snapshot_inventory "$parent" "$state" "$output" "$output-manifest.json") || exit 1
+[[ "$before" == "$after" ]] || exit 1
+"$DSR_CMD" --json prune --snapshots --max-age 30 --keep-last 0 --force \
+    > "$TEST_TMPDIR/bind-retained-envelope.json" 2> "$TEST_TMPDIR/bind-retained.stderr" || exit 1
+after=$(prune_snapshot_inventory "$parent" "$state" "$output" "$output-manifest.json") || exit 1
+[[ "$before" == "$after" ]] || exit 1
+for envelope in "$TEST_TMPDIR/bind-preview-envelope.json" "$TEST_TMPDIR/bind-retained-envelope.json"; do
+    jq -e --arg source "$source" --arg run_path "${state%/state.json}" '
+        .details.snapshots_only == true and .details.pruned_count == 0 and .details.bytes_freed == 0 and
+        (any(.details.retained_snapshot_paths[]?; .path == $source) or
+         any(.details.retained_build_paths[]?; .path == $run_path))
+      ' "$envelope" >/dev/null || exit 1
+done
+jq -e 'has("snapshot_cleanup") | not' "$state" >/dev/null || exit 1
+printf '{"bind_mount":true,"original_receipts_preserved":true,"retained":true}\n' > "$TEST_TMPDIR/bind-summary.json"
+umount "$output" || exit 1
+trap - EXIT
+BASH
+    ) || namespace_status=$?
+    [[ "$namespace_status" -eq 0 ]] || problems+=("real bind alias was admitted or retained data changed")
+    prune_case_result "snapshot reclaim preserves canonical completed output bound to a descendant by a real bind mount" "${problems[@]}"
+    harness_teardown
+}
+
+run_snapshot_prune_tests() {
+    echo ""
+    echo "Explicit Strict Snapshot Reclamation Tests:"
+    test_prune_snapshots_reclaims_owned_only
+    test_prune_snapshots_preview_read_only
+    test_prune_snapshots_historical_roots
+    test_prune_snapshots_ownership_refusals
+    test_prune_snapshots_symlink_contents
+    test_prune_snapshots_unfinished_publication
+    test_prune_snapshots_retention
+    test_prune_snapshots_inherited_custody
+    test_prune_snapshots_partial_transport_retry
+    test_prune_snapshots_retained_data_overlap
+    test_prune_snapshots_interrupted_tail
+    test_prune_snapshots_descendant_move
+    test_prune_snapshots_nested_custody
+    test_prune_snapshots_bind_output
+}
+
+# ============================================================================
 # Cleanup
 # ============================================================================
 
@@ -1171,6 +2137,12 @@ trap cleanup EXIT
 echo "=== E2E: dsr prune Tests ==="
 echo ""
 
+case "${1:-}" in
+    ""|--snapshot-only|--snapshot-race-only|--snapshot-boundary-only) ;;
+    *) echo "Usage: $0 [--snapshot-only|--snapshot-race-only|--snapshot-boundary-only]" >&2; exit 2 ;;
+esac
+
+if [[ -z "${1:-}" ]]; then
 echo "Help Tests (always work):"
 test_prune_help
 test_prune_help_shows_options
@@ -1225,6 +2197,16 @@ test_prune_missing_state_dir
 echo ""
 echo "Stream Separation Tests:"
 test_prune_stream_separation
+fi
+
+if [[ "${1:-}" == --snapshot-race-only ]]; then
+    test_prune_snapshots_descendant_move
+elif [[ "${1:-}" == --snapshot-boundary-only ]]; then
+    test_prune_snapshots_nested_custody
+    test_prune_snapshots_bind_output
+else
+    run_snapshot_prune_tests
+fi
 
 echo ""
 echo "=========================================="

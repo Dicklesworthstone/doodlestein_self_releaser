@@ -927,6 +927,90 @@ build_state_set_source_sync() {
       end' <<< "$source_sync_json"
 }
 
+# Collect every source snapshot a run still owns, including hosts retired by
+# relocation. Ownership is producer evidence, not an inference from a path.
+# A cleanup journal never erases the original source or relocation history.
+build_state_snapshot_inventory() {
+  jq -ces '
+    def count: type == "number" and floor == . and . >= 0 and . <= 9007199254740991;
+    def text: type == "string" and length > 0 and length <= 4096 and
+      all(explode[]; . >= 32 and . != 127);
+    def outcome($pin):
+      type == "object" and .host == $pin.host and .source_root == $pin.source_root and
+      .path == $pin.path and (.status == "removed" or .status == "already_absent") and
+      (.size_bytes | count) and (if .status == "already_absent" then .size_bytes == 0 else true end);
+    if length != 1 or (.[0] | type) != "object" then error("one checkpoint required") else .[0] end |
+    . as $state |
+    [.. | objects | select(has("source_roots")) | .source_roots] as $maps |
+    [.. | objects | select(has("snapshot_owners")) | .snapshot_owners] as $owners |
+    if (all($maps[]; type == "object" and all(to_entries[];
+        (.key | test("^[A-Za-z0-9_-]+$")) and (.value | text))) | not) or
+       (all($owners[]; type == "object" and all(to_entries[];
+        (.key | test("^[A-Za-z0-9_-]+$")) and (.value | type == "object") and
+        .value.host == .key and .value.tool == $state.tool and
+        .value.run_id == $state.run_id and .value.git_sha == $state.git_sha and
+        (.value.source_root | text) and (.value.path | text))) | not)
+    then error("invalid snapshot source or ownership map") else . end |
+    [$maps[] | to_entries[] | {host:.key,source_root:.value}] | unique_by([.host,.source_root]) |
+    map(. as $root |
+      [$owners[][$root.host] | select(type == "object" and .source_root == $root.source_root)] |
+      unique | $root + {owner_pin:(if length == 1 then .[0] else null end)}) as $roots |
+    (if $state | has("snapshot_cleanup") then $state.snapshot_cleanup else null end) as $journal |
+    if ($state | has("snapshot_cleanup")) and
+       (($journal | type != "object") or $journal.schema_version != 1 or
+        ($journal.retention_mtime | count | not) or ($journal.roots | type != "array") or
+        ([$journal.roots[] | [.host,.source_root]] | unique | length) != ($journal.roots | length) or
+        (all($journal.roots[]; . as $entry |
+          (.completed_at | text) and (.owner_pin | type == "object") and
+          (.result | outcome($entry.owner_pin)) and
+          any($roots[]; .host == $entry.host and .source_root == $entry.source_root and
+            .owner_pin == $entry.owner_pin and .owner_pin != null)) | not))
+    then error("invalid snapshot cleanup journal") else
+      {roots:$roots,retention_mtime:($journal.retention_mtime // null),
+       completed:($journal.roots // [])}
+    end
+  ' <<< "$1"
+}
+
+# Persist one actual host outcome under the caller-held build leases. A crash
+# after removal but before this transaction is recoverable as already_absent;
+# it must never authorize deletion of a replacement directory at the same path.
+# Args: tool version run_id before host source_root owner_pin outcome retention_mtime
+build_state_record_snapshot_cleanup() {
+  local tool="$1" version="$2" run_id="$3" before="$4" host="$5" source_root="$6"
+  local owner_pin="$7" outcome="$8" retention_mtime="$9" inventory state_file now
+  [[ "$retention_mtime" =~ ^[0-9]+$ ]] || return 1
+  inventory=$(build_state_snapshot_inventory "$before") || return 1
+  state_file="$(_build_get_tool_dir "$tool" "$version")/$run_id/state.json"
+  now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  _build_state_jq_update "$state_file" \
+    --arg tool "$tool" --arg version "$version" --arg run "$run_id" \
+    --arg host "$host" --arg root "$source_root" --arg now "$now" \
+    --argjson age "$retention_mtime" --slurpfile before /dev/fd/3 \
+    --slurpfile owner /dev/fd/4 --slurpfile result /dev/fd/5 --slurpfile inventory /dev/fd/6 '
+      def one: if length == 1 then .[0] else error("one snapshot document required") end;
+      ($before | one) as $before | ($owner | one) as $owner |
+      ($result | one) as $result | ($inventory | one) as $inventory |
+      if . != $before or .tool != $tool or .version != $version or .run_id != $run or
+         .status != "completed" or .context.build_purpose != "release" or .context.publishable != true or
+         (any($inventory.roots[]; .host == $host and .source_root == $root and
+             .owner_pin == $owner and .owner_pin != null) | not) or
+         any($inventory.completed[]; .host == $host and .source_root == $root) or
+         $result.host != $host or $result.source_root != $root or $result.path != $owner.path or
+         ($result.status != "removed" and $result.status != "already_absent") or
+         ($result.size_bytes | type != "number" or floor != . or . < 0 or . > 9007199254740991) or
+         ($result.status == "already_absent" and $result.size_bytes != 0) or
+         ($age | type != "number" or floor != . or . < 0 or . > 9007199254740991) or
+         ($inventory.retention_mtime != null and $inventory.retention_mtime != $age)
+      then error("snapshot cleanup no longer matches retained custody") else
+        .snapshot_cleanup = {schema_version:1,retention_mtime:$age,
+          roots:($inventory.completed + [{host:$host,source_root:$root,owner_pin:$owner,
+            result:$result,completed_at:$now}])} |
+        .updated_at = $now
+      end
+    ' 3<<< "$before" 4<<< "$owner_pin" 5<<< "$outcome" 6<<< "$inventory"
+}
+
 # Shared jq definitions keep initial host projection and retained-state
 # admission on the same task identity rules. No state or receipt bytes enter
 # the jq program or its argv; callers stream those documents separately.

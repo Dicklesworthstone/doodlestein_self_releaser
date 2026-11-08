@@ -15372,6 +15372,161 @@ _prune_artifact_snapshot() {
           marker_identity:$marker_identity,marker_sha256:$marker_digest}'
 }
 
+# A completed checkpoint alone is insufficient: interrupted publication and
+# unavailable successful outputs still need their source snapshots for recovery.
+# Return the publication observation so it can be rechecked under the same
+# build leases immediately before each host retirement operation.
+_prune_snapshot_output() {
+    local state="$1" output_dir observation result tag
+    if ! jq -e '
+        .status == "completed" and .context.build_purpose == "release" and
+        .context.publishable == true and
+        (.context.output_dir | type == "string" and startswith("/")) and
+        (.context.build_tasks | type == "array" and length > 0) and
+        all(.context.build_tasks[]; .method == "native") and
+        (.target_statuses | type == "object" and length > 0) and
+        ([.context.build_tasks[].key] | sort) == (.target_statuses | keys | sort) and
+        all(.target_statuses[]; .status == "completed" and (.result | type == "object"))
+    ' <<< "$state" >/dev/null; then
+        return 2
+    fi
+    while IFS= read -r result; do
+        _act_target_result_available "$result" release true || return 2
+    done < <(jq -c '.target_statuses[].result' <<< "$state")
+    output_dir=$(jq -r '.context.output_dir' <<< "$state") || return 2
+    tag=$(git_ops_version_to_tag "$(jq -r '.version' <<< "$state")") || return 2
+    observation=$(_prune_artifact_snapshot "$output_dir") || return 2
+    if ! jq -e --arg tag "$tag" --slurpfile state /dev/fd/3 '
+        .tool == $state[0].tool and .tag == $tag and .run_id == $state[0].run_id and
+        .git_sha == $state[0].git_sha and .marker_identity != "" and
+        .directory_identity != ""
+    ' 3<<< "$state" <<< "$observation" >/dev/null; then
+        return 2
+    fi
+    printf '%s\n' "$observation"
+}
+
+# Even authentic source ownership must not authorize removing the checkpoint,
+# shared DSR storage, or retained output accidentally placed inside a snapshot.
+# Check logical and resolved paths: resolving on the coordinator also catches a
+# local alias to an otherwise external release directory. Remote ambiguity is
+# conservatively retained rather than treating that alias as deletion authority.
+_prune_snapshot_paths_clear() {
+    local state="$1" owner="$2" run_dir="$3" state_dir="$4" cache_dir="$5"
+    python3 -I - "$run_dir" "$state_dir" "$cache_dir" \
+        3<<< "$state" 4<<< "$owner" <<'PY'
+import json
+import os
+import stat
+import sys
+
+def variants(path):
+    if not isinstance(path, str) or not path or '\0' in path:
+        raise ValueError("invalid retained path")
+    return {os.path.abspath(path), os.path.realpath(path)}
+
+def overlap(left, right):
+    common = os.path.commonpath((left, right))
+    return common == left or common == right
+
+def retained_paths(value):
+    if isinstance(value, dict):
+        for key in ('output_dir', 'artifact_dir', 'workflow_artifact_dir',
+                    'workflow_payload_dir', 'result_path', 'log_path'):
+            path = value.get(key)
+            if isinstance(path, str) and path:
+                yield path
+        # The old scalar may contain comma-separated paths. Frozen receipts
+        # below remain authoritative for filenames containing those characters.
+        path = value.get('artifact_path')
+        if isinstance(path, str) and path:
+            yield from path.split(',')
+        for path in value.get('artifact_paths', []) or []:
+            if isinstance(path, str) and path:
+                yield path
+        for key in ('artifacts', 'resume_artifacts', 'additional_artifacts'):
+            items = value.get(key, [])
+            if isinstance(items, list):
+                for item in items:
+                    if isinstance(item, dict) and isinstance(item.get('path'), str):
+                        yield item['path']
+        for item in value.values():
+            yield from retained_paths(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from retained_paths(item)
+
+def protect_local_identities(owner, retained):
+    # realpath does not collapse bind mounts. An output alias can expose a
+    # snapshot descendant through another pathname while its files still have
+    # nlink == 1. Match actual local directory/file identities as well.
+    if owner.get('route', {}).get('transport') != 'local':
+        return
+    physical = owner['physical_path']
+    try:
+        root = os.stat(physical, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if (not stat.S_ISDIR(root.st_mode) or
+            str(root.st_dev) != owner['device'] or str(root.st_ino) != owner['inode']):
+        raise ValueError("snapshot root identity changed before retained-path admission")
+    protected = set()
+    for path in retained:
+        try:
+            info = os.stat(path)
+        except FileNotFoundError:
+            continue
+        protected.add((info.st_dev, info.st_ino))
+    # Preserve the symmetric overlap rule when a protected directory aliases
+    # an ancestor of the snapshot, rather than one of its descendants.
+    ancestor = physical
+    while True:
+        info = os.stat(ancestor, follow_symlinks=False)
+        if (info.st_dev, info.st_ino) in protected:
+            raise ValueError("snapshot is within a mounted alias of retained DSR storage or output")
+        parent = os.path.dirname(ancestor)
+        if parent == ancestor:
+            break
+        ancestor = parent
+    def traversal_error(error):
+        raise error
+    count = 0
+    for directory, directories, files, descriptor in os.fwalk(
+            physical, follow_symlinks=False, onerror=traversal_error):
+        if os.path.relpath(directory, physical).count(os.sep) > 256:
+            raise ValueError("snapshot retained-path traversal exceeds its depth budget")
+        info = os.fstat(descriptor)
+        if (info.st_dev, info.st_ino) in protected:
+            raise ValueError("snapshot contains a mounted alias of retained DSR storage or output")
+        for name in directories + files:
+            count += 1
+            if count > 1000000:
+                raise ValueError("snapshot retained-path inventory exceeds its entry budget")
+            info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            if (info.st_dev, info.st_ino) in protected:
+                raise ValueError("snapshot contains a retained file or directory under another name")
+
+try:
+    with os.fdopen(3) as stream:
+        state = json.load(stream)
+    with os.fdopen(4) as stream:
+        owner = json.load(stream)
+    roots = variants(owner['path']) | variants(owner['physical_path'])
+    retained = set(sys.argv[1:]) | set(retained_paths(state))
+    # A single-file bind mount can expose checkpoint bytes without aliasing
+    # the surrounding run directory itself.
+    retained.add(os.path.join(sys.argv[1], 'state.json'))
+    retained.add(os.path.join(sys.argv[1], 'state.json.update.lock'))
+    for path in retained:
+        if any(overlap(root, protected) for root in roots for protected in variants(path)):
+            raise ValueError("snapshot overlaps retained DSR storage or output")
+    protect_local_identities(owner, retained)
+except (OSError, ValueError, TypeError, KeyError, RecursionError) as error:
+    print('[dsr] snapshot retention: ' + str(error), file=sys.stderr)
+    sys.exit(4)
+PY
+}
+
 cmd_prune() {
     # Keep build-custody descriptors and signal cleanup inside this invocation.
     (
@@ -15381,9 +15536,14 @@ cmd_prune() {
     local keep_last=5
     local keep_releases=true
     local force=false
+    local snapshots_only=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --snapshots)
+                snapshots_only=true
+                shift
+                ;;
             --dry-run|-n)
                 dry_run=true
                 shift
@@ -15423,16 +15583,21 @@ OPTIONS:
         --keep-releases Never remove artifacts of a release dsr published (default)
         --no-keep-releases
                         Also remove old artifacts of published releases
+        --snapshots     Reclaim only proven owned Unix snapshots of retired
+                        completed native builds; preserve artifacts and checkpoints
         --force         Skip confirmation prompt
 
 A build run that `latest` points to is always kept (it is what resume uses).
 Build checkpoints with retained source roots or unverifiable state are kept.
 Busy or unverifiable build leases prevent artifact-set and checkpoint pruning.
 Unfinished artifact sets and outputs with unknown ownership are kept.
+Snapshot cleanup requires original producer ownership receipts and a completed
+publishable artifact set. Legacy or unverifiable snapshots are kept.
 
 EXAMPLES:
     dsr prune --dry-run
     dsr prune --max-age 14 --keep-last 3
+    dsr prune --snapshots --dry-run --max-age 14 --keep-last 3
 EOF
                 return 0
                 ;;
@@ -15467,14 +15632,16 @@ EOF
         return 4
     fi
 
-    if [[ ! -d "$cache_dir" ]]; then
+    if ! $snapshots_only && [[ ! -d "$cache_dir" ]]; then
         if ! $JSON_MODE; then
             log_warn "Cache directory not found: $cache_dir (skipping cache cleanup)"
         fi
     fi
 
     if ! $dry_run && ! $force; then
-        if ! confirm "Prune old artifacts and cache in $state_dir and $cache_dir?" "n"; then
+        local prune_question="Prune old artifacts and cache in $state_dir and $cache_dir?"
+        $snapshots_only && prune_question="Reclaim owned snapshots of retired completed builds recorded in $state_dir?"
+        if ! confirm "$prune_question" "n"; then
             if $JSON_MODE; then
                 json_envelope "prune" "error" 5 "{\"state_dir\": \"$state_dir\", \"dry_run\": $dry_run, \"pruned_count\": 0, \"bytes_freed\": 0}"
             fi
@@ -15492,6 +15659,8 @@ EOF
     local errors=()
     local retained_build_paths=()
     local retained_artifact_paths=()
+    local snapshot_results=()
+    local retained_snapshot_paths=()
 
     # Artifact sets and checkpoints share the build's inherited kernel lease.
     # Keep the descriptor registry in this shell until each complete removal
@@ -15499,6 +15668,9 @@ EOF
     if [[ -d "$state_dir/artifacts" || -d "$state_dir/builds" ]]; then
         _dsr_require build_state || return 3
         _dsr_require git_ops || return 3
+    fi
+    if $snapshots_only; then
+        _dsr_require act_runner || return 3
     fi
     local _BUILD_STATE_DIR="$state_dir/builds"
     local lease_tool="" custody_failed=false
@@ -15569,6 +15741,183 @@ EOF
         fi
     }
 
+    _prune_retain_snapshot() {
+        local source_root="$1" host="$2" run="$3" reason="$4"
+        retained_snapshot_paths+=("$(jq -nc --arg path "$source_root" --arg host "$host" \
+            --arg run "$run" --arg reason "$reason" \
+            '{path:$path,host:$host,run_id:$run,reason:$reason}')")
+        $JSON_MODE || log_info "Retaining snapshot: $host:$source_root ($reason)"
+    }
+
+    # Atomic cleanup journaling changes the run directory mtime. Keep the first
+    # retirement age for selection and ordering so a partial host failure can
+    # retry immediately without resetting --max-age or --keep-last.
+    _prune_run_mtime() {
+        local run_dir="$1" retained_mtime=""
+        if $snapshots_only && [[ -f "$run_dir/state.json" && ! -L "$run_dir/state.json" ]]; then
+            retained_mtime=$(jq -ers '
+                if length == 1 then .[0].snapshot_cleanup.retention_mtime |
+                  select(type == "number" and floor == . and . >= 0 and . <= 9007199254740991)
+                else empty end' "$run_dir/state.json" 2>/dev/null) || retained_mtime=""
+        fi
+        if [[ -n "$retained_mtime" ]]; then
+            printf '%s\n' "$retained_mtime"
+        else
+            _prune_mtime_epoch "$run_dir"
+        fi
+    }
+
+    _prune_snapshot_result_valid() {
+        local result="$1" owner="$2" operation="$3"
+        jq -es --arg operation "$operation" --slurpfile owner /dev/fd/3 '
+            length == 1 and ($owner | length == 1) and (.[0] |
+              type == "object" and .host == $owner[0].host and
+              .source_root == $owner[0].source_root and .path == $owner[0].path and
+              (.size_bytes | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
+              (if .status == "already_absent" then .size_bytes == 0
+               elif $operation == "inspect" then .status == "eligible"
+               else .status == "removed" end))
+          ' 3<<< "$owner" <<< "$result" >/dev/null
+    }
+
+    _prune_reclaim_snapshot_run() {
+        local run_dir="$1" current_state="$2" retention_mtime="$3"
+        local run tool version inventory output_before output_now state_now entry owner host source_root
+        local inspected outcome operation_status outcome_status size_bytes mtime_iso journaled
+        run=$(jq -r '.run_id' <<< "$current_state") || return 1
+        tool=$(jq -r '.tool' <<< "$current_state") || return 1
+        version=$(jq -r '.version' <<< "$current_state") || return 1
+        if ! jq -e '.status == "completed"' <<< "$current_state" >/dev/null; then
+            _prune_retain_build "$run_dir" active_run
+            return 0
+        fi
+        if ! build_state_validate_task_host_overrides "$current_state" ||
+           ! inventory=$(build_state_snapshot_inventory "$current_state"); then
+            _prune_retain_build "$run_dir" invalid_state
+            return 0
+        fi
+        if ! output_before=$(_prune_snapshot_output "$current_state"); then
+            _prune_retain_build "$run_dir" publication_pending
+            return 0
+        fi
+        local tag
+        tag=$(git_ops_version_to_tag "$version") || return 1
+        if $keep_releases && [[ -e "$state_dir/releases/$tool-$tag-upload.json" ||
+                                -L "$state_dir/releases/$tool-$tag-upload.json" ]]; then
+            kept_for_releases=$((kept_for_releases + 1))
+            _prune_retain_build "$run_dir" release_retention
+            return 0
+        fi
+        mtime_iso=$(_prune_epoch_to_iso "$retention_mtime")
+        while IFS= read -r entry; do
+            host=$(jq -r '.host' <<< "$entry") || return 1
+            source_root=$(jq -r '.source_root' <<< "$entry") || return 1
+            owner=$(jq -c '.owner_pin' <<< "$entry") || return 1
+            if [[ "$owner" == null ]]; then
+                _prune_retain_snapshot "$source_root" "$host" "$run" snapshot_ownership
+                continue
+            fi
+            if [[ "$source_root" != /* ]] ||
+               jq -e '.route.platform | strings | startswith("windows/")' <<< "$owner" >/dev/null; then
+                _prune_retain_snapshot "$source_root" "$host" "$run" unsupported_host
+                continue
+            fi
+            if ! _prune_snapshot_paths_clear "$current_state" "$owner" "$run_dir" "$state_dir" "$cache_dir"; then
+                _prune_retain_snapshot "$source_root" "$host" "$run" snapshot_ownership
+                continue
+            fi
+            if ! state_now=$(build_state_get "$tool" "$version" "$run") ||
+               [[ "$state_now" != "$current_state" ]]; then
+                _prune_retain_build "$run_dir" invalid_state
+                return 0
+            fi
+            if ! output_now=$(_prune_snapshot_output "$current_state") ||
+               [[ "$output_now" != "$output_before" ]]; then
+                _prune_retain_build "$run_dir" publication_pending
+                return 0
+            fi
+            operation_status=0
+            inspected=$(_act_reclaim_strict_snapshot "$host" "$owner" inspect) || operation_status=$?
+            if [[ "$operation_status" -ne 0 ]]; then
+                if [[ "$operation_status" -eq 4 ]]; then
+                    _prune_retain_snapshot "$source_root" "$host" "$run" snapshot_ownership
+                else
+                    _prune_retain_snapshot "$source_root" "$host" "$run" snapshot_transport
+                    _prune_error E053 "Snapshot inspection failed on $host" "$source_root"
+                fi
+                continue
+            fi
+            if ! _prune_snapshot_result_valid "$inspected" "$owner" inspect; then
+                _prune_retain_snapshot "$source_root" "$host" "$run" snapshot_ownership
+                _prune_error E053 "Snapshot inspection returned invalid evidence on $host" "$source_root"
+                continue
+            fi
+            journaled=false
+            if jq -e --arg host "$host" --arg root "$source_root" \
+                'any(.completed[]; .host == $host and .source_root == $root)' \
+                <<< "$inventory" >/dev/null; then
+                journaled=true
+            fi
+            outcome_status=$(jq -r '.status' <<< "$inspected") || return 1
+            # A completed receipt describes an old removal, never a replacement
+            # directory. Probe again on every invocation and retain any return.
+            if $journaled && [[ "$outcome_status" != already_absent ]]; then
+                _prune_retain_snapshot "$source_root" "$host" "$run" snapshot_ownership
+                continue
+            fi
+            outcome="$inspected"
+            if ! $dry_run && ! $journaled; then
+                # Inspections and remote transport may take time. Re-admit the
+                # retained output/checkpoint before entering the mutating worker.
+                if ! state_now=$(build_state_get "$tool" "$version" "$run") ||
+                   [[ "$state_now" != "$current_state" ]]; then
+                    _prune_retain_build "$run_dir" invalid_state
+                    return 0
+                fi
+                if ! output_now=$(_prune_snapshot_output "$current_state") ||
+                   [[ "$output_now" != "$output_before" ]]; then
+                    _prune_retain_build "$run_dir" publication_pending
+                    return 0
+                fi
+                if $keep_releases && [[ -e "$state_dir/releases/$tool-$tag-upload.json" ||
+                                        -L "$state_dir/releases/$tool-$tag-upload.json" ]]; then
+                    kept_for_releases=$((kept_for_releases + 1))
+                    _prune_retain_build "$run_dir" release_retention
+                    return 0
+                fi
+                operation_status=0
+                outcome=$(_act_reclaim_strict_snapshot "$host" "$owner" remove) || operation_status=$?
+                if [[ "$operation_status" -ne 0 ]] ||
+                   ! _prune_snapshot_result_valid "$outcome" "$owner" remove; then
+                    _prune_retain_snapshot "$source_root" "$host" "$run" cleanup_failed
+                    _prune_error E053 "Snapshot cleanup did not complete on $host" "$source_root"
+                    continue
+                fi
+                if ! build_state_record_snapshot_cleanup "$tool" "$version" "$run" "$current_state" \
+                    "$host" "$source_root" "$owner" "$outcome" "$retention_mtime"; then
+                    _prune_error E053 "Snapshot removed but cleanup receipt could not be retained for $host" "$source_root"
+                    return 1
+                fi
+                current_state=$(build_state_get "$tool" "$version" "$run") || {
+                    _prune_error E053 "Cannot reread snapshot cleanup receipt" "$run_dir"; return 1;
+                }
+                inventory=$(build_state_snapshot_inventory "$current_state") || {
+                    _prune_error E053 "Snapshot cleanup receipt failed admission" "$run_dir"; return 1;
+                }
+            fi
+            snapshot_results+=("$outcome")
+            outcome_status=$(jq -r '.status' <<< "$outcome") || return 1
+            if [[ "$outcome_status" == eligible || "$outcome_status" == removed ]]; then
+                size_bytes=$(jq -r '.size_bytes' <<< "$outcome") || return 1
+                pruned_items+=("$(jq -c --arg mtime "$mtime_iso" --arg run "$run" \
+                    '. + {mtime:$mtime,run_id:$run}' <<< "$outcome")")
+                pruned_count=$((pruned_count + 1))
+                bytes_freed=$((bytes_freed + size_bytes))
+                $JSON_MODE || printf '%s:%s\n' "$host" "$source_root"
+            fi
+        done < <(jq -c '.roots[]' <<< "$inventory")
+    }
+
     _prune_consider() {
         local path="$1"
         [[ -z "$path" ]] && return 0
@@ -15602,7 +15951,7 @@ EOF
     fi
 
     # Prune old logs
-    if [[ -d "$state_dir/logs" ]]; then
+    if ! $snapshots_only && [[ -d "$state_dir/logs" ]]; then
         while IFS= read -r path; do
             _prune_consider "$path"
         done < <(find "$state_dir/logs" -mindepth 1 -maxdepth 1 -type d -mtime +"$max_age_days" 2>/dev/null)
@@ -15613,7 +15962,7 @@ EOF
     fi
 
     # Prune old manifests
-    if [[ -d "$state_dir/manifests" ]]; then
+    if ! $snapshots_only && [[ -d "$state_dir/manifests" ]]; then
         while IFS= read -r path; do
             _prune_consider "$path"
         done < <(find "$state_dir/manifests" -type f -mtime +"$max_age_days" 2>/dev/null)
@@ -15624,7 +15973,7 @@ EOF
     # and so (with --keep-releases) does every set whose release dsr
     # published, recorded as releases/<tool>-<tag>-upload.json.
     local kept_for_releases=0
-    if [[ -d "$state_dir/artifacts" ]]; then
+    if ! $snapshots_only && [[ -d "$state_dir/artifacts" ]]; then
         local entry set_name set_directory set_path set_mtime set_snapshot snapshot_rc
         local -A set_seen=() set_group=() set_time=() set_observation=()
         while IFS= read -r -d '' entry; do
@@ -15766,7 +16115,7 @@ EOF
                 done < <(
                     find "$version_dir" -mindepth 1 -maxdepth 1 -type d ! -name '.*' 2>/dev/null | while read -r dir; do
                         local mtime
-                        mtime=$(_prune_mtime_epoch "$dir")
+                        mtime=$(_prune_run_mtime "$dir")
                         echo "$mtime $dir"
                     done | sort -rn | cut -d' ' -f2-
                 )
@@ -15779,7 +16128,7 @@ EOF
                         continue
                     fi
                     local run_mtime
-                    run_mtime=$(_prune_mtime_epoch "$run_dir")
+                    run_mtime=$(_prune_run_mtime "$run_dir")
                     if [[ "$run_mtime" -le "$cutoff_epoch" ]]; then
                         if ! state=$(build_state_get "$tool" "$version" "${run_dir##*/}") ||
                            ! jq -e '
@@ -15795,6 +16144,8 @@ EOF
                                else true end)
                             ' <<< "$state" >/dev/null 2>&1; then
                             _prune_retain_build "$run_dir" invalid_state
+                        elif $snapshots_only; then
+                            _prune_reclaim_snapshot_run "$run_dir" "$state" "$run_mtime"
                         elif ! jq -e 'all(.. | objects | select(has("source_roots")) | .source_roots;
                             type == "object" and length == 0)' <<< "$state" >/dev/null 2>&1; then
                             _prune_retain_build "$run_dir" source_roots
@@ -15816,17 +16167,20 @@ EOF
     fi
 
     # Prune cache entries
-    if ! $custody_failed && [[ -d "$cache_dir" ]]; then
+    if ! $snapshots_only && ! $custody_failed && [[ -d "$cache_dir" ]]; then
         while IFS= read -r path; do
             _prune_consider "$path"
         done < <(find "$cache_dir" -mindepth 1 -maxdepth 1 -mtime +"$max_age_days" 2>/dev/null)
     fi
 
     local pruned_json errors_json retained_build_json retained_artifact_json details_json
+    local snapshots_json retained_snapshot_json
     pruned_json=$(printf '%s\n' "${pruned_items[@]}" | jq -sc '.' 2>/dev/null || echo "[]")
     errors_json=$(printf '%s\n' "${errors[@]}" | jq -sc '.' 2>/dev/null || echo "[]")
     retained_build_json=$(printf '%s\n' ${retained_build_paths[@]+"${retained_build_paths[@]}"} | jq -sc '.')
     retained_artifact_json=$(printf '%s\n' ${retained_artifact_paths[@]+"${retained_artifact_paths[@]}"} | jq -sc '.')
+    snapshots_json=$(printf '%s\n' ${snapshot_results[@]+"${snapshot_results[@]}"} | jq -sc '.')
+    retained_snapshot_json=$(printf '%s\n' ${retained_snapshot_paths[@]+"${retained_snapshot_paths[@]}"} | jq -sc '.')
 
     local status="success"
     local exit_code=0
@@ -15839,21 +16193,28 @@ EOF
         details_json=$(jq -nc \
             --arg state_dir "$state_dir" \
             --argjson dry_run "$dry_run" \
+            --argjson snapshots_only "$snapshots_only" \
             --argjson cutoff_days "$max_age_days" \
             --argjson keep_last "$keep_last" \
             --argjson keep_releases "$keep_releases" \
             --argjson kept_for_releases "$kept_for_releases" \
             --argjson pruned_count "$pruned_count" \
             --argjson bytes_freed "$bytes_freed" \
-            --argjson pruned_paths "$pruned_json" \
-            --argjson retained_build_paths "$retained_build_json" \
-            --argjson retained_artifact_paths "$retained_artifact_json" \
-            --argjson errors "$errors_json" \
+            --slurpfile pruned_paths /dev/fd/3 \
+            --slurpfile retained_build_paths /dev/fd/4 \
+            --slurpfile retained_artifact_paths /dev/fd/5 \
+            --slurpfile errors /dev/fd/6 \
+            --slurpfile snapshot_results /dev/fd/7 \
+            --slurpfile retained_snapshot_paths /dev/fd/8 \
             '{state_dir: $state_dir, dry_run: $dry_run, cutoff_days: $cutoff_days, keep_last: $keep_last,
+              snapshots_only: $snapshots_only,
               keep_releases: $keep_releases, kept_for_releases: $kept_for_releases,
-              pruned_count: $pruned_count, bytes_freed: $bytes_freed, pruned_paths: $pruned_paths,
-              retained_build_paths: $retained_build_paths, retained_artifact_paths: $retained_artifact_paths,
-              errors: $errors}')
+              pruned_count: $pruned_count, bytes_freed: $bytes_freed, pruned_paths: $pruned_paths[0],
+              retained_build_paths: $retained_build_paths[0], retained_artifact_paths: $retained_artifact_paths[0],
+              snapshot_results: $snapshot_results[0], retained_snapshot_paths: $retained_snapshot_paths[0],
+              errors: $errors[0]}' 3<<< "$pruned_json" 4<<< "$retained_build_json" \
+            5<<< "$retained_artifact_json" 6<<< "$errors_json" \
+            7<<< "$snapshots_json" 8<<< "$retained_snapshot_json") || return 1
         json_envelope "prune" "$status" "$exit_code" "$details_json"
     else
         if $dry_run; then
@@ -17818,16 +18179,22 @@ main() {
     log_set_command "$command"
 
     local dry_run_requested="$DRY_RUN"
+    local snapshot_prune_requested=false
     local command_arg
     for command_arg in "$@"; do
         case "$command_arg" in
+            --snapshots)
+                [[ "$command" != prune ]] || snapshot_prune_requested=true
+                ;;
             --dry-run|-n)
                 dry_run_requested=true
                 break
                 ;;
         esac
     done
-    if ! $dry_run_requested; then
+    # Snapshot retirement preserves ordinary logs too. Startup rotation would
+    # otherwise compress/delete them before the snapshots-only handler runs.
+    if ! $dry_run_requested && ! $snapshot_prune_requested; then
         log_init
     fi
 

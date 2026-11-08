@@ -2423,7 +2423,7 @@ the last `dsr check` result (`state/check/last.json`) when it is under a day old
 Clean up old artifacts, logs, and cache to free disk space.
 
 ```bash
-dsr prune [--dry-run] [--max-age <days>] [--keep-last <n>] [--force]
+dsr prune [--snapshots] [--dry-run] [--max-age <days>] [--keep-last <n>] [--force]
 ```
 
 | Flag | Default | Description |
@@ -2432,6 +2432,7 @@ dsr prune [--dry-run] [--max-age <days>] [--keep-last <n>] [--force]
 | `--max-age` | 30 | Delete items older than N days |
 | `--keep-last` | 5 | Always keep the N most recent artifact sets per tool and build runs per tool/version |
 | `--keep-releases` | true | Never delete artifacts for published releases (`--no-keep-releases` to include them) |
+| `--snapshots` | false | Reclaim only owned Unix snapshots of retired completed native builds, preserving ordinary artifacts, caches, logs and checkpoints |
 | `--force` | false | Skip confirmation prompt |
 
 Artifact sets are `artifacts/<tool>-<tag>/` with their `<tool>-<tag>-manifest.json`;
@@ -2477,7 +2478,7 @@ Checkpoints with recorded source roots are retained, including roots in source
 sync history and relocation evidence. Strict snapshots and their private Cargo
 caches live outside the ordinary state/cache directories and may be protected
 from external cleanup. Removing the checkpoint first would orphan those caches
-and discard recovery evidence. This command does not reclaim the snapshots;
+and discard recovery evidence. The default mode does not reclaim snapshots;
 their recorded paths alone do not establish the directory custody required for
 automatic deletion. Malformed, mismatched or linked checkpoints and ambiguous
 `latest` entries are also retained. These guards apply even with `--keep-last 0`
@@ -2498,6 +2499,72 @@ library finalizer use separate custody mechanisms. Custom outputs outside
 `state/artifacts`, logs, files in `state/manifests` and ordinary cache entries
 remain governed by their existing retention policies. These checks do not
 establish that every recorded recovery input is reclaimable.
+
+**Explicit snapshot retirement (`--snapshots`):**
+
+This mode skips ordinary artifact, log, manifest, cache and checkpoint deletion.
+It applies the same age, latest, per-version keep-last and published-release
+retention policies to completed native build runs. Both the canonical tag and
+stored-version leases remain held through host inspection, removal and the
+checkpoint transaction. A descendant still holding either lease prevents
+cleanup. `--force` skips confirmation only.
+
+Every target must be completed and its original frozen artifact receipts must
+still verify. The output directory must have a completed publishable release
+marker and canonical manifest bound to that checkpoint's tool, version, run and
+source commit. Missing, unfinished, diagnostic or corrupt output is retained.
+Output/checkpoint/shared DSR paths that overlap a snapshot also prevent its
+removal, even when source ownership itself is valid. Local checks compare
+device/inode identities as well as paths, covering directory and single-file
+bind aliases without relying on hardlink counts.
+
+Fresh strict Unix source synchronization issues a private
+`.dsr-snapshot-owner.json` beside `.sbh-protect`, outside authenticated source
+bytes. `snapshot_owners` in the sync result and initial context binds the host,
+run, source commit, logical and physical paths, actual configured route, owner
+UID, directory device/inode, random nonce, and both original marker byte hashes
+and file identities. The coordinator retains the original issuance pin and
+rechecks it after staging. Relocation retains new host pins in its verified
+source-sync receipt. Cleanup unions current and historical roots; an absent,
+conflicting or unverifiable ownership pin is a successful retention, never
+permission to adopt an existing directory. Native Windows and legacy snapshots
+without producer pins remain retained.
+
+The local and SSH workers use the same descriptor-relative implementation.
+They revalidate ownership, reject changed directory/marker identities, unsafe
+ancestors, mount boundaries, special entries and hardlinks outside the owned
+tree, and unlink interior symlinks without following their targets. Source and
+private cache contents are removed before the ownership/protection markers.
+Every held descendant retains its parent/name chain through removal; moving
+that directory outside the snapshot stops further deletion. Nested ownership,
+protection and retirement markers are foreign custody boundaries, so an outer
+run cannot reclaim another run or protected stage stored beneath it.
+An interrupted final directory removal requires the private retirement receipt
+issued by that cleanup attempt; a bare empty replacement is not eligible.
+
+Each completed host removal is recorded in `snapshot_cleanup.roots`, with its
+original owner pin, actual result and completion time. Original context,
+source history, relocation receipts, artifact receipts and checkpoints remain.
+The journal retains the original run-directory age so partial retries do not
+reset retention ordering. A repeated invocation rechecks the host; an absent
+root contributes zero bytes, and a replacement at the old path is retained.
+No journal or lease metadata is written in either dry-run form. Dry-run checks
+describe the current observation and do not reserve future cleanup.
+
+JSON adds `snapshots_only`, `snapshot_results` and `retained_snapshot_paths`.
+Each result contains `{host, source_root, path, status, size_bytes}`, where
+`path` is the owned parent and `status` is `eligible` in dry-run, `removed`, or
+`already_absent`. Only eligible/removed parents increase `pruned_count` and
+`bytes_freed`. The byte count sums each remaining regular inode's apparent size
+once, including the original markers; it excludes directory metadata and
+symlink targets, and is not a filesystem free-space measurement.
+Retained snapshots contain `{path, host, run_id, reason}`, with the source root
+as `path`. Reasons are `snapshot_ownership`, `unsupported_host`,
+`snapshot_transport`, or `cleanup_failed`. Whole-run exclusions add
+`active_run`, `publication_pending`, and `release_retention` to
+`retained_build_paths`. Unknown ownership is a successful skip. Transport,
+removal and journal-write failures report `E053`, return partial status, and
+preserve already completed per-host progress for the next invocation.
 
 **Exit codes:**
 - `0`: Prune completed successfully
@@ -2529,6 +2596,7 @@ Structured error codes for programmatic handling:
 | E050 | PRUNE | State directory not found |
 | E051 | PRUNE | Prune failed or permissions blocked |
 | E052 | REPOS | Repository registry error |
+| E053 | PRUNE | Snapshot transport, removal or cleanup receipt failed |
 | E060 | REPORT | Report generation failed |
 
 ---

@@ -6065,12 +6065,397 @@ def observe(request):
         os.close(parent)
 
 
+def validate_pin(pin):
+    require(isinstance(pin, dict) and set(pin) == PIN_KEYS,
+            'invalid retained snapshot pin fields')
+    body = {key: pin[key] for key in BODY_KEYS}
+    validate_body(body)
+    require(isinstance(pin['receipt_sha256'], str) and
+            re.fullmatch(r'[0-9a-f]{64}', pin['receipt_sha256']) is not None and
+            isinstance(pin['receipt_identity'], str) and
+            re.fullmatch(r'[0-9]+(?::[0-9]+){8}', pin['receipt_identity']) is not None,
+            'invalid retained owner marker pin')
+    return body
+
+
+def same_payload(before, after):
+    return ((before.st_dev, before.st_ino, before.st_mode, before.st_uid,
+             before.st_gid, before.st_size, before.st_mtime_ns) ==
+            (after.st_dev, after.st_ino, after.st_mode, after.st_uid,
+             after.st_gid, after.st_size, after.st_mtime_ns))
+
+
+def mount_boundaries(path):
+    # st_dev alone misses a bind mount on the same filesystem. Check the
+    # worker's mount namespace as well as every descriptor's device number.
+    def decoded(value):
+        return re.sub(r'\\([0-7]{3})', lambda match: chr(int(match.group(1), 8)), value)
+
+    mountpoints = []
+    if sys.platform.startswith('linux'):
+        with open('/proc/self/mountinfo', 'r', encoding='utf-8',
+                  errors='surrogateescape') as stream:
+            raw = stream.read(16 * 1024 * 1024 + 1)
+        require(len(raw) <= 16 * 1024 * 1024, 'mount namespace is too large to validate')
+        for line in raw.splitlines():
+            fields = line.split()
+            require(len(fields) >= 10 and '-' in fields[6:], 'invalid mount namespace record')
+            mountpoints.append(decoded(fields[4]))
+    elif sys.platform == 'darwin':
+        result = subprocess.run(['/sbin/mount'], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, check=False)
+        require(result.returncode == 0 and len(result.stdout) <= 16 * 1024 * 1024,
+                'cannot observe mounted snapshot descendants')
+        for line in result.stdout.decode('utf-8', errors='surrogateescape').splitlines():
+            match = re.fullmatch(r'.+ on (.+) \(.+\)', line)
+            require(match is not None, 'invalid mount namespace record')
+            mountpoints.append(decoded(match.group(1)))
+    else:
+        raise RuntimeError('snapshot reclamation requires Linux or Darwin mount evidence')
+    require(bool(mountpoints), 'mount namespace observation is empty')
+    for mountpoint in mountpoints:
+        require(mountpoint.startswith('/'), 'invalid mounted path')
+        require(mountpoint != path and not mountpoint.startswith(path + '/'),
+                'snapshot contains a mounted directory or file')
+
+
+def stable_parent(parent, body, expected):
+    path = os.path.dirname(body['physical_path'])
+    info = os.fstat(parent)
+    ancestor(info)
+    require(directory_identity(info) == expected and
+            directory_identity(os.stat(path, follow_symlinks=False)) == expected,
+            'snapshot parent directory changed')
+    require(os.path.realpath(body['path']) == body['physical_path'],
+            'snapshot logical path now resolves elsewhere')
+    # Rewalk the physical ancestors without following links. A held parent
+    # descriptor must not silently survive a replacement at its logical name.
+    observed = open_chain(path)
+    try:
+        require(directory_identity(os.fstat(observed)) == expected,
+                'snapshot ancestor chain changed')
+    finally:
+        os.close(observed)
+
+
+def stable_root(parent, root, name, body, parent_identity):
+    stable_parent(parent, body, parent_identity)
+    observed = held_root(parent, name, body)
+    try:
+        require(directory_identity(os.fstat(observed)) == directory_identity(os.fstat(root)),
+                'held snapshot root changed')
+    finally:
+        os.close(observed)
+
+
+def private_retirement(parent, name, expected_raw):
+    try:
+        os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    raw, digest, marker_identity = read_marker(parent, name)
+    require(raw == expected_raw, 'conflicting snapshot retirement receipt')
+    return (digest, marker_identity)
+
+
+def unlink_marker(parent, name, digest, marker_identity, check_path=None):
+    if check_path is not None:
+        check_path()
+    read_marker(parent, name, digest, marker_identity)
+    descriptor = os.open(name, FILE_FLAGS, dir_fd=parent)
+    try:
+        before = os.fstat(descriptor)
+        require(identity(before) == marker_identity and
+                identity(os.stat(name, dir_fd=parent, follow_symlinks=False)) ==
+                marker_identity, 'snapshot marker changed before unlink')
+        if check_path is not None:
+            check_path()
+        os.unlink(name, dir_fd=parent)
+        after = os.fstat(descriptor)
+        require(same_payload(before, after) and after.st_nlink == 0,
+                'snapshot marker changed during unlink')
+        if check_path is not None:
+            check_path()
+        os.fsync(parent)
+    finally:
+        os.close(descriptor)
+
+
+def inspect_markers(root, pin, body, retirement):
+    names = set(os.listdir(root))
+    markers = {OWNER, PROTECT}
+    if not markers.issubset(names):
+        require(retirement is not None and names.issubset(markers),
+                'markerless snapshot has no verified retirement authority')
+    if retirement is not None:
+        require(names.issubset(markers), 'snapshot was repopulated after retirement began')
+    if OWNER in names:
+        raw, _, _ = read_marker(root, OWNER, pin['receipt_sha256'], pin['receipt_identity'])
+        require(parse(raw) == body, 'snapshot ownership body differs from its retained pin')
+    if PROTECT in names:
+        raw, _, _ = read_marker(root, PROTECT, body['protection_sha256'],
+                               body['protection_identity'])
+        require(raw == PROTECTION, 'invalid snapshot protection contents')
+    return names
+
+
+def tree_inventory(root):
+    groups = {}
+    count = 0
+    device = os.fstat(root).st_dev
+
+    def walk(descriptor, depth):
+        nonlocal count
+        require(depth <= 256, 'snapshot directory nesting exceeds the safe traversal budget')
+        before = os.fstat(descriptor)
+        require(before.st_dev == device and before.st_uid == os.geteuid(),
+                'snapshot directory crosses a device or owner boundary')
+        names = sorted(os.listdir(descriptor))
+        require(depth == 0 or (OWNER not in names and PROTECT not in names),
+                'snapshot contains a separately owned or protected directory')
+        # An interrupted child retirement may have already removed both
+        # markers. Its sibling receipt still belongs to that child's lease.
+        # This root's own retirement receipt is outside the inventoried tree.
+        require(not any(name.startswith('.dsr-snapshot-retirement-') and
+                        name.endswith('.json') for name in names),
+                'snapshot contains another retirement ownership receipt')
+        children = {}
+        for name in names:
+            count += 1
+            require(count <= 1000000, 'snapshot inventory exceeds the safe traversal budget')
+            info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            require(info.st_dev == device and info.st_uid == os.geteuid(),
+                    'snapshot entry crosses a device or owner boundary')
+            if stat.S_ISDIR(info.st_mode):
+                child = os.open(name, DIR_FLAGS, dir_fd=descriptor)
+                try:
+                    require(identity(os.fstat(child)) == identity(info),
+                            'snapshot directory changed while opening')
+                    entry = walk(child, depth + 1)
+                finally:
+                    os.close(child)
+            elif stat.S_ISREG(info.st_mode):
+                child = os.open(name, FILE_FLAGS, dir_fd=descriptor)
+                try:
+                    require(identity(os.fstat(child)) == identity(info),
+                            'snapshot file changed while opening')
+                finally:
+                    os.close(child)
+                key = (info.st_dev, info.st_ino)
+                group = groups.setdefault(key, {'current': info, 'count': 0})
+                require(identity(group['current']) == identity(info),
+                        'hardlinked snapshot file changed during inventory')
+                group['count'] += 1
+                entry = {'kind': 'file', 'info': info, 'group': key}
+            elif stat.S_ISLNK(info.st_mode):
+                # Unlink the directory entry, never open or stat its referent.
+                # Symlink hardlinks are uncommon cache objects and are not
+                # accepted as independent ownership evidence.
+                require(info.st_nlink == 1, 'hardlinked snapshot symlink is not supported')
+                entry = {'kind': 'symlink', 'info': info,
+                         'target': os.readlink(name, dir_fd=descriptor)}
+            else:
+                raise RuntimeError('snapshot contains a special filesystem object')
+            require(identity(os.stat(name, dir_fd=descriptor, follow_symlinks=False)) ==
+                    identity(info), 'snapshot entry changed during inventory')
+            children[name] = entry
+        require(names == sorted(os.listdir(descriptor)) and
+                identity(before) == identity(os.fstat(descriptor)),
+                'snapshot directory changed during inventory')
+        return {'kind': 'directory', 'info': before, 'children': children}
+
+    tree = walk(root, 0)
+    size = 0
+    for group in groups.values():
+        require(group['count'] == group['current'].st_nlink,
+                'snapshot file has hardlinks outside the owned directory')
+        size += group['current'].st_size
+    require(size <= 9007199254740991, 'snapshot byte count exceeds the JSON integer range')
+    return tree, groups, size
+
+
+def recheck_tree(descriptor, tree):
+    require(identity(os.fstat(descriptor)) == identity(tree['info']) and
+            set(os.listdir(descriptor)) == set(tree['children']),
+            'snapshot directory changed before retirement')
+    for name, entry in tree['children'].items():
+        require(identity(os.stat(name, dir_fd=descriptor, follow_symlinks=False)) ==
+                identity(entry['info']), 'snapshot entry changed before retirement')
+        if entry['kind'] == 'directory':
+            child = os.open(name, DIR_FLAGS, dir_fd=descriptor)
+            try:
+                recheck_tree(child, entry)
+            finally:
+                os.close(child)
+        elif entry['kind'] == 'symlink':
+            require(os.readlink(name, dir_fd=descriptor) == entry['target'],
+                    'snapshot symlink changed before retirement')
+    require(identity(os.fstat(descriptor)) == identity(tree['info']),
+            'snapshot directory changed during final inventory check')
+
+
+def erase_payload(descriptor, tree, groups, check_path, root_level=False):
+    check_path()
+    require(identity(os.fstat(descriptor)) == identity(tree['info']) and
+            set(os.listdir(descriptor)) == set(tree['children']),
+            'snapshot directory changed before payload retirement')
+    for name, entry in tree['children'].items():
+        if root_level and name in (OWNER, PROTECT):
+            continue
+        check_path()
+        info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        if entry['kind'] == 'directory':
+            require(identity(info) == identity(entry['info']),
+                    'snapshot directory changed before unlink')
+            child = os.open(name, DIR_FLAGS, dir_fd=descriptor)
+            try:
+                # A held directory can be renamed out of the owned root.
+                # Bind every active ancestor to its parent and entry name
+                # before each unlink, not just the top-level snapshot.
+                def check_child():
+                    check_path()
+                    named = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                    require(stat.S_ISDIR(named.st_mode) and
+                            directory_identity(named) == directory_identity(info) ==
+                            directory_identity(os.fstat(child)),
+                            'snapshot descendant moved or changed during retirement')
+
+                erase_payload(child, entry, groups, check_child)
+                check_child()
+                require(not os.listdir(child) and
+                        directory_identity(os.fstat(child)) == directory_identity(info) and
+                        directory_identity(os.stat(name, dir_fd=descriptor,
+                                                   follow_symlinks=False)) ==
+                        directory_identity(info), 'snapshot directory changed before rmdir')
+                os.rmdir(name, dir_fd=descriptor)
+                check_path()
+            finally:
+                os.close(child)
+        elif entry['kind'] == 'file':
+            group = groups[entry['group']]
+            require(identity(info) == identity(group['current']),
+                    'snapshot file changed before unlink')
+            child = os.open(name, FILE_FLAGS, dir_fd=descriptor)
+            try:
+                before = os.fstat(child)
+                require(identity(before) == identity(info) and
+                        identity(os.stat(name, dir_fd=descriptor, follow_symlinks=False)) ==
+                        identity(info), 'snapshot file changed while opening for unlink')
+                check_path()
+                os.unlink(name, dir_fd=descriptor)
+                after = os.fstat(child)
+                require(same_payload(before, after) and
+                        after.st_nlink == before.st_nlink - 1,
+                        'snapshot file changed during unlink')
+                check_path()
+                group['current'] = after
+            finally:
+                os.close(child)
+        else:
+            require(identity(info) == identity(entry['info']) and
+                    os.readlink(name, dir_fd=descriptor) == entry['target'],
+                    'snapshot symlink changed before unlink')
+            check_path()
+            os.unlink(name, dir_fd=descriptor)
+            check_path()
+    check_path()
+    remaining = set(os.listdir(descriptor))
+    require(remaining.issubset({OWNER, PROTECT}) if root_level else not remaining,
+            'snapshot gained entries during retirement')
+    os.fsync(descriptor)
+
+
+def reclaim(request):
+    raw_pin = request.get('pin_json')
+    require(isinstance(raw_pin, str) and len(raw_pin) <= LIMIT,
+            'invalid bounded snapshot pin')
+    pin = parse(raw_pin)
+    body = validate_pin(pin)
+    require(request.get('host') == body['host'] and request.get('route') == body['route'],
+            'snapshot host routing changed')
+    removing = request['operation'] == 'remove'
+    require(os.path.realpath(body['path']) == body['physical_path'],
+            'snapshot logical path now resolves elsewhere')
+    parent = open_chain(os.path.dirname(body['physical_path']))
+    parent_identity = directory_identity(os.fstat(parent))
+    name = os.path.basename(body['physical_path'])
+    retirement_name = '.dsr-snapshot-retirement-' + body['nonce'] + '.json'
+    retirement_raw = (json.dumps({'schema_version': 1,
+                                 'kind': 'dsr-strict-snapshot-retirement',
+                                 'owner_pin': pin},
+                                sort_keys=True, separators=(',', ':')) + '\n').encode()
+    require(len(retirement_raw) <= LIMIT, 'snapshot retirement receipt is too large')
+    root = None
+    try:
+        stable_parent(parent, body, parent_identity)
+        retirement = private_retirement(parent, retirement_name, retirement_raw)
+        try:
+            os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            require(not os.path.lexists(body['path']), 'snapshot logical root was replaced')
+            stable_parent(parent, body, parent_identity)
+            if removing and retirement is not None:
+                unlink_marker(parent, retirement_name, *retirement,
+                              check_path=lambda: stable_parent(parent, body, parent_identity))
+            return {'host': body['host'], 'source_root': body['source_root'],
+                    'path': body['path'], 'status': 'already_absent', 'size_bytes': 0}
+        root = held_root(parent, name, body)
+        inspect_markers(root, pin, body, retirement)
+        mount_boundaries(body['physical_path'])
+        tree, groups, size = tree_inventory(root)
+        recheck_tree(root, tree)
+        stable_root(parent, root, name, body, parent_identity)
+        inspect_markers(root, pin, body, retirement)
+        mount_boundaries(body['physical_path'])
+        if not removing:
+            return {'host': body['host'], 'source_root': body['source_root'],
+                    'path': body['path'], 'status': 'eligible', 'size_bytes': size}
+
+        def check_root():
+            stable_root(parent, root, name, body, parent_identity)
+
+        erase_payload(root, tree, groups, check_root, root_level=True)
+        check_root()
+        inspect_markers(root, pin, body, retirement)
+        mount_boundaries(body['physical_path'])
+        # The exclusive sibling receipt survives the final owner-marker
+        # unlink. A retry never treats a bare empty directory as authority.
+        if retirement is None:
+            write_marker(parent, retirement_name, retirement_raw)
+            retirement = private_retirement(parent, retirement_name, retirement_raw)
+            require(retirement is not None, 'snapshot retirement receipt disappeared')
+        check_root()
+        names = inspect_markers(root, pin, body, retirement)
+        if PROTECT in names:
+            unlink_marker(root, PROTECT, body['protection_sha256'],
+                          body['protection_identity'], check_path=check_root)
+        if OWNER in names:
+            unlink_marker(root, OWNER, pin['receipt_sha256'],
+                          pin['receipt_identity'], check_path=check_root)
+        check_root()
+        require(not os.listdir(root), 'snapshot gained entries before final rmdir')
+        os.rmdir(name, dir_fd=parent)
+        os.fsync(parent)
+        require(not os.path.lexists(body['path']), 'snapshot root was replaced after retirement')
+        stable_parent(parent, body, parent_identity)
+        unlink_marker(parent, retirement_name, *retirement,
+                      check_path=lambda: stable_parent(parent, body, parent_identity))
+        return {'host': body['host'], 'source_root': body['source_root'],
+                'path': body['path'], 'status': 'removed', 'size_bytes': size}
+    finally:
+        if root is not None:
+            os.close(root)
+        os.close(parent)
+
+
 try:
     os.umask(0o077)
     request = parse(sys.argv[1])
-    require(request.get('operation') in ('create', 'observe'),
+    require(isinstance(request, dict), 'invalid snapshot request')
+    require(request.get('operation') in ('create', 'observe', 'inspect', 'remove'),
             'invalid snapshot ownership operation')
-    result = observe(request)
+    result = (observe(request) if request['operation'] in ('create', 'observe')
+              else reclaim(request))
     print(json.dumps(result, sort_keys=True, separators=(',', ':')))
 except (OSError, ValueError, TypeError, KeyError, RuntimeError) as error:
     print('[dsr] strict snapshot custody: ' + str(error), file=sys.stderr)
@@ -6100,6 +6485,39 @@ _act_create_strict_snapshot_owner() {
 
 _act_strict_snapshot_owner() {
     _act_strict_snapshot_owner_request observe "$@"
+}
+
+# This private helper acts only on a producer-issued pin. Public pruning holds
+# the completed build's leases and validates artifact/retention custody first.
+_act_reclaim_strict_snapshot() {
+    [[ $# -ge 2 && $# -le 3 ]] || return 4
+    local host="$1" owner_pin="$2" mode="${3-inspect}" route request program result
+    [[ "$mode" == inspect || "$mode" == remove ]] || return 4
+    [[ ${#owner_pin} -le 16384 ]] || return 4
+    route=$(_act_strict_snapshot_route "$host") || return 4
+    if ! jq -es --arg host "$host" \
+        'length == 2 and (.[0] | type == "object") and
+         .[0].host == $host and .[0].route == .[1]' \
+        <<< "$owner_pin"$'\n'"$route" >/dev/null; then
+        _log_error "Snapshot ownership does not match the current host route"
+        return 4
+    fi
+    # Keep the original JSON as data so the worker can reject duplicate fields.
+    request=$(jq -nc --arg operation "$mode" --arg host "$host" \
+        --argjson route "$route" --rawfile pin /dev/fd/3 \
+        '{operation:$operation,host:$host,route:$route,pin_json:$pin}' \
+        3<<< "$owner_pin") || return 4
+    program=$(_act_strict_snapshot_program "$request") || return 4
+    result=$(_act_strict_snapshot_exec "$host" "$program" "$route") || return $?
+    jq -ce --arg host "$host" --arg mode "$mode" --slurpfile pin /dev/fd/3 '
+        select(($pin | length) == 1) |
+        select(keys == ["host","path","size_bytes","source_root","status"]) |
+        select(.host == $host and .source_root == $pin[0].source_root and .path == $pin[0].path) |
+        select(.size_bytes | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) |
+        select((.status == "already_absent" and .size_bytes == 0) or
+            ($mode == "inspect" and .status == "eligible") or
+            ($mode == "remove" and .status == "removed"))
+    ' 3<<< "$owner_pin" <<< "$result" || return 4
 }
 
 # Describe Unix write locations as data, never by evaluating recipe text in a

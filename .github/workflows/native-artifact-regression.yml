@@ -10,6 +10,7 @@ on:
       - scripts/tests/test_act_runner.sh
       - scripts/tests/test_act_orchestration.sh
       - scripts/tests/test_build_state.sh
+      - scripts/tests/e2e_prune.sh
       - scripts/tests/test_git_build_context.sh
       - scripts/tests/test_act_build_cmd_tokens.sh
       - scripts/tests/test_act_runner_native.sh
@@ -37,6 +38,7 @@ on:
       - src/platforms.sh
       - src/slsa.sh
       - schemas/manifest.json
+      - schemas/prune-details.json
   workflow_dispatch:
 permissions:
   contents: read
@@ -172,6 +174,14 @@ jobs:
           bash scripts/tests/test_act_orchestration.sh --relocation-matrix-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/relocation-matrix.log"
           bash scripts/tests/test_act_orchestration.sh --relocation-variant-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/relocation-variant.log"
           bash scripts/tests/test_act_orchestration.sh --relocation-preview-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/relocation-preview.log"
+          test -z "$(git status --porcelain)"
+      - name: Reclaim retired snapshots while retaining release custody
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/tests/e2e_prune.sh
+          bash scripts/tests/test_act_orchestration.sh --snapshot-owners-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/snapshot-ownership.log"
+          bash scripts/tests/e2e_prune.sh --snapshot-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/snapshot-retirement.log"
           test -z "$(git status --porcelain)"
       - name: Validate native and workflow companion artifact admission
         shell: bash
