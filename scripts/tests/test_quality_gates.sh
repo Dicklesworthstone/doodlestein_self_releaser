@@ -894,6 +894,173 @@ test_run_checks_work_dir() {
     teardown_test_env
 }
 
+test_run_checks_refuses_unavailable_work_dir() {
+    ((TESTS_RUN++))
+    setup_test_env
+    cat > "$DSR_REPOS_FILE" <<YAML
+tools:
+  test-tool:
+    required_checks:
+      - 'printf dispatched > "$TEST_TMPDIR/dispatched"'
+YAML
+    printf 'not a directory\n' > "$TEST_TMPDIR/file"
+    ln -s "$TEST_TMPDIR/missing" "$TEST_TMPDIR/dangling"
+    local path rc failures=0 mode
+    for path in "$TEST_TMPDIR/missing" "$TEST_TMPDIR/file" "$TEST_TMPDIR/dangling"; do
+        for mode in actual planned required; do
+            local args=(test-tool --work-dir "$path")
+            [[ "$mode" != planned ]] || args+=(--dry-run)
+            [[ "$mode" != required ]] || args+=(--skip-checks)
+            rc=0
+            qg_run_checks "${args[@]}" > "$TEST_TMPDIR/result.json" 2> "$TEST_TMPDIR/result.err" || rc=$?
+            if [[ "$rc" != 4 ]] || ! jq -e '.status == "config-error" and .total == 0' \
+                "$TEST_TMPDIR/result.json" >/dev/null; then
+                failures=$((failures + 1))
+            fi
+        done
+    done
+    rc=0
+    qg_run_checks test-tool --work-dir > "$TEST_TMPDIR/missing-arg.out" 2> "$TEST_TMPDIR/missing-arg.err" || rc=$?
+    [[ "$rc" == 4 ]] || failures=$((failures + 1))
+    rc=0
+    _qg_run_single_check 'printf dispatched' "$TEST_TMPDIR/missing" false "$TEST_TMPDIR/check.log" \
+        > "$TEST_TMPDIR/single.out" 2> "$TEST_TMPDIR/single.err" || rc=$?
+    [[ "$rc" == 4 && ! -s "$TEST_TMPDIR/single.out" && ! -e "$TEST_TMPDIR/check.log" ]] || failures=$((failures + 1))
+    if [[ "$failures" == 0 && ! -e "$TEST_TMPDIR/dispatched" && ! -d "$DSR_QUALITY_LOG_DIR" ]]; then
+        pass "unavailable explicit work directories fail before checks or evidence creation"
+    else
+        fail "an unavailable work directory fell back to the caller directory ($failures cases)"
+    fi
+    teardown_test_env
+}
+
+test_run_checks_binds_dirty_source_bytes() {
+    ((TESTS_RUN++))
+    setup_test_env
+    local work_dir="$TEST_TMPDIR/source" rc=0 stable_rc=0 ignored_rc=0 tracked_rc=0 untracked_rc=0
+    mkdir "$work_dir"
+    git -C "$work_dir" init -q
+    git -C "$work_dir" symbolic-ref HEAD refs/heads/main
+    printf 'baseline\n' > "$work_dir/tracked.txt"
+    printf 'build/\n' > "$work_dir/.gitignore"
+    git -C "$work_dir" add tracked.txt .gitignore
+    git -C "$work_dir" -c user.name='DSR Test' -c user.email='dsr-test@example.invalid' \
+        commit -qm baseline || rc=$?
+    printf 'already dirty\n' > "$work_dir/tracked.txt"
+    printf 'already untracked\n' > "$work_dir/untracked.txt"
+    create_repos_yaml 'tools: {test-tool: {checks: ["true"]}}'
+    qg_run_checks test-tool --work-dir "$work_dir" > "$TEST_TMPDIR/stable.json" 2> "$TEST_TMPDIR/stable.err" || stable_rc=$?
+
+    # Normal build output remains excluded by the repository's own ignore
+    # rules. This proves the content fence does not invalidate every build.
+    create_repos_yaml 'tools: {test-tool: {checks: ["mkdir -p build && printf artifact > build/output"]}}'
+    qg_run_checks test-tool --work-dir "$work_dir" > "$TEST_TMPDIR/ignored.json" 2> "$TEST_TMPDIR/ignored.err" || ignored_rc=$?
+
+    git -C "$work_dir" status --porcelain --untracked-files=all > "$TEST_TMPDIR/status-before"
+    create_repos_yaml 'tools: {test-tool: {checks: ["printf changed-tracked > tracked.txt"]}}'
+    qg_run_checks test-tool --work-dir "$work_dir" > "$TEST_TMPDIR/tracked.json" 2> "$TEST_TMPDIR/tracked.err" || tracked_rc=$?
+    git -C "$work_dir" status --porcelain --untracked-files=all > "$TEST_TMPDIR/status-tracked"
+    create_repos_yaml 'tools: {test-tool: {checks: ["printf changed-untracked > untracked.txt"]}}'
+    qg_run_checks test-tool --work-dir "$work_dir" > "$TEST_TMPDIR/untracked.json" 2> "$TEST_TMPDIR/untracked.err" || untracked_rc=$?
+    git -C "$work_dir" status --porcelain --untracked-files=all > "$TEST_TMPDIR/status-untracked"
+    if [[ "$rc" == 0 && "$stable_rc" == 0 && "$ignored_rc" == 0 && "$tracked_rc" == 1 && "$untracked_rc" == 1 ]] &&
+        jq -e '.status == "passed" and .source_before == .source_after' "$TEST_TMPDIR/stable.json" >/dev/null &&
+        jq -e '.status == "passed" and .source_before == .source_after' "$TEST_TMPDIR/ignored.json" >/dev/null &&
+        jq -e '.status == "invalidated-moving-source" and .passed == 1 and .failed == 0 and
+            .source_before != .source_after' "$TEST_TMPDIR/tracked.json" >/dev/null &&
+        jq -e '.status == "invalidated-moving-source" and .passed == 1 and .failed == 0 and
+            .source_before != .source_after' "$TEST_TMPDIR/untracked.json" >/dev/null &&
+        cmp -s "$TEST_TMPDIR/status-before" "$TEST_TMPDIR/status-tracked" &&
+        cmp -s "$TEST_TMPDIR/status-before" "$TEST_TMPDIR/status-untracked"; then
+        pass "real Git source bytes invalidate changed dirty files while stationary dirt and ignored outputs remain valid"
+    else
+        fail "source content fence failed: fixture=$rc stable=$stable_rc ignored=$ignored_rc tracked=$tracked_rc untracked=$untracked_rc"
+    fi
+    teardown_test_env
+}
+
+test_run_checks_binds_git_normalized_bytes() {
+    ((TESTS_RUN++))
+    setup_test_env
+    local work_dir="$TEST_TMPDIR/source" fixture_rc=0 rc=0
+    mkdir "$work_dir"
+    git -C "$work_dir" init -q
+    git -C "$work_dir" symbolic-ref HEAD refs/heads/main
+    printf 'source.txt text eol=lf\n' > "$work_dir/.gitattributes"
+    printf 'baseline\n' > "$work_dir/source.txt"
+    git -C "$work_dir" add .gitattributes source.txt
+    git -C "$work_dir" -c user.name='DSR Test' -c user.email='dsr-test@example.invalid' \
+        commit -qm baseline || fixture_rc=$?
+    printf 'already dirty\n' > "$work_dir/source.txt"
+    git -C "$work_dir" diff --binary > "$TEST_TMPDIR/diff-before"
+    cat > "$DSR_REPOS_FILE" <<'YAML'
+tools:
+  test-tool:
+    checks:
+      - "printf 'already dirty\\r\\n' > source.txt"
+YAML
+    qg_run_checks test-tool --work-dir "$work_dir" > "$TEST_TMPDIR/result.json" 2> "$TEST_TMPDIR/result.err" || rc=$?
+    git -C "$work_dir" diff --binary > "$TEST_TMPDIR/diff-after"
+    if [[ "$fixture_rc" == 0 && "$rc" == 1 ]] &&
+        cmp -s "$TEST_TMPDIR/diff-before" "$TEST_TMPDIR/diff-after" &&
+        jq -e '.status == "invalidated-moving-source" and .passed == 1 and .failed == 0 and
+            .source_before != .source_after' "$TEST_TMPDIR/result.json" >/dev/null; then
+        pass "raw tracked bytes detect LF-to-CRLF changes hidden by Git text normalization"
+    else
+        fail "Git normalization hid changed source bytes: fixture=$fixture_rc actual=$rc"
+    fi
+    teardown_test_env
+}
+
+test_run_checks_binds_initialized_submodule_bytes() {
+    ((TESTS_RUN++))
+    setup_test_env
+    local work_dir="$TEST_TMPDIR/source" dependency="$TEST_TMPDIR/dependency-origin"
+    local fixture_rc=0 stable_rc=0 ignored_rc=0 changed_rc=0 uninitialized_rc=0
+    mkdir "$work_dir" "$dependency"
+    git -C "$dependency" init -q
+    git -C "$dependency" symbolic-ref HEAD refs/heads/main
+    printf 'baseline\n' > "$dependency/source.txt"
+    printf 'build/\n' > "$dependency/.gitignore"
+    git -C "$dependency" add source.txt .gitignore
+    git -C "$dependency" -c user.name='DSR Test' -c user.email='dsr-test@example.invalid' \
+        commit -qm baseline || fixture_rc=$?
+    git -C "$work_dir" init -q
+    git -C "$work_dir" symbolic-ref HEAD refs/heads/main
+    git -C "$work_dir" -c protocol.file.allow=always submodule add -q "$dependency" dependency || fixture_rc=$?
+    git -C "$work_dir" -c user.name='DSR Test' -c user.email='dsr-test@example.invalid' \
+        commit -qm 'pinned dependency' || fixture_rc=$?
+    printf 'dirty before\n' > "$work_dir/dependency/source.txt"
+    create_repos_yaml 'tools: {test-tool: {checks: ["true"]}}'
+    qg_run_checks test-tool --work-dir "$work_dir" > "$TEST_TMPDIR/stable.json" 2> "$TEST_TMPDIR/stable.err" || stable_rc=$?
+    create_repos_yaml 'tools: {test-tool: {checks: ["mkdir -p dependency/build && printf cache > dependency/build/output"]}}'
+    qg_run_checks test-tool --work-dir "$work_dir" > "$TEST_TMPDIR/ignored.json" 2> "$TEST_TMPDIR/ignored.err" || ignored_rc=$?
+    git -C "$work_dir" diff --binary --submodule=short --ignore-submodules=none > "$TEST_TMPDIR/diff-before"
+    create_repos_yaml 'tools: {test-tool: {checks: ["printf dirty-after > dependency/source.txt"]}}'
+    qg_run_checks test-tool --work-dir "$work_dir" > "$TEST_TMPDIR/changed.json" 2> "$TEST_TMPDIR/changed.err" || changed_rc=$?
+    git -C "$work_dir" diff --binary --submodule=short --ignore-submodules=none > "$TEST_TMPDIR/diff-after"
+
+    # A missing child must not be mistaken for the parent repository by
+    # Git's ancestor search, nor produce an endless recursive snapshot.
+    mv "$work_dir/dependency" "$TEST_TMPDIR/retained-dependency"
+    mkdir "$work_dir/dependency"
+    create_repos_yaml 'tools: {test-tool: {checks: ["printf unexpected > dispatched"]}}'
+    qg_run_checks test-tool --work-dir "$work_dir" > "$TEST_TMPDIR/uninitialized.json" 2> "$TEST_TMPDIR/uninitialized.err" || uninitialized_rc=$?
+    if [[ "$fixture_rc" == 0 && "$stable_rc" == 0 && "$ignored_rc" == 0 && "$changed_rc" == 1 &&
+          "$uninitialized_rc" == 4 && ! -e "$work_dir/dispatched" ]] &&
+        jq -e '.status == "passed" and .source_before == .source_after' "$TEST_TMPDIR/stable.json" >/dev/null &&
+        jq -e '.status == "passed" and .source_before == .source_after' "$TEST_TMPDIR/ignored.json" >/dev/null &&
+        cmp -s "$TEST_TMPDIR/diff-before" "$TEST_TMPDIR/diff-after" &&
+        jq -e '.status == "invalidated-moving-source" and .passed == 1 and .failed == 0 and
+            .source_before != .source_after' "$TEST_TMPDIR/changed.json" >/dev/null &&
+        grep -q 'Submodule source is not initialized' "$TEST_TMPDIR/uninitialized.err"; then
+        pass "initialized submodule bytes are bound, ignored outputs stay excluded, and unavailable children are refused"
+    else
+        fail "submodule source fence failed: fixture=$fixture_rc stable=$stable_rc ignored=$ignored_rc changed=$changed_rc uninitialized=$uninitialized_rc"
+    fi
+    teardown_test_env
+}
+
 test_run_checks_duration_total() {
     ((TESTS_RUN++))
     if ! command -v yq &>/dev/null; then
@@ -1073,6 +1240,77 @@ YAML
         pass "a failed multiline program cannot execute its remaining lines as separate checks"
     else
         fail "multiline failure lost its program boundary or exit code: $rc"
+    fi
+    teardown_test_env
+}
+
+test_run_checks_honors_program_errexit() {
+    ((TESTS_RUN++))
+    setup_test_env
+    cat > "$DSR_REPOS_FILE" <<'YAML'
+tools:
+  test-tool:
+    checks:
+      - |
+        set -e
+        false
+        printf escaped > escaped-command
+      - |
+        set -e
+        false | true
+        printf escaped > escaped-pipeline
+      - |
+        test -n "$DSR_QUALITY_RUN_DIR"
+        if IFS= read -r unexpected; then exit 22; fi
+        printf 'later-program-ran\n'
+YAML
+    local rc=0
+    qg_run_checks test-tool --work-dir "$TEST_TMPDIR" > "$TEST_TMPDIR/result.json" 2> "$TEST_TMPDIR/result.err" || rc=$?
+    if [[ "$rc" == 1 && ! -e "$TEST_TMPDIR/escaped-command" && ! -e "$TEST_TMPDIR/escaped-pipeline" ]] &&
+        jq -e '.status == "failed" and .total == 3 and .executed == 3 and .failed == 2 and .passed == 1 and
+            [.checks[].exit_code] == [1,1,0] and
+            (.checks[2].output_preview | contains("later-program-ran"))' "$TEST_TMPDIR/result.json" >/dev/null; then
+        pass "programs honor explicit errexit and pipefail while later checks retain their environment and isolated stdin"
+    else
+        fail "conditional status capture suppressed program errexit or changed check isolation: $rc"
+    fi
+    teardown_test_env
+}
+
+test_run_checks_isolates_exported_shell_options() {
+    ((TESTS_RUN++))
+    setup_test_env
+    cat > "$DSR_REPOS_FILE" <<'YAML'
+tools:
+  test-tool:
+    checks:
+      - |
+        false
+        printf completed > default-program-completed
+      - |
+        set -e
+        false
+        printf escaped > opted-program-escaped
+      - "printf later-program"
+YAML
+    local rc=0
+    (
+        # POSIX mode preserves errexit through command substitutions on all
+        # supported Bash versions, exposing the exported-option boundary.
+        set -e -o posix
+        export SHELLOPTS
+        local program_rc=0
+        qg_run_checks test-tool --work-dir "$TEST_TMPDIR" > "$TEST_TMPDIR/result.json" 2> "$TEST_TMPDIR/result.err" || program_rc=$?
+        [[ "$SHELLOPTS" == *errexit* && "$SHELLOPTS" == *posix* ]] || exit 90
+        export -p | grep 'SHELLOPTS=' >/dev/null || exit 91
+        exit "$program_rc"
+    ) || rc=$?
+    if [[ "$rc" == 1 && -f "$TEST_TMPDIR/default-program-completed" && ! -e "$TEST_TMPDIR/opted-program-escaped" ]] &&
+        jq -e '.status == "failed" and .total == 3 and .executed == 3 and .passed == 2 and .failed == 1 and
+            [.checks[].exit_code] == [0,1,0]' "$TEST_TMPDIR/result.json" >/dev/null; then
+        pass "exported caller options do not change check defaults or disable explicit program errexit"
+    else
+        fail "exported shell options changed check behavior or caller state: $rc"
     fi
     teardown_test_env
 }
@@ -1457,12 +1695,18 @@ main() {
     test_run_checks_all_fail
     test_run_checks_json_output_structure
     test_run_checks_work_dir
+    test_run_checks_refuses_unavailable_work_dir
+    test_run_checks_binds_dirty_source_bytes
+    test_run_checks_binds_git_normalized_bytes
+    test_run_checks_binds_initialized_submodule_bytes
     test_run_checks_duration_total
     test_run_checks_tool_name_in_output
     test_run_checks_continues_after_failure
     test_run_checks_checks_array_content
     test_run_checks_multiline_programs
     test_run_checks_multiline_failure
+    test_run_checks_honors_program_errexit
+    test_run_checks_isolates_exported_shell_options
     test_run_checks_rejects_nul_program
     test_run_checks_large_program_receipts
     test_run_checks_retains_distinct_receipts

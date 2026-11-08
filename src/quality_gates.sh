@@ -80,22 +80,95 @@ _qg_now_ms() {
     fi
 }
 
-# Snapshot the source state of a work dir: git HEAD, a hash of the
-# porcelain dirt listing, and the lock-file hash (empty markers when not
-# a git repo / no lockfile). One line: head|dirt_sha|lock_sha
+# Hash one working-tree entry without Git filters or text normalization.
+# Gitlinks need their own source inventory: the parent's -dirty marker does
+# not change when an already-dirty child is edited again.
+_qg_source_entry() {
+    local root="$1" path="${2%/}" mode="$3" depth="$4" child child_root
+    local target="$root/$path"
+    if [[ "$mode" == 160000 ]]; then
+        if [[ ! -d "$target" || -L "$target" ]] ||
+           ! child=$(CDPATH='' cd -P -- "$target" 2>/dev/null && pwd -P) ||
+           [[ "$child" == "$root" || "$child" != "${root%/}/"* ]]; then
+            _qg_log_error "Submodule source is unavailable or outside its parent checkout: $target"
+            return 4
+        fi
+        if ! child_root=$(git -C "$child" rev-parse --show-toplevel 2>/dev/null) ||
+           ! child_root=$(CDPATH='' cd -P -- "$child_root" 2>/dev/null && pwd -P) ||
+           [[ "$child_root" != "$child" ]]; then
+            _qg_log_error "Submodule source is not initialized at its own repository root: $target (initialize it before running quality checks)"
+            return 4
+        fi
+        printf 'submodule\0%s\0' "$child"
+        _qg_source_snapshot "$child" "$((depth + 1))" || return 4
+    elif [[ -L "$target" ]]; then
+        printf 'link\0'
+        readlink "$target" || return 4
+    elif [[ -f "$target" ]]; then
+        if [[ -x "$target" ]]; then printf 'executable\0'; else printf 'file\0'; fi
+        _qg_sha256 "$target" || return 4
+    elif [[ ! -e "$target" ]]; then
+        printf 'missing\0'
+    else
+        _qg_log_error "Cannot snapshot source entry: $target"
+        return 4
+    fi
+    printf '\0'
+}
+
+# Bind Git HEAD/index and raw tracked/untracked working-tree bytes. Porcelain
+# status and normalized Git diffs can remain identical after source edits.
+# Each initialized submodule contributes its own bounded source snapshot;
+# ignored build outputs remain excluded at every repository level.
+# One line: head|dirt_sha|lock_sha
 _qg_source_snapshot() {
-    local dir="${1:-.}"
-    local head dirt_sha lock_sha
-    head=$(git -C "$dir" rev-parse HEAD 2>/dev/null || echo "not-a-git-repo")
-    dirt_sha=$(git -C "$dir" status --porcelain --untracked-files=all 2>/dev/null \
-        | { command -v sha256sum &>/dev/null && sha256sum || shasum -a 256; } \
-        | awk '{print $1}')
+    local dir="${1:-.}" depth="${2:-0}"
+    local head dirt_sha lock_sha root
+    local GIT_OPTIONAL_LOCKS=0
+    export GIT_OPTIONAL_LOCKS
+    if [[ ! "$depth" =~ ^(0|[1-9][0-9]?)$ ]] || ((depth >= 32)); then
+        _qg_log_error "Quality source submodule nesting exceeds 32 levels: $dir"
+        return 4
+    fi
+    if root=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null); then
+        root=$(CDPATH='' cd -P -- "$root" 2>/dev/null && pwd -P) || return 4
+        if ((depth > 0)) && [[ "$root" != "$dir" ]]; then
+            _qg_log_error "Submodule source repository changed while snapshotting: $dir"
+            return 4
+        fi
+        head=$(git -C "$root" rev-parse --verify HEAD 2>/dev/null) || head="unborn"
+        dirt_sha=$(
+            {
+                git -C "$root" ls-files --stage -z |
+                    while IFS= read -r -d '' entry; do
+                        [[ "$entry" == *$'\t'* ]] || exit 4
+                        path="${entry#*$'\t'}"
+                        mode="${entry%% *}"
+                        [[ "$mode" =~ ^(100644|100755|120000|160000)$ ]] || exit 4
+                        printf 'index\0%s\0' "$entry"
+                        _qg_source_entry "$root" "$path" "$mode" "$depth" || exit 4
+                    done || exit 4
+                git -C "$root" ls-files --others --exclude-standard -z |
+                    while IFS= read -r -d '' path; do
+                        printf 'untracked\0%s\0' "$path"
+                        _qg_source_entry "$root" "$path" untracked "$depth" || exit 4
+                    done || exit 4
+            } | _qg_sha256 -
+        ) || return 4
+    else
+        if ((depth > 0)); then
+            _qg_log_error "Submodule source became unavailable while snapshotting: $dir"
+            return 4
+        fi
+        head="not-a-git-repo"
+        dirt_sha=$(printf '' | _qg_sha256 -) || return 4
+    fi
     if [[ -f "$dir/Cargo.lock" ]]; then
-        lock_sha=$(_qg_sha256 "$dir/Cargo.lock")
+        lock_sha=$(_qg_sha256 "$dir/Cargo.lock") || return 4
     else
         lock_sha="no-lockfile"
     fi
-    echo "${head}|${dirt_sha}|${lock_sha}"
+    printf '%s|%s|%s\n' "$head" "$dirt_sha" "$lock_sha"
 }
 
 # Is <tool> registered in repos.yaml (under tools: or the legacy top level)?
@@ -227,6 +300,11 @@ _qg_run_single_check() {
     local work_dir="$2"
     local dry_run="$3"
     local log_file="$4"
+    local resolved_cwd
+    if ! resolved_cwd=$(CDPATH='' cd -- "${work_dir:-.}" 2>/dev/null && pwd -P); then
+        _qg_log_error "Quality check directory is unavailable: ${work_dir:-.}"
+        return 4
+    fi
 
     local start_ms end_ms duration_ms exit_code=0
     start_ms=$(_qg_now_ms) || return 4
@@ -248,8 +326,6 @@ _qg_run_single_check() {
     fi
 
     _qg_log_info "Running: $cmd"
-    local resolved_cwd
-    resolved_cwd=$(cd "${work_dir:-.}" 2>/dev/null && pwd || pwd)
     # Complete durable log: header with exact argv/cwd/env subset, then
     # the FULL command output (no truncation — bead oxmp).
     {
@@ -267,11 +343,20 @@ _qg_run_single_check() {
     # control stream (including the list of checks that qg_run_checks is
     # iterating).  A check may still opt into a specific input with its own
     # explicit redirection.
-    if [[ -n "$work_dir" && -d "$work_dir" ]]; then
-        (cd "$work_dir" && eval "$cmd") </dev/null >> "$log_file" 2>&1 || exit_code=$?
-    else
-        (eval "$cmd") </dev/null >> "$log_file" 2>&1 || exit_code=$?
-    fi
+    # A fresh interpreter is necessary: eval in a function/subshell whose
+    # caller captures status with || suppresses even the program's explicit
+    # set -e. Stream the complete program so long YAML blocks stay out of
+    # argv. The shell parses the entire group before replacing program stdin.
+    local program
+    printf -v program '{\n%s\n} </dev/null' "$cmd"
+    (
+        # Exported caller options must not silently enable errexit or POSIX
+        # behavior in a check. This changes only the execution subshell;
+        # each program can still opt into set -e explicitly.
+        export -n SHELLOPTS || exit 4
+        cd -- "$resolved_cwd" && BASH_ENV='' ENV='' "$BASH" --noprofile --norc \
+            -u -o pipefail -s <<< "$program"
+    ) >> "$log_file" 2>&1 || exit_code=$?
     # Commands are allowed to finish without a newline. Keep the status
     # trailer on its own line so independent verification can always find it.
     printf '\n# exit_code: %s\n' "$exit_code" >> "$log_file"
@@ -336,6 +421,10 @@ qg_run_checks() {
                 shift
                 ;;
             --work-dir)
+                if [[ $# -lt 2 || -z "${2:-}" ]]; then
+                    _qg_log_error "--work-dir requires a directory"
+                    return 4
+                fi
                 work_dir="$2"
                 shift 2
                 ;;
@@ -371,6 +460,17 @@ EOF
 
     if [[ -z "$tool_name" ]]; then
         _qg_log_error "Tool name required"
+        return 4
+    fi
+
+    local requested_work_dir="${work_dir:-.}"
+    if ! work_dir=$(CDPATH='' cd -- "$requested_work_dir" 2>/dev/null && pwd -P); then
+        _qg_log_error "Quality check directory is unavailable: $requested_work_dir"
+        jq -nc --arg tool "$tool_name" --arg path "$requested_work_dir" '{
+            tool: $tool, status: "config-error", skipped: false, checks: [],
+            passed: 0, failed: 0, planned: 0, total: 0, duration_ms: 0,
+            error: "quality check directory is unavailable", work_dir: $path
+        }'
         return 4
     fi
 
@@ -464,7 +564,10 @@ EOF
     run_dir=$(mktemp -d "$run_parent/$(date +%Y%m%dT%H%M%S)-XXXXXXXX") || return 4
 
     local snapshot_before
-    snapshot_before=$(_qg_source_snapshot "${work_dir:-.}")
+    if ! snapshot_before=$(_qg_source_snapshot "$work_dir"); then
+        _qg_log_error "Could not snapshot the quality check source before execution"
+        return 4
+    fi
 
     _qg_log_info "Running $check_count quality check(s) for $tool_name"
     $dry_run && _qg_log_warn "(dry-run mode: checks are PLANNED, not executed — this cannot pass the gate)"
@@ -512,7 +615,10 @@ EOF
     echo "" >&2
 
     local snapshot_after
-    snapshot_after=$(_qg_source_snapshot "${work_dir:-.}")
+    if ! snapshot_after=$(_qg_source_snapshot "$work_dir"); then
+        _qg_log_error "Could not snapshot the quality check source after execution"
+        return 4
+    fi
     local moving=false
     if ! $dry_run && [[ "$snapshot_before" != "$snapshot_after" ]]; then
         moving=true
