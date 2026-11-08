@@ -613,6 +613,26 @@ dsr build --repo <name> [--targets <list>] [--version <tag>]
 | `--sync-only` | false | Sync selected build hosts without compiling; exit 1 if any host fails |
 | `--diagnostic-native` | false | Build explicit native targets under strict source/family checks, with non-publishable diagnostic provenance |
 
+Every initialized build context records `repo_config_sha256`, the SHA-256 of
+the exact `repos.d/<tool>.yaml` bytes captured before configuration-derived
+planning. This applies to ordinary, strict, workflow, and singleton native
+runs as well as variant matrices. Resume validates the retained binding and
+the current bytes before source preparation or output reuse, and repeats
+admission under the coordinator lock. The CLI passes its original digest
+through synchronization to the scheduler; workers recheck it before execution
+and before accepting results, and final packaging rechecks it before granting
+publication authority.
+
+A changed command, environment, packaging setting, or byte-only YAML edit
+returns configuration error `4` at resume admission. Restore the exact saved
+file or start a fresh run. Missing or malformed saved bindings, including
+older checkpoints, also require a fresh run; current configuration is never
+used to manufacture missing original evidence. A refusal preserves retained
+artifacts, immutable receipts, and attempt counters. `--jobs` may change
+between attempts because it is scheduling input outside the recipe file.
+Explicit approved relocation is the only supported recipe transition and
+must bind the prior digest to this saved value before advancing it atomically.
+
 Native build environment lookup follows launcher export order: a platform's
 `cross_compile.<platform>.env` overrides global `env`, including an explicit
 empty value. Rust target derivation, glibc toolchain selection, and artifact
@@ -757,7 +777,7 @@ workflow tasks retain their platform as the task key. Platform routing and
 Each native variant has its own staging directory, Cargo home, output directory
 and retained artifact receipts. Resume verifies and reuses completed variants
 independently, and refuses a changed ordered task list or repository
-configuration for a matrix run. Partial artifacts remain available for resume,
+configuration. Partial artifacts remain available for resume,
 but no authoritative manifest is emitted until all tasks succeed.
 
 A strict `release_contract` requires one `exact_primary_assets` entry per
@@ -870,8 +890,9 @@ configured triple. For a multi-variant platform, select the failed task with
 match one retained native task exactly. A bare platform is ambiguous and is
 refused for a variant matrix.
 A failed singleton platform may relocate when other platforms in the run have
-multiple variants. Its approval must bind the prior configuration to the run's
-saved matrix configuration digest. The reviewed replacement digest advances
+multiple variants. Every singleton relocation approval must bind the prior
+configuration to the run's saved repository recipe digest; a matrix run also
+requires its saved matrix digest to agree. The reviewed replacement digest advances
 atomically with the host and source bindings; completed variant receipts and
 the exact task inventory stay unchanged. Failed admission or staging cannot
 advance that digest, and later resumes still refuse unapproved configuration
@@ -2091,6 +2112,11 @@ targets that remain eligible under the existing attempt budget. A partial
 checkpoint does not bypass the build step or authorize publication; release
 still requires a complete, validated successful build. Cancelled or unknown
 checkpoint states are refused before execution.
+
+Completed-build reuse also requires the saved repository recipe digest before
+isolated source materialization, quality hooks, signing, or publication. It
+rechecks the same bytes after quality hooks and before the release handoff;
+bypassing the worker scheduler does not bypass recipe admission.
 
 The release step succeeds only when `dsr release` confirms the requested
 repository and tag as public. An upload that correctly leaves an unrelated

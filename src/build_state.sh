@@ -781,7 +781,7 @@ build_state_update_target() {
 # Bind a run to the inputs required for an honest resume.
 # Args: tool version run_id git_sha git_ref source_roots_json output_dir
 #       parallel_jobs target_hosts_json build_purpose build_tasks_json matrix_config_sha256
-#       source_sync_json
+#       source_sync_json repo_config_sha256
 build_state_set_context() {
   local tool="$1"
   local version="$2"
@@ -798,6 +798,15 @@ build_state_set_context() {
   [[ "$build_purpose" == "release" || "$build_purpose" == "diagnostic-native" ]] || return 1
   local build_tasks_json="${11:-}" native_matrix_config_sha256="${12:-}"
   local source_sync_json="${13:-null}"
+  local repo_config_sha256="${14:-}"
+  if [[ ! "$repo_config_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+    log_error "Build context requires the captured repository configuration digest"
+    return 1
+  fi
+  if [[ -n "$native_matrix_config_sha256" && "$native_matrix_config_sha256" != "$repo_config_sha256" ]]; then
+    log_error "Native matrix and repository configuration must bind the same captured recipe"
+    return 1
+  fi
 
   local tool_dir state_file now
   tool_dir=$(_build_get_tool_dir "$tool" "$version")
@@ -841,6 +850,7 @@ build_state_set_context() {
     --arg build_purpose "$build_purpose" \
     --argjson build_tasks "$build_tasks_json" \
     --arg native_matrix_config_sha256 "$native_matrix_config_sha256" \
+    --arg repo_config_sha256 "$repo_config_sha256" \
     --arg output_dir "$output_dir" --argjson parallel_jobs "$parallel_jobs" \
     --arg now "$now" '
       ($source_sync | select(length == 1) | .[0]) as $source_sync |
@@ -854,6 +864,7 @@ build_state_set_context() {
         source_sync: $source_sync,
         build_tasks: $build_tasks,
         native_matrix_config_sha256: $native_matrix_config_sha256,
+        repo_config_sha256: $repo_config_sha256,
         output_dir: $output_dir,
         parallel_jobs: $parallel_jobs
       } |
@@ -906,6 +917,35 @@ build_state_set_source_sync() {
 # the jq program or its argv; callers stream those documents separately.
 _build_state_task_host_filters() {
   cat <<'JQ'
+    def repo_config_digest:
+      type == "string" and test("^[0-9a-f]{64}$");
+    def admit_repo_config_history:
+      . as $state |
+      (if has("relocations") then .relocations else [] end) as $history |
+      if (.context.repo_config_sha256 | repo_config_digest | not) then
+        error("build run lacks a saved repository configuration digest; start a fresh run")
+      elif ($history | type) != "array" then error("invalid relocation recipe history")
+      elif any(.context.build_tasks[]?; .key != .platform) and
+           .context.native_matrix_config_sha256 != .context.repo_config_sha256 then
+        error("saved native matrix and repository configuration digests differ")
+      elif ($history | length) == 0 then .
+      else
+        (reduce $history[] as $receipt ($history[0].prior_context.repo_config_sha256;
+          if (repo_config_digest | not) or
+             $receipt.prior_context.repo_config_sha256 != . or
+             $receipt.approval.prior_repo_config_sha256 != . or
+             ($receipt.repo_config_sha256 | repo_config_digest | not) or
+             $receipt.approval.repo_config_sha256 != $receipt.repo_config_sha256 or
+             $receipt.approval.run_id != $state.run_id or
+             $receipt.approval.target != $receipt.target or
+             $receipt.approval.new_host != $receipt.new_host or
+             (any($receipt.prior_context.build_tasks[]?; .key != .platform) and
+               $receipt.prior_context.native_matrix_config_sha256 != .)
+          then error("relocation history does not bind the retained repository recipe")
+          else $receipt.repo_config_sha256 end)) as $digest |
+        if $digest == $state.context.repo_config_sha256 then $state
+        else error("saved repository recipe differs from approved relocation history") end
+      end;
     def task_host_overrides:
       if type != "object" then error("invalid build context")
       elif has("task_host_overrides") then
@@ -962,10 +1002,11 @@ _build_state_task_host_filters() {
           ($receipt.prior_target.host_capacity_failures // 0)) > ($receipt.prior_target.attempts // 0) or
          $receipt.approval.run_id != $state.run_id or
          $receipt.approval.target != $task.key or $receipt.approval.new_host != $receipt.new_host or
-         (all([$prior.native_matrix_config_sha256, $receipt.repo_config_sha256,
+         (all([$prior.repo_config_sha256, $prior.native_matrix_config_sha256, $receipt.repo_config_sha256,
                $receipt.hosts_config_sha256, $receipt.prior_result_sha256, $receipt.prior_log_sha256][];
            type == "string" and test("^[0-9a-f]{64}$")) | not) or
-         $receipt.approval.prior_repo_config_sha256 != $prior.native_matrix_config_sha256 or
+         $receipt.approval.prior_repo_config_sha256 != $prior.repo_config_sha256 or
+         $prior.repo_config_sha256 != $prior.native_matrix_config_sha256 or
          $receipt.approval.repo_config_sha256 != $receipt.repo_config_sha256 or
          $receipt.approval.hosts_config_sha256 != $receipt.hosts_config_sha256 or
          ($task.key != $task.platform and
@@ -1000,6 +1041,7 @@ _build_state_task_host_filters() {
         (if $task.key == $task.platform then .target_hosts[$task.key] = $receipt.new_host
          else .task_host_overrides = (task_host_overrides + {($task.key): $receipt.new_host}) end) |
         .native_matrix_config_sha256 = $receipt.repo_config_sha256 |
+        .repo_config_sha256 = $receipt.repo_config_sha256 |
         ({context: .} | effective_task_hosts) as $new_hosts |
         .source_roots = (($prior.source_roots + $receipt.verified_source_sync.source_roots) |
           with_entries(select(.key as $host | $new_hosts | any(. == $host))))
@@ -1045,6 +1087,24 @@ build_state_effective_task_hosts() {
   ' <<< "$state"
 }
 
+# A run may reuse old outputs only with its captured recipe. Relocation is the
+# sole reviewed transition: every prior digest must lead to the current one.
+# Omit expected_digest only while admitting that explicit reviewed transition.
+# Missing legacy evidence is never synthesized from the current configuration.
+build_state_validate_repo_config() {
+  local state="$1" expected_digest="${2:-}" filters
+  filters=$(_build_state_task_host_filters) || return 1
+  if ! jq -ce -s --arg expected "$expected_digest" "$filters"'
+    if length == 1 then .[0] | admit_repo_config_history |
+      if $expected == "" or .context.repo_config_sha256 == $expected then true
+      else error("repository configuration changed; restore the saved recipe or start a fresh run") end
+    else error("exactly one build checkpoint required") end
+  ' <<< "$state" >/dev/null; then
+    log_error "Cannot resume with an unbound or changed repository recipe; restore the saved configuration or start a fresh run"
+    return 1
+  fi
+}
+
 # Shape alone cannot authorize a persisted route. Replay reviewed relocations
 # before using overrides on resume, including when an override was removed or
 # changed to another already-staged host. This does not read remote systems.
@@ -1077,6 +1137,14 @@ build_state_relocate_failed_target() {
       if . != $before or .target_statuses[$target].status != "failed" or
          (.status == "completed" or .status == "cancelled")
       then error("relocation state changed or target is not failed")
+      elif ((.context.repo_config_sha256 | repo_config_digest) | not) or
+           (($receipt.repo_config_sha256 | repo_config_digest) | not) or
+           $receipt.approval.prior_repo_config_sha256 != .context.repo_config_sha256 or
+           $receipt.approval.repo_config_sha256 != $receipt.repo_config_sha256 or
+           $receipt.prior_context != .context or
+           $receipt.prior_target != .target_statuses[$target] or
+           $receipt.target != $target or $receipt.new_host != $host
+      then error("relocation approval does not bind the retained repository configuration")
       elif any(.context.build_tasks[]?; .key != .platform) and
          (((.context.native_matrix_config_sha256 | type == "string" and
                test("^[0-9a-f]{64}$")) | not) or
@@ -1099,10 +1167,11 @@ build_state_relocate_failed_target() {
         .relocations = ((.relocations // []) + [$receipt]) |
         .context.target_hosts[$target] = $host |
         .context.source_roots = $roots |
+        .context.repo_config_sha256 = $receipt.repo_config_sha256 |
         if any(.context.build_tasks[]?; .key != .platform) then
           .context.native_matrix_config_sha256 = $receipt.repo_config_sha256
         else . end
-      end | admit_task_host_history' 3<<< "$before" 4<<< "$roots" 5<<< "$receipt"
+      end | admit_repo_config_history | admit_task_host_history' 3<<< "$before" 4<<< "$roots" 5<<< "$receipt"
 }
 
 # Add artifact to build state
@@ -1638,6 +1707,10 @@ build_state_resume() {
     echo '{"error": "Invalid retry configuration", "can_resume": false}'
     return 1
   fi
+  if ! build_state_validate_repo_config "$state"; then
+    echo '{"error": "Saved repository recipe is missing or invalid; start a fresh run", "can_resume": false}'
+    return 1
+  fi
   if ! build_state_validate_task_host_overrides "$state"; then
     log_error "Cannot resume task host bindings without matching relocation history"
     echo '{"error": "Invalid task host relocation history", "can_resume": false}'
@@ -1855,7 +1928,7 @@ build_state_exec_with_retry() (
 # Export functions
 export -f build_state_init build_lock_acquire build_lock_release build_lock_check build_lock_info
 export -f build_state_create build_state_get build_state_update_status build_state_update_host
-export -f build_state_update_target build_state_set_context
+export -f build_state_update_target build_state_set_context build_state_validate_repo_config
 export -f build_state_add_artifact build_state_can_resume
 export -f build_state_set_git_info build_state_get_git_sha build_state_get_git_ref
 export -f build_state_completed_hosts build_state_failed_hosts build_state_pending_hosts

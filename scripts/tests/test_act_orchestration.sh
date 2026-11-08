@@ -2415,7 +2415,7 @@ test_relocation_recovery() {
     for dependency in python3 git jq yq go rsync tar gzip; do
         if [[ "$dependency" == go &&
               ( "${1:-}" == --relocation-matrix-only || "${1:-}" == --relocation-variant-only ||
-                "${1:-}" == --relocation-preview-only ) ]]; then continue; fi
+                "${1:-}" == --relocation-preview-only || "${1:-}" == --recipe-binding-only ) ]]; then continue; fi
         command -v "$dependency" >/dev/null || {
             printf 'Missing relocation integration dependency: %s\n' "$dependency" >&2
             return 77
@@ -2436,7 +2436,8 @@ project = Path(os.environ.get('DSR_TEST_RELOCATION_PROJECT', sys.argv[1]))
 hosts_only = sys.argv[2] == '--relocation-hosts-only'
 variant_only = sys.argv[2] == '--relocation-variant-only'
 preview_only = sys.argv[2] == '--relocation-preview-only'
-matrix_only = variant_only or preview_only or sys.argv[2] == '--relocation-matrix-only'
+recipe_only = sys.argv[2] == '--recipe-binding-only'
+matrix_only = variant_only or preview_only or recipe_only or sys.argv[2] == '--relocation-matrix-only'
 root = Path(tempfile.mkdtemp(prefix='dsr-relocation-recovery-'))
 print('Retained relocation recovery evidence: ' + str(root), flush=True)
 systems = {'Linux': 'linux', 'Darwin': 'darwin'}
@@ -2486,8 +2487,9 @@ matrix_producer = root / 'matrix-producer.py'
 matrix_producer.write_text(r'''import hashlib, json, os, platform, struct, sys
 from pathlib import Path
 case, target, triple, host, phase, sha, ref = Path(sys.argv[1]), *sys.argv[2:]
-triple = triple or 'x86_64-pc-windows-msvc'
-key = target + ('@' + triple if target.startswith('linux/') else '')
+triple = triple or ('x86_64-unknown-linux-gnu' if target.startswith('linux/') else 'x86_64-pc-windows-msvc')
+key = target + ('@' + triple if target.startswith('linux/') and
+                os.environ.get('RELOC_RECIPE_BINDING_FIXTURE') != '1' else '')
 with (case / 'recipe-events').open('a') as stream:
     stream.write(key + '\n')
 result = dict(platform=target, target_triple=triple, method='native', host=host,
@@ -2569,7 +2571,7 @@ if [[ "$RELOC_MODE" == matrix ]]; then
             "$RELOC_PHASE" "$6" "$7"
     }
 fi
-if [[ "${RELOC_VARIANT_FIXTURE:-0}" == 1 ]]; then
+if [[ "${RELOC_VARIANT_FIXTURE:-0}" == 1 || "${RELOC_RECIPE_BINDING_FIXTURE:-0}" == 1 ]]; then
     _act_verify_strict_source_roots() (
         printf '%s\n' "$3" >> "$RELOC_CASE/source-probes" || exit 1
         source "$RELOC_PROJECT/src/act_runner.sh" || exit 1
@@ -2586,6 +2588,19 @@ if [[ "${RELOC_CHECKPOINT_RACE:-0}" == 1 ]]; then
             "$RELOC_CHECKPOINT" > "$RELOC_CASE/raced-state.json" || return 1
         build_state_validate_task_host_overrides "$(cat "$RELOC_CASE/raced-state.json")" || return 1
         cat "$RELOC_CASE/raced-state.json" > "$RELOC_CHECKPOINT" || return 1
+    }
+fi
+if [[ "${RELOC_RECIPE_LOCK_RACE:-0}" == 1 ]]; then
+    # Acquire the genuine lease, then change only the recipe bytes between
+    # planning and the locked admission reread. Neither path may relabel its
+    # earlier task plan with this later document.
+    eval "$(declare -f build_lock_acquire | sed '1s/build_lock_acquire/_reloc_recipe_build_lock_acquire/')"
+    build_lock_acquire() {
+        _reloc_recipe_build_lock_acquire "$@" || return $?
+        if [[ "${_RELOC_RECIPE_LOCK_RACED:-0}" != 1 ]]; then
+            _RELOC_RECIPE_LOCK_RACED=1
+            printf '\n# recipe changed after planning\n' >> "$ACT_REPOS_DIR/relocfixture.yaml"
+        fi
     }
 fi
 if [[ "$RELOC_MODE" == timeout && "$RELOC_PHASE" == first ]]; then
@@ -2626,10 +2641,10 @@ if [[ "$RELOC_PHASE" == coordinator-resume ]]; then
     before=$(build_state_get relocfixture 1.0.0 "$RELOC_RUN") || exit 1
     status=0
     act_orchestrate_build relocfixture 1.0.0 --resume-run-id "$RELOC_RUN" \
-        --git-sha "$RELOC_SHA" --git-ref v1.0.0 --output-dir "$RELOC_CASE/output" \
+        --git-sha "$RELOC_SHA" --git-ref "$(jq -r '.git_ref' <<< "$before")" --output-dir "$RELOC_CASE/output" \
         --source-roots-json "$(jq -c '.context.source_roots' <<< "$before")" \
         --target-hosts-json "$(jq -c '.context.target_hosts' <<< "$before")" \
-        --parallel-jobs 2 -- linux/amd64 windows/amd64 || status=$?
+        --parallel-jobs "${RELOC_JOBS:-2}" -- linux/amd64 windows/amd64 || status=$?
     if build_lock_acquire relocfixture 1.0.0; then
         printf 'released\n' >> "$RELOC_CASE/coordinator-lock-probes"
         build_lock_release relocfixture 1.0.0 || exit 99
@@ -2690,7 +2705,7 @@ if [[ "${RELOC_PREVIEW_GUARDS:-0}" == 1 ]]; then
     build_lock_acquire() { _reloc_preview_forbidden build-lock; }
     build_state_init() { _reloc_preview_forbidden state-initialization; }
 fi
-args=(--version 1.0.0 --jobs 2 --output-dir "$RELOC_CASE/output")
+args=(--version 1.0.0 --jobs "${RELOC_JOBS:-2}" --output-dir "$RELOC_CASE/output")
 if [[ "$RELOC_PHASE" != first ]]; then
     args+=(--resume="$RELOC_RUN")
     if [[ "$RELOC_PHASE" != ordinary-resume && "$RELOC_PHASE" != ordinary-dry-run ]]; then
@@ -2761,6 +2776,9 @@ go build -buildvcs=false -trimpath -o "$binary" .
             release_contract=dict(checksum_sidecar='sha256', exact_primary_assets={
                 native + '@' + gnu: 'relocfixture-gnu', native + '@' + musl: 'relocfixture-musl',
                 failed: 'relocfixture-windows.exe'}))
+    if recipe_only:
+        config['target_triples'][native] = gnu
+        config['release_contract']['exact_primary_assets'] = names
     save(case / 'config/repos.d/relocfixture.yaml', config)
     (case / 'failures').write_text('\n'.join(targets[1:]) + '\n')
     env = dict(os.environ, RELOC_PROJECT=str(project), RELOC_CASE=str(case), RELOC_MODE=mode,
@@ -2774,6 +2792,8 @@ go build -buildvcs=false -trimpath -o "$binary" .
         RCH_DISABLED='1', RCH_CARGO_WRAPPER_BYPASS='1', NO_COLOR='1')
     for key in ('RCH_REQUIRE_REMOTE', 'DSR_BUILD_LOCK_HELD_BY_CALLER', 'DSR_RUN_ID', 'DSR_STRICT_BUILD_ROOT'):
         env.pop(key, None)
+    if recipe_only:
+        env['RELOC_RECIPE_BINDING_FIXTURE'] = '1'
     return case, env, targets
 
 
@@ -2904,6 +2924,125 @@ def mutate_evidence(transform):
                 state['target_statuses'][failed]['result'].pop(key, None)
         save(path, state)
     return change
+
+
+if recipe_only:
+    # Run genuine public partial builds before testing admission. Only the
+    # compiler/metadata boundary is controlled; source sync, state, leases,
+    # worker receipts, packaging and retained artifact bytes remain genuine.
+    for strict in (False, True):
+        label = 'strict-singleton' if strict else 'ordinary-singleton'
+        case, env, targets = fixture(label, 'matrix')
+        config_path = case / 'config/repos.d/relocfixture.yaml'
+        if not strict:
+            config = read(config_path)
+            del config['release_contract']
+            save(config_path, config)
+        original_config = config_path.read_bytes()
+        original_digest = digest(config_path)
+        code, first = invoke(case, env, 'first')
+        details = first.get('details', {})
+        if not check(label + ': public build retains a completed sibling and one actual failed compiler',
+                     code == 1 and details.get('success') == 1 and details.get('failed') == 1):
+            print((case / 'first.stderr').read_text()[-7000:], flush=True)
+            raise AssertionError('Recipe fixture did not reach its partial build')
+        env['RELOC_RUN'] = details['run_id']
+        path = state_file(case, env['RELOC_RUN'])
+        initial = read(path)
+        check(label + ': singleton run captures exact recipe bytes independently of the matrix digest',
+              initial['context'].get('repo_config_sha256') == original_digest and
+              initial['context']['native_matrix_config_sha256'] == '' and
+              [task['key'] for task in initial['context']['build_tasks']] == targets)
+        evidence = retained(initial)
+
+        def refuse_recipe(name, changed_config=None, checkpoint_change=None):
+            prior_state = path.read_bytes()
+            if changed_config is not None:
+                config_path.write_bytes(changed_config)
+            if checkpoint_change is not None:
+                value = read(path)
+                checkpoint_change(value)
+                save(path, value)
+            rejected_state = path.read_bytes()
+            previous_events = events(case)
+            previous_boundaries = observations(case, 'boundaries')
+            previous_probes = observations(case, 'source-probes')
+            for phase in ('ordinary-resume', 'coordinator-resume'):
+                code, unused = invoke(case, env, phase, label + '-' + name + '-' + phase, preflight_exit=4)
+                check(label + '/' + name + '/' + phase + ': refusal preserves checkpoint, attempts, artifacts and source admission',
+                      code == 4 and path.read_bytes() == rejected_state and
+                      events(case) == previous_events and unchanged(evidence) and
+                      observations(case, 'boundaries') == previous_boundaries and
+                      observations(case, 'source-probes') == previous_probes)
+            config_path.write_bytes(original_config)
+            path.write_bytes(prior_state)
+
+        for field in ('build_cmd', 'env', 'binary_name'):
+            changed = json.loads(original_config)
+            if field == 'build_cmd':
+                changed[field] += ' --features changed-recipe'
+            elif field == 'env':
+                changed[field]['RUSTFLAGS'] = '-C opt-level=2'
+            else:
+                changed[field] = 'different-output'
+            refuse_recipe(field, (json.dumps(changed) + '\n').encode())
+        refuse_recipe('byte-only-change', original_config + b'\n')
+        refuse_recipe('legacy-missing-binding', checkpoint_change=lambda state:
+                      state['context'].pop('repo_config_sha256'))
+        refuse_recipe('malformed-binding', checkpoint_change=lambda state:
+                      state['context'].update(repo_config_sha256='invalid'))
+        for phase in ('ordinary-resume', 'coordinator-resume'):
+            prior_state, prior_events = path.read_bytes(), events(case)
+            prior_boundaries, prior_probes = observations(case, 'boundaries'), observations(case, 'source-probes')
+            code, unused = invoke(case, dict(env, RELOC_RECIPE_LOCK_RACE='1'), phase,
+                                  label + '-lock-race-' + phase, preflight_exit=4)
+            check(label + '/' + phase + ': recipe edit after genuine lock acquisition cannot relabel earlier planning',
+                  code == 4 and config_path.read_bytes() == original_config + b'\n# recipe changed after planning\n' and
+                  path.read_bytes() == prior_state and events(case) == prior_events and unchanged(evidence) and
+                  observations(case, 'boundaries') == prior_boundaries and
+                  observations(case, 'source-probes') == prior_probes)
+            config_path.write_bytes(original_config)
+        env['RELOC_JOBS'] = '1'
+        for phase in ('coordinator-resume', 'ordinary-resume'):
+            code, result = invoke(case, env, phase, label + '-restored-' + phase)
+            after = read(path)
+            rows = read(case / (label + '-restored-' + phase + '.stdout')) if phase == 'coordinator-resume' else result['details']
+            rows = rows['targets']
+            check(label + '/' + phase + ': restored recipe retries only unfinished work with changed scheduling',
+                  code == 1 and unchanged(evidence) and
+                  rows[0]['result_path'] == initial['target_statuses'][native]['result_path'] and
+                  rows[0]['log_path'] == initial['target_statuses'][native]['log_path'] and rows[0]['attempt'] == 1 and
+                  (phase != 'coordinator-resume' or rows[0].get('resume_reused') is True) and
+                  after['target_statuses'][native]['attempts'] == 1 and
+                  after['context']['repo_config_sha256'] == original_digest and
+                  Counter(events(case))[native] == 1 and rows[1]['attempt'] in (2, 3))
+        check(label + ': each refused request consumes no compiler allowance',
+              read(path)['target_statuses'][failed]['attempts'] == 3 and
+              Counter(events(case)) == Counter({native:1, failed:3}))
+        (case / 'failures').write_text('')
+        phase = 'ordinary-resume'
+        if strict:
+            approve(case, env, failed, 'replacement', 'reviewed-singleton')
+            phase = 'resume'
+        code, complete = invoke(case, env, phase, label + '-complete')
+        final = read(path)
+        check(label + ': original sibling and repaired target reach actual public completion',
+              code == 0 and final['status'] == 'completed' and unchanged(evidence) and
+              final['target_statuses'][native]['attempts'] == 1 and
+              final['target_statuses'][failed]['attempts'] == 4 and
+              final['context']['repo_config_sha256'] == digest(config_path) and
+              final['context']['native_matrix_config_sha256'] == '' and
+              Counter(events(case)) == Counter({native:1, failed:4}) and
+              complete.get('details', {}).get('publishable') is True)
+        if strict:
+            check('strict singleton relocation advances the general recipe while preserving its prior authority',
+                  final['context']['repo_config_sha256'] != original_digest and
+                  final['relocations'][0]['prior_context']['repo_config_sha256'] == original_digest and
+                  final['relocations'][0]['approval']['prior_repo_config_sha256'] == original_digest and
+                  final['context']['target_hosts'][failed] == 'replacement')
+    (root / 'summary.json').write_text(json.dumps(dict(checks=checks, failures=failures)) + '\n')
+    print('Repository recipe binding: %d checks, %d failures' % (checks, failures), flush=True)
+    raise SystemExit(bool(failures))
 
 
 if preview_only:
@@ -3812,7 +3951,7 @@ PY
 
 if [[ "${1:-}" == --relocation-recovery-only || "${1:-}" == --relocation-hosts-only ||
       "${1:-}" == --relocation-matrix-only || "${1:-}" == --relocation-variant-only ||
-      "${1:-}" == --relocation-preview-only ]]; then
+      "${1:-}" == --relocation-preview-only || "${1:-}" == --recipe-binding-only ]]; then
     test_relocation_recovery "$1"
     exit $?
 fi
@@ -8127,7 +8266,7 @@ test_failed_target_relocation() (
     replacement_hosts=$(jq -nc --arg target "$failed_target" '{"linux/amd64":"trj",($target):"wsurf"}')
     DSR_RUN_ID="$run" build_state_create "$tool" "$version" "linux/amd64,$failed_target" >/dev/null || exit 1
     build_state_set_context "$tool" "$version" "$run" "$sha" "$version" \
-        "$prior_roots" "$TEMP_DIR" 1 "$prior_hosts" release || exit 1
+        "$prior_roots" "$TEMP_DIR" 1 "$prior_hosts" release '' '' null "$(_act_sha256 "$prior")" || exit 1
     build_state_update_target "$tool" "$version" linux/amd64 completed \
         "$(jq -nc --argjson result "$receipt" --arg path "$good_sidecar" '{attempts:1,result:$result,result_path:$path}')" "$run" || exit 1
     build_state_update_target "$tool" "$version" "$failed_target" failed \
@@ -8669,6 +8808,13 @@ case "$relocation_preview_status" in
     0) pass "strict resume previews validate exact approved task routes without worker access or state changes" ;;
     77) skip "strict resume preview integration requires its local fixture dependencies" ;;
     *) fail "strict resume previews changed evidence or admitted an invalid task, recipe or relocation" ;;
+esac
+recipe_binding_status=0
+test_relocation_recovery --recipe-binding-only || recipe_binding_status=$?
+case "$recipe_binding_status" in
+    0) pass "ordinary and strict singleton resumes retain exact recipe authority and reviewed relocation" ;;
+    77) skip "repository recipe binding integration requires its local fixture dependencies" ;;
+    *) fail "repository recipe drift admitted stale completed output or prevented an honest retry" ;;
 esac
 
 if test_worker_group_lifecycle; then

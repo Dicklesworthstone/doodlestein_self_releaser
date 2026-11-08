@@ -291,7 +291,8 @@ if [[ "$1" == create || "$1" == fallback || "$1" == verify || "$1" == public-fin
             printf 'build\n' >> "$CASE/build-calls"
             run=$(DSR_RUN_ID=11111111-1111-4111-8111-111111111111 build_state_create app 1.2.3 linux/amd64) || return 4
             tasks=$(_act_build_task_plan app 1.2.3 '["linux/amd64"]' true) || return 4
-            build_state_set_context app 1.2.3 "$run" "$SOURCE_SHA" v1.2.3 '{}' "$out" 1 '{}' release "$tasks" || return 4
+            build_state_set_context app 1.2.3 "$run" "$SOURCE_SHA" v1.2.3 '{}' "$out" 1 '{}' release \
+                "$tasks" '' null "$(_act_sha256 "$ACT_REPOS_DIR/app.yaml")" || return 4
             build_state_update_status app 1.2.3 completed "$run" || return 4
         }
         cmd_fallback app --version 1.2.3 --expected-sha "$SOURCE_SHA" "$@"

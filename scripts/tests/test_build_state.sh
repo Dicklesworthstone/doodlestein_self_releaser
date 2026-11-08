@@ -940,7 +940,10 @@ test_build_state_resume() {
   ((TESTS_RUN++))
   build_state_init
 
-  build_state_create "resume-tool" "v1.0.0" "trj,mmini,wlap" >/dev/null
+  local run_id
+  run_id=$(build_state_create "resume-tool" "v1.0.0" "trj,mmini,wlap") || return 1
+  build_state_set_context resume-tool v1.0.0 "$run_id" '' '' '{}' '' 1 '{}' release \
+    '' '' null "$(printf '%064d' 7)" || return 1
   build_state_update_status "resume-tool" "v1.0.0" "running"
   build_state_update_host "resume-tool" "v1.0.0" "trj" "completed"
   build_state_update_host "resume-tool" "v1.0.0" "mmini" "failed"
@@ -1208,6 +1211,8 @@ seed_resume_fixture() {
   build_state_init || return 1
   DSR_RUN_ID="${tool}-run" build_state_create "$tool" v1.0.0 "$targets" >/dev/null || return 1
   RESUME_STATE_FILE="$_BUILD_STATE_DIR/$tool/v1.0.0/${tool}-run/state.json"
+  _build_state_jq_update "$RESUME_STATE_FILE" --arg digest "$(printf '%064d' 7)" \
+    '.context.repo_config_sha256 = $digest' || return 1
 }
 
 test_state_read_identity_and_shape() {
@@ -1271,12 +1276,12 @@ test_resume_single_snapshot_after_latest_moves() {
   local first_state="$RESUME_STATE_FILE" second_state calls="$TEMP_DIR/resume-read.calls"
   _build_state_jq_update "$first_state" '
     .hosts = {trj:{status:"failed",retry_count:1}} |
-    .context = {target_hosts:{"linux/amd64":"trj"}, marker:"first"} |
+    .context += {target_hosts:{"linux/amd64":"trj"}, marker:"first"} |
     .target_statuses["linux/amd64"] = {status:"failed",attempts:1}' || return 1
   DSR_RUN_ID=second-run build_state_create moving-latest v1.0.0 darwin/arm64 >/dev/null || return 1
   second_state="$_BUILD_STATE_DIR/moving-latest/v1.0.0/second-run/state.json"
   _build_state_jq_update "$second_state" '
-    .hosts = {mmini:{status:"completed"}} | .context = {marker:"second"}' || return 1
+    .hosts = {mmini:{status:"completed"}} | .context += {marker:"second"}' || return 1
   ln -sfn moving-latest-run "$_BUILD_STATE_DIR/moving-latest/v1.0.0/latest"
   # Load the real reader in a subshell, preserving this observation wrapper
   # without evaluating a rewritten function body. Move latest after the read.
@@ -1554,13 +1559,76 @@ test_retry_record_failure_propagates() {
   ! build_state_record_retry retry-record v1.0.0 trj 1 'failure'
 }
 
+test_repository_recipe_binding() {
+  local tool=recipe-state run_id before bound changed digest replacement value receipt after plan
+  build_state_init || return 1
+  digest=$(printf '%064d' 7)
+  replacement=$(printf '%064d' 8)
+  run_id=$(build_state_create "$tool" v1.0.0 linux/amd64,darwin/arm64) || return 1
+  before=$(build_state_get "$tool" v1.0.0 "$run_id") || return 1
+  for value in '' malformed null "$(printf 'A%063d' 0)" "${digest}0"; do
+    if build_state_set_context "$tool" v1.0.0 "$run_id" '' '' '{}' /output 1 '{}' release \
+         '' '' null "$value" 2>/dev/null; then return 1; fi
+    [[ "$(build_state_get "$tool" v1.0.0 "$run_id")" == "$before" ]] || return 1
+  done
+  build_state_set_context "$tool" v1.0.0 "$run_id" '' '' \
+    '{"stable":"/stable","original":"/original"}' /output 1 \
+    '{"linux/amd64":"stable","darwin/arm64":"original"}' release '' '' null "$digest" || return 1
+  build_state_update_target "$tool" v1.0.0 linux/amd64 completed \
+    '{"attempts":1,"result":{"status":"success","artifact_path":"/retained"}}' "$run_id" || return 1
+  build_state_update_target "$tool" v1.0.0 darwin/arm64 failed \
+    '{"attempts":2,"result":{"status":"failed","exit_code":17}}' "$run_id" || return 1
+  build_state_update_status "$tool" v1.0.0 partial "$run_id" || return 1
+  bound=$(build_state_get "$tool" v1.0.0 "$run_id") || return 1
+  build_state_validate_repo_config "$bound" "$digest" || return 1
+  ! build_state_validate_repo_config "$bound" "$replacement" 2>/dev/null || return 1
+  for value in 'del(.context.repo_config_sha256)' '.context.repo_config_sha256 = null' \
+    '.context.repo_config_sha256 = "bad"' '.context.repo_config_sha256 = 7'; do
+    changed=$(jq -c "$value" <<< "$bound") || return 1
+    ! build_state_validate_repo_config "$changed" 2>/dev/null || return 1
+  done
+  [[ "$(build_state_get "$tool" v1.0.0 "$run_id")" == "$bound" ]] || return 1
+  receipt=$(jq -c --arg next "$replacement" '
+    {target:"darwin/arm64",old_host:"original",new_host:"replacement",
+     repo_config_sha256:$next,prior_context:.context,prior_target:.target_statuses["darwin/arm64"],
+     approval:{run_id:.run_id,target:"darwin/arm64",new_host:"replacement",
+       prior_repo_config_sha256:.context.repo_config_sha256,repo_config_sha256:$next}}' <<< "$bound") || return 1
+  changed=$(jq -c --arg wrong "$replacement" '.approval.prior_repo_config_sha256=$wrong' <<< "$receipt") || return 1
+  ! build_state_relocate_failed_target "$tool" v1.0.0 "$run_id" "$bound" darwin/arm64 replacement \
+    '{"stable":"/stable","replacement":"/replacement"}' "$changed" 2>/dev/null || return 1
+  [[ "$(build_state_get "$tool" v1.0.0 "$run_id")" == "$bound" ]] || return 1
+  build_state_relocate_failed_target "$tool" v1.0.0 "$run_id" "$bound" darwin/arm64 replacement \
+    '{"stable":"/stable","replacement":"/replacement"}' "$receipt" || return 1
+  after=$(build_state_get "$tool" v1.0.0 "$run_id") || return 1
+  build_state_validate_repo_config "$after" "$replacement" || return 1
+  jq -en --argjson prior "$bound" --argjson after "$after" --arg digest "$replacement" '
+    $after.context.repo_config_sha256 == $digest and $after.context.native_matrix_config_sha256 == "" and
+    $after.target_statuses == $prior.target_statuses and
+    $after.relocations[0].prior_context == $prior.context' >/dev/null || return 1
+  for value in '.context.repo_config_sha256 = ("9" * 64)' \
+    '.relocations[0].approval.prior_repo_config_sha256 = ("9" * 64)' \
+    '.relocations[0].prior_context.repo_config_sha256 = ("9" * 64)' \
+    '.relocations[0].approval.repo_config_sha256 = ("9" * 64)' \
+    '.relocations[0].approval.run_id = "another-run"'; do
+    changed=$(jq -c "$value" <<< "$after") || return 1
+    ! build_state_validate_repo_config "$changed" 2>/dev/null || return 1
+  done
+  local state_file="$(_build_get_tool_dir "$tool" v1.0.0)/$run_id/state.json"
+  _build_state_jq_update "$state_file" 'del(.context.repo_config_sha256)' || return 1
+  changed=$(cat "$state_file") || return 1
+  if plan=$(build_state_resume "$tool" v1.0.0 "$run_id" 2>/dev/null); then return 1; fi
+  jq -e '.can_resume == false and (.error | contains("fresh run"))' <<< "$plan" >/dev/null &&
+    [[ "$(cat "$state_file")" == "$changed" ]]
+}
+
 test_native_matrix_resume_tasks() {
   local run_id plan tasks digest
+  build_state_init || return 1
   run_id=$(build_state_create matrix-state v1.0.0 linux/amd64) || return 1
   tasks='[{"key":"linux/amd64@x86_64-unknown-linux-gnu","platform":"linux/amd64","target_triple":"x86_64-unknown-linux-gnu","method":"native"},{"key":"linux/amd64@x86_64-unknown-linux-musl","platform":"linux/amd64","target_triple":"x86_64-unknown-linux-musl","method":"native"}]'
   digest=$(printf '%064d' 1)
   build_state_set_context matrix-state v1.0.0 "$run_id" '' '' '{}' '' 2 '{}' release \
-    "$tasks" "$digest" || return 1
+    "$tasks" "$digest" null "$digest" || return 1
   build_state_update_target matrix-state v1.0.0 linux/amd64@x86_64-unknown-linux-gnu completed \
     '{"attempts":1,"result":{"status":"success","target_triple":"x86_64-unknown-linux-gnu"}}' "$run_id" || return 1
   build_state_update_target matrix-state v1.0.0 linux/amd64@x86_64-unknown-linux-musl failed \
@@ -1696,7 +1764,8 @@ def fixture(name, failed=(musl,)):
                  git_sha='a' * 40, git_ref=version, targets=['linux/amd64', windows],
                  hosts={'original': {'status':'failed', 'retry_count':0}}, target_statuses=entries,
                  context=dict(build_purpose='release', publishable=True, build_tasks=tasks,
-                              native_matrix_config_sha256=digest, source_sync=None, parallel_jobs=2,
+                              native_matrix_config_sha256=digest, repo_config_sha256=digest,
+                              source_sync=None, parallel_jobs=2,
                               output_dir=str(case / 'output'),
                               target_hosts={'linux/amd64':'original', windows:'stable'},
                               source_roots={host:str(case / 'sources' / host) for host in ('original','stable')}))
@@ -1932,7 +2001,7 @@ test_source_sync_context_refresh() {
      hosts:[{host:"healthy",path:"/work/healthy",status:"success"},
        {host:"offline",path:"/work/offline",status:"failed",error:"disconnected"}]}') || return 1
   build_state_set_context sync-context v1.0.0 "$run_id" commit main "$roots" /output 2 \
-    "$hosts" release '' '' "$partial" || return 1
+    "$hosts" release '' '' "$partial" "$(printf '%064d' 7)" || return 1
   build_state_update_target sync-context v1.0.0 linux/amd64 completed \
     '{"attempts":1,"result":{"status":"success","artifact_path":"/output/retained"}}' "$run_id" || return 1
   build_state_update_status sync-context v1.0.0 partial "$run_id" || return 1
@@ -1970,7 +2039,8 @@ test_source_sync_compiler_retry_budget() {
   local run_id attempt extra plan
   local BUILD_RETRY_MAX=3
   run_id=$(build_state_create sync-budget v1.0.0 linux/amd64) || return 1
-  build_state_set_context sync-budget v1.0.0 "$run_id" '' '' '{}' /output 1 '{}' || return 1
+  build_state_set_context sync-budget v1.0.0 "$run_id" '' '' '{}' /output 1 '{}' release \
+    '' '' null "$(printf '%064d' 7)" || return 1
   build_state_update_status sync-budget v1.0.0 failed "$run_id" || return 1
   for attempt in 1 2 3 4; do
     extra=$(jq -nc --argjson attempt "$attempt" '
@@ -2005,7 +2075,8 @@ test_host_readiness_compiler_retry_budget() {
   local run_id attempt extra plan
   local BUILD_RETRY_MAX=3
   run_id=$(build_state_create readiness-budget v1.0.0 linux/amd64) || return 1
-  build_state_set_context readiness-budget v1.0.0 "$run_id" '' '' '{}' /output 1 '{}' || return 1
+  build_state_set_context readiness-budget v1.0.0 "$run_id" '' '' '{}' /output 1 '{}' release \
+    '' '' null "$(printf '%064d' 7)" || return 1
   build_state_update_status readiness-budget v1.0.0 failed "$run_id" || return 1
   # Source transfer and three host-readiness refusals retain four distinct
   # attempts without admitting a compiler. Replay is idempotent for each.
@@ -2052,7 +2123,8 @@ test_host_capacity_compiler_retry_budget() {
   local BUILD_RETRY_MAX=3
   build_state_init || return 1
   run_id=$(build_state_create capacity-budget v1.0.0 linux/amd64) || return 1
-  build_state_set_context capacity-budget v1.0.0 "$run_id" '' '' '{}' /output 1 '{}' || return 1
+  build_state_set_context capacity-budget v1.0.0 "$run_id" '' '' '{}' /output 1 '{}' release \
+    '' '' null "$(printf '%064d' 7)" || return 1
   build_state_update_status capacity-budget v1.0.0 failed "$run_id" || return 1
   # Six reservations fail before compilation, including four busy-host
   # refusals: the immutable attempt number must outgrow the retry allowance
@@ -2111,6 +2183,8 @@ test_host_capacity_requires_preexecution_evidence() {
     ((sequence+=1))
     tool="capacity-evidence-$sequence"
     run_id=$(build_state_create "$tool" v1.0.0 linux/amd64) || return 1
+    build_state_set_context "$tool" v1.0.0 "$run_id" '' '' '{}' /output 1 '{}' release \
+      '' '' null "$(printf '%064d' 7)" || return 1
     build_state_update_status "$tool" v1.0.0 failed "$run_id" || return 1
     extra=$(jq -nc '{status:"failed",stage:"host_capacity",exit_code:2,backend_started:false}' |
       jq -c "$filter" | jq -c '{attempts:1,result:.}') || return 1
@@ -2156,6 +2230,15 @@ fi
 
 if [[ "${1:-}" == --variant-relocation-only ]]; then
   run_state_regression "qualified relocation preserves receipts, history, routing and attempt budget" test_failed_variant_relocation_state
+  echo "Tests run: $TESTS_RUN  Passed: $TESTS_PASSED  Failed: $TESTS_FAILED"
+  [[ $TESTS_FAILED -eq 0 ]]
+  exit $?
+fi
+
+if [[ "${1:-}" == --recipe-binding-only ]]; then
+  run_state_regression "every run binds its recipe and singleton relocation advances only reviewed history" test_repository_recipe_binding
+  run_state_regression "native variant checkpoints resume only failed tasks and reject duplicate identities" test_native_matrix_resume_tasks
+  run_state_regression "resume uses one checkpoint even when latest moves mid-read" test_resume_single_snapshot_after_latest_moves
   echo "Tests run: $TESTS_RUN  Passed: $TESTS_PASSED  Failed: $TESTS_FAILED"
   [[ $TESTS_FAILED -eq 0 ]]
   exit $?
@@ -2232,6 +2315,7 @@ run_state_regression "resume uses one checkpoint even when latest moves mid-read
 run_state_regression "resume maps real hosts and rejects empty target completion evidence" test_resume_host_routing_and_target_evidence
 run_state_regression "resume rejects malformed target/host inventories and counters" test_resume_rejects_malformed_inventory
 run_state_regression "native variant checkpoints resume only failed tasks and reject duplicate identities" test_native_matrix_resume_tasks
+run_state_regression "every run binds its recipe and singleton relocation advances only reviewed history" test_repository_recipe_binding
 run_state_regression "qualified relocation preserves receipts, history, routing and attempt budget" test_failed_variant_relocation_state
 run_state_regression "source-sync refresh preserves completed artifacts and records repair/opt-out history" test_source_sync_context_refresh
 run_state_regression "source-sync failures preserve the compiler retry allowance without double counting" test_source_sync_compiler_retry_budget

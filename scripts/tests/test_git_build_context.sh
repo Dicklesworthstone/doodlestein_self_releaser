@@ -406,7 +406,8 @@ LARGE_SYNC=$(jq -c --argjson roots "$LARGE_ROOTS" --argjson hosts "$LARGE_HOSTS"
 printf '%s\n' "$LARGE_SYNC" > "$WORK/large-sync.json" || exit 1
 check 'initial checkpoint persists a source receipt larger than argv permits' \
   build_state_set_context large-tags v1.0.0 "$LARGE_RUN" "$LARGE_SHA" main \
-  "$LARGE_ROOTS" "$WORK/large-output" 1 "$LARGE_HOSTS" release '' '' "$LARGE_SYNC"
+  "$LARGE_ROOTS" "$WORK/large-output" 1 "$LARGE_HOSTS" release '' '' "$LARGE_SYNC" \
+  "$(printf '%064d' 7)"
 LARGE_EXTRA=$(jq -c '{attempts:1,result:{status:"failed",stage:"source_sync",source_sync:.}}' \
   <<< "$LARGE_SYNC") || exit 1
 check 'target attempt checkpoint retains its large source receipt' \

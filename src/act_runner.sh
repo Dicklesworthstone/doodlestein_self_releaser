@@ -12842,6 +12842,12 @@ EOF
 
     # Execute on remote host
     # Use PIPESTATUS to capture the actual command exit code, not tee's
+    if [[ $exit_code -eq 0 && -n "${_ACT_EXPECTED_REPO_CONFIG_SHA256:-}" ]] &&
+       ! _act_repo_config_matches "$tool_name" "$_ACT_EXPECTED_REPO_CONFIG_SHA256"; then
+        exit_code=4
+        native_execution_phase=recipe_admission
+        native_execution_failure_kind=validation
+    fi
     if [[ $exit_code -eq 0 ]]; then
         native_execution_phase=build_execution
         native_execution_timeout="$_ACT_BUILD_TIMEOUT"
@@ -14063,6 +14069,19 @@ _act_matrix_result_matches() {
     ' <<< "$result" >/dev/null 2>&1
 }
 
+# A captured recipe digest is authority for this invocation, not a hash to
+# discover after planning. Check again at execution boundaries because workers
+# read repository configuration while preparing their native/act commands.
+_act_repo_config_matches() {
+    local tool="$1" expected="$2" observed
+    [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || return 4
+    observed=$(_act_sha256 "$ACT_REPOS_DIR/${tool}.yaml") || return 4
+    if [[ "$observed" != "$expected" ]]; then
+        _log_error "Repository configuration changed; restore the saved recipe or start a fresh run"
+        return 4
+    fi
+}
+
 # Execute exactly one target and emit one compact JSON result as the final
 # stdout line. Diagnostic/build output is retained on stderr by the worker.
 _act_build_orchestration_target() {
@@ -14078,6 +14097,11 @@ _act_build_orchestration_target() {
     local bound_host="${10:-}"
     local selected_triple="${11:-}"
     local _ACT_WORKFLOW_SOURCE_PLAN="${12:-}" _ACT_WORKFLOW_SOURCE_TOOL="$tool_name"
+    local _ACT_EXPECTED_REPO_CONFIG_SHA256="${13:-}"
+    if [[ -n "$_ACT_EXPECTED_REPO_CONFIG_SHA256" ]] &&
+       ! _act_repo_config_matches "$tool_name" "$_ACT_EXPECTED_REPO_CONFIG_SHA256"; then
+        return 4
+    fi
 
     local host="${bound_host:-act-local}" remote_path_override="" ordinary_source_root=""
     if [[ "$strict_release_contract" == "true" ]]; then
@@ -14141,6 +14165,10 @@ _act_build_orchestration_target() {
         while IFS= read -r -d '' flag; do
             act_args+=("$flag")
         done < <(jq -j '.[] | ., "\u0000"' <<< "$extra_flags")
+        if [[ -n "$_ACT_EXPECTED_REPO_CONFIG_SHA256" ]] &&
+           ! _act_repo_config_matches "$tool_name" "$_ACT_EXPECTED_REPO_CONFIG_SHA256"; then
+            return 4
+        fi
         full_output=$(act_run_workflow \
             "$local_path" "$workflow" "$job" "push" "$version" \
             "${act_args[@]}" 2>&1) || exit_code=$?
@@ -14202,6 +14230,13 @@ _act_build_orchestration_target() {
         fi
     fi
 
+    if [[ -n "$_ACT_EXPECTED_REPO_CONFIG_SHA256" ]] &&
+       ! _act_repo_config_matches "$tool_name" "$_ACT_EXPECTED_REPO_CONFIG_SHA256"; then
+        exit_code=4
+        result=$(jq -c '.status="failed" | .exit_code=4 |
+            .error="Repository configuration changed during target execution; restore the saved recipe or start a fresh run"' \
+            <<< "$result") || return 4
+    fi
     local result_status
     result_status=$(jq -r '.status // "unknown"' <<< "$result")
     if [[ "$result_status" == success || "$result_status" == ok || "$result_status" == passed ]] && \
@@ -14359,6 +14394,7 @@ _act_run_target_worker() {
     local selected_triple="${15:-}" task_key="${16:-$target}"
     local source_sync_receipt="${17:-}"
     local workflow_source_plan="${18:-null}"
+    local expected_repo_config_sha256="${19:-}"
     [[ -n "$source_sync_receipt" ]] || source_sync_receipt=null
 
     local host="${bound_host:-act-local}"
@@ -14545,7 +14581,8 @@ _act_run_target_worker() {
         _act_run_target_group "$log_path" _act_build_orchestration_target \
             "$tool_name" "$version" "$run_id" "$target" \
             "$strict_release_contract" "$release_contract_json" "$source_roots_json" \
-            "$release_git_sha" "$release_git_ref" "$host" "$selected_triple" "$workflow_source_plan"
+            "$release_git_sha" "$release_git_ref" "$host" "$selected_triple" "$workflow_source_plan" \
+            "$expected_repo_config_sha256"
     }
     worker_pid="${_ACT_TARGET_GROUP_PID:-}"
     worker_result_fd="${_ACT_TARGET_GROUP[0]:-}"
@@ -14731,6 +14768,7 @@ _act_relocate_failed_target() {
             return 4
         fi
     fi
+    build_state_validate_repo_config "$before" || return 4
     build_state_validate_task_host_overrides "$before" || return 4
     effective_hosts=$(build_state_effective_task_hosts "$before") || return 4
     if $plan_only; then
@@ -14795,6 +14833,10 @@ _act_relocate_failed_target() {
     # Bash cannot retain NUL bytes; malformed input must not acquire the hash
     # of its stripped representation as the claimed prior on-disk document.
     [[ "$(_act_sha256 "$prior_config")" == "$prior_config_hash" ]] || return 4
+    if [[ "$prior_config_hash" != "$(jq -r '.context.repo_config_sha256' <<< "$before")" ]]; then
+        _log_error "Relocation approval does not bind the retained repository configuration"
+        return 4
+    fi
     # A mixed native matrix freezes the whole configuration, including this
     # singleton's route. An explicit relocation may replace that digest only
     # when the reviewed prior configuration is the one retained by this run.
@@ -15199,6 +15241,7 @@ act_orchestrate_build() {
     shift 2
     local targets_arg=()
     local supplied_git_sha="" supplied_git_ref=""
+    local supplied_repo_config_sha256=""
     local supplied_run_id="" source_roots_json="{}"
     local target_hosts_json='{}' effective_task_hosts_json='{}'
     local source_sync_json="" source_sync_supplied=false no_source_sync_gate=false
@@ -15221,6 +15264,12 @@ act_orchestrate_build() {
             --git-ref)
                 [[ $# -ge 2 ]] || { _log_error "--git-ref requires a value"; return 4; }
                 supplied_git_ref="$2"
+                shift 2
+                ;;
+            --repo-config-sha256)
+                [[ $# -ge 2 && -z "$supplied_repo_config_sha256" &&
+                   "$2" =~ ^[0-9a-f]{64}$ ]] || return 4
+                supplied_repo_config_sha256="$2"
                 shift 2
                 ;;
             --run-id)
@@ -15331,6 +15380,17 @@ act_orchestrate_build() {
         fi
     fi
 
+    # Capture the exact recipe before any planner reads it. The held-lock
+    # check below rejects a concurrent edit instead of binding old tasks to a
+    # later configuration. Singleton runs need the same evidence as matrices.
+    local repo_config_sha256
+    repo_config_sha256="$supplied_repo_config_sha256"
+    if [[ -z "$repo_config_sha256" ]]; then
+        repo_config_sha256=$(_act_sha256 "$ACT_REPOS_DIR/${tool_name}.yaml") || return 4
+    fi
+    [[ "$repo_config_sha256" =~ ^[0-9a-f]{64}$ ]] || return 4
+    _act_repo_config_matches "$tool_name" "$repo_config_sha256" || return 4
+
     # Load config
     if ! act_load_repo_config "$tool_name"; then
         _log_error "Failed to load config for $tool_name"
@@ -15421,8 +15481,7 @@ act_orchestrate_build() {
         return 4
     fi
     if jq -e 'any(.[]; .key != .platform)' <<< "$build_tasks_json" >/dev/null; then
-        native_matrix_config_sha256=$(_act_sha256 "$ACT_REPOS_DIR/${tool_name}.yaml") || return 4
-        [[ "$native_matrix_config_sha256" =~ ^[0-9a-f]{64}$ ]] || return 4
+        native_matrix_config_sha256="$repo_config_sha256"
     fi
 
     if $no_source_sync_gate && { $strict_release_contract || $source_sync_supplied; }; then
@@ -15561,10 +15620,20 @@ act_orchestrate_build() {
             lock_acquired_here=true
         fi
 
+        if ! _act_repo_config_matches "$tool_name" "$repo_config_sha256"; then
+            _act_release_orchestration_lock
+            return 4
+        fi
         if $resume_run; then
             local resume_state resume_requested_targets_json
             if ! resume_state=$(build_state_get "$tool_name" "$version" "$requested_run_id" 2>/dev/null); then
                 _log_error "Resume state not found for run $requested_run_id"
+                _act_release_orchestration_lock
+                return 4
+            fi
+            local expected_resume_recipe="$repo_config_sha256"
+            [[ -z "$resume_target_host" ]] || expected_resume_recipe=""
+            if ! build_state_validate_repo_config "$resume_state" "$expected_resume_recipe"; then
                 _act_release_orchestration_lock
                 return 4
             fi
@@ -15761,7 +15830,7 @@ act_orchestrate_build() {
                 ! build_state_set_context "$tool_name" "$version" "$run_id" \
                     "$git_sha" "$git_ref" "$source_roots_json" "$supplied_output_dir" "$parallel_jobs" \
                     "$target_hosts_json" "$build_purpose" "$build_tasks_json" "$native_matrix_config_sha256" \
-                    "${source_sync_json:-null}"; then
+                    "${source_sync_json:-null}" "$repo_config_sha256"; then
                 _log_error "Build state could not retain the run context"
                 _act_release_orchestration_lock
                 return 4
@@ -16087,6 +16156,11 @@ act_orchestrate_build() {
             persisted_result_path=$(jq -r '.result_path // empty' <<< "$persisted_entry")
         fi
 
+        if ! _act_repo_config_matches "$tool_name" "$repo_config_sha256"; then
+            _act_refuse_retained_target "Repository configuration changed before target reuse or dispatch; restore the saved recipe or start a fresh run" "$prior_attempts"
+            break
+        fi
+
         if $resume_run; then
             if [[ -n "$persisted_result" ]] && \
                ! _act_build_purpose_matches "$persisted_result" "$build_purpose" "$strict_release_contract"; then
@@ -16404,7 +16478,7 @@ act_orchestrate_build() {
             "$log_path" "$result_path" "$strict_release_contract" \
             "$release_contract_json" "$source_roots_json" "$git_sha" "$git_ref" "$host" "$build_purpose" \
             "$selected_triple" "$task_key" "$target_sync_receipt" \
-            "$(jq -c '.workflow_source // null' <<< "$task_json")" </dev/null &
+            "$(jq -c '.workflow_source // null' <<< "$task_json")" "$repo_config_sha256" </dev/null &
         worker_pids+=("$!")
         worker_output_paths+=("$output_paths")
         worker_targets+=("$task_key")
@@ -16496,6 +16570,9 @@ act_orchestrate_build() {
     total_duration=$((end_time - start_time))
 
     local source_validation_failed=false
+    if ! _act_repo_config_matches "$tool_name" "$repo_config_sha256"; then
+        coordinator_error="Repository configuration changed during build execution; restore the saved recipe or start a fresh run"
+    fi
     if $strict_release_contract && \
        ! _act_validate_contract_source_identity \
             "$version" "$git_sha" "$git_ref" "$tool_name"; then

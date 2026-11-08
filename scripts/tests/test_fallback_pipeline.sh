@@ -11,6 +11,10 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 source "$ROOT/src/config.sh"
 # shellcheck source=src/act_runner.sh
 source "$ROOT/src/act_runner.sh"
+# Keep recipe admission real in the lightweight fixtures too; their state
+# transport boundaries below do not replace the retained-config validator.
+# shellcheck source=src/build_state.sh
+source "$ROOT/src/build_state.sh"
 # Keep inventory admission real even though cryptographic signing is a
 # controlled boundary below. Sourcing the module does not generate any key.
 # shellcheck source=src/signing.sh
@@ -315,10 +319,14 @@ setup() {
     OUT="$CASE/artifacts"
 }
 checkpoint() {
-    jq -nc --arg status "$1" --arg sha "$SOURCE_SHA" --arg run "$RUN" --arg out "$OUT" '
+    local recipe_digest
+    recipe_digest=$(_release_sha256 "$ACT_REPOS_DIR/tool.yaml") || return 1
+    jq -nc --arg status "$1" --arg sha "$SOURCE_SHA" --arg run "$RUN" --arg out "$OUT" \
+        --arg recipe "$recipe_digest" '
         {tool:"tool",version:"1.2.3",run_id:$run,status:$status,git_sha:$sha,
          targets:["linux/amd64","darwin/arm64"],
-         context:{output_dir:$out,build_purpose:"release",publishable:true}}' > "$CASE/checkpoint.json"
+         context:{output_dir:$out,build_purpose:"release",publishable:true,
+                  repo_config_sha256:$recipe}}' > "$CASE/checkpoint.json"
 }
 completed_fixture() {
     git -C "$CASE/source" init -q
@@ -547,8 +555,30 @@ qg_run_checks() {
 }
 signing_is_enabled() { return 1; }
 signing_wanted() { return 1; }
-cmd_release() { printf 'UNEXPECTED_PUBLICATION %s\n' "$*" >> "$PARTIAL_CASE/boundaries"; return 7; }
-_check_repo() { printf 'UNEXPECTED_NETWORK %s\n' "$*" >> "$PARTIAL_CASE/boundaries"; return 8; }
+cmd_release() {
+    if [[ "$PARTIAL_MODE" != publish && "$PARTIAL_MODE" != publish-isolated ]]; then
+        printf 'UNEXPECTED_PUBLICATION %s\n' "$*" >> "$PARTIAL_CASE/boundaries"
+        return 7
+    fi
+    printf 'PUBLISH %s\n' "$*" >> "$PARTIAL_CASE/boundaries"
+    printf '%s\n' '{"command":"release","status":"success","exit_code":0,"details":{"repo":"fixture/tool","tag":"v1.2.3","release_id":91,"draft":false}}'
+}
+_check_repo() {
+    if [[ "$PARTIAL_MODE" != publish && "$PARTIAL_MODE" != publish-isolated ]]; then
+        printf 'UNEXPECTED_NETWORK %s\n' "$*" >> "$PARTIAL_CASE/boundaries"
+        return 8
+    fi
+    printf 'THROTTLE %s\n' "$*" >> "$PARTIAL_CASE/boundaries"
+    printf '%s\n' '{"queued_count":0,"stuck_in_progress_count":0}'
+}
+_release_contract_scan_release_by_tag() {
+    printf 'RELEASE_SCAN %s\n' "$*" >> "$PARTIAL_CASE/boundaries"
+    printf '%s\n' '{"count":0,"release":null}'
+}
+gh_resolve_tag_sha() {
+    printf 'REMOTE_TAG %s\n' "$*" >> "$PARTIAL_CASE/boundaries"
+    printf '%s\n' "$PARTIAL_SHA"
+}
 case "$PARTIAL_MODE" in
     first)
         cmd_build tool --version 1.2.3 --no-sync --jobs "$PARTIAL_JOBS" --output-dir "$PARTIAL_CASE/output" ;;
@@ -559,6 +589,14 @@ case "$PARTIAL_MODE" in
     resume)
         cmd_fallback tool --version 1.2.3 --expected-sha "$PARTIAL_SHA" --build-only \
             --resume="$PARTIAL_RUN" --output-dir "$PARTIAL_CASE/output" ;;
+    publish|publish-isolated)
+        isolation=()
+        [[ "$PARTIAL_MODE" != publish-isolated ]] || isolation+=(--isolate-source)
+        cmd_fallback tool --version 1.2.3 --expected-sha "$PARTIAL_SHA" \
+            --resume="$PARTIAL_RUN" --output-dir "$PARTIAL_CASE/output" "${isolation[@]}" ;;
+    lease)
+        build_state_init && build_lock_acquire tool v1.2.3 &&
+            build_lock_release tool v1.2.3 && printf '%s\n' '{"available":true}' ;;
 esac
 ''')
 
@@ -627,6 +665,7 @@ def seed(name, jobs):
     (case / 'first.state.json').write_text(state_path.read_text())
     check(name + ': actual persisted checkpoint is partial with exact target outcomes',
           state['status'] == 'partial' and state['context']['parallel_jobs'] == jobs and
+          state['context'].get('repo_config_sha256') == digest(case / 'config/repos.d/tool.yaml') and
           state['target_statuses']['linux/amd64']['status'] == 'completed' and
           state['target_statuses']['linux/arm64']['status'] == 'failed' and
           state['target_statuses']['linux/arm64']['result']['exit_code'] == 17)
@@ -677,6 +716,69 @@ for jobs in (1, 2):
     check(case.name + ': source admission ran and build-only made no publication/network call',
           'READINESS ' in boundaries and 'UNEXPECTED_' not in boundaries and
           resumed.get('details', {}).get('phases', {}).get('release') == 'skipped')
+
+# Reuse a real completed checkpoint from the public build/fallback sequence.
+# Config drift must fail before isolated Git materialization, quality hooks,
+# signing or publication; retained outputs are not permission to reinterpret
+# the recipe. No replacement compiler or updater runs in these refusal cases.
+completed_bytes = state_path.read_bytes()
+recipe_path = case / 'config/repos.d/tool.yaml'
+recipe_bytes = recipe_path.read_bytes()
+completed_events = events(case)
+completed_files = {Path(row['result_path']) for row in state['target_statuses'].values()}
+completed_files.update(Path(row['result']['artifact_path']) for row in state['target_statuses'].values())
+completed_files.update(path for path in (case / 'output').iterdir() if path.is_file())
+completed_identity = {path: (path.stat().st_ino, digest(path)) for path in completed_files}
+for change in ('build-command', 'environment', 'packaging', 'missing-binding', 'malformed-binding'):
+    recipe = json.loads(recipe_bytes)
+    retained = json.loads(completed_bytes)
+    if change == 'build-command':
+        recipe['build_cmd'] = 'different build recipe'
+    elif change == 'environment':
+        recipe['env'] = {'BUILD_FLAVOR': 'different'}
+    elif change == 'packaging':
+        recipe['binary_name'] = 'different-name'
+    elif change == 'missing-binding':
+        retained['context'].pop('repo_config_sha256', None)
+    else:
+        retained['context']['repo_config_sha256'] = 'not-a-config-digest'
+    recipe_path.write_bytes(recipe_bytes if change.endswith('binding') else json.dumps(recipe).encode())
+    state_path.write_bytes(completed_bytes if not change.endswith('binding') else json.dumps(retained).encode())
+    selected_state = (state_path.stat().st_ino, digest(state_path))
+    before_boundaries = (case / 'boundaries').read_text()
+    code, result = invoke(case, env, 'publish-isolated', 'recipe-' + change)
+    new_boundaries = (case / 'boundaries').read_text()[len(before_boundaries):]
+    check(change + ': completed fallback refuses the recipe before source, quality or publication',
+          code == 4 and result.get('exit_code') == 4 and result.get('details', {}).get('phase') == 'resume' and
+          not (case / 'state/fallback-sources').exists() and events(case) == completed_events and
+          not any(line.startswith(('CHECK ', 'READINESS ', 'SLOT ', 'PUBLISH ', 'THROTTLE ',
+                                   'RELEASE_SCAN ', 'REMOTE_TAG ', 'UNEXPECTED_'))
+                  for line in new_boundaries.splitlines()))
+    check(change + ': checkpoint, frozen receipts and published build output stay unchanged',
+          (state_path.stat().st_ino, digest(state_path)) == selected_state and
+          all(path.is_file() and (path.stat().st_ino, digest(path)) == identity
+              for path, identity in completed_identity.items()))
+    code, lease = invoke(case, env, 'lease', 'lease-after-' + change)
+    check(change + ': refusal releases the actual coordinator lease', code == 0 and lease.get('available') is True)
+
+recipe_path.write_bytes(recipe_bytes)
+state_path.write_bytes(completed_bytes)
+before_boundaries = (case / 'boundaries').read_text()
+code, result = invoke(case, env, 'publish', 'recipe-restored-publication')
+new_boundaries = (case / 'boundaries').read_text()[len(before_boundaries):]
+check('restored recipe: completed fallback reuses the real build and reaches confirmed publication',
+      code == 0 and result.get('status') == 'success' and
+      result.get('details', {}).get('resume_run_id') == state['run_id'] and
+      result.get('details', {}).get('phases', {}).get('release') == 'success' and
+      sum(line.startswith('PUBLISH ') for line in new_boundaries.splitlines()) == 1 and
+      'CHECK ' in new_boundaries and events(case) == completed_events)
+check('restored recipe: publication preserves checkpoint, worker receipts and sealed build output',
+      state_path.read_bytes() == completed_bytes and
+      all(path.is_file() and (path.stat().st_ino, digest(path)) == identity
+          for path, identity in completed_identity.items()))
+code, lease = invoke(case, env, 'lease', 'lease-after-publication')
+check('restored recipe: successful publication releases the actual coordinator lease',
+      code == 0 and lease.get('available') is True)
 
 case, env, state_path, initial = seed('refusal-guards', 2)
 before_events = events(case)
@@ -970,6 +1072,9 @@ isolated_fixture() {
         '{repo:"owner/tool",local_path:$path,language:"go",binary_name:"tool",
           workflow:".github/workflows/release.yml",targets:["linux/amd64","darwin/arm64"],
           act_job_map:{"linux/amd64":"build","darwin/arm64":"build"}}' > "$ACT_REPOS_DIR/tool.yaml"
+    # This is the completed fixture's original workflow configuration, before
+    # any test-specific mutation; capture its actual recipe binding.
+    checkpoint completed || return 1
     # shellcheck source=/dev/null
     source <(awk '/^(config_get_tool_field|_config_read_single_mapping_json|_config_canonicalize_release_source_dependency_checkouts_json|_config_get_release_source_dependency_checkouts_json|config_get_release_source_dependencies_json)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$ROOT/src/config.sh")
     # shellcheck source=/dev/null
@@ -1348,7 +1453,8 @@ test_isolated_source_sibling_resume() {
     mv "$CASE/sibling-config.json" "$ACT_REPOS_DIR/tool.yaml"
     receipt=$(jq -nc --arg sha "$SOURCE_SHA" --arg revision "$revision" \
         '{git_context:{git_sha:$sha},sibling_git_contexts:{dependency:{git_sha:$revision}}}')
-    jq --argjson receipt "$receipt" '
+    jq --argjson receipt "$receipt" --arg recipe "$(_release_sha256 "$ACT_REPOS_DIR/tool.yaml")" '
+        .context.repo_config_sha256=$recipe |
         .context.source_sync=$receipt | .source_sync_history=[{receipt:$receipt}] |
         .target_statuses=(.targets | map({key:.,value:{status:"completed",result:{status:"success",method:"native",source_sync:$receipt}}}) | from_entries)
     ' "$CASE/checkpoint.json" > "$CASE/source-state.json"
@@ -1381,6 +1487,7 @@ test_isolated_source_sibling_resume() {
             config_digest=$(_release_sha256 "$ACT_REPOS_DIR/tool.yaml")
             jq --argjson tasks "$tasks" --arg digest "$config_digest" --argjson receipt "$receipt" '
                 .context.build_tasks=$tasks | .context.native_matrix_config_sha256=$digest |
+                .context.repo_config_sha256=$digest |
                 .target_statuses=($tasks | map({key:.key,value:{status:"completed",result:{status:"success",method:"native",source_sync:$receipt}}}) | from_entries)
             ' "$CASE/checkpoint.json" > "$CASE/revised-state.json"
             printf 'third variant bytes\n' > "$OUT/variant"

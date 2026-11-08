@@ -2735,6 +2735,13 @@ EOF
         }
     fi
 
+    # Freeze the recipe before any configuration-derived plan or source work.
+    # The coordinator receives this same digest rather than recapturing a
+    # potentially changed recipe after synchronization.
+    local build_repo_config_sha256
+    build_repo_config_sha256=$(_act_sha256 "$ACT_REPOS_DIR/${tool_name}.yaml") || return 4
+    [[ "$build_repo_config_sha256" =~ ^[0-9a-f]{64}$ ]] || return 4
+
     # Load tool config
     if ! act_load_repo_config "$tool_name"; then
         log_error "Tool '$tool_name' not found in repos.d"
@@ -3018,6 +3025,23 @@ EOF
     fi
 
     local resume_run_id="" resume_state="" resume_completed=false
+    _dsr_build_validate_resume_recipe() {
+        local checkpoint="$1" expected_recipe="$build_repo_config_sha256"
+        # Relocation admits its reviewed configuration delta separately, but
+        # still requires a genuine prior binding and valid transition history.
+        [[ -z "$resume_target_host" ]] || expected_recipe=""
+        if ! _act_repo_config_matches "$tool_name" "$build_repo_config_sha256" ||
+           ! build_state_validate_repo_config "$checkpoint" "$expected_recipe"; then
+            local error="Resume repository recipe changed or lacks its original binding; restore the saved configuration or start a fresh run"
+            log_error "$error"
+            if $JSON_MODE; then
+                json_envelope "build" "error" 4 "$(jq -nc \
+                    --arg repo "$ACT_REPO_GITHUB" --arg version "$tag" --arg error "$error" \
+                    '{repo:$repo,version:$version,targets:[],error:$error}')"
+            fi
+            return 4
+        fi
+    }
     if $resume; then
         if $dry_run; then
             # Checkpoint reads need a path, not the initializer's mkdir calls.
@@ -3030,6 +3054,7 @@ EOF
             log_error "No resumable build state found for $tool_name $version ($resume_selector)"
             return 4
         fi
+        _dsr_build_validate_resume_recipe "$resume_state" || return 4
         if ! build_state_validate_task_host_overrides "$resume_state"; then
             log_error "Resume task hosts do not match approved relocation history"
             if $JSON_MODE; then
@@ -3328,6 +3353,7 @@ EOF
         fi
         local DSR_BUILD_LOCK_HELD_BY_CALLER=1
         export DSR_BUILD_LOCK_HELD_BY_CALLER
+        _act_repo_config_matches "$tool_name" "$build_repo_config_sha256" || return 4
         if $resume; then
             # The initial checkpoint read supports argument validation and dry
             # runs. Re-admit the same checkpoint under the coordinator lock before
@@ -3339,6 +3365,7 @@ EOF
                 log_error "Resume checkpoint changed before build-lock admission"
                 return 4
             fi
+            _dsr_build_validate_resume_recipe "$admitted_resume_state" || return 4
         fi
     fi
 
@@ -3652,6 +3679,7 @@ EOF
     # shellcheck disable=SC2086
     full_output=$(act_orchestrate_build "$tool_name" "$version" \
         --run-id "$build_run_id" \
+        --repo-config-sha256 "$build_repo_config_sha256" \
         "${build_source_args[@]}" "${orchestration_resume_args[@]}" "${purpose_args[@]}" \
         --parallel-jobs "$parallel_jobs" --output-dir "$output_dir" -- \
         $target_list 2>&1) || orchestrator_exit=$?
@@ -3718,6 +3746,9 @@ EOF
     if $VERBOSE; then
         log_debug "Parsed counts: total=$total success=$success failed=$failed"
     fi
+
+    # Packaging must use the same recipe as the retained worker outputs.
+    _act_repo_config_matches "$tool_name" "$build_repo_config_sha256" || return 4
 
     # Collect artifacts into output directory for release/upload
     local collect_failed=false
@@ -5324,6 +5355,9 @@ EOF
                 else error("build output purpose changed before publication") end
             ' "$purpose_marker" > "$sealed_marker"; then
             log_error "Could not prepare the completed build publication"
+            final_exit=4
+        elif ! _act_repo_config_matches "$tool_name" "$build_repo_config_sha256"; then
+            log_error "Repository recipe changed during artifact collection or packaging"
             final_exit=4
         elif ! _act_is_uuid "$result_run_id" ||
            ! command -v build_state_update_status &>/dev/null ||
@@ -12379,6 +12413,7 @@ EOF
     log_set_tool "$tool_name"
 
     local local_path="" repo="" contract="null" tag="" state_dir
+    local fallback_repo_config_sha256=""
 
     # Every real (non-plan) outcome is notified, so a watcher's "Fallback
     # started" is always followed by how it ended. Fallbacks started by one
@@ -12409,6 +12444,8 @@ EOF
 
     # Resolve repository, contract and tag (assigning the locals above).
     _fallback_resolve() {
+        fallback_repo_config_sha256=$(_act_sha256 "$ACT_REPOS_DIR/${tool_name}.yaml") || return 4
+        [[ "$fallback_repo_config_sha256" =~ ^[0-9a-f]{64}$ ]] || return 4
         if ! act_load_repo_config "$tool_name"; then
             log_error "Tool '$tool_name' not found in repos.d"
             return 4
@@ -12613,6 +12650,10 @@ EOF
     trap 'exit 143' TERM
     export DSR_BUILD_LOCK_HELD_BY_CALLER=1
 
+    if ! _act_repo_config_matches "$tool_name" "$fallback_repo_config_sha256"; then
+        _fallback_result 4 config "Repository recipe changed during fallback planning"
+        return 4
+    fi
     if $resume; then
         # Resolve latest once. Neither quality checks nor another new run may
         # redirect this invocation to a different checkpoint or output tree.
@@ -12632,6 +12673,13 @@ EOF
                     type == "string" and test("^[A-Za-z0-9_-]+/[A-Za-z0-9_-]+$"))))
             ' <<< "$resume_state" >/dev/null; then
             _fallback_result 4 resume "A valid release-build checkpoint is required"
+            return 4
+        fi
+        # Completed fallback can bypass cmd_build entirely. Admit the saved
+        # recipe here before source materialization or quality hooks as well
+        # as in the ordinary worker-resume path.
+        if ! build_state_validate_repo_config "$resume_state" "$fallback_repo_config_sha256"; then
+            _fallback_result 4 resume "Repository recipe changed or lacks its original binding; restore the saved configuration or start a fresh run"
             return 4
         fi
         resume_run_id=$(jq -r '.run_id' <<< "$resume_state") || return 4
@@ -12797,6 +12845,8 @@ EOF
         local tasks_json strict_tasks=false matrix_digest=""
         local task task_key workflow_identity retained_target retained_result retained_path
         local -a configured_targets=()
+        _act_repo_config_matches "$tool_name" "$fallback_repo_config_sha256" || return 1
+        build_state_validate_repo_config "$resume_state" "$fallback_repo_config_sha256" || return 1
         current_sha=$(git -C "$local_path" rev-parse --verify HEAD) || return 1
         source_status=$(git -C "$local_path" status --porcelain --untracked-files=all) || return 1
         target_list=$(act_get_targets "$tool_name") || return 1
@@ -12903,6 +12953,11 @@ EOF
         checks_status="passed"
     fi
 
+    if ! _act_repo_config_matches "$tool_name" "$fallback_repo_config_sha256"; then
+        build_status="blocked"; release_status="blocked"
+        _fallback_result 4 build "Repository recipe changed during quality checks"
+        return 4
+    fi
     if ! _fallback_verify_expected_source; then
         build_status="blocked"; release_status="blocked"
         _fallback_result 4 build "Source changed after quality checks; expected workflow commit is no longer available"
@@ -13059,10 +13114,11 @@ EOF
         fi
     done < <(jq -r '.artifacts[] | [.name,.sha256,(.size_bytes|tostring)] | @tsv' <<< "$manifest_json")
     if [[ "$(_release_sha256 "$manifest_file")" != "$manifest_sha" ]] ||
+       ! _act_repo_config_matches "$tool_name" "$fallback_repo_config_sha256" ||
        { $reuse_completed && ! _fallback_verify_completed_source; } ||
        ! _fallback_verify_expected_source; then
         verification_status="failed"; release_status="blocked"
-        _fallback_result 6 verification "Manifest or completed source changed before release"
+        _fallback_result 6 verification "Manifest, repository recipe, or completed source changed before release"
         return 6
     fi
 

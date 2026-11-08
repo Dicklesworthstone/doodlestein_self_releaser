@@ -914,14 +914,16 @@ _watch_checkpoint_source_sha() {
 
 _watch_seed_mixed_checkpoint() (
     local run_id="$1" output_dir="$2" sha="$3" run_status="${4:-partial}"
-    local extra receipt artifact
+    local extra receipt artifact recipe_file="$TEST_TMPDIR/watch-checkpoint-recipe.yaml"
     source "${DSR_ROUTING_TEST_ROOT:-$DSR_PROJECT_ROOT}/src/build_state.sh"
     log_info() { :; }
     log_debug() { :; }
     build_state_init || return 1
+    printf '%s\n' 'tool_name: ntm' 'build_cmd: fixture-only' > "$recipe_file" || return 1
     DSR_RUN_ID="$run_id" build_state_create ntm v1.2.3 linux/amd64,darwin/arm64 >/dev/null || return 1
     build_state_set_context ntm v1.2.3 "$run_id" "$sha" v1.2.3 '{}' "$output_dir" 1 \
-        '{"linux/amd64":"trj","darwin/arm64":"mmini"}' || return 1
+        '{"linux/amd64":"trj","darwin/arm64":"mmini"}' release '' '' null \
+        "$(_build_state_sha256 "$recipe_file")" || return 1
     mkdir -p "$output_dir" || return 1
     artifact="$output_dir/ntm-linux-amd64"
     [[ -f "$artifact" ]] || printf 'completed target payload\n' > "$artifact"

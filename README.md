@@ -639,6 +639,17 @@ by `release` and `release verify`, including when `--no-manifest` is requested.
 Use `--resume` to retry packaging or finish interrupted publication from the
 verified target receipts without rebuilding completed targets.
 
+Every run retains the SHA-256 of its exact `repos.d/<tool>.yaml` bytes,
+including ordinary builds and platforms with only one target triple. Resume
+requires that saved recipe before preparing sources or reusing artifacts.
+Changing a command, environment, packaging setting, or even YAML formatting
+requires restoring the original file or starting a fresh run; DSR cannot
+combine a completed artifact from the old recipe with a new one from the
+edited recipe. A checkpoint created before this binding existed requires a
+fresh run. Changing `--jobs` is allowed because it changes scheduling, not the
+repository recipe. Explicit approved host relocation remains available and
+atomically records its permitted configuration change.
+
 Keep the completed manifest with its artifact directory: the publication
 receipt binds its exact bytes, run ID, and source commit. Removing or modifying
 the manifest invalidates that receipt. Dry runs and `--sync-only` leave the
