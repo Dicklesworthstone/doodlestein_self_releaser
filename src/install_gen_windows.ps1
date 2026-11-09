@@ -7,6 +7,7 @@ param(
     [string]$Prefix = '',
     [string]$CacheDir = '',
     [switch]$Offline,
+    [switch]$Recover,
     [switch]$Yes,
     [switch]$Json,
     [switch]$Help
@@ -822,30 +823,26 @@ function Move-DsrInstalledFile {
     [IO.File]::Move($Source, $Destination, $true)
 }
 
-function Install-DsrExecutableFamily {
-    param([string]$Source, [string]$Prefix, [string[]]$Names, [switch]$Yes)
-    $prefixPath = New-DsrDirectoryChain $Prefix
-    $lockPath = [IO.Path]::Combine($prefixPath, '.dsr-windows-install.lock')
-    $null = Get-DsrPlainPath $lockPath
+function Publish-DsrInstallJournal {
+    param([string]$Source, [string]$Destination)
+    [IO.File]::Move($Source, $Destination, $false)
+}
+
+function Open-DsrInstallLease {
+    param([string]$Prefix)
+    $lockPath = Get-DsrPlainPath ([IO.Path]::Combine($Prefix, '.dsr-windows-install.lock'))
     $lease = $null
-    $createdLease = $false
+    $created = $false
     try {
-        $lease = New-DsrPrivateFile $lockPath
-        $createdLease = $true
-    } catch [IO.IOException] {
-        try { $lease = [IO.FileStream]::new($lockPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None) }
-        catch [IO.IOException] { Stop-DsrInstall 'Installation directory is busy; retry after its active installer exits' 2 }
-    }
-    $stage = ''
-    $committed = $false
-    $retain = $false
-    $previous = @{}
-    $new = @{}
-    $touched = [Collections.Generic.List[string]]::new()
-    try {
-        # The persistent file avoids deleting a kernel-locked pathname while
-        # a later writer may already have opened that same lock generation.
-        if ($createdLease) {
+        try {
+            $lease = New-DsrPrivateFile $lockPath
+            $created = $true
+        } catch [IO.IOException] {
+            try { $lease = [IO.FileStream]::new($lockPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None) }
+            catch [IO.IOException] { Stop-DsrInstall 'Installation directory is busy; retry after its active installer exits' 2 }
+        }
+        # Keep the same persistent pathname for every kernel-lock generation.
+        if ($created) {
             $bytes = [Text.UTF8Encoding]::new($false).GetBytes('dsr-windows-install-lock-v1')
             $lease.Write($bytes, 0, $bytes.Length)
             $lease.Flush($true)
@@ -857,6 +854,241 @@ function Install-DsrExecutableFamily {
                 Stop-DsrInstall 'Reserved installation lock contains unrelated data' 2
             }
         }
+        return $lease
+    } catch {
+        if ($null -ne $lease) { $lease.Dispose() }
+        throw
+    }
+}
+
+function Assert-DsrTransactionEvidence {
+    param($Evidence)
+    Assert-DsrFields $Evidence @('sha256', 'size_bytes')
+    if ($Evidence.sha256 -isnot [string] -or $Evidence.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        ($Evidence.size_bytes -isnot [long] -and $Evidence.size_bytes -isnot [int]) -or
+        $Evidence.size_bytes -lt 0 -or $Evidence.size_bytes -gt $script:DsrMaximumPayloadBytes) {
+        Stop-DsrInstall 'Invalid interrupted-installation file evidence' 7
+    }
+}
+
+function Test-DsrSameEvidence {
+    param($Left, $Right)
+    if ($null -eq $Left -or $null -eq $Right) { return $null -eq $Left -and $null -eq $Right }
+    return $Left.sha256 -ceq $Right.sha256 -and $Left.size_bytes -eq $Right.size_bytes
+}
+
+function Get-DsrInstallTransaction {
+    param([string]$Prefix, $Identity)
+    $pending = Get-DsrPlainPath ([IO.Path]::Combine($Prefix, '.dsr-windows-install.pending.json'))
+    if ([IO.Directory]::Exists($pending)) { Stop-DsrInstall 'Reserved installation journal is a directory' 7 }
+    if (-not [IO.File]::Exists($pending)) { return $null }
+    try {
+        Assert-DsrCacheCustody $pending
+        $text = Read-DsrTextFile $pending 131072
+        $bytes = [Text.UTF8Encoding]::new($false, $true).GetBytes($text)
+        $evidence = @{ sha256 = (Get-DsrBytesHash $bytes); size_bytes = [long]$bytes.Length }
+        if (-not (Test-DsrSameEvidence $evidence (Get-DsrFileEvidence $pending))) {
+            Stop-DsrInstall 'Interrupted-installation journal changed while it was read' 7
+        }
+        $journal = ConvertFrom-DsrJson $text
+        Assert-DsrFields $journal @('schema_version', 'transaction_id', 'tool', 'repository', 'platform', 'prefix', 'binaries')
+        if (($journal.schema_version -isnot [long] -and $journal.schema_version -isnot [int]) -or
+            $journal.schema_version -ne 1 -or $journal.transaction_id -isnot [string] -or
+            $journal.transaction_id -cnotmatch '^[0-9a-f]{32}$' -or
+            $journal.tool -isnot [string] -or $journal.tool -cne $Identity.tool -or
+            $journal.repository -isnot [string] -or $journal.repository -cne $Identity.repository -or
+            $journal.platform -isnot [string] -or $journal.platform -cne $Identity.platform -or
+            $journal.prefix -isnot [string] -or -not $journal.prefix.Equals($Prefix, [StringComparison]::OrdinalIgnoreCase) -or
+            $journal.binaries -isnot [array] -or $journal.binaries.Count -lt 1 -or $journal.binaries.Count -gt 64) {
+            Stop-DsrInstall 'Interrupted-installation journal does not belong to this tool, repository, platform and prefix' 7
+        }
+        $names = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $rows = @{}
+        foreach ($row in $journal.binaries) {
+            Assert-DsrFields $row @('name', 'previous', 'installed')
+            if (-not (Test-DsrWindowsName $row.name) -or $row.name.Length -gt 200 -or
+                -not $row.name.EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase) -or -not $names.Add($row.name)) {
+                Stop-DsrInstall 'Invalid or colliding interrupted-installation executable names' 7
+            }
+            Assert-DsrTransactionEvidence $row.installed
+            if ($null -ne $row.previous) { Assert-DsrTransactionEvidence $row.previous }
+            $rows[$row.name] = $row
+        }
+        # Only a validated GUID can select a sibling stage. Journal-supplied
+        # paths are never combined with the prefix or opened.
+        $stage = Get-DsrPlainPath ([IO.Path]::Combine($Prefix, ('.dsr-install-' + $journal.transaction_id))) -Directory
+        Assert-DsrCacheCustody $stage
+        foreach ($entry in [IO.DirectoryInfo]::new($stage).EnumerateFileSystemInfos()) {
+            $null = Get-DsrPlainPath $entry.FullName
+            Assert-DsrCacheCustody $entry.FullName
+            if ($entry.Name -cin @('new', 'old', 'restore')) {
+                if (($entry.Attributes -band [IO.FileAttributes]::Directory) -eq 0) { Stop-DsrInstall 'Transaction staging directory was replaced' 7 }
+            } elseif ($entry.Name -cin @('complete.ready', 'complete.json')) {
+                if (($entry.Attributes -band [IO.FileAttributes]::Directory) -ne 0) { Stop-DsrInstall 'Transaction completion marker is not a file' 7 }
+            } else { Stop-DsrInstall 'Unexpected file in interrupted-installation staging' 7 }
+        }
+        foreach ($directory in @('new', 'old', 'restore')) {
+            $directoryPath = Get-DsrPlainPath ([IO.Path]::Combine($stage, $directory)) -Directory
+            Assert-DsrCacheCustody $directoryPath
+            $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            foreach ($entry in [IO.DirectoryInfo]::new($directoryPath).EnumerateFileSystemInfos()) {
+                $null = Get-DsrPlainPath $entry.FullName -File
+                Assert-DsrCacheCustody $entry.FullName
+                if (-not $names.Contains($entry.Name) -or -not $seen.Add($entry.Name)) {
+                    Stop-DsrInstall 'Unexpected or colliding file in interrupted-installation staging' 7
+                }
+                $expected = if ($directory -ceq 'new') { $rows[$entry.Name].installed } else { $rows[$entry.Name].previous }
+                if ($null -eq $expected) { Stop-DsrInstall 'Unexpected backup for a previously absent executable' 7 }
+                # A killed recovery can leave a partial private restore copy;
+                # it is never trusted as a backup or installed directly.
+                if ($directory -cne 'restore' -and -not (Test-DsrSameEvidence $expected (Get-DsrFileEvidence $entry.FullName))) {
+                    Stop-DsrInstall 'Interrupted-installation staged bytes changed' 7
+                }
+            }
+            if ($directory -ceq 'old') {
+                foreach ($row in $journal.binaries) {
+                    if ($null -ne $row.previous -and -not $seen.Contains($row.name)) {
+                        Stop-DsrInstall 'Interrupted-installation backup is missing' 7
+                    }
+                }
+            }
+        }
+        $state = 'pending'
+        $complete = Get-DsrPlainPath ([IO.Path]::Combine($stage, 'complete.json'))
+        if ([IO.File]::Exists($complete)) {
+            $marker = ConvertFrom-DsrJson (Read-DsrTextFile $complete 4096)
+            Assert-DsrFields $marker @('schema_version', 'journal_sha256', 'state')
+            if (($marker.schema_version -isnot [long] -and $marker.schema_version -isnot [int]) -or
+                $marker.schema_version -ne 1 -or $marker.journal_sha256 -isnot [string] -or
+                $marker.journal_sha256 -cne $evidence.sha256 -or $marker.state -cnotin @('committed', 'rolled_back')) {
+                Stop-DsrInstall 'Invalid interrupted-installation completion marker' 7
+            }
+            $state = $marker.state
+        }
+        return @{ journal = $journal; evidence = $evidence; pending = $pending; stage = $stage; prefix = $Prefix; state = $state }
+    } catch {
+        if ($_.Exception.Data.Contains('DsrExitCode') -and $_.Exception.Data['DsrExitCode'] -eq 4) {
+            $_.Exception.Data['DsrExitCode'] = 7
+        }
+        throw
+    }
+}
+
+function Get-DsrTransactionDestination {
+    param($Transaction, $Row)
+    $path = Get-DsrPlainPath ([IO.Path]::Combine($Transaction.prefix, $Row.name))
+    if ([IO.Directory]::Exists($path)) { Stop-DsrInstall 'Recovery destination is a directory' 7 }
+    $observed = if ([IO.File]::Exists($path)) { Get-DsrFileEvidence $path } else { $null }
+    if ($null -ne $observed -and -not (Test-DsrSameEvidence $observed $Row.previous) -and
+        -not (Test-DsrSameEvidence $observed $Row.installed)) {
+        Stop-DsrInstall ('Recovery refused because an executable changed outside the interrupted installation: ' + $Row.name) 7
+    }
+    return $observed
+}
+
+function Write-DsrTransactionCompletion {
+    param($Transaction, [string]$State)
+    if ($State -cnotin @('committed', 'rolled_back')) { Stop-DsrInstall 'Invalid transaction completion state' 7 }
+    $ready = Get-DsrPlainPath ([IO.Path]::Combine($Transaction.stage, 'complete.ready'))
+    if ([IO.File]::Exists($ready)) { [IO.File]::Delete($ready) }
+    $marker = @{ schema_version = 1; journal_sha256 = $Transaction.evidence.sha256; state = $State }
+    Write-DsrNewTextFile $ready ($marker | ConvertTo-Json -Compress)
+    # Publication is the completion point. Before it, recovery restores the
+    # previous family; after it, recovery only finishes private-state cleanup.
+    [IO.File]::Move($ready, [IO.Path]::Combine($Transaction.stage, 'complete.json'), $false)
+    $Transaction.state = $State
+}
+
+function Clear-DsrInstallTransaction {
+    param($Transaction)
+    $null = Get-DsrPlainPath $Transaction.pending -File
+    if (-not (Test-DsrSameEvidence $Transaction.evidence (Get-DsrFileEvidence $Transaction.pending))) {
+        Stop-DsrInstall 'Interrupted-installation journal changed before cleanup' 7
+    }
+    # Never remove backups while a published journal still refers to them.
+    [IO.File]::Delete($Transaction.pending)
+    try { Remove-DsrPrivateTree $Transaction.stage }
+    catch { Write-DsrInstallLog ('Completed private transaction staging retained for inspection: ' + $Transaction.stage) }
+}
+
+function Restore-DsrExecutableFamily {
+    param($Transaction)
+    if ($Transaction.state -cne 'pending') { Stop-DsrInstall 'A completed transaction cannot be rolled back' 7 }
+    # Admit the whole current family before the first recovery mutation.
+    foreach ($row in $Transaction.journal.binaries) { $null = Get-DsrTransactionDestination $Transaction $row }
+    for ($index = $Transaction.journal.binaries.Count - 1; $index -ge 0; $index--) {
+        $row = $Transaction.journal.binaries[$index]
+        $observed = Get-DsrTransactionDestination $Transaction $row
+        if (Test-DsrSameEvidence $observed $row.previous) { continue }
+        $path = [IO.Path]::Combine($Transaction.prefix, $row.name)
+        if ($null -ne $row.previous) {
+            $backup = [IO.Path]::Combine($Transaction.stage, 'old', $row.name)
+            if (-not (Test-DsrSameEvidence $row.previous (Get-DsrFileEvidence $backup))) {
+                Stop-DsrInstall 'Recovery backup changed before restoration' 7
+            }
+            $copy = Get-DsrPlainPath ([IO.Path]::Combine($Transaction.stage, 'restore', $row.name))
+            if ([IO.File]::Exists($copy)) { [IO.File]::Delete($copy) }
+            Copy-DsrNewFile $backup $copy
+            if (-not (Test-DsrSameEvidence $row.previous (Get-DsrFileEvidence $copy))) {
+                Stop-DsrInstall 'Private restoration copy differs from its backup' 7
+            }
+            $null = Get-DsrTransactionDestination $Transaction $row
+            Move-DsrInstalledFile $copy $path
+        } else {
+            $null = Get-DsrTransactionDestination $Transaction $row
+            if ([IO.File]::Exists($path)) { [IO.File]::Delete($path) }
+        }
+    }
+    $results = @()
+    foreach ($row in $Transaction.journal.binaries) {
+        $observed = Get-DsrTransactionDestination $Transaction $row
+        if (-not (Test-DsrSameEvidence $observed $row.previous)) { Stop-DsrInstall 'Recovery did not restore the previous executable family' 7 }
+        $results += @{ name = $row.name; path = [IO.Path]::Combine($Transaction.prefix, $row.name);
+            present = ($null -ne $observed); evidence = $observed }
+    }
+    Write-DsrTransactionCompletion $Transaction 'rolled_back'
+    return ,$results
+}
+
+function Recover-DsrExecutableFamily {
+    param([string]$Prefix, $Identity)
+    $prefixPath = Get-DsrPlainPath $Prefix -Directory
+    $lease = Open-DsrInstallLease $prefixPath
+    try {
+        $transaction = Get-DsrInstallTransaction $prefixPath $Identity
+        if ($null -eq $transaction) { Stop-DsrInstall 'No interrupted installation is recorded for this prefix' 2 }
+        $restored = @()
+        $action = 'completed_cleanup'
+        if ($transaction.state -ceq 'pending') {
+            $restored = Restore-DsrExecutableFamily $transaction
+            $action = 'rolled_back'
+        }
+        $state = $transaction.state
+        Clear-DsrInstallTransaction $transaction
+        return @{ state = $state; action = $action; binaries = @($restored) }
+    } finally { $lease.Dispose() }
+}
+
+function Install-DsrExecutableFamily {
+    param([string]$Source, [string]$Prefix, [string[]]$Names, $Identity, [switch]$Yes)
+    $prefixPath = New-DsrDirectoryChain $Prefix
+    $lease = Open-DsrInstallLease $prefixPath
+    $stage = ''
+    $transaction = $null
+    $published = $false
+    $committed = $false
+    $settled = $false
+    $retain = $false
+    $previous = @{}
+    $new = @{}
+    try {
+        $existing = Get-DsrInstallTransaction $prefixPath $Identity
+        if ($null -ne $existing) {
+            if ($existing.state -ceq 'pending') {
+                Stop-DsrInstall 'An interrupted installation must be restored with -Recover -Yes before installing again' 2
+            }
+            Clear-DsrInstallTransaction $existing
+        }
         foreach ($name in $Names) {
             $path = Get-DsrPlainPath ([IO.Path]::Combine($prefixPath, $name))
             if ([IO.Directory]::Exists($path)) { Stop-DsrInstall 'An executable destination is a directory' 2 }
@@ -867,84 +1099,92 @@ function Install-DsrExecutableFamily {
                     if ($answer -cnotin @('y', 'Y')) { Stop-DsrInstall 'Replacement was not authorized' 2 }
                 }
                 $previous[$name] = Get-DsrFileEvidence $path
+                Assert-DsrTransactionEvidence $previous[$name]
             } else { $previous[$name] = $null }
         }
-        $stage = New-DsrPrivateDirectory ([IO.Path]::Combine($prefixPath, ('.dsr-install-' + [Guid]::NewGuid().ToString('N'))))
+        $transactionId = [Guid]::NewGuid().ToString('N')
+        $stage = New-DsrPrivateDirectory ([IO.Path]::Combine($prefixPath, ('.dsr-install-' + $transactionId)))
         $fresh = New-DsrPrivateDirectory ([IO.Path]::Combine($stage, 'new'))
         $backups = New-DsrPrivateDirectory ([IO.Path]::Combine($stage, 'old'))
+        $null = New-DsrPrivateDirectory ([IO.Path]::Combine($stage, 'restore'))
+        $rows = @()
         foreach ($name in $Names) {
             Copy-DsrNewFile ([IO.Path]::Combine($Source, $name)) ([IO.Path]::Combine($fresh, $name))
             $new[$name] = Get-DsrFileEvidence ([IO.Path]::Combine($fresh, $name))
             if ($null -ne $previous[$name]) {
                 Copy-DsrNewFile ([IO.Path]::Combine($prefixPath, $name)) ([IO.Path]::Combine($backups, $name))
                 $backup = Get-DsrFileEvidence ([IO.Path]::Combine($backups, $name))
-                if ($backup.sha256 -cne $previous[$name].sha256 -or $backup.size_bytes -ne $previous[$name].size_bytes) {
+                if (-not (Test-DsrSameEvidence $backup $previous[$name])) {
                     Stop-DsrInstall 'Existing executable changed before backup completed' 7
                 }
             }
+            $rows += @{ name = $name; previous = $previous[$name]; installed = $new[$name] }
         }
+        $journal = [ordered]@{ schema_version = 1; transaction_id = $transactionId; tool = $Identity.tool;
+            repository = $Identity.repository; platform = $Identity.platform; prefix = $prefixPath; binaries = @($rows) }
+        $ready = [IO.Path]::Combine($stage, 'transaction.ready')
+        Write-DsrNewTextFile $ready ($journal | ConvertTo-Json -Depth 8 -Compress)
+        # No destination may change before this immutable journal is visible.
+        # Retain backups even if a handled interruption lands immediately after
+        # publication but before the caller can observe its successful return.
+        $published = $true
+        Publish-DsrInstallJournal $ready ([IO.Path]::Combine($prefixPath, '.dsr-windows-install.pending.json'))
+        $transaction = Get-DsrInstallTransaction $prefixPath $Identity
         foreach ($name in $Names) {
             $path = Get-DsrPlainPath ([IO.Path]::Combine($prefixPath, $name))
             if ($null -eq $previous[$name]) {
                 if ([IO.File]::Exists($path) -or [IO.Directory]::Exists($path)) { Stop-DsrInstall 'An executable appeared during installation' 2 }
             } else {
                 $observed = Get-DsrFileEvidence $path
-                if ($observed.sha256 -cne $previous[$name].sha256 -or $observed.size_bytes -ne $previous[$name].size_bytes) {
+                if (-not (Test-DsrSameEvidence $observed $previous[$name])) {
                     Stop-DsrInstall 'An installed executable changed during installation' 7
                 }
             }
-            $touched.Add($name)
             Move-DsrInstalledFile ([IO.Path]::Combine($fresh, $name)) $path
         }
         $results = @()
         foreach ($name in $Names) {
             $path = Get-DsrPlainPath ([IO.Path]::Combine($prefixPath, $name)) -File
             $observed = Get-DsrFileEvidence $path
-            if ($observed.sha256 -cne $new[$name].sha256 -or $observed.size_bytes -ne $new[$name].size_bytes) {
+            if (-not (Test-DsrSameEvidence $observed $new[$name])) {
                 Stop-DsrInstall 'Final installed executable differs from its staged bytes' 7
             }
             $results += @{ name = $name; path = $path; sha256 = $observed.sha256; size_bytes = $observed.size_bytes }
         }
+        Write-DsrTransactionCompletion $transaction 'committed'
         $committed = $true
+        $settled = $true
         return ,$results
     } finally {
-        if (-not $committed -and $stage) {
-            for ($index = $touched.Count - 1; $index -ge 0; $index--) {
-                $name = $touched[$index]
-                $path = [IO.Path]::Combine($prefixPath, $name)
-                try {
-                    $null = Get-DsrPlainPath $path
-                    if ([IO.Directory]::Exists($path)) { throw 'Destination became a directory' }
-                    if ([IO.File]::Exists($path)) {
-                        $observed = Get-DsrFileEvidence $path
-                        if ($null -ne $previous[$name] -and $observed.sha256 -ceq $previous[$name].sha256 -and
-                            $observed.size_bytes -eq $previous[$name].size_bytes) { continue }
-                        if ($observed.sha256 -cne $new[$name].sha256 -or $observed.size_bytes -ne $new[$name].size_bytes) {
-                            throw 'Destination changed outside this transaction'
-                        }
-                    }
-                    if ($null -ne $previous[$name]) { [IO.File]::Move([IO.Path]::Combine($stage, 'old', $name), $path, $true) }
-                    elseif ([IO.File]::Exists($path)) { [IO.File]::Delete($path) }
-                } catch {
-                    $retain = $true
-                    Write-DsrInstallLog ('Rollback could not restore ' + $name + '; recovery files retained at ' + $stage)
-                }
+        if ($null -ne $transaction -and -not $committed) {
+            try {
+                # Re-read the completion point even on a handled interruption:
+                # a committed marker can never authorize restoring old bytes.
+                $transaction = Get-DsrInstallTransaction $prefixPath $Identity
+                if ($null -eq $transaction) { Stop-DsrInstall 'Installation journal disappeared before rollback' 7 }
+                if ($transaction.state -ceq 'pending') { $null = Restore-DsrExecutableFamily $transaction }
+                $settled = $true
+            } catch {
+                $retain = $true
+                Write-DsrInstallLog ('Rollback could not complete; use -Recover -Yes after resolving the reported state: ' + $_.Exception.Message)
             }
-        }
+        } elseif ($published -and $null -eq $transaction) { $retain = $true }
         try {
-            if ($stage -and -not $retain) {
+            if ($settled) {
+                try { Clear-DsrInstallTransaction $transaction }
+                catch { Write-DsrInstallLog ('Completed transaction metadata retained for a later cleanup: ' + $_.Exception.Message) }
+            } elseif ($stage -and -not $published -and -not $retain) {
                 try { Remove-DsrPrivateTree $stage }
                 catch { Write-DsrInstallLog ('Private transaction staging retained for inspection: ' + $stage) }
             }
-        } finally { if ($null -ne $lease) { $lease.Dispose() } }
+        } finally { $lease.Dispose() }
         if ($retain) { Stop-DsrInstall ('Installation failed; recovery files retained at ' + $stage) 7 }
     }
 }
-
 function Invoke-DsrWindowsInstaller {
     [CmdletBinding()]
     param([string]$Version = '', [string]$Prefix = '', [string]$CacheDir = '',
-          [switch]$Offline, [switch]$Yes, [switch]$Json, [switch]$Help)
+          [switch]$Offline, [switch]$Recover, [switch]$Yes, [switch]$Json, [switch]$Help)
     $work = ''
     $tool = ''
     try {
@@ -961,6 +1201,7 @@ Options:
   -Prefix DIR    Destination directory; default: LocalAppData/Programs/$tool/bin
   -CacheDir DIR  Persistent verified download cache
   -Offline       No network; requires -Version and complete cached evidence
+  -Recover       Restore an interrupted installation offline; requires -Yes
   -Yes           Authorize replacement of existing selected executables
   -Json          Emit one machine-readable result
   -Verbose       Print additional diagnostics to stderr
@@ -978,12 +1219,25 @@ permission. Credentials are sent only to the configured repository's GitHub API.
         $platform = Get-DsrHostPlatform
         if (-not $policy.platforms.Contains($platform)) { Stop-DsrInstall ('No configured release for ' + $platform) 3 }
         $selection = $policy.platforms[$platform]
-        if ($Offline -and -not $Version) { Stop-DsrInstall '-Offline requires an explicit -Version' }
-        if ($Version -and -not (Test-DsrName $Version)) { Stop-DsrInstall 'Invalid release version' }
+        $transactionIdentity = @{ tool = $tool; repository = $policy.repo; platform = $platform }
         $localAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
         if (-not $Prefix) { $Prefix = [IO.Path]::Combine($localAppData, 'Programs', $tool, 'bin') }
-        if (-not $CacheDir) { $CacheDir = [IO.Path]::Combine($localAppData, 'dsr', 'cache', 'installers') }
         $prefixPath = Get-DsrPlainPath $Prefix
+        if ($Recover) {
+            if ($Version -or $Offline -or $CacheDir) { Stop-DsrInstall '-Recover cannot be combined with -Version, -Offline or -CacheDir' }
+            if (-not $Yes) { Stop-DsrInstall '-Recover requires -Yes to restore the previous executable family' 2 }
+            $recovered = Recover-DsrExecutableFamily $prefixPath $transactionIdentity
+            $result = @{ tool = $tool; repository = $policy.repo; status = 'success'; operation = 'recover';
+                platform = $platform; path = $prefixPath; recovery_action = $recovered.action;
+                transaction_state = $recovered.state; binaries = @($recovered.binaries); exit_code = 0 }
+            Write-DsrInstallLog ('Installation recovery for ' + $tool + ': ' + $recovered.action)
+            if ($Json) { [Console]::Out.WriteLine(($result | ConvertTo-Json -Depth 12 -Compress)) }
+            else { [Console]::Out.WriteLine($prefixPath) }
+            return 0
+        }
+        if ($Offline -and -not $Version) { Stop-DsrInstall '-Offline requires an explicit -Version' }
+        if ($Version -and -not (Test-DsrName $Version)) { Stop-DsrInstall 'Invalid release version' }
+        if (-not $CacheDir) { $CacheDir = [IO.Path]::Combine($localAppData, 'dsr', 'cache', 'installers') }
         $cacheRoot = Get-DsrPlainPath $CacheDir
         if (Test-DsrPathsOverlap $prefixPath $cacheRoot) { Stop-DsrInstall 'Installation and download cache paths must not overlap' }
         if (-not $Offline) { $null = New-DsrDirectoryChain $cacheRoot }
@@ -1108,7 +1362,7 @@ permission. Credentials are sent only to the configured repository's GitHub API.
         # destination write; an earlier successful hash is not a reservation.
         $null = Get-DsrCacheReceipt $privateRelease $binding $policy.public_key
         Write-DsrInstallVerbose 'Checksum, configured signature, archive and executable admission completed'
-        $installed = Install-DsrExecutableFamily $expanded $prefixPath $selection.binaries -Yes:$Yes
+        $installed = Install-DsrExecutableFamily $expanded $prefixPath $selection.binaries $transactionIdentity -Yes:$Yes
         $primary = $policy.binary_name
         if (-not $primary.EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase)) { $primary += '.exe' }
         $primaryRow = @($installed | Where-Object { $_.name.Equals($primary, [StringComparison]::OrdinalIgnoreCase) })[0]

@@ -1923,7 +1923,7 @@ validates configuration without creating installer output or publication locks.
 
 The generated script supports public GitHub releases and requires PowerShell
 7.4+ on native Windows. It accepts
-`-Version`, `-Prefix`, `-CacheDir`, `-Offline`, `-Yes`, `-Json`, `-Verbose` and
+`-Version`, `-Prefix`, `-CacheDir`, `-Offline`, `-Recover`, `-Yes`, `-Json`, `-Verbose` and
 `-Help`. Offline installation requires an explicit version and uses only cached
 payload/checksum/signature evidence. Checksums are mandatory; a configured
 Minisign key is also mandatory at verification, including on cache hits. Complete
@@ -1932,6 +1932,26 @@ PE architecture and staged before prefix replacement. Failed updates restore
 previous selected files when possible, retain incomplete recovery evidence and
 never report success for a partially installed family. PATH edits, source builds
 and skill installation are not part of this Windows release installer.
+
+Before the first executable replacement, the installer publishes an immutable
+local journal with the complete previous and incoming family. An interrupted
+transaction blocks ordinary replacement until `-Recover -Yes [-Prefix DIR]`
+restores the previous bytes. Recovery runs before network, cache or verifier
+access and cannot be combined with `-Version`, `-Offline` or `-CacheDir`. It
+requires the same tool, repository, platform and prefix; validates the complete
+journal, backups and current family before mutation; and refuses unknown changed
+bytes, malformed evidence, symbolic links and reparse points. Preserved backups
+allow recovery itself to resume after interruption. A published completion marker
+authorizes cleanup of completed transaction metadata, preserving the completed
+installation. Earlier installers without a journal cannot use this recovery.
+
+With `-Json`, recovery emits `operation: "recover"`, `recovery_action` of
+`"rolled_back"` or `"completed_cleanup"`, and `transaction_state` of
+`"rolled_back"` or `"committed"`. Actual restoration includes each member's
+prior presence and SHA-256/length evidence. These records describe previous
+local bytes; they do not authenticate the prior installation as a signed release.
+The lock coordinates cooperating installers; the family does not switch
+atomically and recovery does not establish power-loss durability.
 
 Generation JSON retains the `installer` envelope and adds `details.shell`;
 each `details.installers[]` row keeps `tool`, `path`, `ok` and `exit_code`.

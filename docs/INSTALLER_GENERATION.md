@@ -201,11 +201,54 @@ The default prefix is `%LOCALAPPDATA%\Programs\TOOL\bin`; it needs no administra
 installation and does not edit PATH or shell profiles. `-Yes` permits replacing
 existing selected executables. Without it, interactive use asks first, while
 noninteractive CI refuses an overwrite. The complete executable family is staged
-and validated before replacement. A cooperating-writer lock covers the update;
-if a later replacement fails, the transaction restores the earlier files and
-retains failed recovery evidence when it cannot complete restoration. Unrelated
-files in the prefix are preserved. This is a cooperating installation transaction,
-not an atomic switch of every executable or a power-loss durability guarantee.
+and validated before replacement. A cooperating-writer lock covers the update.
+Before replacing the first executable, the installer publishes a private,
+immutable transaction journal that records the complete family and the exact
+previous and incoming bytes. Original backups remain available until the
+transaction is completed. A handled replacement failure restores the previous
+family; an interrupted process leaves enough local evidence for explicit
+recovery. Ordinary installation refuses to replace a family with a pending
+transaction.
+
+To restore an interrupted installation, run the generated installer with the
+same destination:
+
+```powershell
+.\install.ps1 -Recover -Yes
+.\install.ps1 -Recover -Yes -Prefix C:\Tools\tool\bin -Json
+```
+
+Recovery requires `-Yes` and does not accept `-Version`, `-Offline` or `-CacheDir`.
+It operates before release lookup or cache access and needs no network, token,
+Minisign executable or downloaded release. The installer validates the journal's
+tool, repository, native platform and destination; private staging ownership and
+paths; every original backup; and the current executable family before restoring
+any member. It refuses unknown destination bytes, malformed metadata, symbolic
+links or reparse points, and changed backups. A file introduced by the interrupted
+installation is removed only when it still contains that transaction's exact incoming bytes. Unrelated
+files remain untouched.
+
+Restoration copies from preserved backups, so another process interruption during
+recovery can be retried with the same command. A completion marker binds the
+exact journal after the entire installed or restored family is checked. If the
+process stopped after that completion point, recovery finishes private-state
+cleanup and preserves the completed installation. It does not undo a successful
+update. The pending journal is removed before backup cleanup, so interrupted
+cleanup cannot be mistaken for an unfinished replacement.
+
+Recovery JSON reports `operation: "recover"`, `recovery_action: "rolled_back"`
+or `"completed_cleanup"`, and `transaction_state: "rolled_back"` or
+`"committed"`. An actual rollback includes each member's prior presence and
+SHA-256/length evidence. These receipts describe locally retained prior bytes;
+they do not assert that the previous installation was a signed release.
+
+The journal protocol applies to installations started by a generated installer
+that implements it. Staging left by earlier installers has no supported
+automatic recovery record. A process stopped before publishing its journal can
+leave private staging, but it has not started replacing executables. These are
+cooperating installation and recovery transactions; the complete family does
+not switch atomically, and file flushing does not establish a power-loss
+durability guarantee.
 
 `-Json` keeps stdout machine-readable and includes the installed executable
 receipts; progress and `-Verbose` diagnostics go to stderr. `-Help` performs no
@@ -215,6 +258,7 @@ authenticated snapshot engine remains a distinct command and policy format.
 
 ```bash
 bash scripts/tests/test_install_gen_windows.sh
+bash scripts/tests/test_install_gen_windows.sh --recovery-only
 bash scripts/tests/test_install_gen_windows_policy.sh
 ```
 
@@ -228,8 +272,14 @@ without credentials. Public latest discovery exercises API rate limits and
 injected transport failures, exact relative/encoded tag redirects, redirect
 limits, unsafe destination refusal, and draft/prerelease metadata refusal.
 Portable PowerShell runs use explicit host/HTTP adapters
-and a labelled move failure injection for rollback; they do not establish native
-NTFS behavior or successful live GitHub acquisition.
+and a labelled move failure injection for rollback. The recovery controls also
+forcibly terminate real PowerShell processes after actual replacements and after
+completion-marker publication, then exercise refusal, exact restoration and
+another interrupted recovery. The focused mode keeps the same per-command
+deadlines; `--baseline-project DIR` can include a frozen pre-recovery checkout's
+actual generated installer in the same comparison. These portable tests do not
+establish native Windows ACL/NTFS behavior, power-loss durability or successful
+live GitHub acquisition.
 The policy regression exercises the actual configuration and publication naming
 helpers, explicit signing-key scope, executable-family limits and refusal before
 any existing installer or publication history changes.

@@ -13,7 +13,8 @@ for dependency in pwsh minisign go python3 jq yq; do
     fi
 done
 
-python3 - "$PROJECT_ROOT" <<'PY'
+python3 - "$PROJECT_ROOT" "$@" <<'PY'
+import argparse
 import base64
 import copy
 import hashlib
@@ -25,9 +26,15 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 
-project = Path(sys.argv[1]).resolve()
+arguments = argparse.ArgumentParser(description="Genuine generated Windows installer regression")
+arguments.add_argument("project")
+arguments.add_argument("--recovery-only", action="store_true", help="Run signed install and interruption/recovery controls")
+arguments.add_argument("--baseline-project", type=Path, help="Optional frozen pre-recovery checkout for a paired functional comparison")
+options = arguments.parse_args()
+project = Path(options.project).resolve()
 root = Path(tempfile.mkdtemp(prefix="dsr-windows-installer-", dir=os.environ.get("TMPDIR"))).resolve()
 os.chmod(root, 0o700)
 print(f"Windows installer fixture evidence: {root}", flush=True)
@@ -57,11 +64,34 @@ def check(name, condition, detail=""):
         failed += 1
         print(f"FAIL: {name}: {detail}", flush=True)
 
-def command(args, label, *, extra=None, cwd=None, timeout=120):
+def command(args, label, *, extra=None, cwd=None, timeout=120, terminate_at=None):
     selected = env.copy()
     selected.update(extra or {})
-    result = subprocess.run([str(arg) for arg in args], cwd=cwd or project, env=selected,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    invocation = [str(arg) for arg in args]
+    if terminate_at is None:
+        result = subprocess.run(invocation, cwd=cwd or project, env=selected,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    else:
+        # The fixture publishes this barrier only after a genuine file move or
+        # completion-marker publication. TerminateProcess/SIGKILL bypasses the
+        # installer's finally blocks; an exception is not a crash substitute.
+        with (root / (label + ".stdout")).open("wb") as output, (root / (label + ".stderr")).open("wb") as errors:
+            process = subprocess.Popen(invocation, cwd=cwd or project, env=selected, stdout=output, stderr=errors)
+            deadline = time.monotonic() + timeout
+            try:
+                while process.poll() is None and not Path(terminate_at).exists() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=10)
+                if not Path(terminate_at).exists() and time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired(invocation, timeout)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=10)
+        result = subprocess.CompletedProcess(invocation, process.returncode,
+            (root / (label + ".stdout")).read_bytes(), (root / (label + ".stderr")).read_bytes())
     (root / (label + ".stdout")).write_bytes(result.stdout)
     (root / (label + ".stderr")).write_bytes(result.stderr)
     return result
@@ -120,6 +150,18 @@ if sys.platform != "win32":
                            "-Version", "1.2.3", "-Json"], "native-host-refusal")
     check("unchanged runtime refuses a non-Windows host", unsupported.returncode == 3 and
           json.loads(unsupported.stdout)["status"] == "error")
+
+baseline_runtime = None
+if options.baseline_project:
+    baseline_project = options.baseline_project.resolve()
+    baseline_output = root / "baseline-generated"
+    baseline_generated = command([baseline_project / "dsr", "--json", "--non-interactive", "installer", "generate", "win-demo",
+        "--shell", "powershell"], "generate-baseline", extra={"DSR_INSTALLER_DIR": str(baseline_output)}, cwd=baseline_project)
+    baseline_runtime = baseline_output / "win-demo/install.ps1"
+    check("frozen baseline CLI generates the same embedded release policy", baseline_generated.returncode == 0 and
+          baseline_runtime.is_file() and encoded[0] in baseline_runtime.read_text(), baseline_generated.stderr.decode(errors="replace"))
+    if baseline_generated.returncode or not baseline_runtime.is_file():
+        raise SystemExit(1)
 
 driver = root / "driver.ps1"
 driver.write_text(r'''param([string]$RuntimePath, [string]$CasePath)
@@ -229,6 +271,13 @@ public sealed class DsrInstallerFixtureHandler : HttpMessageHandler {
         return $true
     }
 }
+if ($fixture.Contains('journal_publish_fault') -and $fixture.journal_publish_fault) {
+    function Publish-DsrInstallJournal {
+        param([string]$Source, [string]$Destination)
+        [IO.File]::Move($Source, $Destination, $false)
+        throw 'Injected handled interruption after atomic journal publication'
+    }
+}
 if ($fixture.Contains('move_fault') -and $fixture.move_fault) {
     # Explicit injected boundary: first replacement performs the real move;
     # the second throws. Backup, rollback and final byte checks remain real.
@@ -238,6 +287,29 @@ if ($fixture.Contains('move_fault') -and $fixture.move_fault) {
         $script:Moves++
         if ($script:Moves -eq 2) { throw 'Injected second replacement failure' }
         [IO.File]::Move($Source, $Destination, $true)
+    }
+}
+if ($fixture.Contains('pause_after_move')) {
+    $script:Moves = 0
+    function Move-DsrInstalledFile {
+        param([string]$Source, [string]$Destination)
+        [IO.File]::Move($Source, $Destination, $true)
+        $script:Moves++
+        if ($script:Moves -eq $script:Fixture.pause_after_move) {
+            [IO.File]::WriteAllText($script:Fixture.pause_marker, 'real move completed')
+            while ($true) { Start-Sleep -Seconds 1 }
+        }
+    }
+}
+if ($fixture.Contains('pause_after_completion')) {
+    $script:RealCompletion = ${function:Write-DsrTransactionCompletion}
+    function Write-DsrTransactionCompletion {
+        param($Transaction, [string]$State)
+        & $script:RealCompletion $Transaction $State
+        if ($State -ceq $script:Fixture.pause_after_completion) {
+            [IO.File]::WriteAllText($script:Fixture.pause_marker, 'real completion marker published')
+            while ($true) { Start-Sleep -Seconds 1 }
+        }
     }
 }
 if ($fixture.Contains('cleanup_fault') -and $fixture.cleanup_fault) {
@@ -332,22 +404,27 @@ def release(label, *, kind="good", checksum="SHA256SUMS", signed=True, selected=
     return downloads
 
 def run_case(label, downloads=None, *, selected_runtime=runtime, cache=None, prefix=None,
-             offline=False, version="1.2.3", yes=True, options=None, credentials=None):
+             offline=False, version="1.2.3", yes=True, options=None, credentials=None, recover=False):
     cache = Path(cache or root / ("cache-" + label))
     prefix = Path(prefix or root / ("prefix-" + label))
     requests = root / (label + ".requests")
-    parameters = {"Prefix": str(prefix), "CacheDir": str(cache), "Json": True, "Yes": yes}
-    if version is not None:
-        parameters["Version"] = version
-    if offline:
-        parameters["Offline"] = True
+    parameters = {"Prefix": str(prefix), "Json": True, "Yes": yes}
+    if recover:
+        parameters["Recover"] = True
+    else:
+        parameters["CacheDir"] = str(cache)
+        if version is not None:
+            parameters["Version"] = version
+        if offline:
+            parameters["Offline"] = True
     spec = {"platform": "windows/amd64", "parameters": parameters,
             "requests": str(requests), "downloads": downloads or {}}
     spec.update(options or {})
     case = root / (label + ".json")
     case.write_text(json.dumps(spec))
     result = command(["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", driver,
-                      "-RuntimePath", selected_runtime, "-CasePath", case], label, extra=credentials)
+                      "-RuntimePath", selected_runtime, "-CasePath", case], label, extra=credentials,
+                      terminate_at=(options or {}).get("pause_marker"))
     try:
         parsed = json.loads(result.stdout)
     except Exception:
@@ -359,6 +436,215 @@ def refusal(label, *, downloads=None, expected=7, **kwargs):
     check(label, result.returncode == expected and parsed.get("status") == "error" and not prefix.exists(),
           result.stderr.decode(errors="replace") + " " + json.dumps(parsed))
     return result, parsed, cache, prefix, requests
+
+def exercise_recovery(cache):
+    originals = {"app.exe": b"previous application bytes", "worker.exe": b"previous worker bytes",
+                 "unrelated.txt": b"preserve unrelated user data"}
+    family = ("app.exe", "worker.exe")
+    pending_name = ".dsr-windows-install.pending.json"
+
+    def prepare(label, missing=()):
+        prefix = root / ("prefix-" + label)
+        prefix.mkdir()
+        for name, value in originals.items():
+            if name not in missing:
+                (prefix / name).write_bytes(value)
+        return prefix
+
+    def observed(prefix):
+        return {name: (prefix / name).read_bytes() if (prefix / name).exists() else None for name in originals}
+
+    def interrupted(label, prefix, *, after=1, selected_runtime=runtime, completion=False):
+        marker = root / (label + ".barrier")
+        control = {"pause_marker": str(marker)}
+        if completion:
+            control["pause_after_completion"] = "committed"
+        else:
+            control["pause_after_move"] = after
+        result = run_case(label, selected_runtime=selected_runtime, cache=cache, prefix=prefix,
+                          offline=True, options=control)
+        check(label + " reaches a genuine filesystem boundary and is forcibly terminated",
+              marker.is_file() and result[0].returncode != 0, result[0].stderr.decode(errors="replace"))
+        if not marker.is_file():
+            raise RuntimeError("Cannot qualify crash recovery without reaching the real mutation barrier")
+        return result
+
+    if baseline_runtime is not None:
+        baseline_prefix = prepare("baseline-interrupted")
+        interrupted("baseline-after-first-move", baseline_prefix, selected_runtime=baseline_runtime)
+        check("frozen baseline leaves a mixed family without a recoverable journal",
+              (baseline_prefix / "app.exe").read_bytes() == (root / "app.exe").read_bytes() and
+              (baseline_prefix / "worker.exe").read_bytes() == originals["worker.exe"] and
+              not (baseline_prefix / pending_name).exists())
+        baseline_retry, _, _, _, _ = run_case("baseline-retry-without-recovery", selected_runtime=baseline_runtime,
+                                              cache=cache, prefix=baseline_prefix, offline=True)
+        check("frozen baseline accepts another update over the unrecovered mixed family", baseline_retry.returncode == 0 and
+              all((baseline_prefix / name).read_bytes() == (root / name).read_bytes() for name in family),
+              baseline_retry.stderr.decode(errors="replace"))
+        baseline_recover, _, _, _, _ = run_case("baseline-recovery-unavailable", selected_runtime=baseline_runtime,
+                                                prefix=baseline_prefix, recover=True)
+        check("frozen baseline cannot restore the previous family through explicit recovery",
+              baseline_recover.returncode != 0 and observed(baseline_prefix) != originals)
+
+    publish_prefix = prepare("handled-journal-publication")
+    publish_failure, _, _, _, _ = run_case("handled-journal-publication", cache=cache, prefix=publish_prefix,
+                                          offline=True, options={"journal_publish_fault": True})
+    publish_pending = publish_prefix / pending_name
+    check("handled interruption immediately after real journal publication retains the pending record and original family",
+          publish_failure.returncode == 7 and publish_pending.is_file() and observed(publish_prefix) == originals,
+          publish_failure.stderr.decode(errors="replace"))
+    if not publish_pending.is_file():
+        raise RuntimeError("Publication-boundary control did not retain its real pending journal")
+    publish_journal = json.loads(publish_pending.read_bytes())
+    publish_stage = publish_prefix / (".dsr-install-" + publish_journal["transaction_id"])
+    check("ambiguous publication return cannot delete backups referenced by the pending journal",
+          all((publish_stage / "old" / name).read_bytes() == originals[name] for name in family))
+    publish_recovery, _, _, _, _ = run_case("recover-handled-journal-publication", prefix=publish_prefix, recover=True)
+    check("explicit recovery safely completes a handled interruption before the first executable replacement",
+          publish_recovery.returncode == 0 and observed(publish_prefix) == originals and
+          not publish_pending.exists() and not publish_stage.exists(), publish_recovery.stderr.decode(errors="replace"))
+
+    prefix = prepare("interrupted-family")
+    interrupted("kill-after-first-move", prefix)
+    pending = prefix / pending_name
+    check("crashed update records the immutable complete family before replacing its first executable",
+          pending.is_file() and (prefix / "app.exe").read_bytes() == (root / "app.exe").read_bytes() and
+          (prefix / "worker.exe").read_bytes() == originals["worker.exe"])
+    if not pending.is_file():
+        raise RuntimeError("Missing journal after a real interrupted candidate installation")
+    journal_bytes = pending.read_bytes()
+    journal = json.loads(journal_bytes)
+    stage = prefix / (".dsr-install-" + journal["transaction_id"])
+    check("crashed update preserves exact original bytes for every family member",
+          len(journal["binaries"]) == 2 and all((stage / "old" / name).read_bytes() == originals[name] for name in family))
+    mixed = observed(prefix)
+    retry, _, _, _, _ = run_case("pending-refuses-update", cache=cache, prefix=prefix, offline=True)
+    check("ordinary retry refuses the interrupted transaction without replacing its mixed family",
+          retry.returncode == 2 and observed(prefix) == mixed and pending.read_bytes() == journal_bytes,
+          retry.stderr.decode(errors="replace"))
+    no_consent, _, _, _, no_consent_requests = run_case("recovery-needs-yes", prefix=prefix, recover=True, yes=False)
+    check("recovery requires explicit consent before changing executables or using HTTP",
+          no_consent.returncode == 2 and observed(prefix) == mixed and not no_consent_requests.exists())
+    busy, _, _, _, _ = run_case("recovery-held-lease", prefix=prefix, recover=True, options={"held_lease": True})
+    check("recovery retains the same exclusive kernel lease as normal installation",
+          busy.returncode == 2 and observed(prefix) == mixed, busy.stderr.decode(errors="replace"))
+
+    # Reject every destination before mutating the first one: an unrelated
+    # writer's bytes must survive even when another member needs restoration.
+    (prefix / "worker.exe").write_bytes(b"independent user modification")
+    externally_changed = observed(prefix)
+    altered, _, _, _, _ = run_case("recovery-modified-destination", prefix=prefix, recover=True)
+    check("recovery refuses an externally changed family before restoring any other member",
+          altered.returncode == 7 and observed(prefix) == externally_changed and pending.read_bytes() == journal_bytes,
+          altered.stderr.decode(errors="replace"))
+    (prefix / "worker.exe").write_bytes(originals["worker.exe"])
+
+    malformed = []
+    foreign = copy.deepcopy(journal)
+    foreign["repository"] = "fixture/another-tool"
+    malformed.append(("foreign-repository", json.dumps(foreign).encode()))
+    escaping = copy.deepcopy(journal)
+    escaping["transaction_id"] = "../outside"
+    malformed.append(("escaping-stage", json.dumps(escaping).encode()))
+    duplicate = journal_bytes.replace(b'"schema_version":1', b'"schema_version":1,"schema_version":1', 1)
+    if duplicate == journal_bytes:
+        raise RuntimeError("Duplicate-key fixture did not mutate the genuine compact journal")
+    malformed.append(("duplicate-json-key", duplicate))
+    invalid_evidence = copy.deepcopy(journal)
+    invalid_evidence["binaries"][0]["previous"]["size_bytes"] = "17"
+    malformed.append(("untyped-evidence", json.dumps(invalid_evidence).encode()))
+    for label, content in malformed:
+        pending.write_bytes(content)
+        refused, _, _, _, attempted_http = run_case("recovery-" + label, prefix=prefix, recover=True)
+        check("recovery refuses " + label + " without following journal paths or mutating the family",
+              refused.returncode == 7 and observed(prefix) == mixed and pending.read_bytes() == content and
+              not attempted_http.exists(), refused.stderr.decode(errors="replace"))
+        pending.write_bytes(journal_bytes)
+
+    backup = stage / "old/app.exe"
+    backup.write_bytes(b"changed private backup")
+    bad_backup, _, _, _, _ = run_case("recovery-changed-backup", prefix=prefix, recover=True)
+    check("recovery authenticates every original backup before changing the destination family",
+          bad_backup.returncode == 7 and observed(prefix) == mixed and pending.read_bytes() == journal_bytes,
+          bad_backup.stderr.decode(errors="replace"))
+    backup.write_bytes(originals["app.exe"])
+    if sys.platform != "win32":
+        saved_backup = root / "saved-original-app.exe"
+        backup.rename(saved_backup)
+        outside = root / "outside-recovery-sentinel"
+        outside.write_bytes(b"never change the link target")
+        backup.symlink_to(outside)
+        linked, _, _, _, _ = run_case("recovery-linked-backup", prefix=prefix, recover=True)
+        check("recovery refuses link-bearing staging without changing its target or the installed family",
+              linked.returncode == 7 and observed(prefix) == mixed and outside.read_bytes() == b"never change the link target",
+              linked.stderr.decode(errors="replace"))
+        backup.unlink()
+        saved_backup.rename(backup)
+
+    recovered, recovered_details, recovery_cache, _, recovery_requests = run_case("recover-previous-family",
+        prefix=prefix, recover=True, options={"without_minisign": True}, credentials={"DSR_GH_TOKEN": "invalid fixture token"})
+    check("explicit recovery restores exact prior bytes offline without a token, verifier or release cache",
+          recovered.returncode == 0 and recovered_details.get("recovery_action") == "rolled_back" and
+          recovered_details.get("transaction_state") == "rolled_back" and observed(prefix) == originals and
+          not recovery_requests.exists() and not recovery_cache.exists() and not pending.exists() and not stage.exists() and
+          "signature_verified" not in recovered_details, recovered.stderr.decode(errors="replace") + " " + json.dumps(recovered_details))
+    check("recovery receipt identifies the complete restored family and original evidence",
+          len(recovered_details.get("binaries", [])) == 2 and
+          all(row["present"] is True and row["evidence"]["sha256"] == hashlib.sha256(originals[row["name"]]).hexdigest()
+              for row in recovered_details.get("binaries", [])))
+
+    partial = prepare("interrupted-recovery")
+    interrupted("kill-after-entire-family-moved", partial, after=2)
+    partial_pending = partial / pending_name
+    partial_journal = json.loads(partial_pending.read_bytes())
+    partial_stage = partial / (".dsr-install-" + partial_journal["transaction_id"])
+    recovery_marker = root / "kill-during-recovery.barrier"
+    killed_recovery, _, _, _, _ = run_case("kill-during-recovery", prefix=partial, recover=True,
+        options={"pause_after_move": 1, "pause_marker": str(recovery_marker)})
+    check("a second genuine process kill interrupts restoration after its first real replacement",
+          recovery_marker.is_file() and killed_recovery.returncode != 0 and
+          (partial / "app.exe").read_bytes() == (root / "app.exe").read_bytes() and
+          (partial / "worker.exe").read_bytes() == originals["worker.exe"] and
+          all((partial_stage / "old" / name).read_bytes() == originals[name] for name in family),
+          killed_recovery.stderr.decode(errors="replace"))
+    resumed, resumed_details, _, _, _ = run_case("resume-interrupted-recovery", prefix=partial, recover=True)
+    check("recovery resumes after another process kill because original backups were never consumed",
+          resumed.returncode == 0 and resumed_details.get("recovery_action") == "rolled_back" and
+          observed(partial) == originals and not partial_pending.exists(), resumed.stderr.decode(errors="replace"))
+
+    added_member = prepare("interrupted-added-member", missing=("worker.exe",))
+    interrupted("kill-after-added-member-moved", added_member, after=2)
+    removed_new, removed_details, _, _, _ = run_case("recover-previously-absent-member", prefix=added_member, recover=True)
+    check("recovery removes only the transaction's newly introduced executable and preserves existing user files",
+          removed_new.returncode == 0 and (added_member / "app.exe").read_bytes() == originals["app.exe"] and
+          not (added_member / "worker.exe").exists() and (added_member / "unrelated.txt").read_bytes() == originals["unrelated.txt"] and
+          any(row["name"] == "worker.exe" and row["present"] is False for row in removed_details.get("binaries", [])),
+          removed_new.stderr.decode(errors="replace"))
+
+    committed_prefix = prepare("committed-before-cleanup")
+    interrupted("kill-after-commit-marker", committed_prefix, completion=True)
+    committed_pending = committed_prefix / pending_name
+    committed_journal = json.loads(committed_pending.read_bytes())
+    committed_stage = committed_prefix / (".dsr-install-" + committed_journal["transaction_id"])
+    completed_marker = json.loads((committed_stage / "complete.json").read_bytes())
+    check("completion marker binds the exact immutable journal after the entire new family is checked",
+          completed_marker["state"] == "committed" and
+          completed_marker["journal_sha256"] == hashlib.sha256(committed_pending.read_bytes()).hexdigest() and
+          all((committed_prefix / name).read_bytes() == (root / name).read_bytes() for name in family))
+    completion, completion_details, _, _, _ = run_case("recover-committed-cleanup", prefix=committed_prefix, recover=True)
+    check("recovery after the commit point completes cleanup without rolling back a successful installation",
+          completion.returncode == 0 and completion_details.get("recovery_action") == "completed_cleanup" and
+          completion_details.get("transaction_state") == "committed" and not committed_pending.exists() and
+          not committed_stage.exists() and all((committed_prefix / name).read_bytes() == (root / name).read_bytes() for name in family) and
+          (committed_prefix / "unrelated.txt").read_bytes() == originals["unrelated.txt"], completion.stderr.decode(errors="replace"))
+
+    handled = prepare("recovery-handled-failure")
+    rollback, rollback_details, _, _, _ = run_case("recovery-handled-second-move", cache=cache, prefix=handled,
+                                                 offline=True, options={"move_fault": True})
+    check("handled second-move failure still restores the whole prior family and clears its transaction",
+          rollback.returncode == 7 and rollback_details.get("status") == "error" and observed(handled) == originals and
+          not (handled / pending_name).exists() and not list(handled.glob(".dsr-install-*")),
+          rollback.stderr.decode(errors="replace"))
 
 good = release("good")
 success, details, good_cache, installed, requests = run_case("signed-family", good)
@@ -378,6 +664,12 @@ offline_result, offline_details, _, offline_prefix, offline_requests = run_case(
 check("offline mode revalidates complete signed evidence without any HTTP request", offline_result.returncode == 0 and
       offline_details.get("cache", {}).get("offline") is True and not offline_requests.exists() and
       (offline_prefix / "worker.exe").read_bytes() == (root / "worker.exe").read_bytes(), offline_result.stderr.decode(errors="replace"))
+exercise_recovery(good_cache)
+if options.recovery_only:
+    print(f"\nWindows installer recovery checks: {passed + failed}; passed: {passed}; failed: {failed}", flush=True)
+    print("Qualified here: genuine generated PowerShell, signed Go PE families, process termination and local recovery.", flush=True)
+    print("Not qualified here: native Windows ACL/NTFS, power-loss durability or live GitHub transport.", flush=True)
+    raise SystemExit(1 if failed else 0)
 missing_verifier, missing_verifier_details, _, missing_verifier_prefix, missing_verifier_requests = run_case(
     "offline-missing-minisign", cache=good_cache, offline=True, options={"without_minisign": True})
 check("signed offline cache requires the genuine verifier before any install or HTTP", missing_verifier.returncode == 3 and
