@@ -19215,7 +19215,10 @@ act_generate_manifest() {
     ' <<< "$result_json") || return 4
 
     local manifest
-    manifest=$(jq -nc \
+    # Preserve the complete collected inventory without making it one exec
+    # argument. Each stream must supply exactly one array; malformed receipts
+    # cannot occupy another input's slot or produce a partial manifest.
+    manifest=$(jq -cse --slurpfile artifact_documents /dev/fd/3 \
         --arg tool "$tool" \
         --arg version "$manifest_version" \
         --arg run_id "$run_id" \
@@ -19226,8 +19229,9 @@ act_generate_manifest() {
         --argjson duration_ms "$duration_ms" \
         --argjson summary "$summary_json" \
         --argjson requested_targets "$requested_targets_json" \
-        --argjson artifacts "$artifacts_json" \
-        'input as $build_environments | {
+        'if length==1 and (.[0]|type=="array") and
+            ($artifact_documents|length==1 and (.[0]|type=="array"))
+         then .[0] as $build_environments | $artifact_documents[0] as $artifacts | {
             schema_version: "1.0.0",
             tool: $tool,
             version: $version,
@@ -19241,8 +19245,9 @@ act_generate_manifest() {
             summary: $summary,
             build_environments: $build_environments,
             artifacts: ($artifacts | map(. + {build_purpose: "release", publishable: true}))
-        } + (if $requested_targets == null then {} else {requested_targets: $requested_targets} end)' \
-            <<< "$build_environments_json") || {
+        } + (if $requested_targets == null then {} else {requested_targets: $requested_targets} end)
+         else error("expected one artifact inventory and build-environment array") end' \
+            3<<< "$artifacts_json" <<< "$build_environments_json") || {
             _log_error "Failed to serialize manifest"
             return 4
         }

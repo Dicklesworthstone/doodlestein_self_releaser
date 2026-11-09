@@ -287,8 +287,188 @@ raise SystemExit(1 if failures else 0)
 PY
 }
 
+test_large_public_manifest() {
+    python3 - "$ROOT" <<'PY'
+import copy
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+
+root = Path(sys.argv[1])
+for dependency in ('bash', 'jq', 'yq'):
+    if not shutil.which(dependency):
+        raise SystemExit('Large manifest tests require ' + dependency)
+work = Path(tempfile.mkdtemp(prefix='dsr-large-public-manifest-')).resolve()
+(work / 'config/repos.d').mkdir(parents=True)
+(work / 'payloads').mkdir()
+print('Large public manifest evidence: ' + str(work), flush=True)
+checks = 0
+
+def check(label, condition):
+    global checks
+    if not condition:
+        raise AssertionError(label)
+    checks += 1
+    print('PASS: ' + label, flush=True)
+
+def save(path, value):
+    path.write_text(json.dumps(value) + '\n')
+
+save(work / 'config/repos.d/largefiles.yaml', {
+    'tool_name': 'largefiles', 'binary_name': 'app', 'targets': ['linux/amd64'],
+    'local_path': str(work), 'target_triples': {'linux/amd64': 'x86_64-unknown-linux-gnu'}})
+with tarfile.open(work / 'payload.tar.gz', 'w:gz') as archive:
+    member = tarfile.TarInfo('app')
+    body = b'#!/bin/sh\nexit 0\n'
+    member.size, member.mode, member.uid, member.gid = len(body), 0o755, 0, 0
+    archive.addfile(member, io.BytesIO(body))
+payload = (work / 'payload.tar.gz').read_bytes()
+digest = hashlib.sha256(payload).hexdigest()
+# These are actual legal filesystem names and real archive bytes, not an
+# oversized extension field. They cross argv's limit with a bounded file count.
+paths = [work / 'payloads' / ('component-%04d-' % i + 'x' * 205 + '-linux-amd64.tar.gz')
+         for i in range(256)]
+for path in paths:
+    path.write_bytes(payload)
+original = {p.name: (p.stat().st_dev, p.stat().st_ino, hashlib.sha256(p.read_bytes()).hexdigest()) for p in paths}
+driver = r'''set -uo pipefail
+export DSR_CONFIG_DIR="$2/config" DSR_REPOS_FILE="$2/config/repos.yaml" ACT_REPOS_DIR="$2/config/repos.d"
+source "$1/src/config.sh" || exit 90
+source "$1/src/act_runner.sh" || exit 90
+root=$1; shift 2
+operation=$1; shift
+case "$operation" in
+    receipts) _act_result_artifact_receipts "$(cat "$1")" > "$2" ;;
+    manifest) act_generate_manifest "$(cat "$1")" "$2" ;;
+    collected) _act_verify_collected_manifest "$@" ;;
+    admission)
+        source "$root/src/slsa.sh" || exit 90
+        _slsa_manifest_statement "$1" fixture/largefiles dsr:manifest-fixture > "$2" ;;
+    bad-environments)
+        _act_build_environments_json() { printf '[]\n[]\n'; }
+        act_generate_manifest "$(cat "$1")" "$2" ;;
+    *) exit 90 ;;
+esac
+'''
+
+def invoke(label, operation, *args, input=None):
+    started = time.monotonic()
+    result = subprocess.run(['bash', '-c', driver, '_', str(root), str(work), operation,
+                             *map(str, args)], input=input, capture_output=True, timeout=105)
+    (work / (label + '.stdout')).write_bytes(result.stdout)
+    (work / (label + '.stderr')).write_bytes(result.stderr)
+    print('%s: exit=%d, seconds=%.3f' % (label, result.returncode, time.monotonic() - started), flush=True)
+    if result.returncode:
+        print(result.stderr.decode(errors='replace')[-1500:], file=sys.stderr, flush=True)
+    return result
+
+results = {}
+for count in (1, 256):
+    row = {'platform': 'linux/amd64', 'host': 'fixture', 'method': 'native',
+           'status': 'success', 'artifact_paths': list(map(str, paths[:count]))}
+    row_path, receipts_path = work / ('row-%d.json' % count), work / ('receipts-%d.json' % count)
+    save(row_path, row)
+    captured = invoke('receipts-%d' % count, 'receipts', row_path, receipts_path)
+    check('real producer receipt inventory covers %d files' % count,
+          captured.returncode == 0 and len(json.loads(receipts_path.read_bytes())) == count)
+    row['resume_artifacts'] = json.loads(receipts_path.read_bytes())
+    result = {'tool': 'largefiles', 'version': '1.2.3', 'run_id': '12345678-1234-1234-1234-123456789abc',
+              'git_sha': 'a' * 40, 'git_ref': 'v1.2.3', 'status': 'success',
+              'summary': {'total': 1, 'success': 1, 'failed': 0}, 'targets': [row]}
+    results[count] = result
+    result_path, manifest = work / ('result-%d.json' % count), work / ('manifest-%d.json' % count)
+    save(result_path, result)
+    generated = invoke('manifest-%d' % count, 'manifest', result_path, manifest)
+    check('public manifest generation succeeds for %d actual archives' % count,
+          generated.returncode == 0 and manifest.is_file())
+    observed = json.loads(manifest.read_bytes())
+    expected = [{'name': p.name, 'target': 'linux/amd64', 'target_triple': 'x86_64-unknown-linux-gnu',
+                 'sha256': digest, 'size_bytes': len(payload), 'archive_format': 'tar.gz',
+                 'signed': False, 'signature_file': '', 'build_purpose': 'release', 'publishable': True}
+                for p in paths[:count]]
+    check('%d-file manifest preserves every exact name, owner, hash and size' % count,
+          observed['artifacts'] == expected and observed['summary'] == result['summary'])
+    if count == 256:
+        assembled = [{k: v for k, v in row.items() if k not in ('build_purpose', 'publishable')}
+                     for row in observed['artifacts']]
+        save(work / 'assembled-artifacts.json', assembled)
+        check('the complete real artifact array exceeds the single-argument limit',
+              len(json.dumps(assembled, indent=2).encode()) > 131072)
+
+manifest = work / 'manifest-256.json'
+framed = b''.join(p.name.encode() + b'\0' for p in paths)
+check('independent final byte and collected-name admission accepts all 256 archives',
+      invoke('final-admission', 'collected', manifest, work / 'payloads', '--collected', input=framed).returncode == 0)
+check('complete manifest passes the shared successful-release profile',
+      invoke('release-profile', 'admission', manifest, work / 'release-proof.json').returncode == 0 and
+      len(json.loads((work / 'release-proof.json').read_bytes())['subject']) == 256)
+value = json.loads(manifest.read_bytes())
+for label, mutation in (
+    ('omitted-row', lambda rows: rows.pop()),
+    ('duplicate-name', lambda rows: rows.append(copy.deepcopy(rows[0]))),
+    ('wrong-hash', lambda rows: rows[0].update(sha256='0' * 64)),
+):
+    changed = copy.deepcopy(value)
+    mutation(changed['artifacts'])
+    candidate = work / (label + '.json')
+    save(candidate, changed)
+    check('complete final inventory refuses ' + label,
+          invoke(label, 'collected', candidate, work / 'payloads', '--collected', input=framed).returncode == 4)
+
+def refused_source(label, selected=results[256], operation='manifest'):
+    source, output = work / (label + '-result.json'), work / (label + '-manifest.json')
+    save(source, selected)
+    failed = invoke(label, operation, source, output)
+    check(label + ' cannot emit or persist a publishable manifest',
+          failed.returncode == 4 and not output.exists() and not failed.stdout)
+
+malformed = copy.deepcopy(results[256])
+malformed['targets'][0]['resume_artifacts'][0]['size_bytes'] = str(len(payload))
+refused_source('malformed-worker-receipt', malformed)
+held = work / 'temporarily-held-archive'
+paths[0].rename(held)
+try:
+    refused_source('missing-collected-archive')
+finally:
+    held.rename(paths[0])
+paths[0].write_bytes(payload + b'changed')
+try:
+    refused_source('changed-collected-archive')
+finally:
+    paths[0].write_bytes(payload)
+wrong_owner = copy.deepcopy(results[1])
+wrong_owner['targets'][0]['platform'] = 'linux/arm64'
+refused_source('wrong-platform-owner', wrong_owner)
+refused_source('trailing-build-environment-document', results[1], 'bad-environments')
+stdout_result = invoke('stdout-manifest', 'manifest', work / 'result-1.json', '')
+check('stdout mode emits exactly one complete manifest document',
+      stdout_result.returncode == 0 and
+      json.loads(stdout_result.stdout)['artifacts'] == json.loads((work / 'manifest-1.json').read_bytes())['artifacts'])
+sentinel = work / 'existing-manifest.json'
+sentinel.write_bytes(b'preserve existing output bytes\n')
+sentinel_inode = sentinel.stat().st_ino
+refused = invoke('preserve-existing-output', 'bad-environments', work / 'result-1.json', sentinel)
+check('serialization failure preserves existing output bytes and inode without stdout',
+      refused.returncode == 4 and not refused.stdout and sentinel.stat().st_ino == sentinel_inode and
+      sentinel.read_bytes() == b'preserve existing output bytes\n')
+check('generation and refusals preserve every original producer inode and byte', original ==
+      {p.name: (p.stat().st_dev, p.stat().st_ino, hashlib.sha256(p.read_bytes()).hexdigest()) for p in paths})
+print('Large public manifest: %d checks passed' % checks, flush=True)
+print('Compiler and source execution are fixture metadata; config, archives, receipts, manifest and byte admission are real.', flush=True)
+PY
+}
+
 case "${1:-}" in
     --companion-packaging-only) test_companion_packaging; exit $? ;;
+    --large-manifest-only) test_large_public_manifest; exit $? ;;
     '') ;;
     *) printf 'Unknown test option: %s\n' "$1" >&2; exit 4 ;;
 esac
