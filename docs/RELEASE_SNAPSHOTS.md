@@ -21,6 +21,14 @@ The public key must not be selected from the downloaded statement. Optional
 statement or build; `--statement-name` selects the remote provenance asset name.
 No value is inferred from a purportedly successful producer receipt.
 
+Each numeric-ID download is bounded while its body is being received. The
+private file cannot grow beyond the admitted API size, including responses
+without `Content-Length` or with chunked transfer encoding. An oversized body
+stops the transfer and fails verification; it is not retried as a transient
+network failure. The existing exact size and SHA-256 checks still apply to
+completed downloads. This bounds retained body bytes, not HTTP framing or
+bytes already buffered by the network stack.
+
 The existing remote verifier authenticates the statement before consuming its
 payload names, downloads every subject (including aliases) by its numeric asset
 ID, checks actual bytes even when API digests exist, and rechecks the release,

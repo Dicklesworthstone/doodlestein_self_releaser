@@ -329,7 +329,10 @@ _formulas_plan_assets() {
         id=$(jq -r '.id' <<< "$asset") size=$(jq -r '.size' <<< "$asset")
         receipt="$work/asset-$id.json" cached="$work/asset-$id"
         if [[ ! -f "$receipt" ]]; then
-            gh_download_release_asset "$repo" "$id" "$cached" || return 8
+            local download_status=0
+            gh_download_release_asset "$repo" "$id" "$cached" "$size" || download_status=$?
+            ((download_status != 63)) || return 7
+            ((download_status == 0)) || return 8
             [[ -f "$cached" && ! -L "$cached" ]] || return 7
             hash=$(_gh_asset_sha256 "$cached") || return 3
             actual_size=$(wc -c < "$cached") || return 4

@@ -525,30 +525,92 @@ gh_api() (
 # One bounded download attempt includes authentication and token lookup, not
 # just the binary transfer. Transport metadata never shares the binary stream.
 _gh_download_asset_attempt() {
-    local repo="$1" asset_id="$2" staged_file="$3" connect_timeout="$4" timeout="$5"
+    local repo="$1" asset_id="$2" staged_file="$3" connect_timeout="$4" timeout="$5" maximum="${6:-}"
     local status=0 token=""
+    local -a transfer_status=()
     printf 'auth\n' > "$staged_file.transport" || return 4
     _gh_check_cli_auth 2>/dev/null || status=$?
     if ((status == 0)); then
         printf 'gh\n' > "$staged_file.transport" || return 4
-        secrets_run_gh api "repos/$repo/releases/assets/$asset_id" --hostname github.com \
-            -H "Accept: application/octet-stream" \
-            -H "Cache-Control: no-cache, no-store, max-age=0" \
-            -H "Pragma: no-cache" > "$staged_file" 2>/dev/null
+        if [[ -z "$maximum" ]]; then
+            secrets_run_gh api "repos/$repo/releases/assets/$asset_id" --hostname github.com \
+                -H "Accept: application/octet-stream" \
+                -H "Cache-Control: no-cache, no-store, max-age=0" \
+                -H "Pragma: no-cache" > "$staged_file" 2>/dev/null
+        else
+            secrets_run_gh api "repos/$repo/releases/assets/$asset_id" --hostname github.com \
+                -H "Accept: application/octet-stream" \
+                -H "Cache-Control: no-cache, no-store, max-age=0" \
+                -H "Pragma: no-cache" 2>/dev/null |
+                _gh_copy_download_body "$staged_file" "$maximum"
+            transfer_status=("${PIPESTATUS[@]}")
+            ((transfer_status[1] == 0)) || return "${transfer_status[1]}"
+            return "${transfer_status[0]}"
+        fi
     elif ((status == 1)); then
         printf 'curl\n' > "$staged_file.transport" || return 4
         token=$(_gh_resolve_token) || return $?
-        curl -fLsS --connect-timeout "$connect_timeout" --max-time "$timeout" \
-            -H "Accept: application/octet-stream" \
-            -H "Authorization: Bearer $token" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            -H "Cache-Control: no-cache, no-store, max-age=0" \
-            -H "Pragma: no-cache" \
-            -D "$staged_file.headers" -w '%{http_code}' -o "$staged_file" \
-            "https://api.github.com/repos/$repo/releases/assets/$asset_id" > "$staged_file.http"
+        if [[ -z "$maximum" ]]; then
+            curl -fLsS --connect-timeout "$connect_timeout" --max-time "$timeout" \
+                -H "Accept: application/octet-stream" \
+                -H "Authorization: Bearer $token" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                -H "Cache-Control: no-cache, no-store, max-age=0" \
+                -H "Pragma: no-cache" \
+                -D "$staged_file.headers" -w '%{http_code}' -o "$staged_file" \
+                "https://api.github.com/repos/$repo/releases/assets/$asset_id" > "$staged_file.http"
+        else
+            # FD3 carries only body bytes. Curl's HTTP status and headers keep
+            # their original channels, including after a failed/redirected read.
+            curl -fLsS --connect-timeout "$connect_timeout" --max-time "$timeout" \
+                -H "Accept: application/octet-stream" \
+                -H "Authorization: Bearer $token" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                -H "Cache-Control: no-cache, no-store, max-age=0" \
+                -H "Pragma: no-cache" \
+                -D "$staged_file.headers" -w '%{http_code}' -o /dev/fd/3 \
+                "https://api.github.com/repos/$repo/releases/assets/$asset_id" \
+                3>&1 > "$staged_file.http" |
+                _gh_copy_download_body "$staged_file" "$maximum"
+            transfer_status=("${PIPESTATUS[@]}")
+            ((transfer_status[1] == 0)) || return "${transfer_status[1]}"
+            return "${transfer_status[0]}"
+        fi
     else
         return "$status"
     fi
+}
+
+# Bound real bytes even when a response is chunked or advertises a false length.
+# Closing the pipe on overflow stops the producer; no whole body is buffered.
+# Exit 63 is a definitive size refusal, never a retryable transport failure.
+_gh_copy_download_body() {
+    python3 -I -c '
+import os
+import sys
+
+class BodyTooLarge(Exception):
+    pass
+
+try:
+    remaining = int(sys.argv[2])
+    fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as output:
+        while True:
+            block = os.read(0, min(65536, remaining + 1))
+            if not block:
+                break
+            output.write(block[:remaining])
+            if len(block) > remaining:
+                raise BodyTooLarge()
+            remaining -= len(block)
+except BodyTooLarge:
+    print("[github] Release asset body exceeds the selected byte limit", file=sys.stderr)
+    sys.exit(63)
+except (OSError, ValueError):
+    print("[github] Cannot retain bounded release asset body", file=sys.stderr)
+    sys.exit(23)
+' "$1" "$2"
 }
 
 # Keep publication in a separate helper so Bash can safely serialize the
@@ -569,11 +631,14 @@ PY
 # Download exact binary bytes without exposing partial files at destination.
 # GH_DOWNLOAD_TIMEOUT bounds each complete auth/transfer attempt (default 900s),
 # with a separate curl connection bound (GH_DOWNLOAD_CONNECT_TIMEOUT, 15s).
+# An optional fourth argument bounds the actual body bytes, independently of
+# HTTP framing. Final exact size/hash verification remains the caller's duty.
 # Python 3 is required for literal, atomic no-clobber publication via os.link.
 gh_download_release_asset() {
     local repo="${1:-}"
     local asset_id="${2:-}"
     local destination="${3:-}"
+    local maximum="${4:-}"
     local destination_parent staging_dir staged_file
     local status=0 attempt=0 transport http_code headers retryable rate_limited
     local max_attempts="${GH_MAX_RETRIES:-3}"
@@ -582,8 +647,13 @@ gh_download_release_asset() {
     local _GH_LAST_RETRY_AFTER="" _GH_LAST_RATE_REMAINING="" _GH_LAST_RATE_RESET=""
 
     if [[ ! "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ || \
-          ! "$asset_id" =~ ^[1-9][0-9]*$ || -z "$destination" ]]; then
+          ! "$asset_id" =~ ^[1-9][0-9]*$ || -z "$destination" || $# -gt 4 ]]; then
         _gh_log_error "Invalid release asset download arguments"
+        return 4
+    fi
+    if [[ $# -eq 4 ]] && { [[ ! "$maximum" =~ ^(0|[1-9][0-9]{0,15})$ ]] ||
+                            ((maximum > 9007199254740991)); }; then
+        _gh_log_error "Invalid release asset byte limit"
         return 4
     fi
     [[ "$destination" == /* ]] || destination="./$destination"
@@ -614,7 +684,7 @@ gh_download_release_asset() {
         staged_file="$staging_dir/asset"
 
         run_with_timeout "$timeout" _gh_download_asset_attempt "$repo" "$asset_id" \
-            "$staged_file" "$connect_timeout" "$timeout" || status=$?
+            "$staged_file" "$connect_timeout" "$timeout" "$maximum" || status=$?
         transport=$(cat "$staged_file.transport" 2>/dev/null) || transport=""
         http_code="" headers=""
         _GH_LAST_RETRY_AFTER="" _GH_LAST_RATE_REMAINING="" _GH_LAST_RATE_RESET=""
@@ -1534,7 +1604,7 @@ _gh_find_release_asset() {
 # and hash those, rather than accepting name/size or following an untrusted URL.
 _gh_verify_uploaded_asset() {
     local repo="$1" name="$2" size="$3" sha="$4" asset="$5" workdir="$6"
-    local asset_id digest downloaded_sha downloaded_size
+    local asset_id digest downloaded_sha downloaded_size download_status=0
     if ! jq -es --arg name "$name" --argjson size "$size" '
         length == 1 and (.[0] | type == "object" and
         .name == $name and .state == "uploaded" and .size == $size and
@@ -1553,8 +1623,10 @@ _gh_verify_uploaded_asset() {
         fi
     else
         asset_id=$(jq -r '.id' <<< "$asset") || return 7
-        if ! gh_download_release_asset "$repo" "$asset_id" "$workdir/verified"; then
+        if gh_download_release_asset "$repo" "$asset_id" "$workdir/verified" "$size"; then :; else
+            download_status=$?
             _gh_log_error "Cannot verify digest-less release asset: $name"
+            ((download_status != 63)) || return 7
             return 8
         fi
         downloaded_sha=$(_gh_asset_sha256 "$workdir/verified") || return $?
@@ -2085,7 +2157,7 @@ export -f _gh_cache_key _gh_get_cache _gh_get_cache_raw _gh_get_etag _gh_set_cac
 export -f _gh_log_info _gh_log_debug
 export GH_CACHE_DIR GH_CACHE_TTL
 export -f gh_download_release_asset
-export -f _gh_download_asset_attempt _gh_publish_download _gh_response_header _gh_retry_pause
+export -f _gh_download_asset_attempt _gh_copy_download_body _gh_publish_download _gh_response_header _gh_retry_pause
 export -f _gh_log_warn _gh_log_error
 export -f gh_get_immutable_tag_ruleset_receipt
 export -f gh_workflow_runs gh_workflow_active_runs gh_workflow_run gh_releases gh_latest_release

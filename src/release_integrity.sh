@@ -334,7 +334,7 @@ _ri_documents() {
 # The signature is untrusted until Minisign checks it; an API digest for it is
 # merely a transport consistency check. No bytes are parsed as shell source.
 _ri_download_unpinned() {
-    local repo="$1" asset="$2" work="$3" path size digest actual
+    local repo="$1" asset="$2" work="$3" path size digest actual status=0
     [[ "$(jq -r '.state' <<< "$asset")" == uploaded ]] || return 7
     size=$(jq -r '.size' <<< "$asset") || return 7
     [[ "$size" =~ ^[1-9][0-9]{0,8}$ ]] && ((size <= ${SBOM_REMOTE_MAX_DOCUMENT_BYTES:-67108864})) || return 7
@@ -342,7 +342,9 @@ _ri_download_unpinned() {
     [[ -z "$digest" || "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || return 7
     path=$(mktemp -d "$work/unsigned.XXXXXXXX") || return 1
     path="$path/body"
-    _sbr_run gh_download_release_asset "$repo" "$(jq -r '.id' <<< "$asset")" "$path" >/dev/null || return $?
+    _sbr_run gh_download_release_asset "$repo" "$(jq -r '.id' <<< "$asset")" "$path" "$size" >/dev/null || status=$?
+    ((status != 63)) || return 7
+    ((status == 0)) || return "$status"
     actual=$(_ri_file_record "$path" body) || return $?
     [[ "$(jq -r '.size' <<< "$actual")" == "$size" &&
        ( -z "$digest" || "$digest" == "sha256:$(jq -r '.sha256' <<< "$actual")" ) ]] || return 7

@@ -7120,8 +7120,8 @@ _release_contract_verify_remote_signed_bytes() {
         primary_download="$download_dir/$pair_index.primary"
         signature_download="$download_dir/$pair_index.minisig"
 
-        if ! gh_download_release_asset "$repo" "$primary_id" "$primary_download" || \
-           ! gh_download_release_asset "$repo" "$signature_id" "$signature_download"; then
+        if ! gh_download_release_asset "$repo" "$primary_id" "$primary_download" "$primary_size" || \
+           ! gh_download_release_asset "$repo" "$signature_id" "$signature_download" "$signature_size"; then
             log_error "Could not download signed release pair: $primary_name"
             status=1
             break
@@ -13458,7 +13458,8 @@ EOF
             file="$strict_bytes_dir/$(jq -r '.id' <<< "$asset")"
             identity=$(jq -c '{id,name,state,size,digest}' <<< "$asset") || return 7
             if [[ ! -e "$file" && ! -L "$file" && ! -e "$file.json" && ! -L "$file.json" ]]; then
-                gh_download_release_asset "$repo" "$(jq -r '.id' <<< "$asset")" "$file" || return 7
+                gh_download_release_asset "$repo" "$(jq -r '.id' <<< "$asset")" "$file" \
+                    "$(jq -r '.size' <<< "$asset")" || return 7
                 (umask 077; set -C; printf '%s\n' "$identity" > "$file.json") || return 7
             fi
             [[ -f "$file" && ! -L "$file" && -f "$file.json" && ! -L "$file.json" ]] || return 7

@@ -165,8 +165,9 @@ _slr_document() {
     ' <<< "$asset" >/dev/null || return 7
     dir=$(mktemp -d "$work/proof.XXXXXXXX") || return 1
     body="$dir/body"
-    _sbr_run gh_download_release_asset "$repo" "$(jq -r .id <<< "$asset")" "$body" >/dev/null || rc=$?
-    case "$rc" in 0) ;; 3|5) return "$rc" ;; *) return 8 ;; esac
+    _sbr_run gh_download_release_asset "$repo" "$(jq -r .id <<< "$asset")" "$body" \
+        "$(jq -r .size <<< "$asset")" >/dev/null || rc=$?
+    case "$rc" in 0) ;; 3|5) return "$rc" ;; 63) return 7 ;; *) return 8 ;; esac
     hash=$(_slsa_sha256 "$body") || return $?
     size=$(wc -c < "$body") || return 1
     expected=$(jq -r '.digest // ""' <<< "$asset") || return 1

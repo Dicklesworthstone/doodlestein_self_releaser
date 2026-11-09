@@ -241,10 +241,11 @@ _sbr_download() {
     fi
     directory=$(mktemp -d "$workdir/download.XXXXXXXX") || return 1
     file="$directory/body"
-    if "$runner" gh_download_release_asset "$repo" "$id" "$file" >/dev/null; then :; else
+    if "$runner" gh_download_release_asset "$repo" "$id" "$file" "$size" >/dev/null; then :; else
         status=$?
         [[ "$status" -ne 5 ]] || return 5
         [[ "$status" -ne 3 ]] || return 3
+        [[ "$status" -ne 63 ]] || return 7
         _sbom_log error "Could not download release asset ID $id"; return 8
     fi
     [[ -f "$file" && ! -L "$file" ]] || return 7
