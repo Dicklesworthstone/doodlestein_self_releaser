@@ -161,6 +161,9 @@ _PRIMARY_INSTALL_NAME="$BINARY_NAME"
 _INSTALL_NAMES=()
 _INSTALL_PATHS=()
 _INSTALLED_BINARIES_JSON='[]'
+_GITHUB_ASSET_INDEX=""
+_GITHUB_ASSET_REPO=""
+_GITHUB_ASSET_TAG=""
 # Working directory created by main(). Declared at script scope so the
 # EXIT trap (which fires AFTER main returns and its locals have been
 # popped) can still see it and clean up. Leaving this as `local temp_dir`
@@ -706,12 +709,260 @@ _variant_asset_name() {
 # GH CLI DOWNLOAD
 # ============================================================================
 
+# A token-only installation must not require a separately installed GitHub CLI.
+# Keep the existing anonymous/gh preference when gh is available. Inspect
+# credentials only in an untraced child; even a malformed explicit token selects
+# this path so it cannot fall through to an anonymous request.
+_installer_token_api_selected() (
+    set +x
+    ! command -v gh >/dev/null 2>&1 &&
+        [[ -n "${DSR_GH_TOKEN:-}" || -n "${GITHUB_TOKEN:-}" || -n "${GH_TOKEN:-}" ]]
+)
+
+_installer_token_api_dependencies() {
+    if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+        _log_error "Private release installation without gh requires curl and jq"
+        return 3
+    fi
+}
+
+# Only HTTPS DNS origins on the default port are accepted. Do not let URL
+# credentials, fragments, backslashes or control characters change routing.
+# curl resolves relative Location values before returning redirect_url.
+_installer_api_https_url() {
+    local url="$1" authority tail
+    [[ "$url" == https://* && "$url" != *[[:space:][:cntrl:]]* &&
+       "$url" != *\\* && "$url" != *'#'* && ${#url} -le 16384 ]] || return 1
+    tail="${url#https://}"
+    [[ "$tail" == */* ]] || return 1
+    authority="${tail%%/*}"
+    [[ "$authority" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:443)?$ ]]
+}
+
+# Scope credentials to this repository's release API, including redirects.
+# Refuse encoded or literal traversal even when the raw prefix appears correct.
+_installer_api_in_scope() {
+    local url="$1" tail authority path
+    _installer_api_https_url "$url" || return 1
+    tail="${url#https://}"; authority="${tail%%/*}"
+    authority=$(printf '%s' "$authority" | tr '[:upper:]' '[:lower:]') || return 1
+    [[ "$authority" == api.github.com || "$authority" == api.github.com:443 ]] || return 1
+    path="/${tail#*/}"; path="${path%%\?*}"
+    path="${path//%2B/+}"; path="${path//%2b/+}"
+    [[ "$path" == "/repos/$REPO/releases/"* && "$path" != *%* &&
+       "$path" =~ ^[A-Za-z0-9._+/-]+$ ]] || return 1
+    case "$path/" in *'/../'*|*'/./'*|*'//'*) return 1 ;; esac
+}
+
+# One complete transfer, with manual redirects and a bounded body pipe. Both
+# the credential and signed object-store URLs reach curl through stdin, never
+# command arguments or a saved curl config. -q ignores an ambient .curlrc.
+# The pipe enforces the byte limit even on curl versions whose --max-filesize
+# only checks Content-Length. The request deadline covers every redirect.
+_installer_api_download() (
+    set +x
+    set -o pipefail
+    local url="$1" destination="$2" kind="$3" maximum="$4" limit="$5"
+    local token escaped_token escaped_url status reply next authority tail bytes
+    local redirects=0 send_credential=true remaining deadline=$((SECONDS + limit))
+    local transfer_maximum="$maximum"
+    local accept='application/vnd.github+json' response_file="$destination.http"
+    _installer_token_api_dependencies || return $?
+    token=$(_installer_github_token) || {
+        _log_error "Invalid selected GitHub credential"; return 4;
+    }
+    [[ ${#token} -le 8192 && "$token" != *[[:cntrl:]]* ]] || {
+        _log_error "Invalid selected GitHub credential"; return 4;
+    }
+    [[ "$maximum" =~ ^[1-9][0-9]*$ && "$limit" =~ ^[1-9][0-9]*$ &&
+       ( "$kind" == json || "$kind" == asset ) ]] || return 4
+    # A redirect's small HTML body may exceed a checksum/signature asset's
+    # actual size. Bound it independently; a final 200 still obeys maximum.
+    ((transfer_maximum >= 65536)) || transfer_maximum=65536
+    _installer_api_in_scope "$url" || return 4
+    [[ "$kind" != asset ]] || accept='application/octet-stream'
+    escaped_token="${token//\\/\\\\}"; escaped_token="${escaped_token//\"/\\\"}"
+    while ((redirects <= 5)); do
+        remaining=$((deadline - SECONDS))
+        if ((remaining <= 0)); then
+            _log_error "GitHub download exceeded its complete-transfer deadline"; return 8
+        fi
+        _installer_api_https_url "$url" || {
+            _log_error "Refusing an unsafe GitHub download redirect"; return 8;
+        }
+        if ! _installer_api_in_scope "$url"; then
+            tail="${url#https://}"; authority="${tail%%/*}"
+            authority=$(printf '%s' "$authority" | tr '[:upper:]' '[:lower:]') || return 1
+            if [[ "$kind" != asset || "$authority" == api.github.com || "$authority" == api.github.com:443 ]]; then
+                _log_error "GitHub API redirect changed the selected repository"; return 8
+            fi
+            # A later redirect back to GitHub must not regain this credential.
+            send_credential=false
+        fi
+        escaped_url="${url//\\/\\\\}"; escaped_url="${escaped_url//\"/\\\"}"
+        if ! {
+            printf 'url = "%s"\n' "$escaped_url"
+            if $send_credential; then
+                printf 'header = "Authorization: Bearer %s"\n' "$escaped_token"
+            fi
+        } | curl -q --config - --silent --globoff --proto '=https' --proto-redir '=https' \
+            --connect-timeout 15 --max-time "$remaining" --max-filesize "$transfer_maximum" \
+            --header "Accept: $accept" --header 'X-GitHub-Api-Version: 2022-11-28' \
+            --user-agent 'dsr-installer' --output /dev/fd/3 \
+            --write-out '%{http_code}\n%{redirect_url}' 3>&1 > "$response_file" 2>/dev/null |
+            head -c "$((transfer_maximum + 1))" > "$destination"; then
+            _log_error "GitHub download failed during HTTPS transport"; return 8
+        fi
+        bytes=$(wc -c < "$destination" | tr -d '[:space:]') || return 1
+        [[ "$bytes" =~ ^[0-9]+$ ]] && ((bytes <= transfer_maximum)) || {
+            _log_error "GitHub download exceeds its size limit"; return 7;
+        }
+        reply=$(cat -- "$response_file") || return 1
+        status="${reply%%$'\n'*}"
+        if [[ "$status" == 200 ]]; then
+            ((bytes <= maximum)) || {
+                _log_error "GitHub download exceeds its size limit"; return 7;
+            }
+            return 0
+        fi
+        case "$status" in
+            301|302|303|307|308)
+                next="${reply#*$'\n'}"
+                [[ "$reply" == *$'\n'* && -n "$next" && $redirects -lt 5 ]] || {
+                    _log_error "Invalid or excessive GitHub download redirects"; return 8;
+                }
+                url="$next"; redirects=$((redirects + 1))
+                ;;
+            *)
+                [[ "$status" =~ ^[0-9]{3}$ ]] || status=unknown
+                _log_error "GitHub download failed with HTTP $status"
+                return 8
+                ;;
+        esac
+    done
+    return 8
+)
+
+# Validate exactly one published release object. A singleton array, boolean
+# string, absent draft marker or mismatched tag is not a release identity.
+_installer_api_release_id() {
+    local file="$1" tag="$2"
+    jq -er -s --arg tag "$tag" '
+        def positive_id: type == "number" and . > 0 and . <= 9007199254740991 and floor == .;
+        if length == 1 and (.[0] | type == "object" and
+            (.id | positive_id) and (.tag_name | type == "string") and
+            .tag_name == $tag and .draft == false)
+        then .[0].id else error("invalid published release identity") end
+    ' "$file" 2>/dev/null
+}
+
+_installer_api_latest() (
+    local directory tag
+    _installer_token_api_dependencies || return $?
+    directory=$(mktemp -d) || return 1
+    trap 'rm -rf -- "$directory"' EXIT
+    _installer_api_download "https://api.github.com/repos/$REPO/releases/latest" \
+        "$directory/release.json" json 8388608 30 || return $?
+    tag=$(jq -er -s 'if length == 1 and (.[0] | type == "object") and
+        (.[0].tag_name | type == "string") then .[0].tag_name else error("invalid tag") end' \
+        "$directory/release.json" 2>/dev/null) || {
+        _log_error "Malformed GitHub release tag"; return 7;
+    }
+    _valid_release_version "$tag" &&
+        _installer_api_release_id "$directory/release.json" "$tag" >/dev/null || {
+        _log_error "GitHub release identity does not select a published tag"; return 7;
+    }
+    printf '%s\n' "$tag"
+)
+
+# Discover every page before selecting any asset. Build our own endpoint URLs;
+# neither browser_download_url nor Link headers control repository selection.
+# Keep the normalized inventory in private staging, not argv or a token cache.
+_installer_api_prepare_assets() {
+    if [[ "$_GITHUB_ASSET_REPO" == "$REPO" && "$_GITHUB_ASSET_TAG" == "$_VERSION" &&
+          -f "$_GITHUB_ASSET_INDEX" && ! -L "$_GITHUB_ASSET_INDEX" ]]; then return 0; fi
+    _installer_token_api_dependencies || return $?
+    [[ -n "$_TEMP_DIR" && -d "$_TEMP_DIR" && ! -L "$_TEMP_DIR" ]] || return 1
+    local directory release_id page=1 count
+    directory=$(mktemp -d "$_TEMP_DIR/github-release.XXXXXXXX") || return 1
+    _installer_api_download "https://api.github.com/repos/$REPO/releases/tags/${_VERSION//+/%2B}" \
+        "$directory/release.json" json 8388608 30 || return $?
+    release_id=$(_installer_api_release_id "$directory/release.json" "$_VERSION") || {
+        _log_error "GitHub release identity does not match the selected published tag"; return 7;
+    }
+    printf '[]\n' > "$directory/assets.json" || return 1
+    while ((page <= 101)); do
+        _installer_api_download "https://api.github.com/repos/$REPO/releases/$release_id/assets?per_page=100&page=$page" \
+            "$directory/page.json" json 8388608 30 || return $?
+        if ! jq -e -s '
+            def integer: type == "number" and . >= 0 and . <= 9007199254740991 and floor == .;
+            if length == 1 and (.[0] | type == "array" and length <= 100) and
+                all(.[0][]; type == "object" and (.id | integer and . > 0) and
+                    (.name | type == "string" and length > 0 and length <= 1024 and
+                        (test("[\u0000-\u001f\u007f]") | not)) and
+                    (.size | integer) and (.state | type == "string"))
+            then .[0] | map({id, name, size, state})
+            else error("invalid release asset page") end
+        ' "$directory/page.json" > "$directory/selected-page.json" 2>/dev/null; then
+            _log_error "Malformed GitHub release asset page"; return 7
+        fi
+        count=$(jq -er 'length' "$directory/selected-page.json") || return 7
+        if ! jq -e --slurpfile page "$directory/selected-page.json" '
+            (. + $page[0]) as $assets |
+            if ($assets | length <= 10000) and
+                ($assets | group_by(.id) | all(.[]; length == 1)) and
+                ($assets | group_by(.name) | all(.[]; length == 1))
+            then $assets else error("duplicate or excessive release assets") end
+        ' "$directory/assets.json" > "$directory/next-assets.json" 2>/dev/null; then
+            _log_error "Duplicate GitHub release asset identity or inventory exceeds 10000 entries"; return 7
+        fi
+        mv -- "$directory/next-assets.json" "$directory/assets.json" || return 1
+        if ((count < 100)); then
+            _GITHUB_ASSET_REPO="$REPO"
+            _GITHUB_ASSET_TAG="$_VERSION"
+            _GITHUB_ASSET_INDEX="$directory/assets.json"
+            return 0
+        fi
+        page=$((page + 1))
+    done
+    _log_error "GitHub release asset inventory exceeds 10000 entries"
+    return 7
+}
+
+_installer_api_fetch_asset() {
+    local asset="$1" destination="$2" maximum="$3" selection asset_id size actual
+    _installer_api_prepare_assets || return $?
+    selection=$(jq -r --arg name "$asset" --argjson maximum "$maximum" '
+        map(select(.name == $name)) |
+        if length == 0 then "missing"
+        elif length == 1 and (.[0] | .state == "uploaded" and .size > 0 and .size <= $maximum)
+        then .[0] | [.id, .size] | @tsv else "invalid" end
+    ' "$_GITHUB_ASSET_INDEX") || return 7
+    [[ "$selection" != missing ]] || return 1
+    if [[ "$selection" == invalid ]]; then
+        _log_error "Selected release asset is incomplete or exceeds its size limit: $asset"; return 7
+    fi
+    IFS=$'\t' read -r asset_id size <<< "$selection"
+    # Presence in the inventory is authoritative. Auth failures, deleted
+    # members or changed bytes are never optional misses or anonymous fallbacks.
+    _installer_api_download "https://api.github.com/repos/$REPO/releases/assets/$asset_id" \
+        "$destination" asset "$size" 300 || return $?
+    actual=$(wc -c < "$destination" | tr -d '[:space:]') || return 1
+    if [[ "$actual" != "$size" ]]; then
+        _log_error "Release asset size changed after discovery: $asset"; return 7
+    fi
+}
+
 # Fetch one exact asset for payloads AND their checksum/signature sidecars.
 # Transport fallback happens here, before verification, never after it fails.
 _fetch_release_asset() {
-    local asset="$1" dest="$2" url
+    local asset="$1" dest="$2" maximum="${3:-2147483648}" url
     $_OFFLINE_MODE && return 1
     [[ "$asset" =~ ^[A-Za-z0-9._+-]+$ && "$asset" != . && "$asset" != .. ]] || return 4
+    if _installer_token_api_selected; then
+        _installer_api_fetch_asset "$asset" "$dest" "$maximum"
+        return $?
+    fi
     url="https://github.com/$REPO/releases/download/$_VERSION/${asset//+/%2B}"
     if $_PREFER_GH && command -v gh &>/dev/null; then
         if _installer_run_gh release download "$_VERSION" --repo "github.com/$REPO" --pattern "$asset" --output "$dest" --clobber 2>/dev/null &&
@@ -745,6 +996,10 @@ _get_latest_version() {
     local api_url="https://api.github.com/repos/$REPO/releases/latest"
     local response version="" effective prefix="https://github.com/$REPO/releases/tag/"
     $_OFFLINE_MODE && return 4
+    if _installer_token_api_selected; then
+        _installer_api_latest
+        return $?
+    fi
     if $_PREFER_GH && command -v gh &>/dev/null; then
         if version=$(_installer_run_gh release view --repo "github.com/$REPO" --json tagName --jq '.tagName' 2>/dev/null) &&
            _valid_release_version "$version"; then
@@ -841,14 +1096,18 @@ _verify_checksum() {
             return 1
         fi
         manifest="$file.checksums.download"
-        local found=false
+        local found=false fetch_status
         for candidate in "$asset.sha256" checksums.sha256 SHA256SUMS \
             "${TOOL_NAME}-${_VERSION#v}-SHA256SUMS.txt" SHA256SUMS.txt checksums.txt; do
-            if _fetch_release_asset "$candidate" "$manifest"; then
+            fetch_status=0
+            _fetch_release_asset "$candidate" "$manifest" 8388608 || fetch_status=$?
+            if ((fetch_status == 0)); then
                 found=true
                 [[ "$candidate" != "$asset.sha256" ]] || hash_only=true
                 break
             fi
+            # Only an absent inventory name can select the next checksum.
+            ((fetch_status == 1)) || return "$fetch_status"
         done
         if ! $found; then
             _log_error "No release checksums available for $asset"
@@ -891,7 +1150,7 @@ _verify_minisign() {
 
     local sig_file="${file}.minisig"
     if [[ ! -e "$sig_file" && ! -L "$sig_file" ]]; then
-        _fetch_release_asset "$asset.minisig" "$sig_file" || {
+        _fetch_release_asset "$asset.minisig" "$sig_file" 1048576 || {
             _log_error "Signature unavailable for $asset"; return 1;
         }
     fi
@@ -1739,6 +1998,7 @@ main() {
         _VERSION=$(_get_latest_version) || discovery_status=$?
         if ((discovery_status != 0)); then
             _VERSION=""
+            ((discovery_status == 1)) || return "$discovery_status"
             if $_ALLOW_SOURCE_BUILD; then
                 _install_from_source "Latest release could not be resolved"
                 return $?
@@ -1763,7 +2023,7 @@ main() {
     trap _cleanup_temp_dir EXIT
     local temp_dir="$_TEMP_DIR"
 
-    local archive_file="" cache_platform="$platform" cached_file acquired=false
+    local archive_file="" cache_platform="$platform" cached_file acquired=false acquisition_status
     local extract_dir="$temp_dir/extracted"
 
     # Select the target before cache lookup. Each candidate has its own bytes
@@ -1789,9 +2049,14 @@ main() {
         elif $_OFFLINE_MODE; then
             _log_warn "Offline mode: no cached archive for $TOOL_NAME $_VERSION ($_TARGET_TRIPLE)"
             continue
-        elif ! _fetch_release_asset "$asset_name" "$archive_file"; then
-            _log_warn "Release payload unavailable: $asset_name"
-            continue
+        else
+            acquisition_status=0
+            _fetch_release_asset "$asset_name" "$archive_file" || acquisition_status=$?
+            if ((acquisition_status != 0)); then
+                ((acquisition_status == 1)) || return "$acquisition_status"
+                _log_warn "Release payload unavailable: $asset_name"
+                continue
+            fi
         fi
         # Integrity failure is final. The fallback policy grants another
         # acquisition attempt only; it never launders rejected release bytes.

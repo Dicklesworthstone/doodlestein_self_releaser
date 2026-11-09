@@ -16,6 +16,72 @@ sourcing the module to select an output root; the default is `./installers`.
 Success prints only the generated installer path to stdout. Diagnostics and
 retained-history paths go to stderr.
 
+## Private Bash releases without the GitHub CLI
+
+A generated Bash installer can download a private release when the client has
+**curl, jq and a repository token**, without installing or logging into `gh`.
+Provide the credential through the environment: selection is `DSR_GH_TOKEN`,
+then `GITHUB_TOKEN`, then `GH_TOKEN`. The token needs **Contents: read** access
+to the configured GitHub repository. An explicit version and latest-release
+discovery both support this path:
+
+```bash
+# The token is supplied by your environment or CI secret configuration.
+bash install.sh --version v1.2.3 --yes --no-skills
+bash install.sh --yes --no-skills
+```
+
+The direct API path is selected when an explicit token is available and `gh`
+is absent. Clients with `gh` retain the existing anonymous-first download and
+`--prefer-gh` behavior. Clients without a token retain public HTTPS downloads.
+The extra jq requirement applies to this direct authenticated API path;
+ordinary public release downloads do not acquire a new dependency.
+
+The installer resolves the exact published release ID and tag, reads the
+complete asset inventory in pages of 100, then downloads the selected payload,
+checksum and configured signature by their exact asset IDs. It handles an empty
+or singleton final page and rejects malformed release objects, drafts, duplicate
+names or IDs, incomplete selected assets and changed download sizes. Inventories
+are limited to 10,000 records. API pages are bounded to 8 MiB and processed from
+private files, so large inventories do not become shell command arguments.
+The implementation follows GitHub's [release-tag lookup](https://docs.github.com/en/rest/releases/releases#get-a-release-by-tag-name)
+and [asset listing and binary-download APIs](https://docs.github.com/en/rest/releases/assets).
+
+An absent checksum filename can select the next supported format, including
+the canonical `SHA256SUMS`. A discovered asset that returns an HTTP error
+cannot be treated as absent. Authentication failures, invalid metadata and
+failed discovered downloads stop installation; they do not select an anonymous
+download, another account or a source build. All downloaded and cached bytes
+still require exact checksum evidence and every configured Minisign signature.
+
+Credentials are sent only to the configured repository's HTTPS release API.
+Binary redirects may reach HTTPS object storage, where the Authorization header
+is removed permanently for that transfer. Metadata redirects outside the
+repository, redirects to a different GitHub API repository, URL credentials,
+fragments, HTTP and nonstandard ports are refused. Curl receives credentials and
+signed object-store URLs through stdin, and ignores ambient curl configuration.
+Neither secret enters curl arguments, installer diagnostics or cached evidence.
+Each transfer has a deadline covering its redirects and a bounded response
+stream, including on older curl versions.
+
+Verified private releases remain usable without a token from the exact cache,
+both with `--offline` and during an explicit-version online install. Offline
+mode makes no release, checksum or signature request. Regenerate deployed
+installers to include the new acquisition path.
+
+The focused regression uses actual generated programs, compiled executable
+families, Minisign, curl and a local HTTPS release service:
+
+```bash
+bash scripts/tests/test_generated_installer_private.sh
+```
+
+It covers token precedence, a real API page larger than 128 KiB, complete
+pagination, redirect and credential behavior, checksum/signature failures,
+latest and explicit tags, public installation and verified offline reuse.
+Only DNS routing and certificate trust are adapted for the local service;
+the regression does not establish successful live GitHub acquisition.
+
 ## Native Windows installers
 
 Generate a standalone PowerShell installer using the same per-tool configuration:
