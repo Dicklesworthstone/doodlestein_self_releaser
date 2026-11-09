@@ -122,7 +122,7 @@ function Get-DsrInstallPolicy {
         Assert-DsrFields $selection @('name', 'format', 'binaries', 'target_triple')
         if ($selection.name -isnot [string] -or
             -not (Test-DsrWindowsName $selection.name.Replace('${version}', '1.2.3')) -or
-            $selection.format -cnotin @('zip', 'none') -or
+            $selection.format -cnotin @('zip', 'tar.gz', 'none') -or
             $selection.binaries -isnot [array] -or $selection.binaries.Count -lt 1 -or
             $selection.binaries.Count -gt 64 -or $selection.target_triple -isnot [string] -or
             ($selection.target_triple -and -not (Test-DsrName $selection.target_triple))) {
@@ -697,11 +697,208 @@ function Assert-DsrPeMachine {
     } finally { $reader.Dispose(); $stream.Dispose() }
 }
 
+function Add-DsrArchiveMemberPath {
+    param([string]$Name, [bool]$Directory, $Nodes, $ExplicitNames, [string]$Format)
+    $path = if ($Directory -and $Name.EndsWith('/', [StringComparison]::Ordinal)) {
+        $Name.Substring(0, $Name.Length - 1)
+    } else { $Name }
+    $parts = $path.Split('/')
+    if (-not $path -or $path.Length -gt 1024 -or $parts.Count -gt 16 -or
+        -not $ExplicitNames.Add($path)) { Stop-DsrInstall ('Unsafe or duplicate ' + $Format + ' member') 7 }
+    foreach ($part in $parts) {
+        if (-not (Test-DsrWindowsName $part)) { Stop-DsrInstall ('Unsafe Windows ' + $Format + ' member path') 7 }
+    }
+    $cursor = ''
+    for ($index = 0; $index -lt $parts.Count; $index++) {
+        $cursor = if ($cursor) { $cursor + '/' + $parts[$index] } else { $parts[$index] }
+        $kind = if ($index -lt $parts.Count - 1 -or $Directory) { 'directory' } else { 'file' }
+        if ($Nodes.ContainsKey($cursor)) {
+            if ($Nodes[$cursor] -cne ('directory:' + $cursor) -or $kind -cne 'directory') {
+                Stop-DsrInstall ('Case-colliding ' + $Format + ' paths or file/directory conflict') 7
+            }
+        } else { $Nodes.Add($cursor, $kind + ':' + $cursor) }
+    }
+    return ,$parts
+}
+
+function New-DsrTarReadStream {
+    param([IO.Stream]$Stream)
+    if (-not ('DsrWindowsTarReadStream' -as [type])) {
+        # TarReader before .NET 11 does not check header checksums, and it
+        # materializes extended-name/PAX metadata before returning an entry.
+        # Validate physical framing and budgets as bytes reach that reader.
+        # The wrapper retains one header, never an expanded archive or entry.
+        Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+public sealed class DsrWindowsTarReadStream : Stream {
+    private readonly Stream source;
+    private readonly long maximum;
+    private readonly byte[] header = new byte[512];
+    private static readonly uint[] crcTable = MakeCrcTable();
+    private uint crc = 0xffffffff;
+    private int headerBytes, entries;
+    private long remaining, consumed, zeroBytes;
+    private bool ended;
+    public DsrWindowsTarReadStream(Stream source, long maximum) { this.source = source; this.maximum = maximum; }
+    private static uint[] MakeCrcTable() {
+        uint[] table = new uint[256];
+        for (uint i = 0; i < table.Length; i++) {
+            uint value = i;
+            for (int bit = 0; bit < 8; bit++) value = (value & 1) != 0 ? (value >> 1) ^ 0xedb88320 : value >> 1;
+            table[i] = value;
+        }
+        return table;
+    }
+    public uint Crc32 => ~crc;
+    private static long Octal(byte[] bytes, int offset, int length) {
+        long value = 0; bool digits = false, tail = false;
+        for (int i = offset; i < offset + length; i++) {
+            byte b = bytes[i];
+            if (b == 0 || b == 32) { if (digits) tail = true; continue; }
+            if (tail || b < 48 || b > 55) throw new InvalidDataException("Invalid TAR numeric field");
+            digits = true; value = checked(value * 8 + b - 48);
+        }
+        return value;
+    }
+    private void Header() {
+        bool zero = true; long checksum = 0;
+        for (int i = 0; i < 512; i++) { zero &= header[i] == 0; checksum += i >= 148 && i < 156 ? 32 : header[i]; }
+        if (zero) { ended = true; zeroBytes = 512; return; }
+        if (++entries > 10000 || Octal(header, 148, 8) != checksum)
+            throw new InvalidDataException("Invalid TAR entry count or header checksum");
+        byte type = header[156];
+        if (type != 0 && type != 48 && type != 53 && type != 120 && type != 103 && type != 76)
+            throw new InvalidDataException("Linked or unsupported TAR member");
+        long size = Octal(header, 124, 12);
+        bool metadata = type == 120 || type == 103 || type == 76;
+        if (size > (metadata ? 1048576L : 2147483648L) || (type == 53 && size != 0))
+            throw new InvalidDataException("TAR member exceeds its admission limit");
+        remaining = checked((size + 511) / 512 * 512);
+    }
+    public override int Read(byte[] buffer, int offset, int count) {
+        int read = source.Read(buffer, offset, count);
+        consumed = checked(consumed + read);
+        if (consumed > maximum) throw new InvalidDataException("TAR expanded stream exceeds its admission limit");
+        int limit = offset + read;
+        for (int i = offset; i < limit; i++) crc = crcTable[(crc ^ buffer[i]) & 255] ^ (crc >> 8);
+        while (offset < limit) {
+            if (ended) {
+                for (; offset < limit; offset++) {
+                    if (buffer[offset] != 0) throw new InvalidDataException("Nonzero content follows the TAR terminator");
+                    zeroBytes++;
+                }
+            } else if (remaining > 0) {
+                int take = (int)Math.Min(remaining, limit - offset); remaining -= take; offset += take;
+            } else {
+                int take = Math.Min(512 - headerBytes, limit - offset);
+                Buffer.BlockCopy(buffer, offset, header, headerBytes, take); headerBytes += take; offset += take;
+                if (headerBytes == 512) { Header(); headerBytes = 0; }
+            }
+        }
+        return read;
+    }
+    public void Complete() {
+        byte[] buffer = new byte[65536];
+        while (Read(buffer, 0, buffer.Length) != 0) { }
+        if (!ended || zeroBytes < 1024 || consumed % 512 != 0 || entries == 0)
+            throw new InvalidDataException("Truncated or empty TAR archive");
+    }
+    public override bool CanRead => true;
+    public override bool CanSeek => false;
+    public override bool CanWrite => false;
+    public override long Length => throw new NotSupportedException();
+    public override long Position { get => consumed; set => throw new NotSupportedException(); }
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    public override void Flush() { }
+}
+'@
+    }
+    # The complete decompressed stream budget includes member data, padding
+    # and metadata. Do not allocate from any untrusted header's declared size.
+    return [DsrWindowsTarReadStream]::new($Stream, $script:DsrMaximumExpandedBytes)
+}
+
+function Expand-DsrTarGzipPayload {
+    param([string]$Payload, $Selection, [string]$Destination)
+    $stream = Open-DsrReadFile $Payload
+    $gzip = $null; $bounded = $null; $archive = $null
+    try {
+        $gzip = [IO.Compression.GZipStream]::new($stream, [IO.Compression.CompressionMode]::Decompress, $true)
+        $bounded = New-DsrTarReadStream $gzip
+        $archive = [System.Formats.Tar.TarReader]::new($bounded, $true)
+        $nodes = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $explicitNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $selected = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $buffer = [byte[]]::new(1048576)
+        $expanded = 0L; $entries = 0
+        while ($null -ne ($entry = $archive.GetNextEntry($false))) {
+            if (++$entries -gt 10000) { Stop-DsrInstall 'Invalid TAR entry count' 7 }
+            if ($entry.EntryType -eq [System.Formats.Tar.TarEntryType]::GlobalExtendedAttributes) { continue }
+            $directory = $entry.EntryType -eq [System.Formats.Tar.TarEntryType]::Directory
+            if (-not $directory -and $entry.EntryType -ne [System.Formats.Tar.TarEntryType]::RegularFile -and
+                $entry.EntryType -ne [System.Formats.Tar.TarEntryType]::V7RegularFile) {
+                Stop-DsrInstall 'Linked or unsupported TAR member' 7
+            }
+            $parts = Add-DsrArchiveMemberPath $entry.Name $directory $nodes $explicitNames 'TAR'
+            $expanded += $entry.Length
+            if ($entry.Length -lt 0 -or $entry.Length -gt $script:DsrMaximumPayloadBytes -or
+                $expanded -gt $script:DsrMaximumExpandedBytes -or ($directory -and $entry.Length -ne 0)) {
+                Stop-DsrInstall 'TAR expanded size exceeds admission limits' 7
+            }
+            if ($directory) { continue }
+            foreach ($binary in $Selection.binaries) {
+                if (-not $parts[-1].Equals($binary, [StringComparison]::OrdinalIgnoreCase)) { continue }
+                if (-not $selected.Add($binary) -or $entry.Length -eq 0 -or $null -eq $entry.DataStream) {
+                    Stop-DsrInstall 'Missing or ambiguous executable TAR member' 7
+                }
+                $outgoing = New-DsrPrivateFile ([IO.Path]::Combine($Destination, $binary))
+                try {
+                    $written = 0L
+                    while (($count = $entry.DataStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                        $written += $count
+                        if ($written -gt $entry.Length) { Stop-DsrInstall 'TAR member exceeds its declared size' 7 }
+                        $outgoing.Write($buffer, 0, $count)
+                    }
+                    if ($written -ne $entry.Length) { Stop-DsrInstall 'Truncated TAR executable' 7 }
+                    $outgoing.Flush($true)
+                } finally { $outgoing.Dispose() }
+            }
+        }
+        # TarReader stops at the first zero header. Drain through the same
+        # bounded framing reader to reject hidden entries, trailing garbage,
+        # incomplete terminators and gzip corruption before installation.
+        $bounded.Complete()
+        # GZipStream may report clean EOF when an entire gzip footer is
+        # missing. Bind the actual final trailer to every decompressed byte
+        # instead of treating the TAR terminator as compression completion.
+        if ($stream.Length -lt 18) { Stop-DsrInstall 'Truncated gzip payload' 7 }
+        $stream.Position = $stream.Length - 8
+        $footer = [IO.BinaryReader]::new($stream, [Text.Encoding]::UTF8, $true)
+        try {
+            if ($footer.ReadUInt32() -ne $bounded.Crc32 -or
+                $footer.ReadUInt32() -ne ($bounded.Position -band 4294967295L)) {
+                Stop-DsrInstall 'Invalid or missing gzip checksum/length trailer' 7
+            }
+        } finally { $footer.Dispose() }
+        if ($selected.Count -ne $Selection.binaries.Count) { Stop-DsrInstall 'TAR does not contain every selected executable' 7 }
+    } finally {
+        if ($null -ne $archive) { $archive.Dispose() }
+        if ($null -ne $bounded) { $bounded.Dispose() }
+        if ($null -ne $gzip) { $gzip.Dispose() }
+        $stream.Dispose()
+    }
+}
+
 function Expand-DsrPayload {
     param([string]$Payload, $Selection, [string]$Platform, [string]$Destination)
     $null = New-DsrPrivateDirectory $Destination
     if ($Selection.format -ceq 'none') {
         Copy-DsrNewFile $Payload ([IO.Path]::Combine($Destination, $Selection.binaries[0]))
+    } elseif ($Selection.format -ceq 'tar.gz') {
+        Expand-DsrTarGzipPayload $Payload $Selection $Destination
     } else {
         $stream = Open-DsrReadFile $Payload
         $archive = $null
@@ -715,30 +912,12 @@ function Expand-DsrPayload {
             foreach ($entry in $archive.Entries) {
                 $name = $entry.FullName
                 $directory = $name.EndsWith('/', [StringComparison]::Ordinal)
-                $path = if ($directory) { $name.Substring(0, $name.Length - 1) } else { $name }
-                $parts = $path.Split('/')
-                if (-not $path -or $path.Length -gt 1024 -or $parts.Count -gt 16 -or
-                    -not $explicitNames.Add($path)) { Stop-DsrInstall 'Unsafe or duplicate ZIP member' 7 }
-                foreach ($part in $parts) {
-                    if (-not (Test-DsrWindowsName $part)) {
-                        Stop-DsrInstall 'Unsafe Windows ZIP member path' 7
-                    }
-                }
+                $parts = Add-DsrArchiveMemberPath $name $directory $nodes $explicitNames 'ZIP'
                 $type = ([long]$entry.ExternalAttributes -shr 16) -band 0xf000
                 if (($type -ne 0 -and $type -ne 0x8000 -and $type -ne 0x4000) -or
                     ($entry.ExternalAttributes -band 0x400) -ne 0 -or
                     ($directory -and $type -eq 0x8000) -or (-not $directory -and $type -eq 0x4000)) {
                     Stop-DsrInstall 'Linked or unsupported ZIP member' 7
-                }
-                $cursor = ''
-                for ($index = 0; $index -lt $parts.Count; $index++) {
-                    $cursor = if ($cursor) { $cursor + '/' + $parts[$index] } else { $parts[$index] }
-                    $kind = if ($index -lt $parts.Count - 1 -or $directory) { 'directory' } else { 'file' }
-                    if ($nodes.ContainsKey($cursor)) {
-                        if ($nodes[$cursor] -cne ('directory:' + $cursor) -or $kind -cne 'directory') {
-                            Stop-DsrInstall 'Case-colliding ZIP paths or file/directory conflict' 7
-                        }
-                    } else { $nodes.Add($cursor, $kind + ':' + $cursor) }
                 }
                 $expanded += $entry.Length
                 if ($entry.Length -lt 0 -or $entry.Length -gt $script:DsrMaximumPayloadBytes -or

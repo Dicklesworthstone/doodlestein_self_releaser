@@ -1055,7 +1055,7 @@ since these are embedded at generation (see "Installers and Verification").
 
 For native Windows, `--shell powershell` generates a standalone PowerShell 7.4+
 installer from the same repository configuration. It supports declared x64,
-ARM64 and x86 Windows targets, ZIP archives or raw PE executables, exact strict
+ARM64 and x86 Windows targets, ZIP or tar.gz archives or raw PE executables, exact strict
 asset names, and the complete platform-specific workspace executable family.
 Generation requires `yq`, `jq`, Python 3 and `pwsh` on the DSR coordinator;
 the generated installer needs PowerShell and, when a signing key is configured,

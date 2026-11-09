@@ -121,14 +121,38 @@ workspace_binaries_by_target:
   windows/arm64: [tool]
 ```
 
-ZIP and raw executable assets are supported. A raw asset supplies exactly one
+ZIP, tar.gz and raw executable assets are supported. A raw asset supplies exactly one
 executable; its strict release basename can differ from the installed `.exe`
-name. ZIPs must contain exactly one regular member for every selected executable.
+name. Archives must contain exactly one regular member for every selected executable.
 Per-target workspace lists replace the global family, and an empty list selects
 the primary. The generated family is bounded to 64 executables. Duplicate or
 case-colliding names, reserved Windows device names, unsafe paths, reparse/link
 entries, and a wrong PE machine type are refused before installation. Unselected
 archive members are not installed as additional executables.
+
+Gzip-compressed TAR archives are read with the .NET runtime included in
+PowerShell; no `tar`, `gzip` or archive extraction command is required on Windows.
+USTAR, GNU long-name and PAX name records are supported. ZIP and TAR share the
+same Windows path and case-collision checks. TAR links, sparse entries, special
+files, ambiguous executable basenames, invalid header checksums and incomplete
+archives are refused. A streaming reader bounds the complete expanded TAR stream
+to 4 GiB, every regular member to 2 GiB, extended metadata to 1 MiB per record,
+and the physical archive to 10,000 headers. It also checks the gzip trailer's
+CRC and length against the actual decompressed bytes. Only selected executables
+are written to private staging; the complete archive is admitted before any
+installed file is replaced. `tar.xz` remains unsupported by this native installer.
+
+The focused archive regression uses the real DSR packager, generated installers,
+genuine Go-built x64/ARM64 PE files and Minisign signatures:
+
+```bash
+bash scripts/tests/test_install_gen_windows_archives.sh
+```
+
+It covers ordinary and literal strict asset names, verified offline cache reuse,
+complete-family rollback and malformed signed archives. Linux adapts host
+detection and HTTP delivery for this test; it does not establish native Windows
+ACL/NTFS or live GitHub acceptance.
 
 Run the generated script in native Windows with PowerShell 7.4 or newer:
 

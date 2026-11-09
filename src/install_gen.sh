@@ -3322,8 +3322,8 @@ _install_gen_windows_policy() (
             # shellcheck disable=SC2016 # Runtime JSON token, never evaluated by Bash.
             name="${name//"$version_marker"/'${version}'}"
         fi
-        case "$format" in zip) ;; none|exe) format=none ;; *)
-            log_error "PowerShell installers support ZIP and raw Windows executables: $platform uses $format"
+        case "$format" in zip|tar.gz) ;; none|exe) format=none ;; *)
+            log_error "PowerShell installers support ZIP, tar.gz and raw Windows executables: $platform uses $format"
             return 4 ;;
         esac
         if [[ "$format" == none && "$(jq length <<< "$names")" != 1 ]]; then
