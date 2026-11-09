@@ -138,20 +138,91 @@ if ($fixture.Contains('without_minisign') -and $fixture.without_minisign) {
     $env:PATH = ''
 }
 function Get-DsrHostPlatform { return $script:Fixture.platform }
-function Invoke-DsrDownload {
-    param([string]$Url, [string]$Destination, [switch]$Optional, [long]$MaximumBytes = 2147483648)
-    [IO.File]::AppendAllText($script:Fixture.requests, $Url + "`n")
-    if ($script:Fixture.parameters.Contains('Offline') -and $script:Fixture.parameters.Offline) {
-        throw 'Offline runtime crossed the HTTP boundary'
+if ($fixture.Contains('http_client_fixture') -and $fixture.http_client_fixture) {
+    # Exercise the real HTTP request/redirect/streaming implementation using
+    # HttpClient's supported handler boundary. Responses are local fixtures;
+    # request headers and credential decisions are production code.
+    Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Net;
+using System.Net.Http;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+public sealed class DsrInstallerFixtureHandler : HttpMessageHandler {
+    private readonly JsonElement fixture;
+    public DsrInstallerFixtureHandler(string path) {
+        using (JsonDocument document = JsonDocument.Parse(File.ReadAllText(path))) {
+            fixture = document.RootElement.Clone();
+        }
     }
-    if (-not $script:Fixture.downloads.Contains($Url)) {
-        if ($Optional) { return $false }
-        Stop-DsrInstall 'Fixture HTTP 404' 8
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken token) {
+        token.ThrowIfCancellationRequested();
+        string url = request.RequestUri.AbsoluteUri;
+        string authorization = request.Headers.Authorization == null ? "" : request.Headers.Authorization.Parameter;
+        string authorizationHash = authorization.Length == 0 ? "" : Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(authorization))).ToLowerInvariant();
+        File.AppendAllText(fixture.GetProperty("requests").GetString(), JsonSerializer.Serialize(new {
+            url, authorization_sha256 = authorizationHash,
+            authorization_scheme = request.Headers.Authorization == null ? "" : request.Headers.Authorization.Scheme,
+            accept = request.Headers.Accept.ToString(), user_agent = request.Headers.UserAgent.ToString()
+        }) + "\n");
+        if (fixture.GetProperty("parameters").TryGetProperty("Offline", out JsonElement offline) && offline.GetBoolean()) {
+            throw new HttpRequestException("Offline runtime crossed the HTTP boundary");
+        }
+        if (fixture.TryGetProperty("expected_token", out JsonElement expected) && request.RequestUri.Host == "api.github.com" &&
+            authorization != expected.GetString()) {
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.Unauthorized));
+        }
+        if (request.RequestUri.Host != "api.github.com" && authorization.Length != 0) {
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.BadRequest));
+        }
+        if (request.RequestUri.AbsolutePath.Contains("/releases/assets/") &&
+            request.Headers.Accept.ToString() != "application/octet-stream") {
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotAcceptable));
+        }
+        if (fixture.TryGetProperty("statuses", out JsonElement statuses) && statuses.TryGetProperty(url, out JsonElement status)) {
+            return Task.FromResult(new HttpResponseMessage((HttpStatusCode)status.GetInt32()));
+        }
+        if (fixture.TryGetProperty("redirects", out JsonElement redirects) && redirects.TryGetProperty(url, out JsonElement location)) {
+            var response = new HttpResponseMessage(HttpStatusCode.Redirect);
+            response.Headers.Location = new Uri(location.GetString(), UriKind.RelativeOrAbsolute);
+            return Task.FromResult(response);
+        }
+        if (fixture.GetProperty("downloads").TryGetProperty(url, out JsonElement source)) {
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) {
+                Content = new ByteArrayContent(File.ReadAllBytes(source.GetString()))
+            });
+        }
+        return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
     }
-    $source = $script:Fixture.downloads[$Url]
-    if ([IO.FileInfo]::new($source).Length -gt $MaximumBytes) { Stop-DsrInstall 'Fixture exceeds real download limit' 7 }
-    Copy-DsrNewFile $source $Destination
-    return $true
+}
+'@
+    $script:FixturePath = $CasePath
+    function New-DsrHttpClient {
+        $client = [Net.Http.HttpClient]::new([DsrInstallerFixtureHandler]::new($script:FixturePath), $true)
+        $client.Timeout = [Threading.Timeout]::InfiniteTimeSpan
+        return $client
+    }
+} else {
+    function Invoke-DsrDownload {
+        param([string]$Url, [string]$Destination, [switch]$Optional, [long]$MaximumBytes = 2147483648,
+              [switch]$ApiAsset)
+        [IO.File]::AppendAllText($script:Fixture.requests, $Url + "`n")
+        if ($script:Fixture.parameters.Contains('Offline') -and $script:Fixture.parameters.Offline) {
+            throw 'Offline runtime crossed the HTTP boundary'
+        }
+        if (-not $script:Fixture.downloads.Contains($Url)) {
+            if ($Optional) { return $false }
+            Stop-DsrInstall 'Fixture HTTP 404' 8
+        }
+        $source = $script:Fixture.downloads[$Url]
+        if ([IO.FileInfo]::new($source).Length -gt $MaximumBytes) { Stop-DsrInstall 'Fixture exceeds real download limit' 7 }
+        Copy-DsrNewFile $source $Destination
+        return $true
+    }
 }
 if ($fixture.Contains('move_fault') -and $fixture.move_fault) {
     # Explicit injected boundary: first replacement performs the real move;
@@ -198,10 +269,10 @@ def asset_for(selected=policy, version="1.2.3"):
 asset = asset_for()
 base_url = "https://github.com/fixture/win-demo/releases/download/v1.2.3/"
 
-def release(label, *, kind="good", checksum="SHA256SUMS", signed=True, selected=policy, raw=False):
+def release(label, *, kind="good", checksum="SHA256SUMS", signed=True, selected=policy, raw=False, version="v1.2.3"):
     directory = root / ("release-" + label)
     directory.mkdir()
-    chosen = asset_for(selected)
+    chosen = asset_for(selected, version.removeprefix("v"))
     payload = directory / chosen
     app = (root / "app.exe").read_bytes()
     worker = (root / "worker.exe").read_bytes()
@@ -251,12 +322,12 @@ def release(label, *, kind="good", checksum="SHA256SUMS", signed=True, selected=
             raise RuntimeError("Minisign fixture signing failed")
         if kind == "bad-signature":
             Path(str(payload) + ".minisig").write_text("invalid signature\n")
-    url = "https://github.com/" + selected["repo"] + "/releases/download/v1.2.3/"
+    url = "https://github.com/" + selected["repo"] + "/releases/download/" + version + "/"
     downloads = {url + path.name: str(path) for path in directory.iterdir()}
     return downloads
 
 def run_case(label, downloads=None, *, selected_runtime=runtime, cache=None, prefix=None,
-             offline=False, version="1.2.3", yes=True, options=None):
+             offline=False, version="1.2.3", yes=True, options=None, credentials=None):
     cache = Path(cache or root / ("cache-" + label))
     prefix = Path(prefix or root / ("prefix-" + label))
     requests = root / (label + ".requests")
@@ -271,7 +342,7 @@ def run_case(label, downloads=None, *, selected_runtime=runtime, cache=None, pre
     case = root / (label + ".json")
     case.write_text(json.dumps(spec))
     result = command(["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", driver,
-                      "-RuntimePath", selected_runtime, "-CasePath", case], label)
+                      "-RuntimePath", selected_runtime, "-CasePath", case], label, extra=credentials)
     try:
         parsed = json.loads(result.stdout)
     except Exception:
@@ -339,6 +410,166 @@ latest, latest_details, _, _, latest_requests = run_case("latest-online", latest
 check("online latest selects a real exact tag before payload lookup", latest.returncode == 0 and
       latest_details.get("version") == "v1.2.3" and latest_requests.read_text().splitlines()[0].endswith("/releases/latest"),
       latest.stderr.decode(errors="replace"))
+
+# This path uses the real download/request implementation. Only HttpClient's
+# response handler is a fixture; policy, pagination, exact asset selection,
+# headers, redirects, transfer limits, checksums and signatures stay genuine.
+fixture_token = "dsr-fixture-token-for-private-releases"
+credentials = {"DSR_GH_TOKEN": fixture_token, "GITHUB_TOKEN": "fixture-github-fallback",
+               "GH_TOKEN": "fixture-gh-fallback"}
+api = "https://api.github.com/repos/fixture/win-demo"
+release_id = 4242
+
+def private_release(label, *, kind="good", checksum="SHA256SUMS", version="v1.2.3", padding=100):
+    public = release("private-" + label, kind=kind, checksum=checksum, version=version)
+    directory = root / ("private-metadata-" + label)
+    directory.mkdir()
+    metadata = {"id": release_id, "tag_name": version, "draft": False}
+    rows = [{"id": index + 1, "name": "other-platform-" + str(index) + ".zip", "state": "uploaded", "size": 1}
+            for index in range(padding)]
+    if rows:
+        # Dictionary keys may shadow PowerShell's adapted .Count property;
+        # unrelated legal release names must not break subsequent pages.
+        rows[0]["name"] = "Count"
+    downloads = {}
+    for index, source in enumerate(public.values(), start=1001):
+        path = Path(source)
+        rows.append({"id": index, "name": path.name, "state": "uploaded", "size": path.stat().st_size,
+                     # These remote URL fields must never become request targets.
+                     "url": "https://example.invalid/untrusted-asset-url",
+                     "browser_download_url": "https://example.invalid/untrusted-browser-url"})
+        downloads[api + "/releases/assets/" + str(index)] = source
+    if kind == "duplicate-asset-name":
+        row = copy.deepcopy(rows[-3])
+        row["id"] = 2001
+        rows.append(row)
+    elif kind == "duplicate-asset-id":
+        row = copy.deepcopy(rows[-3])
+        row["name"] = "another-name.zip"
+        rows.append(row)
+    elif kind == "missing-payload":
+        rows = [row for row in rows if row["name"] != asset_for(policy, version.removeprefix("v"))]
+    elif kind == "missing-signature":
+        rows = [row for row in rows if not row["name"].endswith(".minisig")]
+    elif kind == "incomplete-payload":
+        next(row for row in rows if row["name"] == asset_for(policy, version.removeprefix("v")))["state"] = "starter"
+    elif kind == "changed-size":
+        next(row for row in rows if row["name"] == asset_for(policy, version.removeprefix("v")))["size"] += 1
+    elif kind == "wrong-tag":
+        metadata["tag_name"] = "v9.9.9"
+    elif kind == "array-tag":
+        metadata["tag_name"] = [version]
+    elif kind == "empty-array-tag":
+        metadata["tag_name"] = []
+    elif kind == "repeated-array-tag":
+        metadata["tag_name"] = [version, version]
+    elif kind == "draft-release":
+        metadata["draft"] = True
+    metadata_path = directory / "release.json"
+    metadata_path.write_text(json.dumps(metadata))
+    downloads[api + "/releases/tags/" + version] = str(metadata_path)
+    downloads[api + "/releases/latest"] = str(metadata_path)
+    for start in range(0, len(rows) + 1, 100):
+        page = start // 100 + 1
+        value = rows[start:start + 100]
+        if kind == "object-page":
+            value = {"not": "an array"}
+        page_path = directory / ("page-" + str(page) + ".json")
+        page_path.write_text(json.dumps(value))
+        downloads[api + "/releases/4242/assets?per_page=100&page=" + str(page)] = str(page_path)
+    return downloads
+
+def http_options(**options):
+    return {"http_client_fixture": True, "expected_token": fixture_token, **options}
+
+def request_rows(path):
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+private_downloads = private_release("complete")
+payload_url = next(url for url, path in private_downloads.items() if Path(path).name == asset)
+redirect_url = "https://release-assets.githubusercontent.com/fixture/payload?signature=fixture-only"
+private_downloads[redirect_url] = private_downloads.pop(payload_url)
+private_result, private_details, private_cache, private_prefix, private_requests = run_case(
+    "private-paginated-family", private_downloads, credentials=credentials,
+    options=http_options(redirects={payload_url: redirect_url}))
+private_rows = request_rows(private_requests)
+check("authenticated asset-ID acquisition installs the signed complete family from a later page",
+      private_result.returncode == 0 and private_details.get("signature_verified") is True and
+      all((private_prefix / name).read_bytes() == (root / name).read_bytes() for name in ("app.exe", "worker.exe")) and
+      any(row["url"].endswith("assets?per_page=100&page=2") for row in private_rows),
+      private_result.stderr.decode(errors="replace") + " " + json.dumps(private_details))
+expected_token_hash = hashlib.sha256(fixture_token.encode()).hexdigest()
+api_rows = [row for row in private_rows if row["url"].startswith(api + "/")]
+check("selected token precedence and repository API scope govern every authenticated request",
+      bool(api_rows) and all(row["authorization_sha256"] == expected_token_hash and
+      row["authorization_scheme"] == "Bearer" for row in api_rows) and
+      all(row["user_agent"].startswith("doodlestein_self_releaser-installer/") for row in private_rows) and
+      all(row["url"].startswith(api + "/") or row["url"] == redirect_url for row in private_rows))
+binary_rows = [row for row in private_rows if "/releases/assets/" in row["url"]]
+check("primary checksum and signature use octet-stream requests and object storage receives no credential",
+      len(binary_rows) == 3 and all(row["accept"] == "application/octet-stream" for row in binary_rows) and
+      any(row["url"] == redirect_url and not row["authorization_sha256"] for row in private_rows))
+check("authentication values never enter result diagnostics cache or request evidence",
+      all(value.encode() not in private_result.stdout + private_result.stderr + private_requests.read_bytes()
+          for value in credentials.values()) and
+      all(fixture_token.encode() not in path.read_bytes() for path in private_cache.rglob("*") if path.is_file()))
+private_offline, private_offline_details, _, private_offline_prefix, private_offline_requests = run_case(
+    "private-offline-without-token", cache=private_cache, offline=True, options={"http_client_fixture": True})
+check("authenticated cache is reusable offline without a token or HTTP and still verifies its signature",
+      private_result.returncode == 0 and private_offline.returncode == 0 and
+      private_offline_details.get("signature_verified") is True and not private_offline_requests.exists() and
+      (private_offline_prefix / "worker.exe").read_bytes() == (root / "worker.exe").read_bytes(),
+      private_offline.stderr.decode(errors="replace"))
+
+for kind, expected in (("duplicate-asset-name", 7), ("duplicate-asset-id", 7), ("missing-payload", 8),
+                       ("missing-signature", 8), ("incomplete-payload", 7), ("changed-size", 7),
+                       ("wrong-tag", 7), ("array-tag", 7), ("empty-array-tag", 7), ("repeated-array-tag", 7),
+                       ("draft-release", 7), ("object-page", 7),
+                       ("bad-checksum", 7), ("bad-signature", 7)):
+    outcome, _, _, _, observed = refusal("private-" + kind, downloads=private_release(kind, kind=kind),
+        expected=expected, credentials=credentials, options=http_options())
+    check("private " + kind + " refusal never downgrades to public acquisition",
+          all(row["url"].startswith(api + "/") for row in request_rows(observed)))
+
+for checksum, padding in (("sidecar", 98), ("checksums.sha256", 97)):
+    # 98 unrelated + 3 relevant = a singleton final page; 97 + 3 =
+    # a full page followed by [], exercising both JSON cardinalities.
+    outcome, _, _, _, observed = run_case("private-" + checksum, private_release(checksum, checksum=checksum, padding=padding),
+        credentials=credentials, options=http_options())
+    check("private checksum fallback and complete " + ("singleton" if padding == 98 else "empty") + " final page",
+          outcome.returncode == 0 and any(row["url"].endswith("page=2") for row in request_rows(observed)),
+          outcome.stderr.decode(errors="replace"))
+
+named_tag = "release-2026.11"
+named, named_details, _, _, named_requests = run_case("named-public-tag", release("named-public", version=named_tag), version=named_tag)
+check("explicit nonnumeric release tag is preserved on the public acquisition path", named.returncode == 0 and
+      named_details.get("version") == named_tag and all("/download/" + named_tag + "/" in url
+      for url in named_requests.read_text().splitlines()), named.stderr.decode(errors="replace"))
+named_private, named_private_details, _, _, named_private_requests = run_case("named-private-tag",
+    private_release("named", version=named_tag), version=named_tag, credentials=credentials, options=http_options())
+check("explicit nonnumeric tag resolves its exact private release instead of adding v", named_private.returncode == 0 and
+      named_private_details.get("version") == named_tag and request_rows(named_private_requests)[0]["url"] ==
+      api + "/releases/tags/" + named_tag, named_private.stderr.decode(errors="replace"))
+private_latest, private_latest_details, _, _, private_latest_requests = run_case("private-latest",
+    private_release("latest"), version=None, credentials=credentials, options=http_options())
+check("authenticated latest reuses its validated release ID for complete asset discovery", private_latest.returncode == 0 and
+      private_latest_details.get("version") == "v1.2.3" and request_rows(private_latest_requests)[0]["url"].endswith("/releases/latest") and
+      not any("/releases/tags/" in row["url"] for row in request_rows(private_latest_requests)),
+      private_latest.stderr.decode(errors="replace"))
+
+rejected_auth, _, _, _, rejected_auth_requests = refusal("private-auth-refusal",
+    downloads=private_release("auth-refusal"), expected=8, credentials=credentials,
+    options=http_options(statuses={api + "/releases/tags/v1.2.3": 403}))
+check("authentication refusal cannot fall back to a different account or anonymous download",
+      len(request_rows(rejected_auth_requests)) == 1 and fixture_token.encode() not in rejected_auth.stderr)
+unsafe_redirects = ("http://release-assets.githubusercontent.com/fixture/payload",
+                    "https://api.github.com/repos/other/repository/releases/assets/77",
+                    "https://release-assets.githubusercontent.com:444/fixture/payload")
+for index, target in enumerate(unsafe_redirects):
+    outcome, _, _, _, observed = refusal("private-unsafe-redirect-" + str(index), downloads=private_downloads,
+        expected=8, credentials=credentials, options=http_options(redirects={payload_url: target}))
+    check("unsafe redirect " + str(index) + " is refused before contacting its target",
+          all(row["url"] != target for row in request_rows(observed)))
 
 old_prefix = root / "prefix-rollback"
 old_prefix.mkdir()

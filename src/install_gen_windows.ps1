@@ -79,7 +79,9 @@ function ConvertFrom-DsrJson {
     try {
         $document = [System.Text.Json.JsonDocument]::Parse($Text)
         Assert-DsrJsonKeys $document.RootElement
-        return ConvertFrom-Json -InputObject $Text -AsHashtable -Depth 64
+        # Keep empty and singleton API pages as arrays. PowerShell's normal
+        # pipeline enumeration would turn [] into null and [row] into row.
+        return ,(ConvertFrom-Json -InputObject $Text -AsHashtable -Depth 64 -NoEnumerate)
     } finally {
         if ($null -ne $document) { $document.Dispose() }
     }
@@ -364,31 +366,60 @@ function Remove-DsrPrivateTree {
     [IO.Directory]::Delete($Path, $false)
 }
 
-function Invoke-DsrDownload {
-    param([string]$Url, [string]$Destination, [switch]$Optional, [long]$MaximumBytes = 2147483648)
-    $uri = [Uri]$Url
-    if ($uri.Scheme -cne 'https' -or $uri.Host -cnotin @('github.com', 'api.github.com') -or $uri.UserInfo) {
-        Stop-DsrInstall 'Invalid GitHub acquisition URL' 4
-    }
-    $handler = [Net.Http.HttpClientHandler]::new()
-    $handler.AllowAutoRedirect = $false
-    $client = [Net.Http.HttpClient]::new($handler)
-    $client.Timeout = [Threading.Timeout]::InfiniteTimeSpan
-    $deadline = [Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds(60))
-    $token = ''
+function Get-DsrGitHubToken {
     foreach ($variable in @('DSR_GH_TOKEN', 'GITHUB_TOKEN', 'GH_TOKEN')) {
         $candidate = [Environment]::GetEnvironmentVariable($variable)
-        if ($candidate) { $token = $candidate; break }
+        if ($candidate) {
+            if ($candidate -match '[\x00-\x20\x7f]') { Stop-DsrInstall 'Invalid selected GitHub credential' 4 }
+            return $candidate
+        }
     }
-    if ($token -match '[\x00-\x20\x7f]') { Stop-DsrInstall 'Invalid selected GitHub credential' 4 }
-    $originalHost = $uri.Host
+    return ''
+}
+
+function New-DsrHttpClient {
+    $handler = [Net.Http.HttpClientHandler]::new()
+    $handler.AllowAutoRedirect = $false
+    $handler.UseCookies = $false
+    # Disposing this client also disposes its exclusively owned handler.
+    $client = [Net.Http.HttpClient]::new($handler, $true)
+    $client.Timeout = [Threading.Timeout]::InfiniteTimeSpan
+    return $client
+}
+
+function Invoke-DsrDownload {
+    param([string]$Url, [string]$Destination, [switch]$Optional, [long]$MaximumBytes = 2147483648,
+          [switch]$ApiAsset)
+    $uri = [Uri]$Url
+    if ($uri.Scheme -cne 'https' -or $uri.Host -cnotin @('github.com', 'api.github.com') -or
+        -not $uri.IsDefaultPort -or $uri.UserInfo -or $uri.Fragment) {
+        Stop-DsrInstall 'Invalid GitHub acquisition URL' 4
+    }
+    if ($ApiAsset -and ($uri.Host -cne 'api.github.com' -or
+        $uri.AbsolutePath -cnotmatch '^/repos/[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*/releases/assets/[1-9][0-9]*$')) {
+        Stop-DsrInstall 'Invalid GitHub release-asset API URL' 4
+    }
+    $token = Get-DsrGitHubToken
+    $apiPrefix = ''
+    if ($uri.Host -ceq 'api.github.com') {
+        if ($uri.AbsolutePath -cnotmatch '^(/repos/[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*/releases/)') {
+            Stop-DsrInstall 'Invalid GitHub release API scope' 4
+        }
+        $apiPrefix = $Matches[1]
+    }
+    $client = New-DsrHttpClient
+    $deadline = [Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds(60))
+    $sendCredential = [bool]$apiPrefix
     try {
         for ($redirect = 0; $redirect -le 5; $redirect++) {
             $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, $uri)
             $request.Headers.UserAgent.ParseAdd('doodlestein_self_releaser-installer/1.0')
-            $request.Headers.Accept.ParseAdd('application/vnd.github+json')
+            $accept = if ($ApiAsset) { 'application/octet-stream' } else { 'application/vnd.github+json' }
+            $request.Headers.Accept.ParseAdd($accept)
             $null = $request.Headers.TryAddWithoutValidation('X-GitHub-Api-Version', '2022-11-28')
-            if ($token -and $uri.Host -ceq $originalHost) {
+            # Credentials belong only to the configured repository's API
+            # requests, never browser URLs or signed object-storage redirects.
+            if ($token -and $sendCredential) {
                 $request.Headers.Authorization = [Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $token)
             }
             $response = $null
@@ -399,7 +430,19 @@ function Invoke-DsrDownload {
                 if ($status -in @(301, 302, 303, 307, 308)) {
                     if ($redirect -eq 5 -or $null -eq $response.Headers.Location) { Stop-DsrInstall 'Invalid or excessive download redirects' 8 }
                     $uri = [Uri]::new($uri, $response.Headers.Location)
-                    if ($uri.Scheme -cne 'https' -or $uri.UserInfo) { Stop-DsrInstall 'Refusing an unsafe download redirect' 8 }
+                    if ($uri.Scheme -cne 'https' -or -not $uri.IsDefaultPort -or $uri.UserInfo -or $uri.Fragment) {
+                        Stop-DsrInstall 'Refusing an unsafe download redirect' 8
+                    }
+                    if ($apiPrefix) {
+                        $sameScope = $uri.Host -ceq 'api.github.com' -and
+                            $uri.AbsolutePath.StartsWith($apiPrefix, [StringComparison]::Ordinal)
+                        if ((-not $ApiAsset -or $uri.Host -ceq 'api.github.com') -and -not $sameScope) {
+                            Stop-DsrInstall 'GitHub API redirect changed the selected repository' 8
+                        }
+                        # Once a request leaves the API scope, a redirect back
+                        # cannot regain the original Authorization header.
+                        $sendCredential = $sendCredential -and $sameScope
+                    }
                     continue
                 }
                 if ($status -in @(404, 410) -and $Optional) { return $false }
@@ -429,8 +472,81 @@ function Invoke-DsrDownload {
         }
     } catch [OperationCanceledException] {
         Stop-DsrInstall 'GitHub download exceeded its complete-transfer deadline' 8
-    } finally { $deadline.Dispose(); $client.Dispose(); $handler.Dispose(); $token = '' }
+    } catch [Net.Http.HttpRequestException] {
+        # Exception text can contain a signed redirect URL. Keep credentials
+        # and acquisition tokens out of diagnostics and machine results.
+        Stop-DsrInstall 'GitHub download failed during HTTPS transport' 8
+    } finally { $deadline.Dispose(); $client.Dispose(); $token = '' }
     Stop-DsrInstall 'Download did not complete' 8
+}
+
+function Assert-DsrReleaseIdentity {
+    param($Release, [string]$Tag)
+    if ($Release -isnot [System.Collections.IDictionary] -or
+        -not $Release.Contains('id') -or ($Release.id -isnot [long] -and $Release.id -isnot [int]) -or
+        $Release.id -le 0 -or -not $Release.Contains('tag_name') -or $Release.tag_name -isnot [string] -or
+        $Release.tag_name -cne $Tag -or
+        -not $Release.Contains('draft') -or $Release.draft -isnot [bool] -or $Release.draft) {
+        Stop-DsrInstall 'GitHub release identity does not match the selected published tag' 7
+    }
+}
+
+function Get-DsrReleaseAssets {
+    param([string]$Repository, [long]$ReleaseId, [string]$Directory)
+    $assets = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $ids = [Collections.Generic.HashSet[long]]::new()
+    # Construct every page URL ourselves. Neither server-supplied URLs nor
+    # Link headers can change repository/host or carry credentials elsewhere.
+    for ($page = 1; $page -le 101; $page++) {
+        $path = [IO.Path]::Combine($Directory, ('release-assets-' + $page + '.json'))
+        $url = 'https://api.github.com/repos/' + $Repository + '/releases/' + $ReleaseId + '/assets?per_page=100&page=' + $page
+        $null = Invoke-DsrDownload $url $path -MaximumBytes 8388608
+        $rows = ConvertFrom-DsrJson (Read-DsrTextFile $path)
+        if ($rows -isnot [array] -or $rows.Count -gt 100) { Stop-DsrInstall 'Malformed GitHub release asset page' 7 }
+        if ($assets.get_Count() + $rows.Count -gt 10000) { Stop-DsrInstall 'GitHub release asset inventory exceeds 10000 entries' 7 }
+        foreach ($row in $rows) {
+            if ($row -isnot [System.Collections.IDictionary] -or
+                -not $row.Contains('id') -or ($row.id -isnot [long] -and $row.id -isnot [int]) -or $row.id -le 0 -or
+                -not $row.Contains('name') -or $row.name -isnot [string] -or -not $row.name -or
+                $row.name.Length -gt 1024 -or $row.name -match '[\x00-\x1f\x7f]' -or
+                -not $row.Contains('size') -or ($row.size -isnot [long] -and $row.size -isnot [int]) -or $row.size -lt 0 -or
+                -not $row.Contains('state') -or $row.state -isnot [string]) {
+                Stop-DsrInstall 'Malformed GitHub release asset identity' 7
+            }
+            if (-not $ids.Add($row.id) -or $assets.ContainsKey($row.name)) {
+                Stop-DsrInstall 'Duplicate GitHub release asset name or identity' 7
+            }
+            $assets.Add($row.name, @{ id = $row.id; size = $row.size; state = $row.state })
+        }
+        if ($rows.Count -lt 100) { return ,$assets }
+    }
+    Stop-DsrInstall 'GitHub release asset inventory exceeds 10000 entries' 7
+}
+
+function Save-DsrReleaseAsset {
+    param([string]$Repository, [string]$Tag, [string]$Name, [string]$Destination, $Inventory = $null,
+          [switch]$Optional, [long]$MaximumBytes = 2147483648)
+    if ($null -eq $Inventory) {
+        $url = 'https://github.com/' + $Repository + '/releases/download/' + [Uri]::EscapeDataString($Tag) + '/' + [Uri]::EscapeDataString($Name)
+        return Invoke-DsrDownload $url $Destination -Optional:$Optional -MaximumBytes $MaximumBytes
+    }
+    if (-not $Inventory.ContainsKey($Name)) {
+        if ($Optional) { return $false }
+        Stop-DsrInstall ('Selected release asset is missing: ' + $Name) 8
+    }
+    $asset = $Inventory[$Name]
+    if ($asset.state -cne 'uploaded' -or $asset.size -le 0 -or $asset.size -gt $MaximumBytes) {
+        Stop-DsrInstall ('Selected release asset is incomplete or exceeds its size limit: ' + $Name) 7
+    }
+    $url = 'https://api.github.com/repos/' + $Repository + '/releases/assets/' + $asset.id
+    # An existing inventory member cannot be treated as an optional miss when
+    # its download fails; do not hide deletion/authentication errors by trying
+    # a different checksum format or a public anonymous path.
+    $null = Invoke-DsrDownload $url $Destination -ApiAsset -MaximumBytes $MaximumBytes
+    if ([IO.FileInfo]::new((Get-DsrPlainPath $Destination -File)).Length -ne $asset.size) {
+        Stop-DsrInstall ('Release asset size changed after discovery: ' + $Name) 7
+    }
+    return $true
 }
 
 function Get-DsrChecksumNames {
@@ -779,7 +895,7 @@ function Invoke-DsrWindowsInstaller {
 Install $tool on native Windows using verified release payloads.
 
 Options:
-  -Version TAG   Exact version (1.2.3 or v1.2.3); default: latest online release
+  -Version TAG   Exact tag (numeric 1.2.3 also accepts v1.2.3); default: latest
   -Prefix DIR    Destination directory; default: LocalAppData/Programs/$tool/bin
   -CacheDir DIR  Persistent verified download cache
   -Offline       No network; requires -Version and complete cached evidence
@@ -790,6 +906,8 @@ Options:
 
 Every selected executable is checked before replacement. Configured signatures
 require Minisign. This installer never executes downloaded payloads or edits PATH.
+Private releases use DSR_GH_TOKEN, GITHUB_TOKEN, then GH_TOKEN, with Contents read
+permission. Credentials are sent only to the configured repository's GitHub API.
 "@
             if ($Json) { [Console]::Out.WriteLine((@{ tool = $tool; status = 'help'; help = $text } | ConvertTo-Json -Compress)) }
             else { [Console]::Out.WriteLine($text) }
@@ -809,6 +927,7 @@ require Minisign. This installer never executes downloaded payloads or edits PAT
         if (-not $Offline) { $null = New-DsrDirectoryChain $cacheRoot }
         else { $null = Get-DsrPlainPath $cacheRoot -Directory }
         Assert-DsrCacheCustody $cacheRoot
+        $release = $null
         if (-not $Version) {
             $work = New-DsrPrivateDirectory ([IO.Path]::Combine($cacheRoot, ('.dsr-download-' + [Guid]::NewGuid().ToString('N'))))
             $latest = [IO.Path]::Combine($work, 'latest.json')
@@ -819,7 +938,7 @@ require Minisign. This installer never executes downloaded payloads or edits PAT
                 Stop-DsrInstall 'Invalid latest-release identity' 7
             }
             $tag = $release.tag_name
-        } else { $tag = if ($Version.StartsWith('v', [StringComparison]::Ordinal)) { $Version } else { 'v' + $Version } }
+        } else { $tag = if ($Version -cmatch '^[0-9]') { 'v' + $Version } else { $Version } }
         $number = if ($tag.StartsWith('v', [StringComparison]::Ordinal)) { $tag.Substring(1) } else { $tag }
         $asset = $selection.name.Replace('${version}', $number)
         if (-not (Test-DsrWindowsName $asset)) { Stop-DsrInstall 'Resolved payload name is unsafe' }
@@ -837,15 +956,25 @@ require Minisign. This installer never executes downloaded payloads or edits PAT
             $receipt = Get-DsrCacheReceipt $cache $binding $policy.public_key
         } elseif ($Offline) { Stop-DsrInstall 'No complete verified cache exists for this exact release selection' 7 }
         else {
-            Write-DsrInstallVerbose 'Downloading the selected public GitHub release payload'
             if (-not $work) { $work = New-DsrPrivateDirectory ([IO.Path]::Combine($cacheRoot, ('.dsr-download-' + [Guid]::NewGuid().ToString('N')))) }
+            $inventory = $null
+            if (Get-DsrGitHubToken) {
+                Write-DsrInstallVerbose 'Resolving the selected authenticated GitHub release and complete asset inventory'
+                if ($null -eq $release) {
+                    $metadata = [IO.Path]::Combine($work, 'release.json')
+                    $releaseUrl = 'https://api.github.com/repos/' + $policy.repo + '/releases/tags/' + [Uri]::EscapeDataString($tag)
+                    $null = Invoke-DsrDownload $releaseUrl $metadata -MaximumBytes 8388608
+                    $release = ConvertFrom-DsrJson (Read-DsrTextFile $metadata)
+                }
+                Assert-DsrReleaseIdentity $release $tag
+                $inventory = Get-DsrReleaseAssets $policy.repo $release.id $work
+            } else { Write-DsrInstallVerbose 'Downloading the selected public GitHub release payload' }
             $download = New-DsrPrivateDirectory ([IO.Path]::Combine($work, 'release'))
             $payload = [IO.Path]::Combine($download, $asset)
-            $url = 'https://github.com/' + $policy.repo + '/releases/download/' + [Uri]::EscapeDataString($tag) + '/'
-            $null = Invoke-DsrDownload ($url + [Uri]::EscapeDataString($asset)) $payload -MaximumBytes $script:DsrMaximumPayloadBytes
+            $null = Save-DsrReleaseAsset $policy.repo $tag $asset $payload $inventory -MaximumBytes $script:DsrMaximumPayloadBytes
             $checksumName = ''
             foreach ($candidate in @(Get-DsrChecksumNames $binding)) {
-                if (Invoke-DsrDownload ($url + [Uri]::EscapeDataString($candidate)) ([IO.Path]::Combine($download, $candidate)) -Optional -MaximumBytes 8388608) {
+                if (Save-DsrReleaseAsset $policy.repo $tag $candidate ([IO.Path]::Combine($download, $candidate)) $inventory -Optional -MaximumBytes 8388608) {
                     $checksumName = $candidate
                     break
                 }
@@ -857,7 +986,7 @@ require Minisign. This installer never executes downloaded payloads or edits PAT
             $signatureHash = $null
             if ($policy.public_key) {
                 $signature = [IO.Path]::Combine($download, ($asset + '.minisig'))
-                $null = Invoke-DsrDownload ($url + [Uri]::EscapeDataString($asset + '.minisig')) $signature -MaximumBytes 65536
+                $null = Save-DsrReleaseAsset $policy.repo $tag ($asset + '.minisig') $signature $inventory -MaximumBytes 65536
                 Assert-DsrSignature $payload $signature $policy.public_key
                 $signatureHash = (Get-DsrFileEvidence $signature).sha256
             }

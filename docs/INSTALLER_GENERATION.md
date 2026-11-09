@@ -72,12 +72,42 @@ Run the generated script in native Windows with PowerShell 7.4 or newer:
 .\install.ps1 -Version v1.2.3 -Prefix C:\Tools\tool\bin -CacheDir C:\ToolCache -Offline -Yes
 ```
 
-Online acquisition supports public GitHub release assets. Private release asset
-discovery through GitHub's authenticated asset-ID API is not implemented in this
-generator. Omitting `-Version` selects the latest release online. Offline mode requires an
-explicit version and makes no release lookup, checksum request or signature
+Online acquisition supports public and private GitHub release assets. With a
+selected credential, the installer uses GitHub's release and asset APIs. Token
+selection is `DSR_GH_TOKEN`, then `GITHUB_TOKEN`, then `GH_TOKEN`; use a credential
+with **Contents: read** access to the configured repository. A selected token
+that fails authentication is not replaced by another account or an anonymous
+download. Without a token, public release assets retain their direct HTTPS
+download path. No GitHub CLI installation or stored CLI login is required.
+
+The authenticated path resolves the exact published release ID, reads its
+complete asset listing in pages of 100, and selects the payload, checksum and
+configured signature by their exact names. Empty and singleton final pages are
+handled explicitly; duplicate asset names or IDs, malformed pages, draft or
+mismatched releases, and incomplete assets fail before installation. Inventories
+are bounded to 10,000 assets. Downloads use the selected asset IDs and
+`Accept: application/octet-stream`, and their lengths must match the discovered
+records before checksum and signature verification. Remote asset URLs and
+pagination links cannot redirect selection to another repository.
+This uses GitHub's documented [release-tag lookup](https://docs.github.com/en/rest/releases/releases#get-a-release-by-tag-name)
+and [release asset listing and binary-download APIs](https://docs.github.com/en/rest/releases/assets).
+
+Credentials are sent only to the configured repository's `api.github.com`
+release endpoints. Binary redirects may reach HTTPS object storage, where the
+Authorization header is removed and cannot be restored by a later redirect.
+Metadata redirects outside the configured repository, HTTP redirects and
+nonstandard ports are refused. Tokens are not written to installer results,
+diagnostics or cached receipts. Each transfer retains the complete-transfer
+deadline and size limit used by public downloads.
+
+Omitting `-Version` selects the latest release online. Explicit nonnumeric tags
+such as `release-2026.11` are preserved; a bare numeric `1.2.3` selects `v1.2.3`.
+Offline mode requires an explicit version and makes no release lookup, checksum request or signature
 download. The cache binds repository, version, platform, selected asset and
 embedded policy; cached bytes and evidence are rechecked on every installation.
+Verified private assets can be reused offline without a token, while all checksum
+and configured signature requirements remain in force. An already complete exact
+cache also needs no authenticated discovery during an explicit-version install.
 Cache locations must belong to the current user and reject modification by
 untrusted principals. Payloads and evidence are copied into private staging and
 verified there before extraction. Downloads have a complete-transfer deadline;
@@ -110,8 +140,13 @@ bash scripts/tests/test_install_gen_windows_policy.sh
 
 The regression exercises actual generated programs, genuine Go-produced Windows
 PE files, ZIP parsing, Minisign verification, cache and replacement operations.
-Portable PowerShell runs use explicit host/HTTP adapters and a labelled move
-failure injection for rollback; they do not establish native NTFS behavior.
+Authenticated acquisition runs the actual HTTP request, redirect and streaming
+implementation with a .NET response-handler fixture. It covers token priority,
+paginated exact asset lookup, binary Accept headers, credential removal on signed
+object-store redirects, refusal without anonymous fallback, and offline reuse
+without credentials. Portable PowerShell runs use explicit host/HTTP adapters
+and a labelled move failure injection for rollback; they do not establish native
+NTFS behavior or successful live GitHub acquisition.
 The policy regression exercises the actual configuration and publication naming
 helpers, explicit signing-key scope, executable-family limits and refusal before
 any existing installer or publication history changes.

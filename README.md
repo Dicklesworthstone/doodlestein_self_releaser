@@ -1040,7 +1040,9 @@ ARM64 and x86 Windows targets, ZIP archives or raw PE executables, exact strict
 asset names, and the complete platform-specific workspace executable family.
 Generation requires `yq`, `jq`, Python 3 and `pwsh` on the DSR coordinator;
 the generated installer needs PowerShell and, when a signing key is configured,
-Minisign on Windows. This release-asset path supports public GitHub releases.
+Minisign on Windows. This release-asset path supports public and private GitHub
+releases. Private downloads select `DSR_GH_TOKEN`, then `GITHUB_TOKEN`, then
+`GH_TOKEN`, with Contents read access to the configured repository.
 
 ```powershell
 .\install.ps1 -Version v1.2.3 -Yes
