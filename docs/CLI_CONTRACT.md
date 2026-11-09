@@ -575,7 +575,11 @@ budgets its planned starts against the same limit without writing recovery state
 JSON
 once results include `details.max_concurrent`, `details.active_attempts` (the
 retained active work), and `details.deferred_count` (eligible runs deferred for
-capacity during this poll).
+capacity during this poll). Once and continuous results stream the complete
+retained journal, including histories larger than the operating system's argument
+limit. A final journal-read or result-assembly failure returns an error envelope
+and exit `4`, even when the preceding poll succeeded; it cannot report success
+with missing recovery details.
 
 Terminal fallback notifications are sent only after the worker has saved its
 completion receipt; detailed phase output remains in the attempt's `result.json`

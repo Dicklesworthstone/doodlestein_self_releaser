@@ -612,6 +612,8 @@ PY
 _routing_watch() {
     local check_json="$1"
     shift
+    local -a watch_mode=(--once)
+    [[ "${DSR_WATCH_FIXTURE_CONTINUOUS:-0}" != 1 ]] || watch_mode=()
     printf '%s\n' "$check_json" > "$TEST_TMPDIR/watch-check.json"
     cat > "$TEST_TMPDIR/child-dsr" <<'EOF'
 #!/usr/bin/env bash
@@ -625,6 +627,9 @@ case "$1" in
             ((SECONDS < deadline)) || exit 98
             sleep 0.05
         done
+        if [[ -n "${DSR_WATCH_FIXTURE_HISTORY_AFTER_CHECK:-}" ]]; then
+            cat "$DSR_WATCH_FIXTURE_HISTORY_AFTER_CHECK" > "$DSR_STATE_DIR/triggered.json" || exit 98
+        fi
         cat "$TEST_TMPDIR/watch-check.json"
         exit 1
         ;;
@@ -656,10 +661,44 @@ EOF
                 builtin command "$@"
             }
         fi
+        if [[ "${DSR_WATCH_FIXTURE_REPORT_FAILURE:-0}" == 1 ]]; then
+            # Inject only report assembly failure; state validation and the
+            # final public envelope still use the real jq implementation.
+            jq() {
+                local argument
+                for argument in "$@"; do
+                    if [[ "$argument" == max_concurrent ]]; then
+                        : > "$TEST_TMPDIR/report-assembly-failed"
+                        printf "%s\n" "injected watcher report assembly failure" >&2
+                        return 4
+                    fi
+                done
+                command jq "$@"
+            }
+        fi
+        if [[ "${DSR_WATCH_FIXTURE_CONTINUOUS:-0}" == 1 ]]; then
+            # Stop after the genuine first poll through the existing
+            # interruptible-sleep boundary, without waiting a full interval.
+            sleep() { return 1; }
+        fi
         trap "wait" EXIT
         source "$1" "${@:2}"' \
         "$TEST_TMPDIR/child-dsr" "${DSR_ROUTING_TEST_ROOT:-$DSR_PROJECT_ROOT}/dsr" \
-        --json watch --once --notify none "$@"
+        --json watch ${watch_mode[@]+"${watch_mode[@]}"} --notify none "$@"
+}
+
+# Explicit terminal-history fixture. New attempts, locking, reconciliation and
+# public JSON reporting continue through the actual CLI in _routing_watch.
+_watch_large_history() {
+    jq -n 'reduce range(100000;100500) as $number
+        ({schema_version:2,runs:{},attempts:{},pending:{},last_check:"2026-01-30T12:00:00Z"};
+         ($number | tostring) as $id |
+         .runs[$id] = "2026-01-30T12:00:00Z" |
+         .attempts[$id] = {attempt:1,attempt_id:($id + ".12345678"),tool:"demo",repo:"owner/demo",
+            version:"v1.2.3",head_sha:("1" * 40),status:"succeeded",started_epoch:1,
+            next_retry_at:null,resume_run_id:"",isolate_source:true,exit_code:0,finished_epoch:2})' \
+        > "$DSR_STATE_DIR/triggered.json"
+    [[ "$(jq -c . "$DSR_STATE_DIR/triggered.json" | wc -c)" -gt 131072 ]]
 }
 
 _watch_completed() {
@@ -1040,6 +1079,108 @@ EOF
     assert_contains "$output" "automatic fallback blocked"
     [[ ! -e "$TEST_TMPDIR/fallback.args" ]]
     [[ ! -e "$DSR_STATE_DIR/triggered.json" ]]
+}
+
+@test "watch large history dry-run retains the complete journal without writes" {
+    harness_create_config
+    _watch_large_history
+    cp "$DSR_STATE_DIR/triggered.json" "$TEST_TMPDIR/history-before.json"
+    run --separate-stderr _routing_watch "$(_watch_run_json)" --auto-fallback --dry-run
+    assert_equal 0 "$status"
+    jq -es --slurpfile expected "$TEST_TMPDIR/history-before.json" '
+        length == 1 and (.[0] | .command == "watch" and .status == "success" and .exit_code == 0 and
+            .details.mode == "once" and .details.dry_run == true and .details.auto_fallback == true and
+            .details.max_concurrent == 2 and .details.active_attempts == 0 and .details.deferred_count == 0 and
+            .details.triggered_state == $expected[0])' <<< "$output"
+    cmp "$TEST_TMPDIR/history-before.json" "$DSR_STATE_DIR/triggered.json"
+    [[ ! -e "$TEST_TMPDIR/fallback.args" && ! -e "$DSR_STATE_DIR/watch-attempts" && ! -e "$DSR_STATE_DIR/watch.lock" ]]
+    [[ "$stderr" != *"Argument list too long"* ]]
+}
+
+@test "watch large history persists new attempts and deduplicates across restarts" {
+    harness_create_config
+    _watch_large_history
+    cp "$DSR_STATE_DIR/triggered.json" "$TEST_TMPDIR/history-before.json"
+    local check_json
+    check_json=$(_watch_run_json)
+    run --separate-stderr _routing_watch "$check_json" --auto-fallback
+    assert_equal 0 "$status"
+    jq -es --slurpfile state "$DSR_STATE_DIR/triggered.json" '
+        length == 1 and (.[0] | .status == "success" and .details.triggered_state == $state[0] and
+            (.details.triggered_state.attempts | length) == 501 and .details.active_attempts == 1)' <<< "$output"
+    _watch_completed
+    run --separate-stderr _routing_watch "$check_json" --auto-fallback
+    assert_equal 0 "$status"
+    jq -es --slurpfile state "$DSR_STATE_DIR/triggered.json" --slurpfile before "$TEST_TMPDIR/history-before.json" '
+        length == 1 and (.[0] | .status == "success" and .details.triggered_state == $state[0] and
+            .details.active_attempts == 0 and (.details.triggered_state.attempts | length) == 501) and
+        ($state[0] | .attempts["12345"].status == "succeeded" and .attempts["12345"].attempt == 1 and
+            .attempts["12345"].exit_code == 0 and
+            (del(.attempts["12345"],.runs["12345"],.last_check) == ($before[0] | del(.last_check))))' <<< "$output"
+    [[ "$(wc -l < "$TEST_TMPDIR/fallback.starts")" -eq 1 ]]
+    [[ "$stderr" != *"Argument list too long"* ]]
+}
+
+@test "watch large history survives continuous-mode result assembly" {
+    harness_create_config
+    _watch_large_history
+    cp "$DSR_STATE_DIR/triggered.json" "$TEST_TMPDIR/history-before.json"
+    DSR_WATCH_FIXTURE_CONTINUOUS=1 run --separate-stderr _routing_watch \
+        '{"details":{"throttled":[]}}' --dry-run
+    assert_equal 0 "$status"
+    jq -es --slurpfile expected "$TEST_TMPDIR/history-before.json" '
+        length == 1 and (.[0] | .command == "watch" and .status == "success" and .exit_code == 0 and
+            .details.mode == "continuous" and .details.iterations == 1 and
+            .details.triggered_state == $expected[0])' <<< "$output"
+    cmp "$TEST_TMPDIR/history-before.json" "$DSR_STATE_DIR/triggered.json"
+    [[ ! -e "$TEST_TMPDIR/fallback.args" && ! -e "$DSR_STATE_DIR/watch.lock" ]]
+    [[ "$stderr" != *"Argument list too long"* ]]
+}
+
+@test "watch large history refuses malformed retained source identities" {
+    harness_create_config
+    _watch_large_history
+    cp "$DSR_STATE_DIR/triggered.json" "$TEST_TMPDIR/history-valid.json"
+    local field
+    for field in head_sha version repo; do
+        jq --arg field "$field" '.attempts["100499"][$field] = "invalid"' \
+            "$TEST_TMPDIR/history-valid.json" > "$DSR_STATE_DIR/triggered.json"
+        cp "$DSR_STATE_DIR/triggered.json" "$TEST_TMPDIR/history-invalid-$field.json"
+        run --separate-stderr _routing_watch "$(_watch_run_json)" --auto-fallback
+        assert_equal 4 "$status"
+        jq -es 'length == 1 and (.[0] | .status == "error" and .exit_code == 4 and
+            .details.triggered_state == null and .details.error == "Cannot read watcher recovery state")' <<< "$output"
+        cmp "$TEST_TMPDIR/history-invalid-$field.json" "$DSR_STATE_DIR/triggered.json"
+        [[ ! -e "$TEST_TMPDIR/fallback.args" && ! -e "$DSR_STATE_DIR/watch-attempts" ]]
+    done
+}
+
+@test "watch reporting refuses history corrupted after a successful poll" {
+    harness_create_config
+    _watch_large_history
+    jq '.attempts["100499"].head_sha = "invalid"' "$DSR_STATE_DIR/triggered.json" \
+        > "$TEST_TMPDIR/history-after-check.json"
+    DSR_WATCH_FIXTURE_HISTORY_AFTER_CHECK="$TEST_TMPDIR/history-after-check.json" \
+        run --separate-stderr _routing_watch '{"details":{"throttled":[]}}' --dry-run
+    assert_equal 4 "$status"
+    jq -es 'length == 1 and (.[0] | .command == "watch" and .status == "error" and .exit_code == 4 and
+        .details.triggered_state == null and .details.error == "Cannot read watcher recovery state")' <<< "$output"
+    cmp "$TEST_TMPDIR/history-after-check.json" "$DSR_STATE_DIR/triggered.json"
+    [[ ! -e "$TEST_TMPDIR/fallback.args" && ! -e "$DSR_STATE_DIR/watch-attempts" ]]
+}
+
+@test "watch reporting propagates assembly failures without an empty success" {
+    harness_create_config
+    local continuous
+    for continuous in 0 1; do
+        DSR_WATCH_FIXTURE_REPORT_FAILURE=1 DSR_WATCH_FIXTURE_CONTINUOUS="$continuous" \
+            run --separate-stderr _routing_watch '{"details":{"throttled":[]}}' --dry-run
+        assert_equal 4 "$status"
+        [[ -e "$TEST_TMPDIR/report-assembly-failed" ]]
+        jq -es 'length == 1 and (.[0] | .command == "watch" and .status == "error" and .exit_code == 4 and
+            .details.error == "Cannot assemble watcher result")' <<< "$output"
+        [[ ! -e "$DSR_STATE_DIR/triggered.json" && ! -e "$DSR_STATE_DIR/watch-attempts" ]]
+    done
 }
 
 @test "watch recovery retains a successful child across once invocations" {

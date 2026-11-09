@@ -2369,6 +2369,42 @@ EOF
     trap _watch_release_lock EXIT
     trap 'exit 5' HUP INT TERM
 
+    # Retained history grows across invocations. Keep the complete journal on
+    # stdin rather than passing it through the operating system's argv limit,
+    # and never turn an unreadable journal or failed report into success.
+    _watch_emit_result() {
+        local mode="$1" result="$2" iterations="${3:-0}" state details report_error=""
+        if ! state=$(_watch_load_triggered); then
+            state=null
+            result=4
+            report_error="Cannot read watcher recovery state"
+            log_error "$report_error"
+        fi
+        if ! details=$(jq -cs --arg mode "$mode" --arg error "$report_error" \
+                --argjson iterations "$iterations" \
+                --argjson auto_fallback "$auto_fallback" \
+                --argjson dry_run "$dry_run" \
+                --argjson max_concurrent "$_WATCH_MAX_CONCURRENT" \
+                --argjson deferred "$_WATCH_DEFERRED_COUNT" '
+                (if length == 1 and (.[0] == null or (.[0] | type == "object"))
+                 then .[0] else error("exactly one watcher state required") end) as $state |
+                (if $mode == "once" then
+                    {mode:$mode, auto_fallback:$auto_fallback, dry_run:$dry_run, triggered_state:$state,
+                     max_concurrent:$max_concurrent, deferred_count:$deferred,
+                     active_attempts:([($state.attempts // {})[] |
+                        select(.status == "starting" or .status == "running")] | length)}
+                 else {mode:$mode, iterations:$iterations, triggered_state:$state} end) |
+                if $error == "" then . else . + {error:$error} end' <<< "$state"); then
+            result=4
+            log_error "Cannot assemble watcher result"
+            printf -v details '{"mode":"%s","error":"Cannot assemble watcher result"}' "$mode"
+        fi
+        local status=success
+        [[ "$result" == 0 ]] || status=error
+        json_envelope "watch" "$status" "$result" "$details" || return 4
+        return "$result"
+    }
+
     # Single check mode
     if $once_mode; then
         log_info "Running single check..."
@@ -2376,19 +2412,8 @@ EOF
         local result=$?
 
         if $JSON_MODE; then
-            local state
-            state=$(_watch_load_triggered) || state=null
-            json_envelope "watch" "$([[ $result -eq 0 ]] && echo success || echo error)" "$result" "$(jq -nc \
-                --arg mode "once" \
-                --argjson state "$state" \
-                --argjson auto_fallback "$auto_fallback" \
-                --argjson dry_run "$dry_run" \
-                --argjson max_concurrent "$_WATCH_MAX_CONCURRENT" \
-                --argjson deferred "$_WATCH_DEFERRED_COUNT" \
-                '{mode: $mode, auto_fallback: $auto_fallback, dry_run: $dry_run, triggered_state: $state,
-                  max_concurrent: $max_concurrent, deferred_count: $deferred,
-                  active_attempts: ([($state.attempts // {})[] |
-                    select(.status == "starting" or .status == "running")] | length)}')"
+            _watch_emit_result once "$result"
+            return $?
         fi
 
         return $result
@@ -2440,12 +2465,8 @@ EOF
     log_info "Watcher stopped"
 
     if $JSON_MODE; then
-        local state
-        state=$(_watch_load_triggered) || state=null
-        json_envelope "watch" "success" 0 "$(jq -nc \
-            --argjson iterations "$iteration" \
-            --argjson state "$state" \
-            '{mode: "continuous", iterations: $iterations, triggered_state: $state}')"
+        _watch_emit_result continuous 0 "$iteration"
+        return $?
     fi
 
     return 0
