@@ -3,8 +3,8 @@
 # envelopes. No network, release writes, SSH or source/receipt validator mocks.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P) || exit 1
-command -v python3 >/dev/null && command -v go >/dev/null && command -v git >/dev/null || {
-    printf 'SKIP: native recovery integration requires Python 3, Go and Git\n' >&2
+command -v python3 >/dev/null && command -v go >/dev/null && command -v git >/dev/null && command -v jq >/dev/null || {
+    printf 'SKIP: native recovery integration requires Python 3, Go, Git and jq\n' >&2
     exit 77
 }
 python3 -I - "$ROOT" <<'PY'
@@ -25,7 +25,8 @@ import uuid
 import zipfile
 
 root = Path(sys.argv[1])
-module = root / 'src/release_recover_native.sh'
+module = Path(os.environ.get('DSR_NATIVE_RECOVERY_TEST_MODULE', str(root / 'src/release_recover_native.sh')))
+source_inputs_only = os.environ.get('DSR_RECOVERY_SOURCE_INPUTS_ONLY') == '1'
 work = Path(tempfile.mkdtemp(prefix='dsr-native-recovery-')).resolve(strict=True)
 print('Evidence directory: ' + str(work), flush=True)
 source, assets, states = work / 'source', work / 'artifacts', work / 'states'
@@ -74,6 +75,8 @@ platforms = ['linux/amd64', 'linux/arm64', 'darwin/amd64', 'darwin/arm64',
              'windows/amd64', 'windows/arm64', 'windows/386']
 native_platform = '/'.join(run(['go', 'env', 'GOHOSTOS', 'GOHOSTARCH']).decode().split())
 assert native_platform in platforms, 'No runnable fixture for host: ' + native_platform
+if source_inputs_only:
+    platforms = [native_platform, next(p for p in platforms if p != native_platform)]
 
 
 def native_output(release_root, release_manifest):
@@ -92,7 +95,7 @@ environment.update(CGO_ENABLED='0', GOENV='off', GOTOOLCHAIN='local', GOPROXY='o
                    GOSUMDB='off', GO111MODULE='off',
                    GOCACHE=os.environ.get('DSR_RECOVERY_TEST_GOCACHE', str(work / 'go-cache')))
 built_workers = {}
-for platform in [*platforms, 'linux/armv7', 'freebsd/amd64']:
+for platform in (platforms if source_inputs_only else [*platforms, 'linux/armv7', 'freebsd/amd64']):
     operating_system, architecture = platform.split('/')
     directory = assets / platform.replace('/', '-')
     directory.mkdir()
@@ -143,6 +146,147 @@ def invoke(value=None, arguments=None, raw=None, output=None, expected_hash=None
         response = {}
     return result.returncode, response, output, selected_state
 
+
+def snapshot_tree(directory):
+    snapshot = {}
+    for item in [directory, *sorted(directory.rglob('*'))]:
+        info = item.lstat()
+        snapshot[str(item.relative_to(directory))] = (
+            info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns,
+            sha(item.read_bytes()) if item.is_file() and not item.is_symlink() else None)
+    return snapshot
+
+
+def source_input_cases():
+    # Generate the binding from the actual source bytes/Git context with the
+    # production inventory helper. Only the completed-worker envelope is a
+    # fixture, just as in the rest of this real-executable recovery suite.
+    projection = work / 'source-projection'
+    projection.mkdir()
+    shutil.copytree(source, projection / 'source', ignore=shutil.ignore_patterns('.git'))
+    context = json.loads(run(['bash', '-c',
+        'source "$1/src/git_ops.sh" || exit; git_ops_export_build_context "$2" "$3"',
+        '_', str(root), str(source), str(work / 'source-context')]))
+    contexts = encoded([dict(relative_path='source', context=context)]).decode()
+    inputs = json.loads(run(['bash', '-c',
+        'source "$1/src/act_runner.sh" || exit; _act_ordinary_source_inputs "$2" "$3"',
+        '_', str(root), str(projection), contexts]))
+    bound = copy.deepcopy(state)
+    bound['context']['source_sync'] = dict(staged_ordinary=True, source_inputs=inputs)
+    for saved in bound['target_statuses'].values():
+        saved['result']['source_sync'] = dict(status='success', source_inputs=copy.deepcopy(inputs))
+    before_assets = snapshot_tree(assets)
+    status, response, destination, original_state = invoke(bound)
+    check('matching original source bindings admit the complete native release',
+          status == 0 and response.get('source_inputs') == inputs)
+    if status:
+        print((work / ('run-%d.stderr' % counter)).read_text(), file=sys.stderr)
+        return
+    release = destination / 'release'
+    manifest = json.loads((release / 'build-manifest.json').read_bytes())
+    check('recovered manifest retains the original producer source-input summary',
+          manifest['recovery_evidence'].get('source_inputs') == inputs)
+    check('retained source binding does not claim fresh or strict source authentication',
+          manifest['recovery_evidence']['source_verification'] == 'tag-identity-only' and
+          response.get('strict_source_verified') is False and response.get('dependency_pins_verified') is False)
+    check('bound recovery retains every original checkpoint and executable byte',
+          (release / 'inputs/state.json').read_bytes() == original_state.read_bytes() == encoded(bound) and
+          snapshot_tree(assets) == before_assets)
+    check('bound recovered host executable still runs', native_output(release, manifest) == native_platform)
+    before_output = snapshot_tree(destination)
+    status, repeated, _, _ = invoke(bound, output=destination, arguments=['--resume'])
+    check('bound completed resume preserves original evidence and output identities',
+          status == 0 and repeated == response and snapshot_tree(destination) == before_output)
+    status, planned, _, _ = invoke(bound, output=destination, arguments=['--resume', '--dry-run'])
+    check('bound completed dry-run preserves evidence and reports original binding',
+          status == 0 and planned.get('source_inputs') == inputs and snapshot_tree(destination) == before_output)
+    status, planned, planned_path, _ = invoke(bound, arguments=['--dry-run'])
+    check('fresh bound dry-run validates the complete binding without output',
+          status == 0 and planned.get('source_inputs') == inputs and not planned_path.exists())
+    status, legacy, legacy_path, _ = invoke(arguments=['--dry-run'])
+    check('explicit legacy tag-only recovery remains distinguishable and supported',
+          status == 0 and 'source_inputs' not in legacy and not legacy_path.exists())
+
+    other = platforms[-1]
+    invalid = []
+
+    def changed(label, mutation):
+        candidate = copy.deepcopy(bound)
+        mutation(candidate)
+        invalid.append((label, candidate))
+
+    def receipt(candidate, target=other):
+        return candidate['target_statuses'][target]['result']['source_sync']
+
+    changed('one worker built from different selected source bytes',
+            lambda s: receipt(s)['source_inputs'].update(sha256='0' * 64))
+    changed('one worker drops its source receipt',
+            lambda s: s['target_statuses'][other]['result'].pop('source_sync'))
+    changed('one worker drops only its source binding', lambda s: receipt(s).pop('source_inputs'))
+    changed('a checkpoint cannot discard worker source evidence', lambda s: s['context'].pop('source_sync'))
+    changed('old staged checkpoints cannot invent missing source bindings',
+            lambda s: s['context']['source_sync'].pop('source_inputs'))
+    changed('an unstaged checkpoint cannot downgrade bound workers',
+            lambda s: s['context']['source_sync'].update(staged_ordinary=False))
+    changed('a worker cannot contradict staged source provenance',
+            lambda s: receipt(s).update(staged_ordinary=False))
+    changed('numeric staging flags are not booleans',
+            lambda s: s['context']['source_sync'].update(staged_ordinary=1))
+    changed('null worker bindings do not select legacy admission',
+            lambda s: receipt(s).update(source_inputs=None))
+    changed('null checkpoint bindings do not select legacy admission',
+            lambda s: s['context']['source_sync'].update(source_inputs=None))
+    changed('unknown source-input fields are refused',
+            lambda s: receipt(s)['source_inputs'].update(unbound=True))
+    changed('boolean worker schema versions cannot equal integer versions',
+            lambda s: receipt(s)['source_inputs'].update(schema_version=True))
+    changed('floating-point worker schema versions cannot equal integer versions',
+            lambda s: receipt(s)['source_inputs'].update(schema_version=1.0))
+    changed('floating-point worker byte counts cannot equal integer counts',
+            lambda s: receipt(s)['source_inputs'].update(bytes=float(inputs['bytes'])))
+    changed('boolean worker counts cannot equal integer counts',
+            lambda s: receipt(s)['source_inputs'].update(directories=True))
+    changed('checkpoint source-input types are independently validated',
+            lambda s: s['context']['source_sync']['source_inputs'].update(schema_version=True))
+    changed('source roots cannot escape the selected namespace',
+            lambda s: receipt(s)['source_inputs'].update(roots=['../foreign', 'source']))
+    changed('different worker input inventories cannot share a release',
+            lambda s: receipt(s)['source_inputs'].update(files=inputs['files'] + 1))
+    for label, candidate in invalid:
+        for flags in ([], ['--dry-run']):
+            status, value, rejected, saved_state = invoke(candidate, arguments=flags)
+            check(label + (' (dry-run)' if flags else ''),
+                  status == 4 and value.get('status') == 'error' and
+                  'source' in value.get('error', '') and not rejected.exists() and
+                  saved_state.read_bytes() == encoded(candidate))
+    check('all source-binding refusals preserve original executable identities',
+          snapshot_tree(assets) == before_assets)
+
+    # Even a self-consistent edited manifest/result pair cannot erase the
+    # binding selected from the original checkpoint on completed resume.
+    manifest_path, result_path = release / 'build-manifest.json', release / 'result.json'
+    manifest_bytes, result_bytes = manifest_path.read_bytes(), result_path.read_bytes()
+    stripped = json.loads(manifest_bytes)
+    stripped['recovery_evidence'].pop('source_inputs', None)
+    manifest_path.write_bytes(encoded(stripped))
+    stripped_result = json.loads(result_bytes)
+    stripped_result.pop('source_inputs', None)
+    stripped_result['manifest_sha256'] = sha(manifest_path.read_bytes())
+    result_path.write_bytes(encoded(stripped_result))
+    tampered = snapshot_tree(destination)
+    status, value, _, _ = invoke(bound, output=destination, arguments=['--resume'])
+    check('completed resume cannot erase the original source binding',
+          status != 0 and value.get('status') == 'error' and snapshot_tree(destination) == tampered)
+    manifest_path.write_bytes(manifest_bytes)
+    result_path.write_bytes(result_bytes)
+
+
+source_input_cases()
+if source_inputs_only:
+    print('Native recovery source inputs: %d passed, %d failed; evidence: %s' % (passed, failed, work), flush=True)
+    raise SystemExit(1 if failed else 0)
+
 status, response, output, selected_state = invoke()
 check('seven completed native targets recover after failed coordinator packaging', status == 0 and response.get('recovered_targets') == 7)
 if status:
@@ -174,17 +318,6 @@ check('build time comes from completed checkpoints, not the recovery clock',
 status, response, planned, _ = invoke(arguments=['--dry-run'])
 check('dry-run validates every target without creating output', status == 0 and response.get('status') == 'planned' and
       len(response.get('artifacts', [])) == 7 and not planned.exists())
-
-
-def snapshot_tree(directory):
-    snapshot = {}
-    for item in [directory, *sorted(directory.rglob('*'))]:
-        info = item.lstat()
-        snapshot[str(item.relative_to(directory))] = (
-            info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size,
-            info.st_mtime_ns, info.st_ctime_ns,
-            sha(item.read_bytes()) if item.is_file() and not item.is_symlink() else None)
-    return snapshot
 
 
 first_result = json.loads((release / 'result.json').read_bytes())

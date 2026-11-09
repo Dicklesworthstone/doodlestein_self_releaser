@@ -127,6 +127,26 @@ used that source. It does not assert pinned dependencies or strict source/toolch
 authentication. The entire selected state is retained; no cryptographic signer or
 SLSA build level is implied. Strict builds must use their original strict path.
 
+When the checkpoint or any completed worker carries ordinary staged-source
+evidence, recovery requires the checkpoint's original `source_inputs` summary
+and an exactly matching, independently type-checked summary in every worker.
+Different fingerprints, missing worker bindings, malformed summaries, and
+attempts to discard the checkpoint's staging flag refuse the whole import
+before output is created. The same admission applies to fresh and resumed
+recovery, including dry runs. This prevents independently completed targets
+from different selected source inputs from becoming one recovered release.
+
+The admitted summary is preserved as `recovery_evidence.source_inputs` in the
+manifest and as `source_inputs` in the result or dry-run report. This checks
+consistency of the retained checkpoint and worker evidence; it does not rehash
+the current working tree or authenticate a strict source snapshot. The existing
+`source_verification: "tag-identity-only"` and `strict_source_verified: false`
+qualifications still apply. Historical states with no staged-source assertion
+or source-input summary anywhere retain their explicit legacy tag-only behavior
+and output format. Old staged states without their original summary are refused.
+If a previous recovery omitted an available binding, recover into a new output
+directory; `--resume` does not rewrite that older manifest to add evidence.
+
 The returned manifest and artifact root are inputs to the existing
 `src/release_packaging.sh` pipeline: a recipe can consume each raw asset as an
 archive member named `demo`/`demo.exe`, or rename a raw output to a project's

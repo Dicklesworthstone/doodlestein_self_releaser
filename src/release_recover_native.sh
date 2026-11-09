@@ -435,6 +435,45 @@ def timestamp(value):
     return value
 
 
+def valid_source_inputs(value):
+    # Mirror the producer's bounded ordinary-source-v1 summary. Validate each
+    # receipt independently: Python equality alone conflates True/1 and 1.0/1.
+    fields = {"schema_version", "policy", "sha256", "roots", "files", "directories", "symlinks", "bytes"}
+    return (isinstance(value, dict) and set(value) == fields and
+            type(value["schema_version"]) is int and value["schema_version"] == 1 and
+            value["policy"] == "ordinary-source-v1" and match(value["sha256"], r"[0-9a-f]{64}") and
+            all(type(value[k]) is int and 0 <= value[k] <= 9007199254740991
+                for k in ("files", "directories", "symlinks", "bytes")) and
+            isinstance(value["roots"], list) and value["roots"] and
+            all(match(root, r"[A-Za-z0-9][A-Za-z0-9._+-]*") and ".." not in root
+                for root in value["roots"]) and
+            "source" in value["roots"] and value["roots"] == sorted(set(value["roots"])))
+
+
+def source_input_binding(checkpoint_receipt, worker_receipts):
+    asserted = False
+    for receipt in [checkpoint_receipt, *worker_receipts]:
+        need(receipt is None or isinstance(receipt, dict), "invalid retained source-sync receipt", 4)
+        if receipt is not None:
+            need("staged_ordinary" not in receipt or type(receipt["staged_ordinary"]) is bool,
+                 "invalid retained ordinary source staging flag", 4)
+            asserted |= receipt.get("staged_ordinary", False) or "source_inputs" in receipt
+    if not asserted:
+        # Historical imports remain explicitly tag-only. Evidence on even one
+        # worker cannot be dropped to enter this legacy path.
+        return None
+    need(isinstance(checkpoint_receipt, dict) and checkpoint_receipt.get("staged_ordinary") is True and
+         valid_source_inputs(checkpoint_receipt.get("source_inputs")),
+         "staged native recovery requires the original checkpoint source-input binding", 4)
+    expected = checkpoint_receipt["source_inputs"]
+    for receipt in worker_receipts:
+        need(isinstance(receipt, dict) and
+             ("staged_ordinary" not in receipt or receipt["staged_ordinary"] is True) and
+             valid_source_inputs(receipt.get("source_inputs")) and receipt["source_inputs"] == expected,
+             "native workers do not retain the same original source-input binding", 4)
+    return expected
+
+
 def select_workers(state):
     need(isinstance(state, dict) and match(state.get("tool"), r"[a-z][a-z0-9_-]*") and
          state.get("version") in (args.tag, args.tag[1:]) and state.get("git_sha") == args.sha and
@@ -468,7 +507,7 @@ def select_workers(state):
         need(len(variants) == 1 or all(t["target_triple"] and
              t["key"] == platform + "@" + t["target_triple"] for t in variants),
              "same-platform variants require explicit compiler task identities", 4)
-    selected, names, originals = [], {}, {}
+    selected, names, originals, source_receipts = [], {}, {}, []
     for task in sorted(tasks, key=lambda t: t["key"]):
         saved = statuses[task["key"]]
         result = saved["result"]
@@ -479,6 +518,7 @@ def select_workers(state):
              result.get("task_key") == task["key"] and result.get("build_purpose") == "release" and
              result.get("publishable") is True and result.get("tool") == state["tool"],
              "every requested native worker must have completed successfully", 4)
+        source_receipts.append(result.get("source_sync"))
         need(isinstance(result.get("host"), str) and result["host"] and saved.get("host") == result["host"],
              "worker host is not bound to completed state", 4)
         bound = context.get("target_hosts", {}).get(task["platform"])
@@ -546,7 +586,7 @@ def select_workers(state):
             names[published.casefold()] = descriptor
             selected.append(dict(task=task, result=result, receipt=receipt, path=original, name=published,
                                  completed_at=completed_at, format=format_name, role=role))
-    return selected
+    return selected, source_input_binding(context.get("source_sync"), source_receipts)
 
 
 def check_artifact(worker, destination=None):
@@ -806,7 +846,7 @@ try:
     state_bytes, state_hash, state_info = read_file(state_path)
     need(state_hash == args.state_sha256, "state does not match the independently selected SHA-256")
     state = document(state_bytes)
-    workers = select_workers(state)
+    workers, source_inputs = select_workers(state)
     reuse = existing and (root / "release").exists()
     managed = not existing or (root / "plan.json").exists()
     pending = root / ".partial" if managed else None
@@ -857,6 +897,8 @@ try:
                 task_keys=sorted({v["task"]["key"] for v in workers if v["name"] == w["name"]}),
                 sha256=w["receipt"]["sha256"], archive_format=w["format"])
                 for w in sorted(output_workers.values(), key=lambda row: row["name"])])
+    if source_inputs is not None:
+        planned["source_inputs"] = source_inputs
     # Build the complete expected documents independently of retained output.
     # A partial checkpoint may contribute only its historical observation time.
     artifacts, environments, mapping, artifact_names = [], {}, [], set()
@@ -900,12 +942,18 @@ try:
             built_at_basis="latest-completed-target-checkpoint",
             recovered_at=recovered_at,
             original_status=state["status"], artifacts=mapping))
+    if source_inputs is not None:
+        # Preserve producer evidence without claiming that recovery observed
+        # those working-tree bytes or performed a strict source attestation.
+        manifest["recovery_evidence"]["source_inputs"] = source_inputs
     manifest_bytes = canonical(manifest)
     result = dict(kind="dsr-native-recovery", status="verified", exit_code=0,
         manifest=str(root / "release/build-manifest.json"), manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
         artifacts_dir=str(root / "release/artifacts"), state_sha256=state_hash, recovered_targets=task_count,
         recovered_artifacts=len(artifacts), companion_artifacts=sum(a["target"] == "additional" for a in artifacts),
         strict_source_verified=False, dependency_pins_verified=False)
+    if source_inputs is not None:
+        result["source_inputs"] = source_inputs
     result_bytes = canonical(result)
     expected_documents = {stage / "inputs/state.json": state_bytes,
                           stage / "build-manifest.json": manifest_bytes, stage / "result.json": result_bytes}
