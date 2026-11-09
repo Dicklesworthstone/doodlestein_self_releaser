@@ -408,7 +408,9 @@ _dp_outbox_identity() {
 _dp_state_valid() {
     local file="$1" plan="$2"
     [[ -f "$file" && ! -L "$file" ]] || return 2
-    jq -e -s --argjson plan "$plan" '
+    jq -e -s --slurpfile plans /dev/fd/4 '
+        (if ($plans | length) == 1 then $plans[0]
+         else error("Expected one dispatch plan") end) as $plan |
         def integer: type=="number" and .>=0 and .==floor;
         def receipt($r; $t):
             type=="object" and .repo==$r.repo and .event_type==($r.body|fromjson|.event_type) and
@@ -442,7 +444,7 @@ _dp_state_valid() {
                         $t.resend_uncertain==($previous.outcome=="uncertain" or $previous.outcome=="sending") end) and
                     (if $t.outcome=="sending" then $t.receipt==null
                      else ($t.receipt|receipt($r;$t)) end))))
-    ' "$file" >/dev/null 2>&1
+    ' "$file" 4<<< "$plan" >/dev/null 2>&1
 }
 
 # The advisory lock serializes cooperating senders. The hash also rejects
@@ -464,13 +466,14 @@ _dp_state_write() {
 
 _dp_outbox_summary() {
     local state="$1" file="$2" rc="$3"
-    jq -nc --argjson s "$state" --arg file "$file" --argjson rc "$rc" '
+    jq -cs --arg file "$file" --argjson rc "$rc" '
+        (if length == 1 then .[0] else error("Expected one dispatch state") end) as $s |
         {status:(if $rc==0 then "accepted" else "incomplete" end),exit_code:$rc,
          outbox_file:$file,run_id:$s.plan.payload.run_id,source_repo:$s.plan.source_repo,
          results:[$s.deliveries[] | (.history[-1] // {}) as $last |
             {repo,delivery_id,invocations:(.history|length),
              outcome:(if $last.outcome=="sending" then "uncertain" else ($last.outcome // "pending") end),
-             receipt:($last.receipt // null)}]}'
+             receipt:($last.receipt // null)}]}' <<< "$state"
 }
 
 _dp_release_outbox() (
@@ -510,9 +513,10 @@ _dp_release_outbox() (
             return 2
         fi
         [[ "$inspect" != true ]] || return 4
-        state=$(jq -Scn --argjson plan "$plan" \
-            '{schema_version:1,kind:"dsr-dispatch-outbox",plan:$plan,
-              deliveries:[$plan.requests[]|{repo,delivery_id,history:[]}] }') || return 1
+        state=$(jq -Scs '
+            (if length == 1 then .[0] else error("Expected one dispatch plan") end) as $plan |
+            {schema_version:1,kind:"dsr-dispatch-outbox",plan:$plan,
+             deliveries:[$plan.requests[]|{repo,delivery_id,history:[]}] }' <<< "$plan") || return 1
         oldhash=$(_dp_state_write "$file" "$state" absent "$work" "$plan") || return $?
     else
         _dp_state_valid "$file" "$plan" || { _dp_log_error "Invalid or conflicting outbox plan: $file"; return 2; }
@@ -673,10 +677,11 @@ dispatch_release_json() (
         error=$(head -c 4096 "$work/diagnostics") || return 1
         [[ -n "$error" ]] || error="Dispatch failed (exit $rc)"
     fi
-    jq -nc --argjson details "$result" --argjson rc "$rc" --argjson duration "$((SECONDS-start))" \
+    jq -cs --argjson rc "$rc" --argjson duration "$((SECONDS-start))" \
         --arg error "$error" \
-        '{status:(if $rc==0 then "success" else "error" end),exit_code:$rc,details:$details,
-          error:(if $error=="" then null else $error end),duration_seconds:$duration}' || return 1
+        '(if length == 1 then .[0] else error("Expected one dispatch result") end) as $details |
+         {status:(if $rc==0 then "success" else "error" end),exit_code:$rc,details:$details,
+          error:(if $error=="" then null else $error end),duration_seconds:$duration}' <<< "$result" || return 1
     return "$rc"
 )
 

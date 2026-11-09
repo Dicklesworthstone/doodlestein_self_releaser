@@ -5706,8 +5706,10 @@ _dispatch_send_all() {
     local _DSR_DISPATCH_BINDING
     _DSR_DISPATCH_BINDING=$(_dispatch_release_binding "$source_repo" "$release_id" \
         "$tag" "$git_sha" "$release_url" "$expected_assets") || return $?
-    plan=$(jq -Sc --argjson binding "$_DSR_DISPATCH_BINDING" \
-        '. + {release_binding:$binding}' <<< "$plan") || return 1
+    plan=$(jq -Sc --slurpfile binding /dev/fd/3 '
+        if ($binding | length) == 1 then . + {release_binding:$binding[0]}
+        else error("Expected one release binding") end
+    ' 3<<< "$_DSR_DISPATCH_BINDING" <<< "$plan") || return 1
     _dp_release_outbox "$plan" \
         "${DISPATCH_STATE_DIR:-${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/dispatch}" \
         "$retry_uncertain" false _dispatch_public_guard
@@ -9422,13 +9424,13 @@ EOF
                 --slurpfile artifacts /dev/fd/3 \
                 --slurpfile extra /dev/fd/4 \
                 --argjson strict "$release_contract_enabled" \
-                --argjson installer "$installer_report" \
-                --argjson sbom "$ordinary_sbom_report" \
+                --slurpfile reports /dev/fd/6 \
                 --slurpfile contract_assets /dev/fd/5 \
                 'if ($artifacts | length) == 1 and ($extra | length) == 1 and
-                    ($contract_assets | length) == 1 then
+                    ($contract_assets | length) == 1 and ($reports | length) == 2 then
                  $artifacts[0] as $artifacts | $extra[0] as $extra |
                  $contract_assets[0] as $contract_assets |
+                 $reports[0] as $installer | $reports[1] as $sbom |
                  {tool: $tool, version: $version, tag: $version, repo: $repo,
                   artifacts_dir: $artifacts_dir, draft: $draft, prerelease: $prerelease,
                   promotion_requested: $promotion_requested,
@@ -9441,7 +9443,8 @@ EOF
                 3<<< "$plan_artifacts_json" 4<<< "$plan_extra_json" \
                 5< <(if $release_contract_enabled; then
                     jq -c '[.assets[].name]' <<< "$release_contract_plan"
-                else printf '[]\n'; fi))"
+                else printf '[]\n'; fi) \
+                6< <(printf '%s\n' "$installer_report" "$ordinary_sbom_report"))"
         fi
         return 0
     fi
@@ -10542,24 +10545,31 @@ EOF
             # Include every frozen metadata sidecar, even if it disappeared
             # before the upload list was collected. Payload-only verification
             # cannot make a new release safe for checksum/signature consumers.
-            jq -en --argjson records "$records" --argjson plan "$ordinary_plan" \
-                '($records | map({name,size_bytes,sha256})) == $plan' >/dev/null || return 1
+            # Release matrices and raw GitHub pages can exceed the operating
+            # system's per-argument limit. Keep complete evidence on streams.
+            printf '%s\n%s\n' "$records" "$ordinary_plan" | jq -es '
+                length == 2 and (.[0] | map({name,size_bytes,sha256})) == .[1]
+            ' >/dev/null || return 1
             observed=$(gh_api "repos/$repo/releases/$release_id" --no-cache) || return 1
             _release_ordinary_metadata_matches "$observed" "$expected_draft" || return 1
             for ((page=1; page<=100; page++)); do
                 page_json=$(gh_api "repos/$repo/releases/$release_id/assets?per_page=100&page=$page" --no-cache) || return 1
                 jq -es 'length == 1 and (.[0] | type == "array" and length <= 100 and
                     all(.[]; type == "object"))' <<< "$page_json" >/dev/null || return 1
-                inventory=$(jq -nc --argjson previous "$inventory" --argjson page "$page_json" '$previous + $page') || return 1
+                inventory=$(printf '%s\n%s\n' "$inventory" "$page_json" | jq -sc '
+                    if length == 2 and all(.[]; type == "array") then .[0] + .[1]
+                    else error("Expected two release asset arrays") end
+                ') || return 1
                 count=$(jq 'length' <<< "$page_json") || return 1
                 [[ $count -eq 100 ]] || break
             done
             [[ $page -le 100 ]] || return 1
             # A complete ID-bound collection read catches unexpected assets,
             # duplicate names and replaced IDs, including assets on later pages.
-            jq -en --argjson inventory "$inventory" --argjson records "$records" '
-                ($inventory | map({name,size_bytes:.size,remote_id:.id}) | sort_by(.name)) ==
-                ($records | map({name,size_bytes,remote_id}))
+            printf '%s\n%s\n' "$inventory" "$records" | jq -es '
+                length == 2 and
+                (.[0] | map({name,size_bytes:.size,remote_id:.id}) | sort_by(.name)) ==
+                (.[1] | map({name,size_bytes,remote_id}))
             ' >/dev/null || return 1
             for record in "${uploaded_assets[@]}"; do
                 _release_recheck_uploaded "$record" || return 1
@@ -10842,11 +10852,11 @@ EOF
             --arg dispatch_repos "$dispatch_repos" \
             --argjson dispatch_exit "$dispatch_exit" \
             --arg dispatch_outbox "$dispatch_outbox" \
-            --argjson dispatch_results "$dispatch_results_json" \
-            --argjson installer_check "$installer_report" \
-            --argjson sbom "$ordinary_sbom_report" \
+            --slurpfile reports /dev/fd/5 \
             --argjson completed "$([[ $exit_code -eq 0 ]] && ! $draft && echo true || echo false)" \
-            '{
+            '($reports | if length == 3 then . else error("Expected three release reports") end) as $reports |
+            $reports[0] as $dispatch_results | $reports[1] as $installer_check | $reports[2] as $sbom |
+            {
                 repo: $repo,
                 version: $version,
                 tag: $tag,
@@ -10882,7 +10892,8 @@ EOF
             } + (if $custody_error == "" then {} else
                 {stage:"build_custody",error:$custody_error} end)' \
             3< <(printf '%s\n' "${uploaded_assets[@]}") \
-            4< <(printf '%s\n' "${failed_assets[@]}"))
+            4< <(printf '%s\n' "${failed_assets[@]}") \
+            5< <(printf '%s\n' "$dispatch_results_json" "$installer_report" "$ordinary_sbom_report")) || return 4
         json_envelope "release" "$status" "$exit_code" "$details"
     else
         echo ""
@@ -10955,7 +10966,10 @@ _dispatch_inventory() {
                     (.size | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
                     (.digest == null or (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$")))))
         ' <<< "$page_json" >/dev/null || return 7
-        inventory=$(jq -nc --argjson previous "$inventory" --argjson page "$page_json" '$previous + $page') || return 7
+        inventory=$(printf '%s\n%s\n' "$inventory" "$page_json" | jq -sc '
+            if length == 2 and all(.[]; type == "array") then .[0] + .[1]
+            else error("Expected two release asset arrays") end
+        ') || return 7
         count=$(jq 'length' <<< "$page_json") || return 7
         ((count == 100)) || break
     done
@@ -10977,19 +10991,19 @@ _dispatch_release_binding() {
         umask 077
         local dispatch_repo="$1" dispatch_id="$2" dispatch_tag="$3" dispatch_sha="$4"
         local dispatch_url="$5" binding_expected_assets="$6" metadata inventory after_metadata after_inventory
-        local binding record asset work='' asset_dir='' name size sha remote_sha
+        local binding asset work='' asset_dir='' name size sha remote_sha
         dispatch_repo=$(_dp_repo "$dispatch_repo") || return 4
         [[ "$dispatch_id" =~ ^[1-9][0-9]{0,15}$ && -n "$dispatch_tag" &&
            "$dispatch_tag" != *[[:cntrl:]]* && "$dispatch_sha" =~ ^[0-9a-f]{40}$ ]] || return 4
-        jq -en --arg id "$dispatch_id" --argjson expected "$binding_expected_assets" '
+        jq -es --arg id "$dispatch_id" '
             def identifier: type == "number" and floor == . and . > 0 and . <= 9007199254740991;
-            ($id | tonumber | identifier) and ($expected | type == "array" and length > 0 and
+            length == 1 and ($id | tonumber | identifier) and (.[0] | type == "array" and length > 0 and
                 ([.[].name] | unique | length) == length and
                 all(.[]; type == "object" and (.name | type == "string" and length > 0 and (test("[[:cntrl:]]") | not)) and
                     (.size_bytes | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
                     (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
                     (.remote_id == null or (.remote_id | identifier))))
-        ' >/dev/null || return 4
+        ' <<< "$binding_expected_assets" >/dev/null || return 4
         metadata=$(gh_api "repos/$dispatch_repo/releases/$dispatch_id" --no-cache) || return 7
         jq -es --argjson id "$dispatch_id" --arg repo "$dispatch_repo" --arg tag "$dispatch_tag" --arg url "$dispatch_url" '
             length == 1 and (.[0] | type == "object" and .id == $id and .tag_name == $tag and
@@ -11001,8 +11015,9 @@ _dispatch_release_binding() {
         remote_sha=$(gh_resolve_tag_sha "$dispatch_repo" "$dispatch_tag") || return 7
         [[ "$remote_sha" == "$dispatch_sha" ]] || { log_error "Release tag changed before dispatch"; return 7; }
         inventory=$(_dispatch_inventory "$dispatch_repo" "$dispatch_id") || return 7
-        if ! jq -en --argjson expected "$binding_expected_assets" --argjson actual "$inventory" '
-            ($expected | sort_by(.name)) as $e | ($actual | sort_by(.name)) as $a |
+        if ! printf '%s\n%s\n' "$binding_expected_assets" "$inventory" | jq -es '
+            if length == 2 then . else error("Expected planned and observed asset arrays") end |
+            (.[0] | sort_by(.name)) as $e | (.[1] | sort_by(.name)) as $a |
             ($e | length) == ($a | length) and all($e | to_entries[];
                 .key as $i | .value as $record |
                 $a[$i].name == $record.name and $a[$i].size == $record.size_bytes and
@@ -11013,36 +11028,38 @@ _dispatch_release_binding() {
         fi
         trap '[[ -z "$work" ]] || rm -rf -- "$work"' EXIT
         trap 'exit 5' HUP INT TERM
-        while IFS= read -r record; do
-            name=$(jq -r '.name' <<< "$record") || return 7
-            size=$(jq -r '.size_bytes' <<< "$record") || return 7
-            sha=$(jq -r '.sha256' <<< "$record") || return 7
-            asset=$(jq -c --arg name "$name" '.[] | select(.name == $name)' <<< "$inventory") || return 7
-            if jq -e '.digest == null' <<< "$asset" >/dev/null; then
-                [[ -n "$work" ]] || work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-dispatch-assets.XXXXXXXX") || return 1
-                asset_dir="$work/$(jq -r '.id' <<< "$asset")"
-                mkdir "$asset_dir" || return 1
-                _gh_verify_uploaded_asset "$dispatch_repo" "$name" "$size" "$sha" "$asset" "$asset_dir" >/dev/null || return 7
-            fi
-        done < <(jq -c '.[]' <<< "$binding_expected_assets")
+        # The complete comparison above authenticates supplied API digests.
+        # Only legacy digest-less rows need individual downloads; avoid a
+        # process and whole-inventory scan per modern asset on large releases.
+        while IFS= read -r asset; do
+            name=$(jq -r '.name' <<< "$asset") || return 7
+            size=$(jq -r '.size' <<< "$asset") || return 7
+            sha=$(jq -r --arg name "$name" '.[] | select(.name == $name) | .sha256' \
+                <<< "$binding_expected_assets") || return 7
+            [[ -n "$work" ]] || work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-dispatch-assets.XXXXXXXX") || return 1
+            asset_dir="$work/$(jq -r '.id' <<< "$asset")"
+            mkdir "$asset_dir" || return 1
+            _gh_verify_uploaded_asset "$dispatch_repo" "$name" "$size" "$sha" "$asset" "$asset_dir" >/dev/null || return 7
+        done < <(jq -c '.[] | select(.digest == null)' <<< "$inventory")
         binding=$(jq -nc --arg tag "$dispatch_tag" --arg sha "$dispatch_sha" --arg url "$dispatch_url" \
-            --slurpfile metadata /dev/fd/3 --argjson assets "$inventory" --argjson expected "$binding_expected_assets" '
-            if ($metadata | length) != 1 then error("invalid release metadata") else
-            $metadata[0] as $metadata |
+            --slurpfile metadata /dev/fd/3 --slurpfile assets /dev/fd/4 --slurpfile expected /dev/fd/5 '
+            if ([$metadata,$assets,$expected] | all(.[]; length == 1)) then
+            $metadata[0] as $metadata | $assets[0] as $assets |
+            ($expected[0] | map({key:.name,value:.sha256}) | from_entries) as $hashes |
             {tag:$tag,sha:$sha,release_url:$url,prerelease:$metadata.prerelease,
-             assets:[$assets[] | . as $asset | . + {sha256:($expected[] | select(.name == $asset.name) | .sha256)}]}
-            end
-        ' 3<<< "$metadata") || return 7
+             assets:[$assets[] | . + {sha256:$hashes[.name]}]}
+            else error("Expected release metadata and asset inventories") end
+        ' 3<<< "$metadata" 4<<< "$inventory" 5<<< "$binding_expected_assets") || return 7
         # Re-observe after any content downloads; otherwise a replacement on
         # a later page could hide behind an earlier matching asset receipt.
         after_inventory=$(_dispatch_inventory "$dispatch_repo" "$dispatch_id") || return 7
         after_metadata=$(gh_api "repos/$dispatch_repo/releases/$dispatch_id" --no-cache) || return 7
         jq -en --slurpfile before /dev/fd/3 --slurpfile after /dev/fd/4 \
-            --argjson assets "$inventory" --argjson current "$after_inventory" '
+            --slurpfile assets /dev/fd/5 --slurpfile current /dev/fd/6 '
             def identity: {id,tag_name,draft,prerelease,html_url};
-            ([$before,$after] | all(.[]; length == 1)) and
+            ([$before,$after,$assets,$current] | all(.[]; length == 1)) and
             ($before[0] | identity) == ($after[0] | identity) and $assets == $current
-        ' 3<<< "$metadata" 4<<< "$after_metadata" >/dev/null || return 7
+        ' 3<<< "$metadata" 4<<< "$after_metadata" 5<<< "$inventory" 6<<< "$after_inventory" >/dev/null || return 7
         remote_sha=$(gh_resolve_tag_sha "$dispatch_repo" "$dispatch_tag") || return 7
         [[ "$remote_sha" == "$dispatch_sha" ]] || return 7
         printf '%s\n' "$binding"
@@ -11060,8 +11077,8 @@ _dispatch_public_guard() {
     dispatch_current=$(_dispatch_release_binding "$_DSR_DISPATCH_SOURCE_REPO" "$_DSR_DISPATCH_RELEASE_ID" \
         "$(jq -r '.tag' <<< "$_DSR_DISPATCH_BINDING")" "$(jq -r '.sha' <<< "$_DSR_DISPATCH_BINDING")" \
         "$(jq -r '.release_url' <<< "$_DSR_DISPATCH_BINDING")" "$dispatch_expected") || return $?
-    jq -en --argjson frozen "$_DSR_DISPATCH_BINDING" --argjson current "$dispatch_current" \
-        '$frozen == $current' >/dev/null || { log_error "Public release changed during dispatch"; return 7; }
+    printf '%s\n%s\n' "$_DSR_DISPATCH_BINDING" "$dispatch_current" | jq -es \
+        'length == 2 and .[0] == .[1]' >/dev/null || { log_error "Public release changed during dispatch"; return 7; }
 }
 
 # Recovery treats the saved requests as immutable input, not an opportunity to
@@ -11102,11 +11119,12 @@ _dispatch_saved_plan() {
     source=$(_dp_repo "$(jq -r '.source_repo' <<< "$plan")") || return 2
     [[ "$source" == "$(jq -r '.source_repo' <<< "$plan")" ]] || return 2
     selected=$(_dp_repos "$(jq -r '.requests | map(.repo) | join(",")' <<< "$plan")") || return 2
-    jq -en --arg selected "$selected" --arg source "$source" --argjson plan "$plan" '
+    jq -e --arg selected "$selected" --arg source "$source" '
+        . as $plan |
         ($selected | split("\n")) == ($plan.requests | map(.repo)) and
         ($plan.release_binding.release_url | ascii_downcase | startswith("https://github.com/" + $source + "/releases/")) and
         ([$plan.requests[].body | fromjson | .event_type] | unique | length) == 1
-    ' >/dev/null || return 2
+    ' <<< "$plan" >/dev/null || return 2
     while IFS= read -r row; do
         destination=$(jq -r '.repo' <<< "$row") || return 2
         body=$(jq -r '.body' <<< "$row") || return 2
@@ -11118,12 +11136,13 @@ _dispatch_saved_plan() {
             '{source_repo:$source,repo:$repo,event_type:$event,payload:$payload}') || return 2
         delivery=$(_dp_digest_text "$material") || return 2
         digest=$(_dp_digest_text "$body") || return 2
-        jq -en --argjson row "$row" --argjson plan "$plan" --arg id "$delivery" --arg hash "$digest" '
+        jq -e --argjson row "$row" --arg id "$delivery" --arg hash "$digest" '
+            . as $plan |
             $row.delivery_id == $id and $row.request_sha256 == $hash and
             ($row.body | fromjson) == {event_type:($row.body | fromjson | .event_type),
                 client_payload:($plan.payload + {source_repo:$plan.source_repo,delivery_id:$id})} and
             $row.body == ($row.body | fromjson | tojson)
-        ' >/dev/null || return 2
+        ' <<< "$plan" >/dev/null || return 2
         [[ "$(_dp_body "$event" "$(jq -c '.client_payload' <<< "$body")")" == "$body" ]] || return 2
     done < <(jq -c '.requests[]' <<< "$plan")
     _dp_state_valid "$file" "$plan" || return 2

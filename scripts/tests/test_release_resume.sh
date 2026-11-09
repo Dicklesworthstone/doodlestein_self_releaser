@@ -37,6 +37,9 @@ source <(awk '/^_release_file_size\(\) \{/{copy=1} copy{print} copy && /^\}/{exi
 source <(awk '/^_dispatch_[a-z_]+\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "${DSR_TEST_COMMAND_FILE:-$PROJECT_ROOT/dsr}")
 # shellcheck source=/dev/null
 source <(awk '/^cmd_release_dispatch\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "${DSR_TEST_COMMAND_FILE:-$PROJECT_ROOT/dsr}")
+# Large release results must pass through the actual public envelope as well.
+# shellcheck source=/dev/null
+source <(awk '/^json_envelope\(\) \{/{copy=1} copy{print} copy && /^# ====/{exit}' "${DSR_TEST_COMMAND_FILE:-$PROJECT_ROOT/dsr}")
 
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/dsr-release-resume-tests.XXXXXXXX") || exit 4
 # Retain the isolated fixtures and request logs for failure diagnosis.
@@ -85,10 +88,6 @@ gh_resolve_tag_sha() {
     fi
 }
 upgrade_verify_tool() { printf 'UPGRADE\n' >> "$CALLS"; }
-json_envelope() {
-    jq -nc --arg command "$1" --arg status "$2" --argjson exit_code "$3" \
-        --argjson details "$4" '{command:$command,status:$status,exit_code:$exit_code,details:$details}'
-}
 artifact_naming_generate_dual_for_tool() {
     local arch="$4"
     [[ "${COLLIDE_NAMES:-false}" == true ]] && arch=amd64
@@ -114,7 +113,7 @@ setup() {
       upload_url:"https://uploads.github.com/repos/owner/repo/releases/9/assets{?name,label}",
       html_url:"https://github.com/owner/repo/releases/tag/v1.2.3",assets:[]}' > "$CASE/release.json"
     printf 'real payload\n' > "$CASE/artifacts/payload.bin"
-    export JSON_MODE=true DRY_RUN=false
+    export JSON_MODE=true DRY_RUN=false DSR_VERSION=fixture
     export DSR_GH_TOKEN=fixture-token DSR_RUN_ID=fixture-process
     export DSR_DISPATCH_ENABLED=true DSR_DISPATCH_EVENT=release-ready DSR_DISPATCH_REPOS=owner/downstream
     export DISPATCH_MAX_RETRIES=2 DISPATCH_RETRY_DELAY=0 DISPATCH_MAX_WAIT=0 DISPATCH_TIMEOUT=2
@@ -131,6 +130,7 @@ setup() {
     UPLOAD_DESTINATION_DRIFT=false PUBLISH_DESTINATION_DRIFT=false
     EXTRA_ASSET=false DROP_SIDECAR="" CREATE_INTENT_DRIFT=false
     CONCURRENT_PUBLISH=false STAGED_SOURCE_SHA="" STAGED_REMOTE_MODE=valid
+    API_ASSET_LABEL_SIZE=0 API_INVENTORY_FAIL_PAGE=0
     export DSR_RELEASE_STATE_RETRY_DELAY_SECONDS=0
     export GH_MAX_RETRIES=2 GH_RETRY_DELAY=0
 }
@@ -286,11 +286,15 @@ gh_api() {
         repos/owner/repo/releases/9/assets\?per_page=100\&page=*)
             $INVENTORY_FAIL && return 8
             local page="${endpoint##*page=}"
+            [[ "$page" != "$API_INVENTORY_FAIL_PAGE" ]] || return 8
             if $FINAL_DRIFT && [[ -f "$CASE/post-complete" ]]; then
                 jq 'map(.digest="sha256:"+("0"*64))' "$CASE/inventory.json" > "$CASE/inventory.next"
                 mv "$CASE/inventory.next" "$CASE/inventory.json"
             fi
-            jq --argjson page "$page" '.[(($page-1)*100):($page*100)]' "$CASE/inventory.json"
+            jq --argjson page "$page" --argjson padding "$API_ASSET_LABEL_SIZE" '
+                .[(($page-1)*100):($page*100)] |
+                map(if $padding > 0 then . + {label:("x" * $padding)} else . end)
+            ' "$CASE/inventory.json"
             ;;
         repos/owner/repo/releases/tags/v1.2.3|repos/owner/repo/releases/9)
             if $VISIBILITY_DRIFT && [[ -f "$CASE/post-complete" ]]; then
@@ -1853,6 +1857,134 @@ test_staged_creation_publishes_only_after_private_uploads() {
         [[ $(stat -c %a "$(jq -r '.details.staging_receipt' "$CASE/stdout")") == 600 ]]
 }
 
+# Keep the genuine producer files, checksum generator, creation custody,
+# uploads, final observation and dispatch. Only unused API label metadata is
+# padded to force a single response beyond Linux's 128 KiB argument limit.
+staged_large_inventory_fixture() {
+    setup "$1"
+    CREATE_FAIL=false API_ASSET_LABEL_SIZE=24000
+    printf 'second payload\n' > "$CASE/artifacts/second.bin"
+    printf 'third payload\n' > "$CASE/artifacts/third.bin"
+    staged_manifest payload.bin second.bin third.bin
+}
+
+test_staged_large_inventory_publishes_and_resumes() {
+    staged_large_inventory_fixture staged_large_inventory || return 1
+    run_release
+    [[ $STATUS -eq 0 ]] && grep -Fxq PUBLISH "$CALLS" &&
+        jq -e '.status=="success" and .details.draft==false and .details.success==8 and
+            .details.verification=="ok" and .details.dispatch.status=="completed"' "$CASE/stdout" >/dev/null || return 1
+    gh_api 'repos/owner/repo/releases/9/assets?per_page=100&page=1' > "$CASE/large-page.json" || return 1
+    [[ $(wc -c < "$CASE/large-page.json") -gt 131072 ]] || return 1
+    local outbox
+    outbox=$(jq -r '.details.dispatch.outbox_file' "$CASE/stdout") || return 1
+    cp "$outbox" "$CASE/outbox.before" || return 1
+    : > "$CALLS"
+    run_release --resume
+    [[ $STATUS -eq 0 ]] && ! grep -Eq '^CREATE|^POST |^PUBLISH$|^DISPATCH$' "$CALLS" &&
+        cmp -s "$outbox" "$CASE/outbox.before" &&
+        jq -e '.details.success==8 and .details.draft==false and
+            .details.dispatch.status=="completed"' "$CASE/stdout" >/dev/null
+}
+
+test_staged_large_inventory_drift_restores_draft() {
+    staged_large_inventory_fixture staged_large_inventory_drift || return 1
+    PUBLISH_ASSET_DRIFT=true
+    run_release
+    [[ $STATUS -ne 0 ]] && grep -Fxq PUBLISH "$CALLS" &&
+        grep -Fxq RESTORE-DRAFT "$CALLS" && ! grep -Fxq DISPATCH "$CALLS" &&
+        jq -e '.draft==true' "$CASE/release.json" >/dev/null &&
+        jq -e '.status!="success" and .details.draft==true and
+            .details.verification=="incomplete"' "$CASE/stdout" >/dev/null
+}
+
+# API observations model 800 already verified assets; each published digest
+# names the real fixture payload. This is a GitHub transport fixture, not a
+# claim that 800 real artifacts were uploaded. Both a raw API page and the
+# canonical inventory/retained outbox exceed the single-argument limit.
+large_dispatch_inventory_fixture() {
+    setup "$1"
+    API_ASSET_LABEL_SIZE=1600
+    python3 - "$CASE" <<'PY'
+import hashlib, json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+data = (root / 'artifacts/payload.bin').read_bytes()
+digest = hashlib.sha256(data).hexdigest()
+inventory, expected = [], []
+for index in range(800):
+    name = f'payload-{index:04d}-' + 'component-' * 14 + '.bin'
+    inventory.append(dict(id=1000 + index, name=name, size=len(data), state='uploaded', digest='sha256:' + digest))
+    expected.append(dict(name=name, size_bytes=len(data), sha256=digest, remote_id=1000 + index))
+(root / 'inventory.json').write_text(json.dumps(inventory) + '\n')
+(root / 'expected-assets.json').write_text(json.dumps(expected) + '\n')
+PY
+}
+
+send_large_dispatch_inventory() {
+    local expected
+    expected=$(cat "$CASE/expected-assets.json") || return 1
+    STATUS=0
+    _dispatch_send_all tool 1.2.3 v1.2.3 owner/repo "$(printf '%040d' 1)" \
+        https://github.com/owner/repo/releases/tag/v1.2.3 release-ready owner/a,owner/b 9 false "$expected" \
+        > "$CASE/stdout" 2> "$CASE/stderr" || STATUS=$?
+}
+
+test_release_dispatch_large_inventory_recovers_exact_outbox() {
+    large_dispatch_inventory_fixture dispatch_large_inventory || return 1
+    DISPATCH_MODE=reject
+    send_large_dispatch_inventory
+    [[ $STATUS -eq 1 && $(wc -l < "$CASE/dispatch-calls.jsonl") -eq 2 ]] || return 1
+    local outbox inventory
+    outbox=$(jq -r '.outbox_file' "$CASE/stdout") || return 1
+    [[ -f "$outbox" && $(wc -c < "$outbox") -gt 131072 ]] || return 1
+    jq -e '(.plan.release_binding.assets | length)==800 and
+        .deliveries[0].history[-1].outcome=="accepted" and
+        .deliveries[1].history[-1].outcome=="rejected"' "$outbox" >/dev/null || return 1
+    inventory=$(_dispatch_inventory owner/repo 9) || return 1
+    [[ ${#inventory} -gt 131072 ]] || return 1
+    gh_api 'repos/owner/repo/releases/9/assets?per_page=100&page=1' > "$CASE/large-page.json" || return 1
+    [[ $(wc -c < "$CASE/large-page.json") -gt 131072 ]] || return 1
+    # On retry each API page is small, but the accumulated inventory and
+    # frozen source binding must still survive through every guard/state write.
+    API_ASSET_LABEL_SIZE=0 DISPATCH_MODE=success
+    run_dispatch_recovery --outbox "$outbox"
+    [[ $STATUS -eq 0 ]] &&
+        jq -es 'length==3 and ([.[] | select(.destination=="owner/a")] | length)==1 and
+            ([.[] | select(.destination=="owner/b")] | length)==2' "$CASE/dispatch-calls.jsonl" >/dev/null &&
+        jq -e '.details.status=="accepted" and (.details.results|length)==2 and
+            all(.details.results[]; .outcome=="accepted")' "$CASE/stdout" >/dev/null || return 1
+    cp "$outbox" "$CASE/outbox.before" || return 1
+    : > "$CALLS"
+    INVENTORY_FAIL=true
+    run_dispatch_recovery --outbox "$outbox" --status
+    [[ $STATUS -eq 0 && ! -s "$CALLS" ]] && cmp -s "$outbox" "$CASE/outbox.before"
+}
+
+test_release_dispatch_large_inventory_refuses_late_page_drift() {
+    large_dispatch_inventory_fixture dispatch_large_inventory_drift || return 1
+    DISPATCH_MODE=reject
+    send_large_dispatch_inventory
+    [[ $STATUS -eq 1 ]] || return 1
+    local outbox filter
+    outbox=$(jq -r '.outbox_file' "$CASE/stdout") || return 1
+    cp "$outbox" "$CASE/outbox.before" && cp "$CASE/inventory.json" "$CASE/inventory.before" || return 1
+    DISPATCH_MODE=success
+    for filter in '.[799].digest="sha256:"+("0"*64)' '.[799].id=.[0].id' \
+        '.[799].name=.[0].name' '.[799].size+=1' '.[799].state="starter"' '.[0:799]'; do
+        jq "$filter" "$CASE/inventory.before" > "$CASE/inventory.json" || return 1
+        run_dispatch_recovery --outbox "$outbox"
+        [[ $STATUS -eq 7 && $(wc -l < "$CASE/dispatch-calls.jsonl") -eq 2 ]] &&
+            jq -e '.status=="error" and .exit_code==7 and .details.status=="incomplete"' "$CASE/stdout" >/dev/null &&
+            cmp -s "$outbox" "$CASE/outbox.before" || return 1
+    done
+    cp "$CASE/inventory.before" "$CASE/inventory.json" || return 1
+    API_INVENTORY_FAIL_PAGE=8
+    run_dispatch_recovery --outbox "$outbox"
+    [[ $STATUS -eq 7 && $(wc -l < "$CASE/dispatch-calls.jsonl") -eq 2 ]] &&
+        jq -e '.status=="error" and .exit_code==7 and .details.status=="incomplete"' "$CASE/stdout" >/dev/null &&
+        cmp -s "$outbox" "$CASE/outbox.before"
+}
+
 test_staged_dry_run_creates_no_custody() {
     setup staged_dry_run
     CREATE_FAIL=false DRY_RUN=true
@@ -2839,7 +2971,10 @@ for test in test_release_keeps_artifacts_during_publication \
     test_invalid_journal_is_not_upload_authority test_empty_artifacts_are_not_a_release \
     test_unmanifested_directory_is_refused test_artifacts_must_come_from_the_tagged_commit \
     test_draft_request_refuses_published_release test_wrong_repository_upload_url_is_rejected \
-    test_staged_creation_publishes_only_after_private_uploads test_staged_dry_run_creates_no_custody \
+    test_staged_creation_publishes_only_after_private_uploads \
+    test_staged_large_inventory_publishes_and_resumes test_staged_large_inventory_drift_restores_draft \
+    test_release_dispatch_large_inventory_recovers_exact_outbox \
+    test_release_dispatch_large_inventory_refuses_late_page_drift test_staged_dry_run_creates_no_custody \
     test_staged_interrupted_upload_resumes_and_publishes test_staged_generated_checksums_remain_bound_across_retry \
     test_staged_manifest_aliases_are_all_verified test_staged_explicit_draft_stays_private_on_resume \
     test_promotion_requires_resume_and_refuses_draft_flag test_promotion_keeps_strict_finalization_separate \
