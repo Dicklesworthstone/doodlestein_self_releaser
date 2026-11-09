@@ -180,6 +180,50 @@ for format in spdx cyclonedx; do
     check "$format preserves caller token/host state" test "$GH_HOST" = enterprise.example.test
     check "$format output contains no authentication secrets" bash -c '! grep -F dsr-test-credential "$1"' bash "$CASE/stdout"
 done
+new_case large-release-response
+# Real release responses embed asset rows that are not the complete paginated
+# inventory. Their combined metadata can exceed Linux's single-argument limit.
+# Deliberately make these embedded rows disagree: verification must still use
+# the independently fetched asset inventory and downloaded proof bytes.
+jq '.assets = [range(1;101) | {id:(10000+.),name:("embedded-" + tostring),
+    state:"starter",size:123,body:("x" * 1500)}]' \
+    "$REMOTE/release.json" > "$REMOTE/release.next"
+mv "$REMOTE/release.next" "$REMOTE/release.json"
+check 'large release fixture exceeds the single-argument limit' test "$(wc -c < "$REMOTE/release.json")" -gt 131072
+capture verify
+check 'large release metadata verifies through the real remote verifier' test "$status" -eq 0
+check 'large response retains exact repository, release and source identity' jq -es \
+    'length == 1 and (.[0] | .status == "verified" and .repository == {id:17,node_id:"REPO17",full_name:"acme/tool"}
+     and .release.id == 42 and .tag_commit == ("0" * 39 + "1") and .artifact_count == 2
+     and (.release | has("assets") | not))' "$CASE/stdout"
+check 'embedded asset metadata cannot replace independent proof downloads' test "$(wc -l < "$CASE/downloads.log")" -eq 3
+for mutation in '.id = 43' '.url = "https://api.github.com/repos/other/tool/releases/42"' \
+    '.upload_url = "https://uploads.github.com/repos/other/tool/releases/42/assets{?name,label}"'; do
+    jq "$mutation" "$REMOTE/release.json" > "$REMOTE/release.next"
+    cp "$REMOTE/release.json" "$REMOTE/release.original"
+    mv "$REMOTE/release.next" "$REMOTE/release.json"
+    : > "$CASE/downloads.log"
+    capture verify
+    check "large response still rejects release identity mismatch: $mutation" test "$status" -eq 7
+    check 'mismatched large response cannot download proof bytes' test ! -s "$CASE/downloads.log"
+    check 'mismatched large response emits no success receipt' no_success
+    mv "$REMOTE/release.original" "$REMOTE/release.json"
+done
+jq '.full_name = "other/tool"' "$REMOTE/repository.json" > "$REMOTE/repository.next"
+mv "$REMOTE/repository.next" "$REMOTE/repository.json"
+capture verify
+check 'streamed context rejects a mismatched repository identity' test "$status" -eq 7
+check 'mismatched repository emits no success receipt' no_success
+for document in repository release; do
+    for suffix in '{' '{}'; do
+        new_case "invalid-context-$document-$checks"
+        printf '%s\n' "$suffix" >> "$REMOTE/$document.json"
+        capture verify
+        check "$document response rejects malformed or trailing JSON ($suffix)" test "$status" -eq 8
+        check 'invalid context documents cannot download proof bytes' test ! -s "$CASE/downloads.log"
+        check 'invalid context documents emit no success receipt' no_success
+    done
+done
 new_case no-pin
 capture sbom_verify_release --repo acme/tool --tag v1.2.3
 check 'missing manifest pin fails before reading GitHub' test "$status" -eq 4

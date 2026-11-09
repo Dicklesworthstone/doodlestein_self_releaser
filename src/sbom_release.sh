@@ -139,10 +139,15 @@ _sbr_context() {
         _sbom_log error "Cannot bind existing tag to a commit: $tag"; return 7
     fi
     [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || return 7
-    jq -nceS --arg repo "$repo" --arg tag "$tag" --arg commit "$commit" \
-        --argjson id "$release_id" --argjson repository "$repository" --argjson release "$release" '
+    # A release response can include a large body and embedded asset metadata.
+    # Stream the original documents so their size never becomes an
+    # exec argument limit; validate identity before projecting the retained fields.
+    printf '%s\n' "$repository" "$release" | jq -sceS \
+        --arg repo "$repo" --arg tag "$tag" --arg commit "$commit" --argjson id "$release_id" '
         def id: type == "number" and . > 0 and . <= 9007199254740991 and . == floor;
         def text: type == "string" and length > 0 and (test("[\\x00-\\x1f\\x7f]") | not);
+        if length != 2 then error("expected one repository and one release document") else
+        .[0] as $repository | .[1] as $release |
         if ($repository | type == "object" and (.id | id) and (.node_id | text) and .full_name == $repo) and
            ($release | type == "object" and .id == $id and (.node_id | text) and .tag_name == $tag and
              (.draft | type == "boolean") and (.prerelease | type == "boolean") and
@@ -152,7 +157,7 @@ _sbr_context() {
         then {repository:($repository | {id,node_id,full_name}),
               release:($release | {id,node_id,tag_name,draft,prerelease,target_commitish,upload_url}),
               tag_commit:$commit}
-        else error("repository/release identity is not bound to the request") end
+        else error("repository/release identity is not bound to the request") end end
     ' 2>/dev/null || { _sbom_log error 'Invalid repository/release identity'; return 7; }
 }
 
