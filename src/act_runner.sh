@@ -18811,10 +18811,15 @@ _act_verify_collected_manifest() {
         [[ -z "$name" ]] || return 4
         if [[ ${#collected[@]} -gt 0 ]]; then
             collected_json=$(printf '%s\n' "${collected[@]}" | jq -Rsc 'split("\n")[:-1]') || return 4
-            jq -e --argjson collected "$collected_json" '
+            # The observed namespace can exceed an exec argument even after
+            # every individual file has passed byte admission above.
+            jq -e --slurpfile collected_documents /dev/fd/3 '
+                if ($collected_documents | length == 1 and
+                    (.[0] | type == "array" and length > 0)) then
                 (.artifacts | map(.name)) as $names |
-                all($collected[]; . as $name | $names | index($name) != null)
-            ' "$manifest" >/dev/null || {
+                all($collected_documents[0][]; . as $name | $names | index($name) != null)
+                else error("expected one complete collected-name inventory") end
+            ' "$manifest" 3<<< "$collected_json" >/dev/null || {
                 _log_error "Collected artifact is absent from final manifest"
                 return 4
             }

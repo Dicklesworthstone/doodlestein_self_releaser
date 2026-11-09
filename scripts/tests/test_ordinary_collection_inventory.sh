@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Production collector + manifest + final-byte gate. Compiler/host metadata is
 # a fixture; these payloads test custody/naming, not native execution or ABI.
+# --large-manifest-only keeps the 256-file manifest regression; the separate
+# --large-collected-inventory-only mode crosses the observed-name argv limit.
 # shellcheck disable=SC1090,SC2034 # Extracted production functions consume fixture variables through Bash dynamic scope.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -288,7 +290,7 @@ PY
 }
 
 test_large_public_manifest() {
-    python3 - "$ROOT" <<'PY'
+    python3 - "$ROOT" "${1:-manifest}" <<'PY'
 import copy
 import hashlib
 import io
@@ -303,6 +305,8 @@ import tempfile
 import time
 
 root = Path(sys.argv[1])
+large_collected = sys.argv[2] == 'collected'
+inventory_count = 550 if large_collected else 256
 for dependency in ('bash', 'jq', 'yq'):
     if not shutil.which(dependency):
         raise SystemExit('Large manifest tests require ' + dependency)
@@ -335,7 +339,7 @@ digest = hashlib.sha256(payload).hexdigest()
 # These are actual legal filesystem names and real archive bytes, not an
 # oversized extension field. They cross argv's limit with a bounded file count.
 paths = [work / 'payloads' / ('component-%04d-' % i + 'x' * 205 + '-linux-amd64.tar.gz')
-         for i in range(256)]
+         for i in range(inventory_count)]
 for path in paths:
     path.write_bytes(payload)
 original = {p.name: (p.stat().st_dev, p.stat().st_ino, hashlib.sha256(p.read_bytes()).hexdigest()) for p in paths}
@@ -349,6 +353,14 @@ case "$operation" in
     receipts) _act_result_artifact_receipts "$(cat "$1")" > "$2" ;;
     manifest) act_generate_manifest "$(cat "$1")" "$2" ;;
     collected) _act_verify_collected_manifest "$@" ;;
+    trailing-collected)
+        jq() {
+            if [[ $# -eq 2 && "$1" == -Rsc && "$2" == 'split("\n")[:-1]' ]]; then
+                command jq "$@" || return $?
+                printf '[]\n'
+            else command jq "$@"; fi
+        }
+        _act_verify_collected_manifest "$@" ;;
     admission)
         source "$root/src/slsa.sh" || exit 90
         _slsa_manifest_statement "$1" fixture/largefiles dsr:manifest-fixture > "$2" ;;
@@ -371,7 +383,7 @@ def invoke(label, operation, *args, input=None):
     return result
 
 results = {}
-for count in (1, 256):
+for count in (1, inventory_count):
     row = {'platform': 'linux/amd64', 'host': 'fixture', 'method': 'native',
            'status': 'success', 'artifact_paths': list(map(str, paths[:count]))}
     row_path, receipts_path = work / ('row-%d.json' % count), work / ('receipts-%d.json' % count)
@@ -396,20 +408,26 @@ for count in (1, 256):
                 for p in paths[:count]]
     check('%d-file manifest preserves every exact name, owner, hash and size' % count,
           observed['artifacts'] == expected and observed['summary'] == result['summary'])
-    if count == 256:
+    if count == inventory_count:
         assembled = [{k: v for k, v in row.items() if k not in ('build_purpose', 'publishable')}
                      for row in observed['artifacts']]
         save(work / 'assembled-artifacts.json', assembled)
         check('the complete real artifact array exceeds the single-argument limit',
               len(json.dumps(assembled, indent=2).encode()) > 131072)
 
-manifest = work / 'manifest-256.json'
-framed = b''.join(p.name.encode() + b'\0' for p in paths)
-check('independent final byte and collected-name admission accepts all 256 archives',
+manifest = work / ('manifest-%d.json' % inventory_count)
+# Observe the real output directory independently of the manifest being checked.
+observed_names = sorted(p.name for p in (work / 'payloads').iterdir())
+framed = b''.join(name.encode() + b'\0' for name in observed_names)
+if large_collected:
+    names_size = len(json.dumps(observed_names, separators=(',', ':')).encode())
+    check('all 550 observed filesystem names exceed one argument (%d bytes)' % names_size,
+          len(observed_names) == 550 and names_size > 131072)
+check('independent final byte and collected-name admission accepts all %d archives' % inventory_count,
       invoke('final-admission', 'collected', manifest, work / 'payloads', '--collected', input=framed).returncode == 0)
 check('complete manifest passes the shared successful-release profile',
       invoke('release-profile', 'admission', manifest, work / 'release-proof.json').returncode == 0 and
-      len(json.loads((work / 'release-proof.json').read_bytes())['subject']) == 256)
+      len(json.loads((work / 'release-proof.json').read_bytes())['subject']) == inventory_count)
 value = json.loads(manifest.read_bytes())
 for label, mutation in (
     ('omitted-row', lambda rows: rows.pop()),
@@ -423,14 +441,14 @@ for label, mutation in (
     check('complete final inventory refuses ' + label,
           invoke(label, 'collected', candidate, work / 'payloads', '--collected', input=framed).returncode == 4)
 
-def refused_source(label, selected=results[256], operation='manifest'):
+def refused_source(label, selected=results[inventory_count], operation='manifest'):
     source, output = work / (label + '-result.json'), work / (label + '-manifest.json')
     save(source, selected)
     failed = invoke(label, operation, source, output)
     check(label + ' cannot emit or persist a publishable manifest',
           failed.returncode == 4 and not output.exists() and not failed.stdout)
 
-malformed = copy.deepcopy(results[256])
+malformed = copy.deepcopy(results[inventory_count])
 malformed['targets'][0]['resume_artifacts'][0]['size_bytes'] = str(len(payload))
 refused_source('malformed-worker-receipt', malformed)
 held = work / 'temporarily-held-archive'
@@ -459,6 +477,36 @@ refused = invoke('preserve-existing-output', 'bad-environments', work / 'result-
 check('serialization failure preserves existing output bytes and inode without stdout',
       refused.returncode == 4 and not refused.stdout and sentinel.stat().st_ino == sentinel_inode and
       sentinel.read_bytes() == b'preserve existing output bytes\n')
+if large_collected:
+    check('a repeated observed name preserves historical set-coverage behavior',
+          invoke('repeated-observed-name', 'collected', manifest, work / 'payloads', '--collected',
+                 input=framed + paths[0].name.encode() + b'\0').returncode == 0)
+    metadata_names = ['SHA256SUMS', paths[0].name + '.sha256', paths[0].name + '.minisig',
+                      'release.sbom.json', 'release.intoto.jsonl']
+    for name in metadata_names:
+        (work / 'payloads' / name).write_bytes(b'generated metadata fixture\n')
+    with_metadata = b''.join(p.name.encode() + b'\0' for p in sorted((work / 'payloads').iterdir()))
+    check('actual checksum, signature, SBOM and provenance files keep their metadata exclusion',
+          invoke('metadata-names', 'collected', manifest, work / 'payloads', '--collected', input=with_metadata).returncode == 0)
+    extra = work / 'payloads/unlisted-payload.json'
+    extra.write_bytes(b'{"unexpected":true}\n')
+    actual_extra = b''.join(p.name.encode() + b'\0' for p in sorted((work / 'payloads').iterdir()))
+    check('a real additional collected payload cannot disappear from the manifest',
+          invoke('extra-collected-payload', 'collected', manifest, work / 'payloads', '--collected', input=actual_extra).returncode == 4)
+    extra.rename(work / 'retained-extra-payload.json')
+    small_manifest = work / 'manifest-1.json'
+    for label, invalid in (('unsafe-name', b'../outside.tar.gz\0'), ('empty-name', b'\0'),
+                           ('unterminated-name', paths[0].name.encode())):
+        check('observed collection refuses ' + label,
+              invoke(label, 'collected', small_manifest, work / 'payloads', '--collected', input=invalid).returncode == 4)
+    metadata_only = b''.join(name.encode() + b'\0' for name in metadata_names)
+    check('metadata-only observed collection retains the historical empty-payload behavior',
+          invoke('metadata-only', 'collected', small_manifest, work / 'payloads', '--collected', input=metadata_only).returncode == 0)
+    check('empty observed collection retains the historical optional-inventory behavior',
+          invoke('empty-collected', 'collected', small_manifest, work / 'payloads', '--collected', input=b'').returncode == 0)
+    check('collected-name serialization cannot inject a trailing array document',
+          invoke('trailing-collected', 'trailing-collected', small_manifest, work / 'payloads', '--collected',
+                 input=paths[0].name.encode() + b'\0').returncode == 4)
 check('generation and refusals preserve every original producer inode and byte', original ==
       {p.name: (p.stat().st_dev, p.stat().st_ino, hashlib.sha256(p.read_bytes()).hexdigest()) for p in paths})
 print('Large public manifest: %d checks passed' % checks, flush=True)
@@ -469,6 +517,7 @@ PY
 case "${1:-}" in
     --companion-packaging-only) test_companion_packaging; exit $? ;;
     --large-manifest-only) test_large_public_manifest; exit $? ;;
+    --large-collected-inventory-only) test_large_public_manifest collected; exit $? ;;
     '') ;;
     *) printf 'Unknown test option: %s\n' "$1" >&2; exit 4 ;;
 esac
