@@ -953,8 +953,9 @@ _rf_execute() {
     fi
     if [[ "$dry" == true ]]; then
         jq -nc --arg repo "$repo" --arg tag "$tag" --arg sha "$sha" --arg format "$format" --argjson promote "$promote" --arg selected "$selected" --argjson upload_plan "$upload_plan" \
-            --argjson signed "$require_signatures" --argjson prepared "$prepared_signatures" --arg key "$integrity_token" --argjson preparation "$preparation_plan" \
+            --argjson signed "$require_signatures" --argjson prepared "$prepared_signatures" --arg key "$integrity_token" --slurpfile preparation_docs /dev/fd/3 \
             --argjson provenance "$provenance_policy" '
+            if ($preparation_docs|length)!=1 then error("invalid draft plan document") else $preparation_docs[0] as $preparation |
             {kind:"dsr-release-finalization-result",status:"planned",dry_run:true,exit_code:0,
              repo:$repo,tag:$tag,expected_sha:$sha,format:$format,promote:$promote,
              dispatch_repos:(if $selected=="" then [] else ($selected|split("\n")) end),
@@ -970,7 +971,7 @@ _rf_execute() {
                      (if $signed then ["publish and authenticate payload/checksum signatures"] else [] end)+
                      (if $provenance==null then [] else ["publish and authenticate manifest-backed provenance"] end)+
                      ["generate or reuse SBOMs","publish and verify evidence",
-                     (if $promote then "promote without changing latest" else "retain release mode" end)])}'
+                     (if $promote then "promote without changing latest" else "retain release mode" end)])} end' 3<<< "$preparation_plan"
         return $?
     fi
     dsr_lock_available || return $?
@@ -1028,10 +1029,11 @@ _rf_execute_locked() {
         [[ "$retry_creation" == false ]] || preparation_args+=(--retry-uncertain)
         [[ "$oldhash" == absent ]] || preparation_args+=(--existing-only)
         preparation_result=$(release_prepare "${preparation_args[@]}") || return $?
-        context=$(jq -ecsS --argjson plan "$preparation_plan" 'if length==1 and (.[0]|
+        context=$(jq -ecsS --slurpfile selected /dev/fd/3 '$selected[0] as $plan |
+            if ($selected|length)==1 and length==1 and (.[0]|
             .kind=="dsr-release-preparation-result" and .status=="prepared" and .exit_code==0 and
             .dry_run==false and .plan==$plan) then .[0].context else error("invalid draft receipt") end' \
-            <<< "$preparation_result") || return 7
+            3<<< "$preparation_plan" <<< "$preparation_result") || return 7
     else
         context=$(_sbr_context "$repo" "$tag" "$work") || return $?
     fi
@@ -1070,10 +1072,12 @@ _rf_execute_locked() {
         plan=$(jq -cS --argjson provenance "$provenance_policy" '.provenance=$provenance' <<< "$plan") || return 1
     fi
     if [[ "$oldhash" == absent ]]; then
-        state=$(jq -cSn --argjson plan "$plan" --argjson preparation "$preparation_plan" --argjson receipt "$preparation_result" \
-            '{schema_version:1,kind:"dsr-release-finalization",plan:$plan,manifest_sha256:null,
+        state=$(printf '%s\n' "$plan" "$preparation_plan" "$preparation_result" | jq -csS \
+            'if length!=3 then error("invalid finalization documents") else
+             .[0] as $plan | .[1] as $preparation | .[2] as $receipt |
+             {schema_version:1,kind:"dsr-release-finalization",plan:$plan,manifest_sha256:null,
               verification:null,promotion_attempts:0,phase:"preparing"} |
-             if $preparation==null then . else .+{preparation_plan:$preparation,preparation:$receipt} end') || return 1
+             if $preparation==null then . else .+{preparation_plan:$preparation,preparation:$receipt} end end') || return 1
         oldhash=$(_rf_save "$file" "$state" absent "$work" "$plan") || return $?
     else
         _rf_state_valid "$file" "$plan" || { _rf_log 'Invalid or conflicting finalization plan'; return 2; }
@@ -1400,12 +1404,13 @@ _rf_execute_locked() {
         if ((dispatch_rc == 0)); then status=complete; else status=incomplete; fi
     fi
     jq -nc --arg status "$status" --arg file "$file" --argjson verification "$verification" \
-        --argjson attempted "$promotion_attempted" --argjson rc "$promotion_rc" --argjson dispatch "$dispatch_result" --argjson exit_code "$dispatch_rc" --argjson payloads "$payload_result" --argjson integrity "$integrity_result" --argjson preparation "$preparation_result" \
+        --argjson attempted "$promotion_attempted" --argjson rc "$promotion_rc" --argjson dispatch "$dispatch_result" --argjson exit_code "$dispatch_rc" --argjson payloads "$payload_result" --argjson integrity "$integrity_result" --slurpfile preparation_docs /dev/fd/3 \
         --argjson provenance "$provenance_result" '
+        if ($preparation_docs|length)!=1 then error("invalid draft preparation receipt") else $preparation_docs[0] as $preparation |
         {kind:"dsr-release-finalization-result",status:$status,exit_code:$exit_code,dry_run:false,
          state_file:$file,promotion_attempted:$attempted,promotion_transport_exit_code:$rc,
          verification:$verification,dispatch:$dispatch,payloads:$payloads,integrity:$integrity,preparation:$preparation} |
-         if $provenance==null then . else .+{provenance:$provenance} end' || return 1
+         if $provenance==null then . else .+{provenance:$provenance} end end' 3<<< "$preparation_result" || return 1
     return "$dispatch_rc"
 }
 

@@ -193,6 +193,49 @@ final_state() { find "$CASE/finalize" -maxdepth 2 -type f -name state.json; }
 
 [[ "${DSR_PREPARE_FINALIZE_FIXTURES_ONLY:-false}" != true ]] || return 0
 
+test_large_note_finalization() {
+    new_pipeline
+    jq -nrj '"\\" * 65534 + "\n\n"' > "$CASE/notes"
+    create_pipeline --release-notes-file "$CASE/notes" --dry-run
+    check assert_rc 0
+    check test "${#OUT}" -gt 131072
+    check cmp -s "$CASE/notes" <(jq -jr '.preparation_plan.request.body' <<< "$OUT")
+    check posts 0
+    check no_reads
+    check test ! -e "$CASE/finalize"
+    touch "$CASE/lost-ack"
+    create_pipeline --release-notes-file "$CASE/notes" --promote
+    check assert_rc 0
+    check json '.[0].status=="published" and .[0].preparation.context.release.id==.[0].verification.release.id'
+    check cmp -s "$CASE/notes" <(jq -jr '.preparation.plan.request.body' <<< "$OUT")
+    check cmp -s "$CASE/notes" <(jq -jr '.body' "$CASE/release")
+    check cmp -s "$CASE/notes" <(jq -jr '.preparation_plan.request.body' "$(final_state)")
+    check posts 1
+    check count UPLOAD 1
+    check count PATCH 1
+    create_pipeline --release-notes-file "$CASE/notes" --promote
+    check assert_rc 0
+    check posts 1
+    check count UPLOAD 1
+    check count PATCH 1
+    local retained_state
+    retained_state=$(_rf_hash "$(final_state)")
+    printf 'changed notes\n' > "$CASE/notes"
+    create_pipeline --release-notes-file "$CASE/notes" --promote
+    check assert_rc 2
+    check test "$(_rf_hash "$(final_state)")" = "$retained_state"
+    check posts 1
+    check count UPLOAD 1
+    check count PATCH 1
+}
+
+if [[ "${1:-}" == --large-notes-only ]]; then
+    test_large_note_finalization
+    printf '%s checks: %s passed, %s failed. Fixtures retained at %s\n' "$TOTAL" "$PASSED" "$FAILED" "$TMP"
+    ((FAILED==0))
+    exit $?
+fi
+
 new_pipeline
 create_pipeline --dry-run
 check assert_rc 0
@@ -311,6 +354,8 @@ check count UPLOAD 1
 
 # Planning captures the exact note bytes; later filesystem changes cannot alter
 # the request between preflight and the preparation engine's own state binding.
+test_large_note_finalization
+
 new_pipeline
 printf 'original notes\n' > "$CASE/notes"
 RC=0

@@ -83,25 +83,28 @@ _rp_context() {
     local plan="$1" source="$2" id="$3" release repo
     repo=$(jq -r .repo <<< "$plan") || return 1
     release=$(_sbr_api "repos/$repo/releases/$id") || return $?
-    jq -ecsS --argjson plan "$plan" --argjson source "$source" --argjson id "$id" '
+    printf '%s\n' "$plan" "$source" "$release" | jq -ecsS --argjson id "$id" '
         def text: type=="string" and length>0 and (test("[\\x00-\\x1f\\x7f]")|not);
-        if length==1 and (.[0]|type=="object" and .id==$id and (.node_id|text) and
+        if length!=3 then error("invalid draft context documents") else
+        .[0] as $plan | .[1] as $source | .[2] |
+        if (type=="object" and .id==$id and (.node_id|text) and
             .tag_name==$plan.request.tag_name and (.draft|type=="boolean") and
             .prerelease==$plan.request.prerelease and (.target_commitish|text) and
             .name==$plan.request.name and (.body==null or (.body|type=="string")) and
             (.body//"")==$plan.request.body and
             .url==("https://api.github.com/repos/"+$plan.repo+"/releases/"+($id|tostring)) and
             .upload_url==("https://uploads.github.com/repos/"+$plan.repo+"/releases/"+($id|tostring)+"/assets{?name,label}"))
-        then $source+{release:(.[0]|{id,node_id,tag_name,draft,prerelease,target_commitish,upload_url})}
-        else error("release metadata differs from the selected draft") end' <<< "$release" 2>/dev/null || {
+        then $source+{release:{id,node_id,tag_name,draft,prerelease,target_commitish,upload_url}}
+        else error("release metadata differs from the selected draft") end end' 2>/dev/null || {
             _rp_log 'Release identity or metadata conflicts with the request'; return 2;
         }
 }
 
 _rp_state_valid() {
-    jq -es --argjson plan "$2" '
+    jq -es --slurpfile selected /dev/fd/3 '
         def id: type=="number" and .>0 and .<=9007199254740991 and .==floor;
         def text: type=="string" and length>0;
+        if ($selected|length)!=1 then false else $selected[0] as $plan |
         length==1 and (.[0]|. as $s|type=="object" and .schema_version==1 and
             .kind=="dsr-release-preparation-state" and .plan==$plan and
             (.phase=="pending" or .phase=="sending" or .phase=="uncertain" or .phase=="prepared") and
@@ -117,7 +120,7 @@ _rp_state_valid() {
                         .upload_url==("https://uploads.github.com/repos/"+$plan.repo+"/releases/"+(.id|tostring)+"/assets{?name,label}")))
                 and (.candidate_id==null or .context.release.id==.candidate_id) end) and
             (if .phase=="pending" then .attempts==0 and .candidate_id==null and .context==null else true end) and
-            (if .phase=="sending" or .phase=="uncertain" then .attempts>0 else true end))' "$1" >/dev/null 2>&1
+            (if .phase=="sending" or .phase=="uncertain" then .attempts>0 else true end)) end' "$1" 3<<< "$2" >/dev/null 2>&1
 }
 
 # Compare-before-replace also detects edits by non-cooperating local writers.
@@ -183,12 +186,17 @@ _rp_execute() (
         [[ $(wc -c < "$notes") -le 65536 ]] || return 4
         body=$(jq -Rse 'if contains("\u0000") then error("NUL in notes") else . end' "$notes") || return 4
     fi
-    plan=$(jq -cnS --arg repo "$repo" --arg tag "$tag" --arg sha "$sha" --arg name "$name" \
-        --argjson body "$body" --argjson prerelease "$prerelease" \
-        '{repo:$repo,request:{tag_name:$tag,target_commitish:$sha,name:$name,body:$body,
-            draft:true,prerelease:$prerelease,make_latest:"false"}}') || return 1
+    # Notes are bounded by their original UTF-8 bytes, but JSON escaping can
+    # more than double their size. Keep the full plan off process argv through
+    # dry-run, creation, metadata comparison and durable recovery.
+    plan=$(jq -csS --arg repo "$repo" --arg tag "$tag" --arg sha "$sha" --arg name "$name" \
+        --argjson prerelease "$prerelease" \
+        'if length==1 and (.[0]|type=="string") then
+         {repo:$repo,request:{tag_name:$tag,target_commitish:$sha,name:$name,body:.[0],
+            draft:true,prerelease:$prerelease,make_latest:"false"}}
+         else error("invalid note document") end' <<< "$body") || return 1
     if [[ "$dry" == true ]]; then
-        jq -cn --argjson plan "$plan" '{kind:"dsr-release-preparation-result",status:"planned",exit_code:0,dry_run:true,plan:$plan}'
+        jq -c '{kind:"dsr-release-preparation-result",status:"planned",exit_code:0,dry_run:true,plan:.}' <<< "$plan"
         return $?
     fi
     _rp_require || return $?
@@ -215,9 +223,11 @@ _rp_execute() (
     fi
     source=$(_rp_source "$plan") || return $?
     if [[ "$state" == null ]]; then
-        state=$(jq -cnS --argjson plan "$plan" --argjson source "$source" \
-            '{schema_version:1,kind:"dsr-release-preparation-state",plan:$plan,source:$source,
-                phase:"pending",attempts:0,candidate_id:null,context:null}') || return 1
+        state=$(printf '%s\n' "$plan" "$source" | jq -csS \
+            'if length==2 then
+             {schema_version:1,kind:"dsr-release-preparation-state",plan:.[0],source:.[1],
+                phase:"pending",attempts:0,candidate_id:null,context:null}
+             else error("invalid preparation documents") end') || return 1
         old=$(_rp_save "$file" "$state" "$old" "$plan") || return $?
     else
         [[ "$(jq -cS .source <<< "$state")" == "$source" ]] || { _rp_log 'Repository identity changed'; return 2; }
@@ -276,9 +286,11 @@ _rp_execute() (
        "$(_rp_context "$plan" "$source" "$id")" == "$context" ]] || return 7
     state=$(jq -cS --argjson context "$context" '.phase="prepared"|.context=$context' <<< "$state") || return 1
     old=$(_rp_save "$file" "$state" "$old" "$plan") || return $?
-    jq -cn --argjson plan "$plan" --argjson context "$context" --argjson attempts "$(jq -r .attempts <<< "$state")" --arg file "$file" \
-        '{kind:"dsr-release-preparation-result",status:"prepared",exit_code:0,dry_run:false,
-            plan:$plan,context:$context,creation_attempts:$attempts,state_file:$file}'
+    printf '%s\n' "$plan" "$context" | jq -cs --argjson attempts "$(jq -r .attempts <<< "$state")" --arg file "$file" \
+        'if length==2 then .[0] as $plan | .[1] as $context |
+        {kind:"dsr-release-preparation-result",status:"prepared",exit_code:0,dry_run:false,
+            plan:$plan,context:$context,creation_attempts:$attempts,state_file:$file}
+         else error("invalid preparation result documents") end'
 )
 
 release_prepare() (

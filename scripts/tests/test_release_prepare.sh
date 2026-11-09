@@ -94,6 +94,60 @@ mutate() {
 
 [[ "${DSR_PREPARE_FIXTURES_ONLY:-false}" != true ]] || return 0
 
+test_large_notes() {
+    new_case
+    # The documented byte limit applies to the notes, not their larger JSON
+    # representation. Exercise the entire create/reconcile/resume lifecycle.
+    jq -nrj '"\\" * 65534 + "\n\n"' > "$CASE/notes"
+    check test "$(wc -c < "$CASE/notes")" -eq 65536
+    run --dry-run --notes-file "$CASE/notes"
+    check assert_rc 0
+    check test "${#OUT}" -gt 131072
+    check cmp -s "$CASE/notes" <(jq -jr '.plan.request.body' <<< "$OUT")
+    check test ! -e "$CASE/state"
+    check posts 0
+    touch "$CASE/lost-ack"
+    run --notes-file "$CASE/notes"
+    check assert_rc 0
+    check posts 1
+    check json '.[0].status=="prepared" and .[0].creation_attempts==1 and .[0].context.release.id==42'
+    check cmp -s "$CASE/notes" <(jq -jr '.body' "$CASE/request")
+    check cmp -s "$CASE/notes" <(jq -jr '.plan.request.body' "$(state_file)")
+    run --existing-only --notes-file "$CASE/notes"
+    check assert_rc 0
+    check posts 1
+    local original_state
+    original_state=$(_rp_hash < "$(state_file)")
+    cp "$CASE/notes" "$CASE/original-notes"
+    printf 'different notes\n' > "$CASE/notes"
+    run --notes-file "$CASE/notes"
+    check assert_rc 2
+    check posts 1
+    check test "$(_rp_hash < "$(state_file)")" = "$original_state"
+    cp "$CASE/original-notes" "$CASE/notes"
+    printf '{}\n' >> "$CASE/release"
+    local context_rc=0
+    _rp_context "$(jq -c .plan "$(state_file)")" \
+        "$(jq -c .source "$(state_file)")" 42 > "$CASE/context" 2> "$CASE/context-error" || context_rc=$?
+    check test "$context_rc" -eq 2
+    run --existing-only --notes-file "$CASE/notes"
+    # The complete command rejects the malformed listing before context.
+    check assert_rc 8
+    check posts 1
+    check test "$(_rp_hash < "$(state_file)")" = "$original_state"
+    printf 'x' >> "$CASE/notes"
+    run --dry-run --notes-file "$CASE/notes"
+    check assert_rc 4
+    check posts 1
+}
+
+if [[ "${1:-}" == --large-notes-only ]]; then
+    test_large_notes
+    printf '%s checks: %s passed, %s failed. Fixtures retained at %s\n' "$TOTAL" "$PASSED" "$FAILED" "$TMP"
+    ((FAILED==0))
+    exit $?
+fi
+
 new_case
 run --existing-only
 check assert_rc 2
@@ -284,6 +338,8 @@ check assert_rc 2
 check posts 1
 
 # Every known argument error and an offline dry run fail before auth/network.
+test_large_notes
+
 for value in 'bad..tag' '-v1' 'bad tag' 'bad@{tag' ''; do
     new_case
     RC=0; OUT=$(release_prepare --repo acme/tool --tag "$value" --sha "$SHA" --state-dir "$CASE/state" 2> "$CASE/diagnostics") || RC=$?
