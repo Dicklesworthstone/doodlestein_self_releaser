@@ -15113,6 +15113,96 @@ _act_result_artifact_receipts() {
     done
 
     [[ ${#artifact_paths[@]} -gt 0 ]] || return 4
+    if command -v python3 >/dev/null 2>&1; then
+        # Enumerate with the existing namespace rules, then hash the complete
+        # NUL-framed path set in one process. Spawning hash/stat/jq for every
+        # file made completion and each reuse check scale with subprocesses.
+        # Select the existing platform identity spelling once so old frozen
+        # receipts remain comparable on both GNU and BSD stat hosts.
+        local identity_format _act_captured_artifact_receipts
+        # A caller's exported variable must not turn the complete JSON into
+        # an environment entry subject to the same exec size limit as argv.
+        export -n _act_captured_artifact_receipts
+        identity_format=$(_act_file_identity "${artifact_paths[0]}") || return 4
+        identity_format="${identity_format%%:*}"
+        # Canonicalize once with the same JSON writer used by saved receipts
+        # (including jq's escaping of DEL), so exact resume comparisons agree.
+        # Capture only a successful producer before emitting anything; this
+        # must fail even when the caller disabled the shell's pipefail option.
+        _act_captured_artifact_receipts=$(python3 -I - "$identity_format" \
+            3< <(printf '%s\0' "${artifact_paths[@]}") <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def stamp(info):
+    # Reading can update atime. Every field below must remain unchanged while
+    # the digest is read from its held regular file, including link count.
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink,
+            info.st_uid, info.st_gid, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+try:
+    identity_format = sys.argv[1]
+    require(identity_format in ('gnu', 'bsd'), 'unsupported file identity format')
+    with os.fdopen(3, 'rb') as paths_input:
+        framed = paths_input.read()
+    require(framed.endswith(b'\0'), 'incomplete artifact path framing')
+    encoded_paths = framed[:-1].split(b'\0')
+    require(all(encoded_paths) and len(set(encoded_paths)) == len(encoded_paths),
+            'empty or duplicated artifact path')
+    # JSON paths must round-trip exactly; undecodable filesystem names cannot
+    # become a replacement-character path claiming custody of another file.
+    paths = [path.decode('utf-8') for path in encoded_paths]
+    receipts = []
+    for path in paths:
+        named_before = os.stat(path, follow_symlinks=False)
+        require(stat.S_ISREG(named_before.st_mode), 'artifact is not a plain regular file: ' + path)
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        with os.fdopen(os.open(path, flags), 'rb') as held:
+            before = os.fstat(held.fileno())
+            require(stat.S_ISREG(before.st_mode) and stamp(before) == stamp(named_before),
+                    'artifact changed while opening: ' + path)
+            digest = hashlib.sha256()
+            read_bytes = 0
+            for block in iter(lambda: held.read(1024 * 1024), b''):
+                digest.update(block)
+                read_bytes += len(block)
+            after = os.fstat(held.fileno())
+            named_after = os.stat(path, follow_symlinks=False)
+            require(stamp(before) == stamp(after) == stamp(named_after) and read_bytes == before.st_size,
+                    'artifact changed during hashing: ' + path)
+            require(before.st_ino > 0 and before.st_dev >= 0, 'invalid artifact identity: ' + path)
+            identity = ('gnu:%s:%s' % (before.st_dev, before.st_ino) if identity_format == 'gnu'
+                        else 'bsd:%s' % before.st_ino)
+            receipts.append(dict(path=path, sha256=digest.hexdigest(),
+                                 size_bytes=before.st_size, identity=identity))
+    # No caller can observe a partial receipt if a later path or hash fails.
+    encoded = json.dumps(sorted(receipts, key=lambda row: row['path']),
+                         sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+    sys.stdout.buffer.write(encoded + b'\n')
+except (OSError, ValueError) as error:
+    print('[act] Artifact inventory failed: ' + str(error), file=sys.stderr)
+    raise SystemExit(4)
+PY
+        ) || return $?
+        jq -cse '
+            if length == 1 and (.[0] | type == "array" and length > 0) then .[0]
+            else error("exactly one complete artifact inventory required") end
+        ' <<< "$_act_captured_artifact_receipts" || return 4
+        return 0
+    fi
+
+    # Keep the existing portable producer for act-only installations without
+    # Python. A failure in the held-file producer above never reaches this path.
     for path in "${artifact_paths[@]}"; do
         local sha size identity receipt
         [[ -f "$path" && ! -L "$path" ]] || return 4

@@ -10,6 +10,9 @@
 # against real files without compilers, Docker, SSH, or host-health fixtures.
 # --workflow-inventory-only exercises complete typed workflow collection and
 # admission beyond the exec argument limit using actual ZIP and payload bytes.
+# --receipt-producer-only checks real inventory bytes, namespace refusals and
+# hashing custody. DSR_TEST_RECEIPT_BASELINE may name a saved, unchanged producer
+# function for a paired comparison over the same files in that invocation.
 
 set -uo pipefail
 
@@ -26,6 +29,308 @@ SKIP=0
 pass() { echo -e "${GREEN}✓${NC} $1"; ((PASS++)); }
 fail() { echo -e "${RED}✗${NC} $1"; ((FAIL++)); }
 skip() { echo -e "${YELLOW}○${NC} $1"; ((SKIP++)); }
+
+test_receipt_producer() {
+    local project_root dependency
+    project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" || return 1
+    for dependency in python3 bash jq; do
+        command -v "$dependency" >/dev/null || { echo "Missing test dependency: $dependency" >&2; return 77; }
+    done
+    python3 -I - "${DSR_TEST_ACT_RUNNER:-$project_root/src/act_runner.sh}" "${DSR_TEST_RECEIPT_BASELINE:-}" <<'PY'
+import ctypes
+import hashlib
+import json
+import os
+from pathlib import Path
+import select
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+
+module = Path(sys.argv[1]).resolve()
+baseline = Path(sys.argv[2]).resolve() if sys.argv[2] else None
+work = Path(tempfile.mkdtemp(prefix='dsr-receipt-producer-')).resolve()
+print('Retained receipt producer fixtures: ' + str(work), flush=True)
+checks, failures, timings = 0, [], {}
+
+
+def check(label, condition):
+    global checks
+    checks += 1
+    print(('PASS ' if condition else 'FAIL ') + label, flush=True)
+    if not condition:
+        failures.append(label)
+
+
+driver = r'''set -uo pipefail
+source "$1" || exit 90
+if [[ "$3" == incumbent ]]; then source "$4" || exit 91; fi
+if [[ "$3" == portable ]]; then
+    command() {
+        if [[ $# == 2 && "$1" == -v && "$2" == python3 ]]; then return 1; fi
+        builtin command "$@"
+    }
+elif [[ "$3" == python-failure || "$3" == python-empty || "$3" == python-late-failure || "$3" == python-documents ]]; then
+    receipt_fixture_fallback_marker=$5
+    receipt_fixture_python_mode=$3
+    set +o pipefail
+    python3() {
+        case "$receipt_fixture_python_mode" in
+            python-failure) return 17 ;;
+            python-empty) return 0 ;;
+            python-late-failure) printf '[]\n'; return 17 ;;
+            python-documents) printf '[]\n[]\n'; return 0 ;;
+        esac
+    }
+    _act_sha256() { printf 'unexpected fallback\n' > "$receipt_fixture_fallback_marker"; return 91; }
+fi
+result=$(cat "$2") || exit 4
+if [[ "$3" == reuse ]]; then
+    _act_target_result_available "$result" release true
+else
+    _act_result_artifact_receipts "$result"
+fi
+'''
+
+
+def arguments(input_path, mode):
+    return ['bash', '-c', driver, '_', str(module), str(input_path), mode,
+            str(baseline or ''), str(work / 'unexpected-fallback')]
+
+
+def save(name, value):
+    path = work / (name + '.json')
+    path.write_text(json.dumps(value) + '\n')
+    return path
+
+
+def run(input_path, mode, label):
+    started = time.monotonic()
+    result = subprocess.run(arguments(input_path, mode), capture_output=True, timeout=120)
+    timings[label] = time.monotonic() - started
+    (work / (label + '.stdout')).write_bytes(result.stdout)
+    (work / (label + '.stderr')).write_bytes(result.stderr)
+    return result
+
+
+def receipt_matches(result, paths):
+    try:
+        rows = json.loads(result.stdout)
+        expected = {str(path): path for path in paths}
+        return (result.returncode == 0 and isinstance(rows, list) and
+                len(rows) == len(expected) and {row['path'] for row in rows} == set(expected) and
+                all(set(row) == {'path', 'sha256', 'size_bytes', 'identity'} and
+                    row['sha256'] == hashlib.sha256(expected[row['path']].read_bytes()).hexdigest() and
+                    row['size_bytes'] == expected[row['path']].stat().st_size and row['identity'] in (
+                        'gnu:%s:%s' % (expected[row['path']].stat().st_dev, expected[row['path']].stat().st_ino),
+                        'bsd:%s' % expected[row['path']].stat().st_ino) for row in rows))
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+
+
+def snapshot(paths):
+    return [(str(path), path.stat().st_dev, path.stat().st_ino, path.stat().st_mode,
+             path.stat().st_nlink, path.stat().st_uid, path.stat().st_gid, path.stat().st_size,
+             path.stat().st_mtime_ns, path.stat().st_ctime_ns,
+             hashlib.sha256(path.read_bytes()).hexdigest()) for path in paths]
+
+
+files = work / 'actual-artifacts'
+files.mkdir()
+for index in range(198):
+    (files / ('artifact-%03d.bin' % index)).write_bytes(bytes(range(256)) * (index % 31 + 1))
+(files / 'empty').write_bytes(b'')
+special = files / "quote'comma,backslash\\unicode-界面\nartifact"
+special.write_bytes(b'path framing and exact digest\n')
+(files / 'multiple-read-blocks.bin').write_bytes(bytes(range(256)) * 16385)
+paths = sorted(files.iterdir())
+input_path = save('complete', dict(artifact_dir=str(files), artifact_paths=[str(special)]))
+before = snapshot(paths)
+candidate = run(input_path, 'candidate', 'candidate-complete')
+check('one producer preserves every real path, digest, size and inode', receipt_matches(candidate, paths))
+check('inventory capture preserves all artifact bytes, modes and identities', snapshot(paths) == before)
+if baseline:
+    incumbent = run(input_path, 'incumbent', 'incumbent-complete')
+    check('actual incumbent in the same invocation captures the same complete files', receipt_matches(incumbent, paths))
+    check('candidate and actual incumbent receipts are byte-identical', candidate.stdout == incumbent.stdout)
+    check('paired capture preserves every original artifact', snapshot(paths) == before)
+    print('Paired real-file capture: files=%d candidate=%.6fs incumbent=%.6fs' %
+          (len(paths), timings['candidate-complete'], timings['incumbent-complete']), flush=True)
+    print('Incumbent function sha256=' + hashlib.sha256(baseline.read_bytes()).hexdigest(), flush=True)
+
+framing = work / 'filename-framing'
+framing.mkdir()
+characters = [chr(index) for index in range(1, 32)] + [chr(index) for index in (127, 133, 160, 0x2028, 0x2029, 0x1f603, 0xffff)]
+for index, character in enumerate(characters):
+    (framing / ('name-%02d-%s-tail' % (index, character))).write_bytes(b'exact JSON filename framing\n')
+framing_paths = sorted(framing.iterdir())
+input_path = save('filename-framing', dict(artifact_dir=str(framing)))
+framed = run(input_path, 'candidate', 'candidate-framing')
+check('control characters, DEL and Unicode retain exact paths and digests', receipt_matches(framed, framing_paths))
+if baseline:
+    original = run(input_path, 'incumbent', 'incumbent-framing')
+    check('all supported filename escapes match the actual incumbent byte for byte',
+          original.returncode == 0 and original.stdout == framed.stdout)
+if framed.returncode == 0:
+    reusable = save('framing-reuse', dict(status='success', method='native', build_purpose='release',
+                                        publishable=True, artifact_dir=str(framing),
+                                        resume_artifacts=json.loads(framed.stdout)))
+    check('actual reuse admission accepts unchanged files with every supported filename escape',
+          run(reusable, 'reuse', 'framing-reuse').returncode == 0)
+else:
+    check('actual reuse admission accepts unchanged files with every supported filename escape', False)
+
+controls = work / 'controls'
+controls.mkdir()
+plain = controls / 'plain'
+plain.write_bytes(b'ordinary data\n')
+empty = controls / 'empty'
+empty.write_bytes(b'')
+linked = controls / 'file-link'
+linked.symlink_to(plain)
+tree = controls / 'ordinary-tree'
+(tree / 'nested').mkdir(parents=True)
+(tree / 'one').write_bytes(b'one\n')
+(tree / 'nested/two').write_bytes(b'two\n')
+(tree / 'file-link').symlink_to(plain)
+(tree / 'directory-link').symlink_to(files, target_is_directory=True)
+os.mkfifo(tree / 'pipe')
+plain_workflow = controls / 'plain-workflow'
+plain_workflow.mkdir()
+(plain_workflow / 'output').write_bytes(b'workflow output\n')
+workflow_link = controls / 'workflow-root-link'
+workflow_link.symlink_to(plain_workflow, target_is_directory=True)
+hard_workflow = controls / 'hardlink-workflow'
+hard_workflow.mkdir()
+os.link(plain, hard_workflow / 'output')
+special_workflow = controls / 'special-workflow'
+special_workflow.mkdir()
+os.mkfifo(special_workflow / 'pipe')
+empty_tree = controls / 'empty-tree'
+empty_tree.mkdir()
+cases = [
+    ('array-precedence', dict(artifact_paths=[str(plain), str(empty)], artifact_path=str(controls / 'missing')), [plain, empty]),
+    ('deduplication', dict(artifact_paths=[str(plain), str(plain), str(empty)],
+                          additional_artifacts=[dict(path=str(plain))]), [plain, empty]),
+    ('legacy-paths', dict(artifact_path=str(plain) + ',' + str(empty)), [plain, empty]),
+    ('ordinary-links-and-specials', dict(artifact_dir=str(tree)), [tree / 'one', tree / 'nested/two']),
+    ('workflow-regular-files', dict(workflow_payload_dir=str(plain_workflow)), [plain_workflow / 'output']),
+    ('missing-file', dict(artifact_paths=[str(plain), str(controls / 'missing')]), None),
+    ('explicit-symlink', dict(artifact_paths=[str(linked)]), None),
+    ('explicit-fifo', dict(artifact_paths=[str(tree / 'pipe')]), None),
+    ('empty-tree', dict(artifact_dir=str(empty_tree)), None),
+    ('workflow-root-symlink', dict(workflow_payload_dir=str(workflow_link)), None),
+    ('workflow-hardlink', dict(workflow_artifact_dir=str(hard_workflow)), None),
+    ('workflow-special-file', dict(workflow_artifact_dir=str(special_workflow)), None),
+    ('workflow-linked-namespace', dict(workflow_payload_dir=str(tree)), None),
+    ('malformed-path-array', dict(artifact_paths='not an array'), None),
+    ('malformed-additional-array', dict(additional_artifacts='not an array'), None),
+]
+unreadable = controls / 'unreadable'
+unreadable.write_bytes(b'permission refusal\n')
+unreadable.chmod(0)
+if not os.access(unreadable, os.R_OK):
+    cases.append(('unreadable-file', dict(artifact_paths=[str(unreadable)]), None))
+else:
+    print('SKIP unreadable-file control: this user can read mode000 files', flush=True)
+for name, content, expected in cases:
+    input_path = save(name, content)
+    observed = {}
+    for mode in ('candidate', 'incumbent') if baseline else ('candidate',):
+        result = run(input_path, mode, mode + '-' + name)
+        observed[mode] = result
+        check(mode + ': ' + name,
+              receipt_matches(result, expected) if expected is not None else
+              result.returncode == 4 and not result.stdout)
+    if baseline and expected is not None:
+        check(name + ': both producers emit identical receipts', observed['candidate'].stdout == observed['incumbent'].stdout)
+
+portable = save('portable', dict(artifact_paths=[str(plain), str(empty), str(special)]))
+check('Python absence retains the actual portable producer and exact filenames',
+      receipt_matches(run(portable, 'portable', 'portable'), [plain, empty, special]))
+refused = run(save('portable-missing', dict(artifact_paths=[str(controls / 'missing')])),
+              'portable', 'portable-missing')
+check('portable producer still refuses missing files without partial JSON', refused.returncode == 4 and not refused.stdout)
+refused = run(portable, 'python-failure', 'python-failure')
+check('a failed Python producer never falls back even without caller pipefail',
+      refused.returncode == 17 and not refused.stdout and not (work / 'unexpected-fallback').exists())
+for mode, expected_status in (('python-empty', 4), ('python-late-failure', 17), ('python-documents', 4)):
+    refused = run(portable, mode, mode)
+    check(mode + ': failed or incomplete producer evidence never reaches stdout without caller pipefail',
+          refused.returncode == expected_status and not refused.stdout and not (work / 'unexpected-fallback').exists())
+
+# Observe a real first read before changing a real regular file. No hash,
+# stat, filesystem or producer implementation is replaced by this control.
+# The sparse extent bounds storage while the real hash still reads its bytes.
+if sys.platform.startswith('linux'):
+    unrepresentable = controls / 'non-utf8-tree'
+    unrepresentable.mkdir()
+    with open(os.fsencode(unrepresentable) + b'/invalid-\xff', 'wb') as stream:
+        stream.write(b'cannot claim a replacement-character JSON path\n')
+    refused = run(save('non-utf8', dict(artifact_dir=str(unrepresentable))), 'candidate', 'non-utf8')
+    check('unrepresentable filesystem names refuse instead of changing the JSON path',
+          refused.returncode == 4 and not refused.stdout)
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.inotify_init1.argtypes, libc.inotify_init1.restype = [ctypes.c_int], ctypes.c_int
+    libc.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+    libc.inotify_add_watch.restype = ctypes.c_int
+    races = [(mode, mutation) for mutation in ('truncate', 'replace')
+             for mode in (('incumbent', 'candidate') if baseline else ('candidate',))]
+    for mode, mutation in races:
+        label = mode + '-' + mutation
+        path = controls / ('changing-' + label)
+        with path.open('wb') as stream:
+            stream.truncate(256 * 1024 * 1024)
+        input_path = save('changing-' + label, dict(artifact_paths=[str(path)]))
+        descriptor = libc.inotify_init1(os.O_CLOEXEC)
+        if descriptor < 0:
+            raise OSError(ctypes.get_errno(), 'inotify_init1')
+        process = None
+        observed_read = False
+        try:
+            if libc.inotify_add_watch(descriptor, os.fsencode(path), 1) < 0:
+                raise OSError(ctypes.get_errno(), 'inotify_add_watch')
+            process = subprocess.Popen(arguments(input_path, mode), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if select.select([descriptor], [], [], 10)[0]:
+                event = os.read(descriptor, 4096)
+                observed_read = bool(struct.unpack_from('iIII', event)[1] & 1)
+                if mutation == 'replace':
+                    path.rename(controls / ('retained-original-' + label))
+                with path.open('wb') as stream:
+                    stream.write(b'changed while hashing\n')
+            stdout, stderr = process.communicate(timeout=20)
+        finally:
+            os.close(descriptor)
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.communicate()
+        (work / (label + '-changing.stdout')).write_bytes(stdout)
+        (work / (label + '-changing.stderr')).write_bytes(stderr)
+        check(label + ': mutation occurs after a real file read', observed_read)
+        if mode == 'candidate':
+            check(mutation + ': held-file capture refuses changed bytes with empty stdout',
+                  process.returncode == 4 and not stdout and b'artifact changed' in stderr.lower())
+        else:
+            # This is evidence of the original defect, never an expected
+            # admission for the candidate or an excuse to suppress a refusal.
+            unsafe = subprocess.CompletedProcess([], process.returncode, stdout, stderr)
+            check(mutation + ': actual incumbent demonstrates an inconsistent receipt during mutation',
+                  process.returncode == 0 and not receipt_matches(unsafe, [path]))
+
+summary = dict(checks=checks, failures=failures, timings=timings, artifact_count=len(paths))
+(work / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+print('Receipt producer: %d checks, %d failures' % (checks, len(failures)), flush=True)
+raise SystemExit(bool(failures))
+PY
+}
+
+if [[ "${1:-}" == --receipt-producer-only ]]; then
+    test_receipt_producer
+    exit $?
+fi
 
 # Only the build backend is controlled here. The actual target worker owns
 # the process group, captures checksums/inodes, serializes its attempt result,
@@ -9260,6 +9565,12 @@ case "$recipe_binding_status" in
     77) skip "repository recipe binding integration requires its local fixture dependencies" ;;
     *) fail "repository recipe drift admitted stale completed output or prevented an honest retry" ;;
 esac
+
+if test_receipt_producer; then
+    pass "artifact receipt producer preserves complete bytes and hashing custody"
+else
+    fail "artifact receipt producer lost bytes or admitted changed files"
+fi
 
 if test_worker_artifact_inventory; then
     pass "complete artifact inventories survive worker persistence and exact-byte reuse checks"
