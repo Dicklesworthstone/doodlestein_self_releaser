@@ -765,14 +765,18 @@ _act_validate_workflow_payload_result() {
     local result="$1" plan="$2" payload inventory actual paths additional name path row role format sha size identity
     local primary compat
     payload=$(jq -er '.workflow_payload_dir | strings | select(length > 0)' <<< "$result") || return 4
-    if ! jq -e --argjson plan "$plan" '
+    if ! jq -es --slurpfile plans /dev/fd/3 '
+        if length == 1 and (.[0] | type == "object") and
+           ($plans | length == 1 and (.[0] | type == "object"))
+        then .[0] else error("exactly one workflow result and plan required") end |
+        $plans[0] as $plan |
         .method == "act" and .platform == $plan.target and .job == $plan.job and
         .workflow_payload_plan == $plan and (.artifact_dir // "") == "" and (.artifact_path // "") == "" and
         (.workflow_artifact_dir | type == "string" and length > 0) and
         .workflow_artifact_dir != .workflow_payload_dir and
         (.artifact_paths | type == "array" and all(.[]; type == "string")) and
         (.additional_artifacts | type == "array")
-    ' <<< "$result" >/dev/null; then
+    ' 3<<< "$plan" <<< "$result" >/dev/null; then
         _log_error "Workflow result does not match its configured payload ownership plan"
         return 4
     fi
@@ -794,9 +798,9 @@ _act_validate_workflow_payload_result() {
         sha=$(jq -r '.sha256' <<< "$row"); size=$(jq -r '.size_bytes' <<< "$row"); identity=$(jq -r '.identity' <<< "$row")
         _act_validate_additional_artifact "$path" "$(jq -r '.target' <<< "$plan")" "$format" "$sha" "$size" "$identity" || return 4
         if [[ "$role" == additional ]]; then
-            row=$(jq -c --arg name "$name" --argjson plan "$plan" '
-                . + ($plan.outputs[$name] | if has("target_triple")
-                    then {target_triple:.target_triple} else {} end)' <<< "$row") || return 4
+            row=$(jq -c --arg name "$name" --slurpfile plan /dev/fd/3 '
+                . + ($plan[0].outputs[$name] | if has("target_triple")
+                    then {target_triple:.target_triple} else {} end)' 3<<< "$plan" <<< "$row") || return 4
             additional=$(jq -c --argjson row "$row" '. + [$row]' <<< "$additional") || return 4
         else
             paths=$(jq -c --arg path "$path" '. + [$path]' <<< "$paths") || return 4
@@ -821,13 +825,22 @@ PY
             fi
         fi
     done < <(find "$payload" -print0)
-    if ! jq -en --argjson seen "$payload_names_json" --argjson plan "$plan" --argjson result "$result" \
-        --argjson paths "$paths" --argjson additional "$additional" '
+    # Complete workflow results include both transport and payload inventories.
+    # Stream every collection instead of making it one exec argument; the
+    # independent ownership/receipt comparison must not impose an argv limit.
+    if ! jq -es --slurpfile seen /dev/fd/3 --slurpfile plans /dev/fd/4 \
+        --slurpfile paths /dev/fd/5 --slurpfile additional /dev/fd/6 '
+        if length == 1 and (.[0] | type == "object") and
+           ($plans | length == 1 and (.[0] | type == "object")) and
+           ([$seen,$paths,$additional] | all(.[]; length == 1 and (.[0] | type == "array")))
+        then .[0] else error("exactly one workflow result, plan and each receipt collection required") end |
+        . as $result | $seen[0] as $seen | $plans[0] as $plan |
+        $paths[0] as $paths | $additional[0] as $additional |
         ($seen | map(ascii_downcase) | length == (unique | length)) and
         (([$plan.outputs | to_entries[] | select(.value.required) | .key] - $seen) | length == 0) and
         ($paths | sort) == ($result.artifact_paths | sort) and
         ($additional | sort_by(.path)) == ($result.additional_artifacts | sort_by(.path))
-    ' >/dev/null; then
+    ' 3<<< "$payload_names_json" 4<<< "$plan" 5<<< "$paths" 6<<< "$additional" <<< "$result" >/dev/null; then
         _log_error "Workflow result is missing required primaries or companions, or has contradictory payload receipts"
         return 4
     fi
@@ -906,9 +919,9 @@ _act_materialize_workflow_payloads() {
             [[ "$format" != binary ]] || mode=700
             receipt=$(_act_collect_stream_exclusive "$payload/$name" "$mode" _act_stream_local_file "$path") || return 4
             if [[ "$role" == additional ]]; then
-                receipt=$(jq -c --arg name "$name" --argjson plan "$plan" '
-                    . + ($plan.outputs[$name] | if has("target_triple")
-                        then {target_triple:.target_triple} else {} end)' <<< "$receipt") || return 4
+                receipt=$(jq -c --arg name "$name" --slurpfile plan /dev/fd/3 '
+                    . + ($plan[0].outputs[$name] | if has("target_triple")
+                        then {target_triple:.target_triple} else {} end)' 3<<< "$plan" <<< "$receipt") || return 4
                 additional=$(jq -c --argjson receipt "$receipt" '. + [$receipt]' <<< "$additional") || return 4
             else
                 paths=$(jq -c --arg path "$payload/$name" '. + [$path]' <<< "$paths") || return 4
@@ -917,13 +930,23 @@ _act_materialize_workflow_payloads() {
     done < <(jq -c '.[]' <<< "$before")
     after=$(_act_result_artifact_receipts "$(jq -cn --arg dir "$raw" '{workflow_artifact_dir:$dir}')") || return 4
     [[ "$before" == "$after" ]] || { _log_error "Workflow transport inventory changed during collection"; return 4; }
-    result=$(jq -c --arg raw "$raw" --arg payload "$payload" --argjson plan "$plan" \
-        --argjson paths "$paths" --argjson additional "$additional" '
-        . + {artifact_dir:"",artifact_path:"",artifact_paths:$paths,additional_artifacts:$additional,
-             workflow_artifact_dir:$raw,workflow_payload_dir:$payload,workflow_payload_plan:$plan,
-             artifact_count:(($paths|length)+($additional|length))}' <<< "$result") || return 4
+    result=$(jq -cse --arg raw "$raw" --arg payload "$payload" --slurpfile plans /dev/fd/3 \
+        --slurpfile paths /dev/fd/4 --slurpfile additional /dev/fd/5 '
+        if length == 1 and (.[0] | type == "object") and
+           ($plans | length == 1 and (.[0] | type == "object")) and
+           ([$paths,$additional] | all(.[]; length == 1 and (.[0] | type == "array")))
+        then .[0] else error("exactly one workflow result, plan and each receipt collection required") end |
+        . + {artifact_dir:"",artifact_path:"",artifact_paths:$paths[0],additional_artifacts:$additional[0],
+             workflow_artifact_dir:$raw,workflow_payload_dir:$payload,workflow_payload_plan:$plans[0],
+             artifact_count:(($paths[0]|length)+($additional[0]|length))}' \
+        3<<< "$plan" 4<<< "$paths" 5<<< "$additional" <<< "$result") || return 4
     inventory=$(_act_result_artifact_receipts "$result") || return 4
-    result=$(jq -c --argjson inventory "$inventory" '.workflow_inventory=$inventory' <<< "$result") || return 4
+    result=$(jq -cse --slurpfile inventory /dev/fd/3 '
+        if length == 1 and (.[0] | type == "object") and
+           ($inventory | length == 1 and (.[0] | type == "array" and length > 0))
+        then .[0] + {workflow_inventory:$inventory[0]}
+        else error("exactly one workflow result and complete inventory required") end
+    ' 3<<< "$inventory" <<< "$result") || return 4
     _act_validate_workflow_payload_result "$result" "$plan" || return 4
     printf '%s\n' "$result"
 }

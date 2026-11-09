@@ -8,6 +8,8 @@
 # --host-capacity-only covers the same queue with real one-slot host leases.
 # --artifact-inventory-only exercises large completion receipts and reuse
 # against real files without compilers, Docker, SSH, or host-health fixtures.
+# --workflow-inventory-only exercises complete typed workflow collection and
+# admission beyond the exec argument limit using actual ZIP and payload bytes.
 
 set -uo pipefail
 
@@ -203,6 +205,187 @@ PY
 
 if [[ "${1:-}" == --artifact-inventory-only ]]; then
     test_worker_artifact_inventory
+    exit $?
+fi
+
+# Exercise the production ZIP collector and independent workflow admission.
+# The Linux fixture uses existing files below valid deep stage paths to cross
+# the argument limit without hundreds of archive/content validation processes.
+test_workflow_artifact_inventory() {
+    local project_root dependency
+    project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" || return 1
+    for dependency in python3 bash jq tar gzip unzip; do
+        command -v "$dependency" >/dev/null || { echo "Missing test dependency: $dependency" >&2; return 77; }
+    done
+    python3 -I - "${DSR_TEST_ACT_RUNNER:-$project_root/src/act_runner.sh}" <<'PY'
+import copy
+import errno
+import hashlib
+import io
+import json
+from pathlib import Path
+import shutil
+import stat
+import struct
+import subprocess
+import sys
+import tarfile
+import tempfile
+import zipfile
+
+module = Path(sys.argv[1]).resolve()
+work = Path(tempfile.mkdtemp(prefix='dsr-workflow-inventory-')).resolve()
+print('Retained workflow inventory fixtures: ' + str(work), flush=True)
+checks, failures = 0, []
+
+
+def check(label, condition):
+    global checks
+    checks += 1
+    print(('PASS ' if condition else 'FAIL ') + label, flush=True)
+    if not condition:
+        failures.append(label)
+
+
+driver = r'''set -uo pipefail
+source "$1" || exit 90
+fixture=$2
+ACT_ARTIFACTS_DIR=$(cat "$fixture/stage-path") || exit 4
+plan=$(cat "$fixture/plan.json") || exit 4
+result=$(cat "$fixture/$3.json") || exit 4
+if [[ "$3" == backend ]]; then
+    _act_materialize_workflow_payloads "$result" "$plan"
+else
+    _act_validate_workflow_payload_result "$result" "$plan"
+fi
+'''
+
+
+def invoke(name):
+    result = subprocess.run(['bash', '-c', driver, '_', str(module), str(work), name],
+                            capture_output=True, text=True, timeout=120)
+    (work / (name + '.stdout')).write_text(result.stdout)
+    (work / (name + '.stderr')).write_text(result.stderr)
+    return result
+
+
+def save(name, value):
+    (work / (name + '.json')).write_text(json.dumps(value) + '\n')
+
+
+stage = work / 'retained-build-stage'
+large = sys.platform.startswith('linux')
+if large:
+    # Leave ample room below Linux PATH_MAX for the private workflow directory
+    # and its payload names. Every byte contributing to the JSON size names a
+    # real directory or file; no fake inventory entries or padding are used.
+    index = 0
+    while len(str(stage).encode()) < 3760:
+        stage /= 'release-candidate-%02d-source-dependencies-and-compiler-artifact-staging' % index
+        index += 1
+stage.mkdir(parents=True)
+(work / 'stage-path').write_text(str(stage) + '\n')
+raw = stage / 'uploads'
+raw.mkdir()
+
+header = bytearray(64)
+header[:7] = b'\x7fELF\x02\x01\x01'
+struct.pack_into('<HHI', header, 16, 2, 62, 1)
+header.extend(b'inert format-admission fixture; never executed\n')
+primary_name = 'inventory-tool-1.0.0-linux-amd64.tar.gz'
+primary = io.BytesIO()
+with tarfile.open(fileobj=primary, mode='w:gz') as archive:
+    member = tarfile.TarInfo('inventory-tool')
+    member.size, member.mode, member.mtime = len(header), 0o755, 0
+    archive.addfile(member, io.BytesIO(header))
+payloads = {primary_name: primary.getvalue()}
+triple = 'x86_64-unknown-linux-gnu'
+outputs = {primary_name: dict(role='primary', format='tar.gz', required=True, target_triple=triple)}
+for index in range(33 if large else 2):
+    name = 'dependency-release-metadata-%02d.json' % index
+    payloads[name] = json.dumps(dict(dependency=index, target=triple, retained=True)).encode() + b'\n'
+    outputs[name] = dict(role='additional', format='json', required=True,
+                         owner_target_triple=triple, target_triple=triple)
+wrapper = raw / 'release-uploads.zip'
+with zipfile.ZipFile(wrapper, 'w', zipfile.ZIP_DEFLATED) as archive:
+    for name, data in payloads.items():
+        member = zipfile.ZipInfo('dist/' + name)
+        member.create_system = 3
+        member.external_attr = (stat.S_IFREG | 0o644) << 16
+        archive.writestr(member, data)
+plan = dict(target='linux/amd64', job='build-release', version='v1.0.0',
+            primaries=[dict(target_triple=triple, primary=primary_name, compat=primary_name,
+                            archive_format='tar.gz')], binaries=['inventory-tool'], outputs=outputs,
+            act_arguments_sha256=hashlib.sha256(b'[]').hexdigest(), matrix=None)
+save('plan', plan)
+save('backend', dict(method='act', platform='linux/amd64', job='build-release',
+                     status='success', exit_code=0, artifact_dir=str(raw)))
+result = invoke('backend')
+try:
+    collected = json.loads(result.stdout)
+except ValueError:
+    collected = {}
+check('actual ZIP collection materializes a valid complete workflow result',
+      result.returncode == 0 and collected.get('status') == 'success')
+if not collected:
+    print('Collection stderr retained in ' + str(work / 'backend.stderr'), flush=True)
+    raise SystemExit(1)
+save('collected', collected)
+payload_dir = Path(collected['workflow_payload_dir'])
+inventory = collected['workflow_inventory']
+actual_paths = {str(wrapper), *(str(payload_dir / name) for name in payloads)}
+check('complete transport and payload receipts bind existing paths, bytes, sizes and inodes',
+      len(inventory) == len(actual_paths) and {row['path'] for row in inventory} == actual_paths and
+      all(row['sha256'] == hashlib.sha256(Path(row['path']).read_bytes()).hexdigest() and
+          row['size_bytes'] == Path(row['path']).stat().st_size and row['identity'] in (
+              'gnu:%s:%s' % (Path(row['path']).stat().st_dev, Path(row['path']).stat().st_ino),
+              'bsd:%s' % Path(row['path']).stat().st_ino) for row in inventory))
+check('every declared companion retains its exact bytes and configured compiler owner',
+      len(collected['additional_artifacts']) == len(payloads) - 1 and
+      all(row['target_triple'] == triple and Path(row['path']).read_bytes() == payloads[Path(row['path']).name]
+          for row in collected['additional_artifacts']) and
+      collected['artifact_paths'] == [str(payload_dir / primary_name)] and
+      collected['workflow_payload_plan'] == plan and collected['artifact_count'] == len(payloads))
+if large:
+    for label, document in (('companions', collected['additional_artifacts']), ('inventory', inventory),
+                            ('complete result', collected)):
+        serialized = json.dumps(document, separators=(',', ':'))
+        check(label + ': real complete JSON exceeds the single-argument limit', len(serialized.encode()) > 131072)
+        try:
+            subprocess.run([shutil.which('jq'), '-n', '--argjson', 'value', serialized, '$value'],
+                           capture_output=True, check=False)
+        except OSError as error:
+            check(label + ': previous argv transport fails with E2BIG', error.errno == errno.E2BIG)
+        else:
+            check(label + ': previous argv transport fails with E2BIG', False)
+
+# The real independent validator must still reject contradictory collection
+# receipts even while all original artifact bytes and inventory rows match.
+contradictory = copy.deepcopy(collected)
+contradictory['additional_artifacts'].pop()
+save('contradictory', contradictory)
+refused = invoke('contradictory')
+check('independent admission rejects a missing companion receipt despite intact bytes',
+      refused.returncode == 4 and 'contradictory payload receipts' in refused.stderr)
+
+selected = payload_dir / sorted(name for name in payloads if name != primary_name)[0]
+original = selected.read_bytes()
+selected.write_bytes(original + b'changed after collection\n')
+refused = invoke('collected')
+check('changed payload bytes cannot reuse the frozen workflow inventory', refused.returncode == 4)
+selected.write_bytes(original)
+wrapper.rename(work / 'retained-missing-wrapper.zip')
+refused = invoke('collected')
+check('missing original transport cannot reuse otherwise intact payloads', refused.returncode == 4)
+
+(work / 'summary.json').write_text(json.dumps(dict(checks=checks, failures=failures)) + '\n')
+print('Workflow artifact inventory: %d checks, %d failures' % (checks, len(failures)), flush=True)
+raise SystemExit(bool(failures))
+PY
+}
+
+if [[ "${1:-}" == --workflow-inventory-only ]]; then
+    test_workflow_artifact_inventory
     exit $?
 fi
 
@@ -9082,6 +9265,12 @@ if test_worker_artifact_inventory; then
     pass "complete artifact inventories survive worker persistence and exact-byte reuse checks"
 else
     fail "worker artifact inventory was truncated, lost, or admitted changed output"
+fi
+
+if test_workflow_artifact_inventory; then
+    pass "complete workflow inventories survive materialization and independent admission"
+else
+    fail "workflow inventory was truncated, lost, or admitted contradictory output"
 fi
 
 if test_worker_group_lifecycle; then
