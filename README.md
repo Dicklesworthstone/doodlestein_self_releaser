@@ -663,7 +663,8 @@ or launching a compiler. Other synced hosts can continue. Repair the connection
 and use `--resume` to sync again and retry the blocked targets; verified
 completed artifacts remain reusable, and sync failures do not consume compiler
 retries. `--sync-only` exits 1 if any host fails. Use `--no-sync` when you manage
-the remote sources separately; it explicitly bypasses the sync gate on resume.
+the remote sources separately for a new run. A staged run cannot discard its
+source binding by adding `--no-sync` on resume.
 
 Normal native builds stage source in fresh directories under the host's
 configured `build_root`, or its default disk staging location. Each stage
@@ -677,12 +678,25 @@ hooks, and credentials are not copied into the build repository. Git-backed
 sibling crates receive their own contexts, and a missing required sibling
 blocks sync.
 
+The controller requires rsync and Python 3 for ordinary staging. It applies
+the configured sync selection once to a private source projection, then sends
+that same projection to every native host. The saved source-input fingerprint
+covers selected file paths, contents, permissions, symlink text, configured
+siblings, and the captured Git context. Ignored or otherwise excluded outputs
+do not change it. Symlink targets outside the selected namespace are not
+included. Resume requires this original fingerprint before reusing completed
+artifacts: changing tracked or selected untracked files at the same commit
+requires restoring the original inputs or starting a fresh run. A checkpoint
+without its original source binding also requires a fresh run. A refused
+resume preserves the checkpoint, completed artifacts, and publication receipt.
+
 The source must be a complete, non-shallow SHA-1 repository worktree at its
 top-level directory. Sparse checkouts and files marked `assume-unchanged` or
 `skip-worktree` are refused because their dirty-state semantics cannot be
 reconstructed from the transferred files. Source directories and bundle
 receipts remain available for resume. `--sync-only` continues to synchronize
-the configured checkout paths; `--no-sync` uses externally managed sources.
+the configured checkout paths; a fresh `--no-sync` run uses externally managed
+sources.
 
 A failed strict native target can move to another configured host during an
 explicit resume, after the original controller has released its build lock:

@@ -890,13 +890,83 @@ build_state_set_context() {
       .updated_at = $now' 3<<< "$source_sync_json" 4<<< "$snapshot_owners_json"
 }
 
+# Shared admission for the immutable source namespace of an ordinary run.
+# Git HEAD alone cannot identify dirty, untracked or sibling source bytes.
+_build_state_source_input_filters() {
+  cat <<'JQ'
+    def ordinary_source_inputs:
+      type == "object" and .schema_version == 1 and .policy == "ordinary-source-v1" and
+      (keys == ["bytes","directories","files","policy","roots","schema_version","sha256","symlinks"]) and
+      (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+      all([.bytes,.directories,.files,.symlinks][];
+        type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
+      (.roots | type == "array" and length > 0 and . == (sort | unique) and
+        index("source") != null and all(.[];
+          type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and (contains("..") | not)));
+    def admit_ordinary_source_inputs($next):
+      . as $state |
+      (.context.source_sync // null) as $prior |
+      if $prior.staged_ordinary == true or $next.staged_ordinary == true then
+        if $prior.staged_ordinary != true or $next.staged_ordinary != true or
+           (($prior.source_inputs | ordinary_source_inputs) | not) or
+           (($next.source_inputs | ordinary_source_inputs) | not) or
+           $prior.source_inputs != $next.source_inputs
+        then error("ordinary source inputs changed or lack their original binding; restore the selected sources or start a fresh run")
+        elif (.context.build_tasks | type) != "array"
+        then error("ordinary source binding requires the original task inventory")
+        elif any(.context.build_tasks[] | select(.method == "native") |
+          $state.target_statuses[.key];
+          (.status == "completed" or (.result.status | IN("success", "ok", "passed"))) and
+          (.result.method != "native" or .result.source_sync.source_inputs != $prior.source_inputs))
+        then error("successful native target does not retain the original source input binding")
+        else . end
+      else . end;
+JQ
+}
+
+# Read-only admission before reusing a completed target or changing run state.
+# A staged run cannot discard this binding by requesting an unmanaged resume.
+build_state_validate_source_inputs() {
+  local state="$1" source_sync="$2" filters result_path
+  filters=$(_build_state_source_input_filters) || return 1
+  if ! jq -ces --slurpfile next /dev/fd/3 "$filters"'
+      if length == 1 and ($next | length) == 1 then
+        .[0] | admit_ordinary_source_inputs($next[0]) | true
+      else error("exactly one checkpoint and source observation required") end
+    ' 3<<< "$source_sync" <<< "$state" >/dev/null; then
+    log_error "Cannot resume with changed or unbound ordinary sources; restore the original inputs or start a fresh run"
+    return 1
+  fi
+  if ! jq -e '.context.source_sync.staged_ordinary == true' <<< "$state" >/dev/null; then
+    return 0
+  fi
+  # A worker writes its immutable sidecar before the coordinator records
+  # completion. Inspect successful recovery candidates before any checkpoint
+  # update, using the saved task method rather than a result's self-label.
+  while IFS= read -r -d '' result_path; do
+    [[ -s "$result_path" ]] || continue
+    if [[ ! -f "$result_path" || -L "$result_path" ]] ||
+       ! jq -ces --slurpfile receipt /dev/fd/3 '
+          length == 1 and (.[0] | type == "object") and
+          (.[0] | if (.status | IN("success", "ok", "passed")) then
+            .method == "native" and .source_sync.source_inputs == $receipt[0].source_inputs
+           else true end)
+        ' 3<<< "$source_sync" "$result_path" >/dev/null; then
+      log_error "Cannot reuse native recovery sidecar without its original source input binding: $result_path"
+      return 1
+    fi
+  done < <(jq -j '. as $state | .context.build_tasks[] | select(.method == "native") |
+    $state.target_statuses[.key].result_path | select(type == "string" and length > 0) | ., "\u0000"' <<< "$state")
+  return 0
+}
+
 # Refresh an ordinary run's sync admission evidence without changing completed
 # targets or their attempt receipts. The coordinator validates the receipt and
 # holds the orchestration lock. A null receipt records an explicit sync opt-out.
 # Args: tool version run_id source_sync_json source_roots_json target_hosts_json
 build_state_set_source_sync() {
   local tool="$1" version="$2" run_id="$3" source_sync_json="$4"
-  local source_roots_json="$5" target_hosts_json="$6" tool_dir state_file now
+  local source_roots_json="$5" target_hosts_json="$6" tool_dir state_file now filters prior_state
   if ! jq -es --argjson roots "$source_roots_json" --argjson hosts "$target_hosts_json" '
         length == 1 and (.[0] as $receipt |
         ($receipt == null or ($receipt | type == "object")) and
@@ -910,11 +980,15 @@ build_state_set_source_sync() {
   tool_dir=$(_build_get_tool_dir "$tool" "$version")
   state_file="$tool_dir/$run_id/state.json"
   [[ -f "$state_file" ]] || return 1
+  prior_state=$(cat -- "$state_file") || return 1
+  build_state_validate_source_inputs "$prior_state" "$source_sync_json" || return 1
   now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  filters=$(_build_state_source_input_filters) || return 1
   _build_state_jq_update "$state_file" \
     --slurpfile source_sync /dev/stdin --argjson roots "$source_roots_json" \
-    --argjson hosts "$target_hosts_json" --arg now "$now" '
+    --argjson hosts "$target_hosts_json" --arg now "$now" "$filters"'
       ($source_sync | select(length == 1) | .[0]) as $source_sync |
+      admit_ordinary_source_inputs($source_sync) |
       if .status == "completed" or .status == "cancelled"
       then error("cannot refresh source sync for a terminal run")
       else

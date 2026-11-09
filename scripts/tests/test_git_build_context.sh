@@ -400,13 +400,22 @@ build_state_init || exit 1
 LARGE_RUN=$(DSR_RUN_ID=large-tags build_state_create large-tags v1.0.0 linux/amd64) || exit 1
 LARGE_ROOTS=$(jq -nc --arg root "$WORK/large-local" '{"fixture-tags":$root}') || exit 1
 LARGE_HOSTS='{"linux/amd64":"fixture-tags"}'
+# Use the production inventory over real copied source bytes and the actual
+# large Git context; resumable staging requires this original input binding.
+mkdir "$WORK/large-projection" || exit 1
+copy_source "$WORK/large-source" "$WORK/large-projection/source" || exit 1
+LARGE_CONTEXTS=$(jq -c '[{relative_path:"source",context:.}]' <<< "$LARGE_CONTEXT") || exit 1
+LARGE_INPUTS=$(_act_ordinary_source_inputs "$WORK/large-projection" "$LARGE_CONTEXTS") || exit 1
 LARGE_SYNC=$(jq -c --argjson roots "$LARGE_ROOTS" --argjson hosts "$LARGE_HOSTS" \
-  '{status:"success",staged_ordinary:true,synced:1,failed:0,git_context:.,source_roots:$roots,target_hosts:$hosts}' \
+  --argjson inputs "$LARGE_INPUTS" \
+  '{status:"success",staged_ordinary:true,source_inputs:$inputs,synced:1,failed:0,
+    git_context:.,source_roots:$roots,target_hosts:$hosts}' \
   <<< "$LARGE_CONTEXT") || exit 1
 printf '%s\n' "$LARGE_SYNC" > "$WORK/large-sync.json" || exit 1
 check 'initial checkpoint persists a source receipt larger than argv permits' \
   build_state_set_context large-tags v1.0.0 "$LARGE_RUN" "$LARGE_SHA" main \
-  "$LARGE_ROOTS" "$WORK/large-output" 1 "$LARGE_HOSTS" release '' '' "$LARGE_SYNC" \
+  "$LARGE_ROOTS" "$WORK/large-output" 1 "$LARGE_HOSTS" release \
+  '[{"key":"linux/amd64","platform":"linux/amd64","target_triple":"","method":"native"}]' '' "$LARGE_SYNC" \
   "$(printf '%064d' 7)"
 LARGE_EXTRA=$(jq -c '{attempts:1,result:{status:"failed",stage:"source_sync",source_sync:.}}' \
   <<< "$LARGE_SYNC") || exit 1

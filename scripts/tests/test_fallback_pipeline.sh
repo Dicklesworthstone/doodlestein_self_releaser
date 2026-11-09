@@ -876,6 +876,52 @@ test_completed_task_plan() {
         [[ "$RC" == 4 ]] && one_result && blocked && ! grep -q '^BUILD ' "$CALLS"
     fi
 }
+test_completed_ordinary_source_inputs() {
+    setup "completed-ordinary-$1"
+    mkdir -p "$CASE/sibling" "$CASE/initial-source-contexts" || return 1
+    git -C "$CASE/sibling" init -q || return 1
+    printf 'sibling input\n' > "$CASE/sibling/src.txt"
+    printf 'ignored.log\n' > "$CASE/sibling/.gitignore"
+    printf 'ignored output\n' > "$CASE/sibling/ignored.log"
+    git -C "$CASE/sibling" add src.txt .gitignore || return 1
+    git -C "$CASE/sibling" -c user.name=Fixture -c user.email=fixture@example.invalid \
+        commit -qm sibling || return 1
+    printf 'sibling_crates:\n  - local_path: %s\n    relative_path: sibling\n' \
+        "$CASE/sibling" >> "$ACT_REPOS_DIR/tool.yaml"
+    completed_fixture || return 1
+    local contexts inputs tasks checkpoint_before payload_before expected_rc=4
+    contexts=$(_act_export_ordinary_git_contexts "$ACT_REPOS_DIR/tool.yaml" \
+        "$CASE/source" "$CASE/initial-source-contexts") || return 1
+    inputs=$(_act_project_ordinary_sources "$ACT_REPOS_DIR/tool.yaml" "$contexts" \
+        "$CASE/initial-source-contexts/selected-sources") || return 1
+    tasks=$(_act_build_task_plan tool 1.2.3 '["linux/amd64","darwin/arm64"]' false) || return 1
+    jq --argjson inputs "$inputs" --argjson tasks "$tasks" \
+        '.context.source_sync={staged_ordinary:true,source_inputs:$inputs} | .context.build_tasks=$tasks' \
+        "$CASE/checkpoint.json" > "$CASE/bound-state.json" || return 1
+    mv "$CASE/bound-state.json" "$CASE/checkpoint.json" || return 1
+    case "$1" in
+        matching) expected_rc=0 ;;
+        excluded) printf 'new ignored output\n' >> "$CASE/sibling/ignored.log"; expected_rc=0 ;;
+        selected) printf 'new sibling input\n' >> "$CASE/sibling/src.txt" ;;
+        permissions) chmod 755 "$CASE/sibling/src.txt" ;;
+        unbound)
+            jq 'del(.context.source_sync.source_inputs)' "$CASE/checkpoint.json" > "$CASE/unbound-state.json" || return 1
+            mv "$CASE/unbound-state.json" "$CASE/checkpoint.json" || return 1 ;;
+        quality) QUALITY_MUTATES_PINNED_CHILD=sibling/src.txt; expected_rc=6 ;;
+    esac
+    checkpoint_before=$(_release_sha256 "$CASE/checkpoint.json") || return 1
+    payload_before=$(_release_sha256 "$OUT/worker") || return 1
+    run_fallback --resume
+    [[ "$RC" == "$expected_rc" ]] && one_result &&
+        [[ "$(_release_sha256 "$CASE/checkpoint.json")" == "$checkpoint_before" &&
+           "$(_release_sha256 "$OUT/worker")" == "$payload_before" && ! -e "$CASE/lock" ]] &&
+        ! grep -q '^BUILD ' "$CALLS" || return 1
+    if [[ "$expected_rc" == 0 ]]; then
+        grep -q '^RELEASE ' "$CALLS"
+    else
+        ! grep -q '^RELEASE ' "$CALLS"
+    fi
+}
 test_completed_rejects_drift() {
     setup "drift-$1"; completed_fixture
     case "$1" in
@@ -1630,6 +1676,9 @@ run_test test_completed_resume false
 run_test test_completed_default_output
 run_test test_completed_task_plan matching
 run_test test_completed_task_plan drift
+for mode in matching excluded selected permissions unbound quality; do
+    run_test test_completed_ordinary_source_inputs "$mode"
+done
 for drift in source targets output run manifest-sha payload quality-source; do run_test test_completed_rejects_drift "$drift"; done
 for mode in missing malformed cancelled diagnostic selected; do run_test test_invalid_checkpoint "$mode"; done
 run_test test_signature_resume

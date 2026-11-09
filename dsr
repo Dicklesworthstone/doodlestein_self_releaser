@@ -3449,8 +3449,7 @@ EOF
             # The orchestrator still verifies every retained target receipt.
             local locked_resume_state
             locked_resume_state=$(build_state_get "$tool_name" "$version" "$resume_run_id") || return 4
-            if [[ "$(jq -r '.status' <<< "$locked_resume_state")" != completed ]] || \
-               ! build_state_update_status "$tool_name" "$version" targets-complete "$resume_run_id"; then
+            if [[ "$(jq -r '.status' <<< "$locked_resume_state")" != completed ]]; then
                 log_error "Could not resume interrupted build publication"
                 return 4
             fi
@@ -3488,7 +3487,8 @@ EOF
 
     # Strict resume reuses the immutable, SHA-verified source roots recorded by
     # the interrupted run. Creating a second strict snapshot would change the
-    # run identity and defeat resume. Ordinary builds may safely resync HEAD.
+    # run identity and defeat resume. Ordinary builds resync their complete
+    # selected source namespace and compare it before any target is reused.
     if $resume && $build_release_contract_enabled; then
         build_run_id="$resume_run_id"
         build_source_args=(
@@ -3653,6 +3653,29 @@ EOF
                 json_envelope "build" "success" 0 "$sync_json"
             fi
             return 0
+        fi
+    fi
+
+    if $resume && ! $build_release_contract_enabled; then
+        local source_resume_state source_resume_observation="${sync_json:-null}"
+        $no_sync && source_resume_observation=null
+        source_resume_state=$(build_state_get "$tool_name" "$version" "$resume_run_id") || return 4
+        if ! build_state_validate_source_inputs "$source_resume_state" "$source_resume_observation"; then
+            if $JSON_MODE; then
+                json_envelope "build" "error" 4 "$(jq -nc \
+                    --arg repo "$ACT_REPO_GITHUB" --arg version "$tag" \
+                    '{repo:$repo,version:$version,targets:[],
+                      error:"Ordinary source inputs changed or lack their original binding; restore the selected sources or start a fresh run"}')"
+            fi
+            return 4
+        fi
+    fi
+    if $resume_completed; then
+        # Source admission must precede this first checkpoint mutation: an
+        # interrupted publication cannot repackage old outputs with new inputs.
+        if ! build_state_update_status "$tool_name" "$version" targets-complete "$resume_run_id"; then
+            log_error "Could not resume interrupted build publication"
+            return 4
         fi
     fi
 
@@ -12904,6 +12927,7 @@ EOF
         local current_sha source_status target_list targets_json
         local tasks_json strict_tasks=false matrix_digest=""
         local task task_key workflow_identity retained_target retained_result retained_path
+        local source_parent source_context_parent source_contexts source_inputs source_observation
         local -a configured_targets=()
         _act_repo_config_matches "$tool_name" "$fallback_repo_config_sha256" || return 1
         build_state_validate_repo_config "$resume_state" "$fallback_repo_config_sha256" || return 1
@@ -12928,6 +12952,26 @@ EOF
             (if $matrix_digest == "" then true
              else .context.native_matrix_config_sha256 == $matrix_digest end)
         ' <<< "$resume_state" >/dev/null || return 1
+        # This shortcut skips cmd_build, including its ordinary source-input
+        # admission. Observe the same selected working-tree and sibling bytes
+        # locally at both reuse boundaries; Git HEAD alone cannot bind them.
+        if [[ "$contract" == null ]] &&
+           jq -e '.context.source_sync.staged_ordinary == true' <<< "$resume_state" >/dev/null; then
+            source_parent="$state_dir/source-contexts"
+            if ! mkdir -p -- "$source_parent" || [[ -L "$source_parent" ]] ||
+               ! source_parent=$(cd "$source_parent" && pwd -P) ||
+               ! source_context_parent=$(mktemp -d "$source_parent/completed-resume.XXXXXXXX") ||
+               ! chmod 700 "$source_context_parent"; then
+                return 1
+            fi
+            source_contexts=$(_act_export_ordinary_git_contexts \
+                "$ACT_REPOS_DIR/$tool_name.yaml" "$local_path" "$source_context_parent") || return 1
+            source_inputs=$(_act_project_ordinary_sources "$ACT_REPOS_DIR/$tool_name.yaml" \
+                "$source_contexts" "$source_context_parent/selected-sources") || return 1
+            source_observation=$(jq -cn '{staged_ordinary:true,source_inputs:input}' \
+                <<< "$source_inputs") || return 1
+            build_state_validate_source_inputs "$resume_state" "$source_observation" || return 1
+        fi
         # Completed fallback bypasses the worker scheduler. Require the same
         # original workflow/layout custody here against the freshly resolved
         # task, including any successful sidecar independently of its embedded

@@ -11,9 +11,330 @@
 # as root with a full UID map also covers UID 501 and a non-root SSH receiver.
 # Use --windows-source-links-only for real Git archives and PowerShell regular
 # copy materialization. On Unix this proves the receiver logic, not NTFS.
+# Use --ordinary-inputs-only for actual source selection and immutable resume
+# bindings; --ordinary-resume-only exercises a real Go matrix through cmd_build.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 ROOT="${DSR_TEST_ROOT:-$ROOT}"
+
+test_ordinary_source_inputs() (
+    local dependency work config contexts first next result state_file state failures=0 checks=0
+    for dependency in bash git jq yq python3 rsync; do
+        command -v "$dependency" >/dev/null || { printf 'SKIP: ordinary input tests require %s\n' "$dependency"; return 77; }
+    done
+    work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-ordinary-inputs.XXXXXXXX") || return 1
+    printf 'Ordinary source-input evidence: %s\n' "$work"
+    mkdir -p "$work/source/ignored" "$work/source/target" "$work/sibling" "$work/config/repos.d" "$work/plain" || return 1
+    export DSR_CONFIG_DIR="$work/config" ACT_CONFIG_DIR="$work/config" ACT_REPOS_DIR="$work/config/repos.d"
+    export DSR_STATE_DIR="$work/state" DSR_CACHE_DIR="$work/cache" NO_COLOR=1
+    # shellcheck source=../../src/logging.sh
+    source "$ROOT/src/logging.sh"
+    # shellcheck source=../../src/config.sh
+    source "$ROOT/src/config.sh"
+    # shellcheck source=../../src/git_ops.sh
+    source "$ROOT/src/git_ops.sh"
+    # shellcheck source=../../src/build_state.sh
+    source "$ROOT/src/build_state.sh"
+    # shellcheck source=../../src/act_runner.sh
+    source "$ROOT/src/act_runner.sh"
+    check_inputs() {
+        local label="$1"; shift
+        checks=$((checks + 1))
+        if "$@"; then printf 'PASS: %s\n' "$label"
+        else failures=$((failures + 1)); printf 'FAIL: %s\n' "$label" >&2; fi
+    }
+    printf 'tracked-original\n' > "$work/source/tracked"
+    printf 'selected untracked\n' > "$work/source/untracked"
+    printf '#!/bin/sh\nprintf original\\n\n' > "$work/source/script"
+    chmod 755 "$work/source/script" || return 1
+    printf 'ignored/\n' > "$work/source/.gitignore"
+    printf 'ignored cache\n' > "$work/source/ignored/cache"
+    printf 'compiled output\n' > "$work/source/target/output"
+    printf 'custom excluded\n' > "$work/source/custom.drop"
+    ln -s tracked "$work/source/link" || return 1
+    printf 'sibling original\n' > "$work/sibling/input"
+    printf '*.cache\n' > "$work/sibling/.gitignore"
+    printf 'ignored sibling cache\n' > "$work/sibling/input.cache"
+    printf '*.cache\n' > "$work/plain/.gitignore"
+    printf 'selected plain cache\n' > "$work/plain/input.cache"
+    for result in source sibling; do
+        git -C "$work/$result" init -q -b main || return 1
+        git -C "$work/$result" add .gitignore || return 1
+        if [[ "$result" == source ]]; then
+            git -C "$work/source" add tracked script link || return 1
+        else
+            git -C "$work/sibling" add input || return 1
+        fi
+        git -C "$work/$result" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm inputs || return 1
+    done
+    config="$ACT_REPOS_DIR/inputs.yaml"
+    jq -n --arg work "$work" '{tool_name:"inputs",local_path:($work+"/source"),
+        sync_excludes:["custom.drop"],sibling_crates:[
+          {local_path:($work+"/sibling"),relative_path:"selected-sibling"},
+          {local_path:($work+"/plain"),relative_path:"plain",respect_gitignore:null}]}' > "$config" || return 1
+    capture_inputs() {
+        local label="$1"
+        mkdir "$work/contexts-$label" || return 1
+        contexts=$(_act_export_ordinary_git_contexts "$config" "$work/source" "$work/contexts-$label") || return 1
+        _act_project_ordinary_sources "$config" "$contexts" "$work/projection-$label" > "$work/$label.json"
+    }
+    capture_inputs original || return 1
+    first=$(cat "$work/original.json") || return 1
+    check_inputs 'projection keeps selected dirty/untracked bytes' cmp "$work/source/untracked" "$work/projection-original/source/untracked"
+    check_inputs 'projection preserves executable mode' test -x "$work/projection-original/source/script"
+    check_inputs 'projection preserves symlink text' test "$(readlink "$work/projection-original/source/link")" = tracked
+    check_inputs 'projection excludes ambient Git administration' test ! -e "$work/projection-original/source/.git"
+    check_inputs 'projection excludes default compiler outputs' test ! -e "$work/projection-original/source/target"
+    check_inputs 'projection honors main Git ignore selection' test ! -e "$work/projection-original/source/ignored"
+    check_inputs 'projection honors custom exclusions' test ! -e "$work/projection-original/source/custom.drop"
+    check_inputs 'sibling default honors Git ignore selection' test ! -e "$work/projection-original/selected-sibling/input.cache"
+    check_inputs 'explicit sibling null preserves prior no-ignore policy' cmp "$work/plain/input.cache" "$work/projection-original/plain/input.cache"
+    check_inputs 'summary binds all selected roots and link count' jq -e \
+        '.schema_version==1 and .policy=="ordinary-source-v1" and
+         .roots==["plain","selected-sibling","source"] and .symlinks==1 and .files>0' "$work/original.json"
+    printf 'changed ignored cache\n' > "$work/source/ignored/cache"
+    printf 'changed output\n' > "$work/source/target/output"
+    printf 'changed custom exclude\n' > "$work/source/custom.drop"
+    printf 'changed ignored sibling cache\n' > "$work/sibling/input.cache"
+    capture_inputs ignored || return 1
+    check_inputs 'ignored/default/custom excluded changes do not invalidate inputs' test "$first" = "$(cat "$work/ignored.json")"
+    printf 'tracked-modified\n' > "$work/source/tracked"
+    capture_inputs changed || return 1
+    next=$(cat "$work/changed.json") || return 1
+    check_inputs 'same-HEAD tracked changes invalidate selected source identity' test "$first" != "$next"
+    printf 'tracked-original\n' > "$work/source/tracked"
+    capture_inputs restored || return 1
+    check_inputs 'restoring source bytes restores identity independent of timestamps' test "$first" = "$(cat "$work/restored.json")"
+    printf 'new selected input\n' > "$work/source/another-untracked"
+    capture_inputs added || return 1
+    check_inputs 'added selected untracked file changes identity' test "$first" != "$(cat "$work/added.json")"
+    mv "$work/source/another-untracked" "$work/held-addition" || return 1
+    mv "$work/source/untracked" "$work/held-untracked" || return 1
+    capture_inputs removed || return 1
+    check_inputs 'removed selected untracked file changes identity' test "$first" != "$(cat "$work/removed.json")"
+    mv "$work/held-untracked" "$work/source/untracked" || return 1
+    chmod 644 "$work/source/script" || return 1
+    capture_inputs mode || return 1
+    check_inputs 'execution permission changes invalidate identity' test "$first" != "$(cat "$work/mode.json")"
+    chmod 755 "$work/source/script" || return 1
+    mv "$work/source/link" "$work/held-link" || return 1
+    ln -s untracked "$work/source/link" || return 1
+    capture_inputs link || return 1
+    check_inputs 'symlink retargeting invalidates identity' test "$first" != "$(cat "$work/link.json")"
+    mv "$work/source/link" "$work/retargeted-link" || return 1
+    mv "$work/held-link" "$work/source/link" || return 1
+    printf 'changed sibling bytes\n' > "$work/sibling/input"
+    capture_inputs sibling || return 1
+    check_inputs 'selected sibling source bytes invalidate identity' test "$first" != "$(cat "$work/sibling.json")"
+    printf 'sibling original\n' > "$work/sibling/input"
+    git -C "$work/source" tag added-tag || return 1
+    capture_inputs tags || return 1
+    check_inputs 'Git tag namespace changes invalidate identity without HEAD movement' test "$first" != "$(cat "$work/tags.json")"
+
+    # Use the real state writer and atomic refresh. The retained worker row is
+    # explicitly fixture data; native compilation is covered by the other mode.
+    build_state_init || return 1
+    local run sha recipe receipt initial_context task
+    run=$(build_state_create inputs 1.0.0 linux/amd64) || return 1
+    sha=$(git -C "$work/source" rev-parse HEAD) || return 1
+    recipe=$(_act_sha256 "$config") || return 1
+    receipt=$(jq -nc --argjson inputs "$first" '{staged_ordinary:true,source_inputs:$inputs,
+        source_roots:{host:"/retained/source"},target_hosts:{"linux/amd64":"host"}}') || return 1
+    task='[{"key":"linux/amd64","platform":"linux/amd64","target_triple":"","method":"native"}]'
+    build_state_set_context inputs 1.0.0 "$run" "$sha" main '{"host":"/retained/source"}' \
+        "$work/output" 1 '{"linux/amd64":"host"}' release "$task" '' "$receipt" "$recipe" || return 1
+    build_state_update_status inputs 1.0.0 running "$run" || return 1
+    result=$(jq -nc --argjson inputs "$first" '{result:{method:"native",status:"success",source_sync:{source_inputs:$inputs}}}') || return 1
+    build_state_update_target inputs 1.0.0 linux/amd64 completed "$result" "$run" || return 1
+    state=$(build_state_get inputs 1.0.0 "$run") || return 1
+    state_file="$DSR_STATE_DIR/builds/inputs/1.0.0/$run/state.json"
+    initial_context=$(_act_sha256 "$state_file") || return 1
+    check_inputs 'same inputs pass read-only resume admission' build_state_validate_source_inputs "$state" "$receipt"
+    result=$(jq -c --argjson inputs "$next" '.source_inputs=$inputs' <<< "$receipt") || return 1
+    if build_state_set_source_sync inputs 1.0.0 "$run" "$result" '{"host":"/retained/source"}' \
+        '{"linux/amd64":"host"}' > "$work/refusal.out" 2> "$work/refusal.log"; then
+        check_inputs 'changed input refresh is refused' false
+    else check_inputs 'changed input refresh is refused' true; fi
+    check_inputs 'refused refresh preserves checkpoint bytes' test "$initial_context" = "$(_act_sha256 "$state_file")"
+    if build_state_validate_source_inputs "$state" null; then
+        check_inputs 'no-sync cannot erase a staged source binding' false
+    else check_inputs 'no-sync cannot erase a staged source binding' true; fi
+    result=$(jq -c 'del(.context.source_sync.source_inputs)' <<< "$state") || return 1
+    if build_state_validate_source_inputs "$result" "$receipt"; then
+        check_inputs 'legacy missing binding cannot authorize reuse' false
+    else check_inputs 'legacy missing binding cannot authorize reuse' true; fi
+    result=$(jq -c '.target_statuses["linux/amd64"].result.source_sync.source_inputs.sha256=("0"*64)' <<< "$state") || return 1
+    if build_state_validate_source_inputs "$result" "$receipt"; then
+        check_inputs 'completed receipt must retain the original source binding' false
+    else check_inputs 'completed receipt must retain the original source binding' true; fi
+    result=$(jq -c 'del(.target_statuses["linux/amd64"].result.method) |
+        del(.target_statuses["linux/amd64"].result.source_sync)' <<< "$state") || return 1
+    if build_state_validate_source_inputs "$result" "$receipt"; then
+        check_inputs 'missing result method cannot bypass native task binding' false
+    else check_inputs 'missing result method cannot bypass native task binding' true; fi
+    result=$(jq -c '.target_statuses["linux/amd64"].status="running" |
+        .target_statuses["linux/amd64"].result.method="act" |
+        del(.target_statuses["linux/amd64"].result.source_sync)' <<< "$state") || return 1
+    if build_state_validate_source_inputs "$result" "$receipt"; then
+        check_inputs 'running entry with successful mislabeled native result is refused' false
+    else check_inputs 'running entry with successful mislabeled native result is refused' true; fi
+    jq '.target_statuses["linux/amd64"].result | del(.source_sync)' <<< "$state" > "$work/unbound-sidecar.json" || return 1
+    result=$(jq -c --arg path "$work/unbound-sidecar.json" '
+        .target_statuses["linux/amd64"].status="running" |
+        .target_statuses["linux/amd64"].result_path=$path |
+        del(.target_statuses["linux/amd64"].result)' <<< "$state") || return 1
+    if build_state_validate_source_inputs "$result" "$receipt"; then
+        check_inputs 'successful recovery sidecar cannot bypass native input binding' false
+    else check_inputs 'successful recovery sidecar cannot bypass native input binding' true; fi
+    jq '.target_statuses["linux/amd64"].result' <<< "$state" > "$work/bound-sidecar.json" || return 1
+    result=$(jq -c --arg path "$work/bound-sidecar.json" '
+        .target_statuses["linux/amd64"].status="running" |
+        .target_statuses["linux/amd64"].result_path=$path |
+        del(.target_statuses["linux/amd64"].result)' <<< "$state") || return 1
+    check_inputs 'successful recovery sidecar with original binding remains admissible' \
+        build_state_validate_source_inputs "$result" "$receipt"
+    if _act_result_source_inputs_match "$(cat "$work/unbound-sidecar.json")" "$receipt" native; then
+        check_inputs 'reuse boundary rejects a sidecar changed after admission' false
+    else check_inputs 'reuse boundary rejects a sidecar changed after admission' true; fi
+    check_inputs 'reuse boundary admits original native sidecar' \
+        _act_result_source_inputs_match "$(cat "$work/bound-sidecar.json")" "$receipt" native
+    check_inputs 'matching atomic refresh succeeds' build_state_set_source_sync inputs 1.0.0 "$run" "$receipt" \
+        '{"host":"/retained/source"}' '{"linux/amd64":"host"}'
+    state=$(build_state_get inputs 1.0.0 "$run") || return 1
+    check_inputs 'same-input refresh retains completed target' jq -e \
+        '.target_statuses["linux/amd64"].status=="completed" and (.source_sync_history|length)==2' <<< "$state"
+    printf 'Ordinary source inputs: %s checks, %s failures\n' "$checks" "$failures"
+    [[ "$failures" == 0 ]]
+)
+
+test_ordinary_source_resume() (
+    local dependency work first_status=0 status=0 run state_file marker before_state before_marker
+    local prior_artifact prior_identity prior_digest checks=0 failures=0
+    for dependency in bash git jq yq python3 rsync go tar; do
+        command -v "$dependency" >/dev/null || { printf 'SKIP: ordinary resume requires %s\n' "$dependency"; return 77; }
+    done
+    [[ $(uname -s)/$(uname -m) == Linux/x86_64 && $(go version) == 'go version go'* ]] || {
+        printf 'SKIP: ordinary resume requires Linux x86_64 and the Go compiler\n'; return 77;
+    }
+    work=$(mktemp -d "${DSR_TEST_DISK_ROOT:-${TMPDIR:-/tmp}}/dsr-ordinary-resume.XXXXXXXX") || return 1
+    printf 'Ordinary native resume evidence: %s\n' "$work"
+    mkdir -p "$work/config/repos.d" "$work/source" "$work/state" "$work/stages" || return 1
+    export DSR_CONFIG_DIR="$work/config" ACT_CONFIG_DIR="$work/config" ACT_REPOS_DIR="$work/config/repos.d"
+    export DSR_STATE_DIR="$work/state" DSR_CACHE_DIR="$work/cache"
+    export DSR_HOSTS_FILE="$work/config/hosts.yaml" DSR_REPOS_FILE="$work/config/repos.yaml"
+    export DSR_DISABLE_HOST_SELECTOR=1 RCH_DISABLED=1 RCH_CARGO_WRAPPER_BYPASS=1 NO_COLOR=1
+    printf 'module example/ordinary\n\ngo 1.19\n' > "$work/source/go.mod"
+    printf 'package main\nimport "fmt"\nfunc main() { fmt.Println("first-input") }\n' > "$work/source/main.go"
+    git -C "$work/source" init -q -b main || return 1
+    git -C "$work/source" add go.mod main.go || return 1
+    git -C "$work/source" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm original || return 1
+    jq -n --arg work "$work" '{schema_version:"1.0.0",hosts:{localnative:{
+        platform:"linux/amd64",connection:"local",concurrency:2,build_root:($work+"/stages")}},
+        platform_mapping:{"linux/amd64":"localnative","linux/386":"localnative"}}' > "$DSR_HOSTS_FILE" || return 1
+    jq -n --arg source "$work/source" --arg path "$PATH" --arg work "$work" \
+        --arg cache "${DSR_TEST_GOCACHE:-$work/go-cache}" '{
+        tool_name:"ordinary",repo:"example/ordinary",local_path:$source,language:"go",binary_name:"ordinary",
+        targets:["linux/amd64","linux/386"],act_job_map:{"linux/amd64":null,"linux/386":null},
+        hosts:{"linux/amd64":"localnative","linux/386":"localnative"},
+        build_cmd:"if [ \"$DSR_TARGET_ARCH\" = 386 ] && [ -e \"$PROBE_FAIL\" ]; then exit 6; fi; printf \"%s\\n\" \"$DSR_TARGET_ARCH\" >> \"$PROBE_EVENTS\"; go build -o ordinary .",
+        env:{PATH:$path,PROBE_FAIL:($work+"/fail"),PROBE_EVENTS:($work+"/compiler-events"),GOCACHE:$cache,CGO_ENABLED:"0"},
+        artifact_naming:"${name}-${version}-${os}-${arch}.${ext}",archive_format:{linux:"tar.gz"}}
+        ' > "$ACT_REPOS_DIR/ordinary.yaml" || return 1
+    : > "$work/fail"
+    # shellcheck source=../../src/logging.sh
+    source "$ROOT/src/logging.sh"
+    # shellcheck source=../../src/config.sh
+    source "$ROOT/src/config.sh"
+    # shellcheck source=../../src/build_state.sh
+    source "$ROOT/src/build_state.sh"
+    # shellcheck source=../../src/act_runner.sh
+    source "$ROOT/src/act_runner.sh"
+    # shellcheck source=../../src/artifact_naming.sh
+    source "$ROOT/src/artifact_naming.sh"
+    # shellcheck source=../../src/host_selector.sh
+    source "$ROOT/src/host_selector.sh"
+    # shellcheck source=../../src/host_health.sh
+    source "$ROOT/src/host_health.sh"
+    # shellcheck source=../../src/git_ops.sh
+    source "$ROOT/src/git_ops.sh"
+    # shellcheck source=../../src/packaging.sh
+    source "$ROOT/src/packaging.sh"
+    printf 'BOUNDARY: controlled host health and capacity; actual disk-stage guard, source transfer, Git, Go, collection, checkpoints and publication remain production code\n'
+    host_health_is_ready() { return 0; }
+    selector_acquire_slot() { return 0; }
+    selector_release_slot() { return 0; }
+    build_state_init || return 1
+    export SCRIPT_DIR="$ROOT" JSON_MODE=true DRY_RUN=false VERBOSE=false DSR_VERSION=fixture
+    declare -A _DSR_LOADED_MODULES=([packaging]=1 [artifact_naming]=1)
+    # shellcheck disable=SC1090 # Extract the actual public command; no compiler or source substitute.
+    source <(awk '/^(_dsr_require|cmd_build)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$ROOT/dsr") || return 1
+    # shellcheck disable=SC1090
+    source <(awk '/^json_envelope\(\) \{/{copy=1} copy{print} copy && /^# ====/{exit}' "$ROOT/dsr") || return 1
+    check_resume_inputs() {
+        local label="$1"; shift
+        checks=$((checks + 1))
+        if "$@"; then printf 'PASS: %s\n' "$label"
+        else failures=$((failures + 1)); printf 'FAIL: %s\n' "$label" >&2; fi
+    }
+    cmd_build ordinary --version 1.0.0 --output-dir "$work/output" \
+        > "$work/first.json" 2> "$work/first.log" || first_status=$?
+    check_resume_inputs 'real first build retains one completed and one failed target' test "$first_status" -eq 1
+    build_state_get ordinary 1.0.0 > "$work/first-state.json" || { cat "$work/first.log" >&2; return 1; }
+    run=$(jq -r .run_id "$work/first-state.json") || return 1
+    state_file="$DSR_STATE_DIR/builds/ordinary/1.0.0/$run/state.json"
+    marker="$work/output/.dsr-build-purpose.json"
+    prior_artifact=$(jq -r '.target_statuses["linux/amd64"].result.artifact_path // empty' "$work/first-state.json") || return 1
+    [[ -x "$prior_artifact" ]] || { cat "$work/first.log" >&2; return 1; }
+    check_resume_inputs 'completed original executable runs original source' test "$("$prior_artifact")" = first-input
+    prior_digest=$(_act_sha256 "$prior_artifact") || return 1
+    prior_identity=$(_act_file_identity "$prior_artifact") || return 1
+    before_state=$(_act_sha256 "$state_file") || return 1
+    before_marker=$(_act_sha256 "$marker") || return 1
+    printf 'package main\nimport "fmt"\nfunc main() { fmt.Println("second-input") }\n' > "$work/source/main.go"
+    mv "$work/fail" "$work/fail.disabled" || return 1
+    status=0
+    cmd_build ordinary --version 1.0.0 --allow-dirty --resume="$run" --output-dir "$work/output" \
+        > "$work/changed.json" 2> "$work/changed.log" || status=$?
+    check_resume_inputs 'same-HEAD dirty-source resume is refused' test "$status" -eq 4
+    check_resume_inputs 'source refusal returns one typed command envelope' jq -es \
+        'length==1 and .[0].command=="build" and .[0].exit_code==4 and
+         (.[0].details.error|contains("source inputs"))' "$work/changed.json"
+    check_resume_inputs 'source refusal preserves exact original checkpoint' test "$before_state" = "$(_act_sha256 "$state_file")"
+    check_resume_inputs 'source refusal preserves publication-purpose receipt' test "$before_marker" = "$(_act_sha256 "$marker")"
+    check_resume_inputs 'source refusal preserves completed artifact bytes and inode' test \
+        "$prior_digest/$prior_identity" = "$(_act_sha256 "$prior_artifact")/$(_act_file_identity "$prior_artifact")"
+    check_resume_inputs 'changed source never reaches the failed target compiler' test "$(wc -l < "$work/compiler-events")" -eq 1
+    status=0
+    cmd_build ordinary --version 1.0.0 --allow-dirty --no-sync --resume="$run" --output-dir "$work/output" \
+        > "$work/no-sync.json" 2> "$work/no-sync.log" || status=$?
+    check_resume_inputs 'no-sync cannot discard the original staged binding' test "$status" -eq 4
+    check_resume_inputs 'no-sync refusal leaves the checkpoint untouched' test "$before_state" = "$(_act_sha256 "$state_file")"
+    printf 'package main\nimport "fmt"\nfunc main() { fmt.Println("first-input") }\n' > "$work/source/main.go"
+    status=0
+    cmd_build ordinary --version 1.0.0 --resume="$run" --output-dir "$work/output" \
+        > "$work/restored.json" 2> "$work/restored.log" || status=$?
+    check_resume_inputs 'restored original source resumes successfully' test "$status" -eq 0
+    check_resume_inputs 'only the previously failed target is compiled on retry' test \
+        "$(cat "$work/compiler-events")" = $'amd64\n386'
+    check_resume_inputs 'successful resume preserves completed artifact bytes and inode' test \
+        "$prior_digest/$prior_identity" = "$(_act_sha256 "$prior_artifact")/$(_act_file_identity "$prior_artifact")"
+    build_state_get ordinary 1.0.0 "$run" > "$work/restored-state.json" || return 1
+    # Compare complete objects across actual state/result/source boundaries.
+    check_resume_inputs 'all completed native targets retain the one selected namespace' jq -e '
+        .context.source_sync.source_inputs as $inputs | .status=="completed" and
+        ($inputs.sha256|length)==64 and
+        all(.target_statuses[]; .status=="completed" and .result.source_sync.source_inputs==$inputs)
+        ' "$work/restored-state.json"
+    check_resume_inputs 'real 386 payload contains original source only (no 386 runtime claim)' python3 - "$work/restored-state.json" <<'PY'
+import json, pathlib, sys
+state = json.loads(pathlib.Path(sys.argv[1]).read_text())
+payload = pathlib.Path(state['target_statuses']['linux/386']['result']['artifact_path']).read_bytes()
+assert payload[:5] == b'\x7fELF\x01' and payload[18:20] == b'\x03\x00'
+assert b'first-input' in payload and b'second-input' not in payload
+PY
+    printf 'Ordinary native resume: %s checks, %s failures\n' "$checks" "$failures"
+    [[ "$failures" == 0 ]]
+)
 
 test_windows_source_links() (
     local dependency work backend
@@ -950,6 +1271,14 @@ IGNORE
     [[ "$selection_failures" -eq 0 ]]
 )
 
+if [[ "${1:-}" == --ordinary-inputs-only ]]; then
+    test_ordinary_source_inputs
+    exit $?
+fi
+if [[ "${1:-}" == --ordinary-resume-only ]]; then
+    test_ordinary_source_resume
+    exit $?
+fi
 if [[ "${1:-}" == --windows-source-links-only ]]; then
     test_windows_source_links
     exit $?
@@ -963,6 +1292,9 @@ if [[ "${1:-}" == --ownership-only ]]; then
     exit $?
 fi
 if [[ $# -eq 0 ]]; then
+    ordinary_input_status=0
+    test_ordinary_source_inputs || ordinary_input_status=$?
+    [[ "$ordinary_input_status" == 0 || "$ordinary_input_status" == 77 ]] || exit "$ordinary_input_status"
     windows_links_status=0
     test_windows_source_links || windows_links_status=$?
     [[ "$windows_links_status" == 0 || "$windows_links_status" == 77 ]] || exit "$windows_links_status"

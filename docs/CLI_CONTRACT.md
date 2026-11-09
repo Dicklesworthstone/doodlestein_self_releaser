@@ -834,8 +834,9 @@ the counters, and real build failures still consume the configured retry
 allowance. Checkpoints without these counters retain
 their prior conservative accounting; resume does not invent missing history.
 Direct orchestration resume
-without a new receipt retains the saved gate; the explicit CLI `--no-sync`
-opt-out clears it while preserving recorded host/path bindings and history.
+without a new receipt retains the saved gate. A fresh CLI `--no-sync` run uses
+externally managed sources; a previously staged run cannot discard its input
+binding by resuming with `--no-sync`.
 An ordinary sync receipt records transfer admission; strict releases continue
 to require their frozen source snapshot.
 
@@ -844,9 +845,31 @@ gets an exclusively created directory under `hosts.yaml` `build_root` (default
 `/var/tmp` on Unix or the drive's `Users/Public` on Windows). The main source
 and configured siblings are synchronized there; existing host checkouts remain
 available independently. `--sync-only` retains its configured-path behavior.
-Staged roots are retained for subsequent resume, including explicit `--no-sync`
-resume. Windows Git-context import requires PowerShell 7 and Git; Unix import
-requires Bash, Git, jq, and a SHA-256 utility.
+Staged roots are retained for subsequent resume. Ordinary staging requires
+rsync and Python 3 on the controller. Windows Git-context import requires
+PowerShell 7 and Git; Unix import requires Bash, Git, jq, and a SHA-256 utility.
+
+The controller applies the actual rsync selection policy once to a private
+projection containing the main source and every configured sibling. It verifies
+the copy against the live selection before transport, then sends the same
+projection to every native host without evaluating a second ignore policy.
+The receipt's top-level `source_inputs` and each successful host row contain
+`schema_version: 1`, `policy: "ordinary-source-v1"`, a SHA-256 digest, sorted
+`roots`, and nonnegative `files`, `directories`, `symlinks`, and `bytes` counts.
+The digest binds selected paths, file bytes, file/directory permissions, symlink
+text, and semantic Git HEAD/branch/tag/line-ending context. Timestamps and
+excluded outputs do not affect it. External symlink referents are not part of
+the selected namespace. The frozen projection is checked again after host
+transfers; a changed projection prevents admission.
+
+Before updating a resumed checkpoint or reusing a completed native artifact,
+DSR requires a fresh matching `source_inputs` receipt and the original binding
+in each completed native result. Changed tracked files, selected untracked
+files, permissions, links, siblings, or Git context cannot be combined with
+artifacts from the original inputs merely because HEAD still matches. Missing
+legacy evidence also requires a fresh run. Admission refusal leaves the prior
+checkpoint and publication-purpose receipt intact; restoring the original
+selected inputs permits retrying only unfinished targets.
 
 Before any host transfer, DSR captures the main and Git-backed sibling HEADs,
 symbolic branches, and exact tag object IDs in standalone bundles. A successful
@@ -868,8 +891,9 @@ not transported. Import initializes an absent `.git` and seeds its index from
 HEAD without checking out or resetting working files. Staged and unstaged
 controller edits retain their file contents but appear as unstaged edits in the private
 index. This supports commit, branch, tag ancestry, and dirty version stamping
-while preserving the controller index. Ordinary transfers are not an atomic
-snapshot of concurrently edited working files.
+while preserving the controller index. Selection verification detects changes
+during copying, but the controller worktree is not locked against concurrent
+edits. Every admitted host receives the retained selected projection.
 
 Git context requires a top-level, non-shallow SHA-1 worktree. Sparse checkouts
 and `assume-unchanged`/`skip-worktree` index entries are refused before host

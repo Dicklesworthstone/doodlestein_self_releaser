@@ -5427,6 +5427,7 @@ _act_sync_source() (
     local remote_path="$3"
     shift 3
     local respect_gitignore_excludes=true
+    local verify_projection=false
     local extra_excludes=()
     local git_excludes=""
     # The subshell confines cleanup to this transfer, including early returns
@@ -5437,6 +5438,9 @@ _act_sync_source() (
         case "$1" in
             --no-gitignore-excludes)
                 respect_gitignore_excludes=false
+                ;;
+            --verify-source-projection)
+                verify_projection=true
                 ;;
             *)
                 extra_excludes+=("$1")
@@ -5489,6 +5493,26 @@ _act_sync_source() (
                 exclude_args+=("--exclude-from=$global_excludes_file")
             fi
         fi
+    fi
+
+    if $verify_projection; then
+        # Use rsync's own selection and checksum comparison. Reimplementing
+        # its patterns would make a resume digest cover different files from
+        # the actual transfer. This mode never creates or repairs a target.
+        _act_is_local_host "$host" || return 4
+        [[ -d "$remote_path" && ! -L "$remote_path" ]] || return 4
+        local projection_changes
+        if ! projection_changes=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" \
+            rsync -a --no-owner --no-group --checksum --delete --dry-run \
+                --out-format='%i' "${exclude_args[@]}" "$local_path/" "$remote_path/"); then
+            _log_error "Cannot verify ordinary source projection: $local_path"
+            return 4
+        fi
+        if [[ -n "$projection_changes" ]]; then
+            _log_error "Source changed while its ordinary build snapshot was copied: $local_path"
+            return 4
+        fi
+        return 0
     fi
 
     _log_info "Syncing source to $host:$remote_path"
@@ -8766,6 +8790,151 @@ _act_verify_strict_source_roots() {
 
 # Export once before any host writes. Missing siblings and layouts that could
 # escape or collide with the main staged tree are configuration failures.
+# Hash the selected source namespace, never ambient Git administration or
+# external symlink referents. The retained projection has already passed the
+# real transfer filters. Git's stable semantic identity is bound separately
+# from bundle bytes, which can change when an identical history is repacked.
+_act_ordinary_source_inputs() {
+    local projection="$1" contexts="$2"
+    python3 - "$projection" 3<<< "$contexts" <<'PY'
+import hashlib, json, os, stat, sys
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True) + '\n').encode('ascii')
+
+def identity(value):
+    return (value.st_dev, value.st_ino, value.st_mode, value.st_size,
+            value.st_mtime_ns, value.st_ctime_ns)
+
+try:
+    with os.fdopen(3) as source:
+        contexts = json.load(source)
+    if not isinstance(contexts, list) or not contexts:
+        raise ValueError('missing source context inventory')
+    roots = sorted(row['relative_path'] for row in contexts if not row.get('submodule', False))
+    if 'source' not in roots or len(roots) != len(set(roots)) or any(
+            not isinstance(name, str) or not name or name in ('.', '..') or
+            '/' in name or '\\' in name for name in roots):
+        raise ValueError('invalid ordinary source roots')
+    stable_git = []
+    for row in sorted(contexts, key=lambda value: value['relative_path']):
+        context = row['context']
+        stable_git.append({'root': row['relative_path'], 'git': None if context is None else {
+            key: context[key] for key in ('git_sha', 'git_ref', 'tags', 'core_autocrlf', 'core_eol')}})
+    digest = hashlib.sha256(encode({'policy': 'ordinary-source-v1', 'git_contexts': stable_git}))
+    counts = dict(files=0, directories=0, symlinks=0, bytes=0)
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+    def walk(descriptor, relative):
+        before = os.fstat(descriptor)
+        names = sorted(os.listdir(descriptor), key=os.fsencode)
+        digest.update(encode({'path': relative, 'type': 'directory',
+                              'mode': stat.S_IMODE(before.st_mode)}))
+        counts['directories'] += 1
+        for name in names:
+            path = relative + '/' + name
+            prior = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISDIR(prior.st_mode):
+                child = os.open(name, directory_flags, dir_fd=descriptor)
+                try:
+                    if identity(os.fstat(child)) != identity(prior):
+                        raise ValueError('source directory changed: ' + path)
+                    walk(child, path)
+                finally:
+                    os.close(child)
+            elif stat.S_ISREG(prior.st_mode):
+                child = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=descriptor)
+                try:
+                    if identity(os.fstat(child)) != identity(prior):
+                        raise ValueError('source file changed: ' + path)
+                    content = hashlib.sha256()
+                    length = 0
+                    while True:
+                        block = os.read(child, 1024 * 1024)
+                        if not block:
+                            break
+                        content.update(block)
+                        length += len(block)
+                    if length != prior.st_size or identity(os.fstat(child)) != identity(prior):
+                        raise ValueError('source bytes changed: ' + path)
+                finally:
+                    os.close(child)
+                digest.update(encode({'path': path, 'type': 'file', 'mode': stat.S_IMODE(prior.st_mode),
+                                      'size': length, 'sha256': content.hexdigest()}))
+                counts['files'] += 1
+                counts['bytes'] += length
+            elif stat.S_ISLNK(prior.st_mode):
+                target = os.readlink(name, dir_fd=descriptor)
+                digest.update(encode({'path': path, 'type': 'symlink', 'target': target}))
+                counts['symlinks'] += 1
+            else:
+                raise ValueError('ordinary source contains a special file: ' + path)
+            if identity(os.stat(name, dir_fd=descriptor, follow_symlinks=False)) != identity(prior):
+                raise ValueError('source entry changed: ' + path)
+        if identity(os.fstat(descriptor)) != identity(before) or sorted(os.listdir(descriptor), key=os.fsencode) != names:
+            raise ValueError('source directory changed during inventory: ' + relative)
+
+    base = os.open(sys.argv[1], directory_flags)
+    try:
+        if sorted(os.listdir(base)) != roots:
+            raise ValueError('ordinary projection root inventory changed')
+        for root in roots:
+            descriptor = os.open(root, directory_flags, dir_fd=base)
+            try:
+                walk(descriptor, root)
+            finally:
+                os.close(descriptor)
+        if sorted(os.listdir(base)) != roots:
+            raise ValueError('ordinary projection root inventory changed')
+    finally:
+        os.close(base)
+    print(json.dumps(dict(schema_version=1, policy='ordinary-source-v1', sha256=digest.hexdigest(),
+                          roots=roots, **counts), sort_keys=True, separators=(',', ':')))
+except (OSError, ValueError, TypeError, KeyError) as error:
+    print('[act] Cannot bind ordinary source inputs: ' + str(error), file=sys.stderr)
+    sys.exit(4)
+PY
+}
+
+# Select once with the existing rsync policy, then transport these exact bytes
+# to every host. A native matrix must not mix live worktrees merely because
+# their HEAD still agrees. Keep this private projection as failure evidence.
+_act_project_ordinary_sources() {
+    local config_file="$1" contexts="$2" projection="$3"
+    local row source relative index option respect inputs
+    [[ "$projection" == /* && ! -e "$projection" && ! -L "$projection" ]] || return 4
+    command -v rsync >/dev/null && command -v python3 >/dev/null || {
+        _log_error "Ordinary source snapshots require rsync and python3 on the controller"
+        return 3
+    }
+    mkdir -m 700 -- "$projection" || return 4
+    while IFS= read -r row; do
+        source=$(jq -r .local_path <<< "$row") || return 4
+        relative=$(jq -r .relative_path <<< "$row") || return 4
+        local selection=()
+        if [[ "$relative" == source ]]; then
+            inputs=$(yq -o=json -I=0 '.sync_excludes // []' "$config_file") || return 4
+        else
+            index=$(jq -r .sibling_index <<< "$row") || return 4
+            [[ "$index" =~ ^[0-9]+$ ]] || return 4
+            respect=true
+            if [[ "$(yq -r ".sibling_crates[$index] | has(\"respect_gitignore\")" "$config_file")" == true ]]; then
+                respect=$(yq -r ".sibling_crates[$index].respect_gitignore" "$config_file") || return 4
+            fi
+            [[ "$respect" == true ]] || selection+=(--no-gitignore-excludes)
+            inputs=$(yq -o=json -I=0 ".sibling_crates[$index].extra_excludes // []" "$config_file") || return 4
+        fi
+        jq -e 'type == "array" and all(.[]; type == "string" and (contains("\u0000") | not))' \
+            <<< "$inputs" >/dev/null || return 4
+        while IFS= read -r -d '' option; do selection+=("$option"); done < <(jq -j '.[] | ., "\u0000"' <<< "$inputs")
+        _act_sync_source act "$source" "$projection/$relative" "${selection[@]}" || return 4
+        _act_sync_source act "$source" "$projection/$relative" --verify-source-projection \
+            "${selection[@]}" || return 4
+    done < <(jq -c '.[] | select(.submodule != true)' <<< "$contexts")
+    _act_verify_ordinary_git_contexts "$contexts" || return 4
+    _act_ordinary_source_inputs "$projection" "$contexts"
+}
+
 _act_export_ordinary_git_contexts() {
     local config_file="$1" local_path="$2" context_parent="$3"
     local sources='[]' contexts='[]' item relative source context count index
@@ -8789,8 +8958,8 @@ _act_export_ordinary_git_contexts() {
             return 4
         fi
         sibling_names_seen+="${relative,,} "
-        sources=$(jq -c --arg path "$source" --arg relative "$relative" \
-            '. + [{relative_path:$relative,local_path:$path}]' <<< "$sources") || return 4
+        sources=$(jq -c --arg path "$source" --arg relative "$relative" --argjson index "$index" \
+            '. + [{relative_path:$relative,local_path:$path,sibling_index:$index}]' <<< "$sources") || return 4
     done
     while IFS= read -r item; do
         source=$(jq -r .local_path <<< "$item") || return 4
@@ -8961,6 +9130,7 @@ _act_sync_sibling_crates() {
     local remote_path="$2"
     local config_file="$3"
     local sibling_count="$4"
+    local ordinary_projection="${5:-}"
     local sync_failed=false
     local tool_name="${config_file##*/}"
     tool_name="${tool_name%.yaml}"
@@ -8981,6 +9151,9 @@ _act_sync_sibling_crates() {
         sib_local=$(_act_materialized_source_path "$tool_name" "$sib_configured") || return 4
         sib_relative=$(yq -r ".sibling_crates[$idx].relative_path // \"\"" "$config_file" 2>/dev/null)
         [[ -z "$sib_relative" ]] && sib_relative=$(basename "$sib_local")
+        if [[ -n "$ordinary_projection" ]]; then
+            sib_local="$ordinary_projection/$sib_relative"
+        fi
 
         if [[ ! -d "$sib_local" ]]; then
             _log_error "Required sibling crate not found locally: $sib_local"
@@ -8999,15 +9172,17 @@ _act_sync_sibling_crates() {
         fi
 
         local sync_args=()
-        if [[ "$respect_gitignore" != "true" ]]; then
+        if [[ -n "$ordinary_projection" || "$respect_gitignore" != "true" ]]; then
             sync_args+=(--no-gitignore-excludes)
         fi
 
         local extra_exclude
-        while IFS= read -r extra_exclude; do
-            [[ -z "$extra_exclude" ]] && continue
-            sync_args+=("$extra_exclude")
-        done < <(yq -r ".sibling_crates[$idx].extra_excludes // [] | .[]" "$config_file" 2>/dev/null || true)
+        if [[ -z "$ordinary_projection" ]]; then
+            while IFS= read -r extra_exclude; do
+                [[ -z "$extra_exclude" ]] && continue
+                sync_args+=("$extra_exclude")
+            done < <(yq -r ".sibling_crates[$idx].extra_excludes // [] | .[]" "$config_file" 2>/dev/null || true)
+        fi
 
         if ! _act_sync_source "$host" "$sib_local" "$sib_remote_path" "${sync_args[@]}"; then
             _log_error "Failed to sync sibling crate: $sib_relative"
@@ -9066,6 +9241,7 @@ act_sync_sources() {
     local targets_arg=() target
     local strict_release=false
     local stage_ordinary=false ordinary_stage_id="" ordinary_contexts='[]' primary_git_context=null sibling_git_contexts='{}'
+    local ordinary_projection="" ordinary_source_inputs=null
     local submodule_git_contexts='{}' isolated_identity=null
     local strict_run_id=""
     local strict_git_sha=""
@@ -9418,6 +9594,12 @@ act_sync_sources() {
             echo '{"status":"error","error":"Cannot capture ordinary source Git contexts"}'
             return 4
         fi
+        ordinary_projection="$context_parent/selected-sources"
+        if ! ordinary_source_inputs=$(_act_project_ordinary_sources \
+                "$config_file" "$ordinary_contexts" "$ordinary_projection"); then
+            echo '{"status":"error","error":"Cannot freeze ordinary source inputs"}'
+            return 4
+        fi
         primary_git_context=$(jq -c '.[0].context | del(.bundle_path)' <<< "$ordinary_contexts") || return 4
         sibling_git_contexts=$(jq -c '[.[] | select(.relative_path != "source" and .context != null and .submodule != true) |
             {key:.relative_path,value:(.context | del(.bundle_path))}] | from_entries' <<< "$ordinary_contexts") || return 4
@@ -9486,7 +9668,8 @@ act_sync_sources() {
                 if [[ "$prepared_source_root" =~ ^([A-Za-z]:)?/[A-Za-z0-9_./:+-]+$ &&
                       "$prepared_source_root" == */"$stage_name"/source && "$prepared_source_root" != *..* ]]; then
                     remote_path="$prepared_source_root"
-                    if host_sync_output=$(_act_sync_source "$host" "$local_path" "$remote_path" "${main_sync_excludes[@]}" 2>&1); then
+                    if host_sync_output=$(_act_sync_source "$host" "$ordinary_projection/source" "$remote_path" \
+                            --no-gitignore-excludes 2>&1); then
                         source_synced=true
                     fi
                 else
@@ -9526,7 +9709,8 @@ act_sync_sources() {
                 done < <(jq -c '.[]' <<< "$strict_dependency_checkouts")
             elif [[ "$sibling_count" -gt 0 && "$remote_path" != "$local_path" ]]; then
                 local sibling_sync_output sibling_sync_status
-                sibling_sync_output=$(_act_sync_sibling_crates "$host" "$remote_path" "$config_file" "$sibling_count" 2>&1)
+                sibling_sync_output=$(_act_sync_sibling_crates "$host" "$remote_path" "$config_file" \
+                    "$sibling_count" "$ordinary_projection" 2>&1)
                 sibling_sync_status=$?
                 [[ -n "$sibling_sync_output" ]] && printf '%s\n' "$sibling_sync_output" >&2
                 if [[ "$sibling_sync_status" -ne 0 ]]; then
@@ -9594,11 +9778,12 @@ act_sync_sources() {
                 local success_result
                 success_result=$(jq -nc --arg host "$host" --arg path "$remote_path" \
                     --arg configured_path "${configured_host_paths[$i]}" --argjson staged "$stage_ordinary" \
+                    --argjson inputs "$ordinary_source_inputs" \
                     --slurpfile contexts /dev/fd/3 \
                     '($contexts | if length == 3 then . else error("exactly three Git context documents required") end) as $contexts |
                      $contexts[0] as $context | $contexts[1] as $siblings | $contexts[2] as $submodules |
                      {host:$host,path:$path,status:"success"} +
-                     (if $staged then {configured_path:$configured_path,git_context:$context,
+                     (if $staged then {configured_path:$configured_path,git_context:$context,source_inputs:$inputs,
                        sibling_git_contexts:$siblings} else {} end) +
                      (if ($submodules | length) > 0 then {submodule_git_contexts:$submodules} else {} end)' \
                     3<<< "$restored_primary"$'\n'"$restored_siblings"$'\n'"$restored_submodules") || return 4
@@ -9621,14 +9806,15 @@ act_sync_sources() {
 
     # Earlier hosts cannot remain admitted if the controller identity moved
     # while a later host was transferring its source or context bundle.
-    if $stage_ordinary && ! _act_verify_ordinary_git_contexts "$ordinary_contexts"; then
+    if $stage_ordinary && { ! _act_verify_ordinary_git_contexts "$ordinary_contexts" ||
+        [[ "$(_act_ordinary_source_inputs "$ordinary_projection" "$ordinary_contexts")" != "$ordinary_source_inputs" ]]; }; then
         synced=0
         failed=${#hosts_to_sync[@]}
         source_root_entries=()
         local failed_results=() prior_result
         for prior_result in "${results[@]}"; do
             failed_results+=("$(jq -c '.status="failed" |
-                .error="Controller Git context changed during source synchronization"' <<< "$prior_result")")
+                .error="Controller Git context or frozen source inputs changed during source synchronization"' <<< "$prior_result")")
         done
         results=("${failed_results[@]}")
     fi
@@ -9668,6 +9854,7 @@ act_sync_sources() {
         --argjson source_roots "$source_roots_json" \
         --argjson target_hosts "$target_hosts_json" \
         --argjson staged_ordinary "$stage_ordinary" \
+        --argjson source_inputs "$ordinary_source_inputs" \
         --argjson identity "$isolated_identity" \
         '($contexts | if length == 4 then . else error("exactly four source-sync documents required") end) as $contexts |
         ($owners | if length == 1 and (.[0] | type == "object") then .[0]
@@ -9683,7 +9870,7 @@ act_sync_sources() {
             source_roots: $source_roots,
             target_hosts: $target_hosts
         } + (if ($owners | length) > 0 then {snapshot_owners:$owners} else {} end) +
-            (if $staged_ordinary then {staged_ordinary:true,git_context:$git_context,
+            (if $staged_ordinary then {staged_ordinary:true,git_context:$git_context,source_inputs:$source_inputs,
             sibling_git_contexts:$sibling_git_contexts} else {} end) +
             (if ($submodule_git_contexts | length) > 0 then {submodule_git_contexts:$submodule_git_contexts} else {} end) |
             if $identity == null then . else
@@ -14898,6 +15085,20 @@ _act_target_result_available() {
     [[ "$actual" == "$expected" ]]
 }
 
+# Recheck the actual reuse candidate after preflight: a changed sidecar or
+# embedded result must not acquire authority from its own method label.
+_act_result_source_inputs_match() {
+    local result="$1" receipt="$2" task_method="$3"
+    [[ "$task_method" == native ]] || return 0
+    jq -ces --slurpfile receipt /dev/fd/3 '
+        length == 1 and ($receipt | length) == 1 and
+        (.[0] | if $receipt[0].staged_ordinary == true and
+                    (.status | IN("success", "ok", "passed")) then
+            .method == "native" and .source_sync.source_inputs == $receipt[0].source_inputs
+         else true end)
+      ' 3<<< "$receipt" <<< "$result" >/dev/null
+}
+
 # Expand only native Rust variants. Platforms retain their default routes and
 # release contracts; task keys identify attempts and approved host assignments.
 # Validate the entire matrix before launching its first compiler.
@@ -15994,6 +16195,15 @@ _act_validate_source_sync_receipt() {
         (.core_eol == "lf" or .core_eol == "crlf" or .core_eol == "native") and
         (.tags | type == "object" and all(to_entries[];
           (.key | startswith("refs/tags/")) and (.value | type == "string" and test("^[0-9a-f]{40}$"))));
+      def source_inputs:
+        type == "object" and .schema_version == 1 and .policy == "ordinary-source-v1" and
+        (keys == ["bytes","directories","files","policy","roots","schema_version","sha256","symlinks"]) and
+        (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+        all([.bytes,.directories,.files,.symlinks][];
+          type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
+        (.roots | type == "array" and length > 0 and . == (sort | unique) and
+          index("source") != null and all(.[];
+            type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and (contains("..") | not)));
       select(length == 1) | .[0] |
       . as $receipt |
       ([$tasks[] | select(.method == "native") | .platform] | unique | sort) as $native |
@@ -16023,6 +16233,9 @@ _act_validate_source_sync_receipt() {
         (.source_materialization // null) == ($receipt.source_materialization // null))) |
       select(if has("staged_ordinary") then
         .staged_ordinary == true and (.git_context | context) and
+        (if has("source_inputs") then (.source_inputs | source_inputs) and
+          all(.hosts[] | select(.status == "success"); .source_inputs == $receipt.source_inputs)
+          else true end) and
         (if .source_materialization == null then true else
           .git_context.git_sha == .source_materialization.git_sha and
           ([.sibling_git_contexts | to_entries[] | {relative_path:.key,git_sha:.value.git_sha}] | sort_by(.relative_path)) ==
@@ -16541,6 +16754,18 @@ act_orchestrate_build() {
             if ! build_state_validate_repo_config "$resume_state" "$expected_resume_recipe"; then
                 _act_release_orchestration_lock
                 return 4
+            fi
+            if ! $strict_release_contract; then
+                local resume_source_inputs_receipt="${source_sync_json:-null}"
+                if ! $source_sync_supplied && ! $no_source_sync_gate; then
+                    resume_source_inputs_receipt=$(jq -c '.context.source_sync // null' <<< "$resume_state") || {
+                        _act_release_orchestration_lock; return 4;
+                    }
+                fi
+                if ! build_state_validate_source_inputs "$resume_state" "$resume_source_inputs_receipt"; then
+                    _act_release_orchestration_lock
+                    return 4
+                fi
             fi
             local retained_snapshot_owners
             if ! retained_snapshot_owners=$(jq -ce '
@@ -17087,6 +17312,12 @@ act_orchestrate_build() {
                 _act_refuse_retained_target "Resume target result has missing or different build purpose: $target" "$prior_attempts"
                 break
             fi
+            if [[ -n "$persisted_result" ]] && ! $strict_release_contract &&
+               ! _act_result_source_inputs_match "$persisted_result" "${source_sync_json:-null}" \
+                   "$(jq -r .method <<< "$task_json")"; then
+                _act_refuse_retained_target "Resume native result lost its original source input binding: $target" "$prior_attempts"
+                break
+            fi
             if [[ -n "$persisted_result" ]] && \
                _act_matrix_result_matches "$persisted_result" "$target" "$selected_triple" && \
                [[ "$(jq -r '.task_key // ""' <<< "$persisted_result")" == "$task_key" ]] && \
@@ -17102,6 +17333,12 @@ act_orchestrate_build() {
                recovered_result=$(jq -ce '.' "$persisted_result_path" 2>/dev/null); then
                 if ! _act_build_purpose_matches "$recovered_result" "$build_purpose" "$strict_release_contract"; then
                     _act_refuse_retained_target "Resume sidecar has missing or different build purpose: $target" "$prior_attempts"
+                    break
+                fi
+                if ! $strict_release_contract &&
+                   ! _act_result_source_inputs_match "$recovered_result" "${source_sync_json:-null}" \
+                       "$(jq -r .method <<< "$task_json")"; then
+                    _act_refuse_retained_target "Resume native sidecar lost its original source input binding: $target" "$prior_attempts"
                     break
                 fi
                 if _act_matrix_result_matches "$recovered_result" "$target" "$selected_triple" &&
