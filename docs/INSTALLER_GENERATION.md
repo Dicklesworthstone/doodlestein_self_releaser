@@ -168,6 +168,20 @@ deadline and size limit used by public downloads.
 
 Omitting `-Version` selects the latest release online. Explicit nonnumeric tags
 such as `release-2026.11` are preserved; a bare numeric `1.2.3` selects `v1.2.3`.
+Without a selected token, an unavailable or rate-limited latest-release API
+(HTTP 403, 408, 429, 5xx, or a transport failure) falls back to GitHub's documented
+[public latest-release link](https://docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases).
+The installer follows at most five HTTPS `HEAD` redirects within the exact
+repository, requires a successful `/releases/tag/TAG` destination, and pins all
+subsequent payload and verification downloads to that tag. Login pages, another
+repository, unsafe tags, URL credentials, queries, fragments and nonstandard
+ports are refused before contacting their destinations. HTML content is never
+parsed to guess a version. This discovery has its own 60-second deadline.
+Authenticated failures, malformed successful API responses, and API identities
+claiming a draft or prerelease remain errors; they cannot authorize an anonymous
+fallback. The selected release still needs its exact checksums and every
+configured signature before installation.
+
 Offline mode requires an explicit version and makes no release lookup, checksum request or signature
 download. The cache binds repository, version, platform, selected asset and
 embedded policy; cached bytes and evidence are rechecked on every installation.
@@ -210,7 +224,10 @@ Authenticated acquisition runs the actual HTTP request, redirect and streaming
 implementation with a .NET response-handler fixture. It covers token priority,
 paginated exact asset lookup, binary Accept headers, credential removal on signed
 object-store redirects, refusal without anonymous fallback, and offline reuse
-without credentials. Portable PowerShell runs use explicit host/HTTP adapters
+without credentials. Public latest discovery exercises API rate limits and
+injected transport failures, exact relative/encoded tag redirects, redirect
+limits, unsafe destination refusal, and draft/prerelease metadata refusal.
+Portable PowerShell runs use explicit host/HTTP adapters
 and a labelled move failure injection for rollback; they do not establish native
 NTFS behavior or successful live GitHub acquisition.
 The policy regression exercises the actual configuration and publication naming

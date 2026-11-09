@@ -19,9 +19,10 @@ $script:DsrMaximumPayloadBytes = 2147483648L
 $script:DsrMaximumExpandedBytes = 4294967296L
 
 function Stop-DsrInstall {
-    param([string]$Message, [int]$Code = 4)
+    param([string]$Message, [int]$Code = 4, [switch]$TransientAcquisition)
     $failure = [System.InvalidOperationException]::new($Message)
     $failure.Data['DsrExitCode'] = $Code
+    if ($TransientAcquisition) { $failure.Data['DsrTransientAcquisition'] = $true }
     throw $failure
 }
 
@@ -446,7 +447,10 @@ function Invoke-DsrDownload {
                     continue
                 }
                 if ($status -in @(404, 410) -and $Optional) { return $false }
-                if ($status -ne 200) { Stop-DsrInstall ('GitHub download failed with HTTP ' + $status) 8 }
+                if ($status -ne 200) {
+                    Stop-DsrInstall ('GitHub download failed with HTTP ' + $status) 8 `
+                        -TransientAcquisition:($status -in @(403, 408, 429) -or ($status -ge 500 -and $status -le 599))
+                }
                 if ($null -ne $response.Content.Headers.ContentLength -and $response.Content.Headers.ContentLength -gt $MaximumBytes) {
                     Stop-DsrInstall 'Download exceeds its size limit' 7
                 }
@@ -471,13 +475,71 @@ function Invoke-DsrDownload {
             }
         }
     } catch [OperationCanceledException] {
-        Stop-DsrInstall 'GitHub download exceeded its complete-transfer deadline' 8
+        Stop-DsrInstall 'GitHub download exceeded its complete-transfer deadline' 8 -TransientAcquisition
     } catch [Net.Http.HttpRequestException] {
         # Exception text can contain a signed redirect URL. Keep credentials
         # and acquisition tokens out of diagnostics and machine results.
-        Stop-DsrInstall 'GitHub download failed during HTTPS transport' 8
+        Stop-DsrInstall 'GitHub download failed during HTTPS transport' 8 -TransientAcquisition
     } finally { $deadline.Dispose(); $client.Dispose(); $token = '' }
     Stop-DsrInstall 'Download did not complete' 8
+}
+
+# GitHub's public latest-release redirect does not consume the REST API rate
+# budget. Resolve only that repository's exact tag route with bounded HEAD
+# requests; never scrape HTML or send a credential to the browser endpoint.
+function Get-DsrPublicLatestTag {
+    param([string]$Repository)
+    $latestPath = '/' + $Repository + '/releases/latest'
+    $tagPrefix = '/' + $Repository + '/releases/tag/'
+    $uri = [Uri]('https://github.com' + $latestPath)
+    $client = New-DsrHttpClient
+    $deadline = [Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds(60))
+    try {
+        for ($redirect = 0; $redirect -le 5; $redirect++) {
+            # Validate every destination before contacting it, including a
+            # relative Location resolved against the previous request URL.
+            if ($uri.Scheme -cne 'https' -or $uri.Host -cne 'github.com' -or
+                -not $uri.IsDefaultPort -or $uri.UserInfo -or $uri.Query -or $uri.Fragment) {
+                Stop-DsrInstall 'Refusing an unsafe public latest-release redirect' 8
+            }
+            $tag = ''
+            if ($uri.AbsolutePath.StartsWith($tagPrefix, [StringComparison]::Ordinal)) {
+                $tag = [Uri]::UnescapeDataString($uri.AbsolutePath.Substring($tagPrefix.Length))
+                if (-not (Test-DsrName $tag) -or $tag -match '[\x00-\x20\x7f]') {
+                    Stop-DsrInstall 'Public latest-release redirect does not select a safe exact tag' 8
+                }
+            } elseif ($uri.AbsolutePath -cne $latestPath) {
+                Stop-DsrInstall 'Public latest-release redirect changed the selected repository or route' 8
+            }
+            $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Head, $uri)
+            $request.Headers.UserAgent.ParseAdd('doodlestein_self_releaser-installer/1.0')
+            $response = $null
+            try {
+                $response = $client.SendAsync($request, [Net.Http.HttpCompletionOption]::ResponseHeadersRead,
+                    $deadline.Token).GetAwaiter().GetResult()
+                $status = [int]$response.StatusCode
+                if ($status -in @(301, 302, 303, 307, 308)) {
+                    if ($redirect -eq 5 -or $null -eq $response.Headers.Location) {
+                        Stop-DsrInstall 'Invalid or excessive public latest-release redirects' 8
+                    }
+                    $uri = [Uri]::new($uri, $response.Headers.Location)
+                    continue
+                }
+                if ($status -ne 200 -or -not $tag) {
+                    Stop-DsrInstall 'Cannot resolve the latest published release; use -Version with an existing tag' 8
+                }
+                return $tag
+            } finally {
+                if ($null -ne $response) { $response.Dispose() }
+                $request.Dispose()
+            }
+        }
+    } catch [OperationCanceledException] {
+        Stop-DsrInstall 'Public latest-release discovery exceeded its deadline; use -Version with an existing tag' 8
+    } catch [Net.Http.HttpRequestException] {
+        Stop-DsrInstall 'Public latest-release discovery failed during HTTPS transport; use -Version with an existing tag' 8
+    } finally { $deadline.Dispose(); $client.Dispose() }
+    Stop-DsrInstall 'Public latest-release discovery did not complete' 8
 }
 
 function Assert-DsrReleaseIdentity {
@@ -931,13 +993,31 @@ permission. Credentials are sent only to the configured repository's GitHub API.
         if (-not $Version) {
             $work = New-DsrPrivateDirectory ([IO.Path]::Combine($cacheRoot, ('.dsr-download-' + [Guid]::NewGuid().ToString('N'))))
             $latest = [IO.Path]::Combine($work, 'latest.json')
-            $null = Invoke-DsrDownload ('https://api.github.com/repos/' + $policy.repo + '/releases/latest') $latest -MaximumBytes 8388608
-            $release = ConvertFrom-DsrJson (Read-DsrTextFile $latest)
-            if ($release -isnot [System.Collections.IDictionary] -or -not $release.Contains('tag_name') -or
-                -not (Test-DsrName $release.tag_name) -or ($release.Contains('draft') -and $release.draft -ne $false)) {
-                Stop-DsrInstall 'Invalid latest-release identity' 7
+            $authenticatedDiscovery = [bool](Get-DsrGitHubToken)
+            $latestDownloaded = $false
+            try {
+                $null = Invoke-DsrDownload ('https://api.github.com/repos/' + $policy.repo + '/releases/latest') $latest -MaximumBytes 8388608
+                $latestDownloaded = $true
+            } catch {
+                # A selected credential never falls back to an anonymous
+                # identity. Malformed metadata and unsafe API redirects are
+                # not availability failures and must also remain refusals.
+                if ($authenticatedDiscovery -or
+                    -not $_.Exception.Data.Contains('DsrTransientAcquisition') -or
+                    $_.Exception.Data['DsrTransientAcquisition'] -ne $true) { throw }
+                Write-DsrInstallLog 'GitHub API unavailable; resolving the public latest-release redirect'
+                $tag = Get-DsrPublicLatestTag $policy.repo
             }
-            $tag = $release.tag_name
+            if ($latestDownloaded) {
+                $release = ConvertFrom-DsrJson (Read-DsrTextFile $latest)
+                if ($release -isnot [System.Collections.IDictionary] -or -not $release.Contains('tag_name') -or
+                    -not (Test-DsrName $release.tag_name)) { Stop-DsrInstall 'Invalid latest-release identity' 7 }
+                Assert-DsrReleaseIdentity $release $release.tag_name
+                if (-not $release.Contains('prerelease') -or $release.prerelease -isnot [bool] -or $release.prerelease) {
+                    Stop-DsrInstall 'Latest release is not a published full release' 7
+                }
+                $tag = $release.tag_name
+            }
         } else { $tag = if ($Version -cmatch '^[0-9]') { 'v' + $Version } else { $Version } }
         $number = if ($tag.StartsWith('v', [StringComparison]::Ordinal)) { $tag.Substring(1) } else { $tag }
         $asset = $selection.name.Replace('${version}', $number)

@@ -167,6 +167,7 @@ public sealed class DsrInstallerFixtureHandler : HttpMessageHandler {
         File.AppendAllText(fixture.GetProperty("requests").GetString(), JsonSerializer.Serialize(new {
             url, authorization_sha256 = authorizationHash,
             authorization_scheme = request.Headers.Authorization == null ? "" : request.Headers.Authorization.Scheme,
+            method = request.Method.Method,
             accept = request.Headers.Accept.ToString(), user_agent = request.Headers.UserAgent.ToString()
         }) + "\n");
         if (fixture.GetProperty("parameters").TryGetProperty("Offline", out JsonElement offline) && offline.GetBoolean()) {
@@ -182,6 +183,10 @@ public sealed class DsrInstallerFixtureHandler : HttpMessageHandler {
         if (request.RequestUri.AbsolutePath.Contains("/releases/assets/") &&
             request.Headers.Accept.ToString() != "application/octet-stream") {
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotAcceptable));
+        }
+        if (fixture.TryGetProperty("transport_failures", out JsonElement failures) && failures.TryGetProperty(url, out JsonElement failure)) {
+            if (failure.GetString() == "timeout") { throw new OperationCanceledException("Injected response deadline"); }
+            throw new HttpRequestException("Injected HTTPS transport failure");
         }
         if (fixture.TryGetProperty("statuses", out JsonElement statuses) && statuses.TryGetProperty(url, out JsonElement status)) {
             return Task.FromResult(new HttpResponseMessage((HttpStatusCode)status.GetInt32()));
@@ -404,7 +409,7 @@ for checksum in ("sidecar", "checksums.sha256", "SHA256SUMS.txt", "checksums.txt
 
 latest_downloads = dict(good)
 latest_path = root / "latest.json"
-latest_path.write_text(json.dumps({"tag_name": "v1.2.3", "draft": False}))
+latest_path.write_text(json.dumps({"id": 4242, "tag_name": "v1.2.3", "draft": False, "prerelease": False}))
 latest_downloads["https://api.github.com/repos/fixture/win-demo/releases/latest"] = str(latest_path)
 latest, latest_details, _, _, latest_requests = run_case("latest-online", latest_downloads, version=None)
 check("online latest selects a real exact tag before payload lookup", latest.returncode == 0 and
@@ -424,7 +429,7 @@ def private_release(label, *, kind="good", checksum="SHA256SUMS", version="v1.2.
     public = release("private-" + label, kind=kind, checksum=checksum, version=version)
     directory = root / ("private-metadata-" + label)
     directory.mkdir()
-    metadata = {"id": release_id, "tag_name": version, "draft": False}
+    metadata = {"id": release_id, "tag_name": version, "draft": False, "prerelease": False}
     rows = [{"id": index + 1, "name": "other-platform-" + str(index) + ".zip", "state": "uploaded", "size": 1}
             for index in range(padding)]
     if rows:
@@ -484,6 +489,103 @@ def http_options(**options):
 
 def request_rows(path):
     return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+latest_api = api + "/releases/latest"
+latest_browser = "https://github.com/fixture/win-demo/releases/latest"
+latest_tag_url = "https://github.com/fixture/win-demo/releases/tag/v1.2.3"
+latest_downloads = dict(good)
+latest_page = root / "latest-release-page.html"
+latest_page.write_text("<html>Do not scrape this body for a release version.</html>\n")
+latest_downloads[latest_tag_url] = str(latest_page)
+
+for status in (403, 408, 429, 503):
+    outcome, parsed, _, prefix, observed = run_case("public-latest-http-" + str(status), latest_downloads,
+        version=None, options={"http_client_fixture": True, "statuses": {latest_api: status},
+                               "redirects": {latest_browser: latest_tag_url}})
+    rows = request_rows(observed)
+    check("anonymous latest survives API HTTP " + str(status) + " with a verified complete family",
+          outcome.returncode == 0 and parsed.get("version") == "v1.2.3" and
+          parsed.get("signature_verified") is True and
+          all((prefix / name).read_bytes() == (root / name).read_bytes() for name in ("app.exe", "worker.exe")),
+          outcome.stderr.decode(errors="replace"))
+    if status == 403:
+        check("latest fallback uses bounded HEAD discovery and never attaches credentials",
+              [row["url"] for row in rows[:3]] == [latest_api, latest_browser, latest_tag_url] and
+              all(row["method"] == "HEAD" for row in rows if row["url"] in (latest_browser, latest_tag_url)) and
+              all(not row["authorization_sha256"] for row in rows) and
+              all(row["url"].startswith(base_url) and row["method"] == "GET" for row in rows[3:]))
+
+for fault in ("request", "timeout"):
+    outcome, parsed, _, _, observed = run_case("public-latest-transport-" + fault, latest_downloads,
+        version=None, options={"http_client_fixture": True, "transport_failures": {latest_api: fault},
+                               "redirects": {latest_browser: latest_tag_url}})
+    check("injected API " + fault + " failure still admits an independently verified public release",
+          outcome.returncode == 0 and parsed.get("signature_verified") is True and
+          any(row["url"] == latest_browser for row in request_rows(observed)),
+          outcome.stderr.decode(errors="replace"))
+
+latest_metadata = root / "valid-latest.json"
+latest_metadata.write_text(json.dumps({"id": release_id, "tag_name": "v1.2.3", "draft": False, "prerelease": False}))
+api_latest_downloads = {**good, latest_api: str(latest_metadata)}
+api_latest, api_latest_result, _, _, api_latest_requests = run_case("public-latest-api-success", api_latest_downloads,
+    version=None, options={"http_client_fixture": True})
+check("successful published latest API discovery keeps the ordinary verified path",
+      api_latest.returncode == 0 and api_latest_result.get("signature_verified") is True and
+      not any(row["url"] == latest_browser for row in request_rows(api_latest_requests)),
+      api_latest.stderr.decode(errors="replace"))
+
+for kind, content in (
+        ("malformed-json", '{"tag_name":'),
+        ("draft", json.dumps({"id": release_id, "tag_name": "v1.2.3", "draft": True, "prerelease": False})),
+        ("prerelease", json.dumps({"id": release_id, "tag_name": "v1.2.3", "draft": False, "prerelease": True})),
+        ("invalid-prerelease", json.dumps({"id": release_id, "tag_name": "v1.2.3", "draft": False, "prerelease": []})),
+        ("missing-id", json.dumps({"tag_name": "v1.2.3", "draft": False, "prerelease": False}))):
+    metadata_path = root / ("latest-" + kind + ".json")
+    metadata_path.write_text(content)
+    outcome, _, _, _, observed = refusal("public-latest-" + kind,
+        downloads={**latest_downloads, latest_api: str(metadata_path)}, version=None,
+        options={"http_client_fixture": True, "redirects": {latest_browser: latest_tag_url}})
+    check("successful but " + kind + " API metadata never authorizes browser fallback",
+          [row["url"] for row in request_rows(observed)] == [latest_api])
+
+unsafe_latest_redirects = (
+    "http://github.com/fixture/win-demo/releases/tag/v1.2.3",
+    "https://example.invalid/fixture/win-demo/releases/tag/v1.2.3",
+    "https://github.com/other/repository/releases/tag/v1.2.3",
+    "https://github.com/login",
+    "https://github.com:444/fixture/win-demo/releases/tag/v1.2.3",
+    "https://user@github.com/fixture/win-demo/releases/tag/v1.2.3",
+    latest_tag_url + "?redirect=other",
+    latest_tag_url + "#untrusted",
+    "https://github.com/fixture/win-demo/releases/tag/v1.2.3%2Fother",
+    "https://github.com/fixture/win-demo/releases/tag/v1.2.3%0A")
+for index, target in enumerate(unsafe_latest_redirects):
+    outcome, _, _, _, observed = refusal("public-latest-unsafe-redirect-" + str(index),
+        downloads=latest_downloads, version=None, expected=8,
+        options={"http_client_fixture": True, "statuses": {latest_api: 503},
+                 "redirects": {latest_browser: target}})
+    check("unsafe public latest redirect " + str(index) + " is rejected before any target request",
+          [row["url"] for row in request_rows(observed)] == [latest_api, latest_browser])
+
+for label, statuses, redirects, expected_requests in (
+        ("unresolved", {latest_api: 403, latest_browser: 200}, {}, 2),
+        ("missing-tag-page", {latest_api: 403, latest_tag_url: 404}, {latest_browser: latest_tag_url}, 3),
+        ("redirect-loop", {latest_api: 403}, {latest_browser: latest_browser}, 7)):
+    outcome, _, _, _, observed = refusal("public-latest-" + label, downloads=latest_downloads,
+        version=None, expected=8, options={"http_client_fixture": True, "statuses": statuses, "redirects": redirects})
+    check("public latest " + label + " cannot select an unproved tag or exceed the redirect bound",
+          len(request_rows(observed)) == expected_requests)
+
+tag_with_plus = "v1.2.3+build.4"
+encoded_tag_url = "https://github.com/fixture/win-demo/releases/tag/v1.2.3%2Bbuild.4"
+encoded_downloads = {url.replace("+", "%2B"): path for url, path in release("latest-plus", version=tag_with_plus).items()}
+encoded_downloads[encoded_tag_url] = str(latest_page)
+encoded_result, encoded_details, _, _, _ = run_case("public-latest-encoded-tag", encoded_downloads,
+    version=None, options={"http_client_fixture": True, "statuses": {latest_api: 429},
+                           "redirects": {latest_browser: "/fixture/win-demo/releases/tag/v1.2.3%2Bbuild.4"}})
+check("relative latest redirects preserve an exact percent-encoded plus tag and verified payload",
+      encoded_result.returncode == 0 and encoded_details.get("version") == tag_with_plus and
+      encoded_details.get("signature_verified") is True, encoded_result.stderr.decode(errors="replace"))
 
 private_downloads = private_release("complete")
 payload_url = next(url for url, path in private_downloads.items() if Path(path).name == asset)
@@ -562,6 +664,12 @@ rejected_auth, _, _, _, rejected_auth_requests = refusal("private-auth-refusal",
     options=http_options(statuses={api + "/releases/tags/v1.2.3": 403}))
 check("authentication refusal cannot fall back to a different account or anonymous download",
       len(request_rows(rejected_auth_requests)) == 1 and fixture_token.encode() not in rejected_auth.stderr)
+latest_auth, _, _, _, latest_auth_requests = refusal("private-latest-rate-limit",
+    downloads=private_release("latest-rate-limit"), expected=8, credentials=credentials, version=None,
+    options=http_options(statuses={latest_api: 403}, redirects={latest_browser: latest_tag_url}))
+check("authenticated latest rate limits never downgrade to anonymous browser discovery",
+      [row["url"] for row in request_rows(latest_auth_requests)] == [latest_api] and
+      fixture_token.encode() not in latest_auth.stderr)
 unsafe_redirects = ("http://release-assets.githubusercontent.com/fixture/payload",
                     "https://api.github.com/repos/other/repository/releases/assets/77",
                     "https://release-assets.githubusercontent.com:444/fixture/payload")
