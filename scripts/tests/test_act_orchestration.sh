@@ -15,6 +15,8 @@
 # function for a paired comparison over the same files in that invocation.
 # --strict-manifest-inventory-only compiles a local C executable and exercises
 # exact strict manifests with real Git source, staged receipts and companions.
+# --native-matrix-inventory-only exercises complete native matrix admission
+# with actual archives/receipts; GNU/musl worker selection is fixture metadata.
 
 set -uo pipefail
 
@@ -959,6 +961,235 @@ PY
 
 if [[ "${1:-}" == --strict-manifest-inventory-only ]]; then
     test_strict_manifest_inventory
+    exit $?
+fi
+
+test_native_matrix_inventory() {
+    local project_root dependency
+    project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" || return 1
+    for dependency in python3 bash cc git jq yq; do
+        command -v "$dependency" >/dev/null || { echo "Missing test dependency: $dependency" >&2; return 77; }
+    done
+    python3 -I - "$project_root" "${DSR_TEST_ACT_RUNNER:-$project_root/src/act_runner.sh}" <<'PY'
+import copy
+import hashlib
+import io
+import json
+from pathlib import Path
+import platform
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+
+root, module = map(Path, sys.argv[1:])
+architecture = {'x86_64': ('amd64', 'x86_64'), 'aarch64': ('arm64', 'aarch64')}.get(platform.machine())
+if platform.system() != 'Linux' or architecture is None:
+    print('SKIP: native matrix archive fixture requires local Linux amd64/arm64')
+    raise SystemExit(77)
+target = 'linux/' + architecture[0]
+triples = [architecture[1] + '-unknown-linux-' + libc for libc in ('gnu', 'musl')]
+work = Path(tempfile.mkdtemp(prefix='dsr-native-matrix-inventory-')).resolve()
+for name in ('source', 'config/repos.d', 'payloads'):
+    (work / name).mkdir(parents=True)
+print('Native matrix inventory evidence: ' + str(work), flush=True)
+checks = 0
+
+def check(label, condition):
+    global checks
+    if not condition:
+        raise AssertionError(label)
+    checks += 1
+    print('PASS: ' + label, flush=True)
+
+def save(path, value):
+    path.write_text(json.dumps(value) + '\n')
+
+def identity(path):
+    info = path.stat()
+    return info.st_dev, info.st_ino, info.st_mode, hashlib.sha256(path.read_bytes()).hexdigest()
+
+def run(*args):
+    return subprocess.run(list(map(str, args)), check=True, capture_output=True, timeout=30)
+
+source = work / 'source/inventoryapp.c'
+source.write_text('#include <stdio.h>\nint main(void) { puts("matrix inventory fixture"); return 0; }\n')
+run('git', '-C', work / 'source', 'init', '-q', '-b', 'main')
+run('git', '-C', work / 'source', 'add', 'inventoryapp.c')
+run('git', '-C', work / 'source', '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+    'commit', '-qm', 'matrix manifest source fixture')
+run('git', '-C', work / 'source', 'tag', 'v1.2.3')
+sha = run('git', '-C', work / 'source', 'rev-parse', 'HEAD').stdout.decode().strip()
+run('cc', source, '-o', work / 'inventoryapp')
+check('archive payload is a real locally compiled and runnable C executable',
+      run(work / 'inventoryapp').stdout == b'matrix inventory fixture\n')
+save(work / 'config/repos.d/matrixinventory.yaml', {
+    'tool_name': 'matrixinventory', 'binary_name': 'inventoryapp', 'local_path': str(work / 'source'),
+    'targets': [target], 'act_job_map': {target: None}, 'target_triples': {target: triples}})
+
+driver = r'''set -uo pipefail
+root=$1 module=$2 work=$3; shift 3
+export DSR_CONFIG_DIR="$work/config" DSR_REPOS_FILE="$work/config/repos.yaml"
+export ACT_REPOS_DIR="$work/config/repos.d" ACT_REPO_LOCAL_PATH="$work/source" NO_COLOR=1
+source "$root/src/config.sh" || exit 90
+source "$module" || exit 90
+operation=$1; shift
+case "$operation" in
+    receipts) _act_result_artifact_receipts "$(cat "$1")" > "$2" ;;
+    manifest) act_generate_manifest "$(cat "$1")" "$2" ;;
+    retained) _act_validate_native_manifest_inventory matrixinventory "$(cat "$1")" ;;
+    matrix) _act_validate_native_matrix_result_inventory matrixinventory "$(cat "$1")" "$(cat "$2")" ;;
+    rows-only) _act_validate_native_matrix_result_inventory matrixinventory "$(cat "$1")" ;;
+    collected) _act_verify_collected_manifest "$@" ;;
+    *) exit 90 ;;
+esac
+'''
+
+def invoke(label, operation, *args, input=None):
+    started = time.monotonic()
+    result = subprocess.run(['bash', '-c', driver, '_', str(root), str(module), str(work), operation,
+                             *map(str, args)], input=input, capture_output=True, timeout=105)
+    (work / (label + '.stdout')).write_bytes(result.stdout)
+    (work / (label + '.stderr')).write_bytes(result.stderr)
+    print('%s: exit=%d, seconds=%.3f' % (label, result.returncode, time.monotonic() - started), flush=True)
+    if result.returncode:
+        print(result.stderr.decode(errors='replace')[-1200:], file=sys.stderr, flush=True)
+    return result
+
+# The selected compiler identities are controlled worker metadata. The payload
+# is compiled by local cc, so this does not claim musl compilation or execution.
+# Both archive families and their distinguishing producer labels are real bytes.
+families, payloads, expected = {}, {}, {}
+for triple in triples:
+    archive = work / (triple + '.tar.gz')
+    with tarfile.open(archive, 'w:gz') as output:
+        for name, body, mode in (
+            ('inventoryapp', (work / 'inventoryapp').read_bytes(), 0o755),
+            ('producer.json', json.dumps({'fixture_selected_triple': triple}).encode(), 0o644),
+        ):
+            member = tarfile.TarInfo(name)
+            member.size, member.mode = len(body), mode
+            output.addfile(member, io.BytesIO(body))
+    payloads[triple] = archive.read_bytes()
+    paths = [work / 'payloads' / ('component-%04d-' % i + 'x' * 202 + '-' + triple + '.tar.gz')
+             for i in range(150)]
+    for path in paths:
+        path.write_bytes(payloads[triple])
+    families[triple] = paths
+    expected[triple] = {'sha256': hashlib.sha256(payloads[triple]).hexdigest(), 'size_bytes': len(payloads[triple])}
+all_paths = [p for triple in triples for p in families[triple]]
+original = {str(p): identity(p) for p in all_paths}
+results, expected_rows = {}, {}
+for count in (1, 150):
+    rows, artifacts = [], []
+    for triple in triples:
+        row = {'platform': target, 'target_triple': triple, 'task_key': target + '@' + triple,
+               'method': 'native', 'host': 'controlled-fixture', 'status': 'success',
+               'artifact_paths': list(map(str, families[triple][:count]))}
+        row_path = work / ('row-%s-%d.json' % (triple, count))
+        receipt_path = work / ('receipts-%s-%d.json' % (triple, count))
+        save(row_path, row)
+        check('production receipts cover %d actual %s archive files' % (count, triple),
+              invoke('receipts-%s-%d' % (triple, count), 'receipts', row_path, receipt_path).returncode == 0 and
+              len(json.loads(receipt_path.read_bytes())) == count)
+        row['resume_artifacts'] = json.loads(receipt_path.read_bytes())
+        rows.append(row)
+        artifacts += [{'name': p.name, 'target': target, 'target_triple': triple, **expected[triple],
+                       'archive_format': 'tar.gz', 'signed': False, 'signature_file': '',
+                       'build_purpose': 'release', 'publishable': True} for p in families[triple][:count]]
+    result = {'tool': 'matrixinventory', 'version': '1.2.3', 'run_id': '12345678-1234-1234-1234-123456789abc',
+              'git_sha': sha, 'git_ref': 'v1.2.3', 'status': 'success',
+              'summary': {'total': 2, 'success': 2, 'failed': 0}, 'requested_targets': [target], 'targets': rows}
+    results[count], expected_rows[count] = result, artifacts
+    result_path, manifest = work / ('result-%d.json' % count), work / ('manifest-%d.json' % count)
+    save(result_path, result)
+    generated = invoke('manifest-%d' % count, 'manifest', result_path, manifest)
+    check('public native matrix manifest succeeds for %d actual archives' % (count * 2),
+          generated.returncode == 0 and manifest.is_file() and not generated.stdout)
+    observed = json.loads(manifest.read_bytes())
+    check('%d-file native manifest retains every name, triple, hash, size and source' % (count * 2),
+          observed['artifacts'] == artifacts and observed['summary'] == result['summary'] and
+          observed['source'] == {'git_sha': sha, 'git_ref': 'v1.2.3', 'dependencies': []} and
+          observed['requested_targets'] == [target])
+    if count == 150:
+        assembled = [{k: v for k, v in r.items() if k not in ('build_purpose', 'publishable')} for r in artifacts]
+        size = len(json.dumps(assembled, separators=(',', ':')).encode())
+        check('complete compact matrix inventory exceeds one exec argument (%d bytes)' % size, size > 131072)
+        save(work / 'artifacts.json', assembled)
+
+manifest = work / 'manifest-150.json'
+framed = b''.join(p.name.encode() + b'\0' for p in all_paths)
+check('every final matrix archive passes independent byte and collected-name admission',
+      invoke('collected', 'collected', manifest, work / 'payloads', '--collected', input=framed).returncode == 0)
+check('large retained manifest passes the publication-side native matrix admission',
+      invoke('retained', 'retained', manifest).returncode == 0)
+check('historical row-only inventory admission still accepts complete native tasks',
+      invoke('rows-only', 'rows-only', work / 'result-1.json').returncode == 0)
+save(work / 'no-artifacts.json', [])
+failed = copy.deepcopy(results[1])
+failed.update(status='failed', summary={'total': 2, 'success': 0, 'failed': 2})
+for row in failed['targets']:
+    row['status'] = 'failed'
+save(work / 'failed-result.json', failed)
+check('failed native tasks still admit an explicit empty optional artifact array',
+      invoke('failed-empty', 'matrix', work / 'failed-result.json', work / 'no-artifacts.json').returncode == 0)
+check('successful native tasks cannot use an empty artifact inventory',
+      invoke('success-empty', 'matrix', work / 'result-1.json', work / 'no-artifacts.json').returncode == 4)
+save(work / 'missing-variant-artifacts.json', [r for r in assembled if r['target_triple'] == triples[0]])
+check('complete native matrix refuses an artifact inventory missing its second variant',
+      invoke('missing-variant', 'matrix', work / 'result-150.json', work / 'missing-variant-artifacts.json').returncode == 4)
+(work / 'trailing-artifacts.json').write_text((work / 'artifacts.json').read_text() + '[]\n')
+check('matrix artifact input cannot contain a trailing second array document',
+      invoke('trailing-artifacts', 'matrix', work / 'result-150.json', work / 'trailing-artifacts.json').returncode == 4)
+
+def refused(label, value=None):
+    result_path, output = work / (label + '-result.json'), work / (label + '-manifest.json')
+    save(result_path, results[150] if value is None else value)
+    result = invoke(label, 'manifest', result_path, output)
+    check(label + ' returns 4 without stdout or a publishable manifest',
+          result.returncode == 4 and not result.stdout and not output.exists())
+
+for label, mutation in (
+    ('missing-worker', lambda r: r['targets'].pop()),
+    ('duplicate-worker', lambda r: r['targets'].__setitem__(1, copy.deepcopy(r['targets'][0]))),
+    ('collapsed-summary', lambda r: r['summary'].update(total=1, success=1)),
+    ('failed-worker-in-success', lambda r: r['targets'][0].update(status='failed')),
+):
+    changed = copy.deepcopy(results[150])
+    mutation(changed)
+    refused(label, changed)
+changed = copy.deepcopy(results[1])
+for row, triple in zip(changed['targets'], reversed(triples)):
+    row.update(target_triple=triple, task_key=target + '@' + triple)
+refused('swapped-compiler-owners', changed)
+first, held = all_paths[0], work / 'held-archive'
+first.rename(held)
+try:
+    refused('missing-archive')
+    first.write_bytes(held.read_bytes())
+    refused('replaced-archive-inode')
+finally:
+    if first.exists() or first.is_symlink():
+        first.rename(work / 'retained-replacement')
+    held.rename(first)
+first.write_bytes(payloads[triples[0]] + b'changed\n')
+try:
+    refused('changed-archive-bytes')
+finally:
+    first.write_bytes(payloads[triples[0]])
+check('all original archive bytes, modes and inodes survive generation and refusals',
+      original == {str(p): identity(p) for p in all_paths})
+stdout = invoke('stdout-manifest', 'manifest', work / 'result-1.json', '')
+check('stdout contains exactly one complete native matrix manifest',
+      stdout.returncode == 0 and json.loads(stdout.stdout)['artifacts'] == expected_rows[1])
+print('Native matrix inventory: %d checks passed' % checks, flush=True)
+print('Archives, C payload, hashes, receipts and admission are real; GNU/musl compiler selection is fixture metadata.', flush=True)
+PY
+}
+
+if [[ "${1:-}" == --native-matrix-inventory-only ]]; then
+    test_native_matrix_inventory
     exit $?
 fi
 

@@ -18103,12 +18103,14 @@ _act_validate_native_matrix_result_inventory() {
             return 4
         fi
         if [[ "$artifacts" != null ]] && ! jq -es \
-            --argjson artifacts "$artifacts" --arg platform "$platform" '
-                length == 1 and (.[0] as $rows |
+            --slurpfile artifact_documents /dev/fd/3 --arg platform "$platform" '
+                length == 1 and (.[0] | type == "array") and
+                ($artifact_documents | length == 1 and (.[0] | type == "array")) and
+                (.[0] as $rows | $artifact_documents[0] as $artifacts |
                 all($rows[] | select(.status == "success" or .status == "ok" or .status == "passed");
                     .target_triple as $triple |
                     any($artifacts[]; .target == $platform and .target_triple == $triple)))
-            ' <<< "$rows" >/dev/null; then
+            ' 3<<< "$artifacts" <<< "$rows" >/dev/null; then
             _log_error "Native matrix payload is missing for $tool $platform"
             return 4
         fi
