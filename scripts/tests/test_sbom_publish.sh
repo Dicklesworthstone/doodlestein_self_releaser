@@ -68,6 +68,60 @@ complete_documents() {
     jq -e '[.[] | select(.name | contains(".sbom."))] | length == 2' "$REMOTE/inventory.json" >/dev/null
 }
 
+publication_large_inventory_cases() {
+    new_publication large-inventory
+    # These are existing metadata assets outside this publication's selected
+    # payloads. Every page and every original row must still be retained by
+    # the real publication guards and the independent remote verifier.
+    edit_inventory '. + [range(1;501) | {id:(1000+.),
+        name:("historical-"+("x"*180)+"-"+tostring+".json"),state:"uploaded",size:0,
+        digest:"sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}]'
+    jq -cS 'sort_by(.name)' "$REMOTE/inventory.json" > "$CASE/original-inventory.json"
+    check 'paginated publication fixture exceeds the single-argument limit' \
+        test "$(wc -c < "$CASE/original-inventory.json")" -gt 131072
+    capture publish
+    check 'large paginated inventory completes actual SBOM publication' test "$status" -eq 0
+    check 'large publication independently verifies its selected payloads' jq -es \
+        'length == 1 and (.[0] | .status == "verified" and .verification.artifact_count == 2
+         and .sbom_upload_attempts == 2 and .manifest_upload_attempted == true)' "$CASE/stdout"
+    check 'large publication adds only the three planned documents' test "$(wc -l < "$CASE/uploads.log")" -eq 3
+    check 'large publication preserves every preexisting asset row' jq -es \
+        --slurpfile original "$CASE/original-inventory.json" \
+        'length == 1 and (.[0] | map(select(.id <= 1500)) | sort_by(.name)) == $original[0]' \
+        "$REMOTE/inventory.json"
+    check 'large publication reads the later inventory pages' \
+        grep -Fq 'repos/acme/tool/releases/42/assets?per_page=100&page=6' "$CASE/api.log"
+    capture publish --dry-run
+    check 'large inventory read-only publication retry succeeds' test "$status" -eq 0
+    check 'large inventory remains usable for a read-only publication retry' jq -es \
+        'length == 1 and (.[0] | .status == "planned" and .dry_run == true
+         and (.actions | length) == 3 and all(.actions[]; .action == "reuse"))' "$CASE/stdout"
+    check 'large inventory retry performs no additional uploads' test "$(wc -l < "$CASE/uploads.log")" -eq 3
+
+    local before after names mutation argument
+    before=$(cat "$CASE/original-inventory.json")
+    names='["new.sbom.json"]'
+    after=$(jq -c '. + [{id:9999,name:"new.sbom.json",state:"uploaded",size:1,digest:null}] | sort_by(.name)' \
+        <<< "$before")
+    capture _sbr_inventory_compatible "$before" "$after" "$names"
+    check 'large compatibility gate permits only selected additions' test "$status" -eq 0
+    for mutation in '.[1].id += 9000' '.[1].size += 1' '.[1].digest = "sha256:changed"' \
+        '.[1].state = "starter"' 'del(.[1])' \
+        '. + [{id:9998,name:"unplanned.json",state:"uploaded",size:0,digest:null}] | sort_by(.name)'; do
+        after=$(jq -c "$mutation" <<< "$before")
+        capture _sbr_inventory_compatible "$before" "$after" "$names"
+        check "large compatibility gate rejects changed custody: $mutation" test "$status" -eq 7
+    done
+    for argument in before after names; do
+        case "$argument" in
+            before) capture _sbr_inventory_compatible "$before"$'\n{}' "$before" '[]' ;;
+            after) capture _sbr_inventory_compatible "$before" "$before"$'\n{}' '[]' ;;
+            names) capture _sbr_inventory_compatible "$before" "$before" '[] {}' ;;
+        esac
+        check "compatibility gate rejects a trailing document in $argument" test "$status" -eq 7
+    done
+}
+
 publication_resumption_cases() {
 for format in spdx cyclonedx; do
     new_publication "publish-$format" "$format"
@@ -285,7 +339,10 @@ capture publish
 check 'verified retry converges after concurrent publishers' test "$status" -eq 0
 }
 
-dsr_test_groups publication_resumption_cases publication_mutation_cases publication_completion_cases || exit 1
+[[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0
+
+dsr_test_groups publication_resumption_cases publication_mutation_cases publication_completion_cases \
+    publication_large_inventory_cases || exit 1
 
 printf '\nSBOM publication checks: %d; failures: %d\n' "$checks" "$failures"
 [[ "$failures" -eq 0 ]]

@@ -456,11 +456,16 @@ _sbr_check_local_publication() {
 # All initially present assets must retain their complete identity/metadata.
 # Only the explicitly planned SBOM names may appear during this publication.
 _sbr_inventory_compatible() {
-    jq -ne --argjson before "$1" --argjson after "$2" --argjson names "$3" '
-        all($before[]; . as $item | [$after[] | select(.name == $item.name)] == [$item]) and
-        ([$before[] | select(.name as $n | ($names | index($n)) == null)] ==
-         [$after[] | select(.name as $n | ($names | index($n)) == null)])
-    ' >/dev/null 2>&1 || {
+    # Paginated inventories can be larger than one executable argument. Keep
+    # each document on its own input descriptor so malformed or trailing JSON
+    # cannot supply another document's slot when the inputs are combined.
+    jq -es --slurpfile before /dev/fd/3 --slurpfile after /dev/fd/4 '
+        length == 1 and ($before | length) == 1 and ($after | length) == 1 and
+        (.[0] as $names | $before[0] as $before | $after[0] as $after |
+            all($before[]; . as $item | [$after[] | select(.name == $item.name)] == [$item]) and
+            ([$before[] | select(.name as $n | ($names | index($n)) == null)] ==
+             [$after[] | select(.name as $n | ($names | index($n)) == null)]))
+    ' 3<<< "$1" 4<<< "$2" <<< "$3" >/dev/null 2>&1 || {
         _sbom_log error 'Release inventory changed outside the planned SBOM additions'; return 7;
     }
 }
