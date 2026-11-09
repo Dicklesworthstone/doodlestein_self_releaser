@@ -529,12 +529,15 @@ _slr_verify_remote() {
     _slr_policy "$proof" "$signature" "$key" "$policy" || return $?
     if [[ -n "$cache" ]]; then
         resume_key=$(_slsa_sha256 "$key") || return $?
-        jq -cnS --slurpfile policy "$policy" --arg key "$resume_key" \
-            --arg output "${cache%.partial}" --argjson context "$context" --argjson inventory "$inventory" \
+        jq -csS --slurpfile policy "$policy" --arg key "$resume_key" \
+            --arg output "${cache%.partial}" --argjson context "$context" \
             --arg proof "$proof_hash" --arg signature "$signature_hash" \
-            '{schema_version:1,kind:"dsr-slsa-fetch-checkpoint",output:$output,policy:$policy[0],
+            'if length==1 and (.[0]|type=="array") then .[0] as $inventory |
+             {schema_version:1,kind:"dsr-slsa-fetch-checkpoint",output:$output,policy:$policy[0],
               public_key_sha256:$key,context:$context,inventory:$inventory,
-              statement_sha256:$proof,signature_sha256:$signature}' > "$work/fetch-selection.json" || return 1
+              statement_sha256:$proof,signature_sha256:$signature}
+             else error("exactly one release inventory required") end' \
+            <<< "$inventory" > "$work/fetch-selection.json" || return 1
     fi
     _slr_payloads "$repo" "$inventory" "$proof" "$work" "$cache" "$jobs" || return $?
     slsa_verify_release "$proof" "$work/payloads" --builder "$builder" --public-key "$key" --signature "$signature" \
@@ -703,8 +706,10 @@ _slr_publish() {
     _slr_payloads "$repo" "$inventory" "$work/statement" "$work" || return $?
     current=$(_sbr_publication_gate "$repo" "$tag" "$context" "$inventory" "$names" "$work") || return $?
     if [[ $(jq -r .release.draft <<< "$context") != true ]] &&
-       ! jq -en --argjson names "$names" --argjson inventory "$current" \
-            'all($names[];. as $n|any($inventory[];.name==$n))' >/dev/null; then
+       ! jq -es --argjson names "$names" \
+            'length==1 and (.[0]|type=="array") and
+             (.[0] as $inventory | all($names[];. as $n|any($inventory[];.name==$n)))' \
+            <<< "$current" >/dev/null; then
         _slsa_log 'Missing provenance may only be attached to a draft'; return 4
     fi
     if ! declare -F gh_upload_asset_named >/dev/null; then

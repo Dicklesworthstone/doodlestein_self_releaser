@@ -217,6 +217,72 @@ fi_expect_all_reaped() {
     fi_expect_group_status 1 fi_worker_bad_counts fi_worker_later && [[ -s "$FI_REAP_MARKER" ]]
 }
 
+fi_large_inventory_cases() {
+    local inventory changed before _RF_INTEGRITY_ASSETS _RF_PROVENANCE_KEY _RF_PROVENANCE_DOCUMENTS status=0
+    new_fi_case large-inventory
+    add_payloads || return 1
+    # Unrelated metadata stays in every publication observation; it must not be
+    # dropped to make the selected three-payload release fit one argv element.
+    jq -c '.+[range(1000;1500)|{id:.,name:("existing-"+tostring+"-"+("x"*195)+".json"),
+        size:7,state:"uploaded",digest:("sha256:"+("a"*64))}]|sort_by(.name)' \
+        "$CASE/remote/inventory.json" > "$CASE/large-inventory.json" || return 1
+    cp "$CASE/large-inventory.json" "$CASE/remote/inventory.json" || return 1
+    check 'signed finalization fixture exceeds the single-argument limit' \
+        test "$(wc -c < "$CASE/remote/inventory.json")" -gt 131072
+    capture signed --promote
+    check 'large inventory completes actual integrity publication and signed finalization' test "$status" -eq 0
+    if ((status)); then cat "$CASE/err" "$CASE/out"; return 1; fi
+    check 'large inventory result authenticates the promoted release' jq -e \
+        '.status=="published" and .integrity.authenticated and (.integrity.release.draft|not)' "$CASE/out"
+    check 'large inventory uploads exactly seven integrity proofs' test "$(wc -l < "$CASE/uploads")" -eq 7
+    check 'large inventory promotes exactly once' test "$(wc -l < "$CASE/promotions")" -eq 1
+    check 'unrelated metadata keeps every original immutable record' jq -e \
+        --slurpfile original "$CASE/large-inventory.json" \
+        '[.[]|select(.id>=1000 and .id<1500)]==[$original[0][]|select(.id>=1000 and .id<1500)]' \
+        "$CASE/remote/inventory.json"
+    before=$(wc -l < "$CASE/signs")
+    FI_SECRET=/missing
+    capture signed --promote
+    check 'large published release retries without a private key' test "$status" -eq 0
+    check 'large published retry neither uploads nor promotes again' bash -c \
+        '[[ $(wc -l < "$1/uploads") == 7 && $(wc -l < "$1/promotions") == 1 ]]' _ "$CASE"
+    check 'large published retry preserves the original signature set' test "$(wc -l < "$CASE/signs")" -eq "$before"
+
+    inventory=$(cat "$CASE/remote/inventory.json") || return 1
+    _RF_INTEGRITY_ASSETS=$inventory
+    capture _rf_integrity_assets_gate "$inventory"
+    check 'integrity gate accepts large observed and retained inventories' test "$status" -eq 0
+    changed=$(jq -c 'map(if .id==1000 then .size+=1 else . end)' <<< "$inventory") || return 1
+    capture _rf_integrity_assets_gate "$changed"
+    check 'large inventory still refuses retained metadata drift' test "$status" -eq 7
+    capture _rf_integrity_assets_gate "$inventory"$'\n[]'
+    check 'integrity observation refuses trailing JSON documents' test "$status" -eq 7
+    _RF_INTEGRITY_ASSETS+=$'\n[]'
+    capture _rf_integrity_assets_gate "$inventory"
+    check 'integrity retention refuses trailing JSON documents' test "$status" -eq 7
+
+    # Exercise the provenance identity gate with two actual uploaded proof
+    # records; provenance signing/verification is qualified in its own suite.
+    _RF_PROVENANCE_KEY=$(jq -c '
+        def record($name): first(.[]|select(.name==$name))|{name,asset_id:.id,sha256:(.digest|ltrimstr("sha256:"))};
+        {statement:record("release-integrity.json"),signature:record("release-integrity.json.minisig")}' \
+        <<< "$inventory") || return 1
+    _RF_PROVENANCE_DOCUMENTS=$(jq -c '
+        def record($name): first(.[]|select(.name==$name))|{name,size};
+        {statement:record("release-integrity.json"),signature:record("release-integrity.json.minisig")}' \
+        <<< "$inventory") || return 1
+    capture _rf_provenance_assets_gate "$inventory"
+    check 'provenance gate finds both exact proof identities in a large inventory' test "$status" -eq 0
+    local mutation
+    for mutation in '.id+=1' '.size+=1' '.state="new"' '.digest=("sha256:"+("0"*64))'; do
+        changed=$(jq -c "map(if .name==\"release-integrity.json\" then $mutation else . end)" <<< "$inventory") || return 1
+        capture _rf_provenance_assets_gate "$changed"
+        check "large provenance inventory refuses proof mutation $mutation" test "$status" -eq 7
+    done
+    capture _rf_provenance_assets_gate "$inventory"$'\n[]'
+    check 'provenance observation refuses trailing JSON documents' test "$status" -eq 7
+}
+
 fi_completion_cases() {
 new_fi_case complete
 capture signed --upload-payloads
@@ -418,6 +484,13 @@ check 'competing finalizers promote once' test "$(wc -l < "$CASE/promotions")" -
 check 'competing finalizers do not duplicate proof uploads' test "$(wc -l < "$CASE/uploads")" -eq 7
 }
 
+if [[ "${1:-}" == --large-inventory-only ]]; then
+    fi_large_inventory_cases || exit 1
+    printf '\nLarge signed finalization checks: %d; failures: %d\n' "$checks" "$failures"
+    [[ "$failures" -eq 0 ]]
+    exit
+fi
+
 check 'group runner accepts a completed positive assertion' fi_expect_group_status 0 fi_worker_pass
 check 'group runner retains failed assertions' fi_expect_group_status 1 fi_worker_failure
 check 'group runner rejects an early worker exit with missing counts' fi_expect_group_status 1 fi_worker_abort
@@ -425,7 +498,7 @@ check 'group runner rejects a failing process despite positive assertions' fi_ex
 check 'group runner rejects a worker with no assertions' fi_expect_group_status 1 fi_worker_empty
 check 'group runner rejects empty discovery' fi_expect_group_status 1
 check 'group runner reaps later workers after invalid counts' fi_expect_all_reaped
-dsr_test_groups fi_completion_cases fi_local_failure_cases fi_remote_drift_cases fi_dispatch_and_policy_cases || exit 1
+dsr_test_groups fi_completion_cases fi_local_failure_cases fi_remote_drift_cases fi_dispatch_and_policy_cases fi_large_inventory_cases || exit 1
 
 printf '\nSigned finalization checks: %d; failures: %d\n' "$checks" "$failures"
 [[ "$failures" -eq 0 ]]

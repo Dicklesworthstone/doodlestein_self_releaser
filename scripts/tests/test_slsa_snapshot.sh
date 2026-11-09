@@ -212,6 +212,59 @@ fetch() { policy slsa_fetch_release --output-dir "$CASE/snapshot" "$@"; }
 verify() { policy slsa_verify_snapshot "$CASE/snapshot" "$@"; }
 [[ "${DSR_SNAPSHOT_FIXTURES_ONLY:-false}" != true ]] || return 0
 
+large_inventory_cases() {
+    local selection_hash retained_inode
+    new_case large-inventory
+    jq -c '.+[range(1000;1500)|{id:.,name:("existing-"+tostring+"-"+("x"*195)+".jsonl"),
+        size:7,state:"uploaded",digest:("sha256:"+("a"*64))}]|sort_by(.name)' \
+        "$CASE/inventory.json" > "$CASE/large-inventory.json" || return 1
+    cp "$CASE/large-inventory.json" "$CASE/inventory.json" || return 1
+    check 'snapshot fixture exceeds the single-argument limit' test "$(wc -c < "$CASE/inventory.json")" -gt 131072
+    MODE=late-failure
+    expect 'large snapshot preserves completed payloads after transport failure' 8 fetch --resume
+    check 'large failed fetch exposes no complete snapshot' test ! -e "$CASE/snapshot"
+    check 'checkpoint retains every original release record' jq -e --slurpfile inventory "$CASE/inventory.json" \
+        '.inventory==$inventory[0] and (.inventory|length)==505' "$CASE/snapshot.partial/selection.json"
+    [[ -f "$CASE/snapshot.partial/artifacts/demo-linux" ]] || return 1
+    retained_inode=$(stat -c %i "$CASE/snapshot.partial/artifacts/demo-linux")
+    selection_hash=$(_slsa_sha256 "$CASE/snapshot.partial/selection.json") || return 1
+
+    # Even unrelated retained metadata binds the snapshot generation. A new
+    # observation must not silently reselect the original checkpoint identity.
+    jq 'map(if .id==1000 then .size+=1 else . end)' "$CASE/inventory.json" > "$CASE/changed"
+    cp "$CASE/changed" "$CASE/inventory.json" || return 1
+    MODE=normal
+    : > "$CASE/calls"
+    expect 'large resume refuses changed retained metadata' 7 fetch --resume
+    check 'metadata conflict starts no payload body download' bash -c \
+        '! grep -Eq "^download [123]$" "$1"' _ "$CASE/calls"
+    check 'refused large resume preserves checkpoint bytes' test "$selection_hash" = \
+        "$(_slsa_sha256 "$CASE/snapshot.partial/selection.json")"
+    cp "$CASE/large-inventory.json" "$CASE/inventory.json" || return 1
+    : > "$CASE/calls"
+    expect 'same large release resumes only its unfinished payload' 0 fetch --resume
+    check 'large resumed receipt reports exact reuse and download counts' jq -e \
+        '.authenticated and .acquisition=={reused_payloads:2,downloaded_payloads:1}' "$CASE/result"
+    check 'large resume preserves completed payload inode' test "$retained_inode" = \
+        "$(stat -c %i "$CASE/snapshot/artifacts/demo-linux")"
+    check 'large successful resume preserves checkpoint bytes' test "$selection_hash" = \
+        "$(_slsa_sha256 "$CASE/snapshot.partial/selection.json")"
+    : > "$CASE/calls"
+    expect 'large snapshot verifies independently offline' 0 verify
+    check 'large offline verification makes no transport calls' test ! -s "$CASE/calls"
+    expect 'completed large snapshot reauthenticates without payload download' 0 fetch --resume
+    check 'completed large retry reuses the complete payload family' jq -e \
+        '.acquisition=={reused_payloads:3,downloaded_payloads:0}' "$CASE/result"
+    check 'completed large retry reads only proof and signature' test "$(grep -c '^download ' "$CASE/calls")" -eq 2
+}
+
+if [[ "${1:-}" == --large-inventory-only ]]; then
+    large_inventory_cases || exit 1
+    printf '\nLarge SLSA snapshot inventories: %s passed, %s failed\n' "$PASS" "$FAIL"
+    [[ "$FAIL" == 0 ]]
+    exit
+fi
+
 if [[ "${DSR_SNAPSHOT_PARALLEL_ONLY:-0}" != 1 ]]; then
 if [[ "${DSR_SNAPSHOT_RESUME_ONLY:-0}" != 1 ]]; then
 new_case success
@@ -319,6 +372,7 @@ expect 'duplicate output selections are rejected' 4 fetch --output-dir "$CASE/ot
 check 'invalid output selections perform no network reads' test ! -s "$CASE/calls"
 fi
 
+large_inventory_cases || exit 1
 new_case resumable
 MODE=late-failure
 expect 'resumable fetch retains authenticated progress after a late transport failure' 8 fetch --resume

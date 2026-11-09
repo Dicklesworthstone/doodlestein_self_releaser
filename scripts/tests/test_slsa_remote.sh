@@ -150,6 +150,7 @@ refresh_proof() {
     cp "$WORK/changed" "$WORK/inventory.json"
 }
 BASE=(--repo owner/demo --tag v1.2.3 --sha "$PIN" --builder dsr:test --public-key "$WORK/trusted.pub" --targets 'windows/arm64,linux/amd64')
+if [[ "${1:-}" != --large-inventory-only ]]; then
 reset_remote
 expect 'signed complete remote release verifies' 0 slsa_verify_remote "${BASE[@]}"
 check 'single authenticated receipt binds immutable source/asset identities' jq -es --arg pin "$PIN" \
@@ -219,6 +220,7 @@ expect 'expected target matrix is mandatory' 4 slsa_verify_remote --repo owner/d
 expect 'duplicate expected platforms rejected' 4 slsa_verify_remote --repo owner/demo --tag v1.2.3 --sha "$PIN" --builder dsr:test --public-key "$WORK/trusted.pub" --targets linux/amd64,linux/amd64
 check 'argument rejection performs no downloads' test ! -s "$WORK/download.calls"
 check 'argument rejection performs no remote preflight' test ! -s "$WORK/network.calls"
+fi
 
 # Publication transport fixture: complete immutable asset records and a guarded
 # addition-only inventory. POST responses can be lost after their bytes land.
@@ -227,10 +229,13 @@ _sbr_publication_gate() {
     observed=$(_sbr_context "$1" "$2" "$6") || return $?
     current=$(_sbr_inventory "$1" 10 "$6") || return $?
     [[ "$observed" == "$3" ]] || return 7
-    jq -en --argjson before "$4" --argjson after "$current" --argjson names "$5" '
+    jq -es --slurpfile original /dev/fd/3 --argjson names "$5" '
+        length==1 and ($original|length)==1 and
+        (.[0] as $after | $original[0] as $before |
         all($before[];. as $a|[$after[]|select(.name==$a.name)]==[$a]) and
         ([$before[]|select(.name as $n|$names|index($n)==null)]==
-         [$after[]|select(.name as $n|$names|index($n)==null)])' >/dev/null || return 7
+         [$after[]|select(.name as $n|$names|index($n)==null)]))' \
+        3<<< "$4" <<< "$current" >/dev/null || return 7
     printf '%s\n' "$current"
 }
 gh_upload_asset_named() {
@@ -260,6 +265,36 @@ reset_publication() {
     : > "$WORK/upload.calls"
 }
 publish() { slsa_publish_release "$WORK/proofs/release.intoto.jsonl" "$WORK/assets" "${BASE[@]}" "$@"; }
+large_inventory_cases() {
+    reset_remote
+    : > "$WORK/upload.calls"
+    jq -c '.+[range(1000;1500)|{id:.,name:("existing-"+tostring+"-"+("x"*195)+".json"),
+        size:7,state:"uploaded",digest:("sha256:"+("a"*64))}]|sort_by(.name)' \
+        "$WORK/inventory.json" > "$WORK/large-inventory.json" || return 1
+    cp "$WORK/large-inventory.json" "$WORK/inventory.json" || return 1
+    jq '.release.draft=false' "$WORK/context.json" > "$WORK/changed"
+    cp "$WORK/changed" "$WORK/context.json" || return 1
+    check 'published provenance fixture exceeds the single-argument limit' \
+        test "$(wc -c < "$WORK/inventory.json")" -gt 131072
+    expect 'large published release reuses its existing authenticated provenance' 0 publish
+    check 'large public retry returns verified provenance with zero uploads' jq -e \
+        '.status=="verified" and .upload_attempts==0 and .verification.authenticated and .verification.artifact_count==3' \
+        "$WORK/result"
+    check 'large public retry performs no upload' test ! -s "$WORK/upload.calls"
+    check 'large public retry preserves every remote record' cmp -s "$WORK/large-inventory.json" "$WORK/inventory.json"
+    check 'large public retry rechecks actual payload and proof bytes' bash -c \
+        '[[ $(sort -nu "$1"|paste -sd, -) == 1,2,3,4,5 ]]' _ "$WORK/download.calls"
+    jq 'map(select(.id!=4 and .id!=5))' "$WORK/inventory.json" > "$WORK/changed"
+    cp "$WORK/changed" "$WORK/inventory.json" || return 1
+    expect 'large public release still refuses missing provenance publication' 4 publish
+    check 'large public missing-proof refusal sends no upload' test ! -s "$WORK/upload.calls"
+}
+if [[ "${1:-}" == --large-inventory-only ]]; then
+    large_inventory_cases || exit 1
+    printf '\nLarge published provenance inventories: %s passed, %s failed\n' "$PASS" "$FAIL"
+    [[ "$FAIL" == 0 ]]
+    exit
+fi
 reset_publication
 expect 'publication dry run authenticates local proof without remote calls' 0 publish --dry-run
 check 'dry run is not remote verification' jq -e '.status=="planned" and .dry_run and .local_statement_authenticated and (.remote_verified|not)' "$WORK/result"
@@ -323,6 +358,7 @@ check 'payload preflight happens before any proof upload' test ! -s "$WORK/uploa
 reset_publication
 expect 'private key option is not accepted by the publisher' 4 publish --secret-key /private/key
 expect 'verification cannot be downgraded to a dry run' 4 slsa_verify_remote "${BASE[@]}" --dry-run
+large_inventory_cases || exit 1
 check 'private temporary work is cleaned' bash -c '[[ -z $(find "$1" -name "dsr-slsa-remote.*" -print -quit) ]]' _ "$WORK"
 printf '\nRemote SLSA verification/publication: %s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" == 0 ]]

@@ -470,7 +470,12 @@ _ri_remote_publish() (
     [[ "$(_ri_payload_names "$inventory" "$payload_names")" == "$payload_names" ]] || return 7
     _ri_remote_preflight "$repo" "$inventory" "$documents" "$work" || return $?
     verified="$inventory"
-    missing=$(jq -nc --argjson names "$names" --argjson inventory "$inventory" '$names-[$inventory[].name]') || return 1
+    missing=$(jq -cse --slurpfile inventory /dev/fd/3 '
+        if length==1 and (.[0]|type=="array") and
+           ($inventory|length==1 and (.[0]|type=="array"))
+        then .[0]-[$inventory[0][].name]
+        else error("exactly one proof-name list and release inventory required") end
+    ' 3<<< "$inventory" <<< "$names") || return 1
     if [[ "$missing" != '[]' && "$(jq -r '.release.draft' <<< "$context")" != true ]]; then
         _ri_log 'Missing integrity assets may be added only to a draft'; return 4
     fi

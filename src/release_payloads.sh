@@ -132,9 +132,15 @@ _rup_preflight() {
     local entries entry name asset digest size actual expected suffix
     expected=$(jq -c '[.artifacts[].name]|sort' <<< "$plan") || return 1
     actual=$(_sbr_payload_names "$inventory") || return $?
-    jq -en --argjson actual "$actual" --argjson expected "$expected" --argjson inventory "$inventory" --argjson pinned "$pinned" '
-        ($actual-$expected|length)==0 and
-        all($pinned[];. as $a | [$inventory[]|select(.name==$a.name)]==[$a])' >/dev/null || {
+    # Remote metadata can make an otherwise small payload release exceed one
+    # executable argument. Keep each JSON input separate and require exactly
+    # one document before applying the same namespace and retained-ID checks.
+    jq -es --slurpfile actual /dev/fd/3 --slurpfile expected /dev/fd/4 --slurpfile pinned /dev/fd/5 '
+        length==1 and ($actual|length)==1 and ($expected|length)==1 and ($pinned|length)==1 and
+        (.[0] as $inventory | $actual[0] as $actual | $expected[0] as $expected | $pinned[0] as $pinned |
+            ($actual-$expected|length)==0 and
+            all($pinned[];. as $a | [$inventory[]|select(.name==$a.name)]==[$a]))' \
+        3<<< "$actual" 4<<< "$expected" 5<<< "$pinned" <<< "$inventory" >/dev/null || {
         _rup_log 'Unexpected payload or changed retained asset identity'; return 7;
     }
     entries=$(jq -c '.artifacts[]' <<< "$plan") || return 1
@@ -298,8 +304,9 @@ release_upload_payloads() (
             receipt=$(_rup_upload "$(jq -r '.release.upload_url' <<< "$context")" "$work/payloads/$name" "$entry") || return $?
             uploaded=$((uploaded + 1))
             current=$(_sbr_publication_gate "$repo" "$tag" "$context" "$current" "$names" "$work") || return $?
-            jq -en --argjson receipt "$receipt" --argjson current "$current" \
-                'any($current[];.id==$receipt.id and .name==$receipt.name and .state=="uploaded" and .size==$receipt.size)' >/dev/null || return 7
+            jq -es --argjson receipt "$receipt" \
+                'length==1 and any(.[0][];.id==$receipt.id and .name==$receipt.name and .state=="uploaded" and .size==$receipt.size)' \
+                <<< "$current" >/dev/null || return 7
             _rup_preflight "$repo" "$current" "$plan" "$pinned" "$work" || return $?
         fi
         pinned=$(_rup_selected_assets "$current" "$plan") || return 1

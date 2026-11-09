@@ -436,13 +436,14 @@ _rf_provenance_inputs_gate() {
 
 _rf_provenance_assets_gate() {
     [[ -n "${_RF_PROVENANCE_KEY:-}" ]] || return 0
-    jq -en --argjson inventory "$1" --argjson key "$_RF_PROVENANCE_KEY" --argjson docs "$_RF_PROVENANCE_DOCUMENTS" '
+    jq -es --argjson key "$_RF_PROVENANCE_KEY" --argjson docs "$_RF_PROVENANCE_DOCUMENTS" '
+        length==1 and (.[0]|type=="array") and (.[0] as $inventory |
         all(["statement","signature"][];. as $f|
             [$inventory[]|select(.name==$key[$f].name)] as $a|
             ($a|length)==1 and $a[0].id==$key[$f].asset_id and $a[0].state=="uploaded" and
             $a[0].size==$docs[$f].size and
-            ($a[0].digest==null or $a[0].digest=="" or $a[0].digest==("sha256:"+$key[$f].sha256)))' \
-        >/dev/null || { _rf_log 'Provenance asset identity changed'; return 7; }
+            ($a[0].digest==null or $a[0].digest=="" or $a[0].digest==("sha256:"+$key[$f].sha256))))' \
+        <<< "$1" >/dev/null || { _rf_log 'Provenance asset identity changed'; return 7; }
 }
 
 # Used after metadata publication and again after promotion. Pin both the
@@ -555,8 +556,11 @@ _rf_integrity_local_gate() {
 
 _rf_integrity_assets_gate() {
     [[ -n "${_RF_INTEGRITY_ASSETS:-}" ]] || return 0
-    jq -en --argjson current "$1" --argjson pinned "$_RF_INTEGRITY_ASSETS" \
-        'all($pinned[];. as $a|[$current[]|select(.name==$a.name)]==[$a])' >/dev/null || {
+    jq -es --slurpfile pinned /dev/fd/3 '
+        length==1 and (.[0]|type=="array") and
+        ($pinned|length==1 and (.[0]|type=="array")) and
+        (.[0] as $current | all($pinned[0][];. as $a|[$current[]|select(.name==$a.name)]==[$a]))
+    ' 3<<< "$_RF_INTEGRITY_ASSETS" <<< "$1" >/dev/null || {
             _rf_log 'Signed release asset identity changed'; return 7;
         }
 }

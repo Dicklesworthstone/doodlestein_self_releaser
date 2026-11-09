@@ -57,6 +57,7 @@ gh_upload_asset_named() {
         stage_drift) chmod u+w "${path%/*}/z-compat.tar.gz"; printf changed >> "${path%/*}/z-compat.tar.gz" ;;
         moved_tag) change_json "$CASE/context.json" '.tag_commit=("2"*40)' ;;
         promoted) change_json "$CASE/context.json" '.release.draft=false' ;;
+        inventory_drift) change_json "$CASE/inventory.json" 'map(if .id==1000 then .size+=1 else . end)' ;;
         wrong_receipt) receipt=$(jq '.id=900' <<< "$receipt") ;;
         lost) [[ "$name" != b.zip ]] || return 8 ;;
     esac
@@ -93,6 +94,8 @@ new_case() {
            upload_url:"https://uploads.github.com/repos/owner/tool/releases/17/assets{?name,label}"},tag_commit:$sha}' > "$CASE/context.json"
     unset MODE DRY_RUN
 }
+# Called indirectly through capture, which forwards optional publication flags.
+# shellcheck disable=SC2120
 upload() { release_upload_payloads "$ART" --build-manifest "$MANIFEST" --repo owner/tool --tag v1.0.0 --sha "$PIN" --state-dir "$CASE/state" "$@"; }
 seed() {
     local name="$1" id="$2" hash size
@@ -103,7 +106,83 @@ seed() {
         "$CASE/inventory.json" > "$CASE/inventory.next"
     mv "$CASE/inventory.next" "$CASE/inventory.json"
 }
+payload_seed_large_inventory() {
+    # The existing metadata is deliberately outside the selected payload set.
+    # Its complete remote identity still participates in every publication gate.
+    change_json "$CASE/inventory.json" '. + [range(0;500) |
+        {id:(1000+.),name:("existing-"+(("0000"+tostring)[-4:])+"-"+("x"*195)+".json"),
+         state:"uploaded",size:7,digest:("sha256:"+("a"*64))}] | sort_by(.name)'
+}
+payload_large_inventory_cases() {
+    local saved_state inventory plan pinned filter
+    new_case large_inventory
+    payload_seed_large_inventory
+    cp "$CASE/inventory.json" "$CASE/original-inventory.json"
+    check 'payload inventory exceeds the single-argument limit' test "$(wc -c < "$CASE/inventory.json")" -gt 131072
+    capture upload
+    check 'large remote inventory permits complete payload publication' test "$status" -eq 0
+    check 'large release uploads each selected payload once' test "$(count)" -eq 3
+    check 'large release receipt retains all selected asset identities' jq -es \
+        'length==1 and (.[0]|.status=="verified" and .upload_attempts==3 and (.assets|length)==3)' "$CASE/out"
+    check 'large publication preserves every existing metadata row' jq -es \
+        --slurpfile original "$CASE/original-inventory.json" \
+        'length==1 and (.[0]|map(select(.id>=1000 and .id<1500)))==$original[0]' "$CASE/inventory.json"
+    saved_state=$(state_path)
+    check 'large publication persists a complete verified payload set' jq -e \
+        '.complete and (.assets|length)==3 and .plan.context.tag_commit==("1"*40)' "$saved_state"
+    if [[ -n "$saved_state" ]]; then cp "$saved_state" "$CASE/saved-state.json"; fi
+    capture upload
+    check 'large completed publication can resume' test "$status" -eq 0
+    check 'large completed retry never reuploads payloads' test "$(count)" -eq 3
+    check 'large completed retry preserves exact checkpoint bytes' cmp -s "$saved_state" "$CASE/saved-state.json"
+    change_json "$CASE/inventory.json" 'map(if .name=="b.zip" then .id+=9000 else . end)'
+    capture upload
+    check 'large retry rejects replaced acknowledged asset IDs' test "$status" -eq 7
+    check 'large retained-ID conflict never overwrites an asset' test "$(count)" -eq 3
+
+    new_case large_lost_ack
+    payload_seed_large_inventory
+    MODE=lost; capture upload
+    check 'large upload retains the transport acknowledgement failure' test "$status" -eq 8
+    check 'large interrupted upload retains accepted remote payload bytes' jq -e \
+        '[.[]|select(.name=="a.tar.gz" or .name=="b.zip")]|length==2' "$CASE/inventory.json"
+    unset MODE; capture upload
+    check 'large lost acknowledgement resumes from independent inventory' test "$status" -eq 0
+    check 'large lost acknowledgement never duplicates an accepted upload' test "$(count)" -eq 3
+
+    inventory=$(cat "$CASE/inventory.json")
+    plan=$(_rup_manifest "$MANIFEST" owner/tool v1.0.0 "$PIN")
+    pinned=$(jq -c '[.[]|select(.name=="b.zip")]' <<< "$inventory")
+    capture _rup_preflight owner/tool "$inventory" "$plan" "$pinned" "$WORK"
+    check 'large unchanged retained inventory passes preflight' test "$status" -eq 0
+    for filter in '.id+=1' '.size+=1' '.digest=("sha256:"+("0"*64))' '.state="starter"'; do
+        capture _rup_preflight owner/tool "$inventory" "$plan" "$(jq -c "map($filter)" <<< "$pinned")" "$WORK"
+        check "large preflight preserves complete retained identity: $filter" test "$status" -eq 7
+    done
+    capture _rup_preflight owner/tool "$inventory"$'\n[]' "$plan" "$pinned" "$WORK"
+    check 'large preflight rejects trailing inventory documents' nonzero "$status"
+    capture _rup_preflight owner/tool "$inventory" "$plan" "$pinned"$'\n[]' "$WORK"
+    check 'large preflight rejects trailing retained-identity documents' nonzero "$status"
+
+    new_case large_inventory_drift
+    payload_seed_large_inventory
+    MODE=inventory_drift; capture upload
+    check 'large publication detects existing metadata changing during upload' test "$status" -eq 7
+    check 'large inventory drift stops all subsequent uploads' test "$(count)" -eq 1
+    check 'large inventory drift emits no verified receipt' test ! -s "$CASE/out"
+    new_case large_unselected
+    payload_seed_large_inventory
+    change_json "$CASE/inventory.json" '.+[{id:90,name:"unplanned.zip",state:"uploaded",size:7,digest:null}]|sort_by(.name)'
+    capture upload
+    check 'large release still refuses unselected remote payloads' test "$status" -eq 7
+    check 'large unselected payload conflict precedes every upload' test "$(count)" -eq 0
+}
 if [[ "${DSR_PAYLOAD_FIXTURES_ONLY:-false}" == true ]]; then return 0; fi
+if [[ "${1:-}" == --large-inventory-only ]]; then
+    payload_large_inventory_cases
+    printf '\nPayload publication checks: %d; failures: %d\n' "$checks" "$failures"
+    [[ "$failures" -eq 0 ]]; exit $?
+fi
 new_case complete
 capture upload
 check 'all payloads upload from verified snapshots' test "$status" -eq 0
@@ -220,5 +299,6 @@ check 'competing publisher completes' test "$passed" -ge 1
 check 'concurrent publishers send each name once' test "$(count)" -eq 3
 capture upload
 check 'concurrent result verifies on retry' test "$status" -eq 0
+payload_large_inventory_cases
 printf '\nPayload publication checks: %d; failures: %d\n' "$checks" "$failures"
 [[ "$failures" -eq 0 ]]
