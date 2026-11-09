@@ -13,6 +13,8 @@
 # --receipt-producer-only checks real inventory bytes, namespace refusals and
 # hashing custody. DSR_TEST_RECEIPT_BASELINE may name a saved, unchanged producer
 # function for a paired comparison over the same files in that invocation.
+# --strict-manifest-inventory-only compiles a local C executable and exercises
+# exact strict manifests with real Git source, staged receipts and companions.
 
 set -uo pipefail
 
@@ -691,6 +693,272 @@ PY
 
 if [[ "${1:-}" == --workflow-inventory-only ]]; then
     test_workflow_artifact_inventory
+    exit $?
+fi
+
+test_strict_manifest_inventory() {
+    local project_root dependency
+    project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" || return 1
+    for dependency in python3 bash cc git jq yq; do
+        command -v "$dependency" >/dev/null || { echo "Missing test dependency: $dependency" >&2; return 77; }
+    done
+    python3 -I - "$project_root" "${DSR_TEST_ACT_RUNNER:-$project_root/src/act_runner.sh}" <<'PY'
+import copy
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+root, module = map(Path, sys.argv[1:])
+architecture = {'x86_64': ('amd64', 'x86_64'), 'aarch64': ('arm64', 'aarch64')}.get(platform.machine())
+if platform.system() != 'Linux' or architecture is None:
+    print('SKIP: strict manifest executable fixture requires native Linux amd64/arm64')
+    raise SystemExit(77)
+target, triple = 'linux/' + architecture[0], architecture[1] + '-unknown-linux-gnu'
+work = Path(tempfile.mkdtemp(prefix='dsr-strict-manifest-inventory-')).resolve()
+for name in ('source', 'config/repos.d', 'payloads', 'release'):
+    (work / name).mkdir(parents=True)
+print('Strict manifest inventory evidence: ' + str(work), flush=True)
+checks = 0
+
+def check(label, condition):
+    global checks
+    if not condition:
+        raise AssertionError(label)
+    checks += 1
+    print('PASS: ' + label, flush=True)
+
+def save(path, value):
+    path.write_text(json.dumps(value) + '\n')
+
+def identity(path):
+    info = path.stat()
+    return info.st_dev, info.st_ino, info.st_mode, hashlib.sha256(path.read_bytes()).hexdigest()
+
+def run(*args):
+    return subprocess.run(list(map(str, args)), check=True, capture_output=True, timeout=30)
+
+source = work / 'source/inventoryapp.c'
+source.write_text('#include <stdio.h>\nint main(void) { puts("strict inventory fixture"); return 0; }\n')
+run('git', '-C', work / 'source', 'init', '-q', '-b', 'main')
+run('git', '-C', work / 'source', 'add', 'inventoryapp.c')
+run('git', '-C', work / 'source', '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+    'commit', '-qm', 'strict manifest source fixture')
+run('git', '-C', work / 'source', 'tag', 'v1.2.3')
+sha = run('git', '-C', work / 'source', 'rev-parse', 'HEAD').stdout.decode().strip()
+run('cc', source, '-o', work / 'inventoryapp')
+check('tagged local C source produces a runnable native executable',
+      run(work / 'inventoryapp').stdout == b'strict inventory fixture\n')
+
+driver = r'''set -uo pipefail
+root=$1 module=$2 work=$3 target=$4 triple=$5; shift 5
+export DSR_CONFIG_DIR="$work/config" DSR_REPOS_FILE="$work/config/repos.yaml"
+export ACT_REPOS_DIR="$work/config/repos.d" ACT_ARTIFACTS_DIR="$work/artifacts"
+export ACT_REPO_LOCAL_PATH="$work/source" NO_COLOR=1
+source "$root/src/config.sh" || exit 90
+source "$module" || exit 90
+operation=$1; shift
+case "$operation" in
+    receipts) _act_result_artifact_receipts "$(cat "$1")" > "$2" ;;
+    stage)
+        tool=$1; shift
+        mkdir "$work/collected-$tool" || exit 90
+        receipt=$(_act_collect_stream_exclusive "$work/collected-$tool/inventoryapp" 700 _act_stream_local_file "$work/inventoryapp") || exit $?
+        result=$(jq -c --arg target "$target" --arg triple "$triple" '
+            . + {platform:$target,method:"native",host:"local-fixture",status:"success",
+                 target_triple:$triple,build_purpose:"release",publishable:true,
+                 artifact_path:.path,collected_sha256:.sha256,collected_size_bytes:.size_bytes,
+                 collected_identity:.identity}' <<< "$receipt") || exit $?
+        contract=$(config_get_release_contract_json "$tool") || exit $?
+        _act_stage_contract_primary "$tool" v1.2.3 12345678-1234-1234-1234-123456789abc "$target" "$result" "$contract" > "$1" ;;
+    manifest) act_generate_manifest "$(cat "$1")" "$2" ;;
+    collected) _act_verify_collected_manifest "$@" ;;
+    admission)
+        source "$root/src/slsa.sh" || exit 90
+        _slsa_manifest_statement "$1" fixture/strictinventory dsr:strict-manifest-fixture > "$2" ;;
+    empty-environments|object-environments|trailing-environments)
+        _act_build_environments_json() {
+            case "$operation" in
+                empty-environments) printf '\n' ;;
+                object-environments) printf '{}\n' ;;
+                trailing-environments) printf '[]\n[]\n' ;;
+            esac
+        }
+        act_generate_manifest "$(cat "$1")" "$2" ;;
+    empty-artifacts|object-artifacts|trailing-artifacts)
+        # Fault injection at the final array producer, after real byte/custody
+        # admission. Every other jq invocation remains the installed binary.
+        jq() {
+            if [[ $# -eq 2 && "$1" == -s && "$2" == . ]]; then
+                case "$operation" in
+                    empty-artifacts) printf '[]\n' ;;
+                    object-artifacts) printf '{}\n' ;;
+                    trailing-artifacts) printf '[]\n[]\n' ;;
+                esac
+            else command jq "$@"; fi
+        }
+        act_generate_manifest "$(cat "$1")" "$2" ;;
+    *) exit 90 ;;
+esac
+'''
+
+def invoke(label, operation, *args, input=None):
+    started = time.monotonic()
+    result = subprocess.run(['bash', '-c', driver, '_', str(root), str(module), str(work), target, triple,
+                             operation, *map(str, args)], input=input, capture_output=True, timeout=105)
+    (work / (label + '.stdout')).write_bytes(result.stdout)
+    (work / (label + '.stderr')).write_bytes(result.stderr)
+    print('%s: exit=%d, seconds=%.3f' % (label, result.returncode, time.monotonic() - started), flush=True)
+    if result.returncode:
+        print(result.stderr.decode(errors='replace')[-1200:], file=sys.stderr, flush=True)
+    return result
+
+# These legal 242-byte names and genuine files exceed argv's limit without a
+# padded receipt field. The single-file control traverses the same public path.
+paths = [work / 'payloads' / ('notes-%04d-' % i + 'x' * 226 + '.json') for i in range(280)]
+for i, path in enumerate(paths):
+    save(path, {'component': i})
+original = {str(p): identity(p) for p in paths}
+results, expected_rows, staged_paths = {}, {}, []
+for count in (1, 280):
+    tool = 'strictinventory' + str(count)
+    save(work / ('config/repos.d/' + tool + '.yaml'), {
+        'tool_name': tool, 'binary_name': 'inventoryapp', 'local_path': str(work / 'source'),
+        'targets': [target], 'target_triples': {target: triple}, 'act_job_map': {target: None},
+        'workspace_additional_artifacts': {target: [p.name for p in paths[:count]]},
+        'release_contract': {'checksum_sidecar': 'sha256',
+            'exact_primary_assets': {target: 'inventoryapp-native'},
+            'exact_additional_assets': [p.name for p in paths[:count]]}})
+    staged = work / ('staged-%d.json' % count)
+    check('production exclusive collection and strict staging succeed for %d-file case' % count,
+          invoke('stage-%d' % count, 'stage', tool, staged).returncode == 0)
+    row = json.loads(staged.read_bytes())
+    staged_paths.append(Path(row['artifact_path']))
+    original[str(staged_paths[-1])] = identity(staged_paths[-1])
+    receipt_input, receipts = work / ('companions-%d.json' % count), work / ('receipts-%d.json' % count)
+    save(receipt_input, {'artifact_paths': list(map(str, paths[:count]))})
+    check('production receipts cover every actual companion in %d-file case' % count,
+          invoke('receipts-%d' % count, 'receipts', receipt_input, receipts).returncode == 0 and
+          len(json.loads(receipts.read_bytes())) == count)
+    row['additional_artifacts'] = json.loads(receipts.read_bytes())
+    result = {'tool': tool, 'version': '1.2.3', 'run_id': '12345678-1234-1234-1234-123456789abc',
+              'git_sha': sha, 'git_ref': 'v1.2.3', 'source_dependencies': [],
+              'status': 'success', 'build_purpose': 'release', 'publishable': True,
+              'requested_targets': [target], 'duration_seconds': 7,
+              'summary': {'total': 1, 'success': 1, 'failed': 0}, 'targets': [row]}
+    results[count] = result
+    expected = [{'name': 'inventoryapp-native', 'target': target, 'target_triple': triple,
+                 'sha256': row['staged_sha256'], 'size_bytes': row['staged_size_bytes'],
+                 'archive_format': 'binary', 'signed': False, 'signature_file': '',
+                 'build_purpose': 'release', 'publishable': True}]
+    expected += [{'name': Path(r['path']).name, 'sha256': r['sha256'], 'size_bytes': r['size_bytes'],
+                  'archive_format': 'binary', 'signed': False, 'signature_file': '', 'target': 'additional',
+                  'build_purpose': 'release', 'publishable': True} for r in row['additional_artifacts']]
+    expected_rows[count] = expected
+    result_path, manifest = work / ('result-%d.json' % count), work / ('manifest-%d.json' % count)
+    save(result_path, result)
+    generated = invoke('manifest-%d' % count, 'manifest', result_path, manifest)
+    check('public strict manifest succeeds for %d actual companions' % count,
+          generated.returncode == 0 and manifest.is_file() and not generated.stdout)
+    observed = json.loads(manifest.read_bytes())
+    check('%d-file strict manifest retains exact names, hashes, sizes, owners and source' % count,
+          observed['artifacts'] == expected and observed['summary'] == result['summary'] and
+          observed['source'] == {'git_sha': sha, 'git_ref': 'v1.2.3', 'dependencies': []} and
+          observed['duration_ms'] == 7000 and observed['requested_targets'] == [target])
+    if count == 280:
+        assembled = [{k: v for k, v in r.items() if k not in ('build_purpose', 'publishable')} for r in expected]
+        size = len(json.dumps(assembled, indent=2).encode())
+        check('complete real strict artifact array exceeds the single-argument limit (%d bytes)' % size, size > 131072)
+
+manifest = work / 'manifest-280.json'
+for path in [staged_paths[-1], *paths]:
+    shutil.copyfile(path, work / 'release' / path.name)
+framed = b''.join(p.name.encode() + b'\0' for p in [staged_paths[-1], *paths])
+check('all 281 strict payloads pass independent final collected-byte/name admission',
+      invoke('collected', 'collected', manifest, work / 'release', '--collected', input=framed).returncode == 0)
+check('complete strict manifest passes the shared successful-release profile',
+      invoke('profile', 'admission', manifest, work / 'release-proof.json').returncode == 0 and
+      len(json.loads((work / 'release-proof.json').read_bytes())['subject']) == 281)
+
+def refused(label, value=None, operation='manifest', output=None):
+    result_path = work / (label + '-result.json')
+    save(result_path, results[280] if value is None else value)
+    output = work / (label + '-manifest.json') if output is None else output
+    previous = (output.stat().st_ino, output.read_bytes()) if output.exists() else None
+    result = invoke(label, operation, result_path, output)
+    preserved = not output.exists() if previous is None else (output.stat().st_ino, output.read_bytes()) == previous
+    check(label + ' returns 4 without stdout or output mutation', result.returncode == 4 and not result.stdout and preserved)
+
+for label, mutation in (
+    ('omitted-companion', lambda r: r['targets'][0]['additional_artifacts'].pop(0)),
+    ('duplicate-companion', lambda r: r['targets'][0]['additional_artifacts'].append(copy.deepcopy(r['targets'][0]['additional_artifacts'][0]))),
+    ('invented-compiler-owner', lambda r: r['targets'][0]['additional_artifacts'][0].update(target_triple=architecture[1] + '-unknown-linux-musl')),
+    ('wrong-platform-owner', lambda r: r['targets'][0].update(platform='linux/arm64' if target == 'linux/amd64' else 'linux/amd64')),
+    ('wrong-summary', lambda r: r['summary'].update(total=2)),
+):
+    changed = copy.deepcopy(results[280])
+    mutation(changed)
+    refused(label, changed)
+
+first, held = paths[0], work / 'held-companion'
+first.rename(held)
+try:
+    refused('missing-companion')
+    first.write_bytes(held.read_bytes())
+    refused('replaced-companion-inode')
+    first.rename(work / 'retained-replacement')
+    first.symlink_to(held)
+    refused('symlink-companion')
+    first.rename(work / 'retained-symlink')
+finally:
+    if first.exists() or first.is_symlink():
+        first.rename(work / 'retained-unexpected-companion')
+    held.rename(first)
+body = first.read_bytes()
+first.write_bytes(body + b'changed bytes\n')
+try:
+    refused('changed-companion-bytes')
+finally:
+    first.write_bytes(body)
+
+changed = copy.deepcopy(results[1])
+changed['targets'][0]['staged_sha256'] = '0' * 64
+refused('changed-primary-receipt', changed)
+for operation in ('empty-environments', 'object-environments', 'trailing-environments',
+                  'empty-artifacts', 'object-artifacts', 'trailing-artifacts'):
+    refused(operation, results[1], operation)
+sentinel = work / 'existing-manifest.json'
+sentinel.write_bytes(b'preserve existing strict output\n')
+refused('serializer-preserves-existing-output', results[1], 'trailing-environments', sentinel)
+refused('strict-output-never-clobbers', results[1], output=sentinel)
+stdout = invoke('stdout-manifest', 'manifest', work / 'result-1.json', '')
+check('stdout contains exactly one complete strict manifest document',
+      stdout.returncode == 0 and json.loads(stdout.stdout)['artifacts'] == expected_rows[1])
+diagnostic = copy.deepcopy(results[1])
+for row in [diagnostic, *diagnostic['targets']]:
+    row.update(build_purpose='diagnostic-native', publishable=False)
+save(work / 'diagnostic-result.json', diagnostic)
+generated = invoke('diagnostic', 'manifest', work / 'diagnostic-result.json', work / 'diagnostic-manifest.json')
+check('diagnostic strict manifests retain nonpublishable purpose on every row', generated.returncode == 0 and
+      all(r['build_purpose'] == 'diagnostic-native' and r['publishable'] is False
+          for r in [json.loads((work / 'diagnostic-manifest.json').read_bytes()),
+                    *json.loads((work / 'diagnostic-manifest.json').read_bytes())['artifacts']]))
+check('all original staged and companion bytes, modes and inodes survive success and refusals', original ==
+      {str(p): identity(p) for p in [*paths, *staged_paths]})
+check('tagged source remains clean', not run('git', '-C', work / 'source', 'status', '--porcelain').stdout)
+print('Strict manifest inventory: %d checks passed' % checks, flush=True)
+print('Compilation is local cc; native scheduling and Rust toolchain attestation are outside this fixture.', flush=True)
+PY
+}
+
+if [[ "${1:-}" == --strict-manifest-inventory-only ]]; then
+    test_strict_manifest_inventory
     exit $?
 fi
 

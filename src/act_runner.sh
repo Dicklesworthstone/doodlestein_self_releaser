@@ -18713,7 +18713,10 @@ _act_generate_contract_manifest() {
     [[ "$duration_seconds" =~ ^[0-9]+$ ]] || duration_seconds=0
     duration_ms=$((duration_seconds * 1000))
 
-    if ! manifest=$(jq -nc \
+    # Exact contracts can declare enough real companion files to exceed one
+    # exec argument. Keep the complete artifact inventory on its own stream,
+    # separate from the independently produced build-environment document.
+    if ! manifest=$(jq -cse --slurpfile artifact_documents /dev/fd/3 \
         --arg tool "$tool" \
         --arg version "$manifest_version" \
         --arg run_id "$run_id" \
@@ -18724,10 +18727,12 @@ _act_generate_contract_manifest() {
         --argjson duration_ms "$duration_ms" \
         --arg status "$status" \
         --argjson summary "$summary_json" \
-        --argjson artifacts "$artifacts_json" \
         --arg purpose "$build_purpose" \
         --argjson requested_targets "$requested_targets" \
-        'input as $build_environments | {
+        'if length == 1 and (.[0] | type == "array") and
+            ($artifact_documents | length == 1 and
+                (.[0] | type == "array" and length > 0))
+         then .[0] as $build_environments | $artifact_documents[0] as $artifacts | {
             schema_version: "1.0.0",
             build_purpose: $purpose,
             publishable: ($purpose == "release"),
@@ -18743,7 +18748,8 @@ _act_generate_contract_manifest() {
             build_environments: $build_environments,
             artifacts: ($artifacts | map(. + {build_purpose: $purpose,
                          publishable: ($purpose == "release")}))
-        }' <<< "$build_environments_json"); then
+        } else error("expected one nonempty artifact inventory and build-environment array") end' \
+        3<<< "$artifacts_json" <<< "$build_environments_json"); then
         _log_error "Failed to serialize release manifest"
         return 4
     fi
