@@ -6,6 +6,8 @@
 # compiler, Docker, SSH, or host-health fixtures. --output-queue-only exercises
 # deferred shared outputs, independent hosts, cancellation and exact-run resume.
 # --host-capacity-only covers the same queue with real one-slot host leases.
+# --artifact-inventory-only exercises large completion receipts and reuse
+# against real files without compilers, Docker, SSH, or host-health fixtures.
 
 set -uo pipefail
 
@@ -22,6 +24,187 @@ SKIP=0
 pass() { echo -e "${GREEN}✓${NC} $1"; ((PASS++)); }
 fail() { echo -e "${RED}✗${NC} $1"; ((FAIL++)); }
 skip() { echo -e "${YELLOW}○${NC} $1"; ((SKIP++)); }
+
+# Only the build backend is controlled here. The actual target worker owns
+# the process group, captures checksums/inodes, serializes its attempt result,
+# and independently verifies the same files for reuse.
+test_worker_artifact_inventory() {
+    local project_root dependency
+    project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" || return 1
+    for dependency in python3 bash jq; do
+        command -v "$dependency" >/dev/null || { echo "Missing test dependency: $dependency" >&2; return 77; }
+    done
+    python3 -I - "${DSR_TEST_ACT_RUNNER:-$project_root/src/act_runner.sh}" <<'PY'
+import errno
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+module = Path(sys.argv[1]).resolve()
+work = Path(tempfile.mkdtemp(prefix='dsr-worker-artifact-inventory-')).resolve()
+print('Retained worker artifact fixtures: ' + str(work), flush=True)
+checks, failures = 0, []
+
+
+def check(label, condition):
+    global checks
+    checks += 1
+    print(('PASS ' if condition else 'FAIL ') + label, flush=True)
+    if not condition:
+        failures.append(label)
+
+
+driver = r'''set -uo pipefail
+source "$1" || exit 90
+fixture=$2
+ACT_LOGS_DIR="$fixture/logs"
+act_platform_uses_act() { return 0; }
+_act_build_orchestration_target() { cat "$fixture/backend.json"; }
+if [[ "$3" == verify ]]; then
+    result=$(cat "$fixture/attempt.json") || exit 4
+    _act_target_result_available "$result" release true
+    exit $?
+fi
+if [[ "$3" == serializer-failure ]]; then
+    jq() {
+        local argument
+        for argument in "$@"; do
+            if [[ "$argument" == receipts ]]; then
+                printf 'injected receipt serialization failure\n' >&2
+                return 23
+            fi
+        done
+        command jq "$@"
+    }
+fi
+_act_run_target_worker tool v1.0.0 fixture-run linux/amd64 1 \
+    "$fixture/attempt.log" "$fixture/attempt.json" false null '{}' '' '' act-local release
+'''
+
+
+def fixture(name, count):
+    case = work / name
+    artifact_dir = case / 'artifact files'
+    if count > 1:
+        # Real long stage paths cross the argv byte bound with fewer hashes.
+        # Each component and full path remains within macOS/Linux limits;
+        # no invented fields or padded receipt strings create the scale case.
+        for component in (
+                'pinned-source-workspace-with-local-dependency-repositories',
+                'target-x86_64-unknown-linux-gnu-for-portable-release-builds',
+                'locked-offline-profile-with-generated-native-build-support',
+                'package-manager-and-native-installer-companion-collection',
+                'retained-release-candidate-550e8400-e29b-41d4-a716-446655440010',
+                'compiler-and-linker-verified-artifact-staging-area',
+                'workflow-matrix-compatibility-and-debug-symbol-outputs',
+                'source-archive-binary-bundle-and-supplemental-manifests'):
+            artifact_dir /= component
+    artifact_dir.mkdir(parents=True)
+    (case / 'logs').mkdir()
+    for index in range(count):
+        path = artifact_dir / ('package-%04d-1.0.0-linux-x86_64.payload' % index)
+        path.write_bytes(('genuine retained artifact %d\n' % index).encode())
+    # Inventory framing must also preserve legal filesystem names that cannot
+    # safely pass through a newline/comma-separated path list.
+    special = artifact_dir / "quote'comma,unicode-界面\nartifact"
+    special.write_bytes(b'framing boundary\n')
+    (case / 'backend.json').write_text(json.dumps({
+        'platform': 'linux/amd64', 'method': 'act', 'status': 'success',
+        'exit_code': 0, 'artifact_dir': str(artifact_dir),
+        'artifact_paths': sorted(map(str, artifact_dir.iterdir()))}) + '\n')
+    return case
+
+
+def invoke(case, mode, label):
+    result = subprocess.run(['bash', '-c', driver, '_', str(module), str(case), mode],
+                            capture_output=True, text=True, timeout=120)
+    (case / (label + '.stdout')).write_text(result.stdout)
+    (case / (label + '.stderr')).write_text(result.stderr)
+    return result
+
+
+def document(case):
+    try:
+        return json.loads((case / 'attempt.json').read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+for name, count in (('small', 1), ('large', 200)):
+    case = fixture(name, count)
+    result = invoke(case, 'worker', 'completion')
+    receipt = document(case)
+    check(name + ': actual worker completes with one valid successful result',
+          result.returncode == 0 and receipt.get('status') == 'success' and
+          receipt.get('exit_code') == 0 and receipt.get('backend_started') is True)
+    entries = receipt.get('resume_artifacts', [])
+    paths = {str(path): path for path in (case / 'artifact files').rglob('*') if path.is_file()}
+    check(name + ': completion preserves every path, checksum, size and inode',
+          len(entries) == len(paths) and {row['path'] for row in entries} == set(paths) and
+          all(row['sha256'] == hashlib.sha256(paths[row['path']].read_bytes()).hexdigest() and
+              row['size_bytes'] == paths[row['path']].stat().st_size and
+              row['identity'] in (
+                  'gnu:%s:%s' % (paths[row['path']].stat().st_dev, paths[row['path']].stat().st_ino),
+                  'bsd:%s' % paths[row['path']].stat().st_ino) for row in entries))
+    if name == 'large':
+        serialized = json.dumps(entries, separators=(',', ':'))
+        check('large: authentic inventory exceeds the Linux single-argument limit',
+              len(serialized.encode()) > 131072)
+        if sys.platform.startswith('linux'):
+            try:
+                subprocess.run([shutil.which('jq'), '-n', '--argjson', 'receipts', serialized, '$receipts'],
+                               capture_output=True, check=False)
+            except OSError as error:
+                check('large: unchanged argv transport fails with actual E2BIG', error.errno == errno.E2BIG)
+            else:
+                check('large: unchanged argv transport fails with actual E2BIG', False)
+    check(name + ': independent reuse verification accepts all unchanged bytes',
+          invoke(case, 'verify', 'reuse').returncode == 0)
+    selected = min(paths.values())
+    original = selected.read_bytes()
+    selected.write_bytes(original + b'changed after completion\n')
+    check(name + ': changed artifact bytes refuse reuse without changing the receipt',
+          invoke(case, 'verify', 'changed').returncode != 0 and document(case) == receipt)
+    selected.write_bytes(original)
+    selected.rename(case / 'retained-missing-artifact')
+    check(name + ': missing artifact refuses reuse without dropping its frozen row',
+          invoke(case, 'verify', 'missing').returncode != 0 and document(case) == receipt)
+
+case = fixture('serializer-failure', 1)
+result = invoke(case, 'serializer-failure', 'completion')
+receipt = document(case)
+check('serialization failure returns nonzero and retains an explicit failed attempt',
+      result.returncode == 4 and receipt.get('status') == 'failed' and
+      receipt.get('exit_code') == 4 and receipt.get('backend_started') is True and
+      'could not be frozen' in receipt.get('error', '') and 'resume_artifacts' not in receipt and
+      'injected receipt serialization failure' in result.stderr)
+check('serialization failure cannot produce reusable success evidence',
+      invoke(case, 'verify', 'reuse').returncode != 0)
+
+case = fixture('missing-at-completion', 1)
+(case / 'backend.json').write_text(json.dumps({
+    'platform': 'linux/amd64', 'method': 'act', 'status': 'success',
+    'exit_code': 0, 'artifact_path': str(case / 'does-not-exist')}) + '\n')
+result = invoke(case, 'worker', 'completion')
+receipt = document(case)
+check('missing output cannot be frozen as a successful attempt',
+      result.returncode == 4 and receipt.get('status') == 'failed' and
+      receipt.get('exit_code') == 4 and 'resume_artifacts' not in receipt)
+
+(work / 'summary.json').write_text(json.dumps({'checks': checks, 'failures': failures}) + '\n')
+print('Worker artifact inventory: %d checks, %d failures' % (checks, len(failures)), flush=True)
+raise SystemExit(bool(failures))
+PY
+}
+
+if [[ "${1:-}" == --artifact-inventory-only ]]; then
+    test_worker_artifact_inventory
+    exit $?
+fi
 
 # Exercise output-conflict scheduling with the real planner, coordinator,
 # workers, process groups, host slots and checkpoints. Only compilation is a
@@ -8894,6 +9077,12 @@ case "$recipe_binding_status" in
     77) skip "repository recipe binding integration requires its local fixture dependencies" ;;
     *) fail "repository recipe drift admitted stale completed output or prevented an honest retry" ;;
 esac
+
+if test_worker_artifact_inventory; then
+    pass "complete artifact inventories survive worker persistence and exact-byte reuse checks"
+else
+    fail "worker artifact inventory was truncated, lost, or admitted changed output"
+fi
 
 if test_worker_group_lifecycle; then
     pass "owned target groups drain before receipts and capacity release"

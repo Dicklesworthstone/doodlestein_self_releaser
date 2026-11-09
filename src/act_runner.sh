@@ -48,13 +48,16 @@ _act_strict_git() {
 _act_sha256() {
     local file="$1"
 
+    # Hash through stdin so checksum tools never escape a supplied filename
+    # (GNU sha256sum prefixes the digest with '\\' for newlines/backslashes).
+    # Artifact inventories preserve those valid Unix path bytes exactly.
     if command -v sha256sum &>/dev/null; then
-        sha256sum "$file" 2>/dev/null | awk '{print $1}'
+        sha256sum 2>/dev/null < "$file" | awk '{print $1}'
         return $?
     fi
 
     if command -v shasum &>/dev/null; then
-        shasum -a 256 "$file" 2>/dev/null | awk '{print $1}'
+        shasum -a 256 2>/dev/null < "$file" | awk '{print $1}'
         return $?
     fi
 
@@ -15547,12 +15550,14 @@ _act_run_target_worker() {
         # A refused attempt still belongs to this scheduled target, even when
         # admission stopped before the backend emitted its execution identity.
         # Leave successful identities untouched for the artifact/matrix checks.
-        body=$(jq -c --arg purpose "$build_purpose" --arg task_key "$task_key" \
+        body=$(jq -cse --arg purpose "$build_purpose" --arg task_key "$task_key" \
             --arg platform "$target" --arg host "$host" --arg triple "$selected_triple" \
             --slurpfile source_sync /dev/fd/3 \
             --argjson backend_started "$backend_started" \
             --argjson scheduled_source "$scheduled_source" \
-            '($source_sync | if length == 1 then .[0] else error("exactly one source-sync receipt required") end) as $source_sync |
+            'if length == 1 and (.[0] | type == "object") then .[0]
+             else error("exactly one worker result object required") end |
+             ($source_sync | if length == 1 then .[0] else error("exactly one source-sync receipt required") end) as $source_sync |
              . + {build_purpose: $purpose, publishable: ($purpose == "release"), task_key:$task_key,
                   backend_started:$backend_started} |
              if (.status // "") | IN("success", "ok", "passed") then .
@@ -15698,7 +15703,7 @@ _act_run_target_worker() {
         fi
     fi
 
-    local worker_status=0 result receipts result_status
+    local worker_status=0 result receipts frozen_result result_status
     local worker_monitor=false worker_message="" worker_protocol_valid=false
     [[ $- != *m* ]] || worker_monitor=true
     set -m
@@ -15772,9 +15777,18 @@ _act_run_target_worker() {
     fi
     if [[ "$result_status" == "success" || "$result_status" == "ok" ||
           "$result_status" == "passed" ]]; then
-        if receipts=$(_act_result_artifact_receipts "$result"); then
-            result=$(jq -c --argjson receipts "$receipts" \
-                '.resume_artifacts = $receipts' <<< "$result")
+        # A workflow can produce hundreds of files. Its complete inventory
+        # must remain a stream, not a single exec argument. Preserve the
+        # original result until both receipt capture and serialization finish:
+        # a failed jq must never turn a successful attempt into a blank file.
+        if receipts=$(_act_result_artifact_receipts "$result") &&
+           frozen_result=$(jq -cse --slurpfile receipts /dev/fd/3 '
+               if length == 1 and (.[0] | type == "object") and
+                  ($receipts | length == 1 and (.[0] | type == "array" and length > 0))
+               then .[0] + {resume_artifacts:$receipts[0]}
+               else error("exactly one worker result and artifact inventory required") end
+           ' 3<<< "$receipts" <<< "$result"); then
+            result="$frozen_result"
         else
             worker_status=4
             result=$(jq -c '
