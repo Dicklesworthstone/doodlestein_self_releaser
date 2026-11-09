@@ -8,6 +8,9 @@ param(
     [string]$CacheDir = '',
     [switch]$Offline,
     [switch]$Recover,
+    [switch]$FromSource,
+    [string]$SourceRef = '',
+    [int]$SourceTimeout = 3600,
     [switch]$Yes,
     [switch]$Json,
     [switch]$Help
@@ -99,7 +102,7 @@ function Get-DsrInstallPolicy {
     if ($bytes.Length -eq 0 -or $bytes.Length -gt 1048576) { Stop-DsrInstall 'Invalid embedded installer policy size' }
     $encoding = [System.Text.UTF8Encoding]::new($false, $true)
     $policy = ConvertFrom-DsrJson $encoding.GetString($bytes)
-    Assert-DsrFields $policy @('schema_version', 'tool', 'repo', 'binary_name', 'public_key', 'platforms')
+    Assert-DsrFields $policy @('schema_version', 'tool', 'repo', 'binary_name', 'public_key', 'platforms') @('source')
     if (($policy.schema_version -isnot [long] -and $policy.schema_version -isnot [int]) -or
         $policy.schema_version -ne 1 -or -not (Test-DsrName $policy.tool) -or
         -not (Test-DsrName $policy.binary_name) -or $policy.repo -isnot [string] -or
@@ -108,6 +111,7 @@ function Get-DsrInstallPolicy {
         $policy.platforms -isnot [System.Collections.IDictionary] -or $policy.platforms.Count -lt 1) {
         Stop-DsrInstall 'Invalid embedded Windows installer policy'
     }
+    if ($policy.Contains('source')) { Assert-DsrSourcePolicy $policy.source }
     if ($policy.public_key) {
         if ($policy.public_key -cnotmatch '^[A-Za-z0-9+/]{56}$' -or
             [Convert]::FromBase64String($policy.public_key).Length -ne 42) {
@@ -836,6 +840,23 @@ function Expand-DsrTarGzipPayload {
         $expanded = 0L; $entries = 0
         while ($null -ne ($entry = $archive.GetNextEntry($false))) {
             if (++$entries -gt 10000) { Stop-DsrInstall 'Invalid TAR entry count' 7 }
+            # PAX can encode sparse files while keeping a regular-file type.
+            # TarReader exposes those attributes without reconstructing the
+            # sparse layout; do not install their packed data as an executable.
+            $attributes = $null
+            if ($entry -is [System.Formats.Tar.PaxTarEntry]) { $attributes = $entry.ExtendedAttributes }
+            elseif ($entry -is [System.Formats.Tar.PaxGlobalExtendedAttributesTarEntry]) {
+                $attributes = $entry.GlobalExtendedAttributes
+            }
+            if ($null -ne $attributes) {
+                foreach ($key in $attributes.Keys) {
+                    if ($key.StartsWith('GNU.sparse.', [StringComparison]::Ordinal) -or
+                        $key -ceq 'SCHILY.realsize' -or
+                        ($key -ceq 'SCHILY.filetype' -and $attributes[$key] -ceq 'sparse')) {
+                        Stop-DsrInstall 'Sparse TAR metadata is unsupported' 7
+                    }
+                }
+            }
             if ($entry.EntryType -eq [System.Formats.Tar.TarEntryType]::GlobalExtendedAttributes) { continue }
             $directory = $entry.EntryType -eq [System.Formats.Tar.TarEntryType]::Directory
             if (-not $directory -and $entry.EntryType -ne [System.Formats.Tar.TarEntryType]::RegularFile -and
@@ -996,6 +1017,8 @@ function Get-DsrCacheReceipt {
     }
     return $receipt
 }
+
+__DSR_WINDOWS_SOURCE_ENGINE__
 
 function Move-DsrInstalledFile {
     param([string]$Source, [string]$Destination)
@@ -1249,7 +1272,7 @@ function Recover-DsrExecutableFamily {
 }
 
 function Install-DsrExecutableFamily {
-    param([string]$Source, [string]$Prefix, [string[]]$Names, $Identity, [switch]$Yes)
+    param([string]$Source, [string]$Prefix, [string[]]$Names, $Identity, $ExpectedEvidence = $null, [switch]$Yes)
     $prefixPath = New-DsrDirectoryChain $Prefix
     $lease = Open-DsrInstallLease $prefixPath
     $stage = ''
@@ -1290,6 +1313,14 @@ function Install-DsrExecutableFamily {
         foreach ($name in $Names) {
             Copy-DsrNewFile ([IO.Path]::Combine($Source, $name)) ([IO.Path]::Combine($fresh, $name))
             $new[$name] = Get-DsrFileEvidence ([IO.Path]::Combine($fresh, $name))
+            if ($null -ne $ExpectedEvidence) {
+                if ($ExpectedEvidence -isnot [Collections.IDictionary] -or $ExpectedEvidence.Count -ne $Names.Count -or
+                    -not $ExpectedEvidence.Contains($name)) { Stop-DsrInstall 'Incomplete source executable evidence' 7 }
+                Assert-DsrTransactionEvidence $ExpectedEvidence[$name]
+                if (-not (Test-DsrSameEvidence $new[$name] $ExpectedEvidence[$name])) {
+                    Stop-DsrInstall 'Source executable changed before private installation staging completed' 7
+                }
+            }
             if ($null -ne $previous[$name]) {
                 Copy-DsrNewFile ([IO.Path]::Combine($prefixPath, $name)) ([IO.Path]::Combine($backups, $name))
                 $backup = Get-DsrFileEvidence ([IO.Path]::Combine($backups, $name))
@@ -1363,8 +1394,10 @@ function Install-DsrExecutableFamily {
 function Invoke-DsrWindowsInstaller {
     [CmdletBinding()]
     param([string]$Version = '', [string]$Prefix = '', [string]$CacheDir = '',
-          [switch]$Offline, [switch]$Recover, [switch]$Yes, [switch]$Json, [switch]$Help)
+          [switch]$Offline, [switch]$Recover, [switch]$FromSource, [string]$SourceRef = '', [int]$SourceTimeout = 3600,
+          [switch]$Yes, [switch]$Json, [switch]$Help)
     $work = ''
+    $retainSourceWork = $false
     $tool = ''
     try {
         if ($PSVersionTable.PSVersion -lt [Version]'7.4') { Stop-DsrInstall 'PowerShell 7.4 or newer is required' 3 }
@@ -1381,15 +1414,21 @@ Options:
   -CacheDir DIR  Persistent verified download cache
   -Offline       No network; requires -Version and complete cached evidence
   -Recover       Restore an interrupted installation offline; requires -Yes
+  -FromSource    Explicitly build a configured Go family with installed Git/Go
+  -SourceRef REF Source pin: HEAD, refs/heads/BRANCH, refs/tags/TAG, or full SHA
+  -SourceTimeout SECONDS  Per-source-command deadline; default 3600, maximum 86400
   -Yes           Authorize replacement of existing selected executables
   -Json          Emit one machine-readable result
   -Verbose       Print additional diagnostics to stderr
   -Help          Show this help
 
-Every selected executable is checked before replacement. Configured signatures
-require Minisign. This installer never executes downloaded payloads or edits PATH.
+Every selected executable is checked before replacement. Configured release
+signatures require Minisign. Release executables are never run and PATH is not edited.
+-FromSource runs repository/dependency build code and produces a local build,
+not an authenticated signed release. It never installs a compiler automatically.
 Private releases use DSR_GH_TOKEN, GITHUB_TOKEN, then GH_TOKEN, with Contents read
-permission. Credentials are sent only to the configured repository's GitHub API.
+permission. Release credentials are scoped to the configured repository's API;
+explicit source fetches use the same token at that repository's HTTPS Git URL.
 "@
             if ($Json) { [Console]::Out.WriteLine((@{ tool = $tool; status = 'help'; help = $text } | ConvertTo-Json -Compress)) }
             else { [Console]::Out.WriteLine($text) }
@@ -1403,7 +1442,9 @@ permission. Credentials are sent only to the configured repository's GitHub API.
         if (-not $Prefix) { $Prefix = [IO.Path]::Combine($localAppData, 'Programs', $tool, 'bin') }
         $prefixPath = Get-DsrPlainPath $Prefix
         if ($Recover) {
-            if ($Version -or $Offline -or $CacheDir) { Stop-DsrInstall '-Recover cannot be combined with -Version, -Offline or -CacheDir' }
+            if ($Version -or $Offline -or $CacheDir -or $FromSource -or $SourceRef -or $SourceTimeout -ne 3600) {
+                Stop-DsrInstall '-Recover cannot be combined with release, cache or source-build options'
+            }
             if (-not $Yes) { Stop-DsrInstall '-Recover requires -Yes to restore the previous executable family' 2 }
             $recovered = Recover-DsrExecutableFamily $prefixPath $transactionIdentity
             $result = @{ tool = $tool; repository = $policy.repo; status = 'success'; operation = 'recover';
@@ -1414,6 +1455,13 @@ permission. Credentials are sent only to the configured repository's GitHub API.
             else { [Console]::Out.WriteLine($prefixPath) }
             return 0
         }
+        if (-not $FromSource -and ($SourceRef -or $SourceTimeout -ne 3600)) { Stop-DsrInstall 'Source options require explicit -FromSource consent' }
+        if ($FromSource) {
+            if ($Version -or $Offline) { Stop-DsrInstall '-FromSource cannot be combined with -Version or -Offline; select -SourceRef instead' }
+            if (-not $policy.Contains('source')) { Stop-DsrInstall 'This installer has no supported Go source policy' 4 }
+            if ($SourceTimeout -lt 1 -or $SourceTimeout -gt 86400) { Stop-DsrInstall '-SourceTimeout must be between 1 and 86400 seconds' }
+            if (-not $SourceRef) { $SourceRef = 'HEAD' }
+        }
         if ($Offline -and -not $Version) { Stop-DsrInstall '-Offline requires an explicit -Version' }
         if ($Version -and -not (Test-DsrName $Version)) { Stop-DsrInstall 'Invalid release version' }
         if (-not $CacheDir) { $CacheDir = [IO.Path]::Combine($localAppData, 'dsr', 'cache', 'installers') }
@@ -1422,6 +1470,33 @@ permission. Credentials are sent only to the configured repository's GitHub API.
         if (-not $Offline) { $null = New-DsrDirectoryChain $cacheRoot }
         else { $null = Get-DsrPlainPath $cacheRoot -Directory }
         Assert-DsrCacheCustody $cacheRoot
+        if ($FromSource) {
+            $work = New-DsrPrivateDirectory ([IO.Path]::Combine($cacheRoot, ('.dsr-source-' + [Guid]::NewGuid().ToString('N'))))
+            $retainSourceWork = $true
+            Write-DsrInstallLog ('Building ' + $policy.repo + ' at ' + $SourceRef + '; this is a local source build, not a signed release')
+            $built = Build-DsrGoSourceFamily $policy $selection $platform $SourceRef $work $SourceTimeout
+            # Persist the verified local-build receipt before activation. It
+            # describes compiled bytes, not a claim that installation finished.
+            # A failed update retains both its receipt and private diagnostics.
+            $history = New-DsrDirectoryChain ([IO.Path]::Combine($cacheRoot, 'source-receipts', $tool))
+            Assert-DsrCacheCustody $history
+            $receiptPath = [IO.Path]::Combine($history, ($built.receipt.source_commit + '-' + [Guid]::NewGuid().ToString('N') + '.json'))
+            Copy-DsrNewFile ([IO.Path]::Combine($work, 'source-receipt.json')) $receiptPath
+            $receiptEvidence = Get-DsrFileEvidence $receiptPath
+            $installed = Install-DsrExecutableFamily $built.directory $prefixPath $selection.binaries $transactionIdentity -ExpectedEvidence $built.expected -Yes:$Yes
+            $primary = $policy.binary_name
+            if (-not $primary.EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase)) { $primary += '.exe' }
+            $primaryRow = @($installed | Where-Object { $_.name.Equals($primary, [StringComparison]::OrdinalIgnoreCase) })[0]
+            $result = @{ tool = $tool; repository = $policy.repo; status = 'success'; method = 'source'; signed_release = $false;
+                source = $built.receipt; platform = $platform; go_target = $built.receipt.go_target;
+                source_receipt = @{ path = $receiptPath; sha256 = $receiptEvidence.sha256; size_bytes = $receiptEvidence.size_bytes };
+                path = $primaryRow.path; binaries = @($installed); signature_verified = $false; exit_code = 0 }
+            $retainSourceWork = $false
+            Write-DsrInstallLog ('Installed ' + $tool + ' from source commit ' + $built.receipt.source_commit + ' (' + $installed.Count + ' executable(s))')
+            if ($Json) { [Console]::Out.WriteLine(($result | ConvertTo-Json -Depth 12 -Compress)) }
+            else { [Console]::Out.WriteLine($primaryRow.path) }
+            return 0
+        }
         $release = $null
         if (-not $Version) {
             $work = New-DsrPrivateDirectory ([IO.Path]::Combine($cacheRoot, ('.dsr-download-' + [Guid]::NewGuid().ToString('N'))))
@@ -1557,13 +1632,18 @@ permission. Credentials are sent only to the configured repository's GitHub API.
         if ($_.Exception.Data.Contains('DsrExitCode')) { $code = [int]$_.Exception.Data['DsrExitCode'] }
         Write-DsrInstallLog $_.Exception.Message
         if ($Json) {
-            [Console]::Out.WriteLine((@{ tool = $tool; status = 'error'; error = $_.Exception.Message; exit_code = $code } | ConvertTo-Json -Compress))
+            $result = @{ tool = $tool; status = 'error'; error = $_.Exception.Message; exit_code = $code }
+            if ($retainSourceWork -and $work) { $result.source_diagnostics = $work }
+            [Console]::Out.WriteLine(($result | ConvertTo-Json -Compress))
         }
         return $code
     } finally {
         if ($work) {
-            try { Remove-DsrPrivateTree $work }
-            catch { Write-DsrInstallLog ('Private staging retained for inspection: ' + $work) }
+            if ($retainSourceWork) { Write-DsrInstallLog ('Source build diagnostics retained: ' + $work) }
+            else {
+                try { Remove-DsrPrivateTree $work }
+                catch { Write-DsrInstallLog ('Private staging retained for inspection: ' + $work) }
+            }
         }
     }
 }

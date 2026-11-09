@@ -1923,21 +1923,67 @@ validates configuration without creating installer output or publication locks.
 
 The generated script supports public GitHub releases and requires PowerShell
 7.4+ on native Windows. It accepts
-`-Version`, `-Prefix`, `-CacheDir`, `-Offline`, `-Recover`, `-Yes`, `-Json`, `-Verbose` and
-`-Help`. Offline installation requires an explicit version and uses only cached
+`-Version`, `-Prefix`, `-CacheDir`, `-Offline`, `-Recover`, `-FromSource`,
+`-SourceRef`, `-SourceTimeout`, `-Yes`, `-Json`, `-Verbose` and `-Help`.
+Offline release installation requires an explicit version and uses only cached
 payload/checksum/signature evidence. Checksums are mandatory; a configured
 Minisign key is also mandatory at verification, including on cache hits. Complete
 ZIP/tar.gz executable families and raw single executables are validated for the selected
 PE architecture and staged before prefix replacement. Failed updates restore
 previous selected files when possible, retain incomplete recovery evidence and
-never report success for a partially installed family. PATH edits, source builds
-and skill installation are not part of this Windows release installer.
+never report success for a partially installed family. PATH edits and skill
+installation are not part of this Windows installer.
+
+For a configured Go repository, source installation is a separate explicit mode:
+
+```powershell
+.\install.ps1 -FromSource -SourceRef refs/tags/v1.2.3 -Yes -Json
+```
+
+It requires existing Git and Go executables, executes repository/dependency build
+code, and never installs a compiler automatically. `-SourceRef` accepts `HEAD`
+(the default), a full commit SHA, `refs/heads/BRANCH` or `refs/tags/TAG`. The
+fetched ref is resolved once to a commit in a private detached checkout; an
+explicit SHA must match exactly. Symbolic links, submodules, unsafe Windows
+paths and case collisions in the selected source tree are refused. Go settings
+cannot inherit a different `GOOS`, `GOARCH`, `GOFLAGS`, `GOENV`, `GOWORK` or an
+automatic toolchain download. Existing dependency access and caches otherwise
+remain the installing user's Go environment.
+
+The source policy uses `source_subdir` and `source_entry`. An explicit entry
+selects the primary package; otherwise it uses `cmd/<primary>` when present and
+then the module root. Every selected companion requires its own `cmd/<name>`
+package. The complete per-target family must resolve to `main` packages, compile,
+retain its tracked-source fingerprint, and pass PE checks before any installed
+executable changes. Expected output hashes remain bound through the existing
+journaled family installation and recovery path. Failed builds retain private
+diagnostics and leave installed executables untouched.
+
+`-FromSource` cannot be combined with `-Version`, `-Offline` or `-Recover`.
+Source options without `-FromSource` are refused. Release acquisition, checksum
+and signature failures never invoke a source build. Other configured languages
+retain their normal Windows release installer; this source mode currently
+supports Go only. `-SourceTimeout` is a per-Git/Go-command deadline, including
+redirected output draining: default 3600 seconds, range 1..86400. A timeout
+prevents installation. Cleanup does not claim custody of child processes already
+orphaned by an exited parent.
+
+Source success reports `method: "source"`, `signed_release: false`,
+`signature_verified: false`, the actual `go_target`, and a `source` receipt with
+the requested ref, resolved commit, source fingerprint, package selections,
+compiler version and complete executable hashes/sizes. The configured release
+triple is labeled `release_target_triple`, not asserted as Go compiler evidence.
+`source_receipt` names a private durable JSON file and its hash/size under
+`CacheDir/source-receipts/TOOL/`. That file describes verified locally compiled
+bytes, not a signed release or a promise that a subsequent installation finished.
+Successful temporary source trees are removed; the small receipt remains.
 
 Before the first executable replacement, the installer publishes an immutable
 local journal with the complete previous and incoming family. An interrupted
 transaction blocks ordinary replacement until `-Recover -Yes [-Prefix DIR]`
 restores the previous bytes. Recovery runs before network, cache or verifier
-access and cannot be combined with `-Version`, `-Offline` or `-CacheDir`. It
+access and cannot be combined with `-Version`, `-Offline`, `-CacheDir` or source
+build options. It
 requires the same tool, repository, platform and prefix; validates the complete
 journal, backups and current family before mutation; and refuses unknown changed
 bytes, malformed evidence, symbolic links and reparse points. Preserved backups

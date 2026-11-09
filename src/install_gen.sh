@@ -3256,7 +3256,7 @@ install_gen_create() {
 _install_gen_windows_policy() (
     local config_file="$1" requested="$2" identities tool repo binary config_dir config_tool
     local document targets platform triple format archive_formats local_path key contract_model
-    local names row plan name policy='{}' version_marker='0.0.0-DSRINSTALLERVERSION'
+    local names row plan name source_policy policy='{}' version_marker='0.0.0-DSRINSTALLERVERSION'
     command -v yq >/dev/null && command -v jq >/dev/null || {
         log_error 'yq and jq are required to generate a PowerShell installer'; return 3;
     }
@@ -3272,6 +3272,21 @@ _install_gen_windows_policy() (
     source "$_IG_SCRIPT_DIR/artifact_naming.sh" || return 3
     export DSR_REPOS_FILE=''
     document=$(_config_read_single_mapping_json "$config_file") || return 4
+    source_policy=$(jq -c '
+        def source_path:
+            type == "string" and length > 0 and length <= 1024 and
+            (. == "." or (split("/") | length <= 64 and all(.[];
+                length > 0 and length <= 240 and . != "." and . != ".." and
+                (ascii_downcase != ".git") and (endswith(".") | not) and (endswith(" ") | not) and
+                (test("[[:cntrl:]\\\\:<>\"|?*]") | not) and
+                (test("(?i)^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\\.|$)") | not))));
+        if .language == "go" then
+            {language:"go", subdir:(.source_subdir // "."), entry:(.source_entry // "")} as $source |
+            if ($source.subdir | source_path) and ($source.entry | type == "string" and (. == "" or source_path)) and
+                ((.source_package // "") == "")
+            then $source else error("invalid Windows Go source selection") end
+        else null end
+    ' <<< "$document") || return 4
     targets=$(_config_get_tool_targets_json "$config_tool") || return 4
     dsr_platform_validate_targets_json "$targets" "PowerShell installer targets for $tool" || return 4
     config_validate_target_triples "$config_tool" || return 4
@@ -3341,18 +3356,19 @@ _install_gen_windows_policy() (
             else error("unsafe Windows release basename") end
         ' 3<<< "$names" <<< "$policy") || return 4
     done < <(jq -r '.[] | select(startswith("windows/"))' <<< "$targets")
-    jq -ce --arg tool "$tool" --arg repo "$repo" --arg binary "$binary" --arg key "$key" '
+    jq -ce --arg tool "$tool" --arg repo "$repo" --arg binary "$binary" --arg key "$key" --argjson source "$source_policy" '
         if length == 0 then error("no Windows targets are configured") else
             {schema_version:1,tool:$tool,repo:$repo,
              binary_name:($binary | sub("(?i)\\.exe$"; "") + ".exe"),
-             public_key:$key,platforms:.} end
+             public_key:$key,platforms:.} +
+             (if $source == null then {} else {source:$source} end) end
     ' <<< "$policy" || return 4
 )
 
 # Generate one standalone native Windows installer; dry-run validates policy
 # and existing output custody without creating any destination or lock.
 install_gen_create_powershell() (
-    local requested="${1:-}" selected_root='' dry_run=false config_file policy tool observation template encoded
+    local requested="${1:-}" selected_root='' dry_run=false config_file policy tool observation template encoded source_engine
     _install_gen_name "$requested" || return 4
     shift
     while [[ $# -gt 0 ]]; do
@@ -3379,6 +3395,10 @@ install_gen_create_powershell() (
     [[ -f "$_IG_SCRIPT_DIR/install_gen_windows.ps1" && ! -L "$_IG_SCRIPT_DIR/install_gen_windows.ps1" ]] || return 3
     template=$(cat "$_IG_SCRIPT_DIR/install_gen_windows.ps1") || return 3
     [[ "$template" == *'__DSR_WINDOWS_INSTALL_POLICY_B64__'* ]] || return 3
+    [[ -f "$_IG_SCRIPT_DIR/install_source_windows.ps1" && ! -L "$_IG_SCRIPT_DIR/install_source_windows.ps1" ]] || return 3
+    source_engine=$(cat "$_IG_SCRIPT_DIR/install_source_windows.ps1") || return 3
+    [[ -n "$source_engine" && "$template" == *'__DSR_WINDOWS_SOURCE_ENGINE__'* ]] || return 3
+    template="${template//__DSR_WINDOWS_SOURCE_ENGINE__/"$source_engine"}"
     encoded=$(printf '%s' "$policy" | base64 | tr -d '\r\n') || return 3
     template="${template//__DSR_WINDOWS_INSTALL_POLICY_B64__/"$encoded"}"
     printf '%s\n' "$template" | _install_gen_output publish "$_IG_OUTPUT_DIR" "$tool" "$observation"

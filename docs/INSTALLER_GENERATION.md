@@ -242,7 +242,7 @@ same destination:
 .\install.ps1 -Recover -Yes -Prefix C:\Tools\tool\bin -Json
 ```
 
-Recovery requires `-Yes` and does not accept `-Version`, `-Offline` or `-CacheDir`.
+Recovery requires `-Yes` and does not accept release, cache or source-build options.
 It operates before release lookup or cache access and needs no network, token,
 Minisign executable or downloaded release. The installer validates the journal's
 tool, repository, native platform and destination; private staging ownership and
@@ -276,8 +276,8 @@ durability guarantee.
 
 `-Json` keeps stdout machine-readable and includes the installed executable
 receipts; progress and `-Verbose` diagnostics go to stderr. `-Help` performs no
-download or installation. Windows source builds and agent-skill installation are
-outside this generator's release-asset path. The separate `generate-release`
+download or installation. Agent-skill installation remains outside this
+generator's scope. The separate `generate-release`
 authenticated snapshot engine remains a distinct command and policy format.
 
 ```bash
@@ -307,6 +307,106 @@ live GitHub acquisition.
 The policy regression exercises the actual configuration and publication naming
 helpers, explicit signing-key scope, executable-family limits and refusal before
 any existing installer or publication history changes.
+
+### Explicit Go source installation on Windows
+
+A generated installer for `language: go` can build and install its complete
+configured executable family using **existing Git and Go installations**:
+
+```powershell
+.\install.ps1 -FromSource -SourceRef refs/tags/v1.2.3 -Yes -Json
+.\install.ps1 -FromSource -SourceRef 0123456789abcdef0123456789abcdef01234567 -SourceTimeout 1800 -Yes
+```
+
+Replace the example commit with the intended full source SHA. `-SourceRef`
+accepts `HEAD` (the default), a full commit SHA, `refs/heads/BRANCH`, or
+`refs/tags/TAG`. Git resolves the selected ref once; the receipt records the exact
+fetched commit, and an explicit commit must match it. Source selection uses the
+configured repository and supports `source_subdir` plus the primary
+`source_entry` override:
+
+```yaml
+language: go
+source_subdir: project
+source_entry: apps/primary
+workspace_binaries: [app, helper]
+```
+
+This selects `project/apps/primary` for `app.exe` and `project/cmd/helper` for
+`helper.exe`. Without an override, the primary uses `cmd/<name>` when present
+and otherwise the module root. Every companion requires its own `cmd/<name>`
+directory. The selected project must contain `go.mod`; source paths must be
+relative and Windows-safe. The installer rejects tracked symlinks, submodules,
+case aliases and file/directory collisions before checkout. It resolves every
+selected package and requires `package main` before the first build. Per-target
+workspace lists also apply to source builds, including ARM64-specific families.
+
+`-FromSource` explicitly authorizes execution of repository and dependency build
+code under the caller's account. It is separate from release acquisition:
+`-Version`, `-Offline` and `-Recover` cannot be combined with it, and a failed
+release checksum or signature never invokes it. `-Yes` only permits replacement;
+it does not select source execution. Rust and other language configurations
+continue to generate normal release installers but have no Windows source route.
+The installer does not provision compilers or native dependencies. It forces
+`GOTOOLCHAIN=local`, disables user Go configuration and workspace selection,
+clears inherited Go flags, and builds for the detected Windows architecture.
+Go uses readonly module resolution, or the selected project's vendor directory.
+Normal dependency/cache settings otherwise apply; this is not a hermetic build
+or a pinned compiler/dependency authentication contract.
+
+Source fetches use HTTPS Git at the configured GitHub repository. Private fetches
+use the same token priority as release downloads, supplied through a
+repository-scoped environment header with Git 2.31 or newer. The token is not put
+in Git arguments, remote URLs or retained Git configuration. Redirects, user Git
+configuration, credential helpers, hooks and submodule fetching are disabled for
+the fetch. A failed credential does not authorize anonymous retry. Source code
+execution is not sandboxed, and ordinary caller environment variables remain
+available to compiler processes.
+
+Every selected executable must compile and pass the same Windows PE architecture
+admission as a release payload. The installer rechecks the pinned commit and all
+tracked source bytes after compilation. It binds each compiled executable's
+SHA-256 and length again when copying into the private installation transaction.
+Source builds then use the same complete-family lock, journal, rollback and
+`-Recover -Yes` behavior as release installation. A missing provider, compilation
+failure or changed source/output leaves the previous family intact.
+
+Source JSON reports `method: "source"`, `signed_release: false` and
+`signature_verified: false`. Its `source` receipt includes the requested ref,
+resolved commit, tracked-source digest, actual Go compiler identity, source
+selectors, per-executable entries and byte evidence. `go_target` records the
+actual `windows` OS and Go architecture; `release_target_triple` is labeled as the
+configured release selector rather than a claimed compiler ABI. A small private
+receipt remains at `CacheDir/source-receipts/TOOL/COMMIT-UNIQUE.json`, and
+`source_receipt` returns its path, hash and length. This receipt describes verified
+compiled bytes and is written before activation; its existence alone does not
+claim a successful installation.
+
+Successful temporary source work is cleaned up. A failure retains its private
+source, compiler output and per-command stdout/stderr logs; JSON includes the
+`source_diagnostics` directory. `-SourceTimeout` bounds each Git/Go command and
+its output draining, defaults to 3600 seconds, and accepts 1–86400 seconds. On
+timeout, the installer attempts to terminate a live parent and its descendants. A child already
+orphaned by an exited parent cannot be reliably identified through that process
+handle; the installer closes its pipes and returns a timeout without claiming
+that orphaned children were stopped.
+
+The focused regression uses the public generator, real Git commits and annotated
+tags, the installed Go compiler, genuine x64/ARM64 PE files, and real Minisign
+verification on the ordinary release route:
+
+```bash
+bash scripts/tests/test_install_source_windows.sh
+# Optionally compare the same source caller flow against a frozen older checkout:
+bash scripts/tests/test_install_source_windows.sh --baseline-project /absolute/old-checkout
+```
+
+It covers complete-family builds and updates, source/output binding, later
+compiler failure, rollback, durable receipts, inherited output-pipe deadlines,
+and preserved Rust release generation. Portable runs adapt native host detection
+and the Git/HTTP remote boundaries to local repositories and signed fixtures.
+They do not establish live GitHub, native Windows ACL/NTFS, or Windows descendant
+process qualification.
 
 ## Executable families from source
 

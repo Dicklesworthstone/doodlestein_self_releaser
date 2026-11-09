@@ -1076,6 +1076,14 @@ existing installation. `-Json` emits a structured result; `-Verbose` writes
 diagnostics to stderr. See [native Windows installers](docs/INSTALLER_GENERATION.md#native-windows-installers)
 for cache, upgrade and supported-format behavior.
 
+For a configured Go project, explicit `-FromSource -SourceRef refs/tags/v1.2.3`
+builds the complete Windows executable family with existing Git and Go. It pins
+the fetched commit, checks every output's PE architecture and byte evidence,
+and uses the same journaled update and recovery transaction. Source builds require
+separate consent and return local-build receipts; they never substitute for a
+failed release signature. See [Windows Go source installation](docs/INSTALLER_GENERATION.md#explicit-go-source-installation-on-windows)
+for source selectors, tool requirements and retained diagnostics.
+
 The installer accepts the build's scalar `archive_format: tar.xz` or a mapping
 such as `archive_format: {linux: tar.xz, darwin: tar.gz, windows: zip}`. Omitted
 OS entries keep their defaults (tar.gz on Unix, zip on Windows). A `binary`

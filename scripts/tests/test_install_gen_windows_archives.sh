@@ -250,6 +250,16 @@ for label, content in malformed.items():
     check(label + ' refuses before installation', result.returncode == 7 and value.get('status') == 'error' and
           all((prefix / n).read_bytes() == b and (prefix / n).stat().st_ino == ino for n, (b, ino) in before.items()), result.stderr)
 
+for label, attributes in [('pax-gnu-sparse', {'GNU.sparse.map': '0,' + str(len(app)), 'GNU.sparse.size': str(len(app))}),
+                          ('pax-schily-sparse', {'SCHILY.filetype': 'sparse', 'SCHILY.realsize': str(len(app))})]:
+    sparse = member('app.exe', app)
+    sparse[0].pax_headers = attributes
+    path = package(label, entries=[sparse, member('worker.exe', worker)], fmt=tarfile.PAX_FORMAT)
+    result, value, prefix, before, requests = install(label, path)
+    check(label + ' cannot disguise sparse data as a regular executable', result.returncode == 7 and
+          b'Sparse TAR metadata' in result.stderr and
+          all((prefix / n).read_bytes() == b and (prefix / n).stat().st_ino == ino for n, (b, ino) in before.items()), result.stderr)
+
 for label, compressed in [('gzip-missing-footer', archives['amd64'].read_bytes()[:-8]),
                           ('gzip-bad-crc', archives['amd64'].read_bytes()[:-8] + b'\0\0\0\0' + archives['amd64'].read_bytes()[-4:])]:
     path = root / 'packages' / (label + '.tar.gz')
