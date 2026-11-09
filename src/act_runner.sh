@@ -13335,6 +13335,7 @@ act_run_native_build() {
     # outputs must not add files to the immutable release source snapshot.
     # Windows hosts remain serialized by the orchestrator.
     local output_stage_root="" output_stage_source="" output_stage_parent=""
+    local output_stage_sibling_names=""
     if [[ "$language" != rust ]] && \
        { [[ "${DSR_NATIVE_OUTPUT_STAGE:-}" == 1 ]] || $strict_native_build; } && \
        ! _act_is_windows_host "$host"; then
@@ -13365,6 +13366,35 @@ act_run_native_build() {
         fi
         output_stage_root="${output_stage_parent%/}/dsr-build-${tool_name}-${platform//\//-}-${output_stage_uuid//-/}"
         output_stage_source="$output_stage_root/source"
+        if [[ "$language" == go ]] && ! $strict_native_build; then
+            # Ordinary sync has already selected and placed these roots beside
+            # remote_path. Go replace directives and go.work use entries keep
+            # that relative layout when an output collision moves this attempt
+            # to a private source copy. Never recopy the ambient controller
+            # sibling or reapply filters to the admitted namespace.
+            local output_sibling_count output_sibling_index output_sibling_relative output_sibling_local
+            local output_sibling_seen=' source cargo-home '
+            output_sibling_count=$(yq -r '.sibling_crates // [] | length' "$config_file") || return 4
+            [[ "$output_sibling_count" =~ ^[0-9]+$ ]] || return 4
+            for ((output_sibling_index=0; output_sibling_index<output_sibling_count; output_sibling_index++)); do
+                output_sibling_relative=$(yq -r ".sibling_crates[$output_sibling_index].relative_path // \"\"" \
+                    "$config_file") || return 4
+                if [[ -z "$output_sibling_relative" ]]; then
+                    output_sibling_local=$(yq -r ".sibling_crates[$output_sibling_index].local_path // \"\"" \
+                        "$config_file") || return 4
+                    output_sibling_local=$(_act_materialized_source_path "$tool_name" "$output_sibling_local") || return 4
+                    output_sibling_relative="${output_sibling_local##*/}"
+                fi
+                if [[ ! "$output_sibling_relative" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ||
+                      "$output_sibling_relative" == *..* || "$output_sibling_relative" == *. ||
+                      "$output_sibling_seen" == *" ${output_sibling_relative,,} "* ]]; then
+                    _log_error "Invalid or duplicate Go output-stage sibling name: $output_sibling_relative"
+                    return 4
+                fi
+                output_sibling_seen+="${output_sibling_relative,,} "
+                output_stage_sibling_names+="$output_sibling_relative"$'\n'
+            done
+        fi
     fi
     # Where in-tree outputs of this build land (collection reads from here).
     local artifact_source_root="${output_stage_source:-$remote_path}"
@@ -13659,6 +13689,14 @@ EOF
             local stage_root_q="${output_stage_root//\'/\'\\\'\'}"
             local stage_source_q="${output_stage_source//\'/\'\\\'\'}"
             cargo_home_prefix="mkdir -p '${stage_parent_q}'; $(_act_ram_backed_guard_sh "$output_stage_parent")test -d '$rp_q'; test ! -e '${stage_root_q}'; test ! -L '${stage_root_q}'; mkdir '${stage_root_q}' '${stage_source_q}'; cp -R '$rp_q/.' '${stage_source_q}/'; if test -e '${stage_source_q}/.git' || test -L '${stage_source_q}/.git'; then git -C '${stage_source_q}' status --porcelain --untracked-files=no >/dev/null; fi; "
+            local output_sibling_name output_sibling_source output_sibling_source_q output_sibling_destination_q
+            while IFS= read -r output_sibling_name; do
+                [[ -n "$output_sibling_name" ]] || continue
+                output_sibling_source="${remote_path%/*}/$output_sibling_name"
+                output_sibling_source_q="${output_sibling_source//\'/\'\\\'\'}"
+                output_sibling_destination_q="${stage_root_q}/$output_sibling_name"
+                cargo_home_prefix+="if ! test -d '$output_sibling_source_q' || test -L '$output_sibling_source_q'; then printf '[dsr] required Go sibling is missing or linked: %s\\n' '$output_sibling_source_q' >&2; exit 4; fi; mkdir '$output_sibling_destination_q'; cp -R '$output_sibling_source_q/.' '$output_sibling_destination_q/'; if test -e '$output_sibling_destination_q/.git' || test -L '$output_sibling_destination_q/.git'; then git -C '$output_sibling_destination_q' status --porcelain --untracked-files=no >/dev/null; fi; "
+            done <<< "$output_stage_sibling_names"
             if $strict_native_build; then
                 local stage_manifest stage_manifest_digest stage_object_count stage_verification
                 stage_manifest="$ACT_ARTIFACTS_DIR/strict-source-verification/stage-${output_stage_uuid}.manifest"

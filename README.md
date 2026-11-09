@@ -690,6 +690,11 @@ requires restoring the original inputs or starting a fresh run. A checkpoint
 without its original source binding also requires a fresh run. A refused
 resume preserves the checkpoint, completed artifacts, and publication receipt.
 
+Ordinary native Go builds also preserve configured sibling modules in private
+parallel output stages. Relative `go.mod` replacements and `go.work` entries
+keep the selected sibling layout for every architecture. A missing or linked
+required sibling stops the attempt before its Go build command runs.
+
 The source must be a complete, non-shallow SHA-1 repository worktree at its
 top-level directory. Sparse checkouts and files marked `assume-unchanged` or
 `skip-worktree` are refused because their dirty-state semantics cannot be

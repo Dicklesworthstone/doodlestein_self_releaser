@@ -13,6 +13,8 @@
 # copy materialization. On Unix this proves the receiver logic, not NTFS.
 # Use --ordinary-inputs-only for actual source selection and immutable resume
 # bindings; --ordinary-resume-only exercises a real Go matrix through cmd_build.
+# Use --go-siblings-only for real parallel Go replacements and workspaces,
+# including the source selection and receipts of private output stages.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 ROOT="${DSR_TEST_ROOT:-$ROOT}"
@@ -333,6 +335,170 @@ assert payload[:5] == b'\x7fELF\x01' and payload[18:20] == b'\x03\x00'
 assert b'first-input' in payload and b'second-input' not in payload
 PY
     printf 'Ordinary native resume: %s checks, %s failures\n' "$checks" "$failures"
+    [[ "$failures" == 0 ]]
+)
+
+test_ordinary_go_siblings() (
+    local layout="$1" dependency work config sha tree status=0 checks=0 failures=0
+    local artifact shared_source private_source before_events before_state state_file run
+    local go_work=off
+    for dependency in bash git jq yq python3 rsync go tar; do
+        command -v "$dependency" >/dev/null || { printf 'SKIP: Go siblings require %s\n' "$dependency"; return 77; }
+    done
+    [[ $(uname -s)/$(uname -m) == Linux/x86_64 && $(go version) == 'go version go'* ]] || {
+        printf 'SKIP: Go siblings require Linux x86_64 and the Go compiler\n'; return 77;
+    }
+    work=$(mktemp -d "${DSR_TEST_DISK_ROOT:-${TMPDIR:-/tmp}}/dsr-go-$layout.XXXXXXXX") || return 1
+    printf 'Ordinary Go %s evidence: %s\n' "$layout" "$work"
+    mkdir -p "$work/config/repos.d" "$work/source" "$work/dep" "$work/stages" || return 1
+    export DSR_CONFIG_DIR="$work/config" ACT_CONFIG_DIR="$work/config" ACT_REPOS_DIR="$work/config/repos.d"
+    export DSR_STATE_DIR="$work/state" DSR_CACHE_DIR="$work/cache"
+    export DSR_HOSTS_FILE="$work/config/hosts.yaml" DSR_REPOS_FILE="$work/config/repos.yaml"
+    export DSR_DISABLE_HOST_SELECTOR=1 RCH_DISABLED=1 RCH_CARGO_WRAPPER_BYPASS=1 NO_COLOR=1
+    printf 'module example.local/siblings\n\ngo 1.19\n\nrequire example.local/dep v0.0.0\n' > "$work/source/go.mod"
+    printf 'package main\nimport("fmt"; "example.local/dep")\nfunc main() { fmt.Println(dep.Value()) }\n' > "$work/source/main.go"
+    if [[ "$layout" == replace ]]; then
+        printf 'replace example.local/dep => ../dep\n' >> "$work/source/go.mod"
+    else
+        printf 'go 1.19\n\nuse (\n  .\n  ../dep\n)\n' > "$work/source/go.work"
+        go_work=""
+    fi
+    printf 'module example.local/dep\n\ngo 1.19\n' > "$work/dep/go.mod"
+    printf 'package dep\nfunc Value() string { return Selected() }\n' > "$work/dep/dep.go"
+    printf 'excluded.go\n' > "$work/dep/.gitignore"
+    for tree in source dep; do
+        git -C "$work/$tree" init -q -b main || return 1
+        git -C "$work/$tree" add . || return 1
+        git -C "$work/$tree" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm original || return 1
+    done
+    # Ordinary --allow-dirty must preserve selected untracked sibling source.
+    printf 'package dep\nfunc Selected() string { return "selected-sibling-input" }\n' > "$work/dep/selected.go"
+    GOWORK="$go_work" GOPROXY=off GOSUMDB=off CGO_ENABLED=0 \
+        GOCACHE="${DSR_TEST_GOCACHE:-$work/go-cache}" \
+        go -C "$work/source" build -o "$work/control" . || return 1
+    [[ $("$work/control") == selected-sibling-input ]] || return 1
+    # This invalid Go file must be excluded exactly once by ordinary sync.
+    # Recopying ambient controller siblings would make the real build fail.
+    printf 'this is not valid Go source\n' > "$work/dep/excluded.go"
+    sha=$(git -C "$work/dep" rev-parse HEAD) || return 1
+    jq -n --arg work "$work" '{schema_version:"1.0.0",hosts:{localnative:{
+        platform:"linux/amd64",connection:"local",concurrency:2,build_root:($work+"/stages")}},
+        platform_mapping:{"linux/amd64":"localnative","linux/386":"localnative"}}' > "$DSR_HOSTS_FILE" || return 1
+    config="$ACT_REPOS_DIR/siblings.yaml"
+    jq -n --arg work "$work" --arg path "$PATH" --arg sha "$sha" --arg layout "$layout" \
+        --arg gowork "$go_work" --arg cache "${DSR_TEST_GOCACHE:-$work/go-cache}" '{
+        tool_name:"siblings",repo:"example/siblings",local_path:($work+"/source"),language:"go",binary_name:"siblings",
+        targets:["linux/amd64","linux/386"],act_job_map:{"linux/amd64":null,"linux/386":null},
+        hosts:{"linux/amd64":"localnative","linux/386":"localnative"},
+        sibling_crates:[({local_path:($work+"/dep"),revision:$sha} +
+          (if $layout=="replace" then {relative_path:"dep"} else {} end))],
+        build_cmd:"printf \"%s %s\\n\" \"$DSR_TARGET_ARCH\" \"$PWD\" >> \"$PROBE_EVENTS\"; if [ \"$DSR_TARGET_ARCH\" = 386 ]; then touch \"$PROBE_READY\"; else count=0; while [ ! -e \"$PROBE_READY\" ] && [ \"$count\" -lt 600 ]; do sleep 0.05; count=$((count+1)); done; test -e \"$PROBE_READY\" || exit 9; fi; go build -o siblings .",
+        env:{PATH:$path,PROBE_READY:($work+"/second-ready"),PROBE_EVENTS:($work+"/compiler-events"),
+          GOCACHE:$cache,CGO_ENABLED:"0",GOWORK:$gowork,GOPROXY:"off",GOSUMDB:"off"},
+        artifact_naming:"${name}-${version}-${os}-${arch}.${ext}",archive_format:{linux:"tar.gz"}}
+        ' > "$config" || return 1
+    # shellcheck source=../../src/logging.sh
+    source "$ROOT/src/logging.sh"
+    # shellcheck source=../../src/config.sh
+    source "$ROOT/src/config.sh"
+    # shellcheck source=../../src/build_state.sh
+    source "$ROOT/src/build_state.sh"
+    # shellcheck source=../../src/act_runner.sh
+    source "${DSR_TEST_ACT_RUNNER:-$ROOT/src/act_runner.sh}"
+    # shellcheck source=../../src/artifact_naming.sh
+    source "$ROOT/src/artifact_naming.sh"
+    # shellcheck source=../../src/host_selector.sh
+    source "$ROOT/src/host_selector.sh"
+    # shellcheck source=../../src/host_health.sh
+    source "$ROOT/src/host_health.sh"
+    # shellcheck source=../../src/git_ops.sh
+    source "$ROOT/src/git_ops.sh"
+    # shellcheck source=../../src/packaging.sh
+    source "$ROOT/src/packaging.sh"
+    printf 'BOUNDARY: fixture host health/capacity; actual disk guard, Git, Go, rsync, parallel scheduler, output staging, collection, checkpoint and publication\n'
+    host_health_is_ready() { return 0; }
+    selector_acquire_slot() { return 0; }
+    selector_release_slot() { return 0; }
+    build_state_init || return 1
+    export SCRIPT_DIR="$ROOT" JSON_MODE=true DRY_RUN=false VERBOSE=false DSR_VERSION=fixture DSR_KEEP_BUILD_STAGES=1
+    declare -A _DSR_LOADED_MODULES=([packaging]=1 [artifact_naming]=1)
+    # shellcheck disable=SC1090 # Exercise the actual public command and state writer.
+    source <(awk '/^(_dsr_require|cmd_build)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$ROOT/dsr") || return 1
+    # shellcheck disable=SC1090
+    source <(awk '/^json_envelope\(\) \{/{copy=1} copy{print} copy && /^# ====/{exit}' "$ROOT/dsr") || return 1
+    check_go_siblings() {
+        local label="$1"; shift
+        checks=$((checks + 1))
+        if "$@"; then printf 'PASS: %s: %s\n' "$layout" "$label"
+        else failures=$((failures + 1)); printf 'FAIL: %s: %s\n' "$layout" "$label" >&2; fi
+    }
+    cmd_build siblings --version 1.0.0 --allow-dirty --parallel=2 --output-dir "$work/output" \
+        > "$work/result.json" 2> "$work/build.log" || status=$?
+    check_go_siblings 'public parallel Go matrix completes' test "$status" -eq 0
+    build_state_get siblings 1.0.0 > "$work/state.json" || { cat "$work/build.log" >&2; return 1; }
+    check_go_siblings 'both native results retain the admitted source namespace' jq -e '
+        .context.source_sync.source_inputs as $inputs | .status=="completed" and
+        $inputs.roots==["dep","source"] and ($inputs.sha256|length)==64 and
+        all(.target_statuses[]; .status=="completed" and .result.source_sync.source_inputs==$inputs)
+        ' "$work/state.json"
+    check_go_siblings 'public envelope admits both artifacts' jq -es '
+        length==1 and (.[0] | .details.source_sync.source_inputs as $inputs |
+        .exit_code==0 and .details.success==2 and
+        all(.details.targets[]; .status=="success" and .source_sync.source_inputs==$inputs))
+        ' "$work/result.json"
+    artifact=$(jq -r '.target_statuses["linux/amd64"].result.artifact_path // empty' "$work/state.json") || return 1
+    if [[ -x "$artifact" ]]; then
+        check_go_siblings 'actual amd64 executable uses selected untracked sibling source' test "$("$artifact")" = selected-sibling-input
+    else
+        check_go_siblings 'actual amd64 executable uses selected untracked sibling source' false
+    fi
+    check_go_siblings 'actual 386 ELF uses selected sibling source (no runtime claim)' python3 - "$work/state.json" <<'PY'
+import json, pathlib, sys
+state = json.loads(pathlib.Path(sys.argv[1]).read_text())
+payload = pathlib.Path(state['target_statuses']['linux/386']['result']['artifact_path']).read_bytes()
+assert payload[:5] == b'\x7fELF\x01' and payload[18:20] == b'\x03\x00'
+assert b'selected-sibling-input' in payload
+PY
+    shared_source=$(jq -r '.context.source_sync.source_roots.localnative' "$work/state.json") || return 1
+    private_source=$(awk '$1=="386"{sub(/^[^ ]* /,"");print}' "$work/compiler-events") || return 1
+    check_go_siblings 'overlapping target compiles inside its private output source' \
+        test "${private_source%/*}" != "${shared_source%/*}"
+    check_go_siblings 'private copy retains selected sibling bytes' \
+        cmp "$work/dep/selected.go" "${private_source%/*}/dep/selected.go"
+    check_go_siblings 'ignored ambient Go source is absent from private sibling' \
+        test ! -e "${private_source%/*}/dep/excluded.go"
+    check_go_siblings 'sibling Git identity survives private staging' test \
+        "$(git -C "${private_source%/*}/dep" rev-parse HEAD)" = "$sha"
+    check_go_siblings 'ordinary staging leaves the controller source free of compiler output' test ! -e "$work/source/siblings"
+
+    # Exercise missing and substituted host siblings through the real backend.
+    # The shared output from the earlier successful build cannot authorize
+    # artifact collection when this attempt never reaches its Go command.
+    if [[ "$layout" == replace ]]; then
+        before_events=$(_act_sha256 "$work/compiler-events") || return 1
+        run=$(jq -r .run_id "$work/state.json") || return 1
+        state_file="$DSR_STATE_DIR/builds/siblings/1.0.0/$run/state.json"
+        before_state=$(_act_sha256 "$state_file") || return 1
+        mv "${shared_source%/*}/dep" "$work/retained-host-dep" || return 1
+        for tree in missing linked; do
+            if [[ "$tree" == linked ]]; then
+                ln -s "$work/retained-host-dep" "${shared_source%/*}/dep" || return 1
+            fi
+            status=0
+            DSR_NATIVE_OUTPUT_STAGE=1 act_run_native_build siblings linux/386 1.0.0 "refused-$tree" \
+                '' '' '' localnative '' "$shared_source" > "$work/$tree.json" 2> "$work/$tree.log" || status=$?
+            check_go_siblings "$tree sibling refuses the attempt" test "$status" -ne 0
+            check_go_siblings "$tree sibling never reaches the compiler command" test \
+                "$before_events" = "$(_act_sha256 "$work/compiler-events")"
+            check_go_siblings "$tree sibling cannot collect the earlier successful binary" jq -e \
+                '.status=="failed" and .artifact_paths==[]' "$work/$tree.json"
+            check_go_siblings "$tree refusal reports the unavailable sibling" \
+                grep -q 'required Go sibling is missing or linked' "$work/$tree.log"
+        done
+        check_go_siblings 'direct refused attempts preserve the public completed checkpoint' test \
+            "$before_state" = "$(_act_sha256 "$state_file")"
+    fi
+    printf 'Ordinary Go %s: %s checks, %s failures\n' "$layout" "$checks" "$failures"
     [[ "$failures" == 0 ]]
 )
 
@@ -1278,6 +1444,12 @@ fi
 if [[ "${1:-}" == --ordinary-resume-only ]]; then
     test_ordinary_source_resume
     exit $?
+fi
+if [[ "${1:-}" == --go-siblings-only ]]; then
+    go_sibling_status=0
+    test_ordinary_go_siblings replace || go_sibling_status=$?
+    test_ordinary_go_siblings workspace || go_sibling_status=$?
+    exit "$go_sibling_status"
 fi
 if [[ "${1:-}" == --windows-source-links-only ]]; then
     test_windows_source_links
