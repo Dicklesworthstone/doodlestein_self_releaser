@@ -132,6 +132,7 @@ Required:
 - **git** — Version control
 - **gh** — GitHub CLI for API access
 - **jq** — JSON parsing
+- **yq (mikefarah v4)** — Read and safely edit YAML configuration
 
 For local builds:
 - **docker** — Required for nektos/act containers
@@ -1305,6 +1306,20 @@ leave files and configuration memory unchanged; JSON reports `persisted: false`.
 All configuration commands suppress persistent session logging so a log path
 that points at a configuration file cannot corrupt it. `config edit --dry-run`
 never launches the editor.
+
+Reading a nonempty `config.yaml` requires yq and jq. Loading rejects malformed
+YAML, duplicate keys, multiple documents, unsupported schema versions and
+ambiguous dotted paths before replacing the resolved configuration. A failed
+read leaves the previous in-memory settings intact and returns an error;
+`config show` and `config get` do not report defaults as a successful read of
+an invalid file. Literal values, including empty strings, backslashes and
+trailing newlines, survive retrieval unchanged.
+
+An absent or zero-byte file still loads defaults for initial setup, but
+`config validate` checks the physical file and requires an explicit
+`schema_version: 1.0.0`. Legacy mappings without a version remain readable so
+they can be migrated. Only `DSR_NO_SIGN=1` or `DSR_NO_SIGN=true` explicitly
+disable signing; `false` and `0` preserve the configured signing policy.
 
 ### `dsr doctor`
 

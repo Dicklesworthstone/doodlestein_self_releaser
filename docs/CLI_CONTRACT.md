@@ -165,10 +165,18 @@ Recommended (additive, backwards compatible):
 The `details` field contains command-specific data:
 
 #### `dsr check` details
+
+If reading the configured threshold fails before checking repositories, the
+error details instead contain `stage: "config"`, `config_file`, `error` and
+structured `errors`. The result omits `threshold_seconds`, `repos_checked`,
+`throttled` and `healthy`, since none has been resolved or checked. Its exit
+code is 3 for missing dependencies or 4 for invalid configuration.
+
 ```json
 {
   "details": {
     "repos_checked": ["ntm", "bv", "cass"],
+    "threshold_seconds": 600,
     "throttled": [
       {
         "repo": "ntm",
@@ -2594,6 +2602,40 @@ above applies to `set` and `migrate`.
 `show --section <name>` selects a key or a dotted section (`signing` shows
 `signing.enabled`). Structured answers use a `config` envelope with
 `details.action` identifying the subcommand.
+
+Reading a nonempty `config.yaml` requires mikefarah/yq v4 and jq (exit 3 if
+either is unavailable). The loader requires one YAML mapping without duplicate
+keys. Malformed YAML, multiple documents, unsupported schema versions and
+invalid version types fail with exit 4. It also refuses scalar keys or values
+containing NUL, which Bash cannot represent, and flattened path collisions
+such as a literal `a.b` key alongside nested `a: {b: ...}`. These checks happen
+before any resolved configuration becomes visible. Parsing or decoding failure
+preserves the caller's entire previous `DSR_CONFIG` map; partially decoded
+values and defaults are never published as a successful load.
+
+An absent or zero-byte configuration retains default-only loading for initial
+setup, including when the parsers are unavailable. A valid legacy mapping
+with an absent, null or empty `schema_version` remains loadable for migration.
+Explicit `validate` instead checks the current physical document independently
+of defaults or previously loaded settings: it requires a readable file, one
+mapping and the string `schema_version: 1.0.0`. It applies the same scalar
+admission checks as loading before checking the other configuration files and
+repository release contracts. A successful earlier load cannot make a changed
+or invalid file pass validation.
+
+`get` distinguishes a present empty string from a missing key. Literal strings
+retain equals signs, backslashes, tabs and embedded or trailing newlines;
+flag-like values such as `-n` are data. Human `get` appends one output newline;
+JSON preserves the value exactly. Scalar booleans, numbers and null appear in
+the resolved map as their string representations. `show` escapes both keys
+and values through JSON serialization. Failed public reads return nonzero and,
+when jq is available, one error envelope without stale/default configuration
+values; failed validation reports `valid: false`.
+
+The signing opt-out environment switch is explicit: `DSR_NO_SIGN=1` and
+`DSR_NO_SIGN=true` disable signing. Values `false` and `0` do not override the
+file's signing policy. Configuration loading and the signing decision use the
+same interpretation.
 
 ---
 

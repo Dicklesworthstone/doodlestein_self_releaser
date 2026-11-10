@@ -4,7 +4,40 @@
   "title": "DSR Check Details",
   "description": "Details payload for 'dsr check' command",
   "type": "object",
-  "required": ["repos_checked", "throttled", "healthy", "threshold_seconds"],
+  "if": {
+    "required": ["stage"],
+    "properties": { "stage": { "const": "config" } }
+  },
+  "then": {
+    "required": ["config_file", "error", "errors"],
+    "properties": {
+      "config_file": { "type": "string", "minLength": 1 },
+      "error": { "type": "string", "minLength": 1 },
+      "errors": {
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "type": "object",
+          "required": ["code", "message"],
+          "properties": {
+            "code": { "enum": ["E030", "E041"] },
+            "message": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "not": {
+      "anyOf": [
+        { "required": ["repos_checked"] },
+        { "required": ["throttled"] },
+        { "required": ["healthy"] },
+        { "required": ["threshold_seconds"] }
+      ]
+    }
+  },
+  "else": {
+    "required": ["repos_checked", "throttled", "healthy", "threshold_seconds"]
+  },
   "properties": {
     "repos_checked": {
       "type": "array",

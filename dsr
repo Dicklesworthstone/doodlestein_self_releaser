@@ -348,6 +348,28 @@ _config_envelope() {
     json_envelope "config" "$status" "$exit_code" "$details"
 }
 
+# A failed read must never serialize defaults or a previously loaded map as
+# current configuration. The module retains that map for its sourcing caller.
+_config_read_error() {
+    local action="$1" status="$2"
+    local reason="${_DSR_CONFIG_LOAD_ERROR:-Could not read configuration: $DSR_CONFIG_FILE}"
+    log_error "$reason"
+    if $JSON_MODE; then
+        if ! command -v jq >/dev/null 2>&1; then
+            log_error "jq is required for config $action --json"
+            return 3
+        fi
+        local details
+        details=$(jq -nc --arg action "$action" --arg file "$DSR_CONFIG_FILE" \
+            --arg reason "$reason" --argjson status "$status" '
+            {action: $action, config_file: $file,
+             errors: [{code: (if $status == 3 then "E041" else "E030" end), message: $reason}]}
+            + (if $action == "validate" then {valid: false} else {} end)') || return 3
+        _config_envelope "$status" "$details" || return 3
+    fi
+    return "$status"
+}
+
 cmd_config_init() {
     local force=false dry_run="${DRY_RUN:-false}" status=0 path
     local -a init_args=() planned_files=() _DSR_CONFIG_INIT_BACKUP_PATHS=()
@@ -411,7 +433,7 @@ cmd_config_init() {
 }
 
 cmd_config_show() {
-    local section=""
+    local section="" status=0 has_keys=false _DSR_CONFIG_LOAD_ERROR=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --section)
@@ -434,14 +456,25 @@ cmd_config_show() {
         esac
     done
 
-    config_load
+    if $JSON_MODE && ! command -v jq >/dev/null 2>&1; then
+        log_error "jq is required for config show --json"
+        return 3
+    fi
+    config_load >/dev/null 2>&1 || status=$?
+    if [[ $status -ne 0 ]]; then
+        _config_read_error show "$status"
+        return $?
+    fi
     # A section is a key or a dotted prefix: `signing` shows signing.enabled.
     local -a keys=()
     local k
     for k in "${!DSR_CONFIG[@]}"; do
-        [[ -z "$section" || "$k" == "$section" || "$k" == "$section".* ]] && keys+=("$k")
+        if [[ -z "$section" || "$k" == "$section" || "$k" == "$section".* ]]; then
+            keys+=("$k")
+            has_keys=true
+        fi
     done
-    if [[ -n "$section" && ${#keys[@]} -eq 0 ]]; then
+    if [[ -n "$section" ]] && ! $has_keys; then
         log_error "No configuration under: $section"
         $JSON_MODE && _config_envelope 4 "$(jq -nc --arg section "$section" \
             '{action: "show", section: $section, values: {}}')"
@@ -449,45 +482,57 @@ cmd_config_show() {
     fi
 
     if ! $JSON_MODE; then
-        config_show "$section"
+        _config_show_loaded "$section" false
         return $?
     fi
     local values='{}'
     for k in ${keys[@]+"${keys[@]}"}; do
-        values=$(jq -c --arg k "$k" --arg v "${DSR_CONFIG[$k]}" '. + {($k): $v}' <<< "$values")
+        values=$(jq -c --arg k "$k" --arg v "${DSR_CONFIG[$k]}" '. + {($k): $v}' <<< "$values") || return 3
     done
-    _config_envelope 0 "$(jq -nc --argjson values "$values" --arg section "$section" \
+    local details
+    details=$(jq -nc --argjson values "$values" --arg section "$section" \
         --arg config_dir "$DSR_CONFIG_DIR" --arg cache_dir "$DSR_CACHE_DIR" --arg state_dir "$DSR_STATE_DIR" \
         --arg config_file "$DSR_CONFIG_FILE" --arg hosts_file "$DSR_HOSTS_FILE" --arg repos_file "$DSR_REPOS_FILE" '
         {action: "show", config_dir: $config_dir, cache_dir: $cache_dir, state_dir: $state_dir,
          config_file: $config_file, hosts_file: $hosts_file, repos_file: $repos_file,
          section: (if $section == "" then null else $section end),
-         values: ($values | to_entries | sort_by(.key) | from_entries)}')"
+         values: ($values | to_entries | sort_by(.key) | from_entries)}') || return 3
+    _config_envelope 0 "$details"
 }
 
 cmd_config_get() {
-    local key="${1:-}"
-    if [[ -z "$key" ]]; then
+    local key="${1:-}" status=0 _DSR_CONFIG_LOAD_ERROR=""
+    if [[ $# -ne 1 || -z "$key" ]]; then
         log_error "Usage: dsr config get <key>"
         return 4
     fi
+    if $JSON_MODE && ! command -v jq >/dev/null 2>&1; then
+        log_error "jq is required for config get --json"
+        return 3
+    fi
+    config_load >/dev/null 2>&1 || status=$?
+    if [[ $status -ne 0 ]]; then
+        _config_read_error get "$status"
+        return $?
+    fi
 
-    config_load
-    local value
-    value=$(config_get "$key" "")
-
-    if [[ -z "$value" ]]; then
+    # Empty strings are present values, and command substitution would strip
+    # trailing newlines from a literal value that config set just preserved.
+    if [[ -z "${DSR_CONFIG[$key]+present}" ]]; then
         log_error "Key not found: $key"
         $JSON_MODE && _config_envelope 4 "$(jq -nc --arg key "$key" \
             '{action: "get", key: $key, errors: [{code: "E031", message: "key not found"}]}')"
         return 4
     fi
+    local value="${DSR_CONFIG[$key]}"
 
     if $JSON_MODE; then
-        _config_envelope 0 "$(jq -nc --arg key "$key" --arg value "$value" \
-            '{action: "get", key: $key, value: $value}')"
+        local details
+        details=$(jq -nc --arg key "$key" --arg value "$value" \
+            '{action: "get", key: $key, value: $value}') || return 3
+        _config_envelope 0 "$details"
     else
-        echo "$value"
+        printf '%s\n' "$value"
     fi
 }
 
@@ -568,16 +613,27 @@ cmd_config_set() {
 }
 
 cmd_config_validate() {
-    local status=0
-    config_load
-    if $JSON_MODE; then
-        config_validate 2>/dev/null || status=4
-        _config_envelope "$status" "$(jq -nc --arg file "$DSR_CONFIG_FILE" \
-            --argjson valid "$([[ $status -eq 0 ]] && echo true || echo false)" \
-            '{action: "validate", config_file: $file, valid: $valid}')"
-        return $status
+    local status=0 _DSR_CONFIG_LOAD_ERROR=""
+    if $JSON_MODE && ! command -v jq >/dev/null 2>&1; then
+        log_error "jq is required for config validate --json"
+        return 3
     fi
-    config_validate
+    if $JSON_MODE; then
+        config_validate >/dev/null 2>&1 || status=$?
+    else
+        config_validate || status=$?
+    fi
+    if [[ $status -ne 0 ]]; then
+        _config_read_error validate "$status"
+        return $?
+    fi
+    if $JSON_MODE; then
+        local details
+        details=$(jq -nc --arg file "$DSR_CONFIG_FILE" \
+            '{action: "validate", config_file: $file, valid: true}') || return 3
+        _config_envelope 0 "$details" || return 3
+    fi
+    return 0
 }
 
 # Bring config.yaml to this dsr's schema version, backing it up first.
@@ -1191,8 +1247,7 @@ EOF
     echo ""
     log_info "Configuration:"
 
-    config_load 2>/dev/null || true
-    if config_validate &>/dev/null 2>&1; then
+    if config_load 2>/dev/null && config_validate &>/dev/null; then
         _add_check "config" "ok" ""
         log_ok "  config: valid"
     elif $fix_mode && [[ ! -e "$DSR_CONFIG_FILE" ]] && config_init >/dev/null 2>&1 &&
@@ -1441,9 +1496,22 @@ EOF
     # The configured threshold (threshold_seconds, or DSR_THRESHOLD through
     # config_load) applies unless --threshold overrides it.
     if [[ -z "$threshold" ]]; then
-        config_load 2>/dev/null || true
-        threshold=$(config_get threshold_seconds 600 2>/dev/null) || threshold=600
-        [[ -n "$threshold" ]] || threshold=600
+        local load_status=0
+        config_load >/dev/null 2>&1 || load_status=$?
+        if [[ $load_status -ne 0 ]]; then
+            local reason="${_DSR_CONFIG_LOAD_ERROR:-Could not read configuration: $DSR_CONFIG_FILE}"
+            log_error "$reason"
+            if $JSON_MODE; then
+                local details
+                details=$(jq -nc --arg file "$DSR_CONFIG_FILE" --arg reason "$reason" \
+                    --argjson status "$load_status" '
+                    {stage: "config", config_file: $file, error: $reason,
+                     errors: [{code: (if $status == 3 then "E041" else "E030" end), message: $reason}]}') || return 3
+                json_envelope check error "$load_status" "$details" || return 3
+            fi
+            return "$load_status"
+        fi
+        threshold="${DSR_CONFIG[threshold_seconds]-600}"
     fi
     if [[ ! "$threshold" =~ ^[1-9][0-9]{0,6}$ ]]; then
         log_error "Invalid threshold: $threshold (positive number of seconds)"
@@ -8719,7 +8787,22 @@ EOF
         return 4
     fi
 
-    config_load || return $?
+    local config_load_status=0
+    config_load || config_load_status=$?
+    if [[ $config_load_status -ne 0 ]]; then
+        if $JSON_MODE; then
+            local config_details
+            config_details=$(jq -nc --arg tool "$tool_name" --arg version "$version" \
+                --arg file "$DSR_CONFIG_FILE" \
+                --arg reason "${_DSR_CONFIG_LOAD_ERROR:-Could not read configuration}" \
+                --argjson code "$config_load_status" '
+                {tool: $tool, repo: "", version: $version, tag: "", stage: "config",
+                 config_file: $file, error: $reason,
+                 errors: [{code: (if $code == 3 then "E041" else "E030" end), message: $reason}]}') || return 3
+            json_envelope release error "$config_load_status" "$config_details" || return 3
+        fi
+        return "$config_load_status"
+    fi
     local sbom_policy
     sbom_policy=$(_release_sbom_policy "$sbom_override" "$sbom_format_override") || return $?
     sbom_enabled=$(jq -r '.enabled' <<< "$sbom_policy") || return 4
@@ -12760,7 +12843,22 @@ EOF
         return 4
     fi
     _dsr_require sbom || return 3
-    config_load || return 4
+    local config_load_status=0
+    config_load || config_load_status=$?
+    if [[ $config_load_status -ne 0 ]]; then
+        if $JSON_MODE; then
+            local config_details
+            config_details=$(jq -nc --arg tool "$tool_name" --arg repo "$repo" --arg version "$tag" \
+                --arg file "$DSR_CONFIG_FILE" \
+                --arg reason "${_DSR_CONFIG_LOAD_ERROR:-Could not read configuration}" \
+                --argjson code "$config_load_status" '
+                {tool: $tool, repo: $repo, version: $version, phase: "config", steps: [],
+                 config_file: $file, error: $reason,
+                 errors: [{code: (if $code == 3 then "E041" else "E030" end), message: $reason}]}') || return 3
+            json_envelope fallback error "$config_load_status" "$config_details" || return 3
+        fi
+        return "$config_load_status"
+    fi
     sbom_policy=$(_release_sbom_policy "$sbom_override" "$sbom_format") || return 4
     if [[ "$contract" != null ]] && jq -e '.enabled' <<< "$sbom_policy" >/dev/null; then
         log_error "Automatic SBOM generation is not allowed with a strict closed release contract"
@@ -13187,7 +13285,12 @@ EOF
         local check_started check_result="" check_rc=0 check_workflow check_threshold
         check_started=$(_fallback_now_ms)
         check_workflow=$(config_get_tool_field "$tool_name" "workflow" "" 2>/dev/null) || check_workflow=""
-        config_load 2>/dev/null || true
+        config_load >/dev/null 2>&1 || check_rc=$?
+        if [[ $check_rc -ne 0 ]]; then
+            _fallback_result "$check_rc" config \
+                "${_DSR_CONFIG_LOAD_ERROR:-Could not read configuration: $DSR_CONFIG_FILE}"
+            return "$check_rc"
+        fi
         check_threshold=$(config_get threshold_seconds 600 2>/dev/null) || check_threshold=600
         [[ "$check_threshold" =~ ^[1-9][0-9]{0,6}$ ]] || check_threshold=600
         check_result=$(_check_repo "$repo" "$check_threshold" "$(date +%s)" "${check_workflow##*/}" 2>/dev/null) ||

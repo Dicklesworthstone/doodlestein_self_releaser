@@ -1071,6 +1071,242 @@ test_load_resets_config() {
   [[ -z "${DSR_CONFIG[test_key]:-}" ]]
 }
 
+test_load_rejects_invalid_documents_without_changing_memory() {
+  _init_custom_config_files || return 1
+  config_load || return 1
+  DSR_CONFIG[preserved_key]=$'retained\nvalue\n'
+  local memory before status kind
+  memory=$(declare -p DSR_CONFIG)
+  for kind in malformed duplicate multiple_documents sequence scalar unsupported_schema schema_number nul_value nul_key flattened_collision; do
+    case "$kind" in
+      malformed) printf 'threshold_seconds: [\n' > "$DSR_CONFIG_FILE" ;;
+      duplicate) printf 'threshold_seconds: 300\nthreshold_seconds: 900\n' > "$DSR_CONFIG_FILE" ;;
+      multiple_documents) printf 'threshold_seconds: 300\n---\nthreshold_seconds: 900\n' > "$DSR_CONFIG_FILE" ;;
+      sequence) printf '%s\n' '- threshold_seconds: 300' > "$DSR_CONFIG_FILE" ;;
+      scalar) printf 'not-a-mapping\n' > "$DSR_CONFIG_FILE" ;;
+      unsupported_schema) printf 'schema_version: "99.0.0"\nthreshold_seconds: 900\n' > "$DSR_CONFIG_FILE" ;;
+      schema_number) printf 'schema_version: 1\nthreshold_seconds: 900\n' > "$DSR_CONFIG_FILE" ;;
+      nul_value) printf '%s\n' 'value: "before\u0000after"' > "$DSR_CONFIG_FILE" ;;
+      nul_key) printf '%s\n' '"before\u0000after": value' > "$DSR_CONFIG_FILE" ;;
+      flattened_collision) printf '"signing.enabled": false\nsigning:\n  enabled: true\n' > "$DSR_CONFIG_FILE" ;;
+    esac
+    before=$(cksum "$DSR_CONFIG_FILE") || return 1
+    status=0
+    config_load || status=$?
+    [[ "$status" == 4 && "$memory" == "$(declare -p DSR_CONFIG)" &&
+       "$before" == "$(cksum "$DSR_CONFIG_FILE")" &&
+       ! -e "$DSR_CACHE_DIR" && ! -e "$DSR_STATE_DIR" ]] || return 1
+  done
+}
+
+# Run the genuine parser, then inject a failed exit after its output. A
+# process-substitution reader must not mistake that output for a successful load.
+test_load_parser_failure_preserves_memory() (
+  _init_custom_config_files || return 1
+  DSR_CONFIG[preserved_key]=original-memory
+  local memory before status=0
+  memory=$(declare -p DSR_CONFIG)
+  before=$(cksum "$DSR_CONFIG_FILE") || return 1
+  yq() {
+    command yq "$@" || return $?
+    return 17
+  }
+  config_load || status=$?
+  [[ "$status" -ne 0 && "$memory" == "$(declare -p DSR_CONFIG)" &&
+     "$before" == "$(cksum "$DSR_CONFIG_FILE")" ]]
+)
+
+# The final serializer really emits every value, then reports failure. The
+# loader must require successful completion even if its caller disabled pipefail.
+test_load_serializer_failure_preserves_memory_without_pipefail() (
+  _init_custom_config_files || return 1
+  DSR_CONFIG[preserved_key]=$'original\nmemory\n'
+  local memory status=0
+  memory=$(declare -p DSR_CONFIG)
+  jq() {
+    command jq "$@" || return $?
+    [[ "${1:-}" != -j ]] || return 29
+  }
+  set +o pipefail
+  config_load || status=$?
+  [[ "$status" == 3 && "$memory" == "$(declare -p DSR_CONFIG)" ]]
+)
+
+test_load_missing_dependencies_preserve_memory() {
+  _init_custom_config_files || return 1
+  DSR_CONFIG[preserved_key]=original-memory
+  local memory before tool_path status
+  memory=$(declare -p DSR_CONFIG)
+  before=$(cksum "$DSR_CONFIG_FILE") || return 1
+  mkdir "$TEMP_DIR/only-jq" "$TEMP_DIR/only-yq" || return 1
+  ln -s "$(command -v jq)" "$TEMP_DIR/only-jq/jq" || return 1
+  ln -s "$(command -v yq)" "$TEMP_DIR/only-yq/yq" || return 1
+  # Each parser is genuinely absent from PATH in turn; no replacement parser.
+  for tool_path in "$TEMP_DIR/only-jq" "$TEMP_DIR/only-yq"; do
+    status=0
+    PATH="$tool_path" config_load || status=$?
+    [[ "$status" == 3 && "$memory" == "$(declare -p DSR_CONFIG)" &&
+       "$before" == "$(cksum "$DSR_CONFIG_FILE")" ]] || return 1
+  done
+}
+
+test_load_missing_config_defaults_without_parsers() {
+  DSR_CONFIG[preserved_key]=stale-memory
+  PATH="$TEMP_DIR/no-installed-tools" config_load || return 1
+  [[ "${DSR_CONFIG[threshold_seconds]:-}" == 600 &&
+     "${DSR_CONFIG[schema_version]:-}" == "$DSR_SCHEMA_VERSION" &&
+     -z "${DSR_CONFIG[preserved_key]+present}" ]] && _init_roots_absent
+}
+
+test_load_empty_config_defaults_without_parsers() {
+  mkdir -p "$DSR_CONFIG_DIR" || return 1
+  : > "$DSR_CONFIG_FILE"
+  DSR_CONFIG[preserved_key]=stale-memory
+  PATH="$TEMP_DIR/no-installed-tools" config_load || return 1
+  [[ "${DSR_CONFIG[threshold_seconds]:-}" == 600 &&
+     -z "${DSR_CONFIG[preserved_key]+present}" && ! -s "$DSR_CONFIG_FILE" &&
+     ! -e "$DSR_CACHE_DIR" && ! -e "$DSR_STATE_DIR" ]]
+}
+
+test_load_legacy_schema_remains_readable() {
+  mkdir -p "$DSR_CONFIG_DIR" || return 1
+  local kind
+  for kind in absent null empty; do
+    case "$kind" in
+      absent) printf 'threshold_seconds: 300\n' > "$DSR_CONFIG_FILE" ;;
+      null) printf 'schema_version: null\nthreshold_seconds: 300\n' > "$DSR_CONFIG_FILE" ;;
+      empty) printf 'schema_version: ""\nthreshold_seconds: 300\n' > "$DSR_CONFIG_FILE" ;;
+    esac
+    config_load || return 1
+    [[ "${DSR_CONFIG[threshold_seconds]:-}" == 300 ]] || return 1
+  done
+}
+
+test_load_scalar_values_are_preserved() {
+  mkdir -p "$DSR_CONFIG_DIR" || return 1
+  cat > "$DSR_CONFIG_FILE" <<'YAML'
+schema_version: "1.0.0"
+false_value: false
+null_value: null
+empty_value: ""
+zero_value: 0
+YAML
+  config_load || return 1
+  [[ "${DSR_CONFIG[false_value]:-}" == false &&
+     "${DSR_CONFIG[null_value]:-}" == null &&
+     -n "${DSR_CONFIG[empty_value]+present}" && "${DSR_CONFIG[empty_value]}" == '' &&
+     "${DSR_CONFIG[zero_value]:-}" == 0 ]] || return 1
+  _config_mutation_cli --json config show || return 1
+  [[ ! -s "$TEMP_DIR/mutation.stderr" ]] || return 1
+  jq -es 'length == 1 and (.[0] | .status == "success" and
+    .details.values.false_value == "false" and .details.values.null_value == "null" and
+    .details.values.empty_value == "" and .details.values.zero_value == "0")' \
+    "$TEMP_DIR/mutation.stdout" >/dev/null
+}
+
+test_load_persisted_values_roundtrip() {
+  _init_custom_config_files || return 1
+  local index key value
+  local -a values=('' '-n' 'left = right' 'C:\tools\bin\file' $'embedded\nline' $'trailing\n\n' $'tab\tcarriage\rreturn' ' leading and trailing ')
+  for ((index = 0; index < ${#values[@]}; index++)); do
+    key="roundtrip_$index"
+    value="${values[index]}"
+    config_set "$key" "$value" --persist || return 1
+    DSR_CONFIG["$key"]=stale-memory
+    config_load || return 1
+    [[ -n "${DSR_CONFIG[$key]+present}" && "${DSR_CONFIG[$key]}" == "$value" ]] || return 1
+    # File comparison retains trailing newlines and exposes echo's -n option.
+    printf '%s\n' "$value" > "$TEMP_DIR/expected-value"
+    config_get "$key" > "$TEMP_DIR/actual-value" || return 1
+    cmp -s "$TEMP_DIR/expected-value" "$TEMP_DIR/actual-value" || return 1
+    _config_mutation_cli --json config get "$key" || return 1
+    [[ ! -s "$TEMP_DIR/mutation.stderr" ]] || return 1
+    jq -es --arg key "$key" --arg value "$value" 'length == 1 and (.[0] |
+      .status == "success" and .exit_code == 0 and .details.action == "get" and
+      .details.key == $key and .details.value == $value)' "$TEMP_DIR/mutation.stdout" >/dev/null || return 1
+  done
+}
+
+test_cli_set_values_roundtrip() {
+  _init_custom_config_files || return 1
+  local value
+  for value in '' $'-n = C:\\tools\\file\nlast line\n\n'; do
+    _config_mutation_cli --json config set "roundtrip_value=$value" || return 1
+    [[ ! -s "$TEMP_DIR/mutation.stderr" ]] || return 1
+    jq -es --arg value "$value" 'length == 1 and (.[0] |
+      .status == "success" and .details.persisted == true and .details.value == $value)' \
+      "$TEMP_DIR/mutation.stdout" >/dev/null || return 1
+    _config_mutation_cli --json config get roundtrip_value || return 1
+    [[ ! -s "$TEMP_DIR/mutation.stderr" ]] || return 1
+    jq -es --arg value "$value" 'length == 1 and (.[0] |
+      .status == "success" and .details.value == $value)' "$TEMP_DIR/mutation.stdout" >/dev/null || return 1
+  done
+}
+
+test_load_signing_environment_flags_use_real_policy() (
+  unset DSR_NO_SIGN DSR_SIGNING_ENABLED DSR_MINISIGN_KEY
+  # shellcheck source=../../src/signing.sh
+  source "$SRC_DIR/signing.sh"
+  mkdir -p "$DSR_CONFIG_DIR" || return 1
+  printf 'schema_version: "1.0.0"\nsigning:\n  enabled: true\n' > "$DSR_CONFIG_FILE"
+  local flag status expected
+  for flag in false 0 true 1; do
+    export DSR_NO_SIGN="$flag"
+    config_load || return 1
+    expected=0
+    [[ "$flag" != true && "$flag" != 1 ]] || expected=1
+    status=0
+    signing_wanted || status=$?
+    [[ "$status" == "$expected" ]] || return 1
+  done
+)
+
+test_load_signing_yaml_flags_use_real_policy() (
+  unset DSR_NO_SIGN DSR_SIGNING_ENABLED DSR_MINISIGN_KEY
+  # shellcheck source=../../src/signing.sh
+  source "$SRC_DIR/signing.sh"
+  mkdir -p "$DSR_CONFIG_DIR" || return 1
+  local flag status expected
+  for flag in false 0 true 1 False TRUE; do
+    printf 'schema_version: "1.0.0"\nsigning:\n  enabled: %s\n' "$flag" > "$DSR_CONFIG_FILE"
+    config_load || return 1
+    expected=0
+    [[ "$flag" != false && "$flag" != 0 && "$flag" != False ]] || expected=1
+    status=0
+    signing_wanted || status=$?
+    [[ "$status" == "$expected" ]] || return 1
+  done
+)
+
+test_cli_read_commands_report_config_errors() {
+  mkdir -p "$DSR_CONFIG_DIR" || return 1
+  printf 'threshold_seconds: [\n' > "$DSR_CONFIG_FILE" || return 1
+  local action mode status before paths
+  before=$(cksum "$DSR_CONFIG_FILE") || return 1
+  paths=$(find "$DSR_CONFIG_DIR" -print | LC_ALL=C sort) || return 1
+  for action in show get validate; do
+    for mode in human json; do
+      set -- config "$action"
+      [[ "$action" != get ]] || set -- "$@" threshold_seconds
+      [[ "$mode" != json ]] || set -- --json "$@"
+      status=0
+      _config_mutation_cli "$@" || status=$?
+      [[ "$status" == 4 && "$before" == "$(cksum "$DSR_CONFIG_FILE")" &&
+         "$paths" == "$(find "$DSR_CONFIG_DIR" -print | LC_ALL=C sort)" &&
+         ! -e "$DSR_CACHE_DIR" && ! -e "$DSR_STATE_DIR" ]] || return 1
+      if [[ "$mode" == json ]]; then
+        jq -es --arg action "$action" --arg file "$DSR_CONFIG_FILE" 'length == 1 and (.[0] |
+          .status == "error" and .exit_code == 4 and .details.action == $action and
+          .details.config_file == $file and (.details.errors | length) > 0 and
+          (if $action == "validate" then .details.valid == false else true end))' \
+          "$TEMP_DIR/mutation.stdout" >/dev/null || return 1
+      else
+        [[ ! -s "$TEMP_DIR/mutation.stdout" && -s "$TEMP_DIR/mutation.stderr" ]] || return 1
+      fi
+    done
+  done
+}
+
 # ============================================================================
 # Tests: Get/Set (config_get, config_set)
 # ============================================================================
@@ -1665,11 +1901,59 @@ test_validate_fails_missing_dir() {
 }
 
 test_validate_checks_schema_version() {
-  config_init
-  config_load
-  # Remove schema_version
-  DSR_CONFIG=()
-  ! config_validate
+  mkdir -p "$DSR_CONFIG_DIR" || return 1
+  printf 'schema_version: "1.0.0"\n' > "$DSR_CONFIG_FILE" || return 1
+  config_load || return 1
+  local kind status before
+  # A previously valid memory snapshot must not certify changed disk contents.
+  for kind in missing_file empty_file absent null empty unknown false number sequence object; do
+    case "$kind" in
+      missing_file) mv "$DSR_CONFIG_FILE" "$TEMP_DIR/retained-valid-config" || return 1 ;;
+      empty_file) : > "$DSR_CONFIG_FILE" ;;
+      absent) printf 'threshold_seconds: 300\n' > "$DSR_CONFIG_FILE" ;;
+      null) printf 'schema_version: null\n' > "$DSR_CONFIG_FILE" ;;
+      empty) printf 'schema_version: ""\n' > "$DSR_CONFIG_FILE" ;;
+      unknown) printf 'schema_version: "99.0.0"\n' > "$DSR_CONFIG_FILE" ;;
+      false) printf 'schema_version: false\n' > "$DSR_CONFIG_FILE" ;;
+      number) printf 'schema_version: 1\n' > "$DSR_CONFIG_FILE" ;;
+      sequence) printf 'schema_version: ["1.0.0"]\n' > "$DSR_CONFIG_FILE" ;;
+      object) printf 'schema_version: {version: "1.0.0"}\n' > "$DSR_CONFIG_FILE" ;;
+    esac
+    status=0
+    config_validate || status=$?
+    [[ "$status" == 4 ]] || return 1
+  done
+  printf 'schema_version: "1.0.0"\n' > "$DSR_CONFIG_FILE" || return 1
+  DSR_CONFIG[schema_version]=stale-invalid-version
+  config_validate || return 1
+  # Loading legacy data remains possible, but explicit validation must report
+  # its physically missing schema instead of validating the loaded default.
+  printf 'threshold_seconds: 300\n' > "$DSR_CONFIG_FILE" || return 1
+  before=$(cksum "$DSR_CONFIG_FILE") || return 1
+  status=0
+  _config_mutation_cli --json config validate || status=$?
+  [[ "$status" == 4 && "$before" == "$(cksum "$DSR_CONFIG_FILE")" &&
+     ! -e "$DSR_CACHE_DIR" && ! -e "$DSR_STATE_DIR" ]] || return 1
+  jq -es 'length == 1 and (.[0] | .status == "error" and .exit_code == 4 and
+    .details.action == "validate" and .details.valid == false and
+    (.details.errors | length) > 0)' "$TEMP_DIR/mutation.stdout" >/dev/null
+}
+
+test_validate_rejects_unrepresentable_values() {
+  mkdir -p "$DSR_CONFIG_DIR" || return 1
+  DSR_CONFIG[schema_version]="$DSR_SCHEMA_VERSION"
+  local kind status before
+  for kind in nul_value nul_key flattened_collision; do
+    case "$kind" in
+      nul_value) printf '%s\n' 'schema_version: "1.0.0"' 'value: "before\u0000after"' > "$DSR_CONFIG_FILE" ;;
+      nul_key) printf '%s\n' 'schema_version: "1.0.0"' '"before\u0000after": value' > "$DSR_CONFIG_FILE" ;;
+      flattened_collision) printf 'schema_version: "1.0.0"\n"signing.enabled": false\nsigning:\n  enabled: true\n' > "$DSR_CONFIG_FILE" ;;
+    esac
+    before=$(cksum "$DSR_CONFIG_FILE") || return 1
+    status=0
+    config_validate || status=$?
+    [[ "$status" == 4 && "$before" == "$(cksum "$DSR_CONFIG_FILE")" ]] || return 1
+  done
 }
 
 # ============================================================================
@@ -3236,6 +3520,19 @@ main() {
   run_test "load_threshold_env_override" test_load_threshold_env_override
   run_test "load_signing_disabled_by_env" test_load_signing_disabled_by_env
   run_test "load_resets_config" test_load_resets_config
+  run_test "load_rejects_invalid_documents_without_changing_memory" test_load_rejects_invalid_documents_without_changing_memory
+  run_test "load_parser_failure_preserves_memory" test_load_parser_failure_preserves_memory
+  run_test "load_serializer_failure_preserves_memory_without_pipefail" test_load_serializer_failure_preserves_memory_without_pipefail
+  run_test "load_missing_dependencies_preserve_memory" test_load_missing_dependencies_preserve_memory
+  run_test "load_missing_config_defaults_without_parsers" test_load_missing_config_defaults_without_parsers
+  run_test "load_empty_config_defaults_without_parsers" test_load_empty_config_defaults_without_parsers
+  run_test "load_legacy_schema_remains_readable" test_load_legacy_schema_remains_readable
+  run_test "load_scalar_values_are_preserved" test_load_scalar_values_are_preserved
+  run_test "load_persisted_values_roundtrip" test_load_persisted_values_roundtrip
+  run_test "cli_set_values_roundtrip" test_cli_set_values_roundtrip
+  run_test "load_signing_environment_flags_use_real_policy" test_load_signing_environment_flags_use_real_policy
+  run_test "load_signing_yaml_flags_use_real_policy" test_load_signing_yaml_flags_use_real_policy
+  run_test "cli_read_commands_report_config_errors" test_cli_read_commands_report_config_errors
 
   echo ""
   echo "Get/Set Tests:"
@@ -3269,6 +3566,7 @@ main() {
   run_test "validate_passes_with_init" test_validate_passes_with_init
   run_test "validate_fails_missing_dir" test_validate_fails_missing_dir
   run_test "validate_checks_schema_version" test_validate_checks_schema_version
+  run_test "validate_rejects_unrepresentable_values" test_validate_rejects_unrepresentable_values
   run_test "platform_contract_exact_pairs" test_platform_contract_exact_pairs
   run_test "platform_contract_matches_json_schemas" test_platform_contract_matches_json_schemas
   run_test "additional_artifact_declarations_normalize" test_additional_artifact_declarations_normalize

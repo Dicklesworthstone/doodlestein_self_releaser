@@ -733,76 +733,107 @@ EOF
 # Load configuration with precedence: CLI > ENV > config > defaults
 # Usage: config_load
 config_load() {
-    # Reset config
-    DSR_CONFIG=()
+    local key
+    local -A _config_pending=()
+    _DSR_CONFIG_LOAD_ERROR=""
 
-    # 1. Load defaults
-    DSR_CONFIG[threshold_seconds]=600
-    DSR_CONFIG[log_level]="info"
-    DSR_CONFIG[signing_enabled]="true"
-    DSR_CONFIG[signing_tool]="minisign"
-    DSR_CONFIG[schema_version]="$DSR_SCHEMA_VERSION"
+    # Resolve into a private map. Failed parsing must not replace the caller's
+    # last valid settings with defaults or a partially decoded document.
+    _config_pending[threshold_seconds]=600
+    _config_pending[log_level]="info"
+    _config_pending[signing_enabled]="true"
+    _config_pending[signing_tool]="minisign"
+    _config_pending[schema_version]="$DSR_SCHEMA_VERSION"
 
-    # 2. Load from config file (if exists)
-    if [[ -f "$DSR_CONFIG_FILE" ]]; then
-        _config_load_yaml "$DSR_CONFIG_FILE"
+    if [[ -e "$DSR_CONFIG_FILE" || -L "$DSR_CONFIG_FILE" ]]; then
+        if [[ ! -f "$DSR_CONFIG_FILE" || ! -r "$DSR_CONFIG_FILE" ]]; then
+            _config_load_error "Configuration is not a readable regular file: $DSR_CONFIG_FILE"
+            return 4
+        fi
+        # Retain default-only loading for an absent or zero-byte file. Explicit
+        # validation still requires a physical document with its own schema.
+        if [[ -s "$DSR_CONFIG_FILE" ]]; then
+            _config_load_yaml "$DSR_CONFIG_FILE" || return $?
+        fi
     fi
 
-    # 3. Override with environment variables (DSR_*)
-    [[ -n "${DSR_THRESHOLD:-}" ]] && DSR_CONFIG[threshold_seconds]="$DSR_THRESHOLD"
-    [[ -n "${DSR_LOG_LEVEL:-}" ]] && DSR_CONFIG[log_level]="$DSR_LOG_LEVEL"
-    [[ -n "${DSR_NO_SIGN:-}" ]] && DSR_CONFIG[signing_enabled]="false"
-    [[ -n "${DSR_MINISIGN_KEY:-}" ]] && DSR_CONFIG[signing_key_path]="$DSR_MINISIGN_KEY"
+    [[ -n "${DSR_THRESHOLD:-}" ]] && _config_pending[threshold_seconds]="$DSR_THRESHOLD"
+    [[ -n "${DSR_LOG_LEVEL:-}" ]] && _config_pending[log_level]="$DSR_LOG_LEVEL"
+    if [[ "${DSR_NO_SIGN:-}" == 1 || "${DSR_NO_SIGN:-}" == true ]]; then
+        _config_pending[signing_enabled]="false"
+    fi
+    [[ -n "${DSR_MINISIGN_KEY:-}" ]] && _config_pending[signing_key_path]="$DSR_MINISIGN_KEY"
+
+    DSR_CONFIG=()
+    for key in "${!_config_pending[@]}"; do
+        DSR_CONFIG["$key"]="${_config_pending[$key]}"
+    done
 
     return 0
 }
 
-# Internal: Load YAML config file into DSR_CONFIG
-# This is a simplified loader - for complex YAML, use yq
-_config_load_yaml() {
-    local file="$1"
+_config_load_error() {
+    _DSR_CONFIG_LOAD_ERROR="${_DSR_CONFIG_LOAD_ERROR:+$_DSR_CONFIG_LOAD_ERROR; }$*"
+    _cfg_log_error "$*"
+}
 
-    if ! command -v yq &>/dev/null; then
-        # Fallback: simple key: value parsing (top-level only)
-        # NOTE: This does NOT handle nested structures, lists, or multi-line values
-        local line key value
-        while IFS= read -r line || [[ -n "$line" ]]; do
-            # Skip empty lines
-            [[ -z "$line" ]] && continue
-            # Skip comments
-            [[ "$line" =~ ^[[:space:]]*# ]] && continue
-            # Skip indented lines (nested keys, list items)
-            [[ "$line" =~ ^[[:space:]] ]] && continue
-            # Skip list items at root level (shouldn't happen in well-formed YAML)
-            [[ "$line" =~ ^- ]] && continue
-            # Match "key: value" pattern - must have colon followed by space or end
-            if [[ "$line" =~ ^([a-zA-Z_][a-zA-Z0-9_]*):\ *(.*)$ ]]; then
-                key="${BASH_REMATCH[1]}"
-                value="${BASH_REMATCH[2]}"
-                # Remove quotes from value
-                value="${value#\"}"
-                value="${value%\"}"
-                value="${value#\'}"
-                value="${value%\'}"
-                # Skip if value is empty or starts nested block
-                [[ -z "$value" || "$value" == "{" || "$value" == "[" ]] && continue
-                # Store the value
-                DSR_CONFIG["$key"]="$value"
-            fi
-        done < "$file"
-    else
-        # Use yq for proper YAML parsing
-        local line key value
-        while IFS= read -r line; do
-            # yq props format: key = value (with spaces around =)
-            # Handle keys with dots by taking everything before last " = "
-            if [[ "$line" =~ ^(.+)\ =\ (.*)$ ]]; then
-                key="${BASH_REMATCH[1]}"
-                value="${BASH_REMATCH[2]}"
-                [[ -n "$key" && -n "$value" ]] && DSR_CONFIG["$key"]="$value"
-            fi
-        done < <(yq -o=props "$file" 2>/dev/null | grep -v '^#')
+# Decode one complete document into config_load's private map. A properties
+# file is not a lossless intermediary: it escapes controls and permits the
+# same delimiter inside values. Keep literal strings in JSON until framing.
+_config_load_yaml() {
+    local file="$1" document entries key value complete=false
+    if ! command -v yq >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+        _config_load_error "Reading nonempty configuration requires yq (mikefarah/yq v4) and jq"
+        return 3
     fi
+    if ! document=$(_config_read_single_mapping_json "$file"); then
+        _config_load_error "Cannot load configuration without one valid YAML mapping: $file"
+        return 4
+    fi
+    if ! entries=$(_config_document_entries "$document"); then
+        _config_load_error "Unsupported schema or ambiguous/unrepresentable configuration values: $file"
+        return 4
+    fi
+
+    while IFS= read -r -d '' key; do
+        # Empty keys cannot occur in the checked entries. This marker is
+        # emitted only after successful serialization, never after failure.
+        if [[ -z "$key" ]]; then
+            complete=true
+            break
+        fi
+        if ! IFS= read -r -d '' value; then
+            _config_load_error "Incomplete configuration value stream: $file"
+            return 3
+        fi
+        _config_pending["$key"]="$value"
+    done < <(
+        if printf '%s\n' "$entries" | jq -j '.[] | .key, "\u0000", .value, "\u0000"'; then
+            printf '\0'
+        fi
+    )
+    if ! $complete; then
+        _config_load_error "Configuration decoding did not finish: $file"
+        return 3
+    fi
+}
+
+# Share scalar admission with validation without reparsing YAML. Null/empty
+# legacy versions remain readable for migration; validation requires a version.
+_config_document_entries() {
+    jq -ce --arg schema "$DSR_SCHEMA_VERSION" '
+        if has("schema_version") and
+           (.schema_version != null and .schema_version != "" and .schema_version != $schema)
+        then error("unsupported schema_version") else . end |
+        [paths(type != "object" and type != "array") as $path |
+            {key: ($path | map(tostring) | join(".")),
+             value: (getpath($path) | if type == "string" then . else tostring end)}] |
+        if any(.[]; .key == "" or (.key | contains("\u0000")) or (.value | contains("\u0000")))
+        then error("configuration keys and values must be representable in Bash")
+        elif (map(.key) | unique | length) != length
+        then error("ambiguous dotted configuration paths")
+        else sort_by(.key) end
+    ' <<< "$1"
 }
 
 # Get a config value
@@ -813,9 +844,9 @@ config_get() {
 
     # Use ${var+x} pattern for Bash 4.0+ compatibility (avoids -v operator from 4.3+)
     if [[ -n "${DSR_CONFIG[$key]+x}" ]]; then
-        echo "${DSR_CONFIG[$key]}"
+        printf '%s\n' "${DSR_CONFIG[$key]}"
     else
-        echo "$default"
+        printf '%s\n' "$default"
     fi
 }
 
@@ -933,12 +964,27 @@ config_set() {
 # Returns: 0 if valid, 4 if invalid
 config_validate() {
     local errors=0
+    _DSR_CONFIG_LOAD_ERROR=""
 
-    # Check schema version
-    local schema_version
-    schema_version=$(config_get "schema_version" "")
-    if [[ -z "$schema_version" ]]; then
-        _cfg_log_error "Missing schema_version in config"
+    # Defaults and an earlier successful load are not evidence about the
+    # document currently on disk. Validate its own schema independently.
+    local primary_json=""
+    if [[ ! -f "$DSR_CONFIG_FILE" || ! -r "$DSR_CONFIG_FILE" ]]; then
+        _config_load_error "Configuration file is missing or unreadable: $DSR_CONFIG_FILE"
+        ((errors++))
+    elif ! command -v yq >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+        _config_load_error "yq and jq are required to validate config.yaml"
+        return 3
+    elif ! primary_json=$(_config_read_single_mapping_json "$DSR_CONFIG_FILE"); then
+        _config_load_error "Invalid YAML in config.yaml"
+        ((errors++))
+    elif ! jq -e --arg schema "$DSR_SCHEMA_VERSION" '
+        has("schema_version") and (.schema_version | type == "string") and .schema_version == $schema
+    ' <<< "$primary_json" >/dev/null; then
+        _config_load_error "config.yaml must declare schema_version: $DSR_SCHEMA_VERSION"
+        ((errors++))
+    elif ! _config_document_entries "$primary_json" >/dev/null; then
+        _config_load_error "Ambiguous or unrepresentable configuration values in config.yaml"
         ((errors++))
     fi
 
@@ -1035,37 +1081,36 @@ config_show() {
         fi
     done
 
-    config_load
+    config_load || return $?
+    _config_show_loaded "$key" "$json_mode"
+}
 
-    if $json_mode; then
-        # JSON output
-        echo "{"
-        echo "  \"config_dir\": \"$DSR_CONFIG_DIR\","
-        echo "  \"cache_dir\": \"$DSR_CACHE_DIR\","
-        echo "  \"state_dir\": \"$DSR_STATE_DIR\","
-        echo "  \"config_file\": \"$DSR_CONFIG_FILE\","
-        echo "  \"hosts_file\": \"$DSR_HOSTS_FILE\","
-        echo "  \"repos_file\": \"$DSR_REPOS_FILE\","
-        echo "  \"values\": {"
-
-        local first=true
-        for k in "${!DSR_CONFIG[@]}"; do
-            if [[ -z "$key" || "$k" == "$key" ]]; then
-                $first || echo ","
-                first=false
-                # Escape value for JSON (backslashes, quotes, newlines)
-                local escaped_val="${DSR_CONFIG[$k]}"
-                escaped_val="${escaped_val//\\/\\\\}"
-                escaped_val="${escaped_val//\"/\\\"}"
-                escaped_val="${escaped_val//$'\n'/\\n}"
-                escaped_val="${escaped_val//$'\r'/\\r}"
-                escaped_val="${escaped_val//$'\t'/\\t}"
-                printf '    "%s": "%s"' "$k" "$escaped_val"
-            fi
-        done
-        echo ""
-        echo "  }"
-        echo "}"
+# Format a map whose load already succeeded. The CLI uses this after its own
+# checked load so human output does not parse the same file a second time.
+_config_show_loaded() {
+    local key="${1:-}" json_mode="${2:-false}" k
+    if [[ "$json_mode" == true ]]; then
+        if ! command -v jq >/dev/null 2>&1; then
+            _config_load_error "jq is required for configuration JSON output"
+            return 3
+        fi
+        # Stream values instead of manually escaping JSON or placing a whole
+        # configuration into one exec argument. Both keys and values can
+        # contain quotes, backslashes and trailing newlines.
+        {
+            for k in "${!DSR_CONFIG[@]}"; do
+                if [[ -z "$key" || "$k" == "$key" || "$k" == "$key".* ]]; then
+                    printf '%s\0%s\0' "$k" "${DSR_CONFIG[$k]}"
+                fi
+            done
+        } | jq -Rs --arg config_dir "$DSR_CONFIG_DIR" --arg cache_dir "$DSR_CACHE_DIR" \
+            --arg state_dir "$DSR_STATE_DIR" --arg config_file "$DSR_CONFIG_FILE" \
+            --arg hosts_file "$DSR_HOSTS_FILE" --arg repos_file "$DSR_REPOS_FILE" '
+            split("\u0000") | .[:-1] as $fields |
+            {config_dir:$config_dir, cache_dir:$cache_dir, state_dir:$state_dir,
+             config_file:$config_file, hosts_file:$hosts_file, repos_file:$repos_file,
+             values: ([range(0; ($fields | length); 2) as $i |
+                 {key:$fields[$i], value:$fields[$i+1]}] | sort_by(.key) | from_entries)}'
     else
         # Human-readable output
         echo "dsr Configuration"
@@ -2352,6 +2397,8 @@ export -f _config_init_error _config_init_path _config_init_stat _config_init_ap
 export -f _config_init_original_unchanged _config_init_candidate_unchanged
 export -f _config_init_rollback _config_init_cleanup _config_init_render_default
 export -f _config_persist_value _config_value_render _config_read_single_mapping_json
+export -f _config_load_error _config_load_yaml _config_show_loaded
+export -f _config_document_entries
 export -f _cfg_log_info _cfg_log_ok _cfg_log_warn _cfg_log_error
 export _CFG_RED _CFG_GREEN _CFG_YELLOW _CFG_BLUE _CFG_NC
 export -f config_get_host config_get_tool config_list_hosts config_list_tools
