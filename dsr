@@ -348,19 +348,27 @@ _config_envelope() {
 cmd_config_init() {
     local force=false dry_run="${DRY_RUN:-false}" status=0 path
     local -a init_args=() planned_files=() _DSR_CONFIG_INIT_BACKUP_PATHS=()
+    # These results are populated by the sourced initializer, including when
+    # JSON mode suppresses its human diagnostics.
+    local _DSR_CONFIG_INIT_ERROR="" _DSR_CONFIG_INIT_ROLLED_BACK=false
+    local _DSR_CONFIG_INIT_RECOVERY_REQUIRED=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --force) force=true ;;
             --dry-run|-n) dry_run=true ;;
             *)
                 log_error "Unknown config init option: $1"
+                _DSR_CONFIG_INIT_ERROR="Unknown config init option: $1"
                 status=4
-                break
                 ;;
         esac
         shift
     done
 
+    if $JSON_MODE && ! command -v jq >/dev/null 2>&1; then
+        log_error "jq is required for config init --json"
+        return 3
+    fi
     if [[ $status -eq 0 ]]; then
         $force && init_args+=(--force)
         [[ "$dry_run" != true ]] || init_args+=(--dry-run)
@@ -385,10 +393,15 @@ cmd_config_init() {
         backup_paths=$(jq -nc --args '$ARGS.positional' -- ${_DSR_CONFIG_INIT_BACKUP_PATHS[@]+"${_DSR_CONFIG_INIT_BACKUP_PATHS[@]}"}) || return 3
         details=$(jq -nc --arg dir "$DSR_CONFIG_DIR" --arg file "$DSR_CONFIG_FILE" \
             --argjson initialized "$initialized" --argjson dry_run "$dry_run" --argjson force "$force" \
-            --argjson backup_paths "$backup_paths" \
+            --argjson backup_paths "$backup_paths" --arg error "$_DSR_CONFIG_INIT_ERROR" \
+            --argjson rolled_back "$_DSR_CONFIG_INIT_ROLLED_BACK" \
+            --argjson recovery_required "$_DSR_CONFIG_INIT_RECOVERY_REQUIRED" \
             --args '{action: "init", config_dir: $dir, config_file: $file, initialized: $initialized,
                      dry_run: $dry_run, force: $force, planned_files: $ARGS.positional,
-                     backup_paths: $backup_paths}' -- ${planned_files[@]+"${planned_files[@]}"}) || return 3
+                     backup_paths: $backup_paths, rolled_back: $rolled_back,
+                     recovery_required: $recovery_required,
+                     errors: (if $error == "" then [] else [{code: "E032", message: $error}] end)}' \
+            -- ${planned_files[@]+"${planned_files[@]}"}) || return 3
         _config_envelope "$status" "$details" || return 3
     fi
     return "$status"
@@ -18261,6 +18274,10 @@ _docker_command() {
 # ============================================================================
 
 main() {
+    # Do not let argument errors append to an inherited file before we know
+    # this invocation's write policy. Restore it only for a writable command.
+    local requested_log_file="${LOG_FILE:-}"
+    local LOG_FILE=""
     # shellcheck disable=SC2034  # DRY_RUN/NON_INTERACTIVE reserved for future use
     # Parse global options
     while [[ $# -gt 0 ]]; do
@@ -18291,13 +18308,17 @@ main() {
                 ;;
             --state-dir|--cache-dir|--config|-c|--log-level)
                 # Applied by _dsr_prescan_global_flags; require the value here.
-                if [[ $# -lt 2 || -z "$2" ]]; then
+                if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
                     log_error "Global option $1 requires a value"
                     exit 4
                 fi
                 shift 2
                 ;;
             --state-dir=*|--cache-dir=*|--config=*|--log-level=*)
+                if [[ -z "${1#*=}" ]]; then
+                    log_error "Global option ${1%%=*} requires a value"
+                    exit 4
+                fi
                 shift
                 ;;
             --help|-h)
@@ -18387,13 +18408,14 @@ main() {
     done
     # Snapshot retirement preserves ordinary logs too. Startup rotation would
     # otherwise compress/delete them before the snapshots-only handler runs.
-    if $dry_run_requested; then
-        # A supplied DSR_LOG_FILE also enables writes without log_init.
-        # Dynamic scope keeps handler diagnostics and session completion on
-        # stderr for this invocation, without changing a sourcing caller.
-        local LOG_FILE=""
-    elif ! $snapshot_prune_requested; then
-        log_init
+    # Configuration initialization owns its entire write sequence. Inherited
+    # logging could alias a configuration file, modifying it before backup or
+    # after publication (even in --quiet mode via session completion).
+    if ! $dry_run_requested && [[ "$command" != config || "${1:-}" != init ]]; then
+        LOG_FILE="$requested_log_file"
+        if ! $snapshot_prune_requested; then
+            log_init
+        fi
     fi
 
     # Load modules needed for command execution

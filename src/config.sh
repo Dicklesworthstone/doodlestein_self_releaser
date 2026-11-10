@@ -227,55 +227,333 @@ _cfg_log_ok()    { echo "${_CFG_GREEN}[config]${_CFG_NC} $*" >&2; }
 _cfg_log_warn()  { echo "${_CFG_YELLOW}[config]${_CFG_NC} $*" >&2; }
 _cfg_log_error() { echo "${_CFG_RED}[config]${_CFG_NC} $*" >&2; }
 
-# Initialize config directories and default files
+# Keep errors available to the JSON caller without redirecting diagnostics to
+# a temporary file (in particular, during a preview).
+_config_init_error() {
+    _DSR_CONFIG_INIT_ERROR="${_DSR_CONFIG_INIT_ERROR:+$_DSR_CONFIG_INIT_ERROR; }$*"
+    _cfg_log_error "$*"
+}
+
+# Resolve existing parent symlinks, including for a not-yet-created tree,
+# without mkdir or realpath -m (which is unavailable on macOS). Unresolvable
+# '..' components are refused rather than giving a preview a different path.
+_config_init_path() {
+    local path="$1" parent leaf suffix="" part resolved
+    [[ -n "$path" && "$path" != */ && "$path" != *$'\n'* && "$path" != *$'\r'* ]] || return 4
+    leaf=$(basename -- "$path") || return 4
+    [[ "$leaf" != . && "$leaf" != .. ]] || return 4
+    parent=$(dirname -- "$path") || return 4
+    while [[ ! -d "$parent" ]]; do
+        [[ ! -e "$parent" && ! -L "$parent" ]] || return 4
+        part=$(basename -- "$parent") || return 4
+        [[ "$part" != .. && "$part" != / ]] || return 4
+        [[ "$part" == . ]] || suffix="/$part$suffix"
+        parent=$(dirname -- "$parent") || return 4
+    done
+    resolved=$(CDPATH='' cd -P -- "$parent" && pwd -P) || return 4
+    printf '%s%s/%s\n' "${resolved%/}" "$suffix" "$leaf"
+}
+
+_config_init_stat() {
+    stat -c '%d:%i:%u:%g:%a' -- "$1" 2>/dev/null || stat -f '%d:%i:%u:%g:%Lp' "$1"
+}
+
+# The helpers below use config_init's dynamically scoped transaction arrays.
+# All default bytes and all original backups exist before the first publish.
+_config_init_apply() {
+    local index prior path lock stage backup stamp metadata mode generation=""
+    stamp=$(date -u +%Y%m%dT%H%M%SZ) || { _config_init_error "Could not timestamp configuration backups"; return 1; }
+    for ((index = 0; index < 3; index++)); do
+        path="${canonical_paths[index]}"
+        lock="$path.init.lock"
+        # Even an otherwise no-op init must not declare a killed reset's
+        # mixed configuration initialized while its recovery evidence remains.
+        if ! ${init_selected[index]}; then
+            if [[ -e "$lock" || -L "$lock" ]]; then
+                _config_init_error "Cannot acquire $lock; another initialization or an interrupted operation must be inspected first"
+                return 2
+            fi
+            continue
+        fi
+        if ! (umask 077; mkdir -- "$lock"); then
+            if [[ -e "$lock" || -L "$lock" ]]; then
+                _config_init_error "Cannot acquire $lock; another initialization or an interrupted operation must be inspected first"
+                return 2
+            fi
+            _config_init_error "Could not create initialization lock $lock; check directory permissions and free space"
+            return 1
+        fi
+        init_locks[index]="$lock"
+        if ! printf '%s\n' "${BASHPID:-$$}" > "$lock/owner" ||
+           ! init_stages[index]=$(mktemp -d "$lock/stage.XXXXXXXX"); then
+            _config_init_error "Could not prepare private staging for $path"
+            return 1
+        fi
+        [[ -n "$generation" ]] || generation="${init_stages[index]##*/}"
+    done
+
+    for ((index = 0; index < 3; index++)); do
+        ${init_selected[index]} || continue
+        path="${canonical_paths[index]}"
+        stage="${init_stages[index]}"
+        if [[ -L "$path" || ( -e "$path" && ! -f "$path" ) ]]; then
+            _config_init_error "Configuration destination changed before backup: $path"
+            return 4
+        fi
+        for ((prior = 0; prior < index; prior++)); do
+            if [[ "$path" -ef "${canonical_paths[prior]}" ]]; then
+                _config_init_error "Configuration destinations now alias one another: $path"
+                return 4
+            fi
+        done
+        [[ -f "$path" ]] || continue
+        if ! $force; then
+            _config_init_error "Configuration appeared during initialization: $path"
+            return 2
+        fi
+        if ! init_before[index]=$(_config_init_stat "$path") ||
+           ! cp -p -- "$path" "$stage/original" || ! cmp -s "$path" "$stage/original" ||
+           [[ "${init_before[index]}" != "$(_config_init_stat "$path")" ]]; then
+            _config_init_error "Could not preserve a stable original for $path; configuration not replaced"
+            return 1
+        fi
+        metadata=$(_config_init_stat "$stage/original") || {
+            _config_init_error "Could not inspect preserved metadata for $path"
+            return 1
+        }
+        if [[ "${metadata#*:*:}" != "${init_before[index]#*:*:}" ]]; then
+            _config_init_error "Could not preserve ownership and permissions for $path"
+            return 1
+        fi
+        # Publish only a complete, verified backup. An exclusive hardlink
+        # cannot truncate an older generation or expose an empty reservation.
+        # One suffix identifies the complete original set, even if a process
+        # dies during cleanup after some per-file leases have been removed.
+        backup="$path.bak.$stamp.$generation"
+        if [[ -e "$backup" || -L "$backup" ]] || ! ln -- "$stage/original" "$backup" ||
+           [[ -L "$backup" || ! -f "$backup" || ! "$backup" -ef "$stage/original" ]]; then
+            _config_init_error "Could not publish original backup $backup; configuration not replaced"
+            return 1
+        fi
+        backups[index]="$backup"
+        _DSR_CONFIG_INIT_BACKUP_PATHS+=("$backup")
+        _cfg_log_info "Preserved $path in $backup"
+        # JSON is printed only on return. Retain the exact generation in the
+        # lease too, so a killed JSON invocation remains recoverable.
+        if ! printf '%s\n' "$backup" > "$stage/backup-path"; then
+            _config_init_error "Could not record recovery path for $path; original retained in $backup"
+            return 1
+        fi
+    done
+
+    for ((index = 0; index < 3; index++)); do
+        ${init_selected[index]} || continue
+        path="${canonical_paths[index]}"
+        stage="${init_stages[index]}"
+        mode=600
+        if [[ -n "${backups[index]}" ]]; then
+            mode="${init_before[index]##*:}"
+            # Copy metadata, but make the private candidate writable while
+            # rendering even when the original is read-only (e.g. mode 0400).
+            if ! cp -p -- "${backups[index]}" "$stage/new" || ! chmod 600 "$stage/new"; then
+                _config_init_error "Could not prepare replacement for $path"
+                return 1
+            fi
+        elif ! (umask 077; : > "$stage/new"); then
+            _config_init_error "Could not stage new configuration $path"
+            return 1
+        fi
+        if ! _config_init_render_default "$index" > "$stage/new" || ! chmod "$mode" "$stage/new" ||
+           ! cp -p -- "$stage/new" "$stage/expected" ||
+           ! init_candidates[index]=$(_config_init_stat "$stage/new"); then
+            _config_init_error "Could not finish staging $path; live configuration unchanged"
+            return 1
+        fi
+        if [[ -n "${backups[index]}" && "${init_candidates[index]#*:*:}" != "${init_before[index]#*:*:}" ]]; then
+            _config_init_error "Replacement ownership or permissions differ from the original: $path"
+            return 1
+        fi
+    done
+
+    # Recheck the entire set after preparation, then each leaf immediately
+    # before publication. Cooperating initializers hold the same leaf locks.
+    for ((index = 0; index < 3; index++)); do
+        ${init_selected[index]} || continue
+        _config_init_original_unchanged "$index" || return $?
+    done
+    for ((index = 0; index < 3; index++)); do
+        ${init_selected[index]} || continue
+        _config_init_original_unchanged "$index" || return $?
+        path="${canonical_paths[index]}"
+        stage="${init_stages[index]}"
+        # Record intent before mv/ln: an I/O error may be reported after the
+        # filesystem operation succeeded, and that case needs rollback too.
+        init_attempted+=("$index")
+        init_attempted_count=$((init_attempted_count + 1))
+        if [[ -n "${backups[index]}" ]]; then
+            if ! mv -f -- "$stage/new" "$path"; then
+                _config_init_error "Could not replace $path"
+                return 1
+            fi
+        elif ! ln -- "$stage/new" "$path"; then
+            _config_init_error "Could not create $path without overwriting another file"
+            return 1
+        fi
+        if ! _config_init_candidate_unchanged "$index"; then
+            _config_init_error "Published configuration did not match its staged file: $path"
+            return 1
+        fi
+    done
+}
+
+_config_init_original_unchanged() {
+    local index="$1" path="${canonical_paths[$1]}"
+    if [[ -n "${backups[index]}" ]]; then
+        if [[ ! -L "$path" && -f "$path" && "${init_before[index]}" == "$(_config_init_stat "$path")" ]] &&
+           cmp -s "$path" "${backups[index]}"; then
+            return 0
+        fi
+    elif [[ ! -e "$path" && ! -L "$path" ]]; then
+        return 0
+    fi
+    _config_init_error "Configuration changed during initialization: $path"
+    return 2
+}
+
+_config_init_candidate_unchanged() {
+    local index="$1" path="${canonical_paths[$1]}"
+    [[ ! -L "$path" && -f "$path" && "${init_candidates[index]}" == "$(_config_init_stat "$path")" ]] &&
+        cmp -s "$path" "${init_stages[index]}/expected"
+}
+
+_config_init_rollback() {
+    local offset index path stage restored=false failed=false
+    # Keep a separate count for Bash 4.0-4.3 under nounset, where expanding
+    # even the length of an empty array can abort the sourcing shell.
+    for ((offset = init_attempted_count - 1; offset >= 0; offset--)); do
+        index="${init_attempted[offset]}"
+        path="${canonical_paths[index]}"
+        stage="${init_stages[index]}"
+        if ! _config_init_candidate_unchanged "$index"; then
+            # A failed operation that left its original untouched needs no
+            # restore. Any other change belongs to somebody else: retain it.
+            if [[ -n "${backups[index]}" ]]; then
+                if [[ ! -L "$path" && -f "$path" && "${init_before[index]}" == "$(_config_init_stat "$path")" ]] &&
+                   cmp -s "$path" "${backups[index]}"; then
+                    continue
+                fi
+            elif [[ ! -e "$path" && ! -L "$path" ]]; then
+                continue
+            fi
+            _config_init_error "Refusing to roll back a changed destination: $path; inspect its retained backup and $stage"
+            failed=true
+            continue
+        fi
+        if [[ -n "${backups[index]}" ]]; then
+            if ! cp -p -- "${backups[index]}" "$stage/restore" ||
+               ! cmp -s "${backups[index]}" "$stage/restore" ||
+               ! _config_init_candidate_unchanged "$index" ||
+               ! mv -f -- "$stage/restore" "$path" || ! cmp -s "${backups[index]}" "$path"; then
+                _config_init_error "Could not restore $path; original retained in ${backups[index]}"
+                failed=true
+                continue
+            fi
+        elif ! rm -f -- "$path"; then
+            _config_init_error "Could not remove the newly created $path during rollback"
+            failed=true
+            continue
+        fi
+        restored=true
+    done
+    _DSR_CONFIG_INIT_ROLLED_BACK="$restored"
+    _DSR_CONFIG_INIT_RECOVERY_REQUIRED="$failed"
+    ! $failed
+}
+
+_config_init_cleanup() {
+    local index stage lock failed=false
+    for ((index = 0; index < 3; index++)); do
+        lock="${init_locks[index]}"
+        [[ -n "$lock" ]] || continue
+        stage="${init_stages[index]}"
+        if [[ -n "$stage" ]]; then
+            if ! rm -f -- "$stage/new" "$stage/expected" "$stage/original" "$stage/restore" "$stage/backup-path" || ! rmdir -- "$stage"; then
+                _config_init_error "Could not clean private staging $stage; lock retained"
+                failed=true
+                continue
+            fi
+        fi
+        if ! rm -f -- "$lock/owner" || ! rmdir -- "$lock"; then
+            _config_init_error "Could not release initialization lock $lock"
+            failed=true
+        fi
+    done
+    ! $failed
+}
+
+# Initialize config directories and default files. No traps are installed in
+# the sourcing shell. Termination can leave a mixed set of complete files,
+# preserved originals and locks; a later run refuses to steal those locks.
 # Usage: config_init [--force] [--dry-run]
 config_init() {
-    local force=false dry_run="${DRY_RUN:-false}"
-    local path previous backup parent canonical stamp="" index=0 prior=0
+    local force=false dry_run="${DRY_RUN:-false}" status=0 path previous parent index prior init_attempted_count=0
     local -a init_paths=("$DSR_CONFIG_FILE" "$DSR_HOSTS_FILE" "$DSR_REPOS_FILE")
-    local -a backups=("" "" "") canonical_paths=("" "" "")
+    local -a canonical_paths=("" "" "") backups=("" "" "")
+    local -a init_locks=("" "" "") init_stages=("" "" "") init_before=("" "" "")
+    local -a init_candidates=("" "" "") init_selected=(false false false) init_attempted=()
+    local -a init_dirs=("$DSR_CONFIG_DIR" "$DSR_CACHE_DIR" "$DSR_STATE_DIR"
+        "$DSR_STATE_DIR/logs" "$DSR_STATE_DIR/artifacts" "$DSR_STATE_DIR/manifests"
+        "$DSR_CACHE_DIR/act" "$DSR_CACHE_DIR/builds")
     _DSR_CONFIG_INIT_BACKUP_PATHS=()
+    _DSR_CONFIG_INIT_ERROR=""
+    _DSR_CONFIG_INIT_ROLLED_BACK=false
+    _DSR_CONFIG_INIT_RECOVERY_REQUIRED=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --force) force=true ;;
             --dry-run|-n) dry_run=true ;;
-            *)
-                _cfg_log_error "Unknown config init option: $1"
-                return 4
-                ;;
+            *) _config_init_error "Unknown config init option: $1"; return 4 ;;
         esac
         shift
     done
 
-    # A forced reset may replace regular files only. Validate the complete
-    # destination set before touching any configuration, including aliases.
+    # Preflight the complete destination set, including missing parent aliases,
+    # before any directory creation. A normal init keeps existing regular files.
     for ((index = 0; index < 3; index++)); do
         path="${init_paths[index]}"
-        if ! $force && [[ -f "$path" ]]; then
-            continue
-        fi
-        if [[ -L "$path" || ( -e "$path" && ! -f "$path" ) ]]; then
-            _cfg_log_error "Configuration destination is not a regular file: $path"
+        if ! canonical_paths[index]=$(_config_init_path "$path"); then
+            _config_init_error "Invalid or unresolvable configuration destination: $path"
             return 4
+        fi
+        parent="${canonical_paths[index]%/*}"
+        init_dirs+=("${parent:-/}")
+        if $force || [[ ! -f "$path" ]]; then
+            init_selected[index]=true
+            if [[ -L "$path" || ( -e "$path" && ! -f "$path" ) ]]; then
+                _config_init_error "Configuration destination is not a regular file: $path"
+                return 4
+            fi
         fi
         for ((prior = 0; prior < index; prior++)); do
             previous="${init_paths[prior]}"
-            if [[ "$path" == "$previous" || "$path" -ef "$previous" ]]; then
-                _cfg_log_error "Configuration destinations alias one another: $path and $previous"
+            if [[ "${canonical_paths[index]}" == "${canonical_paths[prior]}" || "$path" -ef "$previous" ]]; then
+                _config_init_error "Configuration destinations alias one another: $path and $previous"
                 return 4
             fi
         done
     done
+    for path in "${init_dirs[@]}"; do
+        if [[ ( -e "$path" || -L "$path" ) && ! -d "$path" ]]; then
+            _config_init_error "Configuration, cache or state directory is not a directory: $path"
+            return 1
+        fi
+    done
 
-    # Planning must return before mkdir, backups, or any file redirection.
-    # Honor DRY_RUN here too, including callers that source this module.
     if [[ "$dry_run" == true ]]; then
-        for path in "$DSR_CONFIG_DIR" "$DSR_CACHE_DIR" "$DSR_STATE_DIR" \
-            "$DSR_STATE_DIR/logs" "$DSR_STATE_DIR/artifacts" "$DSR_STATE_DIR/manifests" \
-            "$DSR_CACHE_DIR/act" "$DSR_CACHE_DIR/builds"; do
+        for path in "${init_dirs[@]}"; do
             [[ -d "$path" ]] || _cfg_log_info "[dry-run] Would create directory: $path"
         done
-        for path in "$DSR_CONFIG_FILE" "$DSR_HOSTS_FILE" "$DSR_REPOS_FILE"; do
+        for path in "${init_paths[@]}"; do
             if [[ -f "$path" ]]; then
                 if $force; then
                     _cfg_log_info "[dry-run] Would back up and replace: $path"
@@ -291,75 +569,32 @@ config_init() {
     fi
 
     _cfg_log_info "Initializing dsr configuration..."
-
-    if ! mkdir -p "$DSR_CONFIG_DIR" "$DSR_CACHE_DIR" "$DSR_STATE_DIR" \
-        "$DSR_STATE_DIR/logs" "$DSR_STATE_DIR/artifacts" "$DSR_STATE_DIR/manifests" \
-        "$DSR_CACHE_DIR/act" "$DSR_CACHE_DIR/builds"; then
-        _cfg_log_error "Could not create configuration, cache or state directories"
+    if ! (umask 077; mkdir -p -- "${init_dirs[@]}"); then
+        _config_init_error "Could not create configuration, cache or state directories"
         return 1
     fi
-
-    # Once the directories exist, resolve parent aliases too. Even two absent
-    # leaves must not become different configuration kinds at the same path.
-    for ((index = 0; index < 3; index++)); do
-        path="${init_paths[index]}"
-        if ! parent=$(CDPATH='' cd -P -- "$(dirname "$path")" && pwd -P); then
-            _cfg_log_error "Could not resolve configuration parent directory: $path"
-            return 1
-        fi
-        canonical=$(basename "$path") || return 1
-        canonical_paths[index]="$parent/$canonical"
-        for ((prior = 0; prior < index; prior++)); do
-            if [[ "${canonical_paths[index]}" == "${canonical_paths[prior]}" ]]; then
-                _cfg_log_error "Configuration destinations resolve to the same file: $path"
-                return 4
-            fi
-        done
-    done
-
-    # Preserve the entire existing set before replacing even its first file.
-    # Adjacent, uniquely allocated backups retain their original permissions
-    # and remain available after a later copy, write, or process failure.
-    if $force; then
-        stamp=$(date -u +%Y%m%dT%H%M%SZ) || return 1
-        for ((index = 0; index < 3; index++)); do
-            path="${init_paths[index]}"
-            if [[ -L "$path" || ( -e "$path" && ! -f "$path" ) ]]; then
-                _cfg_log_error "Configuration destination changed before backup: $path"
-                return 4
-            fi
-            [[ -f "$path" ]] || continue
-            if ! backup=$(mktemp "$path.bak.$stamp.XXXXXXXX"); then
-                _cfg_log_error "Could not allocate backup for $path; configuration not replaced"
-                return 1
-            fi
-            if ! cp -p "$path" "$backup" || ! cmp -s "$path" "$backup"; then
-                _cfg_log_error "Could not preserve $path in $backup; configuration not replaced"
-                return 1
-            fi
-            backups[index]="$backup"
-            _DSR_CONFIG_INIT_BACKUP_PATHS+=("$backup")
-            _cfg_log_info "Preserved $path in $backup"
-        done
-        # Refuse a changed or newly appeared destination before any reset.
-        for ((index = 0; index < 3; index++)); do
-            path="${init_paths[index]}"
-            backup="${backups[index]}"
-            if [[ -n "$backup" ]]; then
-                if [[ -L "$path" || ! -f "$path" ]] || ! cmp -s "$path" "$backup"; then
-                    _cfg_log_error "Configuration changed during backup: $path; configuration not replaced"
-                    return 4
-                fi
-            elif [[ -e "$path" || -L "$path" ]]; then
-                _cfg_log_error "Configuration appeared during backup: $path; configuration not replaced"
-                return 4
-            fi
-        done
+    _config_init_apply || status=$?
+    if [[ $status -ne 0 ]]; then
+        _config_init_rollback || true
     fi
+    if ! $_DSR_CONFIG_INIT_RECOVERY_REQUIRED; then
+        if ! _config_init_cleanup; then
+            _DSR_CONFIG_INIT_RECOVERY_REQUIRED=true
+            [[ $status -ne 0 ]] || status=1
+        fi
+    fi
+    [[ $status -eq 0 ]] || return "$status"
+    for ((index = 0; index < 3; index++)); do
+        ${init_selected[index]} && _cfg_log_ok "Created ${init_paths[index]}"
+    done
+    _cfg_log_ok "Configuration initialized in $DSR_CONFIG_DIR"
+    return 0
+}
 
-    # Create default config.yaml if not exists or force
-    if [[ ! -f "$DSR_CONFIG_FILE" ]] || $force; then
-        if ! cat > "$DSR_CONFIG_FILE" << 'EOF'
+# Templates write only to the caller's private candidate, never a live path.
+_config_init_render_default() {
+    case "$1" in
+        0) cat << 'EOF'
 # dsr configuration
 # See docs/CLI_CONTRACT.md for full specification
 
@@ -388,16 +623,8 @@ log_level: info
 #   slack_webhook: ""
 #   discord_webhook: ""
 EOF
-        then
-            _cfg_log_error "Could not write $DSR_CONFIG_FILE; any forced-reset originals remain in the reported backups"
-            return 1
-        fi
-        _cfg_log_ok "Created $DSR_CONFIG_FILE"
-    fi
-
-    # Create default hosts.yaml if not exists or force
-    if [[ ! -f "$DSR_HOSTS_FILE" ]] || $force; then
-        if ! cat > "$DSR_HOSTS_FILE" << 'EOF'
+            ;;
+        1) cat << 'EOF'
 # dsr build hosts configuration
 # Define your build machines here
 
@@ -455,16 +682,8 @@ platform_mapping:
   windows/amd64: wlap
   windows/arm64: wlap
 EOF
-        then
-            _cfg_log_error "Could not write $DSR_HOSTS_FILE; any forced-reset originals remain in the reported backups"
-            return 1
-        fi
-        _cfg_log_ok "Created $DSR_HOSTS_FILE"
-    fi
-
-    # Create default repos.yaml if not exists or force
-    if [[ ! -f "$DSR_REPOS_FILE" ]] || $force; then
-        if ! cat > "$DSR_REPOS_FILE" << 'EOF'
+            ;;
+        2) cat << 'EOF'
 # dsr repository/tool registry
 # Define tools to build and release
 
@@ -495,15 +714,9 @@ schema_version: "1.0.0"
 
 tools: {}
 EOF
-        then
-            _cfg_log_error "Could not write $DSR_REPOS_FILE; any forced-reset originals remain in the reported backups"
-            return 1
-        fi
-        _cfg_log_ok "Created $DSR_REPOS_FILE"
-    fi
-
-    _cfg_log_ok "Configuration initialized in $DSR_CONFIG_DIR"
-    return 0
+            ;;
+        *) return 4 ;;
+    esac
 }
 
 # Load configuration with precedence: CLI > ENV > config > defaults
@@ -2050,6 +2263,11 @@ config_get_host_for_platform() {
 
 # Export functions for use by other scripts
 export -f config_init config_load config_get config_set config_validate config_show
+export -f _config_init_error _config_init_path _config_init_stat _config_init_apply
+export -f _config_init_original_unchanged _config_init_candidate_unchanged
+export -f _config_init_rollback _config_init_cleanup _config_init_render_default
+export -f _cfg_log_info _cfg_log_ok _cfg_log_warn _cfg_log_error
+export _CFG_RED _CFG_GREEN _CFG_YELLOW _CFG_BLUE _CFG_NC
 export -f config_get_host config_get_tool config_list_hosts config_list_tools
 export -f config_get_host_for_platform
 export -f config_get_tool_field config_get_install_script_compat config_get_install_script_path

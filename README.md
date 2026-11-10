@@ -1275,11 +1275,25 @@ dsr repos validate                              # Validate all configs
 Configuration management.
 
 ```bash
+dsr config init --dry-run                       # Preview without changing files
+dsr config init --force --dry-run               # Preview a reset
+dsr config init --force                         # Preserve originals, then reset
 dsr config show                                 # Show current config
 dsr config get threshold_seconds                # Get specific value
 dsr config set threshold_seconds=300            # Set value
 dsr config validate                             # Validate config files
 ```
+
+Initialization keeps existing files unless `--force` is selected. A forced
+reset preserves every original in a unique adjacent `*.bak.*` file before
+publishing any defaults. Default files are staged first and replaced atomically;
+handled publication failures restore unchanged outputs from the backups.
+`--dry-run` and `--json --dry-run` create no files, directories, backups or logs.
+
+If initialization is killed, the preserved originals and `*.init.lock`
+directories remain available for recovery. A later run refuses to steal those
+locks. See the [configuration initialization contract](docs/CLI_CONTRACT.md#dsr-config)
+for JSON recovery fields, backup restoration, and interruption limits.
 
 ### `dsr doctor`
 

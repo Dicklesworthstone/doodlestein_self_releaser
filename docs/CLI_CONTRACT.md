@@ -2469,26 +2469,86 @@ Initialization preserves existing files unless `--force` is selected.
 creating configuration, cache, state, log or backup files or directories. It
 works before the command or after `init`, including with `--force` in either
 order. Unknown initialization options fail with exit 4 before initialization.
+Even an invalid dry-run request leaves an inherited `DSR_LOG_FILE` untouched.
+Initialization also suppresses persistent session logging on real runs: a log
+path that aliases a configuration must not modify it before backup or after
+publication. Human progress remains on stderr; JSON success leaves stderr empty.
 A JSON preview has `details.dry_run: true`, `details.initialized: false` and
 `details.planned_files` listing the selected configuration paths; successful
 real initialization reports `initialized: true`.
 
 A real `init --force` first copies and verifies **all existing configuration
 files** into unique adjacent `FILE.bak.TIMESTAMP.SUFFIX` backups, preserving their
-permissions. The copies are independent files and are never replaced by a later
-reset. Backup failures stop before any configuration file is replaced. Selected
+ownership and permissions. Each backup is published only after its copy has
+completed and been verified; interruption cannot leave an empty backup name
+that looks ready to restore. The copies are independent of the live files and
+are never replaced by a later reset. All backups from one invocation share
+the same timestamp and random suffix, including resets within the same second.
+Backup failures stop before any
+configuration file is replaced. Selected
 symlinks, nonregular files and duplicate file destinations are refused.
-Changed source bytes, unsafe replacement types, or a newly appeared destination
-detected before writing stop the reset. Directory creation and every
-default-file write are checked.
+
+All defaults are rendered into private staging directories on the destination
+filesystems before any live file changes. Replacements preserve original
+ownership and permissions, including read-only modes; new files use mode 0600.
+Existing directories keep their permissions; directories created by the
+initializer use a private umask.
+Publication uses an atomic rename for replacements and an exclusive hardlink
+for new files. A failed write therefore cannot truncate a live file, and an
+unrelated hardlink to the old file keeps its original content. Initialization
+requires hardlink support; unsupported operations fail safely. Changed source bytes,
+unsafe replacement types, or a newly appeared destination stop initialization.
+
+Each selected destination has an exclusive `FILE.init.lock` directory during
+the operation. Other initializers using that destination return exit 2 without
+stealing the lock. Handled failures roll back files still matching the
+initializer's published inode, permissions and expected bytes. Rollback leaves
+every verified original backup available. If another process has edited a
+published file, rollback preserves that newer edit and retains the lock and
+staging for inspection. No signal traps replace a sourcing caller's traps.
 
 The JSON result includes `details.backup_paths` for successfully preserved
 originals, including if a later operation fails. A preview creates no backups
 and returns an empty array. A failure returns nonzero with
-`details.initialized: false`; human output identifies the retained copies.
-The three files are not updated as one transaction: a later write failure or
-interruption can leave a partial reset. Keep the reported backups to restore
-the prior configuration; this command does not automatically roll it back.
+`details.initialized: false` and an explanation in `details.errors`.
+`details.rolled_back` records whether any published files were restored or
+removed, and `details.recovery_required` identifies an incomplete rollback or
+cleanup. Human output identifies the retained copies and recovery paths.
+
+The three files are not a single atomic transaction. A killed process can leave
+a mix of complete old and new files, all original backups, and its locks. A
+later initialization refuses those locks, even with `--force`. Inspect the
+`owner` PID inside each lock and establish that the initializer has stopped
+before recovery. Select the reported backup generation explicitly; do not use
+an arbitrary first match from a backup glob. While its stage is retained, the
+lock's private `stage.*/backup-path` file identifies its exact backup even if a
+killed JSON invocation never emitted a result. Cleanup starts after all files
+are published; if interruption removes some markers, the shared backup suffix
+still identifies the original set. To restore one file, copy its
+backup to a private sibling and atomically replace the active file:
+
+```bash
+file="$HOME/.config/dsr/hosts.yaml"
+backup="$file.bak.<timestamp>.<suffix>"  # exact preserved path from this run
+restore=$(mktemp "$file.restore.XXXXXXXX") &&
+    cp -p -- "$backup" "$restore" &&
+    cmp -s "$backup" "$restore" &&
+    mv -f -- "$restore" "$file"
+```
+
+Restore each affected file, retaining the backup copies. Preserve each stopped
+operation's `FILE.init.lock` under a different, unused name before retrying
+(for example, `FILE.init.interrupted.<incident-id>`). This keeps the staged
+evidence for inspection while releasing the original lock name. Never move an
+active initializer's lock. A handled failure that fully rolls back and cleans
+up can be retried immediately.
+
+These are local filesystem and process-interruption guarantees. They do not
+promise power-loss durability, an atomic view of all three files to readers,
+or protection against noncooperating processes replacing parent directories
+or racing namespace operations. Avoid concurrent manual configuration edits
+during initialization. Native platform qualification is recorded separately
+from the portable implementation contract.
 
 **migrate subcommand:**
 - Detects config schema version

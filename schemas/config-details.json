@@ -92,6 +92,14 @@
         "type": "string"
       },
       "description": "Verified original-file backups retained by a real forced initialization, including after a later failure"
+    },
+    "rolled_back": {
+      "type": "boolean",
+      "description": "Whether a failed initialization restored or removed any files it published; also check recovery_required"
+    },
+    "recovery_required": {
+      "type": "boolean",
+      "description": "Whether a failed initialization retained its locks and staging because rollback or cleanup could not finish safely"
     }
   },
   "$defs": {
