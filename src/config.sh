@@ -231,7 +231,10 @@ _cfg_log_error() { echo "${_CFG_RED}[config]${_CFG_NC} $*" >&2; }
 # Usage: config_init [--force] [--dry-run]
 config_init() {
     local force=false dry_run="${DRY_RUN:-false}"
-    local path
+    local path previous backup parent canonical stamp="" index=0 prior=0
+    local -a init_paths=("$DSR_CONFIG_FILE" "$DSR_HOSTS_FILE" "$DSR_REPOS_FILE")
+    local -a backups=("" "" "") canonical_paths=("" "" "")
+    _DSR_CONFIG_INIT_BACKUP_PATHS=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --force) force=true ;;
@@ -242,6 +245,26 @@ config_init() {
                 ;;
         esac
         shift
+    done
+
+    # A forced reset may replace regular files only. Validate the complete
+    # destination set before touching any configuration, including aliases.
+    for ((index = 0; index < 3; index++)); do
+        path="${init_paths[index]}"
+        if ! $force && [[ -f "$path" ]]; then
+            continue
+        fi
+        if [[ -L "$path" || ( -e "$path" && ! -f "$path" ) ]]; then
+            _cfg_log_error "Configuration destination is not a regular file: $path"
+            return 4
+        fi
+        for ((prior = 0; prior < index; prior++)); do
+            previous="${init_paths[prior]}"
+            if [[ "$path" == "$previous" || "$path" -ef "$previous" ]]; then
+                _cfg_log_error "Configuration destinations alias one another: $path and $previous"
+                return 4
+            fi
+        done
     done
 
     # Planning must return before mkdir, backups, or any file redirection.
@@ -255,7 +278,7 @@ config_init() {
         for path in "$DSR_CONFIG_FILE" "$DSR_HOSTS_FILE" "$DSR_REPOS_FILE"; do
             if [[ -f "$path" ]]; then
                 if $force; then
-                    _cfg_log_info "[dry-run] Would replace: $path"
+                    _cfg_log_info "[dry-run] Would back up and replace: $path"
                 else
                     _cfg_log_info "[dry-run] Would keep: $path"
                 fi
@@ -269,14 +292,74 @@ config_init() {
 
     _cfg_log_info "Initializing dsr configuration..."
 
-    # Create directories
-    mkdir -p "$DSR_CONFIG_DIR" "$DSR_CACHE_DIR" "$DSR_STATE_DIR"
-    mkdir -p "$DSR_STATE_DIR/logs" "$DSR_STATE_DIR/artifacts" "$DSR_STATE_DIR/manifests"
-    mkdir -p "$DSR_CACHE_DIR/act" "$DSR_CACHE_DIR/builds"
+    if ! mkdir -p "$DSR_CONFIG_DIR" "$DSR_CACHE_DIR" "$DSR_STATE_DIR" \
+        "$DSR_STATE_DIR/logs" "$DSR_STATE_DIR/artifacts" "$DSR_STATE_DIR/manifests" \
+        "$DSR_CACHE_DIR/act" "$DSR_CACHE_DIR/builds"; then
+        _cfg_log_error "Could not create configuration, cache or state directories"
+        return 1
+    fi
+
+    # Once the directories exist, resolve parent aliases too. Even two absent
+    # leaves must not become different configuration kinds at the same path.
+    for ((index = 0; index < 3; index++)); do
+        path="${init_paths[index]}"
+        if ! parent=$(CDPATH='' cd -P -- "$(dirname "$path")" && pwd -P); then
+            _cfg_log_error "Could not resolve configuration parent directory: $path"
+            return 1
+        fi
+        canonical=$(basename "$path") || return 1
+        canonical_paths[index]="$parent/$canonical"
+        for ((prior = 0; prior < index; prior++)); do
+            if [[ "${canonical_paths[index]}" == "${canonical_paths[prior]}" ]]; then
+                _cfg_log_error "Configuration destinations resolve to the same file: $path"
+                return 4
+            fi
+        done
+    done
+
+    # Preserve the entire existing set before replacing even its first file.
+    # Adjacent, uniquely allocated backups retain their original permissions
+    # and remain available after a later copy, write, or process failure.
+    if $force; then
+        stamp=$(date -u +%Y%m%dT%H%M%SZ) || return 1
+        for ((index = 0; index < 3; index++)); do
+            path="${init_paths[index]}"
+            if [[ -L "$path" || ( -e "$path" && ! -f "$path" ) ]]; then
+                _cfg_log_error "Configuration destination changed before backup: $path"
+                return 4
+            fi
+            [[ -f "$path" ]] || continue
+            if ! backup=$(mktemp "$path.bak.$stamp.XXXXXXXX"); then
+                _cfg_log_error "Could not allocate backup for $path; configuration not replaced"
+                return 1
+            fi
+            if ! cp -p "$path" "$backup" || ! cmp -s "$path" "$backup"; then
+                _cfg_log_error "Could not preserve $path in $backup; configuration not replaced"
+                return 1
+            fi
+            backups[index]="$backup"
+            _DSR_CONFIG_INIT_BACKUP_PATHS+=("$backup")
+            _cfg_log_info "Preserved $path in $backup"
+        done
+        # Refuse a changed or newly appeared destination before any reset.
+        for ((index = 0; index < 3; index++)); do
+            path="${init_paths[index]}"
+            backup="${backups[index]}"
+            if [[ -n "$backup" ]]; then
+                if [[ -L "$path" || ! -f "$path" ]] || ! cmp -s "$path" "$backup"; then
+                    _cfg_log_error "Configuration changed during backup: $path; configuration not replaced"
+                    return 4
+                fi
+            elif [[ -e "$path" || -L "$path" ]]; then
+                _cfg_log_error "Configuration appeared during backup: $path; configuration not replaced"
+                return 4
+            fi
+        done
+    fi
 
     # Create default config.yaml if not exists or force
     if [[ ! -f "$DSR_CONFIG_FILE" ]] || $force; then
-        cat > "$DSR_CONFIG_FILE" << 'EOF'
+        if ! cat > "$DSR_CONFIG_FILE" << 'EOF'
 # dsr configuration
 # See docs/CLI_CONTRACT.md for full specification
 
@@ -305,12 +388,16 @@ log_level: info
 #   slack_webhook: ""
 #   discord_webhook: ""
 EOF
+        then
+            _cfg_log_error "Could not write $DSR_CONFIG_FILE; any forced-reset originals remain in the reported backups"
+            return 1
+        fi
         _cfg_log_ok "Created $DSR_CONFIG_FILE"
     fi
 
     # Create default hosts.yaml if not exists or force
     if [[ ! -f "$DSR_HOSTS_FILE" ]] || $force; then
-        cat > "$DSR_HOSTS_FILE" << 'EOF'
+        if ! cat > "$DSR_HOSTS_FILE" << 'EOF'
 # dsr build hosts configuration
 # Define your build machines here
 
@@ -368,12 +455,16 @@ platform_mapping:
   windows/amd64: wlap
   windows/arm64: wlap
 EOF
+        then
+            _cfg_log_error "Could not write $DSR_HOSTS_FILE; any forced-reset originals remain in the reported backups"
+            return 1
+        fi
         _cfg_log_ok "Created $DSR_HOSTS_FILE"
     fi
 
     # Create default repos.yaml if not exists or force
     if [[ ! -f "$DSR_REPOS_FILE" ]] || $force; then
-        cat > "$DSR_REPOS_FILE" << 'EOF'
+        if ! cat > "$DSR_REPOS_FILE" << 'EOF'
 # dsr repository/tool registry
 # Define tools to build and release
 
@@ -404,6 +495,10 @@ schema_version: "1.0.0"
 
 tools: {}
 EOF
+        then
+            _cfg_log_error "Could not write $DSR_REPOS_FILE; any forced-reset originals remain in the reported backups"
+            return 1
+        fi
         _cfg_log_ok "Created $DSR_REPOS_FILE"
     fi
 

@@ -314,7 +314,7 @@ SUBCOMMANDS:
 
 OPTIONS:
     --json      Output in JSON format
-    --force     Replace existing files (init only)
+    --force     Back up and replace existing files (init only)
     --dry-run   Show initialization or migration changes without writing
 
 EXAMPLES:
@@ -347,7 +347,7 @@ _config_envelope() {
 
 cmd_config_init() {
     local force=false dry_run="${DRY_RUN:-false}" status=0 path
-    local -a init_args=() planned_files=()
+    local -a init_args=() planned_files=() _DSR_CONFIG_INIT_BACKUP_PATHS=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --force) force=true ;;
@@ -369,7 +369,11 @@ cmd_config_init() {
                 planned_files+=("$path")
             fi
         done
-        config_init ${init_args[@]+"${init_args[@]}"} || status=$?
+        if $JSON_MODE; then
+            config_init ${init_args[@]+"${init_args[@]}"} >/dev/null 2>&1 || status=$?
+        else
+            config_init ${init_args[@]+"${init_args[@]}"} || status=$?
+        fi
     fi
 
     if $JSON_MODE; then
@@ -377,11 +381,14 @@ cmd_config_init() {
         if [[ $status -eq 0 && "$dry_run" != true ]]; then
             initialized=true
         fi
-        local details
+        local details backup_paths
+        backup_paths=$(jq -nc --args '$ARGS.positional' -- ${_DSR_CONFIG_INIT_BACKUP_PATHS[@]+"${_DSR_CONFIG_INIT_BACKUP_PATHS[@]}"}) || return 3
         details=$(jq -nc --arg dir "$DSR_CONFIG_DIR" --arg file "$DSR_CONFIG_FILE" \
             --argjson initialized "$initialized" --argjson dry_run "$dry_run" --argjson force "$force" \
+            --argjson backup_paths "$backup_paths" \
             --args '{action: "init", config_dir: $dir, config_file: $file, initialized: $initialized,
-                     dry_run: $dry_run, force: $force, planned_files: $ARGS.positional}' -- ${planned_files[@]+"${planned_files[@]}"}) || return 3
+                     dry_run: $dry_run, force: $force, planned_files: $ARGS.positional,
+                     backup_paths: $backup_paths}' -- ${planned_files[@]+"${planned_files[@]}"}) || return 3
         _config_envelope "$status" "$details" || return 3
     fi
     return "$status"

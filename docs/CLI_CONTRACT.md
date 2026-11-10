@@ -2473,6 +2473,23 @@ A JSON preview has `details.dry_run: true`, `details.initialized: false` and
 `details.planned_files` listing the selected configuration paths; successful
 real initialization reports `initialized: true`.
 
+A real `init --force` first copies and verifies **all existing configuration
+files** into unique adjacent `FILE.bak.TIMESTAMP.SUFFIX` backups, preserving their
+permissions. The copies are independent files and are never replaced by a later
+reset. Backup failures stop before any configuration file is replaced. Selected
+symlinks, nonregular files and duplicate file destinations are refused.
+Changed source bytes, unsafe replacement types, or a newly appeared destination
+detected before writing stop the reset. Directory creation and every
+default-file write are checked.
+
+The JSON result includes `details.backup_paths` for successfully preserved
+originals, including if a later operation fails. A preview creates no backups
+and returns an empty array. A failure returns nonzero with
+`details.initialized: false`; human output identifies the retained copies.
+The three files are not updated as one transaction: a later write failure or
+interruption can leave a partial reset. Keep the reported backups to restore
+the prior configuration; this command does not automatically roll it back.
+
 **migrate subcommand:**
 - Detects config schema version
 - Applies necessary transformations

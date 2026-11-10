@@ -260,6 +260,7 @@ test_cli_init_dry_run_flag_orders() {
       8) set -- -n config init --force; expected_force=true ;;
     esac
     _config_init_cli --json "$@" || return 1
+    [[ ! -s "$TEMP_DIR/init.stderr" ]] || return 1
     _init_roots_absent || return 1
     jq -es --arg config "$DSR_CONFIG_FILE" --arg hosts "$DSR_HOSTS_FILE" \
       --arg repos "$DSR_REPOS_FILE" --argjson force "$expected_force" '
@@ -335,12 +336,196 @@ test_cli_init_rejects_unknown_plan_arguments() {
 }
 
 test_cli_init_real_run_creates_files() {
-  _config_init_cli --json config init || return 1
+  # Quiet suppresses the existing session-start logger; JSON must also
+  # suppress the initializer's independent informational diagnostics.
+  _config_init_cli --quiet --json config init || return 1
+  [[ ! -s "$TEMP_DIR/init.stderr" ]] || return 1
   [[ -f "$DSR_CONFIG_FILE" && -f "$DSR_HOSTS_FILE" && -f "$DSR_REPOS_FILE" &&
      -d "$DSR_CACHE_DIR" && -d "$DSR_STATE_DIR" ]] || return 1
   jq -e '.command == "config" and .exit_code == 0 and .details.action == "init" and
     .details.initialized == true and .details.dry_run == false and .details.force == false' \
     "$TEMP_DIR/init.stdout" >/dev/null
+}
+
+
+_init_custom_config_files() {
+  mkdir -p "$DSR_CONFIG_DIR" || return 1
+  printf 'schema_version: "1.0.0"\nretained: original-config\n' > "$DSR_CONFIG_FILE" || return 1
+  printf 'hosts: {retained: {ssh_host: original-builder}}\n' > "$DSR_HOSTS_FILE" || return 1
+  printf 'tools: {retained: {repo: example/original}}\n' > "$DSR_REPOS_FILE" || return 1
+  chmod 640 "$DSR_CONFIG_FILE" "$DSR_HOSTS_FILE" "$DSR_REPOS_FILE"
+}
+
+_init_file_mode() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+
+test_init_force_preserves_complete_backup_generations() {
+  _init_custom_config_files || return 1
+  local index
+  local -a paths=("$DSR_CONFIG_FILE" "$DSR_HOSTS_FILE" "$DSR_REPOS_FILE")
+  local -a first_backups=()
+  for ((index = 0; index < 3; index++)); do
+    cp -p "${paths[index]}" "$TEMP_DIR/original.$index" || return 1
+  done
+  config_init --force || return 1
+  [[ ${#_DSR_CONFIG_INIT_BACKUP_PATHS[@]} -eq 3 ]] || return 1
+  first_backups=("${_DSR_CONFIG_INIT_BACKUP_PATHS[@]}")
+  for ((index = 0; index < 3; index++)); do
+    cmp -s "$TEMP_DIR/original.$index" "${first_backups[index]}" || return 1
+    [[ ! "${paths[index]}" -ef "${first_backups[index]}" &&
+       "$(_init_file_mode "${first_backups[index]}")" == 640 ]] || return 1
+    grep -q '^schema_version:' "${paths[index]}" || return 1
+    cp -p "${paths[index]}" "$TEMP_DIR/default.$index" || return 1
+  done
+  config_init --force || return 1
+  [[ ${#_DSR_CONFIG_INIT_BACKUP_PATHS[@]} -eq 3 ]] || return 1
+  for ((index = 0; index < 3; index++)); do
+    [[ "${_DSR_CONFIG_INIT_BACKUP_PATHS[index]}" != "${first_backups[index]}" ]] || return 1
+    cmp -s "$TEMP_DIR/original.$index" "${first_backups[index]}" || return 1
+    cmp -s "$TEMP_DIR/default.$index" "${_DSR_CONFIG_INIT_BACKUP_PATHS[index]}" || return 1
+  done
+}
+
+# Explicit copy-failure injection: the first original is really copied, while
+# the second fails. None of the live configuration files may be replaced.
+test_init_force_backup_failure_preserves_originals() (
+  _init_custom_config_files || return 1
+  local before status=0
+  before=$(cksum "$DSR_CONFIG_FILE" "$DSR_HOSTS_FILE" "$DSR_REPOS_FILE") || return 1
+  cp() {
+    local arg
+    for arg in "$@"; do
+      [[ "$arg" != "$DSR_HOSTS_FILE" ]] || return 1
+    done
+    command cp "$@"
+  }
+  config_init --force > "$TEMP_DIR/reset.stdout" 2> "$TEMP_DIR/reset.stderr" || status=$?
+  [[ "$status" == 1 &&
+     "$before" == "$(cksum "$DSR_CONFIG_FILE" "$DSR_HOSTS_FILE" "$DSR_REPOS_FILE")" &&
+     ${#_DSR_CONFIG_INIT_BACKUP_PATHS[@]} -eq 1 ]] || return 1
+  cmp -s "$DSR_CONFIG_FILE" "${_DSR_CONFIG_INIT_BACKUP_PATHS[0]}" || return 1
+  ! grep -q 'Configuration initialized' "$TEMP_DIR/reset.stderr"
+)
+
+test_init_directory_failure_propagates() {
+  mkdir -p "$(dirname "$DSR_CACHE_DIR")" || return 1
+  printf 'this is a file, not a cache directory\n' > "$DSR_CACHE_DIR" || return 1
+  local status=0
+  config_init > "$TEMP_DIR/reset.stdout" 2> "$TEMP_DIR/reset.stderr" || status=$?
+  [[ "$status" == 1 && ! -e "$DSR_CONFIG_FILE" &&
+     ! -e "$DSR_HOSTS_FILE" && ! -e "$DSR_REPOS_FILE" ]] || return 1
+  ! grep -q 'Configuration initialized' "$TEMP_DIR/reset.stderr"
+}
+
+# Explicit second-write failure injection. A partial reset must report failure,
+# and every prior file must remain recoverable from its independently copied backup.
+test_init_write_failure_retains_all_backups() (
+  _init_custom_config_files || return 1
+  local index status=0 writes=0
+  local -a paths=("$DSR_CONFIG_FILE" "$DSR_HOSTS_FILE" "$DSR_REPOS_FILE")
+  for ((index = 0; index < 3; index++)); do
+    cp -p "${paths[index]}" "$TEMP_DIR/original.$index" || return 1
+  done
+  cat() {
+    writes=$((writes + 1))
+    [[ $writes -ne 2 ]] || return 1
+    command cat "$@"
+  }
+  config_init --force > "$TEMP_DIR/reset.stdout" 2> "$TEMP_DIR/reset.stderr" || status=$?
+  [[ "$status" == 1 && ${#_DSR_CONFIG_INIT_BACKUP_PATHS[@]} -eq 3 ]] || return 1
+  for ((index = 0; index < 3; index++)); do
+    cmp -s "$TEMP_DIR/original.$index" "${_DSR_CONFIG_INIT_BACKUP_PATHS[index]}" || return 1
+  done
+  ! grep -q 'Configuration initialized' "$TEMP_DIR/reset.stderr" || return 1
+  ! grep -Fq "Created $DSR_HOSTS_FILE" "$TEMP_DIR/reset.stderr"
+)
+
+test_init_force_refuses_unsafe_or_aliased_destinations() {
+  local kind root before referent_before status
+  for kind in symlink dangling fifo directory duplicate hardlink; do
+    root="$TEMP_DIR/$kind"
+    DSR_CONFIG_DIR="$root/config"
+    DSR_CACHE_DIR="$root/cache"
+    DSR_STATE_DIR="$root/state"
+    DSR_CONFIG_FILE="$DSR_CONFIG_DIR/config.yaml"
+    DSR_HOSTS_FILE="$DSR_CONFIG_DIR/hosts.yaml"
+    DSR_REPOS_FILE="$DSR_CONFIG_DIR/repos.yaml"
+    mkdir -p "$DSR_CONFIG_DIR" || return 1
+    printf 'retained config\n' > "$DSR_CONFIG_FILE" || return 1
+    printf 'retained repos\n' > "$DSR_REPOS_FILE" || return 1
+    printf 'protected referent\n' > "$root/referent" || return 1
+    case "$kind" in
+      symlink) ln -s "$root/referent" "$DSR_HOSTS_FILE" || return 1 ;;
+      dangling) ln -s "$root/missing" "$DSR_HOSTS_FILE" || return 1 ;;
+      fifo) mkfifo "$DSR_HOSTS_FILE" || return 1 ;;
+      directory) mkdir "$DSR_HOSTS_FILE" || return 1 ;;
+      duplicate) DSR_HOSTS_FILE="$DSR_CONFIG_FILE" ;;
+      hardlink) ln "$DSR_CONFIG_FILE" "$DSR_HOSTS_FILE" || return 1 ;;
+    esac
+    before=$(cksum "$DSR_CONFIG_FILE" "$DSR_REPOS_FILE") || return 1
+    referent_before=$(cksum "$root/referent") || return 1
+    status=0
+    config_init --force || status=$?
+    [[ "$status" == 4 && "$before" == "$(cksum "$DSR_CONFIG_FILE" "$DSR_REPOS_FILE")" &&
+       "$referent_before" == "$(cksum "$root/referent")" && ! -e "$root/missing" &&
+       ! -e "$DSR_CACHE_DIR" && ! -e "$DSR_STATE_DIR" ]] || return 1
+    [[ -z "$(find "$DSR_CONFIG_DIR" -name '*.bak.*' -print)" ]] || return 1
+  done
+}
+
+test_init_refuses_missing_aliased_destinations() (
+  DSR_HOSTS_FILE="$DSR_CONFIG_DIR/./config.yaml"
+  local status=0
+  config_init || status=$?
+  [[ "$status" == 4 && ! -e "$DSR_CONFIG_FILE" && ! -e "$DSR_REPOS_FILE" ]] || return 1
+  [[ -z "$(find "$DSR_CONFIG_DIR" -name '*.bak.*' -print)" ]] || return 1
+
+  # A caller's CDPATH must not redirect parent resolution to a decoy directory.
+  CDPATH="$TEMP_DIR/decoys"
+  mkdir -p "$CDPATH/relative-config" || return 1
+  cd "$TEMP_DIR" || return 1
+  DSR_CONFIG_DIR=relative-config
+  DSR_CONFIG_FILE=relative-config/config.yaml
+  DSR_HOSTS_FILE="$TEMP_DIR/relative-config/config.yaml"
+  DSR_REPOS_FILE=relative-config/repos.yaml
+  status=0
+  config_init || status=$?
+  [[ "$status" == 4 && ! -e "$DSR_CONFIG_FILE" && ! -e "$DSR_REPOS_FILE" &&
+     ! -e "$CDPATH/relative-config/config.yaml" ]] || return 1
+  [[ -z "$(find "$DSR_CONFIG_DIR" -name '*.bak.*' -print)" ]]
+)
+
+test_cli_init_force_reports_retained_backups() {
+  _init_custom_config_files || return 1
+  local index=0 backup
+  local -a paths=("$DSR_CONFIG_FILE" "$DSR_HOSTS_FILE" "$DSR_REPOS_FILE")
+  for ((index = 0; index < 3; index++)); do
+    cp -p "${paths[index]}" "$TEMP_DIR/original.$index" || return 1
+  done
+  _config_init_cli --quiet --json config init --force || return 1
+  [[ ! -s "$TEMP_DIR/init.stderr" ]] || return 1
+  jq -e '.exit_code == 0 and .details.initialized == true and
+    .details.dry_run == false and .details.force == true and
+    (.details.backup_paths | length) == 3' "$TEMP_DIR/init.stdout" >/dev/null || return 1
+  index=0
+  while IFS= read -r backup; do
+    [[ -f "$backup" && ! -L "$backup" ]] || return 1
+    cmp -s "$TEMP_DIR/original.$index" "$backup" || return 1
+    index=$((index + 1))
+  done < <(jq -r '.details.backup_paths[]' "$TEMP_DIR/init.stdout")
+  [[ $index -eq 3 ]]
+}
+
+test_cli_init_filesystem_failure_is_not_initialized() {
+  mkdir -p "$(dirname "$DSR_CACHE_DIR")" || return 1
+  printf 'blocking file\n' > "$DSR_CACHE_DIR" || return 1
+  local status=0
+  _config_init_cli --json config init || status=$?
+  [[ "$status" == 1 && ! -e "$DSR_CONFIG_FILE" &&
+     ! -e "$DSR_HOSTS_FILE" && ! -e "$DSR_REPOS_FILE" ]] || return 1
+  jq -e '.status == "error" and .exit_code == 1 and .details.initialized == false and
+    .details.dry_run == false and .details.backup_paths == []' "$TEMP_DIR/init.stdout" >/dev/null
 }
 
 # ============================================================================
@@ -2009,6 +2194,14 @@ main() {
   run_test "cli_init_preview_preserves_explicit_log" test_cli_init_preview_preserves_explicit_log
   run_test "cli_init_rejects_unknown_plan_arguments" test_cli_init_rejects_unknown_plan_arguments
   run_test "cli_init_real_run_creates_files" test_cli_init_real_run_creates_files
+  run_test "init_force_preserves_complete_backup_generations" test_init_force_preserves_complete_backup_generations
+  run_test "init_force_backup_failure_preserves_originals" test_init_force_backup_failure_preserves_originals
+  run_test "init_directory_failure_propagates" test_init_directory_failure_propagates
+  run_test "init_write_failure_retains_all_backups" test_init_write_failure_retains_all_backups
+  run_test "init_force_refuses_unsafe_or_aliased_destinations" test_init_force_refuses_unsafe_or_aliased_destinations
+  run_test "init_refuses_missing_aliased_destinations" test_init_refuses_missing_aliased_destinations
+  run_test "cli_init_force_reports_retained_backups" test_cli_init_force_reports_retained_backups
+  run_test "cli_init_filesystem_failure_is_not_initialized" test_cli_init_filesystem_failure_is_not_initialized
 
   echo ""
   echo "Loading Tests:"

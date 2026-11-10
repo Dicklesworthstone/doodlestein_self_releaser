@@ -85,6 +85,13 @@
         "type": "string"
       },
       "description": "Configuration paths selected for creation or replacement by init"
+    },
+    "backup_paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Verified original-file backups retained by a real forced initialization, including after a later failure"
     }
   },
   "$defs": {
