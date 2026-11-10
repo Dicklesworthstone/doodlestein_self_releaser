@@ -18621,10 +18621,10 @@ main() {
     done
     # Snapshot retirement preserves ordinary logs too. Startup rotation would
     # otherwise compress/delete them before the snapshots-only handler runs.
-    # Configuration commands own their write sequence, including previews and
-    # reads. Inherited logging could alias a configuration file, modifying it
-    # before backup or after publication (even through session completion).
-    if ! $dry_run_requested && [[ "$command" != config ]]; then
+    # Configuration and repository commands own their configuration writes.
+    # Inherited logging could alias config.yaml, repos.yaml or repos.d files,
+    # corrupting reads or edits through startup, diagnostics or completion.
+    if ! $dry_run_requested && [[ "$command" != config && "$command" != repos ]]; then
         LOG_FILE="$requested_log_file"
         if ! $snapshot_prune_requested; then
             log_init

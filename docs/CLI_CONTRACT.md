@@ -2444,6 +2444,13 @@ nothing in `repos.yaml` or `repos.d`. `sync` needs GitHub access (exit 3
 without it) and exits 1, `partial` or `error`, when some repositories could
 not be synced.
 
+Every `repos` command suppresses persistent session logging, including reads,
+real mutations, previews, help and rejected arguments. An inherited
+`DSR_LOG_FILE` must not append session records or diagnostics to `repos.yaml`,
+`repos.d/*.yaml` or another configuration path. This applies through command
+completion and prevents startup log rotation from modifying the state tree.
+Human diagnostics remain on stderr and JSON results remain on stdout.
+
 ---
 
 ### `dsr config`

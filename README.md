@@ -1271,6 +1271,11 @@ dsr repos remove repo-name                      # Remove a repo
 dsr repos validate                              # Validate all configs
 ```
 
+Repository commands keep progress and errors on stderr and suppress persistent
+session logging. A `DSR_LOG_FILE` path that points at `repos.yaml` or a per-tool
+configuration therefore cannot corrupt it during reads, previews, edits or
+argument errors.
+
 ### `dsr config`
 
 Configuration management.

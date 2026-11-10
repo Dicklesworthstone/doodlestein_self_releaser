@@ -409,6 +409,199 @@ test_repos_add_remove_dry_run_change_nothing() {
     harness_teardown
 }
 
+# Run the actual CLI without --quiet so startup, progress, error and completion
+# messages exercise the file-logging boundary. Pin every configuration path to
+# the fixture instead of inheriting a caller's explicit DSR_*_FILE override.
+repos_log_alias_run() {
+    local log_file="$1"
+    shift
+    exec_run env DSR_LOG_FILE="$log_file" DSR_LOG_LEVEL=debug NO_COLOR=1 \
+        DSR_CONFIG_FILE="$DSR_CONFIG_DIR/config.yaml" \
+        DSR_HOSTS_FILE="$DSR_CONFIG_DIR/hosts.yaml" \
+        DSR_REPOS_FILE="$DSR_CONFIG_DIR/repos.yaml" \
+        "$DSR_CMD" "$@"
+}
+
+test_repos_fresh_dry_run_log_alias_creates_nothing() {
+    ((TESTS_RUN++))
+    if [[ "$HAS_YQ" != true ]] || ! command -v jq >/dev/null 2>&1; then
+        skip "yq and jq required for repository log-alias regressions"
+        return 0
+    fi
+    harness_setup
+    local placement fresh problems=()
+    local args=()
+    for placement in global local short; do
+        fresh="$TEST_TMPDIR/uncreated-$placement"
+        case "$placement" in
+            global) args=(--json --dry-run repos add acme/preview) ;;
+            local) args=(--json repos add acme/preview --dry-run) ;;
+            short) args=(--json -n repos add acme/preview) ;;
+        esac
+        exec_run env DSR_LOG_FILE="$fresh/config/repos.yaml" DSR_LOG_LEVEL=debug NO_COLOR=1 \
+            DSR_CONFIG_DIR="$fresh/config" DSR_CONFIG_FILE="$fresh/config/config.yaml" \
+            DSR_HOSTS_FILE="$fresh/config/hosts.yaml" DSR_REPOS_FILE="$fresh/config/repos.yaml" \
+            DSR_CACHE_DIR="$fresh/cache" DSR_STATE_DIR="$fresh/state" \
+            "$DSR_CMD" "${args[@]}"
+        [[ "$(exec_status)" -eq 0 ]] || problems+=("$placement preview exit $(exec_status)")
+        exec_stdout | jq -es 'length == 1 and .[0].status == "success" and
+            .[0].details.action == "add" and .[0].details.dry_run == true and
+            .[0].details.added[0].repo == "acme/preview"' >/dev/null ||
+            problems+=("$placement preview JSON")
+        [[ ! -e "$fresh" && ! -L "$fresh" ]] || problems+=("$placement preview created its root")
+    done
+    if [[ -z "${problems[*]-}" ]]; then
+        pass "fresh repository previews with a registry log alias create no files or directories"
+    else
+        fail "fresh repository log alias: ${problems[*]}"
+    fi
+    harness_teardown
+}
+
+test_repos_log_alias_preserves_read_preview_and_error() {
+    ((TESTS_RUN++))
+    local alias_kind="$1"
+    if [[ "$HAS_YQ" != true ]] || ! command -v jq >/dev/null 2>&1; then
+        skip "yq and jq required for repository log-alias regressions"
+        return 0
+    fi
+    harness_setup
+    seed_repos_fixtures
+    local registry="$DSR_CONFIG_DIR/repos.yaml" original="$TEST_TMPDIR/original.yaml"
+    local log_file="$registry" operation expected problems=() args=()
+    cp "$registry" "$original" || { fail "copy registry fixture"; harness_teardown; return; }
+    if [[ "$alias_kind" == hardlink ]]; then
+        log_file="$TEST_TMPDIR/registry-log-alias"
+        ln "$registry" "$log_file" || { fail "create registry hardlink"; harness_teardown; return; }
+    fi
+    for operation in list info add-preview remove-preview bad-option missing-repo; do
+        expected=0
+        case "$operation" in
+            list) args=(repos list --format plain) ;;
+            info) args=(repos info test-tool) ;;
+            add-preview) args=(--json repos add acme/new-tool --dry-run) ;;
+            remove-preview) args=(--json -n repos remove test-tool) ;;
+            bad-option) args=(repos remove test-tool --frobnicate); expected=4 ;;
+            missing-repo) args=(--json repos remove absent-tool); expected=4 ;;
+        esac
+        repos_log_alias_run "$log_file" "${args[@]}"
+        [[ "$(exec_status)" -eq "$expected" ]] || problems+=("$operation exit $(exec_status)")
+        cmp -s "$original" "$registry" || problems+=("$operation changed registry bytes")
+        cmp -s "$original" "$log_file" || problems+=("$operation changed aliased bytes")
+        case "$operation" in
+            list)
+                exec_stdout_contains 'test-tool: testuser/test-tool' || problems+=("list lost registered tool")
+                ;;
+            add-preview|remove-preview)
+                exec_stdout | jq -es 'length == 1 and .[0].status == "success" and
+                    .[0].details.dry_run == true' >/dev/null || problems+=("$operation JSON")
+                ;;
+            missing-repo)
+                exec_stdout | jq -es 'length == 1 and .[0].status == "error" and
+                    .[0].details.errors[0].message == "repo not found"' >/dev/null ||
+                    problems+=("missing-repo JSON")
+                ;;
+        esac
+    done
+    [[ ! -e "$DSR_STATE_DIR/logs" ]] || problems+=("read/preview/error created a log directory")
+    if [[ -z "${problems[*]-}" ]]; then
+        pass "$alias_kind registry log alias is unchanged by reads, previews and errors"
+    else
+        fail "$alias_kind registry log alias: ${problems[*]}"
+    fi
+    harness_teardown
+}
+
+test_repos_log_alias_preserves_real_mutations() {
+    ((TESTS_RUN++))
+    local alias_kind="$1"
+    if [[ "$HAS_YQ" != true ]] || ! command -v jq >/dev/null 2>&1; then
+        skip "yq and jq required for repository log-alias regressions"
+        return 0
+    fi
+    harness_setup
+    seed_repos_fixtures
+    local registry="$DSR_CONFIG_DIR/repos.yaml" original="$TEST_TMPDIR/original.yaml"
+    local original_json checkout_path log_file="$registry" problems=()
+    cp "$registry" "$original" || { fail "copy registry fixture"; harness_teardown; return; }
+    original_json=$(yq -o=json '.' "$original") || { fail "parse registry fixture"; harness_teardown; return; }
+    checkout_path=$(cd "$TEST_TMPDIR" && pwd -P) || { fail "resolve checkout fixture"; harness_teardown; return; }
+    if [[ "$alias_kind" == hardlink ]]; then
+        log_file="$TEST_TMPDIR/registry-log-alias"
+        ln "$registry" "$log_file" || { fail "create registry hardlink"; harness_teardown; return; }
+    fi
+    repos_log_alias_run "$log_file" repos add acme/new-tool --language go --local-path "$checkout_path"
+    [[ "$(exec_status)" -eq 0 ]] || problems+=("add exit $(exec_status)")
+    yq -o=json '.' "$registry" | jq -es --argjson original "$original_json" --arg path "$checkout_path" '
+        length == 1 and .[0] == ($original | .tools["new-tool"] = {
+            repo: "acme/new-tool", language: "go", local_path: $path,
+            targets: ["linux/amd64", "darwin/arm64", "windows/amd64"]})' >/dev/null ||
+        problems+=("add corrupted registry or changed another entry")
+    if [[ "$alias_kind" == hardlink ]]; then
+        cmp -s "$original" "$log_file" || problems+=("add changed original hardlink bytes")
+    fi
+    repos_log_alias_run "$log_file" --json repos remove new-tool
+    [[ "$(exec_status)" -eq 0 ]] || problems+=("remove exit $(exec_status)")
+    exec_stdout | jq -es 'length == 1 and .[0].status == "success" and
+        .[0].details.dry_run == false and
+        .[0].details.removed == [{name: "new-tool", repo: "acme/new-tool"}]' >/dev/null ||
+        problems+=("remove JSON")
+    yq -o=json '.' "$registry" | jq -es --argjson original "$original_json" \
+        'length == 1 and .[0] == $original' >/dev/null || problems+=("remove did not restore expected registry")
+    if [[ "$alias_kind" == hardlink ]]; then
+        cmp -s "$original" "$log_file" || problems+=("remove changed original hardlink bytes")
+    fi
+    if [[ -z "${problems[*]-}" ]]; then
+        pass "$alias_kind registry log alias leaves real add/remove results complete and parseable"
+    else
+        fail "$alias_kind registry mutation log alias: ${problems[*]}"
+    fi
+    harness_teardown
+}
+
+test_repos_log_alias_preserves_per_repo_configuration() {
+    ((TESTS_RUN++))
+    if [[ "$HAS_YQ" != true ]] || ! command -v jq >/dev/null 2>&1; then
+        skip "yq and jq required for repository log-alias regressions"
+        return 0
+    fi
+    harness_setup
+    seed_repos_fixtures
+    local log_file="$DSR_CONFIG_DIR/repos.d/test-tool.yaml" original="$TEST_TMPDIR/tool-original.yaml"
+    local operation expected problems=() args=()
+    mkdir -p "$DSR_CONFIG_DIR/repos.d" || { fail "create repos.d fixture"; harness_teardown; return; }
+    cat > "$log_file" <<'YAML'
+tool_name: test-tool
+repo: testuser/test-tool
+local_path: /data/projects/test-tool
+language: go
+build_cmd: go build -o test-tool ./cmd/test-tool
+targets:
+  - linux/amd64
+  - darwin/arm64
+YAML
+    cp "$log_file" "$original" || { fail "copy repos.d fixture"; harness_teardown; return; }
+    for operation in list add remove preview error; do
+        expected=0
+        case "$operation" in
+            list) args=(repos list --format plain) ;;
+            add) args=(repos add acme/new-tool --language go) ;;
+            remove) args=(repos remove new-tool) ;;
+            preview) args=(repos remove test-tool --dry-run) ;;
+            error) args=(repos remove test-tool --frobnicate); expected=4 ;;
+        esac
+        repos_log_alias_run "$log_file" "${args[@]}"
+        [[ "$(exec_status)" -eq "$expected" ]] || problems+=("$operation exit $(exec_status)")
+        cmp -s "$original" "$log_file" || problems+=("$operation changed per-repo configuration")
+    done
+    if [[ -z "${problems[*]-}" ]]; then
+        pass "repository reads, writes, previews and errors preserve an aliased repos.d file"
+    else
+        fail "repos.d log alias: ${problems[*]}"
+    fi
+    harness_teardown
+}
+
 test_repos_validate_exit_codes() {
     ((TESTS_RUN++))
     if [[ "$HAS_YQ" != "true" ]]; then
@@ -450,6 +643,7 @@ make_sync_gh_stub() {
     cat > "$TEST_TMPDIR/bin/gh" << 'EOF'
 #!/usr/bin/env bash
 case "$1 $2" in
+    "auth token") echo 'dsr-e2e-offline-token'; exit 0 ;;
     "auth status") exit 0 ;;
     "api repos/testuser/test-tool") echo '{"full_name":"testuser/test-tool","default_branch":"trunk"}'; exit 0 ;;
 esac
@@ -562,6 +756,15 @@ echo "Dry runs and exit codes:"
 test_repos_add_remove_dry_run_change_nothing
 test_repos_validate_exit_codes
 test_repos_sync_dry_run_and_partial_failure
+
+echo ""
+echo "Configuration log aliases:"
+test_repos_fresh_dry_run_log_alias_creates_nothing
+test_repos_log_alias_preserves_read_preview_and_error direct
+test_repos_log_alias_preserves_read_preview_and_error hardlink
+test_repos_log_alias_preserves_real_mutations direct
+test_repos_log_alias_preserves_real_mutations hardlink
+test_repos_log_alias_preserves_per_repo_configuration
 
 echo ""
 echo "Error Handling:"
