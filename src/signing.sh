@@ -121,19 +121,245 @@ signing_check() {
     $valid && return 0 || return 3
 }
 
-# Initialize signing keys - generate a new keypair
-# Usage: signing_init [--force] [--no-password]
-# Returns: 0 on success, 1 on failure, 4 on invalid args
+_signing_init_error() {
+    _SIGNING_INIT_ERROR="${_SIGNING_INIT_ERROR:+$_SIGNING_INIT_ERROR; }$*"
+    _sign_log_error "$*"
+}
+
+# Resolve existing parent aliases without creating anything, including when a
+# preview names a not-yet-created configuration tree. The leaf is never followed.
+_signing_init_path() {
+    local path="$1" parent leaf part suffix="" resolved
+    [[ -n "$path" && "$path" != */ && "$path" != *[[:cntrl:]]* ]] || return 4
+    leaf=$(basename -- "$path") || return 4
+    [[ "$leaf" != . && "$leaf" != .. ]] || return 4
+    parent=$(dirname -- "$path") || return 4
+    while [[ ! -d "$parent" ]]; do
+        [[ ! -e "$parent" && ! -L "$parent" ]] || return 4
+        part=$(basename -- "$parent") || return 4
+        [[ "$part" != .. && "$part" != / ]] || return 4
+        [[ "$part" == . ]] || suffix="/$part$suffix"
+        parent=$(dirname -- "$parent") || return 4
+    done
+    resolved=$(CDPATH='' cd -P -- "$parent" && pwd -P) || return 4
+    printf '%s%s/%s\n' "${resolved%/}" "$suffix" "$leaf"
+}
+
+_signing_init_stat() {
+    stat -c '%d:%i:%u:%g:%a' -- "$1" 2>/dev/null || stat -f '%d:%i:%u:%g:%Lp' "$1"
+}
+
+# These helpers share signing_init's local transaction arrays. Each destination
+# has its own lease, so custom private-key paths cannot evade mutual exclusion.
+_signing_init_original_matches() {
+    local index="$1" path="${sign_paths[$1]}"
+    if [[ -n "${sign_before[index]}" ]]; then
+        [[ -f "$path" && ! -L "$path" &&
+           "$(_signing_init_stat "$path")" == "${sign_before[index]}" ]] &&
+            cmp -s "$path" "${sign_stages[index]}/original"
+    else
+        [[ ! -e "$path" && ! -L "$path" ]]
+    fi
+}
+
+_signing_init_candidate_matches() {
+    local index="$1" path="${sign_paths[$1]}"
+    [[ -f "$path" && ! -L "$path" &&
+       "$(_signing_init_stat "$path")" == "${sign_candidates[index]}" ]] &&
+        cmp -s "$path" "${sign_stages[index]}/expected"
+}
+
+_signing_init_apply() {
+    local index path lock stage stamp generation="" backup metadata
+    stamp=$(date -u +%Y%m%dT%H%M%SZ) || {
+        _signing_init_error "Could not timestamp signing backups"; return 1;
+    }
+    for index in 0 1; do
+        path="${sign_paths[index]}"
+        lock="$path.init.lock"
+        if ! (umask 077; mkdir -- "$lock"); then
+            _signing_init_error "Cannot acquire $lock; inspect any active or interrupted initialization before retrying"
+            [[ -e "$lock" || -L "$lock" ]] && return 2
+            return 1
+        fi
+        sign_locks[index]="$lock"
+        if ! (umask 077; printf '%s\n' "${BASHPID:-$$}" > "$lock/owner") ||
+           ! sign_stages[index]=$(mktemp -d "$lock/stage.XXXXXXXX"); then
+            _signing_init_error "Could not prepare private key staging for $path"; return 1
+        fi
+        [[ -n "$generation" ]] || generation="${sign_stages[index]##*/}"
+    done
+
+    # Preserve both originals before generation or replacement. A complete
+    # copied inode is published with an exclusive link, never cp to a backup
+    # pathname: an occupied name (including a symlink) cannot be overwritten.
+    for index in 0 1; do
+        path="${sign_paths[index]}" stage="${sign_stages[index]}"
+        if [[ -L "$path" || ( -e "$path" && ! -f "$path" ) ]] ||
+           [[ "${sign_paths[0]}" -ef "${sign_paths[1]}" ]]; then
+            _signing_init_error "Signing destinations changed or alias one another"; return 4
+        fi
+        [[ -f "$path" ]] || continue
+        if ! $force; then
+            _signing_init_error "Signing key appeared during initialization: $path"; return 2
+        fi
+        if ! sign_before[index]=$(_signing_init_stat "$path") ||
+           ! cp -p -- "$path" "$stage/original" ||
+           ! _signing_init_original_matches "$index"; then
+            _signing_init_error "Could not preserve a stable original for $path; live keys unchanged"; return 1
+        fi
+        metadata=$(_signing_init_stat "$stage/original") || return 1
+        if [[ "${metadata#*:*:}" != "${sign_before[index]#*:*:}" ]]; then
+            _signing_init_error "Could not preserve key ownership and permissions: $path"; return 1
+        fi
+        # Even a previously over-permissive secret must not be exposed by its
+        # backup. Preserve its original mode separately for handled rollback.
+        if [[ $index == 0 ]] && ! chmod 600 "$stage/original"; then
+            _signing_init_error "Could not protect private-key backup: $path"; return 1
+        fi
+        backup="$path.bak.$stamp.$generation"
+        if [[ -e "$backup" || -L "$backup" ]] || ! ln -- "$stage/original" "$backup" ||
+           [[ ! -f "$backup" || -L "$backup" || ! "$backup" -ef "$stage/original" ]]; then
+            _signing_init_error "Could not publish preserved key $backup; live keys unchanged"; return 1
+        fi
+        sign_backups[index]="$backup"
+        _SIGNING_INIT_BACKUP_PATHS+=("$backup")
+        _sign_log_info "Preserved $path in $backup"
+        if ! (umask 077; printf '%s\n' "$backup" > "$stage/backup-path"); then
+            _signing_init_error "Could not record recovery path; original retained in $backup"; return 1
+        fi
+    done
+
+    local -a minisign_args=(-G -s "${sign_stages[0]}/new" -p "${sign_stages[1]}/new")
+    if $no_password; then
+        _sign_log_warn "WARNING: Creating unprotected key (--no-password)"
+        minisign_args+=(-W)
+    else
+        _sign_log_info "Enter a password to protect the new private key."
+    fi
+    _sign_log_info "Generating minisign keypair in private staging..."
+    if ! (umask 077; minisign "${minisign_args[@]}" >&2); then
+        _signing_init_error "Failed to generate keypair; live keys unchanged"; return 1
+    fi
+    for index in 0 1; do
+        stage="${sign_stages[index]}"
+        if [[ ! -s "$stage/new" || ! -f "$stage/new" || -L "$stage/new" ]]; then
+            _signing_init_error "Minisign did not create a complete regular key file"; return 1
+        fi
+        local mode=644
+        [[ $index != 0 ]] || mode=600
+        if ! chmod "$mode" "$stage/new" || ! cp -p -- "$stage/new" "$stage/expected" ||
+           ! sign_candidates[index]=$(_signing_init_stat "$stage/new"); then
+            _signing_init_error "Could not finish staging new signing keys"; return 1
+        fi
+    done
+    signing_public_key_token "${sign_stages[1]}/new" >/dev/null || {
+        _signing_init_error "Generated public key is invalid; live keys unchanged"; return 1;
+    }
+    for index in 0 1; do
+        _signing_init_original_matches "$index" || {
+            _signing_init_error "Signing key changed during preparation: ${sign_paths[index]}"; return 2;
+        }
+    done
+    for index in 0 1; do
+        path="${sign_paths[index]}" stage="${sign_stages[index]}"
+        _signing_init_original_matches "$index" || {
+            _signing_init_error "Signing key changed before replacement: $path"; return 2;
+        }
+        # Record intent first: an operation may change the file and then fail.
+        sign_attempted[index]=true
+        if [[ -n "${sign_before[index]}" ]]; then
+            if ! mv -f -- "$stage/new" "$path"; then
+                _signing_init_error "Could not replace signing key: $path"; return 1
+            fi
+        elif ! ln -- "$stage/new" "$path"; then
+            _signing_init_error "Could not create signing key without overwriting another file: $path"; return 1
+        fi
+        _signing_init_candidate_matches "$index" || {
+            _signing_init_error "Published signing key differs from its staged file: $path"; return 1;
+        }
+    done
+}
+
+_signing_init_rollback() {
+    local index path stage failed=false restored=false
+    for index in 1 0; do
+        ${sign_attempted[index]} || continue
+        path="${sign_paths[index]}" stage="${sign_stages[index]}"
+        if ! _signing_init_candidate_matches "$index"; then
+            _signing_init_original_matches "$index" && continue
+            _signing_init_error "Refusing to overwrite a changed key during rollback: $path; inspect $stage"
+            failed=true
+            continue
+        fi
+        if [[ -n "${sign_backups[index]}" ]]; then
+            if ! cp -p -- "${sign_backups[index]}" "$stage/restore" ||
+               ! chmod "${sign_before[index]##*:}" "$stage/restore" ||
+               ! cmp -s "${sign_backups[index]}" "$stage/restore" ||
+               ! _signing_init_candidate_matches "$index" ||
+               ! mv -f -- "$stage/restore" "$path" ||
+               ! cmp -s "${sign_backups[index]}" "$path"; then
+                _signing_init_error "Could not restore $path; original retained in ${sign_backups[index]}"
+                failed=true
+                continue
+            fi
+        elif ! mv -- "$path" "$stage/retracted"; then
+            _signing_init_error "Could not retract new key $path; inspect $stage"
+            failed=true
+            continue
+        fi
+        restored=true
+    done
+    _SIGNING_INIT_ROLLED_BACK="$restored"
+    _SIGNING_INIT_RECOVERY_REQUIRED="$failed"
+    ! $failed
+}
+
+_signing_init_cleanup() {
+    local index stage lock failed=false
+    for index in 1 0; do
+        lock="${sign_locks[index]}"
+        [[ -n "$lock" ]] || continue
+        stage="${sign_stages[index]}"
+        if [[ -n "$stage" ]]; then
+            if ! rm -f -- "$stage/new" "$stage/expected" "$stage/original" \
+                "$stage/restore" "$stage/retracted" "$stage/backup-path" || ! rmdir -- "$stage"; then
+                _signing_init_error "Could not clean private staging $stage; lock retained"
+                failed=true
+                continue
+            fi
+        fi
+        if ! rm -f -- "$lock/owner" || ! rmdir -- "$lock"; then
+            _signing_init_error "Could not release signing initialization lock $lock"
+            failed=true
+        fi
+    done
+    ! $failed
+}
+
+# Initialize signing keys. No traps replace a sourcing caller's signal handlers.
+# Interruption retains private staging, original backups and leases for recovery;
+# later initializers refuse those leases instead of accepting a mixed key pair.
+# Usage: signing_init [--force] [--no-password] [--dry-run]
+# Returns: 0 success, 1 I/O failure, 2 conflict, 3 dependency, 4 invalid arguments.
 signing_init() {
     local force=false
     local no_password=false
     local dry_run="${DRY_RUN:-false}"
+    local arg index path status=0 secrets_path
+    local -a sign_paths=("" "") sign_locks=("" "") sign_stages=("" "")
+    local -a sign_before=("" "") sign_backups=("" "") sign_candidates=("" "")
+    local -a sign_attempted=(false false)
+    _SIGNING_INIT_BACKUP_PATHS=()
+    _SIGNING_INIT_ERROR=""
+    _SIGNING_INIT_ROLLED_BACK=false
+    _SIGNING_INIT_RECOVERY_REQUIRED=false
 
     for arg in "$@"; do
         case "$arg" in
             --force) force=true ;;
             --no-password) no_password=true ;;
-            --dry-run) dry_run=true ;;
+            --dry-run|-n) dry_run=true ;;
             --help|-h)
                 cat << 'EOF'
 Usage: signing_init [--force] [--no-password] [--dry-run]
@@ -141,7 +367,7 @@ Usage: signing_init [--force] [--no-password] [--dry-run]
 Generate a new minisign keypair for artifact signing.
 
 Options:
-  --force        Replace existing keys (the old pair is kept as *.bak.<time>)
+  --force        Replace existing keys (keep unique, verified *.bak.* originals)
   --no-password  Create unprotected key (NOT RECOMMENDED)
   --dry-run      Show what would be created or replaced; change nothing
 
@@ -154,90 +380,74 @@ EOF
                 return 0
                 ;;
             *)
-                _sign_log_error "Unknown option: $arg"
+                _signing_init_error "Unknown option: $arg"
                 return 4
                 ;;
         esac
     done
 
-    signing_require_minisign || return 3
-
-    # Check if keys already exist
-    if [[ -f "$SIGNING_PRIVATE_KEY" ]] && ! $force; then
-        _sign_log_error "Private key already exists: $SIGNING_PRIVATE_KEY"
-        _sign_log_info "Use --force to overwrite"
-        return 1
+    if ! sign_paths[0]=$(_signing_init_path "$SIGNING_PRIVATE_KEY") ||
+       ! sign_paths[1]=$(_signing_init_path "$SIGNING_PUBLIC_KEY"); then
+        _signing_init_error "Invalid or unresolvable signing key destination"; return 4
     fi
-
-    if [[ -f "$SIGNING_PUBLIC_KEY" ]] && ! $force; then
-        _sign_log_error "Public key already exists: $SIGNING_PUBLIC_KEY"
-        return 1
+    if [[ "${sign_paths[0]}" == "${sign_paths[1]}" || "${sign_paths[0]}" -ef "${sign_paths[1]}" ||
+          "${sign_paths[0]}" == "${sign_paths[1]}"/* || "${sign_paths[1]}" == "${sign_paths[0]}"/* ||
+          "${sign_paths[0]}" == "${sign_paths[1]}.init.lock"* ||
+          "${sign_paths[1]}" == "${sign_paths[0]}.init.lock"* ]]; then
+        _signing_init_error "Signing key destinations alias or overlap one another"; return 4
     fi
-
-    local -a existing_keys=()
-    local key_file
-    for key_file in "$SIGNING_PRIVATE_KEY" "$SIGNING_PUBLIC_KEY"; do
-        [[ -f "$key_file" ]] && existing_keys+=("$key_file")
+    for path in "${sign_paths[@]}"; do
+        if [[ -L "$path" || ( -e "$path" && ! -f "$path" ) ]]; then
+            _signing_init_error "Signing destination must be a regular non-symlink file: $path"; return 4
+        fi
+        if [[ -e "$path.init.lock" || -L "$path.init.lock" ]]; then
+            _SIGNING_INIT_RECOVERY_REQUIRED=true
+            _signing_init_error "Signing initialization is active or interrupted; inspect $path.init.lock before retrying"; return 2
+        fi
+        if [[ -f "$path" ]] && ! $force; then
+            _signing_init_error "Signing key already exists: $path; use --force to preserve and replace it"; return 1
+        fi
     done
-
-    if $dry_run; then
+    signing_require_minisign || { _signing_init_error "Minisign is required to initialize signing"; return 3; }
+    if [[ "$dry_run" == true ]]; then
         _sign_log_info "[dry-run] Would generate a minisign keypair:"
         _sign_log_info "  private key: $SIGNING_PRIVATE_KEY (mode 600)"
         _sign_log_info "  public key:  $SIGNING_PUBLIC_KEY"
-        for key_file in ${existing_keys[@]+"${existing_keys[@]}"}; do
-            _sign_log_info "[dry-run] Would keep the existing $key_file as $key_file.bak.<time>"
+        for path in "${sign_paths[@]}"; do
+            [[ ! -f "$path" ]] || _sign_log_info "[dry-run] Would preserve $path in a unique adjacent *.bak.* file"
         done
         return 0
     fi
 
-    # --force replaces a key pair; a private key cannot be regenerated, so
-    # the old pair is kept beside the new one rather than destroyed.
-    local backup_suffix
-    backup_suffix=".bak.$(date -u +%Y%m%dT%H%M%SZ)"
-    for key_file in ${existing_keys[@]+"${existing_keys[@]}"}; do
-        if ! cp -p -- "$key_file" "$key_file$backup_suffix"; then
-            _sign_log_error "Could not back up $key_file; keys unchanged"
-            return 1
+    if ! (umask 077; mkdir -p -- "${sign_paths[0]%/*}" "${sign_paths[1]%/*}"); then
+        _signing_init_error "Could not create signing key directories"; return 1
+    fi
+    # Tighten the managed secrets directory, but never chmod an arbitrary
+    # existing parent selected with DSR_MINISIGN_KEY.
+    secrets_path=$(_signing_init_path "$SIGNING_SECRETS_DIR/minisign.key") || return 4
+    if [[ "${secrets_path%/*}" == "${sign_paths[0]%/*}" ]] &&
+       ! chmod 700 "${sign_paths[0]%/*}"; then
+        _signing_init_error "Could not protect signing secrets directory"; return 1
+    fi
+    _signing_init_apply || status=$?
+    if [[ $status -ne 0 ]]; then
+        _signing_init_rollback || true
+    fi
+    if ! $_SIGNING_INIT_RECOVERY_REQUIRED; then
+        if ! _signing_init_cleanup; then
+            _SIGNING_INIT_RECOVERY_REQUIRED=true
+            [[ $status -ne 0 ]] || status=1
         fi
-        _sign_log_info "Kept the existing key as $key_file$backup_suffix"
-    done
-
-    # Create secrets directory with restricted permissions
-    _sign_log_info "Creating secrets directory: $SIGNING_SECRETS_DIR"
-    mkdir -p "$SIGNING_SECRETS_DIR"
-    chmod 700 "$SIGNING_SECRETS_DIR"
-
-    # Generate keypair
-    _sign_log_info "Generating minisign keypair..."
-    _sign_log_warn "You will be prompted to enter a password to protect the private key."
-    _sign_log_warn "This password will be required whenever you sign artifacts."
-    echo ""
-
-    local minisign_args=(-G -p "$SIGNING_PUBLIC_KEY" -s "$SIGNING_PRIVATE_KEY")
-    # minisign refuses to replace an existing pair without -f.
-    [[ ${#existing_keys[@]} -gt 0 ]] && minisign_args+=(-f)
-    if $no_password; then
-        _sign_log_warn "WARNING: Creating unprotected key (--no-password)"
-        minisign_args+=(-W)
     fi
+    [[ $status -eq 0 ]] || return "$status"
 
-    if ! minisign "${minisign_args[@]}"; then
-        _sign_log_error "Failed to generate keypair"
-        return 1
-    fi
-
-    # Set strict permissions on private key
-    chmod 600 "$SIGNING_PRIVATE_KEY"
     _sign_log_ok "Private key created: $SIGNING_PRIVATE_KEY (mode 600)"
 
     _sign_log_ok "Public key created: $SIGNING_PUBLIC_KEY"
 
     # Show public key for embedding
-    echo ""
     _sign_log_info "Public key (for embedding in installers and docs):"
-    echo ""
-    cat "$SIGNING_PUBLIC_KEY"
-    echo ""
+    cat -- "$SIGNING_PUBLIC_KEY" >&2 || return 1
 
     _sign_log_ok "Keypair generation complete!"
     _sign_log_info "Remember to:"

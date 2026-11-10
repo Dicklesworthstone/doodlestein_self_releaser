@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_signing.sh - Unit tests for src/signing.sh
 #
-# Run: ./scripts/tests/test_signing.sh [--encrypted-only]
+# Run: ./scripts/tests/test_signing.sh [--encrypted-only|--init-only]
 #
 # Real-behavior tests using actual minisign. Skips if minisign is missing.
 # (No-mocks compliant per bd-3py)
@@ -145,7 +145,7 @@ test_signing_init_force_and_dry_run() {
 
   run_cmd "signing_init --dry-run --force succeeds" signing_init --dry-run --force --no-password
   run_cmd "global DRY_RUN signing_init --force succeeds" env DRY_RUN=true bash -c \
-    "source '$PROJECT_ROOT/src/signing.sh' && signing_init --force --no-password"
+    'source "$1" && signing_init --force --no-password' _ "$SIGNING_TEST_MODULE"
   ((TESTS_RUN++))
   backups=$(find "$DSR_CONFIG_DIR" -name '*.bak.*' | wc -l)
   if [[ "$(key_digest)" == "$before" && "$backups" -eq 0 ]]; then
@@ -170,6 +170,321 @@ test_signing_init_force_and_dry_run() {
     fail "--force should replace keys and back up the old pair (backups: '$old_priv' '$old_pub')"
   fi
   run_cmd "replaced key pair passes signing_check" signing_check >/dev/null
+}
+
+test_signing_init_preserves_identities() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    skip "initialization custody tests require python3"
+    return
+  fi
+  local report="$TEMP_DIR/init-results" status=0 line
+  # Every generated key and signature below is produced and verified by real
+  # Minisign. Only the clock and explicitly named filesystem/process failure
+  # boundaries are controlled; none of those adapters manufactures success.
+  python3 - "$SIGNING_TEST_MODULE" "$TEMP_DIR/init-custody" \
+    "$(command -v minisign)" > "$report" <<'PY' || status=$?
+import hashlib
+import os
+from pathlib import Path
+import secrets
+import signal
+import stat
+import subprocess
+import sys
+
+module, directory, real_minisign = sys.argv[1:]
+root = Path(directory)
+root.mkdir(mode=0o700)
+failures = 0
+
+def check(condition, label):
+    global failures
+    print(("PASS: " if condition else "FAIL: ") + label, flush=True)
+    failures += not condition
+    return bool(condition)
+
+def run(command, *, env=None, data=b"", timeout=30):
+    process = subprocess.Popen(command, env=env, stdin=subprocess.PIPE,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               start_new_session=True)
+    try:
+        out, err = process.communicate(data, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        out, err = process.communicate()
+        return subprocess.CompletedProcess(command, 124, out, err)
+    return subprocess.CompletedProcess(command, process.returncode, out, err)
+
+def case(name, *, populated=True):
+    folder = root / name
+    folder.mkdir(mode=0o700)
+    config = folder / "config"
+    config.mkdir(mode=0o700)
+    private_dir = config / "secrets"
+    private_dir.mkdir(mode=0o700)
+    private, public = private_dir / "minisign.key", config / "minisign.pub"
+    if populated:
+        generated = run([real_minisign, "-G", "-W", "-s", str(private), "-p", str(public)])
+        if generated.returncode != 0:
+            raise RuntimeError("real Minisign fixture generation failed")
+        private.chmod(0o600)
+    return folder, config, private, public
+
+frozen_clock = '''date() {
+    case "$*" in
+        *%Y%m%dT%H%M%SZ*) printf '%s\\n' 20400101T000000Z ;;
+        *) command date "$@" ;;
+    esac
+}
+'''
+
+def invoke(paths, arguments, *, before="", data=b"", overrides=None):
+    folder, config, private, public = paths
+    env = {"PATH": os.environ["PATH"], "HOME": str(folder), "LANG": "C", "NO_COLOR": "1",
+           "DSR_CONFIG_DIR": str(config), "DSR_STATE_DIR": str(folder / "state"),
+           "DSR_CACHE_DIR": str(folder / "cache"), "DSR_MINISIGN_KEY": str(private),
+           "DSR_TEST_REAL_MINISIGN": real_minisign}
+    env.update(overrides or {})
+    script = 'set -uo pipefail\nsource "$1"\nshift\n' + frozen_clock + before + '\nsigning_init "$@"\n'
+    return run(["bash", "-c", script, "init-custody", module, *arguments], env=env, data=data)
+
+def key_bytes(paths):
+    return tuple(path.read_bytes() for path in paths[2:])
+
+def custody(paths):
+    return tuple((path.lstat().st_dev, path.lstat().st_ino, path.lstat().st_mode,
+                  path.lstat().st_size, path.lstat().st_mtime_ns,
+                  hashlib.sha256(path.read_bytes()).hexdigest()) for path in paths)
+
+def inventory(folder):
+    result = {}
+    for path in sorted([folder, *folder.rglob("*")]):
+        info = path.lstat()
+        value = (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns)
+        if stat.S_ISREG(info.st_mode):
+            value += (hashlib.sha256(path.read_bytes()).hexdigest(),)
+        elif stat.S_ISLNK(info.st_mode):
+            value += (os.readlink(path),)
+        result[str(path)] = value
+    return result
+
+def backups(paths, expected):
+    config, private, public = paths[1:]
+    found = []
+    for live, contents in zip((private, public), expected):
+        matches = [path for path in live.parent.glob(live.name + ".bak.*")
+                   if path.is_file() and not path.is_symlink() and path.read_bytes() == contents]
+        found.append(matches)
+    return found
+
+def signs_and_verifies(private, public, folder, name, *, password=b""):
+    artifact = folder / (name + ".bin")
+    artifact.write_bytes(b"real signature recovery probe\n")
+    signature = folder / (name + ".minisig")
+    signed = run([real_minisign, "-S", "-s", str(private), "-m", str(artifact), "-x", str(signature)],
+                 data=password + b"\n")
+    verified = run([real_minisign, "-V", "-p", str(public), "-m", str(artifact), "-x", str(signature)])
+    if signed.returncode != 0 or verified.returncode != 0:
+        print("INFO: real Minisign recovery statuses:", signed.returncode, verified.returncode,
+              (signed.stderr + verified.stderr).decode(errors="replace"), flush=True)
+    return signed.returncode == 0 and verified.returncode == 0
+
+rotations = case("same-second")
+old_pairs = [key_bytes(rotations)]
+first = invoke(rotations, ["--force", "--no-password"])
+old_pairs.append(key_bytes(rotations))
+second = invoke(rotations, ["--force", "--no-password"])
+check(first.returncode == 0 and second.returncode == 0 and len(set(old_pairs + [key_bytes(rotations)])) == 3,
+      "two same-second forced initializations generate three distinct real signing identities")
+retained = [backups(rotations, pair) for pair in old_pairs]
+complete = all(private and public for private, public in retained)
+check(complete, "both same-second rotations retain every original private/public key byte")
+check(complete and all(stat.S_IMODE(private[0].stat().st_mode) == 0o600
+                       for private, public in retained),
+      "every retained private signing identity has mode 600")
+check(complete and all(signs_and_verifies(private[0], public[0], rotations[0], "restored-" + str(index))
+                       for index, (private, public) in enumerate(retained)),
+      "each retained original signing identity independently signs and verifies a real artifact")
+check(signs_and_verifies(rotations[2], rotations[3], rotations[0], "current"),
+      "the final active key pair independently signs and verifies a real artifact")
+
+occupied = case("occupied-backup")
+sentinels = [Path(str(path) + ".bak.20400101T000000Z") for path in occupied[2:]]
+for path in sentinels:
+    path.write_bytes(b"previous retained signing generation\n")
+    path.chmod(0o600)
+before = custody(sentinels)
+old = key_bytes(occupied)
+result = invoke(occupied, ["--force", "--no-password"])
+check(result.returncode == 0 and custody(sentinels) == before and all(backups(occupied, old)),
+      "occupied timestamp backup names remain untouched while a distinct generation is retained")
+
+for label, args, overrides in [
+        ("local", ["--force", "--no-password", "--dry-run"], {}),
+        ("global", ["--force", "--no-password"], {"DRY_RUN": "true"}),
+        ("short", ["--force", "--no-password", "-n"], {})]:
+    paths = case(label + "-preview")
+    before = inventory(paths[0])
+    result = invoke(paths, args, overrides=overrides)
+    check(result.returncode == 0 and inventory(paths[0]) == before,
+          label + " initialization preview preserves all bytes, modes, inodes, and directory entries")
+
+fresh_preview = case("fresh-preview", populated=False)
+before = inventory(fresh_preview[0])
+result = invoke(fresh_preview, ["--dry-run", "--no-password"])
+check(result.returncode == 0 and inventory(fresh_preview[0]) == before,
+      "fresh initialization preview creates no keys, leases, staging files, or backup directories")
+unknown = case("unknown-option")
+before = inventory(unknown[0])
+result = invoke(unknown, ["--force", "--no-password", "--unknown-init-option"])
+check(result.returncode == 4 and inventory(unknown[0]) == before,
+      "unknown initialization options fail before any filesystem change")
+
+generation = case("failed-generator")
+before = custody(generation[2:])
+result = invoke(generation, ["--force", "--no-password"], before='''minisign() {
+    command "$DSR_TEST_REAL_MINISIGN" "$@" || return $?
+    return 73
+}
+''')
+check(result.returncode != 0 and custody(generation[2:]) == before,
+      "injected failure after real key generation preserves both original active keys and identities")
+
+copy_failure = case("failed-backup-copy")
+before = custody(copy_failure[2:])
+result = invoke(copy_failure, ["--force", "--no-password"], before='''cp() {
+    command cp "$@" || return $?
+    return 73
+}
+''')
+check(result.returncode != 0 and custody(copy_failure[2:]) == before,
+      "injected backup-copy failure preserves both original active keys and identities")
+
+size_limit = case("actual-file-size-limit")
+before = custody(size_limit[2:])
+result = invoke(size_limit, ["--force", "--no-password"], before="ulimit -f 0\n")
+check(result.returncode != 0 and custody(size_limit[2:]) == before,
+      "actual RLIMIT_FSIZE write refusal preserves both original keys without replacement")
+
+backup_failure = case("failed-backup-publication")
+before = custody(backup_failure[2:])
+result = invoke(backup_failure, ["--force", "--no-password"], before='''ln() {
+    local destination="${!#}"
+    case "$destination" in *.bak.*) return 73 ;; esac
+    command ln "$@"
+}
+''')
+check(result.returncode != 0 and custody(backup_failure[2:]) == before,
+      "injected backup-publication failure prevents either active key from changing")
+
+publication = case("failed-second-publication")
+old = key_bytes(publication)
+result = invoke(publication, ["--force", "--no-password"], before='''mv() {
+    local destination="${!#}"
+    [[ "$destination" != "$SIGNING_PUBLIC_KEY" ]] || return 73
+    command mv "$@"
+}
+''')
+check(result.returncode != 0 and key_bytes(publication) == old,
+      "injected second-key publication failure restores the complete original active pair")
+check(key_bytes(publication) == old and all(backups(publication, old))
+      and signs_and_verifies(publication[2], publication[3], publication[0], "rollback"),
+      "failed pair publication retains recoverable backups and a usable original signing identity")
+
+if os.geteuid() != 0:
+    permissions = case("actual-directory-write-refusal")
+    permissions[2].chmod(0o400)
+    old = key_bytes(permissions)
+    result = invoke(permissions, ["--force", "--no-password"], before='''minisign() {
+    command "$DSR_TEST_REAL_MINISIGN" "$@" || return $?
+    chmod 500 "$DSR_CONFIG_DIR"
+}
+''')
+    permissions[1].chmod(0o700)
+    check(result.returncode != 0 and key_bytes(permissions) == old
+          and stat.S_IMODE(permissions[2].stat().st_mode) == 0o400,
+          "actual directory-write refusal restores both original keys and private-key mode")
+else:
+    print("SKIP: actual directory-write refusal requires an unprivileged user", flush=True)
+
+interrupted = case("interrupted-generator")
+before = custody(interrupted[2:])
+result = invoke(interrupted, ["--force", "--no-password"], before='''minisign() {
+    command "$DSR_TEST_REAL_MINISIGN" "$@" || return $?
+    kill -TERM "$$"
+    return 73
+}
+''')
+check(result.returncode != 0 and custody(interrupted[2:]) == before,
+      "real process interruption after staged generation preserves the original active pair")
+retry = invoke(interrupted, ["--force", "--no-password"])
+check(retry.returncode != 0 and custody(interrupted[2:]) == before,
+      "interrupted initialization retains a lease that refuses an unreviewed retry")
+
+for kind in ("symlink", "directory", "FIFO", "dangling-symlink"):
+    unsafe = case("unsafe-" + kind, populated=False)
+    target = unsafe[0] / "unrelated-target"
+    target.write_bytes(b"unrelated bytes must survive\n")
+    if kind == "symlink":
+        unsafe[2].symlink_to(target)
+    elif kind == "directory":
+        unsafe[2].mkdir()
+    elif kind == "FIFO":
+        os.mkfifo(unsafe[2], 0o600)
+    else:
+        unsafe[2].symlink_to(unsafe[0] / "missing-target")
+    before = inventory(unsafe[0])
+    result = invoke(unsafe, ["--force", "--no-password"])
+    check(result.returncode != 0 and result.returncode != 124 and inventory(unsafe[0]) == before,
+          kind + " key destination is refused promptly without changing unrelated files")
+
+hardlink = case("existing-hardlink")
+unrelated = hardlink[0] / "unrelated-private-copy"
+os.link(hardlink[2], unrelated)
+before = custody([unrelated])
+result = invoke(hardlink, ["--force", "--no-password"])
+check(custody([unrelated]) == before and (result.returncode != 0 or key_bytes(hardlink)[0] != unrelated.read_bytes()),
+      "forced initialization never overwrites the inode of an unrelated private-key hardlink")
+
+aliased = case("identical-key-destinations", populated=False)
+result = invoke(aliased, ["--force", "--no-password"], overrides={"DSR_MINISIGN_KEY": str(aliased[3])})
+check(result.returncode != 0 and not aliased[3].exists(),
+      "identical private/public key destinations are refused before publication")
+
+custom = case("external-private-key", populated=False)
+custom_private = custom[0] / "external keys" / "identity.key"
+custom_private.parent.mkdir(mode=0o700)
+result = invoke(custom, ["--no-password"], overrides={"DSR_MINISIGN_KEY": str(custom_private)})
+check(result.returncode == 0 and custom_private.is_file()
+      and stat.S_IMODE(custom_private.stat().st_mode) == 0o600
+      and signs_and_verifies(custom_private, custom[3], custom[0], "external"),
+      "configured private-key paths outside the default secrets directory create a usable pair")
+
+encrypted = case("encrypted-initialization", populated=False)
+password = secrets.token_hex(24).encode()
+result = invoke(encrypted, [], data=(password + b"\n") * 2)
+if result.returncode != 0:
+    print("INFO: encrypted initialization status:", result.returncode,
+          result.stderr.decode(errors="replace"), flush=True)
+check(result.returncode == 0 and signs_and_verifies(encrypted[2], encrypted[3], encrypted[0], "encrypted", password=password),
+      "default initialization retains real password-protected Minisign key generation")
+check(password not in result.stdout + result.stderr,
+      "encrypted initialization never prints the password")
+
+sys.exit(bool(failures))
+PY
+  while IFS= read -r line; do
+    case "$line" in
+      'PASS: '*) ((TESTS_RUN++)); pass "${line#PASS: }" ;;
+      'FAIL: '*) ((TESTS_RUN++)); fail "${line#FAIL: }" ;;
+      'SKIP: '*) skip "${line#SKIP: }" ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done < "$report"
+  if ((status != 0)) && ! grep -q '^FAIL: ' "$report"; then
+    ((TESTS_RUN++))
+    fail "initialization custody regression driver completed (exit $status)"
+  fi
 }
 
 test_signing_config_is_honored() {
@@ -732,12 +1047,15 @@ echo ""
 
 if [[ "${1:-}" == "--encrypted-only" ]]; then
   test_signing_encrypted_key_input
+elif [[ "${1:-}" == "--init-only" ]]; then
+  test_signing_init_preserves_identities
 else
 test_signing_require_minisign_missing
 test_signing_init_creates_keys
 test_signing_check_valid
 test_signing_fix_permissions
 test_signing_init_force_and_dry_run
+test_signing_init_preserves_identities
 test_signing_config_is_honored
 test_signing_sign_and_verify
 test_signing_verify_failure
