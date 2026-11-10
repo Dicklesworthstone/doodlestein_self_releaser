@@ -366,7 +366,10 @@ the configured Windows `target_triple` into a new private target directory.
 The target must match the installation architecture; the caller must already
 have its Rust standard library and native linker installed. GNU and MSVC target
 selectors remain distinct. The command explicitly selects its target and target
-directory and clears inherited Rust flags and compiler wrappers. `RUSTUP_AUTO_INSTALL=0`
+directory and removes inherited `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, and
+`CARGO_BUILD_RUSTFLAGS` while preserving committed Cargo configuration, including
+project-specific cfg and linker flags. Inherited compiler wrappers are cleared.
+`RUSTUP_AUTO_INSTALL=0`
 prevents repository toolchain files from implicitly installing a compiler.
 Cargo's actual compiler-artifact messages must name exactly the selected
 providers and private executable paths before PE architecture checks and

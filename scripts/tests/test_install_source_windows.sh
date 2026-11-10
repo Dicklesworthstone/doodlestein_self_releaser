@@ -443,8 +443,9 @@ required(["git", "-C", rust_upstream, "config", "user.email", "fixture@example.i
 required(["git", "-C", rust_upstream, "config", "user.name", "DSR Rust Source Fixture"], "rust-git-name")
 rust_files = {
     "project/Cargo.toml": '[workspace]\nmembers = ["primary", "worker"]\ndefault-members = ["primary"]\nresolver = "2"\n',
+    "project/.cargo/config.toml": '[build]\nrustflags = ["--cfg", "dsr_project_cfg"]\n',
     "project/primary/Cargo.toml": '[package]\nname = "primary-provider"\nversion = "0.1.0"\nedition = "2021"\n\n[[bin]]\nname = "app"\npath = "src/main.rs"\n',
-    "project/primary/src/main.rs": 'fn main() { println!("rust-primary-v1"); }\n',
+    "project/primary/src/main.rs": '#[cfg(not(dsr_project_cfg))]\ncompile_error!("committed Cargo build.rustflags was ignored");\nfn main() { println!("rust-primary-v1"); }\n',
     "project/worker/Cargo.toml": '[package]\nname = "worker-provider"\nversion = "0.1.0"\nedition = "2021"\n\n[[bin]]\nname = "helper"\npath = "src/main.rs"\n',
     "project/worker/src/main.rs": 'fn main() { println!("rust-worker-v1"); }\n',
 }
@@ -499,12 +500,15 @@ if options.rust_baseline_project:
 rust_tagged, rust_result, rust_fixture = invoke_rust("rust-tagged", extra={
     "CARGO_BUILD_TARGET": "invalid-ambient-target", "RUSTFLAGS": "--invalid-ambient-option",
     "CARGO_ENCODED_RUSTFLAGS": "--invalid-encoded-option", "RUSTC_WRAPPER": "/nonexistent-rust-wrapper",
+    "CARGO_BUILD_RUSTFLAGS": "--invalid-build-option",
     "CARGO_TARGET_DIR": str(root / "ambient-cargo-target"),
 })
 check("Rust source installs a real Windows PE family from the pinned annotated tag", rust_tagged.returncode == 0,
       rust_tagged.stderr.decode(errors="replace"))
 if rust_tagged.returncode:
     raise SystemExit(1)
+check("committed Cargo cfg flags apply while inherited RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS and CARGO_BUILD_RUSTFLAGS are ignored",
+      rust_tagged.returncode == 0 and rust_result["source"]["source_commit"] == rust_first_commit)
 rust_prefix = Path(rust_fixture["parameters"]["Prefix"])
 check("Rust source pins the older tag despite HEAD advancement and reports its explicit Cargo target",
       rust_result["source"]["source_commit"] == rust_first_commit and rust_first_commit != rust_second_commit and

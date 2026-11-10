@@ -209,8 +209,10 @@ function Build-DsrRustSourceOutputs {
     $environment.RUSTC = $Rustc
     $environment.RUSTC_WRAPPER = ''
     $environment.RUSTC_WORKSPACE_WRAPPER = ''
-    $environment.RUSTFLAGS = ''
-    $environment.CARGO_ENCODED_RUSTFLAGS = ''
+    # An empty flag variable still overrides Cargo's committed configuration.
+    # Remove ambient overrides so the selected project's own cfg/link flags apply.
+    $environment.RUSTFLAGS = $null
+    $environment.CARGO_ENCODED_RUSTFLAGS = $null
     $environment.CARGO_BUILD_RUSTFLAGS = $null
     $environment.CARGO_BUILD_TARGET = $target
     $environment.CARGO_TARGET_DIR = $targetDirectory
