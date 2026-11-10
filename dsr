@@ -17332,7 +17332,52 @@ cmd_signing() {
 
     case "$subcmd" in
         init)
-            signing_init "$@"
+            if ! $JSON_MODE; then
+                signing_init "$@"
+                return $?
+            fi
+            if ! command -v jq >/dev/null 2>&1; then
+                log_error "jq is required for signing initialization JSON output"
+                return 3
+            fi
+            local code=0 initialized=false planned=false help_requested=false arg details backups
+            local dry_run="${DRY_RUN:-false}" force=false no_password=false
+            local -a _SIGNING_INIT_BACKUP_PATHS=()
+            local _SIGNING_INIT_ERROR="" _SIGNING_INIT_ROLLED_BACK=false
+            local _SIGNING_INIT_RECOVERY_REQUIRED=false
+            for arg in "$@"; do
+                case "$arg" in
+                    --dry-run|-n) dry_run=true ;;
+                    --force) force=true ;;
+                    --no-password) no_password=true ;;
+                    --help|-h) help_requested=true ;;
+                esac
+            done
+            # Capture the operation status without a subshell: its recovery
+            # paths and rollback result must survive to the JSON response.
+            signing_init "$@" >&2 || code=$?
+            if [[ $code -eq 0 ]] && ! $help_requested; then
+                if [[ "$dry_run" == true ]]; then planned=true; else initialized=true; fi
+            fi
+            backups=$(jq -nc --args '$ARGS.positional' -- ${_SIGNING_INIT_BACKUP_PATHS[@]+"${_SIGNING_INIT_BACKUP_PATHS[@]}"}) || return 3
+            details=$(jq -nc --arg private_key "$SIGNING_PRIVATE_KEY" --arg public_key "$SIGNING_PUBLIC_KEY" \
+                --argjson initialized "$initialized" --argjson planned "$planned" \
+                --argjson dry_run "$dry_run" --argjson force "$force" --argjson no_password "$no_password" \
+                --argjson backup_paths "$backups" --argjson help "$help_requested" --argjson code "$code" \
+                --arg error "$_SIGNING_INIT_ERROR" --argjson rolled_back "$_SIGNING_INIT_ROLLED_BACK" \
+                --argjson recovery_required "$_SIGNING_INIT_RECOVERY_REQUIRED" '
+                {action:"init",initialized:$initialized,dry_run:$dry_run,force:$force,
+                 password_protected:(($initialized or $planned) and ($no_password | not)),
+                 status:(if $code != 0 then "error" elif $help then "help"
+                         elif $planned then "planned" else "initialized" end),
+                 private_key:$private_key,public_key:$public_key,backup_paths:$backup_paths,
+                 rolled_back:$rolled_back,recovery_required:$recovery_required,
+                 errors:(if $code == 0 then [] else [{code:"E022",
+                    message:(if $error != "" then $error else "Signing initialization failed" end)}] end)}') || return 3
+            local result=success
+            [[ $code -eq 0 ]] || result=error
+            json_envelope signing "$result" "$code" "$details"
+            return "$code"
             ;;
         check)
             if $JSON_MODE; then
@@ -17370,7 +17415,7 @@ SUBCOMMANDS:
 
 EXAMPLES:
     dsr signing init              Generate new keypair
-    dsr signing init --force      Replace the keypair (old pair kept as *.bak.<time>)
+    dsr signing init --force      Replace the keypair (old pair kept in unique *.bak.* files)
     dsr signing init --dry-run    Show what init would create or replace
     dsr signing check             Check if keys are configured
     dsr signing sign artifact.tar.gz
@@ -18621,10 +18666,10 @@ main() {
     done
     # Snapshot retirement preserves ordinary logs too. Startup rotation would
     # otherwise compress/delete them before the snapshots-only handler runs.
-    # Configuration and repository commands own their configuration writes.
-    # Inherited logging could alias config.yaml, repos.yaml or repos.d files,
+    # Configuration, repository and signing commands own their sensitive file
+    # writes. Inherited logging could alias configuration or a signing key,
     # corrupting reads or edits through startup, diagnostics or completion.
-    if ! $dry_run_requested && [[ "$command" != config && "$command" != repos ]]; then
+    if ! $dry_run_requested && [[ "$command" != config && "$command" != repos && "$command" != signing ]]; then
         LOG_FILE="$requested_log_file"
         if ! $snapshot_prune_requested; then
             log_init

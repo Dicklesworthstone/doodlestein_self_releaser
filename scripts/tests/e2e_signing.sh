@@ -378,6 +378,214 @@ test_signing_fix_restores_permissions() {
     harness_teardown
 }
 
+test_signing_init_json_and_custody() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        skip "public signing initialization custody tests require python3"
+        return
+    fi
+    harness_setup
+    local report="$TEST_TMPDIR/init-cli-results" status=0 line
+    # Invoke the actual executable with real keys. The alias cases exercise
+    # startup logging as well as cmd_signing, which a sourced-module test cannot.
+    python3 - "$DSR_CMD" "$TEST_TMPDIR/init-cli" "$(command -v minisign)" \
+        "$PROJECT_ROOT/schemas/envelope.json" \
+        > "$report" <<'PY' || status=$?
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+
+cli, directory, real_minisign, envelope_schema = sys.argv[1:]
+root = Path(directory)
+root.mkdir(mode=0o700)
+failures = 0
+documents = []
+
+def check(condition, label):
+    global failures
+    print(("PASS: " if condition else "FAIL: ") + label, flush=True)
+    failures += not condition
+
+def run(command, env=None):
+    process = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               start_new_session=True)
+    try:
+        out, err = process.communicate(timeout=20)
+        return subprocess.CompletedProcess(command, process.returncode, out, err)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        out, err = process.communicate()
+        return subprocess.CompletedProcess(command, 124, out, err)
+
+def case(name, populated=True):
+    folder = root / name
+    folder.mkdir(mode=0o700)
+    config = folder / "config"
+    private, public = config / "secrets" / "minisign.key", config / "minisign.pub"
+    if populated:
+        private.parent.mkdir(mode=0o700, parents=True)
+        result = run([real_minisign, "-G", "-W", "-s", str(private), "-p", str(public)])
+        if result.returncode:
+            raise RuntimeError("real Minisign fixture generation failed")
+        private.chmod(0o600)
+    env = {"PATH": os.environ["PATH"], "HOME": str(folder), "LANG": "C", "NO_COLOR": "1",
+           "DSR_CONFIG_DIR": str(config), "DSR_STATE_DIR": str(folder / "state"),
+           "DSR_CACHE_DIR": str(folder / "cache"), "DSR_MINISIGN_KEY": str(private)}
+    return folder, private, public, env
+
+def inventory(folder):
+    result = {}
+    for path in sorted([folder, *folder.rglob("*")]):
+        info = path.lstat()
+        value = (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns)
+        if stat.S_ISREG(info.st_mode):
+            value += (hashlib.sha256(path.read_bytes()).hexdigest(),)
+        elif stat.S_ISLNK(info.st_mode):
+            value += (os.readlink(path),)
+        result[str(path)] = value
+    return result
+
+def invoke(paths, arguments):
+    result = run([cli, *arguments], env=paths[3])
+    try:
+        payload = json.loads(result.stdout)
+    except (ValueError, UnicodeDecodeError):
+        payload = {}
+        print("INFO: initialization returned no JSON:", arguments, "status", result.returncode,
+              result.stderr.decode(errors="replace"), flush=True)
+    documents.append(payload)
+    return result, payload
+
+def truthful(result, payload):
+    return (isinstance(payload, dict) and payload.get("command") == "signing"
+            and payload.get("exit_code") == result.returncode
+            and payload.get("status") == ("success" if result.returncode == 0 else "error")
+            and all(field in payload for field in ("run_id", "started_at", "duration_ms", "tool", "version")))
+
+for position in ("global", "local", "short"):
+    for alias in ("private", "public", "hardlink"):
+        paths = case(position + "-" + alias)
+        if alias == "hardlink":
+            log = paths[0] / "session.log"
+            os.link(paths[1], log)
+        else:
+            log = paths[1] if alias == "private" else paths[2]
+        paths[3]["LOG_FILE"] = str(log)
+        before = inventory(paths[0])
+        arguments = ["--json", "--dry-run", "signing", "init", "--force", "--no-password"]
+        if position == "local":
+            arguments = ["signing", "init", "--force", "--no-password", "--json", "--dry-run"]
+        elif position == "short":
+            arguments = ["signing", "init", "--force", "--no-password", "-j", "-n"]
+        result, payload = invoke(paths, arguments)
+        details = payload.get("details", {})
+        check(result.returncode == 0 and truthful(result, payload)
+              and details.get("status") == "planned" and details.get("initialized") is False
+              and details.get("dry_run") is True and details.get("backup_paths") == []
+              and inventory(paths[0]) == before,
+              position + " JSON preview preserves every file with a " + alias + " signing-key log alias")
+
+fresh = case("fresh-preview", populated=False)
+before = inventory(fresh[0])
+result, payload = invoke(fresh, ["--json", "signing", "init", "--dry-run", "--no-password"])
+check(result.returncode == 0 and truthful(result, payload)
+      and payload.get("details", {}).get("initialized") is False and inventory(fresh[0]) == before,
+      "fresh public CLI preview reports a plan without creating config, state, cache, or logs")
+
+unknown = case("unknown-option")
+unknown[3]["LOG_FILE"] = str(unknown[1])
+before = inventory(unknown[0])
+result, payload = invoke(unknown, ["--json", "signing", "init", "--force", "--unknown-init-option"])
+check(result.returncode == 4 and truthful(result, payload)
+      and payload.get("details", {}).get("initialized") is False
+      and payload.get("details", {}).get("errors") and inventory(unknown[0]) == before,
+      "invalid public initialization returns a truthful JSON error without logging into either key")
+
+held = case("interrupted-lease")
+Path(str(held[1]) + ".init.lock").mkdir(mode=0o700)
+before = inventory(held[0])
+result, payload = invoke(held, ["--json", "signing", "init", "--force", "--no-password"])
+check(result.returncode == 2 and truthful(result, payload)
+      and payload.get("details", {}).get("recovery_required") is True
+      and inventory(held[0]) == before,
+      "an existing initialization lease returns conflict and exposes recovery without mutation")
+
+missing_parser = case("missing-json-parser")
+bin_dir = missing_parser[0] / "bin"
+bin_dir.mkdir()
+# Preserve real commands, including Minisign; only jq is absent. This avoids a
+# fake parser or a fake generator reporting success for an unexecuted operation.
+for name in ("bash", "dirname", "basename", "date", "cat", "tr", "mkdir", "stat", "cp", "chmod",
+             "mktemp", "ln", "mv", "rm", "rmdir", "readlink", "head", "sed", "cut", "awk", "sha256sum"):
+    executable = shutil.which(name)
+    if executable:
+        (bin_dir / name).symlink_to(executable)
+(bin_dir / "minisign").symlink_to(real_minisign)
+missing_parser[3]["PATH"] = str(bin_dir)
+missing_parser[3]["LOG_FILE"] = str(missing_parser[1])
+before = inventory(missing_parser[0])
+result = run([cli, "--json", "signing", "init", "--force", "--no-password"], missing_parser[3])
+check(shutil.which("jq", path=str(bin_dir)) is None and result.returncode == 3
+      and b"jq is required" in result.stderr and not result.stdout
+      and inventory(missing_parser[0]) == before,
+      "missing real JSON dependency refuses forced initialization before keys or backups change")
+
+for alias in ("private", "public"):
+    paths = case("forced-" + alias)
+    old = tuple(path.read_bytes() for path in paths[1:3])
+    paths[3]["LOG_FILE"] = str(paths[1] if alias == "private" else paths[2])
+    result, payload = invoke(paths, ["signing", "init", "--force", "--no-password", "--json"])
+    details = payload.get("details", {})
+    backup_paths = [Path(path) for path in details.get("backup_paths", [])]
+    saved = [path.read_bytes() for path in backup_paths if path.is_file()]
+    check(result.returncode == 0 and truthful(result, payload) and details.get("initialized") is True
+          and details.get("status") == "initialized" and details.get("dry_run") is False
+          and details.get("password_protected") is False and len(saved) == 2
+          and all(key in saved for key in old),
+          "forced JSON initialization reports both preserved originals with a " + alias + " log alias")
+    artifact = paths[0] / "artifact.bin"
+    artifact.write_bytes(b"actual CLI signing identity\n")
+    signed = run([cli, "signing", "sign", str(artifact)], paths[3])
+    verified = run([real_minisign, "-V", "-p", str(paths[2]), "-m", str(artifact)])
+    check(signed.returncode == 0 and verified.returncode == 0,
+          "the rotated " + alias + "-alias CLI identity signs artifacts accepted by independent Minisign")
+
+try:
+    from jsonschema import Draft202012Validator, FormatChecker
+except ImportError:
+    print("SKIP: public initialization JSON schema validation requires jsonschema", flush=True)
+else:
+    validator = Draft202012Validator(json.loads(Path(envelope_schema).read_text()),
+                                     format_checker=FormatChecker())
+    errors = [error.message for document in documents for error in validator.iter_errors(document)]
+    check(len(documents) == 14 and not errors,
+          "all 14 actual initialization JSON responses satisfy the published envelope schema")
+    if errors:
+        print("INFO: JSON schema errors:", errors, flush=True)
+
+sys.exit(bool(failures))
+PY
+    while IFS= read -r line; do
+        case "$line" in
+            'PASS: '*) ((TESTS_RUN++)); pass "${line#PASS: }" ;;
+            'FAIL: '*) ((TESTS_RUN++)); fail "${line#FAIL: }" ;;
+            'SKIP: '*) skip "${line#SKIP: }" ;;
+            *) printf '%s\n' "$line" ;;
+        esac
+    done < "$report"
+    if ((status != 0)) && ! grep -q '^FAIL: ' "$report"; then
+        ((TESTS_RUN++))
+        fail "public initialization regression driver completed (exit $status)"
+    fi
+    harness_teardown
+}
+
 # ============================================================================
 # Cleanup
 # ============================================================================
@@ -404,6 +612,7 @@ test_signing_init_creates_keypair
 test_signing_init_creates_private_key
 test_signing_init_creates_public_key
 test_signing_init_private_key_permissions
+test_signing_init_json_and_custody
 
 echo ""
 echo "Key Check:"

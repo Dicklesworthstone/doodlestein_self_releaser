@@ -513,6 +513,23 @@ available; noninteractive signing never prompts. Verified existing signatures
 can be reused without the password file. This option applies to signing, while
 `dsr signing init` continues to ask for the new key's password interactively.
 
+To rotate a signing identity, use `dsr signing init --force`. DSR preserves
+both old keys in adjacent `*.bak.TIMESTAMP.SUFFIX` files before generating the
+replacement in private staging. Each rotation retains a separate generation,
+even within the same second; private backups have mode `0600`. Existing backup
+files are never overwritten. The replacement private key has mode `0600`, and
+an unrelated hardlink to the original keeps its original contents.
+
+`dsr signing init --force --dry-run` previews the operation without creating
+keys, directories, backups, locks or logs. Generation and handled publication
+failures preserve or restore the original pair. An interrupted initializer
+retains its `KEY.init.lock` directories, private staging and backup paths;
+inspect and recover that generation before retrying. The two key replacements
+are individually atomic, so readers must not sign concurrently with rotation.
+This does not promise an atomic pair swap or power-loss durability. See the
+[signing initialization contract](docs/CLI_CONTRACT.md#dsr-signing) for recovery
+and JSON results.
+
 An exact release contract may include `SHA256SUMS`, `SHA256SUMS.txt`, or the
 legacy `checksums.txt` in `exact_additional_assets`, together with each selected
 aggregate's `.minisig` signature. All three names use the same sorted checksum

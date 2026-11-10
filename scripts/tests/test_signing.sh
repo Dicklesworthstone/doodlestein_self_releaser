@@ -468,6 +468,12 @@ if result.returncode != 0:
           result.stderr.decode(errors="replace"), flush=True)
 check(result.returncode == 0 and signs_and_verifies(encrypted[2], encrypted[3], encrypted[0], "encrypted", password=password),
       "default initialization retains real password-protected Minisign key generation")
+wrong_signature = encrypted[0] / "wrong-password.minisig"
+wrong_password = run([real_minisign, "-S", "-s", str(encrypted[2]),
+                      "-m", str(encrypted[0] / "encrypted.bin"), "-x", str(wrong_signature)],
+                     data=b"deliberately incorrect initialization fixture password\n")
+check(result.returncode == 0 and wrong_password.returncode != 0 and not wrong_signature.exists(),
+      "the initialized protected key refuses a wrong password without publishing a signature")
 check(password not in result.stdout + result.stderr,
       "encrypted initialization never prints the password")
 

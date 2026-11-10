@@ -2646,6 +2646,82 @@ same interpretation.
 
 ---
 
+### `dsr signing`
+
+Manage Minisign identities and artifact signatures. The default subcommand is
+`check`; other subcommands are `init`, `sign`, `verify`, `fix`, and `pubkey`.
+
+**Initialization:**
+
+```bash
+dsr signing init                         # Password-protected key generation
+dsr signing init --force                 # Preserve and rotate an existing pair
+dsr --json signing init --force --dry-run # Read-only rotation plan
+```
+
+`init` accepts `--force`, `--no-password`, `--dry-run` (or `-n`), and `--help`.
+Without `--force`, either existing key prevents initialization. The private
+key defaults to `$DSR_CONFIG_DIR/secrets/minisign.key` and can be selected with
+`DSR_MINISIGN_KEY`; the public key is `$DSR_CONFIG_DIR/minisign.pub`. New parent
+directories are private. DSR restricts its managed secrets directory to mode
+`0700` but does not change the permissions of an arbitrary existing parent
+selected through `DSR_MINISIGN_KEY`. Symlink leaves, directories, special files,
+and private/public paths that alias or overlap one another are refused.
+
+A forced initialization copies and verifies every existing original before
+generating replacements. Backups are adjacent `KEY.bak.TIMESTAMP.SUFFIX` files;
+one unique suffix identifies both members of a generation. Backup publication
+is exclusive and never overwrites an occupied name. Every private-key backup
+has mode `0600`, even if the original had looser permissions. Minisign generates
+both new files in private staging; only a successful, complete generation can
+replace either active key. New private keys have mode `0600` and public keys
+`0644`. Replacing a key leaves unrelated hardlinks to the old inode unchanged.
+The default still prompts for a password; `--no-password` explicitly requests
+an unprotected key. `DSR_MINISIGN_PASSWORD_FILE` remains a signing option and
+does not supply the new password during initialization.
+
+Global and command-local previews create no files or directories and preserve
+all existing key bytes, modes and identities. All signing commands suppress
+persistent session logging, so even a configured log path that aliases a key
+cannot corrupt it. Human diagnostics and Minisign output go to stderr.
+
+For `--json init`, stdout contains one `signing` envelope and its exit code
+matches the process result. `details` contains `action: "init"`, `status`
+(`planned`, `initialized`, `help`, or `error`), `initialized`, `dry_run`,
+`force`, `password_protected`, `private_key`, `public_key`, `backup_paths`,
+`rolled_back`, `recovery_required`, and `errors`. `initialized` is true only
+after the complete operation succeeds. `password_protected` describes the
+planned or successfully created identity, not a pre-existing key on failure.
+JSON mode requires jq before any key changes. Missing dependencies return 3;
+invalid destinations/options return 4; conflicting initialization returns 2;
+other operation failures return 1.
+
+**Failure and interruption recovery:**
+
+Each canonical key pathname has a `KEY.init.lock` directory. Cooperating
+initializers refuse a held lease. Its `stage.*` directory records the preserved
+original's `backup-path`; it may also contain `new` or `expected` candidate
+bytes. Handled publication failure restores only files that still match this
+operation's candidate inode and bytes, using independent copies of the backups.
+A concurrent change is preserved and reported as requiring recovery. Backups
+remain available after either success or failure.
+
+Termination can leave a mixed pair of complete files, retained backups, and
+leases. A subsequent initializer refuses those leases; it does not guess that
+they are stale. Stop all signing/rotation writers, inspect both leases and their
+matching backup generation, and verify the original pair using a disposable
+artifact before restoring it. Restore each key from an independent copy of its
+matching backup, retaining the backup itself; restrict the private copy to mode
+`0600`. Move the inspected lease directories aside only after recovery. Then
+verify a real signature with the restored pair before retrying initialization.
+
+These guarantees concern cooperating writers and process interruptions on a
+local filesystem. They do not promise simultaneous visibility of the two new
+keys, power-loss durability, or protection against hostile parent-directory
+replacement. Finish release signing before rotating its identity.
+
+---
+
 ### `dsr doctor`
 
 System diagnostics.
