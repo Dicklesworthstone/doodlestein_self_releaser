@@ -258,12 +258,13 @@ _config_init_stat() {
     stat -c '%d:%i:%u:%g:%a' -- "$1" 2>/dev/null || stat -f '%d:%i:%u:%g:%Lp' "$1"
 }
 
-# The helpers below use config_init's dynamically scoped transaction arrays.
-# All default bytes and all original backups exist before the first publish.
+# The helpers below use the caller's dynamically scoped transaction arrays
+# and trusted renderer. Initialization and persistent edits share the same
+# locks, verified backups, staged writes and guarded rollback.
 _config_init_apply() {
-    local index prior path lock stage backup stamp metadata mode generation=""
+    local index prior path lock stage backup stamp metadata mode render_status generation=""
     stamp=$(date -u +%Y%m%dT%H%M%SZ) || { _config_init_error "Could not timestamp configuration backups"; return 1; }
-    for ((index = 0; index < 3; index++)); do
+    for ((index = 0; index < ${#canonical_paths[@]}; index++)); do
         path="${canonical_paths[index]}"
         lock="$path.init.lock"
         # Even an otherwise no-op init must not declare a killed reset's
@@ -292,7 +293,7 @@ _config_init_apply() {
         [[ -n "$generation" ]] || generation="${init_stages[index]##*/}"
     done
 
-    for ((index = 0; index < 3; index++)); do
+    for ((index = 0; index < ${#canonical_paths[@]}; index++)); do
         ${init_selected[index]} || continue
         path="${canonical_paths[index]}"
         stage="${init_stages[index]}"
@@ -346,7 +347,7 @@ _config_init_apply() {
         fi
     done
 
-    for ((index = 0; index < 3; index++)); do
+    for ((index = 0; index < ${#canonical_paths[@]}; index++)); do
         ${init_selected[index]} || continue
         path="${canonical_paths[index]}"
         stage="${init_stages[index]}"
@@ -363,7 +364,16 @@ _config_init_apply() {
             _config_init_error "Could not stage new configuration $path"
             return 1
         fi
-        if ! _config_init_render_default "$index" > "$stage/new" || ! chmod "$mode" "$stage/new" ||
+        render_status=0
+        "$init_renderer" "$index" > "$stage/new" || render_status=$?
+        if [[ $render_status -ne 0 ]]; then
+            _config_init_error "Could not finish staging $path; live configuration unchanged"
+            case "$render_status" in
+                3|4) return "$render_status" ;;
+                *) return 1 ;;
+            esac
+        fi
+        if ! chmod "$mode" "$stage/new" ||
            ! cp -p -- "$stage/new" "$stage/expected" ||
            ! init_candidates[index]=$(_config_init_stat "$stage/new"); then
             _config_init_error "Could not finish staging $path; live configuration unchanged"
@@ -377,11 +387,11 @@ _config_init_apply() {
 
     # Recheck the entire set after preparation, then each leaf immediately
     # before publication. Cooperating initializers hold the same leaf locks.
-    for ((index = 0; index < 3; index++)); do
+    for ((index = 0; index < ${#canonical_paths[@]}; index++)); do
         ${init_selected[index]} || continue
         _config_init_original_unchanged "$index" || return $?
     done
-    for ((index = 0; index < 3; index++)); do
+    for ((index = 0; index < ${#canonical_paths[@]}; index++)); do
         ${init_selected[index]} || continue
         _config_init_original_unchanged "$index" || return $?
         path="${canonical_paths[index]}"
@@ -472,7 +482,7 @@ _config_init_rollback() {
 
 _config_init_cleanup() {
     local index stage lock failed=false
-    for ((index = 0; index < 3; index++)); do
+    for ((index = 0; index < ${#canonical_paths[@]}; index++)); do
         lock="${init_locks[index]}"
         [[ -n "$lock" ]] || continue
         stage="${init_stages[index]}"
@@ -497,6 +507,7 @@ _config_init_cleanup() {
 # Usage: config_init [--force] [--dry-run]
 config_init() {
     local force=false dry_run="${DRY_RUN:-false}" status=0 path previous parent index prior init_attempted_count=0
+    local init_renderer=_config_init_render_default
     local -a init_paths=("$DSR_CONFIG_FILE" "$DSR_HOSTS_FILE" "$DSR_REPOS_FILE")
     local -a canonical_paths=("" "" "") backups=("" "" "")
     local -a init_locks=("" "" "") init_stages=("" "" "") init_before=("" "" "")
@@ -808,36 +819,110 @@ config_get() {
     fi
 }
 
-# Set a config value (in memory and optionally persist)
-# Usage: config_set <key> <value> [--persist]
+# Render an edit from the preserved original; never let yq edit a live path.
+# The optional source is used for read-only preflight before acquiring a lock.
+# Migration's version admission is repeated against the locked original.
+_config_value_render() {
+    local index="$1" source parsed
+    source="${2:-${init_stages[index]}/original}"
+    if ! parsed=$(_config_read_single_mapping_json "$source"); then
+        _config_init_error "Cannot edit configuration without one valid YAML mapping: $source"
+        return 4
+    fi
+    if [[ "$init_missing_schema" == true ]] && ! jq -e '
+        (has("schema_version") | not) or .schema_version == null or .schema_version == ""
+    ' <<< "$parsed" >/dev/null; then
+        _config_init_error "Configuration schema changed before migration: $source"
+        return 4
+    fi
+    # Only identifier paths reach this renderer. strenv preserves the value
+    # literally, including quotes and newlines, without interpreting YAML/code.
+    if ! DSR_SET_VALUE="$init_value" yq ".$init_key = strenv(DSR_SET_VALUE)" "$source"; then
+        _config_init_error "Could not render configuration value for $init_key"
+        return 1
+    fi
+}
+
+# Persist one value using the initializer's transaction engine and leaf lock.
+# The missing-schema guard is internal to migration, not a user yq program.
+# Usage: _config_persist_value <key> <value> [missing_schema] [dry_run]
+_config_persist_value() {
+    local init_key="$1" init_value="$2" init_missing_schema="${3:-false}"
+    local dry_run="${4:-${DRY_RUN:-false}}" force=true status=0 init_attempted_count=0
+    local init_renderer=_config_value_render path
+    local -a canonical_paths=("") backups=("") init_locks=("") init_stages=("")
+    local -a init_before=("") init_candidates=("") init_selected=(true) init_attempted=()
+    _DSR_CONFIG_INIT_BACKUP_PATHS=()
+    _DSR_CONFIG_INIT_ERROR=""
+    _DSR_CONFIG_INIT_ROLLED_BACK=false
+    _DSR_CONFIG_INIT_RECOVERY_REQUIRED=false
+
+    if [[ ! "$init_key" =~ ^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$ ]]; then
+        _config_init_error "Refusing to persist key with unsafe characters: $init_key"
+        return 4
+    fi
+    if ! command -v yq >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+        _config_init_error "Saving configuration requires yq (mikefarah/yq v4) and jq"
+        return 3
+    fi
+    if ! path=$(_config_init_path "$DSR_CONFIG_FILE") || [[ -L "$path" || ! -f "$path" ]]; then
+        _config_init_error "Configuration destination must be an existing regular file: $DSR_CONFIG_FILE"
+        return 4
+    fi
+    canonical_paths[0]="$path"
+    # Check the transformation without writes even on a real run. Re-render
+    # from the verified original after the shared lock has been acquired.
+    _config_value_render 0 "$path" >/dev/null || return $?
+    if [[ "$dry_run" == true ]]; then
+        _cfg_log_info "[dry-run] Would back up and set $init_key in $DSR_CONFIG_FILE"
+        return 0
+    fi
+
+    _config_init_apply || status=$?
+    if [[ $status -ne 0 ]]; then
+        _config_init_rollback || true
+    fi
+    if ! $_DSR_CONFIG_INIT_RECOVERY_REQUIRED; then
+        if ! _config_init_cleanup; then
+            _DSR_CONFIG_INIT_RECOVERY_REQUIRED=true
+            [[ $status -ne 0 ]] || status=1
+        fi
+    fi
+    return "$status"
+}
+
+# Set a config value in memory, optionally committing it to disk first.
+# A preview or failed persistence leaves the caller's configuration unchanged.
+# Usage: config_set <key> <value> [--persist] [--dry-run]
 config_set() {
-    local key="$1"
-    local value="$2"
-    local persist=false
-    [[ "${3:-}" == "--persist" ]] && persist=true
-
+    local key="${1:-}" value="${2:-}" persist=false dry_run="${DRY_RUN:-false}"
+    _DSR_CONFIG_INIT_BACKUP_PATHS=()
+    _DSR_CONFIG_INIT_ERROR=""
+    _DSR_CONFIG_INIT_ROLLED_BACK=false
+    _DSR_CONFIG_INIT_RECOVERY_REQUIRED=false
+    if [[ $# -lt 2 || -z "$key" ]]; then
+        _config_init_error "Usage: config_set <key> <value> [--persist] [--dry-run]"
+        return 4
+    fi
+    shift 2
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --persist) persist=true ;;
+            --dry-run|-n) dry_run=true ;;
+            *) _config_init_error "Unknown config set option: $1"; return 4 ;;
+        esac
+        shift
+    done
+    if $persist; then
+        _config_persist_value "$key" "$value" false "$dry_run" || return $?
+    fi
+    if [[ "$dry_run" == true ]]; then
+        $persist || _cfg_log_info "[dry-run] Would set $key in memory"
+        return 0
+    fi
     DSR_CONFIG["$key"]="$value"
-
-    if $persist && command -v yq &>/dev/null; then
-        # Only accept dotted-path keys built from identifier characters —
-        # anything else could inject yq expression syntax (e.g. quotes or
-        # arithmetic) through the unquoted interpolation below.
-        if [[ ! "$key" =~ ^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$ ]]; then
-            _cfg_log_error "Refusing to persist key with unsafe characters: $key"
-            return 4
-        fi
-
-        # yq (Mike Farah Go version) does NOT accept jq-style --arg flags;
-        # pass the value through the environment and read it back with
-        # strenv() inside the expression so the YAML string escaping is
-        # handled by yq itself. Check the exit code so we surface errors
-        # instead of claiming success when persistence actually failed.
-        if DSR_SET_VALUE="$value" yq -i ".$key = strenv(DSR_SET_VALUE)" "$DSR_CONFIG_FILE" 2>/dev/null; then
-            _cfg_log_ok "Set $key = $value (persisted)"
-        else
-            _cfg_log_error "Failed to persist $key to $DSR_CONFIG_FILE"
-            return 1
-        fi
+    if $persist; then
+        _cfg_log_ok "Set $key = $value (persisted; original backup retained)"
     else
         _cfg_log_info "Set $key = $value (in memory)"
     fi
@@ -2266,6 +2351,7 @@ export -f config_init config_load config_get config_set config_validate config_s
 export -f _config_init_error _config_init_path _config_init_stat _config_init_apply
 export -f _config_init_original_unchanged _config_init_candidate_unchanged
 export -f _config_init_rollback _config_init_cleanup _config_init_render_default
+export -f _config_persist_value _config_value_render _config_read_single_mapping_json
 export -f _cfg_log_info _cfg_log_ok _cfg_log_warn _cfg_log_error
 export _CFG_RED _CFG_GREEN _CFG_YELLOW _CFG_BLUE _CFG_NC
 export -f config_get_host config_get_tool config_list_hosts config_list_tools

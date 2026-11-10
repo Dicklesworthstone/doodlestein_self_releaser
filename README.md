@@ -1280,7 +1280,10 @@ dsr config init --force --dry-run               # Preview a reset
 dsr config init --force                         # Preserve originals, then reset
 dsr config show                                 # Show current config
 dsr config get threshold_seconds                # Get specific value
-dsr config set threshold_seconds=300            # Set value
+dsr config set threshold_seconds=300 --dry-run  # Preview a value change
+dsr config set threshold_seconds=300            # Preserve original, then set value
+dsr config migrate --dry-run                    # Preview schema migration
+dsr config edit --dry-run                       # Preview without launching editor
 dsr config validate                             # Validate config files
 ```
 
@@ -1294,6 +1297,14 @@ If initialization is killed, the preserved originals and `*.init.lock`
 directories remain available for recovery. A later run refuses to steal those
 locks. See the [configuration initialization contract](docs/CLI_CONTRACT.md#dsr-config)
 for JSON recovery fields, backup restoration, and interruption limits.
+
+`config set` and `config migrate` share those backups, locks and atomic
+replacement rules. They require yq and jq and refuse an interrupted
+initialization until its retained state has been inspected. Their previews
+leave files and configuration memory unchanged; JSON reports `persisted: false`.
+All configuration commands suppress persistent session logging so a log path
+that points at a configuration file cannot corrupt it. `config edit --dry-run`
+never launches the editor.
 
 ### `dsr doctor`
 

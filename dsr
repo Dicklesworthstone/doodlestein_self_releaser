@@ -307,15 +307,16 @@ SUBCOMMANDS:
     init        Initialize configuration directories and files
     show        Show current configuration (--section <name> for one part)
     get <key>   Get a specific config value
-    set <k>=<v> Set a config value (saved to config.yaml; requires yq)
+    set <k>=<v> Set a config value (backup and save; requires yq and jq)
     validate    Validate configuration files
-    migrate     Bring config.yaml to the current schema (backup first)
+    migrate     Bring config.yaml to the current schema (backup; yq and jq)
     edit        Open config in $EDITOR
 
 OPTIONS:
     --json      Output in JSON format
     --force     Back up and replace existing files (init only)
-    --dry-run   Show initialization or migration changes without writing
+    --dry-run   Preview init, set, migrate or edit without changing files
+    -n          Alias for --dry-run
 
 EXAMPLES:
     dsr config init              Create default config files
@@ -325,8 +326,10 @@ EXAMPLES:
     dsr config show --section signing
     dsr config get threshold_seconds
     dsr config set log_level=debug
+    dsr config set --dry-run log_level=debug
     dsr config validate
     dsr config migrate --dry-run
+    dsr config edit --dry-run
 EOF
             ;;
         *)
@@ -489,37 +492,79 @@ cmd_config_get() {
 }
 
 cmd_config_set() {
-    local input="${1:-}"
-    if [[ -z "$input" || ! "$input" =~ = ]]; then
-        log_error "Usage: dsr config set KEY=VALUE"
-        return 4
+    local input="" key="" value="" input_seen=false
+    local dry_run="${DRY_RUN:-false}" status=0 reason="" persisted=false
+    local -a set_args=(--persist) _DSR_CONFIG_INIT_BACKUP_PATHS=()
+    local _DSR_CONFIG_INIT_ERROR="" _DSR_CONFIG_INIT_ROLLED_BACK=false
+    local _DSR_CONFIG_INIT_RECOVERY_REQUIRED=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run|-n) dry_run=true ;;
+            -*) status=4 reason="Unknown config set option: $1" ;;
+            *=*)
+                if $input_seen; then
+                    status=4 reason="config set requires exactly one KEY=VALUE assignment"
+                else
+                    input="$1"
+                    input_seen=true
+                fi
+                ;;
+            *) status=4 reason="Usage: dsr config set [--dry-run] KEY=VALUE" ;;
+        esac
+        shift
+    done
+    if ! $input_seen && [[ $status -eq 0 ]]; then
+        status=4 reason="Usage: dsr config set [--dry-run] KEY=VALUE"
+    fi
+    if $input_seen; then
+        key="${input%%=*}"
+        value="${input#*=}"
+    fi
+    if $JSON_MODE && ! command -v jq >/dev/null 2>&1; then
+        log_error "jq is required for config set --json"
+        return 3
     fi
 
-    local key="${input%%=*}"
-    local value="${input#*=}"
-    local status=0 reason=""
-
-    # A one-shot CLI has no "in memory": the value is saved or the command fails.
-    if ! command -v yq &>/dev/null; then
-        log_error "Saving configuration requires yq (mikefarah/yq v4)"
-        status=3 reason="yq is not installed"
-    elif [[ ! -f "$DSR_CONFIG_FILE" ]]; then
-        log_error "No configuration file at $DSR_CONFIG_FILE; run 'dsr config init' first"
-        status=4 reason="configuration file not found"
-    else
-        config_load
-        config_set "$key" "$value" --persist || status=$?
-        [[ $status -eq 0 ]] || reason="could not write $DSR_CONFIG_FILE"
+    # The module commits the file before updating memory. Loading the current
+    # configuration here would mutate that memory even on a preview or failure.
+    if [[ $status -eq 0 ]]; then
+        if ! command -v yq >/dev/null 2>&1; then
+            status=3 reason="yq (mikefarah/yq v4) is not installed"
+        elif [[ ! -f "$DSR_CONFIG_FILE" ]]; then
+            status=4 reason="configuration file not found; run 'dsr config init'"
+        else
+            $dry_run && set_args+=(--dry-run)
+            if $JSON_MODE; then
+                config_set "$key" "$value" "${set_args[@]}" >/dev/null 2>&1 || status=$?
+            else
+                config_set "$key" "$value" "${set_args[@]}" || status=$?
+            fi
+            if [[ $status -ne 0 ]]; then
+                reason="${_DSR_CONFIG_INIT_ERROR:-could not write $DSR_CONFIG_FILE}"
+            elif ! $dry_run; then
+                persisted=true
+            fi
+        fi
     fi
+    [[ $status -eq 0 ]] || log_error "Config update failed: $reason"
 
     if $JSON_MODE; then
-        _config_envelope "$status" "$(jq -nc --arg key "$key" --arg value "$value" \
-            --arg file "$DSR_CONFIG_FILE" --arg reason "$reason" '
-            {action: "set", key: $key, value: $value, config_file: $file, persisted: ($reason == "")}
-            + (if $reason == "" then {} else {errors: [{message: $reason,
-                code: (if ($reason | test("not found|not installed")) then "E031" else "E030" end)}]} end)')"
+        local details backup_paths
+        backup_paths=$(jq -nc --args '$ARGS.positional' -- ${_DSR_CONFIG_INIT_BACKUP_PATHS[@]+"${_DSR_CONFIG_INIT_BACKUP_PATHS[@]}"}) || return 3
+        details=$(jq -nc --arg key "$key" --arg value "$value" \
+            --arg file "$DSR_CONFIG_FILE" --arg reason "$reason" \
+            --argjson dry_run "$dry_run" --argjson persisted "$persisted" \
+            --argjson backup_paths "$backup_paths" \
+            --argjson rolled_back "$_DSR_CONFIG_INIT_ROLLED_BACK" \
+            --argjson recovery_required "$_DSR_CONFIG_INIT_RECOVERY_REQUIRED" '
+            {action: "set", key: $key, value: $value, config_file: $file,
+             dry_run: $dry_run, persisted: $persisted, backup_paths: $backup_paths,
+             rolled_back: $rolled_back, recovery_required: $recovery_required,
+             errors: (if $reason == "" then [] else [{message: $reason,
+                code: (if ($reason | test("not found|not installed")) then "E031" else "E030" end)}] end)}') || return 3
+        _config_envelope "$status" "$details" || return 3
     fi
-    return $status
+    return "$status"
 }
 
 cmd_config_validate() {
@@ -539,67 +584,132 @@ cmd_config_validate() {
 # Schema 1.0.0 is the only version so far: migration stamps a missing
 # schema_version and refuses versions this dsr does not know.
 cmd_config_migrate() {
-    local dry_run="${DRY_RUN:-false}"
+    local dry_run="${DRY_RUN:-false}" status=0 reason="" persisted=false
+    local target="$DSR_SCHEMA_VERSION" from="" backup="" document="" schema_state="" migration_needed=false
+    local -a changed=() _DSR_CONFIG_INIT_BACKUP_PATHS=()
+    local _DSR_CONFIG_INIT_ERROR="" _DSR_CONFIG_INIT_ROLLED_BACK=false
+    local _DSR_CONFIG_INIT_RECOVERY_REQUIRED=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --dry-run|-n) dry_run=true; shift ;;
-            *) log_error "Unknown option: $1"; return 4 ;;
+            --dry-run|-n) dry_run=true ;;
+            *) status=4 reason="Unknown config migrate option: $1" ;;
         esac
+        shift
     done
-
-    local target="$DSR_SCHEMA_VERSION" from="" status=0 reason="" backup=""
-    local -a changed=()
-    if [[ ! -f "$DSR_CONFIG_FILE" ]]; then
-        status=4 reason="configuration file not found; run 'dsr config init'"
-    elif ! command -v yq &>/dev/null; then
-        status=3 reason="yq (mikefarah/yq v4) is required"
-    elif ! from=$(yq -r '.schema_version // "" | tostring' "$DSR_CONFIG_FILE" 2>/dev/null); then
-        status=4 reason="configuration file is not valid YAML"
-    elif [[ -z "$from" || "$from" == null ]]; then
-        from=""
-        changed+=(schema_version)
-    elif [[ "$from" != "$target" ]]; then
-        status=4 reason="unknown schema_version $from (this dsr supports $target)"
+    if $JSON_MODE && ! command -v jq >/dev/null 2>&1; then
+        log_error "jq is required for config migrate --json"
+        return 3
+    fi
+    if [[ $status -eq 0 ]]; then
+        if [[ ! -f "$DSR_CONFIG_FILE" ]]; then
+            status=4 reason="configuration file not found; run 'dsr config init'"
+        elif ! command -v yq >/dev/null 2>&1; then
+            status=3 reason="yq (mikefarah/yq v4) is required"
+        elif ! command -v jq >/dev/null 2>&1; then
+            status=3 reason="jq is required for configuration migration"
+        elif ! document=$(_config_read_single_mapping_json "$DSR_CONFIG_FILE" 2>/dev/null); then
+            status=4 reason="configuration must contain exactly one YAML mapping without duplicate keys"
+        elif ! schema_state=$(jq -r --arg target "$target" '
+                if (has("schema_version") | not) or .schema_version == null or .schema_version == ""
+                then "missing"
+                elif (.schema_version | type) != "string" then "invalid"
+                elif .schema_version == $target then "current"
+                else "unknown" end' <<< "$document"); then
+            status=4 reason="could not inspect configuration schema_version"
+        else
+            case "$schema_state" in
+                missing) changed+=(schema_version); migration_needed=true ;;
+                current) from="$target" ;;
+                invalid) status=4 reason="schema_version must be a string or null" ;;
+                unknown)
+                    from=$(jq -r '.schema_version' <<< "$document")
+                    status=4 reason="unknown schema_version $from (this dsr supports $target)"
+                    ;;
+                *) status=4 reason="could not inspect configuration schema_version" ;;
+            esac
+        fi
     fi
 
-    if [[ $status -eq 0 && ${#changed[@]} -gt 0 ]]; then
-        if $dry_run; then
-            log_info "[DRY RUN] Would set schema_version: $target in $DSR_CONFIG_FILE (backup first)"
+    if [[ $status -eq 0 ]] && $migration_needed; then
+        # Recheck the missing schema against the locked original before the
+        # shared transaction publishes a replacement.
+        if $JSON_MODE; then
+            _config_persist_value schema_version "$target" true "$dry_run" >/dev/null 2>&1 || status=$?
         else
-            backup="$DSR_CONFIG_FILE.bak.$(date -u +%Y%m%dT%H%M%SZ)"
-            if [[ -e "$backup" ]] || ! cp -p -- "$DSR_CONFIG_FILE" "$backup"; then
-                status=1 reason="could not create backup $backup" backup=""
-            elif ! DSR_SET_VALUE="$target" yq -i '.schema_version = strenv(DSR_SET_VALUE)' "$DSR_CONFIG_FILE"; then
-                status=1 reason="could not write $DSR_CONFIG_FILE (backup kept at $backup)"
-            else
+            _config_persist_value schema_version "$target" true "$dry_run" || status=$?
+        fi
+        backup="${_DSR_CONFIG_INIT_BACKUP_PATHS[0]:-}"
+        if [[ $status -ne 0 ]]; then
+            reason="${_DSR_CONFIG_INIT_ERROR:-could not write $DSR_CONFIG_FILE}"
+        elif ! $dry_run; then
+            persisted=true
+            if ! $JSON_MODE; then
                 log_ok "Migrated $DSR_CONFIG_FILE to schema $target (backup: $backup)"
             fi
         fi
     elif [[ $status -eq 0 ]]; then
-        log_ok "$DSR_CONFIG_FILE is already at schema $target; nothing to migrate"
+        if ! $JSON_MODE; then
+            log_ok "$DSR_CONFIG_FILE is already at schema $target; nothing to migrate"
+        fi
     fi
     [[ $status -eq 0 ]] || log_error "Config migration failed: $reason"
 
     if $JSON_MODE; then
-        _config_envelope "$status" "$(jq -nc --arg file "$DSR_CONFIG_FILE" --arg from "$from" \
+        local details backup_paths changed_keys
+        backup_paths=$(jq -nc --args '$ARGS.positional' -- ${_DSR_CONFIG_INIT_BACKUP_PATHS[@]+"${_DSR_CONFIG_INIT_BACKUP_PATHS[@]}"}) || return 3
+        changed_keys=$(jq -nc --args '$ARGS.positional' -- ${changed[@]+"${changed[@]}"}) || return 3
+        details=$(jq -nc --arg file "$DSR_CONFIG_FILE" --arg from "$from" \
             --arg to "$target" --arg backup "$backup" --arg reason "$reason" \
-            --argjson dry_run "$dry_run" \
-            --argjson changed "$(printf '%s\n' ${changed[@]+"${changed[@]}"} | jq -Rsc 'split("\n") | map(select(length > 0))')" '
+            --argjson dry_run "$dry_run" --argjson persisted "$persisted" \
+            --argjson changed "$changed_keys" --argjson backup_paths "$backup_paths" \
+            --argjson rolled_back "$_DSR_CONFIG_INIT_ROLLED_BACK" \
+            --argjson recovery_required "$_DSR_CONFIG_INIT_RECOVERY_REQUIRED" '
             {action: "migrate", config_file: $file,
              from_version: (if $from == "" then null else $from end), to_version: $to,
              changed_keys: $changed, backup_path: (if $backup == "" then null else $backup end),
-             dry_run: $dry_run} | with_entries(select(.value != null))
-            + (if $reason == "" then {} else {errors: [{message: $reason,
-                code: (if ($reason | test("not found|required")) then "E031" else "E030" end)}]} end)')"
+             dry_run: $dry_run, persisted: $persisted, backup_paths: $backup_paths,
+             rolled_back: $rolled_back, recovery_required: $recovery_required,
+             errors: (if $reason == "" then [] else [{message: $reason,
+                code: (if ($reason | test("not found|required")) then "E031" else "E030" end)}] end)}
+            | with_entries(select(.value != null))') || return 3
+        _config_envelope "$status" "$details" || return 3
     fi
-    return $status
+    return "$status"
 }
 
 cmd_config_edit() {
-    local editor="${EDITOR:-vi}"
-    if [[ ! -f "$DSR_CONFIG_FILE" ]]; then
-        log_error "Config file not found. Run: dsr config init"
-        return 4
+    local editor="${EDITOR:-vi}" dry_run="${DRY_RUN:-false}" status=0 reason=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run|-n) dry_run=true ;;
+            *) status=4 reason="Unknown config edit option: $1" ;;
+        esac
+        shift
+    done
+    if [[ $status -eq 0 && ! -f "$DSR_CONFIG_FILE" ]]; then
+        status=4 reason="Config file not found. Run: dsr config init"
+    fi
+    if $JSON_MODE && { $dry_run || [[ $status -ne 0 ]]; }; then
+        if ! command -v jq >/dev/null 2>&1; then
+            log_error "jq is required for config edit preview --json"
+            return 3
+        fi
+        local details
+        details=$(jq -nc --arg file "$DSR_CONFIG_FILE" --arg editor "$editor" --arg reason "$reason" \
+            --argjson dry_run "$dry_run" '
+            {action: "edit", config_file: $file, editor: $editor, dry_run: $dry_run,
+             editor_opened: false,
+             errors: (if $reason == "" then [] else [{code: "E030", message: $reason}] end)}') || return 3
+        _config_envelope "$status" "$details" || return 3
+        return "$status"
+    fi
+    if [[ $status -ne 0 ]]; then
+        log_error "$reason"
+        return "$status"
+    fi
+    if $dry_run; then
+        log_info "[DRY RUN] Would open $DSR_CONFIG_FILE with $editor"
+        return 0
     fi
     exec "$editor" "$DSR_CONFIG_FILE"
 }
@@ -18408,10 +18518,10 @@ main() {
     done
     # Snapshot retirement preserves ordinary logs too. Startup rotation would
     # otherwise compress/delete them before the snapshots-only handler runs.
-    # Configuration initialization owns its entire write sequence. Inherited
-    # logging could alias a configuration file, modifying it before backup or
-    # after publication (even in --quiet mode via session completion).
-    if ! $dry_run_requested && [[ "$command" != config || "${1:-}" != init ]]; then
+    # Configuration commands own their write sequence, including previews and
+    # reads. Inherited logging could alias a configuration file, modifying it
+    # before backup or after publication (even through session completion).
+    if ! $dry_run_requested && [[ "$command" != config ]]; then
         LOG_FILE="$requested_log_file"
         if ! $snapshot_prune_requested; then
             log_init

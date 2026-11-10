@@ -1113,13 +1113,541 @@ test_set_creates_new_key() {
 }
 
 test_set_persist_requires_yq() {
-  config_init
-  config_load
-  # This test just verifies the function doesn't crash
-  # Actual persistence depends on yq availability
-  config_set "test_key" "test_value" --persist || true
-  [[ "${DSR_CONFIG[test_key]}" == "test_value" ]]
+  _init_custom_config_files || return 1
+  DSR_CONFIG[test_key]=original-memory-value
+  local before memory status=0
+  before=$(cksum "$DSR_CONFIG_FILE") || return 1
+  memory=$(declare -p DSR_CONFIG)
+  # A genuinely empty command search path, not a substitute yq program.
+  PATH="$TEMP_DIR/no-installed-tools" config_set test_key changed --persist || status=$?
+  [[ "$status" == 3 && "$memory" == "$(declare -p DSR_CONFIG)" &&
+     "$before" == "$(cksum "$DSR_CONFIG_FILE")" &&
+     ! -e "$DSR_CONFIG_FILE.init.lock" ]]
 }
+
+_config_mutation_cli() {
+  env DSR_CONFIG_DIR="$DSR_CONFIG_DIR" DSR_CONFIG_FILE="$DSR_CONFIG_FILE" \
+    DSR_REPOS_FILE="$DSR_REPOS_FILE" DSR_HOSTS_FILE="$DSR_HOSTS_FILE" \
+    DSR_CACHE_DIR="$DSR_CACHE_DIR" DSR_STATE_DIR="$DSR_STATE_DIR" \
+    DSR_LOG_FILE="${DSR_TEST_CONFIG_LOG_FILE:-$DSR_STATE_DIR/custom.log}" \
+    bash "${DSR_TEST_CONFIG_CLI:-$SRC_DIR/../dsr}" "$@" \
+    > "$TEMP_DIR/mutation.stdout" 2> "$TEMP_DIR/mutation.stderr"
+}
+
+test_set_dry_run_preserves_disk_and_memory() {
+  _init_custom_config_files || return 1
+  DSR_CONFIG[threshold_seconds]=original-memory-value
+  local before memory paths variant
+  before=$(cksum "$DSR_CONFIG_FILE") || return 1
+  memory=$(declare -p DSR_CONFIG)
+  paths=$(find "$DSR_CONFIG_DIR" -print | LC_ALL=C sort) || return 1
+  for variant in 1 2 3 4; do
+    case "$variant" in
+      1) config_set threshold_seconds changed --dry-run || return 1 ;;
+      2) config_set threshold_seconds changed --persist --dry-run || return 1 ;;
+      3) config_set threshold_seconds changed -n --persist || return 1 ;;
+      4) DRY_RUN=true config_set threshold_seconds changed --persist || return 1 ;;
+    esac
+    [[ "$memory" == "$(declare -p DSR_CONFIG)" &&
+       "$before" == "$(cksum "$DSR_CONFIG_FILE")" &&
+       "$paths" == "$(find "$DSR_CONFIG_DIR" -print | LC_ALL=C sort)" &&
+       ! -e "$DSR_CACHE_DIR" && ! -e "$DSR_STATE_DIR" ]] || return 1
+  done
+}
+
+test_cli_set_dry_run_flag_orders_preserve_files() {
+  _init_custom_config_files || return 1
+  local before paths variant
+  before=$(cksum "$DSR_CONFIG_FILE" "$DSR_HOSTS_FILE" "$DSR_REPOS_FILE") || return 1
+  paths=$(find "$DSR_CONFIG_DIR" -print | LC_ALL=C sort) || return 1
+  for variant in 1 2 3 4 5 6; do
+    case "$variant" in
+      1) set -- --json --dry-run config set threshold_seconds=900 ;;
+      2) set -- --json -n config set threshold_seconds=900 ;;
+      3) set -- --json config set threshold_seconds=900 --dry-run ;;
+      4) set -- --json config set -n threshold_seconds=900 ;;
+      5) set -- config set threshold_seconds=900 --dry-run ;;
+      6) set -- config set --dry-run threshold_seconds=900 ;;
+    esac
+    _config_mutation_cli "$@" || return 1
+    [[ "$before" == "$(cksum "$DSR_CONFIG_FILE" "$DSR_HOSTS_FILE" "$DSR_REPOS_FILE")" &&
+       "$paths" == "$(find "$DSR_CONFIG_DIR" -print | LC_ALL=C sort)" &&
+       ! -e "$DSR_CACHE_DIR" && ! -e "$DSR_STATE_DIR" ]] || return 1
+    if [[ "$variant" -le 4 ]]; then
+      [[ ! -s "$TEMP_DIR/mutation.stderr" ]] || return 1
+      jq -es 'length == 1 and (.[0] | .status == "success" and .exit_code == 0 and
+        .details.action == "set" and .details.key == "threshold_seconds" and
+        .details.value == "900" and .details.dry_run == true and
+        .details.persisted == false and .details.backup_paths == [])' \
+        "$TEMP_DIR/mutation.stdout" >/dev/null || return 1
+    fi
+  done
+}
+
+test_cli_edit_dry_run_never_launches_editor() (
+  _init_custom_config_files || return 1
+  local before paths variant
+  export EDITOR="$TEMP_DIR/editor-probe" DSR_TEST_EDITOR_MARKER="$TEMP_DIR/editor-called"
+  cat > "$EDITOR" <<'EDITOR'
+#!/usr/bin/env bash
+printf 'editor was executed\n' > "$DSR_TEST_EDITOR_MARKER"
+printf 'editor changed configuration\n' >> "$1"
+EDITOR
+  chmod 700 "$EDITOR" || return 1
+  before=$(cksum "$DSR_CONFIG_FILE") || return 1
+  paths=$(find "$DSR_CONFIG_DIR" -print | LC_ALL=C sort) || return 1
+  for variant in 1 2 3 4; do
+    case "$variant" in
+      1) set -- --json --dry-run config edit ;;
+      2) set -- --json config edit -n ;;
+      3) set -- --dry-run config edit ;;
+      4) set -- config edit --dry-run ;;
+    esac
+    _config_mutation_cli "$@" || return 1
+    [[ ! -e "$DSR_TEST_EDITOR_MARKER" && "$before" == "$(cksum "$DSR_CONFIG_FILE")" &&
+       "$paths" == "$(find "$DSR_CONFIG_DIR" -print | LC_ALL=C sort)" &&
+       ! -e "$DSR_CACHE_DIR" && ! -e "$DSR_STATE_DIR" ]] || return 1
+    if [[ "$variant" -le 2 ]]; then
+      [[ ! -s "$TEMP_DIR/mutation.stderr" ]] || return 1
+      jq -es --arg editor "$EDITOR" 'length == 1 and (.[0] |
+        .status == "success" and .details.action == "edit" and
+        .details.dry_run == true and .details.editor_opened == false and
+        .details.editor == $editor)' "$TEMP_DIR/mutation.stdout" >/dev/null || return 1
+    fi
+  done
+)
+
+test_config_mutations_reject_extra_arguments() {
+  _init_custom_config_files || return 1
+  DSR_CONFIG[threshold_seconds]=original-memory-value
+  local before memory paths status variant
+  before=$(cksum "$DSR_CONFIG_FILE") || return 1
+  memory=$(declare -p DSR_CONFIG)
+  paths=$(find "$DSR_CONFIG_DIR" -print | LC_ALL=C sort) || return 1
+  status=0
+  config_set threshold_seconds changed --persist --unknown-option || status=$?
+  [[ "$status" == 4 && "$memory" == "$(declare -p DSR_CONFIG)" &&
+     "$before" == "$(cksum "$DSR_CONFIG_FILE")" ]] || return 1
+  for variant in 1 2 3 4 5; do
+    case "$variant" in
+      1) set -- config set threshold_seconds=900 threshold_seconds=901 ;;
+      2) set -- config set threshold_seconds=900 --unknown-option ;;
+      3) set -- config set missing_assignment ;;
+      4) set -- config migrate --unknown-option ;;
+      5) set -- config edit --unknown-option ;;
+    esac
+    status=0
+    _config_mutation_cli --json "$@" || status=$?
+    [[ "$status" == 4 && "$before" == "$(cksum "$DSR_CONFIG_FILE")" &&
+       "$paths" == "$(find "$DSR_CONFIG_DIR" -print | LC_ALL=C sort)" &&
+       ! -e "$DSR_CACHE_DIR" && ! -e "$DSR_STATE_DIR" ]] || return 1
+    jq -es 'length == 1 and (.[0] | .exit_code == 4 and .status == "error" and
+      (.details.persisted // false) == false and (.details.errors | length) > 0)' \
+      "$TEMP_DIR/mutation.stdout" >/dev/null || return 1
+  done
+}
+
+test_set_invalid_inputs_preserve_disk_and_memory() {
+  _init_custom_config_files || return 1
+  DSR_CONFIG[threshold_seconds]=original-memory-value
+  local before memory status variant
+  before=$(cksum "$DSR_CONFIG_FILE") || return 1
+  memory=$(declare -p DSR_CONFIG)
+  status=0
+  config_set 'unsafe | .other_key' changed --persist || status=$?
+  [[ "$status" == 4 && "$memory" == "$(declare -p DSR_CONFIG)" &&
+     "$before" == "$(cksum "$DSR_CONFIG_FILE")" ]] || return 1
+  for variant in malformed duplicate multiple_documents sequence; do
+    case "$variant" in
+      malformed) printf 'unfinished: [\n' > "$DSR_CONFIG_FILE" ;;
+      duplicate) printf 'threshold_seconds: 1\nthreshold_seconds: 2\n' > "$DSR_CONFIG_FILE" ;;
+      multiple_documents) printf 'threshold_seconds: 1\n---\nthreshold_seconds: 2\n' > "$DSR_CONFIG_FILE" ;;
+      sequence) printf '%s\n' '- not-a-mapping' > "$DSR_CONFIG_FILE" ;;
+    esac
+    before=$(cksum "$DSR_CONFIG_FILE") || return 1
+    status=0
+    config_set threshold_seconds changed --persist || status=$?
+    [[ "$status" -ne 0 && "$memory" == "$(declare -p DSR_CONFIG)" &&
+       "$before" == "$(cksum "$DSR_CONFIG_FILE")" &&
+       ! -e "$DSR_CONFIG_FILE.init.lock" ]] || return 1
+  done
+}
+
+test_set_persist_preserves_original_metadata_and_hardlink() {
+  _init_custom_config_files || return 1
+  chmod 400 "$DSR_CONFIG_FILE" || return 1
+  cp -p "$DSR_CONFIG_FILE" "$TEMP_DIR/original" || return 1
+  ln "$DSR_CONFIG_FILE" "$TEMP_DIR/unrelated-hardlink" || return 1
+  local value=$'quoted "value"\nsecond line: [literal]' backup restoration
+  config_set custom_value "$value" --persist || return 1
+  [[ "${DSR_CONFIG[custom_value]}" == "$value" &&
+     "$(yq -r '.custom_value' "$DSR_CONFIG_FILE")" == "$value" &&
+     "$(_init_file_mode "$DSR_CONFIG_FILE")" == 400 &&
+     ${#_DSR_CONFIG_INIT_BACKUP_PATHS[@]} -eq 1 ]] || return 1
+  backup="${_DSR_CONFIG_INIT_BACKUP_PATHS[0]}"
+  cmp -s "$TEMP_DIR/original" "$backup" || return 1
+  cmp -s "$TEMP_DIR/original" "$TEMP_DIR/unrelated-hardlink" || return 1
+  [[ "$(_init_file_mode "$backup")" == 400 &&
+     ! "$DSR_CONFIG_FILE" -ef "$TEMP_DIR/unrelated-hardlink" &&
+     ! -e "$DSR_CONFIG_FILE.init.lock" ]] || return 1
+  restoration=$(mktemp "$DSR_CONFIG_FILE.restore.XXXXXXXX") || return 1
+  cp -p "$backup" "$restoration" && mv -f "$restoration" "$DSR_CONFIG_FILE" || return 1
+  cmp -s "$TEMP_DIR/original" "$DSR_CONFIG_FILE" &&
+    [[ "$(_init_file_mode "$DSR_CONFIG_FILE")" == 400 ]]
+}
+
+# Real file-size exhaustion while rendering a value larger than the limit.
+# Diagnostics are collected by an unrestricted process, as in the init probe.
+test_set_file_size_limit_preserves_disk_and_memory() {
+  _init_custom_config_files || return 1
+  DSR_CONFIG[custom_value]=original-memory-value
+  local before value status memory
+  local -a limited_status=()
+  before=$(cksum "$DSR_CONFIG_FILE") || return 1
+  memory=$(declare -p DSR_CONFIG)
+  printf -v value '%4096s' ''
+  value="${value// /x}"
+  (
+    ulimit -c 0
+    ulimit -f 1
+    config_set custom_value "$value" --persist
+    status=$?
+    [[ "$status" -ne 0 && "$memory" == "$(declare -p DSR_CONFIG)" ]]
+  ) 2>&1 | command cat > "$TEMP_DIR/set-limited.stderr"
+  limited_status=("${PIPESTATUS[@]}")
+  [[ "${limited_status[0]}" == 0 && "${limited_status[1]}" == 0 &&
+     "$before" == "$(cksum "$DSR_CONFIG_FILE")" &&
+     ! -e "$DSR_CONFIG_FILE.init.lock" ]]
+}
+
+# The real rename succeeds before the injected error is returned. Memory
+# must not advance when the ambiguous publication has to be rolled back.
+test_set_failed_publication_rolls_back_memory_and_file() (
+  _init_custom_config_files || return 1
+  DSR_CONFIG[threshold_seconds]=original-memory-value
+  cp -p "$DSR_CONFIG_FILE" "$TEMP_DIR/original" || return 1
+  local memory status=0 fail_once=true
+  memory=$(declare -p DSR_CONFIG)
+  mv() {
+    command mv "$@" || return $?
+    if [[ "${!#}" == "$DSR_CONFIG_FILE" && "$fail_once" == true ]]; then
+      fail_once=false
+      return 1
+    fi
+  }
+  config_set threshold_seconds 900 --persist || status=$?
+  [[ "$status" == 1 && "$memory" == "$(declare -p DSR_CONFIG)" &&
+     "${_DSR_CONFIG_INIT_ROLLED_BACK:-false}" == true &&
+     "${_DSR_CONFIG_INIT_RECOVERY_REQUIRED:-true}" == false &&
+     ${#_DSR_CONFIG_INIT_BACKUP_PATHS[@]} -eq 1 ]] || return 1
+  cmp -s "$TEMP_DIR/original" "$DSR_CONFIG_FILE" || return 1
+  cmp -s "$TEMP_DIR/original" "${_DSR_CONFIG_INIT_BACKUP_PATHS[0]}" || return 1
+  [[ "$(_init_file_mode "$DSR_CONFIG_FILE")" == 640 && ! -e "$DSR_CONFIG_FILE.init.lock" ]]
+)
+
+# Cleanup fails after a real commit. The caller must receive a failure and
+# retain its previous memory view while reporting that recovery is required.
+test_set_cleanup_failure_keeps_memory_and_recovery_evidence() (
+  _init_custom_config_files || return 1
+  DSR_CONFIG[threshold_seconds]=original-memory-value
+  cp -p "$DSR_CONFIG_FILE" "$TEMP_DIR/original" || return 1
+  local memory status=0 fail_once=true argument
+  memory=$(declare -p DSR_CONFIG)
+  rm() {
+    if [[ "$fail_once" == true ]]; then
+      for argument in "$@"; do
+        if [[ "$argument" == */expected ]]; then
+          fail_once=false
+          return 1
+        fi
+      done
+    fi
+    command rm "$@"
+  }
+  config_set threshold_seconds 900 --persist || status=$?
+  [[ "$status" == 1 && "$memory" == "$(declare -p DSR_CONFIG)" &&
+     "$(yq -r '.threshold_seconds' "$DSR_CONFIG_FILE")" == 900 &&
+     "${_DSR_CONFIG_INIT_RECOVERY_REQUIRED:-false}" == true &&
+     ${#_DSR_CONFIG_INIT_BACKUP_PATHS[@]} -eq 1 &&
+     -d "$DSR_CONFIG_FILE.init.lock" ]] || return 1
+  cmp -s "$TEMP_DIR/original" "${_DSR_CONFIG_INIT_BACKUP_PATHS[0]}" || return 1
+  status=0
+  config_set threshold_seconds 901 --persist || status=$?
+  [[ "$status" == 2 && "$memory" == "$(declare -p DSR_CONFIG)" ]]
+)
+
+test_set_refuses_unsafe_destinations_without_memory_changes() {
+  local kind before memory status
+  DSR_CONFIG[threshold_seconds]=original-memory-value
+  memory=$(declare -p DSR_CONFIG)
+  printf 'threshold_seconds: 600\n' > "$TEMP_DIR/protected-referent" || return 1
+  before=$(cksum "$TEMP_DIR/protected-referent") || return 1
+  for kind in symlink dangling fifo directory; do
+    DSR_CONFIG_FILE="$TEMP_DIR/$kind"
+    case "$kind" in
+      symlink) ln -s "$TEMP_DIR/protected-referent" "$DSR_CONFIG_FILE" || return 1 ;;
+      dangling) ln -s "$TEMP_DIR/missing-referent" "$DSR_CONFIG_FILE" || return 1 ;;
+      fifo) mkfifo "$DSR_CONFIG_FILE" || return 1 ;;
+      directory) mkdir "$DSR_CONFIG_FILE" || return 1 ;;
+    esac
+    status=0
+    config_set threshold_seconds 900 --persist || status=$?
+    [[ "$status" == 4 && "$memory" == "$(declare -p DSR_CONFIG)" &&
+       "$before" == "$(cksum "$TEMP_DIR/protected-referent")" &&
+       ! -e "$TEMP_DIR/missing-referent" && ! -e "$DSR_CONFIG_FILE.init.lock" ]] || return 1
+  done
+}
+
+test_cli_mutation_log_aliases_preserve_original_backups() {
+  local action alias_kind log_path backup
+  for action in set migrate; do
+    for alias_kind in direct hardlink; do
+      DSR_CONFIG_DIR="$TEMP_DIR/$action-$alias_kind"
+      DSR_CONFIG_FILE="$DSR_CONFIG_DIR/config.yaml"
+      DSR_HOSTS_FILE="$DSR_CONFIG_DIR/hosts.yaml"
+      DSR_REPOS_FILE="$DSR_CONFIG_DIR/repos.yaml"
+      mkdir -p "$DSR_CONFIG_DIR" || return 1
+      printf 'threshold_seconds: 600\nretained: original\n' > "$DSR_CONFIG_FILE" || return 1
+      cp -p "$DSR_CONFIG_FILE" "$TEMP_DIR/original-$action-$alias_kind" || return 1
+      log_path="$DSR_CONFIG_FILE"
+      if [[ "$alias_kind" == hardlink ]]; then
+        log_path="$DSR_CONFIG_DIR/log-hardlink"
+        ln "$DSR_CONFIG_FILE" "$log_path" || return 1
+      fi
+      if [[ "$action" == set ]]; then
+        DSR_TEST_CONFIG_LOG_FILE="$log_path" _config_mutation_cli --json config set threshold_seconds=900 || return 1
+        [[ "$(yq -r '.threshold_seconds' "$DSR_CONFIG_FILE")" == 900 ]] || return 1
+      else
+        DSR_TEST_CONFIG_LOG_FILE="$log_path" _config_mutation_cli --json config migrate || return 1
+        [[ "$(yq -r '.schema_version' "$DSR_CONFIG_FILE")" == "$DSR_SCHEMA_VERSION" ]] || return 1
+      fi
+      [[ ! -s "$TEMP_DIR/mutation.stderr" && ! -e "$DSR_STATE_DIR" ]] || return 1
+      jq -es --arg action "$action" 'length == 1 and (.[0] |
+        .status == "success" and .exit_code == 0 and .details.action == $action and
+        .details.dry_run == false and .details.persisted == true and
+        (.details.backup_paths | length) == 1)' "$TEMP_DIR/mutation.stdout" >/dev/null || return 1
+      backup=$(jq -r '.details.backup_paths[0]' "$TEMP_DIR/mutation.stdout") || return 1
+      cmp -s "$TEMP_DIR/original-$action-$alias_kind" "$backup" || return 1
+      if [[ "$alias_kind" == hardlink ]]; then
+        cmp -s "$TEMP_DIR/original-$action-$alias_kind" "$log_path" || return 1
+      fi
+    done
+  done
+}
+
+test_cli_migrate_dry_run_preserves_files() {
+  mkdir -p "$DSR_CONFIG_DIR" || return 1
+  local form variant before paths
+  for form in missing null empty; do
+    case "$form" in
+      missing) printf 'threshold_seconds: 600\n' > "$DSR_CONFIG_FILE" ;;
+      null) printf 'schema_version: null\nthreshold_seconds: 600\n' > "$DSR_CONFIG_FILE" ;;
+      empty) printf 'schema_version: ""\nthreshold_seconds: 600\n' > "$DSR_CONFIG_FILE" ;;
+    esac
+    before=$(cksum "$DSR_CONFIG_FILE") || return 1
+    paths=$(find "$DSR_CONFIG_DIR" -print | LC_ALL=C sort) || return 1
+    for variant in 1 2 3; do
+      case "$variant" in
+        1) set -- --json --dry-run config migrate ;;
+        2) set -- --json config migrate --dry-run ;;
+        3) set -- config migrate -n ;;
+      esac
+      _config_mutation_cli "$@" || return 1
+      [[ "$before" == "$(cksum "$DSR_CONFIG_FILE")" &&
+         "$paths" == "$(find "$DSR_CONFIG_DIR" -print | LC_ALL=C sort)" &&
+         ! -e "$DSR_STATE_DIR" && ! -e "$DSR_CACHE_DIR" ]] || return 1
+      if [[ "$variant" -le 2 ]]; then
+        [[ ! -s "$TEMP_DIR/mutation.stderr" ]] || return 1
+        jq -es 'length == 1 and (.[0] | .status == "success" and .details.action == "migrate" and
+          .details.dry_run == true and .details.persisted == false and
+          .details.backup_paths == [] and .details.changed_keys == ["schema_version"])' \
+          "$TEMP_DIR/mutation.stdout" >/dev/null || return 1
+      fi
+    done
+  done
+}
+
+test_cli_migrate_rejects_invalid_schema_without_changes() {
+  mkdir -p "$DSR_CONFIG_DIR" || return 1
+  local form before paths status
+  for form in false number object sequence unknown duplicate multiple_documents malformed; do
+    case "$form" in
+      false) printf 'schema_version: false\n' > "$DSR_CONFIG_FILE" ;;
+      number) printf 'schema_version: 1\n' > "$DSR_CONFIG_FILE" ;;
+      object) printf 'schema_version: {version: "1.0.0"}\n' > "$DSR_CONFIG_FILE" ;;
+      sequence) printf 'schema_version: ["1.0.0"]\n' > "$DSR_CONFIG_FILE" ;;
+      unknown) printf 'schema_version: "99.0.0"\n' > "$DSR_CONFIG_FILE" ;;
+      duplicate) printf 'schema_version: null\nschema_version: "1.0.0"\n' > "$DSR_CONFIG_FILE" ;;
+      multiple_documents) printf 'threshold_seconds: 1\n---\nthreshold_seconds: 2\n' > "$DSR_CONFIG_FILE" ;;
+      malformed) printf 'threshold_seconds: [\n' > "$DSR_CONFIG_FILE" ;;
+    esac
+    before=$(cksum "$DSR_CONFIG_FILE") || return 1
+    paths=$(find "$DSR_CONFIG_DIR" -print | LC_ALL=C sort) || return 1
+    status=0
+    _config_mutation_cli --json config migrate || status=$?
+    [[ "$status" == 4 && "$before" == "$(cksum "$DSR_CONFIG_FILE")" &&
+       "$paths" == "$(find "$DSR_CONFIG_DIR" -print | LC_ALL=C sort)" &&
+       ! -e "$DSR_STATE_DIR" ]] || return 1
+    jq -es 'length == 1 and (.[0] | .status == "error" and .exit_code == 4 and
+      .details.persisted == false and .details.backup_paths == [] and
+      (.details.errors | length) > 0)' "$TEMP_DIR/mutation.stdout" >/dev/null || return 1
+  done
+}
+
+# Keep the clock fixed to exercise repeated migration in one timestamp. Only
+# the timestamp is controlled; real exclusive links must preserve every backup.
+test_cli_migrate_preserves_colliding_backup_generations() (
+  mkdir -p "$DSR_CONFIG_DIR" || return 1
+  printf 'threshold_seconds: 600\nretained: original\n' > "$DSR_CONFIG_FILE" || return 1
+  chmod 400 "$DSR_CONFIG_FILE" || return 1
+  cp -p "$DSR_CONFIG_FILE" "$TEMP_DIR/original" || return 1
+  local sentinel="$DSR_CONFIG_FILE.bak.20260101T000000Z" backup first_backup='' round restoration before
+  printf 'an existing backup from another operation\n' > "$sentinel" || return 1
+  before=$(cksum "$sentinel") || return 1
+  date() {
+    if [[ "$#" == 2 && "$1" == -u && "$2" == +%Y%m%dT%H%M%SZ ]]; then
+      printf '20260101T000000Z\n'
+    else
+      command date "$@"
+    fi
+  }
+  export -f date
+  for round in 1 2; do
+    _config_mutation_cli --json config migrate || return 1
+    jq -es 'length == 1 and (.[0] | .status == "success" and .details.persisted == true and
+      .details.changed_keys == ["schema_version"] and (.details.backup_paths | length) == 1 and
+      .details.backup_path == .details.backup_paths[0])' "$TEMP_DIR/mutation.stdout" >/dev/null || return 1
+    backup=$(jq -r '.details.backup_paths[0]' "$TEMP_DIR/mutation.stdout") || return 1
+    [[ "$backup" != "$sentinel" && "$backup" != "$first_backup" &&
+       "$before" == "$(cksum "$sentinel")" &&
+       "$(_init_file_mode "$backup")" == 400 && "$(_init_file_mode "$DSR_CONFIG_FILE")" == 400 ]] || return 1
+    cmp -s "$TEMP_DIR/original" "$backup" || return 1
+    [[ "$(yq -r '.schema_version' "$DSR_CONFIG_FILE")" == "$DSR_SCHEMA_VERSION" ]] || return 1
+    [[ "$round" == 1 ]] || cmp -s "$TEMP_DIR/original" "$first_backup" || return 1
+    first_backup="$backup"
+    # Restore each captured generation for real, including its original mode.
+    restoration=$(mktemp "$DSR_CONFIG_FILE.restore.XXXXXXXX") || return 1
+    cp -p "$backup" "$restoration" && mv -f "$restoration" "$DSR_CONFIG_FILE" || return 1
+    cmp -s "$TEMP_DIR/original" "$DSR_CONFIG_FILE" || return 1
+  done
+)
+
+test_cli_migrate_current_schema_is_read_only() {
+  _init_custom_config_files || return 1
+  local before paths
+  before=$(cksum "$DSR_CONFIG_FILE") || return 1
+  paths=$(find "$DSR_CONFIG_DIR" -print | LC_ALL=C sort) || return 1
+  _config_mutation_cli --json config migrate || return 1
+  [[ ! -s "$TEMP_DIR/mutation.stderr" && "$before" == "$(cksum "$DSR_CONFIG_FILE")" &&
+     "$paths" == "$(find "$DSR_CONFIG_DIR" -print | LC_ALL=C sort)" &&
+     ! -e "$DSR_STATE_DIR" ]] || return 1
+  jq -es 'length == 1 and (.[0] | .status == "success" and .details.persisted == false and
+    .details.dry_run == false and .details.changed_keys == [] and .details.backup_paths == [])' \
+    "$TEMP_DIR/mutation.stdout" >/dev/null
+}
+
+# As with set, inject only the return status after a real successful rename.
+test_cli_migrate_publication_failure_restores_original() (
+  mkdir -p "$DSR_CONFIG_DIR" || return 1
+  printf 'threshold_seconds: 600\n' > "$DSR_CONFIG_FILE" || return 1
+  cp -p "$DSR_CONFIG_FILE" "$TEMP_DIR/original" || return 1
+  local status=0 backup
+  mv() {
+    command mv "$@" || return $?
+    if [[ "${!#}" == "$DSR_CONFIG_FILE" && "${DSR_TEST_MIGRATE_FAILED:-false}" == false ]]; then
+      DSR_TEST_MIGRATE_FAILED=true
+      return 1
+    fi
+  }
+  export -f mv
+  _config_mutation_cli --json config migrate || status=$?
+  [[ "$status" == 1 && ! -e "$DSR_CONFIG_FILE.init.lock" ]] || return 1
+  cmp -s "$TEMP_DIR/original" "$DSR_CONFIG_FILE" || return 1
+  jq -es 'length == 1 and (.[0] | .status == "error" and .details.persisted == false and
+    .details.rolled_back == true and .details.recovery_required == false and
+    (.details.backup_paths | length) == 1 and (.details.errors | length) > 0)' \
+    "$TEMP_DIR/mutation.stdout" >/dev/null || return 1
+  backup=$(jq -r '.details.backup_paths[0]' "$TEMP_DIR/mutation.stdout") || return 1
+  cmp -s "$TEMP_DIR/original" "$backup"
+)
+
+# Explicit scheduling boundary after real lock acquisition: another writer
+# changes the schema before the backup is copied. Admission must be repeated
+# against that locked original, not solely the earlier preview of the file.
+test_cli_migrate_rechecks_schema_after_lock_acquisition() (
+  mkdir -p "$DSR_CONFIG_DIR" || return 1
+  printf 'threshold_seconds: 600\n' > "$DSR_CONFIG_FILE" || return 1
+  printf 'schema_version: "9.0.0"\nthreshold_seconds: 901\n' > "$TEMP_DIR/external-edit" || return 1
+  local status=0 backup
+  mkdir() {
+    command mkdir "$@" || return $?
+    if [[ "${!#}" == "$DSR_CONFIG_FILE.init.lock" ]]; then
+      printf 'schema_version: "9.0.0"\nthreshold_seconds: 901\n' > "$DSR_CONFIG_FILE"
+    fi
+  }
+  export -f mkdir
+  _config_mutation_cli --json config migrate || status=$?
+  [[ "$status" == 4 && ! -e "$DSR_CONFIG_FILE.init.lock" ]] || return 1
+  cmp -s "$TEMP_DIR/external-edit" "$DSR_CONFIG_FILE" || return 1
+  jq -es 'length == 1 and (.[0] | .status == "error" and .details.persisted == false and
+    .details.rolled_back == false and .details.recovery_required == false and
+    (.details.backup_paths | length) == 1 and (.details.errors | length) > 0)' \
+    "$TEMP_DIR/mutation.stdout" >/dev/null || return 1
+  backup=$(jq -r '.details.backup_paths[0]' "$TEMP_DIR/mutation.stdout") || return 1
+  cmp -s "$TEMP_DIR/external-edit" "$backup"
+)
+
+# Timing is controlled with a FIFO after a real publication; termination uses
+# a genuine OS signal. A setter and initializer must honor the same leaf lock.
+test_set_killed_publication_blocks_other_writers() (
+  _init_custom_config_files || return 1
+  cp -p "$DSR_CONFIG_FILE" "$TEMP_DIR/original" || return 1
+  local child_pid='' attempt status=0 before backup restoration
+  local -a matches=()
+  mkfifo "$TEMP_DIR/set-publication-barrier" || return 1
+  trap 'if [[ -n "$child_pid" ]] && kill -0 "$child_pid" 2>/dev/null; then kill -KILL "$child_pid" 2>/dev/null; wait "$child_pid" 2>/dev/null || true; fi' EXIT
+  (
+    mv() {
+      command mv "$@" || return $?
+      if [[ "${!#}" == "$DSR_CONFIG_FILE" ]]; then
+        printf 'published\n' > "$TEMP_DIR/set-publication-ready" || return 1
+        local barrier_release
+        IFS= read -r barrier_release < "$TEMP_DIR/set-publication-barrier" || return 1
+        [[ "$barrier_release" == continue ]]
+      fi
+    }
+    config_set threshold_seconds 900 --persist
+  ) > "$TEMP_DIR/killed-set.stdout" 2> "$TEMP_DIR/killed-set.stderr" &
+  child_pid=$!
+  for ((attempt = 0; attempt < 100; attempt++)); do
+    [[ ! -f "$TEMP_DIR/set-publication-ready" ]] || break
+    kill -0 "$child_pid" 2>/dev/null || return 1
+    sleep 0.05
+  done
+  [[ -f "$TEMP_DIR/set-publication-ready" ]] || return 1
+  before=$(cksum "$DSR_CONFIG_FILE" "$DSR_HOSTS_FILE" "$DSR_REPOS_FILE") || return 1
+  config_init --force || status=$?
+  [[ "$status" == 2 && "$before" == "$(cksum "$DSR_CONFIG_FILE" "$DSR_HOSTS_FILE" "$DSR_REPOS_FILE")" ]] || return 1
+  kill -KILL "$child_pid" || return 1
+  status=0
+  wait "$child_pid" || status=$?
+  child_pid=''
+  [[ "$status" == 137 && "$(yq -r '.threshold_seconds' "$DSR_CONFIG_FILE")" == 900 ]] || return 1
+  status=0
+  config_set threshold_seconds 901 --persist || status=$?
+  [[ "$status" == 2 && "$before" == "$(cksum "$DSR_CONFIG_FILE" "$DSR_HOSTS_FILE" "$DSR_REPOS_FILE")" ]] || return 1
+  matches=("$DSR_CONFIG_FILE".bak.*)
+  [[ ${#matches[@]} -eq 1 && -d "$DSR_CONFIG_FILE.init.lock" ]] || return 1
+  backup="${matches[0]}"
+  cmp -s "$TEMP_DIR/original" "$backup" || return 1
+  [[ "$(cat "$DSR_CONFIG_FILE.init.lock"/stage.*/backup-path)" == "$backup" ]] || return 1
+  restoration=$(mktemp "$DSR_CONFIG_FILE.restore.XXXXXXXX") || return 1
+  cp -p "$backup" "$restoration" && mv -f "$restoration" "$DSR_CONFIG_FILE" || return 1
+  mv "$DSR_CONFIG_FILE.init.lock" "$DSR_CONFIG_FILE.interrupted" || return 1
+  cmp -s "$TEMP_DIR/original" "$DSR_CONFIG_FILE" || return 1
+  config_set threshold_seconds 902 --persist || return 1
+  cmp -s "$TEMP_DIR/original" "$backup"
+)
 
 # ============================================================================
 # Tests: Validation (config_validate)
@@ -2717,6 +3245,24 @@ main() {
   run_test "set_updates_value" test_set_updates_value
   run_test "set_creates_new_key" test_set_creates_new_key
   run_test "set_persist_requires_yq" test_set_persist_requires_yq
+  run_test "set_dry_run_preserves_disk_and_memory" test_set_dry_run_preserves_disk_and_memory
+  run_test "cli_set_dry_run_flag_orders_preserve_files" test_cli_set_dry_run_flag_orders_preserve_files
+  run_test "cli_edit_dry_run_never_launches_editor" test_cli_edit_dry_run_never_launches_editor
+  run_test "config_mutations_reject_extra_arguments" test_config_mutations_reject_extra_arguments
+  run_test "set_invalid_inputs_preserve_disk_and_memory" test_set_invalid_inputs_preserve_disk_and_memory
+  run_test "set_persist_preserves_original_metadata_and_hardlink" test_set_persist_preserves_original_metadata_and_hardlink
+  run_test "set_file_size_limit_preserves_disk_and_memory" test_set_file_size_limit_preserves_disk_and_memory
+  run_test "set_failed_publication_rolls_back_memory_and_file" test_set_failed_publication_rolls_back_memory_and_file
+  run_test "set_cleanup_failure_keeps_memory_and_recovery_evidence" test_set_cleanup_failure_keeps_memory_and_recovery_evidence
+  run_test "set_refuses_unsafe_destinations_without_memory_changes" test_set_refuses_unsafe_destinations_without_memory_changes
+  run_test "cli_mutation_log_aliases_preserve_original_backups" test_cli_mutation_log_aliases_preserve_original_backups
+  run_test "cli_migrate_dry_run_preserves_files" test_cli_migrate_dry_run_preserves_files
+  run_test "cli_migrate_rejects_invalid_schema_without_changes" test_cli_migrate_rejects_invalid_schema_without_changes
+  run_test "cli_migrate_preserves_colliding_backup_generations" test_cli_migrate_preserves_colliding_backup_generations
+  run_test "cli_migrate_current_schema_is_read_only" test_cli_migrate_current_schema_is_read_only
+  run_test "cli_migrate_publication_failure_restores_original" test_cli_migrate_publication_failure_restores_original
+  run_test "cli_migrate_rechecks_schema_after_lock_acquisition" test_cli_migrate_rechecks_schema_after_lock_acquisition
+  run_test "set_killed_publication_blocks_other_writers" test_set_killed_publication_blocks_other_writers
 
   echo ""
   echo "Validation Tests:"

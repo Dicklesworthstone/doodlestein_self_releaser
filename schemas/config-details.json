@@ -37,6 +37,18 @@
       "type": "string",
       "description": "Config value"
     },
+    "persisted": {
+      "type": "boolean",
+      "description": "True only when set or migrate completed a real configuration write; false for previews, failures and migration no-ops"
+    },
+    "editor": {
+      "type": "string",
+      "description": "Editor selected for a configuration edit preview"
+    },
+    "editor_opened": {
+      "type": "boolean",
+      "description": "Whether the editor was launched; always false for an edit preview or rejected edit"
+    },
     "valid": {
       "type": "boolean",
       "description": "Validation result"
@@ -73,7 +85,7 @@
     },
     "dry_run": {
       "type": "boolean",
-      "description": "Whether initialization or migration is a read-only preview"
+      "description": "Whether initialization, setting, migration or editing is a read-only preview"
     },
     "force": {
       "type": "boolean",
@@ -91,15 +103,15 @@
       "items": {
         "type": "string"
       },
-      "description": "Verified original-file backups retained by a real forced initialization, including after a later failure"
+      "description": "Verified original-file backups retained by real initialization, setting or migration, including after a later failure"
     },
     "rolled_back": {
       "type": "boolean",
-      "description": "Whether a failed initialization restored or removed any files it published; also check recovery_required"
+      "description": "Whether a failed configuration transaction restored or removed any files it published; also check recovery_required"
     },
     "recovery_required": {
       "type": "boolean",
-      "description": "Whether a failed initialization retained its locks and staging because rollback or cleanup could not finish safely"
+      "description": "Whether a failed configuration transaction retained its locks and staging because rollback or cleanup could not finish safely"
     }
   },
   "$defs": {

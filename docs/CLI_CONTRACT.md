@@ -2444,12 +2444,12 @@ View and modify configuration.
 
 ```bash
 dsr config show [--section <name>]
-dsr config set <key>=<value>
+dsr config set <key>=<value> [--dry-run]
 dsr config get <key>
 dsr config init [--force] [--dry-run]
 dsr config validate
 dsr config migrate [--dry-run]
-dsr config edit
+dsr config edit [--dry-run]
 ```
 
 | Subcommand | Description |
@@ -2470,9 +2470,10 @@ creating configuration, cache, state, log or backup files or directories. It
 works before the command or after `init`, including with `--force` in either
 order. Unknown initialization options fail with exit 4 before initialization.
 Even an invalid dry-run request leaves an inherited `DSR_LOG_FILE` untouched.
-Initialization also suppresses persistent session logging on real runs: a log
-path that aliases a configuration must not modify it before backup or after
-publication. Human progress remains on stderr; JSON success leaves stderr empty.
+All `config` commands suppress persistent session logging, including real runs
+and read commands: a log path that aliases a configuration must not modify it
+before backup, after publication, or while reading it. Human progress remains
+on stderr; JSON success leaves stderr empty.
 A JSON preview has `details.dry_run: true`, `details.initialized: false` and
 `details.planned_files` listing the selected configuration paths; successful
 real initialization reports `initialized: true`.
@@ -2550,18 +2551,49 @@ or racing namespace operations. Avoid concurrent manual configuration edits
 during initialization. Native platform qualification is recorded separately
 from the portable implementation contract.
 
-**migrate subcommand:**
-- Detects config schema version
-- Applies necessary transformations
-- Creates backup before migration
-- Reports all changes made
+**set and migrate subcommands:**
 
-Schema `1.0.0` is the only version so far: `migrate` stamps a missing
-`schema_version` (after a timestamped `config.yaml.bak.*` backup) and refuses a
-version it does not know (exit 4). `show --section <name>` selects a key or a
-dotted section (`signing` shows `signing.enabled`). `set` saves to
-`config.yaml` (requires yq) or fails; it never reports an unsaved value. Every
-`--json` answer is a `config` envelope with `details.action`.
+`set` accepts exactly one `KEY=VALUE` assignment. Keys are dotted identifier
+paths; values are stored as literal strings, including quotes and newlines.
+Persistent edits require mikefarah/yq v4 and jq, an existing regular
+configuration file, and exactly one YAML mapping without duplicate keys.
+Invalid arguments, missing dependencies, malformed YAML and symlink targets
+fail before a write. The sourced `config_set --persist` also fails if it
+cannot save; it updates `DSR_CONFIG` only after the transaction succeeds.
+
+Both commands accept global or command-local `--dry-run` (or `-n`). Previews
+validate and render the proposed transformation without creating directories,
+staging, locks, backups or logs, and without changing configuration memory.
+JSON previews report `dry_run: true`, `persisted: false` and `backup_paths: []`.
+Unknown options and extra assignments fail before any update.
+
+Real edits use the same `config.yaml.init.lock`, verified original backups,
+private staging, permission preservation, atomic replacement and guarded
+rollback described for initialization. They refuse active or interrupted
+initialization locks. Each successful edit retains a unique adjacent original
+backup, even when several edits occur in the same second. An unrelated hardlink
+keeps the old content. JSON includes `backup_paths`, `rolled_back`,
+`recovery_required` and `errors`; `persisted` is true only when a real write
+completes successfully. The same interruption and manual recovery procedure
+applies to these single-file transactions.
+
+Schema `1.0.0` is the only version so far: `migrate` fills an absent, null or
+empty `schema_version` and refuses an unknown version or a non-string value
+(exit 4). Its schema admission is repeated against the preserved original
+under the lock before replacement. An already-current configuration is a
+successful no-op with `persisted: false`. Migration retains `backup_path` for
+its single original as well as the shared `backup_paths` array.
+
+**edit and read subcommands:**
+
+`edit --dry-run` reports the file and editor without launching a process. Its
+JSON preview has `editor_opened: false`. An actual `edit` launches `$EDITOR`;
+the external editor controls how it saves changes. The staged transaction
+above applies to `set` and `migrate`.
+
+`show --section <name>` selects a key or a dotted section (`signing` shows
+`signing.enabled`). Structured answers use a `config` envelope with
+`details.action` identifying the subcommand.
 
 ---
 
