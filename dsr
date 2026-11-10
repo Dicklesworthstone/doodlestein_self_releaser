@@ -314,11 +314,13 @@ SUBCOMMANDS:
 
 OPTIONS:
     --json      Output in JSON format
-    --force     Overwrite existing files (init only)
-    --dry-run   Report migration changes without writing (migrate only)
+    --force     Replace existing files (init only)
+    --dry-run   Show initialization or migration changes without writing
 
 EXAMPLES:
     dsr config init              Create default config files
+    dsr config init --dry-run    Preview initialization without changing files
+    dsr config init --force --dry-run
     dsr config show              Show all configuration
     dsr config show --section signing
     dsr config get threshold_seconds
@@ -344,27 +346,45 @@ _config_envelope() {
 }
 
 cmd_config_init() {
-    local force=false
-    [[ "${1:-}" == "--force" ]] && force=true
+    local force=false dry_run="${DRY_RUN:-false}" status=0 path
+    local -a init_args=() planned_files=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force) force=true ;;
+            --dry-run|-n) dry_run=true ;;
+            *)
+                log_error "Unknown config init option: $1"
+                status=4
+                break
+                ;;
+        esac
+        shift
+    done
+
+    if [[ $status -eq 0 ]]; then
+        $force && init_args+=(--force)
+        [[ "$dry_run" != true ]] || init_args+=(--dry-run)
+        for path in "$DSR_CONFIG_FILE" "$DSR_HOSTS_FILE" "$DSR_REPOS_FILE"; do
+            if $force || [[ ! -f "$path" ]]; then
+                planned_files+=("$path")
+            fi
+        done
+        config_init ${init_args[@]+"${init_args[@]}"} || status=$?
+    fi
 
     if $JSON_MODE; then
-        local status=0
-        if $force; then
-            config_init --force >/dev/null 2>&1 || status=$?
-        else
-            config_init >/dev/null 2>&1 || status=$?
+        local initialized=false
+        if [[ $status -eq 0 && "$dry_run" != true ]]; then
+            initialized=true
         fi
-        _config_envelope "$status" "$(jq -nc --arg dir "$DSR_CONFIG_DIR" --arg file "$DSR_CONFIG_FILE" \
-            --argjson initialized "$([[ $status -eq 0 ]] && echo true || echo false)" \
-            '{action: "init", config_dir: $dir, config_file: $file, initialized: $initialized}')"
-        return $status
-    else
-        if $force; then
-            config_init --force
-        else
-            config_init
-        fi
+        local details
+        details=$(jq -nc --arg dir "$DSR_CONFIG_DIR" --arg file "$DSR_CONFIG_FILE" \
+            --argjson initialized "$initialized" --argjson dry_run "$dry_run" --argjson force "$force" \
+            --args '{action: "init", config_dir: $dir, config_file: $file, initialized: $initialized,
+                     dry_run: $dry_run, force: $force, planned_files: $ARGS.positional}' -- ${planned_files[@]+"${planned_files[@]}"}) || return 3
+        _config_envelope "$status" "$details" || return 3
     fi
+    return "$status"
 }
 
 cmd_config_show() {
@@ -18360,7 +18380,12 @@ main() {
     done
     # Snapshot retirement preserves ordinary logs too. Startup rotation would
     # otherwise compress/delete them before the snapshots-only handler runs.
-    if ! $dry_run_requested && ! $snapshot_prune_requested; then
+    if $dry_run_requested; then
+        # A supplied DSR_LOG_FILE also enables writes without log_init.
+        # Dynamic scope keeps handler diagnostics and session completion on
+        # stderr for this invocation, without changing a sourcing caller.
+        local LOG_FILE=""
+    elif ! $snapshot_prune_requested; then
         log_init
     fi
 

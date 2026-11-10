@@ -228,10 +228,44 @@ _cfg_log_warn()  { echo "${_CFG_YELLOW}[config]${_CFG_NC} $*" >&2; }
 _cfg_log_error() { echo "${_CFG_RED}[config]${_CFG_NC} $*" >&2; }
 
 # Initialize config directories and default files
-# Usage: config_init [--force]
+# Usage: config_init [--force] [--dry-run]
 config_init() {
-    local force=false
-    [[ "${1:-}" == "--force" ]] && force=true
+    local force=false dry_run="${DRY_RUN:-false}"
+    local path
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force) force=true ;;
+            --dry-run|-n) dry_run=true ;;
+            *)
+                _cfg_log_error "Unknown config init option: $1"
+                return 4
+                ;;
+        esac
+        shift
+    done
+
+    # Planning must return before mkdir, backups, or any file redirection.
+    # Honor DRY_RUN here too, including callers that source this module.
+    if [[ "$dry_run" == true ]]; then
+        for path in "$DSR_CONFIG_DIR" "$DSR_CACHE_DIR" "$DSR_STATE_DIR" \
+            "$DSR_STATE_DIR/logs" "$DSR_STATE_DIR/artifacts" "$DSR_STATE_DIR/manifests" \
+            "$DSR_CACHE_DIR/act" "$DSR_CACHE_DIR/builds"; do
+            [[ -d "$path" ]] || _cfg_log_info "[dry-run] Would create directory: $path"
+        done
+        for path in "$DSR_CONFIG_FILE" "$DSR_HOSTS_FILE" "$DSR_REPOS_FILE"; do
+            if [[ -f "$path" ]]; then
+                if $force; then
+                    _cfg_log_info "[dry-run] Would replace: $path"
+                else
+                    _cfg_log_info "[dry-run] Would keep: $path"
+                fi
+            else
+                _cfg_log_info "[dry-run] Would create: $path"
+            fi
+        done
+        _cfg_log_info "[dry-run] No configuration files or directories changed"
+        return 0
+    fi
 
     _cfg_log_info "Initializing dsr configuration..."
 

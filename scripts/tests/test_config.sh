@@ -210,6 +210,139 @@ test_init_repos_has_tools() {
   grep -q "tools:" "$DSR_REPOS_FILE"
 }
 
+
+_config_init_cli() {
+  env DSR_CONFIG_DIR="$DSR_CONFIG_DIR" DSR_CONFIG_FILE="$DSR_CONFIG_FILE" \
+    DSR_REPOS_FILE="$DSR_REPOS_FILE" DSR_HOSTS_FILE="$DSR_HOSTS_FILE" \
+    DSR_CACHE_DIR="$DSR_CACHE_DIR" DSR_STATE_DIR="$DSR_STATE_DIR" \
+    DSR_LOG_FILE="$DSR_STATE_DIR/custom.log" \
+    bash "$SRC_DIR/../dsr" "$@" > "$TEMP_DIR/init.stdout" 2> "$TEMP_DIR/init.stderr"
+}
+
+_init_roots_absent() {
+  [[ ! -e "$DSR_CONFIG_DIR" && ! -L "$DSR_CONFIG_DIR" &&
+     ! -e "$DSR_CACHE_DIR" && ! -L "$DSR_CACHE_DIR" &&
+     ! -e "$DSR_STATE_DIR" && ! -L "$DSR_STATE_DIR" ]]
+}
+
+test_init_dry_run_does_not_create_roots() {
+  config_init --dry-run || return 1
+  _init_roots_absent || return 1
+  config_init -n --force || return 1
+  _init_roots_absent || return 1
+  config_init --force --dry-run || return 1
+  _init_roots_absent || return 1
+  ( DRY_RUN=true; config_init --force ) || return 1
+  _init_roots_absent
+}
+
+test_init_rejects_unknown_arguments_without_writes() {
+  local status=0
+  config_init --force --unknown-init-option || status=$?
+  [[ "$status" == 4 ]] && _init_roots_absent || return 1
+  status=0
+  config_init unexpected || status=$?
+  [[ "$status" == 4 ]] && _init_roots_absent
+}
+
+test_cli_init_dry_run_flag_orders() {
+  local variant expected_force=false
+  for variant in 1 2 3 4 5 6 7 8; do
+    expected_force=false
+    case "$variant" in
+      1) set -- --dry-run config init ;;
+      2) set -- -n config init ;;
+      3) set -- config init --dry-run ;;
+      4) set -- config init -n ;;
+      5) set -- config init --dry-run --force; expected_force=true ;;
+      6) set -- config init --force --dry-run; expected_force=true ;;
+      7) set -- config init --force -n; expected_force=true ;;
+      8) set -- -n config init --force; expected_force=true ;;
+    esac
+    _config_init_cli --json "$@" || return 1
+    _init_roots_absent || return 1
+    jq -es --arg config "$DSR_CONFIG_FILE" --arg hosts "$DSR_HOSTS_FILE" \
+      --arg repos "$DSR_REPOS_FILE" --argjson force "$expected_force" '
+        length == 1 and (.[0] | .command == "config" and .exit_code == 0 and
+          .details.action == "init" and .details.initialized == false and
+          .details.dry_run == true and .details.force == $force and
+          (.details.planned_files | sort) == ([$config,$hosts,$repos] | sort))
+      ' "$TEMP_DIR/init.stdout" >/dev/null || return 1
+  done
+}
+
+test_cli_init_forced_plan_preserves_existing_files() {
+  mkdir -p "$DSR_CONFIG_DIR" || return 1
+  printf 'schema_version: "1.0.0"\nthreshold_seconds: 1234\n' > "$DSR_CONFIG_FILE"
+  printf 'hosts: {retained: {ssh_host: private-builder}}\n' > "$DSR_HOSTS_FILE"
+  printf 'tools: {retained: {repo: example/retained}}\n' > "$DSR_REPOS_FILE"
+  local before after paths
+  before=$(cksum "$DSR_CONFIG_FILE" "$DSR_HOSTS_FILE" "$DSR_REPOS_FILE") || return 1
+  paths=$(find "$DSR_CONFIG_DIR" -print | LC_ALL=C sort) || return 1
+  config_init --force --dry-run || return 1
+  [[ "$before" == "$(cksum "$DSR_CONFIG_FILE" "$DSR_HOSTS_FILE" "$DSR_REPOS_FILE")" &&
+     "$paths" == "$(find "$DSR_CONFIG_DIR" -print | LC_ALL=C sort)" &&
+     ! -e "$DSR_CACHE_DIR" && ! -e "$DSR_STATE_DIR" ]] || return 1
+  _config_init_cli --json config init --force --dry-run || return 1
+  after=$(cksum "$DSR_CONFIG_FILE" "$DSR_HOSTS_FILE" "$DSR_REPOS_FILE") || return 1
+  [[ "$before" == "$after" && "$paths" == "$(find "$DSR_CONFIG_DIR" -print | LC_ALL=C sort)" &&
+     ! -e "$DSR_CACHE_DIR" && ! -e "$DSR_STATE_DIR" ]] || return 1
+  jq -e '.details.initialized == false and .details.dry_run == true and
+    .details.force == true and (.details.planned_files | length) == 3' \
+    "$TEMP_DIR/init.stdout" >/dev/null || return 1
+  _config_init_cli --json config init --dry-run || return 1
+  [[ "$before" == "$(cksum "$DSR_CONFIG_FILE" "$DSR_HOSTS_FILE" "$DSR_REPOS_FILE")" &&
+     "$paths" == "$(find "$DSR_CONFIG_DIR" -print | LC_ALL=C sort)" &&
+     ! -e "$DSR_CACHE_DIR" && ! -e "$DSR_STATE_DIR" ]] || return 1
+  jq -e '.details.initialized == false and .details.dry_run == true and
+    .details.force == false and .details.planned_files == []' "$TEMP_DIR/init.stdout" >/dev/null
+}
+
+test_cli_init_preview_preserves_explicit_log() {
+  mkdir -p "$DSR_STATE_DIR" || return 1
+  printf 'existing log must not be appended or rotated\n' > "$DSR_STATE_DIR/custom.log"
+  local before paths variant status
+  before=$(cksum "$DSR_STATE_DIR/custom.log") || return 1
+  paths=$(find "$DSR_STATE_DIR" -print | LC_ALL=C sort) || return 1
+  for variant in 1 2 3 4; do
+    case "$variant" in
+      1) set -- --dry-run config init --force ;;
+      2) set -- config init --force -n ;;
+      3) set -- --json config init --dry-run --force ;;
+      4) set -- -n config init --json ;;
+    esac
+    _config_init_cli "$@" || return 1
+    [[ "$before" == "$(cksum "$DSR_STATE_DIR/custom.log")" &&
+       "$paths" == "$(find "$DSR_STATE_DIR" -print | LC_ALL=C sort)" &&
+       ! -e "$DSR_CONFIG_DIR" && ! -e "$DSR_CACHE_DIR" ]] || return 1
+  done
+  status=0
+  _config_init_cli --json config init --dry-run --force --unknown-init-option || status=$?
+  [[ "$status" == 4 && "$before" == "$(cksum "$DSR_STATE_DIR/custom.log")" &&
+     "$paths" == "$(find "$DSR_STATE_DIR" -print | LC_ALL=C sort)" &&
+     ! -e "$DSR_CONFIG_DIR" && ! -e "$DSR_CACHE_DIR" ]] || return 1
+  jq -e '.exit_code == 4 and .status == "error" and .details.initialized == false and
+    .details.dry_run == true and .details.planned_files == []' "$TEMP_DIR/init.stdout" >/dev/null
+}
+
+test_cli_init_rejects_unknown_plan_arguments() {
+  local status=0
+  _config_init_cli config init --force --dry-run --unknown-init-option || status=$?
+  [[ "$status" == 4 ]] && _init_roots_absent || return 1
+  status=0
+  _config_init_cli config init --dry-run unexpected || status=$?
+  [[ "$status" == 4 ]] && _init_roots_absent
+}
+
+test_cli_init_real_run_creates_files() {
+  _config_init_cli --json config init || return 1
+  [[ -f "$DSR_CONFIG_FILE" && -f "$DSR_HOSTS_FILE" && -f "$DSR_REPOS_FILE" &&
+     -d "$DSR_CACHE_DIR" && -d "$DSR_STATE_DIR" ]] || return 1
+  jq -e '.command == "config" and .exit_code == 0 and .details.action == "init" and
+    .details.initialized == true and .details.dry_run == false and .details.force == false' \
+    "$TEMP_DIR/init.stdout" >/dev/null
+}
+
 # ============================================================================
 # Tests: Loading (config_load)
 # ============================================================================
@@ -1869,6 +2002,13 @@ main() {
   run_test "init_config_has_schema_version" test_init_config_has_schema_version
   run_test "init_hosts_has_hosts" test_init_hosts_has_hosts
   run_test "init_repos_has_tools" test_init_repos_has_tools
+  run_test "init_dry_run_does_not_create_roots" test_init_dry_run_does_not_create_roots
+  run_test "init_rejects_unknown_arguments_without_writes" test_init_rejects_unknown_arguments_without_writes
+  run_test "cli_init_dry_run_flag_orders" test_cli_init_dry_run_flag_orders
+  run_test "cli_init_forced_plan_preserves_existing_files" test_cli_init_forced_plan_preserves_existing_files
+  run_test "cli_init_preview_preserves_explicit_log" test_cli_init_preview_preserves_explicit_log
+  run_test "cli_init_rejects_unknown_plan_arguments" test_cli_init_rejects_unknown_plan_arguments
+  run_test "cli_init_real_run_creates_files" test_cli_init_real_run_creates_files
 
   echo ""
   echo "Loading Tests:"

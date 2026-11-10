@@ -2446,7 +2446,7 @@ View and modify configuration.
 dsr config show [--section <name>]
 dsr config set <key>=<value>
 dsr config get <key>
-dsr config init [--force]
+dsr config init [--force] [--dry-run]
 dsr config validate
 dsr config migrate [--dry-run]
 dsr config edit
@@ -2461,6 +2461,17 @@ dsr config edit
 | `validate` | Validate configuration files |
 | `migrate` | Migrate config to latest schema version |
 | `edit` | Open config file in $EDITOR |
+
+**init subcommand:**
+
+Initialization preserves existing files unless `--force` is selected.
+`--dry-run` (or `-n`) previews the planned creation or replacement without
+creating configuration, cache, state, log or backup files or directories. It
+works before the command or after `init`, including with `--force` in either
+order. Unknown initialization options fail with exit 4 before initialization.
+A JSON preview has `details.dry_run: true`, `details.initialized: false` and
+`details.planned_files` listing the selected configuration paths; successful
+real initialization reports `initialized: true`.
 
 **migrate subcommand:**
 - Detects config schema version

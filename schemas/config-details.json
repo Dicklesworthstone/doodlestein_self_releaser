@@ -4,11 +4,21 @@
   "title": "DSR Config Details",
   "description": "Details payload for 'dsr config' command",
   "type": "object",
-  "required": ["action"],
+  "required": [
+    "action"
+  ],
   "properties": {
     "action": {
       "type": "string",
-      "enum": ["show", "get", "set", "init", "validate", "migrate", "edit"],
+      "enum": [
+        "show",
+        "get",
+        "set",
+        "init",
+        "validate",
+        "migrate",
+        "edit"
+      ],
       "description": "Config subcommand"
     },
     "config_file": {
@@ -33,7 +43,9 @@
     },
     "errors": {
       "type": "array",
-      "items": { "$ref": "#/$defs/config_error" },
+      "items": {
+        "$ref": "#/$defs/config_error"
+      },
       "description": "Validation or migration errors"
     },
     "from_version": {
@@ -50,18 +62,48 @@
     },
     "changed_keys": {
       "type": "array",
-      "items": { "type": "string" },
+      "items": {
+        "type": "string"
+      },
       "description": "Keys changed during migration"
+    },
+    "initialized": {
+      "type": "boolean",
+      "description": "True only when initialization completed, never for a dry run"
+    },
+    "dry_run": {
+      "type": "boolean",
+      "description": "Whether initialization or migration is a read-only preview"
+    },
+    "force": {
+      "type": "boolean",
+      "description": "Whether initialization selected replacement of existing files"
+    },
+    "planned_files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Configuration paths selected for creation or replacement by init"
     }
   },
   "$defs": {
     "config_error": {
       "type": "object",
-      "required": ["code", "message"],
+      "required": [
+        "code",
+        "message"
+      ],
       "properties": {
-        "code": { "type": "string" },
-        "message": { "type": "string" },
-        "key": { "type": "string" }
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        }
       }
     }
   }

@@ -6,6 +6,8 @@ on:
       - dsr
       - src/act_runner.sh
       - src/config.sh
+      - scripts/tests/test_config.sh
+      - schemas/config-details.json
       - src/signing.sh
       - src/git_ops.sh
       - src/github.sh
@@ -48,6 +50,14 @@ jobs:
           mkdir -p "$RUNNER_TEMP/dsr-test-bin"
           GOBIN="$RUNNER_TEMP/dsr-test-bin" go install github.com/mikefarah/yq/v4@v4.47.1
           echo "$RUNNER_TEMP/dsr-test-bin" >> "$GITHUB_PATH"
+      - name: Verify read-only config initialization and configuration regressions
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n src/config.sh
+          bash -n scripts/tests/test_config.sh
+          bash scripts/tests/test_config.sh
       - name: Verify inventory admission and GitHub upload recovery
         shell: bash
         run: |
