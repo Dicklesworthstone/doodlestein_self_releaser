@@ -1378,34 +1378,92 @@ _doctor_summary() {
 # CHECK SUBCOMMAND
 # ============================================================================
 
-# Configured tools as JSON records: repos.d files first (flat keys, or the
+# Checked effective tool records: repos.d files first (flat keys, or the
 # older github.repo/github.workflow layout), then registry-only tools. Keep
-# optional tool/workflow fields separate even when they are empty.
+# disabled records so neither a duplicate registry entry nor a stale check can
+# revive an opt-out. Print nothing until the complete inventory is admitted.
 _check_configured_repos() {
-    command -v yq &>/dev/null || return 0
+    local all_tools="${1:-false}"
     local config_dir="${DSR_CONFIG_DIR:-$HOME/.config/dsr}"
     local registry="${DSR_REPOS_FILE:-$config_dir/repos.yaml}"
-    local file line repo
-    local -A seen=()
-    while IFS= read -r line; do
-        repo=$(jq -r '.repo // ""' <<< "$line" 2>/dev/null) || continue
-        [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || continue
-        [[ -z "${seen[${repo,,}]:-}" ]] || continue
-        seen["${repo,,}"]=1
-        printf '%s\n' "$line"
-    done < <(
-        for file in "$config_dir"/repos.d/*.yaml; do
-            [[ -f "$file" && "${file##*/}" != _* ]] || continue
-            yq -o=json -I=0 '{"tool": (.tool_name // .name // ""),
-                "repo": (.repo // .github.repo // ""),
-                "workflow": (.workflow // .github.workflow // "")}' "$file" 2>/dev/null
-        done
-        if [[ -f "$registry" ]]; then
-            yq -o=json -I=0 '.tools // {} | to_entries[] |
-                {"tool": .key, "repo": (.value.repo // ""),
-                 "workflow": (.value.workflow // "")}' "$registry" 2>/dev/null
+    local file document registry_tools='{}' registry_entry registry_entries enabled line repo tool name
+    local -a files=() records=()
+    local -A seen_repos=() seen_tools=() disabled_repos=()
+    [[ "$all_tools" == true || "$all_tools" == false ]] || return 4
+    for file in "$config_dir"/repos.d/*.yaml; do
+        [[ "${file##*/}" != _* ]] || continue
+        [[ -e "$file" || -L "$file" ]] || continue
+        files+=("$file")
+    done
+    if ((${#files[@]} > 0)) || [[ -e "$registry" || -L "$registry" ]]; then
+        if ! command -v yq >/dev/null || ! command -v jq >/dev/null; then
+            log_error "yq and jq are required to read repository automation configuration"
+            return 3
         fi
-    )
+    fi
+    if [[ -e "$registry" || -L "$registry" ]]; then
+        document=$(_config_read_single_mapping_json "$registry") || return $?
+        registry_tools=$(jq -ce 'if has("tools") then .tools else {} end |
+            if type == "object" then . else error("tools must be a mapping") end' \
+            <<< "$document") || return 4
+    fi
+    for file in ${files[@]+"${files[@]}"}; do
+        document=$(_config_read_single_mapping_json "$file") || return $?
+        name="${file##*/}"; name="${name%.yaml}"
+        tool=$(jq -er '(.tool_name // .name // "") | strings' <<< "$document") || return 4
+        registry_entry=$(jq -c --arg tool "${tool:-$name}" \
+            'if has($tool) then .[$tool] else {} end' <<< "$registry_tools") || return 4
+        enabled=$(_config_effective_tool_enabled "$document" "$registry_entry") || return $?
+        line=$(jq -c --arg name "$name" --argjson enabled "$enabled" '
+            {tool: (.tool_name // .name // ""), name: (.tool_name // .name // $name),
+             repo: (.repo // .github.repo // ""), workflow: (.workflow // .github.workflow // ""),
+             local_path: (.local_path // .local.path // ""), language: (.language // .local.language // ""),
+             targets: (.targets // .build.targets // []), enabled: $enabled}' <<< "$document") || return 4
+        repo=$(jq -er '.repo | strings' <<< "$line") || return 4
+        # A per-tool file owns its registry key even when it intentionally
+        # leaves the automatic tool name empty or supplies an unusable repo.
+        seen_tools["$name"]=1
+        [[ -z "$tool" ]] || seen_tools["$tool"]=1
+        [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || continue
+        [[ "$enabled" != false ]] || disabled_repos["${repo,,}"]=1
+        records+=("$line")
+    done
+    registry_entries=$(jq -c 'to_entries[]' <<< "$registry_tools") || return 4
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        tool=$(jq -r '.key' <<< "$line") || return 4
+        [[ "$tool" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
+            log_error "Invalid tool name in repository registry: $tool"
+            return 4
+        }
+        [[ -z "${seen_tools[$tool]:-}" ]] || continue
+        document=$(jq -ce '.value | objects' <<< "$line") || return 4
+        enabled=$(_config_effective_tool_enabled "$document") || return $?
+        line=$(jq -c --arg tool "$tool" --argjson enabled "$enabled" '
+            {tool: $tool, name: $tool, repo: (.repo // ""), workflow: (.workflow // ""),
+             local_path: (.local_path // ""), language: (.language // ""),
+             targets: (.targets // []), enabled: $enabled}' <<< "$document") || return 4
+        repo=$(jq -er '.repo | strings' <<< "$line") || return 4
+        [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || continue
+        seen_tools["$tool"]=1
+        records+=("$line")
+    done <<< "$registry_entries"
+    # Keep distinct tool names visible in list output. A per-tool opt-out is
+    # authoritative for its repository even when another registry key points
+    # there; such aliases remain visible, but cannot authorize automation.
+    local -a admitted=()
+    for line in ${records[@]+"${records[@]}"}; do
+        repo=$(jq -r '.repo' <<< "$line") || return 4
+        if [[ -n "${disabled_repos[${repo,,}]:-}" ]]; then
+            line=$(jq -c '.enabled = false' <<< "$line") || return 4
+        fi
+        if ! $all_tools && [[ -n "${seen_repos[${repo,,}]:-}" ]]; then
+            continue
+        fi
+        seen_repos["${repo,,}"]=1
+        admitted+=("$line")
+    done
+    printf '%s\n' ${admitted[@]+"${admitted[@]}"}
 }
 
 # Save the outcome of one check as state/check/last.json (atomic replace).
@@ -1523,10 +1581,20 @@ EOF
     # Resolve each requested repo (or every configured one) to owner/repo,
     # its dsr tool and its release workflow file.
     local -a configured_repos=() targets=()
-    local line tool repo workflow arg found
+    local line tool repo workflow arg found configured_output configured_status=0
+    configured_output=$(_check_configured_repos) || configured_status=$?
+    if ((configured_status != 0)); then
+        log_error "Cannot read repository automation configuration"
+        if $JSON_MODE; then
+            json_envelope check error "$configured_status" "$(jq -nc --arg file "$DSR_CONFIG_DIR" '
+                {stage:"config",config_file:$file,error:"Cannot read repository automation configuration",
+                 errors:[{code:"E030",message:"Cannot read repository automation configuration"}]}')"
+        fi
+        return "$configured_status"
+    fi
     while IFS= read -r line; do
         [[ -n "$line" ]] && configured_repos+=("$line")
-    done < <(_check_configured_repos)
+    done <<< "$configured_output"
     if [[ ${#repos[@]} -eq 0 ]]; then
         targets=(${configured_repos[@]+"${configured_repos[@]}"})
     else
@@ -2099,14 +2167,20 @@ _watch_jittered_sleep() {
 declare -A _WATCH_REPORTED=()
 
 _watch_configured_repo_matches() {
-    local tool="$1" repo="$2" run_id="$3" configured_repo
-    if ! configured_repo=$(act_get_repo "$tool") || [[ -z "$configured_repo" ]]; then
-        log_warn "Cannot recover run $run_id: its tool configuration is unavailable"
+    local tool="$1" repo="$2" run_id="$3" configured inventory
+    if ! inventory=$(_check_configured_repos true); then
+        log_warn "Cannot admit run $run_id: repository automation configuration is invalid or unavailable"
         return 1
     fi
-    [[ "$configured_repo" == */* ]] || configured_repo="Dicklesworthstone/$configured_repo"
-    if [[ "$configured_repo" != "$repo" ]]; then
-        log_warn "Cannot recover run $run_id: its configured repository has changed"
+    configured=$(jq -sc --arg tool "$tool" --arg repo "$repo" \
+        'map(select(.name == $tool and .repo == $repo)) | if length == 1 then .[0] else null end' \
+        <<< "$inventory") || return 1
+    if [[ "$configured" == null ]]; then
+        log_warn "Cannot admit run $run_id: its tool configuration is unavailable or its repository has changed"
+        return 1
+    fi
+    if ! jq -e '.enabled == true' <<< "$configured" >/dev/null; then
+        log_warn "Automatic fallback disabled for $tool (run $run_id); retaining existing recovery history"
         return 1
     fi
     return 0
@@ -2303,9 +2377,6 @@ _watch_iteration() {
             log_debug "Run $run_id has legacy trigger history; automatic replay blocked"
             continue
         fi
-        if [[ "$pending_record" != null ]]; then
-            _watch_configured_repo_matches "$tool_name" "$repo" "$run_id" || continue
-        fi
         if ! $auto_fallback && [[ -n "${_WATCH_REPORTED[$run_id]:-}" ]]; then
             continue
         fi
@@ -2356,6 +2427,11 @@ _watch_iteration() {
                 ${#fallback_args[@]} -eq 0 || ! "$sha" =~ ^[0-9a-f]{40}$ ||
                 "$sha" == 0000000000000000000000000000000000000000 ]]; then
             log_warn "Run $run_id has no unambiguous version tag and source commit; automatic fallback blocked"
+        elif ! _watch_configured_repo_matches "$tool_name" "$repo" "$run_id"; then
+            # The check or retained queue may predate an opt-out. Re-read
+            # before every automatic start, retry, capacity deferral or plan.
+            # No attempt, cooldown, checkpoint or pending identity is changed.
+            continue
         elif ((active_count >= _WATCH_MAX_CONCURRENT)); then
             # Retain a never-started source identity without claiming an
             # attempt or output. A later fresh observation must still admit
@@ -13995,8 +14071,10 @@ EOF
     # --format json is the JSON envelope, exactly as the global --json.
     [[ "$format" == json ]] && JSON_MODE=true
 
-    # Load repos config
-    if [[ ! -f "$DSR_REPOS_FILE" ]]; then
+    # The listing and watcher consume the same checked effective inventory.
+    # A repos.d entry takes precedence over its registry row, including false.
+    local -a repo_files=("$DSR_CONFIG_DIR"/repos.d/*.yaml)
+    if [[ ! -e "$DSR_REPOS_FILE" && ! -L "$DSR_REPOS_FILE" && ! -e "${repo_files[0]}" ]]; then
         log_error "Repos file not found: $DSR_REPOS_FILE"
         log_info "Run: dsr config init"
         if $JSON_MODE; then
@@ -14005,24 +14083,18 @@ EOF
         return 4
     fi
 
-    local repos_json="[]"
-    if command -v yq &>/dev/null; then
-        repos_json=$(yq -o=json '.tools // {}' "$DSR_REPOS_FILE" 2>/dev/null | jq -c '
-            to_entries | map({
-                name: .key,
-                repo: (.value.repo // ""),
-                local_path: (.value.local_path // ""),
-                language: (.value.language // ""),
-                targets: (.value.targets // []),
-                workflow: (.value.workflow // ""),
-                enabled: (.value.enabled // true)
-            })
-        ' 2>/dev/null || echo "[]")
-    else
-        # Fallback: simple parsing without yq
-        repos_json="[]"
-        log_warn "yq not found. Install yq for full repos functionality."
+    local repos_json configured_output configured_status=0
+    configured_output=$(_check_configured_repos true) || configured_status=$?
+    if ((configured_status != 0)); then
+        log_error "Cannot read repository automation configuration"
+        if $JSON_MODE; then
+            json_envelope repos error "$configured_status" \
+                '{"action":"list","repos":[],"errors":[{"code":"E052","message":"Cannot read repository automation configuration"}]}'
+        fi
+        return "$configured_status"
     fi
+    repos_json=$(jq -sc 'map({name,repo,local_path,language,targets,workflow,enabled})' \
+        <<< "$configured_output") || return 4
 
     if $JSON_MODE; then
         json_envelope "repos" "success" 0 "$(jq -nc --argjson repos "$repos_json" '{action: "list", repos: $repos}')"

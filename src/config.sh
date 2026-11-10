@@ -1240,6 +1240,28 @@ _config_read_single_mapping_json() {
     printf '%s\n' "$canonical"
 }
 
+# Resolve the automation opt-out from an already checked tool mapping and its
+# lower-precedence registry entry. Only absence defaults to true: jq's //
+# operator would also turn an explicit false into true. A present null or any
+# non-boolean value cannot authorize an automatic release.
+_config_effective_tool_enabled() {
+    local primary="$1" registry="${2:-}" enabled
+    [[ -n "$registry" ]] || registry='{}'
+    if ! enabled=$(printf '%s\n' "$primary" "$registry" | jq -cs '
+        if length != 2 or any(.[]; type != "object") then
+            error("tool configuration must be a mapping")
+        elif any(.[]; has("enabled") and (.enabled | type != "boolean")) then
+            error("enabled must be a boolean when present")
+        else
+            (if .[0] | has("enabled") then .[0] else .[1] end) |
+            if has("enabled") then .enabled else true end
+        end' 2>/dev/null); then
+        _cfg_log_error "Tool enabled must be a boolean when present (true or false)"
+        return 4
+    fi
+    printf '%s\n' "$enabled"
+}
+
 # Canonicalize a parsed release contract. A present contract must be an object;
 # null is the opt-out used by legacy tool configurations.
 _config_canonicalize_release_contract_json() {
@@ -1262,16 +1284,16 @@ _config_canonicalize_release_contract_json() {
 
 # Compare a tool's registry entry (repos.yaml) with its per-tool build config
 # (repos.d/<tool>.yaml). The two files historically drifted apart silently:
-# repos.yaml drives `dsr repos list/info/check` and the quality gates while
-# the build runner reads only repos.d — so on divergence the tool you inspect
-# is not the tool you build, which has produced wrong-target releases
-# (issues #12/#13).
+# repos.yaml supplies registry info and quality gates while the build runner
+# reads only repos.d. Build-affecting divergence has produced wrong-target
+# releases (issues #12/#13); list/check now show the per-tool inventory first.
 #
 # Precedence contract (documented in README "Config precedence"):
 #   - repos.d/<tool>.yaml is the build authority: build/release read it
 #     exclusively for build-affecting keys.
-#   - repos.yaml is the registry: list/info/check/quality read it.
-#   - Any key present in both files must be identical.
+#   - repos.yaml is the registry: info/quality read it; list/check combine it
+#     with repos.d, using the per-tool enabled override for automation.
+#   - Common keys must be identical except the boolean enabled opt-out.
 #
 # Usage: config_registry_divergence_json <toolname>
 # stdout: compact JSON:
@@ -1305,6 +1327,16 @@ config_registry_divergence_json() {
         repo_json=$(_config_read_single_mapping_json "$tool_config") || return 4
     fi
 
+    # The automation override is intentionally allowed to differ. Validate
+    # each present mapping before excluding only this key from divergence;
+    # malformed values must not acquire an exemption from validation.
+    if [[ "$repo_json" != null ]]; then
+        _config_effective_tool_enabled "$repo_json" >/dev/null || return $?
+    fi
+    if [[ "$registry_json" != null ]]; then
+        _config_effective_tool_enabled "$registry_json" >/dev/null || return $?
+    fi
+
     jq -nc --argjson registry "$registry_json" --argjson repo "$repo_json" '
         def build_keys: ["repo", "local_path", "language", "binary_name",
             "main_package", "workspace_binaries", "workspace_binaries_by_target", "build_cmd", "build_profile",
@@ -1322,7 +1354,7 @@ config_registry_divergence_json() {
             mismatched_keys: (
                 if $registry == null or $repo == null then []
                 else [ ($registry | keys[]) as $k
-                       | select(($repo | has($k)) and ($registry[$k] != $repo[$k]))
+                       | select($k != "enabled" and ($repo | has($k)) and ($registry[$k] != $repo[$k]))
                        | $k ]
                      | sort
                 end),

@@ -65,6 +65,7 @@ EOF
 
 # Create repos.yaml with tools section
 _setup_repos_yaml() {
+    command -v yq >/dev/null || skip "Real yq is required for repository configuration"
     # Ensure DSR_REPOS_FILE points to our test config
     export DSR_REPOS_FILE="$DSR_CONFIG_DIR/repos.yaml"
 
@@ -90,39 +91,6 @@ tools:
     workflow: release.yml
 EOF
 
-    # Mock yq for YAML parsing (dsr repos needs it)
-    mock_command_script "yq" '
-# Simple yq mock that converts our test YAML to JSON
-if [[ "$1" == "-o=json" ]]; then
-    # Return JSON for .tools query
-    cat << JSONEOF
-{
-  "ntm": {"repo": "Dicklesworthstone/ntm", "local_path": "/data/projects/ntm", "language": "go", "targets": ["linux/amd64", "darwin/arm64", "windows/amd64"], "workflow": "release.yml"},
-  "bv": {"repo": "Dicklesworthstone/beads_viewer", "local_path": "/data/projects/beads_viewer", "language": "rust", "targets": ["linux/amd64", "darwin/arm64"], "workflow": "release.yml"}
-}
-JSONEOF
-elif [[ "$1" == ".tools."* ]]; then
-    # Handle .tools.ntm type queries
-    local tool="${1#.tools.}"
-    if [[ "$tool" == "ntm" ]]; then
-        echo "repo: Dicklesworthstone/ntm"
-        echo "local_path: /data/projects/ntm"
-        echo "language: go"
-    elif [[ "$tool" == "bv" ]]; then
-        echo "repo: Dicklesworthstone/beads_viewer"
-        echo "local_path: /data/projects/beads_viewer"
-        echo "language: rust"
-    else
-        exit 1
-    fi
-elif [[ "$*" == *".tools | keys"* ]]; then
-    echo "- ntm"
-    echo "- bv"
-else
-    echo "unsupported yq mock invocation: $*" >&2
-    exit 1
-fi
-'
 }
 
 # ============================================================================
@@ -609,6 +577,15 @@ PY
     done
 }
 
+# Launch fixtures must provide current configuration as well as an observed
+# run. The watcher rechecks the real file before admitting every child.
+_watch_configure_ntm() {
+    command -v yq >/dev/null || skip "Real yq is required for watcher admission"
+    mkdir -p "$DSR_CONFIG_DIR/repos.d"
+    printf 'tool_name: ntm\nrepo: Dicklesworthstone/ntm\nworkflow: release.yml\n%s\n' \
+        "${1:-}" > "$DSR_CONFIG_DIR/repos.d/ntm.yaml"
+}
+
 _routing_watch() {
     local check_json="$1"
     shift
@@ -629,6 +606,9 @@ case "$1" in
         done
         if [[ -n "${DSR_WATCH_FIXTURE_HISTORY_AFTER_CHECK:-}" ]]; then
             cat "$DSR_WATCH_FIXTURE_HISTORY_AFTER_CHECK" > "$DSR_STATE_DIR/triggered.json" || exit 98
+        fi
+        if [[ -n "${DSR_WATCH_FIXTURE_CONFIG_AFTER_CHECK:-}" ]]; then
+            cat "$DSR_WATCH_FIXTURE_CONFIG_AFTER_CHECK" > "$DSR_CONFIG_DIR/repos.d/ntm.yaml" || exit 98
         fi
         cat "$TEST_TMPDIR/watch-check.json"
         exit 1
@@ -1056,6 +1036,7 @@ EOF
 
 @test "nullable routing: watch passes a known tool and its tag as distinct fallback arguments" {
     harness_create_config
+    _watch_configure_ntm
     local check_json
     check_json=$(_watch_run_json)
 
@@ -1081,8 +1062,274 @@ EOF
     [[ ! -e "$DSR_STATE_DIR/triggered.json" ]]
 }
 
+@test "automation opt-out: list preserves registry false and uses per-tool precedence" {
+    harness_create_config
+    _setup_repos_yaml
+    yq -i '.tools.ntm.enabled = false | .tools.bv.enabled = true' "$DSR_REPOS_FILE"
+    run _routing_dsr --json repos list
+    assert_equal 0 "$status"
+    jq -e '(.details.repos[] | select(.name == "ntm") | .enabled) == false and
+        (.details.repos[] | select(.name == "bv") | .enabled) == true' <<< "$output"
+
+    _watch_configure_ntm
+    run _routing_dsr --json repos list
+    assert_equal 0 "$status"
+    jq -e '(.details.repos[] | select(.name == "ntm") | .enabled) == false' <<< "$output"
+    _watch_configure_ntm 'enabled: true'
+    run _routing_dsr --json repos list
+    assert_equal 0 "$status"
+    jq -e '(.details.repos[] | select(.name == "ntm") | .enabled) == true' <<< "$output"
+
+    yq -i '.tools.ntm.enabled = true | .tools.alias = .tools.ntm |
+        .tools.ntm.repo = "different/registry-repo"' "$DSR_REPOS_FILE"
+    _watch_configure_ntm 'enabled: false'
+    run _routing_dsr --json repos list
+    assert_equal 0 "$status"
+    jq -e '(.details.repos | map(select(.repo == "Dicklesworthstone/ntm") | .name) | sort) ==
+        ["alias","ntm"] and
+        all(.details.repos[] | select(.repo == "Dicklesworthstone/ntm"); .enabled == false) and
+        all(.details.repos[]; .repo != "different/registry-repo")' <<< "$output"
+}
+
+@test "automation opt-out: listing retains distinct registry tools sharing a repository" {
+    harness_create_config
+    _setup_repos_yaml
+    yq -i '.tools.ntm.enabled = true | .tools.alias = .tools.ntm |
+        .tools.alias.enabled = true' "$DSR_REPOS_FILE"
+    run _routing_dsr --json repos list
+    assert_equal 0 "$status"
+    jq -e '(.details.repos | map(select(.repo == "Dicklesworthstone/ntm") | .name) | sort) ==
+        ["alias","ntm"] and
+        (.details.repos[] | select(.name == "ntm") | .enabled) == true and
+        (.details.repos[] | select(.name == "alias") | .enabled) == true' <<< "$output"
+}
+
+@test "automation opt-out: enumeration failure cannot publish a partial inventory or launch" {
+    harness_create_config
+    _setup_repos_yaml
+    _watch_configure_ntm
+    export DSR_TEST_REAL_JQ
+    DSR_TEST_REAL_JQ=$(command -v jq)
+    mock_command_script "jq" 'for argument in "$@"; do
+        if [[ "$argument" == "to_entries[]" ]]; then
+            "$DSR_TEST_REAL_JQ" "$@" || exit $?
+            : > "$TEST_TMPDIR/failed-enumeration"
+            exit 73
+        fi
+    done
+    exec "$DSR_TEST_REAL_JQ" "$@"'
+    run _routing_dsr --json repos list
+    assert_equal 4 "$status"
+    [[ -e "$TEST_TMPDIR/failed-enumeration" ]]
+    jq -e '.status == "error" and .details.repos == []' <<< "$output"
+    run _routing_watch "$(_watch_run_json)" --auto-fallback
+    assert_equal 0 "$status"
+    [[ ! -e "$TEST_TMPDIR/fallback.starts" && ! -e "$DSR_STATE_DIR/triggered.json" ]]
+}
+
+@test "automation opt-out: validation permits only the boolean override and retains build mismatches" {
+    harness_create_config
+    _setup_repos_yaml
+    _watch_configure_ntm 'enabled: false'
+    yq -i '.tools.ntm.enabled = true' "$DSR_REPOS_FILE"
+    local root="${DSR_ROUTING_TEST_ROOT:-$DSR_PROJECT_ROOT}"
+    run bash -c 'source "$1/src/config.sh"; config_registry_divergence_json ntm' _ "$root"
+    assert_equal 0 "$status"
+    jq -e '.mismatched_keys == []' <<< "$output"
+
+    yq -i '.repo = "another/source" | .targets = ["windows/arm64"] | .build_cmd = "changed-build"' \
+        "$DSR_CONFIG_DIR/repos.d/ntm.yaml"
+    yq -i '.tools.ntm.build_cmd = "original-build"' "$DSR_REPOS_FILE"
+    run bash -c 'source "$1/src/config.sh"; config_registry_divergence_json ntm' _ "$root"
+    assert_equal 0 "$status"
+    jq -e '.mismatched_keys == ["build_cmd","repo","targets"]' <<< "$output"
+    run _routing_dsr --json repos validate ntm
+    [[ "$status" -ne 0 ]]
+    jq -e '.details.validated[0].status == "error"' <<< "$output"
+
+    yq -i '.enabled = "false"' "$DSR_CONFIG_DIR/repos.d/ntm.yaml"
+    run bash -c 'source "$1/src/config.sh"; config_registry_divergence_json ntm' _ "$root"
+    assert_equal 4 "$status"
+}
+
+@test "automation opt-out: missing enabled defaults true including repos.d-only listing" {
+    harness_create_config
+    _watch_configure_ntm
+    mv "$DSR_CONFIG_DIR/repos.yaml" "$TEST_TMPDIR/retained-registry.yaml"
+    run _routing_dsr --json repos list
+    assert_equal 0 "$status"
+    jq -e '.details.repos | length == 1 and .[0].name == "ntm" and .[0].enabled == true' <<< "$output"
+    run _routing_watch "$(_watch_run_json)" --auto-fallback
+    assert_equal 0 "$status"
+    _watch_completed
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+}
+
+@test "automation opt-out: malformed present values fail closed with real YAML parsing" {
+    harness_create_config
+    _mock_gh_runs "$(_queued_release_run)"
+    local value
+    for value in null '"false"' '"true"' 0 1 '[]' '{}'; do
+        _watch_configure_ntm "enabled: $value"
+        run _routing_dsr --json repos list
+        assert_equal 4 "$status"
+        jq -e '.status == "error" and .exit_code == 4 and .details.repos == []' <<< "$output"
+        run _routing_dsr --json check ntm
+        assert_equal 4 "$status"
+        jq -e '.status == "error" and .details.stage == "config"' <<< "$output"
+        run _routing_watch "$(_watch_run_json)" --auto-fallback
+        assert_equal 0 "$status"
+        [[ ! -e "$TEST_TMPDIR/fallback.starts" && ! -e "$DSR_STATE_DIR/triggered.json" ]]
+    done
+    [[ ! -e "$TEST_TMPDIR/gh.calls" ]]
+}
+
+@test "automation opt-out: shadowed malformed registry values are not an override escape" {
+    harness_create_config
+    _setup_repos_yaml
+    local policy value
+    for policy in true false; do
+        _watch_configure_ntm "enabled: $policy"
+        for value in '"false"' null; do
+            yq -i ".tools.ntm.enabled = $value" "$DSR_REPOS_FILE"
+            run _routing_dsr --json repos list
+            assert_equal 4 "$status"
+            jq -e '.status == "error" and .details.repos == []' <<< "$output"
+            run _routing_watch "$(_watch_run_json)" --auto-fallback
+            assert_equal 0 "$status"
+            [[ ! -e "$TEST_TMPDIR/fallback.starts" && ! -e "$DSR_STATE_DIR/triggered.json" ]]
+        done
+    done
+}
+
+@test "automation opt-out: invalid or ambiguous YAML never falls through to an enabled registry duplicate" {
+    harness_create_config
+    _setup_repos_yaml
+    yq -i '.tools.ntm.enabled = true' "$DSR_REPOS_FILE"
+    _watch_configure_ntm
+    local document
+    for document in $'enabled: true\nenabled: false' \
+        $'enabled: false\n---\nenabled: true' $'enabled: [true'; do
+        _watch_configure_ntm "$document"
+        run _routing_watch "$(_watch_run_json)" --auto-fallback
+        assert_equal 0 "$status"
+        [[ ! -e "$TEST_TMPDIR/fallback.starts" && ! -e "$DSR_STATE_DIR/triggered.json" ]]
+        run _routing_dsr --json repos list
+        assert_equal 4 "$status"
+    done
+}
+
+@test "automation opt-out: disabled tools remain checkable but cannot launch through a registry alias" {
+    harness_create_config
+    _setup_repos_yaml
+    yq -i '.tools.ntm.enabled = true | .tools.alias = .tools.ntm' "$DSR_REPOS_FILE"
+    _watch_configure_ntm 'enabled: false'
+    _mock_gh_runs "$(_queued_release_run)"
+    run _routing_dsr --json check ntm
+    assert_equal 1 "$status"
+    jq -e '.details.throttled[0].tool == "ntm"' <<< "$output"
+    local check_json
+    check_json=$(_watch_run_json)
+    run _routing_watch "$check_json" --auto-fallback
+    assert_equal 0 "$status"
+    assert_contains "$output" "Automatic fallback disabled for ntm"
+    run _routing_watch "$(jq '.details.throttled[0].tool = "alias"' <<< "$check_json")" --auto-fallback
+    assert_equal 0 "$status"
+    [[ ! -e "$TEST_TMPDIR/fallback.starts" && ! -e "$DSR_STATE_DIR/triggered.json" ]]
+    run _routing_watch "$check_json" --auto-fallback --dry-run
+    assert_equal 0 "$status"
+    [[ "$output" != *"Would trigger fallback"* ]]
+    _watch_configure_ntm 'enabled: true'
+    run _routing_watch "$check_json" --auto-fallback
+    assert_equal 0 "$status"
+    _watch_completed
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+}
+
+@test "automation opt-out: a disable after observation is rechecked before new launch" {
+    harness_create_config
+    _watch_configure_ntm 'enabled: true'
+    printf 'tool_name: ntm\nrepo: Dicklesworthstone/ntm\nenabled: false\n' \
+        > "$TEST_TMPDIR/disabled-after-check.yaml"
+    DSR_WATCH_FIXTURE_CONFIG_AFTER_CHECK="$TEST_TMPDIR/disabled-after-check.yaml" \
+        run _routing_watch "$(_watch_run_json)" --auto-fallback
+    assert_equal 0 "$status"
+    assert_contains "$output" "Automatic fallback disabled for ntm"
+    [[ ! -e "$TEST_TMPDIR/fallback.starts" && ! -e "$DSR_STATE_DIR/triggered.json" &&
+       ! -e "$DSR_STATE_DIR/watch-attempts" ]]
+}
+
+@test "automation opt-out: disabled pending work retains history and resumes only after reenable" {
+    _watch_pending_fixture
+    _watch_configure_ntm 'enabled: false'
+    cp "$DSR_STATE_DIR/triggered.json" "$TEST_TMPDIR/pending-before-disable.json"
+    _mock_watch_upstream_run "$(_watch_upstream_run_json completed failure)"
+    run _routing_watch "$(_watch_run_json)" --auto-fallback --max-concurrent 1
+    assert_equal 0 "$status"
+    cmp "$TEST_TMPDIR/pending-before-disable.json" "$DSR_STATE_DIR/triggered.json"
+    run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --max-concurrent 1
+    assert_equal 0 "$status"
+    cmp "$TEST_TMPDIR/pending-before-disable.json" "$DSR_STATE_DIR/triggered.json"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    [[ ! -e "$TEST_TMPDIR/watch-upstream.calls" ]]
+    _watch_configure_ntm 'enabled: true'
+    run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --max-concurrent 1
+    assert_equal 0 "$status"
+    _watch_completed
+    jq -e '.pending["12345"] == null and .attempts["12345"].attempt == 1 and
+        .attempts["12346"].status == "succeeded"' "$DSR_STATE_DIR/triggered.json"
+    assert_equal 2 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+}
+
+@test "automation opt-out: disabled failed work retains retry budget cooldown and checkpoint" {
+    harness_create_config
+    _watch_configure_ntm
+    local sha check_json checkpoint=12345678-1234-1234-1234-123456789abc
+    sha=$(_watch_checkpoint_source_sha)
+    check_json=$(_watch_run_json "$sha")
+    DSR_WATCH_FIXTURE_STATUS=8 run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal 0 "$status"
+    _watch_completed
+    run _routing_watch '{"details":{"throttled":[]}}' --retry-delay 1
+    assert_equal 0 "$status"
+    _watch_seed_mixed_checkpoint "$checkpoint" "$DSR_STATE_DIR/watch-artifacts/12345" "$sha"
+    cp "$DSR_STATE_DIR/triggered.json" "$TEST_TMPDIR/attempt-before-disable.json"
+    cp "$DSR_STATE_DIR/builds/ntm/v1.2.3/$checkpoint/state.json" "$TEST_TMPDIR/checkpoint-before-disable.json"
+    _watch_configure_ntm 'enabled: false'
+    _mock_watch_upstream_run "$(_watch_upstream_run_json completed failure "$sha")"
+    sleep 1
+    run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal 0 "$status"
+    cmp "$TEST_TMPDIR/attempt-before-disable.json" "$DSR_STATE_DIR/triggered.json"
+    run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --retry-delay 1
+    assert_equal 0 "$status"
+    cmp "$TEST_TMPDIR/attempt-before-disable.json" "$DSR_STATE_DIR/triggered.json"
+    cmp "$TEST_TMPDIR/checkpoint-before-disable.json" "$DSR_STATE_DIR/builds/ntm/v1.2.3/$checkpoint/state.json"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    [[ ! -e "$TEST_TMPDIR/watch-upstream.calls" ]]
+    _watch_configure_ntm 'enabled: true'
+    run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --retry-delay 1
+    assert_equal 0 "$status"
+    _watch_completed
+    jq -e --arg run "$checkpoint" '.attempts["12345"] | .attempt == 2 and .resume_run_id == $run' \
+        "$DSR_STATE_DIR/triggered.json"
+    cmp "$TEST_TMPDIR/checkpoint-before-disable.json" "$DSR_STATE_DIR/builds/ntm/v1.2.3/$checkpoint/state.json"
+    assert_equal 2 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+}
+
+@test "automation opt-out: explicit manual fallback still completes for a disabled tool" {
+    _watch_isolated_pipeline_fixture
+    yq -i '.enabled = false' "$DSR_CONFIG_DIR/repos.d/ntm.yaml"
+    run --separate-stderr bash "$DSR_WATCH_FIXTURE_FALLBACK" ntm --version v1.2.3 \
+        --expected-sha "$DSR_WATCH_PINNED_SHA" --isolate-source --output-dir "$TEST_TMPDIR/manual-output"
+    assert_equal 0 "$status"
+    jq -e '.command == "fallback" and .status == "success" and .details.phases.release == "success"' <<< "$output"
+    assert_equal 'tagged release source' "$(cat "$TEST_TMPDIR/manual-output/ntm")"
+}
+
 @test "watch large history dry-run retains the complete journal without writes" {
     harness_create_config
+    _watch_configure_ntm
     _watch_large_history
     cp "$DSR_STATE_DIR/triggered.json" "$TEST_TMPDIR/history-before.json"
     run --separate-stderr _routing_watch "$(_watch_run_json)" --auto-fallback --dry-run
@@ -1099,6 +1346,7 @@ EOF
 
 @test "watch large history persists new attempts and deduplicates across restarts" {
     harness_create_config
+    _watch_configure_ntm
     _watch_large_history
     cp "$DSR_STATE_DIR/triggered.json" "$TEST_TMPDIR/history-before.json"
     local check_json
@@ -1123,6 +1371,7 @@ EOF
 
 @test "watch large history survives continuous-mode result assembly" {
     harness_create_config
+    _watch_configure_ntm
     _watch_large_history
     cp "$DSR_STATE_DIR/triggered.json" "$TEST_TMPDIR/history-before.json"
     DSR_WATCH_FIXTURE_CONTINUOUS=1 run --separate-stderr _routing_watch \
@@ -1185,6 +1434,7 @@ EOF
 
 @test "watch recovery retains a successful child across once invocations" {
     harness_create_config
+    _watch_configure_ntm
     local check_json
     check_json=$(_watch_run_json)
     run _routing_watch "$check_json" --auto-fallback
@@ -1199,6 +1449,7 @@ EOF
 
 @test "watch recovery uses real Python descriptor locks when flock is absent" {
     harness_create_config
+    _watch_configure_ntm
     local check_json
     check_json=$(_watch_run_json)
     DSR_WATCH_FIXTURE_PYTHON=1 run _routing_watch "$check_json" --auto-fallback
@@ -1212,6 +1463,7 @@ EOF
 
 @test "watch recovery retries failed children with a bounded attempt budget" {
     harness_create_config
+    _watch_configure_ntm
     local check_json
     check_json=$(_watch_run_json)
     DSR_WATCH_FIXTURE_STATUS=8 run _routing_watch "$check_json" --auto-fallback --retry-delay 1 --max-attempts 2
@@ -1401,6 +1653,7 @@ EOF
 
 @test "watch recovery preserves cooldown and does not hold the watcher lock in its child" {
     harness_create_config
+    _watch_configure_ntm
     local check_json
     check_json=$(_watch_run_json)
     DSR_WATCH_FIXTURE_WAIT="$TEST_TMPDIR/finish-child" DSR_WATCH_FIXTURE_STATUS=8 run _routing_watch "$check_json" --auto-fallback
@@ -1689,6 +1942,7 @@ EOF
 
 @test "watch admission defers failed retries without consuming their attempt budget" {
     harness_create_config
+    _watch_configure_ntm
     local first_json second_json both_json saved
     first_json=$(_watch_run_json)
     second_json=$(_watch_multiple_runs_json | jq '.details.throttled = [.details.throttled[1]]')
@@ -1713,6 +1967,7 @@ EOF
 
 @test "watch admission honors live descendant locks even after a completion receipt exists" {
     harness_create_config
+    _watch_configure_ntm
     local check_json directory holder deadline=$((SECONDS + 10))
     check_json=$(_watch_multiple_runs_json)
     run _routing_watch "$(_watch_run_json)" --auto-fallback --max-concurrent 1
@@ -1738,6 +1993,7 @@ EOF
 
 @test "watch admission plans only available slots without changing recovery state" {
     harness_create_config
+    _watch_configure_ntm
     local check_json
     check_json=$(_watch_multiple_runs_json)
     run --separate-stderr _routing_watch "$check_json" --auto-fallback --dry-run
@@ -1762,6 +2018,7 @@ EOF
 
 @test "watch recovery refuses source identity changes and legacy unknown outcomes" {
     harness_create_config
+    _watch_configure_ntm
     local check_json
     check_json=$(_watch_run_json)
     DSR_WATCH_FIXTURE_STATUS=8 run _routing_watch "$check_json" --auto-fallback --retry-delay 1
@@ -1790,6 +2047,7 @@ EOF
 
 @test "watch recovery uses the exact private-output checkpoint instead of latest" {
     harness_create_config
+    _watch_configure_ntm
     local check_json checkpoint=12345678-1234-1234-1234-123456789abc state_dir
     check_json=$(_watch_run_json)
     DSR_WATCH_FIXTURE_STATUS=6 run _routing_watch "$check_json" --auto-fallback --retry-delay 1
@@ -1811,6 +2069,7 @@ EOF
 
 @test "watch source isolation preserves legacy checkpoint mode through repeated retries" {
     harness_create_config
+    _watch_configure_ntm
     local check_json checkpoint=12345678-1234-1234-1234-123456789abc state_dir
     check_json=$(_watch_run_json)
     DSR_WATCH_FIXTURE_STATUS=6 run _routing_watch "$check_json" --auto-fallback --retry-delay 1
@@ -1845,6 +2104,7 @@ EOF
 
 @test "watch source isolation rejects nonboolean saved source modes before retry" {
     harness_create_config
+    _watch_configure_ntm
     local check_json value
     check_json=$(_watch_run_json)
     DSR_WATCH_FIXTURE_STATUS=6 run _routing_watch "$check_json" --auto-fallback --retry-delay 1
@@ -1862,6 +2122,7 @@ EOF
 
 @test "watch partial recovery resumes a mixed-success checkpoint instead of unrelated latest" {
     harness_create_config
+    _watch_configure_ntm
     local sha check_json checkpoint=12345678-1234-1234-1234-123456789abc
     local unrelated=12345678-1234-1234-1234-123456789abd checkpoint_file before payload
     sha=$(_watch_checkpoint_source_sha)
@@ -1925,6 +2186,7 @@ _watch_partial_refusal_case() {
 
 @test "watch partial recovery rejects cancelled mismatched and ambiguous checkpoints" {
     harness_create_config
+    _watch_configure_ntm
     local sha mode
     sha=$(_watch_checkpoint_source_sha)
     for mode in cancelled wrong-source unrelated-output ambiguous; do
@@ -1934,6 +2196,7 @@ _watch_partial_refusal_case() {
 
 @test "watch recovery blocks an artifact directory with no matching source checkpoint" {
     harness_create_config
+    _watch_configure_ntm
     local check_json
     check_json=$(_watch_run_json)
     DSR_WATCH_FIXTURE_STATUS=6 run _routing_watch "$check_json" --auto-fallback --retry-delay 1
@@ -1949,6 +2212,7 @@ _watch_partial_refusal_case() {
 
 @test "watch recovery blocks a lost completion rather than replaying publication" {
     harness_create_config
+    _watch_configure_ntm
     local check_json attempt
     check_json=$(_watch_run_json)
     run _routing_watch "$check_json" --auto-fallback
@@ -1966,6 +2230,7 @@ _watch_partial_refusal_case() {
 
 @test "watch recovery serializes overlapping once invocations" {
     harness_create_config
+    _watch_configure_ntm
     local check_json first deadline=$((SECONDS + 10))
     check_json=$(_watch_run_json)
     DSR_WATCH_FIXTURE_CHECK_WAIT="$TEST_TMPDIR/finish-check" _routing_watch "$check_json" --auto-fallback > "$TEST_TMPDIR/first-watch.log" 2>&1 &
@@ -2157,7 +2422,7 @@ EOF
     # The fallback child runs detached; ntm's local_path does not exist here,
     # so it stops at configuration and must report failure on the same channel.
     local i
-    for i in $(seq 1 60); do
+    for ((i = 1; i <= 60; i++)); do
         grep -q '"event":"fallback\.' "$TEST_TMPDIR/hook.log" 2>/dev/null && break
         sleep 1
     done
@@ -2410,7 +2675,8 @@ _write_report_log() {
     # Bash's dynamic local scope also carries this anchor into _iso_ago subshells.
     local report_fixture_epoch
     report_fixture_epoch=$(date +%s)
-    local day="$DSR_STATE_DIR/logs/$(date +%Y-%m-%d)"
+    local day
+    day="$DSR_STATE_DIR/logs/$(date +%Y-%m-%d)"
     mkdir -p "$day"
     cat > "$day/run.log" << EOF
 {"ts":"$(_iso_ago '3 hours')","run_id":"w1","level":"info","cmd":"watch","msg":"Session started"}
@@ -2793,7 +3059,7 @@ YAML
     # A scanner that fails with a specific reason.
     mock_command_script "syft" 'echo "scanner exploded: disk quota" >&2; exit 2'
 
-    local out err
+    local out
     run bash -c '"$1" sbom generate "$2" 2>"$3"' _ "$PROJECT_ROOT/dsr" "$TEST_TMPDIR/artifact.bin" "$TEST_TMPDIR/err.txt"
     assert_equal "1" "$status"
     assert_equal "" "$output"

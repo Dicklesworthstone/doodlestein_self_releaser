@@ -1233,6 +1233,21 @@ the repo's configured tool at the run's version tag; repos with no dsr tool
 are reported, never guessed. `dsr --dry-run watch --auto-fallback` shows which
 fallbacks would start.
 
+Set `enabled: false` in `repos.d/<tool>.yaml` to suspend automatic fallback for
+that tool. A per-tool `enabled` value overrides `repos.yaml`; when it is absent,
+the registry value applies, and when both are absent automation is enabled.
+Only YAML booleans are accepted: quoted strings, nulls and other types cause a
+configuration error and cannot authorize a release. `dsr repos list --json`
+shows the effective boolean, including per-tool files and overrides.
+
+The watcher rereads this policy before a new launch and before admitting
+pending or failed work. Disabling a tool preserves its pending source identity,
+attempt count, cooldown and build checkpoints, so re-enabling it resumes through
+the same checks. It does not cancel an already running worker. A duplicate
+registry entry cannot override a disabled per-tool repository. Explicit
+`dsr check`, `build`, `release` and `fallback` commands remain available for
+manual diagnosis and recovery; `enabled` controls watcher automation.
+
 The watcher admits at most two fallback pipelines at once by default;
 `--max-concurrent` accepts 1–32. Excess runs wait for a later poll without
 creating a build or consuming a retry attempt. Their repository, tag and source
@@ -1528,9 +1543,13 @@ Tool configuration lives in two places with distinct roles:
   `artifact_naming`, `archive_format`, `release_contract`, ...). The file must
   be named after its own `tool_name` — the runner loads
   `repos.d/<tool_name>.yaml` by filename.
-- **`repos.yaml` is the registry.** `dsr repos list/info/check` and the
-  quality gates (`checks:`) read it.
-- **Any key present in both files must be identical.** `dsr repos validate`
+- **`repos.yaml` is the registry.** `dsr repos info` and the quality gates
+  (`checks:`) read it. `dsr repos list` and `dsr check` use per-tool entries
+  first, then registry-only tools; listing retains distinct tools sharing a
+  repository. Their effective automation policy inherits registry `enabled`
+  only when the per-tool key is absent. A per-tool repository opt-out also
+  disables duplicate registry aliases for that repository.
+- **Common keys must match except the boolean `enabled` override.** `dsr repos validate`
   fails on divergence: mismatched values, build keys present only in
   `repos.yaml` (the runner would ignore them), `repos.d` files missing from
   the registry, and `repos.d` files whose name does not match their

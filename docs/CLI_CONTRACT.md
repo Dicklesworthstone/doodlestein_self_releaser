@@ -508,6 +508,24 @@ dsr watch [--interval <seconds>] [--auto-fallback] [--notify <method>]
 | `--once` | false | Check once using the same exclusive lock and recovery journal |
 | `--notify` | none | Notification: slack\|discord\|desktop\|none |
 
+Automatic admission honors the tool's effective `enabled` policy. A present
+`repos.d/<tool>.yaml` value takes precedence over the matching `repos.yaml`
+entry; an absent per-tool field inherits the registry field, and absence in
+both defaults to `true`. A present value must be a YAML boolean. `false`
+withholds automatic launches, pending work and retries; null, strings, numbers,
+collections, duplicate keys, malformed YAML or unreadable configuration cannot
+authorize fallback. The selected repository and policy are reread before every
+automatic admission, including when a throttled result predates a local edit.
+A duplicate registry entry cannot revive a per-tool opt-out. `repos list`
+reports the same effective inventory and preserves explicit `false` in JSON.
+
+Disabling a tool does not consume retry budget, reset cooldown, retire pending
+work, alter retained checkpoints or stop an already admitted worker. Re-enabling
+it permits recovery only through the existing source, status, capacity and
+checkpoint requirements. Explicit `check`, `build`, `release` and `fallback`
+invocations remain manual operations and do not treat `enabled: false` as a
+prohibition; monitoring can still report a disabled repository's queued runs.
+
 Automatic fallback requires an explicit `v`-prefixed version tag and the
 workflow run's full source SHA. The watcher passes both to `fallback`; missing
 or ambiguous source identity never falls back to detecting a version from the
@@ -536,7 +554,7 @@ throttled, with an exponential cooldown capped at one hour. They can also retry
 after that upstream run leaves the queue and an uncached GitHub observation
 confirms it completed with `failure`, `timed_out`, or `startup_failure`. This
 recovery requires the original run ID, repository, version tag and source SHA,
-and the tool must still be configured for that repository. A missing queue entry
+and the tool must still be configured and enabled for that repository. A missing queue entry
 alone never authorizes a retry. Active, successful, cancelled, approval-pending,
 skipped or otherwise unverified upstream runs do not authorize this recovery;
 failed reads and identity changes preserve the failed attempt without consuming
