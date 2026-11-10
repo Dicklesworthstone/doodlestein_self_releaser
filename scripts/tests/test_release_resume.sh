@@ -68,16 +68,21 @@ _release_require_publishable_artifacts() { return 0; }
 _release_contract_create_nonce() { printf '%064d\n' 1; }
 _release_contract_preflight() { printf 'STRICT-PREFLIGHT\n' >> "$CALLS"; return 4; }
 gh_resolve_tag_sha() {
+    printf 'TAG-RESOLVE %s %s\n' "$1" "$2" >> "$CALLS"
     if [[ -n "${STAGED_SOURCE_SHA:-}" ]]; then
         case "$STAGED_REMOTE_MODE" in
             unavailable) return 8 ;;
             moved) printf '%040d\n' 1; return 0 ;;
             after-publish)
-                if [[ "$(jq -r '.draft' "$CASE/release.json")" == false ]]; then
+                if [[ -f "$CASE/create-request.json" &&
+                      "$(jq -r '.draft' "$CASE/release.json")" == false ]]; then
                     printf '%040d\n' 1; return 0
                 fi ;;
             absent-*)
-                [[ "$(jq -r '.draft' "$CASE/release.json")" == false ]] || return 8
+                # The fixture release record also serves as the POST template.
+                # Until a POST really created/published it, the tag is absent.
+                [[ -f "$CASE/create-request.json" &&
+                   "$(jq -r '.draft' "$CASE/release.json")" == false ]] || return 8
                 if [[ "$STAGED_REMOTE_MODE" == absent-wrong-created ]]; then
                     printf '%040d\n' 1; return 0
                 fi ;;
@@ -1822,6 +1827,222 @@ test_artifacts_must_come_from_the_tagged_commit() {
     [[ $STATUS -eq 0 ]] && grep -q -- "^CREATE .*--target-commitish $tagged" "$CALLS"
 }
 
+manifest_source_setup() {
+    setup "$1"
+    CREATE_FAIL=false
+    printf -v STAGED_SOURCE_SHA '%040d' 2
+    manifest payload.bin || return 1
+    jq --arg sha "$STAGED_SOURCE_SHA" '.source={git_sha:$sha,git_ref:"main",dependencies:[]}' \
+        "$CASE/artifacts/tool-v1.2.3-manifest.json" > "$CASE/source-manifest" &&
+        mv "$CASE/source-manifest" "$CASE/artifacts/tool-v1.2.3-manifest.json"
+}
+
+test_manifest_source_without_checkout_pins_creation_and_dispatch() {
+    manifest_source_setup source_no_checkout || return 1
+    run_release
+    [[ $STATUS -eq 0 ]] &&
+        jq -e --arg sha "$STAGED_SOURCE_SHA" '.target_commitish==$sha and .draft==true' \
+            "$CASE/create-request.json" >/dev/null &&
+        jq -e '.draft==false' "$CASE/release.json" >/dev/null &&
+        grep -Fxq PUBLISH "$CALLS" && grep -Fxq DISPATCH "$CALLS" &&
+        [[ $(grep -c '^TAG-RESOLVE ' "$CALLS") -ge 3 ]] &&
+        jq -e --arg sha "$STAGED_SOURCE_SHA" '.request.target_commitish==$sha' \
+            "$(jq -r '.details.staging_receipt' "$CASE/stdout")" >/dev/null
+}
+
+test_manifest_source_without_checkout_rejects_wrong_remote_before_create() {
+    manifest_source_setup source_wrong_remote || return 1
+    STAGED_REMOTE_MODE=moved
+    run_release
+    [[ $STATUS -eq 7 ]] && ! grep -Eq '^CREATE|^POST |^PUBLISH|^DISPATCH' "$CALLS" &&
+        grep -q "differs from the release's pinned source commit" "$CASE/stderr"
+}
+
+test_manifest_source_without_checkout_rejects_unknown_remote_before_create() {
+    manifest_source_setup source_unknown_remote || return 1
+    STAGED_REMOTE_MODE=unavailable
+    run_release
+    [[ $STATUS -eq 7 ]] && ! grep -Eq '^CREATE|^POST |^PUBLISH|^DISPATCH' "$CALLS"
+}
+
+test_manifest_source_without_checkout_creates_absent_tag_at_build_commit() {
+    manifest_source_setup source_absent_remote || return 1
+    STAGED_REMOTE_MODE=absent-empty
+    run_release
+    [[ $STATUS -eq 0 ]] && grep -Fxq TAG-ABSENCE "$CALLS" &&
+        jq -e --arg sha "$STAGED_SOURCE_SHA" '.target_commitish==$sha' "$CASE/create-request.json" >/dev/null &&
+        grep -Fxq PUBLISH "$CALLS" && grep -Fxq DISPATCH "$CALLS"
+}
+
+test_manifest_source_without_checkout_refuses_ambiguous_declared_evidence() {
+    local source index=0
+    for source in null false 42 '[]' '"source"' \
+        '{"git_sha":null}' '{"git_sha":false}' '{"git_sha":42}' \
+        '{"git_sha":[]}' '{"git_sha":{}}' '{"git_sha":""}' \
+        '{"git_sha":"2222222"}' '{"git_sha":"0000000000000000000000000000000000000000"}' \
+        '{"git_sha":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}'; do
+        index=$((index+1))
+        manifest_source_setup "source_invalid_$index" || return 1
+        jq --argjson source "$source" '.source=$source' "$CASE/artifacts/tool-v1.2.3-manifest.json" > "$CASE/invalid-manifest" &&
+            mv "$CASE/invalid-manifest" "$CASE/artifacts/tool-v1.2.3-manifest.json" || return 1
+        run_release
+        [[ $STATUS -eq 4 && ! -s "$CALLS" ]] || {
+            printf 'Invalid source was not refused before publication: %s (exit %s)\n' "$source" "$STATUS" >&2
+            return 1
+        }
+    done
+}
+
+test_manifest_source_without_checkout_dry_run_keeps_source_and_state_unchanged() {
+    manifest_source_setup source_dry_run || return 1
+    cp "$CASE/artifacts/tool-v1.2.3-manifest.json" "$CASE/original-manifest" || return 1
+    DRY_RUN=true
+    run_release
+    [[ $STATUS -eq 0 && ! -s "$CALLS" && ! -e "$CASE/artifacts/SHA256SUMS" ]] &&
+        cmp -s "$CASE/original-manifest" "$CASE/artifacts/tool-v1.2.3-manifest.json" &&
+        [[ -z "$(find "$DSR_STATE_DIR/releases" -mindepth 1 -print -quit)" ]]
+}
+
+test_manifest_source_unowned_resume_checks_actual_tag_not_target_branch() {
+    manifest_source_setup source_unowned_resume || return 1
+    jq '.target_commitish="main"' "$CASE/release.json" > "$CASE/release.next" &&
+        mv "$CASE/release.next" "$CASE/release.json" || return 1
+    run_release --resume
+    [[ $STATUS -eq 0 ]] && ! grep -Eq '^CREATE|^PUBLISH|^RESTORE-DRAFT' "$CALLS" &&
+        grep -Fxq DISPATCH "$CALLS" &&
+        jq -e '.target_commitish=="main" and .draft==false' "$CASE/release.json" >/dev/null
+}
+
+test_manifest_source_unowned_resume_rejects_wrong_or_unknown_tag_before_upload() {
+    local mode
+    for mode in moved unavailable absent-empty; do
+        manifest_source_setup "source_unowned_$mode" || return 1
+        STAGED_REMOTE_MODE="$mode"
+        run_release --resume
+        [[ $STATUS -eq 7 ]] && ! grep -Eq '^CREATE|^POST |^PUBLISH|^DISPATCH|^RESTORE-DRAFT' "$CALLS" || return 1
+    done
+}
+
+test_manifest_source_legacy_unowned_draft_cannot_create_a_tag() {
+    manifest_source_setup source_unowned_draft || return 1
+    STAGED_REMOTE_MODE=absent-empty
+    jq '.draft=true' "$CASE/release.json" > "$CASE/release.next" &&
+        mv "$CASE/release.next" "$CASE/release.json" || return 1
+    run_release --resume
+    [[ $STATUS -eq 7 ]] && ! grep -Eq '^CREATE|^POST |^PUBLISH|^DISPATCH|^RESTORE-DRAFT' "$CALLS"
+}
+
+test_manifest_source_owned_resume_retains_pin_without_checkout() {
+    manifest_source_setup source_owned_resume || return 1
+    PUBLISH_FAIL=true
+    run_release
+    [[ $STATUS -eq 1 ]] || return 1
+    local intent
+    intent=$(jq -r '.details.staging_receipt' "$CASE/stdout") || return 1
+    cp "$intent" "$CASE/original-intent" || return 1
+    : > "$CALLS"
+    PUBLISH_FAIL=false
+    run_release --resume
+    [[ $STATUS -eq 0 ]] && ! grep -Eq '^CREATE|^POST ' "$CALLS" &&
+        grep -Fxq PUBLISH "$CALLS" && cmp -s "$intent" "$CASE/original-intent" &&
+        jq -e --arg sha "$STAGED_SOURCE_SHA" '.request.target_commitish==$sha' "$intent" >/dev/null
+}
+
+test_manifest_source_owned_resume_rejects_old_unpinned_creation_intent() {
+    manifest_source_setup source_old_unpinned_intent || return 1
+    PUBLISH_FAIL=true
+    run_release
+    [[ $STATUS -eq 1 ]] || return 1
+    local intent response
+    intent=$(jq -r '.details.staging_receipt' "$CASE/stdout") || return 1
+    response=$(printf '%s\n' "${intent%/*}"/dsr-api-response.????????)
+    # Model the exact old source-present/no-checkout publication: its request,
+    # response and release carry no source pin despite a pinned build manifest.
+    jq 'del(.request.target_commitish)' "$intent" > "$CASE/unpinned-intent" &&
+        cat "$CASE/unpinned-intent" > "$intent" || return 1
+    jq 'del(.target_commitish)' "$response" > "$CASE/unpinned-response" &&
+        cat "$CASE/unpinned-response" > "$response" || return 1
+    jq 'del(.target_commitish)' "$CASE/release.json" > "$CASE/release.next" &&
+        mv "$CASE/release.next" "$CASE/release.json" || return 1
+    : > "$CALLS"
+    PUBLISH_FAIL=false
+    run_release --resume
+    [[ $STATUS -eq 7 ]] && ! grep -Eq '^CREATE|^POST |^PUBLISH|^DISPATCH|^RESTORE-DRAFT' "$CALLS"
+}
+
+test_manifest_source_pin_survives_checkout_loss_for_unmanifested_resume() {
+    setup source_intent_without_checkout
+    CREATE_FAIL=false PUBLISH_FAIL=true
+    git init -q "$CASE/checkout" &&
+        git -C "$CASE/checkout" -c user.name=t -c user.email=t@example.invalid commit -q --allow-empty -m tagged &&
+        git -C "$CASE/checkout" tag v1.2.3 || return 1
+    STAGED_SOURCE_SHA=$(git -C "$CASE/checkout" rev-parse HEAD) || return 1
+    act_get_local_path() { printf '%s\n' "$CASE/checkout"; }
+    git_ops_tag_exists() { git -C "$1" rev-parse -q --verify "refs/tags/$2" >/dev/null; }
+    git_ops_tag_sha() { git -C "$1" rev-parse --verify "$2^{commit}"; }
+    run_release
+    [[ $STATUS -eq 1 ]] || return 1
+    local intent
+    intent=$(jq -r '.details.staging_receipt' "$CASE/stdout") || return 1
+    cp "$intent" "$CASE/original-intent" || return 1
+    mv "$CASE/checkout" "$CASE/retained-checkout" || return 1
+    : > "$CALLS"
+    PUBLISH_FAIL=false STAGED_REMOTE_MODE=moved
+    run_release --resume
+    [[ $STATUS -eq 7 ]] && ! grep -Eq '^CREATE|^POST |^PUBLISH|^DISPATCH|^RESTORE-DRAFT' "$CALLS" || return 1
+    : > "$CALLS"
+    STAGED_REMOTE_MODE=valid
+    run_release --resume
+    [[ $STATUS -eq 0 ]] && ! grep -Eq '^CREATE|^POST ' "$CALLS" &&
+        grep -Fxq PUBLISH "$CALLS" && cmp -s "$intent" "$CASE/original-intent"
+}
+
+test_manifest_source_changed_tag_during_unowned_resume_stops_later_uploads() {
+    manifest_source_setup source_late_unowned_drift || return 1
+    gh_resolve_tag_sha() {
+        printf 'TAG-RESOLVE %s %s\n' "$1" "$2" >> "$CALLS"
+        if grep -q '^POST ' "$CALLS"; then printf '%040d\n' 1
+        else printf '%s\n' "$STAGED_SOURCE_SHA"; fi
+    }
+    run_release --resume
+    [[ $STATUS -eq 1 && $(grep -c '^POST ' "$CALLS") -eq 1 ]] &&
+        ! grep -Eq '^CREATE|^PUBLISH|^DISPATCH|^RESTORE-DRAFT' "$CALLS" &&
+        jq -e '.details.verification=="incomplete"' "$CASE/stdout" >/dev/null
+}
+
+test_manifest_source_verify_tag_without_checkout_resolves_remote() {
+    setup source_explicit_verify
+    CREATE_FAIL=false
+    run_release --verify-tag
+    [[ $STATUS -eq 0 ]] && jq -e '.target_commitish==("0"*39+"1")' "$CASE/create-request.json" >/dev/null
+}
+
+test_manifest_source_verify_tag_without_checkout_refuses_unresolved_ref() {
+    setup source_explicit_verify_unavailable
+    CREATE_FAIL=false
+    gh_resolve_tag_sha() { return 8; }
+    run_release --verify-tag
+    [[ $STATUS -eq 7 ]] && ! grep -Eq '^CREATE|^POST |^PUBLISH|^DISPATCH' "$CALLS"
+}
+
+test_manifest_source_verify_tag_requires_existing_tag_even_with_manifest_pin() {
+    manifest_source_setup source_verify_pinned_absence || return 1
+    STAGED_REMOTE_MODE=absent-empty
+    run_release --verify-tag
+    [[ $STATUS -eq 7 ]] && ! grep -Eq '^CREATE|^POST |^PUBLISH|^DISPATCH' "$CALLS"
+}
+
+test_manifest_source_verify_tag_blocks_absence_on_owned_resume() {
+    manifest_source_setup source_verify_owned_absence || return 1
+    STAGED_REMOTE_MODE=absent-empty PUBLISH_FAIL=true
+    run_release
+    [[ $STATUS -eq 1 ]] || return 1
+    : > "$CALLS"
+    PUBLISH_FAIL=false
+    run_release --resume --verify-tag
+    [[ $STATUS -eq 7 ]] && ! grep -Eq '^CREATE|^POST |^PUBLISH|^DISPATCH|^RESTORE-DRAFT' "$CALLS"
+}
+
 test_wrong_repository_upload_url_is_rejected() {
     setup wrong_url
     jq '.upload_url="https://uploads.github.com/repos/owner/other/releases/9/assets{?name,label}"' \
@@ -2229,7 +2450,7 @@ test_promotion_rechecks_pinned_tag_before_publication() {
     STAGED_REMOTE_MODE=moved
     : > "$CALLS"
     run_release --resume --publish-draft
-    [[ $STATUS -eq 1 ]] && ! grep -q '^CREATE\|^POST \|^PUBLISH\|^DISPATCH' "$CALLS" &&
+    [[ $STATUS -eq 7 ]] && ! grep -q '^CREATE\|^POST \|^PUBLISH\|^DISPATCH' "$CALLS" &&
         jq -e '.draft==true' "$CASE/release.json" >/dev/null
 }
 
@@ -2589,8 +2810,9 @@ staged_tag_case() {
         [[ $STATUS -eq 1 ]] && grep -Fxq PUBLISH "$CALLS" && grep -Fxq RESTORE-DRAFT "$CALLS" &&
             ! grep -q '^DISPATCH' "$CALLS" && jq -e '.draft==true' "$CASE/release.json" >/dev/null || return 1
     else
-        [[ $STATUS -eq 1 ]] && ! grep -q '^PUBLISH\|^DISPATCH' "$CALLS" &&
-            jq -e '.draft==true' "$CASE/release.json" >/dev/null || return 1
+        # Source conflicts and unverifiable absence are rejected before POST,
+        # so no draft or asset mutation is needed to contain the failure.
+        [[ $STATUS -eq 7 ]] && ! grep -Eq '^CREATE|^POST |^PUBLISH|^DISPATCH' "$CALLS" || return 1
     fi
     [[ "$1" != absent-* ]] || grep -Fxq TAG-ABSENCE "$CALLS"
 }
@@ -2970,6 +3192,23 @@ for test in test_release_keeps_artifacts_during_publication \
     test_release_dispatch_saved_state_is_validated_before_network \
     test_invalid_journal_is_not_upload_authority test_empty_artifacts_are_not_a_release \
     test_unmanifested_directory_is_refused test_artifacts_must_come_from_the_tagged_commit \
+    test_manifest_source_without_checkout_pins_creation_and_dispatch \
+    test_manifest_source_without_checkout_rejects_wrong_remote_before_create \
+    test_manifest_source_without_checkout_rejects_unknown_remote_before_create \
+    test_manifest_source_without_checkout_creates_absent_tag_at_build_commit \
+    test_manifest_source_without_checkout_refuses_ambiguous_declared_evidence \
+    test_manifest_source_without_checkout_dry_run_keeps_source_and_state_unchanged \
+    test_manifest_source_unowned_resume_checks_actual_tag_not_target_branch \
+    test_manifest_source_unowned_resume_rejects_wrong_or_unknown_tag_before_upload \
+    test_manifest_source_legacy_unowned_draft_cannot_create_a_tag \
+    test_manifest_source_owned_resume_retains_pin_without_checkout \
+    test_manifest_source_owned_resume_rejects_old_unpinned_creation_intent \
+    test_manifest_source_pin_survives_checkout_loss_for_unmanifested_resume \
+    test_manifest_source_changed_tag_during_unowned_resume_stops_later_uploads \
+    test_manifest_source_verify_tag_without_checkout_resolves_remote \
+    test_manifest_source_verify_tag_without_checkout_refuses_unresolved_ref \
+    test_manifest_source_verify_tag_requires_existing_tag_even_with_manifest_pin \
+    test_manifest_source_verify_tag_blocks_absence_on_owned_resume \
     test_draft_request_refuses_published_release test_wrong_repository_upload_url_is_rejected \
     test_staged_creation_publishes_only_after_private_uploads \
     test_staged_large_inventory_publishes_and_resumes test_staged_large_inventory_drift_restores_draft \

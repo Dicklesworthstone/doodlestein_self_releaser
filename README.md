@@ -873,8 +873,16 @@ dsr --dry-run release --repo ntm --version v1.2.3   # Show the exact upload plan
 New ordinary releases stay private until every selected artifact, checksum,
 and metadata sidecar matches the complete remote inventory. DSR then publishes
 the original release ID and verifies it again before running post-release
-hooks. Existing source tags must match the pinned commit. A tag proved absent
-on GitHub is created at that commit when publishing and verified afterward.
+hooks. The build manifest's `source.git_sha` pins publication even when the
+publishing machine has no source checkout. Declared source commits must be
+nonzero 40-character lowercase Git SHAs and agree with any available local
+tag. DSR checks the actual remote tag before creation, each upload, and final
+publication; this also applies to `--resume` of an existing release. A tag
+proved absent on GitHub is created at the pinned commit when publishing an
+owned draft and verified afterward. Malformed or conflicting source evidence
+blocks publication. Legacy inputs without a source pin remain supported;
+`--verify-tag` requires the remote tag to exist already and resolves its commit
+when no local or manifest pin is available.
 
 Downstream dispatch retains each destination's acknowledgement in a persistent
 outbox bound to the GitHub release ID. Retrying skips accepted destinations and

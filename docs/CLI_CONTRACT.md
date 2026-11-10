@@ -1170,13 +1170,27 @@ New ordinary releases are created as private drafts. DSR freezes every selected
 asset name, size, and SHA-256, including the manifest, generated checksums, and
 selected metadata sidecars. It verifies the complete remote inventory and
 release metadata before publishing the original release ID, then repeats the
-verification against the public release. When creation pinned a source commit,
-an existing remote tag must resolve to it. A missing tag is allowed before
+verification against the public release. A manifest's declared `source.git_sha`
+must be a nonzero 40-character lowercase Git SHA and agree with any available
+local tag. Its pin remains authoritative without the original checkout and is
+retained in the private creation intent and `target_commitish`. Malformed
+source objects or declared hashes fail with exit 4 before remote mutation;
+truly absent legacy source evidence remains optional. An existing remote tag
+must resolve to the selected pin before creation, each upload, and final
+verification, including ordinary `--resume` into a release created elsewhere.
+The resolved Git reference, not a potentially mutable branch name in release
+metadata, provides source authority. A missing tag is allowed before
 publication only after an uncached, validated Git reference collection proves
 that the exact tag is absent, including when similarly named tags exist.
 Publishing creates the tag at the pinned commit; the public release must then
 resolve to that exact commit. An unavailable or malformed absence check fails
 closed.
+An unowned draft cannot authorize tag creation. Recovery preserves an original
+private intent's source pin even if the original checkout has disappeared;
+an older unpinned creation intent cannot be upgraded using a newly declared
+manifest pin. Explicit `--verify-tag` requires an existing remote tag, including
+when a manifest pin is available. Without a local or manifest pin, it resolves
+and pins the remote commit; an absent or unreadable tag fails with exit 7.
 An upload, inventory, source, or publication failure suppresses dispatch and
 upgrade hooks. A failed publication can be returned to draft only while its
 current nonce and metadata still prove ownership.
@@ -1334,10 +1348,13 @@ Dry runs and `--sync-only` do not change existing publication state.
 For an external artifact directory without a DSR publication receipt, a missing
 manifest causes exit 4 unless `--no-manifest` is given (no completeness check,
 no checksums).
-The manifest's `source.git_sha` must be the commit the local tag names (exit 4
-otherwise), origin must not hold a different commit under that tag, and a tag
-GitHub does not have yet is created at that commit (`target_commitish`), not at
-the default branch head. `dsr build --version` likewise exits 4 when the
+The manifest's `source.git_sha` pins publication independently of an available
+checkout and must agree with any local tag (exit 4 otherwise). Origin must not
+hold a different commit under that tag. DSR also resolves the configured
+GitHub repository's tag directly; conflicting or unreadable source identity
+blocks creation and uploads. A tag GitHub does not have yet is created at the
+pinned commit (`target_commitish`) only after absence is proved and the draft's
+creation custody is verified. `dsr build --version` likewise exits 4 when the
 version's tag exists and the checkout is at another commit. `--draft` against a
 release that already exists and is published exits 7 without uploading
 (dropping `--draft` adds the assets to it).

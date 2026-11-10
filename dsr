@@ -8968,7 +8968,11 @@ EOF
                 log_info "Create with: dsr version tag $tool_name"
                 return 4
             fi
-            release_tag_sha=$(git_ops_tag_sha "$local_path" "$tag" 2>/dev/null) || release_tag_sha=""
+            if ! release_tag_sha=$(git_ops_tag_sha "$local_path" "$tag" 2>/dev/null) ||
+               [[ ! "$release_tag_sha" =~ ^[0-9a-f]{40}$ || "$release_tag_sha" =~ ^0{40}$ ]]; then
+                log_error "Tag $tag does not identify a nonzero source commit in $local_path"
+                return 4
+            fi
             log_info "Tag $tag verified locally${release_tag_sha:+ ($release_tag_sha)}"
             # GitHub creates a missing tag at target_commitish, else at the
             # default branch head. Origin already holding a different commit
@@ -8986,8 +8990,7 @@ EOF
             fi
         elif $verify_tag; then
             # User explicitly requested verification but no local path available
-            log_warn "Cannot verify tag: local_path not configured for $tool_name"
-            log_info "Tag verification skipped (GitHub will validate on release)"
+            log_info "Tag $tag will be verified directly on GitHub before publication"
         fi
     fi
 
@@ -9094,7 +9097,10 @@ EOF
     local -A ordinary_expected_sha=()
     local -a ordinary_files=()
     if ! $release_contract_enabled && $manifest_exists; then
-        if [[ -L "$manifest_file" ]] || ! ordinary_manifest=$(jq -ces '
+        local ordinary_manifest_sha
+        if [[ -L "$manifest_file" ]] ||
+           ! ordinary_manifest_sha=$(_gh_asset_sha256 "$manifest_file") ||
+           ! ordinary_manifest=$(jq -ces '
             if length == 1 and (.[0] | type == "object") and
                (.[0].artifacts | type == "array" and length > 0) and
                all(.[0].artifacts[];
@@ -9122,12 +9128,27 @@ EOF
         # The binaries must come from the commit the tag names, not whatever
         # the checkout held when they were built.
         local manifest_git_sha
-        manifest_git_sha=$(jq -r '.source.git_sha // empty' <<< "$ordinary_manifest")
+        if ! manifest_git_sha=$(jq -er '
+            if has("source") | not then ""
+            elif (.source | type) != "object" then error("source must be an object")
+            elif (.source | has("git_sha") | not) then ""
+            elif (.source.git_sha | type == "string" and
+                    test("^[0-9a-f]{40}$") and . != ("0" * 40))
+            then .source.git_sha
+            else error("source.git_sha must be a nonzero full commit") end
+        ' <<< "$ordinary_manifest" 2>/dev/null); then
+            log_error "Manifest source must contain an unambiguous nonzero 40-hex commit when declared"
+            return 4
+        fi
         if [[ -n "$release_tag_sha" && -n "$manifest_git_sha" && "$manifest_git_sha" != "$release_tag_sha" ]]; then
             log_error "Artifacts were built from $manifest_git_sha, but $tag is $release_tag_sha"
             log_info "Check out $tag and rebuild: dsr build $tool_name --version $version"
             return 4
         fi
+        # Artifacts can be published from a coordinator without the original
+        # checkout. The frozen build evidence still owns their source identity;
+        # never let GitHub substitute the default branch for that commit.
+        [[ -z "$manifest_git_sha" ]] || release_tag_sha="$manifest_git_sha"
         local required_name required_sha actual_sha
         while IFS=$'\t' read -r required_name required_sha; do
             if [[ ! -s "$artifacts_dir/$required_name" || -L "$artifacts_dir/$required_name" ]] ||
@@ -9138,7 +9159,7 @@ EOF
             fi
             ordinary_expected_sha["$required_name"]="$required_sha"
         done < <(jq -r '.artifacts[] | [(.name // .filename), .sha256] | @tsv' <<< "$ordinary_manifest")
-        ordinary_expected_sha["${manifest_file##*/}"]=$(_gh_asset_sha256 "$manifest_file") || return 4
+        ordinary_expected_sha["${manifest_file##*/}"]="$ordinary_manifest_sha"
         # Signing may be disabled or entirely reused. Publication still needs
         # the complete local inventory, not just byte-correct surviving rows.
         signing_validate_release_inventory "$manifest_file" "$artifacts_dir" \
@@ -9974,6 +9995,50 @@ EOF
         ' 3<<< "$ordinary_response_proof" 4<<< "$observed" >/dev/null 2>&1
     }
 
+    # A release's target_commitish can be a mutable branch name even when its
+    # tag is pinned. Resolve the actual Git ref, never infer its commit from
+    # release metadata. Only a new/owned draft may create a proven-absent tag.
+    _release_ordinary_source_matches() {
+        local allow_absent="$1" expected_sha="${2:-$release_tag_sha}"
+        local remote_sha encoded_tag matching_refs
+        # An explicit existence check cannot be satisfied by creating the tag,
+        # including when the manifest already identifies its intended commit.
+        $verify_tag && allow_absent=false
+        [[ -n "$expected_sha" ]] || return 0
+        [[ "$expected_sha" =~ ^[0-9a-f]{40}$ && ! "$expected_sha" =~ ^0{40}$ ]] || return 1
+        if remote_sha=$(gh_resolve_tag_sha "$repo" "$tag"); then
+            [[ "$remote_sha" == "$expected_sha" ]] || {
+                log_error "Remote tag $tag differs from the release's pinned source commit $expected_sha"
+                return 1
+            }
+            return 0
+        fi
+        if [[ "$allow_absent" != true ]]; then
+            log_error "Could not verify remote tag $tag against the release's pinned source commit"
+            return 1
+        fi
+        # A failed lookup is not proof of absence. This complete endpoint is
+        # not paginated and can include prefix siblings, but never the exact
+        # ref when authorizing creation of the tag at the frozen source SHA.
+        encoded_tag=$(jq -rn --arg tag "$tag" '$tag | @uri') || return 1
+        matching_refs=$(gh_api "repos/$repo/git/matching-refs/tags/$encoded_tag" --no-cache) || return 1
+        if ! jq -es --arg ref "refs/tags/$tag" --arg api "https://api.github.com/repos/$repo/git/" '
+            length == 1 and (.[0] | type == "array" and length <= 1000 and
+                (map(.ref) | length == (unique | length)) and
+                all(.[]; type == "object" and
+                    (.ref | type == "string" and startswith($ref) and . != $ref) and
+                    (.url == ($api + .ref) or
+                     .url == ($api + (.ref | split("/") | map(@uri) | join("/")))) and
+                    (.object | type == "object" and
+                        (.sha | type == "string" and test("^[0-9a-f]{40}$") and . != ("0" * 40)) and
+                        (.type == "commit" or .type == "tag" or .type == "tree" or .type == "blob") and
+                        .url == ($api + ({commit:"commits",tag:"tags",tree:"trees",blob:"blobs"}[.type]) + "/" + .sha))))
+        ' <<< "$matching_refs" >/dev/null; then
+            log_error "Remote tag absence could not be proved before staged publication"
+            return 1
+        fi
+    }
+
     _release_ordinary_restore_draft() {
         local observed attempt retry_delay="${DSR_RELEASE_STATE_RETRY_DELAY_SECONDS:-1}"
         [[ "$retry_delay" =~ ^[0-9]+$ ]] || retry_delay=1
@@ -10051,6 +10116,15 @@ EOF
             log_error "Staged release creation custody is ambiguous or its frozen inputs changed"
             return 1
         fi
+        # An older --no-manifest publication may retain a local tag pin even
+        # after that checkout disappears. Its original private intent remains
+        # authoritative; never downgrade a resumed owned release to unpinned.
+        if [[ -z "$release_tag_sha" ]]; then
+            release_tag_sha=$(jq -er '.record.request |
+                if has("target_commitish") then .target_commitish |
+                    select(type == "string" and test("^[0-9a-f]{40}$") and . != ("0" * 40))
+                else "" end' <<< "$ordinary_intent_proof") || return 1
+        fi
         if ! _release_ordinary_metadata_matches "$release_json" "$draft"; then
             log_error "Staged release metadata differs from its original creation response"
             return 1
@@ -10075,6 +10149,22 @@ EOF
         fi
         log_info "Recovered private staged-release creation custody: $ordinary_intent"
     }
+
+    if ! $release_contract_enabled; then
+        if $verify_tag && [[ -z "$release_tag_sha" ]]; then
+            if ! release_tag_sha=$(gh_resolve_tag_sha "$repo" "$tag") ||
+               [[ ! "$release_tag_sha" =~ ^[0-9a-f]{40}$ || "$release_tag_sha" =~ ^0{40}$ ]]; then
+                log_error "--verify-tag requires an observable source commit for $repo $tag"
+                return 7
+            fi
+        fi
+        # Refuse a conflicting/unknown source before even creating a draft.
+        # Resume first recovers original custody below, so a retained draft
+        # may still prove that its not-yet-created tag belongs to this intent.
+        if ! $resume && ! _release_ordinary_source_matches true; then
+            return 7
+        fi
+    fi
 
     log_info "Creating GitHub release for $tag..."
 
@@ -10310,6 +10400,12 @@ EOF
                 return 7
             fi
         fi
+        # A pre-existing release is not source authority merely because its
+        # tag name matches. Bind every ordinary upload, including unowned
+        # --resume, to the commit selected by the manifest/local tag/intent.
+        local ordinary_allow_absent_tag=false
+        if $ordinary_owned && $draft; then ordinary_allow_absent_tag=true; fi
+        _release_ordinary_source_matches "$ordinary_allow_absent_tag" || return 7
     fi
 
     if $release_contract_enabled; then
@@ -10610,6 +10706,10 @@ EOF
                         skipped_assets+=("$upload_name")
                         continue
                     fi
+                    if ! _release_ordinary_source_matches "$ordinary_allow_absent_tag"; then
+                        _release_record_failed "$upload_name" "Pinned source tag changed or could not be verified before upload"
+                        break 2
+                    fi
                     local upload_result
                     if upload_result=$(gh_upload_asset_named "$upload_url" "$file" "$upload_name" "$content_type"); then
                         log_ok "  Verified upload: $upload_name ($size_bytes bytes)"
@@ -10638,6 +10738,10 @@ EOF
         log_info "[$idx/$total_files] Uploading: $filename"
 
         # Upload
+        if ! _release_ordinary_source_matches "$ordinary_allow_absent_tag"; then
+            _release_record_failed "$filename" "Pinned source tag changed or could not be verified before upload"
+            break
+        fi
         local upload_result
         if upload_result=$(gh_upload_asset "$upload_url" "$file" "$content_type"); then
             log_ok "  Verified upload: $filename ($size_bytes bytes)"
@@ -10891,8 +10995,7 @@ EOF
         )
 
         _release_ordinary_observe_owned() {
-            local expected_draft="$1" observed records inventory='[]' page_json page count record expected_sha remote_sha
-            local matching_refs encoded_tag
+            local expected_draft="$1" observed records inventory='[]' page_json page count record expected_sha
             _release_ordinary_custody_unchanged || return 1
             records=$(printf '%s\n' "${uploaded_assets[@]}" | jq -sc 'sort_by(.name)') || return 1
             # Include every frozen metadata sidecar, even if it disappeared
@@ -10930,39 +11033,7 @@ EOF
             observed=$(gh_api "repos/$repo/releases/$release_id" --no-cache) || return 1
             _release_ordinary_metadata_matches "$observed" "$expected_draft" || return 1
             expected_sha=$(jq -r '.record.request.target_commitish // empty' <<< "$ordinary_intent_proof") || return 1
-            if [[ -n "$expected_sha" ]]; then
-                [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
-                if remote_sha=$(gh_resolve_tag_sha "$repo" "$tag"); then
-                    [[ "$remote_sha" == "$expected_sha" ]] || {
-                        log_error "Remote tag moved away from the staged release's pinned commit"
-                        return 1
-                    }
-                elif [[ "$expected_draft" == true ]]; then
-                    # GitHub creates a missing tag at target_commitish only
-                    # when publishing. A failed lookup is not absence: require
-                    # a successful, complete matching-refs collection. This
-                    # endpoint is not paginated and also returns prefix siblings.
-                    encoded_tag=$(jq -rn --arg tag "$tag" '$tag | @uri') || return 1
-                    matching_refs=$(gh_api "repos/$repo/git/matching-refs/tags/$encoded_tag" --no-cache) || return 1
-                    if ! jq -es --arg ref "refs/tags/$tag" --arg api "https://api.github.com/repos/$repo/git/" '
-                        length == 1 and (.[0] | type == "array" and length <= 1000 and
-                            (map(.ref) | length == (unique | length)) and
-                            all(.[]; type == "object" and
-                                (.ref | type == "string" and startswith($ref) and . != $ref) and
-                                (.url == ($api + .ref) or
-                                 .url == ($api + (.ref | split("/") | map(@uri) | join("/")))) and
-                                (.object | type == "object" and
-                                    (.sha | type == "string" and test("^[0-9a-f]{40}$") and . != ("0" * 40)) and
-                                    (.type == "commit" or .type == "tag" or .type == "tree" or .type == "blob") and
-                                    .url == ($api + ({commit:"commits",tag:"tags",tree:"trees",blob:"blobs"}[.type]) + "/" + .sha))))
-                    ' <<< "$matching_refs" >/dev/null; then
-                        log_error "Remote tag absence could not be proved before staged publication"
-                        return 1
-                    fi
-                else
-                    return 1
-                fi
-            fi
+            _release_ordinary_source_matches "$expected_draft" "$expected_sha" || return 1
             _release_ordinary_custody_unchanged || return 1
             printf '%s\n' "$observed"
         }
@@ -11028,6 +11099,10 @@ EOF
                    (($observed[0] | identity) == ($expected[0] | identity))
                ' 3<<< "$release_json" 4<<< "$observed_release" >/dev/null 2>&1; then
                 _release_record_failed "release-verification" "Release identity or visibility changed after upload"
+                verification_status="incomplete"
+            fi
+            if ! _release_ordinary_source_matches false; then
+                _release_record_failed "source-verification" "Remote tag changed or could not be verified after upload"
                 verification_status="incomplete"
             fi
         fi
