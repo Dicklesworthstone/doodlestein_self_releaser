@@ -1414,7 +1414,7 @@ Options:
   -CacheDir DIR  Persistent verified download cache
   -Offline       No network; requires -Version and complete cached evidence
   -Recover       Restore an interrupted installation offline; requires -Yes
-  -FromSource    Explicitly build a configured Go family with installed Git/Go
+  -FromSource    Explicitly build a configured Rust/Go family with installed tools
   -SourceRef REF Source pin: HEAD, refs/heads/BRANCH, refs/tags/TAG, or full SHA
   -SourceTimeout SECONDS  Per-source-command deadline; default 3600, maximum 86400
   -Yes           Authorize replacement of existing selected executables
@@ -1458,7 +1458,7 @@ explicit source fetches use the same token at that repository's HTTPS Git URL.
         if (-not $FromSource -and ($SourceRef -or $SourceTimeout -ne 3600)) { Stop-DsrInstall 'Source options require explicit -FromSource consent' }
         if ($FromSource) {
             if ($Version -or $Offline) { Stop-DsrInstall '-FromSource cannot be combined with -Version or -Offline; select -SourceRef instead' }
-            if (-not $policy.Contains('source')) { Stop-DsrInstall 'This installer has no supported Go source policy' 4 }
+            if (-not $policy.Contains('source')) { Stop-DsrInstall 'This installer has no supported Rust or Go source policy' 4 }
             if ($SourceTimeout -lt 1 -or $SourceTimeout -gt 86400) { Stop-DsrInstall '-SourceTimeout must be between 1 and 86400 seconds' }
             if (-not $SourceRef) { $SourceRef = 'HEAD' }
         }
@@ -1474,7 +1474,7 @@ explicit source fetches use the same token at that repository's HTTPS Git URL.
             $work = New-DsrPrivateDirectory ([IO.Path]::Combine($cacheRoot, ('.dsr-source-' + [Guid]::NewGuid().ToString('N'))))
             $retainSourceWork = $true
             Write-DsrInstallLog ('Building ' + $policy.repo + ' at ' + $SourceRef + '; this is a local source build, not a signed release')
-            $built = Build-DsrGoSourceFamily $policy $selection $platform $SourceRef $work $SourceTimeout
+            $built = Build-DsrSourceFamily $policy $selection $platform $SourceRef $work $SourceTimeout
             # Persist the verified local-build receipt before activation. It
             # describes compiled bytes, not a claim that installation finished.
             # A failed update retains both its receipt and private diagnostics.
@@ -1488,9 +1488,11 @@ explicit source fetches use the same token at that repository's HTTPS Git URL.
             if (-not $primary.EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase)) { $primary += '.exe' }
             $primaryRow = @($installed | Where-Object { $_.name.Equals($primary, [StringComparison]::OrdinalIgnoreCase) })[0]
             $result = @{ tool = $tool; repository = $policy.repo; status = 'success'; method = 'source'; signed_release = $false;
-                source = $built.receipt; platform = $platform; go_target = $built.receipt.go_target;
+                source = $built.receipt; platform = $platform;
                 source_receipt = @{ path = $receiptPath; sha256 = $receiptEvidence.sha256; size_bytes = $receiptEvidence.size_bytes };
                 path = $primaryRow.path; binaries = @($installed); signature_verified = $false; exit_code = 0 }
+            if ($built.receipt.language -ceq 'go') { $result.go_target = $built.receipt.go_target }
+            else { $result.cargo_target = $built.receipt.cargo_target }
             $retainSourceWork = $false
             Write-DsrInstallLog ('Installed ' + $tool + ' from source commit ' + $built.receipt.source_commit + ' (' + $installed.Count + ' executable(s))')
             if ($Json) { [Console]::Out.WriteLine(($result | ConvertTo-Json -Depth 12 -Compress)) }

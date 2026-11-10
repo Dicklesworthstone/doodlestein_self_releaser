@@ -3285,6 +3285,13 @@ _install_gen_windows_policy() (
             if ($source.subdir | source_path) and ($source.entry | type == "string" and (. == "" or source_path)) and
                 ((.source_package // "") == "")
             then $source else error("invalid Windows Go source selection") end
+        elif .language == "rust" then
+            {language:"rust", subdir:(.source_subdir // "."), package:(.source_package // "")} as $source |
+            if ($source.subdir | source_path) and
+                ($source.package | type == "string" and (. == "" or
+                    (test("^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$") and (contains("..") | not)))) and
+                ((.source_entry // "") == "")
+            then $source else error("invalid Windows Rust source selection") end
         else null end
     ' <<< "$document") || return 4
     targets=$(_config_get_tool_targets_json "$config_tool") || return 4

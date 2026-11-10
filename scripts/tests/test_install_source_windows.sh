@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Genuine generated source installation: real Git pins, Go-built Windows PE
+# Genuine generated source installation: real Git pins, Rust/Go Windows PE
 # families, retained receipts and the ordinary installation transaction. The
 # portable fixture adapts host detection and Git/HTTP transport only; it does
 # not claim live GitHub, native Windows ACL/NTFS or Windows process acceptance.
@@ -7,7 +7,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-for dependency in pwsh git go minisign python3 jq yq; do
+for dependency in pwsh git go cargo rustc minisign python3 jq yq; do
     if ! command -v "$dependency" >/dev/null 2>&1; then
         printf 'SKIP: Windows source installation tests require %s\n' "$dependency"
         exit 0
@@ -29,9 +29,10 @@ import sys
 import tempfile
 import zipfile
 
-arguments = argparse.ArgumentParser(description="Generated Windows Go source installation regression")
+arguments = argparse.ArgumentParser(description="Generated Windows Rust/Go source installation regression")
 arguments.add_argument("project", type=Path)
 arguments.add_argument("--baseline-project", type=Path, help="Frozen checkout before Windows source installation")
+arguments.add_argument("--rust-baseline-project", type=Path, help="Frozen checkout before Windows Rust source installation")
 options = arguments.parse_args()
 project = options.project.resolve()
 root = Path(tempfile.mkdtemp(prefix="dsr-windows-source-", dir=os.environ.get("TMPDIR"))).resolve()
@@ -187,14 +188,15 @@ if (Get-Command Invoke-DsrSourceGit -ErrorAction SilentlyContinue) {
         $result = & $script:RealSourceCommand @PSBoundParameters
         if ($script:Fixture.Contains('mutate_source') -and $script:Fixture.mutate_source -and
             -not $script:MutatedSource -and $Arguments[0] -ceq 'build') {
-            [IO.File]::AppendAllText([IO.Path]::Combine($Directory, 'apps', 'primary', 'main.go'), "`n// injected tracked-source mutation`n")
+            $member = if ($script:Fixture.Contains('mutate_source_member')) { $script:Fixture.mutate_source_member } else { 'apps/primary/main.go' }
+            [IO.File]::AppendAllText([IO.Path]::Combine($Directory, $member), "`n// injected tracked-source mutation`n")
             $script:MutatedSource = $true
         }
         if ($Capture) { return $result }
     }
     if ($fixture.Contains('mutate_output') -and $fixture.mutate_output) {
-        $script:RealBuildSource = ${function:Build-DsrGoSourceFamily}
-        function Build-DsrGoSourceFamily {
+        $script:RealBuildSource = ${function:Build-DsrSourceFamily}
+        function Build-DsrSourceFamily {
             param($Policy, $Selection, [string]$Platform, [string]$Reference, [string]$Work, [int]$Timeout)
             $built = & $script:RealBuildSource @PSBoundParameters
             $path = [IO.Path]::Combine($built.directory, $Selection.binaries[0])
@@ -389,14 +391,18 @@ for label, injection, message in (
     check(label + " keeps failed build diagnostics and never uses release fallback", "source_diagnostics" in result and
           Path(result["source_diagnostics"]).is_dir() and no_http(fixture))
 
-config("rust-release", language="rust")
+config("rust-release", language="rust", source_entry="")
 rust_generated, rust_runtime, rust_policy = generate("rust-release", "generate-rust")
-check("genuine Rust configuration still generates without an unsupported source policy", rust_generated.returncode == 0 and
-      rust_policy is not None and "source" not in rust_policy, rust_generated.stderr.decode(errors="replace"))
+check("genuine Rust configuration now embeds its explicit Cargo source policy", rust_generated.returncode == 0 and
+      rust_policy is not None and rust_policy.get("source") == {"language": "rust", "subdir": "project", "package": ""},
+      rust_generated.stderr.decode(errors="replace"))
 rust_help = command(["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", rust_runtime, "-Help", "-Json"], "rust-help")
 check("generated Rust installer still exposes normal Help", rust_help.returncode == 0 and json.loads(rust_help.stdout).get("status") == "help")
-rust_source, _, fixture = invoke("rust-source-refusal", selected_runtime=rust_runtime)
-check("unsupported source language refuses without changing ordinary release behavior", rust_source.returncode == 4 and
+config("unsupported-source", language="bun")
+unsupported_generated, unsupported_runtime, unsupported_policy = generate("unsupported-source", "generate-unsupported")
+unsupported_source, _, fixture = invoke("unsupported-source-refusal", selected_runtime=unsupported_runtime)
+check("unsupported source language refuses without changing ordinary release behavior", unsupported_generated.returncode == 0 and
+      "source" not in unsupported_policy and unsupported_source.returncode == 4 and
       not calls(fixture) and no_http(fixture) and not Path(fixture["parameters"]["Prefix"]).exists())
 release = root / "signed-release"
 release.mkdir()
@@ -427,6 +433,181 @@ config(source_subdir="../escape")
 bad_config, _, _ = generate("source-demo", "generate-invalid-source")
 check("invalid Go source configuration is rejected without replacing an already published installer", bad_config.returncode != 0 and
       runtime.read_bytes() == published)
+
+# A real Cargo workspace with a companion outside the default package is the
+# missing Windows caller flow. No compiler, metadata or PE output is mocked.
+rust_upstream = root / "rust-upstream"
+rust_upstream.mkdir()
+required(["git", "init", "--quiet", "--initial-branch=main", rust_upstream], "rust-git-init")
+required(["git", "-C", rust_upstream, "config", "user.email", "fixture@example.invalid"], "rust-git-email")
+required(["git", "-C", rust_upstream, "config", "user.name", "DSR Rust Source Fixture"], "rust-git-name")
+rust_files = {
+    "project/Cargo.toml": '[workspace]\nmembers = ["primary", "worker"]\ndefault-members = ["primary"]\nresolver = "2"\n',
+    "project/primary/Cargo.toml": '[package]\nname = "primary-provider"\nversion = "0.1.0"\nedition = "2021"\n\n[[bin]]\nname = "app"\npath = "src/main.rs"\n',
+    "project/primary/src/main.rs": 'fn main() { println!("rust-primary-v1"); }\n',
+    "project/worker/Cargo.toml": '[package]\nname = "worker-provider"\nversion = "0.1.0"\nedition = "2021"\n\n[[bin]]\nname = "helper"\npath = "src/main.rs"\n',
+    "project/worker/src/main.rs": 'fn main() { println!("rust-worker-v1"); }\n',
+}
+for name, value in rust_files.items():
+    path = rust_upstream / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(value)
+required(["cargo", "generate-lockfile", "--offline", "--manifest-path", rust_upstream / "project/Cargo.toml"], "rust-lockfile")
+required(["git", "-C", rust_upstream, "add", "."], "rust-add-v1")
+required(["git", "-C", rust_upstream, "commit", "--quiet", "-m", "Pinned Rust family"], "rust-commit-v1")
+rust_first_commit = required(["git", "-C", rust_upstream, "rev-parse", "HEAD"], "rust-pin-v1")
+required(["git", "-C", rust_upstream, "tag", "-a", "v1.2.3", "-m", "Annotated Rust source release"], "rust-tag")
+(rust_upstream / "project/primary/src/main.rs").write_text(rust_files["project/primary/src/main.rs"].replace("v1", "v2"))
+required(["git", "-C", rust_upstream, "add", "."], "rust-add-v2")
+required(["git", "-C", rust_upstream, "commit", "--quiet", "-m", "Advance Rust source HEAD"], "rust-commit-v2")
+rust_second_commit = required(["git", "-C", rust_upstream, "rev-parse", "HEAD"], "rust-pin-v2")
+rust_target = os.environ.get("DSR_TEST_WINDOWS_RUST_TARGET", "x86_64-pc-windows-gnu")
+
+
+def rust_config(tool="rust-source", **changes):
+    selection = dict(language="rust", source_subdir="project", source_entry="", source_package="",
+                     local_path=str(rust_upstream), targets=["windows/amd64"],
+                     target_triples={"windows/amd64": rust_target}, workspace_binaries_by_target={})
+    selection.update(changes)
+    return config(tool, **selection)
+
+
+rust_config()
+rust_generated, rust_source_runtime, rust_source_policy = generate("rust-source", "generate-rust-source")
+check("public generator embeds Windows Rust source selectors and the complete Cargo family", rust_generated.returncode == 0 and
+      rust_source_policy.get("source") == {"language": "rust", "subdir": "project", "package": ""} and
+      rust_source_policy["platforms"]["windows/amd64"]["binaries"] == ["app.exe", "helper.exe"],
+      rust_generated.stderr.decode(errors="replace"))
+if rust_generated.returncode:
+    raise SystemExit(1)
+
+
+def invoke_rust(label, *, selected_runtime=rust_source_runtime, extra=None, **changes):
+    selected_env = {"CARGO_NET_OFFLINE": "true"}
+    selected_env.update(extra or {})
+    return invoke(label, selected_runtime=selected_runtime, repository_url=rust_upstream.as_uri(), extra=selected_env, **changes)
+
+
+if options.rust_baseline_project:
+    old_generated, old_runtime, old_policy = generate("rust-source", "generate-rust-baseline",
+        checkout=options.rust_baseline_project.resolve(), destination=root / "rust-baseline-generated")
+    old, _, old_fixture = invoke_rust("rust-baseline-source", selected_runtime=old_runtime)
+    check("frozen baseline lacks the Rust source route while retaining identical release policy",
+          old_generated.returncode == 0 and old_policy == {key: value for key, value in rust_source_policy.items() if key != "source"} and
+          old.returncode == 4 and not calls(old_fixture) and not Path(old_fixture["parameters"]["Prefix"]).exists())
+
+rust_tagged, rust_result, rust_fixture = invoke_rust("rust-tagged", extra={
+    "CARGO_BUILD_TARGET": "invalid-ambient-target", "RUSTFLAGS": "--invalid-ambient-option",
+    "CARGO_ENCODED_RUSTFLAGS": "--invalid-encoded-option", "RUSTC_WRAPPER": "/nonexistent-rust-wrapper",
+    "CARGO_TARGET_DIR": str(root / "ambient-cargo-target"),
+})
+check("Rust source installs a real Windows PE family from the pinned annotated tag", rust_tagged.returncode == 0,
+      rust_tagged.stderr.decode(errors="replace"))
+if rust_tagged.returncode:
+    raise SystemExit(1)
+rust_prefix = Path(rust_fixture["parameters"]["Prefix"])
+check("Rust source pins the older tag despite HEAD advancement and reports its explicit Cargo target",
+      rust_result["source"]["source_commit"] == rust_first_commit and rust_first_commit != rust_second_commit and
+      rust_result["cargo_target"] == rust_target and rust_result["source"]["cargo_target"] == rust_target and
+      rust_result["source"]["release_target_triple"] == rust_target and "go_target" not in rust_result)
+check("Rust compiler metadata resolves the non-default workspace companion and binds every installed PE",
+      {row["name"]: row["package"] for row in rust_result["source"]["source_entries"]} ==
+      {"app.exe": "primary-provider", "helper.exe": "worker-provider"} and all(
+          machine(rust_prefix / row["name"]) == 0x8664 and digest(rust_prefix / row["name"]) == row["sha256"] and
+          (rust_prefix / row["name"]).stat().st_size == row["size_bytes"] for row in rust_result["binaries"]))
+rust_builds = [row["arguments"] for row in calls(rust_fixture) if row["arguments"][0] == "build"]
+check("one locked Cargo invocation builds all selected workspace executables into private output",
+      len(rust_builds) == 1 and "--locked" in rust_builds[0] and "--workspace" in rust_builds[0] and
+      "--target" in rust_builds[0] and rust_target in rust_builds[0] and rust_builds[0].count("--bin") == 2 and
+      not (root / "ambient-cargo-target").exists() and no_http(rust_fixture))
+rust_receipt = Path(rust_result["source_receipt"]["path"])
+check("Rust receipts retain real compiler identities and explicitly unsigned byte evidence",
+      rust_result["source"]["compiler"].startswith("rustc ") and rust_result["source"]["cargo_version"].startswith("cargo ") and
+      rust_result["signed_release"] is False and rust_result["signature_verified"] is False and
+      rust_result["source"]["signed_release"] is False and json.loads(rust_receipt.read_text()) == rust_result["source"] and
+      digest(rust_receipt) == rust_result["source_receipt"]["sha256"])
+previous_rust = {row["name"]: (rust_prefix / row["name"]).read_bytes() for row in rust_result["binaries"]}
+rust_head, rust_head_result, _ = invoke_rust("rust-head", parameters={"SourceRef": "HEAD", "Prefix": str(rust_prefix)})
+check("Rust HEAD upgrades the existing family through the shared transaction",
+      rust_head.returncode == 0 and rust_head_result["source"]["source_commit"] == rust_second_commit and
+      (rust_prefix / "app.exe").read_bytes() != previous_rust["app.exe"], rust_head.stderr.decode(errors="replace"))
+
+# Remove only the fixture's index entry, leaving its file intact. The fetched
+# commit genuinely has no Cargo.lock; later fixture commits can re-add it.
+required(["git", "-C", rust_upstream, "update-index", "--force-remove", "project/Cargo.lock"], "rust-untrack-lock")
+required(["git", "-C", rust_upstream, "commit", "--quiet", "-m", "Fixture missing committed lock"], "rust-commit-no-lock")
+no_lock_commit = required(["git", "-C", rust_upstream, "rev-parse", "HEAD"], "rust-pin-no-lock")
+missing_lock, _, fixture = invoke_rust("rust-missing-lock", parameters={"SourceRef": no_lock_commit})
+check("a missing committed Cargo.lock refuses before compilation or installation", missing_lock.returncode != 0 and
+      not any(row["arguments"][0] == "build" for row in calls(fixture)) and
+      not Path(fixture["parameters"]["Prefix"]).exists() and no_http(fixture))
+
+(rust_upstream / "project/worker/src/main.rs").write_text("fn main() { this is a genuine Rust compiler error }\n")
+required(["git", "-C", rust_upstream, "add", "."], "rust-add-compiler-error")
+required(["git", "-C", rust_upstream, "commit", "--quiet", "-m", "Fixture failing companion"], "rust-commit-compiler-error")
+bad_rust_commit = required(["git", "-C", rust_upstream, "rev-parse", "HEAD"], "rust-pin-compiler-error")
+prefix, before = seed_prefix("rust-compiler-failure")
+bad_rust, bad_rust_result, fixture = invoke_rust("rust-compiler-failure", parameters={"SourceRef": bad_rust_commit, "Prefix": str(prefix)})
+check("a real companion compiler failure preserves every previous executable and private diagnostics",
+      bad_rust.returncode == 6 and all((prefix / name).read_bytes() == data for name, data in before.items()) and
+      any(row["arguments"][0] == "build" for row in calls(fixture)) and
+      Path(bad_rust_result.get("source_diagnostics", "/nonexistent")).is_dir() and no_http(fixture),
+      bad_rust.stderr.decode(errors="replace"))
+
+(rust_upstream / "project/worker/src/main.rs").write_text(rust_files["project/worker/src/main.rs"])
+(rust_upstream / "project/Cargo.toml").write_text(rust_files["project/Cargo.toml"].replace('["primary", "worker"]', '["primary", "worker", "duplicate"]'))
+(rust_upstream / "project/duplicate/src").mkdir(parents=True)
+(rust_upstream / "project/duplicate/Cargo.toml").write_text(rust_files["project/primary/Cargo.toml"].replace("primary-provider", "duplicate-provider"))
+(rust_upstream / "project/duplicate/src/main.rs").write_text('fn main() { println!("wrong provider"); }\n')
+required(["cargo", "generate-lockfile", "--offline", "--manifest-path", rust_upstream / "project/Cargo.toml"], "rust-duplicate-lock")
+required(["git", "-C", rust_upstream, "add", "."], "rust-add-duplicate")
+required(["git", "-C", rust_upstream, "commit", "--quiet", "-m", "Fixture ambiguous Cargo provider"], "rust-commit-duplicate")
+duplicate_commit = required(["git", "-C", rust_upstream, "rev-parse", "HEAD"], "rust-pin-duplicate")
+duplicate_rust, _, fixture = invoke_rust("rust-duplicate", parameters={"SourceRef": duplicate_commit})
+check("ambiguous workspace binary providers refuse before the first compilation",
+      duplicate_rust.returncode == 6 and b"exactly one source provider" in duplicate_rust.stderr and
+      not any(row["arguments"][0] == "build" for row in calls(fixture)) and not Path(fixture["parameters"]["Prefix"]).exists())
+rust_config("rust-primary", source_package="primary-provider", workspace_binaries=["app"])
+primary_generated, primary_runtime, primary_policy = generate("rust-primary", "generate-rust-primary")
+primary_rust, primary_result, fixture = invoke_rust("rust-primary", selected_runtime=primary_runtime,
+    parameters={"SourceRef": duplicate_commit})
+check("source_package selects its actual package even when another workspace member has the same binary name",
+      primary_generated.returncode == 0 and primary_rust.returncode == 0 and primary_result["source"]["source_package"] == "primary-provider" and
+      [row["name"] for row in primary_result["binaries"]] == ["app.exe"], primary_rust.stderr.decode(errors="replace"))
+rust_config("rust-restricted", source_package="primary-provider")
+restricted_generated, restricted_runtime, _ = generate("rust-restricted", "generate-rust-restricted")
+restricted_rust, _, fixture = invoke_rust("rust-restricted", selected_runtime=restricted_runtime)
+check("source_package cannot borrow a requested companion from another package", restricted_generated.returncode == 0 and
+      restricted_rust.returncode == 6 and not any(row["arguments"][0] == "build" for row in calls(fixture)) and
+      not Path(fixture["parameters"]["Prefix"]).exists())
+
+(rust_upstream / "project/primary/Cargo.toml").write_text(rust_files["project/primary/Cargo.toml"].replace('version = "0.1.0"', 'version = "0.2.0"'))
+required(["git", "-C", rust_upstream, "add", "."], "rust-add-stale-lock")
+required(["git", "-C", rust_upstream, "commit", "--quiet", "-m", "Fixture stale Cargo lock"], "rust-commit-stale-lock")
+stale_commit = required(["git", "-C", rust_upstream, "rev-parse", "HEAD"], "rust-pin-stale-lock")
+stale_rust, stale_result, fixture = invoke_rust("rust-stale-lock", selected_runtime=primary_runtime,
+    parameters={"SourceRef": stale_commit})
+check("locked Cargo compilation refuses dependency-resolution changes without installing",
+      stale_rust.returncode == 6 and not Path(fixture["parameters"]["Prefix"]).exists() and
+      Path(stale_result.get("source_diagnostics", "/nonexistent")).is_dir(), stale_rust.stderr.decode(errors="replace"))
+for label, injection, expected in (
+    ("rust-source-drift", {"mutate_source": True, "mutate_source_member": "primary/src/main.rs"}, 7),
+    ("rust-output-drift", {"mutate_output": True}, 7),
+    ("rust-rollback", {"move_fault": True}, 7),
+):
+    prefix, before = seed_prefix(label)
+    refused, result, fixture = invoke_rust(label, parameters={"Prefix": str(prefix)}, **injection)
+    check(label + " refuses and preserves the complete previous family", refused.returncode == expected and
+          all((prefix / name).read_bytes() == data for name, data in before.items()) and
+          not (prefix / ".dsr-windows-install.pending.json").exists() and
+          Path(result.get("source_diagnostics", "/nonexistent")).is_dir() and no_http(fixture),
+          refused.stderr.decode(errors="replace"))
+
+published_rust = rust_source_runtime.read_bytes()
+rust_config(source_package="../invalid-package")
+invalid_package, _, _ = generate("rust-source", "generate-invalid-rust-package")
+check("invalid Rust package selection cannot replace a published installer", invalid_package.returncode != 0 and
+      rust_source_runtime.read_bytes() == published_rust)
 
 # Real parent/descendant process fixture, portable across supported Go hosts.
 # The child intentionally inherits stdout/stderr after its parent exits. It

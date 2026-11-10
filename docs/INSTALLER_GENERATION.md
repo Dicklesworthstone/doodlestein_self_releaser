@@ -308,10 +308,11 @@ The policy regression exercises the actual configuration and publication naming
 helpers, explicit signing-key scope, executable-family limits and refusal before
 any existing installer or publication history changes.
 
-### Explicit Go source installation on Windows
+### Explicit Rust and Go source installation on Windows
 
-A generated installer for `language: go` can build and install its complete
-configured executable family using **existing Git and Go installations**:
+A generated installer for `language: rust` or `language: go` can build and install
+its complete configured executable family using **existing Git and compiler
+installations**:
 
 ```powershell
 .\install.ps1 -FromSource -SourceRef refs/tags/v1.2.3 -Yes -Json
@@ -322,7 +323,7 @@ Replace the example commit with the intended full source SHA. `-SourceRef`
 accepts `HEAD` (the default), a full commit SHA, `refs/heads/BRANCH`, or
 `refs/tags/TAG`. Git resolves the selected ref once; the receipt records the exact
 fetched commit, and an explicit commit must match it. Source selection uses the
-configured repository and supports `source_subdir` plus the primary
+configured repository. Go supports `source_subdir` plus the primary
 `source_entry` override:
 
 ```yaml
@@ -341,13 +342,44 @@ case aliases and file/directory collisions before checkout. It resolves every
 selected package and requires `package main` before the first build. Per-target
 workspace lists also apply to source builds, including ARM64-specific families.
 
+For Rust, `source_subdir` selects the directory containing `Cargo.toml`:
+
+```yaml
+language: rust
+source_subdir: project
+workspace_binaries: [app, helper]
+target_triples:
+  windows/amd64: x86_64-pc-windows-msvc
+```
+
+The selected workspace must contain a committed `Cargo.lock`. Before compiling,
+the installer reads Cargo metadata and requires exactly one workspace package
+and binary target to provide each selected executable. A complete family may
+span packages outside the workspace's default members. Set `source_package` to
+restrict all selected binaries to one named package; a companion cannot silently
+come from another package. For a singleton without `source_package`, Cargo's
+current package or default workspace members apply. Rust uses binary names,
+so `source_entry` must be unset.
+
+One `cargo build --locked --release` invocation builds the selected family for
+the configured Windows `target_triple` into a new private target directory.
+The target must match the installation architecture; the caller must already
+have its Rust standard library and native linker installed. GNU and MSVC target
+selectors remain distinct. The command explicitly selects its target and target
+directory and clears inherited Rust flags and compiler wrappers. `RUSTUP_AUTO_INSTALL=0`
+prevents repository toolchain files from implicitly installing a compiler.
+Cargo's actual compiler-artifact messages must name exactly the selected
+providers and private executable paths before PE architecture checks and
+installation proceed. Missing or stale locks, ambiguous providers and partial
+compilation failures leave the existing installation unchanged.
+
 `-FromSource` explicitly authorizes execution of repository and dependency build
 code under the caller's account. It is separate from release acquisition:
 `-Version`, `-Offline` and `-Recover` cannot be combined with it, and a failed
 release checksum or signature never invokes it. `-Yes` only permits replacement;
-it does not select source execution. Rust and other language configurations
-continue to generate normal release installers but have no Windows source route.
-The installer does not provision compilers or native dependencies. It forces
+it does not select source execution. Other language configurations continue to
+generate normal release installers but have no Windows source route.
+The installer does not provision compilers or native dependencies. For Go it forces
 `GOTOOLCHAIN=local`, disables user Go configuration and workspace selection,
 clears inherited Go flags, and builds for the detected Windows architecture.
 Go uses readonly module resolution, or the selected project's vendor directory.
@@ -373,10 +405,13 @@ failure or changed source/output leaves the previous family intact.
 
 Source JSON reports `method: "source"`, `signed_release: false` and
 `signature_verified: false`. Its `source` receipt includes the requested ref,
-resolved commit, tracked-source digest, actual Go compiler identity, source
-selectors, per-executable entries and byte evidence. `go_target` records the
-actual `windows` OS and Go architecture; `release_target_triple` is labeled as the
-configured release selector rather than a claimed compiler ABI. A small private
+resolved commit, tracked-source digest, compiler identity, source selectors,
+per-executable entries and byte evidence. For Rust, `cargo_target` records the
+explicit compilation triple, `cargo_version` identifies Cargo, and each
+`source_entries` row retains its Cargo binary, package ID, manifest and source
+path. For Go, `go_target` records the actual `windows` OS and Go architecture;
+`release_target_triple` is labeled as the configured release selector rather
+than a claimed Go compiler ABI. A small private
 receipt remains at `CacheDir/source-receipts/TOOL/COMMIT-UNIQUE.json`, and
 `source_receipt` returns its path, hash and length. This receipt describes verified
 compiled bytes and is written before activation; its existence alone does not
@@ -384,7 +419,7 @@ claim a successful installation.
 
 Successful temporary source work is cleaned up. A failure retains its private
 source, compiler output and per-command stdout/stderr logs; JSON includes the
-`source_diagnostics` directory. `-SourceTimeout` bounds each Git/Go command and
+`source_diagnostics` directory. `-SourceTimeout` bounds each Git/compiler command and
 its output draining, defaults to 3600 seconds, and accepts 1–86400 seconds. On
 timeout, the installer attempts to terminate a live parent and its descendants. A child already
 orphaned by an exited parent cannot be reliably identified through that process
@@ -392,18 +427,23 @@ handle; the installer closes its pipes and returns a timeout without claiming
 that orphaned children were stopped.
 
 The focused regression uses the public generator, real Git commits and annotated
-tags, the installed Go compiler, genuine x64/ARM64 PE files, and real Minisign
-verification on the ordinary release route:
+tags, the installed Go and Rust compilers, genuine Windows PE files, and real
+Minisign verification on the ordinary release route. The portable Rust fixture
+requires the `x86_64-pc-windows-gnu` standard library and a working MinGW linker;
+`DSR_TEST_WINDOWS_RUST_TARGET` can select another installed x64 Windows target:
 
 ```bash
 bash scripts/tests/test_install_source_windows.sh
 # Optionally compare the same source caller flow against a frozen older checkout:
 bash scripts/tests/test_install_source_windows.sh --baseline-project /absolute/old-checkout
+# Compare Rust support with a checkout that already has Go source installation:
+bash scripts/tests/test_install_source_windows.sh --rust-baseline-project /absolute/pre-rust-checkout
 ```
 
 It covers complete-family builds and updates, source/output binding, later
-compiler failure, rollback, durable receipts, inherited output-pipe deadlines,
-and preserved Rust release generation. Portable runs adapt native host detection
+compiler failure, missing/stale Cargo locks, ambiguous Cargo providers, explicit
+package selection, rollback, durable receipts, inherited output-pipe deadlines,
+and preserved signed release generation. Portable runs adapt native host detection
 and the Git/HTTP remote boundaries to local repositories and signed fixtures.
 They do not establish live GitHub, native Windows ACL/NTFS, or Windows descendant
 process qualification.

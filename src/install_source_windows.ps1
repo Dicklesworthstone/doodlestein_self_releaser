@@ -1,5 +1,5 @@
 # Embedded by the ordinary Windows installer generator. Source installation is
-# explicit execution of repository/dependency code with existing Git and Go;
+# explicit execution of repository/dependency code with existing Git and Rust/Go;
 # its receipts never claim authentication as a published, signed release.
 
 function Test-DsrSourceRelativePath {
@@ -19,10 +19,21 @@ function Test-DsrSourceRelativePath {
 
 function Assert-DsrSourcePolicy {
     param($Source)
-    Assert-DsrFields $Source @('language', 'subdir', 'entry')
-    if ($Source.language -cne 'go' -or -not (Test-DsrSourceRelativePath $Source.subdir -Root) -or
-        $Source.entry -isnot [string] -or ($Source.entry -and -not (Test-DsrSourceRelativePath $Source.entry -Root))) {
-        Stop-DsrInstall 'Invalid embedded Windows Go source selection'
+    Assert-DsrFields $Source @('language', 'subdir') @('entry', 'package')
+    if (-not (Test-DsrSourceRelativePath $Source.subdir -Root)) { Stop-DsrInstall 'Invalid embedded Windows source directory' }
+    if ($Source.language -ceq 'go') {
+        Assert-DsrFields $Source @('language', 'subdir', 'entry')
+        if ($Source.entry -isnot [string] -or ($Source.entry -and -not (Test-DsrSourceRelativePath $Source.entry -Root))) {
+            Stop-DsrInstall 'Invalid embedded Windows Go source selection'
+        }
+    } elseif ($Source.language -ceq 'rust') {
+        Assert-DsrFields $Source @('language', 'subdir', 'package')
+        if ($Source.package -isnot [string] -or ($Source.package -and
+            ($Source.package.Length -gt 128 -or -not (Test-DsrName $Source.package)))) {
+            Stop-DsrInstall 'Invalid embedded Windows Rust source selection'
+        }
+    } else {
+        Stop-DsrInstall 'Unsupported embedded Windows source language'
     }
 }
 
@@ -143,7 +154,7 @@ function Get-DsrSourceFiles {
     foreach ($entry in $Listing.Split([char]0)) {
         if (-not $entry) { continue }
         if ($files.Count -ge 100000 -or $entry -cnotmatch '^(100644|100755) blob ([0-9a-f]{40}|[0-9a-f]{64})\t(.+)$') {
-            Stop-DsrInstall 'Go source installation requires regular tracked files; submodules and symbolic links are unsupported' 4
+            Stop-DsrInstall 'Source installation requires regular tracked files; submodules and symbolic links are unsupported' 4
         }
         $name = $Matches[3]
         if (-not (Test-DsrSourceRelativePath $name)) { Stop-DsrInstall 'Unsafe Windows source member' 4 }
@@ -177,7 +188,131 @@ function Get-DsrSourceTreeEvidence {
     return Get-DsrBytesHash ([Text.Encoding]::UTF8.GetBytes($rows.ToString()))
 }
 
-function Build-DsrGoSourceFamily {
+function Build-DsrRustSourceOutputs {
+    param($Policy, $Selection, [string]$Platform, [string]$Source, [string[]]$Files,
+        [string]$BuildRoot, [string]$Output, [string]$Logs, [string]$Work, [int]$Timeout,
+        [string]$Cargo, [string]$Rustc)
+    $target = $Selection.target_triple
+    $targetPattern = switch ($Platform) {
+        'windows/amd64' { '^x86_64-pc-windows-(msvc|gnu|gnullvm)$' }
+        'windows/arm64' { '^aarch64-pc-windows-(msvc|gnullvm)$' }
+        'windows/386' { '^i686-pc-windows-(msvc|gnu|gnullvm)$' }
+        default { Stop-DsrInstall 'Unsupported Windows Rust source platform' 4 }
+    }
+    if ($target -cnotmatch $targetPattern) { Stop-DsrInstall 'Configured Cargo target does not match the Windows installation platform' 4 }
+    $manifest = Get-DsrPlainPath ([IO.Path]::Combine($BuildRoot, 'Cargo.toml')) -File
+    $targetDirectory = New-DsrPrivateDirectory ([IO.Path]::Combine($Work, 'cargo-target'))
+    $environment = Get-DsrSourceGitEnvironment $Policy.repo
+    # Respect the installed toolchain and dependency caches, but never install
+    # a missing rustup-selected compiler or reuse the caller's build outputs.
+    $environment.RUSTUP_AUTO_INSTALL = '0'
+    $environment.RUSTC = $Rustc
+    $environment.RUSTC_WRAPPER = ''
+    $environment.RUSTC_WORKSPACE_WRAPPER = ''
+    $environment.RUSTFLAGS = ''
+    $environment.CARGO_ENCODED_RUSTFLAGS = ''
+    $environment.CARGO_BUILD_RUSTFLAGS = $null
+    $environment.CARGO_BUILD_TARGET = $target
+    $environment.CARGO_TARGET_DIR = $targetDirectory
+    $environment.CARGO_INCREMENTAL = '0'
+    $cargoBase = @{ Executable = $Cargo; Directory = $BuildRoot; Timeout = $Timeout; Environment = $environment }
+    $compiler = (Invoke-DsrSourceCommand $Rustc @('-vV') $BuildRoot ([IO.Path]::Combine($Logs, 'compiler')) $Timeout $environment -Capture).Trim()
+    $cargoVersion = (Invoke-DsrSourceCommand @cargoBase -Arguments @('--version') -Log ([IO.Path]::Combine($Logs, 'cargo-version')) -Capture).Trim()
+    if ($compiler -cnotmatch '^rustc [0-9]' -or $compiler.Length -gt 4096 -or
+        $cargoVersion -cnotmatch '^cargo [0-9]' -or $cargoVersion.Length -gt 4096) {
+        Stop-DsrInstall 'Invalid installed Rust compiler identity' 6
+    }
+    $metadataArguments = @('metadata', '--format-version=1', '--no-deps', '--locked', '--manifest-path', $manifest)
+    $metadataText = Invoke-DsrSourceCommand @cargoBase -Arguments $metadataArguments -Log ([IO.Path]::Combine($Logs, 'cargo-metadata')) -Capture
+    $metadata = ConvertFrom-DsrJson $metadataText
+    if ($metadata -isnot [Collections.IDictionary] -or -not $metadata.Contains('version') -or $metadata.version -ne 1 -or
+        -not $metadata.Contains('packages') -or $metadata.packages -isnot [array] -or
+        -not $metadata.Contains('workspace_members') -or $metadata.workspace_members -isnot [array] -or
+        -not $metadata.Contains('workspace_root') -or $metadata.workspace_root -isnot [string]) {
+        Stop-DsrInstall 'Cargo returned an incomplete source workspace' 6
+    }
+    $workspace = Get-DsrPlainPath $metadata.workspace_root -Directory
+    $workspaceRelative = [IO.Path]::GetRelativePath($Source, $workspace).Replace('\', '/')
+    if (-not (Test-DsrSourceRelativePath $workspaceRelative -Root)) { Stop-DsrInstall 'Cargo workspace escaped the pinned source checkout' 6 }
+    $lock = [IO.Path]::Combine($workspace, 'Cargo.lock')
+    $lockRelative = [IO.Path]::GetRelativePath($Source, $lock).Replace('\', '/')
+    $manifestRelative = [IO.Path]::GetRelativePath($Source, $manifest).Replace('\', '/')
+    if ($lockRelative -cnotin $Files -or $manifestRelative -cnotin $Files) {
+        Stop-DsrInstall 'Rust source installation requires a committed Cargo.toml and workspace Cargo.lock' 4
+    }
+    $null = Get-DsrPlainPath $lock -File
+    $pathComparison = if ([OperatingSystem]::IsWindows()) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    $packages = @($metadata.packages | Where-Object { $_.id -cin $metadata.workspace_members })
+    if ($Policy.source.package) {
+        $packages = @($packages | Where-Object { $_.name -ceq $Policy.source.package })
+        if ($packages.Count -ne 1) { Stop-DsrInstall 'Requested Cargo source package is not one workspace member' 6 }
+    } elseif ($Selection.binaries.Count -eq 1) {
+        # Match cargo build's current-package/default-members behavior. A
+        # complete multi-package family deliberately selects the workspace.
+        $current = @($packages | Where-Object { [IO.Path]::GetFullPath($_.manifest_path).Equals($manifest, $pathComparison) })
+        if ($current.Count -eq 1) { $packages = $current }
+        elseif ($metadata.Contains('workspace_default_members')) {
+            $packages = @($packages | Where-Object { $_.id -cin $metadata.workspace_default_members })
+        }
+    }
+    $providers = @()
+    foreach ($name in $Selection.binaries) {
+        $bin = $name.Substring(0, $name.Length - 4)
+        $providerMatches = @()
+        foreach ($package in $packages) {
+            foreach ($candidate in $package.targets) {
+                if ($candidate.name -ceq $bin -and 'bin' -cin $candidate.kind) {
+                    $packageManifest = Get-DsrPlainPath $package.manifest_path -File
+                    $entry = Get-DsrPlainPath $candidate.src_path -File
+                    $packageRelative = [IO.Path]::GetRelativePath($Source, $packageManifest).Replace('\', '/')
+                    $entryRelative = [IO.Path]::GetRelativePath($Source, $entry).Replace('\', '/')
+                    if ($packageRelative -cnotin $Files -or $entryRelative -cnotin $Files) {
+                        Stop-DsrInstall 'Cargo executable provider is outside the committed source inventory' 6
+                    }
+                    $providerMatches += @{ name = $name; cargo_bin = $bin; package = $package.name;
+                        package_id = $package.id; manifest = $packageRelative; entry = $entryRelative }
+                }
+            }
+        }
+        if ($providerMatches.Count -ne 1) { Stop-DsrInstall ('Cargo must identify exactly one source provider for ' + $name) 6 }
+        $providers += $providerMatches[0]
+    }
+    $buildArguments = @('build', '--locked', '--release', '--message-format=json-render-diagnostics',
+        '--manifest-path', $manifest, '--target', $target, '--target-dir', $targetDirectory)
+    if ($Policy.source.package) { $buildArguments += @('--package', $Policy.source.package) }
+    elseif ($Selection.binaries.Count -gt 1) { $buildArguments += '--workspace' }
+    foreach ($provider in $providers) { $buildArguments += @('--bin', $provider.cargo_bin) }
+    $buildText = Invoke-DsrSourceCommand @cargoBase -Arguments $buildArguments -Log ([IO.Path]::Combine($Logs, 'cargo-build')) -Capture
+    $artifacts = @()
+    foreach ($line in $buildText.Split("`n")) {
+        if (-not $line.StartsWith('{', [StringComparison]::Ordinal)) { continue }
+        $record = ConvertFrom-DsrJson $line
+        if ($record -is [Collections.IDictionary] -and $record.Contains('reason') -and $record.reason -ceq 'compiler-artifact') {
+            $artifacts += $record
+        }
+    }
+    foreach ($provider in $providers) {
+        $selected = @($artifacts | Where-Object { $_.target.name -ceq $provider.cargo_bin -and 'bin' -cin $_.target.kind })
+        if ($selected.Count -ne 1 -or $selected[0].package_id -cne $provider.package_id -or
+            $selected[0].executable -isnot [string] -or -not $selected[0].executable) {
+            Stop-DsrInstall ('Cargo did not produce one executable from its selected provider: ' + $provider.name) 6
+        }
+        $expected = [IO.Path]::Combine($targetDirectory, $target, 'release', $provider.name)
+        $produced = Get-DsrPlainPath $selected[0].executable -File
+        if (-not $produced.Equals($expected, $pathComparison)) { Stop-DsrInstall 'Cargo output escaped its private target selection' 6 }
+        Assert-DsrPeMachine $produced $Platform
+        $evidence = Get-DsrFileEvidence $produced
+        $destination = [IO.Path]::Combine($Output, $provider.name)
+        Copy-DsrNewFile $produced $destination
+        if (-not (Test-DsrSameEvidence $evidence (Get-DsrFileEvidence $destination))) {
+            Stop-DsrInstall 'Cargo output changed while staging the executable family' 7
+        }
+    }
+    return @{ compiler = $compiler; cargo_version = $cargoVersion; cargo_target = $target;
+        source_package = $Policy.source.package; source_entries = @($providers) }
+}
+
+function Build-DsrSourceFamily {
     param($Policy, $Selection, [string]$Platform, [string]$Reference, [string]$Work, [int]$Timeout)
     Assert-DsrSourcePolicy $Policy.source
     if ($Reference -cnotmatch '^(HEAD|[0-9a-fA-F]{40}|[0-9a-fA-F]{64}|refs/(heads|tags)/[A-Za-z0-9][A-Za-z0-9._/+\-]*)$' -or
@@ -185,8 +320,12 @@ function Build-DsrGoSourceFamily {
         Stop-DsrInstall 'Use HEAD, a full commit SHA, refs/heads/BRANCH or refs/tags/TAG for -SourceRef'
     }
     $git = Get-Command git -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    $go = Get-Command go -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -eq $git -or $null -eq $go) { Stop-DsrInstall 'Source installation requires existing Git and Go executables; no toolchain is installed automatically' 3 }
+    $compilerName = if ($Policy.source.language -ceq 'rust') { 'cargo' } else { 'go' }
+    $compilerTool = Get-Command $compilerName -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    $rustc = if ($Policy.source.language -ceq 'rust') { Get-Command rustc -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1 } else { $null }
+    if ($null -eq $git -or $null -eq $compilerTool -or ($Policy.source.language -ceq 'rust' -and $null -eq $rustc)) {
+        Stop-DsrInstall ('Source installation requires existing Git and ' + $compilerName + ' tools; no toolchain is installed automatically') 3
+    }
     $logs = New-DsrPrivateDirectory ([IO.Path]::Combine($Work, 'logs'))
     $source = New-DsrPrivateDirectory ([IO.Path]::Combine($Work, 'source'))
     $output = New-DsrPrivateDirectory ([IO.Path]::Combine($Work, 'output'))
@@ -210,46 +349,56 @@ function Build-DsrGoSourceFamily {
     $sourceEvidence = Get-DsrSourceTreeEvidence $source $files
     $buildRoot = if ($Policy.source.subdir -ceq '.') { $source } else { [IO.Path]::Combine($source, $Policy.source.subdir) }
     $buildRoot = Get-DsrPlainPath $buildRoot -Directory
-    $null = Get-DsrPlainPath ([IO.Path]::Combine($buildRoot, 'go.mod')) -File
     $primary = $Policy.binary_name
     if (-not $primary.EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase)) { $primary += '.exe' }
-    $entries = @()
-    foreach ($name in $Selection.binaries) {
-        $entry = ''
-        $isPrimary = $name.Equals($primary, [StringComparison]::OrdinalIgnoreCase)
-        if ($isPrimary) { $entry = $Policy.source.entry }
-        if (-not $entry) {
-            $entry = 'cmd/' + $name.Substring(0, $name.Length - 4)
-            $candidate = Get-DsrPlainPath ([IO.Path]::Combine($buildRoot, $entry))
-            if ($isPrimary -and -not [IO.Directory]::Exists($candidate) -and -not [IO.File]::Exists($candidate)) { $entry = '.' }
+    if ($Policy.source.language -ceq 'go') {
+        $null = Get-DsrPlainPath ([IO.Path]::Combine($buildRoot, 'go.mod')) -File
+        $entries = @()
+        foreach ($name in $Selection.binaries) {
+            $entry = ''
+            $isPrimary = $name.Equals($primary, [StringComparison]::OrdinalIgnoreCase)
+            if ($isPrimary) { $entry = $Policy.source.entry }
+            if (-not $entry) {
+                $entry = 'cmd/' + $name.Substring(0, $name.Length - 4)
+                $candidate = Get-DsrPlainPath ([IO.Path]::Combine($buildRoot, $entry))
+                if ($isPrimary -and -not [IO.Directory]::Exists($candidate) -and -not [IO.File]::Exists($candidate)) { $entry = '.' }
+            }
+            if (-not (Test-DsrSourceRelativePath $entry -Root)) { Stop-DsrInstall 'Unsafe Go source entry selection' }
+            $entryPath = if ($entry -ceq '.') { $buildRoot } else { [IO.Path]::Combine($buildRoot, $entry) }
+            $null = Get-DsrPlainPath $entryPath -Directory
+            $entries += $entry
         }
-        if (-not (Test-DsrSourceRelativePath $entry -Root)) { Stop-DsrInstall 'Unsafe Go source entry selection' }
-        $entryPath = if ($entry -ceq '.') { $buildRoot } else { [IO.Path]::Combine($buildRoot, $entry) }
-        $null = Get-DsrPlainPath $entryPath -Directory
-        $entries += $entry
-    }
-    $environment = Get-DsrSourceGitEnvironment $Policy.repo
-    $environment.GOENV = 'off'
-    $environment.GOWORK = 'off'
-    $environment.GOTOOLCHAIN = 'local'
-    $environment.GOFLAGS = ''
-    $environment.GOOS = 'windows'
-    $environment.GOARCH = $Platform.Substring('windows/'.Length)
-    $goBase = @{ Executable = $go.Source; Directory = $buildRoot; Timeout = $Timeout; Environment = $environment }
-    $compiler = (Invoke-DsrSourceCommand $go.Source @('version') $buildRoot ([IO.Path]::Combine($logs, 'compiler')) $Timeout $environment -Capture).Trim()
-    if (-not $compiler -or $compiler.Length -gt 4096) { Stop-DsrInstall 'Invalid installed Go compiler identity' 6 }
-    $moduleMode = 'readonly'
-    $vendor = Get-DsrPlainPath ([IO.Path]::Combine($buildRoot, 'vendor'))
-    if ([IO.Directory]::Exists($vendor)) { $moduleMode = 'vendor' }
-    for ($index = 0; $index -lt $entries.Count; $index++) {
-        $goArguments = @('list', ('-mod=' + $moduleMode), '-f', '{{.Name}}', ('./' + $entries[$index]))
-        $provider = (Invoke-DsrSourceCommand @goBase -Arguments $goArguments -Log ([IO.Path]::Combine($logs, ('package-' + $index))) -Capture).Trim()
-        if ($provider -cne 'main') { Stop-DsrInstall ('Requested Go package is not one executable: ' + $Selection.binaries[$index]) 6 }
-    }
-    for ($index = 0; $index -lt $entries.Count; $index++) {
-        $target = [IO.Path]::Combine($output, $Selection.binaries[$index])
-        $goArguments = @('build', ('-mod=' + $moduleMode), '-trimpath', '-o', $target, ('./' + $entries[$index]))
-        $null = Invoke-DsrSourceCommand @goBase -Arguments $goArguments -Log ([IO.Path]::Combine($logs, ('build-' + $index)))
+        $environment = Get-DsrSourceGitEnvironment $Policy.repo
+        $environment.GOENV = 'off'
+        $environment.GOWORK = 'off'
+        $environment.GOTOOLCHAIN = 'local'
+        $environment.GOFLAGS = ''
+        $environment.GOOS = 'windows'
+        $environment.GOARCH = $Platform.Substring('windows/'.Length)
+        $goBase = @{ Executable = $compilerTool.Source; Directory = $buildRoot; Timeout = $Timeout; Environment = $environment }
+        $compiler = (Invoke-DsrSourceCommand $compilerTool.Source @('version') $buildRoot ([IO.Path]::Combine($logs, 'compiler')) $Timeout $environment -Capture).Trim()
+        if (-not $compiler -or $compiler.Length -gt 4096) { Stop-DsrInstall 'Invalid installed Go compiler identity' 6 }
+        $moduleMode = 'readonly'
+        $vendor = Get-DsrPlainPath ([IO.Path]::Combine($buildRoot, 'vendor'))
+        if ([IO.Directory]::Exists($vendor)) { $moduleMode = 'vendor' }
+        for ($index = 0; $index -lt $entries.Count; $index++) {
+            $goArguments = @('list', ('-mod=' + $moduleMode), '-f', '{{.Name}}', ('./' + $entries[$index]))
+            $provider = (Invoke-DsrSourceCommand @goBase -Arguments $goArguments -Log ([IO.Path]::Combine($logs, ('package-' + $index))) -Capture).Trim()
+            if ($provider -cne 'main') { Stop-DsrInstall ('Requested Go package is not one executable: ' + $Selection.binaries[$index]) 6 }
+        }
+        for ($index = 0; $index -lt $entries.Count; $index++) {
+            $target = [IO.Path]::Combine($output, $Selection.binaries[$index])
+            $goArguments = @('build', ('-mod=' + $moduleMode), '-trimpath', '-o', $target, ('./' + $entries[$index]))
+            $null = Invoke-DsrSourceCommand @goBase -Arguments $goArguments -Log ([IO.Path]::Combine($logs, ('build-' + $index)))
+        }
+        $sourceEntries = @()
+        for ($index = 0; $index -lt $Selection.binaries.Count; $index++) {
+            $sourceEntries += @{ name = $Selection.binaries[$index]; entry = $entries[$index] }
+        }
+        $compilerDetails = @{ compiler = $compiler; go_target = @{ os = 'windows'; arch = $environment.GOARCH };
+            source_entry = $Policy.source.entry; source_entries = @($sourceEntries) }
+    } else {
+        $compilerDetails = Build-DsrRustSourceOutputs $Policy $Selection $Platform $source $files $buildRoot $output $logs $Work $Timeout $compilerTool.Source $rustc.Source
     }
     $finalCommit = (Invoke-DsrSourceGit @gitBase -Arguments @('rev-parse', '--verify', 'HEAD^{commit}') -Log ([IO.Path]::Combine($logs, 'git-final-pin')) -Capture).Trim()
     if ($finalCommit -cne $commit -or (Get-DsrSourceTreeEvidence $source $files) -cne $sourceEvidence) {
@@ -257,10 +406,6 @@ function Build-DsrGoSourceFamily {
     }
     $rows = @()
     $expected = @{}
-    $sourceEntries = @()
-    for ($index = 0; $index -lt $Selection.binaries.Count; $index++) {
-        $sourceEntries += @{ name = $Selection.binaries[$index]; entry = $entries[$index] }
-    }
     foreach ($name in $Selection.binaries) {
         $path = Get-DsrPlainPath ([IO.Path]::Combine($output, $name)) -File
         Assert-DsrPeMachine $path $Platform
@@ -270,11 +415,11 @@ function Build-DsrGoSourceFamily {
     }
     $primaryRow = @($rows | Where-Object { $_.name.Equals($primary, [StringComparison]::OrdinalIgnoreCase) })[0]
     $receipt = @{ schema_version = 1; method = 'source'; repository = $Policy.repo; requested_ref = $Reference;
-        source_commit = $commit; source_tree_sha256 = $sourceEvidence; language = 'go'; compiler = $compiler;
-        platform = $Platform; go_target = @{ os = 'windows'; arch = $environment.GOARCH };
+        source_commit = $commit; source_tree_sha256 = $sourceEvidence; language = $Policy.source.language;
+        platform = $Platform;
         release_target_triple = $Selection.target_triple; source_subdir = $Policy.source.subdir;
-        source_entry = $Policy.source.entry; source_entries = @($sourceEntries);
         binaries = @($rows); sha256 = $primaryRow.sha256; size_bytes = $primaryRow.size_bytes; signed_release = $false }
+    foreach ($key in $compilerDetails.Keys) { $receipt[$key] = $compilerDetails[$key] }
     Write-DsrNewTextFile ([IO.Path]::Combine($Work, 'source-receipt.json')) ($receipt | ConvertTo-Json -Depth 8 -Compress)
     return @{ directory = $output; receipt = $receipt; expected = $expected }
 }
