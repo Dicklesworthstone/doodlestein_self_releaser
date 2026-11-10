@@ -1225,8 +1225,18 @@ GitHub release ID and a validated local manifest. It uploads through the shared
 verified upload helper and never clobbers existing assets. It verifies every
 required name, size, hash, and uploaded asset ID against one complete, fresh
 paginated inventory, including on reruns where no names appear missing.
-Empty or invalid local manifests cannot authorize repair. Release identity and local
-manifest or payload changes prevent success. A nominal upload acknowledgement
+It freezes the selected manifest before remote discovery. A declared
+`source.git_sha` must be a nonzero 40-character lowercase commit SHA; malformed
+source declarations fail locally with exit 4. When the manifest declares a
+source commit, repair resolves the actual Git tag before each upload and again
+after the final inventory and byte checks. Annotated tags are peeled to their
+commit, independently of the release's `target_commitish` branch name. A missing,
+unavailable, or changed tag blocks uploads or leaves the repair incomplete,
+including when every expected asset already exists. Repair cannot create a
+missing tag, even for a draft. Legacy manifests that omit `source` or
+`source.git_sha` retain their existing unpinned behavior.
+Empty or invalid local manifests cannot authorize repair. Release identity,
+source tag, and local manifest or payload changes prevent success. A nominal upload acknowledgement
 cannot remove an asset from the missing list. Ordinary and strict repair hold
 artifact custody through the complete local and remote rechecks, including
 strict checksum-sidecar materialization. Repair failures appear in

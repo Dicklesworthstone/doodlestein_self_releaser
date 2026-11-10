@@ -2611,15 +2611,36 @@ seed_ordinary_verify_repair() {
          ]}' > "$directory/test-tool-v1.0.0-manifest.json"
     ORDINARY_REPAIR_ROOT="$TEST_TMPDIR/ordinary-repair"
     ORDINARY_REPAIR_MODE="$1"
-    export ORDINARY_REPAIR_ROOT ORDINARY_REPAIR_MODE
+    ORDINARY_REPAIR_MANIFEST="$directory/test-tool-v1.0.0-manifest.json"
+    export ORDINARY_REPAIR_ROOT ORDINARY_REPAIR_MODE ORDINARY_REPAIR_MANIFEST
     printf 'v1.0.0\n' > "$ORDINARY_REPAIR_ROOT/tag"
     : > "$ORDINARY_REPAIR_ROOT/uploads"
+    : > "$ORDINARY_REPAIR_ROOT/api-calls"
+    printf '%040d\n' 2 > "$ORDINARY_REPAIR_ROOT/source-sha"
     jq '[.artifacts[0] | {id:101,name,state:"uploaded",size:.size_bytes,digest:("sha256:" + .sha256)}]' \
         "$directory/test-tool-v1.0.0-manifest.json" > "$ORDINARY_REPAIR_ROOT/assets.json" || return 1
     printf 'testuser/test-tool\n' > "$ORDINARY_REPAIR_ROOT/upload-repo"
     printf '0\n' > "$ORDINARY_REPAIR_ROOT/inventory-gets"
     : > "$ORDINARY_REPAIR_ROOT/inventory-pages"
+    if [[ "$ORDINARY_REPAIR_MODE" == source_* ]]; then
+        jq --arg sha "$(cat "$ORDINARY_REPAIR_ROOT/source-sha")" \
+            '.source = {git_sha:$sha,git_ref:"main",dependencies:[]}' \
+            "$ORDINARY_REPAIR_MANIFEST" > "$ORDINARY_REPAIR_ROOT/source-manifest.json" || return 1
+        cp "$ORDINARY_REPAIR_ROOT/source-manifest.json" "$ORDINARY_REPAIR_MANIFEST" || return 1
+        yq -i '.local_path = ""' "$DSR_CONFIG_DIR/repos.d/test-tool.yaml" || return 1
+    fi
     case "$ORDINARY_REPAIR_MODE" in
+        source_wrong|source_complete_wrong)
+            printf '%040d\n' 3 > "$ORDINARY_REPAIR_ROOT/source-sha"
+            ;;
+        source_between_uploads)
+            printf '[]\n' > "$ORDINARY_REPAIR_ROOT/assets.json"
+            ;;
+        source_legacy_metadata)
+            jq 'del(.source.git_sha)' "$ORDINARY_REPAIR_MANIFEST" \
+                > "$ORDINARY_REPAIR_ROOT/source-manifest.json" || return 1
+            cp "$ORDINARY_REPAIR_ROOT/source-manifest.json" "$ORDINARY_REPAIR_MANIFEST" || return 1
+            ;;
         mixed_repo_case)
             yq -i '.repo = "TestUser/Test-Tool"' \
                 "$DSR_CONFIG_DIR/repos.d/test-tool.yaml" || return 1
@@ -2643,7 +2664,7 @@ seed_ordinary_verify_repair() {
             mv "$ORDINARY_REPAIR_ROOT/assets.seeded" "$ORDINARY_REPAIR_ROOT/assets.json" || return 1
             ;;
     esac
-    if [[ "$1" == already_present || "$1" == already_present_wrong_bytes ]]; then
+    if [[ "$1" == already_present || "$1" == already_present_wrong_bytes || "$1" == source_complete_wrong ]]; then
         jq --arg mode "$1" '
             [.artifacts | to_entries[] |
              {id:(101 + .key),name:.value.name,state:"uploaded",size:.value.size_bytes,
@@ -2657,8 +2678,9 @@ create_ordinary_verify_repair_mock() {
     _ordinary_repair_release_json() {
         jq -nc --arg tag "$(cat "$ORDINARY_REPAIR_ROOT/tag")" \
             --arg upload_repo "$(cat "$ORDINARY_REPAIR_ROOT/upload-repo")" \
+            --argjson draft "$([[ "$ORDINARY_REPAIR_MODE" == source_absent_draft ]] && echo true || echo false)" \
             --slurpfile assets "$ORDINARY_REPAIR_ROOT/assets.json" '
-            {id:12345,tag_name:$tag,draft:false,prerelease:false,target_commitish:"main",
+            {id:12345,tag_name:$tag,draft:$draft,prerelease:false,target_commitish:"main",
              html_url:"https://github.com/testuser/test-tool/releases/tag/v1.0.0",
              upload_url:("https://uploads.github.com/repos/" + $upload_repo + "/releases/12345/assets{?name,label}"),
              assets:$assets[0]}'
@@ -2671,11 +2693,37 @@ create_ordinary_verify_repair_mock() {
                 [[ "${2:-}" == token ]] && { printf 'release-fixture-token\n'; return 0; }
                 ;;
             api)
+                printf '%s\n' "${2:-}" >> "$ORDINARY_REPAIR_ROOT/api-calls"
                 if [[ -n "${VERIFY_FIX_CUSTODY_ROOT:-}" ]]; then
                     _verify_fix_custody_boundary "${2:-}" || return $?
                 fi
                 case "${2:-}" in
+                    repos/testuser/test-tool/git/ref/tags/v1.0.0)
+                        case "$ORDINARY_REPAIR_MODE" in
+                            source_unavailable|source_absent_draft) return 1 ;;
+                            source_annotated)
+                                jq -nc '{ref:"refs/tags/v1.0.0",object:{type:"tag",sha:("a" * 40)}}'
+                                ;;
+                            *)
+                                jq -nc --arg sha "$(cat "$ORDINARY_REPAIR_ROOT/source-sha")" \
+                                    '{ref:"refs/tags/v1.0.0",object:{type:"commit",sha:$sha}}'
+                                ;;
+                        esac
+                        return $?
+                        ;;
+                    repos/testuser/test-tool/git/tags/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)
+                        jq -nc --arg sha "$(cat "$ORDINARY_REPAIR_ROOT/source-sha")" \
+                            '{object:{type:"commit",sha:$sha}}'
+                        return $?
+                        ;;
                     repos/testuser/test-tool/releases/tags/v1.0.0|repos/TestUser/Test-Tool/releases/tags/v1.0.0)
+                        if [[ "$ORDINARY_REPAIR_MODE" == source_manifest_after_discovery &&
+                              ! -e "$ORDINARY_REPAIR_ROOT/source-manifest-changed" ]]; then
+                            jq '.source.git_sha = ("3" * 40)' "$ORDINARY_REPAIR_MANIFEST" \
+                                > "$ORDINARY_REPAIR_ROOT/changed-manifest.json" || return 9
+                            cp "$ORDINARY_REPAIR_ROOT/changed-manifest.json" "$ORDINARY_REPAIR_MANIFEST" || return 9
+                            : > "$ORDINARY_REPAIR_ROOT/source-manifest-changed"
+                        fi
                         _ordinary_repair_release_json
                         return $?
                         ;;
@@ -2709,6 +2757,10 @@ create_ordinary_verify_repair_mock() {
                         inventory_gets=$((inventory_gets + 1))
                         printf '%s\n' "$inventory_gets" > "$ORDINARY_REPAIR_ROOT/inventory-gets"
                         printf '%s\n' "$page" >> "$ORDINARY_REPAIR_ROOT/inventory-pages"
+                        if [[ "$ORDINARY_REPAIR_MODE" == source_after_inventory &&
+                              -s "$ORDINARY_REPAIR_ROOT/uploads" ]]; then
+                            printf '%040d\n' 3 > "$ORDINARY_REPAIR_ROOT/source-sha"
+                        fi
                         if [[ "$ORDINARY_REPAIR_MODE" == inventory_coherence && "$inventory_gets" -eq 3 ]]; then
                             # A later complete response contradicts an earlier
                             # Linux row while still reporting valid Darwin.
@@ -2760,22 +2812,26 @@ create_ordinary_verify_repair_mock() {
         # Count every attempted network write, including a forbidden repo
         # URL which this transport will reject before storing any server asset.
         printf 'attempt-post:%s\n' "$url" >> "$ORDINARY_REPAIR_ROOT/uploads"
-        [[ "$url" == "https://uploads.github.com/repos/testuser/test-tool/releases/12345/assets?name=test-tool-darwin-arm64" &&
+        local upload_name="${url##*name=}" upload_id=102
+        [[ "$upload_name" != test-tool-linux-amd64 ]] || upload_id=101
+        [[ "$url" == "https://uploads.github.com/repos/testuser/test-tool/releases/12345/assets?name=$upload_name" &&
+           ( "$upload_name" == test-tool-darwin-arm64 || "$upload_name" == test-tool-linux-amd64 ) &&
            "$authorization" == "Authorization: Bearer release-fixture-token" &&
            -n "$output" && -n "$headers" && -f "$body" ]] || return 9
         local sha size response stored
         sha=$(_gh_asset_sha256 "$body") || return 9
         size=$(wc -c < "$body") || return 9
         size="${size//[[:space:]]/}"
-        response=$(jq -nc --arg sha "$sha" --argjson size "$size" '
-            {id:102,name:"test-tool-darwin-arm64",state:"uploaded",size:$size,digest:("sha256:" + $sha)}') || return 9
+        response=$(jq -nc --arg sha "$sha" --argjson size "$size" \
+            --arg name "$upload_name" --argjson id "$upload_id" '
+            {id:$id,name:$name,state:"uploaded",size:$size,digest:("sha256:" + $sha)}') || return 9
         stored="$response"
         if [[ "$ORDINARY_REPAIR_MODE" == changed_bytes ]]; then
             stored=$(jq '.digest = ("sha256:" + ("f" * 64))' <<< "$response") || return 9
         elif [[ "$ORDINARY_REPAIR_MODE" == replaced_id ]]; then
             stored=$(jq '.id = 103' <<< "$response") || return 9
         fi
-        printf 'post:12345:test-tool-darwin-arm64\n' >> "$ORDINARY_REPAIR_ROOT/uploads"
+        printf 'post:12345:%s\n' "$upload_name" >> "$ORDINARY_REPAIR_ROOT/uploads"
         if [[ "$ORDINARY_REPAIR_MODE" != no_upload ]]; then
             jq --argjson asset "$stored" '. + [$asset]' "$ORDINARY_REPAIR_ROOT/assets.json" \
                 > "$ORDINARY_REPAIR_ROOT/assets.next" || return 9
@@ -2783,6 +2839,9 @@ create_ordinary_verify_repair_mock() {
         fi
         if [[ "$ORDINARY_REPAIR_MODE" == tag_after_upload ]]; then
             printf 'v9.9.9\n' > "$ORDINARY_REPAIR_ROOT/tag"
+        fi
+        if [[ "$ORDINARY_REPAIR_MODE" == source_after_upload || "$ORDINARY_REPAIR_MODE" == source_between_uploads ]]; then
+            printf '%040d\n' 3 > "$ORDINARY_REPAIR_ROOT/source-sha"
         fi
         printf '%s\n' "$response" > "$output"
         printf 'HTTP/1.1 201 Created\r\n\r\n' > "$headers"
@@ -2799,7 +2858,7 @@ create_ordinary_verify_repair_mock() {
 
 remove_ordinary_verify_repair_mock() {
     unset -f gh curl _ordinary_repair_release_json
-    unset ORDINARY_REPAIR_ROOT ORDINARY_REPAIR_MODE
+    unset ORDINARY_REPAIR_ROOT ORDINARY_REPAIR_MODE ORDINARY_REPAIR_MANIFEST
 }
 
 # Exercise real repair and prune commands with real inherited kernel leases.
@@ -3209,7 +3268,7 @@ _verify_ordinary_repair_case() {
     local status expected_posts=1 report_filter='true'
     status=$(exec_status)
     case "$mode" in
-        complete|lost_ack|already_present)
+        complete|lost_ack|already_present|source_valid|source_annotated|source_legacy_metadata)
             report_filter='.status == "success" and .details.verification.missing == 0 and
                 (.details.assets.present | sort) == ["test-tool-darwin-arm64","test-tool-linux-amd64"] and
                 (.details.repair.errors // []) == []'
@@ -3243,6 +3302,17 @@ _verify_ordinary_repair_case() {
                 .details.verification.remote_records_valid == false'
             ;;
         tag_after_upload)
+            report_filter='.status == "incomplete" and
+                (.details.repair.errors | length) > 0 and
+                .details.verification.remote_records_valid == false'
+            ;;
+        source_wrong|source_unavailable|source_absent_draft|source_complete_wrong|source_manifest_after_discovery)
+            expected_posts=0
+            report_filter='.status == "incomplete" and
+                (.details.repair.errors | length) > 0 and
+                .details.verification.remote_records_valid == false'
+            ;;
+        source_after_upload|source_after_inventory|source_between_uploads)
             report_filter='.status == "incomplete" and
                 (.details.repair.errors | length) > 0 and
                 .details.verification.remote_records_valid == false'
@@ -3286,6 +3356,21 @@ _verify_ordinary_repair_case() {
         fi
     elif [[ "$mode" == empty_manifest ]]; then
         report_filter+=' and .details.verification.expected == 0 and .details.repair.uploads == []'
+    elif [[ "$mode" == source_legacy_metadata ]]; then
+        if grep -q '/git/ref/' "$ORDINARY_REPAIR_ROOT/api-calls"; then
+            report_filter=false
+        fi
+    elif [[ "$mode" == source_valid || "$mode" == source_annotated ]]; then
+        if [[ $(awk '/\/git\/ref\//{n++} END {print n+0}' "$ORDINARY_REPAIR_ROOT/api-calls") -lt 2 ]]; then
+            report_filter=false
+        fi
+        if [[ "$mode" == source_annotated ]] &&
+           ! grep -q '/git/tags/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa$' "$ORDINARY_REPAIR_ROOT/api-calls"; then
+            report_filter=false
+        fi
+    elif [[ "$mode" == source_between_uploads ]]; then
+        report_filter+=' and .details.assets.present == ["test-tool-linux-amd64"] and
+            .details.assets.missing == ["test-tool-darwin-arm64"]'
     fi
     local observed_posts attempted_posts
     observed_posts=$(awk '/^post:/{n++} END {print n+0}' "$ORDINARY_REPAIR_ROOT/uploads")
@@ -3418,6 +3503,105 @@ test_verify_fix_reads_paginated_inventory() {
 test_verify_fix_reports_latest_inventory_coherently() {
     _verify_ordinary_repair_case inventory_coherence 0 \
         "ordinary repair reports presence from the latest complete inventory without mixing snapshots"
+}
+
+test_verify_fix_binds_manifest_source_without_checkout() {
+    _verify_ordinary_repair_case source_valid 0 \
+        "ordinary repair binds the peeled tag to manifest source without requiring a checkout or commit-valued target_commitish"
+}
+
+test_verify_fix_binds_annotated_manifest_source() {
+    _verify_ordinary_repair_case source_annotated 0 \
+        "ordinary repair dereferences annotated Git tags before accepting the manifest source"
+}
+
+test_verify_fix_rejects_wrong_manifest_source_before_upload() {
+    _verify_ordinary_repair_case source_wrong 1 \
+        "ordinary repair rejects a different source commit before any asset POST"
+}
+
+test_verify_fix_rejects_unavailable_manifest_source_before_upload() {
+    _verify_ordinary_repair_case source_unavailable 1 \
+        "ordinary repair rejects an unresolved source tag before any asset POST"
+}
+
+test_verify_fix_cannot_create_missing_source_tag_on_draft() {
+    _verify_ordinary_repair_case source_absent_draft 1 \
+        "ordinary draft repair requires an existing source tag and cannot create one"
+}
+
+test_verify_fix_rejects_source_drift_after_upload() {
+    _verify_ordinary_repair_case source_after_upload 1 \
+        "ordinary repair cannot succeed after the source tag changes during upload"
+}
+
+test_verify_fix_rejects_source_drift_during_final_inventory() {
+    _verify_ordinary_repair_case source_after_inventory 1 \
+        "ordinary repair rechecks source after the final remote asset inventory"
+}
+
+test_verify_fix_stops_later_uploads_after_source_drift() {
+    _verify_ordinary_repair_case source_between_uploads 1 \
+        "ordinary repair stops remaining uploads when the source tag changes after the first POST"
+}
+
+test_verify_fix_checks_source_when_no_uploads_are_needed() {
+    _verify_ordinary_repair_case source_complete_wrong 1 \
+        "ordinary repair rejects the wrong source tag even when every asset already matches"
+}
+
+test_verify_fix_freezes_manifest_source_before_remote_discovery() {
+    _verify_ordinary_repair_case source_manifest_after_discovery 1 \
+        "ordinary repair refuses a manifest source changed during release discovery before any POST"
+}
+
+test_verify_fix_preserves_legacy_source_metadata() {
+    _verify_ordinary_repair_case source_legacy_metadata 0 \
+        "ordinary repair preserves legacy source metadata without a declared commit pin"
+}
+
+test_verify_fix_rejects_malformed_declared_source_before_remote_access() {
+    ((TESTS_RUN++))
+    if [[ "$HAS_YQ" != true ]]; then
+        skip "yq required for repos.yaml parsing"
+        return 0
+    fi
+    harness_setup
+    seed_repos_config
+    seed_ordinary_verify_repair source_valid || return 1
+    create_ordinary_verify_repair_mock
+    local source status failures=0
+    local -a invalid_sources=(
+        null false 42 '[]' '"not-an-object"'
+        '{"git_sha":null}' '{"git_sha":false}' '{"git_sha":42}'
+        '{"git_sha":[]}' '{"git_sha":{}}' '{"git_sha":""}'
+        '{"git_sha":"abcdef"}' '{"git_sha":"0000000000000000000000000000000000000000"}'
+        '{"git_sha":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}'
+    )
+    for source in "${invalid_sources[@]}"; do
+        jq --argjson source "$source" '.source = $source' \
+            "$ORDINARY_REPAIR_ROOT/source-manifest.json" > "$ORDINARY_REPAIR_MANIFEST" || return 1
+        : > "$ORDINARY_REPAIR_ROOT/api-calls"
+        : > "$ORDINARY_REPAIR_ROOT/uploads"
+        DSR_GH_TOKEN=release-fixture-token GH_MAX_RETRIES=1 GH_RETRY_DELAY=0 \
+            PATH="$TEST_TMPDIR/bin:$PATH" exec_run \
+            "$DSR_CMD" --json release verify test-tool v1.0.0 --fix
+        status=$(exec_status)
+        if [[ "$status" != 4 || -s "$ORDINARY_REPAIR_ROOT/api-calls" ||
+              -s "$ORDINARY_REPAIR_ROOT/uploads" ]] ||
+           ! exec_stderr_contains "unambiguous manifest source evidence"; then
+            failures=$((failures + 1))
+            printf 'source=%s; status=%s\n' "$source" "$status"
+            exec_stderr
+        fi
+    done
+    if [[ "$failures" == 0 ]]; then
+        pass "ordinary repair rejects all malformed declared source pins before remote access"
+    else
+        fail "ordinary repair must not reinterpret malformed source evidence as legacy unpinned input"
+    fi
+    remove_ordinary_verify_repair_mock
+    harness_teardown
 }
 
 test_verify_fix_dry_run_uploads_nothing() {
@@ -3716,6 +3900,18 @@ test_verify_fix_rejects_foreign_upload_repository
 test_verify_fix_rejects_empty_manifest
 test_verify_fix_reads_paginated_inventory
 test_verify_fix_reports_latest_inventory_coherently
+test_verify_fix_binds_manifest_source_without_checkout
+test_verify_fix_binds_annotated_manifest_source
+test_verify_fix_rejects_wrong_manifest_source_before_upload
+test_verify_fix_rejects_unavailable_manifest_source_before_upload
+test_verify_fix_cannot_create_missing_source_tag_on_draft
+test_verify_fix_rejects_source_drift_after_upload
+test_verify_fix_rejects_source_drift_during_final_inventory
+test_verify_fix_stops_later_uploads_after_source_drift
+test_verify_fix_checks_source_when_no_uploads_are_needed
+test_verify_fix_freezes_manifest_source_before_remote_discovery
+test_verify_fix_preserves_legacy_source_metadata
+test_verify_fix_rejects_malformed_declared_source_before_remote_access
 test_verify_fix_dry_run_uploads_nothing
 test_verify_fix_reports_not_found_locally
 test_verify_fix_keeps_artifacts_during_upload

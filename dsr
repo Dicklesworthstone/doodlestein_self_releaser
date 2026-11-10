@@ -11894,6 +11894,31 @@ EOF
         return 4
     fi
 
+    # Repair must keep the build's source authority even on a coordinator
+    # without a checkout. Freeze it before remote discovery can change local
+    # inputs; a present but malformed pin must not become legacy unpinned input.
+    local ordinary_repair_manifest_sha="" ordinary_repair_source_sha=""
+    if $fix_missing && ! $release_contract_enabled && [[ -f "$manifest_file" ]]; then
+        if ! ordinary_repair_manifest_sha=$(_gh_asset_sha256 "$manifest_file") ||
+           ! ordinary_repair_source_sha=$(jq -ers '
+                if length == 1 and (.[0] | type == "object") then .[0]
+                else error("Expected one build manifest") end |
+                if has("source") then
+                    if (.source | type) != "object" then
+                        error("Manifest source must be an object")
+                    elif (.source | has("git_sha")) then
+                        .source.git_sha |
+                        if type == "string" and test("^[0-9a-f]{40}$") and . != ("0" * 40)
+                        then . else error("Manifest source requires a nonzero 40-hex commit") end
+                    else "" end
+                else "" end
+            ' "$manifest_file") ||
+           [[ "$(_gh_asset_sha256 "$manifest_file")" != "$ordinary_repair_manifest_sha" ]]; then
+            log_error "Release repair requires stable, unambiguous manifest source evidence"
+            return 4
+        fi
+    fi
+
     # Record start time
     local start_time
     start_time=$(date +%s)
@@ -12423,7 +12448,7 @@ EOF
             # Repair must retain the selected release and artifact bytes. A
             # successful upload response alone does not prove the final release
             # still serves the requested asset.
-            local repair_identity="" repair_upload_url="" repair_manifest_sha="" repair_rows=""
+            local repair_identity="" repair_upload_url="" repair_manifest_sha="$ordinary_repair_manifest_sha" repair_rows=""
             local repair_result="" repair_asset="" repair_inventory=""
             local -A repair_shas=() repair_sizes=() repair_remote_ids=()
 
@@ -12442,6 +12467,19 @@ EOF
                 ' <<< "$1"
             }
 
+            _release_ordinary_repair_source_matches() {
+                [[ -n "$ordinary_repair_source_sha" ]] || return 0
+                local remote_sha
+                if ! remote_sha=$(gh_resolve_tag_sha "$repo" "$tag"); then
+                    log_error "Could not resolve repair source tag $tag to the manifest commit"
+                    return 1
+                fi
+                if [[ "$remote_sha" != "$ordinary_repair_source_sha" ]]; then
+                    log_error "Repair source tag $tag points to $remote_sha, not manifest commit $ordinary_repair_source_sha"
+                    return 1
+                fi
+            }
+
             _release_ordinary_repair_context_matches() {
                 local observed identity encoded_tag
                 observed=$(gh_api "repos/$repo/releases/$release_id" --no-cache) || return 1
@@ -12450,7 +12488,8 @@ EOF
                 encoded_tag=$(jq -rn --arg tag "$tag" '$tag | @uri') || return 1
                 observed=$(gh_api "repos/$repo/releases/tags/$encoded_tag" --no-cache) || return 1
                 identity=$(_release_ordinary_repair_identity "$observed") || return 1
-                [[ "$identity" == "$repair_identity" ]]
+                [[ "$identity" == "$repair_identity" ]] || return 1
+                _release_ordinary_repair_source_matches
             }
 
             _release_ordinary_repair_verify_asset() (
@@ -12501,7 +12540,7 @@ EOF
 
             if ! repair_identity=$(_release_ordinary_repair_identity "$release_json") ||
                ! repair_upload_url=$(jq -er '.upload_url' <<< "$repair_identity") ||
-               ! repair_manifest_sha=$(_gh_asset_sha256 "$manifest_file") ||
+               [[ -z "$repair_manifest_sha" ]] ||
                ! _gh_require_upload_inventory ||
                ! signing_validate_release_inventory "$manifest_file" "$artifacts_dir" "$repair_manifest_sha" ||
                ! repair_rows=$(jq -er '.artifacts[] | [.name,.sha256,(.size_bytes | tostring)] | @tsv' "$manifest_file") ||
@@ -12521,7 +12560,7 @@ EOF
                 for missing in ${assets_to_fix[@]+"${assets_to_fix[@]}"}; do
                     if ! _release_ordinary_repair_context_matches ||
                        [[ "$(_gh_asset_sha256 "$manifest_file")" != "$repair_manifest_sha" ]]; then
-                        ordinary_repair_errors+=("Release identity or selected manifest changed before repair upload")
+                        ordinary_repair_errors+=("Release identity, source tag, or selected manifest changed before repair upload")
                         break
                     fi
                     local file_path="$artifacts_dir/$missing"
@@ -12539,7 +12578,7 @@ EOF
                 # Observe release identity before the final asset snapshot so
                 # no later release response can contain ignored asset changes.
                 if ! _release_ordinary_repair_context_matches; then
-                    ordinary_repair_errors+=("Release identity changed after repair")
+                    ordinary_repair_errors+=("Release identity or source tag changed after repair")
                 fi
                 # Derive every required name from the same complete paginated
                 # snapshot. Reject duplicate names/IDs and failed pagination
@@ -12567,6 +12606,12 @@ EOF
                 fi
                 if ! signing_validate_release_inventory "$manifest_file" "$artifacts_dir" "$repair_manifest_sha"; then
                     ordinary_repair_errors+=("Selected manifest or artifact bytes changed after repair")
+                fi
+                # Asset inventory reads and byte verification can outlive the
+                # earlier release observation. Re-resolve the actual Git ref
+                # before reporting success, including repairs with no uploads.
+                if ! _release_ordinary_repair_source_matches; then
+                    ordinary_repair_errors+=("Release tag no longer matches the selected manifest source after repair")
                 fi
             fi
             for repair_result in ${ordinary_repair_errors[@]+"${ordinary_repair_errors[@]}"}; do
