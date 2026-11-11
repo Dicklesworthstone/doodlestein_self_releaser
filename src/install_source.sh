@@ -768,9 +768,20 @@ _isb_compile() (
             # never let a proxy modify an existing global installation.
             # https://rust-lang.github.io/rustup/environment-variables.html
             export RUSTUP_AUTO_INSTALL=0
-            _isb_run "$limit" "$output/compiler.log" rustc -vV || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
+            # Use the compiler whose identity is recorded below, not an
+            # inherited Cargo-only RUSTC or build-cache wrapper. Preserve
+            # compiler homes and dependency caches, as the Windows source
+            # engine does, while keeping this attempt's outputs private.
+            local rustc_command
+            rustc_command=$(command -v rustc) || return 3
+            export RUSTC="$rustc_command" RUSTC_WRAPPER='' RUSTC_WORKSPACE_WRAPPER=''
+            # Empty flag variables still suppress .cargo/config.toml. Remove
+            # ambient overrides so the pinned project's cfg/link flags apply.
+            unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS
+            _isb_run "$limit" "$output/compiler.log" "$rustc_command" -vV || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
             host=$(sed -n 's/^host: //p' "$output/compiler.log")
             [[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 6
+            export CARGO_BUILD_TARGET="$host" CARGO_TARGET_DIR="$output/target" CARGO_INCREMENTAL=0
             local artifact_path cargo_name windows_paths=false
             case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) windows_paths=true ;; esac
             local -a args=(build --locked --release --message-format=json-render-diagnostics

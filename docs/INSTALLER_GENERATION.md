@@ -482,6 +482,15 @@ first build. It preserves the existing readonly/vendor dependency policy and
 builds for the installing machine, regardless of inherited `GOOS`, `GOARCH`,
 or `GOFLAGS`.
 
+Rust source builds use the installed compiler they probe, a private Cargo output
+directory, and the installing machine's target. Ambient `RUSTC`,
+`RUSTC_WRAPPER`, and `RUSTC_WORKSPACE_WRAPPER` cannot substitute a different
+compiler or wrapper. Inherited `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, and
+`CARGO_BUILD_RUSTFLAGS` are removed so the pinned project's committed
+`.cargo/config.toml` can supply its own compiler flags. Existing compiler homes
+and dependency caches remain available; this is a locally built source result,
+not a hermetic or signed release.
+
 ### Committed Go workspaces
 
 Bash and native Windows source installers support tools whose commands depend on sibling

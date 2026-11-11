@@ -126,7 +126,7 @@ for dependency in git jq cargo rustc ps; do
     }
 done
 # shellcheck source=../../src/install_source.sh
-source "$ROOT/src/install_source.sh"
+source "${DSR_INSTALL_SOURCE_ENGINE:-$ROOT/src/install_source.sh}"
 # This fixture uses anonymous Git URL policy; authenticated HTTPS has its own
 # real transport coverage in test_install_source.sh --credentials-only.
 export DSR_GH_TOKEN='' GITHUB_TOKEN='' GH_TOKEN=''
@@ -167,7 +167,7 @@ if ((watchdog_status != 0)); then
         "$@" </dev/null > "$log" 2>&1
     }
 fi
-mkdir -p "$WORK/cache" "$WORK/results" "$WORK/upstream/src" \
+mkdir -p "$WORK/cache" "$WORK/results" "$WORK/upstream/src" "$WORK/upstream/.cargo" \
     "$WORK/upstream/helper/src" "$WORK/upstream/worker/src" || exit 1
 export CARGO_HOME="$WORK/cache" CARGO_NET_OFFLINE=true
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$WORK/gitconfig"
@@ -226,7 +226,17 @@ path = "src/upper.rs"
 name = "family.exe"
 path = "src/exe.rs"
 TOML
-printf 'fn main() { println!("family-tag-v1"); }\n' > "$WORK/upstream/src/main.rs"
+cat > "$WORK/upstream/.cargo/config.toml" <<'TOML'
+[build]
+rustflags = ["--cfg", "dsr_committed_cfg"]
+TOML
+cat > "$WORK/upstream/src/main.rs" <<'RUST'
+#[cfg(not(dsr_committed_cfg))]
+compile_error!("the pinned project's Cargo rustflags were lost");
+#[cfg(dsr_ambient_cfg)]
+compile_error!("inherited compiler flags replaced the pinned project's flags");
+fn main() { println!("family-tag-v1"); }
+RUST
 printf 'fn main() { println!("local-tag-v1"); }\n' > "$WORK/upstream/src/local.rs"
 printf 'fn main() { println!("uppercase-tag-v1"); }\n' > "$WORK/upstream/src/upper.rs"
 printf 'fn main() { println!("literal-exe-tag-v1"); }\n' > "$WORK/upstream/src/exe.rs"
@@ -254,7 +264,7 @@ git init -q -b main "$WORK/upstream" || exit 1
 git -C "$WORK/upstream" config user.name 'DSR test'
 git -C "$WORK/upstream" config user.email 'test@example.invalid'
 cargo generate-lockfile --offline --manifest-path "$WORK/upstream/Cargo.toml" || exit 1
-git -C "$WORK/upstream" add Cargo.toml Cargo.lock src helper worker || exit 1
+git -C "$WORK/upstream" add Cargo.toml Cargo.lock .cargo src helper worker || exit 1
 git -C "$WORK/upstream" commit -qm 'source family v1' || exit 1
 git -C "$WORK/upstream" tag -a v1.0.0 -m 'source family release' || exit 1
 PIN=$(git -C "$WORK/upstream" rev-parse HEAD) || exit 1
@@ -263,9 +273,11 @@ git -C "$WORK/upstream" commit -qam 'later main' || exit 1
 git config --file "$GIT_CONFIG_GLOBAL" \
     url."file://$WORK/upstream".insteadOf https://github.com/example/source-family.git || exit 1
 
-run_build complete refs/tags/v1.0.0 rust family "$WORK/complete" --allow-build --timeout 60 \
+RUSTFLAGS='--cfg dsr_ambient_cfg' CARGO_ENCODED_RUSTFLAGS=$'--cfg\x1fdsr_ambient_cfg' \
+    CARGO_BUILD_RUSTFLAGS='--cfg dsr_ambient_cfg' \
+    run_build complete refs/tags/v1.0.0 rust family "$WORK/complete" --allow-build --timeout 60 \
     --bin family-helper --bin family --bin family-worker
-check 'one build selects binaries across non-default workspace packages' equal "$STATUS" 0
+check 'committed Cargo flags build a complete family despite all inherited flag overrides' equal "$STATUS" 0
 if ((STATUS != 0)); then
     cat "$WORK/results/complete.log" >&2
     exit 1
@@ -294,8 +306,21 @@ done
 check 'unselected root binary was not built' test ! -e \
     "$(dirname "$(jq -r '.path' "$WORK/results/complete.json")")/family-local"
 
-run_build singleton refs/tags/v1.0.0 rust family "$WORK/singleton" --allow-build --timeout 60
-check 'legacy singleton source build succeeds' equal "$STATUS" 0
+cat > "$WORK/ambient-rustc" <<'SH'
+#!/usr/bin/env bash
+printf 'ambient compiler or wrapper ran\n' > "$DSR_SOURCE_OVERRIDE_MARKER"
+exit 97
+SH
+chmod +x "$WORK/ambient-rustc" || exit 1
+DSR_SOURCE_OVERRIDE_MARKER="$WORK/ambient-rustc.called" \
+    RUSTC="$WORK/ambient-rustc" CARGO_BUILD_RUSTC="$WORK/ambient-rustc" \
+    RUSTC_WRAPPER="$WORK/ambient-rustc" RUSTC_WORKSPACE_WRAPPER="$WORK/ambient-rustc" \
+    CARGO_BUILD_RUSTC_WRAPPER="$WORK/ambient-rustc" CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER="$WORK/ambient-rustc" \
+    CARGO_TARGET_DIR="$WORK/ambient-target" CARGO_BUILD_TARGET=dsr-invalid-ambient-target \
+    run_build singleton refs/tags/v1.0.0 rust family "$WORK/singleton" --allow-build --timeout 60
+check 'singleton uses the probed native compiler despite ambient compiler and wrapper overrides' equal "$STATUS" 0
+check 'ambient compiler and wrappers never execute' test ! -e "$WORK/ambient-rustc.called"
+check 'ambient Cargo target directory remains untouched' test ! -e "$WORK/ambient-target"
 check 'singleton retains original primary fields and one additive member' jq -e \
     '.binaries | length == 1' "$WORK/results/singleton.json"
 check 'singleton receipt member matches original path' jq -e \
