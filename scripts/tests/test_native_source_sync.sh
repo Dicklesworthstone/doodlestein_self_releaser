@@ -22,9 +22,232 @@
 # Use --strict-go-admission-only for conservative parallel-output admission,
 # sibling drift and layout refusal checks; --strict-go-matrix-only proves
 # simultaneous pinned amd64/386 Go builds with private verified stages.
+# Use --strict-go-context-only for actual Go policy and retained-output admission.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 ROOT="${DSR_TEST_ROOT:-$ROOT}"
+
+test_strict_go_context() (
+    local dependency work runtime config sha status checks=0 failures=0 stage result
+    local run state_file sidecar original_state original_sidecar before_state before_events kind
+    for dependency in bash git jq yq python3 go tar; do
+        command -v "$dependency" >/dev/null || { printf 'SKIP: strict Go policy requires %s\n' "$dependency"; return 77; }
+    done
+    [[ $(uname -s)/$(uname -m) == Linux/x86_64 && $(go version) == 'go version go'* ]] || return 77
+    work=$(mktemp -d "${DSR_TEST_DISK_ROOT:-${TMPDIR:-/tmp}}/dsr-go-policy.XXXXXXXX") || return 1
+    runtime=$(mktemp -d "${TMPDIR:-/tmp}/dsr-go-policy-runtime.XXXXXXXX") || return 1
+    printf 'Strict Go policy source: %s; evidence: %s\n' "$work" "$runtime"
+    mkdir -p "$runtime/config/repos.d" "$work/source" "$work/stages" "$runtime/outside" || return 1
+    export DSR_CONFIG_DIR="$runtime/config" ACT_CONFIG_DIR="$runtime/config" ACT_REPOS_DIR="$runtime/config/repos.d"
+    export DSR_STATE_DIR="$runtime/state" DSR_CACHE_DIR="$runtime/cache"
+    export DSR_HOSTS_FILE="$runtime/config/hosts.yaml" DSR_REPOS_FILE="$runtime/config/repos.yaml"
+    export DSR_DISABLE_HOST_SELECTOR=1 RCH_DISABLED=1 RCH_CARGO_WRAPPER_BYPASS=1 NO_COLOR=1 GOMAXPROCS=1
+    export DSR_GO_RECIPE_MARKER=recipe-env-expanded
+    printf 'module example.local/context\n\ngo 1.19\n' > "$work/source/go.mod"
+    printf 'package main\nvar message = "pinned-default"\nfunc main() { println(message) }\n' > "$work/source/main.go"
+    git -C "$work/source" init -q -b main || return 1
+    git -C "$work/source" add . || return 1
+    git -C "$work/source" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm pinned-module || return 1
+    git -C "$work/source" tag v1.0.0 || return 1
+    sha=$(git -C "$work/source" rev-parse HEAD) || return 1
+    jq -n --arg work "$work" '{schema_version:"1.0.0",hosts:{localnative:{
+        platform:"linux/amd64",connection:"local",concurrency:1,build_root:($work+"/stages")}},
+        platform_mapping:{"linux/amd64":"localnative","linux/386":"localnative"}}' > "$DSR_HOSTS_FILE" || return 1
+    config="$ACT_REPOS_DIR/context.yaml"
+    jq -n --arg work "$work" --arg runtime "$runtime" --arg path "$PATH" \
+        --arg cache "${DSR_TEST_GOCACHE:-$runtime/go-cache}" '{
+        tool_name:"context",repo:"example/context",local_path:($work+"/source"),language:"go",binary_name:"context",
+        targets:["linux/amd64"],act_job_map:{"linux/amd64":null},hosts:{"linux/amd64":"localnative"},
+        build_cmd:"printf \"%s\\n\" \"$DSR_TARGET_ARCH\" >> \"$PROBE_EVENTS\"; printf %s \"$PROBE_EXPANDED\" > \"$PROBE_EXPANSION_FILE\"; go build -p=1 -buildvcs=false -o context .",
+        env:{PATH:$path,PROBE_EVENTS:($runtime+"/compiler-events"),GOCACHE:$cache,GOMAXPROCS:"1",
+          PROBE_EXPANDED:"$DSR_GO_RECIPE_MARKER",PROBE_EXPANSION_FILE:($runtime+"/recipe-expansion"),
+          CGO_ENABLED:"0",GOPROXY:"off",GOSUMDB:"off"},
+        release_contract:{checksum_sidecar:"sha256",exact_primary_assets:{"linux/amd64":"context-linux-amd64"}}}
+        ' > "$config" || return 1
+    # shellcheck source=../../src/logging.sh
+    source "$ROOT/src/logging.sh"
+    # shellcheck source=../../src/config.sh
+    source "$ROOT/src/config.sh"
+    # shellcheck source=../../src/build_state.sh
+    source "$ROOT/src/build_state.sh"
+    # shellcheck source=../../src/act_runner.sh
+    source "${DSR_TEST_ACT_RUNNER:-$ROOT/src/act_runner.sh}"
+    # shellcheck source=../../src/artifact_naming.sh
+    source "$ROOT/src/artifact_naming.sh"
+    # shellcheck source=../../src/host_selector.sh
+    source "$ROOT/src/host_selector.sh"
+    # shellcheck source=../../src/host_health.sh
+    source "$ROOT/src/host_health.sh"
+    # shellcheck source=../../src/git_ops.sh
+    source "$ROOT/src/git_ops.sh"
+    # shellcheck source=../../src/packaging.sh
+    source "$ROOT/src/packaging.sh"
+    host_health_is_ready() { return 0; }
+    selector_acquire_slot() { return 0; }
+    selector_release_slot() { return 0; }
+    build_state_init || return 1
+    export SCRIPT_DIR="$ROOT" JSON_MODE=true DRY_RUN=false VERBOSE=false DSR_VERSION=fixture DSR_KEEP_BUILD_STAGES=1
+    declare -A _DSR_LOADED_MODULES=([packaging]=1 [artifact_naming]=1)
+    # shellcheck disable=SC1090 # Actual public command and publication consumer.
+    source <(awk '/^(_dsr_require|cmd_build|_release_sha256|_release_require_publishable_artifacts)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$ROOT/dsr") || return 1
+    # shellcheck disable=SC1090
+    source <(awk '/^json_envelope\(\) \{/{copy=1} copy{print} copy && /^# ====/{exit}' "$ROOT/dsr") || return 1
+    check_go_policy() {
+        local label="$1"; shift
+        checks=$((checks + 1))
+        if "$@"; then printf 'PASS: Go policy: %s\n' "$label"
+        else failures=$((failures + 1)); printf 'FAIL: Go policy: %s\n' "$label" >&2; fi
+    }
+    printf 'BOUNDARY: fixture host health/capacity only; real cmd_build, pinned Git snapshots, compiler, collection, checkpoint and publication\n'
+    printf 'GOFLAGS=-ldflags=-X=main.message=persistent-override\n' > "$runtime/go-env"
+    printf 'go 1.19\nuse .\n' > "$runtime/outside/go.work"
+    printf 'module example.local/outside\n\ngo 1.19\n' > "$runtime/outside/go.mod"
+    export GOENV="$runtime/go-env" GOWORK="$runtime/outside/go.work"
+    export GOFLAGS='-ldflags=-X=main.message=ambient-override' GOAMD64=v99 GOTOOLCHAIN=go0.0.1
+    status=0
+    cmd_build context --version 1.0.0 --output-dir "$runtime/no-workfile" \
+        > "$runtime/no-workfile.json" 2> "$runtime/no-workfile.log" || status=$?
+    check_go_policy 'public strict build ignores inherited selectors and persistent GOENV' test "$status" -eq 0
+    if [[ "$status" -ne 0 ]]; then cat "$runtime/no-workfile.log" >&2; return 1; fi
+    check_go_policy 'real binary retains pinned bytes despite ambient linker flags' \
+        test "$("$runtime/no-workfile/context-linux-amd64" 2>&1)" = pinned-default
+    check_go_policy 'unrelated recipe environment keeps its existing shell expansion' \
+        test "$(cat "$runtime/recipe-expansion")" = recipe-env-expanded
+    check_go_policy 'manifest records the actual no-workfile compiler policy' jq -e --arg sha "$sha" '
+        .publishable==true and .source.git_sha==$sha and
+        (.build_environments[0].build_influence_env |
+         .DSR_GO_ENV_POLICY=="1" and .GOENV=="off" and .GOFLAGS=="" and .GOWORK=="off" and
+         .GOTOOLCHAIN=="local" and .GO111MODULE=="on" and .GOOS=="linux" and .GOARCH=="amd64" and
+         .DSR_GO_WORKFILE=="" and .DSR_GO_WORKFILE_SHA256=="" and (has("GOAMD64")|not))
+        ' "$runtime/no-workfile/context-v1.0.0-manifest.json"
+    check_go_policy 'isolated output passes actual publication admission' \
+        _release_require_publishable_artifacts "$runtime/no-workfile" "$runtime/no-workfile/context-v1.0.0-manifest.json" true
+    jq '.build_environments[0].build_influence_env={}' "$runtime/no-workfile/context-v1.0.0-manifest.json" \
+        > "$runtime/old-manifest.json" || return 1
+    status=0
+    _act_validate_contract_variant_inventory context "$(cat "$runtime/old-manifest.json")" \
+        "$(jq -c '.release_contract' "$config")" > "$runtime/old-manifest.out" 2> "$runtime/old-manifest.log" || status=$?
+    check_go_policy 'release consumer refuses an old strict Go manifest without policy receipt' test "$status" -ne 0
+    check_go_policy 'legacy manifest refusal names the missing compiler policy' \
+        grep -q 'compiler environment policy receipt' "$runtime/old-manifest.log"
+    for kind in empty relabelled duplicated; do
+        case "$kind" in
+            empty) jq '.build_environments=[]' "$runtime/no-workfile/context-v1.0.0-manifest.json" ;;
+            relabelled) jq '.build_environments[].method="act"' "$runtime/no-workfile/context-v1.0.0-manifest.json" ;;
+            duplicated) jq '.build_environments += .build_environments' "$runtime/no-workfile/context-v1.0.0-manifest.json" ;;
+        esac > "$runtime/$kind-manifest.json" || return 1
+        status=0
+        _act_validate_contract_variant_inventory context "$(cat "$runtime/$kind-manifest.json")" \
+            "$(jq -c '.release_contract' "$config")" > "$runtime/$kind-manifest.out" 2> "$runtime/$kind-manifest.log" || status=$?
+        check_go_policy "$kind inventory cannot hide a configured native Go target" test "$status" -ne 0
+        check_go_policy "$kind inventory reaches the native policy coverage gate" \
+            grep -q 'exactly one native policy receipt' "$runtime/$kind-manifest.log"
+    done
+
+    printf 'go 1.19\nuse .\n' > "$work/source/go.work"
+    git -C "$work/source" add go.work || return 1
+    git -C "$work/source" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm pinned-workspace || return 1
+    git -C "$work/source" tag v1.0.1 || return 1
+    sha=$(git -C "$work/source" rev-parse HEAD) || return 1
+    jq '.env.GOFLAGS="-ldflags=-X=main.message=reviewed-policy" | .env.GOWORK=""' \
+        "$config" > "$runtime/workspace-config.json" || return 1
+    command cp "$runtime/workspace-config.json" "$config" || return 1
+    status=0
+    cmd_build context --version 1.0.1 --output-dir "$runtime/workspace" \
+        > "$runtime/workspace.json" 2> "$runtime/workspace.log" || status=$?
+    check_go_policy 'public workspace build honors reviewed linker flags' test "$status" -eq 0
+    if [[ "$status" -ne 0 ]]; then cat "$runtime/workspace.log" >&2; return 1; fi
+    check_go_policy 'actual workspace executable contains the reviewed override' \
+        test "$("$runtime/workspace/context-linux-amd64" 2>&1)" = reviewed-policy
+    check_go_policy 'workspace receipt binds pinned bytes and private selection' jq -e \
+        --arg digest "$(_act_sha256 "$work/source/go.work")" --arg sha "$sha" --arg original "$work/source/go.work" '
+        .build_environments[0].build_influence_env |
+        .GOFLAGS=="-ldflags=-X=main.message=reviewed-policy" and .GOENV=="off" and
+        .DSR_GO_WORKFILE=="source/go.work" and .DSR_GO_WORKFILE_SHA256==$digest and
+        .DSR_GO_WORKFILE_GIT_SHA==$sha and .GOWORK!=$original and (.GOWORK|endswith("/source/go.work"))
+        ' "$runtime/workspace/context-v1.0.1-manifest.json"
+    check_go_policy 'workspace output passes actual publication admission' \
+        _release_require_publishable_artifacts "$runtime/workspace" "$runtime/workspace/context-v1.0.1-manifest.json" true
+    stage="$work/stages/test-policy/source"
+    result=$(_act_strict_go_workfile_json context "$sha" "$work/source/go.work" "$stage") || return 1
+    check_go_policy 'explicit original workfile is rebased into the private stage' \
+        test "$(jq -r '.gowork' <<< "$result")" = "$stage/go.work"
+    status=0
+    _act_strict_go_workfile_json context "$sha" "$runtime/outside/go.work" "$stage" \
+        > "$runtime/external-workfile.out" 2> "$runtime/external-workfile.log" || status=$?
+    check_go_policy 'an explicitly unpinned external workspace is refused' test "$status" -ne 0
+    status=0
+    _act_strict_go_build_env context "$sha" v1.0.1 "$stage" "GOENV=$runtime/go-env" \
+        > "$runtime/persistent-env.out" 2> "$runtime/persistent-env.log" || status=$?
+    check_go_policy 'explicit persistent GOENV must become reviewed recipe entries' test "$status" -ne 0
+
+    # Genuine partial release: amd64 succeeds; the configured 386 command
+    # fails before Go starts. Both retained authorities must keep the policy.
+    jq '.targets=["linux/amd64","linux/386"] |
+        .act_job_map["linux/386"]=null | .hosts["linux/386"]="localnative" |
+        .release_contract.exact_primary_assets["linux/386"]="context-linux-386" |
+        .build_cmd="printf \"%s\\n\" \"$DSR_TARGET_ARCH\" >> \"$PROBE_EVENTS\"; if [ \"$DSR_TARGET_ARCH\" = 386 ]; then exit 7; fi; go build -p=1 -buildvcs=false -o context ."
+        ' "$config" > "$runtime/mixed-config.json" || return 1
+    command cp "$runtime/mixed-config.json" "$config" || return 1
+    status=0
+    cmd_build context --version 1.0.1 --output-dir "$runtime/mixed" \
+        > "$runtime/mixed.json" 2> "$runtime/mixed.log" || status=$?
+    check_go_policy 'real mixed release reports its configured command failure' test "$status" -ne 0
+    build_state_get context 1.0.1 > "$runtime/mixed-state.json" || return 1
+    check_go_policy 'mixed checkpoint retains a real successful Go target' jq -e '
+        .target_statuses["linux/amd64"].status=="completed" and
+        .target_statuses["linux/386"].status=="failed" and
+        .target_statuses["linux/amd64"].result.build_influence_env.DSR_GO_ENV_POLICY=="1"
+        ' "$runtime/mixed-state.json"
+    run=$(jq -er '.run_id' "$runtime/mixed-state.json") || return 1
+    state_file="$DSR_STATE_DIR/builds/context/1.0.1/$run/state.json"
+    sidecar=$(jq -er '.target_statuses["linux/amd64"].result_path' "$state_file") || return 1
+    original_state="$runtime/original-state.json"; original_sidecar="$runtime/original-sidecar.json"
+    command cp "$state_file" "$original_state" || return 1
+    command cp "$sidecar" "$original_sidecar" || return 1
+    for kind in embedded sidecar; do
+        command cp "$original_state" "$state_file" || return 1
+        command cp "$original_sidecar" "$sidecar" || return 1
+        if [[ "$kind" == embedded ]]; then
+            jq '.target_statuses["linux/amd64"].result.build_influence_env={}' "$original_state" > "$state_file" || return 1
+        else
+            jq '.build_influence_env={}' "$original_sidecar" > "$sidecar" || return 1
+        fi
+        before_state=$(_act_sha256 "$state_file") || return 1
+        before_events=$(_act_sha256 "$runtime/compiler-events") || return 1
+        status=0
+        cmd_build context --version 1.0.1 --resume="$run" --output-dir "$runtime/mixed" \
+            > "$runtime/old-$kind.json" 2> "$runtime/old-$kind.log" || status=$?
+        check_go_policy "public resume refuses an old $kind Go policy receipt" test "$status" -ne 0
+        check_go_policy "$kind refusal reaches the compiler policy consumer" \
+            grep -q 'compiler environment policy receipt' "$runtime/old-$kind.log"
+        check_go_policy "$kind refusal preserves the prior checkpoint" test "$before_state" = "$(_act_sha256 "$state_file")"
+        check_go_policy "$kind refusal cannot launch another command" test "$before_events" = "$(_act_sha256 "$runtime/compiler-events")"
+    done
+    command cp "$original_state" "$state_file" || return 1
+    command cp "$original_sidecar" "$sidecar" || return 1
+    local amd64_before other_before retained_success
+    amd64_before=$(grep -cx amd64 "$runtime/compiler-events") || return 1
+    other_before=$(grep -cx 386 "$runtime/compiler-events") || return 1
+    retained_success=$(jq -er '.target_statuses["linux/amd64"].result_path' "$original_state") || return 1
+    status=0
+    cmd_build context --version 1.0.1 --resume="$run" --output-dir "$runtime/mixed" \
+        > "$runtime/valid-resume.json" 2> "$runtime/valid-resume.log" || status=$?
+    check_go_policy 'valid policy resume retains the configured 386 failure' test "$status" -ne 0
+    check_go_policy 'valid policy resume reuses successful amd64 without recompiling it' \
+        test "$amd64_before" -eq "$(grep -cx amd64 "$runtime/compiler-events")"
+    check_go_policy 'valid policy resume dispatches only the failed target again' \
+        test "$((other_before + 1))" -eq "$(grep -cx 386 "$runtime/compiler-events")"
+    check_go_policy 'valid resume preserves the successful immutable receipt' jq -e --arg path "$retained_success" '
+        .target_statuses["linux/amd64"].status=="completed" and
+        .target_statuses["linux/amd64"].attempts==1 and
+        .target_statuses["linux/amd64"].result_path==$path and
+        .target_statuses["linux/386"].status=="failed" and
+        .target_statuses["linux/386"].attempts==2
+        ' "$state_file"
+    printf 'Strict Go policy: %s checks, %s failures; evidence %s\n' "$checks" "$failures" "$runtime"
+    [[ "$failures" -eq 0 ]]
+)
 
 test_ordinary_source_inputs() (
     local dependency work config contexts first next result state_file state failures=0 checks=0
@@ -867,9 +1090,13 @@ while command.startswith('set '):
     else: os.environ.pop(name,None)
     command = command[match.end():]
 with (case / 'compiler-events').open('a') as stream:
-    stream.write(json.dumps(dict(cwd=os.getcwd(),GOOS=os.getenv('GOOS'),GOARCH=os.getenv('GOARCH'))) + '\n')
+    selected={name:os.getenv(name) for name in ('GOOS','GOARCH','GOENV','GOFLAGS','GOWORK','GOTOOLCHAIN',
+              'GO111MODULE','GOAMD64','GOEXPERIMENT','GOROOT','GOCACHEPROG')}
+    stream.write(json.dumps(dict(cwd=os.getcwd(),**selected)) + '\n')
 result = subprocess.run(shlex.split(command))
 if os.environ.get('PROBE_FAULT') == 'post-source':
+    (case/'post-compiler-status.json').write_text(json.dumps(dict(exit_code=result.returncode,
+        artifact=str(Path.cwd()/'strictwin.exe'))),encoding='utf-8')
     with (case/'snapshot'/'dep'/'dep.go').open('a') as stream: stream.write('\n// changed by build process\n')
 sys.exit(result.returncode)
 ''', encoding='utf-8')
@@ -882,8 +1109,11 @@ ssh.chmod(0o700)
 print('BOUNDARY: real PowerShell/Git archive verification/Go PE compilation/held collection; fixture Windows drive, cmd, SSH, host-readiness and JobObject launcher; native Windows/NTFS are not qualified.', flush=True)
 for layout in ('replace','workspace'):
     case = work / layout
-    for directory in ('source','dep','snapshot/source','snapshot/dep','config/repos.d','artifacts','logs'):
+    for directory in ('source','dep','snapshot/source','snapshot/dep','config/repos.d','artifacts','logs','outside'):
         (case/directory).mkdir(parents=True, exist_ok=True)
+    (case/'ambient-go-env').write_text('GOFLAGS=-this-persistent-flag-must-not-reach-go\n',encoding='utf-8')
+    (case/'outside/go.work').write_text('go 1.19\nuse .\n',encoding='utf-8')
+    (case/'outside/go.mod').write_text('module example.local/outside\n\ngo 1.19\n',encoding='utf-8')
     (case/'source'/'go.mod').write_text('module example.local/strictwin\n\ngo 1.19\n\nrequire example.local/dep v0.0.0\n' +
         ('replace example.local/dep => ../dep\n' if layout == 'replace' else ''), encoding='utf-8')
     if layout == 'workspace':
@@ -905,7 +1135,11 @@ for layout in ('replace','workspace'):
         DSR_HOSTS_FILE=str(case/'config/hosts.yaml'),DSR_REPOS_FILE=str(case/'config/repos.yaml'),
         ACT_ARTIFACTS_DIR=str(case/'artifacts'),ACT_LOGS_DIR=str(case/'logs'),DSR_CACHE_DIR=str(case/'cache'),
         DSR_STATE_DIR=str(case/'state'),DSR_KEEP_BUILD_STAGES='1',NO_COLOR='1',ComSpec=str(cmd),DOTNET_PROCESSOR_COUNT='1',
-        PATH=str(transports)+os.pathsep+os.environ['PATH'],GOOS='linux',GOARCH='arm64')
+        PATH=str(transports)+os.pathsep+os.environ['PATH'],GOOS='linux',GOARCH='arm64',
+        GOENV=str(case/'ambient-go-env'),GOWORK=str(case/'outside/go.work'),GO111MODULE='off',
+        GOFLAGS='-this-ambient-flag-must-not-reach-go',GOTOOLCHAIN='go0.0.1',GOAMD64='v99',
+        GOEXPERIMENT='dsr-invalid-experiment',GOROOT=str(case/'missing-toolchain'),
+        GOCACHEPROG=str(case/'missing-cache-program'))
     recipe = dict(tool_name='strictwin',repo='example/strictwin',language='go',binary_name='strictwin',
         local_path=str(case/'source'),targets=['windows/amd64'],hosts={'windows/amd64':'winfixture'},
         host_paths={'winfixture':'C:/fixture/source'},build_cmd='go build -o strictwin.exe .',
@@ -962,6 +1196,16 @@ for layout in ('replace','workspace'):
     observed = [json.loads(line) for line in events('compiler-events')]
     check(layout+': configured target reaches real Go in a private source directory',len(observed)==1 and
           observed[0]['GOOS']=='windows' and observed[0]['GOARCH']=='amd64' and '/dsr-build-' in observed[0]['cwd'])
+    policy=value.get('build_influence_env',{})
+    check(layout+': normalized policy reaches Windows child and retained receipt',len(observed)==1 and
+          observed[0]['GOENV']=='off' and observed[0]['GOFLAGS']=='-p=1' and observed[0]['GOTOOLCHAIN']=='local' and
+          observed[0]['GO111MODULE']=='on' and
+          observed[0]['GOWORK']==('off' if layout=='replace' else observed[0]['cwd']+'/go.work') and
+          all(observed[0][name] is None for name in ('GOAMD64','GOEXPERIMENT','GOROOT','GOCACHEPROG')) and
+          policy.get('DSR_GO_ENV_POLICY')=='1' and policy.get('GOENV')==observed[0]['GOENV'] and
+          policy.get('GOFLAGS')==observed[0]['GOFLAGS'] and policy.get('GO111MODULE')==observed[0]['GO111MODULE'] and
+          policy.get('GOOS')==observed[0]['GOOS'] and policy.get('GOARCH')==observed[0]['GOARCH'] and
+          policy.get('DSR_GO_WORKFILE')==('' if layout=='replace' else 'source/go.work'))
     check(layout+': original main and sibling snapshots still pass complete verifier',originals_valid())
     check(layout+': tracked file link is materialized in the private source',bool(observed) and
           not (Path(observed[0]['cwd'])/'license-copy.txt').is_symlink() and
@@ -1016,9 +1260,12 @@ for layout in ('replace','workspace'):
     env['PROBE_FAULT']='post-source'
     before=len(events('compiler-events')); collections=events('transport-events').count('collection')
     failed,result=native('post-source')
+    completion_file=case/'post-compiler-status.json'
+    completion=json.loads(completion_file.read_text(encoding='utf-8')) if completion_file.exists() else {}
     check('post-compiler source alteration prevents artifact collection',failed.returncode!=0 and
           result.get('status')!='success' and len(events('compiler-events'))==before+1 and
-          events('transport-events').count('collection')==collections)
+          events('transport-events').count('collection')==collections and completion.get('exit_code')==0 and
+          pe_amd64(Path(completion['artifact'])))
     dep_path.write_bytes(dep_bytes); env['PROBE_FAULT']=''
     check('all original snapshots still verify after restored negative controls',originals_valid())
 print(f'Windows strict Go staging: {checks-failures} passed, {failures} failed',flush=True)
@@ -2223,6 +2470,10 @@ IGNORE
     [[ "$selection_failures" -eq 0 ]]
 )
 
+if [[ "${1:-}" == --strict-go-context-only ]]; then
+    test_strict_go_context
+    exit $?
+fi
 if [[ "${1:-}" == --ordinary-inputs-only ]]; then
     test_ordinary_source_inputs
     exit $?

@@ -7712,7 +7712,7 @@ _act_windows_strict_go_build_script() {
     local source_root="$5" stage_root="$6" build_cmd="$7" build_env="$8"
     local path dependencies sources entry name checkout sha archive manifest manifest_dir
     local archive_digest manifest_digest object_count records='[]' total_objects=1
-    local records_b64 command_b64 environment_b64 budget_script
+    local records_b64 command_b64 environment_b64 ambient_names_b64 budget_script
     source_root="${source_root//\\//}" stage_root="${stage_root//\\//}"
     if [[ "$source_root" =~ ^/([A-Za-z])/(.*)$ ]]; then
         source_root="${BASH_REMATCH[1]}:/${BASH_REMATCH[2]}"
@@ -7765,6 +7765,8 @@ _act_windows_strict_go_build_script() {
         if all(.[]; test("^[A-Za-z_][A-Za-z0-9_]*=")) then
             map(capture("^(?<name>[^=]+)=(?<value>.*)$"))
         else error("invalid Go build environment") end' | base64 | tr -d '\r\n') || return 4
+    ambient_names_b64=$(_act_go_ambient_env_names | jq -Rsc 'split("\n") | map(select(length > 0))' | \
+        base64 | tr -d '\r\n') || return 4
     budget_script=$(_act_windows_source_budget_script "$host" "${source_root%/*}" \
         0 "$total_objects" expansion) || return 4
     _act_windows_source_runtime_script || return 4
@@ -7818,7 +7820,8 @@ try {
     \$psi.UseShellExecute=\$false
     \$psi.WorkingDirectory=\$dsrStageSource
     \$psi.FileName=\$env:ComSpec
-    foreach (\$name in @('GOOS','GOARCH')) { \$psi.EnvironmentVariables.Remove(\$name) }
+    \$ambientNames=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$ambient_names_b64')) | ConvertFrom-Json
+    foreach (\$name in \$ambientNames) { \$psi.EnvironmentVariables.Remove(\$name) }
     \$environment=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$environment_b64')) | ConvertFrom-Json
     foreach (\$pair in \$environment) { \$psi.EnvironmentVariables[\$pair.name]=\$pair.value }
     \$command=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$command_b64'))
@@ -10409,6 +10412,201 @@ _act_windows_rust_sdk_env_cleanup() {
     local sdk_regex
     sdk_regex=$(_act_rust_sdk_influence_regex)
     printf '%s' "\$keys=@(\$psi.EnvironmentVariables.Keys); foreach (\$key in \$keys) { if (\$key -match '${sdk_regex}') { \$psi.EnvironmentVariables.Remove(\$key) } }; "
+}
+
+# Strict Go workers inherit caches and download policy, but never compiler or
+# source selectors from a login shell or the persistent `go env -w` file.
+# Both native launchers use this list before applying the reviewed recipe.
+_act_go_ambient_env_names() {
+    printf '%s\n' GOOS GOARCH GOENV GOFLAGS GOWORK GOTOOLCHAIN GO111MODULE GOROOT \
+        GOEXPERIMENT GODEBUG GOCACHEPROG GO_EXTLINK_ENABLED GOFIPS140 GCCGO GOAMD64 GOARM GOARM64 \
+        GO386 GOMIPS GOMIPS64 GOPPC64 GORISCV64 GOWASM CGO_ENABLED CGO_CFLAGS \
+        CGO_CPPFLAGS CGO_CXXFLAGS CGO_FFLAGS CGO_LDFLAGS CGO_CFLAGS_ALLOW \
+        CGO_CFLAGS_DISALLOW CGO_CPPFLAGS_ALLOW CGO_CPPFLAGS_DISALLOW \
+        CGO_CXXFLAGS_ALLOW CGO_CXXFLAGS_DISALLOW CGO_FFLAGS_ALLOW \
+        CGO_FFLAGS_DISALLOW CGO_LDFLAGS_ALLOW CGO_LDFLAGS_DISALLOW CC CXX FC AR PKG_CONFIG
+}
+
+_act_go_build_influence_json() {
+    local environment="$1" pair name selected=''
+    local names=$'\n'
+    names+="$(_act_go_ambient_env_names)"$'\n'
+    while IFS= read -r pair; do
+        [[ -n "$pair" && "$pair" == *=* ]] || continue
+        name="${pair%%=*}"
+        case "$name" in
+            DSR_GO_ENV_POLICY|DSR_GO_WORKFILE|DSR_GO_WORKFILE_SHA256|DSR_GO_WORKFILE_GIT_SHA|\
+            DSR_RELEASE_GIT_SHA|DSR_RELEASE_GIT_REF|DSR_TARGET_OS|DSR_TARGET_ARCH|DSR_TARGET_PLATFORM) ;;
+            *) [[ "$names" == *$'\n'"$name"$'\n'* ]] || continue ;;
+        esac
+        selected+="$pair"$'\n'
+    done <<< "$environment"
+    jq -Rn --arg entries "$selected" '
+        reduce ($entries | split("\n")[] | select(length > 0) |
+            index("=") as $at | {key:.[0:$at],value:.[($at+1):]}) as $entry
+            ({}; .[$entry.key]=$entry.value)
+    '
+}
+
+# Resolve only literal workfiles in the admitted Git graph. In particular an
+# empty GOWORK must not let Go walk above the private source stage. The receipt
+# records portable graph-relative identity; the actual process gets the rebased
+# absolute path in this attempt's private copy.
+_act_strict_go_workfile_json() {
+    local tool="$1" sha="$2" selected="$3" stage_source="$4"
+    local checkout dependencies sources
+    checkout=$(act_get_local_path "$tool") || return 4
+    dependencies=$(_act_release_source_dependency_checkouts_json "$tool") || return 4
+    sources=$(jq -cn --arg path "$checkout" --arg sha "$sha" --argjson deps "$dependencies" \
+        '[{relative_path:"source",local_path:$path,git_sha:$sha}] + $deps') || return 4
+    python3 -I - "$selected" "$stage_source" "$sources" <<'PY'
+import hashlib
+import json
+import os
+import posixpath
+import re
+import subprocess
+import sys
+
+try:
+    selected, stage_source, encoded = sys.argv[1:]
+    sources = json.loads(encoded)
+    roots = {row['relative_path']: row for row in sources}
+    if len(roots) != len(sources) or 'source' not in roots:
+        raise ValueError('invalid admitted Go source graph')
+    if any(ord(character) < 32 for character in selected) or '\\' in selected:
+        raise ValueError('GOWORK must be a literal portable path inside an admitted source root')
+    if selected == 'off':
+        print(json.dumps(dict(gowork='off', path='', sha256='', git_sha='')))
+        raise SystemExit(0)
+    optional = selected == ''
+    if optional:
+        name, relative = 'source', 'go.work'
+    elif selected.startswith('/'):
+        matches = []
+        requested = posixpath.normpath(selected)
+        for name, row in roots.items():
+            prefix = posixpath.normpath(row['local_path']).rstrip('/') + '/'
+            if requested.startswith(prefix):
+                matches.append((len(prefix), name, requested[len(prefix):]))
+        if not matches:
+            raise ValueError('GOWORK is outside the admitted main and sibling checkouts')
+        _, name, relative = max(matches)
+    else:
+        requested = posixpath.normpath(posixpath.join('source', selected))
+        name, separator, relative = requested.partition('/')
+        if not separator or name not in roots or relative in ('', '.', '..'):
+            raise ValueError('GOWORK escapes the admitted source graph')
+    row = roots[name]
+    revision = row['git_sha']
+    if not re.fullmatch(r'[0-9a-f]{40}', revision) or not relative or relative.startswith('/'):
+        raise ValueError('invalid pinned Go workfile identity')
+    # Query the admitted checkout itself, never GIT_DIR/GIT_WORK_TREE or
+    # object/config overrides inherited from the coordinator's shell.
+    environment = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+    environment.update(GIT_NO_REPLACE_OBJECTS='1', GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
+    command = ['git', '--literal-pathspecs', '-C', row['local_path']]
+    entry = subprocess.check_output(command + ['ls-tree', '-z', revision, '--', relative], env=environment)
+    if not entry and optional:
+        print(json.dumps(dict(gowork='off', path='', sha256='', git_sha='')))
+        raise SystemExit(0)
+    records = entry.rstrip(b'\0').split(b'\0')
+    if len(records) != 1 or b'\t' not in records[0]:
+        raise ValueError('GOWORK must select one committed regular file')
+    metadata, filename = records[0].split(b'\t', 1)
+    mode, kind, oid = metadata.split(b' ')
+    if mode not in (b'100644', b'100755') or kind != b'blob' or filename.decode('utf-8') != relative:
+        raise ValueError('GOWORK must select a committed regular file without linked ancestors')
+    contents = subprocess.check_output(command + ['cat-file', 'blob', oid.decode('ascii')], env=environment)
+    stage_source = stage_source.replace('\\', '/').rstrip('/')
+    if not stage_source.endswith('/source') or not (stage_source.startswith('/') or re.match(r'^[A-Za-z]:/', stage_source)):
+        raise ValueError('invalid private Go source stage')
+    graph_path = name + '/' + relative
+    actual = stage_source[:-len('source')] + graph_path
+    print(json.dumps(dict(gowork=actual, path=graph_path,
+                         sha256=hashlib.sha256(contents).hexdigest(), git_sha=revision)))
+except (KeyError, TypeError, ValueError, OSError, subprocess.CalledProcessError) as error:
+    print('[act] Strict Go workfile policy: ' + str(error), file=sys.stderr)
+    raise SystemExit(4)
+PY
+}
+
+_act_strict_go_build_env() {
+    local tool="$1" sha="$2" ref="$3" stage_source="$4" environment="$5"
+    local pair name value workfile selected='' result=$'GOENV=off\nGOFLAGS=\nGOTOOLCHAIN=local\nGO111MODULE=on'
+    local governed=$'\n'
+    governed+="$(_act_go_ambient_env_names)"$'\n'
+    [[ "$sha" =~ ^[0-9a-f]{40}$ && "$sha" != 0000000000000000000000000000000000000000 && -n "$ref" ]] || return 4
+    while IFS= read -r pair; do
+        [[ -n "$pair" ]] || continue
+        [[ "$pair" == *=* ]] || return 4
+        name="${pair%%=*}"; value="${pair#*=}"
+        if [[ "$name" != "${name^^}" && "$governed" == *$'\n'"${name^^}"$'\n'* ]]; then
+            _log_error "Strict Go compiler selectors must use their portable uppercase name: $name"
+            return 4
+        fi
+        case "$name" in
+            GOENV)
+                if [[ -n "$value" && "$value" != off ]]; then
+                    _log_error 'Strict Go builds require GOENV=off; put reviewed compiler settings in the DSR recipe'
+                    return 4
+                fi
+                continue ;;
+            GOWORK) selected="$value"; continue ;;
+            DSR_GO_ENV_POLICY|DSR_GO_WORKFILE|DSR_GO_WORKFILE_SHA256|DSR_GO_WORKFILE_GIT_SHA|\
+            DSR_RELEASE_GIT_SHA|DSR_RELEASE_GIT_REF) continue ;;
+        esac
+        result+=$'\n'"$pair"
+    done <<< "$environment"
+    workfile=$(_act_strict_go_workfile_json "$tool" "$sha" "$selected" "$stage_source") || return 4
+    result+=$'\n'"GOWORK=$(jq -r '.gowork' <<< "$workfile")"
+    result+=$'\n'"DSR_GO_ENV_POLICY=1"
+    result+=$'\n'"DSR_GO_WORKFILE=$(jq -r '.path' <<< "$workfile")"
+    result+=$'\n'"DSR_GO_WORKFILE_SHA256=$(jq -r '.sha256' <<< "$workfile")"
+    result+=$'\n'"DSR_GO_WORKFILE_GIT_SHA=$(jq -r '.git_sha' <<< "$workfile")"
+    result+=$'\n'"DSR_RELEASE_GIT_SHA=$sha"
+    result+=$'\n'"DSR_RELEASE_GIT_REF=$ref"
+    printf '%s\n' "$result"
+}
+
+# A policy marker alone is not evidence. Recompute the reviewed selectors and
+# pinned workfile identity before reusing successful native Go output or
+# admitting its retained release manifest. Failed readiness attempts have no
+# compiled output and do not need this receipt.
+_act_validate_strict_go_result() {
+    local tool="$1" result="$2" sha="$3" ref="$4" platform="$5"
+    local language environment expected actual workfile gowork stage_source
+    language=$(yq -r '.language // ""' "$ACT_REPOS_DIR/$tool.yaml") || return 4
+    [[ "$language" == go ]] || return 0
+    jq -e '(.status // "") | IN("success","ok","passed")' <<< "$result" >/dev/null || return 0
+    if ! actual=$(jq -ce --arg platform "$platform" '
+        select(.method=="native" and (.platform // .target)==$platform) |
+        .build_influence_env | select(type=="object" and all(.[];type=="string") and
+            .DSR_GO_ENV_POLICY=="1" and .GOENV=="off")' <<< "$result"); then
+        _log_error 'Strict native Go output lacks its compiler environment policy receipt; start a fresh release build'
+        return 4
+    fi
+    workfile=$(jq -er '.DSR_GO_WORKFILE | strings' <<< "$actual") || return 4
+    gowork=$(jq -er '.GOWORK | strings' <<< "$actual") || return 4
+    stage_source='/.dsr-go-receipt/source'
+    if [[ -n "$workfile" ]]; then
+        # Only the attempt's private prefix varies between otherwise identical
+        # executions; its workfile suffix must match the pinned graph identity.
+        if [[ "$gowork" != *"/$workfile" ]]; then
+            _log_error 'Strict Go workfile receipt does not match its staged compiler selection'
+            return 4
+        fi
+        stage_source="${gowork%"/$workfile"}/source"
+    elif [[ "$gowork" != off ]]; then
+        return 4
+    fi
+    environment=$(act_get_build_env "$tool" "$platform") || return 4
+    environment=$(_act_strict_go_build_env "$tool" "$sha" "$ref" "$stage_source" "$environment") || return 4
+    expected=$(_act_go_build_influence_json "$environment") || return 4
+    if [[ "$(jq -cS . <<< "$actual")" != "$(jq -cS . <<< "$expected")" ]]; then
+        _log_error 'Strict Go output no longer matches the reviewed compiler selectors or pinned workfile; start a fresh release build'
+        return 4
+    fi
 }
 
 _act_is_rust_build_influence_name() {
@@ -13593,6 +13791,12 @@ act_run_native_build() {
     # Where in-tree outputs of this build land (collection reads from here).
     local artifact_source_root="${output_stage_source:-$remote_path}"
 
+    if [[ "$language" == go ]] && $strict_native_build; then
+        build_env=$(_act_strict_go_build_env "$tool_name" "$release_git_sha" "$release_git_ref" \
+            "$artifact_source_root" "$build_env") || return 4
+        build_influence_env_json=$(_act_go_build_influence_json "$build_env") || return 4
+    fi
+
     if ! _act_is_windows_host "$host"; then
         local native_working_root="${nonstrict_source_root:-${output_stage_source:-$remote_path}}"
         native_writable_paths=$(_act_native_writable_paths_json "$remote_path" "$native_working_root" \
@@ -13666,12 +13870,17 @@ act_run_native_build() {
             )
         done
     elif [[ "$language" == go ]]; then
-        # act_get_build_env binds these to the requested platform. Clear the
-        # host's inherited selectors before exporting that effective pair on
-        # both Unix and Windows; persistent `go env -w` values lose to it too.
-        cargo_env_to_unset=(GOOS GOARCH)
-        if [[ "${platform##*/}" == armv7 ]]; then
-            cargo_env_to_unset+=(GOARM)
+        if $strict_native_build; then
+            local go_env_name
+            while IFS= read -r go_env_name; do
+                cargo_env_to_unset+=("$go_env_name")
+            done < <(_act_go_ambient_env_names)
+        else
+            # Ordinary builds still bind only the requested target pair.
+            cargo_env_to_unset=(GOOS GOARCH)
+            if [[ "${platform##*/}" == armv7 ]]; then
+                cargo_env_to_unset+=(GOARM)
+            fi
         fi
     fi
 
@@ -13836,7 +14045,17 @@ EOF
         while IFS= read -r env_pair; do
             [[ -z "$env_pair" ]] && continue
             # Quote the env_pair to handle values with spaces (e.g., FOO="bar baz")
-            env_exports+="export \"$env_pair\"; "
+            if [[ "$language" == go ]] && $strict_native_build &&
+               jq -e --arg name "${env_pair%%=*}" 'has($name)' \
+                   <<< "$build_influence_env_json" >/dev/null; then
+                # Policy receipts describe literal reviewed values. Shell
+                # expansion must not replace a flag or workfile after capture.
+                local go_pair_quoted
+                printf -v go_pair_quoted '%q' "$env_pair"
+                env_exports+="export $go_pair_quoted; "
+            else
+                env_exports+="export \"$env_pair\"; "
+            fi
         done <<< "$build_env"
         if [[ "$language" == "rust" ]]; then
             # A native target host must compile locally.  Explicitly bypass an
@@ -17195,13 +17414,26 @@ act_orchestrate_build() {
             fi
             # Inspect both authorities before admitting any resumed worker.
             # A valid embedded result cannot launder a differently purposed sidecar.
-            local resume_entry resume_receipt resume_result_path
+            local resume_entry resume_map_entry resume_key resume_method resume_platform
+            local resume_receipt resume_result_path resume_go_sha resume_go_ref
             if ! jq -e '.target_statuses | type == "object"' <<< "$resume_state" >/dev/null; then
                 _log_error "Resume target history is not a target-keyed map"
                 _act_release_orchestration_lock
                 return 4
             fi
-            while IFS= read -r resume_entry; do
+            if ! resume_go_sha=$(jq -r '.git_sha // ""' <<< "$resume_state") ||
+               ! resume_go_ref=$(jq -r '.git_ref // ""' <<< "$resume_state"); then
+                _act_release_orchestration_lock
+                return 4
+            fi
+            while IFS= read -r resume_map_entry; do
+                if ! resume_entry=$(jq -c '.value' <<< "$resume_map_entry") ||
+                   ! resume_key=$(jq -r '.key' <<< "$resume_map_entry") ||
+                   ! resume_method=$(jq -r --arg key "$resume_key" '.[] | select(.key==$key) | .method' <<< "$build_tasks_json") ||
+                   ! resume_platform=$(jq -r --arg key "$resume_key" '.[] | select(.key==$key) | .platform' <<< "$build_tasks_json"); then
+                    _act_release_orchestration_lock
+                    return 4
+                fi
                 if ! _act_prior_build_attempts "$resume_entry" >/dev/null; then
                     _log_error "Invalid source synchronization/readiness/build attempt counters in resume state"
                     _act_release_orchestration_lock
@@ -17214,6 +17446,12 @@ act_orchestrate_build() {
                     _act_release_orchestration_lock
                     return 4
                 fi
+                if $strict_release_contract && [[ "$resume_method" == native && -n "$resume_receipt" ]] &&
+                   ! _act_validate_strict_go_result "$tool_name" "$resume_receipt" \
+                       "$resume_go_sha" "$resume_go_ref" "$resume_platform"; then
+                    _act_release_orchestration_lock
+                    return 4
+                fi
                 resume_result_path=$(jq -r '.result_path // empty' <<< "$resume_entry")
                 if [[ -n "$resume_result_path" && -s "$resume_result_path" ]]; then
                     if ! resume_receipt=$(jq -ce '.' "$resume_result_path") || \
@@ -17222,8 +17460,14 @@ act_orchestrate_build() {
                         _act_release_orchestration_lock
                         return 4
                     fi
+                    if $strict_release_contract && [[ "$resume_method" == native ]] &&
+                       ! _act_validate_strict_go_result "$tool_name" "$resume_receipt" \
+                           "$resume_go_sha" "$resume_go_ref" "$resume_platform"; then
+                        _act_release_orchestration_lock
+                        return 4
+                    fi
                 fi
-            done < <(jq -c '.target_statuses[]?' <<< "$resume_state")
+            done < <(jq -c '.target_statuses | to_entries[]' <<< "$resume_state")
             resume_requested_targets_json=$(for target in $targets; do printf '%s\n' "$target"; done | \
                 jq -Rsc 'split("\n") | map(select(length > 0))')
             if ! jq -e --arg run_id "$requested_run_id" \
@@ -17695,6 +17939,11 @@ act_orchestrate_build() {
                 _act_refuse_retained_target "Resume native result lost its original source input binding: $target" "$prior_attempts"
                 break
             fi
+            if $strict_release_contract && [[ "$(jq -r .method <<< "$task_json")" == native && -n "$persisted_result" ]] &&
+               ! _act_validate_strict_go_result "$tool_name" "$persisted_result" "$git_sha" "$git_ref" "$target"; then
+                _act_refuse_retained_target "Resume native Go result lost its compiler policy binding: $target" "$prior_attempts"
+                break
+            fi
             if [[ -n "$persisted_result" ]] && \
                _act_matrix_result_matches "$persisted_result" "$target" "$selected_triple" && \
                [[ "$(jq -r '.task_key // ""' <<< "$persisted_result")" == "$task_key" ]] && \
@@ -17716,6 +17965,11 @@ act_orchestrate_build() {
                    ! _act_result_source_inputs_match "$recovered_result" "${source_sync_json:-null}" \
                        "$(jq -r .method <<< "$task_json")"; then
                     _act_refuse_retained_target "Resume native sidecar lost its original source input binding: $target" "$prior_attempts"
+                    break
+                fi
+                if $strict_release_contract && [[ "$(jq -r .method <<< "$task_json")" == native ]] &&
+                   ! _act_validate_strict_go_result "$tool_name" "$recovered_result" "$git_sha" "$git_ref" "$target"; then
+                    _act_refuse_retained_target "Resume native Go sidecar lost its compiler policy binding: $target" "$prior_attempts"
                     break
                 fi
                 if _act_matrix_result_matches "$recovered_result" "$target" "$selected_triple" &&
@@ -18356,7 +18610,11 @@ _act_validate_native_matrix_result_inventory() {
 # before any remote release mutation. These projected rows describe declared
 # receipts only; they do not manufacture new execution or artifact evidence.
 _act_validate_native_manifest_inventory() {
-    local tool="$1" manifest="$2" inventory artifacts native_rows row companion_names
+    local tool="$1" manifest="$2" require_go_policy="${3:-false}"
+    local inventory artifacts native_rows row companion_names language=''
+    if $require_go_policy; then
+        language=$(yq -r '.language // ""' "$ACT_REPOS_DIR/$tool.yaml") || return 4
+    fi
     companion_names=$(config_get_additional_artifacts_json "$tool") || return 4
     manifest=$(jq -c --argjson companions "$companion_names" '
         [$companions[][] | .name] as $names |
@@ -18372,6 +18630,10 @@ _act_validate_native_manifest_inventory() {
             <<< "$manifest") || return 4
         while IFS= read -r platform; do
             [[ -n "$platform" ]] || continue
+            if [[ "$language" == go ]] && ! act_platform_uses_act "$tool" "$platform"; then
+                _log_error 'Native Go release manifest lacks a compiler environment policy receipt; rebuild the release'
+                return 4
+            fi
             configured=$(config_get_target_triples_json "$tool" "$platform") || return 4
             [[ "$(jq 'length' <<< "$configured")" -gt 1 ]] || continue
             configured_targets=$(act_get_targets "$tool") || return 4
@@ -18420,6 +18682,12 @@ _act_validate_native_manifest_inventory() {
     while IFS= read -r row; do
         [[ -n "$row" ]] || continue
         _act_native_result_target_triple "$tool" "$row" >/dev/null || return 4
+        if [[ "$language" == go ]]; then
+            _act_validate_strict_go_result "$tool" "$row" \
+                "$(jq -r '.source.git_sha // ""' <<< "$manifest")" \
+                "$(jq -r '.source.git_ref // ""' <<< "$manifest")" \
+                "$(jq -r '.platform' <<< "$row")" || return 4
+        fi
     done <<< "$native_rows"
     artifacts=$(jq -c '.artifacts' <<< "$manifest") || return 4
     _act_validate_native_matrix_result_inventory "$tool" "$inventory" "$artifacts"
@@ -18430,8 +18698,36 @@ _act_validate_native_manifest_inventory() {
 # and exactly one corresponding primary. Singleton contracts retain their
 # existing manifest compatibility.
 _act_validate_contract_variant_inventory() {
-    local tool="$1" manifest="$2" contract="$3" identities
+    local tool="$1" manifest="$2" contract="$3" identities language
+    language=$(yq -r '.language // ""' "$ACT_REPOS_DIR/$tool.yaml") || return 4
     identities=$(_act_contract_target_rows "$tool" "$contract") || return 4
+    if [[ "$language" == go ]]; then
+        # A retained manifest cannot choose whether its configured native
+        # tasks need policy evidence by deleting or relabelling their rows.
+        # Workflow rows keep their existing ability to describe multiple
+        # payload platforms; only configured native tasks require one row.
+        local go_native_targets='[]' go_platform
+        while IFS= read -r go_platform; do
+            if ! act_platform_uses_act "$tool" "$go_platform"; then
+                go_native_targets=$(jq -c --arg target "$go_platform" '. + [$target]' \
+                    <<< "$go_native_targets") || return 4
+            fi
+        done < <(jq -r '[.[].platform] | unique | .[]' <<< "$identities")
+        if ! jq -e --argjson native "$go_native_targets" '
+            (.build_environments // []) as $rows |
+            ($rows | type=="array" and all(.[];type=="object")) and
+            all($native[]; . as $target |
+                [$rows[] | select(.target==$target)] as $matches |
+                ($matches|length)==1 and $matches[0].method=="native") and
+            all($rows[] | select(.method=="native");
+                .target as $target | ($native|index($target))!=null)
+        ' <<< "$manifest" >/dev/null; then
+            _log_error 'Strict Go release inventory requires exactly one native policy receipt for every configured native target'
+            return 4
+        fi
+        _act_validate_native_manifest_inventory "$tool" "$manifest" true
+        return $?
+    fi
     if ! jq -e 'any(.[]; .require_triple == true)' <<< "$identities" >/dev/null; then
         return 0
     fi
@@ -19514,6 +19810,8 @@ export -f act_list_tools act_build_matrix
 export -f act_get_build_cmd act_substitute_build_cmd_tokens act_get_build_env act_get_repo act_get_local_path
 export -f _act_materialized_source_path
 export -f act_get_build_env_value act_get_remote_artifact_path
+export -f _act_go_ambient_env_names _act_go_build_influence_json
+export -f _act_strict_go_workfile_json _act_strict_go_build_env _act_validate_strict_go_result
 export -f act_run_native_build act_orchestrate_build act_generate_manifest
 export -f _act_result_artifact_receipts _act_target_result_available
 export -f _act_build_orchestration_target _act_run_target_worker

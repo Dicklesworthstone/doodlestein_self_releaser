@@ -311,6 +311,21 @@ Unix staging reserves the sibling names `source` and `cargo-home`, and verifies
 that every controller checkout still matches its pin before staging. Source-root
 verification is separate from Go compiler and module-cache isolation.
 
+Strict Go workers also clear inherited compiler and source selectors before
+applying the reviewed repository recipe. They use `GOENV=off`, empty `GOFLAGS`,
+`GOTOOLCHAIN=local`, and `GO111MODULE=on` by default. A committed root `go.work`
+is selected inside the private stage; otherwise `GOWORK=off`. An explicit
+`GOWORK` must identify a committed regular file in the admitted main or sibling
+repository and is rebased into that stage. Configure intentional compiler flags
+and toolchain selection in the recipe's `env` entries.
+
+The manifest records those selectors and the selected workfile's commit and
+SHA-256 in `build_influence_env`. Strict resume and publication require complete,
+matching native Go receipts. Start a fresh release build for an older checkpoint
+without this policy evidence. Host caches and download policy remain available;
+these receipts describe source selection and configured compiler settings,
+not a complete compiler or dependency-cache attestation.
+
 Strict native Rust builds seed private Cargo homes with downloads selected
 by the committed `Cargo.lock`: checksum-matching crate archives, their index
 records, and Git databases containing locked commits. Ambient extracted registry

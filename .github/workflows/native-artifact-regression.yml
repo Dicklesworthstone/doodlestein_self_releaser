@@ -187,6 +187,18 @@ jobs:
           timeout 120 bash scripts/tests/test_native_source_sync.sh --strict-go-matrix-only \
             2>&1 | tee "$RUNNER_TEMP/collector-evidence/strict-go-matrix.log"
           test -z "$(git status --porcelain)"
+      - name: Bind strict Go compiler policy through builds, resume and publication
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          DSR_TEST_DISK_ROOT: /var/tmp
+        run: |
+          set -euo pipefail
+          DSR_TEST_GOCACHE=$(go env GOCACHE)
+          export DSR_TEST_GOCACHE
+          timeout 120 bash scripts/tests/test_native_source_sync.sh --strict-go-context-only \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/strict-go-context.log"
+          test -z "$(git status --porcelain)"
       - name: Verify Windows Go staging with genuine PowerShell and PE outputs
         if: runner.os == 'Linux'
         shell: bash
