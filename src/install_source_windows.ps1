@@ -188,6 +188,200 @@ function Get-DsrSourceTreeEvidence {
     return Get-DsrBytesHash ([Text.Encoding]::UTF8.GetBytes($rows.ToString()))
 }
 
+# Go workspace paths are relative to the file declaring them. Resolve them
+# within the fetched tree, including ordinary ../ siblings, without admitting
+# an ambient workspace, an absolute checkout path or a linked module root.
+function Resolve-DsrGoSourceModule {
+    param([string]$Source, [string]$Base, $Relative, [string[]]$Files)
+    if ($Relative -isnot [string] -or -not $Relative -or $Relative.Length -gt 1024) {
+        Stop-DsrInstall 'Invalid Go workspace module path' 4
+    }
+    $relativePath = $Relative.Replace('\', '/')
+    foreach ($part in $relativePath.Split('/')) {
+        if ($part -cin @('.', '..')) { continue }
+        if (-not (Test-DsrSourceRelativePath $part)) { Stop-DsrInstall 'Unsafe Go workspace module path' 4 }
+    }
+    $root = [IO.Path]::GetFullPath([IO.Path]::Combine($Base, $relativePath))
+    $path = [IO.Path]::GetRelativePath($Source, $root).Replace('\', '/')
+    if (-not (Test-DsrSourceRelativePath $path -Root)) {
+        Stop-DsrInstall 'Go workspace module escaped the pinned source checkout' 4
+    }
+    $root = Get-DsrPlainPath $root -Directory
+    $manifest = [IO.Path]::Combine($root, 'go.mod')
+    $manifestPath = [IO.Path]::GetRelativePath($Source, $manifest).Replace('\', '/')
+    if ($manifestPath -cnotin $Files) {
+        Stop-DsrInstall 'Go workspace modules require an exact committed go.mod' 4
+    }
+    $manifest = Get-DsrPlainPath $manifest -File
+    return @{ root = $root; path = $path; manifest = $manifest }
+}
+
+function Read-DsrGoSourceModule {
+    param($Location, $GoBase, [string]$Logs, [int]$Index)
+    $text = Invoke-DsrSourceCommand @GoBase -Arguments @('mod', 'edit', '-json', $Location.manifest) `
+        -Log ([IO.Path]::Combine($Logs, ('go-module-' + $Index))) -Capture
+    $document = ConvertFrom-DsrJson $text
+    if ($document -isnot [Collections.IDictionary] -or -not $document.Contains('Module') -or
+        $document.Module -isnot [Collections.IDictionary] -or -not $document.Module.Contains('Path') -or
+        $document.Module.Path -isnot [string] -or -not $document.Module.Path -or
+        $document.Module.Path -match '[\x00-\x20\x7f]') {
+        Stop-DsrInstall 'Go returned an invalid committed module identity' 4
+    }
+    $replacements = @()
+    if ($document.Contains('Replace') -and $null -ne $document.Replace) {
+        if ($document.Replace -isnot [array]) { Stop-DsrInstall 'Invalid Go module replacement inventory' 4 }
+        $replacements = @($document.Replace)
+    }
+    return @{ root = $Location.root; path = $Location.path; module_path = $document.Module.Path;
+        go_mod_sha256 = (Get-DsrFileEvidence $Location.manifest).sha256; replacements = $replacements }
+}
+
+function Get-DsrGoSourceReplacement {
+    param($Replacement)
+    if ($Replacement -isnot [Collections.IDictionary] -or
+        -not $Replacement.Contains('Old') -or -not $Replacement.Contains('New')) {
+        Stop-DsrInstall 'Invalid Go replacement declaration' 4
+    }
+    foreach ($selection in @($Replacement.Old, $Replacement.New)) {
+        if ($selection -isnot [Collections.IDictionary] -or -not $selection.Contains('Path') -or
+            $selection.Path -isnot [string] -or -not $selection.Path -or
+            ($selection.Contains('Version') -and $selection.Version -isnot [string])) {
+            Stop-DsrInstall 'Invalid Go replacement module identity' 4
+        }
+    }
+    $oldVersion = if ($Replacement.Old.Contains('Version')) { $Replacement.Old.Version } else { '' }
+    $newVersion = if ($Replacement.New.Contains('Version')) { $Replacement.New.Version } else { '' }
+    return @{ module_path = $Replacement.Old.Path; version = $oldVersion;
+        replacement = $Replacement.New.Path; replacement_version = $newVersion }
+}
+
+function Get-DsrGoWorkspaceVendor {
+    param([string]$Source, [string]$WorkspaceRoot, [string[]]$Files)
+    $vendor = Get-DsrPlainPath ([IO.Path]::Combine($WorkspaceRoot, 'vendor'))
+    if (-not [IO.Directory]::Exists($vendor)) { return $null }
+    $manifest = Get-DsrPlainPath ([IO.Path]::Combine($vendor, 'modules.txt'))
+    if (-not [IO.File]::Exists($manifest)) { return $null }
+    # Match Go's bounded first-line workspace marker. Legacy module vendor
+    # directories do not select vendor mode for a workspace.
+    $stream = Open-DsrReadFile $manifest
+    $bytes = [byte[]]::new(512)
+    $length = 0
+    try {
+        while ($length -lt $bytes.Length) {
+            $read = $stream.Read($bytes, $length, $bytes.Length - $length)
+            if ($read -eq 0) { break }
+            $length += $read
+        }
+    } finally { $stream.Dispose() }
+    $firstLine = [Text.Encoding]::UTF8.GetString($bytes, 0, $length).Split("`n")[0]
+    if (-not $firstLine.StartsWith('## ', [StringComparison]::Ordinal) -or
+        -not @($firstLine.Substring(3).Split(';') | Where-Object { $_.Trim() -ceq 'workspace' }).Count) { return $null }
+    $path = [IO.Path]::GetRelativePath($Source, $manifest).Replace('\', '/')
+    if ($path -cnotin $Files) { Stop-DsrInstall 'Go workspace vendor mode requires committed vendor/modules.txt' 4 }
+    return @{ path = $path; sha256 = (Get-DsrFileEvidence $manifest).sha256 }
+}
+
+function Get-DsrGoSourceContext {
+    param([string]$Source, [string]$BuildRoot, [string[]]$Files, $GoBase, [string]$Logs)
+    $cursor = $BuildRoot
+    $workspace = ''
+    $workspacePath = ''
+    while ($true) {
+        $candidate = Get-DsrPlainPath ([IO.Path]::Combine($cursor, 'go.work'))
+        if ([IO.File]::Exists($candidate) -or [IO.Directory]::Exists($candidate)) {
+            $workspacePath = [IO.Path]::GetRelativePath($Source, $candidate).Replace('\', '/')
+            if ($workspacePath -cnotin $Files) { Stop-DsrInstall 'Go workspace must be an exact committed file' 4 }
+            $workspace = Get-DsrPlainPath $candidate -File
+            break
+        }
+        if ($cursor -ceq $Source) { break }
+        $cursor = [IO.Path]::GetDirectoryName($cursor)
+        $relative = [IO.Path]::GetRelativePath($Source, $cursor).Replace('\', '/')
+        if (-not (Test-DsrSourceRelativePath $relative -Root)) {
+            Stop-DsrInstall 'Go workspace discovery escaped the pinned source checkout' 4
+        }
+    }
+    if (-not $workspace) {
+        $null = Get-DsrPlainPath ([IO.Path]::Combine($BuildRoot, 'go.mod')) -File
+        $vendor = Get-DsrPlainPath ([IO.Path]::Combine($BuildRoot, 'vendor'))
+        return @{ workspace = 'off'; module_mode = $(if ([IO.Directory]::Exists($vendor)) { 'vendor' } else { 'readonly' }); receipt = $null }
+    }
+
+    # These parse-only commands keep GOWORK=off, GOENV=off and a local
+    # toolchain. Go's own parser handles quoting and replacement syntax.
+    $text = Invoke-DsrSourceCommand @GoBase -Arguments @('work', 'edit', '-json', $workspace) `
+        -Log ([IO.Path]::Combine($Logs, 'go-workspace')) -Capture
+    $document = ConvertFrom-DsrJson $text
+    if ($document -isnot [Collections.IDictionary] -or -not $document.Contains('Use') -or
+        $document.Use -isnot [array] -or $document.Use.Count -eq 0) {
+        Stop-DsrInstall 'Go workspace must select committed main modules' 4
+    }
+    $workRules = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $selectedRules = [Collections.Generic.List[object]]::new()
+    if ($document.Contains('Replace') -and $null -ne $document.Replace) {
+        if ($document.Replace -isnot [array]) { Stop-DsrInstall 'Invalid Go workspace replacements' 4 }
+        foreach ($replacement in $document.Replace) {
+            $rule = Get-DsrGoSourceReplacement $replacement
+            $key = $rule.module_path + [char]0 + $rule.version
+            if ($workRules.ContainsKey($key)) { Stop-DsrInstall 'Duplicate Go workspace replacement' 4 }
+            $workRules.Add($key, $rule)
+            $selectedRules.Add(@{ rule = $rule; root = $cursor })
+        }
+    }
+    $modules = [Collections.Generic.SortedDictionary[string, object]]::new([StringComparer]::Ordinal)
+    $moduleNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $moduleIndex = 0
+    foreach ($use in $document.Use) {
+        if ($use -isnot [Collections.IDictionary] -or -not $use.Contains('DiskPath')) {
+            Stop-DsrInstall 'Invalid Go workspace use declaration' 4
+        }
+        $location = Resolve-DsrGoSourceModule $Source $cursor $use.DiskPath $Files
+        if ($modules.ContainsKey($location.path)) { Stop-DsrInstall 'Duplicate Go workspace module directory' 4 }
+        $module = Read-DsrGoSourceModule $location $GoBase $Logs $moduleIndex
+        $moduleIndex++
+        if (-not $moduleNames.Add($module.module_path)) { Stop-DsrInstall 'Duplicate Go workspace module identity' 4 }
+        $modules.Add($module.path, $module)
+        foreach ($replacement in $module.replacements) {
+            $rule = Get-DsrGoSourceReplacement $replacement
+            # Workspace rules own their matching selections. A wildcard
+            # workspace rule overrides every version-specific module rule.
+            if ($workRules.ContainsKey($rule.module_path + [char]0 + $rule.version) -or
+                $workRules.ContainsKey($rule.module_path + [char]0)) { continue }
+            $selectedRules.Add(@{ rule = $rule; root = $module.root })
+        }
+    }
+    $vendorManifest = Get-DsrGoWorkspaceVendor $Source $cursor $Files
+    $vendorMode = $null -ne $vendorManifest
+    $replacementModules = @{}
+    $localReplacements = [Collections.Generic.List[object]]::new()
+    foreach ($selection in $selectedRules) {
+        $rule = $selection.rule
+        # Explicit vendor mode consumes the committed vendor tree rather
+        # than local replacement originals, which need not be available.
+        # Every fetched file already passed the plain tracked-tree admission.
+        if ($vendorMode -or $rule.replacement_version) { continue }
+        $location = Resolve-DsrGoSourceModule $Source $selection.root $rule.replacement $Files
+        if ($modules.ContainsKey($location.path)) { $module = $modules[$location.path] }
+        elseif ($replacementModules.ContainsKey($location.path)) { $module = $replacementModules[$location.path] }
+        else {
+            $module = Read-DsrGoSourceModule $location $GoBase $Logs $moduleIndex
+            $moduleIndex++
+            $replacementModules[$location.path] = $module
+        }
+        # A replacement dependency's own replace directives do not apply in
+        # Go. Retain its manifest identity without adopting those directives.
+        $localReplacements.Add(@{ module_path = $rule.module_path; version = $rule.version;
+            path = $module.path; replacement_module_path = $module.module_path; go_mod_sha256 = $module.go_mod_sha256 })
+    }
+    $moduleReceipts = @($modules.Values | ForEach-Object {
+        @{ path = $_.path; module_path = $_.module_path; go_mod_sha256 = $_.go_mod_sha256 }
+    })
+    $receipt = @{ path = $workspacePath; sha256 = (Get-DsrFileEvidence $workspace).sha256;
+        modules = $moduleReceipts; local_replacements = @($localReplacements.ToArray()); vendor = $vendorMode }
+    if ($vendorMode) { $receipt.vendor_modules_sha256 = $vendorManifest.sha256 }
+    return @{ workspace = $workspace; module_mode = $(if ($vendorMode) { 'vendor' } else { 'readonly' }); receipt = $receipt }
+}
+
 function Build-DsrRustSourceOutputs {
     param($Policy, $Selection, [string]$Platform, [string]$Source, [string[]]$Files,
         [string]$BuildRoot, [string]$Output, [string]$Logs, [string]$Work, [int]$Timeout,
@@ -354,7 +548,6 @@ function Build-DsrSourceFamily {
     $primary = $Policy.binary_name
     if (-not $primary.EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase)) { $primary += '.exe' }
     if ($Policy.source.language -ceq 'go') {
-        $null = Get-DsrPlainPath ([IO.Path]::Combine($buildRoot, 'go.mod')) -File
         $entries = @()
         foreach ($name in $Selection.binaries) {
             $entry = ''
@@ -375,14 +568,15 @@ function Build-DsrSourceFamily {
         $environment.GOWORK = 'off'
         $environment.GOTOOLCHAIN = 'local'
         $environment.GOFLAGS = ''
+        $environment.GO111MODULE = 'on'
         $environment.GOOS = 'windows'
         $environment.GOARCH = $Platform.Substring('windows/'.Length)
         $goBase = @{ Executable = $compilerTool.Source; Directory = $buildRoot; Timeout = $Timeout; Environment = $environment }
         $compiler = (Invoke-DsrSourceCommand $compilerTool.Source @('version') $buildRoot ([IO.Path]::Combine($logs, 'compiler')) $Timeout $environment -Capture).Trim()
         if (-not $compiler -or $compiler.Length -gt 4096) { Stop-DsrInstall 'Invalid installed Go compiler identity' 6 }
-        $moduleMode = 'readonly'
-        $vendor = Get-DsrPlainPath ([IO.Path]::Combine($buildRoot, 'vendor'))
-        if ([IO.Directory]::Exists($vendor)) { $moduleMode = 'vendor' }
+        $goContext = Get-DsrGoSourceContext $source $buildRoot $files $goBase $logs
+        $environment.GOWORK = $goContext.workspace
+        $moduleMode = $goContext.module_mode
         for ($index = 0; $index -lt $entries.Count; $index++) {
             $goArguments = @('list', ('-mod=' + $moduleMode), '-f', '{{.Name}}', ('./' + $entries[$index]))
             $provider = (Invoke-DsrSourceCommand @goBase -Arguments $goArguments -Log ([IO.Path]::Combine($logs, ('package-' + $index))) -Capture).Trim()
@@ -399,6 +593,7 @@ function Build-DsrSourceFamily {
         }
         $compilerDetails = @{ compiler = $compiler; go_target = @{ os = 'windows'; arch = $environment.GOARCH };
             source_entry = $Policy.source.entry; source_entries = @($sourceEntries) }
+        if ($null -ne $goContext.receipt) { $compilerDetails.go_workspace = $goContext.receipt }
     } else {
         $compilerDetails = Build-DsrRustSourceOutputs $Policy $Selection $Platform $source $files $buildRoot $output $logs $Work $Timeout $compilerTool.Source $rustc.Source
     }

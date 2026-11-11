@@ -336,8 +336,12 @@ workspace_binaries: [app, helper]
 This selects `project/apps/primary` for `app.exe` and `project/cmd/helper` for
 `helper.exe`. Without an override, the primary uses `cmd/<name>` when present
 and otherwise the module root. Every companion requires its own `cmd/<name>`
-directory. The selected project must contain `go.mod`; source paths must be
-relative and Windows-safe. The installer rejects tracked symlinks, submodules,
+directory. The selected project must contain `go.mod` or belong to a committed
+workspace selected by the nearest `go.work` inside the fetched repository. A
+moduleless workspace root can select separate `cmd/<name>` command modules.
+The [committed Go workspace rules](#committed-go-workspaces) apply to both source
+engines, including local replacements, workspace vendoring and receipt fields.
+Source paths must be relative and Windows-safe. The installer rejects tracked symlinks, submodules,
 case aliases and file/directory collisions before checkout. It resolves every
 selected package and requires `package main` before the first build. Per-target
 workspace lists also apply to source builds, including ARM64-specific families.
@@ -480,7 +484,7 @@ or `GOFLAGS`.
 
 ### Committed Go workspaces
 
-Bash source installers also support tools whose commands depend on sibling
+Bash and native Windows source installers support tools whose commands depend on sibling
 modules through a committed `go.work`. Starting at `source_subdir`, the installer
 selects the nearest `go.work` within the fetched repository. A workspace outside
 that checkout, including the caller's `GOWORK`, cannot select source inputs.
@@ -542,6 +546,19 @@ The focused regression builds and executes a real offline Go executable family:
 ```bash
 bash scripts/tests/test_install_source.sh --go-workspaces-only
 ```
+
+The generated PowerShell installer has matching Go workspace coverage, including
+genuine Windows x64 and ARM64 PE compilation and the complete installation
+transaction:
+
+```bash
+bash scripts/tests/test_install_source_windows.sh --go-workspace-only
+```
+
+That portable caller fixture uses PowerShell, real Git and Go, and local
+transport. It does not claim native Windows filesystem, ACL or process testing.
+Pass `--workspace-baseline-project /path/to/earlier/checkout` to exercise the same
+committed sibling source through an earlier generated installer.
 
 It covers ancestor and nested workfiles, moduleless roots, local replacement
 precedence, self-contained workspace vendoring, Git line-ending conversion,

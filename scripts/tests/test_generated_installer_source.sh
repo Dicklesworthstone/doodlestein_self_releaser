@@ -477,7 +477,7 @@ jq -nc --arg version "$BOOT_GO_VERSION" --arg os "$os" --arg arch "$arch" \
     '[{version:$version,stable:true,files:[{os:$os,arch:$arch,kind:"archive",sha256:$sha,size:$size,
       filename:($version + "." + $os + "-" + $arch + ".tar.gz")}]}]' > "$BOOTSTRAP_METADATA"
 for command in bash env git curl gh jq tar gzip sha256sum shasum uname getconf ldd awk sed grep tr cut \
-    head tail wc sort uniq dirname basename readlink realpath mkdir chmod mktemp cat cp mv rm date \
+    head tail wc sort uniq dirname basename readlink realpath mkdir rmdir chmod mktemp cat cp mv rm date \
     ps sleep find stat touch ln install; do
     resolved=$(command -v "$command") || continue
     ln -s "$resolved" "$TEMP/no-go/$command" || exit 1

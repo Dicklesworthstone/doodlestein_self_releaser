@@ -33,6 +33,9 @@ arguments = argparse.ArgumentParser(description="Generated Windows Rust/Go sourc
 arguments.add_argument("project", type=Path)
 arguments.add_argument("--baseline-project", type=Path, help="Frozen checkout before Windows source installation")
 arguments.add_argument("--rust-baseline-project", type=Path, help="Frozen checkout before Windows Rust source installation")
+arguments.add_argument("--workspace-baseline-project", type=Path, help="Frozen checkout before committed Go workspace support")
+arguments.add_argument("--go-workspace-only", action="store_true", help="Run the generated Go workspace caller regression")
+arguments.add_argument("--go-only", action="store_true", help="Run Go source and signed-release controls without Rust compilation")
 options = arguments.parse_args()
 project = options.project.resolve()
 root = Path(tempfile.mkdtemp(prefix="dsr-windows-source-", dir=os.environ.get("TMPDIR"))).resolve()
@@ -184,8 +187,21 @@ if (Get-Command Invoke-DsrSourceGit -ErrorAction SilentlyContinue) {
     function Invoke-DsrSourceCommand {
         param([string]$Executable, [string[]]$Arguments, [string]$Directory, [string]$Log,
             [int]$Timeout, $Environment = @{}, [int]$FailureCode = 6, [switch]$Capture)
-        [IO.File]::AppendAllText($script:Fixture.commands, ((@{ executable = $Executable; arguments = @($Arguments) } | ConvertTo-Json -Compress) + "`n"))
+        [IO.File]::AppendAllText($script:Fixture.commands, ((@{ executable = $Executable; arguments = @($Arguments);
+            go_environment = @{ GOWORK = $Environment['GOWORK']; GOENV = $Environment['GOENV'];
+                GOFLAGS = $Environment['GOFLAGS']; GO111MODULE = $Environment['GO111MODULE'];
+                GOTOOLCHAIN = $Environment['GOTOOLCHAIN'] } } | ConvertTo-Json -Compress) + "`n"))
         $result = & $script:RealSourceCommand @PSBoundParameters
+        if ($script:Fixture.Contains('inject_untracked_workspace') -and $script:Fixture.inject_untracked_workspace -and
+            'checkout' -cin $Arguments) {
+            [IO.File]::WriteAllText([IO.Path]::Combine($Directory, 'go.work'), "go 1.22`nuse ./project`n")
+        }
+        if ($script:Fixture.Contains('inject_untracked_vendor') -and $script:Fixture.inject_untracked_vendor -and
+            'checkout' -cin $Arguments) {
+            $vendor = [IO.Path]::Combine($Directory, 'vendor')
+            $null = [IO.Directory]::CreateDirectory($vendor)
+            [IO.File]::WriteAllText([IO.Path]::Combine($vendor, 'modules.txt'), "## workspace`n")
+        }
         if ($script:Fixture.Contains('mutate_source') -and $script:Fixture.mutate_source -and
             -not $script:MutatedSource -and $Arguments[0] -ceq 'build') {
             $member = if ($script:Fixture.Contains('mutate_source_member')) { $script:Fixture.mutate_source_member } else { 'apps/primary/main.go' }
@@ -270,6 +286,277 @@ def calls(fixture):
 def no_http(fixture):
     path = Path(fixture["requests"])
     return not path.exists() or not path.read_bytes()
+
+
+def test_go_workspaces():
+    workspace_upstream = root / "workspace-upstream"
+    workspace_upstream.mkdir()
+    required(["git", "init", "--quiet", "--initial-branch=main", workspace_upstream], "workspace-git-init")
+    required(["git", "-C", workspace_upstream, "config", "user.email", "fixture@example.invalid"], "workspace-git-email")
+    required(["git", "-C", workspace_upstream, "config", "user.name", "DSR Go Workspace Fixture"], "workspace-git-name")
+    project_mod = "module example.invalid/workspace-app\n\ngo 1.22\nrequire example.invalid/workspace-shared v0.0.0\n"
+    shared_mod = "module example.invalid/workspace-shared\n\ngo 1.22\n"
+    main_source = 'package main\nimport ("fmt"; "example.invalid/workspace-shared")\nfunc main() { fmt.Println(shared.Value()) }\n'
+    workspace_files = {
+        "go.work": "go 1.22\nuse (\n ./project\n ./shared\n)\n",
+        "project/go.mod": project_mod,
+        "project/apps/primary/main.go": main_source,
+        "project/cmd/helper/main.go": main_source,
+        "project/cmd/arm-helper/main.go": main_source,
+        "shared/go.mod": shared_mod,
+        "shared/value.go": 'package shared\nfunc Value() string { return "pinned-workspace-shared" }\n',
+    }
+
+    def write_files(changes):
+        for name, value in changes.items():
+            path = workspace_upstream / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(value)
+
+    def commit(label):
+        required(["git", "-C", workspace_upstream, "add", "."], label + "-add")
+        required(["git", "-C", workspace_upstream, "commit", "--quiet", "-m", label], label + "-commit")
+        return required(["git", "-C", workspace_upstream, "rev-parse", "HEAD"], label + "-pin")
+
+    def workspace_invoke(label, *, selected_runtime, reference="HEAD", parameters=None, **changes):
+        params = {"SourceRef": reference}
+        params.update(parameters or {})
+        selected_env = {"GOPROXY": "off", "GOSUMDB": "off"}
+        selected_env.update(changes.pop("extra", {}))
+        return invoke(label, selected_runtime=selected_runtime, parameters=params, extra=selected_env,
+                      repository_url=workspace_upstream.as_uri(), **changes)
+
+    write_files(workspace_files)
+    workspace_commit = commit("workspace-pinned-sibling")
+    config("workspace-source", local_path=str(workspace_upstream))
+    generated_workspace, workspace_runtime, workspace_policy = generate("workspace-source", "workspace-generate")
+    check("public generator embeds unchanged Go source selectors for committed workspace layouts",
+          generated_workspace.returncode == 0 and workspace_policy["source"] == policy["source"])
+    if generated_workspace.returncode:
+        return
+    if options.workspace_baseline_project:
+        old_generated, old_runtime, old_policy = generate("workspace-source", "workspace-baseline-generate",
+            checkout=options.workspace_baseline_project.resolve(), destination=root / "workspace-baseline-generated")
+        old, _, old_fixture = workspace_invoke("workspace-baseline", selected_runtime=old_runtime,
+                                               reference=workspace_commit)
+        check("frozen baseline cannot resolve a real offline sibling through its committed Go workspace",
+              old_generated.returncode == 0 and old_policy == workspace_policy and old.returncode == 6 and
+              not Path(old_fixture["parameters"]["Prefix"]).exists() and no_http(old_fixture))
+
+    ambient_work = root / "ambient.go.work"
+    ambient_work.write_text("go 1.22\nuse ./outside-ambient-module\n")
+    ambient_env = root / "ambient-go-env"
+    ambient_env.write_text("GOFLAGS=-invalid-ambient-go-flag\n")
+    installed, result, fixture = workspace_invoke("workspace-subdir", selected_runtime=workspace_runtime,
+        reference=workspace_commit, extra={"GOWORK": str(ambient_work), "GOENV": str(ambient_env),
+            "GOFLAGS": "-invalid-ambient-go-flag", "GO111MODULE": "off", "GOTOOLCHAIN": "go0.0.0+auto"})
+    check("a configured subdirectory compiles its real x64 family using the pinned ancestor workspace",
+          installed.returncode == 0 and result.get("source", {}).get("source_commit") == workspace_commit,
+          installed.stderr.decode(errors="replace"))
+    if installed.returncode:
+        return
+    workspace_receipt = result["source"].get("go_workspace", {})
+    check("receipt binds the exact committed workspace and both Go module manifests without temporary paths",
+          workspace_receipt.get("path") == "go.work" and workspace_receipt.get("sha256") == digest(workspace_upstream / "go.work") and
+          workspace_receipt.get("modules") == [
+              {"path": "project", "module_path": "example.invalid/workspace-app", "go_mod_sha256": digest(workspace_upstream / "project/go.mod")},
+              {"path": "shared", "module_path": "example.invalid/workspace-shared", "go_mod_sha256": digest(workspace_upstream / "shared/go.mod")}] and
+          workspace_receipt.get("local_replacements") == [] and workspace_receipt.get("vendor") is False and
+          str(root) not in json.dumps(workspace_receipt))
+    compiler_calls = [row for row in calls(fixture) if row["arguments"][0] in ("work", "mod", "list", "build")]
+    check("actual Go commands ignore ambient workspace, flags, module mode and automatic toolchain selectors",
+          bool(compiler_calls) and all(row["go_environment"]["GOENV"] == "off" and
+              row["go_environment"]["GOFLAGS"] == "" and row["go_environment"]["GO111MODULE"] == "on" and
+              row["go_environment"]["GOTOOLCHAIN"] == "local" and
+              (row["go_environment"]["GOWORK"] == "off" if row["arguments"][0] in ("work", "mod") else
+               row["go_environment"]["GOWORK"].endswith("/source/go.work")) for row in compiler_calls))
+    check("workspace installs real dependency-bearing Windows executables and rebinds each byte receipt",
+          {row["name"] for row in result["binaries"]} == {"app.exe", "helper.exe"} and all(
+              machine(Path(fixture["parameters"]["Prefix"]) / row["name"]) == 0x8664 and
+              digest(Path(fixture["parameters"]["Prefix"]) / row["name"]) == row["sha256"] and
+              b"pinned-workspace-shared" in (Path(fixture["parameters"]["Prefix"]) / row["name"]).read_bytes()
+              for row in result["binaries"]) and no_http(fixture))
+    arm, arm_result, arm_fixture = workspace_invoke("workspace-arm64", selected_runtime=workspace_runtime,
+        reference=workspace_commit, platform="windows/arm64")
+    check("the same committed workspace compiles the actual ARM64-specific family",
+          arm.returncode == 0 and {row["name"] for row in arm_result.get("binaries", [])} == {"app.exe", "arm-helper.exe"} and
+          all(machine(Path(arm_fixture["parameters"]["Prefix"]) / row["name"]) == 0xAA64 for row in arm_result.get("binaries", [])),
+          arm.stderr.decode(errors="replace"))
+
+    write_files({"go.work": "go 1.22\nuse ./unused-missing-module\n",
+                 "project/go.work": "go 1.22\nuse (\n .\n ../shared\n)\n"})
+    nearest_commit = commit("workspace-nearest-with-parent-sibling")
+    nearest, nearest_result, _ = workspace_invoke("workspace-nearest", selected_runtime=workspace_runtime,
+                                                 reference=nearest_commit)
+    check("nearest committed workspace wins and its parent-relative sibling stays inside the source pin",
+          nearest.returncode == 0 and nearest_result.get("source", {}).get("go_workspace", {}).get("path") == "project/go.work",
+          nearest.stderr.decode(errors="replace"))
+
+    write_files({"project/go.work": "go 1.22\nuse .\n",
+                 "project/go.mod": project_mod + "replace example.invalid/workspace-shared => ../shared\n",
+                 "shared/go.mod": shared_mod + "replace example.invalid/unused => ../../outside-ignored-replacement\n"})
+    replace_commit = commit("workspace-module-replacement")
+    replaced, replaced_result, _ = workspace_invoke("workspace-module-replace", selected_runtime=workspace_runtime,
+                                                   reference=replace_commit)
+    expected_replacement = [{"module_path": "example.invalid/workspace-shared", "version": "", "path": "shared",
+        "replacement_module_path": "example.invalid/workspace-shared", "go_mod_sha256": digest(workspace_upstream / "shared/go.mod")}]
+    check("main-module local replacements are confined and retained while dependency replace directives remain inactive",
+          replaced.returncode == 0 and replaced_result.get("source", {}).get("go_workspace", {}).get("local_replacements") == expected_replacement,
+          replaced.stderr.decode(errors="replace"))
+    write_files({"project/go.mod": project_mod + "replace example.invalid/workspace-shared v0.0.0 => ../../outside-shadowed-replacement\n",
+                 "project/go.work": "go 1.22\nuse .\nreplace example.invalid/workspace-shared => ../shared\n"})
+    override_commit = commit("workspace-overrides-module-replacement")
+    overridden, override_result, _ = workspace_invoke("workspace-override", selected_runtime=workspace_runtime,
+                                                      reference=override_commit)
+    check("a committed workspace override supersedes an otherwise external main-module replacement",
+          overridden.returncode == 0 and override_result.get("source", {}).get("go_workspace", {}).get("local_replacements") == expected_replacement,
+          overridden.stderr.decode(errors="replace"))
+
+    write_files({"go.work": "go 1.22\nuse (\n ./cmd/app\n ./cmd/helper\n ./shared\n)\n",
+                 "cmd/app/go.mod": project_mod.replace("workspace-app", "workspace-root-app"),
+                 "cmd/app/main.go": main_source,
+                 "cmd/helper/go.mod": project_mod.replace("workspace-app", "workspace-root-helper"),
+                 "cmd/helper/main.go": main_source,
+                 "shared/go.mod": shared_mod})
+    root_commit = commit("workspace-moduleless-root")
+    config("workspace-root", local_path=str(workspace_upstream), source_subdir=".", source_entry="",
+           targets=["windows/amd64"], workspace_binaries_by_target={})
+    root_generated, root_runtime, _ = generate("workspace-root", "workspace-root-generate")
+    moduleless, moduleless_result, moduleless_fixture = workspace_invoke("workspace-root", selected_runtime=root_runtime,
+                                                                       reference=root_commit)
+    check("a moduleless workspace root resolves and compiles a family from separate main modules",
+          root_generated.returncode == 0 and moduleless.returncode == 0 and not (workspace_upstream / "go.mod").exists() and
+          [row["path"] for row in moduleless_result.get("source", {}).get("go_workspace", {}).get("modules", [])] ==
+          ["cmd/app", "cmd/helper", "shared"], moduleless.stderr.decode(errors="replace"))
+    if moduleless.returncode:
+        return
+    root_prefix = Path(moduleless_fixture["parameters"]["Prefix"])
+    original_family = {name: digest(root_prefix / name) for name in ("app.exe", "helper.exe")}
+    for label, member in (("workspace-workfile-drift", "go.work"), ("workspace-manifest-drift", "shared/go.mod")):
+        drift, drift_result, _ = workspace_invoke(label, selected_runtime=root_runtime, reference=root_commit,
+            parameters={"Prefix": str(root_prefix)}, mutate_source=True, mutate_source_member=member)
+        check(label + " after actual compilation preserves the complete previous family",
+              drift.returncode == 7 and "changed the pinned tracked inputs" in drift_result.get("error", "") and
+              all(digest(root_prefix / name) == value for name, value in original_family.items()), drift.stderr.decode(errors="replace"))
+
+    write_files({"go.work": "go 1.22\nuse (\n ./cmd/app\n ./cmd/helper\n)\nreplace example.invalid/workspace-shared => ./shared\n"})
+    required(["go", "work", "vendor"], "workspace-vendor-command", cwd=workspace_upstream,
+             extra={"GOWORK": str(workspace_upstream / "go.work"), "GOFLAGS": "", "GOENV": "off", "GO111MODULE": "on", "GOPROXY": "off"})
+    vendor_commit = commit("workspace-committed-vendor")
+    vendored, vendor_result, vendor_fixture = workspace_invoke("workspace-vendor", selected_runtime=root_runtime,
+                                                              reference=vendor_commit)
+    check("committed workspace-root vendor data supports the real complete offline family",
+          vendored.returncode == 0 and vendor_result.get("source", {}).get("go_workspace", {}).get("vendor") is True and
+          vendor_result["source"]["go_workspace"].get("vendor_modules_sha256") == digest(workspace_upstream / "vendor/modules.txt") and
+          vendor_result["source"]["go_workspace"].get("local_replacements") == [] and
+          all("-mod=vendor" in row["arguments"] for row in calls(vendor_fixture) if row["arguments"][0] in ("list", "build")),
+          vendored.stderr.decode(errors="replace"))
+    original_vendor_manifest = (workspace_upstream / "vendor/modules.txt").read_text()
+    write_files({"vendor/modules.txt": original_vendor_manifest.replace("v0.0.0", "v9.0.0")})
+    inconsistent_commit = commit("workspace-inconsistent-vendor")
+    inconsistent, _, inconsistent_fixture = workspace_invoke("workspace-inconsistent-vendor", selected_runtime=root_runtime,
+                                                             reference=inconsistent_commit)
+    check("an inconsistent marked workspace vendor inventory fails actual Go admission before any compiler build",
+          inconsistent.returncode != 0 and not any(row["arguments"][0] == "build" for row in calls(inconsistent_fixture)) and
+          not Path(inconsistent_fixture["parameters"]["Prefix"]).exists())
+    required(["git", "-C", workspace_upstream, "update-index", "--force-remove", "vendor/modules.txt"], "workspace-vendor-untrack")
+    required(["git", "-C", workspace_upstream, "commit", "--quiet", "-m", "Workspace vendor missing manifest"], "workspace-vendor-untrack-commit")
+    incomplete, incomplete_result, incomplete_fixture = workspace_invoke("workspace-vendor-incomplete", selected_runtime=root_runtime)
+    check("a vendor directory without workspace metadata retains actual readonly workspace resolution",
+          incomplete.returncode == 0 and incomplete_result.get("source", {}).get("go_workspace", {}).get("vendor") is False and
+          all("-mod=readonly" in row["arguments"] for row in calls(incomplete_fixture) if row["arguments"][0] in ("list", "build")),
+          incomplete.stderr.decode(errors="replace"))
+    write_files({"vendor/modules.txt": "\n".join(original_vendor_manifest.splitlines()[1:]) + "\n"})
+    legacy_vendor_commit = commit("workspace-legacy-module-vendor")
+    legacy, legacy_result, legacy_fixture = workspace_invoke("workspace-legacy-vendor", selected_runtime=root_runtime,
+                                                            reference=legacy_vendor_commit)
+    check("legacy single-module vendor metadata cannot redirect a workspace away from its committed modules",
+          legacy.returncode == 0 and legacy_result.get("source", {}).get("go_workspace", {}).get("vendor") is False and
+          all("-mod=readonly" in row["arguments"] for row in calls(legacy_fixture) if row["arguments"][0] in ("list", "build")),
+          legacy.stderr.decode(errors="replace"))
+
+    outside_original = root / "workspace-vendor-original"
+    outside_original.mkdir()
+    (outside_original / "go.mod").write_text(shared_mod)
+    (outside_original / "value.go").write_text(workspace_files["shared/value.go"])
+    write_files({"go.work": "go 1.22\nuse (\n ./cmd/app\n ./cmd/helper\n)\nreplace example.invalid/workspace-shared => ../workspace-vendor-original\n"})
+    required(["go", "work", "vendor"], "workspace-external-vendor-command", cwd=workspace_upstream,
+             extra={"GOWORK": str(workspace_upstream / "go.work"), "GOFLAGS": "", "GOENV": "off", "GO111MODULE": "on", "GOPROXY": "off"})
+    external_vendor_commit = commit("workspace-self-contained-vendor")
+    external_vendor, external_result, external_fixture = workspace_invoke("workspace-external-vendor", selected_runtime=root_runtime,
+                                                                         reference=external_vendor_commit)
+    check("self-contained committed vendor builds offline when its replacement original is absent from the fetched checkout",
+          external_vendor.returncode == 0 and external_result.get("source", {}).get("go_workspace", {}).get("vendor") is True and
+          external_result["source"]["go_workspace"].get("local_replacements") == [] and
+          external_result["source"]["go_workspace"].get("vendor_modules_sha256") == digest(workspace_upstream / "vendor/modules.txt") and
+          all("-mod=vendor" in row["arguments"] for row in calls(external_fixture) if row["arguments"][0] in ("list", "build")),
+          external_vendor.stderr.decode(errors="replace"))
+    vendor_drift, vendor_drift_result, _ = workspace_invoke("workspace-vendor-drift", selected_runtime=root_runtime,
+        reference=external_vendor_commit, parameters={"Prefix": str(root_prefix)}, mutate_source=True,
+        mutate_source_member="vendor/example.invalid/workspace-shared/value.go")
+    check("changes to the actually compiled committed vendor bytes prevent installation and preserve the old family",
+          vendor_drift.returncode == 7 and "changed the pinned tracked inputs" in vendor_drift_result.get("error", "") and
+          all(digest(root_prefix / name) == value for name, value in original_family.items()), vendor_drift.stderr.decode(errors="replace"))
+    untracked_vendor, _, untracked_vendor_fixture = workspace_invoke("workspace-untracked-vendor", selected_runtime=root_runtime,
+        reference=root_commit, inject_untracked_vendor=True)
+    check("an injected untracked workspace vendor manifest cannot authorize vendored source",
+          untracked_vendor.returncode == 4 and not any(row["arguments"][0] == "build" for row in calls(untracked_vendor_fixture)) and
+          not Path(untracked_vendor_fixture["parameters"]["Prefix"]).exists())
+    # The following path guards exercise readonly selection, independently of
+    # Go's earlier consistency rejection for stale marked vendor inventories.
+    write_files({"vendor/modules.txt": "# Legacy module vendor fixture\n"})
+
+    for label, workfile in (
+        ("workspace-outside-use", "go 1.22\nuse (\n ./cmd/app\n ../outside\n)\n"),
+        ("workspace-absolute-use", "go 1.22\nuse /outside-absolute-module\n"),
+        ("workspace-case-mismatch", "go 1.22\nuse ./cmd/App\n"),
+        ("workspace-missing-module", "go 1.22\nuse ./missing\n"),
+        ("workspace-external-replacement", "go 1.22\nuse ./cmd/app\nreplace example.invalid/workspace-shared => ../outside\n"),
+        ("workspace-malformed", "go 1.22\nuse (\n"),
+    ):
+        write_files({"go.work": workfile})
+        refused_commit = commit(label)
+        refused, _, refused_fixture = workspace_invoke(label, selected_runtime=root_runtime, reference=refused_commit)
+        check(label + " refuses before compiling or installing any member",
+              refused.returncode != 0 and not any(row["arguments"][0] == "build" for row in calls(refused_fixture)) and
+              not Path(refused_fixture["parameters"]["Prefix"]).exists() and no_http(refused_fixture),
+              refused.stderr.decode(errors="replace"))
+
+    write_files({"go.work": "go 1.22\nuse ./linked\n"})
+    required(["git", "-C", workspace_upstream, "add", "."], "workspace-linked-add")
+    # Put an actual link in the Git tree without requiring Windows symlink
+    # privileges merely to construct the negative source fixture.
+    link_contents = root / "workspace-link-target"
+    link_contents.write_text("shared")
+    link_blob = required(["git", "-C", workspace_upstream, "hash-object", "-w", link_contents], "workspace-linked-blob")
+    required(["git", "-C", workspace_upstream, "update-index", "--add", "--cacheinfo", f"120000,{link_blob},linked"], "workspace-linked-index")
+    required(["git", "-C", workspace_upstream, "commit", "--quiet", "-m", "Workspace linked module"], "workspace-linked-commit")
+    link_commit = required(["git", "-C", workspace_upstream, "rev-parse", "HEAD"], "workspace-linked-pin")
+    linked, _, linked_fixture = workspace_invoke("workspace-linked-module", selected_runtime=root_runtime, reference=link_commit)
+    check("a tracked workspace module symlink cannot reach a compiler or installation",
+          linked.returncode == 4 and not any(row["arguments"][0] == "build" for row in calls(linked_fixture)) and
+          not Path(linked_fixture["parameters"]["Prefix"]).exists())
+    required(["git", "-C", workspace_upstream, "update-index", "--force-remove", "linked"], "workspace-unlink-index")
+    ordinary_blob = required(["git", "-C", workspace_upstream, "hash-object", "-w", workspace_upstream / "shared/value.go"], "workspace-case-blob")
+    for spelling in ("shared/Case.go", "shared/case.go"):
+        required(["git", "-C", workspace_upstream, "update-index", "--add", "--cacheinfo", f"100644,{ordinary_blob},{spelling}"],
+                 "workspace-case-" + spelling.rsplit("/", 1)[1])
+    required(["git", "-C", workspace_upstream, "commit", "--quiet", "-m", "Workspace case-colliding files"], "workspace-case-commit")
+    collision_commit = required(["git", "-C", workspace_upstream, "rev-parse", "HEAD"], "workspace-case-pin")
+    collision, _, collision_fixture = workspace_invoke("workspace-case-collision", selected_runtime=root_runtime, reference=collision_commit)
+    check("a case-colliding committed workspace tree is refused before any compiler or installation",
+          collision.returncode == 4 and not any(row["arguments"][0] == "build" for row in calls(collision_fixture)) and
+          not Path(collision_fixture["parameters"]["Prefix"]).exists())
+    untracked, _, untracked_fixture = invoke("workspace-untracked-file", inject_untracked_workspace=True)
+    check("an injected untracked workspace is refused instead of becoming implicit source authority",
+          untracked.returncode == 4 and not any(row["arguments"][0] == "build" for row in calls(untracked_fixture)) and
+          not Path(untracked_fixture["parameters"]["Prefix"]).exists())
+
+
+test_go_workspaces()
+if options.go_workspace_only:
+    print(f"Windows Go workspace source tests: {passed} passed, {failed} failed", flush=True)
+    raise SystemExit(1 if failed else 0)
 
 
 if options.baseline_project:
@@ -433,6 +720,10 @@ config(source_subdir="../escape")
 bad_config, _, _ = generate("source-demo", "generate-invalid-source")
 check("invalid Go source configuration is rejected without replacing an already published installer", bad_config.returncode != 0 and
       runtime.read_bytes() == published)
+
+if options.go_only:
+    print(f"Windows Go source and release tests: {passed} passed, {failed} failed", flush=True)
+    raise SystemExit(1 if failed else 0)
 
 # A real Cargo workspace with a companion outside the default package is the
 # missing Windows caller flow. No compiler, metadata or PE output is mocked.
