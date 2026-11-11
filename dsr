@@ -2277,7 +2277,7 @@ _watch_iteration() {
     log_info "Running throttle check..."
 
     # Run dsr check over every configured repo's release workflow.
-    local check_output check_exit
+    local check_output check_exit iteration_exit=0
     if check_output=$("$0" --json check 2>/dev/null); then
         check_exit=0
         _WATCH_CURRENT_BACKOFF=0  # Reset backoff on success
@@ -2294,13 +2294,19 @@ _watch_iteration() {
                     _WATCH_CURRENT_BACKOFF=$_WATCH_BACKOFF_MAX
             fi
             log_warn "API error, backing off for ${_WATCH_CURRENT_BACKOFF}s"
-            return 1
-        fi
-        if [[ $check_exit -ne 1 ]]; then
+            iteration_exit=1
+            # An unreadable repository must not strand independent retained
+            # releases. Discard the failed poll's entire inventory: only
+            # previously saved candidates may proceed, after a fresh lookup
+            # of their exact original upstream run below. Keep the failed
+            # result and backoff even when one such recovery can start.
+            check_output='{"details":{"throttled":[]}}'
+        elif [[ $check_exit -ne 1 ]]; then
             log_error "Throttle check failed (exit $check_exit); run 'dsr check' for details"
             return 1
+        else
+            _WATCH_CURRENT_BACKOFF=0
         fi
-        _WATCH_CURRENT_BACKOFF=0
     fi
 
     # Throttled runs: .details.throttled[] (schemas/check-details.json).
@@ -2324,8 +2330,10 @@ _watch_iteration() {
     fi
 
     if [[ -z "$throttled_runs" ]]; then
-        log_ok "No throttled runs detected"
-        return 0
+        if [[ $iteration_exit -eq 0 ]]; then
+            log_ok "No throttled runs detected"
+        fi
+        return "$iteration_exit"
     fi
 
     # Keep an older deferred release ahead of newly observed work. Preserve
@@ -2479,7 +2487,7 @@ _watch_iteration() {
         fi
     fi
 
-    return 0
+    return "$iteration_exit"
 }
 
 cmd_watch() {

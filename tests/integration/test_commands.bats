@@ -611,7 +611,7 @@ case "$1" in
             cat "$DSR_WATCH_FIXTURE_CONFIG_AFTER_CHECK" > "$DSR_CONFIG_DIR/repos.d/ntm.yaml" || exit 98
         fi
         cat "$TEST_TMPDIR/watch-check.json"
-        exit 1
+        exit "${DSR_WATCH_FIXTURE_CHECK_STATUS:-1}"
         ;;
     --non-interactive)
         [[ "$2" == --json && "$3" == fallback ]] || exit 99
@@ -1513,6 +1513,101 @@ EOF
     jq -e '.attempts["12345"] | .status == "succeeded" and .attempt == 2' "$DSR_STATE_DIR/triggered.json"
     assert_equal 2 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
     assert_equal 1 "$(wc -l < "$TEST_TMPDIR/watch-upstream.calls" | tr -d ' ')"
+}
+
+@test "watch degraded queue polls recover retained work without admitting new observed runs" {
+    _watch_pending_fixture
+    _mock_watch_upstream_run "$(_watch_upstream_run_json completed failure)"
+    local errored_inventory
+    # Even a plausible run inventory from a failed poll has no authority.
+    # The saved run must be independently refreshed, and the new run ignored.
+    errored_inventory=$(_watch_multiple_runs_json | jq '
+        .details.throttled |= [.[0], .[2]] |
+        .details.throttled[0].head_sha = "2222222222222222222222222222222222222222" |
+        .details.skipped = [{repo:"owner/unavailable",reason:"failed to fetch runs"}]')
+    DSR_WATCH_FIXTURE_CHECK_STATUS=8 run --separate-stderr _routing_watch "$errored_inventory" \
+        --auto-fallback --max-concurrent 1
+    assert_equal 1 "$status"
+    jq -e '.status == "error" and .exit_code == 1 and
+        .details.triggered_state.attempts["12345"].attempt == 1 and
+        .details.triggered_state.pending["12345"] == null' <<< "$output"
+    assert_contains "$stderr" "API error, backing off for 60s"
+    _watch_completed 12345
+    jq -e '(.attempts | keys) == ["12345","12346"] and .runs["12347"] == null and
+        .pending == {} and .attempts["12345"].head_sha == "1111111111111111111111111111111111111111"' \
+        "$DSR_STATE_DIR/triggered.json"
+    assert_equal 2 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/watch-upstream.calls" | tr -d ' ')"
+    grep -q 'Cache-Control: no-cache, no-store, max-age=0' "$TEST_TMPDIR/watch-upstream.calls"
+    [[ ! -e "$DSR_STATE_DIR/watch-artifacts/12347" ]]
+}
+
+@test "watch degraded queue polls resume only the retained failed checkpoint" {
+    harness_create_config
+    _watch_configure_ntm
+    local sha checkpoint=12345678-1234-1234-1234-123456789abc checkpoint_file before payload
+    sha=$(_watch_checkpoint_source_sha)
+    DSR_WATCH_FIXTURE_STATUS=8 run _routing_watch "$(_watch_run_json "$sha")" \
+        --auto-fallback --retry-delay 1
+    assert_equal 0 "$status"
+    _watch_completed
+    _watch_seed_mixed_checkpoint "$checkpoint" "$DSR_STATE_DIR/watch-artifacts/12345" "$sha"
+    checkpoint_file="$DSR_STATE_DIR/builds/ntm/v1.2.3/$checkpoint/state.json"
+    before=$(cat "$checkpoint_file")
+    payload=$(cat "$DSR_STATE_DIR/watch-artifacts/12345/ntm-linux-amd64")
+    _mock_watch_upstream_run "$(_watch_upstream_run_json completed timed_out "$sha")"
+    sleep 1
+    # Failed transport output need not be JSON. It cannot suppress the
+    # separately admitted original-run status or become a new run inventory.
+    DSR_WATCH_FIXTURE_CHECK_STATUS=8 run --separate-stderr _routing_watch 'unavailable queue response' \
+        --auto-fallback --retry-delay 1
+    assert_equal 1 "$status"
+    jq -e --arg run "$checkpoint" '.status == "error" and .exit_code == 1 and
+        (.details.triggered_state.attempts["12345"] | .attempt == 2 and .resume_run_id == $run)' <<< "$output"
+    _watch_completed
+    jq -Rse --arg resume "--resume=$checkpoint" 'split("\u0000") | index($resume) != null' "$TEST_TMPDIR/fallback.args"
+    assert_equal "$before" "$(cat "$checkpoint_file")"
+    assert_equal "$payload" "$(cat "$DSR_STATE_DIR/watch-artifacts/12345/ntm-linux-amd64")"
+    assert_equal 2 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/watch-upstream.calls" | tr -d ' ')"
+}
+
+@test "watch degraded queue polls retain opt-outs and require fresh upstream failure evidence" {
+    _watch_pending_fixture
+    _mock_watch_upstream_run "$(_watch_upstream_run_json completed failure)"
+    local before candidate upstream_status conclusion
+    before=$(cat "$DSR_STATE_DIR/triggered.json")
+    _watch_configure_ntm 'enabled: false'
+    DSR_WATCH_FIXTURE_CHECK_STATUS=8 run _routing_watch "$(_watch_run_json)" --auto-fallback
+    assert_equal 1 "$status"
+    assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+    [[ ! -e "$TEST_TMPDIR/watch-upstream.calls" ]]
+    _watch_configure_ntm 'enabled: true'
+
+    DSR_WATCH_FIXTURE_CHECK_STATUS=8 DSR_WATCH_UPSTREAM_ERROR=true \
+        run _routing_watch "$(_watch_run_json)" --auto-fallback
+    assert_equal 1 "$status"
+    assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+    _watch_upstream_run_json completed failure 2222222222222222222222222222222222222222 \
+        > "$TEST_TMPDIR/watch-upstream.json"
+    DSR_WATCH_FIXTURE_CHECK_STATUS=8 run _routing_watch "$(_watch_run_json)" --auto-fallback
+    assert_equal 1 "$status"
+    assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+    for candidate in 'in_progress:' 'completed:action_required'; do
+        upstream_status="${candidate%%:*}"; conclusion="${candidate#*:}"
+        _watch_upstream_run_json "$upstream_status" "$conclusion" > "$TEST_TMPDIR/watch-upstream.json"
+        DSR_WATCH_FIXTURE_CHECK_STATUS=8 run _routing_watch "$(_watch_run_json)" --auto-fallback
+        assert_equal 1 "$status"
+        assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+    done
+    _watch_upstream_run_json completed cancelled > "$TEST_TMPDIR/watch-upstream.json"
+    DSR_WATCH_FIXTURE_CHECK_STATUS=8 run --separate-stderr _routing_watch "$(_watch_run_json)" --auto-fallback
+    assert_equal 1 "$status"
+    assert_contains "$stderr" "Retired deferred run 12345"
+    jq -e '.pending == {} and .runs["12345"] == null and .attempts["12345"] == null' \
+        "$DSR_STATE_DIR/triggered.json"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    [[ ! -e "$DSR_STATE_DIR/watch-artifacts/12345" ]]
 }
 
 @test "watch terminal recovery refuses active successful cancelled and unverified upstream runs" {

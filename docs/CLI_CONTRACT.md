@@ -561,6 +561,14 @@ failed reads and identity changes preserve the failed attempt without consuming
 its retry budget. Report-only mode does not query or launch these retries, and
 dry-run can describe an eligible retry without changing its journal or outputs.
 
+A network failure in the aggregate throttle check retains its error status and
+exponential polling backoff, but does not block recovery for every other
+repository. The watcher discards that failed check's run inventory and considers
+only previously retained pending or failed candidates. Each candidate must pass
+the uncached original-run identity and terminal-failure checks above before it
+can start. An unreadable candidate remains deferred; an errored aggregate result
+cannot introduce a new fallback. Report-only mode performs no recovery reads.
+
 A retry resumes only a unique build UUID matching the exact tool, tag, source SHA,
 and private output directory. A `partial` build with both successful and failed targets is
 eligible for this recovery; fallback validates and reuses successful target
