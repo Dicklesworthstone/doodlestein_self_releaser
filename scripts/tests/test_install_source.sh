@@ -5,9 +5,277 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SOURCE_MODULE="${DSR_TEST_INSTALL_SOURCE_MODULE:-$ROOT/src/install_source.sh}"
 case "$#:${1:-}" in
-    0:|1:--credentials-only) ;;
-    *) printf 'Usage: %s [--credentials-only]\n' "$0" >&2; exit 4 ;;
+    0:|1:--credentials-only|1:--go-workspaces-only) ;;
+    *) printf 'Usage: %s [--credentials-only|--go-workspaces-only]\n' "$0" >&2; exit 4 ;;
 esac
+
+# Actual offline Go builds distinguish workspace support from merely passing a
+# GOWORK argument. Every source fetch, module parser and compiler is genuine;
+# Git's remote is the local fixture, and an independently detected hosted PID
+# namespace mismatch is the only optional watchdog boundary adaptation.
+test_go_workspaces() (
+    local dependency real_go work status=0 passed=0 failed=0 pin base_work_hash
+    for dependency in git jq go ps; do
+        command -v "$dependency" >/dev/null 2>&1 || {
+            printf 'SKIP: Go workspace source builds require %s\n' "$dependency"; return 3;
+        }
+    done
+    real_go=$(command -v go)
+    "$real_go" version >/dev/null 2>&1 || {
+        printf 'SKIP: Go workspace source builds require the Go compiler\n'; return 3;
+    }
+    # shellcheck source=../../src/install_source.sh
+    source "$SOURCE_MODULE"
+    work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-source-workspaces.XXXXXXXX") || return 1
+    work=$(cd "$work" && pwd -P) || return 1
+    printf 'Go workspace source fixtures retained at: %s\n' "$work"
+    _isb_run 3 "$work/watchdog-probe.log" printf 'watchdog-ready\n' \
+        > "$work/watchdog-probe.out" 2> "$work/watchdog-probe.err" || status=$?
+    if ((status != 0)); then
+        local namespace_pid="$BASHPID" host_pid='' namespace_line='' observed_pid='' line
+        local -a namespace_pids=()
+        if [[ -r /proc/self/stat && -r /proc/self/status ]]; then
+            read -r host_pid _ < /proc/self/stat
+            while IFS= read -r line; do
+                [[ "$line" != NSpid:* ]] || namespace_line="${line#NSpid:}"
+            done < /proc/self/status
+            observed_pid=$(ps -o pid= -p "$namespace_pid" 2> "$work/namespace-probe.err" || true)
+            observed_pid="${observed_pid//[[:space:]]/}"
+        fi
+        read -r -a namespace_pids <<< "$namespace_line"
+        if [[ $status -ne 3 || -e "$work/watchdog-probe.log" ||
+              ${#namespace_pids[@]} -lt 2 || "$host_pid" == "$namespace_pid" ||
+              "${namespace_pids[0]:-}" != "$host_pid" ||
+              "${namespace_pids[${#namespace_pids[@]}-1]:-}" != "$namespace_pid" ||
+              "$observed_pid" == "$namespace_pid" ]]; then
+            printf 'FAIL: watchdog failed without independent PID namespace evidence (status %s)\n' "$status" >&2
+            return 1
+        fi
+        printf 'BOUNDARY: hosted PID namespace requires synchronous real commands with retained logs\n'
+        _isb_run() {
+            local limit="$1" log="$2"; shift 2
+            [[ "$limit" =~ ^[1-9][0-9]{0,4}$ && ! -e "$log" && ! -L "$log" ]] || return 4
+            "$@" </dev/null > "$log" 2>&1
+        }
+    fi
+    export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$work/gitconfig"
+    export DSR_GH_TOKEN='' GITHUB_TOKEN='' GH_TOKEN=''
+    export GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local GOTELEMETRY=off GOMAXPROCS=2
+    export GOCACHE="${DSR_TEST_GO_CACHE:-/tmp/dsr-test-go-workspace-cache}"
+    gh() { return 1; }
+    local calls='' mutation=false
+    go() {
+        printf '%s\n' "$*" >> "$calls"
+        local code=0
+        "$real_go" "$@" || code=$?
+        if $mutation && [[ "$1" == build && $code == 0 && "${GOWORK:-off}" != off ]]; then
+            printf '\n// changed during compilation\n' >> "$GOWORK"
+        fi
+        return "$code"
+    }
+    workspace_check() {
+        local label="$1"; shift
+        if "$@"; then passed=$((passed + 1)); printf 'PASS: %s\n' "$label"
+        else failed=$((failed + 1)); printf 'FAIL: %s\n' "$label" >&2; fi
+    }
+    workspace_equal() { [[ "$1" == "$2" ]]; }
+    workspace_commit() {
+        git -C "$work/upstream" add . &&
+            git -C "$work/upstream" commit -qm "$1"
+    }
+    workspace_build() {
+        local name="$1" subdir="$2"; shift 2
+        calls="$work/$name.calls"
+        : > "$calls"
+        status=0
+        install_source_build example/workspace-fixture HEAD go app "$work/$name" \
+            --allow-build --subdir "$subdir" --bin helper --bin app --timeout 60 "$@" \
+            > "$work/$name.json" 2> "$work/$name.log" || status=$?
+    }
+    workspace_refused() {
+        local name="$1" subdir="$2" label="$3"
+        workspace_build "$name" "$subdir"
+        workspace_check "$label" workspace_equal "$status" 4
+        workspace_check "$label before package resolution or compilation" \
+            bash -c '! grep -Eq "^(list|build) " "$1"' _ "$calls"
+        workspace_check "$label publishes no source receipt" test ! -e "$work/$name/receipt.json"
+    }
+    mkdir -p "$work/upstream/app/cmd/app" "$work/upstream/app/cmd/helper" \
+        "$work/upstream/app/vendor" "$work/upstream/vendor" "$work/upstream/shared" \
+        "$work/ambient" "$work/outside" || return 1
+    git init -q -b main "$work/upstream" || return 1
+    git -C "$work/upstream" config user.name 'DSR Go workspace fixture'
+    git -C "$work/upstream" config user.email 'workspace@example.invalid'
+    git config --file "$GIT_CONFIG_GLOBAL" \
+        url."file://$work/upstream".insteadOf https://github.com/example/workspace-fixture.git
+    cat > "$work/upstream/app/go.mod" <<'MOD'
+module example.invalid/workspace-app
+go 1.22
+require example.invalid/shared v0.0.0
+MOD
+    cat > "$work/upstream/shared/go.mod" <<'MOD'
+module example.invalid/shared
+go 1.22
+MOD
+    printf 'package shared\nconst Message = "pinned-sibling"\n' > "$work/upstream/shared/shared.go"
+    cat > "$work/upstream/app/cmd/app/main.go" <<'GO'
+package main
+import ("fmt"; "example.invalid/shared")
+func main() { fmt.Println("app-" + shared.Message) }
+GO
+    cat > "$work/upstream/app/cmd/helper/main.go" <<'GO'
+package main
+import ("fmt"; "example.invalid/shared")
+func main() { fmt.Println("helper-" + shared.Message) }
+GO
+    printf 'go 1.22\nuse (\n ./app\n ./shared\n)\n' > "$work/upstream/go.work"
+    : > "$work/upstream/app/go.sum"
+    : > "$work/upstream/go.work.sum"
+    # Go ignores a member's vendor directory in workspace mode. Its presence
+    # must not switch an admitted workspace to that unrelated module inventory.
+    printf 'not the workspace vendor inventory\n' > "$work/upstream/app/vendor/modules.txt"
+    printf '# legacy.example/dependency v1.0.0\n## explicit; go 1.22\n' > "$work/upstream/vendor/modules.txt"
+    printf 'go 1.22\nuse ../outside\n' > "$work/ambient/go.work"
+    printf 'module example.invalid/outside\ngo 1.22\n' > "$work/outside/go.mod"
+    workspace_commit 'Pinned sibling workspace' || return 1
+    pin=$(git -C "$work/upstream" rev-parse HEAD) || return 1
+    base_work_hash=$(_isb_sha256 "$work/upstream/go.work") || return 1
+    GOWORK="$work/ambient/go.work" GOFLAGS=-buildmode=archive GO111MODULE=off GOOS=windows GOARCH=arm64 \
+        workspace_build siblings app
+    workspace_check 'committed sibling workspace builds offline despite hostile ambient Go selection' workspace_equal "$status" 0
+    workspace_check 'primary executes code from the pinned sibling module' workspace_equal \
+        "$("$work/siblings/output/bin/app" 2>/dev/null)" app-pinned-sibling
+    workspace_check 'companion executes its own package with the same pinned sibling' workspace_equal \
+        "$("$work/siblings/output/bin/helper" 2>/dev/null)" helper-pinned-sibling
+    workspace_check 'workspace source receipt binds the real commit, workspace and both module files' jq -e \
+        --arg pin "$pin" --arg sha "$base_work_hash" '
+        .source_commit == $pin and .method == "source" and .signed_release == false and
+        .go_workspace.path == "go.work" and .go_workspace.sha256 == $sha and
+        ([.go_workspace.modules[] | .path] | sort) == ["app","shared"] and
+        all(.go_workspace.modules[]; (.go_mod_sha256 | test("^[0-9a-f]{64}$"))) and
+        [.binaries[].name] == ["helper","app"]' "$work/siblings.json"
+    workspace_check 'workspace receipt contains no private absolute source paths' jq -e --arg root "$work" \
+        '.go_workspace | tostring | contains($root) | not' "$work/siblings.json"
+    workspace_check 'workspace mode keeps readonly dependency resolution' grep -q '^build -mod=readonly ' "$calls"
+    workspace_check 'legacy root vendor data is not mistaken for workspace vendoring' jq -e \
+        '.go_workspace.vendor == false' "$work/siblings.json"
+    workspace_check 'empty committed module and workspace checksum files remain valid' \
+        test -f "$work/siblings/source/go.work.sum"
+
+    printf 'go.work text eol=crlf\n*.mod text eol=crlf\n' > "$work/upstream/.gitattributes"
+    workspace_commit 'Committed Go metadata with checkout line-ending conversion' || return 1
+    workspace_build crlf app
+    workspace_check 'Git CRLF checkout conversion preserves committed Go workspace admission' workspace_equal "$status" 0
+    workspace_check 'line-ending fixture actually checks out CRLF metadata' grep -q $'\r' "$work/crlf/source/go.work"
+    workspace_check 'workspace receipt hashes the actual parsed CRLF bytes' jq -e \
+        --arg sha "$(_isb_sha256 "$work/crlf/source/go.work")" '.go_workspace.sha256 == $sha' "$work/crlf.json"
+    workspace_check 'CRLF workspace builds a genuine native executable' workspace_equal \
+        "$("$work/crlf/output/bin/app" 2>/dev/null)" app-pinned-sibling
+
+    # A workspace replacement supersedes the main module's obsolete local
+    # replacement; rejecting the ignored path would break a valid workspace.
+    printf '\nreplace example.invalid/shared => ../../outside\n' >> "$work/upstream/app/go.mod"
+    printf 'go 1.22\nuse ./app\nreplace example.invalid/shared => ./shared\n' > "$work/upstream/go.work"
+    workspace_commit 'Workspace replacement selects pinned sibling' || return 1
+    workspace_build replacement app
+    workspace_check 'workspace-local replacement overrides ignored module replacement' workspace_equal "$status" 0
+    workspace_check 'replacement source family executes the committed dependency' workspace_equal \
+        "$("$work/replacement/output/bin/helper" 2>/dev/null)" helper-pinned-sibling
+
+    printf 'go 1.22\nuse ./app\n' > "$work/upstream/go.work"
+    workspace_commit 'Unconfined active module replacement' || return 1
+    workspace_refused outside-replacement app 'active local replacement outside the fetched checkout is refused'
+    printf 'go 1.22\nuse (\n ./app\n ../../outside\n)\n' > "$work/upstream/go.work"
+    workspace_commit 'Unconfined workspace member' || return 1
+    workspace_refused outside-use app 'workspace use outside the fetched checkout is refused'
+
+    printf 'go 1.22\nuse ./app\nreplace example.invalid/shared => ./shared\n' > "$work/upstream/go.work"
+    ln -s shared "$work/upstream/shared-link" || return 1
+    printf 'go 1.22\nuse (\n ./app\n ./shared-link\n)\n' > "$work/upstream/go.work"
+    workspace_commit 'Linked workspace member' || return 1
+    workspace_refused linked-use app 'symlinked workspace member cannot change source custody'
+    printf 'go 1.22\nuse (\n ./app\n ./missing\n)\n' > "$work/upstream/go.work"
+    workspace_commit 'Missing workspace member' || return 1
+    workspace_refused missing-use app 'missing committed workspace module is refused'
+
+    printf 'deliberately invalid outer workspace\n' > "$work/upstream/go.work"
+    cat > "$work/upstream/app/go.mod" <<'MOD'
+module example.invalid/workspace-app
+go 1.22
+require example.invalid/shared v0.0.0
+MOD
+    mv "$work/upstream/app/vendor" "$work/upstream/app/member-vendor-evidence" || return 1
+    printf 'go 1.22\nuse (\n .\n ../shared\n)\n' > "$work/upstream/app/go.work"
+    workspace_commit 'Nearest nested workspace' || return 1
+    workspace_build nearest app
+    workspace_check 'nearest committed workspace takes precedence over an invalid ancestor' workspace_equal "$status" 0
+    workspace_check 'nested workspace admits parent-relative sibling paths inside the checkout' jq -e \
+        '.go_workspace.path == "app/go.work" and any(.go_workspace.modules[]; .path == "shared")' "$work/nearest.json"
+    workspace_check 'nested workspace executable uses the selected sibling' workspace_equal \
+        "$("$work/nearest/output/bin/app" 2>/dev/null)" app-pinned-sibling
+    mutation=true
+    workspace_build changed-workspace app
+    mutation=false
+    workspace_check 'a real successful compile cannot attest a modified workfile' workspace_equal "$status" 6
+    workspace_check 'changed tracked workspace leaves no successful source receipt' test ! -e "$work/changed-workspace/receipt.json"
+
+    # A workspace root is not required to be a Go module itself. The family
+    # selects two command modules by their conventional cmd/<name> directories.
+    mkdir -p "$work/upstream/cmd/app" "$work/upstream/cmd/helper" || return 1
+    printf 'module example.invalid/root-app\ngo 1.22\n' > "$work/upstream/cmd/app/go.mod"
+    printf 'module example.invalid/root-helper\ngo 1.22\n' > "$work/upstream/cmd/helper/go.mod"
+    cp "$work/upstream/app/cmd/app/main.go" "$work/upstream/cmd/app/main.go" || return 1
+    cp "$work/upstream/app/cmd/helper/main.go" "$work/upstream/cmd/helper/main.go" || return 1
+    printf 'go 1.22\nuse (\n ./cmd/app\n ./cmd/helper\n ./shared\n)\n' > "$work/upstream/go.work"
+    workspace_commit 'Moduleless executable-family workspace root' || return 1
+    workspace_build moduleless .
+    workspace_check 'moduleless workspace root builds command modules as a complete family' workspace_equal "$status" 0
+    workspace_check 'moduleless workspace records every selected module' jq -e \
+        '([.go_workspace.modules[].path] | sort) == ["cmd/app","cmd/helper","shared"]' "$work/moduleless.json"
+    workspace_check 'moduleless workspace primary runs' workspace_equal \
+        "$("$work/moduleless/output/bin/app" 2>/dev/null)" app-pinned-sibling
+    workspace_check 'moduleless workspace companion runs' workspace_equal \
+        "$("$work/moduleless/output/bin/helper" 2>/dev/null)" helper-pinned-sibling
+
+    # Generate the vendor inventory with real Go, then compile only from the
+    # pinned vendor and workspace sources under the normal installer engine.
+    calls="$work/vendor-prepare.calls"
+    (cd "$work/upstream" && GOENV=off GOFLAGS='' GO111MODULE=on GOWORK="$work/upstream/go.work" \
+        "$real_go" work vendor) > "$work/vendor-prepare.log" 2>&1 || return 1
+    workspace_commit 'Committed workspace vendor inventory' || return 1
+    workspace_build vendored .
+    workspace_check 'committed workspace vendor inventory supports offline family builds' workspace_equal "$status" 0
+    workspace_check 'workspace vendor selection is explicit' grep -q '^build -mod=vendor ' "$calls"
+    workspace_check 'vendored workspace binary still binds the committed sibling' workspace_equal \
+        "$("$work/vendored/output/bin/helper" 2>/dev/null)" helper-pinned-sibling
+
+    # Vendoring snapshots a replacement's bytes. Its original checkout is no
+    # longer a build input and need not exist on the installer's machine.
+    mkdir -p "$work/vendor-original" || return 1
+    cp "$work/upstream/shared/go.mod" "$work/upstream/shared/shared.go" "$work/vendor-original/" || return 1
+    printf 'module example.invalid/root-app\ngo 1.22\nrequire example.invalid/shared v0.0.0\n' > "$work/upstream/cmd/app/go.mod"
+    printf 'module example.invalid/root-helper\ngo 1.22\nrequire example.invalid/shared v0.0.0\n' > "$work/upstream/cmd/helper/go.mod"
+    printf 'go 1.22\nuse (\n ./cmd/app\n ./cmd/helper\n)\nreplace example.invalid/shared => ../vendor-original\n' > "$work/upstream/go.work"
+    (cd "$work/upstream" && GOENV=off GOFLAGS='' GO111MODULE=on GOWORK="$work/upstream/go.work" \
+        "$real_go" work vendor) > "$work/vendor-original-prepare.log" 2>&1 || return 1
+    workspace_commit 'Self-contained vendor tree with an unavailable original replacement' || return 1
+    mv "$work/vendor-original" "$work/vendor-original-unavailable" || return 1
+    workspace_build vendored-absent .
+    workspace_check 'committed workspace vendor builds without the original local replacement checkout' workspace_equal "$status" 0
+    workspace_check 'vendor receipt binds its committed inventory and omits inactive replacement paths' jq -e \
+        --arg sha "$(_isb_sha256 "$work/vendored-absent/source/vendor/modules.txt")" '
+        .go_workspace.vendor == true and .go_workspace.vendor_modules_sha256 == $sha and
+        .go_workspace.local_replacements == []' "$work/vendored-absent.json"
+    workspace_check 'self-contained vendored executable runs the pinned dependency bytes' workspace_equal \
+        "$("$work/vendored-absent/output/bin/app" 2>/dev/null)" app-pinned-sibling
+    printf 'Go workspace source tests: %s passed, %s failed\n' "$passed" "$failed"
+    [[ $failed -eq 0 ]]
+)
+
+if [[ "${1:-}" == --go-workspaces-only ]]; then
+    test_go_workspaces
+    exit $?
+fi
 
 test_source_credentials() {
     local dependency
@@ -327,6 +595,11 @@ sys.exit(0 if failed == 0 else 1)
 PY
 }
 
+if [[ $# -eq 0 ]]; then
+    workspace_status=0
+    test_go_workspaces || workspace_status=$?
+    [[ "$workspace_status" == 0 ]] || exit "$workspace_status"
+fi
 credential_status=0
 test_source_credentials || credential_status=$?
 [[ "$credential_status" == 0 ]] || exit "$credential_status"

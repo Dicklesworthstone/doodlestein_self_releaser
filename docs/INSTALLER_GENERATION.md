@@ -478,6 +478,78 @@ first build. It preserves the existing readonly/vendor dependency policy and
 builds for the installing machine, regardless of inherited `GOOS`, `GOARCH`,
 or `GOFLAGS`.
 
+### Committed Go workspaces
+
+Bash source installers also support tools whose commands depend on sibling
+modules through a committed `go.work`. Starting at `source_subdir`, the installer
+selects the nearest `go.work` within the fetched repository. A workspace outside
+that checkout, including the caller's `GOWORK`, cannot select source inputs.
+Without a selected workfile, the existing standalone-module behavior applies.
+
+For example, this repository layout needs no `replace` directives in the
+application's `go.mod`:
+
+```text
+go.work                 # use (./app ./shared)
+app/go.mod
+app/cmd/app/main.go      # imports the shared module
+app/cmd/helper/main.go
+shared/go.mod
+shared/shared.go
+```
+
+Use `source_subdir: app` and `workspace_binaries: [app, helper]`. A repository
+root containing only `go.work` is supported as well: `use ./cmd/app` and
+`use ./cmd/helper` can select separate command modules with the ordinary
+`cmd/<binary>` entry selection. The workfile and every selected module's
+`go.mod` must be committed regular files. Relative sibling paths such as
+`../shared` are accepted when their entire path stays inside the fetched
+checkout; outside paths and symlink traversal are refused before package
+resolution or compilation.
+
+The installed Go toolchain parses the workspace and module files. Workspace
+`replace` directives take precedence over module directives. Active local
+replacements must resolve to committed modules inside the same checkout;
+replacement dependencies do not contribute their own `replace` directives.
+This follows Go's [workspace and replacement rules](https://go.dev/ref/mod#workspaces)
+without fetching another local checkout or running `go work sync`.
+An outside-root wildcard replacement is still refused when only some of its
+versions are overridden by the workfile: the installer does not infer that all
+other versions are unreachable. Remove that local rule or override its complete
+selection in `go.work`.
+
+Workspace builds use `-mod=readonly`, or `-mod=vendor` when the workspace root
+contains a committed `vendor/modules.txt` marked as a workspace inventory by Go.
+A legacy single-module vendor inventory and a member module's own vendor
+directory do not select workspace vendoring. In vendor mode, replacement
+dependencies come from the committed vendor tree; their original local
+directories need not exist or lie inside the checkout because Go does not read
+them. The main workspace modules still require committed, in-checkout files.
+Ambient `GO111MODULE`, `GOWORK`,
+`GOFLAGS`, and persisted Go configuration cannot override this selection, and
+`GOTOOLCHAIN=local` prevents an implicit compiler download.
+
+Successful source receipts add `go_workspace`, containing the checkout-relative
+workfile path and SHA-256, each main module's path, module identity and `go.mod`
+SHA-256, active local replacement identities, and the vendor selection. A
+vendored workspace also records `vendor_modules_sha256` for its inventory. The
+existing source-commit, complete-family, output-hash and tracked-input checks
+still apply. A successful compiler exit cannot publish a receipt after a
+tracked workspace or module file changes.
+
+The focused regression builds and executes a real offline Go executable family:
+
+```bash
+bash scripts/tests/test_install_source.sh --go-workspaces-only
+```
+
+It covers ancestor and nested workfiles, moduleless roots, local replacement
+precedence, self-contained workspace vendoring, Git line-ending conversion,
+inherited environment overrides, empty checksum files, and refused outside,
+missing or linked modules. The optional
+`DSR_TEST_INSTALL_SOURCE_MODULE` selects an earlier source engine for the same
+before/after fixture; it does not replace the Git parser or compiler.
+
 For Bun and TypeScript, each companion requires its exact name in the selected
 project's `package.json` `bin` object:
 

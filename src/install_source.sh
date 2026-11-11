@@ -484,6 +484,252 @@ _isb_source_entries() (
     printf '%s\n' "${entries[@]}"
 )
 
+# Resolve Go's relative use/replace directories without letting a lexical '..'
+# cross the fetched checkout, or a symlink change what that boundary means.
+# In particular, checking only realpath's final answer would admit a linked
+# ancestor that happened to return to the checkout later in the path.
+_isb_go_directory() (
+    local root="$1" base="$2" reference="$3" cursor="$1" path part
+    [[ -d "$root" && ! -L "$root" && "$root" == /* &&
+       ( "$base" == "$root" || "$base" == "$root/"* ) &&
+       -n "$reference" && "$reference" != /* && "$reference" != *\\* &&
+       "$reference" != *:* && "$reference" != *[[:cntrl:]]* ]] || return 4
+    path="${base#"$root"}"
+    path="${path#/}"
+    for path in "$path" "$reference"; do
+        while [[ -n "$path" ]]; do
+            part="${path%%/*}"
+            if [[ "$path" == */* ]]; then path="${path#*/}"; else path=''; fi
+            case "$part" in
+                ''|.) continue ;;
+                ..) [[ "$cursor" != "$root" ]] || return 4; cursor="${cursor%/*}" ;;
+                *)
+                    [[ "${part,,}" != .git ]] || return 4
+                    cursor="$cursor/$part"
+                    [[ -d "$cursor" && ! -L "$cursor" ]] || return 4
+                    ;;
+            esac
+        done
+    done
+    printf '%s\n' "$cursor"
+)
+
+# Go's own parser supplies syntax and module identity. Git supplies authority:
+# a go.work, go.mod, checksum file or vendor manifest must be an unchanged
+# regular blob from the fetched commit, never an ambient or generated input.
+_isb_go_committed_file() {
+    local root="$1" path="$2" relative row mode type oid rest actual hash attributes filter
+    [[ "$path" == "$root/"* && -f "$path" && ! -L "$path" ]] || return 4
+    relative="${path#"$root"/}"
+    row=$(_isb_git --literal-pathspecs -C "$root" ls-tree HEAD -- "$relative") || return 4
+    [[ -n "$row" && "$row" != *$'\n'* ]] || return 4
+    IFS=$' \t' read -r mode type oid rest <<< "$row"
+    [[ "$type" == blob && ( "$mode" == 100644 || "$mode" == 100755 ) &&
+       ( "$oid" =~ ^[0-9a-f]{40}$ || "$oid" =~ ^[0-9a-f]{64}$ ) ]] || return 4
+    actual=$(_isb_git -C "$root" hash-object --no-filters -- "$path") || return 4
+    if [[ "$actual" != "$oid" ]]; then
+        # A normal checkout can apply core.autocrlf or tracked text/eol
+        # attributes. Let Git perform that normalization, but disable the
+        # selected external filter driver before hashing: metadata admission
+        # must not execute a clean/process hook. The receipt still hashes the
+        # actual checkout bytes that Go parses, including their line endings.
+        attributes=$(_isb_git --literal-pathspecs -C "$root" check-attr filter -- "$relative") || return 4
+        [[ "$attributes" != *$'\n'* && "$attributes" == *': filter: '* ]] || return 4
+        filter="${attributes#*: filter: }"
+        [[ "$filter" =~ ^[A-Za-z0-9_/-][A-Za-z0-9._/-]*$ ]] || return 4
+        actual=$(_isb_git -c "filter.$filter.clean=" -c "filter.$filter.process=" \
+            -c "filter.$filter.required=false" -C "$root" hash-object --path="$relative" -- "$path") || return 4
+    fi
+    [[ "$actual" == "$oid" ]] || return 4
+    # Empty committed go.sum files are valid; payload hashing intentionally
+    # requires nonempty executables, so use the metadata boundary here.
+    if command -v sha256sum >/dev/null 2>&1; then hash=$(sha256sum < "$path") || return 1
+    elif command -v shasum >/dev/null 2>&1; then hash=$(shasum -a 256 < "$path") || return 1
+    else return 3; fi
+    hash="${hash%% *}"
+    [[ "$hash" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s\n' "$hash"
+}
+
+# Select one committed workspace, or the existing standalone module. Only
+# main modules contribute replacement rules: Go ignores replace directives in
+# dependency modules, including modules selected by a local replacement.
+_isb_go_context() (
+    set -o pipefail
+    local root="$1" tree="$2" output="$3" limit="$4" cursor="$2" work='' work_dir=''
+    local work_hash='' parsed paths module_root relative module_path module_hash sum_file status=0
+    local index=0 document scope row old version replacement replacement_version key identity hash
+    local replacement_module replacement_relative vendor=false vendor_hash='' mod=readonly
+    local -a module_roots=() documents=() scopes=()
+    local -A seen_paths=() seen_modules=() workspace_replaces=() replacements=()
+    export GOENV=off GOFLAGS='' GOWORK=off GOTOOLCHAIN=local GO111MODULE=on GOTELEMETRY=off
+    relative="${tree#"$root"/}"; [[ "$tree" != "$root" ]] || relative=.
+    _isb_go_directory "$root" "$root" "$relative" >/dev/null 2>&1 || {
+        _isb_log 'Go build directory escapes the fetched checkout'; return 4;
+    }
+    while :; do
+        if [[ -e "$cursor/go.work" || -L "$cursor/go.work" ]]; then
+            work="$cursor/go.work"; work_dir="$cursor"
+            work_hash=$(_isb_go_committed_file "$root" "$work") || {
+                _isb_log 'The selected go.work must be an unchanged committed regular file'; return 4;
+            }
+            _isb_run "$limit" "$output/go-workspace.log" go work edit -json "$work" || {
+                status=$?; [[ "$status" != 5 ]] || return 5; return 4;
+            }
+            if ! jq -es 'length == 1 and (.[0] | type == "object" and
+                (.Use | type == "array" and length > 0 and all(.[];
+                    type == "object" and (.DiskPath | type == "string" and length > 0 and
+                    (test("[[:cntrl:]]") | not)))))' "$output/go-workspace.log" >/dev/null; then
+                _isb_log 'Go workspace must select at least one literal module directory'; return 4
+            fi
+            paths=$(jq -r '.Use[].DiskPath' "$output/go-workspace.log") || return 4
+            while IFS= read -r relative; do
+                module_root=$(_isb_go_directory "$root" "$work_dir" "$relative") || {
+                    _isb_log "Go workspace module escapes the checkout or traverses a link: $relative"; return 4;
+                }
+                module_roots+=("$module_root")
+            done <<< "$paths"
+            documents+=("$output/go-workspace.log"); scopes+=("$work_dir")
+            break
+        fi
+        [[ "$cursor" != "$root" ]] || break
+        cursor="${cursor%/*}"
+    done
+    if [[ -z "$work" ]]; then
+        module_roots=("$tree")
+        work_dir="$tree"
+    elif [[ -e "$work.sum" || -L "$work.sum" ]]; then
+        _isb_go_committed_file "$root" "$work.sum" >/dev/null || {
+            _isb_log 'go.work.sum must be an unchanged committed regular file'; return 4;
+        }
+    fi
+    : > "$output/go-modules.jsonl" || return 1
+    : > "$output/go-replacements.jsonl" || return 1
+    for module_root in "${module_roots[@]}"; do
+        relative="${module_root#"$root"/}"; [[ "$module_root" != "$root" ]] || relative=.
+        [[ -z "${seen_paths[$relative]:-}" ]] || { _isb_log 'Go workspace repeats a module directory'; return 4; }
+        seen_paths[$relative]=1
+        module_hash=$(_isb_go_committed_file "$root" "$module_root/go.mod") || {
+            _isb_log "Go module requires an unchanged committed regular go.mod: $relative"; return 4;
+        }
+        sum_file="$module_root/go.sum"
+        if [[ -e "$sum_file" || -L "$sum_file" ]]; then
+            _isb_go_committed_file "$root" "$sum_file" >/dev/null || {
+                _isb_log "Go module checksum file is not an unchanged committed regular file: $relative"; return 4;
+            }
+        fi
+        parsed="$output/go-module-$index.log"; index=$((index + 1))
+        _isb_run "$limit" "$parsed" go mod edit -json "$module_root/go.mod" || {
+            status=$?; [[ "$status" != 5 ]] || return 5; return 4;
+        }
+        module_path=$(jq -ers 'if length == 1 then .[0].Module.Path |
+            select(type == "string" and length > 0 and (test("[[:cntrl:]]") | not))
+            else empty end' "$parsed") || { _isb_log "Invalid Go module identity: $relative"; return 4; }
+        [[ -z "${seen_modules[$module_path]:-}" ]] || { _isb_log "Go workspace repeats module identity: $module_path"; return 4; }
+        seen_modules[$module_path]=1
+        jq -nc --arg path "$relative" --arg module "$module_path" --arg hash "$module_hash" \
+            '{path:$path,module_path:$module,go_mod_sha256:$hash}' >> "$output/go-modules.jsonl" || return 1
+        documents+=("$parsed"); scopes+=("$module_root")
+    done
+    if [[ -e "$work_dir/vendor" || -L "$work_dir/vendor" ]]; then
+        _isb_go_directory "$root" "$work_dir" vendor >/dev/null || {
+            _isb_log 'Selected Go vendor directory must stay inside the checkout without links'; return 4;
+        }
+        document="$work_dir/vendor/modules.txt"
+        [[ ! -L "$document" && ( ! -e "$document" || -f "$document" ) ]] || return 4
+        if [[ -z "$work" ]]; then
+            # Preserve standalone module vendoring, including legacy vendor
+            # directories without a modules.txt when Go itself admits them.
+            [[ ! -e "$document" ]] || _isb_go_committed_file "$root" "$document" >/dev/null || return 4
+            vendor=true; mod=vendor
+        elif [[ -f "$document" ]] && head -c 512 "$document" | jq -eRs '
+            split("\n")[0] | if startswith("## ") then .[3:] | split(";") |
+            any(.[]; gsub("^[[:space:]]+|[[:space:]]+$"; "") == "workspace")
+            else false end' >/dev/null; then
+            # Go ignores a member module's vendor tree and a legacy module
+            # vendor at the workspace root. Match its workspace annotation
+            # before choosing vendor mode, rather than forcing an invalid one.
+            vendor_hash=$(_isb_go_committed_file "$root" "$document") || return 4
+            vendor=true; mod=vendor
+        fi
+    fi
+    # Explicit vendor mode reads the committed vendor tree, not the original
+    # directories named by replace rules. Those originals need not exist in a
+    # self-contained clone. Go still checks vendor consistency before building;
+    # the caller rechecks all tracked source bytes after the complete family.
+    if [[ "$mod" != vendor ]]; then
+    for index in "${!documents[@]}"; do
+        document="${documents[$index]}"; scope="${scopes[$index]}"
+        if ! jq -es 'length == 1 and (.[0] | (.Replace // []) | type == "array" and all(.[];
+            (.Old.Path | type == "string" and length > 0 and (test("[[:cntrl:]]") | not)) and
+            ((.Old.Version // "") | type == "string" and (test("[[:cntrl:]]") | not)) and
+            (.New.Path | type == "string" and length > 0 and (test("[[:cntrl:]]") | not)) and
+            ((.New.Version // "") | type == "string" and (test("[[:cntrl:]]") | not))))' "$document" >/dev/null; then
+            _isb_log 'Invalid Go replacement selection'; return 4
+        fi
+        paths=$(jq -c '(.Replace // [])[]' "$document") || return 4
+        while IFS= read -r row; do
+            [[ -n "$row" ]] || continue
+            old=$(jq -r '.Old.Path' <<< "$row") || return 4
+            version=$(jq -r '.Old.Version // ""' <<< "$row") || return 4
+            replacement=$(jq -r '.New.Path' <<< "$row") || return 4
+            replacement_version=$(jq -r '.New.Version // ""' <<< "$row") || return 4
+            key="$old@$version"
+            if [[ -n "$work" && "$document" == "$output/go-workspace.log" ]]; then
+                [[ -z "${workspace_replaces[$key]:-}" ]] || { _isb_log 'Repeated Go workspace replacement'; return 4; }
+                workspace_replaces[$key]=1
+            elif [[ -n "${workspace_replaces[$old@]:-}" || -n "${workspace_replaces[$key]:-}" ]]; then
+                continue
+            fi
+            # An exact workspace override does not erase a module wildcard:
+            # other dependency versions could still select that directory.
+            # Keep it confined even when the current graph might not use it;
+            # admission does not resolve an external graph to prove absence.
+            if [[ -n "$replacement_version" ]]; then
+                identity="module:$replacement@$replacement_version"
+            else
+                replacement=$(_isb_go_directory "$root" "$scope" "$replacement") || {
+                    _isb_log "Local Go replacement escapes the checkout or traverses a link: $old"; return 4;
+                }
+                identity="directory:$replacement"
+            fi
+            if [[ -n "${replacements[$key]:-}" ]]; then
+                [[ "${replacements[$key]}" == "$identity" ]] || { _isb_log "Conflicting Go replacement: $old"; return 4; }
+                continue
+            fi
+            replacements[$key]="$identity"
+            [[ -z "$replacement_version" ]] || continue
+            hash=$(_isb_go_committed_file "$root" "$replacement/go.mod") || {
+                _isb_log "Local Go replacement requires a committed regular go.mod: $old"; return 4;
+            }
+            if [[ -e "$replacement/go.sum" || -L "$replacement/go.sum" ]]; then
+                _isb_go_committed_file "$root" "$replacement/go.sum" >/dev/null || return 4
+            fi
+            parsed="$output/go-replacement-${#replacements[@]}.log"
+            _isb_run "$limit" "$parsed" go mod edit -json "$replacement/go.mod" || {
+                status=$?; [[ "$status" != 5 ]] || return 5; return 4;
+            }
+            replacement_module=$(jq -ers 'if length == 1 then .[0].Module.Path |
+                select(type == "string" and length > 0 and (test("[[:cntrl:]]") | not))
+                else empty end' "$parsed") || return 4
+            replacement_relative="${replacement#"$root"/}"; [[ "$replacement" != "$root" ]] || replacement_relative=.
+            jq -nc --arg module "$old" --arg version "$version" --arg path "$replacement_relative" \
+                --arg replacement "$replacement_module" --arg hash "$hash" \
+                '{module_path:$module,version:$version,path:$path,replacement_module_path:$replacement,go_mod_sha256:$hash}' \
+                >> "$output/go-replacements.jsonl" || return 1
+        done <<< "$paths"
+    done
+    fi
+    relative="${work#"$root"/}"
+    jq -nc --arg work "${work:-off}" --arg path "$relative" --arg hash "$work_hash" --arg mod "$mod" \
+        --argjson vendor "$vendor" --arg vendor_hash "$vendor_hash" --slurpfile modules "$output/go-modules.jsonl" \
+        --slurpfile replacements "$output/go-replacements.jsonl" \
+        '{gowork:$work,mod:$mod,go_workspace:(if $work == "off" then null else
+          {path:$path,sha256:$hash,modules:$modules,local_replacements:$replacements,vendor:$vendor} +
+          (if $vendor then {vendor_modules_sha256:$vendor_hash} else {} end) end)}' \
+        > "$output/go-context.json"
+)
+
 # Build only the requested executable family, into a new private output directory.
 # Never run arbitrary command strings from installer configuration.
 _isb_compile() (
@@ -558,12 +804,12 @@ _isb_compile() (
             done
             ;;
         go)
-            [[ -f go.mod && ! -L go.mod ]] || return 4
             resolved_entries=$(_isb_source_entries "$language" "$tree" "$binary" "$entry" "${binaries[@]}") || return $?
             while IFS= read -r selected_entry; do entries+=("$selected_entry"); done <<< "$resolved_entries"
+            export GOENV=off GOWORK=off GOTOOLCHAIN=local GOFLAGS='' GO111MODULE=on GOTELEMETRY=off
             _isb_prepare_toolchain "$language" "$tree" "$output" "$limit" || return $?
             # Build for this installer host, not an inherited cross target.
-            export GOENV=off GOWORK=off GOTOOLCHAIN=local GOFLAGS='' GOOS='' GOARCH=''
+            export GOOS='' GOARCH=''
             _isb_run "$limit" "$output/compiler.log" go version || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
             _isb_run "$limit" "$output/platform.log" go env GOHOSTOS GOHOSTARCH || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
             local host_os host_arch
@@ -571,7 +817,10 @@ _isb_compile() (
             host_arch=$(sed -n '2p' "$output/platform.log")
             [[ "$host_os" =~ ^[a-z0-9]+$ && "$host_arch" =~ ^[a-z0-9]+$ ]] || return 6
             export GOOS="$host_os" GOARCH="$host_arch"
-            [[ ! -d vendor ]] || mod=vendor
+            _isb_go_context "${_ISB_CHECKOUT_ROOT:-$tree}" "$tree" "$output" "$limit" || return $?
+            GOWORK=$(jq -er .gowork "$output/go-context.json") || return 4
+            mod=$(jq -er .mod "$output/go-context.json") || return 4
+            export GOWORK
             # Check all providers before compiling the first member. A library
             # can make go build succeed with an archive, not an executable.
             for index in "${!entries[@]}"; do
@@ -733,7 +982,7 @@ install_source_build() (
         _isb_log 'Submodule source builds require a project-specific dependency setup'; return 4
     fi
     _isb_path_in_tree "$tree" "$subdir" && [[ -d "$tree/$subdir" ]] || return 4
-    local build_root
+    local build_root _ISB_CHECKOUT_ROOT="$tree"
     build_root=$(cd "$tree/$subdir" && pwd -P) || return 4
     _isb_log "Building ${binary_names[*]} from pinned commit $commit ($language)"
     payloads=$(_isb_compile "$language" "$build_root" "$output" "$binary" "$entry" "$package" "$limit" "${binaries[@]}") || return $?
@@ -762,19 +1011,25 @@ install_source_build() (
     [[ $index -eq ${#binary_names[@]} && -n "$primary_payload" ]] || return 6
     payload="$primary_payload"; sha="$primary_sha"; size="$primary_size"
     binaries_json=$(printf '%s\n' "${binary_receipts[@]}" | jq -sc '.') || return 1
-    local toolchain_receipt=null
+    local toolchain_receipt=null go_context_file=/dev/null
     if [[ -f "$output/toolchain/receipt.json" ]]; then
         toolchain_receipt=$(jq -ce 'del(.root,.bin_dir)' "$output/toolchain/receipt.json") || return 7
+    fi
+    if [[ "$language" == go ]]; then
+        go_context_file="$output/go-context.json"
+        [[ -f "$go_context_file" && ! -L "$go_context_file" ]] || return 7
     fi
     receipt=$(jq -nc --arg repo "$repo" --arg ref "$ref" --arg commit "$commit" \
         --arg language "$language" --arg path "$payload" --arg sha "$sha" --argjson size "$size" \
         --argjson binaries "$binaries_json" \
         --argjson toolchain "$toolchain_receipt" \
+        --slurpfile go_context "$go_context_file" \
         --arg compiler "$(cat "$output/compiler.log")" \
         '{schema_version:1,method:"source",repository:$repo,requested_ref:$ref,source_commit:$commit,
           language:$language,path:$path,sha256:$sha,size_bytes:$size,compiler:$compiler,
           binaries:$binaries,signed_release:false} +
-          (if $toolchain == null then {} else {toolchain:$toolchain} end)') || return 1
+          (if $toolchain == null then {} else {toolchain:$toolchain} end) +
+          (if $go_context[0].go_workspace == null then {} else {go_workspace:$go_context[0].go_workspace} end)') || return 1
     (set -C; printf '%s\n' "$receipt" > "$destination/receipt.json") || return 1
     _isb_log "Built $binary; SHA256 $sha (locally built, not a signed release)"
     printf '%s\n' "$receipt"
