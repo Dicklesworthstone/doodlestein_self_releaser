@@ -207,6 +207,14 @@ GIT
 cat > "$TEMP/bin/go" <<'GOCMD'
 #!/usr/bin/env bash
 printf 'go %s\n' "$*" >> "$CALLS"
+# Availability/version is an explicit boundary fixture. Once bootstrap selects
+# a private compiler, that compiler performs genuine package loading and builds.
+case "${INSTALLED_GO_MODE:-}" in
+    old)
+        if [[ "$*" == version ]]; then printf 'go version go1.19.1 %s\n' "$BOOT_GO_PLATFORM"; exit 0; fi
+        printf 'old compiler cannot compile this pinned source\n' >&2; exit 23 ;;
+    broken) printf 'existing Go installation is unavailable\n' >&2; exit 69 ;;
+esac
 if [[ "${GO_FAILURE:-}" == build && "$1" == build ]]; then
     echo 'intentional compilation failure' >&2
     exit 23
@@ -273,6 +281,17 @@ prepare_no_go_path() {
     done
 }
 
+source_compiler_hash() {
+    local digest
+    # PATH can legitimately name a symlink to an installed compiler. Hash its
+    # opened bytes for preservation checks; no compiler path is changed.
+    if command -v sha256sum >/dev/null 2>&1; then digest=$(sha256sum < "$GO_REAL") || return 1
+    else digest=$(shasum -a 256 < "$GO_REAL") || return 1; fi
+    digest="${digest%% *}"
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s\n' "$digest"
+}
+
 workspace_binary_runs() {
     [[ -f "$1" && -x "$1" ]] && [[ "$("$1")" == "$2" ]]
 }
@@ -293,8 +312,11 @@ test_workspace_bootstrap() {
     # the older plain-key controls on hosts without this optional dependency.
     command -v yq >/dev/null 2>&1 || { printf 'SKIP: Go workspace bootstrap family requires yq\n'; return 0; }
     local runtime_root runtime_version archive digest workspace pin work_hash label subdir entry family name
+    local original_go_hash
     runtime_root=$("$GO_REAL" env GOROOT) || return 1
     runtime_version=$("$GO_REAL" env GOVERSION) || return 1
+    original_go_hash=$(source_compiler_hash) || return 1
+    export BOOT_GO_PLATFORM="$os/$arch"
     [[ "$runtime_version" =~ ^go[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
     mkdir -p "$TEMP/workspace-bootstrap" || return 1
     archive="${DSR_TEST_GO_ARCHIVE:-}"
@@ -356,7 +378,7 @@ GO
     pin=$("$GIT_REAL" -C "$TEMP/upstream" rev-parse HEAD) || return 1
     work_hash=$(_isb_sha256 "$workspace/go.work") || return 1
     check 'workspace bootstrap fixture has no root go.mod' test ! -e "$workspace/go.mod"
-    for label in virtual-root member-root; do
+    for label in virtual-root member-root installed-old; do
         subdir=workspace; entry=cmd/app; family='[app, helper]'
         if [[ "$label" == member-root ]]; then
             subdir=workspace/cmd/app; entry=.; family='[app]'
@@ -373,8 +395,14 @@ artifact_naming: '\${name}-\${version}-\${os}-\${arch}'
 YAML
         INSTALLER=$(install_gen_create app) || return 1
         bash -n "$INSTALLER" || return 1
-        PATH="$TEMP/workspace-no-go" run_case "workspace-bootstrap-$label" discovery-fail \
-            --from-source --version v3.0.0 --install-toolchain --source-timeout 60
+        if [[ "$label" == installed-old ]]; then
+            INSTALLED_GO_MODE=old run_case "workspace-bootstrap-$label" discovery-fail \
+                --from-source --version v3.0.0 --install-toolchain --source-timeout 60
+            check 'installed-old workspace probes its existing compiler' grep -Fxq 'go version' "$CALLS"
+        else
+            PATH="$TEMP/workspace-no-go" run_case "workspace-bootstrap-$label" discovery-fail \
+                --from-source --version v3.0.0 --install-toolchain --source-timeout 60
+        fi
         check "$label workspace bootstraps its selected compiler and installs" equal "$status" 0
         check "$label workspace source receipt binds the fetched tag" source_json "$pin"
         check "$label workspace bootstrap executes the genuine app" workspace_binary_runs "$CASE/install/app" app-workspace-bootstrap
@@ -393,16 +421,18 @@ YAML
         check "$label workspace fetches only the selected compiler archive" grep -Fxq \
             "curl https://go.dev/dl/$runtime_version.$os-$arch.tar.gz" "$CALLS"
         check "$label workspace bootstrap releases its installation lock" test ! -e "$CASE/install/.dsr-install.lock"
-        if [[ "$label" == virtual-root ]]; then
-            check 'moduleless workspace bootstrap executes the genuine companion' workspace_binary_runs \
+        if [[ "$label" != member-root ]]; then
+            check "$label moduleless workspace bootstrap executes the genuine companion" workspace_binary_runs \
                 "$CASE/install/helper" helper-workspace-bootstrap
-            check 'moduleless workspace companion receipts bind the installed bytes' workspace_binary_receipt helper
-            check 'moduleless workspace bootstrap installs the exact complete family' jq -e '
+            check "$label moduleless workspace companion receipts bind the installed bytes" workspace_binary_receipt helper
+            check "$label moduleless workspace bootstrap installs the exact complete family" jq -e '
                 ([.binaries[].name] == ["app", "helper"]) and ([.source.binaries[].name] == ["app", "helper"])
             ' "$CASE/out.json"
         fi
     done
     check 'workspace compiler bootstrap preserves the global compiler home' test ! -e "$HOME/go"
+    check 'workspace compiler bootstrap preserves the installed real Go executable' equal \
+        "$original_go_hash" "$(source_compiler_hash)"
 }
 
 if [[ "$TEST_MODE" == --go-workspace-bootstrap-only ]]; then
@@ -606,7 +636,7 @@ check 'race fixture really advanced the branch' test "$("$GIT_REAL" -C "$SOURCE_
 # The downloaded executable is an explicit boundary adapter: it verifies that
 # private activation occurred, then uses the real host Go installation/cache.
 # Source checkout, compilation, installed bytes and receipt validation are real.
-export BOOT_GO_ROOT BOOT_GO_CACHE="$GOCACHE" BOOT_GO_VERSION
+export BOOT_GO_ROOT BOOT_GO_CACHE="$GOCACHE" BOOT_GO_VERSION BOOT_GO_PLATFORM="$os/$arch"
 BOOT_GO_ROOT=$("$GO_REAL" env GOROOT)
 BOOT_GO_VERSION=$("$GO_REAL" env GOVERSION)
 [[ "$BOOT_GO_VERSION" =~ ^go[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'A released Go compiler is required for bootstrap controls' >&2; exit 1; }
@@ -646,6 +676,42 @@ run_case bootstrap-existing discovery-fail --from-source --version v1.0.0 --inst
 check 'available compiler is preserved with bootstrap consent' equal "$status" 0
 check 'available compiler causes no distribution download' no_http
 check 'existing compiler receipt does not claim bootstrap' jq -e '.source | has("toolchain") | not' "$CASE/out.json"
+mkdir -p "$TEMP/results/bootstrap-installed-no-consent/install"
+printf 'preserved installation\n' > "$TEMP/results/bootstrap-installed-no-consent/install/app"
+prior=$(_isb_sha256 "$TEMP/results/bootstrap-installed-no-consent/install/app")
+INSTALLED_GO_MODE=old run_case bootstrap-installed-no-consent discovery-fail \
+    --from-source --version v2.0.0 --yes --source-timeout 60
+check 'installed old compiler without bootstrap consent fails compilation' equal "$status" 6
+check 'installed old compiler does not grant download consent' no_http
+check 'unconsented compiler failure preserves the installed application' equal "$prior" "$(_isb_sha256 "$CASE/install/app")"
+original_go=$(source_compiler_hash) || exit 1
+original_proxy=$(_isb_sha256 "$TEMP/bin/go")
+for installed_mode in old broken; do
+    INSTALLED_GO_MODE="$installed_mode" run_case "bootstrap-installed-$installed_mode" discovery-fail \
+        --from-source --version v2.0.0 --install-toolchain --source-timeout 60
+    check "$installed_mode installed Go recovers through explicit private bootstrap" equal "$status" 0
+    check "$installed_mode installed Go source result binds the pinned tag" source_json "$BOOT_PIN"
+    check "$installed_mode installed Go recovery compiles an executable that runs" workspace_binary_runs \
+        "$CASE/install/app" default-source-v2
+    check "$installed_mode installed Go recovery binds the verified distribution" jq -e \
+        --arg sha "$BOOT_DIGEST" --arg version "$BOOT_GO_VERSION" --arg platform "$os/$arch" '
+        .source.toolchain | .method == "isolated-bootstrap" and .language == "go" and
+        .version == ("go version " + $version + " " + $platform) and .distribution_sha256 == $sha and
+        (has("root") | not) and (has("bin_dir") | not)' "$CASE/out.json"
+    check "$installed_mode installed Go recovery uses the private compiler for the actual build" grep -Eq \
+        '^bootstrapped-go .*/toolchain/go/bin/go build ' "$CALLS"
+done
+check 'private compiler recovery preserves the global Go executable' equal "$original_go" "$(source_compiler_hash)"
+check 'private compiler recovery preserves the existing PATH compiler' equal "$original_proxy" "$(_isb_sha256 "$TEMP/bin/go")"
+mkdir -p "$TEMP/results/bootstrap-installed-corrupt/install"
+printf 'preserved installation\n' > "$TEMP/results/bootstrap-installed-corrupt/install/app"
+prior=$(_isb_sha256 "$TEMP/results/bootstrap-installed-corrupt/install/app")
+INSTALLED_GO_MODE=old BOOTSTRAP_MODE=bad-hash run_case bootstrap-installed-corrupt discovery-fail \
+    --from-source --version v2.0.0 --install-toolchain --yes --source-timeout 60
+check 'old installed compiler cannot bypass bootstrap checksum verification' equal "$status" 7
+check 'failed replacement compiler preserves the installed application' equal "$prior" "$(_isb_sha256 "$CASE/install/app")"
+check 'failed replacement compiler is not executed' bash -c '! grep -q "^bootstrapped-go " "$1"' _ "$CALLS"
+check 'failed replacement compiler reports a truthful error' error_json
 PATH="$TEMP/no-go" run_case bootstrap-no-consent discovery-fail --from-source --version v2.0.0
 check 'missing compiler without separate consent fails' equal "$status" 3
 check 'missing compiler is not silently downloaded' no_http

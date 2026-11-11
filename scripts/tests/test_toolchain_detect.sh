@@ -553,7 +553,7 @@ bootstrap_fixture() {
 printf 'go %s\n' "$*" >> "$BOOT_CALLS"
 touch "$BOOT_CASE/executed"
 [[ "$1" == version && "$GOROOT" == "$BOOT_ROOT/go" && "$GOENV" == off && "$GOTOOLCHAIN" == local ]] || exit 70
-printf 'go version go%s %s\n' "$BOOT_GO_VERSION" "$BOOT_PLATFORM"
+printf 'go version go%s %s\n' "${BOOT_GO_REPORTED_VERSION:-$BOOT_GO_VERSION}" "$BOOT_PLATFORM"
 GO
   chmod +x "$BOOT_CASE/go/bin/go"
   tar -czf "$BOOT_CASE/go.tar.gz" -C "$BOOT_CASE" go || return 1
@@ -673,6 +673,210 @@ test_bootstrap_go_exact_pin() (
   [[ "$BOOT_STATUS" == 0 ]] && grep -q 'go1.22.2.linux-amd64.tar.gz' "$BOOT_CASE/requests"
 )
 
+# Requirement admission is shared by installed-compiler selection and a fresh
+# bootstrap. These controls do not download or execute a compiler.
+test_bootstrap_go_requirement_selection() (
+  local file="$TEMP_DIR/go-requirement-$BASHPID.mod" expected text selected
+  while IFS='|' read -r expected text; do
+    printf '%b' "$text" > "$file" || return 1
+    selected=$(_tc_go_required_version "$file") || return 1
+    [[ "$selected" == "$expected" ]] || return 1
+  done <<'CASES'
+go1.22|module example.invalid/requirement\ngo 1.22\n
+go1.22.2|go 1.22.2\ntoolchain default\n
+go1.23.0|go 1.22\ntoolchain go1.23.0\nuse .\n
+go1.23|go 1.23\ntoolchain go1.22.2\n
+go1.22.2|go 1.22.2\ntoolchain go1.22.1\n
+go1.22.1|go 1.22.1\ntoolchain go1.22\n
+go2.0|go 2.0\ntoolchain go1.99.0\n
+go1.22.2|// committed workfile\r\ngo 1.22 // minimum\r\ntoolchain go1.22.2 // preference\r\nuse .\r\n
+go1.100.0|go 1.99.9\ntoolchain go1.100.0\n
+CASES
+)
+
+test_bootstrap_go_requirement_defaults() (
+  local directory="$TEMP_DIR/go-defaults-$BASHPID"
+  mkdir "$directory" || return 1
+  printf 'module example.invalid/legacy\n' > "$directory/go.mod"
+  printf 'use .\n' > "$directory/go.work"
+  [[ "$(_tc_go_required_version "$directory/go.mod")" == go1.16 &&
+     "$(_tc_go_required_version "$directory/go.work")" == go1.18 ]]
+)
+
+test_bootstrap_go_requirement_lower_preference() (
+  bootstrap_fixture || return 1
+  BOOT_GO_VERSION=1.23.0
+  printf 'module example.invalid/bootstrap\ngo 1.23.0\ntoolchain go1.22.2\n' > "$BOOT_CASE/tree/go.mod"
+  bootstrap_run go
+  [[ "$BOOT_STATUS" == 0 ]] && jq -e '
+    .version == "go version go1.23.0 linux/amd64" and
+    .distribution_url == "https://go.dev/dl/go1.23.0.linux-amd64.tar.gz"
+  ' "$BOOT_CASE/result.json" >/dev/null
+)
+
+# Only the installed compiler's availability/version is synthetic here. The
+# private bootstrap still uses the existing explicit distribution fixture and
+# production checksum, extraction, activation and watchdog code.
+bootstrap_go_installed() {
+  bootstrap_fixture || return 1
+  # shellcheck source=../../src/install_source.sh
+  source "$SRC_DIR/install_source.sh" || return 1
+  mkdir "$BOOT_CASE/existing-bin" "$BOOT_CASE/existing-root" "$BOOT_CASE/existing-work" "$BOOT_CASE/build" || return 1
+  export BOOT_ROOT="$BOOT_CASE/build/toolchain" BOOT_INSTALLED_MODE="$1"
+  export BOOT_INSTALLED_VERSION="${2:-1.21.9}"
+  printf 'preserved root\n' > "$BOOT_CASE/existing-root/sentinel"
+  printf 'preserved workspace\n' > "$BOOT_CASE/existing-work/sentinel"
+  cat > "$BOOT_CASE/existing-bin/go" <<'INSTALLED_GO'
+#!/usr/bin/env bash
+set -uo pipefail
+printf 'go %s\n' "$*" >> "$BOOT_CASE/probe-calls"
+[[ "$*" == version && "${GOENV:-}" == off && "${GOWORK:-}" == off &&
+   "${GOTOOLCHAIN:-}" == local && -z "${GOFLAGS:-}" && "${GO111MODULE:-}" == on &&
+   "${GOTELEMETRY:-}" == off ]] || exit 90
+case "$BOOT_INSTALLED_MODE" in
+  working) printf 'go version go%s linux/amd64\n' "$BOOT_INSTALLED_VERSION" ;;
+  broken) printf 'the configured Go installation is unavailable\n' >&2; exit 69 ;;
+  malformed) printf 'unrelated program named go\n' ;;
+  timeout) sleep 20 ;;
+  interrupted) kill -TERM "$BASHPID"; exit 143 ;;
+  *) exit 91 ;;
+esac
+INSTALLED_GO
+  chmod +x "$BOOT_CASE/existing-bin/go" || return 1
+  export PATH="$BOOT_CASE/existing-bin:$PATH"
+  export GOROOT="$BOOT_CASE/existing-root" GOPATH="$BOOT_CASE/existing-work"
+  BOOT_INSTALLED_HASH=$(_tc_bootstrap_sha256 "$BOOT_CASE/existing-bin/go") || return 1
+  _ISB_INSTALL_TOOLCHAIN=true
+}
+
+bootstrap_go_admit() {
+  BOOT_STATUS=0
+  _isb_prepare_toolchain go "$BOOT_CASE/tree" "$BOOT_CASE/build" "${2:-10}" \
+    "${1:-$BOOT_CASE/tree/go.mod}" > "$BOOT_CASE/activation.out" \
+    2> "$BOOT_CASE/activation.log" || BOOT_STATUS=$?
+}
+
+bootstrap_go_originals_unchanged() {
+  [[ "$(_tc_bootstrap_sha256 "$BOOT_CASE/existing-bin/go")" == "$BOOT_INSTALLED_HASH" &&
+     "$(cat "$BOOT_CASE/existing-root/sentinel")" == 'preserved root' &&
+     "$(cat "$BOOT_CASE/existing-work/sentinel")" == 'preserved workspace' &&
+     ! -e "$BOOT_CASE/existing-root/bin" && ! -e "$BOOT_CASE/existing-work/pkg" ]]
+}
+
+test_bootstrap_go_installed_old() (
+  bootstrap_go_installed working || return 1
+  GOENV="$BOOT_CASE/ambient.env" GOWORK="$BOOT_CASE/ambient.work" \
+    GOTOOLCHAIN=go1.99.0+auto GOFLAGS='-ambient-invalid' GO111MODULE=off \
+    bootstrap_go_admit
+  [[ "$BOOT_STATUS" == 0 && "$(command -v go)" == "$BOOT_ROOT/go/bin/go" &&
+     "$GOROOT" == "$BOOT_ROOT/go" && "$GOPATH" == "$BOOT_ROOT/go-work" ]] || return 1
+  bootstrap_go_originals_unchanged &&
+    jq -e '.method == "isolated-bootstrap" and .version == "go version go1.22.2 linux/amd64"' \
+      "$BOOT_ROOT/receipt.json" >/dev/null && grep -q '^go version$' "$BOOT_CASE/probe-calls"
+)
+
+test_bootstrap_go_installed_workspace_preference() (
+  bootstrap_go_installed working 1.22.2 || return 1
+  BOOT_GO_VERSION=1.23.0
+  printf 'go 1.22\ntoolchain go1.23.0\nuse .\n' > "$BOOT_CASE/tree/go.work"
+  bootstrap_go_admit "$BOOT_CASE/tree/go.work"
+  [[ "$BOOT_STATUS" == 0 ]] && bootstrap_go_originals_unchanged &&
+    jq -e '.version == "go version go1.23.0 linux/amd64" and
+      .distribution_url == "https://go.dev/dl/go1.23.0.linux-amd64.tar.gz"' "$BOOT_ROOT/receipt.json" >/dev/null
+)
+
+test_bootstrap_go_installed_patch_requirement() (
+  bootstrap_go_installed working 1.22.1 || return 1
+  printf 'module example.invalid/bootstrap\ngo 1.22.2\n' > "$BOOT_CASE/tree/go.mod"
+  bootstrap_go_admit
+  [[ "$BOOT_STATUS" == 0 && -f "$BOOT_ROOT/receipt.json" ]] && bootstrap_go_originals_unchanged
+)
+
+test_bootstrap_go_installed_compatible() (
+  local version prior_path
+  for version in 1.22.2 1.23.0 1.100.0; do
+    bootstrap_go_installed working "$version" || return 1
+    prior_path="$PATH"
+    bootstrap_go_admit
+    [[ "$BOOT_STATUS" == 0 && "$PATH" == "$prior_path" && "$GOROOT" == "$BOOT_CASE/existing-root" &&
+       "$GOPATH" == "$BOOT_CASE/existing-work" && ! -e "$BOOT_ROOT" && ! -e "$BOOT_CASE/requests" ]] || return 1
+    bootstrap_go_originals_unchanged || return 1
+    grep -q '^go version$' "$BOOT_CASE/probe-calls" || return 1
+  done
+)
+
+test_bootstrap_go_installed_legacy_version() (
+  bootstrap_go_installed working 1.20 || return 1
+  printf 'module example.invalid/legacy\ngo 1.20\n' > "$BOOT_CASE/tree/go.mod"
+  local prior_path="$PATH"
+  bootstrap_go_admit
+  [[ "$BOOT_STATUS" == 0 && "$PATH" == "$prior_path" && ! -e "$BOOT_ROOT" &&
+     ! -e "$BOOT_CASE/requests" ]] && bootstrap_go_originals_unchanged
+)
+
+test_bootstrap_go_installed_unreleased_version() (
+  bootstrap_go_installed working 1.22 || return 1
+  bootstrap_go_admit
+  [[ "$BOOT_STATUS" == 0 && "$(command -v go)" == "$BOOT_ROOT/go/bin/go" ]] &&
+    bootstrap_go_originals_unchanged && jq -e '.version == "go version go1.22.2 linux/amd64"' \
+      "$BOOT_ROOT/receipt.json" >/dev/null
+)
+
+test_bootstrap_go_installed_broken() (
+  local mode
+  for mode in broken malformed; do
+    bootstrap_go_installed "$mode" || return 1
+    bootstrap_go_admit
+    [[ "$BOOT_STATUS" == 0 && "$(command -v go)" == "$BOOT_ROOT/go/bin/go" &&
+       -f "$BOOT_ROOT/receipt.json" ]] || return 1
+    bootstrap_go_originals_unchanged || return 1
+  done
+)
+
+test_bootstrap_go_installed_no_consent() (
+  bootstrap_go_installed working || return 1
+  local prior_path="$PATH"
+  _ISB_INSTALL_TOOLCHAIN=false
+  bootstrap_go_admit
+  [[ "$BOOT_STATUS" == 0 && "$PATH" == "$prior_path" && ! -e "$BOOT_ROOT" &&
+     ! -e "$BOOT_CASE/requests" && ! -e "$BOOT_CASE/probe-calls" ]] && bootstrap_go_originals_unchanged
+)
+
+test_bootstrap_go_installed_probe_terminal() (
+  local mode
+  for mode in timeout interrupted; do
+    bootstrap_go_installed "$mode" || return 1
+    bootstrap_go_admit "$BOOT_CASE/tree/go.mod" 1
+    [[ "$BOOT_STATUS" == 5 && ! -e "$BOOT_ROOT" && ! -e "$BOOT_CASE/requests" ]] || return 1
+    bootstrap_go_originals_unchanged || return 1
+    [[ "$mode" != timeout || -f "$BOOT_CASE/build/toolchain-probe.log.timeout" ]] || return 1
+  done
+)
+
+test_bootstrap_go_installed_transport_failure() (
+  bootstrap_go_installed working || return 1
+  export BOOT_TRANSPORT_FAIL=true
+  bootstrap_go_admit
+  [[ "$BOOT_STATUS" == 8 && ! -e "$BOOT_ROOT/receipt.json" && ! -e "$BOOT_CASE/executed" ]] &&
+    bootstrap_go_originals_unchanged
+)
+
+test_bootstrap_go_installed_distribution_version() (
+  bootstrap_go_installed working || return 1
+  export BOOT_GO_REPORTED_VERSION=1.22.1
+  bootstrap_go_admit
+  [[ "$BOOT_STATUS" == 7 && ! -e "$BOOT_ROOT/receipt.json" &&
+     "$(command -v go)" == "$BOOT_CASE/existing-bin/go" ]] && bootstrap_go_originals_unchanged
+)
+
+test_bootstrap_go_installed_invalid_requirement() (
+  bootstrap_go_installed working || return 1
+  printf 'go 1.23\ntoolchain go1.22.2\ntoolchain default\n' > "$BOOT_CASE/tree/go.mod"
+  bootstrap_go_admit
+  [[ "$BOOT_STATUS" == 4 && ! -e "$BOOT_CASE/probe-calls" && ! -e "$BOOT_CASE/requests" &&
+     ! -e "$BOOT_ROOT" ]] && bootstrap_go_originals_unchanged
+)
+
 # These tests exercise requirement selection with the existing declared
 # distribution/version boundary fixture. The generated-installer acceptance
 # fixture separately installs an actual Go archive and compiles the workspace.
@@ -723,7 +927,7 @@ test_bootstrap_go_workspace_bad_directives() (
   bootstrap_fixture || return 1
   local contents status
   local -a malformed=(
-    'use .\n'
+    'go\nuse .\n'
     'go 1.22\ngo 1.23\n'
     'go 1.22\ntoolchain go1.22.2\ntoolchain default\n'
     'go 1.22 extra\n'
@@ -1136,6 +1340,21 @@ main() {
   run_test "bootstrap_requires_consent" test_bootstrap_requires_consent
   run_test "bootstrap_go_minor_selection" test_bootstrap_go_minor_selection
   run_test "bootstrap_go_exact_pin" test_bootstrap_go_exact_pin
+  run_test "bootstrap_go_requirement_selection" test_bootstrap_go_requirement_selection
+  run_test "bootstrap_go_requirement_defaults" test_bootstrap_go_requirement_defaults
+  run_test "bootstrap_go_requirement_lower_preference" test_bootstrap_go_requirement_lower_preference
+  run_test "bootstrap_go_installed_old" test_bootstrap_go_installed_old
+  run_test "bootstrap_go_installed_workspace_preference" test_bootstrap_go_installed_workspace_preference
+  run_test "bootstrap_go_installed_patch_requirement" test_bootstrap_go_installed_patch_requirement
+  run_test "bootstrap_go_installed_compatible" test_bootstrap_go_installed_compatible
+  run_test "bootstrap_go_installed_legacy_version" test_bootstrap_go_installed_legacy_version
+  run_test "bootstrap_go_installed_unreleased_version" test_bootstrap_go_installed_unreleased_version
+  run_test "bootstrap_go_installed_broken" test_bootstrap_go_installed_broken
+  run_test "bootstrap_go_installed_no_consent" test_bootstrap_go_installed_no_consent
+  run_test "bootstrap_go_installed_probe_terminal" test_bootstrap_go_installed_probe_terminal
+  run_test "bootstrap_go_installed_transport_failure" test_bootstrap_go_installed_transport_failure
+  run_test "bootstrap_go_installed_distribution_version" test_bootstrap_go_installed_distribution_version
+  run_test "bootstrap_go_installed_invalid_requirement" test_bootstrap_go_installed_invalid_requirement
   run_test "bootstrap_go_workspace_minor_selection" test_bootstrap_go_workspace_minor_selection
   run_test "bootstrap_go_workspace_toolchain_pin" test_bootstrap_go_workspace_toolchain_pin
   run_test "bootstrap_go_workspace_default_crlf" test_bootstrap_go_workspace_default_crlf

@@ -24,6 +24,9 @@ on:
       - scripts/tests/test_generated_workspace_installer.sh
       - scripts/tests/test_install_source.sh
       - scripts/tests/test_install_source_family.sh
+      - scripts/tests/test_toolchain_detect.sh
+      - scripts/tests/test_generated_installer_source.sh
+      - scripts/tests/test_generated_installer_workspace_bootstrap.sh
       - dsr
       - src/act_runner.sh
       - src/artifact_naming.sh
@@ -34,6 +37,7 @@ on:
       - src/host_health.sh
       - src/install_gen.sh
       - src/install_source.sh
+      - src/toolchain_detect.sh
       - src/packaging.sh
       - src/platforms.sh
       - src/slsa.sh
@@ -88,6 +92,19 @@ jobs:
           mkdir -p "$RUNNER_TEMP/dsr-test-bin"
           GOBIN="$RUNNER_TEMP/dsr-test-bin" go install github.com/mikefarah/yq/v4@v4.47.1
           echo "$RUNNER_TEMP/dsr-test-bin" >> "$GITHUB_PATH"
+      - name: Validate installed-Go recovery and private source toolchains
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n src/toolchain_detect.sh
+          bash -n src/install_source.sh
+          bash -n scripts/tests/test_toolchain_detect.sh
+          bash -n scripts/tests/test_generated_installer_source.sh
+          timeout 120 bash scripts/tests/test_toolchain_detect.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/toolchain-bootstrap.log"
+          timeout 120 bash scripts/tests/test_generated_installer_source.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/generated-source-bootstrap.log"
+          timeout 120 bash scripts/tests/test_generated_installer_workspace_bootstrap.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/workspace-bootstrap.log"
+          test -z "$(git status --porcelain)"
       - name: Validate large Git inventories and source context transport
         shell: bash
         run: |

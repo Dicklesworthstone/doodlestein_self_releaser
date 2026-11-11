@@ -634,14 +634,15 @@ or fall back to source when release discovery/download is unavailable with
 and dependency build code. A failed release checksum or signature remains fatal;
 source fallback cannot bypass artifact verification.
 
-When a required compiler is missing, add **`--install-toolchain`** to prepare one
-inside that source attempt's private build directory:
+When a required compiler is missing, or the installed Go compiler cannot run or
+is older than the pinned source requires, add **`--install-toolchain`** to prepare
+a compatible compiler inside that source attempt's private build directory:
 
 ```bash
 # Build this release tag, preparing a compiler only if required.
 bash install.sh --from-source --version v1.2.3 --install-toolchain
 
-# Prefer a verified release; permit source fallback and a missing compiler.
+# Prefer a verified release; permit source fallback and private compiler setup.
 bash install.sh --allow-source-build --install-toolchain
 ```
 
@@ -660,16 +661,31 @@ Compiler selection comes from the selected source tree:
 
 | Language | Selection |
 |----------|-----------|
-| Go | Requirements come from the nearest committed `go.work` within the fetched checkout, or the selected module's `go.mod` when no workspace applies. An exact numeric `toolchain goX.Y.Z` takes precedence. Otherwise the `go` directive is used: an exact patch stays exact, while `X.Y` selects the newest stable patch in that minor. Unsupported or unavailable requirements fail. |
+| Go | Requirements come from the nearest committed `go.work` within the fetched checkout, or the selected module's `go.mod` when no workspace applies. The higher of a numeric `toolchain` preference and the mandatory `go` version selects the compiler. An omitted `go` directive means 1.18 for `go.work` and 1.16 for `go.mod`, following Go's defaults. An exact patch stays exact, while `X.Y` selects the newest stable patch in that minor. Unsupported or unavailable requirements fail. |
 | Rust | Rustup reads the repository's `rust-toolchain.toml` or legacy `rust-toolchain` file. Without one, the private installation selects stable. Ambient parent overrides are not adopted as project requirements. |
 | Bun / TypeScript | An exact numeric `packageManager: bun@X.Y.Z` is honored; otherwise an exact numeric `engines.bun` can pin the version. Unpinned recipes use the latest stable Bun release and must satisfy any declared engine range. Unsupported pins or incompatible ranges fail. |
 
-A working compiler already on PATH is preserved, including an older compiler
-that may subsequently fail the project's build requirements. Rustup proxies can
-exist without the selected compiler: with bootstrap consent, a bounded probe
-checks availability with automatic Rustup installation disabled. A missing
-selected compiler permits a private bootstrap; a probe timeout or interruption
-fails before downloading anything. Compiler upgrades are not implicit.
+With explicit bootstrap consent, the installer probes an existing Go compiler
+with automatic Go toolchain downloads disabled, outside any ambient workspace
+or user Go environment file. Its released version must meet the selected
+committed `go` requirement and any numeric `toolchain` preference. A compatible
+compiler remains in use, including one newer than the preference; the installer
+does not download a downgrade. An older, unavailable or unidentifiable Go
+compiler selects the same verified private bootstrap used when Go is absent.
+A numeric `toolchain` preference older than the file's `go` requirement cannot
+lower that mandatory requirement. This is a compiler-selection safeguard; Go
+still validates the complete module or workspace and can reject it. Malformed
+or duplicate version directives are refused before downloading anything. A probe
+timeout or interruption is terminal.
+
+Without `--install-toolchain`, no compiler download or replacement is authorized:
+an existing incompatible compiler can still fail the source build. Global Go
+executables, homes and profiles remain untouched even when a private compiler
+is selected. Rust and Bun retain their existing working compilers. Rustup
+proxies can exist without the selected compiler: with bootstrap consent, a
+bounded probe checks availability with automatic Rustup installation disabled.
+A missing selected Rust compiler permits a private bootstrap; its probe timeout
+or interruption also fails before downloading anything.
 
 Downloads use official HTTPS endpoints and verified SHA-256 metadata before
 execution. Go also verifies the advertised archive size and admits only regular
@@ -698,10 +714,12 @@ install_source_build owner/repo refs/tags/v1.2.3 go app ./new-build \
   --allow-build --install-toolchain --timeout 3600
 ```
 
-The fresh-compiler workspace regression runs the generated installer with no Go
-on PATH and a genuine distribution, then executes and verifies the installed
-family. It has its own test entrypoint so cold compiler setup retains the
-ordinary per-file deadline:
+The workspace bootstrap regression runs the generated installer both with no Go
+on PATH and with an explicitly simulated older compiler. It extracts a genuine
+distribution, builds the pinned workspace, then executes and verifies the
+installed family. Only distribution delivery and the old compiler probe are
+adapted; the private compiler and generated programs are real. It has its own
+test entrypoint so cold compiler setup retains the ordinary per-file deadline:
 
 ```bash
 bash scripts/tests/test_generated_installer_workspace_bootstrap.sh

@@ -710,17 +710,26 @@ _tc_bootstrap_extract_go() {
     [[ -f "$destination/go/bin/go" && ! -L "$destination/go/bin/go" ]] || return 7
 }
 
-_tc_bootstrap_go() {
-    local tree="$1" root="$2" platform="$3" requested selection version filename digest size actual
-    local requirements="${4:-$tree/go.mod}"
+_tc_go_required_version() {
+    local requirements="$1" requested implicit=1.16
     [[ -f "$requirements" && ! -L "$requirements" ]] || return 4
-    # The toolchain directive is an exact preferred compiler. Without it, use
-    # the stated go version; a major.minor selects its newest published patch,
-    # never a different minor. Do not silently update a pinned requirement.
-    # The source engine admits this file from its pinned checkout. This small
-    # bootstrap reader only selects a distribution; Go parses the full module
-    # or workfile after that verified compiler becomes available.
-    requested=$(awk '
+    [[ "${requirements##*/}" != go.work ]] || implicit=1.18
+    # The go directive is the minimum; toolchain may suggest a newer compiler.
+    # Use the higher numeric requirement. A major.minor selects its newest
+    # published patch, never a different minor. Missing go directives use Go's
+    # documented module/workspace defaults. The source engine admits this file
+    # from its pinned checkout; the same selection drives installed-Go admission
+    # and private bootstrap. Go parses the full file after compiler selection.
+    requested=$(awk -v implicit="$implicit" '
+        function at_least(selected, minimum, a, b, n, m, i, left, right) {
+            n=split(selected,a,"."); m=split(minimum,b,".")
+            for (i=1; i<=3; i++) {
+                left=(i<=n ? a[i]+0 : 0); right=(i<=m ? b[i]+0 : 0)
+                if (left > right) return 1
+                if (left < right) return 0
+            }
+            return 1
+        }
         { sub(/\r$/, ""); sub(/\/\/.*/, "") }
         $1 == "go" {
             if (NF != 2 || ++g != 1 || $2 !~ /^[1-9][0-9]*\.[0-9]+(\.[0-9]+)?$/) bad=1
@@ -731,15 +740,26 @@ _tc_bootstrap_go() {
             selected=$2
         }
         END {
-            if (bad || g != 1) exit 1
-            if (selected != "" && selected != "default") print selected
+            if (bad) exit 1
+            if (!g) version=implicit
+            if (selected != "" && selected != "default") {
+                if (at_least(substr(selected,3),version)) print selected
+                else print "go" version
+            }
             else print "go" version
         }' "$requirements") || {
-        _tc_log_error 'Go bootstrap requires one released numeric go version and an optional numeric toolchain preference'; return 4;
+        _tc_log_error 'Go bootstrap requires valid numeric go/toolchain versions without duplicate directives'; return 4;
     }
     [[ "$requested" =~ ^go[1-9][0-9]*\.[0-9]+(\.[0-9]+)?$ ]] || {
         _tc_log_error 'Go bootstrap requires a released numeric go/toolchain version'; return 4;
     }
+    printf '%s\n' "$requested"
+}
+
+_tc_bootstrap_go() {
+    local tree="$1" root="$2" platform="$3" requested selection version filename digest size actual
+    local requirements="${4:-$tree/go.mod}"
+    requested=$(_tc_go_required_version "$requirements") || return $?
     _tc_bootstrap_fetch 'https://go.dev/dl/?mode=json&include=all' "$root/releases.json" 8388608 || return $?
     selection=$(jq -ers --arg requested "$requested" --arg os "${platform%/*}" --arg arch "${platform#*/}" '
         if length != 1 or (.[0]|type) != "array" then error("invalid Go release metadata") else .[0] end |

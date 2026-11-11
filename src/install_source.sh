@@ -361,38 +361,78 @@ _isb_probe_rust() (
     rustc -vV && cargo --version
 )
 
-# Activate an explicitly requested bootstrap only when a compiler is missing.
+# Inspect the installed Go compiler without letting Go download another one,
+# adopt an ambient workspace, or consult a user-written Go environment file.
+_isb_probe_go() (
+    export GOENV=off GOWORK=off GOTOOLCHAIN=local GOFLAGS='' GO111MODULE=on GOTELEMETRY=off
+    cd "$1" || return 4
+    go version
+)
+
+# Activate an explicitly requested bootstrap when a compiler is unavailable,
+# or when an installed Go compiler is older than the pinned source requires.
 # This runs inside _isb_compile's subshell, so PATH and language homes never
 # escape the source attempt or replace the caller's installed toolchain.
 _isb_prepare_toolchain() {
     local language="$1" tree="$2" output="$3" limit="$4" command root bin source_dir status=0
-    local go_requirements="${5:-}"
+    local go_requirements="${5:-}" installed=false required observed version
     local -a bootstrap_options=(--allow-install)
     [[ -z "$go_requirements" || "$language" == go ]] || return 4
     [[ -z "$go_requirements" ]] || bootstrap_options+=(--go-requirements "$go_requirements")
     case "$language" in rust) command=cargo ;; go) command=go ;; *) command=bun ;; esac
     if command -v "$command" >/dev/null 2>&1 &&
        { [[ "$language" != rust ]] || command -v rustc >/dev/null 2>&1; }; then
-        if [[ "$language" != rust || "${_ISB_INSTALL_TOOLCHAIN:-false}" != true ]]; then
+        installed=true
+        if [[ "${_ISB_INSTALL_TOOLCHAIN:-false}" != true ||
+              ( "$language" != rust && "$language" != go ) ]]; then
             return 0
         fi
-        # A working installed compiler is preserved even if it is too old for
-        # the project. An unavailable rustup-selected compiler is a missing
-        # toolchain; bootstrap it privately instead of changing that rustup home.
-        _isb_run "$limit" "$output/toolchain-probe.log" _isb_probe_rust "$tree" || status=$?
-        ((status != 0)) || return 0
-        [[ "$status" != 5 ]] || return 5
-        _isb_log 'The existing Rust commands do not provide the selected compiler; preparing an isolated toolchain'
+        if [[ "$language" == rust ]]; then
+            # An unavailable rustup-selected compiler is a missing toolchain;
+            # bootstrap privately instead of changing that rustup home.
+            _isb_run "$limit" "$output/toolchain-probe.log" _isb_probe_rust "$tree" || status=$?
+            ((status != 0)) || return 0
+            ((status != 5 && status < 128)) || return 5
+            _isb_log 'The existing Rust commands do not provide the selected compiler; preparing an isolated toolchain'
+        fi
     fi
     if [[ "${_ISB_INSTALL_TOOLCHAIN:-false}" != true ]]; then
         _isb_log "Missing $command; --install-toolchain permits an isolated compiler for this build"
         return 3
     fi
-    if ! declare -F toolchain_bootstrap >/dev/null 2>&1; then
+    if ! declare -F toolchain_bootstrap >/dev/null 2>&1 ||
+       { [[ "$language" == go ]] && ! declare -F _tc_go_required_version >/dev/null 2>&1; }; then
         source_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || return 3
         [[ -f "$source_dir/toolchain_detect.sh" && ! -L "$source_dir/toolchain_detect.sh" ]] || return 3
         # shellcheck source=SCRIPTDIR/toolchain_detect.sh
         source "$source_dir/toolchain_detect.sh" || return 3
+    fi
+    if $installed && [[ "$language" == go ]]; then
+        # The same committed requirement selects both admission and bootstrap.
+        # A toolchain preference is a minimum for an existing installation;
+        # preserve a newer compiler rather than downloading a downgrade.
+        required=$(_tc_go_required_version "${go_requirements:-$tree/go.mod}") || return $?
+        _isb_run "$limit" "$output/toolchain-probe.log" _isb_probe_go "$tree" || status=$?
+        ((status != 5 && status < 128)) || return 5
+        if ((status == 0)); then
+            observed=$(cat "$output/toolchain-probe.log") || return 1
+            # Before Go 1.21 initial releases omitted the patch component.
+            # A modern two-component version identifies an unreleased compiler.
+            if [[ "$observed" =~ ^go\ version\ go([1-9][0-9]*\.[0-9]+\.[0-9]+|1\.([0-9]|1[0-9]|20))\ [a-z0-9]+/[a-z0-9]+$ ]]; then
+                version="${BASH_REMATCH[1]}"
+                required="${required#go}"
+                [[ "$version" == *.*.* ]] || version+=.0
+                [[ "$required" == *.*.* ]] || required+=.0
+                if _tc_version_ge "$version" "$required"; then
+                    return 0
+                fi
+                _isb_log "Installed Go $version is older than the pinned requirement $required; preparing an isolated toolchain"
+            else
+                _isb_log 'The existing Go command did not identify a released compiler; preparing an isolated toolchain'
+            fi
+        else
+            _isb_log 'The existing Go command is unavailable; preparing an isolated toolchain'
+        fi
     fi
     root="$output/toolchain"
     _isb_log "Preparing a private $language toolchain; existing installations and profiles are preserved"
