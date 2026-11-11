@@ -42,6 +42,7 @@ on:
       - src/packaging.sh
       - src/platforms.sh
       - src/slsa.sh
+      - src/source_snapshot_windows.ps1
       - schemas/manifest.json
       - schemas/prune-details.json
   workflow_dispatch:
@@ -178,6 +179,26 @@ jobs:
           DSR_TEST_DISK_ROOT="$RUNNER_TEMP" DSR_TEST_GOCACHE="$RUNNER_TEMP/strict-go-cache" \
             timeout 120 bash scripts/tests/test_native_source_sync.sh --strict-go-siblings-only \
               2>&1 | tee "$RUNNER_TEMP/collector-evidence/strict-go-siblings.log"
+          test -z "$(git status --porcelain)"
+      - name: Verify Windows Go staging with genuine PowerShell and PE outputs
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v pwsh >/dev/null || ! pwsh -NoLogo -NoProfile -Command 'if ($PSVersionTable.PSVersion -lt [version]"7.4") { exit 1 }'; then
+            archive="$RUNNER_TEMP/powershell-7.5.2-linux-x64.tar.gz"
+            curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
+              --user-agent 'doodlestein_self_releaser-agent (+https://github.com/Dicklesworthstone/doodlestein_self_releaser)' \
+              --output "$archive" \
+              https://github.com/PowerShell/PowerShell/releases/download/v7.5.2/powershell-7.5.2-linux-x64.tar.gz
+            printf '%s  %s\n' 8fa9584f6f95d29ca1466c4397ac39c371373d6581c12dfae9ebd53c06d77664 "$archive" | sha256sum --check --strict
+            mkdir -p "$RUNNER_TEMP/dsr-powershell"
+            tar -xzf "$archive" -C "$RUNNER_TEMP/dsr-powershell"
+            chmod +x "$RUNNER_TEMP/dsr-powershell/pwsh"
+            export PATH="$RUNNER_TEMP/dsr-powershell:$PATH"
+          fi
+          DOTNET_PROCESSOR_COUNT=1 timeout 120 bash scripts/tests/test_native_source_sync.sh --windows-strict-go-only \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/windows-go-staging.log"
           test -z "$(git status --porcelain)"
       - name: Validate stdin-isolated target dispatch and exact-run resume
         shell: bash

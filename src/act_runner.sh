@@ -7702,6 +7702,141 @@ _act_windows_source_runtime_script() {
     cat "$module"
 }
 
+# Go writes its executable into the working tree. Re-expand the authenticated
+# Git archives into one fresh attempt, retaining the pinned sibling layout,
+# instead of allowing compilation to change the immutable source snapshots.
+_act_windows_strict_go_build_script() {
+    [[ $# == 8 ]] || return 4
+    local LC_ALL=C || return 4
+    local host="$1" tool="$2" local_path="$3" revision="$4"
+    local source_root="$5" stage_root="$6" build_cmd="$7" build_env="$8"
+    local path dependencies sources entry name checkout sha archive manifest manifest_dir
+    local archive_digest manifest_digest object_count records='[]' total_objects=1
+    local records_b64 command_b64 environment_b64 budget_script
+    source_root="${source_root//\\//}" stage_root="${stage_root//\\//}"
+    if [[ "$source_root" =~ ^/([A-Za-z])/(.*)$ ]]; then
+        source_root="${BASH_REMATCH[1]}:/${BASH_REMATCH[2]}"
+    fi
+    for path in "$source_root" "$stage_root"; do
+        [[ "$path" =~ ^[A-Za-z]:/[A-Za-z0-9_./+-]+$ && "$path" != *..* ]] || return 4
+    done
+    [[ "${source_root##*/}" == source && "${source_root%/*}" == "${stage_root%/*}" &&
+       "${stage_root##*/}" == dsr-build-* && "$source_root" != "$stage_root" &&
+       "$revision" =~ ^[0-9a-f]{40}$ && -n "$build_cmd" ]] || return 4
+    dependencies=$(_act_release_source_dependency_checkouts_json "$tool") || return 4
+    # Windows path comparison is case insensitive. Never let a sibling replace
+    # the primary source root or collapse another admitted sibling name.
+    jq -e 'all(.[]; (.relative_path | ascii_downcase) != "source") and
+        ([.[].relative_path | ascii_downcase] | length == (unique | length))' \
+        <<< "$dependencies" >/dev/null || return 4
+    sources=$(jq -c --arg path "$local_path" --arg sha "$revision" \
+        '[{relative_path:"source",local_path:$path,git_sha:$sha}] + .' <<< "$dependencies") || return 4
+    mkdir -p "$ACT_ARTIFACTS_DIR/strict-source-verification" || return 4
+    manifest_dir=$(umask 077; mktemp -d \
+        "$ACT_ARTIFACTS_DIR/strict-source-verification/windows-go.XXXXXXXX") || return 4
+    while IFS= read -r entry; do
+        name=$(jq -er '.relative_path' <<< "$entry") || return 4
+        checkout=$(jq -er '.local_path' <<< "$entry") || return 4
+        sha=$(jq -er '.git_sha' <<< "$entry") || return 4
+        archive="dependency-$name"
+        [[ "$name" != source ]] || archive=source
+        manifest="$manifest_dir/$archive.manifest"
+        if ! _act_validate_strict_checkout_at_revision "$checkout" "$sha" "$name" || \
+           ! _act_write_tracked_manifest "$checkout" "$sha" "$manifest" || \
+           ! archive_digest=$(_act_git_archive_sha256 "$checkout" "$sha") || \
+           ! manifest_digest=$(_act_sha256 "$manifest") || \
+           ! object_count=$(_act_tracked_manifest_object_count "$manifest"); then
+            _log_error "Unable to bind Windows Go output-stage source $name to its pinned Git archive"
+            return 4
+        fi
+        [[ "$archive_digest" =~ ^[0-9a-f]{64}$ && "$manifest_digest" =~ ^[0-9a-f]{64}$ &&
+           "$object_count" =~ ^[0-9]{1,7}$ ]] || return 4
+        total_objects=$((total_objects + object_count + 1))
+        records=$(jq -c --arg name "$name" --arg archive ".$archive.tar" \
+            --arg manifest ".$archive.manifest" --arg archive_sha "$archive_digest" \
+            --arg manifest_sha "$manifest_digest" --argjson count "$object_count" \
+            '. + [{name:$name,archive:$archive,manifest:$manifest,archive_sha256:$archive_sha,
+                   manifest_sha256:$manifest_sha,object_count:$count}]' <<< "$records") || return 4
+    done < <(jq -c '.[]' <<< "$sources")
+    records_b64=$(printf '%s' "$records" | base64 | tr -d '\r\n') || return 4
+    command_b64=$(printf '%s' "$build_cmd" | base64 | tr -d '\r\n') || return 4
+    environment_b64=$(printf '%s' "$build_env" | jq -Rsec '
+        split("\n") | map(select(length > 0)) |
+        if all(.[]; test("^[A-Za-z_][A-Za-z0-9_]*=")) then
+            map(capture("^(?<name>[^=]+)=(?<value>.*)$"))
+        else error("invalid Go build environment") end' | base64 | tr -d '\r\n') || return 4
+    budget_script=$(_act_windows_source_budget_script "$host" "${source_root%/*}" \
+        0 "$total_objects" expansion) || return 4
+    _act_windows_source_runtime_script || return 4
+    cat <<EOF
+\$ErrorActionPreference='Stop'
+Assert-DsrWindowsSourceRuntime
+\$dsrSnapshotParent='${source_root%/*}'
+\$dsrStageRoot='$stage_root'
+\$dsrStageSource=Join-Path \$dsrStageRoot 'source'
+\$dsrSourceRecords=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$records_b64')) | ConvertFrom-Json
+\$dsrSourceGuards=New-Object 'System.Collections.Generic.List[IDisposable]'
+\$dsrStagePlans=New-Object 'System.Collections.Generic.List[object]'
+\$dsrGoProcess=\$null
+try {
+    \$dsrSourceGuards.AddRange([IDisposable[]](Open-DsrWindowsSourceAncestors \$dsrSnapshotParent))
+    \$dsrExpandedBytes=[long]0
+    foreach (\$record in \$dsrSourceRecords) {
+        Assert-DsrWindowsSourceMember \$record.name
+        \$plan=Get-DsrWindowsSourcePlan -ArchivePath (Join-Path \$dsrSnapshotParent \$record.archive) -ManifestPath (Join-Path \$dsrSnapshotParent \$record.manifest) -ExpectedArchiveSha256 \$record.archive_sha256 -ExpectedManifestSha256 \$record.manifest_sha256 -ExpectedObjectCount \$record.object_count
+        \$original=Join-Path \$dsrSnapshotParent \$record.name
+        \$null=Test-DsrWindowsSourceSnapshot -Plan \$plan -DestinationPath \$original
+        \$dsrStagePlans.Add(@{Plan=\$plan; Original=\$original; Destination=(Join-Path \$dsrStageRoot \$record.name)})
+        \$dsrExpandedBytes+=\$plan.ExpandedBytes
+    }
+    # Admit the complete source tuple before creating any writable copy.
+    \$dsrSourcePlan=@{ExpandedBytes=\$dsrExpandedBytes}
+    $budget_script
+    if (Get-Item -LiteralPath \$dsrStageRoot -Force -ErrorAction SilentlyContinue) { throw 'Windows Go output stage already exists' }
+    \$null=New-Item -ItemType Directory -Path \$dsrStageRoot -ErrorAction Stop
+    if ([OperatingSystem]::IsWindows()) {
+        \$acl=[Security.AccessControl.DirectorySecurity]::new()
+        \$user=[Security.Principal.WindowsIdentity]::GetCurrent().User
+        \$acl.SetOwner(\$user)
+        \$acl.SetAccessRuleProtection(\$true,\$false)
+        foreach (\$identity in @(\$user,[Security.Principal.SecurityIdentifier]::new('S-1-5-18'))) {
+            \$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(\$identity,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))
+        }
+        Set-Acl -LiteralPath \$dsrStageRoot -AclObject \$acl
+    }
+    \$dsrSourceGuards.AddRange([IDisposable[]](Open-DsrWindowsSourceAncestors \$dsrStageRoot))
+    foreach (\$item in \$dsrStagePlans) {
+        \$null=New-Item -ItemType Directory -Path \$item.Destination -ErrorAction Stop
+        \$null=Expand-DsrWindowsSourceSnapshot -Plan \$item.Plan -DestinationPath \$item.Destination
+    }
+    # A later sibling expansion must not invalidate an earlier copied root.
+    foreach (\$item in \$dsrStagePlans) {
+        \$null=Test-DsrWindowsSourceSnapshot -Plan \$item.Plan -DestinationPath \$item.Original
+        \$null=Test-DsrWindowsSourceSnapshot -Plan \$item.Plan -DestinationPath \$item.Destination
+    }
+    \$psi=[Diagnostics.ProcessStartInfo]::new()
+    \$psi.UseShellExecute=\$false
+    \$psi.WorkingDirectory=\$dsrStageSource
+    \$psi.FileName=\$env:ComSpec
+    foreach (\$name in @('GOOS','GOARCH')) { \$psi.EnvironmentVariables.Remove(\$name) }
+    \$environment=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$environment_b64')) | ConvertFrom-Json
+    foreach (\$pair in \$environment) { \$psi.EnvironmentVariables[\$pair.name]=\$pair.value }
+    \$command=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$command_b64'))
+    \$psi.Arguments='/d /s /c "' + \$command + '"'
+    \$dsrGoProcess=[Diagnostics.Process]::Start(\$psi)
+    \$dsrGoProcess.WaitForExit()
+    \$dsrGoExit=\$dsrGoProcess.ExitCode
+    foreach (\$item in \$dsrStagePlans) {
+        \$null=Test-DsrWindowsSourceSnapshot -Plan \$item.Plan -DestinationPath \$item.Original
+    }
+} finally {
+    if (\$null -ne \$dsrGoProcess) { \$dsrGoProcess.Dispose() }
+    foreach (\$guard in \$dsrSourceGuards) { \$guard.Dispose() }
+}
+exit \$dsrGoExit
+EOF
+}
+
 # Source verification has the same command-line limit as native compilation.
 # Keep larger programs as the existing hash-bound, held Windows script files.
 _act_windows_source_command() {
@@ -13359,7 +13494,8 @@ act_run_native_build() {
     # stage: its outputs are scoped by target triple and isolated above.
     # Strict non-Rust builds also need a private copy: installers and in-tree
     # outputs must not add files to the immutable release source snapshot.
-    # Windows hosts remain serialized by the orchestrator.
+    # Strict Windows Go has the same in-tree output requirement even while
+    # the orchestrator serializes tasks for a Windows host.
     local output_stage_root="" output_stage_source="" output_stage_parent=""
     local output_stage_sibling_names=""
     local output_stage_dependencies='[]'
@@ -13433,6 +13569,25 @@ act_run_native_build() {
                 output_stage_sibling_names+="$output_sibling_relative"$'\n'
             done
         fi
+    elif [[ "$language" == go ]] && $strict_native_build && _act_is_windows_host "$host"; then
+        local windows_output_source_root="${remote_path//\\//}" output_stage_uuid
+        if [[ "$windows_output_source_root" =~ ^/([A-Za-z])/(.*)$ ]]; then
+            windows_output_source_root="${BASH_REMATCH[1]}:/${BASH_REMATCH[2]}"
+        fi
+        # Stay on the admitted source volume. The launcher applies the host's
+        # storage lock and the staging script charges every expanded sibling
+        # against that same source budget before it creates any output tree.
+        output_stage_parent="${windows_output_source_root%/*}"
+        if [[ ! "$tool_name" =~ ^[A-Za-z0-9_.-]+$ ||
+              ! "${platform//\//-}" =~ ^[A-Za-z0-9_.-]+$ ||
+              ! "$output_stage_parent" =~ ^[A-Za-z]:/[A-Za-z0-9_./+-]+$ ||
+              "$output_stage_parent" == *..* ]] ||
+           ! output_stage_uuid=$(_act_generate_uuid); then
+            _log_error "Unable to derive a unique Windows Go output stage"
+            return 4
+        fi
+        output_stage_root="$output_stage_parent/dsr-build-${tool_name}-${platform//\//-}-${output_stage_uuid//-/}"
+        output_stage_source="$output_stage_root/source"
     fi
     # Where in-tree outputs of this build land (collection reads from here).
     local artifact_source_root="${output_stage_source:-$remote_path}"
@@ -13540,7 +13695,7 @@ act_run_native_build() {
         # Note: In cmd.exe, 'set VAR=value && ...' includes trailing space in value.
         # Using 'set "VAR=value"' protects the value from the space before &&.
         local win_path="${remote_path//\//\\}"
-        if ! $strict_rust_build && ! $nonstrict_rust_isolate; then
+        if ! $strict_rust_build && ! $nonstrict_rust_isolate && [[ -z "$output_stage_root" ]]; then
             local env_exports="" env_name
             for env_name in "${cargo_env_to_unset[@]}"; do
                 env_exports+="set \"$env_name=\" && "
@@ -13552,7 +13707,12 @@ act_run_native_build() {
             done <<< "$build_env"
             remote_cmd=$(_act_windows_cmd_via_powershell "cd /d \"${win_path}\" && ${env_exports}${build_cmd}") || return 4
         fi
-        if $strict_rust_build; then
+        if [[ -n "$output_stage_root" ]]; then
+            windows_build_body=$(_act_windows_strict_go_build_script "$host" "$tool_name" \
+                "$local_path" "$release_git_sha" "$remote_path" "$output_stage_root" \
+                "$build_cmd" "$build_env") || return 4
+            _log_info "Building $platform in private output stage $output_stage_source"
+        elif $strict_rust_build; then
             local context_fingerprint context_receipt_digest context_seed_digest
             context_fingerprint=$(jq -er '.fingerprint' <<< "$strict_cargo_context_json") || return 4
             context_receipt_digest=$(jq -er '.receipt_sha256' <<< "$strict_cargo_context_json") || return 4

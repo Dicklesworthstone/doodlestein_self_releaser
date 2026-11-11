@@ -289,7 +289,7 @@ A link must stay inside its own repository, including during `..` traversal.
 Both receivers reject changed submodule bytes and unlisted files. Each archive
 is bounded to 16 nested levels, 256 repositories and 100,000 Git tree entries.
 
-Strict native Go builds on Unix preserve pinned sibling modules in each
+Strict native Go builds preserve pinned sibling modules in each
 target's private output stage. Configure each sibling in `sibling_crates` with
 an exact `revision` and a unique `relative_path`; relative `go.mod` replacements
 and committed `go.work` entries then see the same layout as the source snapshot.
@@ -297,6 +297,12 @@ DSR verifies the copied main and sibling trees against their independent Git
 manifests before running the build command, including file bytes, executable
 modes, links, and unexpected files. Final source checks still verify the
 original snapshots, and release manifests retain the sibling commit identities.
+On Windows, each attempt expands the authenticated Git archives into a fresh
+private stage on the source volume, including safe tracked-link materialization.
+The complete source tuple is checked before compilation and the original
+snapshots are checked again afterward. Collection reads the attempt's output,
+so in-tree executables do not alter the frozen release inputs or reuse an earlier
+attempt's binary.
 
 Strict native Rust builds seed private Cargo homes with downloads selected
 by the committed `Cargo.lock`: checksum-matching crate archives, their index

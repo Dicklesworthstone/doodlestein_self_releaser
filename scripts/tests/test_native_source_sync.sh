@@ -15,6 +15,8 @@
 # bindings; --ordinary-resume-only exercises a real Go matrix through cmd_build.
 # Use --go-siblings-only for real parallel Go replacements and workspaces,
 # including the source selection and receipts of private output stages.
+# Use --windows-strict-go-only for genuine PowerShell source staging and Go
+# Windows PE collection; Unix transport adapters do not qualify native NTFS.
 # Use --strict-go-siblings-only for pinned Go replacements/workspaces through
 # strict snapshots, private output stages, publication and tamper refusals.
 set -uo pipefail
@@ -719,6 +721,306 @@ PY
     fi
     printf 'Strict Go %s: %s checks, %s failures\n' "$layout" "$checks" "$failures"
     [[ "$failures" == 0 ]]
+)
+
+test_windows_strict_go() (
+    local dependency work
+    for dependency in bash git jq yq python3 pwsh go; do
+        command -v "$dependency" >/dev/null || { printf 'SKIP: Windows Go staging requires %s\n' "$dependency"; return 77; }
+    done
+    [[ $(uname -s) == Linux ]] || { printf 'SKIP: portable Windows Go transport fixture requires Linux\n'; return 77; }
+    work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-windows-go.XXXXXXXX") || return 1
+    printf 'Windows Go staging evidence: %s\n' "$work"
+    python3 - "$work" "$ROOT" "${DSR_TEST_ACT_RUNNER:-$ROOT/src/act_runner.sh}" <<'PY'
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import struct
+import subprocess
+import sys
+
+work, root, engine = map(Path, sys.argv[1:])
+checks = failures = 0
+
+def check(label, passed):
+    global checks, failures
+    checks += 1
+    failures += not passed
+    print(('PASS: ' if passed else 'FAIL: ') + label, flush=True)
+
+def run(args, env=None, cwd=None, timeout=120):
+    return subprocess.run([str(arg) for arg in args], env=env, cwd=cwd,
+                          text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+
+def require(result):
+    if result.returncode:
+        raise RuntimeError(result.stdout + result.stderr)
+    return result.stdout
+
+driver = work / 'driver.sh'
+driver.write_text(r'''#!/usr/bin/env bash
+set -uo pipefail
+source "$PROBE_ROOT/src/logging.sh"
+source "$PROBE_ROOT/src/config.sh"
+source "$PROBE_ROOT/src/git_ops.sh"
+source "$PROBE_ENGINE"
+source "$PROBE_ROOT/src/artifact_naming.sh"
+if [[ "$1" == native ]]; then
+    shift
+    # Explicit portable boundaries: host readiness, Windows launcher/JobObject
+    # and SSH. Source planning/verification, compilation and collection are real.
+    host_health_is_ready() { return 0; }
+    _act_get_ssh_destination() { printf winfixture; }
+    if [[ "${PROBE_FAULT:-}" == stage-collision ]]; then
+        _act_generate_uuid() { printf 12345678-1234-4234-8234-123456789abc; }
+    fi
+    _act_windows_build_guard_script() {
+        printf 'guard %s\n' "$1" >> "$PROBE_CASE/transport-events"
+        printf '%s\n' "$2"
+    }
+    _act_windows_stage_build_script() {
+        printf '%s\n' "$3" | python3 "$PROBE_WORK/transport.py" stage
+    }
+    _act_ssh_exec() { python3 "$PROBE_WORK/transport.py" execute "$2"; }
+    act_load_repo_config strictwin || exit 4
+    act_run_native_build strictwin "$1" 1.0.0 12345678-1234-4234-8234-123456789abc \
+        C:/fixture/source "$(cat "$PROBE_CASE/source-sha")" v1.0.0 winfixture
+else
+    "$@"
+fi
+''', encoding='utf-8')
+transport = work / 'transport.py'
+transport.write_text(r"""import base64, json, os
+from pathlib import Path
+import re, shlex, subprocess, sys, uuid
+case = Path(os.environ['PROBE_CASE'])
+def mapped(value):
+    return value.replace('C:/fixture', str(case / 'snapshot')).replace('C:\\fixture', str(case / 'snapshot')).replace('\\', '/')
+operation = sys.argv[1]
+if operation == 'stage':
+    script = sys.stdin.read()
+    fault = os.environ.get('PROBE_FAULT', '')
+    if fault in ('stage-extra','stage-bytes','stage-link'):
+        marker = "\n$ErrorActionPreference='Stop'\nAssert-DsrWindowsSourceRuntime"
+        hook = r'''
+$dsrOriginalExpand=(Get-Command Expand-DsrWindowsSourceSnapshot).ScriptBlock
+function Expand-DsrWindowsSourceSnapshot {
+    param($Plan,[string]$DestinationPath)
+    & $dsrOriginalExpand -Plan $Plan -DestinationPath $DestinationPath
+    if ($DestinationPath.EndsWith('/source')) {
+        if ($env:PROBE_FAULT -ceq 'stage-extra') { [IO.File]::WriteAllText((Join-Path $DestinationPath 'unexpected.txt'),'untracked') }
+        if ($env:PROBE_FAULT -ceq 'stage-bytes') { [IO.File]::AppendAllText((Join-Path $DestinationPath 'main.go'),"`n// changed after authenticated expansion") }
+        if ($env:PROBE_FAULT -ceq 'stage-link') { $null=[IO.File]::CreateSymbolicLink((Join-Path $DestinationPath 'unexpected-link'),(Join-Path $DestinationPath 'LICENSE')) }
+    }
+}
+'''
+        if marker not in script:
+            raise RuntimeError('Missing real Windows staging boundary for fault injection')
+        script = script.replace(marker, '\n' + hook + marker, 1)
+    payload = case / ('payload-' + uuid.uuid4().hex + '.ps1')
+    # Translate only the fixture's synthetic drive spelling. The production
+    # PowerShell runtime, hashes, manifest rules and compiler program are kept.
+    payload.write_text(script.replace('C:/fixture', str(case / 'snapshot')), encoding='utf-8')
+    with (case / 'transport-events').open('a') as stream: stream.write('launcher\n')
+    print(shlex.join(['pwsh','-NoLogo','-NoProfile','-NonInteractive','-File',str(payload)]))
+    sys.exit(0)
+command = sys.argv[-1]
+parts = shlex.split(command)
+if '-EncodedCommand' in parts:
+    script = base64.b64decode(parts[parts.index('-EncodedCommand')+1]).decode('utf-16le')
+    script = script.replace('C:/fixture', str(case / 'snapshot'))
+    script = script.replace('C:\\fixture', str(case / 'snapshot')).replace('C:\fixture', str(case / 'snapshot'))
+    if 'OpenStandardOutput' in script:
+        with (case / 'transport-events').open('a') as stream: stream.write('collection\n')
+    parts = ['pwsh','-NoLogo','-NoProfile','-NonInteractive','-Command',script]
+sys.exit(subprocess.run(parts).returncode)
+""", encoding='utf-8')
+cmd = work / 'cmd-fixture'
+cmd.write_text(r'''#!/usr/bin/env python3
+import json, os
+from pathlib import Path
+import re, shlex, subprocess, sys
+assert sys.argv[1:4] == ['/d','/s','/c'], sys.argv
+command = ' '.join(sys.argv[4:])
+case = Path(os.environ['PROBE_CASE'])
+if os.environ.get('GOWORK','').startswith('C:/fixture/'):
+    os.environ['GOWORK']=os.environ['GOWORK'].replace('C:/fixture',str(case/'snapshot'),1)
+# The incumbent native command uses cmd's cd/set chain. Emulate precisely
+# those fixture forms so the baseline also executes the genuine Go compiler.
+match = re.match(r'^cd /d (?:"([^"]+)"|([^ &]+)) && ', command)
+if match:
+    path = (match[1] or match[2]).replace('\\','/').replace('C:/fixture',str(case/'snapshot'))
+    os.chdir(path)
+    command = command[match.end():]
+while command.startswith('set '):
+    match = re.match(r'^set (?:"([^"]*)"|(.+?)) && ',command)
+    if not match: raise RuntimeError(command)
+    name, equal, value = (match[1] or match[2]).partition('=')
+    if equal != '=' or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name): raise RuntimeError(command)
+    if value: os.environ[name] = value
+    else: os.environ.pop(name,None)
+    command = command[match.end():]
+with (case / 'compiler-events').open('a') as stream:
+    stream.write(json.dumps(dict(cwd=os.getcwd(),GOOS=os.getenv('GOOS'),GOARCH=os.getenv('GOARCH'))) + '\n')
+result = subprocess.run(shlex.split(command))
+if os.environ.get('PROBE_FAULT') == 'post-source':
+    with (case/'snapshot'/'dep'/'dep.go').open('a') as stream: stream.write('\n// changed by build process\n')
+sys.exit(result.returncode)
+''', encoding='utf-8')
+cmd.chmod(0o700)
+transports = work / 'transports'
+transports.mkdir()
+ssh = transports / 'ssh'
+ssh.write_text('#!/bin/sh\nexec python3 "$PROBE_WORK/transport.py" ssh "$@"\n', encoding='utf-8')
+ssh.chmod(0o700)
+print('BOUNDARY: real PowerShell/Git archive verification/Go PE compilation/held collection; fixture Windows drive, cmd, SSH, host-readiness and JobObject launcher; native Windows/NTFS are not qualified.', flush=True)
+for layout in ('replace','workspace'):
+    case = work / layout
+    for directory in ('source','dep','snapshot/source','snapshot/dep','config/repos.d','artifacts','logs'):
+        (case/directory).mkdir(parents=True, exist_ok=True)
+    (case/'source'/'go.mod').write_text('module example.local/strictwin\n\ngo 1.19\n\nrequire example.local/dep v0.0.0\n' +
+        ('replace example.local/dep => ../dep\n' if layout == 'replace' else ''), encoding='utf-8')
+    if layout == 'workspace':
+        (case/'source'/'go.work').write_text('go 1.19\n\nuse (\n .\n ../dep\n)\n', encoding='utf-8')
+    (case/'source'/'main.go').write_text('package main\nimport "example.local/dep"\nfunc main(){println(dep.Value())}\n',encoding='utf-8')
+    (case/'source'/'LICENSE').write_text('tracked materialized license\n',encoding='utf-8')
+    (case/'source'/'license-copy.txt').symlink_to('LICENSE')
+    (case/'dep'/'go.mod').write_text('module example.local/dep\n\ngo 1.19\n',encoding='utf-8')
+    (case/'dep'/'dep.go').write_text('package dep\nfunc Value() string{return "pinned-windows-sibling"}\n',encoding='utf-8')
+    shas = {}
+    for name in ('source','dep'):
+        require(run(['git','-C',case/name,'init','-q','-b','main']))
+        require(run(['git','-C',case/name,'add','.']))
+        require(run(['git','-C',case/name,'-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-qm','pinned']))
+        shas[name] = require(run(['git','-C',case/name,'rev-parse','HEAD'])).strip()
+    (case/'source-sha').write_text(shas['source'],encoding='utf-8')
+    env = dict(os.environ, PROBE_WORK=str(work),PROBE_CASE=str(case),PROBE_ROOT=str(root),PROBE_ENGINE=str(engine),
+        DSR_CONFIG_DIR=str(case/'config'),ACT_CONFIG_DIR=str(case/'config'),ACT_REPOS_DIR=str(case/'config/repos.d'),
+        DSR_HOSTS_FILE=str(case/'config/hosts.yaml'),DSR_REPOS_FILE=str(case/'config/repos.yaml'),
+        ACT_ARTIFACTS_DIR=str(case/'artifacts'),ACT_LOGS_DIR=str(case/'logs'),DSR_CACHE_DIR=str(case/'cache'),
+        DSR_STATE_DIR=str(case/'state'),DSR_KEEP_BUILD_STAGES='1',NO_COLOR='1',ComSpec=str(cmd),DOTNET_PROCESSOR_COUNT='1',
+        PATH=str(transports)+os.pathsep+os.environ['PATH'],GOOS='linux',GOARCH='arm64')
+    recipe = dict(tool_name='strictwin',repo='example/strictwin',language='go',binary_name='strictwin',
+        local_path=str(case/'source'),targets=['windows/amd64'],hosts={'windows/amd64':'winfixture'},
+        host_paths={'winfixture':'C:/fixture/source'},build_cmd='go build -o strictwin.exe .',
+        sibling_crates=[dict(local_path=str(case/'dep'),relative_path='dep',revision=shas['dep'])],
+        env=dict(PATH=env['PATH'],GOENV='off',GOTOOLCHAIN='local',GOFLAGS='-p=1',GOMAXPROCS='1',
+                 CGO_ENABLED='0',GOCACHE=str(work/'go-cache'),GOPROXY='off',GOSUMDB='off',
+                 GOWORK='off' if layout=='replace' else ''),
+        release_contract=dict(checksum_sidecar='sha256',exact_primary_assets={'windows/amd64':'strictwin-windows-amd64.exe'}))
+    config = case/'config/repos.d/strictwin.yaml'
+    config.write_text(json.dumps(recipe),encoding='utf-8')
+    (case/'config/hosts.yaml').write_text(json.dumps(dict(hosts={'winfixture':dict(platform='windows/amd64',connection='ssh')},
+        platform_mapping={'windows/amd64':'winfixture'})),encoding='utf-8')
+    def bash(*args): return run(['bash',driver,*args],env=env)
+    evidence = []
+    for name in ('source','dep'):
+        prefix = 'source' if name=='source' else 'dependency-dep'
+        archive = case/'snapshot'/('.'+prefix+'.tar')
+        manifest = case/'snapshot'/('.'+prefix+'.manifest')
+        require(bash('_act_write_git_archive_evidence',case/name,shas[name],archive))
+        require(bash('_act_write_tracked_manifest',case/name,shas[name],manifest))
+        archive_sha = hashlib.sha256(archive.read_bytes()).hexdigest()
+        manifest_sha = hashlib.sha256(manifest.read_bytes()).hexdigest()
+        count = require(bash('_act_tracked_manifest_object_count',manifest)).strip()
+        program = require(bash('_act_windows_strict_snapshot_extract_script','winfixture',case/'snapshot'/name,
+                               archive,manifest,archive_sha,manifest_sha,count))
+        script = case/(name+'-extract.ps1'); script.write_text(program,encoding='utf-8')
+        require(run(['pwsh','-NoLogo','-NoProfile','-NonInteractive','-File',script],env=env))
+        evidence.append((name,archive,manifest,archive_sha,manifest_sha,count))
+    def originals_valid():
+        for name, archive, manifest, archive_sha, manifest_sha, count in evidence:
+            program = require(bash('_act_windows_strict_snapshot_verify_script',case/'snapshot'/name,case/'snapshot',
+                                   archive,manifest,manifest_sha,count,archive_sha))
+            script = case/(name+'-verify.ps1'); script.write_text(program,encoding='utf-8')
+            if run(['pwsh','-NoLogo','-NoProfile','-NonInteractive','-File',script],env=env).returncode: return False
+        return True
+    def events(name):
+        path = case/name
+        return path.read_text(encoding='utf-8').splitlines() if path.exists() else []
+    def native(label):
+        result = bash('native','windows/amd64')
+        (case/(label+'.stdout')).write_text(result.stdout,encoding='utf-8')
+        (case/(label+'.stderr')).write_text(result.stderr,encoding='utf-8')
+        try: value = json.loads(result.stdout)
+        except ValueError: value = {}
+        return result,value
+    def pe_amd64(path):
+        data = path.read_bytes()
+        offset = struct.unpack_from('<I',data,0x3c)[0]
+        return data[:2]==b'MZ' and data[offset:offset+4]==b'PE\0\0' and struct.unpack_from('<H',data,offset+4)[0]==0x8664
+    first,value = native('first')
+    check(layout+': native build and held PE collection succeed',first.returncode==0 and value.get('status')=='success')
+    artifacts = value.get('artifact_paths',[])
+    check(layout+': collected bytes are real amd64 Windows PE',len(artifacts)==1 and pe_amd64(Path(artifacts[0])))
+    observed = [json.loads(line) for line in events('compiler-events')]
+    check(layout+': configured target reaches real Go in a private source directory',len(observed)==1 and
+          observed[0]['GOOS']=='windows' and observed[0]['GOARCH']=='amd64' and '/dsr-build-' in observed[0]['cwd'])
+    check(layout+': original main and sibling snapshots still pass complete verifier',originals_valid())
+    check(layout+': tracked file link is materialized in the private source',bool(observed) and
+          not (Path(observed[0]['cwd'])/'license-copy.txt').is_symlink() and
+          (Path(observed[0]['cwd'])/'license-copy.txt').read_bytes()==b'tracked materialized license\n')
+    check(layout+': existing guarded launcher and stream collection remain in use',
+          'launcher' in events('transport-events') and 'collection' in events('transport-events') and
+          any(line.startswith('guard ') for line in events('transport-events')))
+    if layout!='replace': continue
+    if first.returncode or value.get('status')!='success': continue
+    again,retry = native('retry')
+    observed = [json.loads(line) for line in events('compiler-events')]
+    check('same-target retry uses a fresh independent stage',again.returncode==0 and len(observed)==2 and
+          observed[0]['cwd']!=observed[1]['cwd'] and len(retry.get('artifact_paths',[]))==1 and
+          retry['artifact_paths'][0]!=artifacts[0])
+    dep_path = case/'snapshot/dep/dep.go'
+    dep_bytes = dep_path.read_bytes()
+    archive = case/'snapshot/.source.tar'; archive_bytes = archive.read_bytes()
+    collision = case/'snapshot/dsr-build-strictwin-windows-amd64-12345678123442348234123456789abc'
+    collision.mkdir()
+    (collision/'sentinel').write_text('preexisting stage',encoding='utf-8')
+    for fault in ('sibling-bytes','sibling-missing','archive-bytes','stage-extra','stage-bytes','stage-link','stage-collision','sibling-namespace'):
+        before = len(events('compiler-events')); collections = events('transport-events').count('collection')
+        env['PROBE_FAULT'] = fault
+        if fault=='sibling-bytes': dep_path.write_bytes(dep_bytes+b'\n// changed\n')
+        if fault=='sibling-missing': (case/'snapshot/dep').rename(case/'snapshot/held-dep')
+        if fault=='archive-bytes': archive.write_bytes(archive_bytes+b'changed')
+        if fault=='sibling-namespace':
+            recipe['sibling_crates'][0]['relative_path']='Source'
+            config.write_text(json.dumps(recipe),encoding='utf-8')
+        rejected,result = native(fault)
+        check(fault+': refused before compiler and collection',rejected.returncode!=0 and
+              result.get('status')!='success' and len(events('compiler-events'))==before and
+              events('transport-events').count('collection')==collections)
+        if fault=='sibling-bytes': dep_path.write_bytes(dep_bytes)
+        if fault=='sibling-missing': (case/'snapshot/held-dep').rename(case/'snapshot/dep')
+        if fault=='archive-bytes': archive.write_bytes(archive_bytes)
+        if fault=='sibling-namespace':
+            recipe['sibling_crates'][0]['relative_path']='dep'
+            config.write_text(json.dumps(recipe),encoding='utf-8')
+    check('preexisting colliding stage remains intact',(collision/'sentinel').read_text(encoding='utf-8')=='preexisting stage' and
+          sorted(path.name for path in collision.iterdir())==['sentinel'])
+    env['PROBE_FAULT']=''
+    recipe['build_cmd']='go build -o strictwin.exe missing.go'
+    config.write_text(json.dumps(recipe),encoding='utf-8')
+    before=len(events('compiler-events')); collections=events('transport-events').count('collection')
+    failed,result=native('compiler-failure')
+    check('genuine Go compilation failure retains failure and prevents collection',failed.returncode!=0 and
+          result.get('status')=='failed' and len(events('compiler-events'))==before+1 and
+          events('transport-events').count('collection')==collections)
+    recipe['build_cmd']='go build -o strictwin.exe .'
+    config.write_text(json.dumps(recipe),encoding='utf-8')
+    env['PROBE_FAULT']='post-source'
+    before=len(events('compiler-events')); collections=events('transport-events').count('collection')
+    failed,result=native('post-source')
+    check('post-compiler source alteration prevents artifact collection',failed.returncode!=0 and
+          result.get('status')!='success' and len(events('compiler-events'))==before+1 and
+          events('transport-events').count('collection')==collections)
+    dep_path.write_bytes(dep_bytes); env['PROBE_FAULT']=''
+    check('all original snapshots still verify after restored negative controls',originals_valid())
+print(f'Windows strict Go staging: {checks-failures} passed, {failures} failed',flush=True)
+sys.exit(1 if failures else 0)
+PY
 )
 
 test_windows_source_links() (
@@ -1675,6 +1977,10 @@ if [[ "${1:-}" == --strict-go-siblings-only ]]; then
     test_strict_go_siblings replace || strict_go_status=$?
     test_strict_go_siblings workspace || strict_go_status=$?
     exit "$strict_go_status"
+fi
+if [[ "${1:-}" == --windows-strict-go-only ]]; then
+    test_windows_strict_go
+    exit $?
 fi
 if [[ "${1:-}" == --windows-source-links-only ]]; then
     test_windows_source_links
