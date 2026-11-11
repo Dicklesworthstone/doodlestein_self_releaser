@@ -13362,14 +13362,26 @@ act_run_native_build() {
     # Windows hosts remain serialized by the orchestrator.
     local output_stage_root="" output_stage_source="" output_stage_parent=""
     local output_stage_sibling_names=""
+    local output_stage_dependencies='[]'
     if [[ "$language" != rust ]] && \
        { [[ "${DSR_NATIVE_OUTPUT_STAGE:-}" == 1 ]] || $strict_native_build; } && \
        ! _act_is_windows_host "$host"; then
         if $strict_native_build; then
-            local stage_dependencies
-            if ! stage_dependencies=$(_act_release_source_dependency_checkouts_json "$tool_name") || \
-               ! jq -e 'type == "array" and length == 0' <<< "$stage_dependencies" >/dev/null; then
-                _log_error "Strict non-Rust output staging requires no sibling source dependencies"
+            if ! output_stage_dependencies=$(_act_release_source_dependency_checkouts_json "$tool_name"); then
+                return 4
+            fi
+            if [[ "$language" != go ]] && \
+               ! jq -e 'length == 0' <<< "$output_stage_dependencies" >/dev/null; then
+                _log_error "Strict sibling output staging requires a Go build"
+                return 4
+            fi
+            # Strict Go replacements and go.work entries use the same pinned
+            # sibling layout as source sync. Keep that namespace beside the
+            # private attempt, never recopy a live controller checkout.
+            if ! jq -e 'all(.[]; (.relative_path | ascii_downcase) != "source")' \
+                    <<< "$output_stage_dependencies" >/dev/null || \
+               ! output_stage_sibling_names=$(jq -r '.[].relative_path' <<< "$output_stage_dependencies"); then
+                _log_error "Invalid strict output-stage sibling namespace"
                 return 4
             fi
         fi
@@ -13724,22 +13736,40 @@ EOF
                 cargo_home_prefix+="if ! test -d '$output_sibling_source_q' || test -L '$output_sibling_source_q'; then printf '[dsr] required Go sibling is missing or linked: %s\\n' '$output_sibling_source_q' >&2; exit 4; fi; mkdir '$output_sibling_destination_q'; cp -R '$output_sibling_source_q/.' '$output_sibling_destination_q/'; if test -e '$output_sibling_destination_q/.git' || test -L '$output_sibling_destination_q/.git'; then git -C '$output_sibling_destination_q' status --porcelain --untracked-files=no >/dev/null; fi; "
             done <<< "$output_stage_sibling_names"
             if $strict_native_build; then
+                local stage_manifest_dir stage_sources stage_entry stage_name stage_checkout stage_revision stage_archive
                 local stage_manifest stage_manifest_digest stage_object_count stage_verification
-                stage_manifest="$ACT_ARTIFACTS_DIR/strict-source-verification/stage-${output_stage_uuid}.manifest"
+                stage_manifest_dir="$ACT_ARTIFACTS_DIR/strict-source-verification/stage-${output_stage_uuid}"
                 if [[ -z "$release_git_sha" ]] || \
-                   ! mkdir -p "${stage_manifest%/*}" || \
-                   ! _act_write_tracked_manifest "$local_path" "$release_git_sha" "$stage_manifest" || \
-                   ! stage_manifest_digest=$(_act_sha256 "$stage_manifest") || \
-                   ! stage_object_count=$(_act_tracked_manifest_object_count "$stage_manifest") || \
-                   ! stage_verification=$(_act_unix_strict_snapshot_verify_script \
-                       "$output_stage_source" "${remote_path%/*}/.source.tar" \
-                       "${remote_path%/*}/.source.manifest" "$stage_manifest_digest" "$stage_object_count"); then
-                    _log_error "Unable to bind private output stage to strict source manifest"
+                   ! mkdir -p "${stage_manifest_dir%/*}" || \
+                   ! mkdir -m 700 "$stage_manifest_dir" || \
+                   ! stage_sources=$(jq -c --arg path "$local_path" --arg sha "$release_git_sha" \
+                       '[{relative_path:"source",local_path:$path,git_sha:$sha}] + .' \
+                       <<< "$output_stage_dependencies"); then
+                    _log_error "Unable to prepare strict output-stage source manifests"
                     return 4
                 fi
-                # Check every staged input and reject extra files before the
-                # command runs; final verification still checks the original.
-                cargo_home_prefix+="${stage_verification}"$'\n'
+                while IFS= read -r stage_entry; do
+                    stage_name=$(jq -er '.relative_path' <<< "$stage_entry") || return 4
+                    stage_checkout=$(jq -er '.local_path' <<< "$stage_entry") || return 4
+                    stage_revision=$(jq -er '.git_sha' <<< "$stage_entry") || return 4
+                    stage_archive="dependency-$stage_name"
+                    [[ "$stage_name" != source ]] || stage_archive=source
+                    stage_manifest="$stage_manifest_dir/$stage_archive.manifest"
+                    if ! _act_write_tracked_manifest "$stage_checkout" "$stage_revision" "$stage_manifest" || \
+                       ! stage_manifest_digest=$(_act_sha256 "$stage_manifest") || \
+                       ! stage_object_count=$(_act_tracked_manifest_object_count "$stage_manifest") || \
+                       ! stage_verification=$(_act_unix_strict_snapshot_verify_script \
+                           "$output_stage_root/$stage_name" "${remote_path%/*}/.$stage_archive.tar" \
+                           "${remote_path%/*}/.$stage_archive.manifest" "$stage_manifest_digest" "$stage_object_count"); then
+                        _log_error "Unable to bind private output-stage source $stage_name to its pinned manifest"
+                        return 4
+                    fi
+                    # Every copied root must match its independently pinned
+                    # Git bytes/modes and complete node inventory before the
+                    # command runs. The coordinator still rechecks all original
+                    # snapshots after compilation and before publication.
+                    cargo_home_prefix+="${stage_verification}"$'\n'
+                done < <(jq -c '.[]' <<< "$stage_sources")
             fi
             cd_cmd="cd '${stage_source_q}'"
             _log_info "Building $platform in private output stage $output_stage_source"

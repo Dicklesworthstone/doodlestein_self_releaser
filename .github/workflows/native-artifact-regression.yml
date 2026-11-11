@@ -14,6 +14,7 @@ on:
       - scripts/tests/test_git_build_context.sh
       - scripts/tests/test_act_build_cmd_tokens.sh
       - scripts/tests/test_act_runner_native.sh
+      - scripts/tests/test_native_source_sync.sh
       - scripts/tests/test_config.sh
       - scripts/tests/test_disk_free_floor.sh
       - scripts/tests/test_host_health.sh
@@ -167,6 +168,16 @@ jobs:
           bash scripts/tests/test_build_state.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/build-state.log"
           bash scripts/tests/test_act_orchestration.sh --coordinator-custody-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/coordinator-custody.log"
           bash scripts/tests/test_act_runner.sh --timeout-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/timeout-ownership.log"
+          test -z "$(git status --porcelain)"
+      - name: Build strict Go releases from pinned sibling snapshots
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/tests/test_native_source_sync.sh
+          DSR_TEST_DISK_ROOT="$RUNNER_TEMP" DSR_TEST_GOCACHE="$RUNNER_TEMP/strict-go-cache" \
+            timeout 120 bash scripts/tests/test_native_source_sync.sh --strict-go-siblings-only \
+              2>&1 | tee "$RUNNER_TEMP/collector-evidence/strict-go-siblings.log"
           test -z "$(git status --porcelain)"
       - name: Validate stdin-isolated target dispatch and exact-run resume
         shell: bash

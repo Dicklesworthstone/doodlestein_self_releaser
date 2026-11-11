@@ -15,6 +15,8 @@
 # bindings; --ordinary-resume-only exercises a real Go matrix through cmd_build.
 # Use --go-siblings-only for real parallel Go replacements and workspaces,
 # including the source selection and receipts of private output stages.
+# Use --strict-go-siblings-only for pinned Go replacements/workspaces through
+# strict snapshots, private output stages, publication and tamper refusals.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 ROOT="${DSR_TEST_ROOT:-$ROOT}"
@@ -499,6 +501,223 @@ PY
             "$before_state" = "$(_act_sha256 "$state_file")"
     fi
     printf 'Ordinary Go %s: %s checks, %s failures\n' "$layout" "$checks" "$failures"
+    [[ "$failures" == 0 ]]
+)
+
+test_strict_go_siblings() (
+    local layout="$1" dependency work tree sha source_sha config status=0 checks=0 failures=0
+    local artifact source_root private_source run state_file before_state before_events mutation
+    local go_work=off
+    for dependency in bash git jq yq python3 go tar; do
+        command -v "$dependency" >/dev/null || { printf 'SKIP: strict Go siblings require %s\n' "$dependency"; return 77; }
+    done
+    [[ $(uname -s)/$(uname -m) == Linux/x86_64 && $(go version) == 'go version go'* ]] || {
+        printf 'SKIP: strict Go siblings require Linux x86_64 and the Go compiler\n'; return 77;
+    }
+    work=$(mktemp -d "${DSR_TEST_DISK_ROOT:-${TMPDIR:-/tmp}}/dsr-strict-go-$layout.XXXXXXXX") || return 1
+    printf 'Strict Go %s evidence: %s\n' "$layout" "$work"
+    mkdir -p "$work/config/repos.d" "$work/source" "$work/dep" "$work/stages" || return 1
+    export DSR_CONFIG_DIR="$work/config" ACT_CONFIG_DIR="$work/config" ACT_REPOS_DIR="$work/config/repos.d"
+    export DSR_STATE_DIR="$work/state" DSR_CACHE_DIR="$work/cache"
+    export DSR_HOSTS_FILE="$work/config/hosts.yaml" DSR_REPOS_FILE="$work/config/repos.yaml"
+    export DSR_DISABLE_HOST_SELECTOR=1 RCH_DISABLED=1 RCH_CARGO_WRAPPER_BYPASS=1 NO_COLOR=1
+    printf 'module example.local/strictgo\n\ngo 1.19\n\nrequire example.local/dep v0.0.0\n' > "$work/source/go.mod"
+    printf 'package main\nimport "example.local/dep"\nfunc main() { println(dep.Value()) }\n' > "$work/source/main.go"
+    if [[ "$layout" == replace ]]; then
+        printf 'replace example.local/dep => ../dep\n' >> "$work/source/go.mod"
+    else
+        printf 'go 1.19\n\nuse (\n  .\n  ../dep\n)\n' > "$work/source/go.work"
+        go_work=""
+    fi
+    printf 'module example.local/dep\n\ngo 1.19\n' > "$work/dep/go.mod"
+    printf 'package dep\nfunc Value() string { return "pinned-sibling-input" }\n' > "$work/dep/dep.go"
+    for tree in source dep; do
+        git -C "$work/$tree" init -q -b main || return 1
+        git -C "$work/$tree" add . || return 1
+        git -C "$work/$tree" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm pinned || return 1
+    done
+    git -C "$work/source" tag v1.0.0 || return 1
+    source_sha=$(git -C "$work/source" rev-parse HEAD) || return 1
+    sha=$(git -C "$work/dep" rev-parse HEAD) || return 1
+    jq -n --arg work "$work" '{schema_version:"1.0.0",hosts:{localnative:{
+        platform:"linux/amd64",connection:"local",concurrency:2,build_root:($work+"/stages")}},
+        platform_mapping:{"linux/amd64":"localnative","linux/386":"localnative"}}' > "$DSR_HOSTS_FILE" || return 1
+    config="$ACT_REPOS_DIR/strictgo.yaml"
+    # The source manifest supplies release Git identity. Archive-only roots
+    # have no VCS metadata for Go's optional build stamp.
+    jq -n --arg work "$work" --arg path "$PATH" --arg sha "$sha" \
+        --arg gowork "$go_work" --arg cache "${DSR_TEST_GOCACHE:-$work/go-cache}" '{
+        tool_name:"strictgo",repo:"example/strictgo",local_path:($work+"/source"),language:"go",binary_name:"strictgo",
+        targets:["linux/amd64","linux/386"],act_job_map:{"linux/amd64":null,"linux/386":null},
+        hosts:{"linux/amd64":"localnative","linux/386":"localnative"},
+        sibling_crates:[{local_path:($work+"/dep"),relative_path:"dep",revision:$sha}],
+        build_cmd:"printf \"%s %s\\n\" \"$DSR_TARGET_ARCH\" \"$PWD\" >> \"$PROBE_EVENTS\"; go build -buildvcs=false -o strictgo .",
+        env:{PATH:$path,PROBE_EVENTS:($work+"/compiler-events"),GOENV:"off",GOFLAGS:"-p=1",GOMAXPROCS:"1",GOTOOLCHAIN:"local",
+          GOCACHE:$cache,CGO_ENABLED:"0",GOWORK:$gowork,GOPROXY:"off",GOSUMDB:"off"},
+        release_contract:{checksum_sidecar:"sha256",exact_primary_assets:{
+          "linux/amd64":"strictgo-linux-amd64","linux/386":"strictgo-linux-386"}}}
+        ' > "$config" || return 1
+    # shellcheck source=../../src/logging.sh
+    source "$ROOT/src/logging.sh"
+    # shellcheck source=../../src/config.sh
+    source "$ROOT/src/config.sh"
+    # shellcheck source=../../src/build_state.sh
+    source "$ROOT/src/build_state.sh"
+    # shellcheck source=../../src/act_runner.sh
+    source "${DSR_TEST_ACT_RUNNER:-$ROOT/src/act_runner.sh}"
+    # shellcheck source=../../src/artifact_naming.sh
+    source "$ROOT/src/artifact_naming.sh"
+    # shellcheck source=../../src/host_selector.sh
+    source "$ROOT/src/host_selector.sh"
+    # shellcheck source=../../src/host_health.sh
+    source "$ROOT/src/host_health.sh"
+    # shellcheck source=../../src/git_ops.sh
+    source "$ROOT/src/git_ops.sh"
+    # shellcheck source=../../src/packaging.sh
+    source "$ROOT/src/packaging.sh"
+    printf 'BOUNDARY: fixture host health/capacity; real Git archives, snapshot verification, Go compiler, parallel stages, collection, checkpoint and publication admission\n'
+    host_health_is_ready() { return 0; }
+    selector_acquire_slot() { return 0; }
+    selector_release_slot() { return 0; }
+    build_state_init || return 1
+    export SCRIPT_DIR="$ROOT" JSON_MODE=true DRY_RUN=false VERBOSE=false DSR_VERSION=fixture DSR_KEEP_BUILD_STAGES=1
+    declare -A _DSR_LOADED_MODULES=([packaging]=1 [artifact_naming]=1)
+    # shellcheck disable=SC1090 # Use the actual command/state/publication consumers.
+    source <(awk '/^(_dsr_require|cmd_build|_release_sha256|_release_require_publishable_artifacts)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$ROOT/dsr") || return 1
+    # shellcheck disable=SC1090
+    source <(awk '/^json_envelope\(\) \{/{copy=1} copy{print} copy && /^# ====/{exit}' "$ROOT/dsr") || return 1
+    check_strict_go() {
+        local label="$1"; shift
+        checks=$((checks + 1))
+        if "$@"; then printf 'PASS: strict %s: %s\n' "$layout" "$label"
+        else failures=$((failures + 1)); printf 'FAIL: strict %s: %s\n' "$layout" "$label" >&2; fi
+    }
+    if [[ "$layout" == replace ]]; then
+        command cp "$work/dep/dep.go" "$work/original-dep.go" || return 1
+        printf '\n// uncommitted dependency input\n' >> "$work/dep/dep.go"
+        cmd_build strictgo --version 1.0.0 --output-dir "$work/dirty-output" \
+            > "$work/dirty.json" 2> "$work/dirty.log" || status=$?
+        check_strict_go 'dirty controller sibling refuses a strict build' test "$status" -ne 0
+        check_strict_go 'dirty controller sibling reaches its specific source refusal' \
+            grep -q 'Strict release checkout is dirty: dep' "$work/dirty.log"
+        check_strict_go 'dirty controller sibling cannot reach compilation' test ! -e "$work/compiler-events"
+        command cp "$work/original-dep.go" "$work/dep/dep.go" || return 1
+        status=0
+    fi
+    cmd_build strictgo --version 1.0.0 --parallel=2 --output-dir "$work/output" \
+        > "$work/result.json" 2> "$work/build.log" || status=$?
+    check_strict_go 'public strict Go matrix completes' test "$status" -eq 0
+    if [[ "$status" -ne 0 ]]; then
+        cat "$work/build.log" >&2
+        printf 'Strict Go %s: %s checks, %s failures\n' "$layout" "$checks" "$failures"
+        return 1
+    fi
+    # The public orchestrator loads configuration in its worker process.
+    # Initialize the same context for the direct verification/refusal calls.
+    act_load_repo_config strictgo || return 1
+    build_state_get strictgo 1.0.0 > "$work/state.json" || return 1
+    run=$(jq -er .run_id "$work/state.json") || return 1
+    source_root=$(jq -er '.context.source_roots.localnative' "$work/state.json") || return 1
+    state_file="$DSR_STATE_DIR/builds/strictgo/1.0.0/$run/state.json"
+    before_state=$(_act_sha256 "$state_file") || return 1
+    before_events=$(_act_sha256 "$work/compiler-events") || return 1
+    check_strict_go 'both native tasks complete' jq -e '
+        .status=="completed" and (.target_statuses|length)==2 and
+        all(.target_statuses[]; .status=="completed" and .result.status=="success")' "$work/state.json"
+    check_strict_go 'public result returns both successful target artifacts' jq -e \
+        --slurpfile state "$work/state.json" '
+        .exit_code==0 and .details.success==2 and
+        .details.run_id==$state[0].run_id and (.details.targets|length)==2 and
+        all(.details.targets[]; .status=="success" and (.artifact_path|length)>0)' "$work/result.json"
+    check_strict_go 'checkpoint retains the exact original snapshot custody receipt' jq -e \
+        --arg sha "$source_sha" --arg source "$source_root" '
+        .run_id as $run | .context.snapshot_owners.localnative |
+        .git_sha==$sha and .run_id==$run and .source_root==$source and
+        (.receipt_sha256|test("^[0-9a-f]{64}$"))' "$work/state.json"
+    check_strict_go 'sealed manifest binds both published artifacts to pinned sibling revision' jq -e \
+        --arg sha "$source_sha" --arg dependency "$sha" '
+        .publishable==true and .status=="success" and .source.git_sha==$sha and
+        .source.dependencies==[{relative_path:"dep",git_sha:$dependency}] and
+        ([.artifacts[].target]|sort)==["linux/386","linux/amd64"]' "$work/output/strictgo-v1.0.0-manifest.json"
+    artifact="$work/output/strictgo-linux-amd64"
+    check_strict_go 'actual amd64 executable consumes the pinned sibling' test "$("$artifact" 2>&1)" = pinned-sibling-input
+    check_strict_go 'actual 386 ELF contains the pinned sibling (no runtime claim)' python3 - "$work/output/strictgo-linux-386" <<'PY'
+import pathlib,sys
+data=pathlib.Path(sys.argv[1]).read_bytes()
+assert data[:5]==b'\x7fELF\x01' and data[18:20]==b'\x03\x00'
+assert b'pinned-sibling-input' in data
+PY
+    check_strict_go 'each target uses a distinct private output stage' test \
+        "$(awk '{print $2}' "$work/compiler-events" | sort -u | wc -l | tr -d ' ')" -eq 2
+    while read -r tree private_source; do
+        check_strict_go "$tree stage is separate from the original snapshot" test "$private_source" != "$source_root"
+        check_strict_go "$tree stage retains exact pinned sibling bytes" cmp "$work/dep/dep.go" "${private_source%/*}/dep/dep.go"
+    done < "$work/compiler-events"
+    check_strict_go 'builds leave the original main snapshot unchanged' test ! -e "$source_root/strictgo"
+    check_strict_go 'builds leave both controller repositories clean' test -z \
+        "$(git -C "$work/source" status --porcelain --untracked-files=all)$(git -C "$work/dep" status --porcelain --untracked-files=all)"
+    check_strict_go 'original snapshots pass the complete post-build verifier' \
+        _act_verify_strict_source_roots strictgo "$source_sha" "$(jq -c .context.source_roots "$work/state.json")"
+    check_strict_go 'completed output passes release publication admission' \
+        _release_require_publishable_artifacts "$work/output" "$work/output/strictgo-v1.0.0-manifest.json" true
+
+    if [[ "$layout" == replace ]]; then
+        # The copied byte verification must run after cp, not only against
+        # the immutable original. Inject faults in the copy operation while
+        # still running the genuine cp, verifier and native backend.
+        export DSR_STAGE_MUTATION_LOG="$work/mutations"
+        cp() {
+            command cp "$@" || return $?
+            local destination="${!#}"
+            if [[ "$destination" == */dsr-build-strictgo-*/dep/ ]]; then
+                printf '%s\n' "$DSR_STAGE_MUTATION" >> "$DSR_STAGE_MUTATION_LOG"
+                case "$DSR_STAGE_MUTATION" in
+                    bytes) printf 'package dep\nfunc Value() string { return "poisoned-copy" }\n' > "${destination}dep.go" ;;
+                    extra) printf 'unexpected\n' > "${destination}extra.txt" ;;
+                    mode) chmod +x "${destination}dep.go" ;;
+                esac
+            fi
+        }
+        export -f cp
+        for mutation in bytes extra mode; do
+            export DSR_STAGE_MUTATION="$mutation"
+            status=0
+            act_run_native_build strictgo linux/amd64 1.0.0 "copy-$mutation" \
+                "$source_root" "$source_sha" v1.0.0 localnative \
+                > "$work/copy-$mutation.json" 2> "$work/copy-$mutation.log" || status=$?
+            check_strict_go "$mutation copy fault was actually injected" grep -qx "$mutation" "$work/mutations"
+            check_strict_go "$mutation copied sibling refuses the target" test "$status" -ne 0
+            check_strict_go "$mutation copied sibling never reaches the compiler" test \
+                "$before_events" = "$(_act_sha256 "$work/compiler-events")"
+            check_strict_go "$mutation copied sibling yields no collected artifact" jq -e \
+                '.status=="failed" and .artifact_paths==[]' "$work/copy-$mutation.json"
+        done
+        unset -f cp
+        unset DSR_STAGE_MUTATION DSR_STAGE_MUTATION_LOG
+        check_strict_go 'copy tampering leaves original snapshot admission intact' \
+            _act_verify_strict_source_roots strictgo "$source_sha" "$(jq -c .context.source_roots "$work/state.json")"
+
+        mv "${source_root%/*}/dep" "$work/retained-dep" || return 1
+        for mutation in missing linked; do
+            [[ "$mutation" != linked ]] || ln -s "$work/retained-dep" "${source_root%/*}/dep" || return 1
+            status=0
+            act_run_native_build strictgo linux/amd64 1.0.0 "host-$mutation" \
+                "$source_root" "$source_sha" v1.0.0 localnative \
+                > "$work/host-$mutation.json" 2> "$work/host-$mutation.log" || status=$?
+            check_strict_go "$mutation host sibling refuses the target" test "$status" -ne 0
+            check_strict_go "$mutation host sibling never reaches the compiler" test \
+                "$before_events" = "$(_act_sha256 "$work/compiler-events")"
+            check_strict_go "$mutation host sibling yields no collected artifact" jq -e \
+                '.status=="failed" and .artifact_paths==[]' "$work/host-$mutation.json"
+        done
+        status=0
+        _act_verify_strict_source_roots strictgo "$source_sha" \
+            "$(jq -c .context.source_roots "$work/state.json")" > "$work/final-refusal.log" 2>&1 || status=$?
+        check_strict_go 'changed original snapshot fails the final source gate' test "$status" -ne 0
+        check_strict_go 'refused retries preserve the completed checkpoint' test \
+            "$before_state" = "$(_act_sha256 "$state_file")"
+    fi
+    printf 'Strict Go %s: %s checks, %s failures\n' "$layout" "$checks" "$failures"
     [[ "$failures" == 0 ]]
 )
 
@@ -1450,6 +1669,12 @@ if [[ "${1:-}" == --go-siblings-only ]]; then
     test_ordinary_go_siblings replace || go_sibling_status=$?
     test_ordinary_go_siblings workspace || go_sibling_status=$?
     exit "$go_sibling_status"
+fi
+if [[ "${1:-}" == --strict-go-siblings-only ]]; then
+    strict_go_status=0
+    test_strict_go_siblings replace || strict_go_status=$?
+    test_strict_go_siblings workspace || strict_go_status=$?
+    exit "$strict_go_status"
 fi
 if [[ "${1:-}" == --windows-source-links-only ]]; then
     test_windows_source_links
