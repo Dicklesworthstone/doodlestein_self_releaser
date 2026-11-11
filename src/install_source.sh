@@ -366,6 +366,10 @@ _isb_probe_rust() (
 # escape the source attempt or replace the caller's installed toolchain.
 _isb_prepare_toolchain() {
     local language="$1" tree="$2" output="$3" limit="$4" command root bin source_dir status=0
+    local go_requirements="${5:-}"
+    local -a bootstrap_options=(--allow-install)
+    [[ -z "$go_requirements" || "$language" == go ]] || return 4
+    [[ -z "$go_requirements" ]] || bootstrap_options+=(--go-requirements "$go_requirements")
     case "$language" in rust) command=cargo ;; go) command=go ;; *) command=bun ;; esac
     if command -v "$command" >/dev/null 2>&1 &&
        { [[ "$language" != rust ]] || command -v rustc >/dev/null 2>&1; }; then
@@ -393,7 +397,7 @@ _isb_prepare_toolchain() {
     root="$output/toolchain"
     _isb_log "Preparing a private $language toolchain; existing installations and profiles are preserved"
     _isb_run "$limit" "$output/toolchain.log" toolchain_bootstrap \
-        "$language" "$tree" "$root" --allow-install || return $?
+        "$language" "$tree" "$root" "${bootstrap_options[@]}" || return $?
     [[ "$language" != typescript ]] || language=bun
     case "$language" in rust) bin="$root/cargo/bin" ;; go) bin="$root/go/bin" ;; bun) bin="$root/bun/bin" ;; esac
     [[ -f "$root/receipt.json" && ! -L "$root/receipt.json" && -d "$bin" && ! -L "$bin" ]] || return 7
@@ -551,50 +555,65 @@ _isb_go_committed_file() {
     printf '%s\n' "$hash"
 }
 
-# Select one committed workspace, or the existing standalone module. Only
-# main modules contribute replacement rules: Go ignores replace directives in
-# dependency modules, including modules selected by a local replacement.
-_isb_go_context() (
-    set -o pipefail
-    local root="$1" tree="$2" output="$3" limit="$4" cursor="$2" work='' work_dir=''
-    local work_hash='' parsed paths module_root relative module_path module_hash sum_file status=0
-    local index=0 document scope row old version replacement replacement_version key identity hash
-    local replacement_module replacement_relative vendor=false vendor_hash='' mod=readonly
-    local -a module_roots=() documents=() scopes=()
-    local -A seen_paths=() seen_modules=() workspace_replaces=() replacements=()
-    export GOENV=off GOFLAGS='' GOWORK=off GOTOOLCHAIN=local GO111MODULE=on GOTELEMETRY=off
+# Compiler-independent selection is shared with isolated bootstrap: a fresh
+# machine must choose its compiler from the same committed workfile that the
+# eventual Go invocation will use. Never inspect an ambient parent workspace.
+# Go itself still parses the complete file after a compiler is available.
+_isb_go_requirements() (
+    local root="$1" tree="$2" cursor="$2" relative selected=''
     relative="${tree#"$root"/}"; [[ "$tree" != "$root" ]] || relative=.
     _isb_go_directory "$root" "$root" "$relative" >/dev/null 2>&1 || {
         _isb_log 'Go build directory escapes the fetched checkout'; return 4;
     }
     while :; do
         if [[ -e "$cursor/go.work" || -L "$cursor/go.work" ]]; then
-            work="$cursor/go.work"; work_dir="$cursor"
-            work_hash=$(_isb_go_committed_file "$root" "$work") || {
-                _isb_log 'The selected go.work must be an unchanged committed regular file'; return 4;
-            }
-            _isb_run "$limit" "$output/go-workspace.log" go work edit -json "$work" || {
-                status=$?; [[ "$status" != 5 ]] || return 5; return 4;
-            }
-            if ! jq -es 'length == 1 and (.[0] | type == "object" and
-                (.Use | type == "array" and length > 0 and all(.[];
-                    type == "object" and (.DiskPath | type == "string" and length > 0 and
-                    (test("[[:cntrl:]]") | not)))))' "$output/go-workspace.log" >/dev/null; then
-                _isb_log 'Go workspace must select at least one literal module directory'; return 4
-            fi
-            paths=$(jq -r '.Use[].DiskPath' "$output/go-workspace.log") || return 4
-            while IFS= read -r relative; do
-                module_root=$(_isb_go_directory "$root" "$work_dir" "$relative") || {
-                    _isb_log "Go workspace module escapes the checkout or traverses a link: $relative"; return 4;
-                }
-                module_roots+=("$module_root")
-            done <<< "$paths"
-            documents+=("$output/go-workspace.log"); scopes+=("$work_dir")
+            selected="$cursor/go.work"
             break
         fi
         [[ "$cursor" != "$root" ]] || break
         cursor="${cursor%/*}"
     done
+    [[ -n "$selected" ]] || selected="$tree/go.mod"
+    _isb_go_committed_file "$root" "$selected" >/dev/null || {
+        _isb_log "The selected ${selected##*/} must be an unchanged committed regular file"; return 4;
+    }
+    printf '%s\n' "$selected"
+)
+
+# Select one committed workspace, or the existing standalone module. Only
+# main modules contribute replacement rules: Go ignores replace directives in
+# dependency modules, including modules selected by a local replacement.
+_isb_go_context() (
+    set -o pipefail
+    local root="$1" tree="$2" output="$3" limit="$4" requirements work='' work_dir=''
+    local work_hash='' parsed paths module_root relative module_path module_hash sum_file status=0
+    local index=0 document scope row old version replacement replacement_version key identity hash
+    local replacement_module replacement_relative vendor=false vendor_hash='' mod=readonly
+    local -a module_roots=() documents=() scopes=()
+    local -A seen_paths=() seen_modules=() workspace_replaces=() replacements=()
+    export GOENV=off GOFLAGS='' GOWORK=off GOTOOLCHAIN=local GO111MODULE=on GOTELEMETRY=off
+    requirements=$(_isb_go_requirements "$root" "$tree") || return $?
+    if [[ "${requirements##*/}" == go.work ]]; then
+        work="$requirements"; work_dir="${work%/*}"
+        work_hash=$(_isb_go_committed_file "$root" "$work") || return 4
+        _isb_run "$limit" "$output/go-workspace.log" go work edit -json "$work" || {
+            status=$?; [[ "$status" != 5 ]] || return 5; return 4;
+        }
+        if ! jq -es 'length == 1 and (.[0] | type == "object" and
+            (.Use | type == "array" and length > 0 and all(.[];
+                type == "object" and (.DiskPath | type == "string" and length > 0 and
+                (test("[[:cntrl:]]") | not)))))' "$output/go-workspace.log" >/dev/null; then
+            _isb_log 'Go workspace must select at least one literal module directory'; return 4
+        fi
+        paths=$(jq -r '.Use[].DiskPath' "$output/go-workspace.log") || return 4
+        while IFS= read -r relative; do
+            module_root=$(_isb_go_directory "$root" "$work_dir" "$relative") || {
+                _isb_log "Go workspace module escapes the checkout or traverses a link: $relative"; return 4;
+            }
+            module_roots+=("$module_root")
+        done <<< "$paths"
+        documents+=("$output/go-workspace.log"); scopes+=("$work_dir")
+    fi
     if [[ -z "$work" ]]; then
         module_roots=("$tree")
         work_dir="$tree"
@@ -807,7 +826,9 @@ _isb_compile() (
             resolved_entries=$(_isb_source_entries "$language" "$tree" "$binary" "$entry" "${binaries[@]}") || return $?
             while IFS= read -r selected_entry; do entries+=("$selected_entry"); done <<< "$resolved_entries"
             export GOENV=off GOWORK=off GOTOOLCHAIN=local GOFLAGS='' GO111MODULE=on GOTELEMETRY=off
-            _isb_prepare_toolchain "$language" "$tree" "$output" "$limit" || return $?
+            local go_requirements
+            go_requirements=$(_isb_go_requirements "${_ISB_CHECKOUT_ROOT:-$tree}" "$tree") || return $?
+            _isb_prepare_toolchain "$language" "$tree" "$output" "$limit" "$go_requirements" || return $?
             # Build for this installer host, not an inherited cross target.
             export GOOS='' GOARCH=''
             _isb_run "$limit" "$output/compiler.log" go version || { status=$?; [[ $status == 5 ]] && return 5; return 6; }

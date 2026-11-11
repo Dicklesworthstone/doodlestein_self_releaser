@@ -544,7 +544,7 @@ test_install_urls_https() {
 bootstrap_fixture() {
   BOOT_CASE=$(mktemp -d "$TEMP_DIR/bootstrap.XXXXXXXX") || return 1
   export BOOT_CASE BOOT_ROOT="$BOOT_CASE/output" BOOT_CALLS="$BOOT_CASE/calls"
-  export BOOT_PLATFORM=linux/amd64 BOOT_LIBC=gnu
+  export BOOT_PLATFORM=linux/amd64 BOOT_LIBC=gnu BOOT_GO_VERSION=1.22.2
   mkdir -p "$BOOT_CASE/tree" "$BOOT_CASE/go/bin" "$BOOT_CASE/rust" "$BOOT_CASE/bun-linux-x64-baseline"
   printf 'module example.invalid/bootstrap\ngo 1.22\n' > "$BOOT_CASE/tree/go.mod"
   printf '{"packageManager":"bun@1.2.3","engines":{"bun":"^1.2.0"}}\n' > "$BOOT_CASE/tree/package.json"
@@ -553,7 +553,7 @@ bootstrap_fixture() {
 printf 'go %s\n' "$*" >> "$BOOT_CALLS"
 touch "$BOOT_CASE/executed"
 [[ "$1" == version && "$GOROOT" == "$BOOT_ROOT/go" && "$GOENV" == off && "$GOTOOLCHAIN" == local ]] || exit 70
-printf 'go version go1.22.2 %s\n' "$BOOT_PLATFORM"
+printf 'go version go%s %s\n' "$BOOT_GO_VERSION" "$BOOT_PLATFORM"
 GO
   chmod +x "$BOOT_CASE/go/bin/go"
   tar -czf "$BOOT_CASE/go.tar.gz" -C "$BOOT_CASE" go || return 1
@@ -618,7 +618,7 @@ BUN
     [[ "${BOOT_TRANSPORT_FAIL:-false}" != true ]] || return 22
     case "$url" in
       'https://go.dev/dl/?mode=json&include=all') cp "$BOOT_CASE/go.json" "$output" ;;
-      https://go.dev/dl/go1.22.2.*.tar.gz) cp "$BOOT_CASE/go.tar.gz" "$output" ;;
+      https://go.dev/dl/go"$BOOT_GO_VERSION".*.tar.gz) cp "$BOOT_CASE/go.tar.gz" "$output" ;;
       https://static.rust-lang.org/rustup/dist/*/rustup-init.sha256) cp "$BOOT_CASE/rustup-init.sha256" "$output" ;;
       https://static.rust-lang.org/rustup/dist/*/rustup-init) cp "$BOOT_CASE/rustup-init" "$output" ;;
       https://github.com/oven-sh/bun/releases/download/bun-v1.2.3/SHASUMS256.txt) cp "$BOOT_CASE/SHASUMS256.txt" "$output" ;;
@@ -641,8 +641,10 @@ bootstrap_go_metadata() {
 }
 
 bootstrap_run() {
+  local language="$1"
+  shift
   BOOT_STATUS=0
-  toolchain_bootstrap "$1" "$BOOT_CASE/tree" "$BOOT_CASE/output" --allow-install \
+  toolchain_bootstrap "$language" "$BOOT_CASE/tree" "$BOOT_CASE/output" --allow-install "$@" \
     > "$BOOT_CASE/result.json" 2> "$BOOT_CASE/result.log" || BOOT_STATUS=$?
 }
 
@@ -670,6 +672,198 @@ test_bootstrap_go_exact_pin() (
   bootstrap_run go
   [[ "$BOOT_STATUS" == 0 ]] && grep -q 'go1.22.2.linux-amd64.tar.gz' "$BOOT_CASE/requests"
 )
+
+# These tests exercise requirement selection with the existing declared
+# distribution/version boundary fixture. The generated-installer acceptance
+# fixture separately installs an actual Go archive and compiles the workspace.
+test_bootstrap_go_workspace_minor_selection() (
+  bootstrap_fixture || return 1
+  printf 'module example.invalid/bootstrap\ngo 1.21\ntoolchain go1.21.9\n' > "$BOOT_CASE/tree/go.mod"
+  printf 'go 1.22\nuse .\n' > "$BOOT_CASE/tree/go.work"
+  bootstrap_run go --go-requirements "$BOOT_CASE/tree/go.work"
+  [[ "$BOOT_STATUS" == 0 ]] && jq -e '
+    .distribution_url == "https://go.dev/dl/go1.22.2.linux-amd64.tar.gz"
+  ' "$BOOT_CASE/result.json" >/dev/null
+)
+
+test_bootstrap_go_workspace_toolchain_pin() (
+  bootstrap_fixture || return 1
+  BOOT_GO_VERSION=1.23.0
+  printf 'go 1.22\ntoolchain go1.23.0\nuse .\n' > "$BOOT_CASE/tree/go.work"
+  bootstrap_run go --go-requirements "$BOOT_CASE/tree/go.work"
+  [[ "$BOOT_STATUS" == 0 ]] && jq -e '
+    .version == "go version go1.23.0 linux/amd64" and
+    .distribution_url == "https://go.dev/dl/go1.23.0.linux-amd64.tar.gz"
+  ' "$BOOT_CASE/result.json" >/dev/null
+)
+
+test_bootstrap_go_workspace_default_crlf() (
+  bootstrap_fixture || return 1
+  printf '// committed workspace\r\ngo 1.22 // matching minor\r\ntoolchain default\r\nuse .\r\n' > "$BOOT_CASE/tree/go.work"
+  bootstrap_run go --go-requirements "$BOOT_CASE/tree/go.work"
+  [[ "$BOOT_STATUS" == 0 ]] && jq -e '
+    .distribution_url == "https://go.dev/dl/go1.22.2.linux-amd64.tar.gz"
+  ' "$BOOT_CASE/result.json" >/dev/null
+)
+
+test_bootstrap_go_workspace_ambient_ignored() (
+  bootstrap_fixture || return 1
+  printf 'go 1.22\nuse .\n' > "$BOOT_CASE/tree/go.work"
+  printf 'go 1.23.0\nuse ./tree\n' > "$BOOT_CASE/ambient.work"
+  printf 'GOTOOLCHAIN=go1.23.0+auto\n' > "$BOOT_CASE/ambient.env"
+  GOWORK="$BOOT_CASE/ambient.work" GOENV="$BOOT_CASE/ambient.env" GOFLAGS='-invalid-ambient-flag' \
+    GOTOOLCHAIN=go1.23.0+auto GO111MODULE=off \
+    bootstrap_run go --go-requirements "$BOOT_CASE/tree/go.work"
+  [[ "$BOOT_STATUS" == 0 ]] && jq -e '
+    .distribution_url == "https://go.dev/dl/go1.22.2.linux-amd64.tar.gz"
+  ' "$BOOT_CASE/result.json" >/dev/null && ! grep -q 'go1.23.0' "$BOOT_CASE/requests"
+)
+
+test_bootstrap_go_workspace_bad_directives() (
+  bootstrap_fixture || return 1
+  local contents status
+  local -a malformed=(
+    'use .\n'
+    'go 1.22\ngo 1.23\n'
+    'go 1.22\ntoolchain go1.22.2\ntoolchain default\n'
+    'go 1.22 extra\n'
+    'go 1.22\ntoolchain go1.22.2 extra\n'
+    'go invalid\ntoolchain go1.22.2\n'
+    'go 1.22\ntoolchain go1.23rc1\n'
+    'go 1.22rc1\n'
+  )
+  for contents in "${malformed[@]}"; do
+    printf '%b' "$contents" > "$BOOT_CASE/tree/go.work"
+    BOOT_ROOT="$BOOT_CASE/output-${#contents}-$RANDOM"
+    status=0
+    toolchain_bootstrap go "$BOOT_CASE/tree" "$BOOT_ROOT" --allow-install \
+      --go-requirements "$BOOT_CASE/tree/go.work" > "$BOOT_CASE/result.json" 2> "$BOOT_CASE/result.log" || status=$?
+    [[ "$status" == 4 && ! -e "$BOOT_CASE/requests" && ! -e "$BOOT_CASE/executed" &&
+       ! -e "$BOOT_ROOT/receipt.json" ]] || return 1
+  done
+)
+
+test_bootstrap_go_workspace_unrelated_file_refused() (
+  bootstrap_fixture || return 1
+  mkdir "$BOOT_CASE/unrelated"
+  printf 'go 1.22\nuse ../tree\n' > "$BOOT_CASE/unrelated/go.work"
+  bootstrap_run go --go-requirements "$BOOT_CASE/unrelated/go.work"
+  [[ "$BOOT_STATUS" == 4 && ! -e "$BOOT_CASE/requests" && ! -e "$BOOT_CASE/executed" ]]
+)
+
+test_bootstrap_go_workspace_link_refused() (
+  bootstrap_fixture || return 1
+  printf 'go 1.22\nuse ./tree\n' > "$BOOT_CASE/requirements.work"
+  ln -s "$BOOT_CASE/requirements.work" "$BOOT_CASE/tree/go.work"
+  bootstrap_run go --go-requirements "$BOOT_CASE/tree/go.work"
+  [[ "$BOOT_STATUS" == 4 && ! -e "$BOOT_CASE/requests" && ! -e "$BOOT_CASE/executed" ]]
+)
+
+test_bootstrap_go_workspace_option_scope() (
+  bootstrap_fixture || return 1
+  printf 'go 1.22\nuse .\n' > "$BOOT_CASE/tree/go.work"
+  bootstrap_run rust --go-requirements "$BOOT_CASE/tree/go.work"
+  [[ "$BOOT_STATUS" == 4 && ! -e "$BOOT_CASE/requests" && ! -e "$BOOT_CASE/executed" ]]
+)
+
+bootstrap_go_source_fixture() {
+  bootstrap_fixture || return 1
+  # shellcheck source=../../src/install_source.sh
+  source "$SRC_DIR/install_source.sh" || return 1
+  mkdir "$BOOT_CASE/tree/project" "$BOOT_CASE/tree/shared" || return 1
+  mv "$BOOT_CASE/tree/go.mod" "$BOOT_CASE/tree/project/go.mod" || return 1
+  printf 'module example.invalid/bootstrap\ngo 1.21\n' > "$BOOT_CASE/tree/project/go.mod"
+  printf 'module example.invalid/shared\ngo 1.21\n' > "$BOOT_CASE/tree/shared/go.mod"
+  printf 'go 1.22\nuse (\n ./project\n ./shared\n)\n' > "$BOOT_CASE/tree/go.work"
+  _isb_git -C "$BOOT_CASE/tree" init -q || return 1
+  bootstrap_go_source_commit
+}
+
+bootstrap_go_source_commit() {
+  _isb_git -C "$BOOT_CASE/tree" add -A || return 1
+  _isb_git -C "$BOOT_CASE/tree" -c user.name=Fixture -c user.email=fixture@example.invalid \
+    -c commit.gpgSign=false commit -qm 'Pin source requirements fixture'
+}
+
+bootstrap_go_source_run() {
+  local build="$1" requirements
+  BOOT_STATUS=0
+  requirements=$(_isb_go_requirements "$BOOT_CASE/tree" "$build" 2> "$BOOT_CASE/selection.log") || BOOT_STATUS=$?
+  printf '%s\n' "$requirements" > "$BOOT_CASE/selected-requirements"
+  ((BOOT_STATUS == 0)) || return 0
+  toolchain_bootstrap go "$build" "$BOOT_ROOT" --allow-install --go-requirements "$requirements" \
+    > "$BOOT_CASE/result.json" 2> "$BOOT_CASE/result.log" || BOOT_STATUS=$?
+}
+
+test_bootstrap_go_source_ancestor_workspace() (
+  bootstrap_go_source_fixture || return 1
+  bootstrap_go_source_run "$BOOT_CASE/tree/project"
+  [[ "$BOOT_STATUS" == 0 && "$(cat "$BOOT_CASE/selected-requirements")" == "$BOOT_CASE/tree/go.work" ]] &&
+    jq -e '.distribution_url == "https://go.dev/dl/go1.22.2.linux-amd64.tar.gz"' "$BOOT_CASE/result.json" >/dev/null
+)
+
+test_bootstrap_go_source_moduleless_root() (
+  bootstrap_go_source_fixture || return 1
+  bootstrap_go_source_run "$BOOT_CASE/tree"
+  [[ "$BOOT_STATUS" == 0 && ! -e "$BOOT_CASE/tree/go.mod" &&
+     "$(cat "$BOOT_CASE/selected-requirements")" == "$BOOT_CASE/tree/go.work" ]]
+)
+
+test_bootstrap_go_source_nearest_workspace() (
+  bootstrap_go_source_fixture || return 1
+  printf 'go 1.23.0\nuse ./project\n' > "$BOOT_CASE/tree/go.work"
+  printf 'go 1.22\nuse .\n' > "$BOOT_CASE/tree/project/go.work"
+  bootstrap_go_source_commit || return 1
+  bootstrap_go_source_run "$BOOT_CASE/tree/project"
+  [[ "$BOOT_STATUS" == 0 &&
+     "$(cat "$BOOT_CASE/selected-requirements")" == "$BOOT_CASE/tree/project/go.work" ]] &&
+    ! grep -q 'go1.23.0' "$BOOT_CASE/requests"
+)
+
+test_bootstrap_go_source_checkout_boundary() (
+  bootstrap_go_source_fixture || return 1
+  mv "$BOOT_CASE/tree/go.work" "$BOOT_CASE/retained-go.work" || return 1
+  printf 'module example.invalid/bootstrap\ngo 1.22\n' > "$BOOT_CASE/tree/project/go.mod"
+  bootstrap_go_source_commit || return 1
+  printf 'go 1.23.0\nuse ./tree/project\n' > "$BOOT_CASE/go.work"
+  GOWORK="$BOOT_CASE/go.work" bootstrap_go_source_run "$BOOT_CASE/tree/project"
+  [[ "$BOOT_STATUS" == 0 &&
+     "$(cat "$BOOT_CASE/selected-requirements")" == "$BOOT_CASE/tree/project/go.mod" ]] &&
+    ! grep -q 'go1.23.0' "$BOOT_CASE/requests"
+)
+
+test_bootstrap_go_source_invalid_requirement() (
+  bootstrap_go_source_fixture || return 1
+  local build="$BOOT_CASE/tree/project"
+  case "$1" in
+    untracked) _isb_git -C "$BOOT_CASE/tree" rm --cached -q go.work || return 1
+      _isb_git -C "$BOOT_CASE/tree" -c user.name=Fixture -c user.email=fixture@example.invalid \
+        -c commit.gpgSign=false commit -qm 'Leave workspace outside source pin' || return 1 ;;
+    modified) printf 'go 1.23.0\nuse ./project\n' > "$BOOT_CASE/tree/go.work" ;;
+    link) mv "$BOOT_CASE/tree/go.work" "$BOOT_CASE/requirements.work" || return 1
+      ln -s "$BOOT_CASE/requirements.work" "$BOOT_CASE/tree/go.work" ;;
+    ancestor-link) ln -s "$BOOT_CASE/tree/project" "$BOOT_CASE/tree/linked-project"
+      build="$BOOT_CASE/tree/linked-project" ;;
+    outside) build="$BOOT_CASE" ;;
+    untracked-module)
+      mv "$BOOT_CASE/tree/go.work" "$BOOT_CASE/retained-go.work" || return 1
+      _isb_git -C "$BOOT_CASE/tree" add -u -- go.work || return 1
+      _isb_git -C "$BOOT_CASE/tree" rm --cached -q project/go.mod || return 1
+      _isb_git -C "$BOOT_CASE/tree" -c user.name=Fixture -c user.email=fixture@example.invalid \
+        -c commit.gpgSign=false commit -qm 'Remove source requirements from pin' || return 1 ;;
+    *) return 1 ;;
+  esac
+  bootstrap_go_source_run "$build"
+  [[ "$BOOT_STATUS" == 4 && ! -e "$BOOT_CASE/requests" && ! -e "$BOOT_CASE/executed" &&
+     ! -e "$BOOT_ROOT/receipt.json" ]]
+)
+
+test_bootstrap_go_source_untracked_workspace() { test_bootstrap_go_source_invalid_requirement untracked; }
+test_bootstrap_go_source_modified_workspace() { test_bootstrap_go_source_invalid_requirement modified; }
+test_bootstrap_go_source_linked_workspace() { test_bootstrap_go_source_invalid_requirement link; }
+test_bootstrap_go_source_linked_ancestor() { test_bootstrap_go_source_invalid_requirement ancestor-link; }
+test_bootstrap_go_source_outside_checkout() { test_bootstrap_go_source_invalid_requirement outside; }
+test_bootstrap_go_source_untracked_module() { test_bootstrap_go_source_invalid_requirement untracked-module; }
 
 test_bootstrap_go_macos_arm() (
   bootstrap_fixture || return 1
@@ -942,6 +1136,24 @@ main() {
   run_test "bootstrap_requires_consent" test_bootstrap_requires_consent
   run_test "bootstrap_go_minor_selection" test_bootstrap_go_minor_selection
   run_test "bootstrap_go_exact_pin" test_bootstrap_go_exact_pin
+  run_test "bootstrap_go_workspace_minor_selection" test_bootstrap_go_workspace_minor_selection
+  run_test "bootstrap_go_workspace_toolchain_pin" test_bootstrap_go_workspace_toolchain_pin
+  run_test "bootstrap_go_workspace_default_crlf" test_bootstrap_go_workspace_default_crlf
+  run_test "bootstrap_go_workspace_ambient_ignored" test_bootstrap_go_workspace_ambient_ignored
+  run_test "bootstrap_go_workspace_bad_directives" test_bootstrap_go_workspace_bad_directives
+  run_test "bootstrap_go_workspace_unrelated_file_refused" test_bootstrap_go_workspace_unrelated_file_refused
+  run_test "bootstrap_go_workspace_link_refused" test_bootstrap_go_workspace_link_refused
+  run_test "bootstrap_go_workspace_option_scope" test_bootstrap_go_workspace_option_scope
+  run_test "bootstrap_go_source_ancestor_workspace" test_bootstrap_go_source_ancestor_workspace
+  run_test "bootstrap_go_source_moduleless_root" test_bootstrap_go_source_moduleless_root
+  run_test "bootstrap_go_source_nearest_workspace" test_bootstrap_go_source_nearest_workspace
+  run_test "bootstrap_go_source_checkout_boundary" test_bootstrap_go_source_checkout_boundary
+  run_test "bootstrap_go_source_untracked_workspace" test_bootstrap_go_source_untracked_workspace
+  run_test "bootstrap_go_source_modified_workspace" test_bootstrap_go_source_modified_workspace
+  run_test "bootstrap_go_source_linked_workspace" test_bootstrap_go_source_linked_workspace
+  run_test "bootstrap_go_source_linked_ancestor" test_bootstrap_go_source_linked_ancestor
+  run_test "bootstrap_go_source_outside_checkout" test_bootstrap_go_source_outside_checkout
+  run_test "bootstrap_go_source_untracked_module" test_bootstrap_go_source_untracked_module
   run_test "bootstrap_go_macos_arm" test_bootstrap_go_macos_arm
   run_test "bootstrap_go_hash" test_bootstrap_go_hash
   run_test "bootstrap_go_size" test_bootstrap_go_size

@@ -2,9 +2,16 @@
 # Exercise the generated installer and embedded source engine together.
 # Git checkout/tag peeling and Go compilation are real. Only release HTTP
 # transports, compiler distribution delivery and selected command failures are
-# fixtures; no network is used. Bootstrap activation delegates to real Go below.
+# fixtures; no network is used. Existing bootstrap controls delegate to real
+# Go; workspace bootstrap controls extract and run the genuine distribution.
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+ROOT="${DSR_TEST_ROOT:-$ROOT}"
+TEST_MODE="${1:-}"
+[[ $# -eq 0 || ( $# -eq 1 && "$TEST_MODE" == --go-workspace-bootstrap-only ) ]] || {
+    printf 'Usage: %s [--go-workspace-bootstrap-only]\n' "$0" >&2
+    exit 4
+}
 for dependency in git jq go tar; do
     command -v "$dependency" >/dev/null || { echo "SKIP: $dependency required"; exit 0; }
 done
@@ -254,6 +261,157 @@ run_case() {
     bash "$INSTALLER" --json --non-interactive --no-skills --cache-dir "$CASE/cache" \
         --dir "$CASE/install" "$@" > "$CASE/out.json" 2> "$CASE/err" || status=$?
 }
+
+prepare_no_go_path() {
+    local destination="$1" command resolved
+    mkdir -p "$destination" || return 1
+    for command in bash env git curl gh jq tar gzip sha256sum shasum uname getconf ldd awk sed grep tr cut \
+        head tail wc sort uniq dirname basename readlink realpath mkdir rmdir chmod mktemp cat cp mv rm date \
+        ps sleep find stat touch ln install; do
+        resolved=$(command -v "$command") || continue
+        ln -s "$resolved" "$destination/$command" || return 1
+    done
+}
+
+workspace_binary_runs() {
+    [[ -f "$1" && -x "$1" ]] && [[ "$("$1")" == "$2" ]]
+}
+
+workspace_binary_receipt() {
+    local name="$1" digest
+    digest=$(_isb_sha256 "$CASE/install/$name") || return 1
+    jq -e --arg name "$name" --arg digest "$digest" --arg path "$CASE/install/$name" '
+        [.binaries[] | select(.name == $name and .path == $path and .sha256 == $digest)] | length == 1
+    ' "$CASE/out.json" >/dev/null &&
+    jq -e --arg name "$name" --arg digest "$digest" '
+        [.source.binaries[] | select(.name == $name and .sha256 == $digest and (has("path") | not))] | length == 1
+    ' "$CASE/out.json" >/dev/null
+}
+
+test_workspace_bootstrap() {
+    # The configured executable family needs the real YAML parser. Preserve
+    # the older plain-key controls on hosts without this optional dependency.
+    command -v yq >/dev/null 2>&1 || { printf 'SKIP: Go workspace bootstrap family requires yq\n'; return 0; }
+    local runtime_root runtime_version archive digest workspace pin work_hash label subdir entry family name
+    runtime_root=$("$GO_REAL" env GOROOT) || return 1
+    runtime_version=$("$GO_REAL" env GOVERSION) || return 1
+    [[ "$runtime_version" =~ ^go[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    mkdir -p "$TEMP/workspace-bootstrap" || return 1
+    archive="${DSR_TEST_GO_ARCHIVE:-}"
+    if [[ -z "$archive" ]]; then
+        # Package the installed, unmodified runtime when an existing genuine
+        # distribution is not supplied. Only HTTP delivery is substituted.
+        ln -s "$runtime_root" "$TEMP/workspace-bootstrap/go" || return 1
+        archive="$TEMP/workspace-bootstrap/distribution.tar.gz"
+        tar -czhf "$archive" -C "$TEMP/workspace-bootstrap" go || return 1
+    fi
+    [[ -f "$archive" && ! -L "$archive" ]] || return 1
+    digest=$(_isb_sha256 "$archive") || return 1
+    export BOOTSTRAP_ARCHIVE="$archive" BOOTSTRAP_METADATA="$TEMP/workspace-bootstrap/releases.json"
+    jq -nc --arg version "$runtime_version" --arg os "$os" --arg arch "$arch" \
+        --arg sha "$digest" --argjson size "$(wc -c < "$archive")" '
+        [{version:$version,stable:true,files:[{os:$os,arch:$arch,kind:"archive",sha256:$sha,size:$size,
+          filename:($version + "." + $os + "-" + $arch + ".tar.gz")}]}]
+    ' > "$BOOTSTRAP_METADATA" || return 1
+    prepare_no_go_path "$TEMP/workspace-no-go" || return 1
+    check 'workspace bootstrap has no ambient Go compiler' env PATH="$TEMP/workspace-no-go" bash -c '! command -v go'
+    workspace="$TEMP/upstream/workspace"
+    mkdir -p "$workspace/cmd/app" "$workspace/cmd/helper" "$workspace/shared" || return 1
+    cat > "$workspace/go.work" <<WORK
+go 1.21
+toolchain $runtime_version
+
+use (
+    ./cmd/app
+    ./cmd/helper
+    ./shared
+)
+WORK
+    cat > "$workspace/shared/go.mod" <<'MOD'
+module example.invalid/workspace-shared
+
+go 1.20
+MOD
+    printf 'package shared\nconst Message = "workspace-bootstrap"\n' > "$workspace/shared/shared.go"
+    for name in app helper; do
+        cat > "$workspace/cmd/$name/go.mod" <<MOD
+module example.invalid/workspace-$name
+
+go 1.20
+
+require example.invalid/workspace-shared v0.0.0
+MOD
+        cat > "$workspace/cmd/$name/main.go" <<GO
+package main
+import (
+    "syscall"
+    "example.invalid/workspace-shared"
+)
+func main() { syscall.Write(1, []byte("$name-" + shared.Message + "\n")) }
+GO
+    done
+    "$GIT_REAL" -C "$TEMP/upstream" add workspace || return 1
+    "$GIT_REAL" -C "$TEMP/upstream" commit -qm 'pin workspace compiler and executable family' || return 1
+    "$GIT_REAL" -C "$TEMP/upstream" tag v3.0.0 || return 1
+    pin=$("$GIT_REAL" -C "$TEMP/upstream" rev-parse HEAD) || return 1
+    work_hash=$(_isb_sha256 "$workspace/go.work") || return 1
+    check 'workspace bootstrap fixture has no root go.mod' test ! -e "$workspace/go.mod"
+    for label in virtual-root member-root; do
+        subdir=workspace; entry=cmd/app; family='[app, helper]'
+        if [[ "$label" == member-root ]]; then
+            subdir=workspace/cmd/app; entry=.; family='[app]'
+        fi
+        cat > "$TEMP/config/repos.d/app.yaml" <<YAML
+tool_name: app
+repo: example/source-app
+binary_name: app
+language: go
+source_subdir: $subdir
+source_entry: $entry
+workspace_binaries: $family
+artifact_naming: '\${name}-\${version}-\${os}-\${arch}'
+YAML
+        INSTALLER=$(install_gen_create app) || return 1
+        bash -n "$INSTALLER" || return 1
+        PATH="$TEMP/workspace-no-go" run_case "workspace-bootstrap-$label" discovery-fail \
+            --from-source --version v3.0.0 --install-toolchain --source-timeout 60
+        check "$label workspace bootstraps its selected compiler and installs" equal "$status" 0
+        check "$label workspace source receipt binds the fetched tag" source_json "$pin"
+        check "$label workspace bootstrap executes the genuine app" workspace_binary_runs "$CASE/install/app" app-workspace-bootstrap
+        check "$label workspace app receipts bind the installed bytes" workspace_binary_receipt app
+        check "$label workspace receipt binds its admitted workfile and modules" jq -e --arg hash "$work_hash" '
+            .source.go_workspace | .path == "workspace/go.work" and .sha256 == $hash and .vendor == false and
+            ([.modules[].path] | sort) == ["workspace/cmd/app", "workspace/cmd/helper", "workspace/shared"]
+        ' "$CASE/out.json"
+        check "$label workspace compiler directive wins over lower member go.mod" jq -e \
+            --arg version "go version $runtime_version $os/$arch" --arg sha "$digest" \
+            --arg url "https://go.dev/dl/$runtime_version.$os-$arch.tar.gz" '
+            .source.compiler == $version and (.source.toolchain | .method == "isolated-bootstrap" and
+            .version == $version and .distribution_sha256 == $sha and .distribution_url == $url and
+            (has("root") | not) and (has("bin_dir") | not))
+        ' "$CASE/out.json"
+        check "$label workspace fetches only the selected compiler archive" grep -Fxq \
+            "curl https://go.dev/dl/$runtime_version.$os-$arch.tar.gz" "$CALLS"
+        check "$label workspace bootstrap releases its installation lock" test ! -e "$CASE/install/.dsr-install.lock"
+        if [[ "$label" == virtual-root ]]; then
+            check 'moduleless workspace bootstrap executes the genuine companion' workspace_binary_runs \
+                "$CASE/install/helper" helper-workspace-bootstrap
+            check 'moduleless workspace companion receipts bind the installed bytes' workspace_binary_receipt helper
+            check 'moduleless workspace bootstrap installs the exact complete family' jq -e '
+                ([.binaries[].name] == ["app", "helper"]) and ([.source.binaries[].name] == ["app", "helper"])
+            ' "$CASE/out.json"
+        fi
+    done
+    check 'workspace compiler bootstrap preserves the global compiler home' test ! -e "$HOME/go"
+}
+
+if [[ "$TEST_MODE" == --go-workspace-bootstrap-only ]]; then
+    test_workspace_bootstrap || exit 1
+    printf 'Generated workspace bootstrap: %s passed, %s failed\n' "$passed" "$failed"
+    [[ "$failed" == 0 ]]
+    exit $?
+fi
+
 run_case force-head discovery-fail --from-source --source-timeout 60
 check 'forced source works without release discovery' equal "$status" 0
 check 'forced source makes no HTTP requests' no_http
@@ -476,12 +634,7 @@ jq -nc --arg version "$BOOT_GO_VERSION" --arg os "$os" --arg arch "$arch" \
     --arg sha "$BOOT_DIGEST" --argjson size "$(wc -c < "$BOOTSTRAP_ARCHIVE")" \
     '[{version:$version,stable:true,files:[{os:$os,arch:$arch,kind:"archive",sha256:$sha,size:$size,
       filename:($version + "." + $os + "-" + $arch + ".tar.gz")}]}]' > "$BOOTSTRAP_METADATA"
-for command in bash env git curl gh jq tar gzip sha256sum shasum uname getconf ldd awk sed grep tr cut \
-    head tail wc sort uniq dirname basename readlink realpath mkdir rmdir chmod mktemp cat cp mv rm date \
-    ps sleep find stat touch ln install; do
-    resolved=$(command -v "$command") || continue
-    ln -s "$resolved" "$TEMP/no-go/$command" || exit 1
-done
+prepare_no_go_path "$TEMP/no-go" || exit 1
 check 'bootstrap fixture genuinely has no compiler on PATH' env PATH="$TEMP/no-go" bash -c '! command -v go'
 run_case bootstrap-no-source good --install-toolchain --yes
 check 'compiler consent alone does not authorize source code' equal "$status" 4

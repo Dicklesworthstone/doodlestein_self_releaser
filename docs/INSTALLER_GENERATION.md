@@ -533,6 +533,13 @@ Ambient `GO111MODULE`, `GOWORK`,
 `GOFLAGS`, and persisted Go configuration cannot override this selection, and
 `GOTOOLCHAIN=local` prevents an implicit compiler download.
 
+On a machine without Go, Bash installers can build these workspaces with the
+existing `--from-source --install-toolchain` consent. The private bootstrap reads
+compiler requirements from the same committed workfile, including when the
+workspace root has no `go.mod` or a member module specifies an older Go version.
+It then uses the installed compiler to parse and validate the complete workspace
+before resolving packages or building any executable.
+
 Successful source receipts add `go_workspace`, containing the checkout-relative
 workfile path and SHA-256, each main module's path, module identity and `go.mod`
 SHA-256, active local replacement identities, and the vendor selection. A
@@ -644,7 +651,7 @@ Compiler selection comes from the selected source tree:
 
 | Language | Selection |
 |----------|-----------|
-| Go | An exact numeric `toolchain goX.Y.Z` takes precedence. Otherwise the `go` directive is used: an exact patch stays exact, while `X.Y` selects the newest stable patch in that minor. Unsupported or unavailable requirements fail. |
+| Go | Requirements come from the nearest committed `go.work` within the fetched checkout, or the selected module's `go.mod` when no workspace applies. An exact numeric `toolchain goX.Y.Z` takes precedence. Otherwise the `go` directive is used: an exact patch stays exact, while `X.Y` selects the newest stable patch in that minor. Unsupported or unavailable requirements fail. |
 | Rust | Rustup reads the repository's `rust-toolchain.toml` or legacy `rust-toolchain` file. Without one, the private installation selects stable. Ambient parent overrides are not adopted as project requirements. |
 | Bun / TypeScript | An exact numeric `packageManager: bun@X.Y.Z` is honored; otherwise an exact numeric `engines.bun` can pin the version. Unpinned recipes use the latest stable Bun release and must satisfy any declared engine range. Unsupported pins or incompatible ranges fail. |
 
@@ -681,6 +688,19 @@ source src/install_source.sh
 install_source_build owner/repo refs/tags/v1.2.3 go app ./new-build \
   --allow-build --install-toolchain --timeout 3600
 ```
+
+The fresh-compiler workspace regression runs the generated installer with no Go
+on PATH and a genuine distribution, then executes and verifies the installed
+family. It has its own test entrypoint so cold compiler setup retains the
+ordinary per-file deadline:
+
+```bash
+bash scripts/tests/test_generated_installer_workspace_bootstrap.sh
+```
+
+Set `DSR_TEST_GO_ARCHIVE` to reuse a matching genuine Go distribution archive;
+otherwise the fixture packages the installed Go runtime. `DSR_TEST_ROOT` can
+select a frozen earlier checkout for the same caller's before/after comparison.
 
 ## Repository-bound release caches
 

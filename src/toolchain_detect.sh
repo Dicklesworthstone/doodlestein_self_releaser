@@ -712,21 +712,33 @@ _tc_bootstrap_extract_go() {
 
 _tc_bootstrap_go() {
     local tree="$1" root="$2" platform="$3" requested selection version filename digest size actual
-    [[ -f "$tree/go.mod" && ! -L "$tree/go.mod" ]] || return 4
+    local requirements="${4:-$tree/go.mod}"
+    [[ -f "$requirements" && ! -L "$requirements" ]] || return 4
     # The toolchain directive is an exact preferred compiler. Without it, use
     # the stated go version; a major.minor selects its newest published patch,
     # never a different minor. Do not silently update a pinned requirement.
+    # The source engine admits this file from its pinned checkout. This small
+    # bootstrap reader only selects a distribution; Go parses the full module
+    # or workfile after that verified compiler becomes available.
     requested=$(awk '
-        { sub(/\/\/.*/, "") }
-        $1 == "go" { if (NF != 2 || ++g != 1) bad=1; version=$2 }
-        $1 == "toolchain" { if (NF != 2 || ++t != 1) bad=1; selected=$2 }
+        { sub(/\r$/, ""); sub(/\/\/.*/, "") }
+        $1 == "go" {
+            if (NF != 2 || ++g != 1 || $2 !~ /^[1-9][0-9]*\.[0-9]+(\.[0-9]+)?$/) bad=1
+            version=$2
+        }
+        $1 == "toolchain" {
+            if (NF != 2 || ++t != 1 || ($2 != "default" && $2 !~ /^go[1-9][0-9]*\.[0-9]+(\.[0-9]+)?$/)) bad=1
+            selected=$2
+        }
         END {
             if (bad || g != 1) exit 1
             if (selected != "" && selected != "default") print selected
             else print "go" version
-        }' "$tree/go.mod") || return 4
+        }' "$requirements") || {
+        _tc_log_error 'Go bootstrap requires one released numeric go version and an optional numeric toolchain preference'; return 4;
+    }
     [[ "$requested" =~ ^go[1-9][0-9]*\.[0-9]+(\.[0-9]+)?$ ]] || {
-        _tc_log_error 'Go bootstrap requires a released numeric go/toolchain version in go.mod'; return 4;
+        _tc_log_error 'Go bootstrap requires a released numeric go/toolchain version'; return 4;
     }
     _tc_bootstrap_fetch 'https://go.dev/dl/?mode=json&include=all' "$root/releases.json" 8388608 || return $?
     selection=$(jq -ers --arg requested "$requested" --arg os "${platform%/*}" --arg arch "${platform#*/}" '
@@ -890,9 +902,12 @@ _tc_bootstrap_bun() {
 # existing toolchain, profile, system directory or default compiler is changed.
 # stdout: receipt JSON; receipt.json appears only after compiler activation was
 # verified. Selection/version policy is read from the already pinned source.
+# Optional --go-requirements selects a caller-admitted go.work at or above the
+# build directory, or its go.mod. Four-argument callers keep their old policy.
 toolchain_bootstrap() (
-    [[ $# -eq 4 && "$4" == --allow-install ]] || return 4
-    local language="$1" tree="$2" root="$3" platform parent command
+    [[ $# -eq 4 || $# -eq 6 ]] || return 4
+    [[ "$4" == --allow-install ]] || return 4
+    local language="$1" tree="$2" root="$3" platform parent command go_requirements='' requirements_parent
     local _TC_BOOTSTRAP_URL='' _TC_BOOTSTRAP_SHA='' _TC_BOOTSTRAP_BIN='' _TC_BOOTSTRAP_VERSION='' _TC_BOOTSTRAP_RUSTUP_TOOLCHAIN=''
     [[ "$language" != typescript ]] || language=bun
     case "$language" in rust|go|bun) ;; *) return 4 ;; esac
@@ -901,6 +916,19 @@ toolchain_bootstrap() (
     [[ -d "$parent" && ! -L "$parent" ]] || return 4
     tree=$(cd "$tree" && pwd -P) || return 4
     root="$(cd "$parent" && pwd -P)/${root##*/}"
+    if [[ $# -eq 6 ]]; then
+        [[ "$language" == go && "$5" == --go-requirements ]] || return 4
+        go_requirements="$6"
+        [[ "$go_requirements" == /* && "$go_requirements" != *[[:cntrl:]]* &&
+           -f "$go_requirements" && ! -L "$go_requirements" ]] || return 4
+        requirements_parent=$(cd "$(dirname "$go_requirements")" && pwd -P) || return 4
+        go_requirements="$requirements_parent/${go_requirements##*/}"
+        case "${go_requirements##*/}" in
+            go.work) [[ "$tree" == "$requirements_parent" || "$tree" == "$requirements_parent/"* ]] || return 4 ;;
+            go.mod) [[ "$tree" == "$requirements_parent" ]] || return 4 ;;
+            *) return 4 ;;
+        esac
+    fi
     platform=$(_tc_detect_platform)
     case "$platform" in linux/amd64|linux/arm64|darwin/amd64|darwin/arm64) ;; *)
         _tc_log_error "Isolated toolchain bootstrap is not supported on $platform; install the compiler first"; return 3 ;;
@@ -912,7 +940,7 @@ toolchain_bootstrap() (
     _tc_log_info "Preparing an isolated $language compiler for $platform"
     case "$language" in
         rust) _tc_bootstrap_rust "$tree" "$root" "$platform" || return $? ;;
-        go) _tc_bootstrap_go "$tree" "$root" "$platform" || return $? ;;
+        go) _tc_bootstrap_go "$tree" "$root" "$platform" "$go_requirements" || return $? ;;
         bun) _tc_bootstrap_bun "$tree" "$root" "$platform" || return $? ;;
     esac
     local receipt
