@@ -173,12 +173,19 @@ jobs:
       - name: Build strict Go releases from pinned sibling snapshots
         if: runner.os == 'Linux'
         shell: bash
+        env:
+          DSR_TEST_DISK_ROOT: /var/tmp
         run: |
           set -euo pipefail
           bash -n scripts/tests/test_native_source_sync.sh
-          DSR_TEST_DISK_ROOT="$RUNNER_TEMP" DSR_TEST_GOCACHE="$RUNNER_TEMP/strict-go-cache" \
-            timeout 120 bash scripts/tests/test_native_source_sync.sh --strict-go-siblings-only \
-              2>&1 | tee "$RUNNER_TEMP/collector-evidence/strict-go-siblings.log"
+          DSR_TEST_GOCACHE=$(go env GOCACHE)
+          export DSR_TEST_GOCACHE
+          timeout 120 bash scripts/tests/test_native_source_sync.sh --strict-go-siblings-only \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/strict-go-siblings.log"
+          timeout 120 bash scripts/tests/test_native_source_sync.sh --strict-go-admission-only \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/strict-go-admission.log"
+          timeout 120 bash scripts/tests/test_native_source_sync.sh --strict-go-matrix-only \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/strict-go-matrix.log"
           test -z "$(git status --porcelain)"
       - name: Verify Windows Go staging with genuine PowerShell and PE outputs
         if: runner.os == 'Linux'

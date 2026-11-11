@@ -13514,7 +13514,8 @@ act_run_native_build() {
             # Strict Go replacements and go.work entries use the same pinned
             # sibling layout as source sync. Keep that namespace beside the
             # private attempt, never recopy a live controller checkout.
-            if ! jq -e 'all(.[]; (.relative_path | ascii_downcase) != "source")' \
+            if ! jq -e 'all(.[]; (.relative_path | ascii_downcase) as $name |
+                    $name != "source" and $name != "cargo-home")' \
                     <<< "$output_stage_dependencies" >/dev/null || \
                ! output_stage_sibling_names=$(jq -r '.[].relative_path' <<< "$output_stage_dependencies"); then
                 _log_error "Invalid strict output-stage sibling namespace"
@@ -13896,7 +13897,7 @@ EOF
                 cargo_home_prefix+="if ! test -d '$output_sibling_source_q' || test -L '$output_sibling_source_q'; then printf '[dsr] required Go sibling is missing or linked: %s\\n' '$output_sibling_source_q' >&2; exit 4; fi; mkdir '$output_sibling_destination_q'; cp -R '$output_sibling_source_q/.' '$output_sibling_destination_q/'; if test -e '$output_sibling_destination_q/.git' || test -L '$output_sibling_destination_q/.git'; then git -C '$output_sibling_destination_q' status --porcelain --untracked-files=no >/dev/null; fi; "
             done <<< "$output_stage_sibling_names"
             if $strict_native_build; then
-                local stage_manifest_dir stage_sources stage_entry stage_name stage_checkout stage_revision stage_archive
+                local stage_manifest_dir stage_sources stage_source_rows stage_entry stage_name stage_checkout stage_revision stage_archive
                 local stage_manifest stage_manifest_digest stage_object_count stage_verification
                 stage_manifest_dir="$ACT_ARTIFACTS_DIR/strict-source-verification/stage-${output_stage_uuid}"
                 if [[ -z "$release_git_sha" ]] || \
@@ -13908,6 +13909,8 @@ EOF
                     _log_error "Unable to prepare strict output-stage source manifests"
                     return 4
                 fi
+                stage_source_rows=$(jq -c '.[]' <<< "$stage_sources") || return 4
+                [[ -n "$stage_source_rows" ]] || return 4
                 while IFS= read -r stage_entry; do
                     stage_name=$(jq -er '.relative_path' <<< "$stage_entry") || return 4
                     stage_checkout=$(jq -er '.local_path' <<< "$stage_entry") || return 4
@@ -13915,7 +13918,8 @@ EOF
                     stage_archive="dependency-$stage_name"
                     [[ "$stage_name" != source ]] || stage_archive=source
                     stage_manifest="$stage_manifest_dir/$stage_archive.manifest"
-                    if ! _act_write_tracked_manifest "$stage_checkout" "$stage_revision" "$stage_manifest" || \
+                    if ! _act_validate_strict_checkout_at_revision "$stage_checkout" "$stage_revision" "$stage_name" || \
+                       ! _act_write_tracked_manifest "$stage_checkout" "$stage_revision" "$stage_manifest" || \
                        ! stage_manifest_digest=$(_act_sha256 "$stage_manifest") || \
                        ! stage_object_count=$(_act_tracked_manifest_object_count "$stage_manifest") || \
                        ! stage_verification=$(_act_unix_strict_snapshot_verify_script \
@@ -13929,7 +13933,7 @@ EOF
                     # command runs. The coordinator still rechecks all original
                     # snapshots after compilation and before publication.
                     cargo_home_prefix+="${stage_verification}"$'\n'
-                done < <(jq -c '.[]' <<< "$stage_sources")
+                done <<< "$stage_source_rows"
             fi
             cd_cmd="cd '${stage_source_q}'"
             _log_info "Building $platform in private output stage $output_stage_source"
@@ -15761,6 +15765,24 @@ _act_native_output_paths() {
             printf 'external\t%s\n' "$path"
         fi
     done <<< "$binaries"
+}
+
+# Only default Go output paths are proven relocatable into a strict private
+# source stage. An explicit GOBIN may still name the original snapshot or
+# escape a relative path, so preserve conflict serialization for that case.
+# Returns 0 for private staging, 1 for deferral, and 4 for unreadable policy.
+_act_strict_go_output_stage_policy() {
+    local tool_name="$1" platform="$2" language build_env env_pair go_bin=""
+    language=$(yq -r '.language // ""' "$ACT_REPOS_DIR/${tool_name}.yaml") || return 4
+    [[ "$language" == go ]] || return 1
+    build_env=$(act_get_build_env "$tool_name" "$platform") || return 4
+    # Match the launcher's ordered assignments, including a platform override
+    # that explicitly clears a global GOBIN. Missing and empty both use the
+    # default output path; no failing environment read can grant admission.
+    while IFS= read -r env_pair; do
+        case "$env_pair" in GOBIN=*) go_bin="${env_pair#GOBIN=}" ;; esac
+    done <<< "$build_env"
+    [[ -z "$go_bin" ]]
 }
 
 # Keep the backend's process-group leader alive until the worker has observed
@@ -17872,8 +17894,10 @@ act_orchestrate_build() {
         # Two concurrent targets on one host whose builds write the same file
         # (`go build -o ntm` in one source tree) would collect each other's
         # binaries. Give this target a private source copy when that makes
-        # the shared path its own; otherwise (strict snapshots, Windows hosts,
-        # outputs outside the tree) wait until the conflicting build is done.
+        # the shared path its own. Strict Unix Go builds also have verified
+        # private source and sibling stages when GOBIN uses the default path.
+        # Explicit GOBIN, other strict languages, Windows hosts and outputs
+        # outside the tree still wait for the conflict.
         local output_paths="" output_stage=0 output_conflict=""
         if (( parallel_jobs > 1 )) &&
            { [[ "$target_sync_receipt" == null ]] || [[ "$(jq -r '.status' <<< "$target_sync_receipt")" == success ]]; }; then
@@ -17881,7 +17905,19 @@ act_orchestrate_build() {
                 "$strict_release_contract" "$source_roots_json")
             output_conflict=$(_act_active_output_conflict "$host" "$output_paths")
             if [[ -n "$output_conflict" ]]; then
-                if ! $strict_release_contract && ! _act_is_windows_host "$host" && \
+                local output_stage_allowed=true output_stage_policy_status=0
+                if $strict_release_contract; then
+                    _act_strict_go_output_stage_policy "$tool_name" "$target" || output_stage_policy_status=$?
+                    case "$output_stage_policy_status" in
+                        0) ;;
+                        1) output_stage_allowed=false ;;
+                        *)
+                            _act_fail_coordinator "Unable to resolve strict output-staging policy for $tool_name/$target"
+                            break
+                            ;;
+                    esac
+                fi
+                if $output_stage_allowed && ! _act_is_windows_host "$host" && \
                    ! grep -q '^external' <<< "$output_paths"; then
                     output_stage=1
                     output_paths=""

@@ -304,6 +304,13 @@ snapshots are checked again afterward. Collection reads the attempt's output,
 so in-tree executables do not alter the frozen release inputs or reuse an earlier
 attempt's binary.
 
+With default in-tree Go outputs, multiple strict targets can build concurrently
+on the same Unix host using separate verified stages. Explicit `GOBIN` paths,
+external outputs, and Windows hosts retain serialization for conflicting files.
+Unix staging reserves the sibling names `source` and `cargo-home`, and verifies
+that every controller checkout still matches its pin before staging. Source-root
+verification is separate from Go compiler and module-cache isolation.
+
 Strict native Rust builds seed private Cargo homes with downloads selected
 by the committed `Cargo.lock`: checksum-matching crate archives, their index
 records, and Git databases containing locked commits. Ambient extracted registry
