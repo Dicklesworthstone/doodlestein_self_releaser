@@ -174,7 +174,7 @@ def snapshot(directory):
 if sys.argv[2:] == ['--cli']:
     program = work/'program'
     (program/'src').mkdir(parents=True)
-    for name in ('release_checksums.sh','checksum_sync.sh'):
+    for name in ('release_checksums.sh','checksum_sync.sh','secrets.sh'):
         shutil.copy2(root/'src'/name,program/'src'/name)
     verifier = Path(os.environ.get('DSR_TEST_VERIFY_MODULE',str(root/'src/release_verify.sh')))
     shutil.copy2(verifier,program/'src/release_verify.sh')

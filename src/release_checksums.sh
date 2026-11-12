@@ -115,15 +115,23 @@ def run(command, *, incoming=None, limit=60):
         child = None
 
 def token_for_request():
-    token = os.environ.get('DSR_GH_TOKEN') or os.environ.get('GH_TOKEN') or os.environ.get('GITHUB_TOKEN') or ''
-    if not token and shutil.which('gh'):
-        code, stdout, _ = run(['gh', 'auth', 'token', '--hostname', 'github.com'], limit=15)
-        if code == 0:
-            try:
-                token = stdout.decode('ascii').strip()
-            except UnicodeError as error:
-                raise Failure('Invalid GitHub authentication token encoding', 3) from error
-    require(not token or re.fullmatch(r'[A-Za-z0-9_.-]+', token) is not None,
+    # Metadata, publication and the standalone auditor must use one credential
+    # policy. In particular, gh's own GH_TOKEN precedence must not switch the
+    # account after the metadata command selected GITHUB_TOKEN.
+    code, stdout, _ = run(['bash', '-c',
+        'set +x; source "$1/secrets.sh" || exit 4; secrets_get_gh_token', '_', str(module)], limit=15)
+    require(code not in (2, 129, 130, 131, 143) and code >= 0,
+            'GitHub credential lookup was cancelled', 5)
+    require(code in (0, 3), 'GitHub credential lookup failed', 3)
+    if code == 3:
+        return ''  # A standalone public audit still permits absent credentials.
+    try:
+        # Remove only the resolver's final record delimiter. Whitespace inside
+        # an explicitly selected token must not become a different credential.
+        token = (stdout[:-1] if stdout.endswith(b'\n') else stdout).decode('ascii')
+    except UnicodeError as error:
+        raise Failure('Invalid GitHub authentication token encoding', 3) from error
+    require(re.fullmatch(r'[A-Za-z0-9_.-]+', token) is not None,
             'Invalid GitHub authentication token encoding', 3)
     return token
 
@@ -573,6 +581,7 @@ try:
     require(args.release_id is None or integer(args.release_id, 1), 'Invalid expected release ID', 4)
     require(shutil.which('curl') and shutil.which('bash'), 'curl and Bash are required', 3)
     require(shutil.which('jq'), 'jq is required for the shared checksum parser', 3)
+    require((module / 'secrets.sh').is_file(), 'Shared GitHub credential policy is unavailable', 3)
     require_curl()
     if args.resume_from is not None:
         resume = read_resume(args.resume_from)

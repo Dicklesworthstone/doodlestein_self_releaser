@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Production release-command registration, checksum adapter, auditor and parser.
-# The existing metadata/repair CLI and HTTP service are explicit boundary
-# fixtures. No GitHub release is changed, no compiler or payload is executed.
+# Metadata/repair adapter cases use an explicit CLI boundary. Credential cases
+# run the actual public CLI with only gh/curl service boundaries substituted.
+# No GitHub release is changed, no compiler or payload is executed.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 for dependency in bash python3 jq; do
     command -v "$dependency" >/dev/null || { printf 'Missing dependency: %s\n' "$dependency" >&2; exit 3; }
 done
-python3 - "$ROOT" <<'PY'
+python3 - "$ROOT" "$@" <<'PY'
+import argparse
 import copy
 import hashlib
 import json
@@ -25,6 +27,10 @@ except ImportError:
     raise SystemExit('Verifier contract tests require Python jsonschema')
 
 root = Path(sys.argv[1])
+arguments = argparse.ArgumentParser(description='Release verification CLI regression')
+arguments.add_argument('--credential-identity-only', action='store_true')
+arguments.add_argument('--credential-baseline-project', type=Path)
+credential_options = arguments.parse_args(sys.argv[2:])
 work = Path(tempfile.mkdtemp(prefix='dsr-verify-cli-tests-'))
 print('Retained evidence: ' + str(work), flush=True)
 passed = 0
@@ -43,9 +49,178 @@ def save(path, value):
 def sha(data):
     return hashlib.sha256(data).hexdigest()
 
+def test_public_credential_identity():
+    if shutil.which('yq') is None:
+        raise SystemExit('Public credential regressions require the real yq parser')
+    credentials = {'dsr':'dsr_identity_fixture', 'ci':'ci_identity_fixture',
+                   'cli':'cli_identity_fixture', 'stored':'stored_identity_fixture'}
+    service = work/'credential-service'
+    (service/'bin').mkdir(parents=True)
+    payload = b'Owned release verification identity fixture\n'
+    checksums = (sha(payload)+'  app-linux-amd64.tar.gz\n').encode()
+    assets = []
+    for asset_id, name, data in ((1,'app-linux-amd64.tar.gz',payload),(2,'SHA256SUMS',checksums)):
+        (service/str(asset_id)).write_bytes(data)
+        assets.append(dict(id=asset_id,name=name,state='uploaded',size=len(data),digest='sha256:'+sha(data),
+            browser_download_url='https://github.com/owner/app/releases/download/v1.2.3/'+name))
+    save(service/'release.json',dict(id=321,tag_name='v1.2.3',draft=False,prerelease=False,
+        target_commitish='main',html_url='https://github.com/owner/app/releases/tag/v1.2.3',assets=assets))
+    save(service/'identities.json',credentials)
+    (service/'bin/gh').write_text('#!'+sys.executable+' -S\n'+r'''
+import hashlib, json, os, sys
+from pathlib import Path
+base=Path(os.environ['DSR_IDENTITY_CASE']); service=Path(os.environ['DSR_IDENTITY_SERVICE'])
+spec=json.loads((base/'fixture.json').read_text()); identities=json.loads((service/'identities.json').read_text())
+args=sys.argv[1:]
+selected=os.environ.get('GH_TOKEN','')
+identity=next((name for name,token in identities.items() if token==selected),'anonymous')
+with (base/'requests.jsonl').open('a') as out:
+    out.write(json.dumps(dict(transport='gh',argv=args,identity=identity,host=os.environ.get('GH_HOST')))+'\n')
+assert '--hostname' in args and args[args.index('--hostname')+1]=='github.com'
+if args[:2]==['auth','token']:
+    if spec.get('missing_token'):sys.exit(1)
+    if spec.get('cancel') and (base/'metadata-read').exists() and not (base/'cancelled').exists():
+        (base/'cancelled').write_text('Explicit credential cancellation reached\n')
+        sys.exit(spec['cancel'])
+    print(identities['stored']);sys.exit(0)
+if args[:2]==['auth','status']:sys.exit(0 if identity==spec['selected'] else 1)
+if args and args[0]=='api':
+    if identity!=spec['selected']:sys.exit(1)
+    assert args[1]=='repos/owner/app/releases/tags/v1.2.3',args
+    (base/'metadata-read').write_text('Production metadata adapter completed\n')
+    print((service/'release.json').read_text());sys.exit(0)
+raise SystemExit('Unexpected GitHub boundary request')
+''')
+    (service/'bin/curl').write_text('#!'+sys.executable+' -S\n'+r'''
+import json, os, re, sys
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs
+args=sys.argv[1:]
+if args==['--disable','--version']:print('curl 8.4.0 identity fixture');sys.exit(0)
+base=Path(os.environ['DSR_IDENTITY_CASE']); service=Path(os.environ['DSR_IDENTITY_SERVICE'])
+spec=json.loads((base/'fixture.json').read_text()); identities=json.loads((service/'identities.json').read_text())
+config=sys.stdin.read(); found=re.search(r'Authorization: Bearer ([A-Za-z0-9_.-]+)',config)
+identity=next((name for name,token in identities.items() if found and token==found[1]),'anonymous')
+with (base/'requests.jsonl').open('a') as out:
+    out.write(json.dumps(dict(transport='curl',argv=args,url=args[-1],identity=identity))+'\n')
+if identity!=spec['selected'] and not (identity=='anonymous' and spec.get('allow_anonymous')):sys.exit(22)
+assert args[0]=='--disable' and '--fail' in args and '--location' in args
+assert args[args.index('--proto')+1]=='=https' and args[args.index('--proto-redir')+1]=='=https'
+assert '--location-trusted' not in args and '--insecure' not in args
+assert not any(token in arg for token in identities.values() for arg in args)
+url=urlparse(args[-1]); assert url.scheme=='https' and url.netloc=='api.github.com'
+release=json.loads((service/'release.json').read_text())
+if url.path=='/repos/owner/app/releases/tags/v1.2.3':data=json.dumps(release).encode()
+elif url.path=='/repos/owner/app/releases/321/assets':
+    assert parse_qs(url.query)=={'per_page':['100'],'page':['1']}
+    data=json.dumps(release['assets']).encode()
+elif url.path in ('/repos/owner/app/releases/assets/1','/repos/owner/app/releases/assets/2'):
+    assert 'Accept: application/octet-stream' in config
+    data=(service/url.path.rsplit('/',1)[1]).read_bytes()
+else:raise SystemExit('Unexpected checksum boundary request')
+Path(args[args.index('--output')+1]).write_bytes(data)
+''')
+    for program in (service/'bin').iterdir():program.chmod(0o755)
+
+    def execute(selected_root,label,values,selected,*,cancel=0,baseline=False,standalone=False,policy_failure=False):
+        case=service/(('baseline-' if baseline else 'candidate-')+label)
+        (case/'config/repos.d').mkdir(parents=True);(case/'tmp').mkdir()
+        save(case/'fixture.json',dict(selected=selected,cancel=cancel,
+            allow_anonymous=bool(cancel or standalone),missing_token=standalone))
+        (case/'config/config.yaml').write_text('schema_version: "1.0.0"\nlog_level: error\nsigning:\n  enabled: false\n')
+        (case/'config/repos.d/app.yaml').write_text('tool_name: app\nrepo: owner/app\nlanguage: go\n'+
+            'local_path: '+str(case/'source')+'\nbinary_name: app\nbuild_cmd: go build -o app .\ntargets:\n  - linux/amd64\n')
+        env=dict(os.environ,PATH=str(service/'bin')+os.pathsep+os.environ['PATH'],
+            DSR_CONFIG_DIR=str(case/'config'),DSR_STATE_DIR=str(case/'state'),DSR_CACHE_DIR=str(case/'cache'),
+            XDG_CONFIG_HOME=str(case/'xdg-config'),XDG_STATE_HOME=str(case/'xdg-state'),XDG_CACHE_HOME=str(case/'xdg-cache'),
+            TMPDIR=str(case/'tmp'),DSR_GH_TOKEN='',GITHUB_TOKEN='',GH_TOKEN='',GH_HOST='enterprise.invalid',
+            DSR_IDENTITY_CASE=str(case),DSR_IDENTITY_SERVICE=str(service),GH_API_TIMEOUT='5',GH_MAX_RETRIES='1',NO_COLOR='1')
+        env.update({name:credentials[identity] for name,identity in values.items()})
+        if standalone:
+            command=['bash',str(selected_root/'src/release_checksums.sh'),'--repo','owner/app','--tag','v1.2.3',
+                '--output-dir',str(case/'audit'),'--timeout','5']
+        else:
+            command=['bash',str(selected_root/'dsr'),'--json','release','verify','app','1.2.3',
+                '--verify-checksums','--checksum-timeout','5']
+        process=subprocess.run(command,env=env,capture_output=True,timeout=60)
+        (case/'stdout').write_bytes(process.stdout);(case/'stderr').write_bytes(process.stderr)
+        result=json.loads(process.stdout)
+        trace=case/'requests.jsonl'
+        rows=[json.loads(line) for line in trace.read_text().splitlines()] if trace.exists() else []
+        http=[row for row in rows if row['transport']=='curl']
+        if baseline:
+            if cancel:
+                check('unchanged baseline ignores stored-credential cancellation and audits anonymously',
+                    process.returncode==0 and result['exit_code']==0 and (case/'cancelled').is_file() and
+                    any(row['identity']=='anonymous' for row in http))
+            else:
+                check('unchanged baseline switches accounts after valid metadata and fails the private audit',
+                    process.returncode==8 and result['exit_code']==8 and
+                    any(row['transport']=='gh' and row['argv'][0]=='api' and row['identity']=='ci' for row in rows) and
+                    http and http[0]['identity']=='cli')
+            return
+        if policy_failure:
+            check(label+': credential policy failure is a dependency error, never absence',
+                process.returncode==3 and result['exit_code']==3 and result['status']=='error')
+            check(label+': failed credential policy never authorizes an anonymous request',
+                not http and result['eligible_count']==result['verified_count']==0 and not (case/'audit').exists())
+        elif cancel:
+            check(label+': explicit cancellation returns one interrupted public envelope',
+                process.returncode==5 and result['exit_code']==5 and result['status']=='error')
+            check(label+': completed metadata never authorizes anonymous audit after cancellation',
+                (case/'metadata-read').is_file() and (case/'cancelled').is_file() and not http and
+                result['details']['checksums']['verified_count']==0 and
+                not list(case.glob('tmp/dsr-release-verify-*/audit/checksums.normalized')))
+        else:
+            evidence=result if standalone else result['details']['checksums']
+            check(label+': actual command verifies the complete selected release',
+                process.returncode==0 and result['exit_code']==0 and evidence['eligible_count']==evidence['verified_count']==1 and
+                evidence['inventory_stable'] is True)
+            check(label+': every audit request keeps the selected identity and repository',
+                http and all(row['identity']==selected and '/repos/owner/app/releases/' in row['url'] for row in http))
+            if not standalone:
+                check(label+': real metadata adapter and audit use the same identity',
+                    any(row['transport']=='gh' and row['argv'][0]=='api' for row in rows) and
+                    all(row['identity']==selected for row in rows if row['transport']=='gh' and row['argv'][0]=='api'))
+            check(label+': checksums do not claim signer or source authentication',
+                evidence['authenticated'] is False and evidence['source_verified'] is False)
+        exposed=process.stdout+process.stderr+(trace.read_bytes() if trace.exists() else b'')
+        check(label+': credentials stay out of output and process arguments',
+            all(token.encode() not in exposed for token in credentials.values()))
+
+    if credential_options.credential_baseline_project:
+        baseline=credential_options.credential_baseline_project.resolve()
+        execute(baseline,'conflicting-cli',{'GITHUB_TOKEN':'ci','GH_TOKEN':'cli'},'ci',baseline=True)
+        execute(baseline,'stored-cancel',{},'stored',cancel=2,baseline=True)
+    for label,values,selected in (
+        ('ci-only',{'GITHUB_TOKEN':'ci'},'ci'),
+        ('conflicting-cli',{'GITHUB_TOKEN':'ci','GH_TOKEN':'cli'},'ci'),
+        ('dsr-override',{'DSR_GH_TOKEN':'dsr','GITHUB_TOKEN':'ci','GH_TOKEN':'cli'},'dsr'),
+        ('cli-only',{'GH_TOKEN':'cli'},'cli'),
+        ('stored-credential',{},'stored')):
+        execute(root,label,values,selected)
+    for status in (2,130):execute(root,'stored-cancel-'+str(status),{},'stored',cancel=status)
+    execute(root,'public-anonymous',{},'anonymous',standalone=True)
+    # These are explicit dependency-failure injections. The audit, response
+    # validation and no-network boundary remain the production implementation.
+    for label,policy in (('policy-load-failure','return 1\n'),
+                         ('policy-empty-success','secrets_get_gh_token() { return 0; }\n'),
+                         ('policy-missing',None)):
+        selected_root=service/(label+'-runtime');(selected_root/'src').mkdir(parents=True)
+        for name in ('release_checksums.sh','checksum_sync.sh'):
+            shutil.copy2(root/'src'/name,selected_root/'src'/name)
+        if policy is not None:(selected_root/'src/secrets.sh').write_text(policy)
+        execute(selected_root,label,{},'anonymous',standalone=True,policy_failure=True)
+
+if credential_options.credential_identity_only:
+    test_public_credential_identity()
+    save(work/'summary.json',dict(passed=passed,failed=0,metadata_boundary='actual public CLI',http_boundary='explicit gh/curl fixtures'))
+    print('Results: %d passed, 0 failed\nEvidence: %s'%(passed,work),flush=True)
+    raise SystemExit(0)
+
 runtime = work/'runtime'
 (runtime/'src').mkdir(parents=True)
-for name in ('release_formulas.sh','release_verify.sh','release_checksums.sh','checksum_sync.sh'):
+for name in ('release_formulas.sh','release_verify.sh','release_checksums.sh','checksum_sync.sh','secrets.sh'):
     shutil.copy2(root/'src'/name, runtime/'src'/name)
 # This is explicitly the METADATA CLI boundary, not an imitation of strict
 # checks. Its outputs let the production adapter prove those checks cannot be
@@ -492,6 +667,7 @@ p=subprocess.run(['bash',str(runtime/'src/release_checksums.sh'),'--repo','owner
                   '--output-dir',str(base/'audit')],env=env,capture_output=True,timeout=60)
 check('explicit DSR token takes precedence through actual acquisition boundary',p.returncode==0 and len(calls(base,'http.jsonl'))==10)
 
-save(work/'summary.json',dict(passed=passed,failed=0,metadata_boundary='explicit CLI fixture',http_boundary='explicit curl fixture'))
+test_public_credential_identity()
+save(work/'summary.json',dict(passed=passed,failed=0,metadata_boundary='explicit CLI fixture plus actual public credential cases',http_boundary='explicit curl/gh fixture'))
 print('Results: %d passed, 0 failed\nEvidence: %s'%(passed,work),flush=True)
 PY

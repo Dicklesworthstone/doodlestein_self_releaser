@@ -167,7 +167,7 @@ spec['fail_id'] = None
 save(base / 'spec.json', spec)
 runtime = base / 'runtime'
 (runtime / 'src').mkdir(parents=True)
-for name in ('release_formulas.sh', 'release_verify.sh', 'release_checksums.sh', 'checksum_sync.sh'):
+for name in ('release_formulas.sh', 'release_verify.sh', 'release_checksums.sh', 'checksum_sync.sh', 'secrets.sh'):
     shutil.copy2(root / 'src' / name, runtime / 'src' / name)
 (runtime / 'dsr').write_text(r"""#!/usr/bin/env bash
 # Explicit metadata CLI boundary fixture; no publisher or compiler runs.

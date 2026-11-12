@@ -78,9 +78,12 @@ payloads were successfully checked before the failure.
 
 ## Authentication, limits and trust
 
-Set `DSR_GH_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN` (in that precedence order), or
-authenticate the GitHub CLI. Token lookup is
-explicitly for `github.com`, regardless of `GH_HOST`. Without a token the auditor
+Set `DSR_GH_TOKEN`, `GITHUB_TOKEN` or `GH_TOKEN` (in that precedence order), or
+authenticate the GitHub CLI. The auditor uses the same credential selection as
+release metadata discovery, so a lower-priority token cannot switch the account
+between discovery and verification. Token lookup is explicitly for `github.com`,
+regardless of `GH_HOST`. Explicit credential-helper cancellation stops the audit
+before any anonymous request. Without a token the auditor
 can still read public releases. API credentials are not signing credentials:
 `authenticated: false` means no trusted publisher signature was checked.
 
