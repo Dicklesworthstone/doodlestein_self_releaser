@@ -851,7 +851,8 @@ CHECKS:
 
 EXIT CODES:
     0  - All checks passed (or only warnings)
-    3  - Critical errors found (missing core deps)
+    3  - Critical errors found (missing core deps or failed authentication)
+    5  - GitHub diagnostic interrupted
 
 EXAMPLES:
     dsr doctor              Full diagnostics
@@ -907,20 +908,61 @@ EOF
         errors=$((errors + 1))
     fi
 
-    # Check gh
+    # Watch invokes this preflight before its monitoring loop. Use the same
+    # complete credential deadline as check, including stored-token lookup.
     if command -v gh &>/dev/null; then
-        _dsr_require secrets
-        local gh_ver
+        _dsr_require github
+        local gh_ver gh_user="unknown" gh_timeout="" gh_status=0
+        local gh_authenticated=false gh_message="not authenticated"
         gh_ver=$(gh --version 2>/dev/null | head -1 | awk '{print $3}')
-        if secrets_run_gh auth status --hostname github.com &>/dev/null; then
-            local gh_user
-            gh_user=$(secrets_run_gh api user --hostname github.com --jq '.login' 2>/dev/null || echo "unknown")
-            _add_check "gh" "ok" ", \"version\": \"$gh_ver\", \"authenticated\": true, \"user\": \"$gh_user\""
+        if gh_timeout=$(_gh_api_timeout); then
+            gh_check &>/dev/null || gh_status=$?
+            if [[ $gh_status -eq 0 ]]; then
+                gh_authenticated=true
+                local user_status=0
+                gh_user=$(run_with_timeout "$gh_timeout" secrets_run_gh \
+                    api user --hostname github.com --jq '.login' 2>/dev/null) || user_status=$?
+                if [[ $user_status -ne 0 ]]; then
+                    # Display metadata is optional after successful auth.
+                    # Discard partial output from failed or timed-out lookups,
+                    # but never turn explicit cancellation into success.
+                    gh_user="unknown"
+                    case "$user_status" in
+                        2|129|130|131|143) gh_status=$user_status ;;
+                    esac
+                fi
+                [[ -n "$gh_user" ]] || gh_user="unknown"
+            fi
+        else
+            gh_status=4
+            gh_message="invalid GH_API_TIMEOUT (requires a positive integer, at most 999999)"
+        fi
+        if [[ $gh_status -eq 0 ]]; then
+            _add_check "gh" "ok" ", \"version\": \"$(_json_escape "$gh_ver")\", \"authenticated\": true, \"user\": \"$(_json_escape "$gh_user")\""
             log_ok "  gh: $gh_ver (authenticated as $gh_user)"
         else
-            _add_check "gh" "error" ", \"version\": \"$gh_ver\", \"authenticated\": false"
-            log_error "  gh: not authenticated"
-            fixes+=("Authenticate GitHub CLI: gh auth login")
+            case "$gh_status" in
+                2|129|130|131|143) gh_message="GitHub diagnostic was interrupted" ;;
+                124|125|137) gh_message="authentication did not complete within its deadline" ;;
+            esac
+            _add_check "gh" "error" ", \"version\": \"$(_json_escape "$gh_ver")\", \"authenticated\": $gh_authenticated, \"message\": \"$(_json_escape "$gh_message")\""
+            log_error "  gh: $gh_message"
+            case "$gh_status" in
+                2|129|130|131|143)
+                    errors=$((errors + 1))
+                    _doctor_summary "$errors" "$warnings" "$fix_mode" 5
+                    return 5
+                    ;;
+                124|125|137)
+                    fixes+=("Check GitHub connectivity and the credential helper, then retry")
+                    ;;
+                4)
+                    fixes+=("Check GH_API_TIMEOUT and GitHub authentication configuration")
+                    ;;
+                *)
+                    fixes+=("Authenticate GitHub CLI: gh auth login")
+                    ;;
+            esac
             errors=$((errors + 1))
         fi
     else
@@ -1318,12 +1360,12 @@ _doctor_summary() {
     local warnings="$2"
     local fix_mode="$3"
 
-    local exit_code=0
+    local exit_code="${4:-0}"
     local overall_status="healthy"
 
     if [[ $errors -gt 0 ]]; then
         log_error "Found $errors error(s), $warnings warning(s)"
-        exit_code=3
+        [[ $exit_code -ne 0 ]] || exit_code=3
         overall_status="unhealthy"
     elif [[ $warnings -gt 0 ]]; then
         log_warn "Found $warnings warning(s)"
@@ -2662,7 +2704,15 @@ EOF
     log_info "Running preflight check..."
     local -a preflight_args=(doctor --quick)
     if $dry_run; then preflight_args=(--dry-run "${preflight_args[@]}"); fi
-    if ! "$0" "${preflight_args[@]}" &>/dev/null; then
+    local preflight_status=0
+    "$0" "${preflight_args[@]}" &>/dev/null || preflight_status=$?
+    if [[ $preflight_status -ne 0 ]]; then
+        case "$preflight_status" in
+            5|129|130|131|143)
+                log_error "Preflight check interrupted"
+                return 5
+                ;;
+        esac
         log_error "Preflight check failed. Run 'dsr doctor' for details."
         return 3
     fi
