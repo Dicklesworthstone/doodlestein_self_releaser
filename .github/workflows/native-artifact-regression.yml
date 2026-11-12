@@ -22,6 +22,7 @@ on:
       - scripts/tests/test_artifact_formats.sh
       - scripts/tests/test_ordinary_collection_inventory.sh
       - scripts/tests/test_generated_installer_transactions.sh
+      - scripts/tests/test_generated_installer_integrity.sh
       - scripts/tests/test_generated_workspace_installer.sh
       - scripts/tests/test_install_source.sh
       - scripts/tests/test_install_source_windows.sh
@@ -313,6 +314,15 @@ jobs:
           bash scripts/tests/test_host_health.sh --disk-capacity-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/concurrent-storage.log"
           bash scripts/tests/test_host_config_admission.sh --capacity-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/public-capacity-admission.log"
           bash scripts/tests/test_act_runner_native.sh --host-writable-path-tests 2>&1 | tee "$RUNNER_TEMP/collector-evidence/writable-path-boundaries.log"
+          test -z "$(git status --porcelain)"
+      - name: Validate generated installer executable targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n src/install_gen.sh
+          bash -n scripts/tests/test_generated_installer_integrity.sh
+          deadline=$(command -v timeout || command -v gtimeout)
+          "$deadline" 120 bash scripts/tests/test_generated_installer_integrity.sh --executable-targets-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/installer-executable-targets.log"
           test -z "$(git status --porcelain)"
       - name: Validate concurrent generated installers
         shell: bash

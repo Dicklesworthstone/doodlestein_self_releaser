@@ -803,9 +803,20 @@ if source_script is not None:
 
 # These are Windows selection-policy tests on the current filesystem, not
 # native Windows execution or NTFS acceptance. Load unchanged generated
-# functions, select their real Windows policy, and inspect real ZIP members.
-if shutil.which("unzip"):
-    print("POLICY BOUNDARY: Windows archive naming/extraction on this host; no native Windows claim", flush=True)
+# functions, select their real Windows policy, and inspect genuine PE members.
+windows_go_probe = command("windows-go-probe", ["go", "version"]) if shutil.which("go") else None
+if (shutil.which("unzip") and windows_go_probe is not None and windows_go_probe.returncode == 0
+        and windows_go_probe.stdout.startswith(b"go version ")):
+    print("POLICY BOUNDARY: Windows archive naming/extraction and real PE bytes on this host; no native Windows claim", flush=True)
+    windows_payloads = work / "payloads/windows-amd64"
+    windows_payloads.mkdir()
+    windows_build_env = env | dict(GOENV="off", GOFLAGS="", GOWORK="off", GOTOOLCHAIN="local",
+                                   GOOS="windows", GOARCH="amd64", CGO_ENABLED="0", GOTELEMETRY="off")
+    for name in names:
+        source = windows_payloads / (name + ".go")
+        source.write_text(f'package main\nfunc main() {{ println("{name} Windows fixture") }}\n')
+        required("compile-windows-" + name, ["go", "build", "-trimpath", "-o", windows_payloads / name, source],
+                 selected_env=windows_build_env)
     windows_names = [name + ".EXE" for name in names]
     config(family=windows_names)
     config_path = work / "config/repos.d/nativefamily.yaml"
@@ -831,9 +842,9 @@ jq -nc --argjson names "$selected_names" --argjson paths "$selected_paths" '{nam
         path = work / "archives" / (label + ".zip")
         with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive_file:
             for name in names:
-                archive_file.write(work / "payloads/1.2.3" / name, "release/" + name.upper() + ".EXE")
+                archive_file.write(windows_payloads / name, "release/" + name.upper() + ".EXE")
             for member, name in extra:
-                archive_file.write(work / "payloads/1.2.3" / name, member)
+                archive_file.write(windows_payloads / name, member)
         return path
 
     windows_zip = windows_archive("windows-uppercase")
@@ -853,7 +864,7 @@ jq -nc --argjson names "$selected_names" --argjson paths "$selected_paths" '{nam
         check("Windows case-insensitive selection preserves actual bytes of " + name,
               selected_path is not None and selected_path.is_file()
               and selected_path.name == name.upper() + ".EXE"
-              and digest(selected_path) == digest(work / "payloads/1.2.3" / name))
+              and digest(selected_path) == digest(windows_payloads / name))
 
     case_collision = windows_archive("windows-casefold-collision", [("RELEASE/nativefamily.exe", names[0])])
     collision_extract = work / "windows-collision-extract"
@@ -872,7 +883,7 @@ jq -nc --argjson names "$selected_names" --argjson paths "$selected_paths" '{nam
     check("Windows ambiguity refusal comes from actual member selection",
           ambiguous_extract.is_dir() and b"exactly one matching binary" in result.stderr)
 else:
-    print("SKIP: Windows archive-policy fixtures require unzip; no Windows policy claim", flush=True)
+    print("SKIP: Windows archive-policy fixtures require unzip and genuine Go; no Windows policy claim", flush=True)
 
 print(f"Results: {passed} passed, {failed} failed; evidence {work}", flush=True)
 sys.exit(1 if failed else 0)

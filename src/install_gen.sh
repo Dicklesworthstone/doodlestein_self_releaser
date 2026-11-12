@@ -1271,6 +1271,215 @@ _extract_archive() {
     fi
 }
 
+# Inspect bounded native headers without executing a downloaded program or
+# requiring Python/file on the installer host. Bash 3.2 and BSD/GNU od work.
+# These checks bind executable format and CPU, not every runtime dependency,
+# minimum OS release, CPU extension, or libc symbol version.
+_installer_header_bytes() {
+    local path="$1" offset="$2" count="$3" data
+    local -a bytes=()
+    data=$(LC_ALL=C od -An -v -tu1 -j "$offset" -N "$count" "$path" 2>/dev/null) || return 1
+    data="${data//$'\n'/ }"
+    read -r -a bytes <<< "$data"
+    (( ${#bytes[@]} == count )) || return 1
+    printf '%s\n' "${bytes[*]}"
+}
+
+# Decode at most eight header bytes, refusing offsets outside a 32-bit file
+# extent before multiplication can overflow shell arithmetic. Payloads larger
+# than 4 GiB require a different admission policy, not a truncated offset.
+_installer_header_uint() {
+    local endian="$1" value=0 index byte
+    shift
+    local -a digits=("$@")
+    (( ${#digits[@]} > 0 && ${#digits[@]} <= 8 )) || return 1
+    for ((index=0; index<${#digits[@]}; index++)); do
+        if [[ "$endian" == le ]]; then byte="${digits[${#digits[@]}-index-1]}"
+        else byte="${digits[index]}"; fi
+        [[ "$byte" =~ ^[0-9]+$ ]] && (( byte <= 255 && value <= 16777215 )) || return 1
+        value=$((value * 256 + byte))
+    done
+    printf '%s\n' "$value"
+}
+
+_installer_macho_slice() {
+    local path="$1" offset="$2" length="$3" expected_cpu="$4" expected_subtype="${5:-}"
+    local data endian header_size cpu subtype kind commands command_bytes magic
+    local -a header=()
+    (( length >= 32 )) || return 1
+    data=$(_installer_header_bytes "$path" "$offset" 32) || return 1
+    read -r -a header <<< "$data"
+    magic="${header[0]} ${header[1]} ${header[2]} ${header[3]}"
+    case "$magic" in
+        '207 250 237 254') endian=le; header_size=32 ;;
+        '254 237 250 207') endian=be; header_size=32 ;;
+        '206 250 237 254') endian=le; header_size=28 ;;
+        '254 237 250 206') endian=be; header_size=28 ;;
+        *) return 1 ;;
+    esac
+    cpu=$(_installer_header_uint "$endian" "${header[@]:4:4}") || return 1
+    subtype=$(_installer_header_uint "$endian" "${header[@]:8:4}") || return 1
+    kind=$(_installer_header_uint "$endian" "${header[@]:12:4}") || return 1
+    commands=$(_installer_header_uint "$endian" "${header[@]:16:4}") || return 1
+    command_bytes=$(_installer_header_uint "$endian" "${header[@]:20:4}") || return 1
+    [[ "$cpu" == "$expected_cpu" && ( -z "$expected_subtype" || "$subtype" == "$expected_subtype" ) ]] || return 1
+    # Current Intel/ARM macOS slices are little-endian, even inside a fat
+    # container whose table is big-endian. Legacy extra slices may differ.
+    case "$cpu" in 16777223|16777228) [[ "$endian" == le ]] || return 1 ;; esac
+    (( kind == 2 && commands > 0 && commands <= command_bytes / 8 &&
+       command_bytes <= length - header_size )) || return 1
+    if (( cpu & 16777216 )); then (( header_size == 32 )) || return 1
+    else (( header_size == 28 )) || return 1; fi
+}
+
+_installer_native_payload() {
+    local path="$1" size="$3" data magic os="${2%/*}" arch="${2#*/}"
+    local class machine expected_class expected_machine kind version offset width entry
+    local header_size ph_size ph_count expected_ph_size cpu subtype count table_size stride
+    local length align index prior found=false endian=be optional_size optional_magic sections flags subsystem
+    local -a header=() row=() starts=() ends=()
+    data=$(_installer_header_bytes "$path" 0 4) || return 1
+    read -r -a header <<< "$data"
+    magic="${header[*]}"
+    case "$magic" in
+        '127 69 76 70')
+            [[ "$os" == linux || "$os" == freebsd ]] || return 1
+            (( size >= 52 )) || return 1
+            data=$(_installer_header_bytes "$path" 0 52) || return 1
+            read -r -a header <<< "$data"
+            class="${header[4]}"
+            [[ "${header[5]}" == 1 && "${header[6]}" == 1 ]] || return 1
+            case "$os:${header[7]}" in linux:0|linux:3|freebsd:0|freebsd:9) ;; *) return 1 ;; esac
+            case "$arch" in
+                amd64) expected_class=2; expected_machine=62 ;;
+                arm64) expected_class=2; expected_machine=183 ;;
+                386) expected_class=1; expected_machine=3 ;;
+                armv7) expected_class=1; expected_machine=40 ;;
+                *) return 1 ;;
+            esac
+            machine=$(_installer_header_uint le "${header[@]:18:2}") || return 1
+            kind=$(_installer_header_uint le "${header[@]:16:2}") || return 1
+            version=$(_installer_header_uint le "${header[@]:20:4}") || return 1
+            (( class == expected_class && machine == expected_machine &&
+               (kind == 2 || kind == 3) && version == 1 )) || return 1
+            if (( class == 2 )); then
+                data=$(_installer_header_bytes "$path" 0 64) || return 1
+                read -r -a header <<< "$data"
+                header_size=64; width=8; expected_ph_size=56
+                offset=$(_installer_header_uint le "${header[@]:32:8}") || return 1
+                ph_size=$(_installer_header_uint le "${header[@]:54:2}") || return 1
+                ph_count=$(_installer_header_uint le "${header[@]:56:2}") || return 1
+                length=$(_installer_header_uint le "${header[@]:52:2}") || return 1
+            else
+                header_size=52; width=4; expected_ph_size=32
+                offset=$(_installer_header_uint le "${header[@]:28:4}") || return 1
+                ph_size=$(_installer_header_uint le "${header[@]:42:2}") || return 1
+                ph_count=$(_installer_header_uint le "${header[@]:44:2}") || return 1
+                length=$(_installer_header_uint le "${header[@]:40:2}") || return 1
+            fi
+            entry="${header[*]:24:width}"
+            [[ "$entry" == *[1-9]* ]] || return 1
+            (( length == header_size && offset >= header_size && ph_size == expected_ph_size &&
+               ph_count > 0 && ph_count < 65535 && offset + ph_size * ph_count <= size ))
+            ;;
+        '207 250 237 254'|'254 237 250 207'|'206 250 237 254'|'254 237 250 206')
+            [[ "$os" == darwin ]] || return 1
+            case "$arch" in amd64) cpu=16777223 ;; arm64) cpu=16777228 ;; *) return 1 ;; esac
+            _installer_macho_slice "$path" 0 "$size" "$cpu"
+            ;;
+        '202 254 186 190'|'190 186 254 202'|'202 254 186 191'|'191 186 254 202')
+            [[ "$os" == darwin ]] || return 1
+            case "$arch" in amd64) expected_machine=16777223 ;; arm64) expected_machine=16777228 ;; *) return 1 ;; esac
+            case "$magic" in
+                '202 254 186 190') stride=20; endian=be ;;
+                '190 186 254 202') stride=20; endian=le ;;
+                '202 254 186 191') stride=32; endian=be ;;
+                *) stride=32; endian=le ;;
+            esac
+            data=$(_installer_header_bytes "$path" 4 4) || return 1
+            read -r -a header <<< "$data"
+            count=$(_installer_header_uint "$endian" "${header[@]}") || return 1
+            table_size=$((8 + count * stride))
+            (( count > 0 && count <= 64 && table_size <= size )) || return 1
+            for ((index=0; index<count; index++)); do
+                data=$(_installer_header_bytes "$path" "$((8 + index * stride))" "$stride") || return 1
+                read -r -a row <<< "$data"
+                cpu=$(_installer_header_uint "$endian" "${row[@]:0:4}") || return 1
+                subtype=$(_installer_header_uint "$endian" "${row[@]:4:4}") || return 1
+                if (( stride == 32 )); then
+                    offset=$(_installer_header_uint "$endian" "${row[@]:8:8}") || return 1
+                    length=$(_installer_header_uint "$endian" "${row[@]:16:8}") || return 1
+                    align=$(_installer_header_uint "$endian" "${row[@]:24:4}") || return 1
+                    [[ "${row[*]:28:4}" == '0 0 0 0' ]] || return 1
+                else
+                    offset=$(_installer_header_uint "$endian" "${row[@]:8:4}") || return 1
+                    length=$(_installer_header_uint "$endian" "${row[@]:12:4}") || return 1
+                    align=$(_installer_header_uint "$endian" "${row[@]:16:4}") || return 1
+                fi
+                (( offset >= table_size && length >= 32 && offset + length <= size &&
+                   align <= 31 && offset % (1 << align) == 0 )) || return 1
+                for ((prior=0; prior<index; prior++)); do
+                    (( offset >= ends[prior] || offset + length <= starts[prior] )) || return 1
+                done
+                starts+=("$offset"); ends+=("$((offset + length))")
+                _installer_macho_slice "$path" "$offset" "$length" "$cpu" "$subtype" || return 1
+                [[ "$cpu" != "$expected_machine" ]] || found=true
+            done
+            $found
+            ;;
+        *)
+            [[ "${header[0]} ${header[1]}" == '77 90' && "$os" == windows && $size -ge 64 ]] || return 1
+            data=$(_installer_header_bytes "$path" 60 4) || return 1
+            read -r -a header <<< "$data"
+            offset=$(_installer_header_uint le "${header[@]}") || return 1
+            (( offset >= 64 && offset + 24 <= size )) || return 1
+            data=$(_installer_header_bytes "$path" "$offset" 24) || return 1
+            read -r -a header <<< "$data"
+            [[ "${header[*]:0:4}" == '80 69 0 0' ]] || return 1
+            machine=$(_installer_header_uint le "${header[@]:4:2}") || return 1
+            sections=$(_installer_header_uint le "${header[@]:6:2}") || return 1
+            optional_size=$(_installer_header_uint le "${header[@]:20:2}") || return 1
+            flags=$(_installer_header_uint le "${header[@]:22:2}") || return 1
+            case "$arch" in
+                amd64) expected_machine=34404; optional_magic=523; width=112 ;;
+                arm64) expected_machine=43620; optional_magic=523; width=112 ;;
+                386) expected_machine=332; optional_magic=267; width=96 ;;
+                *) return 1 ;;
+            esac
+            (( machine == expected_machine && sections > 0 && sections <= 96 &&
+               (flags & 2) != 0 && (flags & 8192) == 0 && optional_size >= width &&
+               offset + 24 + optional_size + sections * 40 <= size )) || return 1
+            data=$(_installer_header_bytes "$path" "$((offset + 24))" "$width") || return 1
+            read -r -a header <<< "$data"
+            kind=$(_installer_header_uint le "${header[@]:0:2}") || return 1
+            entry=$(_installer_header_uint le "${header[@]:16:4}") || return 1
+            subsystem=$(_installer_header_uint le "${header[@]:68:2}") || return 1
+            (( kind == optional_magic && entry > 0 && (subsystem == 2 || subsystem == 3) ))
+            ;;
+    esac
+}
+
+_installer_validate_executable() {
+    local path="$1" platform="$2" size data line
+    [[ -f "$path" && ! -L "$path" && -s "$path" ]] || return 7
+    command -v od >/dev/null 2>&1 || { _log_error 'od is required to inspect executable headers'; return 3; }
+    size=$(wc -c < "$path" | tr -d '[:space:]') || return 1
+    [[ "$size" =~ ^[1-9][0-9]*$ && ${#size} -le 10 ]] && (( size <= 4294967295 )) || return 7
+    data=$(_installer_header_bytes "$path" 0 2) || return 7
+    if [[ "$data" == '35 33' ]]; then
+        # Script launchers are intentional release payloads even for compiled
+        # projects. Recognize their interpreter declaration, never run it.
+        line=$(LC_ALL=C head -c 4096 "$path") || return 1
+        line="${line%%$'\n'*}"
+        line="${line%$'\r'}"
+        [[ "$line" =~ ^#![[:blank:]]*/[^[:space:][:cntrl:]]+ ]] && return 0
+    elif _installer_native_payload "$path" "$platform" "$size"; then
+        return 0
+    fi
+    _log_error "Executable format or architecture does not match $platform: ${path##*/}"
+    return 7
+}
+
 # GNU and BSD stat use different format switches. This identity check is also
 # used for the private owner file, so cleanup cannot remove a replacement lock.
 _install_lock_identity() {
@@ -1436,6 +1645,7 @@ _install_family_transaction() {
         cp -- "${sources[$index]}" "$stage/new/$name" || exit 1
         chmod 755 "$stage/new/$name" || exit 1
         [[ "$(_file_sha256 "$stage/new/$name")" == "${hashes[$index]}" ]] || exit 1
+        _installer_validate_executable "$stage/new/$name" "$_INSTALL_PLATFORM" || exit $?
         path="$dest_dir/$name"
         if [[ -f "$path" && ! -L "$path" ]]; then
             cp -p -- "$path" "$stage/old/$name" || exit 1
@@ -1528,6 +1738,7 @@ _select_archive_binaries() {
             return 1
         fi
         [[ -f "$candidates" && ! -L "$candidates" && -s "$candidates" ]] || return 1
+        _installer_validate_executable "$candidates" "$_INSTALL_PLATFORM" || return $?
         for path in ${_INSTALL_PATHS[@]+"${_INSTALL_PATHS[@]}"}; do
             [[ "$path" != "$candidates" ]] || { _log_error "Two executable names select the same archive member"; return 1; }
         done

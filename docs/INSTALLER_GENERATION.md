@@ -16,6 +16,51 @@ sourcing the module to select an output root; the default is `./installers`.
 Success prints only the generated installer path to stdout. Diagnostics and
 retained-history paths go to stderr.
 
+## Executable target checks in Bash installers
+
+After checksum and configured signature verification, the generated Bash
+installer inspects every selected executable before considering a stale-release
+source build or replacing any installed member. The same check runs again on
+each private staged copy used by both release and source installation.
+
+The check reads binary headers with `od`; it does not execute a payload to
+decide whether to admit it. ELF class and machine must match the selected
+Linux or FreeBSD CPU. Mach-O executables must contain the selected macOS CPU,
+including a matching slice in a universal FAT32/FAT64 container. PE machine,
+optional-header class, executable flags and application subsystem must match
+the selected Windows CPU. Invalid or truncated headers, out-of-file header
+tables, overlapping universal slices, DLLs, object files, unknown formats and
+foreign CPU/format payloads are refused with exit 7 before the first executable
+replacement. A rejected companion preserves the entire previous family.
+Missing `od` reports dependency exit 3.
+
+An explicit `#!` launcher with a nonblank absolute interpreter path remains
+supported independently of the configured source language. DSR can distribute
+script launchers as well as compiled programs; this exception does not prove
+that the interpreter exists, or make a script a native Windows PE executable.
+
+These are bounded header and CPU checks, **not a complete executable loader**.
+They do not validate every segment body or instruction, dynamic-library
+availability, libc symbol versions, CPU extensions or minimum operating-system
+versions. ELF's unspecified System V OSABI can describe both Linux and FreeBSD
+programs; an explicit incompatible OSABI is refused, but an unspecified value
+does not establish runtime ABI compatibility. Individual files are bounded to
+4 GiB minus one byte, and universal containers to 64 nonoverlapping slices.
+Checksums and configured signatures still authenticate the published bytes.
+A format refusal cannot become an automatic source fallback.
+
+Regenerate existing installers to include these checks. The focused regression
+builds genuine Go ELF, Mach-O and PE files for all supported platforms, signs
+their archives with Minisign, and exercises the generated installer:
+
+```bash
+bash scripts/tests/test_generated_installer_integrity.sh --executable-targets-only
+```
+
+Host discovery is explicitly adapted to inspect foreign formats. These tests
+cover selected-file admission and complete-family preservation; they do not
+claim native execution on every target operating system.
+
 ## Private Bash releases without the GitHub CLI
 
 A generated Bash installer can download a private release when the client has

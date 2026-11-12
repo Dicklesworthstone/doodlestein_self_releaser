@@ -3,10 +3,313 @@
 # Real tar archives and SHA256; only remote transports/minisign failure are fixtures.
 set -uo pipefail
 case "$#:${1:-}" in
-    0:|1:--static-go-only|1:--static-go-routing-only|1:--strict-contracts-only|1:--credential-routing-only|1:--cache-identity-only) ;;
-    *) printf 'Usage: %s [--static-go-only|--static-go-routing-only|--strict-contracts-only|--credential-routing-only|--cache-identity-only]\n' "$0" >&2; exit 4 ;;
+    0:|1:--static-go-only|1:--static-go-routing-only|1:--strict-contracts-only|1:--credential-routing-only|1:--cache-identity-only|1:--executable-targets-only) ;;
+    *) printf 'Usage: %s [--static-go-only|--static-go-routing-only|--strict-contracts-only|--credential-routing-only|--cache-identity-only|--executable-targets-only]\n' "$0" >&2; exit 4 ;;
 esac
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# Real cross-compiled payloads through the public generated installer. Host
+# discovery is explicitly adapted; foreign binaries are inspected, not claimed
+# to run on this host. Every archive has a real checksum and Minisign signature.
+test_executable_targets() (
+    local dependency
+    for dependency in python3 bash jq yq go minisign od tar; do
+        command -v "$dependency" >/dev/null 2>&1 || {
+            printf 'SKIP: executable target regression requires %s\n' "$dependency"
+            return 77
+        }
+    done
+    go version >/dev/null 2>&1 || { printf 'SKIP: a genuine Go compiler is required\n'; return 77; }
+    python3 -I - "$ROOT" <<'DSR_EXECUTABLE_TARGETS_PY'
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import struct
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+root = Path(sys.argv[1])
+work = Path(tempfile.mkdtemp(prefix='dsr-installer-targets-')).resolve()
+print('Executable target evidence retained at: ' + str(work), flush=True)
+env = {k: v for k, v in os.environ.items() if k not in ('BASH_ENV', 'ENV') and not k.startswith('BASH_FUNC_')}
+env.update(DSR_CONFIG_DIR=str(work / 'config'), DSR_INSTALLER_DIR=str(work / 'generated'),
+           DSR_GH_TOKEN='', GITHUB_TOKEN='', GH_TOKEN='', NO_COLOR='1')
+for name in ('config/repos.d', 'compiled', 'archives', 'results', 'tools'):
+    (work / name).mkdir(parents=True)
+passed = failed = sequence = 0
+platforms = ['linux/amd64', 'linux/arm64', 'linux/386', 'linux/armv7',
+             'darwin/amd64', 'darwin/arm64', 'windows/amd64', 'windows/arm64',
+             'windows/386', 'freebsd/amd64']
+
+
+def check(label, condition):
+    global passed, failed
+    if condition:
+        passed += 1
+        print('PASS: ' + label, flush=True)
+    else:
+        failed += 1
+        print('FAIL: ' + label, flush=True)
+
+
+def run(args, *, environment=None, timeout=60):
+    return subprocess.run(args, cwd=work, env=environment or env, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, timeout=timeout)
+
+
+def require(args, **kwargs):
+    result = run(args, **kwargs)
+    if result.returncode:
+        raise RuntimeError('Command failed: ' + repr(args) + '\n' + result.stderr.decode(errors='replace'))
+    return result
+
+
+require(['minisign', '-G', '-W', '-p', str(work / 'public.key'), '-s', str(work / 'secret.key')])
+public = (work / 'public.key').read_text().splitlines()[1]
+config = dict(tool_name='demo', repo='example/demo', binary_name='demo', language='go',
+              workspace_binaries=['demo', 'worker'], targets=platforms, archive_format='tar.gz',
+              artifact_naming='${name}-${version}-${os}-${arch}', minisign_pubkey=public)
+(work / 'config/repos.d/demo.yaml').write_text(json.dumps(config) + '\n')
+module = env.get('DSR_INSTALL_GEN_MODULE', str(root / 'src/install_gen.sh'))
+generated = require(['bash', '-c', 'source "$1"; install_gen_create demo --config-dir "$2"',
+                     '_', module, str(work / 'config')])
+installer = Path(generated.stdout.decode().strip())
+require(['bash', '-n', str(installer)])
+(work / 'main.go').write_text('package main\nfunc main() { println("native-target-fixture") }\n')
+compiled = {}
+for target in platforms:
+    operating_system, architecture = target.split('/')
+    compiler = env | dict(GOENV='off', GOFLAGS='', GOWORK='off', GOTOOLCHAIN='local',
+                          GOOS=operating_system, GOARCH='arm' if architecture == 'armv7' else architecture,
+                          GOARM='7', CGO_ENABLED='0', GOTELEMETRY='off', GOMAXPROCS='2')
+    output = work / 'compiled' / target.replace('/', '-')
+    result = require(['go', 'build', '-trimpath', '-o', str(output), str(work / 'main.go')], environment=compiler)
+    (work / 'results' / (target.replace('/', '-') + '-compiler.log')).write_bytes(result.stdout + result.stderr)
+    compiled[target] = output.read_bytes()
+print('Compiled genuine ELF, Mach-O and PE payloads for all ten supported platforms', flush=True)
+
+real_uname = shutil.which('uname')
+(work / 'tools/uname').write_text('''#!/usr/bin/env bash
+case "${1:-}" in
+    -s) printf '%s\\n' "$DSR_TARGET_OS" ;;
+    -m) printf '%s\\n' "$DSR_TARGET_ARCH" ;;
+    *) exec "$DSR_REAL_UNAME" "$@" ;;
+esac
+''')
+(work / 'tools/uname').chmod(0o755)
+os_names = dict(linux='Linux', darwin='Darwin', windows='MINGW64_NT', freebsd='FreeBSD')
+arch_names = dict(amd64='x86_64', arm64='aarch64', **{'386': 'i686'}, armv7='armv7l')
+
+
+def selection_environment(target):
+    operating_system, architecture = target.split('/')
+    return env | dict(PATH=str(work / 'tools') + os.pathsep + env['PATH'],
+                      DSR_TARGET_OS=os_names[operating_system], DSR_TARGET_ARCH=arch_names[architecture],
+                      DSR_REAL_UNAME=real_uname)
+
+
+def member_names(target):
+    return ['demo.exe', 'worker.exe'] if target.startswith('windows/') else ['demo', 'worker']
+
+
+def snapshot(directory):
+    return {p.name: (p.read_bytes(), stat.S_IMODE(p.stat().st_mode), p.stat().st_ino)
+            for p in directory.iterdir() if p.is_file()}
+
+
+def package(target, payloads, label):
+    archive = work / 'archives' / (label + '.tar.gz')
+    with tarfile.open(archive, 'w:gz') as stream:
+        for name, data in zip(member_names(target), payloads):
+            entry = tarfile.TarInfo(name)
+            entry.size, entry.mode = len(data), 0o755
+            stream.addfile(entry, io.BytesIO(data))
+    asset = 'demo-1.2.3-' + target.replace('/', '-') + '.tar.gz'
+    Path(str(archive) + '.sha256').write_text(hashlib.sha256(archive.read_bytes()).hexdigest() + '  ' + asset + '\n')
+    require(['minisign', '-S', '-s', str(work / 'secret.key'), '-m', str(archive),
+             '-x', str(archive) + '.minisig', '-t', 'installer target regression'])
+    return archive
+
+
+def exercise(label, target, payloads, accepted, *, script=None, online=False):
+    global sequence
+    sequence += 1
+    case = work / ('case-' + str(sequence))
+    prefix = case / 'bin'
+    prefix.mkdir(parents=True)
+    for name in member_names(target) + ['unrelated']:
+        (prefix / name).write_bytes(('prior-' + name + '\n').encode())
+        (prefix / name).chmod(0o751)
+    before = snapshot(prefix)
+    archive = package(target, payloads, str(sequence))
+    arguments = ['bash', str(script or installer), '--dir', str(prefix), '--cache-dir', str(case / 'cache'),
+                 '--yes', '--no-skills', '--json', '--non-interactive']
+    if target.startswith('linux/'):
+        arguments += ['--libc', 'gnu']
+    selected_env = selection_environment(target) | dict(DSR_TARGET_ARCHIVE=str(archive),
+                                                        DSR_TARGET_HOOKS=str(case / 'hooks'))
+    if online:
+        arguments += ['--allow-source-build', '--source-if-stale', '0']
+    else:
+        arguments += ['--version', 'v1.2.3', '--offline', str(archive), '--require-signatures']
+    result = run(arguments, environment=selected_env, timeout=30)
+    (case / 'stdout').write_bytes(result.stdout)
+    (case / 'stderr').write_bytes(result.stderr)
+    try:
+        receipt = json.loads(result.stdout)
+    except (ValueError, UnicodeDecodeError):
+        receipt = {}
+    if accepted:
+        correct = (result.returncode == 0 and receipt.get('status') == 'success' and
+                   all((prefix / name).read_bytes() == data for name, data in zip(member_names(target), payloads)) and
+                   (prefix / 'unrelated').read_bytes() == before['unrelated'][0])
+        check(label, correct)
+    else:
+        correct = (result.returncode == 7 and receipt.get('status') == 'error' and snapshot(prefix) == before and
+                   b'Executable format or architecture' in result.stderr)
+        check(label + ' refuses before replacing any member', correct)
+    return case, result
+
+
+for target in platforms:
+    exercise('matching ' + target + ' signed family installs', target, [compiled[target]] * 2, True)
+    if target.endswith('/amd64'):
+        wrong = target.split('/')[0] + '/arm64'
+        if wrong not in compiled:
+            wrong = 'linux/arm64'
+    else:
+        wrong = target.split('/')[0] + '/amd64'
+    exercise('foreign CPU for ' + target, target, [compiled[target], compiled[wrong]], False)
+
+for target, foreign in [('linux/amd64', 'windows/amd64'), ('darwin/arm64', 'linux/arm64'),
+                        ('windows/amd64', 'darwin/amd64'), ('freebsd/amd64', 'windows/amd64')]:
+    exercise('foreign format ' + foreign + ' for ' + target, target, [compiled[target], compiled[foreign]], False)
+
+for label, target, data in [
+    ('truncated ELF header', 'linux/amd64', compiled['linux/amd64'][:40]),
+    ('truncated Mach-O header', 'darwin/arm64', compiled['darwin/arm64'][:20]),
+    ('truncated DOS/PE header', 'windows/amd64', compiled['windows/amd64'][:60]),
+    ('unrecognized payload', 'linux/amd64', b'this is not an executable\n'),
+    ('empty interpreter token', 'linux/amd64', b'#! /   \nprintf bad\n'),
+]:
+    exercise(label, target, [compiled[target], data], False)
+
+for label, target, offset, value in [
+    ('ELF object is not an executable', 'linux/amd64', 16, struct.pack('<H', 1)),
+    ('ELF class must match machine', 'linux/amd64', 4, b'\x01'),
+    ('Linux cannot use explicit FreeBSD OSABI', 'linux/amd64', 7, b'\x09'),
+]:
+    changed = bytearray(compiled[target])
+    changed[offset:offset + len(value)] = value
+    exercise(label, target, [compiled[target], bytes(changed)], False)
+
+pe = compiled['windows/amd64']
+pe_offset = struct.unpack_from('<I', pe, 60)[0]
+for label, offset, value in [
+    ('PE DLL is not a program', pe_offset + 22, struct.pack('<H', struct.unpack_from('<H', pe, pe_offset + 22)[0] | 0x2000)),
+    ('PE32 optional header cannot label AMD64', pe_offset + 24, struct.pack('<H', 0x10b)),
+    ('EFI subsystem is not a Windows application', pe_offset + 24 + 68, struct.pack('<H', 10)),
+]:
+    changed = bytearray(pe)
+    changed[offset:offset + len(value)] = value
+    exercise(label, 'windows/amd64', [pe, bytes(changed)], False)
+
+
+def fat64_or_32(wide=False, only_arm=False):
+    selected = ['darwin/arm64'] if only_arm else ['darwin/amd64', 'darwin/arm64']
+    rows = []
+    body = bytearray(4096)
+    for target in selected:
+        data = compiled[target]
+        offset = len(body)
+        cpu, subtype = struct.unpack_from('<II', data, 4)
+        rows.append(struct.pack('>IIQQII', cpu, subtype, offset, len(data), 12, 0) if wide else
+                    struct.pack('>IIIII', cpu, subtype, offset, len(data), 12))
+        body.extend(data)
+        body.extend(bytes((-len(body)) % 4096))
+    table = struct.pack('>II', 0xcafebabf if wide else 0xcafebabe, len(rows)) + b''.join(rows)
+    body[:len(table)] = table
+    return bytes(body)
+
+
+for wide in (False, True):
+    universal = fat64_or_32(wide)
+    for target in ('darwin/amd64', 'darwin/arm64'):
+        exercise(('fat64' if wide else 'fat32') + ' selects ' + target, target, [universal] * 2, True)
+exercise('fat container lacks selected CPU', 'darwin/amd64', [fat64_or_32(only_arm=True)] * 2, False)
+bad_fat = bytearray(fat64_or_32(True))
+struct.pack_into('>Q', bad_fat, 16, 1 << 63)
+exercise('fat64 overflowing slice offset', 'darwin/amd64', [bytes(bad_fat)] * 2, False)
+bad_fat = bytearray(fat64_or_32())
+first_offset = struct.unpack_from('>I', bad_fat, 16)[0]
+struct.pack_into('>I', bad_fat, 36, first_offset)
+exercise('overlapping fat slices', 'darwin/amd64', [bytes(bad_fat)] * 2, False)
+bad_macho = bytearray(compiled['darwin/amd64'])
+bad_macho[:32] = struct.pack('>8I', *struct.unpack_from('<8I', bad_macho))
+exercise('big-endian modern Mach-O CPU', 'darwin/amd64', [bytes(bad_macho)] * 2, False)
+launcher = b'#!/bin/sh\nprintf "portable-launcher\\n"\n'
+exercise('explicit shebang launchers remain supported', 'linux/amd64', [launcher] * 2, True)
+exercise('MSYS shebang launcher compatibility remains explicit', 'windows/amd64', [launcher] * 2, True)
+
+# Upstream acquisition and freshness are deliberate adapters. Actual signature,
+# archive, member selection and destination operations stay in the generated CLI.
+marker = '# Emit one machine-readable result on every failure, including preflight.\n'
+text = installer.read_text()
+if text.count(marker) != 1:
+    raise RuntimeError('Cannot locate generated entry point')
+hooks = r'''
+_get_latest_version() { printf 'v1.2.3\n'; }
+_fetch_release_asset() {
+    case "$1" in
+        *.tar.gz) cp "$DSR_TARGET_ARCHIVE" "$2" ;;
+        *.tar.gz.sha256) cp "$DSR_TARGET_ARCHIVE.sha256" "$2" ;;
+        *.tar.gz.minisig) cp "$DSR_TARGET_ARCHIVE.minisig" "$2" ;;
+        *) return 1 ;;
+    esac
+}
+install_source_freshness() { printf 'freshness\n' >> "$DSR_TARGET_HOOKS"; return 1; }
+install_source_build() { printf 'source\n' >> "$DSR_TARGET_HOOKS"; return 1; }
+'''
+adapted = work / 'acquisition-adapter.sh'
+adapted.write_text(text.replace(marker, hooks + '\n' + marker))
+case, result = exercise('wrong CPU cannot trigger stale source fallback', 'linux/amd64',
+                        [compiled['linux/amd64'], compiled['linux/arm64']], False, script=adapted, online=True)
+check('foreign payload stops before freshness or source callbacks', not (case / 'hooks').exists())
+
+# The same transaction is used for source receipts. Feed it already-compiled
+# foreign bytes to prove its final staging gate is independent of extraction.
+shared = work / 'shared-activation'
+shared.mkdir()
+for name in ('demo', 'worker'):
+    (shared / name).write_bytes(('prior-' + name).encode())
+before = snapshot(shared)
+activation = work / 'shared-activation.sh'
+activation.write_text(text.split(marker)[0] + r'''
+_select_install_family linux/amd64 || exit $?
+_INSTALL_DIR="$1"; _TEMP_DIR="$2"; _AUTO_YES=true; _NON_INTERACTIVE=true
+_INSTALL_PATHS=("$3" "$4")
+_install_binaries
+''')
+result = run(['bash', str(activation), str(shared), str(work),
+              str(work / 'compiled/linux-amd64'), str(work / 'compiled/linux-arm64')], timeout=30)
+check('shared source/release staging rejects foreign companion before any replacement',
+      result.returncode == 7 and snapshot(shared) == before)
+
+print('Executable target admission: %s passed, %s failed' % (passed, failed), flush=True)
+raise SystemExit(0 if failed == 0 else 1)
+DSR_EXECUTABLE_TARGETS_PY
+)
+
+if [[ "${1:-}" == --executable-targets-only ]]; then
+    test_executable_targets
+    exit $?
+fi
+
 work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-install-integrity.XXXXXXXX") || exit 1
 # Installer output admission rejects symlink ancestors, including macOS /var.
 work=$(cd "$work" && pwd -P) || exit 1

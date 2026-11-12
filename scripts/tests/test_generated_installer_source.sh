@@ -276,7 +276,7 @@ prepare_no_go_path() {
     local destination="$1" command resolved
     mkdir -p "$destination" || return 1
     for command in bash env git curl gh jq tar gzip sha256sum shasum uname getconf ldd awk sed grep tr cut \
-        head tail wc sort uniq dirname basename readlink realpath mkdir rmdir chmod mktemp cat cp mv rm date \
+        head tail wc od sort uniq dirname basename readlink realpath mkdir rmdir chmod mktemp cat cp mv rm date \
         ps sleep find stat touch ln install; do
         resolved=$(command -v "$command") || continue
         ln -s "$resolved" "$destination/$command" || return 1
