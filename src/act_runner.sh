@@ -7712,7 +7712,7 @@ _act_windows_strict_go_build_script() {
     local source_root="$5" stage_root="$6" build_cmd="$7" build_env="$8"
     local path dependencies sources entry name checkout sha archive manifest manifest_dir
     local archive_digest manifest_digest object_count records='[]' total_objects=1
-    local records_b64 command_b64 environment_b64 ambient_names_b64 budget_script
+    local records_b64 command_b64 environment_b64 ambient_names_b64 pkg_config_regex budget_script
     source_root="${source_root//\\//}" stage_root="${stage_root//\\//}"
     if [[ "$source_root" =~ ^/([A-Za-z])/(.*)$ ]]; then
         source_root="${BASH_REMATCH[1]}:/${BASH_REMATCH[2]}"
@@ -7767,6 +7767,7 @@ _act_windows_strict_go_build_script() {
         else error("invalid Go build environment") end' | base64 | tr -d '\r\n') || return 4
     ambient_names_b64=$(_act_go_ambient_env_names | jq -Rsc 'split("\n") | map(select(length > 0))' | \
         base64 | tr -d '\r\n') || return 4
+    pkg_config_regex=$(_act_go_pkg_config_env_regex)
     budget_script=$(_act_windows_source_budget_script "$host" "${source_root%/*}" \
         0 "$total_objects" expansion) || return 4
     _act_windows_source_runtime_script || return 4
@@ -7821,7 +7822,12 @@ try {
     \$psi.WorkingDirectory=\$dsrStageSource
     \$psi.FileName=\$env:ComSpec
     \$ambientNames=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$ambient_names_b64')) | ConvertFrom-Json
-    foreach (\$name in \$ambientNames) { \$psi.EnvironmentVariables.Remove(\$name) }
+    \$ambientKeys=@(\$psi.EnvironmentVariables.Keys)
+    foreach (\$name in \$ambientKeys) {
+        if (\$ambientNames -icontains \$name -or \$name -match '$pkg_config_regex') {
+            \$psi.EnvironmentVariables.Remove(\$name)
+        }
+    }
     \$environment=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$environment_b64')) | ConvertFrom-Json
     foreach (\$pair in \$environment) { \$psi.EnvironmentVariables[\$pair.name]=\$pair.value }
     \$command=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$command_b64'))
@@ -10426,7 +10432,8 @@ _act_windows_rust_sdk_env_cleanup() {
 
 # Strict Go workers inherit caches and download policy, but never compiler or
 # source selectors from a login shell or the persistent `go env -w` file.
-# Both native launchers use this list before applying the reviewed recipe.
+# Both native launchers use this list and the pkg-config family below before
+# applying the reviewed recipe.
 _act_go_ambient_env_names() {
     printf '%s\n' GOOS GOARCH GOENV GOFLAGS GOWORK GOTOOLCHAIN GO111MODULE GOROOT \
         GOEXPERIMENT GODEBUG GOCACHEPROG GO_EXTLINK_ENABLED GOFIPS140 GCCGO GOAMD64 GOARM GOARM64 \
@@ -10437,17 +10444,25 @@ _act_go_ambient_env_names() {
         CGO_FFLAGS_DISALLOW CGO_LDFLAGS_ALLOW CGO_LDFLAGS_DISALLOW CC CXX FC AR PKG_CONFIG
 }
 
+# cgo invokes the selected pkg-config program with the inherited environment.
+# Govern the complete selector family, including extensions, so package search
+# paths, sysroots and flag filtering cannot escape through an unlisted name.
+_act_go_pkg_config_env_regex() {
+    printf '%s\n' '^PKG_CONFIG($|_)'
+}
+
 _act_go_build_influence_json() {
-    local environment="$1" pair name selected=''
+    local environment="$1" pair name selected='' pkg_config_regex
     local names=$'\n'
     names+="$(_act_go_ambient_env_names)"$'\n'
+    pkg_config_regex=$(_act_go_pkg_config_env_regex)
     while IFS= read -r pair; do
         [[ -n "$pair" && "$pair" == *=* ]] || continue
         name="${pair%%=*}"
         case "$name" in
             DSR_GO_ENV_POLICY|DSR_GO_WORKFILE|DSR_GO_WORKFILE_SHA256|DSR_GO_WORKFILE_GIT_SHA|\
             DSR_RELEASE_GIT_SHA|DSR_RELEASE_GIT_REF|DSR_TARGET_OS|DSR_TARGET_ARCH|DSR_TARGET_PLATFORM) ;;
-            *) [[ "$names" == *$'\n'"$name"$'\n'* ]] || continue ;;
+            *) [[ "$names" == *$'\n'"$name"$'\n'* || "$name" =~ $pkg_config_regex ]] || continue ;;
         esac
         selected+="$pair"$'\n'
     done <<< "$environment"
@@ -10731,17 +10746,21 @@ PY
 
 _act_strict_go_build_env() {
     local tool="$1" sha="$2" ref="$3" stage_source="$4" environment="$5"
-    local pair name value workfile selected='' result=$'GOENV=off\nGOFLAGS=\nGOTOOLCHAIN=local\nGO111MODULE=on'
-    local governed=$'\n'
+    local pair name value workfile normalized pkg_config_regex selected=''
+    local result=$'GOENV=off\nGOFLAGS=\nGOTOOLCHAIN=local\nGO111MODULE=on' governed=$'\n'
     governed+="$(_act_go_ambient_env_names)"$'\n'
+    pkg_config_regex=$(_act_go_pkg_config_env_regex)
     [[ "$sha" =~ ^[0-9a-f]{40}$ && "$sha" != 0000000000000000000000000000000000000000 && -n "$ref" ]] || return 4
     while IFS= read -r pair; do
         [[ -n "$pair" ]] || continue
         [[ "$pair" == *=* ]] || return 4
         name="${pair%%=*}"; value="${pair#*=}"
-        if [[ "$name" != "${name^^}" && "$governed" == *$'\n'"${name^^}"$'\n'* ]]; then
-            _log_error "Strict Go compiler selectors must use their portable uppercase name: $name"
-            return 4
+        normalized="${name^^}"
+        if [[ "$governed" == *$'\n'"$normalized"$'\n'* || "$normalized" =~ $pkg_config_regex ]]; then
+            if [[ "$name" != "$normalized" || ! "$name" =~ ^[A-Z_][A-Z0-9_]*$ ]]; then
+                _log_error "Strict Go compiler selectors must use a portable uppercase identifier: $name"
+                return 4
+            fi
         fi
         case "$name" in
             GOENV)
@@ -10758,7 +10777,7 @@ _act_strict_go_build_env() {
     done <<< "$environment"
     workfile=$(_act_strict_go_workfile_json "$tool" "$sha" "$selected" "$stage_source") || return 4
     result+=$'\n'"GOWORK=$(jq -r '.gowork' <<< "$workfile")"
-    result+=$'\n'"DSR_GO_ENV_POLICY=1"
+    result+=$'\n'"DSR_GO_ENV_POLICY=2"
     result+=$'\n'"DSR_GO_WORKFILE=$(jq -r '.path' <<< "$workfile")"
     result+=$'\n'"DSR_GO_WORKFILE_SHA256=$(jq -r '.sha256' <<< "$workfile")"
     result+=$'\n'"DSR_GO_WORKFILE_GIT_SHA=$(jq -r '.git_sha' <<< "$workfile")"
@@ -10780,8 +10799,8 @@ _act_validate_strict_go_result() {
     if ! actual=$(jq -ce --arg platform "$platform" '
         select(.method=="native" and (.platform // .target)==$platform) |
         .build_influence_env | select(type=="object" and all(.[];type=="string") and
-            .DSR_GO_ENV_POLICY=="1" and .GOENV=="off")' <<< "$result"); then
-        _log_error 'Strict native Go output lacks its compiler environment policy receipt; start a fresh release build'
+            .DSR_GO_ENV_POLICY=="2" and .GOENV=="off")' <<< "$result"); then
+        _log_error 'Strict native Go output lacks the current compiler environment policy receipt (DSR_GO_ENV_POLICY=2); start a fresh release build'
         return 4
     fi
     workfile=$(jq -er '.DSR_GO_WORKFILE | strings' <<< "$actual") || return 4
@@ -14235,6 +14254,12 @@ EOF
             # environment. Reject those unsupported export identifiers before
             # a higher-priority target SDK selector can escape isolation.
             env_exports+="for sdk_variable in \$(env | sed 's/=.*//' | grep -Ei '${sdk_regex}' || true); do if ! printf '%s\\n' \"\$sdk_variable\" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*$'; then printf '[dsr] SDK environment name cannot be isolated by this shell: %s; clear it on the build host and configure an underscore-spelled selector in DSR\\n' \"\$sdk_variable\" >&2; exit 4; fi; unset \"\$sdk_variable\"; done; "
+        elif [[ "$language" == go ]] && $strict_native_build; then
+            local pkg_config_regex
+            pkg_config_regex=$(_act_go_pkg_config_env_regex)
+            # Inspect the worker's environment, including selectors added by a
+            # login shell. Invalid export names cannot be removed by unset.
+            env_exports+="while IFS= read -r dsr_go_env_entry; do pkg_config_variable=\${dsr_go_env_entry%%=*}; if test \"\$dsr_go_env_entry\" = \"\$pkg_config_variable\" || ! printf '%s\\n' \"\$pkg_config_variable\" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*$'; then printf '[dsr] Go pkg-config environment name cannot be isolated by this shell: %s; clear it on the build host and configure a portable uppercase selector in DSR\\n' \"\$pkg_config_variable\" >&2; exit 4; fi; unset \"\$pkg_config_variable\"; done < <(env | grep -Ei '${pkg_config_regex}' || true); "
         fi
         for env_name in "${cargo_env_to_unset[@]}"; do
             env_exports+="unset $env_name; "
@@ -20054,7 +20079,7 @@ export -f act_list_tools act_build_matrix
 export -f act_get_build_cmd act_substitute_build_cmd_tokens act_get_build_env act_get_repo act_get_local_path
 export -f _act_materialized_source_path
 export -f act_get_build_env_value act_get_remote_artifact_path
-export -f _act_go_ambient_env_names _act_go_build_influence_json
+export -f _act_go_ambient_env_names _act_go_pkg_config_env_regex _act_go_build_influence_json
 export -f _act_strict_go_workfile_json _act_strict_go_build_env _act_validate_strict_go_result
 export -f act_run_native_build act_orchestrate_build act_generate_manifest
 export -f _act_result_artifact_receipts _act_target_result_available

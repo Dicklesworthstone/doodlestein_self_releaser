@@ -1400,11 +1400,15 @@ The values agree with the durable target result and manifest build-environment
 receipt. Failed attempts retain the evidence available before failure;
 unattempted targets do not receive fabricated provenance.
 
-Strict native Go results retain `DSR_GO_ENV_POLICY=1` in `build_influence_env`,
+Strict native Go results retain `DSR_GO_ENV_POLICY=2` in `build_influence_env`,
 together with the effective reviewed Go selectors and release source identity.
 Workers clear inherited compiler, architecture, cgo and workspace selectors,
-enforce `GOENV=off`, and default to empty `GOFLAGS`, `GOTOOLCHAIN=local` and
-`GO111MODULE=on` before applying the recipe. Governed selector values are literal;
+including the complete `PKG_CONFIG` / `PKG_CONFIG_*` family on Unix and Windows.
+Reviewed pkg-config executable, package search path, sysroot and filtering settings
+must use portable uppercase identifiers in the recipe; every configured family
+member is retained in the receipt. Workers enforce `GOENV=off` and default to
+empty `GOFLAGS`, `GOTOOLCHAIN=local` and `GO111MODULE=on` before applying the recipe.
+Governed selector values are literal, including dollar signs in pkg-config paths;
 unrelated Unix recipe environment values retain their existing shell expansion.
 Proxy credentials and unrelated cache settings are excluded from this receipt.
 
@@ -1439,8 +1443,11 @@ against the current recipe and pinned workfile identity before changing the
 checkpoint or dispatching workers. Publication requires exactly one matching
 native receipt for each configured native contract target; removing, duplicating
 or relabelling rows cannot bypass this requirement. Older strict Go outputs
-without policy evidence require a fresh release build. This policy does not
-attest the installed Go executable or all downloaded dependency-cache bytes.
+without policy evidence, including policy-1 outputs that did not isolate the
+pkg-config selector family, require a fresh release build before resume or
+publication. Changing an old receipt's marker is not a substitute for rebuilding.
+This policy does not attest the installed Go executable or all downloaded
+dependency-cache bytes.
 
 Native results also retain `native_execution`: the observed `phase`, configured
 `timeout_seconds` and `transport_timeout_seconds`, original `command_exit_code`,
