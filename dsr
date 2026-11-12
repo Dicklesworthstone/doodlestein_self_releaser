@@ -3899,14 +3899,18 @@ EOF
         fi
 
         log_info "Syncing source to remote build hosts..."
-        local sync_output sync_json sync_status sync_detail sync_exit=0
+        local sync_output sync_json sync_status sync_exit=0
+        # Diagnostics stay on stderr. A log line cannot stand in for a missing
+        # source receipt, and multiple stdout objects are not one transaction.
         # shellcheck disable=SC2086
-        sync_output=$(act_sync_sources "$tool_name" "${build_sync_args[@]}" $target_list 2>&1) || sync_exit=$?
-        sync_json=$(printf '%s\n' "$sync_output" | grep '^{' | tail -1)
-        # Everything that is not the structured summary is the sync transcript
-        # (module logs plus the underlying rsync/ssh/tar diagnostics). It must
-        # be shown on failure or the real error is silently discarded.
-        sync_detail=$(printf '%s\n' "$sync_output" | grep -v '^{' | grep -v '^[[:space:]]*$' || true)
+        sync_output=$(act_sync_sources "$tool_name" "${build_sync_args[@]}" $target_list) || sync_exit=$?
+        if ! sync_json=$(jq -cse '
+            if length == 1 and (.[0] | type == "object") then .[0]
+            else error("exactly one source-sync receipt required") end
+        ' <<< "$sync_output" 2>/dev/null); then
+            [[ -z "$sync_output" ]] || printf '%s\n' "$sync_output" >&2
+            sync_json=""
+        fi
         if ! sync_status=$(jq -er '.status | strings' <<< "$sync_json" 2>/dev/null); then
             sync_status="unknown"
         fi
@@ -3931,7 +3935,6 @@ EOF
             fi
         fi
         if ! $sync_receipt_valid; then
-            [[ -n "$sync_detail" ]] && printf '%s\n' "$sync_detail" >&2
             log_error "Source sync failed or returned incomplete host evidence"
             if $JSON_MODE; then
                 local sync_error_json
@@ -3955,7 +3958,6 @@ EOF
                 log_ok "Source synced to $synced host(s)"
             fi
         else
-            [[ -n "$sync_detail" ]] && printf '%s\n' "$sync_detail" >&2
             if $build_release_contract_enabled; then
                 log_error "Strict source sync was incomplete"
                 if $JSON_MODE; then
@@ -4088,47 +4090,29 @@ EOF
         --repo-config-sha256 "$build_repo_config_sha256" \
         "${build_source_args[@]}" "${orchestration_resume_args[@]}" "${purpose_args[@]}" \
         --parallel-jobs "$parallel_jobs" --output-dir "$output_dir" -- \
-        $target_list 2>&1) || orchestrator_exit=$?
+        $target_list) || orchestrator_exit=$?
 
-    # Debug: show orchestrator exit and last few lines of output
-    log_debug "Orchestrator exit=$orchestrator_exit, output lines=$(echo "$full_output" | wc -l)"
-    if [[ $orchestrator_exit -ne 0 ]] || [[ "$(echo "$full_output" | wc -l)" -lt 3 ]]; then
-        echo "$full_output" | tail -10 >&2
-    fi
-
-    # Extract JSON from mixed output (orchestrator logs + JSON at end)
-    # The orchestrator outputs JSON containing a summary object
-    # We look for lines containing "summary" that are valid JSON
+    # The coordinator owns stdout; compiler/transport logs remain diagnostic.
+    # Admit one complete result before collecting any files or interpreting
+    # summary counts as shell arithmetic. A successful process alone cannot
+    # authorize packaging after an absent, partial or multiple receipt stream.
     local result=""
-
-    # Try multiple patterns to find the JSON output
-    # First: lines starting with { (standard jq output)
-    result=$(echo "$full_output" | grep '^{' | tail -1)
-
-    # Validate it's actually JSON with expected structure
-    if ! echo "$result" | jq -e '.summary' &>/dev/null 2>&1; then
-        # Second: try finding any JSON object with summary field
-        result=$(echo "$full_output" | grep -o '{[^}]*"summary"[^}]*}' | tail -1)
-
-        if ! echo "$result" | jq -e '.summary' &>/dev/null 2>&1; then
-            # Third: look for multiline JSON (lines between { and })
-            result=$(echo "$full_output" | awk '/^{$/,/^}$/' | tr -d '\n')
-
-            if ! echo "$result" | jq -e '.summary' &>/dev/null 2>&1; then
-                log_warn "Could not parse orchestrator JSON output"
-                if [[ $orchestrator_exit -ne 0 ]]; then
-                    log_error "Orchestrator exited with code $orchestrator_exit"
-                    # Show last few lines of output for diagnosis
-                    echo "$full_output" | tail -20 >&2
-                fi
-                # In verbose mode, show what we got
-                if $VERBOSE; then
-                    log_debug "Full output was:"
-                    echo "$full_output" | head -50 >&2
-                fi
-                result='{}'
-            fi
+    if ! result=$(jq -cse '
+        def count: type == "number" and floor == . and . >= 0 and . <= 9007199254740991;
+        if length == 1 and (.[0] | type == "object" and
+            (.summary | type == "object") and
+            ([.summary.total,.summary.success,.summary.failed] | all(.[]; count)) and
+            (.targets | type == "array"))
+        then .[0] else error("exactly one complete orchestration receipt required") end
+    ' <<< "$full_output" 2>/dev/null); then
+        [[ -z "$full_output" ]] || printf '%s\n' "$full_output" >&2
+        log_error "Build coordinator did not return exactly one complete JSON result"
+        [[ "$orchestrator_exit" -ne 0 ]] || orchestrator_exit=4
+        if $JSON_MODE; then
+            json_envelope "build" "error" "$orchestrator_exit" \
+                '{"error":"Build coordinator did not return exactly one complete JSON result"}'
         fi
+        return "$orchestrator_exit"
     fi
 
     # Parse result

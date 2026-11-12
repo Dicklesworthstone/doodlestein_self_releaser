@@ -1923,6 +1923,105 @@ test_build_workflow_zip_admission() {
     done
 }
 
+# Exercise the public command with genuine sync, orchestration, archive
+# collection and publication guards. The only injected fault changes the
+# coordinator's result stream after its real work has finished. This catches
+# accepting a diagnostic receipt, or silently selecting one of several stdout
+# objects, without manufacturing artifacts or bypassing publication checks.
+test_build_command_receipt_streams() {
+    local scenario
+    for scenario in sync-stderr sync-multiple sync-noisy sync-diagnostic sync-pretty \
+        build-stderr build-multiple build-noisy build-diagnostic build-pretty \
+        build-bad-count build-nonzero; do
+        ((TESTS_RUN++))
+        if [[ "$HAS_YQ" != true ]]; then
+            skip "yq required for command receipt test ($scenario)"
+            continue
+        fi
+        harness_setup
+        local installation="$TEST_TMPDIR/installation" repo_dir="$TEST_TMPDIR/repo"
+        local output_dir="$TEST_TMPDIR/output" manifest expected=4 problems=()
+        seed_lane_archive_fixture "$repo_dir"
+        mkdir -p "$installation"
+        cp "$DSR_CMD" "$installation/dsr" || return 1
+        cp -R "$PROJECT_ROOT/src" "$installation/src" || return 1
+        cat >> "$installation/src/act_runner.sh" <<'RECEIPT_FIXTURE'
+
+# Deliberate protocol fault at the completed producer boundary only.
+eval "_receipt_original_$(declare -f act_sync_sources)"
+eval "_receipt_original_$(declare -f act_orchestrate_build)"
+_receipt_emit() {
+    local stage="$1" receipt="$2"
+    case "$DSR_RECEIPT_CASE" in
+        "$stage-stderr") printf '%s\n' "$receipt" >&2 ;;
+        "$stage-multiple") printf '%s\n%s\n' "$receipt" "$receipt" ;;
+        "$stage-noisy") printf 'producer diagnostic on stdout\n%s\n' "$receipt" ;;
+        "$stage-diagnostic")
+            printf '%s\n' "$receipt"
+            jq -c '.status = "failed"' <<< "$receipt" >&2
+            ;;
+        "$stage-pretty") jq '.' <<< "$receipt" ;;
+        build-bad-count) jq -c '.summary.success = "not-a-count"' <<< "$receipt" ;;
+        build-nonzero) printf '%s\n' "$receipt"; return 7 ;;
+        *) printf '%s\n' "$receipt" ;;
+    esac
+}
+act_sync_sources() {
+    local receipt status=0
+    receipt=$(_receipt_original_act_sync_sources "$@") || status=$?
+    if ((status != 0)); then printf '%s\n' "$receipt"; return "$status"; fi
+    case "$DSR_RECEIPT_CASE" in
+        sync-*) _receipt_emit sync "$receipt" ;;
+        *) printf '%s\n' "$receipt" ;;
+    esac
+}
+act_orchestrate_build() {
+    local receipt status=0
+    receipt=$(_receipt_original_act_orchestrate_build "$@") || status=$?
+    if ((status != 0)); then printf '%s\n' "$receipt"; return "$status"; fi
+    _receipt_emit build "$receipt"
+}
+RECEIPT_FIXTURE
+        local -a extra=()
+        case "$scenario" in
+            sync-*) extra+=(--sync-only); expected=1 ;;
+        esac
+        case "$scenario" in
+            *-diagnostic|*-pretty) expected=0 ;;
+            build-nonzero) expected=7 ;;
+        esac
+        DSR_RECEIPT_CASE="$scenario" PROJECT_ROOT="$installation" DSR_CMD="$installation/dsr" \
+            exec_run run_lane_build lane-tool --version 1.2.3 --output-dir "$output_dir" "${extra[@]}"
+        [[ "$(exec_status)" == "$expected" ]] || problems+=("exit $(exec_status), expected $expected")
+        exec_stdout | jq -es --argjson expected "$expected" '
+            length == 1 and (.[0] | .command == "build" and .exit_code == $expected and
+                (if $expected == 0 then .status == "success" else .status == "error" end))
+        ' >/dev/null 2>&1 || problems+=("missing or contradictory command envelope")
+        if [[ "$scenario" == build-* ]]; then
+            manifest="$output_dir/lane-tool-v1.2.3-manifest.json"
+            if [[ "$expected" == 0 ]]; then
+                lane_publication_matches "$output_dir" "$manifest" true || problems+=("valid result did not publish")
+            else
+                lane_publication_matches "$output_dir" "$manifest" false || problems+=("invalid result permits publication")
+            fi
+        fi
+        if [[ ${#problems[@]} == 0 ]]; then
+            pass "command receipt stream $scenario"
+        else
+            fail "command receipt stream $scenario: ${problems[*]}"
+            echo "stderr: $(exec_stderr | tail -15)"
+        fi
+        harness_teardown
+    done
+}
+
+if [[ "${1:-}" == --command-receipt-only ]]; then
+    test_build_command_receipt_streams
+    printf '\nCommand receipts: %s passed, %s failed, %s skipped\n' "$TESTS_PASSED" "$TESTS_FAILED" "$TESTS_SKIPPED"
+    [[ "$TESTS_FAILED" == 0 ]]
+    exit $?
+fi
+
 if [[ "${1:-}" == --workflow-zip-only ]]; then
     test_build_workflow_zip_admission
     printf '\nWorkflow ZIP admission: %s passed, %s failed, %s skipped\n' "$TESTS_PASSED" "$TESTS_FAILED" "$TESTS_SKIPPED"
@@ -1990,6 +2089,7 @@ test_build_refuses_secondary_variant_include_conflict
 
 echo ""
 echo "Durable Publication and Raw Archive Packaging:"
+test_build_command_receipt_streams
 test_build_failed_compiler_is_not_publishable
 test_build_inflight_is_not_publishable
 test_build_raw_archives_preserve_nested_payloads
