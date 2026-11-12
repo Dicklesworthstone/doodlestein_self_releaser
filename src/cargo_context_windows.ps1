@@ -61,7 +61,7 @@ function Test-DsrCargoSanitizedEnvironmentName {
 function Test-DsrCargoContextEnvironmentName {
     param([string]$Name)
     return (Test-DsrCargoSanitizedEnvironmentName $Name) -or
-        $Name -match '^(PATH|PATHEXT|COMSPEC|SYSTEMROOT|WINDIR|USERPROFILE|HOMEDRIVE|HOMEPATH|TEMP|TMP|NoDefaultCurrentDirectoryInExePath|RCH_DISABLED|RCH_CARGO_WRAPPER_BYPASS|PROCESSOR_ARCHITECTURE|PROCESSOR_ARCHITEW6432)$' -or
+        $Name -match '^(PATH|PATHEXT|COMSPEC|SYSTEMROOT|WINDIR|USERPROFILE|HOMEDRIVE|HOMEPATH|TEMP|TMP|NoDefaultCurrentDirectoryInExePath|RCH_DISABLED|RCH_CARGO_WRAPPER_BYPASS|RCH_CARGO_WRAPPER_ORIGIN|PROCESSOR_ARCHITECTURE|PROCESSOR_ARCHITEW6432)$' -or
         $Name -match '^(VC|VS|WINDOWSSDK|UNIVERSALCRT|UCRT|FRAMEWORK|EXTENSIONSDK|VISUALSTUDIO|DEVENV|NETFXSDK|PROGRAMFILES)'
 }
 
@@ -1006,7 +1006,7 @@ function New-DsrCargoContextEnvironment {
         if ($assignment -notmatch '^([A-Za-z_][A-Za-z0-9_]*)=([^\x00\r\n]*)$') { throw 'Invalid configured Windows Cargo environment assignment' }
         $name = $Matches[1]; $value = $Matches[2]
         # Managed values win and are not additional configured influences.
-        if ($name -in @('CARGO_HOME','RCH_DISABLED','RCH_CARGO_WRAPPER_BYPASS') -or $name -match '^GIT_') { continue }
+        if ($name -in @('CARGO_HOME','RCH_DISABLED','RCH_CARGO_WRAPPER_BYPASS','RCH_CARGO_WRAPPER_ORIGIN') -or $name -match '^GIT_') { continue }
         $effective[$name] = $value; $null = $configured.Add($name.ToUpperInvariant())
     }
     $effective['CARGO_HOME'] = $CargoHome
@@ -1020,6 +1020,7 @@ function New-DsrCargoContextEnvironment {
     $effective['GIT_CONFIG_KEY_0'] = 'core.symlinks'
     $effective['GIT_CONFIG_VALUE_0'] = 'false'
     $effective['RCH_DISABLED'] = '1'; $effective['RCH_CARGO_WRAPPER_BYPASS'] = '1'
+    $effective['RCH_CARGO_WRAPPER_ORIGIN'] = 'rch'
     return @{Environment=$effective; ConfiguredNames=@($configured)}
 }
 

@@ -7431,7 +7431,7 @@ SH
         printf 'export "%s"\n' "$env_pair"
     done <<< "$build_env"
     cat <<'SH'
-export CARGO_HOME="$strict_home" RCH_DISABLED=1 RCH_CARGO_WRAPPER_BYPASS=1
+export CARGO_HOME="$strict_home" RCH_DISABLED=1 RCH_CARGO_WRAPPER_BYPASS=1 RCH_CARGO_WRAPPER_ORIGIN=rch
 (
 set -C
 {
@@ -13956,7 +13956,7 @@ act_run_native_build() {
                 ps_env_assignments+="\$psi.EnvironmentVariables[[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${env_name_b64}'))]=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${env_value_b64}')); "
             done <<< "$build_env"
             # A native host must not re-offload its private source/cache paths.
-            ps_env_assignments+='$psi.EnvironmentVariables["RCH_DISABLED"]="1"; $psi.EnvironmentVariables["RCH_CARGO_WRAPPER_BYPASS"]="1"; '
+            ps_env_assignments+='$psi.EnvironmentVariables["RCH_DISABLED"]="1"; $psi.EnvironmentVariables["RCH_CARGO_WRAPPER_BYPASS"]="1"; $psi.EnvironmentVariables["RCH_CARGO_WRAPPER_ORIGIN"]="rch"; '
             for sibling_relative in "${nonstrict_sibling_relatives[@]}"; do
                 sibling_win_remote=$(_act_windows_cmd_path \
                     "${remote_path%/*}/$sibling_relative") || return 4
@@ -14060,8 +14060,10 @@ EOF
         if [[ "$language" == "rust" ]]; then
             # A native target host must compile locally.  Explicitly bypass an
             # installed RCH Cargo hook so it cannot re-offload a snapshot whose
-            # path is intentionally outside the canonical project root.
-            env_exports+="export RCH_DISABLED=1; export RCH_CARGO_WRAPPER_BYPASS=1; "
+            # path is intentionally outside the canonical project root. Shim v9
+            # requires the paired managed-child origin. Controller and recipe
+            # remote-only policies were checked before native admission above.
+            env_exports+="export RCH_DISABLED=1; export RCH_CARGO_WRAPPER_BYPASS=1; export RCH_CARGO_WRAPPER_ORIGIN=rch; "
         fi
 
         # A configured TMPDIR that does not exist on the build host breaks

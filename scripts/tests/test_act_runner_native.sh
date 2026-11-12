@@ -3317,17 +3317,17 @@ test_unix_rust_sdk_environment() {
     for mode in strict ordinary; do
         reset_state
         MOCK_LANGUAGE=rust
-        MOCK_PLATFORM_ENV=$'OPENSSL_DIR=/configured/openssl with spaces\nOPENSSL_STATIC=1\nPKG_CONFIG=/configured/pkg-config\nPKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=/configured/pkgconfig\nLIBCLANG_PATH=/configured/libclang'
-        MOCK_BUILD_CMD="env"
+        MOCK_PLATFORM_ENV=$'OPENSSL_DIR=/configured/openssl with spaces\nOPENSSL_STATIC=1\nPKG_CONFIG=/configured/pkg-config\nPKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=/configured/pkgconfig\nLIBCLANG_PATH=/configured/libclang\nRCH_DISABLED=0\nRCH_CARGO_WRAPPER_BYPASS=0\nRCH_CARGO_WRAPPER_ORIGIN=caller'
+        MOCK_BUILD_CMD='cargo build --release'
         SDK_COMMAND_FILE="$MOCK_DIR/sdk-unix-$mode-command"
         MOCK_SSH_STREAM_FILE="$MOCK_DIR/sdk-unix-$mode-artifact"
         write_mock_artifact "$MOCK_SSH_STREAM_FILE"
         status=0
         if [[ "$mode" == strict ]]; then
             result=$(act_run_native_build tool darwin/arm64 v1.0.0 sdk-unix \
-                /remote/.dsr-release-snapshots/sdk/source 2>/dev/null) || status=$?
+                /remote/.dsr-release-snapshots/sdk/source) || status=$?
         else
-            result=$(act_run_native_build tool darwin/arm64 v1.0.0 sdk-unix 2>/dev/null) || status=$?
+            result=$(act_run_native_build tool darwin/arm64 v1.0.0 sdk-unix) || status=$?
         fi
         # Execute only the build request, excluding the subsequent cache
         # inventory request captured by the shared SSH transcript.
@@ -3337,7 +3337,9 @@ test_unix_rust_sdk_environment() {
             continue
         fi
         # Execute the actual generated environment portion without staging a
-        # source tree or running a compiler. The configured build command is env.
+        # source tree or running a compiler. Keep the configured Cargo command
+        # valid for strict toolchain parsing and observe its child environment
+        # through a shell fixture at the compiler boundary.
         launch="for sdk_variable in ${cmd#*for sdk_variable in }"
         # The strict toolchain attestation heredocs write receipts beside a
         # real snapshot; test_strict_cargo_private_cache.sh runs them for real.
@@ -3346,12 +3348,13 @@ test_unix_rust_sdk_environment() {
             skip { next }
             match($0, /["][$]dsr_tool_python["] -I - (record|verify) /) { print substr($0, 1, RSTART - 1); skip = 1; next }
             { print }')
-        observed=$(OPENSSL_DIR=/ambient/openssl OPENSSL_NO_VENDOR=1 \
+        observed=$(RCH_CARGO_WRAPPER_BYPASS=0 RCH_CARGO_WRAPPER_ORIGIN=inherited \
+            OPENSSL_DIR=/ambient/openssl OPENSSL_NO_VENDOR=1 \
             X86_64_PC_WINDOWS_MSVC_OPENSSL_DIR=/ambient/target-openssl \
             PKG_CONFIG=/ambient/pkg-config TARGET_PKG_CONFIG_PATH=/ambient/target-pc \
             HOST_PKG_CONFIG=/ambient/host-pc FONTCONFIG_NO_PKG_CONFIG=1 \
             LIBCLANG_PATH=/ambient/libclang LIBCLANG_PATH_EXTRA=preserve \
-            "$BASH" -c "set -e; $launch") || status=$?
+            "$BASH" -c "set -e; cargo() { env; }; $launch") || status=$?
         if [[ "$status" -eq 0 ]] && printf '%s\n' "$observed" | \
             grep -Fx 'OPENSSL_DIR=/configured/openssl with spaces' >/dev/null && \
            printf '%s\n' "$observed" | grep -Fx 'LIBCLANG_PATH_EXTRA=preserve' >/dev/null && \
@@ -3367,9 +3370,17 @@ test_unix_rust_sdk_environment() {
         else
             log_fail "$mode Unix SDK environment/receipt mismatch: status=$status result=$result"
         fi
+        if [[ "$status" -eq 0 ]] &&
+           printf '%s\n' "$observed" | grep -Fx 'RCH_DISABLED=1' >/dev/null &&
+           printf '%s\n' "$observed" | grep -Fx 'RCH_CARGO_WRAPPER_BYPASS=1' >/dev/null &&
+           printf '%s\n' "$observed" | grep -Fx 'RCH_CARGO_WRAPPER_ORIGIN=rch' >/dev/null; then
+            log_pass "$mode Unix native child establishes the paired RCH Cargo markers"
+        else
+            log_fail "$mode Unix native child did not establish the paired RCH Cargo markers"
+        fi
         status=0
         observed=$(env 'PKG_CONFIG_PATH_aarch64-unknown-linux-gnu=/ambient/target-pc' \
-            "$BASH" -c "set -e; $launch" 2>&1) || status=$?
+            "$BASH" -c "set -e; cargo() { env; }; $launch" 2>&1) || status=$?
         if [[ "$status" -eq 4 && "$observed" == *'SDK environment name cannot be isolated by this shell: PKG_CONFIG_PATH_aarch64-unknown-linux-gnu'* ]]; then
             log_pass "$mode Unix refuses inherited SDK names that shell unset silently preserves"
         else
@@ -3390,16 +3401,16 @@ test_windows_rust_sdk_environment() {
         MOCK_LANGUAGE=rust
         MOCK_BUILD_CMD='cargo build --release'
         MOCK_LOCAL_PATH='C:/Users/dsr/projects/tool'
-        MOCK_PLATFORM_ENV=$'OpenSSL_DIR=C:/configured/first\nopenssl_dir=C:/configured/last with spaces\nOPENSSL_STATIC=1\nX86_64_PC_WINDOWS_MSVC_OPENSSL_DIR=C:/configured/target\nPKG_CONFIG=C:/configured/pkg-config\nPKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=C:/configured/pkgconfig\nLIBCLANG_PATH=C:/configured/libclang'
+        MOCK_PLATFORM_ENV=$'OpenSSL_DIR=C:/configured/first\nopenssl_dir=C:/configured/last with spaces\nOPENSSL_STATIC=1\nX86_64_PC_WINDOWS_MSVC_OPENSSL_DIR=C:/configured/target\nPKG_CONFIG=C:/configured/pkg-config\nPKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=C:/configured/pkgconfig\nLIBCLANG_PATH=C:/configured/libclang\nRCH_DISABLED=0\nRCH_CARGO_WRAPPER_BYPASS=0\nRCH_CARGO_WRAPPER_ORIGIN=caller'
         MOCK_SSH_STREAM_FILE="$MOCK_DIR/sdk-windows-$mode-artifact"
         MOCK_ARTIFACT_KIND=pe-amd64 write_mock_artifact "$MOCK_SSH_STREAM_FILE"
         status=0
         if [[ "$mode" == strict ]]; then
             result=$(act_run_native_build tool windows/amd64 v1.0.0 \
                 12345678-1234-4234-8234-123456789abc \
-                C:/build/.dsr-release-snapshots/sdk/source 2>/dev/null) || status=$?
+                C:/build/.dsr-release-snapshots/sdk/source) || status=$?
         else
-            result=$(act_run_native_build tool windows/amd64 v1.0.0 sdk-windows 2>/dev/null) || status=$?
+            result=$(act_run_native_build tool windows/amd64 v1.0.0 sdk-windows) || status=$?
         fi
         cmd=$(get_ssh_cmd)
         first_prefix="${cmd%%"$first_b64"*}"
@@ -3453,10 +3464,12 @@ foreach ($sdkName in @('OPENSSL_DIR', 'OPENSSL_NO_VENDOR', 'X86_64_PC_WINDOWS_MS
     $sdkEnvironment[$sdkName] = 'ambient-value'
 }
 $sdkEnvironment['LIBCLANG_PATH_EXTRA'] = 'preserve'
+$sdkEnvironment['RCH_CARGO_WRAPPER_BYPASS'] = '0'
+$sdkEnvironment['RCH_CARGO_WRAPPER_ORIGIN'] = 'inherited'
 $psi = [pscustomobject]@{ EnvironmentVariables = $sdkEnvironment }
 POWERSHELL
         if [[ "$mode" == strict ]]; then
-            printf '. '\''%s/cargo_context_windows.ps1'\''\n' "$SRC_DIR" >> "$script"
+            printf '. '\''%s/cargo_context_windows.ps1'\''\n' "$_ACT_RUNNER_MODULE_DIR" >> "$script"
             cat >> "$script" <<'POWERSHELL'
 foreach ($sdkName in $sdkEnvironment.Keys) {
     [Environment]::SetEnvironmentVariable($sdkName,$sdkEnvironment[$sdkName],'Process')
@@ -3493,6 +3506,13 @@ POWERSHELL
             log_pass "$mode Windows generated PowerShell removes ambient SDK selectors before configured assignments"
         else
             log_fail "$mode Windows generated SDK cleanup failed: status=$status observed=$observed"
+        fi
+        if [[ "$status" -eq 0 ]] && jq -e '
+            .RCH_DISABLED == "1" and .RCH_CARGO_WRAPPER_BYPASS == "1" and
+            .RCH_CARGO_WRAPPER_ORIGIN == "rch"' <<< "$observed" >/dev/null; then
+            log_pass "$mode Windows native child establishes the paired RCH Cargo markers"
+        else
+            log_fail "$mode Windows native child did not establish the paired RCH Cargo markers"
         fi
     done
 }
@@ -7294,6 +7314,13 @@ test_windows_private_cache_collection() {
 }
 
 main() {
+    if [[ "${1:-}" == --rch-managed-env-only ]]; then
+        test_unix_rust_sdk_environment
+        test_windows_rust_sdk_environment
+        printf 'Managed Cargo environment tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return $?
+    fi
     if [[ "${1:-}" == --glibc-routing-only ]]; then
         test_rust_linux_glibc_floor_command_positions
         test_strict_rust_linux_glibc_floor_ignores_incidental_tokens
