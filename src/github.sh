@@ -188,14 +188,23 @@ _gh_api_attempt() {
     return "$status"
 }
 
-# Generate cache key from endpoint
+# Hash the exact endpoint, including its query. Replacing punctuation with an
+# underscore aliases valid repositories, tags and branch filters. A bounded
+# digest also supports endpoints longer than the filesystem's filename limit.
+# Do not read the old lossy keys: their response/ETag identity is ambiguous.
 _gh_cache_key() {
-    local endpoint="$1"
-    # Create safe filename from endpoint
-    local key="${endpoint//\//_}"
-    # Replace any remaining non-alphanumeric characters with underscore
-    key="${key//[^a-zA-Z0-9_-]/_}"
-    echo "$key"
+    local endpoint="$1" digest
+    if command -v sha256sum >/dev/null 2>&1; then
+        digest=$(printf '%s' "$endpoint" | sha256sum) || return 8
+    elif command -v shasum >/dev/null 2>&1; then
+        digest=$(printf '%s' "$endpoint" | shasum -a 256) || return 8
+    else
+        _gh_log_error "sha256sum or shasum is required for GitHub cache identities"
+        return 3
+    fi
+    digest="${digest%% *}"
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 8
+    printf 'v2-%s\n' "$digest"
 }
 
 # Get cached response if valid
@@ -204,7 +213,7 @@ _gh_cache_key() {
 _gh_get_cache() {
     local endpoint="$1"
     local cache_key
-    cache_key=$(_gh_cache_key "$endpoint")
+    cache_key=$(_gh_cache_key "$endpoint") || return $?
     local cache_file="$GH_CACHE_DIR/${cache_key}.json"
     local meta_file="$GH_CACHE_DIR/${cache_key}.meta"
 
@@ -234,7 +243,7 @@ _gh_get_cache() {
 _gh_get_cache_raw() {
     local endpoint="$1"
     local cache_key
-    cache_key=$(_gh_cache_key "$endpoint")
+    cache_key=$(_gh_cache_key "$endpoint") || return $?
     local cache_file="$GH_CACHE_DIR/${cache_key}.json"
 
     if [[ -f "$cache_file" ]]; then
@@ -251,14 +260,14 @@ _gh_set_cache() {
     local endpoint="$1"
     local etag="${2:-}"
     local cache_key
-    cache_key=$(_gh_cache_key "$endpoint")
+    cache_key=$(_gh_cache_key "$endpoint") || return $?
     local cache_file="$GH_CACHE_DIR/${cache_key}.json"
     local meta_file="$GH_CACHE_DIR/${cache_key}.meta"
 
-    gh_init_cache
+    gh_init_cache || return $?
 
     # Save response
-    cat > "$cache_file"
+    cat > "$cache_file" || return $?
 
     # Save metadata
     {
@@ -271,7 +280,7 @@ _gh_set_cache() {
 _gh_get_etag() {
     local endpoint="$1"
     local cache_key
-    cache_key=$(_gh_cache_key "$endpoint")
+    cache_key=$(_gh_cache_key "$endpoint") || return $?
     local meta_file="$GH_CACHE_DIR/${cache_key}.meta"
 
     if [[ -f "$meta_file" ]]; then
@@ -2140,8 +2149,8 @@ gh_clear_cache() {
 
     if [[ -n "$endpoint" ]]; then
         local cache_key
-        cache_key=$(_gh_cache_key "$endpoint")
-        rm -f "$GH_CACHE_DIR/${cache_key}.json" "$GH_CACHE_DIR/${cache_key}.meta"
+        cache_key=$(_gh_cache_key "$endpoint") || return $?
+        rm -f "$GH_CACHE_DIR/${cache_key}.json" "$GH_CACHE_DIR/${cache_key}.meta" || return $?
         _gh_log_ok "Cleared cache for: $endpoint"
     else
         rm -rf "${GH_CACHE_DIR:?}/"*
