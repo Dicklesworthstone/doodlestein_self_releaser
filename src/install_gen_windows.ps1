@@ -9,6 +9,8 @@ param(
     [switch]$Offline,
     [switch]$Recover,
     [switch]$FromSource,
+    [switch]$AllowSourceBuild,
+    [Nullable[int]]$SourceIfStale = $null,
     [string]$SourceRef = '',
     [int]$SourceTimeout = 3600,
     [switch]$Yes,
@@ -395,7 +397,7 @@ function New-DsrHttpClient {
 
 function Invoke-DsrDownload {
     param([string]$Url, [string]$Destination, [switch]$Optional, [long]$MaximumBytes = 2147483648,
-          [switch]$ApiAsset)
+          [switch]$ApiAsset, [switch]$SourceMetadata)
     $uri = [Uri]$Url
     if ($uri.Scheme -cne 'https' -or $uri.Host -cnotin @('github.com', 'api.github.com') -or
         -not $uri.IsDefaultPort -or $uri.UserInfo -or $uri.Fragment) {
@@ -407,7 +409,18 @@ function Invoke-DsrDownload {
     }
     $token = Get-DsrGitHubToken
     $apiPrefix = ''
-    if ($uri.Host -ceq 'api.github.com') {
+    if ($SourceMetadata) {
+        if ($ApiAsset -or $Optional -or $uri.Host -cne 'api.github.com' -or
+            $uri.AbsolutePath -cnotmatch '^(/repos/[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*/)(commits|commits/tags%2[Ff][A-Za-z0-9._+%\-]+|compare/[0-9a-f]{40}(?:[0-9a-f]{24})?\.\.\.[0-9a-f]{40}(?:[0-9a-f]{24})?)$') {
+            Stop-DsrInstall 'Invalid GitHub source-freshness API scope' 4
+        }
+        $apiPrefix = $Matches[1]
+        $route = $Matches[2]
+        if (($route.StartsWith('commits/tags', [StringComparison]::Ordinal) -and $uri.Query) -or
+            (-not $route.StartsWith('commits/tags', [StringComparison]::Ordinal) -and $uri.Query -cne '?per_page=1')) {
+            Stop-DsrInstall 'Invalid GitHub source-freshness query' 4
+        }
+    } elseif ($uri.Host -ceq 'api.github.com') {
         if ($uri.AbsolutePath -cnotmatch '^(/repos/[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*/releases/)') {
             Stop-DsrInstall 'Invalid GitHub release API scope' 4
         }
@@ -434,6 +447,7 @@ function Invoke-DsrDownload {
                     $deadline.Token).GetAwaiter().GetResult()
                 $status = [int]$response.StatusCode
                 if ($status -in @(301, 302, 303, 307, 308)) {
+                    if ($SourceMetadata) { Stop-DsrInstall 'Source freshness cannot follow redirects' 8 }
                     if ($redirect -eq 5 -or $null -eq $response.Headers.Location) { Stop-DsrInstall 'Invalid or excessive download redirects' 8 }
                     $uri = [Uri]::new($uri, $response.Headers.Location)
                     if ($uri.Scheme -cne 'https' -or -not $uri.IsDefaultPort -or $uri.UserInfo -or $uri.Fragment) {
@@ -487,6 +501,58 @@ function Invoke-DsrDownload {
         Stop-DsrInstall 'GitHub download failed during HTTPS transport' 8 -TransientAcquisition
     } finally { $deadline.Dispose(); $client.Dispose(); $token = '' }
     Stop-DsrInstall 'Download did not complete' 8
+}
+
+# Resolve the observed default branch and annotated release tag to immutable
+# commits before comparing. A paginated commit list is not a distance count.
+# Match Bash's strict threshold and ancestral-history contract: incomplete,
+# denied, malformed or divergent metadata is unknown, never source consent.
+function Get-DsrReleaseFreshness {
+    param([string]$Repository, [string]$Tag, [int]$Threshold, [string]$Directory)
+    $unknown = @{ status = 'unknown'; repository = $Repository; release_version = $Tag;
+        threshold = $Threshold; reason = 'freshness metadata unavailable or invalid' }
+    $api = 'https://api.github.com/repos/' + $Repository
+    try {
+        $root = New-DsrPrivateDirectory ([IO.Path]::Combine($Directory, 'freshness'))
+        $path = [IO.Path]::Combine($root, 'head.json')
+        $null = Invoke-DsrDownload ($api + '/commits?per_page=1') $path -SourceMetadata -MaximumBytes 8388608
+        $heads = ConvertFrom-DsrJson (Read-DsrTextFile $path)
+        if ($heads -isnot [array] -or $heads.Count -ne 1 -or
+            $heads[0] -isnot [System.Collections.IDictionary] -or -not $heads[0].Contains('sha') -or
+            $heads[0].sha -isnot [string] -or $heads[0].sha -cnotmatch '^([0-9a-f]{40}|[0-9a-f]{64})$') { return $unknown }
+        $head = $heads[0].sha
+        $path = [IO.Path]::Combine($root, 'base.json')
+        $null = Invoke-DsrDownload ($api + '/commits/' + [Uri]::EscapeDataString('tags/' + $Tag)) $path -SourceMetadata -MaximumBytes 8388608
+        $baseRow = ConvertFrom-DsrJson (Read-DsrTextFile $path)
+        if ($baseRow -isnot [System.Collections.IDictionary] -or -not $baseRow.Contains('sha') -or
+            $baseRow.sha -isnot [string] -or $baseRow.sha -cnotmatch '^([0-9a-f]{40}|[0-9a-f]{64})$') { return $unknown }
+        $base = $baseRow.sha
+        $path = [IO.Path]::Combine($root, 'compare.json')
+        $null = Invoke-DsrDownload ($api + '/compare/' + $base + '...' + $head + '?per_page=1') $path -SourceMetadata -MaximumBytes 8388608
+        $comparison = ConvertFrom-DsrJson (Read-DsrTextFile $path)
+        if ($comparison -isnot [System.Collections.IDictionary]) { return $unknown }
+        foreach ($name in @('ahead_by', 'behind_by', 'total_commits')) {
+            if (-not $comparison.Contains($name) -or
+                ($comparison[$name] -isnot [long] -and $comparison[$name] -isnot [int]) -or
+                $comparison[$name] -lt 0 -or $comparison[$name] -gt 1000000000) { return $unknown }
+        }
+        foreach ($name in @('base_commit', 'merge_base_commit')) {
+            if (-not $comparison.Contains($name) -or $comparison[$name] -isnot [System.Collections.IDictionary] -or
+                -not $comparison[$name].Contains('sha') -or $comparison[$name].sha -isnot [string] -or
+                $comparison[$name].sha -cne $base) { return $unknown }
+        }
+        if (-not $comparison.Contains('status') -or $comparison.status -isnot [string] -or
+            $comparison.behind_by -ne 0 -or $comparison.total_commits -ne $comparison.ahead_by -or
+            ($head -ceq $base -and ($comparison.status -cne 'identical' -or $comparison.ahead_by -ne 0)) -or
+            ($head -cne $base -and ($comparison.status -cne 'ahead' -or $comparison.ahead_by -le 0))) { return $unknown }
+        return @{ status = $(if ($comparison.ahead_by -gt $Threshold) { 'stale' } else { 'fresh' });
+            repository = $Repository; release_version = $Tag; release_commit = $base; head_commit = $head;
+            commits_behind = $comparison.ahead_by; threshold = $Threshold }
+    } catch {
+        # Transport exceptions may contain URLs. Keep the public decision
+        # stable and credential-free; none of these failures may start Git.
+        return $unknown
+    }
 }
 
 # GitHub's public latest-release redirect does not consume the REST API rate
@@ -1391,13 +1457,43 @@ function Install-DsrExecutableFamily {
         if ($retain) { Stop-DsrInstall ('Installation failed; recovery files retained at ' + $stage) 7 }
     }
 }
+
+function Install-DsrSourceFamily {
+    param($Policy, $Selection, [string]$Platform, [string]$Reference, [string]$Work, [int]$Timeout,
+          [string]$CacheRoot, [string]$PrefixPath, $TransactionIdentity, [switch]$Yes)
+    Write-DsrInstallLog ('Building ' + $Policy.repo + ' at ' + $Reference + '; this is a local source build, not a signed release')
+    $built = Build-DsrSourceFamily $Policy $Selection $Platform $Reference $Work $Timeout
+    # Persist byte evidence before activation. This is a build receipt, not an
+    # assertion that installation completed; failed activation retains it.
+    $history = New-DsrDirectoryChain ([IO.Path]::Combine($CacheRoot, 'source-receipts', $Policy.tool))
+    Assert-DsrCacheCustody $history
+    $receiptPath = [IO.Path]::Combine($history, ($built.receipt.source_commit + '-' + [Guid]::NewGuid().ToString('N') + '.json'))
+    Copy-DsrNewFile ([IO.Path]::Combine($Work, 'source-receipt.json')) $receiptPath
+    $receiptEvidence = Get-DsrFileEvidence $receiptPath
+    $installed = Install-DsrExecutableFamily $built.directory $PrefixPath $Selection.binaries $TransactionIdentity -ExpectedEvidence $built.expected -Yes:$Yes
+    $primary = $Policy.binary_name
+    if (-not $primary.EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase)) { $primary += '.exe' }
+    $primaryRow = @($installed | Where-Object { $_.name.Equals($primary, [StringComparison]::OrdinalIgnoreCase) })[0]
+    $result = @{ tool = $Policy.tool; repository = $Policy.repo; status = 'success'; method = 'source'; signed_release = $false;
+        source = $built.receipt; platform = $Platform;
+        source_receipt = @{ path = $receiptPath; sha256 = $receiptEvidence.sha256; size_bytes = $receiptEvidence.size_bytes };
+        path = $primaryRow.path; binaries = @($installed); signature_verified = $false; exit_code = 0 }
+    if ($built.receipt.language -ceq 'go') { $result.go_target = $built.receipt.go_target }
+    elseif ($built.receipt.language -ceq 'rust') { $result.cargo_target = $built.receipt.cargo_target }
+    else { $result.bun_target = $built.receipt.bun_target }
+    Write-DsrInstallLog ('Installed ' + $Policy.tool + ' from source commit ' + $built.receipt.source_commit + ' (' + $installed.Count + ' executable(s))')
+    return $result
+}
+
 function Invoke-DsrWindowsInstaller {
     [CmdletBinding()]
     param([string]$Version = '', [string]$Prefix = '', [string]$CacheDir = '',
-          [switch]$Offline, [switch]$Recover, [switch]$FromSource, [string]$SourceRef = '', [int]$SourceTimeout = 3600,
+          [switch]$Offline, [switch]$Recover, [switch]$FromSource, [switch]$AllowSourceBuild,
+          [Nullable[int]]$SourceIfStale = $null, [string]$SourceRef = '', [int]$SourceTimeout = 3600,
           [switch]$Yes, [switch]$Json, [switch]$Help)
     $work = ''
     $retainSourceWork = $false
+    $freshness = $null
     $tool = ''
     try {
         if ($PSVersionTable.PSVersion -lt [Version]'7.4') { Stop-DsrInstall 'PowerShell 7.4 or newer is required' 3 }
@@ -1415,6 +1511,8 @@ Options:
   -Offline       No network; requires -Version and complete cached evidence
   -Recover       Restore an interrupted installation offline; requires -Yes
   -FromSource    Explicitly build a configured Rust/Go/Bun family with installed tools
+  -AllowSourceBuild  Consent to the source upgrade selected by -SourceIfStale
+  -SourceIfStale N   After verifying latest release, build its observed head if >N commits behind
   -SourceRef REF Source pin: HEAD, refs/heads/BRANCH, refs/tags/TAG, or full SHA
   -SourceTimeout SECONDS  Per-source-command deadline; default 3600, maximum 86400
   -Yes           Authorize replacement of existing selected executables
@@ -1424,8 +1522,10 @@ Options:
 
 Every selected executable is checked before replacement. Configured release
 signatures require Minisign. Release executables are never run and PATH is not edited.
--FromSource runs repository/dependency build code and produces a local build,
+-FromSource and -AllowSourceBuild run repository/dependency build code and produce a local build,
 not an authenticated signed release. It never installs a compiler automatically.
+-SourceIfStale requires -AllowSourceBuild and latest online mode. Unknown freshness
+keeps the verified release. A failed release integrity check never starts a source build.
 Private releases use DSR_GH_TOKEN, GITHUB_TOKEN, then GH_TOKEN, with Contents read
 permission. Release credentials are scoped to the configured repository's API;
 explicit source fetches use the same token at that repository's HTTPS Git URL.
@@ -1442,7 +1542,8 @@ explicit source fetches use the same token at that repository's HTTPS Git URL.
         if (-not $Prefix) { $Prefix = [IO.Path]::Combine($localAppData, 'Programs', $tool, 'bin') }
         $prefixPath = Get-DsrPlainPath $Prefix
         if ($Recover) {
-            if ($Version -or $Offline -or $CacheDir -or $FromSource -or $SourceRef -or $SourceTimeout -ne 3600) {
+            if ($Version -or $Offline -or $CacheDir -or $FromSource -or $AllowSourceBuild -or
+                $null -ne $SourceIfStale -or $SourceRef -or $SourceTimeout -ne 3600) {
                 Stop-DsrInstall '-Recover cannot be combined with release, cache or source-build options'
             }
             if (-not $Yes) { Stop-DsrInstall '-Recover requires -Yes to restore the previous executable family' 2 }
@@ -1455,11 +1556,22 @@ explicit source fetches use the same token at that repository's HTTPS Git URL.
             else { [Console]::Out.WriteLine($prefixPath) }
             return 0
         }
-        if (-not $FromSource -and ($SourceRef -or $SourceTimeout -ne 3600)) { Stop-DsrInstall 'Source options require explicit -FromSource consent' }
-        if ($FromSource) {
-            if ($Version -or $Offline) { Stop-DsrInstall '-FromSource cannot be combined with -Version or -Offline; select -SourceRef instead' }
+        if (-not $FromSource -and $SourceRef) { Stop-DsrInstall '-SourceRef requires explicit -FromSource consent' }
+        if (-not $FromSource -and -not $AllowSourceBuild -and $SourceTimeout -ne 3600) {
+            Stop-DsrInstall '-SourceTimeout requires explicit source-build consent'
+        }
+        if ($AllowSourceBuild -or $null -ne $SourceIfStale) {
+            if (-not $AllowSourceBuild -or $null -eq $SourceIfStale -or $SourceIfStale -lt 0 -or
+                $SourceIfStale -gt 999999 -or $FromSource -or $Version -or $Offline) {
+                Stop-DsrInstall '-SourceIfStale needs -AllowSourceBuild, 0 through 999999, and latest online release mode'
+            }
+        }
+        if ($FromSource -or $AllowSourceBuild) {
             if (-not $policy.Contains('source')) { Stop-DsrInstall 'This installer has no supported Rust, Go or Bun source policy' 4 }
             if ($SourceTimeout -lt 1 -or $SourceTimeout -gt 86400) { Stop-DsrInstall '-SourceTimeout must be between 1 and 86400 seconds' }
+        }
+        if ($FromSource) {
+            if ($Version -or $Offline) { Stop-DsrInstall '-FromSource cannot be combined with -Version or -Offline; select -SourceRef instead' }
             if (-not $SourceRef) { $SourceRef = 'HEAD' }
         }
         if ($Offline -and -not $Version) { Stop-DsrInstall '-Offline requires an explicit -Version' }
@@ -1473,31 +1585,10 @@ explicit source fetches use the same token at that repository's HTTPS Git URL.
         if ($FromSource) {
             $work = New-DsrPrivateDirectory ([IO.Path]::Combine($cacheRoot, ('.dsr-source-' + [Guid]::NewGuid().ToString('N'))))
             $retainSourceWork = $true
-            Write-DsrInstallLog ('Building ' + $policy.repo + ' at ' + $SourceRef + '; this is a local source build, not a signed release')
-            $built = Build-DsrSourceFamily $policy $selection $platform $SourceRef $work $SourceTimeout
-            # Persist the verified local-build receipt before activation. It
-            # describes compiled bytes, not a claim that installation finished.
-            # A failed update retains both its receipt and private diagnostics.
-            $history = New-DsrDirectoryChain ([IO.Path]::Combine($cacheRoot, 'source-receipts', $tool))
-            Assert-DsrCacheCustody $history
-            $receiptPath = [IO.Path]::Combine($history, ($built.receipt.source_commit + '-' + [Guid]::NewGuid().ToString('N') + '.json'))
-            Copy-DsrNewFile ([IO.Path]::Combine($work, 'source-receipt.json')) $receiptPath
-            $receiptEvidence = Get-DsrFileEvidence $receiptPath
-            $installed = Install-DsrExecutableFamily $built.directory $prefixPath $selection.binaries $transactionIdentity -ExpectedEvidence $built.expected -Yes:$Yes
-            $primary = $policy.binary_name
-            if (-not $primary.EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase)) { $primary += '.exe' }
-            $primaryRow = @($installed | Where-Object { $_.name.Equals($primary, [StringComparison]::OrdinalIgnoreCase) })[0]
-            $result = @{ tool = $tool; repository = $policy.repo; status = 'success'; method = 'source'; signed_release = $false;
-                source = $built.receipt; platform = $platform;
-                source_receipt = @{ path = $receiptPath; sha256 = $receiptEvidence.sha256; size_bytes = $receiptEvidence.size_bytes };
-                path = $primaryRow.path; binaries = @($installed); signature_verified = $false; exit_code = 0 }
-            if ($built.receipt.language -ceq 'go') { $result.go_target = $built.receipt.go_target }
-            elseif ($built.receipt.language -ceq 'rust') { $result.cargo_target = $built.receipt.cargo_target }
-            else { $result.bun_target = $built.receipt.bun_target }
+            $result = Install-DsrSourceFamily $policy $selection $platform $SourceRef $work $SourceTimeout $cacheRoot $prefixPath $transactionIdentity -Yes:$Yes
             $retainSourceWork = $false
-            Write-DsrInstallLog ('Installed ' + $tool + ' from source commit ' + $built.receipt.source_commit + ' (' + $installed.Count + ' executable(s))')
             if ($Json) { [Console]::Out.WriteLine(($result | ConvertTo-Json -Depth 12 -Compress)) }
-            else { [Console]::Out.WriteLine($primaryRow.path) }
+            else { [Console]::Out.WriteLine($result.path) }
             return 0
         }
         $release = $null
@@ -1619,6 +1710,23 @@ explicit source fetches use the same token at that repository's HTTPS Git URL.
         # destination write; an earlier successful hash is not a reservation.
         $null = Get-DsrCacheReceipt $privateRelease $binding $policy.public_key
         Write-DsrInstallVerbose 'Checksum, configured signature, archive and executable admission completed'
+        if ($null -ne $SourceIfStale) {
+            # Verification is complete before any source decision. A stale
+            # release cannot turn bad signature/archive/PE bytes into consent.
+            $freshness = Get-DsrReleaseFreshness $policy.repo $tag $SourceIfStale $work
+            if ($freshness.status -ceq 'stale') {
+                Write-DsrInstallLog ('Release ' + $tag + ' is ' + $freshness.commits_behind + ' commits behind the observed default branch')
+                $retainSourceWork = $true
+                $result = Install-DsrSourceFamily $policy $selection $platform $freshness.head_commit $work $SourceTimeout $cacheRoot $prefixPath $transactionIdentity -Yes:$Yes
+                $retainSourceWork = $false
+                $result.freshness = $freshness
+                if ($Json) { [Console]::Out.WriteLine(($result | ConvertTo-Json -Depth 12 -Compress)) }
+                else { [Console]::Out.WriteLine($result.path) }
+                return 0
+            }
+            if ($freshness.status -ceq 'unknown') { Write-DsrInstallLog 'Freshness unknown; keeping the verified release' }
+            else { Write-DsrInstallVerbose 'Latest release is within the requested commit-distance threshold' }
+        }
         $installed = Install-DsrExecutableFamily $expanded $prefixPath $selection.binaries $transactionIdentity -Yes:$Yes
         $primary = $policy.binary_name
         if (-not $primary.EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase)) { $primary += '.exe' }
@@ -1626,6 +1734,7 @@ explicit source fetches use the same token at that repository's HTTPS Git URL.
         $result = @{ tool = $tool; repository = $policy.repo; status = 'success'; version = $tag; platform = $platform;
             target_triple = $selection.target_triple; path = $primaryRow.path; binaries = @($installed);
             cache = @{ path = $cache; offline = [bool]$Offline }; signature_verified = [bool]$policy.public_key; exit_code = 0 }
+        if ($null -ne $freshness) { $result.freshness = $freshness }
         Write-DsrInstallLog ('Installed ' + $tool + ' ' + $tag + ' (' + $installed.Count + ' executable(s))')
         if ($Json) { [Console]::Out.WriteLine(($result | ConvertTo-Json -Depth 12 -Compress)) }
         else { [Console]::Out.WriteLine($primaryRow.path) }
@@ -1637,6 +1746,7 @@ explicit source fetches use the same token at that repository's HTTPS Git URL.
         if ($Json) {
             $result = @{ tool = $tool; status = 'error'; error = $_.Exception.Message; exit_code = $code }
             if ($retainSourceWork -and $work) { $result.source_diagnostics = $work }
+            if ($null -ne $freshness) { $result.freshness = $freshness }
             [Console]::Out.WriteLine(($result | ConvertTo-Json -Compress))
         }
         return $code

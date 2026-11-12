@@ -331,7 +331,7 @@ jobs:
           bash scripts/tests/test_install_source_family.sh --bun-workspaces-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/bun-workspaces.log"
           bash scripts/tests/test_generated_workspace_installer.sh --go-bun-source-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/go-bun-source-families.log"
           test -z "$(git status --porcelain)"
-      - name: Validate Windows Bun and TypeScript source installation
+      - name: Validate Windows source installation and release freshness
         if: runner.os == 'Linux'
         shell: bash
         env:
@@ -345,6 +345,7 @@ jobs:
           bash -n scripts/tests/test_install_source_windows.sh
           bash scripts/tests/test_install_source_windows.sh --bun-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/windows-bun-source.log"
           bash scripts/tests/test_install_source_windows.sh --bun-workspaces-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/windows-bun-workspaces.log"
+          timeout 120 bash scripts/tests/test_install_source_windows.sh --freshness-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/windows-source-freshness.log"
           test -z "$(git status --porcelain)"
       - name: Validate native compilation, manifests and signed provenance
         shell: bash

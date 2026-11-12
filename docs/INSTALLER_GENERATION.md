@@ -325,6 +325,39 @@ The policy regression exercises the actual configuration and publication naming
 helpers, explicit signing-key scope, executable-family limits and refusal before
 any existing installer or publication history changes.
 
+### Optional stale-release source upgrades on Windows
+
+Generated Windows installers can verify the latest release and build a newer
+source commit when it exceeds an explicitly chosen commit-distance threshold:
+
+```powershell
+.\install.ps1 -AllowSourceBuild -SourceIfStale 10 -Yes -Json
+```
+
+Both freshness flags are required. The threshold is an integer from `0` through
+`999999`; equality keeps the release. Omit `-Version` for latest-release mode.
+`-Offline`, `-Recover`, `-FromSource` and `-SourceRef` cannot be combined with this
+mode. `-Yes` permits replacing existing executables and does not itself consent
+to source execution. Existing Git and the configured compiler are required only
+if a source build is selected; no compiler is provisioned automatically.
+
+The installer completes release checksum, configured Minisign signature,
+archive and PE validation before querying freshness. It then resolves the
+release tag and the observed default-branch head and verifies their ancestral
+comparison through bounded GitHub API requests. Private repositories use the
+same selected token as release acquisition; metadata redirects are refused.
+Unavailable, malformed, denied or divergent metadata reports unknown freshness
+and installs the already verified release. A failed release integrity check
+never selects source.
+
+A stale decision builds the exact observed commit, preserving the pin if the
+branch moves later. The existing source compiler and complete-family installation
+transaction apply, including input rechecks, rollback and a durable unsigned
+build receipt. JSON reports a `freshness` object and identifies a source result
+with `method: "source"` and `signed_release: false`. Failed source compilation
+does not replace the existing installation with a partial family. See the
+explicit source mode below for language requirements and retained diagnostics.
+
 ### Explicit source installation on Windows
 
 A generated installer for `language: rust`, `language: go`, `language: bun` or

@@ -10,6 +10,8 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 dependencies=(pwsh git go cargo rustc minisign python3 jq yq)
 if [[ " $* " == *' --bun-only '* || " $* " == *' --bun-workspaces-only '* ]]; then
     dependencies=(pwsh git bun minisign python3 jq yq)
+elif [[ " $* " == *' --freshness-only '* || " $* " == *' --go-only '* || " $* " == *' --go-workspace-only '* ]]; then
+    dependencies=(pwsh git go minisign python3 jq yq)
 fi
 for dependency in "${dependencies[@]}"; do
     if ! command -v "$dependency" >/dev/null 2>&1; then
@@ -43,6 +45,8 @@ arguments.add_argument("--go-only", action="store_true", help="Run Go source and
 arguments.add_argument("--bun-only", action="store_true", help="Run genuine Bun/TypeScript Windows source installation controls")
 arguments.add_argument("--bun-workspaces-only", action="store_true", help="Run generated Bun workspace source installation controls")
 arguments.add_argument("--bun-baseline-project", type=Path, help="Frozen checkout before Windows Bun source installation")
+arguments.add_argument("--freshness-only", action="store_true", help="Run signed release-first freshness and pinned source-upgrade controls")
+arguments.add_argument("--freshness-baseline-project", type=Path, help="Frozen checkout before Windows freshness source upgrades")
 options = arguments.parse_args()
 project = options.project.resolve()
 root = Path(tempfile.mkdtemp(prefix="dsr-windows-source-", dir=os.environ.get("TMPDIR"))).resolve()
@@ -234,17 +238,86 @@ if (Get-Command Invoke-DsrSourceGit -ErrorAction SilentlyContinue) {
         }
     }
 }
-function Invoke-DsrDownload {
-    param([string]$Url, [string]$Destination, [switch]$Optional, [long]$MaximumBytes = 2147483648, [switch]$ApiAsset)
-    [IO.File]::AppendAllText($script:Fixture.requests, $Url + "`n")
-    if (-not $script:Fixture.downloads.Contains($Url)) {
-        if ($Optional) { return $false }
-        Stop-DsrInstall 'Fixture release HTTP unavailable' 8
+if ($fixture.Contains('http_client_fixture') -and $fixture.http_client_fixture) {
+    # The source upgrade fixture keeps actual request construction, credential
+    # selection, response checks, deadlines and streaming. Only HTTP delivery
+    # is adapted, just as the existing release integration fixture does.
+    Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Net;
+using System.Net.Http;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+public sealed class DsrSourceFixtureHandler : HttpMessageHandler {
+    private readonly JsonElement fixture;
+    public DsrSourceFixtureHandler(string path) {
+        using (JsonDocument document = JsonDocument.Parse(File.ReadAllText(path))) {
+            fixture = document.RootElement.Clone();
+        }
     }
-    $source = $script:Fixture.downloads[$Url]
-    if ([IO.FileInfo]::new($source).Length -gt $MaximumBytes) { Stop-DsrInstall 'Fixture exceeds download size limit' 7 }
-    Copy-DsrNewFile $source $Destination
-    return $true
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken token) {
+        token.ThrowIfCancellationRequested();
+        string url = request.RequestUri.AbsoluteUri;
+        string authorization = request.Headers.Authorization == null ? "" : request.Headers.Authorization.Parameter;
+        string authorizationHash = authorization.Length == 0 ? "" : Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(authorization))).ToLowerInvariant();
+        File.AppendAllText(fixture.GetProperty("requests").GetString(), JsonSerializer.Serialize(new {
+            url, authorization_sha256 = authorizationHash,
+            authorization_scheme = request.Headers.Authorization == null ? "" : request.Headers.Authorization.Scheme,
+            method = request.Method.Method, accept = request.Headers.Accept.ToString(),
+            user_agent = request.Headers.UserAgent.ToString()
+        }) + "\n");
+        if (fixture.TryGetProperty("expected_token", out JsonElement expected) && request.RequestUri.Host == "api.github.com" &&
+            authorization != expected.GetString()) {
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.Unauthorized));
+        }
+        if (request.RequestUri.Host != "api.github.com" && authorization.Length != 0) {
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.BadRequest));
+        }
+        if (fixture.TryGetProperty("transport_failures", out JsonElement failures) && failures.TryGetProperty(url, out JsonElement failure)) {
+            if (failure.GetString() == "timeout") { throw new OperationCanceledException("Injected response deadline"); }
+            throw new HttpRequestException("Injected HTTPS transport failure");
+        }
+        if (fixture.TryGetProperty("statuses", out JsonElement statuses) && statuses.TryGetProperty(url, out JsonElement status)) {
+            return Task.FromResult(new HttpResponseMessage((HttpStatusCode)status.GetInt32()));
+        }
+        if (fixture.TryGetProperty("redirects", out JsonElement redirects) && redirects.TryGetProperty(url, out JsonElement location)) {
+            var response = new HttpResponseMessage(HttpStatusCode.Redirect);
+            response.Headers.Location = new Uri(location.GetString(), UriKind.RelativeOrAbsolute);
+            return Task.FromResult(response);
+        }
+        if (fixture.GetProperty("downloads").TryGetProperty(url, out JsonElement source)) {
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) {
+                Content = new ByteArrayContent(File.ReadAllBytes(source.GetString()))
+            });
+        }
+        return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+    }
+}
+'@
+    $script:FixturePath = $CasePath
+    function New-DsrHttpClient {
+        $client = [Net.Http.HttpClient]::new([DsrSourceFixtureHandler]::new($script:FixturePath), $true)
+        $client.Timeout = [Threading.Timeout]::InfiniteTimeSpan
+        return $client
+    }
+} else {
+    function Invoke-DsrDownload {
+        param([string]$Url, [string]$Destination, [switch]$Optional, [long]$MaximumBytes = 2147483648,
+              [switch]$ApiAsset, [switch]$SourceMetadata)
+        [IO.File]::AppendAllText($script:Fixture.requests, $Url + "`n")
+        if (-not $script:Fixture.downloads.Contains($Url)) {
+            if ($Optional) { return $false }
+            Stop-DsrInstall 'Fixture release HTTP unavailable' 8
+        }
+        $source = $script:Fixture.downloads[$Url]
+        if ([IO.FileInfo]::new($source).Length -gt $MaximumBytes) { Stop-DsrInstall 'Fixture exceeds download size limit' 7 }
+        Copy-DsrNewFile $source $Destination
+        return $true
+    }
 }
 if ($fixture.Contains('move_fault') -and $fixture.move_fault) {
     $script:Moves = 0
@@ -298,6 +371,203 @@ def calls(fixture):
 def no_http(fixture):
     path = Path(fixture["requests"])
     return not path.exists() or not path.read_bytes()
+
+
+def test_release_freshness():
+    tagged, tagged_result, tagged_fixture = invoke("freshness-release-source")
+    check("real Go compilation supplies the pinned annotated-tag release family", tagged.returncode == 0 and
+          tagged_result.get("source", {}).get("source_commit") == first_commit,
+          tagged.stderr.decode(errors="replace"))
+    if tagged.returncode:
+        return
+    release_prefix = Path(tagged_fixture["parameters"]["Prefix"])
+    original = {name: digest(release_prefix / name) for name in ("app.exe", "helper.exe")}
+    asset = policy["platforms"]["windows/amd64"]["name"].replace("${version}", "1.2.3")
+    api = "https://api.github.com/repos/fixture/source-demo"
+    head_url = api + "/commits?per_page=1"
+    base_url = api + "/commits/tags%2Fv1.2.3"
+    compare_url = api + "/compare/" + first_commit + "..." + second_commit + "?per_page=1"
+
+    def metadata(name, value, *, raw=False):
+        path = root / ("freshness-" + name + ".json")
+        path.write_text(value if raw else json.dumps(value))
+        return str(path)
+
+    def release(label, kind="good"):
+        directory = root / ("freshness-release-" + label)
+        directory.mkdir()
+        archive = directory / asset
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as package:
+            for name in original:
+                data = (release_prefix / name).read_bytes()
+                if kind == "wrong-machine" and name == "app.exe":
+                    data = bytearray(data)
+                    offset = struct.unpack_from("<I", data, 60)[0]
+                    struct.pack_into("<H", data, offset + 4, 0xAA64)
+                package.writestr(name, data)
+            if kind == "unsafe-archive":
+                package.writestr("../escape.exe", b"untrusted member")
+        checksum = directory / "SHA256SUMS"
+        checksum.write_text(("0" * 64 if kind == "bad-checksum" else digest(archive)) + "  " + asset + "\n")
+        signature = directory / (asset + ".minisig")
+        required(["minisign", "-S", "-s", root / "key.sec", "-m", archive, "-x", signature], "sign-freshness-" + label)
+        if kind == "bad-signature":
+            signature.write_text("invalid signature fixture\n")
+        base = "https://github.com/fixture/source-demo/releases/download/v1.2.3/"
+        downloads = {base + path.name: str(path) for path in (archive, checksum, signature)}
+        downloads[api + "/releases/latest"] = metadata(label + "-release", {
+            "id": 4242, "tag_name": "v1.2.3", "draft": False, "prerelease": False})
+        rows = []
+        for index, path in enumerate((archive, checksum, signature), start=1):
+            rows.append({"id": index, "name": path.name, "state": "uploaded", "size": path.stat().st_size})
+            downloads[api + "/releases/assets/" + str(index)] = str(path)
+        downloads[api + "/releases/4242/assets?per_page=100&page=1"] = metadata(label + "-assets", rows)
+        return downloads
+
+    comparison = {"base_commit": {"sha": first_commit}, "merge_base_commit": {"sha": first_commit},
+                  "ahead_by": 1, "behind_by": 0, "total_commits": 1, "status": "ahead", "commits": []}
+    downloads = release("good")
+    downloads.update({head_url: metadata("head", [{"sha": second_commit}]),
+                      base_url: metadata("base", {"sha": first_commit}),
+                      compare_url: metadata("compare", comparison)})
+    parameters = {"FromSource": False, "SourceRef": "", "SourceTimeout": 60,
+                  "AllowSourceBuild": True, "SourceIfStale": 0}
+
+    def run(label, *, params=None, selected=runtime, payload=None, **changes):
+        selected_params = dict(parameters)
+        selected_params.update(params or {})
+        return invoke("freshness-" + label, parameters=selected_params, selected_runtime=selected,
+                      downloads=downloads if payload is None else payload, http_client_fixture=True, **changes)
+
+    def requests(fixture):
+        path = Path(fixture["requests"])
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def release_installed(result, fixture):
+        prefix = Path(fixture["parameters"]["Prefix"])
+        return result.get("version") == "v1.2.3" and result.get("signature_verified") is True and \
+            all((prefix / name).is_file() and digest(prefix / name) == value for name, value in original.items())
+
+    if options.freshness_baseline_project:
+        prior, prior_runtime, prior_policy = generate("source-demo", "freshness-baseline-generate",
+            checkout=options.freshness_baseline_project.resolve(), destination=root / "freshness-baseline-generated")
+        before, _, before_fixture = run("baseline", selected=prior_runtime)
+        check("same fixture proves frozen baseline lacks opt-in stale-release upgrade", prior.returncode == 0 and
+              prior_policy == policy and before.returncode != 0 and b"AllowSourceBuild" in before.stderr and
+              not calls(before_fixture) and no_http(before_fixture))
+
+    ordinary, ordinary_result, ordinary_fixture = run("ordinary", params={"AllowSourceBuild": False,
+        "SourceIfStale": None, "SourceTimeout": 3600})
+    check("ordinary latest mode verifies the signed family without freshness requests or source execution",
+          ordinary.returncode == 0 and release_installed(ordinary_result, ordinary_fixture) and not calls(ordinary_fixture) and
+          head_url not in [row["url"] for row in requests(ordinary_fixture)], ordinary.stderr.decode(errors="replace"))
+    if ordinary.returncode:
+        return
+    installed_prefix = Path(ordinary_fixture["parameters"]["Prefix"])
+    fresh, fresh_result, fresh_fixture = run("threshold", params={"SourceIfStale": 1})
+    check("distance equal to the threshold keeps actual signed release bytes without compiling",
+          fresh.returncode == 0 and release_installed(fresh_result, fresh_fixture) and not calls(fresh_fixture) and
+          fresh_result.get("freshness", {}).get("status") == "fresh" and
+          fresh_result["freshness"].get("commits_behind") == 1, fresh.stderr.decode(errors="replace"))
+
+    # Real upstream advances after the observed API head. Source installation
+    # must fetch the exact observed second commit, never resolve HEAD again.
+    (upstream / "project/apps/primary/main.go").write_text(files["project/apps/primary/main.go"].replace("v1", "v3"))
+    required(["git", "-C", upstream, "add", "."], "freshness-moving-head-add")
+    required(["git", "-C", upstream, "commit", "--quiet", "-m", "Head moves after freshness observation"], "freshness-moving-head-commit")
+    advanced_head = required(["git", "-C", upstream, "rev-parse", "HEAD"], "freshness-moving-head-pin")
+    token = "dsr-freshness-private-fixture"
+    credentials = {"DSR_GH_TOKEN": token, "GITHUB_TOKEN": "fixture-other-github", "GH_TOKEN": "fixture-other-gh"}
+    stale, stale_result, stale_fixture = run("stale-private", extra=credentials, expected_token=token)
+    check("verified stale private release builds the exact observed pin after the live branch advances",
+          stale.returncode == 0 and stale_result.get("method") == "source" and
+          stale_result.get("source", {}).get("source_commit") == second_commit and advanced_head != second_commit and
+          stale_result["source"].get("requested_ref") == second_commit, stale.stderr.decode(errors="replace"))
+    if stale.returncode:
+        return
+    source_prefix = Path(stale_fixture["parameters"]["Prefix"])
+    check("real compiled x64 PE family contains the observed source and binds every installed byte",
+          {row["name"] for row in stale_result["binaries"]} == set(original) and
+          b"primary-v2" in (source_prefix / "app.exe").read_bytes() and
+          b"primary-v3" not in (source_prefix / "app.exe").read_bytes() and all(
+              machine(source_prefix / row["name"]) == 0x8664 and digest(source_prefix / row["name"]) == row["sha256"] and
+              (source_prefix / row["name"]).stat().st_size == row["size_bytes"] for row in stale_result["binaries"]))
+    check("source upgrade records comparison and durable unsigned provenance without the old release version",
+          stale_result.get("signed_release") is False and stale_result.get("signature_verified") is False and
+          "version" not in stale_result and stale_result["freshness"] == {
+              "status": "stale", "repository": "fixture/source-demo", "release_version": "v1.2.3",
+              "release_commit": first_commit, "head_commit": second_commit, "commits_behind": 1, "threshold": 0} and
+          json.loads(Path(stale_result["source_receipt"]["path"]).read_text()) == stale_result["source"])
+    observed = requests(stale_fixture)
+    credential_hash = hashlib.sha256(token.encode()).hexdigest()
+    check("private release and all three freshness requests use only the selected repository credential",
+          all(row["authorization_sha256"] == credential_hash and row["authorization_scheme"] == "Bearer" and
+              row["url"].startswith(api + "/") for row in observed) and
+          [row["url"] for row in observed][-3:] == [head_url, base_url, compare_url] and
+          all("doodlestein_self_releaser" in row["user_agent"] for row in observed) and
+          token not in (stale.stdout + stale.stderr).decode(errors="replace") and
+          token not in Path(stale_fixture["commands"]).read_text())
+    fetches = [row["arguments"] for row in calls(stale_fixture) if "fetch" in row["arguments"]]
+    check("actual Git fetch receives the immutable observed SHA and no moving source selector",
+          len(fetches) == 1 and fetches[0][-1] == second_commit and "HEAD" not in fetches[0])
+
+    unknowns = [
+        ("denied", None, None, {"statuses": {head_url: 403}}),
+        ("empty-head", head_url, [], {}),
+        ("object-head", head_url, {"sha": second_commit}, {}),
+        ("invalid-tag", base_url, {"sha": "not-a-commit"}, {}),
+        ("diverged", compare_url, {**comparison, "status": "diverged", "behind_by": 1}, {}),
+        ("wrong-base", compare_url, {**comparison, "merge_base_commit": {"sha": second_commit}}, {}),
+        ("wrong-count", compare_url, {**comparison, "total_commits": 2}, {}),
+        ("boolean-count", compare_url, {**comparison, "ahead_by": True}, {}),
+        ("duplicate-keys", compare_url, '{"status":"ahead","status":"identical"}', {"raw": True}),
+        ("redirect", None, None, {"redirects": {head_url: "https://example.invalid/untrusted-source"}}),
+        ("transport-timeout", None, None, {"transport_failures": {head_url: "timeout"}}),
+    ]
+    for label, url, value, controls in unknowns:
+        selected = dict(downloads)
+        controls = dict(controls)
+        if url:
+            selected[url] = metadata(label, value, raw=controls.pop("raw", False))
+        outcome, result, fixture = run("unknown-" + label, payload=selected, **controls)
+        check(label + " metadata keeps the verified release and never starts Git or a compiler",
+              outcome.returncode == 0 and release_installed(result, fixture) and not calls(fixture) and
+              result.get("freshness", {}).get("status") == "unknown" and
+              all(row["url"].startswith(api + "/") or row["url"].startswith("https://github.com/fixture/source-demo/")
+                  for row in requests(fixture)), outcome.stderr.decode(errors="replace"))
+
+    for label, values in (
+        ("missing-consent", {"AllowSourceBuild": False}), ("missing-threshold", {"SourceIfStale": None}),
+        ("exact-version", {"Version": "v1.2.3"}), ("offline", {"Offline": True}),
+        ("explicit-source", {"FromSource": True}), ("moving-selector", {"SourceRef": "HEAD"}),
+        ("negative-threshold", {"SourceIfStale": -1}), ("large-threshold", {"SourceIfStale": 1000000}),
+        ("invalid-timeout", {"SourceTimeout": 0}), ("recovery", {"Recover": True}),
+    ):
+        refused, _, fixture = run("invalid-" + label, params=values)
+        check(label + " is refused before HTTP, Git, compilation or installation", refused.returncode == 4 and
+              no_http(fixture) and not calls(fixture) and not Path(fixture["parameters"]["Prefix"]).exists(),
+              refused.stderr.decode(errors="replace"))
+    for kind in ("bad-checksum", "bad-signature", "unsafe-archive", "wrong-machine"):
+        selected = dict(downloads)
+        selected.update(release(kind, kind))
+        refused, _, fixture = run(kind, payload=selected, params={"Prefix": str(installed_prefix)})
+        check(kind + " refuses before freshness and preserves every previously installed executable",
+              refused.returncode == 7 and not calls(fixture) and
+              head_url not in [row["url"] for row in requests(fixture)] and
+              all(digest(installed_prefix / name) == value for name, value in original.items()),
+              refused.stderr.decode(errors="replace"))
+    rolled_back, rolled_result, _ = run("rollback", params={"Prefix": str(installed_prefix)}, move_fault=True)
+    check("failed source-family replacement restores every old executable and retains source diagnostics",
+          rolled_back.returncode == 7 and all(digest(installed_prefix / name) == value for name, value in original.items()) and
+          Path(rolled_result.get("source_diagnostics", "/nonexistent")).is_dir() and
+          rolled_result.get("freshness", {}).get("status") == "stale", rolled_back.stderr.decode(errors="replace"))
+
+
+if options.freshness_only:
+    test_release_freshness()
+    print(f"Windows release freshness checks: {passed} passed, {failed} failed", flush=True)
+    print("Portable PowerShell, real Git/Go/Minisign and adapted HTTP delivery; native Windows and live GitHub remain unqualified.", flush=True)
+    raise SystemExit(1 if failed else 0)
 
 
 def test_bun_sources():

@@ -2096,7 +2096,8 @@ validates configuration without creating installer output or publication locks.
 The generated script supports public GitHub releases and requires PowerShell
 7.4+ on native Windows. It accepts
 `-Version`, `-Prefix`, `-CacheDir`, `-Offline`, `-Recover`, `-FromSource`,
-`-SourceRef`, `-SourceTimeout`, `-Yes`, `-Json`, `-Verbose` and `-Help`.
+`-AllowSourceBuild`, `-SourceIfStale`, `-SourceRef`, `-SourceTimeout`, `-Yes`,
+`-Json`, `-Verbose` and `-Help`.
 Offline release installation requires an explicit version and uses only cached
 payload/checksum/signature evidence. Checksums are mandatory; a configured
 Minisign key is also mandatory at verification, including on cache hits. Complete
@@ -2132,9 +2133,32 @@ executable changes. Expected output hashes remain bound through the existing
 journaled family installation and recovery path. Failed builds retain private
 diagnostics and leave installed executables untouched.
 
-`-FromSource` cannot be combined with `-Version`, `-Offline` or `-Recover`.
-Source options without `-FromSource` are refused. Release acquisition, checksum
-and signature failures never invoke a source build. `-SourceTimeout` is a
+For an optional source upgrade after verifying the latest release:
+
+```powershell
+.\install.ps1 -AllowSourceBuild -SourceIfStale 10 -Yes -Json
+```
+
+The paired flags require online latest-release mode, a supported source policy,
+and an integer threshold from `0` through `999999`. Only a release more than
+that many commits behind the observed default-branch head selects source.
+Checksums, configured signatures, archive members and PE architecture are
+verified before any freshness query or source build. The authenticated,
+bounded GitHub queries resolve the tag and observed head to immutable commits
+and require a consistent ancestral comparison. Unknown, denied, redirected,
+malformed or divergent metadata keeps the verified release. A stale decision
+builds the exact observed head, even if the branch subsequently moves, using
+the same complete-family transaction and durable unsigned source receipt as
+`-FromSource`. JSON includes `freshness`, with its decision and, when known,
+commit distance and pinned commits. Source-build failures leave the previous
+installation intact and retain diagnostics; they do not activate a partial family.
+
+`-FromSource` cannot be combined with `-Version`, `-Offline`, `-Recover` or the
+freshness flags. `-SourceRef` requires `-FromSource`; it cannot override the
+observed freshness commit. `-SourceTimeout` requires either explicit source
+mode or the paired freshness flags. `-Yes` authorizes replacement only.
+Release acquisition, checksum and signature failures never invoke a source
+build. `-SourceTimeout` is a
 per-Git/compiler-command deadline, including
 redirected output draining: default 3600 seconds, range 1..86400. A timeout
 prevents installation. Cleanup does not claim custody of child processes already
