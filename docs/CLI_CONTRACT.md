@@ -575,6 +575,13 @@ failed reads and identity changes preserve the failed attempt without consuming
 its retry budget. Report-only mode does not query or launch these retries, and
 dry-run can describe an eligible retry without changing its journal or outputs.
 
+Explicit cancellation during an upstream recovery lookup returns exit `5` and
+stops the poll in both once and continuous mode. It withdraws all candidates
+from that poll, including earlier verified recovery responses and newly observed
+queues, without spending retry budget or changing pending work. The same rule
+applies to dry-run planning. Ordinary unreadable responses still defer only the
+affected retained run and permit independently confirmed work to proceed.
+
 A network failure in the aggregate throttle check retains its error status and
 exponential polling backoff, but does not block recovery for every other
 repository. The watcher discards that failed check's run inventory and considers

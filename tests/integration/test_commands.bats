@@ -952,7 +952,7 @@ if [[ "$1" == api && "$2" == repos/Dicklesworthstone/ntm/actions/runs/12345 ]]; 
     printf '%s\n' "$*" >> "$TEST_TMPDIR/watch-upstream.calls"
     [[ "${DSR_WATCH_UPSTREAM_ERROR:-false}" != true ]] || exit 1
     cat "$TEST_TMPDIR/watch-upstream.json"
-    exit 0
+    exit "${DSR_WATCH_UPSTREAM_STATUS:-0}"
 fi
 printf 'Unexpected watcher API call: %s\n' "$*" >&2
 exit 99
@@ -1873,6 +1873,109 @@ EOF
     assert_equal "$request_count" "$(wc -l < "$TEST_TMPDIR/watch-upstream.calls" | tr -d ' ')"
     assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
     [[ ! -e "$DSR_STATE_DIR/watch-artifacts/12345" ]]
+}
+
+@test "watch recovery cancellation stops pending admission and preserves the journal" {
+    _watch_pending_fixture
+    _mock_watch_upstream_run "$(_watch_upstream_run_json completed failure)"
+    local before check_json cancelled continuous polls
+    before=$(cat "$DSR_STATE_DIR/triggered.json")
+    check_json=$(_watch_multiple_runs_json | jq '.details.throttled |= [.[2]]')
+    polls=$(wc -l < "$TEST_TMPDIR/watch-check.polls" | tr -d ' ')
+    # The cancelled API process emits a valid failure response first. Neither
+    # those partial bytes nor the newly observed queue may authorize a worker.
+    for cancelled in 2 5 130 143; do
+        continuous=0
+        [[ "$cancelled" != 143 ]] || continuous=1
+        DSR_WATCH_UPSTREAM_STATUS="$cancelled" DSR_WATCH_FIXTURE_CONTINUOUS="$continuous" \
+            run --separate-stderr _routing_watch "$check_json" --auto-fallback
+        assert_equal 5 "$status"
+        assert_contains "$stderr" "Upstream recovery inspection interrupted"
+        jq -e '.command == "watch" and .status == "error" and .exit_code == 5 and
+            .details.triggered_state.pending["12345"] != null and
+            .details.triggered_state.attempts["12347"] == null' <<< "$output"
+        assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+        assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+        [[ ! -e "$DSR_STATE_DIR/watch-artifacts/12345" && ! -e "$DSR_STATE_DIR/watch-artifacts/12347" ]]
+    done
+    assert_equal "$((polls + 4))" "$(wc -l < "$TEST_TMPDIR/watch-check.polls" | tr -d ' ')"
+    assert_equal 4 "$(wc -l < "$TEST_TMPDIR/watch-upstream.calls" | tr -d ' ')"
+    # An ordinary unreadable retained run still permits independent confirmed
+    # work. This also proves cancellation released the watcher mutex.
+    DSR_WATCH_UPSTREAM_ERROR=true run _routing_watch "$check_json" --auto-fallback
+    assert_equal 0 "$status"
+    _watch_completed 12347
+    jq -e '.pending["12345"] != null and .attempts["12345"] == null and
+        .attempts["12347"].attempt == 1' "$DSR_STATE_DIR/triggered.json"
+    assert_equal 2 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+}
+
+@test "watch recovery cancellation preserves failed attempts and dry-run state" {
+    harness_create_config
+    _watch_configure_ntm
+    DSR_WATCH_FIXTURE_STATUS=8 run _routing_watch "$(_watch_run_json)" --auto-fallback --retry-delay 1
+    assert_equal 0 "$status"
+    _watch_completed
+    run _routing_watch '{"details":{"throttled":[]}}' --retry-delay 1
+    assert_equal 0 "$status"
+    _mock_watch_upstream_run "$(_watch_upstream_run_json completed timed_out)"
+    local before check_json mode
+    before=$(cat "$DSR_STATE_DIR/triggered.json")
+    check_json=$(_watch_multiple_runs_json | jq '.details.throttled |= [.[2]]')
+    sleep 1
+    for mode in real preview; do
+        local -a options=(--auto-fallback --retry-delay 1)
+        [[ "$mode" != preview ]] || options+=(--dry-run)
+        DSR_WATCH_UPSTREAM_STATUS=2 run --separate-stderr _routing_watch "$check_json" "${options[@]}"
+        assert_equal 5 "$status"
+        jq -e '.exit_code == 5 and .details.triggered_state.attempts["12345"].status == "failed" and
+            .details.triggered_state.attempts["12345"].attempt == 1' <<< "$output"
+        assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+        [[ "$stderr" != *"Would trigger fallback"* ]]
+        assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    done
+}
+
+@test "watch recovery cancellation withdraws earlier verified recovery candidates" {
+    harness_create_config
+    _watch_configure_ntm
+    local queued first_status before check_json
+    queued=$(_watch_multiple_runs_json | jq '.details.throttled |= [.[2], .[0], .[1]]')
+    DSR_WATCH_FIXTURE_WAIT="$DSR_STATE_DIR/finish-child" \
+        run _routing_watch "$queued" --auto-fallback --max-concurrent 1
+    first_status=$status
+    touch "$DSR_STATE_DIR/finish-child"
+    _watch_completed 12347
+    assert_equal 0 "$first_status"
+    run _routing_watch '{"details":{"throttled":[]}}'
+    assert_equal 0 "$status"
+    before=$(cat "$DSR_STATE_DIR/triggered.json")
+    jq -e '(.pending | keys) == ["12345","12346"] and .attempts["12347"].status == "succeeded"' <<< "$before"
+    _watch_upstream_run_json completed failure > "$TEST_TMPDIR/watch-upstream.json"
+    export GH_MAX_RETRIES=1 GH_RETRY_DELAY=0
+    mock_command_script gh 'if [[ "$1" == auth ]]; then
+        [[ "${2:-}" != token ]] || printf "%s\n" dsr-offline-integration-fixture
+        exit 0
+    fi
+    if [[ "$1" == api ]]; then
+        printf "%s\n" "$2" >> "$TEST_TMPDIR/watch-upstream.calls"
+        case "$2" in
+            repos/Dicklesworthstone/ntm/actions/runs/12345)
+                cat "$TEST_TMPDIR/watch-upstream.json"; exit 0 ;;
+            repos/Dicklesworthstone/ntm/actions/runs/12346)
+                jq ".id=12346 | .head_branch=\"v1.2.4\"" "$TEST_TMPDIR/watch-upstream.json"; exit 2 ;;
+        esac
+    fi
+    exit 99'
+    check_json=$(_watch_run_json | jq '.details.throttled[0] |= . + {run_id:12348,head_branch:"v1.2.6"}')
+    run --separate-stderr _routing_watch "$check_json" --auto-fallback
+    assert_equal 5 "$status"
+    assert_contains "$stderr" "Upstream recovery inspection interrupted for run 12346"
+    assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    assert_equal 2 "$(wc -l < "$TEST_TMPDIR/watch-upstream.calls" | tr -d ' ')"
+    jq -e '.exit_code == 5 and (.details.triggered_state.pending | keys) == ["12345","12346"] and
+        (.details.triggered_state.attempts | keys) == ["12347"]' <<< "$output"
 }
 
 @test "watch terminal recovery retains cooldown and does not spend attempts on skipped polls" {

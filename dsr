@@ -2283,7 +2283,7 @@ _watch_configured_repo_matches() {
 _watch_terminal_retry_runs() {
     local state="$1" check_output="$2" now="$3" candidates candidate record
     local include_pending="${4:-true}"
-    local run_id tool repo observed conclusion pending
+    local run_id tool repo observed conclusion pending observed_status
     candidates=$(printf '%s\n' "$state" "$check_output" | jq -sc \
         --argjson now "$now" --argjson maximum "$_WATCH_MAX_ATTEMPTS" --argjson include_pending "$include_pending" '
         . as $inputs | ($inputs[1].details.throttled | map(.run_id | tostring)) as $observed |
@@ -2303,7 +2303,16 @@ _watch_terminal_retry_runs() {
         repo=$(jq -r .repo <<< "$record") || return 4
         pending=$(jq -r .pending <<< "$candidate") || return 4
         _watch_configured_repo_matches "$tool" "$repo" "$run_id" || continue
-        if ! observed=$(gh_api "repos/$repo/actions/runs/$run_id" --no-cache); then
+        observed_status=0
+        observed=$(gh_api "repos/$repo/actions/runs/$run_id" --no-cache) || observed_status=$?
+        if ((observed_status != 0)); then
+            case "$observed_status" in
+                2|5|129|130|131|143)
+                    # Withdraw every candidate from this poll, including
+                    # earlier recovery responses and newly observed queues.
+                    log_error "Upstream recovery inspection interrupted for run $run_id"
+                    return 5 ;;
+            esac
             log_warn "Cannot verify upstream run $run_id; retaining its fallback candidate for a later check"
             continue
         fi
