@@ -367,7 +367,11 @@ function ConvertTo-DsrCacheCanonicalJson {
     }
     if ($Value -is [Collections.IDictionary] -or $Value -is [pscustomobject]) {
         if ($Value -is [Collections.IDictionary]) { $keys = [string[]]@($Value.Keys) }
-        else { $keys = [string[]]@($Value.PSObject.Properties.Name) }
+        else {
+            # JSON round-trips empty maps to PSCustomObject. Enumerating each
+            # property also handles zero properties under StrictMode.
+            $keys = [string[]]@($Value.PSObject.Properties | ForEach-Object { $_.Name })
+        }
         [Array]::Sort($keys, [StringComparer]::Ordinal)
         $members = foreach ($key in $keys) {
             # Assignment outside the branch preserves empty arrays; pipeline

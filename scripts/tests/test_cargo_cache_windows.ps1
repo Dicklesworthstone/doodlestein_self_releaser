@@ -509,6 +509,14 @@ $null = Invoke-DsrCargoCache -Operation verify -First $f.Private -Second $cold.r
 Assert-Check 'empty cache inventory can be authenticated' $true
 Assert-Check 'empty cache receipts preserve arrays rather than null values' (
     [IO.File]::ReadAllText($cold.receipt_path).Contains('"inventory":{"caches":[],"directories":[],"files":[]}'))
+$emptyObservationJson = '{"array":[],"native_environment":{},"null":null,"selection":{"values":{}}}'
+$emptyObservation = ConvertFrom-Json $emptyObservationJson
+Assert-Check 'canonical JSON preserves empty observed maps through receipt roundtrips' (
+    (ConvertTo-DsrCacheCanonicalJson $emptyObservation) -ceq $emptyObservationJson)
+Assert-Check 'an empty observed object stays distinct from null and an empty array' (
+    (ConvertTo-DsrCacheCanonicalJson (ConvertFrom-Json '{}')) -ceq '{}' -and
+    (ConvertTo-DsrCacheCanonicalJson @()) -ceq '[]' -and
+    (ConvertTo-DsrCacheCanonicalJson $null) -ceq 'null')
 Assert-Refused 'an explicitly missing ambient cache fails closed' {
     Invoke-DsrCargoCache -Operation snapshot -First (Join-Path $f.Root 'missing') -Second (Join-Path $f.Root 'missing-private')
 }
