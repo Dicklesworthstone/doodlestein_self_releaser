@@ -194,7 +194,13 @@ class DiskFloor(unittest.TestCase):
         self.assertEqual(result['status'], 'warning')
         self.assertEqual(result['root']['status'], 'error')
         self.assertEqual(result['root']['admitted_as'], 'warning')
-        self.assertEqual(result['build_root']['status'], 'ok')
+        build_root = result['build_root']
+        self.assertEqual(build_root['min_free_bytes'], MINIMUM)
+        self.assertGreaterEqual(build_root['available_bytes'], MINIMUM)
+        # This is a real filesystem: enough free bytes do not imply <=90%
+        # usage. Retain the exact independent warning classification.
+        self.assertEqual(build_root['status'],
+                         'warning' if build_root['usage_percent'] > 90 else 'ok')
 
     def test_split_contract_keeps_its_explicit_root_floor(self):
         self.require_room()
@@ -948,6 +954,26 @@ class ApfsCapacity(unittest.TestCase):
                 self.document['Containers'].append(other)
                 with self.assertRaises(ValueError):
                     self.bind()
+
+    def test_unrelated_duplicate_uuids_do_not_change_selected_capacity(self):
+        baseline = self.accepted(self.bind())
+        for ref in ('disk5', 'disk14'):
+            other = copy.deepcopy(self.document['Containers'][0])
+            other.update(ContainerReference=ref,
+                         APFSContainerUUID='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee')
+            other['Volumes'] = [dict(other['Volumes'][0], DeviceIdentifier=ref + 's1')]
+            self.document['Containers'].append(other)
+        # The complete inventory still contains both cloned UUIDs, but neither
+        # participates in the selected disk3 pool. No capacity or role changes.
+        self.assertEqual(self.accepted(self.bind()), baseline)
+        original = self.infos['20']
+        for ref in ('disk5', 'disk14'):
+            with self.subTest(selected=ref):
+                self.infos['20'] = dict(FilesystemType='apfs', DeviceIdentifier=ref + 's1',
+                                        APFSContainerReference=ref)
+                with self.assertRaisesRegex(ValueError, 'selected APFS container UUID is ambiguous'):
+                    self.bind()
+        self.infos['20'] = original
 
     def test_invalid_capacity_counts_fail_closed(self):
         for field in ('CapacityCeiling', 'CapacityFree'):

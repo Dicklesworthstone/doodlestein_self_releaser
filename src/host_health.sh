@@ -430,7 +430,7 @@ _hh_admission_fingerprint() {
         --arg clock_warn "$_HH_CLOCK_DRIFT_WARN" \
         --arg ssh_timeout "$_HH_SSH_TIMEOUT" \
         --arg command_timeout "$_HH_CMD_TIMEOUT" \
-        '{schema:"dsr-host-admission-v10",host:$host,writable_paths:$requested_paths,policy:{
+        '{schema:"dsr-host-admission-v11",host:$host,writable_paths:$requested_paths,policy:{
             disk_warn:$disk_warn,clock_warn:$clock_warn,
             disk_min_free_bytes:$disk_min_free,
             ssh_timeout:$ssh_timeout,command_timeout:$command_timeout}}') || return 4
@@ -896,16 +896,15 @@ def apfs_inventory(data):
     values = plist(data).get('Containers')
     if not isinstance(values, list):
         raise ValueError('missing APFS container inventory')
-    containers, volumes, uuids = {}, {}, set()
+    containers, volumes = {}, {}
     for value in values:
         ref = device(value['ContainerReference'])
         uid = identifier(value['APFSContainerUUID'])
         total, available = whole(value['CapacityCeiling'], True), whole(value['CapacityFree'])
-        if ref in containers or uid in uuids or available > total:
+        if ref in containers or available > total:
             raise ValueError('duplicate or inconsistent APFS container')
         containers[ref] = dict(container_id=ref, container_uuid=uid,
                                available_bytes=available, total_bytes=total)
-        uuids.add(uid)
         if not isinstance(value['Volumes'], list):
             raise ValueError('missing APFS volume inventory')
         for volume in value['Volumes']:
@@ -935,6 +934,12 @@ def bind_apfs(rows, infos, inventory):
                 volume, container = volumes.get(volume_id), containers.get(ref)
                 if volume is None or container is None or volume['container_id'] != ref:
                     raise ValueError('APFS volume is absent from its selected container')
+                # Unrelated attached clones can share a UUID. Only a selected
+                # pool enters the capacity verdict, and its UUID must still be
+                # unique across the complete inventory to identify that pool.
+                if sum(c['container_uuid'] == container['container_uuid']
+                       for c in containers.values()) != 1:
+                    raise ValueError('selected APFS container UUID is ambiguous')
                 available = min(row['available_bytes'], container['available_bytes'])
                 total = min(row['total_bytes'], container['total_bytes'])
                 quota = volume['quota_bytes']
