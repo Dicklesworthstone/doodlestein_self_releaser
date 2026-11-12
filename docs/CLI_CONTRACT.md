@@ -2116,6 +2116,10 @@ receipts report the actual `cargo_target` and compiler/package evidence.
 
 Bun and TypeScript source builds use `source_subdir` and optional `source_entry`.
 They require committed regular `package.json` and `bun.lock` or `bun.lockb` files.
+For a workspace member, the lock may live at a committed ancestor workspace
+root inside the fetched checkout. Bun's `pm bin` result must identify that exact
+dependency root; an unrelated nested package cannot borrow its lock. The root
+manifest must declare workspaces, and no search reaches outside the source pin.
 The primary entry uses `source_entry` when configured; otherwise it uses the
 package's string `bin` or the exact `bin` map key matching its executable name
 without `.exe`. Each companion requires its own exact map key. Entries must be
@@ -2133,6 +2137,13 @@ existing journaled installation can replace executables. Bun receipts report
 `bun_lockfiles` path/hash/size evidence, with explicitly unsigned local-build
 status. Missing/stale locks, unsafe providers or a later companion failure
 preserve the installed family.
+
+The Bash source engine follows the same workspace-root selection and frozen
+installation policy. Workspace receipts add `bun_workspace.root` (relative to
+the checkout), `bun_workspace.member` (relative to that root), and
+`bun_workspace.package_json_sha256` for the root manifest. The existing
+`package_json_sha256` still identifies the selected package's manifest;
+`bun_lockfiles` paths remain relative to the pinned checkout.
 
 Before the first executable replacement, the installer publishes an immutable
 local journal with the complete previous and incoming family. An interrupted

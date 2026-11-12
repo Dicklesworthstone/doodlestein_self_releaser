@@ -776,6 +776,7 @@ compiler_contracts() (
     bun() {
         printf '%s\n' "$@" >> "$base/bun.args"
         if [[ "$1" == --version ]]; then printf 'bun fixture\n'
+        elif [[ "$1 ${2:-}" == 'pm bin' ]]; then printf '%s/node_modules/.bin\n' "$PWD"
         elif [[ "$1" == build ]]; then printf 'fixture executable\n' > "$base/output/bin/fixture"; fi
     }
     local output code=0

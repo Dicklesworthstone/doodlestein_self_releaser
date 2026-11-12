@@ -508,6 +508,44 @@ function Build-DsrRustSourceOutputs {
         source_package = $Policy.source.package; source_entries = @($providers) }
 }
 
+function Get-DsrBunDependencyContext {
+    param([string]$Source, [string]$BuildRoot, [string[]]$Files)
+    $comparison = if ([OperatingSystem]::IsWindows()) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    $member = [IO.Path]::GetRelativePath($Source, $BuildRoot).Replace('\', '/')
+    if (-not (Test-DsrSourceRelativePath $member -Root)) { Stop-DsrInstall 'Bun package escaped the pinned source checkout' 4 }
+    $cursor = $BuildRoot
+    while ($true) {
+        $locks = @()
+        foreach ($name in @('bun.lock', 'bun.lockb')) {
+            $path = Get-DsrPlainPath ([IO.Path]::Combine($cursor, $name))
+            if (-not [IO.File]::Exists($path)) { continue }
+            $relative = [IO.Path]::GetRelativePath($Source, $path).Replace('\', '/')
+            if ($relative -cnotin $Files) { Stop-DsrInstall 'Bun source lockfiles must be committed regular files' 4 }
+            $evidence = Get-DsrFileEvidence $path
+            $locks += @{ path = $relative; sha256 = $evidence.sha256; size_bytes = $evidence.size_bytes }
+        }
+        if ($locks.Count -gt 0) {
+            $manifest = Get-DsrPlainPath ([IO.Path]::Combine($cursor, 'package.json')) -File
+            $relative = [IO.Path]::GetRelativePath($Source, $manifest).Replace('\', '/')
+            if ($relative -cnotin $Files) { Stop-DsrInstall 'Bun dependency root requires a committed package.json' 4 }
+            if (-not $cursor.Equals($BuildRoot, $comparison)) {
+                $document = ConvertFrom-DsrJson (Read-DsrTextFile $manifest 8388608)
+                $patterns = $null
+                if ($document -is [Collections.IDictionary] -and $document.Contains('workspaces')) { $patterns = $document.workspaces }
+                if ($patterns -is [Collections.IDictionary]) { $patterns = $patterns['packages'] }
+                if ($patterns -isnot [array] -or $patterns.Count -eq 0 -or
+                    @($patterns | Where-Object { $_ -isnot [string] -or -not $_ }).Count -gt 0) {
+                    Stop-DsrInstall 'Bun ancestor lock requires a declared workspace' 4
+                }
+            }
+            return @{ root = $cursor; locks = @($locks); package_json_sha256 = (Get-DsrFileEvidence $manifest).sha256 }
+        }
+        if ($cursor.Equals($Source, $comparison)) { break }
+        $cursor = [IO.Path]::GetDirectoryName($cursor)
+    }
+    Stop-DsrInstall 'Bun source installation requires a committed bun.lock or bun.lockb in the selected package or its workspace' 4
+}
+
 function Build-DsrBunSourceOutputs {
     param($Policy, $Selection, [string]$Platform, [string]$Source, [string[]]$Files,
         [string]$BuildRoot, [string]$Output, [string]$Logs, [int]$Timeout, [string]$Bun)
@@ -521,16 +559,7 @@ function Build-DsrBunSourceOutputs {
     if ($manifestRelative -cnotin $Files) { Stop-DsrInstall 'Bun source installation requires a committed package.json' 4 }
     $manifest = ConvertFrom-DsrJson (Read-DsrTextFile $manifestPath 8388608)
     if ($manifest -isnot [Collections.IDictionary]) { Stop-DsrInstall 'Bun package.json must be an object' 4 }
-    $locks = @()
-    foreach ($name in @('bun.lock', 'bun.lockb')) {
-        $path = Get-DsrPlainPath ([IO.Path]::Combine($BuildRoot, $name))
-        if (-not [IO.File]::Exists($path)) { continue }
-        $relative = [IO.Path]::GetRelativePath($Source, $path).Replace('\', '/')
-        if ($relative -cnotin $Files) { Stop-DsrInstall 'Bun source lockfiles must be committed regular files' 4 }
-        $evidence = Get-DsrFileEvidence $path
-        $locks += @{ path = $relative; sha256 = $evidence.sha256; size_bytes = $evidence.size_bytes }
-    }
-    if ($locks.Count -eq 0) { Stop-DsrInstall 'Bun source installation requires a committed bun.lock or bun.lockb' 4 }
+    $context = Get-DsrBunDependencyContext $Source $BuildRoot $Files
     $primary = $Policy.binary_name
     if (-not $primary.EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase)) { $primary += '.exe' }
     $entries = @()
@@ -565,7 +594,15 @@ function Build-DsrBunSourceOutputs {
     if ($compiler.Length -gt 256 -or $compiler -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.+-]+)?$') {
         Stop-DsrInstall 'Bun did not identify its compiler version' 6
     }
-    $null = Invoke-DsrSourceCommand @bunBase -Arguments @('install', '--frozen-lockfile') -Log ([IO.Path]::Combine($Logs, 'dependencies'))
+    # Bun supplies workspace membership and glob semantics. An ancestor lock
+    # must never be borrowed by an unrelated nested package.
+    $projectBin = (Invoke-DsrSourceCommand @bunBase -Arguments @('pm', 'bin') -Log ([IO.Path]::Combine($Logs, 'bun-project')) -Capture).TrimEnd([char[]]"`r`n")
+    $expectedBin = [IO.Path]::Combine($context.root, 'node_modules', '.bin')
+    $comparison = if ([OperatingSystem]::IsWindows()) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    if (-not $projectBin.Replace('\', '/').Equals($expectedBin.Replace('\', '/'), $comparison)) {
+        Stop-DsrInstall 'Bun did not select the committed dependency root for this source package' 4
+    }
+    $null = Invoke-DsrSourceCommand $Bun @('install', '--frozen-lockfile') $context.root ([IO.Path]::Combine($Logs, 'dependencies')) $Timeout $environment
     for ($index = 0; $index -lt $entries.Count; $index++) {
         $entry = $entries[$index]
         $null = Get-DsrPlainPath ([IO.Path]::Combine($BuildRoot, $entry.entry)) -File
@@ -573,9 +610,15 @@ function Build-DsrBunSourceOutputs {
         $arguments = @('build', '--compile', ('--target=' + $target), '--outfile', $path, ('./' + $entry.entry))
         $null = Invoke-DsrSourceCommand @bunBase -Arguments $arguments -Log ([IO.Path]::Combine($Logs, ('build-' + $index)))
     }
-    return @{ compiler = $compiler; bun_target = $target; source_entry = $Policy.source.entry;
-        source_entries = @($entries); bun_lockfiles = @($locks);
+    $details = @{ compiler = $compiler; bun_target = $target; source_entry = $Policy.source.entry;
+        source_entries = @($entries); bun_lockfiles = @($context.locks);
         package_json_sha256 = (Get-DsrFileEvidence $manifestPath).sha256 }
+    if (-not $context.root.Equals($BuildRoot, $comparison)) {
+        $details.bun_workspace = @{ root = [IO.Path]::GetRelativePath($Source, $context.root).Replace('\', '/');
+            member = [IO.Path]::GetRelativePath($context.root, $BuildRoot).Replace('\', '/');
+            package_json_sha256 = $context.package_json_sha256 }
+    }
+    return $details
 }
 
 function Build-DsrSourceFamily {

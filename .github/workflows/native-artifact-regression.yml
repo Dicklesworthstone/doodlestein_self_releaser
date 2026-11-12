@@ -314,6 +314,7 @@ jobs:
           bash -n src/install_source.sh
           bash scripts/tests/test_install_source.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/source-engine.log"
           bash scripts/tests/test_install_source_family.sh --bun-contracts-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/bun-family-contracts.log"
+          bash scripts/tests/test_install_source_family.sh --bun-workspaces-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/bun-workspaces.log"
           bash scripts/tests/test_generated_workspace_installer.sh --go-bun-source-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/go-bun-source-families.log"
           test -z "$(git status --porcelain)"
       - name: Validate Windows Bun and TypeScript source installation
@@ -329,6 +330,7 @@ jobs:
           bun --version
           bash -n scripts/tests/test_install_source_windows.sh
           bash scripts/tests/test_install_source_windows.sh --bun-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/windows-bun-source.log"
+          bash scripts/tests/test_install_source_windows.sh --bun-workspaces-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/windows-bun-workspaces.log"
           test -z "$(git status --porcelain)"
       - name: Validate native compilation, manifests and signed provenance
         shell: bash

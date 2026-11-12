@@ -8,7 +8,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 dependencies=(pwsh git go cargo rustc minisign python3 jq yq)
-if [[ " $* " == *' --bun-only '* ]]; then
+if [[ " $* " == *' --bun-only '* || " $* " == *' --bun-workspaces-only '* ]]; then
     dependencies=(pwsh git bun minisign python3 jq yq)
 fi
 for dependency in "${dependencies[@]}"; do
@@ -41,6 +41,7 @@ arguments.add_argument("--workspace-baseline-project", type=Path, help="Frozen c
 arguments.add_argument("--go-workspace-only", action="store_true", help="Run the generated Go workspace caller regression")
 arguments.add_argument("--go-only", action="store_true", help="Run Go source and signed-release controls without Rust compilation")
 arguments.add_argument("--bun-only", action="store_true", help="Run genuine Bun/TypeScript Windows source installation controls")
+arguments.add_argument("--bun-workspaces-only", action="store_true", help="Run generated Bun workspace source installation controls")
 arguments.add_argument("--bun-baseline-project", type=Path, help="Frozen checkout before Windows Bun source installation")
 options = arguments.parse_args()
 project = options.project.resolve()
@@ -157,7 +158,7 @@ def generate(tool, label, *, checkout=project, destination=None):
 
 runtime = None
 policy = None
-if not options.bun_only:
+if not options.bun_only and not options.bun_workspaces_only:
     config()
     generated, runtime, policy = generate("source-demo", "generate")
     check("public CLI publishes parse-checked standalone source-capable PowerShell", generated.returncode == 0 and runtime.is_file(),
@@ -196,7 +197,7 @@ if (Get-Command Invoke-DsrSourceGit -ErrorAction SilentlyContinue) {
     function Invoke-DsrSourceCommand {
         param([string]$Executable, [string[]]$Arguments, [string]$Directory, [string]$Log,
             [int]$Timeout, $Environment = @{}, [int]$FailureCode = 6, [switch]$Capture)
-        [IO.File]::AppendAllText($script:Fixture.commands, ((@{ executable = $Executable; arguments = @($Arguments);
+        [IO.File]::AppendAllText($script:Fixture.commands, ((@{ executable = $Executable; arguments = @($Arguments); directory = $Directory;
             go_environment = @{ GOWORK = $Environment['GOWORK']; GOENV = $Environment['GOENV'];
                 GOFLAGS = $Environment['GOFLAGS']; GO111MODULE = $Environment['GO111MODULE'];
                 GOTOOLCHAIN = $Environment['GOTOOLCHAIN'] };
@@ -372,7 +373,7 @@ def test_bun_sources():
           sum(row["arguments"][:3] == ["build", "--compile", "--target=bun-windows-x64-baseline"] for row in selected_calls) == 2)
     bun_calls = [row for row in selected_calls if Path(row["executable"]).name.lower() in ("bun", "bun.exe")]
     check("actual Bun commands remove inherited Node and Bun preloads before execution",
-          len(bun_calls) == 4 and all(row["bun_environment"] == {"NODE_OPTIONS": None, "BUN_OPTIONS": None} for row in bun_calls))
+          len(bun_calls) == 5 and all(row["bun_environment"] == {"NODE_OPTIONS": None, "BUN_OPTIONS": None} for row in bun_calls))
     config("typescript-source", language="typescript", local_path=str(bun_upstream), source_entry="src/primary.ts")
     typescript, ts_runtime, ts_policy = generate("typescript-source", "typescript-generate")
     arm, arm_result, arm_fixture = invoke("bun-arm64", selected_runtime=ts_runtime,
@@ -483,8 +484,105 @@ def test_bun_sources():
           all(digest(prefix / name) == value for name, value in old_family.items()))
 
 
-if options.bun_only:
-    test_bun_sources()
+def test_bun_workspaces():
+    workspace_upstream = root / "bun-workspace-upstream"
+    workspace_upstream.mkdir()
+    required(["git", "init", "--quiet", "--initial-branch=main", workspace_upstream], "workspace-git-init")
+    required(["git", "-C", workspace_upstream, "config", "user.email", "fixture@example.invalid"], "workspace-git-email")
+    required(["git", "-C", workspace_upstream, "config", "user.name", "DSR Bun Workspace Fixture"], "workspace-git-name")
+    root_manifest = {"name": "workspace-root", "private": True, "workspaces": ["packages/*"]}
+    member_manifest = {"name": "app", "version": "1.0.0", "bin": {"app": "src/app.ts", "helper": "src/helper.ts"},
+                       "dependencies": {"shared": "workspace:*"}}
+    contents = {".gitignore": "node_modules/\n", "workspace/package.json": json.dumps(root_manifest),
+                "workspace/packages/app/package.json": json.dumps(member_manifest),
+                "workspace/packages/app/src/app.ts": 'import { value } from "shared"; console.log("workspace-primary-" + value);\n',
+                "workspace/packages/app/src/helper.ts": 'import { value } from "shared"; console.log("workspace-helper-" + value);\n',
+                "workspace/packages/shared/package.json": json.dumps({"name": "shared", "version": "1.0.0", "main": "index.ts"}),
+                "workspace/packages/shared/index.ts": 'export const value = "pinned-bun-workspace-dependency";\n',
+                "workspace/unrelated/package.json": json.dumps({"name": "unrelated", "bin": "entry.ts"}),
+                "workspace/unrelated/entry.ts": 'console.log("unrelated");\n',
+                "workspace/extra/package.json": json.dumps({"name": "extra", "version": "1.0.0", "main": "index.ts"}),
+                "workspace/extra/index.ts": 'export const extra = 1;\n'}
+    for name, value in contents.items():
+        path = workspace_upstream / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(value)
+    required(["bun", "install", "--lockfile-only"], "workspace-bun-lock", cwd=workspace_upstream / "workspace")
+    required(["git", "-C", workspace_upstream, "add", "."], "workspace-git-add")
+    required(["git", "-C", workspace_upstream, "commit", "--quiet", "-m", "Pin Bun workspace family"], "workspace-git-commit")
+    pin = required(["git", "-C", workspace_upstream, "rev-parse", "HEAD"], "workspace-git-pin")
+    required(["git", "-C", workspace_upstream, "tag", "v1.2.3"], "workspace-git-tag")
+    config("bun-workspace", language="bun", local_path=str(workspace_upstream), source_subdir="workspace/packages/app",
+           source_entry="", targets=["windows/amd64"], target_triples={"windows/amd64": "x86_64-pc-windows-msvc"},
+           workspace_binaries_by_target={})
+    generated, workspace_runtime, _ = generate("bun-workspace", "workspace-generate")
+    check("public PowerShell generator admits a configured Bun workspace package", generated.returncode == 0,
+          generated.stderr.decode(errors="replace"))
+    if generated.returncode:
+        return
+    built, result, fixture = invoke("bun-workspace-family", selected_runtime=workspace_runtime,
+        repository_url=workspace_upstream.as_uri(), extra={"NODE_OPTIONS": "--require=/missing/ambient-preload.js",
+                                                          "BUN_OPTIONS": "--preload=/missing/ambient-bun-preload.ts"})
+    check("genuine Windows Bun family builds from a selected package and its root frozen lock",
+          built.returncode == 0 and result.get("source", {}).get("source_commit") == pin and no_http(fixture),
+          built.stderr.decode(errors="replace"))
+    if built.returncode:
+        return
+    prefix = Path(fixture["parameters"]["Prefix"])
+    expected = {name: digest(prefix / name) for name in ("app.exe", "helper.exe")}
+    check("Bun workspace compiles distinct complete x64 PE files with the pinned sibling dependency",
+          all(machine(prefix / name) == 0x8664 and b"pinned-bun-workspace-dependency" in (prefix / name).read_bytes()
+              for name in expected) and expected["app.exe"] != expected["helper.exe"])
+    receipt = result["source"]
+    check("Bun workspace receipt binds root/member manifests, committed lock and each installed payload",
+          receipt["bun_workspace"] == {"root": "workspace", "member": "packages/app",
+              "package_json_sha256": digest(workspace_upstream / "workspace/package.json")} and
+          receipt["package_json_sha256"] == digest(workspace_upstream / "workspace/packages/app/package.json") and
+          receipt["bun_lockfiles"][0]["path"] == "workspace/bun.lock" and
+          receipt["bun_lockfiles"][0]["sha256"] == digest(workspace_upstream / "workspace/bun.lock") and
+          all(row["sha256"] == expected[row["name"]] for row in result["binaries"]) and
+          json.loads(Path(result["source_receipt"]["path"]).read_text()) == receipt)
+    install_calls = [row for row in calls(fixture) if row["arguments"] == ["install", "--frozen-lockfile"]]
+    check("Bun installs the admitted workspace root exactly once before compiling the selected package",
+          len(install_calls) == 1 and install_calls[0]["directory"].endswith("/source/workspace") and
+          sum(row["arguments"] == ["pm", "bin"] for row in calls(fixture)) == 1)
+
+    config("bun-unrelated", language="bun", local_path=str(workspace_upstream), source_subdir="workspace/unrelated",
+           source_entry="", targets=["windows/amd64"], target_triples={"windows/amd64": "x86_64-pc-windows-msvc"},
+           workspace_binaries=["app"], workspace_binaries_by_target={})
+    unrelated_generated, unrelated_runtime, _ = generate("bun-unrelated", "workspace-unrelated-generate")
+    unrelated, unrelated_result, unrelated_fixture = invoke("bun-unrelated-workspace", selected_runtime=unrelated_runtime,
+        repository_url=workspace_upstream.as_uri(), parameters={"Prefix": str(prefix)})
+    check("unrelated nested package cannot borrow an ancestor Bun workspace lock",
+          unrelated_generated.returncode == 0 and unrelated.returncode == 4 and
+          "dependency root" in unrelated_result.get("error", "") and
+          all(row["arguments"][0] != "install" for row in calls(unrelated_fixture)) and
+          all(digest(prefix / name) == value for name, value in expected.items()))
+
+    root_manifest["dependencies"] = {"extra": "file:./extra"}
+    (workspace_upstream / "workspace/package.json").write_text(json.dumps(root_manifest))
+    required(["git", "-C", workspace_upstream, "add", "workspace/package.json"], "workspace-stale-add")
+    required(["git", "-C", workspace_upstream, "commit", "--quiet", "-m", "Change pinned dependencies without lock update"], "workspace-stale-commit")
+    stale, _, stale_fixture = invoke("bun-workspace-stale-lock", selected_runtime=workspace_runtime,
+        repository_url=workspace_upstream.as_uri(), parameters={"SourceRef": "HEAD", "Prefix": str(prefix)})
+    check("stale workspace root lock stops before compilation and preserves the installed family",
+          stale.returncode == 6 and any(row["arguments"] == ["install", "--frozen-lockfile"] for row in calls(stale_fixture)) and
+          all(row["arguments"][0] != "build" for row in calls(stale_fixture)) and
+          all(digest(prefix / name) == value for name, value in expected.items()))
+
+    required(["git", "-C", workspace_upstream, "update-index", "--force-remove", "workspace/bun.lock"], "workspace-missing-lock-index")
+    required(["git", "-C", workspace_upstream, "commit", "--quiet", "-m", "Pin a source tree without its Bun lock"], "workspace-missing-lock-commit")
+    missing, _, missing_fixture = invoke("bun-workspace-missing-lock", selected_runtime=workspace_runtime,
+        repository_url=workspace_upstream.as_uri(), parameters={"SourceRef": "HEAD", "Prefix": str(prefix)})
+    check("missing workspace lock cannot reach compiler probes or mutate installed executables",
+          missing.returncode == 4 and all(Path(row["executable"]).name.lower() not in ("bun", "bun.exe") for row in calls(missing_fixture)) and
+          all(digest(prefix / name) == value for name, value in expected.items()))
+
+
+if options.bun_only or options.bun_workspaces_only:
+    if options.bun_only:
+        test_bun_sources()
+    test_bun_workspaces()
     print(f"Windows Bun source tests: {passed} passed, {failed} failed", flush=True)
     raise SystemExit(1 if failed else 0)
 
@@ -886,7 +984,7 @@ check("genuine Rust configuration now embeds its explicit Cargo source policy", 
       rust_generated.stderr.decode(errors="replace"))
 rust_help = command(["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", rust_runtime, "-Help", "-Json"], "rust-help")
 check("generated Rust installer still exposes normal Help", rust_help.returncode == 0 and json.loads(rust_help.stdout).get("status") == "help")
-config("unsupported-source", language="bun")
+config("unsupported-source", language="python")
 unsupported_generated, unsupported_runtime, unsupported_policy = generate("unsupported-source", "generate-unsupported")
 unsupported_source, _, fixture = invoke("unsupported-source-refusal", selected_runtime=unsupported_runtime)
 check("unsupported source language refuses without changing ordinary release behavior", unsupported_generated.returncode == 0 and

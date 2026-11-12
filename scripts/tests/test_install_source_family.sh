@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Real locked offline Rust workspace builds through the installer source engine.
 # Only Git's HTTPS transport is redirected to a local committed repository.
-# The optional Bun contract mode substitutes the compiler boundary only; it is
-# not evidence of native Bun compilation (the generated installer suite is).
+# Bun workspace mode compiles genuine native executables from pinned workspace
+# packages. The separate contract mode substitutes only the compiler boundary.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 case "$#:${1:-}" in
-    0:|1:--bun-contracts-only) ;;
-    *) printf 'Usage: %s [--bun-contracts-only]\n' "$0" >&2; exit 4 ;;
+    0:|1:--bun-contracts-only|1:--bun-workspaces-only) ;;
+    *) printf 'Usage: %s [--bun-contracts-only|--bun-workspaces-only]\n' "$0" >&2; exit 4 ;;
 esac
 
 test_bun_family_contracts() (
@@ -51,6 +51,7 @@ test_bun_family_contracts() (
             printf '%s\n' "$*" >> "$base/bun.calls"
             case "$1" in
                 --version) printf 'bun-contract-version\n' ;;
+                pm) [[ "${2:-}" == bin ]] && printf '%s/node_modules/.bin\n' "$PWD" ;;
                 install) [[ "$fault" != dependency ]] ;;
                 build)
                     local target='' entry=''
@@ -114,8 +115,119 @@ test_bun_family_contracts() (
     [[ $bad -eq 0 ]]
 )
 
+test_bun_workspaces() (
+    for dependency in git jq bun ps; do
+        command -v "$dependency" >/dev/null 2>&1 || {
+            printf 'SKIP: native Bun workspace regression requires %s\n' "$dependency"; return 77;
+        }
+    done
+    # shellcheck source=../../src/install_source.sh
+    source "${DSR_INSTALL_SOURCE_ENGINE:-$ROOT/src/install_source.sh}"
+    local fixtures upstream pin lock_hash root_hash member_hash good=0 bad=0 code result member
+    fixtures=$(mktemp -d "${TMPDIR:-/tmp}/dsr-bun-workspaces.XXXXXXXX") || return 1
+    printf 'Native Bun workspace evidence: %s\n' "$fixtures"
+    upstream="$fixtures/upstream"
+    mkdir -p "$upstream/workspace/packages/app/src" "$upstream/workspace/packages/shared" \
+        "$upstream/workspace/unrelated" "$upstream/workspace/extra" || return 1
+    export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$fixtures/gitconfig"
+    export DSR_GH_TOKEN='' GITHUB_TOKEN='' GH_TOKEN=''
+    gh() { return 1; }
+    git init -q -b main "$upstream" || return 1
+    git -C "$upstream" config user.name 'DSR Bun workspace' || return 1
+    git -C "$upstream" config user.email 'fixture@example.invalid' || return 1
+    printf 'node_modules/\n' > "$upstream/.gitignore"
+    printf '%s\n' '{"name":"workspace-root","private":true,"workspaces":["packages/*"]}' > "$upstream/workspace/package.json"
+    printf '%s\n' '{"name":"app","version":"1.0.0","bin":{"app":"src/app.ts","helper":"src/helper.ts"},"dependencies":{"shared":"workspace:*"}}' \
+        > "$upstream/workspace/packages/app/package.json"
+    printf '%s\n' '{"name":"shared","version":"1.0.0","main":"index.ts"}' > "$upstream/workspace/packages/shared/package.json"
+    printf '%s\n' 'export const value = "pinned-workspace-dependency";' > "$upstream/workspace/packages/shared/index.ts"
+    for member in app helper; do
+        printf 'import { value } from "shared"; console.log("%s-" + value);\n' "$member" \
+            > "$upstream/workspace/packages/app/src/$member.ts"
+    done
+    printf '%s\n' '{"name":"unrelated","version":"1.0.0","bin":"entry.ts"}' > "$upstream/workspace/unrelated/package.json"
+    printf 'console.log("unrelated");\n' > "$upstream/workspace/unrelated/entry.ts"
+    printf '%s\n' '{"name":"extra","version":"1.0.0","main":"index.ts"}' > "$upstream/workspace/extra/package.json"
+    printf 'export const extra = 1;\n' > "$upstream/workspace/extra/index.ts"
+    (cd "$upstream/workspace" && bun install --lockfile-only) > "$fixtures/lock.stdout" 2> "$fixtures/lock.stderr" || return 1
+    git -C "$upstream" add . || return 1
+    git -C "$upstream" commit -qm 'Pinned Bun workspace and complete executable family' || return 1
+    pin=$(git -C "$upstream" rev-parse HEAD) || return 1
+    git config --file "$GIT_CONFIG_GLOBAL" url."file://$upstream".insteadOf https://github.com/fixture/bun-workspace.git || return 1
+    lock_hash=$(_isb_sha256 "$upstream/workspace/bun.lock") || return 1
+    root_hash=$(_isb_sha256 "$upstream/workspace/package.json") || return 1
+    member_hash=$(_isb_sha256 "$upstream/workspace/packages/app/package.json") || return 1
+    workspace_check() {
+        local label="$1"; shift
+        if "$@"; then good=$((good + 1)); printf 'PASS: %s\n' "$label"
+        else bad=$((bad + 1)); printf 'FAIL: %s\n' "$label" >&2; fi
+    }
+    workspace_equal() { [[ "$1" == "$2" ]]; }
+    workspace_build() {
+        local label="$1" subdir="$2"; shift 2
+        code=0
+        install_source_build fixture/bun-workspace HEAD bun app "$fixtures/$label" \
+            --allow-build --subdir "$subdir" --timeout 30 "$@" \
+            > "$fixtures/$label.json" 2> "$fixtures/$label.stderr" || code=$?
+    }
+    NODE_OPTIONS='--require=/missing/ambient-node-preload.js' BUN_OPTIONS='--preload=/missing/ambient-bun-preload.ts' \
+        workspace_build complete workspace/packages/app --bin helper --bin app
+    workspace_check 'Bun selected workspace builds its entire native family' workspace_equal "$code" 0
+    for member in app helper; do
+        result=''
+        [[ ! -x "$fixtures/complete/output/bin/$member" ]] || result=$("$fixtures/complete/output/bin/$member")
+        workspace_check "$member executable uses the pinned sibling dependency" workspace_equal "$result" "$member-pinned-workspace-dependency"
+    done
+    workspace_check 'Bun workspace receipt binds root, member, lock and source pin' jq -e \
+        --arg pin "$pin" --arg lock "$lock_hash" --arg root "$root_hash" --arg member "$member_hash" '
+        .source_commit == $pin and .signed_release == false and .package_json_sha256 == $member and
+        .bun_workspace == {root:"workspace",member:"packages/app",package_json_sha256:$root} and
+        .bun_lockfiles[0].path == "workspace/bun.lock" and .bun_lockfiles[0].sha256 == $lock and
+        [.binaries[].name] == ["helper","app"]' "$fixtures/complete.json"
+    workspace_check 'Bun uses exactly the selected root reported by its own package manager' \
+        grep -Fxq "$fixtures/complete/source/workspace/node_modules/.bin" "$fixtures/complete/output/bun-project.log"
+    workspace_check 'Bun frozen installation keeps the committed lock unchanged' workspace_equal \
+        "$lock_hash" "$(_isb_sha256 "$fixtures/complete/source/workspace/bun.lock")"
+
+    workspace_build unrelated workspace/unrelated
+    workspace_check 'unrelated nested package cannot borrow an ancestor workspace lock' workspace_equal "$code" 4
+    workspace_check 'unrelated root refusal precedes dependency installation' test ! -e "$fixtures/unrelated/output/dependencies.log"
+    workspace_check 'unrelated root refusal emits no successful source receipt' test ! -s "$fixtures/unrelated.json"
+
+    printf '%s\n' '{"name":"workspace-root","private":true,"workspaces":["packages/*"],"dependencies":{"extra":"file:./extra"}}' \
+        > "$upstream/workspace/package.json"
+    git -C "$upstream" add workspace/package.json || return 1
+    git -C "$upstream" commit -qm 'Change dependencies without updating the committed lock' || return 1
+    workspace_build stale workspace/packages/app --bin app --bin helper
+    workspace_check 'stale root lock refuses the complete Bun family' workspace_equal "$code" 6
+    workspace_check 'stale lock refusal occurs in genuine frozen Bun install' grep -q 'frozen' "$fixtures/stale/output/dependencies.log"
+    workspace_check 'stale root lock emits no successful source receipt' test ! -s "$fixtures/stale.json"
+    workspace_check 'stale root lock never starts executable compilation' test ! -e "$fixtures/stale/output/build-0.log"
+
+    # Remove only the fixture's index entry. The physical file remains for the
+    # next control, but a fresh fetch cannot receive it from the new commit.
+    git -C "$upstream" update-index --force-remove workspace/bun.lock || return 1
+    git -C "$upstream" commit -qm 'Source pin has no committed Bun lock' || return 1
+    workspace_build missing workspace/packages/app
+    workspace_check 'workspace without a committed lock refuses before compiler probes' workspace_equal "$code" 4
+    workspace_check 'missing lock emits no successful source receipt' test ! -s "$fixtures/missing.json"
+    workspace_check 'missing lock does not consult a compiler or dependency installer' test ! -e "$fixtures/missing/output/compiler.log"
+    mkdir "$fixtures/untracked-output" || return 1
+    code=0
+    _ISB_CHECKOUT_ROOT="$upstream" _isb_compile bun "$upstream/workspace/packages/app" \
+        "$fixtures/untracked-output" app '' '' 30 > "$fixtures/untracked.json" 2> "$fixtures/untracked.stderr" || code=$?
+    workspace_check 'untracked ancestor lock cannot authorize dependency installation' workspace_equal "$code" 4
+    workspace_check 'untracked lock refusal precedes compiler probes' test ! -e "$fixtures/untracked-output/compiler.log"
+    printf 'Native Bun workspaces: %s passed, %s failed\n' "$good" "$bad"
+    [[ $bad -eq 0 ]]
+)
+
 if [[ "${1:-}" == --bun-contracts-only ]]; then
     test_bun_family_contracts
+    exit $?
+fi
+if [[ "${1:-}" == --bun-workspaces-only ]]; then
+    test_bun_workspaces
     exit $?
 fi
 

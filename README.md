@@ -1149,7 +1149,11 @@ each selected binary's package before compilation, and builds with `--locked`
 for the configured Windows target using an existing standard library and linker.
 Bun and TypeScript require committed `package.json` and `bun.lock` or `bun.lockb`,
 resolve each selected executable's entry, and compile Windows x64 or ARM64 payloads
-with the installed Bun compiler.
+with the installed Bun compiler. A `source_subdir` inside a Bun workspace uses
+that workspace's committed root lock after Bun confirms the package's membership.
+Both installer shells install workspace dependencies once with `--frozen-lockfile`,
+then compile the selected package's executable entries. Source receipts record
+the root and member paths, both manifest hashes, and the selected lock evidence.
 See [Windows source installation](docs/INSTALLER_GENERATION.md#explicit-source-installation-on-windows)
 for source selectors, tool requirements and retained diagnostics.
 

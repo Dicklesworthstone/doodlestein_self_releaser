@@ -583,10 +583,10 @@ _isb_go_directory() (
     printf '%s\n' "$cursor"
 )
 
-# Go's own parser supplies syntax and module identity. Git supplies authority:
-# a go.work, go.mod, checksum file or vendor manifest must be an unchanged
-# regular blob from the fetched commit, never an ambient or generated input.
-_isb_go_committed_file() {
+# The compiler supplies syntax and package identity. Git supplies authority:
+# source manifests and locks must be unchanged regular blobs from the fetched
+# commit, never ambient or generated inputs.
+_isb_source_committed_file() {
     local root="$1" path="$2" relative row mode type oid rest actual hash attributes filter
     [[ "$path" == "$root/"* && -f "$path" && ! -L "$path" ]] || return 4
     relative="${path#"$root"/}"
@@ -639,7 +639,7 @@ _isb_go_requirements() (
         cursor="${cursor%/*}"
     done
     [[ -n "$selected" ]] || selected="$tree/go.mod"
-    _isb_go_committed_file "$root" "$selected" >/dev/null || {
+    _isb_source_committed_file "$root" "$selected" >/dev/null || {
         _isb_log "The selected ${selected##*/} must be an unchanged committed regular file"; return 4;
     }
     printf '%s\n' "$selected"
@@ -660,7 +660,7 @@ _isb_go_context() (
     requirements=$(_isb_go_requirements "$root" "$tree") || return $?
     if [[ "${requirements##*/}" == go.work ]]; then
         work="$requirements"; work_dir="${work%/*}"
-        work_hash=$(_isb_go_committed_file "$root" "$work") || return 4
+        work_hash=$(_isb_source_committed_file "$root" "$work") || return 4
         _isb_run "$limit" "$output/go-workspace.log" go work edit -json "$work" || {
             status=$?; [[ "$status" != 5 ]] || return 5; return 4;
         }
@@ -683,7 +683,7 @@ _isb_go_context() (
         module_roots=("$tree")
         work_dir="$tree"
     elif [[ -e "$work.sum" || -L "$work.sum" ]]; then
-        _isb_go_committed_file "$root" "$work.sum" >/dev/null || {
+        _isb_source_committed_file "$root" "$work.sum" >/dev/null || {
             _isb_log 'go.work.sum must be an unchanged committed regular file'; return 4;
         }
     fi
@@ -693,12 +693,12 @@ _isb_go_context() (
         relative="${module_root#"$root"/}"; [[ "$module_root" != "$root" ]] || relative=.
         [[ -z "${seen_paths[$relative]:-}" ]] || { _isb_log 'Go workspace repeats a module directory'; return 4; }
         seen_paths[$relative]=1
-        module_hash=$(_isb_go_committed_file "$root" "$module_root/go.mod") || {
+        module_hash=$(_isb_source_committed_file "$root" "$module_root/go.mod") || {
             _isb_log "Go module requires an unchanged committed regular go.mod: $relative"; return 4;
         }
         sum_file="$module_root/go.sum"
         if [[ -e "$sum_file" || -L "$sum_file" ]]; then
-            _isb_go_committed_file "$root" "$sum_file" >/dev/null || {
+            _isb_source_committed_file "$root" "$sum_file" >/dev/null || {
                 _isb_log "Go module checksum file is not an unchanged committed regular file: $relative"; return 4;
             }
         fi
@@ -724,7 +724,7 @@ _isb_go_context() (
         if [[ -z "$work" ]]; then
             # Preserve standalone module vendoring, including legacy vendor
             # directories without a modules.txt when Go itself admits them.
-            [[ ! -e "$document" ]] || _isb_go_committed_file "$root" "$document" >/dev/null || return 4
+            [[ ! -e "$document" ]] || _isb_source_committed_file "$root" "$document" >/dev/null || return 4
             vendor=true; mod=vendor
         elif [[ -f "$document" ]] && head -c 512 "$document" | jq -eRs '
             split("\n")[0] | if startswith("## ") then .[3:] | split(";") |
@@ -733,7 +733,7 @@ _isb_go_context() (
             # Go ignores a member module's vendor tree and a legacy module
             # vendor at the workspace root. Match its workspace annotation
             # before choosing vendor mode, rather than forcing an invalid one.
-            vendor_hash=$(_isb_go_committed_file "$root" "$document") || return 4
+            vendor_hash=$(_isb_source_committed_file "$root" "$document") || return 4
             vendor=true; mod=vendor
         fi
     fi
@@ -783,11 +783,11 @@ _isb_go_context() (
             fi
             replacements[$key]="$identity"
             [[ -z "$replacement_version" ]] || continue
-            hash=$(_isb_go_committed_file "$root" "$replacement/go.mod") || {
+            hash=$(_isb_source_committed_file "$root" "$replacement/go.mod") || {
                 _isb_log "Local Go replacement requires a committed regular go.mod: $old"; return 4;
             }
             if [[ -e "$replacement/go.sum" || -L "$replacement/go.sum" ]]; then
-                _isb_go_committed_file "$root" "$replacement/go.sum" >/dev/null || return 4
+                _isb_source_committed_file "$root" "$replacement/go.sum" >/dev/null || return 4
             fi
             parsed="$output/go-replacement-${#replacements[@]}.log"
             _isb_run "$limit" "$parsed" go mod edit -json "$replacement/go.mod" || {
@@ -812,6 +812,84 @@ _isb_go_context() (
           {path:$path,sha256:$hash,modules:$modules,local_replacements:$replacements,vendor:$vendor} +
           (if $vendor then {vendor_modules_sha256:$vendor_hash} else {} end) end)}' \
         > "$output/go-context.json"
+)
+
+# Select a locked project without walking outside the fetched checkout. Bun
+# itself subsequently confirms that the selected package belongs to this root;
+# a nearby unrelated lockfile is not sufficient workspace authority.
+_isb_bun_dependency_root() (
+    local root="$1" tree="$2" cursor="$2" relative lock found=false
+    relative="${tree#"$root"/}"; [[ "$tree" != "$root" ]] || relative=.
+    _isb_path_in_tree "$root" "$relative" && [[ -d "$tree" ]] || return 4
+    while :; do
+        found=false
+        for lock in bun.lock bun.lockb; do
+            if [[ -e "$cursor/$lock" || -L "$cursor/$lock" ]]; then
+                [[ -f "$cursor/$lock" && ! -L "$cursor/$lock" ]] || return 4
+                [[ -z "${_ISB_CHECKOUT_ROOT:-}" ]] ||
+                    _isb_source_committed_file "$root" "$cursor/$lock" >/dev/null || return 4
+                found=true
+            fi
+        done
+        if $found; then
+            [[ -f "$cursor/package.json" && ! -L "$cursor/package.json" ]] || return 4
+            [[ -z "${_ISB_CHECKOUT_ROOT:-}" ]] ||
+                _isb_source_committed_file "$root" "$cursor/package.json" >/dev/null || return 4
+            if [[ "$cursor" != "$tree" ]]; then
+                jq -es 'length == 1 and (.[0].workspaces |
+                    (if type == "object" then .packages else . end) |
+                    type == "array" and length > 0 and all(.[]; type == "string" and length > 0))' \
+                    "$cursor/package.json" >/dev/null || return 4
+            fi
+            printf '%s\n' "$cursor"
+            return 0
+        fi
+        [[ "$cursor" != "$root" ]] || break
+        cursor="${cursor%/*}"
+    done
+    _isb_log 'A committed bun.lock or bun.lockb is required in the selected package or its workspace'
+    return 4
+)
+
+_isb_bun_context() (
+    local root="$1" tree="$2" dependency_root="$3" output="$4" limit="$5" status=0
+    local selected expected="$dependency_root/node_modules/.bin" lock hash size relative
+    local package_hash root_hash root_relative member_relative
+    local -a locks=()
+    _isb_run "$limit" "$output/bun-project.log" bun pm bin || {
+        status=$?; [[ "$status" != 5 ]] || return 5; return 4;
+    }
+    selected=$(cat "$output/bun-project.log") || return 1
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*)
+            command -v cygpath >/dev/null 2>&1 || return 3
+            expected=$(cygpath -am "$expected") || return 4
+            selected="${selected%$'\r'}"; selected="${selected//\\//}"
+            selected="${selected,,}"; expected="${expected,,}"
+            ;;
+    esac
+    [[ "$selected" == "$expected" ]] || {
+        _isb_log 'Bun did not select the committed dependency root for this source package'; return 4;
+    }
+    package_hash=$(_isb_sha256 "$tree/package.json") || return $?
+    root_hash=$(_isb_sha256 "$dependency_root/package.json") || return $?
+    for lock in bun.lock bun.lockb; do
+        [[ -f "$dependency_root/$lock" && ! -L "$dependency_root/$lock" ]] || continue
+        hash=$(_isb_sha256 "$dependency_root/$lock") || return $?
+        size=$(wc -c < "$dependency_root/$lock") || return 1
+        relative="${dependency_root#"$root"/}/$lock"
+        [[ "$dependency_root" != "$root" ]] || relative="$lock"
+        locks+=("$(jq -nc --arg path "$relative" --arg hash "$hash" --argjson size "$size" \
+            '{path:$path,sha256:$hash,size_bytes:$size}')") || return 1
+    done
+    ((${#locks[@]} > 0)) || return 4
+    root_relative="${dependency_root#"$root"/}"; [[ "$dependency_root" != "$root" ]] || root_relative=.
+    member_relative="${tree#"$dependency_root"/}"; [[ "$tree" != "$dependency_root" ]] || member_relative=.
+    printf '%s\n' "${locks[@]}" | jq -sc --arg package_hash "$package_hash" --arg root_hash "$root_hash" \
+        --arg root "$root_relative" --arg member "$member_relative" \
+        '{package_json_sha256:$package_hash,bun_lockfiles:.} +
+         (if $member == "." then {} else {bun_workspace:{root:$root,member:$member,package_json_sha256:$root_hash}} end)' \
+        > "$output/bun-context.json"
 )
 
 # Build only the requested executable family, into a new private output directory.
@@ -949,13 +1027,17 @@ _isb_compile() (
             [[ -f package.json && ! -L package.json ]] || return 4
             resolved_entries=$(_isb_source_entries "$language" "$tree" "$binary" "$entry" "${binaries[@]}") || return $?
             while IFS= read -r selected_entry; do entries+=("$selected_entry"); done <<< "$resolved_entries"
-            if [[ ! -f bun.lock && ! -f bun.lockb ]]; then
-                _isb_log 'A committed bun.lock or bun.lockb is required'; return 4
-            fi
-            [[ ! -L bun.lock && ! -L bun.lockb ]] || return 4
-            _isb_prepare_toolchain "$language" "$tree" "$output" "$limit" || return $?
+            local bun_root checkout_root="${_ISB_CHECKOUT_ROOT:-$tree}"
+            [[ -z "${_ISB_CHECKOUT_ROOT:-}" ]] ||
+                _isb_source_committed_file "$checkout_root" "$tree/package.json" >/dev/null || return 4
+            bun_root=$(_isb_bun_dependency_root "$checkout_root" "$tree") || return $?
+            unset NODE_OPTIONS BUN_OPTIONS
+            _isb_prepare_toolchain "$language" "$bun_root" "$output" "$limit" || return $?
             _isb_run "$limit" "$output/compiler.log" bun --version || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
-            _isb_run "$limit" "$output/dependencies.log" bun install --frozen-lockfile || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
+            _isb_bun_context "$checkout_root" "$tree" "$bun_root" "$output" "$limit" || return $?
+            _isb_run "$limit" "$output/dependencies.log" _isb_in_dir "$bun_root" bun install --frozen-lockfile || {
+                status=$?; [[ $status == 5 ]] && return 5; return 6;
+            }
             mkdir "$output/bin" || return 1
             for index in "${!entries[@]}"; do
                 name=$(_isb_binary_name "${binaries[$index]}") || return 4
@@ -1108,7 +1190,7 @@ install_source_build() (
     [[ $index -eq ${#binary_names[@]} && -n "$primary_payload" ]] || return 6
     payload="$primary_payload"; sha="$primary_sha"; size="$primary_size"
     binaries_json=$(printf '%s\n' "${binary_receipts[@]}" | jq -sc '.') || return 1
-    local toolchain_receipt=null go_context_file=/dev/null
+    local toolchain_receipt=null go_context_file=/dev/null bun_context_file=/dev/null
     if [[ -f "$output/toolchain/receipt.json" ]]; then
         toolchain_receipt=$(jq -ce 'del(.root,.bin_dir)' "$output/toolchain/receipt.json") || return 7
     fi
@@ -1116,17 +1198,23 @@ install_source_build() (
         go_context_file="$output/go-context.json"
         [[ -f "$go_context_file" && ! -L "$go_context_file" ]] || return 7
     fi
+    if [[ "$language" == bun || "$language" == typescript ]]; then
+        bun_context_file="$output/bun-context.json"
+        [[ -f "$bun_context_file" && ! -L "$bun_context_file" ]] || return 7
+    fi
     receipt=$(jq -nc --arg repo "$repo" --arg ref "$ref" --arg commit "$commit" \
         --arg language "$language" --arg path "$payload" --arg sha "$sha" --argjson size "$size" \
         --argjson binaries "$binaries_json" \
         --argjson toolchain "$toolchain_receipt" \
         --slurpfile go_context "$go_context_file" \
+        --slurpfile bun_context "$bun_context_file" \
         --arg compiler "$(cat "$output/compiler.log")" \
         '{schema_version:1,method:"source",repository:$repo,requested_ref:$ref,source_commit:$commit,
           language:$language,path:$path,sha256:$sha,size_bytes:$size,compiler:$compiler,
           binaries:$binaries,signed_release:false} +
           (if $toolchain == null then {} else {toolchain:$toolchain} end) +
-          (if $go_context[0].go_workspace == null then {} else {go_workspace:$go_context[0].go_workspace} end)') || return 1
+          (if $go_context[0].go_workspace == null then {} else {go_workspace:$go_context[0].go_workspace} end) +
+          ($bun_context[0] // {})') || return 1
     (set -C; printf '%s\n' "$receipt" > "$destination/receipt.json") || return 1
     _isb_log "Built $binary; SHA256 $sha (locally built, not a signed release)"
     printf '%s\n' "$receipt"
