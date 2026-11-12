@@ -684,6 +684,24 @@ or fall back to source when release discovery/download is unavailable with
 and dependency build code. A failed release checksum or signature remains fatal;
 source fallback cannot bypass artifact verification.
 
+On Linux, source fallback also covers a known native libc with no compatible
+configured release target. For example, a GNU-only release installer can build
+natively on a musl host when `--allow-source-build` is present. It still resolves
+the selected version first: an explicit or discovered release version builds
+that exact tag; unavailable latest-release discovery follows the existing
+default-branch policy. No release payload for another ABI is downloaded.
+Installation still refuses before discovery when source consent is absent,
+libc is unknown, or an explicit `--libc` request cannot be satisfied. An
+unsupported host also remains an error.
+
+The focused regression adapts libc discovery while using real local Git tags,
+Go compilation and installed executables. It is also included in the full
+generated-source installer suite:
+
+```bash
+bash scripts/tests/test_generated_installer_source.sh --libc-source-fallback-only
+```
+
 When a required compiler is missing, or the installed Go compiler cannot run or
 is older than the pinned source requires, add **`--install-toolchain`** to prepare
 a compatible compiler inside that source attempt's private build directory:

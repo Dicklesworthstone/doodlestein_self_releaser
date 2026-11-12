@@ -8,8 +8,9 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ROOT="${DSR_TEST_ROOT:-$ROOT}"
 TEST_MODE="${1:-}"
-[[ $# -eq 0 || ( $# -eq 1 && "$TEST_MODE" == --go-workspace-bootstrap-only ) ]] || {
-    printf 'Usage: %s [--go-workspace-bootstrap-only]\n' "$0" >&2
+[[ $# -eq 0 || ( $# -eq 1 && ( "$TEST_MODE" == --go-workspace-bootstrap-only ||
+    "$TEST_MODE" == --libc-source-fallback-only ) ) ]] || {
+    printf 'Usage: %s [--go-workspace-bootstrap-only|--libc-source-fallback-only]\n' "$0" >&2
     exit 4
 }
 for dependency in git jq go tar; do
@@ -247,6 +248,7 @@ no_http() {
     awk '/^curl / || (/^gh / && $0 != "gh auth token --hostname github.com") { bad=1 }
          END { exit bad }' "$CALLS"
 }
+no_payload_download() { ! grep -Eq '/releases/download/|^gh release download ' "$CALLS"; }
 source_json() {
     jq -es --arg commit "$1" --arg path "$CASE/install/app" '
         length == 1 and (.[0] | .status == "success" and .method == "source" and
@@ -435,12 +437,113 @@ YAML
         "$original_go_hash" "$(source_compiler_hash)"
 }
 
+test_libc_source_fallback() {
+    if [[ "$os" != linux ]]; then
+        printf 'SKIP: implicit libc source fallback requires a Linux installer host\n'
+        return 0
+    fi
+    local loader known_musl_loader=false
+    INSTALLER_SOURCE_REAL_LDD=$(command -v ldd) || INSTALLER_SOURCE_REAL_LDD=''
+    INSTALLER_SOURCE_REAL_GETCONF=$(command -v getconf) || INSTALLER_SOURCE_REAL_GETCONF=''
+    INSTALLER_SOURCE_REAL_UNAME=$(command -v uname) || return 1
+    export INSTALLER_SOURCE_REAL_LDD INSTALLER_SOURCE_REAL_GETCONF INSTALLER_SOURCE_REAL_UNAME
+    # Only host discovery is adapted. The generated installer, tag checkout,
+    # native Go compiler, executable bytes and installation remain genuine.
+    # This is a routing test, not a claim of execution on a musl system.
+    cat > "$TEMP/bin/ldd" <<'LIBC'
+#!/usr/bin/env bash
+case "${INSTALLER_TEST_LIBC:-}" in
+    musl) printf 'musl libc (installer routing fixture)\n'; exit 0 ;;
+    unknown) printf 'DSR unidentified runtime fixture\n'; exit 0 ;;
+esac
+[[ -n "${INSTALLER_SOURCE_REAL_LDD:-}" ]] || exit 1
+exec "$INSTALLER_SOURCE_REAL_LDD" "$@"
+LIBC
+    cat > "$TEMP/bin/getconf" <<'LIBC'
+#!/usr/bin/env bash
+[[ "${INSTALLER_TEST_LIBC:-}" != unknown ]] || exit 1
+[[ -n "${INSTALLER_SOURCE_REAL_GETCONF:-}" ]] || exit 1
+exec "$INSTALLER_SOURCE_REAL_GETCONF" "$@"
+LIBC
+    cat > "$TEMP/bin/uname" <<'HOST'
+#!/usr/bin/env bash
+if [[ "${INSTALLER_TEST_HOST:-}" == unknown && "${1:-}" == -s ]]; then
+    printf 'DSR-unsupported-host\n'
+    exit 0
+fi
+exec "$INSTALLER_SOURCE_REAL_UNAME" "$@"
+HOST
+    chmod +x "$TEMP/bin/ldd" "$TEMP/bin/getconf" "$TEMP/bin/uname" || return 1
+
+    # The fixture's default GNU release has no musl candidate. An explicit
+    # source opt-in must still retain the same version policy as download loss.
+    INSTALLER_TEST_LIBC=musl run_case abi-absence-tag good \
+        --allow-source-build --version v1.0.0 --source-timeout 60
+    check 'known libc without a release candidate builds with consent' equal "$status" 0
+    check 'absent ABI source fallback binds the explicit release tag' source_json "$TAG_PIN"
+    check 'absent ABI source fallback installs a real native executable' equal "$("$CASE/install/app")" tagged-source-v1
+    check 'explicit tag without a release candidate makes no HTTP request' no_http
+    check 'absent ABI source fallback does not create a release cache' test ! -e "$CASE/cache"
+
+    INSTALLER_TEST_LIBC=musl run_case abi-absence-latest good \
+        --allow-source-build --source-timeout 60
+    check 'absent ABI still resolves latest release before source build' equal "$status" 0
+    check 'absent ABI latest fallback builds the discovered tag instead of HEAD' source_json "$TAG_PIN"
+    check 'absent ABI never downloads a different target payload' no_payload_download
+
+    INSTALLER_TEST_LIBC=musl run_case abi-absence-no-latest discovery-fail \
+        --allow-source-build --source-timeout 60
+    check 'absent ABI with unavailable latest discovery can build HEAD' equal "$status" 0
+    check 'absent ABI unavailable latest records the actual HEAD commit' source_json "$HEAD_PIN"
+    check 'absent ABI unavailable latest invents no release version' equal "$(jq -r '.version' "$CASE/out.json")" ''
+
+    INSTALLER_TEST_LIBC=musl run_case abi-absence-no-consent good --yes
+    check 'absent ABI without source consent retains argument refusal' equal "$status" 4
+    check 'absent ABI without consent never executes source' no_source
+    check 'absent ABI without consent refuses before release discovery' no_http
+    check 'absent ABI without consent emits one JSON error' error_json
+
+    INSTALLER_TEST_LIBC=musl run_case abi-absence-explicit-libc good \
+        --allow-source-build --libc musl
+    check 'unsatisfied explicit libc remains an exact request' equal "$status" 4
+    check 'unsatisfied explicit libc never invokes source' no_source
+    check 'unsatisfied explicit libc refuses before release discovery' no_http
+
+    # Production also recognizes an installed musl loader. Do not hide that
+    # evidence or claim an unknown-libc fixture when this host supplies it.
+    for loader in /lib/ld-musl-*.so.1 /usr/lib/ld-musl-*.so.1; do
+        [[ ! -e "$loader" ]] || known_musl_loader=true
+    done
+    if $known_musl_loader; then
+        printf 'SKIP: unknown-libc fixture requires no installed musl fallback loader\n'
+    else
+        INSTALLER_TEST_LIBC=unknown run_case abi-unknown-libc good --allow-source-build
+        check 'unknown libc still refuses source fallback' equal "$status" 4
+        check 'unknown libc never executes source' no_source
+        check 'unknown libc refuses before release discovery' no_http
+    fi
+
+    INSTALLER_TEST_HOST=unknown run_case abi-unknown-host good --allow-source-build
+    check 'unsupported host still refuses before source fallback' equal "$status" 1
+    check 'unsupported host never executes source' no_source
+    check 'unsupported host refuses before release discovery' no_http
+}
+
 if [[ "$TEST_MODE" == --go-workspace-bootstrap-only ]]; then
     test_workspace_bootstrap || exit 1
     printf 'Generated workspace bootstrap: %s passed, %s failed\n' "$passed" "$failed"
     [[ "$failed" == 0 ]]
     exit $?
 fi
+
+if [[ "$TEST_MODE" == --libc-source-fallback-only ]]; then
+    test_libc_source_fallback || exit 1
+    printf 'Generated libc source fallback: %s passed, %s failed\n' "$passed" "$failed"
+    [[ "$failed" == 0 ]]
+    exit $?
+fi
+
+test_libc_source_fallback || exit 1
 
 run_case force-head discovery-fail --from-source --source-timeout 60
 check 'forced source works without release discovery' equal "$status" 0
