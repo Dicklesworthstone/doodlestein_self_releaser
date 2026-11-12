@@ -3152,7 +3152,7 @@ Structured error codes for programmatic handling:
 | `GH_API_TIMEOUT` | 60 | Positive integer seconds per complete JSON API attempt or standalone authentication check (maximum 999999) |
 | `DSR_SLACK_WEBHOOK` | config `notifications.slack_webhook` | Slack incoming webhook for `--notify slack` |
 | `DSR_DISCORD_WEBHOOK` | config `notifications.discord_webhook` | Discord webhook for `--notify discord` |
-| `DSR_NOTIFY_TIMEOUT` | 20 | Seconds allowed per webhook delivery |
+| `DSR_NOTIFY_TIMEOUT` | 20 | Positive integer seconds per complete external notification channel (maximum 999999) |
 
 `DSR_MINISIGN_PASSWORD_FILE` enables unattended signing with an encrypted
 private key. It is a path, not a password value. The file must be a regular
@@ -3193,9 +3193,15 @@ Successful draft creation still retains the original response bytes when
 requested, while an interrupted attempt cannot leave an accepted creation
 receipt or cached response.
 
-A webhook delivery that fails (an HTTP error such as a revoked webhook's 404, or
-a timeout) is reported and is not recorded as sent, so the next occurrence of
-the event is delivered again. `watch --notify` passes its methods to the
+A notification delivery that fails (an HTTP error such as a revoked webhook's
+404, a failed local hook, or a timeout) is reported and is not recorded as
+sent, so the next occurrence of the event is delivered again. Every external
+channel has its own `DSR_NOTIFY_TIMEOUT` deadline, including webhook credential
+lookup, desktop commands and Agent Mail hooks. DSR retires the channel's child
+processes when delivery completes or exceeds that deadline. An invalid bound
+refuses external delivery. Notification failures remain best effort: they do
+not prevent watcher fallback launch or retain a completed fallback's capacity.
+`watch --notify` passes its methods to the
 fallbacks it starts; each fallback reports how it ended (`fallback.success`,
 `fallback.build_failed`, `fallback.release_failed`, or `fallback.failed`).
 

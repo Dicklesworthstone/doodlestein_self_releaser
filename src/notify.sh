@@ -16,6 +16,14 @@
 
 set -uo pipefail
 
+# Notifications run while callers may own build or watcher admission locks.
+# Load the shared process-group supervisor for sourceable consumers as well
+# as the CLI; a stalled delivery must not retain those locks indefinitely.
+if ! declare -F run_with_timeout >/dev/null; then
+  # shellcheck source=src/guardrails.sh
+  source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/guardrails.sh" || { return 3 2>/dev/null || exit 3; }
+fi
+
 _NOTIFY_STATE_DIR="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/notifications"
 _NOTIFY_SENT_FILE="$_NOTIFY_STATE_DIR/sent.jsonl"
 
@@ -257,6 +265,22 @@ _notify_agent_mail() {
   return 0
 }
 
+# Bound the complete channel, including credential lookup and local helper
+# descendants. curl's own deadline cannot supervise desktop commands or hooks.
+# Failed delivery remains retryable; notify_event keeps its best-effort status.
+_notify_deliver() {
+  local seconds="${DSR_NOTIFY_TIMEOUT:-20}" status=0
+  if [[ ! "$seconds" =~ ^[1-9][0-9]{0,5}$ ]]; then
+    _notify_log_warn "DSR_NOTIFY_TIMEOUT requires positive integer seconds (at most 999999); delivery skipped"
+    return 4
+  fi
+  run_with_timeout "$seconds" "$@" || status=$?
+  case "$status" in
+    124|125|137) _notify_log_warn "Notification delivery did not complete within its ${seconds}s deadline" ;;
+  esac
+  return "$status"
+}
+
 notify_event() {
   local event="$1"
   local level="$2"
@@ -324,16 +348,16 @@ notify_event() {
         _notify_terminal "$level" "$clean_title" "$clean_message"
         ;;
       slack)
-        _notify_slack "$clean_title" "$clean_message" || all_sent=false
+        _notify_deliver _notify_slack "$clean_title" "$clean_message" || all_sent=false
         ;;
       discord)
-        _notify_discord "$clean_title" "$clean_message" || all_sent=false
+        _notify_deliver _notify_discord "$clean_title" "$clean_message" || all_sent=false
         ;;
       desktop)
-        _notify_desktop "$clean_title" "$clean_message" || all_sent=false
+        _notify_deliver _notify_desktop "$clean_title" "$clean_message" || all_sent=false
         ;;
       agent_mail)
-        _notify_agent_mail "$payload" || all_sent=false
+        _notify_deliver _notify_agent_mail "$payload" || all_sent=false
         ;;
       *)
         _notify_log_warn "Unknown notify method: $method"

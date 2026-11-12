@@ -2528,6 +2528,117 @@ EOF
     [[ -f "$TEST_TMPDIR/terminal-after-completion" ]]
 }
 
+@test "watch notification deadlines preserve fallback launch and release completed capacity" {
+    command -v python3 >/dev/null || skip "Python 3 is required for watcher deadline checks"
+    command -v yq >/dev/null || skip "Real yq is required for watcher admission"
+    harness_create_config
+    export DSR_REPOS_FILE="$DSR_CONFIG_DIR/repos.yaml"
+    printf 'tools: {}\n' > "$DSR_REPOS_FILE"
+    _watch_configure_ntm $'fallback:\n  isolate_source: invalid'
+    _mock_gh_runs "$(_queued_release_run)"
+
+    # Doctor, queue polling, admission, detached fallback, completion and slot
+    # reconciliation all run through the public CLI. The explicit invalid
+    # source-policy fixture refuses before source acquisition or compilation.
+    python3 -I - "${DSR_ROUTING_TEST_ROOT:-$DSR_PROJECT_ROOT}/dsr" "$TEST_TMPDIR" <<'PY'
+import fcntl
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+cli, root = sys.argv[1], Path(sys.argv[2])
+runs_path = root / "runs.json"
+original_runs = json.loads(runs_path.read_text())
+failures = []
+
+def invoke(case, env, label):
+    args = [cli, "--json", "watch", "--once", "--auto-fallback", "--max-concurrent", "1",
+            "--max-attempts", "1", "--notify", "agent_mail"]
+    child = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, start_new_session=True)
+    try:
+        stdout, stderr = child.communicate(timeout=12)
+    except subprocess.TimeoutExpired:
+        os.killpg(child.pid, signal.SIGKILL)
+        stdout, stderr = child.communicate()
+        raise AssertionError((label, "watch outlived the independent 12s guard", stderr))
+    (case / (label + ".stdout")).write_text(stdout)
+    (case / (label + ".stderr")).write_text(stderr)
+    assert child.returncode == 0, (label, child.returncode, stderr)
+    response = json.loads(stdout)
+    assert response["command"] == "watch" and response["status"] == "success", response
+    return response
+
+def wait_for_completion(case, run_id):
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        state = json.loads((case / "state" / "triggered.json").read_text())
+        attempt = state["attempts"][str(run_id)]
+        directory = case / "state" / "watch-attempts" / attempt["attempt_id"]
+        receipt = directory / "completion.json"
+        if receipt.exists():
+            with (directory / "active.lock").open("a") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    pass
+                else:
+                    value = json.loads(receipt.read_text())
+                    assert value["exit_code"] == 4, value
+                    return
+        time.sleep(0.05)
+    raise AssertionError((run_id, "notification retained a completed attempt's capacity"))
+
+for event in ("watch.fallback_started", "fallback.failed"):
+    case = root / event
+    case.mkdir()
+    hook = case / "notification-hook"
+    hook.write_text(r'''#!/usr/bin/env bash
+set -uo pipefail
+payload=$(cat)
+printf '%s\n' "$payload" >> "$DSR_NOTIFY_TEST_CASE/events.jsonl"
+event=$(jq -r .event <<< "$payload")
+run=$(jq -r .run_id <<< "$payload")
+if [[ "$event" == "$DSR_NOTIFY_TEST_EVENT" && "$run" == *12345* ]]; then
+    printf 'started\n' > "$DSR_NOTIFY_TEST_CASE/started"
+    sleep 3
+    printf 'escaped\n' > "$DSR_NOTIFY_TEST_CASE/escaped"
+fi
+''')
+    hook.chmod(0o700)
+    env = dict(os.environ, DSR_STATE_DIR=str(case / "state"), DSR_CACHE_DIR=str(case / "cache"),
+               DSR_AGENT_MAIL_HOOK=str(hook), DSR_NOTIFY_TEST_CASE=str(case),
+               DSR_NOTIFY_TEST_EVENT=event, DSR_NOTIFY_TIMEOUT="1", GH_MAX_RETRIES="1")
+    runs = json.loads(json.dumps(original_runs))
+    runs_path.write_text(json.dumps(runs))
+    try:
+        invoke(case, env, "first")
+        wait_for_completion(case, 12345)
+        assert (case / "started").read_text() == "started\n", event
+        assert not (case / "escaped").exists(), (event, "hook exceeded the configured deadline")
+        sent_path = case / "state" / "notifications" / "sent.jsonl"
+        sent = [json.loads(line) for line in sent_path.read_text().splitlines()]
+        assert not any(row["event"] == event for row in sent), (event, sent)
+        runs["workflow_runs"][0]["id"] = 12346
+        runs_path.write_text(json.dumps(runs))
+        result = invoke(case, env, "second")
+        attempts = result["details"]["triggered_state"]["attempts"]
+        assert attempts["12345"]["status"] == "failed", attempts
+        assert attempts["12345"]["attempt"] == 1 and "12346" in attempts, attempts
+        wait_for_completion(case, 12346)
+        print("PASS watcher notification progress:", event, flush=True)
+    except (AssertionError, OSError, ValueError) as error:
+        failures.append(event)
+        print("FAIL watcher notification progress:", event, repr(error), flush=True)
+
+assert not failures, failures
+PY
+}
+
 @test "dsr watch honors the global --dry-run" {
     harness_create_config
     _setup_repos_d

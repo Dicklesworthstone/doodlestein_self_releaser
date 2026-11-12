@@ -667,6 +667,185 @@ SCRIPT
     teardown_notify_test
 }
 
+# Exercise the public notification boundary with actual helper processes and
+# the production process-group supervisor. The executables are explicit local
+# adapters; no notification is sent to a real service or desktop session.
+test_notify_delivery_deadlines() {
+    ((TESTS_RUN++))
+    setup_notify_test
+    if ! command -v python3 >/dev/null; then
+        skip "Python 3 is required for notification deadline regressions"
+        teardown_notify_test
+        return
+    fi
+    if python3 -I - "$PROJECT_ROOT" "$TEST_TMPDIR" <<'PY'
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+project, root = map(Path, sys.argv[1:])
+root = root / "delivery-deadlines"
+root.mkdir()
+shell = shutil.which("bash")
+programs = {name: shutil.which(name) for name in
+            ("bash", "cat", "date", "dirname", "grep", "jq", "mkdir", "sleep")}
+assert all(programs.values()), programs
+adapter = r'''#!/usr/bin/env bash
+set -uo pipefail
+printf '%s\n' "$DSR_NOTIFY_TEST_PHASE" >> "$DSR_NOTIFY_TEST_CASE/calls"
+case "$DSR_NOTIFY_TEST_PHASE" in
+    stalled)
+        printf 'started\n' > "$DSR_NOTIFY_TEST_CASE/started"
+        sleep 3
+        printf 'escaped\n' > "$DSR_NOTIFY_TEST_CASE/escaped"
+        ;;
+    descendant)
+        bash -c 'printf "started\n" > "$DSR_NOTIFY_TEST_CASE/child";
+            sleep 3; printf "escaped\n" > "$DSR_NOTIFY_TEST_CASE/escaped"' &
+        while [[ ! -f "$DSR_NOTIFY_TEST_CASE/child" ]]; do sleep 0.02; done
+        ;;
+    healthy)
+        if [[ "$DSR_NOTIFY_METHODS" == agent_mail ]]; then
+            cat > "$DSR_NOTIFY_TEST_CASE/payload.json"
+        fi
+        ;;
+    *) exit 17 ;;
+esac
+'''
+driver = r'''
+source "$1/src/notify.sh" || exit $?
+if [[ "$DSR_NOTIFY_TEST_PHASE" == resolver ]]; then
+    secrets_get_slack_webhook() {
+        printf 'started\n' > "$DSR_NOTIFY_TEST_CASE/started"
+        sleep 3
+        printf 'escaped\n' > "$DSR_NOTIFY_TEST_CASE/escaped"
+        printf 'https://fixture.invalid/slack\n'
+    }
+fi
+notify_event build.done info 'Release title' 'Release message' notification-deadline
+'''
+
+def make_case(name, method, executable):
+    case = root / name
+    case.mkdir()
+    binaries = case / "bin"
+    binaries.mkdir()
+    for program, source in programs.items():
+        (binaries / program).symlink_to(source)
+    helper = binaries / executable
+    helper.write_text(adapter)
+    helper.chmod(0o700)
+    env = {key: value for key, value in os.environ.items() if not key.startswith("BASH_FUNC_")}
+    env.update(PATH=str(binaries), DSR_STATE_DIR=str(case / "state"),
+               DSR_NOTIFY_TEST_CASE=str(case), DSR_NOTIFY_METHODS=method,
+               DSR_NOTIFY_TIMEOUT="1", DSR_AGENT_MAIL_HOOK=str(helper),
+               DSR_SLACK_WEBHOOK="https://fixture.invalid/slack",
+               DSR_DISCORD_WEBHOOK="https://fixture.invalid/discord")
+    return case, env
+
+def invoke(case, env, phase):
+    env = dict(env, DSR_NOTIFY_TEST_PHASE=phase)
+    started = time.monotonic()
+    child = subprocess.Popen([shell, "-c", driver, "notification-test", str(project)],
+                             env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, start_new_session=True)
+    try:
+        stdout, stderr = child.communicate(timeout=8)
+    except subprocess.TimeoutExpired:
+        os.killpg(child.pid, signal.SIGKILL)
+        stdout, stderr = child.communicate()
+        raise AssertionError((case.name, "notification outlived the independent 8s guard", stderr))
+    (case / (phase + ".stdout")).write_text(stdout)
+    (case / (phase + ".stderr")).write_text(stderr)
+    assert child.returncode == 0, (case.name, phase, child.returncode, stderr)
+    assert stdout == "", (case.name, phase, stdout)
+    return time.monotonic() - started
+
+def sent(case):
+    path = case / "state" / "notifications" / "sent.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+passed = 0
+failed = []
+def check(name, operation):
+    global passed
+    try:
+        operation()
+        passed += 1
+        print("PASS notification deadline:", name, flush=True)
+    except (AssertionError, OSError, ValueError) as error:
+        failed.append(name)
+        print("FAIL notification deadline:", name, repr(error), flush=True)
+
+for method, executable in (("agent_mail", "notification-hook"), ("desktop", "notify-send"),
+                           ("desktop", "osascript"), ("slack", "curl"), ("discord", "curl")):
+    for phase in ("healthy", "stalled"):
+        name = method + "-" + executable + "-" + phase
+        def probe(name=name, method=method, executable=executable, phase=phase):
+            case, env = make_case(name, method, executable)
+            invoke(case, env, phase)
+            assert (case / "calls").read_text() == phase + "\n", name
+            assert not (case / "escaped").exists(), (name, "helper continued past its deadline")
+            assert len(sent(case)) == (1 if phase == "healthy" else 0), (name, sent(case))
+            if phase == "stalled":
+                assert (case / "started").read_text() == "started\n", name
+            elif method == "agent_mail":
+                payload = json.loads((case / "payload.json").read_text())
+                assert payload["event"] == "build.done" and payload["title"] == "Release title", payload
+        check(name, probe)
+
+for bound in ("0", "-1", "unlimited", "1000000"):
+    def invalid(bound=bound):
+        case, env = make_case("invalid-" + bound, "agent_mail", "notification-hook")
+        env["DSR_NOTIFY_TIMEOUT"] = bound
+        invoke(case, env, "healthy")
+        assert not (case / "calls").exists(), (bound, "invalid deadline still launched delivery")
+        assert not sent(case), (bound, sent(case))
+    check("invalid deadline " + bound, invalid)
+
+def retry():
+    case, env = make_case("retry", "agent_mail", "notification-hook")
+    invoke(case, env, "stalled")
+    assert not sent(case) and not (case / "escaped").exists(), case
+    invoke(case, env, "healthy")
+    invoke(case, env, "healthy")
+    assert (case / "calls").read_text() == "stalled\nhealthy\n", case
+    assert len(sent(case)) == 1, sent(case)
+check("timeout remains retryable and successful retry is deduplicated", retry)
+
+def resolver():
+    case, env = make_case("resolver", "slack", "curl")
+    invoke(case, env, "resolver")
+    assert (case / "started").read_text() == "started\n", case
+    assert not (case / "escaped").exists() and not (case / "calls").exists(), case
+    assert not sent(case), sent(case)
+check("channel deadline includes webhook resolution", resolver)
+
+def descendants():
+    case, env = make_case("descendants", "agent_mail", "notification-hook")
+    invoke(case, env, "descendant")
+    assert (case / "child").read_text() == "started\n", case
+    time.sleep(3.2)
+    assert not (case / "escaped").exists(), "successful helper left a live descendant"
+    assert len(sent(case)) == 1, sent(case)
+check("successful helper completion retires its descendants", descendants)
+
+print("Notification deadline controls: %d passed, %d failed" % (passed, len(failed)))
+sys.exit(bool(failed))
+PY
+    then
+        pass "notification deadlines preserve progress, retries, payloads and descendant cleanup"
+    else
+        fail "notification deadline or delivery regression"
+    fi
+    teardown_notify_test
+}
+
 # ============================================================================
 # Cleanup
 # ============================================================================
@@ -675,6 +854,11 @@ cleanup() {
     harness_teardown 2>/dev/null || true
 }
 trap cleanup EXIT
+
+if [[ "${1:-}" == --delivery-deadlines-only ]]; then
+    test_notify_delivery_deadlines
+    [[ $TESTS_FAILED -eq 0 && $TESTS_PASSED -eq 1 ]] && exit 0 || exit 1
+fi
 
 # ============================================================================
 # Run All Tests
@@ -734,6 +918,7 @@ echo ""
 echo "Multiple Methods Tests:"
 test_notify_event_all_method
 test_notify_event_comma_separated
+test_notify_delivery_deadlines
 
 echo ""
 echo "=========================================="

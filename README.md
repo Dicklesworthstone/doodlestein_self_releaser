@@ -1334,7 +1334,10 @@ checkout mode on retry, including its clean, matching-checkout requirement.
 
 `--notify` takes a comma-separated list of `terminal`, `slack`, `discord`,
 `desktop`, `agent_mail` (or `all`/`none`). Fallbacks started by the watcher
-report their outcome through the same channels. Slack and Discord webhooks come
+report their outcome through the same channels. Each external channel has a
+`DSR_NOTIFY_TIMEOUT` deadline (20 seconds by default), including desktop
+commands and Agent Mail hooks. Failed or timed-out delivery leaves the event
+retryable and allows the fallback pipeline to continue. Slack and Discord webhooks come
 from `DSR_SLACK_WEBHOOK` / `DSR_DISCORD_WEBHOOK`, or from config.yaml:
 
 ```yaml
