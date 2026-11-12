@@ -15,6 +15,7 @@ from pathlib import Path
 import pathlib
 import re
 import unittest
+from unittest.mock import patch
 
 from jsonschema import Draft202012Validator
 
@@ -30,10 +31,10 @@ FACTS = {('unix', None), ('target_arch', 'x86_64'), ('target_os', 'linux'),
          ('target_endian', 'little'), ('target_pointer_width', '64')}
 
 
-def load_observer_definitions():
+def load_observer_definitions(fragment='_act_toolchain_identity_script() {'):
     path = ROOT / 'src/act_runner.sh'
     source = path.read_text()
-    start = source.index('_act_toolchain_identity_script() {')
+    start = source.index(fragment)
     start = source.index("    cat <<'PY'\n", start) + len("    cat <<'PY'\n")
     end = source.index('\nPY\n', start)
     module = ast.parse(source[start:end], filename=str(path))
@@ -50,6 +51,7 @@ def load_observer_definitions():
 
 
 OBSERVER = load_observer_definitions()
+CACHE = load_observer_definitions('_act_strict_cargo_cache_script() {')
 
 
 def executable(program, root='/opt/tools'):
@@ -147,6 +149,46 @@ def explicit_zig_observation(triple=TRIPLE, floor='2.28'):
 
 
 class ToolchainReceiptSchemaTests(unittest.TestCase):
+    def test_managed_cargo_requires_the_complete_pair_without_executable_overrides(self):
+        managed = {'RCH_CARGO_WRAPPER_BYPASS': '1', 'RCH_CARGO_WRAPPER_ORIGIN': 'rch'}
+        self.assertTrue(OBSERVER['managed_cargo_environment'](managed))
+        for key in managed:
+            changed = dict(managed)
+            del changed[key]
+            with self.subTest(missing=key):
+                self.assertFalse(OBSERVER['managed_cargo_environment'](changed))
+        for key, value in [('RCH_CARGO_WRAPPER_BYPASS', '0'),
+                           ('RCH_CARGO_WRAPPER_ORIGIN', ''),
+                           ('RCH_CARGO_WRAPPER_ORIGIN', 'caller'),
+                           ('RCH_REAL_CARGO', '/tmp/cargo'),
+                           ('RCH_SHIM_REAL_CARGO', '/tmp/cargo')]:
+            with self.subTest(key=key, value=value):
+                self.assertFalse(OBSERVER['managed_cargo_environment'](dict(managed, **{key: value})))
+
+    def test_rch_environment_is_bound_into_the_strict_cache_contract(self):
+        managed = {'RCH_DISABLED': '1', 'RCH_CARGO_WRAPPER_BYPASS': '1',
+                   'RCH_CARGO_WRAPPER_ORIGIN': 'rch'}
+        observed = CACHE['cache_environment'](dict(managed, CARGO_HOME='/private/home',
+            CARGO_TARGET_DIR='/private/target', RCH_CARGO_WRAPPER_ORIGIN_EXTRA='irrelevant'))
+        self.assertEqual(observed, managed)
+        for name in managed:
+            self.assertTrue(OBSERVER['influences'](name))
+            changed = dict(managed, **{name: 'changed'})
+            self.assertNotEqual(CACHE['cache_environment'](changed), observed)
+            changed = dict(managed)
+            del changed[name]
+            self.assertNotEqual(CACHE['cache_environment'](changed), observed)
+        self.assertFalse(OBSERVER['influences']('RCH_CARGO_WRAPPER_ORIGIN_EXTRA'))
+
+    def test_build_commands_cannot_reassign_the_managed_origin_between_cargo_invocations(self):
+        for command in ['cargo build && RCH_CARGO_WRAPPER_ORIGIN=caller cargo build',
+                        'RCH_CARGO_WRAPPER_ORIGIN=caller; cargo build']:
+            with self.subTest(command=command), patch.dict(OBSERVER, command=command, mode='record',
+                    cargo_config={'build': {}, 'target': {}, 'alias': {}, 'env': {}}), \
+                 patch.dict(os.environ, RCH_CARGO_WRAPPER_BYPASS='1', RCH_CARGO_WRAPPER_ORIGIN='rch'):
+                with self.assertRaises(ValueError):
+                    OBSERVER['invocation_selection']()
+
     def accepted(self, observation):
         errors = list(VALIDATOR.iter_errors(manifest(observation)))
         self.assertFalse(errors, '\n'.join(error.message for error in errors))

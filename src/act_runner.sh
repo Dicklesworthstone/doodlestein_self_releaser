@@ -11126,6 +11126,15 @@ def digest(path):
 def probe(argv):
     return subprocess.check_output(argv, text=True, timeout=30, env=probe_env).strip()
 
+def cache_environment(environment):
+    excluded = {'CARGO_HOME', 'CARGO_TARGET_DIR', 'CARGO_BUILD_BUILD_DIR',
+                'DSR_RELEASE_GIT_SHA', 'DSR_RELEASE_GIT_REF',
+                'FT_ATOMIC_BUILD_IDENTITY', 'FT_ATOMIC_BUILD_PROFILE'}
+    return {k: v for k, v in environment.items() if k not in excluded and
+            (k in ('RCH_DISABLED', 'RCH_CARGO_WRAPPER_BYPASS', 'RCH_CARGO_WRAPPER_ORIGIN') or
+             k.startswith(('CARGO_', 'RUST', 'XWIN_')) or
+             re.search(r'(^|_)(CC|CXX|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET)($|_)', k))}
+
 with os.fdopen(3) as context_input:
     context = json.load(context_input)
 probe_env = dict(os.environ, **context['environment'])
@@ -11215,12 +11224,7 @@ require(not any('custom-build' in target['kind']
         'strict cache does not support build scripts: rerun-if-changed remains timestamp-based')
 # Source identity/version are deliberately not cache namespace inputs. Cargo
 # fingerprints the newly verified source; the final artifact embeds its identity.
-excluded = {'CARGO_HOME', 'CARGO_TARGET_DIR', 'CARGO_BUILD_BUILD_DIR',
-            'DSR_RELEASE_GIT_SHA', 'DSR_RELEASE_GIT_REF',
-            'FT_ATOMIC_BUILD_IDENTITY', 'FT_ATOMIC_BUILD_PROFILE'}
-influences = {k: v for k, v in probe_env.items() if k not in excluded and
-              (k.startswith(('CARGO_', 'RUST', 'XWIN_')) or
-               re.search(r'(^|_)(CC|CXX|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET)($|_)', k))}
+influences = cache_environment(probe_env)
 shim_selection = selected_identity.get('selection', {}).get('dsr_cargo_shim')
 if shim_selection is not None:
     for variable, field in (('DSR_RUST_TARGET', 'rust_target'), ('DSR_ZIG_TARGET', 'zig_target'),
@@ -11510,8 +11514,14 @@ def shell_word(raw, variables=()):
 
 def influences(name):
     return name in ('PATH', 'DSR_TARGET_TRIPLE', 'DSR_RUST_TARGET', 'DSR_ZIG_TARGET',
-                    'DSR_LINUX_GLIBC_FLOOR') or name.startswith(('CARGO_', 'RUST', 'XWIN_')) or bool(re.search(
+                    'DSR_LINUX_GLIBC_FLOOR', 'RCH_DISABLED', 'RCH_CARGO_WRAPPER_BYPASS',
+                    'RCH_CARGO_WRAPPER_ORIGIN') or name.startswith(('CARGO_', 'RUST', 'XWIN_')) or bool(re.search(
         r'(^|_)(CC|CXX|CPP|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET)($|_)', name))
+
+def managed_cargo_environment(environment):
+    return (environment.get('RCH_CARGO_WRAPPER_BYPASS') == '1' and
+            environment.get('RCH_CARGO_WRAPPER_ORIGIN') == 'rch' and
+            not environment.get('RCH_REAL_CARGO') and not environment.get('RCH_SHIM_REAL_CARGO'))
 
 
 def cargo_env_exemption(name, entry):
@@ -12534,9 +12544,8 @@ def identity(name, program, version_args, rustup_tool=None, required=True, cargo
     managed_cargo = rustup_tool == 'cargo' and record['selected_kind'] == 'script' and \
         record['selected_sha256'] in (rch_shim_hash, rch_toolchain_hash, rch_shim_v6_hash)
     if managed_cargo:
-        if (probe_env.get('RCH_CARGO_WRAPPER_BYPASS') != '1' or
-                probe_env.get('RCH_REAL_CARGO') or probe_env.get('RCH_SHIM_REAL_CARGO')):
-            fail('managed RCH Cargo resolution requires explicit bypass without executable overrides')
+        if not managed_cargo_environment(probe_env):
+            fail('managed RCH Cargo resolution requires paired bypass and origin without executable overrides')
         if record['selected_sha256'] == rch_toolchain_hash and not explicit_toolchain:
             actual = resolved_selected.parent / 'cargo-rch-real'
         elif record['selected_sha256'] == rch_shim_v6_hash and not explicit_toolchain:
@@ -12591,8 +12600,7 @@ def identity(name, program, version_args, rustup_tool=None, required=True, cargo
                     actual, record['rustup_resolver'] = rustup_resolve(fallback_manager, rustup_tool)
             if is_script(actual):
                 if (rustup_tool != 'cargo' or digest(actual) != rch_toolchain_hash or
-                        probe_env.get('RCH_CARGO_WRAPPER_BYPASS') != '1' or
-                        probe_env.get('RCH_REAL_CARGO') or probe_env.get('RCH_SHIM_REAL_CARGO')):
+                        not managed_cargo_environment(probe_env)):
                     fail('unresolved compiler launcher: ' + str(actual))
                 record['toolchain_launcher'] = {'path': str(actual), 'sha256': digest(actual)}
                 actual = (actual.parent / 'cargo-rch-real').resolve(strict=True)
