@@ -1416,6 +1416,24 @@ refused. The worker receives the path in its private stage. The receipt retains
 `DSR_GO_WORKFILE` (graph-relative path), `DSR_GO_WORKFILE_SHA256` and
 `DSR_GO_WORKFILE_GIT_SHA`; all three are empty when workspace mode is off.
 
+Local Go source references must stay within that same pinned graph. Before
+native source staging, DSR inspects every committed `go.mod` local `replace`
+directive and the selected workfile's `use` and local `replace` directives,
+including manifests in pinned Git submodules. Each referenced directory must
+resolve through committed directories to a committed regular `go.mod` in the
+main or an explicitly pinned sibling root. Relative sibling paths such as
+`../shared` remain supported; absolute paths, escapes, symlink traversals and
+untracked module roots are refused. Go quoted-string escapes are decoded before
+containment checks. All committed module manifests are checked, including
+currently inactive replacements, because a reviewed build command can select
+any of those modules. Versioned module replacements remain supported.
+
+The same source-path admission runs again when constructing each worker's
+compiler policy and when validating retained output for resume or publication.
+It does not need a Go compiler on the coordinator and does not fetch dependency
+modules. This checks pinned module/workspace metadata; it does not sandbox
+arbitrary reviewed build commands or authenticate downloaded module-cache bytes.
+
 Strict Go resume validates both embedded results and immutable result sidecars
 against the current recipe and pinned workfile identity before changing the
 checkpoint or dispatching workers. Publication requires exactly one matching

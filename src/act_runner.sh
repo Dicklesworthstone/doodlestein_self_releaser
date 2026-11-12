@@ -9531,12 +9531,22 @@ act_sync_sources() {
     fi
 
     if $strict_release; then
-        local strict_target
+        local strict_target strict_language strict_go_env strict_go_workfile
+        strict_language=$(yq -r '.language // ""' "$config_file") || return 4
         for strict_target in $targets; do
             if act_platform_uses_act "$tool_name" "$strict_target"; then
                 _log_error "Strict release target $strict_target cannot use act"
                 echo '{"status":"error","error":"Strict release targets must use native builds"}'
                 return 4
+            fi
+            if [[ "$strict_language" == go ]]; then
+                strict_go_env=$(act_get_build_env "$tool_name" "$strict_target") || return 4
+                strict_go_workfile=$(act_get_build_env_value "$strict_go_env" GOWORK) || strict_go_workfile=''
+                if ! _act_strict_go_workfile_json "$tool_name" "$strict_git_sha" \
+                    "$strict_go_workfile" '/.dsr-go-source-admission/source' >/dev/null; then
+                    echo '{"status":"error","error":"Strict Go source paths leave the pinned source graph"}'
+                    return 4
+                fi
             fi
         done
     fi
@@ -10468,12 +10478,201 @@ import re
 import subprocess
 import sys
 
+def go_string(token):
+    # Go module strings use strconv.Unquote, not shell or JSON quoting. Decode
+    # the permitted escapes before checking paths, including octal/hex escapes
+    # that could otherwise hide an absolute path or parent traversal.
+    if not token.startswith('"'):
+        if any(character in token for character in '\"\'`'):
+            raise ValueError('unsupported quoted Go module string')
+        return token
+    if len(token) < 2 or not token.endswith('"'):
+        raise ValueError('unterminated Go module string')
+    value = bytearray()
+    index = 1
+    escapes = {'a': 7, 'b': 8, 'f': 12, 'n': 10, 'r': 13, 't': 9, 'v': 11, '\\': 92, '"': 34}
+    while index < len(token) - 1:
+        character = token[index]
+        index += 1
+        if character != '\\':
+            value.extend(character.encode('utf-8'))
+            continue
+        if index >= len(token) - 1:
+            raise ValueError('incomplete Go module escape')
+        character = token[index]
+        index += 1
+        if character in escapes:
+            value.append(escapes[character])
+            continue
+        if character in '01234567':
+            digits = character + token[index:index + 2]
+            if len(digits) != 3 or any(digit not in '01234567' for digit in digits):
+                raise ValueError('invalid Go module octal escape')
+            number = int(digits, 8)
+            if number > 255:
+                raise ValueError('invalid Go module byte escape')
+            value.append(number)
+            index += 2
+            continue
+        length = {'x': 2, 'u': 4, 'U': 8}.get(character)
+        if length is None:
+            raise ValueError('invalid Go module escape')
+        digits = token[index:index + length]
+        if len(digits) != length or not re.fullmatch('[0-9a-fA-F]+', digits):
+            raise ValueError('invalid Go module hexadecimal escape')
+        number = int(digits, 16)
+        if character == 'x':
+            value.append(number)
+        else:
+            if number > 0x10ffff or 0xd800 <= number <= 0xdfff:
+                raise ValueError('invalid Go module Unicode escape')
+            value.extend(chr(number).encode('utf-8'))
+        index += length
+    return value.decode('utf-8')
+
+def go_directives(contents):
+    # Only use/replace select local source. This is a fail-closed lexical
+    # boundary, not a replacement for Go's complete module/version parser.
+    # Match its line/block syntax and // comments; never regex-match paths in
+    # raw text where quoted escapes or comments can change their meaning.
+    block = None
+    for line in contents.decode('utf-8').splitlines():
+        tokens = []
+        index = 0
+        while index < len(line):
+            character = line[index]
+            if character in ' \t\r':
+                index += 1
+                continue
+            if line.startswith('//', index):
+                break
+            if line.startswith('/*', index):
+                raise ValueError('Go module files require // comments')
+            start = index
+            if character in '"`':
+                index += 1
+                while index < len(line):
+                    if line[index] == character:
+                        index += 1
+                        break
+                    if line[index] == '\\' and character == '"':
+                        index += 1
+                    index += 1
+                else:
+                    raise ValueError('unterminated Go module string')
+            elif character in '()[]{},':
+                index += 1
+            else:
+                while index < len(line) and line[index] not in ' \t\r()[]{},':
+                    if line.startswith('//', index):
+                        break
+                    if line.startswith('/*', index) or not line[index].isprintable():
+                        raise ValueError('unsupported Go module token')
+                    index += 1
+            tokens.append(line[start:index])
+        if not tokens:
+            continue
+        if block is not None:
+            if tokens == [')']:
+                block = None
+                continue
+            if '(' in tokens or ')' in tokens:
+                raise ValueError('invalid Go module block')
+            directive, arguments = block, tokens
+        elif len(tokens) == 2 and tokens[1] == '(':
+            block = tokens[0]
+            continue
+        elif len(tokens) == 3 and tokens[1:] == ['(', ')']:
+            continue
+        else:
+            directive, arguments = tokens[0], tokens[1:]
+        if directive == 'use':
+            if len(arguments) != 1:
+                raise ValueError('invalid Go workspace use directive')
+            yield 'use', go_string(arguments[0])
+        elif directive == 'replace':
+            arrow = 1 if len(arguments) >= 2 and arguments[1] == '=>' else 2
+            if len(arguments) not in (arrow + 2, arrow + 3) or arguments[arrow] != '=>':
+                raise ValueError('invalid Go replacement directive')
+            if len(arguments) == arrow + 2:
+                yield 'replace', go_string(arguments[arrow + 1])
+    if block is not None:
+        raise ValueError('unterminated Go module block')
+
 try:
     selected, stage_source, encoded = sys.argv[1:]
     sources = json.loads(encoded)
     roots = {row['relative_path']: row for row in sources}
     if len(roots) != len(sources) or 'source' not in roots:
         raise ValueError('invalid admitted Go source graph')
+    environment = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+    environment.update(GIT_NO_REPLACE_OBJECTS='1', GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
+    inventory = {}
+    directories = set(roots)
+    pending = [(name, row['local_path'], row['git_sha'], 0) for name, row in roots.items()]
+    while pending:
+        prefix, checkout, revision, depth = pending.pop()
+        if depth > 16 or not re.fullmatch('[0-9a-f]{40}', revision):
+            raise ValueError('invalid pinned Go submodule graph')
+        tree = subprocess.check_output(['git', '-C', checkout, 'ls-tree', '-r', '-t', '-z', revision],
+                                       env=environment)
+        for record in tree.split(b'\0'):
+            if not record:
+                continue
+            metadata, path = record.split(b'\t', 1)
+            mode, kind, oid = metadata.decode('ascii').split(' ')
+            relative = path.decode('utf-8')
+            graph_path = prefix + '/' + relative
+            if graph_path in inventory:
+                raise ValueError('duplicate pinned Go source path')
+            inventory[graph_path] = (mode, kind, oid, checkout)
+            if kind == 'tree':
+                directories.add(graph_path)
+            elif mode == '160000' and kind == 'commit':
+                directories.add(graph_path)
+                pending.append((graph_path, os.path.join(checkout, relative), oid, depth + 1))
+
+    def committed_contents(path):
+        mode, kind, oid, checkout = inventory.get(path, ('', '', '', ''))
+        if mode not in ('100644', '100755') or kind != 'blob':
+            raise ValueError('local Go module requires a committed regular file: ' + path)
+        return subprocess.check_output(['git', '-C', checkout, 'cat-file', 'blob', oid], env=environment)
+
+    def local_module(manifest, reference):
+        if (not reference or reference.startswith('/') or '\\' in reference or ':' in reference or
+                any(ord(character) < 32 or ord(character) == 127 for character in reference)):
+            raise ValueError('local Go path must be portable and relative: ' + manifest)
+        components = manifest.split('/')[:-1]
+        for component in reference.split('/'):
+            if component in ('', '.'):
+                continue
+            if component == '..':
+                if not components:
+                    raise ValueError('local Go path escapes the pinned source graph: ' + manifest)
+                components.pop()
+            else:
+                if component.lower() == '.git':
+                    raise ValueError('local Go path enters Git metadata: ' + manifest)
+                components.append(component)
+                if '/'.join(components) not in directories:
+                    raise ValueError('local Go path is unpinned, missing or linked: ' + manifest)
+        target = '/'.join(components)
+        if not target or target.split('/')[0] not in roots:
+            raise ValueError('local Go path escapes the pinned source graph: ' + manifest)
+        committed_contents(target + '/go.mod')
+
+    def validate_paths(manifest, contents, work=False):
+        for directive, reference in go_directives(contents):
+            if directive == 'use' and not work:
+                raise ValueError('use directive is not valid in a Go module')
+            local_module(manifest, reference)
+
+    # Every committed module can be selected by a reviewed build command.
+    # Inspect its local replacements, including nested modules and pinned
+    # submodules. Ordinary downloaded module-cache authentication is separate.
+    for path in inventory:
+        if path.endswith('/go.mod'):
+            validate_paths(path, committed_contents(path))
     if any(ord(character) < 32 for character in selected) or '\\' in selected:
         raise ValueError('GOWORK must be a literal portable path inside an admitted source root')
     if selected == 'off':
@@ -10503,8 +10702,6 @@ try:
         raise ValueError('invalid pinned Go workfile identity')
     # Query the admitted checkout itself, never GIT_DIR/GIT_WORK_TREE or
     # object/config overrides inherited from the coordinator's shell.
-    environment = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
-    environment.update(GIT_NO_REPLACE_OBJECTS='1', GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
     command = ['git', '--literal-pathspecs', '-C', row['local_path']]
     entry = subprocess.check_output(command + ['ls-tree', '-z', revision, '--', relative], env=environment)
     if not entry and optional:
@@ -10518,6 +10715,7 @@ try:
     if mode not in (b'100644', b'100755') or kind != b'blob' or filename.decode('utf-8') != relative:
         raise ValueError('GOWORK must select a committed regular file without linked ancestors')
     contents = subprocess.check_output(command + ['cat-file', 'blob', oid.decode('ascii')], env=environment)
+    validate_paths(name + '/' + relative, contents, work=True)
     stage_source = stage_source.replace('\\', '/').rstrip('/')
     if not stage_source.endswith('/source') or not (stage_source.startswith('/') or re.match(r'^[A-Za-z]:/', stage_source)):
         raise ValueError('invalid private Go source stage')
@@ -10526,7 +10724,7 @@ try:
     print(json.dumps(dict(gowork=actual, path=graph_path,
                          sha256=hashlib.sha256(contents).hexdigest(), git_sha=revision)))
 except (KeyError, TypeError, ValueError, OSError, subprocess.CalledProcessError) as error:
-    print('[act] Strict Go workfile policy: ' + str(error), file=sys.stderr)
+    print('[act] Strict Go source paths and workfile policy: ' + str(error), file=sys.stderr)
     raise SystemExit(4)
 PY
 }

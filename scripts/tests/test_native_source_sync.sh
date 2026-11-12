@@ -23,9 +23,169 @@
 # sibling drift and layout refusal checks; --strict-go-matrix-only proves
 # simultaneous pinned amd64/386 Go builds with private verified stages.
 # Use --strict-go-context-only for actual Go policy and retained-output admission.
+# Use --strict-go-paths-only for pinned local Go dependency boundaries.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 ROOT="${DSR_TEST_ROOT:-$ROOT}"
+
+test_strict_go_source_paths() (
+    local dependency work sha dep_sha config status=0 checks=0 failures=0 item expected
+    local selection="${1:-all}"
+    for dependency in bash git jq yq python3 go tar; do
+        command -v "$dependency" >/dev/null || { printf 'SKIP: strict Go paths require %s\n' "$dependency"; return 77; }
+    done
+    [[ $(uname -s)/$(uname -m) == Linux/x86_64 && $(go version) == 'go version go'* ]] || return 77
+    work=$(mktemp -d "${DSR_TEST_DISK_ROOT:-${TMPDIR:-/tmp}}/dsr-go-paths.XXXXXXXX") || return 1
+    printf 'Strict Go source path evidence: %s\n' "$work"
+    mkdir -p "$work/config/repos.d" "$work/source" "$work/dep" "$work/outside" "$work/stages" || return 1
+    export DSR_CONFIG_DIR="$work/config" ACT_CONFIG_DIR="$work/config" ACT_REPOS_DIR="$work/config/repos.d"
+    export DSR_STATE_DIR="$work/state" DSR_CACHE_DIR="$work/cache"
+    export DSR_HOSTS_FILE="$work/config/hosts.yaml" DSR_REPOS_FILE="$work/config/repos.yaml"
+    export DSR_DISABLE_HOST_SELECTOR=1 NO_COLOR=1 GOMAXPROCS=1
+    printf 'module example.local/dep\n\ngo 1.19\n' > "$work/dep/go.mod"
+    printf 'package dep\nfunc Value() string { return "pinned-input" }\n' > "$work/dep/dep.go"
+    printf 'module example.local/dep\n\ngo 1.19\n' > "$work/outside/go.mod"
+    printf 'package dep\nfunc Value() string { return "UNPINNED-EXTERNAL-INPUT" }\n' > "$work/outside/dep.go"
+    printf 'module example.local/paths\n\ngo 1.19\nrequire example.local/dep v0.0.0\nreplace example.local/dep => %s\n' \
+        "$work/outside" > "$work/source/go.mod"
+    printf 'package main\nimport "example.local/dep"\nfunc main() { println(dep.Value()) }\n' > "$work/source/main.go"
+    for item in source dep; do
+        git -C "$work/$item" init -q -b main || return 1
+        git -C "$work/$item" add . || return 1
+        git -C "$work/$item" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm pinned || return 1
+    done
+    git -C "$work/source" tag v1.0.0 || return 1
+    dep_sha=$(git -C "$work/dep" rev-parse HEAD) || return 1
+    jq -n --arg work "$work" '{schema_version:"1.0.0",hosts:{localnative:{
+        platform:"linux/amd64",connection:"local",concurrency:1,build_root:($work+"/stages")}},
+        platform_mapping:{"linux/amd64":"localnative"}}' > "$DSR_HOSTS_FILE" || return 1
+    config="$ACT_REPOS_DIR/paths.yaml"
+    jq -n --arg work "$work" --arg path "$PATH" --arg sha "$dep_sha" \
+        --arg cache "${DSR_TEST_GOCACHE:-$work/go-cache}" '{
+        tool_name:"paths",repo:"example/paths",local_path:($work+"/source"),language:"go",binary_name:"paths",
+        targets:["linux/amd64"],act_job_map:{"linux/amd64":null},hosts:{"linux/amd64":"localnative"},
+        sibling_crates:[{local_path:($work+"/dep"),relative_path:"dep",revision:$sha}],
+        build_cmd:"printf compiler\\n >> \"$PROBE_EVENTS\"; go build -p=1 -buildvcs=false -o paths .",
+        env:{PATH:$path,PROBE_EVENTS:($work+"/compiler-events"),GOCACHE:$cache,GOMAXPROCS:"1",
+          CGO_ENABLED:"0",GOPROXY:"off",GOSUMDB:"off"},
+        release_contract:{checksum_sidecar:"sha256",exact_primary_assets:{"linux/amd64":"paths-linux-amd64"}}}
+        ' > "$config" || return 1
+    # shellcheck source=../../src/logging.sh
+    source "$ROOT/src/logging.sh"
+    # shellcheck source=../../src/config.sh
+    source "$ROOT/src/config.sh"
+    # shellcheck source=../../src/build_state.sh
+    source "$ROOT/src/build_state.sh"
+    # shellcheck source=../../src/act_runner.sh
+    source "${DSR_TEST_ACT_RUNNER:-$ROOT/src/act_runner.sh}"
+    # shellcheck source=../../src/artifact_naming.sh
+    source "$ROOT/src/artifact_naming.sh"
+    # shellcheck source=../../src/host_selector.sh
+    source "$ROOT/src/host_selector.sh"
+    # shellcheck source=../../src/host_health.sh
+    source "$ROOT/src/host_health.sh"
+    # shellcheck source=../../src/git_ops.sh
+    source "$ROOT/src/git_ops.sh"
+    # shellcheck source=../../src/packaging.sh
+    source "$ROOT/src/packaging.sh"
+    host_health_is_ready() { return 0; }
+    selector_acquire_slot() { return 0; }
+    selector_release_slot() { return 0; }
+    build_state_init || return 1
+    export SCRIPT_DIR="$ROOT" JSON_MODE=true DRY_RUN=false VERBOSE=false DSR_VERSION=fixture DSR_KEEP_BUILD_STAGES=1
+    declare -A _DSR_LOADED_MODULES=([packaging]=1 [artifact_naming]=1)
+    # shellcheck disable=SC1090 # Actual public build and publication consumers.
+    source <(awk '/^(_dsr_require|cmd_build|_release_sha256|_release_require_publishable_artifacts)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$ROOT/dsr") || return 1
+    # shellcheck disable=SC1090
+    source <(awk '/^json_envelope\(\) \{/{copy=1} copy{print} copy && /^# ====/{exit}' "$ROOT/dsr") || return 1
+    check_go_path() {
+        local label="$1"; shift
+        checks=$((checks + 1))
+        if "$@"; then printf 'PASS: Go source paths: %s\n' "$label"
+        else failures=$((failures + 1)); printf 'FAIL: Go source paths: %s\n' "$label" >&2; fi
+    }
+    parse_go_path_fixture() {
+        GOENV=off GOFLAGS='' GOWORK=off GOTOOLCHAIN=local GOTELEMETRY=off go "$@" >/dev/null
+    }
+    printf 'BOUNDARY: fixture host health/capacity only; real pinned Git, cmd_build, Go compilation, collection and publication admission\n'
+    if [[ "$selection" != pinned ]]; then
+    cmd_build paths --version 1.0.0 --output-dir "$work/external-output" \
+        > "$work/external.json" 2> "$work/external.log" || status=$?
+    check_go_path 'public strict build refuses an absolute unpinned replacement' test "$status" -ne 0
+    check_go_path 'local source refusal identifies the Go path boundary' grep -q 'Strict Go source paths' "$work/external.log"
+    check_go_path 'unpinned replacement never reaches the compiler' test ! -e "$work/compiler-events"
+    if [[ -x "$work/external-output/paths-linux-amd64" ]]; then
+        printf 'COUNTEREXAMPLE: genuine strict executable says %s\n' "$("$work/external-output/paths-linux-amd64" 2>&1)"
+        _release_require_publishable_artifacts "$work/external-output" "$work/external-output/paths-v1.0.0-manifest.json" true &&
+            printf 'COUNTEREXAMPLE: unpinned executable passed actual release admission\n'
+    fi
+    if [[ "$selection" == external ]]; then
+        printf 'Strict Go source paths: %s checks, %s failures; evidence %s\n' "$checks" "$failures" "$work"
+        [[ "$failures" -eq 0 ]]; return $?
+    fi
+    fi
+    printf 'module example.local/paths\n\ngo 1.19\nrequire example.local/dep v0.0.0\nreplace example.local/dep => ../dep\n' > "$work/source/go.mod"
+    git -C "$work/source" add go.mod || return 1
+    git -C "$work/source" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm pinned-replacement || return 1
+    git -C "$work/source" tag v1.0.1 || return 1
+    sha=$(git -C "$work/source" rev-parse HEAD) || return 1
+    status=0
+    cmd_build paths --version 1.0.1 --output-dir "$work/pinned-output" \
+        > "$work/pinned.json" 2> "$work/pinned.log" || status=$?
+    check_go_path 'public strict build preserves a pinned sibling replacement' test "$status" -eq 0
+    if [[ "$status" -ne 0 ]]; then cat "$work/pinned.log" >&2; return 1; fi
+    check_go_path 'actual admitted binary executes pinned dependency bytes' \
+        test "$("$work/pinned-output/paths-linux-amd64" 2>&1)" = pinned-input
+    check_go_path 'pinned output passes the actual release admission consumer' \
+        _release_require_publishable_artifacts "$work/pinned-output" "$work/pinned-output/paths-v1.0.1-manifest.json" true
+    act_load_repo_config paths || return 1
+    for item in '../dep' '"\x2e\x2e/dep"' 'example.local/versioned v1.2.3' '../outside' '../../outside' \
+        '"\u002foutside"' '"C:/outside"' '../dep/../../outside' './linked'; do
+        expected=4
+        case "$item" in '../dep'|'"\x2e\x2e/dep"'|'example.local/versioned v1.2.3') expected=0 ;; esac
+        if [[ "$item" == ./linked ]]; then ln -s ../dep "$work/source/linked" || return 1; fi
+        printf 'module example.local/paths\n\ngo 1.19\nrequire example.local/dep v0.0.0\nreplace (\n example.local/dep => %s // path\n)\n' \
+            "$item" > "$work/source/go.mod"
+        git -C "$work/source" add . || return 1
+        git -C "$work/source" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm path-control || return 1
+        sha=$(git -C "$work/source" rev-parse HEAD) || return 1
+        status=0
+        _act_strict_go_build_env paths "$sha" v1.0.1 '/private/stage/source' '' \
+            > "$work/path-result.json" 2> "$work/path-result.log" || status=$?
+        check_go_path "replacement $item observes pinned graph boundaries" test "$status" -eq "$expected"
+        if [[ "$expected" -eq 0 ]]; then
+            check_go_path "actual Go parser accepts replacement $item" \
+                parse_go_path_fixture mod edit -json "$work/source/go.mod"
+        fi
+    done
+    printf 'module example.local/paths\n\ngo 1.19\nrequire example.local/dep v0.0.0\nreplace example.local/dep => ../dep\n' > "$work/source/go.mod"
+    for item in '../dep' '"\x2e\x2e/dep"' '../outside' '"\u002foutside"' './linked' '../dep/../../outside'; do
+        expected=4
+        case "$item" in '../dep'|'"\x2e\x2e/dep"') expected=0 ;; esac
+        printf 'go 1.19\nuse (\n .\n %s // workspace module\n)\n' "$item" > "$work/source/go.work"
+        git -C "$work/source" add . || return 1
+        git -C "$work/source" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm workspace-control || return 1
+        sha=$(git -C "$work/source" rev-parse HEAD) || return 1
+        status=0
+        _act_strict_go_build_env paths "$sha" v1.0.1 'C:/private/stage/source' '' \
+            > "$work/workspace-result.json" 2> "$work/workspace-result.log" || status=$?
+        check_go_path "workspace $item observes the same Windows source graph boundary" test "$status" -eq "$expected"
+        if [[ "$expected" -eq 0 ]]; then
+            check_go_path "actual Go parser accepts workspace $item" \
+                parse_go_path_fixture work edit -json "$work/source/go.work"
+        fi
+    done
+    printf 'go 1.19\nuse (\n .\n ../dep\n)\nreplace example.local/dep => %s\n' "$work/outside" > "$work/source/go.work"
+    git -C "$work/source" add go.work || return 1
+    git -C "$work/source" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm workspace-replacement || return 1
+    sha=$(git -C "$work/source" rev-parse HEAD) || return 1
+    status=0
+    _act_strict_go_build_env paths "$sha" v1.0.1 '/private/stage/source' '' \
+        > "$work/workspace-result.json" 2> "$work/workspace-result.log" || status=$?
+    check_go_path 'workspace replacement cannot escape otherwise pinned use entries' test "$status" -eq 4
+    printf 'Strict Go source paths: %s checks, %s failures; evidence %s\n' "$checks" "$failures" "$work"
+    [[ "$failures" -eq 0 ]]
+)
 
 test_strict_go_context() (
     local dependency work runtime config sha status checks=0 failures=0 stage result
@@ -2470,6 +2630,18 @@ IGNORE
     [[ "$selection_failures" -eq 0 ]]
 )
 
+if [[ "${1:-}" == --strict-go-paths-only ]]; then
+    test_strict_go_source_paths
+    exit $?
+fi
+if [[ "${1:-}" == --strict-go-paths-external-only ]]; then
+    test_strict_go_source_paths external
+    exit $?
+fi
+if [[ "${1:-}" == --strict-go-paths-pinned-only ]]; then
+    test_strict_go_source_paths pinned
+    exit $?
+fi
 if [[ "${1:-}" == --strict-go-context-only ]]; then
     test_strict_go_context
     exit $?
