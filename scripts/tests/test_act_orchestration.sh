@@ -15,6 +15,8 @@
 # function for a paired comparison over the same files in that invocation.
 # --strict-manifest-inventory-only compiles a local C executable and exercises
 # exact strict manifests with real Git source, staged receipts and companions.
+# Its Rust compiler-policy envelopes are explicit synthetic unit fixtures;
+# actual Rust compilation/observation is covered by test_native_source_sync.sh.
 # --native-matrix-inventory-only exercises complete native matrix admission
 # with actual archives/receipts; GNU/musl worker selection is fixture metadata.
 # --backend-receipt-only exercises exact backend stdout admission and proves
@@ -35,6 +37,38 @@ SKIP=0
 pass() { echo -e "${GREEN}✓${NC} $1"; ((PASS++)); }
 fail() { echo -e "${RED}✗${NC} $1"; ((FAIL++)); }
 skip() { echo -e "${YELLOW}○${NC} $1"; ((SKIP++)); }
+
+# Populate the compiler boundary only for tests that deliberately replace the
+# native Rust backend. These values are synthetic protocol data, not observations
+# of Cargo/rustc execution. Collection, staging, manifest and policy validators
+# remain production code, and negative cases remove or corrupt this authority.
+_fixture_strict_rust_result() {
+    local result="$1" sha="$2" ref="$3" source_root="$4" platform triple
+    platform=$(jq -er '.platform' <<< "$result") || return 4
+    triple=$(jq -r '.target_triple // ""' <<< "$result") || return 4
+    [[ -n "$triple" ]] || triple=$(_act_default_rust_target_triple "$platform") || return 4
+    jq -c --arg sha "$sha" --arg ref "$ref" --arg source "$source_root" --arg triple "$triple" '
+        def tool($name): {
+            program:$name, selected_path:("/synthetic-rust-fixture/" + $name),
+            selected_sha256:("5" * 64), selected_kind:"executable",
+            version:"synthetic unit fixture; compiler not executed"
+        };
+        .method = "native" |
+        .host = (.host // "synthetic-rust-fixture") |
+        .build_influence_env = ((.build_influence_env // {}) + {
+            DSR_RUST_ENV_POLICY:"1", DSR_RELEASE_GIT_SHA:$sha, DSR_RELEASE_GIT_REF:$ref
+        }) |
+        .cargo_isolation = {
+            mode:"strict-release-snapshot", source_boundary:"canonical-fresh-source-root",
+            cargo_home:"/synthetic-rust-fixture/cargo-home", target_dir:"/synthetic-rust-fixture/target",
+            ancestor_config_policy:"reject", cache_reuse:[],
+            toolchain:{schema_version:1, cwd:$source, target_triple:$triple, linker_variable:null,
+                tools:{cargo:tool("cargo"), rustc:tool("rustc"), linker:tool("cc")},
+                selection:{rustup_toolchain:null, cargo_commands:["build"], cargo_config:[],
+                    native_environment:{DSR_RUST_ENV_POLICY:"1"}}}
+        }
+    ' <<< "$result"
+}
 
 test_backend_receipt_isolation() {
     local project_root dependency
@@ -962,7 +996,8 @@ test_strict_manifest_inventory() {
     for dependency in python3 bash cc git jq yq; do
         command -v "$dependency" >/dev/null || { echo "Missing test dependency: $dependency" >&2; return 77; }
     done
-    python3 -I - "$project_root" "${DSR_TEST_ACT_RUNNER:-$project_root/src/act_runner.sh}" <<'PY'
+    python3 -I - "$project_root" "${DSR_TEST_ACT_RUNNER:-$project_root/src/act_runner.sh}" \
+        "$(declare -f _fixture_strict_rust_result)" <<'PY'
 import copy
 import hashlib
 import json
@@ -975,7 +1010,8 @@ import sys
 import tempfile
 import time
 
-root, module = map(Path, sys.argv[1:])
+root, module = map(Path, sys.argv[1:3])
+rust_fixture_helper = sys.argv[3]
 architecture = {'x86_64': ('amd64', 'x86_64'), 'aarch64': ('arm64', 'aarch64')}.get(platform.machine())
 if platform.system() != 'Linux' or architecture is None:
     print('SKIP: strict manifest executable fixture requires native Linux amd64/arm64')
@@ -1016,7 +1052,7 @@ run('cc', source, '-o', work / 'inventoryapp')
 check('tagged local C source produces a runnable native executable',
       run(work / 'inventoryapp').stdout == b'strict inventory fixture\n')
 
-driver = r'''set -uo pipefail
+driver = rust_fixture_helper + '\n' + r'''set -uo pipefail
 root=$1 module=$2 work=$3 target=$4 triple=$5; shift 5
 export DSR_CONFIG_DIR="$work/config" DSR_REPOS_FILE="$work/config/repos.yaml"
 export ACT_REPOS_DIR="$work/config/repos.d" ACT_ARTIFACTS_DIR="$work/artifacts"
@@ -1035,6 +1071,8 @@ case "$operation" in
                  target_triple:$triple,build_purpose:"release",publishable:true,
                  artifact_path:.path,collected_sha256:.sha256,collected_size_bytes:.size_bytes,
                  collected_identity:.identity}' <<< "$receipt") || exit $?
+        fixture_sha=$(git -C "$work/source" rev-parse HEAD) || exit $?
+        result=$(_fixture_strict_rust_result "$result" "$fixture_sha" v1.2.3 "$work/source") || exit $?
         contract=$(config_get_release_contract_json "$tool") || exit $?
         _act_stage_contract_primary "$tool" v1.2.3 12345678-1234-1234-1234-123456789abc "$target" "$result" "$contract" > "$1" ;;
     manifest) act_generate_manifest "$(cat "$1")" "$2" ;;
@@ -1089,7 +1127,7 @@ results, expected_rows, staged_paths = {}, {}, []
 for count in (1, 280):
     tool = 'strictinventory' + str(count)
     save(work / ('config/repos.d/' + tool + '.yaml'), {
-        'tool_name': tool, 'binary_name': 'inventoryapp', 'local_path': str(work / 'source'),
+        'tool_name': tool, 'language': 'rust', 'binary_name': 'inventoryapp', 'local_path': str(work / 'source'),
         'targets': [target], 'target_triples': {target: triple}, 'act_job_map': {target: None},
         'workspace_additional_artifacts': {target: [p.name for p in paths[:count]]},
         'release_contract': {'checksum_sidecar': 'sha256',
@@ -1146,7 +1184,7 @@ check('complete strict manifest passes the shared successful-release profile',
       invoke('profile', 'admission', manifest, work / 'release-proof.json').returncode == 0 and
       len(json.loads((work / 'release-proof.json').read_bytes())['subject']) == 281)
 
-def refused(label, value=None, operation='manifest', output=None):
+def refused(label, value=None, operation='manifest', output=None, diagnostic=None):
     result_path = work / (label + '-result.json')
     save(result_path, results[280] if value is None else value)
     output = work / (label + '-manifest.json') if output is None else output
@@ -1154,6 +1192,29 @@ def refused(label, value=None, operation='manifest', output=None):
     result = invoke(label, operation, result_path, output)
     preserved = not output.exists() if previous is None else (output.stat().st_ino, output.read_bytes()) == previous
     check(label + ' returns 4 without stdout or output mutation', result.returncode == 4 and not result.stdout and preserved)
+    if diagnostic is not None:
+        check(label + ' reaches the compiler-policy refusal', diagnostic in result.stderr)
+
+# Only the compiler envelope is synthetic. Exercise the same shared fixture
+# helper as the broad strict Rust orchestration cases, including refusal of old
+# receipts rather than teaching the production gate to accept missing evidence.
+for label, mutation, diagnostic in (
+    ('missing-rust-policy', lambda r: r['targets'][0]['build_influence_env'].pop('DSR_RUST_ENV_POLICY'),
+     b'lacks the current observed native compiler environment policy'),
+    ('obsolete-rust-policy', lambda r: r['targets'][0]['build_influence_env'].update(DSR_RUST_ENV_POLICY='0'),
+     b'lacks the current observed native compiler environment policy'),
+    ('missing-rust-observation', lambda r: r['targets'][0]['cargo_isolation']['toolchain']['selection'].pop('native_environment'),
+     b'lacks the current observed native compiler environment policy'),
+    ('wrong-rust-source', lambda r: r['targets'][0]['build_influence_env'].update(DSR_RELEASE_GIT_SHA='1' * 40),
+     b'lacks the current observed native compiler environment policy'),
+    ('unreviewed-rust-selector', lambda r: r['targets'][0]['build_influence_env'].update(CPATH='/unreviewed'),
+     b'no longer matches the reviewed and observed native C/SDK selectors'),
+    ('changed-rust-observation', lambda r: r['targets'][0]['cargo_isolation']['toolchain']['selection']['native_environment'].update(CPATH='/unreviewed'),
+     b'no longer matches the reviewed and observed native C/SDK selectors'),
+):
+    changed = copy.deepcopy(results[1])
+    mutation(changed)
+    refused(label, changed, diagnostic=diagnostic)
 
 for label, mutation in (
     ('omitted-companion', lambda r: r['targets'][0]['additional_artifacts'].pop(0)),
@@ -1213,7 +1274,7 @@ check('all original staged and companion bytes, modes and inodes survive success
       {str(p): identity(p) for p in [*paths, *staged_paths]})
 check('tagged source remains clean', not run('git', '-C', work / 'source', 'status', '--porcelain').stdout)
 print('Strict manifest inventory: %d checks passed' % checks, flush=True)
-print('Compilation is local cc; native scheduling and Rust toolchain attestation are outside this fixture.', flush=True)
+print('Compilation is local cc; Rust compiler envelopes are synthetic unit data, not native Rust execution evidence.', flush=True)
 PY
 }
 
@@ -7159,6 +7220,8 @@ contract_result=$(
                     observed_release_git_sha: $release_git_sha,
                     observed_release_git_ref: $release_git_ref
                 }')
+            native_result=$(_fixture_strict_rust_result "$native_result" \
+                "$release_git_sha" "$release_git_ref" "$remote_override") || return 4
             with_collection_receipt "$native_result" "$raw_path"
         }
 
@@ -7394,6 +7457,12 @@ archive_windows_result=$(with_collection_receipt \
     "$(jq -nc --arg path "$archive_windows_source" '{
         platform: "windows/amd64", status: "success", artifact_path: $path, artifact_paths: [$path]
     }')" "$archive_windows_source")
+# These archive producers are synthetic native backends, just like the strict
+# scheduler fixture above. Keep policy evidence explicit before real staging.
+archive_linux_result=$(_fixture_strict_rust_result "$archive_linux_result" \
+    "$contract_sha" "$contract_ref" "$TEMP_DIR/source-repo")
+archive_windows_result=$(_fixture_strict_rust_result "$archive_windows_result" \
+    "$contract_sha" "$contract_ref" "$TEMP_DIR/source-repo")
 
 archive_linux_staged=$(_act_stage_contract_primary \
     "focrarchive" "v1.0.0" "550e8400-e29b-41d4-a716-446655440040" \
@@ -7462,6 +7531,8 @@ workspace_archive_result=$(with_collection_receipt \
     "$(jq -nc --arg path "$workspace_archive_source" '{
         platform: "linux/amd64", status: "success", artifact_path: $path, artifact_paths: [$path]
     }')" "$workspace_archive_source")
+workspace_archive_result=$(_fixture_strict_rust_result "$workspace_archive_result" \
+    "$contract_sha" "$contract_ref" "$TEMP_DIR/source-repo")
 workspace_archive_staged=$(_act_stage_contract_primary \
     "focrworkspace" "v1.0.0" "550e8400-e29b-41d4-a716-446655440042" \
     "linux/amd64" "$workspace_archive_result" \
@@ -8207,6 +8278,8 @@ mutated_staged_result=$(_act_stage_contract_primary \
     "$(with_collection_receipt "$(jq -nc --arg path "$mutated_staged_source" '{
         platform: "linux/amd64", status: "success", artifact_path: $path, artifact_paths: [$path]
     }')" "$mutated_staged_source")" "$(config_get_release_contract_json "focrtest")")
+mutated_staged_result=$(_fixture_strict_rust_result "$mutated_staged_result" \
+    "$contract_sha" "$contract_ref" "$TEMP_DIR/source-repo")
 mutated_staged_input=$(echo "$contract_manifest_input" | jq \
     --argjson replacement "$mutated_staged_result" '
         .targets |= map(if .platform == "linux/amd64" then $replacement else . end)

@@ -2781,7 +2781,9 @@ _act_ssh_exec() {
     while IFS= read -r command_line || [[ -n "$command_line" ]]; do
         printf 'CMD:%s\n' "$command_line" >> "$SSH_ARGS_FILE"
     done <<< "$cmd"
-    if [[ -n "${SDK_COMMAND_FILE:-}" && "$cmd" == *'for sdk_variable in '* ]]; then
+    # Select the compiler request by its transport boundary, independent of
+    # how the generated environment cleanup enumerates inherited selectors.
+    if [[ -n "${SDK_COMMAND_FILE:-}" && "$2" == '# DSR_UNIX_BUILD_GUARD'* ]]; then
         printf '%s\n' "$cmd" > "$SDK_COMMAND_FILE"
     fi
     local exit_code
@@ -3883,7 +3885,11 @@ CASES
 
 test_unix_rust_sdk_environment() {
     log_test "Unix strict and ordinary Rust: configured SDK selectors replace ambient values"
-    local mode result cmd launch observed status SDK_COMMAND_FILE
+    local mode result cmd launch observed status cleanup SDK_COMMAND_FILE
+    if ! cleanup=$(_act_unix_rust_sdk_env_cleanup) || [[ -z "$cleanup" ]]; then
+        log_fail "Unix SDK cleanup program could not be generated"
+        return
+    fi
     for mode in strict ordinary; do
         reset_state
         MOCK_LANGUAGE=rust
@@ -3902,7 +3908,7 @@ test_unix_rust_sdk_environment() {
         # Execute only the build request, excluding the subsequent cache
         # inventory request captured by the shared SSH transcript.
         cmd=$(cat "$SDK_COMMAND_FILE" 2>/dev/null)
-        if [[ "$status" -ne 0 || "$cmd" != *'for sdk_variable in '* ]]; then
+        if [[ "$status" -ne 0 || "$cmd" != *"$cleanup"* ]]; then
             log_fail "$mode Unix SDK command construction failed: status=$status result=$result"
             continue
         fi
@@ -3910,7 +3916,9 @@ test_unix_rust_sdk_environment() {
         # source tree or running a compiler. Keep the configured Cargo command
         # valid for strict toolchain parsing and observe its child environment
         # through a shell fixture at the compiler boundary.
-        launch="for sdk_variable in ${cmd#*for sdk_variable in }"
+        # Require the complete shared cleanup in the actual captured program,
+        # then run that program's environment suffix at the Cargo boundary.
+        launch="$cleanup${cmd#*"$cleanup"}"
         # The strict toolchain attestation heredocs write receipts beside a
         # real snapshot; test_strict_cargo_private_cache.sh runs them for real.
         launch=$(printf '%s\n' "$launch" | awk '
@@ -3927,6 +3935,10 @@ test_unix_rust_sdk_environment() {
             "$BASH" -c "set -e; cargo() { env; }; $launch") || status=$?
         if [[ "$status" -eq 0 ]] && printf '%s\n' "$observed" | \
             grep -Fx 'OPENSSL_DIR=/configured/openssl with spaces' >/dev/null && \
+           printf '%s\n' "$observed" | grep -Fx 'OPENSSL_STATIC=1' >/dev/null && \
+           printf '%s\n' "$observed" | grep -Fx 'PKG_CONFIG=/configured/pkg-config' >/dev/null && \
+           printf '%s\n' "$observed" | grep -Fx 'PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=/configured/pkgconfig' >/dev/null && \
+           printf '%s\n' "$observed" | grep -Fx 'LIBCLANG_PATH=/configured/libclang' >/dev/null && \
            printf '%s\n' "$observed" | grep -Fx 'LIBCLANG_PATH_EXTRA=preserve' >/dev/null && \
            ! printf '%s\n' "$observed" | grep -E '^(OPENSSL_NO_VENDOR|X86_64_PC_WINDOWS_MSVC_OPENSSL_DIR|TARGET_PKG_CONFIG_PATH|HOST_PKG_CONFIG|FONTCONFIG_NO_PKG_CONFIG)=' >/dev/null && \
            jq -e '.status == "success" and
@@ -3951,7 +3963,9 @@ test_unix_rust_sdk_environment() {
         status=0
         observed=$(env 'PKG_CONFIG_PATH_aarch64-unknown-linux-gnu=/ambient/target-pc' \
             "$BASH" -c "set -e; cargo() { env; }; $launch" 2>&1) || status=$?
-        if [[ "$status" -eq 4 && "$observed" == *'SDK environment name cannot be isolated by this shell: PKG_CONFIG_PATH_aarch64-unknown-linux-gnu'* ]]; then
+        if [[ "$status" -eq 4 &&
+              "$observed" == *'SDK environment name cannot be isolated by this shell:'* &&
+              "$observed" == *'PKG_CONFIG_PATH_aarch64-unknown-linux-gnu'* ]]; then
             log_pass "$mode Unix refuses inherited SDK names that shell unset silently preserves"
         else
             log_fail "$mode Unix leaked an unsupported target SDK selector: status=$status"
