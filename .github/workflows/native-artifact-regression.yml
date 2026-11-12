@@ -23,6 +23,7 @@ on:
       - scripts/tests/test_ordinary_collection_inventory.sh
       - scripts/tests/test_generated_installer_transactions.sh
       - scripts/tests/test_generated_installer_integrity.sh
+      - scripts/tests/test_generated_installer_private.sh
       - scripts/tests/test_generated_workspace_installer.sh
       - scripts/tests/test_install_source.sh
       - scripts/tests/test_install_source_windows.sh
@@ -88,7 +89,7 @@ jobs:
           set -euo pipefail
           if [[ "$RUNNER_OS" == Linux ]]; then
             sudo apt-get update
-            sudo apt-get install -y --no-install-recommends jq xz-utils golang-go minisign zip unzip msitools wixl rsync python3
+            sudo apt-get install -y --no-install-recommends jq xz-utils golang-go minisign zip unzip msitools wixl rsync python3 gcc openssl
           else
             for tool in jq xz go minisign rsync; do
               command -v "$tool" >/dev/null || brew install "$tool"
@@ -358,6 +359,15 @@ jobs:
           bash scripts/tests/test_install_source_family.sh --bun-workspaces-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/bun-workspaces.log"
           bash scripts/tests/test_generated_workspace_installer.sh --go-bun-source-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/go-bun-source-families.log"
           timeout 120 bash scripts/tests/test_upgrade_verify.sh --bun-source-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/bun-source-upgrade.log"
+          test -z "$(git status --porcelain)"
+      - name: Validate private release source fallback
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/tests/test_generated_installer_private.sh
+          timeout 120 bash scripts/tests/test_generated_installer_private.sh --fallback-only \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/private-source-fallback.log"
           test -z "$(git status --porcelain)"
       - name: Validate Windows source installation and release freshness
         if: runner.os == 'Linux'

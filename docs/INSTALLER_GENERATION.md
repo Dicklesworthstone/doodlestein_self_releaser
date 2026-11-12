@@ -95,9 +95,27 @@ and [asset listing and binary-download APIs](https://docs.github.com/en/rest/rel
 An absent checksum filename can select the next supported format, including
 the canonical `SHA256SUMS`. A discovered asset that returns an HTTP error
 cannot be treated as absent. Authentication failures, invalid metadata and
-failed discovered downloads stop installation; they do not select an anonymous
-download, another account or a source build. All downloaded and cached bytes
+failed checksum/signature downloads stop installation. All downloaded and cached bytes
 still require exact checksum evidence and every configured Minisign signature.
+
+For this direct authenticated API route, `--allow-source-build` also permits
+source fallback when release discovery, exact release metadata, the asset
+inventory or the primary payload is unavailable. Eligible failures are HTTP
+408/429/5xx, DNS/connect/HTTP transfer failures and the installer's own transfer
+deadline. The same selected credential authenticates the source checkout.
+An explicit or discovered version builds `refs/tags/<version>`; only unavailable
+latest discovery before a tag is known selects `HEAD`. A complete inventory
+can prove that the primary is absent, while authenticated 404/410 responses
+remain ambiguous and stop installation.
+
+TLS trust failures, local I/O errors, unsafe redirects, malformed metadata,
+corrupt cache entries and failed verification cannot authorize source execution.
+A truncated HTTP denial keeps its denial status even if the transfer also
+fails. Explicit cancellation returns 5 through discovery, payload and proof
+acquisition. A failed source fetch or compilation remains terminal and preserves
+the installed executable family; a missing selected tag never retries `HEAD`.
+Existing verified cache entries retain precedence. Run the focused controls with
+`bash scripts/tests/test_generated_installer_private.sh --fallback-only`.
 
 Release downloads send credentials only to the configured repository's HTTPS release API.
 Binary redirects may reach HTTPS object storage, where the Authorization header

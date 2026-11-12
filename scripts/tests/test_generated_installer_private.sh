@@ -18,6 +18,7 @@ import http.server
 import json
 import os
 import pathlib
+import resource
 import select
 import shutil
 import socket
@@ -28,12 +29,14 @@ import sys
 import tarfile
 import tempfile
 import threading
+import time
 import urllib.parse
 
 root = pathlib.Path(sys.argv[1])
 freshness_only = sys.argv[2] == "--freshness-only"
-if sys.argv[2] not in ("", "--freshness-only"):
-    raise SystemExit("Usage: test_generated_installer_private.sh [--freshness-only]")
+fallback_only = sys.argv[2] == "--fallback-only"
+if sys.argv[2] not in ("", "--freshness-only", "--fallback-only"):
+    raise SystemExit("Usage: test_generated_installer_private.sh [--freshness-only|--fallback-only]")
 work = pathlib.Path(tempfile.mkdtemp(prefix="dsr-private-bash-"))
 print(f"Private Bash installer fixtures retained at: {work}", flush=True)
 for part in ("config/repos.d", "payload", "bin", "home", "tls"):
@@ -205,6 +208,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def reply(self, status, body=b"", location=None, headers=None):
         self.record["response_bytes"] = len(body)
+        self.record["response_status"] = status
         self.send_response(status)
         self.send_header("Content-Length", str(len(body)))
         for name, value in (headers or {}).items():
@@ -230,6 +234,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
                        "ambient_header": self.headers.get("X-Fixture-Ambient")}
         requests.append(self.record)
         mode = state["mode"]
+        if host == "api.github.com" and self.path in state.get("faults", {}):
+            if authorization != "Bearer " + state["token"]:
+                self.reply(403)
+                return
+            fault = state["faults"][self.path]
+            if isinstance(fault, tuple) and fault[1] == "partial":
+                self.record["response_status"] = fault[0]
+                self.send_response(fault[0])
+                self.send_header("Content-Length", "32")
+                if fault[0] == 302:
+                    self.send_header("Location", "https://api.github.com/repos/other/project/releases/assets/7")
+                self.end_headers()
+                self.wfile.write(b"partial")
+                self.wfile.flush()
+                self.close_connection = True
+                self.connection.shutdown(socket.SHUT_RDWR)
+            elif fault == "disconnect":
+                self.close_connection = True
+                self.connection.shutdown(socket.SHUT_RDWR)
+            elif fault == "cancel":
+                (work / state["label"] / "curl-ready").write_text(self.path)
+                self.connection.settimeout(10)
+                try:
+                    self.connection.recv(1)
+                except (OSError, ssl.SSLError):
+                    pass
+                self.close_connection = True
+            else:
+                self.reply(fault)
+            return
         if host in ("objects.fixture.example", "second.fixture.example", "elsewhere.fixture.example"):
             if authorization:
                 self.reply(403)
@@ -446,7 +480,7 @@ for name in ("bash", "env", "uname", "tr", "getconf", "ldd", "awk", "sed", "mkte
         (work / "bin" / name).symlink_to(executable)
 adapter = work / "bin/curl"
 adapter.write_text("#!" + sys.executable + "\n" + r'''
-import json, os, pathlib, re, subprocess, sys, urllib.parse
+import json, os, pathlib, re, signal, subprocess, sys, time, urllib.parse
 arguments = sys.argv[1:]
 configuration = sys.stdin.buffer.read() if "--config" in arguments else None
 urls = [value for value in arguments if "://" in value]
@@ -464,9 +498,26 @@ with open(os.environ["DSR_TEST_CURL_ARGV"], "a") as output:
 options = ["--noproxy", "*", "--cacert", os.environ["DSR_TEST_CA"]]
 for host in hosts:
     options += ["--connect-to", host + ":443:127.0.0.1:" + os.environ["DSR_TEST_PORT"]]
-result = subprocess.run([os.environ["DSR_TEST_REAL_CURL"], *arguments, *options],
-                        input=configuration, close_fds=False)
-sys.exit(result.returncode)
+command = [os.environ["DSR_TEST_REAL_CURL"], *arguments, *options]
+if os.environ.get("DSR_TEST_CANCEL_PATH") == urllib.parse.urlsplit(urls[0]).path:
+    # Deliver an actual signal after the real authenticated request arrives.
+    # Forward shell-style signal status; no HTTP response or compiler is faked.
+    process = subprocess.Popen(command, stdin=subprocess.PIPE, close_fds=False)
+    process.stdin.write(configuration or b"")
+    process.stdin.close()
+    ready = pathlib.Path(os.environ["DSR_TEST_CURL_READY"])
+    until = time.monotonic() + 10
+    while not ready.exists() and process.poll() is None and time.monotonic() < until:
+        time.sleep(0.01)
+    if not ready.exists():
+        process.kill()
+        process.wait()
+        sys.exit(99)
+    process.send_signal(signal.SIGINT)
+    status = process.wait(timeout=5)
+else:
+    status = subprocess.run(command, input=configuration, close_fds=False).returncode
+sys.exit(128 - status if status < 0 else status)
 ''')
 adapter.chmod(0o755)
 environment.update(PATH=str(work / "bin"), DSR_TEST_REAL_CURL=shutil.which("curl"),
@@ -478,13 +529,26 @@ results = {}
 
 
 def run(label, mode="", *, tag="v1.2.3", latest=False, selected="dsr", options=(),
-        cache=None, public=False, tracing=False, token_override=None, curlrc=False):
-    state.update(label=label, mode=mode, tag=tag, token=tokens[selected or "dsr"], public=public)
+        cache=None, public=False, tracing=False, token_override=None, curlrc=False,
+        faults=None, seed_release=False, requested_version=None, file_limit=None):
+    state.update(label=label, mode=mode, tag=tag, token=tokens[selected or "dsr"], public=public,
+                 faults=faults or {})
     directory = work / label
     directory.mkdir()
+    original = {}
+    if seed_release:
+        (directory / "bin").mkdir()
+        for name in ("demo", "demo-worker"):
+            path = directory / "bin" / name
+            shutil.copy2(work / "payload" / name, path)
+            original[name] = (hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_mode, path.stat().st_ino)
     argv_log = directory / "curl-argv.jsonl"
     env = environment.copy()
     env["DSR_TEST_CURL_ARGV"] = str(argv_log)
+    for path, fault in (faults or {}).items():
+        if fault == "cancel":
+            env["DSR_TEST_CANCEL_PATH"] = path.split("?", 1)[0]
+            env["DSR_TEST_CURL_READY"] = str(directory / "curl-ready")
     if selected:
         env["GH_TOKEN"] = tokens["gh"]
         if selected in ("dsr", "github"):
@@ -507,10 +571,11 @@ def run(label, mode="", *, tag="v1.2.3", latest=False, selected="dsr", options=(
     if "--allow-source-build" not in options:
         args.append("--require-signatures")
     if not latest:
-        args += ["--version", tag]
+        args += ["--version", tag if requested_version is None else requested_version]
     args += list(options)
     offset = len(requests)
-    result = subprocess.run(args, env=env, text=True, capture_output=True, timeout=30)
+    limit = (lambda: resource.setrlimit(resource.RLIMIT_FSIZE, (file_limit, file_limit))) if file_limit else None
+    result = subprocess.run(args, env=env, text=True, capture_output=True, timeout=30, preexec_fn=limit)
     (directory / "stdout").write_text(result.stdout)
     (directory / "stderr").write_text(result.stderr)
     selected_requests = requests[offset:]
@@ -520,7 +585,8 @@ def run(label, mode="", *, tag="v1.2.3", latest=False, selected="dsr", options=(
         (directory / "bin" / name).read_bytes() == (work / "payload" / name).read_bytes()
         for name in ("demo", "demo-worker"))
     blocked = result.returncode != 0 and not (directory / "bin/demo").exists() and not any(cache.rglob("payload"))
-    results[label] = {"exit": result.returncode, "complete": complete, "blocked": blocked}
+    results[label] = {"exit": result.returncode, "complete": complete, "blocked": blocked,
+                      "original": original}
     return result, selected_requests, directory, cache, complete, blocked
 
 
@@ -532,7 +598,178 @@ def source_requests(calls):
     return [call for call in calls if call["host"] == "github.com" and call["path"].startswith("/example/demo.git/")]
 
 
+def test_release_fallback():
+    latest = "/repos/example/demo/releases/latest"
+    metadata = "/repos/example/demo/releases/tags/v1.2.3"
+    page = "/repos/example/demo/releases/42/assets?per_page=100&page=2"
+    primary = "/repos/example/demo/releases/assets/7"
+    checksum = "/repos/example/demo/releases/assets/8"
+    proof = "/repos/example/demo/releases/assets/9"
+    options = ("--allow-source-build", "--source-timeout", "20", "--yes")
+
+    # Prime the genuine compiler's ordinary cache with the committed fixture.
+    # Each installer still fetches its own pin, invokes Go, and must install
+    # the expected executable bytes rather than adopting this setup output.
+    warm_environment = environment.copy()
+    warm_environment.update(GOENV="off", GOWORK="off", GOTOOLCHAIN="local", GOFLAGS="",
+                            GO111MODULE="on", GOTELEMETRY="off", GOOS="", GOARCH="")
+    command([go, "build", "-trimpath", "-o", str(work / "compiled-source-fixture"), "./cmd/demo"],
+            cwd=upstream, env=warm_environment)
+
+    def original_preserved(label, directory):
+        expected = results[label]["original"]
+        return bool(expected) and all(
+            (directory / "bin" / name).is_file() and
+            (hashlib.sha256((directory / "bin" / name).read_bytes()).hexdigest(),
+             (directory / "bin" / name).stat().st_mode,
+             (directory / "bin" / name).stat().st_ino) == evidence
+            for name, evidence in expected.items())
+
+    def source_installed(result, directory, reference, commit, revision, version):
+        if result.returncode != 0:
+            return False
+        try:
+            receipt = json.loads(result.stdout)
+            source = receipt.get("source", {})
+            members = source.get("binaries", [])
+            return receipt.get("method") == "source" and receipt.get("signed_release") is False and \
+                receipt.get("version") == version and source.get("requested_ref") == reference and \
+                source.get("source_commit") == commit and source.get("repository") == "example/demo" and \
+                {row["name"] for row in members} == {"demo", "demo-worker"} and all(
+                    (directory / "bin" / row["name"]).is_file() and
+                    hashlib.sha256((directory / "bin" / row["name"]).read_bytes()).hexdigest() == row["sha256"] and
+                    (directory / "bin" / row["name"]).stat().st_size == row["size_bytes"] and
+                    subprocess.run([str(directory / "bin" / row["name"])], text=True,
+                                   capture_output=True, timeout=5).stdout.strip() == row["name"] + "-" + revision
+                    for row in members)
+        except (KeyError, ValueError, OSError, subprocess.TimeoutExpired):
+            return False
+
+    for label, endpoint, fault, selected, discover, version, reference, commit, revision in (
+        ("latest-outage", latest, 503, "dsr", True, None, "HEAD", head_commit, "observed-head"),
+        ("metadata-timeout", metadata, 408, "github", False, None, "refs/tags/v1.2.3", release_commit, "tagged"),
+        ("inventory-rate-limit", page, 429, "gh", True, None, "refs/tags/v1.2.3", release_commit, "tagged"),
+        ("payload-outage", primary, 503, "dsr", False, "1.2.3", "refs/tags/v1.2.3", release_commit, "tagged"),
+        ("disconnected-latest", latest, "disconnect", "dsr", True, None, "HEAD", head_commit, "observed-head"),
+        ("interrupted-payload", primary, (200, "partial"), "dsr", False, None, "refs/tags/v1.2.3", release_commit, "tagged"),
+    ):
+        result, calls, directory, cache, _, _ = run("fallback-" + label, latest=discover,
+            selected=selected, requested_version=version, faults={endpoint: fault}, options=options, tracing=True)
+        check(label + " builds and installs the genuine selected source family",
+              source_installed(result, directory, reference, commit, revision,
+                               "" if reference == "HEAD" else "v1.2.3"))
+        expected_api = hashlib.sha256(("Bearer " + tokens[selected]).encode()).hexdigest()
+        expected_git = hashlib.sha256(("Basic " + base64.b64encode(
+            ("x-access-token:" + tokens[selected]).encode()).decode()).encode()).hexdigest()
+        logs = result.stdout + result.stderr + (directory / "curl-argv.jsonl").read_text()
+        check(label + " keeps the selected API/Git account and never caches unsigned source as a release",
+              bool(source_requests(calls)) and not any(cache.rglob("payload")) and
+              all(call["authorization_sha256"] == (expected_git if call in source_requests(calls) else expected_api)
+                  for call in calls) and all(token not in logs for token in tokens.values()))
+
+    result, calls, directory, _, _, _ = run("fallback-missing-primary", "missing-primary", options=options)
+    check("a complete authenticated inventory can still prove primary absence",
+          source_installed(result, directory, "refs/tags/v1.2.3", release_commit, "tagged", "v1.2.3") and
+          all(call["path"] != primary for call in calls))
+
+    for endpoint, stage in ((latest, "latest"), (metadata, "metadata"), (primary, "payload")):
+        for status in (401, 403, 404, 410):
+            label = f"fallback-{stage}-{status}"
+            result, calls, directory, cache, _, _ = run(label, latest=endpoint == latest,
+                options=options, faults={endpoint: status}, seed_release=True, public=True)
+            check(stage + " HTTP " + str(status) + " remains terminal without changing account or existing family",
+                  result.returncode == 8 and not source_requests(calls) and original_preserved(label, directory) and
+                  not any(cache.rglob("payload")) and all(call["host"] == "api.github.com" for call in calls))
+
+    for endpoint, status in ((latest, 403), (primary, 404), (primary, 302)):
+        label = "fallback-partial-http-" + str(status)
+        result, calls, directory, _, _, _ = run(label, latest=endpoint == latest,
+            options=options, faults={endpoint: (status, "partial")}, seed_release=True)
+        check("an interrupted HTTP " + str(status) + " body cannot erase denial or unvalidated redirect evidence",
+              result.returncode == 8 and any(call.get("response_status") == status for call in calls) and
+              not source_requests(calls) and original_preserved(label, directory))
+
+    for endpoint, stage in ((latest, "latest"), (primary, "payload"), (checksum, "checksum"), (proof, "signature")):
+        label = "fallback-cancel-" + stage
+        result, calls, directory, _, _, _ = run(label, latest=endpoint == latest,
+            options=options, faults={endpoint: "cancel"}, seed_release=True)
+        check(stage + " cancellation of real curl returns 5 without starting a source build",
+              result.returncode == 5 and (directory / "curl-ready").is_file() and
+              not source_requests(calls) and original_preserved(label, directory))
+
+    for label, endpoint, fault, mode in (
+        ("checksum-outage", checksum, 503, "checksum-403"),
+        ("signature-outage", proof, 503, ""),
+        ("checksum-disconnect", checksum, "disconnect", ""),
+    ):
+        name = "fallback-" + label
+        result, calls, directory, _, _, _ = run(name, mode, options=options,
+            faults={endpoint: fault}, seed_release=True)
+        check(label + " remains a proof failure and cannot select source or another checksum",
+              result.returncode != 0 and not source_requests(calls) and original_preserved(name, directory) and
+              all(call["path"] != "/repos/example/demo/releases/assets/10" for call in calls))
+
+    for mode in ("wrong-checksum", "wrong-signature", "wrong-tag", "short-body", "oversized-body", "metadata-redirect"):
+        name = "fallback-" + mode
+        result, calls, directory, _, _, _ = run(name, mode, options=options, seed_release=True)
+        check(mode + " cannot turn consent into source execution or replace the existing family",
+              result.returncode != 0 and not source_requests(calls) and original_preserved(name, directory))
+
+    result, calls, directory, _, _, _ = run("fallback-local-write-failure", options=options,
+        seed_release=True, file_limit=1024)
+    check("a real bounded-file write failure is not a release availability failure",
+          result.returncode == 8 and any(call.get("response_bytes", 0) > 131072 for call in calls) and
+          not source_requests(calls) and original_preserved("fallback-local-write-failure", directory))
+
+    result, calls, _, _, _, blocked = run("fallback-no-consent", latest=True, faults={latest: 503})
+    check("an unavailable private release without source consent retains network failure",
+          blocked and result.returncode == 8 and not source_requests(calls))
+    result, _, _, cache, complete, _ = run("fallback-cache-warm", options=options)
+    check("source consent continues to prefer an available verified release", complete and "source" not in json.loads(result.stdout))
+    result, calls, _, _, complete, _ = run("fallback-cache-reuse", options=options, cache=cache,
+        faults={metadata: 503, primary: 503})
+    check("a verified exact cache precedes acquisition and source fallback", complete and not calls)
+    cached_payloads = list(cache.rglob("payload"))
+    if len(cached_payloads) == 1:
+        cached_payloads[0].write_bytes(cached_payloads[0].read_bytes() + b"changed cached payload")
+    result, calls, _, _, _, blocked = run("fallback-corrupt-cache", options=options, cache=cache,
+        faults={metadata: 503, primary: 503})
+    check("corrupt cached evidence stays terminal without any API or source request",
+          len(cached_payloads) == 1 and result.returncode != 0 and not calls)
+
+    missing_tag = "/repos/example/demo/releases/tags/v9.9.9"
+    result, calls, directory, _, _, _ = run("fallback-missing-source-tag", tag="v9.9.9",
+        options=options, faults={missing_tag: 503}, seed_release=True)
+    check("a missing selected source tag fails once without retrying HEAD or installing old release bytes",
+          result.returncode == 8 and len([call for call in source_requests(calls) if "/info/refs" in call["path"]]) == 1 and
+          original_preserved("fallback-missing-source-tag", directory) and
+          "Source build diagnostics retained at:" in result.stderr)
+
+    # A valid second package with an unresolved symbol passes go list, then
+    # fails the actual later compiler invocation after the first member built.
+    (upstream / "cmd/demo-worker/main.go").write_text("package main\nfunc main() { undefinedCompanion() }\n")
+    command([git, "-C", str(upstream), "add", "."], env=git_environment)
+    command([git, "-C", str(upstream), "-c", "user.name=DSR Fixture", "-c",
+             "user.email=dsr-fixture@example.invalid", "commit", "-qm", "broken companion"], env=git_environment)
+    command([git, "-C", str(upstream), "push", "-q", str(remotes / "example/demo.git"),
+             "HEAD:refs/heads/main"], env=git_environment)
+    result, calls, directory, _, _, _ = run("fallback-compiler-failure", latest=True,
+        options=options, faults={latest: 503}, seed_release=True)
+    retained = [line.split("Source build diagnostics retained at: ", 1)[1] for line in result.stderr.splitlines()
+                if "Source build diagnostics retained at: " in line]
+    check("a genuine later compiler failure preserves the whole installed family and keeps diagnostic source",
+          result.returncode == 6 and bool(source_requests(calls)) and
+          original_preserved("fallback-compiler-failure", directory) and len(retained) == 1 and
+          (pathlib.Path(retained[0]) / "output/bin/demo").is_file() and
+          (pathlib.Path(retained[0]) / "output/build-1.log").is_file())
+
+
 try:
+    if fallback_only:
+        test_release_fallback()
+        print(f"Private Bash installer source fallback: {passed} passed, {failed} failed", flush=True)
+        sys.exit(0 if failed == 0 else 1)
+
     for selected in ("dsr", "github", "gh"):
         options = ("--allow-source-build", "--source-if-stale", "1")
         if selected == "github":

@@ -2459,8 +2459,8 @@ successful Cargo exit status alone does not admit colliding package outputs.
 All members share the verified source commit. Source receipts include every
 member's hash and size while preserving the primary receipt fields. Source
 builds require explicit consent through `--from-source` or
-`--allow-source-build`; Go and Bun source fallback accepts only a singleton
-selection. Integrity or installation failures never trigger source fallback.
+`--allow-source-build` and preserve the configured source-family selection.
+Integrity or installation failures never trigger source fallback.
 
 Source checkout uses the same GitHub identity as release acquisition and
 freshness: `DSR_GH_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`, then stored GitHub.com
@@ -2472,6 +2472,18 @@ credential helpers, redirects and Git tracing, and an invalid token cannot use
 another `.netrc` account. Without a selected GitHub credential, the existing
 Git-only anonymous and custom-helper path remains available. The selected
 source ref is still resolved to an exact commit before compilation.
+
+For generated Bash installers using an explicit token without `gh`,
+`--allow-source-build` permits fallback on classified release discovery,
+metadata, asset-inventory and primary-payload availability failures. These
+include HTTP 408/429/5xx, DNS/connect/HTTP transfer failures and owned transfer
+expiry. Explicit or discovered versions remain pinned to their exact tag;
+only unresolved latest discovery selects `HEAD`. Authenticated 404/410,
+authentication denial, TLS trust failures, local I/O errors, unsafe redirects,
+malformed metadata and checksum/signature/cache failures cannot authorize
+source execution. Incomplete HTTP denial responses retain that meaning.
+Explicit acquisition cancellation returns 5. Source failures retain diagnostics
+and never retry a different reference or silently install an older release.
 
 `--install-toolchain` separately authorizes provisioning a missing compiler for
 the selected source build. It requires `--from-source` or

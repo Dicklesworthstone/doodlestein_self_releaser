@@ -771,6 +771,8 @@ _installer_api_download() (
     set +x
     set -o pipefail
     local url="$1" destination="$2" kind="$3" maximum="$4" limit="$5"
+    local source_fallback="${6:-false}" transfer_status
+    local -a transfer_statuses=()
     local token escaped_token escaped_url status reply next authority tail bytes
     local redirects=0 send_credential=true remaining deadline=$((SECONDS + limit))
     local transfer_maximum="$maximum"
@@ -783,7 +785,8 @@ _installer_api_download() (
         _log_error "Invalid selected GitHub credential"; return 4;
     }
     [[ "$maximum" =~ ^[1-9][0-9]*$ && "$limit" =~ ^[1-9][0-9]*$ &&
-       ( "$kind" == json || "$kind" == asset ) ]] || return 4
+       ( "$kind" == json || "$kind" == asset ) &&
+       ( "$source_fallback" == true || "$source_fallback" == false ) ]] || return 4
     # A redirect's small HTML body may exceed a checksum/signature asset's
     # actual size. Bound it independently; a final 200 still obeys maximum.
     ((transfer_maximum >= 65536)) || transfer_maximum=65536
@@ -791,21 +794,25 @@ _installer_api_download() (
     [[ "$kind" != asset ]] || accept='application/octet-stream'
     escaped_token="${token//\\/\\\\}"; escaped_token="${escaped_token//\"/\\\"}"
     while ((redirects <= 5)); do
-        remaining=$((deadline - SECONDS))
-        if ((remaining <= 0)); then
-            _log_error "GitHub download exceeded its complete-transfer deadline"; return 8
-        fi
         _installer_api_https_url "$url" || {
             _log_error "Refusing an unsafe GitHub download redirect"; return 8;
         }
         if ! _installer_api_in_scope "$url"; then
             tail="${url#https://}"; authority="${tail%%/*}"
-            authority=$(printf '%s' "$authority" | tr '[:upper:]' '[:lower:]') || return 1
+            authority=$(printf '%s' "$authority" | tr '[:upper:]' '[:lower:]') || return 8
             if [[ "$kind" != asset || "$authority" == api.github.com || "$authority" == api.github.com:443 ]]; then
                 _log_error "GitHub API redirect changed the selected repository"; return 8
             fi
             # A later redirect back to GitHub must not regain this credential.
             send_credential=false
+        fi
+        # Validate an already-observed redirect before considering expiry;
+        # elapsed time cannot turn an unsafe destination into availability.
+        remaining=$((deadline - SECONDS))
+        if ((remaining <= 0)); then
+            _log_error "GitHub download exceeded its complete-transfer deadline"
+            [[ "$source_fallback" != true ]] || return 1
+            return 8
         fi
         escaped_url="${url//\\/\\\\}"; escaped_url="${escaped_url//\"/\\\"}"
         if ! {
@@ -819,13 +826,41 @@ _installer_api_download() (
             --user-agent 'dsr-installer' --output /dev/fd/3 \
             --write-out '%{http_code}\n%{redirect_url}' 3>&1 > "$response_file" 2>/dev/null |
             head -c "$((transfer_maximum + 1))" > "$destination"; then
-            _log_error "GitHub download failed during HTTPS transport"; return 8
+            transfer_statuses=("${PIPESTATUS[@]}")
+            for transfer_status in "${transfer_statuses[@]}"; do
+                case "$transfer_status" in
+                    129|130|143) _log_error "GitHub acquisition was cancelled"; return 5 ;;
+                esac
+            done
+            if [[ "${transfer_statuses[1]:-0}" == 42 ]]; then
+                _log_error "GitHub acquisition was cancelled"; return 5
+            fi
+            _log_error "GitHub download failed during transfer"
+            # Only opted-in discovery/primary callers receive the internal
+            # unavailable result. Failed local writes, size limits, TLS trust,
+            # malformed options and other client errors never grant consent.
+            # Curl exit codes: https://curl.se/docs/manpage.html#EXIT-CODES
+            if [[ "$source_fallback" == true && "${transfer_statuses[0]:-1}" == 0 &&
+                  "${transfer_statuses[2]:-1}" == 0 ]]; then
+                # A transfer can fail after receiving a denial or redirect.
+                # Its incomplete body cannot erase that HTTP evidence.
+                reply=$(cat -- "$response_file") || return 8
+                status="${reply%%$'\n'*}"
+                case "$status" in
+                    000|200|408|429|5[0-9][0-9])
+                        case "${transfer_statuses[1]:-0}" in
+                            5|6|7|16|18|28|52|55|56|92|95) return 1 ;;
+                        esac
+                        ;;
+                esac
+            fi
+            return 8
         fi
-        bytes=$(wc -c < "$destination" | tr -d '[:space:]') || return 1
+        bytes=$(wc -c < "$destination" | tr -d '[:space:]') || return 8
         [[ "$bytes" =~ ^[0-9]+$ ]] && ((bytes <= transfer_maximum)) || {
             _log_error "GitHub download exceeds its size limit"; return 7;
         }
-        reply=$(cat -- "$response_file") || return 1
+        reply=$(cat -- "$response_file") || return 8
         status="${reply%%$'\n'*}"
         if [[ "$status" == 200 ]]; then
             ((bytes <= maximum)) || {
@@ -844,6 +879,9 @@ _installer_api_download() (
             *)
                 [[ "$status" =~ ^[0-9]{3}$ ]] || status=unknown
                 _log_error "GitHub download failed with HTTP $status"
+                if [[ "$source_fallback" == true ]]; then
+                    case "$status" in 408|429|5[0-9][0-9]) return 1 ;; esac
+                fi
                 return 8
                 ;;
         esac
@@ -865,12 +903,12 @@ _installer_api_release_id() {
 }
 
 _installer_api_latest() (
-    local directory tag
+    local source_fallback="${1:-false}" directory tag
     _installer_token_api_dependencies || return $?
-    directory=$(mktemp -d) || return 1
+    directory=$(mktemp -d) || return 8
     trap 'rm -rf -- "$directory"' EXIT
     _installer_api_download "https://api.github.com/repos/$REPO/releases/latest" \
-        "$directory/release.json" json 8388608 30 || return $?
+        "$directory/release.json" json 8388608 30 "$source_fallback" || return $?
     tag=$(jq -er -s 'if length == 1 and (.[0] | type == "object") and
         (.[0].tag_name | type == "string") then .[0].tag_name else error("invalid tag") end' \
         "$directory/release.json" 2>/dev/null) || {
@@ -887,21 +925,22 @@ _installer_api_latest() (
 # neither browser_download_url nor Link headers control repository selection.
 # Keep the normalized inventory in private staging, not argv or a token cache.
 _installer_api_prepare_assets() {
+    local source_fallback="${1:-false}"
     if [[ "$_GITHUB_ASSET_REPO" == "$REPO" && "$_GITHUB_ASSET_TAG" == "$_VERSION" &&
           -f "$_GITHUB_ASSET_INDEX" && ! -L "$_GITHUB_ASSET_INDEX" ]]; then return 0; fi
     _installer_token_api_dependencies || return $?
-    [[ -n "$_TEMP_DIR" && -d "$_TEMP_DIR" && ! -L "$_TEMP_DIR" ]] || return 1
+    [[ -n "$_TEMP_DIR" && -d "$_TEMP_DIR" && ! -L "$_TEMP_DIR" ]] || return 8
     local directory release_id page=1 count
-    directory=$(mktemp -d "$_TEMP_DIR/github-release.XXXXXXXX") || return 1
+    directory=$(mktemp -d "$_TEMP_DIR/github-release.XXXXXXXX") || return 8
     _installer_api_download "https://api.github.com/repos/$REPO/releases/tags/${_VERSION//+/%2B}" \
-        "$directory/release.json" json 8388608 30 || return $?
+        "$directory/release.json" json 8388608 30 "$source_fallback" || return $?
     release_id=$(_installer_api_release_id "$directory/release.json" "$_VERSION") || {
         _log_error "GitHub release identity does not match the selected published tag"; return 7;
     }
-    printf '[]\n' > "$directory/assets.json" || return 1
+    printf '[]\n' > "$directory/assets.json" || return 8
     while ((page <= 101)); do
         _installer_api_download "https://api.github.com/repos/$REPO/releases/$release_id/assets?per_page=100&page=$page" \
-            "$directory/page.json" json 8388608 30 || return $?
+            "$directory/page.json" json 8388608 30 "$source_fallback" || return $?
         if ! jq -e -s '
             def integer: type == "number" and . >= 0 and . <= 9007199254740991 and floor == .;
             if length == 1 and (.[0] | type == "array" and length <= 100) and
@@ -924,7 +963,7 @@ _installer_api_prepare_assets() {
         ' "$directory/assets.json" > "$directory/next-assets.json" 2>/dev/null; then
             _log_error "Duplicate GitHub release asset identity or inventory exceeds 10000 entries"; return 7
         fi
-        mv -- "$directory/next-assets.json" "$directory/assets.json" || return 1
+        mv -- "$directory/next-assets.json" "$directory/assets.json" || return 8
         if ((count < 100)); then
             _GITHUB_ASSET_REPO="$REPO"
             _GITHUB_ASSET_TAG="$_VERSION"
@@ -939,7 +978,8 @@ _installer_api_prepare_assets() {
 
 _installer_api_fetch_asset() {
     local asset="$1" destination="$2" maximum="$3" selection asset_id size actual
-    _installer_api_prepare_assets || return $?
+    local source_fallback="${4:-false}"
+    _installer_api_prepare_assets "$source_fallback" || return $?
     selection=$(jq -r --arg name "$asset" --argjson maximum "$maximum" '
         map(select(.name == $name)) |
         if length == 0 then "missing"
@@ -952,10 +992,12 @@ _installer_api_fetch_asset() {
     fi
     IFS=$'\t' read -r asset_id size <<< "$selection"
     # Presence in the inventory is authoritative. Auth failures, deleted
-    # members or changed bytes are never optional misses or anonymous fallbacks.
+    # members or changed bytes are never optional misses. Only primary-payload
+    # acquisition explicitly opts into classified source fallback; proof
+    # downloads keep every discovered-member transport failure terminal.
     _installer_api_download "https://api.github.com/repos/$REPO/releases/assets/$asset_id" \
-        "$destination" asset "$size" 300 || return $?
-    actual=$(wc -c < "$destination" | tr -d '[:space:]') || return 1
+        "$destination" asset "$size" 300 "$source_fallback" || return $?
+    actual=$(wc -c < "$destination" | tr -d '[:space:]') || return 8
     if [[ "$actual" != "$size" ]]; then
         _log_error "Release asset size changed after discovery: $asset"; return 7
     fi
@@ -965,10 +1007,11 @@ _installer_api_fetch_asset() {
 # Transport fallback happens here, before verification, never after it fails.
 _fetch_release_asset() {
     local asset="$1" dest="$2" maximum="${3:-2147483648}" url
+    local source_fallback="${4:-false}"
     $_OFFLINE_MODE && return 1
     [[ "$asset" =~ ^[A-Za-z0-9._+-]+$ && "$asset" != . && "$asset" != .. ]] || return 4
     if _installer_token_api_selected; then
-        _installer_api_fetch_asset "$asset" "$dest" "$maximum"
+        _installer_api_fetch_asset "$asset" "$dest" "$maximum" "$source_fallback"
         return $?
     fi
     url="https://github.com/$REPO/releases/download/$_VERSION/${asset//+/%2B}"
@@ -1005,7 +1048,7 @@ _get_latest_version() {
     local response version="" effective prefix="https://github.com/$REPO/releases/tag/"
     $_OFFLINE_MODE && return 4
     if _installer_token_api_selected; then
-        _installer_api_latest
+        _installer_api_latest "$_ALLOW_SOURCE_BUILD"
         return $?
     fi
     if $_PREFER_GH && command -v gh &>/dev/null; then
@@ -1156,11 +1199,14 @@ _verify_minisign() {
         return 3
     fi
 
-    local sig_file="${file}.minisig"
+    local sig_file="${file}.minisig" fetch_status=0
     if [[ ! -e "$sig_file" && ! -L "$sig_file" ]]; then
-        _fetch_release_asset "$asset.minisig" "$sig_file" 1048576 || {
-            _log_error "Signature unavailable for $asset"; return 1;
-        }
+        _fetch_release_asset "$asset.minisig" "$sig_file" 1048576 || fetch_status=$?
+        if ((fetch_status != 0)); then
+            _log_error "Signature unavailable for $asset"
+            ((fetch_status != 5)) || return 5
+            return 1
+        fi
     fi
     [[ -f "$sig_file" && ! -L "$sig_file" && -s "$sig_file" ]] || return 1
 
@@ -2284,7 +2330,7 @@ main() {
             continue
         else
             acquisition_status=0
-            _fetch_release_asset "$asset_name" "$archive_file" || acquisition_status=$?
+            _fetch_release_asset "$asset_name" "$archive_file" 2147483648 "$_ALLOW_SOURCE_BUILD" || acquisition_status=$?
             if ((acquisition_status != 0)); then
                 ((acquisition_status == 1)) || return "$acquisition_status"
                 _log_warn "Release payload unavailable: $asset_name"
