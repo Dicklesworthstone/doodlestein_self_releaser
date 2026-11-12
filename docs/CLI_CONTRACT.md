@@ -2166,6 +2166,25 @@ executable changes. Expected output hashes remain bound through the existing
 journaled family installation and recovery path. Failed builds retain private
 diagnostics and leave installed executables untouched.
 
+To prefer a release and permit source fallback when acquisition is unavailable:
+
+```powershell
+.\install.ps1 -AllowSourceBuild -Yes -Json
+.\install.ps1 -AllowSourceBuild -Version v1.2.3 -Yes -Json
+```
+
+A selected release falls back to its exact `refs/tags/TAG`; only unavailable
+latest-release discovery without a selected tag can use `HEAD`. The same selected
+credential is used for API and Git requests. Transport failures, owned request
+deadlines and HTTP 408/429/5xx can permit fallback. Public 404/410 responses and
+a complete authenticated inventory missing the primary payload can also prove
+unavailability. HTTP 401/403, ambiguous authenticated 404/410, malformed metadata,
+missing checksum/signature proof and invalid cache or release bytes cannot
+authorize source fallback. A verified cache retains precedence. Source failure never retries a
+different ref or installs an older release. JSON records `source_fallback` with
+the acquisition stage, requested source ref and known release version; the build
+retains the same durable unsigned source receipt and family transaction.
+
 For an optional source upgrade after verifying the latest release:
 
 ```powershell
@@ -2173,25 +2192,27 @@ For an optional source upgrade after verifying the latest release:
 ```
 
 The paired flags require online latest-release mode, a supported source policy,
-and an integer threshold from `0` through `999999`. Only a release more than
+and a canonical integer threshold from `0` through `999999`. Empty, fractional
+and exponent values are rejected before acquisition. Only a release more than
 that many commits behind the observed default-branch head selects source.
 Checksums, configured signatures, archive members and PE architecture are
 verified before any freshness query or source build. The authenticated,
 bounded GitHub queries resolve the tag and observed head to immutable commits
 and require a consistent ancestral comparison. Unknown, denied, redirected,
-malformed or divergent metadata keeps the verified release. A stale decision
+malformed or divergent metadata keeps the verified release; explicit interruption
+returns exit `5` without installation. A stale decision
 builds the exact observed head, even if the branch subsequently moves, using
 the same complete-family transaction and durable unsigned source receipt as
 `-FromSource`. JSON includes `freshness`, with its decision and, when known,
 commit distance and pinned commits. Source-build failures leave the previous
 installation intact and retain diagnostics; they do not activate a partial family.
 
-`-FromSource` cannot be combined with `-Version`, `-Offline`, `-Recover` or the
-freshness flags. `-SourceRef` requires `-FromSource`; it cannot override the
+`-FromSource` cannot be combined with `-Version`, `-Offline`, `-Recover` or
+`-SourceIfStale`. `-SourceRef` requires `-FromSource`; it cannot override the
 observed freshness commit. `-SourceTimeout` requires either explicit source
-mode or the paired freshness flags. `-Yes` authorizes replacement only.
-Release acquisition, checksum and signature failures never invoke a source
-build. `-SourceTimeout` is a
+mode or `-AllowSourceBuild`. `-Yes` authorizes replacement only. Offline and
+recovery modes refuse source-build options. Checksum and signature failures
+never invoke a source build. `-SourceTimeout` is a
 per-Git/compiler-command deadline, including
 redirected output draining: default 3600 seconds, range 1..86400. A timeout
 prevents installation. Cleanup does not claim custody of child processes already

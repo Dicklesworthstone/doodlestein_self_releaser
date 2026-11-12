@@ -370,6 +370,37 @@ The policy regression exercises the actual configuration and publication naming
 helpers, explicit signing-key scope, executable-family limits and refusal before
 any existing installer or publication history changes.
 
+### Optional source fallback on Windows
+
+Prefer the selected release while permitting an unavailable release to fall back
+to a source build with the existing Git and compiler installations:
+
+```powershell
+.\install.ps1 -AllowSourceBuild -Yes -Json
+.\install.ps1 -AllowSourceBuild -Version v1.2.3 -Yes -Json
+```
+
+A known release uses its exact `refs/tags/TAG`; only unavailable latest-release
+discovery without a selected tag uses `HEAD`. This includes transport failures,
+owned request deadlines and HTTP 408/429/5xx at discovery, authenticated release
+metadata or primary-payload acquisition. Public 404/410 can establish absence.
+A complete authenticated inventory can also prove the primary is absent, while
+an authenticated HTTP 404/410 remains ambiguous and is refused.
+
+The same selected credential authenticates API and Git requests. HTTP 401/403,
+malformed metadata, missing checksum/signature proof and invalid cached or
+downloaded release bytes cannot authorize source execution. A complete verified
+cache is used before fetching its release again. Freshness metadata failures
+keep a verified release; they are not acquisition failures. Explicit interruption
+returns exit `5` and does not install either source or the verified old release.
+
+The existing pinned source compiler and complete-family transaction apply.
+Source failure never retries `HEAD` for a selected tag or silently installs an
+older release. JSON adds `source_fallback` with the acquisition stage, requested
+ref and known release version, alongside durable unsigned source provenance.
+`-Yes` grants replacement permission only; `-AllowSourceBuild` grants build
+consent. Offline and recovery modes refuse this consent.
+
 ### Optional stale-release source upgrades on Windows
 
 Generated Windows installers can verify the latest release and build a newer
@@ -379,8 +410,10 @@ source commit when it exceeds an explicitly chosen commit-distance threshold:
 .\install.ps1 -AllowSourceBuild -SourceIfStale 10 -Yes -Json
 ```
 
-Both freshness flags are required. The threshold is an integer from `0` through
-`999999`; equality keeps the release. Omit `-Version` for latest-release mode.
+Both freshness flags are required for the staleness decision. The threshold is
+a canonical integer from `0` through `999999`; equality keeps the release.
+Empty, fractional, exponent and noncanonical string values are refused before
+acquisition. Omit `-Version` for latest-release mode.
 `-Offline`, `-Recover`, `-FromSource` and `-SourceRef` cannot be combined with this
 mode. `-Yes` permits replacing existing executables and does not itself consent
 to source execution. Existing Git and the configured compiler are required only

@@ -10,7 +10,7 @@ param(
     [switch]$Recover,
     [switch]$FromSource,
     [switch]$AllowSourceBuild,
-    [Nullable[int]]$SourceIfStale = $null,
+    [string]$SourceIfStale = '',
     [string]$SourceRef = '',
     [int]$SourceTimeout = 3600,
     [switch]$Yes,
@@ -25,11 +25,28 @@ $script:DsrMaximumPayloadBytes = 2147483648L
 $script:DsrMaximumExpandedBytes = 4294967296L
 
 function Stop-DsrInstall {
-    param([string]$Message, [int]$Code = 4, [switch]$TransientAcquisition)
+    param([string]$Message, [int]$Code = 4, [switch]$TransientAcquisition, [int]$HttpStatus = 0)
     $failure = [System.InvalidOperationException]::new($Message)
     $failure.Data['DsrExitCode'] = $Code
     if ($TransientAcquisition) { $failure.Data['DsrTransientAcquisition'] = $true }
+    if ($HttpStatus -gt 0) { $failure.Data['DsrHttpStatus'] = $HttpStatus }
     throw $failure
+}
+
+# Only acquisition callers may use this classification. Proof, cache, archive
+# and executable failures never become permission to compile a different input.
+function Test-DsrReleaseAcquisitionUnavailable {
+    param([Exception]$Failure, [switch]$AllowMissing)
+    if (-not $Failure.Data.Contains('DsrExitCode') -or $Failure.Data['DsrExitCode'] -ne 8) { return $false }
+    if ($Failure.Data.Contains('DsrHttpStatus')) {
+        $status = [int]$Failure.Data['DsrHttpStatus']
+        # In particular, the older transient-API marker also covers 403. That
+        # status may try public tag discovery, but never authorizes source.
+        return $status -in @(408, 429) -or ($status -ge 500 -and $status -le 599) -or
+            ($AllowMissing -and $status -in @(404, 410))
+    }
+    return $Failure.Data.Contains('DsrTransientAcquisition') -and
+        $Failure.Data['DsrTransientAcquisition'] -eq $true
 }
 
 function Write-DsrInstallLog {
@@ -467,7 +484,7 @@ function Invoke-DsrDownload {
                 }
                 if ($status -in @(404, 410) -and $Optional) { return $false }
                 if ($status -ne 200) {
-                    Stop-DsrInstall ('GitHub download failed with HTTP ' + $status) 8 `
+                    Stop-DsrInstall ('GitHub download failed with HTTP ' + $status) 8 -HttpStatus $status `
                         -TransientAcquisition:($status -in @(403, 408, 429) -or ($status -ge 500 -and $status -le 599))
                 }
                 if ($null -ne $response.Content.Headers.ContentLength -and $response.Content.Headers.ContentLength -gt $MaximumBytes) {
@@ -494,6 +511,7 @@ function Invoke-DsrDownload {
             }
         }
     } catch [OperationCanceledException] {
+        if (-not $deadline.IsCancellationRequested) { Stop-DsrInstall 'GitHub acquisition was cancelled' 5 }
         Stop-DsrInstall 'GitHub download exceeded its complete-transfer deadline' 8 -TransientAcquisition
     } catch [Net.Http.HttpRequestException] {
         # Exception text can contain a signed redirect URL. Keep credentials
@@ -549,6 +567,16 @@ function Get-DsrReleaseFreshness {
             repository = $Repository; release_version = $Tag; release_commit = $base; head_commit = $head;
             commits_behind = $comparison.ahead_by; threshold = $Threshold }
     } catch {
+        $failure = $_.Exception
+        while ($null -ne $failure) {
+            if ($failure -is [OperationCanceledException] -or
+                $failure -is [Management.Automation.PipelineStoppedException] -or
+                ($failure.Data.Contains('DsrExitCode') -and $failure.Data['DsrExitCode'] -eq 5)) {
+                $_.Exception.Data['DsrExitCode'] = 5
+                throw
+            }
+            $failure = $failure.InnerException
+        }
         # Transport exceptions may contain URLs. Keep the public decision
         # stable and credential-free; none of these failures may start Git.
         return $unknown
@@ -597,7 +625,7 @@ function Get-DsrPublicLatestTag {
                     continue
                 }
                 if ($status -ne 200 -or -not $tag) {
-                    Stop-DsrInstall 'Cannot resolve the latest published release; use -Version with an existing tag' 8
+                    Stop-DsrInstall 'Cannot resolve the latest published release; use -Version with an existing tag' 8 -HttpStatus $status
                 }
                 return $tag
             } finally {
@@ -606,9 +634,10 @@ function Get-DsrPublicLatestTag {
             }
         }
     } catch [OperationCanceledException] {
-        Stop-DsrInstall 'Public latest-release discovery exceeded its deadline; use -Version with an existing tag' 8
+        if (-not $deadline.IsCancellationRequested) { Stop-DsrInstall 'Public latest-release discovery was cancelled' 5 }
+        Stop-DsrInstall 'Public latest-release discovery exceeded its deadline; use -Version with an existing tag' 8 -TransientAcquisition
     } catch [Net.Http.HttpRequestException] {
-        Stop-DsrInstall 'Public latest-release discovery failed during HTTPS transport; use -Version with an existing tag' 8
+        Stop-DsrInstall 'Public latest-release discovery failed during HTTPS transport; use -Version with an existing tag' 8 -TransientAcquisition
     } finally { $deadline.Dispose(); $client.Dispose() }
     Stop-DsrInstall 'Public latest-release discovery did not complete' 8
 }
@@ -1489,11 +1518,15 @@ function Invoke-DsrWindowsInstaller {
     [CmdletBinding()]
     param([string]$Version = '', [string]$Prefix = '', [string]$CacheDir = '',
           [switch]$Offline, [switch]$Recover, [switch]$FromSource, [switch]$AllowSourceBuild,
-          [Nullable[int]]$SourceIfStale = $null, [string]$SourceRef = '', [int]$SourceTimeout = 3600,
+          [string]$SourceIfStale = '', [string]$SourceRef = '', [int]$SourceTimeout = 3600,
           [switch]$Yes, [switch]$Json, [switch]$Help)
     $work = ''
     $retainSourceWork = $false
     $freshness = $null
+    $freshnessRequested = $PSBoundParameters.ContainsKey('SourceIfStale')
+    $fallbackReference = ''
+    $fallbackStage = ''
+    $fallbackVersion = $null
     $tool = ''
     try {
         if ($PSVersionTable.PSVersion -lt [Version]'7.4') { Stop-DsrInstall 'PowerShell 7.4 or newer is required' 3 }
@@ -1511,7 +1544,7 @@ Options:
   -Offline       No network; requires -Version and complete cached evidence
   -Recover       Restore an interrupted installation offline; requires -Yes
   -FromSource    Explicitly build a configured Rust/Go/Bun family with installed tools
-  -AllowSourceBuild  Consent to the source upgrade selected by -SourceIfStale
+  -AllowSourceBuild  Permit source fallback when release acquisition is unavailable
   -SourceIfStale N   After verifying latest release, build its observed head if >N commits behind
   -SourceRef REF Source pin: HEAD, refs/heads/BRANCH, refs/tags/TAG, or full SHA
   -SourceTimeout SECONDS  Per-source-command deadline; default 3600, maximum 86400
@@ -1526,6 +1559,9 @@ signatures require Minisign. Release executables are never run and PATH is not e
 not an authenticated signed release. It never installs a compiler automatically.
 -SourceIfStale requires -AllowSourceBuild and latest online mode. Unknown freshness
 keeps the verified release. A failed release integrity check never starts a source build.
+Source fallback keeps a selected release's exact tag; only unavailable latest
+discovery selects HEAD. Credentials remain the same, and authentication failures,
+missing verification proof or invalid release metadata never authorize fallback.
 Private releases use DSR_GH_TOKEN, GITHUB_TOKEN, then GH_TOKEN, with Contents read
 permission. Release credentials are scoped to the configured repository's API;
 explicit source fetches use the same token at that repository's HTTPS Git URL.
@@ -1543,7 +1579,7 @@ explicit source fetches use the same token at that repository's HTTPS Git URL.
         $prefixPath = Get-DsrPlainPath $Prefix
         if ($Recover) {
             if ($Version -or $Offline -or $CacheDir -or $FromSource -or $AllowSourceBuild -or
-                $null -ne $SourceIfStale -or $SourceRef -or $SourceTimeout -ne 3600) {
+                $freshnessRequested -or $SourceRef -or $SourceTimeout -ne 3600) {
                 Stop-DsrInstall '-Recover cannot be combined with release, cache or source-build options'
             }
             if (-not $Yes) { Stop-DsrInstall '-Recover requires -Yes to restore the previous executable family' 2 }
@@ -1560,13 +1596,14 @@ explicit source fetches use the same token at that repository's HTTPS Git URL.
         if (-not $FromSource -and -not $AllowSourceBuild -and $SourceTimeout -ne 3600) {
             Stop-DsrInstall '-SourceTimeout requires explicit source-build consent'
         }
-        if ($AllowSourceBuild -or $null -ne $SourceIfStale) {
-            if (-not $AllowSourceBuild -or $null -eq $SourceIfStale -or $SourceIfStale -lt 0 -or
-                $SourceIfStale -gt 999999 -or $FromSource -or $Version -or $Offline) {
-                Stop-DsrInstall '-SourceIfStale needs -AllowSourceBuild, 0 through 999999, and latest online release mode'
+        if ($freshnessRequested) {
+            if (-not $AllowSourceBuild -or $SourceIfStale -cnotmatch '^(0|[1-9][0-9]{0,5})$' -or
+                $FromSource -or $Version -or $Offline) {
+                Stop-DsrInstall '-SourceIfStale needs -AllowSourceBuild, an integer from 0 through 999999, and latest online release mode'
             }
         }
         if ($FromSource -or $AllowSourceBuild) {
+            if ($Offline) { Stop-DsrInstall 'Source-build consent cannot be combined with -Offline' }
             if (-not $policy.Contains('source')) { Stop-DsrInstall 'This installer has no supported Rust, Go or Bun source policy' 4 }
             if ($SourceTimeout -lt 1 -or $SourceTimeout -gt 86400) { Stop-DsrInstall '-SourceTimeout must be between 1 and 86400 seconds' }
         }
@@ -1604,11 +1641,32 @@ explicit source fetches use the same token at that repository's HTTPS Git URL.
                 # A selected credential never falls back to an anonymous
                 # identity. Malformed metadata and unsafe API redirects are
                 # not availability failures and must also remain refusals.
-                if ($authenticatedDiscovery -or
-                    -not $_.Exception.Data.Contains('DsrTransientAcquisition') -or
-                    $_.Exception.Data['DsrTransientAcquisition'] -ne $true) { throw }
+                if ($authenticatedDiscovery) {
+                    if ($AllowSourceBuild -and (Test-DsrReleaseAcquisitionUnavailable $_.Exception)) {
+                        $fallbackReference = 'HEAD'
+                        $fallbackStage = 'release_discovery'
+                    }
+                    throw
+                }
+                if (-not $_.Exception.Data.Contains('DsrTransientAcquisition') -or
+                    $_.Exception.Data['DsrTransientAcquisition'] -ne $true) {
+                    if ($AllowSourceBuild -and (Test-DsrReleaseAcquisitionUnavailable $_.Exception -AllowMissing)) {
+                        $fallbackReference = 'HEAD'
+                        $fallbackStage = 'release_discovery'
+                    }
+                    throw
+                }
                 Write-DsrInstallLog 'GitHub API unavailable; resolving the public latest-release redirect'
-                $tag = Get-DsrPublicLatestTag $policy.repo
+                $allowDiscoveryFallback = $AllowSourceBuild -and
+                    (Test-DsrReleaseAcquisitionUnavailable $_.Exception -AllowMissing)
+                try { $tag = Get-DsrPublicLatestTag $policy.repo }
+                catch {
+                    if ($allowDiscoveryFallback -and (Test-DsrReleaseAcquisitionUnavailable $_.Exception -AllowMissing)) {
+                        $fallbackReference = 'HEAD'
+                        $fallbackStage = 'release_discovery'
+                    }
+                    throw
+                }
             }
             if ($latestDownloaded) {
                 $release = ConvertFrom-DsrJson (Read-DsrTextFile $latest)
@@ -1640,20 +1698,45 @@ explicit source fetches use the same token at that repository's HTTPS Git URL.
         else {
             if (-not $work) { $work = New-DsrPrivateDirectory ([IO.Path]::Combine($cacheRoot, ('.dsr-download-' + [Guid]::NewGuid().ToString('N')))) }
             $inventory = $null
-            if (Get-DsrGitHubToken) {
+            $authenticatedAcquisition = [bool](Get-DsrGitHubToken)
+            if ($authenticatedAcquisition) {
                 Write-DsrInstallVerbose 'Resolving the selected authenticated GitHub release and complete asset inventory'
-                if ($null -eq $release) {
-                    $metadata = [IO.Path]::Combine($work, 'release.json')
-                    $releaseUrl = 'https://api.github.com/repos/' + $policy.repo + '/releases/tags/' + [Uri]::EscapeDataString($tag)
-                    $null = Invoke-DsrDownload $releaseUrl $metadata -MaximumBytes 8388608
-                    $release = ConvertFrom-DsrJson (Read-DsrTextFile $metadata)
+                try {
+                    if ($null -eq $release) {
+                        $metadata = [IO.Path]::Combine($work, 'release.json')
+                        $releaseUrl = 'https://api.github.com/repos/' + $policy.repo + '/releases/tags/' + [Uri]::EscapeDataString($tag)
+                        $null = Invoke-DsrDownload $releaseUrl $metadata -MaximumBytes 8388608
+                        $release = ConvertFrom-DsrJson (Read-DsrTextFile $metadata)
+                    }
+                    Assert-DsrReleaseIdentity $release $tag
+                    $inventory = Get-DsrReleaseAssets $policy.repo $release.id $work
+                } catch {
+                    if ($AllowSourceBuild -and (Test-DsrReleaseAcquisitionUnavailable $_.Exception)) {
+                        $fallbackReference = 'refs/tags/' + $tag
+                        $fallbackVersion = $tag
+                        $fallbackStage = 'release_metadata'
+                    }
+                    throw
                 }
-                Assert-DsrReleaseIdentity $release $tag
-                $inventory = Get-DsrReleaseAssets $policy.repo $release.id $work
             } else { Write-DsrInstallVerbose 'Downloading the selected public GitHub release payload' }
             $download = New-DsrPrivateDirectory ([IO.Path]::Combine($work, 'release'))
             $payload = [IO.Path]::Combine($download, $asset)
-            $null = Save-DsrReleaseAsset $policy.repo $tag $asset $payload $inventory -MaximumBytes $script:DsrMaximumPayloadBytes
+            try {
+                $null = Save-DsrReleaseAsset $policy.repo $tag $asset $payload $inventory -MaximumBytes $script:DsrMaximumPayloadBytes
+            } catch {
+                # A complete, authenticated inventory can prove absence of
+                # this primary payload. An HTTP 404 cannot prove that same
+                # fact: a private repository may hide denied access as 404.
+                $missingInventoryPayload = $null -ne $inventory -and -not $inventory.ContainsKey($asset) -and
+                    $_.Exception.Data.Contains('DsrExitCode') -and $_.Exception.Data['DsrExitCode'] -eq 8
+                if ($AllowSourceBuild -and ($missingInventoryPayload -or
+                    (Test-DsrReleaseAcquisitionUnavailable $_.Exception -AllowMissing:(-not $authenticatedAcquisition)))) {
+                    $fallbackReference = 'refs/tags/' + $tag
+                    $fallbackVersion = $tag
+                    $fallbackStage = 'release_payload'
+                }
+                throw
+            }
             $checksumName = ''
             foreach ($candidate in @(Get-DsrChecksumNames $binding)) {
                 if (Save-DsrReleaseAsset $policy.repo $tag $candidate ([IO.Path]::Combine($download, $candidate)) $inventory -Optional -MaximumBytes 8388608) {
@@ -1710,10 +1793,10 @@ explicit source fetches use the same token at that repository's HTTPS Git URL.
         # destination write; an earlier successful hash is not a reservation.
         $null = Get-DsrCacheReceipt $privateRelease $binding $policy.public_key
         Write-DsrInstallVerbose 'Checksum, configured signature, archive and executable admission completed'
-        if ($null -ne $SourceIfStale) {
+        if ($freshnessRequested) {
             # Verification is complete before any source decision. A stale
             # release cannot turn bad signature/archive/PE bytes into consent.
-            $freshness = Get-DsrReleaseFreshness $policy.repo $tag $SourceIfStale $work
+            $freshness = Get-DsrReleaseFreshness $policy.repo $tag ([int]$SourceIfStale) $work
             if ($freshness.status -ceq 'stale') {
                 Write-DsrInstallLog ('Release ' + $tag + ' is ' + $freshness.commits_behind + ' commits behind the observed default branch')
                 $retainSourceWork = $true
@@ -1740,13 +1823,35 @@ explicit source fetches use the same token at that repository's HTTPS Git URL.
         else { [Console]::Out.WriteLine($primaryRow.path) }
         return 0
     } catch {
+        $failure = $_.Exception
+        if ($fallbackReference) {
+            # Only classified release acquisition above selects this path.
+            # Never reuse its exception after compilation starts: source or
+            # installation failure is final and retains its own diagnostics.
+            try {
+                $sourceWork = New-DsrPrivateDirectory ([IO.Path]::Combine($work, 'source-fallback'))
+                $retainSourceWork = $true
+                Write-DsrInstallLog ('Release acquisition unavailable; using permitted source fallback at ' + $fallbackReference)
+                $result = Install-DsrSourceFamily $policy $selection $platform $fallbackReference $sourceWork $SourceTimeout $cacheRoot $prefixPath $transactionIdentity -Yes:$Yes
+                $result.source_fallback = @{ reason = 'release_unavailable'; stage = $fallbackStage;
+                    requested_ref = $fallbackReference; release_version = $fallbackVersion }
+                $retainSourceWork = $false
+                if ($Json) { [Console]::Out.WriteLine(($result | ConvertTo-Json -Depth 12 -Compress)) }
+                else { [Console]::Out.WriteLine($result.path) }
+                return 0
+            } catch { $failure = $_.Exception }
+        }
         $code = 7
-        if ($_.Exception.Data.Contains('DsrExitCode')) { $code = [int]$_.Exception.Data['DsrExitCode'] }
-        Write-DsrInstallLog $_.Exception.Message
+        if ($failure.Data.Contains('DsrExitCode')) { $code = [int]$failure.Data['DsrExitCode'] }
+        Write-DsrInstallLog $failure.Message
         if ($Json) {
-            $result = @{ tool = $tool; status = 'error'; error = $_.Exception.Message; exit_code = $code }
+            $result = @{ tool = $tool; status = 'error'; error = $failure.Message; exit_code = $code }
             if ($retainSourceWork -and $work) { $result.source_diagnostics = $work }
             if ($null -ne $freshness) { $result.freshness = $freshness }
+            if ($fallbackReference) {
+                $result.source_fallback = @{ reason = 'release_unavailable'; stage = $fallbackStage;
+                    requested_ref = $fallbackReference; release_version = $fallbackVersion }
+            }
             [Console]::Out.WriteLine(($result | ConvertTo-Json -Compress))
         }
         return $code

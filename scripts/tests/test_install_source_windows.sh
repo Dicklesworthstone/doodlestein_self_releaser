@@ -10,7 +10,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 dependencies=(pwsh git go cargo rustc minisign python3 jq yq)
 if [[ " $* " == *' --bun-only '* || " $* " == *' --bun-workspaces-only '* ]]; then
     dependencies=(pwsh git bun minisign python3 jq yq)
-elif [[ " $* " == *' --freshness-only '* || " $* " == *' --go-only '* || " $* " == *' --go-workspace-only '* ]]; then
+elif [[ " $* " == *' --freshness-only '* || " $* " == *' --fallback-only '* || " $* " == *' --freshness-deadline-only '* || " $* " == *' --go-only '* || " $* " == *' --go-workspace-only '* ]]; then
     dependencies=(pwsh git go minisign python3 jq yq)
 fi
 for dependency in "${dependencies[@]}"; do
@@ -33,6 +33,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 
 arguments = argparse.ArgumentParser(description="Generated Windows Rust/Go/Bun source installation regression")
@@ -46,6 +47,9 @@ arguments.add_argument("--bun-only", action="store_true", help="Run genuine Bun/
 arguments.add_argument("--bun-workspaces-only", action="store_true", help="Run generated Bun workspace source installation controls")
 arguments.add_argument("--bun-baseline-project", type=Path, help="Frozen checkout before Windows Bun source installation")
 arguments.add_argument("--freshness-only", action="store_true", help="Run signed release-first freshness and pinned source-upgrade controls")
+arguments.add_argument("--fallback-only", action="store_true", help="Run classified unavailable-release source fallback controls")
+arguments.add_argument("--fallback-baseline-project", type=Path, help="Frozen checkout before unavailable-release source fallback")
+arguments.add_argument("--freshness-deadline-only", action="store_true", help="Exercise the actual owned freshness HTTP deadline")
 arguments.add_argument("--freshness-baseline-project", type=Path, help="Frozen checkout before Windows freshness source upgrades")
 options = arguments.parse_args()
 project = options.project.resolve()
@@ -206,6 +210,9 @@ if (Get-Command Invoke-DsrSourceGit -ErrorAction SilentlyContinue) {
                 GOFLAGS = $Environment['GOFLAGS']; GO111MODULE = $Environment['GO111MODULE'];
                 GOTOOLCHAIN = $Environment['GOTOOLCHAIN'] };
             bun_environment = @{ NODE_OPTIONS = $Environment['NODE_OPTIONS']; BUN_OPTIONS = $Environment['BUN_OPTIONS'] }
+            git_authorization_sha256 = $(if ($Environment['DSR_INSTALLER_GIT_AUTHORIZATION']) {
+                Get-DsrBytesHash ([Text.Encoding]::UTF8.GetBytes($Environment['DSR_INSTALLER_GIT_AUTHORIZATION']))
+            } else { '' })
         } | ConvertTo-Json -Compress) + "`n"))
         $result = & $script:RealSourceCommand @PSBoundParameters
         if ($script:Fixture.Contains('inject_untracked_workspace') -and $script:Fixture.inject_untracked_workspace -and
@@ -259,6 +266,10 @@ public sealed class DsrSourceFixtureHandler : HttpMessageHandler {
             fixture = document.RootElement.Clone();
         }
     }
+    private static async Task<HttpResponseMessage> WaitForDeadline(CancellationToken token) {
+        await Task.Delay(Timeout.Infinite, token);
+        throw new InvalidOperationException("Unbounded fixture unexpectedly completed");
+    }
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken token) {
         token.ThrowIfCancellationRequested();
         string url = request.RequestUri.AbsoluteUri;
@@ -278,7 +289,8 @@ public sealed class DsrSourceFixtureHandler : HttpMessageHandler {
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.BadRequest));
         }
         if (fixture.TryGetProperty("transport_failures", out JsonElement failures) && failures.TryGetProperty(url, out JsonElement failure)) {
-            if (failure.GetString() == "timeout") { throw new OperationCanceledException("Injected response deadline"); }
+            if (failure.GetString() == "cancel") { throw new OperationCanceledException("Injected explicit cancellation"); }
+            if (failure.GetString() == "deadline") { return WaitForDeadline(token); }
             throw new HttpRequestException("Injected HTTPS transport failure");
         }
         if (fixture.TryGetProperty("statuses", out JsonElement statuses) && statuses.TryGetProperty(url, out JsonElement status)) {
@@ -436,6 +448,10 @@ def test_release_freshness():
     def run(label, *, params=None, selected=runtime, payload=None, **changes):
         selected_params = dict(parameters)
         selected_params.update(params or {})
+        # None means the caller omitted this optional argument. An explicitly
+        # supplied empty string remains present and must be rejected.
+        if selected_params.get("SourceIfStale") is None:
+            selected_params.pop("SourceIfStale", None)
         return invoke("freshness-" + label, parameters=selected_params, selected_runtime=selected,
                       downloads=downloads if payload is None else payload, http_client_fixture=True, **changes)
 
@@ -447,6 +463,221 @@ def test_release_freshness():
         prefix = Path(fixture["parameters"]["Prefix"])
         return result.get("version") == "v1.2.3" and result.get("signature_verified") is True and \
             all((prefix / name).is_file() and digest(prefix / name) == value for name, value in original.items())
+
+    if options.freshness_deadline_only:
+        started = time.monotonic()
+        outcome, result, fixture = run("owned-deadline", transport_failures={head_url: "deadline"})
+        elapsed = time.monotonic() - started
+        check("the real unchanged 60-second metadata deadline keeps the verified release",
+              outcome.returncode == 0 and elapsed >= 55 and release_installed(result, fixture) and
+              not calls(fixture) and result.get("freshness", {}).get("status") == "unknown",
+              f"elapsed={elapsed:.3f}s " + outcome.stderr.decode(errors="replace"))
+        return
+
+    if options.fallback_only:
+        latest_url = api + "/releases/latest"
+        public_latest = "https://github.com/fixture/source-demo/releases/latest"
+        public_tag = "https://github.com/fixture/source-demo/releases/tag/v1.2.3"
+        public_payload = "https://github.com/fixture/source-demo/releases/download/v1.2.3/" + asset
+        private_payload = api + "/releases/assets/1"
+        inventory_url = api + "/releases/4242/assets?per_page=100&page=1"
+        exact_url = api + "/releases/tags/v1.2.3"
+        downloads[exact_url] = downloads[latest_url]
+
+        def fallback(label, *, params=None, **changes):
+            chosen = {"SourceIfStale": None}
+            chosen.update(params or {})
+            return run("fallback-" + label, params=chosen, **changes)
+
+        def source_selected(result, fixture, reference, commit):
+            prefix = Path(fixture["parameters"]["Prefix"])
+            rows = result.get("binaries", [])
+            fetches = [row for row in calls(fixture) if "fetch" in row["arguments"]]
+            return result.get("method") == "source" and result.get("signed_release") is False and \
+                result.get("signature_verified") is False and "version" not in result and \
+                result.get("source", {}).get("requested_ref") == reference and \
+                result["source"].get("source_commit") == commit and \
+                {row["name"] for row in rows} == set(original) and \
+                len(fetches) == 1 and fetches[0]["arguments"][-1] == reference and all(
+                    machine(prefix / row["name"]) == 0x8664 and digest(prefix / row["name"]) == row["sha256"]
+                    for row in rows) and result.get("source_fallback", {}).get("requested_ref") == reference and \
+                json.loads(Path(result["source_receipt"]["path"]).read_text()) == result["source"]
+
+        if options.fallback_baseline_project:
+            prior, prior_runtime, prior_policy = generate("source-demo", "fallback-baseline-generate",
+                checkout=options.fallback_baseline_project.resolve(), destination=root / "fallback-baseline-generated")
+            for label, statuses in (("latest", {latest_url: 404}), ("payload", {public_payload: 404})):
+                before, _, fixture = fallback("baseline-" + label, selected=prior_runtime,
+                    params={"SourceIfStale": 0}, statuses=statuses)
+                check("same signed-source caller proves baseline has no unavailable-" + label + " fallback",
+                      prior.returncode == 0 and prior_policy == policy and before.returncode == 8 and
+                      not calls(fixture) and not Path(fixture["parameters"]["Prefix"]).exists(),
+                      before.stderr.decode(errors="replace"))
+            coerced, coerced_result, _ = fallback("baseline-fractional-threshold", selected=prior_runtime,
+                params={"SourceIfStale": 0.5})
+            check("actual baseline silently rounds fractional consent and compiles a source family",
+                  coerced.returncode == 0 and coerced_result.get("method") == "source" and
+                  coerced_result.get("freshness", {}).get("threshold") == 0,
+                  coerced.stderr.decode(errors="replace"))
+
+        available, available_result, available_fixture = fallback("available")
+        check("source fallback consent alone keeps an available fully signed release without freshness requests",
+              available.returncode == 0 and release_installed(available_result, available_fixture) and
+              not calls(available_fixture) and "freshness" not in available_result,
+              available.stderr.decode(errors="replace"))
+        for label, params, statuses, expected_ref, expected_commit in (
+            ("known-release", {}, {public_payload: 404}, "refs/tags/v1.2.3", first_commit),
+            ("explicit-numeric", {"Version": "1.2.3"}, {public_payload: 410}, "refs/tags/v1.2.3", first_commit),
+            ("missing-latest", {"SourceIfStale": 0}, {latest_url: 404}, "HEAD", second_commit),
+            ("public-outage", {}, {latest_url: 503, public_latest: 503}, "HEAD", second_commit),
+        ):
+            outcome, result, fixture = fallback(label, params=params, statuses=statuses)
+            check(label + " installs the genuine complete family from the correct source selection",
+                  outcome.returncode == 0 and source_selected(result, fixture, expected_ref, expected_commit) and
+                  result["source_fallback"].get("release_version") == (None if expected_ref == "HEAD" else "v1.2.3"),
+                  outcome.stderr.decode(errors="replace"))
+        redirected = dict(downloads)
+        redirected[public_tag] = metadata("public-tag-head", {})
+        resolved, resolved_result, resolved_fixture = fallback("public-redirect-tag", payload=redirected,
+            statuses={latest_url: 429, public_payload: 404}, redirects={public_latest: public_tag})
+        check("public redirect recovery binds unavailable payload fallback to its exact resolved release tag",
+              resolved.returncode == 0 and source_selected(resolved_result, resolved_fixture, "refs/tags/v1.2.3", first_commit) and
+              any(row["url"] == public_tag and row["method"] == "HEAD" for row in requests(resolved_fixture)),
+              resolved.stderr.decode(errors="replace"))
+
+        token = "dsr-fallback-selected-credential"
+        credentials = {"DSR_GH_TOKEN": token, "GITHUB_TOKEN": "other-fixture-account", "GH_TOKEN": "third-fixture-account"}
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        authorization = "Authorization: Basic " + base64.b64encode(("x-access-token:" + token).encode()).decode()
+        authorization_hash = hashlib.sha256(authorization.encode()).hexdigest()
+        for label, params, failed_url, status, expected_ref, expected_commit in (
+            ("private-discovery", {}, latest_url, 503, "HEAD", second_commit),
+            ("private-exact", {"Version": "v1.2.3"}, exact_url, 408, "refs/tags/v1.2.3", first_commit),
+            ("private-inventory", {}, inventory_url, 429, "refs/tags/v1.2.3", first_commit),
+            ("private-payload", {}, private_payload, 503, "refs/tags/v1.2.3", first_commit),
+        ):
+            outcome, result, fixture = fallback(label, params=params, statuses={failed_url: status},
+                extra=credentials, expected_token=token)
+            fetches = [row for row in calls(fixture) if "fetch" in row["arguments"]]
+            observed = requests(fixture)
+            check(label + " retains the selected account through metadata outage and real source fetch",
+                  outcome.returncode == 0 and source_selected(result, fixture, expected_ref, expected_commit) and
+                  all(row["url"].startswith(api + "/") and row["authorization_sha256"] == token_hash for row in observed) and
+                  len(fetches) == 1 and fetches[0].get("git_authorization_sha256") == authorization_hash and
+                  token not in (outcome.stdout + outcome.stderr).decode(errors="replace") and
+                  token not in Path(fixture["commands"]).read_text(), outcome.stderr.decode(errors="replace"))
+        absent = dict(downloads)
+        absent[inventory_url] = metadata("fallback-absent-primary", [
+            row for row in json.loads(Path(downloads[inventory_url]).read_text()) if row["name"] != asset])
+        omitted, omitted_result, omitted_fixture = fallback("private-absent-primary", payload=absent,
+            extra=credentials, expected_token=token)
+        check("complete authenticated inventory proves primary absence without an anonymous request",
+              omitted.returncode == 0 and source_selected(omitted_result, omitted_fixture, "refs/tags/v1.2.3", first_commit) and
+              all(row["url"].startswith(api + "/") and row["authorization_sha256"] == token_hash for row in requests(omitted_fixture)) and
+              private_payload not in [row["url"] for row in requests(omitted_fixture)],
+              omitted.stderr.decode(errors="replace"))
+
+        for label, failed_url, status, authenticated in (
+            ("public-api-denied", latest_url, 401, False),
+            ("public-api-forbidden", latest_url, 403, False),
+            ("public-payload-denied", public_payload, 401, False),
+            ("public-payload-forbidden", public_payload, 403, False),
+            ("private-api-denied", latest_url, 401, True),
+            ("private-api-forbidden", latest_url, 403, True),
+            ("private-api-hidden", latest_url, 404, True),
+            ("private-payload-denied", private_payload, 401, True),
+            ("private-payload-forbidden", private_payload, 403, True),
+            ("private-payload-hidden", private_payload, 404, True),
+        ):
+            extra = {"extra": credentials, "expected_token": token} if authenticated else {}
+            refused, _, fixture = fallback(label, statuses={failed_url: status}, **extra)
+            check(label + " cannot authorize source execution or a replacement identity",
+                  refused.returncode == 8 and not calls(fixture) and not Path(fixture["parameters"]["Prefix"]).exists() and
+                  (not authenticated or all(row["authorization_sha256"] == token_hash for row in requests(fixture))),
+                  refused.stderr.decode(errors="replace"))
+
+        for label, changed in (
+            ("no-consent", {"AllowSourceBuild": False, "SourceTimeout": 3600}),
+            ("fractional-threshold", {"SourceIfStale": 0.5}),
+            ("empty-threshold", {"SourceIfStale": ""}),
+            ("empty-recovery-threshold", {"SourceIfStale": "", "Recover": True,
+                "AllowSourceBuild": False, "SourceTimeout": 3600, "CacheDir": ""}),
+            ("leading-zero", {"SourceIfStale": "01"}),
+            ("offline", {"Offline": True, "Version": "v1.2.3"}),
+        ):
+            refused, _, fixture = fallback(label, params=changed, statuses={latest_url: 404})
+            check(label + " cannot start an unavailable-release source build",
+                  refused.returncode == (8 if label == "no-consent" else 4) and not calls(fixture) and
+                  not Path(fixture["parameters"]["Prefix"]).exists() and (label == "no-consent" or no_http(fixture)),
+                  refused.stderr.decode(errors="replace"))
+
+        for label, failed_url in (("discovery-cancel", latest_url), ("payload-cancel", public_payload)):
+            cancelled, _, fixture = fallback(label, transport_failures={failed_url: "cancel"})
+            check(label + " stops explicitly without compiling or installing anything",
+                  cancelled.returncode == 5 and not calls(fixture) and not Path(fixture["parameters"]["Prefix"]).exists(),
+                  cancelled.stderr.decode(errors="replace"))
+        for label, failed_url in (
+            ("checksum-unavailable", public_payload.rsplit("/", 1)[0] + "/SHA256SUMS"),
+            ("signature-unavailable", public_payload + ".minisig"),
+        ):
+            refused, _, fixture = fallback(label, statuses={failed_url: 503})
+            check(label + " is a proof failure and never a source fallback",
+                  refused.returncode == 8 and not calls(fixture) and not Path(fixture["parameters"]["Prefix"]).exists(),
+                  refused.stderr.decode(errors="replace"))
+        malformed = dict(downloads)
+        malformed[latest_url] = metadata("malformed-latest", {"id": 4242, "tag_name": [], "draft": False})
+        refused, _, fixture = fallback("malformed-latest", payload=malformed)
+        check("malformed successful release metadata cannot be called an unavailable release",
+              refused.returncode == 7 and not calls(fixture), refused.stderr.decode(errors="replace"))
+        for kind in ("bad-checksum", "bad-signature", "unsafe-archive", "wrong-machine"):
+            selected = dict(downloads)
+            selected.update(release("fallback-" + kind, kind))
+            refused, _, fixture = fallback(kind, payload=selected, params={"Prefix": str(release_prefix)})
+            check(kind + " remains terminal under fallback consent and preserves the existing family",
+                  refused.returncode == 7 and not calls(fixture) and
+                  all(digest(release_prefix / name) == value for name, value in original.items()),
+                  refused.stderr.decode(errors="replace"))
+
+        warm, warm_result, warm_fixture = fallback("cache-warm", params={"Version": "v1.2.3"})
+        reused, reused_result, reused_fixture = fallback("cache-reuse", params={"Version": "v1.2.3",
+            "CacheDir": warm_fixture["parameters"]["CacheDir"]}, extra=credentials, statuses={exact_url: 401})
+        check("verified exact cache still avoids failed acquisition and every source probe",
+              warm.returncode == 0 and reused.returncode == 0 and release_installed(reused_result, reused_fixture) and
+              no_http(reused_fixture) and not calls(reused_fixture), reused.stderr.decode(errors="replace"))
+        cached_payload = Path(warm_result["cache"]["path"]) / asset
+        with cached_payload.open("ab") as changed:
+            changed.write(b"changed cached payload")
+        corrupt, _, corrupt_fixture = fallback("cache-corrupt", params={"Version": "v1.2.3",
+            "CacheDir": warm_fixture["parameters"]["CacheDir"]})
+        check("corrupt cached proof cannot be replaced by source execution",
+              corrupt.returncode == 7 and no_http(corrupt_fixture) and not calls(corrupt_fixture),
+              corrupt.stderr.decode(errors="replace"))
+
+        missing, missing_result, missing_fixture = fallback("missing-selected-tag", params={"Version": "v9.9.9",
+            "Prefix": str(release_prefix)})
+        missing_fetches = [row["arguments"] for row in calls(missing_fixture) if "fetch" in row["arguments"]]
+        check("a missing exact source tag fails once without retrying moving HEAD",
+              missing.returncode == 8 and len(missing_fetches) == 1 and missing_fetches[0][-1] == "refs/tags/v9.9.9" and
+              missing_result.get("source_fallback", {}).get("requested_ref") == "refs/tags/v9.9.9" and
+              all(digest(release_prefix / name) == value for name, value in original.items()),
+              missing.stderr.decode(errors="replace"))
+        rollback, rollback_result, _ = fallback("rollback", statuses={latest_url: 404}, move_fault=True,
+            params={"Prefix": str(release_prefix)})
+        check("fallback family replacement failure restores old bytes and retains diagnostics",
+              rollback.returncode == 7 and all(digest(release_prefix / name) == value for name, value in original.items()) and
+              Path(rollback_result.get("source_diagnostics", "/nonexistent")).is_dir(),
+              rollback.stderr.decode(errors="replace"))
+        (upstream / "project/cmd/helper/main.go").write_text("package main\nfunc main() { invalid Go source }\n")
+        required(["git", "-C", upstream, "add", "."], "fallback-broken-add")
+        required(["git", "-C", upstream, "commit", "--quiet", "-m", "Real later family compiler failure"], "fallback-broken-commit")
+        broken, broken_result, broken_fixture = fallback("compiler-failure", statuses={latest_url: 404},
+            params={"Prefix": str(release_prefix)})
+        check("real later source compiler failure never installs a partial family or switches back to release",
+              broken.returncode == 6 and sum(row["arguments"][0] == "build" for row in calls(broken_fixture)) == 2 and
+              all(digest(release_prefix / name) == value for name, value in original.items()) and
+              Path(broken_result.get("source_diagnostics", "/nonexistent")).is_dir(),
+              broken.stderr.decode(errors="replace"))
+        return
 
     if options.freshness_baseline_project:
         prior, prior_runtime, prior_policy = generate("source-demo", "freshness-baseline-generate",
@@ -522,7 +753,7 @@ def test_release_freshness():
         ("boolean-count", compare_url, {**comparison, "ahead_by": True}, {}),
         ("duplicate-keys", compare_url, '{"status":"ahead","status":"identical"}', {"raw": True}),
         ("redirect", None, None, {"redirects": {head_url: "https://example.invalid/untrusted-source"}}),
-        ("transport-timeout", None, None, {"transport_failures": {head_url: "timeout"}}),
+        ("transport-failure", None, None, {"transport_failures": {head_url: "network"}}),
     ]
     for label, url, value, controls in unknowns:
         selected = dict(downloads)
@@ -537,16 +768,24 @@ def test_release_freshness():
                   for row in requests(fixture)), outcome.stderr.decode(errors="replace"))
 
     for label, values in (
-        ("missing-consent", {"AllowSourceBuild": False}), ("missing-threshold", {"SourceIfStale": None}),
+        ("missing-consent", {"AllowSourceBuild": False}),
         ("exact-version", {"Version": "v1.2.3"}), ("offline", {"Offline": True}),
         ("explicit-source", {"FromSource": True}), ("moving-selector", {"SourceRef": "HEAD"}),
         ("negative-threshold", {"SourceIfStale": -1}), ("large-threshold", {"SourceIfStale": 1000000}),
+        ("fractional-threshold", {"SourceIfStale": 1.5}), ("leading-zero-threshold", {"SourceIfStale": "01"}),
+        ("empty-threshold", {"SourceIfStale": ""}), ("exponent-threshold", {"SourceIfStale": "1e0"}),
         ("invalid-timeout", {"SourceTimeout": 0}), ("recovery", {"Recover": True}),
     ):
         refused, _, fixture = run("invalid-" + label, params=values)
         check(label + " is refused before HTTP, Git, compilation or installation", refused.returncode == 4 and
               no_http(fixture) and not calls(fixture) and not Path(fixture["parameters"]["Prefix"]).exists(),
               refused.stderr.decode(errors="replace"))
+    cancelled, _, cancelled_fixture = run("cancelled", transport_failures={head_url: "cancel"},
+        params={"Prefix": str(installed_prefix)})
+    check("explicit freshness cancellation stops instead of installing a verified old release",
+          cancelled.returncode == 5 and not calls(cancelled_fixture) and
+          all(digest(installed_prefix / name) == value for name, value in original.items()),
+          cancelled.stderr.decode(errors="replace"))
     for kind in ("bad-checksum", "bad-signature", "unsafe-archive", "wrong-machine"):
         selected = dict(downloads)
         selected.update(release(kind, kind))
@@ -563,9 +802,9 @@ def test_release_freshness():
           rolled_result.get("freshness", {}).get("status") == "stale", rolled_back.stderr.decode(errors="replace"))
 
 
-if options.freshness_only:
+if options.freshness_only or options.fallback_only or options.freshness_deadline_only:
     test_release_freshness()
-    print(f"Windows release freshness checks: {passed} passed, {failed} failed", flush=True)
+    print(f"Windows release source-routing checks: {passed} passed, {failed} failed", flush=True)
     print("Portable PowerShell, real Git/Go/Minisign and adapted HTTP delivery; native Windows and live GitHub remain unqualified.", flush=True)
     raise SystemExit(1 if failed else 0)
 
