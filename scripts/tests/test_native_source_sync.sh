@@ -26,9 +26,119 @@
 # simultaneous pinned amd64/386 Go builds with private verified stages.
 # Use --strict-go-context-only for actual Go policy and retained-output admission.
 # Use --strict-go-paths-only for pinned local Go dependency boundaries.
+# Use --strict-cgo-selectors-only for genuine C header selection and compiler
+# environment evidence through the public strict build and release consumers.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 ROOT="${DSR_TEST_ROOT:-$ROOT}"
+
+test_strict_cgo_selectors() (
+    local dependency work config sha status=0 checks=0 failures=0 item
+    for dependency in bash git jq yq python3 go cc tar printenv; do
+        command -v "$dependency" >/dev/null || { printf 'SKIP: strict cgo selectors require %s\n' "$dependency"; return 77; }
+    done
+    [[ $(uname -s)/$(uname -m) == Linux/x86_64 && $(go version) == 'go version go'* ]] || return 77
+    work=$(mktemp -d "${DSR_TEST_DISK_ROOT:-${TMPDIR:-/tmp}}/dsr-cgo-selectors.XXXXXXXX") || return 1
+    printf 'Strict cgo selector evidence: %s\n' "$work"
+    mkdir -p "$work/config/repos.d" "$work/source" "$work/reviewed" "$work/ambient" "$work/stages" || return 1
+    export DSR_CONFIG_DIR="$work/config" ACT_CONFIG_DIR="$work/config" ACT_REPOS_DIR="$work/config/repos.d"
+    export DSR_STATE_DIR="$work/state" DSR_CACHE_DIR="$work/cache" DSR_HOSTS_FILE="$work/config/hosts.yaml"
+    export DSR_REPOS_FILE="$work/config/repos.yaml" DSR_DISABLE_HOST_SELECTOR=1 NO_COLOR=1 GOMAXPROCS=1
+    printf '#define DSR_SELECTOR_VALUE 41\n' > "$work/reviewed/dsr_selector.h"
+    printf '#define DSR_SELECTOR_VALUE 99\n' > "$work/ambient/dsr_selector.h"
+    printf 'module example.local/cgoselector\n\ngo 1.19\n' > "$work/source/go.mod"
+    cat > "$work/source/main.go" <<'GO'
+package main
+/*
+#include <dsr_selector.h>
+static int dsr_selector_value(void) { return DSR_SELECTOR_VALUE; }
+*/
+import "C"
+func main() { println(int(C.dsr_selector_value())) }
+GO
+    git -C "$work/source" init -q -b main || return 1
+    git -C "$work/source" add . || return 1
+    git -C "$work/source" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm pinned-cgo || return 1
+    git -C "$work/source" tag v1.0.0 || return 1
+    sha=$(git -C "$work/source" rev-parse HEAD) || return 1
+    jq -n --arg work "$work" '{schema_version:"1.0.0",hosts:{localnative:{
+        platform:"linux/amd64",connection:"local",concurrency:1,build_root:($work+"/stages")}},
+        platform_mapping:{"linux/amd64":"localnative"}}' > "$DSR_HOSTS_FILE" || return 1
+    config="$ACT_REPOS_DIR/cgoselector.yaml"
+    jq -n --arg work "$work" --arg path "$PATH" --arg cc "$(command -v cc)" \
+        --arg cache "${DSR_TEST_GOCACHE:-$work/go-cache}" '{
+        tool_name:"cgoselector",repo:"example/cgoselector",local_path:($work+"/source"),language:"go",
+        binary_name:"cgoselector",targets:["linux/amd64"],act_job_map:{"linux/amd64":null},
+        hosts:{"linux/amd64":"localnative"},
+        build_cmd:"printenv CPATH CPLUS_INCLUDE_PATH OBJC_INCLUDE_PATH LIBRARY_PATH COMPILER_PATH GCC_EXEC_PREFIX > \"$PROBE_AMBIENT\" || true; printf %s \"$C_INCLUDE_PATH\" > \"$PROBE_REVIEWED\"; go build -p=1 -buildvcs=false -o cgoselector .",
+        env:{PATH:$path,CC:$cc,C_INCLUDE_PATH:($work+"/reviewed"),CGO_ENABLED:"1",GOCACHE:$cache,
+          PROBE_AMBIENT:($work+"/child-ambient"),PROBE_REVIEWED:($work+"/child-reviewed"),
+          GOMAXPROCS:"1",GOPROXY:"off",GOSUMDB:"off"},
+        release_contract:{checksum_sidecar:"sha256",exact_primary_assets:{"linux/amd64":"cgoselector-linux-amd64"}}}
+        ' > "$config" || return 1
+    for item in logging config build_state act_runner artifact_naming host_selector host_health git_ops packaging; do
+        if [[ "$item" == act_runner ]]; then
+            # shellcheck disable=SC1090 # Optional unchanged module for paired behavior.
+            source "${DSR_TEST_ACT_RUNNER:-$ROOT/src/act_runner.sh}" || return 1
+        else
+            # shellcheck disable=SC1090 # These are the production modules used by cmd_build.
+            source "$ROOT/src/$item.sh" || return 1
+        fi
+    done
+    host_health_is_ready() { return 0; }
+    selector_acquire_slot() { return 0; }
+    selector_release_slot() { return 0; }
+    build_state_init || return 1
+    export SCRIPT_DIR="$ROOT" JSON_MODE=true DRY_RUN=false VERBOSE=false DSR_VERSION=fixture DSR_KEEP_BUILD_STAGES=1
+    declare -A _DSR_LOADED_MODULES=([packaging]=1 [artifact_naming]=1)
+    # shellcheck disable=SC1090 # Actual public build and publication consumers.
+    source <(awk '/^(_dsr_require|cmd_build|_release_sha256|_release_require_publishable_artifacts)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$ROOT/dsr") || return 1
+    # shellcheck disable=SC1090
+    source <(awk '/^json_envelope\(\) \{/{copy=1} copy{print} copy && /^# ====/{exit}' "$ROOT/dsr") || return 1
+    check_cgo_selector() {
+        local label="$1"; shift
+        checks=$((checks + 1))
+        if "$@"; then printf 'PASS: cgo selectors: %s\n' "$label"
+        else failures=$((failures + 1)); printf 'FAIL: cgo selectors: %s\n' "$label" >&2; fi
+    }
+    # CPATH takes precedence over the reviewed language-specific include path.
+    # Keep the other inherited selectors benign so the incumbent compiles and
+    # demonstrates the resulting wrong bytes, rather than only a tool failure.
+    export CPATH="$work/ambient" CPLUS_INCLUDE_PATH="$work/ambient" OBJC_INCLUDE_PATH="$work/ambient"
+    export LIBRARY_PATH="$work/ambient" COMPILER_PATH="$work/ambient"
+    unset GCC_EXEC_PREFIX
+    printf 'BOUNDARY: fixture health/capacity only; real Git snapshots, native Go/cgo, artifact custody and release admission\n'
+    cmd_build cgoselector --version 1.0.0 --output-dir "$work/output" \
+        > "$work/build.json" 2> "$work/build.log" || status=$?
+    check_cgo_selector 'public strict cgo build completes with reviewed headers' test "$status" -eq 0
+    if [[ "$status" -ne 0 ]]; then cat "$work/build.log" >&2; return 1; fi
+    check_cgo_selector 'actual executable selects the reviewed header rather than ambient CPATH' \
+        test "$("$work/output/cgoselector-linux-amd64" 2>&1)" = 41
+    check_cgo_selector 'native child inherits none of the unreviewed C compiler selectors' test ! -s "$work/child-ambient"
+    check_cgo_selector 'native child receives the reviewed include path' test "$(cat "$work/child-reviewed")" = "$work/reviewed"
+    check_cgo_selector 'manifest records current policy and only reviewed C compiler selectors' jq -e --arg path "$work/reviewed" --arg sha "$sha" '
+        .publishable==true and .source.git_sha==$sha and (.build_environments[0].build_influence_env |
+        .DSR_GO_ENV_POLICY=="3" and .C_INCLUDE_PATH==$path and
+        (has("CPATH")|not) and (has("COMPILER_PATH")|not) and (has("GCC_EXEC_PREFIX")|not) and
+        (has("LIBRARY_PATH")|not) and (has("CPLUS_INCLUDE_PATH")|not) and (has("OBJC_INCLUDE_PATH")|not))
+        ' "$work/output/cgoselector-v1.0.0-manifest.json"
+    check_cgo_selector 'reviewed cgo output passes real publication admission' \
+        _release_require_publishable_artifacts "$work/output" "$work/output/cgoselector-v1.0.0-manifest.json" true
+    jq '.build_environments[0].build_influence_env.DSR_GO_ENV_POLICY="2"' \
+        "$work/output/cgoselector-v1.0.0-manifest.json" > "$work/old-policy.json" || return 1
+    status=0
+    _act_validate_contract_variant_inventory cgoselector "$(cat "$work/old-policy.json")" \
+        "$(jq -c '.release_contract' "$config")" > "$work/old-policy.out" 2> "$work/old-policy.log" || status=$?
+    check_cgo_selector 'older receipts cannot authorize the expanded isolation policy' test "$status" -ne 0
+    jq --arg path "$work/ambient" '.env.C_INCLUDE_PATH=$path' "$config" > "$work/changed-config.json" || return 1
+    command cp "$work/changed-config.json" "$config" || return 1
+    status=0
+    _act_validate_contract_variant_inventory cgoselector "$(cat "$work/output/cgoselector-v1.0.0-manifest.json")" \
+        "$(jq -c '.release_contract' "$config")" > "$work/changed-selector.out" 2> "$work/changed-selector.log" || status=$?
+    check_cgo_selector 'changing reviewed C header selection invalidates retained output' test "$status" -ne 0
+    printf 'Strict cgo selectors: %s checks, %s failures; evidence %s\n' "$checks" "$failures" "$work"
+    [[ "$failures" -eq 0 ]]
+)
 
 test_strict_go_source_paths() (
     local dependency work sha dep_sha config status=0 checks=0 failures=0 item expected
@@ -278,7 +388,7 @@ test_strict_go_context() (
     check_go_policy 'manifest records the actual no-workfile compiler policy' jq -e --arg sha "$sha" '
         .publishable==true and .source.git_sha==$sha and
         (.build_environments[0].build_influence_env |
-         .DSR_GO_ENV_POLICY=="2" and .GOENV=="off" and .GOFLAGS=="" and .GOWORK=="off" and
+         .DSR_GO_ENV_POLICY=="3" and .GOENV=="off" and .GOFLAGS=="" and .GOWORK=="off" and
          .GOTOOLCHAIN=="local" and .GO111MODULE=="on" and .GOOS=="linux" and .GOARCH=="amd64" and
          .DSR_GO_WORKFILE=="" and .DSR_GO_WORKFILE_SHA256=="" and (has("GOAMD64")|not))
         ' "$runtime/no-workfile/context-v1.0.0-manifest.json"
@@ -299,7 +409,7 @@ test_strict_go_context() (
         "$(jq -c '.release_contract' "$config")" > "$runtime/policy-one.out" 2> "$runtime/policy-one.log" || status=$?
     check_go_policy 'release consumer refuses policy one without pkg-config isolation evidence' test "$status" -ne 0
     check_go_policy 'obsolete policy refusal requires a fresh build, not receipt migration' \
-        grep -q 'DSR_GO_ENV_POLICY=2.*start a fresh release build' "$runtime/policy-one.log"
+        grep -q 'DSR_GO_ENV_POLICY=3.*start a fresh release build' "$runtime/policy-one.log"
     for kind in empty relabelled duplicated; do
         case "$kind" in
             empty) jq '.build_environments=[]' "$runtime/no-workfile/context-v1.0.0-manifest.json" ;;
@@ -375,7 +485,7 @@ test_strict_go_context() (
     check_go_policy 'mixed checkpoint retains a real successful Go target' jq -e '
         .target_statuses["linux/amd64"].status=="completed" and
         .target_statuses["linux/386"].status=="failed" and
-        .target_statuses["linux/amd64"].result.build_influence_env.DSR_GO_ENV_POLICY=="2"
+        .target_statuses["linux/amd64"].result.build_influence_env.DSR_GO_ENV_POLICY=="3"
         ' "$runtime/mixed-state.json"
     run=$(jq -er '.run_id' "$runtime/mixed-state.json") || return 1
     state_file="$DSR_STATE_DIR/builds/context/1.0.1/$run/state.json"
@@ -493,7 +603,7 @@ GO
         --arg directory "$pkg_reviewed" --arg program "$pkg_program" --arg sha "$sha" '
         .publishable==true and .source.git_sha==$sha and
         (.build_environments[0].build_influence_env |
-         .DSR_GO_ENV_POLICY=="2" and .CGO_ENABLED=="1" and .PKG_CONFIG==$program and
+         .DSR_GO_ENV_POLICY=="3" and .CGO_ENABLED=="1" and .PKG_CONFIG==$program and
          .PKG_CONFIG_LIBDIR==$directory and .PKG_CONFIG_DSR_REVIEWED=="$DSR_GO_RECIPE_MARKER" and
          (has("PKG_CONFIG_PATH")|not) and (has("PKG_CONFIG_SYSROOT_DIR")|not) and
          (has("PKG_CONFIG_DSR_UNREVIEWED")|not) and (has("pkg_config_path")|not))
@@ -1491,7 +1601,7 @@ def run_layout(layout):
               observed[0]['GO111MODULE']=='on' and
               observed[0]['GOWORK']==('off' if layout=='replace' else observed[0]['cwd']+'/go.work') and
               all(observed[0][name] is None for name in ('GOAMD64','GOEXPERIMENT','GOROOT','GOCACHEPROG')) and
-              policy.get('DSR_GO_ENV_POLICY')=='2' and policy.get('GOENV')==observed[0]['GOENV'] and
+              policy.get('DSR_GO_ENV_POLICY')=='3' and policy.get('GOENV')==observed[0]['GOENV'] and
               policy.get('GOFLAGS')==observed[0]['GOFLAGS'] and policy.get('GO111MODULE')==observed[0]['GO111MODULE'] and
               policy.get('GOOS')==observed[0]['GOOS'] and policy.get('GOARCH')==observed[0]['GOARCH'] and
               policy.get('DSR_GO_WORKFILE')==('' if layout=='replace' else 'source/go.work'))
@@ -2778,6 +2888,10 @@ IGNORE
     [[ "$selection_failures" -eq 0 ]]
 )
 
+if [[ "${1:-}" == --strict-cgo-selectors-only ]]; then
+    test_strict_cgo_selectors
+    exit $?
+fi
 if [[ "${1:-}" == --strict-go-paths-only ]]; then
     test_strict_go_source_paths
     exit $?

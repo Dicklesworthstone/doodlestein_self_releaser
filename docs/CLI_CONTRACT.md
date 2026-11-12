@@ -1411,10 +1411,15 @@ cannot authorize collection. Retries receive a different stage and collected
 artifact path. The shared staging mechanism preserves each language's compiler
 policy: Bun and TypeScript do not acquire Go environment-policy receipts.
 
-Strict native Go results retain `DSR_GO_ENV_POLICY=2` in `build_influence_env`,
+Strict native Go results retain `DSR_GO_ENV_POLICY=3` in `build_influence_env`,
 together with the effective reviewed Go selectors and release source identity.
 Workers clear inherited compiler, architecture, cgo and workspace selectors,
 including the complete `PKG_CONFIG` / `PKG_CONFIG_*` family on Unix and Windows.
+They also clear C compiler search selectors (`CPATH`, `C_INCLUDE_PATH`,
+`CPLUS_INCLUDE_PATH`, `OBJC_INCLUDE_PATH`, `LIBRARY_PATH`, `COMPILER_PATH` and
+`GCC_EXEC_PREFIX`) before applying reviewed values. These settings can change
+cgo header bytes, linked libraries or compiler subprocesses independently of
+Go's flags; intentional recipe values are retained literally in the receipt.
 Reviewed pkg-config executable, package search path, sysroot and filtering settings
 must use portable uppercase identifiers in the recipe; every configured family
 member is retained in the receipt. Workers enforce `GOENV=off` and default to
@@ -1454,9 +1459,9 @@ against the current recipe and pinned workfile identity before changing the
 checkpoint or dispatching workers. Publication requires exactly one matching
 native receipt for each configured native contract target; removing, duplicating
 or relabelling rows cannot bypass this requirement. Older strict Go outputs
-without policy evidence, including policy-1 outputs that did not isolate the
-pkg-config selector family, require a fresh release build before resume or
-publication. Changing an old receipt's marker is not a substitute for rebuilding.
+without current policy evidence, including policy-1 outputs that did not isolate
+the pkg-config selector family and policy-2 outputs that did not isolate C compiler
+search selectors, require a fresh release build before resume or publication. Changing an old receipt's marker is not a substitute for rebuilding.
 This policy does not attest the installed Go executable or all downloaded
 dependency-cache bytes.
 

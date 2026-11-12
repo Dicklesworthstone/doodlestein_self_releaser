@@ -10431,7 +10431,8 @@ _act_windows_rust_sdk_env_cleanup() {
 # Strict Go workers inherit caches and download policy, but never compiler or
 # source selectors from a login shell or the persistent `go env -w` file.
 # Both native launchers use this list and the pkg-config family below before
-# applying the reviewed recipe.
+# applying the reviewed recipe. cgo's C/C++ child also honors header, library
+# and compiler-subprogram search paths even when Go's own flags are empty.
 _act_go_ambient_env_names() {
     printf '%s\n' GOOS GOARCH GOENV GOFLAGS GOWORK GOTOOLCHAIN GO111MODULE GOROOT \
         GOEXPERIMENT GODEBUG GOCACHEPROG GO_EXTLINK_ENABLED GOFIPS140 GCCGO GOAMD64 GOARM GOARM64 \
@@ -10439,7 +10440,9 @@ _act_go_ambient_env_names() {
         CGO_CPPFLAGS CGO_CXXFLAGS CGO_FFLAGS CGO_LDFLAGS CGO_CFLAGS_ALLOW \
         CGO_CFLAGS_DISALLOW CGO_CPPFLAGS_ALLOW CGO_CPPFLAGS_DISALLOW \
         CGO_CXXFLAGS_ALLOW CGO_CXXFLAGS_DISALLOW CGO_FFLAGS_ALLOW \
-        CGO_FFLAGS_DISALLOW CGO_LDFLAGS_ALLOW CGO_LDFLAGS_DISALLOW CC CXX FC AR PKG_CONFIG
+        CGO_FFLAGS_DISALLOW CGO_LDFLAGS_ALLOW CGO_LDFLAGS_DISALLOW CC CXX FC AR PKG_CONFIG \
+        CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH OBJC_INCLUDE_PATH LIBRARY_PATH \
+        COMPILER_PATH GCC_EXEC_PREFIX
 }
 
 # cgo invokes the selected pkg-config program with the inherited environment.
@@ -10775,7 +10778,7 @@ _act_strict_go_build_env() {
     done <<< "$environment"
     workfile=$(_act_strict_go_workfile_json "$tool" "$sha" "$selected" "$stage_source") || return 4
     result+=$'\n'"GOWORK=$(jq -r '.gowork' <<< "$workfile")"
-    result+=$'\n'"DSR_GO_ENV_POLICY=2"
+    result+=$'\n'"DSR_GO_ENV_POLICY=3"
     result+=$'\n'"DSR_GO_WORKFILE=$(jq -r '.path' <<< "$workfile")"
     result+=$'\n'"DSR_GO_WORKFILE_SHA256=$(jq -r '.sha256' <<< "$workfile")"
     result+=$'\n'"DSR_GO_WORKFILE_GIT_SHA=$(jq -r '.git_sha' <<< "$workfile")"
@@ -10797,8 +10800,8 @@ _act_validate_strict_go_result() {
     if ! actual=$(jq -ce --arg platform "$platform" '
         select(.method=="native" and (.platform // .target)==$platform) |
         .build_influence_env | select(type=="object" and all(.[];type=="string") and
-            .DSR_GO_ENV_POLICY=="2" and .GOENV=="off")' <<< "$result"); then
-        _log_error 'Strict native Go output lacks the current compiler environment policy receipt (DSR_GO_ENV_POLICY=2); start a fresh release build'
+            .DSR_GO_ENV_POLICY=="3" and .GOENV=="off")' <<< "$result"); then
+        _log_error 'Strict native Go output lacks the current compiler environment policy receipt (DSR_GO_ENV_POLICY=3); start a fresh release build'
         return 4
     fi
     workfile=$(jq -er '.DSR_GO_WORKFILE | strings' <<< "$actual") || return 4

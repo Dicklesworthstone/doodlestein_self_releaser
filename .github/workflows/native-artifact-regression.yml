@@ -201,6 +201,8 @@ jobs:
           export DSR_TEST_GOCACHE
           timeout 120 bash scripts/tests/test_native_source_sync.sh --strict-go-context-only \
             2>&1 | tee "$RUNNER_TEMP/collector-evidence/strict-go-context.log"
+          timeout 120 bash scripts/tests/test_native_source_sync.sh --strict-cgo-selectors-only \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/strict-cgo-selectors.log"
           test -z "$(git status --porcelain)"
       - name: Verify Windows Go staging with genuine PowerShell and PE outputs
         if: runner.os == 'Linux'
