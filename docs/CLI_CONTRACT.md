@@ -624,6 +624,14 @@ Their separate descriptor locks prevent overlapping attempts without holding
 the watcher lock. Both continuous mode and `--once` require `flock` or Python 3
 with `fcntl`; dry-run does not create locks, attempts, or recovery state.
 
+Both `dsr --dry-run watch` and `dsr watch --dry-run` propagate preview mode to
+preflight and queue discovery. They preserve configuration, cache, retained
+check results and logs, including an inherited `DSR_LOG_FILE`, and create no
+missing persistent directories. Discovery still runs and reports dependency
+and API failures. Notification selections are validated, but a preview neither
+delivers events nor initializes or updates notification state, including with
+`--auto-fallback` and `--notify` together.
+
 ---
 
 ### `dsr build`

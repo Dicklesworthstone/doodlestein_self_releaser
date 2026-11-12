@@ -251,7 +251,7 @@ jobs:
           bash ./dsr --version
           bash ./dsr fallback --help
           bash scripts/tests/test_fallback_pipeline.sh
-          bats --filter 'watch.*(recovery|degraded queue)' tests/integration/test_commands.bats
+          bats --filter 'watch.*(recovery|degraded queue|preview)' tests/integration/test_commands.bats
           bash scripts/tests/test_release_resume.sh
           bash scripts/tests/test_release_source_only.sh
           bash scripts/tests/test_release_source_only_exact_tag.sh

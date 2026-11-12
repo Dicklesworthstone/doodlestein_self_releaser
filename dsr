@@ -2276,9 +2276,13 @@ _watch_iteration() {
 
     log_info "Running throttle check..."
 
-    # Run dsr check over every configured repo's release workflow.
+    # Run dsr check over every configured repo's release workflow. Carry the
+    # preview policy into the child before startup logging or check snapshots
+    # can write; the child still performs real configuration/API discovery.
     local check_output check_exit iteration_exit=0
-    if check_output=$("$0" --json check 2>/dev/null); then
+    local -a check_args=(--json check)
+    if $dry_run; then check_args=(--dry-run "${check_args[@]}"); fi
+    if check_output=$("$0" "${check_args[@]}" 2>/dev/null); then
         check_exit=0
         _WATCH_CURRENT_BACKOFF=0  # Reset backoff on success
     else
@@ -2406,7 +2410,7 @@ _watch_iteration() {
         else
             log_warn "Throttled run detected: $run_id ($repo)"
         fi
-        if [[ "$retry_reason" != upstream_failure && "${DSR_NOTIFY_ENABLED:-false}" == "true" ]]; then
+        if ! $dry_run && [[ "$retry_reason" != upstream_failure && "${DSR_NOTIFY_ENABLED:-false}" == "true" ]]; then
             notify_event "watch.throttled" "warn" \
                 "Throttle detected" \
                 "Repo $repo run $run_id exceeded threshold" \
@@ -2642,8 +2646,9 @@ EOF
 
     # Configure notifications for the watch loop. Exported: the fallbacks it
     # starts are child processes and report their build and release outcome
-    # through the same channels.
-    if [[ "$notify_methods" != "none" ]]; then
+    # through the same channels. A preview validates the selection above but
+    # neither initializes the notification journal nor delivers events.
+    if ! $dry_run && [[ "$notify_methods" != "none" ]]; then
         export DSR_NOTIFY_METHODS="$notify_methods"
         export DSR_NOTIFY_ENABLED=true
         notify_init >/dev/null 2>&1 || true
@@ -2653,9 +2658,11 @@ EOF
         export DSR_NOTIFY_ENABLED=false
     fi
 
-    # Run preflight check
+    # Preflight stays read-only during a preview, including child startup logs.
     log_info "Running preflight check..."
-    if ! "$0" doctor --quick &>/dev/null; then
+    local -a preflight_args=(doctor --quick)
+    if $dry_run; then preflight_args=(--dry-run "${preflight_args[@]}"); fi
+    if ! "$0" "${preflight_args[@]}" &>/dev/null; then
         log_error "Preflight check failed. Run 'dsr doctor' for details."
         return 3
     fi

@@ -594,6 +594,7 @@ _routing_watch() {
     printf '%s\n' "$check_json" > "$TEST_TMPDIR/watch-check.json"
     cat > "$TEST_TMPDIR/child-dsr" <<'EOF'
 #!/usr/bin/env bash
+[[ "${1:-}" != --dry-run ]] || shift
 case "$1" in
     doctor) exit 0 ;;
     --json)
@@ -2536,6 +2537,159 @@ EOF
     assert_equal "0" "$status"
     assert_contains "$output" "[DRY RUN] Would trigger fallback for ntm"
     [[ ! -e "$DSR_STATE_DIR/fallback-12345.log" ]]
+}
+
+# Inventory every persistent path a preview may touch, including absent roots,
+# file bytes, timestamps and symlink targets. Fixture transport call logs stay
+# outside these roots so real discovery remains observable without hiding DSR
+# writes. Use the actual CLI, doctor, check, YAML parser and logging modules.
+_watch_preview_inventory() {
+    python3 -I - "$DSR_CONFIG_DIR" "$DSR_STATE_DIR" "$DSR_CACHE_DIR" \
+        "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "${DSR_LOG_FILE:-}" <<'PY'
+import hashlib, json, os, stat, sys
+rows = []
+def inspect(path):
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        rows.append([path, "absent"])
+        return
+    row = [path, info.st_mode, info.st_mtime_ns]
+    if stat.S_ISLNK(info.st_mode):
+        row.append(os.readlink(path))
+    elif stat.S_ISREG(info.st_mode):
+        with open(path, "rb") as stream:
+            row.append(hashlib.sha256(stream.read()).hexdigest())
+    rows.append(row)
+    if stat.S_ISDIR(info.st_mode):
+        for name in sorted(os.listdir(path)):
+            inspect(os.path.join(path, name))
+for root in sys.argv[1:]:
+    if root:
+        inspect(root)
+print(json.dumps(rows, separators=(",", ":")))
+PY
+}
+
+_watch_preview_cli() {
+    local placement="$1" automatic="$2"
+    shift 2
+    local -a args=(--json)
+    [[ "$placement" != global ]] || args+=(--dry-run)
+    args+=(watch --once)
+    [[ "$placement" != local ]] || args+=(--dry-run)
+    [[ "$automatic" != true ]] || args+=(--auto-fallback)
+    "${DSR_ROUTING_TEST_ROOT:-$DSR_PROJECT_ROOT}/dsr" "${args[@]}" "$@"
+}
+
+@test "watch preview preserves existing configuration state cache and logs in either flag order" {
+    command -v yq >/dev/null || skip "Real yq is required for repository configuration"
+    harness_create_config
+    _setup_repos_d
+    _mock_gh_runs "$(_queued_release_run)"
+    mkdir -p "$DSR_STATE_DIR/check" "$DSR_STATE_DIR/logs/2000-01-01" "$DSR_CACHE_DIR/github"
+    printf 'retained diagnostic bytes\n' > "$DSR_STATE_DIR/logs/2000-01-01/run.log"
+    touch -t 200001010000 "$DSR_STATE_DIR/logs/2000-01-01/run.log"
+    ln -s 2000-01-01 "$DSR_STATE_DIR/logs/latest"
+    printf '{"retained":"check"}\n' > "$DSR_STATE_DIR/check/last.json"
+    printf '{"retained":"cache"}\n' > "$DSR_CACHE_DIR/github/retained.json"
+    printf '{"schema_version":2,"runs":{"777":"2026-01-01T00:00:00Z"},"attempts":{},"pending":{},"last_check":null}\n' \
+        > "$DSR_STATE_DIR/triggered.json"
+    export DSR_LOG_FILE="$TEST_TMPDIR/inherited.log"
+    printf 'inherited log bytes\n' > "$DSR_LOG_FILE"
+    local before placement automatic
+    before=$(_watch_preview_inventory)
+    for placement in global local; do
+        for automatic in false true; do
+            run --separate-stderr _watch_preview_cli "$placement" "$automatic"
+            assert_equal 0 "$status"
+            jq -e --argjson automatic "$automatic" '.command == "watch" and .status == "success" and
+                .details.dry_run and .details.auto_fallback == $automatic and
+                .details.triggered_state.runs["777"] == "2026-01-01T00:00:00Z"' <<< "$output"
+            if [[ "$automatic" == true ]]; then
+                assert_contains "$stderr" "[DRY RUN] Would trigger fallback for ntm --version v1.2.3"
+            else
+                assert_contains "$stderr" "dsr fallback ntm --version v1.2.3"
+            fi
+            assert_equal "$before" "$(_watch_preview_inventory)"
+        done
+    done
+    grep -q 'actions/workflows/release.yml/runs' "$TEST_TMPDIR/gh.calls"
+}
+
+@test "watch preview leaves missing persistent directories absent in either flag order" {
+    command -v yq >/dev/null || skip "Real yq is required for repository configuration"
+    harness_create_config
+    _setup_repos_d
+    _mock_gh_runs "$(_queued_release_run)"
+    export DSR_STATE_DIR="$TEST_TMPDIR/absent-state" DSR_CACHE_DIR="$TEST_TMPDIR/absent-cache"
+    export DSR_LOG_FILE="$TEST_TMPDIR/absent-log"
+    local before placement automatic
+    before=$(_watch_preview_inventory)
+    for placement in global local; do
+        for automatic in false true; do
+            run --separate-stderr _watch_preview_cli "$placement" "$automatic"
+            assert_equal 0 "$status"
+            jq -e '.details.dry_run and .details.triggered_state.runs == {} and
+                .details.triggered_state.attempts == {} and .details.triggered_state.pending == {}' <<< "$output"
+            assert_equal "$before" "$(_watch_preview_inventory)"
+        done
+    done
+}
+
+@test "watch preview does not deliver notifications or create notification state" {
+    command -v yq >/dev/null || skip "Real yq is required for repository configuration"
+    harness_create_config
+    _setup_repos_d
+    _mock_gh_runs "$(_queued_release_run)"
+    export DSR_AGENT_MAIL_HOOK="$TEST_TMPDIR/preview-notification-hook"
+    cat > "$DSR_AGENT_MAIL_HOOK" <<'EOF'
+#!/usr/bin/env bash
+cat >> "$TEST_TMPDIR/preview-notifications"
+EOF
+    chmod +x "$DSR_AGENT_MAIL_HOOK"
+    local before placement automatic
+    before=$(_watch_preview_inventory)
+    for placement in global local; do
+        for automatic in false true; do
+            run --separate-stderr _watch_preview_cli "$placement" "$automatic" --notify agent_mail
+            assert_equal 0 "$status"
+            assert_contains "$stderr" "Throttled run detected: 12345"
+            [[ ! -e "$TEST_TMPDIR/preview-notifications" ]]
+            assert_equal "$before" "$(_watch_preview_inventory)"
+        done
+    done
+    run --separate-stderr _watch_preview_cli local true --notify invalid
+    assert_equal 4 "$status"
+    assert_contains "$stderr" "Unknown --notify method"
+    assert_equal "$before" "$(_watch_preview_inventory)"
+}
+
+@test "watch preview preserves discovery error statuses without persistent writes" {
+    command -v yq >/dev/null || skip "Real yq is required for repository configuration"
+    harness_create_config
+    _setup_repos_d
+    export GH_MAX_RETRIES=1
+    export DSR_LOG_FILE="$TEST_TMPDIR/inherited-error.log"
+    printf 'keep error log\n' > "$DSR_LOG_FILE"
+    local before placement
+    before=$(_watch_preview_inventory)
+    _mock_gh_runs ''
+    for placement in global local; do
+        run --separate-stderr _watch_preview_cli "$placement" true
+        assert_equal 1 "$status"
+        jq -e '.command == "watch" and .status == "error" and .exit_code == 1 and
+            .details.dry_run and .details.triggered_state.attempts == {}' <<< "$output"
+        assert_contains "$stderr" "API error, backing off"
+        assert_equal "$before" "$(_watch_preview_inventory)"
+    done
+    mock_command_script gh 'exit 1'
+    for placement in global local; do
+        run --separate-stderr _watch_preview_cli "$placement" false
+        assert_equal 3 "$status"
+        assert_contains "$stderr" "Preflight check failed"
+        assert_equal "$before" "$(_watch_preview_inventory)"
+    done
 }
 
 @test "dsr watch rejects unknown options and runs outside the checkout" {
