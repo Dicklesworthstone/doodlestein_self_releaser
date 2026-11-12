@@ -1411,6 +1411,14 @@ cannot authorize collection. Retries receive a different stage and collected
 artifact path. The shared staging mechanism preserves each language's compiler
 policy: Bun and TypeScript do not acquire Go environment-policy receipts.
 
+Strict native Bun and TypeScript builds on Linux and macOS also preserve pinned
+`sibling_crates` beside each private source stage, so relative imports such as
+`../dep/dep.ts` resolve to the configured Git revision. DSR copies these roots
+from the admitted immutable snapshots and verifies every copied tree against
+its pinned archive and manifest before the build command runs. Missing or
+changed sibling inputs refuse compilation, and the final source check still
+requires the original snapshots to be unchanged before publication.
+
 Strict native Go results retain `DSR_GO_ENV_POLICY=3` in `build_influence_env`,
 together with the effective reviewed Go selectors and release source identity.
 Workers clear inherited compiler, architecture, cgo and workspace selectors,

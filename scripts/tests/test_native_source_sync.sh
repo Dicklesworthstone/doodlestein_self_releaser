@@ -21,6 +21,8 @@
 # TypeScript Windows PE builds, including pinned sibling imports and retries.
 # Use --strict-go-siblings-only for pinned Go replacements/workspaces through
 # strict snapshots, private output stages, publication and tamper refusals.
+# Use --strict-bun-siblings-only for genuine Bun/TypeScript sibling imports
+# through strict Linux snapshots, private stages and publication admission.
 # Use --strict-go-admission-only for conservative parallel-output admission,
 # sibling drift and layout refusal checks; --strict-go-matrix-only proves
 # simultaneous pinned amd64/386 Go builds with private verified stages.
@@ -1098,7 +1100,7 @@ PY
             check_go_siblings "$tree sibling cannot collect the earlier successful binary" jq -e \
                 '.status=="failed" and .artifact_paths==[]' "$work/$tree.json"
             check_go_siblings "$tree refusal reports the unavailable sibling" \
-                grep -q 'required Go sibling is missing or linked' "$work/$tree.log"
+                grep -q 'required sibling is missing or linked' "$work/$tree.log"
         done
         check_go_siblings 'direct refused attempts preserve the public completed checkpoint' test \
             "$before_state" = "$(_act_sha256 "$state_file")"
@@ -1321,6 +1323,177 @@ PY
             "$before_state" = "$(_act_sha256 "$state_file")"
     fi
     printf 'Strict Go %s: %s checks, %s failures\n' "$layout" "$checks" "$failures"
+    [[ "$failures" == 0 ]]
+)
+
+test_strict_bun_siblings() (
+    local language="$1" dependency work tree sha source_sha config status=0 checks=0 failures=0
+    local artifact source_root private_source run state_file before_state before_events
+    case "$language" in bun|typescript) ;; *) return 4 ;; esac
+    for dependency in bash git jq yq python3 bun tar; do
+        command -v "$dependency" >/dev/null || { printf 'SKIP: strict Bun siblings require %s\n' "$dependency"; return 77; }
+    done
+    [[ $(uname -s)/$(uname -m) == Linux/x86_64 ]] || {
+        printf 'SKIP: strict Bun sibling executable fixture requires Linux x86_64\n'; return 77;
+    }
+    work=$(mktemp -d "${DSR_TEST_DISK_ROOT:-${TMPDIR:-/tmp}}/dsr-strict-$language.XXXXXXXX") || return 1
+    printf 'Strict %s sibling evidence: %s\n' "$language" "$work"
+    mkdir -p "$work/config/repos.d" "$work/source" "$work/dep" "$work/stages" || return 1
+    export DSR_CONFIG_DIR="$work/config" ACT_CONFIG_DIR="$work/config" ACT_REPOS_DIR="$work/config/repos.d"
+    export DSR_STATE_DIR="$work/state" DSR_CACHE_DIR="$work/cache"
+    export DSR_HOSTS_FILE="$work/config/hosts.yaml" DSR_REPOS_FILE="$work/config/repos.yaml"
+    export DSR_DISABLE_HOST_SELECTOR=1 RCH_DISABLED=1 RCH_CARGO_WRAPPER_BYPASS=1 NO_COLOR=1
+    printf '{"name":"strictbun","version":"1.0.0","type":"module"}\n' > "$work/source/package.json"
+    printf 'import { value } from "../dep/dep.ts";\nconsole.log(value);\n' > "$work/source/main.ts"
+    printf 'export const value: string = "pinned-sibling-input";\n' > "$work/dep/dep.ts"
+    for tree in source dep; do
+        git -C "$work/$tree" init -q -b main || return 1
+        git -C "$work/$tree" add . || return 1
+        git -C "$work/$tree" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm pinned || return 1
+    done
+    git -C "$work/source" tag v1.0.0 || return 1
+    source_sha=$(git -C "$work/source" rev-parse HEAD) || return 1
+    sha=$(git -C "$work/dep" rev-parse HEAD) || return 1
+    jq -n --arg work "$work" '{schema_version:"1.0.0",hosts:{localnative:{
+        platform:"linux/amd64",connection:"local",concurrency:1,build_root:($work+"/stages")}},
+        platform_mapping:{"linux/amd64":"localnative"}}' > "$DSR_HOSTS_FILE" || return 1
+    config="$ACT_REPOS_DIR/strictbun.yaml"
+    jq -n --arg work "$work" --arg path "$PATH" --arg sha "$sha" --arg language "$language" '{
+        tool_name:"strictbun",repo:"example/strictbun",local_path:($work+"/source"),language:$language,binary_name:"strictbun",
+        targets:["linux/amd64"],act_job_map:{"linux/amd64":null},hosts:{"linux/amd64":"localnative"},
+        sibling_crates:[{local_path:($work+"/dep"),relative_path:"dep",revision:$sha}],
+        build_cmd:"printf \"%s\\n\" \"$PWD\" >> \"$PROBE_EVENTS\"; bun build --compile --outfile strictbun main.ts",
+        env:{PATH:$path,PROBE_EVENTS:($work+"/compiler-events")},
+        release_contract:{checksum_sidecar:"sha256",exact_primary_assets:{"linux/amd64":"strictbun-linux-amd64"}}}
+        ' > "$config" || return 1
+    # shellcheck source=../../src/logging.sh
+    source "$ROOT/src/logging.sh"
+    # shellcheck source=../../src/config.sh
+    source "$ROOT/src/config.sh"
+    # shellcheck source=../../src/build_state.sh
+    source "$ROOT/src/build_state.sh"
+    # shellcheck source=../../src/act_runner.sh
+    source "${DSR_TEST_ACT_RUNNER:-$ROOT/src/act_runner.sh}"
+    # shellcheck source=../../src/artifact_naming.sh
+    source "$ROOT/src/artifact_naming.sh"
+    # shellcheck source=../../src/host_selector.sh
+    source "$ROOT/src/host_selector.sh"
+    # shellcheck source=../../src/host_health.sh
+    source "$ROOT/src/host_health.sh"
+    # shellcheck source=../../src/git_ops.sh
+    source "$ROOT/src/git_ops.sh"
+    # shellcheck source=../../src/packaging.sh
+    source "$ROOT/src/packaging.sh"
+    printf 'BOUNDARY: fixture host health/capacity; real Git snapshots, Bun compiler, Linux executable, collection, checkpoint and publication admission; no macOS runtime claim\n'
+    host_health_is_ready() { return 0; }
+    selector_acquire_slot() { return 0; }
+    selector_release_slot() { return 0; }
+    build_state_init || return 1
+    export SCRIPT_DIR="$ROOT" JSON_MODE=true DRY_RUN=false VERBOSE=false DSR_VERSION=fixture DSR_KEEP_BUILD_STAGES=1
+    declare -A _DSR_LOADED_MODULES=([packaging]=1 [artifact_naming]=1)
+    # shellcheck disable=SC1090 # Exercise the actual public build and publication consumers.
+    source <(awk '/^(_dsr_require|cmd_build|_release_sha256|_release_require_publishable_artifacts)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$ROOT/dsr") || return 1
+    # shellcheck disable=SC1090
+    source <(awk '/^json_envelope\(\) \{/{copy=1} copy{print} copy && /^# ====/{exit}' "$ROOT/dsr") || return 1
+    check_strict_bun() {
+        local label="$1"; shift
+        checks=$((checks + 1))
+        if "$@"; then printf 'PASS: strict %s siblings: %s\n' "$language" "$label"
+        else failures=$((failures + 1)); printf 'FAIL: strict %s siblings: %s\n' "$language" "$label" >&2; fi
+    }
+    if [[ "$language" == bun ]]; then
+        command cp "$work/dep/dep.ts" "$work/original-dep.ts" || return 1
+        printf '\n// uncommitted dependency input\n' >> "$work/dep/dep.ts"
+        cmd_build strictbun --version 1.0.0 --output-dir "$work/dirty-output" \
+            > "$work/dirty.json" 2> "$work/dirty.log" || status=$?
+        check_strict_bun 'dirty controller sibling refuses a strict build' test "$status" -ne 0
+        check_strict_bun 'dirty sibling reaches its specific source refusal' \
+            grep -q 'Strict release checkout is dirty: dep' "$work/dirty.log"
+        check_strict_bun 'dirty sibling cannot reach compilation' test ! -e "$work/compiler-events"
+        command cp "$work/original-dep.ts" "$work/dep/dep.ts" || return 1
+        status=0
+    fi
+    cmd_build strictbun --version 1.0.0 --output-dir "$work/output" \
+        > "$work/result.json" 2> "$work/build.log" || status=$?
+    check_strict_bun 'public strict build completes' test "$status" -eq 0
+    if [[ "$status" -ne 0 ]]; then
+        cat "$work/build.log" >&2
+        printf 'Strict %s siblings: %s checks, %s failures\n' "$language" "$checks" "$failures"
+        return 1
+    fi
+    act_load_repo_config strictbun || return 1
+    build_state_get strictbun 1.0.0 > "$work/state.json" || return 1
+    run=$(jq -er .run_id "$work/state.json") || return 1
+    source_root=$(jq -er '.context.source_roots.localnative' "$work/state.json") || return 1
+    private_source=$(cat "$work/compiler-events") || return 1
+    state_file="$DSR_STATE_DIR/builds/strictbun/1.0.0/$run/state.json"
+    before_state=$(_act_sha256 "$state_file") || return 1
+    before_events=$(_act_sha256 "$work/compiler-events") || return 1
+    check_strict_bun 'native task completes with a durable result' jq -e '
+        .status=="completed" and (.target_statuses|length)==1 and
+        .target_statuses["linux/amd64"].status=="completed" and
+        .target_statuses["linux/amd64"].result.status=="success"' "$work/state.json"
+    check_strict_bun 'public result returns the successful target artifact' jq -e '
+        .exit_code==0 and .details.success==1 and (.details.targets|length)==1 and
+        .details.targets[0].status=="success" and (.details.targets[0].artifact_path|length)>0' "$work/result.json"
+    check_strict_bun 'sealed manifest binds the executable to both pinned revisions' jq -e \
+        --arg sha "$source_sha" --arg dependency "$sha" '
+        .publishable==true and .status=="success" and .source.git_sha==$sha and
+        .source.dependencies==[{relative_path:"dep",git_sha:$dependency}] and
+        [.artifacts[].target]==["linux/amd64"]' "$work/output/strictbun-v1.0.0-manifest.json"
+    artifact="$work/output/strictbun-linux-amd64"
+    check_strict_bun 'actual Linux executable consumes the pinned sibling' test "$("$artifact" 2>&1)" = pinned-sibling-input
+    check_strict_bun 'compiler uses a private source stage' test "$private_source" != "$source_root"
+    check_strict_bun 'private stage retains the pinned sibling layout and bytes' cmp "$work/dep/dep.ts" "${private_source%/*}/dep/dep.ts"
+    check_strict_bun 'build leaves the original main snapshot without compiler output' test ! -e "$source_root/strictbun"
+    check_strict_bun 'build leaves both controller repositories clean' test -z \
+        "$(git -C "$work/source" status --porcelain --untracked-files=all)$(git -C "$work/dep" status --porcelain --untracked-files=all)"
+    check_strict_bun 'original snapshots pass the complete post-build verifier' \
+        _act_verify_strict_source_roots strictbun "$source_sha" "$(jq -c .context.source_roots "$work/state.json")"
+    check_strict_bun 'completed output passes release publication admission' \
+        _release_require_publishable_artifacts "$work/output" "$work/output/strictbun-v1.0.0-manifest.json" true
+    if [[ "$language" == bun ]]; then
+        # Mutate a real copied sibling before the generated verifier runs.
+        # The actual cp, source gate, compiler boundary and collector remain in use.
+        export DSR_STAGE_MUTATION_LOG="$work/mutations"
+        cp() {
+            command cp "$@" || return $?
+            local destination="${!#}"
+            if [[ "$destination" == */dsr-build-strictbun-*/dep/ ]]; then
+                printf 'bytes\n' >> "$DSR_STAGE_MUTATION_LOG"
+                printf 'export const value = "poisoned-copy";\n' > "${destination}dep.ts"
+            fi
+        }
+        export -f cp
+        status=0
+        act_run_native_build strictbun linux/amd64 1.0.0 copy-bytes \
+            "$source_root" "$source_sha" v1.0.0 localnative \
+            > "$work/copy-bytes.json" 2> "$work/copy-bytes.log" || status=$?
+        unset -f cp
+        unset DSR_STAGE_MUTATION_LOG
+        check_strict_bun 'copied sibling fault was actually injected' grep -qx bytes "$work/mutations"
+        check_strict_bun 'altered copied sibling refuses the target' test "$status" -ne 0
+        check_strict_bun 'altered copied sibling never reaches the compiler' test \
+            "$before_events" = "$(_act_sha256 "$work/compiler-events")"
+        check_strict_bun 'altered copied sibling yields no collected artifact' jq -e \
+            '.status=="failed" and .artifact_paths==[]' "$work/copy-bytes.json"
+        mv "${source_root%/*}/dep" "$work/retained-dep" || return 1
+        status=0
+        act_run_native_build strictbun linux/amd64 1.0.0 host-missing \
+            "$source_root" "$source_sha" v1.0.0 localnative \
+            > "$work/host-missing.json" 2> "$work/host-missing.log" || status=$?
+        check_strict_bun 'missing host sibling refuses before compilation' test "$status" -ne 0
+        check_strict_bun 'missing host sibling never reaches the compiler' test \
+            "$before_events" = "$(_act_sha256 "$work/compiler-events")"
+        check_strict_bun 'missing host sibling yields no collected artifact' jq -e \
+            '.status=="failed" and .artifact_paths==[]' "$work/host-missing.json"
+        mv "$work/retained-dep" "${source_root%/*}/dep" || return 1
+        check_strict_bun 'refused attempts preserve the completed checkpoint' test \
+            "$before_state" = "$(_act_sha256 "$state_file")"
+        check_strict_bun 'restored original snapshots retain source admission' \
+            _act_verify_strict_source_roots strictbun "$source_sha" "$(jq -c .context.source_roots "$work/state.json")"
+    fi
+    printf 'Strict %s siblings: %s checks, %s failures\n' "$language" "$checks" "$failures"
     [[ "$failures" == 0 ]]
 )
 
@@ -2931,6 +3104,12 @@ fi
 if [[ "${1:-}" == --windows-strict-go-only ]]; then
     test_windows_strict_native go
     exit $?
+fi
+if [[ "${1:-}" == --strict-bun-siblings-only ]]; then
+    strict_bun_status=0
+    test_strict_bun_siblings bun || strict_bun_status=$?
+    test_strict_bun_siblings typescript || strict_bun_status=$?
+    exit "$strict_bun_status"
 fi
 if [[ "${1:-}" == --windows-strict-bun-only ]]; then
     test_windows_strict_native bun

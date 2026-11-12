@@ -13930,14 +13930,14 @@ act_run_native_build() {
             if ! output_stage_dependencies=$(_act_release_source_dependency_checkouts_json "$tool_name"); then
                 return 4
             fi
-            if [[ "$language" != go ]] && \
+            if [[ "$language" != go && "$language" != bun && "$language" != typescript ]] && \
                ! jq -e 'length == 0' <<< "$output_stage_dependencies" >/dev/null; then
-                _log_error "Strict sibling output staging requires a Go build"
+                _log_error "Strict sibling output staging requires a Go, Bun, or TypeScript build"
                 return 4
             fi
-            # Strict Go replacements and go.work entries use the same pinned
-            # sibling layout as source sync. Keep that namespace beside the
-            # private attempt, never recopy a live controller checkout.
+            # Go local modules and Bun/TypeScript relative imports use the
+            # same pinned sibling layout as source sync. Keep that namespace
+            # beside the private attempt, never recopy a live controller checkout.
             if ! jq -e 'all(.[]; (.relative_path | ascii_downcase) as $name |
                     $name != "source" and $name != "cargo-home")' \
                     <<< "$output_stage_dependencies" >/dev/null || \
@@ -14348,7 +14348,7 @@ EOF
                 output_sibling_source="${remote_path%/*}/$output_sibling_name"
                 output_sibling_source_q="${output_sibling_source//\'/\'\\\'\'}"
                 output_sibling_destination_q="${stage_root_q}/$output_sibling_name"
-                cargo_home_prefix+="if ! test -d '$output_sibling_source_q' || test -L '$output_sibling_source_q'; then printf '[dsr] required Go sibling is missing or linked: %s\\n' '$output_sibling_source_q' >&2; exit 4; fi; mkdir '$output_sibling_destination_q'; cp -R '$output_sibling_source_q/.' '$output_sibling_destination_q/'; if test -e '$output_sibling_destination_q/.git' || test -L '$output_sibling_destination_q/.git'; then git -C '$output_sibling_destination_q' status --porcelain --untracked-files=no >/dev/null; fi; "
+                cargo_home_prefix+="if ! test -d '$output_sibling_source_q' || test -L '$output_sibling_source_q'; then printf '[dsr] required sibling is missing or linked: %s\\n' '$output_sibling_source_q' >&2; exit 4; fi; mkdir '$output_sibling_destination_q'; cp -R '$output_sibling_source_q/.' '$output_sibling_destination_q/'; if test -e '$output_sibling_destination_q/.git' || test -L '$output_sibling_destination_q/.git'; then git -C '$output_sibling_destination_q' status --porcelain --untracked-files=no >/dev/null; fi; "
             done <<< "$output_stage_sibling_names"
             if $strict_native_build; then
                 local stage_manifest_dir stage_sources stage_source_rows stage_entry stage_name stage_checkout stage_revision stage_archive
