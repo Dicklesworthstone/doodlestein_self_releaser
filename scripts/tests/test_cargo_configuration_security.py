@@ -27,10 +27,18 @@ def refuse(message):
 
 
 source = MODULE.read_text()
+native_environment_pattern = re.compile(subprocess.run(
+    ['bash', '-c', 'source "$1" || exit $?; _act_rust_sdk_influence_regex', '_', str(MODULE)],
+    capture_output=True, text=True, check=True, timeout=30).stdout.strip(), re.IGNORECASE)
+native_c_environment_pattern = re.compile(subprocess.run(
+    ['bash', '-c', 'source "$1" || exit $?; _act_native_c_influence_regex', '_', str(MODULE)],
+    capture_output=True, text=True, check=True, timeout=30).stdout.strip(), re.IGNORECASE)
 start = source.index('def cargo_env_exemption(')
 end = source.index('\ncargo_config, cargo_config_receipts', start)
 namespace = dict(re=re, os=os, pathlib=__import__('pathlib'), hashlib=hashlib,
-                 subprocess=subprocess, fail=refuse)
+                 subprocess=subprocess, fail=refuse,
+                 native_environment_pattern=native_environment_pattern,
+                 native_c_environment_pattern=native_c_environment_pattern)
 exec(compile(source[start:end], str(MODULE), 'exec'), namespace)
 influence_start = source.index('def influences(name):')
 influence_end = source.index('\n\n', influence_start)
@@ -206,7 +214,9 @@ class CargoConfigurationSecurityTests(unittest.TestCase):
         names = ('RUSTC', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER', 'RUSTFLAGS',
                  'CARGO_ENCODED_RUSTFLAGS', 'RUSTUP_TOOLCHAIN', 'CARGO_BUILD_RUSTC',
                  'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER', 'PATH', 'CC',
-                 'RUST_MIN_STACK_X', 'RUST_TEST_THREADS_X')
+                 'RUST_MIN_STACK_X', 'RUST_TEST_THREADS_X', 'CPATH', 'C_INCLUDE_PATH',
+                 'CPLUS_INCLUDE_PATH', 'OBJC_INCLUDE_PATH', 'LIBRARY_PATH',
+                 'COMPILER_PATH', 'GCC_EXEC_PREFIX', 'DSR_RUST_ENV_POLICY')
         for fixture, _, _ in FIXTURES:
             # Establish that any refusal is caused by the appended table, not
             # by one of the original compatibility blockers or bad fixture TOML.

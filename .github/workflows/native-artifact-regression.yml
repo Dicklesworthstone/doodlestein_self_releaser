@@ -211,6 +211,17 @@ jobs:
           timeout 120 bash scripts/tests/test_native_source_sync.sh --strict-cgo-selectors-only \
             2>&1 | tee "$RUNNER_TEMP/collector-evidence/strict-cgo-selectors.log"
           test -z "$(git status --porcelain)"
+      - name: Verify strict Rust native compiler search paths
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          DSR_TEST_DISK_ROOT: /var/tmp
+        run: |
+          set -euo pipefail
+          bash -n scripts/tests/test_native_source_sync.sh
+          timeout 120 bash scripts/tests/test_native_source_sync.sh --strict-rust-selectors-only \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/strict-rust-selectors.log"
+          test -z "$(git status --porcelain)"
       - name: Verify Bun and TypeScript sibling builds
         if: runner.os == 'Linux'
         shell: bash

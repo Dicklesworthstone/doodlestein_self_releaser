@@ -48,6 +48,15 @@ function ConvertTo-DsrCargoLiteralArgument {
     return '"' + $Value + '"'
 }
 
+function Test-DsrCargoNativeEnvironmentName {
+    param([string]$Name)
+    # Parity with the coordinator's shared native-C list and Rust SDK family.
+    # PowerShell/Windows environment names are case-insensitive; observations
+    # use uppercase keys so a differently cased recipe cannot escape identity.
+    return $Name -match '^(CPATH|C_INCLUDE_PATH|CPLUS_INCLUDE_PATH|OBJC_INCLUDE_PATH|LIBRARY_PATH|COMPILER_PATH|GCC_EXEC_PREFIX|DSR_RUST_ENV_POLICY)$' -or
+        $Name -match '^(OPENSSL_|.+_OPENSSL_|PKG_CONFIG($|_)|(HOST|TARGET)_PKG_CONFIG($|_)|.+_NO_PKG_CONFIG$|LIBCLANG_PATH$)'
+}
+
 function Test-DsrCargoSanitizedEnvironmentName {
     param([string]$Name)
     return $Name -match '^(CARGO_|RUST|XWIN_|GIT_)' -or
@@ -55,7 +64,7 @@ function Test-DsrCargoSanitizedEnvironmentName {
         $Name -match '^(LINK|_LINK_)$' -or
         $Name -match '^(CC|CXX|CPP|AR|RANLIB|LD|NM|OBJCOPY|STRIP|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|BINDGEN_EXTRA_CLANG_ARGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET|IPHONEOS_DEPLOYMENT_TARGET|INCLUDE|LIB|LIBPATH)(_|$)' -or
         $Name -match '_(CC|CXX|AR|RANLIB|CFLAGS|CXXFLAGS|LDFLAGS)$' -or
-        $Name -match '^(OPENSSL_|.+_OPENSSL_|PKG_CONFIG($|_)|(HOST|TARGET)_PKG_CONFIG($|_)|.+_NO_PKG_CONFIG$|LIBCLANG_PATH$)'
+        (Test-DsrCargoNativeEnvironmentName $Name)
 }
 
 function Test-DsrCargoContextEnvironmentName {
@@ -986,11 +995,16 @@ function Get-DsrCargoToolchainIdentity {
     $tools.linker.version=($tools.linker.version -split '\r?\n')[0]
     # Command plugins are excluded by the literal invocation parser. State
     # that boundary explicitly; an unused cargo-build.exe is not provenance.
+    $nativeEnvironment=@{}
+    foreach ($name in $effective.Keys) {
+        if (Test-DsrCargoNativeEnvironmentName $name) { $nativeEnvironment[$name.ToUpperInvariant()]=$effective[$name] }
+    }
     return @{schema_version=1; cwd=$Context.SourceRoot; target_triple=$triple;
         linker_variable=$(if ($effective.ContainsKey($linkerVariable)) { $linkerVariable } else { $null }); tools=$tools;
         selection=@{rustup_toolchain=$(if ($Context.Toolchain) { $Context.Toolchain } elseif ($effective.ContainsKey('RUSTUP_TOOLCHAIN')) { $effective['RUSTUP_TOOLCHAIN'] } else { $null });
             cargo_commands=@((@((Split-DsrCargoLiteralCommand $Context.BuildCommand) | Where-Object { $_.Value -cin @('build','rustc') })[0].Value));
-            cargo_config=$config.receipts; cargo_target=$targetObservation.Receipt}}
+            cargo_config=$config.receipts; cargo_target=$targetObservation.Receipt;
+            native_environment=$nativeEnvironment}}
 }
 
 function New-DsrCargoContextEnvironment {

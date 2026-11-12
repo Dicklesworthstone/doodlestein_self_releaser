@@ -44,10 +44,18 @@ def refuse(message):
 # Load only production definitions, never its side-effecting top-level probe.
 # Integration below executes the complete shell-generated observer unchanged.
 source = MODULE.read_text()
+native_environment_pattern = re.compile(subprocess.run(
+    ['bash', '-c', 'source "$1" || exit $?; _act_rust_sdk_influence_regex', '_', str(MODULE)],
+    capture_output=True, text=True, check=True, timeout=30).stdout.strip(), re.IGNORECASE)
+native_c_environment_pattern = re.compile(subprocess.run(
+    ['bash', '-c', 'source "$1" || exit $?; _act_native_c_influence_regex', '_', str(MODULE)],
+    capture_output=True, text=True, check=True, timeout=30).stdout.strip(), re.IGNORECASE)
 start = source.index('def cargo_env_exemption(')
 end = source.index('\ncargo_config, cargo_config_receipts', start)
 namespace = dict(re=re, os=os, pathlib=__import__('pathlib'), hashlib=hashlib,
-                 subprocess=subprocess, fail=refuse)
+                 subprocess=subprocess, fail=refuse,
+                 native_environment_pattern=native_environment_pattern,
+                 native_c_environment_pattern=native_c_environment_pattern)
 exec(compile(source[start:end], str(MODULE), 'exec'), namespace)
 for name in ('cargo_env_exemption', 'cargo_effective_environment', 'cargo_parse_cfg',
              'cargo_match_cfg', 'cargo_parse_target_cfg', 'cargo_target_settings',

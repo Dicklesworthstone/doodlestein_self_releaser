@@ -778,6 +778,41 @@ try {
                 (Get-DsrCargoContextDigests -Context $explicitLinkContext -UseRecordedToolchain).environment_sha256 -cne $explicitDigest)
         } finally { [Environment]::SetEnvironmentVariable($linkVariable,$originalLinkValue,'Process') }
     }
+    # Cargo build.rs children may use native compiler search paths even when
+    # Cargo itself never reads them. Exercise the real Windows environment
+    # normalizer and admitted-context digest; portable runs are policy proof,
+    # not execution of MSVC or a claim about a native Windows filesystem.
+    foreach ($selectorName in @('CPATH','C_INCLUDE_PATH','CPLUS_INCLUDE_PATH','OBJC_INCLUDE_PATH',
+            'LIBRARY_PATH','COMPILER_PATH','GCC_EXEC_PREFIX')) {
+        $ambientName=$selectorName.ToLowerInvariant()
+        $originalSelectorValue=[Environment]::GetEnvironmentVariable($ambientName,'Process')
+        try {
+            [Environment]::SetEnvironmentVariable($ambientName,'unreviewed native compiler search path','Process')
+            $ambientSelectorEnvironment=New-DsrCargoContextEnvironment -CargoHome $context.CargoHome -Environment $baseEnvironment
+            Check ('case-normalized ambient '+$selectorName+' cannot reach Cargo or its native children') (
+                -not $ambientSelectorEnvironment.Environment.ContainsKey($selectorName))
+            $literalSelector='C:\Reviewed literal $DSR_SELECTOR_TOKEN\headers'
+            $explicitSelectorEnvironment=New-DsrCargoContextEnvironment -CargoHome $context.CargoHome `
+                -Environment ($baseEnvironment+($ambientName+'='+$literalSelector))
+            $explicitSelectorContext=$context.PSObject.Copy()
+            $explicitSelectorContext.Environment=$explicitSelectorEnvironment.Environment
+            $explicitSelectorContext.ConfiguredNames=$explicitSelectorEnvironment.ConfiguredNames
+            $selectorDigest=(Get-DsrCargoContextDigests -Context $explicitSelectorContext -UseRecordedToolchain).environment_sha256
+            Check ('reviewed '+$selectorName+' is literal, normalized and bound to context identity') (
+                $explicitSelectorContext.Environment[$selectorName] -ceq $literalSelector -and
+                $explicitSelectorContext.ConfiguredNames -contains $selectorName -and
+                $selectorDigest -cne $originalEnvironmentDigest)
+            $explicitSelectorContext.Environment[$selectorName]='C:\Different reviewed headers'
+            Check ('changed '+$selectorName+' cannot retain the admitted context digest') (
+                (Get-DsrCargoContextDigests -Context $explicitSelectorContext -UseRecordedToolchain).environment_sha256 -cne $selectorDigest)
+            $emptySelectorEnvironment=New-DsrCargoContextEnvironment -CargoHome $context.CargoHome `
+                -Environment ($baseEnvironment+($ambientName+'='))
+            Check ('an explicitly empty '+$selectorName+' stays reviewed and present') (
+                $emptySelectorEnvironment.Environment.ContainsKey($selectorName) -and
+                $emptySelectorEnvironment.Environment[$selectorName] -ceq '' -and
+                $emptySelectorEnvironment.ConfiguredNames -contains $selectorName)
+        } finally { [Environment]::SetEnvironmentVariable($ambientName,$originalSelectorValue,'Process') }
+    }
     $identity=$context.ToolchainIdentity
     $realCargo=Join-Path $sysroot ('bin/cargo' + $extension)
     $realRustc=Join-Path $sysroot ('bin/rustc' + $extension)

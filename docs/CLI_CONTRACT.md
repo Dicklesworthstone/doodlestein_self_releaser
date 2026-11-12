@@ -1887,6 +1887,35 @@ graphs, including forwarding hidden inside custom native executables, are not
 measured.
 These receipts assume the native host honestly executes DSR.
 
+Rust native compilation also governs the C toolchain search paths used by
+Cargo build scripts: `CPATH`, `C_INCLUDE_PATH`, `CPLUS_INCLUDE_PATH`,
+`OBJC_INCLUDE_PATH`, `LIBRARY_PATH`, `COMPILER_PATH` and `GCC_EXEC_PREFIX`.
+Metadata preparation and compilation remove inherited values before applying
+the reviewed build environment. Configured values for these selectors and
+the existing OpenSSL, pkg-config and libclang selector families are literal;
+spaces and dollar signs are preserved rather than interpreted by the launcher
+shell. Put these values in the configured environment, not an inline override
+inside `build_cmd`. Windows normalizes environment names case-insensitively and
+retains explicit empty values.
+
+DSR manages `DSR_RUST_ENV_POLICY=1` and records the selected native C/SDK
+environment twice: in `build_influence_env` and in the independently observed
+`cargo_isolation.toolchain.selection.native_environment`. Strict builds bind
+that observation through the existing compiler identity checks before and
+after execution. Strict resume and publication require both maps to match the
+current reviewed configuration and policy. A missing observation, an obsolete
+policy or a changed selector requires a fresh build; adding a policy marker to
+an old receipt does not authorize its executable. This applies to singleton
+native targets as well as each member of a variant matrix.
+
+The strict intermediate Cargo cache includes these observed selectors and the
+policy in its schema-3 identity. A changed reviewed search path therefore
+selects a different cache namespace. The existing cache restrictions, including
+the refusal of crates with build scripts, remain in force. These receipts bind
+selector values and the observed compiler context; they do not recursively
+authenticate every file inside an externally configured include or library
+directory.
+
 On Unix hosts, strict Rust
 builds also attest their direct Cargo invocations. Inside the build's own
 shell (same working directory, environment and PATH, including DSR's

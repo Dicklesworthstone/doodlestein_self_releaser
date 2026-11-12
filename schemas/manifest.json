@@ -794,6 +794,11 @@
               "items": {"type": "string", "pattern": "^[a-z][a-z0-9-]*$"}
             },
             "cargo_target": {"$ref": "#/$defs/cargo_target_observation"},
+            "native_environment": {
+              "type": "object",
+              "description": "Literal native C and SDK selectors observed in the selected compiler context. Strict Rust publication and reuse require the current policy and equality with the reviewed build environment; historical diagnostic receipts may omit this field.",
+              "additionalProperties": {"type": "string"}
+            },
             "cargo_zigbuild": {
               "$ref": "#/$defs/toolchain_identity/properties/selection/properties/dsr_cargo_shim",
               "description": "Exact target from an explicit cargo zigbuild invocation, enforced through the byte-verified DSR dispatcher. A requested GNU glibc version is retained separately from the canonical Rust target; unversioned targets record a null floor and are not rewritten. The request is not a claim about the resulting binary's ABI requirements."

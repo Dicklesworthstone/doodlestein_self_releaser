@@ -7412,7 +7412,7 @@ EOF
 }
 
 _act_unix_cargo_metadata_body() {
-    local build_cmd="${1-cargo build}" build_env="${2:-}" env_pair env_name
+    local build_cmd="${1-cargo build}" build_env="${2:-}" env_pair env_name env_quoted sdk_regex
     _act_unix_cargo_sources_runtime || return $?
     cat <<'SH'
 ancestor=${physical_source_root%/*}
@@ -7425,8 +7425,12 @@ done
 for variable in $(env | sed 's/=.*//'); do
     case "$variable" in CARGO_*|RUST*|XWIN_*|DSR_RELEASE_GIT_SHA|DSR_RELEASE_GIT_REF|CC|CXX|CPP|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS) unset "$variable";; esac
 done
-cd "$physical_source_root"
 SH
+    # Metadata invokes the same selected compiler and native dependency
+    # tools as the build. Remove their inherited search paths before probing.
+    _act_unix_rust_sdk_env_cleanup || return $?
+    printf '\ncd "$physical_source_root"\n'
+    sdk_regex=$(_act_rust_sdk_influence_regex) || return 4
     # Restore the same configured environment as the native launcher after
     # removing ambient selectors. CARGO_HOME remains this metadata attempt's
     # private copy, including when the caller already has an admitted seed.
@@ -7435,7 +7439,12 @@ SH
         env_name="${env_pair%%=*}"
         [[ "$env_pair" == *=* && "$env_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 4
         [[ "$env_name" == CARGO_HOME ]] && continue
-        printf 'export "%s"\n' "$env_pair"
+        if [[ "${env_name^^}" =~ $sdk_regex ]]; then
+            printf -v env_quoted '%q' "$env_pair"
+            printf 'export %s\n' "$env_quoted"
+        else
+            printf 'export "%s"\n' "$env_pair"
+        fi
     done <<< "$build_env"
     cat <<'SH'
 export CARGO_HOME="$strict_home" RCH_DISABLED=1 RCH_CARGO_WRAPPER_BYPASS=1 RCH_CARGO_WRAPPER_ORIGIN=rch
@@ -10422,11 +10431,89 @@ _act_default_rust_target_triple() {
     esac
 }
 
-# Shared by receipt selection and both native launchers. OpenSSL accepts a
-# target-triple prefix; pkg-config accepts target suffixes and HOST_/TARGET_
-# prefixes, including selectors for the pkg-config executable itself.
+# GCC/Clang children of both cgo and Cargo build scripts honor these search
+# paths independently of the language driver's flags. Keep their names shared
+# by launchers, observed toolchain context and intermediate-cache selection.
+_act_native_c_env_names() {
+    printf '%s\n' CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH OBJC_INCLUDE_PATH \
+        LIBRARY_PATH COMPILER_PATH GCC_EXEC_PREFIX
+}
+
+_act_native_c_influence_regex() {
+    local native_c_names
+    native_c_names=$(_act_native_c_env_names) || return 4
+    printf '%s\n' "^(${native_c_names//$'\n'/|}|DSR_RUST_ENV_POLICY)\$"
+}
+
+# Shared by Rust receipt selection and both native launchers. OpenSSL accepts
+# a target-triple prefix; pkg-config accepts target suffixes and HOST_/TARGET_
+# prefixes, including selectors for the executable itself. The policy marker
+# is managed by DSR and cannot be inherited from the host or supplied by a recipe.
 _act_rust_sdk_influence_regex() {
-    printf '%s\n' '^(OPENSSL_|.+_OPENSSL_|PKG_CONFIG($|_)|(HOST|TARGET)_PKG_CONFIG($|_)|.+_NO_PKG_CONFIG$|LIBCLANG_PATH$)'
+    local native_c_regex
+    native_c_regex=$(_act_native_c_influence_regex) || return 4
+    printf '%s\n' "^(OPENSSL_|.+_OPENSSL_|PKG_CONFIG(\$|_)|(HOST|TARGET)_PKG_CONFIG(\$|_)|.+_NO_PKG_CONFIG\$|LIBCLANG_PATH\$)|${native_c_regex}"
+}
+
+_act_unix_rust_sdk_env_cleanup() {
+    local sdk_regex
+    sdk_regex=$(_act_rust_sdk_influence_regex) || return 4
+    # Enumerate on the worker: login shells can introduce additional selectors.
+    # Shell unset silently leaves names containing '-' in the environment, so
+    # refuse unsupported spellings rather than claim they were removed.
+    # Read actual keys, never line-oriented `env`: an exported Bash function or
+    # any multiline value can contain text that resembles another SDK selector.
+    printf 'unset dsr_rust_native_env_names || exit 4\n'
+    printf 'dsr_rust_native_env_names=$(python3 -I - '\''%s'\'' <<'\''DSR_RUST_NATIVE_ENV_NAMES'\''\n' "$sdk_regex"
+    cat <<'SH'
+import os, re, sys
+pattern = re.compile(sys.argv[1], re.IGNORECASE)
+names = sorted(name for name in os.environ if pattern.search(name))
+for name in names:
+    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name):
+        sys.stderr.write('[dsr] SDK environment name cannot be isolated by this shell: ' + repr(name) +
+                         '; clear it on the build host and configure an underscore-spelled selector in DSR\n')
+        raise SystemExit(4)
+sys.stdout.write('\n'.join(names))
+DSR_RUST_NATIVE_ENV_NAMES
+) || exit 4
+while IFS= read -r sdk_variable; do
+    test -z "$sdk_variable" || unset "$sdk_variable" || exit 4
+done <<< "$dsr_rust_native_env_names"
+unset dsr_rust_native_env_names;
+SH
+}
+
+_act_rust_native_build_env() {
+    local environment="$1" pair name sdk_regex result=''
+    sdk_regex=$(_act_rust_sdk_influence_regex) || return 4
+    while IFS= read -r pair; do
+        [[ -n "$pair" ]] || continue
+        [[ "$pair" == *=* ]] || return 4
+        name="${pair%%=*}"
+        [[ "${name^^}" != DSR_RUST_ENV_POLICY ]] || continue
+        if [[ "${name^^}" =~ $sdk_regex && ! "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            _log_error "Rust native compiler selectors require a portable environment identifier: $name"
+            return 4
+        fi
+        result+="$pair"$'\n'
+    done <<< "$environment"
+    printf '%sDSR_RUST_ENV_POLICY=1\n' "$result"
+}
+
+# This projection deliberately excludes managed per-attempt Cargo paths. Their
+# existing source/cache receipts remain authoritative; the native-C policy
+# binds the literal reviewed search selectors, including Windows key casing.
+_act_rust_native_selectors_json() {
+    local environment="$1" windows="${2:-false}" sdk_regex
+    sdk_regex=$(_act_rust_sdk_influence_regex) || return 4
+    jq -Rsc --arg pattern "$sdk_regex" --argjson windows "$windows" '
+        reduce (split("\n")[] | select(length > 0) |
+            index("=") as $at | select($at != null) |
+            {key: .[0:$at], value: .[($at+1):]} |
+            select(.key | test($pattern; "i"))) as $entry
+            ({}; .[($entry.key | if $windows then ascii_upcase else . end)] = $entry.value)
+    ' <<< "$environment"
 }
 
 _act_windows_rust_sdk_env_cleanup() {
@@ -10447,9 +10534,8 @@ _act_go_ambient_env_names() {
         CGO_CPPFLAGS CGO_CXXFLAGS CGO_FFLAGS CGO_LDFLAGS CGO_CFLAGS_ALLOW \
         CGO_CFLAGS_DISALLOW CGO_CPPFLAGS_ALLOW CGO_CPPFLAGS_DISALLOW \
         CGO_CXXFLAGS_ALLOW CGO_CXXFLAGS_DISALLOW CGO_FFLAGS_ALLOW \
-        CGO_FFLAGS_DISALLOW CGO_LDFLAGS_ALLOW CGO_LDFLAGS_DISALLOW CC CXX FC AR PKG_CONFIG \
-        CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH OBJC_INCLUDE_PATH LIBRARY_PATH \
-        COMPILER_PATH GCC_EXEC_PREFIX
+        CGO_FFLAGS_DISALLOW CGO_LDFLAGS_ALLOW CGO_LDFLAGS_DISALLOW CC CXX FC AR PKG_CONFIG
+    _act_native_c_env_names
 }
 
 # cgo invokes the selected pkg-config program with the inherited environment.
@@ -10832,6 +10918,55 @@ _act_validate_strict_go_result() {
         _log_error 'Strict Go output no longer matches the reviewed compiler selectors or pinned workfile; start a fresh release build'
         return 4
     fi
+}
+
+# Search selectors are observed in the pinned pre/post compiler context as
+# well as recorded from the recipe. Old output cannot acquire this policy by
+# adding a marker to its coordinator receipt, and changed reviewed selectors
+# require a fresh compilation rather than reusing the previous executable.
+_act_validate_strict_rust_result() {
+    local tool="$1" result="$2" sha="$3" ref="$4" platform="$5"
+    local language environment expected actual observed sdk_regex host windows=false
+    language=$(yq -r '.language // ""' "$ACT_REPOS_DIR/$tool.yaml") || return 4
+    [[ "$language" == rust ]] || return 0
+    jq -e '(.status // "") | IN("success","ok","passed")' <<< "$result" >/dev/null || return 0
+    [[ "$sha" =~ ^[0-9a-f]{40}$ && ! "$sha" =~ ^0{40}$ && -n "$ref" ]] || return 4
+    sdk_regex=$(_act_rust_sdk_influence_regex) || return 4
+    if ! actual=$(jq -ce --arg platform "$platform" --arg sha "$sha" --arg ref "$ref" \
+        --arg pattern "$sdk_regex" '
+        select(.method == "native" and (.platform // .target) == $platform and
+            .cargo_isolation.mode == "strict-release-snapshot") |
+        .build_influence_env | select(type == "object" and all(.[]; type == "string") and
+            .DSR_RUST_ENV_POLICY == "1" and .DSR_RELEASE_GIT_SHA == $sha and
+            .DSR_RELEASE_GIT_REF == $ref) |
+        with_entries(select(.key | test($pattern; "i")))' <<< "$result") ||
+       ! observed=$(jq -ce '
+        .cargo_isolation.toolchain.selection.native_environment |
+        select(type == "object" and all(.[]; type == "string") and
+            .DSR_RUST_ENV_POLICY == "1")' <<< "$result"); then
+        _log_error 'Strict native Rust output lacks the current observed native compiler environment policy (DSR_RUST_ENV_POLICY=1); start a fresh release build'
+        return 4
+    fi
+    host=$(jq -er '.host | strings | select(length > 0)' <<< "$result") || return 4
+    _act_is_windows_host "$host" && windows=true
+    environment=$(act_get_build_env "$tool" "$platform") || return 4
+    environment=$(_act_rust_native_build_env "$environment") || return 4
+    expected=$(_act_rust_native_selectors_json "$environment" "$windows") || return 4
+    if [[ "$(jq -cS . <<< "$actual")" != "$(jq -cS . <<< "$expected")" ||
+          "$(jq -cS . <<< "$observed")" != "$(jq -cS . <<< "$expected")" ]]; then
+        _log_error 'Strict Rust output no longer matches the reviewed and observed native C/SDK selectors; start a fresh release build'
+        return 4
+    fi
+}
+
+_act_validate_strict_native_result() {
+    local language
+    language=$(yq -r '.language // ""' "$ACT_REPOS_DIR/$1.yaml") || return 4
+    case "$language" in
+        go) _act_validate_strict_go_result "$@" ;;
+        rust) _act_validate_strict_rust_result "$@" ;;
+        *) return 0 ;;
+    esac
 }
 
 _act_is_rust_build_influence_name() {
@@ -11319,10 +11454,11 @@ _act_ssh_exec_unix_program() {
 # failure. Python owns the advisory lock through build and output detachment.
 _act_strict_cargo_cache_script() {
     local cache_root="$1" cache_contract="$2" command="$3" zig_shim_dir="${4:-}"
-    local root_q contract_q command_q selection_script
+    local root_q contract_q command_q selection_script native_regex_q
     printf -v root_q '%q' "$cache_root"
     printf -v contract_q '%q' "$cache_contract"
     printf -v command_q '%q' "$command"
+    printf -v native_regex_q '%q' "$(_act_rust_sdk_influence_regex)"
     selection_script=$(_act_toolchain_identity_script context /dev/null "$command" "" "" "" "$zig_shim_dir") || return $?
     # Assignment preserves an inherited export attribute. Clear it before
     # collecting the potentially large observation, so only fd3 carries it.
@@ -11333,9 +11469,11 @@ _act_strict_cargo_cache_script() {
     # Environment entries have the same single-argument limit as exec argv on
     # Linux. Keep the observation on an inherited input descriptor instead.
     printf 'unset DSR_CARGO_TOOLCHAIN_CONTEXT || exit $?\n'
-    printf '"$dsr_tool_python" -I - %s %s %s 3<<< "$dsr_cache_context" <<\x27DSR_CARGO_CACHE_PY\x27\n' "$root_q" "$contract_q" "$command_q"
+    printf '"$dsr_tool_python" -I - %s %s %s %s 3<<< "$dsr_cache_context" <<\x27DSR_CARGO_CACHE_PY\x27\n' "$root_q" "$contract_q" "$command_q" "$native_regex_q"
     cat <<'PY'
 import fcntl, hashlib, json, os, pathlib, re, shlex, shutil, stat, subprocess, sys, tempfile, tomllib
+
+native_environment_pattern = re.compile(sys.argv[4], re.IGNORECASE)
 
 def require(ok, message):
     if not ok:
@@ -11358,6 +11496,7 @@ def cache_environment(environment):
     return {k: v for k, v in environment.items() if k not in excluded and
             (k in ('RCH_DISABLED', 'RCH_CARGO_WRAPPER_BYPASS', 'RCH_CARGO_WRAPPER_ORIGIN') or
              k.startswith(('CARGO_', 'RUST', 'XWIN_')) or
+             native_environment_pattern.search(k) or
              re.search(r'(^|_)(CC|CXX|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET)($|_)', k))}
 
 with os.fdopen(3) as context_input:
@@ -11479,7 +11618,7 @@ if sys.platform == 'darwin':
     require(settings.is_file(), 'SDK settings unavailable')
     sdk = {'path': str(sdk_path), 'settings_sha256': digest(settings),
            'xcode': probe(['xcodebuild', '-version'])}
-contract = {'schema': 2, 'source_freshness': 'nightly-content-no-build-scripts-v1',
+contract = {'schema': 3, 'source_freshness': 'nightly-content-no-build-scripts-v1',
             'configuration': json.loads(sys.argv[2]), 'cargo': cargo,
             'rustc': rustc, 'compilers': compilers, 'tools': tools, 'sdk': sdk, 'environment': influences}
 # Include actual target/linker/plugin bytes without the fresh source cwd: two
@@ -11582,7 +11721,7 @@ PY
 _act_toolchain_identity_script() {
     local mode="$1" output="$2" build_cmd="$3" extra_tools="${4:-}" receipt_pin="${5:-}" expected_cwd="${6:-}"
     local zig_shim_dir="${7:-}" zig_shim_hash="" shim_dir_q shim_hash_q
-    local output_q command_q extra_q pin_q cwd_q python_q=python3
+    local output_q command_q extra_q pin_q cwd_q native_regex_q native_c_regex_q python_q=python3
     [[ "$mode" == record || "$mode" == verify || "$mode" == read || "$mode" == metadata || "$mode" == context || "$mode" == target || "$mode" == selection || "$mode" == routing ]] || return 4
     [[ "$output" == /* && "$output" != *..* ]] || return 4
     [[ -z "$expected_cwd" || ( "$expected_cwd" == /* && "$expected_cwd" != *..* ) ]] || return 4
@@ -11601,6 +11740,8 @@ _act_toolchain_identity_script() {
     printf -v cwd_q '%q' "$expected_cwd"
     printf -v shim_dir_q '%q' "$zig_shim_dir"
     printf -v shim_hash_q '%q' "$zig_shim_hash"
+    printf -v native_regex_q '%q' "$(_act_rust_sdk_influence_regex)"
+    printf -v native_c_regex_q '%q' "$(_act_native_c_influence_regex)"
     # Command planning runs on the coordinator without invoking any build
     # tools or reading its Cargo configuration. The configured PATH may be a
     # remote host path, so use the coordinator's absolute Python interpreter.
@@ -11614,11 +11755,13 @@ _act_toolchain_identity_script() {
         _act_toolchain_python_prefix_sh "$zig_shim_dir" || return $?
         python_q='"$dsr_tool_python"'
     fi
-    printf '%s -I - %s %s %s %s %s %s %s %s <<\x27DSR_TOOLCHAIN_IDENTITY_PY\x27\n' "$python_q" "$mode" "$output_q" "$command_q" "$extra_q" "$pin_q" "$cwd_q" "$shim_dir_q" "$shim_hash_q"
+    printf '%s -I - %s %s %s %s %s %s %s %s %s %s <<\x27DSR_TOOLCHAIN_IDENTITY_PY\x27\n' "$python_q" "$mode" "$output_q" "$command_q" "$extra_q" "$pin_q" "$cwd_q" "$shim_dir_q" "$shim_hash_q" "$native_regex_q" "$native_c_regex_q"
     cat <<'PY'
 import hashlib, json, os, pathlib, re, shutil, stat, subprocess, sys
 
 mode, output, command, extra, receipt_pin, expected_cwd, zig_shim_dir, zig_shim_hash = sys.argv[1:9]
+native_environment_pattern = re.compile(sys.argv[9], re.IGNORECASE)
+native_c_environment_pattern = re.compile(sys.argv[10], re.IGNORECASE)
 
 def fail(message):
     sys.stderr.write('[dsr] toolchain identity: ' + message + '\n')
@@ -11738,9 +11881,12 @@ def shell_word(raw, variables=()):
 
 
 def influences(name):
+    # Tracked Cargo SDK [env] settings remain supported and bound by the
+    # configuration's byte receipt. Only newly governed C search selectors and
+    # the managed marker join the existing compiler-context override refusal.
     return name in ('PATH', 'DSR_TARGET_TRIPLE', 'DSR_RUST_TARGET', 'DSR_ZIG_TARGET',
                     'DSR_LINUX_GLIBC_FLOOR', 'RCH_DISABLED', 'RCH_CARGO_WRAPPER_BYPASS',
-                    'RCH_CARGO_WRAPPER_ORIGIN') or name.startswith(('CARGO_', 'RUST', 'XWIN_')) or bool(re.search(
+                    'RCH_CARGO_WRAPPER_ORIGIN') or native_c_environment_pattern.search(name) or name.startswith(('CARGO_', 'RUST', 'XWIN_')) or bool(re.search(
         r'(^|_)(CC|CXX|CPP|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET)($|_)', name))
 
 def managed_cargo_environment(environment):
@@ -12481,6 +12627,11 @@ if mode == 'routing':
 
 selection, probe_env, explicit_toolchain, cargo_commands, assigned_environment = invocation_selection()
 
+if os.environ.get('DSR_RUST_ENV_POLICY') == '1' and any(
+        native_environment_pattern.search(name) and probe_env.get(name) != os.environ.get(name)
+        for name in set(probe_env) | set(os.environ)):
+    fail('build_cmd cannot override native C/SDK selectors; use the configured build environment')
+
 if mode == 'selection':
     # Coordinator-only intent, before staging or compiler lookup. The worker
     # repeats this parser and must attest the generated dispatcher itself.
@@ -12909,7 +13060,9 @@ result = {'schema_version': 1, 'cwd': os.getcwd(), 'target_triple': triple,
           'selection': {'rustup_toolchain': selection['toolchain'],
                         'cargo_commands': cargo_commands,
                         'cargo_config': cargo_config_receipts,
-                        'cargo_target': cargo_target_receipt}}
+                        'cargo_target': cargo_target_receipt,
+                        'native_environment': {name: value for name, value in probe_env.items()
+                                               if native_environment_pattern.search(name)}}}
 if zig_shim_record is not None:
     result['selection']['dsr_cargo_shim'] = {
         'rust_target': probe_env['DSR_RUST_TARGET'], 'zig_target': probe_env['DSR_ZIG_TARGET'],
@@ -13354,6 +13507,11 @@ act_run_native_build() {
 
     local language
     language=$(yq -r '.language // ""' "$config_file" 2>/dev/null)
+    if [[ "$language" == rust ]]; then
+        # Set policy before metadata/cache preparation, not only before the
+        # final compiler command. All contexts receive the same reviewed map.
+        build_env=$(_act_rust_native_build_env "$build_env") || return 4
+    fi
 
     # Portable glibc floor for Linux Rust builds, ordinary AND strict (issue
     # #9: a strict focr release once shipped needing GLIBC_2.39 because this
@@ -14265,12 +14423,8 @@ EOF
         fi
         if [[ "$language" == "rust" ]]; then
             local sdk_regex
-            sdk_regex=$(_act_rust_sdk_influence_regex)
-            # Enumerate on the build host, not the coordinator. Bash's unset
-            # silently leaves inherited names containing '-' in the process
-            # environment. Reject those unsupported export identifiers before
-            # a higher-priority target SDK selector can escape isolation.
-            env_exports+="for sdk_variable in \$(env | sed 's/=.*//' | grep -Ei '${sdk_regex}' || true); do if ! printf '%s\\n' \"\$sdk_variable\" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*$'; then printf '[dsr] SDK environment name cannot be isolated by this shell: %s; clear it on the build host and configure an underscore-spelled selector in DSR\\n' \"\$sdk_variable\" >&2; exit 4; fi; unset \"\$sdk_variable\"; done; "
+            sdk_regex=$(_act_rust_sdk_influence_regex) || return 4
+            env_exports+=$(_act_unix_rust_sdk_env_cleanup) || return 4
         elif [[ "$language" == go ]] && $strict_native_build; then
             local pkg_config_regex
             pkg_config_regex=$(_act_go_pkg_config_env_regex)
@@ -14285,14 +14439,16 @@ EOF
         while IFS= read -r env_pair; do
             [[ -z "$env_pair" ]] && continue
             # Quote the env_pair to handle values with spaces (e.g., FOO="bar baz")
-            if [[ "$language" == go ]] && $strict_native_build &&
-               jq -e --arg name "${env_pair%%=*}" 'has($name)' \
-                   <<< "$build_influence_env_json" >/dev/null; then
+            env_name="${env_pair%%=*}"
+            if { [[ "$language" == go ]] && $strict_native_build &&
+                 jq -e --arg name "$env_name" 'has($name)' \
+                     <<< "$build_influence_env_json" >/dev/null; } ||
+               [[ "$language" == rust && "${env_name^^}" =~ $sdk_regex ]]; then
                 # Policy receipts describe literal reviewed values. Shell
                 # expansion must not replace a flag or workfile after capture.
-                local go_pair_quoted
-                printf -v go_pair_quoted '%q' "$env_pair"
-                env_exports+="export $go_pair_quoted; "
+                local env_pair_quoted
+                printf -v env_pair_quoted '%q' "$env_pair"
+                env_exports+="export $env_pair_quoted; "
             else
                 env_exports+="export \"$env_pair\"; "
             fi
@@ -17737,7 +17893,7 @@ act_orchestrate_build() {
                     return 4
                 fi
                 if $strict_release_contract && [[ "$resume_method" == native && -n "$resume_receipt" ]] &&
-                   ! _act_validate_strict_go_result "$tool_name" "$resume_receipt" \
+                   ! _act_validate_strict_native_result "$tool_name" "$resume_receipt" \
                        "$resume_go_sha" "$resume_go_ref" "$resume_platform"; then
                     _act_release_orchestration_lock
                     return 4
@@ -17751,7 +17907,7 @@ act_orchestrate_build() {
                         return 4
                     fi
                     if $strict_release_contract && [[ "$resume_method" == native ]] &&
-                       ! _act_validate_strict_go_result "$tool_name" "$resume_receipt" \
+                       ! _act_validate_strict_native_result "$tool_name" "$resume_receipt" \
                            "$resume_go_sha" "$resume_go_ref" "$resume_platform"; then
                         _act_release_orchestration_lock
                         return 4
@@ -18230,8 +18386,8 @@ act_orchestrate_build() {
                 break
             fi
             if $strict_release_contract && [[ "$(jq -r .method <<< "$task_json")" == native && -n "$persisted_result" ]] &&
-               ! _act_validate_strict_go_result "$tool_name" "$persisted_result" "$git_sha" "$git_ref" "$target"; then
-                _act_refuse_retained_target "Resume native Go result lost its compiler policy binding: $target" "$prior_attempts"
+               ! _act_validate_strict_native_result "$tool_name" "$persisted_result" "$git_sha" "$git_ref" "$target"; then
+                _act_refuse_retained_target "Resume native result lost its compiler policy binding: $target" "$prior_attempts"
                 break
             fi
             if [[ -n "$persisted_result" ]] && \
@@ -18258,8 +18414,8 @@ act_orchestrate_build() {
                     break
                 fi
                 if $strict_release_contract && [[ "$(jq -r .method <<< "$task_json")" == native ]] &&
-                   ! _act_validate_strict_go_result "$tool_name" "$recovered_result" "$git_sha" "$git_ref" "$target"; then
-                    _act_refuse_retained_target "Resume native Go sidecar lost its compiler policy binding: $target" "$prior_attempts"
+                   ! _act_validate_strict_native_result "$tool_name" "$recovered_result" "$git_sha" "$git_ref" "$target"; then
+                    _act_refuse_retained_target "Resume native sidecar lost its compiler policy binding: $target" "$prior_attempts"
                     break
                 fi
                 if _act_matrix_result_matches "$recovered_result" "$target" "$selected_triple" &&
@@ -18969,9 +19125,9 @@ _act_validate_manifest_variant_coverage() {
 # before any remote release mutation. These projected rows describe declared
 # receipts only; they do not manufacture new execution or artifact evidence.
 _act_validate_native_manifest_inventory() {
-    local tool="$1" manifest="$2" require_go_policy="${3:-false}"
+    local tool="$1" manifest="$2" require_native_policy="${3:-false}"
     local inventory artifacts native_rows row companion_names language=''
-    if $require_go_policy; then
+    if $require_native_policy; then
         language=$(yq -r '.language // ""' "$ACT_REPOS_DIR/$tool.yaml") || return 4
     fi
     companion_names=$(config_get_additional_artifacts_json "$tool") || return 4
@@ -18989,8 +19145,8 @@ _act_validate_native_manifest_inventory() {
             <<< "$manifest") || return 4
         while IFS= read -r platform; do
             [[ -n "$platform" ]] || continue
-            if [[ "$language" == go ]] && ! act_platform_uses_act "$tool" "$platform"; then
-                _log_error 'Native Go release manifest lacks a compiler environment policy receipt; rebuild the release'
+            if [[ "$language" == go || "$language" == rust ]] && ! act_platform_uses_act "$tool" "$platform"; then
+                _log_error "Native ${language^} release manifest lacks a compiler environment policy receipt; rebuild the release"
                 return 4
             fi
             configured=$(config_get_target_triples_json "$tool" "$platform") || return 4
@@ -19041,8 +19197,8 @@ _act_validate_native_manifest_inventory() {
     while IFS= read -r row; do
         [[ -n "$row" ]] || continue
         _act_native_result_target_triple "$tool" "$row" >/dev/null || return 4
-        if [[ "$language" == go ]]; then
-            _act_validate_strict_go_result "$tool" "$row" \
+        if [[ "$language" == go || "$language" == rust ]]; then
+            _act_validate_strict_native_result "$tool" "$row" \
                 "$(jq -r '.source.git_sha // ""' <<< "$manifest")" \
                 "$(jq -r '.source.git_ref // ""' <<< "$manifest")" \
                 "$(jq -r '.platform' <<< "$row")" || return 4
@@ -19054,10 +19210,11 @@ _act_validate_native_manifest_inventory() {
 
 # New strict variant contracts cannot use the legacy manifest fallback. Each
 # selected compiler target needs its own native execution and source context,
-# and exactly one corresponding primary. Singleton contracts retain their
-# existing manifest compatibility.
+# and exactly one corresponding primary. Rust and Go singleton contracts also
+# need their native environment policy, independently of variant-qualified names.
 _act_validate_contract_variant_inventory() {
     local tool="$1" manifest="$2" contract="$3" identities language
+    local require_native_policy=false
     language=$(yq -r '.language // ""' "$ACT_REPOS_DIR/$tool.yaml") || return 4
     identities=$(_act_contract_target_rows "$tool" "$contract") || return 4
     if [[ "$language" == go ]]; then
@@ -19087,7 +19244,40 @@ _act_validate_contract_variant_inventory() {
         _act_validate_native_manifest_inventory "$tool" "$manifest" true
         return $?
     fi
+    if [[ "$language" == rust ]]; then
+        require_native_policy=true
+        # A missing, duplicated, or relabelled native row cannot opt out of
+        # the environment policy. Qualify matrix workers by compiler triple;
+        # a singleton still owns exactly one row for its configured platform.
+        local rust_native_identities='[]' rust_identity rust_platform
+        while IFS= read -r rust_identity; do
+            rust_platform=$(jq -er '.platform' <<< "$rust_identity") || return 4
+            if ! act_platform_uses_act "$tool" "$rust_platform"; then
+                rust_native_identities=$(jq -c --argjson row "$rust_identity" '. + [$row]' \
+                    <<< "$rust_native_identities") || return 4
+            fi
+        done < <(jq -c '.[]' <<< "$identities")
+        if ! jq -e --argjson native "$rust_native_identities" '
+            def matches($row; $wanted):
+                $row.target == $wanted.platform and
+                (if $wanted.require_triple then $row.target_triple == $wanted.target_triple else true end);
+            (.build_environments // []) as $rows |
+            ($rows | type == "array" and all(.[]; type == "object")) and
+            all($native[]; . as $wanted |
+                [$rows[] | select(matches(.; $wanted))] as $matches |
+                ($matches | length) == 1 and $matches[0].method == "native") and
+            all($rows[] | select(.method == "native"); . as $row |
+                any($native[]; matches($row; .)))
+        ' <<< "$manifest" >/dev/null; then
+            _log_error 'Strict Rust release inventory requires exactly one native policy receipt for every configured native target variant'
+            return 4
+        fi
+    fi
     if ! jq -e 'any(.[]; .require_triple == true)' <<< "$identities" >/dev/null; then
+        if $require_native_policy; then
+            _act_validate_native_manifest_inventory "$tool" "$manifest" true
+            return $?
+        fi
         return 0
     fi
     if ! jq -e --argjson identities "$identities" --argjson contract "$contract" '
@@ -19119,7 +19309,7 @@ _act_validate_contract_variant_inventory() {
         _log_error "Strict variant manifest lacks exact native compiler/source receipts"
         return 4
     fi
-    _act_validate_native_manifest_inventory "$tool" "$manifest"
+    _act_validate_native_manifest_inventory "$tool" "$manifest" "$require_native_policy"
 }
 
 # Primary and additional are contract roles, not platform labels: an explicitly
@@ -20169,7 +20359,11 @@ export -f act_list_tools act_build_matrix
 export -f act_get_build_cmd act_substitute_build_cmd_tokens act_get_build_env act_get_repo act_get_local_path
 export -f _act_materialized_source_path
 export -f act_get_build_env_value act_get_remote_artifact_path
+export -f _act_native_c_env_names _act_native_c_influence_regex
 export -f _act_go_ambient_env_names _act_go_pkg_config_env_regex _act_go_build_influence_json
+export -f _act_rust_sdk_influence_regex _act_unix_rust_sdk_env_cleanup
+export -f _act_rust_native_build_env _act_rust_native_selectors_json
+export -f _act_validate_strict_rust_result _act_validate_strict_native_result
 export -f _act_strict_go_workfile_json _act_strict_go_build_env _act_validate_strict_go_result
 export -f act_run_native_build act_orchestrate_build act_generate_manifest
 export -f _act_result_artifact_receipts _act_target_result_available

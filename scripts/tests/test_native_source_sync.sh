@@ -32,9 +32,326 @@
 # Use --strict-go-paths-only for pinned local Go dependency boundaries.
 # Use --strict-cgo-selectors-only for genuine C header selection and compiler
 # environment evidence through the public strict build and release consumers.
+# Use --strict-rust-selectors-only for the same boundary through a genuine
+# Cargo build.rs and static C library; --strict-rust-selector-cache-only checks
+# actual nightly intermediate-cache identity with an eligible no-script crate.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 ROOT="${DSR_TEST_ROOT:-$ROOT}"
+
+test_strict_rust_selectors() (
+    local dependency work config sha status=0 checks=0 failures=0 item reviewed changed actual
+    local manifest result retained source_hash events_before selector kind cleanup_program note
+    for dependency in bash git jq yq python3 rustc cargo cc ar tar rsync; do
+        command -v "$dependency" >/dev/null || { printf 'SKIP: strict Rust selectors require %s\n' "$dependency"; return 77; }
+    done
+    [[ $(uname -s)/$(uname -m) == Linux/x86_64 ]] || return 77
+    work=$(mktemp -d "${DSR_TEST_DISK_ROOT:-${TMPDIR:-/tmp}}/dsr-rust-selectors.XXXXXXXX") || return 1
+    printf 'Strict Rust selector evidence: %s\n' "$work"
+    reviewed="$work/reviewed literal-\$DSR_SELECTOR_TOKEN"
+    changed="$work/changed literal-\$DSR_SELECTOR_TOKEN"
+    mkdir -p "$work/config/repos.d" "$work/source/src" "$reviewed" "$changed" \
+        "$work/ambient" "$work/stages" "$work/cargo-seed" || return 1
+    export DSR_CONFIG_DIR="$work/config" ACT_CONFIG_DIR="$work/config" ACT_REPOS_DIR="$work/config/repos.d"
+    export DSR_STATE_DIR="$work/state" DSR_CACHE_DIR="$work/cache" DSR_HOSTS_FILE="$work/config/hosts.yaml"
+    export DSR_REPOS_FILE="$work/config/repos.yaml" DSR_DISABLE_HOST_SELECTOR=1 NO_COLOR=1
+    export CARGO_HOME="$work/cargo-seed" CARGO_NET_OFFLINE=true RCH_DISABLED=1 RCH_CARGO_WRAPPER_BYPASS=1
+    export DSR_SELECTOR_TOKEN=expanded-inherited-value
+    printf '#define DSR_SELECTOR_VALUE 41\n' > "$reviewed/dsr_selector.h"
+    printf '#define DSR_SELECTOR_VALUE 73\n' > "$changed/dsr_selector.h"
+    printf '#define DSR_SELECTOR_VALUE 99\n' > "$work/ambient/dsr_selector.h"
+    cat > "$work/source/Cargo.toml" <<'TOML'
+[package]
+name = "rustselector"
+version = "1.0.0"
+edition = "2021"
+TOML
+    cat > "$work/source/src/main.rs" <<'RUST'
+extern "C" { fn dsr_selector_value() -> i32; }
+fn main() { println!("{}", unsafe { dsr_selector_value() }); }
+RUST
+    cat > "$work/source/selector.c" <<'C'
+#include <dsr_selector.h>
+int dsr_selector_value(void) { return DSR_SELECTOR_VALUE; }
+C
+    cat > "$work/source/build.rs" <<'RUST'
+use std::{env, fs::{self, OpenOptions}, io::Write, path::PathBuf, process::Command};
+fn main() {
+    let mut evidence = String::new();
+    for name in ["CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "OBJC_INCLUDE_PATH",
+                 "LIBRARY_PATH", "COMPILER_PATH", "GCC_EXEC_PREFIX", "DSR_RUST_ENV_POLICY"] {
+        if let Ok(value) = env::var(name) { evidence.push_str(&format!("{name}={value}\n")); }
+    }
+    fs::write(env::var("PROBE_ENV").unwrap(), evidence).unwrap();
+    let mut events = OpenOptions::new().create(true).append(true)
+        .open(env::var("PROBE_EVENTS").unwrap()).unwrap();
+    writeln!(events, "{}", env::var("C_INCLUDE_PATH").unwrap_or_default()).unwrap();
+    let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    assert!(Command::new(env::var("CC").unwrap()).arg("-c").arg("selector.c")
+        .arg("-o").arg(out.join("selector.o")).status().unwrap().success());
+    assert!(Command::new(env::var("AR").unwrap()).arg("crs").arg(out.join("libdsr_selector.a"))
+        .arg(out.join("selector.o")).status().unwrap().success());
+    println!("cargo:rustc-link-search=native={}", out.display());
+    println!("cargo:rustc-link-lib=static=dsr_selector");
+    println!("cargo:rerun-if-changed=selector.c");
+    println!("cargo:rerun-if-env-changed=C_INCLUDE_PATH");
+}
+RUST
+    cargo generate-lockfile --offline --manifest-path "$work/source/Cargo.toml" || return 1
+    git -C "$work/source" init -q -b main || return 1
+    git -C "$work/source" add . || return 1
+    git -C "$work/source" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm pinned-rust-c-selector || return 1
+    git -C "$work/source" tag v1.0.0 || return 1
+    git -C "$work/source" tag v1.0.1 || return 1
+    sha=$(git -C "$work/source" rev-parse HEAD) || return 1
+    jq -n --arg work "$work" '{schema_version:"1.0.0",hosts:{localnative:{
+        platform:"linux/amd64",connection:"local",concurrency:1,build_root:($work+"/stages")}},
+        platform_mapping:{"linux/amd64":"localnative"}}' > "$DSR_HOSTS_FILE" || return 1
+    config="$ACT_REPOS_DIR/rustselector.yaml"
+    jq -n --arg work "$work" --arg path "$PATH" --arg cc "$(command -v cc)" \
+        --arg ar "$(command -v ar)" --arg reviewed "$reviewed" '{
+        tool_name:"rustselector",repo:"example/rustselector",local_path:($work+"/source"),language:"rust",
+        binary_name:"rustselector",linux_glibc_floor:"native",targets:["linux/amd64"],
+        target_triples:{"linux/amd64":"x86_64-unknown-linux-gnu"},
+        act_job_map:{"linux/amd64":null},hosts:{"linux/amd64":"localnative"},
+        build_cmd:"cargo build --release --locked --offline",
+        env:{PATH:$path,CC:$cc,AR:$ar,C_INCLUDE_PATH:$reviewed,CARGO_BUILD_JOBS:"1",CARGO_NET_OFFLINE:"true",
+          PROBE_ENV:($work+"/child-env"),PROBE_EVENTS:($work+"/compiler-events")},
+        release_contract:{checksum_sidecar:"sha256",exact_primary_assets:{"linux/amd64":"rustselector-linux-amd64"}}}
+        ' > "$config" || return 1
+    for item in logging config build_state act_runner artifact_naming host_selector host_health git_ops packaging; do
+        if [[ "$item" == act_runner ]]; then
+            # shellcheck disable=SC1090 # Optional unchanged module for the paired compiler counterexample.
+            source "${DSR_TEST_ACT_RUNNER:-$ROOT/src/act_runner.sh}" || return 1
+        else
+            # shellcheck disable=SC1090 # Production dependencies of the public command.
+            source "$ROOT/src/$item.sh" || return 1
+        fi
+    done
+    host_health_is_ready() { return 0; }
+    selector_acquire_slot() { return 0; }
+    selector_release_slot() { return 0; }
+    build_state_init || return 1
+    export SCRIPT_DIR="$ROOT" JSON_MODE=true DRY_RUN=false VERBOSE=false DSR_VERSION=fixture DSR_KEEP_BUILD_STAGES=1
+    declare -A _DSR_LOADED_MODULES=([packaging]=1 [artifact_naming]=1)
+    # shellcheck disable=SC1090 # Actual public build and publication consumers.
+    source <(awk '/^(_dsr_require|cmd_build|_release_sha256|_release_require_publishable_artifacts)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$ROOT/dsr") || return 1
+    # shellcheck disable=SC1090
+    source <(awk '/^json_envelope\(\) \{/{copy=1} copy{print} copy && /^# ====/{exit}' "$ROOT/dsr") || return 1
+    check_rust_selector() {
+        local label="$1"; shift
+        checks=$((checks + 1))
+        if "$@"; then printf 'PASS: Rust selectors: %s\n' "$label"
+        else failures=$((failures + 1)); printf 'FAIL: Rust selectors: %s\n' "$label" >&2; fi
+    }
+    # `env` renders exported Bash functions and ordinary multiline values on
+    # several lines. Their contents must never be interpreted as extra names.
+    # This is the actual generated child cleanup, not a copied classifier.
+    cleanup_program=$(_act_unix_rust_sdk_env_cleanup) || return 1
+    rust_selector_inherited_function() { printf '%s\n' 'TARGET_OPENSSL_DIR=only-function-text'; }
+    export -f rust_selector_inherited_function
+    note=$'ordinary value\nX_OPENSSL_DIR=only-value-text'
+    status=0
+    env CPATH="$work/ambient" DSR_SELECTOR_NOTE="$note" bash -c "$cleanup_program"$'\n''[[ ! ${CPATH+x} && "$DSR_SELECTOR_NOTE" == "$1" ]] && rust_selector_inherited_function >/dev/null' _ "$note" \
+        > "$work/multiline-environment.out" 2> "$work/multiline-environment.log" || status=$?
+    check_rust_selector 'cleanup removes true CPATH while preserving multiline values and exported functions' \
+        test "$status" -eq 0
+    status=0
+    env "x86_64-unknown-linux-gnu_OPENSSL_DIR=$work/ambient" bash -c "$cleanup_program" \
+        > "$work/unsupported-name.out" 2> "$work/unsupported-name.log" || status=$?
+    check_rust_selector 'a real native selector with an unsupported shell name fails closed' test "$status" -eq 4
+    check_rust_selector 'unsupported-name refusal identifies the actual environment boundary' \
+        grep -q 'SDK environment name cannot be isolated' "$work/unsupported-name.log"
+    # GCC searches CPATH before C_INCLUDE_PATH. These other directories are
+    # benign, letting the previous policy compile actual wrong bytes (99).
+    export CPATH="$work/ambient" CPLUS_INCLUDE_PATH="$work/ambient" OBJC_INCLUDE_PATH="$work/ambient"
+    export LIBRARY_PATH="$work/ambient" COMPILER_PATH="$work/ambient"
+    unset GCC_EXEC_PREFIX
+    printf 'BOUNDARY: fixture health/capacity only; real pinned Git, Cargo build.rs, cc/ar, executable and publication admission\n'
+    status=0
+    cmd_build rustselector --version 1.0.0 --output-dir "$work/output" \
+        > "$work/build.json" 2> "$work/build.log" || status=$?
+    check_rust_selector 'public strict Rust build completes' test "$status" -eq 0
+    if [[ "$status" -ne 0 ]]; then cat "$work/build.log" >&2; return 1; fi
+    manifest="$work/output/rustselector-v1.0.0-manifest.json"
+    actual=$("$work/output/rustselector-linux-amd64") || return 1
+    printf 'OBSERVED: actual C-linked Rust executable prints %s\n' "$actual"
+    check_rust_selector 'real C-linked executable selects reviewed header41' test "$actual" = 41
+    check_rust_selector 'spaces and dollar signs reach the compiler literally' \
+        grep -Fqx "C_INCLUDE_PATH=$reviewed" "$work/child-env"
+    for selector in CPATH CPLUS_INCLUDE_PATH OBJC_INCLUDE_PATH LIBRARY_PATH COMPILER_PATH GCC_EXEC_PREFIX; do
+        check_rust_selector "build.rs cannot inherit unreviewed $selector" \
+            bash -c '! grep -q "^$1=" "$2"' _ "$selector" "$work/child-env"
+    done
+    check_rust_selector 'build.rs receives the current Rust environment policy' \
+        grep -qx 'DSR_RUST_ENV_POLICY=1' "$work/child-env"
+    build_state_get rustselector 1.0.0 > "$work/state.json" || return 1
+    jq -c '.details.targets[0]' "$work/build.json" > "$work/result.json" || return 1
+    result=$(cat "$work/result.json") || return 1
+    check_rust_selector 'manifest, public result and checkpoint bind reviewed selectors and policy' jq -e \
+        --arg sha "$sha" --arg reviewed "$reviewed" --slurpfile state "$work/state.json" \
+        --slurpfile result "$work/result.json" '
+        .publishable==true and .source.git_sha==$sha and
+        (.build_environments[0].build_influence_env as $env |
+          $env.DSR_RUST_ENV_POLICY=="1" and $env.C_INCLUDE_PATH==$reviewed and
+          ($env|has("CPATH")|not) and ($env|has("COMPILER_PATH")|not) and
+          ($env|has("GCC_EXEC_PREFIX")|not) and ($env|has("LIBRARY_PATH")|not) and
+          ($env|has("CPLUS_INCLUDE_PATH")|not) and ($env|has("OBJC_INCLUDE_PATH")|not) and
+          $env==$result[0].build_influence_env and
+          $env==$state[0].target_statuses["linux/amd64"].result.build_influence_env) and
+        (.build_environments[0].cargo_isolation.toolchain.selection.native_environment as $observed |
+          $observed=={DSR_RUST_ENV_POLICY:"1",C_INCLUDE_PATH:$reviewed} and
+          $observed==$result[0].cargo_isolation.toolchain.selection.native_environment and
+          $observed==$state[0].target_statuses["linux/amd64"].result.cargo_isolation.toolchain.selection.native_environment)
+        ' "$manifest"
+    check_rust_selector 'reviewed output passes real release publication admission' \
+        _release_require_publishable_artifacts "$work/output" "$manifest" true
+    check_rust_selector 'current native result passes retained-output admission' \
+        _act_validate_strict_native_result rustselector "$result" "$sha" v1.0.0 linux/amd64
+    events_before=$(_act_sha256 "$work/compiler-events") || return 1
+    source_hash=$(_act_sha256 "$manifest") || return 1
+    for kind in missing-policy obsolete-policy unreviewed-selector missing-toolchain-policy contradictory-toolchain-selector; do
+        case "$kind" in
+            missing-policy) retained=$(jq -c 'del(.build_influence_env.DSR_RUST_ENV_POLICY)' <<< "$result") || return 1 ;;
+            obsolete-policy) retained=$(jq -c '.build_influence_env.DSR_RUST_ENV_POLICY="0"' <<< "$result") || return 1 ;;
+            unreviewed-selector) retained=$(jq -c --arg path "$work/ambient" '.build_influence_env.CPATH=$path' <<< "$result") || return 1 ;;
+            missing-toolchain-policy) retained=$(jq -c 'del(.cargo_isolation.toolchain.selection.native_environment)' <<< "$result") || return 1 ;;
+            contradictory-toolchain-selector) retained=$(jq -c --arg path "$work/ambient" \
+                '.cargo_isolation.toolchain.selection.native_environment.C_INCLUDE_PATH=$path' <<< "$result") || return 1 ;;
+        esac
+        status=0
+        _act_validate_strict_native_result rustselector "$retained" "$sha" v1.0.0 linux/amd64 \
+            > "$work/$kind-result.out" 2> "$work/$kind-result.log" || status=$?
+        check_rust_selector "$kind cannot authorize retained native output" test "$status" -eq 4
+        jq --argjson env "$(jq -c '.build_influence_env' <<< "$retained")" \
+            --argjson isolation "$(jq -c '.cargo_isolation' <<< "$retained")" \
+            '.build_environments[0] |= (.build_influence_env=$env | .cargo_isolation=$isolation)' \
+            "$manifest" > "$work/$kind-manifest.json" || return 1
+        status=0
+        _act_validate_contract_variant_inventory rustselector "$(cat "$work/$kind-manifest.json")" \
+            "$(jq -c '.release_contract' "$config")" > "$work/$kind-manifest.out" 2> "$work/$kind-manifest.log" || status=$?
+        check_rust_selector "$kind cannot authorize a strict publication inventory" test "$status" -eq 4
+    done
+    jq --arg path "$changed" '.env.C_INCLUDE_PATH=$path' "$config" > "$work/changed-config.json" || return 1
+    command cp "$work/changed-config.json" "$config" || return 1
+    status=0
+    _act_validate_strict_native_result rustselector "$result" "$sha" v1.0.0 linux/amd64 \
+        > "$work/changed-result.out" 2> "$work/changed-result.log" || status=$?
+    check_rust_selector 'reviewed selector change invalidates the retained result' test "$status" -eq 4
+    status=0
+    _act_validate_contract_variant_inventory rustselector "$(cat "$manifest")" \
+        "$(jq -c '.release_contract' "$config")" > "$work/changed-manifest.out" 2> "$work/changed-manifest.log" || status=$?
+    check_rust_selector 'reviewed selector change invalidates the retained publication inventory' test "$status" -eq 4
+    check_rust_selector 'retained-output refusals do not invoke Cargo build.rs again' \
+        test "$events_before" = "$(_act_sha256 "$work/compiler-events")"
+    check_rust_selector 'retained-output refusals leave the sealed manifest unchanged' \
+        test "$source_hash" = "$(_act_sha256 "$manifest")"
+    status=0
+    cmd_build rustselector --version 1.0.1 --output-dir "$work/changed-output" \
+        > "$work/changed-build.json" 2> "$work/changed-build.log" || status=$?
+    check_rust_selector 'fresh public build accepts the changed reviewed selector' test "$status" -eq 0
+    if [[ "$status" -ne 0 ]]; then cat "$work/changed-build.log" >&2; return 1; fi
+    check_rust_selector 'changed reviewed C header produces actual executable73' \
+        test "$("$work/changed-output/rustselector-linux-amd64")" = 73
+    check_rust_selector 'changed selector remains literal in new manifest evidence' jq -e --arg path "$changed" '
+        .build_environments[0].build_influence_env.C_INCLUDE_PATH==$path and
+        .build_environments[0].build_influence_env.DSR_RUST_ENV_POLICY=="1"
+        ' "$work/changed-output/rustselector-v1.0.1-manifest.json"
+    check_rust_selector 'fresh selector output passes real release admission' \
+        _release_require_publishable_artifacts "$work/changed-output" \
+            "$work/changed-output/rustselector-v1.0.1-manifest.json" true
+    check_rust_selector 'both builds preserve the pinned controller source' \
+        test -z "$(git -C "$work/source" status --porcelain --untracked-files=all)"
+    printf 'Strict Rust selectors: %s checks, %s failures; evidence %s\n' "$checks" "$failures" "$work"
+    [[ "$failures" -eq 0 ]]
+)
+
+test_strict_rust_selector_cache() (
+    local dependency work reviewed changed selected label status checks=0 failures=0 cache_program
+    local first_namespace='' repeat_namespace='' changed_namespace='' first_sha='' namespace
+    for dependency in bash git jq python3 rustc cargo cc c++ ar ld; do
+        command -v "$dependency" >/dev/null || { printf 'SKIP: Rust selector cache requires %s\n' "$dependency"; return 77; }
+    done
+    [[ $(uname -s)/$(uname -m) == Linux/x86_64 && $(cargo --version) == *-nightly* && $(rustc --version) == *-nightly* ]] || {
+        printf 'SKIP: Rust selector cache requires genuine Linux x86_64 nightly Cargo/rustc\n'; return 77;
+    }
+    work=$(mktemp -d "${DSR_TEST_DISK_ROOT:-${TMPDIR:-/tmp}}/dsr-rust-selector-cache.XXXXXXXX") || return 1
+    printf 'Rust selector cache evidence: %s\n' "$work"
+    reviewed="$work/reviewed literal-\$DSR_SELECTOR_TOKEN"
+    changed="$work/changed literal-\$DSR_SELECTOR_TOKEN"
+    mkdir -p "$work/source/src" "$work/cache" "$work/cargo-home" || return 1
+    chmod 700 "$work/cache" || return 1
+    cat > "$work/source/Cargo.toml" <<'TOML'
+[package]
+name = "rustselectorcache"
+version = "1.0.0"
+edition = "2021"
+TOML
+    # The intermediate-cache policy deliberately refuses build.rs. This
+    # eligible crate records the real compiler environment in its executable;
+    # the separate public fixture proves actual C header/library selection.
+    cat > "$work/source/src/main.rs" <<'RUST'
+fn main() { println!("{}", env!("C_INCLUDE_PATH")); }
+RUST
+    CARGO_HOME="$work/cargo-home" cargo generate-lockfile --offline --manifest-path "$work/source/Cargo.toml" || return 1
+    git -C "$work/source" init -q -b main || return 1
+    git -C "$work/source" add . || return 1
+    git -C "$work/source" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm pinned-rust-cache-selector || return 1
+    # shellcheck disable=SC1090 # Exact production cache wrapper, also allowing the paired baseline.
+    source "${DSR_TEST_ACT_RUNNER:-$ROOT/src/act_runner.sh}" || return 1
+    cache_program=$(_act_strict_cargo_cache_script "$work/cache" '{"fixture":"native-C-selector"}' \
+        'cargo build --release --locked --offline -j1') || return 1
+    printf '%s\n' "$cache_program" > "$work/cache-runner.sh" || return 1
+    check_rust_selector_cache() {
+        local name="$1"; shift
+        checks=$((checks + 1))
+        if "$@"; then printf 'PASS: Rust selector cache: %s\n' "$name"
+        else failures=$((failures + 1)); printf 'FAIL: Rust selector cache: %s\n' "$name" >&2; fi
+    }
+    for label in first repeated changed; do
+        selected="$reviewed"
+        [[ "$label" != changed ]] || selected="$changed"
+        status=0
+        (
+            cd "$work/source" || exit 1
+            env -i PATH="$PATH" HOME="$HOME" LANG=C LC_ALL=C \
+                LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+                RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-}" CARGO_HOME="$work/cargo-home" \
+                CARGO_TARGET_DIR="$work/target-$label" CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu \
+                DSR_TARGET_TRIPLE=x86_64-unknown-linux-gnu DSR_RUST_ENV_POLICY=1 \
+                RCH_DISABLED=1 RCH_CARGO_WRAPPER_BYPASS=1 RCH_CARGO_WRAPPER_ORIGIN=rch \
+                CARGO_NET_OFFLINE=true C_INCLUDE_PATH="$selected" \
+                bash -e "$work/cache-runner.sh"
+        ) > "$work/$label.log" 2>&1 || status=$?
+        check_rust_selector_cache "$label uses genuine nightly Cargo under cache custody" test "$status" -eq 0
+        if [[ "$status" -ne 0 ]]; then cat "$work/$label.log" >&2; return 1; fi
+        check_rust_selector_cache "$label executable embeds its literal compiler selector" \
+            test "$("$work/target-$label/x86_64-unknown-linux-gnu/release/rustselectorcache")" = "$selected"
+        check_rust_selector_cache "$label cache receipt binds current policy and exact selector" jq -e --arg path "$selected" '
+            .contract.schema==3 and .contract.environment.DSR_RUST_ENV_POLICY=="1" and
+            .contract.environment.C_INCLUDE_PATH==$path and
+            .final_output_policy=="fresh-run-target-detached-under-custody"
+            ' "$work/target-$label.cache-receipt.json"
+        namespace=$(jq -er '.namespace | select(test("^[0-9a-f]{64}$"))' "$work/target-$label.cache-receipt.json") || return 1
+        case "$label" in
+            first)
+                first_namespace="$namespace"
+                first_sha=$(_act_sha256 "$work/target-first/x86_64-unknown-linux-gnu/release/rustselectorcache") || return 1 ;;
+            repeated) repeat_namespace="$namespace" ;;
+            changed) changed_namespace="$namespace" ;;
+        esac
+    done
+    check_rust_selector_cache 'unchanged reviewed selectors reuse the actual cache namespace' \
+        test "$first_namespace" = "$repeat_namespace"
+    check_rust_selector_cache 'a reviewed selector change selects a different cache namespace' \
+        test "$first_namespace" != "$changed_namespace"
+    check_rust_selector_cache 'later cache builds preserve previously collected executable bytes' \
+        test "$first_sha" = "$(_act_sha256 "$work/target-first/x86_64-unknown-linux-gnu/release/rustselectorcache")"
+    check_rust_selector_cache 'cache builds preserve the pinned source tree' \
+        test -z "$(git -C "$work/source" status --porcelain --untracked-files=all)"
+    printf 'Rust selector cache: %s checks, %s failures; evidence %s\n' "$checks" "$failures" "$work"
+    [[ "$failures" -eq 0 ]]
+)
 
 test_strict_cgo_selectors() (
     local dependency work config sha status=0 checks=0 failures=0 item
@@ -3214,6 +3531,14 @@ IGNORE
     [[ "$selection_failures" -eq 0 ]]
 )
 
+if [[ "${1:-}" == --strict-rust-selectors-only ]]; then
+    test_strict_rust_selectors
+    exit $?
+fi
+if [[ "${1:-}" == --strict-rust-selector-cache-only ]]; then
+    test_strict_rust_selector_cache
+    exit $?
+fi
 if [[ "${1:-}" == --strict-cgo-selectors-only ]]; then
     test_strict_cgo_selectors
     exit $?

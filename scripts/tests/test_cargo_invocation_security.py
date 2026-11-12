@@ -34,13 +34,21 @@ def emit(mode, command, shim_dir='', receipt='/tmp/dsr-unused-receipt.json'):
 
 
 program = emit('record', 'cargo build')
+native_environment_pattern = re.compile(subprocess.run(
+    ['bash', '-c', 'source "$1" || exit $?; _act_rust_sdk_influence_regex', '_', str(MODULE)],
+    capture_output=True, text=True, check=True, timeout=30).stdout.strip(), re.IGNORECASE)
+native_c_environment_pattern = re.compile(subprocess.run(
+    ['bash', '-c', 'source "$1" || exit $?; _act_native_c_influence_regex', '_', str(MODULE)],
+    capture_output=True, text=True, check=True, timeout=30).stdout.strip(), re.IGNORECASE)
 python_text = program.split("<<'DSR_TOOLCHAIN_IDENTITY_PY'\n", 1)[1].rsplit('\nDSR_TOOLCHAIN_IDENTITY_PY', 1)[0]
 # Compile the complete emitted Python, not a hand-copied implementation.
 tree = ast.parse(python_text)
 compile(tree, str(MODULE), 'exec')
 namespace = dict(hashlib=hashlib, json=json, os=os, pathlib=__import__('pathlib'),
                  re=re, shlex=shlex, shutil=shutil, stat=stat,
-                 subprocess=subprocess, sys=sys)
+                 subprocess=subprocess, sys=sys,
+                 native_environment_pattern=native_environment_pattern,
+                 native_c_environment_pattern=native_c_environment_pattern)
 exec(compile(ast.Module(body=[node for node in tree.body if isinstance(node, ast.FunctionDef)],
                         type_ignores=[]), str(MODULE), 'exec'), namespace)
 

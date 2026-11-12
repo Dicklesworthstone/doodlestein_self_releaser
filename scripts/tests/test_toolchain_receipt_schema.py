@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import pathlib
 import re
+import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -29,6 +30,14 @@ DIGEST = 'a' * 64
 FACTS = {('unix', None), ('target_arch', 'x86_64'), ('target_os', 'linux'),
          ('target_env', 'gnu'), ('target_vendor', 'unknown'), ('target_family', 'unix'),
          ('target_endian', 'little'), ('target_pointer_width', '64')}
+NATIVE_ENVIRONMENT_PATTERN = re.compile(subprocess.run(
+    ['bash', '-c', 'source "$1" || exit $?; _act_rust_sdk_influence_regex',
+     '_', str(ROOT / 'src/act_runner.sh')],
+    capture_output=True, text=True, check=True, timeout=30).stdout.strip(), re.IGNORECASE)
+NATIVE_C_ENVIRONMENT_PATTERN = re.compile(subprocess.run(
+    ['bash', '-c', 'source "$1" || exit $?; _act_native_c_influence_regex',
+     '_', str(ROOT / 'src/act_runner.sh')],
+    capture_output=True, text=True, check=True, timeout=30).stdout.strip(), re.IGNORECASE)
 
 
 def load_observer_definitions(fragment='_act_toolchain_identity_script() {'):
@@ -40,7 +49,9 @@ def load_observer_definitions(fragment='_act_toolchain_identity_script() {'):
     module = ast.parse(source[start:end], filename=str(path))
     definitions = ast.Module(body=[node for node in module.body
                                   if isinstance(node, ast.FunctionDef)], type_ignores=[])
-    namespace = dict(re=re, os=os, pathlib=pathlib, hashlib=hashlib, json=json)
+    namespace = dict(re=re, os=os, pathlib=pathlib, hashlib=hashlib, json=json,
+                     native_environment_pattern=NATIVE_ENVIRONMENT_PATTERN,
+                     native_c_environment_pattern=NATIVE_C_ENVIRONMENT_PATTERN)
     exec(compile(definitions, str(path), 'exec'), namespace)
 
     def refuse(message):
@@ -206,6 +217,30 @@ class ToolchainReceiptSchemaTests(unittest.TestCase):
         result = target_observation()
         self.assertEqual(result['selection']['cargo_target']['rustflags_source'], 'build')
         self.accepted(result)
+
+    def test_native_selector_observation_preserves_literal_string_values(self):
+        result = identity()
+        result['selection']['native_environment'] = {
+            'DSR_RUST_ENV_POLICY': '1', 'C_INCLUDE_PATH': '/sdk literal-$VALUE', 'CPATH': ''}
+        self.accepted(result)
+        for value in (None, [], 'not-an-object', {'CPATH': 1}, {'CPATH': False}, {'CPATH': []}):
+            with self.subTest(value=value):
+                changed = deepcopy(result)
+                changed['selection']['native_environment'] = value
+                self.rejected(changed)
+
+    def test_native_c_selector_changes_enter_actual_observer_and_cache_projection(self):
+        for name in ('CPATH', 'C_INCLUDE_PATH', 'CPLUS_INCLUDE_PATH', 'OBJC_INCLUDE_PATH',
+                     'LIBRARY_PATH', 'COMPILER_PATH', 'GCC_EXEC_PREFIX', 'DSR_RUST_ENV_POLICY'):
+            with self.subTest(name=name):
+                self.assertTrue(OBSERVER['influences'](name))
+                literal = {name: '/sdk literal-$VALUE'}
+                self.assertEqual(CACHE['cache_environment'](literal), literal)
+                self.assertNotEqual(CACHE['cache_environment']({name: ''}), {})
+                self.assertNotEqual(CACHE['cache_environment'](literal),
+                                    CACHE['cache_environment']({name: '/changed-sdk'}))
+        self.assertFalse(OBSERVER['influences']('CPATH_UNRELATED'))
+        self.assertEqual(CACHE['cache_environment']({'CPATH_UNRELATED': '/ignored'}), {})
 
     def test_numeric_production_receipts_and_precedence(self):
         for name in ('RUST_MIN_STACK', 'RUST_TEST_THREADS'):

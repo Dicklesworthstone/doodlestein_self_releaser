@@ -11,6 +11,7 @@ on:
       - scripts/tests/test_cargo_configuration_security.py
       - scripts/tests/test_cargo_invocation_security.py
       - scripts/tests/test_toolchain_identity.sh
+      - scripts/tests/test_native_source_sync.sh
       - tests/fixtures/cargo/**
       - .github/workflows/cargo-configuration-regression.yml
   workflow_dispatch:
@@ -81,6 +82,13 @@ jobs:
           rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
           rustc -vV
           cargo -vV
+      - name: Bind strict Rust cache identity to native search selectors
+        env:
+          DSR_TEST_DISK_ROOT: /var/tmp
+        run: |
+          set -euo pipefail
+          bash -n scripts/tests/test_native_source_sync.sh
+          timeout 120 bash scripts/tests/test_native_source_sync.sh --strict-rust-selector-cache-only
       - name: Run genuine Cargo and complete identity regressions
         run: |
           set -euo pipefail
