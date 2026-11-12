@@ -10217,6 +10217,27 @@ act_get_build_env() {
         return 4
     fi
 
+    # Validate the original boundaries before NAME=value transport. A newline
+    # in any value can invent a selector, '=' in a key can change its meaning,
+    # and command substitution silently drops NUL bytes. Both native launchers
+    # require portable identifiers. Printable/empty values remain literal;
+    # ordinary scalar coercion stays supported, but selectors require strings.
+    local environment_config native_c_pattern
+    environment_config=$(yq -o=json '.' "$config_file") || return 4
+    if [[ "$(jq -r '.language // ""' <<< "$environment_config")" == rust ]]; then
+        native_c_pattern=$(_act_native_c_influence_regex) || return 4
+        if ! jq -e --arg platform "$platform" --arg pattern "$native_c_pattern" '
+            [.env // {}, .cross_compile[$platform].env // {}] |
+            all(.[]; type == "object" and all(to_entries[];
+                (.key | test("\\A[A-Za-z_][A-Za-z0-9_]*\\z")) and
+                (if (.value | type) == "string"
+                 then (.value | explode | all(.[]; . != 0 and . != 10 and . != 13))
+                 else (.key | test($pattern; "i") | not) end)))' <<< "$environment_config" >/dev/null; then
+            _log_error 'Rust build environment requires portable names and single-line values without NUL; native C selectors must be strings'
+            return 4
+        fi
+    fi
+
     local result=""
 
     # Get global env vars

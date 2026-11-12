@@ -35,9 +35,173 @@
 # Use --strict-rust-selectors-only for the same boundary through a genuine
 # Cargo build.rs and static C library; --strict-rust-selector-cache-only checks
 # actual nightly intermediate-cache identity with an eligible no-script crate.
+# Use --rust-selector-values-only for literal configured values and early
+# LF/CR/NUL refusal through the actual native backend, before Cargo preparation.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 ROOT="${DSR_TEST_ROOT:-$ROOT}"
+
+test_rust_selector_values() (
+    local dependency work config sha literal environment actual run_id result status checks=0 failures=0
+    local selector kind scope before after item
+    for dependency in bash git jq yq python3 rustc cargo cc tar; do
+        command -v "$dependency" >/dev/null || { printf 'SKIP: Rust selector values require %s\n' "$dependency"; return 77; }
+    done
+    [[ $(uname -s)/$(uname -m) == Linux/x86_64 ]] || return 77
+    work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-rust-selector-values.XXXXXXXX") || return 1
+    printf 'Rust selector value evidence: %s\n' "$work"
+    mkdir -p "$work/config/repos.d" "$work/source/src" "$work/cargo-seed" || return 1
+    export DSR_CONFIG_DIR="$work/config" ACT_CONFIG_DIR="$work/config" DSR_HOSTS_FILE="$work/config/hosts.yaml"
+    export DSR_STATE_DIR="$work/state" DSR_CACHE_DIR="$work/cache" NO_COLOR=1 DSR_KEEP_BUILD_STAGES=1
+    export CARGO_HOME="$work/cargo-seed" RCH_DISABLED=1 RCH_CARGO_WRAPPER_BYPASS=1
+    printf '[package]\nname="rustvalues"\nversion="1.0.0"\nedition="2021"\n' > "$work/source/Cargo.toml"
+    printf 'fn main() { println!("{}", env!("C_INCLUDE_PATH")); }\n' > "$work/source/src/main.rs"
+    cargo generate-lockfile --offline --manifest-path "$work/source/Cargo.toml" || return 1
+    git -C "$work/source" init -q -b main || return 1
+    git -C "$work/source" add . || return 1
+    git -C "$work/source" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm pinned-rust-values || return 1
+    git -C "$work/source" tag v1.0.0 || return 1
+    sha=$(git -C "$work/source" rev-parse HEAD) || return 1
+    jq -n '{schema_version:"1.0.0",hosts:{localnative:{platform:"linux/amd64",connection:"local",concurrency:1}},
+        platform_mapping:{"linux/amd64":"localnative"}}' > "$DSR_HOSTS_FILE" || return 1
+    literal='literal $DSR_SELECTOR_VALUE `backticks` "quotes" spaces=and\slashes'
+    config="$work/config/repos.d/rustvalues.yaml"
+    jq -n --arg work "$work" --arg path "$PATH" --arg literal "$literal" '{
+        tool_name:"rustvalues",repo:"example/rustvalues",local_path:($work+"/source"),language:"rust",
+        binary_name:"rustvalues",linux_glibc_floor:"native",targets:["linux/amd64"],
+        target_triples:{"linux/amd64":"x86_64-unknown-linux-gnu"},
+        act_job_map:{"linux/amd64":null},hosts:{"linux/amd64":"localnative"},
+        build_cmd:"cargo build --release --locked --offline -j1",
+        env:{PATH:$path,C_INCLUDE_PATH:$literal,CPATH:"",CARGO_NET_OFFLINE:"true"}}
+        ' > "$work/reviewed-config.json" || return 1
+    command cp "$work/reviewed-config.json" "$config" || return 1
+    for item in config host_health act_runner; do
+        if [[ "$item" == act_runner ]]; then
+            # shellcheck disable=SC1090 # Same test also runs against the exact incoming module.
+            source "${DSR_TEST_ACT_RUNNER:-$ROOT/src/act_runner.sh}" || return 1
+        else
+            # shellcheck disable=SC1090 # Production native dependencies.
+            source "$ROOT/src/$item.sh" || return 1
+        fi
+    done
+    host_health_is_ready() { return 0; }
+    check_rust_value() {
+        local label="$1"; shift
+        checks=$((checks + 1))
+        if "$@"; then printf 'PASS: Rust selector values: %s\n' "$label"
+        else failures=$((failures + 1)); printf 'FAIL: Rust selector values: %s\n' "$label" >&2; fi
+    }
+    environment=$(act_get_build_env rustvalues linux/amd64) || return 1
+    environment=$(_act_rust_native_build_env "$environment") || return 1
+    check_rust_value 'literal selector and explicit empty selector survive configuration unchanged' \
+        jq -e --arg literal "$literal" '.C_INCLUDE_PATH==$literal and .CPATH==""' \
+            <<< "$(_act_rust_native_selectors_json "$environment")"
+    # The source tree is pinned directly for this backend-boundary probe. It
+    # does not qualify the orchestrator's disk-backed snapshot custody. Host
+    # readiness is the only adapter; Cargo, identity and collection are real.
+    printf 'BOUNDARY: manually Git-pinned source and fixture host readiness; actual native Cargo backend, compiler and collection\n'
+    run_id=$(_act_generate_uuid) || return 1
+    status=0
+    act_run_native_build rustvalues linux/amd64 1.0.0 "$run_id" "$work/source" "$sha" v1.0.0 \
+        localnative x86_64-unknown-linux-gnu > "$work/literal-result.json" 2> "$work/literal-build.log" || status=$?
+    check_rust_value 'genuine native Cargo accepts printable literal selector bytes' test "$status" -eq 0
+    if [[ "$status" -ne 0 ]]; then cat "$work/literal-build.log" >&2; return 1; fi
+    result=$(cat "$work/literal-result.json") || return 1
+    actual=$(jq -er '.artifact_paths[0]' <<< "$result") || return 1
+    check_rust_value 'real executable embeds dollar, backtick, quote, backslash and space bytes' test "$("$actual")" = "$literal"
+    check_rust_value 'actual toolchain observation retains the exact literal selector' jq -e --arg literal "$literal" \
+        '.cargo_isolation.toolchain.selection.native_environment.C_INCLUDE_PATH==$literal' <<< "$result"
+    jq --arg literal "$literal" '.env.REVIEW_NOTE=$literal | .env.EMPTY_REVIEW_NOTE="" |
+        .env.REVIEW_COUNT=42 | .env.REVIEW_ENABLED=false' "$work/reviewed-config.json" > "$config" || return 1
+    environment=$(act_get_build_env rustvalues linux/amd64) || return 1
+    check_rust_value 'printable non-selector values preserve literal bytes during serialization' \
+        test "$(act_get_build_env_value "$environment" REVIEW_NOTE)" = "$literal"
+    actual=$(act_get_build_env_value "$environment" EMPTY_REVIEW_NOTE) || return 1
+    check_rust_value 'an explicitly empty non-selector remains present' test "$actual" = ""
+    check_rust_value 'ordinary numeric environment scalar keeps its existing coercion' \
+        test "$(act_get_build_env_value "$environment" REVIEW_COUNT)" = 42
+    check_rust_value 'ordinary boolean environment scalar keeps its existing coercion' \
+        test "$(act_get_build_env_value "$environment" REVIEW_ENABLED)" = false
+    for scope in global platform; do
+        for selector in $(_act_native_c_env_names) c_include_path DSR_RUST_ENV_POLICY; do
+            for kind in lf cr nul; do
+                jq --arg scope "$scope" --arg selector "$selector" --arg kind "$kind" '
+                    (if $kind=="lf" then "/reviewed\nCPATH=/ambient"
+                     elif $kind=="cr" then "/reviewed\rpath" else "/reviewed\u0000path" end) as $value |
+                    if $scope=="global" then .env[$selector]=$value
+                    else .cross_compile["linux/amd64"].env[$selector]=$value end
+                    ' "$work/reviewed-config.json" > "$config" || return 1
+                status=0
+                act_get_build_env rustvalues linux/amd64 > "$work/$scope-$selector-$kind.out" \
+                    2> "$work/$scope-$selector-$kind.log" || status=$?
+                check_rust_value "$scope $selector refuses $kind before line transport" test "$status" -eq 4
+                check_rust_value "$scope $selector $kind emits no partial environment" test ! -s "$work/$scope-$selector-$kind.out"
+            done
+        done
+        for kind in lf cr nul; do
+            jq --arg scope "$scope" --arg kind "$kind" '
+                (if $kind=="lf" then "original\nC_INCLUDE_PATH=/unreviewed"
+                 elif $kind=="cr" then "original\rvalue" else "original\u0000value" end) as $value |
+                if $scope=="global" then .env.REVIEW_NOTE=$value
+                else .cross_compile["linux/amd64"].env.REVIEW_NOTE=$value end
+                ' "$work/reviewed-config.json" > "$config" || return 1
+            status=0
+            act_get_build_env rustvalues linux/amd64 > "$work/$scope-carrier-$kind.out" \
+                2> "$work/$scope-carrier-$kind.log" || status=$?
+            check_rust_value "$scope non-selector $kind carrier is refused before it can invent assignments" test "$status" -eq 4
+            check_rust_value "$scope non-selector $kind carrier emits no partial environment" test ! -s "$work/$scope-carrier-$kind.out"
+        done
+        for kind in lf-assignment nul-name equals-name trailing-lf; do
+            jq --arg scope "$scope" --arg kind "$kind" '
+                (if $kind=="lf-assignment" then "REVIEW=original\nC_INCLUDE_PATH"
+                 elif $kind=="nul-name" then "C_INCLU\u0000DE_PATH"
+                 elif $kind=="equals-name" then "C_INCLUDE_PATH=/unreviewed"
+                 else "C_INCLUDE_PATH\n" end) as $key |
+                if $scope=="global" then .env[$key]="/unreviewed"
+                else .cross_compile["linux/amd64"].env[$key]="/unreviewed" end
+                ' "$work/reviewed-config.json" > "$config" || return 1
+            status=0
+            act_get_build_env rustvalues linux/amd64 > "$work/$scope-key-$kind.out" \
+                2> "$work/$scope-key-$kind.log" || status=$?
+            check_rust_value "$scope $kind key cannot synthesize or rename a compiler selector" test "$status" -eq 4
+            check_rust_value "$scope $kind key emits no partial environment" test ! -s "$work/$scope-key-$kind.out"
+        done
+    done
+    for kind in number boolean array; do
+        jq --arg kind "$kind" '.env.C_INCLUDE_PATH=(if $kind=="number" then 42
+            elif $kind=="boolean" then false else ["/reviewed"] end)' "$work/reviewed-config.json" > "$config" || return 1
+        status=0
+        act_get_build_env rustvalues linux/amd64 > "$work/$kind.out" 2> "$work/$kind.log" || status=$?
+        check_rust_value "$kind selector is refused as nonliteral configuration" test "$status" -eq 4
+        check_rust_value "$kind refusal emits no partial environment" test ! -s "$work/$kind.out"
+    done
+    for kind in array object; do
+        jq --arg kind "$kind" '.env.REVIEW_NOTE=(if $kind=="array" then ["original\nC_INCLUDE_PATH=/unreviewed"]
+            else {value:"original\nC_INCLUDE_PATH=/unreviewed"} end)' "$work/reviewed-config.json" > "$config" || return 1
+        status=0
+        act_get_build_env rustvalues linux/amd64 > "$work/non-selector-$kind.out" \
+            2> "$work/non-selector-$kind.log" || status=$?
+        check_rust_value "ordinary $kind remains refused by environment serialization" test "$status" -eq 4
+        check_rust_value "ordinary $kind refusal emits no partial environment" test ! -s "$work/non-selector-$kind.out"
+    done
+    before=$(find "$work" -maxdepth 1 -type d -name '.cargo-home-*' -print | sort) || return 1
+    for kind in lf cr nul carrier; do
+        jq --arg kind "$kind" 'if $kind=="carrier" then .env.REVIEW_NOTE="original\nC_INCLUDE_PATH=/unreviewed"
+            else .env.C_INCLUDE_PATH=(if $kind=="lf" then "/reviewed\nCPATH=/ambient"
+            elif $kind=="cr" then "/reviewed\rpath" else "/reviewed\u0000path" end) end' \
+            "$work/reviewed-config.json" > "$config" || return 1
+        status=0
+        act_run_native_build rustvalues linux/amd64 1.0.0 "$run_id" "$work/source" "$sha" v1.0.0 \
+            localnative x86_64-unknown-linux-gnu > "$work/native-$kind.json" 2> "$work/native-$kind.log" || status=$?
+        check_rust_value "native backend refuses $kind at the configured environment boundary" \
+            jq -e --argjson status "$status" '$status==4 and .exit_code==4 and .error=="Invalid native target environment"' "$work/native-$kind.json"
+        after=$(find "$work" -maxdepth 1 -type d -name '.cargo-home-*' -print | sort) || return 1
+        check_rust_value "native $kind refusal occurs before private Cargo preparation" test "$before" = "$after"
+    done
+    check_rust_value 'selector validation preserves the pinned source bytes' git -C "$work/source" diff --quiet "$sha"
+    printf 'Rust selector values: %s checks, %s failures; evidence %s\n' "$checks" "$failures" "$work"
+    [[ "$failures" -eq 0 ]]
+)
 
 test_strict_rust_selectors() (
     local dependency work config sha status=0 checks=0 failures=0 item reviewed changed actual
@@ -3531,6 +3695,10 @@ IGNORE
     [[ "$selection_failures" -eq 0 ]]
 )
 
+if [[ "${1:-}" == --rust-selector-values-only ]]; then
+    test_rust_selector_values
+    exit $?
+fi
 if [[ "${1:-}" == --strict-rust-selectors-only ]]; then
     test_strict_rust_selectors
     exit $?

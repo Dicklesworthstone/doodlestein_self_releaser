@@ -1898,6 +1898,14 @@ shell. Put these values in the configured environment, not an inline override
 inside `build_cmd`. Windows normalizes environment names case-insensitively and
 retains explicit empty values.
 
+Before serializing a Rust build environment, DSR validates the original global
+and selected-platform entries. Names must be portable shell identifiers, and
+string values cannot contain LF, CR or NUL. Native C selectors must be strings,
+including explicit empty strings. Invalid entries stop the build before private
+Cargo preparation. This also prevents an unrelated environment entry from
+creating a compiler selector through a line break or a malformed variable name;
+printable literal selector bytes retain their original meaning.
+
 DSR manages `DSR_RUST_ENV_POLICY=1` and records the selected native C/SDK
 environment twice: in `build_influence_env` and in the independently observed
 `cargo_isolation.toolchain.selection.native_environment`. Strict builds bind
