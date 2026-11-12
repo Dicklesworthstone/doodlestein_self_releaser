@@ -624,6 +624,14 @@ Their separate descriptor locks prevent overlapping attempts without holding
 the watcher lock. Both continuous mode and `--once` require `flock` or Python 3
 with `fcntl`; dry-run does not create locks, attempts, or recovery state.
 
+Both `dsr --dry-run watch` and `dsr watch --dry-run` propagate preview mode to
+preflight and queue discovery. They preserve configuration, cache, retained
+check results and logs, including an inherited `DSR_LOG_FILE`, and create no
+missing persistent directories. Discovery still runs and reports dependency
+and API failures. Notification selections are validated, but a preview neither
+delivers events nor initializes or updates notification state, including with
+`--auto-fallback` and `--notify` together.
+
 ---
 
 ### `dsr build`
@@ -1392,11 +1400,15 @@ The values agree with the durable target result and manifest build-environment
 receipt. Failed attempts retain the evidence available before failure;
 unattempted targets do not receive fabricated provenance.
 
-Strict native Go results retain `DSR_GO_ENV_POLICY=1` in `build_influence_env`,
+Strict native Go results retain `DSR_GO_ENV_POLICY=2` in `build_influence_env`,
 together with the effective reviewed Go selectors and release source identity.
 Workers clear inherited compiler, architecture, cgo and workspace selectors,
-enforce `GOENV=off`, and default to empty `GOFLAGS`, `GOTOOLCHAIN=local` and
-`GO111MODULE=on` before applying the recipe. Governed selector values are literal;
+including the complete `PKG_CONFIG` / `PKG_CONFIG_*` family on Unix and Windows.
+Reviewed pkg-config executable, package search path, sysroot and filtering settings
+must use portable uppercase identifiers in the recipe; every configured family
+member is retained in the receipt. Workers enforce `GOENV=off` and default to
+empty `GOFLAGS`, `GOTOOLCHAIN=local` and `GO111MODULE=on` before applying the recipe.
+Governed selector values are literal, including dollar signs in pkg-config paths;
 unrelated Unix recipe environment values retain their existing shell expansion.
 Proxy credentials and unrelated cache settings are excluded from this receipt.
 
@@ -1408,13 +1420,34 @@ refused. The worker receives the path in its private stage. The receipt retains
 `DSR_GO_WORKFILE` (graph-relative path), `DSR_GO_WORKFILE_SHA256` and
 `DSR_GO_WORKFILE_GIT_SHA`; all three are empty when workspace mode is off.
 
+Local Go source references must stay within that same pinned graph. Before
+native source staging, DSR inspects every committed `go.mod` local `replace`
+directive and the selected workfile's `use` and local `replace` directives,
+including manifests in pinned Git submodules. Each referenced directory must
+resolve through committed directories to a committed regular `go.mod` in the
+main or an explicitly pinned sibling root. Relative sibling paths such as
+`../shared` remain supported; absolute paths, escapes, symlink traversals and
+untracked module roots are refused. Go quoted-string escapes are decoded before
+containment checks. All committed module manifests are checked, including
+currently inactive replacements, because a reviewed build command can select
+any of those modules. Versioned module replacements remain supported.
+
+The same source-path admission runs again when constructing each worker's
+compiler policy and when validating retained output for resume or publication.
+It does not need a Go compiler on the coordinator and does not fetch dependency
+modules. This checks pinned module/workspace metadata; it does not sandbox
+arbitrary reviewed build commands or authenticate downloaded module-cache bytes.
+
 Strict Go resume validates both embedded results and immutable result sidecars
 against the current recipe and pinned workfile identity before changing the
 checkpoint or dispatching workers. Publication requires exactly one matching
 native receipt for each configured native contract target; removing, duplicating
 or relabelling rows cannot bypass this requirement. Older strict Go outputs
-without policy evidence require a fresh release build. This policy does not
-attest the installed Go executable or all downloaded dependency-cache bytes.
+without policy evidence, including policy-1 outputs that did not isolate the
+pkg-config selector family, require a fresh release build before resume or
+publication. Changing an old receipt's marker is not a substitute for rebuilding.
+This policy does not attest the installed Go executable or all downloaded
+dependency-cache bytes.
 
 Native results also retain `native_execution`: the observed `phase`, configured
 `timeout_seconds` and `transport_timeout_seconds`, original `command_exit_code`,
@@ -2019,14 +2052,15 @@ previous selected files when possible, retain incomplete recovery evidence and
 never report success for a partially installed family. PATH edits and skill
 installation are not part of this Windows installer.
 
-For a configured Go repository, source installation is a separate explicit mode:
+For a configured Go, Rust, Bun or TypeScript repository, source installation is a
+separate explicit mode:
 
 ```powershell
 .\install.ps1 -FromSource -SourceRef refs/tags/v1.2.3 -Yes -Json
 ```
 
-It requires existing Git and Go executables, executes repository/dependency build
-code, and never installs a compiler automatically. `-SourceRef` accepts `HEAD`
+It requires existing Git and the selected compiler, executes repository/dependency
+build code, and never installs a compiler automatically. `-SourceRef` accepts `HEAD`
 (the default), a full commit SHA, `refs/heads/BRANCH` or `refs/tags/TAG`. The
 fetched ref is resolved once to a commit in a private detached checkout; an
 explicit SHA must match exactly. Symbolic links, submodules, unsafe Windows
@@ -2035,8 +2069,8 @@ cannot inherit a different `GOOS`, `GOARCH`, `GOFLAGS`, `GOENV`, `GOWORK` or an
 automatic toolchain download. Existing dependency access and caches otherwise
 remain the installing user's Go environment.
 
-The source policy uses `source_subdir` and `source_entry`. An explicit entry
-selects the primary package; otherwise it uses `cmd/<primary>` when present and
+For Go, the source policy uses `source_subdir` and `source_entry`. An explicit
+entry selects the primary package; otherwise it uses `cmd/<primary>` when present and
 then the module root. Every selected companion requires its own `cmd/<name>`
 package. The complete per-target family must resolve to `main` packages, compile,
 retain its tracked-source fingerprint, and pass PE checks before any installed
@@ -2046,9 +2080,8 @@ diagnostics and leave installed executables untouched.
 
 `-FromSource` cannot be combined with `-Version`, `-Offline` or `-Recover`.
 Source options without `-FromSource` are refused. Release acquisition, checksum
-and signature failures never invoke a source build. Other configured languages
-retain their normal Windows release installer; this source mode currently
-supports Go only. `-SourceTimeout` is a per-Git/Go-command deadline, including
+and signature failures never invoke a source build. `-SourceTimeout` is a
+per-Git/compiler-command deadline, including
 redirected output draining: default 3600 seconds, range 1..86400. A timeout
 prevents installation. Cleanup does not claim custody of child processes already
 orphaned by an exited parent.
@@ -2062,6 +2095,33 @@ triple is labeled `release_target_triple`, not asserted as Go compiler evidence.
 `CacheDir/source-receipts/TOOL/`. That file describes verified locally compiled
 bytes, not a signed release or a promise that a subsequent installation finished.
 Successful temporary source trees are removed; the small receipt remains.
+
+Rust source builds use `source_subdir` and optional `source_package`, require a
+committed workspace `Cargo.lock`, and resolve the complete selected workspace
+executable family before compiling. Cargo runs with `--locked` and the configured
+Windows target in private output. Package identity, tracked-source stability,
+PE architecture and each output's bytes are verified before installation. Rust
+receipts report the actual `cargo_target` and compiler/package evidence.
+
+Bun and TypeScript source builds use `source_subdir` and optional `source_entry`.
+They require committed regular `package.json` and `bun.lock` or `bun.lockb` files.
+The primary entry uses `source_entry` when configured; otherwise it uses the
+package's string `bin` or the exact `bin` map key matching its executable name
+without `.exe`. Each companion requires its own exact map key. Entries must be
+committed regular files within the selected source directory; a leading `./`
+is accepted. Every selected provider is resolved before dependencies are installed.
+
+An installed Bun runs one `bun install --frozen-lockfile`, then compiles each
+member with `bun build --compile` for `bun-windows-x64-baseline` or
+`bun-windows-arm64`. Ambient `NODE_OPTIONS` and `BUN_OPTIONS` are removed.
+Committed project configuration and ordinary dependency settings still apply;
+this is not a hermetic dependency sandbox. The complete family must preserve
+tracked inputs and pass PE architecture and output-byte checks before the
+existing journaled installation can replace executables. Bun receipts report
+`bun_target`, compiler version, `source_entries`, `package_json_sha256` and
+`bun_lockfiles` path/hash/size evidence, with explicitly unsigned local-build
+status. Missing/stale locks, unsafe providers or a later companion failure
+preserve the installed family.
 
 Before the first executable replacement, the installer publishes an immutable
 local journal with the complete previous and incoming family. An interrupted

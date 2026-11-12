@@ -541,6 +541,14 @@ _select_target_triple() {
             fi
         done
     fi
+    # A known host with no compatible release is an acquisition absence.
+    # Only explicit source consent may select this internal status; unknown
+    # libc and an unsatisfied --libc request keep their original refusals.
+    # The caller must still resolve the release tag before invoking source.
+    if [[ -z "$_LIBC" ]] && $_ALLOW_SOURCE_BUILD; then
+        _log_warn "No $libc release build of $TOOL_NAME is configured for ${os}/${arch}; source fallback is permitted"
+        return 1
+    fi
     _log_error "No $libc build of $TOOL_NAME is configured for ${os}/${arch}"
     return 4
 }
@@ -1979,14 +1987,23 @@ main() {
         _install_from_source "Explicit --from-source request"
         return $?
     fi
-    _TARGET_TRIPLE=$(_select_target_triple "${platform%/*}" "${platform#*/}") || return $?
-    if [[ ! "$_TARGET_TRIPLE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
-        _log_error "Unresolved target triple for $platform"
-        return 4
+    local install_targets='' fallback_triple target_status=0
+    _TARGET_TRIPLE=$(_select_target_triple "${platform%/*}" "${platform#*/}") || target_status=$?
+    if ((target_status != 0)); then
+        # Status 1 is reserved for an auto-detected, known libc without a
+        # compatible configured release and with explicit source consent.
+        # Keep version discovery below: a resolved release builds its tag,
+        # while unavailable latest discovery follows the existing HEAD policy.
+        ((target_status == 1)) && $_ALLOW_SOURCE_BUILD && [[ -z "$_LIBC" ]] || return "$target_status"
+    else
+        if [[ ! "$_TARGET_TRIPLE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            _log_error "Unresolved target triple for $platform"
+            return 4
+        fi
+        install_targets="$_TARGET_TRIPLE"
+        fallback_triple=$(_fallback_target_triple "${platform%/*}" "${platform#*/}" "$_TARGET_TRIPLE") || return $?
+        [[ -z "$fallback_triple" ]] || install_targets+=$'\n'"$fallback_triple"
     fi
-    local install_targets="$_TARGET_TRIPLE" fallback_triple
-    fallback_triple=$(_fallback_target_triple "${platform%/*}" "${platform#*/}" "$_TARGET_TRIPLE") || return $?
-    [[ -z "$fallback_triple" ]] || install_targets+=$'\n'"$fallback_triple"
     # Get version
     if [[ -z "$_VERSION" ]]; then
         if $_OFFLINE_MODE; then
@@ -2012,6 +2029,11 @@ main() {
         return 4
     fi
     _log_info "Version: $_VERSION"
+
+    if ((target_status == 1)); then
+        _install_from_source "No compatible release target is configured for $platform"
+        return $?
+    fi
 
     local format asset_name asset_plan
 
@@ -3280,11 +3302,11 @@ _install_gen_windows_policy() (
                 (ascii_downcase != ".git") and (endswith(".") | not) and (endswith(" ") | not) and
                 (test("[[:cntrl:]\\\\:<>\"|?*]") | not) and
                 (test("(?i)^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\\.|$)") | not))));
-        if .language == "go" then
-            {language:"go", subdir:(.source_subdir // "."), entry:(.source_entry // "")} as $source |
+        if .language == "go" or .language == "bun" or .language == "typescript" then
+            {language:.language, subdir:(.source_subdir // "."), entry:(.source_entry // "")} as $source |
             if ($source.subdir | source_path) and ($source.entry | type == "string" and (. == "" or source_path)) and
                 ((.source_package // "") == "")
-            then $source else error("invalid Windows Go source selection") end
+            then $source else error("invalid Windows Go/Bun source selection") end
         elif .language == "rust" then
             {language:"rust", subdir:(.source_subdir // "."), package:(.source_package // "")} as $source |
             if ($source.subdir | source_path) and

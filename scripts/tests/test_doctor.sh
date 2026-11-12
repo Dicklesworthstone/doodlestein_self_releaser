@@ -207,6 +207,171 @@ SH
     fi
 }
 
+# The gh boundary is an explicit fixture; the public doctor/watch commands,
+# credential selection and process-group deadline supervisor all execute.
+test_doctor_github_deadlines() {
+    ((TESTS_RUN++))
+    if ! command -v python3 >/dev/null; then
+        skip "Python 3 is required for bounded doctor/watch regression checks"
+        return
+    fi
+    if python3 - "$DSR_CMD" "$TEMP_DIR" <<'PY'
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+cli, root = sys.argv[1], Path(sys.argv[2])
+fixture = root / "doctor-deadlines"
+fixture.mkdir()
+bin_dir = fixture / "bin"
+bin_dir.mkdir()
+gh = bin_dir / "gh"
+gh.write_text(r'''#!/usr/bin/env bash
+set -uo pipefail
+printf '%s\n' "$*" >> "$DSR_DOCTOR_CASE/calls"
+stall() {
+    printf 'started\n' >> "$DSR_DOCTOR_CASE/started"
+    command sleep 3
+    printf 'escaped\n' >> "$DSR_DOCTOR_CASE/escaped"
+}
+case "$*" in
+    --version) printf 'gh version 2.0.0 (deadline fixture)\n'; exit 0 ;;
+    'auth token --hostname github.com')
+        case "$DSR_DOCTOR_PHASE" in
+            token-timeout) stall ;;
+            token-cancel) exit 2 ;;
+            token-missing) exit 1 ;;
+            user-token-cancel)
+                [[ ! -f "$DSR_DOCTOR_CASE/authenticated" ]] || exit 130
+                ;;
+        esac
+        printf 'doctor-fixture-token\n'
+        exit 0
+        ;;
+esac
+[[ "$GH_TOKEN" == doctor-fixture-token && "$GH_HOST" == github.com ]] || exit 9
+case "$*" in
+    'auth status --hostname github.com')
+        case "$DSR_DOCTOR_PHASE" in
+            auth-timeout) stall ;;
+            auth-cancel) exit 2 ;;
+            auth-error) exit 1 ;;
+        esac
+        : > "$DSR_DOCTOR_CASE/authenticated"
+        exit 0
+        ;;
+    'api user --hostname github.com --jq .login')
+        case "$DSR_DOCTOR_PHASE" in
+            user-timeout) printf 'partial-user\n'; stall ;;
+            user-error) printf 'partial-user\n'; exit 1 ;;
+            user-cancel) printf 'partial-user\n'; exit 130 ;;
+        esac
+        printf 'selected-release-user\n'
+        ;;
+    *) exit 9 ;;
+esac
+''')
+gh.chmod(0o700)
+
+cases = [
+    ("doctor", "healthy", 0),
+    ("doctor", "auth-timeout", 3),
+    ("doctor", "token-timeout", 3),
+    ("doctor", "user-timeout", 0),
+    ("doctor", "user-error", 0),
+    ("doctor", "auth-cancel", 5),
+    ("doctor", "user-cancel", 5),
+    ("doctor", "invalid-deadline", 3),
+    ("doctor", "token-cancel", 5),
+    ("doctor", "user-token-cancel", 5),
+    ("doctor", "token-missing", 3),
+    ("doctor", "auth-error", 3),
+    ("watch", "auth-timeout", 3),
+    ("watch", "token-timeout", 3),
+    ("watch", "auth-cancel", 5),
+    ("watch", "user-cancel", 5),
+    ("watch", "token-cancel", 5),
+    ("watch", "user-token-cancel", 5),
+    ("watch", "user-error", 1),
+    ("watch", "user-timeout", 1),
+]
+for command, phase, expected in cases:
+    case = fixture / (command + "-" + phase)
+    case.mkdir(mode=0o700)
+    env = dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ["PATH"],
+               DSR_DOCTOR_CASE=str(case), DSR_DOCTOR_PHASE=phase,
+               DSR_GH_TOKEN="" if phase in ("token-timeout", "token-cancel", "user-token-cancel", "token-missing")
+                   else "doctor-fixture-token",
+               GITHUB_TOKEN="", GH_TOKEN="", GH_HOST="enterprise.fixture.invalid",
+               GH_API_TIMEOUT="0" if phase == "invalid-deadline" else "1",
+               DSR_CONFIG_DIR=str(case / "config"), DSR_CONFIG_FILE=str(case / "config.yaml"),
+               DSR_REPOS_FILE=str(case / "repos.yaml"), DSR_HOSTS_FILE=str(case / "hosts.yaml"),
+               DSR_STATE_DIR=str(case / "state"), DSR_CACHE_DIR=str(case / "cache"),
+               NO_COLOR="1")
+    args = [cli, "--dry-run", "--json", command]
+    args += ["--quick"] if command == "doctor" else ["--once", "--auto-fallback"]
+    started = time.monotonic()
+    result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=8)
+    elapsed = time.monotonic() - started
+    (case / "stdout").write_text(result.stdout)
+    (case / "stderr").write_text(result.stderr)
+    (case / "result.json").write_text(json.dumps({"status": result.returncode, "elapsed": elapsed}))
+    assert result.returncode == expected, (command, phase, result.returncode, result.stderr)
+    assert not (case / "escaped").exists(), (command, phase, "deadline operation continued")
+    calls = (case / "calls").read_text().splitlines()
+    auth = [line for line in calls if line == "auth status --hostname github.com"]
+    user = [line for line in calls if line == "api user --hostname github.com --jq .login"]
+    tokens = [line for line in calls if line == "auth token --hostname github.com"]
+    if phase.endswith("timeout"):
+        assert (case / "started").read_text() == "started\n", (command, phase, "repeated operation")
+    if phase in ("token-timeout", "token-cancel", "token-missing", "invalid-deadline"):
+        assert not auth and not user, (command, phase, calls)
+        assert len(tokens) == (0 if phase == "invalid-deadline" else 1), (command, phase, calls)
+    elif phase == "user-token-cancel":
+        assert len(auth) == 1 and len(tokens) == 2 and not user, (command, phase, calls)
+    else:
+        assert len(auth) == 1 and not tokens, (command, phase, calls)
+        assert len(user) == (0 if phase.startswith("auth-") else 1), (command, phase, calls)
+    if command == "doctor":
+        response = json.loads(result.stdout)
+        assert response["exit_code"] == expected, (phase, response)
+        assert response["status"] == ("success" if expected == 0 else "error"), (phase, response)
+        check = next(item for item in response["details"]["checks"] if item["name"] == "gh")
+        assert check["authenticated"] == (phase.startswith("user-") or phase == "healthy"), (phase, check)
+        if phase in ("user-timeout", "user-error", "healthy"):
+            wanted = "selected-release-user" if phase == "healthy" else "unknown"
+            assert check["status"] == "ok" and check["user"] == wanted, (phase, check)
+            assert "partial-user" not in result.stdout, (phase, result.stdout)
+        elif phase == "invalid-deadline":
+            assert "GH_API_TIMEOUT" in check["message"], check
+        elif phase in ("auth-error", "token-missing"):
+            assert "not authenticated" in check["message"], check
+        elif phase.endswith("cancel"):
+            assert "interrupted" in check["message"], check
+        else:
+            assert "deadline" in check["message"], check
+    else:
+        # Optional account-name failures still admit monitoring. No repositories
+        # are configured, so the real check stops before any HTTP discovery.
+        proceeds = phase in ("user-error", "user-timeout")
+        assert ("Running throttle check..." in result.stderr) == proceeds, (phase, result.stderr)
+        assert "Starting fallback for" not in result.stderr, (phase, result.stderr)
+        assert not (case / "state" / "watch-attempts").exists(), (phase, "fallback dispatched")
+        if phase.endswith("cancel"):
+            assert "Preflight check interrupted" in result.stderr, result.stderr
+    assert not (case / "state").exists(), (command, phase, "dry-run wrote persistent state")
+print("Doctor/watch credential deadlines: %d cases passed" % len(cases))
+PY
+    then
+        pass "doctor/watch bound credential probes, retain optional metadata fallback, and propagate cancellation"
+    else
+        fail "doctor/watch credential deadline or cancellation regression"
+    fi
+}
+
 test_doctor_detects_jq() {
     ((TESTS_RUN++))
 
@@ -485,6 +650,7 @@ echo "Core Dependency Detection:"
 test_doctor_detects_git
 test_doctor_detects_gh
 test_doctor_uses_selected_github_identity
+test_doctor_github_deadlines
 test_doctor_detects_jq
 
 echo ""

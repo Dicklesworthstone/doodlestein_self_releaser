@@ -102,22 +102,20 @@ skip_test() {
 
 test_cache_key_simple() {
   local key
-  key=$(_gh_cache_key "repos/owner/repo")
-  [[ "$key" == "repos_owner_repo" ]]
+  key=$(_gh_cache_key "repos/owner/repo") || return 1
+  [[ -n "$key" && "$key" == "$(_gh_cache_key "repos/owner/repo")" ]]
 }
 
 test_cache_key_with_query() {
   local key
-  key=$(_gh_cache_key "repos/owner/repo/releases?per_page=10")
-  # Should replace special chars with underscores
-  [[ "$key" =~ ^repos_owner_repo_releases ]]
+  key=$(_gh_cache_key "repos/owner/repo/releases?per_page=10") || return 1
+  [[ "$key" != "$(_gh_cache_key "repos/owner/repo/releases?per_page=100")" ]]
 }
 
 test_cache_key_safe_chars() {
   local key
-  key=$(_gh_cache_key "repos/test-org/my_repo-name")
-  # Hyphens and underscores should be preserved
-  [[ "$key" =~ test-org ]] && [[ "$key" =~ my_repo-name ]]
+  key=$(_gh_cache_key "repos/test-org/my_repo-name") || return 1
+  [[ "$key" =~ ^[A-Za-z0-9_-]+$ && ${#key} -le 240 ]]
 }
 
 test_cache_key_special_chars() {
@@ -139,21 +137,24 @@ test_init_cache_creates_dir() {
 
 test_set_cache_creates_files() {
   echo '{"test": true}' | _gh_set_cache "test/endpoint" "etag123"
-  [[ -f "$GH_CACHE_DIR/test_endpoint.json" ]] && \
-  [[ -f "$GH_CACHE_DIR/test_endpoint.meta" ]]
+  local key
+  key=$(_gh_cache_key "test/endpoint") || return 1
+  [[ -f "$GH_CACHE_DIR/$key.json" ]] && \
+  [[ -f "$GH_CACHE_DIR/$key.meta" ]]
 }
 
 test_set_cache_stores_content() {
   echo '{"data": "value"}' | _gh_set_cache "test/content" ""
   local content
-  content=$(cat "$GH_CACHE_DIR/test_content.json")
+  content=$(_gh_get_cache_raw "test/content") || return 1
   [[ "$content" == '{"data": "value"}' ]]
 }
 
 test_set_cache_stores_timestamp() {
   echo '{}' | _gh_set_cache "test/time" ""
-  local timestamp
-  timestamp=$(head -1 "$GH_CACHE_DIR/test_time.meta")
+  local timestamp key
+  key=$(_gh_cache_key "test/time") || return 1
+  timestamp=$(head -1 "$GH_CACHE_DIR/$key.meta")
   # Should be a reasonable epoch timestamp
   [[ "$timestamp" =~ ^[0-9]+$ ]] && [[ "$timestamp" -gt 1700000000 ]]
 }
@@ -161,7 +162,7 @@ test_set_cache_stores_timestamp() {
 test_set_cache_stores_etag() {
   echo '{}' | _gh_set_cache "test/etag" "W/\"abc123\""
   local etag
-  etag=$(sed -n '2p' "$GH_CACHE_DIR/test_etag.meta")
+  etag=$(_gh_get_etag "test/etag") || return 1
   [[ "$etag" == 'W/"abc123"' ]]
 }
 
@@ -178,10 +179,12 @@ test_get_cache_missing_returns_error() {
 
 test_get_cache_expired_returns_error() {
   # Create cache with old timestamp
+  local key
+  key=$(_gh_cache_key "test/expired") || return 1
   mkdir -p "$GH_CACHE_DIR"
-  echo '{"old": true}' > "$GH_CACHE_DIR/test_expired.json"
-  echo "1000000000" > "$GH_CACHE_DIR/test_expired.meta"  # Very old
-  echo "" >> "$GH_CACHE_DIR/test_expired.meta"
+  echo '{"old": true}' > "$GH_CACHE_DIR/$key.json"
+  echo "1000000000" > "$GH_CACHE_DIR/$key.meta"  # Very old
+  echo "" >> "$GH_CACHE_DIR/$key.meta"
   ! _gh_get_cache "test/expired"
 }
 
@@ -205,6 +208,95 @@ test_get_etag_missing_returns_empty() {
   local etag
   etag=$(_gh_get_etag "nonexistent/etag")
   [[ -z "$etag" ]]
+}
+
+# Exercise real cache reads, API cache hits, validators and targeted eviction
+# for endpoint pairs that the original punctuation substitution merged.
+test_cache_endpoint_isolation() {
+  local first="$1" second="$2" response etag
+  local original='{"id":41,"body":"first endpoint only"}'
+  local other='{"id":82,"body":"second endpoint only"}'
+  printf '%s\n' "$original" | _gh_set_cache "$first" 'W/"first"' || return 1
+  if _gh_get_cache "$second" >/dev/null || _gh_get_cache_raw "$second" >/dev/null; then
+    return 1
+  fi
+  etag=$(_gh_get_etag "$second")
+  [[ -z "$etag" ]] || return 1
+  response=$(gh_api "$first") || return 1
+  [[ "$response" == "$original" ]] || return 1
+  printf '%s\n' "$other" | _gh_set_cache "$second" 'W/"second"' || return 1
+  [[ "$(gh_api "$first")" == "$original" && "$(gh_api "$second")" == "$other" &&
+     "$(_gh_get_etag "$first")" == 'W/"first"' && "$(_gh_get_etag "$second")" == 'W/"second"' ]] || return 1
+  gh_clear_cache "$second" || return 1
+  [[ "$(gh_api "$first")" == "$original" && "$(_gh_get_etag "$first")" == 'W/"first"' ]] || return 1
+  ! _gh_get_cache "$second" >/dev/null
+}
+
+test_cache_long_endpoint() {
+  local filter endpoint response
+  printf -v filter '%0700d' 1
+  endpoint="repos/owner/repo/actions/runs?branch=$filter&status=queued"
+  printf '{"workflow_runs":[],"total_count":0}\n' | _gh_set_cache "$endpoint" long-etag || return 1
+  response=$(gh_api "$endpoint") || return 1
+  [[ "$response" == '{"workflow_runs":[],"total_count":0}' &&
+     "$(_gh_get_etag "$endpoint")" == long-etag ]]
+}
+
+test_cache_refuses_legacy_alias() {
+  printf '{"id":41,"body":"ambiguous legacy response"}\n' > "$GH_CACHE_DIR/repos_owner_app_one_releases_latest.json"
+  { date +%s; printf 'legacy-etag\n'; } > "$GH_CACHE_DIR/repos_owner_app_one_releases_latest.meta"
+  local endpoint etag
+  for endpoint in repos/owner/app.one/releases/latest repos/owner/app_one/releases/latest; do
+    if _gh_get_cache "$endpoint" >/dev/null || _gh_get_cache_raw "$endpoint" >/dev/null; then
+      return 1
+    fi
+    etag=$(_gh_get_etag "$endpoint")
+    [[ -z "$etag" ]] || return 1
+  done
+}
+
+test_cache_hash_failure_is_not_an_empty_key() (
+  # A failing installed digest tool must not redirect any operation to .json
+  # or .meta, and cache eviction must preserve those unrelated files.
+  printf '{"unrelated":true}\n' > "$GH_CACHE_DIR/.json"
+  printf '1700000000\nunrelated-etag\n' > "$GH_CACHE_DIR/.meta"
+  sha256sum() { return 9; }
+  local status=0
+  _gh_cache_key repos/owner/repo >/dev/null && return 1
+  _gh_get_cache repos/owner/repo >/dev/null && return 1
+  _gh_get_cache_raw repos/owner/repo >/dev/null && return 1
+  _gh_get_etag repos/owner/repo >/dev/null && return 1
+  printf '{}\n' | _gh_set_cache repos/owner/repo changed && return 1
+  gh_clear_cache repos/owner/repo || status=$?
+  [[ "$status" -ne 0 && "$(cat "$GH_CACHE_DIR/.json")" == '{"unrelated":true}' &&
+     "$(cat "$GH_CACHE_DIR/.meta")" == $'1700000000\nunrelated-etag' ]]
+)
+
+test_cache_hash_fallback() (
+  local expected fallback shasum_path status=0
+  expected=$(_gh_cache_key 'repos/owner/app.one/releases/tags/v1.2.3?per_page=10') || return 1
+  shasum_path=$(type -P shasum) || return 1
+  mkdir "$TEMP_DIR/hash-fallback" "$TEMP_DIR/no-hash" || return 1
+  ln -s "$shasum_path" "$TEMP_DIR/hash-fallback/shasum" || return 1
+  fallback=$(PATH="$TEMP_DIR/hash-fallback" _gh_cache_key \
+    'repos/owner/app.one/releases/tags/v1.2.3?per_page=10') || return 1
+  [[ "$fallback" == "$expected" ]] || return 1
+  PATH="$TEMP_DIR/no-hash" _gh_cache_key repos/owner/app >/dev/null || status=$?
+  [[ "$status" -eq 3 ]]
+)
+
+run_cache_identity_regressions() {
+  run_test cache_isolates_repositories test_cache_endpoint_isolation \
+    repos/owner/app.one/releases/latest repos/owner/app_one/releases/latest
+  run_test cache_isolates_release_tags test_cache_endpoint_isolation \
+    repos/owner/app/releases/tags/v1.2.3 repos/owner/app/releases/tags/v1_2_3
+  run_test cache_isolates_query_values test_cache_endpoint_isolation \
+    'repos/owner/app/actions/runs?branch=release%2Fnext&status=queued' \
+    'repos/owner/app/actions/runs?branch=release_2Fnext&status=queued'
+  run_test cache_supports_long_endpoints test_cache_long_endpoint
+  run_test cache_refuses_legacy_alias test_cache_refuses_legacy_alias
+  run_test cache_hash_failure_is_not_an_empty_key test_cache_hash_failure_is_not_an_empty_key
+  run_test cache_hash_fallback test_cache_hash_fallback
 }
 
 # ============================================================================
@@ -1668,16 +1760,15 @@ test_clear_cache_removes_all() {
   echo '{}' | _gh_set_cache "test/a" ""
   echo '{}' | _gh_set_cache "test/b" ""
   gh_clear_cache
-  [[ ! -f "$GH_CACHE_DIR/test_a.json" ]] && \
-  [[ ! -f "$GH_CACHE_DIR/test_b.json" ]]
+  ! _gh_get_cache_raw "test/a" && ! _gh_get_cache_raw "test/b"
 }
 
 test_clear_cache_specific_endpoint() {
   echo '{}' | _gh_set_cache "test/keep" ""
   echo '{}' | _gh_set_cache "test/remove" ""
   gh_clear_cache "test/remove"
-  [[ -f "$GH_CACHE_DIR/test_keep.json" ]] && \
-  [[ ! -f "$GH_CACHE_DIR/test_remove.json" ]]
+  [[ "$(_gh_get_cache_raw "test/keep")" == '{}' ]] && \
+  ! _gh_get_cache_raw "test/remove"
 }
 
 # ============================================================================
@@ -2215,7 +2306,7 @@ test_release_aggregate_upload_scenario() (
         jq -r '.artifacts[] | .sha256 + "  " + .name' "$manifest" > "$directory/$name" || return 1
         [[ "$name" == SHA256SUMS ]] || mv "$directory/$name" "$fixture/retained-$name" || return 1
       done ;;
-    metadata-renamed) upload_name=other-checksums.txt; expected_status=4; expected_posts=0 ;;
+    metadata-renamed) upload_name='other-checksums.txt'; expected_status=4; expected_posts=0 ;;
     payload-renamed) file="$directory/app"; expected_status=4; expected_posts=0 ;;
     unknown-name)
       file="$directory/$aggregate.extra" upload_name="$aggregate.extra"
@@ -2869,6 +2960,13 @@ main() {
   echo "=== github.sh Tests ==="
   echo ""
 
+  if [[ "${1:-}" == --cache-identity-only ]]; then
+    run_cache_identity_regressions
+    printf 'Cache identity: %s passed, %s failed\n' "$TESTS_PASSED" "$TESTS_FAILED"
+    [[ "$TESTS_FAILED" -eq 0 ]]
+    exit $?
+  fi
+
   if [[ "${1:-}" == --release-notes-only ]]; then
     run_release_notes_regressions
     printf 'Release notes: %s passed, %s failed\n' "$TESTS_PASSED" "$TESTS_FAILED"
@@ -2947,6 +3045,7 @@ main() {
   run_test "get_cache_ttl_respected" test_get_cache_ttl_respected
   run_test "get_etag_returns_stored" test_get_etag_returns_stored
   run_test "get_etag_missing_returns_empty" test_get_etag_missing_returns_empty
+  run_cache_identity_regressions
 
   echo ""
   echo "Rate Limit Detection:"

@@ -124,7 +124,7 @@ secrets_mask() {
 # Get GitHub token with precedence
 # Usage: secrets_get_gh_token
 # Returns: Token value (to stdout), never logged
-# Exit: 0 if found, 3 if not found
+# Exit: 0 if found, 3 if not found, explicit credential-helper cancellation otherwise
 secrets_get_gh_token() {
     local token=""
 
@@ -142,7 +142,12 @@ secrets_get_gh_token() {
         _sec_log_info "Using GitHub token from GH_TOKEN"
     # 4. Public-GitHub stored credentials, independent of an ambient GH_HOST.
     elif command -v gh &>/dev/null; then
-        if token=$(GH_HOST=github.com gh auth token --hostname github.com 2>/dev/null) && [[ -n "$token" ]]; then
+        local auth_status=0
+        token=$(GH_HOST=github.com gh auth token --hostname github.com 2>/dev/null) || auth_status=$?
+        case "$auth_status" in
+            2|129|130|131|143) return "$auth_status" ;;
+        esac
+        if [[ $auth_status -eq 0 && -n "$token" ]]; then
             _sec_log_info "Using GitHub token from gh auth"
         else
             token=""
@@ -167,9 +172,14 @@ secrets_get_gh_token() {
 # Usage: secrets_run_gh <gh arguments...>
 secrets_run_gh() (
     set +x
-    local token
+    local token resolve_status=0
     command -v gh >/dev/null 2>&1 || return 3
-    token=$(secrets_get_gh_token 2>/dev/null) || return 3
+    token=$(secrets_get_gh_token 2>/dev/null) || resolve_status=$?
+    case "$resolve_status" in
+        0) ;;
+        2|129|130|131|143) return "$resolve_status" ;;
+        *) return 3 ;;
+    esac
     [[ -n "$token" ]] || return 3
     GH_HOST=github.com GH_TOKEN="$token" gh "$@"
 )

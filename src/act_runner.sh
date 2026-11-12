@@ -3223,11 +3223,11 @@ act_run_workflow() {
         XDG_CACHE_HOME="$isolated_home/.cache" \
         _act_run_with_timeout "$ACT_TIMEOUT" "${act_cmd[@]}" \
             --directory "$repo_path" \
-            2>&1 | tee -a "$log_file"
+            2>&1 | tee -a "$log_file" >&2
     else
         _act_run_with_timeout "$ACT_TIMEOUT" "${act_cmd[@]}" \
             --directory "$repo_path" \
-            2>&1 | tee -a "$log_file"
+            2>&1 | tee -a "$log_file" >&2
     fi
     local exit_code=${PIPESTATUS[0]}
     local source_valid=true
@@ -3282,7 +3282,7 @@ act_run_workflow() {
             artifact_dir: $artifact_dir,
             artifact_count: $artifact_count,
             log_file: $log_file
-        } + (if $source_layout == null then {} else {source_layout:$source_layout} end)'
+        } + (if $source_layout == null then {} else {source_layout:$source_layout} end)' || return 4
 
     return "$exit_code"
 }
@@ -7712,7 +7712,7 @@ _act_windows_strict_go_build_script() {
     local source_root="$5" stage_root="$6" build_cmd="$7" build_env="$8"
     local path dependencies sources entry name checkout sha archive manifest manifest_dir
     local archive_digest manifest_digest object_count records='[]' total_objects=1
-    local records_b64 command_b64 environment_b64 ambient_names_b64 budget_script
+    local records_b64 command_b64 environment_b64 ambient_names_b64 pkg_config_regex budget_script
     source_root="${source_root//\\//}" stage_root="${stage_root//\\//}"
     if [[ "$source_root" =~ ^/([A-Za-z])/(.*)$ ]]; then
         source_root="${BASH_REMATCH[1]}:/${BASH_REMATCH[2]}"
@@ -7767,6 +7767,7 @@ _act_windows_strict_go_build_script() {
         else error("invalid Go build environment") end' | base64 | tr -d '\r\n') || return 4
     ambient_names_b64=$(_act_go_ambient_env_names | jq -Rsc 'split("\n") | map(select(length > 0))' | \
         base64 | tr -d '\r\n') || return 4
+    pkg_config_regex=$(_act_go_pkg_config_env_regex)
     budget_script=$(_act_windows_source_budget_script "$host" "${source_root%/*}" \
         0 "$total_objects" expansion) || return 4
     _act_windows_source_runtime_script || return 4
@@ -7821,7 +7822,12 @@ try {
     \$psi.WorkingDirectory=\$dsrStageSource
     \$psi.FileName=\$env:ComSpec
     \$ambientNames=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$ambient_names_b64')) | ConvertFrom-Json
-    foreach (\$name in \$ambientNames) { \$psi.EnvironmentVariables.Remove(\$name) }
+    \$ambientKeys=@(\$psi.EnvironmentVariables.Keys)
+    foreach (\$name in \$ambientKeys) {
+        if (\$ambientNames -icontains \$name -or \$name -match '$pkg_config_regex') {
+            \$psi.EnvironmentVariables.Remove(\$name)
+        }
+    }
     \$environment=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$environment_b64')) | ConvertFrom-Json
     foreach (\$pair in \$environment) { \$psi.EnvironmentVariables[\$pair.name]=\$pair.value }
     \$command=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$command_b64'))
@@ -9531,12 +9537,22 @@ act_sync_sources() {
     fi
 
     if $strict_release; then
-        local strict_target
+        local strict_target strict_language strict_go_env strict_go_workfile
+        strict_language=$(yq -r '.language // ""' "$config_file") || return 4
         for strict_target in $targets; do
             if act_platform_uses_act "$tool_name" "$strict_target"; then
                 _log_error "Strict release target $strict_target cannot use act"
                 echo '{"status":"error","error":"Strict release targets must use native builds"}'
                 return 4
+            fi
+            if [[ "$strict_language" == go ]]; then
+                strict_go_env=$(act_get_build_env "$tool_name" "$strict_target") || return 4
+                strict_go_workfile=$(act_get_build_env_value "$strict_go_env" GOWORK) || strict_go_workfile=''
+                if ! _act_strict_go_workfile_json "$tool_name" "$strict_git_sha" \
+                    "$strict_go_workfile" '/.dsr-go-source-admission/source' >/dev/null; then
+                    echo '{"status":"error","error":"Strict Go source paths leave the pinned source graph"}'
+                    return 4
+                fi
             fi
         done
     fi
@@ -10416,7 +10432,8 @@ _act_windows_rust_sdk_env_cleanup() {
 
 # Strict Go workers inherit caches and download policy, but never compiler or
 # source selectors from a login shell or the persistent `go env -w` file.
-# Both native launchers use this list before applying the reviewed recipe.
+# Both native launchers use this list and the pkg-config family below before
+# applying the reviewed recipe.
 _act_go_ambient_env_names() {
     printf '%s\n' GOOS GOARCH GOENV GOFLAGS GOWORK GOTOOLCHAIN GO111MODULE GOROOT \
         GOEXPERIMENT GODEBUG GOCACHEPROG GO_EXTLINK_ENABLED GOFIPS140 GCCGO GOAMD64 GOARM GOARM64 \
@@ -10427,17 +10444,25 @@ _act_go_ambient_env_names() {
         CGO_FFLAGS_DISALLOW CGO_LDFLAGS_ALLOW CGO_LDFLAGS_DISALLOW CC CXX FC AR PKG_CONFIG
 }
 
+# cgo invokes the selected pkg-config program with the inherited environment.
+# Govern the complete selector family, including extensions, so package search
+# paths, sysroots and flag filtering cannot escape through an unlisted name.
+_act_go_pkg_config_env_regex() {
+    printf '%s\n' '^PKG_CONFIG($|_)'
+}
+
 _act_go_build_influence_json() {
-    local environment="$1" pair name selected=''
+    local environment="$1" pair name selected='' pkg_config_regex
     local names=$'\n'
     names+="$(_act_go_ambient_env_names)"$'\n'
+    pkg_config_regex=$(_act_go_pkg_config_env_regex)
     while IFS= read -r pair; do
         [[ -n "$pair" && "$pair" == *=* ]] || continue
         name="${pair%%=*}"
         case "$name" in
             DSR_GO_ENV_POLICY|DSR_GO_WORKFILE|DSR_GO_WORKFILE_SHA256|DSR_GO_WORKFILE_GIT_SHA|\
             DSR_RELEASE_GIT_SHA|DSR_RELEASE_GIT_REF|DSR_TARGET_OS|DSR_TARGET_ARCH|DSR_TARGET_PLATFORM) ;;
-            *) [[ "$names" == *$'\n'"$name"$'\n'* ]] || continue ;;
+            *) [[ "$names" == *$'\n'"$name"$'\n'* || "$name" =~ $pkg_config_regex ]] || continue ;;
         esac
         selected+="$pair"$'\n'
     done <<< "$environment"
@@ -10468,12 +10493,201 @@ import re
 import subprocess
 import sys
 
+def go_string(token):
+    # Go module strings use strconv.Unquote, not shell or JSON quoting. Decode
+    # the permitted escapes before checking paths, including octal/hex escapes
+    # that could otherwise hide an absolute path or parent traversal.
+    if not token.startswith('"'):
+        if any(character in token for character in '\"\'`'):
+            raise ValueError('unsupported quoted Go module string')
+        return token
+    if len(token) < 2 or not token.endswith('"'):
+        raise ValueError('unterminated Go module string')
+    value = bytearray()
+    index = 1
+    escapes = {'a': 7, 'b': 8, 'f': 12, 'n': 10, 'r': 13, 't': 9, 'v': 11, '\\': 92, '"': 34}
+    while index < len(token) - 1:
+        character = token[index]
+        index += 1
+        if character != '\\':
+            value.extend(character.encode('utf-8'))
+            continue
+        if index >= len(token) - 1:
+            raise ValueError('incomplete Go module escape')
+        character = token[index]
+        index += 1
+        if character in escapes:
+            value.append(escapes[character])
+            continue
+        if character in '01234567':
+            digits = character + token[index:index + 2]
+            if len(digits) != 3 or any(digit not in '01234567' for digit in digits):
+                raise ValueError('invalid Go module octal escape')
+            number = int(digits, 8)
+            if number > 255:
+                raise ValueError('invalid Go module byte escape')
+            value.append(number)
+            index += 2
+            continue
+        length = {'x': 2, 'u': 4, 'U': 8}.get(character)
+        if length is None:
+            raise ValueError('invalid Go module escape')
+        digits = token[index:index + length]
+        if len(digits) != length or not re.fullmatch('[0-9a-fA-F]+', digits):
+            raise ValueError('invalid Go module hexadecimal escape')
+        number = int(digits, 16)
+        if character == 'x':
+            value.append(number)
+        else:
+            if number > 0x10ffff or 0xd800 <= number <= 0xdfff:
+                raise ValueError('invalid Go module Unicode escape')
+            value.extend(chr(number).encode('utf-8'))
+        index += length
+    return value.decode('utf-8')
+
+def go_directives(contents):
+    # Only use/replace select local source. This is a fail-closed lexical
+    # boundary, not a replacement for Go's complete module/version parser.
+    # Match its line/block syntax and // comments; never regex-match paths in
+    # raw text where quoted escapes or comments can change their meaning.
+    block = None
+    for line in contents.decode('utf-8').splitlines():
+        tokens = []
+        index = 0
+        while index < len(line):
+            character = line[index]
+            if character in ' \t\r':
+                index += 1
+                continue
+            if line.startswith('//', index):
+                break
+            if line.startswith('/*', index):
+                raise ValueError('Go module files require // comments')
+            start = index
+            if character in '"`':
+                index += 1
+                while index < len(line):
+                    if line[index] == character:
+                        index += 1
+                        break
+                    if line[index] == '\\' and character == '"':
+                        index += 1
+                    index += 1
+                else:
+                    raise ValueError('unterminated Go module string')
+            elif character in '()[]{},':
+                index += 1
+            else:
+                while index < len(line) and line[index] not in ' \t\r()[]{},':
+                    if line.startswith('//', index):
+                        break
+                    if line.startswith('/*', index) or not line[index].isprintable():
+                        raise ValueError('unsupported Go module token')
+                    index += 1
+            tokens.append(line[start:index])
+        if not tokens:
+            continue
+        if block is not None:
+            if tokens == [')']:
+                block = None
+                continue
+            if '(' in tokens or ')' in tokens:
+                raise ValueError('invalid Go module block')
+            directive, arguments = block, tokens
+        elif len(tokens) == 2 and tokens[1] == '(':
+            block = tokens[0]
+            continue
+        elif len(tokens) == 3 and tokens[1:] == ['(', ')']:
+            continue
+        else:
+            directive, arguments = tokens[0], tokens[1:]
+        if directive == 'use':
+            if len(arguments) != 1:
+                raise ValueError('invalid Go workspace use directive')
+            yield 'use', go_string(arguments[0])
+        elif directive == 'replace':
+            arrow = 1 if len(arguments) >= 2 and arguments[1] == '=>' else 2
+            if len(arguments) not in (arrow + 2, arrow + 3) or arguments[arrow] != '=>':
+                raise ValueError('invalid Go replacement directive')
+            if len(arguments) == arrow + 2:
+                yield 'replace', go_string(arguments[arrow + 1])
+    if block is not None:
+        raise ValueError('unterminated Go module block')
+
 try:
     selected, stage_source, encoded = sys.argv[1:]
     sources = json.loads(encoded)
     roots = {row['relative_path']: row for row in sources}
     if len(roots) != len(sources) or 'source' not in roots:
         raise ValueError('invalid admitted Go source graph')
+    environment = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+    environment.update(GIT_NO_REPLACE_OBJECTS='1', GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
+    inventory = {}
+    directories = set(roots)
+    pending = [(name, row['local_path'], row['git_sha'], 0) for name, row in roots.items()]
+    while pending:
+        prefix, checkout, revision, depth = pending.pop()
+        if depth > 16 or not re.fullmatch('[0-9a-f]{40}', revision):
+            raise ValueError('invalid pinned Go submodule graph')
+        tree = subprocess.check_output(['git', '-C', checkout, 'ls-tree', '-r', '-t', '-z', revision],
+                                       env=environment)
+        for record in tree.split(b'\0'):
+            if not record:
+                continue
+            metadata, path = record.split(b'\t', 1)
+            mode, kind, oid = metadata.decode('ascii').split(' ')
+            relative = path.decode('utf-8')
+            graph_path = prefix + '/' + relative
+            if graph_path in inventory:
+                raise ValueError('duplicate pinned Go source path')
+            inventory[graph_path] = (mode, kind, oid, checkout)
+            if kind == 'tree':
+                directories.add(graph_path)
+            elif mode == '160000' and kind == 'commit':
+                directories.add(graph_path)
+                pending.append((graph_path, os.path.join(checkout, relative), oid, depth + 1))
+
+    def committed_contents(path):
+        mode, kind, oid, checkout = inventory.get(path, ('', '', '', ''))
+        if mode not in ('100644', '100755') or kind != 'blob':
+            raise ValueError('local Go module requires a committed regular file: ' + path)
+        return subprocess.check_output(['git', '-C', checkout, 'cat-file', 'blob', oid], env=environment)
+
+    def local_module(manifest, reference):
+        if (not reference or reference.startswith('/') or '\\' in reference or ':' in reference or
+                any(ord(character) < 32 or ord(character) == 127 for character in reference)):
+            raise ValueError('local Go path must be portable and relative: ' + manifest)
+        components = manifest.split('/')[:-1]
+        for component in reference.split('/'):
+            if component in ('', '.'):
+                continue
+            if component == '..':
+                if not components:
+                    raise ValueError('local Go path escapes the pinned source graph: ' + manifest)
+                components.pop()
+            else:
+                if component.lower() == '.git':
+                    raise ValueError('local Go path enters Git metadata: ' + manifest)
+                components.append(component)
+                if '/'.join(components) not in directories:
+                    raise ValueError('local Go path is unpinned, missing or linked: ' + manifest)
+        target = '/'.join(components)
+        if not target or target.split('/')[0] not in roots:
+            raise ValueError('local Go path escapes the pinned source graph: ' + manifest)
+        committed_contents(target + '/go.mod')
+
+    def validate_paths(manifest, contents, work=False):
+        for directive, reference in go_directives(contents):
+            if directive == 'use' and not work:
+                raise ValueError('use directive is not valid in a Go module')
+            local_module(manifest, reference)
+
+    # Every committed module can be selected by a reviewed build command.
+    # Inspect its local replacements, including nested modules and pinned
+    # submodules. Ordinary downloaded module-cache authentication is separate.
+    for path in inventory:
+        if path.endswith('/go.mod'):
+            validate_paths(path, committed_contents(path))
     if any(ord(character) < 32 for character in selected) or '\\' in selected:
         raise ValueError('GOWORK must be a literal portable path inside an admitted source root')
     if selected == 'off':
@@ -10503,8 +10717,6 @@ try:
         raise ValueError('invalid pinned Go workfile identity')
     # Query the admitted checkout itself, never GIT_DIR/GIT_WORK_TREE or
     # object/config overrides inherited from the coordinator's shell.
-    environment = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
-    environment.update(GIT_NO_REPLACE_OBJECTS='1', GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
     command = ['git', '--literal-pathspecs', '-C', row['local_path']]
     entry = subprocess.check_output(command + ['ls-tree', '-z', revision, '--', relative], env=environment)
     if not entry and optional:
@@ -10518,6 +10730,7 @@ try:
     if mode not in (b'100644', b'100755') or kind != b'blob' or filename.decode('utf-8') != relative:
         raise ValueError('GOWORK must select a committed regular file without linked ancestors')
     contents = subprocess.check_output(command + ['cat-file', 'blob', oid.decode('ascii')], env=environment)
+    validate_paths(name + '/' + relative, contents, work=True)
     stage_source = stage_source.replace('\\', '/').rstrip('/')
     if not stage_source.endswith('/source') or not (stage_source.startswith('/') or re.match(r'^[A-Za-z]:/', stage_source)):
         raise ValueError('invalid private Go source stage')
@@ -10526,24 +10739,28 @@ try:
     print(json.dumps(dict(gowork=actual, path=graph_path,
                          sha256=hashlib.sha256(contents).hexdigest(), git_sha=revision)))
 except (KeyError, TypeError, ValueError, OSError, subprocess.CalledProcessError) as error:
-    print('[act] Strict Go workfile policy: ' + str(error), file=sys.stderr)
+    print('[act] Strict Go source paths and workfile policy: ' + str(error), file=sys.stderr)
     raise SystemExit(4)
 PY
 }
 
 _act_strict_go_build_env() {
     local tool="$1" sha="$2" ref="$3" stage_source="$4" environment="$5"
-    local pair name value workfile selected='' result=$'GOENV=off\nGOFLAGS=\nGOTOOLCHAIN=local\nGO111MODULE=on'
-    local governed=$'\n'
+    local pair name value workfile normalized pkg_config_regex selected=''
+    local result=$'GOENV=off\nGOFLAGS=\nGOTOOLCHAIN=local\nGO111MODULE=on' governed=$'\n'
     governed+="$(_act_go_ambient_env_names)"$'\n'
+    pkg_config_regex=$(_act_go_pkg_config_env_regex)
     [[ "$sha" =~ ^[0-9a-f]{40}$ && "$sha" != 0000000000000000000000000000000000000000 && -n "$ref" ]] || return 4
     while IFS= read -r pair; do
         [[ -n "$pair" ]] || continue
         [[ "$pair" == *=* ]] || return 4
         name="${pair%%=*}"; value="${pair#*=}"
-        if [[ "$name" != "${name^^}" && "$governed" == *$'\n'"${name^^}"$'\n'* ]]; then
-            _log_error "Strict Go compiler selectors must use their portable uppercase name: $name"
-            return 4
+        normalized="${name^^}"
+        if [[ "$governed" == *$'\n'"$normalized"$'\n'* || "$normalized" =~ $pkg_config_regex ]]; then
+            if [[ "$name" != "$normalized" || ! "$name" =~ ^[A-Z_][A-Z0-9_]*$ ]]; then
+                _log_error "Strict Go compiler selectors must use a portable uppercase identifier: $name"
+                return 4
+            fi
         fi
         case "$name" in
             GOENV)
@@ -10560,7 +10777,7 @@ _act_strict_go_build_env() {
     done <<< "$environment"
     workfile=$(_act_strict_go_workfile_json "$tool" "$sha" "$selected" "$stage_source") || return 4
     result+=$'\n'"GOWORK=$(jq -r '.gowork' <<< "$workfile")"
-    result+=$'\n'"DSR_GO_ENV_POLICY=1"
+    result+=$'\n'"DSR_GO_ENV_POLICY=2"
     result+=$'\n'"DSR_GO_WORKFILE=$(jq -r '.path' <<< "$workfile")"
     result+=$'\n'"DSR_GO_WORKFILE_SHA256=$(jq -r '.sha256' <<< "$workfile")"
     result+=$'\n'"DSR_GO_WORKFILE_GIT_SHA=$(jq -r '.git_sha' <<< "$workfile")"
@@ -10582,8 +10799,8 @@ _act_validate_strict_go_result() {
     if ! actual=$(jq -ce --arg platform "$platform" '
         select(.method=="native" and (.platform // .target)==$platform) |
         .build_influence_env | select(type=="object" and all(.[];type=="string") and
-            .DSR_GO_ENV_POLICY=="1" and .GOENV=="off")' <<< "$result"); then
-        _log_error 'Strict native Go output lacks its compiler environment policy receipt; start a fresh release build'
+            .DSR_GO_ENV_POLICY=="2" and .GOENV=="off")' <<< "$result"); then
+        _log_error 'Strict native Go output lacks the current compiler environment policy receipt (DSR_GO_ENV_POLICY=2); start a fresh release build'
         return 4
     fi
     workfile=$(jq -er '.DSR_GO_WORKFILE | strings' <<< "$actual") || return 4
@@ -14045,6 +14262,12 @@ EOF
             # environment. Reject those unsupported export identifiers before
             # a higher-priority target SDK selector can escape isolation.
             env_exports+="for sdk_variable in \$(env | sed 's/=.*//' | grep -Ei '${sdk_regex}' || true); do if ! printf '%s\\n' \"\$sdk_variable\" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*$'; then printf '[dsr] SDK environment name cannot be isolated by this shell: %s; clear it on the build host and configure an underscore-spelled selector in DSR\\n' \"\$sdk_variable\" >&2; exit 4; fi; unset \"\$sdk_variable\"; done; "
+        elif [[ "$language" == go ]] && $strict_native_build; then
+            local pkg_config_regex
+            pkg_config_regex=$(_act_go_pkg_config_env_regex)
+            # Inspect the worker's environment, including selectors added by a
+            # login shell. Invalid export names cannot be removed by unset.
+            env_exports+="while IFS= read -r dsr_go_env_entry; do pkg_config_variable=\${dsr_go_env_entry%%=*}; if test \"\$dsr_go_env_entry\" = \"\$pkg_config_variable\" || ! printf '%s\\n' \"\$pkg_config_variable\" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*$'; then printf '[dsr] Go pkg-config environment name cannot be isolated by this shell: %s; clear it on the build host and configure a portable uppercase selector in DSR\\n' \"\$pkg_config_variable\" >&2; exit 4; fi; unset \"\$pkg_config_variable\"; done < <(env | grep -Ei '${pkg_config_regex}' || true); "
         fi
         for env_name in "${cargo_env_to_unset[@]}"; do
             env_exports+="unset $env_name; "
@@ -15751,8 +15974,10 @@ _act_repo_config_matches() {
     fi
 }
 
-# Execute exactly one target and emit one compact JSON result as the final
-# stdout line. Diagnostic/build output is retained on stderr by the worker.
+# Execute exactly one target and emit exactly one compact JSON result on
+# stdout. Diagnostic/build output remains on stderr all the way to the worker.
+# Neither a compiler log line nor a partial/multiple result stream can replace
+# a missing backend receipt.
 _act_build_orchestration_target() {
     local tool_name="$1"
     local version="$2"
@@ -15840,14 +16065,17 @@ _act_build_orchestration_target() {
         fi
         full_output=$(act_run_workflow \
             "$local_path" "$workflow" "$job" "push" "$version" \
-            "${act_args[@]}" 2>&1) || exit_code=$?
-        [[ -n "$full_output" ]] && printf '%s\n' "$full_output" >&2
-        result=$(printf '%s\n' "$full_output" | grep '^{.*}$' | tail -1)
-        if [[ -z "$result" ]] || ! jq -e '.' <<< "$result" &>/dev/null; then
-            local fallback_status="failed"
-            [[ "$exit_code" -eq 0 ]] && fallback_status="success"
-            result=$(jq -nc --arg status "$fallback_status" --argjson exit_code "$exit_code" \
-                '{status: $status, exit_code: $exit_code}')
+            "${act_args[@]}") || exit_code=$?
+        if ! result=$(jq -cse '
+                if length == 1 and (.[0] | type == "object") then .[0]
+                else error("exactly one backend result object required") end
+            ' <<< "$full_output" 2>/dev/null); then
+            [[ -z "$full_output" ]] || printf '%s\n' "$full_output" >&2
+            _log_error "Workflow backend did not emit exactly one JSON result object"
+            [[ "$exit_code" -ne 0 ]] || exit_code=4
+            result=$(jq -nc --argjson exit_code "$exit_code" \
+                '{status:"failed",exit_code:$exit_code,stage:"backend_receipt",
+                  error:"Workflow backend did not emit exactly one JSON result object"}') || return 4
         fi
         result=$(jq -c --arg target "$target" --arg method "act" --arg host "$host" \
             '. + {platform: $target, method: $method, host: $host}' <<< "$result")
@@ -15886,16 +16114,19 @@ _act_build_orchestration_target() {
         _log_info "Method: native (host=$host)"
         full_output=$(act_run_native_build \
             "$tool_name" "$target" "$version" "$run_id" "$remote_path_override" \
-            "$release_git_sha" "$release_git_ref" "$host" "$selected_triple" "$ordinary_source_root" 2>&1) || exit_code=$?
-        [[ -n "$full_output" ]] && printf '%s\n' "$full_output" >&2
-        result=$(printf '%s\n' "$full_output" | grep '^{' | tail -1)
-        if [[ -z "$result" ]] || ! jq -e '.' <<< "$result" &>/dev/null; then
-            local fallback_status="failed"
-            [[ "$exit_code" -eq 0 ]] && fallback_status="success"
-            result=$(jq -nc --arg status "$fallback_status" --argjson exit_code "$exit_code" \
+            "$release_git_sha" "$release_git_ref" "$host" "$selected_triple" "$ordinary_source_root") || exit_code=$?
+        if ! result=$(jq -cse '
+                if length == 1 and (.[0] | type == "object") then .[0]
+                else error("exactly one backend result object required") end
+            ' <<< "$full_output" 2>/dev/null); then
+            [[ -z "$full_output" ]] || printf '%s\n' "$full_output" >&2
+            _log_error "Native backend did not emit exactly one JSON result object"
+            [[ "$exit_code" -ne 0 ]] || exit_code=4
+            result=$(jq -nc --argjson exit_code "$exit_code" \
                 --arg platform "$target" --arg method "native" --arg host "$host" \
-                '{status: $status, exit_code: $exit_code, platform: $platform,
-                  method: $method, host: $host}')
+                '{status:"failed",exit_code:$exit_code,platform:$platform,
+                  method:$method,host:$host,stage:"backend_receipt",
+                  error:"Native backend did not emit exactly one JSON result object"}') || return 4
         fi
     fi
 
@@ -16068,6 +16299,26 @@ _act_run_target_group() {
     return 4
 }
 
+# Capture stdout independently from diagnostics before the owned group starts
+# the orchestration backend. The file is private and exclusive; retained output
+# is never truncated, and a FIFO/link/directory is refused before opening it.
+_act_capture_target_result() (
+    local output="$1" incoming_umask incoming_noclobber=false
+    shift
+    if [[ -e "$output" || -L "$output" ]]; then
+        _log_error "Target result capture already exists: $output"
+        return 4
+    fi
+    incoming_umask=$(umask) || return 4
+    [[ $- != *C* ]] || incoming_noclobber=true
+    umask 077
+    set -o noclobber
+    exec > "$output" || return 4
+    umask "$incoming_umask" || return 4
+    $incoming_noclobber || set +o noclobber
+    "$@"
+)
+
 # Worker wrapper: reserve host capacity and write immutable attempt receipts.
 _act_run_target_worker() {
     local tool_name="$1" version="$2" run_id="$3" target="$4"
@@ -16082,6 +16333,7 @@ _act_run_target_worker() {
     local source_sync_receipt="${17:-}"
     local workflow_source_plan="${18:-null}"
     local expected_repo_config_sha256="${19:-}"
+    local worker_output_path="${result_path}.stdout"
     [[ -n "$source_sync_receipt" ]] || source_sync_receipt=null
 
     local host="${bound_host:-act-local}"
@@ -16127,6 +16379,13 @@ _act_run_target_worker() {
             printf '%s\n' "$body" > "$result_path"
         )
     }
+
+    if [[ -e "$worker_output_path" || -L "$worker_output_path" ]]; then
+        _act_write_worker_result "$(jq -nc --arg target "$target" --arg host "$host" \
+            '{platform:$target,host:$host,status:"failed",exit_code:4,
+              error:"Target result capture already exists or is unavailable"}')" || return 4
+        return 4
+    fi
 
     if [[ "$strict_release_contract" == "true" ]] && \
        { [[ -z "$bound_host" ]] || ! jq -e --arg host "$bound_host" \
@@ -16267,7 +16526,8 @@ _act_run_target_worker() {
     # recover retry budget after it has actually run.
     backend_started=true
     coproc _ACT_TARGET_GROUP {
-        _act_run_target_group "$log_path" _act_build_orchestration_target \
+        _act_run_target_group "$log_path" _act_capture_target_result "$worker_output_path" \
+            _act_build_orchestration_target \
             "$tool_name" "$version" "$run_id" "$target" \
             "$strict_release_contract" "$release_contract_json" "$source_roots_json" \
             "$release_git_sha" "$release_git_ref" "$host" "$selected_triple" "$workflow_source_plan" \
@@ -16293,18 +16553,25 @@ _act_run_target_worker() {
         [[ "$worker_status" -ne 0 ]] || worker_status=6
     fi
 
-    result=$(grep '^{.*}$' "$log_path" | tail -1)
-    if [[ -z "$result" ]] || ! jq -e '.' <<< "$result" &>/dev/null; then
-        [[ "$worker_status" -ne 0 ]] || worker_status=6
+    # Retain the raw stream for diagnostics, but never read attempt.log as
+    # authority: it contains compiler text and can contain arbitrary JSON.
+    if [[ -f "$worker_output_path" && ! -L "$worker_output_path" ]]; then
+        cat -- "$worker_output_path" >> "$log_path" || true
+    fi
+    if [[ ! -f "$worker_output_path" || -L "$worker_output_path" ]] ||
+       ! result=$(jq -cse '
+            if length == 1 and (.[0] | type == "object") then .[0]
+            else error("exactly one worker result object required") end
+        ' "$worker_output_path" 2>/dev/null); then
+        [[ "$worker_status" -ne 0 ]] || worker_status=4
         result=$(jq -nc --arg target "$target" --arg host "$host" \
             --argjson exit_code "$worker_status" \
             '{platform: $target, host: $host, status: "failed",
               exit_code: $exit_code, error: "Worker produced no valid result"}')
     fi
     result_status=$(jq -r '.status // "unknown"' <<< "$result")
-    # The log can contain backend success before the orchestration child has
-    # finished normalization and strict staging. Its observed exit must agree
-    # before those artifact paths become an immutable, reusable success.
+    # The observed exit must still agree with the isolated result before its
+    # artifact paths become an immutable, reusable success.
     if [[ "$worker_status" -ne 0 ]] &&
        [[ "$result_status" == success || "$result_status" == ok || "$result_status" == passed ]]; then
         result_status=failed
@@ -19820,7 +20087,7 @@ export -f act_list_tools act_build_matrix
 export -f act_get_build_cmd act_substitute_build_cmd_tokens act_get_build_env act_get_repo act_get_local_path
 export -f _act_materialized_source_path
 export -f act_get_build_env_value act_get_remote_artifact_path
-export -f _act_go_ambient_env_names _act_go_build_influence_json
+export -f _act_go_ambient_env_names _act_go_pkg_config_env_regex _act_go_build_influence_json
 export -f _act_strict_go_workfile_json _act_strict_go_build_env _act_validate_strict_go_result
 export -f act_run_native_build act_orchestrate_build act_generate_manifest
 export -f _act_result_artifact_receipts _act_target_result_available
