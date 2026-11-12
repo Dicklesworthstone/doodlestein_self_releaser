@@ -5176,8 +5176,12 @@ _act_windows_stage_build_script() {
     setup="\$ErrorActionPreference='Stop'; \$parent=Get-Item -LiteralPath '$remote_parent_q' -Force; if (-not \$parent.PSIsContainer -or ((\$parent.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Launcher parent is not a plain directory' }; if (Test-Path -LiteralPath '$remote_dir_q') { throw 'Launcher destination already exists' }; New-Item -ItemType Directory -Path '$remote_dir_q' | Out-Null; \$acl=Get-Acl -LiteralPath '$remote_dir_q'; \$acl.SetAccessRuleProtection(\$true,\$false); \$user=[Security.Principal.WindowsIdentity]::GetCurrent().User; \$rule=[Security.AccessControl.FileSystemAccessRule]::new(\$user,'FullControl','ContainerInherit,ObjectInherit','None','Allow'); \$acl.AddAccessRule(\$rule); Set-Acl -LiteralPath '$remote_dir_q' -AclObject \$acl"
     setup+="; \$system=[Security.Principal.SecurityIdentifier]::new('S-1-5-18'); \$systemRule=[Security.AccessControl.FileSystemAccessRule]::new(\$system,'FullControl','ContainerInherit,ObjectInherit','None','Allow'); \$acl.AddAccessRule(\$systemRule); Set-Acl -LiteralPath '$remote_dir_q' -AclObject \$acl"
     _act_ssh_exec "$host" "$(_act_windows_encoded_powershell "$setup" pwsh)" 60 >&2 || return 4
-    scp -q -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
-        -o StrictHostKeyChecking=accept-new "$local_script" "$destination:$remote_script" >&2 || return 4
+    # Upload precedes the remote build deadline. Bound the whole transfer and
+    # its descendants with the source-sync budget, including after connection.
+    _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" scp -q \
+        -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
+        -o StrictHostKeyChecking=accept-new "$local_script" "$destination:$remote_script" \
+        </dev/null >&2 || return 4
     # A normal custom scan retains Defender policy; no exclusion, policy
     # bypass, or restoration of quarantined content is permitted here.
     guard="\$ErrorActionPreference='Stop'; \$item=Get-Item -LiteralPath '$remote_script_q' -Force; if (\$item.PSIsContainer -or ((\$item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Launcher is not a plain file' }; \$scanner=Join-Path \$env:ProgramFiles 'Windows Defender/MpCmdRun.exe'; if (Test-Path -LiteralPath \$scanner) { & \$scanner -Scan -ScanType 3 -File \$item.FullName | ForEach-Object { [Console]::Error.WriteLine(\$_) }; if (\$LASTEXITCODE -ne 0) { throw 'Launcher security scan failed' } }; \$held=[IO.File]::Open('$remote_script_q',[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read); try { \$actual=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(\$held)); if (\$actual -ne '$digest') { throw 'Launcher digest mismatch' }; & '$remote_script_q'; exit \$LASTEXITCODE } finally { \$held.Dispose() }"

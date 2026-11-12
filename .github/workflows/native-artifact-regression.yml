@@ -172,6 +172,8 @@ jobs:
           bash scripts/tests/test_build_state.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/build-state.log"
           bash scripts/tests/test_act_orchestration.sh --coordinator-custody-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/coordinator-custody.log"
           bash scripts/tests/test_act_runner.sh --timeout-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/timeout-ownership.log"
+          timeout 120 bash scripts/tests/test_act_runner_native.sh --windows-launcher-transfer-only \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/windows-launcher-transfer.log"
           test -z "$(git status --porcelain)"
       - name: Build strict Go releases from pinned sibling snapshots
         if: runner.os == 'Linux'

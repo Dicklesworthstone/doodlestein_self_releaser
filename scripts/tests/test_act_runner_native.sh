@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_act_runner_native.sh - Unit tests for act_runner.sh native build SSH logic
 #
-# Usage: ./test_act_runner_native.sh [--typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --workspace-archives-only | --failure-evidence-only | --env-precedence-only | --archive-delivery-only | --zig-dispatch-only | --glibc-routing-only]
+# Usage: ./test_act_runner_native.sh [--typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --workspace-archives-only | --failure-evidence-only | --env-precedence-only | --archive-delivery-only | --zig-dispatch-only | --glibc-routing-only | --windows-launcher-transfer-only]
 #
 # Tests native build SSH command construction with mocks.
 # Covers: command construction, path handling, env vars, SCP, error handling.
@@ -11,6 +11,241 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SRC_DIR="$PROJECT_ROOT/src"
+
+# Exercise the actual strict metadata and native build callers, generated
+# Windows payloads, external SCP process and owned deadline supervisor. Only
+# host readiness and the network endpoints are controlled; this does not
+# execute the retained PowerShell payload or qualify a native Windows host.
+test_windows_launcher_transfer_deadline() {
+    local dependency
+    for dependency in bash python3 jq yq git gzip iconv base64 ps; do
+        command -v "$dependency" >/dev/null || { printf 'Missing test dependency: %s\n' "$dependency" >&2; return 3; }
+    done
+    python3 -I - "$PROJECT_ROOT" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+root = Path(sys.argv[1])
+module = Path(os.environ.get('DSR_TEST_ACT_RUNNER', str(root / 'src/act_runner.sh'))).resolve()
+work = Path(tempfile.mkdtemp(prefix='dsr-windows-launcher-transfer-'))
+print('Retained Windows launcher transfer evidence: ' + str(work), flush=True)
+checks = failures = 0
+
+
+def check(label, condition):
+    global checks, failures
+    checks += 1
+    failures += not condition
+    print(('PASS: ' if condition else 'FAIL: ') + label, flush=True)
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    if Path('/proc/self/stat').is_file():
+        try:
+            state = (Path('/proc') / str(pid) / 'stat').read_text().rsplit(') ', 1)[1].split()[0]
+        except FileNotFoundError:
+            return False
+        return state not in ('Z', 'X')
+    state = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)],
+                           capture_output=True, text=True, timeout=2).stdout.strip()
+    return bool(state) and not state.startswith('Z')
+
+
+bin_dir = work / 'bin'
+bin_dir.mkdir()
+(bin_dir / 'ssh').write_text(r'''#!/usr/bin/env bash
+set -uo pipefail
+source "$DSR_TRANSFER_MODULE" || exit $?
+decoded=$(_act_windows_command_script "${!#}") || exit 94
+if [[ "$decoded" == *'Launcher parent is not a plain directory'* ]]; then
+    printf 'setup\n' >> "$DSR_TRANSFER_CASE/ssh-events"
+else
+    printf 'execute\n' >> "$DSR_TRANSFER_CASE/ssh-events"
+    printf 'unexpected remote execution\n' >&2
+    exit 95
+fi
+''')
+(bin_dir / 'scp').write_text(r'''#!/usr/bin/env python3
+import hashlib, json, os, subprocess, sys, time
+from pathlib import Path
+case = Path(os.environ['DSR_TRANSFER_CASE'])
+mode = os.environ['DSR_TRANSFER_MODE']
+source, destination = sys.argv[-2:]
+payload = Path(source).read_bytes()
+remote = Path(os.environ['DSR_TRANSFER_REMOTE']) / destination.split(':', 1)[1]
+remote.parent.mkdir(parents=True, exist_ok=True)
+with remote.open('xb') as stream:
+    stream.write(payload[:97] if mode in ('fail', 'stall') else payload)
+stdin = sys.stdin.buffer.read()
+child = None
+if mode == 'stall':
+    child = subprocess.Popen([sys.executable, '-c',
+        'import os, signal, time; from pathlib import Path; '
+        'signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+        'Path(os.environ["DSR_TRANSFER_CASE"], "child-ready").write_text(str(os.getpid())); '
+        'time.sleep(30)'])
+    until = time.monotonic() + 2
+    while not (case / 'child-ready').exists() and time.monotonic() < until:
+        time.sleep(0.01)
+    if not (case / 'child-ready').exists():
+        raise SystemExit('fixture child failed to start')
+record = dict(pid=os.getpid(), pgid=os.getpgrp(), child=child.pid if child else None,
+              source=source, destination=destination, remote=str(remote),
+              bytes=len(payload), sha256=hashlib.sha256(payload).hexdigest(), stdin_bytes=len(stdin))
+(case / 'scp.json').write_text(json.dumps(record))
+print('SCP fixture progress on stdout', flush=True)
+print('SCP fixture diagnostic on stderr', file=sys.stderr, flush=True)
+if mode == 'stall':
+    time.sleep(30)
+raise SystemExit(23 if mode == 'fail' else 0)
+''')
+for path in bin_dir.iterdir():
+    path.chmod(0o700)
+driver = work / 'driver.bash'
+driver.write_text(r'''#!/usr/bin/env bash
+set -uo pipefail
+source "$DSR_TRANSFER_MODULE" || exit $?
+_act_is_windows_host() { return 0; }
+_act_is_local_host() { return 1; }
+_act_get_ssh_destination() { printf 'fixture-windows\n'; }
+_act_windows_storage_config() { return 1; }
+host_health_is_ready() { return 0; }
+_ACT_SYNC_TIMEOUT=1
+_ACT_SSH_TIMEOUT=1
+_ACT_BUILD_TIMEOUT=30
+case "$1" in
+    metadata)
+        _act_strict_cargo_metadata_json fixture C:/fixture/source 'cargo build --release --locked' ''
+        ;;
+    build)
+        act_run_native_build transfer windows/amd64 1.0.0 \
+            33333333-3333-4333-8333-333333333333 '' '' '' fixture
+        ;;
+    stage)
+        script=$(_act_windows_private_cargo_home_script C:/fixture/source metadata-transfer) || exit $?
+        body=$(_act_windows_cargo_metadata_body 'cargo build --release --locked' '') || exit $?
+        script+=$'\n'"$body"
+        printf '%s\n' "$script" > "$DSR_TRANSFER_CASE/expected.ps1" || exit $?
+        command=$(_act_windows_cache_command fixture C:/fixture/source "$script") || exit $?
+        _act_windows_command_script "$command" > "$DSR_TRANSFER_CASE/guard.ps1" || exit $?
+        printf '%s\n' "$command"
+        ;;
+    *) exit 94 ;;
+esac
+''')
+config = work / 'config'
+(config / 'repos.d').mkdir(parents=True)
+(work / 'source').mkdir()
+(config / 'hosts.yaml').write_text(json.dumps({'hosts': {'fixture': {
+    'platform': 'windows/amd64', 'connection': 'ssh', 'ssh_host': 'fixture-windows'}}}))
+(config / 'repos.d/transfer.yaml').write_text(json.dumps({
+    'tool_name': 'transfer', 'language': 'go', 'local_path': str(work / 'source'),
+    'binary_name': 'transfer', 'build_cmd': 'go build -o transfer.exe .',
+    'host_paths': {'fixture': 'C:/fixture/source'}, 'targets': ['windows/amd64']}))
+environment = dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ['PATH'],
+    DSR_TRANSFER_MODULE=str(module), DSR_TRANSFER_REMOTE=str(work / 'remote'),
+    DSR_CONFIG_DIR=str(config), DSR_HOSTS_FILE=str(config / 'hosts.yaml'),
+    ACT_REPOS_DIR=str(config / 'repos.d'), ACT_ARTIFACTS_DIR=str(work / 'artifacts'),
+    ACT_LOGS_DIR=str(work / 'logs'), RCH_REQUIRE_REMOTE='0', NO_COLOR='1')
+
+
+def invoke(operation, mode, label):
+    case = work / label
+    case.mkdir()
+    env = dict(environment, DSR_TRANSFER_CASE=str(case), DSR_TRANSFER_MODE=mode)
+    started = time.monotonic()
+    outer_timeout = False
+    with (case / 'stdout').open('wb') as output, (case / 'stderr').open('wb') as error:
+        process = subprocess.Popen(['bash', str(driver), operation], env=env,
+            stdin=subprocess.PIPE, stdout=output, stderr=error, start_new_session=True)
+        process.stdin.write(b'caller input must not reach the uploader\n')
+        process.stdin.close()
+        try:
+            status = process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            outer_timeout = True
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                status = process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                status = process.wait(timeout=2)
+    elapsed = time.monotonic() - started
+    record = json.loads((case / 'scp.json').read_text()) if (case / 'scp.json').exists() else {}
+    live = [pid for pid in (record.get('pid'), record.get('child')) if pid and alive(pid)]
+    # Retain the failure observation before retiring only fixture-owned groups.
+    if live:
+        pgid = record['pgid']
+        if pgid > 1 and pgid != os.getpgrp() and any(os.getpgid(pid) == pgid for pid in live):
+            os.killpg(pgid, signal.SIGKILL)
+    events = (case / 'ssh-events').read_text().splitlines() if (case / 'ssh-events').exists() else []
+    return case, status, outer_timeout, elapsed, record, live, events
+
+
+for operation in ('metadata', 'build'):
+    case, status, outer, elapsed, record, live, events = invoke(operation, 'stall', operation + '-stall')
+    check(operation + ': upload uses its one-second deadline before the outer failsafe',
+          not outer and status == 4 and elapsed < 9)
+    check(operation + ': actual caller reached the real external SCP upload',
+          bool(record) and Path(record['source']).is_file() and events == ['setup'])
+    check(operation + ': refusal emits no success receipt or later remote execution',
+          events == ['setup'] and (case / 'stdout').stat().st_size == 0)
+    check(operation + ': upload deadline drains the child that ignores termination',
+          bool(record.get('child')) and not live)
+    if operation == 'metadata':
+        check('strict metadata fixture uses its genuine program above 128 KiB', record.get('bytes', 0) > 131072)
+
+failed, status, outer, _, failure, live, events = invoke('metadata', 'fail', 'transfer-failure')
+check('nonzero SCP failure stops metadata without launching or reporting success',
+      status == 4 and not outer and not live and events == ['setup'] and
+      (failed / 'stdout').stat().st_size == 0 and failure.get('bytes', 0) > 131072)
+retained = {name: (Path(failure[name]).stat().st_ino, digest(Path(failure[name])))
+            for name in ('source', 'remote')} if failure else {}
+successful, status, outer, _, receipt, live, events = invoke('stage', 'success', 'retry')
+check('a successful retry returns a bounded held-file launcher',
+      status == 0 and not outer and not live and events == ['setup'] and
+      0 < (successful / 'stdout').stat().st_size < 7000)
+check('successful upload preserves every byte of the generated metadata program',
+      bool(receipt) and Path(receipt['remote']).read_bytes() == (successful / 'expected.ps1').read_bytes() and
+      receipt['sha256'] == digest(successful / 'expected.ps1') and receipt['bytes'] > 131072)
+guard = (successful / 'guard.ps1').read_text() if (successful / 'guard.ps1').exists() else ''
+check('returned launcher holds and verifies the exact uploaded script hash',
+      bool(receipt) and receipt['sha256'] in guard and '[IO.FileShare]::Read' in guard and
+      'Launcher digest mismatch' in guard)
+check('retry owns a fresh destination and leaves failed local and remote evidence intact',
+      bool(receipt) and bool(failure) and receipt['destination'] != failure['destination'] and
+      receipt['source'] != failure['source'] and all(
+          (Path(failure[name]).stat().st_ino, digest(Path(failure[name]))) == value
+          for name, value in retained.items()))
+check('upload stdin is isolated and SCP progress remains on stderr',
+      bool(receipt) and receipt['stdin_bytes'] == 0 and
+      'SCP fixture progress on stdout' in (successful / 'stderr').read_text() and
+      'SCP fixture diagnostic on stderr' in (successful / 'stderr').read_text() and
+      'SCP fixture' not in (successful / 'stdout').read_text())
+print(f'Windows launcher transfer: {checks-failures} passed, {failures} failed', flush=True)
+sys.exit(1 if failures else 0)
+PY
+}
+
+if [[ "${1:-}" == --windows-launcher-transfer-only ]]; then
+    test_windows_launcher_transfer_deadline
+    exit $?
+fi
 
 # Real native allocation/collection/manifest code with controlled remote
 # admission, transport and Rust cache protocol responses. No compiler, network

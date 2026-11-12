@@ -1543,6 +1543,13 @@ receive EOF on stdin. A missing host runtime returns dependency error 3 before
 the compiler runs. Commands that deliberately detach into a new session are
 outside this process-group boundary. Strict Rust still requires Python 3.11+.
 
+Windows launcher uploads for metadata inspection and native compilation use the
+controller's source-sync deadline (`DSR_SYNC_TIMEOUT`, default 1800 seconds).
+The complete SCP process and its owned descendants are supervised, with stdin
+closed and transfer diagnostics on stderr. A timeout or failed upload refuses
+dispatch before returning a launcher; retained local and partial remote files
+remain available for diagnosis, and a retry uses a fresh private destination.
+
 Native Windows guards retain the complete compiler program as `payload.ps1`
 beside the staged launcher and start PowerShell with a quoted `-File` path.
 The program's size therefore does not become a child command-line argument.
