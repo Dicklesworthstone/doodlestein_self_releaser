@@ -985,6 +985,140 @@ test_real_tool_bv() {
     harness_teardown
 }
 
+# Exercise the public CLI with Bun's actual dependency resolver, compiler and
+# executable. The package graph is local and updater output is deterministic;
+# no GitHub request or release publication is part of this fixture.
+test_bun_source_upgrade() {
+    local dependency
+    for dependency in bun jq yq git; do
+        if ! command -v "$dependency" >/dev/null; then
+            TESTS_RUN=$((TESTS_RUN + 1))
+            skip "Bun source upgrade requires $dependency"
+            return 0
+        fi
+    done
+    local scenario
+    for scenario in root-object root-string workspace explicit-entry all-tools version-mismatch \
+            missing-entry unsafe-entry changed-lock missing-lock inconsistent-lock compile-failure dry-run; do
+        TESTS_RUN=$((TESTS_RUN + 1))
+        TEST_NAME="bun-upgrade-$scenario" harness_setup
+        setup_module
+        local checkout="$TEST_TMPDIR/source checkout" package='.' language=bun entry='' expected=0
+        local before lock_before rc=0 run_count=0
+        local -a flags=() options=() problems=() selection=(verify upgrade bun-upgrade)
+        mkdir -p "$checkout/src"
+        if [[ "$scenario" == workspace ]]; then
+            package=packages/cli; language=typescript
+            mkdir -p "$checkout/$package/src" "$checkout/packages/messages"
+            printf '%s\n' '{"name":"upgrade-workspace","private":true,"workspaces":["packages/*"]}' > "$checkout/package.json"
+            printf '%s\n' '{"name":"upgrade-messages","version":"1.0.0","exports":"./index.ts"}' > "$checkout/packages/messages/package.json"
+            printf '%s\n' 'export const latest = "1.2.3";' > "$checkout/packages/messages/index.ts"
+            printf '%s\n' '{"name":"upgrade-cli","bin":{"dsr-bun-upgrade":"src/main.ts"},"dependencies":{"upgrade-messages":"workspace:*"}}' > "$checkout/$package/package.json"
+            printf '%s\n' 'import { latest } from "upgrade-messages";' > "$checkout/$package/src/main.ts"
+        else
+            mkdir "$checkout/messages"
+            printf '%s\n' '{"name":"upgrade-messages","version":"1.0.0","exports":"./index.ts"}' > "$checkout/messages/package.json"
+            printf '%s\n' 'export const latest = "1.2.3";' > "$checkout/messages/index.ts"
+            printf '%s\n' '{"name":"upgrade-cli","bin":{"dsr-bun-upgrade":"src/main.ts"},"dependencies":{"upgrade-messages":"file:./messages"}}' > "$checkout/package.json"
+            printf '%s\n' 'import { latest } from "upgrade-messages";' > "$checkout/src/main.ts"
+        fi
+        cat >> "$checkout/$package/src/main.ts" <<'TYPESCRIPT'
+if (JSON.stringify(process.argv.slice(2)) !== JSON.stringify(["update", "--check"])) process.exit(23);
+if (process.env.DSR_UPGRADE_BUN_PROBE) {
+  const { appendFileSync } = await import("node:fs");
+  appendFileSync(process.env.DSR_UPGRADE_BUN_PROBE, "compiled-primary\n");
+}
+console.log("Current version: 1.2.2\nLatest version: " + latest + "\nUpdate available");
+TYPESCRIPT
+        if [[ "$scenario" == root-string ]]; then
+            printf '%s\n' '{"name":"upgrade-cli","bin":"src/main.ts","dependencies":{"upgrade-messages":"file:./messages"}}' > "$checkout/package.json"
+            language=typescript
+        elif [[ "$scenario" == explicit-entry ]]; then
+            cp "$checkout/src/main.ts" "$checkout/src/custom.ts"
+            printf '%s\n' '{"name":"upgrade-cli","bin":{"another-tool":"src/main.ts"},"dependencies":{"upgrade-messages":"file:./messages"}}' > "$checkout/package.json"
+            entry=src/custom.ts
+        fi
+        if ! (cd "$checkout" && bun install --lockfile-only --ignore-scripts) \
+                > "$TEST_TMPDIR/lock.log" 2>&1; then
+            fail "Bun fixture lock generation failed: $scenario"
+            harness_teardown
+            continue
+        fi
+        if ! command git init -q -b main "$checkout" || ! command git -C "$checkout" add . ||
+           ! command git -C "$checkout" -c user.name='DSR test' -c user.email='test@example.invalid' commit -qm fixture; then
+            fail "Bun fixture source commit failed: $scenario"
+            harness_teardown
+            continue
+        fi
+        case "$scenario" in
+            version-mismatch) expected=1; options=(--version 9.9.9) ;;
+            missing-entry) entry=src/absent.ts; expected=1 ;;
+            unsafe-entry) entry=../outside.ts; expected=1 ;;
+            changed-lock) printf '\n' >> "$checkout/bun.lock"; expected=1 ;;
+            missing-lock) mv "$checkout/bun.lock" "$TEST_TMPDIR/saved-bun.lock"; expected=1 ;;
+            inconsistent-lock)
+                printf '%s\n' '{"name":"upgrade-cli","bin":{"dsr-bun-upgrade":"src/main.ts"},"dependencies":{"upgrade-messages":"file:./absent"}}' > "$checkout/package.json"
+                command git -C "$checkout" add package.json &&
+                    command git -C "$checkout" -c user.name='DSR test' -c user.email='test@example.invalid' commit -qm inconsistent-lock
+                expected=1 ;;
+            compile-failure) printf '\nconst broken = ;\n' >> "$checkout/src/main.ts"; expected=1 ;;
+            dry-run) options=(--dry-run); run_count=-1 ;;
+            all-tools) selection=(verify upgrade --all); flags=(--json) ;;
+        esac
+        [[ ${#options[@]} -gt 0 ]] || options=(--version v1.2.3)
+        printf 'tool_name: bun-upgrade\nbinary_name: dsr-bun-upgrade\nlanguage: %s\nlocal_path: %s\nsource_subdir: %s\nsource_entry: "%s"\nupgrade_check_args: [update, --check]\n' \
+            "$language" "$checkout" "$package" "$entry" > "$TEST_TMPDIR/repos.d/bun-upgrade.yaml"
+        if [[ "$scenario" == root-string || "$scenario" == explicit-entry || "$expected" != 0 ]]; then
+            flags=(--json)
+            options+=(--build-from-source)
+            cat > "$TEST_TMPDIR/bin/dsr-bun-upgrade" <<'SH'
+#!/usr/bin/env bash
+printf 'installed-primary\n' >> "$DSR_UPGRADE_BUN_PROBE"
+exit 24
+SH
+            chmod +x "$TEST_TMPDIR/bin/dsr-bun-upgrade"
+        fi
+        before=$(find "$TEST_TMPDIR/bin" -type f -exec sha256sum {} +)
+        lock_before='missing'
+        [[ ! -f "$checkout/bun.lock" ]] || lock_before=$(sha256sum "$checkout/bun.lock")
+        export DSR_UPGRADE_BUN_PROBE="$TEST_TMPDIR/updater.calls"
+        PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$PROJECT_ROOT/dsr" ${flags[@]+"${flags[@]}"} \
+            "${selection[@]}" "${options[@]}"
+        rc=$(exec_status)
+        [[ "$rc" == "$expected" ]] || problems+=("exit=$rc expected=$expected")
+        if ((run_count != -1)); then
+            if [[ "$expected" == 0 || "$scenario" == version-mismatch ]]; then run_count=1; else run_count=0; fi
+            local observed=0
+            [[ ! -f "$DSR_UPGRADE_BUN_PROBE" ]] || observed=$(wc -l < "$DSR_UPGRADE_BUN_PROBE")
+            [[ "$observed" -eq "$run_count" ]] || problems+=("updater ran $observed times, wanted $run_count")
+            [[ ! -f "$DSR_UPGRADE_BUN_PROBE" ]] ||
+                [[ "$(sort -u "$DSR_UPGRADE_BUN_PROBE")" == compiled-primary ]] || problems+=("installed executable ran")
+        else
+            [[ ! -e "$DSR_UPGRADE_BUN_PROBE" ]] || problems+=("dry-run executed updater")
+            [[ ! -e "$checkout/node_modules" ]] || problems+=("dry-run installed dependencies")
+            exec_stderr_contains 'Would build dsr-bun-upgrade from source' || problems+=("missing build preview")
+        fi
+        [[ "$before" == "$(find "$TEST_TMPDIR/bin" -type f -exec sha256sum {} +)" ]] || problems+=("installed executable changed")
+        if [[ "$lock_before" != missing ]]; then
+            [[ "$lock_before" == "$(sha256sum "$checkout/bun.lock")" ]] || problems+=("frozen lockfile changed")
+        fi
+        if [[ ${#flags[@]} -gt 0 ]]; then
+            jq -es --argjson code "$expected" 'length==1 and (.[0]|.command=="verify-upgrade" and .exit_code==$code)' \
+                "$_EXEC_STDOUT_FILE" >/dev/null || problems+=("invalid public JSON verdict")
+        else
+            [[ ! -s "$_EXEC_STDOUT_FILE" ]] || problems+=("compiler diagnostics escaped to stdout")
+        fi
+        if [[ ${#problems[@]} -eq 0 ]]; then
+            pass "real Bun source upgrade: $scenario"
+        else
+            fail "real Bun source upgrade $scenario: ${problems[*]}"
+            cat "$_EXEC_STDERR_FILE"
+        fi
+        unset DSR_UPGRADE_BUN_PROBE
+        harness_teardown
+    done
+}
+
 # ============================================================================
 # Cleanup
 # ============================================================================
@@ -1000,6 +1134,13 @@ trap cleanup EXIT
 
 echo "=== Upgrade Verify Tests ==="
 echo ""
+
+if [[ "${1:-}" == --bun-source-only ]]; then
+    test_bun_source_upgrade
+    printf 'Bun source checks: %s; passed: %s; skipped: %s; failed: %s\n' \
+        "$TESTS_RUN" "$TESTS_PASSED" "$TESTS_SKIPPED" "$TESTS_FAILED"
+    [[ "$TESTS_FAILED" -eq 0 ]]; exit $?
+fi
 
 echo "Module Tests:"
 test_module_loads
@@ -1033,6 +1174,7 @@ test_cli_process_status_and_output_agree
 test_real_timeout_after_positive_output_fails
 test_cli_dry_run_runs_and_builds_nothing
 test_cli_all_selection_and_options
+test_bun_source_upgrade
 
 echo ""
 echo "Repository Finding Tests:"

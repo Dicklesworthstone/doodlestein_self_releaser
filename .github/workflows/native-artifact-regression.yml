@@ -27,6 +27,7 @@ on:
       - scripts/tests/test_install_source_windows.sh
       - scripts/tests/test_install_source_family.sh
       - scripts/tests/test_toolchain_detect.sh
+      - scripts/tests/test_upgrade_verify.sh
       - scripts/tests/test_generated_installer_source.sh
       - scripts/tests/test_generated_installer_workspace_bootstrap.sh
       - dsr
@@ -42,6 +43,7 @@ on:
       - src/install_source.sh
       - src/install_source_windows.ps1
       - src/toolchain_detect.sh
+      - src/upgrade_verify.sh
       - src/packaging.sh
       - src/platforms.sh
       - src/slsa.sh
@@ -332,6 +334,7 @@ jobs:
           bash scripts/tests/test_install_source_family.sh --bun-contracts-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/bun-family-contracts.log"
           bash scripts/tests/test_install_source_family.sh --bun-workspaces-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/bun-workspaces.log"
           bash scripts/tests/test_generated_workspace_installer.sh --go-bun-source-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/go-bun-source-families.log"
+          timeout 120 bash scripts/tests/test_upgrade_verify.sh --bun-source-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/bun-source-upgrade.log"
           test -z "$(git status --porcelain)"
       - name: Validate Windows source installation and release freshness
         if: runner.os == 'Linux'

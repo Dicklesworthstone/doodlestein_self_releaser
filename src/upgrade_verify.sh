@@ -543,17 +543,82 @@ _upgrade_find_repo_dir() {
     return 1
 }
 
+# Build the primary Bun executable with the same entry, lockfile and workspace
+# admission used by generated source installers. This checks a local checkout;
+# it does not install a compiler, replace an installed tool or attest a release.
+_upgrade_build_bun_tool() (
+    local tool_name="$1" repo_dir="$2" binary_name="$3" tmpdir="$4"
+    local config_file="${ACT_REPOS_DIR:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.d}/$tool_name.yaml"
+    local source_dir configuration subdir entry language tree output built status=0
+    local _ISB_CHECKOUT_ROOT _ISB_INSTALL_TOOLCHAIN=false
+    local limit="${DSR_BUILD_TIMEOUT:-3600}"
+    command -v jq >/dev/null && command -v yq >/dev/null &&
+        command -v git >/dev/null && command -v ps >/dev/null || return 3
+    [[ "$limit" =~ ^[1-9][0-9]{0,4}$ ]] || return 4
+    source_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || return 3
+    # shellcheck source=SCRIPTDIR/install_source.sh
+    source "$source_dir/install_source.sh" || return 3
+    _isb_name "$binary_name" && [[ "$binary_name" != *..* ]] || return 4
+    [[ -f "$config_file" && ! -L "$config_file" ]] || return 4
+    if ! declare -F _config_read_single_mapping_json >/dev/null; then
+        # shellcheck source=SCRIPTDIR/config.sh
+        source "$source_dir/config.sh" || return 3
+    fi
+    configuration=$(_config_read_single_mapping_json "$config_file") || return $?
+    configuration=$(jq -ce '
+        {language:.language,
+         subdir:(if has("source_subdir") then .source_subdir else "." end),
+         entry:(if has("source_entry") then .source_entry else "" end),
+         package:(if has("source_package") then .source_package else "" end)} |
+        select((.language == "bun" or .language == "typescript") and
+               (.subdir|type == "string" and length > 0) and
+               (.entry|type == "string") and .package == "")
+    ' <<< "$configuration") || return 4
+    language=$(jq -r .language <<< "$configuration") || return 4
+    subdir=$(jq -r .subdir <<< "$configuration") || return 4
+    entry=$(jq -r .entry <<< "$configuration") || return 4
+    _ISB_CHECKOUT_ROOT=$(cd "$repo_dir" && pwd -P) || return 4
+    _isb_path_in_tree "$_ISB_CHECKOUT_ROOT" "$subdir" || return 4
+    [[ -z "$entry" ]] || _isb_relative_path "$entry" || return 4
+    tree="$_ISB_CHECKOUT_ROOT"
+    [[ "$subdir" == . ]] || tree+="/$subdir"
+    [[ -d "$tree" ]] || return 4
+    output="$tmpdir/build"
+    mkdir "$output" || return 1
+    built=$(_isb_compile "$language" "$tree" "$output" "$binary_name" "$entry" '' "$limit") || status=$?
+    if ((status != 0)); then
+        log_error "Bun source verification build failed; diagnostics: $output"
+        local log
+        for log in "$output/compiler.log" "$output/bun-project.log" "$output/dependencies.log" "$output/build.log"; do
+            [[ ! -f "$log" || -L "$log" ]] || tail -n 20 "$log" >&2
+        done
+        return "$status"
+    fi
+    [[ "$built" == "$output/bin/$(_isb_binary_name "$binary_name")" && -f "$built" &&
+       -s "$built" && -x "$built" && ! -L "$built" ]] || return 6
+    # The public verifier owns this whole attempt directory. Keep its primary
+    # at the existing cleanup boundary, while compiler logs stay in build/.
+    cp -p -- "$built" "$tmpdir/$binary_name" || return 1
+)
+
 # Build tool from source
 _upgrade_build_tool() {
     local tool_name="$1"
     local repo_dir="$2"
     local binary_name="${3:-$tool_name}"
     local tmpdir
-    tmpdir=$(mktemp -d)
+    tmpdir=$(mktemp -d) || return 1
 
     local bin_path="$tmpdir/$binary_name"
+    local language=''
+    if declare -F config_get_tool_field >/dev/null; then
+        language=$(config_get_tool_field "$tool_name" language '') || return $?
+    fi
 
-    if [[ -f "$repo_dir/go.mod" ]]; then
+    if [[ "$language" == bun || "$language" == typescript ]]; then
+        log_debug "Building Bun/TypeScript project..."
+        _upgrade_build_bun_tool "$tool_name" "$repo_dir" "$binary_name" "$tmpdir" || return $?
+    elif [[ -f "$repo_dir/go.mod" ]]; then
         # Go project.  cd into the module so module-mode resolves
         # correctly regardless of the caller's PWD; the subshell
         # contains the cd so the rest of the script is unaffected.
@@ -601,3 +666,4 @@ _upgrade_build_tool() {
 export -f upgrade_verify_tool upgrade_verify_all upgrade_verify_json
 export -f _upgrade_check_succeeded _upgrade_extract_latest_version _upgrade_check_args _upgrade_has_explicit_check_args
 export -f _upgrade_tool_binary_name _upgrade_find_repo_dir _upgrade_build_tool
+export -f _upgrade_build_bun_tool

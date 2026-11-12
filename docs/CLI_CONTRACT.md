@@ -1164,6 +1164,7 @@ dsr release --repo <name> --version <tag> [--draft] [--prerelease] [--dispatch]
 | `--draft` | false | Keep the verified release as a draft |
 | `--prerelease` | false | Mark as prerelease |
 | `--artifacts` | auto | Artifact directory |
+| `--verify-upgrade` | false | After successful public publication, run the primary executable's configured update check against the released version |
 | `--dispatch` | false | Trigger repository dispatch hooks after release |
 | `--no-dispatch` | false | Disable repository dispatch for this run |
 | `--dispatch-event` | `dsr_release` | Override dispatch event type |
@@ -2954,6 +2955,43 @@ These guarantees concern cooperating writers and process interruptions on a
 local filesystem. They do not promise simultaneous visibility of the two new
 keys, power-loss durability, or protection against hostile parent-directory
 replacement. Finish release signing before rotating its identity.
+
+---
+
+### `dsr verify upgrade`
+
+Check that a tool's update command resolves the intended release:
+
+```bash
+dsr verify upgrade TOOL --version 1.2.3
+dsr verify upgrade TOOL --build-from-source --version 1.2.3
+dsr verify upgrade --all --build-from-source
+```
+
+The verifier uses the configured `binary_name` and `upgrade_check_args` (default
+`upgrade --check`). It executes the argument array directly, once per selected
+tool, and requires a successful process result. An explicit version must match
+the updater's reported latest version. `release --verify-upgrade` uses this same
+check after successful public publication; drafts do not run the hook.
+
+When the executable is absent, or `--build-from-source` is selected, verification
+builds the configured primary executable from `local_path`. Go, Rust, Bun and
+TypeScript are supported. Bun/TypeScript requires an installed Bun compiler and
+uses the source installer's entry, frozen-lock and workspace rules: `source_subdir`
+selects the project, `source_entry` selects the primary entry when present, and
+otherwise the exact `binary_name` entry or scalar `bin` in `package.json` applies.
+The selected package manifest and `bun.lock` or `bun.lockb` must be committed and
+unchanged. A nested workspace uses its admitted root lock and selected member.
+Missing or unsafe entries, changed or inconsistent locks and compilation errors
+fail verification before executing the update command.
+
+Bun dependency installation and compilation use `DSR_BUILD_TIMEOUT` (default
+3600 seconds per operation). Compilation produces a fresh temporary executable
+and does not replace an installed tool or provision a compiler. This verifies
+the primary updater; it does not build or install a complete release family.
+`--dry-run` reports the planned build and check without executing them. JSON
+mode preserves the command's success or failure and does not run the updater a
+second time to assemble its response.
 
 ---
 
