@@ -240,18 +240,43 @@ _installer_run_gh() (
 # Freshness is advisory release metadata, NOT artifact or commit-signature
 # verification. Query only GitHub's API and do not inherit a GH_HOST override.
 # Separate API bytes from diagnostic logs so warnings cannot become JSON.
-_isb_freshness_request() {
+_isb_freshness_request() (
+    set +x
     local transport="$1" endpoint="$2" destination="$3"
     if [[ "$transport" == gh ]]; then
         _installer_run_gh api --hostname github.com --method GET \
             -H 'Accept: application/vnd.github+json' -H 'Cache-Control: no-cache' \
             "$endpoint" > "$destination"
+    elif ! command -v gh >/dev/null 2>&1 &&
+         [[ -n "${DSR_GH_TOKEN:-}" || -n "${GITHUB_TOKEN:-}" || -n "${GH_TOKEN:-}" ]]; then
+        # Match token-only release acquisition without adding a gh dependency.
+        # Keep credentials off argv and disk, ignore ambient curl options, and
+        # never follow metadata redirects. These endpoints are assembled only
+        # from the admitted repository/tag and the resolved immutable commits.
+        local token escaped_token bytes status maximum=8388608
+        token=$(_installer_github_token) || return $?
+        [[ ${#token} -le 8192 && "$token" != *[[:cntrl:]]* ]] || return 4
+        escaped_token="${token//\\/\\\\}"; escaped_token="${escaped_token//\"/\\\"}"
+        set -o pipefail
+        if ! printf 'header = "Authorization: Bearer %s"\n' "$escaped_token" |
+            curl -q --config - --silent --globoff --proto '=https' \
+                --connect-timeout 10 --max-time 30 --max-filesize "$maximum" \
+                -H 'Accept: application/vnd.github+json' -H 'Cache-Control: no-cache' \
+                -H 'X-GitHub-Api-Version: 2022-11-28' \
+                "https://api.github.com/$endpoint" --output /dev/fd/3 \
+                --write-out '%{http_code}' 3>&1 > "$destination.http" 2>/dev/null |
+            head -c "$((maximum + 1))" > "$destination"; then
+            return 8
+        fi
+        bytes=$(wc -c < "$destination" | tr -d '[:space:]') || return 1
+        status=$(cat -- "$destination.http") || return 1
+        [[ "$status" == 200 && "$bytes" =~ ^[0-9]+$ ]] && ((bytes <= maximum)) || return 8
     else
         curl -sSf --proto '=https' --connect-timeout 10 --max-time 30 \
             -H 'Accept: application/vnd.github+json' -H 'Cache-Control: no-cache' \
             "https://api.github.com/$endpoint" -o "$destination"
     fi
-}
+)
 
 _isb_freshness_get() {
     local endpoint="$1" destination="$2" prefer="$3" transport status

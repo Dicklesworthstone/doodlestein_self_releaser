@@ -54,7 +54,7 @@ failed discovered downloads stop installation; they do not select an anonymous
 download, another account or a source build. All downloaded and cached bytes
 still require exact checksum evidence and every configured Minisign signature.
 
-Credentials are sent only to the configured repository's HTTPS release API.
+Release downloads send credentials only to the configured repository's HTTPS release API.
 Binary redirects may reach HTTPS object storage, where the Authorization header
 is removed permanently for that transfer. Metadata redirects outside the
 repository, redirects to a different GitHub API repository, URL credentials,
@@ -69,6 +69,20 @@ both with `--offline` and during an explicit-version online install. Offline
 mode makes no release, checksum or signature request. Regenerate deployed
 installers to include the new acquisition path.
 
+Token-only clients can also use `--allow-source-build --source-if-stale N`
+against a private repository. After verifying the complete release family,
+the installer uses the same selected account to resolve the annotated release
+tag and default-branch head to immutable commits and compare their distance.
+When the release is more than `N` commits behind, it fetches and builds that
+exact observed head, including every selected companion executable. Freshness
+API requests remain within the configured repository, refuse redirects, ignore
+ambient curl configuration, and bound each JSON body to 8 MiB. Unavailable or
+invalid comparison metadata remains `unknown` and keeps the verified release;
+it never grants source-build permission. A failed release checksum or signature
+stops before freshness lookup. Source builds still require installed compilers
+or separate `--install-toolchain` consent and produce explicitly unsigned local
+build receipts.
+
 The focused regression uses actual generated programs, compiled executable
 families, Minisign, curl and a local HTTPS release service:
 
@@ -79,6 +93,9 @@ bash scripts/tests/test_generated_installer_private.sh
 It covers token precedence, a real API page larger than 128 KiB, complete
 pagination, redirect and credential behavior, checksum/signature failures,
 latest and explicit tags, public installation and verified offline reuse.
+Private freshness controls also exercise actual Git-over-HTTPS acquisition and
+Go compilation of a complete executable family. Run those controls alone with
+`bash scripts/tests/test_generated_installer_private.sh --freshness-only`.
 Only DNS routing and certificate trust are adapted for the local service;
 the regression does not establish successful live GitHub acquisition.
 
