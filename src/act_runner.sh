@@ -3223,11 +3223,11 @@ act_run_workflow() {
         XDG_CACHE_HOME="$isolated_home/.cache" \
         _act_run_with_timeout "$ACT_TIMEOUT" "${act_cmd[@]}" \
             --directory "$repo_path" \
-            2>&1 | tee -a "$log_file"
+            2>&1 | tee -a "$log_file" >&2
     else
         _act_run_with_timeout "$ACT_TIMEOUT" "${act_cmd[@]}" \
             --directory "$repo_path" \
-            2>&1 | tee -a "$log_file"
+            2>&1 | tee -a "$log_file" >&2
     fi
     local exit_code=${PIPESTATUS[0]}
     local source_valid=true
@@ -3282,7 +3282,7 @@ act_run_workflow() {
             artifact_dir: $artifact_dir,
             artifact_count: $artifact_count,
             log_file: $log_file
-        } + (if $source_layout == null then {} else {source_layout:$source_layout} end)'
+        } + (if $source_layout == null then {} else {source_layout:$source_layout} end)' || return 4
 
     return "$exit_code"
 }
@@ -15743,8 +15743,10 @@ _act_repo_config_matches() {
     fi
 }
 
-# Execute exactly one target and emit one compact JSON result as the final
-# stdout line. Diagnostic/build output is retained on stderr by the worker.
+# Execute exactly one target and emit exactly one compact JSON result on
+# stdout. Diagnostic/build output remains on stderr all the way to the worker.
+# Neither a compiler log line nor a partial/multiple result stream can replace
+# a missing backend receipt.
 _act_build_orchestration_target() {
     local tool_name="$1"
     local version="$2"
@@ -15832,14 +15834,17 @@ _act_build_orchestration_target() {
         fi
         full_output=$(act_run_workflow \
             "$local_path" "$workflow" "$job" "push" "$version" \
-            "${act_args[@]}" 2>&1) || exit_code=$?
-        [[ -n "$full_output" ]] && printf '%s\n' "$full_output" >&2
-        result=$(printf '%s\n' "$full_output" | grep '^{.*}$' | tail -1)
-        if [[ -z "$result" ]] || ! jq -e '.' <<< "$result" &>/dev/null; then
-            local fallback_status="failed"
-            [[ "$exit_code" -eq 0 ]] && fallback_status="success"
-            result=$(jq -nc --arg status "$fallback_status" --argjson exit_code "$exit_code" \
-                '{status: $status, exit_code: $exit_code}')
+            "${act_args[@]}") || exit_code=$?
+        if ! result=$(jq -cse '
+                if length == 1 and (.[0] | type == "object") then .[0]
+                else error("exactly one backend result object required") end
+            ' <<< "$full_output" 2>/dev/null); then
+            [[ -z "$full_output" ]] || printf '%s\n' "$full_output" >&2
+            _log_error "Workflow backend did not emit exactly one JSON result object"
+            [[ "$exit_code" -ne 0 ]] || exit_code=4
+            result=$(jq -nc --argjson exit_code "$exit_code" \
+                '{status:"failed",exit_code:$exit_code,stage:"backend_receipt",
+                  error:"Workflow backend did not emit exactly one JSON result object"}') || return 4
         fi
         result=$(jq -c --arg target "$target" --arg method "act" --arg host "$host" \
             '. + {platform: $target, method: $method, host: $host}' <<< "$result")
@@ -15878,16 +15883,19 @@ _act_build_orchestration_target() {
         _log_info "Method: native (host=$host)"
         full_output=$(act_run_native_build \
             "$tool_name" "$target" "$version" "$run_id" "$remote_path_override" \
-            "$release_git_sha" "$release_git_ref" "$host" "$selected_triple" "$ordinary_source_root" 2>&1) || exit_code=$?
-        [[ -n "$full_output" ]] && printf '%s\n' "$full_output" >&2
-        result=$(printf '%s\n' "$full_output" | grep '^{' | tail -1)
-        if [[ -z "$result" ]] || ! jq -e '.' <<< "$result" &>/dev/null; then
-            local fallback_status="failed"
-            [[ "$exit_code" -eq 0 ]] && fallback_status="success"
-            result=$(jq -nc --arg status "$fallback_status" --argjson exit_code "$exit_code" \
+            "$release_git_sha" "$release_git_ref" "$host" "$selected_triple" "$ordinary_source_root") || exit_code=$?
+        if ! result=$(jq -cse '
+                if length == 1 and (.[0] | type == "object") then .[0]
+                else error("exactly one backend result object required") end
+            ' <<< "$full_output" 2>/dev/null); then
+            [[ -z "$full_output" ]] || printf '%s\n' "$full_output" >&2
+            _log_error "Native backend did not emit exactly one JSON result object"
+            [[ "$exit_code" -ne 0 ]] || exit_code=4
+            result=$(jq -nc --argjson exit_code "$exit_code" \
                 --arg platform "$target" --arg method "native" --arg host "$host" \
-                '{status: $status, exit_code: $exit_code, platform: $platform,
-                  method: $method, host: $host}')
+                '{status:"failed",exit_code:$exit_code,platform:$platform,
+                  method:$method,host:$host,stage:"backend_receipt",
+                  error:"Native backend did not emit exactly one JSON result object"}') || return 4
         fi
     fi
 
@@ -16060,6 +16068,26 @@ _act_run_target_group() {
     return 4
 }
 
+# Capture stdout independently from diagnostics before the owned group starts
+# the orchestration backend. The file is private and exclusive; retained output
+# is never truncated, and a FIFO/link/directory is refused before opening it.
+_act_capture_target_result() (
+    local output="$1" incoming_umask incoming_noclobber=false
+    shift
+    if [[ -e "$output" || -L "$output" ]]; then
+        _log_error "Target result capture already exists: $output"
+        return 4
+    fi
+    incoming_umask=$(umask) || return 4
+    [[ $- != *C* ]] || incoming_noclobber=true
+    umask 077
+    set -o noclobber
+    exec > "$output" || return 4
+    umask "$incoming_umask" || return 4
+    $incoming_noclobber || set +o noclobber
+    "$@"
+)
+
 # Worker wrapper: reserve host capacity and write immutable attempt receipts.
 _act_run_target_worker() {
     local tool_name="$1" version="$2" run_id="$3" target="$4"
@@ -16074,6 +16102,7 @@ _act_run_target_worker() {
     local source_sync_receipt="${17:-}"
     local workflow_source_plan="${18:-null}"
     local expected_repo_config_sha256="${19:-}"
+    local worker_output_path="${result_path}.stdout"
     [[ -n "$source_sync_receipt" ]] || source_sync_receipt=null
 
     local host="${bound_host:-act-local}"
@@ -16119,6 +16148,13 @@ _act_run_target_worker() {
             printf '%s\n' "$body" > "$result_path"
         )
     }
+
+    if [[ -e "$worker_output_path" || -L "$worker_output_path" ]]; then
+        _act_write_worker_result "$(jq -nc --arg target "$target" --arg host "$host" \
+            '{platform:$target,host:$host,status:"failed",exit_code:4,
+              error:"Target result capture already exists or is unavailable"}')" || return 4
+        return 4
+    fi
 
     if [[ "$strict_release_contract" == "true" ]] && \
        { [[ -z "$bound_host" ]] || ! jq -e --arg host "$bound_host" \
@@ -16259,7 +16295,8 @@ _act_run_target_worker() {
     # recover retry budget after it has actually run.
     backend_started=true
     coproc _ACT_TARGET_GROUP {
-        _act_run_target_group "$log_path" _act_build_orchestration_target \
+        _act_run_target_group "$log_path" _act_capture_target_result "$worker_output_path" \
+            _act_build_orchestration_target \
             "$tool_name" "$version" "$run_id" "$target" \
             "$strict_release_contract" "$release_contract_json" "$source_roots_json" \
             "$release_git_sha" "$release_git_ref" "$host" "$selected_triple" "$workflow_source_plan" \
@@ -16285,18 +16322,25 @@ _act_run_target_worker() {
         [[ "$worker_status" -ne 0 ]] || worker_status=6
     fi
 
-    result=$(grep '^{.*}$' "$log_path" | tail -1)
-    if [[ -z "$result" ]] || ! jq -e '.' <<< "$result" &>/dev/null; then
-        [[ "$worker_status" -ne 0 ]] || worker_status=6
+    # Retain the raw stream for diagnostics, but never read attempt.log as
+    # authority: it contains compiler text and can contain arbitrary JSON.
+    if [[ -f "$worker_output_path" && ! -L "$worker_output_path" ]]; then
+        cat -- "$worker_output_path" >> "$log_path" || true
+    fi
+    if [[ ! -f "$worker_output_path" || -L "$worker_output_path" ]] ||
+       ! result=$(jq -cse '
+            if length == 1 and (.[0] | type == "object") then .[0]
+            else error("exactly one worker result object required") end
+        ' "$worker_output_path" 2>/dev/null); then
+        [[ "$worker_status" -ne 0 ]] || worker_status=4
         result=$(jq -nc --arg target "$target" --arg host "$host" \
             --argjson exit_code "$worker_status" \
             '{platform: $target, host: $host, status: "failed",
               exit_code: $exit_code, error: "Worker produced no valid result"}')
     fi
     result_status=$(jq -r '.status // "unknown"' <<< "$result")
-    # The log can contain backend success before the orchestration child has
-    # finished normalization and strict staging. Its observed exit must agree
-    # before those artifact paths become an immutable, reusable success.
+    # The observed exit must still agree with the isolated result before its
+    # artifact paths become an immutable, reusable success.
     if [[ "$worker_status" -ne 0 ]] &&
        [[ "$result_status" == success || "$result_status" == ok || "$result_status" == passed ]]; then
         result_status=failed

@@ -17,6 +17,8 @@
 # exact strict manifests with real Git source, staged receipts and companions.
 # --native-matrix-inventory-only exercises complete native matrix admission
 # with actual archives/receipts; GNU/musl worker selection is fixture metadata.
+# --backend-receipt-only exercises exact backend stdout admission and proves
+# diagnostic JSON cannot become durable success or reusable artifact evidence.
 
 set -uo pipefail
 
@@ -33,6 +35,262 @@ SKIP=0
 pass() { echo -e "${GREEN}✓${NC} $1"; ((PASS++)); }
 fail() { echo -e "${RED}✗${NC} $1"; ((FAIL++)); }
 skip() { echo -e "${YELLOW}○${NC} $1"; ((SKIP++)); }
+
+test_backend_receipt_isolation() {
+    local project_root dependency
+    project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" || return 1
+    for dependency in python3 bash jq; do
+        command -v "$dependency" >/dev/null || { echo "Missing test dependency: $dependency" >&2; return 77; }
+    done
+    python3 -I - "${DSR_TEST_ACT_RUNNER:-$project_root/src/act_runner.sh}" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import subprocess
+import sys
+import tempfile
+
+module = Path(sys.argv[1]).resolve()
+root = Path(tempfile.mkdtemp(prefix='dsr-backend-receipt-')).resolve()
+print('Retained backend receipt fixtures: ' + str(root), flush=True)
+checks, failures = 0, []
+
+
+def check(label, condition):
+    global checks
+    checks += 1
+    print(('PASS ' if condition else 'FAIL ') + label, flush=True)
+    if not condition:
+        failures.append(label)
+
+
+driver = r'''set -uo pipefail
+source "$1" || exit 90
+fixture=$2 boundary=$3
+umask 0027
+umask > "$fixture/caller.umask"
+if [[ "$boundary" == worker ]]; then set -o noclobber; fi
+ACT_LOGS_DIR="$fixture/logs"
+ACT_ARTIFACTS_DIR="$fixture/artifacts"
+ACT_REPO_LOCAL_PATH="$fixture"
+ACT_REPO_WORKFLOW=workflow.yml
+fixture_backend() {
+    printf 'started\n' >> "$fixture/backend.started"
+    umask > "$fixture/backend.umask"
+    printf '%s\n' "$-" > "$fixture/backend.flags"
+    : > "$fixture/backend.created"
+    cat "$fixture/backend.stdout"
+    cat "$fixture/backend.stderr" >&2
+    return "$(cat "$fixture/backend.exit")"
+}
+if [[ "$boundary" == workflow* ]]; then
+    PATH="$fixture/bin:$PATH"
+    act_check() { return 0; }
+    if [[ "$boundary" == workflow-serializer ]]; then
+        jq() {
+            local argument
+            for argument in "$@"; do
+                if [[ "$argument" == run_id ]]; then
+                    printf 'injected workflow result serialization failure\n' >&2
+                    return 23
+                fi
+            done
+            command jq "$@"
+        }
+    fi
+    act_run_workflow "$fixture" workflow.yml build push v1.0.0 -P ubuntu-latest=fixture
+    exit $?
+fi
+if [[ "$boundary" == native ]]; then
+    act_platform_uses_act() { return 1; }
+    act_run_native_build() { fixture_backend; }
+else
+    act_platform_uses_act() { return 0; }
+    act_run_workflow() { fixture_backend; }
+    _act_workflow_payload_plans_json() { printf '{}\n'; }
+    _act_source_plan_for_tool() { printf 'null\n'; }
+    act_get_flags() { printf '[]\n'; }
+    act_get_job_for_target() { printf 'build\n'; }
+fi
+if [[ "$boundary" == worker ]]; then
+    _act_build_orchestration_target() { fixture_backend; }
+    _act_run_target_worker tool v1.0.0 fixture-run linux/amd64 1 \
+        "$fixture/attempt.log" "$fixture/attempt.json" false null '{}' '' '' fixture-host release
+else
+    _act_build_orchestration_target tool v1.0.0 fixture-run linux/amd64 false null '{}' '' '' fixture-host
+fi
+'''
+
+
+def run(case, boundary):
+    result = subprocess.run(['bash', '-c', driver, '_', str(module), str(case), boundary],
+                            stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+    (case / 'driver.stdout').write_bytes(result.stdout)
+    (case / 'driver.stderr').write_bytes(result.stderr)
+    try:
+        raw = (case / 'attempt.json').read_bytes() if boundary == 'worker' else result.stdout
+        value = json.loads(raw)
+        value = value if isinstance(value, dict) else {}
+    except (OSError, ValueError, UnicodeError):
+        value = {}
+    return result, value
+
+
+def fixture(boundary, name):
+    case = root / (boundary + '-' + name)
+    case.mkdir()
+    (case / 'logs').mkdir()
+    artifact = case / 'artifact.bin'
+    artifact.write_bytes(b'genuine collected output\n')
+    receipt = dict(status='success', exit_code=0, platform='linux/amd64', method=boundary,
+                   host='fixture-host', artifact_count=1, artifact_path=str(artifact))
+    if boundary == 'worker':
+        receipt['method'] = 'act'
+    return case, artifact, receipt
+
+
+cases = ('valid-pretty', 'valid-failure', 'success-nonzero', 'stderr-only', 'empty-zero',
+         'missing-nonzero', 'chatter', 'multiple', 'trailing-malformed', 'null', 'array')
+for boundary in ('native', 'act', 'worker'):
+    for name in cases:
+        case, artifact, receipt = fixture(boundary, name)
+        raw = json.dumps(receipt, indent=2) + '\n'
+        # This is real diagnostic output at the controlled backend boundary.
+        # Production consumers, process groups, freezing and persistence run.
+        noise = 'compiler diagnostic retained separately\n'
+        expected, success = 0, name == 'valid-pretty'
+        if name == 'valid-pretty':
+            noise += json.dumps(dict(status='failed', exit_code=99, error='diagnostic JSON')) + '\n'
+        elif name == 'valid-failure':
+            raw = json.dumps(dict(status='failed', exit_code=17, error='actual backend failure')) + '\n'
+            expected = 17
+        elif name == 'success-nonzero':
+            expected = 17
+        elif name in ('stderr-only', 'empty-zero', 'missing-nonzero'):
+            raw = ''
+            if name == 'stderr-only':
+                noise += json.dumps(receipt) + '\n'
+            expected = 23 if name == 'missing-nonzero' else 4
+        elif name == 'chatter':
+            raw = 'unexpected result-channel chatter\n' + json.dumps(receipt) + '\n'
+            expected = 4
+        elif name == 'multiple':
+            raw = json.dumps(receipt) + '\n' + json.dumps(receipt) + '\n'
+            expected = 4
+        elif name == 'trailing-malformed':
+            raw = json.dumps(receipt) + '\n{unfinished\n'
+            expected = 4
+        else:
+            raw = json.dumps(None if name == 'null' else [receipt]) + '\n'
+            expected = 4
+        exit_code = 17 if name in ('valid-failure', 'success-nonzero') else 23 if name == 'missing-nonzero' else 0
+        (case / 'backend.stdout').write_text(raw)
+        (case / 'backend.stderr').write_text(noise)
+        (case / 'backend.exit').write_text(str(exit_code) + '\n')
+        result, value = run(case, boundary)
+        label = boundary + '/' + name
+        check(label + ': observed status and complete receipt agree',
+              result.returncode == expected and value.get('exit_code') == expected and
+              value.get('status') == ('success' if success else 'failed'))
+        if success:
+            check(label + ': valid multiline receipt preserves the actual artifact identity',
+                  value.get('artifact_path') == str(artifact) and value.get('method') == receipt['method'])
+            check(label + ': caller umask still controls backend-created files',
+                  int((case / 'backend.umask').read_text().strip(), 8) == 0o027 and
+                  stat.S_IMODE((case / 'backend.created').stat().st_mode) == 0o640)
+            if boundary == 'worker':
+                check(label + ': private stdout mode does not change backend noclobber policy',
+                      stat.S_IMODE((case / 'attempt.json.stdout').stat().st_mode) == 0o600 and
+                      'C' in (case / 'backend.flags').read_text())
+                frozen = value.get('resume_artifacts', [])
+                check(label + ': real artifact bytes become durable reuse evidence',
+                      len(frozen) == 1 and frozen[0]['path'] == str(artifact) and
+                      frozen[0]['sha256'] == hashlib.sha256(artifact.read_bytes()).hexdigest())
+        else:
+            check(label + ': invalid or unsuccessful output cannot authorize reuse',
+                  'resume_artifacts' not in value and value.get('status') != 'success')
+        diagnostics = (case / 'attempt.log').read_bytes() if boundary == 'worker' else result.stderr
+        check(label + ': original diagnostic text is retained', noise.encode() in diagnostics)
+
+# The raw attempt channel is write-once too; a conflicting file, link, FIFO or
+# directory cannot be overwritten or opened by a backend before admission.
+for kind in ('regular', 'symlink', 'fifo', 'directory'):
+    case, artifact, receipt = fixture('worker', 'occupied-' + kind)
+    path = case / 'attempt.json.stdout'
+    held = case / 'held-evidence'
+    held.write_bytes(b'original retained evidence\n')
+    if kind == 'regular':
+        path.write_bytes(held.read_bytes())
+    elif kind == 'symlink':
+        path.symlink_to(held)
+    elif kind == 'fifo':
+        os.mkfifo(path)
+    else:
+        path.mkdir()
+    (case / 'backend.stdout').write_text(json.dumps(receipt) + '\n')
+    (case / 'backend.stderr').write_text('backend must never run\n')
+    (case / 'backend.exit').write_text('0\n')
+    before = path.lstat()
+    result, value = run(case, 'worker')
+    after = path.lstat()
+    check('worker/occupied-' + kind + ': refuse before execution and preserve prior evidence',
+          result.returncode != 0 and value.get('status') == 'failed' and
+          value.get('backend_started') is False and
+          not (case / 'backend.started').exists() and
+          (before.st_dev, before.st_ino, before.st_mode, before.st_size) ==
+          (after.st_dev, after.st_ino, after.st_mode, after.st_size) and
+          held.read_bytes() == b'original retained evidence\n' and
+          (kind != 'regular' or path.read_bytes() == held.read_bytes()))
+
+# Exercise the real workflow producer around an external act executable.
+# No Docker/compiler behavior is simulated as proof of compilation here.
+for name in ('success', 'failure', 'serializer'):
+    case, artifact, receipt = fixture('workflow', name)
+    (case / 'workflow.yml').write_text('name: fixture\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n')
+    (case / 'bin').mkdir()
+    executable = case / 'bin/act'
+    executable.write_text('''#!/usr/bin/env bash
+set -uo pipefail
+while (( $# )); do
+    if [[ "$1" == --artifact-server-path ]]; then
+        printf 'real workflow output\\n' > "$2/output.bin"
+        shift
+    fi
+    shift
+done
+printf 'workflow stdout diagnostic\\n'
+printf '{"status":"success","artifact_count":999,"log_record":true}\\n'
+printf 'workflow stderr diagnostic\\n' >&2
+exit ''' + ('17' if name == 'failure' else '0') + '\n')
+    executable.chmod(0o700)
+    result, value = run(case, 'workflow-serializer' if name == 'serializer' else 'workflow')
+    expected = 4 if name == 'serializer' else 6 if name == 'failure' else 0
+    check('workflow/' + name + ': actual producer preserves execution or serialization failure',
+          result.returncode == expected and
+          (not result.stdout if name == 'serializer' else
+           value.get('exit_code') == expected and value.get('artifact_count') == 1 and
+           value.get('status') == ('success' if name == 'success' else 'failed')))
+    check('workflow/' + name + ': stdout and stderr logs stay diagnostic',
+          b'workflow stdout diagnostic' in result.stderr and
+          b'workflow stderr diagnostic' in result.stderr and
+          b'"log_record":true' in result.stderr and b'"log_record":true' not in result.stdout)
+    logs = list((case / 'logs').glob('*.log'))
+    check('workflow/' + name + ': original compiler streams remain in the durable log',
+          len(logs) == 1 and b'workflow stdout diagnostic' in logs[0].read_bytes() and
+          b'workflow stderr diagnostic' in logs[0].read_bytes())
+
+(root / 'summary.json').write_text(json.dumps(dict(checks=checks, failures=failures)) + '\n')
+print('Backend receipt isolation: %d checks, %d failures' % (checks, len(failures)), flush=True)
+raise SystemExit(bool(failures))
+PY
+}
+
+if [[ "${1:-}" == --backend-receipt-only ]]; then
+    test_backend_receipt_isolation
+    exit $?
+fi
 
 test_receipt_producer() {
     local project_root dependency
@@ -10064,6 +10322,12 @@ case "$recipe_binding_status" in
     77) skip "repository recipe binding integration requires its local fixture dependencies" ;;
     *) fail "repository recipe drift admitted stale completed output or prevented an honest retry" ;;
 esac
+
+if test_backend_receipt_isolation; then
+    pass "backend and worker stdout retain exact result authority independent of diagnostic logs"
+else
+    fail "diagnostic output authorized backend success or replaced an exact worker result"
+fi
 
 if test_receipt_producer; then
     pass "artifact receipt producer preserves complete bytes and hashing custody"
