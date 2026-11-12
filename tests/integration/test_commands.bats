@@ -130,7 +130,7 @@ EOF
     old_time=$(date -u -d "15 minutes ago" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -v-15M +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "2026-01-30T11:45:00Z")
 
     # Mock gh to return a queued run that's been waiting too long
-    _mock_gh_runs "{\"workflow_runs\":[{\"id\":12345,\"status\":\"queued\",\"created_at\":\"$old_time\",\"name\":\"Release\"}]}"
+    _mock_gh_runs "{\"workflow_runs\":[{\"id\":12345,\"status\":\"queued\",\"run_attempt\":1,\"created_at\":\"$old_time\",\"name\":\"Release\"}]}"
 
     run harness_run_dsr check ntm
     # Should fail (throttling detected)
@@ -199,6 +199,12 @@ if [[ "$1" == auth ]]; then
 fi
 if [[ "$1" == api ]]; then
     [[ -s "$TEST_TMPDIR/runs.json" ]] || { echo 'gh: Bad gateway (HTTP 502)' >&2; exit 1; }
+    if [[ "$2" =~ ^repos/Dicklesworthstone/ntm/actions/runs/([0-9]+)(/attempts/[0-9]+)?/jobs\? ]]; then
+        jq -e --arg id "${BASH_REMATCH[1]}" '.workflow_runs | any(.[];
+            (.id | tostring) == $id and .status == "queued")' "$TEST_TMPDIR/runs.json" >/dev/null || exit 99
+        printf '%s\n' '{"total_count":0,"jobs":[]}'
+        exit 0
+    fi
     if [[ "$*" == *repos/Dicklesworthstone/ntm/* ]]; then
         desired=""
         [[ "$*" == *status=queued* ]] && desired=queued
@@ -229,7 +235,7 @@ _minutes_ago() {
 
 # A queued run of release.yml, 15 minutes old, started by tag v1.2.3.
 _queued_release_run() {
-    printf '{"workflow_runs":[{"id":12345,"status":"queued","created_at":"%s","name":"Release","path":".github/workflows/release.yml","head_branch":"v1.2.3","head_sha":"1111111111111111111111111111111111111111","html_url":"https://github.com/Dicklesworthstone/ntm/actions/runs/12345"}]}' \
+    printf '{"workflow_runs":[{"id":12345,"status":"queued","run_attempt":1,"created_at":"%s","name":"Release","path":".github/workflows/release.yml","head_branch":"v1.2.3","head_sha":"1111111111111111111111111111111111111111","html_url":"https://github.com/Dicklesworthstone/ntm/actions/runs/12345"}]}' \
         "$(_minutes_ago 15)"
 }
 
@@ -245,7 +251,7 @@ _mock_active_inventory() {
     export ACTIVE_FIXTURE_CASE="$1" GH_MAX_RETRIES=1 GH_RETRY_DELAY=0
     jq -n --arg mode "$1" --arg old "$(_minutes_ago 15)" --arg fresh "$(_minutes_ago 1)" '
         def run($id; $status; $time):
-            {id:$id,status:$status,created_at:$time,run_started_at:$time,
+            {id:$id,status:$status,created_at:$time,run_started_at:$time,run_attempt:1,
              name:"Release",workflow_id:17,path:".github/workflows/release.yml",
              head_branch:"v1.2.3",head_sha:"1111111111111111111111111111111111111111",event:"push",
              html_url:("https://github.com/Dicklesworthstone/ntm/actions/runs/"+($id|tostring))};
@@ -274,6 +280,12 @@ for arg in "$@"; do
     [[ "$arg" == repos/*/actions/* ]] && endpoint="$arg"
 done
 [[ -n "$endpoint" ]] || exit 99
+if [[ "$endpoint" =~ /runs/([0-9]+)(/attempts/[0-9]+)?/jobs\? ]]; then
+    jq -e --arg id "${BASH_REMATCH[1]}" 'any(.[];
+        (.id | tostring) == $id and .status == "queued")' "$TEST_TMPDIR/active-history.json" >/dev/null || exit 99
+    printf '%s\n' '{"total_count":0,"jobs":[]}'
+    exit 0
+fi
 desired=""
 [[ "$endpoint" == *status=queued* ]] && desired=queued
 [[ "$endpoint" == *status=in_progress* ]] && desired=in_progress
@@ -403,7 +415,9 @@ _mock_job_inventory() {
         elif $mode == "recent-completion" then
             [job(1;"completed") + {completed_at:$fresh},job(2;"queued")]
         elif $mode == "recent-queue" then [job(1;"queued") + {created_at:$fresh}]
-        elif $mode == "empty" then []
+        elif $mode == "all-completed" then [job(1;"completed") + {completed_at:$old}]
+        elif $mode == "empty" or $mode == "initial-empty" or $mode == "fresh-run" or
+             $mode == "unproven-empty" or $mode == "unproven-attempt" then []
         elif $mode == "later-running" or $mode == "later-queued" or $mode == "later-error" or $mode == "duplicate" or
              $mode == "latest-paged" or $mode == "latest-mixed-pages" or $mode == "latest-unpinned-pages" then
             [range(1;101) | job(.;"completed") + {completed_at:$old}] +
@@ -419,9 +433,14 @@ _mock_job_inventory() {
         elif $mode == "invalid-time" then [job(1;"queued") | .created_at="not-a-time"]
         else [job(1;"queued")] end
     ' > "$TEST_TMPDIR/job-history.json"
-    jq -n --arg old "$(_minutes_ago 60)" --arg mode "$1" '
-        {total_count:1,workflow_runs:[{id:555,status:"in_progress",created_at:$old,run_started_at:$old,
-         run_attempt:(if $mode | startswith("latest") then null else 2 end),name:"Release",workflow_id:17,
+    jq -n --arg old "$(_minutes_ago 60)" --arg fresh "$(_minutes_ago 1)" \
+        --arg mode "$1" --arg status "${2:-in_progress}" '
+        {total_count:1,workflow_runs:[{id:555,status:$status,created_at:$old,
+         run_started_at:(if $mode == "fresh-run" then $fresh
+                         elif $mode == "initial-empty" or $mode == "unproven-empty" or
+                              $mode == "unproven-jobs" or $mode == "unproven-attempt" then null else $old end),
+         run_attempt:(if ($mode | startswith("latest")) or $mode == "unproven-attempt" then null
+                      elif $mode == "initial-empty" then 1 else 2 end),name:"Release",workflow_id:17,
          path:".github/workflows/release.yml",head_branch:"v1.2.3",
          head_sha:"1111111111111111111111111111111111111111",event:"push",
          html_url:"https://github.com/Dicklesworthstone/ntm/actions/runs/555"}]}
@@ -449,13 +468,150 @@ if [[ "$endpoint" == *'/jobs?'* ]]; then
         elif $mode == "short-page" then .total_count=2
         elif $mode == "duplicate" and $page == 2 then .jobs[0].id=1
         else . end' "$TEST_TMPDIR/job-history.json"
-elif [[ "$endpoint" == *status=in_progress* ]]; then
-    cat "$TEST_TMPDIR/job-workflow.json"
-elif [[ "$endpoint" == *status=queued* ]]; then
-    printf '%s\n' '{"total_count":0,"workflow_runs":[]}'
+elif [[ "$endpoint" == *status=in_progress* || "$endpoint" == *status=queued* ]]; then
+    desired=queued
+    [[ "$endpoint" != *status=in_progress* ]] || desired=in_progress
+    jq --arg desired "$desired" '.workflow_runs | map(select(.status == $desired)) |
+        {total_count:length,workflow_runs:.}' "$TEST_TMPDIR/job-workflow.json"
 else exit 99; fi
 SCRIPT
 )"
+}
+
+@test "queued job evidence: running approval and recent activity suppress stale workflow status" {
+    harness_create_config
+    _setup_repos_d
+    local mode
+    for mode in running mixed approval pending recent-completion recent-queue all-completed; do
+        _mock_job_inventory "$mode" queued
+        run _routing_dsr --json check ntm
+        assert_equal 0 "$status"
+        jq -e '.details.throttled == [] and .details.healthy == ["Dicklesworthstone/ntm"] and
+            (.details.repos[0] | .queued_count == 0 and .stuck_in_progress_count == 0 and
+                .oldest_queued_seconds == 0 and .oldest_queued_minutes == 0)' <<< "$output"
+    done
+    grep -q 'runs/555/attempts/2/jobs?per_page=100&page=1' "$TEST_TMPDIR/gh.calls"
+}
+
+@test "queued job evidence: complete empty queues and stalled jobs remain actionable" {
+    harness_create_config
+    _setup_repos_d
+    local mode reason
+    for mode in empty initial-empty stalled; do
+        _mock_job_inventory "$mode" queued
+        run _routing_dsr --json check ntm
+        assert_equal 1 "$status"
+        reason=workflow_queue
+        [[ "$mode" != stalled ]] || reason=job_queue
+        jq -e --arg reason "$reason" '.details.healthy == [] and .details.skipped == [] and
+            (.details.throttled | length) == 1 and
+            (.details.throttled[0] | .run_id == 555 and .status == "queued" and
+                .queue_reason == $reason and .queue_time_seconds > 600 and
+                (if $reason == "job_queue" then .queued_job_ids == [1] else .queued_job_ids == null end)) and
+            (.details.repos[0] | .queued_count == 1 and .stuck_in_progress_count == 0 and
+                .oldest_queued_seconds > 600 and .oldest_queued_minutes >= 10)' <<< "$output"
+    done
+}
+
+@test "queued job evidence: queued attempts require current timing evidence" {
+    harness_create_config
+    _setup_repos_d
+    _mock_job_inventory fresh-run queued
+    run _routing_dsr --json check ntm
+    assert_equal 0 "$status"
+    jq -e '.details.throttled == [] and .details.healthy == ["Dicklesworthstone/ntm"]' <<< "$output"
+    run grep -q '/jobs?' "$TEST_TMPDIR/gh.calls"
+    assert_equal 1 "$status"
+    local mode
+    for mode in unproven-empty unproven-jobs unproven-attempt; do
+        _mock_job_inventory "$mode" queued
+        run _routing_dsr --json check ntm
+        assert_equal 8 "$status"
+        jq -e '.details.throttled == [] and .details.healthy == [] and
+            .details.skipped == [{repo:"Dicklesworthstone/ntm",run_id:555,reason:"failed to inspect workflow jobs"}] and
+            (.details.repos[0] | .queued_count == 0 and .oldest_queued_seconds == 0)' <<< "$output"
+    done
+}
+
+@test "queued job evidence: unreadable or mismatched jobs cannot authorize fallback" {
+    harness_create_config
+    _setup_repos_d
+    local mode
+    for mode in wrong-source wrong-run wrong-attempt invalid-time malformed short-page cap later-error; do
+        _mock_job_inventory "$mode" queued
+        run _routing_dsr --json check ntm
+        assert_equal 8 "$status"
+        jq -e '.details.throttled == [] and .details.healthy == [] and
+            .details.skipped == [{repo:"Dicklesworthstone/ntm",run_id:555,reason:"failed to inspect workflow jobs"}] and
+            (.details.repos[0] | .queued_count == 0 and .stuck_in_progress_count == 0 and
+                .oldest_queued_seconds == 0)' <<< "$output"
+    done
+}
+
+@test "queued job evidence: later job pages determine whether the workflow is stalled" {
+    harness_create_config
+    _setup_repos_d
+    _mock_job_inventory later-running queued
+    run _routing_dsr --json check ntm
+    assert_equal 0 "$status"
+    jq -e '.details.throttled == [] and .details.healthy == ["Dicklesworthstone/ntm"]' <<< "$output"
+    local mode
+    for mode in later-queued latest-paged; do
+        _mock_job_inventory "$mode" queued
+        run _routing_dsr --json check ntm
+        assert_equal 1 "$status"
+        jq -e '.details.throttled | length == 1 and
+            (.[0] | .run_id == 555 and .status == "queued" and .queue_reason == "job_queue" and
+                .queued_job_ids == [101])' <<< "$output"
+    done
+    grep -q 'runs/555/jobs?filter=latest&per_page=100&page=1' "$TEST_TMPDIR/gh.calls"
+    grep -q 'runs/555/attempts/2/jobs?per_page=100&page=2' "$TEST_TMPDIR/gh.calls"
+}
+
+@test "queued job evidence: one unreadable queued run preserves independently proven releases" {
+    harness_create_config
+    _setup_repos_d
+    _mock_independent_job_inventory queued-transport
+    run _routing_dsr --json check ntm
+    assert_equal 1 "$status"
+    jq -e '(.details.throttled | map(.run_id)) == [101,202] and
+        .details.skipped == [{repo:"Dicklesworthstone/ntm",run_id:201,reason:"failed to inspect workflow jobs"}] and
+        (.details.repos[0] | .queued_count == 1 and .stuck_in_progress_count == 1 and
+            .oldest_queued_seconds > 600)' <<< "$output"
+}
+
+@test "queued job evidence: cancellation withdraws previously inspected queued runs" {
+    harness_create_config
+    _setup_repos_d
+    local code
+    for code in 2 130; do
+        export INDEPENDENT_CANCEL_CODE="$code"
+        _mock_independent_job_inventory queued-cancel
+        run _routing_dsr --json check ntm
+        assert_equal 5 "$status"
+        jq -e '.status == "error" and .exit_code == 5 and .details.throttled == [] and
+            .details.healthy == [] and .details.skipped[0].run_id == 201' <<< "$output"
+        [[ ! -e "$DSR_STATE_DIR/check/last.json" ]]
+    done
+    run grep -Eq 'runs/(202|203|204)/attempts/2/jobs' "$TEST_TMPDIR/gh.calls"
+    assert_equal 1 "$status"
+}
+
+@test "queued job evidence: real watch waits for running jobs and starts a proven empty queue" {
+    harness_create_config
+    _watch_configure_ntm
+    _mock_job_inventory mixed queued
+    DSR_WATCH_FIXTURE_REAL_CHECK=1 run --separate-stderr _routing_watch '{}' --auto-fallback
+    assert_equal 0 "$status"
+    jq -e '.details.triggered_state.attempts == {} and .details.triggered_state.pending == {}' <<< "$output"
+    [[ ! -e "$TEST_TMPDIR/fallback.args" && ! -e "$DSR_STATE_DIR/watch-attempts" ]]
+    _mock_job_inventory empty queued
+    DSR_WATCH_FIXTURE_REAL_CHECK=1 run --separate-stderr _routing_watch '{}' --auto-fallback
+    assert_equal 0 "$status"
+    _watch_completed 555
+    jq -e '.attempts["555"] | .attempt == 1 and .head_sha == "1111111111111111111111111111111111111111" and
+        .version == "v1.2.3" and .isolate_source == true' "$DSR_STATE_DIR/triggered.json"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
 }
 
 # Distinct releases can share a repository without sharing job-inspection
@@ -468,7 +624,8 @@ _mock_independent_job_inventory() {
             {id:$id,status:$status,created_at:$old,run_started_at:$old,run_attempt:2,
              name:"Release",workflow_id:17,path:".github/workflows/release.yml",
              head_branch:("v1.2."+($id|tostring)),head_sha:("1"*40),event:"push"};
-        {ntm:([workflow(201;"in_progress"),workflow(203;"in_progress"),workflow(204;"in_progress")] +
+        {ntm:([workflow(201;(if $mode | startswith("queued-") then "queued" else "in_progress" end)),
+               workflow(203;"in_progress"),workflow(204;"in_progress")] +
               (if $mode == "unreadable" or $mode == "cross-repo" or $mode == "cross-repo-cancel" then []
                elif $mode == "job-only" then [workflow(202;"in_progress")]
                else [workflow(101;"queued"),workflow(202;"in_progress")] end)),
@@ -485,9 +642,13 @@ endpoint=""
 for arg in "$@"; do [[ "$arg" == repos/*/actions/* ]] && endpoint="$arg"; done
 if [[ "$endpoint" =~ /runs/([0-9]+)/attempts/2/jobs\? ]]; then
     run_id="${BASH_REMATCH[1]}"
+    if [[ "$run_id" == 101 || "$run_id" == 301 ]]; then
+        printf '%s\n' '{"total_count":0,"jobs":[]}'
+        exit 0
+    fi
     if [[ "$run_id" == 201 ]]; then
         case "$INDEPENDENT_JOB_CASE" in
-            cancel-jobs|cross-repo-cancel) exit "${INDEPENDENT_CANCEL_CODE:-2}" ;;
+            cancel-jobs|cross-repo-cancel|queued-cancel) exit "${INDEPENDENT_CANCEL_CODE:-2}" ;;
             wrong-source|wrong-attempt|invalid-time|malformed|short-page|recovered) ;;
             *) printf 'gh: Bad gateway (HTTP 502)\n' >&2; exit 1 ;;
         esac

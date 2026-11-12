@@ -1792,10 +1792,15 @@ _check_waiting_jobs() {
         .[0] as $run | .[1].jobs as $jobs |
         if any($jobs[]; (.head_sha | ascii_downcase) != ($run.head_sha | ascii_downcase))
         then error("job source differs from observed workflow") else . end |
+        if $run.status == "queued" and $run.run_attempt != 1 and $run.run_started_at == null and
+            all($jobs[]; .created_at == null and .started_at == null and .completed_at == null)
+        then error("queued attempt has no current activity timestamp") else . end |
         ([($run.run_started_at // $run.created_at | fromdateiso8601)] +
             [$jobs[] | .created_at,.started_at,.completed_at | select(. != null) | fromdateiso8601]) | max as $activity |
         [$jobs[] | select(.status == "queued") | .id] as $queued |
-        if ($queued | length) > 0 and all($jobs[]; .status == "queued" or .status == "completed") and
+        if ($jobs | length) == 0 and $run.status == "queued" and $now - $activity > $threshold
+        then $run + {age_seconds:($now - $activity),queue_reason:"workflow_queue"}
+        elif ($queued | length) > 0 and all($jobs[]; .status == "queued" or .status == "completed") and
             $now - $activity > $threshold
         then $run + {age_seconds:($now - $activity),queue_reason:"job_queue",queued_job_ids:$queued}
         else null end
@@ -1852,15 +1857,14 @@ _check_repo() {
             --argjson now "$now" --argjson threshold "$threshold" '
         .workflow_runs | map(
             (.created_at | fromdateiso8601) as $created |
-            (if .status == "in_progress" and .run_started_at != null
+            (if .run_started_at != null
              then (.run_started_at | fromdateiso8601) else $created end) as $start |
             ($now - $start) as $age | select($age > $threshold) |
             {id: .id, status: .status, created_at: .created_at,
              workflow_id: .workflow_id, workflow_name: .name, path: .path,
              head_branch: .head_branch, head_sha: .head_sha,
              run_attempt: .run_attempt, event: .event, html_url: .html_url,
-             age_seconds: $age, queue_reason:"workflow_queue"} +
-            (if .status == "in_progress" then {run_started_at: .run_started_at} else {} end)
+             age_seconds: $age, queue_reason:"workflow_queue",run_started_at: .run_started_at}
         ) |
         {queued_runs: map(select(.status == "queued")),
          stuck_runs: map(select(.status == "in_progress"))} |
@@ -1877,9 +1881,10 @@ _check_repo() {
         return 8
     fi
 
-    # An elapsed workflow duration cannot distinguish runner starvation from
-    # a legitimate long compile. Only a complete job inventory showing queued
-    # jobs, no executing/approval-pending jobs, and no recent activity can do so.
+    # GitHub can label a workflow queued while some of its jobs are running.
+    # Inspect both active statuses: an elapsed duration alone cannot authorize
+    # fallback during a legitimate compile or an approval gate. A complete
+    # empty inventory remains evidence for an old, wholly queued workflow.
     # Each inventory authorizes only its own run. An unreadable run cannot
     # invalidate a separately proven queue from this complete active listing.
     local run checked inspection_status
@@ -1898,14 +1903,18 @@ _check_repo() {
                 '{run_id:$run_id,reason:"failed to inspect workflow jobs"}') || return 8
         fi
         [[ "$checked" == null ]] || job_observations+=("$checked")
-    done < <(jq -c '.stuck_runs[]' <<< "$result")
+    done < <(jq -c '.queued_runs[], .stuck_runs[]' <<< "$result")
     result=$({
         printf '%s\n' "$result"
         if ((${#job_observations[@]})); then printf '%s\n' "${job_observations[@]}"; fi
     } | jq -sc '.[0] + {
+            queued_runs:[.[1:][] | select(.status == "queued")],
             stuck_runs:[.[1:][] | select(.status == "in_progress")],
             job_errors:[.[1:][] | select(.reason != null)]} |
+        .queued_count = (.queued_runs | length) |
         .stuck_in_progress_count = (.stuck_runs | length) |
+        .oldest_queued_seconds = ([.queued_runs[].age_seconds] | max // 0) |
+        .oldest_queued_minutes = ((.oldest_queued_seconds / 60) | floor) |
         .status = (if .queued_count > 0 or .stuck_in_progress_count > 0 then "throttled"
                    elif (.job_errors | length) > 0 then "error" else "ok" end) |
         if .status == "error" then . + {error:"failed to inspect workflow jobs"} else . end') || return 8

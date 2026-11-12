@@ -457,19 +457,26 @@ makes that repository unreadable (`details.skipped`), never healthy. A known
 throttled run in another successfully checked repository still takes exit-code
 precedence over the unreadable repository.
 
-An in-progress run is not throttled solely because it has run for a long
-time. DSR reads the complete job inventory for that observed run attempt
+A queued or in-progress run is not throttled solely because it is old. GitHub
+can report a workflow as queued while some jobs are already executing. For
+each candidate older than the threshold, DSR reads the complete job inventory
+for that observed run attempt
 (or explicitly requests the latest jobs if the attempt is unavailable).
 Latest-job pagination requires every first-page job to identify the same
 attempt; subsequent pages are pinned to it. Ambiguous attempts or missing
 attempt evidence block pagination instead of combining separate reruns.
-At least one job must be queued, every other job must be completed, and
+In a nonempty inventory, at least one job must be queued, every other job must be completed, and
 the latest available run/job timestamp must exceed the threshold. Executing
 jobs and approval-pending jobs suppress this automatic fallback decision.
 Recent job creation or completion restarts the queue clock. Job inventories
 that cannot be fully read within the 1,000-job safety bound, contain invalid
 metadata, or disagree with the observed run/source/attempt are unreadable.
-An unreadable job inventory excludes only that run: queued workflows and
+An empty complete inventory authorizes only an old queued workflow, never an
+in-progress one. Only an explicitly observed first attempt may use workflow
+creation time as its sole timing evidence; reruns and unknown attempts need a
+current run-start or job-activity timestamp. Each aged queued candidate now
+requires its own uncached job lookup before admission.
+An unreadable job inventory excludes only that run: independently verified queued workflows and
 independently verified stalled runs from the same complete active-run listing
 remain actionable. Each unreadable run is reported in `details.skipped` with
 its `repo`, `run_id`, and `reason`, and in the repository's `job_errors` array.
@@ -485,7 +492,8 @@ and single-pass watchers stop on that cancellation without launching workers
 or starting another poll.
 
 Each throttled row includes `queue_reason: "workflow_queue"` for a queued
-workflow or `queue_reason: "job_queue"` for stalled job dispatch. The latter
+workflow with a complete empty job inventory, or `queue_reason: "job_queue"`
+for stalled job dispatch in either workflow status. The latter
 also includes the nonempty `queued_job_ids` array and measures
 `queue_time_seconds` from the latest available activity.
 
