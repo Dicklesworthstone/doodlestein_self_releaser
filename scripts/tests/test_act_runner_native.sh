@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_act_runner_native.sh - Unit tests for act_runner.sh native build SSH logic
 #
-# Usage: ./test_act_runner_native.sh [--typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --workspace-archives-only | --failure-evidence-only | --env-precedence-only | --archive-delivery-only | --zig-dispatch-only | --glibc-routing-only | --windows-launcher-transfer-only]
+# Usage: ./test_act_runner_native.sh [--typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --workspace-archives-only | --failure-evidence-only | --env-precedence-only | --archive-delivery-only | --zig-dispatch-only | --glibc-routing-only | --windows-launcher-transfer-only | --artifact-transfer-only]
 #
 # Tests native build SSH command construction with mocks.
 # Covers: command construction, path handling, env vars, SCP, error handling.
@@ -11,6 +11,341 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SRC_DIR="$PROJECT_ROOT/src"
+
+# Run real native collection and external SSH/SCP processes under the existing
+# transfer budget. Host readiness and compiler execution are controlled; the
+# collector, destination custody, process supervisor and result JSON are real.
+test_native_artifact_transfer_deadline() {
+    local dependency
+    for dependency in bash python3 jq yq git gzip iconv base64 ps; do
+        command -v "$dependency" >/dev/null || { printf 'Missing test dependency: %s\n' "$dependency" >&2; return 3; }
+    done
+    python3 -I - "$PROJECT_ROOT" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import zipfile
+
+root = Path(sys.argv[1])
+module = Path(os.environ.get('DSR_TEST_ACT_RUNNER', str(root / 'src/act_runner.sh'))).resolve()
+work = Path(tempfile.mkdtemp(prefix='dsr-native-artifact-transfer-'))
+print('Retained native artifact transfer evidence: ' + str(work), flush=True)
+checks = failures = 0
+
+
+def check(label, condition):
+    global checks, failures
+    checks += 1
+    failures += not condition
+    print(('PASS: ' if condition else 'FAIL: ') + label, flush=True)
+
+
+def fingerprint(path):
+    path = Path(path)
+    info = path.stat()
+    return (info.st_dev, info.st_ino, stat.S_IMODE(info.st_mode), info.st_size,
+            hashlib.sha256(path.read_bytes()).hexdigest())
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    if Path('/proc/self/stat').is_file():
+        try:
+            state = (Path('/proc') / str(pid) / 'stat').read_text().rsplit(') ', 1)[1].split()[0]
+        except FileNotFoundError:
+            return False
+        return state not in ('Z', 'X')
+    state = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)],
+                           capture_output=True, text=True, timeout=2).stdout.strip()
+    return bool(state) and not state.startswith('Z')
+
+
+bin_dir = work / 'bin'
+bin_dir.mkdir()
+transport = r'''#!/usr/bin/env python3
+import base64, hashlib, json, os, re, shlex, subprocess, sys, time
+from pathlib import Path
+case = Path(os.environ['DSR_COLLECTION_CASE'])
+kind = Path(sys.argv[0]).name
+if kind == 'scp':
+    source, destination = sys.argv[-2:]
+    if ':' in destination:
+        # The real Windows compiler launcher upload precedes collection.
+        Path(source).read_bytes()
+        raise SystemExit(0)
+    name = source.rsplit('/', 1)[-1]
+else:
+    command = sys.argv[-1]
+    if '-EncodedCommand ' in command:
+        decoded = base64.b64decode(command.rsplit(' ', 1)[-1]).decode('utf-16-le')
+        match = re.search(r"OpenRead\('((?:[^']|'')*)'\)", decoded)
+        if not match:
+            raise SystemExit('unexpected Windows stream command')
+        source = match.group(1).replace("''", "'")
+    else:
+        arguments = shlex.split(command)
+        if arguments[:2] != ['cat', '--'] or len(arguments) != 3:
+            raise SystemExit('unexpected Unix stream command')
+        source = arguments[-1]
+    name = source.rsplit('/', 1)[-1]
+    destination = os.environ['DSR_COLLECTION_DESTINATION']
+payload_path = Path(os.environ['DSR_COLLECTION_INPUTS']) / name
+record = dict(kind=kind, pid=os.getpid(), pgid=os.getpgrp(), source=source,
+              destination=destination, name=name, child=None, started=time.monotonic(),
+              stdin_bytes=len(sys.stdin.buffer.read()), arguments=sys.argv[1:])
+mode = os.environ['DSR_COLLECTION_MODE'] if name == os.environ['DSR_COLLECTION_FAULT'] else 'success'
+if not payload_path.is_file():
+    record['missing'] = True
+else:
+    payload = payload_path.read_bytes()
+    record.update(bytes=len(payload), sha256=hashlib.sha256(payload).hexdigest())
+    data = payload[:97] if mode in ('fail', 'stall') else payload
+    if kind == 'scp':
+        Path(destination).write_bytes(data)
+    else:
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+    if mode == 'stall':
+        ready = case / (name + '.child-ready')
+        child = subprocess.Popen([sys.executable, '-c',
+            'import os, signal, sys, time; from pathlib import Path; '
+            'signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+            'Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(30)', str(ready)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        until = time.monotonic() + 2
+        while not ready.exists() and time.monotonic() < until:
+            time.sleep(0.01)
+        if not ready.exists():
+            raise SystemExit('fixture child failed to start')
+        record['child'] = child.pid
+with (case / 'transfers.jsonl').open('a') as stream:
+    stream.write(json.dumps(record) + '\n')
+print('controlled transfer diagnostic: ' + name, file=sys.stderr, flush=True)
+if mode == 'stall' and not record.get('missing'):
+    time.sleep(30)
+raise SystemExit(23 if mode == 'fail' or record.get('missing') else 0)
+'''
+for name in ('ssh', 'scp'):
+    (bin_dir / name).write_text(transport)
+    (bin_dir / name).chmod(0o700)
+
+driver = work / 'driver.bash'
+driver.write_text(r'''#!/usr/bin/env bash
+set -uo pipefail
+source "$DSR_COLLECTION_PROJECT/src/config.sh" || exit $?
+source "$DSR_COLLECTION_MODULE" || exit $?
+host_health_is_ready() { return 0; }
+_act_is_windows_host() { return 0; }
+_act_is_local_host() { return 1; }
+_act_get_ssh_destination() { printf 'fixture-windows\n'; }
+_act_windows_storage_config() { return 1; }
+_act_ssh_exec() {
+    local decoded
+    decoded=$(_act_windows_command_script "$2") || return 94
+    if [[ "$decoded" == *'Launcher digest mismatch'* ]]; then
+        printf 'completed compiler\n' >> "$DSR_COLLECTION_CASE/build-events"
+        printf 'controlled compiler completed\n'
+    fi
+    return 0
+}
+_ACT_SYNC_TIMEOUT=1
+_ACT_SSH_TIMEOUT=1
+_ACT_BUILD_TIMEOUT=1
+case "$1" in
+    unix)
+        _act_collect_stream_exclusive "$DSR_COLLECTION_DESTINATION" 600 \
+            _act_stream_remote_unix_file fixture-unix /fixture/payload.bin
+        ;;
+    windows)
+        _act_collect_stream_exclusive "$DSR_COLLECTION_DESTINATION" 600 \
+            _act_stream_remote_windows_file fixture-windows C:/fixture/payload.bin
+        ;;
+    ordinary)
+        act_run_native_build collect windows/amd64 1.0.0 \
+            44444444-4444-4444-8444-444444444444 '' '' '' fixture
+        ;;
+    strict)
+        act_run_native_build collect windows/amd64 1.0.0 \
+            44444444-4444-4444-8444-444444444444 C:/fixture/release/source \
+            "$DSR_COLLECTION_SHA" v1.0.0 fixture
+        ;;
+    *) exit 94 ;;
+esac
+''')
+config = work / 'config'
+(config / 'repos.d').mkdir(parents=True)
+source = work / 'source'
+source.mkdir()
+(source / 'main.ts').write_text('console.log("collection fixture");\n')
+subprocess.run(['git', '-C', str(source), 'init', '-q', '-b', 'main'], check=True)
+subprocess.run(['git', '-C', str(source), 'add', 'main.ts'], check=True)
+subprocess.run(['git', '-C', str(source), '-c', 'user.name=DSR fixture',
+    '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false',
+    'commit', '-qm', 'Native transfer fixture'], check=True)
+sha = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD']).decode().strip()
+(config / 'hosts.yaml').write_text(json.dumps({'hosts': {'fixture': {
+    'platform': 'windows/amd64', 'connection': 'ssh', 'ssh_host': 'fixture-windows'}}}))
+inputs = work / 'inputs'
+inputs.mkdir()
+payload = bytes(range(256)) * 64
+(inputs / 'payload.bin').write_bytes(payload)
+header = b'MZ' + b'\0' * 58 + b'\x40\0\0\0PE\0\0\x64\x86' + b'\0' * 18 + b'\x0b\x02' + b'\0' * 6
+(inputs / 'collect.exe').write_bytes(header + payload)
+(inputs / 'NOTICE').write_bytes(b'retained archive member\n' * 10)
+(inputs / 'metadata.json').write_text(json.dumps({'source': sha, 'value': 'retained companion'}))
+environment = dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ['PATH'],
+    DSR_COLLECTION_MODULE=str(module), DSR_COLLECTION_PROJECT=str(root),
+    DSR_COLLECTION_INPUTS=str(inputs), DSR_COLLECTION_SHA=sha,
+    DSR_CONFIG_DIR=str(config), DSR_HOSTS_FILE=str(config / 'hosts.yaml'),
+    ACT_REPOS_DIR=str(config / 'repos.d'), ACT_ARTIFACTS_DIR=str(work / 'artifacts'),
+    ACT_LOGS_DIR=str(work / 'logs'), RCH_REQUIRE_REMOTE='0', NO_COLOR='1')
+
+
+def invoke(label, operation, mode='success', fault='payload.bin', family=False, destination=None):
+    case = work / label
+    case.mkdir()
+    recipe = {'tool_name': 'collect', 'language': 'bun', 'repo': 'owner/collect',
+        'local_path': str(source), 'binary_name': 'collect',
+        'build_cmd': 'bun build --compile ./main.ts --outfile collect.exe',
+        'host_paths': {'fixture': 'C:/fixture/source'}, 'targets': ['windows/amd64']}
+    if family:
+        recipe.update(workspace_binaries=['collect'], archive_format='zip',
+            workspace_archive_files={'windows/amd64': [{'name': 'NOTICE', 'executable': False}]},
+            workspace_additional_artifacts={'windows/amd64': [{'name': 'metadata.json', 'format': 'json'}]})
+    (config / 'repos.d/collect.yaml').write_text(json.dumps(recipe))
+    target = Path(destination) if destination else case / 'payload.bin'
+    env = dict(environment, DSR_COLLECTION_CASE=str(case), DSR_COLLECTION_MODE=mode,
+               DSR_COLLECTION_FAULT=fault, DSR_COLLECTION_DESTINATION=str(target))
+    outer = False
+    with (case / 'stdout').open('wb') as output, (case / 'stderr').open('wb') as error:
+        process = subprocess.Popen(['bash', str(driver), operation], env=env,
+            stdin=subprocess.PIPE, stdout=output, stderr=error, start_new_session=True)
+        process.stdin.write(b'caller input must not reach artifact transfers\n')
+        process.stdin.close()
+        try:
+            status = process.wait(timeout=12)
+        except subprocess.TimeoutExpired:
+            outer = True
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                status = process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                status = process.wait(timeout=2)
+    finished = time.monotonic()
+    records = [json.loads(line) for line in (case / 'transfers.jsonl').read_text().splitlines()] \
+        if (case / 'transfers.jsonl').exists() else []
+    live = [pid for row in records for pid in (row['pid'], row.get('child')) if pid and alive(pid)]
+    # Observe first; then retire only fixture-owned groups after a failed gate.
+    for row in records:
+        members = [pid for pid in (row['pid'], row.get('child')) if pid in live and alive(pid)]
+        if members and row['pgid'] > 1 and row['pgid'] != os.getpgrp():
+            if any(os.getpgid(pid) == row['pgid'] for pid in members):
+                os.killpg(row['pgid'], signal.SIGKILL)
+    try:
+        result = json.loads((case / 'stdout').read_text())
+    except (ValueError, UnicodeError):
+        result = {}
+    return case, target, status, outer, finished, records, live, result
+
+
+def stalled(label, operation, fault, family=False):
+    result = invoke(label, operation, 'stall', fault, family)
+    case, target, status, outer, finished, records, live, receipt = result
+    faults = [row for row in records if row['name'] == fault and not row.get('missing')]
+    check(label + ': real external transfer reaches the stalled producer',
+          len(faults) == 1 and bool(faults[0].get('child')))
+    check(label + ': one-second transfer budget returns before the independent failsafe',
+          not outer and bool(faults) and finished - faults[0]['started'] < 8)
+    check(label + ': owned process group drains the termination-resistant child', bool(faults) and not live)
+    if operation in ('unix', 'windows'):
+        check(label + ': partial bytes remain private and have no success receipt',
+              status == 7 and not receipt and target.is_file() and target.read_bytes() == payload[:97])
+    else:
+        check(label + ': native result refuses partial output after a completed compiler',
+              status == 7 and receipt.get('status') == 'failed' and not receipt.get('artifact_paths') and
+              not receipt.get('additional_artifacts') and
+              receipt.get('native_execution', {}).get('command_exit_code') == 0 and
+              (case / 'build-events').read_text().splitlines() == ['completed compiler']
+              if (case / 'build-events').exists() else False)
+    return result
+
+
+unix_failure = stalled('strict-unix-stall', 'unix', 'payload.bin')
+stalled('strict-windows-stall', 'windows', 'payload.bin')
+stalled('native-strict-stall', 'strict', 'collect.exe')
+stalled('ordinary-primary-stall', 'ordinary', 'collect.exe')
+(inputs / 'collect').write_bytes((inputs / 'collect.exe').read_bytes())
+(inputs / 'collect.exe').rename(inputs / 'retained-collect.exe')
+stalled('ordinary-fallback-stall', 'ordinary', 'collect')
+(inputs / 'retained-collect.exe').rename(inputs / 'collect.exe')
+# The bare-name fallback is unavailable for the other controlled failures.
+(inputs / 'collect').rename(inputs / 'retained-collect')
+stalled('ordinary-archive-stall', 'ordinary', 'NOTICE', True)
+stalled('ordinary-additional-stall', 'ordinary', 'metadata.json', True)
+
+failed_path = unix_failure[1]
+before = fingerprint(failed_path)
+case, _, status, outer, _, records, _, receipt = invoke(
+    'strict-existing-destination', 'unix', destination=failed_path)
+check('strict retry: existing partial inode is retained without another producer',
+      status == 4 and not outer and not receipt and not records and fingerprint(failed_path) == before)
+for operation in ('unix', 'windows'):
+    case, target, status, outer, _, records, live, receipt = invoke('strict-' + operation + '-success', operation)
+    check(operation + ': complete successful stream retains exact bytes and hash receipt',
+          status == 0 and not outer and not live and target.read_bytes() == payload and
+          receipt.get('sha256') == hashlib.sha256(payload).hexdigest() and
+          receipt.get('size_bytes') == len(payload) and receipt.get('path') == str(target))
+    check(operation + ': transport receives EOF and its diagnostics stay out of the receipt',
+          len(records) == 1 and records[0]['stdin_bytes'] == 0 and
+          'controlled transfer diagnostic' in (case / 'stderr').read_text() and
+          'controlled transfer diagnostic' not in (case / 'stdout').read_text())
+
+partial_paths = [Path(row['destination']) for label in ('ordinary-primary-stall', 'ordinary-fallback-stall',
+    'ordinary-archive-stall', 'ordinary-additional-stall')
+    if (work / label / 'transfers.jsonl').is_file()
+    for row in [json.loads(line) for line in (work / label / 'transfers.jsonl').read_text().splitlines()]
+    if not row.get('missing') and Path(row['destination']).is_file()]
+held = {str(path): fingerprint(path) for path in partial_paths}
+case, _, status, outer, _, records, live, receipt = invoke('ordinary-family-retry', 'ordinary', family=True)
+archive = Path(receipt.get('artifact_path', '/nonexistent-dsr-transfer-fixture'))
+check('native retry: all ordinary download branches complete with real archive and companion receipts',
+      status == 0 and not outer and not live and receipt.get('status') == 'success' and archive.is_file() and
+      [row['name'] for row in records] == ['collect.exe', 'NOTICE', 'metadata.json'] and
+      len(receipt.get('additional_artifacts', [])) == 1)
+if archive.is_file():
+    with zipfile.ZipFile(archive) as bundle:
+        exact_archive = sorted(bundle.namelist()) == ['NOTICE', 'collect.exe'] and all(
+            bundle.read(name) == (inputs / name).read_bytes() for name in bundle.namelist())
+else:
+    exact_archive = False
+companion = receipt.get('additional_artifacts', [{}])[0] if receipt.get('additional_artifacts') else {}
+check('native retry: published payload bytes and companion hash match the successful producer',
+      exact_archive and companion.get('sha256') == hashlib.sha256((inputs / 'metadata.json').read_bytes()).hexdigest())
+check('native retry: earlier partial destinations retain their bytes and inode identities',
+      len(held) >= 4 and all(fingerprint(path) == identity for path, identity in held.items()) and
+      all(row['destination'] not in held for row in records))
+check('ordinary transfers are noninteractive and cannot drain the caller input',
+      len(records) == 3 and all(row['stdin_bytes'] == 0 and 'BatchMode=yes' in row['arguments'] for row in records))
+print(f'Native artifact transfer: {checks-failures} passed, {failures} failed', flush=True)
+sys.exit(1 if failures else 0)
+PY
+}
+
+if [[ "${1:-}" == --artifact-transfer-only ]]; then
+    test_native_artifact_transfer_deadline
+    exit $?
+fi
 
 # Exercise the actual strict metadata and native build callers, generated
 # Windows payloads, external SCP process and owned deadline supervisor. Only

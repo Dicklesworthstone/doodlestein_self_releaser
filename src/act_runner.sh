@@ -170,7 +170,9 @@ _act_stream_remote_unix_file() {
     # -n: never forward the caller's stdin.  These streams run inside
     # `while read` collection loops; without -n ssh drains the loop's
     # remaining lines and every artifact after the first is silently lost.
-    ssh -n \
+    # Compilation has already finished. Its deadline cannot bound a stalled
+    # artifact stream, so supervise the complete transfer and its descendants.
+    _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh -n \
         -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
         -o BatchMode=yes \
         -o StrictHostKeyChecking=accept-new \
@@ -189,7 +191,8 @@ _act_stream_remote_windows_file() {
     ssh_destination=$(_act_get_ssh_destination "$host") || return 4
     command=$(_act_windows_encoded_powershell "$ps_command") || return 4
     command=$(_act_windows_storage_command "$host" "$command") || return 4
-    ssh -n -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
+    _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh -n \
+        -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
         -o StrictHostKeyChecking=accept-new "$ssh_destination" "$command"
 }
 
@@ -15050,9 +15053,10 @@ EOF
                     echo "Local cp failed for $bin: $copy_src" >> "$log_file"
                     download_failed=true
                 fi
-            elif scp_output=$(scp -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
+            elif scp_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" scp \
+                   -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
                    -o StrictHostKeyChecking=accept-new \
-                   "${ssh_destination}:${remote_artifact_path}" "$this_artifact_path" 2>&1); then
+                   "${ssh_destination}:${remote_artifact_path}" "$this_artifact_path" </dev/null 2>&1); then
                 _log_ok "Artifact downloaded: $this_artifact_path"
                 # Log file size for verification
                 if [[ -f "$this_artifact_path" ]]; then
@@ -15079,9 +15083,10 @@ EOF
                 if [[ "$remote_artifact_path" == *.exe ]]; then
                     local alt_remote_artifact_path="${remote_artifact_path%.exe}"
                     local alt_scp_output
-                    if alt_scp_output=$(scp -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
+                    if alt_scp_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" scp \
+                           -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
                            -o StrictHostKeyChecking=accept-new \
-                           "${ssh_destination}:${alt_remote_artifact_path}" "$this_artifact_path" 2>&1); then
+                           "${ssh_destination}:${alt_remote_artifact_path}" "$this_artifact_path" </dev/null 2>&1); then
                         _log_ok "Artifact downloaded (fallback, no .exe): $this_artifact_path"
                         if [[ -f "$this_artifact_path" ]]; then
                             local file_size
@@ -15236,10 +15241,11 @@ EOF
                     _log_error "Failed to collect workspace archive member $archive_file from $host:$archive_file_remote"
                     download_failed=true
                 fi
-            elif scp -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
+            elif _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" scp \
+                    -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
                     -o StrictHostKeyChecking=accept-new \
                     "${ssh_destination}:${archive_file_remote}" \
-                    "$archive_file_local" >/dev/null 2>&1 && \
+                    "$archive_file_local" </dev/null >/dev/null 2>&1 && \
                  chmod "$archive_file_mode" "$archive_file_local" && \
                  { [[ -z "$workspace_binaries" ]] || \
                    archive_file_receipt=$(_act_workspace_member_receipt \
@@ -15311,10 +15317,11 @@ EOF
                    chmod "$additional_mode" "$additional_local"; then
                     :
                 elif ! _act_is_local_host "$host" && \
-                     scp -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
+                     _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" scp \
+                         -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
                          -o StrictHostKeyChecking=accept-new \
                          "${ssh_destination}:${additional_remote}" \
-                         "$additional_local" >/dev/null 2>&1 && \
+                         "$additional_local" </dev/null >/dev/null 2>&1 && \
                      chmod "$additional_mode" "$additional_local"; then
                     :
                 else

@@ -1544,6 +1544,14 @@ receive EOF on stdin. A missing host runtime returns dependency error 3 before
 the compiler runs. Commands that deliberately detach into a new session are
 outside this process-group boundary. Strict Rust still requires Python 3.11+.
 
+Remote native artifact collection applies `DSR_SYNC_TIMEOUT` to each complete
+SSH stream or SCP download, including owned descendants. This covers strict
+Unix and Windows collection and ordinary primary, filename-fallback, archive
+member and companion downloads. Collection has its own transfer budget after
+compilation finishes. A failed transfer cannot admit partial bytes; successful
+compiler execution evidence remains separate from the collection failure.
+Private partial files and their existing identities are retained for diagnosis.
+
 Windows launcher uploads for metadata inspection and native compilation use the
 controller's source-sync deadline (`DSR_SYNC_TIMEOUT`, default 1800 seconds).
 The complete SCP process and its owned descendants are supervised, with stdin
