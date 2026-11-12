@@ -17,6 +17,8 @@
 # including the source selection and receipts of private output stages.
 # Use --windows-strict-go-only for genuine PowerShell source staging and Go
 # Windows PE collection; Unix transport adapters do not qualify native NTFS.
+# Use --windows-strict-bun-only for the same source custody with real Bun and
+# TypeScript Windows PE builds, including pinned sibling imports and retries.
 # Use --strict-go-siblings-only for pinned Go replacements/workspaces through
 # strict snapshots, private output stages, publication and tamper refusals.
 # Use --strict-go-admission-only for conservative parallel-output admission,
@@ -1212,16 +1214,18 @@ PY
     [[ "$failures" == 0 ]]
 )
 
-test_windows_strict_go() (
-    local dependency work
-    for dependency in bash git jq yq python3 pwsh go; do
-        command -v "$dependency" >/dev/null || { printf 'SKIP: Windows Go staging requires %s\n' "$dependency"; return 77; }
+test_windows_strict_native() (
+    local compiler="$1" dependency work
+    case "$compiler" in go|bun) ;; *) return 4 ;; esac
+    for dependency in bash git jq yq python3 pwsh "$compiler"; do
+        command -v "$dependency" >/dev/null || { printf 'SKIP: Windows %s staging requires %s\n' "$compiler" "$dependency"; return 77; }
     done
-    [[ $(uname -s) == Linux ]] || { printf 'SKIP: portable Windows Go transport fixture requires Linux\n'; return 77; }
-    work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-windows-go.XXXXXXXX") || return 1
-    printf 'Windows Go staging evidence: %s\n' "$work"
-    python3 - "$work" "$ROOT" "${DSR_TEST_ACT_RUNNER:-$ROOT/src/act_runner.sh}" <<'PY'
+    [[ $(uname -s) == Linux ]] || { printf 'SKIP: portable Windows transport fixture requires Linux\n'; return 77; }
+    work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-windows-$compiler.XXXXXXXX") || return 1
+    printf 'Windows %s staging evidence: %s\n' "$compiler" "$work"
+    python3 - "$work" "$ROOT" "${DSR_TEST_ACT_RUNNER:-$ROOT/src/act_runner.sh}" "$compiler" <<'PY'
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -1230,15 +1234,19 @@ import shlex
 import struct
 import subprocess
 import sys
+import threading
 
-work, root, engine = map(Path, sys.argv[1:])
+work, root, engine = map(Path, sys.argv[1:4])
+compiler = sys.argv[4]
 checks = failures = 0
+check_lock = threading.Lock()
 
 def check(label, passed):
     global checks, failures
-    checks += 1
-    failures += not passed
-    print(('PASS: ' if passed else 'FAIL: ') + label, flush=True)
+    with check_lock:
+        checks += 1
+        failures += not passed
+        print(('PASS: ' if passed else 'FAIL: ') + label, flush=True)
 
 def run(args, env=None, cwd=None, timeout=120):
     return subprocess.run([str(arg) for arg in args], env=env, cwd=cwd,
@@ -1301,7 +1309,7 @@ function Expand-DsrWindowsSourceSnapshot {
     & $dsrOriginalExpand -Plan $Plan -DestinationPath $DestinationPath
     if ($DestinationPath.EndsWith('/source')) {
         if ($env:PROBE_FAULT -ceq 'stage-extra') { [IO.File]::WriteAllText((Join-Path $DestinationPath 'unexpected.txt'),'untracked') }
-        if ($env:PROBE_FAULT -ceq 'stage-bytes') { [IO.File]::AppendAllText((Join-Path $DestinationPath 'main.go'),"`n// changed after authenticated expansion") }
+        if ($env:PROBE_FAULT -ceq 'stage-bytes') { [IO.File]::AppendAllText((Join-Path $DestinationPath $env:PROBE_ENTRY),"`n// changed after authenticated expansion") }
         if ($env:PROBE_FAULT -ceq 'stage-link') { $null=[IO.File]::CreateSymbolicLink((Join-Path $DestinationPath 'unexpected-link'),(Join-Path $DestinationPath 'LICENSE')) }
     }
 }
@@ -1338,7 +1346,7 @@ case = Path(os.environ['PROBE_CASE'])
 if os.environ.get('GOWORK','').startswith('C:/fixture/'):
     os.environ['GOWORK']=os.environ['GOWORK'].replace('C:/fixture',str(case/'snapshot'),1)
 # The incumbent native command uses cmd's cd/set chain. Emulate precisely
-# those fixture forms so the baseline also executes the genuine Go compiler.
+# those fixture forms so the baseline also executes the genuine compiler.
 match = re.match(r'^cd /d (?:"([^"]+)"|([^ &]+)) && ', command)
 if match:
     path = (match[1] or match[2]).replace('\\','/').replace('C:/fixture',str(case/'snapshot'))
@@ -1362,7 +1370,7 @@ result = subprocess.run(shlex.split(command))
 if os.environ.get('PROBE_FAULT') == 'post-source':
     (case/'post-compiler-status.json').write_text(json.dumps(dict(exit_code=result.returncode,
         artifact=str(Path.cwd()/'strictwin.exe'))),encoding='utf-8')
-    with (case/'snapshot'/'dep'/'dep.go').open('a') as stream: stream.write('\n// changed by build process\n')
+    with (case/'snapshot'/'dep'/os.environ['PROBE_DEP_ENTRY']).open('a') as stream: stream.write('\n// changed by build process\n')
 sys.exit(result.returncode)
 ''', encoding='utf-8')
 cmd.chmod(0o700)
@@ -1371,9 +1379,12 @@ transports.mkdir()
 ssh = transports / 'ssh'
 ssh.write_text('#!/bin/sh\nexec python3 "$PROBE_WORK/transport.py" ssh "$@"\n', encoding='utf-8')
 ssh.chmod(0o700)
-print('BOUNDARY: real PowerShell/Git archive verification/Go PE compilation/held collection; fixture Windows drive, cmd, SSH, host-readiness and JobObject launcher; native Windows/NTFS are not qualified.', flush=True)
-for layout in ('replace','workspace'):
+print(f'BOUNDARY: real PowerShell/Git archive verification/{compiler} PE compilation/held collection; fixture Windows drive, cmd, SSH, host-readiness and JobObject launcher; native Windows/NTFS are not qualified.', flush=True)
+def run_layout(layout):
     case = work / layout
+    language = 'go' if compiler == 'go' else ('bun' if layout == 'replace' else 'typescript')
+    entry = 'main.go' if compiler == 'go' else 'main.ts'
+    dep_entry = 'dep.go' if compiler == 'go' else 'dep.ts'
     for directory in ('source','dep','snapshot/source','snapshot/dep','config/repos.d','artifacts','logs','outside'):
         (case/directory).mkdir(parents=True, exist_ok=True)
     (case/'ambient-go-env').write_text('GOFLAGS=-this-persistent-flag-must-not-reach-go\n',encoding='utf-8')
@@ -1388,6 +1399,10 @@ for layout in ('replace','workspace'):
     (case/'source'/'license-copy.txt').symlink_to('LICENSE')
     (case/'dep'/'go.mod').write_text('module example.local/dep\n\ngo 1.19\n',encoding='utf-8')
     (case/'dep'/'dep.go').write_text('package dep\nfunc Value() string{return "pinned-windows-sibling"}\n',encoding='utf-8')
+    if compiler == 'bun':
+        (case/'source'/'package.json').write_text(json.dumps(dict(name='strictwin',version='1.0.0',type='module')),encoding='utf-8')
+        (case/'source'/entry).write_text('import { value } from "../dep/dep.ts";\nconsole.log(value);\n',encoding='utf-8')
+        (case/'dep'/dep_entry).write_text('export const value: string = "pinned-windows-sibling";\n',encoding='utf-8')
     shas = {}
     for name in ('source','dep'):
         require(run(['git','-C',case/name,'init','-q','-b','main']))
@@ -1396,6 +1411,7 @@ for layout in ('replace','workspace'):
         shas[name] = require(run(['git','-C',case/name,'rev-parse','HEAD'])).strip()
     (case/'source-sha').write_text(shas['source'],encoding='utf-8')
     env = dict(os.environ, PROBE_WORK=str(work),PROBE_CASE=str(case),PROBE_ROOT=str(root),PROBE_ENGINE=str(engine),
+        PROBE_ENTRY=entry,PROBE_DEP_ENTRY=dep_entry,
         DSR_CONFIG_DIR=str(case/'config'),ACT_CONFIG_DIR=str(case/'config'),ACT_REPOS_DIR=str(case/'config/repos.d'),
         DSR_HOSTS_FILE=str(case/'config/hosts.yaml'),DSR_REPOS_FILE=str(case/'config/repos.yaml'),
         ACT_ARTIFACTS_DIR=str(case/'artifacts'),ACT_LOGS_DIR=str(case/'logs'),DSR_CACHE_DIR=str(case/'cache'),
@@ -1407,9 +1423,11 @@ for layout in ('replace','workspace'):
         GOCACHEPROG=str(case/'missing-cache-program'),PKG_CONFIG_PATH=str(case/'ambient-packages'),
         PKG_CONFIG_SYSROOT_DIR=str(case/'ambient-sysroot'),PKG_CONFIG_DSR_UNREVIEWED='ambient-selector',
         pkg_config_path=str(case/'lowercase-packages'))
-    recipe = dict(tool_name='strictwin',repo='example/strictwin',language='go',binary_name='strictwin',
+    build_command = ('go build -o strictwin.exe .' if compiler == 'go' else
+                     'bun build --compile --target=bun-windows-x64-baseline --outfile strictwin.exe main.ts')
+    recipe = dict(tool_name='strictwin',repo='example/strictwin',language=language,binary_name='strictwin',
         local_path=str(case/'source'),targets=['windows/amd64'],hosts={'windows/amd64':'winfixture'},
-        host_paths={'winfixture':'C:/fixture/source'},build_cmd='go build -o strictwin.exe .',
+        host_paths={'winfixture':'C:/fixture/source'},build_cmd=build_command,
         sibling_crates=[dict(local_path=str(case/'dep'),relative_path='dep',revision=shas['dep'])],
         env=dict(PATH=env['PATH'],GOENV='off',GOTOOLCHAIN='local',GOFLAGS='-p=1',GOMAXPROCS='1',
                  CGO_ENABLED='0',GOCACHE=str(work/'go-cache'),GOPROXY='off',GOSUMDB='off',
@@ -1462,39 +1480,45 @@ for layout in ('replace','workspace'):
     artifacts = value.get('artifact_paths',[])
     check(layout+': collected bytes are real amd64 Windows PE',len(artifacts)==1 and pe_amd64(Path(artifacts[0])))
     observed = [json.loads(line) for line in events('compiler-events')]
-    check(layout+': configured target reaches real Go in a private source directory',len(observed)==1 and
-          observed[0]['GOOS']=='windows' and observed[0]['GOARCH']=='amd64' and '/dsr-build-' in observed[0]['cwd'])
+    check(language+'/'+layout+': genuine compiler uses a private source directory',len(observed)==1 and
+          '/dsr-build-' in observed[0]['cwd'])
     policy=value.get('build_influence_env',{})
-    check(layout+': normalized policy reaches Windows child and retained receipt',len(observed)==1 and
-          observed[0]['GOENV']=='off' and observed[0]['GOFLAGS']=='-p=1' and observed[0]['GOTOOLCHAIN']=='local' and
-          observed[0]['GO111MODULE']=='on' and
-          observed[0]['GOWORK']==('off' if layout=='replace' else observed[0]['cwd']+'/go.work') and
-          all(observed[0][name] is None for name in ('GOAMD64','GOEXPERIMENT','GOROOT','GOCACHEPROG')) and
-          policy.get('DSR_GO_ENV_POLICY')=='2' and policy.get('GOENV')==observed[0]['GOENV'] and
-          policy.get('GOFLAGS')==observed[0]['GOFLAGS'] and policy.get('GO111MODULE')==observed[0]['GO111MODULE'] and
-          policy.get('GOOS')==observed[0]['GOOS'] and policy.get('GOARCH')==observed[0]['GOARCH'] and
-          policy.get('DSR_GO_WORKFILE')==('' if layout=='replace' else 'source/go.work'))
-    check(layout+': Windows child drops the entire ambient pkg-config selector family',len(observed)==1 and
-          all(observed[0][name] is None and name not in policy for name in
-              ('PKG_CONFIG_PATH','PKG_CONFIG_SYSROOT_DIR','PKG_CONFIG_DSR_UNREVIEWED','pkg_config_path')))
-    check(layout+': reviewed pkg-config values reach Windows child and receipt literally',len(observed)==1 and
-          all(observed[0][name]==recipe['env'][name] and policy.get(name)==recipe['env'][name] for name in
-              ('PKG_CONFIG_LIBDIR','PKG_CONFIG_DSR_REVIEWED')))
-    check(layout+': original main and sibling snapshots still pass complete verifier',originals_valid())
+    if compiler == 'go':
+        check(layout+': configured target reaches real Go',len(observed)==1 and
+              observed[0]['GOOS']=='windows' and observed[0]['GOARCH']=='amd64')
+        check(layout+': normalized policy reaches Windows child and retained receipt',len(observed)==1 and
+              observed[0]['GOENV']=='off' and observed[0]['GOFLAGS']=='-p=1' and observed[0]['GOTOOLCHAIN']=='local' and
+              observed[0]['GO111MODULE']=='on' and
+              observed[0]['GOWORK']==('off' if layout=='replace' else observed[0]['cwd']+'/go.work') and
+              all(observed[0][name] is None for name in ('GOAMD64','GOEXPERIMENT','GOROOT','GOCACHEPROG')) and
+              policy.get('DSR_GO_ENV_POLICY')=='2' and policy.get('GOENV')==observed[0]['GOENV'] and
+              policy.get('GOFLAGS')==observed[0]['GOFLAGS'] and policy.get('GO111MODULE')==observed[0]['GO111MODULE'] and
+              policy.get('GOOS')==observed[0]['GOOS'] and policy.get('GOARCH')==observed[0]['GOARCH'] and
+              policy.get('DSR_GO_WORKFILE')==('' if layout=='replace' else 'source/go.work'))
+        check(layout+': Windows child drops the entire ambient pkg-config selector family',len(observed)==1 and
+              all(observed[0][name] is None and name not in policy for name in
+                  ('PKG_CONFIG_PATH','PKG_CONFIG_SYSROOT_DIR','PKG_CONFIG_DSR_UNREVIEWED','pkg_config_path')))
+        check(layout+': reviewed pkg-config values reach Windows child and receipt literally',len(observed)==1 and
+              all(observed[0][name]==recipe['env'][name] and policy.get(name)==recipe['env'][name] for name in
+                  ('PKG_CONFIG_LIBDIR','PKG_CONFIG_DSR_REVIEWED')))
+    else:
+        check(language+': native output does not claim the Go compiler policy','DSR_GO_ENV_POLICY' not in policy)
+    originals_verified = originals_valid()
+    check(layout+': original main and sibling snapshots still pass complete verifier',originals_verified)
     check(layout+': tracked file link is materialized in the private source',bool(observed) and
           not (Path(observed[0]['cwd'])/'license-copy.txt').is_symlink() and
           (Path(observed[0]['cwd'])/'license-copy.txt').read_bytes()==b'tracked materialized license\n')
     check(layout+': existing guarded launcher and stream collection remain in use',
           'launcher' in events('transport-events') and 'collection' in events('transport-events') and
           any(line.startswith('guard ') for line in events('transport-events')))
-    if layout!='replace': continue
-    if first.returncode or value.get('status')!='success': continue
+    if layout!='replace': return
+    if first.returncode or value.get('status')!='success' or not originals_verified: return
     again,retry = native('retry')
     observed = [json.loads(line) for line in events('compiler-events')]
     check('same-target retry uses a fresh independent stage',again.returncode==0 and len(observed)==2 and
           observed[0]['cwd']!=observed[1]['cwd'] and len(retry.get('artifact_paths',[]))==1 and
           retry['artifact_paths'][0]!=artifacts[0])
-    dep_path = case/'snapshot/dep/dep.go'
+    dep_path = case/'snapshot/dep'/dep_entry
     dep_bytes = dep_path.read_bytes()
     archive = case/'snapshot/.source.tar'; archive_bytes = archive.read_bytes()
     collision = case/'snapshot/dsr-build-strictwin-windows-amd64-12345678123442348234123456789abc'
@@ -1522,14 +1546,15 @@ for layout in ('replace','workspace'):
     check('preexisting colliding stage remains intact',(collision/'sentinel').read_text(encoding='utf-8')=='preexisting stage' and
           sorted(path.name for path in collision.iterdir())==['sentinel'])
     env['PROBE_FAULT']=''
-    recipe['build_cmd']='go build -o strictwin.exe missing.go'
+    recipe['build_cmd']=('go build -o strictwin.exe missing.go' if compiler == 'go' else
+                         'bun build --compile --target=bun-windows-x64-baseline --outfile strictwin.exe missing.ts')
     config.write_text(json.dumps(recipe),encoding='utf-8')
     before=len(events('compiler-events')); collections=events('transport-events').count('collection')
     failed,result=native('compiler-failure')
-    check('genuine Go compilation failure retains failure and prevents collection',failed.returncode!=0 and
+    check('genuine '+compiler+' compilation failure retains failure and prevents collection',failed.returncode!=0 and
           result.get('status')=='failed' and len(events('compiler-events'))==before+1 and
           events('transport-events').count('collection')==collections)
-    recipe['build_cmd']='go build -o strictwin.exe .'
+    recipe['build_cmd']=build_command
     config.write_text(json.dumps(recipe),encoding='utf-8')
     env['PROBE_FAULT']='post-source'
     before=len(events('compiler-events')); collections=events('transport-events').count('collection')
@@ -1542,7 +1567,16 @@ for layout in ('replace','workspace'):
           pe_amd64(Path(completion['artifact'])))
     dep_path.write_bytes(dep_bytes); env['PROBE_FAULT']=''
     check('all original snapshots still verify after restored negative controls',originals_valid())
-print(f'Windows strict Go staging: {checks-failures} passed, {failures} failed',flush=True)
+if compiler == 'bun':
+    # Each language owns separate source/config/state/log/artifact directories;
+    # the common transport programs are read-only. Keep the complete Bun fault
+    # lifecycle and real TypeScript positive in the same bounded invocation.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        list(executor.map(run_layout, ('replace','workspace')))
+else:
+    for layout in ('replace','workspace'):
+        run_layout(layout)
+print(f'Windows strict {compiler} staging: {checks-failures} passed, {failures} failed',flush=True)
 sys.exit(1 if failures else 0)
 PY
 )
@@ -2781,7 +2815,11 @@ if [[ "${1:-}" == --strict-go-siblings-only ]]; then
     exit "$strict_go_status"
 fi
 if [[ "${1:-}" == --windows-strict-go-only ]]; then
-    test_windows_strict_go
+    test_windows_strict_native go
+    exit $?
+fi
+if [[ "${1:-}" == --windows-strict-bun-only ]]; then
+    test_windows_strict_native bun
     exit $?
 fi
 if [[ "${1:-}" == --strict-go-admission-only ]]; then

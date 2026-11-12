@@ -223,6 +223,14 @@ jobs:
           DOTNET_PROCESSOR_COUNT=1 timeout 120 bash scripts/tests/test_native_source_sync.sh --windows-strict-go-only \
             2>&1 | tee "$RUNNER_TEMP/collector-evidence/windows-go-staging.log"
           test -z "$(git status --porcelain)"
+      - name: Verify Windows Bun and TypeScript private staging
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          DOTNET_PROCESSOR_COUNT=1 timeout 120 bash scripts/tests/test_native_source_sync.sh --windows-strict-bun-only \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/windows-bun-staging.log"
+          test -z "$(git status --porcelain)"
       - name: Validate stdin-isolated target dispatch and exact-run resume
         shell: bash
         run: |

@@ -1400,6 +1400,17 @@ The values agree with the durable target result and manifest build-environment
 receipt. Failed attempts retain the evidence available before failure;
 unattempted targets do not receive fabricated provenance.
 
+Strict native Windows Go, Bun and TypeScript builds compile in a fresh private
+source stage for each attempt. DSR reconstructs the main and pinned sibling
+trees from their authenticated Git archives, preserves their relative layout,
+and verifies all originals and staged trees before launching the configured
+command. In-tree executables and dependency installation therefore leave the
+immutable source snapshots intact. Original snapshots are verified again after
+the command, before artifact collection; changed sources or a failed compiler
+cannot authorize collection. Retries receive a different stage and collected
+artifact path. The shared staging mechanism preserves each language's compiler
+policy: Bun and TypeScript do not acquire Go environment-policy receipts.
+
 Strict native Go results retain `DSR_GO_ENV_POLICY=2` in `build_influence_env`,
 together with the effective reviewed Go selectors and release source identity.
 Workers clear inherited compiler, architecture, cgo and workspace selectors,

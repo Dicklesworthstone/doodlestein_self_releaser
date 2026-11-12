@@ -7702,17 +7702,18 @@ _act_windows_source_runtime_script() {
     cat "$module"
 }
 
-# Go writes its executable into the working tree. Re-expand the authenticated
+# Go and Bun write their executables into the working tree. Re-expand the authenticated
 # Git archives into one fresh attempt, retaining the pinned sibling layout,
 # instead of allowing compilation to change the immutable source snapshots.
-_act_windows_strict_go_build_script() {
-    [[ $# == 8 ]] || return 4
+_act_windows_strict_output_build_script() {
+    [[ $# == 9 ]] || return 4
     local LC_ALL=C || return 4
     local host="$1" tool="$2" local_path="$3" revision="$4"
-    local source_root="$5" stage_root="$6" build_cmd="$7" build_env="$8"
+    local source_root="$5" stage_root="$6" build_cmd="$7" build_env="$8" language="$9"
+    case "$language" in go|bun|typescript) ;; *) return 4 ;; esac
     local path dependencies sources entry name checkout sha archive manifest manifest_dir
     local archive_digest manifest_digest object_count records='[]' total_objects=1
-    local records_b64 command_b64 environment_b64 ambient_names_b64 pkg_config_regex budget_script
+    local records_b64 command_b64 environment_b64 ambient_names_b64 pkg_config_regex budget_script go_env_cleanup=''
     source_root="${source_root//\\//}" stage_root="${stage_root//\\//}"
     if [[ "$source_root" =~ ^/([A-Za-z])/(.*)$ ]]; then
         source_root="${BASH_REMATCH[1]}:/${BASH_REMATCH[2]}"
@@ -7733,7 +7734,7 @@ _act_windows_strict_go_build_script() {
         '[{relative_path:"source",local_path:$path,git_sha:$sha}] + .' <<< "$dependencies") || return 4
     mkdir -p "$ACT_ARTIFACTS_DIR/strict-source-verification" || return 4
     manifest_dir=$(umask 077; mktemp -d \
-        "$ACT_ARTIFACTS_DIR/strict-source-verification/windows-go.XXXXXXXX") || return 4
+        "$ACT_ARTIFACTS_DIR/strict-source-verification/windows-output.XXXXXXXX") || return 4
     while IFS= read -r entry; do
         name=$(jq -er '.relative_path' <<< "$entry") || return 4
         checkout=$(jq -er '.local_path' <<< "$entry") || return 4
@@ -7746,7 +7747,7 @@ _act_windows_strict_go_build_script() {
            ! archive_digest=$(_act_git_archive_sha256 "$checkout" "$sha") || \
            ! manifest_digest=$(_act_sha256 "$manifest") || \
            ! object_count=$(_act_tracked_manifest_object_count "$manifest"); then
-            _log_error "Unable to bind Windows Go output-stage source $name to its pinned Git archive"
+            _log_error "Unable to bind Windows output-stage source $name to its pinned Git archive"
             return 4
         fi
         [[ "$archive_digest" =~ ^[0-9a-f]{64}$ && "$manifest_digest" =~ ^[0-9a-f]{64}$ &&
@@ -7764,10 +7765,13 @@ _act_windows_strict_go_build_script() {
         split("\n") | map(select(length > 0)) |
         if all(.[]; test("^[A-Za-z_][A-Za-z0-9_]*=")) then
             map(capture("^(?<name>[^=]+)=(?<value>.*)$"))
-        else error("invalid Go build environment") end' | base64 | tr -d '\r\n') || return 4
-    ambient_names_b64=$(_act_go_ambient_env_names | jq -Rsc 'split("\n") | map(select(length > 0))' | \
-        base64 | tr -d '\r\n') || return 4
-    pkg_config_regex=$(_act_go_pkg_config_env_regex)
+        else error("invalid native build environment") end' | base64 | tr -d '\r\n') || return 4
+    if [[ "$language" == go ]]; then
+        ambient_names_b64=$(_act_go_ambient_env_names | jq -Rsc 'split("\n") | map(select(length > 0))' | \
+            base64 | tr -d '\r\n') || return 4
+        pkg_config_regex=$(_act_go_pkg_config_env_regex)
+        go_env_cleanup="\$ambientNames=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$ambient_names_b64')) | ConvertFrom-Json; \$ambientKeys=@(\$psi.EnvironmentVariables.Keys); foreach (\$name in \$ambientKeys) { if (\$ambientNames -icontains \$name -or \$name -match '$pkg_config_regex') { \$psi.EnvironmentVariables.Remove(\$name) } }; "
+    fi
     budget_script=$(_act_windows_source_budget_script "$host" "${source_root%/*}" \
         0 "$total_objects" expansion) || return 4
     _act_windows_source_runtime_script || return 4
@@ -7780,7 +7784,7 @@ Assert-DsrWindowsSourceRuntime
 \$dsrSourceRecords=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$records_b64')) | ConvertFrom-Json
 \$dsrSourceGuards=New-Object 'System.Collections.Generic.List[IDisposable]'
 \$dsrStagePlans=New-Object 'System.Collections.Generic.List[object]'
-\$dsrGoProcess=\$null
+\$dsrBuildProcess=\$null
 try {
     \$dsrSourceGuards.AddRange([IDisposable[]](Open-DsrWindowsSourceAncestors \$dsrSnapshotParent))
     \$dsrExpandedBytes=[long]0
@@ -7795,7 +7799,7 @@ try {
     # Admit the complete source tuple before creating any writable copy.
     \$dsrSourcePlan=@{ExpandedBytes=\$dsrExpandedBytes}
     $budget_script
-    if (Get-Item -LiteralPath \$dsrStageRoot -Force -ErrorAction SilentlyContinue) { throw 'Windows Go output stage already exists' }
+    if (Get-Item -LiteralPath \$dsrStageRoot -Force -ErrorAction SilentlyContinue) { throw 'Windows output stage already exists' }
     \$null=New-Item -ItemType Directory -Path \$dsrStageRoot -ErrorAction Stop
     if ([OperatingSystem]::IsWindows()) {
         \$acl=[Security.AccessControl.DirectorySecurity]::new()
@@ -7821,28 +7825,22 @@ try {
     \$psi.UseShellExecute=\$false
     \$psi.WorkingDirectory=\$dsrStageSource
     \$psi.FileName=\$env:ComSpec
-    \$ambientNames=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$ambient_names_b64')) | ConvertFrom-Json
-    \$ambientKeys=@(\$psi.EnvironmentVariables.Keys)
-    foreach (\$name in \$ambientKeys) {
-        if (\$ambientNames -icontains \$name -or \$name -match '$pkg_config_regex') {
-            \$psi.EnvironmentVariables.Remove(\$name)
-        }
-    }
+    $go_env_cleanup
     \$environment=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$environment_b64')) | ConvertFrom-Json
     foreach (\$pair in \$environment) { \$psi.EnvironmentVariables[\$pair.name]=\$pair.value }
     \$command=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$command_b64'))
     \$psi.Arguments='/d /s /c "' + \$command + '"'
-    \$dsrGoProcess=[Diagnostics.Process]::Start(\$psi)
-    \$dsrGoProcess.WaitForExit()
-    \$dsrGoExit=\$dsrGoProcess.ExitCode
+    \$dsrBuildProcess=[Diagnostics.Process]::Start(\$psi)
+    \$dsrBuildProcess.WaitForExit()
+    \$dsrBuildExit=\$dsrBuildProcess.ExitCode
     foreach (\$item in \$dsrStagePlans) {
         \$null=Test-DsrWindowsSourceSnapshot -Plan \$item.Plan -DestinationPath \$item.Original
     }
 } finally {
-    if (\$null -ne \$dsrGoProcess) { \$dsrGoProcess.Dispose() }
+    if (\$null -ne \$dsrBuildProcess) { \$dsrBuildProcess.Dispose() }
     foreach (\$guard in \$dsrSourceGuards) { \$guard.Dispose() }
 }
-exit \$dsrGoExit
+exit \$dsrBuildExit
 EOF
 }
 
@@ -13917,8 +13915,8 @@ act_run_native_build() {
     # stage: its outputs are scoped by target triple and isolated above.
     # Strict non-Rust builds also need a private copy: installers and in-tree
     # outputs must not add files to the immutable release source snapshot.
-    # Strict Windows Go has the same in-tree output requirement even while
-    # the orchestrator serializes tasks for a Windows host.
+    # Strict Windows Go and Bun/TypeScript have the same in-tree output
+    # requirement even while the orchestrator serializes tasks for a host.
     local output_stage_root="" output_stage_source="" output_stage_parent=""
     local output_stage_sibling_names=""
     local output_stage_dependencies='[]'
@@ -13993,7 +13991,8 @@ act_run_native_build() {
                 output_stage_sibling_names+="$output_sibling_relative"$'\n'
             done
         fi
-    elif [[ "$language" == go ]] && $strict_native_build && _act_is_windows_host "$host"; then
+    elif [[ "$language" == go || "$language" == bun || "$language" == typescript ]] && \
+         $strict_native_build && _act_is_windows_host "$host"; then
         local windows_output_source_root="${remote_path//\\//}" output_stage_uuid
         if [[ "$windows_output_source_root" =~ ^/([A-Za-z])/(.*)$ ]]; then
             windows_output_source_root="${BASH_REMATCH[1]}:/${BASH_REMATCH[2]}"
@@ -14007,7 +14006,7 @@ act_run_native_build() {
               ! "$output_stage_parent" =~ ^[A-Za-z]:/[A-Za-z0-9_./+-]+$ ||
               "$output_stage_parent" == *..* ]] ||
            ! output_stage_uuid=$(_act_generate_uuid); then
-            _log_error "Unable to derive a unique Windows Go output stage"
+            _log_error "Unable to derive a unique Windows output stage"
             return 4
         fi
         output_stage_root="$output_stage_parent/dsr-build-${tool_name}-${platform//\//-}-${output_stage_uuid//-/}"
@@ -14143,9 +14142,9 @@ act_run_native_build() {
             remote_cmd=$(_act_windows_cmd_via_powershell "cd /d \"${win_path}\" && ${env_exports}${build_cmd}") || return 4
         fi
         if [[ -n "$output_stage_root" ]]; then
-            windows_build_body=$(_act_windows_strict_go_build_script "$host" "$tool_name" \
+            windows_build_body=$(_act_windows_strict_output_build_script "$host" "$tool_name" \
                 "$local_path" "$release_git_sha" "$remote_path" "$output_stage_root" \
-                "$build_cmd" "$build_env") || return 4
+                "$build_cmd" "$build_env" "$language") || return 4
             _log_info "Building $platform in private output stage $output_stage_source"
         elif $strict_rust_build; then
             local context_fingerprint context_receipt_digest context_seed_digest
