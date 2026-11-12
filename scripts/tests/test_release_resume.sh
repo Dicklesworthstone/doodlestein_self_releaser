@@ -1070,6 +1070,118 @@ variant_fixture() {
     fi
 }
 
+# One act job owns a GNU/musl platform, so worker counts alone cannot prove
+# that both compiler variants reached publication. These exercise the actual
+# release command with real YAML policy, byte-bound files and remote-call logs;
+# they are inventory fixtures, not compiler or native-host qualification.
+workflow_variant_fixture() {
+    local mode="$1"
+    source "$PROJECT_ROOT/src/artifact_naming.sh" || return 1
+    python3 - "$CASE" "$mode" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+case, mode = Path(sys.argv[1]), sys.argv[2]
+gnu, musl = 'x86_64-unknown-linux-gnu', 'x86_64-unknown-linux-musl'
+platform = 'linux/amd64'
+config = dict(tool_name='tool', binary_name='tool', language='rust',
+              targets=[platform], act_job_map={platform: 'build'},
+              target_triples={platform: [gnu, musl]})
+rows = []
+artifacts = case / 'artifacts'
+
+def add(name, triple, role=None, filename=False):
+    data = ('variant fixture: ' + name + '\n').encode()
+    (artifacts / name).write_bytes(data)
+    row = dict(target=platform, target_triple=triple, archive_format='none',
+               sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data))
+    row['filename' if filename else 'name'] = name
+    if role:
+        row['role'] = role
+    rows.append(row)
+
+add('payload.bin', gnu)
+if mode in ('complete', 'subset'):
+    add('tool-musl.bin', musl)
+elif mode == 'metadata-prefix':
+    add('sha256sums-helper-musl.bin', musl)
+elif mode == 'metadata':
+    for name in ('tool-musl.bin.sha256', 'tool-musl.bin.minisig',
+                 'tool-musl.sbom.spdx.json', 'tool-musl.intoto.jsonl',
+                 'tool-musl-manifest.json', 'SHA256SUMS.txt'):
+        add(name, musl)
+elif mode in ('companion', 'companion-filename'):
+    config['workspace_additional_artifacts'] = {
+        platform: [dict(name='notes.json', format='json', target_triple=musl)]}
+    add('notes.json', musl, filename=(mode == 'companion-filename'))
+elif mode == 'role-only':
+    add('notes.json', musl, role='additional')
+elif mode not in ('missing', 'legacy-untyped'):
+    raise AssertionError(mode)
+
+manifest = dict(tool='tool', version='v1.2.3', status='success',
+                summary=dict(total=1, success=1, failed=0),
+                requested_targets=[platform],
+                build_environments=[dict(target=platform, method='act', host='act-local')],
+                artifacts=rows)
+if mode == 'legacy-untyped':
+    manifest.pop('requested_targets')
+    manifest.pop('build_environments')
+    for row in rows:
+        row.pop('target')
+        row.pop('target_triple')
+if mode == 'subset':
+    config['targets'].append('linux/arm64')
+    config['act_job_map']['linux/arm64'] = 'build-arm'
+    config['target_triples']['linux/arm64'] = [
+        'aarch64-unknown-linux-gnu', 'aarch64-unknown-linux-musl']
+(case / 'config/repos.d/tool.yaml').write_text(json.dumps(config))
+(artifacts / 'tool-v1.2.3-manifest.json').write_text(json.dumps(manifest) + '\n')
+PY
+}
+
+test_workflow_variant_missing_primary_is_refused() {
+    local mode before after
+    for mode in missing metadata companion companion-filename role-only legacy-untyped; do
+        setup "workflow-variant-$mode"
+        workflow_variant_fixture "$mode" || return 1
+        before=$(_gh_asset_sha256 "$CASE/artifacts/tool-v1.2.3-manifest.json") || return 1
+        run_release --resume
+        after=$(_gh_asset_sha256 "$CASE/artifacts/tool-v1.2.3-manifest.json") || return 1
+        [[ $STATUS -eq 4 && ! -s "$CALLS" && "$before" == "$after" &&
+           ! -e "$CASE/artifacts/SHA256SUMS" &&
+           ! -e "$DSR_STATE_DIR/releases/tool-v1.2.3-upload.json" ]] || return 1
+        if [[ "$mode" == legacy-untyped ]]; then
+            grep -q 'Multi-variant release requires explicit payload platform identities' "$CASE/stderr" || return 1
+        else
+            grep -q 'Missing configured primary variant.*x86_64-unknown-linux-musl' "$CASE/stderr" || return 1
+        fi
+        DRY_RUN=true
+        run_release --resume
+        [[ $STATUS -eq 4 && ! -s "$CALLS" ]] || return 1
+    done
+}
+
+test_workflow_variant_complete_and_selected_subset_are_publishable() {
+    local mode before
+    for mode in complete subset metadata-prefix; do
+        setup "workflow-variant-$mode"
+        workflow_variant_fixture "$mode" || return 1
+        before=$(_gh_asset_sha256 "$CASE/artifacts/tool-v1.2.3-manifest.json") || return 1
+        DRY_RUN=true
+        run_release --resume
+        [[ $STATUS -eq 0 && ! -s "$CALLS" &&
+           "$(_gh_asset_sha256 "$CASE/artifacts/tool-v1.2.3-manifest.json")" == "$before" &&
+           ! -e "$CASE/artifacts/SHA256SUMS" ]] || return 1
+        jq -e '.status == "dry_run" and
+            ([.details.plan.artifacts[].target_triple] | unique | sort) ==
+                ["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]
+        ' "$CASE/stdout" >/dev/null || return 1
+    done
+}
+
 planned_names() {
     jq -c --arg name "$1" '.details.plan.artifacts[] | select(.name == $name) | .upload_names' "$CASE/stdout"
 }
@@ -3166,6 +3278,8 @@ for test in test_release_keeps_artifacts_during_publication \
     test_release_records_installer_check_after_upload test_installer_mismatch_does_not_fail_verified_release \
     test_variants_publish_under_their_own_triple_names test_shared_variant_names_go_to_the_primary_build \
     test_shared_variant_names_upload_without_collision \
+    test_workflow_variant_missing_primary_is_refused \
+    test_workflow_variant_complete_and_selected_subset_are_publishable \
     test_literal_companion_unknown_abi_word_keeps_owner \
     test_literal_companion_conflicting_abi_words_keep_primary_variant \
     test_literal_companion_explicit_secondary_variant_is_published test_literal_companion_explicit_variant_drift_is_rejected \

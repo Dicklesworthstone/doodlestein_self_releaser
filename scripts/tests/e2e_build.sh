@@ -1563,31 +1563,120 @@ test_build_packages_each_target_triple_variant() {
     harness_teardown
 }
 
-test_build_names_unproduced_target_triple_variant() {
+test_build_refuses_unproduced_target_triple_variant() {
     ((TESTS_RUN++))
-
     if [[ "$HAS_YQ" != "true" ]]; then
         skip "yq required for unproduced variant test"
         return 0
     fi
 
     harness_setup
-    local repo_dir output_dir
-    repo_dir="$(harness_tmpdir)/variant-repo"
-    output_dir="$(harness_tmpdir)/variant-out"
+    local repo_dir="$TEST_TMPDIR/variant-repo" output_dir="$TEST_TMPDIR/variant-out"
+    local manifest="$TEST_TMPDIR/variant-out/lane-tool-v1.2.3-manifest.json" problems=()
     seed_variant_lane_fixture "$repo_dir"
 
     LANE_GNU_ONLY=1 exec_run run_lane_build lane-tool --version 1.2.3 --output-dir "$output_dir"
-    if [[ "$(exec_status)" -eq 0 ]] &&
-       [[ -f "$output_dir/lane-tool-x86_64-unknown-linux-gnu.tar.gz" ]] &&
-       [[ ! -e "$output_dir/lane-tool-x86_64-unknown-linux-musl.tar.gz" ]] &&
-       exec_stderr | grep -q 'Variant x86_64-unknown-linux-musl of lane-tool linux/amd64 was not produced by this build'; then
-        pass "build names a configured variant the lane did not produce"
+    [[ "$(exec_status)" -eq 1 ]] || problems+=("exit $(exec_status), expected partial failure")
+    exec_stdout | jq -e '.status == "partial" and .details.publishable == false and
+        .details.manifest_path == ""' >/dev/null 2>&1 ||
+        problems+=("incomplete GNU/musl build advertised publication")
+    [[ -f "$output_dir/lane-tool-1.2.3-x86_64-unknown-linux-gnu.tar.gz" ]] ||
+        problems+=("completed GNU payload was discarded")
+    [[ ! -e "$output_dir/lane-tool-x86_64-unknown-linux-musl.tar.gz" ]] ||
+        problems+=("missing musl variant acquired an alias")
+    exec_stderr | grep -q 'Missing configured primary variant.*x86_64-unknown-linux-musl' ||
+        problems+=("diagnostic does not identify the missing musl variant")
+    lane_publication_matches "$output_dir" "$manifest" false ||
+        problems+=("incomplete build remains publishable, including without a manifest")
+
+    if [[ ${#problems[@]} -eq 0 ]]; then
+        pass "build refuses an unproduced configured variant and retains non-publishable diagnostics"
     else
-        fail "build should report the missing musl variant"
+        fail "missing target variant: ${problems[*]}"
         echo "stderr: $(exec_stderr | tail -15)"
     fi
+    harness_teardown
+}
 
+test_build_shared_variant_alias_belongs_to_primary() {
+    local format
+    for format in tar.gz tar.xz; do
+        ((TESTS_RUN++))
+        if [[ "$HAS_YQ" != "true" ]]; then
+            skip "yq required for shared variant alias test ($format)"
+            continue
+        fi
+        harness_setup
+        local repo_dir="$TEST_TMPDIR/variant-repo" output_dir="$TEST_TMPDIR/variant-out"
+        local original="$TEST_TMPDIR/original-musl.tar.gz" problems=() libc name
+        seed_variant_lane_fixture "$repo_dir"
+        DSR_VARIANT_FORMAT="$format" yq -i '
+            .archive_format.linux = strenv(DSR_VARIANT_FORMAT) |
+            .install_script_compat = "${name}-${os}-${arch}" |
+            .include_files = []
+        ' "$DSR_CONFIG_DIR/repos.d/lane-tool.yaml" || return 1
+
+        LANE_ORIGINAL_ARCHIVE="$original" exec_run run_lane_build lane-tool \
+            --version 1.2.3 --output-dir "$output_dir"
+        [[ "$(exec_status)" -eq 0 ]] || problems+=("exit $(exec_status)")
+        for libc in gnu musl; do
+            name="lane-tool-1.2.3-x86_64-unknown-linux-$libc.$format"
+            [[ "$(tar -xOf "$output_dir/$name" lane-tool 2>/dev/null | tail -1)" == "echo $libc" ]] ||
+                problems+=("$name lacks its own variant")
+        done
+        name="lane-tool-linux-amd64.$format"
+        [[ "$(tar -xOf "$output_dir/$name" lane-tool 2>/dev/null | tail -1)" == "echo gnu" ]] ||
+            problems+=("shared installer alias does not contain primary GNU bytes")
+        jq -e --arg name "$name" '
+            [.artifacts[] | select(.name == $name)] |
+            length == 1 and .[0].target_triple == "x86_64-unknown-linux-gnu"
+        ' "$output_dir/lane-tool-v1.2.3-manifest.json" >/dev/null 2>&1 ||
+            problems+=("shared alias lost its primary manifest identity")
+        cmp -s "$original" "$output_dir/lane-tool-1.2.3-x86_64-unknown-linux-musl.tar.gz" ||
+            problems+=("prebuilt musl compressed bytes were replaced")
+        lane_publication_matches "$output_dir" "$output_dir/lane-tool-v1.2.3-manifest.json" true ||
+            problems+=("complete matrix cannot be published")
+        if [[ ${#problems[@]} -eq 0 ]]; then
+            pass "workflow shared alias belongs to the primary variant ($format)"
+        else
+            fail "shared variant alias ($format): ${problems[*]}"
+            echo "stderr: $(exec_stderr | tail -15)"
+        fi
+        harness_teardown
+    done
+}
+
+test_build_selected_target_matrix_does_not_require_other_platforms() {
+    ((TESTS_RUN++))
+    if [[ "$HAS_YQ" != "true" ]]; then
+        skip "yq required for selected variant matrix test"
+        return 0
+    fi
+    harness_setup
+    local repo_dir="$TEST_TMPDIR/variant-repo" output_dir="$TEST_TMPDIR/variant-out" problems=()
+    seed_variant_lane_fixture "$repo_dir"
+    yq -i '
+        .targets += ["linux/arm64"] |
+        .act_job_map."linux/arm64" = "build-arm" |
+        .target_triples."linux/arm64" = ["aarch64-unknown-linux-gnu", "aarch64-unknown-linux-musl"]
+    ' "$DSR_CONFIG_DIR/repos.d/lane-tool.yaml" || return 1
+
+    exec_run run_lane_build lane-tool --version 1.2.3 --target linux/amd64 --output-dir "$output_dir"
+    [[ "$(exec_status)" -eq 0 ]] || problems+=("selected complete platform failed: $(exec_status)")
+    jq -e '.requested_targets == ["linux/amd64"] and
+        all(.artifacts[]; .target == "linux/amd64") and
+        ([.artifacts[].target_triple] | unique | sort) ==
+            ["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]
+    ' "$output_dir/lane-tool-v1.2.3-manifest.json" >/dev/null 2>&1 ||
+        problems+=("manifest does not preserve the selected complete platform")
+    lane_publication_matches "$output_dir" "$output_dir/lane-tool-v1.2.3-manifest.json" true ||
+        problems+=("unselected platform blocked publication")
+    if [[ ${#problems[@]} -eq 0 ]]; then
+        pass "an explicit complete target subset does not require unselected platform variants"
+    else
+        fail "selected variant matrix: ${problems[*]}"
+        echo "stderr: $(exec_stderr | tail -15)"
+    fi
     harness_teardown
 }
 
@@ -2015,6 +2104,17 @@ RECEIPT_FIXTURE
     done
 }
 
+if [[ "${1:-}" == --variant-inventory-only ]]; then
+    test_build_packages_each_target_triple_variant
+    test_build_refuses_unproduced_target_triple_variant
+    test_build_shared_variant_alias_belongs_to_primary
+    test_build_selected_target_matrix_does_not_require_other_platforms
+    test_build_refuses_secondary_variant_include_conflict
+    printf '\nVariant inventory: %s passed, %s failed, %s skipped\n' "$TESTS_PASSED" "$TESTS_FAILED" "$TESTS_SKIPPED"
+    [[ "$TESTS_FAILED" == 0 && "$TESTS_SKIPPED" == 0 ]]
+    exit $?
+fi
+
 if [[ "${1:-}" == --command-receipt-only ]]; then
     test_build_command_receipt_streams
     printf '\nCommand receipts: %s passed, %s failed, %s skipped\n' "$TESTS_PASSED" "$TESTS_FAILED" "$TESTS_SKIPPED"
@@ -2084,7 +2184,9 @@ test_build_checks_prebuilt_include_contract
 test_build_validates_prebuilt_archives_without_includes
 test_build_workflow_zip_admission
 test_build_packages_each_target_triple_variant
-test_build_names_unproduced_target_triple_variant
+test_build_refuses_unproduced_target_triple_variant
+test_build_shared_variant_alias_belongs_to_primary
+test_build_selected_target_matrix_does_not_require_other_platforms
 test_build_refuses_secondary_variant_include_conflict
 
 echo ""

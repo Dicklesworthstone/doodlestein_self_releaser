@@ -1565,9 +1565,18 @@ deadline returns 124 after stopping the job.
 
 The manifest also retains `requested_targets` when supplied by the orchestrator.
 For native matrices, both generation and release admission reconcile selected
-triples, environment receipts and retained payloads. A missing or duplicate
-variant is refused before any GitHub mutation; explicit act receipts continue
-to support one workflow job producing cross-platform assets.
+triples, environment receipts and retained payloads. Individual act receipts can
+still supply variants or cross-platform assets from one workflow job, but a
+successful ordinary build must retain a primary payload for every configured
+triple of each requested or declared platform. Missing coverage returns partial
+failure and leaves output non-publishable, with no completed manifest. Ordinary
+release rechecks this inventory before checksum generation or any GitHub
+mutation. Companions, checksum/signature sidecars, SBOMs and build manifests
+cannot satisfy primary coverage. Multi-variant legacy manifests require
+explicit payload platform identities; complete selected platform subsets do
+not require unrelated configured platforms. Shared compatibility aliases
+belong to the primary variant for both native and workflow packaging, including
+cross-format conversion; a distinct alias for every secondary is optional.
 
 When a repository opts into `release_contract`, DSR creates a new empty draft,
 uploads only the contracted primaries, their checksum sidecars, the regular

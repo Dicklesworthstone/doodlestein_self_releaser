@@ -18888,6 +18888,75 @@ _act_validate_native_matrix_result_inventory() {
     fi
 }
 
+# Ordinary workflow jobs can emit several compiler variants under one platform
+# receipt. Success of that job is not evidence that every configured primary
+# exists. Check the final payload inventory independently of execution method;
+# optional aliases and configured companion assets do not define coverage.
+_act_validate_manifest_variant_coverage() {
+    local tool="$1" manifest="$2"
+    local companions inventory platforms platform configured missing mapping
+    companions=$(config_get_additional_artifacts_json "$tool") || return 4
+    if ! inventory=$(jq -ces --slurpfile companion_documents /dev/fd/3 '
+        if length != 1 or (.[0] | type != "object") or
+           ($companion_documents | length != 1 or (.[0] | type != "object"))
+        then error("expected one manifest and companion map")
+        else .[0] as $manifest | $companion_documents[0] as $companions |
+            if ($manifest.artifacts | type != "array") or
+               ($manifest.requested_targets != null and
+                   ($manifest.requested_targets | type != "array" or
+                    (all(.[]; type == "string" and length > 0) | not))) or
+               ($manifest.build_environments != null and
+                   ($manifest.build_environments | type != "array" or
+                    (all(.[]; type == "object" and
+                        (.target | type == "string" and length > 0)) | not)))
+            then error("invalid variant inventory")
+            else [$companions[][] | .name] as $additional_names | {
+                platforms: (
+                    ($manifest.requested_targets // []) +
+                    [$manifest.build_environments[]? | .target] +
+                    [$manifest.artifacts[] | .target | strings] | unique),
+                artifacts: [$manifest.artifacts[] |
+                    (.name // .filename) as $name |
+                    select(.role != "additional" and
+                        ($additional_names | index($name)) == null and
+                        ($name | ascii_downcase |
+                            test("\\.(minisig|sig|sha256|sha512|intoto\\.jsonl)$|^sha256sums(\\.txt)?$|^checksums\\.txt$|\\.sbom\\.|-manifest\\.json$") | not)) |
+                    {target, target_triple}]
+            } end
+        end
+    ' 3<<< "$companions" <<< "$manifest"); then
+        _log_error "Release manifest has an invalid variant inventory"
+        return 4
+    fi
+    # Legacy manifests may omit requested_targets, but a configured variant
+    # matrix still needs unambiguous payload platforms. Do not let an untyped
+    # manifest turn the coverage check into an empty loop. Typed subsets remain
+    # valid; absent unrequested platforms are not inferred from configuration.
+    mapping=$(_config_target_triples_json "$tool") || return 4
+    if jq -e 'type == "object" and any(.[]; type == "array" and length > 1)' \
+            <<< "$mapping" >/dev/null &&
+       ! jq -e '(.platforms | length > 0) and
+            all(.artifacts[]; .target | type == "string" and length > 0)' \
+            <<< "$inventory" >/dev/null; then
+        _log_error "Multi-variant release requires explicit payload platform identities; rebuild its manifest"
+        return 4
+    fi
+    platforms=$(jq -r '.platforms[]' <<< "$inventory") || return 4
+    while IFS= read -r platform; do
+        [[ -n "$platform" ]] || continue
+        configured=$(config_get_target_triples_json "$tool" "$platform") || return 4
+        [[ "$(jq 'length' <<< "$configured")" -gt 1 ]] || continue
+        missing=$(jq -r --arg platform "$platform" --argjson configured "$configured" '
+            [.artifacts[] | select(.target == $platform) | .target_triple] as $actual |
+            $configured[] | select(. as $triple | ($actual | index($triple)) == null)
+        ' <<< "$inventory") || return 4
+        if [[ -n "$missing" ]]; then
+            _log_error "Missing configured primary variant(s) for $tool $platform: $missing"
+            return 4
+        fi
+    done <<< "$platforms"
+}
+
 # A retained manifest reaches release without its original worker results.
 # Reconcile its saved environment inventory with the same native matrix rules
 # before any remote release mutation. These projected rows describe declared

@@ -4,6 +4,7 @@ on:
     branches: [main]
     paths:
       - dsr
+      - src/act_runner.sh
       - src/github.sh
       - src/dispatch.sh
       - src/release_finalize_core.sh
@@ -38,6 +39,7 @@ on:
       - scripts/tests/test_host_health.sh
       - scripts/tests/test_host_config_admission.sh
       - scripts/tests/test_release_resume.sh
+      - scripts/tests/e2e_build.sh
       - scripts/tests/test_release_verify.sh
       - scripts/tests/test_release_builds.sh
       - scripts/tests/test_release_builds_resume.sh
@@ -233,10 +235,23 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends bats jq python3 rsync shellcheck curl util-linux golang-go
+          sudo apt-get install -y --no-install-recommends bats jq python3 rsync shellcheck curl util-linux golang-go zip unzip xz-utils
           mkdir -p "$RUNNER_TEMP/dsr-test-bin"
           GOBIN="$RUNNER_TEMP/dsr-test-bin" go install github.com/mikefarah/yq/v4@v4.47.1
           echo "$RUNNER_TEMP/dsr-test-bin" >> "$GITHUB_PATH"
+      - name: Verify complete ordinary variant inventories and primary alias ownership
+        shell: bash
+        run: |
+          set -euo pipefail
+          for source in dsr src/act_runner.sh scripts/tests/e2e_build.sh scripts/tests/test_release_resume.sh; do
+            bash -n "$source"
+          done
+          awk '/^_act_validate_manifest_variant_coverage\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' \
+            src/act_runner.sh > "$RUNNER_TEMP/variant-coverage.sh"
+          shellcheck -s bash -S warning "$RUNNER_TEMP/variant-coverage.sh"
+          timeout 120 bash scripts/tests/e2e_build.sh --variant-inventory-only
+          DSR_RELEASE_RESUME_TEST_FILTER='test_workflow_variant_' \
+            timeout 120 bash scripts/tests/test_release_resume.sh
       - name: Check syntax, fallback recovery, and release uploads
         shell: bash
         run: |

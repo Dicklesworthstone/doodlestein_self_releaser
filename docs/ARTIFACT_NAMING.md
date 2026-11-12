@@ -163,12 +163,23 @@ Before accepting a successful native matrix, manifest generation requires one
 successful result and at least one payload for every configured triple. Release
 also checks the retained native environment inventory, requested platforms and
 payloads before any GitHub mutation. Missing or duplicated native receipts and
-missing variant payloads are refused. Workflow receipts remain
-valid when one act job supplies only some configured variants or supplies
-artifacts for several platforms.
+missing variant payloads are refused. Individual workflow receipts may supply
+subsets of variants or assets for several platforms. The complete ordinary
+build inventory must still contain a primary payload for every configured
+triple of each requested or declared platform before it becomes publishable.
+A missing variant returns a partial build with no publishable manifest; its
+completed payloads remain available as diagnostics. Release rechecks the same
+coverage before checksum generation or GitHub mutation, including retained
+workflow manifests. Companion assets, signatures, checksums and SBOMs cannot
+stand in for a missing primary. Legacy manifests for a multi-variant tool must
+identify their payload platforms; explicit complete platform subsets remain
+valid without building unrelated configured platforms.
 
-Ordinary builds can expose shared installer aliases with one deterministic owner.
-Use a target-qualified pattern when installers must select both variants. The
+Ordinary builds can expose shared installer aliases with one deterministic owner:
+the configured primary variant. This applies to workflow and native lanes,
+including when packaging converts between archive formats. A missing distinct
+secondary alias is not a missing compiler variant when its primary payload is
+present. Use a target-qualified pattern when installers must select both variants. The
 generated installer refuses to install a nonprimary variant through an alias
 whose name is also used by the primary, and rejects literal libc markers that
 contradict the selected triple.

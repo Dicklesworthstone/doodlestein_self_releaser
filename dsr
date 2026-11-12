@@ -5025,8 +5025,8 @@ EOF
 
     # Platforms with several target-triple variants (bd-cdcz), e.g. gnu and
     # musl builds of linux/amd64. The build lane produces each variant's
-    # archive; give every non-primary variant it produced its own
-    # installer-compatible alias, and name the variants it did not produce.
+    # archive; require every configured variant and give each non-primary
+    # its own installer-compatible alias when that name is not shared.
     _build_emit_variant_aliases() {
         local tool="$1" version="$2" target="$3" format="$4" naming_ext="$5"
         local output_dir="$6" repo_path="$7" primary_versioned="$8"
@@ -5074,24 +5074,23 @@ EOF
                     return 0
                 fi
             fi
-            if $native_variant; then
-                # A shared public name belongs to the primary. Emitting the
-                # secondary alias first would either steal that name or make
-                # later primary packaging fail with a byte collision.
-                if [[ "$compat" == "$primary_compat" || "$compat" == "$primary_versioned" ]]; then
-                    compat=""
-                fi
-                naming_override=$(jq -nc --arg versioned "$versioned" --arg compat "$compat" \
-                    '{versioned:$versioned, compat:$compat}') || return 1
+            # A shared public name belongs to the primary for every lane.
+            # A workflow's secondary alias must not steal that name before
+            # GNU/native primary packaging, including cross-format repacking.
+            if [[ "$compat" == "$primary_compat" || "$compat" == "$primary_versioned" ]]; then
+                compat=""
             fi
+            naming_override=$(jq -nc --arg versioned "$versioned" --arg compat "$compat" \
+                '{versioned:$versioned, compat:$compat}') || return 1
             if ! _build_require_primary_names_available "$versioned" "$compat"; then
                 collect_failed=true
                 return 1
             fi
             variant_path=$(_build_find_manifest_artifact "$manifest_file" "$output_dir" "$target" "$format" "$triple" 2>/dev/null || true)
             if [[ -z "$variant_path" || -L "$variant_path" ]]; then
-                log_warn "Variant $triple of $tool $target was not produced by this build ($versioned); installers selecting it will find no asset"
-                continue
+                log_error "Missing configured primary variant $triple for $tool $target ($versioned)"
+                collect_failed=true
+                return 1
             fi
             log_info "Variant $triple of $tool $target: $versioned"
             local variant_format include
@@ -5727,7 +5726,7 @@ EOF
         fi
     fi
 
-    if $all_targets_succeeded && ! $build_release_contract_enabled; then
+    if $all_targets_succeeded && ! $manifest_failed && ! $build_release_contract_enabled; then
         if ! _build_package_archives "$tool_name" "$version" "$output_dir" "$result" "$target_list" "$manifest_file"; then
             collect_failed=true
         fi
@@ -5772,6 +5771,17 @@ EOF
         if [[ ! -f "$manifest_file" || -L "$manifest_file" ]] ||
            ! printf '%s\0' "${!collected_names[@]}" |
                 _act_verify_collected_manifest "$manifest_file" "$output_dir" --collected; then
+            manifest_failed=true
+        fi
+    fi
+
+    # A successful workflow can omit one configured compiler variant. Native
+    # worker counts cannot prove workflow payload completeness. Check the
+    # final primary inventory before its manifest receives publication rights.
+    if [[ -f "$manifest_file" ]] && ! $manifest_failed && ! $build_release_contract_enabled; then
+        local variant_manifest
+        if ! variant_manifest=$(cat "$manifest_file") ||
+           ! _act_validate_manifest_variant_coverage "$tool_name" "$variant_manifest"; then
             manifest_failed=true
         fi
     fi
@@ -9240,6 +9250,7 @@ EOF
             log_error "Manifest does not describe a successful build of $tool_name $tag"
             return 4
         fi
+        _act_validate_manifest_variant_coverage "$tool_name" "$ordinary_manifest" || return 4
         _act_validate_native_manifest_inventory "$tool_name" "$ordinary_manifest" || return 4
         # The binaries must come from the commit the tag names, not whatever
         # the checkout held when they were built.
