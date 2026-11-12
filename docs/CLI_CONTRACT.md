@@ -2045,14 +2045,15 @@ previous selected files when possible, retain incomplete recovery evidence and
 never report success for a partially installed family. PATH edits and skill
 installation are not part of this Windows installer.
 
-For a configured Go repository, source installation is a separate explicit mode:
+For a configured Go, Rust, Bun or TypeScript repository, source installation is a
+separate explicit mode:
 
 ```powershell
 .\install.ps1 -FromSource -SourceRef refs/tags/v1.2.3 -Yes -Json
 ```
 
-It requires existing Git and Go executables, executes repository/dependency build
-code, and never installs a compiler automatically. `-SourceRef` accepts `HEAD`
+It requires existing Git and the selected compiler, executes repository/dependency
+build code, and never installs a compiler automatically. `-SourceRef` accepts `HEAD`
 (the default), a full commit SHA, `refs/heads/BRANCH` or `refs/tags/TAG`. The
 fetched ref is resolved once to a commit in a private detached checkout; an
 explicit SHA must match exactly. Symbolic links, submodules, unsafe Windows
@@ -2061,8 +2062,8 @@ cannot inherit a different `GOOS`, `GOARCH`, `GOFLAGS`, `GOENV`, `GOWORK` or an
 automatic toolchain download. Existing dependency access and caches otherwise
 remain the installing user's Go environment.
 
-The source policy uses `source_subdir` and `source_entry`. An explicit entry
-selects the primary package; otherwise it uses `cmd/<primary>` when present and
+For Go, the source policy uses `source_subdir` and `source_entry`. An explicit
+entry selects the primary package; otherwise it uses `cmd/<primary>` when present and
 then the module root. Every selected companion requires its own `cmd/<name>`
 package. The complete per-target family must resolve to `main` packages, compile,
 retain its tracked-source fingerprint, and pass PE checks before any installed
@@ -2072,9 +2073,8 @@ diagnostics and leave installed executables untouched.
 
 `-FromSource` cannot be combined with `-Version`, `-Offline` or `-Recover`.
 Source options without `-FromSource` are refused. Release acquisition, checksum
-and signature failures never invoke a source build. Other configured languages
-retain their normal Windows release installer; this source mode currently
-supports Go only. `-SourceTimeout` is a per-Git/Go-command deadline, including
+and signature failures never invoke a source build. `-SourceTimeout` is a
+per-Git/compiler-command deadline, including
 redirected output draining: default 3600 seconds, range 1..86400. A timeout
 prevents installation. Cleanup does not claim custody of child processes already
 orphaned by an exited parent.
@@ -2088,6 +2088,33 @@ triple is labeled `release_target_triple`, not asserted as Go compiler evidence.
 `CacheDir/source-receipts/TOOL/`. That file describes verified locally compiled
 bytes, not a signed release or a promise that a subsequent installation finished.
 Successful temporary source trees are removed; the small receipt remains.
+
+Rust source builds use `source_subdir` and optional `source_package`, require a
+committed workspace `Cargo.lock`, and resolve the complete selected workspace
+executable family before compiling. Cargo runs with `--locked` and the configured
+Windows target in private output. Package identity, tracked-source stability,
+PE architecture and each output's bytes are verified before installation. Rust
+receipts report the actual `cargo_target` and compiler/package evidence.
+
+Bun and TypeScript source builds use `source_subdir` and optional `source_entry`.
+They require committed regular `package.json` and `bun.lock` or `bun.lockb` files.
+The primary entry uses `source_entry` when configured; otherwise it uses the
+package's string `bin` or the exact `bin` map key matching its executable name
+without `.exe`. Each companion requires its own exact map key. Entries must be
+committed regular files within the selected source directory; a leading `./`
+is accepted. Every selected provider is resolved before dependencies are installed.
+
+An installed Bun runs one `bun install --frozen-lockfile`, then compiles each
+member with `bun build --compile` for `bun-windows-x64-baseline` or
+`bun-windows-arm64`. Ambient `NODE_OPTIONS` and `BUN_OPTIONS` are removed.
+Committed project configuration and ordinary dependency settings still apply;
+this is not a hermetic dependency sandbox. The complete family must preserve
+tracked inputs and pass PE architecture and output-byte checks before the
+existing journaled installation can replace executables. Bun receipts report
+`bun_target`, compiler version, `source_entries`, `package_json_sha256` and
+`bun_lockfiles` path/hash/size evidence, with explicitly unsigned local-build
+status. Missing/stale locks, unsafe providers or a later companion failure
+preserve the installed family.
 
 Before the first executable replacement, the installer publishes an immutable
 local journal with the complete previous and incoming family. An interrupted

@@ -308,11 +308,11 @@ The policy regression exercises the actual configuration and publication naming
 helpers, explicit signing-key scope, executable-family limits and refusal before
 any existing installer or publication history changes.
 
-### Explicit Rust and Go source installation on Windows
+### Explicit source installation on Windows
 
-A generated installer for `language: rust` or `language: go` can build and install
-its complete configured executable family using **existing Git and compiler
-installations**:
+A generated installer for `language: rust`, `language: go`, `language: bun` or
+`language: typescript` can build and install its complete configured executable
+family using **existing Git and compiler installations**:
 
 ```powershell
 .\install.ps1 -FromSource -SourceRef refs/tags/v1.2.3 -Yes -Json
@@ -380,6 +380,38 @@ providers and private executable paths before PE architecture checks and
 installation proceed. Missing or stale locks, ambiguous providers and partial
 compilation failures leave the existing installation unchanged.
 
+For Bun and TypeScript, `source_subdir` selects the project containing a committed
+`package.json` and `bun.lock` or `bun.lockb`:
+
+```yaml
+language: typescript
+source_subdir: project
+source_entry: src/primary.ts
+workspace_binaries: [app, helper]
+```
+
+The generated Bun/TypeScript source policy contains `language`, `subdir` and
+`entry`; the latter two retain the configured `source_subdir` and `source_entry`.
+The optional `source_entry` selects only the primary executable. Otherwise the
+primary uses the project's `package.json` `bin` string or its exact entry in the
+`bin` object. Every companion requires its own exact `bin` object key, using the
+selected executable name without `.exe`; a scalar `bin` cannot supply companions.
+For the example above, `helper.exe` requires a `helper` entry in that object.
+Entries may begin with `./`, but must resolve to regular committed relative
+files inside the selected project. The complete family is resolved before
+installation or compilation; missing entries, linked files and unsafe paths are
+refused.
+
+The installer uses the existing Bun executable, clears inherited `NODE_OPTIONS`
+and `BUN_OPTIONS`, and preserves other dependency/cache settings. It runs one
+`bun install --frozen-lockfile` for the family, then `bun build --compile` for
+each selected entry into a private output directory. Windows x64 selects
+`bun-windows-x64-baseline`; Windows ARM64 selects `bun-windows-arm64`. Every output
+must pass PE machine validation for the installing architecture. The shared
+pinned-commit and tracked-source checks still apply after dependency installation
+and compilation, including the committed manifest and lockfile. A failed member
+or changed input prevents activation of the entire family.
+
 `-FromSource` explicitly authorizes execution of repository and dependency build
 code under the caller's account. It is separate from release acquisition:
 `-Version`, `-Offline` and `-Recover` cannot be combined with it, and a failed
@@ -418,8 +450,12 @@ explicit compilation triple, `cargo_version` identifies Cargo, and each
 `source_entries` row retains its Cargo binary, package ID, manifest and source
 path. For Go, `go_target` records the actual `windows` OS and Go architecture;
 `release_target_triple` is labeled as the configured release selector rather
-than a claimed Go compiler ABI. A small private
-receipt remains at `CacheDir/source-receipts/TOOL/COMMIT-UNIQUE.json`, and
+than a claimed Go compiler ABI. Bun and TypeScript receipts retain the compiler
+identity, explicit `bun_target`, each selected `source_entries` path, the committed
+lockfile's SHA-256 and byte length, and the package manifest's SHA-256. These
+receipts bind the complete locally compiled family to its source inputs; they
+do not claim a signed release or a fully authenticated dependency graph. A small
+private receipt remains at `CacheDir/source-receipts/TOOL/COMMIT-UNIQUE.json`, and
 `source_receipt` returns its path, hash and length. This receipt describes verified
 compiled bytes and is written before activation; its existence alone does not
 claim a successful installation.
@@ -454,6 +490,20 @@ and preserved signed release generation. Portable runs adapt native host detecti
 and the Git/HTTP remote boundaries to local repositories and signed fixtures.
 They do not establish live GitHub, native Windows ACL/NTFS, or Windows descendant
 process qualification.
+
+The focused Bun/TypeScript source-family regression uses genuine PowerShell,
+Git and Bun, with Bun producing actual Windows PE executables:
+
+```bash
+bash scripts/tests/test_install_source_windows.sh --bun-only
+```
+
+Its Linux run adapts native host detection and source/download transport
+boundaries while exercising the generated installer, entry and lock admission,
+compilation, receipts and complete-family installation transaction. Native
+Windows filesystem and process qualification remains pending; the portable
+result does not establish it. The ordinary signed release route remains
+separate, and a signature failure never authorizes source compilation.
 
 ## Executable families from source
 

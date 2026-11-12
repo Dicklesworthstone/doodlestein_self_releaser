@@ -1,5 +1,5 @@
 # Embedded by the ordinary Windows installer generator. Source installation is
-# explicit execution of repository/dependency code with existing Git and Rust/Go;
+# explicit execution of repository/dependency code with existing Git and Rust/Go/Bun;
 # its receipts never claim authentication as a published, signed release.
 
 function Test-DsrSourceRelativePath {
@@ -21,10 +21,10 @@ function Assert-DsrSourcePolicy {
     param($Source)
     Assert-DsrFields $Source @('language', 'subdir') @('entry', 'package')
     if (-not (Test-DsrSourceRelativePath $Source.subdir -Root)) { Stop-DsrInstall 'Invalid embedded Windows source directory' }
-    if ($Source.language -ceq 'go') {
+    if ($Source.language -cin @('go', 'bun', 'typescript')) {
         Assert-DsrFields $Source @('language', 'subdir', 'entry')
         if ($Source.entry -isnot [string] -or ($Source.entry -and -not (Test-DsrSourceRelativePath $Source.entry -Root))) {
-            Stop-DsrInstall 'Invalid embedded Windows Go source selection'
+            Stop-DsrInstall 'Invalid embedded Windows Go/Bun source selection'
         }
     } elseif ($Source.language -ceq 'rust') {
         Assert-DsrFields $Source @('language', 'subdir', 'package')
@@ -508,6 +508,76 @@ function Build-DsrRustSourceOutputs {
         source_package = $Policy.source.package; source_entries = @($providers) }
 }
 
+function Build-DsrBunSourceOutputs {
+    param($Policy, $Selection, [string]$Platform, [string]$Source, [string[]]$Files,
+        [string]$BuildRoot, [string]$Output, [string]$Logs, [int]$Timeout, [string]$Bun)
+    $target = switch ($Platform) {
+        'windows/amd64' { 'bun-windows-x64-baseline' }
+        'windows/arm64' { 'bun-windows-arm64' }
+        default { Stop-DsrInstall 'Unsupported Windows Bun source platform' 4 }
+    }
+    $manifestPath = Get-DsrPlainPath ([IO.Path]::Combine($BuildRoot, 'package.json')) -File
+    $manifestRelative = [IO.Path]::GetRelativePath($Source, $manifestPath).Replace('\', '/')
+    if ($manifestRelative -cnotin $Files) { Stop-DsrInstall 'Bun source installation requires a committed package.json' 4 }
+    $manifest = ConvertFrom-DsrJson (Read-DsrTextFile $manifestPath 8388608)
+    if ($manifest -isnot [Collections.IDictionary]) { Stop-DsrInstall 'Bun package.json must be an object' 4 }
+    $locks = @()
+    foreach ($name in @('bun.lock', 'bun.lockb')) {
+        $path = Get-DsrPlainPath ([IO.Path]::Combine($BuildRoot, $name))
+        if (-not [IO.File]::Exists($path)) { continue }
+        $relative = [IO.Path]::GetRelativePath($Source, $path).Replace('\', '/')
+        if ($relative -cnotin $Files) { Stop-DsrInstall 'Bun source lockfiles must be committed regular files' 4 }
+        $evidence = Get-DsrFileEvidence $path
+        $locks += @{ path = $relative; sha256 = $evidence.sha256; size_bytes = $evidence.size_bytes }
+    }
+    if ($locks.Count -eq 0) { Stop-DsrInstall 'Bun source installation requires a committed bun.lock or bun.lockb' 4 }
+    $primary = $Policy.binary_name
+    if (-not $primary.EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase)) { $primary += '.exe' }
+    $entries = @()
+    foreach ($name in $Selection.binaries) {
+        $isPrimary = $name.Equals($primary, [StringComparison]::OrdinalIgnoreCase)
+        $entry = if ($isPrimary) { $Policy.source.entry } else { '' }
+        if (-not $entry) {
+            $key = $name.Substring(0, $name.Length - 4)
+            $bins = if ($manifest.Contains('bin')) { $manifest.bin } else { $null }
+            if ($bins -is [Collections.IDictionary]) {
+                $matches = @($bins.Keys | Where-Object { $_ -ceq $key })
+                if ($matches.Count -eq 1) { $entry = $bins[$matches[0]] }
+            } elseif ($isPrimary -and $bins -is [string]) { $entry = $bins }
+        }
+        if ($entry -is [string] -and $entry.StartsWith('./', [StringComparison]::Ordinal)) { $entry = $entry.Substring(2) }
+        if (-not (Test-DsrSourceRelativePath $entry)) {
+            Stop-DsrInstall ('Missing or unsafe Bun source entry for ' + $name + '; declare package.json bin or source_entry') 4
+        }
+        $path = Get-DsrPlainPath ([IO.Path]::Combine($BuildRoot, $entry)) -File
+        $relative = [IO.Path]::GetRelativePath($Source, $path).Replace('\', '/')
+        if ($relative -cnotin $Files) { Stop-DsrInstall ('Bun entry must be a committed regular source file: ' + $entry) 4 }
+        $entries += @{ name = $name; entry = $entry }
+    }
+    $environment = Get-DsrSourceGitEnvironment $Policy.repo
+    # Ambient preloads must not replace the selected project's startup code.
+    # Dependency settings and committed bunfig.toml still apply; this is an
+    # explicitly requested source build, not a hermetic dependency sandbox.
+    $environment.NODE_OPTIONS = $null
+    $environment.BUN_OPTIONS = $null
+    $bunBase = @{ Executable = $Bun; Directory = $BuildRoot; Timeout = $Timeout; Environment = $environment }
+    $compiler = (Invoke-DsrSourceCommand @bunBase -Arguments @('--version') -Log ([IO.Path]::Combine($Logs, 'compiler')) -Capture).Trim()
+    if ($compiler.Length -gt 256 -or $compiler -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.+-]+)?$') {
+        Stop-DsrInstall 'Bun did not identify its compiler version' 6
+    }
+    $null = Invoke-DsrSourceCommand @bunBase -Arguments @('install', '--frozen-lockfile') -Log ([IO.Path]::Combine($Logs, 'dependencies'))
+    for ($index = 0; $index -lt $entries.Count; $index++) {
+        $entry = $entries[$index]
+        $null = Get-DsrPlainPath ([IO.Path]::Combine($BuildRoot, $entry.entry)) -File
+        $path = [IO.Path]::Combine($Output, $entry.name)
+        $arguments = @('build', '--compile', ('--target=' + $target), '--outfile', $path, ('./' + $entry.entry))
+        $null = Invoke-DsrSourceCommand @bunBase -Arguments $arguments -Log ([IO.Path]::Combine($Logs, ('build-' + $index)))
+    }
+    return @{ compiler = $compiler; bun_target = $target; source_entry = $Policy.source.entry;
+        source_entries = @($entries); bun_lockfiles = @($locks);
+        package_json_sha256 = (Get-DsrFileEvidence $manifestPath).sha256 }
+}
+
 function Build-DsrSourceFamily {
     param($Policy, $Selection, [string]$Platform, [string]$Reference, [string]$Work, [int]$Timeout)
     Assert-DsrSourcePolicy $Policy.source
@@ -516,7 +586,11 @@ function Build-DsrSourceFamily {
         Stop-DsrInstall 'Use HEAD, a full commit SHA, refs/heads/BRANCH or refs/tags/TAG for -SourceRef'
     }
     $git = Get-Command git -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    $compilerName = if ($Policy.source.language -ceq 'rust') { 'cargo' } else { 'go' }
+    $compilerName = switch ($Policy.source.language) {
+        'rust' { 'cargo' }
+        'go' { 'go' }
+        default { 'bun' }
+    }
     $compilerTool = Get-Command $compilerName -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     $rustc = if ($Policy.source.language -ceq 'rust') { Get-Command rustc -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1 } else { $null }
     if ($null -eq $git -or $null -eq $compilerTool -or ($Policy.source.language -ceq 'rust' -and $null -eq $rustc)) {
@@ -594,8 +668,10 @@ function Build-DsrSourceFamily {
         $compilerDetails = @{ compiler = $compiler; go_target = @{ os = 'windows'; arch = $environment.GOARCH };
             source_entry = $Policy.source.entry; source_entries = @($sourceEntries) }
         if ($null -ne $goContext.receipt) { $compilerDetails.go_workspace = $goContext.receipt }
-    } else {
+    } elseif ($Policy.source.language -ceq 'rust') {
         $compilerDetails = Build-DsrRustSourceOutputs $Policy $Selection $Platform $source $files $buildRoot $output $logs $Work $Timeout $compilerTool.Source $rustc.Source
+    } else {
+        $compilerDetails = Build-DsrBunSourceOutputs $Policy $Selection $Platform $source $files $buildRoot $output $logs $Timeout $compilerTool.Source
     }
     $finalCommit = (Invoke-DsrSourceGit @gitBase -Arguments @('rev-parse', '--verify', 'HEAD^{commit}') -Log ([IO.Path]::Combine($logs, 'git-final-pin')) -Capture).Trim()
     if ($finalCommit -cne $commit -or (Get-DsrSourceTreeEvidence $source $files) -cne $sourceEvidence) {

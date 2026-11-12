@@ -24,6 +24,7 @@ on:
       - scripts/tests/test_generated_installer_transactions.sh
       - scripts/tests/test_generated_workspace_installer.sh
       - scripts/tests/test_install_source.sh
+      - scripts/tests/test_install_source_windows.sh
       - scripts/tests/test_install_source_family.sh
       - scripts/tests/test_toolchain_detect.sh
       - scripts/tests/test_generated_installer_source.sh
@@ -37,7 +38,9 @@ on:
       - src/git_ops.sh
       - src/host_health.sh
       - src/install_gen.sh
+      - src/install_gen_windows.ps1
       - src/install_source.sh
+      - src/install_source_windows.ps1
       - src/toolchain_detect.sh
       - src/packaging.sh
       - src/platforms.sh
@@ -215,6 +218,7 @@ jobs:
             tar -xzf "$archive" -C "$RUNNER_TEMP/dsr-powershell"
             chmod +x "$RUNNER_TEMP/dsr-powershell/pwsh"
             export PATH="$RUNNER_TEMP/dsr-powershell:$PATH"
+            echo "$RUNNER_TEMP/dsr-powershell" >> "$GITHUB_PATH"
           fi
           DOTNET_PROCESSOR_COUNT=1 timeout 120 bash scripts/tests/test_native_source_sync.sh --windows-strict-go-only \
             2>&1 | tee "$RUNNER_TEMP/collector-evidence/windows-go-staging.log"
@@ -303,6 +307,20 @@ jobs:
           bash scripts/tests/test_install_source.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/source-engine.log"
           bash scripts/tests/test_install_source_family.sh --bun-contracts-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/bun-family-contracts.log"
           bash scripts/tests/test_generated_workspace_installer.sh --go-bun-source-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/go-bun-source-families.log"
+          test -z "$(git status --porcelain)"
+      - name: Validate Windows Bun and TypeScript source installation
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          DOTNET_PROCESSOR_COUNT: '1'
+          POWERSHELL_TELEMETRY_OPTOUT: '1'
+          DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+        run: |
+          set -euo pipefail
+          pwsh --version
+          bun --version
+          bash -n scripts/tests/test_install_source_windows.sh
+          bash scripts/tests/test_install_source_windows.sh --bun-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/windows-bun-source.log"
           test -z "$(git status --porcelain)"
       - name: Validate native compilation, manifests and signed provenance
         shell: bash

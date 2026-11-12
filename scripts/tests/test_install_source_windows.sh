@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Genuine generated source installation: real Git pins, Rust/Go Windows PE
+# Genuine generated source installation: real Git pins, Rust/Go/Bun Windows PE
 # families, retained receipts and the ordinary installation transaction. The
 # portable fixture adapts host detection and Git/HTTP transport only; it does
 # not claim live GitHub, native Windows ACL/NTFS or Windows process acceptance.
@@ -7,7 +7,11 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-for dependency in pwsh git go cargo rustc minisign python3 jq yq; do
+dependencies=(pwsh git go cargo rustc minisign python3 jq yq)
+if [[ " $* " == *' --bun-only '* ]]; then
+    dependencies=(pwsh git bun minisign python3 jq yq)
+fi
+for dependency in "${dependencies[@]}"; do
     if ! command -v "$dependency" >/dev/null 2>&1; then
         printf 'SKIP: Windows source installation tests require %s\n' "$dependency"
         exit 0
@@ -29,13 +33,15 @@ import sys
 import tempfile
 import zipfile
 
-arguments = argparse.ArgumentParser(description="Generated Windows Rust/Go source installation regression")
+arguments = argparse.ArgumentParser(description="Generated Windows Rust/Go/Bun source installation regression")
 arguments.add_argument("project", type=Path)
 arguments.add_argument("--baseline-project", type=Path, help="Frozen checkout before Windows source installation")
 arguments.add_argument("--rust-baseline-project", type=Path, help="Frozen checkout before Windows Rust source installation")
 arguments.add_argument("--workspace-baseline-project", type=Path, help="Frozen checkout before committed Go workspace support")
 arguments.add_argument("--go-workspace-only", action="store_true", help="Run the generated Go workspace caller regression")
 arguments.add_argument("--go-only", action="store_true", help="Run Go source and signed-release controls without Rust compilation")
+arguments.add_argument("--bun-only", action="store_true", help="Run genuine Bun/TypeScript Windows source installation controls")
+arguments.add_argument("--bun-baseline-project", type=Path, help="Frozen checkout before Windows Bun source installation")
 options = arguments.parse_args()
 project = options.project.resolve()
 root = Path(tempfile.mkdtemp(prefix="dsr-windows-source-", dir=os.environ.get("TMPDIR"))).resolve()
@@ -149,16 +155,19 @@ def generate(tool, label, *, checkout=project, destination=None):
     return result, runtime, policy
 
 
-config()
-generated, runtime, policy = generate("source-demo", "generate")
-check("public CLI publishes parse-checked standalone source-capable PowerShell", generated.returncode == 0 and runtime.is_file(),
-      generated.stderr.decode(errors="replace"))
-if generated.returncode or policy is None:
-    raise SystemExit(1)
-check("embedded source selectors and both target-specific families match configuration",
-      policy.get("source") == {"language": "go", "subdir": "project", "entry": "apps/primary"} and
-      policy["platforms"]["windows/amd64"]["binaries"] == ["app.exe", "helper.exe"] and
-      policy["platforms"]["windows/arm64"]["binaries"] == ["app.exe", "arm-helper.exe"])
+runtime = None
+policy = None
+if not options.bun_only:
+    config()
+    generated, runtime, policy = generate("source-demo", "generate")
+    check("public CLI publishes parse-checked standalone source-capable PowerShell", generated.returncode == 0 and runtime.is_file(),
+          generated.stderr.decode(errors="replace"))
+    if generated.returncode or policy is None:
+        raise SystemExit(1)
+    check("embedded source selectors and both target-specific families match configuration",
+          policy.get("source") == {"language": "go", "subdir": "project", "entry": "apps/primary"} and
+          policy["platforms"]["windows/amd64"]["binaries"] == ["app.exe", "helper.exe"] and
+          policy["platforms"]["windows/arm64"]["binaries"] == ["app.exe", "arm-helper.exe"])
 
 driver = root / "driver.ps1"
 driver.write_text(r'''param([string]$RuntimePath, [string]$CasePath)
@@ -190,7 +199,9 @@ if (Get-Command Invoke-DsrSourceGit -ErrorAction SilentlyContinue) {
         [IO.File]::AppendAllText($script:Fixture.commands, ((@{ executable = $Executable; arguments = @($Arguments);
             go_environment = @{ GOWORK = $Environment['GOWORK']; GOENV = $Environment['GOENV'];
                 GOFLAGS = $Environment['GOFLAGS']; GO111MODULE = $Environment['GO111MODULE'];
-                GOTOOLCHAIN = $Environment['GOTOOLCHAIN'] } } | ConvertTo-Json -Compress) + "`n"))
+                GOTOOLCHAIN = $Environment['GOTOOLCHAIN'] };
+            bun_environment = @{ NODE_OPTIONS = $Environment['NODE_OPTIONS']; BUN_OPTIONS = $Environment['BUN_OPTIONS'] }
+        } | ConvertTo-Json -Compress) + "`n"))
         $result = & $script:RealSourceCommand @PSBoundParameters
         if ($script:Fixture.Contains('inject_untracked_workspace') -and $script:Fixture.inject_untracked_workspace -and
             'checkout' -cin $Arguments) {
@@ -286,6 +297,196 @@ def calls(fixture):
 def no_http(fixture):
     path = Path(fixture["requests"])
     return not path.exists() or not path.read_bytes()
+
+
+def test_bun_sources():
+    bun_upstream = root / "bun-upstream"
+    bun_upstream.mkdir()
+    required(["git", "init", "--quiet", "--initial-branch=main", bun_upstream], "bun-git-init")
+    required(["git", "-C", bun_upstream, "config", "user.email", "fixture@example.invalid"], "bun-git-email")
+    required(["git", "-C", bun_upstream, "config", "user.name", "DSR Bun Source Fixture"], "bun-git-name")
+    manifest = {"name": "dsr-bun-source", "version": "1.0.0", "bin": {"helper": "./src/helper.ts", "arm-helper": "src/arm-helper.ts"},
+                "dependencies": {"local-fixture": "file:./local-fixture"}}
+    sources = {"project/package.json": json.dumps(manifest),
+               "project/src/primary.ts": 'import { value } from "local-fixture"; console.log("pinned-bun-primary-v1", value);\n',
+               "project/src/helper.ts": 'console.log("pinned-bun-helper-v1");\n',
+               "project/src/arm-helper.ts": 'console.log("pinned-bun-arm-helper-v1");\n',
+               "project/local-fixture/package.json": json.dumps({"name": "local-fixture", "version": "1.0.0", "main": "index.ts"}),
+               "project/local-fixture/index.ts": 'export const value = "committed-bun-dependency";\n',
+               "project/other-dependency/package.json": json.dumps({"name": "local-fixture", "version": "2.0.0", "main": "index.ts"}),
+               "project/other-dependency/index.ts": 'export const value = "other-committed-dependency";\n',
+               ".gitignore": "node_modules/\n"}
+    for name, value in sources.items():
+        path = bun_upstream / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(value)
+    required(["bun", "install", "--lockfile-only"], "bun-lock", cwd=bun_upstream / "project")
+    required(["git", "-C", bun_upstream, "add", "."], "bun-add")
+    required(["git", "-C", bun_upstream, "commit", "--quiet", "-m", "Pinned Bun source family"], "bun-commit")
+    commit = required(["git", "-C", bun_upstream, "rev-parse", "HEAD"], "bun-pin")
+    required(["git", "-C", bun_upstream, "tag", "-a", "v1.2.3", "-m", "Bun source release"], "bun-tag")
+    config("bun-source", language="bun", local_path=str(bun_upstream), source_entry="src/primary.ts")
+    generated_bun, bun_runtime, bun_policy = generate("bun-source", "bun-generate")
+    check("public generator embeds Bun source entry and target-specific executable families",
+          generated_bun.returncode == 0 and bun_policy.get("source") ==
+          {"language": "bun", "subdir": "project", "entry": "src/primary.ts"}, generated_bun.stderr.decode(errors="replace"))
+    if generated_bun.returncode:
+        return
+    if options.bun_baseline_project:
+        prior, prior_runtime, prior_policy = generate("bun-source", "bun-baseline-generate",
+            checkout=options.bun_baseline_project.resolve(), destination=root / "bun-baseline-generated")
+        before, before_result, before_fixture = invoke("bun-baseline", selected_runtime=prior_runtime,
+            repository_url=bun_upstream.as_uri())
+        release_policy = copy.deepcopy(bun_policy)
+        release_policy.pop("source")
+        check("same caller's frozen baseline has no Bun source route and identical release policy",
+              prior.returncode == 0 and prior_policy == release_policy and before.returncode == 4 and
+              "source policy" in before_result.get("error", "") and not calls(before_fixture) and no_http(before_fixture))
+    built, result, fixture = invoke("bun-pinned-family", selected_runtime=bun_runtime,
+        repository_url=bun_upstream.as_uri(), extra={"NODE_OPTIONS": "--require=/missing/ambient-preload.js",
+                                                   "BUN_OPTIONS": "--preload=/missing/ambient-bun-preload.ts"})
+    check("real frozen Bun dependency install compiles the complete pinned x64 source family",
+          built.returncode == 0 and result.get("method") == "source" and result.get("source", {}).get("source_commit") == commit and
+          result.get("bun_target") == "bun-windows-x64-baseline" and no_http(fixture), built.stderr.decode(errors="replace"))
+    if built.returncode:
+        return
+    prefix = Path(fixture["parameters"]["Prefix"])
+    old_family = {row["name"]: digest(prefix / row["name"]) for row in result["binaries"]}
+    check("real Windows PE payloads retain compiled primary, companion and dependency bytes with exact receipts",
+          set(old_family) == {"app.exe", "helper.exe"} and all(machine(prefix / row["name"]) == 0x8664 and
+          digest(prefix / row["name"]) == row["sha256"] and (prefix / row["name"]).stat().st_size == row["size_bytes"]
+          for row in result["binaries"]) and b"pinned-bun-primary-v1" in (prefix / "app.exe").read_bytes() and
+          b"committed-bun-dependency" in (prefix / "app.exe").read_bytes() and
+          b"pinned-bun-helper-v1" in (prefix / "helper.exe").read_bytes())
+    receipt = json.loads(Path(result["source_receipt"]["path"]).read_text())
+    check("durable Bun source receipt binds lockfile, manifest, compiler, target and every provider",
+          receipt == result["source"] and receipt["signed_release"] is False and
+          receipt["language"] == "bun" and "cargo_target" not in receipt and "go_target" not in receipt and
+          receipt["source_entries"] == [{"name": "app.exe", "entry": "src/primary.ts"}, {"name": "helper.exe", "entry": "src/helper.ts"}] and
+          receipt["package_json_sha256"] == digest(bun_upstream / "project/package.json") and
+          receipt["bun_lockfiles"][0]["sha256"] == digest(bun_upstream / "project/bun.lock") and
+          re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.+-]+)?", receipt["compiler"]) is not None)
+    selected_calls = calls(fixture)
+    check("Bun install uses frozen lock and each build uses an explicit private Windows target",
+          sum(row["arguments"][:2] == ["install", "--frozen-lockfile"] for row in selected_calls) == 1 and
+          sum(row["arguments"][:3] == ["build", "--compile", "--target=bun-windows-x64-baseline"] for row in selected_calls) == 2)
+    bun_calls = [row for row in selected_calls if Path(row["executable"]).name.lower() in ("bun", "bun.exe")]
+    check("actual Bun commands remove inherited Node and Bun preloads before execution",
+          len(bun_calls) == 4 and all(row["bun_environment"] == {"NODE_OPTIONS": None, "BUN_OPTIONS": None} for row in bun_calls))
+    config("typescript-source", language="typescript", local_path=str(bun_upstream), source_entry="src/primary.ts")
+    typescript, ts_runtime, ts_policy = generate("typescript-source", "typescript-generate")
+    arm, arm_result, arm_fixture = invoke("bun-arm64", selected_runtime=ts_runtime,
+        repository_url=bun_upstream.as_uri(), platform="windows/arm64")
+    check("TypeScript configuration builds actual ARM64-specific Windows executable family",
+          typescript.returncode == 0 and ts_policy["source"]["language"] == "typescript" and arm.returncode == 0 and
+          arm_result.get("bun_target") == "bun-windows-arm64" and
+          {row["name"] for row in arm_result.get("binaries", [])} == {"app.exe", "arm-helper.exe"} and
+          all(machine(Path(arm_fixture["parameters"]["Prefix"]) / row["name"]) == 0xAA64 for row in arm_result.get("binaries", [])),
+          arm.stderr.decode(errors="replace"))
+    for label, injection in (("bun-source-drift", {"mutate_source": True, "mutate_source_member": "src/primary.ts"}),
+                             ("bun-output-drift", {"mutate_output": True}), ("bun-rollback", {"move_fault": True})):
+        refused, _, _ = invoke(label, selected_runtime=bun_runtime, repository_url=bun_upstream.as_uri(),
+            parameters={"Prefix": str(prefix)}, **injection)
+        check(label + " preserves the entire previously installed executable family",
+              refused.returncode == 7 and all(digest(prefix / name) == value for name, value in old_family.items()),
+              refused.stderr.decode(errors="replace"))
+
+    def changed_commit(label, content):
+        (bun_upstream / "project/package.json").write_text(json.dumps(content))
+        required(["git", "-C", bun_upstream, "add", "project"], label + "-add")
+        required(["git", "-C", bun_upstream, "commit", "--quiet", "-m", label], label + "-commit")
+        return required(["git", "-C", bun_upstream, "rev-parse", "HEAD"], label + "-pin")
+
+    scalar_manifest = copy.deepcopy(manifest)
+    scalar_manifest["bin"] = "./src/primary.ts"
+    scalar_revision = changed_commit("bun-scalar-bin", scalar_manifest)
+    config("bun-single", language="bun", local_path=str(bun_upstream), source_entry="",
+           workspace_binaries=["app"], workspace_binaries_by_target={}, targets=["windows/amd64"])
+    single_generated, single_runtime, _ = generate("bun-single", "bun-scalar-generate")
+    single, single_result, single_fixture = invoke("bun-scalar-bin", selected_runtime=single_runtime,
+        repository_url=bun_upstream.as_uri(), parameters={"SourceRef": scalar_revision})
+    check("a scalar package bin supplies the primary entry without an explicit source_entry",
+          single_generated.returncode == 0 and single.returncode == 0 and
+          single_result.get("source", {}).get("source_entries") == [{"name": "app.exe", "entry": "src/primary.ts"}] and
+          [row["name"] for row in single_result.get("binaries", [])] == ["app.exe"] and
+          machine(Path(single_fixture["parameters"]["Prefix"]) / "app.exe") == 0x8664,
+          single.stderr.decode(errors="replace"))
+
+    release = root / "bun-signed-release"
+    release.mkdir()
+    asset = bun_policy["platforms"]["windows/amd64"]["name"].replace("${version}", "1.2.3")
+    archive = release / asset
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as package:
+        for name in ("app.exe", "helper.exe"):
+            package.write(prefix / name, name)
+    checksum = release / (asset + ".sha256")
+    checksum.write_text(digest(archive) + "  " + asset + "\n")
+    signature = release / (asset + ".minisig")
+    signature.write_text("invalid signature fixture\n")
+    base = "https://github.com/fixture/bun-source/releases/download/v1.2.3/"
+    downloads = {base + path.name: str(path) for path in (archive, checksum, signature)}
+    release_parameters = {"FromSource": False, "SourceRef": "", "SourceTimeout": 3600,
+                          "Version": "v1.2.3", "Prefix": str(prefix)}
+    failed_release, _, release_fixture = invoke("bun-bad-signature", parameters=release_parameters,
+        selected_runtime=bun_runtime, downloads=downloads)
+    check("failed configured release signatures never invoke Bun source installation or replace installed bytes",
+          failed_release.returncode == 7 and not calls(release_fixture) and
+          all(digest(prefix / name) == value for name, value in old_family.items()),
+          failed_release.stderr.decode(errors="replace"))
+
+    for label, change in (("bun-missing-provider", {}), ("bun-escaping-provider", {"helper": "../outside.ts"}),
+                          ("bun-invalid-provider", {"helper": ["src/helper.ts"]})):
+        selected = copy.deepcopy(manifest)
+        selected["bin"] = change
+        revision = changed_commit(label, selected)
+        refused, _, rejected_fixture = invoke(label, selected_runtime=bun_runtime, repository_url=bun_upstream.as_uri(),
+            parameters={"Prefix": str(prefix), "SourceRef": revision})
+        check(label + " fails before dependency installation or compilation and preserves installed bytes",
+              refused.returncode == 4 and not any(row["arguments"][0] in ("install", "build") for row in calls(rejected_fixture)) and
+              all(digest(prefix / name) == value for name, value in old_family.items()))
+    selected = copy.deepcopy(manifest)
+    selected["dependencies"]["local-fixture"] = "file:./other-dependency"
+    revision = changed_commit("bun-stale-lock", selected)
+    stale, stale_result, stale_fixture = invoke("bun-stale-lock", selected_runtime=bun_runtime, repository_url=bun_upstream.as_uri(),
+        parameters={"Prefix": str(prefix), "SourceRef": revision})
+    diagnostic_root = Path(stale_result.get("source_diagnostics", "/nonexistent")) / "logs"
+    dependency_diagnostics = "\n".join(path.read_text(errors="replace") for path in
+        (diagnostic_root / "dependencies.stdout", diagnostic_root / "dependencies.stderr") if path.is_file()).lower()
+    check("a stale committed lock cannot update dependencies or reach compilation",
+          stale.returncode == 6 and any(row["arguments"][:2] == ["install", "--frozen-lockfile"] for row in calls(stale_fixture)) and
+          "frozen" in dependency_diagnostics and "lockfile" in dependency_diagnostics and
+          not any(row["arguments"][0] == "build" for row in calls(stale_fixture)) and
+          all(digest(prefix / name) == value for name, value in old_family.items()),
+          dependency_diagnostics)
+    unfrozen = root / "bun-unfrozen-control"
+    required(["git", "clone", "--quiet", "--no-local", bun_upstream, unfrozen], "bun-unfrozen-clone")
+    required(["git", "-C", unfrozen, "checkout", "--quiet", "--detach", revision], "bun-unfrozen-checkout")
+    old_lock = digest(unfrozen / "project/bun.lock")
+    unlocked_install = command(["bun", "install"], "bun-unfrozen-install", cwd=unfrozen / "project", extra={"CI": ""})
+    check("the same valid dependency change succeeds and rewrites its lock when freezing is absent",
+          unlocked_install.returncode == 0 and digest(unfrozen / "project/bun.lock") != old_lock,
+          unlocked_install.stderr.decode(errors="replace"))
+    (bun_upstream / "project/src/helper.ts").write_text('this is not valid TypeScript !!!\n')
+    revision = changed_commit("bun-failed-companion", manifest)
+    partial, _, partial_fixture = invoke("bun-failed-companion", selected_runtime=bun_runtime, repository_url=bun_upstream.as_uri(),
+        parameters={"Prefix": str(prefix), "SourceRef": revision})
+    check("genuine later companion compiler failure never activates the completed primary",
+          partial.returncode == 6 and sum(row["arguments"][0] == "build" for row in calls(partial_fixture)) == 2 and
+          all(digest(prefix / name) == value for name, value in old_family.items()))
+    required(["git", "-C", bun_upstream, "update-index", "--force-remove", "project/bun.lock"], "bun-missing-lock-index")
+    required(["git", "-C", bun_upstream, "commit", "--quiet", "-m", "Missing Bun lock"], "bun-missing-lock-commit")
+    revision = required(["git", "-C", bun_upstream, "rev-parse", "HEAD"], "bun-missing-lock-pin")
+    missing, _, missing_fixture = invoke("bun-missing-lock", selected_runtime=bun_runtime, repository_url=bun_upstream.as_uri(),
+        parameters={"Prefix": str(prefix), "SourceRef": revision})
+    check("missing committed Bun lock is refused before dependency or compiler execution",
+          missing.returncode == 4 and not any(row["arguments"][0] in ("install", "build", "--version") for row in calls(missing_fixture)) and
+          all(digest(prefix / name) == value for name, value in old_family.items()))
+
+
+if options.bun_only:
+    test_bun_sources()
+    print(f"Windows Bun source tests: {passed} passed, {failed} failed", flush=True)
+    raise SystemExit(1 if failed else 0)
 
 
 def test_go_workspaces():

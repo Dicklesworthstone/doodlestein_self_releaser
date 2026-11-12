@@ -1414,7 +1414,7 @@ Options:
   -CacheDir DIR  Persistent verified download cache
   -Offline       No network; requires -Version and complete cached evidence
   -Recover       Restore an interrupted installation offline; requires -Yes
-  -FromSource    Explicitly build a configured Rust/Go family with installed tools
+  -FromSource    Explicitly build a configured Rust/Go/Bun family with installed tools
   -SourceRef REF Source pin: HEAD, refs/heads/BRANCH, refs/tags/TAG, or full SHA
   -SourceTimeout SECONDS  Per-source-command deadline; default 3600, maximum 86400
   -Yes           Authorize replacement of existing selected executables
@@ -1458,7 +1458,7 @@ explicit source fetches use the same token at that repository's HTTPS Git URL.
         if (-not $FromSource -and ($SourceRef -or $SourceTimeout -ne 3600)) { Stop-DsrInstall 'Source options require explicit -FromSource consent' }
         if ($FromSource) {
             if ($Version -or $Offline) { Stop-DsrInstall '-FromSource cannot be combined with -Version or -Offline; select -SourceRef instead' }
-            if (-not $policy.Contains('source')) { Stop-DsrInstall 'This installer has no supported Rust or Go source policy' 4 }
+            if (-not $policy.Contains('source')) { Stop-DsrInstall 'This installer has no supported Rust, Go or Bun source policy' 4 }
             if ($SourceTimeout -lt 1 -or $SourceTimeout -gt 86400) { Stop-DsrInstall '-SourceTimeout must be between 1 and 86400 seconds' }
             if (-not $SourceRef) { $SourceRef = 'HEAD' }
         }
@@ -1492,7 +1492,8 @@ explicit source fetches use the same token at that repository's HTTPS Git URL.
                 source_receipt = @{ path = $receiptPath; sha256 = $receiptEvidence.sha256; size_bytes = $receiptEvidence.size_bytes };
                 path = $primaryRow.path; binaries = @($installed); signature_verified = $false; exit_code = 0 }
             if ($built.receipt.language -ceq 'go') { $result.go_target = $built.receipt.go_target }
-            else { $result.cargo_target = $built.receipt.cargo_target }
+            elseif ($built.receipt.language -ceq 'rust') { $result.cargo_target = $built.receipt.cargo_target }
+            else { $result.bun_target = $built.receipt.bun_target }
             $retainSourceWork = $false
             Write-DsrInstallLog ('Installed ' + $tool + ' from source commit ' + $built.receipt.source_commit + ' (' + $installed.Count + ' executable(s))')
             if ($Json) { [Console]::Out.WriteLine(($result | ConvertTo-Json -Depth 12 -Compress)) }

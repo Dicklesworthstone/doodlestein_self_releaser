@@ -1139,7 +1139,7 @@ existing installation. `-Json` emits a structured result; `-Verbose` writes
 diagnostics to stderr. See [native Windows installers](docs/INSTALLER_GENERATION.md#native-windows-installers)
 for cache, upgrade and supported-format behavior.
 
-For a configured Rust or Go project, explicit `-FromSource -SourceRef refs/tags/v1.2.3`
+For a configured Rust, Go, Bun or TypeScript project, explicit `-FromSource -SourceRef refs/tags/v1.2.3`
 builds the complete Windows executable family with existing Git and compiler tools. It pins
 the fetched commit, checks every output's PE architecture and byte evidence,
 and uses the same journaled update and recovery transaction. Source builds require
@@ -1147,7 +1147,10 @@ separate consent and return local-build receipts; they never substitute for a
 failed release signature. Rust requires a committed workspace `Cargo.lock`, resolves
 each selected binary's package before compilation, and builds with `--locked`
 for the configured Windows target using an existing standard library and linker.
-See [Windows source installation](docs/INSTALLER_GENERATION.md#explicit-rust-and-go-source-installation-on-windows)
+Bun and TypeScript require committed `package.json` and `bun.lock` or `bun.lockb`,
+resolve each selected executable's entry, and compile Windows x64 or ARM64 payloads
+with the installed Bun compiler.
+See [Windows source installation](docs/INSTALLER_GENERATION.md#explicit-source-installation-on-windows)
 for source selectors, tool requirements and retained diagnostics.
 
 The installer accepts the build's scalar `archive_format: tar.xz` or a mapping

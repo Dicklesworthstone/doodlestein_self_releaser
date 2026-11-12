@@ -3280,11 +3280,11 @@ _install_gen_windows_policy() (
                 (ascii_downcase != ".git") and (endswith(".") | not) and (endswith(" ") | not) and
                 (test("[[:cntrl:]\\\\:<>\"|?*]") | not) and
                 (test("(?i)^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\\.|$)") | not))));
-        if .language == "go" then
-            {language:"go", subdir:(.source_subdir // "."), entry:(.source_entry // "")} as $source |
+        if .language == "go" or .language == "bun" or .language == "typescript" then
+            {language:.language, subdir:(.source_subdir // "."), entry:(.source_entry // "")} as $source |
             if ($source.subdir | source_path) and ($source.entry | type == "string" and (. == "" or source_path)) and
                 ((.source_package // "") == "")
-            then $source else error("invalid Windows Go source selection") end
+            then $source else error("invalid Windows Go/Bun source selection") end
         elif .language == "rust" then
             {language:"rust", subdir:(.source_subdir // "."), package:(.source_package // "")} as $source |
             if ($source.subdir | source_path) and
