@@ -13965,12 +13965,12 @@ act_run_native_build() {
         fi
         output_stage_root="${output_stage_parent%/}/dsr-build-${tool_name}-${platform//\//-}-${output_stage_uuid//-/}"
         output_stage_source="$output_stage_root/source"
-        if [[ "$language" == go ]] && ! $strict_native_build; then
+        if [[ "$language" == go || "$language" == bun || "$language" == typescript ]] && ! $strict_native_build; then
             # Ordinary sync has already selected and placed these roots beside
-            # remote_path. Go replace directives and go.work use entries keep
-            # that relative layout when an output collision moves this attempt
-            # to a private source copy. Never recopy the ambient controller
-            # sibling or reapply filters to the admitted namespace.
+            # remote_path. Go local modules and Bun/TypeScript relative imports
+            # keep that layout when an output collision moves this attempt to
+            # a private source copy. Never recopy the ambient controller sibling
+            # or reapply filters to the admitted namespace.
             local output_sibling_count output_sibling_index output_sibling_relative output_sibling_local
             local output_sibling_seen=' source cargo-home '
             output_sibling_count=$(yq -r '.sibling_crates // [] | length' "$config_file") || return 4
@@ -13987,7 +13987,7 @@ act_run_native_build() {
                 if [[ ! "$output_sibling_relative" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ||
                       "$output_sibling_relative" == *..* || "$output_sibling_relative" == *. ||
                       "$output_sibling_seen" == *" ${output_sibling_relative,,} "* ]]; then
-                    _log_error "Invalid or duplicate Go output-stage sibling name: $output_sibling_relative"
+                    _log_error "Invalid or duplicate output-stage sibling name: $output_sibling_relative"
                     return 4
                 fi
                 output_sibling_seen+="${output_sibling_relative,,} "

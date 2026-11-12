@@ -909,6 +909,15 @@ Staged roots are retained for subsequent resume. Ordinary staging requires
 rsync and Python 3 on the controller. Windows Git-context import requires
 PowerShell 7 and Git; Unix import requires Bash, Git, jq, and a SHA-256 utility.
 
+When ordinary parallel Go, Bun or TypeScript targets on one Unix host share an
+in-tree output path, the scheduler can move a conflicting target into a private
+source copy. That copy preserves the synchronized sibling layout and selected
+untracked files, using the host's admitted inputs without reapplying ignore
+rules or copying live controller siblings. Missing or link-substituted sibling
+roots refuse the new command and cannot authorize collection of an earlier
+output. Existing scheduling restrictions for strict builds and Windows remain
+in effect.
+
 The controller applies the actual rsync selection policy once to a private
 projection containing the main source and every configured sibling. It verifies
 the copy against the live selection before transport, then sends the same

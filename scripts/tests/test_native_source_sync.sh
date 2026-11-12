@@ -15,6 +15,8 @@
 # bindings; --ordinary-resume-only exercises a real Go matrix through cmd_build.
 # Use --go-siblings-only for real parallel Go replacements and workspaces,
 # including the source selection and receipts of private output stages.
+# Use --bun-siblings-only for ordinary Bun/TypeScript parallel Linux builds
+# preserving selected sibling imports when the scheduler isolates an output.
 # Use --windows-strict-go-only for genuine PowerShell source staging and Go
 # Windows PE collection; Unix transport adapters do not qualify native NTFS.
 # Use --windows-strict-bun-only for the same source custody with real Bun and
@@ -1106,6 +1108,157 @@ PY
             "$before_state" = "$(_act_sha256 "$state_file")"
     fi
     printf 'Ordinary Go %s: %s checks, %s failures\n' "$layout" "$checks" "$failures"
+    [[ "$failures" == 0 ]]
+)
+
+test_ordinary_bun_siblings() (
+    local language="$1" dependency work config sha tree status=0 checks=0 failures=0
+    local artifact shared_source private_source before_events before_state state_file run controller_before
+    case "$language" in bun|typescript) ;; *) return 4 ;; esac
+    for dependency in bash git jq yq python3 rsync bun tar; do
+        command -v "$dependency" >/dev/null || { printf 'SKIP: ordinary Bun siblings require %s\n' "$dependency"; return 77; }
+    done
+    [[ $(uname -s)/$(uname -m) == Linux/x86_64 ]] || {
+        printf 'SKIP: ordinary Bun sibling executable fixture requires Linux x86_64\n'; return 77;
+    }
+    work=$(mktemp -d "${DSR_TEST_DISK_ROOT:-${TMPDIR:-/tmp}}/dsr-ordinary-$language.XXXXXXXX") || return 1
+    printf 'Ordinary %s sibling evidence: %s\n' "$language" "$work"
+    mkdir -p "$work/config/repos.d" "$work/source" "$work/dep" "$work/stages" || return 1
+    export DSR_CONFIG_DIR="$work/config" ACT_CONFIG_DIR="$work/config" ACT_REPOS_DIR="$work/config/repos.d"
+    export DSR_STATE_DIR="$work/state" DSR_CACHE_DIR="$work/cache"
+    export DSR_HOSTS_FILE="$work/config/hosts.yaml" DSR_REPOS_FILE="$work/config/repos.yaml"
+    export DSR_DISABLE_HOST_SELECTOR=1 RCH_DISABLED=1 RCH_CARGO_WRAPPER_BYPASS=1 NO_COLOR=1
+    printf '{"name":"bunsiblings","version":"1.0.0","type":"module"}\n' > "$work/source/package.json"
+    printf 'import { value } from "../dep/dep.ts";\nconsole.log(value);\n' > "$work/source/main.ts"
+    printf 'export { value } from "./selected.ts";\n' > "$work/dep/dep.ts"
+    printf 'excluded.ts\n' > "$work/dep/.gitignore"
+    for tree in source dep; do
+        git -C "$work/$tree" init -q -b main || return 1
+        git -C "$work/$tree" add . || return 1
+        git -C "$work/$tree" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm original || return 1
+    done
+    # Ordinary --allow-dirty selects untracked source while excluding ignored
+    # files. The output stage must reuse that selection, not the live checkout.
+    printf 'export const value: string = "selected-sibling-input";\n' > "$work/dep/selected.ts"
+    printf 'this is not valid TypeScript source\n' > "$work/dep/excluded.ts"
+    controller_before="$(git -C "$work/source" status --porcelain --untracked-files=all)$(git -C "$work/dep" status --porcelain --untracked-files=all)"
+    sha=$(git -C "$work/dep" rev-parse HEAD) || return 1
+    jq -n --arg work "$work" '{schema_version:"1.0.0",hosts:{localnative:{
+        platform:"linux/amd64",connection:"local",concurrency:2,build_root:($work+"/stages")}},
+        platform_mapping:{"linux/amd64":"localnative","linux/arm64":"localnative"}}' > "$DSR_HOSTS_FILE" || return 1
+    config="$ACT_REPOS_DIR/bunsiblings.yaml"
+    jq -n --arg work "$work" --arg path "$PATH" --arg sha "$sha" --arg language "$language" '{
+        tool_name:"bunsiblings",repo:"example/bunsiblings",local_path:($work+"/source"),language:$language,binary_name:"bunsiblings",
+        targets:["linux/amd64","linux/arm64"],act_job_map:{"linux/amd64":null,"linux/arm64":null},
+        hosts:{"linux/amd64":"localnative","linux/arm64":"localnative"},
+        sibling_crates:[({local_path:($work+"/dep"),revision:$sha} +
+          (if $language=="bun" then {relative_path:"dep"} else {} end))],
+        build_cmd:"printf \"%s %s\\n\" \"$DSR_TARGET_ARCH\" \"$PWD\" >> \"$PROBE_EVENTS\"; if [ \"$DSR_TARGET_ARCH\" = arm64 ]; then target=bun-linux-arm64; touch \"$PROBE_READY\"; else target=bun-linux-x64; count=0; while [ ! -e \"$PROBE_READY\" ] && [ \"$count\" -lt 600 ]; do sleep 0.05; count=$((count+1)); done; test -e \"$PROBE_READY\" || exit 9; fi; bun build --compile --target=\"$target\" --outfile bunsiblings main.ts",
+        env:{PATH:$path,PROBE_READY:($work+"/second-ready"),PROBE_EVENTS:($work+"/compiler-events")},
+        artifact_naming:"${name}-${version}-${os}-${arch}.${ext}",archive_format:{linux:"tar.gz"}}
+        ' > "$config" || return 1
+    # shellcheck source=../../src/logging.sh
+    source "$ROOT/src/logging.sh"
+    # shellcheck source=../../src/config.sh
+    source "$ROOT/src/config.sh"
+    # shellcheck source=../../src/build_state.sh
+    source "$ROOT/src/build_state.sh"
+    # shellcheck source=../../src/act_runner.sh
+    source "${DSR_TEST_ACT_RUNNER:-$ROOT/src/act_runner.sh}"
+    # shellcheck source=../../src/artifact_naming.sh
+    source "$ROOT/src/artifact_naming.sh"
+    # shellcheck source=../../src/host_selector.sh
+    source "$ROOT/src/host_selector.sh"
+    # shellcheck source=../../src/host_health.sh
+    source "$ROOT/src/host_health.sh"
+    # shellcheck source=../../src/git_ops.sh
+    source "$ROOT/src/git_ops.sh"
+    # shellcheck source=../../src/packaging.sh
+    source "$ROOT/src/packaging.sh"
+    printf 'BOUNDARY: fixture host health/capacity; genuine rsync/Git selection, Bun compiler, parallel scheduler, private stages, collection and checkpoint; arm64 is inspected, not executed\n'
+    host_health_is_ready() { return 0; }
+    selector_acquire_slot() { return 0; }
+    selector_release_slot() { return 0; }
+    build_state_init || return 1
+    export SCRIPT_DIR="$ROOT" JSON_MODE=true DRY_RUN=false VERBOSE=false DSR_VERSION=fixture DSR_KEEP_BUILD_STAGES=1
+    declare -A _DSR_LOADED_MODULES=([packaging]=1 [artifact_naming]=1)
+    # shellcheck disable=SC1090 # Public command, scheduler and durable result writer.
+    source <(awk '/^(_dsr_require|cmd_build)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$ROOT/dsr") || return 1
+    # shellcheck disable=SC1090
+    source <(awk '/^json_envelope\(\) \{/{copy=1} copy{print} copy && /^# ====/{exit}' "$ROOT/dsr") || return 1
+    check_ordinary_bun() {
+        local label="$1"; shift
+        checks=$((checks + 1))
+        if "$@"; then printf 'PASS: ordinary %s siblings: %s\n' "$language" "$label"
+        else failures=$((failures + 1)); printf 'FAIL: ordinary %s siblings: %s\n' "$language" "$label" >&2; fi
+    }
+    cmd_build bunsiblings --version 1.0.0 --allow-dirty --parallel=2 --output-dir "$work/output" \
+        > "$work/result.json" 2> "$work/build.log" || status=$?
+    check_ordinary_bun 'real scheduler isolates the overlapping target output' \
+        grep -q 'Target linux/arm64 shares its output path.*building it in a private source copy' "$work/build.log"
+    check_ordinary_bun 'public parallel matrix completes' test "$status" -eq 0
+    if [[ "$status" -ne 0 ]]; then
+        cat "$work/build.log" >&2
+        printf 'Ordinary %s siblings: %s checks, %s failures\n' "$language" "$checks" "$failures"
+        return 1
+    fi
+    build_state_get bunsiblings 1.0.0 > "$work/state.json" || return 1
+    check_ordinary_bun 'both native results retain the admitted source namespace' jq -e '
+        .context.source_sync.source_inputs as $inputs | .status=="completed" and
+        $inputs.roots==["dep","source"] and ($inputs.sha256|length)==64 and
+        all(.target_statuses[]; .status=="completed" and .result.source_sync.source_inputs==$inputs)
+        ' "$work/state.json"
+    check_ordinary_bun 'public result admits both target artifacts and their source receipts' jq -es '
+        length==1 and (.[0] | .details.source_sync.source_inputs as $inputs |
+        .exit_code==0 and .details.success==2 and (.details.targets|length)==2 and
+        all(.details.targets[]; .status=="success" and .source_sync.source_inputs==$inputs))
+        ' "$work/result.json"
+    artifact=$(jq -er '.target_statuses["linux/amd64"].result.artifact_path' "$work/state.json") || return 1
+    check_ordinary_bun 'actual amd64 executable consumes selected untracked sibling input' test "$("$artifact" 2>&1)" = selected-sibling-input
+    check_ordinary_bun 'actual arm64 ELF contains the selected sibling (no runtime claim)' python3 - "$work/state.json" <<'PY'
+import json, pathlib, sys
+state = json.loads(pathlib.Path(sys.argv[1]).read_text())
+payload = pathlib.Path(state['target_statuses']['linux/arm64']['result']['artifact_path']).read_bytes()
+assert payload[:6] == b'\x7fELF\x02\x01' and payload[18:20] == b'\xb7\x00'
+assert b'selected-sibling-input' in payload
+PY
+    shared_source=$(jq -er '.context.source_sync.source_roots.localnative' "$work/state.json") || return 1
+    private_source=$(awk '$1=="arm64"{sub(/^[^ ]* /,"");print}' "$work/compiler-events") || return 1
+    check_ordinary_bun 'overlapping compiler uses a distinct private source stage' test "$private_source" != "$shared_source"
+    check_ordinary_bun 'private sibling retains selected untracked source bytes' cmp "$work/dep/selected.ts" "${private_source%/*}/dep/selected.ts"
+    check_ordinary_bun 'ignored controller file stays outside the private sibling' test ! -e "${private_source%/*}/dep/excluded.ts"
+    check_ordinary_bun 'sibling Git identity survives output staging' test "$(git -C "${private_source%/*}/dep" rev-parse HEAD)" = "$sha"
+    check_ordinary_bun 'controller main remains free of build output' test ! -e "$work/source/bunsiblings"
+    check_ordinary_bun 'controller repositories retain their selected dirty state' test "$controller_before" = \
+        "$(git -C "$work/source" status --porcelain --untracked-files=all)$(git -C "$work/dep" status --porcelain --untracked-files=all)"
+    if [[ "$language" == bun ]]; then
+        # Ordinary admission binds the selected transfer, not immutable build
+        # trees. Refuse absent or link-substituted roots before starting a new
+        # command, even though an earlier output exists in the shared source.
+        before_events=$(_act_sha256 "$work/compiler-events") || return 1
+        run=$(jq -er .run_id "$work/state.json") || return 1
+        state_file="$DSR_STATE_DIR/builds/bunsiblings/1.0.0/$run/state.json"
+        before_state=$(_act_sha256 "$state_file") || return 1
+        mv "${shared_source%/*}/dep" "$work/retained-host-dep" || return 1
+        for tree in missing linked; do
+            if [[ "$tree" == linked ]]; then
+                ln -s "$work/retained-host-dep" "${shared_source%/*}/dep" || return 1
+            fi
+            status=0
+            DSR_NATIVE_OUTPUT_STAGE=1 act_run_native_build bunsiblings linux/arm64 1.0.0 "refused-$tree" \
+                '' '' '' localnative '' "$shared_source" > "$work/$tree.json" 2> "$work/$tree.log" || status=$?
+            check_ordinary_bun "$tree sibling refuses the attempt" test "$status" -ne 0
+            check_ordinary_bun "$tree sibling never reaches the compiler command" test \
+                "$before_events" = "$(_act_sha256 "$work/compiler-events")"
+            check_ordinary_bun "$tree sibling cannot collect an earlier output" jq -e \
+                '.status=="failed" and .artifact_paths==[]' "$work/$tree.json"
+            check_ordinary_bun "$tree sibling reaches the specific source refusal" \
+                grep -q 'required sibling is missing or linked' "$work/$tree.log"
+        done
+        check_ordinary_bun 'refused attempts preserve the public completed checkpoint' test \
+            "$before_state" = "$(_act_sha256 "$state_file")"
+    fi
+    printf 'Ordinary %s siblings: %s checks, %s failures\n' "$language" "$checks" "$failures"
     [[ "$failures" == 0 ]]
 )
 
@@ -3100,6 +3253,12 @@ if [[ "${1:-}" == --strict-go-siblings-only ]]; then
     test_strict_go_siblings replace || strict_go_status=$?
     test_strict_go_siblings workspace || strict_go_status=$?
     exit "$strict_go_status"
+fi
+if [[ "${1:-}" == --bun-siblings-only ]]; then
+    bun_sibling_status=0
+    test_ordinary_bun_siblings bun || bun_sibling_status=$?
+    test_ordinary_bun_siblings typescript || bun_sibling_status=$?
+    exit "$bun_sibling_status"
 fi
 if [[ "${1:-}" == --windows-strict-go-only ]]; then
     test_windows_strict_native go

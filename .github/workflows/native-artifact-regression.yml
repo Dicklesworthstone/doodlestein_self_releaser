@@ -204,7 +204,7 @@ jobs:
           timeout 120 bash scripts/tests/test_native_source_sync.sh --strict-cgo-selectors-only \
             2>&1 | tee "$RUNNER_TEMP/collector-evidence/strict-cgo-selectors.log"
           test -z "$(git status --porcelain)"
-      - name: Verify pinned Bun and TypeScript sibling builds
+      - name: Verify Bun and TypeScript sibling builds
         if: runner.os == 'Linux'
         shell: bash
         env:
@@ -213,6 +213,8 @@ jobs:
           set -euo pipefail
           timeout 120 bash scripts/tests/test_native_source_sync.sh --strict-bun-siblings-only \
             2>&1 | tee "$RUNNER_TEMP/collector-evidence/strict-bun-siblings.log"
+          timeout 120 bash scripts/tests/test_native_source_sync.sh --bun-siblings-only \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/ordinary-bun-siblings.log"
           test -z "$(git status --porcelain)"
       - name: Verify Windows Go staging with genuine PowerShell and PE outputs
         if: runner.os == 'Linux'
