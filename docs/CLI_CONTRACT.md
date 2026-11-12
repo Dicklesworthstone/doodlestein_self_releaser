@@ -469,6 +469,20 @@ jobs and approval-pending jobs suppress this automatic fallback decision.
 Recent job creation or completion restarts the queue clock. Job inventories
 that cannot be fully read within the 1,000-job safety bound, contain invalid
 metadata, or disagree with the observed run/source/attempt are unreadable.
+An unreadable job inventory excludes only that run: queued workflows and
+independently verified stalled runs from the same complete active-run listing
+remain actionable. Each unreadable run is reported in `details.skipped` with
+its `repo`, `run_id`, and `reason`, and in the repository's `job_errors` array.
+The repository is never listed as healthy while any inspected run is unreadable.
+With no proven throttled run, inspection failures return exit 8; with a proven
+throttled run, exit 1 permits the watcher to admit only the verified candidates.
+An incomplete or malformed top-level active-run listing still excludes the
+entire repository.
+Explicit cancellation during authentication, run listing, or job inspection
+aborts the entire check with exit 5, withdraws any previously observed fallback
+candidates, and preserves the last completed check snapshot. Both continuous
+and single-pass watchers stop on that cancellation without launching workers
+or starting another poll.
 
 Each throttled row includes `queue_reason: "workflow_queue"` for a queued
 workflow or `queue_reason: "job_queue"` for stalled job dispatch. The latter
@@ -480,7 +494,7 @@ also includes the nonempty `queued_job_ids` array and measures
 - `1`: Throttling detected (triggers fallback recommendation)
 - `3`: gh auth missing
 - `4`: Invalid request deadline configuration
-- `5`: Authentication interrupted
+- `5`: Authentication or workflow inspection interrupted
 - `8`: GitHub API error for a repo (listed in `details.skipped`), with no throttling seen elsewhere
 
 Authentication preflight is bounded by `GH_API_TIMEOUT` (60 seconds by default).
@@ -2408,11 +2422,13 @@ dsr check --repo $REPO && dsr build --repo $REPO && dsr release --repo $REPO
 ```
 
 The check step records why the fallback ran (`details.trigger`, e.g. "release
-workflow throttled: 1 run(s) over 600s"); it does not block a fallback that was
-asked for, since `dsr check` itself exits 1 exactly when throttled. Its step
-carries `throttled` and the check's own exit code. The build step covers the
-quality gate, build, artifact verification and signing; `--build-only` runs
-the build step alone. `details.steps[]` lists the steps that ran.
+workflow throttled: 1 run(s) over 600s"). A healthy or unavailable check does
+not block a requested fallback. Explicit cancellation stops with exit 5,
+records the interrupted check, and blocks quality checks, compilation, signing,
+and publication while releasing the coordinator lock. Its step carries
+`throttled` and the check's own exit code. The build step covers the quality
+gate, build, artifact verification and signing; `--build-only` runs the build
+step alone. `details.steps[]` lists the steps that ran.
 
 `--resume=RUN_UUID` accepts a saved `partial` build as well as failed or
 interrupted builds. It retains the original run UUID and output directory,

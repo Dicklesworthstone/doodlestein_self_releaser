@@ -1519,7 +1519,7 @@ _check_save_snapshot() {
             --argjson threshold "$threshold" '
             {checked_at: $at, threshold_seconds: $threshold, repos_checked: [.[].repo],
              throttled: [.[] | select(.status == "throttled") | .repo],
-             skipped: [.[] | select(.status == "error") | .repo]}' > "$tmp" 2>/dev/null &&
+             skipped: [.[] | select(.status == "error" or ((.job_errors // []) | length > 0)) | .repo]}' > "$tmp" 2>/dev/null &&
        mv -f -- "$tmp" "$dir/last.json"; then
         return 0
     fi
@@ -1576,6 +1576,7 @@ EXIT CODES:
     1  - Throttling detected
     3  - Dependency error (gh not authenticated)
     4  - Invalid arguments
+    5  - Authentication or workflow inspection interrupted
     8  - Network/API error (no throttling seen in the repos that answered)
 EOF
                 return 0
@@ -1696,7 +1697,7 @@ EOF
     fi
 
     # Process each repo
-    local any_throttled=false any_error=false
+    local any_throttled=false any_error=false interrupted=false
     local results=()
     local now
     now=$(date +%s)
@@ -1712,6 +1713,8 @@ EOF
 
         if [[ $status -eq 1 ]]; then
             any_throttled=true
+        elif [[ $status -eq 5 ]]; then
+            interrupted=true
         elif [[ $status -ne 0 ]]; then
             any_error=true
         fi
@@ -1724,16 +1727,22 @@ EOF
         if ! $JSON_MODE; then
             _check_print_result "$result"
         fi
+        $interrupted && break
     done
 
-    # The last result, for `dsr report` and `dsr status` (not under dry-run).
-    ${DRY_RUN:-false} || _check_save_snapshot "$threshold" "${results[@]}"
+    # An interrupted poll cannot replace the last completed observation or
+    # authorize previously collected candidates from another repository.
+    if ! $interrupted; then
+        ${DRY_RUN:-false} || _check_save_snapshot "$threshold" "${results[@]}"
+    fi
 
     # Throttling is actionable even when another repo could not be read; an
     # unreadable repo is never reported as healthy.
     # Envelope status per docs/CLI_CONTRACT.md: success|partial|error.
     local summary_status="success" summary_exit=0
-    if $any_throttled; then
+    if $interrupted; then
+        summary_status="error" summary_exit=5
+    elif $any_throttled; then
         summary_status="partial" summary_exit=1
     elif $any_error; then
         summary_status="error" summary_exit=8
@@ -1744,10 +1753,10 @@ EOF
         local results_json
         results_json=$(printf '%s\n' "${results[@]}" | jq -sc '.')
         json_envelope "check" "$summary_status" "$summary_exit" \
-            "$(jq -c --argjson threshold "$threshold" '. as $repos |
+            "$(jq -c --argjson threshold "$threshold" --argjson interrupted "$interrupted" '. as $repos |
                 {threshold_seconds: $threshold,
                  repos_checked: [$repos[].repo],
-                 throttled: [$repos[] | select(.status == "throttled") | . as $r |
+                 throttled: (if $interrupted then [] else [$repos[] | select(.status == "throttled") | . as $r |
                      ((.queued_runs // []) + (.stuck_runs // []))[] |
                      ((.path // "") | split("/") | last) as $file |
                      {repo: $r.repo, tool: $r.tool,
@@ -1757,10 +1766,14 @@ EOF
                       started_at: .run_started_at, head_branch: .head_branch,
                       head_sha: .head_sha, html_url: .html_url,
                       queue_reason: .queue_reason, queued_job_ids: .queued_job_ids} |
-                     with_entries(select(.value != null))],
-                 healthy: [$repos[] | select(.status == "ok") | .repo],
-                 skipped: [$repos[] | select(.status == "error") |
-                     {repo: .repo, reason: (.error // "check failed")}],
+                     with_entries(select(.value != null))] end),
+                 healthy: (if $interrupted then [] else [$repos[] | select(.status == "ok") | .repo] end),
+                 skipped: [$repos[] | . as $repo |
+                     if ((.job_errors // []) | length) > 0 then
+                         .job_errors[] | {repo:$repo.repo,run_id:.run_id,reason:.reason}
+                     elif .status == "error" then
+                         {repo:.repo,reason:(.error // "check failed")}
+                     else empty end],
                  repos: $repos}' <<< "$results_json")"
     fi
 
@@ -1771,10 +1784,10 @@ EOF
 # executing/awaiting approval. Job timestamps are optional in GitHub responses;
 # the latest observed run/job activity provides a conservative queue baseline.
 _check_waiting_jobs() {
-    local repo="$1" run="$2" threshold="$3" now="$4" jobs run_id attempt
+    local repo="$1" run="$2" threshold="$3" now="$4" jobs run_id attempt analysis_status=0
     run_id=$(jq -r '.id' <<< "$run") || return 8
     attempt=$(jq -r '.run_attempt // empty' <<< "$run") || return 8
-    jobs=$(gh_workflow_jobs "$repo" "$run_id" "$attempt") || return 8
+    jobs=$(gh_workflow_jobs "$repo" "$run_id" "$attempt") || return $?
     printf '%s\n' "$run" "$jobs" | jq -sc --argjson now "$now" --argjson threshold "$threshold" '
         .[0] as $run | .[1].jobs as $jobs |
         if any($jobs[]; (.head_sha | ascii_downcase) != ($run.head_sha | ascii_downcase))
@@ -1786,7 +1799,14 @@ _check_waiting_jobs() {
             $now - $activity > $threshold
         then $run + {age_seconds:($now - $activity),queue_reason:"job_queue",queued_job_ids:$queued}
         else null end
-    '
+    ' || analysis_status=$?
+    # jq uses exit 5 for invalid source/timestamp evidence too. Normalize its
+    # validation failures separately from API and process-signal interruption.
+    case "$analysis_status" in
+        0) return 0 ;;
+        129|130|131|143) return 5 ;;
+        *) return 8 ;;
+    esac
 }
 
 # Check a single repo for throttling
@@ -1811,6 +1831,12 @@ _check_repo() {
     runs_json=$(gh_workflow_active_runs "${run_args[@]}")
     local fetch_status=$?
 
+    if [[ $fetch_status -eq 5 ]]; then
+        jq -nc --arg repo "$repo" --arg workflow "$workflow" \
+            '{repo:$repo,status:"error",error:"workflow inspection interrupted",
+              workflow:(if $workflow == "" then null else $workflow end)}'
+        return 5
+    fi
     if [[ $fetch_status -ne 0 ]] || [[ -z "$runs_json" ]] ||
        ! jq -e 'type == "object"' <<< "$runs_json" >/dev/null 2>&1; then
         jq -nc --arg repo "$repo" --arg workflow "$workflow" \
@@ -1854,33 +1880,49 @@ _check_repo() {
     # An elapsed workflow duration cannot distinguish runner starvation from
     # a legitimate long compile. Only a complete job inventory showing queued
     # jobs, no executing/approval-pending jobs, and no recent activity can do so.
-    local run checked
-    local -a waiting_runs=()
+    # Each inventory authorizes only its own run. An unreadable run cannot
+    # invalidate a separately proven queue from this complete active listing.
+    local run checked inspection_status
+    local -a job_observations=()
     while IFS= read -r run; do
-        if ! checked=$(_check_waiting_jobs "$repo" "$run" "$threshold" "$now"); then
-            jq -nc --arg repo "$repo" --arg workflow "$workflow" \
-                '{repo:$repo,status:"error",error:"failed to inspect workflow jobs",
+        inspection_status=0
+        checked=$(_check_waiting_jobs "$repo" "$run" "$threshold" "$now") || inspection_status=$?
+        if [[ $inspection_status -eq 5 ]]; then
+            jq -nc --arg repo "$repo" --arg workflow "$workflow" --argjson run_id "$(jq -r '.id' <<< "$run")" \
+                '{repo:$repo,status:"error",error:"workflow job inspection interrupted",
+                  job_errors:[{run_id:$run_id,reason:"workflow job inspection interrupted"}],
                   workflow:(if $workflow == "" then null else $workflow end)}'
-            return 8
+            return 5
+        elif [[ $inspection_status -ne 0 ]]; then
+            checked=$(jq -nc --argjson run_id "$(jq -r '.id' <<< "$run")" \
+                '{run_id:$run_id,reason:"failed to inspect workflow jobs"}') || return 8
         fi
-        [[ "$checked" == null ]] || waiting_runs+=("$checked")
+        [[ "$checked" == null ]] || job_observations+=("$checked")
     done < <(jq -c '.stuck_runs[]' <<< "$result")
     result=$({
         printf '%s\n' "$result"
-        if ((${#waiting_runs[@]})); then printf '%s\n' "${waiting_runs[@]}"; fi
-    } | jq -sc '.[0] + {stuck_runs:.[1:]} |
+        if ((${#job_observations[@]})); then printf '%s\n' "${job_observations[@]}"; fi
+    } | jq -sc '.[0] + {
+            stuck_runs:[.[1:][] | select(.status == "in_progress")],
+            job_errors:[.[1:][] | select(.reason != null)]} |
         .stuck_in_progress_count = (.stuck_runs | length) |
-        .status = (if .queued_count > 0 or .stuck_in_progress_count > 0 then "throttled" else "ok" end)') || return 8
+        .status = (if .queued_count > 0 or .stuck_in_progress_count > 0 then "throttled"
+                   elif (.job_errors | length) > 0 then "error" else "ok" end) |
+        if .status == "error" then . + {error:"failed to inspect workflow jobs"} else . end') || return 8
 
     printf '%s\n' "$result"
-    [[ "$(jq -r '.status' <<< "$result")" == "throttled" ]] && return 1 || return 0
+    case "$(jq -r '.status' <<< "$result")" in
+        throttled) return 1 ;;
+        error) return 8 ;;
+        *) return 0 ;;
+    esac
 }
 
 # Print human-readable check result
 _check_print_result() {
     local result="$1"
 
-    local repo status queued stuck oldest_min
+    local repo status queued stuck oldest_min warning
     repo=$(echo "$result" | jq -r '.repo + (if .workflow then " (\(.workflow))" else "" end)')
     status=$(echo "$result" | jq -r '.status')
     queued=$(echo "$result" | jq -r '.queued_count')
@@ -1901,6 +1943,9 @@ _check_print_result() {
     else
         log_ok "$repo: OK (no throttling detected)"
     fi
+    while IFS= read -r warning; do
+        log_warn "$warning"
+    done < <(jq -r '.job_errors[]? | "  - Run \(.run_id): \(.reason)"' <<< "$result")
 }
 
 # ============================================================================
@@ -2348,6 +2393,11 @@ _watch_iteration() {
             # result and backoff even when one such recovery can start.
             check_output='{"details":{"throttled":[]}}'
         elif [[ $check_exit -ne 1 ]]; then
+            case "$check_exit" in
+                5|129|130|131|143)
+                    log_error "Throttle check interrupted"
+                    return 5 ;;
+            esac
             log_error "Throttle check failed (exit $check_exit); run 'dsr check' for details"
             return 1
         else
@@ -2794,14 +2844,22 @@ EOF
     fi
 
     _WATCH_RUNNING=true
-    local iteration=0
+    local iteration=0 iteration_status
 
     while $_WATCH_RUNNING; do
         iteration=$((iteration + 1))
         log_info "--- Iteration $iteration ---"
 
         # Run check
-        if ! _watch_iteration "$dry_run" "$auto_fallback"; then
+        iteration_status=0
+        _watch_iteration "$dry_run" "$auto_fallback" || iteration_status=$?
+        if [[ $iteration_status -eq 5 ]]; then
+            if $JSON_MODE; then
+                _watch_emit_result continuous 5 "$iteration"
+                return $?
+            fi
+            return 5
+        elif [[ $iteration_status -ne 0 ]]; then
             # Backoff on error
             if [[ $_WATCH_CURRENT_BACKOFF -gt 0 ]]; then
                 log_info "Sleeping ${_WATCH_CURRENT_BACKOFF}s (backoff)..."
@@ -13524,8 +13582,8 @@ EOF
         fi
     fi
 
-    # Throttle check: records why the fallback ran. It never blocks one that
-    # was asked for, and a build-only run publishes nothing, so it skips it.
+    # Throttle check: records why the fallback ran. Read failures do not block
+    # an explicit request; cancellation does. Build-only runs skip this check.
     if ! $build_only; then
         local check_started check_result="" check_rc=0 check_workflow check_threshold
         check_started=$(_fallback_now_ms)
@@ -13546,6 +13604,7 @@ EOF
                log_info "Fallback trigger: $fallback_trigger" ;;
             0) fallback_trigger="manual: no throttled release run detected"
                log_warn "No throttled run of $repo's release workflow detected; continuing as requested" ;;
+            5) fallback_trigger="throttle check interrupted" ;;
             *) fallback_trigger="manual: throttle check unavailable"
                log_warn "Could not check $repo for throttling (exit $check_rc); continuing as requested" ;;
         esac
@@ -13554,6 +13613,11 @@ EOF
             {command: "check", status: (if $rc <= 1 then "success" else "error" end), exit_code: $rc,
              throttled: ($rc == 1), duration_ms: ([($ended - $started), 0] | max)}
             + (if $rc > 1 then {error: ($result.error // "throttle check failed")} else {} end)')
+        if [[ $check_rc -eq 5 ]]; then
+            checks_status="skipped"; build_status="blocked"; verification_status="skipped"; release_status="blocked"
+            _fallback_result 5 check "Throttle check interrupted"
+            return 5
+        fi
     fi
     fallback_build_started_ms=$(_fallback_now_ms)
 

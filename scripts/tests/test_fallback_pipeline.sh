@@ -55,8 +55,15 @@ act_platform_uses_act() { return 0; }
 # The throttle check finds one queued release run: the fallback's trigger.
 _check_repo() {
     printf 'THROTTLE %s\n' "$1" >> "$CALLS"
-    printf '{"repo":"%s","status":"throttled","queued_count":1,"stuck_in_progress_count":0}\n' "$1"
-    return 1
+    if [[ "$THROTTLE_RC" == 1 ]]; then
+        printf '{"repo":"%s","status":"throttled","queued_count":1,"stuck_in_progress_count":0}\n' "$1"
+    else
+        jq -nc --arg repo "$1" --argjson rc "$THROTTLE_RC" '
+            {repo:$repo,status:(if $rc == 0 then "ok" else "error" end),queued_count:0,stuck_in_progress_count:0} |
+            if $rc == 5 then . + {error:"workflow job inspection interrupted"}
+            elif $rc != 0 then . + {error:"failed to fetch runs"} else . end'
+    fi
+    return "$THROTTLE_RC"
 }
 config_get_tool_field() { printf '\n'; }
 config_get_release_contract_json() { printf '%s\n' "$CONTRACT"; }
@@ -306,7 +313,7 @@ setup() {
     CALLS="$CASE/calls"; : > "$CALLS"
     export DSR_STATE_DIR="$CASE/state"
     export JSON_MODE=true DRY_RUN=false
-    INIT_RC=0 LOCK_RC=0 UNLOCK_RC=0 QUALITY_RC=0 BUILD_RC=0 SIGN_RC=0 RELEASE_RC=0 CONFIG_RC=0
+    INIT_RC=0 LOCK_RC=0 UNLOCK_RC=0 QUALITY_RC=0 BUILD_RC=0 SIGN_RC=0 RELEASE_RC=0 CONFIG_RC=0 THROTTLE_RC=1
     CONTRACT=null SIGN_ENABLED=true SIGN_WANTED=true MANIFEST_MODE=valid SIGNAL_PHASE=""
     export SIGNING_PRIVATE_KEY="$CASE/keys/minisign.key" SIGNING_PUBLIC_KEY="$CASE/keys/minisign.pub"
     SIGN_MODE=valid SCAN_RC=0 RELEASE_EXISTS=false QUALITY_MUTATES_SOURCE=false BUILD_MUTATES_SOURCE=false
@@ -375,6 +382,31 @@ test_success() {
         grep -Fq "SIGN $OUT/daemon $OUT/worker" "$CALLS" &&
         jq -e '.details.artifacts_count==2 and .details.phases.release=="success"' "$CASE/stdout" >/dev/null &&
         [[ ! -e "$OUT/tool-1.2.3-SHA256SUMS.txt" ]]
+}
+test_throttle_check_interruption() {
+    setup interrupted-throttle
+    THROTTLE_RC=5 QUALITY_MUTATES_SOURCE=true
+    printf 'original source\n' > "$CASE/source/src.txt"
+    run_fallback
+    [[ "$RC" == 5 && ! -e "$OUT" && ! -e "$CASE/lock" &&
+       ! -e "$DSR_STATE_DIR/fallback-sources" && "$(cat "$CASE/source/src.txt")" == 'original source' ]] &&
+        one_result && ! grep -Eq '^(CHECK|BUILD|SIGN|RELEASE) ' "$CALLS" &&
+        grep -q '^UNLOCK ' "$CALLS" &&
+        jq -e '.status == "error" and .details.phase == "check" and
+            .details.phases.build == "blocked" and .details.phases.release == "blocked" and
+            [.details.steps[] | [.command,.status,.exit_code]] == [["check","error",5]]' \
+            "$CASE/stdout" >/dev/null
+}
+test_throttle_check_manual_request() {
+    setup "manual-throttle-$1"
+    THROTTLE_RC="$1"
+    run_fallback
+    [[ "$RC" == 0 && ! -e "$CASE/lock" ]] && one_result &&
+        grep -q '^CHECK ' "$CALLS" && grep -q '^BUILD ' "$CALLS" && grep -q '^RELEASE ' "$CALLS" &&
+        jq -e --argjson rc "$1" '.details.phases.release == "success" and
+            .details.steps[0].exit_code == $rc and
+            .details.steps[0].status == (if $rc == 0 then "success" else "error" end) and
+            (.details.trigger | startswith("manual:"))' "$CASE/stdout" >/dev/null
 }
 test_build_failure() {
     setup "build-$1"; BUILD_RC="$1"; run_fallback
@@ -1646,6 +1678,9 @@ test_isolated_source_plan_and_arguments() {
 }
 
 run_test test_success
+run_test test_throttle_check_interruption
+run_test test_throttle_check_manual_request 0
+run_test test_throttle_check_manual_request 8
 for rc in 1 2 3 4 5 6 8 130 143; do run_test test_build_failure "$rc"; done
 for mode in missing malformed multiple empty partial wrong-tool wrong-version duplicate unsafe diagnostic corrupt absent symlink manifest-link hash-failure extra-payload; do
     run_test test_manifest_failure "$mode"

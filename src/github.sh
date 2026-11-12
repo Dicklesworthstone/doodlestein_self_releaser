@@ -1218,13 +1218,20 @@ gh_workflow_active_runs() {
     local endpoint="repos/$repo/actions/runs"
     [[ -n "$workflow" ]] && endpoint="repos/$repo/actions/workflows/$workflow/runs"
     local runs='[]' status status_runs response page_runs page page_count
-    local total_count expected_count unique_count complete
+    local total_count expected_count unique_count complete request_status
     for status in queued in_progress; do
         status_runs='[]'
         expected_count=0
         complete=false
         for ((page = 1; page <= 10; page++)); do
-            if ! response=$(gh_api "$endpoint?per_page=100&status=$status&page=$page" --no-cache); then
+            request_status=0
+            response=$(gh_api "$endpoint?per_page=100&status=$status&page=$page" --no-cache) || request_status=$?
+            if ((request_status != 0)); then
+                case "$request_status" in
+                    2|5|129|130|131|143)
+                        _gh_log_error "Workflow-run inspection interrupted for $repo"
+                        return 5 ;;
+                esac
                 _gh_log_error "Cannot read $status workflow runs for $repo (page $page)"
                 return 8
             fi
@@ -1301,12 +1308,19 @@ gh_workflow_jobs() {
         query=''
     fi
     endpoint+='/jobs'
-    local jobs='[]' response page page_jobs count expected=0 total unique inferred_attempt
+    local jobs='[]' response page page_jobs count expected=0 total unique inferred_attempt request_status
     for ((page = 1; page <= 10; page++)); do
-        response=$(gh_api "$endpoint?${query}per_page=100&page=$page" --no-cache) || {
+        request_status=0
+        response=$(gh_api "$endpoint?${query}per_page=100&page=$page" --no-cache) || request_status=$?
+        if ((request_status != 0)); then
+            case "$request_status" in
+                2|5|129|130|131|143)
+                    _gh_log_error "Workflow-job inspection interrupted for $repo run $run_id"
+                    return 5 ;;
+            esac
             _gh_log_error "Cannot read workflow jobs for $repo run $run_id (page $page)"
             return 8
-        }
+        fi
         if ! jq -es --arg run "$run_id" --arg attempt "$attempt" '
             def identifier: type == "number" and . > 0 and floor == . and . <= 9007199254740991;
             length == 1 and (.[0] | type == "object" and

@@ -458,6 +458,212 @@ SCRIPT
 )"
 }
 
+# Distinct releases can share a repository without sharing job-inspection
+# authority. The real API wrapper and CLI read these transport-only fixtures;
+# one unreadable run must never hide another run's conclusive queue evidence.
+_mock_independent_job_inventory() {
+    export INDEPENDENT_JOB_CASE="$1" GH_MAX_RETRIES=1 GH_RETRY_DELAY=0
+    jq -n --arg mode "$1" --arg old "$(_minutes_ago 60)" '
+        def workflow($id;$status):
+            {id:$id,status:$status,created_at:$old,run_started_at:$old,run_attempt:2,
+             name:"Release",workflow_id:17,path:".github/workflows/release.yml",
+             head_branch:("v1.2."+($id|tostring)),head_sha:("1"*40),event:"push"};
+        {ntm:([workflow(201;"in_progress"),workflow(203;"in_progress"),workflow(204;"in_progress")] +
+              (if $mode == "unreadable" or $mode == "cross-repo" or $mode == "cross-repo-cancel" then []
+               elif $mode == "job-only" then [workflow(202;"in_progress")]
+               else [workflow(101;"queued"),workflow(202;"in_progress")] end)),
+         bv:(if $mode == "cross-repo" or $mode == "cross-repo-cancel" then [workflow(301;"queued")] else [] end)}
+    ' > "$TEST_TMPDIR/independent-runs.json"
+    mock_command_script "gh" "$(cat <<'SCRIPT'
+printf '%s\n' "$*" >> "$TEST_TMPDIR/gh.calls"
+if [[ "$1" == auth ]]; then
+    [[ "${2:-}" != token ]] || printf '%s\n' 'dsr-offline-integration-fixture'
+    exit 0
+fi
+[[ "$1" == api ]] || exit 99
+endpoint=""
+for arg in "$@"; do [[ "$arg" == repos/*/actions/* ]] && endpoint="$arg"; done
+if [[ "$endpoint" =~ /runs/([0-9]+)/attempts/2/jobs\? ]]; then
+    run_id="${BASH_REMATCH[1]}"
+    if [[ "$run_id" == 201 ]]; then
+        case "$INDEPENDENT_JOB_CASE" in
+            cancel-jobs|cross-repo-cancel) exit "${INDEPENDENT_CANCEL_CODE:-2}" ;;
+            wrong-source|wrong-attempt|invalid-time|malformed|short-page|recovered) ;;
+            *) printf 'gh: Bad gateway (HTTP 502)\n' >&2; exit 1 ;;
+        esac
+    fi
+    jq -n --argjson run "$run_id" --arg mode "$INDEPENDENT_JOB_CASE" '
+        def job($id;$status):
+            {id:$id,run_id:$run,run_attempt:2,status:$status,head_sha:("1"*40),
+             started_at:null,completed_at:null};
+        (if $run == 203 then [job(2030;"in_progress"),job(2031;"queued")]
+         elif $run == 204 then [job(2040;"waiting"),job(2041;"queued")]
+         else [job($run*10;"queued")] end) as $jobs |
+        {total_count:($jobs|length),jobs:$jobs} |
+        if $run != 201 then .
+        elif $mode == "wrong-source" then .jobs[0].head_sha=("2"*40)
+        elif $mode == "wrong-attempt" then .jobs[0].run_attempt=1
+        elif $mode == "invalid-time" then .jobs[0].created_at="not-a-timestamp"
+        elif $mode == "malformed" then .jobs={}
+        elif $mode == "short-page" then .total_count=2
+        else . end'
+elif [[ "$endpoint" == *status=queued* || "$endpoint" == *status=in_progress* ]]; then
+    if [[ "$INDEPENDENT_JOB_CASE" == cancel-active && "$endpoint" == *status=in_progress* ]]; then
+        exit "${INDEPENDENT_CANCEL_CODE:-2}"
+    fi
+    tool=ntm
+    [[ "$endpoint" != repos/Dicklesworthstone/beads_viewer/* ]] || tool=bv
+    desired=queued
+    [[ "$endpoint" != *status=in_progress* ]] || desired=in_progress
+    jq --arg tool "$tool" --arg desired "$desired" '
+        .[$tool] | map(select(.status==$desired)) | {total_count:length,workflow_runs:.}
+    ' "$TEST_TMPDIR/independent-runs.json"
+else exit 99; fi
+SCRIPT
+)"
+}
+
+@test "independent job scan: a failed run cannot hide verified queues in its repository" {
+    harness_create_config
+    _setup_repos_d
+    local mode
+    for mode in transport wrong-source wrong-attempt invalid-time malformed short-page; do
+        _mock_independent_job_inventory "$mode"
+        run _routing_dsr --json check ntm
+        assert_equal 1 "$status"
+        jq -e '.status == "partial" and .exit_code == 1 and .details.healthy == [] and
+            (.details.throttled | map(.run_id)) == [101,202] and
+            (.details.throttled | map(.queue_reason)) == ["workflow_queue","job_queue"] and
+            .details.skipped == [{repo:"Dicklesworthstone/ntm",run_id:201,reason:"failed to inspect workflow jobs"}] and
+            .details.repos[0].job_errors == [{run_id:201,reason:"failed to inspect workflow jobs"}]' <<< "$output"
+        jq -e '.throttled == ["Dicklesworthstone/ntm"] and .skipped == ["Dicklesworthstone/ntm"]' \
+            "$DSR_STATE_DIR/check/last.json"
+    done
+    grep -q 'runs/202/attempts/2/jobs?per_page=100&page=1' "$TEST_TMPDIR/gh.calls"
+}
+
+@test "independent job scan: later verified job queues remain actionable without a queued workflow" {
+    harness_create_config
+    _setup_repos_d
+    _mock_independent_job_inventory job-only
+    run _routing_dsr --json check ntm
+    assert_equal 1 "$status"
+    jq -e '(.details.throttled | map(.run_id)) == [202] and
+        .details.throttled[0].queued_job_ids == [2020] and .details.healthy == [] and
+        .details.skipped[0].run_id == 201' <<< "$output"
+}
+
+@test "independent job scan: unreadable jobs cannot become a healthy repository or fallback authority" {
+    harness_create_config
+    _setup_repos_d
+    _mock_independent_job_inventory unreadable
+    run _routing_dsr --json check ntm
+    assert_equal 8 "$status"
+    jq -e '.status == "error" and .details.throttled == [] and .details.healthy == [] and
+        .details.skipped == [{repo:"Dicklesworthstone/ntm",run_id:201,reason:"failed to inspect workflow jobs"}]' <<< "$output"
+    DSR_WATCH_FIXTURE_REAL_CHECK=1 run --separate-stderr _routing_watch '{}' --auto-fallback
+    assert_equal 1 "$status"
+    jq -e '.status == "error" and .details.triggered_state.attempts == {}' <<< "$output"
+    [[ ! -e "$TEST_TMPDIR/fallback.args" ]]
+}
+
+@test "independent job scan: actual watch admits only proven runs and recovers a later readable run" {
+    harness_create_config
+    _setup_repos_d
+    _mock_independent_job_inventory transport
+    DSR_WATCH_FIXTURE_REAL_CHECK=1 run --separate-stderr _routing_watch '{}' --auto-fallback
+    assert_equal 0 "$status"
+    _watch_completed 101
+    _watch_completed 202
+    jq -e '(.attempts | keys) == ["101","202"] and .pending == {} and
+        .attempts["101"].head_sha == ("1"*40) and .attempts["202"].head_sha == ("1"*40)' \
+        "$DSR_STATE_DIR/triggered.json"
+    assert_equal 2 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+
+    _mock_independent_job_inventory recovered
+    DSR_WATCH_FIXTURE_REAL_CHECK=1 run --separate-stderr _routing_watch '{}' --auto-fallback
+    assert_equal 0 "$status"
+    _watch_completed 201
+    jq -e '(.attempts | keys) == ["101","201","202"] and
+        .attempts["101"].status == "succeeded" and .attempts["202"].status == "succeeded" and
+        .attempts["201"].attempt == 1 and .attempts["201"].version == "v1.2.201"' \
+        "$DSR_STATE_DIR/triggered.json"
+    assert_equal 3 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+}
+
+@test "independent job scan: another repository remains actionable through actual watch admission" {
+    harness_create_config
+    _setup_repos_d
+    _mock_independent_job_inventory cross-repo
+    run _routing_dsr --json check ntm bv
+    assert_equal 1 "$status"
+    jq -e '(.details.throttled | map(.run_id)) == [301] and .details.healthy == [] and
+        .details.skipped[0].repo == "Dicklesworthstone/ntm"' <<< "$output"
+    DSR_WATCH_FIXTURE_REAL_CHECK=1 run --separate-stderr _routing_watch '{}' --auto-fallback
+    assert_equal 0 "$status"
+    _watch_completed 301
+    jq -e '(.attempts | keys) == ["301"] and .attempts["301"].tool == "bv" and
+        .attempts["301"].repo == "Dicklesworthstone/beads_viewer"' "$DSR_STATE_DIR/triggered.json"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+}
+
+@test "independent job scan: explicit job cancellation withdraws every candidate and stops inspection" {
+    harness_create_config
+    _setup_repos_d
+    local code
+    for code in 2 130; do
+        export INDEPENDENT_CANCEL_CODE="$code"
+        _mock_independent_job_inventory cancel-jobs
+        run _routing_dsr --json check ntm
+        assert_equal 5 "$status"
+        jq -e '.status == "error" and .exit_code == 5 and .details.throttled == [] and
+            .details.healthy == [] and .details.skipped ==
+            [{repo:"Dicklesworthstone/ntm",run_id:201,reason:"workflow job inspection interrupted"}]' <<< "$output"
+        [[ ! -e "$DSR_STATE_DIR/check/last.json" ]]
+    done
+    ! grep -q 'runs/202/attempts/2/jobs' "$TEST_TMPDIR/gh.calls"
+}
+
+@test "independent job scan: active-list cancellation stops before jobs and later repositories" {
+    harness_create_config
+    _setup_repos_d
+    _mock_independent_job_inventory cancel-active
+    run _routing_dsr --json check ntm bv
+    assert_equal 5 "$status"
+    jq -e '.status == "error" and .exit_code == 5 and .details.throttled == [] and
+        .details.healthy == [] and .details.skipped[0].reason == "workflow inspection interrupted"' <<< "$output"
+    [[ ! -e "$DSR_STATE_DIR/check/last.json" ]]
+    ! grep -Eq '/jobs\?|repos/Dicklesworthstone/beads_viewer/' "$TEST_TMPDIR/gh.calls"
+}
+
+@test "independent job scan: cancellation supersedes queues already proven in another repository" {
+    harness_create_config
+    _setup_repos_d
+    _mock_independent_job_inventory cross-repo-cancel
+    run _routing_dsr --json check bv ntm
+    assert_equal 5 "$status"
+    jq -e '.status == "error" and .exit_code == 5 and .details.throttled == [] and
+        .details.healthy == [] and .details.repos[0].status == "throttled" and
+        .details.skipped[0].run_id == 201' <<< "$output"
+    [[ ! -e "$DSR_STATE_DIR/check/last.json" ]]
+}
+
+@test "independent job scan: watch stops on cancellation without a launch or another poll" {
+    harness_create_config
+    _setup_repos_d
+    _mock_independent_job_inventory cancel-jobs
+    local continuous
+    for continuous in 0 1; do
+        DSR_WATCH_FIXTURE_REAL_CHECK=1 DSR_WATCH_FIXTURE_CONTINUOUS="$continuous" \
+            run --separate-stderr _routing_watch '{}' --auto-fallback
+        assert_equal 5 "$status"
+        jq -e '.status == "error" and .exit_code == 5 and
+            .details.triggered_state.attempts == {}' <<< "$output"
+        [[ ! -e "$TEST_TMPDIR/fallback.args" ]]
+    done
+    assert_equal 2 "$(wc -l < "$TEST_TMPDIR/watch-check.polls" | tr -d ' ')"
+}
+
 @test "job scan: long executing or approval-pending workflows do not trigger fallback" {
     harness_create_config
     _setup_repos_d
@@ -600,6 +806,7 @@ case "$1" in
     --json)
         [[ "$2" == check ]] || exit 99
         : > "$TEST_TMPDIR/watch-check.started"
+        printf 'checked\n' >> "$TEST_TMPDIR/watch-check.polls"
         deadline=$((SECONDS + 60))
         while [[ -n "${DSR_WATCH_FIXTURE_CHECK_WAIT:-}" && ! -e "$DSR_WATCH_FIXTURE_CHECK_WAIT" ]]; do
             ((SECONDS < deadline)) || exit 98
@@ -610,6 +817,11 @@ case "$1" in
         fi
         if [[ -n "${DSR_WATCH_FIXTURE_CONFIG_AFTER_CHECK:-}" ]]; then
             cat "$DSR_WATCH_FIXTURE_CONFIG_AFTER_CHECK" > "$DSR_CONFIG_DIR/repos.d/ntm.yaml" || exit 98
+        fi
+        if [[ "${DSR_WATCH_FIXTURE_REAL_CHECK:-0}" == 1 ]]; then
+            # Keep the watch-to-check handoff genuine; only the external gh
+            # transport, doctor preflight and fallback worker are fixtures.
+            exec "${DSR_ROUTING_TEST_ROOT:-$DSR_PROJECT_ROOT}/dsr" --json check
         fi
         cat "$TEST_TMPDIR/watch-check.json"
         exit "${DSR_WATCH_FIXTURE_CHECK_STATUS:-1}"
