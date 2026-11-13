@@ -119,6 +119,9 @@ and validation do not change the active checkout. Handled activation failures an
 signals restore prior entries; abrupt power loss or SIGKILL can require manual
 recovery from the retained directories.
 
+Explicit versions select release tags (with or without a leading v), even when
+a branch has the same name. Use --version main to select the main branch.
+
 Environment:
   DSR_DEST           Override install directory (default: ~/.local/bin)
   DSR_DATA_DIR       Override data directory (default: ~/.local/share/dsr)
@@ -696,8 +699,24 @@ clone_repo_ref() {
   local error_file="$2"
   local destination="$3"
 
-  git clone --quiet --depth 1 --branch "$clone_ref" \
-    "https://github.com/${OWNER}/${REPO}.git" "$destination" 2>"$error_file"
+  if [ "$VERSION_EXPLICIT" -eq 1 ] && [[ "$VERSION" != main ]]; then
+    # A branch and a tag may have the same short name. Fetch only the exact
+    # tag namespace so --version cannot install a same-labelled branch.
+    # Each attempt has its own private destination and retained diagnostics.
+    (
+      local tag_ref="refs/tags/$clone_ref" commit
+      git check-ref-format "$tag_ref" || exit 1
+      git init --quiet "$destination" || exit $?
+      git -C "$destination" remote add origin "https://github.com/${OWNER}/${REPO}.git" || exit $?
+      git -C "$destination" fetch --quiet --depth 1 --no-tags origin "$tag_ref:$tag_ref" || exit $?
+      commit=$(git -C "$destination" rev-parse --verify "$tag_ref^{commit}") || exit $?
+      git -C "$destination" checkout --quiet --detach "$commit" || exit $?
+      [[ "$(git -C "$destination" rev-parse --verify HEAD)" == "$commit" ]]
+    ) 2>"$error_file"
+  else
+    git clone --quiet --depth 1 --branch "$clone_ref" \
+      "https://github.com/${OWNER}/${REPO}.git" "$destination" 2>"$error_file"
+  fi
 }
 
 print_clone_error() {

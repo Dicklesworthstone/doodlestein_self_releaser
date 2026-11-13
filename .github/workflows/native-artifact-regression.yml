@@ -21,6 +21,7 @@ on:
       - scripts/tests/test_host_config_admission.sh
       - scripts/tests/test_artifact_formats.sh
       - scripts/tests/test_ordinary_collection_inventory.sh
+      - scripts/tests/test_installer_signatures.sh
       - scripts/tests/test_generated_installer_transactions.sh
       - scripts/tests/test_generated_installer_integrity.sh
       - scripts/tests/test_generated_installer_private.sh
@@ -33,6 +34,7 @@ on:
       - scripts/tests/test_generated_installer_source.sh
       - scripts/tests/test_generated_installer_workspace_bootstrap.sh
       - dsr
+      - install.sh
       - src/act_runner.sh
       - src/artifact_naming.sh
       - src/artifact_formats.sh
@@ -89,9 +91,9 @@ jobs:
           set -euo pipefail
           if [[ "$RUNNER_OS" == Linux ]]; then
             sudo apt-get update
-            sudo apt-get install -y --no-install-recommends jq xz-utils golang-go minisign zip unzip msitools wixl rsync python3 gcc openssl
+            sudo apt-get install -y --no-install-recommends jq xz-utils golang-go minisign zip unzip msitools wixl rsync python3 gcc openssl shellcheck
           else
-            for tool in jq xz go minisign rsync; do
+            for tool in jq xz go minisign rsync shellcheck; do
               command -v "$tool" >/dev/null || brew install "$tool"
             done
             if ! command -v timeout >/dev/null && ! command -v gtimeout >/dev/null; then brew install coreutils; fi
@@ -101,6 +103,16 @@ jobs:
           mkdir -p "$RUNNER_TEMP/dsr-test-bin"
           GOBIN="$RUNNER_TEMP/dsr-test-bin" go install github.com/mikefarah/yq/v4@v4.47.1
           echo "$RUNNER_TEMP/dsr-test-bin" >> "$GITHUB_PATH"
+      - name: Validate transactional self-installation and exact release tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n install.sh
+          bash -n scripts/tests/test_installer_signatures.sh
+          shellcheck -S warning install.sh scripts/tests/test_installer_signatures.sh
+          deadline=$(command -v timeout || command -v gtimeout)
+          "$deadline" 120 bash scripts/tests/test_installer_signatures.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/self-installer.log"
+          test -z "$(git status --porcelain)"
       - name: Validate installed-Go recovery and private source toolchains
         if: runner.os == 'Linux'
         shell: bash

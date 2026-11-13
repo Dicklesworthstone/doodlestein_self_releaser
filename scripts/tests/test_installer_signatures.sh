@@ -813,6 +813,10 @@ if [[ "$1" == clone && "${DSR_FIXTURE_FAULT:-}" == partial-clone ]]; then
   printf 'partial clone fixture\\n' > "${@: -1}/partial"
   exit 42
 fi
+if [[ "${DSR_FIXTURE_FAULT:-}" == partial-tag-fetch && "${3:-}" == fetch ]]; then
+  printf 'partial tag fetch fixture\\n' > "$2/partial"
+  exit 42
+fi
 exec "$DSR_FIXTURE_REAL_GIT" "$@"
 ''')
     for path in wrappers.iterdir():
@@ -912,14 +916,98 @@ preserved('version mismatch', context, before, old_id,
 
 context = setup('partial-clone')
 before, old_id = tree_snapshot(context[1]), identity(context[1])
-preserved('injected incomplete clone', context, before, old_id,
-          invoke(context, ['--version', '1.2.3'], 'partial-clone'))
-check('failed clone attempts retain acquisition diagnostics', len(list(context[0].glob('.repo.install.*/candidate-*/partial'))) == 2)
+preserved('injected incomplete main clone', context, before, old_id,
+          invoke(context, ['--version', 'main'], 'partial-clone'))
+check('failed main clone retains acquisition diagnostics', len(list(context[0].glob('.repo.install.*/candidate-*/partial'))) == 1)
+
+context = setup('partial-tag-fetch')
+before, old_id = tree_snapshot(context[1]), identity(context[1])
+preserved('injected incomplete tag fetch', context, before, old_id,
+          invoke(context, ['--version', '1.2.3'], 'partial-tag-fetch'))
+check('both failed tag spellings retain acquisition diagnostics', len(list(context[0].glob('.repo.install.*/candidate-*/partial'))) == 2)
 
 context = setup('version-prefix')
 result = invoke(context, ['--version', '1.2.3'])
 check('1.2.30 does not satisfy requested 1.2.3', result.returncode == 0 and run([str(context[2] / 'dsr'), '--version']).stdout.strip() == 'dsr version 1.2.3')
 check('numeric request uses a genuine local Git tag clone', (context[1] / '.git').is_dir() and run([real_git, '-C', str(context[1]), 'describe', '--tags', '--exact-match']).stdout.strip() == 'v1.2.3')
+
+
+# Git permits a branch and tag with the same name. A source version marker
+# cannot distinguish their different commits, so exercise the actual public
+# installer against real local remotes with those namespace collisions.
+def git_checked(*arguments, input=None):
+    result = run([real_git, *arguments], env=git_environment, input=input)
+    if result.returncode:
+        raise RuntimeError(result.stderr)
+    return result.stdout.strip()
+
+def release_repository(name, branch='main', tag='', annotated=False):
+    remote = root / name
+    source_tree(remote, label='release-tag')
+    git_checked('-c', 'init.defaultBranch=' + branch, 'init', str(remote))
+    git_checked('-C', str(remote), 'add', '.')
+    git_checked('-C', str(remote), 'commit', '-m', 'Exact release source')
+    if tag:
+        tag_args = ['-a', tag, '-m', 'Annotated release'] if annotated else [tag]
+        git_checked('-C', str(remote), 'tag', *tag_args)
+    return remote, git_checked('-C', str(remote), 'rev-parse', '--verify', 'HEAD')
+
+def point_to_remote(context, remote):
+    Path(context[3]['GIT_CONFIG_GLOBAL']).write_text(
+        '[url "' + remote.as_uri() + '"]\n'
+        '\tinsteadOf = https://github.com/Dicklesworthstone/doodlestein_self_releaser.git\n')
+
+branch_only, _ = release_repository('branch-only-remote', branch='v1.2.3')
+context = setup('branch-only-version')
+point_to_remote(context, branch_only)
+before, old_id = tree_snapshot(context[1]), identity(context[1])
+preserved('a same-version branch without a release tag', context, before, old_id,
+          invoke(context, ['--version', 'v1.2.3']))
+
+collision, release_commit = release_repository('colliding-remote', tag='v1.2.3', annotated=True)
+git_checked('-C', str(collision), 'checkout', '-b', 'v1.2.3')
+(collision / 'src' / 'current.sh').write_text("fixture_current() { printf '%s\\n' 'branch-shadow'; }\n")
+git_checked('-C', str(collision), 'add', '.')
+git_checked('-C', str(collision), 'commit', '-m', 'Different same-version branch')
+branch_commit = git_checked('-C', str(collision), 'rev-parse', '--verify', 'refs/heads/v1.2.3')
+check('collision fixture has distinct branch and annotated tag commits', branch_commit != release_commit)
+for requested in ('v1.2.3', '1.2.3'):
+    context = setup('colliding-tag-' + requested)
+    point_to_remote(context, collision)
+    before, old_id = tree_snapshot(context[1]), identity(context[1])
+    result = invoke(context, ['--version', requested])
+    check(requested + ' selects the exact annotated tag despite a same-named branch', result.returncode == 0 and
+          run([real_git, '-C', str(context[1]), 'rev-parse', '--verify', 'HEAD']).stdout.strip() == release_commit)
+    check(requested + ' activates the tagged module bytes', run([str(context[2] / 'dsr')]).stdout.strip() == 'release-tag')
+    check(requested + ' retains a detached tag checkout', run([real_git, '-C', str(context[1]), 'symbolic-ref', '-q', 'HEAD']).returncode == 1 and
+          run([real_git, '-C', str(context[1]), 'rev-parse', '--verify', 'refs/tags/v1.2.3^{commit}']).stdout.strip() == release_commit)
+    backups = list(context[0].glob('.repo.install.*/previous-repo'))
+    check(requested + ' preserves the previous source generation', len(backups) == 1 and
+          tree_snapshot(backups[0]) == before and identity(backups[0]) == old_id)
+
+bare_tag, bare_commit = release_repository('unprefixed-tag-remote', tag='1.2.3')
+context = setup('unprefixed-tag-version')
+point_to_remote(context, bare_tag)
+result = invoke(context, ['--version', 'v1.2.3'])
+check('the unprefixed release-tag spelling remains supported', result.returncode == 0 and
+      run([real_git, '-C', str(context[1]), 'rev-parse', '--verify', 'HEAD']).stdout.strip() == bare_commit and
+      run([real_git, '-C', str(context[1]), 'rev-parse', '--verify', 'refs/tags/1.2.3^{commit}']).stdout.strip() == bare_commit)
+
+noncommit, _ = release_repository('noncommit-tag-remote')
+blob = git_checked('-C', str(noncommit), 'hash-object', '-w', '--stdin', input='not a release commit\n')
+git_checked('-C', str(noncommit), 'update-ref', 'refs/tags/v1.2.3', blob)
+context = setup('noncommit-tag-version')
+point_to_remote(context, noncommit)
+before, old_id = tree_snapshot(context[1]), identity(context[1])
+preserved('a release tag that does not peel to a commit', context, before, old_id,
+          invoke(context, ['--version', 'v1.2.3']))
+
+context = setup('explicit-main-version')
+point_to_remote(context, collision)
+result = invoke(context, ['--version', 'main'])
+check('explicit main continues to select the main branch', result.returncode == 0 and
+      run([real_git, '-C', str(context[1]), 'symbolic-ref', '--short', 'HEAD']).stdout.strip() == 'main' and
+      run([str(context[2] / 'dsr')]).stdout.strip() == 'release-tag')
 
 context = setup('exact-noop', old_version='1.2.3')
 for args in (['-c', 'init.defaultBranch=main', 'init', str(context[1])],
