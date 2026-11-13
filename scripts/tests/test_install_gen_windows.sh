@@ -227,8 +227,9 @@ public sealed class DsrInstallerFixtureHandler : HttpMessageHandler {
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotAcceptable));
         }
         if (fixture.TryGetProperty("transport_failures", out JsonElement failures) && failures.TryGetProperty(url, out JsonElement failure)) {
-            if (failure.GetString() == "timeout") { throw new OperationCanceledException("Injected response deadline"); }
-            throw new HttpRequestException("Injected HTTPS transport failure");
+            if (failure.GetString() == "cancel") { throw new OperationCanceledException("Injected explicit cancellation"); }
+            if (failure.GetString() == "request") { throw new HttpRequestException(HttpRequestError.ConnectionError, "Injected connection failure"); }
+            throw new HttpRequestException("Injected unclassified HTTPS failure");
         }
         if (fixture.TryGetProperty("statuses", out JsonElement statuses) && statuses.TryGetProperty(url, out JsonElement status)) {
             return Task.FromResult(new HttpResponseMessage((HttpStatusCode)status.GetInt32()));
@@ -807,14 +808,20 @@ for status in (403, 408, 429, 503):
               all(not row["authorization_sha256"] for row in rows) and
               all(row["url"].startswith(base_url) and row["method"] == "GET" for row in rows[3:]))
 
-for fault in ("request", "timeout"):
-    outcome, parsed, _, _, observed = run_case("public-latest-transport-" + fault, latest_downloads,
+for fault in ("request", "cancel"):
+    outcome, parsed, _, prefix, observed = run_case("public-latest-transport-" + fault, latest_downloads,
         version=None, options={"http_client_fixture": True, "transport_failures": {latest_api: fault},
                                "redirects": {latest_browser: latest_tag_url}})
-    check("injected API " + fault + " failure still admits an independently verified public release",
-          outcome.returncode == 0 and parsed.get("signature_verified") is True and
-          any(row["url"] == latest_browser for row in request_rows(observed)),
-          outcome.stderr.decode(errors="replace"))
+    if fault == "request":
+        check("typed API connection failure still admits an independently verified public release",
+              outcome.returncode == 0 and parsed.get("signature_verified") is True and
+              any(row["url"] == latest_browser for row in request_rows(observed)),
+              outcome.stderr.decode(errors="replace"))
+    else:
+        check("explicit API cancellation stops before public discovery or installation",
+              outcome.returncode == 5 and parsed.get("exit_code") == 5 and not prefix.exists() and
+              [row["url"] for row in request_rows(observed)] == [latest_api],
+              outcome.stderr.decode(errors="replace"))
 
 latest_metadata = root / "valid-latest.json"
 latest_metadata.write_text(json.dumps({"id": release_id, "tag_name": "v1.2.3", "draft": False, "prerelease": False}))

@@ -10,7 +10,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 dependencies=(pwsh git go cargo rustc minisign python3 jq yq)
 if [[ " $* " == *' --bun-only '* || " $* " == *' --bun-workspaces-only '* ]]; then
     dependencies=(pwsh git bun minisign python3 jq yq)
-elif [[ " $* " == *' --freshness-only '* || " $* " == *' --fallback-only '* || " $* " == *' --freshness-deadline-only '* || " $* " == *' --go-only '* || " $* " == *' --go-workspace-only '* ]]; then
+elif [[ " $* " == *' --freshness-only '* || " $* " == *' --fallback-only '* || " $* " == *' --acquisition-errors-only '* || " $* " == *' --freshness-deadline-only '* || " $* " == *' --go-only '* || " $* " == *' --go-workspace-only '* ]]; then
     dependencies=(pwsh git go minisign python3 jq yq)
 fi
 for dependency in "${dependencies[@]}"; do
@@ -48,6 +48,7 @@ arguments.add_argument("--bun-workspaces-only", action="store_true", help="Run g
 arguments.add_argument("--bun-baseline-project", type=Path, help="Frozen checkout before Windows Bun source installation")
 arguments.add_argument("--freshness-only", action="store_true", help="Run signed release-first freshness and pinned source-upgrade controls")
 arguments.add_argument("--fallback-only", action="store_true", help="Run classified unavailable-release source fallback controls")
+arguments.add_argument("--acquisition-errors-only", action="store_true", help="Keep HTTPS trust/protocol failures terminal while admitting real availability fallback")
 arguments.add_argument("--fallback-baseline-project", type=Path, help="Frozen checkout before unavailable-release source fallback")
 arguments.add_argument("--freshness-deadline-only", action="store_true", help="Exercise the actual owned freshness HTTP deadline")
 arguments.add_argument("--freshness-baseline-project", type=Path, help="Frozen checkout before Windows freshness source upgrades")
@@ -259,6 +260,30 @@ using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+public sealed class DsrSourceFailureStream : Stream {
+    private readonly Exception failure;
+    private bool started;
+    public DsrSourceFailureStream(HttpRequestError error) {
+        failure = new HttpIOException(error, "Injected body failure https://example.invalid/?token=transport-secret");
+    }
+    public override bool CanRead => true;
+    public override bool CanSeek => false;
+    public override bool CanWrite => false;
+    public override long Length => throw new NotSupportedException();
+    public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+    public override void Flush() { }
+    public override int Read(byte[] buffer, int offset, int count) {
+        if (!started && count > 0) { started = true; buffer[offset] = 0x50; return 1; }
+        throw failure;
+    }
+    public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken token) {
+        try { return Task.FromResult(Read(buffer, offset, count)); }
+        catch (Exception error) { return Task.FromException<int>(error); }
+    }
+    public override long Seek(long offset, SeekOrigin origin) { throw new NotSupportedException(); }
+    public override void SetLength(long value) { throw new NotSupportedException(); }
+    public override void Write(byte[] buffer, int offset, int count) { throw new NotSupportedException(); }
+}
 public sealed class DsrSourceFixtureHandler : HttpMessageHandler {
     private readonly JsonElement fixture;
     public DsrSourceFixtureHandler(string path) {
@@ -289,9 +314,35 @@ public sealed class DsrSourceFixtureHandler : HttpMessageHandler {
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.BadRequest));
         }
         if (fixture.TryGetProperty("transport_failures", out JsonElement failures) && failures.TryGetProperty(url, out JsonElement failure)) {
-            if (failure.GetString() == "cancel") { throw new OperationCanceledException("Injected explicit cancellation"); }
-            if (failure.GetString() == "deadline") { return WaitForDeadline(token); }
-            throw new HttpRequestException("Injected HTTPS transport failure");
+            string kind = failure.GetString();
+            string message = "Injected HTTPS failure https://example.invalid/?token=transport-secret";
+            if (kind == "cancel") { throw new OperationCanceledException(message); }
+            if (kind == "deadline") { return WaitForDeadline(token); }
+            if (kind.StartsWith("body-", StringComparison.Ordinal)) {
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) {
+                    Content = new StreamContent(new DsrSourceFailureStream(Enum.Parse<HttpRequestError>(kind.Substring(5))))
+                });
+            }
+            if (kind == "network") { throw new HttpRequestException(HttpRequestError.ConnectionError, message); }
+            if (kind == "legacy") { throw new HttpRequestException(message); }
+            if (kind == "nested-auth") {
+                throw new HttpRequestException(HttpRequestError.ConnectionError, message,
+                    new System.Security.Authentication.AuthenticationException(message));
+            }
+            if (kind == "nested-cancel") {
+                throw new HttpRequestException(HttpRequestError.ConnectionError, message, new OperationCanceledException(message));
+            }
+            if (kind == "nested-unknown") {
+                throw new HttpRequestException(HttpRequestError.ConnectionError, message, new HttpRequestException(message));
+            }
+            if (kind == "aggregate-auth") {
+                throw new HttpRequestException(HttpRequestError.ConnectionError, message,
+                    new AggregateException(new IOException(message), new System.Security.Authentication.AuthenticationException(message)));
+            }
+            if (kind == "status-denied") {
+                throw new HttpRequestException(HttpRequestError.ConnectionError, message, null, HttpStatusCode.Unauthorized);
+            }
+            throw new HttpRequestException(Enum.Parse<HttpRequestError>(kind), message);
         }
         if (fixture.TryGetProperty("statuses", out JsonElement statuses) && statuses.TryGetProperty(url, out JsonElement status)) {
             return Task.FromResult(new HttpResponseMessage((HttpStatusCode)status.GetInt32()));
@@ -351,6 +402,57 @@ if ($fixture.Contains('pipe_probe')) {
     }
     [Console]::Out.WriteLine((@{ exit_code = $code; elapsed_ms = $clock.ElapsedMilliseconds } | ConvertTo-Json -Compress))
     exit $code
+}
+if ($fixture.Contains('exception_graph_probe')) {
+    $message = 'Untrusted diagnostic https://example.invalid/?token=transport-secret'
+    $connection = [Net.Http.HttpRequestException]::new([Net.Http.HttpRequestError]::ConnectionError, $message, $null, $null)
+    $tls = [Net.Http.HttpRequestException]::new([Net.Http.HttpRequestError]::SecureConnectionError, $message, $null, $null)
+    $auth = [Security.Authentication.AuthenticationException]::new($message)
+    $unknown = [Net.Http.HttpRequestException]::new($message)
+    $aggregate = [AggregateException]::new($message, [Exception[]]@($connection, $auth))
+    $cases = @(
+        @{ name = 'owned-plain'; failure = [OperationCanceledException]::new($message); expired = $true },
+        @{ name = 'owned-connection'; failure = [OperationCanceledException]::new($message, $connection); expired = $true },
+        @{ name = 'owned-tls'; failure = [OperationCanceledException]::new($message, $tls); expired = $true },
+        @{ name = 'owned-auth'; failure = [OperationCanceledException]::new($message, $auth); expired = $true },
+        @{ name = 'owned-unknown'; failure = [OperationCanceledException]::new($message, $unknown); expired = $true },
+        @{ name = 'owned-aggregate'; failure = [OperationCanceledException]::new($message, $aggregate); expired = $true },
+        @{ name = 'explicit-plain'; failure = [OperationCanceledException]::new($message); expired = $false },
+        @{ name = 'explicit-tls'; failure = [OperationCanceledException]::new($message, $tls); expired = $false }
+    )
+    $results = [Collections.Generic.List[object]]::new()
+    foreach ($probe in $cases) {
+        try { Stop-DsrHttpTransportFailure $probe.failure 'Bounded transport refusal' $probe.expired }
+        catch {
+            $failure = $_.Exception
+            $code = if ($failure.Data.Contains('DsrExitCode')) { [int]$failure.Data['DsrExitCode'] } else { 7 }
+            $results.Add(@{ name = $probe.name; exit_code = $code;
+                unavailable = (Test-DsrReleaseAcquisitionUnavailable $failure); message = $failure.Message })
+        }
+    }
+    [Console]::Out.WriteLine((ConvertTo-Json -InputObject @($results.ToArray()) -Depth 8 -Compress))
+    exit 0
+}
+if ($fixture.Contains('acquisition_matrix')) {
+    # Run the complete public caller for each error in one PowerShell process.
+    # Each case still gets its own request log, cache and production transaction.
+    # The real HttpClient handler, source engine and installation code are used.
+    $results = [Collections.Generic.List[object]]::new()
+    foreach ($casePath in $fixture.acquisition_matrix) {
+        $script:FixturePath = [string]$casePath
+        $script:Fixture = ConvertFrom-Json ([IO.File]::ReadAllText($casePath)) -AsHashtable
+        $parameters = $script:Fixture.parameters
+        $output = [IO.StringWriter]::new()
+        $previousOutput = [Console]::Out
+        try {
+            [Console]::SetOut($output)
+            $code = Invoke-DsrWindowsInstaller @parameters
+        } finally { [Console]::SetOut($previousOutput) }
+        $results.Add(@{ case_path = [string]$casePath; exit_code = $code; stdout = $output.ToString() })
+        $output.Dispose()
+    }
+    [Console]::Out.WriteLine((ConvertTo-Json -InputObject @($results.ToArray()) -Depth 12 -Compress))
+    exit 0
 }
 $parameters = $fixture.parameters
 exit (Invoke-DsrWindowsInstaller @parameters)
@@ -474,7 +576,7 @@ def test_release_freshness():
               f"elapsed={elapsed:.3f}s " + outcome.stderr.decode(errors="replace"))
         return
 
-    if options.fallback_only:
+    if options.fallback_only or options.acquisition_errors_only:
         latest_url = api + "/releases/latest"
         public_latest = "https://github.com/fixture/source-demo/releases/latest"
         public_tag = "https://github.com/fixture/source-demo/releases/tag/v1.2.3"
@@ -502,6 +604,112 @@ def test_release_freshness():
                     machine(prefix / row["name"]) == 0x8664 and digest(prefix / row["name"]) == row["sha256"]
                     for row in rows) and result.get("source_fallback", {}).get("requested_ref") == reference and \
                 json.loads(Path(result["source_receipt"]["path"]).read_text()) == result["source"]
+
+        if options.acquisition_errors_only:
+            # The old blanket transient marker compiled source for these
+            # failures. Exercise the generated caller and its real exception
+            # handling, not a separately reconstructed classification table.
+            terminal_errors = (
+                "Unknown", "SecureConnectionError", "UserAuthenticationError", "ProxyTunnelError",
+                "InvalidResponse", "HttpProtocolError", "VersionNegotiationError",
+                "ExtendedConnectNotSupported", "ConfigurationLimitExceeded",
+            )
+            matrix = []
+            scenarios = []
+            for stage, failed_url, statuses in (
+                ("discovery", latest_url, {}),
+                ("public-head", public_latest, {latest_url: 503}),
+                ("payload", public_payload, {}),
+            ):
+                for error in terminal_errors:
+                    scenarios.append((stage + "-" + error, failed_url, error, statuses, 8))
+            for error in ("legacy", "nested-auth", "nested-unknown", "aggregate-auth", "status-denied",
+                          "body-InvalidResponse", "body-HttpProtocolError"):
+                scenarios.append(("payload-" + error, public_payload, error, {}, 8))
+            for stage, failed_url in (("discovery", latest_url), ("public-head", public_latest),
+                                      ("payload", public_payload)):
+                for error in ("cancel", "nested-cancel"):
+                    scenarios.append((stage + "-" + error, failed_url, error,
+                                      {latest_url: 503} if stage == "public-head" else {}, 5))
+            for label, failed_url, error, statuses, code in scenarios:
+                case = root / ("transport-" + label + ".json")
+                fixture = {
+                    "platform": "windows/amd64", "repository_url": upstream.as_uri(),
+                    "parameters": {"FromSource": False, "AllowSourceBuild": True, "SourceTimeout": 60,
+                                   "SourceRef": "", "Prefix": str(release_prefix),
+                                   "CacheDir": str(root / ("transport-" + label + "-cache")), "Yes": True, "Json": True},
+                    "requests": str(root / ("transport-" + label + ".requests")),
+                    "commands": str(root / ("transport-" + label + ".commands")),
+                    "downloads": downloads, "http_client_fixture": True,
+                    "transport_failures": {failed_url: error}, "statuses": statuses,
+                }
+                case.write_text(json.dumps(fixture))
+                matrix.append((label, case, fixture, code, failed_url))
+            batch, _, _ = fallback("transport-matrix", acquisition_matrix=[str(row[1]) for row in matrix])
+            try:
+                observed = json.loads(batch.stdout)
+            except (ValueError, UnicodeDecodeError):
+                observed = []
+            check("the complete typed transport-error matrix finishes with one result per caller",
+                  batch.returncode == 0 and isinstance(observed, list) and len(observed) == len(matrix),
+                  batch.stderr.decode(errors="replace"))
+            for index, (label, case, fixture, code, failed_url) in enumerate(matrix):
+                row = observed[index] if isinstance(observed, list) and index < len(observed) else {}
+                try:
+                    result = json.loads(row.get("stdout", ""))
+                except (ValueError, TypeError):
+                    result = {}
+                observed_requests = requests(fixture)
+                check(label + " is terminal before Git, compilation or family replacement",
+                      row.get("case_path") == str(case) and row.get("exit_code") == code and
+                      result.get("exit_code") == code and result.get("status") == "error" and
+                      "source_fallback" not in result and not calls(fixture) and
+                      observed_requests and observed_requests[-1]["url"] == failed_url and
+                      all(digest(release_prefix / name) == value for name, value in original.items()),
+                      json.dumps(row))
+            check("typed transport diagnostics never expose exception-carried URL credentials",
+                  b"transport-secret" not in batch.stdout + batch.stderr,
+                  batch.stderr.decode(errors="replace"))
+
+            graphs, _, _ = fallback("deadline-exception-graphs", exception_graph_probe=True)
+            try:
+                graph_rows = json.loads(graphs.stdout)
+            except (ValueError, UnicodeDecodeError):
+                graph_rows = []
+            expected_graphs = (
+                ("owned-plain", 8, True), ("owned-connection", 8, True),
+                ("owned-tls", 8, False), ("owned-auth", 8, False),
+                ("owned-unknown", 8, False), ("owned-aggregate", 8, False),
+                ("explicit-plain", 5, False), ("explicit-tls", 5, False),
+            )
+            check("deadline exception graph probe emits exactly its eight independent decisions",
+                  graphs.returncode == 0 and isinstance(graph_rows, list) and len(graph_rows) == len(expected_graphs),
+                  graphs.stderr.decode(errors="replace"))
+            for index, (name, code, unavailable) in enumerate(expected_graphs):
+                row = graph_rows[index] if isinstance(graph_rows, list) and index < len(graph_rows) else {}
+                check(name + " preserves cancellation and unsafe-inner precedence",
+                      row.get("name") == name and row.get("exit_code") == code and
+                      row.get("unavailable") is unavailable and "transport-secret" not in json.dumps(row),
+                      json.dumps(row))
+
+            token = "dsr-transport-selected-account"
+            private, _, private_fixture = fallback("private-tls", extra={"DSR_GH_TOKEN": token},
+                expected_token=token, transport_failures={latest_url: "SecureConnectionError"})
+            check("selected-account TLS refusal does not retry public discovery or source",
+                  private.returncode == 8 and not calls(private_fixture) and
+                  len(requests(private_fixture)) == 1 and
+                  requests(private_fixture)[0]["authorization_sha256"] == hashlib.sha256(token.encode()).hexdigest(),
+                  private.stderr.decode(errors="replace"))
+            for label, errors, expected_ref, expected_commit in (
+                ("dns", {latest_url: "NameResolutionError", public_latest: "NameResolutionError"}, "HEAD", second_commit),
+                ("connection", {public_payload: "ConnectionError"}, "refs/tags/v1.2.3", first_commit),
+                ("premature-body", {public_payload: "body-ResponseEnded"}, "refs/tags/v1.2.3", first_commit),
+            ):
+                outcome, result, fixture = fallback("transport-" + label, transport_failures=errors)
+                check(label + " availability still builds the complete genuine Go family from its exact source",
+                      outcome.returncode == 0 and source_selected(result, fixture, expected_ref, expected_commit),
+                      outcome.stderr.decode(errors="replace"))
+            return
 
         if options.fallback_baseline_project:
             prior, prior_runtime, prior_policy = generate("source-demo", "fallback-baseline-generate",
@@ -802,7 +1010,7 @@ def test_release_freshness():
           rolled_result.get("freshness", {}).get("status") == "stale", rolled_back.stderr.decode(errors="replace"))
 
 
-if options.freshness_only or options.fallback_only or options.freshness_deadline_only:
+if options.freshness_only or options.fallback_only or options.acquisition_errors_only or options.freshness_deadline_only:
     test_release_freshness()
     print(f"Windows release source-routing checks: {passed} passed, {failed} failed", flush=True)
     print("Portable PowerShell, real Git/Go/Minisign and adapted HTTP delivery; native Windows and live GitHub remain unqualified.", flush=True)

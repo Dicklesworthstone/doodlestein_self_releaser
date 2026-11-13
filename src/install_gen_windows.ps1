@@ -49,6 +49,50 @@ function Test-DsrReleaseAcquisitionUnavailable {
         $Failure.Data['DsrTransientAcquisition'] -eq $true
 }
 
+# PowerShell 7.4 uses .NET 8, whose HTTP exceptions distinguish unavailable
+# transport from TLS, authentication, protocol and response-validation failures.
+# Walk method-invocation wrappers as well; an unknown category is not permission
+# to replace a verified release with a source build.
+function Stop-DsrHttpTransportFailure {
+    param([Exception]$Failure, [string]$Message, [bool]$DeadlineExpired)
+    $pending = [Collections.Generic.Stack[Exception]]::new()
+    $pending.Push($Failure)
+    $classified = $false
+    $unavailable = $true
+    $cancelled = $false
+    $stopped = $false
+    while ($pending.Count -gt 0) {
+        $current = $pending.Pop()
+        if ($current -is [Management.Automation.PipelineStoppedException]) { $stopped = $true }
+        if ($current -is [OperationCanceledException]) { $cancelled = $true }
+        if ($current -is [Security.Authentication.AuthenticationException]) { $unavailable = $false }
+        if ($current -is [Net.Http.HttpRequestException] -or $current -is [Net.Http.HttpIOException]) {
+            $classified = $true
+            if ($current.HttpRequestError -notin @(
+                    [Net.Http.HttpRequestError]::NameResolutionError,
+                    [Net.Http.HttpRequestError]::ConnectionError,
+                    [Net.Http.HttpRequestError]::ResponseEnded) -or
+                ($current -is [Net.Http.HttpRequestException] -and $null -ne $current.StatusCode)) {
+                $unavailable = $false
+            }
+        }
+        if ($current -is [AggregateException]) {
+            # A combined failure has no single availability classification.
+            $unavailable = $false
+            foreach ($inner in $current.InnerExceptions) { $pending.Push($inner) }
+        } elseif ($null -ne $current.InnerException) { $pending.Push($current.InnerException) }
+    }
+    if ($stopped -or ($cancelled -and -not $DeadlineExpired)) {
+        Stop-DsrInstall 'GitHub acquisition was cancelled' 5
+    }
+    if ($cancelled -and $DeadlineExpired -and $unavailable) {
+        Stop-DsrInstall 'GitHub acquisition exceeded its complete-transfer deadline' 8 -TransientAcquisition
+    }
+    # Messages are supplied by the caller, never derived from exception text,
+    # which can contain credentials or signed object-storage URLs.
+    Stop-DsrInstall $Message 8 -TransientAcquisition:($classified -and $unavailable)
+}
+
 function Write-DsrInstallLog {
     param([string]$Message)
     [Console]::Error.WriteLine('[dsr installer] ' + $Message)
@@ -510,13 +554,8 @@ function Invoke-DsrDownload {
                 $request.Dispose()
             }
         }
-    } catch [OperationCanceledException] {
-        if (-not $deadline.IsCancellationRequested) { Stop-DsrInstall 'GitHub acquisition was cancelled' 5 }
-        Stop-DsrInstall 'GitHub download exceeded its complete-transfer deadline' 8 -TransientAcquisition
-    } catch [Net.Http.HttpRequestException] {
-        # Exception text can contain a signed redirect URL. Keep credentials
-        # and acquisition tokens out of diagnostics and machine results.
-        Stop-DsrInstall 'GitHub download failed during HTTPS transport' 8 -TransientAcquisition
+    } catch [OperationCanceledException], [Net.Http.HttpRequestException], [Net.Http.HttpIOException] {
+        Stop-DsrHttpTransportFailure $_.Exception 'GitHub download failed during HTTPS transport' $deadline.IsCancellationRequested
     } finally { $deadline.Dispose(); $client.Dispose(); $token = '' }
     Stop-DsrInstall 'Download did not complete' 8
 }
@@ -633,11 +672,8 @@ function Get-DsrPublicLatestTag {
                 $request.Dispose()
             }
         }
-    } catch [OperationCanceledException] {
-        if (-not $deadline.IsCancellationRequested) { Stop-DsrInstall 'Public latest-release discovery was cancelled' 5 }
-        Stop-DsrInstall 'Public latest-release discovery exceeded its deadline; use -Version with an existing tag' 8 -TransientAcquisition
-    } catch [Net.Http.HttpRequestException] {
-        Stop-DsrInstall 'Public latest-release discovery failed during HTTPS transport; use -Version with an existing tag' 8 -TransientAcquisition
+    } catch [OperationCanceledException], [Net.Http.HttpRequestException], [Net.Http.HttpIOException] {
+        Stop-DsrHttpTransportFailure $_.Exception 'Public latest-release discovery failed during HTTPS transport; use -Version with an existing tag' $deadline.IsCancellationRequested
     } finally { $deadline.Dispose(); $client.Dispose() }
     Stop-DsrInstall 'Public latest-release discovery did not complete' 8
 }

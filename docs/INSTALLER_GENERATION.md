@@ -313,7 +313,8 @@ deadline and size limit used by public downloads.
 Omitting `-Version` selects the latest release online. Explicit nonnumeric tags
 such as `release-2026.11` are preserved; a bare numeric `1.2.3` selects `v1.2.3`.
 Without a selected token, an unavailable or rate-limited latest-release API
-(HTTP 403, 408, 429, 5xx, or a transport failure) falls back to GitHub's documented
+(HTTP 403, 408, 429, 5xx, a DNS/connection failure, a prematurely ended response,
+or an owned request deadline) falls back to GitHub's documented
 [public latest-release link](https://docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases).
 The installer follows at most five HTTPS `HEAD` redirects within the exact
 repository, requires a successful `/releases/tag/TAG` destination, and pins all
@@ -439,16 +440,23 @@ to a source build with the existing Git and compiler installations:
 ```
 
 A known release uses its exact `refs/tags/TAG`; only unavailable latest-release
-discovery without a selected tag uses `HEAD`. This includes transport failures,
-owned request deadlines and HTTP 408/429/5xx at discovery, authenticated release
-metadata or primary-payload acquisition. Public 404/410 can establish absence.
+discovery without a selected tag uses `HEAD`. This includes classified DNS or
+connection failures, prematurely ended response streams, owned request deadlines,
+and HTTP 408/429/5xx at discovery, authenticated release metadata or primary-payload
+acquisition. Public 404/410 can establish absence.
 A complete authenticated inventory can also prove the primary is absent, while
 an authenticated HTTP 404/410 remains ambiguous and is refused.
 
-The same selected credential authenticates API and Git requests. HTTP 401/403,
-malformed metadata, missing checksum/signature proof and invalid cached or
-downloaded release bytes cannot authorize source execution. A complete verified
-cache is used before fetching its release again. Freshness metadata failures
+The same selected credential authenticates API and Git requests. HTTP 401/403
+cannot authorize source execution. TLS trust or handshake failures,
+proxy/authentication failures, malformed or
+protocol-invalid responses, configured response limits, and unclassified HTTPS
+exceptions cannot authorize public discovery or source execution. Exception
+messages never supply that classification. Unsafe nested failures remain terminal
+even when .NET reports them inside an expired request's cancellation exception.
+Malformed metadata, missing checksum/signature proof and invalid cached or
+downloaded release bytes also remain terminal. A complete verified cache is used
+before fetching its release again. Freshness metadata failures
 keep a verified release; they are not acquisition failures. Explicit interruption
 returns exit `5` and does not install either source or the verified old release.
 
@@ -458,6 +466,20 @@ older release. JSON adds `source_fallback` with the acquisition stage, requested
 ref and known release version, alongside durable unsigned source provenance.
 `-Yes` grants replacement permission only; `-AllowSourceBuild` grants build
 consent. Offline and recovery modes refuse this consent.
+
+The focused transport regression exercises the generated public caller with real
+typed .NET exceptions at its HTTP boundary and genuine Git/Go source-build
+positives:
+
+```bash
+timeout 120 bash scripts/tests/test_install_source_windows.sh --acquisition-errors-only
+```
+
+It covers API discovery, public HEAD discovery and payload streams; terminal
+cases retain the installed family and start no Git or compiler process. The
+separate `--freshness-deadline-only` mode retains the actual 60-second owned
+deadline check. These controlled fixtures do not establish native Windows
+filesystem behavior or live GitHub/TLS service acceptance.
 
 ### Optional stale-release source upgrades on Windows
 

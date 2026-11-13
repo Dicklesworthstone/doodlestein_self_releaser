@@ -398,6 +398,7 @@ jobs:
           bash scripts/tests/test_install_source_windows.sh --bun-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/windows-bun-source.log"
           bash scripts/tests/test_install_source_windows.sh --bun-workspaces-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/windows-bun-workspaces.log"
           timeout 120 bash scripts/tests/test_install_source_windows.sh --freshness-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/windows-source-freshness.log"
+          timeout 120 bash scripts/tests/test_install_source_windows.sh --acquisition-errors-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/windows-acquisition-errors.log"
           timeout 120 bash scripts/tests/test_install_source_windows.sh --fallback-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/windows-source-fallback.log"
           test -z "$(git status --porcelain)"
       - name: Validate native compilation, manifests and signed provenance
