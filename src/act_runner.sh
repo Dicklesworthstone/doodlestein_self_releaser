@@ -9551,7 +9551,7 @@ act_sync_sources() {
     fi
 
     if $strict_release; then
-        local strict_target strict_language strict_go_env strict_go_workfile
+        local strict_target strict_language strict_go_env strict_go_workfile strict_go_command
         strict_language=$(yq -r '.language // ""' "$config_file") || return 4
         for strict_target in $targets; do
             if act_platform_uses_act "$tool_name" "$strict_target"; then
@@ -9561,6 +9561,11 @@ act_sync_sources() {
             fi
             if [[ "$strict_language" == go ]]; then
                 strict_go_env=$(act_get_build_env "$tool_name" "$strict_target") || return 4
+                strict_go_command=$(act_get_build_cmd "$tool_name" "$strict_target") || return 4
+                if ! _act_validate_strict_go_source_flags "$strict_go_env" "$strict_go_command"; then
+                    echo '{"status":"error","error":"Strict Go source-selection flags leave the pinned source graph"}'
+                    return 4
+                fi
                 strict_go_workfile=$(act_get_build_env_value "$strict_go_env" GOWORK) || strict_go_workfile=''
                 if ! _act_strict_go_workfile_json "$tool_name" "$strict_git_sha" \
                     "$strict_go_workfile" '/.dsr-go-source-admission/source' >/dev/null; then
@@ -10588,6 +10593,208 @@ _act_go_build_influence_json() {
     '
 }
 
+# The module/workfile graph cannot authorize an alternate module file or a Go
+# overlay: either can select mutable source bytes outside that graph without
+# changing the recorded flag string. Until these file formats have their own
+# pinned-source materialization contract, admit only their disabling empty
+# values. This is a literal compiler-selector check, not a shell sandbox.
+_act_validate_strict_go_source_flags() {
+    local environment="$1" command="${2:-}"
+    python3 -I - 3<<< "$environment" 4<<< "$command" <<'PY'
+import os
+import re
+import shlex
+import sys
+
+
+def refuse(message):
+    raise ValueError('Strict Go source-selection flags: ' + message)
+
+
+def go_words(value):
+    # Match cmd/internal/quoted.Split: only leading quotes delimit a field;
+    # neither quotes inside an unquoted field nor backslashes are shell syntax.
+    words = []
+    while value:
+        value = value.lstrip(' \t\r\n')
+        if not value:
+            break
+        if value[0] in ('"', "'"):
+            quote, value = value[0], value[1:]
+            end = value.find(quote)
+            if end < 0:
+                refuse('unterminated quoted GOFLAGS field')
+            words.append(value[:end])
+            value = value[end + 1:]
+        else:
+            match = re.match(r'[^ \t\r\n]+', value)
+            words.append(match[0])
+            value = value[len(match[0]):]
+    return words
+
+
+source_flags = {'-overlay', '--overlay', '-modfile', '--modfile'}
+# Values of other Go flags are data, even when they happen to spell -overlay.
+value_flags = {'-asmflags', '-buildmode', '-compiler', '-coverpkg', '-coverprofile',
+               '-f', '-gccgoflags', '-gcflags', '-installsuffix', '-ldflags',
+               '-mod', '-o', '-p', '-pkgdir', '-tags', '-toolexec'}
+value_flags |= {'-' + value for value in value_flags}
+
+
+def check_flags(words, goflags=False):
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if word == '--' and not goflags:
+            break
+        name, equals, value = word.partition('=')
+        if name in source_flags:
+            if not equals:
+                if goflags or index + 1 == len(words):
+                    refuse(name + ' requires an explicit empty value; external source selectors are not pinned')
+                index += 1
+                value = words[index]
+            if value:
+                refuse(name + ' is not supported for pinned native builds; use committed go.mod/go.work and source files')
+        elif goflags:
+            if not word.startswith('-') or word in ('-', '--') or word.startswith(('---', '-=', '--=')):
+                refuse('GOFLAGS contains a non-flag field')
+        elif not equals and name in value_flags:
+            # A following linker/compiler argument is not another Go flag.
+            index += 1
+        index += 1
+
+
+def assignment(word, validate=True):
+    match = re.fullmatch(r'(?:\$env:)?([A-Za-z_][A-Za-z0-9_]*)=(.*)', word, re.DOTALL | re.IGNORECASE)
+    if validate and match and match[1].upper() == 'GOFLAGS':
+        check_flags(go_words(match[2]), goflags=True)
+    return bool(match)
+
+
+def check_command(words, native_path=False):
+    # Shell control words and transparent command prefixes do not hide the
+    # direct Go invocation. Opaque scripts remain reviewed recipe code.
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if word in ('if', 'then', 'elif', 'else', 'while', 'until', 'do', '!', '{', '}'):
+            index += 1
+            continue
+        if assignment(word, not native_path):
+            index += 1
+            continue
+        if (re.fullmatch(r'\$env:GOFLAGS', word, re.IGNORECASE) and
+                index + 2 < len(words) and words[index + 1] == '='):
+            if not native_path:
+                check_flags(go_words(words[index + 2]), goflags=True)
+            index += 3
+            continue
+        executable = word.replace('\\', '/').rsplit('/', 1)[-1].lower()
+        if executable in ('export', 'readonly', 'declare', 'typeset', 'set'):
+            if not native_path:
+                for value in words[index + 1:]:
+                    assignment(value)
+            return
+        if executable in ('command', 'builtin', 'exec', 'time', 'nohup'):
+            index += 1
+            while index < len(words) and words[index].startswith('-'):
+                option = words[index]
+                index += 1
+                if option == '--':
+                    break
+                if executable == 'command' and re.fullmatch(r'-[pvV]+', option):
+                    if 'v' in option or 'V' in option:
+                        return  # Name lookup does not invoke the compiler.
+                elif executable == 'exec' and option == '-a':
+                    index += 1  # argv[0], not the executable or its flags.
+                elif executable == 'exec' and re.fullmatch(r'-[cl]+', option):
+                    pass
+                elif executable == 'time' and option == '-p':
+                    pass
+                else:
+                    return  # Unknown wrapper options are opaque recipe code.
+            continue
+        if executable == 'env':
+            index += 1
+            while index < len(words):
+                option = words[index]
+                if option in ('-S', '--split-string') or option.startswith(('--split-string=', '-S')):
+                    if option in ('-S', '--split-string'):
+                        index += 1
+                        if index == len(words):
+                            refuse('env split-string requires a literal command')
+                        selected = words[index]
+                    else:
+                        selected = option.partition('=')[2] if option.startswith('--') else option[2:]
+                    # GNU env's split-string supports additional expansion and
+                    # escape syntax. Refuse those forms rather than interpreting
+                    # them as an apparently empty source-selection value.
+                    if '\\' in selected or '$' in selected:
+                        refuse('env split-string expansion is unsupported for pinned Go commands')
+                    check_command(shlex.split(selected) + words[index + 1:], native_path)
+                    return
+                if option in ('-u', '--unset', '-C', '--chdir'):
+                    index += 2
+                elif option == '--':
+                    index += 1
+                    break
+                elif option.startswith('-'):
+                    index += 1
+                elif assignment(option, not native_path):
+                    index += 1
+                else:
+                    break
+            continue
+        if executable in ('go', 'go.exe') and (not native_path or '\\' in word):
+            check_flags(words[index + 1:])
+        return
+
+
+try:
+    with os.fdopen(3) as stream:
+        environment = dict(line.rstrip('\n').split('=', 1) for line in stream
+                           if '=' in line)
+    check_flags(go_words(environment.get('GOFLAGS', '')), goflags=True)
+    with os.fdopen(4) as stream:
+        command = stream.read()
+    # POSIX decoding recognizes quoted/escaped option names and assignments.
+    # The second pass preserves native Windows drive-path backslashes; its
+    # whole-word quotes are removed without evaluating either shell.
+    for posix in (True, False):
+        lexer = shlex.shlex(command, posix=posix, punctuation_chars=';&|()<>\n')
+        lexer.whitespace = ' \t\r'
+        lexer.whitespace_split = True
+        words, redirect = [], False
+        for token in lexer:
+            if token.startswith(('<(', '>(')) and words and words[-1].endswith('='):
+                # A process substitution is a nonempty path supplied by the
+                # shell. Do not truncate -overlay=<(...) into the disabling
+                # empty spelling while splitting shell punctuation below.
+                words[-1] += '<process-substitution>'
+            if token and all(char in ';&|()\n' for char in token):
+                check_command(words, native_path=not posix)
+                words = []
+                redirect = False
+                continue
+            if token and all(char in '<>&' for char in token) and ('<' in token or '>' in token):
+                if words and words[-1].isdigit():
+                    words.pop()
+                redirect = True
+                continue
+            if redirect:
+                redirect = False
+                continue
+            if not posix and len(token) >= 2 and token[0] == token[-1] and token[0] in ('"', "'"):
+                token = token[1:-1]
+            words.append(token)
+        check_command(words, native_path=not posix)
+except (OSError, ValueError) as error:
+    print('[act] ' + str(error), file=sys.stderr)
+    raise SystemExit(4)
+PY
+}
+
 # Resolve only literal workfiles in the admitted Git graph. In particular an
 # empty GOWORK must not let Go walk above the private source stage. The receipt
 # records portable graph-relative identity; the actual process gets the rebased
@@ -10861,6 +11068,7 @@ PY
 
 _act_strict_go_build_env() {
     local tool="$1" sha="$2" ref="$3" stage_source="$4" environment="$5"
+    local command="${6:-}"
     local pair name value workfile normalized pkg_config_regex selected=''
     local result=$'GOENV=off\nGOFLAGS=\nGOTOOLCHAIN=local\nGO111MODULE=on' governed=$'\n'
     governed+="$(_act_go_ambient_env_names)"$'\n'
@@ -10890,6 +11098,7 @@ _act_strict_go_build_env() {
         esac
         result+=$'\n'"$pair"
     done <<< "$environment"
+    _act_validate_strict_go_source_flags "$result" "$command" || return 4
     workfile=$(_act_strict_go_workfile_json "$tool" "$sha" "$selected" "$stage_source") || return 4
     result+=$'\n'"GOWORK=$(jq -r '.gowork' <<< "$workfile")"
     result+=$'\n'"DSR_GO_ENV_POLICY=3"
@@ -10907,7 +11116,7 @@ _act_strict_go_build_env() {
 # compiled output and do not need this receipt.
 _act_validate_strict_go_result() {
     local tool="$1" result="$2" sha="$3" ref="$4" platform="$5"
-    local language environment expected actual workfile gowork stage_source
+    local language environment expected actual workfile gowork stage_source command
     language=$(yq -r '.language // ""' "$ACT_REPOS_DIR/$tool.yaml") || return 4
     [[ "$language" == go ]] || return 0
     jq -e '(.status // "") | IN("success","ok","passed")' <<< "$result" >/dev/null || return 0
@@ -10933,7 +11142,8 @@ _act_validate_strict_go_result() {
         return 4
     fi
     environment=$(act_get_build_env "$tool" "$platform") || return 4
-    environment=$(_act_strict_go_build_env "$tool" "$sha" "$ref" "$stage_source" "$environment") || return 4
+    command=$(act_get_build_cmd "$tool" "$platform") || return 4
+    environment=$(_act_strict_go_build_env "$tool" "$sha" "$ref" "$stage_source" "$environment" "$command") || return 4
     expected=$(_act_go_build_influence_json "$environment") || return 4
     if [[ "$(jq -cS . <<< "$actual")" != "$(jq -cS . <<< "$expected")" ]]; then
         _log_error 'Strict Go output no longer matches the reviewed compiler selectors or pinned workfile; start a fresh release build'
@@ -14206,7 +14416,7 @@ act_run_native_build() {
 
     if [[ "$language" == go ]] && $strict_native_build; then
         build_env=$(_act_strict_go_build_env "$tool_name" "$release_git_sha" "$release_git_ref" \
-            "$artifact_source_root" "$build_env") || return 4
+            "$artifact_source_root" "$build_env" "$build_cmd") || return 4
         build_influence_env_json=$(_act_go_build_influence_json "$build_env") || return 4
     fi
 
@@ -20386,6 +20596,7 @@ export -f _act_rust_sdk_influence_regex _act_unix_rust_sdk_env_cleanup
 export -f _act_rust_native_build_env _act_rust_native_selectors_json
 export -f _act_validate_strict_rust_result _act_validate_strict_native_result
 export -f _act_strict_go_workfile_json _act_strict_go_build_env _act_validate_strict_go_result
+export -f _act_validate_strict_go_source_flags
 export -f act_run_native_build act_orchestrate_build act_generate_manifest
 export -f _act_result_artifact_receipts _act_target_result_available
 export -f _act_build_orchestration_target _act_run_target_worker

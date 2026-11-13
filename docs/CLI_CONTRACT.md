@@ -62,6 +62,15 @@ Exit codes are semantic and MUST be consistent across all commands:
 
 ### Exit Code Usage
 
+Release authentication is a terminal admission step for ordinary publication,
+strict draft finalization, source-only releases, verification and repair,
+package-manager updates, and repository metadata synchronization. Only an
+unavailable or unauthenticated `gh` CLI result permits selected-token fallback.
+Cancellation returns `5`, an expired credential deadline returns `8`, invalid
+`GH_API_TIMEOUT` returns `4` before credentials are read, and other authentication
+refusals return `3`. These failures stop the command before release, package, or
+registry mutation. Existing credential-selection precedence is unchanged.
+
 ```bash
 dsr build --repo ntm
 case $? in
@@ -1494,6 +1503,20 @@ untracked module roots are refused. Go quoted-string escapes are decoded before
 containment checks. All committed module manifests are checked, including
 currently inactive replacements, because a reviewed build command can select
 any of those modules. Versioned module replacements remain supported.
+
+Native strict builds refuse nonempty Go `-overlay` and `-modfile` selections.
+An overlay can replace otherwise pinned source files, and an alternate module
+file can replace the admitted dependency graph without changing the recorded
+flag path. These formats do not yet have a pinned-source materialization
+contract. Use committed source files and the admitted `go.mod`/`go.work` graph;
+literal empty forms such as `-overlay=` and `-modfile ""` remain valid.
+The check covers configured `GOFLAGS` using Go's field-quoting rules, literal
+direct Go arguments, inline or `env`-supplied `GOFLAGS`, and shell or PowerShell
+assignments in compound recipes. Common transparent prefixes such as
+`command -p`, `exec -a`, and literal `env -S` commands are inspected too;
+`env -S` escape or variable expansion is refused because it cannot be treated
+as a literal command. Other flag values, including quoted linker arguments,
+remain data. It does not execute or sandbox arbitrary recipe scripts.
 
 The same source-path admission runs again when constructing each worker's
 compiler policy and when validating retained output for resume or publication.

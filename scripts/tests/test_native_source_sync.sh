@@ -30,6 +30,8 @@
 # simultaneous pinned amd64/386 Go builds with private verified stages.
 # Use --strict-go-context-only for actual Go policy and retained-output admission.
 # Use --strict-go-paths-only for pinned local Go dependency boundaries.
+# Use --strict-go-flags-only for alternate-module/overlay source admission,
+# actual Go flag parsing, and retained native-policy refusal.
 # Use --strict-cgo-selectors-only for genuine C header selection and compiler
 # environment evidence through the public strict build and release consumers.
 # Use --strict-rust-selectors-only for the same boundary through a genuine
@@ -622,6 +624,192 @@ GO
         "$(jq -c '.release_contract' "$config")" > "$work/changed-selector.out" 2> "$work/changed-selector.log" || status=$?
     check_cgo_selector 'changing reviewed C header selection invalidates retained output' test "$status" -ne 0
     printf 'Strict cgo selectors: %s checks, %s failures; evidence %s\n' "$checks" "$failures" "$work"
+    [[ "$failures" -eq 0 ]]
+)
+
+test_strict_go_source_flags() (
+    local dependency work sha config item status checks=0 failures=0 policy result
+    local label environment command expected index=0 variant actual
+    for dependency in bash git jq yq python3 go; do
+        command -v "$dependency" >/dev/null || { printf 'SKIP: strict Go flags require %s\n' "$dependency"; return 77; }
+    done
+    [[ $(go version) == 'go version go'* ]] || return 77
+    work=$(mktemp -d "${DSR_TEST_DISK_ROOT:-${TMPDIR:-/tmp}}/dsr-go-source-flags.XXXXXXXX") || return 1
+    printf 'Strict Go source-flag evidence: %s\n' "$work"
+    mkdir -p "$work/config/repos.d" "$work/source" "$work/stages" || return 1
+    export DSR_CONFIG_DIR="$work/config" ACT_CONFIG_DIR="$work/config" ACT_REPOS_DIR="$work/config/repos.d"
+    export DSR_STATE_DIR="$work/state" DSR_CACHE_DIR="$work/cache" DSR_HOSTS_FILE="$work/config/hosts.yaml"
+    export DSR_REPOS_FILE="$work/config/repos.yaml" DSR_DISABLE_HOST_SELECTOR=1 NO_COLOR=1 GOMAXPROCS=1
+    printf 'module example.local/sourceflags\n\ngo 1.19\n' > "$work/source/go.mod"
+    printf 'package main\nvar message = "pinned-input"\nfunc main() { println(message) }\n' > "$work/source/main.go"
+    printf 'package main\nfunc main() { println("UNPINNED-OVERLAY") }\n' > "$work/external.go"
+    printf 'module example.external/alternate\n\ngo 1.19\n' > "$work/alternate.mod"
+    jq -n --arg external "$work/external.go" '{Replace:{"main.go":$external}}' > "$work/overlay.json" || return 1
+    git -C "$work/source" init -q -b main || return 1
+    git -C "$work/source" add . || return 1
+    git -C "$work/source" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm pinned-source || return 1
+    git -C "$work/source" tag v1.0.0 || return 1
+    sha=$(git -C "$work/source" rev-parse HEAD) || return 1
+    jq -n --arg work "$work" '{schema_version:"1.0.0",hosts:{localnative:{
+        platform:"linux/amd64",connection:"local",concurrency:1,build_root:($work+"/stages")}},
+        platform_mapping:{"linux/amd64":"localnative"}}' > "$DSR_HOSTS_FILE" || return 1
+    config="$ACT_REPOS_DIR/sourceflags.yaml"
+    jq -n --arg work "$work" --arg path "$PATH" --arg cache "${DSR_TEST_GOCACHE:-$work/go-cache}" '{
+        tool_name:"sourceflags",repo:"example/sourceflags",local_path:($work+"/source"),language:"go",
+        binary_name:"sourceflags",targets:["linux/amd64"],act_job_map:{"linux/amd64":null},
+        hosts:{"linux/amd64":"localnative"},
+        build_cmd:"printf compiler\\n >> \"$PROBE_EVENTS\"; go build -p=1 -buildvcs=false -o sourceflags .",
+        env:{PATH:$path,PROBE_EVENTS:($work+"/compiler-events"),GOCACHE:$cache,GOMAXPROCS:"1",
+          CGO_ENABLED:"0",GOPROXY:"off",GOSUMDB:"off",GOTELEMETRY:"off"},
+        release_contract:{checksum_sidecar:"sha256",exact_primary_assets:{"linux/amd64":"sourceflags-linux-amd64"}}}
+        ' > "$work/recipe.json" || return 1
+    command cp "$work/recipe.json" "$config" || return 1
+    for item in logging config build_state act_runner artifact_naming host_selector host_health git_ops packaging; do
+        if [[ "$item" == act_runner ]]; then
+            # shellcheck disable=SC1090 # Exact incoming module supports paired controls.
+            source "${DSR_TEST_ACT_RUNNER:-$ROOT/src/act_runner.sh}" || return 1
+        else
+            # shellcheck disable=SC1090 # Actual public command dependencies.
+            source "$ROOT/src/$item.sh" || return 1
+        fi
+    done
+    check_go_flag() {
+        local label="$1"; shift
+        checks=$((checks + 1))
+        if "$@"; then printf 'PASS: Go source flags: %s\n' "$label"
+        else failures=$((failures + 1)); printf 'FAIL: Go source flags: %s\n' "$label" >&2; fi
+    }
+    run_flag_compiler() (
+        local flags="$1"; shift
+        cd "$work/source" || exit 1
+        GOENV=off GOTOOLCHAIN=local GO111MODULE=on GOWORK=off GOFLAGS="$flags" \
+            GOPROXY=off GOSUMDB=off GOTELEMETRY=off CGO_ENABLED=0 GOMAXPROCS=1 \
+            GOCACHE="${DSR_TEST_GOCACHE:-$work/go-cache}" go "$@"
+    )
+    # These actual Go commands establish the compiler's interpretation of the
+    # tested flags. They deliberately bypass DSR admission in disposable input
+    # trees; they are not successful DSR releases or hosted/native acceptance.
+    status=0
+    run_flag_compiler "-overlay=$work/overlay.json" build -p=1 -buildvcs=false -o "$work/unsafe-overlay" . \
+        > "$work/unsafe-overlay.out" 2> "$work/unsafe-overlay.log" || status=$?
+    check_go_flag 'actual Go overlay can replace pinned source without changing it' test "$status" -eq 0
+    if [[ "$status" -ne 0 ]]; then cat "$work/unsafe-overlay.log" >&2; return 1; fi
+    check_go_flag 'counterexample executable uses the external overlay bytes' \
+        test "$("$work/unsafe-overlay" 2>&1)" = UNPINNED-OVERLAY
+    actual=$(run_flag_compiler "-modfile=$work/alternate.mod" list -m) || return 1
+    check_go_flag 'actual Go alternate module file changes the selected module graph' \
+        test "$actual" = example.external/alternate
+    status=0
+    run_flag_compiler "-overlay= --modfile= \"-ldflags=-X 'main.message=quoted value'\"" \
+        build -p=1 -buildvcs=false -o "$work/empty-selectors" . \
+        > "$work/empty-selectors.out" 2> "$work/empty-selectors.log" || status=$?
+    check_go_flag 'Go accepts empty disabling selectors and quoted unrelated flag data' test "$status" -eq 0
+    if [[ "$status" -ne 0 ]]; then cat "$work/empty-selectors.log" >&2; return 1; fi
+    check_go_flag 'empty selectors compile the pinned source with its reviewed linker value' \
+        test "$("$work/empty-selectors" 2>&1)" = 'quoted value'
+    check_go_flag 'compiler controls leave the pinned checkout byte-identical' \
+        git -C "$work/source" diff --quiet HEAD --
+
+    # The existing policy producer, rather than the new helper alone, is the
+    # entrance for every case. An unchanged incoming module therefore admits
+    # the unsafe cases and fails these same assertions.
+    while IFS= read -r item; do
+        label=$(jq -r '.label' <<< "$item") || return 1
+        environment=$(jq -r '.env' <<< "$item") || return 1
+        command=$(jq -r '.command' <<< "$item") || return 1
+        expected=$(jq -r '.status' <<< "$item") || return 1
+        index=$((index + 1)); status=0
+        _act_strict_go_build_env sourceflags "$sha" v1.0.0 '/private/stage/source' "$environment" "$command" \
+            > "$work/case-$index.out" 2> "$work/case-$index.log" || status=$?
+        check_go_flag "$label policy admission" test "$status" -eq "$expected"
+        if [[ "$expected" == 4 ]]; then
+            check_go_flag "$label refusal identifies the source-selector boundary" \
+                grep -q 'Strict Go source-selection flags' "$work/case-$index.log"
+            check_go_flag "$label emits no partial compiler environment" test ! -s "$work/case-$index.out"
+        fi
+    done <<'CASES'
+{"label":"configured overlay","env":"GOFLAGS=-overlay=/outside/overlay.json","command":"go build .","status":4}
+{"label":"configured alternate module","env":"GOFLAGS=--modfile=/outside/alternate.mod","command":"go build .","status":4}
+{"label":"Go-quoted overlay path","env":"GOFLAGS=\"-overlay=/outside/path with spaces/overlay.json\"","command":"go build .","status":4}
+{"label":"separate command overlay","env":"","command":"go build -overlay /outside/overlay.json .","status":4}
+{"label":"equals command modfile","env":"","command":"go build --modfile='/outside/path with spaces/alternate.mod' .","status":4}
+{"label":"inline GOFLAGS","env":"","command":"GOFLAGS='-overlay=/outside/overlay.json' go build .","status":4}
+{"label":"env GOFLAGS","env":"","command":"env -- GOFLAGS=-modfile=/outside/alternate.mod go build .","status":4}
+{"label":"assignment before command prefix","env":"","command":"FOO=bar command go build -overlay=/outside/overlay.json .","status":4}
+{"label":"command path-search prefix","env":"","command":"command -p go build -modfile=/outside/alternate.mod .","status":4}
+{"label":"env and command prefixes","env":"","command":"env FOO=bar command go build -overlay=/outside/overlay.json .","status":4}
+{"label":"exec argv name prefix","env":"","command":"exec -a custom-name go build -overlay=/outside/overlay.json .","status":4}
+{"label":"env split-string prefix","env":"","command":"env -S 'go build -overlay=/outside/overlay.json .'","status":4}
+{"label":"process-substitution overlay","env":"","command":"go build -overlay=<(cat /outside/overlay.json) .","status":4}
+{"label":"PowerShell GOFLAGS","env":"","command":"$env:GOFLAGS='-overlay=C:/outside/overlay.json'; go build .","status":4}
+{"label":"PowerShell spaced GOFLAGS","env":"","command":"$env:GOFLAGS = '-modfile=C:/outside/alternate.mod'; go build .","status":4}
+{"label":"exported GOFLAGS","env":"","command":"export GOFLAGS=-overlay=/outside/overlay.json; go build .","status":4}
+{"label":"compound command","env":"","command":"printf ready; if test 1 = 1; then go build -overlay=/outside/overlay.json .; fi","status":4}
+{"label":"quoted executable","env":"","command":"'go' build '-overlay=/outside/overlay.json' .","status":4}
+{"label":"Windows env selection","env":"","command":"set \"GOFLAGS=-overlay=C:/outside/overlay.json\" && go build .","status":4}
+{"label":"Windows Go executable path","env":"","command":"\"C:\\Go\\bin\\go.exe\" build -modfile=C:/outside/alternate.mod .","status":4}
+{"label":"redirected compiler","env":"","command":"go build > compile.log -overlay=/outside/overlay.json .","status":4}
+{"label":"configured empty selectors","env":"GOFLAGS=-overlay= --modfile=","command":"go build .","status":0}
+{"label":"separate empty selectors","env":"","command":"go build -overlay '' --modfile \"\" .","status":0}
+{"label":"quoted linker data","env":"GOFLAGS=\"-ldflags=-X 'main.message=quoted value'\"","command":"go build -tags 'one two' .","status":0}
+{"label":"inline quoted linker data","env":"","command":"GOFLAGS=\"\\\"-ldflags=-X 'main.message=quoted value'\\\"\" go build .","status":0}
+{"label":"selector spelling inside linker data","env":"","command":"go build -ldflags '-X main.message=-overlay=/literal' .","status":0}
+{"label":"selector spelling in diagnostics","env":"","command":"printf 'go build -overlay=/literal'; go build .","status":0}
+{"label":"command name query","env":"","command":"command -v go -overlay=/literal; go build .","status":0}
+{"label":"empty selectors after transparent prefixes","env":"","command":"FOO=bar command -- env -- go build -overlay= --modfile= .","status":0}
+{"label":"env split-string healthy flags","env":"","command":"env -S 'go build -overlay= -tags=release .'","status":0}
+{"label":"literal Go quoting differs from shell quoting","env":"GOFLAGS='-overlay=/outside/one'\"--modfile=/outside/two\"","command":"go build .","status":4}
+{"label":"brace-group compiler","env":"","command":"{ go build -overlay=/outside/overlay.json .; }","status":4}
+CASES
+
+    # Resume and publication share this existing native-result consumer. Use
+    # real policy output to create otherwise matching retained receipts, so a
+    # failure cannot be attributed to a fabricated marker or missing fields.
+    environment=$(act_get_build_env sourceflags linux/amd64) || return 1
+    policy=$(_act_strict_go_build_env sourceflags "$sha" v1.0.0 '/private/stage/source' "$environment" 'go build .') || return 1
+    for variant in environment command; do
+        if [[ "$variant" == environment ]]; then
+            jq --arg flags "-overlay=$work/overlay.json" '.env.GOFLAGS=$flags' "$work/recipe.json" > "$config" || return 1
+            result=$(_act_go_build_influence_json "$policy"$'\n'"GOFLAGS=-overlay=$work/overlay.json") || return 1
+        else
+            jq --arg file "$work/alternate.mod" '.build_cmd="go build -modfile="+$file+" ."' \
+                "$work/recipe.json" > "$config" || return 1
+            result=$(_act_go_build_influence_json "$policy") || return 1
+        fi
+        result=$(jq -nc --argjson environment "$result" '{method:"native",status:"success",platform:"linux/amd64",build_influence_env:$environment}') || return 1
+        status=0
+        _act_validate_strict_go_result sourceflags "$result" "$sha" v1.0.0 linux/amd64 \
+            > "$work/retained-$variant.out" 2> "$work/retained-$variant.log" || status=$?
+        check_go_flag "retained $variant selector is refused by the resume/publication consumer" test "$status" -eq 4
+        check_go_flag "retained $variant reaches source-selector validation" \
+            grep -q 'Strict Go source-selection flags' "$work/retained-$variant.log"
+    done
+    command cp "$work/recipe.json" "$config" || return 1
+    result=$(jq -nc --argjson environment "$(_act_go_build_influence_json "$policy")" \
+        '{method:"native",status:"success",platform:"linux/amd64",build_influence_env:$environment}') || return 1
+    check_go_flag 'unchanged safe retained output still passes the shared consumer' \
+        _act_validate_strict_go_result sourceflags "$result" "$sha" v1.0.0 linux/amd64
+
+    host_health_is_ready() { return 0; }
+    selector_acquire_slot() { return 0; }
+    selector_release_slot() { return 0; }
+    build_state_init || return 1
+    export SCRIPT_DIR="$ROOT" JSON_MODE=true DRY_RUN=false VERBOSE=false DSR_VERSION=fixture
+    declare -A _DSR_LOADED_MODULES=([packaging]=1 [artifact_naming]=1)
+    # shellcheck disable=SC1090 # Actual public native build entry point.
+    source <(awk '/^(_dsr_require|cmd_build)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$ROOT/dsr") || return 1
+    # shellcheck disable=SC1090
+    source <(awk '/^json_envelope\(\) \{/{copy=1} copy{print} copy && /^# ====/{exit}' "$ROOT/dsr") || return 1
+    jq --arg flags "-overlay=$work/overlay.json" '.env.GOFLAGS=$flags' "$work/recipe.json" > "$config" || return 1
+    status=0
+    cmd_build sourceflags --version 1.0.0 --output-dir "$work/output" \
+        > "$work/public-build.json" 2> "$work/public-build.log" || status=$?
+    check_go_flag 'public strict build refuses the external overlay' test "$status" -ne 0
+    check_go_flag 'public refusal reaches source admission before staging' \
+        grep -q 'Strict Go source-selection flags' "$work/public-build.log"
+    check_go_flag 'public refusal never starts a compiler command' test ! -e "$work/compiler-events"
+    check_go_flag 'public refusal creates no source snapshot' test ! -e "$work/stages/.dsr-release-snapshots"
+    printf 'Strict Go source flags: %s checks, %s failures; evidence %s\n' "$checks" "$failures" "$work"
     [[ "$failures" -eq 0 ]]
 )
 
@@ -3709,6 +3897,10 @@ if [[ "${1:-}" == --strict-rust-selector-cache-only ]]; then
 fi
 if [[ "${1:-}" == --strict-cgo-selectors-only ]]; then
     test_strict_cgo_selectors
+    exit $?
+fi
+if [[ "${1:-}" == --strict-go-flags-only ]]; then
+    test_strict_go_source_flags
     exit $?
 fi
 if [[ "${1:-}" == --strict-go-paths-only ]]; then
