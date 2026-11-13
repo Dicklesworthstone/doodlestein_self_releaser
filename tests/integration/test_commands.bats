@@ -1854,6 +1854,99 @@ EOF
     [[ "$(wc -l < "$TEST_TMPDIR/fallback.starts")" -eq 2 ]]
 }
 
+@test "watch recovery blocks interrupted children while ordinary build failures remain retryable" {
+    harness_create_config
+    _watch_configure_ntm
+    local check_json run_id code directory n=0
+    check_json=$(_watch_run_json | jq -c '.details.throttled[0] as $first |
+        .details.throttled = [range(0;7) as $n | $first +
+            {run_id:(12345 + $n),head_branch:("v1.2." + (3 + $n | tostring))}]')
+    # The child boundary supplies actual terminal statuses; source admission,
+    # attempt locks, immutable completion receipts and reconciliation are real.
+    cat > "$TEST_TMPDIR/interrupted-fallback" <<'EOF'
+#!/usr/bin/env bash
+case "$DSR_RUN_ID" in
+    watch-12345-*) exit 5 ;;
+    watch-12346-*) exit 129 ;;
+    watch-12347-*) exit 130 ;;
+    watch-12348-*) exit 131 ;;
+    watch-12349-*) exit 137 ;;
+    watch-12350-*) exit 143 ;;
+    watch-12351-*) exit 6 ;;
+    *) exit 99 ;;
+esac
+EOF
+    DSR_WATCH_FIXTURE_FALLBACK="$TEST_TMPDIR/interrupted-fallback" \
+        run _routing_watch "$check_json" --auto-fallback --retry-delay 1 --max-attempts 2 --max-concurrent 7
+    assert_equal "0" "$status"
+    for run_id in 12345 12346 12347 12348 12349 12350 12351; do
+        _watch_completed "$run_id"
+        directory=$(jq -r --arg id "$run_id" '.attempts[$id].attempt_id' "$DSR_STATE_DIR/triggered.json")
+        cp "$DSR_STATE_DIR/watch-attempts/$directory/completion.json" "$TEST_TMPDIR/completion-$run_id.json"
+    done
+    sleep 1
+    DSR_WATCH_FIXTURE_FALLBACK="$TEST_TMPDIR/interrupted-fallback" \
+        run _routing_watch "$check_json" --auto-fallback --retry-delay 1 --max-attempts 2 --max-concurrent 7
+    assert_equal "0" "$status"
+    _watch_completed 12351
+    run _routing_watch '{"details":{"throttled":[]}}' --retry-delay 1 --max-attempts 2 --max-concurrent 7
+    assert_equal "0" "$status"
+    for code in 5 129 130 131 137 143; do
+        run_id=$((12345 + n))
+        n=$((n + 1))
+        jq -e --arg id "$run_id" --argjson code "$code" '.attempts[$id] |
+            .status == "blocked" and .attempt == 1 and .exit_code == $code and
+            .next_retry_at == null and (.error | contains("interrupted")) and
+            .tool == "ntm" and .repo == "Dicklesworthstone/ntm" and
+            .head_sha == ("1" * 40) and .isolate_source == true' "$DSR_STATE_DIR/triggered.json"
+        directory=$(jq -r --arg id "$run_id" '.attempts[$id].attempt_id' "$DSR_STATE_DIR/triggered.json")
+        cmp "$TEST_TMPDIR/completion-$run_id.json" "$DSR_STATE_DIR/watch-attempts/$directory/completion.json"
+        [[ ! -e "$DSR_STATE_DIR/watch-artifacts/$run_id" ]]
+    done
+    jq -e '(.attempts | length) == 7 and (.attempts["12351"] |
+        .status == "failed" and .attempt == 2 and .exit_code == 6 and .next_retry_at > .finished_epoch)' \
+        "$DSR_STATE_DIR/triggered.json"
+    assert_equal 8 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+}
+
+@test "watch recovery preserves older interrupted failures without planning or upstream replay" {
+    harness_create_config
+    _watch_configure_ntm
+    local check_json directory
+    check_json=$(_watch_run_json)
+    DSR_WATCH_FIXTURE_STATUS=5 run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal "0" "$status"
+    _watch_completed
+    directory=$(jq -r '.attempts["12345"].attempt_id' "$DSR_STATE_DIR/triggered.json")
+    # Model the old classification around a genuine child completion, keeping
+    # its identity and receipt bytes. It is already past its retry deadline.
+    jq -s '.[0] as $state | .[1] as $receipt | $state |
+        .attempts["12345"] += {status:"failed",exit_code:$receipt.exit_code,
+            finished_epoch:$receipt.finished_epoch,next_retry_at:0}' \
+        "$DSR_STATE_DIR/triggered.json" "$DSR_STATE_DIR/watch-attempts/$directory/completion.json" \
+        > "$TEST_TMPDIR/legacy-interrupted.json"
+    cp "$TEST_TMPDIR/legacy-interrupted.json" "$DSR_STATE_DIR/triggered.json"
+    cp "$DSR_STATE_DIR/watch-attempts/$directory/completion.json" "$TEST_TMPDIR/legacy-completion.json"
+
+    run _routing_watch "$check_json" --auto-fallback --dry-run --retry-delay 1
+    assert_equal "0" "$status"
+    [[ "$output" != *"Would trigger"* ]]
+    cmp "$TEST_TMPDIR/legacy-interrupted.json" "$DSR_STATE_DIR/triggered.json"
+
+    run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal "0" "$status"
+    cmp "$TEST_TMPDIR/legacy-interrupted.json" "$DSR_STATE_DIR/triggered.json"
+
+    _mock_watch_upstream_run "$(_watch_upstream_run_json completed failure)"
+    run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --retry-delay 1
+    assert_equal "0" "$status"
+    [[ ! -e "$TEST_TMPDIR/watch-upstream.calls" ]]
+    cmp "$TEST_TMPDIR/legacy-interrupted.json" "$DSR_STATE_DIR/triggered.json"
+    cmp "$TEST_TMPDIR/legacy-completion.json" "$DSR_STATE_DIR/watch-attempts/$directory/completion.json"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    [[ ! -e "$DSR_STATE_DIR/watch-artifacts/12345" ]]
+}
+
 @test "watch terminal recovery resumes its exact checkpoint after upstream failure leaves the queue" {
     harness_create_config
     mkdir -p "$DSR_CONFIG_DIR/repos.d"

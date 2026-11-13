@@ -614,9 +614,15 @@ artifacts while retrying the remaining targets. Cancelled, mismatched, or
 ambiguous checkpoints block automatic recovery. When an earlier attempt failed
 before creating either a checkpoint or its output directory, the retry may start
 the same pinned build afresh. Successful runs are never
-replayed. Legacy timestamp-only history and workers lost without a completion
-receipt require manual recovery; their publication outcome cannot safely be
-inferred.
+replayed. A fallback's interrupted exit (`5`) or signal-termination status
+(`129`, `130`, `131`, `137`, or `143`) blocks automatic recovery, even when
+the interruption preceded checkpoint creation. New completions retain their
+original exit status and receipts as `blocked` with no retry deadline. Older
+journals that recorded those exits as `failed` also remain ineligible for
+automatic launch or dry-run planning, without rewriting their retained evidence.
+Ordinary build and network failures keep the bounded retry behavior above.
+Legacy timestamp-only history and workers lost without a completion receipt
+require manual recovery; their publication outcome cannot safely be inferred.
 
 Admission is bounded across the retained attempt journal, rather than separately
 for each poll. A running attempt occupies its slot until its inherited kernel
