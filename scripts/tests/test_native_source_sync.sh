@@ -7,6 +7,7 @@
 # Use --strict-mixed-protocol-only for mixed-platform receipt/selection controls;
 # this mode never claims a Darwin compiler or artifact execution.
 # Use --git-selection-only for genuine Git/rsync selection without a compiler.
+# Use --source-transport-only for bounded admission and actual rsync/tar stdin.
 # Use --ownership-only for actual rsync/tar/Git source ownership checks. Running
 # as root with a full UID map also covers UID 501 and a non-root SSH receiver.
 # Use --windows-source-links-only for real Git archives and PowerShell regular
@@ -42,6 +43,280 @@
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 ROOT="${DSR_TEST_ROOT:-$ROOT}"
+
+test_source_transport_admission() (
+    local dependency work
+    for dependency in bash python3 jq rsync tar base64 iconv ps; do
+        command -v "$dependency" >/dev/null 2>&1 || {
+            printf 'SKIP: source transport admission requires %s\n' "$dependency"
+            return 77
+        }
+    done
+    work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-source-transport.XXXXXXXX") || return 1
+    printf 'Source transport evidence: %s\n' "$work"
+    python3 -I - "${DSR_TEST_ACT_RUNNER:-$ROOT/src/act_runner.sh}" "$work" <<'PY'
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+module = Path(sys.argv[1]).resolve()
+work = Path(sys.argv[2]).resolve()
+bin_dir = work / 'bin'
+bin_dir.mkdir()
+source = work / 'source'
+source.mkdir()
+(source / 'payload.bin').write_bytes(bytes(range(256)) * 1024)
+(source / 'run.sh').write_text('#!/bin/sh\nprintf "source transport\\n"\n')
+(source / 'run.sh').chmod(0o755)
+checks, failures = 0, []
+
+
+def check(label, condition):
+    global checks
+    checks += 1
+    print(('PASS ' if condition else 'FAIL ') + label, flush=True)
+    if not condition:
+        failures.append(label)
+
+
+# SSH is the only service boundary. The actual supervisor owns this external
+# process and its TERM-resistant descendant. Unix receivers run real shell,
+# rsync and tar programs. Windows wrappers are decoded, not executed as CMD.
+ssh = bin_dir / 'ssh'
+ssh.write_text(r'''#!/usr/bin/env python3
+import base64, json, os, re, signal, subprocess, sys, time
+from pathlib import Path
+args = sys.argv[1:]
+original = list(args)
+null_input = False
+no_tty = False
+batch = False
+while args and args[0].startswith('-'):
+    option = args.pop(0)
+    if option in ('-o', '-p', '-l'):
+        value = args.pop(0)
+        if option == '-o' and value == 'BatchMode=yes':
+            batch = True
+    elif option == '-n':
+        null_input = True
+    elif option == '-T':
+        no_tty = True
+    elif option not in ('-q', '-t'):
+        raise SystemExit(97)
+if len(args) < 2 or args.pop(0) != 'fixture-builder':
+    raise SystemExit(97)
+command = ' '.join(args)
+decoded = command
+encoded = re.search(r'-EncodedCommand ([A-Za-z0-9+/=]+)', command)
+if encoded:
+    script = base64.b64decode(encoded.group(1)).decode('utf-16-le')
+    inner = re.search(r"FromBase64String\('([A-Za-z0-9+/=]+)'\)", script)
+    if not inner:
+        raise SystemExit(97)
+    decoded = base64.b64decode(inner.group(1)).decode('utf-8')
+if decoded.startswith('where rsync ') or command == 'command -v rsync >/dev/null 2>&1':
+    phase = 'probe'
+elif command.startswith('rsync '):
+    phase = 'rsync'
+elif 'tar --no-same-owner -xzf -' in command:
+    phase = 'tar'
+else:
+    phase = 'mkdir'
+case = Path(os.environ['DSR_SYNC_TEST_CASE'])
+if null_input:
+    descriptor = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(descriptor, 0)
+    os.close(descriptor)
+# OpenSSH can consume the sender's input even when the remote probe does not.
+received = sys.stdin.buffer.read() if phase in ('probe', 'mkdir') else b''
+with (case / 'ssh.jsonl').open('a') as stream:
+    stream.write(json.dumps({'phase': phase, 'argv': original, 'stdin_bytes': len(received),
+                             'no_tty': no_tty, 'batch': batch}) + '\n')
+if os.environ.get('DSR_SYNC_TEST_STALL') == phase:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    child = subprocess.Popen([sys.executable, '-c',
+        'import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(120)'])
+    (case / 'owned-pids.json').write_text(json.dumps([os.getpid(), child.pid]))
+    time.sleep(120)
+status = int(os.environ.get('DSR_SYNC_TEST_' + phase.upper() + '_STATUS', '0'))
+if status:
+    raise SystemExit(status)
+if phase == 'probe' or os.environ['DSR_SYNC_TEST_PLATFORM'] == 'windows':
+    raise SystemExit(0)
+os.execv('/bin/sh', ['/bin/sh', '-c', command])
+''')
+ssh.chmod(0o755)
+driver = work / 'driver.bash'
+driver.write_text(r'''#!/usr/bin/env bash
+set -uo pipefail
+source "$1" || exit $?
+shift
+_act_is_local_host() { return 1; }
+_act_is_windows_host() { [[ "$DSR_SYNC_TEST_PLATFORM" == windows ]]; }
+_act_get_ssh_destination() { printf '%s\n' fixture-builder; }
+status=0
+case "$1" in
+    mkdir) _act_remote_mkdir receiver "$2" || status=$? ;;
+    probe) _act_has_rsync receiver || status=$? ;;
+    sync) _act_sync_source receiver "$2" "$3" --no-gitignore-excludes || status=$? ;;
+    *) exit 4 ;;
+esac
+remaining=''
+IFS= read -r remaining || true
+printf 'remaining:%s\n' "$remaining"
+exit "$status"
+''')
+
+
+def alive(pid):
+    result = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)],
+                            capture_output=True, text=True, timeout=3)
+    state = result.stdout.strip()
+    return bool(state) and not state.startswith('Z')
+
+
+def run(label, action, platform='unix', **settings):
+    case = work / label
+    case.mkdir()
+    target = case / 'destination'
+    environment = dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ['PATH'],
+                       DSR_CONFIG_DIR=str(case / 'config'), DSR_HOSTS_FILE=str(case / 'no-hosts.yaml'),
+                       DSR_STATE_DIR=str(case / 'state'), DSR_CACHE_DIR=str(case / 'cache'),
+                       DSR_SYNC_TIMEOUT='1', DSR_SYNC_TEST_CASE=str(case),
+                       DSR_SYNC_TEST_PLATFORM=platform, DSR_SYNC_TEST_STALL='',
+                       DSR_SYNC_TEST_PROBE_STATUS='0', DSR_SYNC_TEST_MKDIR_STATUS='0',
+                       DSR_SYNC_TEST_RSYNC_STATUS='0', DSR_SYNC_TEST_TAR_STATUS='0',
+                       NO_COLOR='1')
+    environment.update(settings)
+    remote = 'C:/dsr-fixture/source' if platform == 'windows' else str(target)
+    arguments = [str(source), remote] if action == 'sync' else [remote]
+    process = subprocess.Popen(['bash', str(driver), str(module), action, *arguments],
+                               env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, start_new_session=True)
+    started = time.monotonic()
+    timed_out = False
+    try:
+        stdout, stderr = process.communicate(b'caller-source-record\n', timeout=15)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        stdout = stderr = b''
+    pids_path = case / 'owned-pids.json'
+    pids = json.loads(pids_path.read_text()) if pids_path.exists() else []
+    live = [pid for pid in pids if alive(pid)]
+    # Record failed ownership before the independent failsafe cleans up only
+    # this fixture's known groups. Cleanup cannot turn a failed check green.
+    if timed_out or live:
+        groups = {process.pid}
+        for pid in pids:
+            try:
+                groups.add(os.getpgid(pid))
+            except ProcessLookupError:
+                pass
+        for group in groups:
+            if group != os.getpgrp():
+                try:
+                    os.killpg(group, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        stdout, stderr = process.communicate(timeout=5)
+    elapsed = time.monotonic() - started
+    (case / 'stdout').write_bytes(stdout)
+    (case / 'stderr').write_bytes(stderr)
+    events_path = case / 'ssh.jsonl'
+    events = [json.loads(line) for line in events_path.read_text().splitlines()] if events_path.exists() else []
+    return {'status': process.returncode, 'timed_out': timed_out, 'elapsed': elapsed,
+            'live': live, 'pids': pids, 'events': events, 'stdout': stdout, 'target': target}
+
+
+print('BOUNDARY: local SSH service adapter; real supervisor/processes and Unix rsync/tar; no native Windows claim', flush=True)
+for platform in ('unix', 'windows'):
+    result = run(platform + '-mkdir', 'mkdir', platform)
+    check(platform + ' directory admission succeeds', result['status'] == 0 and not result['timed_out'])
+    check(platform + ' directory admission preserves caller stdin',
+          result['stdout'] == b'remaining:caller-source-record\n')
+    check(platform + ' directory admission sends no input to SSH',
+          len(result['events']) == 1 and result['events'][0]['stdin_bytes'] == 0)
+    result = run(platform + '-mkdir-refused', 'mkdir', platform, DSR_SYNC_TEST_MKDIR_STATUS='19')
+    check(platform + ' directory refusal retains status and caller stdin',
+          result['status'] == 19 and result['stdout'] == b'remaining:caller-source-record\n')
+    result = run(platform + '-probe', 'probe', platform)
+    check(platform + ' rsync probe succeeds without draining caller stdin',
+          result['status'] == 0 and result['stdout'] == b'remaining:caller-source-record\n' and
+          len(result['events']) == 1 and result['events'][0]['stdin_bytes'] == 0)
+    result = run(platform + '-invalid-bound', 'mkdir', platform, DSR_SYNC_TIMEOUT='0')
+    check(platform + ' invalid admission deadline refuses before SSH',
+          result['status'] == 4 and not result['events'] and
+          result['stdout'] == b'remaining:caller-source-record\n')
+    for status in (124, 130, 143, 255):
+        result = run(platform + '-probe-refused-' + str(status), 'sync', platform,
+                     DSR_SYNC_TEST_PROBE_STATUS=str(status))
+        check(platform + ' source sync retains rsync probe status ' + str(status),
+              result['status'] == status and not result['timed_out'])
+        check(platform + ' refused probe ' + str(status) + ' starts no directory or payload work',
+              [event['phase'] for event in result['events']] == ['probe'] and
+              not result['target'].exists())
+        check(platform + ' refused probe ' + str(status) + ' preserves caller stdin',
+              result['stdout'] == b'remaining:caller-source-record\n')
+
+# Both actual Windows source-sync branches call the previously unbounded
+# directory helper. Each must stop before rsync/tar transfer can begin.
+for label, action, platform, probe_status in (
+        ('unix-direct-stall', 'mkdir', 'unix', '0'),
+        ('windows-rsync-stall', 'sync', 'windows', '0'),
+        ('windows-tar-stall', 'sync', 'windows', '1')):
+    result = run(label, action, platform, DSR_SYNC_TEST_STALL='mkdir',
+                 DSR_SYNC_TEST_PROBE_STATUS=probe_status)
+    check(label + ' reaches the real external process and resistant child', len(result['pids']) == 2)
+    check(label + ' respects the owned one-second deadline and kill grace',
+          not result['timed_out'] and result['status'] in (124, 137) and result['elapsed'] < 13)
+    check(label + ' drains descendants before returning', not result['timed_out'] and not result['live'])
+    check(label + ' admits no payload after directory timeout',
+          [event['phase'] for event in result['events']] ==
+          (['mkdir'] if action == 'mkdir' else ['probe', 'mkdir']))
+    check(label + ' preserves caller stdin through timeout',
+          result['stdout'] == b'remaining:caller-source-record\n')
+
+# Real source bytes must still reach both transfer mechanisms. Closing payload
+# stdin as though it were an admission probe breaks these positive controls.
+for method, probe_status in (('rsync', '0'), ('tar', '1')):
+    result = run('unix-transfer-' + method, 'sync', DSR_SYNC_TEST_PROBE_STATUS=probe_status,
+                 DSR_SYNC_TIMEOUT='10')
+    check(method + ' source transfer succeeds without consuming caller stdin',
+          result['status'] == 0 and not result['timed_out'] and
+          result['stdout'] == b'remaining:caller-source-record\n')
+    target = result['target']
+    check(method + ' transfers the complete binary payload through stdin',
+          (target / 'payload.bin').is_file() and
+          (target / 'payload.bin').read_bytes() == (source / 'payload.bin').read_bytes())
+    check(method + ' preserves executable source bytes and mode',
+          (target / 'run.sh').is_file() and
+          (target / 'run.sh').read_bytes() == (source / 'run.sh').read_bytes() and
+          (target / 'run.sh').stat().st_mode & 0o777 == 0o755)
+    check(method + ' uses the admitted transport only',
+          [event['phase'] for event in result['events']] ==
+          (['probe', 'mkdir', 'rsync'] if method == 'rsync' else ['probe', 'tar']))
+
+for status in (130, 143, 255):
+    result = run('unix-tar-refused-' + str(status), 'sync', DSR_SYNC_TEST_PROBE_STATUS='1',
+                 DSR_SYNC_TEST_TAR_STATUS=str(status))
+    check('tar receiver status ' + str(status) + ' is not flattened into another failure',
+          result['status'] == status and not result['timed_out'])
+    check('tar receiver refusal ' + str(status) + ' preserves caller stdin and source custody',
+          result['stdout'] == b'remaining:caller-source-record\n' and not result['target'].exists())
+
+events = [json.loads(line) for path in work.glob('*/ssh.jsonl') for line in path.read_text().splitlines()]
+check('every admission and payload SSH connection is noninteractive with no terminal',
+      bool(events) and all(event['batch'] and event['no_tty'] for event in events))
+print('Source transport admission: %d passed, %d failed (%d checks)' %
+      (checks - len(failures), len(failures), checks), flush=True)
+(work / 'results.json').write_text(json.dumps({'checks': checks, 'failures': failures}, indent=2) + '\n')
+raise SystemExit(bool(failures))
+PY
+)
 
 test_rust_selector_values() (
     local dependency work config sha literal environment actual run_id result status checks=0 failures=0
@@ -3883,6 +4158,10 @@ IGNORE
     [[ "$selection_failures" -eq 0 ]]
 )
 
+if [[ "${1:-}" == --source-transport-only ]]; then
+    test_source_transport_admission
+    exit $?
+fi
 if [[ "${1:-}" == --rust-selector-values-only ]]; then
     test_rust_selector_values
     exit $?
@@ -3986,6 +4265,9 @@ if [[ "${1:-}" == --ownership-only ]]; then
     exit $?
 fi
 if [[ $# -eq 0 ]]; then
+    source_transport_status=0
+    test_source_transport_admission || source_transport_status=$?
+    [[ "$source_transport_status" == 0 || "$source_transport_status" == 77 ]] || exit "$source_transport_status"
     ordinary_input_status=0
     test_ordinary_source_inputs || ordinary_input_status=$?
     [[ "$ordinary_input_status" == 0 || "$ordinary_input_status" == 77 ]] || exit "$ordinary_input_status"

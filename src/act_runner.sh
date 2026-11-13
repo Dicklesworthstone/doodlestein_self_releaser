@@ -5326,24 +5326,28 @@ _act_windows_rsync_host_path() {
 # local-host and tar-fallback sync paths already `mkdir -p`; this gives the
 # remote-rsync path the same guarantee.
 # Usage: _act_remote_mkdir <host> <remote_path>
-# Returns: 0 on success, 1 on failure
+# Returns: 0 on success, nonzero command or preparation status on failure
 _act_remote_mkdir() {
     local host="$1"
     local remote_path="$2"
-    local ssh_destination
+    local ssh_destination command
     ssh_destination=$(_act_get_ssh_destination "$host") || return 1
-    local ssh_opts=(-o "ConnectTimeout=$_ACT_SSH_TIMEOUT" -o StrictHostKeyChecking=accept-new)
 
     if _act_is_windows_host "$host"; then
         # cmd.exe: `mkdir` creates intermediate dirs; guard with `if not exist`.
         local win_path
-        win_path=$(_act_windows_cmd_path "$remote_path")
-        ssh "${ssh_opts[@]}" "$ssh_destination" \
-            "$(_act_windows_cmd_via_powershell "if not exist \"$win_path\" mkdir \"$win_path\"")" >/dev/null 2>&1
+        win_path=$(_act_windows_cmd_path "$remote_path") || return 4
+        command=$(_act_windows_cmd_via_powershell "if not exist \"$win_path\" mkdir \"$win_path\"") || return $?
     else
-        ssh "${ssh_opts[@]}" "$ssh_destination" \
-            "mkdir -p '${remote_path//\'/\'\\\'\'}'" >/dev/null 2>&1
+        command="mkdir -p '${remote_path//\'/\'\\\'\'}'"
     fi
+
+    # Directory admission is part of source synchronization: connecting is not
+    # a completion deadline, and SSH must not drain the caller's source list.
+    _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh -T -n \
+        -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
+        -o StrictHostKeyChecking=accept-new \
+        "$ssh_destination" "$command" </dev/null >/dev/null 2>&1
 }
 
 _act_has_rsync() {
@@ -5355,13 +5359,13 @@ _act_has_rsync() {
     fi
 
     if _act_is_local_host "$host"; then
-        _act_run_with_timeout 10 bash -lc "$probe_cmd" 2>/dev/null
+        _act_run_with_timeout 10 bash -lc "$probe_cmd" </dev/null 2>/dev/null
     else
         ssh_destination=$(_act_get_ssh_destination "$host") || return 4
-        _act_run_with_timeout 10 ssh -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
+        _act_run_with_timeout 10 ssh -T -n -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
             -o BatchMode=yes \
             -o StrictHostKeyChecking=accept-new \
-            "$ssh_destination" "$probe_cmd" 2>/dev/null
+            "$ssh_destination" "$probe_cmd" </dev/null 2>/dev/null
     fi
 }
 
@@ -5579,17 +5583,24 @@ _act_sync_source() (
         fi
 
         _act_log_sync_failure "local rsync" "$sync_cmd_status" "$sync_cmd_output"
-        return 1
+        return "$sync_cmd_status"
     fi
 
     local ssh_destination
     ssh_destination=$(_act_get_ssh_destination "$host") || return 4
 
-    # Check for rsync on remote
-    if _act_has_rsync "$host"; then
+    # Only the missing-executable status authorizes another transfer method.
+    # A cancelled, timed-out or unreadable probe must not start fresh work.
+    local rsync_probe_status=0 source_prepare_status=0
+    _act_has_rsync "$host" || rsync_probe_status=$?
+    if [[ "$rsync_probe_status" -ne 0 && "$rsync_probe_status" -ne 1 ]]; then
+        _log_error "Cannot determine rsync availability on $host (exit $rsync_probe_status); refusing source sync"
+        return "$rsync_probe_status"
+    fi
+    if [[ "$rsync_probe_status" -eq 0 ]]; then
         local rsync_remote_path="$remote_path"
         local -a rsync_io_opts=()
-        local rsync_transport="ssh -o ConnectTimeout=$_ACT_SSH_TIMEOUT -o StrictHostKeyChecking=accept-new"
+        local rsync_transport="ssh -T -o ConnectTimeout=$_ACT_SSH_TIMEOUT -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
         if _act_is_windows_host "$host"; then
             # Resolve the receiver's configured mount convention before
             # creating directories or transferring any source bytes.
@@ -5607,18 +5618,25 @@ _act_sync_source() (
         # tar-fallback branches). Without this, a missing per-version parent dir
         # makes the whole sync fail with "No such file or directory".
         if _act_is_windows_host "$host"; then
-            if ! _act_remote_mkdir "$host" "$remote_path"; then
-                _log_error "failed to create remote directory $remote_path on $host"
-                return 1
+            if _act_remote_mkdir "$host" "$remote_path"; then
+                :
+            else
+                source_prepare_status=$?
+                _log_error "failed to create remote directory $remote_path on $host (exit $source_prepare_status)"
+                return "$source_prepare_status"
             fi
         else
             local prepare_command
             prepare_command=$(_act_source_sync_prepare_sh "$remote_path") || return 4
-            if ! _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh -n \
-                -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o StrictHostKeyChecking=accept-new \
-                "$ssh_destination" "$prepare_command"; then
-                _log_error "failed to prepare owned source directory $remote_path on $host"
-                return 1
+            if _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh -T -n \
+                -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
+                -o StrictHostKeyChecking=accept-new \
+                "$ssh_destination" "$prepare_command" </dev/null; then
+                :
+            else
+                source_prepare_status=$?
+                _log_error "failed to prepare owned source directory $remote_path on $host (exit $source_prepare_status)"
+                return "$source_prepare_status"
             fi
         fi
 
@@ -5650,7 +5668,7 @@ _act_sync_source() (
             return 0
         else
             _act_log_sync_failure "rsync to $host" "$sync_cmd_status" "$sync_cmd_output"
-            return 1
+            return "$sync_cmd_status"
         fi
     else
         # Fallback: tar + ssh + untar (works everywhere)
@@ -5676,9 +5694,12 @@ _act_sync_source() (
                 _log_error "tar fallback requires a metacharacter-free Windows path: $remote_path"
                 return 4
             fi
-            if ! _act_remote_mkdir "$host" "$remote_path"; then
-                _log_error "failed to create remote directory $remote_path on $host"
-                return 1
+            if _act_remote_mkdir "$host" "$remote_path"; then
+                :
+            else
+                source_prepare_status=$?
+                _log_error "failed to create remote directory $remote_path on $host (exit $source_prepare_status)"
+                return "$source_prepare_status"
             fi
             # Invoke bsdtar directly. Wrapping this in `cmd /c` can detach the
             # extractor from OpenSSH's stdin when the destination already
@@ -5706,8 +5727,8 @@ _act_sync_source() (
                             COPYFILE_DISABLE=1 tar czf - "${tar_excludes[@]}" .
                     fi
                 } |
-                    _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh \
-                        -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
+                    _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh -T \
+                        -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
                         -o StrictHostKeyChecking=accept-new \
                         "$ssh_destination" "$remote_extract_cmd"
             } 2>&1
@@ -5719,7 +5740,7 @@ _act_sync_source() (
             return 0
         else
             _act_log_sync_failure "tar fallback sync to $host" "$sync_cmd_status" "$sync_cmd_output"
-            return 1
+            return "$sync_cmd_status"
         fi
     fi
 )

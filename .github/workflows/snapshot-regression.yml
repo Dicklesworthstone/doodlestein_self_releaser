@@ -62,6 +62,11 @@ jobs:
           set -euo pipefail
           bash -n scripts/tests/test_native_source_sync.sh
           bash scripts/tests/test_native_source_sync.sh --ownership-only
+      - name: Verify source transport deadlines and payload streams
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/tests/test_native_source_sync.sh --source-transport-only
       # The transport adapter runs a real rsync receiver and tar extractor.
       # A real root process is needed to exercise foreign controller UIDs and
       # mismatched repository ownership, without changing Git's trust policy.
