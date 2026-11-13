@@ -2956,9 +2956,105 @@ test_dispatch_fails_on_error_response() (
 # Main Test Runner
 # ============================================================================
 
+test_publication_authentication_consumers() {
+  python3 - "$SRC_DIR/.." "$TEMP_DIR" "$GITHUB_MODULE" <<'PY'
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+root, work, module = map(lambda value: Path(value).resolve(), sys.argv[1:])
+source = Path(os.environ.get('DSR_TEST_COMMAND_FILE', str(root / 'dsr'))).read_text()
+names = ('_release_finalize_execute', 'cmd_release_source_only',
+         'cmd_release_verify', 'cmd_repos_sync')
+commands = work / 'commands.sh'
+commands.write_text('\n'.join(re.search(r'^' + name + r'\(\) \{\n.*?^\}',
+                                      source, re.M | re.S).group(0) for name in names))
+subprocess.run(['bash', '-n', str(commands)], check=True)
+bin_dir = work / 'bin'
+bin_dir.mkdir()
+(bin_dir / 'gh').write_text('#!' + sys.executable + '\n' + r'''
+import json, os, sys
+from pathlib import Path
+with Path(os.environ['AUTH_CALLS']).open('a') as out:
+    out.write(json.dumps(sys.argv[1:]) + '\n')
+assert sys.argv[1:] == ['auth', 'status', '--hostname', 'github.com']
+sys.exit(int(os.environ['AUTH_STATUS']))
+''')
+(bin_dir / 'gh').chmod(0o700)
+
+# Only the external credential command is replaced. Each production consumer
+# uses the real bounded GitHub adapter and selected-token policy. Unrelated
+# lazy modules are unnecessary: these failures must stop before their work.
+driver = r'''
+set -uo pipefail
+source "$AUTH_MODULE"
+source "$AUTH_COMMANDS"
+source "$AUTH_ROOT/src/release_formulas.sh"
+_dsr_require() { :; }
+log_info() { printf '%s\n' "$*" >&2; }
+log_error() { log_info "$@"; }
+JSON_MODE=false
+DRY_RUN=false
+case "$1" in
+  finalize) _release_finalize_execute app 1.2.3 --create-response "$AUTH_CASE/dsr-api-response.ABCDEF12" --no-dispatch ;;
+  source) cmd_release_source_only app 1.2.3 --notes-file "$AUTH_CASE/notes.md" --no-dispatch ;;
+  repair) cmd_release_verify app 1.2.3 --fix ;;
+  formulas) cmd_release_formulas app 1.2.3 --skip-homebrew --push ;;
+  repos) cmd_repos_sync ;;
+esac
+'''
+passed = 0
+for consumer in ('finalize', 'source', 'repair', 'formulas', 'repos'):
+    for label, raw_status, deadline, expected in (
+            ('cancel', 2, '10', 5), ('signal', 130, '10', 5),
+            ('auth-refusal', 4, '10', 3), ('deadline', 124, '10', 8),
+            ('invalid-deadline', 0, '0', 4)):
+        case = work / (consumer + '-' + label)
+        case.mkdir()
+        notes = case / 'notes.md'
+        notes.write_text('Reviewed source-only notes.\n')
+        registry = case / 'repos.yaml'
+        registry.write_text('tools: {}\n')
+        calls = case / 'auth.jsonl'
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith('BASH_FUNC_') and key not in ('BASH_ENV', 'ENV')}
+        env.update(PATH=str(bin_dir) + os.pathsep + env['PATH'],
+                   AUTH_MODULE=str(module), AUTH_COMMANDS=str(commands), AUTH_ROOT=str(root),
+                   AUTH_CASE=str(case), AUTH_CALLS=str(calls), AUTH_STATUS=str(raw_status),
+                   DSR_STATE_DIR=str(case / 'state'), DSR_CACHE_DIR=str(case / 'cache'),
+                   DSR_CONFIG_DIR=str(case), DSR_REPOS_FILE=str(registry),
+                   DSR_GH_TOKEN='selected-fixture-token', GITHUB_TOKEN='', GH_TOKEN='',
+                   GH_API_TIMEOUT=deadline, NO_COLOR='1')
+        result = subprocess.run(['bash', '-c', driver, '_', consumer], env=env,
+                                capture_output=True, text=True, timeout=20)
+        (case / 'stdout').write_text(result.stdout)
+        (case / 'stderr').write_text(result.stderr)
+        observed = [json.loads(line) for line in calls.read_text().splitlines()] if calls.exists() else []
+        expected_calls = [] if label == 'invalid-deadline' else [['auth', 'status', '--hostname', 'github.com']]
+        assert result.returncode == expected, (consumer, label, result.returncode, result.stderr)
+        assert observed == expected_calls, (consumer, label, observed)
+        assert not (case / 'state').exists() and not (case / 'cache').exists(), (consumer, label, 'state created')
+        assert registry.read_text() == 'tools: {}\n' and notes.read_text() == 'Reviewed source-only notes.\n'
+        assert 'selected-fixture-token' not in result.stdout + result.stderr
+        passed += 1
+        print('PASS: %s %s refuses before publication/configuration mutation' % (consumer, label), flush=True)
+print('Publication authentication consumers: %d passed' % passed, flush=True)
+PY
+}
+
 main() {
   echo "=== github.sh Tests ==="
   echo ""
+
+  if [[ "${1:-}" == --publication-auth-only ]]; then
+    run_test "publication_authentication_consumers" test_publication_authentication_consumers
+    printf 'Publication authentication: %s passed, %s failed\n' "$TESTS_PASSED" "$TESTS_FAILED"
+    [[ "$TESTS_FAILED" -eq 0 ]]
+    exit $?
+  fi
 
   if [[ "${1:-}" == --cache-identity-only ]]; then
     run_cache_identity_regressions
@@ -3244,6 +3340,7 @@ UPLOAD_SCENARIOS
 
   echo ""
   echo "Dispatch Helpers:"
+  run_test "publication_authentication_consumers" test_publication_authentication_consumers
   run_test "resolve_tag_sha_rejects_missing_args" test_resolve_tag_sha_rejects_missing_args
   run_test "resolve_tag_sha_commit" test_resolve_tag_sha_commit
   run_test "resolve_tag_sha_annotated" test_resolve_tag_sha_annotated

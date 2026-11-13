@@ -4,7 +4,7 @@
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-source "$PROJECT_ROOT/src/github.sh"
+source "${DSR_TEST_GITHUB_MODULE:-$PROJECT_ROOT/src/github.sh}"
 source "$PROJECT_ROOT/src/config.sh"
 source "$PROJECT_ROOT/src/artifact_naming.sh"
 # cmd_release uses the runner's retained native inventory admission. Keep
@@ -420,6 +420,155 @@ run_test() {
     else
         FAIL=$((FAIL+1)); printf 'FAIL: %s\n' "$name"
     fi
+}
+
+# Exercise the real credential resolution and owned deadline, with only the
+# external gh executable replaced. The existing GitHub transport fixture stays
+# in place so a bad admission decision exposes CREATE/upload/PUBLISH calls.
+release_auth_setup() {
+    local phase="$1"
+    setup "release_auth_$phase" || return 1
+    # The ordinary recovery cases replace these functions with always-success
+    # fixtures. Restore their complete production implementations for admission.
+    # shellcheck source=/dev/null
+    source <(awk '/^(gh_check|gh_check_token|gh_require_auth|_gh_resolve_token|_gh_check_cli_auth)\(\) \{/{copy=1}
+        copy{print} copy && /^\}/{copy=0}' "${DSR_TEST_GITHUB_MODULE:-$PROJECT_ROOT/src/github.sh}") || return 1
+    mkdir "$CASE/auth-bin" || return 1
+    cat > "$CASE/auth-bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -uo pipefail
+printf '%s\n' "$*" >> "$DSR_RELEASE_AUTH_CASE/auth-calls"
+case "$*" in
+    'auth token --hostname github.com')
+        case "$DSR_RELEASE_AUTH_PHASE" in
+            token-cancel-*) exit "${DSR_RELEASE_AUTH_PHASE##*-}" ;;
+            token-timeout) command sleep 10; exit 0 ;;
+            missing-token) exit 1 ;;
+            fallback-cancel|fallback-timeout)
+                if [[ -f "$DSR_RELEASE_AUTH_CASE/token-served" ]]; then
+                    [[ "$DSR_RELEASE_AUTH_PHASE" != fallback-cancel ]] || exit 130
+                    command sleep 10
+                    exit 0
+                fi
+                : > "$DSR_RELEASE_AUTH_CASE/token-served"
+                ;;
+        esac
+        printf 'release-fixture-token\n'
+        ;;
+    'auth status --hostname github.com')
+        [[ "${GH_HOST:-}" == github.com && "${GH_TOKEN:-}" == release-fixture-token ]] || exit 9
+        case "$DSR_RELEASE_AUTH_PHASE" in
+            auth-cancel-*) exit "${DSR_RELEASE_AUTH_PHASE##*-}" ;;
+            auth-timeout) command sleep 10 ;;
+            auth-required) exit 4 ;;
+            fallback|fallback-cancel|fallback-timeout) exit 1 ;;
+            healthy) exit 0 ;;
+            *) exit 9 ;;
+        esac
+        ;;
+    *) exit 9 ;;
+esac
+SH
+    chmod 700 "$CASE/auth-bin/gh" || return 1
+    : > "$CASE/auth-calls"
+    export DSR_RELEASE_AUTH_PHASE="$phase" DSR_RELEASE_AUTH_CASE="$CASE"
+    export PATH="$CASE/auth-bin:$PATH" GH_API_TIMEOUT=10
+    # Real stored-token lookup makes forbidden fallback visible as a second
+    # credential request, while never reading the operator's real credentials.
+    export DSR_GH_TOKEN='' GITHUB_TOKEN='' GH_TOKEN=''
+    export DSR_DISPATCH_ENABLED=false
+    CREATE_FAIL=false
+    cp "$CASE/artifacts/payload.bin" "$CASE/payload.before" || return 1
+}
+
+release_auth_refused() {
+    local expected="$1"
+    [[ "$STATUS" -eq "$expected" && ! -s "$CALLS" &&
+       ! -e "$DSR_STATE_DIR/builds" && ! -e "$CASE/create-request.json" &&
+       ! -e "$CASE/artifacts/SHA256SUMS" ]] || return 1
+    cmp -s "$CASE/payload.before" "$CASE/artifacts/payload.bin" || return 1
+    [[ -z "$(find "$DSR_STATE_DIR/releases" -mindepth 1 -print -quit)" ]] || return 1
+    jq -es --argjson expected "$expected" '
+        length == 1 and (.[0] | .command == "release" and .status == "error" and
+            .exit_code == $expected and .details.stage == "authentication" and
+            .details.repo == "" and .details.version == "1.2.3" and .details.tag == "" and
+            (.details.error | type == "string" and length > 0))
+    ' "$CASE/stdout" >/dev/null
+}
+
+test_release_auth_cancellation_never_falls_back_or_publishes() {
+    local phase status
+    for phase in auth-cancel token-cancel; do
+        for status in 2 129 130 131 143; do
+            release_auth_setup "$phase-$status" || return 1
+            run_release
+            release_auth_refused 5 || return 1
+            [[ $(grep -c '^auth token ' "$CASE/auth-calls") -eq 1 ]] || return 1
+            if [[ "$phase" == auth-cancel ]]; then
+                [[ $(grep -c '^auth status ' "$CASE/auth-calls") -eq 1 ]] || return 1
+            else
+                ! grep -q '^auth status ' "$CASE/auth-calls" || return 1
+            fi
+            printf '  preserved %s cancellation %s before release state\n' "$phase" "$status"
+        done
+    done
+}
+
+test_release_auth_token_fallback_preserves_cancellation() {
+    release_auth_setup fallback-cancel || return 1
+    run_release
+    release_auth_refused 5 && [[ $(grep -c '^auth token ' "$CASE/auth-calls") -eq 2 ]]
+}
+
+test_release_auth_deadlines_never_publish() {
+    local phase tokens
+    for phase in auth-timeout token-timeout fallback-timeout; do
+        release_auth_setup "$phase" || return 1
+        GH_API_TIMEOUT=1
+        run_release
+        release_auth_refused 8 || return 1
+        tokens=1
+        [[ "$phase" != fallback-timeout ]] || tokens=2
+        [[ $(grep -c '^auth token ' "$CASE/auth-calls") -eq "$tokens" ]] || return 1
+        printf '  bounded %s before release state\n' "$phase"
+    done
+}
+
+test_release_auth_invalid_deadline_never_launches_credentials() {
+    local deadline
+    for deadline in 0 -1 1.5 invalid 1000000; do
+        release_auth_setup "invalid-deadline-$deadline" || return 1
+        GH_API_TIMEOUT="$deadline"
+        run_release
+        release_auth_refused 4 && [[ ! -s "$CASE/auth-calls" ]] || return 1
+    done
+}
+
+test_release_auth_refusal_never_tries_another_transport() {
+    local phase
+    for phase in auth-required missing-token; do
+        release_auth_setup "$phase" || return 1
+        run_release
+        release_auth_refused 3 && [[ $(grep -c '^auth token ' "$CASE/auth-calls") -eq 1 ]] || return 1
+    done
+}
+
+test_release_auth_healthy_and_token_fallback_still_publish() {
+    local phase tokens
+    for phase in healthy fallback; do
+        release_auth_setup "$phase" || return 1
+        run_release
+        [[ "$STATUS" -eq 0 ]] && grep -q '^CREATE ' "$CALLS" &&
+            grep -Fxq 'POST payload.bin' "$CALLS" && grep -Fxq PUBLISH "$CALLS" || return 1
+        jq -es 'length == 1 and (.[0] | .status == "success" and .exit_code == 0 and
+            .details.verification == "ok" and .details.draft == false)' "$CASE/stdout" >/dev/null || return 1
+        # The upload fixture uses the real named-upload adapter, which
+        # independently resolves the stored token once more before POST.
+        tokens=2
+        [[ "$phase" != fallback ]] || tokens=3
+        [[ $(grep -c '^auth token ' "$CASE/auth-calls") -eq "$tokens" ]] || return 1
+        printf '  preserved successful %s publication\n' "$phase"
+    done
 }
 
 # Keep the output old without regenerating checksum files during publication.
@@ -3259,7 +3408,12 @@ test_sbom_missing_aggregate_blocks_publication() {
         jq -e '.draft==true' "$CASE/release.json" >/dev/null
 }
 
-for test in test_release_keeps_artifacts_during_publication \
+for test in test_release_auth_cancellation_never_falls_back_or_publishes \
+    test_release_auth_token_fallback_preserves_cancellation test_release_auth_deadlines_never_publish \
+    test_release_auth_invalid_deadline_never_launches_credentials \
+    test_release_auth_refusal_never_tries_another_transport \
+    test_release_auth_healthy_and_token_fallback_still_publish \
+    test_release_keeps_artifacts_during_publication \
     test_release_refuses_busy_canonical_custody test_release_refuses_busy_bare_custody \
     test_release_refuses_inherited_worker_custody test_release_caller_flag_cannot_bypass_custody \
     test_release_borrows_fallback_custody_without_releasing_it \

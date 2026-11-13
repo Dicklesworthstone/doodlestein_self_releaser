@@ -451,8 +451,11 @@ HELP
     if ! $skip_homebrew && ! command -v ruby >/dev/null; then
         _formulas_error 3 "Ruby is required to safely parse Homebrew formulas"; return 3
     fi
-    if ! gh_check 2>/dev/null && ! gh_check_token 2>/dev/null; then
-        _formulas_error 3 "GitHub authentication required"; return 3
+    local authentication_status=0
+    gh_require_auth || authentication_status=$?
+    if ((authentication_status != 0)); then
+        _formulas_error "$authentication_status" "GitHub authentication did not complete"
+        return "$authentication_status"
     fi
     act_load_repo_config "$tool_name" >/dev/null || { _formulas_error 4 "Tool not found: $tool_name"; return 4; }
     local repo tag release release_id source_sha config_file

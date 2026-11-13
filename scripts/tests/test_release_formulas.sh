@@ -6,6 +6,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+source "$PROJECT_ROOT/src/github.sh"
 source "$PROJECT_ROOT/src/release_formulas.sh"
 
 ROOT=$(mktemp -d "${TMPDIR:-/tmp}/dsr-formulas-tests.XXXXXXXX") || exit 1

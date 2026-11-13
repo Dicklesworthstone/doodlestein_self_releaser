@@ -8056,7 +8056,7 @@ EOF
         log_error "release finalize requires --no-dispatch (finalization never dispatches)"
         return 4
     fi
-    gh_check || gh_check_token || return 3
+    gh_require_auth || return $?
     local repo path tag contract config config_sha config_json registry registry_sha registry_json
     config="$ACT_REPOS_DIR/$tool.yaml"
     if [[ ! -f "$config" || -L "$config" ||
@@ -8497,7 +8497,7 @@ EOF
     _dsr_require github
     _dsr_require git_ops
     _dsr_require act_runner
-    if ! gh_check 2>/dev/null && ! gh_check_token 2>/dev/null; then return 3; fi
+    gh_require_auth 2>/dev/null || return $?
     local config_file="$ACT_REPOS_DIR/$tool.yaml" config="" config_sha=""
     [[ -f "$config_file" && ! -L "$config_file" ]] || return 4
     config_sha=$(_gh_asset_sha256 "$config_file") || return 4
@@ -9019,16 +9019,24 @@ EOF
     sbom_enabled=$(jq -r '.enabled' <<< "$sbom_policy") || return 4
     sbom_format=$(jq -r '.format // empty' <<< "$sbom_policy") || return 4
 
-    # Check GitHub authentication
-    if ! gh_check 2>/dev/null; then
-        if ! gh_check_token 2>/dev/null; then
-            log_error "GitHub authentication required"
-            log_info "Run: gh auth login"
-            if $JSON_MODE; then
-                json_envelope "release" "error" 3 '{"error": "GitHub authentication required"}'
-            fi
-            return 3
+    # Credential cancellation and deadlines are terminal before artifact
+    # custody, checksums, draft creation, or publication can change any state.
+    local authentication_status=0 authentication_error="GitHub authentication required"
+    gh_require_auth 2>/dev/null || authentication_status=$?
+    if ((authentication_status != 0)); then
+        case "$authentication_status" in
+            4) authentication_error="Invalid GH_API_TIMEOUT" ;;
+            5) authentication_error="GitHub authentication was interrupted" ;;
+            8) authentication_error="GitHub authentication could not complete within its deadline" ;;
+        esac
+        log_error "$authentication_error"
+        [[ "$authentication_status" != 3 ]] || log_info "Run: gh auth login"
+        if $JSON_MODE; then
+            json_envelope release error "$authentication_status" \
+                "$(jq -nc --arg tool "$tool_name" --arg version "$version" --arg error "$authentication_error" \
+                    '{repo:"",version:$version,tag:"",tool:$tool,stage:"authentication",error:$error}')" || return 3
         fi
+        return "$authentication_status"
     fi
 
     # Load tool configuration
@@ -11890,15 +11898,22 @@ EOF
         return 4
     fi
 
-    # Check GitHub authentication
-    if ! gh_check 2>/dev/null; then
-        if ! gh_check_token 2>/dev/null; then
-            log_error "GitHub authentication required"
-            if $JSON_MODE; then
-                json_envelope "release-verify" "error" 3 '{"error": "GitHub authentication required"}'
-            fi
-            return 3
+    # Verification can repair remote assets, so cancelled or timed-out
+    # authentication must stop before inspecting or mutating release state.
+    local authentication_status=0 authentication_error="GitHub authentication required"
+    gh_require_auth 2>/dev/null || authentication_status=$?
+    if ((authentication_status != 0)); then
+        case "$authentication_status" in
+            4) authentication_error="Invalid GH_API_TIMEOUT" ;;
+            5) authentication_error="GitHub authentication was interrupted" ;;
+            8) authentication_error="GitHub authentication could not complete within its deadline" ;;
+        esac
+        log_error "$authentication_error"
+        if $JSON_MODE; then
+            json_envelope release-verify error "$authentication_status" \
+                "$(jq -nc --arg error "$authentication_error" '{error:$error}')" || return 3
         fi
+        return "$authentication_status"
     fi
 
     # Load tool configuration
@@ -15747,10 +15762,12 @@ EOF
 
     # Without GitHub access nothing can be synced; that is a dependency
     # error, not one failure per repository.
-    if ! gh_check 2>/dev/null && ! gh_check_token 2>/dev/null; then
-        log_error "GitHub authentication required (gh auth login or GITHUB_TOKEN)"
-        $JSON_MODE && json_envelope "repos" "error" 3 '{"action": "sync", "errors": [{"code": "E001", "message": "GitHub authentication required"}]}'
-        return 3
+    local authentication_status=0
+    gh_require_auth || authentication_status=$?
+    if ((authentication_status != 0)); then
+        $JSON_MODE && json_envelope "repos" "error" "$authentication_status" \
+            '{"action": "sync", "errors": [{"code": "E001", "message": "GitHub authentication did not complete"}]}'
+        return "$authentication_status"
     fi
 
     local tools_json

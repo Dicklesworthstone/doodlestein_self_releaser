@@ -107,10 +107,15 @@ gh_check() {
 # Resolve the canonical DSR_GH_TOKEN / GITHUB_TOKEN / GH_TOKEN / public-GitHub
 # stored credential cascade. Keep precedence in secrets.sh for every transport.
 # Emits the resolved token on stdout. Returns 0 with a non-empty token on
-# success, 3 on failure.
+# success, 3 on missing credentials, or the original explicit cancellation.
 _gh_resolve_token() {
-    local token=""
-    token=$(secrets_get_gh_token 2>/dev/null) || return 3
+    local token="" status=0
+    token=$(secrets_get_gh_token 2>/dev/null) || status=$?
+    case "$status" in
+        0) ;;
+        2|129|130|131|143) return "$status" ;;
+        *) return 3 ;;
+    esac
     if [[ -z "$token" ]]; then
         return 3
     fi
@@ -137,6 +142,34 @@ gh_check_token() {
         return 3
     fi
     return 0
+}
+
+# Admission for commands that can mutate release/build state. Only ordinary
+# CLI unavailability or unauthenticated status authorizes token fallback.
+# Cancellation and a stalled credential helper are terminal: retrying another
+# transport could publish after the caller already cancelled authentication.
+# Returns DSR's public status codes: 3 auth, 4 invalid deadline, 5 interrupted,
+# 8 deadline/supervision failure. No credential bytes are emitted.
+gh_require_auth() {
+    local status=0
+    _gh_api_timeout >/dev/null || return $?
+    gh_check >/dev/null || status=$?
+    if ((status == 1)); then
+        status=0
+        gh_check_token >/dev/null || status=$?
+    fi
+    case "$status" in
+        0) return 0 ;;
+        2|5|129|130|131|143)
+            _gh_log_error "GitHub authentication was interrupted"
+            return 5 ;;
+        124|125|137)
+            _gh_log_error "GitHub authentication could not complete within its deadline"
+            return 8 ;;
+        *)
+            _gh_log_error "GitHub authentication required"
+            return 3 ;;
+    esac
 }
 
 # Keep this heredoc outside a conditional in exported gh_api: Bash's function
@@ -2173,7 +2206,7 @@ gh_clear_cache() {
 }
 
 # Export functions
-export -f gh_init_cache gh_check gh_check_token _gh_resolve_token gh_api
+export -f gh_init_cache gh_check gh_check_token gh_require_auth _gh_resolve_token gh_api
 export -f _gh_api_timeout _gh_check_cli_auth _gh_api_attempt _gh_api_with_gh _gh_api_with_curl
 export -f _gh_response_retention_directory
 export -f _gh_cache_key _gh_get_cache _gh_get_cache_raw _gh_get_etag _gh_set_cache _gh_is_rate_limited
