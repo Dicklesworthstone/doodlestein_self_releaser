@@ -235,7 +235,7 @@ _minutes_ago() {
 
 # A queued run of release.yml, 15 minutes old, started by tag v1.2.3.
 _queued_release_run() {
-    printf '{"workflow_runs":[{"id":12345,"status":"queued","run_attempt":1,"created_at":"%s","name":"Release","path":".github/workflows/release.yml","head_branch":"v1.2.3","head_sha":"1111111111111111111111111111111111111111","html_url":"https://github.com/Dicklesworthstone/ntm/actions/runs/12345"}]}' \
+    printf '{"workflow_runs":[{"id":12345,"status":"queued","run_attempt":1,"workflow_id":17,"created_at":"%s","name":"Release","path":".github/workflows/release.yml","head_branch":"v1.2.3","head_sha":"1111111111111111111111111111111111111111","html_url":"https://github.com/Dicklesworthstone/ntm/actions/runs/12345"}]}' \
         "$(_minutes_ago 15)"
 }
 
@@ -1069,7 +1069,7 @@ _watch_completed() {
 _watch_run_json() {
     jq -nc --arg sha "${1:-1111111111111111111111111111111111111111}" '
         {details:{throttled:[{run_id:12345,repo:"Dicklesworthstone/ntm",tool:"ntm",
-            head_branch:"v1.2.3",head_sha:$sha}]}}'
+            head_branch:"v1.2.3",head_sha:$sha,run_attempt:1,workflow_id:17,threshold_seconds:600}]}}'
 }
 
 _watch_multiple_runs_json() {
@@ -1125,7 +1125,7 @@ _watch_upstream_run_json() {
     jq -nc --arg status "${1:-completed}" --arg conclusion "${2-failure}" \
         --arg sha "${3:-1111111111111111111111111111111111111111}" '
         {id:12345,repository:{full_name:"Dicklesworthstone/ntm"},
-         head_branch:"v1.2.3",head_sha:$sha,status:$status,run_attempt:1,
+         head_branch:"v1.2.3",head_sha:$sha,status:$status,run_attempt:1,workflow_id:17,
          conclusion:(if $conclusion == "" then null else $conclusion end)}'
 }
 
@@ -1147,15 +1147,18 @@ _watch_isolated_pipeline_fixture() {
         '{tool_name:"ntm",repo:"Dicklesworthstone/ntm",local_path:$path,language:"go",
           binary_name:"ntm",targets:["linux/amd64"],workflow:"release.yml"}' \
         > "$DSR_CONFIG_DIR/repos.d/ntm.yaml"
+    _watch_upstream_run_json queued "" "$DSR_WATCH_PINNED_SHA" |
+        jq '. + {created_at:"2000-01-01T00:00:00Z",run_started_at:"2000-01-01T00:00:00Z",
+                  path:".github/workflows/release.yml",event:"push"}' > "$TEST_TMPDIR/watch-live-run.json"
     export DSR_WATCH_FIXTURE_FALLBACK="$TEST_TMPDIR/real-fallback"
     cat > "$DSR_WATCH_FIXTURE_FALLBACK" <<'EOF'
 #!/usr/bin/env bash
 set -uo pipefail
 root="${DSR_ROUTING_TEST_ROOT:-$DSR_PROJECT_ROOT}"
-for module in config act_runner git_ops build_state signing sbom; do
+for module in config act_runner git_ops build_state signing sbom github; do
     source "$root/src/$module.sh" || exit 3
 done
-source <(awk '/^(_release_file_size|_release_sha256|_release_require_publishable_artifacts|_release_sbom_policy|cmd_fallback)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$root/dsr") || exit 3
+source <(awk '/^(_release_file_size|_release_sha256|_release_require_publishable_artifacts|_release_sbom_policy|_check_configured_repos|_check_waiting_jobs|_watch_configured_repo_matches|_watch_validate_admission_json|_watch_admit_upstream|cmd_fallback)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$root/dsr") || exit 3
 JSON_MODE=true DRY_RUN=false
 log_info() { printf '%s\n' "$*" >&2; }
 log_warn() { log_info "$@"; }
@@ -1169,6 +1172,23 @@ signing_wanted() { return 1; }
 signing_is_enabled() { return 1; }
 _check_repo() { printf '{"status":"throttled","queued_count":1}\n'; return 1; }
 gh_resolve_tag_sha() { printf '%s\n' "$DSR_WATCH_PINNED_SHA"; }
+# Keep admission, configuration and attempt-pinned job parsing real. The
+# independent HTTP fixture may advance after the parent's queued observation.
+gh_api() {
+    printf '%s\n' "$*" >> "$TEST_TMPDIR/watch-admission.calls"
+    [[ $# == 2 && "$2" == --no-cache ]] || return 99
+    case "$1" in
+        repos/Dicklesworthstone/ntm/actions/runs/12345)
+            if [[ -f "$TEST_TMPDIR/watch-upstream.json" ]]; then
+                cat "$TEST_TMPDIR/watch-upstream.json"
+            else
+                cat "$TEST_TMPDIR/watch-live-run.json"
+            fi ;;
+        'repos/Dicklesworthstone/ntm/actions/runs/12345/attempts/1/jobs?per_page=100&page=1')
+            printf '{"total_count":0,"jobs":[]}\n' ;;
+        *) return 99 ;;
+    esac
+}
 json_envelope() {
     jq -nc --arg command "$1" --arg status "$2" --argjson code "$3" --argjson details "$4" \
         '{command:$command,status:$status,exit_code:$code,details:$details}'
@@ -1259,6 +1279,25 @@ EOF
     assert_equal "$before_index" "$(git hash-object "$checkout/.git/index")"
     assert_equal "$before_source" "$(git hash-object "$checkout/source.txt")"
     assert_equal 'untracked work' "$(cat "$checkout/private.txt")"
+}
+
+@test "watch admission refuses an upstream success observed after the queued poll" {
+    _watch_isolated_pipeline_fixture
+    _watch_upstream_run_json completed success "$DSR_WATCH_PINNED_SHA" > "$TEST_TMPDIR/watch-live-run.json"
+
+    run _routing_watch "$(_watch_run_json "$DSR_WATCH_PINNED_SHA")" --auto-fallback
+    assert_equal "0" "$status"
+    _watch_completed
+    local attempt
+    attempt=$(jq -r '.attempts["12345"].attempt_id' "$DSR_STATE_DIR/triggered.json")
+    jq -e '.exit_code == 2' "$DSR_STATE_DIR/watch-attempts/$attempt/completion.json"
+    jq -e '.exit_code == 2 and .details.phase == "admission" and .details.phases.release == "blocked"' \
+        "$DSR_STATE_DIR/watch-attempts/$attempt/result.json"
+    [[ ! -e "$TEST_TMPDIR/quality-source" && ! -e "$TEST_TMPDIR/build-source" &&
+       ! -e "$TEST_TMPDIR/release-source" && ! -e "$DSR_STATE_DIR/fallback-sources" &&
+       ! -e "$DSR_STATE_DIR/watch-artifacts/12345" ]]
+    grep -q '^repos/Dicklesworthstone/ntm/actions/runs/12345 --no-cache$' "$TEST_TMPDIR/watch-admission.calls"
+    assert_equal 'tagged release source' "$(cat "$TEST_TMPDIR/developer-source/source.txt")"
 }
 
 @test "watch source isolation fetches an absent checkout through the pinned tag transport" {
@@ -1417,9 +1456,16 @@ EOF
     run _routing_watch "$check_json" --auto-fallback
     assert_equal "0" "$status"
     _watch_completed
-    jq -Rse --arg output "$DSR_STATE_DIR/watch-artifacts/12345" 'split("\u0000") ==
-        ["--non-interactive", "--json", "fallback", "ntm", "--version", "v1.2.3",
-         "--expected-sha", "1111111111111111111111111111111111111111", "--isolate-source", "--output-dir", $output, ""]' \
+    jq -Rse --arg output "$DSR_STATE_DIR/watch-artifacts/12345" '
+        split("\u0000") as $args | ($args | index("--watch-admission")) as $index |
+        $index != null and
+        ($args[$index + 1] | fromjson) ==
+            {run_id:"12345",run_attempt:1,workflow_id:17,repo:"Dicklesworthstone/ntm",
+             version:"v1.2.3",git_sha:"1111111111111111111111111111111111111111",
+             reason:"throttled",threshold_seconds:600} and
+        ($args[:$index] + $args[$index + 2:]) ==
+            ["--non-interactive", "--json", "fallback", "ntm", "--version", "v1.2.3",
+             "--expected-sha", "1111111111111111111111111111111111111111", "--isolate-source", "--output-dir", $output, ""]' \
         "$TEST_TMPDIR/fallback.args"
     jq -e '.runs["12345"] != null' "$DSR_STATE_DIR/triggered.json"
     jq -e '.attempts["12345"].isolate_source == true' "$DSR_STATE_DIR/triggered.json"
@@ -2314,6 +2360,14 @@ EOF
     assert_equal "$(cat "$TEST_TMPDIR/build-source")" "$(cat "$TEST_TMPDIR/release-source")"
     assert_equal "$DSR_WATCH_PINNED_SHA" "$(git -C "$TEST_TMPDIR/developer-source" rev-parse HEAD)"
     assert_equal 2 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    jq -Rse --arg sha "$DSR_WATCH_PINNED_SHA" '
+        split("\u0000") as $args |
+        [$args | to_entries[] | select(.value=="--watch-admission") | .key] |
+        map($args[. + 1] | fromjson) |
+        length == 2 and map(.reason) == ["throttled","upstream_failure"] and
+        map(.threshold_seconds) == [600,0] and
+        all(.[]; .git_sha==$sha and .run_id=="12345" and .run_attempt==1 and .workflow_id==17)' \
+        "$TEST_TMPDIR/fallback.args"
 }
 
 @test "watch recovery preserves cooldown and does not hold the watcher lock in its child" {

@@ -19,6 +19,32 @@
       "pattern": "^(?!0{40}$)[0-9a-f]{40}$",
       "description": "Explicit workflow source commit required of the checkout, version tag, and build manifest"
     },
+    "watch_admission": {
+      "$ref": "#/$defs/watch_admission",
+      "description": "Original conditional authority for an automatic workflow worker"
+    },
+    "watch_observation": {
+      "type": ["object", "null"],
+      "description": "Latest fresh admission result; null before a check or after its refusal",
+      "required": ["run_id", "run_attempt", "workflow_id", "reason", "status", "conclusion", "threshold_seconds", "checked_epoch"],
+      "properties": {
+        "run_id": { "type": "string", "pattern": "^[1-9][0-9]{0,15}$" },
+        "run_attempt": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "workflow_id": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "reason": { "enum": ["throttled", "upstream_failure"] },
+        "status": { "enum": ["queued", "in_progress", "completed"] },
+        "conclusion": { "enum": [null, "failure", "timed_out", "startup_failure"] },
+        "threshold_seconds": { "type": "integer", "minimum": 0, "maximum": 9999999 },
+        "checked_epoch": { "type": "integer", "minimum": 0 },
+        "queue_reason": { "enum": ["workflow_queue", "job_queue"] },
+        "queued_job_ids": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 1 },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
     "isolated_source": {
       "type": "boolean",
       "description": "Pinned source is materialized privately without changing the configured checkout"
@@ -82,6 +108,24 @@
     }
   },
   "$defs": {
+    "watch_admission": {
+      "type": "object",
+      "required": ["run_id", "run_attempt", "workflow_id", "repo", "version", "git_sha", "reason", "threshold_seconds"],
+      "additionalProperties": false,
+      "properties": {
+        "run_id": { "type": "string", "pattern": "^[1-9][0-9]{0,15}$" },
+        "run_attempt": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "workflow_id": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "repo": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$" },
+        "version": { "type": "string", "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+([.+-][0-9A-Za-z.+-]*)?$" },
+        "git_sha": { "type": "string", "pattern": "^(?!0{40}$)[0-9a-f]{40}$" },
+        "reason": { "enum": ["throttled", "upstream_failure"] },
+        "threshold_seconds": { "type": "integer", "minimum": 0, "maximum": 9999999 }
+      },
+      "if": { "properties": { "reason": { "const": "throttled" } } },
+      "then": { "properties": { "threshold_seconds": { "minimum": 1 } } },
+      "else": { "properties": { "threshold_seconds": { "const": 0 } } }
+    },
     "fallback_step": {
       "type": "object",
       "required": ["command", "status", "exit_code"],

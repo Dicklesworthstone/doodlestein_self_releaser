@@ -1761,7 +1761,8 @@ EOF
                      ((.path // "") | split("/") | last) as $file |
                      {repo: $r.repo, tool: $r.tool,
                       workflow: (if $file != "" then $file else (.workflow_name // "unknown") end),
-                      run_id: .id, status: .status, queue_time_seconds: .age_seconds,
+                      run_id: .id, run_attempt: .run_attempt, workflow_id: .workflow_id,
+                       status: .status, queue_time_seconds: .age_seconds,
                       threshold_seconds: $threshold, created_at: .created_at,
                       started_at: .run_started_at, head_branch: .head_branch,
                       head_sha: .head_sha, html_url: .html_url,
@@ -2178,7 +2179,7 @@ _watch_run_attempt() (
     local run_id="$1" attempt="$2" directory="$3" tool="$4" version="$5" sha="$6" output="$7" resume="$8"
     # The launcher acquired this descriptor before publishing the journal.
     # Keep it inherited by fallback and its descendants until they all exit.
-    local attempt_fd="$9" isolate_source="${10}" rc=0 temporary finished
+    local attempt_fd="$9" isolate_source="${10}" watch_admission="${11}" rc=0 temporary finished
     # The worker must outlive --once without keeping the watcher mutex held.
     _watch_release_lock
     trap - EXIT
@@ -2190,7 +2191,7 @@ _watch_run_attempt() (
     # works after the checkout advances or acquires staged/untracked work.
     local -a args=(--non-interactive --json fallback "$tool" --version "$version" --expected-sha "$sha")
     [[ "$isolate_source" != true ]] || args+=(--isolate-source)
-    args+=(--output-dir "$output")
+    args+=(--output-dir "$output" --watch-admission "$watch_admission")
     [[ -z "$resume" ]] || args+=("--resume=$resume")
     export DSR_RUN_ID="watch-$run_id-$attempt"
     # The worker reports the terminal event only after its completion receipt
@@ -2231,9 +2232,10 @@ _watch_run_attempt() (
 
 _watch_launch_attempt() (
     local run_id="$1" tool="$2" repo="$3" version="$4" sha="$5" attempt="$6" resume="$7"
-    local isolate_source="$8"
+    local isolate_source="$8" watch_admission="$9"
     local state directory now timestamp attempt_fd output="$_WATCH_STATE_DIR/watch-artifacts/$run_id"
     [[ "$isolate_source" == true || "$isolate_source" == false ]] || return 4
+    _watch_validate_admission_json "$watch_admission" "$repo" "$version" "$sha" || return 4
     mkdir -p -- "$_WATCH_STATE_DIR/watch-attempts" "$_WATCH_STATE_DIR/watch-artifacts" || return 4
     [[ ! -L "$_WATCH_STATE_DIR/watch-attempts" && ! -L "$_WATCH_STATE_DIR/watch-artifacts" ]] || return 4
     directory=$(mktemp -d "$_WATCH_STATE_DIR/watch-attempts/$run_id.XXXXXXXX") || return 4
@@ -2244,11 +2246,12 @@ _watch_launch_attempt() (
     state=$(_watch_load_triggered) || return 4
     state=$(jq -c --arg id "$run_id" --arg tool "$tool" --arg repo "$repo" --arg version "$version" \
         --arg sha "$sha" --arg directory "${directory##*/}" --arg resume "$resume" --arg timestamp "$timestamp" \
-        --argjson attempt "$attempt" --argjson now "$now" --argjson isolate_source "$isolate_source" '
+        --argjson attempt "$attempt" --argjson now "$now" --argjson isolate_source "$isolate_source" \
+        --argjson admission "$watch_admission" '
         del(.pending[$id]) | .runs[$id] = $timestamp | .last_check = $timestamp |
         .attempts[$id] = {attempt:$attempt,attempt_id:$directory,tool:$tool,repo:$repo,version:$version,
             head_sha:$sha,status:"running",started_epoch:$now,next_retry_at:null,resume_run_id:$resume,
-            isolate_source:$isolate_source}
+            isolate_source:$isolate_source,watch_admission:$admission}
     ' <<< "$state") || return 4
     _watch_save_triggered "$state" || return 4
     local fallback_log="$_WATCH_STATE_DIR/fallback-${run_id}.log"
@@ -2264,7 +2267,7 @@ _watch_launch_attempt() (
         # Close in the background supervisor too, before invoking the worker
         # subshell; otherwise that waiting supervisor would retain the mutex.
         _watch_release_lock
-        _watch_run_attempt "$run_id" "$attempt" "$directory" "$tool" "$version" "$sha" "$output" "$resume" "$attempt_fd" "$isolate_source"
+        _watch_run_attempt "$run_id" "$attempt" "$directory" "$tool" "$version" "$sha" "$output" "$resume" "$attempt_fd" "$isolate_source" "$watch_admission"
     ) >> "$fallback_log" 2>&1 &
     log_info "Fallback started (PID: $!, attempt: $attempt, log: $fallback_log)"
 )
@@ -2283,6 +2286,139 @@ _watch_jittered_sleep() {
 # Throttled runs this watcher has already reported (without --auto-fallback),
 # so each is announced once per watcher rather than on every poll.
 declare -A _WATCH_REPORTED=()
+
+# A watcher decision is conditional authority for one workflow attempt, not a
+# manual request to release the same source under any later upstream state.
+_watch_validate_admission_json() {
+    local admission="$1" repo="$2" version="$3" sha="$4"
+    jq -es --arg repo "$repo" --arg version "$version" --arg sha "$sha" '
+        def identifier: type == "number" and floor == . and . >= 1 and . <= 9007199254740991;
+        length == 1 and (.[0] | type == "object" and
+            keys == ["git_sha","reason","repo","run_attempt","run_id","threshold_seconds","version","workflow_id"] and
+            (.run_id | type == "string" and test("^[1-9][0-9]{0,15}$") and
+                (tonumber <= 9007199254740991)) and
+            (.run_attempt | identifier) and (.workflow_id | identifier) and
+            (.repo | type == "string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) and
+            (.version | type == "string" and test("^v[0-9]+\\.[0-9]+\\.[0-9]+([.+-][0-9A-Za-z.+-]*)?$")) and
+            (.git_sha | type == "string" and test("^[0-9a-f]{40}$") and
+                . != "0000000000000000000000000000000000000000") and
+            .repo == $repo and .version == $version and .git_sha == $sha and
+            (.reason | IN("throttled","upstream_failure")) and
+            (.threshold_seconds | type == "number" and floor == .) and
+            (if .reason == "throttled"
+             then .threshold_seconds >= 1 and .threshold_seconds <= 9999999
+             else .threshold_seconds == 0 end))
+    ' <<< "$admission" >/dev/null 2>&1 || return 4
+}
+
+# Re-read the exact run without caches at each automatic execution boundary.
+# Attempt-pinned job pages are bracketed by run observations so an intervening
+# rerun or status change cannot authorize work using the old attempt's jobs.
+# Returns 2 when no longer eligible, 4 for changed identity/configuration,
+# 5 for cancellation, and 8 when fresh upstream evidence is unavailable.
+_watch_admit_upstream() {
+    (
+    local tool="$1" admission="$2" repo version sha run_id reason threshold current_threshold
+    local observed after waiting=null status=0 now identity_filter
+    repo=$(jq -er '.repo' <<< "$admission") || return 4
+    version=$(jq -er '.version' <<< "$admission") || return 4
+    sha=$(jq -er '.git_sha' <<< "$admission") || return 4
+    _watch_validate_admission_json "$admission" "$repo" "$version" "$sha" || return 4
+    run_id=$(jq -r '.run_id' <<< "$admission") || return 4
+    reason=$(jq -r '.reason' <<< "$admission") || return 4
+    threshold=$(jq -r '.threshold_seconds' <<< "$admission") || return 4
+    _watch_configured_repo_matches "$tool" "$repo" "$run_id" || return 2
+    if [[ "$reason" == throttled ]]; then
+        config_load >/dev/null || return $?
+        current_threshold=$(config_get threshold_seconds 600) || return 4
+        [[ "$current_threshold" =~ ^[1-9][0-9]{0,6}$ ]] || {
+            log_error "Automatic fallback requires a valid current queue threshold"
+            return 4
+        }
+        # A newly raised threshold withdraws an earlier, less conservative
+        # admission. Lowering it cannot expand the worker's original authority.
+        ((current_threshold > threshold)) && threshold="$current_threshold"
+    fi
+    identity_filter='
+        def identifier: type == "number" and floor == . and . >= 1 and . <= 9007199254740991;
+        def matches:
+            type == "object" and (.id | identifier) and
+            (.id | tostring) == $expected.run_id and
+            .repository.full_name == $expected.repo and
+            .head_branch == $expected.version and .head_sha == $expected.git_sha and
+            .run_attempt == $expected.run_attempt and .workflow_id == $expected.workflow_id and
+            (.status | type == "string") and
+            (.conclusion | type == "null" or type == "string");
+    '
+    observed=$(gh_api "repos/$repo/actions/runs/$run_id" --no-cache) || status=$?
+    if ((status != 0)); then
+        case "$status" in 2|5|129|130|131|143) return 5 ;; esac
+        log_warn "Cannot revalidate upstream run $run_id; automatic fallback withheld"
+        return 8
+    fi
+    if ! jq -es --argjson expected "$admission" \
+        "$identity_filter"'length == 1 and (.[0] | matches)' <<< "$observed" >/dev/null 2>&1; then
+        log_error "Upstream identity or attempt changed for run $run_id; automatic fallback withheld"
+        return 4
+    fi
+    if [[ "$reason" == upstream_failure ]]; then
+        if ! jq -e '.status == "completed" and
+            (.conclusion | IN("failure","timed_out","startup_failure"))' <<< "$observed" >/dev/null; then
+            log_warn "Upstream run $run_id is no longer a completed failure; automatic recovery withheld"
+            return 2
+        fi
+    else
+        if ! jq -e '(.status | IN("queued","in_progress")) and .conclusion == null' \
+            <<< "$observed" >/dev/null; then
+            log_warn "Upstream run $run_id is no longer waiting; automatic fallback withheld"
+            return 2
+        fi
+        now=$(date +%s) || return 4
+        status=0
+        waiting=$(_check_waiting_jobs "$repo" "$observed" "$threshold" "$now") || status=$?
+        if ((status != 0)); then
+            case "$status" in 2|5|129|130|131|143) return 5 ;; esac
+            log_warn "Cannot revalidate jobs for run $run_id; automatic fallback withheld"
+            return 8
+        fi
+        if [[ "$waiting" == null ]]; then
+            log_info "Upstream run $run_id is executing or no longer starved; automatic fallback withheld"
+            return 2
+        fi
+        jq -e 'type == "object" and (.queue_reason | IN("workflow_queue","job_queue"))' \
+            <<< "$waiting" >/dev/null 2>&1 || return 8
+    fi
+    status=0
+    after=$(gh_api "repos/$repo/actions/runs/$run_id" --no-cache) || status=$?
+    if ((status != 0)); then
+        case "$status" in 2|5|129|130|131|143) return 5 ;; esac
+        log_warn "Cannot finish upstream revalidation for run $run_id; automatic fallback withheld"
+        return 8
+    fi
+    if ! jq -es --argjson expected "$admission" \
+        "$identity_filter"'length == 1 and (.[0] | matches)' <<< "$after" >/dev/null 2>&1; then
+        log_error "Upstream identity or attempt changed during inspection of run $run_id"
+        return 4
+    fi
+    if ! printf '%s\n' "$observed" "$after" | jq -se '
+        length == 2 and
+        (.[0] | {status,conclusion,run_started_at,updated_at}) ==
+        (.[1] | {status,conclusion,run_started_at,updated_at})
+    ' >/dev/null 2>&1; then
+        log_info "Upstream run $run_id changed during inspection; automatic fallback withheld"
+        return 2
+    fi
+    now=$(date +%s) || return 4
+    printf '%s\n' "$after" "$waiting" | jq -sc --argjson expected "$admission" \
+        --argjson threshold "$threshold" --argjson now "$now" '
+        {run_id:$expected.run_id,run_attempt:$expected.run_attempt,workflow_id:$expected.workflow_id,
+         reason:$expected.reason,status:.[0].status,conclusion:.[0].conclusion,
+         threshold_seconds:$threshold,checked_epoch:$now}
+        + (if .[1] == null then {} else
+            {queue_reason:.[1].queue_reason,queued_job_ids:(.[1].queued_job_ids // [])} end)
+    ' || return 4
+    )
+}
 
 _watch_configured_repo_matches() {
     local tool="$1" repo="$2" run_id="$3" configured inventory
@@ -2383,9 +2519,12 @@ _watch_terminal_retry_runs() {
             continue
         fi
         conclusion=$(jq -r .conclusion <<< "$observed") || return 4
-        jq -nc --arg run "$run_id" --argjson record "$record" --arg conclusion "$conclusion" '
+        jq -nc --arg run "$run_id" --argjson record "$record" --arg conclusion "$conclusion" \
+            --slurpfile observed /dev/fd/3 '
             {run_id:$run,tool:$record.tool,repo:$record.repo,head_branch:$record.version,
-             head_sha:$record.head_sha,retry_reason:"upstream_failure",upstream_conclusion:$conclusion}' || return 4
+             head_sha:$record.head_sha,retry_reason:"upstream_failure",upstream_conclusion:$conclusion,
+             run_attempt:$observed[0].run_attempt,workflow_id:$observed[0].workflow_id}' \
+            3<<< "$observed" || return 4
     done <<< "$candidates"
 }
 
@@ -2491,7 +2630,7 @@ _watch_iteration() {
 
     # Process new throttled runs and source-verified terminal recovery candidates.
     local run run_id repo tool_name ref sha record pending_record bound_record
-    local attempt resume outcome next_retry isolate_source retry_reason completion_exit
+    local attempt resume outcome next_retry isolate_source retry_reason completion_exit watch_admission
     while IFS= read -r run; do
         run_id=$(jq -r '.run_id // empty | tostring' <<< "$run")
         [[ "$run_id" =~ ^[1-9][0-9]{0,15}$ ]] || { log_error "Invalid throttled run ID"; return 8; }
@@ -2619,8 +2758,17 @@ _watch_iteration() {
                 log_error "Unclaimed watcher artifact directory already exists: $output"
                 return 4
             fi
+            watch_admission=$(jq -c '
+                {run_id:(.run_id | tostring),run_attempt,workflow_id,repo,version:.head_branch,git_sha:.head_sha,
+                 reason:(if .retry_reason == "upstream_failure" then "upstream_failure" else "throttled" end),
+                 threshold_seconds:(if .retry_reason == "upstream_failure" then 0 else .threshold_seconds end)}
+            ' <<< "$run") || return 4
+            if ! _watch_validate_admission_json "$watch_admission" "$repo" "$ref" "$sha"; then
+                log_warn "Run $run_id lacks complete workflow-attempt admission; automatic fallback withheld"
+                continue
+            fi
             log_info "Starting fallback for $tool_name (run $run_id, attempt $attempt)..."
-            _watch_launch_attempt "$run_id" "$tool_name" "$repo" "$ref" "$sha" "$attempt" "$resume" "$isolate_source" || return $?
+            _watch_launch_attempt "$run_id" "$tool_name" "$repo" "$ref" "$sha" "$attempt" "$resume" "$isolate_source" "$watch_admission" || return $?
             state=$(_watch_load_triggered) || return 4
             triggered_count=$((triggered_count + 1))
             active_count=$((active_count + 1))
@@ -12996,7 +13144,7 @@ cmd_fallback() {
     # In particular, do not leave an EXIT trap referring to expired locals.
     (
     local tool_name="" version="" output_dir="" expected_sha=""
-    local expected_sha_set=false
+    local expected_sha_set=false watch_admission_set=false watch_admission="" watch_observation=null
     local isolate_source=false isolated_dependencies='[]' source_materialization=null
     local configured_dependencies='[]'
     # Runtime-only source paths stay inside this fallback invocation. They do
@@ -13009,7 +13157,7 @@ cmd_fallback() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --tool|-t|--repo|--version|-V|--output-dir|-o|--expected-sha)
+            --tool|-t|--repo|--version|-V|--output-dir|-o|--expected-sha|--watch-admission)
                 if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
                     log_error "$1 requires a value"
                     return 4
@@ -13022,12 +13170,21 @@ cmd_fallback() {
                         $expected_sha_set && { log_error "--expected-sha may only be specified once"; return 4; }
                         expected_sha="${2,,}"; expected_sha_set=true
                         ;;
+                    --watch-admission)
+                        $watch_admission_set && { log_error "--watch-admission may only be specified once"; return 4; }
+                        watch_admission="$2"; watch_admission_set=true
+                        ;;
                 esac
                 shift 2
                 ;;
             --expected-sha=*)
                 $expected_sha_set && { log_error "--expected-sha may only be specified once"; return 4; }
                 expected_sha="${1#*=}"; expected_sha="${expected_sha,,}"; expected_sha_set=true
+                shift
+                ;;
+            --watch-admission=*)
+                $watch_admission_set && { log_error "--watch-admission may only be specified once"; return 4; }
+                watch_admission="${1#*=}"; watch_admission_set=true
                 shift
                 ;;
             --build-only) build_only=true; shift ;;
@@ -13054,6 +13211,7 @@ OPTIONS:
     -t, --tool <name>      Tool to build/release (--repo is an alias)
     -V, --version <ver>    Version to release (default: detect from source)
     --expected-sha <sha>   Require this full source commit and an explicit version
+    --watch-admission <json> Reserved watcher workflow-attempt admission
     --isolate-source       Materialize that commit without changing your checkout
     --sbom / --no-sbom     Enable or disable SBOMs for ordinary publication
     --sbom-format <format> Select an SBOM format and enable its generation
@@ -13075,7 +13233,11 @@ DESCRIPTION:
     custody. Missing assets are added without replacement, then the existing
     signed finalizer verifies and publishes the owned draft without dispatch.
     Missing original POST responses, changed inputs, and unrelated drafts block.
-    --expected-sha binds an automatic fallback to its observed workflow run:
+    Watcher workers revalidate their exact workflow attempt before source
+    preparation, after preparation, before compilation and before publication.
+    Upstream progress, reruns or unreadable evidence withdraw automatic work;
+    completed failures require explicit recovery admission from the watcher.
+    --expected-sha binds the source to an observed workflow commit:
     the clean checkout, local version tag and build manifest must name that
     commit. Source identity is rechecked after quality checks and signing.
     --isolate-source (or fallback.isolate_source: true in the tool config)
@@ -13088,7 +13250,7 @@ DESCRIPTION:
 EXIT CODES:
     0  - Pipeline completed successfully
     1  - Partial build or upload failure (partial builds are never published)
-    2  - Lock conflict
+    2  - Lock conflict or automatic admission withdrawn
     3  - Dependency error
     4  - Invalid arguments, configuration, or state
     5  - Interrupted
@@ -13117,6 +13279,10 @@ EOF
         fi
         # Replacement objects must not reinterpret the observed workflow SHA.
         export GIT_NO_REPLACE_OBJECTS=1
+    fi
+    if $watch_admission_set && { ! $expected_sha_set || $build_only; }; then
+        log_error "Watcher admission requires --expected-sha and a release pipeline"
+        return 4
     fi
     if $resume && [[ "$resume_selector" != latest &&
           ! "$resume_selector" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
@@ -13223,6 +13389,11 @@ EOF
         $dry_run || _fallback_notify 4 config "configuration could not be resolved"
         return 4
     fi
+    if $watch_admission_set &&
+       ! _watch_validate_admission_json "$watch_admission" "$repo" "$tag" "$expected_sha"; then
+        log_error "Watcher admission does not bind this repository, version and source"
+        return 4
+    fi
     _dsr_require sbom || return 3
     local config_load_status=0
     config_load || config_load_status=$?
@@ -13274,6 +13445,7 @@ EOF
                 --arg tool "$tool_name" --arg version "$tag" --arg repo "$repo" \
                 --arg run_id "$run_id" --arg output_dir "$output_dir" \
                 --arg expected_sha "$expected_sha" \
+                --argjson watch_admission "${watch_admission:-null}" --argjson watch_observation "$watch_observation" \
                 --argjson isolate_source "$isolate_source" --argjson materialization "$source_materialization" \
                 --argjson publication_recovery "$publication_recovery" \
                 --arg checks "$checks_status" --arg build "$build_status" \
@@ -13293,7 +13465,8 @@ EOF
                      exit_code: (if $failed then $rc else 0 end),
                      duration_ms: ([($ended - $started), 0] | max)}
                     + (if $failed and $error != "" then {error: $error} else {} end);
-                ($phase | IN("checks", "build", "verification", "signing")) as $build_failed |
+                (($phase | IN("checks", "build", "verification", "signing")) or
+                    ($phase == "admission" and $build != "success")) as $build_failed |
                 ($now_ms) as $end |
                 {tool:$tool,version:$version,repo:$repo,run_id:$run_id,
                   output_dir:$output_dir,phase:$phase,error:(if $error=="" then null else $error end),
@@ -13305,13 +13478,15 @@ EOF
                           step("build"; $build_failed; ($build_started | tonumber);
                                (if $release_started == "" then $end else ($release_started | tonumber) end)) end),
                       (if $release_started == "" then empty else
-                          step("release"; $phase == "release"; ($release_started | tonumber); $end) end)
+                          step("release"; ($phase == "release" or $phase == "admission"); ($release_started | tonumber); $end) end)
                   ]),
                   artifacts_count:$artifacts,duration_seconds:$duration,
                   build_only:$build_only,skip_checks:$skip_checks,resume:$resume,
                   resume_run_id:$resume_run_id}
                 + (if $trigger == "" then {} else {trigger: $trigger} end)
                 + (if $expected_sha == "" then {} else {expected_sha: $expected_sha} end)
+                + (if $watch_admission == null then {} else
+                    {watch_admission:$watch_admission,watch_observation:$watch_observation} end)
                 + (if $isolate_source then {isolated_source:true,source_materialization:$materialization} else {} end)
                 + (if $publication_recovery == null then {} else {publication_recovery:$publication_recovery} end)') || return 4
             json_envelope fallback "$status" "$rc" "$details"
@@ -13321,6 +13496,38 @@ EOF
         fi
         [[ "$phase" == plan ]] || _fallback_notify "$rc" "$phase" "$error"
         return "$rc"
+    }
+
+    _fallback_check_watch_admission() {
+        [[ -n "$watch_admission" ]] || return 0
+        local admission_status=0 admission_started observation message
+        admission_started=$(_fallback_now_ms)
+        observation=$(_watch_admit_upstream "$tool_name" "$watch_admission") || admission_status=$?
+        if ((admission_status == 0)); then
+            watch_observation="$observation"
+            fallback_trigger="automatic: $(jq -r '.reason' <<< "$watch_admission") for workflow run $(jq -r '.run_id' <<< "$watch_admission") attempt $(jq -r '.run_attempt' <<< "$watch_admission")"
+            message=""
+        else
+            # A previous successful observation never stands in for a failed
+            # fresh read, including at the final publication handoff.
+            watch_observation=null
+            fallback_trigger="automatic admission withdrawn"
+            message="Automatic fallback is no longer admitted by its exact upstream workflow attempt (exit $admission_status)"
+        fi
+        fallback_check_step=$(jq -nc --argjson rc "$admission_status" --argjson started "$admission_started" \
+            --argjson ended "$(_fallback_now_ms)" --arg error "$message" --argjson admission "$watch_admission" '
+            {command:"check",status:(if $rc == 0 then "success" else "error" end),exit_code:$rc,
+             throttled:($rc == 0 and $admission.reason == "throttled"),
+             duration_ms:([($ended - $started),0] | max)}
+            + (if $rc == 0 then {} else {error:$error} end)') || return 4
+        if ((admission_status != 0)); then
+            [[ "$checks_status" != pending ]] || checks_status=skipped
+            [[ "$build_status" == success ]] || build_status=blocked
+            [[ "$verification_status" != pending ]] || verification_status=skipped
+            release_status=blocked
+            _fallback_result "$admission_status" admission "$message"
+            return "$admission_status"
+        fi
     }
 
     _fallback_verify_expected_source() {
@@ -13365,6 +13572,9 @@ EOF
         _fallback_result 0 plan
         return $?
     fi
+    # Reject expired automatic intent before source materialization, state
+    # allocation or the build lock. Manual fallbacks retain their own policy.
+    _fallback_check_watch_admission || return $?
     if ! build_state_init; then
         _fallback_result 4 state "Build state initialization failed"
         return 4
@@ -13660,9 +13870,12 @@ EOF
         fi
     fi
 
-    # Throttle check: records why the fallback ran. Read failures do not block
-    # an explicit request; cancellation does. Build-only runs skip this check.
-    if ! $build_only; then
+    # Source preparation can be slow. Automatic work needs fresh authority;
+    # only an explicit manual request may proceed when the queue is healthy
+    # or unreadable. Build-only manual requests skip the throttle check.
+    if [[ -n "$watch_admission" ]]; then
+        _fallback_check_watch_admission || return $?
+    elif ! $build_only; then
         local check_started check_result="" check_rc=0 check_workflow check_threshold
         check_started=$(_fallback_now_ms)
         check_workflow=$(config_get_tool_field "$tool_name" "workflow" "" 2>/dev/null) || check_workflow=""
@@ -13729,6 +13942,9 @@ EOF
         return 4
     fi
 
+    # Quality hooks can outlast the upstream queue. Revalidate immediately
+    # before starting compilers or reusing a completed checkpoint.
+    _fallback_check_watch_admission || return $?
     local -a build_args=("$tool_name" --version "$version" --output-dir "$output_dir")
     $resume && build_args+=("--resume=$resume_run_id")
     if $reuse_completed; then
@@ -14214,6 +14430,9 @@ EOF
                 return 7
             fi
         fi
+        # Retain verified artifacts when GitHub resumes or finishes while we
+        # build/sign. A successful local build is not fresh authority to publish.
+        _fallback_check_watch_admission || return $?
         local release_result="" custody_rc=0
         if [[ "$contract" != null ]]; then
             if ! _fallback_strict_prepare || ! _fallback_strict_capture; then

@@ -23,10 +23,14 @@ source "$ROOT/src/signing.sh"
 source "$ROOT/src/git_ops.sh"
 # shellcheck source=src/sbom.sh
 source "$ROOT/src/sbom.sh"
+# Admission uses the real attempt-pinned job reader; only gh_api responses
+# are controlled in the focused watcher-origin fixtures below.
+# shellcheck source=src/github.sh
+source "$ROOT/src/github.sh"
 COMMAND_FILE="${DSR_TEST_COMMAND_FILE:-$ROOT/dsr}"
 HELPERS_FILE="${DSR_TEST_HELPERS_FILE:-$COMMAND_FILE}"
 # shellcheck source=/dev/null
-source <(awk '/^(_release_file_size|_release_sha256|_release_require_publishable_artifacts|_release_sbom_policy)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$HELPERS_FILE")
+source <(awk '/^(_release_file_size|_release_sha256|_release_require_publishable_artifacts|_release_sbom_policy|_check_configured_repos|_check_waiting_jobs|_watch_configured_repo_matches|_watch_validate_admission_json|_watch_admit_upstream)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$HELPERS_FILE")
 # shellcheck source=/dev/null
 source <(awk '/^cmd_fallback\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "$COMMAND_FILE")
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/dsr-fallback-tests.XXXXXXXX") || exit 1
@@ -137,6 +141,9 @@ qg_run_checks() {
     if [[ -n "${QUALITY_MUTATES_PINNED_CHILD:-}" ]]; then
         printf 'mutated child\n' >> "${quality_source%/*}/$QUALITY_MUTATES_PINNED_CHILD"
     fi
+    if [[ "${WATCH_ADMISSION_TRANSITION:-}" == quality ]]; then
+        watch_admission_complete_upstream || return 1
+    fi
     return "$QUALITY_RC"
 }
 signing_is_enabled() { [[ "$SIGN_ENABLED" == true ]]; }
@@ -166,6 +173,9 @@ signing_sign_batch() {
         if [[ "$SIGN_MODE" == source ]]; then printf 'mutated by signer\n' >> "$(act_get_local_path tool)/src.txt"; fi
         if [[ "$SIGN_MODE" == submodule ]]; then printf 'mutated by signer\n' >> "$(act_get_local_path tool)/vendor/library/src.txt"; fi
         if [[ "$SIGN_MODE" == tag ]]; then git -C "$(act_get_local_path tool)" tag -f v1.2.3 "$OTHER_SHA" >/dev/null; fi
+    fi
+    if [[ "${WATCH_ADMISSION_TRANSITION:-}" == signing ]]; then
+        watch_admission_complete_upstream || return 1
     fi
     return "$SIGN_RC"
 }
@@ -302,6 +312,9 @@ cmd_build() {
     fi
     printf '{"child":"build"}\n'
     if [[ "$SIGNAL_PHASE" == build ]]; then kill -TERM "$BASHPID"; fi
+    if [[ "${WATCH_ADMISSION_TRANSITION:-}" == build ]]; then
+        watch_admission_complete_upstream || return 1
+    fi
     return "$BUILD_RC"
 }
 
@@ -321,6 +334,7 @@ setup() {
     QUALITY_MUTATES_PINNED_CHILD='' BUILD_MUTATES_PINNED_CHILD=''
     BUILD_FROM_PINNED_CHILD=''
     OTHER_SHA="" REMOTE_TAG_MODE=valid RELEASE_RESULT_MODE=public
+    WATCH_ADMISSION_TRANSITION="" WATCH_HTTP_DRIFT="" WATCH_HTTP_RC=0
     RUN=11111111-1111-4111-8111-111111111111 SOURCE_SHA=0000000000000000000000000000000000000000
     TARGETS='linux/amd64 darwin/arm64'
     OUT="$CASE/artifacts"
@@ -408,6 +422,152 @@ test_throttle_check_manual_request() {
             .details.steps[0].status == (if $rc == 0 then "success" else "error" end) and
             (.details.trigger | startswith("manual:"))' "$CASE/stdout" >/dev/null
 }
+# Watcher-origin fallbacks must keep the exact upstream attempt eligible while
+# source preparation, checks and compilation run. Admission and job parsing stay
+# real; only the GitHub HTTP boundary supplies controlled observations.
+watch_admission_update_json() {
+    local file="$1" filter="$2"
+    jq "$filter" "$file" > "$file.next" && mv "$file.next" "$file"
+}
+watch_admission_complete_upstream() {
+    watch_admission_update_json "$CASE/watch-run.json" '.status="completed" | .conclusion="success"'
+}
+watch_admission_fixture() {
+    setup "watch-admission-$1"
+    git -C "$CASE/source" init -q || return 1
+    printf 'source code\n' > "$CASE/source/src.txt"
+    git -C "$CASE/source" add src.txt || return 1
+    git -C "$CASE/source" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm source || return 1
+    git -C "$CASE/source" tag v1.2.3 || return 1
+    SOURCE_SHA=$(git -C "$CASE/source" rev-parse HEAD) || return 1
+    export DSR_CONFIG_DIR="$CASE" DSR_REPOS_FILE="$CASE/repos.yaml"
+    jq -nc --arg path "$CASE/source" '
+        {tool_name:"tool",repo:"owner/tool",local_path:$path,enabled:true,
+         language:"go",binary_name:"tool",workflow:"release.yml",
+         targets:["linux/amd64","darwin/arm64"]}' > "$ACT_REPOS_DIR/tool.yaml" || return 1
+    WATCH_ADMISSION=$(jq -nc --arg sha "$SOURCE_SHA" '
+        {run_id:"12345",run_attempt:2,workflow_id:17,repo:"owner/tool",
+         version:"v1.2.3",git_sha:$sha,reason:"throttled",threshold_seconds:600}') || return 1
+    jq -nc --arg sha "$SOURCE_SHA" '
+        {id:12345,repository:{full_name:"owner/tool"},head_branch:"v1.2.3",
+         head_sha:$sha,status:"queued",conclusion:null,run_attempt:2,workflow_id:17,
+         path:".github/workflows/release.yml",event:"push",
+         created_at:"2000-01-01T00:00:00Z",run_started_at:"2000-01-01T00:00:00Z"}' \
+        > "$CASE/watch-run.json" || return 1
+    jq -nc --arg sha "$SOURCE_SHA" '
+        {total_count:1,jobs:[{id:1,run_id:12345,run_attempt:2,head_sha:$sha,
+          status:"queued",created_at:"2000-01-01T00:00:00Z",
+          started_at:null,completed_at:null}]}' > "$CASE/watch-jobs.json" || return 1
+    gh_api() {
+        printf 'UPSTREAM %s\n' "$*" >> "$CALLS"
+        [[ $# == 2 && "$2" == --no-cache ]] || return 99
+        case "$1" in
+            repos/owner/tool/actions/runs/12345)
+                [[ "$WATCH_HTTP_RC" == 0 ]] || return "$WATCH_HTTP_RC"
+                cat "$CASE/watch-run.json" ;;
+            'repos/owner/tool/actions/runs/12345/attempts/2/jobs?per_page=100&page=1')
+                cat "$CASE/watch-jobs.json" || return 1
+                if [[ "$WATCH_HTTP_DRIFT" == attempt ]]; then
+                    watch_admission_update_json "$CASE/watch-run.json" '.run_attempt=3' || return 1
+                fi ;;
+            *) return 99 ;;
+        esac
+    }
+}
+test_watch_admission_success() {
+    watch_admission_fixture "success-$1" || return 1
+    if [[ "$1" != throttled ]]; then
+        WATCH_ADMISSION=$(jq '.reason="upstream_failure" | .threshold_seconds=0' <<< "$WATCH_ADMISSION") || return 1
+        watch_admission_update_json "$CASE/watch-run.json" \
+            ".status=\"completed\" | .conclusion=\"$1\"" || return 1
+    fi
+    run_fallback --expected-sha "$SOURCE_SHA" --watch-admission "$WATCH_ADMISSION"
+    [[ "$RC" == 0 && ! -e "$CASE/lock" ]] && one_result &&
+        grep -q '^CHECK ' "$CALLS" && grep -q '^BUILD ' "$CALLS" &&
+        grep -q '^SIGN ' "$CALLS" && grep -q '^RELEASE ' "$CALLS" &&
+        ! grep -q '^THROTTLE ' "$CALLS" &&
+        grep -q '^UPSTREAM repos/owner/tool/actions/runs/12345 --no-cache$' "$CALLS" || return 1
+    if [[ "$1" == throttled ]]; then
+        grep -Fq 'UPSTREAM repos/owner/tool/actions/runs/12345/attempts/2/jobs?per_page=100&page=1 --no-cache' "$CALLS"
+    else
+        ! grep -q '/jobs?' "$CALLS"
+    fi
+}
+test_watch_admission_initial_refusal() {
+    watch_admission_fixture "initial-$1" || return 1
+    local expected_rc=2
+    case "$1" in
+        success) watch_admission_complete_upstream || return 1 ;;
+        cancelled) watch_admission_update_json "$CASE/watch-run.json" '.status="completed" | .conclusion="cancelled"' || return 1 ;;
+        failed) watch_admission_update_json "$CASE/watch-run.json" '.status="completed" | .conclusion="failure"' || return 1 ;;
+        active) watch_admission_update_json "$CASE/watch-jobs.json" '.jobs[0].status="in_progress"' || return 1 ;;
+        waiting) watch_admission_update_json "$CASE/watch-jobs.json" '.jobs[0].status="waiting"' || return 1 ;;
+        recent) watch_admission_update_json "$CASE/watch-jobs.json" '.jobs[0].created_at=(now | todateiso8601)' || return 1 ;;
+        attempt) expected_rc=4; watch_admission_update_json "$CASE/watch-run.json" '.run_attempt=3' || return 1 ;;
+        workflow) expected_rc=4; watch_admission_update_json "$CASE/watch-run.json" '.workflow_id=18' || return 1 ;;
+        source) expected_rc=4; watch_admission_update_json "$CASE/watch-run.json" '.head_sha=("f"*40)' || return 1 ;;
+        disabled) watch_admission_update_json "$ACT_REPOS_DIR/tool.yaml" '.enabled=false' || return 1 ;;
+        unreadable) expected_rc=8; WATCH_HTTP_RC=8 ;;
+        interrupted) expected_rc=5; WATCH_HTTP_RC=130 ;;
+        jobs-rerun) expected_rc=4; WATCH_HTTP_DRIFT=attempt ;;
+        *) return 1 ;;
+    esac
+    run_fallback --expected-sha "$SOURCE_SHA" --isolate-source --watch-admission "$WATCH_ADMISSION"
+    [[ "$RC" == "$expected_rc" && ! -e "$OUT" && ! -e "$CASE/lock" &&
+       ! -e "$DSR_STATE_DIR/fallback-sources" ]] && one_result &&
+        ! grep -Eq '^(INIT|LOCK|CHECK|BUILD|SIGN|RELEASE)( |$)' "$CALLS" &&
+        jq -e '.details.phase=="admission" and .details.phases.release=="blocked"' "$CASE/stdout" >/dev/null || return 1
+    if [[ "$1" == jobs-rerun ]]; then
+        [[ "$(grep -c '^UPSTREAM repos/owner/tool/actions/runs/12345 --no-cache$' "$CALLS")" == 2 ]] &&
+            grep -Fq 'UPSTREAM repos/owner/tool/actions/runs/12345/attempts/2/jobs?per_page=100&page=1 --no-cache' "$CALLS"
+    fi
+}
+test_watch_admission_late_refusal() {
+    watch_admission_fixture "late-$1" || return 1
+    WATCH_ADMISSION_TRANSITION="$1"
+    run_fallback --expected-sha "$SOURCE_SHA" --watch-admission "$WATCH_ADMISSION"
+    [[ "$RC" == 2 && ! -e "$CASE/lock" ]] && one_result &&
+        grep -q '^CHECK ' "$CALLS" && ! grep -q '^RELEASE ' "$CALLS" &&
+        jq -e '.details.phase=="admission" and .details.phases.release=="blocked"' "$CASE/stdout" >/dev/null || return 1
+    if [[ "$1" == quality ]]; then
+        ! grep -Eq '^(BUILD|SIGN) ' "$CALLS" && [[ ! -e "$OUT" ]]
+    else
+        jq -e '[.details.steps[] | select(.command=="release") | {status,exit_code}] ==
+            [{status:"error",exit_code:2}]' "$CASE/stdout" >/dev/null &&
+            grep -q '^BUILD ' "$CALLS" &&
+            [[ "$(cat "$OUT/daemon")" == 'daemon bytes' && "$(cat "$OUT/worker")" == 'worker bytes' ]] &&
+            jq -e --arg sha "$(_release_sha256 "$OUT/daemon")" --arg source "$SOURCE_SHA" \
+                '.source.git_sha==$source and any(.artifacts[]; .name=="daemon" and .sha256==$sha)' \
+                "$OUT/tool-v1.2.3-manifest.json" >/dev/null || return 1
+        if [[ "$1" == signing ]]; then
+            grep -q '^SIGN ' "$CALLS" && signing_verify "$OUT/daemon" && signing_verify "$OUT/worker"
+        fi
+    fi
+}
+test_watch_admission_arguments() {
+    watch_admission_fixture "arguments-$1" || return 1
+    local admission="$WATCH_ADMISSION"
+    case "$1" in
+        missing-field) admission=$(jq 'del(.run_attempt)' <<< "$admission") || return 1 ;;
+        extra-field) admission=$(jq '.unexpected=true' <<< "$admission") || return 1 ;;
+        fractional-attempt) admission=$(jq '.run_attempt=1.5' <<< "$admission") || return 1 ;;
+        wrong-repo) admission=$(jq '.repo="owner/other"' <<< "$admission") || return 1 ;;
+        bad-reason) admission=$(jq '.reason="manual"' <<< "$admission") || return 1 ;;
+        bad-threshold) admission=$(jq '.threshold_seconds=0' <<< "$admission") || return 1 ;;
+        missing-expected)
+            run_fallback --watch-admission "$admission"
+            [[ "$RC" == 4 && ! -s "$CALLS" && ! -e "$DSR_STATE_DIR" ]] && return 0
+            return 1 ;;
+        build-only)
+            run_fallback --expected-sha "$SOURCE_SHA" --watch-admission "$admission" --build-only
+            [[ "$RC" == 4 && ! -s "$CALLS" && ! -e "$DSR_STATE_DIR" ]] && return 0
+            return 1 ;;
+        *) return 1 ;;
+    esac
+    run_fallback --expected-sha "$SOURCE_SHA" --watch-admission "$admission"
+    [[ "$RC" == 4 && ! -s "$CALLS" && ! -e "$OUT" && ! -e "$DSR_STATE_DIR" ]]
+}
+
 test_build_failure() {
     setup "build-$1"; BUILD_RC="$1"; run_fallback
     [[ "$RC" == "$1" ]] && one_result && blocked &&
@@ -1681,6 +1841,14 @@ run_test test_success
 run_test test_throttle_check_interruption
 run_test test_throttle_check_manual_request 0
 run_test test_throttle_check_manual_request 8
+for mode in throttled failure timed_out startup_failure; do run_test test_watch_admission_success "$mode"; done
+for mode in success cancelled failed active waiting recent attempt workflow source disabled unreadable interrupted jobs-rerun; do
+    run_test test_watch_admission_initial_refusal "$mode"
+done
+for mode in quality build signing; do run_test test_watch_admission_late_refusal "$mode"; done
+for mode in missing-field extra-field fractional-attempt wrong-repo bad-reason bad-threshold missing-expected build-only; do
+    run_test test_watch_admission_arguments "$mode"
+done
 for rc in 1 2 3 4 5 6 8 130 143; do run_test test_build_failure "$rc"; done
 for mode in missing malformed multiple empty partial wrong-tool wrong-version duplicate unsafe diagnostic corrupt absent symlink manifest-link hash-failure extra-payload; do
     run_test test_manifest_failure "$mode"

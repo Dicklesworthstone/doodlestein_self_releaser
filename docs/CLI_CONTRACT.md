@@ -550,17 +550,39 @@ automatic admission, including when a throttled result predates a local edit.
 A duplicate registry entry cannot revive a per-tool opt-out. `repos list`
 reports the same effective inventory and preserves explicit `false` in JSON.
 
-Disabling a tool does not consume retry budget, reset cooldown, retire pending
-work, alter retained checkpoints or stop an already admitted worker. Re-enabling
-it permits recovery only through the existing source, status, capacity and
-checkpoint requirements. Explicit `check`, `build`, `release` and `fallback`
+Disabling a tool before launch preserves retry budget, cooldown, pending work
+and retained checkpoints. An already started worker rechecks the policy at its
+next admission boundary, retains any built artifacts and withholds subsequent
+work; an executing compiler is not interrupted by a configuration edit.
+Re-enabling permits recovery only through the existing source, status, capacity
+and checkpoint requirements. Explicit `check`, `build`, `release` and `fallback`
 invocations remain manual operations and do not treat `enabled: false` as a
 prohibition; monitoring can still report a disabled repository's queued runs.
 
-Automatic fallback requires an explicit `v`-prefixed version tag and the
-workflow run's full source SHA. The watcher passes both to `fallback`; missing
-or ambiguous source identity never falls back to detecting a version from the
-current checkout. It also passes `--isolate-source`: quality checks, builds and
+Automatic fallback binds the repository, explicit `v`-prefixed version tag,
+full source SHA, workflow ID, run ID and run attempt. The watcher passes this
+identity, its queue threshold and the admission reason to `fallback` through
+the reserved `--watch-admission` argument. A missing or ambiguous field
+withholds the launch. Each actual retry receives a freshly observed admission;
+saved journal metadata alone cannot authorize a worker.
+
+The worker rechecks that admission before allocating build state or preparing
+source, after source preparation, immediately before compilation or completed
+build reuse, and before handing verified artifacts to publication. Each check
+uses uncached exact-run observations around attempt-specific job inspection.
+Running jobs, approval waits, recent queue activity, upstream completion, a
+rerun, changed identity, disabled policy or unreadable evidence withhold the
+next stage. A raised queue threshold applies immediately; a lower threshold
+does not broaden an already launched worker's authority. Terminal recovery
+requires the explicit `upstream_failure` reason and a fresh observation of
+`failure`, `timed_out` or `startup_failure`; queue admission cannot silently
+become terminal recovery. The journal and fallback result retain the original
+admission, and `details.watch_observation` records the latest successful check
+or null after a refusal. These checks precede publication handoff; GitHub does
+not provide an atomic lock tying workflow state to release publication.
+
+Missing source identity never falls back to detecting a version from the
+current checkout. The watcher also passes `--isolate-source`: quality checks, builds and
 publication use a private materialization of that exact commit. A newer, dirty
 or absent developer checkout does not prevent automatic fallback. Available
 objects and the matching tag are copied without modifying the checkout; when
@@ -2588,14 +2610,20 @@ Full fallback pipeline: check -> build -> release.
 dsr fallback --repo <name> [--version <tag>]
 ```
 
-This is the main command for automated fallback. Equivalent to:
-```bash
-dsr check --repo $REPO && dsr build --repo $REPO && dsr release --repo $REPO
-```
+This command coordinates quality checks, builds, verification, signing and
+publication, preserving source and artifact identity between stages.
 
 The check step records why the fallback ran (`details.trigger`, e.g. "release
 workflow throttled: 1 run(s) over 600s"). A healthy or unavailable check does
-not block a requested fallback. Explicit cancellation stops with exit 5,
+not block an explicit manual fallback. Watcher workers instead carry the
+reserved `--watch-admission <json>` argument and require fresh evidence for
+their exact workflow attempt at each boundary described under `dsr watch`.
+This argument requires an explicit version and `--expected-sha`, and cannot
+be combined with `--build-only`. Withdrawal returns `2`, changed identity or
+invalid admission returns `4`, interrupted reads return `5`, and unavailable
+upstream evidence returns `8`. Refusals report `details.phase: "admission"`,
+block publication, and retain already built artifacts for eligible recovery.
+Explicit cancellation of a manual throttle check stops with exit 5,
 records the interrupted check, and blocks quality checks, compilation, signing,
 and publication while releasing the coordinator lock. Its step carries
 `throttled` and the check's own exit code. The build step covers the quality

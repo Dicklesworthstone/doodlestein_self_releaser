@@ -12,6 +12,7 @@ on:
       - scripts/tests/test_act_runner_native.sh
       - scripts/tests/test_cargo_cache.sh
       - scripts/tests/test_native_single_archives.sh
+      - scripts/tests/test_packaging_reproducible.sh
       - scripts/tests/test_strict_cargo_private_cache.sh
       - scripts/tests/test_toolchain_identity.sh
       - .github/workflows/native-archive-regression.yml
@@ -94,6 +95,7 @@ jobs:
           bash -n src/cargo_sources.sh
           bash -n scripts/tests/test_cargo_cache.sh
           bash -n scripts/tests/test_native_single_archives.sh
+          bash -n scripts/tests/test_packaging_reproducible.sh
           bash -n scripts/tests/test_strict_cargo_private_cache.sh
           bash scripts/tests/test_cargo_cache.sh
           bash scripts/tests/test_strict_cargo_private_cache.sh
@@ -102,3 +104,4 @@ jobs:
           DSR_TEST_TAR=gnu bash scripts/tests/test_native_single_archives.sh
           DSR_TEST_TAR=bsd bash scripts/tests/test_native_single_archives.sh
           bash scripts/tests/test_act_runner_native.sh --archive-delivery-only
+          bash scripts/tests/test_packaging_reproducible.sh
