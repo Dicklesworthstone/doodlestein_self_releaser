@@ -62,6 +62,41 @@ PY
 build_one() (export SOURCE_DATE_EPOCH=1700000001 TZ=UTC; umask 022; packaging_build_archive "$1" "$2" "$work/one" tool docs LICENSE)
 build_two() (export SOURCE_DATE_EPOCH=1700000001 TZ=Pacific/Kiritimati; umask 077; packaging_build_archive "$1" "$2" "$work/two" LICENSE docs tool tool)
 
+# Exercise the production native stream entry points with both a held output
+# descriptor and an actual pipe. ZIP output must not change with seekability.
+native_write() (
+    local epoch="$1" delivery="$2" format="$3" destination="$4" payload="$5" writer
+    shift 5
+    source "$ROOT/src/act_runner.sh" || return $?
+    export SOURCE_DATE_EPOCH="$epoch"
+    case "$format" in
+        tar.gz) writer=_act_stream_workspace_tar_gz ;;
+        tar.xz) writer=_act_stream_workspace_tar_xz ;;
+        zip) writer=_act_stream_workspace_zip ;;
+        *) return 4 ;;
+    esac
+    case "$delivery" in
+        file)
+            export TZ=UTC
+            umask 022
+            "$writer" "$payload" "$@" > "$destination"
+            ;;
+        pipe)
+            export TZ=Pacific/Kiritimati
+            umask 077
+            "$writer" "$payload" "$@" | cat > "$destination"
+            ;;
+        receipt)
+            umask 077
+            _act_collect_stream_exclusive "$destination" 600 "$writer" "$payload" "$@"
+            ;;
+        *) return 4 ;;
+    esac
+)
+long_member='docs/'
+for ((part=0; part<24; part++)); do long_member+='long-'; done
+long_member+='guide with spaces'
+
 for format in tar.gz tar.xz zip; do
     if [[ "$format" == zip ]] && { ! command -v zip >/dev/null || ! command -v unzip >/dev/null; }; then
         printf 'SKIP zip: install zip and unzip\n'; skipped=$((skipped + 1)); continue
@@ -103,6 +138,57 @@ else:
         assert struct.unpack('<I', header[4:8])[0] == epoch
 PY
     then pass "$format independent metadata inspection"; else fail "$format metadata inspection"; fi
+
+    native_first="$dir/native-file.$format" native_second="$dir/native-pipe.$format"
+    run_ok "$format native descriptor writer succeeds" native_write 1700000001 file \
+        "$format" "$native_first" "$work/one" tool "$long_member" LICENSE
+    run_ok "$format native pipe writer succeeds with reordered private inputs" native_write 1700000001 pipe \
+        "$format" "$native_second" "$work/two" LICENSE "$long_member" tool
+    equal "$format native output matches independently built canonical archive" "$first" "$native_first"
+    equal "$format native bytes ignore output seekability and source metadata" "$native_first" "$native_second"
+
+    # No acceptance receipt may be emitted until the real writer has finished
+    # and the collector has independently bound the produced bytes and inode.
+    if command -v jq >/dev/null && \
+       { command -v sha256sum >/dev/null || command -v shasum >/dev/null; }; then
+        collected="$dir/native-collected.$format"
+        if native_write 1700000001 receipt "$format" "$collected" "$work/two" \
+            tool LICENSE "$long_member" > "$dir/native-receipt.json" 2> "$work/stderr"; then
+            if python3 - "$dir/native-receipt.json" "$collected" <<'PY'
+import hashlib, json, os, stat, sys
+with open(sys.argv[1], encoding='utf-8') as stream:
+    receipt = json.load(stream)
+path = sys.argv[2]
+info = os.stat(path)
+with open(path, 'rb') as stream:
+    data = stream.read()
+assert receipt['path'] == path
+assert receipt['sha256'] == hashlib.sha256(data).hexdigest()
+assert receipt['size_bytes'] == info.st_size == len(data) > 0
+assert receipt['identity'] in (f'gnu:{info.st_dev}:{info.st_ino}', f'bsd:{info.st_ino}')
+assert stat.S_IMODE(info.st_mode) == 0o600
+PY
+            then pass "$format native collector retains exact private artifact receipt"
+            else fail "$format native collection receipt"; fi
+        else
+            fail "$format native collection failed"
+            cat "$work/stderr" >&2
+        fi
+        equal "$format receipt-bound archive preserves canonical bytes" "$first" "$collected"
+        native_write invalid receipt "$format" "$dir/native-refused.$format" "$work/one" \
+            tool > "$work/stdout" 2> "$work/stderr"
+        native_status=$?
+        if [[ $native_status -eq 7 && ! -s "$work/stdout" &&
+              -f "$dir/native-refused.$format" && ! -s "$dir/native-refused.$format" ]] && \
+           grep -Fq 'SOURCE_DATE_EPOCH must be an integer' "$work/stderr"; then
+            pass "$format invalid epoch cannot produce bytes or a collection receipt"
+        else
+            fail "$format invalid epoch collection refusal: exit $native_status"
+        fi
+    else
+        printf 'SKIP %s native collection receipt: install jq and a SHA-256 utility\n' "$format"
+        skipped=$((skipped + 1))
+    fi
 
     # Existing verified bytes are authoritative even when another epoch is
     # selected. This is intentionally not an in-place recompression command.
@@ -154,6 +240,14 @@ PY
         run_invalid "$format rejects invalid epoch [$epoch] even on reuse" \
             env SOURCE_DATE_EPOCH="$epoch" bash -c 'source "$1"; packaging_build_archive "$2" "$3" "$4" tool docs LICENSE' _ \
             "$ROOT/src/packaging.sh" "$format" "$first" "$work/one"
+        run_invalid "$format native stream rejects invalid epoch [$epoch]" native_write "$epoch" file \
+            "$format" "$dir/native-invalid.$format" "$work/one" tool
+        if [[ -f "$dir/native-invalid.$format" && ! -s "$dir/native-invalid.$format" ]] && \
+           grep -Fq 'SOURCE_DATE_EPOCH must be an integer' "$work/stderr"; then
+            pass "$format invalid native policy refuses before archive bytes"
+        else
+            fail "$format invalid native policy did not refuse at epoch validation"
+        fi
     done
     equal "$format invalid policy never changes existing archive" "$first" "$second"
 done
@@ -189,7 +283,7 @@ for path, before in json.load(open(sys.argv[1])).items():
     assert [s.st_mode, s.st_uid, s.st_gid, s.st_mtime_ns] == before, path
 PY
 then pass 'source metadata never modified'; else fail 'source metadata modified'; fi
-[[ -z "$(find "$work" -name '.dsr-package.*' -o -name '.dsr-repack.*')" ]] && \
+[[ -z "$(find "$work" -name '.dsr-package.*' -o -name '.dsr-repack.*' -o -name '.dsr-archive.*')" ]] && \
     pass 'staging cleaned on success and failure' || fail 'staging cleanup'
 printf '\nReproducible packaging: %s passed, %s failed, %s skipped\n' "$passed" "$failed" "$skipped"
 [[ $failed -eq 0 ]]

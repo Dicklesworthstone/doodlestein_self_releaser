@@ -333,11 +333,19 @@ bash src/release_packaging.sh --recipe /srv/packaging.json \
   --repo OWNER/REPO --tag v1.2.3 --sha "$SOURCE_COMMIT"
 ```
 
-The same environment selection works with sourced `packaging_build_archive`
-and with cross-format `packaging_repack_archive`. It is opt-in: an unset
-variable retains the existing native archive-tool behavior. A set value must
-contain 1–10 decimal digits and be in `0..4294967295`, the common unsigned gzip
-timestamp range. Invalid values return `4` from the packaging helpers even if
+The same environment selection works with sourced `packaging_build_archive`,
+with cross-format `packaging_repack_archive`, and with the native archive
+streams used for single-binary and workspace releases. For `dsr build`, export
+`SOURCE_DATE_EPOCH` in the coordinator environment before starting the build.
+New native archives use the same sorted-member writer and canonical metadata
+as recipe packaging, so file-descriptor and pipe consumers receive identical
+bytes. The writer completes a private compressed file before streaming it to
+the native collector; the original private payload files and collection
+receipts remain unchanged. It is opt-in: an unset variable retains the existing
+native archive-tool behavior.
+
+A set value must contain 1–10 decimal digits and be in `0..4294967295`, the
+common unsigned gzip timestamp range. Invalid values return `4` from the packaging helpers even if
 an existing archive could otherwise be reused. A new reproducible archive needs
 Python 3.8+ with standard gzip, lzma, tarfile and zipfile support; a missing
 interpreter or archive module returns dependency code `3`.

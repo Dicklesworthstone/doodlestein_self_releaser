@@ -438,6 +438,7 @@ packaging_stream_archive() (
     set -o pipefail
     local format="$1" payload_dir="$2" staging_parent="$3"
     shift 3
+    _pkg_validate_epoch || return $?
     [[ $# -gt 0 && -d "$payload_dir" && ! -L "$payload_dir" &&
        -d "$staging_parent" && ! -L "$staging_parent" ]] || return 4
     unset TAR_OPTIONS ZIPOPT GZIP XZ_OPT XZ_DEFAULTS
@@ -558,6 +559,18 @@ except (OSError, ValueError) as error:
     print('ERROR: Release archive staging failed: ' + str(error), file=sys.stderr)
     sys.exit(4)
 PY
+
+    if [[ ${SOURCE_DATE_EPOCH+x} ]]; then
+        # Keep the same canonical writer as packaging_build_archive. Finalize
+        # its seekable private output before streaming it: ZIP headers must not
+        # depend on whether the caller supplies a file descriptor or a pipe.
+        # The normalized copies above retain the native source-custody checks.
+        printf '%s\n' "$@" | LC_ALL=C sort > "$workdir/reproducible-members" || return 4
+        _pkg_reproducible_archive "$format" "$workdir/artifact.$format" \
+            "$workdir/payload" "$workdir/reproducible-members" || return $?
+        cat -- "$workdir/artifact.$format" || return 4
+        return 0
+    fi
 
     case "$format" in
         tar.gz|tgz)
