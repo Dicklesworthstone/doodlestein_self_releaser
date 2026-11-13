@@ -829,7 +829,7 @@ _installer_api_download() (
             transfer_statuses=("${PIPESTATUS[@]}")
             for transfer_status in "${transfer_statuses[@]}"; do
                 case "$transfer_status" in
-                    129|130|143) _log_error "GitHub acquisition was cancelled"; return 5 ;;
+                    129|130|131|143) _log_error "GitHub acquisition was cancelled"; return 5 ;;
                 esac
             done
             if [[ "${transfer_statuses[1]:-0}" == 42 ]]; then
@@ -1003,11 +1003,98 @@ _installer_api_fetch_asset() {
     fi
 }
 
+# Anonymous requests distinguish proven absence from refusals before source
+# fallback. Bound every response and the complete redirect chain, ignore curl
+# configuration, and retain HTTP evidence when a transfer subsequently fails.
+# Status 9 is internal: a denied anonymous API request may still resolve a
+# public tag, or a denied public asset may use gh, but neither authorizes source.
+_installer_public_download() (
+    set +x
+    local url="$1" destination="$2" maximum="$3" limit="$4" kind="$5"
+    local status reply next remaining bytes part code escaped_url
+    local redirects=0 deadline=$((SECONDS + limit))
+    local response_file="$destination.http" transfer_maximum="$maximum"
+    local -a transfer_statuses=() method=()
+    [[ "$maximum" =~ ^[1-9][0-9]*$ && "$limit" =~ ^[1-9][0-9]*$ &&
+       ( "$kind" == json || "$kind" == asset || "$kind" == head ) ]] || return 4
+    command -v curl >/dev/null 2>&1 || return 3
+    ((transfer_maximum >= 65536)) || transfer_maximum=65536
+    [[ "$kind" != head ]] || method=(--head)
+    while ((redirects <= 5)); do
+        _installer_api_https_url "$url" || {
+            _log_error "Refusing an unsafe public release redirect"; return 8;
+        }
+        if [[ "$kind" == json ]]; then
+            _installer_api_in_scope "$url" || {
+                _log_error "Public release API redirect changed the selected repository"; return 8;
+            }
+        elif [[ "$kind" == head && "$url" != "https://github.com/$REPO/releases/latest" ]]; then
+            part="${url#"https://github.com/$REPO/releases/tag/"}"
+            part="${part//%2B/+}"; part="${part//%2b/+}"
+            [[ "$url" == "https://github.com/$REPO/releases/tag/"* ]] && _valid_release_version "$part" || {
+                _log_error "Public release discovery left the selected repository tag route"; return 8;
+            }
+        fi
+        remaining=$((deadline - SECONDS))
+        if ((remaining <= 0)); then
+            _log_error "Public release request exceeded its complete-transfer deadline"
+            return 1
+        fi
+        escaped_url="${url//\\/\\\\}"; escaped_url="${escaped_url//\"/\\\"}"
+        if ! printf 'url = "%s"\n' "$escaped_url" |
+            curl -q --config - --silent --globoff --proto '=https' --proto-redir '=https' \
+            --connect-timeout 15 --max-time "$remaining" --max-filesize "$transfer_maximum" \
+            --user-agent 'dsr-installer' ${method[@]+"${method[@]}"} \
+            --output /dev/fd/3 --write-out '%{http_code}\n%{redirect_url}' \
+            3>&1 > "$response_file" 2>/dev/null | head -c "$((transfer_maximum + 1))" > "$destination"; then
+            transfer_statuses=("${PIPESTATUS[@]}")
+            for code in "${transfer_statuses[@]}"; do
+                case "$code" in 129|130|131|143) _log_error "Release acquisition was cancelled"; return 5 ;; esac
+            done
+            [[ "${transfer_statuses[1]:-0}" != 42 ]] || return 5
+            reply=$(cat -- "$response_file") || return 8
+            status="${reply%%$'\n'*}"
+            if [[ "${transfer_statuses[0]:-1}" == 0 && "${transfer_statuses[2]:-1}" == 0 ]]; then
+                case "$status" in
+                    000|200|408|429|5[0-9][0-9])
+                        case "${transfer_statuses[1]:-0}" in
+                            5|6|7|16|18|28|52|55|56|92|95) return 1 ;;
+                        esac
+                        ;;
+                esac
+            fi
+            _log_error "Public release transfer failed without availability evidence"
+            return 8
+        fi
+        bytes=$(wc -c < "$destination" | tr -d '[:space:]') || return 8
+        [[ "$bytes" =~ ^[0-9]+$ ]] && ((bytes <= transfer_maximum)) || return 7
+        reply=$(cat -- "$response_file") || return 8
+        status="${reply%%$'\n'*}"
+        if [[ "$status" == 200 ]]; then
+            ((bytes <= maximum)) || return 7
+            [[ "$kind" != head ]] || printf '%s\n' "$url"
+            return 0
+        fi
+        case "$status" in
+            301|302|303|307|308)
+                next="${reply#*$'\n'}"
+                [[ "$reply" == *$'\n'* && -n "$next" && $redirects -lt 5 ]] || return 8
+                url="$next"; redirects=$((redirects + 1))
+                ;;
+            404|410|408|429|5[0-9][0-9]) return 1 ;;
+            403) [[ "$kind" != json && "$kind" != asset ]] || return 9; return 8 ;;
+            401) [[ "$kind" != asset ]] || return 9; return 8 ;;
+            *) _log_error "Public release request failed with HTTP ${status:-unknown}"; return 8 ;;
+        esac
+    done
+    return 8
+)
+
 # Fetch one exact asset for payloads AND their checksum/signature sidecars.
 # Transport fallback happens here, before verification, never after it fails.
 _fetch_release_asset() {
-    local asset="$1" dest="$2" maximum="${3:-2147483648}" url
-    local source_fallback="${4:-false}"
+    local asset="$1" dest="$2" maximum="${3:-2147483648}" url status=0 failure=3
+    local source_fallback="${4:-false}" gh_ambiguous=false
     $_OFFLINE_MODE && return 1
     [[ "$asset" =~ ^[A-Za-z0-9._+-]+$ && "$asset" != . && "$asset" != .. ]] || return 4
     if _installer_token_api_selected; then
@@ -1016,23 +1103,42 @@ _fetch_release_asset() {
     fi
     url="https://github.com/$REPO/releases/download/$_VERSION/${asset//+/%2B}"
     if $_PREFER_GH && command -v gh &>/dev/null; then
-        if _installer_run_gh release download "$_VERSION" --repo "github.com/$REPO" --pattern "$asset" --output "$dest" --clobber 2>/dev/null &&
-           [[ -f "$dest" && ! -L "$dest" && -s "$dest" ]]; then
+        _installer_run_gh release download "$_VERSION" --repo "github.com/$REPO" --pattern "$asset" --output "$dest" --clobber 2>/dev/null || status=$?
+        if ((status == 0)); then
+            [[ -f "$dest" && ! -L "$dest" && -s "$dest" ]] || return 7
             return 0
         fi
+        case "$status" in 5|4) return "$status" ;; 1) gh_ambiguous=true ;; 3) ;; *) failure=8 ;; esac
     fi
-    if command -v curl &>/dev/null &&
-       curl -sSfL --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 300 \
-           --retry 2 "$url" -o "$dest" 2>/dev/null && [[ -f "$dest" && ! -L "$dest" && -s "$dest" ]]; then
-        return 0
+    if command -v curl &>/dev/null; then
+        status=0
+        _installer_public_download "$url" "$dest" "$maximum" 300 asset || status=$?
+        if ((status == 0)); then
+            [[ -f "$dest" && ! -L "$dest" && -s "$dest" ]] || return 7
+            return 0
+        fi
+        case "$status" in
+            1) [[ "$failure" == 8 ]] || failure=1 ;;
+            9) failure=8 ;;
+            *) return "$status" ;;
+        esac
     fi
     if ! $_PREFER_GH && command -v gh &>/dev/null; then
-        if _installer_run_gh release download "$_VERSION" --repo "github.com/$REPO" --pattern "$asset" --output "$dest" --clobber 2>/dev/null &&
-           [[ -f "$dest" && ! -L "$dest" && -s "$dest" ]]; then
+        status=0
+        _installer_run_gh release download "$_VERSION" --repo "github.com/$REPO" --pattern "$asset" --output "$dest" --clobber 2>/dev/null || status=$?
+        if ((status == 0)); then
+            [[ -f "$dest" && ! -L "$dest" && -s "$dest" ]] || return 7
             return 0
         fi
+        case "$status" in 5|4) return "$status" ;; 1) gh_ambiguous=true ;; 3) ;; *) failure=8 ;; esac
     fi
-    return 1
+    # A missing optional sidecar may proceed to another checksum filename
+    # after curl independently proves availability failure. An ambiguous gh
+    # failure cannot supply that evidence, or permit compiling the payload.
+    if $gh_ambiguous && { [[ "$source_fallback" == true ]] || [[ "$failure" == 3 ]]; }; then
+        return 8
+    fi
+    return "$failure"
 }
 
 # A tag becomes one URL and cache-path component; never accept API null,
@@ -1043,36 +1149,46 @@ _valid_release_version() {
 
 # Use authenticated discovery for private repos and an API-independent public
 # redirect when the releases API is throttled. Never guess a tag from a date.
-_get_latest_version() {
+_get_latest_version() (
     local api_url="https://api.github.com/repos/$REPO/releases/latest"
-    local response version="" effective prefix="https://github.com/$REPO/releases/tag/"
+    local version="" effective prefix="https://github.com/$REPO/releases/tag/"
+    local status=0 failure=3 directory
     $_OFFLINE_MODE && return 4
     if _installer_token_api_selected; then
         _installer_api_latest "$_ALLOW_SOURCE_BUILD"
         return $?
     fi
     if $_PREFER_GH && command -v gh &>/dev/null; then
-        if version=$(_installer_run_gh release view --repo "github.com/$REPO" --json tagName --jq '.tagName' 2>/dev/null) &&
-           _valid_release_version "$version"; then
+        version=$(_installer_run_gh release view --repo "github.com/$REPO" --json tagName --jq '.tagName' 2>/dev/null) || status=$?
+        if ((status == 0)); then
+            _valid_release_version "$version" || return 7
             printf '%s\n' "$version"; return 0
         fi
+        case "$status" in 5|4) return "$status" ;; 3) ;; *) failure=8 ;; esac
     fi
     if command -v curl &>/dev/null; then
-        if response=$(curl -sSfL --proto '=https' --proto-redir '=https' --connect-timeout 10 \
-            --max-time 30 "$api_url" 2>/dev/null); then
-            if command -v jq &>/dev/null; then
-                version=$(jq -er -s 'if length == 1 and (.[0].tag_name | type == "string")
-                    then .[0].tag_name else error("invalid release") end' <<< "$response" 2>/dev/null) || version=""
-                if _valid_release_version "$version"; then
-                    printf '%s\n' "$version"; return 0
-                fi
+        directory=$(mktemp -d) || return 8
+        trap 'rm -rf -- "$directory"' EXIT
+        if command -v jq &>/dev/null; then
+            status=0
+            _installer_public_download "$api_url" "$directory/release.json" 8388608 30 json || status=$?
+            if ((status == 0)); then
+                version=$(jq -er -s 'if length == 1 and (.[0] | type == "object") and
+                    (.[0].tag_name | type == "string") then .[0].tag_name else error("invalid release") end' \
+                    "$directory/release.json" 2>/dev/null) && _valid_release_version "$version" &&
+                    _installer_api_release_id "$directory/release.json" "$version" >/dev/null || {
+                    _log_error "Malformed public release metadata"; return 7;
+                }
+                printf '%s\n' "$version"; return 0
             fi
+            case "$status" in 1) [[ "$failure" == 8 ]] || failure=1 ;; 9) failure=8 ;; *) return "$status" ;; esac
         fi
         # HEAD follows only HTTPS redirects. Pin the final owner/repo and tag
         # route rather than accepting a login page, another repo, or /latest.
-        if effective=$(curl -sSfIL --proto '=https' --proto-redir '=https' --max-redirs 5 \
-            --connect-timeout 10 --max-time 30 -o /dev/null -w '%{url_effective}' \
-            "https://github.com/$REPO/releases/latest" 2>/dev/null) && [[ "$effective" == "$prefix"* ]]; then
+        status=0
+        effective=$(_installer_public_download "https://github.com/$REPO/releases/latest" \
+            "$directory/latest" 8388608 30 head) || status=$?
+        if ((status == 0)) && [[ "$effective" == "$prefix"* ]]; then
             version="${effective#"$prefix"}"
             version="${version//%2B/+}"; version="${version//%2b/+}"
             if _valid_release_version "$version"; then
@@ -1080,16 +1196,26 @@ _get_latest_version() {
                 printf '%s\n' "$version"; return 0
             fi
         fi
-    fi
-    if ! $_PREFER_GH && command -v gh &>/dev/null; then
-        if version=$(_installer_run_gh release view --repo "github.com/$REPO" --json tagName --jq '.tagName' 2>/dev/null) &&
-           _valid_release_version "$version"; then
-            printf '%s\n' "$version"; return 0
+        if ((status == 1)); then
+            [[ "$failure" == 8 ]] || failure=1
+        elif ((status == 0)); then
+            return 8
+        else
+            return "$status"
         fi
     fi
+    if ! $_PREFER_GH && command -v gh &>/dev/null; then
+        status=0
+        version=$(_installer_run_gh release view --repo "github.com/$REPO" --json tagName --jq '.tagName' 2>/dev/null) || status=$?
+        if ((status == 0)); then
+            _valid_release_version "$version" || return 7
+            printf '%s\n' "$version"; return 0
+        fi
+        case "$status" in 5|4) return "$status" ;; 3) ;; *) failure=8 ;; esac
+    fi
     _log_error "Cannot resolve latest release; use --version with an existing release tag"
-    return 1
-}
+    return "$failure"
+)
 
 # Accept exactly one SHA256 record for the RELEASE name, not the staging name.
 # Hash-only sidecars are allowed only when fetched as <asset>.sha256.

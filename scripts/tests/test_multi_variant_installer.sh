@@ -81,20 +81,36 @@ SH
 cat > "$work/transports/curl" <<'SH'
 #!/usr/bin/env bash
 set -uo pipefail
-url='' dest=''
+url='' dest='' write_out='' config_stdin=false
 while (($#)); do
     case "$1" in
         -o|--output) dest="$2"; shift 2 ;;
-        --proto|--proto-redir|--connect-timeout|--max-time|--retry|--max-redirs|-w) shift 2 ;;
+        --proto|--proto-redir|--connect-timeout|--max-time|--retry|--max-redirs) shift 2 ;;
+        -w|--write-out) write_out="$2"; shift 2 ;;
+        --config) [[ "$2" != - ]] || config_stdin=true; shift 2 ;;
         https:*) url="$1"; shift ;;
         *) shift ;;
     esac
 done
+if $config_stdin; then
+    while IFS= read -r line; do
+        if [[ "$line" == 'url = "'*'"' ]]; then
+            url="${line#'url = "'}"; url="${url%'"'}"
+            url="${url//\\\"/\"}"; url="${url//\\\\/\\}"
+        fi
+    done
+fi
 printf 'curl %s\n' "$url" >> "$CALLS"
+missing() {
+    if [[ "$write_out" == *http_code* ]]; then printf '404\n'; return 0; fi
+    return 22
+}
 name="${url##*/}"
-[[ -z "$WITHHELD_TRIPLE" || "$name" != *"linux-$WITHHELD_TRIPLE"* ]] || exit 22
-[[ -n "$dest" && -f "$REMOTE/$name" ]] || exit 22
-cp "$REMOTE/$name" "$dest"
+[[ -n "$dest" ]] || exit 2
+[[ -z "$WITHHELD_TRIPLE" || "$name" != *"linux-$WITHHELD_TRIPLE"* ]] || { missing; exit $?; }
+[[ -f "$REMOTE/$name" ]] || { missing; exit $?; }
+cp "$REMOTE/$name" "$dest" || exit 23
+[[ "$write_out" != *http_code* ]] || printf '200\n'
 SH
 cat > "$work/transports/gh" <<'SH'
 #!/usr/bin/env bash

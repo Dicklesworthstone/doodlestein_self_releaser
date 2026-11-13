@@ -9,8 +9,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ROOT="${DSR_TEST_ROOT:-$ROOT}"
 TEST_MODE="${1:-}"
 [[ $# -eq 0 || ( $# -eq 1 && ( "$TEST_MODE" == --go-workspace-bootstrap-only ||
-    "$TEST_MODE" == --libc-source-fallback-only ) ) ]] || {
-    printf 'Usage: %s [--go-workspace-bootstrap-only|--libc-source-fallback-only]\n' "$0" >&2
+    "$TEST_MODE" == --libc-source-fallback-only || "$TEST_MODE" == --acquisition-fallback-only ) ) ]] || {
+    printf 'Usage: %s [--go-workspace-bootstrap-only|--libc-source-fallback-only|--acquisition-fallback-only]\n' "$0" >&2
     exit 4
 }
 for dependency in git jq go tar; do
@@ -136,15 +136,65 @@ FRESHNESS
 cat > "$TEMP/bin/curl" <<'CURL'
 #!/usr/bin/env bash
 set -uo pipefail
-url='' dest=''
+url='' dest='' write_out='' config_stdin=false
 while (($#)); do
     case "$1" in
         -o|--output) dest="$2"; shift 2 ;;
+        -w|--write-out) write_out="$2"; shift 2 ;;
+        --config) [[ "$2" != - ]] || config_stdin=true; shift 2 ;;
         https://*) url="$1"; shift ;;
         *) shift ;;
     esac
 done
+if $config_stdin; then
+    while IFS= read -r line; do
+        if [[ "$line" == 'url = "'*'"' ]]; then
+            url="${line#'url = "'}"; url="${url%'"'}"
+            url="${url//\\\"/\"}"; url="${url//\\\\/\\}"
+        fi
+    done
+fi
 printf 'curl %s\n' "$url" >> "$CALLS"
+response() {
+    local code="$1" body="${2:-}" location="${3:-}"
+    if [[ -n "$dest" ]]; then printf '%s' "$body" > "$dest" || return 23
+    else printf '%s' "$body" || return 23; fi
+    if [[ "$write_out" == *http_code* ]]; then
+        printf '%s\n%s' "$code" "$location"
+    elif [[ "$write_out" == *url_effective* ]]; then
+        printf '%s' "${location:-$url}"
+    elif [[ "$code" != 200 ]]; then return 22; fi
+}
+if [[ "$url" == *github.com* && "${ACQUISITION_FAILURE_STAGE:-}" != '' ]]; then
+    stage=payload
+    [[ "$url" != */releases/latest ]] || stage=discovery
+    if [[ "$stage" == "$ACQUISITION_FAILURE_STAGE" ]]; then
+        case "${ACQUISITION_FAILURE:-}" in
+            tls) response 000; exit 60 ;;
+            write) response 000; exit 23 ;;
+            cancel) response 000; exit 130 ;;
+            quit) response 000; exit 131 ;;
+            denied) response 403; exit $? ;;
+            unauthorized) response 401; exit $? ;;
+            unavailable) response 503; exit $? ;;
+            missing) response 404; exit $? ;;
+            malformed)
+                if [[ "$url" == https://api.github.com/* ]]; then response 200 '{"tag_name":'
+                else response 404; fi
+                exit $? ;;
+            invalid-tag)
+                if [[ "$url" == https://api.github.com/* ]]; then response 200 '{"tag_name":"../bad"}'
+                else response 404; fi
+                exit $? ;;
+            draft)
+                response 200 '{"id":17,"tag_name":"v1.0.0","draft":true}'; exit $? ;;
+            missing-id)
+                response 200 '{"tag_name":"v1.0.0","draft":false}'; exit $? ;;
+            api-rate-limit)
+                if [[ "$url" == https://api.github.com/* ]]; then response 403; exit $?; fi ;;
+        esac
+    fi
+fi
 case "$url" in
     'https://go.dev/dl/?mode=json&include=all')
         [[ "${BOOTSTRAP_MODE:-good}" != unavailable ]] || exit 22
@@ -161,20 +211,37 @@ case "$url" in
         freshness-response "$url" > "$dest"
         ;;
     */releases/latest)
-        [[ "$MODE" != discovery-fail ]] || exit 22
-        printf '{"tag_name":"v1.0.0"}\n'
+        [[ "$MODE" != discovery-fail ]] || { response 404; exit $?; }
+        if [[ "$url" == https://api.github.com/* ]]; then
+            response 200 '{"id":17,"tag_name":"v1.0.0","draft":false}'
+        else
+            response 302 '' 'https://github.com/example/source-app/releases/tag/v1.0.0'
+        fi
+        ;;
+    https://github.com/example/source-app/releases/tag/v1.0.0)
+        response 200
         ;;
     */releases/download/*)
-        [[ "$MODE" != download-fail && "$MODE" != discovery-fail ]] || exit 22
+        [[ "$MODE" != download-fail && "$MODE" != discovery-fail ]] || { response 404; exit $?; }
         asset="${url##*/}"
         [[ -n "$dest" ]] || exit 22
+        if [[ "${ACQUISITION_FAILURE:-}" == canonical-checksums ]]; then
+            case "$asset" in
+                *.sha256) response 404; exit $? ;;
+                SHA256SUMS)
+                    cp "$RELEASE_FIXTURES/$ASSET.sha256" "$dest" || exit 23
+                    [[ "$write_out" != *http_code* ]] || printf '200\n'
+                    exit 0 ;;
+            esac
+        fi
         if [[ "$MODE" == checksum-bad && "$asset" == *.sha256 ]]; then
-            printf '%064d  %s\n' 0 "$ASSET" > "$dest"
+            printf '%064d  %s\n' 0 "$ASSET" > "$dest" || exit 23
         elif [[ "$asset" == *.minisig ]]; then
-            printf 'signature fixture\n' > "$dest"
+            printf 'signature fixture\n' > "$dest" || exit 23
         elif [[ -f "$RELEASE_FIXTURES/$asset" ]]; then
-            cp "$RELEASE_FIXTURES/$asset" "$dest"
-        else exit 22; fi
+            cp "$RELEASE_FIXTURES/$asset" "$dest" || exit 23
+        else response 404; exit $?; fi
+        [[ "$write_out" != *http_code* ]] || printf '200\n'
         ;;
     *) exit 22 ;;
 esac
@@ -184,11 +251,21 @@ cat > "$TEMP/bin/gh" <<'GH'
 printf 'gh %s\n' "$*" >> "$CALLS"
 if [[ "${1:-} ${2:-}" == 'auth token' ]]; then
     [[ "${GH_HOST:-}" == github.com && "${3:-} ${4:-}" == '--hostname github.com' ]] || exit 1
+    [[ "${ACQUISITION_FAILURE:-}" != token-cancel ]] || exit 2
+    [[ "${ACQUISITION_FAILURE:-}" != token-quit ]] || exit 131
     # Ordinary source cases use the real file:// Git route without a stored
     # GitHub login. The dedicated private freshness control opts into one.
     [[ -n "${GH_EXPECTED_TOKEN:-}" ]] || exit 1
     printf 'installer-source-fixture-token\n'
     exit 0
+fi
+if [[ "${1:-}" == release ]]; then
+    case "${ACQUISITION_FAILURE:-}" in
+        gh-cancel) exit 2 ;;
+        gh-quit) exit 131 ;;
+        gh-denied) exit 4 ;;
+        gh-ambiguous) exit 1 ;;
+    esac
 fi
 if [[ "$1" == api ]]; then
     if [[ -n "${GH_EXPECTED_TOKEN:-}" ]]; then
@@ -529,6 +606,106 @@ HOST
     check 'unsupported host refuses before release discovery' no_http
 }
 
+test_acquisition_source_fallback() {
+    local stage failure expected prior label
+    # These are external curl/gh boundary outcomes. The generated installer,
+    # Git checkout, Go compiler and installed-file transaction remain real.
+    for stage in discovery payload; do
+        for failure in tls write cancel quit denied unauthorized malformed invalid-tag draft missing-id; do
+            [[ "$stage" != payload || ( "$failure" != malformed && "$failure" != invalid-tag &&
+                "$failure" != draft && "$failure" != missing-id ) ]] || continue
+            label="acquisition-$stage-$failure"
+            [[ -z "${DSR_INSTALLER_ACQUISITION_TEST_FILTER:-}" || "$label" =~ $DSR_INSTALLER_ACQUISITION_TEST_FILTER ]] || continue
+            mkdir -p "$TEMP/results/$label/install"
+            printf 'preserved installed executable\n' > "$TEMP/results/$label/install/app"
+            prior=$(_isb_sha256 "$TEMP/results/$label/install/app") || return 1
+            expected=8
+            [[ "$failure" != cancel && "$failure" != quit ]] || expected=5
+            [[ "$failure" != malformed && "$failure" != invalid-tag && "$failure" != draft && "$failure" != missing-id ]] || expected=7
+            local -a version_args=()
+            [[ "$stage" != payload ]] || version_args=(--version v1.0.0)
+            ACQUISITION_FAILURE_STAGE="$stage" ACQUISITION_FAILURE="$failure" \
+                run_case "$label" good --allow-source-build --yes --source-timeout 60 "${version_args[@]}"
+            check "$stage $failure is terminal with its real failure class" equal "$status" "$expected"
+            check "$stage $failure never authorizes source checkout or compilation" no_source
+            check "$stage $failure preserves installed bytes" equal "$prior" "$(_isb_sha256 "$CASE/install/app")"
+            check "$stage $failure emits one truthful error" error_json
+        done
+    done
+    for failure in gh-cancel gh-quit gh-denied gh-ambiguous token-cancel token-quit; do
+        label="acquisition-$failure"
+        [[ -z "${DSR_INSTALLER_ACQUISITION_TEST_FILTER:-}" || "$label" =~ $DSR_INSTALLER_ACQUISITION_TEST_FILTER ]] || continue
+        expected=8
+        [[ "$failure" != gh-cancel && "$failure" != gh-quit && "$failure" != token-cancel && "$failure" != token-quit ]] || expected=5
+        if [[ "$failure" == token-cancel || "$failure" == token-quit ]]; then
+            ACQUISITION_FAILURE="$failure" run_case "$label" discovery-fail --prefer-gh --allow-source-build --source-timeout 60
+        else
+            # Selected token authenticates only the failing gh boundary; no
+            # source transport may be reached after its ambiguous refusal.
+            DSR_GH_TOKEN=acquisition-test-token ACQUISITION_FAILURE="$failure" \
+                run_case "$label" discovery-fail --prefer-gh --allow-source-build --source-timeout 60
+        fi
+        check "$failure is terminal and preserves cancellation" equal "$status" "$expected"
+        check "$failure never authorizes source checkout or compilation" no_source
+        check "$failure emits one truthful error" error_json
+    done
+    for stage in discovery payload; do
+        label="acquisition-$stage-unavailable"
+        [[ -z "${DSR_INSTALLER_ACQUISITION_TEST_FILTER:-}" || "$label" =~ $DSR_INSTALLER_ACQUISITION_TEST_FILTER ]] || continue
+        local -a version_args=()
+        [[ "$stage" != payload ]] || version_args=(--version v1.0.0)
+        ACQUISITION_FAILURE_STAGE="$stage" ACQUISITION_FAILURE=unavailable \
+            run_case "$label" good --allow-source-build --source-timeout 60 "${version_args[@]}"
+        check "$stage proven availability failure still builds with consent" equal "$status" 0
+        if [[ "$stage" == discovery ]]; then
+            check 'unavailable discovery binds the real default branch' source_json "$HEAD_PIN"
+        else
+            check 'unavailable payload preserves the exact release tag' source_json "$TAG_PIN"
+        fi
+        check "$stage fallback installs a genuine executable" test -x "$CASE/install/app"
+    done
+    label=acquisition-payload-gh-ambiguous
+    if [[ -z "${DSR_INSTALLER_ACQUISITION_TEST_FILTER:-}" || "$label" =~ $DSR_INSTALLER_ACQUISITION_TEST_FILTER ]]; then
+        DSR_GH_TOKEN=acquisition-test-token ACQUISITION_FAILURE=gh-ambiguous \
+            run_case "$label" download-fail --version v1.0.0 --allow-source-build --source-timeout 60
+        check 'ambiguous gh payload error remains terminal after public 404' equal "$status" 8
+        check 'ambiguous gh payload error never authorizes source' no_source
+        check 'ambiguous gh payload error emits one truthful error' error_json
+    fi
+    label=acquisition-canonical-checksums
+    if [[ -z "${DSR_INSTALLER_ACQUISITION_TEST_FILTER:-}" || "$label" =~ $DSR_INSTALLER_ACQUISITION_TEST_FILTER ]]; then
+        DSR_GH_TOKEN=acquisition-test-token ACQUISITION_FAILURE=canonical-checksums \
+            run_case "$label" good --version v1.0.0 --allow-source-build
+        check 'canonical-only release verifies after public sidecar 404 and gh 1' equal "$status" 0
+        check 'canonical-only release installs the verified executable' workspace_binary_runs "$CASE/install/app" downloaded-release-v1
+        check 'canonical-only release never invokes source' no_source
+        check 'canonical-only release exercises the ambiguous gh sidecar boundary' grep -Fq -- \
+            "--pattern $ASSET.sha256" "$CALLS"
+        check 'canonical-only release uses the exact canonical checksum manifest' grep -Fq '/SHA256SUMS' "$CALLS"
+    fi
+    for failure in good api-rate-limit; do
+        label="acquisition-release-$failure"
+        [[ -z "${DSR_INSTALLER_ACQUISITION_TEST_FILTER:-}" || "$label" =~ $DSR_INSTALLER_ACQUISITION_TEST_FILTER ]] || continue
+        ACQUISITION_FAILURE_STAGE=discovery ACQUISITION_FAILURE="$failure" \
+            run_case "$label" good --allow-source-build
+        check "$failure discovery preserves verified release preference" equal "$status" 0
+        check "$failure release never invokes source checkout or compilation" no_source
+        check "$failure release installs the verified executable" workspace_binary_runs "$CASE/install/app" downloaded-release-v1
+        check "$failure release is not mislabeled as source" jq -e '.status == "success" and (has("source") | not)' "$CASE/out.json"
+        if [[ "$failure" == api-rate-limit ]]; then
+            check 'API rate limiting resolves the exact public tag through HEAD' grep -Fq \
+                'curl https://github.com/example/source-app/releases/tag/v1.0.0' "$CALLS"
+        fi
+    done
+}
+
+if [[ "$TEST_MODE" == --acquisition-fallback-only ]]; then
+    test_acquisition_source_fallback || exit 1
+    printf 'Generated acquisition source fallback: %s passed, %s failed\n' "$passed" "$failed"
+    [[ "$failed" == 0 ]]
+    exit $?
+fi
+
 if [[ "$TEST_MODE" == --go-workspace-bootstrap-only ]]; then
     test_workspace_bootstrap || exit 1
     printf 'Generated workspace bootstrap: %s passed, %s failed\n' "$passed" "$failed"
@@ -543,6 +720,7 @@ if [[ "$TEST_MODE" == --libc-source-fallback-only ]]; then
     exit $?
 fi
 
+test_acquisition_source_fallback || exit 1
 test_libc_source_fallback || exit 1
 
 run_case force-head discovery-fail --from-source --source-timeout 60

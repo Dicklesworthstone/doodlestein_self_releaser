@@ -61,6 +61,46 @@ Host discovery is explicitly adapted to inspect foreign formats. These tests
 cover selected-file admission and complete-family preservation; they do not
 claim native execution on every target operating system.
 
+## Public Bash acquisition and source fallback
+
+`--allow-source-build` grants source fallback for proven release availability
+failures. Anonymous HTTP 404/410, 408/429/5xx, supported DNS/connection/transfer
+failures, and the installer's complete-transfer deadline may use the source
+engine. An explicit or discovered version still builds its exact tag; only
+unavailable latest discovery before a tag is known can select `HEAD`.
+
+TLS trust failures, local write errors, unsafe redirects, malformed successful
+release metadata, drafts, and invalid checksum/signature evidence stop the
+installation. They never become permission to execute repository build code.
+Cancellation returns 5, including cancellation during GitHub CLI credential
+lookup. Source fallback preserves an existing installation until the complete
+replacement executable family has been built and verified.
+
+An anonymous latest-API 403 may still resolve a published public tag through
+bounded HTTPS `HEAD` redirects within the exact repository. If that independent
+discovery cannot identify a tag, the denial remains terminal. `--prefer-gh`
+retains its transport preference, and a successful alternate download remains
+usable. An unsuccessful actual `gh` request does not prove that a release is
+absent, so its ambiguous failure cannot authorize source compilation. A machine
+with no stored GitHub CLI login can continue using anonymous acquisition.
+For optional checksum filenames, independently proven public unavailability
+may still advance to the next supported manifest after an ambiguous `gh`
+failure. The selected manifest must then verify the exact payload; this
+exception never authorizes source compilation.
+
+Public requests ignore ambient curl configuration, bound response streams and
+the complete redirect chain, and keep signed object-store redirect URLs out of
+curl arguments and shell tracing. Published release identity is validated
+before selecting a latest tag. Existing verified cache entries retain their
+precedence. Regenerate deployed installers to include these checks.
+
+The focused regression exercises actual generated installers with real Git and
+Go builds and explicit curl/gh response-boundary fixtures:
+
+```bash
+bash scripts/tests/test_generated_installer_source.sh --acquisition-fallback-only
+```
+
 ## Private Bash releases without the GitHub CLI
 
 A generated Bash installer can download a private release when the client has

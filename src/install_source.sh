@@ -168,6 +168,7 @@ _isb_checkout() (
     # With no selected GitHub credential, retain the existing Git-only path:
     # anonymous HTTPS, user credential helpers and configured URL policy.
     # A malformed explicit credential must not fall through to that path.
+    ((token_status != 5)) || return 5
     ((token_status == 0 || token_status == 3)) || return 8
     if [[ -n "$token" ]]; then
         # A header supplied before the first request also prevents libcurl's
@@ -213,7 +214,7 @@ _isb_in_dir() ( cd "$1" && shift && "$@" )
 # login. Keep credentials and tracing changes confined to this child process.
 _installer_github_token() (
     set +x
-    local token=''
+    local token='' status=0
     if [[ -n "${DSR_GH_TOKEN:-}" ]]; then
         token="$DSR_GH_TOKEN"
     elif [[ -n "${GITHUB_TOKEN:-}" ]]; then
@@ -222,7 +223,12 @@ _installer_github_token() (
         token="$GH_TOKEN"
     else
         command -v gh >/dev/null 2>&1 || return 3
-        token=$(GH_HOST=github.com gh auth token --hostname github.com 2>/dev/null) || return 3
+        token=$(GH_HOST=github.com gh auth token --hostname github.com 2>/dev/null) || status=$?
+        case "$status" in
+            0) ;;
+            2|129|130|131|143) return 5 ;;
+            *) return 3 ;;
+        esac
     fi
     [[ -n "$token" ]] || return 3
     [[ "$token" != *$'\r'* && "$token" != *$'\n'* ]] || return 4
@@ -232,9 +238,18 @@ _installer_github_token() (
 _installer_run_gh() (
     set +x
     command -v gh >/dev/null 2>&1 || return 3
-    local token
+    local token status=0
     token=$(_installer_github_token) || return $?
-    GH_HOST=github.com GH_TOKEN="$token" gh "$@"
+    GH_HOST=github.com GH_TOKEN="$token" gh "$@" || status=$?
+    case "$status" in
+        0) return 0 ;;
+        # gh uses 1 for both unavailable assets and other request failures.
+        # Only the acquisition caller can combine it with independent HTTP
+        # evidence; it must never authorize source execution by itself.
+        1) return 1 ;;
+        2|129|130|131|143) return 5 ;;
+        *) return 8 ;;
+    esac
 )
 
 # Freshness is advisory release metadata, NOT artifact or commit-signature

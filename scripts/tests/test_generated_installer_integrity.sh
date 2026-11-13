@@ -346,33 +346,54 @@ tar -czf "$work/remote/$asset" -C "$work/payload" demo || exit 1
 hash=$(sha256sum < "$work/remote/$asset" | awk '{print $1}')
 export REMOTE="$work/remote" CALLS="$work/calls" ASSET="$asset"
 export CURL_FAIL=0 GH_FAIL=0 LATEST_MODE=none GH_VIEW_TAG=''
-export LATEST_JSON='{"tag_name":"v1.2.3"}' LATEST_URL='https://github.com/example/demo/releases/tag/v1.2.3'
+export LATEST_JSON='{"id":17,"tag_name":"v1.2.3","draft":false}' LATEST_URL='https://github.com/example/demo/releases/tag/v1.2.3'
 cat > "$work/transports/curl" <<'TRANSPORT'
 #!/usr/bin/env bash
 set -uo pipefail
-url='' dest='' effective=false
+url='' dest='' write_out='' config_stdin=false
 while (($#)); do
     case "$1" in
         -o|--output) dest="$2"; shift 2 ;;
         --proto|--proto-redir|--connect-timeout|--max-time|--retry|--max-redirs) shift 2 ;;
-        -w) effective=true; shift 2 ;;
+        -w|--write-out) write_out="$2"; shift 2 ;;
+        --config) [[ "$2" != - ]] || config_stdin=true; shift 2 ;;
         https:*) url="$1"; shift ;;
         *) shift ;;
     esac
 done
-printf 'curl %s\n' "$url" >> "$CALLS"
-[[ "$CURL_FAIL" == 0 ]] || exit 22
-if [[ "$url" == https://api.github.com/* ]]; then
-    [[ "$LATEST_MODE" == api ]] || exit 22
-    printf '%s\n' "$LATEST_JSON"; exit 0
+if $config_stdin; then
+    while IFS= read -r line; do
+        if [[ "$line" == 'url = "'*'"' ]]; then
+            url="${line#'url = "'}"; url="${url%'"'}"
+            url="${url//\\\"/\"}"; url="${url//\\\\/\\}"
+        fi
+    done
 fi
-if $effective; then
-    [[ "$LATEST_MODE" == redirect || "$LATEST_MODE" == api ]] || exit 22
-    printf '%s' "$LATEST_URL"; exit 0
+printf 'curl %s\n' "$url" >> "$CALLS"
+response() {
+    local code="$1" body="${2:-}" location="${3:-}"
+    if [[ -n "$dest" ]]; then printf '%s' "$body" > "$dest" || return 23
+    else printf '%s' "$body" || return 23; fi
+    if [[ "$write_out" == *http_code* ]]; then printf '%s\n%s' "$code" "$location"
+    elif [[ "$write_out" == *url_effective* ]]; then printf '%s' "${location:-$url}"
+    elif [[ "$code" != 200 ]]; then return 22; fi
+}
+[[ "$CURL_FAIL" == 0 ]] || { response 503; exit $?; }
+if [[ "$url" == https://api.github.com/* ]]; then
+    [[ "$LATEST_MODE" == api ]] || { response 404; exit $?; }
+    response 200 "$LATEST_JSON"; exit $?
+fi
+if [[ "$url" == https://github.com/example/demo/releases/latest ]]; then
+    [[ "$LATEST_MODE" == redirect || "$LATEST_MODE" == api ]] || { response 404; exit $?; }
+    response 302 '' "$LATEST_URL"; exit $?
+fi
+if [[ "$url" == "$LATEST_URL" ]]; then
+    response 200; exit $?
 fi
 name="${url##*/}"
-[[ -f "$REMOTE/$name" ]] || exit 22
-cp "$REMOTE/$name" "$dest"
+[[ -f "$REMOTE/$name" ]] || { response 404; exit $?; }
+cp "$REMOTE/$name" "$dest" || exit 23
+[[ "$write_out" != *http_code* ]] || printf '200\n'
 TRANSPORT
 cat > "$work/transports/gh" <<'TRANSPORT'
 #!/usr/bin/env bash

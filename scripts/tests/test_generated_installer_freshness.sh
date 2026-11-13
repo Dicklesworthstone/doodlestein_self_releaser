@@ -57,19 +57,35 @@ BIN
 cat > "$TEMP/bin/curl" <<'BIN'
 #!/usr/bin/env bash
 printf 'curl %s\n' "$*" >> "$TEST_HTTP_LOG"
-dest='' url=''
+dest='' url='' write_out='' config_stdin=false
 while (($#)); do
     case "$1" in
-        -o) dest="$2"; shift 2 ;;
+        -o|--output) dest="$2"; shift 2 ;;
+        -w|--write-out) write_out="$2"; shift 2 ;;
+        --config) [[ "$2" != - ]] || config_stdin=true; shift 2 ;;
         https:*) url="$1"; shift ;;
         *) shift ;;
     esac
 done
+if $config_stdin; then
+    while IFS= read -r line; do
+        if [[ "$line" == 'url = "'*'"' ]]; then
+            url="${line#'url = "'}"; url="${url%'"'}"
+            url="${url//\\\"/\"}"; url="${url//\\\\/\\}"
+        fi
+    done
+fi
+printf 'curl-url %s\n' "$url" >> "$TEST_HTTP_LOG"
 emit_json() { if [[ -n "$dest" ]]; then cat > "$dest"; else cat; fi; }
+response() {
+    local code="$1" body="${2:-}"
+    printf '%s' "$body" | emit_json || return 23
+    if [[ "$write_out" == *http_code* ]]; then printf '%s\n' "$code"
+    elif [[ "$code" != 200 ]]; then return 22; fi
+}
 if [[ "$url" == https://api.github.com/*/releases/latest ]]; then
-    [[ "$TEST_LATEST" != unavailable ]] || exit 22
-    printf '{"tag_name":"%s"}\n' "$TEST_LATEST"
-    exit 0
+    [[ "$TEST_LATEST" != unavailable ]] || { response 503; exit $?; }
+    response 200 "{\"id\":17,\"tag_name\":\"$TEST_LATEST\",\"draft\":false}"; exit $?
 fi
 if [[ "$url" == https://api.github.com/*/commits\?* ]]; then
     case "$TEST_METADATA_FAULT" in
@@ -120,15 +136,16 @@ if [[ "$url" == https://api.github.com/*/compare/* ]]; then
     fi
     printf '%s\n' "$response" | emit_json; exit 0
 fi
-[[ "$url" == */releases/download/* && "$TEST_DELIVERY" != missing ]] || exit 22
+[[ "$url" == */releases/download/* && "$TEST_DELIVERY" != missing ]] || { response 404; exit $?; }
 name="${url##*/}"
 case "$name" in
-    *.tar.gz) cp "$TEST_RELEASE_DIR/payload.tar.gz" "$dest" ;;
+    *.tar.gz) cp "$TEST_RELEASE_DIR/payload.tar.gz" "$dest" || exit 23 ;;
     *.sha256)
-        if [[ "$TEST_DELIVERY" == corrupt ]]; then printf '%064d\n' 0 > "$dest"
-        else cat "$TEST_RELEASE_DIR/hash" > "$dest"; fi ;;
-    *) exit 22 ;;
+        if [[ "$TEST_DELIVERY" == corrupt ]]; then printf '%064d\n' 0 > "$dest" || exit 23
+        else cat "$TEST_RELEASE_DIR/hash" > "$dest" || exit 23; fi ;;
+    *) response 404; exit $? ;;
 esac
+[[ "$write_out" != *http_code* ]] || printf '200\n'
 BIN
 cat > "$TEMP/bin/gh" <<'BIN'
 #!/usr/bin/env bash
