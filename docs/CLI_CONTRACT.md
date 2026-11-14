@@ -2285,6 +2285,14 @@ previous selected files when possible, retain incomplete recovery evidence and
 never report success for a partially installed family. PATH edits and skill
 installation are not part of this Windows installer.
 
+The checked-in `installers/ntm/install.ps1` is generated through
+`dsr installer generate ntm --shell powershell --output-dir installers`.
+It uses the current shared release/source/recovery runtime and NTM's
+`ntm_${version}_windows_${arch}.zip` naming. Its policy has no signing key:
+checksum verification is required, and successful receipts correctly report
+`signature_verified: false`. Its declared architectures describe installer
+support; a selected release must still actually contain the requested asset.
+
 For a configured Go, Rust, Bun or TypeScript repository, source installation is a
 separate explicit mode:
 

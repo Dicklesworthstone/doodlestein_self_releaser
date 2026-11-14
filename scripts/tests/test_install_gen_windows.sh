@@ -33,6 +33,8 @@ arguments = argparse.ArgumentParser(description="Genuine generated Windows insta
 arguments.add_argument("project")
 arguments.add_argument("--recovery-only", action="store_true", help="Run signed install and interruption/recovery controls")
 arguments.add_argument("--baseline-project", type=Path, help="Optional frozen pre-recovery checkout for a paired functional comparison")
+arguments.add_argument("--shipped-ntm-only", action="store_true", help="Exercise the checked-in NTM Windows installer and its verified offline cache")
+arguments.add_argument("--shipped-baseline-project", type=Path, help="Frozen checkout containing the previous NTM Windows installer")
 options = arguments.parse_args()
 project = Path(options.project).resolve()
 root = Path(tempfile.mkdtemp(prefix="dsr-windows-installer-", dir=os.environ.get("TMPDIR"))).resolve()
@@ -646,6 +648,128 @@ def exercise_recovery(cache):
           rollback.returncode == 7 and rollback_details.get("status") == "error" and observed(handled) == originals and
           not (handled / pending_name).exists() and not list(handled.glob(".dsr-install-*")),
           rollback.stderr.decode(errors="replace"))
+
+def exercise_shipped_ntm():
+    shipped = project / "installers/ntm/install.ps1"
+    if options.shipped_baseline_project:
+        previous = options.shipped_baseline_project.resolve() / "installers/ntm/install.ps1"
+        baseline_help = command(["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", previous, "-Help"],
+                                "shipped-baseline-help")
+        check("frozen shipped NTM installer fails before help because Verbose is bound twice",
+              baseline_help.returncode != 0 and b"Verbose" in baseline_help.stderr and
+              b"defined multiple times" in baseline_help.stderr, baseline_help.stderr.decode(errors="replace"))
+    actual_help = command(["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", shipped, "-Help", "-Json", "-Verbose"],
+                          "shipped-help")
+    try:
+        help_details = json.loads(actual_help.stdout)
+    except (ValueError, UnicodeDecodeError):
+        help_details = {}
+    check("the exact checked-in NTM client starts and preserves every original public option",
+          actual_help.returncode == 0 and help_details.get("tool") == "ntm" and help_details.get("status") == "help" and
+          all(flag in help_details.get("help", "") for flag in (
+              "-Version", "-Prefix", "-CacheDir", "-Offline", "-Yes", "-Verbose", "-Json", "-Help")),
+          actual_help.stderr.decode(errors="replace"))
+    tokens = re.findall(r"\$script:DsrWindowsInstallPolicyBase64 = '([A-Za-z0-9+/=]+)'", shipped.read_text())
+    if len(tokens) != 1:
+        check("shipped NTM client contains one generated policy", False)
+        return
+    chosen = json.loads(base64.b64decode(tokens[0]))
+    expected_platforms = {"windows/" + arch: {"name": "ntm_${version}_windows_" + arch + ".zip",
+        "format": "zip", "binaries": ["ntm.exe"], "target_triple": triple}
+        for arch, triple in (("amd64", "x86_64-pc-windows-msvc"), ("arm64", "aarch64-pc-windows-msvc"),
+                             ("386", "i686-pc-windows-msvc"))}
+    check("shipped NTM identity, underscore release names, empty signing key and Go source policy remain exact",
+          chosen == {"schema_version": 1, "tool": "ntm", "repo": "Dicklesworthstone/ntm", "binary_name": "ntm.exe",
+              "public_key": "", "source": {"language": "go", "subdir": ".", "entry": ""}, "platforms": expected_platforms},
+          json.dumps(chosen))
+    if sys.platform != "win32":
+        unsupported = command(["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", shipped,
+            "-Version", "1.2.3", "-Prefix", root / "shipped-native-refusal", "-Json"], "shipped-native-refusal")
+        check("unadapted shipped client keeps the real native Windows host boundary",
+              unsupported.returncode == 3 and not (root / "shipped-native-refusal").exists(), unsupported.stderr.decode(errors="replace"))
+
+    payload_dir = root / "shipped-release"
+    payload_dir.mkdir()
+    chosen_asset = asset_for(chosen)
+    payload = payload_dir / chosen_asset
+    with zipfile.ZipFile(payload, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.write(root / "app.exe", "ntm.exe")
+        archive.writestr("README.txt", "Real Go PE fixture; installed bytes are never executed.\n")
+    payload_hash = hashlib.sha256(payload.read_bytes()).hexdigest()
+    sidecar = payload_dir / (chosen_asset + ".sha256")
+    sidecar.write_text(payload_hash + "\n")
+    url = "https://github.com/Dicklesworthstone/ntm/releases/download/v1.2.3/"
+    downloads = {url + path.name: str(path) for path in (payload, sidecar)}
+    expected = (root / "app.exe").read_bytes()
+    installed, result, cache, prefix, request_path = run_case("shipped-online", downloads, selected_runtime=shipped,
+        options={"http_client_fixture": True})
+    check("exact shipped client acquires its named ZIP and checksum through the real HTTP implementation",
+          installed.returncode == 0 and result.get("tool") == "ntm" and result.get("version") == "v1.2.3" and
+          result.get("signature_verified") is False and len(result.get("binaries", [])) == 1 and
+          (prefix / "ntm.exe").is_file() and (prefix / "ntm.exe").read_bytes() == expected and
+          result["binaries"][0]["sha256"] == hashlib.sha256(expected).hexdigest(),
+          installed.stderr.decode(errors="replace") + " " + json.dumps(result))
+    if installed.returncode:
+        return
+    requests = [json.loads(line) for line in request_path.read_text().splitlines()]
+    check("NTM acquisition uses only exact configured URLs without credentials or source execution",
+          [row["url"] for row in requests] == [url + chosen_asset, url + "SHA256SUMS", url + sidecar.name] and
+          all(row["authorization_sha256"] == "" for row in requests) and "source" not in result, json.dumps(requests))
+    offline, offline_result, _, offline_prefix, offline_requests = run_case("shipped-offline", selected_runtime=shipped,
+        cache=cache, offline=True, options={"http_client_fixture": True}, credentials={"DSR_GH_TOKEN": "invalid fixture token"})
+    check("shipped offline mode revalidates the complete cache without HTTP or credentials",
+          offline.returncode == 0 and offline_result.get("cache", {}).get("offline") is True and
+          not offline_requests.exists() and (offline_prefix / "ntm.exe").is_file() and
+          (offline_prefix / "ntm.exe").read_bytes() == expected, offline.stderr.decode(errors="replace"))
+    denied, _, _, _, _ = run_case("shipped-no-consent", selected_runtime=shipped, cache=cache,
+        prefix=prefix, offline=True, yes=False, options={"http_client_fixture": True})
+    check("an existing NTM executable still requires replacement consent",
+          denied.returncode == 2 and (prefix / "ntm.exe").read_bytes() == expected, denied.stderr.decode(errors="replace"))
+    missing, _, _, missing_prefix, _ = run_case("shipped-missing-checksum", {url + chosen_asset: str(payload)},
+        selected_runtime=shipped, options={"http_client_fixture": True})
+    check("missing published checksum proof cannot install the shipped NTM payload",
+          missing.returncode == 7 and not missing_prefix.exists(), missing.stderr.decode(errors="replace"))
+    bad_sidecar = root / "shipped-bad-checksum.sha256"
+    bad_sidecar.write_text("0" * 64 + "\n")
+    changed, _, _, _, _ = run_case("shipped-bad-checksum", {url + chosen_asset: str(payload), url + sidecar.name: str(bad_sidecar)},
+        selected_runtime=shipped, prefix=prefix, options={"http_client_fixture": True})
+    check("checksum mismatch cannot replace a previously installed NTM executable",
+          changed.returncode == 7 and (prefix / "ntm.exe").read_bytes() == expected, changed.stderr.decode(errors="replace"))
+    corrupt_cache = root / "shipped-corrupt-cache"
+    shutil.copytree(cache, corrupt_cache)
+    entry = next(path for path in corrupt_cache.iterdir() if path.is_dir())
+    (entry / chosen_asset).write_bytes(b"changed cached payload")
+    corrupt, _, _, corrupt_prefix, corrupt_requests = run_case("shipped-corrupt-offline", selected_runtime=shipped,
+        cache=corrupt_cache, offline=True, options={"http_client_fixture": True})
+    check("offline checksum verification refuses modified NTM cache bytes without contacting HTTP",
+          corrupt.returncode == 7 and not corrupt_prefix.exists() and not corrupt_requests.exists(), corrupt.stderr.decode(errors="replace"))
+
+    interrupted_prefix = root / "shipped-interrupted-prefix"
+    interrupted_prefix.mkdir()
+    previous_bytes = b"previous NTM executable bytes"
+    (interrupted_prefix / "ntm.exe").write_bytes(previous_bytes)
+    marker = root / "shipped-real-move.barrier"
+    killed, _, _, _, _ = run_case("shipped-interrupted", selected_runtime=shipped, cache=cache,
+        prefix=interrupted_prefix, offline=True, options={"pause_after_move": 1, "pause_marker": str(marker)})
+    check("real termination after NTM replacement leaves a recoverable journal and original backup",
+          killed.returncode != 0 and marker.is_file() and
+          (interrupted_prefix / "ntm.exe").read_bytes() == expected and
+          (interrupted_prefix / ".dsr-windows-install.pending.json").is_file(), killed.stderr.decode(errors="replace"))
+    recovered, recovery, _, _, recovery_requests = run_case("shipped-recovered", selected_runtime=shipped,
+        prefix=interrupted_prefix, recover=True, options={"without_minisign": True})
+    check("shipped offline recovery restores the previous NTM bytes without downloads or a verifier",
+          recovered.returncode == 0 and recovery.get("recovery_action") == "rolled_back" and
+          (interrupted_prefix / "ntm.exe").read_bytes() == previous_bytes and not recovery_requests.exists() and
+          not (interrupted_prefix / ".dsr-windows-install.pending.json").exists(), recovered.stderr.decode(errors="replace"))
+
+
+if options.shipped_ntm_only:
+    exercise_shipped_ntm()
+    print(f"Windows shipped NTM installer checks: {passed} passed, {failed} failed", flush=True)
+    print("Exact checked-in client, genuine PowerShell/Go PE and local recovery; host/HTTP delivery are explicit adapters.", flush=True)
+    print("NTM has no configured signing key. Native Windows ACL/NTFS and live GitHub are not qualified here.", flush=True)
+    raise SystemExit(1 if failed else 0)
+
 
 good = release("good")
 success, details, good_cache, installed, requests = run_case("signed-family", good)
