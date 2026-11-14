@@ -88,6 +88,15 @@ may still advance to the next supported manifest after an ambiguous `gh`
 failure. The selected manifest must then verify the exact payload; this
 exception never authorizes source compilation.
 
+Generated Bash installers bound each complete GitHub CLI request, including
+stored-token lookup: metadata requests have a 30-second deadline and release
+downloads have a 300-second deadline. Set `DSR_INSTALLER_GH_TIMEOUT` to an integer
+from 1 through 300 seconds to override either deadline. An invalid value returns
+4 before credential lookup or a CLI request. A CLI deadline returns 8 and cannot
+authorize source compilation; explicit cancellation returns 5. The deadline
+stops the supervised request and its descendants while preserving an existing
+installation. Regenerate deployed installers to include this behavior.
+
 Public requests ignore ambient curl configuration, bound response streams and
 the complete redirect chain, and keep signed object-store redirect URLs out of
 curl arguments and shell tracing. Published release identity is validated
@@ -99,6 +108,13 @@ Go builds and explicit curl/gh response-boundary fixtures:
 
 ```bash
 bash scripts/tests/test_generated_installer_source.sh --acquisition-fallback-only
+```
+
+The credential, discovery and payload deadline fixtures exercise the generated
+installer with stalled GitHub CLI processes and TERM-resistant descendants:
+
+```bash
+bash scripts/tests/test_generated_installer_source.sh --github-timeout-only
 ```
 
 ## Private Bash releases without the GitHub CLI

@@ -235,21 +235,90 @@ _installer_github_token() (
     printf '%s\n' "$token"
 )
 
+# Bound the whole GitHub CLI request, including stored-token lookup. Curl's
+# network timeout does not cover a blocked gh credential helper. Keep stdout
+# streaming to the caller and credentials off disk; only the timeout marker is
+# stored. Job control gives this request and watchdog separate owned groups,
+# using syntax supported by release installers on stock macOS Bash 3.2.
+# Match the curl acquisition budgets: 30s metadata, 300s release payloads.
 _installer_run_gh() (
     set +x
+    local limit="${DSR_INSTALLER_GH_TIMEOUT:-}" directory child='' guard='' status=0 interrupted=false
+    if [[ -z "$limit" ]]; then
+        if [[ "${1:-} ${2:-}" == 'release download' ]]; then limit=300
+        else limit=30; fi
+    fi
+    [[ "$limit" =~ ^[1-9][0-9]{0,2}$ ]] && ((limit <= 300)) || {
+        printf '[installer] DSR_INSTALLER_GH_TIMEOUT must be 1 through 300 seconds\n' >&2
+        return 4
+    }
     command -v gh >/dev/null 2>&1 || return 3
-    local token status=0
-    token=$(_installer_github_token) || return $?
-    GH_HOST=github.com GH_TOKEN="$token" gh "$@" || status=$?
-    case "$status" in
-        0) return 0 ;;
-        # gh uses 1 for both unavailable assets and other request failures.
-        # Only the acquisition caller can combine it with independent HTTP
-        # evidence; it must never authorize source execution by itself.
-        1) return 1 ;;
-        2|129|130|131|143) return 5 ;;
-        *) return 8 ;;
-    esac
+    directory=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/dsr-gh.XXXXXXXX") || return 8
+    _installer_gh_dispose() {
+        trap '' HUP INT TERM
+        [[ -z "$child" ]] || kill -TERM -- "-$child" 2>/dev/null || true
+        [[ -z "$guard" ]] || kill -TERM -- "-$guard" 2>/dev/null || true
+        [[ -z "$child" ]] || kill -KILL -- "-$child" 2>/dev/null || true
+        [[ -z "$child" ]] || wait "$child" 2>/dev/null || true
+        [[ -z "$guard" ]] || wait "$guard" 2>/dev/null || true
+        rm -f -- "$directory/timeout" 2>/dev/null || true
+        rmdir -- "$directory" 2>/dev/null || true
+    }
+    _installer_gh_cancel() {
+        _installer_gh_dispose
+        exit 5
+    }
+    # Record setup signals until both launched process IDs are available.
+    # A trap between starting a job and reading $! must not lose that child.
+    trap 'interrupted=true' HUP INT TERM
+    set -m
+    (
+        set +m
+        token=$(_installer_github_token) || exit $?
+        request_status=0
+        GH_HOST=github.com GH_TOKEN="$token" gh "$@" || request_status=$?
+        case "$request_status" in
+            0) exit 0 ;;
+            # gh uses 1 for both unavailable assets and other request failures.
+            # Only the acquisition caller can combine it with independent HTTP
+            # evidence; it must never authorize source execution by itself.
+            1) exit 1 ;;
+            2|129|130|131|143) exit 5 ;;
+            *) exit 8 ;;
+        esac
+    ) </dev/null &
+    child=$!
+    $interrupted && _installer_gh_cancel
+    (
+        set +m
+        timer=''
+        _installer_gh_stop_timer() {
+            trap '' HUP INT TERM
+            [[ -z "$timer" ]] || kill "$timer" 2>/dev/null || true
+            [[ -z "$timer" ]] || wait "$timer" 2>/dev/null || true
+            exit 0
+        }
+        trap _installer_gh_stop_timer HUP INT TERM
+        sleep "$limit" & timer=$!
+        wait "$timer" || exit 0
+        printf 'timeout\n' > "$directory/timeout"
+        kill -TERM -- "-$child" 2>/dev/null || true
+        sleep 2 & timer=$!
+        wait "$timer" || exit 0
+        kill -KILL -- "-$child" 2>/dev/null || true
+    ) &
+    guard=$!
+    trap _installer_gh_cancel HUP INT TERM
+    $interrupted && _installer_gh_cancel
+    wait "$child" 2>/dev/null || status=$?
+    if [[ -f "$directory/timeout" ]]; then
+        printf '[installer] GitHub CLI request exceeded %ss\n' "$limit" >&2
+        # A credential/CLI timeout is ambiguous, never proof that a release
+        # is absent and therefore never permission to compile source.
+        status=8
+    fi
+    _installer_gh_dispose
+    return "$status"
 )
 
 # Freshness is advisory release metadata, NOT artifact or commit-signature

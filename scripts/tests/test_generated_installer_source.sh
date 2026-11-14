@@ -9,8 +9,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ROOT="${DSR_TEST_ROOT:-$ROOT}"
 TEST_MODE="${1:-}"
 [[ $# -eq 0 || ( $# -eq 1 && ( "$TEST_MODE" == --go-workspace-bootstrap-only ||
-    "$TEST_MODE" == --libc-source-fallback-only || "$TEST_MODE" == --acquisition-fallback-only ) ) ]] || {
-    printf 'Usage: %s [--go-workspace-bootstrap-only|--libc-source-fallback-only|--acquisition-fallback-only]\n' "$0" >&2
+    "$TEST_MODE" == --libc-source-fallback-only || "$TEST_MODE" == --acquisition-fallback-only ||
+    "$TEST_MODE" == --github-timeout-only ) ) ]] || {
+    printf 'Usage: %s [--go-workspace-bootstrap-only|--libc-source-fallback-only|--acquisition-fallback-only|--github-timeout-only]\n' "$0" >&2
     exit 4
 }
 for dependency in git jq go tar; do
@@ -249,6 +250,21 @@ CURL
 cat > "$TEMP/bin/gh" <<'GH'
 #!/usr/bin/env bash
 printf 'gh %s\n' "$*" >> "$CALLS"
+if [[ ( "${GH_STALL_PHASE:-}" == auth && "${1:-} ${2:-}" == 'auth token' ) ||
+      ( "${GH_STALL_PHASE:-}" == latest && "${1:-} ${2:-}" == 'release view' ) ||
+      ( "${GH_STALL_PHASE:-}" == payload && "${1:-} ${2:-}" == 'release download' ) ]]; then
+    # Both processes ignore TERM so a complete timeout must kill the owned
+    # group, not merely return while the credential helper keeps running.
+    trap '' HUP INT TERM
+    sleep 60 &
+    printf '%s %s\n' "$$" "$!" > "$CALLS.stall"
+    wait
+    exit 1
+fi
+if [[ "${GH_RELEASE_VIEW:-}" == valid && "${1:-} ${2:-}" == 'release view' ]]; then
+    printf 'v1.0.0\n'
+    exit 0
+fi
 if [[ "${1:-} ${2:-}" == 'auth token' ]]; then
     [[ "${GH_HOST:-}" == github.com && "${3:-} ${4:-}" == '--hostname github.com' ]] || exit 1
     [[ "${ACQUISITION_FAILURE:-}" != token-cancel ]] || exit 2
@@ -699,6 +715,147 @@ test_acquisition_source_fallback() {
     done
 }
 
+test_github_acquisition_deadlines() {
+    command -v python3 >/dev/null 2>&1 || {
+        printf 'SKIP: GitHub installer deadline regression requires Python 3\n'; return 77;
+    }
+    python3 - "$INSTALLER" "$TEMP" <<'PY_GH_DEADLINES'
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+installer, temporary = map(Path, sys.argv[1:])
+passed = failed = 0
+
+def check(label, condition):
+    global passed, failed
+    if condition:
+        passed += 1
+        print("PASS: " + label, flush=True)
+    else:
+        failed += 1
+        print("FAIL: " + label, flush=True)
+
+def active(pid):
+    observed = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    state = observed.stdout.strip()
+    if observed.returncode not in (0, 1):
+        raise RuntimeError("cannot observe fixture process state")
+    return observed.returncode == 0 and bool(state) and not state.startswith("Z")
+
+def stop_session(session):
+    # A broken watchdog may leave a separate process group holding stdout.
+    # Kill only this Popen-created session, including its owned subgroups.
+    inventory = subprocess.check_output(["ps", "-axo", "pid="], text=True)
+    groups = set()
+    for text in inventory.split():
+        pid = int(text)
+        try:
+            if os.getsid(pid) == session:
+                groups.add(os.getpgid(pid))
+        except ProcessLookupError:
+            pass
+    for group in groups:
+        try:
+            os.killpg(group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+def invoke(label, *, phase="", bound="1", payload=False, healthy=False):
+    case = temporary / "results" / ("github-deadline-" + label)
+    (case / "tmp").mkdir(parents=True)
+    (case / "install").mkdir()
+    original = b"preserve previously installed executable\n"
+    (case / "install/app").write_bytes(original)
+    calls = case / "calls"
+    calls.write_text("")
+    environment = os.environ.copy()
+    environment.update(CALLS=str(calls), TMPDIR=str(case / "tmp"), MODE="good" if healthy else
+                       ("download-fail" if payload else "discovery-fail"),
+                       DSR_INSTALLER_GH_TIMEOUT=bound, GH_STALL_PHASE=phase,
+                       GH_RELEASE_VIEW="valid" if healthy else "",
+                       DSR_GH_TOKEN="" if phase == "auth" else "deadline-fixture-token",
+                       GITHUB_TOKEN="", GH_TOKEN="")
+    command = ["bash", str(installer), "--json", "--non-interactive", "--no-skills", "--yes",
+               "--prefer-gh", "--allow-source-build", "--dir", str(case / "install"),
+               "--cache-dir", str(case / "cache")]
+    if payload:
+        command += ["--version", "v1.0.0"]
+    started = time.monotonic()
+    process = subprocess.Popen(command, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               start_new_session=True)
+    expired = False
+    try:
+        stdout, stderr = process.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        expired = True
+        stop_session(process.pid)
+        stdout, stderr = process.communicate(timeout=5)
+    elapsed = time.monotonic() - started
+    (case / "out.json").write_bytes(stdout)
+    (case / "err").write_bytes(stderr)
+    try:
+        result = json.loads(stdout)
+    except (ValueError, UnicodeDecodeError):
+        result = {}
+    observed_calls = calls.read_text().splitlines()
+    marker = Path(str(calls) + ".stall")
+    descendants = [int(pid) for pid in marker.read_text().split()] if marker.exists() else []
+    remaining = [pid for pid in descendants if active(pid)]
+    # Even the unchanged-baseline failure must not leave a fixture sleeper.
+    # Inspect first; cleanup after the liveness observation cannot make it pass.
+    for pid in remaining:
+        try:
+            if os.getsid(pid) == process.pid:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    return case, original, process.returncode, expired, elapsed, result, observed_calls, descendants, remaining
+
+for phase in ("auth", "latest", "payload"):
+    case, original, status, expired, elapsed, result, calls, descendants, remaining = invoke(
+        phase, phase=phase, payload=phase == "payload")
+    check(phase + " stalls terminate within their configured complete-request deadline",
+          not expired and elapsed < 10 and status == 8)
+    check(phase + " timeout emits one truthful JSON failure", result.get("status") == "error")
+    check(phase + " timeout never turns public unavailability into source consent",
+          not any(line.startswith(("git ", "go ")) for line in calls) and "source" not in result)
+    check(phase + " timeout preserves the installed executable", (case / "install/app").read_bytes() == original)
+    check(phase + " timeout stops the helper and its TERM-resistant descendant",
+          len(descendants) == 2 and not remaining)
+    check(phase + " timeout removes private supervision state", not list((case / "tmp").glob("dsr-gh.*")))
+    if phase == "auth":
+        check("credential deadline expires before any release CLI call",
+              not any(line.startswith("gh release ") for line in calls))
+
+for bound in ("0", "00", "-1", "301", "1.5", "not-a-number"):
+    case, original, status, expired, _, result, calls, _, _ = invoke("invalid-" + bound, bound=bound)
+    check("invalid GitHub deadline " + bound + " refuses before credential or network launch",
+          not expired and status == 4 and not calls and result.get("status") == "error" and
+          (case / "install/app").read_bytes() == original)
+
+case, _, status, expired, _, result, calls, _, _ = invoke("healthy", healthy=True)
+check("bounded healthy discovery retains exact CLI stdout and installs the verified release",
+      not expired and status == 0 and result.get("status") == "success" and
+      result.get("version") == "v1.0.0" and "source" not in result and
+      any(line.startswith("gh release view ") for line in calls) and
+      (case / "install/app").read_text() == '#!/usr/bin/env bash\nprintf \'downloaded-release-v1\\n\'\n')
+check("healthy GitHub completion leaves no supervision state", not list((case / "tmp").glob("dsr-gh.*")))
+print(f"GitHub acquisition deadlines: {passed} passed, {failed} failed", flush=True)
+raise SystemExit(0 if failed == 0 else 1)
+PY_GH_DEADLINES
+}
+
+if [[ "$TEST_MODE" == --github-timeout-only ]]; then
+    test_github_acquisition_deadlines
+    exit $?
+fi
+
 if [[ "$TEST_MODE" == --acquisition-fallback-only ]]; then
     test_acquisition_source_fallback || exit 1
     printf 'Generated acquisition source fallback: %s passed, %s failed\n' "$passed" "$failed"
@@ -720,6 +877,7 @@ if [[ "$TEST_MODE" == --libc-source-fallback-only ]]; then
     exit $?
 fi
 
+test_github_acquisition_deadlines || exit 1
 test_acquisition_source_fallback || exit 1
 test_libc_source_fallback || exit 1
 
