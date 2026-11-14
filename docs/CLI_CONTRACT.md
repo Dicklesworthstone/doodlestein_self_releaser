@@ -2311,6 +2311,17 @@ executable changes. Expected output hashes remain bound through the existing
 journaled family installation and recovery path. Failed builds retain private
 diagnostics and leave installed executables untouched.
 
+Without a `go.work`, the main module's local replacement directives must still
+resolve to exact committed modules inside the pinned checkout. Absolute paths,
+parent traversal outside the checkout, linked directories, and untracked
+module/checksum metadata are refused before dependency loading. Dependency
+modules' own replacement directives remain inactive, matching Go's behavior.
+A `go_module` source receipt records the main and selected replacement manifest
+hashes. A committed vendor tree takes precedence over replacement originals;
+its `modules.txt`, when present, must also be committed and is recorded by hash.
+Go continues to reject inconsistent vendor metadata. Legacy committed vendor
+trees without that metadata retain the behavior admitted by Go.
+
 To prefer a release and permit source fallback when acquisition is unavailable:
 
 ```powershell

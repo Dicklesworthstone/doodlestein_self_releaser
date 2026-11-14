@@ -10,7 +10,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 dependencies=(pwsh git go cargo rustc minisign python3 jq yq)
 if [[ " $* " == *' --bun-only '* || " $* " == *' --bun-workspaces-only '* ]]; then
     dependencies=(pwsh git bun minisign python3 jq yq)
-elif [[ " $* " == *' --freshness-only '* || " $* " == *' --fallback-only '* || " $* " == *' --acquisition-errors-only '* || " $* " == *' --freshness-deadline-only '* || " $* " == *' --go-only '* || " $* " == *' --go-workspace-only '* ]]; then
+elif [[ " $* " == *' --freshness-only '* || " $* " == *' --fallback-only '* || " $* " == *' --acquisition-errors-only '* || " $* " == *' --freshness-deadline-only '* || " $* " == *' --go-only '* || " $* " == *' --go-workspace-only '* || " $* " == *' --go-modules-only '* ]]; then
     dependencies=(pwsh git go minisign python3 jq yq)
 fi
 for dependency in "${dependencies[@]}"; do
@@ -42,6 +42,8 @@ arguments.add_argument("--baseline-project", type=Path, help="Frozen checkout be
 arguments.add_argument("--rust-baseline-project", type=Path, help="Frozen checkout before Windows Rust source installation")
 arguments.add_argument("--workspace-baseline-project", type=Path, help="Frozen checkout before committed Go workspace support")
 arguments.add_argument("--go-workspace-only", action="store_true", help="Run the generated Go workspace caller regression")
+arguments.add_argument("--go-modules-only", action="store_true", help="Run ordinary Go module source-custody and vendoring controls")
+arguments.add_argument("--module-baseline-project", type=Path, help="Frozen checkout before ordinary Go module confinement")
 arguments.add_argument("--go-only", action="store_true", help="Run Go source and signed-release controls without Rust compilation")
 arguments.add_argument("--bun-only", action="store_true", help="Run genuine Bun/TypeScript Windows source installation controls")
 arguments.add_argument("--bun-workspaces-only", action="store_true", help="Run generated Bun workspace source installation controls")
@@ -225,6 +227,13 @@ if (Get-Command Invoke-DsrSourceGit -ErrorAction SilentlyContinue) {
             $vendor = [IO.Path]::Combine($Directory, 'vendor')
             $null = [IO.Directory]::CreateDirectory($vendor)
             [IO.File]::WriteAllText([IO.Path]::Combine($vendor, 'modules.txt'), "## workspace`n")
+        }
+        if ($script:Fixture.Contains('inject_module_files') -and 'checkout' -cin $Arguments) {
+            foreach ($name in $script:Fixture.inject_module_files.Keys) {
+                $path = [IO.Path]::Combine($Directory, $name)
+                $null = [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($path))
+                [IO.File]::WriteAllText($path, $script:Fixture.inject_module_files[$name])
+            }
         }
         if ($script:Fixture.Contains('mutate_source') -and $script:Fixture.mutate_source -and
             -not $script:MutatedSource -and $Arguments[0] -ceq 'build') {
@@ -1301,6 +1310,198 @@ if options.bun_only or options.bun_workspaces_only:
         test_bun_sources()
     test_bun_workspaces()
     print(f"Windows Bun source tests: {passed} passed, {failed} failed", flush=True)
+    raise SystemExit(1 if failed else 0)
+
+
+def test_go_module_replacements():
+    module_upstream = root / "module-upstream"
+    module_upstream.mkdir()
+    required(["git", "init", "--quiet", "--initial-branch=main", module_upstream], "module-git-init")
+    required(["git", "-C", module_upstream, "config", "user.email", "fixture@example.invalid"], "module-git-email")
+    required(["git", "-C", module_upstream, "config", "user.name", "DSR Go Module Fixture"], "module-git-name")
+    module = "module example.invalid/module-app\n\ngo 1.22\nrequire example.invalid/module-shared v0.0.0\n"
+    dependency = "module example.invalid/module-shared\n\ngo 1.22\n"
+    main = 'package main\nimport ("fmt"; "example.invalid/module-shared")\nfunc main() { fmt.Println(shared.Value()) }\n'
+    pinned_value = 'package shared\nfunc Value() string { return "pinned-ordinary-module" }\n'
+    manifests = {"project/go.mod": module + "replace example.invalid/module-shared => ../shared\n",
+        "project/apps/primary/main.go": main, "project/cmd/helper/main.go": main,
+        "project/cmd/arm-helper/main.go": main, "shared/value.go": pinned_value,
+        # Dependency-module replacement rules are deliberately inactive in Go.
+        "shared/go.mod": dependency + "replace example.invalid/ignored => /outside-ignored-dependency\n"}
+
+    def write_files(changes):
+        for name, value in changes.items():
+            path = module_upstream / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(value)
+
+    def commit(label, untracked=()):
+        required(["git", "-C", module_upstream, "add", "."], label + "-add")
+        if untracked:
+            required(["git", "-C", module_upstream, "update-index", "--force-remove", "--", *untracked], label + "-untrack")
+        required(["git", "-C", module_upstream, "commit", "--quiet", "-m", label], label + "-commit")
+        return required(["git", "-C", module_upstream, "rev-parse", "HEAD"], label + "-pin")
+
+    def run(label, *, selected_runtime=None, reference="HEAD", parameters=None, **changes):
+        params = {"SourceRef": reference}
+        params.update(parameters or {})
+        return invoke(label, selected_runtime=selected_runtime or module_runtime, parameters=params,
+            extra={"GOPROXY": "off", "GOSUMDB": "off"}, repository_url=module_upstream.as_uri(), **changes)
+
+    def installed_marker(result, fixture, marker, architecture=0x8664):
+        prefix = Path(fixture["parameters"]["Prefix"])
+        rows = result.get("binaries", [])
+        return len(rows) == 2 and all((prefix / row["name"]).is_file() and
+            machine(prefix / row["name"]) == architecture and digest(prefix / row["name"]) == row["sha256"] and
+            marker.encode() in (prefix / row["name"]).read_bytes() for row in rows)
+
+    write_files(manifests)
+    pinned_commit = commit("module-committed-sibling")
+    config("module-source", local_path=str(module_upstream))
+    generated_module, module_runtime, module_policy = generate("module-source", "module-generate")
+    check("ordinary module regression uses the unchanged public source and family policy",
+          generated_module.returncode == 0 and module_policy["source"] == policy["source"],
+          generated_module.stderr.decode(errors="replace"))
+    if generated_module.returncode:
+        return
+    good, details, fixture = run("module-local-sibling", reference=pinned_commit)
+    check("a standalone module builds its complete genuine PE family from a committed sibling",
+          good.returncode == 0 and installed_marker(details, fixture, "pinned-ordinary-module") and
+          details.get("source", {}).get("source_commit") == pinned_commit and no_http(fixture),
+          good.stderr.decode(errors="replace"))
+    if good.returncode:
+        return
+    prefix = Path(fixture["parameters"]["Prefix"])
+    before = {name: digest(prefix / name) for name in ("app.exe", "helper.exe")}
+    original_bytes = {name: (prefix / name).read_bytes() for name in before}
+
+    def protected_prefix(label):
+        selected = root / (label + "-protected-prefix")
+        selected.mkdir()
+        for name, data in original_bytes.items():
+            (selected / name).write_bytes(data)
+        return selected
+
+    module_receipt = details["source"].get("go_module", {})
+    check("ordinary source receipt identifies its main module and exact committed replacement without ambient paths",
+          module_receipt.get("path") == "project" and module_receipt.get("module_path") == "example.invalid/module-app" and
+          module_receipt.get("go_mod_sha256") == digest(module_upstream / "project/go.mod") and
+          module_receipt.get("local_replacements") == [{"module_path": "example.invalid/module-shared", "version": "",
+              "path": "shared", "replacement_module_path": "example.invalid/module-shared",
+              "go_mod_sha256": digest(module_upstream / "shared/go.mod")}] and
+          module_receipt.get("vendor") is False and "go_workspace" not in details["source"] and
+          str(root) not in json.dumps(module_receipt), json.dumps(module_receipt))
+    arm, arm_details, arm_fixture = run("module-local-arm64", reference=pinned_commit, platform="windows/arm64")
+    check("ordinary local module closure also compiles the selected ARM64 companion family",
+          arm.returncode == 0 and installed_marker(arm_details, arm_fixture, "pinned-ordinary-module", 0xAA64) and
+          {row["name"] for row in arm_details.get("binaries", [])} == {"app.exe", "arm-helper.exe"},
+          arm.stderr.decode(errors="replace"))
+
+    ambient = root / "ambient-module"
+    ambient.mkdir()
+    (ambient / "go.mod").write_text(dependency)
+    (ambient / "value.go").write_text(pinned_value.replace("pinned-ordinary-module", "ambient-module-one"))
+    absolute_rule = "replace example.invalid/module-shared => " + json.dumps(str(ambient)) + "\n"
+    write_files({"project/go.mod": module + absolute_rule})
+    outside_commit = commit("module-absolute-ambient-dependency")
+    if options.module_baseline_project:
+        old_generated, old_runtime, old_policy = generate("module-source", "module-baseline-generate",
+            checkout=options.module_baseline_project.resolve(), destination=root / "module-baseline-generated")
+        old, old_details, old_fixture = run("module-baseline-ambient-one", selected_runtime=old_runtime, reference=outside_commit)
+        check("frozen baseline actually compiles the external host module under a pinned source receipt",
+              old_generated.returncode == 0 and old_policy == module_policy and old.returncode == 0 and
+              old_details.get("source", {}).get("source_commit") == outside_commit and
+              installed_marker(old_details, old_fixture, "ambient-module-one"), old.stderr.decode(errors="replace"))
+        (ambient / "value.go").write_text(pinned_value.replace("pinned-ordinary-module", "ambient-module-two"))
+        changed, changed_details, changed_fixture = run("module-baseline-ambient-two", selected_runtime=old_runtime, reference=outside_commit)
+        check("the same frozen source pin installs different real bytes after only the ambient dependency changes",
+              changed.returncode == 0 and changed_details.get("source", {}).get("source_commit") == outside_commit and
+              installed_marker(changed_details, changed_fixture, "ambient-module-two") and
+              changed_details.get("source", {}).get("sha256") != old_details.get("source", {}).get("sha256"),
+              changed.stderr.decode(errors="replace"))
+    refused_prefix = protected_prefix("module-absolute-refusal")
+    refused, _, refused_fixture = run("module-absolute-refusal", reference=outside_commit, parameters={"Prefix": str(refused_prefix)})
+    check("an absolute local replacement cannot reach Go package loading or alter the existing family",
+          refused.returncode == 4 and not any(row["arguments"][0] in ("list", "build") for row in calls(refused_fixture)) and
+          all(digest(refused_prefix / name) == value for name, value in before.items()) and no_http(refused_fixture),
+          refused.stderr.decode(errors="replace"))
+
+    for label, rule in (
+        ("module-relative-escape", "replace example.invalid/module-shared => ../../outside\n"),
+        ("module-unused-escape", "replace example.invalid/module-shared => ../shared\nreplace example.invalid/unused => /outside-unused\n"),
+        ("module-versioned-escape", "replace example.invalid/module-shared v0.0.0 => ../../outside\n"),
+    ):
+        write_files({"project/go.mod": module + rule})
+        reference = commit(label)
+        denied_prefix = protected_prefix(label)
+        denied, _, denied_fixture = run(label, reference=reference, parameters={"Prefix": str(denied_prefix)})
+        check(label + " fails before dependency loading and preserves the complete prior family",
+              denied.returncode == 4 and not any(row["arguments"][0] in ("list", "build") for row in calls(denied_fixture)) and
+              all(digest(denied_prefix / name) == value for name, value in before.items()), denied.stderr.decode(errors="replace"))
+
+    injected_prefix = protected_prefix("module-untracked-checksums")
+    injected, _, injected_fixture = run("module-untracked-checksums", reference=pinned_commit,
+        inject_module_files={"shared/go.sum": ""}, parameters={"Prefix": str(injected_prefix)})
+    check("untracked checksum metadata cannot become authority for a selected local module",
+          injected.returncode == 4 and not any(row["arguments"][0] in ("list", "build") for row in calls(injected_fixture)) and
+          all(digest(injected_prefix / name) == value for name, value in before.items()), injected.stderr.decode(errors="replace"))
+    drift_prefix = protected_prefix("module-dependency-drift")
+    drift, drift_details, _ = run("module-dependency-drift", reference=pinned_commit,
+        parameters={"Prefix": str(drift_prefix)}, mutate_source=True, mutate_source_member="../shared/value.go")
+    check("real compilation followed by tracked dependency drift cannot activate any new family member",
+          drift.returncode == 7 and "changed the pinned tracked inputs" in drift_details.get("error", "") and
+          all(digest(drift_prefix / name) == value for name, value in before.items()), drift.stderr.decode(errors="replace"))
+
+    # Go vendor materialization, not a hand-written imitation, establishes the
+    # exact metadata that makes the external replacement original irrelevant.
+    write_files({"project/go.mod": module + absolute_rule})
+    required(["go", "mod", "vendor"], "module-vendor-materialize", cwd=module_upstream / "project",
+        extra={"GOWORK": "off", "GOENV": "off", "GOFLAGS": "", "GOPROXY": "off", "GOSUMDB": "off"})
+    vendor_commit = commit("module-committed-vendor")
+    vendor_marker = "ambient-module-two" if options.module_baseline_project else "ambient-module-one"
+    (ambient / "value.go").write_text(pinned_value.replace("pinned-ordinary-module", "unused-after-vendoring"))
+    vendored, vendor_details, vendor_fixture = run("module-committed-vendor", reference=vendor_commit)
+    vendor_receipt = vendor_details.get("source", {}).get("go_module", {})
+    check("committed ordinary vendor code builds without consuming its now-different external original",
+          vendored.returncode == 0 and installed_marker(vendor_details, vendor_fixture, vendor_marker) and
+          vendor_receipt.get("vendor") is True and vendor_receipt.get("local_replacements") == [] and
+          vendor_receipt.get("vendor_modules_sha256") == digest(module_upstream / "project/vendor/modules.txt") and
+          all("-mod=vendor" in row["arguments"] for row in calls(vendor_fixture) if row["arguments"][0] in ("list", "build")),
+          vendored.stderr.decode(errors="replace"))
+    vendor_manifest = (module_upstream / "project/vendor/modules.txt").read_text()
+    write_files({"project/vendor/modules.txt": vendor_manifest.replace("v0.0.0", "v9.0.0")})
+    invalid_vendor_commit = commit("module-inconsistent-vendor")
+    inconsistent_prefix = protected_prefix("module-inconsistent-vendor")
+    inconsistent, _, inconsistent_fixture = run("module-inconsistent-vendor", reference=invalid_vendor_commit,
+        parameters={"Prefix": str(inconsistent_prefix)})
+    check("Go still rejects inconsistent committed vendor inventory before compiling any member",
+          inconsistent.returncode != 0 and not any(row["arguments"][0] == "build" for row in calls(inconsistent_fixture)) and
+          all(digest(inconsistent_prefix / name) == value for name, value in before.items()), inconsistent.stderr.decode(errors="replace"))
+
+    injected_vendor_prefix = protected_prefix("module-untracked-vendor")
+    injected_vendor, _, injected_vendor_fixture = run("module-untracked-vendor", reference=pinned_commit,
+        inject_module_files={"project/vendor/modules.txt": vendor_manifest}, parameters={"Prefix": str(injected_vendor_prefix)})
+    check("untracked module vendor metadata is refused before Go dependency loading",
+          injected_vendor.returncode == 4 and not any(row["arguments"][0] in ("list", "build") for row in calls(injected_vendor_fixture)) and
+          all(digest(injected_vendor_prefix / name) == value for name, value in before.items()), injected_vendor.stderr.decode(errors="replace"))
+
+    simple = 'package main\nimport "fmt"\nfunc main() { fmt.Println("legacy-vendor-without-dependencies") }\n'
+    write_files({"project/go.mod": "module example.invalid/module-app\n\ngo 1.22\n",
+        "project/apps/primary/main.go": simple, "project/cmd/helper/main.go": simple})
+    legacy_commit = commit("module-legacy-vendor", untracked=["project/vendor/modules.txt"])
+    legacy, legacy_details, legacy_fixture = run("module-legacy-vendor", reference=legacy_commit)
+    check("legacy committed vendor directories without modules.txt retain Go's no-dependency behavior",
+          legacy.returncode == 0 and installed_marker(legacy_details, legacy_fixture, "legacy-vendor-without-dependencies") and
+          legacy_details.get("source", {}).get("go_module", {}).get("vendor") is True and
+          "vendor_modules_sha256" not in legacy_details.get("source", {}).get("go_module", {}),
+          legacy.stderr.decode(errors="replace"))
+
+
+if not options.go_workspace_only:
+    test_go_module_replacements()
+if options.go_modules_only:
+    print(f"Windows ordinary Go module source tests: {passed} passed, {failed} failed", flush=True)
+    print("Real Go PE compilation and Git pins with portable PowerShell; native Windows and live GitHub remain unqualified.", flush=True)
     raise SystemExit(1 if failed else 0)
 
 
