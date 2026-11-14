@@ -185,8 +185,10 @@ def fixture(boundary, name):
     return case, artifact, receipt
 
 
-cases = ('valid-pretty', 'valid-failure', 'success-nonzero', 'stderr-only', 'empty-zero',
-         'missing-nonzero', 'chatter', 'multiple', 'trailing-malformed', 'null', 'array')
+cases = ('valid-pretty', 'valid-failure', 'success-nonzero', 'success-declared-failure',
+         'success-string-exit', 'success-null-exit', 'failure-zero', 'failure-mismatched-exit',
+         'unknown-status', 'stderr-only', 'empty-zero', 'missing-nonzero', 'chatter',
+         'multiple', 'trailing-malformed', 'null', 'array')
 for boundary in ('native', 'act', 'worker'):
     for name in cases:
         case, artifact, receipt = fixture(boundary, name)
@@ -202,6 +204,19 @@ for boundary in ('native', 'act', 'worker'):
             expected = 17
         elif name == 'success-nonzero':
             expected = 17
+        elif name in ('success-declared-failure', 'success-string-exit', 'success-null-exit'):
+            receipt['exit_code'] = {'success-declared-failure': 17,
+                                    'success-string-exit': '0', 'success-null-exit': None}[name]
+            raw = json.dumps(receipt) + '\n'
+            expected = 4
+        elif name in ('failure-zero', 'failure-mismatched-exit'):
+            raw = json.dumps(dict(status='failed', exit_code=17,
+                                  error='backend reported a failed build')) + '\n'
+            expected = 4 if name == 'failure-zero' else 23
+        elif name == 'unknown-status':
+            receipt['status'] = 'unknown'
+            raw = json.dumps(receipt) + '\n'
+            expected = 4
         elif name in ('stderr-only', 'empty-zero', 'missing-nonzero'):
             raw = ''
             if name == 'stderr-only':
@@ -219,7 +234,8 @@ for boundary in ('native', 'act', 'worker'):
         else:
             raw = json.dumps(None if name == 'null' else [receipt]) + '\n'
             expected = 4
-        exit_code = 17 if name in ('valid-failure', 'success-nonzero') else 23 if name == 'missing-nonzero' else 0
+        exit_code = 17 if name in ('valid-failure', 'success-nonzero') else 23 if name in (
+            'missing-nonzero', 'failure-mismatched-exit') else 0
         (case / 'backend.stdout').write_text(raw)
         (case / 'backend.stderr').write_text(noise)
         (case / 'backend.exit').write_text(str(exit_code) + '\n')
@@ -247,6 +263,31 @@ for boundary in ('native', 'act', 'worker'):
                   'resume_artifacts' not in value and value.get('status') != 'success')
         diagnostics = (case / 'attempt.log').read_bytes() if boundary == 'worker' else result.stderr
         check(label + ': original diagnostic text is retained', noise.encode() in diagnostics)
+
+# Retained bytes cannot rehabilitate a contradictory outcome from an earlier
+# run. Use the real successful worker receipt and its actual frozen artifact,
+# changing only the declared exit code at the production reuse boundary.
+completed = root / 'worker-valid-pretty'
+saved = json.loads((completed / 'attempt.json').read_bytes())
+reuse_driver = r'''set -uo pipefail
+source "$1" || exit 90
+result=$(cat -- "$2") || exit 4
+_act_target_result_available "$result" release true
+'''
+for name, code in (('zero', 0), ('missing', 0), ('nonzero', 17), ('string', '0'),
+                   ('null', None), ('fraction', 0.5), ('negative', -1), ('boolean', False)):
+    candidate = dict(saved)
+    if name == 'missing':
+        candidate.pop('exit_code', None)
+    else:
+        candidate['exit_code'] = code
+    receipt = completed / ('reuse-' + name + '.json')
+    receipt.write_text(json.dumps(candidate) + '\n')
+    result = subprocess.run(['bash', '-c', reuse_driver, '_', str(module), str(receipt)],
+                            stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+    (completed / ('reuse-' + name + '.stderr')).write_bytes(result.stderr)
+    check('retained/' + name + ': only a coherent success can authorize frozen-byte reuse',
+          result.returncode == (0 if name in ('zero', 'missing') else 1))
 
 # The raw attempt channel is write-once too; a conflicting file, link, FIFO or
 # directory cannot be overwritten or opened by a backend before admission.
@@ -2041,6 +2082,31 @@ act_run_native_build() {
 case "$DSR_STDIN_MODE" in
     missing-receipt) _act_run_target_worker() { return 0; } ;;
     killed-worker) _act_run_target_worker() { kill -KILL "$BASHPID"; } ;;
+    coordinator-exit|coordinator-stream)
+        # The real coordinator must reject a damaged terminal receipt even
+        # when the outer worker exits zero. Preserve its original bytes.
+        _act_run_target_worker() {
+            local slug artifact result receipts
+            slug=$(printf '%s' "$4" | tr / -) || return 4
+            artifact="$DSR_STDIN_CASE/output/coordinator-$slug.bin"
+            printf 'retained artifact for %s\n' "$4" > "$artifact" || return 4
+            printf 'Injected incoherent worker receipt\n' >> "$6" || return 4
+            result=$(jq -nc --arg target "$4" --arg artifact "$artifact" \
+                '{platform:$target,task_key:$target,method:"native",status:"success",exit_code:0,
+                  build_purpose:"release",publishable:true,artifact_path:$artifact}') || return 4
+            receipts=$(_act_result_artifact_receipts "$result") || return 4
+            result=$(jq -c --argjson receipts "$receipts" \
+                '. + {resume_artifacts:$receipts}' <<< "$result") || return 4
+            if [[ "$DSR_STDIN_MODE" == coordinator-exit ]]; then
+                result=$(jq -c '.exit_code=17' <<< "$result") || return 4
+            fi
+            printf '%s\n' "$result" > "$7" || return 4
+            if [[ "$DSR_STDIN_MODE" == coordinator-stream ]]; then
+                printf '%s\n' "$result" >> "$7" || return 4
+            fi
+            cp -- "$7" "$DSR_STDIN_CASE/coordinator-$slug.retained" || return 4
+        }
+        ;;
     child-*)
         # The real outer worker must observe this command's actual status.
         # A native backend can already have printed successful JSON when its
@@ -2121,7 +2187,8 @@ def invoke(case, identity, jobs, mode, phase, retry_max=3, expected_code=None):
     process = subprocess.Popen(['bash', str(driver)], env=env, stdin=subprocess.DEVNULL,
                                stdout=out, stderr=err, start_new_session=True)
     try:
-        if phase == 'first' and mode not in ('missing-receipt', 'killed-worker'):
+        if phase == 'first' and mode not in ('missing-receipt', 'killed-worker',
+                                            'coordinator-exit', 'coordinator-stream'):
             # Each admitted worker blocks in its capacity prelude. The next
             # batch cannot start until we release this exact initial wave.
             wait_for(process, lambda: len(list(case.glob('prelude.*.ready'))) == jobs,
@@ -2159,7 +2226,8 @@ def invoke(case, identity, jobs, mode, phase, retry_max=3, expected_code=None):
         expected_code = (0 if mode in ('child-success', 'child-durable-success-killed') else 1) \
             if mode.startswith('child-') else {
             'success': 0, 'failure': 1, 'timeout': 1, 'readiness': 1, 'cancel': 130,
-            'missing-receipt': 6, 'killed-worker': 6}[mode]
+            'missing-receipt': 6, 'killed-worker': 6,
+            'coordinator-exit': 6, 'coordinator-stream': 6}[mode]
     check(case.name + '/' + phase + ': aggregate preserves the real exit status', code == expected_code)
     check(case.name + '/' + phase + ': exactly six ordered target rows',
           value['run_id'] == identity and value['summary']['total'] == 6 and
@@ -2415,7 +2483,8 @@ for jobs in (() if sys.argv[3] in ('--coordinator-receipt-only', '--sidecar-reco
 
 for jobs in (() if sys.argv[3] in ('--sidecar-recovery-only', '--worker-completion-only',
                                   '--host-readiness-only', '--host-readiness-cli-only') else (1, 3)):
-    for mode, observed_exit in (('missing-receipt', 0), ('killed-worker', 137)):
+    for mode, observed_exit in (('missing-receipt', 0), ('killed-worker', 137),
+                                ('coordinator-exit', 0), ('coordinator-stream', 0)):
         case, identity = fixture(jobs, mode)
         first, state = invoke(case, identity, jobs, mode, 'first')
         check(case.name + ': lost worker receipts cannot report compilation or publication success',
@@ -2426,15 +2495,36 @@ for jobs in (() if sys.argv[3] in ('--sidecar-recovery-only', '--worker-completi
         for row in first['targets']:
             saved = state['target_statuses'][row['platform']]
             result_path, log_path = Path(row['result_path']), Path(row['log_path'])
-            receipt = read(result_path)
-            check(case.name + ': ' + row['platform'] + ' retains the observed child exit separately',
-                  row['status'] == 'failed' and row['exit_code'] == (observed_exit or 6) and
-                  row['worker_exit_code'] == observed_exit and row['receipt_source'] == 'coordinator' and
-                  row['attempt'] == 1 and saved['attempts'] == 1 and saved['status'] == 'failed' and
-                  receipt == saved['result'] and receipt == row and not receipt.get('resume_artifacts'))
+            if mode.startswith('coordinator-'):
+                original = case / ('coordinator-' + row['platform'].replace('/', '-') + '.retained')
+                check(case.name + ': ' + row['platform'] + ' refuses incoherent completion without rewriting it',
+                      row['status'] == 'failed' and
+                      row['exit_code'] == (4 if mode == 'coordinator-exit' else 6) and
+                      row['attempt'] == 1 and saved['attempts'] == 1 and saved['status'] == 'failed' and
+                      saved['result'] == row and not row.get('resume_artifacts') and
+                      result_path.read_bytes() == original.read_bytes())
+            else:
+                receipt = read(result_path)
+                check(case.name + ': ' + row['platform'] + ' retains the observed child exit separately',
+                      row['status'] == 'failed' and row['exit_code'] == (observed_exit or 6) and
+                      row['worker_exit_code'] == observed_exit and row['receipt_source'] == 'coordinator' and
+                      row['attempt'] == 1 and saved['attempts'] == 1 and saved['status'] == 'failed' and
+                      receipt == saved['result'] and receipt == row and not receipt.get('resume_artifacts'))
             immutable[result_path] = result_path.read_bytes()
             immutable[log_path] = log_path.read_bytes()
         (case / 'release').write_text('continue\n')
+        if mode == 'coordinator-stream':
+            # A malformed multi-document sidecar remains an explicit recovery
+            # refusal; it must never become a reusable success on the next run.
+            env = invocation_env(case, identity, jobs, 'success', 'resume')
+            refused = subprocess.run(['bash', str(driver)], env=env, stdin=subprocess.DEVNULL,
+                                     capture_output=True, timeout=45)
+            (case / 'resume-refused.stdout').write_bytes(refused.stdout)
+            (case / 'resume-refused.stderr').write_bytes(refused.stderr)
+            check(case.name + ': malformed retained receipts cannot authorize any resumed compiler',
+                  refused.returncode != 0 and not events(case) and
+                  all(path.read_bytes() == contents for path, contents in immutable.items()))
+            continue
         resumed, resumed_state = invoke(case, identity, jobs, 'success', 'resume')
         verify_attempts(case, resumed, resumed_state, {target: 1 for target in targets}, {},
                         case.name + '/resume', {target: 2 for target in targets})

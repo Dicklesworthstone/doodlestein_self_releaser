@@ -16293,7 +16293,8 @@ _act_target_result_available() {
     local result_json="$1"
     local purpose="${2:-release}" require_purpose="${3:-false}"
     _act_build_purpose_matches "$result_json" "$purpose" "$require_purpose" || return 1
-    jq -e '(.status == "success" or .status == "ok" or .status == "passed")' \
+    jq -e '(.status == "success" or .status == "ok" or .status == "passed") and
+        ((has("exit_code") | not) or .exit_code == 0)' \
         <<< "$result_json" &>/dev/null || return 1
     _act_validate_workflow_source_result "$result_json" "${4:-}" || return 1
     local expected actual
@@ -16393,6 +16394,33 @@ _act_repo_config_matches() {
         _log_error "Repository configuration changed; restore the saved recipe or start a fresh run"
         return 4
     fi
+}
+
+# Reconcile a complete backend object with the process exit observed by its
+# caller. JSON success cannot override an actual failure, nor may a zero exit
+# hide a reported failure or malformed exit code. Only admitted success can
+# acquire or retain reusable artifact evidence. A missing code is filled from
+# the process observation; an explicitly supplied code must agree.
+_act_backend_result_json() {
+    local observed_exit="$1" result="$2"
+    [[ "$observed_exit" =~ ^[0-9]{1,3}$ ]] && (( 10#$observed_exit <= 255 )) || return 4
+    jq -ce --argjson observed_exit "$observed_exit" '
+        def succeeded: . == "success" or . == "ok" or . == "passed";
+        if type != "object" then error("expected a backend result object")
+        elif $observed_exit != 0 then
+            if (.status | succeeded) then
+                .status = "failed" |
+                .error = (.error // "Backend exited nonzero despite reporting success")
+            else . end |
+            .exit_code = $observed_exit | del(.resume_artifacts)
+        elif (.status | succeeded) and ((has("exit_code") | not) or .exit_code == 0) then
+            .exit_code = 0
+        else
+            .status = "failed" | .exit_code = 4 | .stage = "backend_receipt" |
+            .error = (.error // "Backend result is inconsistent with its observed exit status") |
+            del(.resume_artifacts)
+        end
+    ' <<< "$result"
 }
 
 # Execute exactly one target and emit exactly one compact JSON result on
@@ -16498,6 +16526,8 @@ _act_build_orchestration_target() {
                 '{status:"failed",exit_code:$exit_code,stage:"backend_receipt",
                   error:"Workflow backend did not emit exactly one JSON result object"}') || return 4
         fi
+        result=$(_act_backend_result_json "$exit_code" "$result") || return 4
+        exit_code=$(jq -er '.exit_code' <<< "$result") || return 4
         result=$(jq -c --arg target "$target" --arg method "act" --arg host "$host" \
             '. + {platform: $target, method: $method, host: $host}' <<< "$result")
         if [[ "$exit_code" -eq 0 ]] &&
@@ -16549,6 +16579,8 @@ _act_build_orchestration_target() {
                   method:$method,host:$host,stage:"backend_receipt",
                   error:"Native backend did not emit exactly one JSON result object"}') || return 4
         fi
+        result=$(_act_backend_result_json "$exit_code" "$result") || return 4
+        exit_code=$(jq -er '.exit_code' <<< "$result") || return 4
     fi
 
     if [[ -n "$_ACT_EXPECTED_REPO_CONFIG_SHA256" ]] &&
@@ -16567,16 +16599,6 @@ _act_build_orchestration_target() {
         result=$(jq -c '.status = "failed" | .exit_code = 4 |
             .error = "Native variant result does not match the requested target triple"' <<< "$result") || return 4
     fi
-    if [[ "$exit_code" -ne 0 ]] &&
-       [[ "$result_status" == "success" || "$result_status" == "ok" ||
-          "$result_status" == "passed" ]]; then
-        result=$(jq -c --argjson exit_code "$exit_code" '
-            .status = "failed" | .exit_code = $exit_code |
-            .error = (.error // "Build command exited nonzero despite reporting success")
-        ' <<< "$result")
-        result_status="failed"
-    fi
-
     if [[ "$strict_release_contract" == "true" ]]; then
         local staged_result
         if [[ "$result_status" == "success" ]]; then
@@ -16990,22 +17012,15 @@ _act_run_target_worker() {
             '{platform: $target, host: $host, status: "failed",
               exit_code: $exit_code, error: "Worker produced no valid result"}')
     fi
-    result_status=$(jq -r '.status // "unknown"' <<< "$result")
     # The observed exit must still agree with the isolated result before its
     # artifact paths become an immutable, reusable success.
-    if [[ "$worker_status" -ne 0 ]] &&
-       [[ "$result_status" == success || "$result_status" == ok || "$result_status" == passed ]]; then
-        result_status=failed
-        if ! result=$(jq -c --argjson exit_code "$worker_status" '
-            .status = "failed" | .exit_code = $exit_code |
-            .error = (.error // "Worker exited nonzero despite reporting success") |
-            del(.resume_artifacts)
-        ' <<< "$result"); then
-            _act_worker_release_slot
-            trap - EXIT INT TERM HUP
-            return 4
-        fi
+    if ! result=$(_act_backend_result_json "$worker_status" "$result") ||
+       ! worker_status=$(jq -er '.exit_code' <<< "$result"); then
+        _act_worker_release_slot
+        trap - EXIT INT TERM HUP
+        return 4
     fi
+    result_status=$(jq -r '.status // "unknown"' <<< "$result")
     if [[ "$result_status" == success || "$result_status" == ok || "$result_status" == passed ]] && \
        ! _act_matrix_result_matches "$result" "$target" "$selected_triple"; then
         worker_status=4
@@ -18374,7 +18389,11 @@ act_orchestrate_build() {
         local result_path="${worker_results[$index]}" log_path="${worker_logs[$index]}"
         local host="${worker_hosts[$index]}" attempt="${worker_attempts[$index]}"
         local finished_result status extra
-        if [[ -s "$result_path" ]] && finished_result=$(jq -ce '.' "$result_path" 2>/dev/null); then
+        if [[ -f "$result_path" && ! -L "$result_path" && -s "$result_path" ]] &&
+           finished_result=$(jq -cse '
+               if length == 1 and (.[0] | type == "object") then .[0]
+               else error("exactly one completed worker result object required") end
+           ' "$result_path" 2>/dev/null); then
             if ! _act_build_purpose_matches "$finished_result" "$build_purpose" true; then
                 finished_result=$(jq -nc --arg target "$finished_platform" --arg host "$host" \
                     '{platform: $target, host: $host, status: "failed", exit_code: 4,
@@ -18388,6 +18407,14 @@ act_orchestrate_build() {
                 '{platform: $target, host: $host, status: "failed", exit_code: $exit_code,
                   worker_exit_code: $worker_exit_code,
                   error: "Worker result receipt missing or invalid"}')
+        fi
+        # A terminal success receipt survives a later worker cleanup death.
+        # Its own recorded outcome must nevertheless be internally coherent;
+        # the outer worker's exit cannot repair a contradictory backend code.
+        if jq -e '(.status | IN("success", "ok", "passed")) and
+                (has("exit_code") and .exit_code != 0)' \
+                <<< "$finished_result" >/dev/null; then
+            finished_result=$(_act_backend_result_json 0 "$finished_result") || return 4
         fi
         if [[ "$(jq -r '.status // ""' <<< "$finished_result")" == success ]] && \
            ! _act_matrix_result_matches "$finished_result" "$finished_platform" "$finished_triple"; then
@@ -20620,5 +20647,6 @@ export -f _act_strict_go_workfile_json _act_strict_go_build_env _act_validate_st
 export -f _act_validate_strict_go_source_flags
 export -f act_run_native_build act_orchestrate_build act_generate_manifest
 export -f _act_result_artifact_receipts _act_target_result_available
+export -f _act_backend_result_json
 export -f _act_build_orchestration_target _act_run_target_worker
 export -f act_sync_sources

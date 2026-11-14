@@ -763,8 +763,16 @@ the resolved pair. `CGO_ENABLED` remains under the repository's control, so
 cross-compilation that requires C libraries still needs the configured C
 toolchain.
 
-Target logs and result receipts are isolated by task and attempt. Aggregation
-is deterministic in requested-platform order, then configured triple order.
+Target logs and result receipts are isolated by task and attempt. A backend
+must emit one complete JSON object on its result channel. Successful status and
+any declared exit code must agree with the observed process outcome before the
+worker freezes artifacts for resume. An actual nonzero exit takes precedence;
+a zero-exit process with a failed, unknown, or contradictory result is refused.
+Coordinator reads also reject multiple result documents and inconsistent
+success receipts. Original receipt bytes remain available for diagnosis. A
+coherent success already written by a completed backend remains recoverable if
+the outer worker subsequently dies during cleanup.
+Aggregation is deterministic in requested-platform order, then configured triple order.
 Targets that share a native output path use private source copies when supported.
 When those outputs cannot be isolated, only the conflicting targets wait;
 independent queued targets continue within the configured job limit. Deferral
