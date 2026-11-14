@@ -96,19 +96,58 @@ cat > "$work/transports/curl" <<'SH'
 #!/usr/bin/env bash
 set -uo pipefail
 args=() url_count=0
-for arg in "$@"; do
-    case "$arg" in
+config_stdin=false expect_config=false config_line='' config_url='' routed_config=''
+route_release_url() {
+    case "$1" in
         https://github.com/Dicklesworthstone/*/releases/download/v1.2.3/*)
-            printf '%s\n' "$arg" >> "$DSR_TEST_CALLS"
-            [[ "$DSR_TEST_HTTP_VARIANT" != offline ]] || exit 22
-            args+=("$DSR_TEST_ORIGIN/$DSR_TEST_HTTP_VARIANT/${arg#https://github.com/}")
+            printf '%s\n' "$1" >> "$DSR_TEST_CALLS"
+            [[ "$DSR_TEST_HTTP_VARIANT" != offline ]] || return 22
+            printf '%s/%s/%s' "$DSR_TEST_ORIGIN" "$DSR_TEST_HTTP_VARIANT" "${1#https://github.com/}" ;;
+        *) printf 'REFUSED %s\n' "$1" >> "$DSR_TEST_CALLS"; return 22 ;;
+    esac
+}
+for arg in "$@"; do
+    if $expect_config; then
+        [[ "$arg" == - ]] || exit 22
+        args+=("$arg")
+        config_stdin=true
+        expect_config=false
+        continue
+    fi
+    case "$arg" in
+        --config|-K)
+            $config_stdin && exit 22
+            expect_config=true
+            args+=("$arg") ;;
+        --config=*|-K?*) exit 22 ;;
+        https://github.com/Dicklesworthstone/*/releases/download/v1.2.3/*)
+            routed=$(route_release_url "$arg") || exit $?
+            args+=("$routed")
             url_count=$((url_count + 1)) ;;
         *://*) printf 'REFUSED %s\n' "$arg" >> "$DSR_TEST_CALLS"; exit 22 ;;
         *) args+=("$arg") ;;
     esac
 done
+$expect_config && exit 22
+if $config_stdin; then
+    # Current installers put one public URL in curl's stdin config. Admit
+    # only that exact record; retain every curl option and route only its URL.
+    IFS= read -r config_line || exit 22
+    config_url=${config_line#'url = "'}
+    config_url=${config_url%'"'}
+    [[ "$config_line" == "url = \"$config_url\"" &&
+       "$config_url" != *[[:cntrl:]]* && "$config_url" != *\\* && "$config_url" != *\"* ]] || exit 22
+    extra=''
+    if IFS= read -r extra || [[ -n "$extra" ]]; then exit 22; fi
+    routed=$(route_release_url "$config_url") || exit $?
+    routed_config="url = \"$routed\""
+    url_count=$((url_count + 1))
+fi
 [[ "$url_count" == 1 ]] || exit 22
-exec "$DSR_TEST_CURL" --noproxy '*' --cacert "$DSR_TEST_CA" "${args[@]}"
+if $config_stdin; then
+    exec "$DSR_TEST_CURL" -q --noproxy '*' --cacert "$DSR_TEST_CA" "${args[@]}" <<< "$routed_config"
+fi
+exec "$DSR_TEST_CURL" -q --noproxy '*' --cacert "$DSR_TEST_CA" "${args[@]}"
 SH
 cat > "$work/transports/gh" <<'SH'
 #!/usr/bin/env bash

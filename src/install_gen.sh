@@ -66,6 +66,7 @@ _install_gen_template() {
 #   -v, --version VERSION    Install specific version, e.g. 1.2.3 or v1.2.3 (default: latest)
 #   -d, --dir DIR            Installation directory (default: ~/.local/bin)
 #   -y, --yes                Replace an existing binary without asking
+#   --recover               With --yes: recover a stopped installation (Python 3 required)
 #   --mode vibe|safe         vibe (default) also installs agent skills; safe installs
 #                            only the verified release binary (no skills, no source builds)
 #   --verify                 Verify checksums (always enabled)
@@ -140,6 +141,7 @@ _VERIFY=true
 _REQUIRE_SIGNATURES=false
 _NON_INTERACTIVE=false
 _AUTO_YES=false
+_RECOVER=false
 _OFFLINE_ARCHIVE=""
 _CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/dsr/installers"
 _OFFLINE_MODE=false
@@ -160,6 +162,7 @@ _INSTALL_PLATFORM=""
 _PRIMARY_INSTALL_NAME="$BINARY_NAME"
 _INSTALL_NAMES=()
 _INSTALL_PATHS=()
+_INSTALL_APPROVALS=()
 _INSTALLED_BINARIES_JSON='[]'
 _GITHUB_ASSET_INDEX=""
 _GITHUB_ASSET_REPO=""
@@ -488,14 +491,16 @@ _detect_linux_libc() {
     local version="" loader
     if command -v ldd >/dev/null 2>&1; then
         version=$(ldd --version 2>&1) || true
-        case "${version,,}" in
+        version=$(printf '%s' "$version" | LC_ALL=C tr '[:upper:]' '[:lower:]') || return 1
+        case "$version" in
             *musl*) echo musl; return 0 ;;
             *"gnu libc"*|*"gnu c library"*|*glibc*) echo gnu; return 0 ;;
         esac
     fi
     if command -v getconf >/dev/null 2>&1; then
         version=$(getconf GNU_LIBC_VERSION 2>/dev/null) || true
-        [[ "${version,,}" != *glibc* ]] || { echo gnu; return 0; }
+        version=$(printf '%s' "$version" | LC_ALL=C tr '[:upper:]' '[:lower:]') || return 1
+        [[ "$version" != *glibc* ]] || { echo gnu; return 0; }
     fi
     for loader in /lib/ld-musl-*.so.1 /usr/lib/ld-musl-*.so.1; do
         if [[ -e "$loader" ]]; then
@@ -739,12 +744,13 @@ _installer_token_api_dependencies() {
 # curl resolves relative Location values before returning redirect_url.
 _installer_api_https_url() {
     local url="$1" authority tail
+    local authority_pattern='^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:443)?$'
     [[ "$url" == https://* && "$url" != *[[:space:][:cntrl:]]* &&
        "$url" != *\\* && "$url" != *'#'* && ${#url} -le 16384 ]] || return 1
     tail="${url#https://}"
     [[ "$tail" == */* ]] || return 1
     authority="${tail%%/*}"
-    [[ "$authority" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:443)?$ ]]
+    [[ "$authority" =~ $authority_pattern ]]
 }
 
 # Scope credentials to this repository's release API, including redirects.
@@ -1424,10 +1430,10 @@ _extract_archive() {
         # ZIP writers may record permissions but omit S_IFREG (Python's
         # writestr does this). Accept zero type bits, not arbitrary unknown
         # types, and require an attribute record for every entry.
-        local attributes=0 mode
+        local attributes=0 mode attribute_pattern='^[[:space:]]+Unix file attributes \(([0-7]{6}) octal\)'
         listing=$(LC_ALL=C unzip -Z -v "$archive" 2>/dev/null) || return 1
         while IFS= read -r line; do
-            if [[ "$line" =~ ^[[:space:]]+Unix\ file\ attributes\ \(([0-7]{6})\ octal\) ]]; then
+            if [[ "$line" =~ $attribute_pattern ]]; then
                 mode=$((8#${BASH_REMATCH[1]} & 0170000))
                 ((mode == 0 || mode == 0100000 || mode == 0040000)) || return 1
                 attributes=$((attributes + 1))
@@ -1671,6 +1677,31 @@ _install_lock_owned() {
     [[ "$observed" == "$owner" ]]
 }
 
+# File identities distinguish our renamed payloads from a later user's edit.
+# Keep this producer in Bash: ordinary release installation needs no Python.
+_install_file_record() {
+    local path="$1" before after hash mode value
+    local fields=()
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    before=$(stat -c '%d %i %a %u %g %h %s' -- "$path" 2>/dev/null) ||
+        before=$(stat -f '%d %i %Lp %u %g %l %z' "$path" 2>/dev/null) || return 1
+    read -r -a fields <<< "$before"
+    [[ ${#fields[@]} -eq 7 && "${fields[2]}" =~ ^[0-7]{1,4}$ ]] || return 1
+    for value in "${fields[@]}"; do [[ "$value" =~ ^[0-9]+$ ]] || return 1; done
+    mode=$((8#${fields[2]}))
+    hash=$(_file_sha256 "$path") || return $?
+    after=$(stat -c '%d %i %a %u %g %h %s' -- "$path" 2>/dev/null) ||
+        after=$(stat -f '%d %i %Lp %u %g %l %z' "$path" 2>/dev/null) || return 1
+    [[ -f "$path" && ! -L "$path" && "$before" == "$after" ]] || return 1
+    printf '{"identity":"%s:%s","nlink":%s,"mode":%s,"uid":%s,"gid":%s,"size":%s,"sha256":"%s"}' \
+        "${fields[0]}" "${fields[1]}" "${fields[5]}" "$mode" "${fields[3]}" "${fields[4]}" "${fields[6]}" "$hash"
+}
+
+_install_destination_record() {
+    if [[ -e "$1" || -L "$1" ]]; then _install_file_record "$1"
+    else printf 'null'; fi
+}
+
 # Stage the complete family and backups on the destination filesystem before
 # replacing its first member. On failure, restore every touched destination;
 # unrelated executables are never moved or removed.
@@ -1678,11 +1709,33 @@ _install_lock_owned() {
 # A second function-body subshell would hide the actual writer behind $! and
 # leave it running when the parent forwards a signal to its tracked child.
 _install_family_transaction() {
-    local dest_dir="$1"; shift
-    local sources=("$@") hashes=() sizes=() previous=()
+    # Job control in the foreground parent gives this writer its own group.
+    # All its utility children remain in that group after the writer dies.
+    set +m
+    local dest_dir="$1" startup="$2"; shift 2
+    local sources=("$@") hashes=() sizes=() previous=() originals=() candidates=() backups=() restorations=()
     local name path hash size previous_hash backup_hash index=0 stage='' committed=false touched=0
     local receipt='[' separator='' original_dir="$dest_dir"
     local install_lock='' lock_identity='' owner_identity='' lock_owner='' lock_held=false lock_setup_interrupted=false
+    local writer_pid='' writer_group='' writer_host='' writer_host_hex='' directory_hex='' process_scope=global startup_deadline=$((SECONDS + 5))
+    local directory_identity='' stage_identity='' journal='' journal_hash='' original_record backup_record rollback_record candidate_record
+    local original_identity='' original_identities='|'
+    while ((SECONDS < startup_deadline)); do
+        if [[ -f "$startup" && ! -L "$startup" ]] && IFS= read -r writer_pid < "$startup"; then break; fi
+        sleep 0.01
+    done
+    [[ "$writer_pid" =~ ^[1-9][0-9]*$ ]] || exit 3
+    writer_group=$(ps -o pgid= -p "$writer_pid") || exit 3
+    writer_group="${writer_group//[[:space:]]/}"
+    [[ "$writer_group" == "$writer_pid" ]] || { _log_error 'Cannot isolate the installation writer'; exit 3; }
+    writer_host=$(uname -n) || exit 3
+    writer_host_hex=$(printf '%s' "$writer_host" | od -An -tx1 | tr -d '[:space:]') || exit 3
+    if [[ "$_INSTALL_PLATFORM" == linux/* ]]; then
+        process_scope=$(readlink /proc/self/ns/pid) || {
+            _log_error 'Linux installation custody requires procfs PID namespace identity'; exit 3;
+        }
+        [[ "$process_scope" =~ ^pid:\[[0-9]+\]$ ]] || exit 3
+    fi
     [[ ${#sources[@]} -eq ${#_INSTALL_NAMES[@]} && ${#sources[@]} -gt 0 ]] || exit 1
     for path in "${sources[@]}"; do
         [[ -f "$path" && ! -L "$path" && -s "$path" ]] || exit 1
@@ -1703,14 +1756,14 @@ _install_family_transaction() {
     fi
     mkdir -p -- "$dest_dir" || exit 1
     dest_dir=$(CDPATH='' cd -P -- "$dest_dir" && pwd -P) || exit 1
-    if ! _install_lock_identity "$dest_dir" >/dev/null; then
+    if ! directory_identity=$(_install_lock_identity "$dest_dir"); then
         _log_error "stat cannot identify the installation directory; refusing unprotected replacement: $dest_dir"
         exit 3
     fi
     install_lock="$dest_dir/.dsr-install.lock"
-    lock_owner="pid=${BASHPID:-$$} tool=$TOOL_NAME token=$RANDOM-$RANDOM-$RANDOM"
+    lock_owner="pid=$writer_pid tool=$TOOL_NAME token=$RANDOM-$RANDOM-$RANDOM"
     _finish_family_transaction() {
-        local status=$? restore_index restore_name failed=false
+        local status=$? restore_index restore_name current_record failed=false outcome=rolled-back
         trap - EXIT
         # Keep ownership through restoration even if the caller repeats TERM.
         trap '' HUP INT TERM
@@ -1732,29 +1785,80 @@ _install_family_transaction() {
             fi
         fi
         if ! $committed; then
+            # Inspect the complete family before restoring its first member.
+            # An independent edit must not be overwritten by our error handler.
+            restore_index=0
+            while ((touched > 0 && restore_index < ${#originals[@]})); do
+                restore_name="${_INSTALL_NAMES[$restore_index]}"
+                current_record=$(_install_destination_record "$dest_dir/$restore_name") || failed=true
+                if [[ "$current_record" != "${originals[$restore_index]}" &&
+                      "$current_record" != "${candidates[$restore_index]}" &&
+                      "$current_record" != "${restorations[$restore_index]}" ]]; then failed=true; fi
+                if [[ "${originals[$restore_index]}" != null ]]; then
+                    [[ "$(_install_file_record "$stage/old/$restore_name")" == "${backups[$restore_index]}" &&
+                       "$(_install_file_record "$stage/restore/$restore_name")" == "${restorations[$restore_index]}" ]] || failed=true
+                fi
+                restore_index=$((restore_index + 1))
+            done
+            if $failed; then
+                _log_error "Install destination changed outside this transaction; preserving family and recovery evidence: $stage"
+                exit 1
+            fi
             restore_index=$((touched - 1))
             while ((restore_index >= 0)); do
                 restore_name="${_INSTALL_NAMES[$restore_index]}"
-                if [[ "${previous[$restore_index]}" == true ]]; then
-                    mv -f -- "$stage/old/$restore_name" "$dest_dir/$restore_name" || failed=true
+                current_record=$(_install_destination_record "$dest_dir/$restore_name") || { failed=true; break; }
+                if [[ "$current_record" == "${originals[$restore_index]}" ||
+                      "$current_record" == "${restorations[$restore_index]}" ]]; then
+                    restore_index=$((restore_index - 1))
+                    continue
+                elif [[ "$current_record" != "${candidates[$restore_index]}" ]]; then
+                    failed=true
+                    break
+                elif [[ "${previous[$restore_index]}" == true ]]; then
+                    [[ "$(_install_file_record "$stage/restore/$restore_name")" == "${restorations[$restore_index]}" ]] || { failed=true; break; }
+                    mv -f -- "$stage/restore/$restore_name" "$dest_dir/$restore_name" || { failed=true; break; }
                 else
-                    rm -f -- "$dest_dir/$restore_name" || failed=true
+                    rm -f -- "$dest_dir/$restore_name" || { failed=true; break; }
                 fi
                 restore_index=$((restore_index - 1))
             done
+        else
+            outcome=committed
         fi
         if $failed; then
             _log_error "Could not restore every previous binary; recovery files and installation lock retained: $stage"
             exit 1
         fi
-        [[ -z "$stage" ]] || rm -rf -- "$stage"
+        if [[ -n "$journal_hash" ]]; then
+            # A complete marker is written only after all replacements or all
+            # restorations finished. It makes cleanup interruption recoverable.
+            if ! (umask 077; printf '%s\n%s\n' "$outcome" "$journal_hash" > "$install_lock/completion.pending") ||
+               ! mv -- "$install_lock/completion.pending" "$install_lock/completion"; then
+                _log_error "Cannot record completed installation; recovery evidence retained: $stage"
+                exit 1
+            fi
+        fi
         if $lock_held; then
-            if ! _install_lock_owned "$install_lock" "$lock_identity" "$owner_identity" "$lock_owner" ||
-               ! rm -- "$install_lock/owner" || ! rmdir -- "$install_lock"; then
+            if ! _install_lock_owned "$install_lock" "$lock_identity" "$owner_identity" "$lock_owner"; then
+                _log_error "Could not release the owned installation lock; inspect before retrying: $install_lock"
+                exit 1
+            fi
+            if [[ -n "$stage" ]]; then
+                # Retire the common lock atomically before deleting backups.
+                # A killed cleanup cannot strand an active lock with no journal.
+                if [[ "$(_install_lock_identity "$stage")" != "$stage_identity" || -e "$stage/lock" || -L "$stage/lock" ]] ||
+                   ! mv -- "$install_lock" "$stage/lock" ||
+                   ! _install_lock_owned "$stage/lock" "$lock_identity" "$owner_identity" "$lock_owner"; then
+                    _log_error "Cannot retire installation custody; evidence retained: $stage"
+                    exit 1
+                fi
+            elif ! rm -- "$install_lock/owner" || ! rmdir -- "$install_lock"; then
                 _log_error "Could not release the owned installation lock; inspect before retrying: $install_lock"
                 exit 1
             fi
         fi
+        [[ -z "$stage" ]] || rm -rf -- "$stage"
         exit "$status"
     }
     trap _finish_family_transaction EXIT
@@ -1770,7 +1874,7 @@ _install_family_transaction() {
         fi
         _log_error "Installation directory is busy or its lock needs inspection: $install_lock"
         _log_info 'Wait for the active installer to finish, then retry.'
-        _log_info 'If it stopped unexpectedly, inspect the lock before removing it manually; --yes does not steal locks.'
+        _log_info 'If it stopped unexpectedly, run this installer with --recover --yes and the same --dir; --yes alone does not steal locks.'
         exit 2
     fi
     lock_held=true
@@ -1786,60 +1890,90 @@ _install_family_transaction() {
     trap 'exit 5' HUP INT TERM
     $lock_setup_interrupted && exit 5
     _install_lock_owned "$install_lock" "$lock_identity" "$owner_identity" "$lock_owner" || exit 1
-    # Gather every replacement decision under the lock before staging binaries.
+    # Foreground consent is bound to the exact observed files. Recheck it
+    # under the common writer lock before staging any replacement.
     for name in "${_INSTALL_NAMES[@]}"; do
         path="$dest_dir/$name"
         [[ ! -L "$path" && ( ! -e "$path" || -f "$path" ) ]] || {
             _log_error "Refusing a linked or non-regular install destination: $path"; exit 1;
         }
-        if [[ -f "$path" ]] && ! $_AUTO_YES; then
-            if $_NON_INTERACTIVE; then
-                _log_error "Binary already exists at $path"
-                _log_info "Use --yes to overwrite or remove it manually"
-                exit 1
-            fi
-            _log_warn "Binary already exists: $path"
-            local response=""
-            if ! read -rp "Overwrite? [y/N] " response < /dev/tty 2>/dev/null; then
-                _log_error "No terminal to confirm replacing $path"
-                _log_info "Re-run with --yes to replace it"
-                exit 1
-            fi
-            if [[ ! "$response" =~ ^[yY] ]]; then
-                _log_info "Installation cancelled"
-                exit 1
-            fi
+        if [[ -f "$path" ]]; then
+            original_identity=$(_install_lock_identity "$path") || exit 1
+            case "$original_identities" in
+                *"|$original_identity|"*) _log_error 'Two installed family members share an inode; separate them before replacement'; exit 4 ;;
+            esac
+            original_identities+="$original_identity|"
         fi
+        if [[ -f "$path" ]] && ! $_AUTO_YES; then
+            if [[ "${_INSTALL_APPROVALS[$index]:-}" != "$(_install_file_record "$path")" ]]; then
+                _log_error "Install destination changed after overwrite consent; retry: $path"
+                exit 1
+            fi
+        elif ! $_AUTO_YES && [[ "${_INSTALL_APPROVALS[$index]:-absent}" != absent ]]; then
+            _log_error "Install destination disappeared after overwrite consent; retry: $path"
+            exit 1
+        fi
+        index=$((index + 1))
     done
-    stage=$(mktemp -d "$dest_dir/.${BINARY_NAME}.install.XXXXXXXX") || exit 1
-    mkdir -- "$stage/new" "$stage/old" || exit 1
+    stage=$(umask 077; mktemp -d "$dest_dir/.${BINARY_NAME}.install.XXXXXXXX") || exit 1
+    stage_identity=$(_install_lock_identity "$stage") || exit 1
+    (umask 077; mkdir -- "$stage/new" "$stage/old" "$stage/restore") || exit 1
+    # Unix paths are bytes and need not be UTF-8. Hex keeps journal JSON valid
+    # and binds their exact spelling without requiring Python during install.
+    directory_hex=$(printf '%s' "$dest_dir" | od -An -tx1 | tr -d '[:space:]') || exit 1
+    journal='{"schema_version":1,"tool":"'"$(_json_escape_str "$TOOL_NAME")"'","repository":"'"$(_json_escape_str "$REPO")"'","platform":"'"$(_json_escape_str "$_INSTALL_PLATFORM")"'","directory_hex":"'"$directory_hex"'","directory_identity":"'"$directory_identity"'","lock_identity":"'"$lock_identity"'","owner_identity":"'"$owner_identity"'","owner":"'"$(_json_escape_str "$lock_owner")"'","process_group":'"$writer_pid"',"process_scope":"'"$process_scope"'","hostname_hex":"'"$writer_host_hex"'","stage":"'"${stage##*/}"'","stage_identity":"'"$stage_identity"'","members":['
+    index=0
     for name in "${_INSTALL_NAMES[@]}"; do
         cp -- "${sources[$index]}" "$stage/new/$name" || exit 1
         chmod 755 "$stage/new/$name" || exit 1
         [[ "$(_file_sha256 "$stage/new/$name")" == "${hashes[$index]}" ]] || exit 1
         _installer_validate_executable "$stage/new/$name" "$_INSTALL_PLATFORM" || exit $?
+        candidate_record=$(_install_file_record "$stage/new/$name") || exit 1
         path="$dest_dir/$name"
         if [[ -f "$path" && ! -L "$path" ]]; then
+            original_record=$(_install_file_record "$path") || exit 1
             cp -p -- "$path" "$stage/old/$name" || exit 1
             previous_hash=$(_file_sha256 "$path") || exit 1
             backup_hash=$(_file_sha256 "$stage/old/$name") || exit 1
             [[ "$previous_hash" == "$backup_hash" ]] || exit 1
+            backup_record=$(_install_file_record "$stage/old/$name") || exit 1
+            cp -p -- "$stage/old/$name" "$stage/restore/$name" || exit 1
+            rollback_record=$(_install_file_record "$stage/restore/$name") || exit 1
+            [[ "$(_install_file_record "$path")" == "$original_record" &&
+               "${original_record#*,\"mode\":}" == "${backup_record#*,\"mode\":}" &&
+               "${original_record#*,\"mode\":}" == "${rollback_record#*,\"mode\":}" ]] || exit 1
             previous+=(true)
         elif [[ ! -e "$path" && ! -L "$path" ]]; then
+            original_record=null; backup_record=null; rollback_record=null
             previous+=(false)
         else
             exit 1
         fi
         receipt+="$separator"'{"name":"'"$(_json_escape_str "$name")"'","path":"'"$(_json_escape_str "$original_dir/$name")"'","sha256":"'"${hashes[$index]}"'","size_bytes":'"${sizes[$index]}"'}'
+        journal+="$separator"'{"name":"'"$name"'","original":'"$original_record"',"backup":'"$backup_record"',"rollback":'"$rollback_record"',"candidate":'"$candidate_record"'}'
+        originals+=("$original_record"); candidates+=("$candidate_record"); backups+=("$backup_record"); restorations+=("$rollback_record")
         separator=,
         index=$((index + 1))
     done
     receipt+=']'
+    journal+=']}'
+    (umask 077; printf '%s\n' "$journal" > "$install_lock/journal.pending") || exit 1
+    mv -- "$install_lock/journal.pending" "$install_lock/journal.json" || exit 1
+    journal_hash=$(_file_sha256 "$install_lock/journal.json") || exit 1
+    index=0
+    for name in "${_INSTALL_NAMES[@]}"; do
+        [[ "$(_install_destination_record "$dest_dir/$name")" == "${originals[$index]}" ]] || {
+            _log_error "Install destination changed during staging; preserving it: $name"; exit 1;
+        }
+        index=$((index + 1))
+    done
     index=0
     for name in "${_INSTALL_NAMES[@]}"; do
         _install_lock_owned "$install_lock" "$lock_identity" "$owner_identity" "$lock_owner" || exit 1
         path="$dest_dir/$name"
-        [[ ! -L "$path" && ( ! -e "$path" || -f "$path" ) ]] || exit 1
+        [[ "$(_install_destination_record "$path")" == "${originals[$index]}" ]] || {
+            _log_error "Install destination changed before replacement; preserving it: $name"; exit 1;
+        }
         touched=$((index + 1))
         mv -f -- "$stage/new/$name" "$path" || exit 1
         index=$((index + 1))
@@ -1864,19 +1998,81 @@ _install_family_transaction() {
 }
 
 _install_binaries() {
-    local receipt receipt_file family_pid='' previous_traps interrupted=false status=0
+    local receipt receipt_file family_pid='' previous_traps interrupted=false status=0 monitor=false cancel_guard=''
+    local name path approval response
+    _INSTALL_APPROVALS=()
+    # A job-control process group must not read a foreground terminal. Obtain
+    # consent here, then let the writer validate the exact files under lock.
+    if ! $_AUTO_YES; then
+        for name in "${_INSTALL_NAMES[@]}"; do
+            path="$_INSTALL_DIR/$name"
+            if [[ -f "$path" && ! -L "$path" ]]; then
+                if $_NON_INTERACTIVE; then
+                    _log_error "Binary already exists at $path"
+                    _log_info 'Use --yes to overwrite or remove it manually'
+                    return 1
+                fi
+                approval=$(_install_file_record "$path") || return 1
+                _log_warn "Binary already exists: $path"
+                response=''
+                printf 'Overwrite? [y/N] ' >&2
+                if ! read -r response < /dev/tty 2>/dev/null; then
+                    _log_error "No terminal to confirm replacing $path; re-run with --yes"
+                    return 1
+                fi
+                [[ "$response" =~ ^[yY] ]] || { _log_info 'Installation cancelled'; return 1; }
+                _INSTALL_APPROVALS+=("$approval")
+            elif [[ ! -e "$path" && ! -L "$path" ]]; then
+                _INSTALL_APPROVALS+=(absent)
+            else
+                _log_error "Refusing a linked or non-regular install destination: $path"
+                return 1
+            fi
+        done
+    fi
     receipt_file=$(mktemp "$_TEMP_DIR/install-family.XXXXXXXX") || return 1
     previous_traps=$(trap -p HUP INT TERM)
     # Sending TERM to only this installer PID must also stop its transaction.
     # Wait for the child's rollback before restoring the caller's handlers.
-    trap 'interrupted=true; if [[ -n "$family_pid" ]]; then kill -TERM "$family_pid" 2>/dev/null || true; fi' HUP INT TERM
-    _install_family_transaction "$_INSTALL_DIR" "${_INSTALL_PATHS[@]}" > "$receipt_file" &
+    trap 'interrupted=true; if [[ -n "$family_pid" ]]; then kill -TERM -- "-$family_pid" 2>/dev/null || true; fi' HUP INT TERM
+    case $- in *m*) monitor=true ;; esac
+    set -m
+    _install_family_transaction "$_INSTALL_DIR" "$receipt_file.writer" "${_INSTALL_PATHS[@]}" > "$receipt_file" &
     family_pid=$!
-    if $interrupted; then kill -TERM "$family_pid" 2>/dev/null || true; fi
+    $monitor || set +m
+    if ! (umask 077; set -C; printf '%s\n' "$family_pid" > "$receipt_file.writer"); then
+        kill -TERM -- "-$family_pid" 2>/dev/null || true
+        interrupted=true
+    fi
+    if $interrupted; then kill -TERM -- "-$family_pid" 2>/dev/null || true; fi
     wait "$family_pid" || status=$?
     if $interrupted; then
         trap '' HUP INT TERM
+        # Give ordinary rollback time to finish, but do not let a utility
+        # that ignores TERM defer the writer's trap indefinitely. A forced
+        # stop leaves the immutable journal for explicit recovery.
+        set -m
+        (
+            set +m
+            timer=''
+            _install_stop_cancel_guard() {
+                trap '' HUP INT TERM
+                [[ -z "$timer" ]] || kill "$timer" 2>/dev/null || true
+                [[ -z "$timer" ]] || wait "$timer" 2>/dev/null || true
+                exit 0
+            }
+            trap _install_stop_cancel_guard HUP INT TERM
+            sleep 5 & timer=$!
+            wait "$timer" || exit 0
+            if kill -0 "$family_pid" 2>/dev/null; then
+                kill -KILL -- "-$family_pid" 2>/dev/null || true
+            fi
+        ) &
+        cancel_guard=$!
+        $monitor || set +m
         wait "$family_pid" 2>/dev/null || true
+        kill -TERM "$cancel_guard" 2>/dev/null || true
+        wait "$cancel_guard" 2>/dev/null || true
         status=5
     fi
     trap - HUP INT TERM
@@ -1884,6 +2080,440 @@ _install_binaries() {
     ((status == 0)) || return "$status"
     receipt=$(cat -- "$receipt_file") || return 1
     _INSTALLED_BINARIES_JSON="$receipt"
+}
+
+# Recovery is an explicit local operation, before release discovery or source
+# execution. Python supplies directory-relative, no-follow operations and a
+# kernel lease between recoverers; ordinary installation remains Bash-only.
+_recover_installation() {
+    command -v python3 >/dev/null 2>&1 || { _log_error 'Python 3 is required for --recover'; return 3; }
+    local result status=0
+    result=$(python3 -I - "$_INSTALL_DIR" "$TOOL_NAME" "$REPO" "$_INSTALL_PLATFORM" "$BINARY_NAME" "$_JSON_MODE" "${_INSTALL_NAMES[@]}" <<'DSR_INSTALL_RECOVERY_PY'
+import hashlib
+import json
+import os
+import re
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import uuid
+
+os.umask(0o077)
+directory, tool, repository, platform, primary, json_mode = sys.argv[1:7]
+names = sys.argv[7:]
+descriptors = []
+chain = []
+leases = []
+changed = []
+evidence = ''
+outcome = 'refused'
+recovered = False
+
+
+class Refusal(Exception):
+    def __init__(self, message, code=4):
+        super().__init__(message)
+        self.code = code
+
+
+def need(condition, message, code=4):
+    if not condition:
+        raise Refusal(message, code)
+
+
+def stop(signum, frame):
+    raise Refusal('Recovery interrupted; retained evidence permits another --recover --yes', 5)
+
+
+def held(fd):
+    descriptors.append(fd)
+    return fd
+
+
+def identity(info):
+    return '%s:%s' % (info.st_dev, info.st_ino)
+
+
+def fingerprint(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+            info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def entry(parent, name):
+    try:
+        return os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def open_directory(parent, name, expected=None, private=False):
+    fd = held(os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent))
+    info = os.fstat(fd)
+    need(expected is None or identity(info) == expected, 'Directory identity changed: ' + name)
+    if private:
+        need(info.st_uid == os.geteuid() and not stat.S_IMODE(info.st_mode) & 0o022,
+             'Recovery directory has unsafe ownership or permissions: ' + name)
+    chain.append((parent, name, fd, identity(info)))
+    return fd
+
+
+def custody():
+    for parent, name, fd, expected in chain:
+        info = entry(parent, name)
+        need(info is not None and stat.S_ISDIR(info.st_mode) and
+             identity(info) == expected == identity(os.fstat(fd)),
+             'Recovery directory moved or was replaced: ' + name)
+    for parent, name, fd, expected in leases:
+        info = entry(parent, name)
+        need(info is not None and stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and
+             info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o600 and
+             identity(info) == expected == identity(os.fstat(fd)),
+             'Recovery lease owner was replaced or changed')
+
+
+def read_file(parent, name, limit, private=False):
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+    try:
+        before = os.fstat(fd)
+        need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and before.st_size <= limit,
+             'Invalid recovery metadata: ' + name)
+        if private:
+            need(before.st_uid == os.geteuid() and stat.S_IMODE(before.st_mode) == 0o600,
+                 'Recovery metadata has unsafe ownership or permissions: ' + name)
+        chunks = []
+        remaining = limit + 1
+        while remaining:
+            chunk = os.read(fd, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        value = b''.join(chunks)
+        need(len(value) <= limit and fingerprint(before) == fingerprint(os.fstat(fd)) and
+             fingerprint(before) == fingerprint(os.stat(name, dir_fd=parent, follow_symlinks=False)),
+             'Recovery metadata changed during inspection: ' + name)
+        return value, identity(before)
+    finally:
+        os.close(fd)
+
+
+def file_record(parent, name):
+    if entry(parent, name) is None:
+        return None
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+    try:
+        before = os.fstat(fd)
+        need(stat.S_ISREG(before.st_mode), 'Linked or non-regular family member: ' + name)
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        need(fingerprint(before) == fingerprint(os.fstat(fd)) and
+             fingerprint(before) == fingerprint(os.stat(name, dir_fd=parent, follow_symlinks=False)),
+             'Family member changed during inspection: ' + name)
+        return {'identity': identity(before), 'nlink': before.st_nlink, 'mode': stat.S_IMODE(before.st_mode),
+                'uid': before.st_uid, 'gid': before.st_gid, 'size': before.st_size, 'sha256': digest.hexdigest()}
+    finally:
+        os.close(fd)
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        need(key not in result, 'Duplicate recovery journal field')
+        result[key] = value
+    return result
+
+
+def record_valid(value):
+    return (isinstance(value, dict) and set(value) == {'identity', 'nlink', 'mode', 'uid', 'gid', 'size', 'sha256'} and
+            isinstance(value['identity'], str) and re.fullmatch(r'[0-9]+:[0-9]+', value['identity']) and
+            isinstance(value['sha256'], str) and re.fullmatch(r'[0-9a-f]{64}', value['sha256']) and
+            all(type(value[key]) is int and value[key] >= 0 for key in ('nlink', 'mode', 'uid', 'gid', 'size')) and
+            value['nlink'] > 0 and value['mode'] <= 0o7777)
+
+
+def contents(value):
+    return {key: value[key] for key in ('mode', 'uid', 'gid', 'size', 'sha256')}
+
+
+def inactive_group(group):
+    try:
+        os.killpg(group, 0)
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        raise Refusal('The original installation process group is still active or inaccessible', 2)
+    # Zombies cannot perform a delayed rename. A complete ps census lets
+    # recovery work even when an init process is slow to reap killed children.
+    observed = subprocess.run(['ps', '-axo', 'pid=,pgid=,stat='], stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True, timeout=5)
+    need(observed.returncode == 0, 'Cannot inspect the original installation process group', 2)
+    members = []
+    for line in observed.stdout.splitlines():
+        fields = line.split()
+        need(len(fields) == 3 and fields[0].isdigit() and fields[1].isdigit() and fields[2],
+             'Incomplete process observation; installation recovery withheld', 2)
+        if int(fields[1]) == group:
+            members.append(fields[2])
+    need(members and all(value.startswith('Z') for value in members),
+         'The original installation writer or a descendant is still active; wait before recovery', 2)
+
+
+def run():
+    global directory, evidence, outcome, recovered
+    try:
+        import fcntl
+    except ImportError:
+        raise Refusal('Installation recovery requires Unix Python 3 with fcntl', 3)
+    directory = os.path.realpath(directory)
+    need(os.path.isabs(directory) and os.path.isdir(directory), 'Recovery requires an existing installation directory')
+    parent = held(os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW))
+    for component in directory.split('/')[1:]:
+        if component:
+            parent = open_directory(parent, component)
+    prefix = parent
+    guard_name = '.dsr-install.lock'
+    if entry(prefix, guard_name) is None:
+        outcome = 'nothing-to-recover'
+        return []
+    guard = open_directory(prefix, guard_name, private=True)
+    guard_identity = identity(os.fstat(guard))
+    evidence = directory + '/' + guard_name
+    owner, owner_identity = read_file(guard, 'owner', 4096, private=True)
+    raw, journal_identity = read_file(guard, 'journal.json', 64 * 1024 * 1024, private=True)
+    journal = json.loads(raw, object_pairs_hook=unique_object)
+    journal_hash = hashlib.sha256(raw).hexdigest()
+    keys = {'schema_version', 'tool', 'repository', 'platform', 'directory_hex', 'directory_identity', 'lock_identity',
+            'owner_identity', 'owner', 'process_group', 'process_scope', 'hostname_hex', 'stage', 'stage_identity', 'members'}
+    need(isinstance(journal, dict) and set(journal) == keys and type(journal['schema_version']) is int and
+         journal['schema_version'] == 1, 'Unsupported or incomplete installation journal')
+    need(all(isinstance(journal[key], str) and re.fullmatch(r'[0-9]+:[0-9]+', journal[key])
+             for key in ('directory_identity', 'lock_identity', 'owner_identity', 'stage_identity')),
+         'Invalid installation directory or owner identity')
+    need(journal['tool'] == tool and journal['repository'] == repository and journal['platform'] == platform and
+         journal['directory_hex'] == os.fsencode(directory).hex() and journal['directory_identity'] == identity(os.fstat(prefix)) and
+         journal['lock_identity'] == guard_identity and journal['owner_identity'] == owner_identity and
+         isinstance(journal['owner'], str) and owner == (journal['owner'] + '\n').encode() and
+         journal['hostname_hex'] == os.fsencode(socket.gethostname()).hex(), 'Installation journal belongs to another directory, tool, platform, host or owner')
+    group = journal['process_group']
+    need(type(group) is int and 1 < group <= 2147483647 and
+         re.fullmatch(r'pid=' + str(group) + r' tool=' + re.escape(tool) + r' token=[0-9]+-[0-9]+-[0-9]+', journal['owner']),
+         'Invalid installation writer identity')
+    scope = os.readlink('/proc/self/ns/pid') if platform.startswith('linux/') else 'global'
+    need(journal['process_scope'] == scope, 'Recovery must run in the original installation PID namespace')
+    inactive_group(group)
+    stage_name = journal['stage']
+    need(isinstance(stage_name, str) and re.fullmatch(r'\.' + re.escape(primary) + r'\.install\.[A-Za-z0-9]{8}', stage_name),
+         'Unsafe installation stage name')
+    completed = None
+    completion_record = None
+    if entry(guard, 'completion') is not None:
+        completion_record = read_file(guard, 'completion', 256, private=True)
+        value = completion_record[0]
+        for phase in ('committed', 'rolled-back'):
+            if value == (phase + '\n' + journal_hash + '\n').encode():
+                completed = phase
+        need(completed is not None, 'Completion marker contradicts the installation journal')
+    original_stage = entry(prefix, stage_name)
+    archived_stage = entry(guard, 'evidence')
+    need((original_stage is None) != (archived_stage is None), 'Installation evidence is missing or ambiguous')
+    stage_parent, stage_entry = (prefix, stage_name) if original_stage is not None else (guard, 'evidence')
+    stage = open_directory(stage_parent, stage_entry, journal['stage_identity'], private=True)
+    need(set(os.listdir(stage)) == {'new', 'old', 'restore'}, 'Installation stage contains unrecognized resources')
+    new = open_directory(stage, 'new', private=True)
+    old = open_directory(stage, 'old', private=True)
+    restore = open_directory(stage, 'restore', private=True)
+    members = journal['members']
+    need(isinstance(members, list) and len(members) == len(names) and
+         all(isinstance(member, dict) and set(member) == {'name', 'original', 'backup', 'rollback', 'candidate'} for member in members) and
+         [member['name'] for member in members] == names and len(set(names)) == len(names),
+         'Journal executable family differs from this installer')
+    pins = set()
+    for member in members:
+        need(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]*', member['name']) and '..' not in member['name'], 'Unsafe executable name')
+        candidate = member['candidate']
+        need(record_valid(candidate) and candidate['nlink'] == 1 and candidate['mode'] == 0o755,
+             'Invalid candidate executable record')
+        if member['original'] is None:
+            need(member['backup'] is None and member['rollback'] is None, 'Absent executable has unexpected backup records')
+        else:
+            need(all(record_valid(member[key]) for key in ('original', 'backup', 'rollback')) and
+                 member['backup']['nlink'] == member['rollback']['nlink'] == 1 and
+                 contents(member['original']) == contents(member['backup']) == contents(member['rollback']),
+                 'Backup records contradict the original executable')
+        for key in ('original', 'candidate', 'backup', 'rollback'):
+            value = member[key]
+            if value is not None:
+                need(value['identity'] not in pins, 'Two staged executable records share an identity')
+                pins.add(value['identity'])
+
+    recovery_receipt = json.dumps({'schema_version': 1, 'outcome': 'committed' if completed == 'committed' else 'rolled-back',
+                                  'journal_sha256': journal_hash}, sort_keys=True).encode() + b'\n'
+
+    def inspect():
+        custody()
+        need(set(os.listdir(guard)) <= {'owner', 'journal.json', 'completion', 'completion.pending',
+                                       'evidence', 'recovery-result.json', 'recovery-result.pending'},
+             'Installation lock contains unrecognized resources')
+        need(read_file(guard, 'owner', 4096, private=True) == (owner, owner_identity) and
+             read_file(guard, 'journal.json', 64 * 1024 * 1024, private=True) == (raw, journal_identity),
+             'Installation owner or journal changed during recovery')
+        observed_completion = read_file(guard, 'completion', 256, private=True) if entry(guard, 'completion') is not None else None
+        need(observed_completion == completion_record, 'Installation completion marker changed during recovery')
+        if entry(guard, 'completion.pending') is not None:
+            pending, _ = read_file(guard, 'completion.pending', 256, private=True)
+            need(any((phase + '\n' + journal_hash + '\n').encode().startswith(pending) for phase in ('committed', 'rolled-back')),
+                 'Unexpected pending installation completion record')
+        if entry(guard, 'recovery-result.json') is not None:
+            need(read_file(guard, 'recovery-result.json', 4096, private=True)[0] == recovery_receipt,
+                 'Conflicting prior recovery receipt')
+        if entry(guard, 'recovery-result.pending') is not None:
+            pending, _ = read_file(guard, 'recovery-result.pending', 4096, private=True)
+            need(recovery_receipt.startswith(pending), 'Unexpected pending recovery receipt')
+        for fd in (new, old, restore):
+            need(set(os.listdir(fd)) <= set(names), 'Staged family contains unrelated files')
+        states = []
+        for member in members:
+            name = member['name']
+            current = file_record(prefix, name)
+            if current == member['original']:
+                state = 'original'
+            elif current == member['candidate']:
+                state = 'candidate'
+            elif member['rollback'] is not None and current == member['rollback']:
+                state = 'rollback'
+            else:
+                raise Refusal('Installed file changed outside this transaction; preserved: ' + name)
+            staged = file_record(new, name)
+            need(staged is None or staged == member['candidate'], 'Candidate evidence changed: ' + name)
+            need(not (state == 'original' and current is not None and staged is None), 'Untouched member lost its candidate evidence: ' + name)
+            need(file_record(old, name) == member['backup'], 'Original backup changed or disappeared: ' + name)
+            replacement = file_record(restore, name)
+            need(replacement == member['rollback'] or
+                 (replacement is None and state == 'rollback'), 'Restoration copy changed or disappeared: ' + name)
+            if completed == 'committed':
+                need(state == 'candidate', 'Completed installation no longer matches its verified family')
+            elif completed == 'rolled-back':
+                need(state != 'candidate', 'Completed rollback no longer matches its previous family')
+            states.append(state)
+        inactive_group(group)
+        return states
+
+    inspect()
+    # The journal pins this immutable file's inode. Recoverers cannot split
+    # their exclusion by replacing a separate, unbound lease pathname.
+    lease = held(os.open('owner', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=guard))
+    info = os.fstat(lease)
+    need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == os.geteuid() and
+         stat.S_IMODE(info.st_mode) == 0o600 and identity(info) == owner_identity, 'Invalid installation recovery lease')
+    try:
+        fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise Refusal('Another recovery is active for this installation directory', 2)
+    leases.append((guard, 'owner', lease, owner_identity))
+    states = inspect()
+    if completed != 'committed':
+        for member, state in zip(members, states):
+            if state != 'candidate':
+                continue
+            custody()
+            inactive_group(group)
+            name = member['name']
+            need(file_record(prefix, name) == member['candidate'] and file_record(old, name) == member['backup'],
+                 'Recovery inputs changed before restoring ' + name)
+            if member['original'] is None:
+                os.unlink(name, dir_fd=prefix)
+            else:
+                need(file_record(restore, name) == member['rollback'], 'Restoration copy changed: ' + name)
+                os.replace(name, name, src_dir_fd=restore, dst_dir_fd=prefix)
+            changed.append(name)
+        outcome = 'rolled-back'
+    else:
+        outcome = 'committed'
+    final_states = inspect()
+    need(completed == 'committed' or all(state != 'candidate' for state in final_states), 'Recovery did not restore the complete family')
+    receipt = recovery_receipt
+    if entry(guard, 'recovery-result.json') is not None:
+        need(read_file(guard, 'recovery-result.json', 4096, private=True)[0] == receipt, 'Conflicting prior recovery receipt')
+    else:
+        prior_pending = None
+        if entry(guard, 'recovery-result.pending') is not None:
+            prior_pending = read_file(guard, 'recovery-result.pending', 4096, private=True)
+            need(receipt.startswith(prior_pending[0]), 'Unexpected interrupted recovery receipt')
+        flags = os.O_WRONLY | os.O_NOFOLLOW
+        if prior_pending is None:
+            flags |= os.O_CREAT | os.O_EXCL
+        pending = os.open('recovery-result.pending', flags, 0o600, dir_fd=guard)
+        try:
+            need(prior_pending is None or identity(os.fstat(pending)) == prior_pending[1], 'Pending recovery receipt changed')
+            with os.fdopen(pending, 'wb') as stream:
+                stream.write(receipt)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except BaseException:
+            raise
+        os.rename('recovery-result.pending', 'recovery-result.json', src_dir_fd=guard, dst_dir_fd=guard)
+    if stage_parent == prefix:
+        inspect()
+        os.rename(stage_name, 'evidence', src_dir_fd=prefix, dst_dir_fd=guard)
+        chain[:] = [(guard, 'evidence', fd, pin) if fd == stage else (parent_fd, name, fd, pin)
+                    for parent_fd, name, fd, pin in chain]
+    inspect()
+    inactive_group(group)
+    archive_name = '.dsr-recovered-' + uuid.uuid4().hex
+    os.mkdir(archive_name, 0o700, dir_fd=prefix)
+    archive = open_directory(prefix, archive_name, private=True)
+    custody()
+    # The new private archive owns its empty destination. Retiring the common
+    # guard is the final operation that touches the installation namespace.
+    os.rename(guard_name, 'transaction', src_dir_fd=prefix, dst_dir_fd=archive)
+    need(identity(os.stat('transaction', dir_fd=archive, follow_symlinks=False)) == guard_identity,
+         'Retired installation lock changed unexpectedly')
+    evidence = directory + '/' + archive_name + '/transaction'
+    recovered = True
+    result = []
+    for member in members:
+        current = member['candidate'] if outcome == 'committed' else member['original']
+        if current is not None:
+            result.append({'name': member['name'], 'path': directory + '/' + member['name'],
+                           'sha256': current['sha256'], 'size_bytes': current['size']})
+    return result
+
+
+for number in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+    signal.signal(number, stop)
+code = 0
+binaries = []
+try:
+    binaries = run()
+    message = 'No active installation transaction' if outcome == 'nothing-to-recover' else 'Installation recovery complete: ' + outcome
+except Refusal as error:
+    code, message = error.code, str(error)
+except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+    code, message = 4, 'Installation recovery refused; retained evidence requires inspection: ' + str(error)
+finally:
+    for fd in reversed(descriptors):
+        os.close(fd)
+print('[' + tool + '] ' + message, file=sys.stderr)
+if evidence:
+    print('[' + tool + '] Recovery evidence: ' + evidence, file=sys.stderr)
+if json_mode == 'true':
+    print(json.dumps({'tool': tool, 'status': 'success' if code == 0 else 'error', 'message': message,
+                      'version': '', 'path': directory, 'action': 'recover', 'binaries': binaries,
+                      'recovery': {'outcome': outcome, 'recovered': recovered, 'changed_names': changed, 'evidence_path': evidence}}))
+raise SystemExit(code)
+DSR_INSTALL_RECOVERY_PY
+) || status=$?
+    if [[ -n "$result" ]]; then
+        printf '%s\n' "$result"
+        _JSON_EMITTED=true
+    fi
+    return "$status"
 }
 
 _select_archive_binaries() {
@@ -2182,6 +2812,7 @@ DSR_INSTALLER_HELP
 main() {
     local prefer_stale=false stale_threshold=10 stale_threshold_set=false
     local install_mode=vibe
+    local stale_threshold_pattern='^(0|[1-9][0-9]{0,5})$'
     # Parse arguments
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -2216,8 +2847,12 @@ main() {
                 _AUTO_YES=true
                 shift
                 ;;
+            --recover)
+                _RECOVER=true
+                shift
+                ;;
             --mode)
-                [[ $# -ge 2 && "$2" =~ ^(vibe|safe)$ ]] || {
+                [[ $# -ge 2 && ( "$2" == vibe || "$2" == safe ) ]] || {
                     _log_error "--mode requires vibe or safe"
                     return 4
                 }
@@ -2282,7 +2917,7 @@ main() {
                 shift
                 ;;
             --libc)
-                [[ $# -ge 2 && "$2" =~ ^(gnu|musl)$ ]] || {
+                [[ $# -ge 2 && ( "$2" == gnu || "$2" == musl ) ]] || {
                     _log_error "--libc requires gnu or musl"
                     return 4
                 }
@@ -2300,10 +2935,23 @@ main() {
         esac
     done
 
+    if $_RECOVER; then
+        if ! $_AUTO_YES || $_FROM_SOURCE || $_ALLOW_SOURCE_BUILD || $_INSTALL_TOOLCHAIN || $_OFFLINE_MODE ||
+           $_REQUIRE_SIGNATURES || $_PREFER_GH || $prefer_stale || $stale_threshold_set ||
+           [[ -n "$_VERSION$_SOURCE_REF$_SOURCE_IF_STALE$_LIBC" || "$_SOURCE_TIMEOUT" != 3600 ]]; then
+            _log_error '--recover requires --yes and cannot be combined with release or source selection'
+            return 4
+        fi
+        # Bash 3.2 uses temporary files for here strings/documents. Establish
+        # private readable permissions before family selection and Python's
+        # program input, even when the caller's umask removes owner access.
+        umask 077 || return 1
+    fi
+
     # Both CLI spellings use the same post-verification freshness path. Never
     # silently resolve conflicting thresholds by whichever flag appeared last.
     if $prefer_stale; then
-        [[ "$stale_threshold" =~ ^(0|[1-9][0-9]{0,5})$ && -z "$_SOURCE_IF_STALE" ]] || {
+        [[ "$stale_threshold" =~ $stale_threshold_pattern && -z "$_SOURCE_IF_STALE" ]] || {
             _log_error "--stale-threshold must be 0 through 999999, and not combined with --source-if-stale"
             return 4
         }
@@ -2317,7 +2965,7 @@ main() {
         return 4
     }
     if [[ -n "$_SOURCE_IF_STALE" ]]; then
-        if [[ ! "$_SOURCE_IF_STALE" =~ ^(0|[1-9][0-9]{0,5})$ || -n "$_VERSION" ]] ||
+        if [[ ! "$_SOURCE_IF_STALE" =~ $stale_threshold_pattern || -n "$_VERSION" ]] ||
            ! $_ALLOW_SOURCE_BUILD || $_FROM_SOURCE; then
             _log_error "--source-if-stale needs --allow-source-build, a nonnegative integer, and latest-release mode (no --version or --from-source)"
             return 4
@@ -2366,6 +3014,10 @@ main() {
         return 4
     fi
     _select_install_family "$platform" || return $?
+    if $_RECOVER; then
+        _recover_installation
+        return $?
+    fi
     if $_FROM_SOURCE; then
         _install_from_source "Explicit --from-source request"
         return $?

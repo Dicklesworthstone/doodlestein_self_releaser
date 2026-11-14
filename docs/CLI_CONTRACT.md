@@ -2551,8 +2551,40 @@ replaced. All new payloads and backups are staged on the destination filesystem
 before replacement starts. A handled replacement failure restores the touched
 destinations; unrelated files are preserved. This is a sequence of file
 replacements with rollback, not one filesystem transaction over the entire
-directory. If recovery itself fails, the installer reports failure and retains
-its backup directory for recovery.
+directory. If rollback cannot restore the family, the installer reports failure
+and retains its lock, journal and backup directory for inspection.
+
+Generated Bash installers support explicit recovery after a process interruption:
+
+```bash
+bash install.sh --recover --yes --dir "$HOME/.local/bin" --json
+```
+
+Recovery runs locally before release discovery and requires Unix Python 3 with
+`fcntl`. On Linux, the journal records the writer's PID namespace through
+`/proc/self/ns/pid`; recovery must run in that same namespace so it can observe
+the original writer and its descendants. It cannot be combined with release or
+source selection. An unfinished transaction restores the previous complete
+executable family, including removing
+members first introduced by that transaction. A recorded completed installation
+preserves the verified new family. With no active installation lock in an existing
+directory, recovery returns `nothing-to-recover` without changing the installation.
+
+Before changing any executable, recovery checks the entire family, the original
+backups, restoration copies, candidate records, directory identities and lock
+ownership. It refuses live original writers or descendants, concurrent recovery,
+changed or linked files, foreign staging contents, a different tool/platform/host,
+and old locks that lack a recovery journal. Ordinary `--yes` never steals a lock.
+An interrupted recovery can be resumed with the same command. Successful recovery
+retains its journal and original backups beneath
+`DIR/.dsr-recovered-<uuid>/transaction/`, then permits a new installation.
+
+Recovery JSON uses `action: "recover"`, an empty `version`, the recovered
+`binaries` list, and `recovery: {outcome, recovered, changed_names, evidence_path}`.
+The successful outcomes are `rolled-back`, `committed` and `nothing-to-recover`.
+The journal covers process interruption and cooperating installer writers; it
+does not establish power-loss durability or protect against hostile replacement
+of parent directories by another process running as the same user.
 
 Successful installer `--json` output retains the primary `path` and adds
 `binaries: [{name, path, sha256, size_bytes}]` for the complete installed set.

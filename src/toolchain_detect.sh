@@ -712,6 +712,7 @@ _tc_bootstrap_extract_go() {
 
 _tc_go_required_version() {
     local requirements="$1" requested implicit=1.16
+    local version_pattern='^go[1-9][0-9]*\.[0-9]+(\.[0-9]+)?$'
     [[ -f "$requirements" && ! -L "$requirements" ]] || return 4
     [[ "${requirements##*/}" != go.work ]] || implicit=1.18
     # The go directive is the minimum; toolchain may suggest a newer compiler.
@@ -750,7 +751,7 @@ _tc_go_required_version() {
         }' "$requirements") || {
         _tc_log_error 'Go bootstrap requires valid numeric go/toolchain versions without duplicate directives'; return 4;
     }
-    [[ "$requested" =~ ^go[1-9][0-9]*\.[0-9]+(\.[0-9]+)?$ ]] || {
+    [[ "$requested" =~ $version_pattern ]] || {
         _tc_log_error 'Go bootstrap requires a released numeric go/toolchain version'; return 4;
     }
     printf '%s\n' "$requested"

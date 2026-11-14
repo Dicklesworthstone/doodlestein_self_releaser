@@ -10,6 +10,7 @@
 #   -v, --version VERSION    Install specific version, e.g. 1.2.3 or v1.2.3 (default: latest)
 #   -d, --dir DIR            Installation directory (default: ~/.local/bin)
 #   -y, --yes                Replace an existing binary without asking
+#   --recover               With --yes: recover a stopped installation (Python 3 required)
 #   --mode vibe|safe         vibe (default) also installs agent skills; safe installs
 #                            only the verified release binary (no skills, no source builds)
 #   --verify                 Verify checksums (always enabled)
@@ -55,6 +56,8 @@ BINARY_NAME='ntm'
 ARCHIVE_FORMAT_LINUX="tar.gz"
 ARCHIVE_FORMAT_DARWIN="tar.gz"
 ARCHIVE_FORMAT_WINDOWS="zip"
+ARCHIVE_FORMAT_FREEBSD="tar.gz"
+SUPPORTED_PLATFORM_PATTERN="^(linux/amd64|linux/arm64|linux/386|linux/armv7|darwin/amd64|darwin/arm64|windows/amd64|windows/arm64|windows/386|freebsd/amd64)$"
 # The template is data, not shell code. Expand its variables only in the renderer.
 ARTIFACT_NAMING='${name}_${version}_${os}_${arch}'
 LINUX_LIBC_FALLBACK='none'
@@ -783,24 +786,57 @@ _tc_bootstrap_extract_go() {
     [[ -f "$destination/go/bin/go" && ! -L "$destination/go/bin/go" ]] || return 7
 }
 
+_tc_go_required_version() {
+    local requirements="$1" requested implicit=1.16
+    local version_pattern='^go[1-9][0-9]*\.[0-9]+(\.[0-9]+)?$'
+    [[ -f "$requirements" && ! -L "$requirements" ]] || return 4
+    [[ "${requirements##*/}" != go.work ]] || implicit=1.18
+    # The go directive is the minimum; toolchain may suggest a newer compiler.
+    # Use the higher numeric requirement. A major.minor selects its newest
+    # published patch, never a different minor. Missing go directives use Go's
+    # documented module/workspace defaults. The source engine admits this file
+    # from its pinned checkout; the same selection drives installed-Go admission
+    # and private bootstrap. Go parses the full file after compiler selection.
+    requested=$(awk -v implicit="$implicit" '
+        function at_least(selected, minimum, a, b, n, m, i, left, right) {
+            n=split(selected,a,"."); m=split(minimum,b,".")
+            for (i=1; i<=3; i++) {
+                left=(i<=n ? a[i]+0 : 0); right=(i<=m ? b[i]+0 : 0)
+                if (left > right) return 1
+                if (left < right) return 0
+            }
+            return 1
+        }
+        { sub(/\r$/, ""); sub(/\/\/.*/, "") }
+        $1 == "go" {
+            if (NF != 2 || ++g != 1 || $2 !~ /^[1-9][0-9]*\.[0-9]+(\.[0-9]+)?$/) bad=1
+            version=$2
+        }
+        $1 == "toolchain" {
+            if (NF != 2 || ++t != 1 || ($2 != "default" && $2 !~ /^go[1-9][0-9]*\.[0-9]+(\.[0-9]+)?$/)) bad=1
+            selected=$2
+        }
+        END {
+            if (bad) exit 1
+            if (!g) version=implicit
+            if (selected != "" && selected != "default") {
+                if (at_least(substr(selected,3),version)) print selected
+                else print "go" version
+            }
+            else print "go" version
+        }' "$requirements") || {
+        _tc_log_error 'Go bootstrap requires valid numeric go/toolchain versions without duplicate directives'; return 4;
+    }
+    [[ "$requested" =~ $version_pattern ]] || {
+        _tc_log_error 'Go bootstrap requires a released numeric go/toolchain version'; return 4;
+    }
+    printf '%s\n' "$requested"
+}
+
 _tc_bootstrap_go() {
     local tree="$1" root="$2" platform="$3" requested selection version filename digest size actual
-    [[ -f "$tree/go.mod" && ! -L "$tree/go.mod" ]] || return 4
-    # The toolchain directive is an exact preferred compiler. Without it, use
-    # the stated go version; a major.minor selects its newest published patch,
-    # never a different minor. Do not silently update a pinned requirement.
-    requested=$(awk '
-        { sub(/\/\/.*/, "") }
-        $1 == "go" { if (NF != 2 || ++g != 1) bad=1; version=$2 }
-        $1 == "toolchain" { if (NF != 2 || ++t != 1) bad=1; selected=$2 }
-        END {
-            if (bad || g != 1) exit 1
-            if (selected != "" && selected != "default") print selected
-            else print "go" version
-        }' "$tree/go.mod") || return 4
-    [[ "$requested" =~ ^go[1-9][0-9]*\.[0-9]+(\.[0-9]+)?$ ]] || {
-        _tc_log_error 'Go bootstrap requires a released numeric go/toolchain version in go.mod'; return 4;
-    }
+    local requirements="${4:-$tree/go.mod}"
+    requested=$(_tc_go_required_version "$requirements") || return $?
     _tc_bootstrap_fetch 'https://go.dev/dl/?mode=json&include=all' "$root/releases.json" 8388608 || return $?
     selection=$(jq -ers --arg requested "$requested" --arg os "${platform%/*}" --arg arch "${platform#*/}" '
         if length != 1 or (.[0]|type) != "array" then error("invalid Go release metadata") else .[0] end |
@@ -963,9 +999,12 @@ _tc_bootstrap_bun() {
 # existing toolchain, profile, system directory or default compiler is changed.
 # stdout: receipt JSON; receipt.json appears only after compiler activation was
 # verified. Selection/version policy is read from the already pinned source.
+# Optional --go-requirements selects a caller-admitted go.work at or above the
+# build directory, or its go.mod. Four-argument callers keep their old policy.
 toolchain_bootstrap() (
-    [[ $# -eq 4 && "$4" == --allow-install ]] || return 4
-    local language="$1" tree="$2" root="$3" platform parent command
+    [[ $# -eq 4 || $# -eq 6 ]] || return 4
+    [[ "$4" == --allow-install ]] || return 4
+    local language="$1" tree="$2" root="$3" platform parent command go_requirements='' requirements_parent
     local _TC_BOOTSTRAP_URL='' _TC_BOOTSTRAP_SHA='' _TC_BOOTSTRAP_BIN='' _TC_BOOTSTRAP_VERSION='' _TC_BOOTSTRAP_RUSTUP_TOOLCHAIN=''
     [[ "$language" != typescript ]] || language=bun
     case "$language" in rust|go|bun) ;; *) return 4 ;; esac
@@ -974,6 +1013,19 @@ toolchain_bootstrap() (
     [[ -d "$parent" && ! -L "$parent" ]] || return 4
     tree=$(cd "$tree" && pwd -P) || return 4
     root="$(cd "$parent" && pwd -P)/${root##*/}"
+    if [[ $# -eq 6 ]]; then
+        [[ "$language" == go && "$5" == --go-requirements ]] || return 4
+        go_requirements="$6"
+        [[ "$go_requirements" == /* && "$go_requirements" != *[[:cntrl:]]* &&
+           -f "$go_requirements" && ! -L "$go_requirements" ]] || return 4
+        requirements_parent=$(cd "$(dirname "$go_requirements")" && pwd -P) || return 4
+        go_requirements="$requirements_parent/${go_requirements##*/}"
+        case "${go_requirements##*/}" in
+            go.work) [[ "$tree" == "$requirements_parent" || "$tree" == "$requirements_parent/"* ]] || return 4 ;;
+            go.mod) [[ "$tree" == "$requirements_parent" ]] || return 4 ;;
+            *) return 4 ;;
+        esac
+    fi
     platform=$(_tc_detect_platform)
     case "$platform" in linux/amd64|linux/arm64|darwin/amd64|darwin/arm64) ;; *)
         _tc_log_error "Isolated toolchain bootstrap is not supported on $platform; install the compiler first"; return 3 ;;
@@ -985,7 +1037,7 @@ toolchain_bootstrap() (
     _tc_log_info "Preparing an isolated $language compiler for $platform"
     case "$language" in
         rust) _tc_bootstrap_rust "$tree" "$root" "$platform" || return $? ;;
-        go) _tc_bootstrap_go "$tree" "$root" "$platform" || return $? ;;
+        go) _tc_bootstrap_go "$tree" "$root" "$platform" "$go_requirements" || return $? ;;
         bun) _tc_bootstrap_bun "$tree" "$root" "$platform" || return $? ;;
     esac
     local receipt
@@ -1081,9 +1133,12 @@ _isb_relative_path() {
 # Ref names are not revspecs, refspecs, options, or shell expressions. Tags
 # requested by --version are passed as refs/tags/<version>, never as HEAD.
 _isb_ref() {
+    # The embedded engine must parse before the installer can require Bash 4
+    # for source execution. Early Bash 3.2 parsers need grouped EREs in variables.
+    local reference_pattern='^refs/(heads|tags)/[A-Za-z0-9_][A-Za-z0-9._+/-]*$'
     [[ "$1" == HEAD || "$1" =~ ^[0-9a-fA-F]{40}$ || "$1" =~ ^[0-9a-fA-F]{64}$ ]] && return 0
     case "$1" in refs/heads/*|refs/tags/*) ;; *) return 1 ;; esac
-    [[ "$1" =~ ^refs/(heads|tags)/[A-Za-z0-9_][A-Za-z0-9._+/-]*$ ]] &&
+    [[ "$1" =~ $reference_pattern ]] &&
         git check-ref-format "$1" >/dev/null 2>&1
 }
 
@@ -1207,6 +1262,7 @@ _isb_checkout() (
     # With no selected GitHub credential, retain the existing Git-only path:
     # anonymous HTTPS, user credential helpers and configured URL policy.
     # A malformed explicit credential must not fall through to that path.
+    ((token_status != 5)) || return 5
     ((token_status == 0 || token_status == 3)) || return 8
     if [[ -n "$token" ]]; then
         # A header supplied before the first request also prevents libcurl's
@@ -1252,7 +1308,7 @@ _isb_in_dir() ( cd "$1" && shift && "$@" )
 # login. Keep credentials and tracing changes confined to this child process.
 _installer_github_token() (
     set +x
-    local token=''
+    local token='' status=0
     if [[ -n "${DSR_GH_TOKEN:-}" ]]; then
         token="$DSR_GH_TOKEN"
     elif [[ -n "${GITHUB_TOKEN:-}" ]]; then
@@ -1261,36 +1317,144 @@ _installer_github_token() (
         token="$GH_TOKEN"
     else
         command -v gh >/dev/null 2>&1 || return 3
-        token=$(GH_HOST=github.com gh auth token --hostname github.com 2>/dev/null) || return 3
+        token=$(GH_HOST=github.com gh auth token --hostname github.com 2>/dev/null) || status=$?
+        case "$status" in
+            0) ;;
+            2|129|130|131|143) return 5 ;;
+            *) return 3 ;;
+        esac
     fi
     [[ -n "$token" ]] || return 3
     [[ "$token" != *$'\r'* && "$token" != *$'\n'* ]] || return 4
     printf '%s\n' "$token"
 )
 
+# Bound the whole GitHub CLI request, including stored-token lookup. Curl's
+# network timeout does not cover a blocked gh credential helper. Keep stdout
+# streaming to the caller and credentials off disk; only the timeout marker is
+# stored. Job control gives this request and watchdog separate owned groups,
+# using syntax supported by release installers on stock macOS Bash 3.2.
+# Match the curl acquisition budgets: 30s metadata, 300s release payloads.
 _installer_run_gh() (
     set +x
+    local limit="${DSR_INSTALLER_GH_TIMEOUT:-}" directory child='' guard='' status=0 interrupted=false
+    if [[ -z "$limit" ]]; then
+        if [[ "${1:-} ${2:-}" == 'release download' ]]; then limit=300
+        else limit=30; fi
+    fi
+    [[ "$limit" =~ ^[1-9][0-9]{0,2}$ ]] && ((limit <= 300)) || {
+        printf '[installer] DSR_INSTALLER_GH_TIMEOUT must be 1 through 300 seconds\n' >&2
+        return 4
+    }
     command -v gh >/dev/null 2>&1 || return 3
-    local token
-    token=$(_installer_github_token) || return $?
-    GH_HOST=github.com GH_TOKEN="$token" gh "$@"
+    directory=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/dsr-gh.XXXXXXXX") || return 8
+    _installer_gh_dispose() {
+        trap '' HUP INT TERM
+        [[ -z "$child" ]] || kill -TERM -- "-$child" 2>/dev/null || true
+        [[ -z "$guard" ]] || kill -TERM -- "-$guard" 2>/dev/null || true
+        [[ -z "$child" ]] || kill -KILL -- "-$child" 2>/dev/null || true
+        [[ -z "$child" ]] || wait "$child" 2>/dev/null || true
+        [[ -z "$guard" ]] || wait "$guard" 2>/dev/null || true
+        rm -f -- "$directory/timeout" 2>/dev/null || true
+        rmdir -- "$directory" 2>/dev/null || true
+    }
+    _installer_gh_cancel() {
+        _installer_gh_dispose
+        exit 5
+    }
+    # Record setup signals until both launched process IDs are available.
+    # A trap between starting a job and reading $! must not lose that child.
+    trap 'interrupted=true' HUP INT TERM
+    set -m
+    (
+        set +m
+        token=$(_installer_github_token) || exit $?
+        request_status=0
+        GH_HOST=github.com GH_TOKEN="$token" gh "$@" || request_status=$?
+        case "$request_status" in
+            0) exit 0 ;;
+            # gh uses 1 for both unavailable assets and other request failures.
+            # Only the acquisition caller can combine it with independent HTTP
+            # evidence; it must never authorize source execution by itself.
+            1) exit 1 ;;
+            2|129|130|131|143) exit 5 ;;
+            *) exit 8 ;;
+        esac
+    ) </dev/null &
+    child=$!
+    $interrupted && _installer_gh_cancel
+    (
+        set +m
+        timer=''
+        _installer_gh_stop_timer() {
+            trap '' HUP INT TERM
+            [[ -z "$timer" ]] || kill "$timer" 2>/dev/null || true
+            [[ -z "$timer" ]] || wait "$timer" 2>/dev/null || true
+            exit 0
+        }
+        trap _installer_gh_stop_timer HUP INT TERM
+        sleep "$limit" & timer=$!
+        wait "$timer" || exit 0
+        printf 'timeout\n' > "$directory/timeout"
+        kill -TERM -- "-$child" 2>/dev/null || true
+        sleep 2 & timer=$!
+        wait "$timer" || exit 0
+        kill -KILL -- "-$child" 2>/dev/null || true
+    ) &
+    guard=$!
+    trap _installer_gh_cancel HUP INT TERM
+    $interrupted && _installer_gh_cancel
+    wait "$child" 2>/dev/null || status=$?
+    if [[ -f "$directory/timeout" ]]; then
+        printf '[installer] GitHub CLI request exceeded %ss\n' "$limit" >&2
+        # A credential/CLI timeout is ambiguous, never proof that a release
+        # is absent and therefore never permission to compile source.
+        status=8
+    fi
+    _installer_gh_dispose
+    return "$status"
 )
 
 # Freshness is advisory release metadata, NOT artifact or commit-signature
 # verification. Query only GitHub's API and do not inherit a GH_HOST override.
 # Separate API bytes from diagnostic logs so warnings cannot become JSON.
-_isb_freshness_request() {
+_isb_freshness_request() (
+    set +x
     local transport="$1" endpoint="$2" destination="$3"
     if [[ "$transport" == gh ]]; then
         _installer_run_gh api --hostname github.com --method GET \
             -H 'Accept: application/vnd.github+json' -H 'Cache-Control: no-cache' \
             "$endpoint" > "$destination"
+    elif ! command -v gh >/dev/null 2>&1 &&
+         [[ -n "${DSR_GH_TOKEN:-}" || -n "${GITHUB_TOKEN:-}" || -n "${GH_TOKEN:-}" ]]; then
+        # Match token-only release acquisition without adding a gh dependency.
+        # Keep credentials off argv and disk, ignore ambient curl options, and
+        # never follow metadata redirects. These endpoints are assembled only
+        # from the admitted repository/tag and the resolved immutable commits.
+        local token escaped_token bytes status maximum=8388608
+        token=$(_installer_github_token) || return $?
+        [[ ${#token} -le 8192 && "$token" != *[[:cntrl:]]* ]] || return 4
+        escaped_token="${token//\\/\\\\}"; escaped_token="${escaped_token//\"/\\\"}"
+        set -o pipefail
+        if ! printf 'header = "Authorization: Bearer %s"\n' "$escaped_token" |
+            curl -q --config - --silent --globoff --proto '=https' \
+                --connect-timeout 10 --max-time 30 --max-filesize "$maximum" \
+                -H 'Accept: application/vnd.github+json' -H 'Cache-Control: no-cache' \
+                -H 'X-GitHub-Api-Version: 2022-11-28' \
+                "https://api.github.com/$endpoint" --output /dev/fd/3 \
+                --write-out '%{http_code}' 3>&1 > "$destination.http" 2>/dev/null |
+            head -c "$((maximum + 1))" > "$destination"; then
+            return 8
+        fi
+        bytes=$(wc -c < "$destination" | tr -d '[:space:]') || return 1
+        status=$(cat -- "$destination.http") || return 1
+        [[ "$status" == 200 && "$bytes" =~ ^[0-9]+$ ]] && ((bytes <= maximum)) || return 8
     else
         curl -sSf --proto '=https' --connect-timeout 10 --max-time 30 \
             -H 'Accept: application/vnd.github+json' -H 'Cache-Control: no-cache' \
             "https://api.github.com/$endpoint" -o "$destination"
     fi
-}
+)
 
 _isb_freshness_get() {
     local endpoint="$1" destination="$2" prefer="$3" transport status
@@ -1324,11 +1488,12 @@ _isb_freshness_get() {
 # to compile. This helper does not fetch Git objects or execute repository code.
 install_source_freshness() (
     local repo="${1:-}" tag="${2:-}" threshold="${3:-}" directory="${4:-}" prefer=false
+    local threshold_pattern='^(0|[1-9][0-9]{0,5})$'
     [[ $# -eq 4 || ( $# -eq 5 && "$5" == --prefer-gh ) ]] || return 4
     [[ $# -ne 5 ]] || prefer=true
     [[ "$repo" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ &&
        "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ && "$tag" != null &&
-       "$threshold" =~ ^(0|[1-9][0-9]{0,5})$ ]] || return 4
+       "$threshold" =~ $threshold_pattern ]] || return 4
     command -v jq >/dev/null 2>&1 || return 3
     _isb_freshness_unknown() {
         jq -nc --arg repo "$repo" --arg tag "$tag" --argjson threshold "$threshold" --arg reason "$1" \
@@ -1400,39 +1565,84 @@ _isb_probe_rust() (
     rustc -vV && cargo --version
 )
 
-# Activate an explicitly requested bootstrap only when a compiler is missing.
+# Inspect the installed Go compiler without letting Go download another one,
+# adopt an ambient workspace, or consult a user-written Go environment file.
+_isb_probe_go() (
+    export GOENV=off GOWORK=off GOTOOLCHAIN=local GOFLAGS='' GO111MODULE=on GOTELEMETRY=off
+    cd "$1" || return 4
+    go version
+)
+
+# Activate an explicitly requested bootstrap when a compiler is unavailable,
+# or when an installed Go compiler is older than the pinned source requires.
 # This runs inside _isb_compile's subshell, so PATH and language homes never
 # escape the source attempt or replace the caller's installed toolchain.
 _isb_prepare_toolchain() {
     local language="$1" tree="$2" output="$3" limit="$4" command root bin source_dir status=0
+    local go_requirements="${5:-}" installed=false required observed version
+    local go_version_pattern='^go version go([1-9][0-9]*\.[0-9]+\.[0-9]+|1\.([0-9]|1[0-9]|20)) [a-z0-9]+/[a-z0-9]+$'
+    local -a bootstrap_options=(--allow-install)
+    [[ -z "$go_requirements" || "$language" == go ]] || return 4
+    [[ -z "$go_requirements" ]] || bootstrap_options+=(--go-requirements "$go_requirements")
     case "$language" in rust) command=cargo ;; go) command=go ;; *) command=bun ;; esac
     if command -v "$command" >/dev/null 2>&1 &&
        { [[ "$language" != rust ]] || command -v rustc >/dev/null 2>&1; }; then
-        if [[ "$language" != rust || "${_ISB_INSTALL_TOOLCHAIN:-false}" != true ]]; then
+        installed=true
+        if [[ "${_ISB_INSTALL_TOOLCHAIN:-false}" != true ||
+              ( "$language" != rust && "$language" != go ) ]]; then
             return 0
         fi
-        # A working installed compiler is preserved even if it is too old for
-        # the project. An unavailable rustup-selected compiler is a missing
-        # toolchain; bootstrap it privately instead of changing that rustup home.
-        _isb_run "$limit" "$output/toolchain-probe.log" _isb_probe_rust "$tree" || status=$?
-        ((status != 0)) || return 0
-        [[ "$status" != 5 ]] || return 5
-        _isb_log 'The existing Rust commands do not provide the selected compiler; preparing an isolated toolchain'
+        if [[ "$language" == rust ]]; then
+            # An unavailable rustup-selected compiler is a missing toolchain;
+            # bootstrap privately instead of changing that rustup home.
+            _isb_run "$limit" "$output/toolchain-probe.log" _isb_probe_rust "$tree" || status=$?
+            ((status != 0)) || return 0
+            ((status != 5 && status < 128)) || return 5
+            _isb_log 'The existing Rust commands do not provide the selected compiler; preparing an isolated toolchain'
+        fi
     fi
     if [[ "${_ISB_INSTALL_TOOLCHAIN:-false}" != true ]]; then
         _isb_log "Missing $command; --install-toolchain permits an isolated compiler for this build"
         return 3
     fi
-    if ! declare -F toolchain_bootstrap >/dev/null 2>&1; then
+    if ! declare -F toolchain_bootstrap >/dev/null 2>&1 ||
+       { [[ "$language" == go ]] && ! declare -F _tc_go_required_version >/dev/null 2>&1; }; then
         source_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || return 3
         [[ -f "$source_dir/toolchain_detect.sh" && ! -L "$source_dir/toolchain_detect.sh" ]] || return 3
         # shellcheck source=SCRIPTDIR/toolchain_detect.sh
         source "$source_dir/toolchain_detect.sh" || return 3
     fi
+    if $installed && [[ "$language" == go ]]; then
+        # The same committed requirement selects both admission and bootstrap.
+        # A toolchain preference is a minimum for an existing installation;
+        # preserve a newer compiler rather than downloading a downgrade.
+        required=$(_tc_go_required_version "${go_requirements:-$tree/go.mod}") || return $?
+        _isb_run "$limit" "$output/toolchain-probe.log" _isb_probe_go "$tree" || status=$?
+        ((status != 5 && status < 128)) || return 5
+        if ((status == 0)); then
+            observed=$(cat "$output/toolchain-probe.log") || return 1
+            # Before Go 1.21 initial releases omitted the patch component.
+            # A modern two-component version identifies an unreleased compiler.
+            if [[ "$observed" =~ $go_version_pattern ]]; then
+                version="${BASH_REMATCH[1]}"
+                required="${required#go}"
+                [[ "$version" == *.*.* ]] || version+=.0
+                [[ "$required" == *.*.* ]] || required+=.0
+                if _tc_version_ge "$version" "$required"; then
+                    return 0
+                fi
+                _isb_log "Installed Go $version is older than the pinned requirement $required; preparing an isolated toolchain"
+            else
+                _isb_log 'The existing Go command did not identify a released compiler; preparing an isolated toolchain'
+            fi
+        else
+            _isb_log 'The existing Go command is unavailable; preparing an isolated toolchain'
+        fi
+    fi
     root="$output/toolchain"
     _isb_log "Preparing a private $language toolchain; existing installations and profiles are preserved"
     _isb_run "$limit" "$output/toolchain.log" toolchain_bootstrap \
-        "$language" "$tree" "$root" --allow-install || return $?
+        "$language" "$tree" "$root" "${bootstrap_options[@]}" || return $?
     [[ "$language" != typescript ]] || language=bun
     case "$language" in rust) bin="$root/cargo/bin" ;; go) bin="$root/go/bin" ;; bun) bin="$root/bun/bin" ;; esac
     [[ -f "$root/receipt.json" && ! -L "$root/receipt.json" && -d "$bin" && ! -L "$bin" ]] || return 7
@@ -1463,29 +1673,438 @@ _isb_prepare_toolchain() {
     esac
 }
 
+# Resolve every Go/Bun entry before a compiler or dependency install can run.
+# An explicit entry selects only the primary. Companions must have their own
+# conventional Go command directory or package.json bin declaration; a missing
+# companion must never fall back to building the primary a second time.
+_isb_source_entries() (
+    local language="$1" tree="$2" binary="$3" entry="$4"
+    shift 4
+    local name source_name selected primary windows=false
+    local -a entries=()
+    case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) windows=true ;; esac
+    binary=$(_isb_binary_name "$binary") || return 4
+    for name in "$@"; do
+        name=$(_isb_binary_name "$name") || return 4
+        primary=false
+        if [[ "$name" == "$binary" ]] || { $windows && [[ "${name,,}" == "${binary,,}" ]]; }; then
+            primary=true
+        fi
+        source_name="$name"
+        $windows && source_name="${source_name%.exe}"
+        selected=''
+        $primary && selected="$entry"
+        if [[ -z "$selected" ]]; then
+            case "$language" in
+                go)
+                    selected="cmd/$source_name"
+                    if $primary && [[ ! -e "$tree/$selected" && ! -L "$tree/$selected" ]]; then
+                        selected=.
+                    fi
+                    ;;
+                bun|typescript)
+                    selected=$(jq -er --arg binary "$source_name" --argjson primary "$primary" '
+                        .bin | if type == "object" then .[$binary]
+                        elif type == "string" and $primary then . else empty end |
+                        select(type == "string" and length > 0)
+                    ' "$tree/package.json") || {
+                        _isb_log "Bun source entry is missing for $name; declare package.json bin.$source_name"
+                        return 4
+                    }
+                    selected="${selected#./}"
+                    ;;
+                *) return 4 ;;
+            esac
+        fi
+        if ! _isb_path_in_tree "$tree" "$selected"; then
+            _isb_log "Missing or unsafe source entry for $name: $selected"
+            return 4
+        fi
+        case "$language" in
+            go) [[ -d "$tree/$selected" ]] || {
+                _isb_log "Go source entry for $name must be a package directory: $selected"; return 4;
+            } ;;
+            *) [[ -f "$tree/$selected" ]] || {
+                _isb_log "Bun source entry for $name must be a regular file: $selected"; return 4;
+            } ;;
+        esac
+        entries+=("$selected")
+    done
+    printf '%s\n' "${entries[@]}"
+)
+
+# Resolve Go's relative use/replace directories without letting a lexical '..'
+# cross the fetched checkout, or a symlink change what that boundary means.
+# In particular, checking only realpath's final answer would admit a linked
+# ancestor that happened to return to the checkout later in the path.
+_isb_go_directory() (
+    local root="$1" base="$2" reference="$3" cursor="$1" path part
+    [[ -d "$root" && ! -L "$root" && "$root" == /* &&
+       ( "$base" == "$root" || "$base" == "$root/"* ) &&
+       -n "$reference" && "$reference" != /* && "$reference" != *\\* &&
+       "$reference" != *:* && "$reference" != *[[:cntrl:]]* ]] || return 4
+    path="${base#"$root"}"
+    path="${path#/}"
+    for path in "$path" "$reference"; do
+        while [[ -n "$path" ]]; do
+            part="${path%%/*}"
+            if [[ "$path" == */* ]]; then path="${path#*/}"; else path=''; fi
+            case "$part" in
+                ''|.) continue ;;
+                ..) [[ "$cursor" != "$root" ]] || return 4; cursor="${cursor%/*}" ;;
+                *)
+                    [[ "${part,,}" != .git ]] || return 4
+                    cursor="$cursor/$part"
+                    [[ -d "$cursor" && ! -L "$cursor" ]] || return 4
+                    ;;
+            esac
+        done
+    done
+    printf '%s\n' "$cursor"
+)
+
+# The compiler supplies syntax and package identity. Git supplies authority:
+# source manifests and locks must be unchanged regular blobs from the fetched
+# commit, never ambient or generated inputs.
+_isb_source_committed_file() {
+    local root="$1" path="$2" relative row mode type oid rest actual hash attributes filter
+    [[ "$path" == "$root/"* && -f "$path" && ! -L "$path" ]] || return 4
+    relative="${path#"$root"/}"
+    row=$(_isb_git --literal-pathspecs -C "$root" ls-tree HEAD -- "$relative") || return 4
+    [[ -n "$row" && "$row" != *$'\n'* ]] || return 4
+    IFS=$' \t' read -r mode type oid rest <<< "$row"
+    [[ "$type" == blob && ( "$mode" == 100644 || "$mode" == 100755 ) &&
+       ( "$oid" =~ ^[0-9a-f]{40}$ || "$oid" =~ ^[0-9a-f]{64}$ ) ]] || return 4
+    actual=$(_isb_git -C "$root" hash-object --no-filters -- "$path") || return 4
+    if [[ "$actual" != "$oid" ]]; then
+        # A normal checkout can apply core.autocrlf or tracked text/eol
+        # attributes. Let Git perform that normalization, but disable the
+        # selected external filter driver before hashing: metadata admission
+        # must not execute a clean/process hook. The receipt still hashes the
+        # actual checkout bytes that Go parses, including their line endings.
+        attributes=$(_isb_git --literal-pathspecs -C "$root" check-attr filter -- "$relative") || return 4
+        [[ "$attributes" != *$'\n'* && "$attributes" == *': filter: '* ]] || return 4
+        filter="${attributes#*: filter: }"
+        [[ "$filter" =~ ^[A-Za-z0-9_/-][A-Za-z0-9._/-]*$ ]] || return 4
+        actual=$(_isb_git -c "filter.$filter.clean=" -c "filter.$filter.process=" \
+            -c "filter.$filter.required=false" -C "$root" hash-object --path="$relative" -- "$path") || return 4
+    fi
+    [[ "$actual" == "$oid" ]] || return 4
+    # Empty committed go.sum files are valid; payload hashing intentionally
+    # requires nonempty executables, so use the metadata boundary here.
+    if command -v sha256sum >/dev/null 2>&1; then hash=$(sha256sum < "$path") || return 1
+    elif command -v shasum >/dev/null 2>&1; then hash=$(shasum -a 256 < "$path") || return 1
+    else return 3; fi
+    hash="${hash%% *}"
+    [[ "$hash" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s\n' "$hash"
+}
+
+# Compiler-independent selection is shared with isolated bootstrap: a fresh
+# machine must choose its compiler from the same committed workfile that the
+# eventual Go invocation will use. Never inspect an ambient parent workspace.
+# Go itself still parses the complete file after a compiler is available.
+_isb_go_requirements() (
+    local root="$1" tree="$2" cursor="$2" relative selected=''
+    relative="${tree#"$root"/}"; [[ "$tree" != "$root" ]] || relative=.
+    _isb_go_directory "$root" "$root" "$relative" >/dev/null 2>&1 || {
+        _isb_log 'Go build directory escapes the fetched checkout'; return 4;
+    }
+    while :; do
+        if [[ -e "$cursor/go.work" || -L "$cursor/go.work" ]]; then
+            selected="$cursor/go.work"
+            break
+        fi
+        [[ "$cursor" != "$root" ]] || break
+        cursor="${cursor%/*}"
+    done
+    [[ -n "$selected" ]] || selected="$tree/go.mod"
+    _isb_source_committed_file "$root" "$selected" >/dev/null || {
+        _isb_log "The selected ${selected##*/} must be an unchanged committed regular file"; return 4;
+    }
+    printf '%s\n' "$selected"
+)
+
+# Select one committed workspace, or the existing standalone module. Only
+# main modules contribute replacement rules: Go ignores replace directives in
+# dependency modules, including modules selected by a local replacement.
+_isb_go_context() (
+    set -o pipefail
+    local root="$1" tree="$2" output="$3" limit="$4" requirements work='' work_dir=''
+    local work_hash='' parsed paths module_root relative module_path module_hash sum_file status=0
+    local index=0 document scope row old version replacement replacement_version key identity hash
+    local replacement_module replacement_relative vendor=false vendor_hash='' mod=readonly
+    local -a module_roots=() documents=() scopes=()
+    local -A seen_paths=() seen_modules=() workspace_replaces=() replacements=()
+    export GOENV=off GOFLAGS='' GOWORK=off GOTOOLCHAIN=local GO111MODULE=on GOTELEMETRY=off
+    requirements=$(_isb_go_requirements "$root" "$tree") || return $?
+    if [[ "${requirements##*/}" == go.work ]]; then
+        work="$requirements"; work_dir="${work%/*}"
+        work_hash=$(_isb_source_committed_file "$root" "$work") || return 4
+        _isb_run "$limit" "$output/go-workspace.log" go work edit -json "$work" || {
+            status=$?; [[ "$status" != 5 ]] || return 5; return 4;
+        }
+        if ! jq -es 'length == 1 and (.[0] | type == "object" and
+            (.Use | type == "array" and length > 0 and all(.[];
+                type == "object" and (.DiskPath | type == "string" and length > 0 and
+                (test("[[:cntrl:]]") | not)))))' "$output/go-workspace.log" >/dev/null; then
+            _isb_log 'Go workspace must select at least one literal module directory'; return 4
+        fi
+        paths=$(jq -r '.Use[].DiskPath' "$output/go-workspace.log") || return 4
+        while IFS= read -r relative; do
+            module_root=$(_isb_go_directory "$root" "$work_dir" "$relative") || {
+                _isb_log "Go workspace module escapes the checkout or traverses a link: $relative"; return 4;
+            }
+            module_roots+=("$module_root")
+        done <<< "$paths"
+        documents+=("$output/go-workspace.log"); scopes+=("$work_dir")
+    fi
+    if [[ -z "$work" ]]; then
+        module_roots=("$tree")
+        work_dir="$tree"
+    elif [[ -e "$work.sum" || -L "$work.sum" ]]; then
+        _isb_source_committed_file "$root" "$work.sum" >/dev/null || {
+            _isb_log 'go.work.sum must be an unchanged committed regular file'; return 4;
+        }
+    fi
+    : > "$output/go-modules.jsonl" || return 1
+    : > "$output/go-replacements.jsonl" || return 1
+    for module_root in "${module_roots[@]}"; do
+        relative="${module_root#"$root"/}"; [[ "$module_root" != "$root" ]] || relative=.
+        [[ -z "${seen_paths[$relative]:-}" ]] || { _isb_log 'Go workspace repeats a module directory'; return 4; }
+        seen_paths[$relative]=1
+        module_hash=$(_isb_source_committed_file "$root" "$module_root/go.mod") || {
+            _isb_log "Go module requires an unchanged committed regular go.mod: $relative"; return 4;
+        }
+        sum_file="$module_root/go.sum"
+        if [[ -e "$sum_file" || -L "$sum_file" ]]; then
+            _isb_source_committed_file "$root" "$sum_file" >/dev/null || {
+                _isb_log "Go module checksum file is not an unchanged committed regular file: $relative"; return 4;
+            }
+        fi
+        parsed="$output/go-module-$index.log"; index=$((index + 1))
+        _isb_run "$limit" "$parsed" go mod edit -json "$module_root/go.mod" || {
+            status=$?; [[ "$status" != 5 ]] || return 5; return 4;
+        }
+        module_path=$(jq -ers 'if length == 1 then .[0].Module.Path |
+            select(type == "string" and length > 0 and (test("[[:cntrl:]]") | not))
+            else empty end' "$parsed") || { _isb_log "Invalid Go module identity: $relative"; return 4; }
+        [[ -z "${seen_modules[$module_path]:-}" ]] || { _isb_log "Go workspace repeats module identity: $module_path"; return 4; }
+        seen_modules[$module_path]=1
+        jq -nc --arg path "$relative" --arg module "$module_path" --arg hash "$module_hash" \
+            '{path:$path,module_path:$module,go_mod_sha256:$hash}' >> "$output/go-modules.jsonl" || return 1
+        documents+=("$parsed"); scopes+=("$module_root")
+    done
+    if [[ -e "$work_dir/vendor" || -L "$work_dir/vendor" ]]; then
+        _isb_go_directory "$root" "$work_dir" vendor >/dev/null || {
+            _isb_log 'Selected Go vendor directory must stay inside the checkout without links'; return 4;
+        }
+        document="$work_dir/vendor/modules.txt"
+        [[ ! -L "$document" && ( ! -e "$document" || -f "$document" ) ]] || return 4
+        if [[ -z "$work" ]]; then
+            # Preserve standalone module vendoring, including legacy vendor
+            # directories without a modules.txt when Go itself admits them.
+            [[ ! -e "$document" ]] || _isb_source_committed_file "$root" "$document" >/dev/null || return 4
+            vendor=true; mod=vendor
+        elif [[ -f "$document" ]] && head -c 512 "$document" | jq -eRs '
+            split("\n")[0] | if startswith("## ") then .[3:] | split(";") |
+            any(.[]; gsub("^[[:space:]]+|[[:space:]]+$"; "") == "workspace")
+            else false end' >/dev/null; then
+            # Go ignores a member module's vendor tree and a legacy module
+            # vendor at the workspace root. Match its workspace annotation
+            # before choosing vendor mode, rather than forcing an invalid one.
+            vendor_hash=$(_isb_source_committed_file "$root" "$document") || return 4
+            vendor=true; mod=vendor
+        fi
+    fi
+    # Explicit vendor mode reads the committed vendor tree, not the original
+    # directories named by replace rules. Those originals need not exist in a
+    # self-contained clone. Go still checks vendor consistency before building;
+    # the caller rechecks all tracked source bytes after the complete family.
+    if [[ "$mod" != vendor ]]; then
+    for index in "${!documents[@]}"; do
+        document="${documents[$index]}"; scope="${scopes[$index]}"
+        if ! jq -es 'length == 1 and (.[0] | (.Replace // []) | type == "array" and all(.[];
+            (.Old.Path | type == "string" and length > 0 and (test("[[:cntrl:]]") | not)) and
+            ((.Old.Version // "") | type == "string" and (test("[[:cntrl:]]") | not)) and
+            (.New.Path | type == "string" and length > 0 and (test("[[:cntrl:]]") | not)) and
+            ((.New.Version // "") | type == "string" and (test("[[:cntrl:]]") | not))))' "$document" >/dev/null; then
+            _isb_log 'Invalid Go replacement selection'; return 4
+        fi
+        paths=$(jq -c '(.Replace // [])[]' "$document") || return 4
+        while IFS= read -r row; do
+            [[ -n "$row" ]] || continue
+            old=$(jq -r '.Old.Path' <<< "$row") || return 4
+            version=$(jq -r '.Old.Version // ""' <<< "$row") || return 4
+            replacement=$(jq -r '.New.Path' <<< "$row") || return 4
+            replacement_version=$(jq -r '.New.Version // ""' <<< "$row") || return 4
+            key="$old@$version"
+            if [[ -n "$work" && "$document" == "$output/go-workspace.log" ]]; then
+                [[ -z "${workspace_replaces[$key]:-}" ]] || { _isb_log 'Repeated Go workspace replacement'; return 4; }
+                workspace_replaces[$key]=1
+            elif [[ -n "${workspace_replaces[$old@]:-}" || -n "${workspace_replaces[$key]:-}" ]]; then
+                continue
+            fi
+            # An exact workspace override does not erase a module wildcard:
+            # other dependency versions could still select that directory.
+            # Keep it confined even when the current graph might not use it;
+            # admission does not resolve an external graph to prove absence.
+            if [[ -n "$replacement_version" ]]; then
+                identity="module:$replacement@$replacement_version"
+            else
+                replacement=$(_isb_go_directory "$root" "$scope" "$replacement") || {
+                    _isb_log "Local Go replacement escapes the checkout or traverses a link: $old"; return 4;
+                }
+                identity="directory:$replacement"
+            fi
+            if [[ -n "${replacements[$key]:-}" ]]; then
+                [[ "${replacements[$key]}" == "$identity" ]] || { _isb_log "Conflicting Go replacement: $old"; return 4; }
+                continue
+            fi
+            replacements[$key]="$identity"
+            [[ -z "$replacement_version" ]] || continue
+            hash=$(_isb_source_committed_file "$root" "$replacement/go.mod") || {
+                _isb_log "Local Go replacement requires a committed regular go.mod: $old"; return 4;
+            }
+            if [[ -e "$replacement/go.sum" || -L "$replacement/go.sum" ]]; then
+                _isb_source_committed_file "$root" "$replacement/go.sum" >/dev/null || return 4
+            fi
+            parsed="$output/go-replacement-${#replacements[@]}.log"
+            _isb_run "$limit" "$parsed" go mod edit -json "$replacement/go.mod" || {
+                status=$?; [[ "$status" != 5 ]] || return 5; return 4;
+            }
+            replacement_module=$(jq -ers 'if length == 1 then .[0].Module.Path |
+                select(type == "string" and length > 0 and (test("[[:cntrl:]]") | not))
+                else empty end' "$parsed") || return 4
+            replacement_relative="${replacement#"$root"/}"; [[ "$replacement" != "$root" ]] || replacement_relative=.
+            jq -nc --arg module "$old" --arg version "$version" --arg path "$replacement_relative" \
+                --arg replacement "$replacement_module" --arg hash "$hash" \
+                '{module_path:$module,version:$version,path:$path,replacement_module_path:$replacement,go_mod_sha256:$hash}' \
+                >> "$output/go-replacements.jsonl" || return 1
+        done <<< "$paths"
+    done
+    fi
+    relative="${work#"$root"/}"
+    jq -nc --arg work "${work:-off}" --arg path "$relative" --arg hash "$work_hash" --arg mod "$mod" \
+        --argjson vendor "$vendor" --arg vendor_hash "$vendor_hash" --slurpfile modules "$output/go-modules.jsonl" \
+        --slurpfile replacements "$output/go-replacements.jsonl" \
+        '{gowork:$work,mod:$mod,go_workspace:(if $work == "off" then null else
+          {path:$path,sha256:$hash,modules:$modules,local_replacements:$replacements,vendor:$vendor} +
+          (if $vendor then {vendor_modules_sha256:$vendor_hash} else {} end) end)}' \
+        > "$output/go-context.json"
+)
+
+# Select a locked project without walking outside the fetched checkout. Bun
+# itself subsequently confirms that the selected package belongs to this root;
+# a nearby unrelated lockfile is not sufficient workspace authority.
+_isb_bun_dependency_root() (
+    local root="$1" tree="$2" cursor="$2" relative lock found=false
+    relative="${tree#"$root"/}"; [[ "$tree" != "$root" ]] || relative=.
+    _isb_path_in_tree "$root" "$relative" && [[ -d "$tree" ]] || return 4
+    while :; do
+        found=false
+        for lock in bun.lock bun.lockb; do
+            if [[ -e "$cursor/$lock" || -L "$cursor/$lock" ]]; then
+                [[ -f "$cursor/$lock" && ! -L "$cursor/$lock" ]] || return 4
+                [[ -z "${_ISB_CHECKOUT_ROOT:-}" ]] ||
+                    _isb_source_committed_file "$root" "$cursor/$lock" >/dev/null || return 4
+                found=true
+            fi
+        done
+        if $found; then
+            [[ -f "$cursor/package.json" && ! -L "$cursor/package.json" ]] || return 4
+            [[ -z "${_ISB_CHECKOUT_ROOT:-}" ]] ||
+                _isb_source_committed_file "$root" "$cursor/package.json" >/dev/null || return 4
+            if [[ "$cursor" != "$tree" ]]; then
+                jq -es 'length == 1 and (.[0].workspaces |
+                    (if type == "object" then .packages else . end) |
+                    type == "array" and length > 0 and all(.[]; type == "string" and length > 0))' \
+                    "$cursor/package.json" >/dev/null || return 4
+            fi
+            printf '%s\n' "$cursor"
+            return 0
+        fi
+        [[ "$cursor" != "$root" ]] || break
+        cursor="${cursor%/*}"
+    done
+    _isb_log 'A committed bun.lock or bun.lockb is required in the selected package or its workspace'
+    return 4
+)
+
+_isb_bun_context() (
+    local root="$1" tree="$2" dependency_root="$3" output="$4" limit="$5" status=0
+    local selected expected="$dependency_root/node_modules/.bin" lock hash size relative
+    local package_hash root_hash root_relative member_relative
+    local -a locks=()
+    _isb_run "$limit" "$output/bun-project.log" bun pm bin || {
+        status=$?; [[ "$status" != 5 ]] || return 5; return 4;
+    }
+    selected=$(cat "$output/bun-project.log") || return 1
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*)
+            command -v cygpath >/dev/null 2>&1 || return 3
+            expected=$(cygpath -am "$expected") || return 4
+            selected="${selected%$'\r'}"; selected="${selected//\\//}"
+            selected="${selected,,}"; expected="${expected,,}"
+            ;;
+    esac
+    [[ "$selected" == "$expected" ]] || {
+        _isb_log 'Bun did not select the committed dependency root for this source package'; return 4;
+    }
+    package_hash=$(_isb_sha256 "$tree/package.json") || return $?
+    root_hash=$(_isb_sha256 "$dependency_root/package.json") || return $?
+    for lock in bun.lock bun.lockb; do
+        [[ -f "$dependency_root/$lock" && ! -L "$dependency_root/$lock" ]] || continue
+        hash=$(_isb_sha256 "$dependency_root/$lock") || return $?
+        size=$(wc -c < "$dependency_root/$lock") || return 1
+        relative="${dependency_root#"$root"/}/$lock"
+        [[ "$dependency_root" != "$root" ]] || relative="$lock"
+        locks+=("$(jq -nc --arg path "$relative" --arg hash "$hash" --argjson size "$size" \
+            '{path:$path,sha256:$hash,size_bytes:$size}')") || return 1
+    done
+    ((${#locks[@]} > 0)) || return 4
+    root_relative="${dependency_root#"$root"/}"; [[ "$dependency_root" != "$root" ]] || root_relative=.
+    member_relative="${tree#"$dependency_root"/}"; [[ "$tree" != "$dependency_root" ]] || member_relative=.
+    printf '%s\n' "${locks[@]}" | jq -sc --arg package_hash "$package_hash" --arg root_hash "$root_hash" \
+        --arg root "$root_relative" --arg member "$member_relative" \
+        '{package_json_sha256:$package_hash,bun_lockfiles:.} +
+         (if $member == "." then {} else {bun_workspace:{root:$root,member:$member,package_json_sha256:$root_hash}} end)' \
+        > "$output/bun-context.json"
+)
+
 # Build only the requested executable family, into a new private output directory.
 # Never run arbitrary command strings from installer configuration.
 _isb_compile() (
     local language="$1" tree="$2" output="$3" binary="$4" entry="$5" package="$6" limit="$7"
     shift 7
-    local -a binaries=("$@") targets=()
+    local -a binaries=("$@") targets=() entries=()
     ((${#binaries[@]})) || binaries=("$binary")
-    [[ "$language" == rust || ${#binaries[@]} -eq 1 ]] || return 4
-    local status=0 host target name mod=readonly
+    local status=0 host target name mod=readonly resolved_entries selected_entry index log
     cd "$tree" || return 4
-    _isb_prepare_toolchain "$language" "$tree" "$output" "$limit" || return $?
     binary=$(_isb_binary_name "$binary") || return 4
     case "$language" in
         rust)
             [[ -f Cargo.toml && ! -L Cargo.toml ]] || return 4
+            _isb_prepare_toolchain "$language" "$tree" "$output" "$limit" || return $?
             # rustup proxies may auto-install a missing repository-selected
             # toolchain. Any separately authorized bootstrap is already active;
             # never let a proxy modify an existing global installation.
             # https://rust-lang.github.io/rustup/environment-variables.html
             export RUSTUP_AUTO_INSTALL=0
-            _isb_run "$limit" "$output/compiler.log" rustc -vV || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
+            # Use the compiler whose identity is recorded below, not an
+            # inherited Cargo-only RUSTC or build-cache wrapper. Preserve
+            # compiler homes and dependency caches, as the Windows source
+            # engine does, while keeping this attempt's outputs private.
+            local rustc_command
+            rustc_command=$(command -v rustc) || return 3
+            export RUSTC="$rustc_command" RUSTC_WRAPPER='' RUSTC_WORKSPACE_WRAPPER=''
+            # Empty flag variables still suppress .cargo/config.toml. Remove
+            # ambient overrides so the pinned project's cfg/link flags apply.
+            unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS
+            _isb_run "$limit" "$output/compiler.log" "$rustc_command" -vV || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
             host=$(sed -n 's/^host: //p' "$output/compiler.log")
             [[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 6
+            export CARGO_BUILD_TARGET="$host" CARGO_TARGET_DIR="$output/target" CARGO_INCREMENTAL=0
             local artifact_path cargo_name windows_paths=false
             case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) windows_paths=true ;; esac
             local -a args=(build --locked --release --message-format=json-render-diagnostics
@@ -1538,9 +2157,14 @@ _isb_compile() (
             done
             ;;
         go)
-            [[ -f go.mod && ! -L go.mod ]] || return 4
+            resolved_entries=$(_isb_source_entries "$language" "$tree" "$binary" "$entry" "${binaries[@]}") || return $?
+            while IFS= read -r selected_entry; do entries+=("$selected_entry"); done <<< "$resolved_entries"
+            export GOENV=off GOWORK=off GOTOOLCHAIN=local GOFLAGS='' GO111MODULE=on GOTELEMETRY=off
+            local go_requirements
+            go_requirements=$(_isb_go_requirements "${_ISB_CHECKOUT_ROOT:-$tree}" "$tree") || return $?
+            _isb_prepare_toolchain "$language" "$tree" "$output" "$limit" "$go_requirements" || return $?
             # Build for this installer host, not an inherited cross target.
-            export GOENV=off GOWORK=off GOTOOLCHAIN=local GOFLAGS='' GOOS='' GOARCH=''
+            export GOOS='' GOARCH=''
             _isb_run "$limit" "$output/compiler.log" go version || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
             _isb_run "$limit" "$output/platform.log" go env GOHOSTOS GOHOSTARCH || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
             local host_os host_arch
@@ -1548,36 +2172,64 @@ _isb_compile() (
             host_arch=$(sed -n '2p' "$output/platform.log")
             [[ "$host_os" =~ ^[a-z0-9]+$ && "$host_arch" =~ ^[a-z0-9]+$ ]] || return 6
             export GOOS="$host_os" GOARCH="$host_arch"
-            [[ ! -d vendor ]] || mod=vendor
-            if [[ -z "$entry" ]]; then
-                entry=.
-                [[ ! -d "cmd/${binary%.exe}" ]] || entry="cmd/${binary%.exe}"
-            fi
-            _isb_path_in_tree "$tree" "$entry" || return 4
-            _isb_run "$limit" "$output/package.log" go list "-mod=$mod" -f '{{.Name}}' "./$entry" || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
-            [[ "$(cat "$output/package.log")" == main ]] || { _isb_log 'Requested Go package is not one executable'; return 6; }
-            target="$output/$binary"
-            _isb_run "$limit" "$output/build.log" go build "-mod=$mod" -trimpath -o "$target" "./$entry" || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
-            targets+=("$target")
+            _isb_go_context "${_ISB_CHECKOUT_ROOT:-$tree}" "$tree" "$output" "$limit" || return $?
+            GOWORK=$(jq -er .gowork "$output/go-context.json") || return 4
+            mod=$(jq -er .mod "$output/go-context.json") || return 4
+            export GOWORK
+            # Check all providers before compiling the first member. A library
+            # can make go build succeed with an archive, not an executable.
+            for index in "${!entries[@]}"; do
+                log="$output/package.log"
+                ((${#entries[@]} == 1)) || log="$output/package-$index.log"
+                _isb_run "$limit" "$log" go list "-mod=$mod" -f '{{.Name}}' "./${entries[$index]}" || {
+                    status=$?; [[ $status == 5 ]] && return 5; return 6;
+                }
+                [[ "$(cat "$log")" == main ]] || {
+                    _isb_log "Requested Go package is not one executable: ${binaries[$index]} (${entries[$index]})"; return 6;
+                }
+            done
+            # Executable names may legally be compiler.log or dependencies.log.
+            # Keep payloads separate from retained diagnostics and toolchains.
+            mkdir "$output/bin" || return 1
+            for index in "${!entries[@]}"; do
+                name=$(_isb_binary_name "${binaries[$index]}") || return 4
+                _isb_path_in_tree "$tree" "${entries[$index]}" || return 6
+                target="$output/bin/$name"
+                log="$output/build.log"
+                ((${#entries[@]} == 1)) || log="$output/build-$index.log"
+                _isb_run "$limit" "$log" go build "-mod=$mod" -trimpath -o "$target" "./${entries[$index]}" || {
+                    status=$?; [[ $status == 5 ]] && return 5; return 6;
+                }
+                targets+=("$target")
+            done
             ;;
         bun|typescript)
             [[ -f package.json && ! -L package.json ]] || return 4
-            if [[ -z "$entry" ]]; then
-                entry=$(jq -er --arg binary "${binary%.exe}" '.bin | if type == "string" then . elif type == "object" then .[$binary] else empty end | select(type == "string" and length > 0)' package.json) || {
-                    _isb_log 'Bun source build needs source_entry or a matching package.json bin'; return 4;
-                }
-                entry="${entry#./}"
-            fi
-            _isb_path_in_tree "$tree" "$entry" && [[ -f "$entry" ]] || return 4
-            if [[ ! -f bun.lock && ! -f bun.lockb ]]; then
-                _isb_log 'A committed bun.lock or bun.lockb is required'; return 4
-            fi
-            [[ ! -L bun.lock && ! -L bun.lockb ]] || return 4
+            resolved_entries=$(_isb_source_entries "$language" "$tree" "$binary" "$entry" "${binaries[@]}") || return $?
+            while IFS= read -r selected_entry; do entries+=("$selected_entry"); done <<< "$resolved_entries"
+            local bun_root checkout_root="${_ISB_CHECKOUT_ROOT:-$tree}"
+            [[ -z "${_ISB_CHECKOUT_ROOT:-}" ]] ||
+                _isb_source_committed_file "$checkout_root" "$tree/package.json" >/dev/null || return 4
+            bun_root=$(_isb_bun_dependency_root "$checkout_root" "$tree") || return $?
+            unset NODE_OPTIONS BUN_OPTIONS
+            _isb_prepare_toolchain "$language" "$bun_root" "$output" "$limit" || return $?
             _isb_run "$limit" "$output/compiler.log" bun --version || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
-            _isb_run "$limit" "$output/dependencies.log" bun install --frozen-lockfile || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
-            target="$output/$binary"
-            _isb_run "$limit" "$output/build.log" bun build --compile --outfile "$target" "./$entry" || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
-            targets+=("$target")
+            _isb_bun_context "$checkout_root" "$tree" "$bun_root" "$output" "$limit" || return $?
+            _isb_run "$limit" "$output/dependencies.log" _isb_in_dir "$bun_root" bun install --frozen-lockfile || {
+                status=$?; [[ $status == 5 ]] && return 5; return 6;
+            }
+            mkdir "$output/bin" || return 1
+            for index in "${!entries[@]}"; do
+                name=$(_isb_binary_name "${binaries[$index]}") || return 4
+                _isb_path_in_tree "$tree" "${entries[$index]}" && [[ -f "${entries[$index]}" ]] || return 6
+                target="$output/bin/$name"
+                log="$output/build.log"
+                ((${#entries[@]} == 1)) || log="$output/build-$index.log"
+                _isb_run "$limit" "$log" bun build --compile --outfile "$target" "./${entries[$index]}" || {
+                    status=$?; [[ $status == 5 ]] && return 5; return 6;
+                }
+                targets+=("$target")
+            done
             ;;
         *) return 4 ;;
     esac
@@ -1626,10 +2278,6 @@ install_source_build() (
     [[ "$language" != rust || -z "$entry" ]] || { _isb_log 'Rust selects the configured binary, not --entry'; return 4; }
     [[ "$language" == rust || -z "$package" ]] || { _isb_log '--package is only supported for Rust'; return 4; }
     ((${#binaries[@]})) || binaries=("$binary")
-    if [[ "$language" != rust && ${#binaries[@]} -gt 1 ]]; then
-        _isb_log 'Executable families are supported only for Rust source builds'
-        return 4
-    fi
     local -A binary_keys=()
     local -a binary_names=()
     local selected key primary_name primary_index=-1 index=0 windows=false
@@ -1693,7 +2341,7 @@ install_source_build() (
         _isb_log 'Submodule source builds require a project-specific dependency setup'; return 4
     fi
     _isb_path_in_tree "$tree" "$subdir" && [[ -d "$tree/$subdir" ]] || return 4
-    local build_root
+    local build_root _ISB_CHECKOUT_ROOT="$tree"
     build_root=$(cd "$tree/$subdir" && pwd -P) || return 4
     _isb_log "Building ${binary_names[*]} from pinned commit $commit ($language)"
     payloads=$(_isb_compile "$language" "$build_root" "$output" "$binary" "$entry" "$package" "$limit" "${binaries[@]}") || return $?
@@ -1722,19 +2370,31 @@ install_source_build() (
     [[ $index -eq ${#binary_names[@]} && -n "$primary_payload" ]] || return 6
     payload="$primary_payload"; sha="$primary_sha"; size="$primary_size"
     binaries_json=$(printf '%s\n' "${binary_receipts[@]}" | jq -sc '.') || return 1
-    local toolchain_receipt=null
+    local toolchain_receipt=null go_context_file=/dev/null bun_context_file=/dev/null
     if [[ -f "$output/toolchain/receipt.json" ]]; then
         toolchain_receipt=$(jq -ce 'del(.root,.bin_dir)' "$output/toolchain/receipt.json") || return 7
+    fi
+    if [[ "$language" == go ]]; then
+        go_context_file="$output/go-context.json"
+        [[ -f "$go_context_file" && ! -L "$go_context_file" ]] || return 7
+    fi
+    if [[ "$language" == bun || "$language" == typescript ]]; then
+        bun_context_file="$output/bun-context.json"
+        [[ -f "$bun_context_file" && ! -L "$bun_context_file" ]] || return 7
     fi
     receipt=$(jq -nc --arg repo "$repo" --arg ref "$ref" --arg commit "$commit" \
         --arg language "$language" --arg path "$payload" --arg sha "$sha" --argjson size "$size" \
         --argjson binaries "$binaries_json" \
         --argjson toolchain "$toolchain_receipt" \
+        --slurpfile go_context "$go_context_file" \
+        --slurpfile bun_context "$bun_context_file" \
         --arg compiler "$(cat "$output/compiler.log")" \
         '{schema_version:1,method:"source",repository:$repo,requested_ref:$ref,source_commit:$commit,
           language:$language,path:$path,sha256:$sha,size_bytes:$size,compiler:$compiler,
           binaries:$binaries,signed_release:false} +
-          (if $toolchain == null then {} else {toolchain:$toolchain} end)') || return 1
+          (if $toolchain == null then {} else {toolchain:$toolchain} end) +
+          (if $go_context[0].go_workspace == null then {} else {go_workspace:$go_context[0].go_workspace} end) +
+          ($bun_context[0] // {})') || return 1
     (set -C; printf '%s\n' "$receipt" > "$destination/receipt.json") || return 1
     _isb_log "Built $binary; SHA256 $sha (locally built, not a signed release)"
     printf '%s\n' "$receipt"
@@ -1749,6 +2409,7 @@ _VERIFY=true
 _REQUIRE_SIGNATURES=false
 _NON_INTERACTIVE=false
 _AUTO_YES=false
+_RECOVER=false
 _OFFLINE_ARCHIVE=""
 _CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/dsr/installers"
 _OFFLINE_MODE=false
@@ -1769,7 +2430,11 @@ _INSTALL_PLATFORM=""
 _PRIMARY_INSTALL_NAME="$BINARY_NAME"
 _INSTALL_NAMES=()
 _INSTALL_PATHS=()
+_INSTALL_APPROVALS=()
 _INSTALLED_BINARIES_JSON='[]'
+_GITHUB_ASSET_INDEX=""
+_GITHUB_ASSET_REPO=""
+_GITHUB_ASSET_TAG=""
 # Working directory created by main(). Declared at script scope so the
 # EXIT trap (which fires AFTER main returns and its locals have been
 # popped) can still see it and clean up. Leaving this as `local temp_dir`
@@ -1906,6 +2571,7 @@ _detect_platform() {
     case "$os" in
         darwin) os="darwin" ;;
         linux) os="linux" ;;
+        freebsd) os="freebsd" ;;
         mingw*|msys*|cygwin*) os="windows" ;;
         *) _log_error "Unsupported OS: $os"; return 1 ;;
     esac
@@ -1919,6 +2585,10 @@ _detect_platform() {
         *) _log_error "Unsupported architecture: $arch"; return 1 ;;
     esac
 
+    if [[ ! "$os/$arch" =~ $SUPPORTED_PLATFORM_PATTERN ]]; then
+        _log_error "Unsupported platform: $os/$arch"
+        return 1
+    fi
     echo "$os/$arch"
 }
 
@@ -1931,6 +2601,7 @@ _get_archive_format() {
         linux) echo "$ARCHIVE_FORMAT_LINUX" ;;
         darwin) echo "$ARCHIVE_FORMAT_DARWIN" ;;
         windows) echo "$ARCHIVE_FORMAT_WINDOWS" ;;
+        freebsd) echo "$ARCHIVE_FORMAT_FREEBSD" ;;
         *) echo "tar.gz" ;;
     esac
 }
@@ -2075,6 +2746,8 @@ _target_triple_candidates() {
         darwin/arm64) echo "aarch64-apple-darwin" ;;
         windows/amd64) echo "x86_64-pc-windows-msvc" ;;
         windows/arm64) echo "aarch64-pc-windows-msvc" ;;
+        windows/386) echo "i686-pc-windows-msvc" ;;
+        freebsd/amd64) echo "x86_64-unknown-freebsd" ;;
         *) echo "${os}-${arch}" ;;
     esac
 }
@@ -2086,14 +2759,16 @@ _detect_linux_libc() {
     local version="" loader
     if command -v ldd >/dev/null 2>&1; then
         version=$(ldd --version 2>&1) || true
-        case "${version,,}" in
+        version=$(printf '%s' "$version" | LC_ALL=C tr '[:upper:]' '[:lower:]') || return 1
+        case "$version" in
             *musl*) echo musl; return 0 ;;
             *"gnu libc"*|*"gnu c library"*|*glibc*) echo gnu; return 0 ;;
         esac
     fi
     if command -v getconf >/dev/null 2>&1; then
         version=$(getconf GNU_LIBC_VERSION 2>/dev/null) || true
-        [[ "${version,,}" != *glibc* ]] || { echo gnu; return 0; }
+        version=$(printf '%s' "$version" | LC_ALL=C tr '[:upper:]' '[:lower:]') || return 1
+        [[ "$version" != *glibc* ]] || { echo gnu; return 0; }
     fi
     for loader in /lib/ld-musl-*.so.1 /usr/lib/ld-musl-*.so.1; do
         if [[ -e "$loader" ]]; then
@@ -2138,6 +2813,14 @@ _select_target_triple() {
                 return 0
             fi
         done
+    fi
+    # A known host with no compatible release is an acquisition absence.
+    # Only explicit source consent may select this internal status; unknown
+    # libc and an unsatisfied --libc request keep their original refusals.
+    # The caller must still resolve the release tag before invoking source.
+    if [[ -z "$_LIBC" ]] && $_ALLOW_SOURCE_BUILD; then
+        _log_warn "No $libc release build of $TOOL_NAME is configured for ${os}/${arch}; source fallback is permitted"
+        return 1
     fi
     _log_error "No $libc build of $TOOL_NAME is configured for ${os}/${arch}"
     return 4
@@ -2187,6 +2870,36 @@ _contract_asset_plan() {
     esac
     _log_error "No exact release asset is configured for $1 ($_TARGET_TRIPLE)"
     return 4
+}
+
+# Ordinary native Rust matrices publish colliding secondary names with the
+# full compiler triple. Workflow jobs do not own that naming rule. This table
+# is frozen from the same per-platform act_job_map routing used by the build.
+_native_variant_platform() {
+    case "$1" in
+
+    esac
+    return 1
+}
+
+# Match _act_native_variant_artifact_name's suffix placement, including raw
+# names and sidecars. The caller has already established native ownership,
+# a configured nonprimary target, and a collision with the primary name.
+_qualified_native_asset_name() {
+    local name="$1" base="$1" ext=""
+    case "$name" in
+        *.tar.gz) ext=.tar.gz; base="${name%.tar.gz}" ;;
+        *.tar.xz) ext=.tar.xz; base="${name%.tar.xz}" ;;
+        *.tgz) ext=.tgz; base="${name%.tgz}" ;;
+        *.zip) ext=.zip; base="${name%.zip}" ;;
+        *.exe) ext=.exe; base="${name%.exe}" ;;
+        *.minisig|*.sha256|*.sha512|*.sig)
+            ext=".${name##*.}"
+            base=$(_qualified_native_asset_name "${name%.*}") || return $?
+            printf '%s%s\n' "$base" "$ext"
+            return 0 ;;
+    esac
+    printf '%s-%s%s\n' "$base" "$_TARGET_TRIPLE" "$ext"
 }
 
 _apply_artifact_pattern() {
@@ -2262,8 +2975,12 @@ _variant_asset_name() {
     if [[ "$_TARGET_TRIPLE" != "$primary" ]]; then
         primary_name=$(_TARGET_TRIPLE="$primary" _apply_artifact_pattern "$ARTIFACT_NAMING" "$os" "$arch" "$version" "$format") || return $?
         if [[ "$name" == "$primary_name" ]]; then
-            _log_error "Artifact naming does not distinguish $_TARGET_TRIPLE from primary $primary; use a target-qualified pattern"
-            return 4
+            if _native_variant_platform "$os/$arch"; then
+                name=$(_qualified_native_asset_name "$name") || return $?
+            else
+                _log_error "Artifact naming does not distinguish $_TARGET_TRIPLE from primary $primary; use a target-qualified pattern"
+                return 4
+            fi
         fi
     fi
     printf '%s\n' "$name"
@@ -2273,31 +2990,429 @@ _variant_asset_name() {
 # GH CLI DOWNLOAD
 # ============================================================================
 
+# A token-only installation must not require a separately installed GitHub CLI.
+# Keep the existing anonymous/gh preference when gh is available. Inspect
+# credentials only in an untraced child; even a malformed explicit token selects
+# this path so it cannot fall through to an anonymous request.
+_installer_token_api_selected() (
+    set +x
+    ! command -v gh >/dev/null 2>&1 &&
+        [[ -n "${DSR_GH_TOKEN:-}" || -n "${GITHUB_TOKEN:-}" || -n "${GH_TOKEN:-}" ]]
+)
+
+_installer_token_api_dependencies() {
+    if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+        _log_error "Private release installation without gh requires curl and jq"
+        return 3
+    fi
+}
+
+# Only HTTPS DNS origins on the default port are accepted. Do not let URL
+# credentials, fragments, backslashes or control characters change routing.
+# curl resolves relative Location values before returning redirect_url.
+_installer_api_https_url() {
+    local url="$1" authority tail
+    local authority_pattern='^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:443)?$'
+    [[ "$url" == https://* && "$url" != *[[:space:][:cntrl:]]* &&
+       "$url" != *\\* && "$url" != *'#'* && ${#url} -le 16384 ]] || return 1
+    tail="${url#https://}"
+    [[ "$tail" == */* ]] || return 1
+    authority="${tail%%/*}"
+    [[ "$authority" =~ $authority_pattern ]]
+}
+
+# Scope credentials to this repository's release API, including redirects.
+# Refuse encoded or literal traversal even when the raw prefix appears correct.
+_installer_api_in_scope() {
+    local url="$1" tail authority path
+    _installer_api_https_url "$url" || return 1
+    tail="${url#https://}"; authority="${tail%%/*}"
+    authority=$(printf '%s' "$authority" | tr '[:upper:]' '[:lower:]') || return 1
+    [[ "$authority" == api.github.com || "$authority" == api.github.com:443 ]] || return 1
+    path="/${tail#*/}"; path="${path%%\?*}"
+    path="${path//%2B/+}"; path="${path//%2b/+}"
+    [[ "$path" == "/repos/$REPO/releases/"* && "$path" != *%* &&
+       "$path" =~ ^[A-Za-z0-9._+/-]+$ ]] || return 1
+    case "$path/" in *'/../'*|*'/./'*|*'//'*) return 1 ;; esac
+}
+
+# One complete transfer, with manual redirects and a bounded body pipe. Both
+# the credential and signed object-store URLs reach curl through stdin, never
+# command arguments or a saved curl config. -q ignores an ambient .curlrc.
+# The pipe enforces the byte limit even on curl versions whose --max-filesize
+# only checks Content-Length. The request deadline covers every redirect.
+_installer_api_download() (
+    set +x
+    set -o pipefail
+    local url="$1" destination="$2" kind="$3" maximum="$4" limit="$5"
+    local source_fallback="${6:-false}" transfer_status
+    local -a transfer_statuses=()
+    local token escaped_token escaped_url status reply next authority tail bytes
+    local redirects=0 send_credential=true remaining deadline=$((SECONDS + limit))
+    local transfer_maximum="$maximum"
+    local accept='application/vnd.github+json' response_file="$destination.http"
+    _installer_token_api_dependencies || return $?
+    token=$(_installer_github_token) || {
+        _log_error "Invalid selected GitHub credential"; return 4;
+    }
+    [[ ${#token} -le 8192 && "$token" != *[[:cntrl:]]* ]] || {
+        _log_error "Invalid selected GitHub credential"; return 4;
+    }
+    [[ "$maximum" =~ ^[1-9][0-9]*$ && "$limit" =~ ^[1-9][0-9]*$ &&
+       ( "$kind" == json || "$kind" == asset ) &&
+       ( "$source_fallback" == true || "$source_fallback" == false ) ]] || return 4
+    # A redirect's small HTML body may exceed a checksum/signature asset's
+    # actual size. Bound it independently; a final 200 still obeys maximum.
+    ((transfer_maximum >= 65536)) || transfer_maximum=65536
+    _installer_api_in_scope "$url" || return 4
+    [[ "$kind" != asset ]] || accept='application/octet-stream'
+    escaped_token="${token//\\/\\\\}"; escaped_token="${escaped_token//\"/\\\"}"
+    while ((redirects <= 5)); do
+        _installer_api_https_url "$url" || {
+            _log_error "Refusing an unsafe GitHub download redirect"; return 8;
+        }
+        if ! _installer_api_in_scope "$url"; then
+            tail="${url#https://}"; authority="${tail%%/*}"
+            authority=$(printf '%s' "$authority" | tr '[:upper:]' '[:lower:]') || return 8
+            if [[ "$kind" != asset || "$authority" == api.github.com || "$authority" == api.github.com:443 ]]; then
+                _log_error "GitHub API redirect changed the selected repository"; return 8
+            fi
+            # A later redirect back to GitHub must not regain this credential.
+            send_credential=false
+        fi
+        # Validate an already-observed redirect before considering expiry;
+        # elapsed time cannot turn an unsafe destination into availability.
+        remaining=$((deadline - SECONDS))
+        if ((remaining <= 0)); then
+            _log_error "GitHub download exceeded its complete-transfer deadline"
+            [[ "$source_fallback" != true ]] || return 1
+            return 8
+        fi
+        escaped_url="${url//\\/\\\\}"; escaped_url="${escaped_url//\"/\\\"}"
+        if ! {
+            printf 'url = "%s"\n' "$escaped_url"
+            if $send_credential; then
+                printf 'header = "Authorization: Bearer %s"\n' "$escaped_token"
+            fi
+        } | curl -q --config - --silent --globoff --proto '=https' --proto-redir '=https' \
+            --connect-timeout 15 --max-time "$remaining" --max-filesize "$transfer_maximum" \
+            --header "Accept: $accept" --header 'X-GitHub-Api-Version: 2022-11-28' \
+            --user-agent 'dsr-installer' --output /dev/fd/3 \
+            --write-out '%{http_code}\n%{redirect_url}' 3>&1 > "$response_file" 2>/dev/null |
+            head -c "$((transfer_maximum + 1))" > "$destination"; then
+            transfer_statuses=("${PIPESTATUS[@]}")
+            for transfer_status in "${transfer_statuses[@]}"; do
+                case "$transfer_status" in
+                    129|130|131|143) _log_error "GitHub acquisition was cancelled"; return 5 ;;
+                esac
+            done
+            if [[ "${transfer_statuses[1]:-0}" == 42 ]]; then
+                _log_error "GitHub acquisition was cancelled"; return 5
+            fi
+            _log_error "GitHub download failed during transfer"
+            # Only opted-in discovery/primary callers receive the internal
+            # unavailable result. Failed local writes, size limits, TLS trust,
+            # malformed options and other client errors never grant consent.
+            # Curl exit codes: https://curl.se/docs/manpage.html#EXIT-CODES
+            if [[ "$source_fallback" == true && "${transfer_statuses[0]:-1}" == 0 &&
+                  "${transfer_statuses[2]:-1}" == 0 ]]; then
+                # A transfer can fail after receiving a denial or redirect.
+                # Its incomplete body cannot erase that HTTP evidence.
+                reply=$(cat -- "$response_file") || return 8
+                status="${reply%%$'\n'*}"
+                case "$status" in
+                    000|200|408|429|5[0-9][0-9])
+                        case "${transfer_statuses[1]:-0}" in
+                            5|6|7|16|18|28|52|55|56|92|95) return 1 ;;
+                        esac
+                        ;;
+                esac
+            fi
+            return 8
+        fi
+        bytes=$(wc -c < "$destination" | tr -d '[:space:]') || return 8
+        [[ "$bytes" =~ ^[0-9]+$ ]] && ((bytes <= transfer_maximum)) || {
+            _log_error "GitHub download exceeds its size limit"; return 7;
+        }
+        reply=$(cat -- "$response_file") || return 8
+        status="${reply%%$'\n'*}"
+        if [[ "$status" == 200 ]]; then
+            ((bytes <= maximum)) || {
+                _log_error "GitHub download exceeds its size limit"; return 7;
+            }
+            return 0
+        fi
+        case "$status" in
+            301|302|303|307|308)
+                next="${reply#*$'\n'}"
+                [[ "$reply" == *$'\n'* && -n "$next" && $redirects -lt 5 ]] || {
+                    _log_error "Invalid or excessive GitHub download redirects"; return 8;
+                }
+                url="$next"; redirects=$((redirects + 1))
+                ;;
+            *)
+                [[ "$status" =~ ^[0-9]{3}$ ]] || status=unknown
+                _log_error "GitHub download failed with HTTP $status"
+                if [[ "$source_fallback" == true ]]; then
+                    case "$status" in 408|429|5[0-9][0-9]) return 1 ;; esac
+                fi
+                return 8
+                ;;
+        esac
+    done
+    return 8
+)
+
+# Validate exactly one published release object. A singleton array, boolean
+# string, absent draft marker or mismatched tag is not a release identity.
+_installer_api_release_id() {
+    local file="$1" tag="$2"
+    jq -er -s --arg tag "$tag" '
+        def positive_id: type == "number" and . > 0 and . <= 9007199254740991 and floor == .;
+        if length == 1 and (.[0] | type == "object" and
+            (.id | positive_id) and (.tag_name | type == "string") and
+            .tag_name == $tag and .draft == false)
+        then .[0].id else error("invalid published release identity") end
+    ' "$file" 2>/dev/null
+}
+
+_installer_api_latest() (
+    local source_fallback="${1:-false}" directory tag
+    _installer_token_api_dependencies || return $?
+    directory=$(mktemp -d) || return 8
+    trap 'rm -rf -- "$directory"' EXIT
+    _installer_api_download "https://api.github.com/repos/$REPO/releases/latest" \
+        "$directory/release.json" json 8388608 30 "$source_fallback" || return $?
+    tag=$(jq -er -s 'if length == 1 and (.[0] | type == "object") and
+        (.[0].tag_name | type == "string") then .[0].tag_name else error("invalid tag") end' \
+        "$directory/release.json" 2>/dev/null) || {
+        _log_error "Malformed GitHub release tag"; return 7;
+    }
+    _valid_release_version "$tag" &&
+        _installer_api_release_id "$directory/release.json" "$tag" >/dev/null || {
+        _log_error "GitHub release identity does not select a published tag"; return 7;
+    }
+    printf '%s\n' "$tag"
+)
+
+# Discover every page before selecting any asset. Build our own endpoint URLs;
+# neither browser_download_url nor Link headers control repository selection.
+# Keep the normalized inventory in private staging, not argv or a token cache.
+_installer_api_prepare_assets() {
+    local source_fallback="${1:-false}"
+    if [[ "$_GITHUB_ASSET_REPO" == "$REPO" && "$_GITHUB_ASSET_TAG" == "$_VERSION" &&
+          -f "$_GITHUB_ASSET_INDEX" && ! -L "$_GITHUB_ASSET_INDEX" ]]; then return 0; fi
+    _installer_token_api_dependencies || return $?
+    [[ -n "$_TEMP_DIR" && -d "$_TEMP_DIR" && ! -L "$_TEMP_DIR" ]] || return 8
+    local directory release_id page=1 count
+    directory=$(mktemp -d "$_TEMP_DIR/github-release.XXXXXXXX") || return 8
+    _installer_api_download "https://api.github.com/repos/$REPO/releases/tags/${_VERSION//+/%2B}" \
+        "$directory/release.json" json 8388608 30 "$source_fallback" || return $?
+    release_id=$(_installer_api_release_id "$directory/release.json" "$_VERSION") || {
+        _log_error "GitHub release identity does not match the selected published tag"; return 7;
+    }
+    printf '[]\n' > "$directory/assets.json" || return 8
+    while ((page <= 101)); do
+        _installer_api_download "https://api.github.com/repos/$REPO/releases/$release_id/assets?per_page=100&page=$page" \
+            "$directory/page.json" json 8388608 30 "$source_fallback" || return $?
+        if ! jq -e -s '
+            def integer: type == "number" and . >= 0 and . <= 9007199254740991 and floor == .;
+            if length == 1 and (.[0] | type == "array" and length <= 100) and
+                all(.[0][]; type == "object" and (.id | integer and . > 0) and
+                    (.name | type == "string" and length > 0 and length <= 1024 and
+                        (test("[\u0000-\u001f\u007f]") | not)) and
+                    (.size | integer) and (.state | type == "string"))
+            then .[0] | map({id, name, size, state})
+            else error("invalid release asset page") end
+        ' "$directory/page.json" > "$directory/selected-page.json" 2>/dev/null; then
+            _log_error "Malformed GitHub release asset page"; return 7
+        fi
+        count=$(jq -er 'length' "$directory/selected-page.json") || return 7
+        if ! jq -e --slurpfile page "$directory/selected-page.json" '
+            (. + $page[0]) as $assets |
+            if ($assets | length <= 10000) and
+                ($assets | group_by(.id) | all(.[]; length == 1)) and
+                ($assets | group_by(.name) | all(.[]; length == 1))
+            then $assets else error("duplicate or excessive release assets") end
+        ' "$directory/assets.json" > "$directory/next-assets.json" 2>/dev/null; then
+            _log_error "Duplicate GitHub release asset identity or inventory exceeds 10000 entries"; return 7
+        fi
+        mv -- "$directory/next-assets.json" "$directory/assets.json" || return 8
+        if ((count < 100)); then
+            _GITHUB_ASSET_REPO="$REPO"
+            _GITHUB_ASSET_TAG="$_VERSION"
+            _GITHUB_ASSET_INDEX="$directory/assets.json"
+            return 0
+        fi
+        page=$((page + 1))
+    done
+    _log_error "GitHub release asset inventory exceeds 10000 entries"
+    return 7
+}
+
+_installer_api_fetch_asset() {
+    local asset="$1" destination="$2" maximum="$3" selection asset_id size actual
+    local source_fallback="${4:-false}"
+    _installer_api_prepare_assets "$source_fallback" || return $?
+    selection=$(jq -r --arg name "$asset" --argjson maximum "$maximum" '
+        map(select(.name == $name)) |
+        if length == 0 then "missing"
+        elif length == 1 and (.[0] | .state == "uploaded" and .size > 0 and .size <= $maximum)
+        then .[0] | [.id, .size] | @tsv else "invalid" end
+    ' "$_GITHUB_ASSET_INDEX") || return 7
+    [[ "$selection" != missing ]] || return 1
+    if [[ "$selection" == invalid ]]; then
+        _log_error "Selected release asset is incomplete or exceeds its size limit: $asset"; return 7
+    fi
+    IFS=$'\t' read -r asset_id size <<< "$selection"
+    # Presence in the inventory is authoritative. Auth failures, deleted
+    # members or changed bytes are never optional misses. Only primary-payload
+    # acquisition explicitly opts into classified source fallback; proof
+    # downloads keep every discovered-member transport failure terminal.
+    _installer_api_download "https://api.github.com/repos/$REPO/releases/assets/$asset_id" \
+        "$destination" asset "$size" 300 "$source_fallback" || return $?
+    actual=$(wc -c < "$destination" | tr -d '[:space:]') || return 8
+    if [[ "$actual" != "$size" ]]; then
+        _log_error "Release asset size changed after discovery: $asset"; return 7
+    fi
+}
+
+# Anonymous requests distinguish proven absence from refusals before source
+# fallback. Bound every response and the complete redirect chain, ignore curl
+# configuration, and retain HTTP evidence when a transfer subsequently fails.
+# Status 9 is internal: a denied anonymous API request may still resolve a
+# public tag, or a denied public asset may use gh, but neither authorizes source.
+_installer_public_download() (
+    set +x
+    local url="$1" destination="$2" maximum="$3" limit="$4" kind="$5"
+    local status reply next remaining bytes part code escaped_url
+    local redirects=0 deadline=$((SECONDS + limit))
+    local response_file="$destination.http" transfer_maximum="$maximum"
+    local -a transfer_statuses=() method=()
+    [[ "$maximum" =~ ^[1-9][0-9]*$ && "$limit" =~ ^[1-9][0-9]*$ &&
+       ( "$kind" == json || "$kind" == asset || "$kind" == head ) ]] || return 4
+    command -v curl >/dev/null 2>&1 || return 3
+    ((transfer_maximum >= 65536)) || transfer_maximum=65536
+    [[ "$kind" != head ]] || method=(--head)
+    while ((redirects <= 5)); do
+        _installer_api_https_url "$url" || {
+            _log_error "Refusing an unsafe public release redirect"; return 8;
+        }
+        if [[ "$kind" == json ]]; then
+            _installer_api_in_scope "$url" || {
+                _log_error "Public release API redirect changed the selected repository"; return 8;
+            }
+        elif [[ "$kind" == head && "$url" != "https://github.com/$REPO/releases/latest" ]]; then
+            part="${url#"https://github.com/$REPO/releases/tag/"}"
+            part="${part//%2B/+}"; part="${part//%2b/+}"
+            [[ "$url" == "https://github.com/$REPO/releases/tag/"* ]] && _valid_release_version "$part" || {
+                _log_error "Public release discovery left the selected repository tag route"; return 8;
+            }
+        fi
+        remaining=$((deadline - SECONDS))
+        if ((remaining <= 0)); then
+            _log_error "Public release request exceeded its complete-transfer deadline"
+            return 1
+        fi
+        escaped_url="${url//\\/\\\\}"; escaped_url="${escaped_url//\"/\\\"}"
+        if ! printf 'url = "%s"\n' "$escaped_url" |
+            curl -q --config - --silent --globoff --proto '=https' --proto-redir '=https' \
+            --connect-timeout 15 --max-time "$remaining" --max-filesize "$transfer_maximum" \
+            --user-agent 'dsr-installer' ${method[@]+"${method[@]}"} \
+            --output /dev/fd/3 --write-out '%{http_code}\n%{redirect_url}' \
+            3>&1 > "$response_file" 2>/dev/null | head -c "$((transfer_maximum + 1))" > "$destination"; then
+            transfer_statuses=("${PIPESTATUS[@]}")
+            for code in "${transfer_statuses[@]}"; do
+                case "$code" in 129|130|131|143) _log_error "Release acquisition was cancelled"; return 5 ;; esac
+            done
+            [[ "${transfer_statuses[1]:-0}" != 42 ]] || return 5
+            reply=$(cat -- "$response_file") || return 8
+            status="${reply%%$'\n'*}"
+            if [[ "${transfer_statuses[0]:-1}" == 0 && "${transfer_statuses[2]:-1}" == 0 ]]; then
+                case "$status" in
+                    000|200|408|429|5[0-9][0-9])
+                        case "${transfer_statuses[1]:-0}" in
+                            5|6|7|16|18|28|52|55|56|92|95) return 1 ;;
+                        esac
+                        ;;
+                esac
+            fi
+            _log_error "Public release transfer failed without availability evidence"
+            return 8
+        fi
+        bytes=$(wc -c < "$destination" | tr -d '[:space:]') || return 8
+        [[ "$bytes" =~ ^[0-9]+$ ]] && ((bytes <= transfer_maximum)) || return 7
+        reply=$(cat -- "$response_file") || return 8
+        status="${reply%%$'\n'*}"
+        if [[ "$status" == 200 ]]; then
+            ((bytes <= maximum)) || return 7
+            [[ "$kind" != head ]] || printf '%s\n' "$url"
+            return 0
+        fi
+        case "$status" in
+            301|302|303|307|308)
+                next="${reply#*$'\n'}"
+                [[ "$reply" == *$'\n'* && -n "$next" && $redirects -lt 5 ]] || return 8
+                url="$next"; redirects=$((redirects + 1))
+                ;;
+            404|410|408|429|5[0-9][0-9]) return 1 ;;
+            403) [[ "$kind" != json && "$kind" != asset ]] || return 9; return 8 ;;
+            401) [[ "$kind" != asset ]] || return 9; return 8 ;;
+            *) _log_error "Public release request failed with HTTP ${status:-unknown}"; return 8 ;;
+        esac
+    done
+    return 8
+)
+
 # Fetch one exact asset for payloads AND their checksum/signature sidecars.
 # Transport fallback happens here, before verification, never after it fails.
 _fetch_release_asset() {
-    local asset="$1" dest="$2" url
+    local asset="$1" dest="$2" maximum="${3:-2147483648}" url status=0 failure=3
+    local source_fallback="${4:-false}" gh_ambiguous=false
     $_OFFLINE_MODE && return 1
     [[ "$asset" =~ ^[A-Za-z0-9._+-]+$ && "$asset" != . && "$asset" != .. ]] || return 4
+    if _installer_token_api_selected; then
+        _installer_api_fetch_asset "$asset" "$dest" "$maximum" "$source_fallback"
+        return $?
+    fi
     url="https://github.com/$REPO/releases/download/$_VERSION/${asset//+/%2B}"
     if $_PREFER_GH && command -v gh &>/dev/null; then
-        if _installer_run_gh release download "$_VERSION" --repo "github.com/$REPO" --pattern "$asset" --output "$dest" --clobber 2>/dev/null &&
-           [[ -f "$dest" && ! -L "$dest" && -s "$dest" ]]; then
+        _installer_run_gh release download "$_VERSION" --repo "github.com/$REPO" --pattern "$asset" --output "$dest" --clobber 2>/dev/null || status=$?
+        if ((status == 0)); then
+            [[ -f "$dest" && ! -L "$dest" && -s "$dest" ]] || return 7
             return 0
         fi
+        case "$status" in 5|4) return "$status" ;; 1) gh_ambiguous=true ;; 3) ;; *) failure=8 ;; esac
     fi
-    if command -v curl &>/dev/null &&
-       curl -sSfL --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 300 \
-           --retry 2 "$url" -o "$dest" 2>/dev/null && [[ -f "$dest" && ! -L "$dest" && -s "$dest" ]]; then
-        return 0
+    if command -v curl &>/dev/null; then
+        status=0
+        _installer_public_download "$url" "$dest" "$maximum" 300 asset || status=$?
+        if ((status == 0)); then
+            [[ -f "$dest" && ! -L "$dest" && -s "$dest" ]] || return 7
+            return 0
+        fi
+        case "$status" in
+            1) [[ "$failure" == 8 ]] || failure=1 ;;
+            9) failure=8 ;;
+            *) return "$status" ;;
+        esac
     fi
     if ! $_PREFER_GH && command -v gh &>/dev/null; then
-        if _installer_run_gh release download "$_VERSION" --repo "github.com/$REPO" --pattern "$asset" --output "$dest" --clobber 2>/dev/null &&
-           [[ -f "$dest" && ! -L "$dest" && -s "$dest" ]]; then
+        status=0
+        _installer_run_gh release download "$_VERSION" --repo "github.com/$REPO" --pattern "$asset" --output "$dest" --clobber 2>/dev/null || status=$?
+        if ((status == 0)); then
+            [[ -f "$dest" && ! -L "$dest" && -s "$dest" ]] || return 7
             return 0
         fi
+        case "$status" in 5|4) return "$status" ;; 1) gh_ambiguous=true ;; 3) ;; *) failure=8 ;; esac
     fi
-    return 1
+    # A missing optional sidecar may proceed to another checksum filename
+    # after curl independently proves availability failure. An ambiguous gh
+    # failure cannot supply that evidence, or permit compiling the payload.
+    if $gh_ambiguous && { [[ "$source_fallback" == true ]] || [[ "$failure" == 3 ]]; }; then
+        return 8
+    fi
+    return "$failure"
 }
 
 # A tag becomes one URL and cache-path component; never accept API null,
@@ -2308,32 +3423,46 @@ _valid_release_version() {
 
 # Use authenticated discovery for private repos and an API-independent public
 # redirect when the releases API is throttled. Never guess a tag from a date.
-_get_latest_version() {
+_get_latest_version() (
     local api_url="https://api.github.com/repos/$REPO/releases/latest"
-    local response version="" effective prefix="https://github.com/$REPO/releases/tag/"
+    local version="" effective prefix="https://github.com/$REPO/releases/tag/"
+    local status=0 failure=3 directory
     $_OFFLINE_MODE && return 4
+    if _installer_token_api_selected; then
+        _installer_api_latest "$_ALLOW_SOURCE_BUILD"
+        return $?
+    fi
     if $_PREFER_GH && command -v gh &>/dev/null; then
-        if version=$(_installer_run_gh release view --repo "github.com/$REPO" --json tagName --jq '.tagName' 2>/dev/null) &&
-           _valid_release_version "$version"; then
+        version=$(_installer_run_gh release view --repo "github.com/$REPO" --json tagName --jq '.tagName' 2>/dev/null) || status=$?
+        if ((status == 0)); then
+            _valid_release_version "$version" || return 7
             printf '%s\n' "$version"; return 0
         fi
+        case "$status" in 5|4) return "$status" ;; 3) ;; *) failure=8 ;; esac
     fi
     if command -v curl &>/dev/null; then
-        if response=$(curl -sSfL --proto '=https' --proto-redir '=https' --connect-timeout 10 \
-            --max-time 30 "$api_url" 2>/dev/null); then
-            if command -v jq &>/dev/null; then
-                version=$(jq -er -s 'if length == 1 and (.[0].tag_name | type == "string")
-                    then .[0].tag_name else error("invalid release") end' <<< "$response" 2>/dev/null) || version=""
-                if _valid_release_version "$version"; then
-                    printf '%s\n' "$version"; return 0
-                fi
+        directory=$(mktemp -d) || return 8
+        trap 'rm -rf -- "$directory"' EXIT
+        if command -v jq &>/dev/null; then
+            status=0
+            _installer_public_download "$api_url" "$directory/release.json" 8388608 30 json || status=$?
+            if ((status == 0)); then
+                version=$(jq -er -s 'if length == 1 and (.[0] | type == "object") and
+                    (.[0].tag_name | type == "string") then .[0].tag_name else error("invalid release") end' \
+                    "$directory/release.json" 2>/dev/null) && _valid_release_version "$version" &&
+                    _installer_api_release_id "$directory/release.json" "$version" >/dev/null || {
+                    _log_error "Malformed public release metadata"; return 7;
+                }
+                printf '%s\n' "$version"; return 0
             fi
+            case "$status" in 1) [[ "$failure" == 8 ]] || failure=1 ;; 9) failure=8 ;; *) return "$status" ;; esac
         fi
         # HEAD follows only HTTPS redirects. Pin the final owner/repo and tag
         # route rather than accepting a login page, another repo, or /latest.
-        if effective=$(curl -sSfIL --proto '=https' --proto-redir '=https' --max-redirs 5 \
-            --connect-timeout 10 --max-time 30 -o /dev/null -w '%{url_effective}' \
-            "https://github.com/$REPO/releases/latest" 2>/dev/null) && [[ "$effective" == "$prefix"* ]]; then
+        status=0
+        effective=$(_installer_public_download "https://github.com/$REPO/releases/latest" \
+            "$directory/latest" 8388608 30 head) || status=$?
+        if ((status == 0)) && [[ "$effective" == "$prefix"* ]]; then
             version="${effective#"$prefix"}"
             version="${version//%2B/+}"; version="${version//%2b/+}"
             if _valid_release_version "$version"; then
@@ -2341,16 +3470,26 @@ _get_latest_version() {
                 printf '%s\n' "$version"; return 0
             fi
         fi
-    fi
-    if ! $_PREFER_GH && command -v gh &>/dev/null; then
-        if version=$(_installer_run_gh release view --repo "github.com/$REPO" --json tagName --jq '.tagName' 2>/dev/null) &&
-           _valid_release_version "$version"; then
-            printf '%s\n' "$version"; return 0
+        if ((status == 1)); then
+            [[ "$failure" == 8 ]] || failure=1
+        elif ((status == 0)); then
+            return 8
+        else
+            return "$status"
         fi
     fi
+    if ! $_PREFER_GH && command -v gh &>/dev/null; then
+        status=0
+        version=$(_installer_run_gh release view --repo "github.com/$REPO" --json tagName --jq '.tagName' 2>/dev/null) || status=$?
+        if ((status == 0)); then
+            _valid_release_version "$version" || return 7
+            printf '%s\n' "$version"; return 0
+        fi
+        case "$status" in 5|4) return "$status" ;; 3) ;; *) failure=8 ;; esac
+    fi
     _log_error "Cannot resolve latest release; use --version with an existing release tag"
-    return 1
-}
+    return "$failure"
+)
 
 # Accept exactly one SHA256 record for the RELEASE name, not the staging name.
 # Hash-only sidecars are allowed only when fetched as <asset>.sha256.
@@ -2408,14 +3547,18 @@ _verify_checksum() {
             return 1
         fi
         manifest="$file.checksums.download"
-        local found=false
-        for candidate in "$asset.sha256" checksums.sha256 \
+        local found=false fetch_status
+        for candidate in "$asset.sha256" checksums.sha256 SHA256SUMS \
             "${TOOL_NAME}-${_VERSION#v}-SHA256SUMS.txt" SHA256SUMS.txt checksums.txt; do
-            if _fetch_release_asset "$candidate" "$manifest"; then
+            fetch_status=0
+            _fetch_release_asset "$candidate" "$manifest" 8388608 || fetch_status=$?
+            if ((fetch_status == 0)); then
                 found=true
                 [[ "$candidate" != "$asset.sha256" ]] || hash_only=true
                 break
             fi
+            # Only an absent inventory name can select the next checksum.
+            ((fetch_status == 1)) || return "$fetch_status"
         done
         if ! $found; then
             _log_error "No release checksums available for $asset"
@@ -2456,11 +3599,14 @@ _verify_minisign() {
         return 3
     fi
 
-    local sig_file="${file}.minisig"
+    local sig_file="${file}.minisig" fetch_status=0
     if [[ ! -e "$sig_file" && ! -L "$sig_file" ]]; then
-        _fetch_release_asset "$asset.minisig" "$sig_file" || {
-            _log_error "Signature unavailable for $asset"; return 1;
-        }
+        _fetch_release_asset "$asset.minisig" "$sig_file" 1048576 || fetch_status=$?
+        if ((fetch_status != 0)); then
+            _log_error "Signature unavailable for $asset"
+            ((fetch_status != 5)) || return 5
+            return 1
+        fi
     fi
     [[ -f "$sig_file" && ! -L "$sig_file" && -s "$sig_file" ]] || return 1
 
@@ -2552,10 +3698,10 @@ _extract_archive() {
         # ZIP writers may record permissions but omit S_IFREG (Python's
         # writestr does this). Accept zero type bits, not arbitrary unknown
         # types, and require an attribute record for every entry.
-        local attributes=0 mode
+        local attributes=0 mode attribute_pattern='^[[:space:]]+Unix file attributes \(([0-7]{6}) octal\)'
         listing=$(LC_ALL=C unzip -Z -v "$archive" 2>/dev/null) || return 1
         while IFS= read -r line; do
-            if [[ "$line" =~ ^[[:space:]]+Unix\ file\ attributes\ \(([0-7]{6})\ octal\) ]]; then
+            if [[ "$line" =~ $attribute_pattern ]]; then
                 mode=$((8#${BASH_REMATCH[1]} & 0170000))
                 ((mode == 0 || mode == 0100000 || mode == 0040000)) || return 1
                 attributes=$((attributes + 1))
@@ -2571,6 +3717,259 @@ _extract_archive() {
     fi
 }
 
+# Inspect bounded native headers without executing a downloaded program or
+# requiring Python/file on the installer host. Bash 3.2 and BSD/GNU od work.
+# These checks bind executable format and CPU, not every runtime dependency,
+# minimum OS release, CPU extension, or libc symbol version.
+_installer_header_bytes() {
+    local path="$1" offset="$2" count="$3" data
+    local -a bytes=()
+    data=$(LC_ALL=C od -An -v -tu1 -j "$offset" -N "$count" "$path" 2>/dev/null) || return 1
+    data="${data//$'\n'/ }"
+    read -r -a bytes <<< "$data"
+    (( ${#bytes[@]} == count )) || return 1
+    printf '%s\n' "${bytes[*]}"
+}
+
+# Decode at most eight header bytes, refusing offsets outside a 32-bit file
+# extent before multiplication can overflow shell arithmetic. Payloads larger
+# than 4 GiB require a different admission policy, not a truncated offset.
+_installer_header_uint() {
+    local endian="$1" value=0 index byte
+    shift
+    local -a digits=("$@")
+    (( ${#digits[@]} > 0 && ${#digits[@]} <= 8 )) || return 1
+    for ((index=0; index<${#digits[@]}; index++)); do
+        if [[ "$endian" == le ]]; then byte="${digits[${#digits[@]}-index-1]}"
+        else byte="${digits[index]}"; fi
+        [[ "$byte" =~ ^[0-9]+$ ]] && (( byte <= 255 && value <= 16777215 )) || return 1
+        value=$((value * 256 + byte))
+    done
+    printf '%s\n' "$value"
+}
+
+_installer_macho_slice() {
+    local path="$1" offset="$2" length="$3" expected_cpu="$4" expected_subtype="${5:-}"
+    local data endian header_size cpu subtype kind commands command_bytes magic
+    local -a header=()
+    (( length >= 32 )) || return 1
+    data=$(_installer_header_bytes "$path" "$offset" 32) || return 1
+    read -r -a header <<< "$data"
+    magic="${header[0]} ${header[1]} ${header[2]} ${header[3]}"
+    case "$magic" in
+        '207 250 237 254') endian=le; header_size=32 ;;
+        '254 237 250 207') endian=be; header_size=32 ;;
+        '206 250 237 254') endian=le; header_size=28 ;;
+        '254 237 250 206') endian=be; header_size=28 ;;
+        *) return 1 ;;
+    esac
+    cpu=$(_installer_header_uint "$endian" "${header[@]:4:4}") || return 1
+    subtype=$(_installer_header_uint "$endian" "${header[@]:8:4}") || return 1
+    kind=$(_installer_header_uint "$endian" "${header[@]:12:4}") || return 1
+    commands=$(_installer_header_uint "$endian" "${header[@]:16:4}") || return 1
+    command_bytes=$(_installer_header_uint "$endian" "${header[@]:20:4}") || return 1
+    [[ "$cpu" == "$expected_cpu" && ( -z "$expected_subtype" || "$subtype" == "$expected_subtype" ) ]] || return 1
+    # Current Intel/ARM macOS slices are little-endian, even inside a fat
+    # container whose table is big-endian. Legacy extra slices may differ.
+    case "$cpu" in 16777223|16777228) [[ "$endian" == le ]] || return 1 ;; esac
+    (( kind == 2 && commands > 0 && commands <= command_bytes / 8 &&
+       command_bytes <= length - header_size )) || return 1
+    if (( cpu & 16777216 )); then (( header_size == 32 )) || return 1
+    else (( header_size == 28 )) || return 1; fi
+}
+
+_installer_native_payload() {
+    local path="$1" size="$3" data magic os="${2%/*}" arch="${2#*/}"
+    local class machine expected_class expected_machine kind version offset width entry
+    local header_size ph_size ph_count expected_ph_size cpu subtype count table_size stride
+    local length align index prior found=false endian=be optional_size optional_magic sections flags subsystem
+    local -a header=() row=() starts=() ends=()
+    data=$(_installer_header_bytes "$path" 0 4) || return 1
+    read -r -a header <<< "$data"
+    magic="${header[*]}"
+    case "$magic" in
+        '127 69 76 70')
+            [[ "$os" == linux || "$os" == freebsd ]] || return 1
+            (( size >= 52 )) || return 1
+            data=$(_installer_header_bytes "$path" 0 52) || return 1
+            read -r -a header <<< "$data"
+            class="${header[4]}"
+            [[ "${header[5]}" == 1 && "${header[6]}" == 1 ]] || return 1
+            case "$os:${header[7]}" in linux:0|linux:3|freebsd:0|freebsd:9) ;; *) return 1 ;; esac
+            case "$arch" in
+                amd64) expected_class=2; expected_machine=62 ;;
+                arm64) expected_class=2; expected_machine=183 ;;
+                386) expected_class=1; expected_machine=3 ;;
+                armv7) expected_class=1; expected_machine=40 ;;
+                *) return 1 ;;
+            esac
+            machine=$(_installer_header_uint le "${header[@]:18:2}") || return 1
+            kind=$(_installer_header_uint le "${header[@]:16:2}") || return 1
+            version=$(_installer_header_uint le "${header[@]:20:4}") || return 1
+            (( class == expected_class && machine == expected_machine &&
+               (kind == 2 || kind == 3) && version == 1 )) || return 1
+            if (( class == 2 )); then
+                data=$(_installer_header_bytes "$path" 0 64) || return 1
+                read -r -a header <<< "$data"
+                header_size=64; width=8; expected_ph_size=56
+                offset=$(_installer_header_uint le "${header[@]:32:8}") || return 1
+                ph_size=$(_installer_header_uint le "${header[@]:54:2}") || return 1
+                ph_count=$(_installer_header_uint le "${header[@]:56:2}") || return 1
+                length=$(_installer_header_uint le "${header[@]:52:2}") || return 1
+            else
+                header_size=52; width=4; expected_ph_size=32
+                offset=$(_installer_header_uint le "${header[@]:28:4}") || return 1
+                ph_size=$(_installer_header_uint le "${header[@]:42:2}") || return 1
+                ph_count=$(_installer_header_uint le "${header[@]:44:2}") || return 1
+                length=$(_installer_header_uint le "${header[@]:40:2}") || return 1
+            fi
+            entry="${header[*]:24:width}"
+            [[ "$entry" == *[1-9]* ]] || return 1
+            (( length == header_size && offset >= header_size && ph_size == expected_ph_size &&
+               ph_count > 0 && ph_count < 65535 && offset + ph_size * ph_count <= size ))
+            ;;
+        '207 250 237 254'|'254 237 250 207'|'206 250 237 254'|'254 237 250 206')
+            [[ "$os" == darwin ]] || return 1
+            case "$arch" in amd64) cpu=16777223 ;; arm64) cpu=16777228 ;; *) return 1 ;; esac
+            _installer_macho_slice "$path" 0 "$size" "$cpu"
+            ;;
+        '202 254 186 190'|'190 186 254 202'|'202 254 186 191'|'191 186 254 202')
+            [[ "$os" == darwin ]] || return 1
+            case "$arch" in amd64) expected_machine=16777223 ;; arm64) expected_machine=16777228 ;; *) return 1 ;; esac
+            case "$magic" in
+                '202 254 186 190') stride=20; endian=be ;;
+                '190 186 254 202') stride=20; endian=le ;;
+                '202 254 186 191') stride=32; endian=be ;;
+                *) stride=32; endian=le ;;
+            esac
+            data=$(_installer_header_bytes "$path" 4 4) || return 1
+            read -r -a header <<< "$data"
+            count=$(_installer_header_uint "$endian" "${header[@]}") || return 1
+            table_size=$((8 + count * stride))
+            (( count > 0 && count <= 64 && table_size <= size )) || return 1
+            for ((index=0; index<count; index++)); do
+                data=$(_installer_header_bytes "$path" "$((8 + index * stride))" "$stride") || return 1
+                read -r -a row <<< "$data"
+                cpu=$(_installer_header_uint "$endian" "${row[@]:0:4}") || return 1
+                subtype=$(_installer_header_uint "$endian" "${row[@]:4:4}") || return 1
+                if (( stride == 32 )); then
+                    offset=$(_installer_header_uint "$endian" "${row[@]:8:8}") || return 1
+                    length=$(_installer_header_uint "$endian" "${row[@]:16:8}") || return 1
+                    align=$(_installer_header_uint "$endian" "${row[@]:24:4}") || return 1
+                    [[ "${row[*]:28:4}" == '0 0 0 0' ]] || return 1
+                else
+                    offset=$(_installer_header_uint "$endian" "${row[@]:8:4}") || return 1
+                    length=$(_installer_header_uint "$endian" "${row[@]:12:4}") || return 1
+                    align=$(_installer_header_uint "$endian" "${row[@]:16:4}") || return 1
+                fi
+                (( offset >= table_size && length >= 32 && offset + length <= size &&
+                   align <= 31 && offset % (1 << align) == 0 )) || return 1
+                for ((prior=0; prior<index; prior++)); do
+                    (( offset >= ends[prior] || offset + length <= starts[prior] )) || return 1
+                done
+                starts+=("$offset"); ends+=("$((offset + length))")
+                _installer_macho_slice "$path" "$offset" "$length" "$cpu" "$subtype" || return 1
+                [[ "$cpu" != "$expected_machine" ]] || found=true
+            done
+            $found
+            ;;
+        *)
+            [[ "${header[0]} ${header[1]}" == '77 90' && "$os" == windows && $size -ge 64 ]] || return 1
+            data=$(_installer_header_bytes "$path" 60 4) || return 1
+            read -r -a header <<< "$data"
+            offset=$(_installer_header_uint le "${header[@]}") || return 1
+            (( offset >= 64 && offset + 24 <= size )) || return 1
+            data=$(_installer_header_bytes "$path" "$offset" 24) || return 1
+            read -r -a header <<< "$data"
+            [[ "${header[*]:0:4}" == '80 69 0 0' ]] || return 1
+            machine=$(_installer_header_uint le "${header[@]:4:2}") || return 1
+            sections=$(_installer_header_uint le "${header[@]:6:2}") || return 1
+            optional_size=$(_installer_header_uint le "${header[@]:20:2}") || return 1
+            flags=$(_installer_header_uint le "${header[@]:22:2}") || return 1
+            case "$arch" in
+                amd64) expected_machine=34404; optional_magic=523; width=112 ;;
+                arm64) expected_machine=43620; optional_magic=523; width=112 ;;
+                386) expected_machine=332; optional_magic=267; width=96 ;;
+                *) return 1 ;;
+            esac
+            (( machine == expected_machine && sections > 0 && sections <= 96 &&
+               (flags & 2) != 0 && (flags & 8192) == 0 && optional_size >= width &&
+               offset + 24 + optional_size + sections * 40 <= size )) || return 1
+            data=$(_installer_header_bytes "$path" "$((offset + 24))" "$width") || return 1
+            read -r -a header <<< "$data"
+            kind=$(_installer_header_uint le "${header[@]:0:2}") || return 1
+            entry=$(_installer_header_uint le "${header[@]:16:4}") || return 1
+            subsystem=$(_installer_header_uint le "${header[@]:68:2}") || return 1
+            (( kind == optional_magic && entry > 0 && (subsystem == 2 || subsystem == 3) ))
+            ;;
+    esac
+}
+
+_installer_validate_executable() {
+    local path="$1" platform="$2" size data line
+    [[ -f "$path" && ! -L "$path" && -s "$path" ]] || return 7
+    command -v od >/dev/null 2>&1 || { _log_error 'od is required to inspect executable headers'; return 3; }
+    size=$(wc -c < "$path" | tr -d '[:space:]') || return 1
+    [[ "$size" =~ ^[1-9][0-9]*$ && ${#size} -le 10 ]] && (( size <= 4294967295 )) || return 7
+    data=$(_installer_header_bytes "$path" 0 2) || return 7
+    if [[ "$data" == '35 33' ]]; then
+        # Script launchers are intentional release payloads even for compiled
+        # projects. Recognize their interpreter declaration, never run it.
+        line=$(LC_ALL=C head -c 4096 "$path") || return 1
+        line="${line%%$'\n'*}"
+        line="${line%$'\r'}"
+        [[ "$line" =~ ^#![[:blank:]]*/[^[:space:][:cntrl:]]+ ]] && return 0
+    elif _installer_native_payload "$path" "$platform" "$size"; then
+        return 0
+    fi
+    _log_error "Executable format or architecture does not match $platform: ${path##*/}"
+    return 7
+}
+
+# GNU and BSD stat use different format switches. This identity check is also
+# used for the private owner file, so cleanup cannot remove a replacement lock.
+_install_lock_identity() {
+    local value
+    value=$(stat -c '%d:%i' -- "$1" 2>/dev/null) ||
+        value=$(stat -f '%d:%i' "$1" 2>/dev/null) || return 1
+    [[ "$value" =~ ^[0-9]+:[0-9]+$ ]] || return 1
+    printf '%s\n' "$value"
+}
+
+_install_lock_owned() {
+    local directory="$1" directory_identity="$2" owner_identity="$3" owner="$4" observed
+    [[ -d "$directory" && ! -L "$directory" && -f "$directory/owner" && ! -L "$directory/owner" ]] || return 1
+    [[ "$(_install_lock_identity "$directory")" == "$directory_identity" &&
+       "$(_install_lock_identity "$directory/owner")" == "$owner_identity" ]] || return 1
+    observed=$(cat -- "$directory/owner") || return 1
+    [[ "$observed" == "$owner" ]]
+}
+
+# File identities distinguish our renamed payloads from a later user's edit.
+# Keep this producer in Bash: ordinary release installation needs no Python.
+_install_file_record() {
+    local path="$1" before after hash mode value
+    local fields=()
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    before=$(stat -c '%d %i %a %u %g %h %s' -- "$path" 2>/dev/null) ||
+        before=$(stat -f '%d %i %Lp %u %g %l %z' "$path" 2>/dev/null) || return 1
+    read -r -a fields <<< "$before"
+    [[ ${#fields[@]} -eq 7 && "${fields[2]}" =~ ^[0-7]{1,4}$ ]] || return 1
+    for value in "${fields[@]}"; do [[ "$value" =~ ^[0-9]+$ ]] || return 1; done
+    mode=$((8#${fields[2]}))
+    hash=$(_file_sha256 "$path") || return $?
+    after=$(stat -c '%d %i %a %u %g %h %s' -- "$path" 2>/dev/null) ||
+        after=$(stat -f '%d %i %Lp %u %g %l %z' "$path" 2>/dev/null) || return 1
+    [[ -f "$path" && ! -L "$path" && "$before" == "$after" ]] || return 1
+    printf '{"identity":"%s:%s","nlink":%s,"mode":%s,"uid":%s,"gid":%s,"size":%s,"sha256":"%s"}' \
+        "${fields[0]}" "${fields[1]}" "${fields[5]}" "$mode" "${fields[3]}" "${fields[4]}" "${fields[6]}" "$hash"
+}
+
+_install_destination_record() {
+    if [[ -e "$1" || -L "$1" ]]; then _install_file_record "$1"
+    else printf 'null'; fi
+}
+
 # Stage the complete family and backups on the destination filesystem before
 # replacing its first member. On failure, restore every touched destination;
 # unrelated executables are never moved or removed.
@@ -2578,10 +3977,33 @@ _extract_archive() {
 # A second function-body subshell would hide the actual writer behind $! and
 # leave it running when the parent forwards a signal to its tracked child.
 _install_family_transaction() {
-    local dest_dir="$1"; shift
-    local sources=("$@") hashes=() sizes=() previous=()
+    # Job control in the foreground parent gives this writer its own group.
+    # All its utility children remain in that group after the writer dies.
+    set +m
+    local dest_dir="$1" startup="$2"; shift 2
+    local sources=("$@") hashes=() sizes=() previous=() originals=() candidates=() backups=() restorations=()
     local name path hash size previous_hash backup_hash index=0 stage='' committed=false touched=0
     local receipt='[' separator='' original_dir="$dest_dir"
+    local install_lock='' lock_identity='' owner_identity='' lock_owner='' lock_held=false lock_setup_interrupted=false
+    local writer_pid='' writer_group='' writer_host='' writer_host_hex='' directory_hex='' process_scope=global startup_deadline=$((SECONDS + 5))
+    local directory_identity='' stage_identity='' journal='' journal_hash='' original_record backup_record rollback_record candidate_record
+    local original_identity='' original_identities='|'
+    while ((SECONDS < startup_deadline)); do
+        if [[ -f "$startup" && ! -L "$startup" ]] && IFS= read -r writer_pid < "$startup"; then break; fi
+        sleep 0.01
+    done
+    [[ "$writer_pid" =~ ^[1-9][0-9]*$ ]] || exit 3
+    writer_group=$(ps -o pgid= -p "$writer_pid") || exit 3
+    writer_group="${writer_group//[[:space:]]/}"
+    [[ "$writer_group" == "$writer_pid" ]] || { _log_error 'Cannot isolate the installation writer'; exit 3; }
+    writer_host=$(uname -n) || exit 3
+    writer_host_hex=$(printf '%s' "$writer_host" | od -An -tx1 | tr -d '[:space:]') || exit 3
+    if [[ "$_INSTALL_PLATFORM" == linux/* ]]; then
+        process_scope=$(readlink /proc/self/ns/pid) || {
+            _log_error 'Linux installation custody requires procfs PID namespace identity'; exit 3;
+        }
+        [[ "$process_scope" =~ ^pid:\[[0-9]+\]$ ]] || exit 3
+    fi
     [[ ${#sources[@]} -eq ${#_INSTALL_NAMES[@]} && ${#sources[@]} -gt 0 ]] || exit 1
     for path in "${sources[@]}"; do
         [[ -f "$path" && ! -L "$path" && -s "$path" ]] || exit 1
@@ -2600,86 +4022,226 @@ _install_family_transaction() {
             _log_error "Install directory is a dangling or unusable symlink: $original_dir"; exit 1;
         }
     fi
-    # Gather every replacement decision before creating files in the prefix.
+    mkdir -p -- "$dest_dir" || exit 1
+    dest_dir=$(CDPATH='' cd -P -- "$dest_dir" && pwd -P) || exit 1
+    if ! directory_identity=$(_install_lock_identity "$dest_dir"); then
+        _log_error "stat cannot identify the installation directory; refusing unprotected replacement: $dest_dir"
+        exit 3
+    fi
+    install_lock="$dest_dir/.dsr-install.lock"
+    lock_owner="pid=$writer_pid tool=$TOOL_NAME token=$RANDOM-$RANDOM-$RANDOM"
+    _finish_family_transaction() {
+        local status=$? restore_index restore_name current_record failed=false outcome=rolled-back
+        trap - EXIT
+        # Keep ownership through restoration even if the caller repeats TERM.
+        trap '' HUP INT TERM
+        if $lock_held; then
+            if [[ -z "$owner_identity" ]]; then
+                # Setup failed before a complete owner record. Remove only an
+                # empty directory whose identity is still ours; never recurse.
+                if [[ -n "$lock_identity" && ! -L "$install_lock" &&
+                      "$(_install_lock_identity "$install_lock")" == "$lock_identity" ]]; then
+                    rmdir -- "$install_lock" 2>/dev/null ||
+                        _log_error "Incomplete installation lock retained for inspection: $install_lock"
+                fi
+                exit "$status"
+            fi
+            if ! _install_lock_owned "$install_lock" "$lock_identity" "$owner_identity" "$lock_owner"; then
+                _log_error "Installation lock ownership changed; refusing uncoordinated rollback or cleanup"
+                [[ -z "$stage" ]] || _log_error "Recovery files retained at: $stage"
+                exit 1
+            fi
+        fi
+        if ! $committed; then
+            # Inspect the complete family before restoring its first member.
+            # An independent edit must not be overwritten by our error handler.
+            restore_index=0
+            while ((touched > 0 && restore_index < ${#originals[@]})); do
+                restore_name="${_INSTALL_NAMES[$restore_index]}"
+                current_record=$(_install_destination_record "$dest_dir/$restore_name") || failed=true
+                if [[ "$current_record" != "${originals[$restore_index]}" &&
+                      "$current_record" != "${candidates[$restore_index]}" &&
+                      "$current_record" != "${restorations[$restore_index]}" ]]; then failed=true; fi
+                if [[ "${originals[$restore_index]}" != null ]]; then
+                    [[ "$(_install_file_record "$stage/old/$restore_name")" == "${backups[$restore_index]}" &&
+                       "$(_install_file_record "$stage/restore/$restore_name")" == "${restorations[$restore_index]}" ]] || failed=true
+                fi
+                restore_index=$((restore_index + 1))
+            done
+            if $failed; then
+                _log_error "Install destination changed outside this transaction; preserving family and recovery evidence: $stage"
+                exit 1
+            fi
+            restore_index=$((touched - 1))
+            while ((restore_index >= 0)); do
+                restore_name="${_INSTALL_NAMES[$restore_index]}"
+                current_record=$(_install_destination_record "$dest_dir/$restore_name") || { failed=true; break; }
+                if [[ "$current_record" == "${originals[$restore_index]}" ||
+                      "$current_record" == "${restorations[$restore_index]}" ]]; then
+                    restore_index=$((restore_index - 1))
+                    continue
+                elif [[ "$current_record" != "${candidates[$restore_index]}" ]]; then
+                    failed=true
+                    break
+                elif [[ "${previous[$restore_index]}" == true ]]; then
+                    [[ "$(_install_file_record "$stage/restore/$restore_name")" == "${restorations[$restore_index]}" ]] || { failed=true; break; }
+                    mv -f -- "$stage/restore/$restore_name" "$dest_dir/$restore_name" || { failed=true; break; }
+                else
+                    rm -f -- "$dest_dir/$restore_name" || { failed=true; break; }
+                fi
+                restore_index=$((restore_index - 1))
+            done
+        else
+            outcome=committed
+        fi
+        if $failed; then
+            _log_error "Could not restore every previous binary; recovery files and installation lock retained: $stage"
+            exit 1
+        fi
+        if [[ -n "$journal_hash" ]]; then
+            # A complete marker is written only after all replacements or all
+            # restorations finished. It makes cleanup interruption recoverable.
+            if ! (umask 077; printf '%s\n%s\n' "$outcome" "$journal_hash" > "$install_lock/completion.pending") ||
+               ! mv -- "$install_lock/completion.pending" "$install_lock/completion"; then
+                _log_error "Cannot record completed installation; recovery evidence retained: $stage"
+                exit 1
+            fi
+        fi
+        if $lock_held; then
+            if ! _install_lock_owned "$install_lock" "$lock_identity" "$owner_identity" "$lock_owner"; then
+                _log_error "Could not release the owned installation lock; inspect before retrying: $install_lock"
+                exit 1
+            fi
+            if [[ -n "$stage" ]]; then
+                # Retire the common lock atomically before deleting backups.
+                # A killed cleanup cannot strand an active lock with no journal.
+                if [[ "$(_install_lock_identity "$stage")" != "$stage_identity" || -e "$stage/lock" || -L "$stage/lock" ]] ||
+                   ! mv -- "$install_lock" "$stage/lock" ||
+                   ! _install_lock_owned "$stage/lock" "$lock_identity" "$owner_identity" "$lock_owner"; then
+                    _log_error "Cannot retire installation custody; evidence retained: $stage"
+                    exit 1
+                fi
+            elif ! rm -- "$install_lock/owner" || ! rmdir -- "$install_lock"; then
+                _log_error "Could not release the owned installation lock; inspect before retrying: $install_lock"
+                exit 1
+            fi
+        fi
+        [[ -z "$stage" ]] || rm -rf -- "$stage"
+        exit "$status"
+    }
+    trap _finish_family_transaction EXIT
+    # Record signals during the few setup commands, then handle cancellation
+    # once ownership can be released safely. Do not silently ignore a signal.
+    trap 'lock_setup_interrupted=true' HUP INT TERM
+    # One backend for every installer/PATH. Portable mkdir provides exclusion
+    # on macOS and FreeBSD too; a flock fallback would split the writer set.
+    if ! (umask 077; mkdir -- "$install_lock") 2>/dev/null; then
+        if [[ ! -e "$install_lock" && ! -L "$install_lock" ]]; then
+            _log_error "Cannot create the installation lock; check directory permissions and free space: $dest_dir"
+            exit 1
+        fi
+        _log_error "Installation directory is busy or its lock needs inspection: $install_lock"
+        _log_info 'Wait for the active installer to finish, then retry.'
+        _log_info 'If it stopped unexpectedly, run this installer with --recover --yes and the same --dir; --yes alone does not steal locks.'
+        exit 2
+    fi
+    lock_held=true
+    lock_identity=$(_install_lock_identity "$install_lock") || {
+        _log_error "Cannot identify the new installation lock; inspect before retrying: $install_lock"
+        exit 1
+    }
+    (umask 077; printf '%s\n' "$lock_owner" > "$install_lock/owner") || exit 1
+    owner_identity=$(_install_lock_identity "$install_lock/owner") || {
+        _log_error "Cannot identify the installation lock owner; inspect before retrying: $install_lock"
+        exit 1
+    }
+    trap 'exit 5' HUP INT TERM
+    $lock_setup_interrupted && exit 5
+    _install_lock_owned "$install_lock" "$lock_identity" "$owner_identity" "$lock_owner" || exit 1
+    # Foreground consent is bound to the exact observed files. Recheck it
+    # under the common writer lock before staging any replacement.
     for name in "${_INSTALL_NAMES[@]}"; do
         path="$dest_dir/$name"
         [[ ! -L "$path" && ( ! -e "$path" || -f "$path" ) ]] || {
             _log_error "Refusing a linked or non-regular install destination: $path"; exit 1;
         }
+        if [[ -f "$path" ]]; then
+            original_identity=$(_install_lock_identity "$path") || exit 1
+            case "$original_identities" in
+                *"|$original_identity|"*) _log_error 'Two installed family members share an inode; separate them before replacement'; exit 4 ;;
+            esac
+            original_identities+="$original_identity|"
+        fi
         if [[ -f "$path" ]] && ! $_AUTO_YES; then
-            if $_NON_INTERACTIVE; then
-                _log_error "Binary already exists at $path"
-                _log_info "Use --yes to overwrite or remove it manually"
+            if [[ "${_INSTALL_APPROVALS[$index]:-}" != "$(_install_file_record "$path")" ]]; then
+                _log_error "Install destination changed after overwrite consent; retry: $path"
                 exit 1
             fi
-            _log_warn "Binary already exists: $path"
-            local response=""
-            if ! read -rp "Overwrite? [y/N] " response < /dev/tty 2>/dev/null; then
-                _log_error "No terminal to confirm replacing $path"
-                _log_info "Re-run with --yes to replace it"
-                exit 1
-            fi
-            if [[ ! "$response" =~ ^[yY] ]]; then
-                _log_info "Installation cancelled"
-                exit 1
-            fi
-        fi
-    done
-    mkdir -p -- "$dest_dir" || exit 1
-    stage=$(mktemp -d "$dest_dir/.${BINARY_NAME}.install.XXXXXXXX") || exit 1
-    _finish_family_transaction() {
-        local status=$? restore_index restore_name failed=false
-        trap - EXIT
-        # Finish restoration even if the caller repeats an interrupt while
-        # backups are being moved back into place.
-        trap '' HUP INT TERM
-        if ! $committed; then
-            restore_index=$((touched - 1))
-            while ((restore_index >= 0)); do
-                restore_name="${_INSTALL_NAMES[$restore_index]}"
-                if [[ "${previous[$restore_index]}" == true ]]; then
-                    mv -f -- "$stage/old/$restore_name" "$dest_dir/$restore_name" || failed=true
-                else
-                    rm -f -- "$dest_dir/$restore_name" || failed=true
-                fi
-                restore_index=$((restore_index - 1))
-            done
-        fi
-        if $failed; then
-            _log_error "Could not restore every previous binary; recovery files retained at: $stage"
+        elif ! $_AUTO_YES && [[ "${_INSTALL_APPROVALS[$index]:-absent}" != absent ]]; then
+            _log_error "Install destination disappeared after overwrite consent; retry: $path"
             exit 1
         fi
-        rm -rf -- "$stage"
-        exit "$status"
-    }
-    trap _finish_family_transaction EXIT
-    trap 'exit 5' HUP INT TERM
-    mkdir -- "$stage/new" "$stage/old" || exit 1
+        index=$((index + 1))
+    done
+    stage=$(umask 077; mktemp -d "$dest_dir/.${BINARY_NAME}.install.XXXXXXXX") || exit 1
+    stage_identity=$(_install_lock_identity "$stage") || exit 1
+    (umask 077; mkdir -- "$stage/new" "$stage/old" "$stage/restore") || exit 1
+    # Unix paths are bytes and need not be UTF-8. Hex keeps journal JSON valid
+    # and binds their exact spelling without requiring Python during install.
+    directory_hex=$(printf '%s' "$dest_dir" | od -An -tx1 | tr -d '[:space:]') || exit 1
+    journal='{"schema_version":1,"tool":"'"$(_json_escape_str "$TOOL_NAME")"'","repository":"'"$(_json_escape_str "$REPO")"'","platform":"'"$(_json_escape_str "$_INSTALL_PLATFORM")"'","directory_hex":"'"$directory_hex"'","directory_identity":"'"$directory_identity"'","lock_identity":"'"$lock_identity"'","owner_identity":"'"$owner_identity"'","owner":"'"$(_json_escape_str "$lock_owner")"'","process_group":'"$writer_pid"',"process_scope":"'"$process_scope"'","hostname_hex":"'"$writer_host_hex"'","stage":"'"${stage##*/}"'","stage_identity":"'"$stage_identity"'","members":['
+    index=0
     for name in "${_INSTALL_NAMES[@]}"; do
         cp -- "${sources[$index]}" "$stage/new/$name" || exit 1
         chmod 755 "$stage/new/$name" || exit 1
         [[ "$(_file_sha256 "$stage/new/$name")" == "${hashes[$index]}" ]] || exit 1
+        _installer_validate_executable "$stage/new/$name" "$_INSTALL_PLATFORM" || exit $?
+        candidate_record=$(_install_file_record "$stage/new/$name") || exit 1
         path="$dest_dir/$name"
         if [[ -f "$path" && ! -L "$path" ]]; then
+            original_record=$(_install_file_record "$path") || exit 1
             cp -p -- "$path" "$stage/old/$name" || exit 1
             previous_hash=$(_file_sha256 "$path") || exit 1
             backup_hash=$(_file_sha256 "$stage/old/$name") || exit 1
             [[ "$previous_hash" == "$backup_hash" ]] || exit 1
+            backup_record=$(_install_file_record "$stage/old/$name") || exit 1
+            cp -p -- "$stage/old/$name" "$stage/restore/$name" || exit 1
+            rollback_record=$(_install_file_record "$stage/restore/$name") || exit 1
+            [[ "$(_install_file_record "$path")" == "$original_record" &&
+               "${original_record#*,\"mode\":}" == "${backup_record#*,\"mode\":}" &&
+               "${original_record#*,\"mode\":}" == "${rollback_record#*,\"mode\":}" ]] || exit 1
             previous+=(true)
         elif [[ ! -e "$path" && ! -L "$path" ]]; then
+            original_record=null; backup_record=null; rollback_record=null
             previous+=(false)
         else
             exit 1
         fi
         receipt+="$separator"'{"name":"'"$(_json_escape_str "$name")"'","path":"'"$(_json_escape_str "$original_dir/$name")"'","sha256":"'"${hashes[$index]}"'","size_bytes":'"${sizes[$index]}"'}'
+        journal+="$separator"'{"name":"'"$name"'","original":'"$original_record"',"backup":'"$backup_record"',"rollback":'"$rollback_record"',"candidate":'"$candidate_record"'}'
+        originals+=("$original_record"); candidates+=("$candidate_record"); backups+=("$backup_record"); restorations+=("$rollback_record")
         separator=,
         index=$((index + 1))
     done
     receipt+=']'
+    journal+=']}'
+    (umask 077; printf '%s\n' "$journal" > "$install_lock/journal.pending") || exit 1
+    mv -- "$install_lock/journal.pending" "$install_lock/journal.json" || exit 1
+    journal_hash=$(_file_sha256 "$install_lock/journal.json") || exit 1
     index=0
     for name in "${_INSTALL_NAMES[@]}"; do
+        [[ "$(_install_destination_record "$dest_dir/$name")" == "${originals[$index]}" ]] || {
+            _log_error "Install destination changed during staging; preserving it: $name"; exit 1;
+        }
+        index=$((index + 1))
+    done
+    index=0
+    for name in "${_INSTALL_NAMES[@]}"; do
+        _install_lock_owned "$install_lock" "$lock_identity" "$owner_identity" "$lock_owner" || exit 1
         path="$dest_dir/$name"
-        [[ ! -L "$path" && ( ! -e "$path" || -f "$path" ) ]] || exit 1
+        [[ "$(_install_destination_record "$path")" == "${originals[$index]}" ]] || {
+            _log_error "Install destination changed before replacement; preserving it: $name"; exit 1;
+        }
         touched=$((index + 1))
         mv -f -- "$stage/new/$name" "$path" || exit 1
         index=$((index + 1))
@@ -2704,19 +4266,81 @@ _install_family_transaction() {
 }
 
 _install_binaries() {
-    local receipt receipt_file family_pid='' previous_traps interrupted=false status=0
+    local receipt receipt_file family_pid='' previous_traps interrupted=false status=0 monitor=false cancel_guard=''
+    local name path approval response
+    _INSTALL_APPROVALS=()
+    # A job-control process group must not read a foreground terminal. Obtain
+    # consent here, then let the writer validate the exact files under lock.
+    if ! $_AUTO_YES; then
+        for name in "${_INSTALL_NAMES[@]}"; do
+            path="$_INSTALL_DIR/$name"
+            if [[ -f "$path" && ! -L "$path" ]]; then
+                if $_NON_INTERACTIVE; then
+                    _log_error "Binary already exists at $path"
+                    _log_info 'Use --yes to overwrite or remove it manually'
+                    return 1
+                fi
+                approval=$(_install_file_record "$path") || return 1
+                _log_warn "Binary already exists: $path"
+                response=''
+                printf 'Overwrite? [y/N] ' >&2
+                if ! read -r response < /dev/tty 2>/dev/null; then
+                    _log_error "No terminal to confirm replacing $path; re-run with --yes"
+                    return 1
+                fi
+                [[ "$response" =~ ^[yY] ]] || { _log_info 'Installation cancelled'; return 1; }
+                _INSTALL_APPROVALS+=("$approval")
+            elif [[ ! -e "$path" && ! -L "$path" ]]; then
+                _INSTALL_APPROVALS+=(absent)
+            else
+                _log_error "Refusing a linked or non-regular install destination: $path"
+                return 1
+            fi
+        done
+    fi
     receipt_file=$(mktemp "$_TEMP_DIR/install-family.XXXXXXXX") || return 1
     previous_traps=$(trap -p HUP INT TERM)
     # Sending TERM to only this installer PID must also stop its transaction.
     # Wait for the child's rollback before restoring the caller's handlers.
-    trap 'interrupted=true; if [[ -n "$family_pid" ]]; then kill -TERM "$family_pid" 2>/dev/null || true; fi' HUP INT TERM
-    _install_family_transaction "$_INSTALL_DIR" "${_INSTALL_PATHS[@]}" > "$receipt_file" &
+    trap 'interrupted=true; if [[ -n "$family_pid" ]]; then kill -TERM -- "-$family_pid" 2>/dev/null || true; fi' HUP INT TERM
+    case $- in *m*) monitor=true ;; esac
+    set -m
+    _install_family_transaction "$_INSTALL_DIR" "$receipt_file.writer" "${_INSTALL_PATHS[@]}" > "$receipt_file" &
     family_pid=$!
-    if $interrupted; then kill -TERM "$family_pid" 2>/dev/null || true; fi
+    $monitor || set +m
+    if ! (umask 077; set -C; printf '%s\n' "$family_pid" > "$receipt_file.writer"); then
+        kill -TERM -- "-$family_pid" 2>/dev/null || true
+        interrupted=true
+    fi
+    if $interrupted; then kill -TERM -- "-$family_pid" 2>/dev/null || true; fi
     wait "$family_pid" || status=$?
     if $interrupted; then
         trap '' HUP INT TERM
+        # Give ordinary rollback time to finish, but do not let a utility
+        # that ignores TERM defer the writer's trap indefinitely. A forced
+        # stop leaves the immutable journal for explicit recovery.
+        set -m
+        (
+            set +m
+            timer=''
+            _install_stop_cancel_guard() {
+                trap '' HUP INT TERM
+                [[ -z "$timer" ]] || kill "$timer" 2>/dev/null || true
+                [[ -z "$timer" ]] || wait "$timer" 2>/dev/null || true
+                exit 0
+            }
+            trap _install_stop_cancel_guard HUP INT TERM
+            sleep 5 & timer=$!
+            wait "$timer" || exit 0
+            if kill -0 "$family_pid" 2>/dev/null; then
+                kill -KILL -- "-$family_pid" 2>/dev/null || true
+            fi
+        ) &
+        cancel_guard=$!
+        $monitor || set +m
         wait "$family_pid" 2>/dev/null || true
+        kill -TERM "$cancel_guard" 2>/dev/null || true
+        wait "$cancel_guard" 2>/dev/null || true
         status=5
     fi
     trap - HUP INT TERM
@@ -2724,6 +4348,440 @@ _install_binaries() {
     ((status == 0)) || return "$status"
     receipt=$(cat -- "$receipt_file") || return 1
     _INSTALLED_BINARIES_JSON="$receipt"
+}
+
+# Recovery is an explicit local operation, before release discovery or source
+# execution. Python supplies directory-relative, no-follow operations and a
+# kernel lease between recoverers; ordinary installation remains Bash-only.
+_recover_installation() {
+    command -v python3 >/dev/null 2>&1 || { _log_error 'Python 3 is required for --recover'; return 3; }
+    local result status=0
+    result=$(python3 -I - "$_INSTALL_DIR" "$TOOL_NAME" "$REPO" "$_INSTALL_PLATFORM" "$BINARY_NAME" "$_JSON_MODE" "${_INSTALL_NAMES[@]}" <<'DSR_INSTALL_RECOVERY_PY'
+import hashlib
+import json
+import os
+import re
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import uuid
+
+os.umask(0o077)
+directory, tool, repository, platform, primary, json_mode = sys.argv[1:7]
+names = sys.argv[7:]
+descriptors = []
+chain = []
+leases = []
+changed = []
+evidence = ''
+outcome = 'refused'
+recovered = False
+
+
+class Refusal(Exception):
+    def __init__(self, message, code=4):
+        super().__init__(message)
+        self.code = code
+
+
+def need(condition, message, code=4):
+    if not condition:
+        raise Refusal(message, code)
+
+
+def stop(signum, frame):
+    raise Refusal('Recovery interrupted; retained evidence permits another --recover --yes', 5)
+
+
+def held(fd):
+    descriptors.append(fd)
+    return fd
+
+
+def identity(info):
+    return '%s:%s' % (info.st_dev, info.st_ino)
+
+
+def fingerprint(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+            info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def entry(parent, name):
+    try:
+        return os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def open_directory(parent, name, expected=None, private=False):
+    fd = held(os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent))
+    info = os.fstat(fd)
+    need(expected is None or identity(info) == expected, 'Directory identity changed: ' + name)
+    if private:
+        need(info.st_uid == os.geteuid() and not stat.S_IMODE(info.st_mode) & 0o022,
+             'Recovery directory has unsafe ownership or permissions: ' + name)
+    chain.append((parent, name, fd, identity(info)))
+    return fd
+
+
+def custody():
+    for parent, name, fd, expected in chain:
+        info = entry(parent, name)
+        need(info is not None and stat.S_ISDIR(info.st_mode) and
+             identity(info) == expected == identity(os.fstat(fd)),
+             'Recovery directory moved or was replaced: ' + name)
+    for parent, name, fd, expected in leases:
+        info = entry(parent, name)
+        need(info is not None and stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and
+             info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o600 and
+             identity(info) == expected == identity(os.fstat(fd)),
+             'Recovery lease owner was replaced or changed')
+
+
+def read_file(parent, name, limit, private=False):
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+    try:
+        before = os.fstat(fd)
+        need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and before.st_size <= limit,
+             'Invalid recovery metadata: ' + name)
+        if private:
+            need(before.st_uid == os.geteuid() and stat.S_IMODE(before.st_mode) == 0o600,
+                 'Recovery metadata has unsafe ownership or permissions: ' + name)
+        chunks = []
+        remaining = limit + 1
+        while remaining:
+            chunk = os.read(fd, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        value = b''.join(chunks)
+        need(len(value) <= limit and fingerprint(before) == fingerprint(os.fstat(fd)) and
+             fingerprint(before) == fingerprint(os.stat(name, dir_fd=parent, follow_symlinks=False)),
+             'Recovery metadata changed during inspection: ' + name)
+        return value, identity(before)
+    finally:
+        os.close(fd)
+
+
+def file_record(parent, name):
+    if entry(parent, name) is None:
+        return None
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+    try:
+        before = os.fstat(fd)
+        need(stat.S_ISREG(before.st_mode), 'Linked or non-regular family member: ' + name)
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        need(fingerprint(before) == fingerprint(os.fstat(fd)) and
+             fingerprint(before) == fingerprint(os.stat(name, dir_fd=parent, follow_symlinks=False)),
+             'Family member changed during inspection: ' + name)
+        return {'identity': identity(before), 'nlink': before.st_nlink, 'mode': stat.S_IMODE(before.st_mode),
+                'uid': before.st_uid, 'gid': before.st_gid, 'size': before.st_size, 'sha256': digest.hexdigest()}
+    finally:
+        os.close(fd)
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        need(key not in result, 'Duplicate recovery journal field')
+        result[key] = value
+    return result
+
+
+def record_valid(value):
+    return (isinstance(value, dict) and set(value) == {'identity', 'nlink', 'mode', 'uid', 'gid', 'size', 'sha256'} and
+            isinstance(value['identity'], str) and re.fullmatch(r'[0-9]+:[0-9]+', value['identity']) and
+            isinstance(value['sha256'], str) and re.fullmatch(r'[0-9a-f]{64}', value['sha256']) and
+            all(type(value[key]) is int and value[key] >= 0 for key in ('nlink', 'mode', 'uid', 'gid', 'size')) and
+            value['nlink'] > 0 and value['mode'] <= 0o7777)
+
+
+def contents(value):
+    return {key: value[key] for key in ('mode', 'uid', 'gid', 'size', 'sha256')}
+
+
+def inactive_group(group):
+    try:
+        os.killpg(group, 0)
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        raise Refusal('The original installation process group is still active or inaccessible', 2)
+    # Zombies cannot perform a delayed rename. A complete ps census lets
+    # recovery work even when an init process is slow to reap killed children.
+    observed = subprocess.run(['ps', '-axo', 'pid=,pgid=,stat='], stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True, timeout=5)
+    need(observed.returncode == 0, 'Cannot inspect the original installation process group', 2)
+    members = []
+    for line in observed.stdout.splitlines():
+        fields = line.split()
+        need(len(fields) == 3 and fields[0].isdigit() and fields[1].isdigit() and fields[2],
+             'Incomplete process observation; installation recovery withheld', 2)
+        if int(fields[1]) == group:
+            members.append(fields[2])
+    need(members and all(value.startswith('Z') for value in members),
+         'The original installation writer or a descendant is still active; wait before recovery', 2)
+
+
+def run():
+    global directory, evidence, outcome, recovered
+    try:
+        import fcntl
+    except ImportError:
+        raise Refusal('Installation recovery requires Unix Python 3 with fcntl', 3)
+    directory = os.path.realpath(directory)
+    need(os.path.isabs(directory) and os.path.isdir(directory), 'Recovery requires an existing installation directory')
+    parent = held(os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW))
+    for component in directory.split('/')[1:]:
+        if component:
+            parent = open_directory(parent, component)
+    prefix = parent
+    guard_name = '.dsr-install.lock'
+    if entry(prefix, guard_name) is None:
+        outcome = 'nothing-to-recover'
+        return []
+    guard = open_directory(prefix, guard_name, private=True)
+    guard_identity = identity(os.fstat(guard))
+    evidence = directory + '/' + guard_name
+    owner, owner_identity = read_file(guard, 'owner', 4096, private=True)
+    raw, journal_identity = read_file(guard, 'journal.json', 64 * 1024 * 1024, private=True)
+    journal = json.loads(raw, object_pairs_hook=unique_object)
+    journal_hash = hashlib.sha256(raw).hexdigest()
+    keys = {'schema_version', 'tool', 'repository', 'platform', 'directory_hex', 'directory_identity', 'lock_identity',
+            'owner_identity', 'owner', 'process_group', 'process_scope', 'hostname_hex', 'stage', 'stage_identity', 'members'}
+    need(isinstance(journal, dict) and set(journal) == keys and type(journal['schema_version']) is int and
+         journal['schema_version'] == 1, 'Unsupported or incomplete installation journal')
+    need(all(isinstance(journal[key], str) and re.fullmatch(r'[0-9]+:[0-9]+', journal[key])
+             for key in ('directory_identity', 'lock_identity', 'owner_identity', 'stage_identity')),
+         'Invalid installation directory or owner identity')
+    need(journal['tool'] == tool and journal['repository'] == repository and journal['platform'] == platform and
+         journal['directory_hex'] == os.fsencode(directory).hex() and journal['directory_identity'] == identity(os.fstat(prefix)) and
+         journal['lock_identity'] == guard_identity and journal['owner_identity'] == owner_identity and
+         isinstance(journal['owner'], str) and owner == (journal['owner'] + '\n').encode() and
+         journal['hostname_hex'] == os.fsencode(socket.gethostname()).hex(), 'Installation journal belongs to another directory, tool, platform, host or owner')
+    group = journal['process_group']
+    need(type(group) is int and 1 < group <= 2147483647 and
+         re.fullmatch(r'pid=' + str(group) + r' tool=' + re.escape(tool) + r' token=[0-9]+-[0-9]+-[0-9]+', journal['owner']),
+         'Invalid installation writer identity')
+    scope = os.readlink('/proc/self/ns/pid') if platform.startswith('linux/') else 'global'
+    need(journal['process_scope'] == scope, 'Recovery must run in the original installation PID namespace')
+    inactive_group(group)
+    stage_name = journal['stage']
+    need(isinstance(stage_name, str) and re.fullmatch(r'\.' + re.escape(primary) + r'\.install\.[A-Za-z0-9]{8}', stage_name),
+         'Unsafe installation stage name')
+    completed = None
+    completion_record = None
+    if entry(guard, 'completion') is not None:
+        completion_record = read_file(guard, 'completion', 256, private=True)
+        value = completion_record[0]
+        for phase in ('committed', 'rolled-back'):
+            if value == (phase + '\n' + journal_hash + '\n').encode():
+                completed = phase
+        need(completed is not None, 'Completion marker contradicts the installation journal')
+    original_stage = entry(prefix, stage_name)
+    archived_stage = entry(guard, 'evidence')
+    need((original_stage is None) != (archived_stage is None), 'Installation evidence is missing or ambiguous')
+    stage_parent, stage_entry = (prefix, stage_name) if original_stage is not None else (guard, 'evidence')
+    stage = open_directory(stage_parent, stage_entry, journal['stage_identity'], private=True)
+    need(set(os.listdir(stage)) == {'new', 'old', 'restore'}, 'Installation stage contains unrecognized resources')
+    new = open_directory(stage, 'new', private=True)
+    old = open_directory(stage, 'old', private=True)
+    restore = open_directory(stage, 'restore', private=True)
+    members = journal['members']
+    need(isinstance(members, list) and len(members) == len(names) and
+         all(isinstance(member, dict) and set(member) == {'name', 'original', 'backup', 'rollback', 'candidate'} for member in members) and
+         [member['name'] for member in members] == names and len(set(names)) == len(names),
+         'Journal executable family differs from this installer')
+    pins = set()
+    for member in members:
+        need(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]*', member['name']) and '..' not in member['name'], 'Unsafe executable name')
+        candidate = member['candidate']
+        need(record_valid(candidate) and candidate['nlink'] == 1 and candidate['mode'] == 0o755,
+             'Invalid candidate executable record')
+        if member['original'] is None:
+            need(member['backup'] is None and member['rollback'] is None, 'Absent executable has unexpected backup records')
+        else:
+            need(all(record_valid(member[key]) for key in ('original', 'backup', 'rollback')) and
+                 member['backup']['nlink'] == member['rollback']['nlink'] == 1 and
+                 contents(member['original']) == contents(member['backup']) == contents(member['rollback']),
+                 'Backup records contradict the original executable')
+        for key in ('original', 'candidate', 'backup', 'rollback'):
+            value = member[key]
+            if value is not None:
+                need(value['identity'] not in pins, 'Two staged executable records share an identity')
+                pins.add(value['identity'])
+
+    recovery_receipt = json.dumps({'schema_version': 1, 'outcome': 'committed' if completed == 'committed' else 'rolled-back',
+                                  'journal_sha256': journal_hash}, sort_keys=True).encode() + b'\n'
+
+    def inspect():
+        custody()
+        need(set(os.listdir(guard)) <= {'owner', 'journal.json', 'completion', 'completion.pending',
+                                       'evidence', 'recovery-result.json', 'recovery-result.pending'},
+             'Installation lock contains unrecognized resources')
+        need(read_file(guard, 'owner', 4096, private=True) == (owner, owner_identity) and
+             read_file(guard, 'journal.json', 64 * 1024 * 1024, private=True) == (raw, journal_identity),
+             'Installation owner or journal changed during recovery')
+        observed_completion = read_file(guard, 'completion', 256, private=True) if entry(guard, 'completion') is not None else None
+        need(observed_completion == completion_record, 'Installation completion marker changed during recovery')
+        if entry(guard, 'completion.pending') is not None:
+            pending, _ = read_file(guard, 'completion.pending', 256, private=True)
+            need(any((phase + '\n' + journal_hash + '\n').encode().startswith(pending) for phase in ('committed', 'rolled-back')),
+                 'Unexpected pending installation completion record')
+        if entry(guard, 'recovery-result.json') is not None:
+            need(read_file(guard, 'recovery-result.json', 4096, private=True)[0] == recovery_receipt,
+                 'Conflicting prior recovery receipt')
+        if entry(guard, 'recovery-result.pending') is not None:
+            pending, _ = read_file(guard, 'recovery-result.pending', 4096, private=True)
+            need(recovery_receipt.startswith(pending), 'Unexpected pending recovery receipt')
+        for fd in (new, old, restore):
+            need(set(os.listdir(fd)) <= set(names), 'Staged family contains unrelated files')
+        states = []
+        for member in members:
+            name = member['name']
+            current = file_record(prefix, name)
+            if current == member['original']:
+                state = 'original'
+            elif current == member['candidate']:
+                state = 'candidate'
+            elif member['rollback'] is not None and current == member['rollback']:
+                state = 'rollback'
+            else:
+                raise Refusal('Installed file changed outside this transaction; preserved: ' + name)
+            staged = file_record(new, name)
+            need(staged is None or staged == member['candidate'], 'Candidate evidence changed: ' + name)
+            need(not (state == 'original' and current is not None and staged is None), 'Untouched member lost its candidate evidence: ' + name)
+            need(file_record(old, name) == member['backup'], 'Original backup changed or disappeared: ' + name)
+            replacement = file_record(restore, name)
+            need(replacement == member['rollback'] or
+                 (replacement is None and state == 'rollback'), 'Restoration copy changed or disappeared: ' + name)
+            if completed == 'committed':
+                need(state == 'candidate', 'Completed installation no longer matches its verified family')
+            elif completed == 'rolled-back':
+                need(state != 'candidate', 'Completed rollback no longer matches its previous family')
+            states.append(state)
+        inactive_group(group)
+        return states
+
+    inspect()
+    # The journal pins this immutable file's inode. Recoverers cannot split
+    # their exclusion by replacing a separate, unbound lease pathname.
+    lease = held(os.open('owner', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=guard))
+    info = os.fstat(lease)
+    need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == os.geteuid() and
+         stat.S_IMODE(info.st_mode) == 0o600 and identity(info) == owner_identity, 'Invalid installation recovery lease')
+    try:
+        fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise Refusal('Another recovery is active for this installation directory', 2)
+    leases.append((guard, 'owner', lease, owner_identity))
+    states = inspect()
+    if completed != 'committed':
+        for member, state in zip(members, states):
+            if state != 'candidate':
+                continue
+            custody()
+            inactive_group(group)
+            name = member['name']
+            need(file_record(prefix, name) == member['candidate'] and file_record(old, name) == member['backup'],
+                 'Recovery inputs changed before restoring ' + name)
+            if member['original'] is None:
+                os.unlink(name, dir_fd=prefix)
+            else:
+                need(file_record(restore, name) == member['rollback'], 'Restoration copy changed: ' + name)
+                os.replace(name, name, src_dir_fd=restore, dst_dir_fd=prefix)
+            changed.append(name)
+        outcome = 'rolled-back'
+    else:
+        outcome = 'committed'
+    final_states = inspect()
+    need(completed == 'committed' or all(state != 'candidate' for state in final_states), 'Recovery did not restore the complete family')
+    receipt = recovery_receipt
+    if entry(guard, 'recovery-result.json') is not None:
+        need(read_file(guard, 'recovery-result.json', 4096, private=True)[0] == receipt, 'Conflicting prior recovery receipt')
+    else:
+        prior_pending = None
+        if entry(guard, 'recovery-result.pending') is not None:
+            prior_pending = read_file(guard, 'recovery-result.pending', 4096, private=True)
+            need(receipt.startswith(prior_pending[0]), 'Unexpected interrupted recovery receipt')
+        flags = os.O_WRONLY | os.O_NOFOLLOW
+        if prior_pending is None:
+            flags |= os.O_CREAT | os.O_EXCL
+        pending = os.open('recovery-result.pending', flags, 0o600, dir_fd=guard)
+        try:
+            need(prior_pending is None or identity(os.fstat(pending)) == prior_pending[1], 'Pending recovery receipt changed')
+            with os.fdopen(pending, 'wb') as stream:
+                stream.write(receipt)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except BaseException:
+            raise
+        os.rename('recovery-result.pending', 'recovery-result.json', src_dir_fd=guard, dst_dir_fd=guard)
+    if stage_parent == prefix:
+        inspect()
+        os.rename(stage_name, 'evidence', src_dir_fd=prefix, dst_dir_fd=guard)
+        chain[:] = [(guard, 'evidence', fd, pin) if fd == stage else (parent_fd, name, fd, pin)
+                    for parent_fd, name, fd, pin in chain]
+    inspect()
+    inactive_group(group)
+    archive_name = '.dsr-recovered-' + uuid.uuid4().hex
+    os.mkdir(archive_name, 0o700, dir_fd=prefix)
+    archive = open_directory(prefix, archive_name, private=True)
+    custody()
+    # The new private archive owns its empty destination. Retiring the common
+    # guard is the final operation that touches the installation namespace.
+    os.rename(guard_name, 'transaction', src_dir_fd=prefix, dst_dir_fd=archive)
+    need(identity(os.stat('transaction', dir_fd=archive, follow_symlinks=False)) == guard_identity,
+         'Retired installation lock changed unexpectedly')
+    evidence = directory + '/' + archive_name + '/transaction'
+    recovered = True
+    result = []
+    for member in members:
+        current = member['candidate'] if outcome == 'committed' else member['original']
+        if current is not None:
+            result.append({'name': member['name'], 'path': directory + '/' + member['name'],
+                           'sha256': current['sha256'], 'size_bytes': current['size']})
+    return result
+
+
+for number in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+    signal.signal(number, stop)
+code = 0
+binaries = []
+try:
+    binaries = run()
+    message = 'No active installation transaction' if outcome == 'nothing-to-recover' else 'Installation recovery complete: ' + outcome
+except Refusal as error:
+    code, message = error.code, str(error)
+except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+    code, message = 4, 'Installation recovery refused; retained evidence requires inspection: ' + str(error)
+finally:
+    for fd in reversed(descriptors):
+        os.close(fd)
+print('[' + tool + '] ' + message, file=sys.stderr)
+if evidence:
+    print('[' + tool + '] Recovery evidence: ' + evidence, file=sys.stderr)
+if json_mode == 'true':
+    print(json.dumps({'tool': tool, 'status': 'success' if code == 0 else 'error', 'message': message,
+                      'version': '', 'path': directory, 'action': 'recover', 'binaries': binaries,
+                      'recovery': {'outcome': outcome, 'recovered': recovered, 'changed_names': changed, 'evidence_path': evidence}}))
+raise SystemExit(code)
+DSR_INSTALL_RECOVERY_PY
+) || status=$?
+    if [[ -n "$result" ]]; then
+        printf '%s\n' "$result"
+        _JSON_EMITTED=true
+    fi
+    return "$status"
 }
 
 _select_archive_binaries() {
@@ -2750,6 +4808,7 @@ _select_archive_binaries() {
             return 1
         fi
         [[ -f "$candidates" && ! -L "$candidates" && -s "$candidates" ]] || return 1
+        _installer_validate_executable "$candidates" "$_INSTALL_PLATFORM" || return $?
         for path in ${_INSTALL_PATHS[@]+"${_INSTALL_PATHS[@]}"}; do
             [[ "$path" != "$candidates" ]] || { _log_error "Two executable names select the same archive member"; return 1; }
         done
@@ -2764,7 +4823,7 @@ _select_archive_binaries() {
 # Skill archive is embedded at generation time as a gzip-compressed tarball
 # encoded in base64 so multi-file skill trees can be restored on install.
 # If this placeholder was not replaced, skill installation is skipped.
-_SKILL_ARCHIVE_B64='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'
+_SKILL_ARCHIVE_B64='H4sIAAAAAAAAA+1a627jxhXe33qKqdJLshUlX9fAIkrheDeJ2/V6azvIj6KIRuRImpjksDNDaxUERR+iT9gn6XfOkBQp2Zv86KIoyoNFLI3mcuZcvnOZjCfPPjodgM5OT+nv4dnpQftvTc8OT4/OXhwenp0dHD07ODw4Ojh8Jk4/PmvPnpXOSyvEM7lUuf/AvJ/7/X+UxpPbP12+eTPOko93Bin4xcnJE/o/Ojg+frGj/8OTg9Nn4uDjsbSl/3P9R1E0yGWmXorcZ4NEudjqwmuTvxRfRAMhbspcvL27EgtjRVamXkcsCOGz8r0wNl4p562kBSOxNvZeeKsxYySsmRsvMpPgs5ML5TcjbBcbYxOdVwtknojUxDIV5+8u3Vh865RYr1QuXCHXuc6Xwq2lzdxIJBpDPl7RGB0zwtnYzhSKDsfgDOzPhHTYUwQOwfCqzPA1TDJ2PKDLDj7/VRSJu+uLl+LPpY7vxS3078VP4lY5B67EdftSGH9VHS1+K25U6eQ8VeLcOeUdfvyOrnyZe5WmGqfGCmMXrTvSvnx5fLhhiVxBInyafVB0bXx+Z80PKvbY3pm0rJbdqIWytKPjL6n0KhG39zpNnYiiLwaDT1gv//rHP8Vb6C8Rd6SRK5nj9nYw+EI8f35hrBKxLORcp9pvXj5/Lu5Km4sZKW8mdO6NkAJXLWNfWpVAaSo2D5AW3bGtbRI5pBCrcdj5RslE+JXCgsKIhbbOj7H75YIHIdCl8vyb0xD8RqygmNn516/f3t0CaWakm9nN6/NXV6/pK53L+xnof64WxLYsinRDivUr7YSje48hhsJEwWB0HviGsJwgnq2GXMGssjpmycjkQTcMk4qsxHQI/QFGUnqTsYIgFEyI2H5EIt1qbqQllnigkKnyXs2CqRpczoq7by+FK+1CkmokWF3UlubGvNVX5CqSbFVFdDGW5vbEkSgs6VbMooidJHo+CwvfmjzSLUYv3lzCYTLsnEAEJUyQxEh8OZU3PLa8rh6CiO6dSLXzzUV0oVIwBG1LX7rqQtVesMRZuAnNYAfETTc8RPqMU4WPDk5vTDqubatl5LSXhu12JHrOlnMldQr10iEyKKveNVELCRPrQAJEozNNlw8SgYjoet4q5WZblpsxMR6PA+uuLApjyUcaRphd19wn2GphUh3jamlq1o6Gs3ASTFeGGW07DZpynQtEJk83jC7QRs1J5AoV6wVMz5apAmAtDJ2AA2RwBIjtk0/aiDMYzGazOQwOjnwJYwZHYgKkzOGpAggU3w/i0qYiWrjbN2K48r5wLycTK9fjpfarcl6CpdjAXHI/hpVMXmFrHA2O/Mp5k6sJRDXJpM4nOuw/dqs//PrTBEgifv8b99kQwEIMiIgQBf+UdJuIEHvAzqAKjD8Q0FzAjLEId7YEUTBNCdEwaPHUv/G1sk01hq28ygqCrOnS0AZvZJmT+YpMv4eKGNV5JQN9Z2UcT4/oj0mmh/i7zPT0kLZoYJhEPqidYGepGF7JgpUNf1uJVG7gZ2Q2mFQQupCO4bkAJQH+8vFwEMRf0A5s66W1NeKJpZXFite7jcOV2HuCdFpeh5MBAXDuaSbtfWLWOc+ovdvlsnAr40nfbASPBprBgIIfOHABUBK5ibyJ8Af3DPNTvVDxJiZoZpTPwOfLrRk9Kc7jSpxHjTgfn5rKuUrFwrJNJZUqPjh3LuP77VTRclZeJpNd/VRn7/6wfzJpn6cSiAUeGLi2y3jwQav1ztCPxmStzY/Dgd4DkHdmNmi/M16BfmuUNQf9LMq0kgVMETidu5+VPz5lhRdDjpgNsgSb4sQDiqUgsWGLGj6+ixU4OY2wIL5/fAaBTBItIfr8KUaAYyaXUwmr0747puGsbE7KvnxK4zh8icyC8WHqMmKdNfqiUtdJY9+Np9Ild1KmweAbvVxFqaIsA65DgRoT8AlRPkd69APycTHj4wG/KTQ+42A3FncM4Qj9hVnDq+FSAPCyYHwfbExJoXJOAQwJAMXpOmVsdCXWwE1sUTFUu1UFD6QlyTyOd3S6CzOE1MMLQujCIFwHXZYI01b/iPyFgi/kOh4+vrqQuYKvDK/X+RaoMr0MMNBexcbDq7brh7ebPEZgE4TrfDIFF0tRNF8gsvmnzo0FZxa5TCd04oTiGaVHS0O2yX4UMq1yHrDu8W08coT34OwBNZN2rlTTYa5JJbz7kKBQQ7ZPnfW4SGprsqZExJALpCEUBId38l5tZRQialQWTwgW+gYez7FF9SVibFXLzRShDLORTG8GvBZpLvIhtwWXeoCMatfXyC8XnC0007dDvKDrenXo205vRqrZIQBVt2AjbOJl65D9n7rLa1Cy7E1pbcckjXokVCkIQrAwdoIxO1ws8yaQk93oZVlVO4DgbDD7+2QchjmDCClWe3NOwGfj5kdGfFR5JuQt22Qr5PID8FFmlMtXKZ8LydBe7TQYEHcMBEhhc6BNgAMkG3AaRHNKIugSl56TL647ojjF/iEeO5WquMlIMayX+SNRshW7H4nlcwRe21Y+kkVlvdt+d4pAVAz/+N0dm+Zw+xOQFNpp2X+h2Qdq2+dJuXq/taOQZAS7DBx3wQZ1A6Pvvik/sWKOaOKmcxsdHh2P+M8J7UPZ+BRArd43ltOqH1iPnCkTkq4lYI10gbPXYE/M5g+1DSBBqdMjva2to4XV4AuJMaVCY94dqSotFNsyZ3tCnS4DSzfhODKakG+pfAkY/x3MQHIZFDoJwIai9MFy9oqPm1C3boIF5XAT9Z7yPc7wqVoDtOQJmWCn2mAnR6CA+/t0s2MlGVUuj4P/TcDcGuqZhTpxZPxbmLiskZj30fncvN/JM7ZV2u4JQVuuNQtb72U64RfIO6Y6EzWaa+Us4oTyMURUJYahhseluawMXDVyQK75aGrVnpDAP9tc7k1oos/unG2UdPKhzV6UiWFV6lvt7jcNrg13F3YFtPsr1aW0SXeC11kod7cYXI8wiH5eg6tOvuCfEfq4UVG7NvkshAYDZUNRMKCKM1km2odddpmSgCz3pCzAaZntZZWXTbVquO3Wzii7hh4x3D1pOVzI1JuFucHduhWv9h8uFLoZ/LbQ7sS+MJQpu6TmACSivj/cljeh30U+cV5g/weZuuCXhNnzUqc+AnJUPcGKvdCPkNX8pr8SWoJUpXPDh3Jog0I9ESsTQweIHNh0rv1eHh54CIbdHgkBCtUuamiu6unqK9QA7UnBrykBW5kS7n100v61KqYDYlfCZXNg122P4iY6qQvGakwllQZqtTR9oSoEsAhahlsP8BFyHgPVO+OPDCE8bKpxAl8AA8xruEZ5tax7c3MrEUuHlQ0utiG701ezCpU9nMsskO1Ixk/SX+KoFYCMxBO+AlqXlOuH7hj1XLa9KvjSbCTMXG0eP6GCcyzOKRa0WqSDQejLcs7OZfGOiuuoAiMoOgNNw1NXRtwU4ltr2KvN24PUGOgMNIViZ7Qu9jGQJSiBOPJ3ZiAHcCqI+MJkGXWkpLtvtYr4trWtP3E/ikDTtqNmbjkd3j5Sb1DbZVOoafDIziYIc5098D0iRERQnR4fdGXiEa86kwk23fT0YOf2Oo1qb+Iv1YLO0tJS6OGO2Y6OnIsC1k4/gLX1dE5pIsa7Kr+plDlF/pHvTaWUUGdVClStiEKmpFBfEEuHjy1CwrCziMcqD5oOoUTUyV4lld9cV8kP8NgUQX2eUrvDsfjSGE85WxEMeM/ejlDPUmrR+ZVS9DzEAtsMriUA43gszmO/sxfWj0RdCoVP4ZLhMwcJeicRdRYyOKEWejT/MG9CL+pOmMNiJFKAABdu/G6vcx1iTO39zctLeEZCpquodd28MHSyuO0TCGH/u7pDfVv5Q4gZCB6mSeaatyJekZThoaKuxp7yJG5wUzVNOdvZ8fEZj5LlIDsPTwYNSNdM2DIXXODUI25iuUoeb2SWUkJedQ92WkfdNjttEx0dHJ3ApA7Irk5OX0QA5qQ7ucH67fEhV/hly6k9n5cFmDJpouz0LNnJ8KsO/4ItNV/CkR5U/fBGlUrVe6iibVu5tMQB9lMVsWkE/VLX2fJLALS4/3gF6TcpxqwygaZfXGXblGtxb3ynHt3pvYQyVFDEqta77/Gj+mVd52sbGhPdtUJSywY2BalTROOglEpUJV5MRBxa3VK4TQbp3gf7pkuoSqzUh6q1Ty+nonQllzEZdZuqkmP/tjR1LN5Qp9PhcG50+t2tKGbWZXbois6ClJvXQBTMVMIN6he4+sWUiiriEsEfFSJSdkU4zh5OF0OUCO+kdCT3jvhJTcxNQnXPT+LOFIhIrWdH8RNGI2RK1X/xrdu6q16mmvbaqHJuenEkZx8JRDx6/sOxo23bTdZPp3+5uL66On/7ivqhf/3UNs+dk9b4Z3zueYOLC8WvlK2CUITWO04noCSDQYJFxjxiyJtQpJkQllerQtsGp99cf3l9F11dv3q9e37nl8DBN/yQ3OQBo7pHPBL3ajPXXFq6kMPS82DTTw0RjaowPvPV+e03X16f37zaPbL9QzixdivbuNWoMY1gx0isKveABlbV6d0eTVvWb7+6/Hpf0tUonRnMrP3OPBhEYsYuzxE+wAFXstTuIRSgXseKnidX8l5VLHAB3H4wo13mNqxmTfArSlMvheeVPIYIeeZDmMm9gEiu+bkQaRM9DcKWvP4xZMuYSroNk/m3BpOt8lYrZN+D//b/XdFTTz311FNPPfXUU0899dRTTz311FNPPfXUU0899dRTTz311FNPPfXUU0899dRTTz311FNP/1n6N95lXu0AUAAA'
 
 # Decode skill archive at runtime
 _decode_skill_archive() {
@@ -3024,6 +5083,7 @@ Options:
   -v, --version VERSION    Install specific version, e.g. 1.2.3 or v1.2.3 (default: latest)
   -d, --dir DIR            Installation directory (default: ~/.local/bin)
   -y, --yes                Replace an existing binary without asking
+  --recover               With --yes: recover a stopped installation (Python 3 required)
   --mode vibe|safe         vibe (default) also installs agent skills; safe installs
                            only the verified release binary (no skills, no source builds)
   --verify                 Verify checksums (always enabled)
@@ -3066,6 +5126,7 @@ DSR_INSTALLER_HELP
 main() {
     local prefer_stale=false stale_threshold=10 stale_threshold_set=false
     local install_mode=vibe
+    local stale_threshold_pattern='^(0|[1-9][0-9]{0,5})$'
     # Parse arguments
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -3100,8 +5161,12 @@ main() {
                 _AUTO_YES=true
                 shift
                 ;;
+            --recover)
+                _RECOVER=true
+                shift
+                ;;
             --mode)
-                [[ $# -ge 2 && "$2" =~ ^(vibe|safe)$ ]] || {
+                [[ $# -ge 2 && ( "$2" == vibe || "$2" == safe ) ]] || {
                     _log_error "--mode requires vibe or safe"
                     return 4
                 }
@@ -3166,7 +5231,7 @@ main() {
                 shift
                 ;;
             --libc)
-                [[ $# -ge 2 && "$2" =~ ^(gnu|musl)$ ]] || {
+                [[ $# -ge 2 && ( "$2" == gnu || "$2" == musl ) ]] || {
                     _log_error "--libc requires gnu or musl"
                     return 4
                 }
@@ -3184,10 +5249,23 @@ main() {
         esac
     done
 
+    if $_RECOVER; then
+        if ! $_AUTO_YES || $_FROM_SOURCE || $_ALLOW_SOURCE_BUILD || $_INSTALL_TOOLCHAIN || $_OFFLINE_MODE ||
+           $_REQUIRE_SIGNATURES || $_PREFER_GH || $prefer_stale || $stale_threshold_set ||
+           [[ -n "$_VERSION$_SOURCE_REF$_SOURCE_IF_STALE$_LIBC" || "$_SOURCE_TIMEOUT" != 3600 ]]; then
+            _log_error '--recover requires --yes and cannot be combined with release or source selection'
+            return 4
+        fi
+        # Bash 3.2 uses temporary files for here strings/documents. Establish
+        # private readable permissions before family selection and Python's
+        # program input, even when the caller's umask removes owner access.
+        umask 077 || return 1
+    fi
+
     # Both CLI spellings use the same post-verification freshness path. Never
     # silently resolve conflicting thresholds by whichever flag appeared last.
     if $prefer_stale; then
-        [[ "$stale_threshold" =~ ^(0|[1-9][0-9]{0,5})$ && -z "$_SOURCE_IF_STALE" ]] || {
+        [[ "$stale_threshold" =~ $stale_threshold_pattern && -z "$_SOURCE_IF_STALE" ]] || {
             _log_error "--stale-threshold must be 0 through 999999, and not combined with --source-if-stale"
             return 4
         }
@@ -3201,7 +5279,7 @@ main() {
         return 4
     }
     if [[ -n "$_SOURCE_IF_STALE" ]]; then
-        if [[ ! "$_SOURCE_IF_STALE" =~ ^(0|[1-9][0-9]{0,5})$ || -n "$_VERSION" ]] ||
+        if [[ ! "$_SOURCE_IF_STALE" =~ $stale_threshold_pattern || -n "$_VERSION" ]] ||
            ! $_ALLOW_SOURCE_BUILD || $_FROM_SOURCE; then
             _log_error "--source-if-stale needs --allow-source-build, a nonnegative integer, and latest-release mode (no --version or --from-source)"
             return 4
@@ -3250,18 +5328,31 @@ main() {
         return 4
     fi
     _select_install_family "$platform" || return $?
+    if $_RECOVER; then
+        _recover_installation
+        return $?
+    fi
     if $_FROM_SOURCE; then
         _install_from_source "Explicit --from-source request"
         return $?
     fi
-    _TARGET_TRIPLE=$(_select_target_triple "${platform%/*}" "${platform#*/}") || return $?
-    if [[ ! "$_TARGET_TRIPLE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
-        _log_error "Unresolved target triple for $platform"
-        return 4
+    local install_targets='' fallback_triple target_status=0
+    _TARGET_TRIPLE=$(_select_target_triple "${platform%/*}" "${platform#*/}") || target_status=$?
+    if ((target_status != 0)); then
+        # Status 1 is reserved for an auto-detected, known libc without a
+        # compatible configured release and with explicit source consent.
+        # Keep version discovery below: a resolved release builds its tag,
+        # while unavailable latest discovery follows the existing HEAD policy.
+        ((target_status == 1)) && $_ALLOW_SOURCE_BUILD && [[ -z "$_LIBC" ]] || return "$target_status"
+    else
+        if [[ ! "$_TARGET_TRIPLE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            _log_error "Unresolved target triple for $platform"
+            return 4
+        fi
+        install_targets="$_TARGET_TRIPLE"
+        fallback_triple=$(_fallback_target_triple "${platform%/*}" "${platform#*/}" "$_TARGET_TRIPLE") || return $?
+        [[ -z "$fallback_triple" ]] || install_targets+=$'\n'"$fallback_triple"
     fi
-    local install_targets="$_TARGET_TRIPLE" fallback_triple
-    fallback_triple=$(_fallback_target_triple "${platform%/*}" "${platform#*/}" "$_TARGET_TRIPLE") || return $?
-    [[ -z "$fallback_triple" ]] || install_targets+=$'\n'"$fallback_triple"
     # Get version
     if [[ -z "$_VERSION" ]]; then
         if $_OFFLINE_MODE; then
@@ -3273,6 +5364,7 @@ main() {
         _VERSION=$(_get_latest_version) || discovery_status=$?
         if ((discovery_status != 0)); then
             _VERSION=""
+            ((discovery_status == 1)) || return "$discovery_status"
             if $_ALLOW_SOURCE_BUILD; then
                 _install_from_source "Latest release could not be resolved"
                 return $?
@@ -3287,6 +5379,11 @@ main() {
     fi
     _log_info "Version: $_VERSION"
 
+    if ((target_status == 1)); then
+        _install_from_source "No compatible release target is configured for $platform"
+        return $?
+    fi
+
     local format asset_name asset_plan
 
     # Create temp directory. _TEMP_DIR is a script-scope global so the
@@ -3297,7 +5394,7 @@ main() {
     trap _cleanup_temp_dir EXIT
     local temp_dir="$_TEMP_DIR"
 
-    local archive_file="" cache_platform="$platform" cached_file acquired=false
+    local archive_file="" cache_platform="$platform" cached_file acquired=false acquisition_status
     local extract_dir="$temp_dir/extracted"
 
     # Select the target before cache lookup. Each candidate has its own bytes
@@ -3323,9 +5420,14 @@ main() {
         elif $_OFFLINE_MODE; then
             _log_warn "Offline mode: no cached archive for $TOOL_NAME $_VERSION ($_TARGET_TRIPLE)"
             continue
-        elif ! _fetch_release_asset "$asset_name" "$archive_file"; then
-            _log_warn "Release payload unavailable: $asset_name"
-            continue
+        else
+            acquisition_status=0
+            _fetch_release_asset "$asset_name" "$archive_file" 2147483648 "$_ALLOW_SOURCE_BUILD" || acquisition_status=$?
+            if ((acquisition_status != 0)); then
+                ((acquisition_status == 1)) || return "$acquisition_status"
+                _log_warn "Release payload unavailable: $asset_name"
+                continue
+            fi
         fi
         # Integrity failure is final. The fallback policy grants another
         # acquisition attempt only; it never launders rejected release bytes.

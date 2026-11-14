@@ -42,9 +42,12 @@ _isb_relative_path() {
 # Ref names are not revspecs, refspecs, options, or shell expressions. Tags
 # requested by --version are passed as refs/tags/<version>, never as HEAD.
 _isb_ref() {
+    # The embedded engine must parse before the installer can require Bash 4
+    # for source execution. Early Bash 3.2 parsers need grouped EREs in variables.
+    local reference_pattern='^refs/(heads|tags)/[A-Za-z0-9_][A-Za-z0-9._+/-]*$'
     [[ "$1" == HEAD || "$1" =~ ^[0-9a-fA-F]{40}$ || "$1" =~ ^[0-9a-fA-F]{64}$ ]] && return 0
     case "$1" in refs/heads/*|refs/tags/*) ;; *) return 1 ;; esac
-    [[ "$1" =~ ^refs/(heads|tags)/[A-Za-z0-9_][A-Za-z0-9._+/-]*$ ]] &&
+    [[ "$1" =~ $reference_pattern ]] &&
         git check-ref-format "$1" >/dev/null 2>&1
 }
 
@@ -394,11 +397,12 @@ _isb_freshness_get() {
 # to compile. This helper does not fetch Git objects or execute repository code.
 install_source_freshness() (
     local repo="${1:-}" tag="${2:-}" threshold="${3:-}" directory="${4:-}" prefer=false
+    local threshold_pattern='^(0|[1-9][0-9]{0,5})$'
     [[ $# -eq 4 || ( $# -eq 5 && "$5" == --prefer-gh ) ]] || return 4
     [[ $# -ne 5 ]] || prefer=true
     [[ "$repo" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ &&
        "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ && "$tag" != null &&
-       "$threshold" =~ ^(0|[1-9][0-9]{0,5})$ ]] || return 4
+       "$threshold" =~ $threshold_pattern ]] || return 4
     command -v jq >/dev/null 2>&1 || return 3
     _isb_freshness_unknown() {
         jq -nc --arg repo "$repo" --arg tag "$tag" --argjson threshold "$threshold" --arg reason "$1" \
@@ -485,6 +489,7 @@ _isb_probe_go() (
 _isb_prepare_toolchain() {
     local language="$1" tree="$2" output="$3" limit="$4" command root bin source_dir status=0
     local go_requirements="${5:-}" installed=false required observed version
+    local go_version_pattern='^go version go([1-9][0-9]*\.[0-9]+\.[0-9]+|1\.([0-9]|1[0-9]|20)) [a-z0-9]+/[a-z0-9]+$'
     local -a bootstrap_options=(--allow-install)
     [[ -z "$go_requirements" || "$language" == go ]] || return 4
     [[ -z "$go_requirements" ]] || bootstrap_options+=(--go-requirements "$go_requirements")
@@ -527,7 +532,7 @@ _isb_prepare_toolchain() {
             observed=$(cat "$output/toolchain-probe.log") || return 1
             # Before Go 1.21 initial releases omitted the patch component.
             # A modern two-component version identifies an unreleased compiler.
-            if [[ "$observed" =~ ^go\ version\ go([1-9][0-9]*\.[0-9]+\.[0-9]+|1\.([0-9]|1[0-9]|20))\ [a-z0-9]+/[a-z0-9]+$ ]]; then
+            if [[ "$observed" =~ $go_version_pattern ]]; then
                 version="${BASH_REMATCH[1]}"
                 required="${required#go}"
                 [[ "$version" == *.*.* ]] || version+=.0
