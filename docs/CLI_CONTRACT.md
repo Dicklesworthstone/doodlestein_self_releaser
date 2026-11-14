@@ -1660,6 +1660,14 @@ compilation finishes. A failed transfer cannot admit partial bytes; successful
 compiler execution evidence remains separate from the collection failure.
 Private partial files and their existing identities are retained for diagnosis.
 
+The ordinary tar fallback supervises the entire source-transfer pipeline under
+the same deadline: Git file selection, archive creation and the SSH receiver.
+A stalled local producer cannot keep a build waiting after the receiver has
+timed out or refused the transfer. Cancellation drains ordinary producer and
+receiver descendants before the supervisor returns. The caller's input remains
+separate from archive bytes, and a failed producer is still a failed transfer
+even if the receiver extracted a complete archive.
+
 Windows launcher uploads for metadata inspection and native compilation use the
 controller's source-sync deadline (`DSR_SYNC_TIMEOUT`, default 1800 seconds).
 The complete SCP process and its owned descendants are supervised, with stdin

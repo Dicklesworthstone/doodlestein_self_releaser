@@ -46,7 +46,7 @@ ROOT="${DSR_TEST_ROOT:-$ROOT}"
 
 test_source_transport_admission() (
     local dependency work
-    for dependency in bash python3 jq rsync tar base64 iconv ps; do
+    for dependency in bash python3 git jq rsync tar base64 iconv ps; do
         command -v "$dependency" >/dev/null 2>&1 || {
             printf 'SKIP: source transport admission requires %s\n' "$dependency"
             return 77
@@ -58,6 +58,7 @@ test_source_transport_admission() (
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
@@ -72,6 +73,14 @@ source.mkdir()
 (source / 'payload.bin').write_bytes(bytes(range(256)) * 1024)
 (source / 'run.sh').write_text('#!/bin/sh\nprintf "source transport\\n"\n')
 (source / 'run.sh').chmod(0o755)
+(source / '.gitignore').write_text('ignored.txt\n')
+subprocess.run(['git', '-C', str(source), 'init', '-q'], check=True)
+subprocess.run(['git', '-C', str(source), 'add', '.'], check=True)
+subprocess.run(['git', '-C', str(source), '-c', 'user.name=DSR Test',
+                '-c', 'user.email=dsr-test@example.invalid', 'commit', '-qm',
+                'Source transfer fixture'], check=True)
+(source / 'ignored.txt').write_text('This file is outside the Git source selection.\n')
+real_tar, real_git = shutil.which('tar'), shutil.which('git')
 checks, failures = 0, []
 
 
@@ -150,6 +159,37 @@ if phase == 'probe' or os.environ['DSR_SYNC_TEST_PLATFORM'] == 'windows':
 os.execv('/bin/sh', ['/bin/sh', '-c', command])
 ''')
 ssh.chmod(0o755)
+# Healthy invocations execute the genuine programs. Explicit fault controls
+# stall one producer before output, with a real TERM-resistant descendant,
+# or let a complete real archive reach the receiver before returning failure.
+# Neither the source selector nor the supervision/pipefail code is replaced.
+producer = r'''#!/usr/bin/env python3
+import json, os, signal, subprocess, sys, time
+from pathlib import Path
+name = Path(sys.argv[0]).name
+args = sys.argv[1:]
+selected = ((name == 'tar' and args and args[0] in ('czf', '-czf')) or
+            (name == 'git' and 'ls-files' in args and '--cached' in args))
+case = Path(os.environ['DSR_SYNC_TEST_CASE'])
+if selected:
+    with (case / 'producer-events').open('a') as stream:
+        stream.write(name + '\n')
+    if os.environ.get('DSR_SYNC_TEST_PRODUCER_STALL') == name:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        child = subprocess.Popen([sys.executable, '-c',
+            'import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(120)'])
+        (case / 'producer-pids.json').write_text(json.dumps([os.getpid(), child.pid]))
+        time.sleep(120)
+program = os.environ['DSR_SYNC_TEST_REAL_' + name.upper()]
+if selected and name == 'tar' and os.environ.get('DSR_SYNC_TEST_PRODUCER_STATUS'):
+    result = subprocess.run([program, *args])
+    raise SystemExit(result.returncode or int(os.environ['DSR_SYNC_TEST_PRODUCER_STATUS']))
+os.execv(program, [program, *args])
+'''
+for name in ('tar', 'git'):
+    path = bin_dir / name
+    path.write_text(producer)
+    path.chmod(0o755)
 driver = work / 'driver.bash'
 driver.write_text(r'''#!/usr/bin/env bash
 set -uo pipefail
@@ -162,7 +202,11 @@ status=0
 case "$1" in
     mkdir) _act_remote_mkdir receiver "$2" || status=$? ;;
     probe) _act_has_rsync receiver || status=$? ;;
-    sync) _act_sync_source receiver "$2" "$3" --no-gitignore-excludes || status=$? ;;
+    sync)
+        selection=(--no-gitignore-excludes)
+        [[ "${DSR_SYNC_TEST_GIT_SELECTION:-}" != 1 ]] || selection=()
+        _act_sync_source receiver "$2" "$3" "${selection[@]}" || status=$?
+        ;;
     *) exit 4 ;;
 esac
 remaining=''
@@ -179,7 +223,7 @@ def alive(pid):
     return bool(state) and not state.startswith('Z')
 
 
-def run(label, action, platform='unix', **settings):
+def run(label, action, platform='unix', cancel=False, **settings):
     case = work / label
     case.mkdir()
     target = case / 'destination'
@@ -190,6 +234,9 @@ def run(label, action, platform='unix', **settings):
                        DSR_SYNC_TEST_PLATFORM=platform, DSR_SYNC_TEST_STALL='',
                        DSR_SYNC_TEST_PROBE_STATUS='0', DSR_SYNC_TEST_MKDIR_STATUS='0',
                        DSR_SYNC_TEST_RSYNC_STATUS='0', DSR_SYNC_TEST_TAR_STATUS='0',
+                       DSR_SYNC_TEST_REAL_TAR=real_tar, DSR_SYNC_TEST_REAL_GIT=real_git,
+                       DSR_SYNC_TEST_PRODUCER_STALL='', DSR_SYNC_TEST_PRODUCER_STATUS='',
+                       DSR_SYNC_TEST_GIT_SELECTION='',
                        NO_COLOR='1')
     environment.update(settings)
     remote = 'C:/dsr-fixture/source' if platform == 'windows' else str(target)
@@ -199,13 +246,25 @@ def run(label, action, platform='unix', **settings):
                                stderr=subprocess.PIPE, start_new_session=True)
     started = time.monotonic()
     timed_out = False
+    cancelled = False
+    if cancel:
+        while time.monotonic() - started < 5 and process.poll() is None:
+            if (case / 'producer-pids.json').exists():
+                os.killpg(process.pid, signal.SIGTERM)
+                cancelled = True
+                break
+            time.sleep(0.01)
     try:
-        stdout, stderr = process.communicate(b'caller-source-record\n', timeout=15)
+        stdout, stderr = process.communicate(b'caller-source-record\n',
+                                             timeout=max(0.1, 15 - (time.monotonic() - started)))
     except subprocess.TimeoutExpired:
         timed_out = True
         stdout = stderr = b''
-    pids_path = case / 'owned-pids.json'
-    pids = json.loads(pids_path.read_text()) if pids_path.exists() else []
+    pids = []
+    for name in ('owned-pids.json', 'producer-pids.json'):
+        pids_path = case / name
+        if pids_path.exists():
+            pids.extend(json.loads(pids_path.read_text()))
     live = [pid for pid in pids if alive(pid)]
     # Record failed ownership before the independent failsafe cleans up only
     # this fixture's known groups. Cleanup cannot turn a failed check green.
@@ -229,10 +288,11 @@ def run(label, action, platform='unix', **settings):
     events_path = case / 'ssh.jsonl'
     events = [json.loads(line) for line in events_path.read_text().splitlines()] if events_path.exists() else []
     return {'status': process.returncode, 'timed_out': timed_out, 'elapsed': elapsed,
-            'live': live, 'pids': pids, 'events': events, 'stdout': stdout, 'target': target}
+            'live': live, 'pids': pids, 'events': events, 'stdout': stdout, 'target': target,
+            'cancelled': cancelled}
 
 
-print('BOUNDARY: local SSH service adapter; real supervisor/processes and Unix rsync/tar; no native Windows claim', flush=True)
+print('BOUNDARY: local SSH service adapter; real supervisor/processes and Unix Git/rsync/tar; explicit producer fault adapters; no native Windows claim', flush=True)
 for platform in ('unix', 'windows'):
     result = run(platform + '-mkdir', 'mkdir', platform)
     check(platform + ' directory admission succeeds', result['status'] == 0 and not result['timed_out'])
@@ -307,6 +367,54 @@ for status in (130, 143, 255):
           result['status'] == status and not result['timed_out'])
     check('tar receiver refusal ' + str(status) + ' preserves caller stdin and source custody',
           result['stdout'] == b'remaining:caller-source-record\n' and not result['target'].exists())
+
+# A deadline on only SSH leaves the archive writer and its Git inventory
+# outside the owned group. The original pipeline waits forever for these
+# producers even after its receiver has timed out or refused the request.
+for name in ('tar', 'git'):
+    result = run(name + '-producer-stall', 'sync', DSR_SYNC_TEST_PROBE_STATUS='1',
+                 DSR_SYNC_TEST_PRODUCER_STALL=name, DSR_SYNC_TEST_GIT_SELECTION='1')
+    check(name + ' stall reaches the producer and resistant descendant', len(result['pids']) == 2)
+    check(name + ' producer shares the actual one-second transfer deadline',
+          not result['timed_out'] and result['status'] in (124, 137) and result['elapsed'] < 13)
+    check(name + ' producer descendants are retired before returning',
+          not result['timed_out'] and not result['live'])
+    check(name + ' producer timeout preserves the caller input record',
+          result['stdout'] == b'remaining:caller-source-record\n')
+
+result = run('tar-producer-receiver-refusal', 'sync', DSR_SYNC_TEST_PROBE_STATUS='1',
+             DSR_SYNC_TEST_TAR_STATUS='19', DSR_SYNC_TEST_PRODUCER_STALL='tar')
+check('receiver refusal reaches the actual producer and resistant descendant', len(result['pids']) == 2)
+check('receiver refusal cannot strand a source producer beyond the deadline',
+      not result['timed_out'] and result['status'] in (124, 137) and result['elapsed'] < 13)
+check('refused receiver leaves no live producer descendants', not result['timed_out'] and not result['live'])
+
+result = run('tar-producer-cancelled', 'sync', cancel=True, DSR_SYNC_TEST_PROBE_STATUS='1',
+             DSR_SYNC_TEST_PRODUCER_STALL='tar', DSR_SYNC_TIMEOUT='10')
+check('cancellation reaches the actual producer before the signal', result['cancelled'] and len(result['pids']) == 2)
+check('cancellation drains the complete transfer before its independent failsafe',
+      not result['timed_out'] and result['status'] != 0 and result['elapsed'] < 13)
+check('cancellation leaves no live producer descendants', not result['timed_out'] and not result['live'])
+
+result = run('tar-complete-producer-failed', 'sync', DSR_SYNC_TEST_PROBE_STATUS='1',
+             DSR_SYNC_TEST_PRODUCER_STATUS='23', DSR_SYNC_TIMEOUT='10')
+check('a complete archive from a failed producer is still refused',
+      not result['timed_out'] and result['status'] == 23)
+check('producer failure does not hide behind successful extraction',
+      (result['target'] / 'payload.bin').is_file() and
+      (result['target'] / 'payload.bin').read_bytes() == (source / 'payload.bin').read_bytes())
+
+result = run('tar-git-selected-healthy', 'sync', DSR_SYNC_TEST_PROBE_STATUS='1',
+             DSR_SYNC_TEST_GIT_SELECTION='1', DSR_SYNC_TIMEOUT='10')
+check('the bounded pipeline transfers the complete real Git selection',
+      not result['timed_out'] and result['status'] == 0 and
+      (result['target'] / 'payload.bin').is_file() and
+      (result['target'] / 'payload.bin').read_bytes() == (source / 'payload.bin').read_bytes() and
+      (result['target'] / 'run.sh').read_bytes() == (source / 'run.sh').read_bytes() and
+      (result['target'] / 'run.sh').stat().st_mode & 0o777 == 0o755)
+check('the bounded pipeline retains Git ignores and caller input',
+      not (result['target'] / 'ignored.txt').exists() and not (result['target'] / '.git').exists() and
+      result['stdout'] == b'remaining:caller-source-record\n')
 
 events = [json.loads(line) for path in work.glob('*/ssh.jsonl') for line in path.read_text().splitlines()]
 check('every admission and payload SSH connection is noninteractive with no terminal',

@@ -5456,6 +5456,29 @@ mkdir -p -- "$dsr_source_path" || exit 4
 SH
 }
 
+# The archive producer and SSH receiver are one transfer. Supervising only
+# SSH leaves a blocked Git inventory or tar writer outside the deadline and
+# can strand it after receiver failure or cancellation. The shared supervisor
+# runs this function with every producer/receiver descendant in its owned
+# process group; the pipe still carries archive bytes, never caller input.
+_act_transfer_source_tar() (
+    local local_path="$1" ssh_destination="$2" remote_extract_cmd="$3"
+    local respect_gitignore_excludes="$4"
+    shift 4
+    set -o pipefail
+    {
+        if $respect_gitignore_excludes &&
+           git -C "$local_path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            git -C "$local_path" ls-files --cached --others --exclude-standard -z |
+                COPYFILE_DISABLE=1 tar -czf - -C "$local_path" "$@" --null -T -
+        else
+            cd "$local_path" && COPYFILE_DISABLE=1 tar czf - "$@" .
+        fi
+    } |
+        ssh -T -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
+            -o StrictHostKeyChecking=accept-new "$ssh_destination" "$remote_extract_cmd"
+)
+
 # Sync source code to remote host via rsync
 # Usage: _act_sync_source <host> <local_path> <remote_path> [extra_excludes...]
 # Returns: 0 on success, non-zero on failure
@@ -5714,26 +5737,9 @@ _act_sync_source() (
         fi
 
         local sync_cmd_output sync_cmd_status
-        sync_cmd_output=$(
-            set -o pipefail
-            {
-                {
-                    if $respect_gitignore_excludes &&
-                       git -C "$local_path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-                        git -C "$local_path" ls-files --cached --others --exclude-standard -z |
-                            COPYFILE_DISABLE=1 tar -czf - -C "$local_path" \
-                                "${tar_excludes[@]}" --null -T -
-                    else
-                        cd "$local_path" &&
-                            COPYFILE_DISABLE=1 tar czf - "${tar_excludes[@]}" .
-                    fi
-                } |
-                    _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh -T \
-                        -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
-                        -o StrictHostKeyChecking=accept-new \
-                        "$ssh_destination" "$remote_extract_cmd"
-            } 2>&1
-        )
+        sync_cmd_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" \
+            _act_transfer_source_tar "$local_path" "$ssh_destination" "$remote_extract_cmd" \
+                "$respect_gitignore_excludes" "${tar_excludes[@]}" </dev/null 2>&1)
         sync_cmd_status=$?
         if [[ "$sync_cmd_status" -eq 0 ]]; then
             local duration=$(($(date +%s) - start_time))
