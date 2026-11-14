@@ -997,6 +997,12 @@ roots refuse the new command and cannot authorize collection of an earlier
 output. Existing scheduling restrictions for strict builds and Windows remain
 in effect.
 
+Ordinary native Rust, Go, Bun and TypeScript collection verifies that each
+compiled executable matches the requested operating system and architecture.
+Every selected workspace executable must pass before the family can be archived.
+A successful build command cannot authorize text or a host executable for a
+different target. Rejected output receives no reusable artifact receipt.
+
 The controller applies the actual rsync selection policy once to a private
 projection containing the main source and every configured sibling. It verifies
 the copy against the live selection before transport, then sends the same

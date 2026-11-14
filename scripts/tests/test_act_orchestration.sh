@@ -23,6 +23,8 @@
 # diagnostic JSON cannot become durable success or reusable artifact evidence.
 # --invocation-identity-only exercises singleton execution identity through
 # coordinator completion and exact-run resume of real frozen artifact bytes.
+# --native-bun-collection-only compiles genuine Bun/TypeScript executables and
+# checks ordinary native collection before their bytes become reusable output.
 
 set -uo pipefail
 
@@ -382,6 +384,162 @@ PY
 
 if [[ "${1:-}" == --backend-receipt-only ]]; then
     test_backend_receipt_isolation
+    exit $?
+fi
+
+test_native_bun_collection() {
+    local project_root dependency
+    project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" || return 1
+    for dependency in python3 bash jq yq bun tar; do
+        command -v "$dependency" >/dev/null || { echo "Missing test dependency: $dependency" >&2; return 77; }
+    done
+    if [[ "$(uname -s)/$(uname -m)" != Linux/x86_64 ]]; then
+        echo 'Native Bun collection fixture requires Linux x86_64' >&2
+        return 77
+    fi
+    python3 -I - "$project_root" "${DSR_TEST_ACT_RUNNER:-$project_root/src/act_runner.sh}" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+project, module = map(Path, sys.argv[1:3])
+root = Path(tempfile.mkdtemp(prefix='dsr-native-bun-collection-',
+                             dir=os.environ.get('DSR_TEST_DISK_ROOT'))).resolve()
+print('Retained native Bun collection fixtures: ' + str(root), flush=True)
+print('BOUNDARY: host health/capacity admitted by fixture; genuine Bun compiler, '
+      'native launcher, collection, workspace archives and durable worker receipts', flush=True)
+checks, failures = 0, []
+
+
+def check(label, valid):
+    global checks
+    checks += 1
+    print(('PASS ' if valid else 'FAIL ') + label, flush=True)
+    if not valid:
+        failures.append(label)
+
+
+driver = root / 'driver.sh'
+driver.write_text(r'''#!/usr/bin/env bash
+set -uo pipefail
+source "$DSR_BUN_PROJECT/src/logging.sh" || exit 90
+source "$DSR_BUN_PROJECT/src/config.sh" || exit 90
+source "$DSR_BUN_MODULE" || exit 90
+host_health_is_ready() { return 0; }
+selector_acquire_slot() { return 0; }
+selector_release_slot() { return 0; }
+_act_run_target_worker bunfixture 1.0.0 fixture-run "$DSR_BUN_TARGET" 1 \
+    "$DSR_BUN_CASE/attempt.log" "$DSR_BUN_CASE/attempt.json" false null '{}' '' '' localnative release
+''')
+
+for language in ('bun', 'typescript'):
+    for mode, target in (('singleton', 'linux/amd64'), ('wrong-architecture', 'linux/arm64'),
+                         ('workspace', 'linux/amd64'), ('workspace-invalid', 'linux/amd64')):
+        case = root / (language + '-' + mode)
+        source = case / 'source'
+        config = case / 'config'
+        source.mkdir(parents=True)
+        (config / 'repos.d').mkdir(parents=True)
+        (source / 'main.ts').write_text('const value: string = "native-bun-collection"; console.log(value);\n')
+        (source / 'package.json').write_text('{"name":"native-bun-collection","type":"module"}\n')
+        # Deliberately omit --target. A real host executable must never be
+        # admitted as arm64 merely because the scheduler requested that task.
+        build = 'bun build --compile --outfile bunfixture main.ts'
+        if mode == 'workspace':
+            build += ' && cp bunfixture companion'
+        elif mode == 'workspace-invalid':
+            build += ' && printf "not a compiled executable\\n" > companion && chmod 755 companion'
+        recipe = dict(tool_name='bunfixture', repo='fixture/bunfixture', language=language,
+                      binary_name='bunfixture', local_path=str(source), build_cmd=build,
+                      targets=[target], act_job_map={target: None},
+                      env=dict(PATH=os.environ['PATH']),
+                      archive_format=dict(linux='tar.gz'), include_extra_files=False)
+        if mode.startswith('workspace'):
+            recipe['workspace_binaries'] = ['bunfixture', 'companion']
+        (config / 'repos.d/bunfixture.yaml').write_text(json.dumps(recipe) + '\n')
+        (config / 'hosts.yaml').write_text(json.dumps(dict(schema_version='1.0.0',
+            hosts=dict(localnative=dict(platform='linux/amd64', connection='local')))) + '\n')
+        env = dict(os.environ, DSR_BUN_PROJECT=str(project), DSR_BUN_MODULE=str(module),
+                   DSR_BUN_CASE=str(case), DSR_BUN_TARGET=target, DSR_CONFIG_DIR=str(config),
+                   DSR_HOSTS_FILE=str(config / 'hosts.yaml'), DSR_STATE_DIR=str(case / 'state'),
+                   DSR_CACHE_DIR=str(case / 'cache'), ACT_LOGS_DIR=str(case / 'logs'),
+                   ACT_ARTIFACTS_DIR=str(case / 'artifacts'), NO_COLOR='1')
+        # Genuine standalone Bun executables exceed 100 MiB. A family also
+        # exercises archive creation and repeated independent byte checks;
+        # this fixture tests admission, not a compiler/packager speed bound.
+        process = subprocess.Popen(['bash', str(driver)], env=env, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   start_new_session=True)
+        try:
+            out, err = process.communicate(timeout=180)
+        except subprocess.TimeoutExpired:
+            process.send_signal(signal.SIGTERM)
+            try:
+                out, err = process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                out, err = process.communicate(timeout=5)
+            (case / 'stdout').write_bytes(out)
+            (case / 'stderr').write_bytes(err)
+            raise
+        (case / 'stdout').write_bytes(out)
+        (case / 'stderr').write_bytes(err)
+        receipt = json.loads((case / 'attempt.json').read_text())
+        built = source / 'bunfixture'
+        compiled = built.read_bytes()
+        check(case.name + ': actual compiler produced an executable for the host',
+              compiled[:6] == b'\x7fELF\x02\x01' and compiled[18:20] == b'\x3e\x00' and
+              subprocess.run([str(built)], capture_output=True, timeout=10).stdout ==
+              b'native-bun-collection\n')
+        check(case.name + ': native command really completed before collection',
+              receipt.get('native_execution', {}).get('build_program_dispatched') is True and
+              receipt.get('native_execution', {}).get('command_exit_code') == 0)
+        success = mode in ('singleton', 'workspace')
+        check(case.name + ': collector and worker retain the expected outcome',
+              process.returncode == (0 if success else 7) and
+              receipt['exit_code'] == process.returncode and
+              receipt['status'] == ('success' if success else 'failed'))
+        check(case.name + ': scheduled invocation identity survives actual collection',
+              receipt['platform'] == target and receipt['method'] == 'native' and
+              receipt['host'] == 'localnative')
+        if success:
+            artifact = Path(receipt['artifact_path'])
+            frozen = receipt.get('resume_artifacts', [])
+            check(case.name + ': only admitted bytes acquire durable reuse evidence',
+                  len(frozen) == 1 and frozen[0]['path'] == str(artifact) and
+                  frozen[0]['sha256'] == hashlib.sha256(artifact.read_bytes()).hexdigest())
+            if mode == 'workspace':
+                with tarfile.open(artifact, 'r:gz') as archive:
+                    members = {item.name: archive.extractfile(item).read()
+                               for item in archive.getmembers() if item.isfile()}
+                check(case.name + ': archive contains the complete genuine executable family',
+                      members == {'bunfixture': compiled, 'companion': compiled})
+            else:
+                check(case.name + ': collected executable retains compiler bytes',
+                      artifact.read_bytes() == compiled)
+        else:
+            diagnostics = (case / 'attempt.log').read_text()
+            check(case.name + ': rejected bytes cannot become reusable artifacts or a family archive',
+                  not receipt.get('resume_artifacts') and not receipt['artifact_path'] and
+                  receipt['artifact_paths'] == [] and
+                  not list((case / 'artifacts').rglob('*.tar.gz')))
+            check(case.name + ': rejection identifies the actual executable format mismatch',
+                  'Collected artifact is not a ' + target + ' executable:' in diagnostics)
+
+(root / 'summary.json').write_text(json.dumps(dict(checks=checks, failures=failures)) + '\n')
+print('Native Bun collection: %d checks, %d failures' % (checks, len(failures)), flush=True)
+raise SystemExit(bool(failures))
+PY
+}
+
+if [[ "${1:-}" == --native-bun-collection-only ]]; then
+    test_native_bun_collection
     exit $?
 fi
 
@@ -10591,6 +10749,14 @@ if test_backend_receipt_isolation; then
 else
     fail "diagnostic output authorized backend success or replaced an exact worker result"
 fi
+
+native_bun_collection_status=0
+test_native_bun_collection || native_bun_collection_status=$?
+case "$native_bun_collection_status" in
+    0) pass "native Bun and TypeScript collection admits only the requested executable family" ;;
+    77) skip "native Bun collection requires Linux x86_64 and the genuine Bun compiler" ;;
+    *) fail "native Bun collection admitted an invalid target executable or reusable family" ;;
+esac
 
 if test_receipt_producer; then
     pass "artifact receipt producer preserves complete bytes and hashing custody"

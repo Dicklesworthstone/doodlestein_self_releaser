@@ -4500,14 +4500,15 @@ _act_glibc_version_le() {
 # path already validates this via _act_stage_contract_primary), and when the
 # glibc floor was active it must not need a newer glibc than the floor
 # (issue #9 — a floor that silently rises with the build host is exactly the
-# defect the floor exists to stop). Only compiled languages are checked.
+# defect the floor exists to stop). Native Bun and TypeScript builds also
+# produce compiled executables and must pass the same platform check.
 _act_accept_collected_binary() {
     local path="$1"
     local platform="$2"
     local language="$3"
     local glibc_floor="${4:-}"
 
-    case "$language" in rust|go) ;; *) return 0 ;; esac
+    case "$language" in rust|go|bun|typescript) ;; *) return 0 ;; esac
     dsr_platform_is_supported "$platform" || {
         _log_error "Unsupported collected binary platform: $platform"
         return 4
@@ -15946,7 +15947,7 @@ EOF
                 fi
             else
                 local validate_workspace_architecture=false
-                case "$language" in rust|go) validate_workspace_architecture=true ;; esac
+                case "$language" in rust|go|bun|typescript) validate_workspace_architecture=true ;; esac
                 if [[ -n "$archive_receipt" ]] && \
                    ! _act_validate_workspace_archive \
                          "$archive_path" "$archive_ext" "$platform" "$config_file" \
