@@ -2710,6 +2710,45 @@ contracts and the standalone module entry points.
 
 ---
 
+### `dsr quality`
+
+Run the configured release checks with durable per-command logs and an
+aggregate receipt:
+
+```bash
+dsr quality tool --work-dir /path/to/source --check-timeout 1800
+```
+
+Each complete configured program runs in a fresh Bash with EOF on its input.
+`--check-timeout` accepts an integer from 1 to 86400 seconds. The default is
+`DSR_QUALITY_TIMEOUT`, or 3600 seconds when unset. The environment setting also
+applies to quality checks inside `dsr fallback`; required checks have the same
+deadline and remain mandatory under `--skip-checks`.
+
+A stalled program fails the gate. Its ordinary process-group descendants are
+terminated before the complete log is hashed, including children left behind
+by a shell that exits successfully. Deadline escalation can take five additional
+seconds. Later configured checks still execute, and the aggregate returns 1 if
+any check failed. `timeout_seconds` is recorded in each check and the aggregate;
+the per-check `exit_code` preserves the actual result. Invalid deadlines return
+4 before any check or run state is created. Dry runs return 2 with planned
+checks and the selected deadline, without executing them. Source inventory and
+configuration reads are outside the per-command execution budget; deliberately
+detached sessions are outside process-group cleanup.
+
+The registry containing the check inventory is hashed before reading the
+commands and checked again before dispatch and after execution. A change while
+loading the inventory refuses dispatch. A change during execution produces
+`invalidated-config`, preserves `config_sha256` for the original registry and
+`config_sha256_after` for the final observation, and cannot authorize a release.
+`config_snapshot_path` retains the exact original registry beside the logs so
+the standalone receipt verifier can still verify an invalidated gate's evidence.
+This applies even when that registry lives outside the source tree and every
+individual command succeeds. The existing raw-source before/after checks remain
+in force.
+
+---
+
 ### `dsr fallback`
 
 Full fallback pipeline: check -> build -> release.

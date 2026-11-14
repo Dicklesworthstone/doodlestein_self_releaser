@@ -35,6 +35,14 @@
 
 set -uo pipefail
 
+# A stalled release gate must not keep an unattended fallback and its build
+# lock alive forever. Sourceable consumers use the same owned process-group
+# supervisor as the CLI, including its portable Bash timer on macOS.
+if ! declare -F run_with_timeout >/dev/null; then
+    # shellcheck source=src/guardrails.sh
+    source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/guardrails.sh" || { return 3 2>/dev/null || exit 3; }
+fi
+
 # Colors for output
 if [[ -z "${NO_COLOR:-}" && -t 2 ]]; then
     _QG_GREEN=$'\033[0;32m'
@@ -52,6 +60,15 @@ _qg_log_ok()    { echo "${_QG_GREEN}[quality]${_QG_NC} $*" >&2; }
 _qg_log_warn()  { echo "${_QG_YELLOW}[quality]${_QG_NC} $*" >&2; }
 _qg_log_error() { echo "${_QG_RED}[quality]${_QG_NC} $*" >&2; }
 
+_qg_timeout_seconds() {
+    local seconds="${1-${DSR_QUALITY_TIMEOUT-3600}}"
+    if [[ ! "$seconds" =~ ^[1-9][0-9]{0,4}$ ]] || ((seconds > 86400)); then
+        _qg_log_error "Quality check timeout must be an integer from 1 to 86400 seconds"
+        return 4
+    fi
+    printf '%s\n' "$seconds"
+}
+
 # Portable sha256 of a file; "-" hashes stdin.
 _qg_sha256() {
     if command -v sha256sum &>/dev/null; then
@@ -59,6 +76,21 @@ _qg_sha256() {
     else
         shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
     fi
+}
+
+# The registry can live outside the checked source tree. Bind its bytes before
+# reading any check inventory, rather than attributing executed commands to
+# whichever registry happens to exist after they finish.
+_qg_registry_snapshot() {
+    local path="$1" digest
+    if [[ ! -e "$path" && ! -L "$path" ]]; then
+        printf '%s\n' absent
+        return 0
+    fi
+    [[ -f "$path" && -r "$path" ]] || return 4
+    digest=$(_qg_sha256 "$path") || return 4
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 4
+    printf '%s\n' "$digest"
 }
 
 _qg_now_ms() {
@@ -300,6 +332,8 @@ _qg_run_single_check() {
     local work_dir="$2"
     local dry_run="$3"
     local log_file="$4"
+    local timeout_seconds
+    timeout_seconds=$(_qg_timeout_seconds) || return 4
     local resolved_cwd
     if ! resolved_cwd=$(CDPATH='' cd -- "${work_dir:-.}" 2>/dev/null && pwd -P); then
         _qg_log_error "Quality check directory is unavailable: ${work_dir:-.}"
@@ -311,13 +345,14 @@ _qg_run_single_check() {
 
     if [[ "$dry_run" == "true" ]]; then
         _qg_log_info "(dry-run) Planned, NOT executed: $cmd"
-        printf '%s' "$cmd" | jq -Rsc '{
+        printf '%s' "$cmd" | jq -Rsc --argjson timeout_seconds "$timeout_seconds" '{
             command: .,
             status: "planned",
             executed: false,
             passed: false,
             exit_code: null,
             duration_ms: 0,
+            timeout_seconds: $timeout_seconds,
             output_preview: "dry-run: not executed",
             log_path: null,
             log_sha256: null
@@ -335,8 +370,9 @@ _qg_run_single_check() {
         echo "# env: PATH=$PATH"
         env | LC_ALL=C grep -E '^(DSR_|CARGO_|RUST)' | sed 's/^/# env: /' || true
         echo "# started_monotonic_ms: $start_ms"
+        echo "# timeout_seconds: $timeout_seconds"
         echo "# ----"
-    } > "$log_file"
+    } > "$log_file" || return 4
 
     # Quality checks are non-interactive release gates.  Isolate their stdin so
     # a command such as `ssh`, `rch`, or `read` cannot consume the caller's
@@ -354,12 +390,19 @@ _qg_run_single_check() {
         # behavior in a check. This changes only the execution subshell;
         # each program can still opt into set -e explicitly.
         export -n SHELLOPTS || exit 4
-        cd -- "$resolved_cwd" && BASH_ENV='' ENV='' "$BASH" --noprofile --norc \
-            -u -o pipefail -s <<< "$program"
+        # The supervisor itself forks from this shell. POSIX mode makes its
+        # deliberate closed-descriptor probes fatal; clearing only the export
+        # would protect the fresh program but leave supervision unusable.
+        set +e +o posix
+        cd -- "$resolved_cwd" && BASH_ENV='' ENV='' run_with_timeout "$timeout_seconds" \
+            "$BASH" --noprofile --norc -u -o pipefail -s <<< "$program"
     ) >> "$log_file" 2>&1 || exit_code=$?
+    # The supervisor drains the command group before returning, including
+    # descendants left behind by a successful shell. Only now is the log
+    # complete and safe to hash; ordinary descendants cannot outlive it.
     # Commands are allowed to finish without a newline. Keep the status
     # trailer on its own line so independent verification can always find it.
-    printf '\n# exit_code: %s\n' "$exit_code" >> "$log_file"
+    printf '\n# exit_code: %s\n' "$exit_code" >> "$log_file" || return 4
 
     end_ms=$(_qg_now_ms) || return 4
     duration_ms=$((end_ms - start_ms))
@@ -378,6 +421,7 @@ _qg_run_single_check() {
         --arg cwd "$resolved_cwd" \
         --argjson exit_code "$exit_code" \
         --argjson duration_ms "$duration_ms" \
+        --argjson timeout_seconds "$timeout_seconds" \
         --argjson preview "$preview" \
         --arg log_path "$log_file" \
         --arg log_sha "$log_sha" \
@@ -389,6 +433,7 @@ _qg_run_single_check() {
             exit_code: $exit_code,
             cwd: $cwd,
             duration_ms: $duration_ms,
+            timeout_seconds: $timeout_seconds,
             output_preview: $preview,
             log_path: $log_path,
             log_sha256: $log_sha
@@ -401,6 +446,7 @@ _qg_run_single_check() {
 #   --dry-run       Plan checks without executing (exit 2, never a pass)
 #   --skip-checks   Skip ordinary checks; configured required checks still run
 #   --work-dir      Directory to run checks in
+#   --check-timeout Per-check deadline in seconds (default DSR_QUALITY_TIMEOUT or 3600)
 # Returns: evidence-complete aggregate receipt JSON on stdout; also
 # retained durably next to the per-check logs. Exit codes per header.
 qg_run_checks() {
@@ -408,6 +454,7 @@ qg_run_checks() {
     local dry_run=false
     local skip_checks=false
     local work_dir=""
+    local timeout_seconds="${DSR_QUALITY_TIMEOUT-3600}"
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -428,6 +475,14 @@ qg_run_checks() {
                 work_dir="$2"
                 shift 2
                 ;;
+            --check-timeout)
+                if [[ $# -lt 2 || -z "${2:-}" ]]; then
+                    _qg_log_error "--check-timeout requires seconds"
+                    return 4
+                fi
+                timeout_seconds="$2"
+                shift 2
+                ;;
             --help|-h)
                 cat << 'EOF'
 Usage: qg_run_checks <tool_name> [options]
@@ -438,6 +493,7 @@ Options:
   --dry-run       Plan checks without executing (exit 2, never a pass)
   --skip-checks   Skip ordinary checks; configured required checks still run
   --work-dir      Directory to run checks in
+  --check-timeout Per-check deadline, 1..86400 seconds (DSR_QUALITY_TIMEOUT or 3600)
 
 Exit Codes:
   0  - All checks EXECUTED and passed
@@ -462,6 +518,7 @@ EOF
         _qg_log_error "Tool name required"
         return 4
     fi
+    timeout_seconds=$(_qg_timeout_seconds "$timeout_seconds") || return 4
 
     local requested_work_dir="${work_dir:-.}"
     if ! work_dir=$(CDPATH='' cd -- "$requested_work_dir" 2>/dev/null && pwd -P); then
@@ -473,6 +530,13 @@ EOF
         }'
         return 4
     fi
+
+    local repos_file="${DSR_REPOS_FILE:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.yaml}"
+    local config_sha config_sha_after
+    config_sha=$(_qg_registry_snapshot "$repos_file") || {
+        _qg_log_error "Could not snapshot quality configuration: $repos_file"
+        return 4
+    }
 
     # A repository may define release-critical checks that are not bypassable.
     # --skip-checks keeps its historic behavior only when that required set is
@@ -494,6 +558,11 @@ EOF
         fi
         required_count=$(jq -r 'length' <<< "$required_checks" 2>/dev/null) || return 4
         if [[ "$required_count" -eq 0 ]]; then
+            config_sha_after=$(_qg_registry_snapshot "$repos_file") || return 4
+            if [[ "$config_sha" != "$config_sha_after" ]]; then
+                _qg_log_error "Quality configuration changed while reading required checks"
+                return 4
+            fi
             _qg_log_warn "Skipping quality checks (--skip-checks)"
             jq -nc --arg tool "$tool_name" '{
                 tool: $tool,
@@ -555,13 +624,25 @@ EOF
         return 4
     fi
 
-    local repos_file="${DSR_REPOS_FILE:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.yaml}"
+    config_sha_after=$(_qg_registry_snapshot "$repos_file") || return 4
+    if [[ ! "$config_sha" =~ ^[0-9a-f]{64}$ || "$config_sha" != "$config_sha_after" ]]; then
+        _qg_log_error "Quality configuration changed while reading the check inventory"
+        return 4
+    fi
     local run_dir run_parent
     run_parent="${DSR_QUALITY_LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr/quality-logs}/${tool_name}"
     mkdir -p -- "$run_parent" || return 4
     # Multiple calls and subshell workers can share both a timestamp and $$.
     # Keep each invocation's complete logs and receipt in its own directory.
     run_dir=$(mktemp -d "$run_parent/$(date +%Y%m%dT%H%M%S)-XXXXXXXX") || return 4
+
+    local config_snapshot="$run_dir/checks-config.yaml" snapshot_sha
+    if ! (umask 077; cp -- "$repos_file" "$config_snapshot") ||
+       ! snapshot_sha=$(_qg_registry_snapshot "$config_snapshot") ||
+       [[ "$snapshot_sha" != "$config_sha" ]]; then
+        _qg_log_error "Could not preserve the selected quality configuration"
+        return 4
+    fi
 
     local snapshot_before
     if ! snapshot_before=$(_qg_source_snapshot "$work_dir"); then
@@ -597,7 +678,7 @@ EOF
         idx=$((idx + 1))
 
         local result status
-        result=$(DSR_QUALITY_RUN_DIR="$run_dir" \
+        result=$(DSR_QUALITY_RUN_DIR="$run_dir" DSR_QUALITY_TIMEOUT="$timeout_seconds" \
             _qg_run_single_check "$cmd" "$work_dir" "$dry_run" \
                 "$run_dir/check-$idx.log")
         results+=("$result")
@@ -623,6 +704,12 @@ EOF
     if ! $dry_run && [[ "$snapshot_before" != "$snapshot_after" ]]; then
         moving=true
         _qg_log_error "Source state moved during the run (before: $snapshot_before, after: $snapshot_after) — the aggregate cannot bind a moving tree"
+    fi
+    local moving_config=false
+    config_sha_after=$(_qg_registry_snapshot "$repos_file") || config_sha_after=unreadable
+    if [[ "$config_sha" != "$config_sha_after" ]]; then
+        moving_config=true
+        _qg_log_error "Quality configuration changed during the run — the aggregate cannot pass"
     fi
 
     # Build results JSON
@@ -651,6 +738,8 @@ EOF
     local overall
     if $incomplete; then
         overall="incomplete"
+    elif $moving_config; then
+        overall="invalidated-config"
     elif $dry_run; then
         overall="planned"
     elif $moving; then
@@ -661,16 +750,15 @@ EOF
         overall="passed"
     fi
 
-    local config_sha
-    config_sha=$(_qg_sha256 "$repos_file")
-
     local result_json
     result_json=$(jq -c \
         --arg tool "$tool_name" \
         --arg status "$overall" \
         --arg dsr_version "${DSR_VERSION:-unversioned}" \
         --arg config_path "$repos_file" \
+        --arg config_snapshot "$config_snapshot" \
         --arg config_sha "$config_sha" \
+        --arg config_sha_after "$config_sha_after" \
         --arg snap_before "$snapshot_before" \
         --arg snap_after "$snapshot_after" \
         --arg run_dir "$run_dir" \
@@ -682,6 +770,7 @@ EOF
         --argjson planned "$planned" \
         --argjson total "$check_count" \
         --argjson duration_ms "$total_duration_ms" \
+        --argjson timeout_seconds "$timeout_seconds" \
         '{
             tool: $tool,
             status: $status,
@@ -689,7 +778,9 @@ EOF
             skipped: false,
             dsr_version: $dsr_version,
             config_path: $config_path,
+            config_snapshot_path: $config_snapshot,
             config_sha256: $config_sha,
+            config_sha256_after: $config_sha_after,
             source_before: $snap_before,
             source_after: $snap_after,
             run_dir: $run_dir,
@@ -700,7 +791,8 @@ EOF
             failed: $failed,
             planned: $planned,
             total: $total,
-            duration_ms: $duration_ms
+            duration_ms: $duration_ms,
+            timeout_seconds: $timeout_seconds
         }' <<< "$checks_json") || return 4
 
     # Durable aggregate receipt next to the per-check logs.
@@ -712,6 +804,9 @@ EOF
     # Log summary + exit per contract
     if $incomplete; then
         _qg_log_error "Quality gates INCOMPLETE: observed $observed/$check_count, executed $executed/$check_count — receipt: $run_dir/receipt.json"
+        return 1
+    fi
+    if $moving_config; then
         return 1
     fi
     if $dry_run; then

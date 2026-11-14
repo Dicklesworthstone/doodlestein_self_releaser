@@ -37,6 +37,8 @@ passed=$(jq -r '.passed' "$receipt")
 failed=$(jq -r '.failed' "$receipt")
 planned=$(jq -r '.planned' "$receipt")
 dry_run=$(jq -r '.dry_run' "$receipt")
+config_sha=$(jq -r '.config_sha256 // empty' "$receipt")
+config_sha_after=$(jq -r '.config_sha256_after // empty' "$receipt")
 
 # 1. Count arithmetic must close.
 if [[ $((passed + failed + planned)) -ne "$total" ]]; then
@@ -48,7 +50,7 @@ fi
 
 # 2. Status must follow the counts.
 if [[ "$dry_run" == "true" ]]; then
-    [[ "$status" == "planned" ]] || flunk "dry_run receipt has status=$status"
+    [[ "$status" == "planned" || "$status" == "invalidated-config" ]] || flunk "dry_run receipt has status=$status"
     [[ "$passed" -eq 0 ]] || flunk "dry_run receipt claims $passed passed checks"
 else
     if [[ "$failed" -gt 0 && "$status" == "passed" ]]; then
@@ -59,21 +61,46 @@ else
     fi
 fi
 
+# Configuration invalidation is a failed gate with verifiable evidence, not a
+# claim that the old command inventory passed under the replacement registry.
+if [[ "$status" == "invalidated-config" ]]; then
+    [[ "$config_sha" =~ ^[0-9a-f]{64}$ && -n "$config_sha_after" && "$config_sha" != "$config_sha_after" ]] \
+        || flunk "invalidated-config receipt does not bind different original/final configuration observations"
+elif [[ -n "$config_sha_after" && "$config_sha" != "$config_sha_after" ]]; then
+    flunk "configuration changed but status=$status"
+fi
+
 # 3. Moving-source invariant.
 before=$(jq -r '.source_before // empty' "$receipt")
 after=$(jq -r '.source_after // empty' "$receipt")
 if [[ "$dry_run" != "true" && -n "$before" && "$before" != "$after" \
-      && "$status" != "invalidated-moving-source" ]]; then
+      && "$status" != "invalidated-moving-source" && "$status" != "invalidated-config" ]]; then
     flunk "source moved (before != after) but status=$status"
 fi
 
-# 4. Config hash recomputes (when the config file still exists).
+# 4. Retained original configuration rehashes even after the registry changes.
+# Compare the current registry against the final observation for an invalidated
+# gate, and against the original observation for a stable gate.
 config_path=$(jq -r '.config_path // empty' "$receipt")
-config_sha=$(jq -r '.config_sha256 // empty' "$receipt")
+config_snapshot=$(jq -r '.config_snapshot_path // empty' "$receipt")
+if [[ -n "$config_snapshot" ]]; then
+    if [[ ! -f "$config_snapshot" || ! -r "$config_snapshot" ]]; then
+        flunk "retained quality configuration is unavailable"
+    elif [[ "$(sha "$config_snapshot")" != "$config_sha" ]]; then
+        flunk "retained quality configuration does not match its original hash"
+    fi
+elif [[ "$status" == "invalidated-config" ]]; then
+    flunk "invalidated-config receipt has no retained original configuration"
+fi
+expected_config_sha="$config_sha"
+[[ "$status" != "invalidated-config" ]] || expected_config_sha="$config_sha_after"
 if [[ -n "$config_path" && -f "$config_path" && -n "$config_sha" ]]; then
     actual=$(sha "$config_path")
-    [[ "$actual" == "$config_sha" ]] \
-        || flunk "config hash mismatch: receipt $config_sha, file $actual (config changed since the run)"
+    [[ "$actual" == "$expected_config_sha" ]] \
+        || flunk "config hash mismatch: receipt $expected_config_sha, file $actual (config changed since the run)"
+elif [[ "$status" == "invalidated-config" ]]; then
+    [[ "$expected_config_sha" == "absent" && -n "$config_path" && ! -e "$config_path" && ! -L "$config_path" ]] \
+        || flunk "final quality configuration observation cannot be independently verified"
 fi
 
 # 5. Every executed check's durable log rehashes to its bound value.

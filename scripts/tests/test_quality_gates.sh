@@ -7,6 +7,7 @@
 # - qg_run_checks: Run all checks with options (--dry-run, --skip-checks)
 #
 # Run: ./scripts/tests/test_quality_gates.sh
+# Use --lifecycle-only for real command deadlines and descendant cleanup.
 
 set -uo pipefail
 
@@ -1740,5 +1741,244 @@ main() {
 
     [[ $TESTS_FAILED -eq 0 ]] && exit 0 || exit 1
 }
+
+test_quality_lifecycle() {
+    command -v python3 >/dev/null || return 77
+    python3 -I - "${DSR_TEST_QUALITY_GATES:-$PROJECT_ROOT/src/quality_gates.sh}" "$PROJECT_ROOT" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+module, root = map(Path, sys.argv[1:])
+work = Path(tempfile.mkdtemp(prefix='dsr-quality-lifecycle-'))
+print('Quality lifecycle evidence: ' + str(work), flush=True)
+checks, failures = 0, []
+
+
+def check(label, condition):
+    global checks
+    checks += 1
+    print(('PASS ' if condition else 'FAIL ') + label, flush=True)
+    if not condition:
+        failures.append(label)
+
+
+driver = work / 'driver.bash'
+driver.write_text('''#!/usr/bin/env bash
+set -uo pipefail
+source "$1" || exit $?
+action="$2"
+case "$action" in
+    single)
+        program=$(cat "$4"; printf '.')
+        _qg_run_single_check "${program%.}" "$3" false "$5"
+        ;;
+    aggregate) qg_run_checks example --work-dir "$3" ;;
+    inventory-drift)
+        # Keep the actual YAML reader. Change only the operator-owned registry
+        # after it emits the old inventory, before command dispatch.
+        yq() {
+            command yq "$@" || return $?
+            case "$*" in
+                *'as $tool'*) printf '%s\\n' '{"tools":{"example":{"checks":["false"]}}}' > "$DSR_REPOS_FILE" ;;
+            esac
+        }
+        qg_run_checks example --work-dir "$3"
+        ;;
+    planned) qg_run_checks example --work-dir "$3" --dry-run ;;
+    invalid) qg_run_checks example --work-dir "$3" ;;
+    *) exit 4 ;;
+esac
+''')
+worker = work / 'worker.py'
+worker.write_text('''import json, os, signal, subprocess, sys, time
+from pathlib import Path
+case = Path(os.environ['DSR_QUALITY_TEST_CASE'])
+mode = sys.argv[1]
+if mode in ('resistant', 'leave-child'):
+    child = subprocess.Popen([sys.executable, '-c',
+        'import signal,time; from pathlib import Path; '
+        'signal.signal(signal.SIGTERM,signal.SIG_IGN); '
+        'time.sleep(.7); print("late child output",flush=True); '
+        'Path(' + repr(str(case / 'late-write')) + ').write_text("late"); time.sleep(120)'])
+    (case / 'pids.json').write_text(json.dumps([os.getpid(), child.pid]))
+    if mode == 'leave-child':
+        print('leader complete', flush=True)
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+else:
+    (case / 'pids.json').write_text(json.dumps([os.getpid()]))
+print('check started', flush=True)
+time.sleep(120)
+''')
+
+
+def alive(pid):
+    result = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)],
+                            capture_output=True, text=True, timeout=3)
+    return bool(result.stdout.strip()) and not result.stdout.strip().startswith('Z')
+
+
+def run(label, program, action='single', bound='1', outer=12, cli=False):
+    case = work / label
+    case.mkdir()
+    source = case / 'source'
+    source.mkdir()
+    command_file = case / 'program.bash'
+    command_file.write_text(program)
+    config = case / 'repos.yaml'
+    config.write_text(json.dumps({'tools': {'example': {'checks': [program, 'printf next-check']}}}))
+    environment = dict(os.environ, DSR_QUALITY_TIMEOUT=bound, DSR_QUALITY_TEST_CASE=str(case),
+                       DSR_QUALITY_LOG_DIR=str(case / 'logs'), DSR_CONFIG_DIR=str(case / 'config'),
+                       DSR_REPOS_FILE=str(config), NO_COLOR='1')
+    argv = ['bash', str(driver), str(module), action, str(source),
+            str(command_file), str(case / 'check.log')]
+    if cli:
+        argv = ['bash', str(root / 'dsr'), '--json', 'quality', 'example',
+                '--work-dir', str(source), '--check-timeout', bound]
+        environment['DSR_QUALITY_TIMEOUT'] = '3600'
+    started = time.monotonic()
+    process = subprocess.Popen(argv, env=environment, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True, start_new_session=True)
+    outer_expired = False
+    try:
+        stdout, stderr = process.communicate(timeout=outer)
+    except subprocess.TimeoutExpired:
+        outer_expired = True
+        os.killpg(process.pid, signal.SIGKILL)
+        stdout, stderr = process.communicate(timeout=3)
+    elapsed = time.monotonic() - started
+    (case / 'stdout').write_text(stdout)
+    (case / 'stderr').write_text(stderr)
+    (case / 'status.json').write_text(json.dumps({'exit_code': process.returncode,
+        'outer_expired': outer_expired, 'elapsed_seconds': elapsed, 'argv': argv}))
+    try:
+        receipt = json.loads(stdout)
+    except (ValueError, TypeError):
+        receipt = {}
+    pids = json.loads((case / 'pids.json').read_text()) if (case / 'pids.json').exists() else []
+    live = [pid for pid in pids if alive(pid)]
+    return case, receipt, process, outer_expired, live
+
+
+def retire(process):
+    # Each fixture owns a new session; retain all evidence, terminate only its
+    # live processes. On the fixed path the command group was already drained.
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+for label, mode in [('deadline', 'ordinary'), ('resistant', 'resistant')]:
+    case, receipt, process, expired, live = run(label, f'python3 "{worker}" {mode}')
+    check(label + ' finishes within the independent 12-second guard', not expired)
+    check(label + ' retains a failed check and actual deadline exit',
+          process.returncode == 0 and receipt.get('passed') is False and
+          receipt.get('exit_code') in (124, 137) and receipt.get('timeout_seconds') == 1)
+    check(label + ' drains the command and its resistant descendants', not expired and
+          bool((case / 'pids.json').exists()) and not live)
+    log = case / 'check.log'
+    check(label + ' hashes the complete final log', log.exists() and
+          receipt.get('log_sha256') == hashlib.sha256(log.read_bytes()).hexdigest() and
+          b'# exit_code: ' in log.read_bytes())
+    retire(process)
+
+case, receipt, process, expired, live = run('leader-exit', f'python3 "{worker}" leave-child')
+before = (case / 'check.log').read_bytes()
+time.sleep(.9)
+check('successful leader cannot retain a background check writer', not expired and not live)
+check('returned log hash stays stable after descendant cleanup',
+      before == (case / 'check.log').read_bytes() and not (case / 'late-write').exists() and
+      receipt.get('log_sha256') == hashlib.sha256(before).hexdigest())
+retire(process)
+
+case, receipt, process, expired, live = run('healthy', 'printf "healthy stdout\\n"; printf "healthy stderr\\n" >&2')
+check('healthy check retains success and full output under the same deadline',
+      not expired and process.returncode == 0 and receipt.get('passed') is True and
+      receipt.get('exit_code') == 0 and b'healthy stdout\nhealthy stderr\n' in (case / 'check.log').read_bytes())
+retire(process)
+
+case, receipt, process, expired, live = run('aggregate', f'python3 "{worker}" ordinary', action='aggregate')
+check('timed-out gate cannot pass an aggregate while later checks still run',
+      not expired and process.returncode == 1 and receipt.get('status') == 'failed' and
+      receipt.get('total') == 2 and receipt.get('passed') == 1 and receipt.get('failed') == 1)
+check('aggregate binds the selected per-check deadline', receipt.get('timeout_seconds') == 1 and
+      len(receipt.get('checks', [])) == 2 and all(r.get('timeout_seconds') == 1 for r in receipt['checks']))
+if receipt.get('run_dir'):
+    verified = subprocess.run(['bash', str(root / 'scripts/verify_quality_receipt.sh'),
+                               str(Path(receipt['run_dir']) / 'receipt.json')],
+                              capture_output=True, text=True, timeout=5)
+    (case / 'verification.log').write_text(verified.stdout + verified.stderr)
+    check('timed-out aggregate retains independently verifiable evidence', verified.returncode == 0)
+else:
+    check('timed-out aggregate retains independently verifiable evidence', False)
+retire(process)
+
+for bound in ('0', '-1', '1.5', '86401', 'invalid'):
+    case, receipt, process, expired, live = run('invalid-' + bound, 'printf should-not-run', action='invalid', bound=bound)
+    check('invalid deadline ' + bound + ' refuses before state or execution',
+          not expired and process.returncode == 4 and not (case / 'logs').exists())
+    retire(process)
+
+case, receipt, process, expired, live = run('planned', f'python3 "{worker}" ordinary', action='planned')
+check('dry run records the deadline without executing a check',
+      not expired and process.returncode == 2 and receipt.get('status') == 'planned' and
+      receipt.get('timeout_seconds') == 1 and not (case / 'pids.json').exists())
+retire(process)
+
+case, receipt, process, expired, live = run('registry-drift',
+    '''printf '%s\\n' '{"tools":{"example":{"checks":["false"]}}}' > "$DSR_REPOS_FILE"''', action='aggregate')
+check('changed external registry invalidates otherwise successful checks',
+      not expired and process.returncode == 1 and receipt.get('status') == 'invalidated-config' and
+      receipt.get('passed') == 2 and receipt.get('failed') == 0)
+check('registry receipt retains the original and final configuration hashes',
+      len(receipt.get('config_sha256', '')) == 64 and
+      receipt.get('config_sha256') != receipt.get('config_sha256_after') and
+      receipt.get('config_sha256_after') == hashlib.sha256((case / 'repos.yaml').read_bytes()).hexdigest())
+verified = None
+if receipt.get('run_dir'):
+    verified = subprocess.run(['bash', str(root / 'scripts/verify_quality_receipt.sh'),
+                               str(Path(receipt['run_dir']) / 'receipt.json')],
+                              capture_output=True, text=True, timeout=5)
+    (case / 'verification.log').write_text(verified.stdout + verified.stderr)
+check('configuration invalidation preserves independently verifiable original policy',
+      receipt.get('status') == 'invalidated-config' and verified is not None and verified.returncode == 0 and
+      Path(receipt.get('config_snapshot_path', '/nonexistent')).is_file() and
+      hashlib.sha256(Path(receipt['config_snapshot_path']).read_bytes()).hexdigest() == receipt.get('config_sha256'))
+retire(process)
+
+case, receipt, process, expired, live = run('inventory-drift',
+    'printf dispatched > "$DSR_QUALITY_TEST_CASE/dispatched"', action='inventory-drift')
+check('registry drift while loading checks refuses before dispatch or state',
+      not expired and process.returncode == 4 and not (case / 'logs').exists() and not (case / 'dispatched').exists())
+retire(process)
+
+# CLI integration is tested only against the complete candidate, not a baseline
+# module loaded into a different CLI. The baseline comparisons above use the
+# exact same driver, bounds and assertions as the candidate.
+if module.resolve() == (root / 'src/quality_gates.sh').resolve():
+    case, envelope, process, expired, live = run('public-cli', f'python3 "{worker}" ordinary', cli=True)
+    details = envelope.get('details', {})
+    check('public quality command applies --check-timeout and reports failure',
+          not expired and process.returncode == 1 and envelope.get('status') == 'failure' and
+          details.get('timeout_seconds') == 1 and details.get('failed') == 1 and details.get('passed') == 1)
+    retire(process)
+
+print(f'Quality lifecycle: {checks - len(failures)}/{checks} passed', flush=True)
+raise SystemExit(bool(failures))
+PY
+}
+
+if [[ "${1:-}" == --lifecycle-only ]]; then
+    test_quality_lifecycle
+    exit $?
+fi
 
 main "$@"

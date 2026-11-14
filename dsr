@@ -6247,6 +6247,7 @@ cmd_quality() {
     local dry_run="$DRY_RUN"
     local skip_checks=false
     local work_dir=""
+    local check_timeout="${DSR_QUALITY_TIMEOUT-3600}"
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -6267,6 +6268,11 @@ cmd_quality() {
                 work_dir="$2"
                 shift 2
                 ;;
+            --check-timeout)
+                [[ $# -ge 2 && -n "${2:-}" ]] || { log_error "--check-timeout requires seconds"; return 4; }
+                check_timeout="$2"
+                shift 2
+                ;;
             --help|-h)
                 cat << 'EOF'
 dsr quality - Run pre-release quality checks
@@ -6279,10 +6285,14 @@ OPTIONS:
     -n, --dry-run        Show checks without running them
     --skip-checks        Skip ordinary checks; required checks still run
     -w, --work-dir       Directory to run checks in
+    --check-timeout <s>  Per-check deadline, 1..86400 seconds (default 3600)
 
 DESCRIPTION:
     Runs quality gate checks configured in repos.yaml for the specified tool.
     Checks are commands like 'cargo test', 'go vet', etc.
+    DSR_QUALITY_TIMEOUT sets the per-check deadline for quality and fallback.
+    --check-timeout overrides it for this command. Deadline failures preserve
+    complete logs and fail the release gate; later configured checks still run.
 
 CONFIGURATION:
     Configure checks in ~/.config/dsr/repos.yaml:
@@ -6326,7 +6336,7 @@ EOF
     fi
 
     # Build qg_run_checks arguments
-    local qg_args=("$tool_name")
+    local qg_args=("$tool_name" --check-timeout "$check_timeout")
     $dry_run && qg_args+=("--dry-run")
     $skip_checks && qg_args+=("--skip-checks")
     [[ -n "$work_dir" ]] && qg_args+=("--work-dir" "$work_dir")
