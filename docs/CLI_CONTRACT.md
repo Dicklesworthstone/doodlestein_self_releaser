@@ -661,7 +661,23 @@ outcomes may follow a remote publication and require manual recovery. New comple
 original exit status and receipts as `blocked` with no retry deadline. Older
 journals that recorded those exits as `failed` also remain ineligible for
 automatic launch or dry-run planning, without rewriting their retained evidence.
-Ordinary build and network failures keep the bounded retry behavior above.
+Ordinary build and network failures keep the bounded retry behavior above when
+their result is verified. A worker must emit one parsed `fallback` result whose
+tool, repository, version, source SHA, output directory, worker run ID and exact
+upstream admission match the scheduled invocation. The result's status and exit
+code must agree with the observed process exit. Success also requires the
+complete phase and confirmed publication, rather than a build-only result.
+
+The completion receipt freezes the SHA-256 of the original `result.json` bytes.
+Reconciliation checks those bytes and their identity again after every descendant
+has released the attempt lease. Missing, malformed, inconsistent or changed
+results become `blocked`, retain their raw evidence and receive no automatic
+retry deadline. A failure after reported publication also blocks automatic retry.
+Retry admission, including preview, rechecks the saved completion and original
+result before authorizing another attempt. Later changes withhold retry without
+rewriting the retained evidence. Legacy completions or failed attempts without this result
+binding require manual inspection before recovery. Failure to write the final
+success JSON result returns exit `4`, including after confirmed publication.
 Legacy timestamp-only history and workers lost without a completion receipt
 require manual recovery; their publication outcome cannot safely be inferred.
 

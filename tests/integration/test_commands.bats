@@ -1000,7 +1000,50 @@ case "$1" in
             ((SECONDS < deadline)) || exit 98
             sleep 0.05
         done
-        exit "${DSR_WATCH_FIXTURE_STATUS:-0}"
+        # This controlled child still emits the public fallback contract. Its
+        # real arguments supply invocation identity; no watcher state is read
+        # or manufactured by the fixture.
+        tool="$4"; shift 4
+        version="" source="" output="" admission=""
+        while (($#)); do
+            case "$1" in
+                --version) version="$2"; shift 2 ;;
+                --expected-sha) source="$2"; shift 2 ;;
+                --output-dir) output="$2"; shift 2 ;;
+                --watch-admission) admission="$2"; shift 2 ;;
+                --isolate-source|--resume=*) shift ;;
+                *) exit 99 ;;
+            esac
+        done
+        rc="${DSR_WATCH_FIXTURE_STATUS:-0}"
+        receipt=$(jq -nc --arg tool "$tool" --arg version "$version" --arg sha "$source" \
+            --arg output "$output" --arg run "$DSR_RUN_ID" --argjson admission "$admission" --argjson rc "$rc" '
+            {command:"fallback",status:(if $rc == 0 then "success" elif $rc == 1 then "partial" else "error" end),
+             exit_code:$rc,details:{tool:$tool,repo:$admission.repo,version:$version,expected_sha:$sha,
+               output_dir:$output,run_id:$run,build_only:false,watch_admission:$admission,
+               phase:(if $rc == 0 then "complete" else "build" end),
+               phases:{release:(if $rc == 0 then "success" else "blocked" end)}}}') || exit 99
+        case "${DSR_WATCH_FIXTURE_RECEIPT:-valid}" in
+            empty) exit "$rc" ;;
+            malformed) printf '{broken\n'; exit "$rc" ;;
+            multiple) printf '%s\n%s\n' "$receipt" "$receipt"; exit "$rc" ;;
+            wrong-tool) receipt=$(jq '.details.tool="another-tool"' <<< "$receipt") ;;
+            wrong-repo) receipt=$(jq '.details.repo="another/repo"' <<< "$receipt") ;;
+            wrong-tag) receipt=$(jq '.details.version="v9.9.9"' <<< "$receipt") ;;
+            wrong-source) receipt=$(jq '.details.expected_sha=("f"*40)' <<< "$receipt") ;;
+            wrong-output) receipt=$(jq '.details.output_dir += "/another"' <<< "$receipt") ;;
+            wrong-run) receipt=$(jq '.details.run_id="another-run"' <<< "$receipt") ;;
+            wrong-admission) receipt=$(jq '.details.watch_admission.run_attempt += 1' <<< "$receipt") ;;
+            wrong-exit) receipt=$(jq '.exit_code += 1' <<< "$receipt") ;;
+            wrong-status) receipt=$(jq '.status="error"' <<< "$receipt") ;;
+            unpublished) receipt=$(jq '.details.phases.release="blocked"' <<< "$receipt") ;;
+            build-only) receipt=$(jq '.details.build_only=true' <<< "$receipt") ;;
+            post-publication-error) receipt=$(jq '.details.phase="lock" | .details.phases.release="success"' <<< "$receipt") ;;
+            valid) ;;
+            *) exit 99 ;;
+        esac
+        printf '%s\n' "$receipt"
+        exit "$rc"
         ;;
     *) exit 99 ;;
 esac
@@ -1190,6 +1233,10 @@ gh_api() {
     esac
 }
 json_envelope() {
+    if [[ "${DSR_WATCH_FIXTURE_REPORT_REFUSAL:-false}" == true && "$1" == fallback ]]; then
+        printf 'injected final fallback report failure\n' >&2
+        return 73
+    fi
     jq -nc --arg command "$1" --arg status "$2" --argjson code "$3" --argjson details "$4" \
         '{command:$command,status:$status,exit_code:$code,details:$details}'
 }
@@ -1241,6 +1288,7 @@ cmd_build() {
         > "$out/ntm-v1.2.3-manifest.json"
 }
 cmd_release() {
+    printf 'published\n' >> "$TEST_TMPDIR/release.calls" || return 4
     act_get_local_path ntm > "$TEST_TMPDIR/release-source" || return 4
     printf '%s\n' '{"command":"release","status":"success","exit_code":0,"details":{"repo":"Dicklesworthstone/ntm","tag":"v1.2.3","release_id":9,"draft":false}}'
 }
@@ -1265,7 +1313,8 @@ EOF
     assert_equal "0" "$status"
     _watch_completed
     attempt=$(jq -r '.attempts["12345"].attempt_id' "$DSR_STATE_DIR/triggered.json")
-    jq -e '.exit_code == 0' "$DSR_STATE_DIR/watch-attempts/$attempt/completion.json"
+    jq -e '.exit_code == 0 and .result_status == "valid" and
+        (.result_sha256 | test("^[0-9a-f]{64}$"))' "$DSR_STATE_DIR/watch-attempts/$attempt/completion.json"
     jq -e '.status == "success" and .details.isolated_source and
         .details.source_materialization.transport == "local-objects" and .details.phases.release == "success"' \
         "$DSR_STATE_DIR/watch-attempts/$attempt/result.json"
@@ -1279,6 +1328,11 @@ EOF
     assert_equal "$before_index" "$(git hash-object "$checkout/.git/index")"
     assert_equal "$before_source" "$(git hash-object "$checkout/source.txt")"
     assert_equal 'untracked work' "$(cat "$checkout/private.txt")"
+    run _routing_watch "$(_watch_run_json "$DSR_WATCH_PINNED_SHA")" --auto-fallback
+    assert_equal 0 "$status"
+    jq -e '.attempts["12345"] | .status == "succeeded" and .result_status == "valid" and .attempt == 1' \
+        "$DSR_STATE_DIR/triggered.json"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/release.calls" | tr -d ' ')"
 }
 
 @test "watch admission refuses an upstream success observed after the queued poll" {
@@ -1852,6 +1906,216 @@ EOF
     done
 }
 
+# The child transport is controlled, while dispatch, inherited leases,
+# completion issuance, journal reconciliation and repeated public watch calls
+# execute unchanged. Faults alter only the child's result channel.
+_watch_refuse_completion_receipt() {
+    local mode="$1" child_status="${2:-0}" check_json attempt directory
+    harness_create_config
+    _watch_configure_ntm
+    check_json=$(_watch_run_json)
+    DSR_WATCH_FIXTURE_RECEIPT="$mode" DSR_WATCH_FIXTURE_STATUS="$child_status" \
+        run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal 0 "$status"
+    _watch_completed
+    attempt=$(jq -r '.attempts["12345"].attempt_id' "$DSR_STATE_DIR/triggered.json")
+    directory="$DSR_STATE_DIR/watch-attempts/$attempt"
+    cp "$directory/result.json" "$TEST_TMPDIR/retained-result.json"
+    cp "$directory/completion.json" "$TEST_TMPDIR/retained-completion.json"
+
+    run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal 0 "$status"
+    assert_equal blocked "$(jq -r '.attempts["12345"].status' "$DSR_STATE_DIR/triggered.json")"
+    jq -e --argjson rc "$child_status" '.attempts["12345"] |
+        .attempt == 1 and .exit_code == $rc and .next_retry_at == null and (.error | length > 0)' \
+        "$DSR_STATE_DIR/triggered.json"
+    cmp "$TEST_TMPDIR/retained-result.json" "$directory/result.json"
+    cmp "$TEST_TMPDIR/retained-completion.json" "$directory/completion.json"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+}
+
+@test "watch completion receipt refuses empty successful child output" {
+    _watch_refuse_completion_receipt empty
+}
+
+@test "watch completion receipt refuses malformed successful child output" {
+    _watch_refuse_completion_receipt malformed
+}
+
+@test "watch completion receipt refuses multiple result documents" {
+    _watch_refuse_completion_receipt multiple
+}
+
+@test "watch completion receipt binds the scheduled tool" {
+    _watch_refuse_completion_receipt wrong-tool
+}
+
+@test "watch completion receipt binds the scheduled repository" {
+    _watch_refuse_completion_receipt wrong-repo
+}
+
+@test "watch completion receipt binds the scheduled release tag" {
+    _watch_refuse_completion_receipt wrong-tag
+}
+
+@test "watch completion receipt binds the scheduled source commit" {
+    _watch_refuse_completion_receipt wrong-source
+}
+
+@test "watch completion receipt binds the private output directory" {
+    _watch_refuse_completion_receipt wrong-output
+}
+
+@test "watch completion receipt binds the worker run identity" {
+    _watch_refuse_completion_receipt wrong-run
+}
+
+@test "watch completion receipt binds the exact upstream admission" {
+    _watch_refuse_completion_receipt wrong-admission
+}
+
+@test "watch completion receipt agrees with the actual process outcome" {
+    _watch_refuse_completion_receipt wrong-exit
+}
+
+@test "watch completion receipt refuses contradictory success status" {
+    _watch_refuse_completion_receipt wrong-status
+}
+
+@test "watch completion receipt requires confirmed publication" {
+    _watch_refuse_completion_receipt unpublished
+}
+
+@test "watch completion receipt refuses a build-only result" {
+    _watch_refuse_completion_receipt build-only
+}
+
+@test "watch completion receipt does not retry post-publication cleanup failure" {
+    _watch_refuse_completion_receipt post-publication-error 4
+}
+
+@test "watch completion receipt never retries an unverified failed child" {
+    _watch_refuse_completion_receipt empty 8
+}
+
+@test "watch completion receipt detects changed result bytes before reconciliation" {
+    harness_create_config
+    _watch_configure_ntm
+    local check_json attempt directory
+    check_json=$(_watch_run_json)
+    run _routing_watch "$check_json" --auto-fallback
+    assert_equal 0 "$status"
+    _watch_completed
+    attempt=$(jq -r '.attempts["12345"].attempt_id' "$DSR_STATE_DIR/triggered.json")
+    directory="$DSR_STATE_DIR/watch-attempts/$attempt"
+    # Even a semantically equivalent rewrite cannot replace the worker's
+    # original result evidence after its completion receipt was issued.
+    printf ' \n' >> "$directory/result.json"
+    cp "$directory/result.json" "$TEST_TMPDIR/changed-result.json"
+    cp "$directory/completion.json" "$TEST_TMPDIR/original-completion.json"
+    run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal 0 "$status"
+    assert_equal blocked "$(jq -r '.attempts["12345"].status' "$DSR_STATE_DIR/triggered.json")"
+    cmp "$TEST_TMPDIR/changed-result.json" "$directory/result.json"
+    cmp "$TEST_TMPDIR/original-completion.json" "$directory/completion.json"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+}
+
+@test "watch completion receipt refuses legacy unbound completion evidence" {
+    harness_create_config
+    _watch_configure_ntm
+    local check_json attempt directory
+    check_json=$(_watch_run_json)
+    run _routing_watch "$check_json" --auto-fallback
+    assert_equal 0 "$status"
+    _watch_completed
+    attempt=$(jq -r '.attempts["12345"].attempt_id' "$DSR_STATE_DIR/triggered.json")
+    directory="$DSR_STATE_DIR/watch-attempts/$attempt"
+    jq 'del(.result_status,.result_sha256)' "$directory/completion.json" > "$TEST_TMPDIR/legacy-completion.json"
+    cp "$TEST_TMPDIR/legacy-completion.json" "$directory/completion.json"
+    run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal 0 "$status"
+    assert_equal blocked "$(jq -r '.attempts["12345"].status' "$DSR_STATE_DIR/triggered.json")"
+    cmp "$TEST_TMPDIR/legacy-completion.json" "$directory/completion.json"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+}
+
+_watch_refuse_saved_failure() {
+    local mode="$1" check_json attempt directory preview
+    harness_create_config
+    _watch_configure_ntm
+    check_json=$(_watch_run_json)
+    DSR_WATCH_FIXTURE_STATUS=8 run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal 0 "$status"
+    _watch_completed
+    run _routing_watch '{"details":{"throttled":[]}}'
+    assert_equal 0 "$status"
+    jq -e '.attempts["12345"] | .status == "failed" and .result_status == "valid"' \
+        "$DSR_STATE_DIR/triggered.json"
+    attempt=$(jq -r '.attempts["12345"].attempt_id' "$DSR_STATE_DIR/triggered.json")
+    directory="$DSR_STATE_DIR/watch-attempts/$attempt"
+    if [[ "$mode" == legacy ]]; then
+        # Begin with an actual completed child, then retain the old journal
+        # format that recorded only its exit. No new success is invented.
+        jq 'del(.result_status,.result_sha256)' "$directory/completion.json" > "$TEST_TMPDIR/old-completion.json"
+        cp "$TEST_TMPDIR/old-completion.json" "$directory/completion.json"
+        jq 'del(.attempts["12345"].result_status) | .attempts["12345"].next_retry_at=0' \
+            "$DSR_STATE_DIR/triggered.json" > "$TEST_TMPDIR/saved-failure.json"
+    else
+        # A once-valid failed result can also change after reconciliation.
+        # Retry admission must recheck the retained evidence, not its label.
+        printf ' \n' >> "$directory/result.json"
+        jq '.attempts["12345"].next_retry_at=0' "$DSR_STATE_DIR/triggered.json" > "$TEST_TMPDIR/saved-failure.json"
+    fi
+    cp "$TEST_TMPDIR/saved-failure.json" "$DSR_STATE_DIR/triggered.json"
+    cp "$directory/result.json" "$TEST_TMPDIR/saved-failure-result.json"
+    cp "$directory/completion.json" "$TEST_TMPDIR/saved-failure-completion.json"
+    _mock_watch_upstream_run "$(_watch_upstream_run_json completed failure)"
+    for preview in true false; do
+        local -a args=(--auto-fallback --retry-delay 1)
+        [[ "$preview" != true ]] || args+=(--dry-run)
+        run _routing_watch "$check_json" "${args[@]}"
+        assert_equal 0 "$status"
+        [[ "$output" != *"Would trigger"* ]]
+        run _routing_watch '{"details":{"throttled":[]}}' "${args[@]}"
+        assert_equal 0 "$status"
+        [[ "$output" != *"Would trigger"* ]]
+        cmp "$TEST_TMPDIR/saved-failure.json" "$DSR_STATE_DIR/triggered.json"
+        cmp "$TEST_TMPDIR/saved-failure-result.json" "$directory/result.json"
+        cmp "$TEST_TMPDIR/saved-failure-completion.json" "$directory/completion.json"
+    done
+    [[ ! -e "$TEST_TMPDIR/watch-upstream.calls" ]]
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+}
+
+@test "watch completion receipt retains legacy failed history without queued or terminal replay" {
+    _watch_refuse_saved_failure legacy
+}
+
+@test "watch completion receipt rechecks failed result bytes at every retry admission" {
+    _watch_refuse_saved_failure changed
+}
+
+@test "watch completion receipt blocks real fallback report failure after publication" {
+    _watch_isolated_pipeline_fixture
+    export DSR_WATCH_FIXTURE_REPORT_REFUSAL=true
+    local check_json attempt directory
+    check_json=$(_watch_run_json "$DSR_WATCH_PINNED_SHA")
+    run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal 0 "$status"
+    _watch_completed
+    attempt=$(jq -r '.attempts["12345"].attempt_id' "$DSR_STATE_DIR/triggered.json")
+    directory="$DSR_STATE_DIR/watch-attempts/$attempt"
+    [[ -f "$TEST_TMPDIR/release-source" && ! -s "$directory/result.json" ]]
+    assert_equal 4 "$(jq -r .exit_code "$directory/completion.json")"
+    run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal 0 "$status"
+    assert_equal blocked "$(jq -r '.attempts["12345"].status' "$DSR_STATE_DIR/triggered.json")"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/release.calls" | tr -d ' ')"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    grep -q 'injected final fallback report failure' "$DSR_STATE_DIR/fallback-12345.log"
+}
+
 @test "watch recovery retains a successful child across once invocations" {
     harness_create_config
     _watch_configure_ntm
@@ -1918,9 +2182,30 @@ case "$DSR_RUN_ID" in
     watch-12348-*) exit 131 ;;
     watch-12349-*) exit 137 ;;
     watch-12350-*) exit 143 ;;
-    watch-12351-*) exit 6 ;;
+    watch-12351-*) ;;
     *) exit 99 ;;
 esac
+# An ordinary build refusal has a complete error report, unlike a crash.
+# Bind that report to the actual child invocation before returning exit 6.
+tool="$1"; shift
+version="" source="" output="" admission=""
+while (($#)); do
+    case "$1" in
+        --version) version="$2"; shift 2 ;;
+        --expected-sha) source="$2"; shift 2 ;;
+        --output-dir) output="$2"; shift 2 ;;
+        --watch-admission) admission="$2"; shift 2 ;;
+        --isolate-source|--resume=*) shift ;;
+        *) exit 99 ;;
+    esac
+done
+jq -nc --arg tool "$tool" --arg version "$version" --arg sha "$source" \
+    --arg output "$output" --arg run "$DSR_RUN_ID" --argjson admission "$admission" '
+    {command:"fallback",status:"error",exit_code:6,
+     details:{tool:$tool,repo:$admission.repo,version:$version,expected_sha:$sha,
+       output_dir:$output,run_id:$run,build_only:false,watch_admission:$admission,
+       phase:"build",phases:{release:"blocked"}}}' || exit 99
+exit 6
 EOF
     DSR_WATCH_FIXTURE_FALLBACK="$TEST_TMPDIR/interrupted-fallback" \
         run _routing_watch "$check_json" --auto-fallback --retry-delay 1 --max-attempts 2 --max-concurrent 7
@@ -3312,7 +3597,13 @@ fi
         runs_path.write_text(json.dumps(runs))
         result = invoke(case, env, "second")
         attempts = result["details"]["triggered_state"]["attempts"]
-        assert attempts["12345"]["status"] == "failed", attempts
+        # Configuration resolution stopped before fallback could emit its
+        # bound result. Retain that unknown outcome without consuming a slot
+        # or allowing an automatic publication retry.
+        assert attempts["12345"]["status"] == "blocked", attempts
+        assert attempts["12345"]["result_status"] == "invalid", attempts
+        assert attempts["12345"]["exit_code"] == 4, attempts
+        assert attempts["12345"]["next_retry_at"] is None, attempts
         assert attempts["12345"]["attempt"] == 1 and "12346" in attempts, attempts
         wait_for_completion(case, 12346)
         print("PASS watcher notification progress:", event, flush=True)

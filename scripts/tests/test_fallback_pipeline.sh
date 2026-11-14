@@ -397,6 +397,23 @@ test_success() {
         jq -e '.details.artifacts_count==2 and .details.phases.release=="success"' "$CASE/stdout" >/dev/null &&
         [[ ! -e "$OUT/tool-1.2.3-SHA256SUMS.txt" ]]
 }
+test_final_result_write_failure() {
+    setup final-result-write-failure
+    # The release transport confirms publication, but the final JSON output
+    # cannot be written. A later caller must not mistake that silence for a
+    # complete success, and no success notification may hide the lost report.
+    json_envelope() {
+        [[ "$1" == fallback ]] || return 99
+        printf 'injected final fallback report failure\n' >&2
+        return 73
+    }
+    run_fallback
+    printf 'Final result write refusal: fallback exit %s\n' "$RC"
+    [[ "$RC" == 4 && ! -s "$CASE/stdout" && ! -e "$CASE/lock" ]] &&
+        grep -q '^RELEASE ' "$CALLS" && grep -q '^UNLOCK ' "$CALLS" &&
+        ! grep -q '^NOTIFY fallback.success$' "$CALLS" &&
+        grep -q 'Could not write the final fallback result' "$CASE/stderr"
+}
 test_throttle_check_interruption() {
     setup interrupted-throttle
     THROTTLE_RC=5 QUALITY_MUTATES_SOURCE=true
@@ -1838,6 +1855,7 @@ test_isolated_source_plan_and_arguments() {
 }
 
 run_test test_success
+run_test test_final_result_write_failure
 run_test test_throttle_check_interruption
 run_test test_throttle_check_manual_request 0
 run_test test_throttle_check_manual_request 8

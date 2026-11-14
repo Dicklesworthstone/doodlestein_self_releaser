@@ -2082,8 +2082,67 @@ _watch_interrupted_exit() {
     ((status == 5 || (status > 128 && status <= 255)))
 }
 
+# A process exit alone does not establish which release was completed. Bind
+# the untouched result channel to the scheduled invocation and observed exit,
+# then freeze its bytes. Reconciliation repeats this check after every child
+# holding the attempt lease has exited, so late writers cannot replace it.
+_watch_fallback_result_evidence() (
+    local path="$1" identity="$2" observed_exit="$3" before after facts
+    [[ -f "$path" && ! -L "$path" ]] || return 4
+    before=$(_release_sha256 "$path") || return 4
+    [[ "$before" =~ ^[0-9a-f]{64}$ ]] || return 4
+    facts=$(jq -ces --argjson identity "$identity" --argjson observed "$observed_exit" '
+        if length == 1 and (.[0] | type == "object" and
+            .command == "fallback" and .exit_code == $observed and
+            .status == (if $observed == 0 then "success" elif $observed == 1 then "partial" else "error" end) and
+            (.details | type == "object" and
+                {tool,repo,version,expected_sha,output_dir,run_id,watch_admission,build_only} == $identity and
+                (.watch_admission | type == "object") and
+                (.phase | type == "string" and length > 0) and
+                (.phases | type == "object" and
+                    (.release | IN("pending","blocked","failed","partial","success","skipped"))) and
+                (if $observed == 0 then .phase == "complete" and .phases.release == "success"
+                 else .phase != "plan" and .phase != "complete" end)))
+        then {publication_complete:(.[0].details.phases.release == "success")}
+        else error("fallback result does not match the scheduled invocation and observed exit") end
+    ' "$path" 2>/dev/null) || return 4
+    [[ -f "$path" && ! -L "$path" ]] || return 4
+    after=$(_release_sha256 "$path") || return 4
+    [[ "$after" == "$before" ]] || return 4
+    jq -nc --arg sha "$before" --argjson facts "$facts" '$facts + {sha256:$sha}'
+)
+
+# Older journals could label an unreported child failure as retryable. A saved
+# status alone cannot authorize another publication. Verify the original child
+# receipt again at retry admission, including previews, without changing it.
+_watch_retry_result_verified() (
+    local run_id="$1" record="$2" directory receipt identity evidence rc
+    jq -e '.status == "failed" and .result_status == "valid"' <<< "$record" >/dev/null || return 1
+    directory="$_WATCH_STATE_DIR/watch-attempts/$(jq -r '.attempt_id' <<< "$record")"
+    [[ -f "$directory/completion.json" && ! -L "$directory/completion.json" ]] || return 1
+    receipt=$(jq -ces --arg run "$run_id" --argjson record "$record" '
+        if length == 1 and (.[0] | type == "object" and
+            .run_id == $run and .attempt_id == $record.attempt_id and .attempt == $record.attempt and
+            .exit_code == $record.exit_code and .finished_epoch == $record.finished_epoch and
+            (.exit_code | type == "number" and floor == . and . > 0 and . <= 255) and
+            .result_status == "valid" and
+            (.result_sha256 | type == "string" and test("^[0-9a-f]{64}$")))
+        then .[0] else error("unbound retry completion") end
+    ' "$directory/completion.json" 2>/dev/null) || return 1
+    rc=$(jq -r .exit_code <<< "$receipt") || return 1
+    _watch_interrupted_exit "$rc" && return 1
+    identity=$(jq -c --arg run "$run_id" --arg output "$_WATCH_STATE_DIR/watch-artifacts/$run_id" '
+        {tool,repo,version,expected_sha:.head_sha,output_dir:$output,
+         run_id:("watch-" + $run + "-" + (.attempt | tostring)),
+         watch_admission,build_only:false}' <<< "$record") || return 1
+    evidence=$(_watch_fallback_result_evidence "$directory/result.json" "$identity" "$rc") || return 1
+    [[ "$(jq -r .sha256 <<< "$evidence")" == "$(jq -r .result_sha256 <<< "$receipt")" ]] || return 1
+    jq -e '.publication_complete == false' <<< "$evidence" >/dev/null
+)
+
 _watch_reconcile_attempts() {
     local state record run_id directory receipt rc now status updated=false delay attempt outcome
+    local result_identity result_evidence result_valid result_error
     state=$(_watch_load_triggered) || { log_error "Cannot read watcher recovery state"; return 4; }
     now=$(date +%s) || return 4
     while IFS= read -r run_id; do
@@ -2108,26 +2167,50 @@ _watch_reconcile_attempts() {
             attempt=$(jq -r '.attempt' <<< "$record")
             delay=$((_WATCH_RETRY_DELAY * (1 << (attempt - 1))))
             ((delay > _WATCH_BACKOFF_MAX)) && delay=$_WATCH_BACKOFF_MAX
+            result_identity=$(jq -c --arg run "$run_id" \
+                --arg output "$_WATCH_STATE_DIR/watch-artifacts/$run_id" '
+                {tool,repo,version,expected_sha:.head_sha,output_dir:$output,
+                 run_id:("watch-" + $run + "-" + (.attempt | tostring)),
+                 watch_admission,build_only:false}' <<< "$record") || return 4
+            result_valid=false
+            result_evidence=""
+            if jq -e '.result_status == "valid" and
+                    (.result_sha256 | type == "string" and test("^[0-9a-f]{64}$"))' \
+                    <<< "$receipt" >/dev/null 2>&1 &&
+               result_evidence=$(_watch_fallback_result_evidence "$directory/result.json" "$result_identity" "$rc") &&
+               [[ "$(jq -r .sha256 <<< "$result_evidence")" == "$(jq -r .result_sha256 <<< "$receipt")" ]]; then
+                result_valid=true
+            fi
             outcome=failed
-            if [[ "$rc" == 0 ]]; then
-                outcome=succeeded
-            elif _watch_interrupted_exit "$rc"; then
+            result_error=""
+            if _watch_interrupted_exit "$rc"; then
                 outcome=blocked
+                result_error="Fallback was interrupted; inspect retained outputs before manual recovery"
+            elif ! $result_valid; then
+                outcome=blocked
+                result_error="Fallback result is missing, changed or inconsistent with its completion; inspect retained evidence before manual recovery"
+            elif [[ "$rc" == 0 ]]; then
+                outcome=succeeded
+            elif jq -e '.publication_complete == true' <<< "$result_evidence" >/dev/null; then
+                outcome=blocked
+                result_error="Publication completed before fallback cleanup failed; inspect retained evidence before manual recovery"
             fi
             state=$(jq -c --arg id "$run_id" --arg outcome "$outcome" \
+                --arg error "$result_error" --argjson valid "$result_valid" \
                 --argjson receipt "$receipt" --argjson delay "$delay" '
                 .attempts[$id] += ({status:$outcome,
                     exit_code:$receipt.exit_code, finished_epoch:$receipt.finished_epoch,
+                    result_status:(if $valid then "valid" else "invalid" end),
                     next_retry_at:(if $outcome == "failed" then $receipt.finished_epoch + $delay else null end)}
                     + (if $outcome == "blocked" then
-                        {error:"Fallback was interrupted; inspect retained outputs before manual recovery"}
+                        {error:$error}
                        else {} end))
             ' <<< "$state") || return 4
             updated=true
-            if [[ "$rc" == 0 ]]; then
+            if [[ "$outcome" == succeeded ]]; then
                 log_ok "Fallback for run $run_id completed (attempt $attempt)"
             elif [[ "$outcome" == blocked ]]; then
-                log_warn "Fallback for run $run_id was interrupted (exit $rc); automatic retry blocked"
+                log_warn "Fallback for run $run_id requires manual recovery (exit $rc); automatic retry blocked: $result_error"
             else
                 log_warn "Fallback for run $run_id failed (exit $rc, attempt $attempt/$_WATCH_MAX_ATTEMPTS)"
             fi
@@ -2179,6 +2262,7 @@ _watch_run_attempt() (
     # The launcher acquired this descriptor before publishing the journal.
     # Keep it inherited by fallback and its descendants until they all exit.
     local attempt_fd="$9" isolate_source="${10}" watch_admission="${11}" rc=0 temporary finished
+    local result_identity result_evidence result_status=invalid result_sha="" result_error=""
     # The worker must outlive --once without keeping the watcher mutex held.
     _watch_release_lock
     trap - EXIT
@@ -2196,17 +2280,34 @@ _watch_run_attempt() (
     # The worker reports the terminal event only after its completion receipt
     # is durable. Suppress the fallback command's earlier terminal event.
     DSR_NOTIFY_ENABLED=false DSR_NOTIFY_METHODS=none "$0" "${args[@]}" > "$directory/result.json" || rc=$?
+    result_identity=$(jq -nc --arg tool "$tool" --arg version "$version" --arg sha "$sha" \
+        --arg output "$output" --arg run "$DSR_RUN_ID" --argjson admission "$watch_admission" '
+        {tool:$tool,repo:$admission.repo,version:$version,expected_sha:$sha,output_dir:$output,
+         run_id:$run,watch_admission:$admission,build_only:false}') || return 4
+    if result_evidence=$(_watch_fallback_result_evidence "$directory/result.json" "$result_identity" "$rc"); then
+        result_status=valid
+        result_sha=$(jq -r .sha256 <<< "$result_evidence") || return 4
+    else
+        result_error="Fallback did not produce one invocation-bound result matching its actual exit; publication outcome requires manual review"
+        log_error "$result_error (run $run_id, process exit $rc)"
+    fi
     finished=$(date +%s) || return 4
     temporary=$(mktemp "$directory/.completion.XXXXXXXX") || return 4
     jq -nc --arg run "$run_id" --arg id "${directory##*/}" --argjson attempt "$attempt" \
-        --argjson rc "$rc" --argjson finished "$finished" \
-        '{run_id:$run,attempt_id:$id,attempt:$attempt,exit_code:$rc,finished_epoch:$finished}' > "$temporary" || return 4
+        --argjson rc "$rc" --argjson finished "$finished" --arg result "$result_status" \
+        --arg sha "$result_sha" --arg error "$result_error" '
+        {run_id:$run,attempt_id:$id,attempt:$attempt,exit_code:$rc,finished_epoch:$finished,
+         result_status:$result,result_sha256:(if $sha == "" then null else $sha end)}
+        + (if $error == "" then {} else {error:$error} end)' > "$temporary" || return 4
     mv -- "$temporary" "$directory/completion.json" || return 4
     if [[ "${DSR_NOTIFY_ENABLED:-false}" == true ]]; then
         local phase event level title message
         phase=$(jq -ers 'select(length == 1) | .[0].details.phase | strings | select(length > 0)' \
             "$directory/result.json" 2>/dev/null) || phase=fallback
-        if [[ "$rc" == 0 ]]; then
+        if [[ "$result_status" != valid ]]; then
+            event=fallback.failed level=error title="Fallback outcome unverified"
+            message="$tool $version fallback stopped with an unverified result (exit $rc); inspect $directory before manual recovery"
+        elif [[ "$rc" == 0 ]]; then
             event=fallback.success level=success title="Release Complete"
             message="$tool $version released successfully"
         else
@@ -2226,6 +2327,7 @@ _watch_run_attempt() (
         fi
         notify_event "$event" "$level" "$title" "$message" "$DSR_RUN_ID:$tool:$version" >&2 || true
     fi
+    [[ "$result_status" == valid ]] || return 4
     return "$rc"
 )
 
@@ -2475,6 +2577,10 @@ _watch_terminal_retry_runs() {
             log_warn "Fallback for run $run_id was interrupted; automatic retry blocked"
             continue
         fi
+        if [[ "$pending" == false ]] && ! _watch_retry_result_verified "$run_id" "$record"; then
+            log_warn "Fallback for run $run_id lacks verified result evidence; automatic retry blocked"
+            continue
+        fi
         _watch_configured_repo_matches "$tool" "$repo" "$run_id" || continue
         observed_status=0
         observed=$(gh_api "repos/$repo/actions/runs/$run_id" --no-cache) || observed_status=$?
@@ -2657,6 +2763,10 @@ _watch_iteration() {
             completion_exit=$(jq -r '.exit_code // 0' <<< "$record") || return 4
             if _watch_interrupted_exit "$completion_exit"; then
                 log_warn "Fallback for run $run_id was interrupted; automatic retry blocked"
+                continue
+            fi
+            if ! _watch_retry_result_verified "$run_id" "$record"; then
+                log_warn "Fallback for run $run_id lacks verified result evidence; automatic retry blocked"
                 continue
             fi
             ((attempt < _WATCH_MAX_ATTEMPTS)) || continue
@@ -13499,7 +13609,10 @@ EOF
                     {watch_admission:$watch_admission,watch_observation:$watch_observation} end)
                 + (if $isolate_source then {isolated_source:true,source_materialization:$materialization} else {} end)
                 + (if $publication_recovery == null then {} else {publication_recovery:$publication_recovery} end)') || return 4
-            json_envelope fallback "$status" "$rc" "$details"
+            if ! json_envelope fallback "$status" "$rc" "$details"; then
+                log_error "Could not write the final fallback result; inspect retained publication evidence before retrying"
+                return 4
+            fi
         else
             log_info "Fallback $status: $tool_name $tag (phase: $phase; artifacts: $artifacts_count)"
             [[ -z "$error" ]] || log_error "$error"

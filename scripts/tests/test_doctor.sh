@@ -307,7 +307,7 @@ for command, phase, expected in cases:
                    else "doctor-fixture-token",
                GITHUB_TOKEN="", GH_TOKEN="", GH_HOST="enterprise.fixture.invalid",
                GH_API_TIMEOUT=("0" if phase == "invalid-deadline" else
-                               "10" if command == "watch" and phase == "user-error" else "1"),
+                               "10" if command == "watch" and not phase.endswith("timeout") else "1"),
                DSR_CONFIG_DIR=str(case / "config"), DSR_CONFIG_FILE=str(case / "config.yaml"),
                DSR_REPOS_FILE=str(case / "repos.yaml"), DSR_HOSTS_FILE=str(case / "hosts.yaml"),
                DSR_STATE_DIR=str(case / "state"), DSR_CACHE_DIR=str(case / "cache"),
@@ -316,7 +316,7 @@ for command, phase, expected in cases:
     args += ["--quick"] if command == "doctor" else ["--once", "--auto-fallback"]
     started = time.monotonic()
     result = subprocess.run(args, env=env, capture_output=True, text=True,
-                            timeout=20 if command == "watch" and phase == "user-error" else 8)
+                            timeout=20 if command == "watch" and not phase.endswith("timeout") else 8)
     elapsed = time.monotonic() - started
     (case / "stdout").write_text(result.stdout)
     (case / "stderr").write_text(result.stderr)
@@ -327,13 +327,19 @@ for command, phase, expected in cases:
     auth = [line for line in calls if line == "auth status --hostname github.com"]
     user = [line for line in calls if line == "api user --hostname github.com --jq .login"]
     tokens = [line for line in calls if line == "auth token --hostname github.com"]
-    if phase.endswith("timeout"):
+    # A watch budget covers doctor startup and both credential operations.
+    # It can expire before the optional user lookup starts. The standalone
+    # doctor/user-timeout case above still requires that exact probe to run.
+    early_watch_deadline = command == "watch" and phase == "user-timeout" and not (case / "started").exists()
+    if phase.endswith("timeout") and not early_watch_deadline:
         assert (case / "started").read_text() == "started\n", (command, phase, "repeated operation")
     if phase in ("token-timeout", "token-cancel", "token-missing", "invalid-deadline"):
         assert not auth and not user, (command, phase, calls)
         assert len(tokens) == (0 if phase == "invalid-deadline" else 1), (command, phase, calls)
     elif phase == "user-token-cancel":
         assert len(auth) == 1 and len(tokens) == 2 and not user, (command, phase, calls)
+    elif early_watch_deadline:
+        assert len(auth) <= 1 and not user and not tokens, (command, phase, calls)
     else:
         assert len(auth) == 1 and not tokens, (command, phase, calls)
         assert len(user) == (0 if phase.startswith("auth-") else 1), (command, phase, calls)
@@ -497,8 +503,11 @@ for phase, mode, engine, expected in cases:
         "tool_name: tool\nrepo: fixture/tool\nworkflow: release.yml\n")
     before = {str(p.relative_to(config)): hashlib.sha256(p.read_bytes()).hexdigest()
               for p in config.rglob("*") if p.is_file()}
-    healthy = phase in ("healthy", "stdin")
-    bound = "0" if phase == "invalid" else "10" if healthy else "1"
+    deadline_case = phase in ("gh", "git", "jq", "curl", "yq", "combined", "gh-resistant", "jq-all")
+    # Immediate refusal and cancellation exercise status propagation, not a
+    # one-second race with healthy diagnostic work. Every stalled-probe and
+    # cumulative-deadline case retains its original one-second budget.
+    bound = "0" if phase == "invalid" else "1" if deadline_case else "10"
     env = dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ["PATH"],
                DSR_PREFLIGHT_CASE=str(case), DSR_PREFLIGHT_PHASE=phase, DSR_PREFLIGHT_ENGINE=engine,
                DSR_GH_TOKEN="preflight-fixture-token", GITHUB_TOKEN="", GH_TOKEN="",
@@ -527,7 +536,7 @@ for phase, mode, engine, expected in cases:
                                text=True, start_new_session=True)
     try:
         out, err = process.communicate(input="watcher-caller-input\n" if phase == "stdin" else None,
-                                       timeout=20 if healthy else 8)
+                                       timeout=8 if deadline_case or phase == "invalid" else 20)
     except subprocess.TimeoutExpired:
         os.killpg(process.pid, signal.SIGKILL)
         out, err = process.communicate()
