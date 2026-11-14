@@ -16373,13 +16373,16 @@ _act_build_task_plan() {
     printf '%s\n' "$plan"
 }
 
-# Matrix success must originate from the selected native invocation. Never
-# manufacture missing or contradictory execution identity from a scheduler row.
-_act_matrix_result_matches() {
-    local result="$1" platform="$2" triple="$3"
-    [[ -z "$triple" ]] && return 0
-    jq -e --arg platform "$platform" --arg triple "$triple" '
-        .platform == $platform and .target_triple == $triple and .method == "native"
+# Every successful result belongs to one scheduled invocation, even when the
+# language has no Rust triple or the platform has only one configured variant.
+# Missing or contradictory execution identity cannot be supplied by a worker
+# receipt, a retained artifact inventory, or a scheduler's task-key overlay.
+_act_target_result_matches() {
+    local result="$1" platform="$2" triple="$3" method="$4" host="$5"
+    [[ -n "$platform" && -n "$host" && ( "$method" == native || "$method" == act ) ]] || return 1
+    jq -e --arg platform "$platform" --arg triple "$triple" --arg method "$method" --arg host "$host" '
+        .platform == $platform and .method == $method and .host == $host and
+        ($triple == "" or (.target_triple == $triple and .method == "native"))
     ' <<< "$result" >/dev/null 2>&1
 }
 
@@ -16469,8 +16472,9 @@ _act_build_orchestration_target() {
 
     _log_info "--- Building target: $target ---"
 
-    local result exit_code=0 full_output=""
+    local result exit_code=0 full_output="" result_method=native
     if act_platform_uses_act "$tool_name" "$target"; then
+        result_method=act
         if [[ "$strict_release_contract" == "true" ]]; then
             _log_error "Strict target configuration changed to an unbound build method"
             jq -nc '{status: "error", exit_code: 4, error: "Strict release targets must use native builds"}'
@@ -16593,11 +16597,12 @@ _act_build_orchestration_target() {
     local result_status
     result_status=$(jq -r '.status // "unknown"' <<< "$result")
     if [[ "$result_status" == success || "$result_status" == ok || "$result_status" == passed ]] && \
-       ! _act_matrix_result_matches "$result" "$target" "$selected_triple"; then
+       ! _act_target_result_matches "$result" "$target" "$selected_triple" "$result_method" "$host"; then
         exit_code=4
         result_status=failed
         result=$(jq -c '.status = "failed" | .exit_code = 4 |
-            .error = "Native variant result does not match the requested target triple"' <<< "$result") || return 4
+            .error = "Backend result does not match the scheduled platform, method, host or target triple" |
+            del(.resume_artifacts)' <<< "$result") || return 4
     fi
     if [[ "$strict_release_contract" == "true" ]]; then
         local staged_result
@@ -16779,7 +16784,8 @@ _act_run_target_worker() {
     local worker_output_path="${result_path}.stdout"
     [[ -n "$source_sync_receipt" ]] || source_sync_receipt=null
 
-    local host="${bound_host:-act-local}"
+    local host="${bound_host:-act-local}" worker_method=native
+    if act_platform_uses_act "$tool_name" "$target"; then worker_method=act; fi
     local slot_task="${task_key//\//-}"
     slot_task="${slot_task//@/-}"
     local slot_id="${run_id}-${slot_task}-attempt-${attempt}"
@@ -17022,11 +17028,12 @@ _act_run_target_worker() {
     fi
     result_status=$(jq -r '.status // "unknown"' <<< "$result")
     if [[ "$result_status" == success || "$result_status" == ok || "$result_status" == passed ]] && \
-       ! _act_matrix_result_matches "$result" "$target" "$selected_triple"; then
+       ! _act_target_result_matches "$result" "$target" "$selected_triple" "$worker_method" "$host"; then
         worker_status=4
         result_status=failed
         if ! result=$(jq -c '.status = "failed" | .exit_code = 4 |
-            .error = "Native worker result does not match the requested target triple"' <<< "$result"); then
+            .error = "Worker result does not match the scheduled platform, method, host or target triple" |
+            del(.resume_artifacts)' <<< "$result"); then
             _act_worker_release_slot
             trap - EXIT INT TERM HUP
             return 4
@@ -18127,7 +18134,7 @@ act_orchestrate_build() {
             fi
             # Inspect both authorities before admitting any resumed worker.
             # A valid embedded result cannot launder a differently purposed sidecar.
-            local resume_entry resume_map_entry resume_key resume_method resume_platform
+            local resume_entry resume_map_entry resume_key resume_method resume_platform resume_triple resume_host
             local resume_receipt resume_result_path resume_go_sha resume_go_ref
             if ! jq -e '.target_statuses | type == "object"' <<< "$resume_state" >/dev/null; then
                 _log_error "Resume target history is not a target-keyed map"
@@ -18143,9 +18150,18 @@ act_orchestrate_build() {
                 if ! resume_entry=$(jq -c '.value' <<< "$resume_map_entry") ||
                    ! resume_key=$(jq -r '.key' <<< "$resume_map_entry") ||
                    ! resume_method=$(jq -r --arg key "$resume_key" '.[] | select(.key==$key) | .method' <<< "$build_tasks_json") ||
-                   ! resume_platform=$(jq -r --arg key "$resume_key" '.[] | select(.key==$key) | .platform' <<< "$build_tasks_json"); then
+                   ! resume_platform=$(jq -r --arg key "$resume_key" '.[] | select(.key==$key) | .platform' <<< "$build_tasks_json") ||
+                   ! resume_triple=$(jq -r --arg key "$resume_key" '.[] | select(.key==$key) |
+                        if .key == .platform then "" else .target_triple end' <<< "$build_tasks_json") ||
+                   ! resume_host=$(jq -r '.host // ""' <<< "$resume_entry"); then
                     _act_release_orchestration_lock
                     return 4
+                fi
+                if $strict_release_contract; then
+                    resume_host=$(jq -r --arg key "$resume_key" '.[$key] // ""' <<< "$effective_task_hosts_json") || {
+                        _act_release_orchestration_lock
+                        return 4
+                    }
                 fi
                 if ! _act_prior_build_attempts "$resume_entry" >/dev/null; then
                     _log_error "Invalid source synchronization/readiness/build attempt counters in resume state"
@@ -18159,6 +18175,13 @@ act_orchestrate_build() {
                     _act_release_orchestration_lock
                     return 4
                 fi
+                if [[ -n "$resume_receipt" ]] &&
+                   jq -e '.status | IN("success", "ok", "passed")' <<< "$resume_receipt" >/dev/null &&
+                   ! _act_target_result_matches "$resume_receipt" "$resume_platform" "$resume_triple" "$resume_method" "$resume_host"; then
+                    _log_error "Resume target result does not belong to its scheduled invocation"
+                    _act_release_orchestration_lock
+                    return 4
+                fi
                 if $strict_release_contract && [[ "$resume_method" == native && -n "$resume_receipt" ]] &&
                    ! _act_validate_strict_native_result "$tool_name" "$resume_receipt" \
                        "$resume_go_sha" "$resume_go_ref" "$resume_platform"; then
@@ -18167,9 +18190,16 @@ act_orchestrate_build() {
                 fi
                 resume_result_path=$(jq -r '.result_path // empty' <<< "$resume_entry")
                 if [[ -n "$resume_result_path" && -s "$resume_result_path" ]]; then
-                    if ! resume_receipt=$(jq -ce '.' "$resume_result_path") || \
+                    if ! resume_receipt=$(jq -cse 'if length == 1 and (.[0] | type == "object") then .[0]
+                            else error("exactly one retained worker result required") end' "$resume_result_path") || \
                        ! _act_build_purpose_matches "$resume_receipt" "$build_purpose" "$strict_release_contract"; then
                         _log_error "Resume sidecar has missing or different build purpose"
+                        _act_release_orchestration_lock
+                        return 4
+                    fi
+                    if jq -e '.status | IN("success", "ok", "passed")' <<< "$resume_receipt" >/dev/null &&
+                       ! _act_target_result_matches "$resume_receipt" "$resume_platform" "$resume_triple" "$resume_method" "$resume_host"; then
+                        _log_error "Resume sidecar does not belong to its scheduled invocation"
                         _act_release_orchestration_lock
                         return 4
                     fi
@@ -18357,7 +18387,7 @@ act_orchestrate_build() {
     local start_time target_index=0
     start_time=$(date +%s)
     local -a worker_pids=() worker_targets=() worker_platforms=() worker_triples=()
-    local -a worker_results=() worker_logs=() worker_hosts=() worker_attempts=()
+    local -a worker_results=() worker_logs=() worker_hosts=() worker_methods=() worker_attempts=()
     local -a worker_output_paths=()
     local active_workers=0
     declare -A final_results=() worker_reaped=()
@@ -18416,10 +18446,12 @@ act_orchestrate_build() {
                 <<< "$finished_result" >/dev/null; then
             finished_result=$(_act_backend_result_json 0 "$finished_result") || return 4
         fi
-        if [[ "$(jq -r '.status // ""' <<< "$finished_result")" == success ]] && \
-           ! _act_matrix_result_matches "$finished_result" "$finished_platform" "$finished_triple"; then
-            finished_result=$(jq -c '.status = "failed" | .exit_code = 4 |
-                .error = "Completed native result has inconsistent variant identity"' <<< "$finished_result") || return 4
+        if jq -e '.status | IN("success", "ok", "passed")' <<< "$finished_result" >/dev/null && \
+           ! _act_target_result_matches "$finished_result" "$finished_platform" "$finished_triple" "${worker_methods[$index]}" "$host"; then
+            finished_result=$(jq -c --arg platform "$finished_platform" --arg host "$host" '
+                .status = "failed" | .exit_code = 4 | .platform = $platform | .host = $host |
+                .error = "Completed result does not belong to its scheduled invocation" |
+                del(.resume_artifacts)' <<< "$finished_result") || return 4
         fi
         finished_result=$(jq -c --arg log_path "$log_path" \
             --argjson attempt "$attempt" \
@@ -18670,18 +18702,21 @@ act_orchestrate_build() {
                 break
             fi
             if [[ -n "$persisted_result" ]] && \
-               _act_matrix_result_matches "$persisted_result" "$target" "$selected_triple" && \
+               _act_target_result_matches "$persisted_result" "$target" "$selected_triple" \
+                    "$(jq -r '.method' <<< "$task_json")" "$(jq -r '.host // ""' <<< "$persisted_entry")" && \
                [[ "$(jq -r '.task_key // ""' <<< "$persisted_result")" == "$task_key" ]] && \
                _act_target_result_available "$persisted_result" "$build_purpose" "$strict_release_contract" \
                     "$(jq -c '.workflow_source // null' <<< "$task_json")"; then
                 final_results["$task_key"]=$(jq -c '. + {resume_reused: true}' <<< "$persisted_result")
+                dispatch_hosts[$dispatch_index]=$(jq -r '.host' <<< "$persisted_entry")
                 _log_info "Resume: reusing completed target $task_key"
                 deferred_tasks=0
                 continue
             fi
             local recovered_result="" recovered_status=""
             if [[ -n "$persisted_result_path" && -s "$persisted_result_path" ]] &&
-               recovered_result=$(jq -ce '.' "$persisted_result_path" 2>/dev/null); then
+               recovered_result=$(jq -cse 'if length == 1 and (.[0] | type == "object") then .[0]
+                   else error("exactly one retained worker result required") end' "$persisted_result_path" 2>/dev/null); then
                 if ! _act_build_purpose_matches "$recovered_result" "$build_purpose" "$strict_release_contract"; then
                     _act_refuse_retained_target "Resume sidecar has missing or different build purpose: $target" "$prior_attempts"
                     break
@@ -18697,7 +18732,8 @@ act_orchestrate_build() {
                     _act_refuse_retained_target "Resume native sidecar lost its compiler policy binding: $target" "$prior_attempts"
                     break
                 fi
-                if _act_matrix_result_matches "$recovered_result" "$target" "$selected_triple" &&
+                if _act_target_result_matches "$recovered_result" "$target" "$selected_triple" \
+                        "$(jq -r '.method' <<< "$task_json")" "$(jq -r '.host // ""' <<< "$persisted_entry")" &&
                    [[ "$(jq -r '.task_key // ""' <<< "$recovered_result")" == "$task_key" ]] &&
                    _act_target_result_available "$recovered_result" "$build_purpose" "$strict_release_contract" \
                         "$(jq -c '.workflow_source // null' <<< "$task_json")"; then
@@ -18750,6 +18786,7 @@ act_orchestrate_build() {
                     persisted_result="$recovered_result"
                     if [[ "$recovered_status" == completed ]]; then
                         final_results["$task_key"]="$recovered_result"
+                        dispatch_hosts[$dispatch_index]=$(jq -r '.host' <<< "$persisted_entry")
                         _log_info "Resume: reconciled completed sidecar for $task_key"
                         deferred_tasks=0
                         continue
@@ -19014,6 +19051,7 @@ act_orchestrate_build() {
         worker_results+=("$result_path")
         worker_logs+=("$log_path")
         worker_hosts+=("$host")
+        worker_methods+=("$(jq -r '.method' <<< "$task_json")")
         worker_attempts+=("$attempt")
         active_workers=$((active_workers + 1))
 
@@ -19037,6 +19075,7 @@ act_orchestrate_build() {
 
     # Deterministic aggregation follows configured target order, never worker
     # completion order.
+    local aggregate_index=0
     while IFS= read -r task_json; do
         target=$(jq -r '.platform' <<< "$task_json")
         task_key=$(jq -r '.key' <<< "$task_json")
@@ -19077,14 +19116,18 @@ act_orchestrate_build() {
         fi
         if [[ "$(jq -r '.status // empty' <<< "$ordered_result")" == "success" ]] && \
            { ! _act_build_purpose_matches "$ordered_result" "$build_purpose" "$strict_release_contract" || \
-             ! _act_matrix_result_matches "$ordered_result" "$target" "$selected_triple"; }; then
-            ordered_result=$(jq -c '.status = "failed" | .exit_code = 4 |
-                .error = "Target purpose failed final aggregation"' <<< "$ordered_result") || return 4
+             ! _act_target_result_matches "$ordered_result" "$target" "$selected_triple" \
+                "$(jq -r '.method' <<< "$task_json")" "${dispatch_hosts[$aggregate_index]:-}"; }; then
+            ordered_result=$(jq -c --arg platform "$target" '
+                .status = "failed" | .exit_code = 4 | .platform = $platform |
+                .error = "Target purpose or scheduled invocation failed final aggregation" |
+                del(.resume_artifacts)' <<< "$ordered_result") || return 4
         fi
         ordered_result=$(jq -c --arg purpose "$build_purpose" --arg task_key "$task_key" \
             '. + {build_purpose: $purpose, publishable: ($purpose == "release"), task_key:$task_key}' \
             <<< "$ordered_result") || return 4
         results+=("$ordered_result")
+        aggregate_index=$((aggregate_index + 1))
         if [[ "$(jq -r '.status // "unknown"' <<< "$ordered_result")" == "success" ]]; then
             success_count=$((success_count + 1))
         else

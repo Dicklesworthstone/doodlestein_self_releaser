@@ -21,6 +21,8 @@
 # with actual archives/receipts; GNU/musl worker selection is fixture metadata.
 # --backend-receipt-only exercises exact backend stdout admission and proves
 # diagnostic JSON cannot become durable success or reusable artifact evidence.
+# --invocation-identity-only exercises singleton execution identity through
+# coordinator completion and exact-run resume of real frozen artifact bytes.
 
 set -uo pipefail
 
@@ -188,9 +190,15 @@ def fixture(boundary, name):
 cases = ('valid-pretty', 'valid-failure', 'success-nonzero', 'success-declared-failure',
          'success-string-exit', 'success-null-exit', 'failure-zero', 'failure-mismatched-exit',
          'unknown-status', 'stderr-only', 'empty-zero', 'missing-nonzero', 'chatter',
-         'multiple', 'trailing-malformed', 'null', 'array')
+         'multiple', 'trailing-malformed', 'null', 'array', 'wrong-platform',
+         'missing-platform', 'wrong-method', 'missing-method', 'wrong-host', 'missing-host')
 for boundary in ('native', 'act', 'worker'):
     for name in cases:
+        # Workflow producers do not select their task identity: the production
+        # orchestration adapter supplies it from the actual act invocation.
+        # Native producers and completed worker receipts must retain theirs.
+        if boundary == 'act' and name.startswith(('wrong-', 'missing-')) and name != 'missing-nonzero':
+            continue
         case, artifact, receipt = fixture(boundary, name)
         raw = json.dumps(receipt, indent=2) + '\n'
         # This is real diagnostic output at the controlled backend boundary.
@@ -215,6 +223,16 @@ for boundary in ('native', 'act', 'worker'):
             expected = 4 if name == 'failure-zero' else 23
         elif name == 'unknown-status':
             receipt['status'] = 'unknown'
+            raw = json.dumps(receipt) + '\n'
+            expected = 4
+        elif name in ('wrong-platform', 'missing-platform', 'wrong-method',
+                      'missing-method', 'wrong-host', 'missing-host'):
+            field = name.split('-', 1)[1]
+            if name.startswith('missing-'):
+                receipt.pop(field)
+            else:
+                receipt[field] = {'platform': 'darwin/arm64', 'host': 'different-builder',
+                                  'method': 'act' if boundary == 'native' else 'native'}[field]
             raw = json.dumps(receipt) + '\n'
             expected = 4
         elif name in ('stderr-only', 'empty-zero', 'missing-nonzero'):
@@ -757,7 +775,7 @@ def fixture(name, count):
     special = artifact_dir / "quote'comma,unicode-界面\nartifact"
     special.write_bytes(b'framing boundary\n')
     (case / 'backend.json').write_text(json.dumps({
-        'platform': 'linux/amd64', 'method': 'act', 'status': 'success',
+        'platform': 'linux/amd64', 'method': 'act', 'host': 'act-local', 'status': 'success',
         'exit_code': 0, 'artifact_dir': str(artifact_dir),
         'artifact_paths': sorted(map(str, artifact_dir.iterdir()))}) + '\n')
     return case
@@ -1956,7 +1974,7 @@ def wait_for(process, predicate, label):
 worker = root / 'native.py'
 worker.write_text(r'''import json, os, stat, sys, time
 from pathlib import Path
-case, target, attempt, mode = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4]
+case, target, attempt, mode, host = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5]
 slug = target.replace('/', '-') + '.attempt-' + str(attempt)
 descriptor, null = os.fstat(0), os.stat(os.devnull)
 is_null = stat.S_ISCHR(descriptor.st_mode) and descriptor.st_rdev == null.st_rdev
@@ -1982,7 +2000,7 @@ if mode in ('child-malformed-zero', 'child-malformed-exit'):
 artifact = case / 'output' / (slug + '.bin')
 artifact.write_bytes(('artifact for ' + target + '\n').encode())
 status = 'ok' if mode == 'child-ok-exit' else 'passed' if mode == 'child-passed-exit' else 'success'
-print(json.dumps(dict(platform=target, method='native', status=status, exit_code=0,
+print(json.dumps(dict(platform=target, method='native', host=host, status=status, exit_code=0,
                      artifact_path=str(artifact), artifact_paths=[str(artifact)])), flush=True)
 ''')
 
@@ -2063,7 +2081,7 @@ act_run_native_build() {
             source "$DSR_STDIN_MODULE"
             host_health_is_ready() {
                 _act_run_with_timeout 10 python3 "$DSR_STDIN_WORKER" \
-                    "$DSR_STDIN_CASE" "$platform" "$attempt" readiness
+                    "$DSR_STDIN_CASE" "$platform" "$attempt" readiness "$host"
             }
             act_run_native_build "$@"
         )
@@ -2075,14 +2093,14 @@ act_run_native_build() {
     [[ "$DSR_STDIN_MODE" != cancel && "$DSR_STDIN_MODE" != custody-cancel ]] || deadline=60
     if [[ "$DSR_STDIN_MODE" == timeout && "$2" == linux/amd64 ]]; then deadline=1; fi
     _act_run_with_timeout "$deadline" python3 "$DSR_STDIN_WORKER" \
-        "$DSR_STDIN_CASE" "$2" "$attempt" "$native_mode"
+        "$DSR_STDIN_CASE" "$2" "$attempt" "$native_mode" "$8"
 }
 # Explicit fault injection at the worker boundary tests the real parent's
 # recovery of a missing receipt, including an actual uncatchable child death.
 case "$DSR_STDIN_MODE" in
     missing-receipt) _act_run_target_worker() { return 0; } ;;
     killed-worker) _act_run_target_worker() { kill -KILL "$BASHPID"; } ;;
-    coordinator-exit|coordinator-stream)
+    coordinator-exit|coordinator-stream|coordinator-identity)
         # The real coordinator must reject a damaged terminal receipt even
         # when the outer worker exits zero. Preserve its original bytes.
         _act_run_target_worker() {
@@ -2091,14 +2109,25 @@ case "$DSR_STDIN_MODE" in
             artifact="$DSR_STDIN_CASE/output/coordinator-$slug.bin"
             printf 'retained artifact for %s\n' "$4" > "$artifact" || return 4
             printf 'Injected incoherent worker receipt\n' >> "$6" || return 4
-            result=$(jq -nc --arg target "$4" --arg artifact "$artifact" \
-                '{platform:$target,task_key:$target,method:"native",status:"success",exit_code:0,
+            result=$(jq -nc --arg target "$4" --arg artifact "$artifact" --arg host "${13}" \
+                '{platform:$target,task_key:$target,method:"native",host:$host,status:"success",exit_code:0,
                   build_purpose:"release",publishable:true,artifact_path:$artifact}') || return 4
             receipts=$(_act_result_artifact_receipts "$result") || return 4
             result=$(jq -c --argjson receipts "$receipts" \
                 '. + {resume_artifacts:$receipts}' <<< "$result") || return 4
             if [[ "$DSR_STDIN_MODE" == coordinator-exit ]]; then
                 result=$(jq -c '.exit_code=17' <<< "$result") || return 4
+            elif [[ "$DSR_STDIN_MODE" == coordinator-identity ]]; then
+                # Each row corrupts a different identity field while retaining
+                # its real frozen artifact and matching scheduled task key.
+                case "$4" in
+                    linux/amd64) result=$(jq -c '.platform="darwin/arm64"' <<< "$result") ;;
+                    linux/arm64) result=$(jq -c 'del(.platform)' <<< "$result") ;;
+                    darwin/amd64) result=$(jq -c '.method="act"' <<< "$result") ;;
+                    darwin/arm64) result=$(jq -c 'del(.method)' <<< "$result") ;;
+                    windows/amd64) result=$(jq -c '.host="different-builder"' <<< "$result") ;;
+                    windows/arm64) result=$(jq -c 'del(.host)' <<< "$result") ;;
+                esac
             fi
             printf '%s\n' "$result" > "$7" || return 4
             if [[ "$DSR_STDIN_MODE" == coordinator-stream ]]; then
@@ -2115,7 +2144,7 @@ case "$DSR_STDIN_MODE" in
         _act_build_orchestration_target() {
             local mode=success
             [[ "$4" != linux/amd64 ]] || mode="$DSR_STDIN_MODE"
-            python3 "$DSR_STDIN_WORKER" "$DSR_STDIN_CASE" "$4" "$attempt" "$mode" || return $?
+            python3 "$DSR_STDIN_WORKER" "$DSR_STDIN_CASE" "$4" "$attempt" "$mode" "${10}" || return $?
             case "$mode" in
                 child-success-killed) kill -KILL "$BASHPID" ;;
                 child-*-exit) return 9 ;;
@@ -2188,7 +2217,7 @@ def invoke(case, identity, jobs, mode, phase, retry_max=3, expected_code=None):
                                stdout=out, stderr=err, start_new_session=True)
     try:
         if phase == 'first' and mode not in ('missing-receipt', 'killed-worker',
-                                            'coordinator-exit', 'coordinator-stream'):
+                                            'coordinator-exit', 'coordinator-stream', 'coordinator-identity'):
             # Each admitted worker blocks in its capacity prelude. The next
             # batch cannot start until we release this exact initial wave.
             wait_for(process, lambda: len(list(case.glob('prelude.*.ready'))) == jobs,
@@ -2227,7 +2256,7 @@ def invoke(case, identity, jobs, mode, phase, retry_max=3, expected_code=None):
             if mode.startswith('child-') else {
             'success': 0, 'failure': 1, 'timeout': 1, 'readiness': 1, 'cancel': 130,
             'missing-receipt': 6, 'killed-worker': 6,
-            'coordinator-exit': 6, 'coordinator-stream': 6}[mode]
+            'coordinator-exit': 6, 'coordinator-stream': 6, 'coordinator-identity': 6}[mode]
     check(case.name + '/' + phase + ': aggregate preserves the real exit status', code == expected_code)
     check(case.name + '/' + phase + ': exactly six ordered target rows',
           value['run_id'] == identity and value['summary']['total'] == 6 and
@@ -2293,6 +2322,77 @@ def verify_attempts(case, value, state, expected_counts, expected_codes, label, 
     check(label + ': target completion does not claim finalized publication',
           (state['status'] == 'targets-complete') == completed and
           state['status'] != 'completed' and not (case / 'output/.dsr-build-purpose.json').exists())
+
+
+def invocation_identity_cases():
+    for jobs in (1, 3):
+        case, identity = fixture(jobs, 'invocation-valid')
+        first, state = invoke(case, identity, jobs, 'success', 'first')
+        verify_attempts(case, first, state, {target: 1 for target in targets}, {}, case.name + '/first')
+        resumed, state = invoke(case, identity, jobs, 'success', 'resume')
+        check(case.name + ': matching singleton outputs are reused without another backend',
+              len(events(case)) == 6 and all(row.get('resume_reused') for row in resumed['targets']) and
+              all(row['host'] == 'host-' + row['platform'].replace('/', '-') and
+                  row['method'] == 'native' for row in resumed['targets']))
+        state_path = case / 'state/builds/stdinfixture/1.0.0' / identity / 'state.json'
+        sidecar = Path(state['target_statuses'][targets[0]]['result_path'])
+        original_state, original_sidecar = state_path.read_bytes(), sidecar.read_bytes()
+        original_events = events(case)
+        artifacts = {path: path.read_bytes() for path in (case / 'output').glob('*.bin')}
+        for boundary in ('embedded', 'sidecar'):
+            for field in ('platform', 'method', 'host'):
+                for missing in (False, True):
+                    # Each corruption is a fresh test of the same completed
+                    # invocation. Restore only these fixture-owned bytes;
+                    # production recovery must never perform this rewrite.
+                    state_path.write_bytes(original_state)
+                    sidecar.write_bytes(original_sidecar)
+                    candidate = json.loads(original_state if boundary == 'embedded' else original_sidecar)
+                    row = candidate['target_statuses'][targets[0]]['result'] if boundary == 'embedded' else candidate
+                    if missing:
+                        row.pop(field)
+                    else:
+                        row[field] = {'platform': 'darwin/arm64', 'method': 'act',
+                                      'host': 'different-builder'}[field]
+                    changed = state_path if boundary == 'embedded' else sidecar
+                    changed.write_text(json.dumps(candidate) + '\n')
+                    before_state, before_sidecar = state_path.read_bytes(), sidecar.read_bytes()
+                    label = 'resume-%s-%s-%s' % (boundary, 'missing' if missing else 'wrong', field)
+                    refused = subprocess.run(['bash', str(driver)], stdin=subprocess.DEVNULL,
+                                             env=invocation_env(case, identity, jobs, 'success', label),
+                                             capture_output=True, timeout=45)
+                    (case / (label + '.stdout')).write_bytes(refused.stdout)
+                    (case / (label + '.stderr')).write_bytes(refused.stderr)
+                    check(case.name + '/' + label + ': refuse before any new backend or checkpoint change',
+                          refused.returncode == 4 and b'does not belong to its scheduled invocation' in refused.stderr and
+                          events(case) == original_events and state_path.read_bytes() == before_state and
+                          sidecar.read_bytes() == before_sidecar and
+                          all(path.read_bytes() == data for path, data in artifacts.items()))
+        state_path.write_bytes(original_state)
+        sidecar.write_bytes(original_sidecar)
+
+        case, identity = fixture(jobs, 'coordinator-identity')
+        first, state = invoke(case, identity, jobs, 'coordinator-identity', 'first')
+        check(case.name + ': foreign singleton receipts never become completed targets',
+              not events(case) and first['summary'] == {'total': 6, 'success': 0, 'failed': 6} and
+              state['status'] == 'failed' and not (case / 'output/.dsr-build-purpose.json').exists())
+        for row in first['targets']:
+            target = row['platform']
+            saved = state['target_statuses'][target]
+            retained = case / ('coordinator-' + target.replace('/', '-') + '.retained')
+            check(case.name + ': reject ' + target + ' while preserving the original sidecar and artifact',
+                  row['status'] == 'failed' and row['exit_code'] == 4 and not row.get('resume_artifacts') and
+                  saved['status'] == 'failed' and saved['result'] == row and
+                  Path(row['result_path']).read_bytes() == retained.read_bytes() and
+                  read(retained)['status'] == 'success' and bool(read(retained)['resume_artifacts']) and
+                  Path(row['artifact_path']).read_bytes() == ('retained artifact for ' + target + '\n').encode())
+
+
+if sys.argv[3] in ('all', '--invocation-identity-only'):
+    invocation_identity_cases()
+if sys.argv[3] == '--invocation-identity-only':
+    print('Invocation identity: %d checks passed' % checks, flush=True)
+    raise SystemExit(0)
 
 
 def coordinator_custody_cases():
@@ -2959,7 +3059,7 @@ payload = root / 'payload.py'
 payload.write_text(r'''import json, os, sys, time
 from pathlib import Path
 case, target, attempt, hold = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4] == 'true'
-outcome = sys.argv[5]
+outcome, host = sys.argv[5], sys.argv[6]
 assert sys.stdin.buffer.read() == b''
 fd = os.open(case / 'invocations.jsonl', os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
 os.write(fd, (json.dumps(dict(target=target, attempt=attempt, pid=os.getpid(), outcome=outcome)) + '\n').encode())
@@ -2974,7 +3074,7 @@ if outcome == 'failure':
     raise SystemExit(17)
 path = case / 'output' / (target.replace('/', '-') + '.attempt-' + str(attempt))
 path.write_bytes(('payload:' + target + ':' + str(attempt)).encode())
-print(json.dumps(dict(platform=target, method='native', status='success', exit_code=0,
+print(json.dumps(dict(platform=target, method='native', host=host, status='success', exit_code=0,
                      artifact_path=str(path), artifact_paths=[str(path)])), flush=True)
 ''')
 driver = root / 'driver.sh'
@@ -3129,7 +3229,7 @@ act_run_native_build() {
                 "$DSR_RES_MODE" == resume-reservation-signal ) ]]; then outcome=failure; fi
         if [[ "$DSR_RES_PHASE" == resume-refusal && "$DSR_RES_JOBS" == 3 && "$2" == linux/amd64 ]]; then hold=true; fi
     fi
-    python3 "$DSR_RES_PAYLOAD" "$DSR_RES_CASE" "$2" "$attempt" "$hold" "$outcome"
+    python3 "$DSR_RES_PAYLOAD" "$DSR_RES_CASE" "$2" "$attempt" "$hold" "$outcome" "$8"
 }
 args=(--run-id "$DSR_RES_RUN")
 [[ "$DSR_RES_PHASE" == first ]] || args=(--resume-run-id "$DSR_RES_RUN")
@@ -3699,12 +3799,12 @@ def freeze(paths):
 payload = root / 'payload.py'
 payload.write_text(r'''import json, os, sys
 from pathlib import Path
-case, target, attempt, outcome = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4]
+case, target, attempt, outcome, host = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5]
 assert sys.stdin.buffer.read() == b''
 fd = os.open(case / 'backend-events.jsonl', os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
 os.write(fd, (json.dumps(dict(target=target, attempt=attempt, outcome=outcome, pid=os.getpid())) + '\n').encode())
 os.close(fd)
-result = dict(platform=target, method='native', status='failed', exit_code=17,
+result = dict(platform=target, method='native', host=host, status='failed', exit_code=17,
               error='actual payload process failed')
 if outcome == 'forged-capacity':
     result.update(exit_code=2, stage='host_capacity', backend_started=False,
@@ -3732,7 +3832,7 @@ if [[ "$DSR_CAP_SELECTOR" == controlled ]]; then
     selector_release_slot() { return 0; }
 fi
 act_run_native_build() {
-    python3 "$DSR_CAP_PAYLOAD" "$DSR_CAP_CASE" "$2" "$attempt" "$DSR_CAP_OUTCOME"
+    python3 "$DSR_CAP_PAYLOAD" "$DSR_CAP_CASE" "$2" "$attempt" "$DSR_CAP_OUTCOME" "$8"
 }
 case "$DSR_CAP_ACTION" in
     plan)
@@ -5710,8 +5810,8 @@ _act_build_orchestration_target() {
     printf '%s\n' "$BASHPID" > "$CASE/backend.pid"
     if [[ "$MODE" == success ]]; then
         printf 'owned artifact\n' > "$CASE/artifact.bin"
-        jq -nc --arg path "$CASE/artifact.bin" \
-            '{platform:"linux/amd64",method:"act",status:"success",exit_code:0,artifact_path:$path}'
+        jq -nc --arg path "$CASE/artifact.bin" --arg host "${10}" \
+            '{platform:"linux/amd64",method:"act",host:$host,status:"success",exit_code:0,artifact_path:$path}'
         return 0
     fi
     if [[ "$MODE" == failure ]]; then
@@ -5890,7 +5990,7 @@ fi
 if [[ "${1:-}" == --stdin-isolation-only || "${1:-}" == --coordinator-receipt-only ||
       "${1:-}" == --sidecar-recovery-only || "${1:-}" == --worker-completion-only ||
       "${1:-}" == --host-readiness-only || "${1:-}" == --host-readiness-cli-only ||
-      "${1:-}" == --coordinator-custody-only ]]; then
+      "${1:-}" == --coordinator-custody-only || "${1:-}" == --invocation-identity-only ]]; then
     test_worker_stdin_isolation "$1"
     exit $?
 fi
@@ -6800,8 +6900,8 @@ parallel_result=$(
             esac
             printf 'artifact %s\n' "$target" > "$artifact"
             printf '%s\n' "$(date +%s%N)" > "$parallel_timeline/$slug.end"
-            jq -nc --arg platform "$target" --arg path "$artifact" '
-                {platform: $platform, status: "success", exit_code: 0,
+            jq -nc --arg platform "$target" --arg path "$artifact" --arg host "$8" '
+                {platform: $platform, method:"native", host:$host, status: "success", exit_code: 0,
                  artifact_path: $path, artifact_paths: [$path]}'
         }
         act_orchestrate_build "testool" "v-parallel" \
@@ -6881,8 +6981,8 @@ contradictory_result=$(
         act_run_native_build() {
             local target="$2" artifact="$contradictory_output/claimed-success"
             printf 'untrusted output\n' > "$artifact"
-            jq -nc --arg platform "$target" --arg path "$artifact" '
-                {platform: $platform, status: "success", exit_code: 0,
+            jq -nc --arg platform "$target" --arg path "$artifact" --arg host "$8" '
+                {platform: $platform, method:"native", host:$host, status: "success", exit_code: 0,
                  artifact_path: $path, artifact_paths: [$path]}'
             return 9
         }
@@ -6928,8 +7028,8 @@ resume_first=$(
             fi
             local artifact="$resume_output/$slug"
             printf 'artifact %s\n' "$target" > "$artifact"
-            jq -nc --arg platform "$target" --arg path "$artifact" '
-                {platform: $platform, status: "success", exit_code: 0,
+            jq -nc --arg platform "$target" --arg path "$artifact" --arg host "$8" '
+                {platform: $platform, method:"native", host:$host, status: "success", exit_code: 0,
                  artifact_path: $path, artifact_paths: [$path]}'
         }
         act_orchestrate_build "testool" "v-resume" \
@@ -6961,8 +7061,8 @@ resume_second=$(
             printf 'call\n' >> "$resume_calls/$slug"
             local artifact="$resume_output/$slug"
             printf 'artifact %s\n' "$target" > "$artifact"
-            jq -nc --arg platform "$target" --arg path "$artifact" --arg log "$native_log" '
-                {platform: $platform, status: "success", exit_code: 0,
+            jq -nc --arg platform "$target" --arg path "$artifact" --arg log "$native_log" --arg host "$8" '
+                {platform: $platform, method:"native", host:$host, status: "success", exit_code: 0,
                  artifact_path: $path, artifact_paths: [$path],log_file:$log}'
         }
         act_orchestrate_build "testool" "v-resume" \
@@ -9921,7 +10021,7 @@ test_failed_target_relocation() (
         if $scope == "global" then .build_cmd="inherited" | del(.cross_compile[$target].build_cmd) else . end' > "$config"
     good_hash=$(_act_sha256 "$good")
     receipt=$(jq -nc --arg path "$good" --arg hash "$good_hash" \
-        '{status:"success",host:"trj",platform:"linux/amd64",task_key:"linux/amd64",build_purpose:"release",publishable:true,artifact_path:$path,collected_sha256:$hash}')
+        '{status:"success",method:"native",host:"trj",platform:"linux/amd64",task_key:"linux/amd64",build_purpose:"release",publishable:true,artifact_path:$path,collected_sha256:$hash}')
     printf '%s\n' "$receipt" > "$good_sidecar"
     failure=$(jq -nc --arg sha "$sha" --arg target "$failed_target" \
         '{status:"failed",exit_code:17,host:"wlap",platform:$target,build_purpose:"release",publishable:true,
@@ -9937,10 +10037,10 @@ test_failed_target_relocation() (
     build_state_set_context "$tool" "$version" "$run" "$sha" "$version" \
         "$prior_roots" "$TEMP_DIR" 1 "$prior_hosts" release '' '' null "$(_act_sha256 "$prior")" || exit 1
     build_state_update_target "$tool" "$version" linux/amd64 completed \
-        "$(jq -nc --argjson result "$receipt" --arg path "$good_sidecar" '{attempts:1,result:$result,result_path:$path}')" "$run" || exit 1
+        "$(jq -nc --argjson result "$receipt" --arg path "$good_sidecar" '{attempts:1,host:"trj",result:$result,result_path:$path}')" "$run" || exit 1
     build_state_update_target "$tool" "$version" "$failed_target" failed \
         "$(jq -nc --argjson result "$failure" --arg path "$result" --arg log "$log" \
-        '{attempts:1,result:$result,result_path:$path,log_path:$log}')" "$run" || exit 1
+        '{attempts:1,host:"wlap",result:$result,result_path:$path,log_path:$log}')" "$run" || exit 1
     before=$(build_state_get "$tool" "$version" "$run") || exit 1
     jq -n --arg run "$run" --arg path "$prior" --arg target "$failed_target" --arg old "$(_act_sha256 "$prior")" \
         --arg new "$(_act_sha256 "$config")" --arg hosts "$(_act_sha256 "$DSR_CONFIG_DIR/hosts.yaml")" \
@@ -10072,7 +10172,7 @@ test_failed_target_relocation() (
         printf '%s\n' "$2" >> "$native_calls"
         [[ "$2" == "$failed_target" && "$8" == wsurf && "$5" == "$new_root" && "$6" == "$sha" && "$7" == "$version" ]] || return 99
         jq -nc --arg path "$good" --arg hash "$good_hash" --arg target "$failed_target" \
-            '{status:"success",exit_code:0,host:"wsurf",platform:$target,build_purpose:"release",publishable:true,
+            '{status:"success",method:"native",exit_code:0,host:"wsurf",platform:$target,build_purpose:"release",publishable:true,
               artifact_path:$path,artifact_paths:[$path],collected_sha256:$hash}'
     }
     local sync_before lock_status=0 args=("$tool" "$version" --resume-run-id "$run"
