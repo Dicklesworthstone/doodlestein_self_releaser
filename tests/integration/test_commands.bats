@@ -1993,6 +1993,68 @@ EOF
     [[ ! -e "$DSR_STATE_DIR/watch-artifacts/12345" ]]
 }
 
+@test "watch recovery quarantines crashed children before queued or terminal replay" {
+    harness_create_config
+    _watch_configure_ntm
+    local check_json run_id directory code before
+    check_json=$(_watch_run_json | jq -c '.details.throttled[0] as $first |
+        .details.throttled = [$first, $first + {run_id:12346,head_branch:"v1.2.4"}]')
+    # Terminate the actual fallback child by signal. A crash can happen after
+    # a remote mutation, so a durable exit receipt alone cannot make it safe
+    # to replay the release. Disable core files for the isolated fixture.
+    cat > "$TEST_TMPDIR/crashed-fallback" <<'EOF'
+#!/usr/bin/env bash
+ulimit -c 0
+trap - SEGV PIPE
+case "$DSR_RUN_ID" in
+    watch-12345-*) kill -SEGV "$BASHPID" ;;
+    watch-12346-*) kill -PIPE "$BASHPID" ;;
+    *) exit 99 ;;
+esac
+exit 99
+EOF
+    DSR_WATCH_FIXTURE_FALLBACK="$TEST_TMPDIR/crashed-fallback" \
+        run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal 0 "$status"
+    for run_id in 12345 12346; do
+        _watch_completed "$run_id"
+        directory=$(jq -r --arg id "$run_id" '.attempts[$id].attempt_id' "$DSR_STATE_DIR/triggered.json")
+        code=139
+        [[ "$run_id" != 12346 ]] || code=141
+        jq -e --argjson code "$code" '.exit_code == $code' \
+            "$DSR_STATE_DIR/watch-attempts/$directory/completion.json"
+        cp "$DSR_STATE_DIR/watch-attempts/$directory/completion.json" "$TEST_TMPDIR/crash-$run_id.json"
+    done
+    run _routing_watch '{"details":{"throttled":[]}}'
+    assert_equal 0 "$status"
+    jq -e 'all(.attempts[]; .status == "blocked" and .attempt == 1 and
+        .next_retry_at == null and (.error | contains("interrupted")))' "$DSR_STATE_DIR/triggered.json"
+
+    # Also retain old journals that called these signal outcomes retryable.
+    # Queued, preview and completed-failure recovery share the same refusal;
+    # none may start a child or contact GitHub for a crashed attempt.
+    jq '.attempts |= with_entries(.value.status="failed" | .value.next_retry_at=0)' \
+        "$DSR_STATE_DIR/triggered.json" > "$TEST_TMPDIR/legacy-crashes.json"
+    cp "$TEST_TMPDIR/legacy-crashes.json" "$DSR_STATE_DIR/triggered.json"
+    before=$(git hash-object "$DSR_STATE_DIR/triggered.json")
+    run _routing_watch "$check_json" --auto-fallback --dry-run --retry-delay 1
+    assert_equal 0 "$status"
+    [[ "$output" != *"Would trigger"* ]]
+    run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal 0 "$status"
+    _mock_watch_upstream_run "$(_watch_upstream_run_json completed failure)"
+    run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --retry-delay 1
+    assert_equal 0 "$status"
+    [[ ! -e "$TEST_TMPDIR/watch-upstream.calls" ]]
+    assert_equal "$before" "$(git hash-object "$DSR_STATE_DIR/triggered.json")"
+    assert_equal 2 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    for run_id in 12345 12346; do
+        directory=$(jq -r --arg id "$run_id" '.attempts[$id].attempt_id' "$DSR_STATE_DIR/triggered.json")
+        cmp "$TEST_TMPDIR/crash-$run_id.json" "$DSR_STATE_DIR/watch-attempts/$directory/completion.json"
+        [[ ! -e "$DSR_STATE_DIR/watch-artifacts/$run_id" ]]
+    done
+}
+
 @test "watch terminal recovery resumes its exact checkpoint after upstream failure leaves the queue" {
     harness_create_config
     mkdir -p "$DSR_CONFIG_DIR/repos.d"

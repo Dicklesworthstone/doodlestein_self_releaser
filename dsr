@@ -2073,14 +2073,13 @@ _watch_attempt_active() (
     case "$status" in 0) return 1 ;; 1) return 0 ;; *) return 4 ;; esac
 )
 
-# Public fallback cancellation and signal termination cannot authorize another
-# unattended publication attempt. Exit 137 at this direct-child boundary also
-# means interrupted work; there is no watcher timeout wrapper to reinterpret it.
+# Public fallback cancellation and every signal-like child exit require manual
+# recovery: a crash or broken pipe can occur after a remote publication. There
+# is no watcher timeout wrapper to reinterpret these as retryable deadlines.
 _watch_interrupted_exit() {
-    case "${1:-}" in
-        5|129|130|131|137|143) return 0 ;;
-        *) return 1 ;;
-    esac
+    local status="${1:-}"
+    [[ "$status" =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
+    ((status == 5 || (status > 128 && status <= 255)))
 }
 
 _watch_reconcile_attempts() {

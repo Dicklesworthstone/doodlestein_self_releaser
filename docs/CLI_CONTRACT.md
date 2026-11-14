@@ -636,9 +636,10 @@ artifacts while retrying the remaining targets. Cancelled, mismatched, or
 ambiguous checkpoints block automatic recovery. When an earlier attempt failed
 before creating either a checkpoint or its output directory, the retry may start
 the same pinned build afresh. Successful runs are never
-replayed. A fallback's interrupted exit (`5`) or signal-termination status
-(`129`, `130`, `131`, `137`, or `143`) blocks automatic recovery, even when
-the interruption preceded checkpoint creation. New completions retain their
+replayed. A fallback's interrupted exit (`5`) or any signal-like child exit
+(`129` through `255`, including crashes and broken pipes) blocks automatic
+recovery, even when the interruption preceded checkpoint creation. These
+outcomes may follow a remote publication and require manual recovery. New completions retain their
 original exit status and receipts as `blocked` with no retry deadline. Older
 journals that recorded those exits as `failed` also remain ineligible for
 automatic launch or dry-run planning, without rewriting their retained evidence.
