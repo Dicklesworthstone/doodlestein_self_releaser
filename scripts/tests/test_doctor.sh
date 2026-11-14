@@ -10,7 +10,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-DSR_CMD="$PROJECT_ROOT/dsr"
+DSR_CMD="${DSR_TEST_COMMAND_FILE:-$PROJECT_ROOT/dsr}"
 
 # Test counters
 TESTS_RUN=0
@@ -289,14 +289,14 @@ cases = [
     ("doctor", "user-token-cancel", 5),
     ("doctor", "token-missing", 3),
     ("doctor", "auth-error", 3),
-    ("watch", "auth-timeout", 3),
-    ("watch", "token-timeout", 3),
+    ("watch", "auth-timeout", 8),
+    ("watch", "token-timeout", 8),
     ("watch", "auth-cancel", 5),
     ("watch", "user-cancel", 5),
     ("watch", "token-cancel", 5),
     ("watch", "user-token-cancel", 5),
     ("watch", "user-error", 1),
-    ("watch", "user-timeout", 1),
+    ("watch", "user-timeout", 8),
 ]
 for command, phase, expected in cases:
     case = fixture / (command + "-" + phase)
@@ -306,7 +306,8 @@ for command, phase, expected in cases:
                DSR_GH_TOKEN="" if phase in ("token-timeout", "token-cancel", "user-token-cancel", "token-missing")
                    else "doctor-fixture-token",
                GITHUB_TOKEN="", GH_TOKEN="", GH_HOST="enterprise.fixture.invalid",
-               GH_API_TIMEOUT="0" if phase == "invalid-deadline" else "1",
+               GH_API_TIMEOUT=("0" if phase == "invalid-deadline" else
+                               "10" if command == "watch" and phase == "user-error" else "1"),
                DSR_CONFIG_DIR=str(case / "config"), DSR_CONFIG_FILE=str(case / "config.yaml"),
                DSR_REPOS_FILE=str(case / "repos.yaml"), DSR_HOSTS_FILE=str(case / "hosts.yaml"),
                DSR_STATE_DIR=str(case / "state"), DSR_CACHE_DIR=str(case / "cache"),
@@ -314,7 +315,8 @@ for command, phase, expected in cases:
     args = [cli, "--dry-run", "--json", command]
     args += ["--quick"] if command == "doctor" else ["--once", "--auto-fallback"]
     started = time.monotonic()
-    result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=8)
+    result = subprocess.run(args, env=env, capture_output=True, text=True,
+                            timeout=20 if command == "watch" and phase == "user-error" else 8)
     elapsed = time.monotonic() - started
     (case / "stdout").write_text(result.stdout)
     (case / "stderr").write_text(result.stderr)
@@ -354,9 +356,10 @@ for command, phase, expected in cases:
         else:
             assert "deadline" in check["message"], check
     else:
-        # Optional account-name failures still admit monitoring. No repositories
-        # are configured, so the real check stops before any HTTP discovery.
-        proceeds = phase in ("user-error", "user-timeout")
+        # An immediate optional account-name failure still admits monitoring.
+        # Expiring the whole preflight budget stops before queue discovery.
+        # No repositories are configured in the admitted control.
+        proceeds = phase == "user-error"
         assert ("Running throttle check..." in result.stderr) == proceeds, (phase, result.stderr)
         assert "Starting fallback for" not in result.stderr, (phase, result.stderr)
         assert not (case / "state" / "watch-attempts").exists(), (phase, "fallback dispatched")
@@ -369,6 +372,228 @@ PY
         pass "doctor/watch bound credential probes, retain optional metadata fallback, and propagate cancellation"
     else
         fail "doctor/watch credential deadline or cancellation regression"
+    fi
+}
+
+# Every quick-doctor probe shares the watcher's one preflight budget. Run the
+# public CLI and its real supervisor; only external tools are fixture boundaries.
+# The portable cases hide timer discovery, without replacing supervision.
+test_watch_complete_preflight_deadline() {
+    ((TESTS_RUN++))
+    if ! command -v python3 >/dev/null || ! command -v yq >/dev/null; then
+        skip "Python 3 and yq are required for complete watcher preflight checks"
+        return
+    fi
+    if python3 - "$DSR_CMD" "$TEMP_DIR" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+cli, root = sys.argv[1], Path(sys.argv[2])
+fixture = root / "watch-preflight"
+fixture.mkdir()
+bin_dir = fixture / "bin"
+bin_dir.mkdir()
+for name in ("git", "jq", "curl", "yq"):
+    program = shutil.which(name)
+    assert program, name
+    wrapper = bin_dir / name
+    wrapper.write_text('''#!/usr/bin/env bash
+set -uo pipefail
+probe=''' + shlex.quote(name) + '''
+if [[ "${1:-}" == --version ]]; then
+    printf '%s\\n' "$probe" >> "$DSR_PREFLIGHT_CASE/probes"
+fi
+if [[ "$DSR_PREFLIGHT_PHASE" == "$probe" || ( "$probe" == jq && "$DSR_PREFLIGHT_PHASE" == jq-all ) ]] &&
+   [[ "${1:-}" == --version || "$DSR_PREFLIGHT_PHASE" == jq-all ]]; then
+    printf '%s\\n' "$BASHPID" > "$DSR_PREFLIGHT_CASE/stalled-pid"
+    command sleep 4
+    printf 'escaped\\n' >> "$DSR_PREFLIGHT_CASE/escaped"
+fi
+exec ''' + shlex.quote(program) + ''' "$@"
+''')
+    wrapper.chmod(0o700)
+gh = bin_dir / "gh"
+gh.write_text(r'''#!/usr/bin/env bash
+set -uo pipefail
+printf '%s\n' "$*" >> "$DSR_PREFLIGHT_CASE/calls"
+case "$*" in
+    --version)
+        if [[ "$DSR_PREFLIGHT_PHASE" == stdin ]]; then
+            if IFS= read -r caller_input; then
+                printf '%s\n' "$caller_input" > "$DSR_PREFLIGHT_CASE/consumed-stdin"
+                exit 9
+            fi
+        fi
+        if [[ "$DSR_PREFLIGHT_PHASE" == gh || "$DSR_PREFLIGHT_PHASE" == gh-resistant ]]; then
+            printf '%s\n' "$BASHPID" > "$DSR_PREFLIGHT_CASE/stalled-pid"
+            [[ "$DSR_PREFLIGHT_PHASE" != gh-resistant ]] || trap '' TERM
+            command sleep 4
+            printf 'escaped\n' >> "$DSR_PREFLIGHT_CASE/escaped"
+        fi
+        printf 'gh version 2.0.0 (preflight fixture)\n'
+        exit 0 ;;
+    'auth status --hostname github.com')
+        [[ "$GH_TOKEN" == preflight-fixture-token && "$GH_HOST" == github.com ]] || exit 9
+        [[ "$DSR_PREFLIGHT_PHASE" != auth-error ]] || exit 1
+        [[ "$DSR_PREFLIGHT_PHASE" != cancel ]] || exit 2
+        if [[ "$DSR_PREFLIGHT_PHASE" == combined ]]; then command sleep 0.6; fi
+        exit 0 ;;
+    'api user --hostname github.com --jq .login')
+        if [[ "$DSR_PREFLIGHT_PHASE" == combined ]]; then
+            command sleep 0.6
+            printf 'escaped\n' >> "$DSR_PREFLIGHT_CASE/escaped"
+        fi
+        printf 'preflight-fixture-user\n'
+        exit 0 ;;
+esac
+if [[ "${1:-}" == api && "${2:-}" == repos/fixture/tool/actions/workflows/release.yml/runs\?* ]]; then
+    printf '{"total_count":0,"workflow_runs":[]}\n'
+    exit 0
+fi
+printf 'Unexpected preflight fixture request: %s\n' "$*" >&2
+exit 99
+''')
+gh.chmod(0o700)
+
+cases = [
+    ("gh", "global", "native", 8),
+    ("git", "command", "native", 8),
+    ("jq", "real", "native", 8),
+    ("curl", "real", "native", 8),
+    ("yq", "real", "native", 8),
+    ("combined", "global", "native", 8),
+    ("gh-resistant", "global", "native", 8),
+    ("gh", "command", "portable", 8),
+    ("gh-resistant", "command", "portable", 8),
+    ("invalid", "global", "native", 4),
+    ("invalid", "real", "native", 4),
+    ("auth-error", "global", "native", 3),
+    ("cancel", "global", "native", 5),
+    ("missing-jq", "global", "native", 3),
+    ("jq-all", "global", "native", 8),
+    ("healthy", "global", "native", 0),
+    ("healthy", "command", "native", 0),
+    ("healthy", "real", "native", 0),
+    ("healthy", "global", "portable", 0),
+    ("stdin", "global", "native", 0),
+]
+failures = []
+for phase, mode, engine, expected in cases:
+    label = "-".join((phase, mode, engine))
+    case = fixture / label
+    case.mkdir(mode=0o700)
+    config = case / "config"
+    (config / "repos.d").mkdir(parents=True)
+    (config / "config.yaml").write_text("threshold_seconds: 600\n")
+    (config / "repos.d" / "tool.yaml").write_text(
+        "tool_name: tool\nrepo: fixture/tool\nworkflow: release.yml\n")
+    before = {str(p.relative_to(config)): hashlib.sha256(p.read_bytes()).hexdigest()
+              for p in config.rglob("*") if p.is_file()}
+    healthy = phase in ("healthy", "stdin")
+    bound = "0" if phase == "invalid" else "10" if healthy else "1"
+    env = dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ["PATH"],
+               DSR_PREFLIGHT_CASE=str(case), DSR_PREFLIGHT_PHASE=phase, DSR_PREFLIGHT_ENGINE=engine,
+               DSR_GH_TOKEN="preflight-fixture-token", GITHUB_TOKEN="", GH_TOKEN="",
+               GH_HOST="enterprise.fixture.invalid", GH_API_TIMEOUT=bound,
+               GH_MAX_RETRIES="1", GH_RETRY_DELAY="0", DSR_CONFIG_DIR=str(config),
+               DSR_CONFIG_FILE=str(config / "config.yaml"), DSR_REPOS_FILE=str(config / "repos.yaml"),
+               DSR_HOSTS_FILE=str(config / "hosts.yaml"), DSR_STATE_DIR=str(case / "state"),
+               DSR_CACHE_DIR=str(case / "cache"), DSR_LOG_FILE=str(case / "inherited.log"),
+               DSR_NOTIFY_ENABLED="true", DSR_NOTIFY_METHODS="terminal", NO_COLOR="1")
+    args = [cli, "--json"]
+    if mode == "global": args.append("--dry-run")
+    args += ["watch", "--once", "--auto-fallback", "--notify", "terminal"]
+    if mode == "command": args.append("--dry-run")
+    if engine == "portable" or phase == "missing-jq":
+        args = ["bash", "-c", r'''command() {
+            if [[ "${1:-}" == -v ]]; then
+                if [[ "${2:-}" == jq && "$DSR_PREFLIGHT_PHASE" == missing-jq ]]; then return 1; fi
+                if [[ ( "${2:-}" == timeout || "${2:-}" == gtimeout ) &&
+                      "$DSR_PREFLIGHT_ENGINE" == portable ]]; then return 1; fi
+            fi
+            builtin command "$@"
+        }; export -f command; exec "$@"''', "preflight-test"] + args
+    started = time.monotonic()
+    process = subprocess.Popen(args, env=env, stdin=subprocess.PIPE,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, start_new_session=True)
+    try:
+        out, err = process.communicate(input="watcher-caller-input\n" if phase == "stdin" else None,
+                                       timeout=20 if healthy else 8)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        out, err = process.communicate()
+        failures.append((label, "outer failsafe expired"))
+    elapsed = time.monotonic() - started
+    (case / "stdout").write_text(out)
+    (case / "stderr").write_text(err)
+    (case / "result.json").write_text(json.dumps({"status": process.returncode, "elapsed": elapsed}))
+    try:
+        assert process.returncode == expected, (process.returncode, err)
+        assert not (case / "escaped").exists(), "timed-out probe continued"
+        assert not (case / "consumed-stdin").exists(), "preflight consumed caller input"
+        calls = (case / "calls").read_text().splitlines() if (case / "calls").exists() else []
+        if expected:
+            # Preflight refuses before the normal watcher envelope. Keep the
+            # diagnostic on stderr and do not relaunch a stalled/missing jq.
+            assert not out.strip(), out
+            assert not any("/actions/" in line for line in calls), calls
+            assert "Running throttle check..." not in err, err
+            for name in ("watch.lock", "triggered.json", "watch-attempts", "watch-artifacts", "notifications", "check"):
+                assert not (case / "state" / name).exists(), name
+            if phase == "invalid":
+                assert not calls and not (case / "probes").exists(), "invalid bound launched probes"
+                assert "GH_API_TIMEOUT" in err, err
+            elif expected == 8:
+                assert "deadline" in err, err
+            elif expected == 5:
+                assert "Preflight check interrupted" in err, err
+            else:
+                assert "Preflight check failed" in err, err
+        else:
+            response = json.loads(out)
+            assert response["command"] == "watch" and response["exit_code"] == 0, response
+            assert response["status"] == "success" and response["details"]["mode"] == "once", response
+            requests = [line for line in calls if "/actions/" in line]
+            assert len(requests) == 2, calls
+            assert any("status=queued" in line for line in requests), requests
+            assert any("status=in_progress" in line for line in requests), requests
+            assert not (case / "state" / "watch-attempts").exists(), "healthy poll dispatched fallback"
+        if (case / "stalled-pid").exists():
+            pid = (case / "stalled-pid").read_text().strip()
+            deadline = time.monotonic() + 2
+            while True:
+                state = subprocess.run(["ps", "-p", pid, "-o", "stat="],
+                                       capture_output=True, text=True, timeout=2)
+                if state.returncode or not state.stdout.strip() or state.stdout.strip().startswith("Z"):
+                    break
+                assert time.monotonic() < deadline, "supervised probe survived preflight completion"
+                time.sleep(0.05)
+        if mode != "real":
+            assert not (case / "state").exists() and not (case / "cache").exists(), "preview wrote persistent paths"
+            assert not (case / "inherited.log").exists(), "preview appended inherited log"
+        after = {str(p.relative_to(config)): hashlib.sha256(p.read_bytes()).hexdigest()
+                 for p in config.rglob("*") if p.is_file()}
+        assert before == after, "configuration changed"
+        print("PASS complete watch preflight:", label, flush=True)
+    except (AssertionError, json.JSONDecodeError) as error:
+        failures.append((label, str(error)))
+        print("FAIL complete watch preflight:", label, str(error), flush=True)
+assert not failures, failures
+print("Complete watcher preflight: %d cases passed" % len(cases))
+PY
+    then
+        pass "watch bounds the complete preflight before monitoring, state or notifications"
+    else
+        fail "complete watcher preflight deadline or admission regression"
     fi
 }
 
@@ -651,6 +876,7 @@ test_doctor_detects_git
 test_doctor_detects_gh
 test_doctor_uses_selected_github_identity
 test_doctor_github_deadlines
+test_watch_complete_preflight_deadline
 test_doctor_detects_jq
 
 echo ""

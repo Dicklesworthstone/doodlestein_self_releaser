@@ -1288,6 +1288,12 @@ the repo's configured tool at the run's version tag; repos with no dsr tool
 are reported, never guessed. `dsr --dry-run watch --auto-fallback` shows which
 fallbacks would start.
 
+Before monitoring, the complete `doctor --quick` preflight has one
+`GH_API_TIMEOUT` deadline (60 seconds by default), including dependency
+version probes and credential lookups. A stalled preflight stops with exit 8
+before queue discovery, notification initialization or automatic fallback.
+Invalid deadlines stop with exit 4 before launching any probe.
+
 Set `enabled: false` in `repos.d/<tool>.yaml` to suspend automatic fallback for
 that tool. A per-tool `enabled` value overrides `repos.yaml`; when it is absent,
 the registry value applies, and when both are absent automation is enabled.

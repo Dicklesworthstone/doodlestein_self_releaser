@@ -539,6 +539,24 @@ dsr watch [--interval <seconds>] [--auto-fallback] [--notify <method>]
 | `--once` | false | Check once using the same exclusive lock and recovery journal |
 | `--notify` | none | Notification: slack\|discord\|desktop\|none |
 
+The complete `doctor --quick` preflight runs under one `GH_API_TIMEOUT`
+deadline (60 seconds by default). It includes version probes, credential
+selection, authentication and the optional account-name lookup; individual
+probe deadlines do not restart the overall budget. An invalid bound returns
+`4` before any diagnostic child or notification initialization. Deadline or
+supervision failures return `8`, interruption returns `5`, and other preflight
+dependency/authentication failures return `3`. The supervisor reserves
+`137` for forced termination as well as child exits, so that ambiguous status
+is a preflight supervision failure; it does not prove which signal caused it.
+Every preflight refusal withholds queue polling, watcher locks, notification
+state, recovery and fallback workers. Existing startup logging for real
+invocations is unchanged.
+
+Preflight refusals retain their diagnostic on stderr and produce no stdout,
+including in `--json` mode: the normal watcher envelope is emitted only after
+preflight succeeds. Reporting a preflight failure does not invoke `jq` again,
+since a missing or stalled `jq` may itself have caused the refusal.
+
 Automatic admission honors the tool's effective `enabled` policy. A present
 `repos.d/<tool>.yaml` value takes precedence over the matching `repos.yaml`
 entry; an absent per-tool field inherits the registry field, and absence in
@@ -3446,7 +3464,7 @@ Structured error codes for programmatic handling:
 | `DSR_GH_TOKEN` | | Highest-priority GitHub API token for DSR |
 | `GITHUB_TOKEN` | | GitHub API token, after `DSR_GH_TOKEN` |
 | `GH_TOKEN` | | GitHub API token, after `DSR_GH_TOKEN` and `GITHUB_TOKEN` |
-| `GH_API_TIMEOUT` | 60 | Positive integer seconds per complete JSON API attempt or standalone authentication check (maximum 999999) |
+| `GH_API_TIMEOUT` | 60 | Positive integer seconds per complete JSON API attempt, standalone authentication check or whole watcher preflight (maximum 999999) |
 | `DSR_SLACK_WEBHOOK` | config `notifications.slack_webhook` | Slack incoming webhook for `--notify slack` |
 | `DSR_DISCORD_WEBHOOK` | config `notifications.discord_webhook` | Discord webhook for `--notify discord` |
 | `DSR_NOTIFY_TIMEOUT` | 20 | Positive integer seconds per complete external notification channel (maximum 999999) |

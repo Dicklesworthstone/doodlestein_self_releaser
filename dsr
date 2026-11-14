@@ -2901,7 +2901,9 @@ EXIT CODES:
     0  - Success (or clean shutdown)
     2  - Another watcher is already running
     3  - Dependency error (run dsr doctor)
+    4  - Invalid options or GH_API_TIMEOUT
     5  - Interrupted (SIGTERM/SIGINT)
+    8  - Preflight deadline or supervision failure
 EOF
                 return 0
                 ;;
@@ -2935,37 +2937,46 @@ EOF
         return 4
     fi
 
-    # Configure notifications for the watch loop. Exported: the fallbacks it
-    # starts are child processes and report their build and release outcome
-    # through the same channels. A preview validates the selection above but
-    # neither initializes the notification journal nor delivers events.
+    # Bound the complete preflight, including version probes and credential
+    # helpers. Per-request deadlines inside doctor cannot bound their sum or
+    # a stalled dependency before authentication. Validate before any probe
+    # or notification initialization, and keep preview child logs read-only.
+    local preflight_timeout
+    preflight_timeout=$(_gh_api_timeout) || return $?
+    export DSR_NOTIFY_METHODS=none
+    export DSR_NOTIFY_ENABLED=false
+    log_info "Running preflight check..."
+    local -a preflight_args=(doctor --quick)
+    if $dry_run; then preflight_args=(--dry-run "${preflight_args[@]}"); fi
+    local preflight_status=0
+    run_with_timeout "$preflight_timeout" "$0" "${preflight_args[@]}" </dev/null &>/dev/null || preflight_status=$?
+    if [[ $preflight_status -ne 0 ]]; then
+        # This supervisor also uses 137 for forced deadline termination.
+        # Classify it before the fallback-worker interruption predicate; no
+        # preflight failure can authorize polling, recovery or a new worker.
+        case "$preflight_status" in
+            124|125|137)
+                log_error "Preflight check did not complete safely within its ${preflight_timeout}s deadline"
+                return 8
+                ;;
+        esac
+        if _watch_interrupted_exit "$preflight_status"; then
+            log_error "Preflight check interrupted"
+            return 5
+        fi
+        log_error "Preflight check failed. Run 'dsr doctor' for details."
+        return 3
+    fi
+    log_ok "Preflight check passed"
+
+    # Only an admitted watcher initializes notification state. Child fallback
+    # workers inherit the selected methods; previews keep notifications off.
     if ! $dry_run && [[ "$notify_methods" != "none" ]]; then
         export DSR_NOTIFY_METHODS="$notify_methods"
         export DSR_NOTIFY_ENABLED=true
         notify_init >/dev/null 2>&1 || true
         log_info "Notifications enabled: $notify_methods"
-    else
-        export DSR_NOTIFY_METHODS=none
-        export DSR_NOTIFY_ENABLED=false
     fi
-
-    # Preflight stays read-only during a preview, including child startup logs.
-    log_info "Running preflight check..."
-    local -a preflight_args=(doctor --quick)
-    if $dry_run; then preflight_args=(--dry-run "${preflight_args[@]}"); fi
-    local preflight_status=0
-    "$0" "${preflight_args[@]}" &>/dev/null || preflight_status=$?
-    if [[ $preflight_status -ne 0 ]]; then
-        case "$preflight_status" in
-            5|129|130|131|143)
-                log_error "Preflight check interrupted"
-                return 5
-                ;;
-        esac
-        log_error "Preflight check failed. Run 'dsr doctor' for details."
-        return 3
-    fi
-    log_ok "Preflight check passed"
 
     # Read-only planning creates neither a lock nor recovery state. Every real
     # invocation, including --once, serializes launches and journal updates.
