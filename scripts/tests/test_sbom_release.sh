@@ -4,6 +4,214 @@
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 MODULE="${SBOM_TEST_MODULE:-$ROOT/src/sbom.sh}"
+
+# Real Bash/supervisor/process groups and filesystem publication, with an
+# explicit scanner process fixture. Every invocation has the same independent
+# nine-second outer guard, including runs against the unchanged module. This
+# exercises scanner lifecycle; it does not claim package-detection coverage.
+sbom_lifecycle_checks() {
+    python3 - "$ROOT" "$MODULE" <<'PY'
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+root, module = map(Path, sys.argv[1:])
+work = Path(tempfile.mkdtemp(prefix='dsr-sbom-lifecycle-'))
+binary = work / 'bin'
+binary.mkdir()
+checks = failures = 0
+print('SBOM lifecycle fixtures: ' + str(work), flush=True)
+document = dict(spdxVersion='SPDX-2.3', dataLicense='CC0-1.0', SPDXID='SPDXRef-DOCUMENT',
+                name='scanner-fixture', documentNamespace='https://example.test/lifecycle',
+                creationInfo=dict(creators=['Tool: process-fixture'], created='2026-11-14T00:00:00Z'),
+                packages=[])
+(work / 'document.json').write_text(json.dumps(document) + '\n')
+scanner = binary / 'syft'
+scanner.write_text(r'''#!/usr/bin/env python3
+import json, os, signal, sys, time
+from pathlib import Path
+case = Path(os.environ['SBOM_LIFECYCLE_CASE'])
+mode = os.environ.get('SBOM_LIFECYCLE_MODE', 'healthy')
+version = sys.argv[1:] == ['version']
+name = next((Path(a[5:]).name for a in sys.argv[1:] if a.startswith('file:')), '')
+with (case / 'calls').open('a') as log: log.write(json.dumps(sys.argv[1:])+'\n')
+output = 'syft 1.0.0\n' if version else Path(os.environ['SBOM_LIFECYCLE_DOCUMENT']).read_text()
+if mode == 'stdin' and sys.stdin.buffer.read():
+    print('scanner consumed caller input', file=sys.stderr); sys.exit(17)
+if mode == 'deadline' or (mode == 'partial' and name == 'b.bin'):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    print(output, end='', flush=True)
+    print('scanner is deliberately blocked', file=sys.stderr, flush=True)
+    (case / 'ready').write_text(str(os.getpid()))
+    while True: time.sleep(1)
+if mode == 'late-writer':
+    reader, writer = os.pipe()
+    child = os.fork()
+    if child == 0:
+        os.close(reader)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        os.write(writer, b'ready'); os.close(writer)
+        time.sleep(2)
+        (case / 'late-write').write_text('descendant wrote after scanner exit\n')
+        print('late scanner output', flush=True)
+        os._exit(0)
+    os.close(writer); assert os.read(reader, 5) == b'ready'; os.close(reader)
+    (case / 'child-pid').write_text(str(child))
+print(output, end='', flush=True)
+''')
+scanner.chmod(0o700)
+driver = work / 'driver.sh'
+driver.write_text(r'''#!/usr/bin/env bash
+set -uo pipefail
+source "$1/src/guardrails.sh" || exit 3
+source "$2" || exit 3
+engine=$3 action=$4
+shift 4
+if [[ "$engine" == portable ]]; then _dsr_timeout_cmd() { printf ''; }; fi
+if [[ "$engine" == strict-caller ]]; then set -e -o posix; export SHELLOPTS; fi
+case "$action" in
+    version) sbom_version ;;
+    generate) sbom_generate "$@" ;;
+    batch) sbom_generate_artifacts "$@" ;;
+    json) sbom_generate_json "$@" ;;
+    exported) bash -c 'sbom_generate "$@"' _ "$@" ;;
+    *) exit 4 ;;
+esac
+''')
+
+def check(label, condition):
+    global checks, failures
+    checks += 1
+    failures += not condition
+    print(('ok ' if condition else 'not ok ') + str(checks) + ' - ' + label, flush=True)
+
+def new_case(label):
+    case = work / label
+    case.mkdir()
+    (case / 'input.bin').write_bytes(b'opaque scanner input\n')
+    return case
+
+def run(case, engine='gnu', action='generate', mode='healthy', seconds='1', args=None, incoming=b''):
+    if args is None:
+        args = [] if action == 'version' else [case / 'input.bin', '--output', case / 'proof.json']
+    number = len(list(case.glob('invocation-*.json')))
+    out, err = case / ('stdout-'+str(number)), case / ('stderr-'+str(number))
+    env = dict(os.environ, PATH=str(binary)+':'+os.environ['PATH'], DSR_SBOM_TIMEOUT=seconds,
+               SBOM_OUTPUT_DIR='', SBOM_LIFECYCLE_CASE=str(case), SBOM_LIFECYCLE_MODE=mode,
+               SBOM_LIFECYCLE_DOCUMENT=str(work / 'document.json'))
+    started = time.monotonic()
+    expired = False
+    with out.open('wb') as stdout, err.open('wb') as stderr:
+        process = subprocess.Popen(['bash', str(driver), str(root), str(module), engine, action,
+                                    *map(str, args)], env=env, stdin=subprocess.PIPE,
+                                   stdout=stdout, stderr=stderr, start_new_session=True)
+        try:
+            process.communicate(input=incoming, timeout=9)
+        except subprocess.TimeoutExpired:
+            expired = True
+            # The baseline's scanner remains in this invocation's session.
+            # Candidate supervision must finish before this independent guard.
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate(timeout=4)
+    record = dict(exit_code=process.returncode, outer_timeout=expired,
+                  elapsed_seconds=round(time.monotonic()-started, 3), engine=engine, action=action)
+    (case / ('invocation-'+str(number)+'.json')).write_text(json.dumps(record)+'\n')
+    return record, out.read_text(), err.read_text()
+
+def valid(path):
+    try: return json.loads(path.read_text()) == document
+    except (OSError, ValueError): return False
+
+for engine in ('gnu', 'portable'):
+    case = new_case(engine+'-healthy')
+    result, output, _ = run(case, engine)
+    check(engine+' supervised healthy scan publishes one complete document',
+          result['exit_code'] == 0 and output.strip() == str(case/'proof.json') and valid(case/'proof.json'))
+    check(engine+' healthy scan removes only its completed staging', not list(case.glob('.dsr-sbom.*')))
+
+    case = new_case(engine+'-late-writer')
+    result, output, _ = run(case, engine, mode='late-writer')
+    check(engine+' scanner exit zero initially produces a successful result', result['exit_code'] == 0)
+    time.sleep(2.3)
+    check(engine+' stopped descendant cannot write after success', not (case/'late-write').exists())
+    check(engine+' published SBOM remains valid after descendant write opportunity', valid(case/'proof.json'))
+
+    case = new_case(engine+'-deadline')
+    original = json.dumps(dict(document, name='retained-original'))+'\n'
+    (case/'proof.json').write_text(original)
+    result, output, errors = run(case, engine, mode='deadline')
+    check(engine+' blocked TERM-resistant scan finishes within the independent guard',
+          not result['outer_timeout'] and result['exit_code'] == 5)
+    check(engine+' deadline never publishes the valid-looking partial scanner output',
+          output == '' and (case/'proof.json').read_text() == original)
+    stages = list(case.glob('.dsr-sbom.*'))
+    check(engine+' failed scan retains its actual deadline and scanner diagnostics',
+          len(stages) == 1 and (stages[0]/'scan-timeout-seconds').is_file() and
+          (stages[0]/'scan-timeout-seconds').read_text() == '1\n' and
+          'deliberately blocked' in (stages[0]/'scanner.stderr').read_text() and
+          str(stages[0]) in errors)
+
+    case = new_case(engine+'-version-deadline')
+    result, output, _ = run(case, engine, action='version', mode='deadline')
+    check(engine+' version discovery has the same deadline and cannot bless partial output',
+          not result['outer_timeout'] and result['exit_code'] == 5 and output == '')
+
+case = new_case('partial-batch')
+artifacts = case / 'artifacts'
+artifacts.mkdir()
+for name in ('a.bin', 'b.bin'): (artifacts/name).write_bytes((name+' opaque input\n').encode())
+result, output, _ = run(case, action='batch', mode='partial', args=[artifacts])
+check('batch timeout stops before claiming complete coverage',
+      not result['outer_timeout'] and result['exit_code'] == 5 and output == '' and
+      not (artifacts/'sbom-manifest.spdx.json').exists() and not (artifacts/'b.bin.sbom.spdx.json').exists())
+retained = artifacts / 'a.bin.sbom.spdx.json.dsr.json'
+retained_bytes = retained.read_bytes() if retained.exists() else b''
+proof_bytes = (artifacts/'a.bin.sbom.spdx.json').read_bytes() if retained.exists() else b''
+check('completed batch evidence survives a later scanner timeout', bool(retained_bytes) and bool(proof_bytes))
+result, output, _ = run(case, action='batch', seconds='2', args=[artifacts])
+check('healthy retry completes the same frozen batch',
+      result['exit_code'] == 0 and output.strip() == str(artifacts/'sbom-manifest.spdx.json'))
+calls = [json.loads(line) for line in (case/'calls').read_text().splitlines()]
+check('retry preserves completed proof bytes and does not rescan them',
+      retained.exists() and retained.read_bytes() == retained_bytes and
+      (artifacts/'a.bin.sbom.spdx.json').read_bytes() == proof_bytes and
+      sum(any(a.endswith('/a.bin') for a in command) for command in calls) == 1)
+
+for seconds in ('', '0', '-1', '1.5', '01', '86401', '99999999999999999999'):
+    case = new_case('invalid-'+str(checks))
+    result, output, _ = run(case, seconds=seconds)
+    check('invalid scan bound is refused before invoking Syft: '+repr(seconds),
+          result['exit_code'] == 4 and output == '' and not (case/'calls').exists() and
+          not list(case.glob('.dsr-sbom.*')))
+
+case = new_case('explicit-override')
+result, _, _ = run(case, seconds='invalid', args=[case/'input.bin', '--output', case/'proof.json', '--scan-timeout', '2'])
+check('explicit scan deadline overrides the ambient default', result['exit_code'] == 0 and valid(case/'proof.json'))
+case = new_case('stdin')
+result, _, _ = run(case, mode='stdin', incoming=b'caller control stream\n')
+check('scanner stdin cannot consume its caller control stream', result['exit_code'] == 0 and valid(case/'proof.json'))
+case = new_case('exported')
+result, _, _ = run(case, action='exported')
+check('exported scanner API retains the real supervisor dependencies', result['exit_code'] == 0 and valid(case/'proof.json'))
+case = new_case('strict-caller')
+result, _, _ = run(case, engine='strict-caller')
+check('exported caller errexit and POSIX options cannot break scanner supervision',
+      result['exit_code'] == 0 and valid(case/'proof.json'))
+
+print('SBOM lifecycle checks: '+str(checks)+'; failures: '+str(failures), flush=True)
+sys.exit(bool(failures))
+PY
+}
+
+if [[ "${1:-}" == --lifecycle-only ]]; then
+    sbom_lifecycle_checks
+    exit $?
+fi
 WORK=$(mktemp -d)
 WORK=$(cd "$WORK" && pwd -P) || exit 1
 trap 'if [[ "${DSR_TEST_KEEP_TEMP:-0}" != 1 ]]; then rm -rf -- "$WORK"; fi' EXIT
@@ -232,4 +440,5 @@ check 'snapshot copy failure publishes nothing' absent "$CASE/tool.tar.gz.sbom.s
 unset -f cp
 
 printf '\nSBOM release regression checks: %d; failures: %d\n' "$checks" "$failures"
-[[ "$failures" -eq 0 ]]
+[[ "$failures" -eq 0 ]] || exit 1
+sbom_lifecycle_checks

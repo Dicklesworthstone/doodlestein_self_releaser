@@ -18860,10 +18860,14 @@ SUBCOMMANDS:
 OPTIONS:
     --format, -f <fmt>  Output format: spdx (default) or cyclonedx
     --output, -o <file> Output file (default: auto-generated)
+    --scan-timeout <s>  Syft command deadline, 1..86400 seconds (default 900)
 
 DESCRIPTION:
     Generates Software Bill of Materials using syft for supply chain
     transparency. SBOMs can be attached to releases for compliance.
+    DSR_SBOM_TIMEOUT sets the default deadline, including release and fallback
+    scans. Failed or interrupted scans retain diagnostics and preserve prior
+    output; incomplete scan bytes are never published as a successful SBOM.
 
 REQUIREMENTS:
     - syft must be installed: curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s
@@ -18878,6 +18882,7 @@ EXIT CODES:
     1  - Error generating/verifying SBOM
     3  - syft not installed
     4  - Invalid arguments
+    5  - Scanner deadline or interruption
 EOF
             return 0
             ;;
@@ -18893,11 +18898,15 @@ _sbom_generate() {
     local target=""
     local format="spdx"
     local output=""
+    local scan_timeout="${DSR_SBOM_TIMEOUT-900}"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --format|-f) format="$2"; shift 2 ;;
             --output|-o) output="$2"; shift 2 ;;
+            --scan-timeout)
+                [[ $# -ge 2 && -n "${2:-}" ]] || { log_error "--scan-timeout requires seconds"; return 4; }
+                scan_timeout="$2"; shift 2 ;;
             -*) log_error "Unknown option: $1"; return 4 ;;
             *) target="$1"; shift ;;
         esac
@@ -18911,7 +18920,7 @@ _sbom_generate() {
     local start_time
     start_time=$(date +%s)
 
-    local -a args=()
+    local -a args=(--scan-timeout "$scan_timeout")
     [[ -n "$output" ]] && args+=("--output" "$output")
 
     # The SBOM path is stdout; diagnostics stay on stderr, where a failure's

@@ -38,6 +38,17 @@ object on failure and returns the failing process status. Single scans accept
 `--output FILE` and `--quiet`. Batch calls accept `--output-dir DIRECTORY`;
 `SBOM_OUTPUT_DIR` is the fallback when that option is omitted.
 
+Single and batch generation accept `--scan-timeout SECONDS`, an integer from
+1 to 86400. The default is `DSR_SBOM_TIMEOUT`, or 900 seconds when unset. The
+environment setting also applies to automatic release/fallback scans and Syft
+version discovery. Each actual scanner invocation receives its own deadline;
+verified reuse does not invoke the scanner.
+
+```bash
+dsr sbom generate dist/tool.tar.gz --scan-timeout 600
+DSR_SBOM_TIMEOUT=1800 dsr fallback tool --version v1.2.3 --sbom
+```
+
 Ordinary `dsr release` and `dsr fallback` invoke complete-set generation when
 requested with `--sbom`, `--sbom-format FORMAT`, or `sbom.enabled: true` in
 configuration. The standalone batch and remote commands remain available through
@@ -123,6 +134,22 @@ be reported as successful scans. Existing documents survive failed attempts.
 Unsigned valid single-scan outputs can be regenerated atomically; signed or
 invalid retained outputs are rejected rather than overwritten.
 
+Scanner execution receives EOF on stdin and uses DSR's owned process-group
+supervisor. Ordinary descendants are drained before validating or publishing a
+document, including a helper left behind after Syft exits zero. Such a helper
+cannot keep writing through an inherited descriptor into the published SBOM.
+Deadline or interruption statuses return 5; escalation can take five additional
+seconds. Failed scan staging retains the input copy, partial output, diagnostics
+and selected timeout beside the destination under `.dsr-sbom.*`, and reports that
+path on stderr. Previous output and signatures remain intact.
+
+Subsequent directory scans exclude this reserved staging namespace as well as
+their output, so retained failure evidence does not become package inventory.
+This budget covers scanner execution, not pre/post-scan hashing. Cleanup covers
+ordinary descendants in the owned group; deliberately detached sessions and
+prompt handling of a signal sent only to the outer calling shell are outside
+this guarantee.
+
 Batch generation freezes the entire intended release before scanning. Completed
 SBOM/receipt pairs survive a later failure. A retry verifies those pairs and scans
 only missing work. Removing an unfinished artifact, adding a new one, or changing
@@ -158,7 +185,7 @@ or artifact provenance. They do not verify detached signatures. Use an independe
 trusted signing/verification policy when authenticity is required.
 
 Directory scans are live observations rather than immutable source attestations.
-Their output and in-progress staging directory are excluded from the scan. The
+Their output and retained scanner staging directories are excluded from the scan. The
 filesystem and scanner host remain trusted; these checks are not a sandbox against
 a malicious local writer. Source file checks detect observed drift, not every
 possible transient change on an adversarial filesystem.

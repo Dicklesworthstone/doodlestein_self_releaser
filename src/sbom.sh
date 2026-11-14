@@ -9,6 +9,8 @@
 
 SBOM_DEFAULT_FORMAT="${SBOM_DEFAULT_FORMAT:-spdx}"
 SBOM_OUTPUT_DIR="${SBOM_OUTPUT_DIR:-}"
+_SBOM_MODULE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+export _SBOM_MODULE_DIR
 
 _sbom_log() {
     local level="$1"
@@ -58,10 +60,50 @@ sbom_check() {
     return 3
 }
 
+# Each scanner invocation has a finite budget, including version discovery and
+# a scanner's own network/plugin work. A completed retained inventory still
+# verifies without invoking Syft. Deadline selection never changes its bytes.
+_sbom_scan_timeout() {
+    local seconds="${1-${DSR_SBOM_TIMEOUT-900}}"
+    if [[ ! "$seconds" =~ ^[1-9][0-9]{0,4}$ ]] || ((seconds > 86400)); then
+        _sbom_log error 'SBOM scan timeout must be an integer from 1 to 86400 seconds'
+        return 4
+    fi
+    printf '%s\n' "$seconds"
+}
+
+_sbom_run_scanner() (
+    local seconds="$1"
+    shift
+    # The supervisor probes unused descriptors. POSIX special-builtin rules
+    # must not turn a deliberate failed probe into shell termination, and an
+    # exported caller policy must not re-enable it in a scanner's Bash helper.
+    # These changes remain private to this scanner invocation.
+    export -n SHELLOPTS || return 4
+    set +e +o posix
+    if ! declare -F run_with_timeout >/dev/null; then
+        # shellcheck source=src/guardrails.sh
+        source "$_SBOM_MODULE_DIR/guardrails.sh" || return 3
+    fi
+    # The shared supervisor drains ordinary descendants even when Syft exits
+    # zero. Otherwise a background scanner helper can modify a published SBOM
+    # through its inherited output descriptor after validation has finished.
+    run_with_timeout "$seconds" syft "$@" </dev/null
+)
+
 sbom_version() {
-    local text
+    local text seconds status
+    seconds=$(_sbom_scan_timeout) || return $?
     sbom_check || return $?
-    text=$(syft version 2>/dev/null) || return 1
+    if text=$(_sbom_run_scanner "$seconds" version 2>/dev/null); then
+        :
+    else
+        status=$?
+        case "$status" in
+            124|129|130|137|141|143) return 5 ;;
+            *) return 1 ;;
+        esac
+    fi
     [[ "$text" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]] || return 1
     printf '%s\n' "${BASH_REMATCH[1]}"
 }
@@ -156,25 +198,32 @@ _sbom_output_state() {
     fi
 }
 
-# Args: target [--format spdx|cyclonedx] [--output file] [--quiet]
+# Args: target [--format spdx|cyclonedx] [--output file] [--scan-timeout seconds] [--quiet]
 # stdout: one absolute output path. Exit: 1 scan/I/O/validation, 2 conflict,
-# 3 missing dependency, 4 invalid input. No partial output is published.
+# 3 missing dependency, 4 invalid input, 5 interrupted/deadline. No partial
+# output is published; unsuccessful scanner staging is retained for inspection.
 sbom_generate() (
     set -o pipefail
     local target="${1:-}" format="${SBOM_DEFAULT_FORMAT:-spdx}" output="" quiet=false
+    local scan_timeout="${DSR_SBOM_TIMEOUT-900}"
     [[ $# -gt 0 ]] && shift
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --format|-f|--output|-o)
+            --format|-f|--output|-o|--scan-timeout)
                 [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || {
                     _sbom_log error "Missing value for $1"; return 4;
                 }
-                case "$1" in --format|-f) format="$2" ;; *) output="$2" ;; esac
+                case "$1" in
+                    --format|-f) format="$2" ;;
+                    --scan-timeout) scan_timeout="$2" ;;
+                    *) output="$2" ;;
+                esac
                 shift 2 ;;
             --quiet|-q) quiet=true; shift ;;
             *) _sbom_log error "Unknown SBOM option: $1"; return 4 ;;
         esac
     done
+    scan_timeout=$(_sbom_scan_timeout "$scan_timeout") || return $?
     format=$(_sbom_format "$format") || return $?
     [[ -n "$target" && ! -L "$target" && ( -f "$target" || -d "$target" ) &&
        "$target" != *[[:cntrl:]]* && "$target" != *\\* ]] || {
@@ -218,9 +267,12 @@ sbom_generate() (
         return 2
     fi
     workdir=$(mktemp -d "$output_dir/.dsr-sbom.XXXXXXXX") || return 1
-    trap 'rm -rf -- "$workdir"' EXIT
+    local scan_complete=false
+    trap 'if $scan_complete; then rm -rf -- "$workdir";
+          else _sbom_log error "SBOM scan evidence retained at: $workdir"; fi' EXIT
     trap 'exit 5' HUP INT TERM
     staged="$workdir/result.json"
+    printf '%s\n' "$scan_timeout" > "$workdir/scan-timeout-seconds" || return 1
     local -a args=(-o "$format-json")
     if [[ -f "$target" ]]; then
         input_hash=$(_sbom_hash "$target") || return $?
@@ -237,16 +289,26 @@ sbom_generate() (
             args+=(--exclude "./$(_sbom_glob_literal "$relative")")
         fi
         if [[ "$workdir" == "${target%/}/"* ]]; then
-            relative="${workdir#"${target%/}/"}"
-            args+=(--exclude "./$(_sbom_glob_literal "$relative")/**")
+            # Failed scanner evidence is retained beside the destination.
+            # Exclude that reserved staging namespace on subsequent directory
+            # scans too, so a retry does not inventory earlier input copies.
+            relative="${output_dir#"${target%/}"}"
+            relative="${relative#/}"
+            [[ -z "$relative" ]] || relative="$(_sbom_glob_literal "$relative")/"
+            args+=(--exclude "./${relative}.dsr-sbom.*/**")
         fi
     fi
     $quiet || _sbom_log info "Generating $format SBOM for: $target"
     local status
-    if syft "${args[@]}" > "$staged" 2> "$workdir/scanner.stderr"; then
+    if _sbom_run_scanner "$scan_timeout" "${args[@]}" > "$staged" 2> "$workdir/scanner.stderr"; then
         :
     else
         status=$?
+        case "$status" in
+            124|129|130|137|141|143)
+                _sbom_log error "SBOM generation interrupted or exceeded its ${scan_timeout}s scan timeout (exit $status)"
+                return 5 ;;
+        esac
         _sbom_log error "SBOM generation failed (syft exit $status): $(head -c 8192 "$workdir/scanner.stderr")"
         return 1
     fi
@@ -273,6 +335,7 @@ sbom_generate() (
     elif ! cmp -s "$staged" "$output"; then
         mv -f -- "$staged" "$output" || return 1
     fi
+    scan_complete=true
     $quiet || _sbom_log ok "SBOM generated: $output"
     printf '%s\n' "$output"
 )
@@ -493,15 +556,17 @@ _sbom_verify_manifest() {
 _sbom_artifacts() (
     set -o pipefail
     local action="$1" root="${2:-}" format="${SBOM_DEFAULT_FORMAT:-spdx}" output_dir="${SBOM_OUTPUT_DIR:-}"
+    local scan_timeout="${DSR_SBOM_TIMEOUT-900}"
     local selection='' selection_hash='' selection_inputs='' selection_policy=top-level-artifacts-v1
     shift
     [[ $# -gt 0 ]] && shift
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --format|-f|--output-dir|--selection)
+            --format|-f|--output-dir|--selection|--scan-timeout)
                 [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || return 4
                 case "$1" in
                     --format|-f) format="$2" ;;
+                    --scan-timeout) scan_timeout="$2" ;;
                     --selection) [[ -z "$selection" ]] || return 4; selection="$2" ;;
                     *) output_dir="$2" ;;
                 esac
@@ -509,6 +574,7 @@ _sbom_artifacts() (
             *) _sbom_log error "Unknown SBOM batch option: $1"; return 4 ;;
         esac
     done
+    scan_timeout=$(_sbom_scan_timeout "$scan_timeout") || return $?
     format=$(_sbom_format "$format") || return $?
     [[ -d "$root" && ! -L "$root" && "$root" != *[[:cntrl:]]* && "$root" != *\\* ]] || return 4
     root=$(cd "$root" && pwd -P) || return 4
@@ -625,7 +691,8 @@ _sbom_artifacts() (
         if [[ "$hash" == absent ]]; then
             # Capture a receipt only for the frozen input actually scanned.
             [[ "$(_sbom_hash "$root/$name")" == "$digest" ]] || return 2
-            if sbom_generate "$root/$name" --format "$format" --output "$doc" --quiet > "$workdir/scan.out"; then
+            if sbom_generate "$root/$name" --format "$format" --output "$doc" \
+                --scan-timeout "$scan_timeout" --quiet > "$workdir/scan.out"; then
                 :
             else
                 status=$?
@@ -715,6 +782,7 @@ sbom_generate_json() (
 )
 
 export -f sbom_check sbom_version sbom_generate sbom_generate_project
+export -f _sbom_scan_timeout _sbom_run_scanner
 export -f sbom_generate_artifacts sbom_verify sbom_generate_json
 export -f _sbom_log _sbom_format _sbom_extension _sbom_hash _sbom_validate
 export -f _sbom_glob_literal _sbom_has_signature _sbom_output_state
@@ -751,8 +819,9 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
                 'Commands: generate, project, artifacts, verify, verify-artifacts, json' \
                 'Remote: publish-artifacts DIR --repo OWNER/REPO --tag vVERSION [--dry-run]' \
                 '        verify-release --repo OWNER/REPO --tag vVERSION --manifest-sha256 SHA256' \
-                'Single scan: --format spdx|cyclonedx --output FILE --quiet' \
-                'Release set: --format spdx|cyclonedx --output-dir DIRECTORY [--selection FILE]' \
+                'Single scan: --format spdx|cyclonedx --output FILE --quiet [--scan-timeout SECONDS]' \
+                'Release set: --format spdx|cyclonedx --output-dir DIRECTORY [--selection FILE] [--scan-timeout SECONDS]' \
+                'Scan deadline: DSR_SBOM_TIMEOUT (default 900, integer 1..86400 seconds); interrupted scans return 5.' \
                 'Verification checks local integrity, not signatures or build provenance.' ;;
         *) _sbom_log error "Unknown SBOM command: $_sbom_command"; exit 4 ;;
     esac
