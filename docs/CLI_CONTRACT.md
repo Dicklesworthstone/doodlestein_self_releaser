@@ -2640,6 +2640,30 @@ another `.netrc` account. Without a selected GitHub credential, the existing
 Git-only anonymous and custom-helper path remains available. The selected
 source ref is still resolved to an exact commit before compilation.
 
+Generated Bash source installers acquire recursive Git submodules at the exact
+commits recorded by their parent gitlinks. A newer child branch cannot replace a
+pin. Supported URLs are `https://github.com/OWNER/REPO[.git]`, `../REPO[.git]`
+within the parent's owner, and `../../OWNER/REPO[.git]`. Each child uses the same
+selected GitHub account, with its credential header scoped to that child's
+repository. Unsupported hosts/protocols, unsafe paths, duplicate declarations
+and unavailable commits are refused before compilation. Submodule update
+commands and branch/ignore settings do not select or relax the source graph.
+The source fetch deadline covers the complete recursive acquisition, bounded
+by 16 submodule levels, 256 repositories and 100000 tracked entries.
+
+`source_subdir`, Go workspace modules/local replacements and Bun workspace
+metadata may select files in pinned children. Each child has an independent
+Git directory and detached checkout. Before compilation, the installer records
+actual tracked working bytes, file kinds, executable bits and literal symlink
+targets across the graph. It compares them again afterward without Git clean
+filters or index stat caches, and verifies every original HEAD and staged
+identity using explicit Git directory/worktree paths. Untracked compiler outputs
+remain permitted; ordinary checkout line-ending conversion is preserved.
+Source receipts add `submodules: [{path, repository, source_commit}]`, with paths
+relative to the root checkout. This is a before/after source consistency check,
+not isolation of repository build code. Native PowerShell source installers
+retain their existing submodule refusal.
+
 For generated Bash installers using an explicit token without `gh`,
 `--allow-source-build` permits fallback on classified release discovery,
 metadata, asset-inventory and primary-payload availability failures. These

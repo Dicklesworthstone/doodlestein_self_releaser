@@ -206,7 +206,216 @@ _isb_checkout() (
         [[ "$commit" == "${ref,,}" ]] || return 8
     fi
     _isb_git ${git_options[@]+"${git_options[@]}"} -C "$dir" -c advice.detachedHead=false checkout -q --detach "$commit" || return 8
+    [[ "$(_isb_git ${git_options[@]+"${git_options[@]}"} -C "$dir" rev-parse --verify 'HEAD^{commit}')" == "$commit" ]] || return 8
 )
+
+# Resolve only GitHub repository identities, never arbitrary submodule URLs.
+# A relative URL is relative to the parent repository, as in Git's .gitmodules
+# convention. Acquisition always uses the existing scoped HTTPS/account path.
+_isb_submodule_repo() {
+    local parent="$1" url="$2" repo
+    case "$url" in
+        https://github.com/*) repo="${url#https://github.com/}" ;;
+        ../../*) repo="${url#../../}" ;;
+        ../*) repo="${parent%%/*}/${url#../}" ;;
+        *) _isb_log "Submodule URL must select a GitHub HTTPS repository: $url"; return 4 ;;
+    esac
+    repo="${repo%.git}"
+    [[ "$repo" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || {
+        _isb_log "Unsafe or unsupported submodule repository: $url"; return 4;
+    }
+    printf '%s\n' "$repo"
+}
+
+_isb_submodule_path() {
+    local path="$1"
+    [[ "$path" != . && ${#path} -le 4096 ]] && _isb_relative_path "$path" || return 4
+    case "/${path,,}/" in *'/.git/'*) return 4 ;; esac
+}
+
+# All graph scratch files live outside source. Fetch each child by its parent
+# gitlink, with an independent .git directory: no submodule update procedures,
+# branch selectors, inherited child checkouts or submodule URL fetching by Git.
+# The outer _isb_run deadline covers the complete recursive acquisition.
+_isb_acquire_submodules() {
+    local repo="$1" tree="$2" prefix="$3" depth="$4" number="$_ISB_SOURCE_REPO_COUNT"
+    local record mode type oid path metadata key field name value child_repo full_path
+    local commit entries_file="$_ISB_SOURCE_GRAPH_DIR/tree-$number" config_file="$_ISB_SOURCE_GRAPH_DIR/modules-$number"
+    local -a paths=() pins=()
+    local -A declarations=() urls=() names_by_path=() folded_paths=()
+    commit=$(_isb_git -C "$tree" rev-parse --verify 'HEAD^{commit}') || return 8
+    jq -nc --arg path "$prefix" --arg repo "$repo" --arg commit "$commit" \
+        '{path:$path,repository:$repo,source_commit:$commit}' >> "$_ISB_SOURCE_GRAPH_DIR/repositories.jsonl" || return 1
+    _isb_git -C "$tree" ls-tree -r -z --full-tree "$commit" > "$entries_file" || return 8
+    while IFS= read -r -d '' record; do
+        _ISB_SOURCE_ENTRY_COUNT=$((_ISB_SOURCE_ENTRY_COUNT + 1))
+        ((_ISB_SOURCE_ENTRY_COUNT <= 100000)) || { _isb_log 'Source graph exceeds 100000 tracked entries'; return 4; }
+        [[ "$record" == *$'\t'* ]] || return 4
+        metadata="${record%%$'\t'*}"; path="${record#*$'\t'}"
+        IFS=' ' read -r mode type oid <<< "$metadata"
+        [[ "$mode" == 160000 ]] || continue
+        [[ "$type" == commit && ( "$oid" =~ ^[0-9a-f]{40}$ || "$oid" =~ ^[0-9a-f]{64}$ ) ]] &&
+            _isb_submodule_path "$path" || { _isb_log "Unsafe source submodule path: $path"; return 4; }
+        paths+=("$path"); pins+=("$oid")
+    done < "$entries_file"
+    ((${#paths[@]})) || return 0
+    ((depth < 16 && _ISB_SOURCE_REPO_COUNT + ${#paths[@]} <= 256)) || {
+        _isb_log 'Source submodules exceed 16 levels or 256 repositories'; return 4;
+    }
+    _isb_source_committed_file "$tree" "$tree/.gitmodules" >/dev/null || {
+        _isb_log "Submodules require an unchanged committed regular .gitmodules: ${prefix:-.}"; return 4;
+    }
+    # --no-includes prevents local/global files named by .gitmodules from
+    # becoming dependency authority. Other fields (update, branch, ignore)
+    # are never executed or used to relax commit/content verification.
+    _isb_git -C "$tree" config --no-includes --null --file "$tree/.gitmodules" \
+        --get-regexp '^submodule\..*\.(path|url)$' > "$config_file" || return 4
+    while IFS= read -r -d '' record; do
+        [[ "$record" == *$'\n'* ]] || return 4
+        key="${record%%$'\n'*}"; value="${record#*$'\n'}"
+        field="${key##*.}"; name="${key#submodule.}"; name="${name%.*}"
+        [[ "$name" =~ ^[A-Za-z0-9_][A-Za-z0-9._/-]*$ ]] || {
+            _isb_log 'Unsafe or unsupported submodule name'; return 4;
+        }
+        case "$field" in
+            path)
+                _isb_submodule_path "$value" && [[ -z "${declarations[$name]:-}" &&
+                    -z "${folded_paths[${value,,}]:-}" ]] || {
+                    _isb_log "Duplicate or unsafe submodule path: $value"; return 4;
+                }
+                declarations[$name]="$value"; names_by_path[$value]="$name"; folded_paths[${value,,}]=1
+                ;;
+            url)
+                [[ -z "${urls[$name]:-}" ]] || { _isb_log "Repeated submodule URL: $name"; return 4; }
+                child_repo=$(_isb_submodule_repo "$repo" "$value") || return 4
+                urls[$name]="$child_repo"
+                ;;
+            *) return 4 ;;
+        esac
+    done < "$config_file"
+    [[ ${#declarations[@]} -eq ${#paths[@]} && ${#urls[@]} -eq ${#paths[@]} ]] || {
+        _isb_log 'Submodule declarations must match every pinned gitlink exactly'; return 4;
+    }
+    local index
+    # Validate the entire parent's declaration set before fetching any child.
+    for path in "${paths[@]}"; do
+        name="${names_by_path[$path]:-}"
+        [[ -n "$name" && -n "${urls[$name]:-}" ]] &&
+            _isb_path_in_tree "$tree" "$path" && [[ -d "$tree/$path" && ! -e "$tree/$path/.git" && ! -L "$tree/$path/.git" ]] || {
+            _isb_log "Missing, linked or ambiguous submodule declaration: $path"; return 4;
+        }
+    done
+    for index in "${!paths[@]}"; do
+        path="${paths[$index]}"; name="${names_by_path[$path]}"; child_repo="${urls[$name]}"
+        _ISB_SOURCE_REPO_COUNT=$((_ISB_SOURCE_REPO_COUNT + 1))
+        ((_ISB_SOURCE_REPO_COUNT <= 256)) || { _isb_log 'Source graph exceeds 256 repositories'; return 4; }
+        full_path="${prefix:+$prefix/}$path"
+        _isb_log "Fetching submodule $full_path at ${pins[$index]} ($child_repo)"
+        _isb_checkout "$child_repo" "${pins[$index]}" "$tree/$path" || return $?
+        [[ "$(_isb_git -C "$tree/$path" rev-parse --verify 'HEAD^{commit}')" == "${pins[$index]}" ]] || return 8
+        _isb_acquire_submodules "$child_repo" "$tree/$path" "$full_path" "$((depth + 1))" || return $?
+    done
+}
+
+_isb_checkout_source() {
+    local repo="$1" ref="$2" tree="$3" _ISB_SOURCE_GRAPH_DIR="$4"
+    local _ISB_SOURCE_REPO_COUNT=1 _ISB_SOURCE_ENTRY_COUNT=0
+    mkdir -- "$_ISB_SOURCE_GRAPH_DIR" || return 1
+    _isb_checkout "$repo" "$ref" "$tree" || return $?
+    _isb_acquire_submodules "$repo" "$tree" '' 0 || return $?
+    jq -s '.' "$_ISB_SOURCE_GRAPH_DIR/repositories.jsonl" > "$_ISB_SOURCE_GRAPH_DIR/repositories.json" || return 1
+}
+
+# Observe actual checkout bytes, independently of filters and index stat data.
+# The caller retains the digest in its own shell across compiler execution;
+# a build cannot replace a comparison file with a new baseline. Git supplies
+# the original tracked selection and staged identity, never normalized bytes.
+# Batching hashes keeps this linear without a subprocess for every source file.
+_isb_verify_source_repository() (
+    local tree="$1" commit="$2" inventory="$3" record metadata mode type oid path
+    local cursor remaining component target executable
+    local -a files=()
+    [[ ! -e "$inventory" && ! -L "$inventory" && -d "$tree/.git" && ! -L "$tree/.git" &&
+       -f "$tree/.git/index" && ! -L "$tree/.git/index" ]] || return 6
+    unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE
+    unset GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT
+    export GIT_DIR="$tree/.git" GIT_WORK_TREE="$tree" GIT_COMMON_DIR="$tree/.git"
+    export GIT_INDEX_FILE="$tree/.git/index" GIT_OBJECT_DIRECTORY="$tree/.git/objects"
+    export GIT_NO_REPLACE_OBJECTS=1 GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+    local -a git_options=(-c core.hooksPath=/dev/null -c core.fsmonitor=false -c submodule.recurse=false
+        --git-dir="$tree/.git" --work-tree="$tree")
+    [[ "$(git "${git_options[@]}" rev-parse --verify 'HEAD^{commit}')" == "$commit" ]] || return 6
+    git "${git_options[@]}" diff-index --cached --quiet --no-ext-diff --no-textconv \
+        --ignore-submodules=none "$commit" -- || return 6
+    git "${git_options[@]}" ls-tree -r -z --full-tree "$commit" > "$inventory" || return 6
+    while IFS= read -r -d '' record; do
+        [[ "$record" == *$'\t'* ]] || return 6
+        metadata="${record%%$'\t'*}"; path="${record#*$'\t'}"
+        IFS=' ' read -r mode type oid <<< "$metadata"
+        [[ "$oid" =~ ^[0-9a-f]{40}$ || "$oid" =~ ^[0-9a-f]{64}$ ]] || return 6
+        [[ -n "$path" && "$path" != /* ]] || return 6
+        # Ordinary tracked filenames may contain spaces, tabs or newlines.
+        # Only directory boundaries need validation; NUL frames the records.
+        cursor="$tree"; remaining="$path"
+        while [[ "$remaining" == */* ]]; do
+            component="${remaining%%/*}"; remaining="${remaining#*/}"
+            case "${component,,}" in ''|.|..|.git) return 6 ;; esac
+            cursor="$cursor/$component"
+            [[ -d "$cursor" && ! -L "$cursor" ]] || return 6
+        done
+        case "${remaining,,}" in ''|.|..|.git) return 6 ;; esac
+        cursor="$cursor/$remaining"
+        printf '%s\0%s\0' "$metadata" "$path" || return 6
+        case "$mode:$type" in
+            100644:blob|100755:blob|120000:blob)
+                if [[ "$mode" == 120000 && -L "$cursor" ]]; then
+                    # The sentinel preserves targets ending in newline through
+                    # command substitution; readlink's own newline is consistent.
+                    target=$(readlink "$cursor" && printf '.') || return 6
+                    printf 'symlink\0%s\0' "${target%.}" || return 6
+                else
+                    # core.symlinks=false materializes tracked links as regular
+                    # target-text files. Preserve that initial representation;
+                    # a later link/file conversion changes this fingerprint.
+                    [[ -f "$cursor" && ! -L "$cursor" ]] || return 6
+                    executable=0; [[ ! -x "$cursor" ]] || executable=1
+                    printf 'regular:%s\0' "$executable" || return 6
+                    files+=("$cursor")
+                    if ((${#files[@]} == 128)); then
+                        git "${git_options[@]}" hash-object --no-filters -- "${files[@]}" || return 6
+                        files=()
+                    fi
+                fi
+                ;;
+            160000:commit)
+                [[ -d "$cursor" && ! -L "$cursor" ]] || return 6
+                printf 'submodule\0' || return 6
+                ;;
+            *) return 6 ;;
+        esac
+    done < "$inventory"
+    if ((${#files[@]})); then
+        git "${git_options[@]}" hash-object --no-filters -- "${files[@]}" || return 6
+    fi
+)
+
+_isb_verify_source_graph() {
+    local tree="$1" graph="$2" directory="$3" rows path commit index=0 manifest
+    [[ -d "$directory" && ! -L "$directory" ]] || return 6
+    directory=$(umask 077; mktemp -d "$directory/verify.XXXXXXXX") || return 6
+    manifest="$directory/source-state"
+    rows=$(jq -r '.[] | [(if .path == "" then "." else .path end),.source_commit] | @tsv' <<< "$graph") || return 6
+    : > "$manifest" || return 6
+    while IFS=$'\t' read -r path commit; do
+        printf '%s\0%s\0' "$path" "$commit" >> "$manifest" || return 6
+        _isb_path_in_tree "$tree" "$path" &&
+            _isb_verify_source_repository "$tree/$path" "$commit" "$directory/tree-$index" >> "$manifest" || {
+            _isb_log "Build changed pinned source or Git identity: $path"; return 6;
+        }
+        index=$((index + 1))
+    done <<< "$rows"
+    _isb_sha256 "$manifest"
+}
 
 _isb_in_dir() ( cd "$1" && shift && "$@" )
 
@@ -721,7 +930,22 @@ _isb_source_committed_file() {
     local root="$1" path="$2" relative row mode type oid rest actual hash attributes filter
     [[ "$path" == "$root/"* && -f "$path" && ! -L "$path" ]] || return 4
     relative="${path#"$root"/}"
-    row=$(_isb_git --literal-pathspecs -C "$root" ls-tree HEAD -- "$relative") || return 4
+    local reference=HEAD owner owner_path
+    if [[ -n "${_ISB_SOURCE_GRAPH:-}" && "$root" == "${_ISB_CHECKOUT_ROOT:-}" ]]; then
+        # ls-tree cannot walk through a gitlink. Resolve the longest recorded
+        # parent path, and read metadata from that child's original commit,
+        # never from a new repository or HEAD introduced by a build script.
+        owner=$(jq -cer --arg path "$relative" '
+            [.[] | .path as $prefix | select($prefix == "" or ($path | startswith($prefix + "/")))] |
+            max_by(.path | length)' <<< "$_ISB_SOURCE_GRAPH") || return 4
+        owner_path=$(jq -r '.path' <<< "$owner") || return 4
+        reference=$(jq -r '.source_commit' <<< "$owner") || return 4
+        if [[ -n "$owner_path" ]]; then
+            _isb_path_in_tree "$root" "$owner_path" || return 4
+            root="$root/$owner_path"; relative="${path#"$root"/}"
+        fi
+    fi
+    row=$(_isb_git --literal-pathspecs -C "$root" ls-tree "$reference" -- "$relative") || return 4
     [[ -n "$row" && "$row" != *$'\n'* ]] || return 4
     IFS=$' \t' read -r mode type oid rest <<< "$row"
     [[ "$type" == blob && ( "$mode" == 100644 || "$mode" == 100755 ) &&
@@ -1279,18 +1503,15 @@ install_source_build() (
     umask 077
     mkdir "$destination" || return 1
     local tree="$destination/source" output="$destination/output" status=0 commit payload sha size receipt payloads
+    local _ISB_SOURCE_GRAPH='' graph_dir="$destination/source-graph" source_state final_source_state
     mkdir "$output" || return 1
     _isb_log "Fetching $repo at $ref into an isolated checkout"
-    _isb_run "$limit" "$destination/fetch.log" _isb_checkout "$repo" "$ref" "$tree" || {
-        status=$?; [[ $status == 5 ]] && return 5; return 8;
+    _isb_run "$limit" "$destination/fetch.log" _isb_checkout_source "$repo" "$ref" "$tree" "$graph_dir" || {
+        status=$?; case "$status" in 1|3|4|5) return "$status" ;; *) return 8 ;; esac
     }
     commit=$(_isb_git -C "$tree" rev-parse --verify 'HEAD^{commit}') || return 8
-    # An incomplete checkout cannot masquerade as a supported source build.
-    local entries
-    entries=$(_isb_git -C "$tree" ls-files --stage) || return 8
-    if grep -q '^160000 ' <<< "$entries"; then
-        _isb_log 'Submodule source builds require a project-specific dependency setup'; return 4
-    fi
+    _ISB_SOURCE_GRAPH=$(jq -ce '.' "$graph_dir/repositories.json") || return 8
+    source_state=$(_isb_verify_source_graph "$tree" "$_ISB_SOURCE_GRAPH" "$graph_dir") || return $?
     _isb_path_in_tree "$tree" "$subdir" && [[ -d "$tree/$subdir" ]] || return 4
     local build_root _ISB_CHECKOUT_ROOT="$tree"
     build_root=$(cd "$tree/$subdir" && pwd -P) || return 4
@@ -1298,8 +1519,10 @@ install_source_build() (
     payloads=$(_isb_compile "$language" "$build_root" "$output" "$binary" "$entry" "$package" "$limit" "${binaries[@]}") || return $?
     # Preserve the source pin through compilation. Build scripts may not move
     # HEAD or modify tracked inputs and then claim they built the pinned tree.
-    [[ "$(_isb_git -C "$tree" rev-parse --verify 'HEAD^{commit}')" == "$commit" ]] || return 6
-    _isb_git -C "$tree" diff --quiet HEAD -- || { _isb_log 'Build modified tracked source inputs'; return 6; }
+    final_source_state=$(_isb_verify_source_graph "$tree" "$_ISB_SOURCE_GRAPH" "$graph_dir") || return $?
+    [[ "$final_source_state" == "$source_state" ]] || {
+        _isb_log 'Build changed tracked source bytes, links or executable modes'; return 6;
+    }
     local -a binary_receipts=()
     local primary_payload='' primary_sha='' primary_size='' binaries_json
     index=0
@@ -1333,19 +1556,21 @@ install_source_build() (
         bun_context_file="$output/bun-context.json"
         [[ -f "$bun_context_file" && ! -L "$bun_context_file" ]] || return 7
     fi
-    receipt=$(jq -nc --arg repo "$repo" --arg ref "$ref" --arg commit "$commit" \
+    receipt=$(jq -c --arg repo "$repo" --arg ref "$ref" --arg commit "$commit" \
         --arg language "$language" --arg path "$payload" --arg sha "$sha" --argjson size "$size" \
         --argjson binaries "$binaries_json" \
         --argjson toolchain "$toolchain_receipt" \
         --slurpfile go_context "$go_context_file" \
         --slurpfile bun_context "$bun_context_file" \
         --arg compiler "$(cat "$output/compiler.log")" \
-        '{schema_version:1,method:"source",repository:$repo,requested_ref:$ref,source_commit:$commit,
+        '[.[] | select(.path != "")] as $submodules |
+         {schema_version:1,method:"source",repository:$repo,requested_ref:$ref,source_commit:$commit,
           language:$language,path:$path,sha256:$sha,size_bytes:$size,compiler:$compiler,
           binaries:$binaries,signed_release:false} +
           (if $toolchain == null then {} else {toolchain:$toolchain} end) +
           (if $go_context[0].go_workspace == null then {} else {go_workspace:$go_context[0].go_workspace} end) +
-          ($bun_context[0] // {})') || return 1
+          ($bun_context[0] // {}) +
+          (if ($submodules | length) == 0 then {} else {submodules:$submodules} end)' <<< "$_ISB_SOURCE_GRAPH") || return 1
     (set -C; printf '%s\n' "$receipt" > "$destination/receipt.json") || return 1
     _isb_log "Built $binary; SHA256 $sha (locally built, not a signed release)"
     printf '%s\n' "$receipt"

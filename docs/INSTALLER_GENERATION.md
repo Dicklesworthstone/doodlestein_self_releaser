@@ -784,6 +784,53 @@ compiler or wrapper. Inherited `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, and
 and dependency caches remain available; this is a locally built source result,
 not a hermetic or signed release.
 
+### Pinned Git submodules in Bash source builds
+
+Newly generated Bash installers can build repositories with recursive Git
+submodules. The commit stored in each parent gitlink is authoritative, including
+when the child's default branch has advanced. Each child is fetched into its own
+detached checkout through the same selected GitHub account as the root source.
+No custom submodule update command is executed.
+
+Committed `.gitmodules` declarations must match the pinned child paths exactly.
+The supported repository forms are:
+
+| URL form | Repository selected |
+| --- | --- |
+| `https://github.com/OWNER/REPO.git` | The named GitHub repository |
+| `../REPO.git` | A repository under the parent's owner |
+| `../../OWNER/REPO.git` | The named GitHub owner and repository |
+
+The `.git` suffix is optional. Other protocols or hosts, credential-bearing
+URLs, traversal, linked paths, duplicate declarations and unavailable pinned
+commits are refused before any compiler work. Child branch and ignore settings
+cannot change the pin or suppress verification. The existing fetch timeout
+covers the whole recursive request, with limits of 16 child levels, 256 total
+repositories and 100000 tracked entries.
+
+`source_subdir` can select a module inside a child or grandchild. Go workspaces
+and local replacements, and Bun workspace manifests, resolve committed metadata
+through the owning pinned repository. Successful source receipts contain a
+`submodules` array with each child's root-relative `path`, canonical `repository`
+and `source_commit`. The top-level `source_commit` remains the root pin.
+
+Before and after compilation, the engine checks each repository's HEAD and
+staged identity and fingerprints its actual tracked file bytes, executable
+state and literal symlink targets. It keeps the initial digest in the caller
+shell, compares raw bytes without clean filters or stat-cache shortcuts, and
+pins the verification Git directory and worktree explicitly. This detects the
+reproduced Git worktree/filter concealment cases while retaining legitimate
+CRLF checkouts and untracked compiler outputs. Git's `core.symlinks=false`
+representation of a tracked link as a regular target-text file is preserved;
+changing its bytes or switching its file kind still invalidates the result.
+It does not sandbox build code
+or prove that source was never temporarily changed during compilation.
+
+This feature applies to newly generated Bash installers. Native PowerShell
+source installers retain their existing submodule refusal. Checked-in generated
+clients must be regenerated through the public generator to include a newer
+source engine.
+
 ### Committed Go workspaces
 
 Bash and native Windows source installers support tools whose commands depend on sibling
