@@ -247,6 +247,14 @@ _installer_github_token() (
 _installer_run_gh() (
     set +x
     local limit="${DSR_INSTALLER_GH_TIMEOUT:-}" directory child='' guard='' status=0 interrupted=false
+    local destination='' maximum=''
+    if [[ "${1:-}" == --bounded-output ]]; then
+        [[ $# -ge 4 && -n "$2" && "$3" =~ ^[1-9][0-9]{0,9}$ ]] || return 4
+        destination="$2"; maximum="$3"; shift 3
+        ((maximum <= 2147483648)) || return 4
+        [[ ! -L "$destination" && ( ! -e "$destination" || -f "$destination" ) ]] || return 8
+        command -v head >/dev/null 2>&1 && command -v ps >/dev/null 2>&1 || return 3
+    fi
     if [[ -z "$limit" ]]; then
         if [[ "${1:-} ${2:-}" == 'release download' ]]; then limit=300
         else limit=30; fi
@@ -264,7 +272,7 @@ _installer_run_gh() (
         [[ -z "$child" ]] || kill -KILL -- "-$child" 2>/dev/null || true
         [[ -z "$child" ]] || wait "$child" 2>/dev/null || true
         [[ -z "$guard" ]] || wait "$guard" 2>/dev/null || true
-        rm -f -- "$directory/timeout" 2>/dev/null || true
+        rm -f -- "$directory/timeout" "$directory/output-limit" "$directory/output-error" 2>/dev/null || true
         rmdir -- "$directory" 2>/dev/null || true
     }
     _installer_gh_cancel() {
@@ -279,7 +287,33 @@ _installer_run_gh() (
         set +m
         token=$(_installer_github_token) || exit $?
         request_status=0
-        GH_HOST=github.com GH_TOKEN="$token" gh "$@" || request_status=$?
+        if [[ -n "$maximum" ]]; then
+            # An external shell observes this worker's actual process group
+            # on Bash 3.2 too, where BASHPID is unavailable. The reader can
+            # stop the entire owned request as soon as its byte bound is hit;
+            # it must not wait for a CLI that ignores SIGPIPE or holds stdout.
+            request_group=$(sh -c 'ps -o pgid= -p "$$"') || exit 3
+            request_group="${request_group//[[:space:]]/}"
+            [[ "$request_group" =~ ^[1-9][0-9]*$ ]] || exit 3
+            local -a output_statuses=()
+            GH_HOST=github.com GH_TOKEN="$token" gh "$@" | (
+                bytes=''
+                if head -c "$((maximum + 1))" > "$destination" &&
+                   bytes=$(wc -c < "$destination") && [[ "$bytes" =~ ^[[:space:]]*[0-9]+[[:space:]]*$ ]]; then
+                    if ((bytes <= maximum)); then exit 0; fi
+                    printf 'limit\n' > "$directory/output-limit"
+                else
+                    printf 'write\n' > "$directory/output-error"
+                fi
+                kill -TERM -- "-$request_group" 2>/dev/null || true
+                exit 8
+            )
+            output_statuses=("${PIPESTATUS[@]}")
+            request_status=${output_statuses[0]}
+            [[ "${output_statuses[1]}" == 0 ]] || request_status=8
+        else
+            GH_HOST=github.com GH_TOKEN="$token" gh "$@" || request_status=$?
+        fi
         case "$request_status" in
             0) exit 0 ;;
             # gh uses 1 for both unavailable assets and other request failures.
@@ -314,10 +348,18 @@ _installer_run_gh() (
     trap _installer_gh_cancel HUP INT TERM
     $interrupted && _installer_gh_cancel
     wait "$child" 2>/dev/null || status=$?
-    if [[ -f "$directory/timeout" ]]; then
+    if [[ -f "$directory/output-limit" ]]; then
+        # Observed oversized bytes stay an integrity refusal even if the
+        # deadline fires concurrently; another transport must not retry them.
+        printf '[installer] GitHub CLI asset exceeds its %s-byte limit\n' "$maximum" >&2
+        status=7
+    elif [[ -f "$directory/timeout" ]]; then
         printf '[installer] GitHub CLI request exceeded %ss\n' "$limit" >&2
         # A credential/CLI timeout is ambiguous, never proof that a release
         # is absent and therefore never permission to compile source.
+        status=8
+    elif [[ -f "$directory/output-error" ]]; then
+        printf '[installer] Cannot retain the bounded GitHub CLI asset\n' >&2
         status=8
     fi
     _installer_gh_dispose

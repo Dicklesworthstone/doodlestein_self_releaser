@@ -1109,12 +1109,12 @@ _fetch_release_asset() {
     fi
     url="https://github.com/$REPO/releases/download/$_VERSION/${asset//+/%2B}"
     if $_PREFER_GH && command -v gh &>/dev/null; then
-        _installer_run_gh release download "$_VERSION" --repo "github.com/$REPO" --pattern "$asset" --output "$dest" --clobber 2>/dev/null || status=$?
+        _installer_run_gh --bounded-output "$dest" "$maximum" release download "$_VERSION" --repo "github.com/$REPO" --pattern "$asset" --output - 2>/dev/null || status=$?
         if ((status == 0)); then
             [[ -f "$dest" && ! -L "$dest" && -s "$dest" ]] || return 7
             return 0
         fi
-        case "$status" in 5|4) return "$status" ;; 1) gh_ambiguous=true ;; 3) ;; *) failure=8 ;; esac
+        case "$status" in 5|4|7) return "$status" ;; 1) gh_ambiguous=true ;; 3) ;; *) failure=8 ;; esac
     fi
     if command -v curl &>/dev/null; then
         status=0
@@ -1131,12 +1131,12 @@ _fetch_release_asset() {
     fi
     if ! $_PREFER_GH && command -v gh &>/dev/null; then
         status=0
-        _installer_run_gh release download "$_VERSION" --repo "github.com/$REPO" --pattern "$asset" --output "$dest" --clobber 2>/dev/null || status=$?
+        _installer_run_gh --bounded-output "$dest" "$maximum" release download "$_VERSION" --repo "github.com/$REPO" --pattern "$asset" --output - 2>/dev/null || status=$?
         if ((status == 0)); then
             [[ -f "$dest" && ! -L "$dest" && -s "$dest" ]] || return 7
             return 0
         fi
-        case "$status" in 5|4) return "$status" ;; 1) gh_ambiguous=true ;; 3) ;; *) failure=8 ;; esac
+        case "$status" in 5|4|7) return "$status" ;; 1) gh_ambiguous=true ;; 3) ;; *) failure=8 ;; esac
     fi
     # A missing optional sidecar may proceed to another checksum filename
     # after curl independently proves availability failure. An ambiguous gh

@@ -210,7 +210,7 @@ test_template_has_gh_download_function() {
     # Every release asset (payload and sidecars) is fetched by one function
     # with a gh release download fallback for private or throttled repos.
     if grep -qF '_fetch_release_asset() {' <<< "$template" && \
-       grep -qF '_installer_run_gh release download "$_VERSION" --repo "github.com/$REPO" --pattern "$asset"' <<< "$template"; then
+       grep -qF '_installer_run_gh --bounded-output "$dest" "$maximum" release download "$_VERSION" --repo "github.com/$REPO" --pattern "$asset"' <<< "$template"; then
         pass "template includes gh release download fallback"
     else
         fail "template missing gh release download fallback"

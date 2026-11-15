@@ -97,6 +97,25 @@ authorize source compilation; explicit cancellation returns 5. The deadline
 stops the supervised request and its descendants while preserving an existing
 installation. Regenerate deployed installers to include this behavior.
 
+GitHub CLI asset downloads also enforce the same byte limits as HTTP downloads:
+2 GiB for a release payload, 8 MiB for a checksum manifest, and 1 MiB for a
+signature. The installer streams CLI output and keeps at most one additional
+byte to detect overflow. An oversized asset immediately stops the supervised
+request and its descendants, returns 7, and cannot select another transport or
+authorize source compilation. An otherwise valid checksum manifest at its
+exact limit remains supported. Existing executable families and caches are
+preserved on refusal. The shipped `bv`, `cass`, and `ntm` Bash installers include
+the same limits.
+
+The focused regression exercises the public generator, its generated installer,
+both CLI acquisition orders, exact byte boundaries, cancellation, resistant
+descendants, and the shipped installers. GitHub responses are explicit external
+fixtures; checksum verification and installation are real:
+
+```bash
+bash scripts/tests/test_generated_installer_integrity.sh --github-size-only
+```
+
 Public requests ignore ambient curl configuration, bound response streams and
 the complete redirect chain, and keep signed object-store redirect URLs out of
 curl arguments and shell tracing. Published release identity is validated

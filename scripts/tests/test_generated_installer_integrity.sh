@@ -3,10 +3,11 @@
 # Real tar archives and SHA256; only remote transports/minisign failure are fixtures.
 set -uo pipefail
 case "$#:${1:-}" in
-    0:|1:--static-go-only|1:--static-go-routing-only|1:--strict-contracts-only|1:--credential-routing-only|1:--cache-identity-only|1:--executable-targets-only) ;;
-    *) printf 'Usage: %s [--static-go-only|--static-go-routing-only|--strict-contracts-only|--credential-routing-only|--cache-identity-only|--executable-targets-only]\n' "$0" >&2; exit 4 ;;
+    0:|1:--static-go-only|1:--static-go-routing-only|1:--strict-contracts-only|1:--credential-routing-only|1:--cache-identity-only|1:--executable-targets-only|1:--github-size-only) ;;
+    *) printf 'Usage: %s [--static-go-only|--static-go-routing-only|--strict-contracts-only|--credential-routing-only|--cache-identity-only|--executable-targets-only|--github-size-only]\n' "$0" >&2; exit 4 ;;
 esac
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+ROOT="${DSR_TEST_ROOT:-$ROOT}"
 # Real cross-compiled payloads through the public generated installer. Host
 # discovery is explicitly adapted; foreign binaries are inspected, not claimed
 # to run on this host. Every archive has a real checksum and Minisign signature.
@@ -448,7 +449,20 @@ if [[ "$operation" == 'release view' ]]; then
 fi
 printf 'gh %s\n' "$asset" >> "$CALLS"
 [[ "$GH_FAIL" == 0 && -n "$asset" && -n "$dest" && -f "$REMOTE/$asset" ]] || exit 1
-cp "$REMOTE/$asset" "$dest"
+if [[ "${GH_SIZE_MODE:-}" == cancel ]]; then exit 2; fi
+if [[ "${GH_SIZE_MODE:-}" == overflow-hang ]]; then
+    # The real supervisor must stop both the writer and its resistant child
+    # when the bounded reader closes, without waiting for the request deadline.
+    trap '' HUP INT TERM PIPE
+    sleep 60 &
+    printf '%s %s\n' "$$" "$!" > "$CALLS.writer"
+    if [[ "$dest" == - ]]; then head -c 65 /dev/zero
+    else head -c 65 /dev/zero > "$dest"; fi
+    wait
+    exit 0
+fi
+if [[ "$dest" == - ]]; then cat "$REMOTE/$asset"
+else cp "$REMOTE/$asset" "$dest"; fi
 TRANSPORT
 chmod +x "$work/transports/curl" "$work/transports/gh"
 export PATH="$work/transports:$PATH"
@@ -473,6 +487,142 @@ fi
 success() { [[ $status -eq 0 && -x "$case_dir/bin/demo" ]] && jq -es 'length == 1 and .[0].status == "success"' "$case_dir/out" >/dev/null; }
 blocked() { [[ $status -ne 0 && ! -e "$case_dir/bin/demo" && ! -e "$case_dir/cache/demo/example/demo/v1.2.3/$os-$arch/tar.gz/$asset/payload" ]]; }
 set_manifest() { printf '%s\n' "$1" > "$REMOTE/checksums.sha256"; }
+
+# Public generator and generated CLI, with real payloads/checksums and an
+# external gh response fixture. Transport size limits must hold identically
+# for the preferred CLI and the fallback after anonymous curl unavailability.
+test_installer_github_size() {
+    local dependency
+    for dependency in python3 jq yq ps; do
+        command -v "$dependency" >/dev/null 2>&1 || {
+            printf 'SKIP: GitHub asset-size regression requires %s\n' "$dependency"
+            return 3
+        }
+    done
+    local size_root="$work/github-size" installer="$installer" mode size entry label code
+    local old_remote="$REMOTE" count before elapsed case_dir='' status=0
+    local -x CURL_FAIL=1 GH_FAIL=0 GH_SIZE_MODE='' DSR_INSTALLER_GH_TIMEOUT=10
+    local -x REMOTE="$size_root/remote" CALLS="$size_root/calls" TMPDIR="$size_root/tmp"
+    local -a options=()
+    mkdir -p "$REMOTE" "$TMPDIR" || return 1
+    cp "$old_remote/$asset" "$REMOTE/$asset" || return 1
+    code=0
+    bash "$ROOT/dsr" --json installer generate demo --output-dir "$size_root/generated" \
+        > "$size_root/generation.json" 2> "$size_root/generation.log" || code=$?
+    check 'bounded download regression uses the public installer generator' test "$code" -eq 0
+    installer="$size_root/generated/demo/install.sh"
+    [[ -f "$installer" ]] || return 1
+    check 'public generator reports its result truthfully' jq -es \
+        'length == 1 and .[0].status == "success" and .[0].exit_code == 0' "$size_root/generation.json"
+    check 'publicly generated bounded installer parses' bash -n "$installer"
+
+    for mode in preferred fallback; do
+        options=()
+        [[ "$mode" != preferred ]] || options=(--prefer-gh)
+        for size in 8388607 8388608 8388609; do
+            python3 - "$REMOTE/$asset.sha256" "$hash" "$asset" "$size" <<'BOUNDED_MANIFEST'
+from pathlib import Path
+import sys
+path, digest, asset, size = sys.argv[1:]
+record = (digest + '  ' + asset + '\n').encode()
+Path(path).write_bytes(record + b'#' + b'x' * (int(size) - len(record) - 2) + b'\n')
+BOUNDED_MANIFEST
+            if ((size > 8388608)); then
+                mkdir -p "$work/case-$((case_id + 1))/bin" || return 1
+                printf 'previous installation\n' > "$work/case-$((case_id + 1))/bin/demo"
+            fi
+            : > "$CALLS"
+            run_install ${options[@]+"${options[@]}"} --allow-source-build --yes
+            if ((size <= 8388608)); then
+                check "$mode gh admits an exact valid $size-byte checksum manifest" success
+                check "$mode gh installs the checksum-verified payload unchanged" \
+                    cmp -s "$case_dir/bin/demo" "$work/payload/demo"
+            else
+                check "$mode gh rejects an oversized checksum as terminal integrity failure" test "$status" -eq 7
+                check "$mode gh refuses before replacing the previous installation" \
+                    grep -qx 'previous installation' "$case_dir/bin/demo"
+                check "$mode gh reports one failure without a source-build receipt" jq -es \
+                    'length == 1 and .[0].status == "error" and (.[0] | has("source") | not)' "$case_dir/out"
+                check "$mode gh does not publish oversized evidence into cache" \
+                    test ! -e "$case_dir/cache/demo/example/demo/v1.2.3/$os-$arch/tar.gz/$asset/payload"
+                if [[ "$mode" == preferred ]]; then
+                    check 'preferred gh overlimit never retries anonymous acquisition' \
+                        test "$(grep -c '^curl ' "$CALLS" || true)" -eq 0
+                fi
+            fi
+        done
+    done
+
+    # Exercise small bounds without multi-gigabyte primary fixtures. This is
+    # the actual generated fetcher, including its real CLI watchdog/reader.
+    printf '012345678901234567890123456789012' > "$REMOTE/bounded.bin"
+    for size in 31 32 33; do
+        head -c "$size" /dev/zero > "$REMOTE/bounded.bin" || return 1
+        code=0
+        bash -c 'source "$1" --help >/dev/null; _VERSION=v1.2.3; _PREFER_GH=true;
+            _fetch_release_asset bounded.bin "$2" 32 true' \
+            bash "$installer" "$size_root/bytes-$size" > "$size_root/bytes-$size.out" \
+            2> "$size_root/bytes-$size.err" || code=$?
+        if ((size <= 32)); then
+            check "gh primary accepts $size bytes at a 32-byte limit" test "$code" -eq 0
+            check "gh primary retains all $size admitted bytes" cmp -s "$REMOTE/bounded.bin" "$size_root/bytes-$size"
+        else
+            check 'gh primary rejects one byte beyond its limit' test "$code" -eq 7
+            check 'gh primary retains at most the one-byte overflow probe' \
+                test "$(wc -c < "$size_root/bytes-$size" | tr -d '[:space:]')" -eq 33
+        fi
+    done
+
+    GH_SIZE_MODE=overflow-hang
+    : > "$CALLS"
+    before=$SECONDS code=0
+    timeout 15 bash -c 'source "$1" --help >/dev/null; _VERSION=v1.2.3; _PREFER_GH=true;
+        _fetch_release_asset bounded.bin "$2" 32 true' \
+        bash "$installer" "$size_root/overflow" > "$size_root/overflow.out" \
+        2> "$size_root/overflow.err" || code=$?
+    elapsed=$((SECONDS - before))
+    check 'overflowing TERM-resistant CLI is rejected without waiting for its deadline' \
+        test "$code" -eq 7 -a "$elapsed" -lt 8
+    check 'overflowing CLI cannot write beyond the one-byte probe' \
+        test "$(wc -c < "$size_root/overflow" | tr -d '[:space:]')" -eq 33
+    if [[ -s "$CALLS.writer" ]]; then
+        read -r entry label < "$CALLS.writer"
+        for count in "$entry" "$label"; do
+            # An adopted zombie is no longer executing or retaining the pipe.
+            check "oversized CLI process $count is stopped" bash -c \
+                'state=$(ps -o stat= -p "$1" 2>/dev/null) || exit 0; [[ -z "$state" || "$state" == *Z* ]]' \
+                bash "$count"
+        done
+    else
+        check 'oversized CLI actually started the resistant process fixture' false
+    fi
+    check 'bounded request removes its private supervision state' \
+        test -z "$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -name 'dsr-gh.*' -print)"
+
+    GH_SIZE_MODE=cancel code=0
+    bash -c 'source "$1" --help >/dev/null; _VERSION=v1.2.3; _PREFER_GH=true;
+        _fetch_release_asset bounded.bin "$2" 32 true' \
+        bash "$installer" "$size_root/cancel" > "$size_root/cancel.out" \
+        2> "$size_root/cancel.err" || code=$?
+    check 'bounded CLI cancellation retains public exit 5' test "$code" -eq 5
+
+    GH_SIZE_MODE=''
+    for label in bv cass ntm; do
+        code=0
+        bash -c 'source "$1" --help >/dev/null; _VERSION=v1.2.3; _PREFER_GH=true;
+            _fetch_release_asset bounded.bin "$2" 32 true' \
+            bash "$ROOT/installers/$label/install.sh" "$size_root/shipped-$label" \
+            > "$size_root/shipped-$label.out" 2> "$size_root/shipped-$label.err" || code=$?
+        check "$label shipped installer enforces the same gh byte limit" test "$code" -eq 7
+    done
+}
+
+if [[ "${1:-}" == --github-size-only ]]; then
+    test_installer_github_size || exit 1
+    printf 'Installer GitHub asset limits: %s passed, %s failed\n' "$passed" "$failed"
+    [[ $failed -eq 0 ]]
+    exit $?
+fi
 
 # Two installers may use the same tool/version/platform labels while selecting
 # different repositories or literal release names. Exercise the complete public
@@ -1207,6 +1357,7 @@ if [[ "${1:-}" == --strict-contracts-only ]]; then
     [[ $failed -eq 0 ]]
     exit $?
 fi
+test_installer_github_size || exit 1
 test_installer_credential_routing || exit 1
 set_manifest "$hash  $asset"
 run_install
