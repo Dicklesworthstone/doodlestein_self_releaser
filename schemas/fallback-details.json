@@ -14,6 +14,12 @@
       "type": "string",
       "description": "Version/tag used for the fallback"
     },
+    "parallel_jobs": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 32,
+      "description": "Selected target-build concurrency bound; host capacity and shared output paths may reduce actual concurrency"
+    },
     "expected_sha": {
       "type": "string",
       "pattern": "^(?!0{40}$)[0-9a-f]{40}$",

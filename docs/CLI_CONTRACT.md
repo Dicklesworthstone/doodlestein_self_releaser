@@ -2755,10 +2755,23 @@ Full fallback pipeline: check -> build -> release.
 
 ```bash
 dsr fallback --repo <name> [--version <tag>]
+             [--parallel[=N] | --jobs <N>] [--resume[=RUN_ID]]
 ```
 
 This command coordinates quality checks, builds, verification, signing and
 publication, preserving source and artifact identity between stages.
+
+Build targets run serially by default. `--parallel` / `-p` uses
+`DSR_BUILD_PARALLELISM`, defaulting to 2 when unset or empty. `--parallel=N`
+and `--jobs N` select an explicit integer from 1 through 32; repeated concurrency
+options use the last value. Invalid bounds, including oversized integers, return
+exit 4 before configuration-derived work, quality hooks or state mutation.
+`details.parallel_jobs` records the selected bound in plans and execution
+results. This bound is passed to the ordinary build scheduler, whose host
+capacity and shared-output protections remain authoritative. Concurrency changes
+neither the complete configured target matrix nor release admission. A resumed
+build may use a different bound without invalidating its retained recipe or
+successful target receipts; a fully completed build launches no new workers.
 
 The check step records why the fallback ran (`details.trigger`, e.g. "release
 workflow throttled: 1 run(s) over 600s"). A healthy or unavailable check does

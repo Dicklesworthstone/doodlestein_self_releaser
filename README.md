@@ -1253,7 +1253,16 @@ Full pipeline: check → build → release.
 
 ```bash
 dsr fallback --repo ntm --version v1.2.3        # One command does it all
+dsr fallback --repo ntm --version v1.2.3 --jobs 3  # Build up to three targets concurrently
 ```
+
+Target builds run serially by default. `--parallel` (or `-p`) selects two targets,
+or the value of `DSR_BUILD_PARALLELISM` when set; `--parallel=N` and `--jobs N`
+select an explicit limit from 1 through 32. The existing scheduler also respects
+host capacity and shared output paths. Resume may select a new concurrency bound
+while retaining verified completed targets. The complete configured target set,
+quality checks and publication requirements still apply. JSON results and
+dry-run plans report the selected bound in `details.parallel_jobs`.
 
 Automation can add `--expected-sha <full-commit>` to bind the operation to the
 workflow run's source. The clean checkout, local version tag and build manifest

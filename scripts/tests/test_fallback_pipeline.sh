@@ -212,6 +212,7 @@ cmd_release() {
 }
 cmd_build() {
     printf 'BUILD %s flag=%s\n' "$*" "${DSR_BUILD_LOCK_HELD_BY_CALLER:-unset}" >> "$CALLS"
+    jq -nc --args '$ARGS.positional' -- "$@" > "$CASE/build-arguments.json" || return 4
     if [[ "${_ACT_ISOLATED_SOURCE_TOOL:-}" == tool ]]; then
         act_load_repo_config tool || return 4
         local source contexts
@@ -396,6 +397,64 @@ test_success() {
         grep -Fq "SIGN $OUT/daemon $OUT/worker" "$CALLS" &&
         jq -e '.details.artifacts_count==2 and .details.phases.release=="success"' "$CASE/stdout" >/dev/null &&
         [[ ! -e "$OUT/tool-1.2.3-SHA256SUMS.txt" ]]
+}
+test_parallel_forwarding() {
+    local expected="$1"; shift
+    setup "parallel-$expected-${1:-default}"
+    local DSR_BUILD_PARALLELISM=7
+    run_fallback "$@"
+    [[ "$RC" == 0 && ! -e "$CASE/lock" ]] && one_result &&
+        jq -e --arg jobs "$expected" --arg out "$OUT" '
+            . == ["tool","--version","1.2.3","--output-dir",$out,"--jobs",$jobs]
+        ' "$CASE/build-arguments.json" >/dev/null &&
+        jq -e --argjson jobs "$expected" '.details.parallel_jobs == $jobs and
+            .details.phases.release == "success" and .details.artifacts_count == 2' \
+            "$CASE/stdout" >/dev/null && grep -q '^CHECK ' "$CALLS" && grep -q '^RELEASE ' "$CALLS"
+}
+test_parallel_default_bound() {
+    setup parallel-default-bound
+    local DSR_BUILD_PARALLELISM=""
+    run_fallback --parallel
+    [[ "$RC" == 0 ]] && one_result &&
+        jq -e '.details.parallel_jobs == 2' "$CASE/stdout" >/dev/null &&
+        jq -e '.[-2:] == ["--jobs","2"]' "$CASE/build-arguments.json" >/dev/null
+}
+test_parallel_invalid() {
+    setup parallel-invalid
+    local value="$1" option="$2" DSR_BUILD_PARALLELISM="$1"
+    case "$option" in
+        env) run_fallback --parallel ;;
+        parallel) run_fallback "--parallel=$value" ;;
+        jobs) run_fallback --jobs "$value" ;;
+        missing) run_fallback --jobs ;;
+        *) return 1 ;;
+    esac
+    [[ "$RC" == 4 && ! -s "$CALLS" && ! -e "$OUT" && ! -e "$DSR_STATE_DIR" &&
+       ! -e "$CASE/build-arguments.json" ]]
+}
+test_parallel_dry_run() {
+    setup parallel-plan
+    run_fallback --parallel=3 --dry-run
+    [[ "$RC" == 0 && ! -s "$CALLS" && ! -e "$OUT" && ! -e "$DSR_STATE_DIR" ]] && one_result &&
+        jq -e '.status == "dry_run" and .details.parallel_jobs == 3 and
+            .details.steps == []' "$CASE/stdout" >/dev/null
+}
+test_parallel_resume() {
+    setup parallel-resume; checkpoint failed
+    run_fallback --resume="$RUN" --jobs 4
+    [[ "$RC" == 0 ]] && one_result &&
+        jq -e --arg run "$RUN" '.[-3:] == ["--jobs","4",("--resume=" + $run)]' \
+            "$CASE/build-arguments.json" >/dev/null &&
+        jq -e --arg run "$RUN" '.details.parallel_jobs == 4 and .details.resume_run_id == $run and
+            .details.phases.release == "success"' "$CASE/stdout" >/dev/null
+}
+test_parallel_failure_blocks_publication() {
+    setup parallel-failure; BUILD_RC=1
+    run_fallback --jobs 3
+    [[ "$RC" == 1 ]] && one_result && blocked &&
+        jq -e '.details.parallel_jobs == 3 and .details.phases.build == "partial" and
+            .details.phases.release == "blocked"' "$CASE/stdout" >/dev/null &&
+        jq -e '.[-2:] == ["--jobs","3"]' "$CASE/build-arguments.json" >/dev/null
 }
 test_final_result_write_failure() {
     setup final-result-write-failure
@@ -1855,6 +1914,26 @@ test_isolated_source_plan_and_arguments() {
 }
 
 run_test test_success
+run_test test_parallel_forwarding 1
+run_test test_parallel_forwarding 7 --parallel
+run_test test_parallel_forwarding 7 -p
+run_test test_parallel_forwarding 3 --parallel=3
+run_test test_parallel_forwarding 4 --jobs 4
+run_test test_parallel_forwarding 32 --jobs 32
+run_test test_parallel_forwarding 2 --parallel=4 --jobs 2
+run_test test_parallel_forwarding 3 --jobs 4 --parallel=3
+run_test test_parallel_default_bound
+for invalid_jobs in '' 0 01 33 -1 1.5 text 18446744073709551617; do
+    for parallel_option in parallel jobs env; do
+        # An unset/empty environment retains the documented default of two.
+        [[ -n "$invalid_jobs" || "$parallel_option" != env ]] || continue
+        run_test test_parallel_invalid "$invalid_jobs" "$parallel_option"
+    done
+done
+run_test test_parallel_invalid '' missing
+run_test test_parallel_dry_run
+run_test test_parallel_resume
+run_test test_parallel_failure_blocks_publication
 run_test test_final_result_write_failure
 run_test test_throttle_check_interruption
 run_test test_throttle_check_manual_request 0
