@@ -7222,6 +7222,86 @@ YAML
     else
         log_fail "Environment resolution lost the remote-only refusal: status=$status env=$environment"
     fi
+
+    # All native languages use the same newline-delimited transport. A
+    # non-selector entry must not create another assignment or change its key
+    # before Go/Bun/TypeScript policy or the launcher sees it. These are real
+    # YAML/parser/resolver checks; they do not claim native compiler execution.
+    local language scope kind literal null_value empty_value
+    literal='  $DSR_ENV_TOKEN "quoted" \slash = value  '
+    for language in rust go bun typescript; do
+        jq -n --arg language "$language" --arg literal "$literal" '{
+            language:$language,derive_cargo_build_target:false,
+            env:{REVIEW_NOTE:$literal,REVIEW_EMPTY:"",REVIEW_NULL:null,
+                 REVIEW_NUMBER:42,REVIEW_ZERO:0,REVIEW_ENABLED:false,
+                 REVIEW_OVERRIDE:"global",C_INCLUDE_PATH:$literal},
+            cross_compile:{"linux/amd64":{env:{REVIEW_OVERRIDE:""}}}
+        }' > "$ACT_REPOS_DIR/env-boundaries.yaml" || return 1
+        status=0
+        environment=$(_test_env_real_config act_get_build_env env-boundaries linux/amd64 \
+            2> "$fixture/$language-valid.stderr") || status=$?
+        null_value=$(act_get_build_env_value "$environment" REVIEW_NULL) || status=9
+        empty_value=$(act_get_build_env_value "$environment" REVIEW_EMPTY) || status=9
+        if [[ "$status" -eq 0 &&
+              "$(act_get_build_env_value "$environment" REVIEW_NOTE)" == "$literal" &&
+              "$(act_get_build_env_value "$environment" C_INCLUDE_PATH)" == "$literal" &&
+              "$(act_get_build_env_value "$environment" REVIEW_NUMBER)" == 42 &&
+              "$(act_get_build_env_value "$environment" REVIEW_ZERO)" == 0 &&
+              "$(act_get_build_env_value "$environment" REVIEW_ENABLED)" == false &&
+              "$(act_get_build_env_value "$environment" REVIEW_OVERRIDE)" == "" &&
+              "$null_value" == "" && "$empty_value" == "" ]]; then
+            log_pass "$language serialization preserves printable bytes, scalar coercion and empty overrides"
+        else
+            log_fail "$language valid environment serialization changed: status=$status"
+        fi
+
+        for scope in global platform; do
+            for kind in lf-value cr-value nul-value lf-name nul-name equals-name trailing-lf-name array-env; do
+                jq -n --arg language "$language" --arg scope "$scope" --arg kind "$kind" '
+                    (if $kind=="lf-value" then {REVIEW_NOTE:"original\nGOFLAGS=-trimpath"}
+                     elif $kind=="cr-value" then {REVIEW_NOTE:"original\rvalue"}
+                     elif $kind=="nul-value" then {REVIEW_NOTE:"original\u0000value"}
+                     elif $kind=="lf-name" then {"REVIEW=original\nGOFLAGS":"-trimpath"}
+                     elif $kind=="nul-name" then {"GOFL\u0000AGS":"-trimpath"}
+                     elif $kind=="equals-name" then {"GOFLAGS=-trimpath":"unexpected"}
+                     elif $kind=="trailing-lf-name" then {"GOFLAGS\n":"-trimpath"}
+                     else [] end) as $entries |
+                    {language:$language,derive_cargo_build_target:false} |
+                    if $scope=="global" then .env=$entries
+                    else .cross_compile["linux/amd64"].env=$entries end
+                ' > "$ACT_REPOS_DIR/env-boundaries.yaml" || return 1
+                status=0
+                result=$(_test_env_real_config act_get_build_env env-boundaries linux/amd64 \
+                    2> "$fixture/$language-$scope-$kind.stderr") || status=$?
+                if [[ "$status" -eq 4 && -z "$result" ]]; then
+                    log_pass "$language $scope $kind refuses before partial environment output"
+                else
+                    log_fail "$language $scope $kind reached line transport: status=$status"
+                fi
+            done
+
+            # Match the existing // {} mapping defaults. A false mapping is
+            # currently absent; false as an entry value remains the string
+            # 'false' in the positive control above.
+            for kind in missing null false; do
+                jq -n --arg language "$language" --arg scope "$scope" --arg kind "$kind" '
+                    {language:$language,derive_cargo_build_target:false} |
+                    if $kind=="missing" then .
+                    elif $scope=="global" then .env=(if $kind=="null" then null else false end)
+                    else .cross_compile["linux/amd64"].env=(if $kind=="null" then null else false end) end
+                ' > "$ACT_REPOS_DIR/env-boundaries.yaml" || return 1
+                status=0
+                result=$(_test_env_real_config act_get_build_env env-boundaries linux/amd64 \
+                    2> "$fixture/$language-$scope-$kind.stderr") || status=$?
+                if [[ "$status" -eq 0 &&
+                      "$(act_get_build_env_value "$result" DSR_TARGET_PLATFORM)" == linux/amd64 ]]; then
+                    log_pass "$language $scope $kind mapping keeps the existing empty default"
+                else
+                    log_fail "$language $scope $kind mapping default changed: status=$status"
+                fi
+            done
+        done
+    done
 }
 
 test_rust_derives_build_target_and_dsr_env() {
