@@ -611,6 +611,34 @@ draft admission and immediately before publication, and reports the revalidated
 receipt from `dsr release verify`. Missing or redacted policy fields are not
 treated as evidence.
 
+For an installer pinned by another repository, configure its public main pin
+separately from the release archive checksums:
+
+```yaml
+release_contract:
+  # Keep the existing exact asset, signature and source requirements.
+  raw_installer_checksum:
+    downstream_repo: Dicklesworthstone/agentic_coding_flywheel_setup
+    checksum_path: checksums.yaml
+    installer_key: mcp_agent_mail
+    installer_path: install.sh
+```
+
+Strict `dsr release TOOL VERSION` and `dsr release finalize TOOL VERSION`
+hash the tracked installer at the frozen release commit, check the immutable
+public-main blob and canonical raw `refs/heads/main` URL, and require the same URL and SHA-256 in the
+downstream's committed public main checksum file. Both main refs are checked
+again before accepting the observation. Missing credentials, stale or ambiguous
+pins, failed downloads and moving refs block publication. A failed check after
+promotion attempts to restore the owned draft before returning an error.
+Offline plan mode only computes the expected digest and supplies no public verification.
+
+Run the downstream's existing refresh/check mechanism and commit/push its
+reviewed pin before publication. This gate reads public state; it does not
+generate, commit or push downstream changes. It accepts the ACFS generator's
+canonical `installers` mapping with quoted URL and SHA-256 fields, rejects
+duplicates, and leaves archive checksum synchronization as a separate operation.
+
 ### 5. Check System Health
 
 ```bash

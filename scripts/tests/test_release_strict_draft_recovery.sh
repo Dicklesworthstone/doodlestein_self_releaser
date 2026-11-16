@@ -56,15 +56,33 @@ repo = base / 'repo'
 repo.mkdir(parents=True)
 subprocess.run(['minisign', '-G', '-W', '-p', str(repo/'minisign.pub'), '-s', str(base/'fixture.key')], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 (repo/'README.md').write_text('Isolated signing fixture. No release compilation.\n')
-for args in [['init','-q'],['config','user.name','DSR fixture'],['config','user.email','dsr@example.invalid'],['add','README.md','minisign.pub'],['commit','-qm','signed source fixture'],['tag','-a','v1.2.3','-m','fixture'],['remote','add','origin','https://github.com/owner/app.git']]:
+(repo/'install.sh').write_text('#!/bin/sh\nprintf "isolated installer fixture\\n"\n')
+for args in [['init','-q'],['config','user.name','DSR fixture'],['config','user.email','dsr@example.invalid'],['add','README.md','minisign.pub','install.sh'],['commit','-qm','signed source fixture'],['tag','-a','v1.2.3','-m','fixture'],['remote','add','origin','https://github.com/owner/app.git']]:
     subprocess.run(['git','-C',str(repo)]+args,check=True)
 sha = subprocess.check_output(['git','-C',str(repo),'rev-parse','HEAD'],text=True).strip()
 contract = {'checksum_sidecar':'sha256','minisign_public_key_file':'minisign.pub',
             'exact_primary_assets':{'linux/amd64':'payload.tar.gz'},
             'exact_additional_assets':['SHA256SUMS','SHA256SUMS.minisig']}
+installer_digest=hashlib.sha256((repo/'install.sh').read_bytes()).hexdigest()
+installer_url='https://raw.githubusercontent.com/owner/app/refs/heads/main/install.sh'
+def checksum_text(digest=installer_digest,url=installer_url):
+    return '# Private downstream generator fixture\ninstallers:\n  app:\n'+f'    url: "{url}"\n    sha256: "{digest}"\n'
+downstream=base/'downstream'
+downstream.mkdir()
+for args in [['init','-q','-b','main'],['config','user.name','DSR fixture'],['config','user.email','dsr@example.invalid']]:
+    subprocess.run(['git','-C',str(downstream)]+args,check=True)
+(downstream/'checksums.yaml').write_text(checksum_text('0'*64))
+for args in [['add','checksums.yaml'],['commit','-qm','old installer pin']]:
+    subprocess.run(['git','-C',str(downstream)]+args,check=True)
+subprocess.run(['git','init','--bare','-q','-b','main',str(base/'downstream-public.git')],check=True)
+for args in [['remote','add','origin',str(base/'downstream-public.git')],['push','-q','origin','main']]:
+    subprocess.run(['git','-C',str(downstream)]+args,check=True)
+(downstream/'checksums.yaml').write_text(checksum_text())
+for args in [['add','checksums.yaml'],['commit','-qm','refreshed installer pin']]:
+    subprocess.run(['git','-C',str(downstream)]+args,check=True)
 
 api = r'''
-import hashlib, json, os, signal, time
+import base64, hashlib, json, os, signal, subprocess, time
 from pathlib import Path
 import sys
 c=Path(os.environ['CASE']); args=sys.argv[1:]
@@ -75,7 +93,38 @@ endpoint=args[0]
 control=json.loads((c/'control.json').read_text())
 with (c/'requests.jsonl').open('a') as f:f.write(json.dumps(args)+'\n')
 r=json.loads((c/'remote.json').read_text())
-if endpoint=='upload-boundary':
+if endpoint.startswith('repos/owner/') and '/git/ref/heads/main' in endpoint:
+    if control.get('raw_auth_denied'):
+        print('Controlled authentication refusal',file=sys.stderr);sys.exit(1)
+    source=endpoint.startswith('repos/owner/app/')
+    sha=os.environ['SOURCE_SHA'] if source else subprocess.check_output(
+        ['git','--git-dir',str(c/'downstream-public.git'),'rev-parse','refs/heads/main'],text=True).strip()
+    field='raw_source_reads' if source else 'raw_downstream_reads'
+    control[field]=control.get(field,0)+1
+    (c/'control.json').write_text(json.dumps(control))
+    if control.get('raw_move_source') and source and control[field]>1:sha='f'*40
+    if control.get('raw_move_downstream') and not source and control[field]>1:sha='e'*40
+    value={'ref':'refs/heads/main','object':{'type':'commit','sha':sha}}
+    if control.get('raw_bad_ref'):value['ref']='refs/heads/stale'
+    print(json.dumps(value))
+elif endpoint.startswith('repos/owner/app/contents/install.sh?ref=') or endpoint.startswith('repos/owner/downstream/contents/checksums.yaml?ref='):
+    ref=endpoint.split('?ref=',1)[1]
+    source=endpoint.startswith('repos/owner/app/')
+    path='install.sh' if source else 'checksums.yaml'
+    data=(subprocess.check_output(['git','-C',str(c/'repo'),'show',ref+':install.sh']) if source else
+          subprocess.check_output(['git','--git-dir',str(c/'downstream-public.git'),'show',ref+':checksums.yaml']))
+    if source and control.get('raw_wrong_source_blob'):data+=b'changed immutable main installer\n'
+    blob=hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
+    value={'type':'file','path':path,'encoding':'base64','size':len(data),'sha':blob,
+           'content':base64.b64encode(data).decode()}
+    if control.get('raw_bad_blob'):value['sha']='0'*40
+    if control.get('raw_bad_size'):value['size']+=1
+    print(json.dumps(value))
+elif endpoint=='raw-installer-download':
+    data=(c/'repo/install.sh').read_bytes()
+    if control.get('raw_wrong_bytes'):data+=b'changed public installer\n'
+    sys.stdout.buffer.write(data)
+elif endpoint=='upload-boundary':
     source=Path(args[1]);name=args[2];data=source.read_bytes();aid=100+len(r['assets'])
     if control.get('pause_upload'):
         (c/'upload-paused').write_text(name)
@@ -133,6 +182,11 @@ elif endpoint=='repos/owner/app/releases/9':
         if patch.get('draft') is False and control.get('fail_publish'):
             print('Controlled publication failure',file=sys.stderr);sys.exit(1)
         r.update(patch)
+        if r['draft'] is False and control.get('raw_drift_after_publish'):
+            p=c/'downstream/checksums.yaml'
+            p.write_text(p.read_text().replace(os.environ['INSTALLER_DIGEST'],'0'*64))
+            for a in [['add','checksums.yaml'],['commit','-qm','concurrent wrong installer pin'],['push','-q','origin','main']]:
+                subprocess.run(['git','-C',str(c/'downstream')]+a,check=True)
         if r['draft'] is False and control.get('metadata_drift_after_publish'):r['body']='changed after publish'
         if r['draft'] is False and control.get('prerelease_drift_after_publish'):r['prerelease']=not r['prerelease']
         (c/'remote.json').write_text(json.dumps(r));print(json.dumps(r))
@@ -204,6 +258,10 @@ _dispatch_is_true() { [[ "$1" == true ]]; }
 gh_check() { return 0; }
 gh_check_token() { return 0; }
 gh_api() { python3 "$CASE/api.py" "$@"; }
+curl() {
+    [[ "${!#}" == 'https://raw.githubusercontent.com/owner/app/refs/heads/main/install.sh' ]] || return 89
+    python3 "$CASE/api.py" raw-installer-download
+}
 gh_download_release_asset() { test ! -e "$3" && cp "$CASE/bytes/$2" "$3"; }
 mktemp() {
     if [[ "${FAIL_PENDING:-false}" == true && "$*" == *finalization-pending* ]]; then return 1; fi
@@ -217,7 +275,7 @@ DSR_VERSION=fixture
 VERBOSE=false
 QUIET=false
 NON_INTERACTIVE=false
-if [[ "$1" == create || "$1" == fallback || "$1" == verify || "$1" == public-finalize ]]; then
+if [[ "$1" == create || "$1" == publish || "$1" == fallback || "$1" == verify || "$1" == public-finalize ]]; then
     mode="$1"
     shift
     # Retain the real API adapter and creation producer. Only HTTP transport
@@ -241,6 +299,8 @@ if [[ "$1" == create || "$1" == fallback || "$1" == verify || "$1" == public-fin
     JSON_MODE=true
     if [[ "$mode" == create ]]; then
         cmd_release app 1.2.3 --draft --no-dispatch "$@"
+    elif [[ "$mode" == publish ]]; then
+        cmd_release app 1.2.3 --no-dispatch "$@"
     elif [[ "$mode" == verify ]]; then
         curl() {
             [[ $# == 4 && "$1" == -sL && "$3" == -o ]] || return 89
@@ -313,7 +373,7 @@ else
 fi
 '''
 
-def setup(label, controls=None, extra_assets=0, long_names=False, large_notes=False):
+def setup(label, controls=None, extra_assets=0, long_names=False, large_notes=False, raw_installer=False):
     c=work/label;shutil.copytree(base,c)
     case_sha=sha
     if large_notes:
@@ -329,6 +389,11 @@ def setup(label, controls=None, extra_assets=0, long_names=False, large_notes=Fa
     (c/'api.py').write_text(api);(c/'requests.jsonl').write_text('');(c/'control.json').write_text(json.dumps(controls or {}))
     extra_names=['companion-%03d-%s.txt'%(i,'x'*220 if long_names else 'data') for i in range(extra_assets)]
     selected_contract=dict(contract,exact_additional_assets=contract['exact_additional_assets']+extra_names)
+    if raw_installer:
+        selected_contract['raw_installer_checksum']={'downstream_repo':'owner/downstream','checksum_path':'checksums.yaml',
+                                                     'installer_key':'app','installer_path':'install.sh'}
+        subprocess.run(['git','-C',str(c/'downstream'),'remote','set-url','origin',str(c/'downstream-public.git')],check=True)
+        subprocess.run(['git','-C',str(c/'downstream'),'push','-q','origin','main'],check=True)
     (c/'config/repos.d/app.yaml').write_text(json.dumps({'tool_name':'app','repo':'owner/app','local_path':str(c/'repo'),'targets':['linux/amd64'],'release_contract':selected_contract}))
     artifacts=c/'state/artifacts/app-v1.2.3'
     # A real tar archive; this test does not claim a native binary build.
@@ -351,7 +416,8 @@ def setup(label, controls=None, extra_assets=0, long_names=False, large_notes=Fa
     (c/'remote.json').write_text(json.dumps(original))
     response=c/'tmp/dsr-api-response.ABCDEF12';response.write_text(json.dumps(original));response.chmod(0o600)
     env=dict(os.environ,ROOT=str(root),FUNCTIONS=str(functions),CASE=str(c),SOURCE_SHA=case_sha,
-             DSR_CONFIG_DIR=str(c/'config'),DSR_STATE_DIR=str(c/'state'),TMPDIR=str(c/'tmp'),DSR_MINISIGN_KEY=str(c/'fixture.key'),NO_COLOR='1')
+             DSR_CONFIG_DIR=str(c/'config'),DSR_STATE_DIR=str(c/'state'),TMPDIR=str(c/'tmp'),DSR_MINISIGN_KEY=str(c/'fixture.key'),
+             INSTALLER_DIGEST=installer_digest,NO_COLOR='1')
     r=subprocess.run(['bash','-c',script,'fixture','prepare'],env=env,capture_output=True,text=True)
     (c/'prepare.log').write_text(r.stdout+r.stderr)
     if r.returncode:raise AssertionError(label+' real preflight: '+r.stderr[-2500:])
@@ -371,6 +437,119 @@ def invoke(c,env,response,dry=False,flags=None):
     requests=[json.loads(l) for l in (c/'requests.jsonl').read_text().splitlines()]
     patches=[q for q in requests if '--method' in q]
     return r,patches
+
+
+def test_raw_installer_checksum_publication():
+    # Git repositories, commits, pushes, immutable blobs and Minisign are real.
+    # GitHub/HTTP transport remains the existing isolated delivery fixture;
+    # these cases do not certify a public release or native packaged binaries.
+    def published(c):
+        return json.loads((c/'remote.json').read_text())['draft'] is False
+
+    def commit_pin(c, text, push=True):
+        (c/'downstream/checksums.yaml').write_bytes(text.encode())
+        # Keep adversarial record delimiters in the actual committed blob;
+        # caller Git attributes or autocrlf must not normalize the control.
+        blob=subprocess.check_output(['git','-C',str(c/'downstream'),'hash-object','-w',
+                                      '--no-filters','checksums.yaml'],text=True).strip()
+        for args in [['update-index','--add','--cacheinfo','100644,'+blob+',checksums.yaml'],
+                     ['commit','-qm','checksum transition']]:
+            subprocess.run(['git','-C',str(c/'downstream')]+args,check=True)
+        if push:
+            subprocess.run(['git','-C',str(c/'downstream'),'push','-q','origin','main'],check=True)
+
+    for mode in ['finalize','publish','finalize-crlf','publish-crlf']:
+        c,env,response,_=setup('raw-installer-'+mode,raw_installer=True)
+        if mode.endswith('-crlf'):
+            commit_pin(c,checksum_text().replace('installers:\n','installers:\n \t \n').replace('\n','\r\n'))
+        (c/'control.json').write_text(json.dumps({'absent':True} if mode.startswith('publish') else {}))
+        if mode.startswith('publish'):
+            result=subprocess.run(['bash','-c',script,'fixture','publish'],env=env,capture_output=True,text=True,timeout=90)
+            patches=[q for q in map(json.loads,(c/'requests.jsonl').read_text().splitlines()) if '--method' in q]
+        else:
+            result,patches=invoke(c,env,response)
+        (c/'raw-transition.log').write_text(result.stdout+result.stderr)
+        check('raw installer '+mode+' publishes the verified candidate',result.returncode==0 and published(c))
+        check('raw installer '+mode+' makes one publication mutation',sum('draft' in q[q.index('--data')+1] and
+              json.loads(q[q.index('--data')+1]).get('draft') is False for q in patches)==1)
+        requests=list(map(json.loads,(c/'requests.jsonl').read_text().splitlines()))
+        check('raw installer '+mode+' rechecks both public branch authorities',
+              sum(q[0]=='repos/owner/app/git/ref/heads/main' for q in requests)>=4 and
+              sum(q[0]=='repos/owner/downstream/git/ref/heads/main' for q in requests)>=4)
+
+    for label in ['stale','wrong-url','duplicate-key','duplicate-root','duplicate-field','missing-key',
+                  'bare-cr','unicode-linebreak','unicode-space-record',
+                  'auth-denied','wrong-bytes','cached-raw','bad-ref','bad-blob','bad-size','move-source','move-downstream',
+                  'uncommitted-refresh','push-failed','post-publication-drift']:
+        c,env,response,_=setup('raw-installer-'+label,raw_installer=True)
+        controls={}
+        if label=='stale':commit_pin(c,checksum_text('0'*64))
+        elif label=='wrong-url':commit_pin(c,checksum_text(url=installer_url.replace('/main/','/stale/')))
+        elif label=='duplicate-key':commit_pin(c,checksum_text()+'  app:\n'+checksum_text().split('  app:\n',1)[1])
+        elif label=='duplicate-root':commit_pin(c,checksum_text()+'installers:\n')
+        elif label=='duplicate-field':commit_pin(c,checksum_text()+f'    sha256: "{installer_digest}"\n')
+        elif label=='missing-key':commit_pin(c,checksum_text().replace('  app:','  other:'))
+        elif label=='bare-cr':commit_pin(c,checksum_text().replace('\n','\r'))
+        elif label=='unicode-linebreak':commit_pin(c,checksum_text().replace('\n','\u2028'))
+        elif label=='unicode-space-record':commit_pin(c,checksum_text().replace('installers:\n','installers:\n\u00a0\n'))
+        elif label in ['uncommitted-refresh','push-failed']:
+            commit_pin(c,checksum_text('0'*64))
+            (c/'downstream/checksums.yaml').write_text(checksum_text())
+            if label=='push-failed':
+                subprocess.run(['git','-C',str(c/'downstream'),'add','checksums.yaml'],check=True)
+                subprocess.run(['git','-C',str(c/'downstream'),'commit','-qm','local refresh not published'],check=True)
+                hook=c/'downstream-public.git/hooks/pre-receive'
+                hook.write_text('#!/bin/sh\nexit 1\n');hook.chmod(0o700)
+                push=subprocess.run(['git','-C',str(c/'downstream'),'push','origin','main'],capture_output=True,text=True)
+                (c/'failed-downstream-push.stdout').write_text(push.stdout)
+                (c/'failed-downstream-push.stderr').write_text(push.stderr)
+                check('real failed downstream push is retained',push.returncode!=0 and
+                      'pre-receive hook declined' in push.stderr)
+        else:
+            field={'auth-denied':'raw_auth_denied','wrong-bytes':'raw_wrong_bytes','bad-ref':'raw_bad_ref',
+                   'cached-raw':'raw_wrong_source_blob',
+                   'bad-blob':'raw_bad_blob','bad-size':'raw_bad_size','move-source':'raw_move_source',
+                   'move-downstream':'raw_move_downstream','post-publication-drift':'raw_drift_after_publish'}[label]
+            controls[field]=True
+        (c/'control.json').write_text(json.dumps(controls))
+        result,patches=invoke(c,env,response)
+        check('raw installer '+label+' cannot report publication success',result.returncode!=0)
+        check('raw installer '+label+' leaves the owned release as a draft',not published(c))
+        if label!='post-publication-drift':
+            check('raw installer '+label+' refuses before publication mutation',not patches)
+        else:
+            check('raw installer post-publication drift triggers owned-draft restoration',len(patches)==2)
+
+    # The direct producer has its own promotion and post-publication branch.
+    # Exercise its failures independently of retained-draft finalization.
+    for label in ['stale','wrong-bytes','cached-raw','bare-cr','unicode-linebreak','unicode-space-record','push-failed','post-publication-drift']:
+        c,env,_,_=setup('raw-direct-'+label,raw_installer=True)
+        controls={'absent':True}
+        if label in ['stale','push-failed']:
+            commit_pin(c,checksum_text('0'*64))
+            if label=='push-failed':
+                commit_pin(c,checksum_text(),push=False)
+                hook=c/'downstream-public.git/hooks/pre-receive'
+                hook.write_text('#!/bin/sh\nexit 1\n');hook.chmod(0o700)
+                push=subprocess.run(['git','-C',str(c/'downstream'),'push','origin','main'],capture_output=True,text=True)
+                (c/'failed-downstream-push.stdout').write_text(push.stdout)
+                (c/'failed-downstream-push.stderr').write_text(push.stderr)
+                check('direct real failed downstream push is retained',push.returncode!=0 and
+                      'pre-receive hook declined' in push.stderr)
+        elif label=='bare-cr':commit_pin(c,checksum_text().replace('\n','\r'))
+        elif label=='unicode-linebreak':commit_pin(c,checksum_text().replace('\n','\u2028'))
+        elif label=='unicode-space-record':commit_pin(c,checksum_text().replace('installers:\n','installers:\n\u00a0\n'))
+        else:
+            controls[{'wrong-bytes':'raw_wrong_bytes','cached-raw':'raw_wrong_source_blob',
+                      'post-publication-drift':'raw_drift_after_publish'}[label]]=True
+        (c/'control.json').write_text(json.dumps(controls))
+        result=subprocess.run(['bash','-c',script,'fixture','publish'],env=env,capture_output=True,text=True,timeout=90)
+        (c/'raw-transition.log').write_text(result.stdout+result.stderr)
+        patches=[q for q in map(json.loads,(c/'requests.jsonl').read_text().splitlines()) if '--method' in q]
+        check('raw direct '+label+' refuses publication success',result.returncode!=0)
+        check('raw direct '+label+' leaves a draft',not published(c))
+        check('raw direct '+label+' has only the expected publication mutations',
+              len(patches)==(2 if label=='post-publication-drift' else 0))
 
 
 def test_large_note_creation_and_finalization():
@@ -1375,6 +1554,11 @@ def test_custom_artifact_repair():
           len([row for row in rows if row[0]=='checksum-download'])==2 and not mutations(rows))
 
 
+if os.environ.get('DSR_TEST_STRICT_RAW_INSTALLER_ONLY')=='1':
+    test_raw_installer_checksum_publication()
+    print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
+    raise SystemExit(0)
+
 if os.environ.get('DSR_TEST_STRICT_LARGE_NOTES_ONLY')=='1':
     test_large_note_creation_and_finalization()
     print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
@@ -1423,6 +1607,7 @@ if os.environ.get('DSR_TEST_STRICT_CREATION_ONLY')!='1':
 
 # Execute the complete producer-to-consumer handoff. The response's name,
 # bytes, permissions and directory come from production creation, not setup().
+test_raw_installer_checksum_publication()
 test_large_note_creation_and_finalization()
 c,env,_,_=setup('creation-handoff',{'absent':True})
 # Existing release state may be readable by other users; preserve that parent

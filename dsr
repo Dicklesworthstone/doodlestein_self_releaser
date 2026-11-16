@@ -6860,6 +6860,183 @@ _release_prepare_ordinary_sbom() (
     ' <<< "$report"
 )
 
+# Freeze raw installer bytes from the same immutable source as the archives.
+# This is a local plan, not evidence that a downstream pin has been published.
+_release_contract_raw_installer_plan() {
+(
+    set -o pipefail
+    local repo="$1" sha="$2" root="$3" contract="$4" policy path entry metadata observed digest
+    if ! jq -e 'has("raw_installer_checksum")' <<< "$contract" >/dev/null; then
+        printf 'null\n'
+        return 0
+    fi
+    policy=$(jq -c '.raw_installer_checksum' <<< "$contract") || return 4
+    _config_validate_raw_installer_checksum_json "$policy" || {
+        log_error 'Invalid raw installer checksum policy'; return 4;
+    }
+    path=$(jq -r '.installer_path' <<< "$policy") || return 4
+    entry=$(git -C "$root" ls-tree "$sha" -- "$path") || return 4
+    metadata=${entry%%$'\t'*}
+    observed=${entry#*$'\t'}
+    [[ "$observed" == "$path" && "$metadata" =~ ^100(644|755)\ blob\ [0-9a-f]{40}$ ]] || {
+        log_error 'Release installer must be one regular tracked source file'; return 4;
+    }
+    digest=$(git -C "$root" show "$sha:$path" | python3 -I -c '
+import hashlib, sys
+data = sys.stdin.buffer.read(2097153)
+if not 0 < len(data) <= 2097152:
+    raise SystemExit("Raw installer must contain 1..2097152 bytes")
+print(hashlib.sha256(data).hexdigest())') || return 4
+    jq -nc --argjson policy "$policy" --arg repo "$repo" --arg sha "$sha" \
+        --arg digest "$digest" --arg url "https://raw.githubusercontent.com/$repo/refs/heads/main/$path" '
+        {policy:$policy,source_repo:$repo,source_sha:$sha,sha256:$digest,url:$url}'
+)
+}
+
+_release_contract_public_main() {
+    set -o pipefail
+    gh_api "repos/$1/git/ref/heads/main" --no-cache | python3 -I -c '
+import json, re, sys
+def unique(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate GitHub ref field")
+        result[key] = value
+    return result
+value = json.load(sys.stdin, object_pairs_hook=unique)
+obj = value.get("object", {})
+sha = obj.get("sha", "")
+if (value.get("ref") != "refs/heads/main" or obj.get("type") != "commit"
+        or not isinstance(sha, str) or re.fullmatch("[0-9a-f]{40}", sha) is None
+        or sha == "0" * 40):
+    raise SystemExit("Malformed public main ref")
+print(sha)'
+}
+
+# Decode a GitHub contents response only after validating its complete blob
+# identity. Streams avoid the operating system limit on per-argument size.
+_release_contract_public_text_file() {
+    set -o pipefail
+    gh_api "repos/$1/contents/$3?ref=$2" --no-cache | python3 -I -c '
+import base64, hashlib, json, sys
+def unique(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate GitHub contents field")
+        result[key] = value
+    return result
+raw = sys.stdin.buffer.read(4194305)
+if len(raw) > 4194304:
+    raise SystemExit("Oversized checksum response")
+value = json.loads(raw, object_pairs_hook=unique)
+if (value.get("type") != "file" or value.get("path") != sys.argv[1]
+        or value.get("encoding") != "base64" or type(value.get("size")) is not int
+        or not 0 < value["size"] <= 2097152 or not isinstance(value.get("content"), str)):
+    raise SystemExit("Malformed checksum contents metadata")
+data = base64.b64decode(value["content"].replace("\n", ""), validate=True)
+blob = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+if len(data) != value["size"] or blob != value.get("sha"):
+    raise SystemExit("Checksum contents do not match their Git blob")
+if "\0" in data.decode("utf-8"):
+    raise SystemExit("Checksum text contains NUL")
+sys.stdout.buffer.write(data)' "$3"
+}
+
+# A local checksum edit or successful push response is not a public pin.
+# Re-observe committed bytes and both branch authorities around the check.
+_release_contract_verify_raw_installer_checksum() {
+(
+    set -o pipefail
+    local plan="${1:-null}" repo downstream path key installer_path url expected source_ref downstream_ref text actual
+    [[ "$plan" != null ]] || return 0
+    jq -e '
+        type == "object" and
+        (.source_repo | type == "string" and test("\\A[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*\\z")) and
+        (.source_sha | type == "string" and test("\\A[0-9a-f]{40}\\z")) and
+        (.sha256 | type == "string" and test("\\A[0-9a-f]{64}\\z"))
+    ' <<< "$plan" >/dev/null || return 4
+    _config_validate_raw_installer_checksum_json "$(jq -c '.policy' <<< "$plan")" || return 4
+    repo=$(jq -r '.source_repo' <<< "$plan") || return 4
+    downstream=$(jq -r '.policy.downstream_repo' <<< "$plan") || return 4
+    path=$(jq -r '.policy.checksum_path' <<< "$plan") || return 4
+    key=$(jq -r '.policy.installer_key' <<< "$plan") || return 4
+    installer_path=$(jq -r '.policy.installer_path' <<< "$plan") || return 4
+    expected=$(jq -r '.sha256' <<< "$plan") || return 4
+    url="https://raw.githubusercontent.com/$repo/refs/heads/main/$installer_path"
+    [[ "$(jq -r '.url' <<< "$plan")" == "$url" ]] || return 4
+    source_ref=$(_release_contract_public_main "$repo") || return 7
+    downstream_ref=$(_release_contract_public_main "$downstream") || return 7
+    # A cached raw-main response must not rescue a different current main
+    # installer. Bind that public authority to an immutable Git blob too.
+    actual=$(_release_contract_public_text_file "$repo" "$source_ref" "$installer_path" |
+        python3 -I -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())') || return 7
+    [[ "$actual" == "$expected" ]] || {
+        log_error 'Immutable public main installer differs from release-source bytes'; return 7;
+    }
+    actual=$(curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+        --connect-timeout 10 --max-time 30 --max-filesize 2097152 \
+        --user-agent "doodlestein_self_releaser-agent (+https://github.com/$repo)" \
+        "$url" | python3 -I -c '
+import hashlib, sys
+data = sys.stdin.buffer.read(2097153)
+if not 0 < len(data) <= 2097152:
+    raise SystemExit("Raw installer response has invalid size")
+print(hashlib.sha256(data).hexdigest())') || return 7
+    [[ "$actual" == "$expected" ]] || {
+        log_error 'Public main installer differs from release-source bytes'; return 7;
+    }
+    text=$(_release_contract_public_text_file "$downstream" "$downstream_ref" "$path") || return 7
+    # Accept the downstream generator's canonical byte shape, not aliases,
+    # duplicate keys or another document that a YAML reader might reinterpret.
+    if ! printf '%s\n' "$text" | python3 -I -c '
+import re, sys
+selected, url, digest = sys.argv[1:]
+entries = {}
+current = None
+root = False
+for line in sys.stdin.read().split("\n"):
+    line = line[:-1] if line.endswith("\r") else line
+    if not line.strip(" \t") or line.startswith("#"):
+        continue
+    if line == "installers:":
+        if root:
+            raise SystemExit("Duplicate checksum root")
+        root = True
+        continue
+    match = re.fullmatch(r"  ([A-Za-z0-9][A-Za-z0-9_-]*):", line)
+    if root and match:
+        current = match[1]
+        if current in entries:
+            raise SystemExit("Duplicate installer checksum key")
+        entries[current] = []
+    elif current is not None and (
+            re.fullmatch(r"    url: \"https?://[^\"\\\s]+\"", line)
+            or re.fullmatch(r"    sha256: \"[0-9a-f]{64}\"", line)):
+        entries[current].append(line)
+    else:
+        raise SystemExit("Noncanonical downstream checksum document")
+if (not root or any(len(fields) != 2 or not fields[0].startswith("    url:")
+                    or not fields[1].startswith("    sha256:") for fields in entries.values())
+        or entries.get(selected) != [f"    url: \"{url}\"", f"    sha256: \"{digest}\""]):
+    raise SystemExit("Downstream entry does not pin the exact installer URL and digest")
+' "$key" "$url" "$expected"; then
+        log_error 'Committed downstream checksum does not pin this raw installer; run the downstream refresh/check and push it before publication'
+        return 7
+    fi
+    [[ "$(_release_contract_public_main "$downstream")" == "$downstream_ref" &&
+       "$(_release_contract_public_main "$repo")" == "$source_ref" ]] || {
+        log_error 'Public source or downstream main moved during installer verification'; return 7;
+    }
+    log_info "Verified raw installer $expected; source main $source_ref, downstream $downstream main $downstream_ref"
+    jq -nc --arg repo "$repo" --arg source "$source_ref" --arg downstream "$downstream" \
+        --arg revision "$downstream_ref" --arg digest "$expected" --arg url "$url" '
+        {schema:"dsr.raw_installer_checksum.v1",source_repo:$repo,source_main:$source,
+         downstream_repo:$downstream,downstream_main:$revision,sha256:$digest,url:$url}'
+)
+}
+
 # Validate an opt-in release contract and return the closed upload plan as JSON.
 # No GitHub mutation is allowed before this succeeds. sidecar_mode is create,
 # verify, or plan. Creation uses noclobber; an existing sidecar is always
@@ -6927,7 +7104,8 @@ _release_contract_preflight() {
             "exact_additional_assets",
             "exact_primary_assets",
             "github_tag_ruleset",
-            "minisign_public_key_file"
+            "minisign_public_key_file",
+            "raw_installer_checksum"
         ]) | length == 0) and
         .checksum_sidecar == "sha256" and
         (.exact_primary_assets | type == "object") and
@@ -6957,6 +7135,12 @@ _release_contract_preflight() {
         (($all_assets | map(ascii_downcase) | unique | length) == ($all_assets | length))
     ' <<< "$contract_json" >/dev/null 2>&1; then
         log_error "Invalid release contract for $tool_name"
+        return 4
+    fi
+    if jq -e 'has("raw_installer_checksum")' <<< "$contract_json" >/dev/null &&
+       ! _config_validate_raw_installer_checksum_json \
+            "$(jq -c '.raw_installer_checksum' <<< "$contract_json")"; then
+        log_error "Invalid raw installer checksum policy for $tool_name"
         return 4
     fi
 
@@ -7561,8 +7745,12 @@ _release_contract_preflight() {
         return 4
     fi
 
-    local assets_json
+    local assets_json raw_installer_plan
     assets_json=$(printf '%s\n' "${planned_assets[@]}" | jq -sc '.') || return 4
+    raw_installer_plan=$(_release_contract_raw_installer_plan "$repo" "$head_sha" "$local_path" "$contract_json") || return 4
+    if [[ "$sidecar_mode" != plan ]]; then
+        _release_contract_verify_raw_installer_checksum "$raw_installer_plan" >/dev/null || return 4
+    fi
     jq -nc \
         --arg tool "$tool_name" \
         --arg tag "$tag" \
@@ -7574,6 +7762,7 @@ _release_contract_preflight() {
         --slurpfile contract /dev/fd/4 \
         --argjson minisign_public_key "$minisign_public_key_json" \
         --argjson tag_ruleset_receipt "$tag_ruleset_receipt_json" \
+        --argjson raw_installer "$raw_installer_plan" \
         --slurpfile assets /dev/fd/5 \
         '{
             tool: $tool,
@@ -7587,7 +7776,8 @@ _release_contract_preflight() {
             minisign_public_key: $minisign_public_key,
             tag_ruleset_receipt: $tag_ruleset_receipt,
             assets: $assets[0]
-        }' 3<<< "$expected_dependencies_json" 4<<< "$contract_json" 5<<< "$assets_json"
+        } + (if $raw_installer == null then {} else {raw_installer_checksum:$raw_installer} end)' \
+        3<<< "$expected_dependencies_json" 4<<< "$contract_json" 5<<< "$assets_json"
 }
 
 # Re-fetch the repository-owned immutable-tag policy and require byte-for-byte
@@ -8623,6 +8813,7 @@ _release_finalize_execute_locked() {
     _release_contract_verify_remote_tag_identity "$repo" "$tag" "$(jq -r '.git_sha' <<< "$plan")" || return 7
     _release_contract_verify_tag_ruleset_receipt "$(jq -c '.tag_ruleset_receipt' <<< "$plan")" || return 7
     _source_release_identity "$repo" "$path" "$tag" "$(jq -r '.git_sha' <<< "$plan")" || return 4
+    _release_contract_verify_raw_installer_checksum "$(jq -c '.raw_installer_checksum // null' <<< "$plan")" >/dev/null || return 7
     if jq -e '.draft == true' <<< "$observed" >/dev/null; then
         gh_api "repos/$repo/releases/$release_id" --method PATCH --data '{"draft":false}' --no-cache >/dev/null || true
     fi
@@ -11383,7 +11574,9 @@ EOF
                    ! _release_contract_verify_remote_tag_identity \
                     "$repo" "$tag" "$expected_git_sha" || \
                    ! _release_contract_verify_tag_ruleset_receipt \
-                    "$release_contract_tag_ruleset_receipt"; then
+                    "$release_contract_tag_ruleset_receipt" || \
+                   ! _release_contract_verify_raw_installer_checksum \
+                    "$(jq -c '.raw_installer_checksum // null' <<< "$release_contract_plan")" >/dev/null; then
                     verification_status="incomplete"
                     _release_record_failed "publish" \
                         "Remote draft or tag changed immediately before publication"
@@ -11398,6 +11591,7 @@ EOF
                     local postpublish_assets_valid=false
                     local postpublish_tag_valid=false
                     local postpublish_ruleset_valid=false
+                    local postpublish_raw_installer_valid=false
                     if published_release_json=$(_release_contract_verify_remote_assets \
                         "$repo" "$release_id" "$expected_assets_json" false "$tag" \
                         "$release_contract_metadata_json"); then
@@ -11411,9 +11605,13 @@ EOF
                         "$release_contract_tag_ruleset_receipt"; then
                         postpublish_ruleset_valid=true
                     fi
+                    if _release_contract_verify_raw_installer_checksum \
+                        "$(jq -c '.raw_installer_checksum // null' <<< "$release_contract_plan")" >/dev/null; then
+                        postpublish_raw_installer_valid=true
+                    fi
 
                     if $postpublish_assets_valid && $postpublish_tag_valid && \
-                       $postpublish_ruleset_valid; then
+                       $postpublish_ruleset_valid && $postpublish_raw_installer_valid; then
                         draft=false
                         local published_url
                         published_url=$(jq -r '.html_url // empty' <<< "$published_release_json")

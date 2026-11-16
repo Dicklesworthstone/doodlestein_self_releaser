@@ -2150,6 +2150,52 @@ YAML
     config_validate_release_contract contract-tool
 }
 
+test_release_contract_accepts_raw_installer_checksum_policy() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets: {linux/amd64: contract-tool-linux}
+  raw_installer_checksum:
+    downstream_repo: owner/downstream
+    checksum_path: checksums.yaml
+    installer_key: contract_tool
+    installer_path: install.sh
+YAML
+  config_validate_release_contract contract-tool &&
+    [[ "$(config_get_release_contract_json contract-tool | jq -r '.raw_installer_checksum.installer_key')" == contract_tool ]]
+}
+
+test_release_contract_rejects_invalid_raw_installer_checksum_policy() {
+  release_contract_test_deps_available || return 0
+  local policy
+  for policy in \
+    'null' 'false' '[]' '{}' \
+    '{downstream_repo: "https://github.com/owner/downstream", checksum_path: checksums.yaml, installer_key: app, installer_path: install.sh}' \
+    '{downstream_repo: owner/downstream, checksum_path: ../checksums.yaml, installer_key: app, installer_path: install.sh}' \
+    '{downstream_repo: owner/downstream, checksum_path: checksums.yaml, installer_key: "app.key", installer_path: install.sh}' \
+    '{downstream_repo: "owner/downstream\n", checksum_path: checksums.yaml, installer_key: app, installer_path: install.sh}' \
+    '{downstream_repo: owner/downstream, checksum_path: "checksums.yaml\n", installer_key: app, installer_path: install.sh}' \
+    '{downstream_repo: owner/downstream, checksum_path: checksums.yaml, installer_key: "app\n", installer_path: install.sh}' \
+    '{downstream_repo: owner/downstream, checksum_path: checksums.yaml, installer_key: app, installer_path: "install.sh\n"}' \
+    '{downstream_repo: owner/downstream, checksum_path: checksums.yaml, installer_key: app, installer_path: /install.sh}' \
+    '{downstream_repo: owner/downstream, checksum_path: checksums.yaml, installer_key: app, installer_path: install.sh, branch: stale}'; do
+    write_contract_tool_config << YAML
+tool_name: contract-tool
+targets: [linux/amd64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets: {linux/amd64: contract-tool-linux}
+  raw_installer_checksum: $policy
+YAML
+    if config_validate_release_contract contract-tool; then
+      return 1
+    fi
+  done
+}
+
 test_release_contract_accepts_pinned_minisign_key_file() {
   release_contract_test_deps_available || return 0
   write_contract_tool_config << 'YAML'
@@ -3610,6 +3656,8 @@ main() {
   run_test "release_contract_null_is_legacy_compatible" test_release_contract_null_is_legacy_compatible
   run_test "release_contract_rejects_non_object" test_release_contract_rejects_non_object
   run_test "release_contract_valid_is_canonical_json" test_release_contract_valid_is_canonical_json
+  run_test "release_contract_accepts_raw_installer_checksum_policy" test_release_contract_accepts_raw_installer_checksum_policy
+  run_test "release_contract_rejects_invalid_raw_installer_checksum_policy" test_release_contract_rejects_invalid_raw_installer_checksum_policy
   run_test "release_contract_accepts_pinned_minisign_key_file" test_release_contract_accepts_pinned_minisign_key_file
   run_test "release_contract_accepts_pinned_github_tag_ruleset" test_release_contract_accepts_pinned_github_tag_ruleset
   run_test "release_contract_rejects_invalid_github_tag_ruleset" test_release_contract_rejects_invalid_github_tag_ruleset

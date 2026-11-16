@@ -1282,6 +1282,24 @@ _config_canonicalize_release_contract_json() {
     printf '%s\n' "$canonical"
 }
 
+# Raw installer pins are independent of the signed binary archive manifest.
+# Only public main is authoritative; callers cannot select a stale branch.
+_config_validate_raw_installer_checksum_json() {
+    jq -e '
+        def project_path:
+            type == "string" and length > 0 and length <= 1024 and
+            (split("/") | all(.[];
+                test("\\A[A-Za-z0-9][A-Za-z0-9._+-]*\\z") and . != "." and . != ".."));
+        type == "object" and
+        keys == ["checksum_path", "downstream_repo", "installer_key", "installer_path"] and
+        (.downstream_repo | type == "string" and length <= 200 and
+            test("\\A[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*\\z")) and
+        (.installer_path | project_path) and (.checksum_path | project_path) and
+        (.installer_key | type == "string" and length <= 128 and
+            test("\\A[A-Za-z0-9][A-Za-z0-9_-]*\\z"))
+    ' <<< "$1" >/dev/null 2>&1
+}
+
 # Compare a tool's registry entry (repos.yaml) with its per-tool build config
 # (repos.d/<tool>.yaml). The two files historically drifted apart silently:
 # repos.yaml supplies registry info and quality gates while the build runner
@@ -1890,7 +1908,8 @@ config_validate_release_contract() {
             "exact_additional_assets",
             "exact_primary_assets",
             "github_tag_ruleset",
-            "minisign_public_key_file"
+            "minisign_public_key_file",
+            "raw_installer_checksum"
         ] | length) != 0 then false
         elif $contract.checksum_sidecar != "sha256" then false
         elif ($contract.exact_primary_assets | type) != "object" then false
@@ -1945,6 +1964,12 @@ config_validate_release_contract() {
             (($all_assets | map(ascii_downcase) | unique | length) == ($all_assets | length))
         end
     ' >/dev/null 2>&1; then
+        if jq -e 'has("raw_installer_checksum")' <<< "$contract_json" >/dev/null &&
+           ! _config_validate_raw_installer_checksum_json \
+                "$(jq -c '.raw_installer_checksum' <<< "$contract_json")"; then
+            _cfg_log_error "Invalid raw installer checksum policy for $toolname"
+            return 4
+        fi
         if ! config_get_release_source_dependencies_json "$toolname" >/dev/null; then
             _cfg_log_error "Invalid release source dependencies for $toolname"
             return 4
