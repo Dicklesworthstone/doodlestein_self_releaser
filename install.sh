@@ -84,6 +84,12 @@ INSTALL_LINK_NEW_ID=""
 INSTALL_LINK_OLD_ID=""
 INSTALL_LINK_SWITCH=0
 INSTALL_LOCK_ID=""
+INSTALL_REQUEST_DIR=""
+INSTALL_REQUEST_CHILD=""
+INSTALL_REQUEST_GUARD=""
+INSTALL_REQUEST_STARTING=0
+INSTALL_REQUEST_STOPPING=0
+INSTALL_INTERRUPTED=0
 
 # ============================================================
 # Usage
@@ -126,6 +132,8 @@ Environment:
   DSR_DEST           Override install directory (default: ~/.local/bin)
   DSR_DATA_DIR       Override data directory (default: ~/.local/share/dsr)
   DSR_REPO_DIR       Override repo clone directory (default: $DSR_DATA_DIR/repo)
+  DSR_INSTALLER_TIMEOUT  Complete request budget, 1–3600 seconds (default:
+                         30 for HTTP, 300 for Git; includes helper processes)
   HTTPS_PROXY        Proxy for HTTPS connections
   HTTP_PROXY         Proxy for HTTP connections
 EOF
@@ -332,6 +340,100 @@ setup_proxy() {
   fi
 }
 
+# A connect timeout does not bound a complete response, a redirect chain, or a
+# Git credential helper. Supervise the whole acquisition in an owned process
+# group. Keep this supervisor in the installer shell (never $(...)) so a signal
+# sent only to the installer PID can stop every ordinary request descendant.
+validate_request_timeout() {
+  if [[ -n "${DSR_INSTALLER_TIMEOUT+x}" ]] &&
+     { [[ ! "$DSR_INSTALLER_TIMEOUT" =~ ^[1-9][0-9]{0,3}$ ]] || ((DSR_INSTALLER_TIMEOUT > 3600)); }; then
+    err "DSR_INSTALLER_TIMEOUT must be an integer from 1 through 3600 seconds"
+    return 4
+  fi
+}
+
+request_workspace() {
+  [[ -z "$INSTALL_REQUEST_DIR" ]] || return 0
+  INSTALL_REQUEST_DIR=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/dsr-installer-request.XXXXXXXX") || return 1
+}
+
+stop_request() {
+  INSTALL_REQUEST_STOPPING=1
+  [[ -z "$INSTALL_REQUEST_CHILD" ]] || kill -TERM -- "-$INSTALL_REQUEST_CHILD" 2>/dev/null || true
+  [[ -z "$INSTALL_REQUEST_GUARD" ]] || kill -TERM -- "-$INSTALL_REQUEST_GUARD" 2>/dev/null || true
+  [[ -z "$INSTALL_REQUEST_CHILD" ]] || kill -KILL -- "-$INSTALL_REQUEST_CHILD" 2>/dev/null || true
+  [[ -z "$INSTALL_REQUEST_GUARD" ]] || kill -KILL -- "-$INSTALL_REQUEST_GUARD" 2>/dev/null || true
+  [[ -z "$INSTALL_REQUEST_CHILD" ]] || wait "$INSTALL_REQUEST_CHILD" 2>/dev/null || true
+  [[ -z "$INSTALL_REQUEST_GUARD" ]] || wait "$INSTALL_REQUEST_GUARD" 2>/dev/null || true
+  INSTALL_REQUEST_CHILD="" INSTALL_REQUEST_GUARD=""
+  INSTALL_REQUEST_STOPPING=0
+}
+
+installer_signal() {
+  INSTALL_INTERRUPTED="$1"
+  # Do not lose $! if a signal arrives between fork and PID registration.
+  if ((INSTALL_REQUEST_STARTING || INSTALL_REQUEST_STOPPING)); then return; fi
+  exit "$INSTALL_INTERRUPTED"
+}
+
+request_terminal_status() {
+  case "$1" in 124|129|130|131|137|143) return 0 ;; *) return 1 ;; esac
+}
+
+run_request() {
+  local limit="$1" status=0 monitor=0
+  shift
+  request_workspace || return 1
+  rm -f -- "$INSTALL_REQUEST_DIR/timeout" || return 1
+  [[ "$-" != *m* ]] || monitor=1
+  INSTALL_REQUEST_STARTING=1
+  set -m
+  (
+    set +m
+    trap - EXIT HUP INT TERM
+    "$@"
+  ) </dev/null &
+  INSTALL_REQUEST_CHILD=$!
+  (
+    set +m
+    trap - EXIT HUP INT TERM
+    sleep "$limit" & timer=$!
+    wait "$timer" || exit 0
+    printf 'timeout\n' > "$INSTALL_REQUEST_DIR/timeout" || true
+    kill -TERM -- "-$INSTALL_REQUEST_CHILD" 2>/dev/null || true
+    sleep 1 & timer=$!
+    wait "$timer" || exit 0
+    kill -KILL -- "-$INSTALL_REQUEST_CHILD" 2>/dev/null || true
+  ) </dev/null >/dev/null 2>&1 &
+  INSTALL_REQUEST_GUARD=$!
+  ((monitor)) || set +m
+  INSTALL_REQUEST_STARTING=0
+  ((INSTALL_INTERRUPTED == 0)) || installer_signal "$INSTALL_INTERRUPTED"
+  wait "$INSTALL_REQUEST_CHILD" 2>/dev/null || status=$?
+  stop_request
+  # Reap the watchdog before classifying the result: it cannot mark an expired
+  # request after this check and turn a timeout into permission to try again.
+  [[ ! -f "$INSTALL_REQUEST_DIR/timeout" ]] || status=124
+  ((INSTALL_INTERRUPTED == 0)) || installer_signal "$INSTALL_INTERRUPTED"
+  if ((status == 124)); then err "Acquisition exceeded its ${limit}s request budget"; fi
+  return "$status"
+}
+
+request_curl() {
+  curl -q --connect-timeout 5 --max-time "${DSR_INSTALLER_TIMEOUT:-30}" \
+    --user-agent "doodlestein_self_releaser-installer" "${PROXY_ARGS[@]}" "$@" 2>/dev/null
+}
+
+http_request() {
+  local status=0
+  request_workspace || return 1
+  run_request "${DSR_INSTALLER_TIMEOUT:-30}" request_curl "$@" > "$INSTALL_REQUEST_DIR/body" || status=$?
+  # curl can reach its own connect/response deadline before the watchdog.
+  # That remains terminal, not permission to try another acquisition.
+  if ((status == 28)); then err "HTTP acquisition timed out"; return 124; fi
+  return "$status"
+}
+
 # ============================================================
 # Version Resolution
 # ============================================================
@@ -343,16 +445,23 @@ resolve_version() {
   [[ -n "$OFFLINE_TARBALL" ]] && return 0
 
   # 2. GitHub API (latest release tag, if releases exist)
-  VERSION=$(curl -fsSL --connect-timeout 5 "${PROXY_ARGS[@]}" \
-    "https://api.github.com/repos/${OWNER}/${REPO}/releases/latest" 2>/dev/null \
-    | grep -o '"tag_name": *"[^"]*"' | head -n 1 | sed -E 's/.*"v?([^"]*)"$/\1/' || true)
+  local status=0
+  http_request -fsSL "https://api.github.com/repos/${OWNER}/${REPO}/releases/latest" || status=$?
+  request_terminal_status "$status" && return "$status"
+  VERSION=""
+  if ((status == 0)); then
+    VERSION=$(grep -o '"tag_name": *"[^"]*"' "$INSTALL_REQUEST_DIR/body" \
+      | head -n 1 | sed -E 's/.*"v?([^"]*)"$/\1/' || true)
+  fi
   [[ "$VERSION" =~ ^[0-9] ]] || VERSION=""
   [[ -n "$VERSION" ]] && return 0
 
   # 3. Redirect URL parsing (fallback when API rate-limited)
-  VERSION=$(curl -fsSL -o /dev/null -w '%{url_effective}' "${PROXY_ARGS[@]}" \
-    "https://github.com/${OWNER}/${REPO}/releases/latest" 2>/dev/null \
-    | sed -E 's|.*/tag/v?||' || true)
+  status=0
+  http_request -fsSL -o /dev/null -w '%{url_effective}' \
+    "https://github.com/${OWNER}/${REPO}/releases/latest" || status=$?
+  request_terminal_status "$status" && return "$status"
+  if ((status == 0)); then VERSION=$(sed -E 's|.*/tag/v?||' "$INSTALL_REQUEST_DIR/body"); fi
   # Reject HTML page (GitHub returns /releases if no releases exist)
   if [[ "$VERSION" == *"releases"* ]] || [[ -z "$VERSION" ]]; then
     VERSION=""
@@ -360,9 +469,12 @@ resolve_version() {
   [[ -n "$VERSION" ]] && return 0
 
   # 4. Parse from raw dsr script header on GitHub
-  VERSION=$(curl -fsSL --connect-timeout 5 "${PROXY_ARGS[@]}" \
-    "${GITHUB_RAW}/main/dsr" 2>/dev/null \
-    | grep -m1 'DSR_VERSION=' | sed -E 's/.*"([^"]+)".*/\1/' || true)
+  status=0
+  http_request -fsSL "${GITHUB_RAW}/main/dsr" || status=$?
+  request_terminal_status "$status" && return "$status"
+  if ((status == 0)); then
+    VERSION=$(grep -m1 'DSR_VERSION=' "$INSTALL_REQUEST_DIR/body" | sed -E 's/.*"([^"]+)".*/\1/' || true)
+  fi
   [[ -n "$VERSION" ]] && return 0
 
   # 5. Installer-bundled version (last resort)
@@ -450,7 +562,10 @@ check_existing_install() {
       INSTALL_COMMITTED=1
       # Still run agent configuration (idempotent)
       if [ "$NO_CONFIGURE" -eq 0 ]; then
-        configure_agents || warn "Agent configuration did not complete; the installed dsr is unchanged"
+        local configure_status=0
+        configure_agents || configure_status=$?
+        request_terminal_status "$configure_status" && return "$configure_status"
+        ((configure_status == 0)) || warn "Agent configuration did not complete; the installed dsr is unchanged"
       fi
       show_summary
       exit 0
@@ -467,8 +582,10 @@ check_network() {
   if [[ -n "$OFFLINE_TARBALL" ]]; then
     return 0
   fi
-  if ! curl -fsSL --connect-timeout 3 "${PROXY_ARGS[@]}" \
-    "https://github.com/${OWNER}/${REPO}" -o /dev/null 2>/dev/null; then
+  local status=0
+  http_request -fsSL "https://github.com/${OWNER}/${REPO}" -o /dev/null || status=$?
+  request_terminal_status "$status" && return "$status"
+  if ((status != 0)); then
     warn "Cannot reach github.com — install may fail"
     warn "Use --offline FILE to install from a pre-downloaded script"
   fi
@@ -482,7 +599,7 @@ preflight_checks() {
   check_write_permissions
 
   if [[ -z "$OFFLINE_TARBALL" ]]; then
-    check_network
+    check_network || return $?
   fi
 
   # Check for curl (used for version resolution + skill downloads, but not required —
@@ -505,6 +622,7 @@ cleanup() {
   trap - EXIT
   # Finish a handled rollback even if another interrupt arrives midway.
   trap '' HUP INT TERM
+  stop_request
   if [ "$INSTALL_COMMITTED" -eq 0 ]; then
     if ! rollback_installation; then
       status=1
@@ -535,6 +653,10 @@ cleanup() {
     else
       warn "Installation lock ownership changed; leaving it untouched: $LOCK_DIR"
     fi
+  fi
+  if [[ -n "$INSTALL_REQUEST_DIR" ]]; then
+    rm -f -- "$INSTALL_REQUEST_DIR/body" "$INSTALL_REQUEST_DIR/timeout" || true
+    rmdir -- "$INSTALL_REQUEST_DIR" 2>/dev/null || warn "Request workspace retained for inspection: $INSTALL_REQUEST_DIR"
   fi
   exit "$status"
 }
@@ -792,17 +914,20 @@ clone_or_update_repo() {
 
   info "Cloning dsr from ${OWNER}/${REPO}..."
   build_clone_refs
-  local clone_ref clone_error attempt=0 last_clone_error=""
+  local clone_ref clone_error attempt=0 last_clone_error="" status
   for clone_ref in "${CLONE_REFS[@]}"; do
     attempt=$((attempt + 1))
     INSTALL_REPO_CANDIDATE="$TMP/candidate-$attempt"
     clone_error="$TMP/git-clone-$attempt.err"
     last_clone_error="$clone_error"
     if run_with_spinner "Cloning repository ($clone_ref)..." \
-      clone_repo_ref "$clone_ref" "$clone_error" "$INSTALL_REPO_CANDIDATE"; then
+      run_request "${DSR_INSTALLER_TIMEOUT:-300}" clone_repo_ref "$clone_ref" "$clone_error" "$INSTALL_REPO_CANDIDATE"; then
       ok "Staged dsr ($clone_ref) in $INSTALL_REPO_CANDIDATE"
       return 0
+    else
+      status=$?
     fi
+    request_terminal_status "$status" && return "$status"
     if [ "$VERSION_EXPLICIT" -eq 0 ]; then
       break
     fi
@@ -1133,7 +1258,7 @@ install_skill() {
   local agent_name="$2"
   local local_skill_path=""
   local skill_md_url="${GITHUB_RAW}/main/SKILL.md"
-  local script_dir
+  local script_dir status=0
 
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -1154,15 +1279,22 @@ install_skill() {
   fi
 
   # Secondary: download SKILL.md directly from repo
-  if [[ -z "$OFFLINE_TARBALL" ]] && curl -fsSL "${PROXY_ARGS[@]}" "$skill_md_url" -o "$dest_dir/SKILL.md" 2>/dev/null; then
-    ok "Installed dsr skill for $agent_name (from repo)"
-    return 0
+  if [[ -z "$OFFLINE_TARBALL" ]]; then
+    http_request -fsSL "$skill_md_url" || status=$?
+    request_terminal_status "$status" && return "$status"
+    if ((status == 0)) && cp -- "$INSTALL_REQUEST_DIR/body" "$dest_dir/SKILL.md"; then
+      ok "Installed dsr skill for $agent_name (from repo)"
+      return 0
+    fi
   fi
 
   # Tertiary: download skill tarball from releases (requires TMP dir)
   local skill_url="https://github.com/${OWNER}/${REPO}/releases/latest/download/skill.tar.gz"
-  if [[ -z "$OFFLINE_TARBALL" && -n "$TMP" ]] && curl -fsSL "${PROXY_ARGS[@]}" "$skill_url" -o "$TMP/skill.tar.gz" 2>/dev/null; then
-    if tar -xzf "$TMP/skill.tar.gz" -C "$dest_dir" 2>/dev/null; then
+  if [[ -z "$OFFLINE_TARBALL" && -n "$TMP" ]]; then
+    status=0
+    http_request -fsSL "$skill_url" || status=$?
+    request_terminal_status "$status" && return "$status"
+    if ((status == 0)) && tar -xzf "$INSTALL_REQUEST_DIR/body" -C "$dest_dir" 2>/dev/null; then
       ok "Installed dsr skill for $agent_name (from release)"
       return 0
     fi
@@ -1271,7 +1403,7 @@ configure_agents() {
   detect_agents
   print_detected_agents
 
-  local count=${#DETECTED_AGENTS[@]}
+  local count=${#DETECTED_AGENTS[@]} status
   [[ $count -eq 0 ]] && return 0
 
   for agent in "${DETECTED_AGENTS[@]}"; do
@@ -1285,6 +1417,8 @@ configure_agents() {
           if install_skill "$claude_skill_dir" "Claude Code"; then
             CLAUDE_STATUS="created"
           else
+            status=$?
+            request_terminal_status "$status" && return "$status"
             CLAUDE_STATUS="failed"
           fi
         fi
@@ -1298,6 +1432,8 @@ configure_agents() {
           if install_skill "$codex_skill_dir" "Codex CLI"; then
             CODEX_STATUS="created"
           else
+            status=$?
+            request_terminal_status "$status" && return "$status"
             CODEX_STATUS="failed"
           fi
         fi
@@ -1439,12 +1575,20 @@ show_summary() {
 # ============================================================
 
 main() {
+  validate_request_timeout || return $?
   # Handle uninstall early
   if [ "$UNINSTALL" -eq 1 ]; then
     do_uninstall
   fi
 
   show_header
+
+  # Cover metadata discovery too: cancellation must own requests even before
+  # the installation lock and source transaction have been created.
+  trap cleanup EXIT
+  trap 'installer_signal 129' HUP
+  trap 'installer_signal 130' INT
+  trap 'installer_signal 143' TERM
 
   # Platform + proxy
   detect_platform
@@ -1455,11 +1599,7 @@ main() {
   resolve_version
   info "Target version: ${VERSION:-latest}"
 
-  # Recovery is armed before acquiring ownership or performing any rename.
-  trap cleanup EXIT
-  trap 'exit 129' HUP
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
+  # Recovery was armed before acquiring ownership or performing any rename.
   acquire_lock
 
   # Check the selected installation under the writer lock.
@@ -1480,7 +1620,10 @@ main() {
   setup_config_dirs
 
   # Agent detection + skill installation
-  configure_agents || warn "Agent configuration did not complete; dsr is installed"
+  local status=0
+  configure_agents || status=$?
+  request_terminal_status "$status" && return "$status"
+  ((status == 0)) || warn "Agent configuration did not complete; dsr is installed"
 
   # PATH setup
   maybe_add_path || warn "PATH configuration did not complete; dsr is installed at $DEST/$BINARY_NAME"

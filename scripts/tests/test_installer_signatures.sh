@@ -681,10 +681,12 @@ import hashlib
 import os
 from pathlib import Path
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tarfile
+import time
 
 project, temporary = map(Path, sys.argv[1:])
 installer = Path(os.environ.get('DSR_ROOT_INSTALLER_UNDER_TEST', project / 'install.sh'))
@@ -785,7 +787,19 @@ def setup(name, old_version='1.2.30', destination=True, old_source=True):
     if destination:
         (target / 'dsr').symlink_to(selected / 'dsr')
     wrappers.joinpath('curl').write_text('''#!/usr/bin/env bash
-printf 'curl invoked\\n' >> "$DSR_FIXTURE_CASE/http.calls"
+printf '%s\\n' "$*" >> "$DSR_FIXTURE_CASE/http.calls"
+case "${DSR_FIXTURE_FAULT:-}" in
+  stalled-metadata) exec "$DSR_FIXTURE_CASE/wrappers/stall-request" ;;
+  stalled-redirect)
+    [[ "$*" != *api.github.com* ]] && exec "$DSR_FIXTURE_CASE/wrappers/stall-request" ;;
+  stalled-header)
+    [[ "$*" != *raw.githubusercontent.com* ]] || exec "$DSR_FIXTURE_CASE/wrappers/stall-request" ;;
+  stalled-network) exec "$DSR_FIXTURE_CASE/wrappers/stall-request" ;;
+  stalled-skill)
+    [[ "$*" != *SKILL.md* ]] || exec "$DSR_FIXTURE_CASE/wrappers/stall-request" ;;
+  healthy-metadata)
+    if [[ "$*" == *api.github.com* ]]; then printf '{"tag_name":"v1.2.3"}\\n'; exit 0; fi ;;
+esac
 exit 22
 ''')
     wrappers.joinpath('mv').write_text('''#!/usr/bin/env bash
@@ -808,6 +822,18 @@ if [[ "${DSR_FIXTURE_FAULT:-}" == launcher-create && "${@: -1}" == */.dsr-launch
 exec "$DSR_FIXTURE_REAL_LN" "$@"
 ''')
     wrappers.joinpath('git').write_text('''#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$DSR_FIXTURE_CASE/git.calls"
+if [[ "$1" == clone && "${DSR_FIXTURE_FAULT:-}" == stalled-clone ]]; then
+  exec "$DSR_FIXTURE_CASE/wrappers/stall-request"
+fi
+if [[ "${3:-}" == fetch && "${DSR_FIXTURE_FAULT:-}" == stalled-credential ]]; then
+  # Exercise genuine Git credential-helper dispatch underneath the supervised
+  # acquisition. No remote is contacted and the helper never returns a token.
+  printf 'protocol=https\\nhost=github.com\\n\\n' |
+    "$DSR_FIXTURE_REAL_GIT" -c credential.helper= \\
+      -c "credential.helper=!\\\"$DSR_FIXTURE_CASE/wrappers/stall-request\\\"" credential fill
+  exit $?
+fi
 if [[ "$1" == clone && "${DSR_FIXTURE_FAULT:-}" == partial-clone ]]; then
   mkdir -p -- "${@: -1}"
   printf 'partial clone fixture\\n' > "${@: -1}/partial"
@@ -819,18 +845,32 @@ if [[ "${DSR_FIXTURE_FAULT:-}" == partial-tag-fetch && "${3:-}" == fetch ]]; the
 fi
 exec "$DSR_FIXTURE_REAL_GIT" "$@"
 ''')
+    wrappers.joinpath('stall-request').write_text('''#!/usr/bin/env bash
+exec "$DSR_FIXTURE_PYTHON" "$DSR_FIXTURE_CASE/stall.py"
+''')
+    (case / 'stall.py').write_text('''import os, pathlib, signal, subprocess, sys, time
+case = pathlib.Path(os.environ['DSR_FIXTURE_CASE'])
+for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+    signal.signal(sig, signal.SIG_IGN)
+child = subprocess.Popen([sys.executable, '-c',
+    'import signal,time; [signal.signal(s,signal.SIG_IGN) for s in '
+    '(signal.SIGHUP,signal.SIGINT,signal.SIGTERM)]; time.sleep(30)'])
+(case / 'request.pids').write_text(str(os.getpid()) + '\\n' + str(child.pid) + '\\n')
+time.sleep(30)
+''')
     for path in wrappers.iterdir():
         path.chmod(0o755)
     configuration = task_home / '.gitconfig'
     configuration.write_text('[url "' + valid.as_uri() + '"]\n'
                              '\tinsteadOf = https://github.com/Dicklesworthstone/doodlestein_self_releaser.git\n')
     environment = os.environ.copy()
-    for key in ('REPO_DIR', 'DSR_DEST', 'DSR_REPO_DIR', 'DSR_DATA_DIR', 'GIT_DIR', 'GIT_WORK_TREE'):
+    for key in ('REPO_DIR', 'DSR_DEST', 'DSR_REPO_DIR', 'DSR_DATA_DIR', 'GIT_DIR', 'GIT_WORK_TREE', 'DSR_INSTALLER_TIMEOUT'):
         environment.pop(key, None)
     environment.update(HOME=str(task_home), DSR_DEST=str(target), DSR_REPO_DIR=str(selected),
                        XDG_DATA_HOME=str(task_home / 'data'), DSR_FIXTURE_CASE=str(case),
                        DSR_FIXTURE_REAL_MV=real_mv, DSR_FIXTURE_REAL_LN=real_ln,
-                       DSR_FIXTURE_REAL_GIT=real_git, GIT_CONFIG_GLOBAL=str(configuration),
+                       DSR_FIXTURE_REAL_GIT=real_git, DSR_FIXTURE_PYTHON=sys.executable,
+                       GIT_CONFIG_GLOBAL=str(configuration),
                        GIT_CONFIG_NOSYSTEM='1', GIT_ALLOW_PROTOCOL='file', GIT_TRACE=str(case / 'git.trace'),
                        PATH=str(wrappers) + os.pathsep + os.environ['PATH'])
     return case, selected, target, environment
@@ -849,6 +889,132 @@ def preserved(label, context, before, old_id, result):
     check(label + ' preserves all previous source bytes/modes', selected.is_dir() and tree_snapshot(selected) == before)
     check(label + ' restores the original checkout inode', selected.is_dir() and identity(selected) == old_id)
     check(label + ' leaves the previous launcher runnable', run([str(target / 'dsr')]).stdout.strip() == 'old')
+
+def process_live(pid):
+    result = run(['ps', '-o', 'stat=', '-p', str(pid)])
+    return result.returncode == 0 and bool(result.stdout.strip()) and not result.stdout.lstrip().startswith('Z')
+
+def request_case(label, fault, arguments, cancel=None, skills=False):
+    context = setup(label)
+    case, selected, target, environment = context
+    before, old_id = tree_snapshot(selected), identity(selected)
+    private = case / 'requests'
+    private.mkdir()
+    environment.update(DSR_INSTALLER_TIMEOUT='1', DSR_FIXTURE_FAULT=fault, TMPDIR=str(private))
+    entry = installer
+    if skills:
+        # Run identical installer bytes without an adjacent checkout SKILL.md
+        # so the public optional download path is actually reached.
+        entry = case / 'entry.sh'
+        shutil.copyfile(installer, entry)
+        (Path(environment['HOME']) / '.claude').mkdir()
+        for name in ('claude', 'codex', 'gemini'):
+            wrapper = case / 'wrappers' / name
+            wrapper.write_text('#!/usr/bin/env bash\nprintf "fixture agent\\n"\n')
+            wrapper.chmod(0o755)
+    command = ['bash', str(entry), '--quiet', '--no-gum']
+    if not skills:
+        command.append('--no-configure')
+    command.extend(arguments)
+    started = time.monotonic()
+    harness_timeout = False
+    pids = []
+    lock = Path('/tmp/dsr-installer.d')
+    with (case / 'stdout').open('w') as out, (case / 'stderr').open('w') as err:
+        child = subprocess.Popen(command, env=environment, stdout=out, stderr=err, start_new_session=True)
+        (case / 'installer.pid').write_text(str(child.pid))
+        try:
+            if cancel is not None:
+                until = time.monotonic() + 3
+                while time.monotonic() < until and not (case / 'request.pids').exists() and child.poll() is None:
+                    time.sleep(0.02)
+                check(label + ' reaches its actual request helper', (case / 'request.pids').exists())
+                if child.poll() is None:
+                    os.kill(child.pid, cancel)
+            try:
+                child.wait(timeout=4)
+            except subprocess.TimeoutExpired:
+                harness_timeout = True
+            if (case / 'request.pids').exists():
+                pids = [int(value) for value in (case / 'request.pids').read_text().splitlines()]
+            check(label + ' finishes before the independent harness deadline', not harness_timeout)
+            expected = 124 if cancel is None else 128 + int(cancel)
+            check(label + ' preserves timeout/cancellation status', child.returncode == expected)
+            check(label + ' stops resistant request descendants', len(pids) == 2 and not any(process_live(pid) for pid in pids))
+            check(label + ' releases its installation lock', not lock.exists())
+        finally:
+            if child.poll() is None:
+                os.killpg(child.pid, signal.SIGKILL)
+            child.wait(timeout=3)
+            # Contain a failing baseline too: these are exact owned fixture
+            # PIDs, and live-children assertions were evaluated before cleanup.
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            # SIGKILL is only the independent harness's last resort. Contain
+            # its stale lock so a failing original cannot poison later cases.
+            if lock.is_dir() and (lock / 'pid').is_file() and (lock / 'pid').read_text().strip() == str(child.pid):
+                (lock / 'pid').unlink()
+                lock.rmdir()
+    check(label + ' removes its private request workspace', not list(private.iterdir()))
+    http = (case / 'http.calls').read_text().splitlines() if (case / 'http.calls').exists() else []
+    git = (case / 'git.calls').read_text().splitlines() if (case / 'git.calls').exists() else []
+    expected_http = {'stalled-metadata': 1, 'stalled-redirect': 2, 'stalled-header': 3,
+                     'stalled-network': 1, 'stalled-clone': 1, 'stalled-credential': 1,
+                     'stalled-skill': 2}[fault]
+    check(label + ' does not start a later HTTP acquisition', len(http) == expected_http)
+    acquisitions = [line for line in git if line.startswith('clone ') or ' fetch ' in line]
+    check(label + ' does not retry source acquisition', len(acquisitions) == (1 if fault in ('stalled-clone', 'stalled-credential', 'stalled-skill') else 0))
+    if skills:
+        check(label + ' keeps its successfully activated source usable', run([str(target / 'dsr')]).stdout.strip() == 'new')
+        backups = list(case.glob('.repo.install.*/previous-repo'))
+        check(label + ' retains the previous installed source bytes', len(backups) == 1 and tree_snapshot(backups[0]) == before)
+        check(label + ' never publishes partial or fallback skill bytes', not (Path(environment['HOME']) / '.claude/skills/dsr/SKILL.md').exists())
+    else:
+        check(label + ' preserves all previous source bytes/modes', selected.is_dir() and tree_snapshot(selected) == before)
+        check(label + ' preserves the original checkout inode', selected.is_dir() and identity(selected) == old_id)
+        check(label + ' leaves the previous launcher runnable', run([str(target / 'dsr')]).stdout.strip() == 'old')
+    check(label + ' stays within the overall request budget', time.monotonic() - started < 6)
+
+for label, fault, arguments in (
+    ('metadata-deadline', 'stalled-metadata', []),
+    ('redirect-deadline', 'stalled-redirect', []),
+    ('header-deadline', 'stalled-header', []),
+    ('network-deadline', 'stalled-network', ['--version', 'main']),
+    ('clone-deadline', 'stalled-clone', ['--version', 'main']),
+    ('credential-deadline', 'stalled-credential', ['--version', '1.2.3']),
+):
+    request_case(label, fault, arguments)
+request_case('optional-skill-deadline', 'stalled-skill', ['--version', 'main'], skills=True)
+request_case('metadata-term', 'stalled-metadata', [], cancel=signal.SIGTERM)
+request_case('clone-term', 'stalled-clone', ['--version', 'main'], cancel=signal.SIGTERM)
+request_case('credential-int', 'stalled-credential', ['--version', '1.2.3'], cancel=signal.SIGINT)
+
+for index, value in enumerate(('', '0', '01', '-1', '1.5', '3601', '999999999999999999999', '1;exit 0')):
+    context = setup('invalid-budget-' + str(index))
+    case, selected, target, environment = context
+    before, old_id = tree_snapshot(selected), identity(selected)
+    missing = case / 'untouched' / 'bin'
+    environment.update(DSR_INSTALLER_TIMEOUT=value, DSR_DEST=str(missing))
+    result = invoke(context, ['--version', 'main'])
+    check('invalid budget ' + repr(value) + ' is rejected as configuration', result.returncode == 4)
+    check('invalid budget ' + repr(value) + ' creates no destination paths', not missing.parent.exists())
+    check('invalid budget ' + repr(value) + ' performs no transport or staging', not (case / 'http.calls').exists() and not (case / 'git.calls').exists() and not list(case.glob('.repo.install.*')))
+    check('invalid budget ' + repr(value) + ' preserves previous source', tree_snapshot(selected) == before and identity(selected) == old_id)
+
+context = setup('healthy-bounded-metadata')
+context[3]['DSR_INSTALLER_TIMEOUT'] = '3'
+result = invoke(context, [], 'healthy-metadata')
+check('healthy bounded metadata and a genuine Git clone complete', result.returncode == 0 and run([str(context[2] / 'dsr')]).stdout.strip() == 'new')
+check('successful metadata avoids alternate version acquisitions', len((context[0] / 'http.calls').read_text().splitlines()) == 2)
+
+if os.environ.get('DSR_ROOT_INSTALLER_REQUESTS_ONLY') == '1':
+    print(f'Root installer requests: {checks - len(failures)}/{checks} checks passed', flush=True)
+    if failures:
+        print('Fixture diagnostics: ' + str(root), file=sys.stderr)
+    sys.exit(bool(failures))
 
 for label, missing, invalid in (
     ('invalid-entry', '', 'entry'), ('missing-entry', 'dsr', ''),
