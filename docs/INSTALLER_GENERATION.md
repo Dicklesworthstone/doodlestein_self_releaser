@@ -122,6 +122,23 @@ curl arguments and shell tracing. Published release identity is validated
 before selecting a latest tag. Existing verified cache entries retain their
 precedence. Regenerate deployed installers to include these checks.
 
+Freshness metadata has an 8 MiB body limit through both curl and the GitHub CLI,
+including responses without a trustworthy `Content-Length`. Curl ignores
+ambient configuration and accepts only HTTP 200 without following metadata
+redirects. GitHub CLI freshness requests admit only a final HTTP 200, with an
+additional 64 KiB maximum for the reported response headers. Oversized,
+incomplete and non-200 responses cannot authorize a source upgrade. If neither
+transport supplies valid advisory evidence, freshness remains `unknown` and
+installation retains the verified release. Explicit cancellation still stops
+installation. These limits apply to newly generated clients.
+
+The focused acquisition regression uses genuine curl and GitHub CLI requests
+against a local HTTPS service, including complete generated installations:
+
+```bash
+bash scripts/tests/test_generated_installer_private.sh --freshness-bounds-only
+```
+
 The focused regression exercises actual generated installers with real Git and
 Go builds and explicit curl/gh response-boundary fixtures:
 

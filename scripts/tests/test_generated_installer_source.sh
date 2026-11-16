@@ -209,7 +209,8 @@ case "$url" in
         ;;
     https://api.github.com/*/commits*|https://api.github.com/*/compare/*)
         [[ "$FRESHNESS_MODE" != private ]] || exit 22
-        freshness-response "$url" > "$dest"
+        body=$(freshness-response "$url") || exit $?
+        response 200 "$body"
         ;;
     */releases/latest)
         [[ "$MODE" != discovery-fail ]] || { response 404; exit $?; }
@@ -287,6 +288,9 @@ if [[ "$1" == api ]]; then
     if [[ -n "${GH_EXPECTED_TOKEN:-}" ]]; then
         printf 'gh-context %s %s\n' "${GH_HOST:-}" "${GH_TOKEN:-}" >> "$CALLS"
         [[ "${GH_HOST:-}" == github.com && "${GH_TOKEN:-}" == "$GH_EXPECTED_TOKEN" ]] || exit 1
+    fi
+    if [[ " $* " == *' --include '* ]]; then
+        printf 'HTTP/2.0 200 OK\r\nContent-Type: application/json\r\n\r\n'
     fi
     freshness-response "${!#}"
     exit $?

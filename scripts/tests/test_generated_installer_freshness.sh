@@ -77,6 +77,10 @@ if $config_stdin; then
 fi
 printf 'curl-url %s\n' "$url" >> "$TEST_HTTP_LOG"
 emit_json() { if [[ -n "$dest" ]]; then cat > "$dest"; else cat; fi; }
+emit_freshness() {
+    emit_json || return $?
+    [[ "$write_out" != *http_code* ]] || printf '200\n'
+}
 response() {
     local code="$1" body="${2:-}"
     printf '%s' "$body" | emit_json || return 23
@@ -90,18 +94,18 @@ fi
 if [[ "$url" == https://api.github.com/*/commits\?* ]]; then
     case "$TEST_METADATA_FAULT" in
         unavailable) exit 22 ;;
-        malformed) printf 'not-json\n' | emit_json; exit 0 ;;
-        multiple) printf '[] []\n' | emit_json; exit 0 ;;
-        missing) printf '[{}]\n' | emit_json; exit 0 ;;
-        control) jq -nc --arg sha "$TEST_HEAD_PIN" '[{sha:($sha + "\n")}]' | emit_json; exit 0 ;;
+        malformed) printf 'not-json\n' | emit_freshness; exit 0 ;;
+        multiple) printf '[] []\n' | emit_freshness; exit 0 ;;
+        missing) printf '[{}]\n' | emit_freshness; exit 0 ;;
+        control) jq -nc --arg sha "$TEST_HEAD_PIN" '[{sha:($sha + "\n")}]' | emit_freshness; exit 0 ;;
     esac
-    jq -nc --arg sha "$TEST_HEAD_PIN" '[{sha:$sha}]' | emit_json; exit 0
+    jq -nc --arg sha "$TEST_HEAD_PIN" '[{sha:$sha}]' | emit_freshness; exit 0
 fi
 if [[ "$url" == https://api.github.com/*/commits/tags%2F* ]]; then
     if [[ "$TEST_METADATA_FAULT" == base-control ]]; then
-        jq -nc --arg sha "$TEST_TAG_PIN" '{sha:($sha + "\n")}' | emit_json
+        jq -nc --arg sha "$TEST_TAG_PIN" '{sha:($sha + "\n")}' | emit_freshness
     else
-        jq -nc --arg sha "$TEST_TAG_PIN" '{sha:$sha}' | emit_json
+        jq -nc --arg sha "$TEST_TAG_PIN" '{sha:$sha}' | emit_freshness
     fi
     exit 0
 fi
@@ -134,7 +138,7 @@ if [[ "$url" == https://api.github.com/*/compare/* ]]; then
         "$REAL_GIT" -C "$TEST_UPSTREAM" add main.go
         "$REAL_GIT" -C "$TEST_UPSTREAM" commit -qm 'move head after assessment'
     fi
-    printf '%s\n' "$response" | emit_json; exit 0
+    printf '%s\n' "$response" | emit_freshness; exit 0
 fi
 [[ "$url" == */releases/download/* && "$TEST_DELIVERY" != missing ]] || { response 404; exit $?; }
 name="${url##*/}"

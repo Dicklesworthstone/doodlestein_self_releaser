@@ -400,13 +400,14 @@ cat > "$work/transports/gh" <<'TRANSPORT'
 #!/usr/bin/env bash
 set -uo pipefail
 operation="${1:-} ${2:-}"
-repo='' hostname='' asset='' dest='' endpoint="${!#}"
+repo='' hostname='' asset='' dest='' endpoint="${!#}" include=false
 while (($#)); do
     case "$1" in
         --repo) repo="$2"; shift 2 ;;
         --hostname) hostname="$2"; shift 2 ;;
         --pattern) asset="$2"; shift 2 ;;
         --output) dest="$2"; shift 2 ;;
+        --include) include=true; shift ;;
         *) shift ;;
     esac
 done
@@ -433,6 +434,7 @@ fi
 if [[ "$operation" == api\ * ]]; then
     base=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     head=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    if $include; then printf 'HTTP/2.0 200 OK\r\nContent-Type: application/json\r\n\r\n'; fi
     case "$endpoint" in
         'repos/example/demo/commits?per_page=1') printf '[{"sha":"%s"}]\n' "$head" ;;
         repos/example/demo/commits/tags%2Fv1.2.3) printf '{"sha":"%s"}\n' "$base" ;;

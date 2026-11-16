@@ -581,38 +581,70 @@ _installer_run_gh() (
 _isb_freshness_request() (
     set +x
     local transport="$1" endpoint="$2" destination="$3"
+    local maximum=8388608 bytes status token='' escaped_token='' header header_bytes=0 headers_complete=false
+    local status_pattern='^HTTP/[0-9]+(\.[0-9]+)? 200( .*)?$'
+    local LC_ALL=C
+    local -a transfer_statuses=()
+    set -o pipefail
     if [[ "$transport" == gh ]]; then
-        _installer_run_gh api --hostname github.com --method GET \
+        # The CLI's successful exit includes responses other than HTTP 200.
+        # Bound its complete response before parsing, then admit exactly one
+        # bounded header block and a separately bounded JSON body. The extra
+        # 64 KiB is solely for headers, never a larger metadata allowance.
+        _installer_run_gh --bounded-output "$destination.response" "$((maximum + 65536))" \
+            api --hostname github.com --method GET --include \
             -H 'Accept: application/vnd.github+json' -H 'Cache-Control: no-cache' \
-            "$endpoint" > "$destination"
-    elif ! command -v gh >/dev/null 2>&1 &&
-         [[ -n "${DSR_GH_TOKEN:-}" || -n "${GITHUB_TOKEN:-}" || -n "${GH_TOKEN:-}" ]]; then
-        # Match token-only release acquisition without adding a gh dependency.
-        # Keep credentials off argv and disk, ignore ambient curl options, and
-        # never follow metadata redirects. These endpoints are assembled only
-        # from the admitted repository/tag and the resolved immutable commits.
-        local token escaped_token bytes status maximum=8388608
-        token=$(_installer_github_token) || return $?
-        [[ ${#token} -le 8192 && "$token" != *[[:cntrl:]]* ]] || return 4
-        escaped_token="${token//\\/\\\\}"; escaped_token="${escaped_token//\"/\\\"}"
-        set -o pipefail
-        if ! printf 'header = "Authorization: Bearer %s"\n' "$escaped_token" |
+            "$endpoint" || return $?
+        {
+            IFS= read -r header || return 8
+            header_bytes=$((${#header} + 1))
+            header="${header%$'\r'}"
+            [[ "$header" =~ $status_pattern ]] || return 8
+            while IFS= read -r header; do
+                header_bytes=$((header_bytes + ${#header} + 1))
+                ((header_bytes <= 65536)) || return 8
+                header="${header%$'\r'}"
+                if [[ -z "$header" ]]; then headers_complete=true; break; fi
+            done
+            $headers_complete || return 8
+            head -c "$((maximum + 1))" > "$destination" || return 8
+        } < "$destination.response"
+        bytes=$(wc -c < "$destination") || return 8
+        [[ "$bytes" =~ ^[[:space:]]*[0-9]+[[:space:]]*$ ]] && ((bytes <= maximum)) || return 8
+    elif [[ "$transport" == curl ]]; then
+        # Keep the same selected-account rule as release acquisition. A
+        # token-only installation authenticates without requiring the CLI;
+        # anonymous metadata uses exactly the same status and byte limits.
+        if ! command -v gh >/dev/null 2>&1 &&
+           [[ -n "${DSR_GH_TOKEN:-}" || -n "${GITHUB_TOKEN:-}" || -n "${GH_TOKEN:-}" ]]; then
+            token=$(_installer_github_token) || return $?
+            [[ ${#token} -le 8192 && "$token" != *[[:cntrl:]]* ]] || return 4
+            escaped_token="${token//\\/\\\\}"; escaped_token="${escaped_token//\"/\\\"}"
+        fi
+        # Do not trust Content-Length as the only bound: older curl versions
+        # cannot enforce --max-filesize for unknown-length/chunked bodies.
+        # Ignore .curlrc, do not follow redirects, and never put credentials
+        # in argv. An unavailable advisory response cannot authorize source.
+        if ! {
+            [[ -z "$token" ]] || printf 'header = "Authorization: Bearer %s"\n' "$escaped_token"
+        } |
             curl -q --config - --silent --globoff --proto '=https' \
                 --connect-timeout 10 --max-time 30 --max-filesize "$maximum" \
                 -H 'Accept: application/vnd.github+json' -H 'Cache-Control: no-cache' \
                 -H 'X-GitHub-Api-Version: 2022-11-28' \
+                --user-agent 'dsr-installer' \
                 "https://api.github.com/$endpoint" --output /dev/fd/3 \
                 --write-out '%{http_code}' 3>&1 > "$destination.http" 2>/dev/null |
             head -c "$((maximum + 1))" > "$destination"; then
+            transfer_statuses=("${PIPESTATUS[@]}")
+            case "${transfer_statuses[1]:-0}" in 42|129|130|131|143) return 5 ;; esac
             return 8
         fi
         bytes=$(wc -c < "$destination" | tr -d '[:space:]') || return 1
         status=$(cat -- "$destination.http") || return 1
         [[ "$status" == 200 && "$bytes" =~ ^[0-9]+$ ]] && ((bytes <= maximum)) || return 8
     else
-        curl -sSf --proto '=https' --connect-timeout 10 --max-time 30 \
-            -H 'Accept: application/vnd.github+json' -H 'Cache-Control: no-cache' \
-            "https://api.github.com/$endpoint" -o "$destination"
+        return 4
     fi
 )
 

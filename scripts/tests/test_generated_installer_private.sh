@@ -34,9 +34,10 @@ import urllib.parse
 
 root = pathlib.Path(sys.argv[1])
 freshness_only = sys.argv[2] == "--freshness-only"
+freshness_bounds_only = sys.argv[2] == "--freshness-bounds-only"
 fallback_only = sys.argv[2] == "--fallback-only"
-if sys.argv[2] not in ("", "--freshness-only", "--fallback-only"):
-    raise SystemExit("Usage: test_generated_installer_private.sh [--freshness-only|--fallback-only]")
+if sys.argv[2] not in ("", "--freshness-only", "--freshness-bounds-only", "--fallback-only"):
+    raise SystemExit("Usage: test_generated_installer_private.sh [--freshness-only|--freshness-bounds-only|--fallback-only]")
 work = pathlib.Path(tempfile.mkdtemp(prefix="dsr-private-bash-"))
 print(f"Private Bash installer fixtures retained at: {work}", flush=True)
 for part in ("config/repos.d", "payload", "bin", "home", "tls"):
@@ -206,11 +207,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-    def reply(self, status, body=b"", location=None, headers=None):
+    def reply(self, status, body=b"", location=None, headers=None, framing="fixed"):
         self.record["response_bytes"] = len(body)
         self.record["response_status"] = status
+        if framing in ("chunked", "chunked-with-length"):
+            self.protocol_version = "HTTP/1.1"
         self.send_response(status)
-        self.send_header("Content-Length", str(len(body)))
+        if framing == "fixed":
+            self.send_header("Content-Length", str(len(body)))
+        elif framing == "short":
+            self.send_header("Content-Length", str(len(body) + 1))
+        elif framing in ("chunked", "chunked-with-length"):
+            self.send_header("Transfer-Encoding", "chunked")
+            if framing == "chunked-with-length":
+                self.send_header("Content-Length", "1")
         for name, value in (headers or {}).items():
             if name.lower() not in ("content-length", "connection"):
                 self.send_header(name, value)
@@ -219,9 +229,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         if body:
             try:
-                self.wfile.write(body)
+                if framing in ("chunked", "chunked-with-length"):
+                    for start in range(0, len(body), 65536):
+                        chunk = body[start:start + 65536]
+                        self.wfile.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
+                    self.wfile.write(b"0\r\n\r\n")
+                else:
+                    self.wfile.write(body)
             except (BrokenPipeError, ConnectionResetError, ssl.SSLError):
                 pass  # Deliberately oversized metadata is refused by the client.
+        if framing in ("unknown", "short"):
+            self.close_connection = True
 
     def do_GET(self):
         host = self.headers.get("Host", "").split(":")[0]
@@ -234,8 +252,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                        "ambient_header": self.headers.get("X-Fixture-Ambient")}
         requests.append(self.record)
         mode = state["mode"]
+        selected_authorizations = {"Bearer " + state["token"]}
+        if state.get("github_cli"):
+            # Genuine gh uses GitHub's token scheme; curl uses Bearer. Both
+            # must name the same selected token, never a second credential.
+            selected_authorizations.add("token " + state["token"])
         if host == "api.github.com" and self.path in state.get("faults", {}):
-            if authorization != "Bearer " + state["token"]:
+            if authorization not in selected_authorizations and not (state["public"] and not authorization):
                 self.reply(403)
                 return
             fault = state["faults"][self.path]
@@ -311,7 +334,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if mode == "redirect-back" and parsed.query == "returned=1":
             self.reply(200 if not authorization else 403, payload if not authorization else b"")
             return
-        if mode == "auth-error" or authorization != "Bearer " + state["token"]:
+        if mode == "auth-error" or (authorization not in selected_authorizations and
+                                    not (state["public"] and not authorization)):
             self.reply(403)
             return
         if path.startswith("/repos/example/demo/commits") or path.startswith("/repos/example/demo/compare/"):
@@ -338,6 +362,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.reply(200, encoded + b"\n{}")
             elif mode == "freshness-oversized":
                 self.reply(200, encoded + b" " * (8 * 1024 * 1024))
+            elif mode == "freshness-at-limit" and path == "/repos/example/demo/commits":
+                self.reply(200, encoded + b" " * (8 * 1024 * 1024 - len(encoded)))
+            elif mode in ("freshness-unknown-length", "freshness-chunked", "freshness-lying-length"):
+                framing = {"freshness-unknown-length": "unknown", "freshness-chunked": "chunked",
+                           "freshness-lying-length": "chunked-with-length"}[mode]
+                self.reply(200, encoded + b" " * (16 * 1024 * 1024), framing=framing)
+            elif mode == "freshness-short-body":
+                self.reply(200, encoded, framing="short")
+            elif mode in ("freshness-202", "freshness-206"):
+                self.reply(int(mode[-3:]), encoded)
+            elif mode == "freshness-large-headers":
+                self.reply(200, encoded, headers={"X-Large-Fixture": "x" * 65536})
             else:
                 self.reply(200, encoded)
             return
@@ -439,7 +475,8 @@ class GitTunnel(socketserver.BaseRequestHandler):
                 if not block or len(request) >= 8192:
                     return
                 request += block
-            if request.split(b"\r\n", 1)[0].split()[:2] != [b"CONNECT", b"github.com:443"]:
+            first_line = request.split(b"\r\n", 1)[0].split()[:2]
+            if first_line not in ([b"CONNECT", b"github.com:443"], [b"CONNECT", b"api.github.com:443"]):
                 self.request.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
                 return
             with socket.create_connection(server.server_address, timeout=15) as upstream_socket:
@@ -470,7 +507,7 @@ proxy_url = "http://127.0.0.1:" + str(git_proxy.server_address[1])
 
 # A genuine client PATH without gh. The adapter forwards config stdin and
 # file descriptor 3 unchanged; it never fabricates an API response or a header.
-for name in ("bash", "env", "uname", "tr", "getconf", "ldd", "awk", "sed", "mktemp", "rm",
+for name in ("bash", "sh", "env", "uname", "tr", "getconf", "ldd", "awk", "sed", "mktemp", "rm",
              "mkdir", "rmdir", "cp", "mv", "cat", "stat", "chmod", "tar", "gzip", "head",
              "tail", "wc", "od", "cut", "sort", "grep", "sha256sum", "shasum", "readlink",
              "realpath", "date", "sleep", "jq", "printf", "touch", "tee", "ln", "id", "uniq",
@@ -531,7 +568,7 @@ results = {}
 def run(label, mode="", *, tag="v1.2.3", latest=False, selected="dsr", options=(),
         cache=None, public=False, tracing=False, token_override=None, curlrc=False,
         faults=None, seed_release=False, requested_version=None, file_limit=None):
-    state.update(label=label, mode=mode, tag=tag, token=tokens[selected or "dsr"], public=public,
+    state.update(label=label, mode=mode, tag=tag, token=tokens[selected or "dsr"], public=public, github_cli=False,
                  faults=faults or {})
     directory = work / label
     directory.mkdir()
@@ -575,7 +612,13 @@ def run(label, mode="", *, tag="v1.2.3", latest=False, selected="dsr", options=(
     args += list(options)
     offset = len(requests)
     limit = (lambda: resource.setrlimit(resource.RLIMIT_FSIZE, (file_limit, file_limit))) if file_limit else None
-    result = subprocess.run(args, env=env, text=True, capture_output=True, timeout=30, preexec_fn=limit)
+    try:
+        result = subprocess.run(args, env=env, text=True, capture_output=True, timeout=30, preexec_fn=limit)
+    except subprocess.TimeoutExpired as error:
+        for name, captured in (("stdout", error.stdout), ("stderr", error.stderr)):
+            (directory / name).write_bytes(captured.encode() if isinstance(captured, str) else captured or b"")
+        (directory / "requests.json").write_text(json.dumps(requests[offset:], indent=2))
+        raise
     (directory / "stdout").write_text(result.stdout)
     (directory / "stderr").write_text(result.stderr)
     selected_requests = requests[offset:]
@@ -596,6 +639,96 @@ def freshness_requests(calls):
 
 def source_requests(calls):
     return [call for call in calls if call["host"] == "github.com" and call["path"].startswith("/example/demo.git/")]
+
+
+def test_freshness_bounds():
+    maximum = 8 * 1024 * 1024
+    installed_gh = shutil.which("gh")
+    if installed_gh is None:
+        raise RuntimeError("The genuine GitHub CLI is required for freshness response controls")
+    gh_path = work / "with-gh"
+    gh_path.mkdir()
+    for entry in (work / "bin").iterdir():
+        (gh_path / entry.name).symlink_to(entry)
+    (gh_path / "gh").symlink_to(installed_gh)
+    source_module = pathlib.Path(module).with_name("install_source.sh")
+
+    # Exercise the actual shared helper against genuine curl and gh over TLS.
+    # No response parser, status or streaming behavior is mocked. GitHub is
+    # reached only through this fixture's scoped DNS/trust/CONNECT adapters.
+    for transport in ("curl", "gh"):
+        for mode in ("healthy", "freshness-at-limit", "freshness-oversized", "freshness-unknown-length",
+                     "freshness-chunked", "freshness-lying-length", "freshness-short-body",
+                     "freshness-202", "freshness-206") + (("freshness-large-headers",) if transport == "gh" else ()):
+            label = "bounded-" + transport + "-" + mode
+            directory = work / label
+            directory.mkdir()
+            state.update(label=label, mode=mode, token=tokens["dsr"], public=transport == "curl",
+                         github_cli=transport == "gh", faults={})
+            env = environment.copy()
+            env.update(HOME=str(directory), DSR_TEST_CURL_ARGV=str(directory / "curl-argv.jsonl"))
+            (directory / ".curlrc").write_text('header = "X-Fixture-Ambient: applied"\nverbose\n')
+            if transport == "gh":
+                env.update(PATH=str(gh_path), DSR_GH_TOKEN=tokens["dsr"],
+                           SSL_CERT_FILE=str(work / "tls/cert.pem"), DSR_INSTALLER_GH_TIMEOUT="10")
+            destination = directory / "metadata.json"
+            offset = len(requests)
+            result = subprocess.run(["/bin/bash", "-c",
+                'source "$1"; _isb_freshness_request "$2" repos/example/demo/commits?per_page=1 "$3"',
+                "fixture", str(source_module), transport, str(destination)],
+                env=env, text=True, capture_output=True, timeout=20)
+            (directory / "stdout").write_text(result.stdout)
+            (directory / "stderr").write_text(result.stderr)
+            calls = requests[offset:]
+            (directory / "requests.json").write_text(json.dumps(calls, indent=2))
+            accepted = mode in ("healthy", "freshness-at-limit")
+            check(label + " admits only complete HTTP 200 metadata within the byte bound",
+                  (result.returncode == 0) == accepted and bool(calls))
+            body_size = destination.stat().st_size if destination.exists() else 0
+            raw = pathlib.Path(str(destination) + ".response")
+            check(label + " retains bounded body and CLI header evidence",
+                  body_size <= maximum + 1 and (not raw.exists() or raw.stat().st_size <= maximum + 65536 + 1))
+            if accepted:
+                check(label + " preserves the genuine JSON body and exact limit",
+                      destination.is_file() and json.loads(destination.read_bytes()) == [{"sha": head_commit}] and
+                      (mode != "freshness-at-limit" or body_size == maximum))
+            if transport == "curl":
+                check(label + " ignores ambient curl configuration without adding a credential",
+                      all(call["ambient_header"] is None and call["authorization_sha256"] is None for call in calls))
+            else:
+                expected = {hashlib.sha256((scheme + " " + tokens["dsr"]).encode()).hexdigest()
+                            for scheme in ("Bearer", "token")}
+                check(label + " uses the selected account through genuine gh",
+                      all(call["authorization_sha256"] in expected for call in calls))
+
+    # The public generated caller must keep the authenticated release when
+    # advisory metadata is unavailable; it must never treat a large body or
+    # a successful redirect/202/206 body as consent for a newer source build.
+    for mode in ("healthy", "freshness-at-limit", "freshness-unknown-length", "freshness-lying-length",
+                 "freshness-202", "freshness-206", "freshness-redirect-host", "freshness-redirect-repository"):
+        accepted = mode in ("healthy", "freshness-at-limit")
+        threshold = "1" if accepted else "0"
+        result, calls, directory, _, complete, _ = run("public-" + mode, mode, latest=True,
+            selected=None, public=True, curlrc=True,
+            options=("--allow-source-build", "--source-if-stale", threshold))
+        receipt = json.loads(result.stdout) if result.returncode == 0 else {}
+        check("public " + mode + " keeps the complete signed release and truthful advisory state",
+              complete and receipt.get("freshness", {}).get("status") == ("fresh" if accepted else "unknown") and
+              "source" not in receipt and not source_requests(calls))
+        check("public " + mode + " does not inherit curl configuration or follow an advisory redirect",
+              bool(freshness_requests(calls)) and all(call["ambient_header"] is None and
+                  call["host"] in ("github.com", "api.github.com") for call in calls))
+
+    result, calls, directory, _, _, _ = run("public-freshness-cancel", latest=True,
+        selected=None, public=True, seed_release=True,
+        options=("--allow-source-build", "--source-if-stale", "0", "--yes"),
+        faults={"/repos/example/demo/commits?per_page=1": "cancel"})
+    original = results["public-freshness-cancel"]["original"]
+    check("public freshness cancellation returns 5 without source acquisition or executable replacement",
+          result.returncode == 5 and bool(freshness_requests(calls)) and not source_requests(calls) and
+          all((hashlib.sha256((directory / "bin" / name).read_bytes()).hexdigest(),
+               (directory / "bin" / name).stat().st_mode, (directory / "bin" / name).stat().st_ino) == prior
+              for name, prior in original.items()))
 
 
 def test_release_fallback():
@@ -765,6 +898,10 @@ def test_release_fallback():
 
 
 try:
+    if freshness_bounds_only:
+        test_freshness_bounds()
+        print(f"Bash installer freshness bounds: {passed} passed, {failed} failed", flush=True)
+        sys.exit(0 if failed == 0 else 1)
     if fallback_only:
         test_release_fallback()
         print(f"Private Bash installer source fallback: {passed} passed, {failed} failed", flush=True)
