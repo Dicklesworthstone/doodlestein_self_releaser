@@ -483,8 +483,11 @@ _rf_prepared_integrity_plan() (
     _ri_verify_set "$root" "$proofs" "$repo" "$tag" "$sha" "$token" "$work" || return $?
     _ri_local_unchanged "$root" "$proofs" "$selection" "$documents" "$work" || return $?
     [[ "$(signing_public_key_token "$public")" == "$token" ]] || return 7
-    jq -cSn --arg token "$token" --argjson selection "$selection" --argjson documents "$documents" \
-        '{public_key:$token,selection:$selection,documents:$documents}'
+    jq -csS --arg token "$token" --slurpfile documents /dev/fd/3 '
+        if length==1 and ($documents|length)==1 then
+            {public_key:$token,selection:.[0],documents:$documents[0]}
+        else error("expected one integrity selection and proof inventory") end
+    ' 3<<< "$documents" <<< "$selection"
 )
 
 # Freeze the exact authenticated proof set at the finalizer/publisher boundary.
@@ -509,8 +512,10 @@ _rf_integrity_key() {
     local receipt="$1" repo="$2" tag="$3" sha="$4" token="$5" hash="$6" selection="$7" documents="$8" context
     context=$(_rf_context_key "$receipt" "$repo" "$tag" "$sha") || return 7
     jq -ecsS --argjson context "$context" --arg token "$token" --arg hash "$hash" \
-        --argjson selection "$selection" --argjson documents "$documents" '
+        --slurpfile selections /dev/fd/3 --slurpfile document_sets /dev/fd/4 '
+        def one: if length==1 then .[0] else error("expected one integrity document") end;
         def id: type=="number" and .>0 and .<=9007199254740991 and .==floor;
+        ($selections|one) as $selection|($document_sets|one) as $documents|
         ($selection.artifacts+$documents|sort_by(.name)) as $records |
         if length==1 and (.[0]|. as $r|
             .schema_version==1 and .kind=="dsr-release-integrity-verification" and
@@ -525,7 +530,8 @@ _rf_integrity_key() {
                 ($a[0].digest==null or $a[0].digest=="" or $a[0].digest==("sha256:"+$p.sha256))) and
             ([.assets[]|select(.name=="release-integrity.json")|.id]==[.manifest.asset_id]))
         then .[0]|{context:$context,authenticated,verification_policy,public_key,manifest,assets:(.assets|sort_by(.name))}
-        else error("missing or mismatched signature verification evidence") end' <<< "$receipt" 2>/dev/null
+        else error("missing or mismatched signature verification evidence") end' \
+        3<<< "$selection" 4<<< "$documents" <<< "$receipt" 2>/dev/null
 }
 
 # Signature verification authenticates frozen bytes. Rehash those bytes and keep
@@ -634,11 +640,23 @@ _rf_evidence_key() {
     ' <<< "$1" 2>/dev/null
 }
 
+# Whole selections and verification receipts can exceed exec's argument limit.
+# Callers choose a literal field; require one object and one value, keeping each
+# JSON input independent even when either contains an array or null.
+_rf_set_json() {
+    jq -csS --arg field "$1" --slurpfile values /dev/fd/3 '
+        if length==1 and (.[0]|type=="object") and ($values|length)==1 then
+            .[0]|.[$field]=$values[0]
+        else error("expected one finalization object and field document") end
+    ' 3<<< "$2"
+}
+
 _rf_state_valid() {
-    jq -es --argjson plan "$2" '
+    jq -es --slurpfile plans /dev/fd/3 '
         def digest: type=="string" and test("^[0-9a-f]{64}$");
         def record: type=="object" and (.name|type=="string" and length>0) and (.sha256|digest) and
             (.size|type=="number" and .>0 and .==floor);
+        ($plans|if length==1 then .[0] else error("expected one finalization plan") end) as $plan|
         length==1 and (.[0] | . as $s | type=="object" and .schema_version==1 and
             .kind=="dsr-release-finalization" and .plan==$plan and
             (.manifest_sha256==null or (.manifest_sha256|digest)) and
@@ -688,7 +706,7 @@ _rf_state_valid() {
                  (.phase=="preparing" or .provenance_verification!=null) and
                  (.provenance_verification==null or .provenance_documents!=null)
              end))
-    ' "$1" >/dev/null 2>&1
+    ' "$1" 3<<< "$2" >/dev/null 2>&1
     local rc=$? receipt key
     ((rc == 0)) || return "$rc"
     receipt=$(jq -c '.provenance_verification // null' "$1") || return 2
@@ -956,10 +974,12 @@ _rf_execute() {
         _rf_log 'Draft metadata and --retry-creation require --create-draft'; return 4
     fi
     if [[ "$dry" == true ]]; then
-        jq -nc --arg repo "$repo" --arg tag "$tag" --arg sha "$sha" --arg format "$format" --argjson promote "$promote" --arg selected "$selected" --argjson upload_plan "$upload_plan" \
+        jq -nc --arg repo "$repo" --arg tag "$tag" --arg sha "$sha" --arg format "$format" --argjson promote "$promote" --arg selected "$selected" \
             --argjson signed "$require_signatures" --argjson prepared "$prepared_signatures" --arg key "$integrity_token" --slurpfile preparation_docs /dev/fd/3 \
-            --argjson provenance "$provenance_policy" '
-            if ($preparation_docs|length)!=1 then error("invalid draft plan document") else $preparation_docs[0] as $preparation |
+            --slurpfile payload_docs /dev/fd/4 --slurpfile provenance_docs /dev/fd/5 '
+            if ($preparation_docs|length)!=1 or ($payload_docs|length)!=1 or ($provenance_docs|length)!=1
+            then error("invalid finalization plan documents") else
+            $preparation_docs[0] as $preparation|$payload_docs[0] as $upload_plan|$provenance_docs[0] as $provenance|
             {kind:"dsr-release-finalization-result",status:"planned",dry_run:true,exit_code:0,
              repo:$repo,tag:$tag,expected_sha:$sha,format:$format,promote:$promote,
              dispatch_repos:(if $selected=="" then [] else ($selected|split("\n")) end),
@@ -975,7 +995,8 @@ _rf_execute() {
                      (if $signed then ["publish and authenticate payload/checksum signatures"] else [] end)+
                      (if $provenance==null then [] else ["publish and authenticate manifest-backed provenance"] end)+
                      ["generate or reuse SBOMs","publish and verify evidence",
-                     (if $promote then "promote without changing latest" else "retain release mode" end)])} end' 3<<< "$preparation_plan"
+                     (if $promote then "promote without changing latest" else "retain release mode" end)])} end' \
+            3<<< "$preparation_plan" 4<<< "$upload_plan" 5<<< "$provenance_policy"
         return $?
     fi
     dsr_lock_available || return $?
@@ -1064,8 +1085,10 @@ _rf_execute_locked() {
     if [[ "$require_signatures" == true ]]; then
         mkdir -p -- "$integrity_dir" || return 1
         integrity_dir=$(cd "$integrity_dir" && pwd -P) || return 4
-        integrity_policy=$(jq -cSn --arg token "$integrity_token" --arg dir "$integrity_dir" --argjson selection "$integrity_selection" \
-            '{required:true,public_key:$token,output_dir:$dir,selection:$selection}') || return 1
+        integrity_policy=$(jq -csS --arg token "$integrity_token" --arg dir "$integrity_dir" '
+            if length==1 then {required:true,public_key:$token,output_dir:$dir,selection:.[0]}
+            else error("expected one selected integrity policy") end
+        ' <<< "$integrity_selection") || return 1
         if [[ "$prepared_signatures" == true ]]; then
             integrity_policy=$(jq -cS '.mode="prepared"' <<< "$integrity_policy") || return 1
         fi
@@ -1073,7 +1096,7 @@ _rf_execute_locked() {
     plan=$(jq -cSn --argjson context "$context_key" --arg root "$root" --arg output "$output_dir" --arg format "$format" \
         '{context:$context,artifacts_dir:$root,output_dir:$output,format:$format}') || return 1
     if [[ "$require_provenance" == true ]]; then
-        plan=$(jq -cS --argjson provenance "$provenance_policy" '.provenance=$provenance' <<< "$plan") || return 1
+        plan=$(_rf_set_json provenance "$provenance_policy" <<< "$plan") || return 1
     fi
     if [[ "$oldhash" == absent ]]; then
         state=$(printf '%s\n' "$plan" "$preparation_plan" "$preparation_result" | jq -csS \
@@ -1098,7 +1121,7 @@ _rf_execute_locked() {
         [[ "$(jq -r '.phase' <<< "$state")" == preparing ]] || {
             _rf_log 'Signature policy must be selected before evidence finalization'; return 2;
         }
-        state=$(jq -cS --argjson policy "$integrity_policy" '.integrity_policy=$policy' <<< "$state") || return 1
+        state=$(_rf_set_json integrity_policy "$integrity_policy" <<< "$state") || return 1
         oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
     fi
     saved=$(jq -cS '.handoff // null' <<< "$state") || return 1
@@ -1106,7 +1129,7 @@ _rf_execute_locked() {
         _rf_log 'Cannot change or omit the frozen downstream handoff'; return 2;
     }
     if [[ "$handoff" != null && "$saved" == null ]]; then
-        state=$(jq -cS --argjson handoff "$handoff" '.handoff=$handoff' <<< "$state") || return 1
+        state=$(_rf_set_json handoff "$handoff" <<< "$state") || return 1
         oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
     fi
     saved=$(jq -cS '.payload_plan // null' <<< "$state") || return 1
@@ -1174,8 +1197,8 @@ _rf_execute_locked() {
         [[ -z "$saved" || "$saved" == "$integrity_hash" ]] || return 2
         saved=$(jq -cS '.integrity_documents // null' <<< "$state") || return 1
         [[ "$saved" == null || "$saved" == "$(jq -cS . <<< "$integrity_documents")" ]] || return 2
-        state=$(jq -cS --arg hash "$integrity_hash" --argjson docs "$integrity_documents" \
-            '.integrity_manifest_sha256=$hash|.integrity_documents=$docs' <<< "$state") || return 1
+        state=$(_rf_set_json integrity_documents "$integrity_documents" <<< "$state") || return 1
+        state=$(jq -cS --arg hash "$integrity_hash" '.integrity_manifest_sha256=$hash' <<< "$state") || return 1
         oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
         if [[ -n "$build_manifest" ]]; then
             [[ "$(_rf_hash "$build_manifest")" == "$build_pin" ]] || return 2
@@ -1197,7 +1220,7 @@ _rf_execute_locked() {
             "$secret_key" "$integrity_dir" "$provenance_policy" "$prepared_signatures") || return $?
         [[ "$saved" == null || "$saved" == "$provenance_documents" ]] || return 2
         [[ "$prepared_provenance" == null || "$prepared_provenance" == "$provenance_documents" ]] || return 2
-        state=$(jq -cS --argjson docs "$provenance_documents" '.provenance_documents=$docs' <<< "$state") || return 1
+        state=$(_rf_set_json provenance_documents "$provenance_documents" <<< "$state") || return 1
         oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
         _RF_PROVENANCE_POLICY="$provenance_policy"; _RF_PROVENANCE_DOCUMENTS="$provenance_documents"
         _RF_PROVENANCE_OUTPUT="$integrity_dir"; _RF_PROVENANCE_PUBLIC="$public_key"
@@ -1210,7 +1233,7 @@ _rf_execute_locked() {
             --manifest-sha256 "$build_pin" --invocation-id "$(jq -r .invocation_id <<< "$provenance_policy")")
     fi
     if [[ "$upload_payloads" == true ]]; then
-        state=$(jq -cS --argjson selection "$upload_plan" '.payload_plan=$selection' <<< "$state") || return 1
+        state=$(_rf_set_json payload_plan "$upload_plan" <<< "$state") || return 1
         oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
         # The uploader must consume the already selected manifest, not a new
         # build that appeared between the planning read and this invocation.
@@ -1223,18 +1246,19 @@ _rf_execute_locked() {
         }
         payload_result=$(release_upload_payloads "$root" --build-manifest "$build_snapshot" \
             --repo "$repo" --tag "$tag" --sha "$sha" --state-dir "$session/payloads") || return $?
-        jq -es --argjson selection "$upload_plan" 'length==1 and (.[0]|
+        jq -es --slurpfile selections /dev/fd/3 '
+            ($selections|length)==1 and ($selections[0] as $selection|length==1 and (.[0]|
             .kind=="dsr-release-payload-publication" and .status=="verified" and .dry_run==false and
             .manifest_sha256==$selection.manifest_sha256 and .tool==$selection.tool and
-            (.assets|type=="array") and (.assets|map(.name)|sort)==($selection.artifacts|map(.name)|sort))' \
-            <<< "$payload_result" >/dev/null || return 7
+            (.assets|type=="array") and (.assets|map(.name)|sort)==($selection.artifacts|map(.name)|sort)))' \
+            3<<< "$upload_plan" <<< "$payload_result" >/dev/null || return 7
         [[ "$(_rf_context_key "$payload_result" "$repo" "$tag" "$sha")" == "$context_key" &&
            "$(jq -r '.release.draft' <<< "$payload_result")" == "$initial_draft" ]] || return 7
         _RF_PAYLOAD_ROOT="$root"; _RF_BUILD_MANIFEST="$build_manifest"; _RF_BUILD_PLAN="$upload_plan"
         _RF_PAYLOAD_ASSETS=$(jq -cS '.assets' <<< "$payload_result") || return 1
         saved=$(jq -cS '.payload_verification.assets // null' <<< "$state") || return 1
         [[ "$saved" == null || "$saved" == "$_RF_PAYLOAD_ASSETS" ]] || return 7
-        state=$(jq -cS --argjson receipt "$payload_result" '.payload_verification=$receipt' <<< "$state") || return 1
+        state=$(_rf_set_json payload_verification "$payload_result" <<< "$state") || return 1
         oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
     fi
     if [[ "$require_signatures" == true ]]; then
@@ -1268,7 +1292,7 @@ _rf_execute_locked() {
                 "$integrity_hash" "$integrity_selection" "$integrity_documents")" == "$integrity_key" ]] || return 7
         fi
         _RF_INTEGRITY_ASSETS=$(jq -cS '.assets' <<< "$integrity_key") || return 1
-        state=$(jq -cS --argjson receipt "$integrity_result" '.integrity_verification=$receipt' <<< "$state") || return 1
+        state=$(_rf_set_json integrity_verification "$integrity_result" <<< "$state") || return 1
         oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
     fi
     if [[ "$require_provenance" == true ]]; then
@@ -1290,7 +1314,7 @@ _rf_execute_locked() {
            ( -z "$_RF_PROVENANCE_KEY" || "$_RF_PROVENANCE_KEY" == "$provenance_key" ) ]] || return 7
         _RF_PROVENANCE_KEY="$provenance_key"
         _rf_integrity_inputs_gate "$work" || return $?
-        state=$(jq -cS --argjson receipt "$provenance_result" '.provenance_verification=$receipt' <<< "$state") || return 1
+        state=$(_rf_set_json provenance_verification "$provenance_result" <<< "$state") || return 1
         oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
     fi
     case "$format" in spdx) manifest_name=sbom-manifest.spdx.json ;; *) manifest_name=sbom-manifest.cdx.json ;; esac
@@ -1328,21 +1352,24 @@ _rf_execute_locked() {
     if [[ "$require_provenance" == true ]]; then
         provenance_result=$(_rf_provenance_verify "$repo" "$tag" "$sha" "$provenance_policy" "$provenance_documents" \
             "$provenance_key" "$initial_draft" "$evidence" "${provenance_args[@]}") || return $?
-        state=$(jq -cS --argjson receipt "$provenance_result" '.provenance_verification=$receipt' <<< "$state") || return 1
+        state=$(_rf_set_json provenance_verification "$provenance_result" <<< "$state") || return 1
     fi
-    state=$(jq -cS --argjson verification "$verification" \
-        '.verification=$verification | if .phase=="published" then . else .phase="evidence_ready" end' <<< "$state") || return 1
+    state=$(_rf_set_json verification "$verification" <<< "$state") || return 1
+    state=$(jq -cS 'if .phase=="published" then . else .phase="evidence_ready" end' <<< "$state") || return 1
     oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
     if [[ -n "$selected" ]]; then
-        payload=$(jq -nc --arg tool "$tool" --arg tag "$tag" --arg sha "$sha" --arg run "$dispatch_run" --argjson evidence "$evidence" --argjson integrity "$integrity_key" \
-            --argjson provenance "$provenance_key" '
+        payload=$(jq -nc --arg tool "$tool" --arg tag "$tag" --arg sha "$sha" --arg run "$dispatch_run" \
+            --slurpfile evidence_docs /dev/fd/3 --slurpfile integrity_docs /dev/fd/4 --slurpfile provenance_docs /dev/fd/5 '
+            def one: if length==1 then .[0] else error("expected one downstream evidence document") end;
+            ($evidence_docs|one) as $evidence|($integrity_docs|one) as $integrity|($provenance_docs|one) as $provenance|
             {tool:$tool,version:$tag,sha:$sha,run_id:$run,
              release_evidence:($evidence|{repository_id:.repository.id,release_id:.release.id,
                  format,manifest,artifact_count,asset_inventory_sha256,verification_policy})} |
             if $integrity==null then . else
                 .release_evidence.integrity=($integrity|{verification_policy,public_key,manifest}) end |
             if $provenance==null then . else
-                .release_evidence.provenance=($provenance|del(.context)) end') || return 1
+                .release_evidence.provenance=($provenance|del(.context)) end' \
+            3<<< "$evidence" 4<<< "$integrity_key" 5<<< "$provenance_key") || return 1
         dispatch_plan=$(_dp_release_plan "${repo,,}" "$selected" "$payload") || return $?
         _rf_dispatch_preflight "$dispatch_plan" "$dispatch_root" || return $?
     fi
@@ -1375,13 +1402,13 @@ _rf_execute_locked() {
         [[ "$(_rf_integrity_key "$integrity_result" "$repo" "$tag" "$sha" "$integrity_token" \
             "$integrity_hash" "$integrity_selection" "$integrity_documents")" == "$integrity_key" &&
            "$(jq -r '.release.draft' <<< "$integrity_result")" == "$initial_draft" ]] || return 7
-        state=$(jq -cS --argjson receipt "$integrity_result" '.integrity_verification=$receipt' <<< "$state") || return 1
+        state=$(_rf_set_json integrity_verification "$integrity_result" <<< "$state") || return 1
         oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
     fi
     if [[ "$require_provenance" == true ]]; then
         provenance_result=$(_rf_provenance_verify "$repo" "$tag" "$sha" "$provenance_policy" "$provenance_documents" \
             "$provenance_key" "$initial_draft" "$evidence" "${provenance_args[@]}") || return $?
-        state=$(jq -cS --argjson receipt "$provenance_result" '.provenance_verification=$receipt' <<< "$state") || return 1
+        state=$(_rf_set_json provenance_verification "$provenance_result" <<< "$state") || return 1
         oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
     fi
     sbom_verify_artifacts "$root" --format "$format" --output-dir "$output_dir" \
@@ -1389,7 +1416,8 @@ _rf_execute_locked() {
     _rf_gate "$repo" "$tag" "$sha" "$evidence" "$initial_draft" "$manifest" "$work" || return $?
     if [[ "$initial_draft" == false ]]; then
         status=published
-        state=$(jq -cS --argjson verification "$verification" '.verification=$verification | .phase="published"' <<< "$state") || return 1
+        state=$(_rf_set_json verification "$verification" <<< "$state") || return 1
+        state=$(jq -cS '.phase="published"' <<< "$state") || return 1
         oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
     fi
     [[ "$(_rf_hash "$file")" == "$oldhash" ]] || return 2
@@ -1407,14 +1435,20 @@ _rf_execute_locked() {
         if ((dispatch_rc == 0)); then _rf_dispatch_guard || dispatch_rc=$?; fi
         if ((dispatch_rc == 0)); then status=complete; else status=incomplete; fi
     fi
-    jq -nc --arg status "$status" --arg file "$file" --argjson verification "$verification" \
-        --argjson attempted "$promotion_attempted" --argjson rc "$promotion_rc" --argjson dispatch "$dispatch_result" --argjson exit_code "$dispatch_rc" --argjson payloads "$payload_result" --argjson integrity "$integrity_result" --slurpfile preparation_docs /dev/fd/3 \
-        --argjson provenance "$provenance_result" '
-        if ($preparation_docs|length)!=1 then error("invalid draft preparation receipt") else $preparation_docs[0] as $preparation |
-        {kind:"dsr-release-finalization-result",status:$status,exit_code:$exit_code,dry_run:false,
-         state_file:$file,promotion_attempted:$attempted,promotion_transport_exit_code:$rc,
-         verification:$verification,dispatch:$dispatch,payloads:$payloads,integrity:$integrity,preparation:$preparation} |
-         if $provenance==null then . else .+{provenance:$provenance} end end' 3<<< "$preparation_result" || return 1
+    local final_result
+    final_result=$(jq -nc --arg status "$status" --arg file "$file" \
+        --argjson attempted "$promotion_attempted" --argjson rc "$promotion_rc" --argjson exit_code "$dispatch_rc" \
+        '{kind:"dsr-release-finalization-result",status:$status,exit_code:$exit_code,dry_run:false,
+          state_file:$file,promotion_attempted:$attempted,promotion_transport_exit_code:$rc}') || return 1
+    final_result=$(_rf_set_json verification "$verification" <<< "$final_result") || return 1
+    final_result=$(_rf_set_json dispatch "$dispatch_result" <<< "$final_result") || return 1
+    final_result=$(_rf_set_json payloads "$payload_result" <<< "$final_result") || return 1
+    final_result=$(_rf_set_json integrity "$integrity_result" <<< "$final_result") || return 1
+    final_result=$(_rf_set_json preparation "$preparation_result" <<< "$final_result") || return 1
+    if [[ "$provenance_result" != null ]]; then
+        final_result=$(_rf_set_json provenance "$provenance_result" <<< "$final_result") || return 1
+    fi
+    printf '%s\n' "$final_result" || return 1
     return "$dispatch_rc"
 }
 

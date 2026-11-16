@@ -370,6 +370,41 @@ whether promotion was attempted. A reconciled transport failure is recorded even
 when re-reading proves the release was successfully published. Errors do not copy
 raw promotion API responses or credentials into diagnostics.
 
+### Large selected release inventories
+
+Payload plans, retained asset identities, SBOM input sets, signature inventories
+and finalization receipts are passed to JSON tools through streams or private
+file descriptors. Their complete contents stay bound to the selected release
+when they exceed the operating system's per-argument limit. Each streamed plan,
+inventory or receipt must contain exactly one JSON document; trailing documents
+are refused.
+
+This covers the manifest-bound payload preview and upload checkpoint, initial
+and resumed SBOM plans, signed-integrity preparation and verification, and the
+finalizer's saved evidence, downstream evidence projection and final result.
+Names, hashes, sizes and acknowledged asset IDs are preserved without truncating
+the selected set. Existing source, signature, identity and conflict checks remain
+in force. Profiles with explicit artifact-count or filename limits retain those
+limits.
+
+Run the selected-set regressions independently under the standard suite deadline:
+
+```bash
+timeout 120 bash scripts/tests/test_release_payloads.sh --large-selection-only
+timeout 120 bash scripts/tests/test_sbom_batch.sh --selected-payload-scale-only
+timeout 120 bash scripts/tests/test_release_finalize.sh --large-selection-only
+```
+
+The payload fixture uses 423 real selected files and oversized retained asset
+rows. The SBOM fixture independently hashes 502 real files, deliberately fails
+its first scanner after plan creation, retries the same plan, and checks that
+changing the final payload prevents another scan. The finalizer fixture covers
+the public large-plan preview and production integrity/checkpoint consumers;
+its remote asset records are explicit fixtures. These focused checks do not
+perform a full large release upload or authenticate hundreds of signatures.
+The existing integration suites continue to cover publication, signing,
+promotion and recovery with their declared transport and scanner fixtures.
+
 ### Cancellation and process lifetime
 
 The library entry point and its build-set/build-plan commands handle interrupt,

@@ -68,11 +68,12 @@ _ri_checksums() {
 }
 
 _ri_matches_selection() {
-    jq -en --argjson selection "$2" --slurpfile m "$1" '
+    jq -es --slurpfile m "$1" '
+        length==1 and (.[0] as $selection|
         ($m|length)==1 and $m[0].build_manifest_sha256==$selection.manifest_sha256 and
         $m[0].tool==$selection.tool and
-        ($m[0].artifacts|map({name,sha256,size})|sort_by(.name))==$selection.artifacts
-    ' >/dev/null 2>&1
+        ($m[0].artifacts|map({name,sha256,size})|sort_by(.name))==$selection.artifacts)
+    ' <<< "$2" >/dev/null 2>&1
 }
 
 _ri_check_record() {
@@ -296,11 +297,14 @@ _ri_prepare() (
         jq -nc --argjson record "$record" --argjson signature "$sig" \
             '$record+{signature:$signature}' >> "$rows" || return 1
     done <<< "$names"
-    jq -cSs --arg repo "$repo" --arg tag "$tag" --arg sha "$sha" --arg token "$token" --argjson s "$selection" '
+    jq -cSs --arg repo "$repo" --arg tag "$tag" --arg sha "$sha" --arg token "$token" --slurpfile selected /dev/fd/3 '
+        if ($selected|length)==1 then $selected[0] as $s|
         {schema_version:1,kind:"dsr-release-integrity",repository:$repo,tag:$tag,source_sha:$sha,
          tool:$s.tool,build_manifest_sha256:$s.manifest_sha256,signer:{type:"minisign",public_key:$token},
          artifacts:(map(select(.name!="checksums.sha256"))|sort_by(.name)),
-         checksums:(map(select(.name=="checksums.sha256"))[0])}' "$rows" > "$work/proofs/release-integrity.json" || return 1
+         checksums:(map(select(.name=="checksums.sha256"))[0])}
+        else error("expected one signed release selection") end
+    ' 3<<< "$selection" "$rows" > "$work/proofs/release-integrity.json" || return 1
     if [[ -e "$output/release-integrity.json" || -L "$output/release-integrity.json" ]]; then
         [[ -f "$output/release-integrity.json" && ! -L "$output/release-integrity.json" ]] &&
             cmp -s "$output/release-integrity.json" "$work/proofs/release-integrity.json" || return 2
@@ -352,7 +356,11 @@ _ri_download_unpinned() {
 }
 
 _ri_selected_assets() {
-    jq -cS --argjson names "$2" '[.[]|select(.name as $n|$names|index($n)!=null)]|sort_by(.name)' <<< "$1"
+    jq -csS --slurpfile selected /dev/fd/3 '
+        if length==1 and ($selected|length)==1 then
+            $selected[0] as $names|[.[0][]|select(.name as $n|$names|index($n)!=null)]|sort_by(.name)
+        else error("expected one inventory and one selected name set") end
+    ' 3<<< "$2" <<< "$1"
 }
 
 # Include selected metadata names only when they are actually present in the
@@ -381,7 +389,7 @@ _ri_local_unchanged() {
 
 _ri_remote_verify() (
     local repo="$1" tag="$2" sha="$3" token="$4" expected="$5" work="$6"
-    local context inventory id asset file manifest before documents names entries row name hash current
+    local context inventory id asset file manifest before documents names entries row name hash current assets
     context=$(_sbr_context "$repo" "$tag" "$work") || return $?
     # The release must match the selected repository, tag and commit.
     _rup_context_key "$context" "$repo" "$tag" "$sha" >/dev/null || return 7
@@ -401,7 +409,10 @@ _ri_remote_verify() (
     names=$(jq -c '[.artifacts[].name]|sort' "$manifest") || return 1
     [[ "$(_ri_payload_names "$inventory" "$names")" == "$names" ]] || return 7
     documents=$(_ri_documents "$work/proofs") || return $?
-    entries=$(jq -c --argjson docs "$documents" '[.artifacts[]|del(.signature)]+$docs|.[]' "$manifest") || return 1
+    entries=$(jq -cs --slurpfile docs /dev/fd/3 '
+        if length==1 and ($docs|length)==1 then [.[0].artifacts[]|del(.signature)]+$docs[0]|.[]
+        else error("expected one integrity manifest and proof inventory") end
+    ' 3<<< "$documents" "$manifest") || return 1
     while IFS= read -r row; do
         name=$(jq -r '.name' <<< "$row") || return 1
         case "$name" in release-integrity.json|release-integrity.json.minisig) continue ;; esac
@@ -420,14 +431,20 @@ _ri_remote_verify() (
     current=$(_sbr_inventory "$repo" "$id" "$work") || return $?
     [[ "$inventory" == "$current" && "$(_sbr_context "$repo" "$tag" "$work")" == "$context" &&
        "$(_slsa_sha256 "$manifest")" == "$before" ]] || return 7
-    names=$(jq -c --argjson docs "$documents" '[.artifacts[].name]+[$docs[].name]|sort' "$manifest") || return 1
+    names=$(jq -cs --slurpfile docs /dev/fd/3 '
+        if length==1 and ($docs|length)==1 then [.[0].artifacts[].name]+[$docs[0][].name]|sort
+        else error("expected one integrity manifest and proof inventory") end
+    ' 3<<< "$documents" "$manifest") || return 1
     asset=$(_sbr_named_asset "$inventory" release-integrity.json) || return $?
-    jq -nc --argjson context "$context" --arg token "$token" --arg hash "$before" --argjson asset "$asset" \
-        --argjson assets "$(_ri_selected_assets "$inventory" "$names")" '
+    assets=$(_ri_selected_assets "$inventory" "$names") || return $?
+    jq -cs --argjson context "$context" --arg token "$token" --arg hash "$before" --argjson asset "$asset" '
+        if length==1 then
         {schema_version:1,kind:"dsr-release-integrity-verification",status:"verified",authenticated:true,
          verification_policy:"minisign-all-payloads-and-checksums",repository:$context.repository,
          release:$context.release,tag_commit:$context.tag_commit,public_key:$token,
-         manifest:{name:"release-integrity.json",sha256:$hash,asset_id:$asset.id},assets:$assets}'
+         manifest:{name:"release-integrity.json",sha256:$hash,asset_id:$asset.id},assets:.[0]}
+        else error("expected one verified asset inventory") end
+    ' <<< "$assets"
 )
 
 # Preflight every already occupied proof before any metadata POST. Wrong bytes
@@ -569,8 +586,11 @@ _ri_execute() (
         _rup_check_files "$root" "$manifest" "$selection" "$work" || return $?
         _ri_selection_names_valid "$selection" || return $?
         if [[ "$dry" == true ]]; then
-            jq -nc --arg action "$action" --arg repo "$repo" --arg token "$token" --argjson selection "$selection" \
-                '{kind:"dsr-release-integrity-plan",status:"planned",dry_run:true,action:$action,repo:$repo,public_key:$token,selection:$selection}'
+            jq -cs --arg action "$action" --arg repo "$repo" --arg token "$token" '
+                if length==1 then
+                    {kind:"dsr-release-integrity-plan",status:"planned",dry_run:true,action:$action,repo:$repo,public_key:$token,selection:.[0]}
+                else error("expected one integrity selection") end
+            ' <<< "$selection"
             return $?
         fi
         signing_require_minisign || return $?
@@ -587,9 +607,12 @@ _ri_execute() (
             _sbr_require || return $?
             receipt=$(_ri_remote_publish "$root" "$output" "$selection" "$repo" "$tag" "$sha" "$token" "$work") || return $?
         else
-            receipt=$(jq -nc --arg repo "$repo" --arg tag "$tag" --arg sha "$sha" --arg token "$token" --arg hash "$hash" \
-                --argjson selection "$selection" '{schema_version:1,kind:"dsr-release-integrity-local",status:"verified",authenticated:true,
-                  repo:$repo,tag:$tag,source_sha:$sha,public_key:$token,manifest_sha256:$hash,selection:$selection}') || return 1
+            receipt=$(jq -cs --arg repo "$repo" --arg tag "$tag" --arg sha "$sha" --arg token "$token" --arg hash "$hash" '
+                if length==1 then
+                    {schema_version:1,kind:"dsr-release-integrity-local",status:"verified",authenticated:true,
+                     repo:$repo,tag:$tag,source_sha:$sha,public_key:$token,manifest_sha256:$hash,selection:.[0]}
+                else error("expected one verified integrity selection") end
+            ' <<< "$selection") || return 1
         fi
         _rup_check_files "$root" "$manifest" "$selection" "$work" || return $?
         [[ "$(_slsa_sha256 "$output/release-integrity.json")" == "$hash" ]] || return 7

@@ -247,6 +247,163 @@ state_path() { find "$CASE/state/release-finalize" -name state.json -print | hea
 outbox_path() { find "$CASE/state/dispatch" -name state.json -print | head -1; }
 handoff() { run_finalize --tool tool --dispatch-repos owner/a,owner/b --promote "$@"; }
 
+# Real selected files and manifests; signature/remote receipts below are explicit
+# fixtures. This isolates size/admission/state boundaries, not signing or uploads.
+test_finalization_large_selection() (
+    # shellcheck source=scripts/tests/test_release_payloads.sh
+    DSR_PAYLOAD_FIXTURES_ONLY=true source "$ROOT/scripts/tests/test_release_payloads.sh" || return 1
+    # shellcheck source=src/release_integrity.sh
+    source "$ROOT/src/release_integrity.sh" || return 1
+    new_case finalizer-large-selection
+    payload_seed_large_selection || return 1
+    local selection documents receipt token hash plan state pinned saved changed filter names inventory
+    selection=$(_rup_manifest "$MANIFEST" owner/tool v1.0.0 "$PIN") || return 1
+    printf '%s\n' "$selection" > "$CASE/selection.json" || return 1
+    check 'finalizer selection exceeds one exec argument' test "$(wc -c < "$CASE/selection.json")" -gt 131072
+    capture release_finalize "$ART" --repo owner/tool --tag v1.0.0 --sha "$PIN" \
+        --upload-payloads --build-manifest "$MANIFEST" --output-dir "$CASE/proofs" \
+        --state-dir "$CASE/finalize-state" --dry-run
+    check 'public finalizer plans all selected payloads' test "$status" -eq 0
+    check 'finalizer plan preserves every selected byte identity' jq -es --slurpfile selected "$CASE/selection.json" \
+        'length==1 and (.[0]|.status=="planned" and .exit_code==0 and .dry_run==true and
+         .payload_plan==$selected[0] and (.payload_plan.artifacts|length)==423)' "$CASE/out"
+    check 'planning does not authenticate' test ! -s "$CASE/auth"
+    check 'planning performs no uploads' test "$(count)" -eq 0
+    check 'planning creates no persistent finalization state' test ! -e "$CASE/finalize-state"
+    python3 - "$CASE" "$ART" <<'PY' || return 1
+import copy, hashlib, json, pathlib, sys
+case, artifacts = map(pathlib.Path, sys.argv[1:])
+selection = json.loads((case/'selection.json').read_text())
+context = json.loads((case/'context.json').read_text())
+proofs = case/'proofs'; proofs.mkdir()
+def write(name, value):
+    (case/name).write_text(json.dumps(value, sort_keys=True, separators=(',', ':'))+'\n')
+def record(path):
+    data = path.read_bytes()
+    return dict(name=path.name, sha256=hashlib.sha256(data).hexdigest(), size=len(data))
+documents = []
+for row in selection['artifacts']:
+    assert record(artifacts/row['name']) == row
+    signature = proofs/(row['name']+'.minisig')
+    signature.write_text('fixture signature for '+row['sha256']+'\n')
+    documents.append(record(signature))
+manifest = proofs/'release-integrity.json'
+manifest.write_text(json.dumps(dict(tool=selection['tool'],
+                                   build_manifest_sha256=selection['manifest_sha256'],
+                                   artifacts=selection['artifacts']), sort_keys=True)+'\n')
+documents.append(record(manifest))
+rows = sorted(selection['artifacts']+documents, key=lambda row: row['name'])
+assets = [dict(id=index+100, name=row['name'], size=row['size'], state='uploaded',
+               digest='sha256:'+row['sha256']) for index, row in enumerate(rows)]
+token = 'A'*56
+receipt = dict(context, schema_version=1, kind='dsr-release-integrity-verification',
+               status='verified', authenticated=True, public_key=token,
+               verification_policy='minisign-all-payloads-and-checksums', assets=assets,
+               manifest=dict(name=manifest.name, sha256=record(manifest)['sha256'],
+                             asset_id=next(row['id'] for row in assets if row['name']==manifest.name)))
+bound = copy.deepcopy(context); del bound['release']['draft']
+plan = dict(context=bound, artifacts_dir=str(artifacts), output_dir=str(proofs), format='spdx')
+write('documents.json', documents); write('receipt.json', receipt); write('plan.json', plan)
+write('policy.json', dict(required=True, public_key=token, output_dir=str(proofs), selection=selection))
+write('initial-state.json', dict(schema_version=1, kind='dsr-release-finalization', plan=plan,
+                                manifest_sha256=None, verification=None, promotion_attempts=0, phase='preparing'))
+PY
+    documents=$(cat "$CASE/documents.json"); receipt=$(cat "$CASE/receipt.json")
+    token=$(jq -r .public_key <<< "$receipt"); hash=$(jq -r .manifest.sha256 <<< "$receipt")
+    plan=$(cat "$CASE/plan.json")
+    check 'proof inventory exceeds one exec argument' test "$(wc -c < "$CASE/documents.json")" -gt 131072
+    check 'verified selected receipt exceeds one exec argument' test "$(wc -c < "$CASE/receipt.json")" -gt 131072
+    capture _ri_matches_selection "$CASE/proofs/release-integrity.json" "$selection"
+    check 'integrity manifest matches the complete selected payload set' test "$status" -eq 0
+    changed=$(jq -c '.artifacts[-1].sha256=("0"*64)' <<< "$selection") || return 1
+    capture _ri_matches_selection "$CASE/proofs/release-integrity.json" "$changed"
+    check 'integrity manifest refuses a changed final payload digest' nonzero "$status"
+    capture _ri_matches_selection "$CASE/proofs/release-integrity.json" "$selection"$'\n{}'
+    check 'integrity manifest refuses a trailing selected-plan document' nonzero "$status"
+    capture _rf_integrity_key "$receipt" owner/tool v1.0.0 "$PIN" "$token" "$hash" "$selection" "$documents"
+    check 'integrity key binds all selected payload and proof records' test "$status" -eq 0
+    check 'integrity key preserves every selected asset identity' jq -es --slurpfile receipt "$CASE/receipt.json" \
+        'length==1 and (.[0].assets==($receipt[0].assets|sort_by(.name)))' "$CASE/out"
+    pinned=$(jq -cS .assets "$CASE/receipt.json") || return 1
+    names=$(jq -c '[.assets[].name]' "$CASE/receipt.json") || return 1
+    printf '%s\n' "$names" > "$CASE/selected-names.json" || return 1
+    check 'selected proof and payload names exceed one exec argument' test "$(wc -c < "$CASE/selected-names.json")" -gt 131072
+    inventory=$(jq -c '.+[{id:9999,name:"unrelated.bin",size:1,state:"uploaded",digest:null}]' <<< "$pinned") || return 1
+    capture _ri_selected_assets "$inventory" "$names"
+    check 'integrity selection reads complete large names and inventory streams' test "$status" -eq 0
+    check 'integrity selection preserves all selected assets and excludes unrelated rows' jq -es --slurpfile receipt "$CASE/receipt.json" \
+        'length==1 and .[0]==($receipt[0].assets|sort_by(.name))' "$CASE/out"
+    capture _ri_selected_assets "$inventory" "$names"$'\n[]'
+    check 'integrity selection refuses a trailing selected-name document' nonzero "$status"
+    check 'invalid selected-name input emits no asset set' test ! -s "$CASE/out"
+    capture _ri_selected_assets "$inventory"$'\n[]' "$names"
+    check 'integrity selection refuses a trailing inventory document' nonzero "$status"
+    local _RF_INTEGRITY_ASSETS="$pinned"
+    capture _rf_integrity_assets_gate "$pinned"
+    check 'large retained identity set passes unchanged' test "$status" -eq 0
+    changed=$(jq -c '.[0].id+=10000' <<< "$pinned") || return 1
+    capture _rf_integrity_assets_gate "$changed"
+    check 'large retained identity set refuses a replaced asset ID' nonzero "$status"
+    for filter in '.assets[0].id=0' '.assets[0].id=.assets[1].id' \
+        '.assets[0].size+=1' '.assets[0].digest=("sha256:"+("0"*64))' \
+        'del(.assets[0])' '.manifest.asset_id+=1'; do
+        changed=$(jq -c "$filter" <<< "$receipt") || return 1
+        capture _rf_integrity_key "$changed" owner/tool v1.0.0 "$PIN" "$token" "$hash" "$selection" "$documents"
+        check "large integrity receipt refuses $filter" nonzero "$status"
+    done
+    capture _rf_integrity_key "$receipt"$'\n{}' owner/tool v1.0.0 "$PIN" "$token" "$hash" "$selection" "$documents"
+    check 'integrity key refuses trailing receipt document' nonzero "$status"
+    capture _rf_integrity_key "$receipt" owner/tool v1.0.0 "$PIN" "$token" "$hash" "$selection"$'\n{}' "$documents"
+    check 'integrity key refuses trailing selection document' nonzero "$status"
+    capture _rf_integrity_key "$receipt" owner/tool v1.0.0 "$PIN" "$token" "$hash" "$selection" "$documents"$'\n[]'
+    check 'integrity key refuses trailing proof inventory document' nonzero "$status"
+    state=$(cat "$CASE/initial-state.json") || return 1
+    state=$(_rf_set_json integrity_policy "$(cat "$CASE/policy.json")" <<< "$state") || return 1
+    state=$(_rf_set_json integrity_documents "$documents" <<< "$state") || return 1
+    state=$(_rf_set_json integrity_verification "$receipt" <<< "$state") || return 1
+    state=$(_rf_set_json payload_plan "$selection" <<< "$state") || return 1
+    state=$(jq -cS --arg hash "$hash" '.integrity_manifest_sha256=$hash' <<< "$state") || return 1
+    printf '%s\n' "$state" > "$CASE/state-input.json" || return 1
+    check 'state retains complete selection policy and receipt' jq -e --slurpfile selected "$CASE/selection.json" \
+        --slurpfile receipt "$CASE/receipt.json" '.payload_plan==$selected[0] and
+        .integrity_policy.selection==$selected[0] and .integrity_verification==$receipt[0]' "$CASE/state-input.json"
+    capture _rf_state_valid "$CASE/state-input.json" "$plan"
+    check 'complete large finalization state remains admissible' test "$status" -eq 0
+    capture _rf_state_valid "$CASE/state-input.json" "$plan"$'\n{}'
+    check 'state validation refuses trailing expected-plan document' nonzero "$status"
+    changed=$(jq -c '.format="cyclonedx"' <<< "$plan") || return 1
+    capture _rf_state_valid "$CASE/state-input.json" "$changed"
+    check 'state validation refuses changed selected plan' nonzero "$status"
+    capture _rf_set_json payload_plan "$selection"$'\n{}' <<< "$state"
+    check 'state setter refuses trailing field document' nonzero "$status"
+    check 'rejected field document emits no state' test ! -s "$CASE/out"
+    capture _rf_set_json payload_plan "$selection" <<< "$state"$'\n{}'
+    check 'state setter refuses trailing object document' nonzero "$status"
+    capture _rf_set_json payload_plan "$selection" <<< '[]'
+    check 'state setter refuses a non-object state' nonzero "$status"
+    mkdir "$CASE/save-work" || return 1
+    capture _rf_save "$CASE/saved-state.json" "$state" absent "$CASE/save-work" "$plan"
+    check 'large state publishes through the real persistence gate' test "$status" -eq 0
+    saved=$(cat "$CASE/out") || return 1
+    check 'persistence preserves the entire state document' cmp -s "$CASE/state-input.json" "$CASE/saved-state.json"
+    capture _rf_save "$CASE/saved-state.json" "$state" "$saved" "$CASE/save-work" "$plan"
+    check 'identical large state can be resumed' test "$status" -eq 0
+    check 'identical large state keeps its exact digest' test "$(_rf_hash "$CASE/saved-state.json")" = "$saved"
+    capture _rf_save "$CASE/saved-state.json" "$state" absent "$CASE/save-work" "$plan"
+    check 'stale persistence generation is refused' nonzero "$status"
+    changed=$(jq -c '.integrity_verification.public_key="wrong"' <<< "$state") || return 1
+    capture _rf_save "$CASE/saved-state.json" "$changed" "$saved" "$CASE/save-work" "$plan"
+    check 'mismatched signature policy cannot replace retained state' nonzero "$status"
+    check 'failed state writes retain original exact bytes' cmp -s "$CASE/state-input.json" "$CASE/saved-state.json"
+    printf '\nSelected finalization checks: %d; failures: %d\n' "$checks" "$failures"
+    [[ "$failures" -eq 0 ]]
+)
+
+if [[ "${1:-}" == --large-selection-only ]]; then
+    test_finalization_large_selection || failures=$((failures+1))
+    [[ "$failures" -eq 0 ]]; exit $?
+fi
+
 new_case ready
 capture run_finalize
 check 'default finalization verifies but retains draft' test "$status" -eq 0

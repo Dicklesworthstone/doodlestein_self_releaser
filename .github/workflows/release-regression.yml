@@ -8,10 +8,15 @@ on:
       - src/github.sh
       - src/dispatch.sh
       - src/release_finalize_core.sh
+      - src/release_integrity.sh
       - src/release_payloads.sh
       - src/sbom.sh
       - src/sbom_release.sh
       - scripts/tests/test_release_payloads.sh
+      - scripts/tests/test_release_payload_pipeline.sh
+      - scripts/tests/test_release_finalize.sh
+      - scripts/tests/test_release_integrity.sh
+      - scripts/tests/test_release_integrity_finalize.sh
       - scripts/tests/test_sbom_batch.sh
       - scripts/tests/test_sbom_publish.sh
       - src/release_finalize.sh
@@ -123,6 +128,33 @@ jobs:
           timeout 120 bash scripts/tests/test_sbom_batch.sh --selected-payload-scale-only
           timeout 120 bash scripts/tests/test_sbom_batch.sh
           timeout 120 bash scripts/tests/test_sbom_publish.sh
+          test -z "$(git status --porcelain)"
+  signed-finalization:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install signature and finalization regression dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq python3 python3-cryptography minisign shellcheck util-linux coreutils procps
+      - name: Validate complete selected evidence and finalization recovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n src/release_finalize_core.sh
+          bash -n src/release_integrity.sh
+          bash -n scripts/tests/test_release_finalize.sh
+          shellcheck -S warning src/release_finalize_core.sh src/release_integrity.sh scripts/tests/test_release_finalize.sh
+          timeout 120 bash scripts/tests/test_release_finalize.sh --large-selection-only
+          timeout 120 bash scripts/tests/test_release_finalize.sh
+          timeout 120 bash scripts/tests/test_release_payload_pipeline.sh
+          timeout 120 bash scripts/tests/test_release_integrity.sh
+          timeout 120 bash scripts/tests/test_release_integrity_finalize.sh
           test -z "$(git status --porcelain)"
   container-workflow:
     runs-on: ubuntu-24.04
