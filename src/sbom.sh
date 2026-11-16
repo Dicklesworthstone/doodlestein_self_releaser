@@ -636,11 +636,12 @@ _sbom_artifacts() (
     # retry cannot silently drop an unfinished target or accept changed bytes.
     plan_hash=$(_sbom_output_state "$plan") || return $?
     if [[ "$plan_hash" != absent ]]; then
-        jq -e -s --arg format "$format" --arg policy "$selection_policy" --argjson inputs "$inputs" '
+        jq -e -s --arg format "$format" --arg policy "$selection_policy" --slurpfile selected /dev/fd/3 '
+            ($selected|length)==1 and ($selected[0] as $inputs|
             length == 1 and (.[0] | type == "object" and .schema_version == 1 and
                 .kind == "dsr-sbom-plan" and .format == $format and
-                .selection_policy == $policy and .artifacts == $inputs)
-        ' "$plan" >/dev/null 2>&1 || {
+                .selection_policy == $policy and .artifacts == $inputs))
+        ' "$plan" 3<<< "$inputs" >/dev/null 2>&1 || {
             _sbom_log error "SBOM retry differs from the frozen release plan"; return 2;
         }
         [[ "$(_sbom_hash "$plan")" == "$plan_hash" ]] || return 2
@@ -675,10 +676,12 @@ _sbom_artifacts() (
         fi
     done <<< "$recorded"
     if [[ "$plan_hash" == absent ]]; then
-        jq -nc --arg format "$format" --arg policy "$selection_policy" --argjson inputs "$inputs" '
-            {schema_version:1,kind:"dsr-sbom-plan",format:$format,
-             selection_policy:$policy,artifacts:$inputs}' \
-            > "$workdir/plan.json" || return 1
+        jq -cs --arg format "$format" --arg policy "$selection_policy" '
+            if length==1 then
+                {schema_version:1,kind:"dsr-sbom-plan",format:$format,
+                 selection_policy:$policy,artifacts:.[0]}
+            else error("expected one selected SBOM input set") end' \
+            <<< "$inputs" > "$workdir/plan.json" || return 1
         _sbom_publish_record "$workdir/plan.json" "$plan" || return $?
         plan_hash=$(_sbom_hash "$plan") || return $?
     fi

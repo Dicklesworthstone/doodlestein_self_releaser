@@ -98,6 +98,84 @@ partial() {
     unset SBOM_FAIL_ASSET
 }
 
+# Exercise the complete selected set, not unrelated remote metadata. The first
+# scanner fails after plan publication, keeping real generation/resumption
+# bounded without scanning hundreds of payloads.
+sbom_selected_payload_scale_cases() {
+    new_case selected-payload-scale
+    local plan="$ART/sbom-plan.spdx.json"
+    local expected="$CASE/expected-inputs.json" last_payload
+    last_payload=$(python3 - "$ART" "$expected" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+for number in range(500):
+    name = "payload-%04d-" % number + "x" * 190 + ".tar.gz"
+    if len(name) > 220 or len(name + ".sbom.spdx.json.dsr.json") > 255:
+        raise SystemExit("scale fixture exceeds the filesystem filename limit")
+    (root / name).write_bytes(("owned selected payload %d\n" % number).encode())
+paths = sorted(root.iterdir(), key=lambda path: path.name)
+if len(paths) != 502 or not all(path.is_file() and not path.is_symlink() for path in paths):
+    raise SystemExit("scale fixture must contain exactly 502 ordinary payload files")
+rows = [
+    {"name": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    for path in paths
+]
+Path(sys.argv[2]).write_text(
+    json.dumps(rows, separators=(",", ":")) + "\n", encoding="utf-8"
+)
+print(paths[-1])
+PY
+    ) || return 1
+    check 'selected payload fixture exceeds the single-argument limit' \
+        test "$(wc -c < "$expected")" -gt 131072
+
+    # The existing Syft fixture records the scan, emits partial JSON and exits
+    # 17; sbom_generate maps that failure to 1 and retains the frozen plan.
+    export SBOM_FAIL_ASSET=a.tar.gz
+    capture sbom_generate_artifacts "$ART"
+    check 'large selected set reaches the deliberately failing scanner' test "$status" -eq 1
+    check 'large selected set starts exactly one scan' test "$(scan_count)" -eq 1
+    check 'large plan freezes every actual selected name and digest' \
+        jq -es --slurpfile expected "$expected" '
+            length==1 and ($expected|length)==1 and
+            (.[0]|.schema_version==1 and .kind=="dsr-sbom-plan" and
+                .format=="spdx" and .selection_policy=="top-level-artifacts-v1" and
+                (.artifacts|length)==502 and .artifacts==$expected[0])
+        ' "$plan"
+    check 'frozen selected plan exceeds the single-argument limit' test "$(wc -c < "$plan")" -gt 131072
+    check 'large interrupted selection publishes no complete manifest' absent "$ART/sbom-manifest.spdx.json"
+    check 'large interrupted selection emits no success path' test -z "$output"
+    cp -- "$plan" "$CASE/plan.before" || return 1
+
+    capture sbom_generate_artifacts "$ART"
+    check 'unchanged large selection resumes through the frozen-plan gate' test "$status" -eq 1
+    check 'unchanged large retry scans only its first unfinished payload' test "$(scan_count)" -eq 2
+    check 'unchanged large retry preserves the exact frozen plan' cmp -s "$plan" "$CASE/plan.before"
+    check 'unchanged large retry emits no success path' test -z "$output"
+    check 'unchanged large retry leaves the complete manifest absent' absent "$ART/sbom-manifest.spdx.json"
+
+    # The final real payload lies beyond the bytes that fit in one argv element.
+    # Its changed digest must prevent any new scan or replacement of the plan.
+    printf 'changed final selected payload\n' >> "$last_payload" || return 1
+    capture sbom_generate_artifacts "$ART"
+    check 'changed final payload conflicts with the large frozen plan' test "$status" -eq 2
+    check 'changed final payload is refused before any further scan' test "$(scan_count)" -eq 2
+    check 'large selection conflict preserves the original frozen plan' cmp -s "$plan" "$CASE/plan.before"
+    check 'large selection conflict cannot publish a complete manifest' absent "$ART/sbom-manifest.spdx.json"
+    check 'large selection conflict emits no success path' test -z "$output"
+    unset SBOM_FAIL_ASSET
+}
+
+if [[ "${1:-}" == --selected-payload-scale-only ]]; then
+    sbom_selected_payload_scale_cases || failures=$((failures+1))
+    printf '\nSelected-payload SBOM checks: %d; failures: %d\n' "$checks" "$failures"
+    [[ "$failures" -eq 0 ]]; exit $?
+fi
+
 new_case complete
 ln "$ART/a.tar.gz" "$ART/compat-linux-amd64.tar.gz"
 printf exe > "$ART/tool.exe"

@@ -634,11 +634,14 @@ sbom_publish_artifacts() (
         '.[] | select(.name == $name) | .action' <<< "$actions") || return 1
     _sbom_selection_gate "$selection" "$selection_hash" || return $?
     if [[ "$dry_run" == true ]]; then
-        jq -nc --argjson context "$context" --arg format "$format" --argjson actions "$actions" \
+        jq -cs --argjson context "$context" --arg format "$format" \
             --argjson manifest "$(jq -c '.manifest' <<< "$plan")" '
-            {schema_version:1,kind:"dsr-sbom-publication",status:"planned",dry_run:true,
-             repository:$context.repository,release:$context.release,tag_commit:$context.tag_commit,
-             format:$format,manifest:$manifest,actions:$actions}'
+            if length==1 then
+                {schema_version:1,kind:"dsr-sbom-publication",status:"planned",dry_run:true,
+                 repository:$context.repository,release:$context.release,tag_commit:$context.tag_commit,
+                 format:$format,manifest:$manifest,actions:.[0]}
+            else error("expected one SBOM publication action set") end
+        ' <<< "$actions"
         return $?
     fi
     if [[ "$manifest_action" == upload ]]; then
