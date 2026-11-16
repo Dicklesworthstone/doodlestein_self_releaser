@@ -90,7 +90,8 @@ _rup_context_key() {
 }
 
 _rup_state_valid() {
-    jq -es --argjson plan "$2" '
+    jq -es --slurpfile selected /dev/fd/3 '
+        ($selected|length)==1 and ($selected[0] as $plan |
         length==1 and (.[0]|type=="object" and .schema_version==1 and
             .kind=="dsr-release-payload-state" and .plan==$plan and (.complete|type=="boolean") and
             (.assets|type=="array" and all(.[];
@@ -100,8 +101,8 @@ _rup_state_valid() {
                     ($a.digest==null or $a.digest=="" or $a.digest==("sha256:"+.sha256))) ]|length)==1)) and
             ((.assets|map(.name)|unique|length)==(.assets|length)) and
             ((.assets|map(.id)|unique|length)==(.assets|length)) and
-            (if .complete then (.assets|map(.name)|sort)==($plan.artifacts|map(.name)|sort) else true end))
-    ' "$1" >/dev/null 2>&1
+            (if .complete then (.assets|map(.name)|sort)==($plan.artifacts|map(.name)|sort) else true end)))
+    ' "$1" 3<<< "$2" >/dev/null 2>&1
 }
 
 _rup_save() {
@@ -166,7 +167,12 @@ _rup_preflight() {
 }
 
 _rup_selected_assets() {
-    jq -cS --argjson plan "$2" '[.[]|select(.name as $n|any($plan.artifacts[];.name==$n))]|sort_by(.name)' <<< "$1"
+    jq -csS --slurpfile selected /dev/fd/3 '
+        if length==1 and ($selected|length)==1 then
+            $selected[0] as $plan |
+            [.[0][]|select(.name as $n|any($plan.artifacts[];.name==$n))]|sort_by(.name)
+        else error("expected one inventory and one payload plan") end
+    ' 3<<< "$2" <<< "$1"
 }
 
 _rup_upload() {
@@ -228,8 +234,10 @@ release_upload_payloads() (
     selection=$(_rup_manifest "$manifest" "$repo" "$tag" "$sha") || return $?
     _rup_check_files "$root" "$manifest" "$selection" "$work" || return $?
     if [[ "$dry" == true ]]; then
-        jq -nc --argjson plan "$selection" --arg repo "$repo" \
-            '{kind:"dsr-release-payload-publication",status:"planned",dry_run:true,repo:$repo,plan:$plan}'
+        jq -cs --arg repo "$repo" '
+            if length==1 then
+                {kind:"dsr-release-payload-publication",status:"planned",dry_run:true,repo:$repo,plan:.[0]}
+            else error("expected one payload selection") end' <<< "$selection"
         return $?
     fi
     dsr_lock_available || return $?
@@ -250,7 +258,10 @@ release_upload_payloads() (
     _rup_check_files "$root" "$manifest" "$selection" "$work" || return $?
     context=$(_sbr_context "$repo" "$tag" "$work") || return $?
     context_key=$(_rup_context_key "$context" "$repo" "$tag" "$sha") || return 7
-    plan=$(jq -cSn --argjson context "$context_key" --argjson selection "$selection" '$selection+{context:$context}') || return 1
+    plan=$(jq -csS --slurpfile context /dev/fd/3 '
+        if length==1 and ($context|length)==1 then .[0]+{context:$context[0]}
+        else error("expected one payload selection and release context") end
+    ' 3<<< "$context_key" <<< "$selection") || return 1
     [[ -n "$state_dir" ]] || state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/release-payloads"
     [[ ! -L "$state_dir" && "$state_dir" != *[[:cntrl:]]* && "$state_dir" != *\\* ]] || return 4
     mkdir -p -- "$state_dir" || return 1
@@ -290,8 +301,11 @@ release_upload_payloads() (
           "$(jq 'length' <<< "$pinned")" != "$(jq '.artifacts|length' <<< "$plan")" ]]; then
         _rup_log 'Missing payloads may only be uploaded to a draft release'; return 4
     fi
-    state=$(jq -cSn --argjson plan "$plan" --argjson assets "$pinned" --argjson complete "$retained_complete" \
-        '{schema_version:1,kind:"dsr-release-payload-state",plan:$plan,assets:$assets,complete:$complete}') || return 1
+    state=$(jq -csS --slurpfile assets /dev/fd/3 --argjson complete "$retained_complete" '
+        if length==1 and ($assets|length)==1 then
+            {schema_version:1,kind:"dsr-release-payload-state",plan:.[0],assets:$assets[0],complete:$complete}
+        else error("expected one payload plan and retained inventory") end
+    ' 3<<< "$pinned" <<< "$plan") || return 1
     oldhash=$(_rup_save "$file" "$state" "$oldhash" "$plan" "$state_work") || return $?
     while IFS= read -r entry; do
         name=$(jq -r '.name' <<< "$entry") || return 1
@@ -310,7 +324,10 @@ release_upload_payloads() (
             _rup_preflight "$repo" "$current" "$plan" "$pinned" "$work" || return $?
         fi
         pinned=$(_rup_selected_assets "$current" "$plan") || return 1
-        state=$(jq -cS --argjson assets "$pinned" '.assets=$assets' <<< "$state") || return 1
+        state=$(jq -csS --slurpfile assets /dev/fd/3 '
+            if length==1 and ($assets|length)==1 then .[0]|.assets=$assets[0]
+            else error("expected one payload state and retained inventory") end
+        ' 3<<< "$pinned" <<< "$state") || return 1
         oldhash=$(_rup_save "$file" "$state" "$oldhash" "$plan" "$state_work") || return $?
     done <<< "$entries"
     _rup_check_files "$root" "$manifest" "$plan" "$work" || return $?
@@ -324,12 +341,16 @@ release_upload_payloads() (
     final=$(_sbr_publication_gate "$repo" "$tag" "$context" "$current" "$names" "$work") || return $?
     [[ "$final" == "$current" && "$(_slsa_sha256 "$file")" == "$oldhash" ]] || return 7
     fingerprint=$(_sbr_inventory_sha256 "$final" "$work") || return $?
-    jq -nc --argjson context "$context" --argjson plan "$selection" --argjson assets "$pinned" \
+    jq -cs --slurpfile contexts /dev/fd/3 --slurpfile plans /dev/fd/4 \
         --arg state "$file" --argjson uploaded "$uploaded" --arg fingerprint "$fingerprint" '
-        {kind:"dsr-release-payload-publication",status:"verified",dry_run:false,
-         repository:$context.repository,release:$context.release,tag_commit:$context.tag_commit,
-         manifest_sha256:$plan.manifest_sha256,tool:$plan.tool,assets:$assets,
-         asset_inventory_sha256:$fingerprint,state_file:$state,upload_attempts:$uploaded}'
+        if length==1 and ($contexts|length)==1 and ($plans|length)==1 then
+            $contexts[0] as $context|$plans[0] as $plan|
+            {kind:"dsr-release-payload-publication",status:"verified",dry_run:false,
+             repository:$context.repository,release:$context.release,tag_commit:$context.tag_commit,
+             manifest_sha256:$plan.manifest_sha256,tool:$plan.tool,assets:.[0],
+             asset_inventory_sha256:$fingerprint,state_file:$state,upload_attempts:$uploaded}
+        else error("expected one payload context, plan and retained inventory") end
+    ' 3<<< "$context" 4<<< "$selection" <<< "$pinned"
 )
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

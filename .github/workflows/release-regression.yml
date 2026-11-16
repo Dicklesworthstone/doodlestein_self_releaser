@@ -8,6 +8,8 @@ on:
       - src/github.sh
       - src/dispatch.sh
       - src/release_finalize_core.sh
+      - src/release_payloads.sh
+      - scripts/tests/test_release_payloads.sh
       - src/release_finalize.sh
       - src/release_builds.sh
       - src/release_bundle.sh
@@ -70,6 +72,29 @@ concurrency:
   group: release-regression-refs/heads/main
   cancel-in-progress: false
 jobs:
+  payload-publication:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install payload publication regression dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq python3 shellcheck util-linux coreutils
+      - name: Validate selected payload scale and resumable publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n src/release_payloads.sh
+          bash -n scripts/tests/test_release_payloads.sh
+          shellcheck -S warning src/release_payloads.sh scripts/tests/test_release_payloads.sh
+          timeout 120 bash scripts/tests/test_release_payloads.sh --large-selection-only
+          timeout 120 bash scripts/tests/test_release_payloads.sh
+          test -z "$(git status --porcelain)"
   container-workflow:
     runs-on: ubuntu-24.04
     timeout-minutes: 15

@@ -177,7 +177,120 @@ payload_large_inventory_cases() {
     check 'large release still refuses unselected remote payloads' test "$status" -eq 7
     check 'large unselected payload conflict precedes every upload' test "$(count)" -eq 0
 }
+# A large selected release exercises different boundaries from unrelated remote
+# metadata: selection, retained IDs and checkpoints each grow with payload count.
+payload_seed_large_selection() {
+    local name hash size
+    hash=$(_slsa_sha256 "$ART/a.tar.gz") || return 1
+    size=$(wc -c < "$ART/a.tar.gz") || return 1
+    jq -nc --arg hash "$hash" --argjson size "$size" '
+        [range(0;420)|{
+            name:("large-"+(("0000"+tostring)[-4:])+"-"+("x"*220)+".bin"),
+            target:"linux/amd64",sha256:$hash,size_bytes:$size,archive_format:"binary"
+        }]' > "$CASE/selected-rows.json" || return 1
+    jq -r '.[].name' "$CASE/selected-rows.json" > "$CASE/selected-names" || return 1
+    while IFS= read -r name; do
+        printf 'linux payload\n' > "$ART/$name" || return 1
+    done < "$CASE/selected-names"
+    jq -cS --slurpfile extra "$CASE/selected-rows.json" '.artifacts += $extra[0]' \
+        "$MANIFEST" > "$CASE/next.json" || return 1
+    mv "$CASE/next.json" "$MANIFEST"
+}
+payload_large_selection_cases() {
+    local selection context plan inventory state pin changed filter
+    new_case large_selection
+    payload_seed_large_selection || { failures=$((failures+1)); return 1; }
+    selection=$(_rup_manifest "$MANIFEST" owner/tool v1.0.0 "$PIN") || {
+        failures=$((failures+1)); return 1;
+    }
+    printf '%s\n' "$selection" > "$CASE/selection.json"
+    check 'actual selected manifest exceeds a single executable argument' \
+        test "$(wc -c < "$CASE/selection.json")" -gt 131072
+    capture upload --dry-run
+    check 'large real payload selection produces a dry-run plan' test "$status" -eq 0
+    check 'large dry-run preserves every selected name and digest' jq -es \
+        --slurpfile expected "$CASE/selection.json" \
+        'length==1 and (.[0]|.status=="planned" and .dry_run==true and .plan==$expected[0] and (.plan.artifacts|length)==423)' "$CASE/out"
+    check 'large dry-run performs no authentication' test ! -s "$CASE/auth"
+    check 'large dry-run performs no upload' test "$(count)" -eq 0
+    check 'large dry-run creates no persistent publication state' test ! -e "$CASE/state"
+
+    context=$(_rup_context_key "$(cat "$CASE/context.json")" owner/tool v1.0.0 "$PIN") || {
+        failures=$((failures+1)); return 1;
+    }
+    plan=$(jq -cS --slurpfile context /dev/fd/3 '.+{context:$context[0]}' \
+        3<<< "$context" <<< "$selection") || return 1
+    printf '%s\n' "$plan" > "$CASE/plan.json"
+    # These ID-bearing rows are explicit API-boundary fixtures. The selected
+    # files and their build-manifest authentication above use real bytes.
+    jq -cS '[.artifacts|to_entries[]|{id:(1000+.key),name:.value.name,
+        state:"uploaded",size:.value.size_bytes,digest:("sha256:"+.value.sha256)}]|
+        sort_by(.name)' "$MANIFEST" > "$CASE/expected-selected.json" || return 1
+    jq -cS '.+[{id:9,name:"private.json",state:"uploaded",size:7,digest:null}]|sort_by(.name)' \
+        "$CASE/expected-selected.json" > "$CASE/inventory.json" || return 1
+    inventory=$(cat "$CASE/inventory.json") || return 1
+    check 'selected remote identities exceed one executable argument' \
+        test "$(wc -c < "$CASE/expected-selected.json")" -gt 131072
+    capture _rup_selected_assets "$inventory" "$plan"
+    check 'large selection retains all and only selected remote rows' test "$status" -eq 0
+    check 'large selection preserves exact selected IDs, sizes and digests' jq -es \
+        --slurpfile expected "$CASE/expected-selected.json" \
+        'length==1 and .[0]==$expected[0]' "$CASE/out"
+    capture _rup_selected_assets "$inventory"$'\n[]' "$plan"
+    check 'large selection rejects trailing inventory documents' nonzero "$status"
+    capture _rup_selected_assets "$inventory" "$plan"$'\n{}'
+    check 'large selection rejects trailing plan documents' nonzero "$status"
+
+    jq -ncS --slurpfile plan "$CASE/plan.json" --slurpfile assets "$CASE/expected-selected.json" \
+        '{schema_version:1,kind:"dsr-release-payload-state",plan:$plan[0],assets:$assets[0],complete:true}' \
+        > "$CASE/complete-state.json" || return 1
+    state=$(cat "$CASE/complete-state.json") || return 1
+    capture _rup_state_valid "$CASE/complete-state.json" "$plan"
+    check 'large complete recovery checkpoint validates its exact plan' test "$status" -eq 0
+    capture _rup_state_valid "$CASE/complete-state.json" "$plan"$'\n{}'
+    check 'checkpoint validation rejects trailing selected plans' nonzero "$status"
+    capture _rup_save "$CASE/checkpoint.json" "$state" absent "$plan" "$CASE"
+    check 'large checkpoint persists every selected identity' test "$status" -eq 0
+    check 'checkpoint bytes equal the complete input evidence' cmp -s "$CASE/checkpoint.json" "$CASE/complete-state.json"
+    pin=$(_slsa_sha256 "$CASE/complete-state.json") || return 1
+    capture _rup_save "$CASE/checkpoint.json" "$state" "$pin" "$plan" "$CASE"
+    check 'unchanged large checkpoint can be saved again' test "$status" -eq 0
+    check 'unchanged large checkpoint remains byte-stable' cmp -s "$CASE/checkpoint.json" "$CASE/complete-state.json"
+    for filter in '.assets[-1].id=.assets[0].id' '.assets[-1].size+=1' \
+        '.assets[-1].digest=("sha256:"+("0"*64))' '.assets[-1].state="starter"' \
+        '.assets=.assets[:-1]' '.plan.artifacts=.plan.artifacts[:-1]'; do
+        changed=$(jq -cS "$filter" "$CASE/complete-state.json") || return 1
+        capture _rup_save "$CASE/checkpoint.json" "$changed" "$pin" "$plan" "$CASE"
+        check "large recovery refuses inconsistent checkpoint: $filter" test "$status" -eq 2
+        check 'refused checkpoint keeps previous complete evidence unchanged' \
+            cmp -s "$CASE/checkpoint.json" "$CASE/complete-state.json"
+    done
+    changed=$(jq -cS '.artifacts[-1].sha256=("0"*64)' "$CASE/plan.json") || return 1
+    capture _rup_state_valid "$CASE/complete-state.json" "$changed"
+    check 'large checkpoint cannot be rebound to a changed selection' nonzero "$status"
+    capture _rup_save "$CASE/checkpoint.json" "$state" absent "$plan" "$CASE"
+    check 'large checkpoint cannot overwrite an unexpectedly occupied destination' test "$status" -eq 2
+    check 'occupied-destination refusal preserves checkpoint bytes' \
+        cmp -s "$CASE/checkpoint.json" "$CASE/complete-state.json"
+
+    printf changed >> "$ART/b.zip"
+    capture upload --dry-run
+    check 'large real-file plan refuses altered selected bytes' test "$status" -eq 7
+    check 'altered selection emits no planned receipt' test ! -s "$CASE/out"
+    printf 'windows payload\n' > "$ART/b.zip"
+    printf extra > "$ART/unplanned.zip"
+    capture upload --dry-run
+    check 'large plan still refuses an unselected local payload' test "$status" -eq 4
+    check 'large refusal performs no authentication' test ! -s "$CASE/auth"
+    check 'large refusal performs no upload' test "$(count)" -eq 0
+}
+
 if [[ "${DSR_PAYLOAD_FIXTURES_ONLY:-false}" == true ]]; then return 0; fi
+if [[ "${1:-}" == --large-selection-only ]]; then
+    payload_large_selection_cases || failures=$((failures+1))
+    printf '\nPayload publication checks: %d; failures: %d\n' "$checks" "$failures"
+    [[ "$failures" -eq 0 ]]; exit $?
+fi
 if [[ "${1:-}" == --large-inventory-only ]]; then
     payload_large_inventory_cases
     printf '\nPayload publication checks: %d; failures: %d\n' "$checks" "$failures"
