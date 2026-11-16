@@ -1297,7 +1297,216 @@ _isb_checkout() (
         [[ "$commit" == "${ref,,}" ]] || return 8
     fi
     _isb_git ${git_options[@]+"${git_options[@]}"} -C "$dir" -c advice.detachedHead=false checkout -q --detach "$commit" || return 8
+    [[ "$(_isb_git ${git_options[@]+"${git_options[@]}"} -C "$dir" rev-parse --verify 'HEAD^{commit}')" == "$commit" ]] || return 8
 )
+
+# Resolve only GitHub repository identities, never arbitrary submodule URLs.
+# A relative URL is relative to the parent repository, as in Git's .gitmodules
+# convention. Acquisition always uses the existing scoped HTTPS/account path.
+_isb_submodule_repo() {
+    local parent="$1" url="$2" repo
+    case "$url" in
+        https://github.com/*) repo="${url#https://github.com/}" ;;
+        ../../*) repo="${url#../../}" ;;
+        ../*) repo="${parent%%/*}/${url#../}" ;;
+        *) _isb_log "Submodule URL must select a GitHub HTTPS repository: $url"; return 4 ;;
+    esac
+    repo="${repo%.git}"
+    [[ "$repo" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || {
+        _isb_log "Unsafe or unsupported submodule repository: $url"; return 4;
+    }
+    printf '%s\n' "$repo"
+}
+
+_isb_submodule_path() {
+    local path="$1"
+    [[ "$path" != . && ${#path} -le 4096 ]] && _isb_relative_path "$path" || return 4
+    case "/${path,,}/" in *'/.git/'*) return 4 ;; esac
+}
+
+# All graph scratch files live outside source. Fetch each child by its parent
+# gitlink, with an independent .git directory: no submodule update procedures,
+# branch selectors, inherited child checkouts or submodule URL fetching by Git.
+# The outer _isb_run deadline covers the complete recursive acquisition.
+_isb_acquire_submodules() {
+    local repo="$1" tree="$2" prefix="$3" depth="$4" number="$_ISB_SOURCE_REPO_COUNT"
+    local record mode type oid path metadata key field name value child_repo full_path
+    local commit entries_file="$_ISB_SOURCE_GRAPH_DIR/tree-$number" config_file="$_ISB_SOURCE_GRAPH_DIR/modules-$number"
+    local -a paths=() pins=()
+    local -A declarations=() urls=() names_by_path=() folded_paths=()
+    commit=$(_isb_git -C "$tree" rev-parse --verify 'HEAD^{commit}') || return 8
+    jq -nc --arg path "$prefix" --arg repo "$repo" --arg commit "$commit" \
+        '{path:$path,repository:$repo,source_commit:$commit}' >> "$_ISB_SOURCE_GRAPH_DIR/repositories.jsonl" || return 1
+    _isb_git -C "$tree" ls-tree -r -z --full-tree "$commit" > "$entries_file" || return 8
+    while IFS= read -r -d '' record; do
+        _ISB_SOURCE_ENTRY_COUNT=$((_ISB_SOURCE_ENTRY_COUNT + 1))
+        ((_ISB_SOURCE_ENTRY_COUNT <= 100000)) || { _isb_log 'Source graph exceeds 100000 tracked entries'; return 4; }
+        [[ "$record" == *$'\t'* ]] || return 4
+        metadata="${record%%$'\t'*}"; path="${record#*$'\t'}"
+        IFS=' ' read -r mode type oid <<< "$metadata"
+        [[ "$mode" == 160000 ]] || continue
+        [[ "$type" == commit && ( "$oid" =~ ^[0-9a-f]{40}$ || "$oid" =~ ^[0-9a-f]{64}$ ) ]] &&
+            _isb_submodule_path "$path" || { _isb_log "Unsafe source submodule path: $path"; return 4; }
+        paths+=("$path"); pins+=("$oid")
+    done < "$entries_file"
+    ((${#paths[@]})) || return 0
+    ((depth < 16 && _ISB_SOURCE_REPO_COUNT + ${#paths[@]} <= 256)) || {
+        _isb_log 'Source submodules exceed 16 levels or 256 repositories'; return 4;
+    }
+    _isb_source_committed_file "$tree" "$tree/.gitmodules" >/dev/null || {
+        _isb_log "Submodules require an unchanged committed regular .gitmodules: ${prefix:-.}"; return 4;
+    }
+    # --no-includes prevents local/global files named by .gitmodules from
+    # becoming dependency authority. Other fields (update, branch, ignore)
+    # are never executed or used to relax commit/content verification.
+    _isb_git -C "$tree" config --no-includes --null --file "$tree/.gitmodules" \
+        --get-regexp '^submodule\..*\.(path|url)$' > "$config_file" || return 4
+    while IFS= read -r -d '' record; do
+        [[ "$record" == *$'\n'* ]] || return 4
+        key="${record%%$'\n'*}"; value="${record#*$'\n'}"
+        field="${key##*.}"; name="${key#submodule.}"; name="${name%.*}"
+        [[ "$name" =~ ^[A-Za-z0-9_][A-Za-z0-9._/-]*$ ]] || {
+            _isb_log 'Unsafe or unsupported submodule name'; return 4;
+        }
+        case "$field" in
+            path)
+                _isb_submodule_path "$value" && [[ -z "${declarations[$name]:-}" &&
+                    -z "${folded_paths[${value,,}]:-}" ]] || {
+                    _isb_log "Duplicate or unsafe submodule path: $value"; return 4;
+                }
+                declarations[$name]="$value"; names_by_path[$value]="$name"; folded_paths[${value,,}]=1
+                ;;
+            url)
+                [[ -z "${urls[$name]:-}" ]] || { _isb_log "Repeated submodule URL: $name"; return 4; }
+                child_repo=$(_isb_submodule_repo "$repo" "$value") || return 4
+                urls[$name]="$child_repo"
+                ;;
+            *) return 4 ;;
+        esac
+    done < "$config_file"
+    [[ ${#declarations[@]} -eq ${#paths[@]} && ${#urls[@]} -eq ${#paths[@]} ]] || {
+        _isb_log 'Submodule declarations must match every pinned gitlink exactly'; return 4;
+    }
+    local index
+    # Validate the entire parent's declaration set before fetching any child.
+    for path in "${paths[@]}"; do
+        name="${names_by_path[$path]:-}"
+        [[ -n "$name" && -n "${urls[$name]:-}" ]] &&
+            _isb_path_in_tree "$tree" "$path" && [[ -d "$tree/$path" && ! -e "$tree/$path/.git" && ! -L "$tree/$path/.git" ]] || {
+            _isb_log "Missing, linked or ambiguous submodule declaration: $path"; return 4;
+        }
+    done
+    for index in "${!paths[@]}"; do
+        path="${paths[$index]}"; name="${names_by_path[$path]}"; child_repo="${urls[$name]}"
+        _ISB_SOURCE_REPO_COUNT=$((_ISB_SOURCE_REPO_COUNT + 1))
+        ((_ISB_SOURCE_REPO_COUNT <= 256)) || { _isb_log 'Source graph exceeds 256 repositories'; return 4; }
+        full_path="${prefix:+$prefix/}$path"
+        _isb_log "Fetching submodule $full_path at ${pins[$index]} ($child_repo)"
+        _isb_checkout "$child_repo" "${pins[$index]}" "$tree/$path" || return $?
+        [[ "$(_isb_git -C "$tree/$path" rev-parse --verify 'HEAD^{commit}')" == "${pins[$index]}" ]] || return 8
+        _isb_acquire_submodules "$child_repo" "$tree/$path" "$full_path" "$((depth + 1))" || return $?
+    done
+}
+
+_isb_checkout_source() {
+    local repo="$1" ref="$2" tree="$3" _ISB_SOURCE_GRAPH_DIR="$4"
+    local _ISB_SOURCE_REPO_COUNT=1 _ISB_SOURCE_ENTRY_COUNT=0
+    mkdir -- "$_ISB_SOURCE_GRAPH_DIR" || return 1
+    _isb_checkout "$repo" "$ref" "$tree" || return $?
+    _isb_acquire_submodules "$repo" "$tree" '' 0 || return $?
+    jq -s '.' "$_ISB_SOURCE_GRAPH_DIR/repositories.jsonl" > "$_ISB_SOURCE_GRAPH_DIR/repositories.json" || return 1
+}
+
+# Observe actual checkout bytes, independently of filters and index stat data.
+# The caller retains the digest in its own shell across compiler execution;
+# a build cannot replace a comparison file with a new baseline. Git supplies
+# the original tracked selection and staged identity, never normalized bytes.
+# Batching hashes keeps this linear without a subprocess for every source file.
+_isb_verify_source_repository() (
+    local tree="$1" commit="$2" inventory="$3" record metadata mode type oid path
+    local cursor remaining component target executable
+    local -a files=()
+    [[ ! -e "$inventory" && ! -L "$inventory" && -d "$tree/.git" && ! -L "$tree/.git" &&
+       -f "$tree/.git/index" && ! -L "$tree/.git/index" ]] || return 6
+    unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE
+    unset GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT
+    export GIT_DIR="$tree/.git" GIT_WORK_TREE="$tree" GIT_COMMON_DIR="$tree/.git"
+    export GIT_INDEX_FILE="$tree/.git/index" GIT_OBJECT_DIRECTORY="$tree/.git/objects"
+    export GIT_NO_REPLACE_OBJECTS=1 GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+    local -a git_options=(-c core.hooksPath=/dev/null -c core.fsmonitor=false -c submodule.recurse=false
+        --git-dir="$tree/.git" --work-tree="$tree")
+    [[ "$(git "${git_options[@]}" rev-parse --verify 'HEAD^{commit}')" == "$commit" ]] || return 6
+    git "${git_options[@]}" diff-index --cached --quiet --no-ext-diff --no-textconv \
+        --ignore-submodules=none "$commit" -- || return 6
+    git "${git_options[@]}" ls-tree -r -z --full-tree "$commit" > "$inventory" || return 6
+    while IFS= read -r -d '' record; do
+        [[ "$record" == *$'\t'* ]] || return 6
+        metadata="${record%%$'\t'*}"; path="${record#*$'\t'}"
+        IFS=' ' read -r mode type oid <<< "$metadata"
+        [[ "$oid" =~ ^[0-9a-f]{40}$ || "$oid" =~ ^[0-9a-f]{64}$ ]] || return 6
+        [[ -n "$path" && "$path" != /* ]] || return 6
+        # Ordinary tracked filenames may contain spaces, tabs or newlines.
+        # Only directory boundaries need validation; NUL frames the records.
+        cursor="$tree"; remaining="$path"
+        while [[ "$remaining" == */* ]]; do
+            component="${remaining%%/*}"; remaining="${remaining#*/}"
+            case "${component,,}" in ''|.|..|.git) return 6 ;; esac
+            cursor="$cursor/$component"
+            [[ -d "$cursor" && ! -L "$cursor" ]] || return 6
+        done
+        case "${remaining,,}" in ''|.|..|.git) return 6 ;; esac
+        cursor="$cursor/$remaining"
+        printf '%s\0%s\0' "$metadata" "$path" || return 6
+        case "$mode:$type" in
+            100644:blob|100755:blob|120000:blob)
+                if [[ "$mode" == 120000 && -L "$cursor" ]]; then
+                    # The sentinel preserves targets ending in newline through
+                    # command substitution; readlink's own newline is consistent.
+                    target=$(readlink "$cursor" && printf '.') || return 6
+                    printf 'symlink\0%s\0' "${target%.}" || return 6
+                else
+                    # core.symlinks=false materializes tracked links as regular
+                    # target-text files. Preserve that initial representation;
+                    # a later link/file conversion changes this fingerprint.
+                    [[ -f "$cursor" && ! -L "$cursor" ]] || return 6
+                    executable=0; [[ ! -x "$cursor" ]] || executable=1
+                    printf 'regular:%s\0' "$executable" || return 6
+                    files+=("$cursor")
+                    if ((${#files[@]} == 128)); then
+                        git "${git_options[@]}" hash-object --no-filters -- "${files[@]}" || return 6
+                        files=()
+                    fi
+                fi
+                ;;
+            160000:commit)
+                [[ -d "$cursor" && ! -L "$cursor" ]] || return 6
+                printf 'submodule\0' || return 6
+                ;;
+            *) return 6 ;;
+        esac
+    done < "$inventory"
+    if ((${#files[@]})); then
+        git "${git_options[@]}" hash-object --no-filters -- "${files[@]}" || return 6
+    fi
+)
+
+_isb_verify_source_graph() {
+    local tree="$1" graph="$2" directory="$3" rows path commit index=0 manifest
+    [[ -d "$directory" && ! -L "$directory" ]] || return 6
+    directory=$(umask 077; mktemp -d "$directory/verify.XXXXXXXX") || return 6
+    manifest="$directory/source-state"
+    rows=$(jq -r '.[] | [(if .path == "" then "." else .path end),.source_commit] | @tsv' <<< "$graph") || return 6
+    : > "$manifest" || return 6
+    while IFS=$'\t' read -r path commit; do
+        printf '%s\0%s\0' "$path" "$commit" >> "$manifest" || return 6
+        _isb_path_in_tree "$tree" "$path" &&
+            _isb_verify_source_repository "$tree/$path" "$commit" "$directory/tree-$index" >> "$manifest" || {
+            _isb_log "Build changed pinned source or Git identity: $path"; return 6;
+        }
+        index=$((index + 1))
+    done <<< "$rows"
+    _isb_sha256 "$manifest"
+}
 
 _isb_in_dir() ( cd "$1" && shift && "$@" )
 
@@ -1463,38 +1672,70 @@ _installer_run_gh() (
 _isb_freshness_request() (
     set +x
     local transport="$1" endpoint="$2" destination="$3"
+    local maximum=8388608 bytes status token='' escaped_token='' header header_bytes=0 headers_complete=false
+    local status_pattern='^HTTP/[0-9]+(\.[0-9]+)? 200( .*)?$'
+    local LC_ALL=C
+    local -a transfer_statuses=()
+    set -o pipefail
     if [[ "$transport" == gh ]]; then
-        _installer_run_gh api --hostname github.com --method GET \
+        # The CLI's successful exit includes responses other than HTTP 200.
+        # Bound its complete response before parsing, then admit exactly one
+        # bounded header block and a separately bounded JSON body. The extra
+        # 64 KiB is solely for headers, never a larger metadata allowance.
+        _installer_run_gh --bounded-output "$destination.response" "$((maximum + 65536))" \
+            api --hostname github.com --method GET --include \
             -H 'Accept: application/vnd.github+json' -H 'Cache-Control: no-cache' \
-            "$endpoint" > "$destination"
-    elif ! command -v gh >/dev/null 2>&1 &&
-         [[ -n "${DSR_GH_TOKEN:-}" || -n "${GITHUB_TOKEN:-}" || -n "${GH_TOKEN:-}" ]]; then
-        # Match token-only release acquisition without adding a gh dependency.
-        # Keep credentials off argv and disk, ignore ambient curl options, and
-        # never follow metadata redirects. These endpoints are assembled only
-        # from the admitted repository/tag and the resolved immutable commits.
-        local token escaped_token bytes status maximum=8388608
-        token=$(_installer_github_token) || return $?
-        [[ ${#token} -le 8192 && "$token" != *[[:cntrl:]]* ]] || return 4
-        escaped_token="${token//\\/\\\\}"; escaped_token="${escaped_token//\"/\\\"}"
-        set -o pipefail
-        if ! printf 'header = "Authorization: Bearer %s"\n' "$escaped_token" |
+            "$endpoint" || return $?
+        {
+            IFS= read -r header || return 8
+            header_bytes=$((${#header} + 1))
+            header="${header%$'\r'}"
+            [[ "$header" =~ $status_pattern ]] || return 8
+            while IFS= read -r header; do
+                header_bytes=$((header_bytes + ${#header} + 1))
+                ((header_bytes <= 65536)) || return 8
+                header="${header%$'\r'}"
+                if [[ -z "$header" ]]; then headers_complete=true; break; fi
+            done
+            $headers_complete || return 8
+            head -c "$((maximum + 1))" > "$destination" || return 8
+        } < "$destination.response"
+        bytes=$(wc -c < "$destination") || return 8
+        [[ "$bytes" =~ ^[[:space:]]*[0-9]+[[:space:]]*$ ]] && ((bytes <= maximum)) || return 8
+    elif [[ "$transport" == curl ]]; then
+        # Keep the same selected-account rule as release acquisition. A
+        # token-only installation authenticates without requiring the CLI;
+        # anonymous metadata uses exactly the same status and byte limits.
+        if ! command -v gh >/dev/null 2>&1 &&
+           [[ -n "${DSR_GH_TOKEN:-}" || -n "${GITHUB_TOKEN:-}" || -n "${GH_TOKEN:-}" ]]; then
+            token=$(_installer_github_token) || return $?
+            [[ ${#token} -le 8192 && "$token" != *[[:cntrl:]]* ]] || return 4
+            escaped_token="${token//\\/\\\\}"; escaped_token="${escaped_token//\"/\\\"}"
+        fi
+        # Do not trust Content-Length as the only bound: older curl versions
+        # cannot enforce --max-filesize for unknown-length/chunked bodies.
+        # Ignore .curlrc, do not follow redirects, and never put credentials
+        # in argv. An unavailable advisory response cannot authorize source.
+        if ! {
+            [[ -z "$token" ]] || printf 'header = "Authorization: Bearer %s"\n' "$escaped_token"
+        } |
             curl -q --config - --silent --globoff --proto '=https' \
                 --connect-timeout 10 --max-time 30 --max-filesize "$maximum" \
                 -H 'Accept: application/vnd.github+json' -H 'Cache-Control: no-cache' \
                 -H 'X-GitHub-Api-Version: 2022-11-28' \
+                --user-agent 'dsr-installer' \
                 "https://api.github.com/$endpoint" --output /dev/fd/3 \
                 --write-out '%{http_code}' 3>&1 > "$destination.http" 2>/dev/null |
             head -c "$((maximum + 1))" > "$destination"; then
+            transfer_statuses=("${PIPESTATUS[@]}")
+            case "${transfer_statuses[1]:-0}" in 42|129|130|131|143) return 5 ;; esac
             return 8
         fi
         bytes=$(wc -c < "$destination" | tr -d '[:space:]') || return 1
         status=$(cat -- "$destination.http") || return 1
         [[ "$status" == 200 && "$bytes" =~ ^[0-9]+$ ]] && ((bytes <= maximum)) || return 8
     else
-        curl -sSf --proto '=https' --connect-timeout 10 --max-time 30 \
-            -H 'Accept: application/vnd.github+json' -H 'Cache-Control: no-cache' \
-            "https://api.github.com/$endpoint" -o "$destination"
+        return 4
     fi
 )
 
@@ -1812,7 +2053,22 @@ _isb_source_committed_file() {
     local root="$1" path="$2" relative row mode type oid rest actual hash attributes filter
     [[ "$path" == "$root/"* && -f "$path" && ! -L "$path" ]] || return 4
     relative="${path#"$root"/}"
-    row=$(_isb_git --literal-pathspecs -C "$root" ls-tree HEAD -- "$relative") || return 4
+    local reference=HEAD owner owner_path
+    if [[ -n "${_ISB_SOURCE_GRAPH:-}" && "$root" == "${_ISB_CHECKOUT_ROOT:-}" ]]; then
+        # ls-tree cannot walk through a gitlink. Resolve the longest recorded
+        # parent path, and read metadata from that child's original commit,
+        # never from a new repository or HEAD introduced by a build script.
+        owner=$(jq -cer --arg path "$relative" '
+            [.[] | .path as $prefix | select($prefix == "" or ($path | startswith($prefix + "/")))] |
+            max_by(.path | length)' <<< "$_ISB_SOURCE_GRAPH") || return 4
+        owner_path=$(jq -r '.path' <<< "$owner") || return 4
+        reference=$(jq -r '.source_commit' <<< "$owner") || return 4
+        if [[ -n "$owner_path" ]]; then
+            _isb_path_in_tree "$root" "$owner_path" || return 4
+            root="$root/$owner_path"; relative="${path#"$root"/}"
+        fi
+    fi
+    row=$(_isb_git --literal-pathspecs -C "$root" ls-tree "$reference" -- "$relative") || return 4
     [[ -n "$row" && "$row" != *$'\n'* ]] || return 4
     IFS=$' \t' read -r mode type oid rest <<< "$row"
     [[ "$type" == blob && ( "$mode" == 100644 || "$mode" == 100755 ) &&
@@ -2370,18 +2626,15 @@ install_source_build() (
     umask 077
     mkdir "$destination" || return 1
     local tree="$destination/source" output="$destination/output" status=0 commit payload sha size receipt payloads
+    local _ISB_SOURCE_GRAPH='' graph_dir="$destination/source-graph" source_state final_source_state
     mkdir "$output" || return 1
     _isb_log "Fetching $repo at $ref into an isolated checkout"
-    _isb_run "$limit" "$destination/fetch.log" _isb_checkout "$repo" "$ref" "$tree" || {
-        status=$?; [[ $status == 5 ]] && return 5; return 8;
+    _isb_run "$limit" "$destination/fetch.log" _isb_checkout_source "$repo" "$ref" "$tree" "$graph_dir" || {
+        status=$?; case "$status" in 1|3|4|5) return "$status" ;; *) return 8 ;; esac
     }
     commit=$(_isb_git -C "$tree" rev-parse --verify 'HEAD^{commit}') || return 8
-    # An incomplete checkout cannot masquerade as a supported source build.
-    local entries
-    entries=$(_isb_git -C "$tree" ls-files --stage) || return 8
-    if grep -q '^160000 ' <<< "$entries"; then
-        _isb_log 'Submodule source builds require a project-specific dependency setup'; return 4
-    fi
+    _ISB_SOURCE_GRAPH=$(jq -ce '.' "$graph_dir/repositories.json") || return 8
+    source_state=$(_isb_verify_source_graph "$tree" "$_ISB_SOURCE_GRAPH" "$graph_dir") || return $?
     _isb_path_in_tree "$tree" "$subdir" && [[ -d "$tree/$subdir" ]] || return 4
     local build_root _ISB_CHECKOUT_ROOT="$tree"
     build_root=$(cd "$tree/$subdir" && pwd -P) || return 4
@@ -2389,8 +2642,10 @@ install_source_build() (
     payloads=$(_isb_compile "$language" "$build_root" "$output" "$binary" "$entry" "$package" "$limit" "${binaries[@]}") || return $?
     # Preserve the source pin through compilation. Build scripts may not move
     # HEAD or modify tracked inputs and then claim they built the pinned tree.
-    [[ "$(_isb_git -C "$tree" rev-parse --verify 'HEAD^{commit}')" == "$commit" ]] || return 6
-    _isb_git -C "$tree" diff --quiet HEAD -- || { _isb_log 'Build modified tracked source inputs'; return 6; }
+    final_source_state=$(_isb_verify_source_graph "$tree" "$_ISB_SOURCE_GRAPH" "$graph_dir") || return $?
+    [[ "$final_source_state" == "$source_state" ]] || {
+        _isb_log 'Build changed tracked source bytes, links or executable modes'; return 6;
+    }
     local -a binary_receipts=()
     local primary_payload='' primary_sha='' primary_size='' binaries_json
     index=0
@@ -2424,19 +2679,21 @@ install_source_build() (
         bun_context_file="$output/bun-context.json"
         [[ -f "$bun_context_file" && ! -L "$bun_context_file" ]] || return 7
     fi
-    receipt=$(jq -nc --arg repo "$repo" --arg ref "$ref" --arg commit "$commit" \
+    receipt=$(jq -c --arg repo "$repo" --arg ref "$ref" --arg commit "$commit" \
         --arg language "$language" --arg path "$payload" --arg sha "$sha" --argjson size "$size" \
         --argjson binaries "$binaries_json" \
         --argjson toolchain "$toolchain_receipt" \
         --slurpfile go_context "$go_context_file" \
         --slurpfile bun_context "$bun_context_file" \
         --arg compiler "$(cat "$output/compiler.log")" \
-        '{schema_version:1,method:"source",repository:$repo,requested_ref:$ref,source_commit:$commit,
+        '[.[] | select(.path != "")] as $submodules |
+         {schema_version:1,method:"source",repository:$repo,requested_ref:$ref,source_commit:$commit,
           language:$language,path:$path,sha256:$sha,size_bytes:$size,compiler:$compiler,
           binaries:$binaries,signed_release:false} +
           (if $toolchain == null then {} else {toolchain:$toolchain} end) +
           (if $go_context[0].go_workspace == null then {} else {go_workspace:$go_context[0].go_workspace} end) +
-          ($bun_context[0] // {})') || return 1
+          ($bun_context[0] // {}) +
+          (if ($submodules | length) == 0 then {} else {submodules:$submodules} end)' <<< "$_ISB_SOURCE_GRAPH") || return 1
     (set -C; printf '%s\n' "$receipt" > "$destination/receipt.json") || return 1
     _isb_log "Built $binary; SHA256 $sha (locally built, not a signed release)"
     printf '%s\n' "$receipt"
@@ -4865,7 +5122,7 @@ _select_archive_binaries() {
 # Skill archive is embedded at generation time as a gzip-compressed tarball
 # encoded in base64 so multi-file skill trees can be restored on install.
 # If this placeholder was not replaced, skill installation is skipped.
-_SKILL_ARCHIVE_B64='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'
+_SKILL_ARCHIVE_B64='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'
 
 # Decode skill archive at runtime
 _decode_skill_archive() {

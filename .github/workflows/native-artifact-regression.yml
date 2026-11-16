@@ -28,6 +28,9 @@ on:
       - scripts/tests/test_generated_workspace_installer.sh
       - scripts/tests/test_install_source.sh
       - scripts/tests/test_install_source_submodules.sh
+      - installers/bv/install.sh
+      - installers/cass/install.sh
+      - installers/ntm/install.sh
       - scripts/tests/test_install_source_windows.sh
       - scripts/tests/test_install_source_family.sh
       - scripts/tests/test_toolchain_detect.sh
@@ -113,6 +116,16 @@ jobs:
           shellcheck -S warning src/install_source.sh scripts/tests/test_install_source_submodules.sh
           deadline=$(command -v timeout || command -v gtimeout)
           "$deadline" 120 bash scripts/tests/test_install_source_submodules.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/source-submodules.log"
+          test -z "$(git status --porcelain)"
+      - name: Validate shipped recursive-source installers
+        shell: bash
+        run: |
+          set -euo pipefail
+          for installer in installers/bv/install.sh installers/cass/install.sh installers/ntm/install.sh; do
+            bash -n "$installer"
+          done
+          deadline=$(command -v timeout || command -v gtimeout)
+          "$deadline" 120 bash scripts/tests/test_install_source_submodules.sh --shipped-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/shipped-source-installers.log"
           test -z "$(git status --porcelain)"
       - name: Validate transactional self-installation and exact release tags
         shell: bash

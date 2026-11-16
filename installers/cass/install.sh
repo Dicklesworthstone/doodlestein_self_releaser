@@ -1297,7 +1297,216 @@ _isb_checkout() (
         [[ "$commit" == "${ref,,}" ]] || return 8
     fi
     _isb_git ${git_options[@]+"${git_options[@]}"} -C "$dir" -c advice.detachedHead=false checkout -q --detach "$commit" || return 8
+    [[ "$(_isb_git ${git_options[@]+"${git_options[@]}"} -C "$dir" rev-parse --verify 'HEAD^{commit}')" == "$commit" ]] || return 8
 )
+
+# Resolve only GitHub repository identities, never arbitrary submodule URLs.
+# A relative URL is relative to the parent repository, as in Git's .gitmodules
+# convention. Acquisition always uses the existing scoped HTTPS/account path.
+_isb_submodule_repo() {
+    local parent="$1" url="$2" repo
+    case "$url" in
+        https://github.com/*) repo="${url#https://github.com/}" ;;
+        ../../*) repo="${url#../../}" ;;
+        ../*) repo="${parent%%/*}/${url#../}" ;;
+        *) _isb_log "Submodule URL must select a GitHub HTTPS repository: $url"; return 4 ;;
+    esac
+    repo="${repo%.git}"
+    [[ "$repo" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || {
+        _isb_log "Unsafe or unsupported submodule repository: $url"; return 4;
+    }
+    printf '%s\n' "$repo"
+}
+
+_isb_submodule_path() {
+    local path="$1"
+    [[ "$path" != . && ${#path} -le 4096 ]] && _isb_relative_path "$path" || return 4
+    case "/${path,,}/" in *'/.git/'*) return 4 ;; esac
+}
+
+# All graph scratch files live outside source. Fetch each child by its parent
+# gitlink, with an independent .git directory: no submodule update procedures,
+# branch selectors, inherited child checkouts or submodule URL fetching by Git.
+# The outer _isb_run deadline covers the complete recursive acquisition.
+_isb_acquire_submodules() {
+    local repo="$1" tree="$2" prefix="$3" depth="$4" number="$_ISB_SOURCE_REPO_COUNT"
+    local record mode type oid path metadata key field name value child_repo full_path
+    local commit entries_file="$_ISB_SOURCE_GRAPH_DIR/tree-$number" config_file="$_ISB_SOURCE_GRAPH_DIR/modules-$number"
+    local -a paths=() pins=()
+    local -A declarations=() urls=() names_by_path=() folded_paths=()
+    commit=$(_isb_git -C "$tree" rev-parse --verify 'HEAD^{commit}') || return 8
+    jq -nc --arg path "$prefix" --arg repo "$repo" --arg commit "$commit" \
+        '{path:$path,repository:$repo,source_commit:$commit}' >> "$_ISB_SOURCE_GRAPH_DIR/repositories.jsonl" || return 1
+    _isb_git -C "$tree" ls-tree -r -z --full-tree "$commit" > "$entries_file" || return 8
+    while IFS= read -r -d '' record; do
+        _ISB_SOURCE_ENTRY_COUNT=$((_ISB_SOURCE_ENTRY_COUNT + 1))
+        ((_ISB_SOURCE_ENTRY_COUNT <= 100000)) || { _isb_log 'Source graph exceeds 100000 tracked entries'; return 4; }
+        [[ "$record" == *$'\t'* ]] || return 4
+        metadata="${record%%$'\t'*}"; path="${record#*$'\t'}"
+        IFS=' ' read -r mode type oid <<< "$metadata"
+        [[ "$mode" == 160000 ]] || continue
+        [[ "$type" == commit && ( "$oid" =~ ^[0-9a-f]{40}$ || "$oid" =~ ^[0-9a-f]{64}$ ) ]] &&
+            _isb_submodule_path "$path" || { _isb_log "Unsafe source submodule path: $path"; return 4; }
+        paths+=("$path"); pins+=("$oid")
+    done < "$entries_file"
+    ((${#paths[@]})) || return 0
+    ((depth < 16 && _ISB_SOURCE_REPO_COUNT + ${#paths[@]} <= 256)) || {
+        _isb_log 'Source submodules exceed 16 levels or 256 repositories'; return 4;
+    }
+    _isb_source_committed_file "$tree" "$tree/.gitmodules" >/dev/null || {
+        _isb_log "Submodules require an unchanged committed regular .gitmodules: ${prefix:-.}"; return 4;
+    }
+    # --no-includes prevents local/global files named by .gitmodules from
+    # becoming dependency authority. Other fields (update, branch, ignore)
+    # are never executed or used to relax commit/content verification.
+    _isb_git -C "$tree" config --no-includes --null --file "$tree/.gitmodules" \
+        --get-regexp '^submodule\..*\.(path|url)$' > "$config_file" || return 4
+    while IFS= read -r -d '' record; do
+        [[ "$record" == *$'\n'* ]] || return 4
+        key="${record%%$'\n'*}"; value="${record#*$'\n'}"
+        field="${key##*.}"; name="${key#submodule.}"; name="${name%.*}"
+        [[ "$name" =~ ^[A-Za-z0-9_][A-Za-z0-9._/-]*$ ]] || {
+            _isb_log 'Unsafe or unsupported submodule name'; return 4;
+        }
+        case "$field" in
+            path)
+                _isb_submodule_path "$value" && [[ -z "${declarations[$name]:-}" &&
+                    -z "${folded_paths[${value,,}]:-}" ]] || {
+                    _isb_log "Duplicate or unsafe submodule path: $value"; return 4;
+                }
+                declarations[$name]="$value"; names_by_path[$value]="$name"; folded_paths[${value,,}]=1
+                ;;
+            url)
+                [[ -z "${urls[$name]:-}" ]] || { _isb_log "Repeated submodule URL: $name"; return 4; }
+                child_repo=$(_isb_submodule_repo "$repo" "$value") || return 4
+                urls[$name]="$child_repo"
+                ;;
+            *) return 4 ;;
+        esac
+    done < "$config_file"
+    [[ ${#declarations[@]} -eq ${#paths[@]} && ${#urls[@]} -eq ${#paths[@]} ]] || {
+        _isb_log 'Submodule declarations must match every pinned gitlink exactly'; return 4;
+    }
+    local index
+    # Validate the entire parent's declaration set before fetching any child.
+    for path in "${paths[@]}"; do
+        name="${names_by_path[$path]:-}"
+        [[ -n "$name" && -n "${urls[$name]:-}" ]] &&
+            _isb_path_in_tree "$tree" "$path" && [[ -d "$tree/$path" && ! -e "$tree/$path/.git" && ! -L "$tree/$path/.git" ]] || {
+            _isb_log "Missing, linked or ambiguous submodule declaration: $path"; return 4;
+        }
+    done
+    for index in "${!paths[@]}"; do
+        path="${paths[$index]}"; name="${names_by_path[$path]}"; child_repo="${urls[$name]}"
+        _ISB_SOURCE_REPO_COUNT=$((_ISB_SOURCE_REPO_COUNT + 1))
+        ((_ISB_SOURCE_REPO_COUNT <= 256)) || { _isb_log 'Source graph exceeds 256 repositories'; return 4; }
+        full_path="${prefix:+$prefix/}$path"
+        _isb_log "Fetching submodule $full_path at ${pins[$index]} ($child_repo)"
+        _isb_checkout "$child_repo" "${pins[$index]}" "$tree/$path" || return $?
+        [[ "$(_isb_git -C "$tree/$path" rev-parse --verify 'HEAD^{commit}')" == "${pins[$index]}" ]] || return 8
+        _isb_acquire_submodules "$child_repo" "$tree/$path" "$full_path" "$((depth + 1))" || return $?
+    done
+}
+
+_isb_checkout_source() {
+    local repo="$1" ref="$2" tree="$3" _ISB_SOURCE_GRAPH_DIR="$4"
+    local _ISB_SOURCE_REPO_COUNT=1 _ISB_SOURCE_ENTRY_COUNT=0
+    mkdir -- "$_ISB_SOURCE_GRAPH_DIR" || return 1
+    _isb_checkout "$repo" "$ref" "$tree" || return $?
+    _isb_acquire_submodules "$repo" "$tree" '' 0 || return $?
+    jq -s '.' "$_ISB_SOURCE_GRAPH_DIR/repositories.jsonl" > "$_ISB_SOURCE_GRAPH_DIR/repositories.json" || return 1
+}
+
+# Observe actual checkout bytes, independently of filters and index stat data.
+# The caller retains the digest in its own shell across compiler execution;
+# a build cannot replace a comparison file with a new baseline. Git supplies
+# the original tracked selection and staged identity, never normalized bytes.
+# Batching hashes keeps this linear without a subprocess for every source file.
+_isb_verify_source_repository() (
+    local tree="$1" commit="$2" inventory="$3" record metadata mode type oid path
+    local cursor remaining component target executable
+    local -a files=()
+    [[ ! -e "$inventory" && ! -L "$inventory" && -d "$tree/.git" && ! -L "$tree/.git" &&
+       -f "$tree/.git/index" && ! -L "$tree/.git/index" ]] || return 6
+    unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE
+    unset GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT
+    export GIT_DIR="$tree/.git" GIT_WORK_TREE="$tree" GIT_COMMON_DIR="$tree/.git"
+    export GIT_INDEX_FILE="$tree/.git/index" GIT_OBJECT_DIRECTORY="$tree/.git/objects"
+    export GIT_NO_REPLACE_OBJECTS=1 GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+    local -a git_options=(-c core.hooksPath=/dev/null -c core.fsmonitor=false -c submodule.recurse=false
+        --git-dir="$tree/.git" --work-tree="$tree")
+    [[ "$(git "${git_options[@]}" rev-parse --verify 'HEAD^{commit}')" == "$commit" ]] || return 6
+    git "${git_options[@]}" diff-index --cached --quiet --no-ext-diff --no-textconv \
+        --ignore-submodules=none "$commit" -- || return 6
+    git "${git_options[@]}" ls-tree -r -z --full-tree "$commit" > "$inventory" || return 6
+    while IFS= read -r -d '' record; do
+        [[ "$record" == *$'\t'* ]] || return 6
+        metadata="${record%%$'\t'*}"; path="${record#*$'\t'}"
+        IFS=' ' read -r mode type oid <<< "$metadata"
+        [[ "$oid" =~ ^[0-9a-f]{40}$ || "$oid" =~ ^[0-9a-f]{64}$ ]] || return 6
+        [[ -n "$path" && "$path" != /* ]] || return 6
+        # Ordinary tracked filenames may contain spaces, tabs or newlines.
+        # Only directory boundaries need validation; NUL frames the records.
+        cursor="$tree"; remaining="$path"
+        while [[ "$remaining" == */* ]]; do
+            component="${remaining%%/*}"; remaining="${remaining#*/}"
+            case "${component,,}" in ''|.|..|.git) return 6 ;; esac
+            cursor="$cursor/$component"
+            [[ -d "$cursor" && ! -L "$cursor" ]] || return 6
+        done
+        case "${remaining,,}" in ''|.|..|.git) return 6 ;; esac
+        cursor="$cursor/$remaining"
+        printf '%s\0%s\0' "$metadata" "$path" || return 6
+        case "$mode:$type" in
+            100644:blob|100755:blob|120000:blob)
+                if [[ "$mode" == 120000 && -L "$cursor" ]]; then
+                    # The sentinel preserves targets ending in newline through
+                    # command substitution; readlink's own newline is consistent.
+                    target=$(readlink "$cursor" && printf '.') || return 6
+                    printf 'symlink\0%s\0' "${target%.}" || return 6
+                else
+                    # core.symlinks=false materializes tracked links as regular
+                    # target-text files. Preserve that initial representation;
+                    # a later link/file conversion changes this fingerprint.
+                    [[ -f "$cursor" && ! -L "$cursor" ]] || return 6
+                    executable=0; [[ ! -x "$cursor" ]] || executable=1
+                    printf 'regular:%s\0' "$executable" || return 6
+                    files+=("$cursor")
+                    if ((${#files[@]} == 128)); then
+                        git "${git_options[@]}" hash-object --no-filters -- "${files[@]}" || return 6
+                        files=()
+                    fi
+                fi
+                ;;
+            160000:commit)
+                [[ -d "$cursor" && ! -L "$cursor" ]] || return 6
+                printf 'submodule\0' || return 6
+                ;;
+            *) return 6 ;;
+        esac
+    done < "$inventory"
+    if ((${#files[@]})); then
+        git "${git_options[@]}" hash-object --no-filters -- "${files[@]}" || return 6
+    fi
+)
+
+_isb_verify_source_graph() {
+    local tree="$1" graph="$2" directory="$3" rows path commit index=0 manifest
+    [[ -d "$directory" && ! -L "$directory" ]] || return 6
+    directory=$(umask 077; mktemp -d "$directory/verify.XXXXXXXX") || return 6
+    manifest="$directory/source-state"
+    rows=$(jq -r '.[] | [(if .path == "" then "." else .path end),.source_commit] | @tsv' <<< "$graph") || return 6
+    : > "$manifest" || return 6
+    while IFS=$'\t' read -r path commit; do
+        printf '%s\0%s\0' "$path" "$commit" >> "$manifest" || return 6
+        _isb_path_in_tree "$tree" "$path" &&
+            _isb_verify_source_repository "$tree/$path" "$commit" "$directory/tree-$index" >> "$manifest" || {
+            _isb_log "Build changed pinned source or Git identity: $path"; return 6;
+        }
+        index=$((index + 1))
+    done <<< "$rows"
+    _isb_sha256 "$manifest"
+}
 
 _isb_in_dir() ( cd "$1" && shift && "$@" )
 
@@ -1463,38 +1672,70 @@ _installer_run_gh() (
 _isb_freshness_request() (
     set +x
     local transport="$1" endpoint="$2" destination="$3"
+    local maximum=8388608 bytes status token='' escaped_token='' header header_bytes=0 headers_complete=false
+    local status_pattern='^HTTP/[0-9]+(\.[0-9]+)? 200( .*)?$'
+    local LC_ALL=C
+    local -a transfer_statuses=()
+    set -o pipefail
     if [[ "$transport" == gh ]]; then
-        _installer_run_gh api --hostname github.com --method GET \
+        # The CLI's successful exit includes responses other than HTTP 200.
+        # Bound its complete response before parsing, then admit exactly one
+        # bounded header block and a separately bounded JSON body. The extra
+        # 64 KiB is solely for headers, never a larger metadata allowance.
+        _installer_run_gh --bounded-output "$destination.response" "$((maximum + 65536))" \
+            api --hostname github.com --method GET --include \
             -H 'Accept: application/vnd.github+json' -H 'Cache-Control: no-cache' \
-            "$endpoint" > "$destination"
-    elif ! command -v gh >/dev/null 2>&1 &&
-         [[ -n "${DSR_GH_TOKEN:-}" || -n "${GITHUB_TOKEN:-}" || -n "${GH_TOKEN:-}" ]]; then
-        # Match token-only release acquisition without adding a gh dependency.
-        # Keep credentials off argv and disk, ignore ambient curl options, and
-        # never follow metadata redirects. These endpoints are assembled only
-        # from the admitted repository/tag and the resolved immutable commits.
-        local token escaped_token bytes status maximum=8388608
-        token=$(_installer_github_token) || return $?
-        [[ ${#token} -le 8192 && "$token" != *[[:cntrl:]]* ]] || return 4
-        escaped_token="${token//\\/\\\\}"; escaped_token="${escaped_token//\"/\\\"}"
-        set -o pipefail
-        if ! printf 'header = "Authorization: Bearer %s"\n' "$escaped_token" |
+            "$endpoint" || return $?
+        {
+            IFS= read -r header || return 8
+            header_bytes=$((${#header} + 1))
+            header="${header%$'\r'}"
+            [[ "$header" =~ $status_pattern ]] || return 8
+            while IFS= read -r header; do
+                header_bytes=$((header_bytes + ${#header} + 1))
+                ((header_bytes <= 65536)) || return 8
+                header="${header%$'\r'}"
+                if [[ -z "$header" ]]; then headers_complete=true; break; fi
+            done
+            $headers_complete || return 8
+            head -c "$((maximum + 1))" > "$destination" || return 8
+        } < "$destination.response"
+        bytes=$(wc -c < "$destination") || return 8
+        [[ "$bytes" =~ ^[[:space:]]*[0-9]+[[:space:]]*$ ]] && ((bytes <= maximum)) || return 8
+    elif [[ "$transport" == curl ]]; then
+        # Keep the same selected-account rule as release acquisition. A
+        # token-only installation authenticates without requiring the CLI;
+        # anonymous metadata uses exactly the same status and byte limits.
+        if ! command -v gh >/dev/null 2>&1 &&
+           [[ -n "${DSR_GH_TOKEN:-}" || -n "${GITHUB_TOKEN:-}" || -n "${GH_TOKEN:-}" ]]; then
+            token=$(_installer_github_token) || return $?
+            [[ ${#token} -le 8192 && "$token" != *[[:cntrl:]]* ]] || return 4
+            escaped_token="${token//\\/\\\\}"; escaped_token="${escaped_token//\"/\\\"}"
+        fi
+        # Do not trust Content-Length as the only bound: older curl versions
+        # cannot enforce --max-filesize for unknown-length/chunked bodies.
+        # Ignore .curlrc, do not follow redirects, and never put credentials
+        # in argv. An unavailable advisory response cannot authorize source.
+        if ! {
+            [[ -z "$token" ]] || printf 'header = "Authorization: Bearer %s"\n' "$escaped_token"
+        } |
             curl -q --config - --silent --globoff --proto '=https' \
                 --connect-timeout 10 --max-time 30 --max-filesize "$maximum" \
                 -H 'Accept: application/vnd.github+json' -H 'Cache-Control: no-cache' \
                 -H 'X-GitHub-Api-Version: 2022-11-28' \
+                --user-agent 'dsr-installer' \
                 "https://api.github.com/$endpoint" --output /dev/fd/3 \
                 --write-out '%{http_code}' 3>&1 > "$destination.http" 2>/dev/null |
             head -c "$((maximum + 1))" > "$destination"; then
+            transfer_statuses=("${PIPESTATUS[@]}")
+            case "${transfer_statuses[1]:-0}" in 42|129|130|131|143) return 5 ;; esac
             return 8
         fi
         bytes=$(wc -c < "$destination" | tr -d '[:space:]') || return 1
         status=$(cat -- "$destination.http") || return 1
         [[ "$status" == 200 && "$bytes" =~ ^[0-9]+$ ]] && ((bytes <= maximum)) || return 8
     else
-        curl -sSf --proto '=https' --connect-timeout 10 --max-time 30 \
-            -H 'Accept: application/vnd.github+json' -H 'Cache-Control: no-cache' \
-            "https://api.github.com/$endpoint" -o "$destination"
+        return 4
     fi
 )
 
@@ -1812,7 +2053,22 @@ _isb_source_committed_file() {
     local root="$1" path="$2" relative row mode type oid rest actual hash attributes filter
     [[ "$path" == "$root/"* && -f "$path" && ! -L "$path" ]] || return 4
     relative="${path#"$root"/}"
-    row=$(_isb_git --literal-pathspecs -C "$root" ls-tree HEAD -- "$relative") || return 4
+    local reference=HEAD owner owner_path
+    if [[ -n "${_ISB_SOURCE_GRAPH:-}" && "$root" == "${_ISB_CHECKOUT_ROOT:-}" ]]; then
+        # ls-tree cannot walk through a gitlink. Resolve the longest recorded
+        # parent path, and read metadata from that child's original commit,
+        # never from a new repository or HEAD introduced by a build script.
+        owner=$(jq -cer --arg path "$relative" '
+            [.[] | .path as $prefix | select($prefix == "" or ($path | startswith($prefix + "/")))] |
+            max_by(.path | length)' <<< "$_ISB_SOURCE_GRAPH") || return 4
+        owner_path=$(jq -r '.path' <<< "$owner") || return 4
+        reference=$(jq -r '.source_commit' <<< "$owner") || return 4
+        if [[ -n "$owner_path" ]]; then
+            _isb_path_in_tree "$root" "$owner_path" || return 4
+            root="$root/$owner_path"; relative="${path#"$root"/}"
+        fi
+    fi
+    row=$(_isb_git --literal-pathspecs -C "$root" ls-tree "$reference" -- "$relative") || return 4
     [[ -n "$row" && "$row" != *$'\n'* ]] || return 4
     IFS=$' \t' read -r mode type oid rest <<< "$row"
     [[ "$type" == blob && ( "$mode" == 100644 || "$mode" == 100755 ) &&
@@ -2370,18 +2626,15 @@ install_source_build() (
     umask 077
     mkdir "$destination" || return 1
     local tree="$destination/source" output="$destination/output" status=0 commit payload sha size receipt payloads
+    local _ISB_SOURCE_GRAPH='' graph_dir="$destination/source-graph" source_state final_source_state
     mkdir "$output" || return 1
     _isb_log "Fetching $repo at $ref into an isolated checkout"
-    _isb_run "$limit" "$destination/fetch.log" _isb_checkout "$repo" "$ref" "$tree" || {
-        status=$?; [[ $status == 5 ]] && return 5; return 8;
+    _isb_run "$limit" "$destination/fetch.log" _isb_checkout_source "$repo" "$ref" "$tree" "$graph_dir" || {
+        status=$?; case "$status" in 1|3|4|5) return "$status" ;; *) return 8 ;; esac
     }
     commit=$(_isb_git -C "$tree" rev-parse --verify 'HEAD^{commit}') || return 8
-    # An incomplete checkout cannot masquerade as a supported source build.
-    local entries
-    entries=$(_isb_git -C "$tree" ls-files --stage) || return 8
-    if grep -q '^160000 ' <<< "$entries"; then
-        _isb_log 'Submodule source builds require a project-specific dependency setup'; return 4
-    fi
+    _ISB_SOURCE_GRAPH=$(jq -ce '.' "$graph_dir/repositories.json") || return 8
+    source_state=$(_isb_verify_source_graph "$tree" "$_ISB_SOURCE_GRAPH" "$graph_dir") || return $?
     _isb_path_in_tree "$tree" "$subdir" && [[ -d "$tree/$subdir" ]] || return 4
     local build_root _ISB_CHECKOUT_ROOT="$tree"
     build_root=$(cd "$tree/$subdir" && pwd -P) || return 4
@@ -2389,8 +2642,10 @@ install_source_build() (
     payloads=$(_isb_compile "$language" "$build_root" "$output" "$binary" "$entry" "$package" "$limit" "${binaries[@]}") || return $?
     # Preserve the source pin through compilation. Build scripts may not move
     # HEAD or modify tracked inputs and then claim they built the pinned tree.
-    [[ "$(_isb_git -C "$tree" rev-parse --verify 'HEAD^{commit}')" == "$commit" ]] || return 6
-    _isb_git -C "$tree" diff --quiet HEAD -- || { _isb_log 'Build modified tracked source inputs'; return 6; }
+    final_source_state=$(_isb_verify_source_graph "$tree" "$_ISB_SOURCE_GRAPH" "$graph_dir") || return $?
+    [[ "$final_source_state" == "$source_state" ]] || {
+        _isb_log 'Build changed tracked source bytes, links or executable modes'; return 6;
+    }
     local -a binary_receipts=()
     local primary_payload='' primary_sha='' primary_size='' binaries_json
     index=0
@@ -2424,19 +2679,21 @@ install_source_build() (
         bun_context_file="$output/bun-context.json"
         [[ -f "$bun_context_file" && ! -L "$bun_context_file" ]] || return 7
     fi
-    receipt=$(jq -nc --arg repo "$repo" --arg ref "$ref" --arg commit "$commit" \
+    receipt=$(jq -c --arg repo "$repo" --arg ref "$ref" --arg commit "$commit" \
         --arg language "$language" --arg path "$payload" --arg sha "$sha" --argjson size "$size" \
         --argjson binaries "$binaries_json" \
         --argjson toolchain "$toolchain_receipt" \
         --slurpfile go_context "$go_context_file" \
         --slurpfile bun_context "$bun_context_file" \
         --arg compiler "$(cat "$output/compiler.log")" \
-        '{schema_version:1,method:"source",repository:$repo,requested_ref:$ref,source_commit:$commit,
+        '[.[] | select(.path != "")] as $submodules |
+         {schema_version:1,method:"source",repository:$repo,requested_ref:$ref,source_commit:$commit,
           language:$language,path:$path,sha256:$sha,size_bytes:$size,compiler:$compiler,
           binaries:$binaries,signed_release:false} +
           (if $toolchain == null then {} else {toolchain:$toolchain} end) +
           (if $go_context[0].go_workspace == null then {} else {go_workspace:$go_context[0].go_workspace} end) +
-          ($bun_context[0] // {})') || return 1
+          ($bun_context[0] // {}) +
+          (if ($submodules | length) == 0 then {} else {submodules:$submodules} end)' <<< "$_ISB_SOURCE_GRAPH") || return 1
     (set -C; printf '%s\n' "$receipt" > "$destination/receipt.json") || return 1
     _isb_log "Built $binary; SHA256 $sha (locally built, not a signed release)"
     printf '%s\n' "$receipt"
@@ -4865,7 +5122,7 @@ _select_archive_binaries() {
 # Skill archive is embedded at generation time as a gzip-compressed tarball
 # encoded in base64 so multi-file skill trees can be restored on install.
 # If this placeholder was not replaced, skill installation is skipped.
-_SKILL_ARCHIVE_B64='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'
+_SKILL_ARCHIVE_B64='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'
 
 # Decode skill archive at runtime
 _decode_skill_archive() {

@@ -8,7 +8,14 @@ set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 SOURCE_MODULE="${DSR_TEST_INSTALL_SOURCE_MODULE:-$ROOT/src/install_source.sh}"
-for dependency in git jq go ps tar; do
+TEST_MODE="${1:-}"
+[[ $# -eq 0 || ( $# -eq 1 && "$TEST_MODE" == --shipped-only ) ]] || {
+    printf 'Usage: %s [--shipped-only]\n' "$0" >&2
+    exit 4
+}
+dependencies=(git jq go ps tar)
+[[ "$TEST_MODE" != --shipped-only ]] || dependencies+=(python3)
+for dependency in "${dependencies[@]}"; do
     command -v "$dependency" >/dev/null 2>&1 || {
         printf 'SKIP: pinned source submodules require %s\n' "$dependency"
         exit 3
@@ -22,6 +29,7 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/dsr-source-submodules.XXXXXXXX") || exit 1
 WORK=$(cd "$WORK" && pwd -P) || exit 1
 printf 'Pinned source submodule fixtures retained at: %s\n' "$WORK"
 PASS=0 FAIL=0 STATUS=0 CALLS='' MUTATION='' BUILD_SOURCE=''
+WATCHDOG_ADAPTED=false
 
 check() {
     local label="$1"; shift
@@ -62,6 +70,7 @@ if ((STATUS != 0)); then
         exit 1
     fi
     printf 'BOUNDARY: hosted PID namespace requires synchronous real commands with retained logs\n'
+    WATCHDOG_ADAPTED=true
     _isb_run() {
         local limit="$1" log="$2"; shift 2
         [[ "$limit" =~ ^[1-9][0-9]{0,4}$ && ! -e "$log" && ! -L "$log" ]] || return 4
@@ -180,6 +189,265 @@ git config --file "$GIT_CONFIG_GLOBAL" core.hooksPath "$WORK/hooks" || exit 1
 git config --file "$GIT_CONFIG_GLOBAL" diff.ignoreSubmodules all || exit 1
 git config --file "$GIT_CONFIG_GLOBAL" submodule.shared.update \
     '!printf "custom update executed\n" >> "$DSR_TEST_SUBMODULE_HOOK_MARKER"' || exit 1
+
+# Exercise the committed client entrypoints, not a newly generated substitute
+# or a sourced helper. Only GitHub transport is adapted; source acquisition,
+# recursive checkout, watchdogs, native Go compilation and installation run
+# unchanged. The existing direct-engine cases below remain independently useful.
+test_shipped_installers() {
+    if $WATCHDOG_ADAPTED; then
+        printf 'SKIP: shipped entrypoints require a working native process watchdog\n' >&2
+        return 3
+    fi
+    python3 - "$ROOT" "$WORK" "$REAL_GO" "$ROOT_PIN" "$SHARED_PIN" "$LEAF_PIN" <<'PY'
+import base64
+import hashlib
+import io
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+
+root, fixture = map(pathlib.Path, sys.argv[1:3])
+real_go, root_pin, shared_pin, leaf_pin = sys.argv[3:]
+work = fixture / "shipped"
+(work / "bin").mkdir(parents=True)
+(work / "home").mkdir()
+real_git = shutil.which("git")
+passed = failed = 0
+
+
+def check(label, condition):
+    global passed, failed
+    if condition:
+        passed += 1
+        print("PASS: " + label, flush=True)
+    else:
+        failed += 1
+        print("FAIL: " + label, file=sys.stderr, flush=True)
+
+
+def command(arguments, **kwargs):
+    return subprocess.run(arguments, capture_output=True, text=True, timeout=60, **kwargs)
+
+
+policies = {
+    "bv": ("Dicklesworthstone/beads_viewer", "go", "${name}_${version}_${os}_${arch}",
+           "a5aeb8877e4ac9b06e212493d775a5e2c44482248086586c5a96d010d4cf3553"),
+    "cass": ("Dicklesworthstone/coding_agent_session_search", "rust", "${name}-${os}-${arch}",
+             "3dd554a6601c19a0f2a4de558ac817959eccc15cb30b0bf77e4d21329f8389b5"),
+    "ntm": ("Dicklesworthstone/ntm", "go", "${name}_${version}_${os}_${arch}",
+            "9fd59c8eb5a56ce33113abf0be34484828bf0acce3c81ae4f78ae4c26ee9d9d3"),
+}
+engine = (root / "src/install_source.sh").read_bytes().rstrip(b"\n")
+toolchain = (root / "src/toolchain_detect.sh").read_bytes().rstrip(b"\n")
+for tool, (repository, language, naming, skill_hash) in policies.items():
+    script = root / "installers" / tool / "install.sh"
+    payload = script.read_bytes()
+    text = payload.decode()
+    check(f"{tool} ships the complete current source and toolchain engines byte for byte",
+          payload.count(toolchain + b"\n" + engine) == 1)
+    expected = {
+        "TOOL_NAME": repr(tool), "REPO": repr(repository), "BINARY_NAME": repr(tool),
+        "SOURCE_LANGUAGE": repr(language), "SOURCE_SUBDIR": "'.'", "SOURCE_ENTRY": "''",
+        "SOURCE_PACKAGE": "''", "ARTIFACT_NAMING": repr(naming),
+        "LINUX_LIBC_FALLBACK": "'none'", "STRICT_RELEASE_CONTRACT": "false", "MINISIGN_PUBKEY": '""',
+        "ARCHIVE_FORMAT_LINUX": '"tar.gz"', "ARCHIVE_FORMAT_DARWIN": '"tar.gz"',
+        "ARCHIVE_FORMAT_WINDOWS": '"zip"', "ARCHIVE_FORMAT_FREEBSD": '"tar.gz"',
+        "SUPPORTED_PLATFORM_PATTERN": '"^(linux/amd64|linux/arm64|linux/386|linux/armv7|darwin/amd64|darwin/arm64|windows/amd64|windows/arm64|windows/386|freebsd/amd64)$"',
+    }
+    observed = {name: re.findall(r"^" + name + r"=(.*)$", text, re.M) for name in expected}
+    check(f"{tool} preserves its published repository, release, platform and source policy",
+          all(observed[name] == [value] for name, value in expected.items()))
+    tables = {}
+    for name in ("_resolve_arch_alias", "_configured_target_triples", "_libc_independent_go_platform",
+                 "_contract_asset_plan", "_native_variant_platform", "_workspace_binary_names"):
+        function = re.search(r"^" + name + r"\(\) \{\n(.*?)^\}", text, re.M | re.S)
+        case = re.search(r"\bcase .*? in\n(.*?)    esac", function.group(1), re.S) if function else None
+        tables[name] = case.group(1).strip() if case else None
+    check(f"{tool} preserves all target, alias, libc, contract and executable-family cases",
+          all(value == "" for name, value in tables.items() if name != "_workspace_binary_names") and
+          tables["_workspace_binary_names"] == "*) printf '%s\\n' '" + tool + "' ;;")
+    match = re.search(r"^_SKILL_ARCHIVE_B64='([^']*)'$", text, re.M)
+    archive = base64.b64decode(match.group(1), validate=True) if match else b""
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as bundle:
+        members = bundle.getmembers()
+        names = [str(pathlib.PurePosixPath(member.name)) for member in members]
+        valid = names == [".", "SKILL.md"] and members[0].isdir() and members[0].mode == 0o755
+        valid = valid and members[1].isfile() and members[1].mode == 0o644
+        valid = valid and hashlib.sha256(bundle.extractfile(members[1]).read()).hexdigest() == skill_hash
+    check(f"{tool} preserves the original embedded skill files, modes and content", valid)
+
+if failed:
+    raise SystemExit(1)
+
+for tool in ("bv", "ntm"):
+    repository = policies[tool][0]
+    result = command([real_git, "config", "--file", os.environ["GIT_CONFIG_GLOBAL"], "--add",
+                      f"url.file://{fixture / 'root'}.insteadOf", f"https://github.com/{repository}.git"])
+    if result.returncode:
+        raise RuntimeError(result.stderr)
+
+# The branch moves beyond the annotated release while all dependency gitlinks
+# remain pinned. A bad freshness response must not authorize this newer source.
+result = command([real_git, "-c", "core.hooksPath=/dev/null", "-C", str(fixture / "root"),
+                  "commit", "--allow-empty", "-qm", "Newer shipped-installer freshness fixture"])
+if result.returncode:
+    raise RuntimeError(result.stderr)
+head_pin = command([real_git, "-C", str(fixture / "root"), "rev-parse", "HEAD"]).stdout.strip()
+
+for name, executable in (("git", real_git), ("go", real_go)):
+    wrapper = work / "bin" / name
+    wrapper.write_text('#!/usr/bin/env bash\nprintf \'%s %s\\n\' "' + name +
+                       '" "$*" >> "$DSR_SHIPPED_CALLS"\nexec "' + executable + '" "$@"\n')
+    wrapper.chmod(0o755)
+(work / "bin/gh").write_text('#!/usr/bin/env bash\nexit 1\n')
+(work / "bin/gh").chmod(0o755)
+
+# This deliberately does not enforce curl's --max-filesize: it qualifies the
+# installer's independent stream limit, including unknown-length responses on
+# older curl. Genuine curl/TLS and gh framing are covered by the private suite.
+(work / "bin/curl").write_text(r'''#!/usr/bin/env python3
+import json, os, pathlib, sys, urllib.parse
+arguments = sys.argv[1:]
+url = next((arg for arg in arguments if arg.startswith("https://")), "")
+if "--config" in arguments and arguments[arguments.index("--config") + 1] == "-":
+    for line in sys.stdin:
+        if line.startswith("url = "):
+            url = json.loads(line[6:])
+def option(name):
+    return arguments[arguments.index(name) + 1] if name in arguments else ""
+destination = option("--output") or option("-o")
+writeout = option("--write-out") or option("-w")
+parsed = urllib.parse.urlsplit(url)
+base, head = os.environ["DSR_SHIPPED_BASE"], os.environ["DSR_SHIPPED_HEAD"]
+repository = os.environ["DSR_SHIPPED_REPOSITORY"]
+mode = os.environ["DSR_SHIPPED_MODE"]
+status = "200"
+if url == "https://api.github.com/repos/" + repository + "/releases/latest":
+    body = json.dumps({"id": 123, "tag_name": "v1.0.0", "draft": False}).encode()
+elif url.startswith("https://github.com/" + repository + "/releases/download/v1.0.0/"):
+    asset = pathlib.Path(parsed.path).name
+    body = (pathlib.Path(os.environ["DSR_SHIPPED_RELEASES"]) / asset).read_bytes()
+elif url == "https://api.github.com/repos/" + repository + "/commits?per_page=1":
+    body = json.dumps([{"sha": head}]).encode()
+    if mode in ("boundary", "oversized"):
+        body += b" " * (8388608 + int(mode == "oversized") - len(body))
+    if mode == "partial":
+        status = "206"
+elif url == "https://api.github.com/repos/" + repository + "/commits/tags%2Fv1.0.0":
+    body = json.dumps({"sha": base}).encode()
+elif url == "https://api.github.com/repos/" + repository + "/compare/" + base + "..." + head + "?per_page=1":
+    body = json.dumps({"base_commit": {"sha": base}, "merge_base_commit": {"sha": base},
+                       "status": "ahead", "ahead_by": 1, "behind_by": 0, "total_commits": 1,
+                       "commits": [{"sha": head}]}).encode()
+else:
+    raise SystemExit(22)
+with open(os.environ["DSR_SHIPPED_HTTP"], "a") as log:
+    log.write(json.dumps({"url": url, "status": status, "bytes": len(body),
+                          "maximum": option("--max-filesize"), "writeout": writeout,
+                          "isolated_config": arguments[0] == "-q"}) + "\n")
+try:
+    if destination:
+        with open(destination, "wb") as output:
+            output.write(body)
+    else:
+        sys.stdout.buffer.write(body)
+    if writeout:
+        sys.stdout.write(writeout.replace("%{http_code}", status).replace("%{redirect_url}", "").replace("\\n", "\n"))
+except BrokenPipeError:
+    raise SystemExit(23)
+''')
+(work / "bin/curl").chmod(0o755)
+
+environment = os.environ.copy()
+environment.update(PATH=str(work / "bin") + os.pathsep + environment["PATH"], HOME=str(work / "home"),
+                   DSR_GH_TOKEN="", GITHUB_TOKEN="", GH_TOKEN="", DSR_SHIPPED_BASE=root_pin,
+                   DSR_SHIPPED_HEAD=head_pin, GOMAXPROCS="2", NO_COLOR="1")
+
+
+def run(tool, label, options, mode="boundary"):
+    case = work / f"{tool}-{label}"
+    (case / "tmp").mkdir(parents=True)
+    environment.update(DSR_SHIPPED_CALLS=str(case / "calls"), DSR_SHIPPED_HTTP=str(case / "http.jsonl"),
+                       DSR_SHIPPED_MODE=mode, DSR_SHIPPED_REPOSITORY=policies[tool][0],
+                       DSR_SHIPPED_RELEASES=str(work / f"{tool}-releases"), TMPDIR=str(case / "tmp"))
+    arguments = ["bash", str(root / "installers" / tool / "install.sh"), "--json", "--non-interactive",
+                 "--no-skills", "--cache-dir", str(case / "cache"), "--dir", str(case / "install"), *options]
+    (case / "argv.json").write_text(json.dumps(arguments) + "\n")
+    # Retain partial evidence even if the unchanged caller deadline expires.
+    with (case / "stdout.json").open("w") as output, (case / "stderr.log").open("w") as diagnostics:
+        result = subprocess.run(arguments, env=environment, stdout=output, stderr=diagnostics, timeout=60)
+    try:
+        receipt = json.loads((case / "stdout.json").read_text())
+    except ValueError:
+        receipt = {}
+    return case, result, receipt
+
+
+expected_graph = [{"path": "deps/shared", "repository": "example/shared", "source_commit": shared_pin},
+                  {"path": "deps/shared/leaf", "repository": "example/leaf", "source_commit": leaf_pin}]
+system = os.uname().sysname.lower()
+architecture = {"x86_64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(os.uname().machine)
+for tool in ("bv", "ntm"):
+    case, result, receipt = run(tool, "source", ["--from-source", "--version", "v1.0.0", "--source-timeout", "60"])
+    binary = case / "install" / tool
+    source = receipt.get("source", {})
+    check(f"shipped {tool} entrypoint builds and installs with real Git and Go", result.returncode == 0 and binary.is_file())
+    check(f"shipped {tool} source receipt binds the annotated tag and both pinned gitlinks",
+          receipt.get("method") == "source" and receipt.get("signed_release") is False and
+          source.get("repository") == policies[tool][0] and source.get("source_commit") == root_pin and
+          source.get("requested_ref") == "refs/tags/v1.0.0" and source.get("submodules") == expected_graph)
+    if result.returncode or not binary.is_file():
+        continue
+    check(f"shipped {tool} executable runs the pinned child and grandchild instead of their branch tips",
+          command([str(binary)]).stdout.strip() == "app-shared-leaf-pinned")
+    digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+    check(f"shipped {tool} receipt hashes the installed native executable",
+          source.get("sha256") == digest and source.get("size_bytes") == binary.stat().st_size and
+          receipt.get("binaries", [{}])[0].get("sha256") == digest)
+    releases = work / f"{tool}-releases"
+    releases.mkdir()
+    asset = f"{tool}_1.0.0_{system}_{architecture}.tar.gz"
+    archive = releases / asset
+    with tarfile.open(archive, "w:gz") as output:
+        output.add(binary, arcname=tool)
+    (releases / (asset + ".sha256")).write_text(hashlib.sha256(archive.read_bytes()).hexdigest() + "  " + asset + "\n")
+    for mode in ("boundary", "oversized", "partial"):
+        threshold = "1" if mode == "boundary" else "0"
+        case, result, receipt = run(tool, "freshness-" + mode,
+                                    ["--allow-source-build", "--source-if-stale", threshold, "--source-timeout", "60"], mode)
+        selected = case / "install" / tool
+        check(f"shipped {tool} {mode} freshness preserves the verified release bytes",
+              result.returncode == 0 and selected.is_file() and hashlib.sha256(selected.read_bytes()).hexdigest() == digest and
+              receipt.get("status") == "success" and "source" not in receipt)
+        check(f"shipped {tool} {mode} freshness produces the exact admission decision",
+              receipt.get("freshness", {}).get("status") == ("fresh" if mode == "boundary" else "unknown"))
+        calls = (case / "calls").read_text() if (case / "calls").exists() else ""
+        check(f"shipped {tool} {mode} freshness does not fetch or compile newer source",
+              not any(line.startswith(("git ", "go ")) for line in calls.splitlines()))
+        http = [json.loads(line) for line in (case / "http.jsonl").read_text().splitlines()]
+        heads = [row for row in http if row["url"].endswith("/commits?per_page=1")]
+        check(f"shipped {tool} {mode} freshness actually consumes the bounded-status transport control",
+              len(heads) == 1 and heads[0]["bytes"] == (8388608 + (mode == "oversized") if mode != "partial" else len(json.dumps([{"sha": head_pin}]).encode())) and
+              heads[0]["status"] == ("206" if mode == "partial" else "200") and
+              heads[0]["maximum"] == "8388608" and heads[0]["writeout"] == "%{http_code}" and heads[0]["isolated_config"])
+
+check("shipped recursive builds never execute ambient hooks or custom submodule update commands",
+      not (fixture / "hook-executed").exists())
+print(f"Shipped installer tests: {passed} passed, {failed} failed; evidence retained at {work}", flush=True)
+raise SystemExit(1 if failed else 0)
+PY
+}
+
+if [[ "$TEST_MODE" == --shipped-only ]]; then
+    test_shipped_installers
+    exit $?
+fi
 
 # Every fault happens only after the real native compiler exits successfully.
 # This distinguishes post-build custody refusal from a compilation failure.
