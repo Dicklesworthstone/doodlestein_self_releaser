@@ -1290,7 +1290,7 @@ cmd_build() {
 cmd_release() {
     printf 'published\n' >> "$TEST_TMPDIR/release.calls" || return 4
     act_get_local_path ntm > "$TEST_TMPDIR/release-source" || return 4
-    printf '%s\n' '{"command":"release","status":"success","exit_code":0,"details":{"repo":"Dicklesworthstone/ntm","tag":"v1.2.3","release_id":9,"draft":false}}'
+    printf '%s\n' '{"command":"release","status":"success","exit_code":0,"details":{"repo":"Dicklesworthstone/ntm","tag":"v1.2.3","release_id":9,"draft":false,"prerelease":false}}'
 }
 cmd_fallback "$@"
 EOF

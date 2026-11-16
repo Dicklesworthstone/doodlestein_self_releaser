@@ -20,6 +20,14 @@
       "maximum": 32,
       "description": "Selected target-build concurrency bound; host capacity and shared output paths may reduce actual concurrency"
     },
+    "prerelease_requested": {
+      "type": "boolean",
+      "description": "Whether --prerelease explicitly requires prerelease publication"
+    },
+    "prerelease": {
+      "type": "boolean",
+      "description": "Selected prerelease mode in plans and failures; observed mode after successful publication. Ordinary retries without --prerelease preserve an existing release's mode."
+    },
     "expected_sha": {
       "type": "string",
       "pattern": "^(?!0{40}$)[0-9a-f]{40}$",

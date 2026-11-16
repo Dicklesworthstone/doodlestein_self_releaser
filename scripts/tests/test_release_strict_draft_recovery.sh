@@ -134,6 +134,7 @@ elif endpoint=='repos/owner/app/releases/9':
             print('Controlled publication failure',file=sys.stderr);sys.exit(1)
         r.update(patch)
         if r['draft'] is False and control.get('metadata_drift_after_publish'):r['body']='changed after publish'
+        if r['draft'] is False and control.get('prerelease_drift_after_publish'):r['prerelease']=not r['prerelease']
         (c/'remote.json').write_text(json.dumps(r));print(json.dumps(r))
         sys.exit(1 if control.get('lost_patch') else 0)
     count=control.get('reads',0)+1;control['reads']=count
@@ -424,7 +425,7 @@ def prepare_cases(cases):
         prepared=list(pool.map(lambda case: setup(*case),cases))
     return zip(cases,prepared)
 
-def test_fallback_recovery(pagination_only=False):
+def test_fallback_recovery(pagination_only=False, prerelease_only=False):
     run_id='11111111-1111-4111-8111-111111111111'
     missing='payload.tar.gz.sha256'
 
@@ -435,11 +436,16 @@ def test_fallback_recovery(pagination_only=False):
         subprocess.run(['git','-C',str(c/'repo'),'update-index','--refresh'],check=True)
         config=c/'config/repos.d/app.yaml'
         data=json.loads(config.read_text())
-        data.update(language='go',act_job_map={'linux/amd64':None})
+        # These retained payloads model workflow outputs, not native compiler
+        # execution. Keep the configured job and manifest inventory truthful
+        # so real release admission does not require a fabricated Go receipt.
+        data.update(language='go',act_job_map={'linux/amd64':'build'})
         config.write_text(json.dumps(data))
         artifacts=c/'state/artifacts/app-v1.2.3'
         manifest=artifacts/'app-v1.2.3-manifest.json'
         data=json.loads(manifest.read_text());data['run_id']=run_id
+        data['requested_targets']=['linux/amd64']
+        data['build_environments']=[{'target':'linux/amd64','method':'act','host':'act-local'}]
         manifest.write_text(json.dumps(data))
         artifacts.rename(c/'build-inputs')
         output=c/'custom release artifacts' if custom else artifacts
@@ -456,15 +462,18 @@ def test_fallback_recovery(pagination_only=False):
         if resume:args+=['--resume='+run_id]
         args+=list(extra)
         before=len(requests(c))
-        result=subprocess.run(args,env=env,capture_output=True,text=True)
         name=label or ('resumed' if resume else 'initial')
-        (c/(name+'.stdout')).write_text(result.stdout)
-        (c/(name+'.stderr')).write_text(result.stderr)
+        stdout=c/(name+'.stdout');stderr=c/(name+'.stderr')
+        # Preserve the current operation's diagnostics even when an outer
+        # test deadline interrupts Python before subprocess.run returns.
+        with stdout.open('w') as out, stderr.open('w') as err:
+            result=subprocess.run(args,env=env,stdout=out,stderr=err,text=True)
+        result.stdout=stdout.read_text();result.stderr=stderr.read_text()
         return result,requests(c)[before:]
 
-    def interrupt_upload(label,custom=False,extra_assets=0,long_names=False):
+    def interrupt_upload(label,custom=False,extra_assets=0,long_names=False,options=()):
         c,env,output=prepare(label,{'fail_upload_name':missing},custom,extra_assets,long_names)
-        result,rows=invoke_fallback(c,env,output)
+        result,rows=invoke_fallback(c,env,output,extra=options)
         check(label+' initial publication interrupted',result.returncode!=0)
         details=json.loads(result.stdout)['details']
         if details.get('publication_recovery',{}).get('status')!='ready':
@@ -476,6 +485,111 @@ def test_fallback_recovery(pagination_only=False):
               len([row for row in rows if '--post' in row])==1 and
               json.loads((c/'remote.json').read_text())['draft'] is True)
         return c,env,output,details['publication_recovery']
+
+    if prerelease_only:
+        selected=os.environ.get('DSR_TEST_STRICT_PRERELEASE_CASE','all')
+        if selected not in ('all','plan','new','recovery','stable','drift') or (
+                selected!='all' and os.environ.get('DSR_TEST_STRICT_PRERELEASE_ONLY')!='1'):
+            raise AssertionError('Select a known prerelease case together with DSR_TEST_STRICT_PRERELEASE_ONLY=1')
+        if selected in ('all','plan'):
+            c,env,output=prepare('prerelease-plan')
+            result,rows=invoke_fallback(c,env,output,extra=['--prerelease','--dry-run'])
+            check('explicit prerelease planning succeeds',result.returncode==0)
+            details=json.loads(result.stdout)['details']
+            check('prerelease plan retains selected and requested modes',
+                  details['prerelease'] is True and details['prerelease_requested'] is True)
+            check('prerelease plan performs no build or publication mutation',
+                  not output.exists() and not (c/'build-calls').exists() and not mutations(rows))
+
+        if selected in ('all','new'):
+            c,env,output=prepare('prerelease-fresh')
+            result,rows=invoke_fallback(c,env,output,extra=['--prerelease'])
+            check('new strict prerelease publishes successfully',result.returncode==0)
+            details=json.loads(result.stdout)['details']
+            recovery=details['publication_recovery']
+            intent=Path(recovery['intent'])
+            response=Path(recovery['create_response'])
+            original=response.read_bytes();original_inode=response.stat().st_ino
+            remote=json.loads((c/'remote.json').read_text())
+            posts=[json.loads(row[row.index('--post')+1]) for row in rows if '--post' in row]
+            check('new strict prerelease creation and original intent select prerelease',
+                  len(posts)==1 and posts[0]['prerelease'] is True and
+                  json.loads(intent.read_text())['prerelease'] is True and
+                  json.loads(original)['prerelease'] is True)
+            check('new strict prerelease result and remote metadata prove public prerelease',
+                  details['prerelease'] is True and details['prerelease_requested'] is True and
+                  remote['draft'] is False and remote['prerelease'] is True)
+            result,rows=invoke_fallback(c,env,output,True,['--prerelease'])
+            check('completed prerelease retry preserves mode without compilation or publication mutation',
+                  result.returncode==0 and not mutations(rows) and
+                  (c/'build-calls').read_text().splitlines().count('build')==1 and
+                  response.read_bytes()==original and response.stat().st_ino==original_inode)
+            details=json.loads(result.stdout)['details']
+            final=json.loads(Path(details['publication_recovery']['finalization_receipt']).read_text())
+            check('completed prerelease retry retains a matching signed finalization receipt',
+                  details['prerelease'] is True and details['prerelease_requested'] is True and
+                  final['release']['draft'] is False and final['release']['prerelease'] is True)
+
+        if selected in ('all','recovery'):
+            c,env,output,recovery=interrupt_upload('prerelease-interrupted',options=['--prerelease'])
+            response=Path(recovery['create_response'])
+            original=response.read_bytes();original_inode=response.stat().st_ino
+            intent=Path(recovery['intent']);intent_bytes=intent.read_bytes()
+            check('interrupted strict prerelease retains requested mode in original custody',
+                  json.loads(original)['prerelease'] is True and json.loads(intent_bytes)['prerelease'] is True)
+            (c/'control.json').write_text('{}')
+            result,rows=invoke_fallback(c,env,output,True,label='omitted-prerelease')
+            check('omitting prerelease on strict recovery refuses before mutation',
+                  result.returncode!=0 and not mutations(rows) and
+                  (c/'build-calls').read_text().splitlines().count('build')==1 and
+                  response.read_bytes()==original and response.stat().st_ino==original_inode and
+                  intent.read_bytes()==intent_bytes and json.loads((c/'remote.json').read_text())['draft'] is True)
+            remote=json.loads((c/'remote.json').read_text());remote['prerelease']=False
+            (c/'remote.json').write_text(json.dumps(remote))
+            result,rows=invoke_fallback(c,env,output,True,['--prerelease'],label='remote-mode-drift')
+            check('changed remote prerelease mode blocks recovery before upload or publication',
+                  result.returncode!=0 and not mutations(rows) and
+                  response.read_bytes()==original and intent.read_bytes()==intent_bytes and
+                  (c/'build-calls').read_text().splitlines().count('build')==1)
+            remote['prerelease']=True
+            (c/'remote.json').write_text(json.dumps(remote))
+            result,rows=invoke_fallback(c,env,output,True,['--prerelease'],label='matching-prerelease')
+            check('matching strict prerelease recovers only missing bytes and publishes',
+                  result.returncode==0 and [row[2] for row in rows if row[0]=='upload-boundary']==[missing] and
+                  not any('--post' in row for row in rows) and
+                  json.loads((c/'remote.json').read_text())['draft'] is False and
+                  json.loads((c/'remote.json').read_text())['prerelease'] is True)
+            details=json.loads(result.stdout)['details']
+            final=json.loads(Path(details['publication_recovery']['finalization_receipt']).read_text())
+            check('recovered prerelease result and final receipt retain selection',
+                  details['prerelease'] is True and details['prerelease_requested'] is True and
+                  final['release']['prerelease'] is True and response.read_bytes()==original and
+                  response.stat().st_ino==original_inode and intent.read_bytes()==intent_bytes and
+                  (c/'build-calls').read_text().splitlines().count('build')==1)
+
+        if selected in ('all','stable'):
+            c,env,output,recovery=interrupt_upload('stable-mode-interrupted')
+            response=Path(recovery['create_response']);original=response.read_bytes()
+            (c/'control.json').write_text('{}')
+            result,rows=invoke_fallback(c,env,output,True,['--prerelease'])
+            check('switching a retained stable attempt to prerelease refuses before mutation',
+                  result.returncode!=0 and not mutations(rows) and response.read_bytes()==original and
+                  json.loads((c/'remote.json').read_text())['prerelease'] is False and
+                  json.loads((c/'remote.json').read_text())['draft'] is True and
+                  (c/'build-calls').read_text().splitlines().count('build')==1)
+
+        if selected in ('all','drift'):
+            c,env,output=prepare('prerelease-public-drift',{'prerelease_drift_after_publish':True})
+            result,rows=invoke_fallback(c,env,output,extra=['--prerelease'])
+            check('public prerelease metadata drift cannot report successful publication',
+                  result.returncode!=0 and json.loads(result.stdout)['details']['phases']['release']!='success')
+            patches=[row for row in rows if '--method' in row]
+            check('public mode drift restores only the original owned release to draft',
+                  any(json.loads(row[row.index('--data')+1]).get('draft') is False for row in patches) and
+                  any(json.loads(row[row.index('--data')+1]).get('draft') is True for row in patches) and
+                  all(row[0]=='repos/owner/app/releases/9' for row in patches) and
+                  json.loads((c/'remote.json').read_text())['draft'] is True)
+        return
 
     if pagination_only:
         # 201 assets, including a real signed aggregate and primary pair. Long
@@ -1276,6 +1390,11 @@ if os.environ.get('DSR_TEST_STRICT_PAGINATION_ONLY')=='1':
     print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
     raise SystemExit(0)
 
+if os.environ.get('DSR_TEST_STRICT_PRERELEASE_ONLY')=='1':
+    test_fallback_recovery(prerelease_only=True)
+    print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
+    raise SystemExit(0)
+
 if os.environ.get('DSR_TEST_STRICT_CLI_ONLY')=='1':
     test_public_finalizer_lifecycle()
     print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
@@ -1510,5 +1629,6 @@ for (label,controls),(c,env,response,_) in prepare_cases([('post-metadata-drift'
 
 test_fallback_recovery()
 test_fallback_recovery(pagination_only=True)
+test_fallback_recovery(prerelease_only=True)
 print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
 PY

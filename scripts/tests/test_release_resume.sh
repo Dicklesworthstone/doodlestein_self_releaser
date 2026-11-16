@@ -1035,6 +1035,58 @@ test_draft_resume_does_not_dispatch_or_verify_upgrade() {
             .details.dispatch.status=="skipped"' "$CASE/stdout" >/dev/null
 }
 
+test_prerelease_request_refuses_existing_stable_release() {
+    local mode visibility
+    for mode in create resume; do
+        for visibility in false true; do
+            setup "prerelease-conflict-$mode-$visibility"
+            jq --argjson draft "$visibility" '.draft=$draft' "$CASE/release.json" > "$CASE/release.next"
+            mv "$CASE/release.next" "$CASE/release.json"
+            cp "$CASE/release.json" "$CASE/release.before"
+            if [[ "$mode" == resume ]]; then
+                run_release --prerelease --resume
+            else
+                run_release --prerelease
+            fi
+            [[ $STATUS -eq 7 ]] && ! grep -Eq '^POST|^PUBLISH|^DISPATCH|^UPGRADE|--method (PATCH|DELETE)' "$CALLS" &&
+                cmp -s "$CASE/release.before" "$CASE/release.json" &&
+                jq -es 'length == 1 and (.[0] | .status == "error" and .exit_code == 7 and
+                    .details.repo == "owner/repo" and .details.version == "1.2.3" and .details.tag == "v1.2.3" and
+                    .details.prerelease_requested == true and .details.prerelease == false)' \
+                    "$CASE/stdout" >/dev/null || return 1
+        done
+    done
+}
+
+test_prerelease_resume_preserves_matching_public_mode() {
+    local selection
+    for selection in explicit observed; do
+        setup "prerelease-matching-$selection"
+        jq '.prerelease=true' "$CASE/release.json" > "$CASE/release.next"
+        mv "$CASE/release.next" "$CASE/release.json"
+        if [[ "$selection" == explicit ]]; then
+            run_release --resume --prerelease
+        else
+            run_release --resume
+        fi
+        [[ $STATUS -eq 0 ]] && grep -Fxq 'POST payload.bin' "$CALLS" &&
+            ! grep -Eq '^CREATE|^PUBLISH|--method (PATCH|DELETE)' "$CALLS" &&
+            jq -e '.status == "success" and .details.draft == false and .details.prerelease == true' \
+                "$CASE/stdout" >/dev/null || return 1
+    done
+}
+
+test_prerelease_new_release_preserves_mode_through_promotion() {
+    setup prerelease-new
+    CREATE_FAIL=false
+    run_release --prerelease
+    [[ $STATUS -eq 0 ]] && grep -Fxq 'POST payload.bin' "$CALLS" && grep -Fxq PUBLISH "$CALLS" &&
+        jq -e '.prerelease == true and .draft == true' "$CASE/create-request.json" >/dev/null &&
+        jq -e '.prerelease == true and .draft == false' "$CASE/release.json" >/dev/null &&
+        jq -e '.status == "success" and .details.prerelease == true and .details.draft == false' \
+            "$CASE/stdout" >/dev/null
+}
+
 test_named_upload_emits_one_json_envelope() {
     setup aliases
     mv "$CASE/artifacts/payload.bin" "$CASE/artifacts/tool-linux-amd64.tar.gz"
@@ -3425,6 +3477,8 @@ for test in test_release_auth_cancellation_never_falls_back_or_publishes \
     test_saved_name_with_changed_remote_fails_closed test_legacy_digestless_assets_are_hashed \
     test_unavailable_inventory_is_not_success test_failed_resume_lookup_never_creates \
     test_draft_resume_does_not_dispatch_or_verify_upgrade test_named_upload_emits_one_json_envelope \
+    test_prerelease_request_refuses_existing_stable_release \
+    test_prerelease_resume_preserves_matching_public_mode test_prerelease_new_release_preserves_mode_through_promotion \
     test_missing_manifest_artifact_blocks_creation test_changed_local_manifest_artifact_blocks_creation \
     test_wrong_release_identity_cannot_upload test_lost_upload_response_reconciles_real_bytes \
     test_strict_preflight_remains_required test_dry_run_has_no_network_or_checkpoint_writes \

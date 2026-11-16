@@ -188,16 +188,25 @@ signing_verify() {
 signing_sign_files() { signing_sign_batch "$@"; }
 cmd_release() {
     printf 'RELEASE %s\n' "$*" >> "$CALLS"
+    local selected_prerelease=false argument
+    for argument in "$@"; do
+        [[ "$argument" != --prerelease ]] || selected_prerelease=true
+    done
     if [[ "$RELEASE_RESULT_MODE" == malformed ]]; then
         printf '{invalid\n'
     else
-        jq -nc --arg mode "$RELEASE_RESULT_MODE" --argjson rc "$RELEASE_RC" '
+        jq -nc --arg mode "$RELEASE_RESULT_MODE" --argjson rc "$RELEASE_RC" \
+            --argjson prerelease "$selected_prerelease" '
             {command:"release",status:(if $rc==0 then "success" else "error" end),exit_code:$rc,
-             details:{repo:"owner/tool",tag:"v1.2.3",release_id:9,draft:false}} |
+             details:{repo:"owner/tool",tag:"v1.2.3",release_id:9,draft:false,prerelease:$prerelease}} |
             if $mode=="draft" then .details.draft=true
             elif $mode=="missing-visibility" then del(.details.draft)
             elif $mode=="wrong-tag" then .details.tag="v9.9.9"
             elif $mode=="wrong-repo" then .details.repo="owner/other"
+            elif $mode=="stable" then .details.prerelease=false
+            elif $mode=="prerelease" then .details.prerelease=true
+            elif $mode=="missing-prerelease" then del(.details.prerelease)
+            elif $mode=="malformed-prerelease" then .details.prerelease="true"
             else . end'
     fi
     if [[ "${_ACT_ISOLATED_SOURCE_TOOL:-}" == tool ]]; then
@@ -397,6 +406,51 @@ test_success() {
         grep -Fq "SIGN $OUT/daemon $OUT/worker" "$CALLS" &&
         jq -e '.details.artifacts_count==2 and .details.phases.release=="success"' "$CASE/stdout" >/dev/null &&
         [[ ! -e "$OUT/tool-1.2.3-SHA256SUMS.txt" ]]
+}
+test_prerelease_forwarding() {
+    local mode="$1"
+    setup "prerelease-$mode"
+    case "$mode" in
+        fresh) run_fallback --prerelease ;;
+        plan) run_fallback --prerelease --dry-run ;;
+        resume)
+            checkpoint failed; RELEASE_EXISTS=true
+            run_fallback --prerelease --resume="$RUN" ;;
+        completed)
+            completed_fixture; RELEASE_EXISTS=true
+            run_fallback --prerelease --resume="$RUN" ;;
+        *) return 1 ;;
+    esac
+    [[ "$RC" == 0 && ! -e "$CASE/lock" ]] && one_result &&
+        jq -e '.details.prerelease_requested == true and .details.prerelease == true' \
+            "$CASE/stdout" >/dev/null || return 1
+    if [[ "$mode" == plan ]]; then
+        [[ ! -s "$CALLS" && ! -e "$OUT" && ! -e "$DSR_STATE_DIR" ]] &&
+            jq -e '.status == "dry_run" and .details.steps == []' "$CASE/stdout" >/dev/null
+    else
+        grep -Eq '^RELEASE .* --prerelease( |$)' "$CALLS" || return 1
+        if [[ "$mode" == resume || "$mode" == completed ]]; then
+            grep -Eq '^RELEASE .* --resume( |$)' "$CALLS" || return 1
+        fi
+        [[ "$mode" != completed ]] || ! grep -q '^BUILD ' "$CALLS"
+    fi
+}
+test_prerelease_public_confirmation() {
+    setup "prerelease-confirmation-$1"
+    RELEASE_RESULT_MODE="$1"
+    run_fallback --prerelease
+    [[ "$RC" == 7 && ! -e "$CASE/lock" ]] && one_result &&
+        grep -q '^RELEASE ' "$CALLS" && ! grep -q '^NOTIFY fallback.success$' "$CALLS" &&
+        jq -e '.details.prerelease_requested == true and .details.prerelease == true and
+            .details.phases.release == "blocked"' "$CASE/stdout" >/dev/null
+}
+test_prerelease_observed_mode_without_explicit_request() {
+    setup prerelease-observed
+    completed_fixture; RELEASE_EXISTS=true; RELEASE_RESULT_MODE=prerelease
+    run_fallback --resume="$RUN"
+    [[ "$RC" == 0 ]] && one_result && ! grep -q -- '--prerelease' "$CALLS" &&
+        jq -e '.details.prerelease_requested == false and .details.prerelease == true and
+            .details.phases.release == "success"' "$CASE/stdout" >/dev/null
 }
 test_parallel_forwarding() {
     local expected="$1"; shift
@@ -829,7 +883,7 @@ cmd_release() {
         return 7
     fi
     printf 'PUBLISH %s\n' "$*" >> "$PARTIAL_CASE/boundaries"
-    printf '%s\n' '{"command":"release","status":"success","exit_code":0,"details":{"repo":"fixture/tool","tag":"v1.2.3","release_id":91,"draft":false}}'
+    printf '%s\n' '{"command":"release","status":"success","exit_code":0,"details":{"repo":"fixture/tool","tag":"v1.2.3","release_id":91,"draft":false,"prerelease":false}}'
 }
 _check_repo() {
     if [[ "$PARTIAL_MODE" != publish && "$PARTIAL_MODE" != publish-isolated ]]; then
@@ -1914,6 +1968,9 @@ test_isolated_source_plan_and_arguments() {
 }
 
 run_test test_success
+for mode in fresh plan resume completed; do run_test test_prerelease_forwarding "$mode"; done
+for mode in stable missing-prerelease malformed-prerelease; do run_test test_prerelease_public_confirmation "$mode"; done
+run_test test_prerelease_observed_mode_without_explicit_request
 run_test test_parallel_forwarding 1
 run_test test_parallel_forwarding 7 --parallel
 run_test test_parallel_forwarding 7 -p

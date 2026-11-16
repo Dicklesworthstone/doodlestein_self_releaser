@@ -10823,7 +10823,14 @@ EOF
             return 7
         fi
         if $prerelease && [[ "$(jq -r '.prerelease' <<< "$release_json")" == false ]]; then
-            log_warn "--prerelease was requested, but the existing $tag release is not a prerelease"
+            log_error "--prerelease was requested, but $tag is a stable release; nothing uploaded"
+            if $JSON_MODE; then
+                json_envelope "release" "error" 7 "$(jq -nc --arg repo "$repo" --arg version "$version" \
+                    --arg tag "$tag" --arg url "$release_url" \
+                    '{error:"existing stable release conflicts with --prerelease",repo:$repo,version:$version,tag:$tag,
+                      release_url:$url,prerelease_requested:true,prerelease:false}')"
+            fi
+            return 7
         fi
         # An existing draft does not become public merely because --draft was
         # omitted on retry. Downstream dispatch must use observed state.
@@ -13281,6 +13288,7 @@ cmd_fallback() {
     # not rewrite configuration or change the hashes frozen in build receipts.
     local _ACT_ISOLATED_SOURCE_TOOL="" _ACT_ISOLATED_SOURCE_PATHS='{}' _ACT_ISOLATED_SOURCE_IDENTITY=null
     local build_only=false skip_checks=false resume=false
+    local prerelease=false prerelease_requested=false
     local dry_run="$DRY_RUN" output_dir_explicit=false
     local parallel_jobs=1
     local resume_selector="latest" resume_run_id="" resume_state="" reuse_completed=false
@@ -13319,6 +13327,7 @@ cmd_fallback() {
                 shift
                 ;;
             --build-only) build_only=true; shift ;;
+            --prerelease) prerelease=true; prerelease_requested=true; shift ;;
             --parallel|-p)
                 parallel_jobs="${DSR_BUILD_PARALLELISM:-2}"; shift ;;
             --parallel=*)
@@ -13356,6 +13365,7 @@ OPTIONS:
     --sbom / --no-sbom     Enable or disable SBOMs for ordinary publication
     --sbom-format <format> Select an SBOM format and enable its generation
     --build-only           Build and verify artifacts without publishing
+    --prerelease           Publish as a prerelease; retain this choice on strict resume
     -p, --parallel[=N]     Build targets concurrently (default bound: 2)
     --jobs <N>             Explicit target concurrency bound (1-32)
     --skip-checks          Skip ordinary quality checks; required checks still run
@@ -13373,6 +13383,10 @@ DESCRIPTION:
     when set, otherwise 2; --jobs selects an explicit bound. The existing host
     scheduler still limits each build host and serializes shared output paths.
     Concurrency never changes the required target matrix or publication checks.
+    --prerelease is explicit; a version suffix does not select prerelease mode.
+    Existing stable releases cannot satisfy --prerelease and are not modified.
+    Ordinary retries without the flag preserve the existing release's mode;
+    strict retries must repeat the original choice, including --prerelease.
     Resume rechecks quality, source identity, and every artifact. For ordinary
     releases it reconciles an existing release or creates one when absent.
     Strict retries recover only this build's preserved original draft creation
@@ -13606,6 +13620,7 @@ EOF
                 --argjson artifacts "$artifacts_count" --argjson build_only "$build_only" \
                 --argjson skip_checks "$skip_checks" --argjson resume "$resume" \
                 --argjson parallel_jobs "$parallel_jobs" \
+                --argjson prerelease "$prerelease" --argjson prerelease_requested "$prerelease_requested" \
                 --arg resume_run_id "$resume_run_id" \
                 --argjson duration "$(($(date +%s) - start_time))" \
                 --argjson rc "$rc" --argjson now_ms "$(_fallback_now_ms)" \
@@ -13636,6 +13651,7 @@ EOF
                   artifacts_count:$artifacts,duration_seconds:$duration,
                   build_only:$build_only,skip_checks:$skip_checks,resume:$resume,
                   parallel_jobs:$parallel_jobs,
+                  prerelease:$prerelease,prerelease_requested:$prerelease_requested,
                   resume_run_id:$resume_run_id}
                 + (if $trigger == "" then {} else {trigger: $trigger} end)
                 + (if $expected_sha == "" then {} else {expected_sha: $expected_sha} end)
@@ -13727,6 +13743,7 @@ EOF
         $isolate_source && log_info "[dry-run] Would materialize $tag ($expected_sha) and its pinned dependencies in private source repositories"
         log_info "[dry-run] Would check, build, verify, and release $tool_name $tag in $output_dir"
         log_info "[dry-run] Target concurrency: $parallel_jobs"
+        log_info "[dry-run] Prerelease: $prerelease (explicit request: $prerelease_requested)"
         _fallback_result 0 plan
         return $?
     fi
@@ -14297,11 +14314,12 @@ EOF
             --arg run "$strict_build_run" --arg artifacts "$strict_artifacts" \
             --arg sha "$(jq -r '.source.git_sha' <<< "$manifest_json")" --arg manifest "$manifest_sha" \
             --arg config "$strict_config" --arg config_sha "$strict_config_sha" \
-            --arg registry "$strict_registry" --arg registry_sha "$strict_registry_sha" '
+            --arg registry "$strict_registry" --arg registry_sha "$strict_registry_sha" \
+            --argjson prerelease "$prerelease" '
             {schema_version:"dsr.strict_fallback_intent.v1",repo:$repo,tool:$tool,tag:$tag,
              build_run_id:$run,artifacts_dir:$artifacts,git_sha:$sha,manifest_sha256:$manifest,
              config:{path:$config,sha256:$config_sha},registry:{path:$registry,sha256:$registry_sha},
-             publish:true}') || return 4
+             publish:true,prerelease:$prerelease}') || return 4
         mkdir -p "$state_dir/releases" || return 4
         [[ -d "$state_dir/releases" && ! -L "$state_dir/releases" ]] || return 4
         for candidate in "$state_dir/releases/dsr-fallback.$strict_build_run."*; do
@@ -14396,6 +14414,7 @@ EOF
             ($p.assets | type == "array" and length > 0 and length < 10000) and
             $m.requested_draft == false and $m.tag_name == $intent.tag and $m.name == $intent.tag and
             $m.target_commitish == $intent.git_sha and ($m.prerelease | type == "boolean") and
+            $m.prerelease == $intent.prerelease and
             ($m.body | type == "string" and test("<!-- dsr-create-nonce:[0-9a-f]{64} -->$")) and
             ($response.id | type == "number" and floor == . and . > 0 and . <= 9007199254740991) and
             $response.draft == true and $response.assets == [] and
@@ -14538,17 +14557,21 @@ EOF
             "$tool_name" "$tag" "$tool_name-$tag-finalized.") || return 7
         jq -e --slurpfile plan /dev/fd/3 \
             --arg repo "$repo" --arg tag "$tag" --argjson id "$strict_release_id" \
+            --argjson prerelease "$prerelease" \
             --arg response "$strict_response" --arg sha "$(jq -r '.sha256' <<< "$strict_response_proof")" '
             $plan[0] as $plan | .record | .schema == "dsr.strict_finalization_receipt.v1" and .status == "success" and
             .repo == $repo and .tag == $tag and .release_id == $id and
             .create_response == $response and .create_response_sha256 == $sha and
-            .plan == $plan and .release.id == $id and .release.draft == false' \
+            .plan == $plan and .release.id == $id and .release.draft == false and
+            .release.prerelease == $prerelease' \
             3<<< "$strict_plan" <<< "$final_proof" >/dev/null || return 7
         _fallback_strict_inputs_match || return 4
         publication_recovery=$(jq -c --arg receipt "$final_receipt" \
             '. + {status:"finalized",finalization_receipt:$receipt}' <<< "$publication_recovery") || return 4
         release_result=$(jq -nc --arg repo "$repo" --arg tag "$tag" --argjson id "$strict_release_id" \
-            '{command:"release",status:"success",exit_code:0,details:{repo:$repo,tag:$tag,release_id:$id,draft:false}}') || return 4
+            --argjson prerelease "$prerelease" '
+            {command:"release",status:"success",exit_code:0,
+             details:{repo:$repo,tag:$tag,release_id:$id,draft:false,prerelease:$prerelease}}') || return 4
     }
 
     if $build_only; then
@@ -14556,6 +14579,7 @@ EOF
     else
         fallback_release_started_ms=$(_fallback_now_ms)
         local -a release_args=("$tool_name" "$version" --artifacts "$output_dir")
+        $prerelease_requested && release_args+=(--prerelease)
         case "$sbom_override" in true) release_args+=(--sbom) ;; false) release_args+=(--no-sbom) ;; esac
         [[ -z "$sbom_format" ]] || release_args+=(--sbom-format "$sbom_format")
         if $resume && [[ "$contract" == null ]]; then
@@ -14630,14 +14654,18 @@ EOF
         # A manual upload can successfully leave an unrelated draft private.
         # Automated fallback must not call that a completed publication or
         # retire its durable watch attempt while downloads remain unavailable.
-        if ! jq -es --arg repo "$repo" --arg tag "$tag" '
+        if ! jq -es --arg repo "$repo" --arg tag "$tag" \
+            --argjson prerelease "$prerelease" --argjson requested "$prerelease_requested" \
+            --argjson strict "$( [[ "$contract" != null ]] && echo true || echo false )" '
             length == 1 and (.[0] | .command == "release" and .status == "success" and
             .exit_code == 0 and .details.repo == $repo and .details.tag == $tag and
             .details.draft == false and
+            (.details.prerelease | type == "boolean") and
+            (if $requested or $strict then .details.prerelease == $prerelease else true end) and
             (.details.release_id | type == "number" and floor == . and . > 0))
         ' <<< "$release_result" >/dev/null 2>&1; then
             release_status="blocked"
-            _fallback_result 7 release "Release was not confirmed public; it may still be a draft"
+            _fallback_result 7 release "Release was not confirmed public with the selected prerelease mode"
             return 7
         fi
         if [[ "$contract" != null ]] && ! jq -e --argjson id "$strict_release_id" \
@@ -14646,6 +14674,7 @@ EOF
             _fallback_result 7 release "Published release differs from the original strict creation custody"
             return 7
         fi
+        prerelease=$(jq -r '.details.prerelease' <<< "$release_result") || return 4
         release_status="success"
     fi
     # Explicitly check release of the lock before reporting success. The EXIT

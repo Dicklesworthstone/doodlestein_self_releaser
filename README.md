@@ -1254,6 +1254,7 @@ Full pipeline: check → build → release.
 ```bash
 dsr fallback --repo ntm --version v1.2.3        # One command does it all
 dsr fallback --repo ntm --version v1.2.3 --jobs 3  # Build up to three targets concurrently
+dsr fallback --repo ntm --version v1.3.0-rc.1 --prerelease
 ```
 
 Target builds run serially by default. `--parallel` (or `-p`) selects two targets,
@@ -1263,6 +1264,15 @@ host capacity and shared output paths. Resume may select a new concurrency bound
 while retaining verified completed targets. The complete configured target set,
 quality checks and publication requirements still apply. JSON results and
 dry-run plans report the selected bound in `details.parallel_jobs`.
+
+Add `--prerelease` to require prerelease publication. A version suffix such as
+`-rc.1` does not select this mode automatically. Both `fallback` and `release`
+refuse an explicit prerelease request against an existing stable release before
+uploading assets. Ordinary retries without the flag preserve an existing
+release's mode. JSON plans and results report `details.prerelease_requested`;
+`details.prerelease` records the selected mode, or the observed mode after
+successful publication. `--build-only --prerelease` records the selection without
+publishing.
 
 Automation can add `--expected-sha <full-commit>` to bind the operation to the
 workflow run's source. The clean checkout, local version tag and build manifest
@@ -1279,6 +1289,13 @@ unrelated drafts, or a lost original creation response. Preserve
 `$DSR_STATE_DIR/releases` and the artifacts. The
 [strict recovery guide](docs/NATIVE_RELEASE_RECOVERY.md#resume-an-interrupted-strict-fallback-publication)
 describes the supported configuration and recovery evidence.
+
+Strict retry also requires the original prerelease selection: repeat
+`--prerelease` when the interrupted attempt used it. Adding or omitting it on
+retry cannot change that attempt's release mode. Strict fallback custody created
+before the prerelease choice was recorded is refused by automatic recovery;
+use the existing explicit `dsr release finalize` command with its original
+`--create-response` file to verify and finalize that older draft.
 
 ### `dsr watch`
 

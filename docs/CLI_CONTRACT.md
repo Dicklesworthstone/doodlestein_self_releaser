@@ -267,6 +267,22 @@ download URLs use the release tag and percent-encoded filenames; draft assets
 remain subject to GitHub's draft access rules until publication.
 
 #### `dsr fallback` details
+
+`--prerelease` explicitly selects prerelease publication; version suffixes do
+not select it implicitly. Plans and outcomes include boolean
+`prerelease_requested` and `prerelease` fields. The first records whether the
+flag was supplied; the second records the selected mode before publication and
+the observed mode after success. Ordinary retries without the flag preserve
+an existing release's mode. Explicit prerelease requests against existing
+stable releases return exit 7 before asset upload. Public success requires a
+boolean prerelease receipt consistent with the explicit selection.
+
+Strict fallback binds the selected mode in its private publication intent,
+checks it against the original draft creation response, and verifies it again
+in the final public receipt. `--resume=RUN_UUID` must repeat the original
+`--prerelease` selection. A changed choice or older intent without the field
+returns exit 4 before recovery uploads. Older custody remains available to the
+existing explicit `dsr release finalize --create-response ...` path.
 Success:
 ```json
 {
@@ -2779,7 +2795,7 @@ Full fallback pipeline: check -> build -> release.
 
 ```bash
 dsr fallback --repo <name> [--version <tag>]
-             [--parallel[=N] | --jobs <N>] [--resume[=RUN_ID]]
+             [--parallel[=N] | --jobs <N>] [--resume[=RUN_ID]] [--prerelease]
 ```
 
 This command coordinates quality checks, builds, verification, signing and
