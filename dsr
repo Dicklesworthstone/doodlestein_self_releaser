@@ -1976,6 +1976,7 @@ _WATCH_BACKOFF_MAX=3600      # 1 hour max backoff
 _WATCH_MAX_ATTEMPTS=3
 _WATCH_RETRY_DELAY=60
 _WATCH_MAX_CONCURRENT=2
+_WATCH_PARALLEL_JOBS=1
 
 # Internal state
 _WATCH_RUNNING=false
@@ -2034,6 +2035,7 @@ _watch_load_triggered() {
                     (.started_epoch | integer and . >= 0) and
                     (.next_retry_at == null or (.next_retry_at | integer and . >= 0)) and
                     ((has("isolate_source") | not) or (.isolate_source | type == "boolean")) and
+                    ((has("parallel_jobs") | not) or (.parallel_jobs | integer and . >= 1 and . <= 32)) and
                     (.resume_run_id | type == "string" and
                         (. == "" or test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")))
                 )
@@ -2096,7 +2098,8 @@ _watch_fallback_result_evidence() (
             .command == "fallback" and .exit_code == $observed and
             .status == (if $observed == 0 then "success" elif $observed == 1 then "partial" else "error" end) and
             (.details | type == "object" and
-                {tool,repo,version,expected_sha,output_dir,run_id,watch_admission,build_only} == $identity and
+                ({tool,repo,version,expected_sha,output_dir,run_id,watch_admission,build_only} +
+                    (if ($identity | has("parallel_jobs")) then {parallel_jobs} else {} end)) == $identity and
                 (.watch_admission | type == "object") and
                 (.phase | type == "string" and length > 0) and
                 (.phases | type == "object" and
@@ -2134,7 +2137,8 @@ _watch_retry_result_verified() (
     identity=$(jq -c --arg run "$run_id" --arg output "$_WATCH_STATE_DIR/watch-artifacts/$run_id" '
         {tool,repo,version,expected_sha:.head_sha,output_dir:$output,
          run_id:("watch-" + $run + "-" + (.attempt | tostring)),
-         watch_admission,build_only:false}' <<< "$record") || return 1
+         watch_admission,build_only:false} +
+         (if has("parallel_jobs") then {parallel_jobs} else {} end)' <<< "$record") || return 1
     evidence=$(_watch_fallback_result_evidence "$directory/result.json" "$identity" "$rc") || return 1
     [[ "$(jq -r .sha256 <<< "$evidence")" == "$(jq -r .result_sha256 <<< "$receipt")" ]] || return 1
     jq -e '.publication_complete == false' <<< "$evidence" >/dev/null
@@ -2171,7 +2175,8 @@ _watch_reconcile_attempts() {
                 --arg output "$_WATCH_STATE_DIR/watch-artifacts/$run_id" '
                 {tool,repo,version,expected_sha:.head_sha,output_dir:$output,
                  run_id:("watch-" + $run + "-" + (.attempt | tostring)),
-                 watch_admission,build_only:false}' <<< "$record") || return 4
+                 watch_admission,build_only:false} +
+                 (if has("parallel_jobs") then {parallel_jobs} else {} end)' <<< "$record") || return 4
             result_valid=false
             result_evidence=""
             if jq -e '.result_status == "valid" and
@@ -2261,7 +2266,8 @@ _watch_run_attempt() (
     local run_id="$1" attempt="$2" directory="$3" tool="$4" version="$5" sha="$6" output="$7" resume="$8"
     # The launcher acquired this descriptor before publishing the journal.
     # Keep it inherited by fallback and its descendants until they all exit.
-    local attempt_fd="$9" isolate_source="${10}" watch_admission="${11}" rc=0 temporary finished
+    local attempt_fd="$9" isolate_source="${10}" watch_admission="${11}" parallel_jobs="${12}"
+    local rc=0 temporary finished
     local result_identity result_evidence result_status=invalid result_sha="" result_error=""
     # The worker must outlive --once without keeping the watcher mutex held.
     _watch_release_lock
@@ -2269,21 +2275,23 @@ _watch_run_attempt() (
     trap 'exit 5' HUP INT TERM
     [[ "$attempt_fd" =~ ^[0-9]+$ ]] || return 4
     [[ "$isolate_source" == true || "$isolate_source" == false ]] || return 4
+    [[ "$parallel_jobs" =~ ^([1-9]|[12][0-9]|3[0-2])$ ]] || return 4
     # A queued workflow names a release commit, not the developer checkout's
     # current HEAD. Materialize that commit privately so unattended fallback
     # works after the checkout advances or acquires staged/untracked work.
     local -a args=(--non-interactive --json fallback "$tool" --version "$version" --expected-sha "$sha")
     [[ "$isolate_source" != true ]] || args+=(--isolate-source)
-    args+=(--output-dir "$output" --watch-admission "$watch_admission")
+    args+=(--output-dir "$output" --watch-admission "$watch_admission" --jobs "$parallel_jobs")
     [[ -z "$resume" ]] || args+=("--resume=$resume")
     export DSR_RUN_ID="watch-$run_id-$attempt"
     # The worker reports the terminal event only after its completion receipt
     # is durable. Suppress the fallback command's earlier terminal event.
     DSR_NOTIFY_ENABLED=false DSR_NOTIFY_METHODS=none "$0" "${args[@]}" > "$directory/result.json" || rc=$?
     result_identity=$(jq -nc --arg tool "$tool" --arg version "$version" --arg sha "$sha" \
-        --arg output "$output" --arg run "$DSR_RUN_ID" --argjson admission "$watch_admission" '
+        --arg output "$output" --arg run "$DSR_RUN_ID" --argjson admission "$watch_admission" \
+        --argjson parallel_jobs "$parallel_jobs" '
         {tool:$tool,repo:$admission.repo,version:$version,expected_sha:$sha,output_dir:$output,
-         run_id:$run,watch_admission:$admission,build_only:false}') || return 4
+         run_id:$run,watch_admission:$admission,build_only:false,parallel_jobs:$parallel_jobs}') || return 4
     if result_evidence=$(_watch_fallback_result_evidence "$directory/result.json" "$result_identity" "$rc"); then
         result_status=valid
         result_sha=$(jq -r .sha256 <<< "$result_evidence") || return 4
@@ -2333,9 +2341,10 @@ _watch_run_attempt() (
 
 _watch_launch_attempt() (
     local run_id="$1" tool="$2" repo="$3" version="$4" sha="$5" attempt="$6" resume="$7"
-    local isolate_source="$8" watch_admission="$9"
+    local isolate_source="$8" watch_admission="$9" parallel_jobs="${10}"
     local state directory now timestamp attempt_fd output="$_WATCH_STATE_DIR/watch-artifacts/$run_id"
     [[ "$isolate_source" == true || "$isolate_source" == false ]] || return 4
+    [[ "$parallel_jobs" =~ ^([1-9]|[12][0-9]|3[0-2])$ ]] || return 4
     _watch_validate_admission_json "$watch_admission" "$repo" "$version" "$sha" || return 4
     mkdir -p -- "$_WATCH_STATE_DIR/watch-attempts" "$_WATCH_STATE_DIR/watch-artifacts" || return 4
     [[ ! -L "$_WATCH_STATE_DIR/watch-attempts" && ! -L "$_WATCH_STATE_DIR/watch-artifacts" ]] || return 4
@@ -2348,11 +2357,11 @@ _watch_launch_attempt() (
     state=$(jq -c --arg id "$run_id" --arg tool "$tool" --arg repo "$repo" --arg version "$version" \
         --arg sha "$sha" --arg directory "${directory##*/}" --arg resume "$resume" --arg timestamp "$timestamp" \
         --argjson attempt "$attempt" --argjson now "$now" --argjson isolate_source "$isolate_source" \
-        --argjson admission "$watch_admission" '
+        --argjson admission "$watch_admission" --argjson parallel_jobs "$parallel_jobs" '
         del(.pending[$id]) | .runs[$id] = $timestamp | .last_check = $timestamp |
         .attempts[$id] = {attempt:$attempt,attempt_id:$directory,tool:$tool,repo:$repo,version:$version,
             head_sha:$sha,status:"running",started_epoch:$now,next_retry_at:null,resume_run_id:$resume,
-            isolate_source:$isolate_source,watch_admission:$admission}
+            isolate_source:$isolate_source,watch_admission:$admission,parallel_jobs:$parallel_jobs}
     ' <<< "$state") || return 4
     _watch_save_triggered "$state" || return 4
     local fallback_log="$_WATCH_STATE_DIR/fallback-${run_id}.log"
@@ -2368,7 +2377,7 @@ _watch_launch_attempt() (
         # Close in the background supervisor too, before invoking the worker
         # subshell; otherwise that waiting supervisor would retain the mutex.
         _watch_release_lock
-        _watch_run_attempt "$run_id" "$attempt" "$directory" "$tool" "$version" "$sha" "$output" "$resume" "$attempt_fd" "$isolate_source" "$watch_admission"
+        _watch_run_attempt "$run_id" "$attempt" "$directory" "$tool" "$version" "$sha" "$output" "$resume" "$attempt_fd" "$isolate_source" "$watch_admission" "$parallel_jobs"
     ) >> "$fallback_log" 2>&1 &
     log_info "Fallback started (PID: $!, attempt: $attempt, log: $fallback_log)"
 )
@@ -2850,7 +2859,7 @@ _watch_iteration() {
             _WATCH_DEFERRED_COUNT=$((_WATCH_DEFERRED_COUNT + 1))
             log_info "Deferring fallback for $tool_name (run $run_id): $active_count/$_WATCH_MAX_CONCURRENT watch slots occupied"
         elif $dry_run; then
-            log_info "[DRY RUN] Would trigger fallback for $tool_name${fallback_args[*]:+ ${fallback_args[*]}} (run $run_id)"
+            log_info "[DRY RUN] Would trigger fallback for $tool_name${fallback_args[*]:+ ${fallback_args[*]}} (run $run_id); --jobs $_WATCH_PARALLEL_JOBS"
             triggered_count=$((triggered_count + 1))
             active_count=$((active_count + 1))
         else
@@ -2877,7 +2886,7 @@ _watch_iteration() {
                 continue
             fi
             log_info "Starting fallback for $tool_name (run $run_id, attempt $attempt)..."
-            _watch_launch_attempt "$run_id" "$tool_name" "$repo" "$ref" "$sha" "$attempt" "$resume" "$isolate_source" "$watch_admission" || return $?
+            _watch_launch_attempt "$run_id" "$tool_name" "$repo" "$ref" "$sha" "$attempt" "$resume" "$isolate_source" "$watch_admission" "$_WATCH_PARALLEL_JOBS" || return $?
             state=$(_watch_load_triggered) || return 4
             triggered_count=$((triggered_count + 1))
             active_count=$((active_count + 1))
@@ -2902,6 +2911,7 @@ cmd_watch() {
     local _WATCH_LOCK_FD="" _WATCH_RUNNING=false
     local _WATCH_MAX_ATTEMPTS=3 _WATCH_RETRY_DELAY=60
     local _WATCH_MAX_CONCURRENT=2 _WATCH_DEFERRED_COUNT=0
+    local _WATCH_PARALLEL_JOBS=1
     local interval=$_WATCH_DEFAULT_INTERVAL
     local daemon_mode=false
     # The global --dry-run (dsr -n watch) never starts a fallback either.
@@ -2921,6 +2931,21 @@ cmd_watch() {
             --auto-fallback)
                 auto_fallback=true
                 shift
+                ;;
+            --parallel|-p)
+                _WATCH_PARALLEL_JOBS="${DSR_BUILD_PARALLELISM:-2}"
+                shift
+                ;;
+            --parallel=*)
+                _WATCH_PARALLEL_JOBS="${1#*=}"
+                shift
+                ;;
+            --jobs)
+                [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || {
+                    log_error "--jobs requires a value"; return 4;
+                }
+                _WATCH_PARALLEL_JOBS="$2"
+                shift 2
                 ;;
             --max-attempts|--retry-delay|--max-concurrent)
                 [[ $# -ge 2 ]] || { log_error "$1 requires a value"; return 4; }
@@ -2965,6 +2990,8 @@ OPTIONS:
     --max-attempts <N>     Maximum fallback attempts per run (1-10, default: 3)
     --retry-delay <sec>    Initial retry cooldown (1-3600, default: 60)
     --max-concurrent <N>   Active watcher fallbacks at once (1-32, default: 2)
+    -p, --parallel[=N]     Build targets concurrently within each fallback
+    --jobs <N>            Target build concurrency per fallback (1-32, default: 1)
     --daemon, -d           Run in background (daemon mode)
     --dry-run, -n          Check but don't trigger fallbacks (also the global -n)
     --once, -1             Single check and exit
@@ -2987,6 +3014,12 @@ BEHAVIOR:
     - A completed upstream failure can start a pending release or resume a
       failed fallback after leaving the queue; active/unknown runs cannot
     - Exact upstream success/cancellation retires never-started candidates
+    - Target builds are serial unless --parallel or --jobs is selected;
+      bare --parallel uses DSR_BUILD_PARALLELISM, defaulting to 2
+    - --max-concurrent bounds release pipelines independently of --jobs;
+      each build still obeys its host-capacity and complete-matrix checks
+    - New attempts and retries use the current target bound; running workers
+      retain the bound recorded when they were started
     - Never replays successful, interrupted, or unknown-outcome attempts
     - --once uses the same lock and recovery state as continuous mode
     - Uses jittered intervals to avoid thundering herd
@@ -3002,6 +3035,8 @@ STATE FILES:
 EXAMPLES:
     dsr watch                         Report throttled runs (foreground)
     dsr watch --auto-fallback         Also build and release on throttle
+    dsr watch --auto-fallback --max-concurrent 2 --jobs 4
+                                      Up to 2 releases, 4 target builds each
     dsr watch --once                  Single check and exit
     dsr watch --dry-run --auto-fallback   Show which fallbacks would start
     dsr watch --interval 300          Poll every five minutes
@@ -3038,6 +3073,12 @@ EOF
     fi
     if [[ ! "$_WATCH_MAX_CONCURRENT" =~ ^([1-9]|[12][0-9]|3[0-2])$ ]]; then
         log_error "Watch requires 1-32 concurrent fallbacks"
+        return 4
+    fi
+    # Validate text before arithmetic, preflight, locks or child launch. An
+    # inherited build default applies only when bare --parallel selects it.
+    if [[ ! "$_WATCH_PARALLEL_JOBS" =~ ^([1-9]|[12][0-9]|3[0-2])$ ]]; then
+        log_error "Parallel job count must be an integer from 1 through 32"
         return 4
     fi
 
@@ -3114,6 +3155,7 @@ EOF
                 --argjson auto_fallback "$auto_fallback" \
                 --argjson dry_run "$dry_run" \
                 --argjson max_concurrent "$_WATCH_MAX_CONCURRENT" \
+                --argjson parallel_jobs "$_WATCH_PARALLEL_JOBS" \
                 --argjson deferred "$_WATCH_DEFERRED_COUNT" '
                 (if length == 1 and (.[0] == null or (.[0] | type == "object"))
                  then .[0] else error("exactly one watcher state required") end) as $state |
@@ -3122,7 +3164,8 @@ EOF
                      max_concurrent:$max_concurrent, deferred_count:$deferred,
                      active_attempts:([($state.attempts // {})[] |
                         select(.status == "starting" or .status == "running")] | length)}
-                 else {mode:$mode, iterations:$iterations, triggered_state:$state} end) |
+                 else {mode:$mode, iterations:$iterations, triggered_state:$state} end) +
+                {parallel_jobs:$parallel_jobs} |
                 if $error == "" then . else . + {error:$error} end' <<< "$state"); then
             result=4
             log_error "Cannot assemble watcher result"

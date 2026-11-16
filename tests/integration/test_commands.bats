@@ -963,7 +963,7 @@ _routing_watch() {
 #!/usr/bin/env bash
 [[ "${1:-}" != --dry-run ]] || shift
 case "$1" in
-    doctor) exit 0 ;;
+    doctor) : > "$TEST_TMPDIR/watch-doctor.started"; exit 0 ;;
     --json)
         [[ "$2" == check ]] || exit 99
         : > "$TEST_TMPDIR/watch-check.started"
@@ -1004,23 +1004,25 @@ case "$1" in
         # real arguments supply invocation identity; no watcher state is read
         # or manufactured by the fixture.
         tool="$4"; shift 4
-        version="" source="" output="" admission=""
+        version="" source="" output="" admission="" parallel_jobs=1
         while (($#)); do
             case "$1" in
                 --version) version="$2"; shift 2 ;;
                 --expected-sha) source="$2"; shift 2 ;;
                 --output-dir) output="$2"; shift 2 ;;
                 --watch-admission) admission="$2"; shift 2 ;;
+                --jobs) parallel_jobs="$2"; shift 2 ;;
                 --isolate-source|--resume=*) shift ;;
                 *) exit 99 ;;
             esac
         done
         rc="${DSR_WATCH_FIXTURE_STATUS:-0}"
         receipt=$(jq -nc --arg tool "$tool" --arg version "$version" --arg sha "$source" \
-            --arg output "$output" --arg run "$DSR_RUN_ID" --argjson admission "$admission" --argjson rc "$rc" '
+            --arg output "$output" --arg run "$DSR_RUN_ID" --argjson admission "$admission" --argjson rc "$rc" \
+            --argjson parallel_jobs "$parallel_jobs" '
             {command:"fallback",status:(if $rc == 0 then "success" elif $rc == 1 then "partial" else "error" end),
              exit_code:$rc,details:{tool:$tool,repo:$admission.repo,version:$version,expected_sha:$sha,
-               output_dir:$output,run_id:$run,build_only:false,watch_admission:$admission,
+               output_dir:$output,run_id:$run,build_only:false,watch_admission:$admission,parallel_jobs:$parallel_jobs,
                phase:(if $rc == 0 then "complete" else "build" end),
                phases:{release:(if $rc == 0 then "success" else "blocked" end)}}}') || exit 99
         case "${DSR_WATCH_FIXTURE_RECEIPT:-valid}" in
@@ -1034,6 +1036,9 @@ case "$1" in
             wrong-output) receipt=$(jq '.details.output_dir += "/another"' <<< "$receipt") ;;
             wrong-run) receipt=$(jq '.details.run_id="another-run"' <<< "$receipt") ;;
             wrong-admission) receipt=$(jq '.details.watch_admission.run_attempt += 1' <<< "$receipt") ;;
+            wrong-jobs) receipt=$(jq '.details.parallel_jobs += 1' <<< "$receipt") ;;
+            missing-jobs) receipt=$(jq 'del(.details.parallel_jobs)' <<< "$receipt") ;;
+            string-jobs) receipt=$(jq '.details.parallel_jobs |= tostring' <<< "$receipt") ;;
             wrong-exit) receipt=$(jq '.exit_code += 1' <<< "$receipt") ;;
             wrong-status) receipt=$(jq '.status="error"' <<< "$receipt") ;;
             unpublished) receipt=$(jq '.details.phases.release="blocked"' <<< "$receipt") ;;
@@ -2188,22 +2193,24 @@ esac
 # An ordinary build refusal has a complete error report, unlike a crash.
 # Bind that report to the actual child invocation before returning exit 6.
 tool="$1"; shift
-version="" source="" output="" admission=""
+version="" source="" output="" admission="" parallel_jobs=1
 while (($#)); do
     case "$1" in
         --version) version="$2"; shift 2 ;;
         --expected-sha) source="$2"; shift 2 ;;
         --output-dir) output="$2"; shift 2 ;;
         --watch-admission) admission="$2"; shift 2 ;;
+        --jobs) parallel_jobs="$2"; shift 2 ;;
         --isolate-source|--resume=*) shift ;;
         *) exit 99 ;;
     esac
 done
 jq -nc --arg tool "$tool" --arg version "$version" --arg sha "$source" \
-    --arg output "$output" --arg run "$DSR_RUN_ID" --argjson admission "$admission" '
+    --arg output "$output" --arg run "$DSR_RUN_ID" --argjson admission "$admission" \
+    --argjson parallel_jobs "$parallel_jobs" '
     {command:"fallback",status:"error",exit_code:6,
      details:{tool:$tool,repo:$admission.repo,version:$version,expected_sha:$sha,
-       output_dir:$output,run_id:$run,build_only:false,watch_admission:$admission,
+       output_dir:$output,run_id:$run,build_only:false,watch_admission:$admission,parallel_jobs:$parallel_jobs,
        phase:"build",phases:{release:"blocked"}}}' || exit 99
 exit 6
 EOF
@@ -3080,6 +3087,195 @@ EOF
     done
     run _routing_watch "$(_watch_run_json)" --auto-fallback --max-concurrent
     assert_equal "4" "$status"
+}
+
+@test "watch target parallelism preserves serial defaults even with an invalid ambient build bound" {
+    harness_create_config
+    _watch_configure_ntm
+    DSR_BUILD_PARALLELISM=invalid run --separate-stderr _routing_watch "$(_watch_run_json)" --auto-fallback
+    assert_equal 0 "$status"
+    jq -e '.details | .parallel_jobs == 1 and .max_concurrent == 2 and
+        .triggered_state.attempts["12345"].parallel_jobs == 1' <<< "$output"
+    _watch_completed
+    jq -Rse 'split("\u0000") | .[index("--jobs") + 1] == "1"' "$TEST_TMPDIR/fallback.args"
+    local directory
+    directory="$DSR_STATE_DIR/watch-attempts/$(jq -r '.attempts["12345"].attempt_id' "$DSR_STATE_DIR/triggered.json")"
+    jq -e '.details.parallel_jobs == 1' "$directory/result.json"
+    jq -e '.result_status == "valid"' "$directory/completion.json"
+}
+
+@test "watch target parallelism plans aliases and explicit bounds without launching or writing state" {
+    harness_create_config
+    _watch_configure_ntm
+    local option expected
+    for option in --parallel -p --parallel=32; do
+        expected=2
+        [[ "$option" != --parallel=32 ]] || expected=32
+        DSR_BUILD_PARALLELISM='' run --separate-stderr _routing_watch "$(_watch_run_json)" \
+            --auto-fallback --dry-run "$option"
+        assert_equal 0 "$status"
+        jq -e --argjson expected "$expected" '.details | .parallel_jobs == $expected and
+            .max_concurrent == 2 and .active_attempts == 0 and .dry_run == true' <<< "$output"
+        [[ "$stderr" == *"--jobs $expected"* ]]
+    done
+    DSR_BUILD_PARALLELISM=6 run --separate-stderr _routing_watch "$(_watch_run_json)" \
+        --auto-fallback --dry-run --parallel
+    assert_equal 0 "$status"
+    jq -e '.details.parallel_jobs == 6' <<< "$output"
+    DSR_BUILD_PARALLELISM=invalid run --separate-stderr _routing_watch "$(_watch_run_json)" \
+        --auto-fallback --dry-run --parallel=32 --jobs 3
+    assert_equal 0 "$status"
+    jq -e '.details.parallel_jobs == 3' <<< "$output"
+    DSR_BUILD_PARALLELISM=5 run --separate-stderr _routing_watch "$(_watch_run_json)" \
+        --auto-fallback --dry-run --jobs 3 --parallel
+    assert_equal 0 "$status"
+    jq -e '.details.parallel_jobs == 5' <<< "$output"
+    [[ ! -e "$DSR_STATE_DIR/triggered.json" && ! -e "$DSR_STATE_DIR/watch.lock" &&
+       ! -e "$DSR_STATE_DIR/watch-attempts" && ! -e "$TEST_TMPDIR/fallback.args" ]]
+}
+
+@test "watch target parallelism records continuous report-only planning without authorizing fallback" {
+    harness_create_config
+    _watch_configure_ntm
+    DSR_WATCH_FIXTURE_CONTINUOUS=1 run --separate-stderr _routing_watch "$(_watch_run_json)" --dry-run --jobs 4
+    assert_equal 0 "$status"
+    jq -e '.details | .mode == "continuous" and .iterations == 1 and .parallel_jobs == 4 and
+        .triggered_state.attempts == {}' <<< "$output"
+    [[ ! -e "$TEST_TMPDIR/fallback.args" && ! -e "$DSR_STATE_DIR/triggered.json" && ! -e "$DSR_STATE_DIR/watch.lock" ]]
+}
+
+@test "watch target parallelism keeps release admission independent of each child target bound" {
+    harness_create_config
+    _watch_configure_ntm
+    DSR_WATCH_FIXTURE_WAIT="$TEST_TMPDIR/finish-child" run --separate-stderr _routing_watch \
+        "$(_watch_multiple_runs_json)" --auto-fallback --max-concurrent 1 --jobs 4
+    local observed_status=$status observed_output=$output
+    touch "$TEST_TMPDIR/finish-child"
+    _watch_completed
+    assert_equal 0 "$observed_status"
+    jq -e '.details | .parallel_jobs == 4 and .max_concurrent == 1 and
+        .active_attempts == 1 and .deferred_count == 2 and
+        (.triggered_state.attempts | keys == ["12345"]) and
+        .triggered_state.attempts["12345"].parallel_jobs == 4 and
+        (.triggered_state.pending | keys == ["12346","12347"])' <<< "$observed_output"
+    jq -Rse 'split("\u0000") | .[index("--jobs") + 1] == "4" and
+        .[index("--expected-sha") + 1] == ("1" * 40) and
+        .[index("--version") + 1] == "v1.2.3" and
+        (.[index("--watch-admission") + 1] | fromjson | .run_id == "12345" and .run_attempt == 1)' \
+        "$TEST_TMPDIR/fallback.args"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+}
+
+@test "watch target parallelism rejects malformed and overflowing bounds before preflight or state" {
+    harness_create_config
+    local value option
+    for value in 0 33 -1 01 1.5 invalid '' 18446744073709551617 '1+1' 1e1; do
+        for option in --jobs --parallel=; do
+            if [[ "$option" == --jobs ]]; then
+                run _routing_watch "$(_watch_run_json)" --auto-fallback --jobs "$value"
+            else
+                run _routing_watch "$(_watch_run_json)" --auto-fallback "--parallel=$value"
+            fi
+            assert_equal 4 "$status"
+            [[ ! -e "$TEST_TMPDIR/watch-doctor.started" && ! -e "$TEST_TMPDIR/watch-check.started" &&
+               ! -e "$TEST_TMPDIR/fallback.args" && ! -e "$DSR_STATE_DIR/triggered.json" &&
+               ! -e "$DSR_STATE_DIR/watch.lock" ]]
+        done
+    done
+    run _routing_watch "$(_watch_run_json)" --auto-fallback --jobs
+    assert_equal 4 "$status"
+    DSR_BUILD_PARALLELISM=33 run _routing_watch "$(_watch_run_json)" --auto-fallback --parallel
+    assert_equal 4 "$status"
+    [[ ! -e "$TEST_TMPDIR/watch-doctor.started" && ! -e "$TEST_TMPDIR/fallback.args" ]]
+}
+
+@test "watch target parallelism retunes a retry while preserving its exact partial checkpoint and prior receipt" {
+    harness_create_config
+    _watch_configure_ntm
+    local sha check_json checkpoint=12345678-1234-1234-1234-123456789abc first_directory
+    sha=$(_watch_checkpoint_source_sha)
+    check_json=$(_watch_run_json "$sha")
+    DSR_WATCH_FIXTURE_STATUS=1 run _routing_watch "$check_json" --auto-fallback --retry-delay 1 --jobs 4
+    assert_equal 0 "$status"
+    _watch_completed
+    first_directory="$DSR_STATE_DIR/watch-attempts/$(jq -r '.attempts["12345"].attempt_id' "$DSR_STATE_DIR/triggered.json")"
+    cp "$first_directory/result.json" "$TEST_TMPDIR/first-result.json"
+    cp "$first_directory/completion.json" "$TEST_TMPDIR/first-completion.json"
+    _watch_seed_mixed_checkpoint "$checkpoint" "$DSR_STATE_DIR/watch-artifacts/12345" "$sha"
+    cp "$DSR_STATE_DIR/builds/ntm/v1.2.3/$checkpoint/state.json" "$TEST_TMPDIR/checkpoint-before.json"
+    sleep 1
+    run --separate-stderr _routing_watch "$check_json" --auto-fallback --retry-delay 1 --parallel=2
+    assert_equal 0 "$status"
+    _watch_completed
+    jq -e --arg sha "$sha" --arg checkpoint "$checkpoint" '.attempts["12345"] |
+        .attempt == 2 and .parallel_jobs == 2 and .resume_run_id == $checkpoint and
+        .head_sha == $sha and .isolate_source == true and .watch_admission.run_id == "12345"' \
+        "$DSR_STATE_DIR/triggered.json"
+    jq -Rse --arg resume "--resume=$checkpoint" 'split("\u0000") as $args |
+        [$args | to_entries[] | select(.value == "--jobs") | $args[.key + 1]] == ["4","2"] and
+        ($args | index($resume)) != null' "$TEST_TMPDIR/fallback.args"
+    cmp "$TEST_TMPDIR/checkpoint-before.json" "$DSR_STATE_DIR/builds/ntm/v1.2.3/$checkpoint/state.json"
+    cmp "$TEST_TMPDIR/first-result.json" "$first_directory/result.json"
+    cmp "$TEST_TMPDIR/first-completion.json" "$first_directory/completion.json"
+}
+
+@test "watch target parallelism can recover an older journal without a scheduling field" {
+    harness_create_config
+    _watch_configure_ntm
+    local check_json directory original_hash
+    check_json=$(_watch_run_json)
+    DSR_WATCH_FIXTURE_STATUS=6 run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal 0 "$status"
+    _watch_completed
+    directory="$DSR_STATE_DIR/watch-attempts/$(jq -r '.attempts["12345"].attempt_id' "$DSR_STATE_DIR/triggered.json")"
+    # Explicit historical fixture: the old worker report and journal did not
+    # record target scheduling. Retain all source, exit and custody fields.
+    jq 'del(.details.parallel_jobs)' "$directory/result.json" > "$TEST_TMPDIR/legacy-result.json"
+    mv "$TEST_TMPDIR/legacy-result.json" "$directory/result.json"
+    original_hash=$(sha256sum "$directory/result.json" | awk '{print $1}')
+    jq --arg digest "$original_hash" '.result_sha256=$digest' "$directory/completion.json" > "$TEST_TMPDIR/legacy-completion.json"
+    mv "$TEST_TMPDIR/legacy-completion.json" "$directory/completion.json"
+    jq 'del(.attempts["12345"].parallel_jobs)' "$DSR_STATE_DIR/triggered.json" > "$TEST_TMPDIR/legacy-journal.json"
+    mv "$TEST_TMPDIR/legacy-journal.json" "$DSR_STATE_DIR/triggered.json"
+    cp "$directory/result.json" "$TEST_TMPDIR/legacy-result-before.json"
+    cp "$directory/completion.json" "$TEST_TMPDIR/legacy-completion-before.json"
+    sleep 1
+    run _routing_watch "$check_json" --auto-fallback --retry-delay 1 --jobs 3
+    assert_equal 0 "$status"
+    _watch_completed
+    jq -e '.attempts["12345"] | .attempt == 2 and .parallel_jobs == 3 and .head_sha == ("1" * 40)' \
+        "$DSR_STATE_DIR/triggered.json"
+    cmp "$TEST_TMPDIR/legacy-result-before.json" "$directory/result.json"
+    cmp "$TEST_TMPDIR/legacy-completion-before.json" "$directory/completion.json"
+}
+
+@test "watch target parallelism refuses invalid retained bounds without rewriting history" {
+    harness_create_config
+    _watch_configure_ntm
+    _watch_large_history
+    cp "$DSR_STATE_DIR/triggered.json" "$TEST_TMPDIR/history-valid.json"
+    local value
+    for value in 0 33 1.5 '"2"' null true; do
+        jq --argjson jobs "$value" '.attempts["100499"].parallel_jobs=$jobs' \
+            "$TEST_TMPDIR/history-valid.json" > "$DSR_STATE_DIR/triggered.json"
+        cp "$DSR_STATE_DIR/triggered.json" "$TEST_TMPDIR/invalid-bound.json"
+        run --separate-stderr _routing_watch "$(_watch_run_json)" --auto-fallback
+        assert_equal 4 "$status"
+        cmp "$TEST_TMPDIR/invalid-bound.json" "$DSR_STATE_DIR/triggered.json"
+        [[ ! -e "$TEST_TMPDIR/fallback.args" && ! -e "$TEST_TMPDIR/watch-check.started" ]]
+    done
+}
+
+@test "watch target parallelism binds each completed fallback to its scheduled bound" {
+    _watch_refuse_completion_receipt wrong-jobs
+}
+
+@test "watch target parallelism refuses a new fallback result missing its scheduled bound" {
+    _watch_refuse_completion_receipt missing-jobs
+}
+
+@test "watch target parallelism refuses a string instead of a numeric result bound" {
+    _watch_refuse_completion_receipt string-jobs
 }
 
 @test "watch recovery refuses source identity changes and legacy unknown outcomes" {

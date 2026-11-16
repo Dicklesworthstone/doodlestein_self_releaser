@@ -543,6 +543,7 @@ Continuous monitoring daemon.
 
 ```bash
 dsr watch [--interval <seconds>] [--auto-fallback] [--notify <method>]
+          [--max-concurrent <N>] [--parallel[=N] | --jobs <N>]
 ```
 
 | Flag | Default | Description |
@@ -552,8 +553,36 @@ dsr watch [--interval <seconds>] [--auto-fallback] [--notify <method>]
 | `--max-attempts` | 3 | Maximum attempts per observed run, from 1 through 10 |
 | `--retry-delay` | 60 | Initial retry cooldown in seconds, from 1 through 3600 |
 | `--max-concurrent` | 2 | Active watcher fallback pipelines, from 1 through 32 |
+| `--parallel`, `-p` | false | Concurrent target builds within each fallback; bare flag uses `DSR_BUILD_PARALLELISM` or 2 |
+| `--parallel=N`, `--jobs N` | 1 | Explicit target concurrency per fallback, from 1 through 32 |
 | `--once` | false | Check once using the same exclusive lock and recovery journal |
 | `--notify` | none | Notification: slack\|discord\|desktop\|none |
+
+Target scheduling is serial by default, including when `DSR_BUILD_PARALLELISM`
+is set. Only bare `--parallel` / `-p` selects that environment default; unset or
+empty defaults to 2. An explicit value must be a canonical integer from 1
+through 32. Repeated scheduling options use the last value, matching `build`
+and `fallback`. Invalid or overflowing values return `4` before preflight,
+queue discovery, watcher locks or automatic launch.
+
+`--jobs` bounds target workers inside each fallback independently of the
+`--max-concurrent` release-pipeline bound. For example, two concurrent releases
+with four jobs each can schedule up to eight target workers, subject to existing
+per-host limits and shared-output ownership. The target matrix, quality gates,
+source custody and publication admission remain unchanged. Selecting jobs does
+not enable automatic fallback; report-only and dry-run modes still launch no
+workers.
+
+The watcher passes an explicit `--jobs` to every new or retried fallback and
+records `parallel_jobs` in its attempt journal. Retries can adopt the current
+watcher bound while resuming the same uniquely matched source/output checkpoint;
+workers already running retain their original bound. A new attempt's fallback
+result must report that same numeric value before its completion is admitted.
+Older journals and completed results without this optional scheduling metadata
+remain governed by their existing source, outcome and receipt checks. Once and
+continuous watcher JSON includes `details.parallel_jobs` for the current
+invocation; each retained attempt's own field describes the bound it actually
+received.
 
 The complete `doctor --quick` preflight runs under one `GH_API_TIMEOUT`
 deadline (60 seconds by default). It includes version probes, credential

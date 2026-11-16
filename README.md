@@ -1305,6 +1305,7 @@ Continuous monitoring daemon.
 dsr watch                                       # Default: check every 60s
 dsr watch --interval 30 --auto-fallback         # Auto-trigger on throttle
 dsr watch --auto-fallback --max-concurrent 4    # Admit up to four fallback pipelines
+dsr watch --auto-fallback --max-concurrent 2 --jobs 4  # Four target builds per release
 dsr watch --notify desktop                      # Desktop notifications
 ```
 
@@ -1336,7 +1337,18 @@ registry entry cannot override a disabled per-tool repository. Explicit
 manual diagnosis and recovery; `enabled` controls watcher automation.
 
 The watcher admits at most two fallback pipelines at once by default;
-`--max-concurrent` accepts 1–32. Excess runs wait for a later poll without
+`--max-concurrent` accepts 1–32. Target builds within each fallback remain serial
+unless `--parallel` / `-p`, `--parallel=N`, or `--jobs N` is selected. Bare
+`--parallel` uses `DSR_BUILD_PARALLELISM`, defaulting to 2; explicit counts accept
+1–32. The two limits are independent: `--max-concurrent 2 --jobs 4` permits at
+most two release pipelines with up to four target workers each, subject to the
+existing build-host capacity limits. Plans and results report `parallel_jobs`,
+and every started attempt records its selected bound. New attempts and retries
+use the current watcher setting; running workers keep their original bound.
+A retry can change concurrency while retaining its exact source and build
+checkpoint. Report-only and dry-run modes still start no workers.
+
+Excess runs wait for a later poll without
 creating a build or consuming a retry attempt. Their repository, tag and source
 SHA are retained across restarts, and older waiting releases take priority over
 new arrivals. Active workers retain their
