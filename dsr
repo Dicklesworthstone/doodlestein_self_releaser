@@ -7237,7 +7237,7 @@ _release_contract_preflight() {
         .tool == $tool and
         .version == $tag and
         (.source | type == "object") and
-        .source.git_ref == $tag and
+        (.source.git_ref == $tag or .source.git_ref == ("refs/tags/" + $tag)) and
         (.source.git_sha | type == "string" and test("^[0-9a-f]{40}$")) and
         .source.dependencies == $expected_dependencies and
         .status == "success" and
@@ -7663,15 +7663,14 @@ _release_contract_preflight() {
         fi
     done < <(jq -r '.[]' <<< "$base_additional_json")
 
-    # A contracted aggregate checksum is derived from every manifest-bound
-    # primary and base additional artifact.  It is never accepted as an
-    # unrelated pre-existing file.
+    # Cover every primary, additional payload and public manifest name. The
+    # frozen manifest hash is outside the manifest's own artifact inventory.
     # Only these exact conventional basenames are derived aggregates. Legacy
     # checksums.txt is an alias of the same sorted payload inventory (GH #28).
     local aggregate_name
     while IFS= read -r aggregate_name; do
         local aggregate_path="$artifacts_dir/$aggregate_name"
-        local aggregate_lines aggregate_sha aggregate_size
+        local aggregate_lines aggregate_sha aggregate_size manifest_name
         aggregate_lines=$(
             for ((idx = 0; idx < ${#primary_names[@]}; idx++)); do
                 printf '%s  %s\n' "${primary_shas[$idx]}" "${primary_names[$idx]}"
@@ -7681,6 +7680,9 @@ _release_contract_preflight() {
                 additional_path="$artifacts_dir/$additional_name"
                 printf '%s  %s\n' "$(_release_sha256 "$additional_path")" "$additional_name"
             done < <(jq -r '.[]' <<< "$base_additional_json")
+            while IFS= read -r manifest_name; do
+                printf '%s  %s\n' "$manifest_sha_before" "$manifest_name"
+            done < <(jq -r '.build_manifest_assets[]?' <<< "$contract_json")
         )
         aggregate_lines=$(printf '%s\n' "$aggregate_lines" | LC_ALL=C sort)
         aggregate_sha=$(_release_sha256_line "$aggregate_lines") || return 4
@@ -7706,16 +7708,27 @@ _release_contract_preflight() {
             <<< "$contract_json" >/dev/null 2>&1; then
             signature="${aggregate_path}.minisig"
             [[ -n "$minisign_public_key_file" ]] || return 4
+            local aggregate_comment="dsr strict release $tool_name $tag aggregate $aggregate_sha"
+            local signed_public_manifest=false
+            if [[ "$aggregate_name" == SHA256SUMS ]] && jq -e 'has("build_manifest_assets")' <<< "$contract_json" >/dev/null; then
+                signed_public_manifest=true
+                aggregate_comment="$tool_name $tag SHA256SUMS"
+            fi
             if [[ "$sidecar_mode" == "create" && ! -e "$signature" && ! -L "$signature" ]]; then
                 signing_private_key="${SIGNING_PRIVATE_KEY:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/secrets/minisign.key}"
                 signing_sign_exact "$aggregate_path" "$signature" \
                     "$signing_private_key" "$minisign_public_key_token" \
-                    "dsr strict release $tool_name $tag aggregate $aggregate_sha" \
+                    "$aggregate_comment" \
                     "$aggregate_sha" || return 4
             fi
             [[ -f "$signature" && ! -L "$signature" ]] || return 4
-            signing_verify_exact "$aggregate_path" "$signature" \
-                "$minisign_public_key_token" || return 4
+            if $signed_public_manifest; then
+                _signing_reuse "$aggregate_path" "$signature" "$minisign_public_key_token" \
+                    "$aggregate_sha" "$aggregate_comment" || return 4
+            else
+                signing_verify_exact "$aggregate_path" "$signature" \
+                    "$minisign_public_key_token" || return 4
+            fi
             signature_sha=$(_release_sha256 "$signature") || return 4
             signature_size=$(_release_file_size "$signature") || return 4
             planned_assets+=("$(jq -nc \

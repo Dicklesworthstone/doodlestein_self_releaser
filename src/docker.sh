@@ -291,7 +291,7 @@ _dk_published_release_context() (
     [[ "$repo" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || return 4
     key_path=$(jq -er '.minisign_public_key_file' <<< "$contract") || return 4
     [[ "$key_path" =~ ^[A-Za-z0-9][A-Za-z0-9_./+-]*$ && "$key_path" != *..* ]] || return 4
-    revision=$(git -C "$root" rev-parse --verify "$tag^{commit}") || return 7
+    revision=$(git -C "$root" rev-parse --verify "refs/tags/$tag^{commit}") || return 7
     _release_contract_verify_remote_tag_identity "$repo" "$tag" "$revision" || return 7
     context="$work/release-context"
     (umask 077; mkdir "$context" "$work/release-assets") || return 7
@@ -335,8 +335,9 @@ PY
     [[ "$(sed -n '3{s/\r$//;p;}' "$work/release-assets/SHA256SUMS.minisig")" == \
         "trusted comment: $tool $tag SHA256SUMS" ]] || { _dk_log_error 'Release signature belongs to another tool or tag'; return 7; }
     printf '%s\n' "$contract" > "$work/release-contract.json" || return 7
-    # Copy the tracked recipe, not a modified/untracked checkout or its secrets.
-    git -C "$root" show HEAD:Dockerfile.release > "$context/Dockerfile.release" || return 7
+    # Build with the authenticated release revision's recipe, even if the
+    # operator's checkout has advanced since that release was published.
+    git -C "$root" show "$revision:Dockerfile.release" > "$context/Dockerfile.release" || return 7
     python3 -I - "$work" "$revision" "$tool" "$tag" <<'PY' || return 7
 import hashlib,json,os,re,shutil,stat,sys,tarfile
 from pathlib import Path

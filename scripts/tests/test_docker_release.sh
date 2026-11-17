@@ -362,7 +362,10 @@ config={'tool_name':'tool','repo':'owner/app','targets':['linux/amd64','linux/ar
         'container_release_from_published_assets':True,'container_binaries':['am','mcp-agent-mail'],'release_contract':contract}
 source=Path(sys.argv[5]).read_text();functions=work/'published-functions.sh'
 functions.write_text('\n'.join(re.search(r'^'+n+r'\(\) \{\n.*?^\}',source,re.M|re.S).group(0)
-    for n in ['_release_contract_verify_remote_tag_identity','_release_contract_observe_remote_inventory']))
+    for n in ['_release_contract_verify_remote_tag_identity','_release_contract_observe_remote_inventory',
+              '_release_contract_preflight','_release_require_publishable_artifacts',
+              '_release_contract_raw_installer_plan','_release_contract_verify_raw_installer_checksum',
+              '_release_sha256','_release_sha256_line','_release_file_size']))
 with functions.open('a') as f:
     for name in ['json_envelope','_docker_command']:
         f.write('\n'+re.search(r'^'+name+r'\(\) \{\n.*?^\}\n(?=\n# =)',source,re.M|re.S).group(0))
@@ -470,6 +473,17 @@ _dsr_require() { :; } # All actual dependency modules are explicitly loaded abov
 log_error() { printf '%s\n' "$*" >&2; }
 gh_api() { python3 "$PUBLISHED_CASE/api.py" "$@"; }
 gh_download_release_asset() { python3 "$PUBLISHED_CASE/api.py" download "$2" "$3"; }
+if [[ "$0" == strict-producer ]]; then
+    source "$ROOT/src/git_ops.sh"
+    source "$ROOT/src/act_runner.sh"
+    SIGNING_PRIVATE_KEY="$PUBLISHED_CASE/key"
+    local_repo="$PUBLISHED_CASE/repo"
+    artifacts="$PUBLISHED_CASE/$1"
+    contract=$(config_get_release_contract_json tool) || exit $?
+    _release_contract_preflight tool v1.2.3 owner/app "$local_repo" \
+        "$artifacts" "$artifacts/build-manifest.json" "$contract" "$2"
+    exit $?
+fi
 if [[ "${PUBLISHED_OPERATION:-build}" == release ]]; then
     export DOCKER_OUTPUT_DIR="$PUBLISHED_CASE/output"
     if [[ "${PUBLISHED_ADAPTER:-0}" == 1 ]]; then
@@ -517,6 +531,13 @@ for label in labels:
     old_tags={'ghcr.io/acme/tool:v1.2.3':'sha256:'+'0'*64,'ghcr.io/acme/tool:latest':'sha256:'+'0'*64}
     (c/'registry/tags.json').write_text(json.dumps(old_tags))
     a=c/'assets'
+    env=dict(os.environ,ROOT=str(root),MODULE=str(module),PUBLISHED_CASE=str(c),PUBLISHED_FUNCTIONS=str(functions),
+             DK_RELEASE_SHA=sha,DK_PUBLISHED_CHECK='1',DK_CALLS=str(c/'calls'),DK_MODE='',
+             DK_REGISTRY=str(c/'registry'),PUBLISHED_OPERATION='release' if label in publication else 'build',
+             PUBLISHED_ADAPTER='1' if label in ['publish-valid','publish-direct-index'] else '0',DSR_VERSION=version,
+             DSR_CONFIG_DIR=str(c/'config'),DSR_REPOS_FILE=str(c/'config/repos.yaml'),TMPDIR=str(c/'tmp'),
+             ACT_REPOS_DIR=str(c/'config/repos.d'),
+             PATH=str(c/'bin')+os.pathsep+os.environ['PATH'])
     input_label=label.removeprefix('publish-input-')
     if input_label=='wrong-version':archive(a/names['linux/amd64'],version='9.9.9')
     if label in ['archive-link','archive-traversal']:archive(a/names['linux/amd64'],special=label.split('-')[1])
@@ -527,13 +548,50 @@ for label in labels:
     (a/'build-manifest.json').write_text(json.dumps(current_manifest))
     if label=='duplicate-build-source':(a/'build-manifest.json').write_text(
         json.dumps(manifest)[:-1]+',"source":{"git_sha":"'+'e'*40+'"},"source":{"git_sha":"'+sha+'"}}')
-    payloads=sorted(p for p in a.iterdir() if p.name not in ['SHA256SUMS','SHA256SUMS.minisig'])
-    lines=[hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n' for p in payloads]
-    if input_label=='incomplete-manifest':lines=lines[1:]
-    if label=='duplicate-entry':lines+=lines[:1]
-    (a/'SHA256SUMS').write_text(''.join(lines))
-    run(['minisign','-S','-s',str(c/('other.key' if input_label=='untrusted-signer' else 'key')),
-         '-m',str(a/'SHA256SUMS'),'-t','tool v1.2.3 SHA256SUMS'])
+    if label in ['publish-valid','publish-direct-index']:
+        # Give the actual binary publisher its normal input manifest. Serve
+        # its planned bytes unchanged to the actual container publisher.
+        tag_ref='refs/tags/v1.2.3' if label=='publish-direct-index' else 'v1.2.3'
+        current_manifest['source'].update(git_ref=tag_ref,dependencies=[])
+        current_manifest['summary'].update(total=2,success=2)
+        target_by_name={name:target for target,name in names.items()}
+        for artifact in current_manifest['artifacts']:
+            artifact.update(target=target_by_name[artifact['name']],publishable=True,build_purpose='release')
+        (a/'build-manifest.json').write_text(json.dumps(current_manifest))
+        (c/'release.json').write_text('{}')
+        prepared=subprocess.run(['bash','-c',driver,'strict-producer','assets','create'],env=env,capture_output=True)
+        (c/'strict-producer.json').write_bytes(prepared.stdout)
+        (c/'strict-producer.stderr').write_bytes(prepared.stderr)
+        check(label+' strict binary publisher creates a verified upload plan',prepared.returncode==0)
+        planned_assets=json.loads(prepared.stdout)['assets']
+        check(label+' fixture publishes every asset in the producer plan',
+              {p.name for p in a.iterdir()}=={item['name'] for item in planned_assets})
+        current=(a/'SHA256SUMS').read_text()
+        expected=sorted(hashlib.sha256((a/name).read_bytes()).hexdigest()+'  '+name
+                        for name in [*names.values(),'build-manifest.json'])
+        check(label+' producer signs the exact archive and build manifest inventory',current.splitlines()==expected)
+        check(label+' producer uses the exact requested trusted comment',
+              (a/'SHA256SUMS.minisig').read_text().splitlines()[2]=='trusted comment: tool v1.2.3 SHA256SUMS')
+        if label=='publish-valid':
+            retained=c/'retained';shutil.copytree(a,retained,ignore=shutil.ignore_patterns('SHA256SUMS.minisig'))
+            signature=retained/'SHA256SUMS.minisig'
+            run(['minisign','-S','-s',str(c/'key'),'-m',str(retained/'SHA256SUMS'),'-t','tool v1.2.4 SHA256SUMS'])
+            before=signature.read_bytes()
+            bad=subprocess.run(['bash','-c',driver,'strict-producer','retained','verify'],env=env,capture_output=True)
+            (c/'strict-retained.stderr').write_bytes(bad.stderr)
+            check('producer refuses the valid signature for another tag and preserves its bytes',
+                  bad.returncode==4 and b'different requested comments' in bad.stderr and signature.read_bytes()==before)
+            later_recipe=c/'repo/Dockerfile.release'
+            later_recipe.write_text(later_recipe.read_text()+'# newer checkout recipe\n')
+            run(['git','-C',str(c/'repo'),'commit','-qam','advance checkout past the published tag'])
+    else:
+        payloads=sorted(p for p in a.iterdir() if p.name not in ['SHA256SUMS','SHA256SUMS.minisig'])
+        lines=[hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n' for p in payloads]
+        if input_label=='incomplete-manifest':lines=lines[1:]
+        if label=='duplicate-entry':lines+=lines[:1]
+        (a/'SHA256SUMS').write_text(''.join(lines))
+        run(['minisign','-S','-s',str(c/('other.key' if input_label=='untrusted-signer' else 'key')),
+             '-m',str(a/'SHA256SUMS'),'-t','tool v1.2.3 SHA256SUMS'])
     if input_label=='tampered-manifest':(a/'SHA256SUMS').write_text((a/'SHA256SUMS').read_text()+'tampered\n')
     if label=='tampered-archive':(a/names['linux/amd64']).write_bytes(b'tampered archive')
     skipped={'SHA256SUMS.minisig'} if input_label=='missing-signature' else set()
@@ -546,12 +604,6 @@ for label in labels:
                         'digest':'sha256:'+hashlib.sha256(p.read_bytes()).hexdigest()}
                        for i,p in enumerate(sorted(a.iterdir()),100) if p.name not in skipped]}
     (c/'release.json').write_text(json.dumps(release))
-    env=dict(os.environ,ROOT=str(root),MODULE=str(module),PUBLISHED_CASE=str(c),PUBLISHED_FUNCTIONS=str(functions),
-             DK_RELEASE_SHA=sha,DK_PUBLISHED_CHECK='1',DK_CALLS=str(c/'calls'),DK_MODE='',
-             DK_REGISTRY=str(c/'registry'),PUBLISHED_OPERATION='release' if label in publication else 'build',
-             PUBLISHED_ADAPTER='1' if label in ['publish-valid','publish-direct-index'] else '0',DSR_VERSION=version,
-             DSR_CONFIG_DIR=str(c/'config'),DSR_REPOS_FILE=str(c/'config/repos.yaml'),TMPDIR=str(c/'tmp'),
-             PATH=str(c/'bin')+os.pathsep+os.environ['PATH'])
     env['DK_MODE']={'publish-scan-fail':'syft-fail','publish-sign-fail':'sign-fail','publish-evidence-fail':'attest-fail'}.get(label,'')
     if label.startswith('inherited-'):
         foreign=c/'foreign';foreign.mkdir();(foreign/'caller-only').write_text('preserve staged caller bytes\n')
@@ -574,6 +626,9 @@ for label in labels:
             check(label+' completes the actual publisher',result.returncode==0)
             envelope=json.loads(result.stdout);receipt=envelope['details']['result'];image=receipt['reference']
             check(label+' reports actual publication through the public adapter',envelope['exit_code']==0 and envelope['details']['pushed'] is True)
+            check(label+' transfers the tagged recipe rather than the checkout recipe',
+                  (c/'worker/context/Dockerfile.release').read_bytes()==
+                  run(['git','-C',str(c/'repo'),'show',sha+':Dockerfile.release']).stdout)
             check(label+' promotes exactly the verified digest',set(tags.values())=={image.rsplit('@',1)[1]})
             check(label+' preserves both verified platform predicates',len(receipt['platforms'])==2 and receipt['signature']=='verified' and receipt['sbom']=='verified')
             check(label+' uploads the inspected layout before tag copies',len(transport)==4 and transport[1][-2].startswith('oci:') and '@sha256:' in transport[1][-1] and all(x[-2]=='docker://'+image for x in transport[2:]))
