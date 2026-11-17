@@ -19516,6 +19516,8 @@ OPTIONS:
     --local             Build for local platform only (build only)
     --repo-path DIR     Source checkout for build/release
     --dockerfile FILE   Dockerfile inside the source checkout
+    --published-release Authenticate published archives and source manifest (build only);
+                        prepare Dockerfile.release with exact version/revision
     --tag TAG           Additional explicit tag (repeatable; build/release)
     --output OCI_TAR    OCI archive destination (build only)
     -p, --platform      Exact Linux platform list (build/release/verify/attest)

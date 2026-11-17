@@ -648,6 +648,43 @@ generate, commit or push downstream changes. It accepts the ACFS generator's
 canonical `installers` mapping with quoted URL and SHA-256 fields, rejects
 duplicates, and leaves archive checksum synchronization as a separate operation.
 
+For release-artifact containers, use the existing container command with
+`--published-release`:
+
+```bash
+dsr docker build mcp_agent_mail_rust "$RELEASE_TAG" --published-release \
+  --repo-path /data/projects/mcp_agent_mail_rust --output /private/results/am.oci.tar
+```
+
+This path requires Python 3.11+ on the controller, both Linux architectures,
+the configured release contract and tracked public key. It resolves the exact
+public tag, downloads immutable asset IDs, verifies the Minisign signature and its exact tool/tag comment,
+requires every published payload in the signed checksum inventory, and checks
+the signed build manifest's source revision. It extracts only regular `am` and
+`mcp-agent-mail` files from the GNU archives into a private context, then supplies
+`AM_VERSION` and `AM_REVISION` to the tracked `Dockerfile.release`. Existing
+runtime version checks run inside each architecture's image build.
+
+Builds go through `rch exec --job --require-remote` with a required Docker
+capability and complete result collection. The worker checks all private input
+hashes before Docker runs, and the collected result must identify that same input
+manifest. Workers need Bash, jq, GNU sha256sum and Docker Buildx. An admission
+refusal or missing remote completion is an error, with no local Docker fallback.
+The private bundle preserves its required inputs under RCH's normal filters;
+its exact directory is the invocation's canonical root. Inherited Git selectors
+cannot redirect its source reads or staging into another repository or index.
+The context, transfer diagnostics and build results are retained. Read-only
+planning (`--dry-run`) does not fetch assets or contact Docker/RCH.
+
+Declare the exact `container_binaries` (Agent Mail uses `[mcp-agent-mail, am]`).
+Set `container_release_from_published_assets: true` in the tool's profile to
+reserve stable image tags for this path. Source builds then use `source-v...`
+and refuse additional stable tags. The published-release path exports OCI only;
+`--push` and `docker release` refuse it before network operations. Stable-tag
+publication must later consume the verified exported OCI artifact, not rebuild
+and push before the RCH result is collected. That publication transition and
+its native/public release gates remain open.
+
 ### 5. Check System Health
 
 ```bash

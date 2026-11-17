@@ -153,8 +153,8 @@ _dk_hash() {
 # creating directories, or writing an output. Also used for release preflight.
 _dk_build_plan() {
     local tool='' version='' root='' dockerfile='' output='' mode=oci
-    local push=false local_only=false explicit_platform=false dry="${DRY_RUN:-false}"
-    local platforms="${DOCKER_PLATFORMS:-linux/amd64,linux/arm64}" tags='[]' tag image builder
+    local push=false local_only=false explicit_platform=false published=false dry="${DRY_RUN:-false}"
+    local platforms="${DOCKER_PLATFORMS:-linux/amd64,linux/arm64}" tags='[]' tag image builder artifact_policy=false
     local -a extra_tags=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -171,6 +171,7 @@ _dk_build_plan() {
                 esac
                 shift 2 ;;
             --push) push=true; shift ;;
+            --published-release) published=true; shift ;;
             --local) local_only=true; shift ;;
             --dry-run|-n) dry=true; shift ;;
             -*) _dk_log_error "Unknown option: $1"; return 4 ;;
@@ -189,6 +190,10 @@ _dk_build_plan() {
     image="${DOCKER_REGISTRY:-ghcr.io/dicklesworthstone}/$tool"
     _dk_repository_valid "$image" || { _dk_log_error 'Invalid container repository'; return 4; }
     builder="${DOCKER_BUILDER_NAME:-dsr-builder}"
+    if declare -F config_get_tool_field >/dev/null; then
+        artifact_policy=$(config_get_tool_field "$tool" container_release_from_published_assets false) || return 4
+        [[ "$artifact_policy" == true || "$artifact_policy" == false ]] || return 4
+    fi
     [[ "$builder" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ && "$dry" =~ ^(true|false)$ ]] || return 4
     $push && $local_only && { _dk_log_error '--push and --local conflict'; return 4; }
     if $push; then mode=registry; elif $local_only; then mode=docker; fi
@@ -202,6 +207,12 @@ _dk_build_plan() {
         [[ "$mode" != docker || "$platforms" != *,* ]] || { _dk_log_error '--local loads only one platform'; return 4; }
     fi
     for tag in "v${version#v}" "${extra_tags[@]}"; do
+        if [[ "$artifact_policy" == true && "$published" == false ]]; then
+            if [[ "$tag" == "v${version#v}" ]]; then tag="source-$tag"
+            elif [[ "$tag" != source-* ]]; then
+                _dk_log_error 'Source containers cannot overwrite stable release tags'; return 4
+            fi
+        fi
         _dk_tag_valid "$tag" || return 4
         tags=$(jq -c --arg tag "$image:$tag" 'if index($tag) then . else . + [$tag] end' <<< "$tags") || return 1
     done
@@ -211,6 +222,15 @@ _dk_build_plan() {
     [[ -n "$root" ]] || root="/data/projects/$tool"
     [[ -d "$root" && ! -L "$root" && "$root" != *[[:cntrl:]]* ]] || { _dk_log_error "Invalid repository path: $root"; return 4; }
     root=$(cd "$root" && pwd -P) || return 4
+    if $published; then
+        [[ "v${version#v}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ &&
+           "$mode" == oci && "$local_only" == false &&
+           "$(jq -c 'sort' <<< "$platforms_json")" == '["linux/amd64","linux/arm64"]' &&
+           ( -z "$dockerfile" || "$dockerfile" == Dockerfile.release || "$dockerfile" == "$root/Dockerfile.release" ) ]] || {
+            _dk_log_error 'Published release builds require OCI export, an exact version, Dockerfile.release and both GNU Linux platforms'; return 4;
+        }
+        dockerfile="$root/Dockerfile.release"
+    fi
     if [[ -z "$dockerfile" ]]; then
         dockerfile=$(docker_find_dockerfile "$tool" "$root") || { _dk_log_error 'No Dockerfile found'; return 7; }
     elif [[ "$dockerfile" != /* ]]; then dockerfile="$root/$dockerfile"; fi
@@ -225,16 +245,298 @@ _dk_build_plan() {
     fi
     jq -nc --arg tool "$tool" --arg version "v${version#v}" --arg repository "$image" \
         --arg root "$root" --arg dockerfile "$dockerfile" --arg builder "$builder" --arg exporter "$mode" \
-        --arg output "$output" --argjson tags "$tags" --argjson platforms "$platforms_json" --argjson dry "$dry" '
+        --arg output "$output" --argjson tags "$tags" --argjson platforms "$platforms_json" --argjson dry "$dry" \
+        --argjson published "$published" '
         {schema_version:1,kind:"dsr-container-build",status:"planned",tool:$tool,version:$version,
          repository:$repository,tags:$tags,context:$root,dockerfile:$dockerfile,builder:$builder,
          exporter:$exporter,platforms:$platforms,dry_run:$dry,
-         output_file:(if $output == "" then null else $output end)}'
+         output_file:(if $output == "" then null else $output end)} +
+        (if $published then {published_release:true} else {} end)'
 }
 
-_dk_build_execute() (
+# Call only inside the private helper subshells. Hooks and callers may export
+# repository selectors; even `git -C` would then use their index/object store.
+_dk_clear_git_context() {
+    local names name
+    names=$(git rev-parse --local-env-vars) || return 7
+    while IFS= read -r name; do
+        [[ "$name" =~ ^GIT_[A-Z0-9_]+$ ]] || return 7
+        unset "$name" || return 7
+    done <<< "$names"
+    export GIT_NO_REPLACE_OBJECTS=1
+}
+
+# Resolve the public release independently of local build state. Existing DSR
+# transport and Minisign verification remain authoritative; never synthesize a
+# build manifest to make an older public release look like a new native build.
+_dk_published_release_context() (
     set -o pipefail
-    local plan="$1" work='' output_work='' root dockerfile builder mode output platforms digest start=$SECONDS
+    umask 077
+    _dk_clear_git_context || return $?
+    local plan="$1" work="$2" tool tag root contract repo revision key_path token release release_id after id name context binary_names
+    tool=$(jq -r '.tool' <<< "$plan") || return 4
+    tag=$(jq -r '.version' <<< "$plan") || return 4
+    root=$(jq -r '.context' <<< "$plan") || return 4
+    declare -F _dsr_require >/dev/null || { _dk_log_error 'Published release preparation requires the DSR CLI'; return 4; }
+    _dsr_require config && _dsr_require signing && _dsr_require github || return 3
+    config_validate_release_contract "$tool" || return 4
+    contract=$(config_get_release_contract_json "$tool") || return 4
+    binary_names=$(config_get_tool_field "$tool" 'container_binaries | @json' '[]') || return 4
+    jq -e 'type=="array" and length>0 and length<=64 and (unique|length)==length and
+        all(.[];type=="string" and test("\\A[A-Za-z0-9][A-Za-z0-9._+-]*\\z") and (contains("..")|not))' \
+        <<< "$binary_names" >/dev/null || { _dk_log_error 'Declare the exact container_binaries in the tool profile'; return 4; }
+    contract=$(jq -c --argjson binaries "$binary_names" '. + {container_binaries:$binaries}' <<< "$contract") || return 4
+    printf '%s\n' "$contract" > "$work/release-contract.json" || return 7
+    repo=$(config_get_tool_field "$tool" repo '') || return 4
+    [[ "$repo" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || return 4
+    key_path=$(jq -er '.minisign_public_key_file' <<< "$contract") || return 4
+    [[ "$key_path" =~ ^[A-Za-z0-9][A-Za-z0-9_./+-]*$ && "$key_path" != *..* ]] || return 4
+    revision=$(git -C "$root" rev-parse --verify "$tag^{commit}") || return 7
+    _release_contract_verify_remote_tag_identity "$repo" "$tag" "$revision" || return 7
+    context="$work/release-context"
+    (umask 077; mkdir "$context" "$work/release-assets") || return 7
+    git -C "$root" show "HEAD:$key_path" > "$work/release-key.pub" || return 7
+    token=$(signing_public_key_token "$work/release-key.pub") || return 7
+    release=$(gh_api "repos/$repo/releases/tags/$tag" --no-cache) || return 8
+    release_id=$(jq -er '.id | select(type=="number" and .>0 and .==floor)' <<< "$release") || return 7
+    release=$(_release_contract_observe_remote_inventory "$repo" "$release_id") || return 8
+    printf '%s\n' "$release" > "$work/release.json" || return 7
+    # Validate before any names become paths, IDs become transport arguments,
+    # or a partial asset list can become the signed-inventory denominator.
+    python3 -I - "$work/release.json" "$tag" "$work/release-contract.json" <<'PY' > "$work/release-assets.tsv" || return 7
+import json,re,sys
+def unique(pairs):
+    result={}
+    for k,v in pairs:
+        if k in result:raise ValueError('duplicate release JSON key')
+        result[k]=v
+    return result
+r=json.load(open(sys.argv[1]),object_pairs_hook=unique)
+assert r.get('tag_name')==sys.argv[2] and r.get('draft') is False and type(r.get('id')) is int and r['id']>0
+a=r.get('assets');assert isinstance(a,list) and 0<len(a)<100
+assert len({x['name'].lower() for x in a})==len(a) and len({x['id'] for x in a})==len(a)
+assert sum(x['size'] for x in a)<=536870912
+c=json.load(open(sys.argv[3]));assert c.get('build_manifest_assets'),'a source-bound build manifest is required'
+required=set(c['exact_primary_assets'].values())|set(c.get('exact_additional_assets',[]))|set(c['build_manifest_assets'])
+missing=required-{x['name'] for x in a}
+assert not missing,'public release misses required assets: '+', '.join(sorted(missing))
+for x in a:
+    assert re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]{0,254}',x['name']) and '..' not in x['name']
+    assert type(x['id']) is int and x['id']>0 and x.get('state')=='uploaded'
+    assert type(x['size']) is int and 0<x['size']<=268435456
+    print(str(x['id'])+'\t'+x['name'])
+PY
+    while IFS=$'\t' read -r id name; do
+        gh_download_release_asset "$repo" "$id" "$work/release-assets/$name" || return 8
+    done < "$work/release-assets.tsv"
+    signing_verify_exact "$work/release-assets/SHA256SUMS" "$work/release-assets/SHA256SUMS.minisig" "$token" || {
+        _dk_log_error 'Release checksum signature verification failed'; return 7;
+    }
+    [[ "$(sed -n '3{s/\r$//;p;}' "$work/release-assets/SHA256SUMS.minisig")" == \
+        "trusted comment: $tool $tag SHA256SUMS" ]] || { _dk_log_error 'Release signature belongs to another tool or tag'; return 7; }
+    printf '%s\n' "$contract" > "$work/release-contract.json" || return 7
+    # Copy the tracked recipe, not a modified/untracked checkout or its secrets.
+    git -C "$root" show HEAD:Dockerfile.release > "$context/Dockerfile.release" || return 7
+    python3 -I - "$work" "$revision" "$tool" "$tag" <<'PY' || return 7
+import hashlib,json,os,re,shutil,stat,sys,tarfile
+from pathlib import Path
+def unique(pairs):
+    result={}
+    for key,value in pairs:
+        assert key not in result,'duplicate signed manifest key'
+        result[key]=value
+    return result
+w=Path(sys.argv[1]);assets=w/'release-assets';context=w/'release-context'
+r=json.loads((w/'release.json').read_text());contract=json.loads((w/'release-contract.json').read_text())
+entries={}
+for line in (assets/'SHA256SUMS').read_text().splitlines():
+    match=re.fullmatch(r'([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9._+-]*)',line)
+    assert match and match[2] not in entries,'ambiguous checksum inventory'
+    entries[match[2]]=match[1]
+names={x['name']:x for x in r['assets']}
+build_manifests=contract.get('build_manifest_assets',[])
+assert build_manifests,'published containers require a signed source-bound build manifest'
+required=set(contract['exact_primary_assets'].values())|set(contract.get('exact_additional_assets',[]))|set(build_manifests)
+required-={'SHA256SUMS','SHA256SUMS.minisig'}
+assert required<=entries.keys(),'signed inventory misses required payloads'
+payloads={n for n in names if n not in ('SHA256SUMS','SHA256SUMS.minisig') and not n.endswith(('.sha256','.minisig'))}
+assert entries.keys()==payloads,'signed inventory must cover every published payload'
+for name,metadata in names.items():
+    p=assets/name;s=p.lstat()
+    assert stat.S_ISREG(s.st_mode) and s.st_size==metadata['size'],'download size/type mismatch'
+for name,digest in entries.items():
+    with (assets/name).open('rb') as f:assert hashlib.file_digest(f,'sha256').hexdigest()==digest,'payload digest mismatch'
+    sidecar=assets/(name+'.sha256')
+    if sidecar.exists():assert sidecar.read_bytes()==f'{digest}  {name}\n'.encode(),'sidecar mismatch'
+for name in build_manifests:
+    m=json.loads((assets/name).read_text(),object_pairs_hook=unique)
+    assert (m.get('tool')==sys.argv[3] and m.get('version')==sys.argv[4] and
+            m.get('source',{}).get('git_sha')==sys.argv[2] and m.get('status')=='success' and
+            m.get('publishable') is True and m.get('build_purpose')=='release' and
+            type(m.get('summary',{}).get('failed')) is int and
+            m['summary']['failed']==0),'build manifest does not bind this release source'
+    artifacts=m.get('artifacts');assert isinstance(artifacts,list) and artifacts,'build manifest lacks artifacts'
+    by_name={x['name']:x for x in artifacts}
+    assert len(by_name)==len(artifacts) and set(contract['exact_primary_assets'].values())<=by_name.keys(),'incomplete build inventory'
+    for payload,record in by_name.items():
+        assert (payload in names and type(record['size_bytes']) is int and
+                record['size_bytes']==names[payload]['size']),'build inventory size/name mismatch'
+        with (assets/payload).open('rb') as f:assert hashlib.file_digest(f,'sha256').hexdigest()==record['sha256'],'build inventory digest mismatch'
+primaries=contract['exact_primary_assets']
+selected={
+    'amd64':primaries.get('linux/amd64@x86_64-unknown-linux-gnu',primaries.get('linux/amd64')),
+    'arm64':primaries.get('linux/arm64@aarch64-unknown-linux-gnu',primaries.get('linux/arm64'))}
+assert all(selected.values()) and len(set(selected.values()))==2,'both GNU archives are required'
+for arch,name in selected.items():
+    assert name in entries and name.endswith(('.tar.xz','.tar.gz')),'missing GNU archive'
+    dest=context/'dist'/arch;dest.mkdir(parents=True,mode=0o700)
+    with tarfile.open(assets/name,'r:*') as archive:
+        seen=set();total=0
+        for index,member in enumerate(archive):
+            assert index<256,'too many archive entries'
+            path=Path(member.name)
+            assert not path.is_absolute() and '..' not in path.parts,'unsafe archive path'
+            if member.isdir():continue
+            assert member.isfile() and not member.issparse(),'links/special archive members are forbidden'
+            assert member.name not in seen and 0<=member.size<=268435456,'duplicate or oversized archive member'
+            seen.add(member.name);total+=member.size;assert len(seen)<=256 and total<=536870912,'oversized archive'
+            if path.name not in contract['container_binaries']:continue
+            target=dest/path.name;assert not target.exists(),'duplicate binary basename'
+            with archive.extractfile(member) as source,target.open('xb') as output:shutil.copyfileobj(source,output)
+            target.chmod(0o755)
+    assert {p.name for p in dest.iterdir()}==set(contract['container_binaries']),'archive lacks required binaries'
+PY
+    _release_contract_verify_remote_tag_identity "$repo" "$tag" "$revision" || return 7
+    after=$(_release_contract_observe_remote_inventory "$repo" "$release_id") || return 8
+    [[ "$after" == "$release" ]] || { _dk_log_error 'Public release changed during artifact preparation'; return 7; }
+    jq -c --arg context "$context" --arg revision "$revision" --arg release_repo "$repo" \
+        --argjson release_id "$(jq -r '.id' <<< "$release")" '
+        . + {context:$context,dockerfile:($context+"/Dockerfile.release"),
+             release_source_revision:$revision,release_repository:$release_repo,release_id:$release_id,
+             build_args:[("AM_VERSION="+(.version|ltrimstr("v"))),("AM_REVISION="+$revision)]}' <<< "$plan"
+)
+
+# Published-release contexts contain only authenticated assets and our frozen
+# recipe/driver. RCH owns remote admission and result collection. Its job API
+# cannot use Cargo's source-content-receipt mode, so verify every staged input
+# on the worker before Docker and bind the returned result to that manifest.
+_dk_build_remote_release() (
+    set -o pipefail
+    local plan="$1" root="$2" work="$3" result output envelope publication input_manifest_hash status=0
+    _dk_clear_git_context || return $?
+    _dk_dependency rch || return 3
+    mkdir "$work/remote-job" || return 7
+    cp -a -- "$root" "$work/remote-job/context" || return 7
+    root="$work/remote-job"
+    cp -- "${BASH_SOURCE[0]}" "$root/.dsr-container-module.sh" || return 7
+    printf '%s\n' "$plan" > "$root/.dsr-container-plan.json" || return 7
+    cat > "$root/.dsr-container-run.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+sha256sum --strict --check .dsr-container-inputs.sha256 >&2
+input_manifest_hash=$(sha256sum .dsr-container-inputs.sha256)
+input_manifest_hash="${input_manifest_hash%% *}"
+source ./.dsr-container-module.sh
+mkdir .dsr-container-result
+plan=$(jq --arg root "$PWD" '
+    .context=($root+"/context") | .dockerfile=($root+"/context/Dockerfile.release") |
+    .output_file=(if .exporter=="oci" then $root+"/.dsr-container-result/image.tar" else null end) |
+    .retain_work=true' .dsr-container-plan.json)
+_dk_build_execute_local "$plan" | jq --arg inputs "$input_manifest_hash" \
+    '. + {input_manifest_sha256:$inputs}' > .dsr-container-result/build.json
+SH
+    python3 -I - "$root" <<'PY' > "$root/.dsr-container-inputs.sha256" || return 7
+import hashlib,stat,sys
+from pathlib import Path
+root=Path(sys.argv[1])
+paths=[root/name for name in ['.dsr-container-module.sh','.dsr-container-plan.json','.dsr-container-run.sh']]
+paths+=sorted((root/'context').rglob('*'))
+for path in paths:
+    mode=path.lstat().st_mode
+    if stat.S_ISDIR(mode):continue
+    assert stat.S_ISREG(mode),'only regular private inputs are allowed'
+    relative=str(path.relative_to(root));assert '\n' not in relative and '\\' not in relative
+    with path.open('rb') as source:digest=hashlib.file_digest(source,'sha256').hexdigest()
+    print(digest+'  '+relative)
+PY
+    input_manifest_hash=$(_dk_hash "$root/.dsr-container-inputs.sha256") || return 7
+    # RCH excludes generated dist/ trees, but preserves tracked input files.
+    # Index only this private authenticated bundle; keep the normal credential
+    # exclusions and every operator/source repository untouched. No commit or
+    # source publication is manufactured by this transport-only index.
+    git -C "$root" init --template= -q -b main || return 7
+    GIT_ATTR_NOSYSTEM=1 git -C "$root" -c core.hooksPath=/dev/null -c core.attributesFile=/dev/null \
+        -c core.autocrlf=false -c core.fsmonitor=false add -f -- context \
+        .dsr-container-module.sh .dsr-container-plan.json .dsr-container-run.sh .dsr-container-inputs.sha256 || return 7
+    (cd "$root" && RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_CANONICAL_PROJECT_ROOT="$root" \
+        rch --json exec --job --require-remote --require-tool docker \
+          --result-dir .dsr-container-result -- bash .dsr-container-run.sh \
+          > "$work/rch.jsonl" 2> "$work/rch.stderr") || status=$?
+    cat "$work/rch.stderr" >&2 || return 7
+    (( status == 0 )) || { _dk_log_error "Remote container build did not complete (exit $status)"; return "$status"; }
+    envelope=$(jq -cse '
+        [.[] | select(.api_version == "1.0" and has("location"))] |
+        if length==1 then .[0] else error("ambiguous RCH completion") end |
+        select(.location=="remote" and .outcome=="completed" and .remote_exit_code==0 and
+               (.worker_id | type=="string" and length>0) and
+               .admission.strict_remote==true and .admission.terminal_acknowledged==true and
+               .admission.worker_id==.worker_id and
+               (.result_dirs | length==1 and .[0].path==".dsr-container-result" and .[0].status=="ok" and .[0].files>=2))
+        ' "$work/rch.jsonl") || { _dk_log_error 'RCH did not prove remote completion and complete result collection'; return 7; }
+    [[ -f "$root/.dsr-container-result/build.json" && ! -L "$root/.dsr-container-result/build.json" ]] || return 7
+    result=$(jq -ce -s --argjson plan "$plan" --arg inputs "$input_manifest_hash" '
+        if length==1 then .[0] else error("ambiguous build result") end |
+        select(.status=="built" and .repository==$plan.repository and .tags==$plan.tags and
+               .platforms==$plan.platforms and .exporter==$plan.exporter and .input_manifest_sha256==$inputs and
+               .tool==$plan.tool and .version==$plan.version and .build_args==$plan.build_args and
+               .release_source_revision==$plan.release_source_revision and
+               .release_repository==$plan.release_repository and .release_id==$plan.release_id and
+               (.digest | test("^sha256:[0-9a-f]{64}$")) and .reference==(.repository+"@"+.digest))
+        ' "$root/.dsr-container-result/build.json") || return 7
+    output=$(jq -r '.output_file // ""' <<< "$plan") || return 7
+    if [[ $(jq -r '.exporter' <<< "$plan") == oci ]]; then
+        [[ "$(_dk_hash "$root/.dsr-container-result/image.tar")" == "$(jq -r '.archive.sha256' <<< "$result")" &&
+           "$(wc -c < "$root/.dsr-container-result/image.tar" | tr -d '[:space:]')" == "$(jq -r '.archive.size' <<< "$result")" ]] || return 7
+        mkdir -p -- "$(dirname "$output")" || return 7
+        [[ ! -e "$output" && ! -L "$output" ]] || return 7
+        publication=$(mktemp -d "$(dirname "$output")/.dsr-remote-oci.XXXXXXXX") || return 7
+        cp -- "$root/.dsr-container-result/image.tar" "$publication/image.tar" || return 7
+        [[ "$(_dk_hash "$publication/image.tar")" == "$(jq -r '.archive.sha256' <<< "$result")" ]] || return 7
+        ln -- "$publication/image.tar" "$output" || return 7
+    fi
+    jq -c --argjson plan "$plan" --argjson remote "$envelope" '
+        . + {context:$plan.context,dockerfile:$plan.dockerfile,output_file:$plan.output_file,
+             remote_execution:$remote}' <<< "$result"
+)
+
+_dk_build_execute() (
+    local plan="$1" work root
+    if [[ $(jq -r '.dry_run' <<< "$plan") == true ]]; then printf '%s\n' "$plan"; return 0; fi
+    if [[ $(jq -r '.published_release // false' <<< "$plan") == true ]]; then
+        root=$(jq -r '.context' <<< "$plan") || return 7
+        [[ "$(jq -r '.output_file // ""' <<< "$plan")" != "$root/"* ]] || return 4
+        work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-published-container.XXXXXXXX") || return 7
+        _dk_log_info "Retaining authenticated release context and remote build output: $work"
+        plan=$(_dk_published_release_context "$plan" "$work") || return $?
+        root=$(jq -r '.context' <<< "$plan") || return 7
+        _dk_build_remote_release "$plan" "$root" "$work"
+    else
+        # The source-build backend has no strict remote adapter. Never let a
+        # direct Docker invocation silently defeat a caller's RCH requirement.
+        local remote_policy="${RCH_REQUIRE_REMOTE:-}"
+        remote_policy="${remote_policy#"${remote_policy%%[![:space:]]*}"}"
+        remote_policy="${remote_policy%"${remote_policy##*[![:space:]]}"}"
+        case "${remote_policy,,}" in
+            ''|0|false|no|off|disabled) ;;
+            *) _dk_log_error 'Strict remote source-container builds are unavailable; no Docker build dispatched'; return 4 ;;
+        esac
+        _dk_build_execute_local "$plan"
+    fi
+)
+
+_dk_build_execute_local() (
+    set -o pipefail
+    local plan="$1" work='' output_work='' root dockerfile builder mode output platforms digest start=$SECONDS retain=false
     root=$(jq -r '.context' <<< "$plan") || return 1
     dockerfile=$(jq -r '.dockerfile' <<< "$plan") || return 1
     builder=$(jq -r '.builder' <<< "$plan") || return 1
@@ -243,7 +545,10 @@ _dk_build_execute() (
     platforms=$(jq -r '.platforms | join(",")' <<< "$plan") || return 1
     if [[ $(jq -r '.dry_run' <<< "$plan") == true ]]; then printf '%s\n' "$plan"; return 0; fi
     work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-container.XXXXXXXX") || return 1
-    trap '[[ -z "$output_work" ]] || rm -rf -- "$output_work"; rm -rf -- "$work"' EXIT
+    [[ $(jq -r '.retain_work // false' <<< "$plan") != true ]] || retain=true
+    if ! $retain; then
+        trap '[[ -z "$output_work" ]] || rm -rf -- "$output_work"; rm -rf -- "$work"' EXIT
+    fi
     trap 'exit 5' HUP INT TERM
     if [[ "$mode" == oci ]]; then
         mkdir -p -- "$(dirname "$output")" || return 1
@@ -256,6 +561,10 @@ _dk_build_execute() (
     docker_setup_buildx "$builder" || return $?
     local tag tag_lines repository
     local -a args=(--builder "$builder" --file "$dockerfile" --metadata-file "$work/metadata.json" --progress plain)
+    local build_arg
+    local build_args
+    build_args=$(jq -r '.build_args[]?' <<< "$plan") || return 7
+    while IFS= read -r build_arg; do [[ -z "$build_arg" ]] || args+=(--build-arg "$build_arg"); done <<< "$build_args"
     [[ -z "$platforms" ]] || args+=(--platform "$platforms")
     tag_lines=$(jq -r '.tags[]' <<< "$plan") || return 1
     while IFS= read -r tag; do args+=(--tag "$tag"); done <<< "$tag_lines"
@@ -301,6 +610,7 @@ docker_build() {
     case "${1:-}" in --help|-h)
         printf '%s\n' 'docker_build - Build multi-arch Docker image' \
             'Usage: docker_build TOOL VERSION [--repo-path DIR] [--dockerfile FILE]' \
+            '  --published-release (authenticate complete public release assets and use Dockerfile.release)' \
             '  --push | --local | --output OCI_TAR (default: XDG state OCI archive)' \
             '  --platform linux/amd64,linux/arm64 --tag TAG --dry-run' \
             'No implicit latest tag. --local without --platform uses the builder default.' >&2
@@ -750,6 +1060,7 @@ export -f docker_check docker_check_buildx docker_check_cosign docker_version
 export -f docker_setup_buildx docker_setup docker_command docker_check_ghcr_auth docker_login_ghcr
 export -f docker_is_containerized docker_find_dockerfile docker_build docker_sign
 export -f docker_attest_sbom docker_release docker_build_json docker_release_json
+export -f _dk_build_execute_local _dk_build_remote_release _dk_published_release_context _dk_clear_git_context
 export -f _dk_log_info _dk_log_ok _dk_log_warn _dk_log_error _dk_log_debug
 export -f _dk_dependency _dk_resolve_gh_token _dk_tag_valid _dk_repository_valid _dk_pinned_valid
 export -f _dk_platforms _dk_hash _dk_build_plan _dk_build_execute _dk_spdx_valid _dk_json
