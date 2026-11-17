@@ -19516,7 +19516,7 @@ OPTIONS:
     --local             Build for local platform only (build only)
     --repo-path DIR     Source checkout for build/release
     --dockerfile FILE   Dockerfile inside the source checkout
-    --published-release Authenticate published archives and source manifest (build only);
+    --published-release Authenticate published archives and source manifest;
                         prepare Dockerfile.release with exact version/revision
     --tag TAG           Additional explicit tag (repeatable; build/release)
     --output OCI_TAR    OCI archive destination (build only)
@@ -19604,7 +19604,8 @@ _docker_command() {
             {image:($build.tags[0] // $r.reference // $build.reference)} else {} end) +
         (if $code != 0 then {}
          elif $operation == "build" or $operation == "release" then
-            {pushed:($build.status == "built" and $build.exporter == "registry")}
+            {pushed:(($operation == "release" and $r.status == "verified") or
+                     ($build.status == "built" and $build.exporter == "registry"))}
          elif $operation == "sign" then {signed:($r.signed == true),verified:false}
          elif $operation == "setup" then
             {ready:($code == 0 and $r.ready == true)} + (if $r.builder then {builder:$r.builder} else {} end)

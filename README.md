@@ -679,11 +679,30 @@ planning (`--dry-run`) does not fetch assets or contact Docker/RCH.
 Declare the exact `container_binaries` (Agent Mail uses `[mcp-agent-mail, am]`).
 Set `container_release_from_published_assets: true` in the tool's profile to
 reserve stable image tags for this path. Source builds then use `source-v...`
-and refuse additional stable tags. The published-release path exports OCI only;
-`--push` and `docker release` refuse it before network operations. Stable-tag
-publication must later consume the verified exported OCI artifact, not rebuild
-and push before the RCH result is collected. That publication transition and
-its native/public release gates remain open.
+and refuse additional stable tags. The build command exports OCI only and
+rejects `--push`. Publish through the existing release command:
+
+```bash
+dsr docker release mcp_agent_mail_rust "$RELEASE_TAG" --published-release \
+  --certificate-identity "$IMAGE_SIGNER_IDENTITY" \
+  --certificate-oidc-issuer "$IMAGE_SIGNER_ISSUER"
+```
+
+This requires Skopeo plus the existing Cosign/Syft dependencies and an exact
+image-signing identity/issuer; published releases reject `--skip-sign`.
+The publisher checks every OCI blob, both platform configs, source/version
+labels, uncompressed layer hashes and the final packaged binary bytes against
+the authenticated archives. It stages a private OCI directory with caller
+ownership, uploads by immutable digest, verifies both platform SBOMs and image
+signatures, then promotes the selected tags. [Skopeo's complete-image copy and
+digest preservation](https://github.com/containers/skopeo/blob/main/docs/skopeo-copy.1.md)
+keep the verified index and its child images together.
+
+The public Git tag and complete release inventory are rechecked before upload
+and each tag promotion. Each attempt retains its archive and publication
+evidence. Tag promotions are sequential; a late failure leaves prior successful
+effects recorded and returns failure. Native packaged execution and public
+image digest/platform proof remain required before release qualification.
 
 ### 5. Check System Health
 

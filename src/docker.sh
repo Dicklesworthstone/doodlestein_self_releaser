@@ -273,7 +273,7 @@ _dk_published_release_context() (
     set -o pipefail
     umask 077
     _dk_clear_git_context || return $?
-    local plan="$1" work="$2" tool tag root contract repo revision key_path token release release_id after id name context binary_names
+    local plan="$1" work="$2" tool tag root contract repo revision key_path token release release_id after id name context binary_names inventory_hash
     tool=$(jq -r '.tool' <<< "$plan") || return 4
     tag=$(jq -r '.version' <<< "$plan") || return 4
     root=$(jq -r '.context' <<< "$plan") || return 4
@@ -409,10 +409,13 @@ PY
     _release_contract_verify_remote_tag_identity "$repo" "$tag" "$revision" || return 7
     after=$(_release_contract_observe_remote_inventory "$repo" "$release_id") || return 8
     [[ "$after" == "$release" ]] || { _dk_log_error 'Public release changed during artifact preparation'; return 7; }
+    inventory_hash=$(_dk_hash "$work/release.json") || return 7
     jq -c --arg context "$context" --arg revision "$revision" --arg release_repo "$repo" \
+        --arg inventory_hash "$inventory_hash" \
         --argjson release_id "$(jq -r '.id' <<< "$release")" '
         . + {context:$context,dockerfile:($context+"/Dockerfile.release"),
              release_source_revision:$revision,release_repository:$release_repo,release_id:$release_id,
+             release_inventory_sha256:$inventory_hash,
              build_args:[("AM_VERSION="+(.version|ltrimstr("v"))),("AM_REVISION="+$revision)]}' <<< "$plan"
 )
 
@@ -491,6 +494,7 @@ PY
                .tool==$plan.tool and .version==$plan.version and .build_args==$plan.build_args and
                .release_source_revision==$plan.release_source_revision and
                .release_repository==$plan.release_repository and .release_id==$plan.release_id and
+               .release_inventory_sha256==$plan.release_inventory_sha256 and
                (.digest | test("^sha256:[0-9a-f]{64}$")) and .reference==(.repository+"@"+.digest))
         ' "$root/.dsr-container-result/build.json") || return 7
     output=$(jq -r '.output_file // ""' <<< "$plan") || return 7
@@ -946,10 +950,214 @@ _dk_check_tags() {
     done <<< "$tags"
 }
 
+# Re-observe the same complete public release, never a locally reconstructed
+# inventory. Call immediately before each external publication boundary.
+_dk_public_release_unchanged() {
+    local build="$1" work="$2" repo tag revision release_id current
+    repo=$(jq -er '.release_repository' <<< "$build") || return 7
+    tag=$(jq -er '.version' <<< "$build") || return 7
+    revision=$(jq -er '.release_source_revision' <<< "$build") || return 7
+    release_id=$(jq -er '.release_id' <<< "$build") || return 7
+    _release_contract_verify_remote_tag_identity "$repo" "$tag" "$revision" || return 7
+    current=$(gh_api "repos/$repo/releases/tags/$tag" --no-cache) || return 8
+    jq -e --argjson id "$release_id" '.id==$id and .draft==false' <<< "$current" >/dev/null || return 7
+    current=$(_release_contract_observe_remote_inventory "$repo" "$release_id") || return 8
+    printf '%s\n' "$current" > "$work/current-release.json" || return 7
+    [[ "$(_dk_hash "$work/current-release.json")" == "$(jq -r '.release_inventory_sha256' <<< "$build")" ]] || {
+        _dk_log_error 'Public release changed before container publication'; return 7;
+    }
+}
+
+# Inspect bytes before writing a private OCI layout. Both platform configs and
+# final packaged binaries must match the signed input. Copy regular files with
+# caller ownership; OCI-archive readers may otherwise attempt privileged chown.
+_dk_oci_inventory() {
+    local archive="$1" build="$2" work="$3"
+    printf '%s\n' "$build" > "$work/oci-build.json" || return 7
+    python3 -I - "$archive" "$work/oci-build.json" "$work/layout" <<'PY'
+import gzip,hashlib,json,re,shutil,stat,sys,tarfile
+from pathlib import Path,PurePosixPath
+def unique(pairs):
+    result={}
+    for key,value in pairs:
+        assert key not in result,'duplicate OCI JSON key'
+        result[key]=value
+    return result
+build=json.load(open(sys.argv[2]));rows=[]
+index_type='application/vnd.oci.image.index.v1+json'
+manifest_type='application/vnd.oci.image.manifest.v1+json'
+with tarfile.open(sys.argv[1],'r:*') as archive:
+    members={};total=0
+    for count,member in enumerate(archive):
+        assert count<4096,'too many OCI archive entries'
+        path=PurePosixPath(member.name)
+        assert not path.is_absolute() and '..' not in path.parts,'unsafe OCI archive path'
+        name=str(path)
+        if member.isdir():continue
+        assert member.isfile() and not member.issparse() and name not in members,'duplicate/link/special OCI entry'
+        assert 0<=member.size<=8589934592,'oversized OCI blob'
+        total+=member.size;assert total<=17179869184,'oversized OCI archive'
+        assert name in ['oci-layout','index.json'] or re.fullmatch(r'blobs/sha256/[0-9a-f]{64}',name),'unsupported OCI entry'
+        members[name]=member
+        if name.startswith('blobs/'):
+            with archive.extractfile(member) as source:
+                assert hashlib.file_digest(source,'sha256').hexdigest()==name.rsplit('/',1)[1],'OCI blob hash mismatch'
+    def data(name):
+        member=members[name];assert member.size<=16777216,'oversized OCI metadata'
+        return archive.extractfile(member).read()
+    def obj(name):return json.loads(data(name),object_pairs_hook=unique)
+    def blob(descriptor):
+        digest=descriptor['digest'];assert re.fullmatch(r'sha256:[0-9a-f]{64}',digest)
+        name='blobs/sha256/'+digest[7:]
+        assert type(descriptor['size']) is int and descriptor['size']==members[name].size,'OCI descriptor size mismatch'
+        assert not descriptor.get('urls'),'external OCI blobs are forbidden'
+        return name
+    assert obj('oci-layout')['imageLayoutVersion']=='1.0.0','unsupported OCI layout'
+    layout=obj('index.json');digest=build['digest'];direct='sha256:'+hashlib.sha256(data('index.json')).hexdigest()==digest
+    if direct:root=layout
+    else:
+        selected=[d for d in layout['manifests'] if d['digest']==digest]
+        assert len(selected)==1,'OCI layout does not select the built digest'
+        root=obj(blob(selected[0]))
+    assert root['schemaVersion']==2 and root['mediaType']==index_type,'release needs an OCI index'
+    descriptors=root['manifests'];assert isinstance(descriptors,list) and 2<=len(descriptors)<=64
+    images=[d for d in descriptors if d.get('annotations',{}).get('vnd.docker.reference.type')!='attestation-manifest']
+    assert len(images)==2 and len({d['digest'] for d in images})==2,'exactly two executable images are required'
+    for descriptor in descriptors:
+        assert descriptor['mediaType']==manifest_type,'unsupported OCI manifest type'
+        manifest=obj(blob(descriptor));assert manifest['schemaVersion']==2 and manifest['mediaType']==manifest_type
+        config=obj(blob(manifest['config']));layers=manifest['layers']
+        assert isinstance(layers,list) and len(layers)<=256
+        for layer in layers:blob(layer)
+        if descriptor not in images:
+            assert descriptor['platform']=={'architecture':'unknown','os':'unknown'},'unsupported evidence platform'
+            assert descriptor['annotations']['vnd.docker.reference.digest'] in {d['digest'] for d in images},'unbound OCI evidence'
+            continue
+        platform=descriptor['platform'];arch=platform['architecture']
+        assert platform['os']=='linux' and arch in ['amd64','arm64'] and platform.get('variant','') in ['', 'v8']
+        assert config['os']=='linux' and config['architecture']==arch and config.get('variant','') in ['', 'v8'],'OCI platform config mismatch'
+        assert arch=='arm64' or not platform.get('variant') and not config.get('variant'),'invalid amd64 variant'
+        labels=config['config']['Labels']
+        assert labels['org.opencontainers.image.version']==build['version'].removeprefix('v'),'OCI binary version label mismatch'
+        assert labels['org.opencontainers.image.revision']==build['release_source_revision'],'OCI source label mismatch'
+        expected={}
+        for path in (Path(build['context'])/'dist'/arch).iterdir():
+            assert stat.S_ISREG(path.lstat().st_mode),'nonregular authenticated binary'
+            with path.open('rb') as source:expected['usr/local/bin/'+path.name]=hashlib.file_digest(source,'sha256').hexdigest()
+        assert expected,'no authenticated binaries'
+        parents={str(p) for name in expected for p in PurePosixPath(name).parents if str(p)!='.'}
+        state={};diff_ids=config['rootfs']['diff_ids']
+        assert config['rootfs']['type']=='layers' and len(diff_ids)==len(layers),'OCI layer configuration mismatch'
+        class Reader:
+            def __init__(self,source):self.source=source;self.hash=hashlib.sha256();self.size=0
+            def read(self,size):
+                value=self.source.read(size);self.size+=len(value)
+                assert self.size<=8589934592,'oversized uncompressed OCI layer'
+                self.hash.update(value);return value
+        for index,layer in enumerate(layers):
+            media=layer['mediaType']
+            assert media in ['application/vnd.oci.image.layer.v1.tar','application/vnd.oci.image.layer.v1.tar+gzip'],'unsupported OCI layer compression'
+            with archive.extractfile(members[blob(layer)]) as compressed:
+                source=gzip.GzipFile(fileobj=compressed) if media.endswith('+gzip') else compressed
+                reader=Reader(source);changes={};removed=set();size=0
+                with tarfile.open(fileobj=reader,mode='r|') as files:
+                    for count,member in enumerate(files):
+                        assert count<100000 and member.size<=1073741824,'oversized layer entry set'
+                        size+=member.size;assert size<=8589934592,'oversized layer payload'
+                        path=PurePosixPath(member.name)
+                        assert not path.is_absolute() and '..' not in path.parts,'unsafe layer path'
+                        name=str(path);parent=str(path.parent);prefix='' if parent=='.' else parent+'/'
+                        if path.name=='.wh..wh..opq':removed.update(n for n in expected if n.startswith(prefix))
+                        elif path.name.startswith('.wh.'):removed.update(n for n in expected if n==prefix+path.name[4:] or n.startswith(prefix+path.name[4:]+'/'))
+                        elif name in parents:assert member.isdir(),'packaged binary parent is not a directory'
+                        elif name in expected:
+                            assert member.isfile() and not member.issparse() and name not in changes and member.mode&0o111,'invalid packaged binary'
+                            with files.extractfile(member) as binary:changes[name]=hashlib.file_digest(binary,'sha256').hexdigest()
+                while reader.read(1048576):pass
+                assert 'sha256:'+reader.hash.hexdigest()==diff_ids[index],'OCI uncompressed layer hash mismatch'
+                for name in removed:state.pop(name,None)
+                state.update(changes)
+        assert state==expected,'packaged binaries differ from authenticated release archives'
+        rows.append({'reference':build['repository']+'@'+descriptor['digest'],'digest':descriptor['digest'],'platform':'linux/'+arch})
+    assert {row['platform'] for row in rows}=={'linux/amd64','linux/arm64'},'missing or duplicate OCI platform'
+    destination=Path(sys.argv[3]);destination.mkdir(mode=0o700)
+    for name,member in members.items():
+        if name=='index.json':continue
+        target=destination/name;target.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+        with archive.extractfile(member) as source,target.open('xb') as output:shutil.copyfileobj(source,output)
+        if name.startswith('blobs/'):
+            with target.open('rb') as copied:assert hashlib.file_digest(copied,'sha256').hexdigest()==name.rsplit('/',1)[1],'staged OCI blob changed'
+    if direct:
+        raw=data('index.json');target=destination/'blobs/sha256'/digest[7:]
+        if not target.exists():
+            with target.open('xb') as output:output.write(raw)
+        layout={'schemaVersion':2,'mediaType':index_type,'manifests':[{'mediaType':index_type,'digest':digest,'size':len(raw)}]}
+        index_bytes=json.dumps(layout,separators=(',',':')).encode()
+    else:index_bytes=data('index.json')
+    with (destination/'index.json').open('xb') as output:output.write(index_bytes)
+print(json.dumps(sorted(rows,key=lambda row:row['platform']),separators=(',',':')))
+PY
+}
+
+# Push only the collected, independently inspected OCI archive. Registry tags
+# are the final mutation, after immutable upload, signatures and both SBOMs.
+_dk_release_published() (
+    umask 077
+    local plan="$1" identity="$2" issuer="$3" skip="$4" build image archive work local_inventory inventory after scans evidence result tag tags
+    _dk_verify_policy "$identity" "$issuer" || return $?
+    [[ "$skip" == false ]] || { _dk_log_error 'Published-release containers require image signatures'; return 4; }
+    docker_check_cosign && _dk_dependency syft && _dk_dependency skopeo || return 3
+    build=$(_dk_build_execute "$plan") || return $?
+    image=$(jq -er '.reference' <<< "$build") || return 7
+    work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-container-publish.XXXXXXXX") || return 7
+    _dk_log_info "Retaining container publication inputs and evidence: $work"
+    archive="$work/image.oci.tar"
+    cp -- "$(jq -er '.output_file' <<< "$build")" "$archive" || return 7
+    [[ "$(_dk_hash "$archive")" == "$(jq -r '.archive.sha256' <<< "$build")" ]] || return 7
+    local_inventory=$(_dk_oci_inventory "$archive" "$build" "$work") || return 7
+    skopeo inspect --raw "oci:$work/layout" > "$work/transport-manifest.json" || return 7
+    [[ "sha256:$(_dk_hash "$work/transport-manifest.json")" == "${image##*@}" ]] || return 7
+    if [[ "$image" == ghcr.io/* && -n "${DSR_GH_TOKEN:-${GITHUB_TOKEN:-${GH_TOKEN:-}}}" ]]; then docker_login_ghcr || return $?; fi
+    _dk_public_release_unchanged "$build" "$work" || return $?
+    skopeo copy --all --preserve-digests --digestfile "$work/upload.digest" \
+        "oci:$work/layout" "docker://$image" >&2 || return 7
+    [[ "$(cat "$work/upload.digest")" == "${image##*@}" ]] || return 7
+    inventory=$(_dk_registry_inventory "$image" '["linux/amd64","linux/arm64"]' "$work") || return $?
+    [[ "$inventory" == "$local_inventory" ]] || return 7
+    scans=$(_dk_prepare_sboms "$inventory" "$work") || return $?
+    docker_sign "$image" >/dev/null || return $?
+    _dk_verify_signature "$image" "$identity" "$issuer" "$work/signature.json" || return $?
+    evidence=$(_dk_publish_sboms "$scans" "$identity" "$issuer" "$work") || return $?
+    result=$(_dk_evidence_command verify-scans "$image" "$scans" --certificate-identity "$identity" --certificate-oidc-issuer "$issuer") || return $?
+    jq -e --argjson evidence "$evidence" '
+        (.platforms|map({reference,predicate_sha256})|sort_by(.reference)) ==
+        ($evidence|map({reference,predicate_sha256})|sort_by(.reference))' <<< "$result" >/dev/null || return 7
+    tags=$(jq -r '.tags[]' <<< "$build") || return 7
+    : > "$work/tag-transitions.jsonl" || return 7
+    while IFS= read -r tag; do
+        _dk_public_release_unchanged "$build" "$work" || return $?
+        jq -nc --arg tag "$tag" --arg image "$image" '{tag:$tag,reference:$image,status:"attempting"}' >> "$work/tag-transitions.jsonl" || return 7
+        skopeo copy --all --preserve-digests --digestfile "$work/tag.digest" "docker://$image" "docker://$tag" >&2 || return 7
+        [[ "$(cat "$work/tag.digest")" == "${image##*@}" ]] || return 7
+        jq -nc --arg tag "$tag" --arg image "$image" '{tag:$tag,reference:$image,status:"verified"}' >> "$work/tag-transitions.jsonl" || return 7
+    done <<< "$tags"
+    _dk_check_tags "$build" "$work" || return $?
+    after=$(_dk_registry_inventory "$image" '["linux/amd64","linux/arm64"]' "$work") || return $?
+    [[ "$inventory" == "$after" ]] || return 7
+    _dk_public_release_unchanged "$build" "$work" || return $?
+    result=$(_dk_evidence_command verify-scans "$image" "$scans" --certificate-identity "$identity" --certificate-oidc-issuer "$issuer") || return $?
+    jq -e --argjson evidence "$evidence" '
+        (.platforms|map({reference,predicate_sha256})|sort_by(.reference)) ==
+        ($evidence|map({reference,predicate_sha256})|sort_by(.reference))' <<< "$result" >/dev/null || return 7
+    jq -nc --argjson build "$build" --argjson evidence "$evidence" --argjson result "$result" '
+        {schema_version:1,kind:"dsr-container-release",status:"verified",build:$build,
+         reference:$build.reference,signature:"verified",sbom:"verified",platforms:$evidence,verification:$result}'
+)
+
 # Release failures are never downgraded to warnings. Dependencies are checked
 # before push; completed external effects are not deleted to hide a late error.
 docker_release() (
-    local skip=false plan build image work inventory after scans evidence expected result
+    local skip=false published=false plan build image work inventory after scans evidence expected result release_output
     local identity="${DOCKER_CERTIFICATE_IDENTITY:-}" issuer="${DOCKER_CERTIFICATE_OIDC_ISSUER:-}"
     local -a args=()
     while [[ $# -gt 0 ]]; do
@@ -965,9 +1173,11 @@ docker_release() (
                 case "$1" in --certificate-identity) identity="$2" ;; *) issuer="$2" ;; esac
                 shift 2 ;;
             --skip-sign) skip=true; shift ;;
+            --published-release) published=true; args+=(--published-release); shift ;;
             --help|-h)
                 printf '%s\n' 'docker_release - Build, push, sign, and attest container image' \
                     'Usage: docker_release TOOL VERSION [build options] [--skip-sign] [--dry-run]' \
+                    '  --published-release (publish a collected, inspected signed-release OCI export)' \
                     '  --certificate-identity ID --certificate-oidc-issuer HTTPS_ISSUER' >&2
                 return 0 ;;
             --push|--local|--output) _dk_log_error 'Release requires registry export'; return 4 ;;
@@ -975,11 +1185,23 @@ docker_release() (
         esac
     done
     [[ ${#args[@]} -gt 0 ]] || { _dk_log_error 'Tool and version required'; return 4; }
-    plan=$(_dk_build_plan "${args[@]}" --push) || return $?
+    if $published; then
+        $skip && { _dk_log_error 'Published-release containers require image signatures'; return 4; }
+        # Every attempt retains its collected archive. A failed upload must not
+        # make a retry collide with the previous attempt's successful export.
+        release_output="${DOCKER_OUTPUT_DIR:-${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/containers}/release-${BASHPID}-${RANDOM}.oci.tar"
+        plan=$(_dk_build_plan "${args[@]}" --output "$release_output") || return $?
+    else
+        plan=$(_dk_build_plan "${args[@]}" --push) || return $?
+    fi
     if [[ $(jq -r '.dry_run' <<< "$plan") == true ]]; then
         jq -c --argjson skip "$skip" --arg identity "$identity" --arg issuer "$issuer" '
             . + {kind:"dsr-container-release",certificate_identity:$identity,certificate_oidc_issuer:$issuer,
                  signature:(if $skip then "skipped" else "planned" end),sbom:"planned"}' <<< "$plan"
+        return $?
+    fi
+    if [[ $(jq -r '.published_release // false' <<< "$plan") == true ]]; then
+        _dk_release_published "$plan" "$identity" "$issuer" "$skip"
         return $?
     fi
     _dk_verify_policy "$identity" "$issuer" || return $?
@@ -1061,6 +1283,7 @@ export -f docker_setup_buildx docker_setup docker_command docker_check_ghcr_auth
 export -f docker_is_containerized docker_find_dockerfile docker_build docker_sign
 export -f docker_attest_sbom docker_release docker_build_json docker_release_json
 export -f _dk_build_execute_local _dk_build_remote_release _dk_published_release_context _dk_clear_git_context
+export -f _dk_public_release_unchanged _dk_oci_inventory _dk_release_published
 export -f _dk_log_info _dk_log_ok _dk_log_warn _dk_log_error _dk_log_debug
 export -f _dk_dependency _dk_resolve_gh_token _dk_tag_valid _dk_repository_valid _dk_pinned_valid
 export -f _dk_platforms _dk_hash _dk_build_plan _dk_build_execute _dk_spdx_valid _dk_json

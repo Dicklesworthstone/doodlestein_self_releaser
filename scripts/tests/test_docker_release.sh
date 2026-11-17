@@ -43,7 +43,10 @@ if [[ "${1:-} ${2:-} ${3:-}" == 'buildx imagetools inspect' ]]; then
     digest="${ref##*@sha256:}"
     if [[ "$ref" != *@* ]]; then
         if [[ "${DK_MODE:-}" == tag-drift || -f "$DK_REGISTRY/tag-moved" ]]; then echo changed; exit; fi
-        digest="${DK_DIGEST#sha256:}"
+        if [[ -f "$DK_REGISTRY/tags.json" ]]; then
+            digest=$(jq -er --arg ref "$ref" '.[$ref]' "$DK_REGISTRY/tags.json") || exit 19
+            digest="${digest#sha256:}"
+        else digest="${DK_DIGEST#sha256:}"; fi
     fi
     if [[ "$5" == --raw ]]; then
         [[ "${DK_MODE:-}" != raw-corrupt ]] || { printf corrupt; exit; }
@@ -72,6 +75,7 @@ for arch in ['amd64','arm64']:
         assert value==binary+' 1.2.3','wrong binary version'
 PY
 fi
+published_context="${*: -1}"
 metadata='' dest=''
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -92,8 +96,72 @@ case "${DK_MODE:-}" in
     *) jq -nc --arg digest "$DK_DIGEST" '{"containerimage.digest":$digest,"containerimage.descriptor":{"digest":$digest}}' > "$metadata" ;;
 esac
 if [[ -n "$dest" && "${DK_MODE:-}" != no-archive ]]; then
-    # Real tar bytes exercise publication; this is not a real OCI image.
-    tar -cf "$dest" -C "$DK_WORK" payload
+    if [[ "${DK_PUBLISHED_CHECK:-0}" == 1 ]]; then
+        # Real OCI layout/blob/layer bytes, with fixture shell programs. Docker
+        # build/execution is still substituted; this is never native-image proof.
+        python3 -I - "$dest" "$metadata" "$published_context" <<'PY' || exit 19
+import gzip,hashlib,io,json,os,sys,tarfile
+from pathlib import Path
+dest,metadata,context=map(Path,sys.argv[1:]);label=Path(os.environ['PUBLISHED_CASE']).name;blobs={};images=[]
+def encoded(value):return json.dumps(value,separators=(',',':')).encode()
+def blob(data,media):
+    digest=hashlib.sha256(data).hexdigest();blobs[digest]=data
+    return {'mediaType':media,'digest':'sha256:'+digest,'size':len(data)}
+def layer(entries):
+    output=io.BytesIO()
+    with tarfile.open(fileobj=output,mode='w') as t:
+        for name,data in entries:
+            member=tarfile.TarInfo(name);member.mode=0o755
+            if data is None:member.type=tarfile.SYMTYPE;member.linkname='elsewhere';t.addfile(member)
+            else:member.size=len(data);t.addfile(member,io.BytesIO(data))
+    raw=output.getvalue()
+    return blob(gzip.compress(raw,mtime=0),'application/vnd.oci.image.layer.v1.tar+gzip'),'sha256:'+hashlib.sha256(raw).hexdigest()
+for arch in ['amd64','arm64']:
+    entries=[('usr/local/bin/'+name,(context/'dist'/arch/name).read_bytes()) for name in ['am','mcp-agent-mail']]
+    if label=='publish-wrong-binary':entries[0]=(entries[0][0],entries[0][1]+b'\n# wrong packaged bytes\n')
+    first,diff=layer(entries);layers=[first];diffs=[diff]
+    if label in ['publish-whiteout','publish-parent-link']:
+        extra,extra_diff=layer([('.wh.usr',b'')] if label=='publish-whiteout' else [('usr/local',None)])
+        layers.append(extra);diffs.append(extra_diff)
+    if label=='publish-wrong-diffid':diffs[0]='sha256:'+'0'*64
+    config={'os':'linux','architecture':'amd64' if label=='publish-config' and arch=='arm64' else arch,
+            'config':{'Labels':{'org.opencontainers.image.version':'9.9.9' if label=='publish-version' else '1.2.3',
+              'org.opencontainers.image.revision':'e'*40 if label=='publish-source' else os.environ['DK_RELEASE_SHA']}},
+            'rootfs':{'type':'layers','diff_ids':diffs}}
+    cfg=blob(encoded(config),'application/vnd.oci.image.config.v1+json')
+    if label=='publish-size':cfg['size']+=1
+    manifest=blob(encoded({'schemaVersion':2,'mediaType':'application/vnd.oci.image.manifest.v1+json','config':cfg,'layers':layers}),
+                  'application/vnd.oci.image.manifest.v1+json')
+    images.append(dict(manifest,platform={'os':'linux','architecture':arch}))
+if label=='publish-missing-platform':images=images[:1]
+evidence=[]
+for image in images:
+    config=blob(encoded({'os':'unknown','architecture':'unknown','config':{},'rootfs':{'type':'layers','diff_ids':[]}}),'application/vnd.oci.image.config.v1+json')
+    statement=blob(encoded({'subject':[{'digest':{'sha256':image['digest'][7:]}}]}),'application/vnd.in-toto+json')
+    record=blob(encoded({'schemaVersion':2,'mediaType':'application/vnd.oci.image.manifest.v1+json','config':config,'layers':[statement]}),
+                'application/vnd.oci.image.manifest.v1+json')
+    evidence.append(dict(record,platform={'os':'unknown','architecture':'unknown'},annotations={
+        'vnd.docker.reference.type':'attestation-manifest','vnd.docker.reference.digest':'sha256:'+'0'*64 if label=='publish-unbound-evidence' else image['digest']}))
+images+=evidence
+root=encoded({'schemaVersion':2,'mediaType':'application/vnd.oci.image.index.v1+json','manifests':images})
+if label=='publish-duplicate-json':root=root[:-1]+b',"schemaVersion":2}'
+selected=blob(root,'application/vnd.oci.image.index.v1+json')
+layout=encoded({'schemaVersion':2,'mediaType':'application/vnd.oci.image.index.v1+json','manifests':[selected]})
+if label=='publish-direct-index':layout=root;blobs.pop(selected['digest'][7:])
+with tarfile.open(dest,'w') as t:
+    records={'oci-layout':encoded({'imageLayoutVersion':'1.0.0'}),'index.json':layout}
+    records.update({'blobs/sha256/'+digest:data for digest,data in blobs.items()})
+    if label=='publish-corrupt-blob':
+        name=next(n for n in records if n.startswith('blobs/'));records[name]+=b'corrupt'
+    for name,data in records.items():
+        member=tarfile.TarInfo(name);member.size=len(data);t.addfile(member,io.BytesIO(data))
+    if label=='publish-oci-link':
+        member=tarfile.TarInfo('link');member.type=tarfile.SYMTYPE;member.linkname='/outside';t.addfile(member)
+metadata.write_text(json.dumps({'containerimage.digest':selected['digest'],'containerimage.descriptor':{'digest':selected['digest']}}))
+PY
+    else
+        tar -cf "$dest" -C "$DK_WORK" payload
+    fi
 fi
 echo 'build progress on stdout'
 SH
@@ -257,10 +325,12 @@ build() { docker_build tool 1.2.3 --repo-path "$REPO" "$@"; }
 release() { docker_release tool 1.2.3 --repo-path "$REPO" "$@"; }
 
 published_release_cases() {
-python3 - "$ROOT" "$MODULE" "$WORK" <<'PY'
+local cohort="${1:-all}" cohort_work="$WORK/published-${1:-all}"
+mkdir "$cohort_work" || return 1
+python3 - "$ROOT" "$MODULE" "$cohort_work" "$cohort" "$CLI" <<'PY'
 import hashlib,io,json,os,re,shutil,subprocess,sys,tarfile
 from pathlib import Path
-root,module,work=map(Path,sys.argv[1:]);base=work/'published-base';base.mkdir()
+root,module,work=map(Path,sys.argv[1:4]);cohort=sys.argv[4];base=work/'published-base';base.mkdir()
 repo=base/'repo';repo.mkdir();assets=base/'assets';assets.mkdir()
 def run(args,**kwargs):return subprocess.run(args,check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,**kwargs)
 run(['minisign','-G','-W','-p',str(repo/'minisign.pub'),'-s',str(base/'key')])
@@ -290,22 +360,31 @@ contract={'checksum_sidecar':'sha256','minisign_public_key_file':'minisign.pub',
           'exact_additional_assets':['SHA256SUMS','SHA256SUMS.minisig'],'build_manifest_assets':['build-manifest.json']}
 config={'tool_name':'tool','repo':'owner/app','targets':['linux/amd64','linux/arm64'],
         'container_release_from_published_assets':True,'container_binaries':['am','mcp-agent-mail'],'release_contract':contract}
-source=(root/'dsr').read_text();functions=work/'published-functions.sh'
+source=Path(sys.argv[5]).read_text();functions=work/'published-functions.sh'
 functions.write_text('\n'.join(re.search(r'^'+n+r'\(\) \{\n.*?^\}',source,re.M|re.S).group(0)
     for n in ['_release_contract_verify_remote_tag_identity','_release_contract_observe_remote_inventory']))
+with functions.open('a') as f:
+    for name in ['json_envelope','_docker_command']:
+        f.write('\n'+re.search(r'^'+name+r'\(\) \{\n.*?^\}\n(?=\n# =)',source,re.M|re.S).group(0))
+version=re.search(r'^DSR_VERSION="([^"]+)"',source,re.M).group(1)
 api=r'''
 import json,os,sys
 from pathlib import Path
 c=Path(os.environ['PUBLISHED_CASE']);a=sys.argv[1:];r=json.loads((c/'release.json').read_text())
 with (c/'api-calls').open('a') as f:f.write(json.dumps(a)+'\n')
-label=c.name
+label=c.name.removeprefix('publish-input-')
 if label=='auth-denied':print('controlled authentication refusal',file=sys.stderr);sys.exit(1)
 if a[0]=='download':
     asset=next(x for x in r['assets'] if x['id']==int(a[1]));p=Path(a[2]);assert not p.exists();p.write_bytes((c/'assets'/asset['name']).read_bytes());sys.exit(0)
 e=a[0]
-if '/git/ref/tags/' in e:print(json.dumps({'object':{'type':'commit','sha':'f'*40 if label=='wrong-source' else os.environ['DK_RELEASE_SHA']}}))
+if '/git/ref/tags/' in e:print(json.dumps({'object':{'type':'commit','sha':'f'*40 if label=='wrong-source' or label=='publish-git-drift' and (c/'rch-args.json').exists() else os.environ['DK_RELEASE_SHA']}}))
 elif '/releases/7/assets?' in e:print(json.dumps([] if 'page=2' in e else r['assets']))
 elif '/releases/' in e:
+    copies=[json.loads(x) for x in (c/'skopeo-calls').read_text().splitlines() if json.loads(x)[0]=='copy']
+    if (label=='publish-release-before-upload' and (c/'rch-args.json').exists() or
+        label=='publish-release-before-tags' and len(copies)>=1 or
+        label=='publish-release-after-first-tag' and len(copies)>=2):r['body']='changed during publisher transition'
+    if label=='publish-release-replaced' and (c/'rch-args.json').exists() and '/tags/' in e:r['id']=8
     if label=='changed-release' and len([x for x in (c/'api-calls').read_text().splitlines() if '/releases/7"' in x])>2:r['body']='changed after download'
     if label=='truncated-embedded':r['assets']=[]
     print(json.dumps(r))
@@ -350,6 +429,36 @@ print(json.dumps({'api_version':'1.0','outcome':'completed','location':location,
     'admission':{'worker_id':'explicit-fixture','strict_remote':True,'terminal_acknowledged':label!='rch-unacknowledged'},
     'remote_exit_code':0,'result_dirs':[{'path':'.dsr-container-result','status':'missing' if label=='rch-missing' else 'ok','files':2,'bytes':1}]}))
 '''
+skopeo=r'''#!/usr/bin/env python3
+import json,os,sys,tarfile
+from pathlib import Path
+c=Path(os.environ['PUBLISHED_CASE']);label=c.name;a=sys.argv[1:];registry=c/'registry'
+with (c/'skopeo-calls').open('a') as f:f.write(json.dumps(a)+'\n')
+def content(source):
+    layout=Path(source.removeprefix('oci:'));index=json.loads((layout/'index.json').read_text());digest=index['manifests'][0]['digest']
+    data={str(p.relative_to(layout)):p.read_bytes() for p in layout.rglob('*') if p.is_file()}
+    return digest,data
+if a[0]=='inspect':
+    digest,data=content(a[-1]);sys.stdout.buffer.write(data['blobs/sha256/'+digest[7:]]+(b'corrupt' if label=='publish-inspect' else b''));sys.exit(0)
+assert a[0]=='copy' and '--all' in a and '--preserve-digests' in a
+source,dest=a[-2:];out=Path(a[a.index('--digestfile')+1]);dest=dest.removeprefix('docker://')
+if source.startswith('oci:'):
+    if label=='publish-upload-fail':print('controlled immutable upload failure',file=sys.stderr);sys.exit(19)
+    digest,data=content(source);assert dest.endswith('@'+digest)
+    root=json.loads(data['blobs/sha256/'+digest[7:]])
+    for name,value in data.items():
+        if name.startswith('blobs/sha256/'):(registry/'raw'/name.rsplit('/',1)[1]).write_bytes(value)
+    for image in root['manifests']:
+        manifest=json.loads(data['blobs/sha256/'+image['digest'][7:]])
+        (registry/'config'/image['digest'][7:]).write_bytes(data['blobs/sha256/'+manifest['config']['digest'][7:]])
+    if label=='publish-upload-digest':digest='sha256:'+'0'*64
+else:
+    digest=source.rsplit('@',1)[1]
+    if label=='publish-promote-fail' or label=='publish-partial' and dest.endswith(':latest'):
+        print('controlled tag promotion failure',file=sys.stderr);sys.exit(19)
+    tags=json.loads((registry/'tags.json').read_text());tags[dest]=digest;(registry/'tags.json').write_text(json.dumps(tags))
+out.write_text(digest+'\n')
+'''
 driver=r'''
 set -uo pipefail
 source "$ROOT/src/config.sh"
@@ -361,7 +470,15 @@ _dsr_require() { :; } # All actual dependency modules are explicitly loaded abov
 log_error() { printf '%s\n' "$*" >&2; }
 gh_api() { python3 "$PUBLISHED_CASE/api.py" "$@"; }
 gh_download_release_asset() { python3 "$PUBLISHED_CASE/api.py" download "$2" "$3"; }
-docker_build tool 1.2.3 --repo-path "$PUBLISHED_CASE/repo" --output "${PUBLISHED_OUTPUT:-$PUBLISHED_CASE/output/image.tar}" "$@"
+if [[ "${PUBLISHED_OPERATION:-build}" == release ]]; then
+    export DOCKER_OUTPUT_DIR="$PUBLISHED_CASE/output"
+    if [[ "${PUBLISHED_ADAPTER:-0}" == 1 ]]; then
+        JSON_MODE=true; DRY_RUN=false
+        _docker_command release tool 1.2.3 --repo-path "$PUBLISHED_CASE/repo" --tag latest "$@"
+    else docker_release tool 1.2.3 --repo-path "$PUBLISHED_CASE/repo" --tag latest "$@"; fi
+else
+    docker_build tool 1.2.3 --repo-path "$PUBLISHED_CASE/repo" --output "${PUBLISHED_OUTPUT:-$PUBLISHED_CASE/output/image.tar}" "$@"
+fi
 '''
 checks=0
 def check(label,condition):
@@ -373,7 +490,19 @@ negatives=['wrong-tag','wrong-source','missing-signature','empty-signature','tam
            'missing-build-manifest','duplicate-entry','duplicate-build-source','bad-build-inventory','archive-link','archive-traversal','changed-release',
            'auth-denied','rch-refused','rch-local','rch-missing','rch-corrupt','rch-wrong-platform','rch-unacknowledged',
            'rch-corrupt-input','rch-corrupt-input-manifest','rch-wrong-source-receipt']
-for label in ['valid','truncated-embedded','inherited-index','inherited-git-context']+negatives:
+publication=['publish-valid','publish-direct-index','publish-unbound-evidence','publish-corrupt-blob','publish-missing-platform','publish-config','publish-version',
+             'publish-source','publish-size','publish-wrong-binary','publish-wrong-diffid','publish-whiteout',
+             'publish-parent-link','publish-duplicate-json','publish-oci-link','publish-inspect','publish-upload-fail',
+             'publish-upload-digest','publish-scan-fail','publish-sign-fail','publish-evidence-fail','publish-promote-fail','publish-partial',
+             'publish-release-before-upload','publish-release-before-tags','publish-release-after-first-tag',
+             'publish-git-drift','publish-release-replaced',
+             'publish-input-wrong-tag','publish-input-wrong-source','publish-input-missing-signature',
+             'publish-input-empty-signature','publish-input-tampered-manifest','publish-input-untrusted-signer',
+             'publish-input-incomplete-manifest','publish-input-wrong-version']
+labels=(['valid','truncated-embedded','inherited-index','inherited-git-context']+negatives if cohort!='publisher' else [])
+labels+=publication if cohort!='export' else []
+assert labels,'empty published-release cohort'
+for label in labels:
     c=work/('published-'+label);shutil.copytree(base,c)
     # The transport cases use the short label, independently of temp paths.
     case=c/label;case.mkdir()
@@ -382,8 +511,14 @@ for label in ['valid','truncated-embedded','inherited-index','inherited-git-cont
     (c/'tmp').mkdir();(c/'config/repos.d').mkdir(parents=True);(c/'config/repos.d/tool.yaml').write_text(json.dumps(config))
     (c/'api.py').write_text(api);(c/'api-calls').write_text('');(c/'calls').write_text('')
     (c/'bin').mkdir();(c/'bin/rch').write_text(rch);(c/'bin/rch').chmod(0o700)
+    (c/'bin/skopeo').write_text(skopeo);(c/'bin/skopeo').chmod(0o700);(c/'skopeo-calls').write_text('')
+    (c/'registry').mkdir()
+    for name in ['raw','config','signed','attestations']:(c/'registry'/name).mkdir()
+    old_tags={'ghcr.io/acme/tool:v1.2.3':'sha256:'+'0'*64,'ghcr.io/acme/tool:latest':'sha256:'+'0'*64}
+    (c/'registry/tags.json').write_text(json.dumps(old_tags))
     a=c/'assets'
-    if label=='wrong-version':archive(a/names['linux/amd64'],version='9.9.9')
+    input_label=label.removeprefix('publish-input-')
+    if input_label=='wrong-version':archive(a/names['linux/amd64'],version='9.9.9')
     if label in ['archive-link','archive-traversal']:archive(a/names['linux/amd64'],special=label.split('-')[1])
     current_manifest=dict(manifest,artifacts=[{'name':n,'sha256':hashlib.sha256((a/n).read_bytes()).hexdigest(),
         'size_bytes':(a/n).stat().st_size} for n in names.values()])
@@ -394,18 +529,18 @@ for label in ['valid','truncated-embedded','inherited-index','inherited-git-cont
         json.dumps(manifest)[:-1]+',"source":{"git_sha":"'+'e'*40+'"},"source":{"git_sha":"'+sha+'"}}')
     payloads=sorted(p for p in a.iterdir() if p.name not in ['SHA256SUMS','SHA256SUMS.minisig'])
     lines=[hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n' for p in payloads]
-    if label=='incomplete-manifest':lines=lines[1:]
+    if input_label=='incomplete-manifest':lines=lines[1:]
     if label=='duplicate-entry':lines+=lines[:1]
     (a/'SHA256SUMS').write_text(''.join(lines))
-    run(['minisign','-S','-s',str(c/('other.key' if label=='untrusted-signer' else 'key')),
+    run(['minisign','-S','-s',str(c/('other.key' if input_label=='untrusted-signer' else 'key')),
          '-m',str(a/'SHA256SUMS'),'-t','tool v1.2.3 SHA256SUMS'])
-    if label=='tampered-manifest':(a/'SHA256SUMS').write_text((a/'SHA256SUMS').read_text()+'tampered\n')
+    if input_label=='tampered-manifest':(a/'SHA256SUMS').write_text((a/'SHA256SUMS').read_text()+'tampered\n')
     if label=='tampered-archive':(a/names['linux/amd64']).write_bytes(b'tampered archive')
-    skipped={'SHA256SUMS.minisig'} if label=='missing-signature' else set()
-    if label=='empty-signature':(a/'SHA256SUMS.minisig').write_bytes(b'')
+    skipped={'SHA256SUMS.minisig'} if input_label=='missing-signature' else set()
+    if input_label=='empty-signature':(a/'SHA256SUMS.minisig').write_bytes(b'')
     if label=='missing-platform':skipped.add(names['linux/arm64'])
     if label=='missing-build-manifest':skipped.add('build-manifest.json')
-    release={'id':7,'tag_name':'v1.2.4' if label=='wrong-tag' else 'v1.2.3','draft':False,'name':'candidate','body':'fixture',
+    release={'id':7,'tag_name':'v1.2.4' if input_label=='wrong-tag' else 'v1.2.3','draft':False,'name':'candidate','body':'fixture',
              'prerelease':False,'target_commitish':sha,'upload_url':'https://uploads.github.com/repos/owner/app/releases/7/assets',
              'assets':[{'id':i,'name':p.name,'size':p.stat().st_size,'state':'uploaded',
                         'digest':'sha256:'+hashlib.sha256(p.read_bytes()).hexdigest()}
@@ -413,8 +548,11 @@ for label in ['valid','truncated-embedded','inherited-index','inherited-git-cont
     (c/'release.json').write_text(json.dumps(release))
     env=dict(os.environ,ROOT=str(root),MODULE=str(module),PUBLISHED_CASE=str(c),PUBLISHED_FUNCTIONS=str(functions),
              DK_RELEASE_SHA=sha,DK_PUBLISHED_CHECK='1',DK_CALLS=str(c/'calls'),DK_MODE='',
+             DK_REGISTRY=str(c/'registry'),PUBLISHED_OPERATION='release' if label in publication else 'build',
+             PUBLISHED_ADAPTER='1' if label in ['publish-valid','publish-direct-index'] else '0',DSR_VERSION=version,
              DSR_CONFIG_DIR=str(c/'config'),DSR_REPOS_FILE=str(c/'config/repos.yaml'),TMPDIR=str(c/'tmp'),
              PATH=str(c/'bin')+os.pathsep+os.environ['PATH'])
+    env['DK_MODE']={'publish-scan-fail':'syft-fail','publish-sign-fail':'sign-fail','publish-evidence-fail':'attest-fail'}.get(label,'')
     if label.startswith('inherited-'):
         foreign=c/'foreign';foreign.mkdir();(foreign/'caller-only').write_text('preserve staged caller bytes\n')
         run(['git','-C',str(foreign),'init','--template=','-q','-b','main'])
@@ -429,6 +567,32 @@ for label in ['valid','truncated-embedded','inherited-index','inherited-git-cont
     if label.startswith('inherited-'):
         check(label+' preserves the caller index exactly',(foreign/'.git/index').read_bytes()==index_before)
     out=c/'output/image.tar';calls=[json.loads(x) for x in (c/'calls').read_text().splitlines()]
+    if label in publication:
+        tags=json.loads((c/'registry/tags.json').read_text())
+        transport=[json.loads(x) for x in (c/'skopeo-calls').read_text().splitlines()]
+        if label in ['publish-valid','publish-direct-index']:
+            check(label+' completes the actual publisher',result.returncode==0)
+            envelope=json.loads(result.stdout);receipt=envelope['details']['result'];image=receipt['reference']
+            check(label+' reports actual publication through the public adapter',envelope['exit_code']==0 and envelope['details']['pushed'] is True)
+            check(label+' promotes exactly the verified digest',set(tags.values())=={image.rsplit('@',1)[1]})
+            check(label+' preserves both verified platform predicates',len(receipt['platforms'])==2 and receipt['signature']=='verified' and receipt['sbom']=='verified')
+            check(label+' uploads the inspected layout before tag copies',len(transport)==4 and transport[1][-2].startswith('oci:') and '@sha256:' in transport[1][-1] and all(x[-2]=='docker://'+image for x in transport[2:]))
+            before=(c/'api-calls').read_bytes();calls_before=(c/'calls').read_bytes();transport_before=(c/'skopeo-calls').read_bytes()
+            planned=subprocess.run(['bash','-c',driver,'planned','--published-release','--dry-run'],env=env,capture_output=True,text=True)
+            check('published release dry-run is side-effect free after a completed export',planned.returncode==0 and json.loads(planned.stdout)['details']['result']['kind']=='dsr-container-release' and
+                  (c/'api-calls').read_bytes()==before and (c/'calls').read_bytes()==calls_before and (c/'skopeo-calls').read_bytes()==transport_before)
+            unsigned=subprocess.run(['bash','-c',driver,'unsigned','--published-release','--skip-sign','--dry-run'],env=env,capture_output=True,text=True)
+            check('published release cannot skip signatures even in a plan',unsigned.returncode!=0 and (c/'api-calls').read_bytes()==before and (c/'skopeo-calls').read_bytes()==transport_before)
+        else:
+            check(label+' returns failure',result.returncode!=0)
+            if label in ['publish-partial','publish-release-after-first-tag']:
+                check(label+' retains the acknowledged first tag',tags['ghcr.io/acme/tool:v1.2.3']!=old_tags['ghcr.io/acme/tool:v1.2.3'])
+                check(label+' preserves the failed second tag',tags['ghcr.io/acme/tool:latest']==old_tags['ghcr.io/acme/tool:latest'])
+            else:check(label+' leaves stable tags untouched',tags==old_tags)
+            if label not in ['publish-upload-digest','publish-scan-fail','publish-sign-fail','publish-evidence-fail','publish-promote-fail','publish-partial',
+                              'publish-release-before-tags','publish-release-after-first-tag']:
+                check(label+' prevents registry publication',not any(x[0]=='copy' for x in transport) or label=='publish-upload-fail')
+        continue
     if label in negatives:
         check(label+' returns failure',result.returncode!=0)
         check(label+' creates no exported image',not out.exists())
@@ -459,7 +623,7 @@ for label in ['valid','truncated-embedded','inherited-index','inherited-git-cont
             r=subprocess.run(['bash','-c',driver,'policy'],env=e,capture_output=True,text=True)
             check('strict/invalid source policy '+policy+' refuses without local fallback',
                   r.returncode!=0 and (c/'calls').read_bytes()==before)
-print(json.dumps({'assertions':checks,'passed':True,'boundary':'R2 transport/RCH/Docker; real Git, Minisign, archives and processes'}),flush=True)
+print(json.dumps({'cohort':cohort,'assertions':checks,'passed':True,'boundary':'R2 transport/RCH/Docker; real Git, Minisign, archives and processes'}),flush=True)
 PY
 }
 
@@ -467,11 +631,17 @@ if [[ "${1:-}" == --published-only ]]; then
     published_release_cases
     exit $?
 fi
+if [[ "${1:-}" == --publisher-only ]]; then
+    published_release_cases publisher
+    exit $?
+fi
 
 # Independent cases use their own directories and child environment. Run them
 # alongside the original suite to retain the runner's unchanged 120s bound.
-published_release_cases &
-published_pid=$!
+published_release_cases export &
+published_export_pid=$!
+published_release_cases publisher &
+published_publisher_pid=$!
 
 if [[ "${1:-}" != --cli-only ]]; then
 new_case dry
@@ -976,5 +1146,6 @@ else
 fi
 
 printf '\nContainer regression checks: %d; failures: %d\n' "$checks" "$failures"
-wait "$published_pid" || failures=$((failures+1))
+wait "$published_export_pid" || failures=$((failures+1))
+wait "$published_publisher_pid" || failures=$((failures+1))
 [[ "$failures" -eq 0 ]]
