@@ -6944,6 +6944,47 @@ if "\0" in data.decode("utf-8"):
 sys.stdout.buffer.write(data)' "$3"
 }
 
+# Execute the existing ACFS URL checker from the same immutable downstream
+# revision as its pin. The explicit checker policy trusts that repository's
+# code; no worktree hooks, user shell startup or exported functions are loaded.
+# Retain its bounded downloads and private output, including on failure.
+_release_contract_acfs_installer_checksum() {
+(
+    set -o pipefail
+    local downstream="$1" revision="$2" url="$3" snapshot file actual status=0
+    [[ "$downstream" == Dicklesworthstone/agentic_coding_flywheel_setup &&
+       "$revision" =~ ^[0-9a-f]{40}$ ]] || return 7
+    snapshot=$(mktemp -d "${TMPDIR:-/tmp}/dsr-acfs-check.XXXXXXXX") || return 7
+    log_info "Retaining ACFS checker at $revision in $snapshot"
+    for file in security.sh logging.sh; do
+        ( umask 077; set -o noclobber
+          # Open only our destination exclusively. GitHub's nested response
+          # helper must still be able to fill its own pre-created tempfiles.
+          { set +o noclobber
+            _release_contract_public_text_file "$downstream" "$revision" "scripts/lib/$file"
+          } > "$snapshot/$file"
+        ) || return 7
+    done
+    # Use the current Bash (ACFS needs Bash 4+) with a minimal public-download
+    # environment. No release credentials or ambient Bash hooks reach it.
+    ( umask 077; set -o noclobber
+      env -i PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin \
+        HOME="$snapshot" TMPDIR="$snapshot" NO_COLOR=1 LC_ALL=C \
+        "$BASH" --noprofile --norc "$snapshot/security.sh" --checksum "$url" --retain-temp-files \
+        > "$snapshot/stdout" 2> "$snapshot/stderr"
+    ) || status=$?
+    cat "$snapshot/stderr" >&2 || return 7
+    (( status == 0 )) || {
+        log_error "Required ACFS checksum checker failed (exit $status)"; return 7;
+    }
+    actual=$(cat "$snapshot/stdout") || return 7
+    [[ "$actual" =~ ^[0-9a-f]{64}$ ]] || {
+        log_error 'ACFS checksum checker returned an invalid digest'; return 7;
+    }
+    printf '%s\n' "$actual"
+)
+}
+
 # A local checksum edit or successful push response is not a public pin.
 # Re-observe committed bytes and both branch authorities around the check.
 _release_contract_verify_raw_installer_checksum() {
@@ -6975,7 +7016,10 @@ _release_contract_verify_raw_installer_checksum() {
     [[ "$actual" == "$expected" ]] || {
         log_error 'Immutable public main installer differs from release-source bytes'; return 7;
     }
-    actual=$(curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+    if [[ "$(jq -r '.policy.checker // ""' <<< "$plan")" == acfs ]]; then
+        actual=$(_release_contract_acfs_installer_checksum "$downstream" "$downstream_ref" "$url") || return 7
+    else
+        actual=$(curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
         --connect-timeout 10 --max-time 30 --max-filesize 2097152 \
         --user-agent "doodlestein_self_releaser-agent (+https://github.com/$repo)" \
         "$url" | python3 -I -c '
@@ -6984,6 +7028,7 @@ data = sys.stdin.buffer.read(2097153)
 if not 0 < len(data) <= 2097152:
     raise SystemExit("Raw installer response has invalid size")
 print(hashlib.sha256(data).hexdigest())') || return 7
+    fi
     [[ "$actual" == "$expected" ]] || {
         log_error 'Public main installer differs from release-source bytes'; return 7;
     }

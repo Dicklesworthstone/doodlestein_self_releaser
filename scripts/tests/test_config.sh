@@ -2168,6 +2168,25 @@ YAML
     [[ "$(config_get_release_contract_json contract-tool | jq -r '.raw_installer_checksum.installer_key')" == contract_tool ]]
 }
 
+test_release_contract_accepts_acfs_checksum_checker() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets: {linux/amd64: contract-tool-linux}
+  raw_installer_checksum:
+    checker: acfs
+    downstream_repo: Dicklesworthstone/agentic_coding_flywheel_setup
+    checksum_path: checksums.yaml
+    installer_key: mcp_agent_mail
+    installer_path: install.sh
+YAML
+  config_validate_release_contract contract-tool &&
+    [[ "$(config_get_release_contract_json contract-tool | jq -r '.raw_installer_checksum.checker')" == acfs ]]
+}
+
 test_release_contract_rejects_invalid_raw_installer_checksum_policy() {
   release_contract_test_deps_available || return 0
   local policy
@@ -2181,6 +2200,10 @@ test_release_contract_rejects_invalid_raw_installer_checksum_policy() {
     '{downstream_repo: owner/downstream, checksum_path: checksums.yaml, installer_key: "app\n", installer_path: install.sh}' \
     '{downstream_repo: owner/downstream, checksum_path: checksums.yaml, installer_key: app, installer_path: "install.sh\n"}' \
     '{downstream_repo: owner/downstream, checksum_path: checksums.yaml, installer_key: app, installer_path: /install.sh}' \
+    '{checker: acfs, downstream_repo: owner/downstream, checksum_path: checksums.yaml, installer_key: app, installer_path: install.sh}' \
+    '{checker: false, downstream_repo: Dicklesworthstone/agentic_coding_flywheel_setup, checksum_path: checksums.yaml, installer_key: app, installer_path: install.sh}' \
+    '{checker: null, downstream_repo: Dicklesworthstone/agentic_coding_flywheel_setup, checksum_path: checksums.yaml, installer_key: app, installer_path: install.sh}' \
+    '{checker: shell, downstream_repo: Dicklesworthstone/agentic_coding_flywheel_setup, checksum_path: checksums.yaml, installer_key: app, installer_path: install.sh}' \
     '{downstream_repo: owner/downstream, checksum_path: checksums.yaml, installer_key: app, installer_path: install.sh, branch: stale}'; do
     write_contract_tool_config << YAML
 tool_name: contract-tool
@@ -3657,6 +3680,7 @@ main() {
   run_test "release_contract_rejects_non_object" test_release_contract_rejects_non_object
   run_test "release_contract_valid_is_canonical_json" test_release_contract_valid_is_canonical_json
   run_test "release_contract_accepts_raw_installer_checksum_policy" test_release_contract_accepts_raw_installer_checksum_policy
+  run_test "release_contract_accepts_acfs_checksum_checker" test_release_contract_accepts_acfs_checksum_checker
   run_test "release_contract_rejects_invalid_raw_installer_checksum_policy" test_release_contract_rejects_invalid_raw_installer_checksum_policy
   run_test "release_contract_accepts_pinned_minisign_key_file" test_release_contract_accepts_pinned_minisign_key_file
   run_test "release_contract_accepts_pinned_github_tag_ruleset" test_release_contract_accepts_pinned_github_tag_ruleset

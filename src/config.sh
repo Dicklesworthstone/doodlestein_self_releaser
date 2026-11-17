@@ -1291,7 +1291,11 @@ _config_validate_raw_installer_checksum_json() {
             (split("/") | all(.[];
                 test("\\A[A-Za-z0-9][A-Za-z0-9._+-]*\\z") and . != "." and . != ".."));
         type == "object" and
-        keys == ["checksum_path", "downstream_repo", "installer_key", "installer_path"] and
+        ((keys - ["checker", "checksum_path", "downstream_repo", "installer_key", "installer_path"]) == []) and
+        (["checksum_path", "downstream_repo", "installer_key", "installer_path"] - keys == []) and
+        ((has("checker") | not) or
+            (.checker == "acfs" and
+             .downstream_repo == "Dicklesworthstone/agentic_coding_flywheel_setup")) and
         (.downstream_repo | type == "string" and length <= 200 and
             test("\\A[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*\\z")) and
         (.installer_path | project_path) and (.checksum_path | project_path) and

@@ -618,6 +618,7 @@ separately from the release archive checksums:
 release_contract:
   # Keep the existing exact asset, signature and source requirements.
   raw_installer_checksum:
+    checker: acfs
     downstream_repo: Dicklesworthstone/agentic_coding_flywheel_setup
     checksum_path: checksums.yaml
     installer_key: mcp_agent_mail
@@ -633,8 +634,16 @@ pins, failed downloads and moving refs block publication. A failed check after
 promotion attempts to restore the owned draft before returning an error.
 Offline plan mode only computes the expected digest and supplies no public verification.
 
-Run the downstream's existing refresh/check mechanism and commit/push its
-reviewed pin before publication. This gate reads public state; it does not
+With `checker: acfs`, DSR requires ACFS's existing `security.sh --checksum`
+command instead of its built-in URL hasher. This option trusts executable code
+from `Dicklesworthstone/agentic_coding_flywheel_setup`: DSR downloads the checker
+and logging library from the same immutable public commit as the checksum pin,
+verifies their Git blob identities, and runs them with a clean environment and
+private retained output. Checker errors or an invalid/different digest block
+publication; there is no fallback. Other downstreams omit this option.
+
+Run the downstream's refresh mechanism and commit/push its reviewed pin before
+publication. This gate reads public state; it does not
 generate, commit or push downstream changes. It accepts the ACFS generator's
 canonical `installers` mapping with quoted URL and SHA-256 fields, rejects
 duplicates, and leaves archive checksum synchronization as a separate operation.

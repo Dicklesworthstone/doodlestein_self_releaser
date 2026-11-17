@@ -93,7 +93,7 @@ endpoint=args[0]
 control=json.loads((c/'control.json').read_text())
 with (c/'requests.jsonl').open('a') as f:f.write(json.dumps(args)+'\n')
 r=json.loads((c/'remote.json').read_text())
-if endpoint.startswith('repos/owner/') and '/git/ref/heads/main' in endpoint:
+if endpoint.startswith(('repos/owner/', 'repos/Dicklesworthstone/agentic_coding_flywheel_setup/')) and '/git/ref/heads/main' in endpoint:
     if control.get('raw_auth_denied'):
         print('Controlled authentication refusal',file=sys.stderr);sys.exit(1)
     source=endpoint.startswith('repos/owner/app/')
@@ -107,17 +107,24 @@ if endpoint.startswith('repos/owner/') and '/git/ref/heads/main' in endpoint:
     value={'ref':'refs/heads/main','object':{'type':'commit','sha':sha}}
     if control.get('raw_bad_ref'):value['ref']='refs/heads/stale'
     print(json.dumps(value))
-elif endpoint.startswith('repos/owner/app/contents/install.sh?ref=') or endpoint.startswith('repos/owner/downstream/contents/checksums.yaml?ref='):
+elif endpoint.startswith(('repos/owner/app/contents/install.sh?ref=', 'repos/owner/downstream/contents/',
+                          'repos/Dicklesworthstone/agentic_coding_flywheel_setup/contents/')):
     ref=endpoint.split('?ref=',1)[1]
     source=endpoint.startswith('repos/owner/app/')
-    path='install.sh' if source else 'checksums.yaml'
+    path=endpoint.split('/contents/',1)[1].split('?ref=',1)[0]
+    checker=path.startswith('scripts/lib/')
+    if checker and control.get('checker_auth_denied'):
+        print('Controlled checker authentication refusal',file=sys.stderr);sys.exit(1)
     data=(subprocess.check_output(['git','-C',str(c/'repo'),'show',ref+':install.sh']) if source else
-          subprocess.check_output(['git','--git-dir',str(c/'downstream-public.git'),'show',ref+':checksums.yaml']))
+          subprocess.check_output(['git','--git-dir',str(c/'downstream-public.git'),'show',ref+':'+path]))
+    if checker and control.get('checker_post_publication_failure') and not r['draft']:
+        data=b'#!/bin/bash\nprintf "Controlled late checker failure\\n" >&2\nexit 23\n'
     if source and control.get('raw_wrong_source_blob'):data+=b'changed immutable main installer\n'
     blob=hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
     value={'type':'file','path':path,'encoding':'base64','size':len(data),'sha':blob,
            'content':base64.b64encode(data).decode()}
     if control.get('raw_bad_blob'):value['sha']='0'*40
+    if checker and control.get('checker_bad_blob'):value['sha']='0'*40
     if control.get('raw_bad_size'):value['size']+=1
     print(json.dumps(value))
 elif endpoint=='raw-installer-download':
@@ -239,6 +246,9 @@ source "${DSR_TEST_SIGNING_MODULE:-$ROOT/src/signing.sh}"
 source "$ROOT/src/artifact_naming.sh"
 source "$ROOT/src/sbom.sh"
 source "$FUNCTIONS"
+export DSR_CHECKER_SECRET_PROBE='must not reach the downstream process'
+dsr_checker_injected_function() { return 42; }
+export -f dsr_checker_injected_function
 log_error() { printf 'ERROR %s\n' "$*" >&2; }
 log_info() { printf 'INFO %s\n' "$*" >&2; }
 log_ok() { log_info "$@"; }
@@ -257,7 +267,18 @@ _dispatch_load_config() { printf 'false|||\n'; }
 _dispatch_is_true() { [[ "$1" == true ]]; }
 gh_check() { return 0; }
 gh_check_token() { return 0; }
-gh_api() { python3 "$CASE/api.py" "$@"; }
+gh_api() {
+    if [[ "$1" == */contents/scripts/lib/* ]]; then
+        # Like the real API helper, fill a safely pre-created response file.
+        # Exclusive destination creation must not leak noclobber into here.
+        local response_file
+        response_file=$(command mktemp "$CASE/tmp/script-delivery.XXXXXXXX") || return
+        python3 "$CASE/api.py" "$@" > "$response_file" || return
+        cat "$response_file"
+    else
+        python3 "$CASE/api.py" "$@"
+    fi
+}
 curl() {
     [[ "${!#}" == 'https://raw.githubusercontent.com/owner/app/refs/heads/main/install.sh' ]] || return 89
     python3 "$CASE/api.py" raw-installer-download
@@ -373,7 +394,7 @@ else
 fi
 '''
 
-def setup(label, controls=None, extra_assets=0, long_names=False, large_notes=False, raw_installer=False):
+def setup(label, controls=None, extra_assets=0, long_names=False, large_notes=False, raw_installer=False, acfs_checker=False):
     c=work/label;shutil.copytree(base,c)
     case_sha=sha
     if large_notes:
@@ -389,10 +410,27 @@ def setup(label, controls=None, extra_assets=0, long_names=False, large_notes=Fa
     (c/'api.py').write_text(api);(c/'requests.jsonl').write_text('');(c/'control.json').write_text(json.dumps(controls or {}))
     extra_names=['companion-%03d-%s.txt'%(i,'x'*220 if long_names else 'data') for i in range(extra_assets)]
     selected_contract=dict(contract,exact_additional_assets=contract['exact_additional_assets']+extra_names)
-    if raw_installer:
+    if raw_installer or acfs_checker:
         selected_contract['raw_installer_checksum']={'downstream_repo':'owner/downstream','checksum_path':'checksums.yaml',
                                                      'installer_key':'app','installer_path':'install.sh'}
         subprocess.run(['git','-C',str(c/'downstream'),'remote','set-url','origin',str(c/'downstream-public.git')],check=True)
+        if acfs_checker:
+            selected_contract['raw_installer_checksum'].update(checker='acfs',
+                downstream_repo='Dicklesworthstone/agentic_coding_flywheel_setup')
+            lib=c/'downstream/scripts/lib';lib.mkdir(parents=True)
+            # R2 script-delivery boundary: real Git commits/blob transport and
+            # actual child process, with an explicit substitute for ACFS code.
+            # A separate real public-checker run is required for native credit.
+            (lib/'logging.sh').write_text('CHECKER_LOGGING_LOADED=yes\n')
+            (lib/'security.sh').write_text('#!/usr/bin/env bash\nset -euo pipefail\n'
+                'source "${BASH_SOURCE[0]%/*}/logging.sh"\n'
+                '[[ $# == 3 && $1 == --checksum && $2 == '+installer_url+' && $3 == --retain-temp-files ]]\n'
+                '[[ $CHECKER_LOGGING_LOADED == yes && -z ${DSR_MINISIGN_KEY:-} && -z ${DSR_CHECKER_SECRET_PROBE:-} ]]\n'
+                'if declare -F dsr_checker_injected_function; then exit 24; fi\n'
+                'printf "checker invoked with clean environment\\n" > "$TMPDIR/checker-invoked"\n'
+                'printf "%s\\n" '+installer_digest+'\n')
+            for args in [['add','scripts/lib'],['commit','-qm','private checker delivery fixture']]:
+                subprocess.run(['git','-C',str(c/'downstream')]+args,check=True)
         subprocess.run(['git','-C',str(c/'downstream'),'push','-q','origin','main'],check=True)
     (c/'config/repos.d/app.yaml').write_text(json.dumps({'tool_name':'app','repo':'owner/app','local_path':str(c/'repo'),'targets':['linux/amd64'],'release_contract':selected_contract}))
     artifacts=c/'state/artifacts/app-v1.2.3'
@@ -550,6 +588,68 @@ def test_raw_installer_checksum_publication():
         check('raw direct '+label+' leaves a draft',not published(c))
         check('raw direct '+label+' has only the expected publication mutations',
               len(patches)==(2 if label=='post-publication-drift' else 0))
+
+
+def test_acfs_checksum_checker_publication():
+    # Both actual publishers must execute the mandatory checker, without
+    # rescuing its failure through the generic hasher or a previously good pin.
+    for mode in ['finalize','publish']:
+        for failure in [None,'exit','empty','invalid','wrong-digest','good-digest-error',
+                        'logging-missing','auth-denied','bad-blob','late-failure']:
+            label=f'acfs-{mode}-{failure or "valid"}'
+            c,env,response,_=setup(label,acfs_checker=True)
+            prepared_snapshots=set((c/'tmp').glob('dsr-acfs-check.*'))
+            controls={'absent':True} if mode=='publish' else {}
+            if failure in ['auth-denied','bad-blob','late-failure']:
+                controls[{'auth-denied':'checker_auth_denied','bad-blob':'checker_bad_blob',
+                          'late-failure':'checker_post_publication_failure'}[failure]]=True
+            elif failure:
+                # Change and push the actual downstream script object. A
+                # syntactically valid old checksum pin cannot bypass its error.
+                contents={
+                    'exit':'printf "Controlled checker failure\\n" >&2\nexit 23\n',
+                    'empty':'exit 0\n',
+                    'invalid':'printf "invalid checksum\\n"\n',
+                    'wrong-digest':'printf "%s\\n" '+'0'*64+'\n',
+                    'good-digest-error':'printf "%s\\n" '+installer_digest+'\nexit 23\n',
+                    'logging-missing':'source "${BASH_SOURCE[0]%/*}/missing-logging.sh"\n'
+                }[failure]
+                (c/'downstream/scripts/lib/security.sh').write_text('#!/bin/bash\nset -euo pipefail\n'+contents)
+                for args in [['add','scripts/lib/security.sh'],['commit','-qm','adversarial checker delivery'],
+                             ['push','-q','origin','main']]:
+                    subprocess.run(['git','-C',str(c/'downstream')]+args,check=True)
+            (c/'control.json').write_text(json.dumps(controls))
+            if mode=='publish':
+                result=subprocess.run(['bash','-c',script,'fixture','publish'],env=env,
+                                      capture_output=True,text=True,timeout=90)
+                patches=[q for q in map(json.loads,(c/'requests.jsonl').read_text().splitlines()) if '--method' in q]
+            else:
+                result,patches=invoke(c,env,response)
+            (c/'checker-transition.log').write_text(result.stdout+result.stderr)
+            published=json.loads((c/'remote.json').read_text())['draft'] is False
+            if failure:
+                check(label+' cannot report publication success',result.returncode!=0)
+                check(label+' preserves the owned draft',not published)
+                check(label+' has only expected publication mutations',
+                      len(patches)==(2 if failure=='late-failure' else 0))
+            else:
+                check(label+' publishes the verified candidate',result.returncode==0 and published)
+                check(label+' makes exactly one publication mutation',len(patches)==1)
+                snapshots=list(set((c/'tmp').glob('dsr-acfs-check.*'))-prepared_snapshots)
+                check(label+' executes and retains the isolated checker at every observation',
+                      len(snapshots)>=3 and all((p/'checker-invoked').is_file() for p in snapshots))
+                check(label+' keeps snapshot and output private',all(stat.S_IMODE(p.stat().st_mode)==0o700
+                      and all(stat.S_IMODE((p/name).stat().st_mode)==0o600
+                              for name in ['security.sh','logging.sh','stdout','stderr']) for p in snapshots))
+                requests=list(map(json.loads,(c/'requests.jsonl').read_text().splitlines()))
+                revision=subprocess.check_output(['git','--git-dir',str(c/'downstream-public.git'),
+                                                  'rev-parse','refs/heads/main'],text=True).strip()
+                script_requests=[q for q in requests if '/contents/scripts/lib/' in q[0]]
+                check(label+' binds both script files to the downstream pin revision',
+                    len(script_requests)==2*len(snapshots) and
+                    {q[0].split('/scripts/lib/',1)[1].split('?ref=',1)[0] for q in script_requests}
+                        == {'security.sh','logging.sh'} and
+                    all('?ref='+revision in q[0] for q in script_requests))
 
 
 def test_large_note_creation_and_finalization():
@@ -1554,8 +1654,14 @@ def test_custom_artifact_repair():
           len([row for row in rows if row[0]=='checksum-download'])==2 and not mutations(rows))
 
 
+if os.environ.get('DSR_TEST_STRICT_ACFS_CHECKER_ONLY')=='1':
+    test_acfs_checksum_checker_publication()
+    print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
+    raise SystemExit(0)
+
 if os.environ.get('DSR_TEST_STRICT_RAW_INSTALLER_ONLY')=='1':
     test_raw_installer_checksum_publication()
+    test_acfs_checksum_checker_publication()
     print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
     raise SystemExit(0)
 
@@ -1608,6 +1714,7 @@ if os.environ.get('DSR_TEST_STRICT_CREATION_ONLY')!='1':
 # Execute the complete producer-to-consumer handoff. The response's name,
 # bytes, permissions and directory come from production creation, not setup().
 test_raw_installer_checksum_publication()
+test_acfs_checksum_checker_publication()
 test_large_note_creation_and_finalization()
 c,env,_,_=setup('creation-handoff',{'absent':True})
 # Existing release state may be readable by other users; preserve that parent
