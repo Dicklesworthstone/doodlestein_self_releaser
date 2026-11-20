@@ -2,18 +2,20 @@
 # Pinned source installers must build the actual recursive Git dependency
 # graph, including Go modules inside gitlinks. Git and Go execute normally;
 # only GitHub transport is redirected to private local fixture repositories.
-# Compiler-side source/index changes below are explicit fault injections after
-# a genuine successful compilation. No release service or production key is used.
+# Acquisition faults use real Git filters and files; compiler-side source/index
+# changes occur after a genuine successful compilation. No release service or
+# production key is used.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 SOURCE_MODULE="${DSR_TEST_INSTALL_SOURCE_MODULE:-$ROOT/src/install_source.sh}"
 TEST_MODE="${1:-}"
-[[ $# -eq 0 || ( $# -eq 1 && "$TEST_MODE" == --shipped-only ) ]] || {
-    printf 'Usage: %s [--shipped-only]\n' "$0" >&2
+[[ $# -eq 0 || ( $# -eq 1 && ( "$TEST_MODE" == --shipped-only || "$TEST_MODE" == --admission-only ) ) ]] || {
+    printf 'Usage: %s [--shipped-only|--admission-only]\n' "$0" >&2
     exit 4
 }
-dependencies=(git jq go ps tar)
+dependencies=(git jq go ps tar cmp)
+[[ "$TEST_MODE" != --admission-only ]] || dependencies=(git jq cmp)
 [[ "$TEST_MODE" != --shipped-only ]] || dependencies+=(python3)
 for dependency in "${dependencies[@]}"; do
     command -v "$dependency" >/dev/null 2>&1 || {
@@ -21,8 +23,11 @@ for dependency in "${dependencies[@]}"; do
         exit 3
     }
 done
-REAL_GO=$(command -v go)
-"$REAL_GO" version >/dev/null 2>&1 || exit 3
+REAL_GO=''
+if [[ "$TEST_MODE" != --admission-only ]]; then
+    REAL_GO=$(command -v go)
+    "$REAL_GO" version >/dev/null 2>&1 || exit 3
+fi
 # shellcheck source=../../src/install_source.sh
 source "$SOURCE_MODULE"
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/dsr-source-submodules.XXXXXXXX") || exit 1
@@ -42,6 +47,149 @@ check() {
 equal() { [[ "$1" == "$2" ]]; }
 no_compile() { ! grep -Eq '^(list|build) ' "$CALLS"; }
 no_receipt() { [[ ! -s "$WORK/$1.json" && ! -e "$WORK/$1/receipt.json" ]]; }
+
+# This entrypoint also runs against DSR_TEST_INSTALL_SOURCE_MODULE from a frozen
+# checkout. It proves acquisition/admission, independently of native compilers
+# and the watchdog; a passing post-build drift check cannot substitute for it.
+test_source_admission() (
+    local PASS=0 FAIL=0 STATUS=0 base="$WORK/admission" pin graph digest path index
+    local expected observed
+    mkdir -p "$base/upstream/fixtures" || return 1
+    export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$base/gitconfig"
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY
+    unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT
+    export DSR_GH_TOKEN='' GITHUB_TOKEN='' GH_TOKEN=''
+    gh() { return 1; }
+    git config --file "$GIT_CONFIG_GLOBAL" protocol.allow never &&
+        git config --file "$GIT_CONFIG_GLOBAL" protocol.file.allow always &&
+        git config --file "$GIT_CONFIG_GLOBAL" "url.file://$base/upstream.insteadOf" \
+            https://github.com/example/source-admission.git || return 1
+    git init -q -b main "$base/upstream" &&
+        git -C "$base/upstream" config user.name 'DSR source admission fixture' &&
+        git -C "$base/upstream" config user.email 'source@example.invalid' || return 1
+    printf 'module example.invalid/source-admission\ngo 1.22\n' > "$base/upstream/go.mod"
+    printf 'package main\nimport "fmt"\nfunc main() { fmt.Println("REVIEWED_SOURCE") }\n' > "$base/upstream/main.go"
+    printf 'main.go filter=fixture\n*.txt text eol=crlf\nidentity.txt ident\n' > "$base/upstream/.gitattributes"
+    printf 'source $Id$\n' > "$base/upstream/identity.txt"
+    printf 'injected.go\n' > "$base/upstream/.gitignore"
+    # More than one hash batch, with ordinary names and NUL-framed unusual
+    # names that also require legitimate Git text conversion on checkout.
+    for index in {1..129}; do
+        printf -v path 'fixtures/%03d.data' "$index"
+        printf 'reviewed fixture %s\n' "$index" > "$base/upstream/$path"
+    done
+    for path in 'space name.txt' $'tab\tname.txt' $'line\nname.txt'; do
+        printf 'committed text\n' > "$base/upstream/$path"
+    done
+    printf 'last committed source\n' > "$base/upstream/zz-last.data"
+    ln -s main.go "$base/upstream/source-link" &&
+        ln -s $'main.go\n' "$base/upstream/newline-link" &&
+        git -C "$base/upstream" add . &&
+        git -c core.hooksPath=/dev/null -C "$base/upstream" commit -qm 'Pin acquisition source' || return 1
+    pin=$(git -C "$base/upstream" rev-parse HEAD) || return 1
+    admission_checkout() {
+        local label="$1"
+        mkdir "$base/$label" &&
+            _isb_checkout_source example/source-admission "$pin" "$base/$label/source" "$base/$label/graph"
+    }
+    admission_verify() {
+        local label="$1" phase="${2:-initial}" record="${3:-proof}"
+        graph=$(cat "$base/$label/graph/repositories.json") || return 1
+        STATUS=0
+        _isb_verify_source_graph "$base/$label/source" "$graph" "$base/$label/graph" "$phase" \
+            > "$base/$label/$record" 2> "$base/$label/$record.err" || STATUS=$?
+    }
+
+    admission_checkout pristine || return 1
+    admission_verify pristine
+    check 'pinned acquired source authenticates across multiple hash batches' equal "$STATUS" 0
+    check 'unusual source names actually have converted CRLF bytes' \
+        grep -q $'\r' "$base/pristine/source/"$'line\nname.txt'
+    expected=$(git -C "$base/pristine/source" rev-parse "$pin:identity.txt") || return 1
+    check 'canonical Git identity expansion remains an authenticated checkout' \
+        grep -Fq "\$Id: $expected \$" "$base/pristine/source/identity.txt"
+    digest=$(cat "$base/pristine/proof") || return 1
+    printf 'legitimate compiler output\n' > "$base/pristine/source/compiler-output"
+    admission_verify pristine verify after-output
+    check 'post-build verification still admits untracked compiler output' equal "$STATUS" 0
+    check 'untracked compiler output does not alter pinned source fingerprint' \
+        equal "$(cat "$base/pristine/after-output")" "$digest"
+
+    admission_checkout late-blob || return 1
+    printf 'unreviewed bytes beyond the first hash batch\n' > "$base/late-blob/source/zz-last.data"
+    admission_verify late-blob
+    check 'a changed final-batch tracked blob cannot become the initial baseline' equal "$STATUS" 6
+    check 'a changed final-batch blob produces no accepted source digest' test ! -s "$base/late-blob/proof"
+
+    admission_checkout altered-identity || return 1
+    printf 'source $Id: unrelated marker text $\r\n' > "$base/altered-identity/source/identity.txt"
+    admission_verify altered-identity
+    check 'noncanonical identity text cannot be hidden by reverse Git normalization' equal "$STATUS" 6
+    check 'noncanonical identity text produces no accepted digest' test ! -s "$base/altered-identity/proof"
+
+    admission_checkout case-hidden || return 1
+    printf 'untracked alternate source bytes\n' > "$base/case-hidden/source/MAIN.go"
+    git -C "$base/case-hidden/source" config core.ignorecase true || return 1
+    if [[ ! "$base/case-hidden/source/MAIN.go" -ef "$base/case-hidden/source/main.go" ]]; then
+        check 'case-insensitive Git indexing would hide the extra source' \
+            equal "$(git -C "$base/case-hidden/source" ls-files --others)" ''
+        admission_verify case-hidden
+        check 'initial admission still detects case-distinct untracked source' equal "$STATUS" 6
+    else
+        printf 'BOUNDARY: case-distinct extra-file control requires a case-sensitive filesystem\n'
+    fi
+
+    git config --file "$GIT_CONFIG_GLOBAL" filter.fixture.smudge 'sed s/REVIEWED_SOURCE/UNPINNED_SOURCE/g' || return 1
+    admission_checkout smudged || return 1
+    check 'real Git smudge changed acquired compiler source' grep -q UNPINNED_SOURCE "$base/smudged/source/main.go"
+    export DSR_TEST_SOURCE_CLEAN_MARKER="$base/clean-filter-executed"
+    # Local drivers would be consulted even though admission ignores global
+    # Git configuration. Neither kind of executable filter may authenticate it.
+    git -C "$base/smudged/source" config filter.fixture.clean \
+        'printf clean >> "$DSR_TEST_SOURCE_CLEAN_MARKER"; git show HEAD:main.go' &&
+        git -C "$base/smudged/source" config filter.fixture.process \
+            'printf process >> "$DSR_TEST_SOURCE_CLEAN_MARKER"; exit 97' || return 1
+    admission_verify smudged
+    check 'checkout-transformed compiler source is refused before an initial digest' equal "$STATUS" 6
+    check 'smudged source cannot publish its own accepted baseline' test ! -s "$base/smudged/proof"
+    check 'source authentication never executes configured clean or process drivers' \
+        test ! -e "$DSR_TEST_SOURCE_CLEAN_MARKER"
+
+    git config --file "$GIT_CONFIG_GLOBAL" filter.fixture.smudge \
+        'cat; printf "package main\nfunc init() {}\n" > injected.go' || return 1
+    admission_checkout injected || return 1
+    expected=$(git -C "$base/injected/source" rev-parse "$pin:main.go") || return 1
+    observed=$(git -C "$base/injected/source" hash-object --no-filters main.go) || return 1
+    check 'injection control preserves every reviewed primary-source byte' equal "$observed" "$expected"
+    check 'real Git filter planted an ignored compiler input' test -s "$base/injected/source/injected.go"
+    check 'ordinary ignored-file exclusion would hide the injected input' \
+        equal "$(git -C "$base/injected/source" ls-files --others --exclude-standard)" ''
+    admission_verify injected
+    check 'ignored untracked compiler input is refused at initial admission' equal "$STATUS" 6
+    check 'ignored source injection produces no accepted digest' test ! -s "$base/injected/proof"
+    git config --file "$GIT_CONFIG_GLOBAL" --unset filter.fixture.smudge || return 1
+
+    admission_checkout changed-link || return 1
+    mv "$base/changed-link/source/newline-link" "$base/changed-link/original-link" &&
+        ln -s main.go "$base/changed-link/source/newline-link" || return 1
+    admission_verify changed-link
+    check 'literal symlink target preserves its committed trailing newline' equal "$STATUS" 6
+
+    git config --file "$GIT_CONFIG_GLOBAL" core.symlinks false || return 1
+    admission_checkout link-stub || return 1
+    admission_verify link-stub
+    check 'unmodified regular link stubs authenticate as their exact target blobs' equal "$STATUS" 0
+    printf 'different-target' > "$base/link-stub/source/source-link"
+    admission_verify link-stub initial changed
+    check 'changed regular link stub cannot become an initial source baseline' equal "$STATUS" 6
+    printf 'Pinned source admission tests: %s passed, %s failed\n' "$PASS" "$FAIL"
+    [[ $FAIL -eq 0 ]]
+)
+
+if [[ "$TEST_MODE" != --shipped-only ]]; then
+    test_source_admission || exit $?
+    [[ "$TEST_MODE" != --admission-only ]] || exit 0
+fi
 
 # A known hosted /proc view can expose host PIDs while Bash sees namespace
 # PIDs. Substitute only the watchdog boundary after independently proving
@@ -521,6 +669,32 @@ set_root_module() {
     git -C "$WORK/root" config --file .gitmodules "$key" "$value" &&
         git -C "$WORK/root" add .gitmodules && fixture_commit "$WORK/root" "Fixture $key=$value"
 }
+
+# The public source-build entrypoint must select initial admission before
+# resolving packages or starting a compiler, not just compare two snapshots
+# of the already-changed checkout. Existing tagged builds below stay pinned
+# to their original commits while these controls use a new fixture commit.
+printf 'main.go filter=source-admission\n' > "$WORK/root/.gitattributes"
+printf 'injected.go\n' > "$WORK/root/.gitignore"
+git -C "$WORK/root" add .gitattributes .gitignore &&
+    fixture_commit "$WORK/root" 'Fixture source acquisition policy' || exit 1
+git config --file "$GIT_CONFIG_GLOBAL" filter.source-admission.smudge \
+    'sed s/app-/changed-/g' || exit 1
+run_build initial-smudge HEAD
+check 'public source acquisition actually changes the fixture program text' \
+    grep -q changed- "$WORK/initial-smudge/source/main.go"
+check 'public source build refuses substituted tracked source' equal "$STATUS" 6
+check 'substituted source is refused before package resolution or compilation' no_compile
+check 'substituted source cannot publish a successful build receipt' no_receipt initial-smudge
+git config --file "$GIT_CONFIG_GLOBAL" filter.source-admission.smudge \
+    'cat; printf "package main\nvar ExtraSource = true\n" > injected.go' || exit 1
+run_build initial-extra HEAD
+check 'public source acquisition actually plants the ignored fixture file' \
+    test -s "$WORK/initial-extra/source/injected.go"
+check 'public source build refuses an ignored extra source file' equal "$STATUS" 6
+check 'ignored extra source is refused before package resolution or compilation' no_compile
+check 'ignored extra source cannot publish a successful build receipt' no_receipt initial-extra
+git config --file "$GIT_CONFIG_GLOBAL" --unset filter.source-admission.smudge || exit 1
 
 run_build nested refs/tags/v1.0.0
 check 'recursive source graph builds with real Git and Go' equal "$STATUS" 0

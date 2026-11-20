@@ -834,7 +834,14 @@ and `source_commit`. The top-level `source_commit` remains the root pin.
 
 Before and after compilation, the engine checks each repository's HEAD and
 staged identity and fingerprints its actual tracked file bytes, executable
-state and literal symlink targets. It keeps the initial digest in the caller
+state and literal symlink targets. Initial admission also authenticates each
+file against its pinned Git blob and refuses untracked files, including ignored
+compiler inputs, even when Git is configured to ignore filename case. Normal
+Git text/encoding conversion and canonical identity expansion remain valid:
+the actual bytes must match a forward checkout of the pinned blob without
+external filters. Reverse normalization cannot hide different contents. Literal
+symlink targets and regular link stubs must match their original blob exactly.
+It keeps the initial digest in the caller
 shell, compares raw bytes without clean filters or stat-cache shortcuts, and
 pins the verification Git directory and worktree explicitly. This detects the
 reproduced Git worktree/filter concealment cases while retaining legitimate
@@ -861,6 +868,13 @@ Go fixture.
 
 ```bash
 bash scripts/tests/test_install_source_submodules.sh --shipped-only
+```
+
+The acquisition/admission regression can run with Git, jq and cmp, including
+real checkout filters, ignored source injection and CRLF filenames:
+
+```bash
+bash scripts/tests/test_install_source_submodules.sh --admission-only
 ```
 
 ### Committed Go workspaces

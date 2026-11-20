@@ -326,15 +326,15 @@ _isb_checkout_source() {
     jq -s '.' "$_ISB_SOURCE_GRAPH_DIR/repositories.jsonl" > "$_ISB_SOURCE_GRAPH_DIR/repositories.json" || return 1
 }
 
-# Observe actual checkout bytes, independently of filters and index stat data.
-# The caller retains the digest in its own shell across compiler execution;
-# a build cannot replace a comparison file with a new baseline. Git supplies
-# the original tracked selection and staged identity, never normalized bytes.
-# Batching hashes keeps this linear without a subprocess for every source file.
+# Authenticate the acquired bytes against the pinned Git tree before retaining
+# their raw fingerprint across compilation. Git EOL/encoding conversion is
+# allowed, but an external filter cannot supply the authenticated content.
+# Batching raw hashes avoids a subprocess for every ordinary source file.
 _isb_verify_source_repository() (
     local tree="$1" commit="$2" inventory="$3" record metadata mode type oid path
-    local cursor remaining component target executable
-    local -a files=()
+    local phase="${4:-verify}" cursor remaining component target executable actual
+    local -a files=() oids=() modes=()
+    [[ "$phase" == initial || "$phase" == verify ]] || return 6
     [[ ! -e "$inventory" && ! -L "$inventory" && -d "$tree/.git" && ! -L "$tree/.git" &&
        -f "$tree/.git/index" && ! -L "$tree/.git/index" ]] || return 6
     unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE
@@ -342,11 +342,69 @@ _isb_verify_source_repository() (
     export GIT_DIR="$tree/.git" GIT_WORK_TREE="$tree" GIT_COMMON_DIR="$tree/.git"
     export GIT_INDEX_FILE="$tree/.git/index" GIT_OBJECT_DIRECTORY="$tree/.git/objects"
     export GIT_NO_REPLACE_OBJECTS=1 GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
-    local -a git_options=(-c core.hooksPath=/dev/null -c core.fsmonitor=false -c submodule.recurse=false
+    local -a git_options=(-C "$tree" -c core.hooksPath=/dev/null -c core.fsmonitor=false -c submodule.recurse=false
         --git-dir="$tree/.git" --work-tree="$tree")
     [[ "$(git "${git_options[@]}" rev-parse --verify 'HEAD^{commit}')" == "$commit" ]] || return 6
     git "${git_options[@]}" diff-index --cached --quiet --no-ext-diff --no-textconv \
         --ignore-submodules=none "$commit" -- || return 6
+    if [[ "$phase" == initial ]]; then
+        # A checkout filter can leave extra compiler inputs without changing
+        # any tracked blob. Include ignored files here. Later compiler output
+        # and dependency materialization are allowed by the post-build pass.
+        [[ ! -e "$inventory.untracked" && ! -L "$inventory.untracked" ]] || return 6
+        git "${git_options[@]}" -c core.ignorecase=false ls-files --others -z > "$inventory.untracked" || return 6
+        if [[ -s "$inventory.untracked" ]]; then
+            _isb_log 'Fetched source contains untracked files, including ignored compiler inputs'
+            return 6
+        fi
+    fi
+    [[ ! -e "$inventory.attributes" && ! -L "$inventory.attributes" &&
+       ! -e "$inventory.expected" && ! -L "$inventory.expected" ]] || return 6
+    _isb_verify_source_batch() {
+        local hashes index=0 observed relative attribute filter conversion matched
+        local -a attributes=()
+        hashes=$(git "${git_options[@]}" hash-object --no-filters -- "${files[@]}") || return 6
+        while IFS= read -r observed; do
+            ((index < ${#files[@]})) &&
+                [[ "$observed" =~ ^[0-9a-f]{40}$ || "$observed" =~ ^[0-9a-f]{64}$ ]] || return 6
+            if [[ "$observed" != "${oids[index]}" ]]; then
+                # Link stubs contain literal link text, never normalized text.
+                [[ "${modes[index]}" != 120000 ]] || return 6
+                relative="${files[index]#"$tree"/}"
+                git "${git_options[@]}" --literal-pathspecs check-attr -z filter -- "$relative" \
+                    > "$inventory.attributes" || return 6
+                attributes=()
+                while IFS= read -r -d '' attribute; do attributes+=("$attribute"); done < "$inventory.attributes"
+                [[ ${#attributes[@]} -eq 3 && "${attributes[0]}" == "$relative" &&
+                   "${attributes[1]}" == filter ]] || return 6
+                filter="${attributes[2]}"
+                [[ "$filter" =~ ^[A-Za-z0-9_/-][A-Za-z0-9._/-]*$ ]] || return 6
+                # Compare the actual bytes with a forward checkout of the
+                # pinned blob. Reverse cleaning is not proof: for example,
+                # ident cleaning discards arbitrary text inside an Id marker.
+                # Admit normal LF/CRLF checkouts while retaining tracked
+                # text, encoding and canonical ident expansion. Never execute
+                # an external filter to manufacture the expected content.
+                matched=false
+                for conversion in false true; do
+                    git "${git_options[@]}" -c core.autocrlf="$conversion" -c core.eol=lf \
+                        -c core.safecrlf=false -c "filter.$filter.clean=" \
+                        -c "filter.$filter.smudge=" -c "filter.$filter.process=" \
+                        -c "filter.$filter.required=false" cat-file --filters \
+                        --path="$relative" "${oids[index]}" > "$inventory.expected" || return 6
+                    if cmp -s "${files[index]}" "$inventory.expected"; then
+                        matched=true
+                        break
+                    fi
+                done
+                $matched || return 6
+            fi
+            index=$((index + 1))
+        done <<< "$hashes"
+        [[ $index -eq ${#files[@]} ]] || return 6
+        # Keep the actual acquired bytes in the before/after fingerprint.
+        printf '%s\n' "$hashes"
+    }
     git "${git_options[@]}" ls-tree -r -z --full-tree "$commit" > "$inventory" || return 6
     while IFS= read -r -d '' record; do
         [[ "$record" == *$'\t'* ]] || return 6
@@ -369,10 +427,15 @@ _isb_verify_source_repository() (
         case "$mode:$type" in
             100644:blob|100755:blob|120000:blob)
                 if [[ "$mode" == 120000 && -L "$cursor" ]]; then
-                    # The sentinel preserves targets ending in newline through
-                    # command substitution; readlink's own newline is consistent.
+                    # Preserve target newlines, then remove exactly the one
+                    # newline emitted by readlink rather than stored in Git.
                     target=$(readlink "$cursor" && printf '.') || return 6
-                    printf 'symlink\0%s\0' "${target%.}" || return 6
+                    target="${target%.}"
+                    [[ "$target" == *$'\n' ]] || return 6
+                    target="${target%$'\n'}"
+                    actual=$(printf '%s' "$target" | git "${git_options[@]}" hash-object --stdin) || return 6
+                    [[ "$actual" == "$oid" ]] || return 6
+                    printf 'symlink\0%s\0' "$target" || return 6
                 else
                     # core.symlinks=false materializes tracked links as regular
                     # target-text files. Preserve that initial representation;
@@ -380,10 +443,10 @@ _isb_verify_source_repository() (
                     [[ -f "$cursor" && ! -L "$cursor" ]] || return 6
                     executable=0; [[ ! -x "$cursor" ]] || executable=1
                     printf 'regular:%s\0' "$executable" || return 6
-                    files+=("$cursor")
+                    files+=("$cursor"); oids+=("$oid"); modes+=("$mode")
                     if ((${#files[@]} == 128)); then
-                        git "${git_options[@]}" hash-object --no-filters -- "${files[@]}" || return 6
-                        files=()
+                        _isb_verify_source_batch || return 6
+                        files=(); oids=(); modes=()
                     fi
                 fi
                 ;;
@@ -395,12 +458,14 @@ _isb_verify_source_repository() (
         esac
     done < "$inventory"
     if ((${#files[@]})); then
-        git "${git_options[@]}" hash-object --no-filters -- "${files[@]}" || return 6
+        _isb_verify_source_batch || return 6
     fi
 )
 
 _isb_verify_source_graph() {
     local tree="$1" graph="$2" directory="$3" rows path commit index=0 manifest
+    local phase="${4:-verify}"
+    [[ "$phase" == initial || "$phase" == verify ]] || return 6
     [[ -d "$directory" && ! -L "$directory" ]] || return 6
     directory=$(umask 077; mktemp -d "$directory/verify.XXXXXXXX") || return 6
     manifest="$directory/source-state"
@@ -409,8 +474,8 @@ _isb_verify_source_graph() {
     while IFS=$'\t' read -r path commit; do
         printf '%s\0%s\0' "$path" "$commit" >> "$manifest" || return 6
         _isb_path_in_tree "$tree" "$path" &&
-            _isb_verify_source_repository "$tree/$path" "$commit" "$directory/tree-$index" >> "$manifest" || {
-            _isb_log "Build changed pinned source or Git identity: $path"; return 6;
+            _isb_verify_source_repository "$tree/$path" "$commit" "$directory/tree-$index" "$phase" >> "$manifest" || {
+            _isb_log "Source does not match its pinned Git content or identity: $path"; return 6;
         }
         index=$((index + 1))
     done <<< "$rows"
@@ -1515,7 +1580,7 @@ install_source_build() (
         return 4
     fi
     local tool
-    for tool in git jq ps; do
+    for tool in git jq ps cmp; do
         command -v "$tool" >/dev/null 2>&1 || { _isb_log "Required source-build dependency missing: $tool"; return 3; }
     done
     case "$language" in rust) tool=cargo ;; go) tool=go ;; *) tool=bun ;; esac
@@ -1543,7 +1608,7 @@ install_source_build() (
     }
     commit=$(_isb_git -C "$tree" rev-parse --verify 'HEAD^{commit}') || return 8
     _ISB_SOURCE_GRAPH=$(jq -ce '.' "$graph_dir/repositories.json") || return 8
-    source_state=$(_isb_verify_source_graph "$tree" "$_ISB_SOURCE_GRAPH" "$graph_dir") || return $?
+    source_state=$(_isb_verify_source_graph "$tree" "$_ISB_SOURCE_GRAPH" "$graph_dir" initial) || return $?
     _isb_path_in_tree "$tree" "$subdir" && [[ -d "$tree/$subdir" ]] || return 4
     local build_root _ISB_CHECKOUT_ROOT="$tree"
     build_root=$(cd "$tree/$subdir" && pwd -P) || return 4
