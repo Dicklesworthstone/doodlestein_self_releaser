@@ -21,8 +21,10 @@
 #   - authentic lockfile selections above 128 KiB survive the private-cache
 #     receiver, strict preparation receipt and ordinary native caller without
 #     becoming Python/jq arguments or exported shell variables.
+#   - coordinator matrix/Zig planning accepts large generated observers while
+#     preserving target refusal, worker environment isolation and caller stdin.
 #
-# Usage: ./scripts/tests/test_ssh_exec_large_program.sh [--cargo-selection-only]
+# Usage: ./scripts/tests/test_ssh_exec_large_program.sh [--cargo-selection-only|--coordinator-planning-only]
 #
 # Exit codes:
 #   0 - All tests passed
@@ -36,8 +38,10 @@ ACT_RUNNER_MODULE="${DSR_TEST_ACT_RUNNER:-$PROJECT_ROOT/src/act_runner.sh}"
 MODE=all
 if [[ "${1:-}" == --cargo-selection-only && $# == 1 ]]; then
     MODE=cargo-selection
+elif [[ "${1:-}" == --coordinator-planning-only && $# == 1 ]]; then
+    MODE=coordinator-planning
 elif (( $# != 0 )); then
-    printf 'Usage: %s [--cargo-selection-only]\n' "$0" >&2
+    printf 'Usage: %s [--cargo-selection-only|--coordinator-planning-only]\n' "$0" >&2
     exit 4
 fi
 
@@ -151,6 +155,74 @@ test_small_command_keeps_argv() {
     check "Small command keeps ssh -n" grep -qx -- '-n' "$DSR_TEST_SSH_DIR/ssh.args"
     check "Small command is the final ssh argument" test "$(tail -1 "$DSR_TEST_SSH_DIR/ssh.args")" = 'printf small'
     check "Small command sends nothing on stdin" test ! -s "$DSR_TEST_SSH_DIR/ssh.stdin"
+}
+
+test_large_coordinator_planning() {
+    local directory target environment padding command program status output input
+    local bash_env target_status zig_status malformed_status
+    directory=$(mktemp -d "$WORK/coordinator-planning.XXXXXXXX") || return 1
+    target=x86_64-unknown-linux-gnu
+    bash_env="$directory/worker-startup.sh"
+    printf 'printf executed > %q\n' "$directory/startup-executed" > "$bash_env"
+    # These are worker settings. Neither its startup files nor its PATH may
+    # affect the coordinator's nonexecuting command selection.
+    environment="CARGO_BUILD_TARGET=$target"$'\n'"DSR_TARGET_TRIPLE=$target"$'\n'"BASH_ENV=$bash_env"$'\n'"ENV=$bash_env"$'\n''PATH=/worker-only/compiler/bin'
+    status=0
+    _act_validate_native_target_command "cargo build --locked --target $target" "$environment" "$target" \
+        > "$directory/small-target.out" 2> "$directory/small-target.err" || status=$?
+    check "Small matrix command keeps its real target admission" test "$status" -eq 0
+    check "Matrix target admission emits no compiler output" test ! -s "$directory/small-target.out"
+
+    # The valid recipe itself is comfortably below MAX_ARG_STRLEN. Shell
+    # quoting plus the production observer is what exceeds the process limit.
+    # Keep the Cargo command literal; the large comment must never execute.
+    printf -v padding '%60000s' ''
+    command="cargo build --locked --target $target # $padding"
+    program=$(_act_toolchain_identity_script target /dev/null "$command") || return 1
+    check "Large recipe still fits one ordinary process argument" test "$(byte_length "$command")" -lt 131072
+    check "Actual matrix observer exceeds the process argument limit" test "$(byte_length "$program")" -gt 131072
+    target_status=0
+    input=""
+    {
+        _act_validate_native_target_command "$command" "$environment" "$target" \
+            > "$directory/large-target.out" 2> "$directory/large-target.err" || target_status=$?
+        IFS= read -r input || true
+    } <<< 'matrix caller input'
+    check "Large matrix command is admitted without executing Cargo" test "$target_status" -eq 0
+    check "Large matrix planning preserves caller input" test "$input" = 'matrix caller input'
+    check "Large matrix planning emits no compiler output" test ! -s "$directory/large-target.out"
+
+    malformed_status=0
+    _act_validate_native_target_command "$command" "$environment" aarch64-unknown-linux-gnu \
+        > "$directory/mismatch.out" 2> "$directory/mismatch.err" || malformed_status=$?
+    check "Large matrix command still refuses a contradictory scheduled target" test "$malformed_status" -eq 4
+
+    command="cargo zigbuild --release --target $target.2.28 # $padding"
+    program=$(_act_toolchain_identity_script selection /dev/null "$command") || return 1
+    check "Actual Zig observer exceeds the process argument limit" test "$(byte_length "$program")" -gt 131072
+    zig_status=0
+    input=""
+    {
+        _act_explicit_zigbuild_selection "$command" "$environment" \
+            > "$directory/zig.json" 2> "$directory/zig.err" || zig_status=$?
+        IFS= read -r input || true
+    } <<< 'zig caller input'
+    check "Large explicit Zig command is admitted without executing Cargo" test "$zig_status" -eq 0
+    check "Large Zig selection preserves exact target and ABI floor" jq -e \
+        '. == {rust_target:"x86_64-unknown-linux-gnu",zig_target:"x86_64-unknown-linux-gnu.2.28",glibc_floor:"2.28"}' \
+        "$directory/zig.json"
+    check "Large Zig planning preserves caller input" test "$input" = 'zig caller input'
+    check "Worker startup hooks never execute during coordinator planning" test ! -e "$directory/startup-executed"
+
+    status=0
+    output=$(_act_explicit_zigbuild_selection 'cargo build --locked' "$environment" \
+        2> "$directory/plain.err") || status=$?
+    check "Ordinary Cargo commands still have no explicit Zig selection" test "$status:$output" = '0:null'
+    status=0
+    output=$(_act_explicit_zigbuild_selection "cargo zigbuild --target aarch64-unknown-linux-gnu.2.28 # $padding" \
+        "$environment" 2> "$directory/zig-mismatch.err") || status=$?
+    check "Large explicit Zig commands retain target disagreement refusal" test "$status" -ne 0
+    check "Refused Zig selection emits no successful receipt" test -z "$output"
 }
 
 test_large_program_reaches_ssh_only_on_stdin() {
@@ -595,6 +667,13 @@ raise SystemExit(bool(failures))
 PY
 }
 
+if [[ "$MODE" == coordinator-planning ]]; then
+    test_large_coordinator_planning
+    log_info "Results: $PASS_COUNT/$TEST_COUNT passed, $FAIL_COUNT failed"
+    [[ "$FAIL_COUNT" -eq 0 ]]
+    exit $?
+fi
+
 if [[ "$MODE" == cargo-selection ]]; then
     check "Actual large Cargo selection receipts survive every caller boundary" test_large_cargo_selection_receipts
     log_info "Results: $PASS_COUNT/$TEST_COUNT passed, $FAIL_COUNT failed"
@@ -606,6 +685,7 @@ log_info "Running large Unix program transport tests (dsr-00n2)"
 test_actual_metadata_program_routes_to_stdin
 test_argv_bound_counts_bytes_at_the_boundary
 test_small_command_keeps_argv
+test_large_coordinator_planning
 test_large_program_reaches_ssh_only_on_stdin
 test_large_program_runs_locally_on_stdin
 test_large_program_with_syntax_error_runs_nothing

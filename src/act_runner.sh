@@ -13585,7 +13585,10 @@ _act_validate_native_target_command() {
     local actual
     # The configured environment belongs to the worker. In particular its
     # BASH_ENV must remain data, never a coordinator startup program.
-    actual=$(env -i "${pairs[@]}" "$BASH" -p -c "$script") || return 4
+    # Quoting a valid recipe inside the observer can exceed the per-argument
+    # process limit even when the recipe itself fits. Keep the generated
+    # program on its own stdin, without consuming the caller's input.
+    actual=$(env -i "${pairs[@]}" "$BASH" -p -s <<< "$script") || return 4
     [[ "$actual" == "$selected_triple" ]] || return 4
 }
 
@@ -13602,7 +13605,9 @@ _act_explicit_zigbuild_selection() {
         pairs+=("$pair")
     done <<< "$build_env"
     script=$(_act_toolchain_identity_script selection /dev/null "$build_cmd") || return 4
-    env -i "${pairs[@]}" "$BASH" -p -c "$script"
+    # Match matrix/routing admission: worker startup settings stay inert and
+    # the complete generated observer never becomes an exec argument.
+    env -i "${pairs[@]}" "$BASH" -p -s <<< "$script"
 }
 
 # Run native build on remote host via SSH
