@@ -57,6 +57,7 @@ on:
       - scripts/tests/test_release_builds_recovery.sh
       - scripts/tests/test_release_builds_admission.sh
       - scripts/tests/test_release_build_plan_variants.sh
+      - scripts/tests/test_release_bundle_variants.sh
       - scripts/tests/test_release_packaging.sh
       - scripts/tests/test_release_packaging_variants.sh
       - scripts/tests/test_release_install.sh
@@ -151,6 +152,7 @@ jobs:
           bash -n scripts/tests/test_release_finalize.sh
           shellcheck -S warning src/release_finalize_core.sh src/release_integrity.sh scripts/tests/test_release_finalize.sh
           timeout 120 bash scripts/tests/test_release_finalize.sh --large-selection-only
+          timeout 120 bash scripts/tests/test_release_bundle_variants.sh --large-plan-only
           timeout 120 bash scripts/tests/test_release_finalize.sh
           timeout 120 bash scripts/tests/test_release_payload_pipeline.sh
           timeout 120 bash scripts/tests/test_release_integrity.sh

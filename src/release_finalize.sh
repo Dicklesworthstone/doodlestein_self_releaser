@@ -10,8 +10,10 @@ source "$_RELEASE_FINALIZE_ENTRY_DIR/release_finalize_core.sh" || { return 3 2>/
 # name selections must not change at that handoff. Neither side proves builds
 # happened: the coordinator and collector admit the original evidence.
 _rf_build_plan_selection_matches() {
-    jq -en --slurpfile expected "$1" --argjson actual "$2" '
-        ($expected|length)==1 and ($expected[0] as $p |
+    # Complete allowed variant/asset matrices can exceed an exec argument.
+    # Stream the canonical result without discarding any selection evidence.
+    jq -es --slurpfile expected "$1" '
+        length==1 and ($expected|length)==1 and (.[0] as $actual | $expected[0] as $p |
         all(["repo","tool","tag","source_sha","required_targets"][];
             . as $key | $actual[$key]==$p[$key]) and
         all(["required_assets","required_variants"][]; . as $key |
@@ -21,7 +23,7 @@ _rf_build_plan_selection_matches() {
             (if has("variants") then {variants:.variants} else {} end)))==
         ($p.builds|map({id,targets} +
             (if has("variants") then {variants:.variants} else {} end))))
-    ' >/dev/null || {
+    ' <<< "$2" >/dev/null || {
         _rf_log 'Completed build set differs from the reviewed execution selection'; return 7;
     }
 }

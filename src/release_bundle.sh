@@ -294,8 +294,10 @@ release_bundle() (
     local canonical hash work state id entry imported=0 missing=0 rc path name expected
     canonical=$(_rb_plan "$plan") || return $?
     if [[ "$dry" == true ]]; then
-        jq -cn --argjson plan "$canonical" --arg output "$output" \
-            '{kind:"dsr-release-bundle",status:"planned",dry_run:true,publishable:false,plan:$plan,output_dir:$output}'
+        jq -cs --arg output "$output" '
+            if length==1 then
+                {kind:"dsr-release-bundle",status:"planned",dry_run:true,publishable:false,plan:.[0],output_dir:$output}
+            else error("expected one canonical build-set plan") end' <<< "$canonical"
         return $?
     fi
     [[ -d "${output%/*}/" ]] || return 4
@@ -313,9 +315,9 @@ release_bundle() (
     state="$output/state.json"
     if [[ -e "$state" || -L "$state" ]]; then
         [[ -f "$state" && ! -L "$state" ]] || return 2
-        jq -es --arg hash "$hash" --argjson plan "$canonical" '
-            length==1 and (.[0]|.schema_version==1 and .kind=="dsr-release-bundle-state" and
-            .plan_sha256==$hash and .plan==$plan and
+        jq -es --arg hash "$hash" --slurpfile plan "$work/plan.json" '
+            length==1 and ($plan|length)==1 and (.[0]|.schema_version==1 and .kind=="dsr-release-bundle-state" and
+            .plan_sha256==$hash and .plan==$plan[0] and
             (.run_id|type=="string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")))' \
             "$state" >/dev/null || { _rb_log 'Build-set plan changed or state is damaged'; return 2; }
     else

@@ -271,6 +271,12 @@ Changes to the selected plan are refused; ordering input/target arrays different
 does not change its canonical identity. Only one collector can hold the output
 directory's lock at a time.
 
+Complete plans retain their full asset and compiler-variant selection during
+preview, retry and the build-plan finalizer handoff, including plans larger than
+the operating system's per-argument limit. The existing 256-record asset and
+variant bounds still apply. A changed final record or an extra JSON document
+is rejected just as it is for a small plan.
+
 Each payload is copied rather than hardlinked to a build-host file. Executable
 permissions are retained without setuid/setgid bits. Only explicitly named
 manifest artifacts are imported; arbitrary paths embedded in the manifest are

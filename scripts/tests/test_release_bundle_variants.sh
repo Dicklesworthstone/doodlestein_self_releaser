@@ -79,6 +79,174 @@ write_json(root / "plan.json", dict(schema_version=1, tool="app", repo="example/
 PY
 }
 
+large_plan_cases() {
+    python3 - "$ROOT" "$BUNDLE" "$SLSA" "${RELEASE_FINALIZE_TEST_MODULE:-$ROOT/src/release_finalize.sh}" "$WORK" <<'PY'
+import copy
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+root, bundle, slsa, finalizer, work = map(Path, sys.argv[1:])
+case = work / 'large-plan'
+case.mkdir()
+artifacts = case / 'producer'
+artifacts.mkdir()
+passed = failed = 0
+
+def check(label, value):
+    global passed, failed
+    if value:
+        passed += 1
+        print('PASS: ' + label, flush=True)
+    else:
+        failed += 1
+        print('FAIL: ' + label, file=sys.stderr, flush=True)
+
+def save(path, value):
+    path.write_text(json.dumps(value, sort_keys=True, separators=(',', ':')) + '\n')
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def run(label, command, expected):
+    process = subprocess.run(command, capture_output=True, timeout=60)
+    (case / (label + '.stdout')).write_bytes(process.stdout)
+    (case / (label + '.stderr')).write_bytes(process.stderr)
+    check(label + ' has the expected process status', process.returncode == expected)
+    if process.returncode != expected:
+        print(process.stderr.decode(errors='replace')[-3000:], file=sys.stderr)
+    return process
+
+# Every record stays inside the public 256-row and 128-character limits.
+# These are producer-manifest and payload fixtures for custom compiler
+# selectors; they do not pretend that a compiler or remote build executed.
+variants, assets, environments = [], [], []
+for index in range(208):
+    triple = 'x86_64-custom-' + 'x' * 110 + f'{index:04}'
+    name = f'app-{index:04}-' + 'n' * 119
+    payload = artifacts / name
+    payload.write_bytes(f'Owned release variant {index}\n'.encode())
+    payload.chmod(0o755)
+    variants.append(dict(target='linux/amd64', target_triple=triple))
+    assets.append(dict(name=name, target='linux/amd64', target_triple=triple,
+                       archive_format='binary', sha256=sha(payload), size_bytes=payload.stat().st_size))
+    environments.append(dict(target='linux/amd64', target_triple=triple, method='native'))
+manifest = case / 'producer.json'
+save(manifest, dict(schema_version='1.0.0', tool='app', version='v1.2.3',
+    run_id='11111111-1111-4111-8111-111111111111', built_at='2026-11-20T00:00:00Z',
+    status='success', build_purpose='release', publishable=True,
+    source=dict(git_sha='a' * 40, git_ref='refs/tags/v1.2.3', dependencies=[]),
+    requested_targets=['linux/amd64'], required_variants=variants,
+    summary=dict(total=len(variants), success=len(variants), failed=0),
+    artifacts=assets, build_environments=environments))
+plan = dict(schema_version=1, tool='app', repo='owner/app', tag='v1.2.3', source_sha='a' * 40,
+    required_targets=['linux/amd64'], required_variants=variants,
+    required_assets=[{k: a[k] for k in ('name', 'target', 'target_triple', 'archive_format')} for a in assets],
+    builds=[dict(id='linux', targets=['linux/amd64'], variants=variants,
+                 manifest=str(manifest), manifest_sha256=sha(manifest), artifacts_dir=str(artifacts))])
+planfile = case / 'plan.json'
+save(planfile, plan)
+normalize = run('canonical-plan', ['bash', '-c',
+    'source "$1" && _rb_plan "$2"', '_', str(bundle), str(planfile)], 0)
+canonical = case / 'canonical.json'
+canonical.write_bytes(normalize.stdout)
+check('admitted canonical plan exceeds the single-argument limit', len(normalize.stdout) > 131072)
+
+def collect(output, *options, selected=planfile):
+    return ['bash', '-c', 'source "$1" && source "$2" && shift 2 && release_bundle "$@"',
+            '_', str(slsa), str(bundle), '--plan', str(selected), '--output-dir', str(output), *options]
+
+preview = run('large-preview', collect(case / 'preview', '--dry-run'), 0)
+if preview.returncode == 0:
+    value = json.loads(preview.stdout)
+    check('preview retains the exact complete selection', value['plan'] == json.loads(normalize.stdout))
+    check('preview is never a publishable build', value['status'] == 'planned' and not value['publishable'])
+check('preview creates no persistent output', not (case / 'preview').exists())
+
+# Exercise frozen-state comparison before any source is available, then let
+# the same selection finish. The original input is moved, never overwritten.
+held = case / 'producer-held.json'
+manifest.rename(held)
+output = case / 'bundle'
+run('large-incomplete', collect(output), 1)
+state = output / 'state.json'
+state_pin = sha(state) if state.exists() else None
+run('large-incomplete-retry', collect(output), 1)
+check('incomplete retry preserves the exact frozen state', state.exists() and sha(state) == state_pin)
+check('missing input never produces a release', not (output / 'release').exists())
+held.rename(manifest)
+completed = run('large-completion', collect(output), 0)
+if completed.returncode == 0:
+    result = json.loads(completed.stdout)
+    published = Path(result['manifest'])
+    exported = json.loads(published.read_text())
+    check('complete collection retains all variant and asset bindings',
+          exported['required_assets'] == plan['required_assets'] and exported['required_variants'] == variants and
+          exported['summary'] == dict(total=208, success=208, failed=0))
+    check('every published payload has its independently selected digest',
+          all(sha(Path(result['artifacts_dir']) / asset['name']) == asset['sha256'] for asset in assets))
+    identity = published.stat().st_ino, sha(published), sha(output / 'release/result.json')
+    manifest.rename(held)
+    run('large-complete-retry', collect(output), 0)
+    check('completed retry preserves immutable results without producer access',
+          identity == (published.stat().st_ino, sha(published), sha(output / 'release/result.json')))
+    changed = copy.deepcopy(plan)
+    changed['builds'][0]['manifest_sha256'] = 'b' * 64
+    save(case / 'changed-plan.json', changed)
+    run('large-changed-plan', collect(output, selected=case / 'changed-plan.json'), 2)
+    check('rejected changed selection preserves every completed identity',
+          identity == (published.stat().st_ino, sha(published), sha(output / 'release/result.json')) and sha(state) == state_pin)
+    payload = Path(result['artifacts_dir']) / assets[-1]['name']
+    payload.write_bytes(b'changed final selected payload\n')
+    run('large-payload-drift', collect(output), 7)
+
+expected = copy.deepcopy(plan)
+expected['builds'][0]['driver'] = 'import'
+save(case / 'execution-plan.json', expected)
+def handoff(selected=canonical, expected_file=case / 'execution-plan.json'):
+    return ['bash', '-c', 'source "$1" && actual=$(cat "$3") && '
+            '_rf_build_plan_selection_matches "$2" "$actual"',
+            '_', str(finalizer), str(expected_file), str(selected)]
+run('large-finalizer-handoff', handoff(), 0)
+for label, mutation in (
+    ('last-asset', lambda p: p['required_assets'][-1].update(archive_format='none')),
+    ('last-variant', lambda p: p['required_variants'][-1].update(target_triple='changed')),
+    ('job-identity', lambda p: p['builds'][0].update(id='other')),
+    ('source-identity', lambda p: p.update(source_sha='b' * 40)),
+):
+    changed = copy.deepcopy(json.loads(normalize.stdout))
+    mutation(changed)
+    selected = case / (label + '.json')
+    save(selected, changed)
+    run('handoff-refuses-' + label, handoff(selected), 7)
+for label, data in (('empty', b''), ('truncated', normalize.stdout[:-4]),
+                    ('extra-document', normalize.stdout + normalize.stdout)):
+    selected = case / (label + '.json')
+    selected.write_bytes(data)
+    run('handoff-refuses-' + label, handoff(selected), 7)
+double_expected = case / 'extra-expected.json'
+double_expected.write_bytes((case / 'execution-plan.json').read_bytes() * 2)
+run('handoff-refuses-extra-expected-document', handoff(expected_file=double_expected), 7)
+save(case / 'missing-last-variant.json', dict(plan, required_variants=variants[:-1]))
+run('preview-refuses-missing-variant', collect(case / 'invalid', '--dry-run',
+    selected=case / 'missing-last-variant.json'), 4)
+double = case / 'double-plan.json'
+double.write_bytes(planfile.read_bytes() * 2)
+run('preview-refuses-extra-document', collect(case / 'invalid', '--dry-run', selected=double), 4)
+check('invalid selection creates no output', not (case / 'invalid').exists())
+print(f'Large build selections: {passed} passed, {failed} failed')
+sys.exit(1 if failed else 0)
+PY
+}
+
+if [[ "${1:-}" == --large-plan-only ]]; then
+    large_plan_cases
+    exit $?
+fi
+
 for arch in amd64 arm64; do
     case_dir="$WORK/$arch"
     fixture "$case_dir" "$arch" || exit 1
