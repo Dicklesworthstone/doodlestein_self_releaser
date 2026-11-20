@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_act_runner_native.sh - Unit tests for act_runner.sh native build SSH logic
 #
-# Usage: ./test_act_runner_native.sh [--typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --workspace-archives-only | --failure-evidence-only | --env-precedence-only | --archive-delivery-only | --zig-dispatch-only | --glibc-routing-only | --windows-launcher-transfer-only | --artifact-transfer-only]
+# Usage: ./test_act_runner_native.sh [--typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --large-inventory-only | --workspace-archives-only | --failure-evidence-only | --env-precedence-only | --archive-delivery-only | --zig-dispatch-only | --glibc-routing-only | --windows-launcher-transfer-only | --artifact-transfer-only]
 #
 # Tests native build SSH command construction with mocks.
 # Covers: command construction, path handling, env vars, SCP, error handling.
@@ -590,7 +590,7 @@ test_native_attempt_isolation() {
     for dependency in python3 yq jq git; do
         command -v "$dependency" >/dev/null || { printf 'Missing test dependency: %s\n' "$dependency" >&2; return 3; }
     done
-    python3 - "$PROJECT_ROOT" <<'PY'
+    python3 - "$PROJECT_ROOT" "${1:-all}" <<'PY'
 import copy
 import hashlib
 import json
@@ -602,6 +602,7 @@ import sys
 import tempfile
 
 root = Path(sys.argv[1])
+mode = sys.argv[2]
 work = Path(tempfile.mkdtemp(prefix='dsr-native-attempts-'))
 print('Retained native attempt evidence: ' + str(work), flush=True)
 checks = failures = 0
@@ -747,7 +748,14 @@ def launch(context, label, **overrides):
     inputs.mkdir()
     header = b'MZ' + b'\0' * 58 + b'\x40\0\0\0PE\0\0\x64\x86' + b'\0' * 18 + b'\x0b\x02' + b'\0' * 6
     (inputs / 'attempt.exe').write_bytes(header + ('inert fixture ' + label + '\n').encode())
-    save(inputs / 'metadata.json', {'attempt': label})
+    recipe = json.loads((case / 'config/repos.d/attempt.yaml').read_text())
+    if recipe['language'] == 'bash':
+        (inputs / 'attempt.exe').write_text('#!/usr/bin/env bash\nprintf "native-inventory\\n"\n')
+    for companion in next(iter(recipe['workspace_additional_artifacts'].values())):
+        data = {'attempt': label}
+        if companion['name'] != 'metadata.json':
+            data['name'] = companion['name']
+        save(inputs / companion['name'], data)
     child_env = dict(env, DSR_ATTEMPT_LABEL=label, DSR_ATTEMPT_INPUTS=str(inputs), **overrides)
     return subprocess.Popen(['bash', '-c', program], env=child_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -826,8 +834,81 @@ def admission(context, label, result):
         expected = {Path(r['path']).name: r['sha256'] for r in result['resume_artifacts']}
         check(label + ': manifest hashes and owners match retained original receipts',
               {r['name']: r['sha256'] for r in actual} == expected and
-              all(r['target'] == 'windows/amd64' for r in actual))
+              all(r['target'] == result['platform'] for r in actual))
 
+
+if mode == 'large-inventory':
+    # Every receipt comes from a real collected file. Long valid configured
+    # storage paths reproduce exec's single-argument limit without thousands
+    # of subprocesses or padding a receipt with invented observation fields.
+    # Unlike the Windows attempt fixtures below, this lane runs a real local
+    # shell producer and local collection. Only host readiness is controlled.
+    program = r'''
+source "$DSR_ATTEMPT_PROJECT/src/config.sh" || exit $?
+source "$DSR_ATTEMPT_MODULE" || exit $?
+host_health_is_ready() { return 0; }
+case "$DSR_ATTEMPT_OPERATION" in
+    build) act_run_native_build attempt linux/amd64 1.0.0 "$DSR_ATTEMPT_RUN" '' '' '' fixture ;;
+    receipts) _act_result_artifact_receipts "$(cat "$DSR_ATTEMPT_RESULT")" ;;
+    available) _act_target_result_available "$(cat "$DSR_ATTEMPT_RESULT")" ;;
+    manifest) act_generate_manifest "$(cat "$DSR_ATTEMPT_RESULT")" "$DSR_ATTEMPT_MANIFEST" ;;
+    *) exit 93 ;;
+esac
+'''
+    context = prepare('large-inventory')
+    case, env, _ = context
+    output = case / 'artifacts'
+    while len(str(output)) < 3700:
+        output = output / ('storage-' + 'x' * 92)
+    env['ACT_ARTIFACTS_DIR'] = str(output)
+    config_path = case / 'config/repos.d/attempt.yaml'
+    config = json.loads(config_path.read_text())
+    names = ['metadata-%02d.json' % index for index in range(36)]
+    config.update(language='bash', build_cmd='bash ./build.sh',
+                  targets=['linux/amd64'], act_job_map={'linux/amd64': None},
+                  host_paths={'fixture': str(case / 'source')},
+                  workspace_additional_artifacts={'linux/amd64': [
+                      {'name': name, 'format': 'json'} for name in names]})
+    save(config_path, config)
+    save(case / 'config/hosts.yaml', {'hosts': {'fixture': {
+        'platform': 'linux/amd64', 'connection': 'local', 'enabled': True}}})
+    (case / 'source/build.sh').write_text('''#!/usr/bin/env bash
+set -uo pipefail
+cp "$DSR_ATTEMPT_INPUTS/attempt.exe" attempt && chmod 755 attempt || exit 1
+for companion in "$DSR_ATTEMPT_INPUTS"/*.json; do
+    cp "$companion" "${companion##*/}" || exit 1
+done
+''')
+    code, result = build(context, 'large')
+    check('large native inventory returns a complete success after collection',
+          code == 0 and result.get('status') == 'success')
+    paths = sorted(output.rglob('metadata-*.json')) if output.exists() else []
+    check('all configured companions were physically collected before result serialization',
+          len(paths) == len(names) and all(json.loads(path.read_text()) ==
+              {'attempt': 'large', 'name': path.name} for path in paths))
+    check('real collected receipt paths exceed the single exec argument limit',
+          sum(len(str(path)) for path in paths) > 131072)
+    receipts = result.get('additional_artifacts', [])
+    check('result retains every typed companion receipt without truncation',
+          len(receipts) == len(names) and
+          sorted(Path(row['path']).name for row in receipts) == names and
+          all(row['sha256'] == hashlib.sha256(Path(row['path']).read_bytes()).hexdigest()
+              and row['size_bytes'] == Path(row['path']).stat().st_size for row in receipts))
+    check('frozen resume inventory covers the primary and every companion',
+          len(result.get('resume_artifacts', [])) == len(names) + 1)
+    if result.get('status') == 'success':
+        held = snapshot(retained_paths(result))
+        admission(context, 'large', result)
+        check('receipt and manifest inspection preserves collected bytes and inodes', snapshot(held) == held)
+        first = Path(receipts[0]['path'])
+        first.write_bytes(first.read_bytes() + b'changed companion bytes\n')
+        held_result = case / 'large.result.json'
+        rejected = subprocess.run(['bash', '-c', program], env=dict(env,
+            DSR_ATTEMPT_OPERATION='available', DSR_ATTEMPT_RESULT=str(held_result)),
+            capture_output=True, timeout=20)
+        check('changed companion still invalidates the complete large resume inventory', rejected.returncode != 0)
+    print('Large native inventory: %d checks, %d failures' % (checks, failures), flush=True)
+    raise SystemExit(1 if failures else 0)
 
 context = prepare('sequential')
 case, env, _ = context
@@ -911,8 +992,12 @@ raise SystemExit(1 if failures else 0)
 PY
 }
 
-if [[ "${1:-}" == --attempt-isolation-only ]]; then
-    test_native_attempt_isolation
+if [[ "${1:-}" == --attempt-isolation-only || "${1:-}" == --large-inventory-only ]]; then
+    if [[ "$1" == --large-inventory-only ]]; then
+        test_native_attempt_isolation large-inventory
+    else
+        test_native_attempt_isolation
+    fi
     exit $?
 fi
 

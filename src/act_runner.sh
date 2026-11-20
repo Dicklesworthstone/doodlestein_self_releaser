@@ -16059,21 +16059,24 @@ EOF
             "${additional_artifact_receipts[@]}" | jq -s '.') || return 4
     fi
 
-    jq -nc \
+    # A native release may collect enough companion receipts or long output
+    # paths to exceed one exec argument after the build already succeeded.
+    # Transport complete inventories and environment evidence as separate JSON
+    # documents, and keep the display path off argv as well. Validate framing
+    # before emitting any success so truncated/multiple documents cannot be
+    # mistaken for a reusable complete result.
+    jq -cse \
         --arg tool "$tool_name" \
         --arg platform "$platform" \
         --arg host "$host" \
         --arg status "$status" \
         --argjson exit_code "$exit_code" \
         --argjson duration "$duration" \
-        --arg artifact_path "${local_artifact_path:-}" \
-        --argjson artifact_paths "$artifact_paths_json" \
-        --argjson additional_artifacts "$additional_artifacts_json" \
+        --rawfile artifact_path /dev/fd/3 \
         --arg target_triple "$native_target_triple" \
         --arg collected_sha256 "$collected_sha256" \
         --argjson collected_size_bytes "$collected_size_bytes" \
         --arg collected_identity "$collected_identity" \
-        --argjson build_influence_env "$build_influence_env_json" \
         --arg execution_phase "$native_execution_phase" \
         --arg execution_timeout "$native_execution_timeout" \
         --arg execution_transport_timeout "$native_execution_transport_timeout" \
@@ -16084,7 +16087,12 @@ EOF
         --arg storage_error "$native_storage_error" \
         --arg log_file "$log_file" \
         'def seconds: if test("^[1-9][0-9]*$") then tonumber else null end;
-        input as $cargo_isolation | {
+        if length == 4 and (.[0] == null or (.[0] | type == "object")) and
+            (.[1] | type == "array") and
+            (.[2] | type == "array") and (.[3] | type == "object") then .
+        else error("expected native isolation, artifact paths, companion receipts and environment documents") end |
+        .[0] as $cargo_isolation | .[1] as $artifact_paths |
+        .[2] as $additional_artifacts | .[3] as $build_influence_env | {
             tool: $tool,
             platform: $platform,
             host: $host,
@@ -16114,7 +16122,9 @@ EOF
           + (if $execution_error == "" then {} else
                {stage: $execution_phase, error: $execution_error} end)
           + (if $storage_error == "" then {} else
-               {stage:"host_readiness",error:$storage_error} end)' <<< "$cargo_isolation_json" || return 4
+               {stage:"host_readiness",error:$storage_error} end)' \
+        3< <(printf '%s' "${local_artifact_path:-}") \
+        <<< "$cargo_isolation_json"$'\n'"$artifact_paths_json"$'\n'"$additional_artifacts_json"$'\n'"$build_influence_env_json" || return 4
 
     return "$exit_code"
 }
