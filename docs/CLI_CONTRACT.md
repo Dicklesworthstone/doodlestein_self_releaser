@@ -1486,12 +1486,15 @@ finalization or retry. Resume still verifies the actual remote assets; a saved
 receipt never authorizes skipping verification or publishing a draft.
 
 An upload or creation adapter cancellation, transport signal, or expired supervision
-deadline stops the release with exit `5`. This includes interruption while
-reading the asset inventory or downloading an existing asset for verification.
+deadline stops the release with exit `5`. Ordinary publication also stops on
+interruption during final verification, publication, or restoration of a draft.
+This includes interrupted release metadata, asset inventory, source-tag reads,
+and downloads used to verify existing assets.
 The stopped invocation performs no later upload, reconciliation, promotion,
 draft restoration, or dispatch. JSON output records
 `details.verification: "interrupted"` and an `interruption` object containing
-`stage: "create"` or `"upload"`, the original adapter `exit_code`, and `outcome: "unconfirmed"`.
+`stage: "create"`, `"upload"`, `"verification"`, `"publish"`, or `"restore"`,
+the original adapter `exit_code`, and `outcome: "unconfirmed"`.
 The `draft` field describes the last observed visibility; interruption cannot
 establish whether GitHub accepted the in-flight request. Original creation
 custody and any verified upload receipts remain available. Explicitly resume
@@ -1502,6 +1505,16 @@ Interrupted creation reports `details.creation_custody_dir`, retaining its
 pending intent without treating partial transport output as a successful
 original POST response. A draft missing that original response cannot be
 adopted automatically by a later retry.
+For ordinary releases, an interrupted publication or draft-restoration PATCH is
+never followed by an automatic read or compensating PATCH in that invocation. The last completed,
+validated metadata observation determines `draft`; a failed request's partial
+output cannot update it. Explicit resume rereads GitHub and verifies the
+original release identity and complete asset bytes before deciding whether a
+publication PATCH is still needed. A publication accepted before cancellation
+is recognized without reuploading assets or making the release private again.
+An explicitly private original intent still requires `--publish-draft` when
+resuming a release that remains a draft; an interrupted promotion never rewrites
+that intent to authorize a future plain resume.
 Ordinary retryable network errors retain their existing bounded reconciliation
 behavior; an exhausted curl proxy lookup is a network failure, not caller
 cancellation.

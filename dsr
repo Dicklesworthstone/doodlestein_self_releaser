@@ -10748,7 +10748,7 @@ EOF
     # release metadata. Only a new/owned draft may create a proven-absent tag.
     _release_ordinary_source_matches() {
         local allow_absent="$1" expected_sha="${2:-$release_tag_sha}"
-        local remote_sha encoded_tag matching_refs
+        local remote_sha encoded_tag matching_refs source_status
         # An explicit existence check cannot be satisfied by creating the tag,
         # including when the manifest already identifies its intended commit.
         $verify_tag && allow_absent=false
@@ -10760,6 +10760,9 @@ EOF
                 return 1
             }
             return 0
+        else
+            source_status=$?
+            if _gh_operation_interrupted "$source_status"; then return "$source_status"; fi
         fi
         if [[ "$allow_absent" != true ]]; then
             log_error "Could not verify remote tag $tag against the release's pinned source commit"
@@ -10769,7 +10772,7 @@ EOF
         # not paginated and can include prefix siblings, but never the exact
         # ref when authorizing creation of the tag at the frozen source SHA.
         encoded_tag=$(jq -rn --arg tag "$tag" '$tag | @uri') || return 1
-        matching_refs=$(gh_api "repos/$repo/git/matching-refs/tags/$encoded_tag" --no-cache) || return 1
+        matching_refs=$(gh_api "repos/$repo/git/matching-refs/tags/$encoded_tag" --no-cache) || return $?
         if ! jq -es --arg ref "refs/tags/$tag" --arg api "https://api.github.com/repos/$repo/git/" '
             length == 1 and (.[0] | type == "array" and length <= 1000 and
                 (map(.ref) | length == (unique | length)) and
@@ -10788,22 +10791,28 @@ EOF
     }
 
     _release_ordinary_restore_draft() {
-        local observed attempt retry_delay="${DSR_RELEASE_STATE_RETRY_DELAY_SECONDS:-1}"
+        local observed attempt restore_status retry_delay="${DSR_RELEASE_STATE_RETRY_DELAY_SECONDS:-1}"
         [[ "$retry_delay" =~ ^[0-9]+$ ]] || retry_delay=1
         for ((attempt=0; attempt<=3; attempt++)); do
             _release_ordinary_custody_unchanged || return 1
-            observed=$(gh_api "repos/$repo/releases/$release_id" --no-cache) || return 1
+            observed=$(gh_api "repos/$repo/releases/$release_id" --no-cache) || return $?
             if _release_ordinary_metadata_matches "$observed" true; then
+                draft=true
                 release_url=$(jq -er '.html_url' <<< "$observed") || return 1
                 return 0
             fi
             # An original POST does not authorize overwriting a release whose
             # current nonce, notes, target or destination no longer match it.
             _release_ordinary_metadata_matches "$observed" false || return 1
+            draft=false
+            release_url=$(jq -er '.html_url' <<< "$observed") || return 1
             [[ $attempt -lt 3 ]] || return 1
-            gh_api "repos/$repo/releases/$release_id" --method PATCH --data '{"draft":true}' \
-                --no-cache >/dev/null 2>&1 || true
-            ((retry_delay == 0)) || sleep "$retry_delay"
+            if gh_api "repos/$repo/releases/$release_id" --method PATCH --data '{"draft":true}' \
+                --no-cache >/dev/null 2>&1; then :; else
+                restore_status=$?
+                if _gh_operation_interrupted "$restore_status"; then return "$restore_status"; fi
+            fi
+            if ((retry_delay > 0)); then sleep "$retry_delay" || return $?; fi
         done
         return 1
     }
@@ -11386,8 +11395,34 @@ EOF
             '{name: $name, error: $error}')")
     }
 
+    local release_interrupted=false release_stop_status=0 release_stop_stage=""
+    local verification_status="skipped"
+    _release_record_interruption() {
+        local stage="$1" stopped_status="$2" last_observation="${3:-}"
+        _gh_operation_interrupted "$stopped_status" || return 1
+        release_interrupted=true
+        release_stop_status="$stopped_status"
+        release_stop_stage="$stage"
+        verification_status="interrupted"
+        # An observation helper may retain metadata from a completed read
+        # before a later inventory/download/tag read was interrupted. This is
+        # visibility evidence only; the failed verification cannot publish.
+        if [[ -n "$last_observation" ]] && $ordinary_owned; then
+            if _release_ordinary_metadata_matches "$last_observation" true; then
+                draft=true
+                release_url=$(jq -r '.html_url' <<< "$last_observation")
+            elif _release_ordinary_metadata_matches "$last_observation" false; then
+                draft=false
+                release_url=$(jq -r '.html_url' <<< "$last_observation")
+            fi
+        fi
+        log_error "Release $stage stopped (exit $stopped_status); remote outcome is unconfirmed"
+        log_info "Original publication custody is retained. Explicitly resume to verify remote state before continuing."
+        return 0
+    }
+
     # Upload each file
-    local idx=0 upload_interrupted=false upload_stop_status=0
+    local idx=0 upload_stop_status=0
     for file in "${files_to_upload[@]}"; do
         idx=$((idx + 1))
         local filename
@@ -11447,8 +11482,7 @@ EOF
                 upload_stop_status=$?
                 log_error "  Failed to upload: $filename"
                 _release_record_failed "$filename" "$strict_upload_result"
-                if _gh_operation_interrupted "$upload_stop_status"; then
-                    upload_interrupted=true
+                if _release_record_interruption upload "$upload_stop_status"; then
                     break
                 fi
                 strict_upload_response_failures+=("$(jq -nc \
@@ -11489,8 +11523,10 @@ EOF
                         skipped_assets+=("$upload_name")
                         continue
                     fi
-                    if ! _release_ordinary_source_matches "$ordinary_allow_absent_tag"; then
+                    if _release_ordinary_source_matches "$ordinary_allow_absent_tag"; then :; else
+                        local source_status=$?
                         _release_record_failed "$upload_name" "Pinned source tag changed or could not be verified before upload"
+                        _release_record_interruption verification "$source_status" || true
                         break 2
                     fi
                     local upload_result
@@ -11503,8 +11539,7 @@ EOF
                         upload_stop_status=$?
                         log_error "  Failed to upload: $upload_name"
                         _release_record_failed "$upload_name" "Verified upload failed (see release log): $upload_result"
-                        if _gh_operation_interrupted "$upload_stop_status"; then
-                            upload_interrupted=true
+                        if _release_record_interruption upload "$upload_stop_status"; then
                             break 2
                         fi
                     fi
@@ -11526,8 +11561,10 @@ EOF
         log_info "[$idx/$total_files] Uploading: $filename"
 
         # Upload
-        if ! _release_ordinary_source_matches "$ordinary_allow_absent_tag"; then
+        if _release_ordinary_source_matches "$ordinary_allow_absent_tag"; then :; else
+            local source_status=$?
             _release_record_failed "$filename" "Pinned source tag changed or could not be verified before upload"
+            _release_record_interruption verification "$source_status" || true
             break
         fi
         local upload_result
@@ -11541,20 +11578,16 @@ EOF
             log_error "  Failed to upload: $filename"
             log_error "  Error: $upload_result"
             _release_record_failed "$filename" "Verified upload failed (see release log): $upload_result"
-            if _gh_operation_interrupted "$upload_stop_status"; then
-                upload_interrupted=true
+            if _release_record_interruption upload "$upload_stop_status"; then
                 break
             fi
         fi
     done
 
     # Verify uploaded assets match the selected release contract.
-    local verification_status="skipped"
     local missing_assets=()
-    if $upload_interrupted; then
+    if $release_interrupted; then
         verification_status="interrupted"
-        log_error "Release upload stopped (exit $upload_stop_status); remote outcome is unconfirmed"
-        log_info "Publication custody is retained. Explicitly resume to verify remote bytes before continuing."
     elif $release_contract_enabled; then
         local expected_assets_json
         local upload_failures=${#failed_assets[@]}
@@ -11777,7 +11810,7 @@ EOF
         done < <(jq -r '.artifacts[] | .name // .filename' <<< "$ordinary_manifest")
     fi
 
-    if ! $release_contract_enabled && ! $upload_interrupted; then
+    if ! $release_contract_enabled && ! $release_interrupted; then
         # Re-read by immutable release ID after all uploads. A local journal,
         # an earlier POST response, or an earlier matching name is not proof
         # that the final release still contains the selected artifact bytes.
@@ -11787,7 +11820,7 @@ EOF
             sha=$(jq -er '.sha256' <<< "$record") || return 1
             size=$(jq -er '.size_bytes' <<< "$record") || return 1
             expected_id=$(jq -er '.remote_id' <<< "$record") || return 1
-            observed=$(_gh_find_release_asset "$repo" "$release_id" "$name") || return 1
+            observed=$(_gh_find_release_asset "$repo" "$release_id" "$name") || return $?
             [[ "$(jq -r '.id' <<< "$observed")" == "$expected_id" ]] || return 1
             umask 077
             workdir=$(mktemp -d "${TMPDIR:-/tmp}/dsr-release-verify.XXXXXXXX") || return 1
@@ -11798,8 +11831,17 @@ EOF
             _gh_verify_uploaded_asset "$repo" "$name" "$size" "$sha" "$observed" "$workdir" >/dev/null
         )
 
+        _release_ordinary_observation_failed() {
+            local failed_status="$1" last_observation="$2"
+            if _gh_operation_interrupted "$failed_status" && [[ -n "$last_observation" ]]; then
+                printf '%s\n' "$last_observation"
+            fi
+            return "$failed_status"
+        }
+
         _release_ordinary_observe_owned() {
             local expected_draft="$1" observed records inventory='[]' page_json page count record expected_sha
+            local last_observation="" observation_status
             _release_ordinary_custody_unchanged || return 1
             records=$(printf '%s\n' "${uploaded_assets[@]}" | jq -sc 'sort_by(.name)') || return 1
             # Include every frozen metadata sidecar, even if it disappeared
@@ -11810,10 +11852,15 @@ EOF
             printf '%s\n%s\n' "$records" "$ordinary_plan" | jq -es '
                 length == 2 and (.[0] | map({name,size_bytes,sha256})) == .[1]
             ' >/dev/null || return 1
-            observed=$(gh_api "repos/$repo/releases/$release_id" --no-cache) || return 1
+            observed=$(gh_api "repos/$repo/releases/$release_id" --no-cache) || return $?
             _release_ordinary_metadata_matches "$observed" "$expected_draft" || return 1
+            last_observation="$observed"
             for ((page=1; page<=100; page++)); do
-                page_json=$(gh_api "repos/$repo/releases/$release_id/assets?per_page=100&page=$page" --no-cache) || return 1
+                page_json=$(gh_api "repos/$repo/releases/$release_id/assets?per_page=100&page=$page" --no-cache) || {
+                    observation_status=$?
+                    _release_ordinary_observation_failed "$observation_status" "$last_observation"
+                    return "$observation_status"
+                }
                 jq -es 'length == 1 and (.[0] | type == "array" and length <= 100 and
                     all(.[]; type == "object"))' <<< "$page_json" >/dev/null || return 1
                 inventory=$(printf '%s\n%s\n' "$inventory" "$page_json" | jq -sc '
@@ -11832,33 +11879,54 @@ EOF
                 (.[1] | map({name,size_bytes,remote_id}))
             ' >/dev/null || return 1
             for record in "${uploaded_assets[@]}"; do
-                _release_recheck_uploaded "$record" || return 1
+                _release_recheck_uploaded "$record" || {
+                    observation_status=$?
+                    _release_ordinary_observation_failed "$observation_status" "$last_observation"
+                    return "$observation_status"
+                }
             done
-            observed=$(gh_api "repos/$repo/releases/$release_id" --no-cache) || return 1
+            observed=$(gh_api "repos/$repo/releases/$release_id" --no-cache) || {
+                observation_status=$?
+                _release_ordinary_observation_failed "$observation_status" "$last_observation"
+                return "$observation_status"
+            }
             _release_ordinary_metadata_matches "$observed" "$expected_draft" || return 1
+            last_observation="$observed"
             expected_sha=$(jq -r '.record.request.target_commitish // empty' <<< "$ordinary_intent_proof") || return 1
-            _release_ordinary_source_matches "$expected_draft" "$expected_sha" || return 1
+            _release_ordinary_source_matches "$expected_draft" "$expected_sha" || {
+                observation_status=$?
+                _release_ordinary_observation_failed "$observation_status" "$last_observation"
+                return "$observation_status"
+            }
             _release_ordinary_custody_unchanged || return 1
             printf '%s\n' "$observed"
         }
 
-        local verified_record observed_release
+        local verified_record observed_release ordinary_observe_status=0
         [[ "$verification_status" == "skipped" ]] && verification_status="ok"
         if $ordinary_owned; then
             [[ ${#failed_assets[@]} -eq 0 ]] || verification_status="incomplete"
-            if [[ ${#failed_assets[@]} -eq 0 ]] &&
-               ! observed_release=$(_release_ordinary_observe_owned "$draft"); then
-                if $draft && $ordinary_publish && ! $requested_draft &&
-                   observed_release=$(_release_ordinary_observe_owned false); then
-                    # A concurrent controller may have finished the same
-                    # owned intent. Complete public proof is required before
-                    # accepting its publication instead of restoring draft.
-                    draft=false
-                    log_info "Verified that the owned staged release is already completely published"
-                else
+            if [[ ${#failed_assets[@]} -eq 0 ]]; then
+                observed_release=$(_release_ordinary_observe_owned "$draft") || ordinary_observe_status=$?
+                if [[ $ordinary_observe_status -ne 0 ]] &&
+                   ! _release_record_interruption verification "$ordinary_observe_status" "$observed_release" &&
+                   $draft && $ordinary_publish && ! $requested_draft; then
+                    ordinary_observe_status=0
+                    observed_release=$(_release_ordinary_observe_owned false) || ordinary_observe_status=$?
+                    if [[ $ordinary_observe_status -eq 0 ]]; then
+                        # A concurrent controller may have finished the same
+                        # owned intent. Require complete public proof before
+                        # accepting its publication instead of restoring draft.
+                        draft=false
+                        log_info "Verified that the owned staged release is already completely published"
+                    else
+                        _release_record_interruption verification "$ordinary_observe_status" "$observed_release" || true
+                    fi
+                fi
+                if [[ $ordinary_observe_status -ne 0 ]]; then
                     _release_record_failed "release-verification" \
                         "Staged release custody, metadata, or complete asset inventory changed after upload"
-                    verification_status="incomplete"
+                    $release_interrupted || verification_status="incomplete"
                 fi
             fi
             if [[ ${#failed_assets[@]} -eq 0 ]] && $ordinary_publish && $draft && ! $requested_draft; then
@@ -11871,12 +11939,16 @@ EOF
                 else
                     gh_api "repos/$repo/releases/$release_id" --method PATCH --data '{"draft":false}' \
                         --no-cache >/dev/null 2>&1 || ordinary_patch_status=$?
-                    if observed_release=$(_release_ordinary_observe_owned false); then
+                    if _release_record_interruption publish "$ordinary_patch_status"; then
+                        _release_record_failed "publish" "Publication interrupted; remote outcome is unconfirmed"
+                    elif observed_release=$(_release_ordinary_observe_owned false); then
                         draft=false
                         [[ $ordinary_patch_status -eq 0 ]] || log_warn "Publish response failed; fresh verification confirmed the complete public release"
                     else
+                        ordinary_observe_status=$?
                         _release_record_failed "publish" "Publication did not produce the verified complete public release"
-                        verification_status="incomplete"
+                        _release_record_interruption verification "$ordinary_observe_status" "$observed_release" || \
+                            verification_status="incomplete"
                     fi
                 fi
             fi
@@ -11889,25 +11961,34 @@ EOF
             fi
         else
             for verified_record in "${uploaded_assets[@]}"; do
-                if ! _release_recheck_uploaded "$verified_record"; then
+                if _release_recheck_uploaded "$verified_record"; then :; else
+                    ordinary_observe_status=$?
                     _release_record_failed "$(jq -r '.name' <<< "$verified_record")" \
                         "Remote artifact changed or could not be reverified after upload"
+                    if _release_record_interruption verification "$ordinary_observe_status"; then break; fi
                     verification_status="incomplete"
                 fi
             done
-            if ! observed_release=$(gh_api "repos/$repo/releases/$release_id" --no-cache) ||
-               ! jq -en --slurpfile expected /dev/fd/3 --slurpfile observed /dev/fd/4 '
+            if ! $release_interrupted; then
+                ordinary_observe_status=0
+                observed_release=$(gh_api "repos/$repo/releases/$release_id" --no-cache) || ordinary_observe_status=$?
+                if [[ $ordinary_observe_status -ne 0 ]] ||
+                   ! jq -en --slurpfile expected /dev/fd/3 --slurpfile observed /dev/fd/4 '
                    def identity: {id,tag_name,upload_url,draft,prerelease};
                    ([$expected,$observed] | all(.[]; length == 1)) and
                    ($observed[0] | type == "object") and
                    (($observed[0] | identity) == ($expected[0] | identity))
-               ' 3<<< "$release_json" 4<<< "$observed_release" >/dev/null 2>&1; then
-                _release_record_failed "release-verification" "Release identity or visibility changed after upload"
-                verification_status="incomplete"
+                   ' 3<<< "$release_json" 4<<< "$observed_release" >/dev/null 2>&1; then
+                    _release_record_failed "release-verification" "Release identity or visibility changed after upload"
+                    _release_record_interruption verification "$ordinary_observe_status" || verification_status="incomplete"
+                fi
             fi
-            if ! _release_ordinary_source_matches false; then
-                _release_record_failed "source-verification" "Remote tag changed or could not be verified after upload"
-                verification_status="incomplete"
+            if ! $release_interrupted; then
+                if _release_ordinary_source_matches false; then :; else
+                    ordinary_observe_status=$?
+                    _release_record_failed "source-verification" "Remote tag changed or could not be verified after upload"
+                    _release_record_interruption verification "$ordinary_observe_status" || verification_status="incomplete"
+                fi
             fi
         fi
     fi
@@ -11946,7 +12027,7 @@ EOF
 
     local status="success"
     local exit_code=0
-    if $upload_interrupted; then
+    if $release_interrupted; then
         status="error"
         exit_code=5
     elif [[ $failed_count -gt 0 ]]; then
@@ -11954,7 +12035,7 @@ EOF
         exit_code=1
     fi
 
-    if ! $upload_interrupted && $release_contract_enabled && [[ $exit_code -ne 0 ]]; then
+    if ! $release_interrupted && $release_contract_enabled && [[ $exit_code -ne 0 ]]; then
         if _release_contract_confirm_or_restore_bound_draft \
             "$repo" "$release_id" "$tag"; then
             draft=true
@@ -11962,12 +12043,20 @@ EOF
             draft=false
             log_error "Strict release failure could not confirm a bound draft state"
         fi
-    elif ! $upload_interrupted && $ordinary_owned && ! $ordinary_external_publication && [[ $exit_code -ne 0 ]]; then
+    elif ! $release_interrupted && $ordinary_owned && ! $ordinary_external_publication && [[ $exit_code -ne 0 ]]; then
         if _release_ordinary_restore_draft; then
             draft=true
         else
-            draft=false
-            log_error "Staged release failure could not confirm its original ID/tag as a draft"
+            local restore_status=$?
+            if _release_record_interruption restore "$restore_status"; then
+                _release_record_failed "restore" "Draft restoration interrupted; remote outcome is unconfirmed"
+                failed_count=${#failed_assets[@]}
+                status="error"
+                exit_code=5
+            else
+                draft=false
+                log_error "Staged release failure could not confirm its original ID/tag as a draft"
+            fi
         fi
     fi
 
@@ -12051,7 +12140,7 @@ EOF
         release_custody_error="Release finished but its build custody could not be released"
         log_error "$release_custody_error"
         status=error
-        $upload_interrupted || exit_code=4
+        $release_interrupted || exit_code=4
     fi
 
     # Output
@@ -12076,8 +12165,9 @@ EOF
             --slurpfile uploaded /dev/fd/3 \
             --slurpfile failed /dev/fd/4 \
             --arg verification "$verification_status" \
-            --argjson upload_interrupted "$upload_interrupted" \
-            --argjson upload_stop_status "$upload_stop_status" \
+            --argjson release_interrupted "$release_interrupted" \
+            --argjson release_stop_status "$release_stop_status" \
+            --arg release_stop_stage "$release_stop_stage" \
             --argjson tag_ruleset_receipt "$release_contract_tag_ruleset_receipt" \
             --argjson total "$total_files" \
             --argjson success "$success_count" \
@@ -12126,8 +12216,8 @@ EOF
                     repos: (if $dispatch_repos == "" then [] else ($dispatch_repos | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))) end),
                     results: $dispatch_results
                 }
-            } + (if $upload_interrupted then
-                {interruption:{stage:"upload",exit_code:$upload_stop_status,outcome:"unconfirmed"}}
+            } + (if $release_interrupted then
+                {interruption:{stage:$release_stop_stage,exit_code:$release_stop_status,outcome:"unconfirmed"}}
                 else {} end)
               + (if $custody_error == "" then {} else
                 {stage:"build_custody",error:$custody_error} end)' \

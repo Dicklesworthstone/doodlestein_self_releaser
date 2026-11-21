@@ -2112,9 +2112,11 @@ gh_resolve_tag_sha() {
         return 3
     fi
 
-    local ref_json
+    local ref_json resolve_status
     ref_json=$(gh_api "repos/$repo/git/ref/tags/$tag" --no-cache 2>/dev/null) || {
+        resolve_status=$?
         _gh_log_error "Failed to fetch tag ref: $tag"
+        if _gh_operation_interrupted "$resolve_status"; then return "$resolve_status"; fi
         return 4
     }
 
@@ -2137,7 +2139,9 @@ gh_resolve_tag_sha() {
             tag)
                 local tag_json
                 tag_json=$(gh_api "repos/$repo/git/tags/$obj_sha" --no-cache 2>/dev/null) || {
+                    resolve_status=$?
                     _gh_log_error "Failed to dereference annotated tag: $tag"
+                    if _gh_operation_interrupted "$resolve_status"; then return "$resolve_status"; fi
                     return 4
                 }
                 obj_sha=$(echo "$tag_json" | jq -r '.object.sha // empty' 2>/dev/null)

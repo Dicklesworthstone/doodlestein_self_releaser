@@ -2985,6 +2985,49 @@ test_resolve_tag_sha_rejects_non_commit_target() (
   [[ $status -eq 0 ]]
 )
 
+test_resolve_tag_sha_read_status() (
+  local stopped_status="$1" phase="$2" expected_status="$3"
+  local calls="$TEMP_DIR/tag-read-calls" sha status=0 expected_calls=1
+  : > "$calls"
+  [[ "$phase" != annotated ]] || expected_calls=2
+
+  gh_api() {
+    printf '%s\n' "$1" >> "$calls"
+    if [[ "$phase" == annotated && "$1" == repos/owner/repo/git/ref/tags/v1.2.3 ]]; then
+      printf '{"object":{"sha":"1111111111111111111111111111111111111111","type":"tag"}}\n'
+      return 0
+    fi
+    # A partial but plausible response cannot authorize a commit when the
+    # request failed or was interrupted.
+    printf '{"object":{"sha":"2222222222222222222222222222222222222222","type":"commit"}}\n'
+    return "$stopped_status"
+  }
+
+  sha=$(gh_resolve_tag_sha owner/repo v1.2.3) || status=$?
+  [[ "$status" -eq "$expected_status" && -z "$sha" &&
+     "$(wc -l < "$calls")" -eq "$expected_calls" ]]
+)
+
+run_tag_resolution_tests() {
+  run_test "resolve_tag_sha_rejects_missing_args" test_resolve_tag_sha_rejects_missing_args
+  run_test "resolve_tag_sha_commit" test_resolve_tag_sha_commit
+  run_test "resolve_tag_sha_annotated" test_resolve_tag_sha_annotated
+  run_test "resolve_tag_sha_nested_annotated" test_resolve_tag_sha_nested_annotated
+  run_test "resolve_tag_sha_rejects_short_sha" test_resolve_tag_sha_rejects_short_sha
+  run_test "resolve_tag_sha_rejects_non_commit_target" test_resolve_tag_sha_rejects_non_commit_target
+  local phase status
+  for phase in reference annotated; do
+    for status in 2 5 124 125 129 130 131 137 143 255; do
+      run_test "resolve_tag_sha_${phase}_interrupted_${status}" \
+        test_resolve_tag_sha_read_status "$status" "$phase" "$status"
+    done
+    for status in 1 8 22 128; do
+      run_test "resolve_tag_sha_${phase}_unavailable_${status}" \
+        test_resolve_tag_sha_read_status "$status" "$phase" 4
+    done
+  done
+}
+
 test_dispatch_rejects_missing_args() {
   ! gh_repository_dispatch "" "event" 2>/dev/null
   ! gh_repository_dispatch "owner/repo" "" 2>/dev/null
@@ -3113,6 +3156,13 @@ PY
 main() {
   echo "=== github.sh Tests ==="
   echo ""
+
+  if [[ "${1:-}" == --tag-resolution-only ]]; then
+    run_tag_resolution_tests
+    printf 'Tag resolution: %s passed, %s failed\n' "$TESTS_PASSED" "$TESTS_FAILED"
+    [[ "$TESTS_FAILED" -eq 0 ]]
+    exit $?
+  fi
 
   if [[ "${1:-}" == --publication-auth-only ]]; then
     run_test "publication_authentication_consumers" test_publication_authentication_consumers
@@ -3408,12 +3458,7 @@ UPLOAD_SCENARIOS
   echo ""
   echo "Dispatch Helpers:"
   run_test "publication_authentication_consumers" test_publication_authentication_consumers
-  run_test "resolve_tag_sha_rejects_missing_args" test_resolve_tag_sha_rejects_missing_args
-  run_test "resolve_tag_sha_commit" test_resolve_tag_sha_commit
-  run_test "resolve_tag_sha_annotated" test_resolve_tag_sha_annotated
-  run_test "resolve_tag_sha_nested_annotated" test_resolve_tag_sha_nested_annotated
-  run_test "resolve_tag_sha_rejects_short_sha" test_resolve_tag_sha_rejects_short_sha
-  run_test "resolve_tag_sha_rejects_non_commit_target" test_resolve_tag_sha_rejects_non_commit_target
+  run_tag_resolution_tests
   run_test "dispatch_rejects_missing_args" test_dispatch_rejects_missing_args
   run_test "dispatch_accepts_valid_payload" test_dispatch_accepts_valid_payload
   run_test "dispatch_fails_on_error_response" test_dispatch_fails_on_error_response
