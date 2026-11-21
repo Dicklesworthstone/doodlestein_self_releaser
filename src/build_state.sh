@@ -818,7 +818,8 @@ build_state_set_context() {
     build_tasks_json=$(jq -c '[.targets[] | {key:., platform:., target_triple:"", method:"native"}]' \
       "$state_file") || return 1
   fi
-  if ! jq -e --argjson tasks "$build_tasks_json" --arg digest "$native_matrix_config_sha256" '
+  if ! jq -e --slurpfile task_documents /dev/fd/3 --arg digest "$native_matrix_config_sha256" '
+      ($task_documents | select(length == 1) | .[0]) as $tasks |
       .targets as $platforms |
       ($tasks | type == "array") and
       ([$tasks[].key] | unique | length) == ($tasks | length) and
@@ -827,13 +828,19 @@ build_state_set_context() {
         (.platform as $platform | $platforms | index($platform) != null) and
         (.target_triple | type == "string") and
         (.method == "act" or .method == "native") and
+        (if .method == "act" then .workflow_event |
+            type == "object" and keys == ["event","payload","payload_sha256"] and
+            (.event | IN("push","release","workflow_dispatch")) and
+            (.payload | type == "object") and
+            (.payload_sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+         else true end) and
         (.key == .platform or (.method == "native" and
           (.target_triple | test("^[A-Za-z0-9][A-Za-z0-9._-]*$") and (contains("..") | not)) and
           .key == (.platform + "@" + .target_triple)))) and
       ([$tasks[].platform] | unique | sort) == ($platforms | unique | sort) and
       (if any($tasks[]; .key != .platform) then $digest | test("^[0-9a-f]{64}$")
        else $digest == "" end)
-    ' "$state_file" >/dev/null 2>&1; then
+    ' 3<<< "$build_tasks_json" "$state_file" >/dev/null 2>&1; then
     log_error "Invalid build task plan for run $run_id"
     return 1
   fi
@@ -861,13 +868,14 @@ build_state_set_context() {
     --argjson target_hosts "$target_hosts_json" \
     --slurpfile source_sync /dev/fd/3 --slurpfile snapshot_owners /dev/fd/4 \
     --arg build_purpose "$build_purpose" \
-    --argjson build_tasks "$build_tasks_json" \
+    --slurpfile task_documents /dev/fd/5 \
     --arg native_matrix_config_sha256 "$native_matrix_config_sha256" \
     --arg repo_config_sha256 "$repo_config_sha256" \
     --arg output_dir "$output_dir" --argjson parallel_jobs "$parallel_jobs" \
     --arg now "$now" '
       ($source_sync | select(length == 1) | .[0]) as $source_sync |
       ($snapshot_owners | select(length == 1) | .[0]) as $snapshot_owners |
+      ($task_documents | select(length == 1) | .[0]) as $build_tasks |
       .git_sha = $sha |
       .git_ref = $ref |
       .context = {
@@ -887,7 +895,7 @@ build_state_set_context() {
         .[$task.key] = {status: "pending", attempts: 0})) |
       .source_sync_history = (if $source_sync == null then []
         else [{recorded_at: $now, receipt: $source_sync}] end) |
-      .updated_at = $now' 3<<< "$source_sync_json" 4<<< "$snapshot_owners_json"
+      .updated_at = $now' 3<<< "$source_sync_json" 4<<< "$snapshot_owners_json" 5<<< "$build_tasks_json"
 }
 
 # Shared admission for the immutable source namespace of an ordinary run.

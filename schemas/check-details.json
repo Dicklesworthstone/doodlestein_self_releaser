@@ -100,6 +100,11 @@
           "maximum": 9007199254740991,
           "description": "Workflow identity retained in automatic admission"
         },
+        "event": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Observed GitHub Actions event; automatic fallback must match the configured workflow event"
+        },
         "threshold_seconds": {
           "type": "integer",
           "minimum": 1,

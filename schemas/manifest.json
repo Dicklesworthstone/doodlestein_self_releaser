@@ -225,6 +225,17 @@
           "type": "string",
           "enum": ["act", "native"]
         },
+        "workflow_event": {
+          "type": "object",
+          "required": ["event", "payload", "payload_sha256"],
+          "additionalProperties": false,
+          "properties": {
+            "event": {"enum": ["push", "release", "workflow_dispatch"]},
+            "payload": {"type": "object"},
+            "payload_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          },
+          "description": "Configured event and canonical payload admitted for an act build"
+        },
         "build_influence_env": {
           "type": "object",
           "additionalProperties": {

@@ -149,6 +149,17 @@
           "type": "string",
           "description": "Workflow file used"
         },
+        "workflow_event": {
+          "type": "object",
+          "required": ["event", "payload", "payload_sha256"],
+          "additionalProperties": false,
+          "properties": {
+            "event": { "enum": ["push", "release", "workflow_dispatch"] },
+            "payload": { "type": "object" },
+            "payload_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          },
+          "description": "Admitted workflow event and canonical payload identity retained by an act attempt"
+        },
         "job": {
           "type": "string",
           "description": "Job name within workflow"

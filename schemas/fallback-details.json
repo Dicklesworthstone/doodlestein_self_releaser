@@ -37,14 +37,20 @@
       "$ref": "#/$defs/watch_admission",
       "description": "Original conditional authority for an automatic workflow worker"
     },
+    "workflow_event": {
+      "$ref": "#/$defs/workflow_event",
+      "description": "Configured workflow event and canonical payload selected for this fallback, including a dry-run plan"
+    },
     "watch_observation": {
       "type": ["object", "null"],
       "description": "Latest fresh admission result; null before a check or after its refusal",
-      "required": ["run_id", "run_attempt", "workflow_id", "reason", "status", "conclusion", "threshold_seconds", "checked_epoch"],
+      "required": ["run_id", "run_attempt", "workflow_id", "reason", "status", "conclusion", "event", "workflow_event_sha256", "threshold_seconds", "checked_epoch"],
       "properties": {
         "run_id": { "type": "string", "pattern": "^[1-9][0-9]{0,15}$" },
         "run_attempt": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
         "workflow_id": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "event": { "enum": ["push", "release", "workflow_dispatch"] },
+        "workflow_event_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
         "reason": { "enum": ["throttled", "upstream_failure"] },
         "status": { "enum": ["queued", "in_progress", "completed"] },
         "conclusion": { "enum": [null, "failure", "timed_out", "startup_failure"] },
@@ -122,14 +128,25 @@
     }
   },
   "$defs": {
+    "workflow_event": {
+      "type": "object",
+      "required": ["event", "payload", "payload_sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "event": { "enum": ["push", "release", "workflow_dispatch"] },
+        "payload": { "type": "object" },
+        "payload_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
     "watch_admission": {
       "type": "object",
-      "required": ["run_id", "run_attempt", "workflow_id", "repo", "version", "git_sha", "reason", "threshold_seconds"],
+      "required": ["run_id", "run_attempt", "workflow_id", "repo", "version", "git_sha", "reason", "threshold_seconds", "workflow_event"],
       "additionalProperties": false,
       "properties": {
         "run_id": { "type": "string", "pattern": "^[1-9][0-9]{0,15}$" },
         "run_attempt": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
         "workflow_id": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "workflow_event": { "$ref": "#/$defs/workflow_event" },
         "repo": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$" },
         "version": { "type": "string", "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+([.+-][0-9A-Za-z.+-]*)?$" },
         "git_sha": { "type": "string", "pattern": "^(?!0{40}$)[0-9a-f]{40}$" },

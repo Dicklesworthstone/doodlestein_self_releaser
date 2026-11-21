@@ -3018,37 +3018,83 @@ _act_runner_image_config_present() {
     return 1
 }
 
-# act appends repeated --matrix options from its user/invocation actrc files;
-# they widen the allowed values instead of being replaced by command-line
-# filters. Shared-job ownership therefore requires those filters in the DSR
-# configuration alone. Read without executing any configuration shell text.
-_act_shared_matrix_config_admission() {
-    python3 -I - <<'PY'
-import os, pathlib, re, sys
-
-home = pathlib.Path(os.environ.get('HOME', str(pathlib.Path.home())))
-locations = [home / '.actrc', home / '.config/act/actrc',
-             home / 'Library/Application Support/act/actrc', pathlib.Path.cwd() / '.actrc']
-for variable in ('XDG_CONFIG_HOME', 'APPDATA', 'LOCALAPPDATA'):
-    if os.environ.get(variable):
-        locations.append(pathlib.Path(os.environ[variable]) / 'act/actrc')
-try:
-    for path in dict.fromkeys(locations):
-        if not path.exists():
-            continue
-        with path.open(encoding='utf-8') as stream:
-            for line in stream:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                line = re.sub(r'\$(?:\{([^}]+)\}|([A-Za-z0-9_]+))',
-                              lambda match: os.environ.get(match[1] or match[2], ''), line)
-                if re.search(r'(^|\s)--matrix(?:=|\s|$)', line):
-                    raise ValueError('move actrc --matrix filters into act_matrix for shared workflow jobs: ' + str(path))
-except (OSError, ValueError) as exc:
-    sys.stderr.write('[act] Shared workflow matrix: ' + str(exc) + '\n')
-    raise SystemExit(4)
-PY
+# act appends matrix and input overrides from user/invocation actrc files.
+# Those merge with managed values rather than being replaced by the final
+# event path or matrix filter. Read without executing configuration text.
+_act_ambient_argument_admission() {
+    # Snapshot only exported environment values before local names can shadow
+    # them. A failed JSON producer appends null, so partial output cannot pass
+    # the exactly-one-object admission below. Function exports are not names
+    # that act's ordinary $NAME/${NAME} syntax can select.
+    set -- "${1:-matrix}" "$(jq -cn 'env | with_entries(select(.key | test("^[A-Za-z_][A-Za-z0-9_]*$")))' || printf '\nnull\n')"
+    local kind="${1:-matrix}" act_user_home="${HOME:-}"
+    local environment_json="$2" environment_value
+    local path variable contents line expanded prefix remainder
+    jq -es 'length == 1 and (.[0] | type == "object" and all(.[]; type == "string"))' \
+        <<< "$environment_json" >/dev/null || return 4
+    [[ "$kind" == matrix || "$kind" == event ]] || return 4
+    [[ -n "$act_user_home" ]] || { _log_error "HOME is required to inspect act configuration"; return 4; }
+    local -a locations=("$act_user_home/.actrc" "$act_user_home/.config/act/actrc"
+        "$act_user_home/Library/Application Support/act/actrc" "$PWD/.actrc")
+    for variable in XDG_CONFIG_HOME APPDATA LOCALAPPDATA; do
+        environment_value=$(jq -jr --arg key "$variable" '(.[$key] // "") + "\u0001"' \
+            <<< "$environment_json") || return 4
+        environment_value="${environment_value%$'\001'}"
+        [[ -z "$environment_value" ]] || locations+=("$environment_value/act/actrc")
+    done
+    for path in "${locations[@]}"; do
+        [[ -e "$path" || -L "$path" ]] || continue
+        if [[ ! -f "$path" || ! -r "$path" ]] || ! contents=$(cat -- "$path"); then
+            _log_error "Cannot inspect act configuration: $path"
+            return 4
+        fi
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            # Go trims Unicode WhiteSpace before environment expansion. Bash
+            # character classes omit some of it (notably NBSP and NEL), so
+            # trim the same set before checking literal flag boundaries.
+            line=$(jq -Rrs '
+                gsub("^[\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$"; "")
+            ' <<< "$line") || return 4
+            [[ -n "$line" && ! "$line" =~ ^[[:space:]]*# ]] || continue
+            # act expands environment names in each line. Expand them once
+            # without eval: neither values nor configuration text are shell
+            # programs, and a substituted value must not be expanded again.
+            expanded=""
+            while [[ "$line" == *'$'* ]]; do
+                prefix="${line%%\$*}"
+                expanded+="$prefix"
+                remainder="${line#*\$}"
+                if [[ "$remainder" =~ ^\{([^}]+)\}(.*)$ ]]; then
+                    variable="${BASH_REMATCH[1]}"
+                    line="${BASH_REMATCH[2]}"
+                elif [[ "$remainder" =~ ^([A-Za-z0-9_]+)(.*)$ ]]; then
+                    variable="${BASH_REMATCH[1]}"
+                    line="${BASH_REMATCH[2]}"
+                else
+                    _log_error "Unsupported dollar expansion in act configuration: $path"
+                    return 4
+                fi
+                if [[ ! "$variable" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+                    _log_error "Unsupported act configuration environment name: $path"
+                    return 4
+                fi
+                # The sentinel preserves trailing newlines through command
+                # substitution; dropping one could hide an option boundary.
+                environment_value=$(jq -jr --arg key "$variable" '(.[$key] // "") + "\u0001"' \
+                    <<< "$environment_json") || return 4
+                expanded+="${environment_value%$'\001'}"
+            done
+            expanded+="$line"
+            if [[ "$kind" == matrix && "$expanded" =~ (^|[[:space:]])--matrix(=|[[:space:]]|$) ]]; then
+                _log_error "Move actrc --matrix filters into act_matrix for shared workflow jobs: $path"
+                return 4
+            fi
+            if [[ "$kind" == event && "$expanded" =~ (^|[[:space:]])--input(-file)?(=|[[:space:]]|$) ]]; then
+                _log_error "Move actrc input overrides into workflow_event_payload.inputs: $path"
+                return 4
+            fi
+        done <<< "$contents"
+    done
 }
 
 # Keep source projection optional for existing single-repository callers and
@@ -3100,6 +3146,136 @@ _act_validate_workflow_source_results() {
         (.status == "success" or .status == "ok" or .status == "passed"))' <<< "$result")
 }
 
+# Resolve the event independently of act's ambient files and defaults. The
+# selected release version owns every supported source selector; payload data
+# may describe a release or dispatch inputs, but cannot select another tree.
+# Input: exactly one repository configuration object on stdin.
+_act_workflow_event_plan_from_json() {
+    local version="${1:-}" tag="" plan payload digest
+    if [[ -n "$version" ]]; then
+        tag="v${version#v}"
+        git check-ref-format "refs/tags/$tag" >/dev/null 2>&1 || {
+            _log_error "Invalid workflow release tag: $tag"
+            return 4
+        }
+    fi
+    plan=$(jq -ces --arg tag "$tag" '
+        if length != 1 or (.[0] | type != "object") then
+            error("workflow event requires one repository mapping")
+        else .[0] end |
+        {event:(if has("workflow_event") then .workflow_event else "push" end),
+         payload:(if has("workflow_event_payload") then .workflow_event_payload else {} end)} |
+        if (.event | IN("push","release","workflow_dispatch") | not) or
+           (.payload | type != "object") then
+            error("workflow_event must be push, release or workflow_dispatch; workflow_event_payload must be a mapping")
+        elif any(.payload | .. | strings; contains("\u0000")) or
+             any(.payload | .. | objects | keys[]; contains("\u0000")) then
+            error("workflow event payload cannot contain NUL")
+        else . end
+    ') || return 4
+    # Keep the forbidden-source test separate from normalization so the input
+    # object remains the jq context while iterating selector names.
+    plan=$(jq -ce --arg tag "$tag" '
+        . as $plan |
+        if any(["after","before","head_commit","commits","pull_request","repository",
+                "repository_id","head","base","sha","head_sha","head_branch","ref_name",
+                "ref_type","workflow_run","workflow_job","check_run","check_suite"][];
+                . as $key | $plan.payload | has($key)) then
+            error("workflow event contains an unsupported source selector")
+        elif (.payload | has("ref")) and
+             ($tag == "" or .payload.ref != ("refs/tags/" + $tag)) then
+            error("workflow event ref conflicts with the selected release tag")
+        elif .event != "release" and ((.payload | has("release")) or (.payload | has("action"))) then
+            error("release and action payload fields require workflow_event: release")
+        elif .event != "workflow_dispatch" and (.payload | has("inputs")) then
+            error("inputs require workflow_event: workflow_dispatch")
+        elif .event == "workflow_dispatch" and (.payload | has("inputs")) and
+             (.payload.inputs | type != "object" or
+                 (all(to_entries[]; (.key | length > 0) and
+                    (.value | type | IN("string","boolean","number"))) | not)) then
+            error("workflow dispatch inputs must map names to string, boolean or number values")
+        else . end |
+        # GitHub event.inputs represents booleans as strings. act recovers
+        # typed inputs from the workflow declaration and compares boolean
+        # input values with the literal string "true"; JSON true would skip
+        # a job guarded by inputs.enabled. Number and string inputs retain
+        # their configured values, including zero and the empty string.
+        if .event == "workflow_dispatch" and (.payload | has("inputs")) then
+            .payload.inputs |= with_entries(.value |=
+                if type == "boolean" then tostring else . end)
+        else . end |
+        if .event == "release" then
+            if $tag == "" then error("release events require a selected version")
+            elif (.payload | has("release")) and (.payload.release | type != "object") then
+                error("release payload must be a mapping")
+            elif (.payload | has("action")) and
+                 (.payload.action | IN("published","unpublished","created","edited","deleted","prereleased","released") | not) then
+                error("unsupported release event action")
+            else .payload.release = (.payload.release // {}) |
+                if (.payload.release | has("tag_name")) and .payload.release.tag_name != $tag then
+                    error("release tag_name conflicts with the selected version")
+                elif (.payload.release | has("target_commitish")) and
+                     (.payload.release.target_commitish != $tag and
+                      .payload.release.target_commitish != ("refs/tags/" + $tag)) then
+                    error("release target_commitish must identify the selected tag")
+                elif any(["draft","prerelease"][];
+                    . as $key | $plan.payload.release // {} |
+                    has($key) and (.[$key] | type != "boolean")) then
+                    error("release draft and prerelease fields must be booleans")
+                else .payload.action = (.payload.action // "published") |
+                    .payload.release.tag_name = $tag |
+                    if .payload.release | has("target_commitish") then
+                        .payload.release.target_commitish = ("refs/tags/" + $tag)
+                    else . end
+                end
+            end
+        else . end |
+        if $tag == "" then . else .payload.ref = ("refs/tags/" + $tag) end
+    ' <<< "$plan") || return 4
+    payload=$(jq -cS .payload <<< "$plan") || return 4
+    local LC_ALL=C
+    if ((${#payload} + 1 > 65536)); then
+        _log_error "Canonical workflow event payload exceeds the 65536-byte limit"
+        return 4
+    fi
+    digest=$(_act_sha256 /dev/stdin <<< "$payload") || return 4
+    jq -cS --arg digest "$digest" '. + {payload_sha256:$digest}' <<< "$plan"
+}
+
+# Public planner used by the CLI, automatic admission and the coordinator.
+_act_workflow_event_plan_json() {
+    local tool="$1" version="${2:-}" document
+    if ! declare -F _config_read_single_mapping_json >/dev/null; then
+        # shellcheck source=SCRIPTDIR/config.sh
+        source "$_ACT_RUNNER_MODULE_DIR/config.sh" || return 3
+    fi
+    document=$(_config_read_single_mapping_json "$ACT_REPOS_DIR/$tool.yaml") || return 4
+    _act_workflow_event_plan_from_json "$version" <<< "$document"
+}
+
+_act_validate_workflow_event_result() {
+    local result="$1" expected="${2:-null}"
+    [[ "$expected" != null ]] || return 0
+    jq -es --slurpfile expected /dev/fd/3 '
+        length == 1 and ($expected | length == 1) and
+        (.[0] | .method == "act" and .workflow_event == $expected[0])
+    ' 3<<< "$expected" <<< "$result" >/dev/null
+}
+
+_act_validate_workflow_event_results() {
+    local tool="$1" result="$2" version plan row
+    jq -e 'any(.targets[]; .method == "act")' <<< "$result" >/dev/null || return 0
+    version=$(jq -er '.version | strings | select(length > 0)' <<< "$result") || return 4
+    plan=$(_act_workflow_event_plan_json "$tool" "$version") || return 4
+    while IFS= read -r row; do
+        _act_validate_workflow_event_result "$row" "$plan" || {
+            _log_error "Workflow result differs from its configured event and payload"
+            return 4
+        }
+    done < <(jq -c '.targets[] | select(.method == "act" and
+        (.status | IN("success","ok","passed")))' <<< "$result")
+}
+
 # Run a workflow via act
 # Usage: act_run_workflow <repo_path> <workflow> [job] [event] [version] [extra_args...]
 # Returns: exit code (0=success, 1=partial, 6=build failed, 3=dependency error)
@@ -3118,6 +3294,34 @@ act_run_workflow() {
     local version="${5:-}"
     if [[ $# -gt 5 ]]; then shift 5; else set --; fi
     local extra_args=("$@")
+
+    local event_plan="${_ACT_WORKFLOW_EVENT_PLAN:-null}" event_payload="" event_file=""
+    if [[ "$event_plan" != null ]]; then
+        local normalized_event
+        normalized_event=$(jq -ce '
+            if type == "object" and keys == ["event","payload","payload_sha256"] then
+                {workflow_event:.event,workflow_event_payload:.payload}
+            else error("invalid managed workflow event plan") end
+        ' <<< "$event_plan" | _act_workflow_event_plan_from_json "$version") || return 4
+        if ! jq -es --arg event "$event" --slurpfile expected /dev/fd/3 '
+            length == 1 and ($expected | length == 1) and
+            .[0] == $expected[0] and .[0].event == $event
+        ' 3<<< "$event_plan" <<< "$normalized_event" >/dev/null; then
+            _log_error "Managed workflow event differs from its admitted plan"
+            return 4
+        fi
+        local managed_argument
+        for managed_argument in "${extra_args[@]}"; do
+            case "$managed_argument" in
+                -e|-e?*|--eventpath|--eventpath=*|--input|--input=*|--input-file|--input-file=*|--)
+                    _log_error "Managed workflow events own eventpath and inputs; use workflow_event_payload"
+                    return 4
+                    ;;
+            esac
+        done
+        _act_ambient_argument_admission event || return 4
+        event_payload=$(jq -cS .payload <<< "$event_plan") || return 4
+    fi
 
     local tag="" argument
     if [[ -n "$version" ]]; then
@@ -3152,7 +3356,7 @@ act_run_workflow() {
         return 4
     fi
     if [[ "${_ACT_SHARED_WORKFLOW_MATRIX:-false}" == true ]]; then
-        _act_shared_matrix_config_admission || return 4
+        _act_ambient_argument_admission matrix || return 4
     fi
 
     local source_plan=null source_layout=null projected_workflow="$workflow"
@@ -3234,8 +3438,8 @@ act_run_workflow() {
         act_cmd+=(--env "GITHUB_REF=refs/tags/$tag")
         act_cmd+=(--env "GITHUB_REF_NAME=$tag")
         act_cmd+=(--env "GITHUB_REF_TYPE=tag")
-        if [[ "$event" == push ]]; then
-            local event_file="$ACT_LOGS_DIR/$run_id.event.json"
+        if [[ "$event" == push && "$event_plan" == null ]]; then
+            event_file="$ACT_LOGS_DIR/$run_id.event.json"
             # Store control data beside the log, never inside the upload
             # inventory. Each concurrent run/retry owns a separate private file.
             if ! (umask 077; set -o noclobber;
@@ -3246,6 +3450,17 @@ act_run_workflow() {
             act_cmd+=(--eventpath "$event_file")
         fi
         _log_info "Injecting tag context: $tag"
+    fi
+    if [[ "$event_plan" != null ]]; then
+        event_file="$ACT_LOGS_DIR/$run_id.event.json"
+        if ! (umask 077; set -o noclobber; printf '%s\n' "$event_payload" > "$event_file") ||
+           [[ "$(_act_sha256 "$event_file")" != "$(jq -r .payload_sha256 <<< "$event_plan")" ]]; then
+            _log_error "Failed to reserve the admitted workflow event: $event_file"
+            return 4
+        fi
+        # Disable act's implicit .input file: it is not part of the frozen
+        # recipe. Explicit and ambient --input overrides were refused above.
+        act_cmd+=(--input-file /dev/null --eventpath "$event_file")
     fi
 
     local isolated_home=""
@@ -3309,6 +3524,13 @@ act_run_workflow() {
         source_valid=false
         exit_code=4
     fi
+    if [[ "$event_plan" != null ]] &&
+       { [[ ! -f "$event_file" || -L "$event_file" ]] ||
+         [[ "$(_act_sha256 "$event_file")" != "$(jq -r .payload_sha256 <<< "$event_plan")" ]]; }; then
+        _log_error "Admitted workflow event changed during execution"
+        source_valid=false
+        exit_code=4
+    fi
 
     local end_time
     end_time=$(date +%s)
@@ -3345,6 +3567,7 @@ act_run_workflow() {
         --argjson artifact_count "$artifact_count" \
         --arg log_file "$log_file" \
         --argjson source_layout "$source_layout" \
+        --slurpfile workflow_event /dev/fd/3 \
         '{
             run_id: $run_id,
             workflow: $workflow,
@@ -3355,7 +3578,9 @@ act_run_workflow() {
             artifact_dir: $artifact_dir,
             artifact_count: $artifact_count,
             log_file: $log_file
-        } + (if $source_layout == null then {} else {source_layout:$source_layout} end)' || return 4
+        } + (if $source_layout == null then {} else {source_layout:$source_layout} end) +
+        (if $workflow_event[0] == null then {} else {workflow_event:$workflow_event[0]} end)' \
+        3<<< "$event_plan" || return 4
 
     return "$exit_code"
 }
@@ -16429,6 +16654,7 @@ _act_target_result_available() {
         ((has("exit_code") | not) or .exit_code == 0)' \
         <<< "$result_json" &>/dev/null || return 1
     _act_validate_workflow_source_result "$result_json" "${4:-}" || return 1
+    _act_validate_workflow_event_result "$result_json" "${5:-null}" || return 1
     local expected actual
     expected=$(jq -ceS '
         .resume_artifacts |
@@ -16459,8 +16685,9 @@ _act_result_source_inputs_match() {
 _act_build_task_plan() {
     local tool="$1" version="$2" platforms_json="$3" strict="$4"
     local platform method triples triple key environment command command_template language binary_name
-    local plan='[]' config_file="$ACT_REPOS_DIR/${tool}.yaml" workflow_source
+    local plan='[]' config_file="$ACT_REPOS_DIR/${tool}.yaml" workflow_source workflow_event workflow_flags
     _act_workflow_payload_plans_json "$tool" "$version" >/dev/null || return 4
+    workflow_event=$(_act_workflow_event_plan_json "$tool" "$version") || return 4
     language=$(yq -r '.language // ""' "$config_file") || return 4
     binary_name=$(yq -r '.binary_name // ""' "$config_file") || return 4
     [[ -n "$binary_name" ]] || binary_name="$tool"
@@ -16494,12 +16721,21 @@ _act_build_task_plan() {
             if [[ "$method" == act ]]; then
                 workflow_source=$(_act_source_plan_for_tool "$tool" "$platform") || return 4
                 workflow_source=$(jq -c '.identity // null' <<< "$workflow_source") || return 4
+                workflow_flags=$(act_get_flags "$tool" "$platform") || return 4
+                if ! jq -e 'type == "array" and all(.[]; type == "string" and
+                    (test("^-e|^--(eventpath|input|input-file)(=|$)|^--$") | not))' \
+                    <<< "$workflow_flags" >/dev/null; then
+                    _log_error "Managed workflow events own eventpath and inputs; use workflow_event_payload"
+                    return 4
+                fi
             fi
             plan=$(jq -c --arg key "$platform" --arg platform "$platform" \
                 --arg triple "$triples" --arg method "$method" --argjson source "$workflow_source" \
+                --slurpfile event /dev/fd/3 \
                 '. + [{key:$key, platform:$platform, target_triple:$triple, method:$method} +
-                    (if $source == null then {} else {workflow_source:$source} end)]' \
-                <<< "$plan") || return 4
+                    (if $source == null then {} else {workflow_source:$source} end) +
+                    (if $method == "act" then {workflow_event:$event[0]} else {} end)]' \
+                3<<< "$workflow_event" <<< "$plan") || return 4
         fi
     done < <(jq -r '.[]' <<< "$platforms_json")
     printf '%s\n' "$plan"
@@ -16576,6 +16812,7 @@ _act_build_orchestration_target() {
     local selected_triple="${11:-}"
     local _ACT_WORKFLOW_SOURCE_PLAN="${12:-}" _ACT_WORKFLOW_SOURCE_TOOL="$tool_name"
     local _ACT_EXPECTED_REPO_CONFIG_SHA256="${13:-}"
+    local _ACT_WORKFLOW_EVENT_PLAN="${14:-null}"
     if [[ -n "$_ACT_EXPECTED_REPO_CONFIG_SHA256" ]] &&
        ! _act_repo_config_matches "$tool_name" "$_ACT_EXPECTED_REPO_CONFIG_SHA256"; then
         return 4
@@ -16613,6 +16850,17 @@ _act_build_orchestration_target() {
             return 4
         fi
         local job workflow local_path extra_flags arguments_sha256 workflow_plans workflow_plan materialized flag
+        local current_event_plan event
+        current_event_plan=$(_act_workflow_event_plan_json "$tool_name" "$version") || return 4
+        if [[ "$_ACT_WORKFLOW_EVENT_PLAN" == null ]]; then
+            _ACT_WORKFLOW_EVENT_PLAN="$current_event_plan"
+        elif ! jq -es --slurpfile expected /dev/fd/3 \
+            'length == 1 and ($expected | length == 1) and .[0] == $expected[0]' \
+            3<<< "$_ACT_WORKFLOW_EVENT_PLAN" <<< "$current_event_plan" >/dev/null; then
+            _log_error "Workflow event changed after task admission"
+            return 4
+        fi
+        event=$(jq -r .event <<< "$_ACT_WORKFLOW_EVENT_PLAN") || return 4
         local _ACT_SHARED_WORKFLOW_MATRIX=false
         workflow_plans=$(_act_workflow_payload_plans_json "$tool_name" "$version") || return 4
         workflow_plan=$(jq -c --arg target "$target" '.[$target] // null' <<< "$workflow_plans") || return 4
@@ -16649,7 +16897,7 @@ _act_build_orchestration_target() {
             return 4
         fi
         full_output=$(act_run_workflow \
-            "$local_path" "$workflow" "$job" "push" "$version" \
+            "$local_path" "$workflow" "$job" "$event" "$version" \
             "${act_args[@]}") || exit_code=$?
         if ! result=$(jq -cse '
                 if length == 1 and (.[0] | type == "object") then .[0]
@@ -16666,6 +16914,12 @@ _act_build_orchestration_target() {
         exit_code=$(jq -er '.exit_code' <<< "$result") || return 4
         result=$(jq -c --arg target "$target" --arg method "act" --arg host "$host" \
             '. + {platform: $target, method: $method, host: $host}' <<< "$result")
+        if [[ "$exit_code" -eq 0 ]] &&
+           ! _act_validate_workflow_event_result "$result" "$_ACT_WORKFLOW_EVENT_PLAN"; then
+            exit_code=4
+            result=$(jq -c '.status="failed" | .exit_code=4 |
+                .error="Workflow result does not retain the admitted event and payload"' <<< "$result") || return 4
+        fi
         if [[ "$exit_code" -eq 0 ]] &&
            ! _act_validate_workflow_source_result "$result" "$_ACT_WORKFLOW_SOURCE_PLAN"; then
             exit_code=4
@@ -16913,6 +17167,7 @@ _act_run_target_worker() {
     local source_sync_receipt="${17:-}"
     local workflow_source_plan="${18:-null}"
     local expected_repo_config_sha256="${19:-}"
+    local workflow_event_plan="${20:-null}"
     local worker_output_path="${result_path}.stdout"
     [[ -n "$source_sync_receipt" ]] || source_sync_receipt=null
 
@@ -17112,7 +17367,7 @@ _act_run_target_worker() {
             "$tool_name" "$version" "$run_id" "$target" \
             "$strict_release_contract" "$release_contract_json" "$source_roots_json" \
             "$release_git_sha" "$release_git_ref" "$host" "$selected_triple" "$workflow_source_plan" \
-            "$expected_repo_config_sha256"
+            "$expected_repo_config_sha256" "$workflow_event_plan"
     }
     worker_pid="${_ACT_TARGET_GROUP_PID:-}"
     worker_result_fd="${_ACT_TARGET_GROUP[0]:-}"
@@ -17609,7 +17864,7 @@ _act_target_source_sync_json() {
 # worker merely because an older checkout is still present at that path.
 _act_validate_source_sync_receipt() {
     local receipt="$1" build_tasks="$2"
-    jq -sce --argjson tasks "$build_tasks" '
+    jq -sce --slurpfile task_documents /dev/fd/3 3<<< "$build_tasks" '
       def text: type == "string" and length > 0 and (test("[[:cntrl:]]") | not);
       def host: type == "string" and test("^[A-Za-z0-9_-]+$");
       def path: gsub("\\\\";"/") | if test("^[A-Za-z]:/") then ascii_downcase else . end;
@@ -17652,6 +17907,7 @@ _act_validate_source_sync_receipt() {
         (.roots | type == "array" and length > 0 and . == (sort | unique) and
           index("source") != null and all(.[];
             type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and (contains("..") | not)));
+      ($task_documents | select(length == 1) | .[0]) as $tasks |
       select(length == 1) | .[0] |
       . as $receipt |
       ([$tasks[] | select(.method == "native") | .platform] | unique | sort) as $native |
@@ -18267,7 +18523,7 @@ act_orchestrate_build() {
             # Inspect both authorities before admitting any resumed worker.
             # A valid embedded result cannot launder a differently purposed sidecar.
             local resume_entry resume_map_entry resume_key resume_method resume_platform resume_triple resume_host
-            local resume_receipt resume_result_path resume_go_sha resume_go_ref
+            local resume_receipt resume_result_path resume_go_sha resume_go_ref resume_event
             if ! jq -e '.target_statuses | type == "object"' <<< "$resume_state" >/dev/null; then
                 _log_error "Resume target history is not a target-keyed map"
                 _act_release_orchestration_lock
@@ -18300,10 +18556,21 @@ act_orchestrate_build() {
                     _act_release_orchestration_lock
                     return 4
                 fi
+                resume_event=$(jq -c --arg key "$resume_key" \
+                    '.[] | select(.key == $key) | .workflow_event // null' <<< "$build_tasks_json") || {
+                    _act_release_orchestration_lock; return 4;
+                }
                 resume_receipt=$(jq -c '.result // empty' <<< "$resume_entry")
                 if [[ -n "$resume_receipt" ]] && \
                    ! _act_build_purpose_matches "$resume_receipt" "$build_purpose" "$strict_release_contract"; then
                     _log_error "Resume target result has missing or different build purpose"
+                    _act_release_orchestration_lock
+                    return 4
+                fi
+                if [[ -n "$resume_receipt" ]] &&
+                   jq -e '.status | IN("success", "ok", "passed")' <<< "$resume_receipt" >/dev/null &&
+                   ! _act_validate_workflow_event_result "$resume_receipt" "$resume_event"; then
+                    _log_error "Resume target result lost its admitted workflow event: $resume_key"
                     _act_release_orchestration_lock
                     return 4
                 fi
@@ -18332,6 +18599,12 @@ act_orchestrate_build() {
                     if jq -e '.status | IN("success", "ok", "passed")' <<< "$resume_receipt" >/dev/null &&
                        ! _act_target_result_matches "$resume_receipt" "$resume_platform" "$resume_triple" "$resume_method" "$resume_host"; then
                         _log_error "Resume sidecar does not belong to its scheduled invocation"
+                        _act_release_orchestration_lock
+                        return 4
+                    fi
+                    if jq -e '.status | IN("success", "ok", "passed")' <<< "$resume_receipt" >/dev/null &&
+                       ! _act_validate_workflow_event_result "$resume_receipt" "$resume_event"; then
+                        _log_error "Resume sidecar lost its admitted workflow event: $resume_key"
                         _act_release_orchestration_lock
                         return 4
                     fi
@@ -18585,6 +18858,15 @@ act_orchestrate_build() {
                 .error = "Completed result does not belong to its scheduled invocation" |
                 del(.resume_artifacts)' <<< "$finished_result") || return 4
         fi
+        local finished_event
+        finished_event=$(jq -c --arg key "$finished_target" \
+            '.[] | select(.key == $key) | .workflow_event // null' <<< "$build_tasks_json") || return 4
+        if jq -e '.status | IN("success", "ok", "passed")' <<< "$finished_result" >/dev/null &&
+           ! _act_validate_workflow_event_result "$finished_result" "$finished_event"; then
+            finished_result=$(jq -c '.status = "failed" | .exit_code = 4 |
+                .error = "Completed result lost its admitted workflow event" |
+                del(.resume_artifacts)' <<< "$finished_result") || return 4
+        fi
         finished_result=$(jq -c --arg log_path "$log_path" \
             --argjson attempt "$attempt" \
             --arg purpose "$build_purpose" --arg task_key "$finished_target" \
@@ -18822,6 +19104,13 @@ act_orchestrate_build() {
                 _act_refuse_retained_target "Resume target result has missing or different build purpose: $target" "$prior_attempts"
                 break
             fi
+            if [[ -n "$persisted_result" ]] &&
+               jq -e '.status | IN("success", "ok", "passed")' <<< "$persisted_result" >/dev/null &&
+               ! _act_validate_workflow_event_result "$persisted_result" \
+                    "$(jq -c '.workflow_event // null' <<< "$task_json")"; then
+                _act_refuse_retained_target "Resume target result lost its admitted workflow event: $target" "$prior_attempts"
+                break
+            fi
             if [[ -n "$persisted_result" ]] && ! $strict_release_contract &&
                ! _act_result_source_inputs_match "$persisted_result" "${source_sync_json:-null}" \
                    "$(jq -r .method <<< "$task_json")"; then
@@ -18838,7 +19127,8 @@ act_orchestrate_build() {
                     "$(jq -r '.method' <<< "$task_json")" "$(jq -r '.host // ""' <<< "$persisted_entry")" && \
                [[ "$(jq -r '.task_key // ""' <<< "$persisted_result")" == "$task_key" ]] && \
                _act_target_result_available "$persisted_result" "$build_purpose" "$strict_release_contract" \
-                    "$(jq -c '.workflow_source // null' <<< "$task_json")"; then
+                    "$(jq -c '.workflow_source // null' <<< "$task_json")" \
+                    "$(jq -c '.workflow_event // null' <<< "$task_json")"; then
                 final_results["$task_key"]=$(jq -c '. + {resume_reused: true}' <<< "$persisted_result")
                 dispatch_hosts[$dispatch_index]=$(jq -r '.host' <<< "$persisted_entry")
                 _log_info "Resume: reusing completed target $task_key"
@@ -18851,6 +19141,12 @@ act_orchestrate_build() {
                    else error("exactly one retained worker result required") end' "$persisted_result_path" 2>/dev/null); then
                 if ! _act_build_purpose_matches "$recovered_result" "$build_purpose" "$strict_release_contract"; then
                     _act_refuse_retained_target "Resume sidecar has missing or different build purpose: $target" "$prior_attempts"
+                    break
+                fi
+                if jq -e '.status | IN("success", "ok", "passed")' <<< "$recovered_result" >/dev/null &&
+                   ! _act_validate_workflow_event_result "$recovered_result" \
+                        "$(jq -c '.workflow_event // null' <<< "$task_json")"; then
+                    _act_refuse_retained_target "Resume sidecar lost its admitted workflow event: $target" "$prior_attempts"
                     break
                 fi
                 if ! $strict_release_contract &&
@@ -18868,7 +19164,8 @@ act_orchestrate_build() {
                         "$(jq -r '.method' <<< "$task_json")" "$(jq -r '.host // ""' <<< "$persisted_entry")" &&
                    [[ "$(jq -r '.task_key // ""' <<< "$recovered_result")" == "$task_key" ]] &&
                    _act_target_result_available "$recovered_result" "$build_purpose" "$strict_release_contract" \
-                        "$(jq -c '.workflow_source // null' <<< "$task_json")"; then
+                        "$(jq -c '.workflow_source // null' <<< "$task_json")" \
+                        "$(jq -c '.workflow_event // null' <<< "$task_json")"; then
                     recovered_status=completed
                 elif jq -e --arg task_key "$task_key" --arg platform "$target" \
                         --arg triple "$selected_triple" '
@@ -19174,7 +19471,8 @@ act_orchestrate_build() {
             "$log_path" "$result_path" "$strict_release_contract" \
             "$release_contract_json" "$source_roots_json" "$git_sha" "$git_ref" "$host" "$build_purpose" \
             "$selected_triple" "$task_key" "$target_sync_receipt" \
-            "$(jq -c '.workflow_source // null' <<< "$task_json")" "$repo_config_sha256" </dev/null &
+            "$(jq -c '.workflow_source // null' <<< "$task_json")" "$repo_config_sha256" \
+            "$(jq -c '.workflow_event // null' <<< "$task_json")" </dev/null &
         worker_pids+=("$!")
         worker_output_paths+=("$output_paths")
         worker_targets+=("$task_key")
@@ -19389,7 +19687,9 @@ _act_build_environments_json() {
                 method: (.method // ""),
                 build_influence_env: (.build_influence_env // {}),
                 cargo_isolation: (.cargo_isolation // null)
-            } + (if .target_triple == null then {} else {target_triple: .target_triple} end)
+            } + (if .target_triple == null then {} else {target_triple: .target_triple} end) +
+                (if .method == "act" and .workflow_event != null then
+                    {workflow_event:.workflow_event} else {} end)
         ] | sort_by(.target, .target_triple)
         | if all(.[];
             (.target | type == "string" and length > 0) and
@@ -19398,7 +19698,12 @@ _act_build_environments_json() {
             (.target_triple == null or (.target_triple | type == "string" and
                 test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and (contains("..") | not))) and
             (.build_influence_env | type == "object" and all(.[]; type == "string")) and
-            (.cargo_isolation == null or (.cargo_isolation | type == "object"))
+            (.cargo_isolation == null or (.cargo_isolation | type == "object")) and
+            (.workflow_event == null or (.workflow_event | type == "object" and
+                keys == ["event","payload","payload_sha256"] and
+                (.event | IN("push","release","workflow_dispatch")) and
+                (.payload | type == "object") and
+                (.payload_sha256 | type == "string" and test("^[0-9a-f]{64}$"))))
           ) then . else error("invalid build environment receipt") end
     ' <<< "$result_json"
 }
@@ -20390,6 +20695,7 @@ act_generate_manifest() {
     config_validate_target_triples "$tool" || return 4
     _act_validate_native_matrix_result_inventory "$tool" "$result_json" || return 4
     _act_validate_workflow_source_results "$tool" "$result_json" || return 4
+    _act_validate_workflow_event_results "$tool" "$result_json" || return 4
     local verified_additional verified_workflow_files workflow_plans
     verified_additional=$(_act_additional_artifact_receipts_json "$tool" "$result_json") || return 4
     workflow_plans=$(_act_workflow_payload_plans_json "$tool" "$version") || return 4
@@ -20806,6 +21112,9 @@ export -f act_check_prereqs act_check act_version_is_supported act_list_jobs act
 export -f act_run_workflow act_collect_artifacts act_analyze_workflow act_cleanup
 export -f _act_load_source_layout _act_source_plan_for_tool _act_validate_workflow_source_result
 export -f _act_validate_workflow_source_results
+export -f _act_workflow_event_plan_from_json _act_workflow_event_plan_json
+export -f _act_validate_workflow_event_result _act_ambient_argument_admission
+export -f _act_validate_workflow_event_results
 export -f act_load_repo_config act_get_job_for_target act_platform_uses_act
 export -f act_get_flags act_get_targets act_get_native_host act_get_build_strategy
 export -f _act_native_host_capability

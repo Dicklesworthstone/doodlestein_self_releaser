@@ -623,11 +623,28 @@ invocations remain manual operations and do not treat `enabled: false` as a
 prohibition; monitoring can still report a disabled repository's queued runs.
 
 Automatic fallback binds the repository, explicit `v`-prefixed version tag,
-full source SHA, workflow ID, run ID and run attempt. The watcher passes this
+full source SHA, workflow ID, run ID, run attempt, and configured workflow
+event and canonical payload. The watcher passes this
 identity, its queue threshold and the admission reason to `fallback` through
 the reserved `--watch-admission` argument. A missing or ambiguous field
 withholds the launch. Each actual retry receives a freshly observed admission;
 saved journal metadata alone cannot authorize a worker.
+
+The observed run's `event` must equal `workflow_event` in `repos.d/<tool>.yaml`
+(`push` by default; `release` and `workflow_dispatch` are also supported).
+`watch_admission.workflow_event` contains `{event, payload, payload_sha256}`.
+The worker recomputes this plan before every admission boundary and refuses a
+changed configuration before another upstream request. Deferred work retains
+the same plan, and automatic retries without original event custody are
+withheld. `watch_observation` includes the observed `event` and the configured
+`workflow_event_sha256` after a successful check.
+
+The GitHub workflow-run API exposes the event name, not the original webhook
+body. Dispatch inputs and release action are taken from the explicit reviewed
+`workflow_event_payload` configuration; DSR does not claim to reconstruct or
+authenticate the original upstream values. Automatic replay is appropriate
+when those inputs are fixed by configuration. Tag/source admission remains
+mandatory, so a branch-only dispatch does not authorize a release fallback.
 
 The worker rechecks that admission before allocating build state or preparing
 source, after source preparation, immediately before compilation or completed
@@ -783,6 +800,33 @@ delivers events nor initializes or updates notification state, including with
 ### `dsr build`
 
 Build artifacts locally using act or native compilation.
+
+Act tasks use the repository configuration's `workflow_event` (`push` by
+default, or `release` / `workflow_dispatch`) and `workflow_event_payload`
+(a mapping, default `{}`). The selected version owns `ref` as
+`refs/tags/v<VERSION>`. Release events additionally own `release.tag_name` and
+default to `action: published`; a matching `release.target_commitish` is
+normalized to the full tag ref. Conflicting source selectors are rejected.
+Dispatch `inputs` must map names to string, number, or boolean values. Boolean
+configuration values are normalized to `"true"` / `"false"` in the event
+payload; `act` derives boolean values for declared boolean workflow inputs.
+Strings and numbers are retained without coercion.
+
+The canonical payload is sorted compact JSON followed by a newline, limited
+to 65,536 bytes. Its SHA-256 and complete payload are stored as
+`{event, payload, payload_sha256}` in each act task, original worker result,
+public target details, and manifest build environment. The private event file
+lives beside the run log and is excluded from upload discovery. Managed builds
+reject extra event/input overrides and ambient actrc inputs; a default `.input`
+file cannot change the admitted payload. Native recipes keep their existing
+behavior.
+
+Resume requires the current task plan and both retained successful result
+representations to match that original event. Missing event evidence cannot be
+filled in from current configuration. Completed-build fallback reuse applies
+the same check, including when the scheduler is bypassed. Event and payload
+changes require a new build. A fallback preview validates and reports the
+configured event without writing event files or build state.
 
 ```bash
 dsr build --repo <name> [--targets <list>] [--version <tag>]
@@ -1369,6 +1413,18 @@ creation response and pending receipt keep their exact bytes. Explicitly
 rerunning finalization recognizes an already accepted publication without
 reuploading assets or restoring the release to a draft. Ordinary retryable
 transport failures continue to reconcile using fresh remote evidence.
+
+Strict `release` and standalone `release finalize` preserve terminal status
+through paginated asset inventories, signed-byte downloads, source-tag and
+immutable-ruleset checks, raw-installer verification, preflight, and bound draft
+restoration. A stop during these checks returns exit `5` with interruption
+stage `verification` or `restore` and the original terminal status. No further
+read, retry, compensating write, or dispatch runs after the stop. Visibility
+comes only from a completed observation matching the retained release
+identity; partial transport output never establishes it. Explicit retry
+rechecks the original custody and can finish the same release without
+reuploading verified assets. An ordinary raw-download proxy/DNS exit `5`
+remains a verification failure rather than an adapter cancellation.
 
 New ordinary releases are created as private drafts. DSR freezes every selected
 asset name, size, and SHA-256, including the manifest, generated checksums, and

@@ -575,9 +575,12 @@ watch_admission_fixture() {
         {tool_name:"tool",repo:"owner/tool",local_path:$path,enabled:true,
          language:"go",binary_name:"tool",workflow:"release.yml",
          targets:["linux/amd64","darwin/arm64"]}' > "$ACT_REPOS_DIR/tool.yaml" || return 1
-    WATCH_ADMISSION=$(jq -nc --arg sha "$SOURCE_SHA" '
+    local workflow_event
+    workflow_event=$(_act_workflow_event_plan_json tool v1.2.3) || return 1
+    WATCH_ADMISSION=$(jq -nc --arg sha "$SOURCE_SHA" --slurpfile event /dev/fd/3 '
         {run_id:"12345",run_attempt:2,workflow_id:17,repo:"owner/tool",
-         version:"v1.2.3",git_sha:$sha,reason:"throttled",threshold_seconds:600}') || return 1
+         version:"v1.2.3",git_sha:$sha,reason:"throttled",threshold_seconds:600,
+         workflow_event:$event[0]}' 3<<< "$workflow_event") || return 1
     jq -nc --arg sha "$SOURCE_SHA" '
         {id:12345,repository:{full_name:"owner/tool"},head_branch:"v1.2.3",
          head_sha:$sha,status:"queued",conclusion:null,run_attempt:2,workflow_id:17,
@@ -636,6 +639,10 @@ test_watch_admission_initial_refusal() {
         attempt) expected_rc=4; watch_admission_update_json "$CASE/watch-run.json" '.run_attempt=3' || return 1 ;;
         workflow) expected_rc=4; watch_admission_update_json "$CASE/watch-run.json" '.workflow_id=18' || return 1 ;;
         source) expected_rc=4; watch_admission_update_json "$CASE/watch-run.json" '.head_sha=("f"*40)' || return 1 ;;
+        event) expected_rc=4; watch_admission_update_json "$CASE/watch-run.json" '.event="release"' || return 1 ;;
+        missing-event) expected_rc=4; watch_admission_update_json "$CASE/watch-run.json" 'del(.event)' || return 1 ;;
+        configured-event) expected_rc=4; watch_admission_update_json "$ACT_REPOS_DIR/tool.yaml" '.workflow_event="release"' || return 1 ;;
+        configured-payload) expected_rc=4; watch_admission_update_json "$ACT_REPOS_DIR/tool.yaml" '.workflow_event_payload={custom:"changed"}' || return 1 ;;
         disabled) watch_admission_update_json "$ACT_REPOS_DIR/tool.yaml" '.enabled=false' || return 1 ;;
         unreadable) expected_rc=8; WATCH_HTTP_RC=8 ;;
         interrupted) expected_rc=5; WATCH_HTTP_RC=130 ;;
@@ -651,6 +658,26 @@ test_watch_admission_initial_refusal() {
         [[ "$(grep -c '^UPSTREAM repos/owner/tool/actions/runs/12345 --no-cache$' "$CALLS")" == 2 ]] &&
             grep -Fq 'UPSTREAM repos/owner/tool/actions/runs/12345/attempts/2/jobs?per_page=100&page=1 --no-cache' "$CALLS"
     fi
+}
+test_watch_configured_event() {
+    local event="$1" plan
+    watch_admission_fixture "configured-$event" || return 1
+    watch_admission_update_json "$ACT_REPOS_DIR/tool.yaml" ".workflow_event=\"$event\"" || return 1
+    if [[ "$event" == workflow_dispatch ]]; then
+        watch_admission_update_json "$ACT_REPOS_DIR/tool.yaml" \
+            '.workflow_event_payload={inputs:{channel:"preview",publish:false}}' || return 1
+    fi
+    plan=$(_act_workflow_event_plan_json tool v1.2.3) || return 1
+    WATCH_ADMISSION=$(jq --slurpfile event /dev/fd/3 '.workflow_event=$event[0]' \
+        <<< "$WATCH_ADMISSION" 3<<< "$plan") || return 1
+    watch_admission_update_json "$CASE/watch-run.json" ".event=\"$event\"" || return 1
+    run_fallback --expected-sha "$SOURCE_SHA" --watch-admission "$WATCH_ADMISSION"
+    [[ "$RC" == 0 ]] && one_result && grep -q '^BUILD ' "$CALLS" && grep -q '^RELEASE ' "$CALLS" &&
+        jq -e --slurpfile plan /dev/fd/3 '
+            .details.watch_admission.workflow_event == $plan[0] and
+            .details.watch_observation.event == $plan[0].event and
+            .details.watch_observation.workflow_event_sha256 == $plan[0].payload_sha256
+        ' "$CASE/stdout" 3<<< "$plan" >/dev/null
 }
 test_watch_admission_late_refusal() {
     watch_admission_fixture "late-$1" || return 1
@@ -1996,9 +2023,10 @@ run_test test_throttle_check_interruption
 run_test test_throttle_check_manual_request 0
 run_test test_throttle_check_manual_request 8
 for mode in throttled failure timed_out startup_failure; do run_test test_watch_admission_success "$mode"; done
-for mode in success cancelled failed active waiting recent attempt workflow source disabled unreadable interrupted jobs-rerun; do
+for mode in success cancelled failed active waiting recent attempt workflow source event missing-event configured-event configured-payload disabled unreadable interrupted jobs-rerun; do
     run_test test_watch_admission_initial_refusal "$mode"
 done
+for event in push release workflow_dispatch; do run_test test_watch_configured_event "$event"; done
 for mode in quality build signing; do run_test test_watch_admission_late_refusal "$mode"; done
 for mode in missing-field extra-field fractional-attempt wrong-repo bad-reason bad-threshold missing-expected build-only; do
     run_test test_watch_admission_arguments "$mode"

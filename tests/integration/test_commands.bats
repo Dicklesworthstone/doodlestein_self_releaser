@@ -1117,7 +1117,7 @@ _watch_completed() {
 _watch_run_json() {
     jq -nc --arg sha "${1:-1111111111111111111111111111111111111111}" '
         {details:{throttled:[{run_id:12345,repo:"Dicklesworthstone/ntm",tool:"ntm",
-            head_branch:"v1.2.3",head_sha:$sha,run_attempt:1,workflow_id:17,threshold_seconds:600}]}}'
+            head_branch:"v1.2.3",head_sha:$sha,run_attempt:1,workflow_id:17,threshold_seconds:600,event:"push"}]}}'
 }
 
 _watch_multiple_runs_json() {
@@ -1173,7 +1173,7 @@ _watch_upstream_run_json() {
     jq -nc --arg status "${1:-completed}" --arg conclusion "${2-failure}" \
         --arg sha "${3:-1111111111111111111111111111111111111111}" '
         {id:12345,repository:{full_name:"Dicklesworthstone/ntm"},
-         head_branch:"v1.2.3",head_sha:$sha,status:$status,run_attempt:1,workflow_id:17,
+         head_branch:"v1.2.3",head_sha:$sha,status:$status,run_attempt:1,workflow_id:17,event:"push",
          conclusion:(if $conclusion == "" then null else $conclusion end)}'
 }
 
@@ -1521,10 +1521,12 @@ EOF
         ($args[$index + 1] | fromjson) ==
             {run_id:"12345",run_attempt:1,workflow_id:17,repo:"Dicklesworthstone/ntm",
              version:"v1.2.3",git_sha:"1111111111111111111111111111111111111111",
-             reason:"throttled",threshold_seconds:600} and
+             reason:"throttled",threshold_seconds:600,
+             workflow_event:{event:"push",payload:{ref:"refs/tags/v1.2.3"},
+                payload_sha256:"d5413999a126569f67939d4ace0dbca532138aa83b414805e46fe40c6ea2df9f"}} and
         ($args[:$index] + $args[$index + 2:]) ==
             ["--non-interactive", "--json", "fallback", "ntm", "--version", "v1.2.3",
-             "--expected-sha", "1111111111111111111111111111111111111111", "--isolate-source", "--output-dir", $output, ""]' \
+             "--expected-sha", "1111111111111111111111111111111111111111", "--isolate-source", "--output-dir", $output, "--jobs", "1", ""]' \
         "$TEST_TMPDIR/fallback.args"
     jq -e '.runs["12345"] != null' "$DSR_STATE_DIR/triggered.json"
     jq -e '.attempts["12345"].isolate_source == true' "$DSR_STATE_DIR/triggered.json"
@@ -1539,6 +1541,74 @@ EOF
     assert_contains "$output" "automatic fallback blocked"
     [[ ! -e "$TEST_TMPDIR/fallback.args" ]]
     [[ ! -e "$DSR_STATE_DIR/triggered.json" ]]
+}
+
+@test "workflow event replay: watcher binds release and dispatch payloads to new attempts" {
+    harness_create_config
+    local event run_id=12345 check_json
+    for event in release workflow_dispatch; do
+        _watch_configure_ntm "workflow_event: $event"
+        if [[ "$event" == workflow_dispatch ]]; then
+            cat >> "$DSR_CONFIG_DIR/repos.d/ntm.yaml" <<'EOF'
+workflow_event_payload:
+  inputs:
+    channel: preview
+    publish: false
+EOF
+        fi
+        check_json=$(_watch_run_json | jq --arg event "$event" --argjson id "$run_id" \
+            '.details.throttled[0] += {event:$event,run_id:$id}')
+        run --separate-stderr _routing_watch "$check_json" --auto-fallback
+        assert_equal 0 "$status"
+        _watch_completed "$run_id"
+        jq -e --arg id "$run_id" --arg event "$event" '
+            .attempts[$id].watch_admission.workflow_event |
+            .event == $event and .payload.ref == "refs/tags/v1.2.3" and
+            (if $event == "release" then .payload.action == "published" and
+                 .payload.release.tag_name == "v1.2.3"
+             else .payload.inputs == {channel:"preview",publish:"false"} end)
+        ' "$DSR_STATE_DIR/triggered.json"
+        python3 - "$DSR_STATE_DIR/triggered.json" "$run_id" <<'PY'
+import hashlib, json, sys
+event = json.load(open(sys.argv[1]))['attempts'][sys.argv[2]]['watch_admission']['workflow_event']
+canonical = json.dumps(event['payload'], sort_keys=True, separators=(',', ':'), ensure_ascii=False) + '\n'
+assert hashlib.sha256(canonical.encode()).hexdigest() == event['payload_sha256']
+PY
+        run_id=$((run_id + 1))
+    done
+    assert_equal 2 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+}
+
+@test "workflow event replay: mismatched or missing upstream events cannot launch or preview" {
+    harness_create_config
+    _watch_configure_ntm 'workflow_event: release'
+    local mutation check_json
+    for mutation in '.event="push"' '.event="workflow_dispatch"' 'del(.event)'; do
+        check_json=$(_watch_run_json | jq ".details.throttled[0] |= ($mutation)")
+        run _routing_watch "$check_json" --auto-fallback
+        assert_equal 0 "$status"
+        assert_contains "$output" "does not match the configured workflow event"
+        [[ ! -e "$TEST_TMPDIR/fallback.starts" && ! -e "$DSR_STATE_DIR/triggered.json" ]]
+        run _routing_watch "$check_json" --auto-fallback --dry-run
+        assert_equal 0 "$status"
+        [[ "$output" != *"Would trigger fallback"* && ! -e "$TEST_TMPDIR/fallback.starts" ]]
+    done
+}
+
+@test "workflow event replay: deferred work retains its original payload and rejects drift" {
+    _watch_pending_fixture
+    cp "$DSR_STATE_DIR/triggered.json" "$TEST_TMPDIR/event-before-drift.json"
+    _watch_configure_ntm $'workflow_event_payload:\n  custom: changed'
+    run _routing_watch "$(_watch_run_json)" --auto-fallback --max-concurrent 1
+    assert_equal 0 "$status"
+    assert_contains "$output" "lacks unchanged workflow event custody"
+    cmp "$TEST_TMPDIR/event-before-drift.json" "$DSR_STATE_DIR/triggered.json"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    _watch_configure_ntm
+    run _routing_watch "$(_watch_run_json)" --auto-fallback --max-concurrent 1
+    assert_equal 0 "$status"
+    _watch_completed
+    assert_equal 2 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
 }
 
 @test "automation opt-out: list preserves registry false and uses per-tool precedence" {

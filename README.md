@@ -1202,6 +1202,15 @@ Keep the original creation response and retry the same finalization command
 to reconcile the release against fresh evidence. A request already accepted by
 GitHub may have completed even when its local transport was interrupted.
 
+Strict `release` and `release finalize` also stop on terminal interruption
+during inventory reads, signed-byte downloads, tag and ruleset verification,
+raw-installer checks, or draft restoration. They return exit `5`, retain the
+original terminal status in the JSON interruption details, and perform no
+later remote operation in that invocation. Only a completed observation
+matching the owned release can establish its last known visibility. Ordinary
+transient failures still use bounded reconciliation; an explicit retry
+revalidates the retained creation and publication evidence.
+
 ### `dsr installer`
 
 Generate the `curl | bash` installer for a tool from its `repos.d/<tool>.yaml`:
@@ -1745,6 +1754,55 @@ hosts:
   darwin/arm64: mac-builder
   windows/amd64: win-builder
 ```
+
+### Workflow events
+
+DSR runs act with a `push` event by default. For workflows triggered by a
+published release, select that event explicitly in `repos.d/<tool>.yaml`:
+
+```yaml
+workflow: .github/workflows/release.yml
+workflow_event: release
+workflow_event_payload:
+  action: published
+```
+
+For a dispatch workflow, put its inputs in the payload. Strings and numbers
+retain their JSON types, including numeric zero. Boolean values become
+`"true"` or `"false"` in the event payload, matching GitHub's event format;
+`act` restores booleans in the workflow's typed `inputs` context:
+
+```yaml
+workflow_event: workflow_dispatch
+workflow_event_payload:
+  inputs:
+    channel: stable
+    run_tests: true
+```
+
+The selected build version owns `ref: refs/tags/v<VERSION>` and, for a release
+event, `release.tag_name`. Release events default to `action: published`.
+An explicitly matching `release.target_commitish` is normalized to the full
+tag ref so it cannot select an identically named branch.
+Conflicting source selectors, invalid payload objects, and extra act options
+that replace the event file or inputs are refused before execution. Payloads
+are limited to 64 KiB of canonical JSON. DSR writes a private event file outside
+the upload inventory and retains its canonical SHA-256 with the task and build
+result. Resume requires the same event, payload, and original result evidence;
+changing the recipe requires a new build.
+
+`watch --auto-fallback` requires the observed workflow event to match this
+configuration as well as the exact repository, tag, source, run, and attempt.
+Deferred work and retries retain the original configured payload. A changed
+payload, missing event evidence, or a mismatched upstream event withholds the
+automatic fallback. Existing recovery journals without event custody require
+an explicit manual fallback.
+
+GitHub's workflow-run API does not provide the original dispatch inputs or
+release action. Automatic fallback replays the reviewed configuration above;
+it does not recover the original webhook body. Use it for workflows whose
+release inputs are fixed by that configuration. Publication still uses DSR's
+normal signing, release-contract, and explicit `--prerelease` policies.
 
 ### Config precedence: `repos.yaml` vs `repos.d/`
 

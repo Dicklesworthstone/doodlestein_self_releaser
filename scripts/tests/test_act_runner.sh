@@ -876,6 +876,7 @@ test_workflow_tag_event() {
     log_test "workflow tag event and optional invocation arguments"
     if python3 -I - "$SRC_DIR/act_runner.sh" "${DSR_TEST_REAL_ACT:-}" <<'PY'
 import json
+import hashlib
 import os
 from pathlib import Path
 import stat
@@ -927,12 +928,12 @@ act_run_workflow "$@"
 '''
 
 
-def invoke(label, arguments, actual=False):
+def invoke(label, arguments, actual=False, plan=None, ambient='', ambient_vars=None):
     directory = root / label
     directory.mkdir()
     home = directory / 'home'
     home.mkdir()
-    (home / '.actrc').write_text('-P ubuntu-latest=-self-hosted\n')
+    (home / '.actrc').write_text('-P ubuntu-latest=-self-hosted\n' + ambient)
     binary_dir = directory / 'bin'
     binary_dir.mkdir()
     binary = binary_dir / 'act'
@@ -948,6 +949,9 @@ def invoke(label, arguments, actual=False):
                        ACT_ARTIFACTS_DIR=str(directory / 'artifacts'),
                        ACT_LOGS_DIR=str(directory / 'logs'), ACT_TIMEOUT='25',
                        DSR_EVENT_LAUNCH=str(directory / 'launch.json'))
+    if plan is not None:
+        environment['_ACT_WORKFLOW_EVENT_PLAN'] = json.dumps(plan)
+    environment.update(ambient_vars or {})
     result = subprocess.run(['bash', '-c', driver, '_', str(module)] + arguments,
                             env=environment, stdin=subprocess.DEVNULL, capture_output=True, timeout=35)
     (directory / 'stdout').write_bytes(result.stdout)
@@ -1005,6 +1009,128 @@ for label, event, version in (('versionless-custom', 'push', ''), ('other-event-
     check(label + ' preserves explicit caller-owned event data',
           result.returncode == 0 and launch is not None and launch['event_path'] == str(custom) and
           launch['payload'] == json.loads(custom.read_text()))
+
+def resolve(configuration, version='v1.2.3'):
+    result = subprocess.run(['bash', '-c',
+        'source "$1" || exit $?; _act_workflow_event_plan_from_json "$2"',
+        '_', str(module), version], input=json.dumps(configuration).encode(),
+        capture_output=True, timeout=20)
+    return result, json.loads(result.stdout) if result.returncode == 0 else None
+
+
+configured_cases = (
+    ('managed-push', {}, 'push', {'ref': 'refs/tags/v1.2.3'}),
+    ('managed-release', {'workflow_event': 'release'}, 'release',
+        {'action': 'published', 'ref': 'refs/tags/v1.2.3', 'release': {'tag_name': 'v1.2.3'}}),
+    ('managed-prerelease', {'workflow_event': 'release', 'workflow_event_payload': {
+        'action': 'prereleased', 'release': {'prerelease': True, 'draft': False,
+                                           'target_commitish': 'refs/tags/v1.2.3'}}}, 'release',
+        {'action': 'prereleased', 'ref': 'refs/tags/v1.2.3', 'release': {
+            'tag_name': 'v1.2.3', 'prerelease': True, 'draft': False,
+            'target_commitish': 'refs/tags/v1.2.3'}}),
+    ('managed-dispatch', {'workflow_event': 'workflow_dispatch', 'workflow_event_payload': {
+        'inputs': {'literal': 'two words\n"quoted" $HOME `literal`', 'enabled': False,
+                   'count': 0, 'empty': ''}}}, 'workflow_dispatch',
+        {'ref': 'refs/tags/v1.2.3', 'inputs': {'literal': 'two words\n"quoted" $HOME `literal`',
+                                            'enabled': 'false', 'count': 0, 'empty': ''}}),
+    ('managed-dispatch-true', {'workflow_event': 'workflow_dispatch', 'workflow_event_payload': {
+        'inputs': {'enabled': True, 'count': 0, 'ratio': 1.5, 'literal': 'false'}}},
+        'workflow_dispatch', {'ref': 'refs/tags/v1.2.3', 'inputs': {
+            'enabled': 'true', 'count': 0, 'ratio': 1.5, 'literal': 'false'}}),
+)
+plans = {}
+for label, configuration, event_name, expected_payload in configured_cases:
+    resolved, plan = resolve(configuration)
+    check(label + ' resolves its exact event and literal payload',
+          resolved.returncode == 0 and plan['event'] == event_name and plan['payload'] == expected_payload)
+    if plan is None:
+        continue
+    plans[label] = plan
+    result, launch, directory = invoke(label, [str(source), 'workflow.yml', 'build', event_name,
+                                             'v1.2.3'], plan=plan)
+    check(label + ' dispatches the configured event exactly once',
+          result.returncode == 0 and launch is not None and launch['argv'].count(event_name) == 1)
+    check(label + ' persists the entire plan in its backend receipt',
+          result.returncode == 0 and json.loads(result.stdout).get('workflow_event') == plan)
+    event_path = Path(launch['event_path']) if launch and launch['event_path'] else None
+    check(label + ' binds the private event bytes to their digest',
+          event_path is not None and event_path.is_file() and
+          json.loads(event_path.read_text()) == expected_payload and
+          hashlib.sha256(event_path.read_bytes()).hexdigest() == plan['payload_sha256'] and
+          stat.S_IMODE(event_path.stat().st_mode) == 0o600 and event_path.parent == directory / 'logs')
+    check(label + ' disables ambient input files', launch is not None and
+          launch['argv'][launch['argv'].index('--input-file') + 1] == '/dev/null')
+
+invalid_configurations = [
+    [], {'workflow_event': None}, {'workflow_event': 'pull_request'},
+    {'workflow_event_payload': None}, {'workflow_event_payload': []},
+    {'workflow_event_payload': {'ref': 'refs/heads/main'}},
+    {'workflow_event_payload': {'inputs': {}}},
+    {'workflow_event': 'release', 'workflow_event_payload': {'release': []}},
+    {'workflow_event': 'release', 'workflow_event_payload': {'release': {'tag_name': 'v9.9.9'}}},
+    {'workflow_event': 'release', 'workflow_event_payload': {'release': {'target_commitish': 'main'}}},
+    {'workflow_event': 'release', 'workflow_event_payload': {'release': {'draft': 'false'}}},
+    {'workflow_event': 'release', 'workflow_event_payload': {'action': 'something-else'}},
+    {'workflow_event': 'workflow_dispatch', 'workflow_event_payload': {'inputs': []}},
+    {'workflow_event': 'workflow_dispatch', 'workflow_event_payload': {'inputs': {'items': []}}},
+    {'workflow_event': 'workflow_dispatch', 'workflow_event_payload': {'inputs': {'': 'unnamed'}}},
+    {'workflow_event_payload': {'nested': {'data': 'nul\0byte'}}},
+    {'workflow_event_payload': {'nul\0key': True}},
+    {'workflow_event_payload': {'comment': 'x' * 65536}},
+]
+invalid_configurations.extend({'workflow_event_payload': {field: {}}}
+    for field in ('after', 'before', 'head_commit', 'repository', 'pull_request', 'head_sha'))
+for index, configuration in enumerate(invalid_configurations):
+    result, _ = resolve(configuration)
+    check('invalid managed event configuration %d fails before producing a plan' % index,
+          result.returncode == 4 and not result.stdout)
+
+dispatch_plan = plans.get('managed-dispatch')
+if dispatch_plan:
+    for index, extra in enumerate((['--eventpath', str(custom)], ['-e' + str(custom)],
+            ['--input', 'enabled=true'], ['--input=enabled=true'],
+            ['--input-file', str(custom)], ['--input-file=' + str(custom)], ['--'])):
+        result, launch, directory = invoke('managed-conflict-' + str(index),
+            [str(source), 'workflow.yml', 'build', 'workflow_dispatch', 'v1.2.3'] + extra,
+            plan=dispatch_plan)
+        check('managed payload override %d fails before storage or execution' % index,
+              result.returncode == 4 and launch is None and not (directory / 'artifacts').exists() and
+              not (directory / 'logs').exists())
+    for label, candidate, event_name, version, ambient in (
+            ('managed-wrong-event', dispatch_plan, 'release', 'v1.2.3', ''),
+            ('managed-wrong-version', dispatch_plan, 'workflow_dispatch', 'v9.9.9', ''),
+            ('managed-wrong-digest', dict(dispatch_plan, payload_sha256='0' * 64), 'workflow_dispatch', 'v1.2.3', ''),
+            ('managed-actrc-input', dispatch_plan, 'workflow_dispatch', 'v1.2.3', '--input enabled=true\n'),
+            ('managed-actrc-nbsp-input', dispatch_plan, 'workflow_dispatch', 'v1.2.3', '\u00a0--input enabled=true\n'),
+            ('managed-actrc-nel-input', dispatch_plan, 'workflow_dispatch', 'v1.2.3', '\u0085--input enabled=true\n'),
+            ('managed-actrc-input-file', dispatch_plan, 'workflow_dispatch', 'v1.2.3', '--input-file fixture\n')):
+        result, launch, directory = invoke(label,
+            [str(source), 'workflow.yml', 'build', event_name, version], plan=candidate, ambient=ambient)
+        check(label + ' refuses before storage or execution', result.returncode == 4 and launch is None and
+              not (directory / 'artifacts').exists() and not (directory / 'logs').exists())
+    for label, ambient, variables in (
+            ('managed-actrc-expanded-input', '${DSR_EVENT_AMBIENT}\n', {'DSR_EVENT_AMBIENT': '--input enabled=true'}),
+            ('managed-actrc-local-shadow', '$kind\n', {'kind': '--input enabled=true'}),
+            ('managed-actrc-newline-boundary', '${DSR_EVENT_AMBIENT}--input enabled=true\n', {'DSR_EVENT_AMBIENT': 'prefix\n'}),
+            ('managed-actrc-unset-prefix', '${DSR_EVENT_UNSET}--input enabled=true\n', {}),
+            ('managed-actrc-special-dollar', '$$--input enabled=true\n', {}),
+            ('managed-actrc-special-dash', '$---input enabled=true\n', {}),
+            ('managed-actrc-invalid-name', '${BAD-NAME}--input enabled=true\n', {})):
+        result, launch, directory = invoke(label,
+            [str(source), 'workflow.yml', 'build', 'workflow_dispatch', 'v1.2.3'],
+            plan=dispatch_plan, ambient=ambient, ambient_vars=variables)
+        check(label + ' refuses before storage or execution', result.returncode == 4 and launch is None and
+              not (directory / 'artifacts').exists() and not (directory / 'logs').exists())
+    result, launch, _ = invoke('managed-actrc-literal-environment-path',
+        [str(source), 'workflow.yml', 'build', 'workflow_dispatch', 'v1.2.3'], plan=dispatch_plan,
+        ambient='--cache-server-path ${DSR_EVENT_AMBIENT}/cache\n',
+        ambient_vars={'DSR_EVENT_AMBIENT': str(root)})
+    check('ordinary actrc environment paths remain usable', result.returncode == 0 and launch is not None)
+    reordered = {'workflow_event_payload': {'inputs': dict(reversed(list(dispatch_plan['payload']['inputs'].items())))},
+                 'workflow_event': 'workflow_dispatch'}
+    result, reordered_plan = resolve(reordered)
+    check('equivalent mapping order preserves the canonical replay identity',
+          result.returncode == 0 and reordered_plan == dispatch_plan)
 
 if real_act:
     workflow = source / 'tag.yml'

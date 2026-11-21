@@ -25,6 +25,10 @@
 # coordinator completion and exact-run resume of real frozen artifact bytes.
 # --native-bun-collection-only compiles genuine Bun/TypeScript executables and
 # checks ordinary native collection before their bytes become reusable output.
+# --workflow-event-only exercises configured workflow events through real
+# planning, workers, durable receipts and exact-run resume. Set DSR_TEST_REAL_ACT
+# to also execute release/dispatch/push jobs with act's local host runner.
+# --workflow-event-real-act-only runs just those genuine host-runner controls.
 
 set -uo pipefail
 
@@ -41,6 +45,395 @@ SKIP=0
 pass() { echo -e "${GREEN}✓${NC} $1"; ((PASS++)); }
 fail() { echo -e "${RED}✗${NC} $1"; ((FAIL++)); }
 skip() { echo -e "${YELLOW}○${NC} $1"; ((SKIP++)); }
+
+# The external runner is the only simulated build boundary. The coordinator,
+# configuration, event files, worker process protocol, artifact bytes and
+# checkpoint/reuse admission are production code. An optional real act run
+# executes local fixture steps without Docker, network actions or publication.
+test_workflow_event_replay() {
+    local project_root dependency
+    project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" || return 1
+    for dependency in python3 bash jq yq git; do
+        command -v "$dependency" >/dev/null || { echo "Missing test dependency: $dependency" >&2; return 77; }
+    done
+    python3 -I - "$project_root" "${DSR_TEST_ACT_RUNNER:-$project_root/src/act_runner.sh}" \
+        "${DSR_TEST_REAL_ACT:-}" "${1:-all}" <<'PY'
+import copy
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import uuid
+
+project, module = map(Path, sys.argv[1:3])
+real_act = str(Path(sys.argv[3]).resolve()) if sys.argv[3] else ''
+mode = sys.argv[4]
+root = Path(tempfile.mkdtemp(prefix='dsr-workflow-events-')).resolve()
+print('Retained workflow event integration fixtures: ' + str(root), flush=True)
+checks, failures = 0, []
+tag = 'v1.2.3'
+targets = ['linux/amd64', 'linux/arm64']
+
+
+def check(label, valid):
+    global checks
+    checks += 1
+    print(('PASS ' if valid else 'FAIL ') + label, flush=True)
+    if not valid:
+        failures.append(label)
+
+
+def read(path):
+    return json.loads(path.read_text())
+
+
+def launches(case):
+    path = case / 'launches.jsonl'
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+def identity(path):
+    observed = path.stat()
+    return observed.st_dev, observed.st_ino, hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+runner = r'''#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+real = os.environ.get('DSR_EVENTS_REAL_ACT', '')
+if args == ['--version']:
+    if real:
+        os.execv(real, [real, '--version'])
+    print('act version 0.2.98')
+    raise SystemExit(0)
+case = pathlib.Path(os.environ['DSR_EVENTS_CASE'])
+job = args[args.index('-j') + 1]
+artifact_dir = pathlib.Path(args[args.index('--artifact-server-path') + 1])
+event_path = pathlib.Path(args[args.index('--eventpath') + 1]) if '--eventpath' in args else None
+payload = json.loads(event_path.read_text()) if event_path else None
+events = [event for event in ('push', 'release', 'workflow_dispatch') if event in args]
+event = events[0] if len(events) == 1 else None
+record = dict(event=event, job=job, payload=payload,
+              event_path=str(event_path) if event_path else None, artifact_dir=str(artifact_dir))
+fd = os.open(case / 'launches.jsonl', os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+os.write(fd, (json.dumps(record) + '\n').encode())
+os.close(fd)
+if real:
+    os.execv(real, [real] + args + ['--env', 'DSR_EVENT_ARTIFACT_ROOT=' + str(artifact_dir)])
+if os.environ.get('DSR_EVENTS_PHASE') == 'fail-second' and job == 'build_arm64':
+    print('Deliberate second target failure', file=sys.stderr)
+    raise SystemExit(19)
+# Model the actual release-conditioned job: successful runner exit with a
+# skipped job produces no upload. The unchanged orchestration must reject it.
+expected = json.loads((case / 'expected.json').read_text())
+if event == expected['event'] and payload == expected['payload']:
+    artifact_dir.joinpath(job + '.json').write_text(json.dumps(record) + '\n')
+'''
+
+driver = r'''set -uo pipefail
+source "$DSR_EVENTS_PROJECT/src/logging.sh"
+source "$DSR_EVENTS_PROJECT/src/config.sh"
+source "${DSR_TEST_BUILD_STATE:-$DSR_EVENTS_PROJECT/src/build_state.sh}"
+source "$DSR_EVENTS_MODULE"
+# Host-runner fixtures do not need Docker. Preserve genuine version/config
+# admission; only capacity, Docker and the external act transport are adapted.
+act_check_prereqs() { act_version_is_supported; }
+selector_acquire_slot() { return 0; }
+selector_release_slot() { return 0; }
+selector_has_capacity() { return 0; }
+if [[ -n "$DSR_EVENTS_REAL_ACT" ]]; then
+    event=push
+    if [[ "$DSR_EVENTS_PHASE" != legacy-push ]]; then
+        _ACT_WORKFLOW_EVENT_PLAN=$(_act_workflow_event_plan_json eventfixture v1.2.3) || exit $?
+        event=$(jq -r .event <<< "$_ACT_WORKFLOW_EVENT_PLAN") || exit $?
+    fi
+    act_run_workflow "$DSR_EVENTS_CASE/source" workflow.yml build_amd64 "$event" v1.2.3 \
+        --action-offline-mode --artifact-server-addr 127.0.0.1 --artifact-server-port 0 \
+        --cache-server-addr 127.0.0.1
+    exit $?
+fi
+args=(--run-id "$DSR_EVENTS_RUN")
+if [[ "$DSR_EVENTS_PHASE" == resume* ]]; then args=(--resume-run-id "$DSR_EVENTS_RUN"); fi
+act_orchestrate_build eventfixture v1.2.3 "${args[@]}" \
+    --parallel-jobs 2 --no-source-sync-gate --output-dir "$DSR_EVENTS_CASE/output"
+'''
+
+
+def fixture(name, event='push', payload=None, selected=None, actual=False):
+    case = root / name
+    for directory in ('config/repos.d', 'state', 'cache', 'source', 'output', 'home', 'bin'):
+        (case / directory).mkdir(parents=True, exist_ok=True)
+    (case / 'home/.actrc').write_text('-P ubuntu-latest=-self-hosted\n')
+    (case / 'bin/act').write_text(runner)
+    (case / 'bin/act').chmod(0o755)
+    selected = targets if selected is None else selected
+    configuration = dict(tool_name='eventfixture', repo='fixture/eventfixture', language='go',
+                         local_path=str(case / 'source'), binary_name='eventfixture',
+                         workflow='workflow.yml', targets=selected,
+                         act_job_map={target: 'build_' + target.split('/')[1] for target in selected})
+    if event != 'push' or payload is not None:
+        configuration['workflow_event'] = event
+    if payload is not None:
+        configuration['workflow_event_payload'] = payload
+    (case / 'config/repos.d/eventfixture.yaml').write_text(json.dumps(configuration) + '\n')
+    expected_payload = copy.deepcopy(payload) if payload is not None else {}
+    expected_payload['ref'] = 'refs/tags/' + tag
+    if event == 'release':
+        expected_payload.setdefault('action', 'published')
+        expected_payload.setdefault('release', {})['tag_name'] = tag
+    if event == 'workflow_dispatch' and 'inputs' in expected_payload:
+        expected_payload['inputs'] = {
+            key: ('true' if value else 'false') if isinstance(value, bool) else value
+            for key, value in expected_payload['inputs'].items()}
+    (case / 'expected.json').write_text(json.dumps(dict(event=event, payload=expected_payload)))
+    workflow = 'name: Event fixture\non: [push, release, workflow_dispatch]\njobs: {}\n'
+    if actual:
+        condition = {
+            'push': "startsWith(github.event.ref, 'refs/tags/')",
+            'release': "github.event_name == 'release' && github.event.action == 'published' && github.event.release.tag_name == 'v1.2.3'",
+            'workflow_dispatch': "github.event_name == 'workflow_dispatch' && inputs.enabled",
+        }[event]
+        workflow = '''name: Actual event fixture
+on:
+  push:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      enabled:
+        type: boolean
+        default: false
+      label:
+        type: string
+        default: ''
+      disabled:
+        type: boolean
+        default: true
+      count:
+        type: number
+        default: 1
+jobs:
+  build_amd64:
+    if: CONDITION
+    runs-on: ubuntu-latest
+    steps:
+      - name: Preserve expression and event contexts
+        env:
+          OBSERVED_NAME: ${{ github.event_name }}
+          OBSERVED_REF: ${{ github.ref }}
+          OBSERVED_PAYLOAD: ${{ toJSON(github.event) }}
+          OBSERVED_ENABLED: ${{ toJSON(inputs.enabled) }}
+          OBSERVED_LABEL: ${{ inputs.label }}
+          OBSERVED_DISABLED: ${{ toJSON(inputs.disabled) }}
+          OBSERVED_COUNT: ${{ toJSON(inputs.count) }}
+        run: |
+          python3 - <<'PYCODE'
+          import json, os
+          from pathlib import Path
+          result = dict(event=os.environ['OBSERVED_NAME'], ref=os.environ['OBSERVED_REF'],
+                        payload=json.loads(os.environ['OBSERVED_PAYLOAD']),
+                        enabled=os.environ['OBSERVED_ENABLED'], label=os.environ['OBSERVED_LABEL'],
+                        disabled=os.environ['OBSERVED_DISABLED'], count=os.environ['OBSERVED_COUNT'])
+          Path(os.environ['DSR_EVENT_ARTIFACT_ROOT'], 'observed.json').write_text(json.dumps(result))
+          PYCODE
+'''.replace('CONDITION', condition)
+    (case / 'source/workflow.yml').write_text(workflow)
+    for arguments in (['init', '-q', '-b', 'main'], ['add', 'workflow.yml'],
+                      ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                       'commit', '-qm', 'pinned workflow'], ['tag', tag]):
+        subprocess.run(['git', '-C', str(case / 'source')] + arguments, check=True, capture_output=True)
+    return case
+
+
+def invoke(case, run, phase='first', actual=False):
+    environment = os.environ.copy()
+    environment.update(PATH=str(case / 'bin') + os.pathsep + environment['PATH'],
+                       HOME=str(case / 'home'), XDG_CONFIG_HOME=str(case / 'home/.config'),
+                       XDG_CACHE_HOME=str(case / 'cache'), DSR_CONFIG_DIR=str(case / 'config'),
+                       DSR_STATE_DIR=str(case / 'state'), DSR_CACHE_DIR=str(case / 'cache'),
+                       DSR_EVENTS_PROJECT=str(project), DSR_EVENTS_MODULE=str(module),
+                       DSR_EVENTS_CASE=str(case), DSR_EVENTS_RUN=run, DSR_EVENTS_PHASE=phase,
+                       DSR_EVENTS_REAL_ACT=real_act if actual else '', ACT_TIMEOUT='25',
+                       DSR_DISABLE_HOST_SELECTOR='1')
+    process = subprocess.Popen(['bash', '-c', driver], env=environment,
+                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, start_new_session=True)
+    timed_out = False
+    try:
+        stdout, stderr = process.communicate(timeout=60)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stdout, stderr = process.communicate()
+    (case / (phase + '.stdout')).write_bytes(stdout)
+    (case / (phase + '.stderr')).write_bytes(stderr)
+    if timed_out:
+        raise TimeoutError('Workflow event fixture exceeded its unchanged 60-second deadline: ' + str(case))
+    try:
+        output = json.loads(stdout)
+    except ValueError:
+        output = {}
+    state_path = case / 'state/builds/eventfixture/v1.2.3' / run / 'state.json'
+    state = read(state_path) if state_path.exists() else {}
+    return process.returncode, output, state_path, state
+
+
+dispatch_payload = {'inputs': {'enabled': True, 'label': 'false "quoted"\nliteral line',
+                               'disabled': False, 'count': 0}}
+if real_act:
+    for event, payload in (('release', None), ('workflow_dispatch', dispatch_payload), ('push', None)):
+        case = fixture('actual-' + event, event, payload, targets[:1], actual=True)
+        code, result, _, _ = invoke(case, str(uuid.uuid4()), actual=True)
+        observed = launches(case)
+        artifact = Path(observed[0]['artifact_dir']) / 'observed.json' if observed else None
+        check('actual act host runner executes the ' + event + '-conditioned job',
+              code == 0 and result.get('status') == 'success' and result.get('artifact_count') == 1 and
+              artifact is not None and artifact.is_file())
+        if artifact is not None and artifact.is_file():
+            value = read(artifact)
+            check('actual act ' + event + ' expressions agree with selected source and event payload',
+                  value['event'] == event and value['ref'] == 'refs/tags/' + tag and
+                  all(value['payload'].get(key) == expected_value
+                      for key, expected_value in read(case / 'expected.json')['payload'].items()))
+            check('actual act ' + event + ' retains its configured event and exact private payload digest',
+                  result.get('workflow_event', {}).get('event') == event and
+                  result.get('workflow_event', {}).get('payload') == read(case / 'expected.json')['payload'] and
+                  result.get('workflow_event', {}).get('payload_sha256') ==
+                  hashlib.sha256(Path(observed[0]['event_path']).read_bytes()).hexdigest())
+            if event == 'workflow_dispatch':
+                check('actual dispatch preserves typed true/false, numeric zero and the literal string input',
+                      value['enabled'] == 'true' and value['label'] == dispatch_payload['inputs']['label'] and
+                      value['disabled'] == 'false' and value['count'] == '0' and
+                      value['payload']['inputs'] == read(case / 'expected.json')['payload']['inputs'])
+        else:
+            print((case / 'first.stderr').read_text(), file=sys.stderr)
+        if event == 'release':
+            code, legacy, _, _ = invoke(case, str(uuid.uuid4()), 'legacy-push', actual=True)
+            legacy_launch = launches(case)[-1]
+            check('legacy push invocation skips the same genuine release-conditioned job without artifacts',
+                  code == 0 and legacy.get('status') == 'success' and legacy.get('artifact_count') == 0 and
+                  legacy_launch['event'] == 'push' and
+                  not (Path(legacy_launch['artifact_dir']) / 'observed.json').exists())
+else:
+    print('SKIP actual act execution: set DSR_TEST_REAL_ACT to an installed act binary', flush=True)
+if mode == '--workflow-event-real-act-only':
+    print('Actual workflow event execution: %d checks, %d failures' % (checks, len(failures)), flush=True)
+    raise SystemExit(bool(failures) if real_act else 77)
+
+
+case = fixture('release-recovery', 'release', {'release': {'name': 'Literal "release" title'}})
+run = str(uuid.uuid4())
+code, first, state_path, state = invoke(case, run, 'fail-second')
+check('configured release event executes the first target while preserving a genuine peer failure',
+      code == 1 and first.get('summary') == dict(total=2, success=1, failed=1))
+check('every workflow receives the configured release payload and selected tag',
+      len(launches(case)) == 2 and all(
+          row['event'] == 'release' and row['payload'] == read(case / 'expected.json')['payload']
+          for row in launches(case)))
+if first.get('summary') != dict(total=2, success=1, failed=1):
+    print((case / 'fail-second.stderr').read_text(), file=sys.stderr)
+    raise SystemExit(1)
+successful = first['targets'][0]
+plan = state['context']['build_tasks'][0].get('workflow_event')
+check('task, successful worker and failed worker retain the same admitted event plan',
+      isinstance(plan, dict) and plan.get('event') == 'release' and
+      all(task.get('workflow_event') == plan for task in state['context']['build_tasks']) and
+      all(row.get('workflow_event') == plan for row in first['targets']))
+retained_paths = [Path(successful['log_path']), Path(successful['result_path'])]
+retained_paths += [Path(row['path']) for row in successful['resume_artifacts']]
+retained = {path: identity(path) for path in retained_paths}
+for launch in launches(case):
+    event_path = Path(launch['event_path'])
+    check('each event file is private, outside upload inventory and bound to the retained digest',
+          stat.S_IMODE(event_path.stat().st_mode) == 0o600 and
+          event_path.parent != Path(launch['artifact_dir']) and
+          isinstance(plan, dict) and hashlib.sha256(event_path.read_bytes()).hexdigest() == plan.get('payload_sha256'))
+code, resumed, _, state = invoke(case, run, 'resume')
+check('exact-run resume reuses the successful release target and executes only the failed peer',
+      code == 0 and resumed.get('summary') == dict(total=2, success=2, failed=0) and
+      resumed['targets'][0].get('resume_reused') is True and
+      not resumed['targets'][1].get('resume_reused') and
+      [row['job'] for row in launches(case)].count('build_amd64') == 1 and
+      [row['job'] for row in launches(case)].count('build_arm64') == 2)
+check('resume retains original successful artifact inodes, bytes and immutable attempt evidence',
+      all(identity(path) == before for path, before in retained.items()))
+code, repeated, _, state = invoke(case, run, 'resume-again')
+check('a repeated release resume reuses both event-bound targets without starting act',
+      code == 0 and len(launches(case)) == 3 and
+      len(repeated.get('targets', [])) == 2 and
+      all(row.get('resume_reused') is True for row in repeated.get('targets', [])))
+
+config_path = case / 'config/repos.d/eventfixture.yaml'
+original_config = config_path.read_bytes()
+before_state = state_path.read_bytes()
+changed = json.loads(original_config)
+changed['workflow_event_payload']['release']['name'] = 'Changed execution input'
+config_path.write_text(json.dumps(changed) + '\n')
+code, _, _, _ = invoke(case, run, 'resume-changed-payload')
+check('changing configured event input refuses resume before execution or checkpoint mutation',
+      code == 4 and len(launches(case)) == 3 and state_path.read_bytes() == before_state)
+config_path.write_bytes(original_config)
+
+for boundary in ('embedded-result', 'worker-sidecar', 'task-plan'):
+    saved_state = state_path.read_bytes()
+    damaged = json.loads(saved_state)
+    sidecar_path = Path(damaged['target_statuses']['linux/amd64']['result_path'])
+    saved_sidecar = sidecar_path.read_bytes()
+    if boundary == 'embedded-result':
+        damaged['target_statuses']['linux/amd64']['result']['workflow_event']['event'] = 'push'
+        state_path.write_text(json.dumps(damaged) + '\n')
+    elif boundary == 'worker-sidecar':
+        sidecar = json.loads(saved_sidecar)
+        sidecar.pop('workflow_event', None)
+        sidecar_path.write_text(json.dumps(sidecar) + '\n')
+    else:
+        damaged['context']['build_tasks'][0]['workflow_event']['event'] = 'push'
+        state_path.write_text(json.dumps(damaged) + '\n')
+    input_state, input_sidecar = state_path.read_bytes(), sidecar_path.read_bytes()
+    code, _, _, _ = invoke(case, run, 'resume-corrupt-' + boundary)
+    check(boundary + ' event disagreement refuses without reuse, act execution or evidence replacement',
+          code == 4 and len(launches(case)) == 3 and state_path.read_bytes() == input_state and
+          sidecar_path.read_bytes() == input_sidecar)
+    state_path.write_bytes(saved_state)
+    sidecar_path.write_bytes(saved_sidecar)
+
+for event, payload in (('workflow_dispatch', dispatch_payload), ('push', None)):
+    case = fixture(event, event, payload, targets[:1])
+    code, result, _, state = invoke(case, str(uuid.uuid4()))
+    observed = launches(case)
+    expected = read(case / 'expected.json')
+    check(event + ' executes the configured event without losing literal JSON payload values',
+          code == 0 and result.get('summary') == dict(total=1, success=1, failed=0) and
+          len(observed) == 1 and observed[0]['event'] == event and observed[0]['payload'] == expected['payload'])
+    if code == 0:
+        check(event + ' freezes its exact event payload in the durable task and returned receipt',
+              state['context']['build_tasks'][0].get('workflow_event') == result['targets'][0].get('workflow_event') and
+              result['targets'][0].get('workflow_event', {}).get('payload') == expected['payload'])
+
+print('Workflow event integration: %d checks, %d failures' % (checks, len(failures)), flush=True)
+raise SystemExit(bool(failures))
+PY
+}
+
+if [[ "${1:-}" == --workflow-event-only || "${1:-}" == --workflow-event-real-act-only ]]; then
+    test_workflow_event_replay "$1"
+    exit $?
+fi
 
 # Populate the compiler boundary only for tests that deliberately replace the
 # native Rust backend. These values are synthetic protocol data, not observations
@@ -147,6 +540,7 @@ if [[ "$boundary" == native ]]; then
 else
     act_platform_uses_act() { return 0; }
     act_run_workflow() { fixture_backend; }
+    _act_workflow_event_plan_json() { cat "$fixture/event-plan.json"; }
     _act_workflow_payload_plans_json() { printf '{}\n'; }
     _act_source_plan_for_tool() { printf 'null\n'; }
     act_get_flags() { printf '[]\n'; }
@@ -184,6 +578,11 @@ def fixture(boundary, name):
     artifact.write_bytes(b'genuine collected output\n')
     receipt = dict(status='success', exit_code=0, platform='linux/amd64', method=boundary,
                    host='fixture-host', artifact_count=1, artifact_path=str(artifact))
+    event_plan = dict(event='push', payload={'ref': 'refs/tags/v1.0.0'},
+                      payload_sha256=hashlib.sha256(b'{"ref":"refs/tags/v1.0.0"}\n').hexdigest())
+    (case / 'event-plan.json').write_text(json.dumps(event_plan) + '\n')
+    if boundary == 'act':
+        receipt['workflow_event'] = event_plan
     if boundary == 'worker':
         receipt['method'] = 'act'
     return case, artifact, receipt
@@ -7741,8 +8140,9 @@ act_zero_artifact_check() {
         act_get_job_for_target() { printf 'build-linux\n'; }
         act_get_flags() { printf '[]\n'; }
         act_run_workflow() {
-            jq -nc --argjson count "$count_json" \
-                '{status:"success",exit_code:0,artifact_count:$count}'
+            jq -nc --argjson count "$count_json" --slurpfile event /dev/fd/3 \
+                '{status:"success",exit_code:0,artifact_count:$count,workflow_event:$event[0]}' \
+                3<<< "$_ACT_WORKFLOW_EVENT_PLAN"
         }
         _act_build_orchestration_target testool v1.0.0 ordinary linux/amd64 false null '{}' \
             2>/dev/null
@@ -10753,6 +11153,14 @@ if test_backend_receipt_isolation; then
 else
     fail "diagnostic output authorized backend success or replaced an exact worker result"
 fi
+
+workflow_event_status=0
+test_workflow_event_replay || workflow_event_status=$?
+case "$workflow_event_status" in
+    0) pass "configured workflow events retain exact payload and source authority through execution and resume" ;;
+    77) skip "workflow event integration requires Python, jq, yq and Git" ;;
+    *) fail "workflow event execution or retained event/source authority disagrees with its configured plan" ;;
+esac
 
 native_bun_collection_status=0
 test_native_bun_collection || native_bun_collection_status=$?
