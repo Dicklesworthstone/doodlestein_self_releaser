@@ -1,6 +1,6 @@
 # Explicit SBOM release inputs
 
-The standalone `sbom.sh artifacts` and `verify-artifacts` commands accept
+The public `dsr sbom generate-artifacts` and `verify-artifacts` commands accept
 `--selection FILE`. Select every intended release payload by basename and
 SHA256, including licenses and shared JSON data which ordinary scanner discovery
 excludes. This is a caller-selected byte inventory, not a signed build claim.
@@ -13,11 +13,11 @@ excludes. This is a caller-selected byte inventory, not a signed build claim.
 ```
 
 ```bash
-bash src/sbom.sh artifacts /srv/release/artifacts \
+dsr sbom generate-artifacts /srv/release/artifacts \
   --selection /srv/policy/inputs.json --output-dir /srv/release/sboms
-bash src/sbom.sh verify-artifacts /srv/release/artifacts \
+dsr sbom verify-artifacts /srv/release/artifacts \
   --selection /srv/policy/inputs.json --output-dir /srv/release/sboms
-bash src/sbom_release.sh publish /srv/release/artifacts \
+dsr sbom publish-artifacts /srv/release/artifacts \
   --repo owner/tool --tag v1.2.3 --selection /srv/policy/inputs.json \
   --output-dir /srv/release/sboms
 ```
@@ -62,3 +62,7 @@ verification and complete retries need no scanner. Run
 real hashing, staging, receipts, publication and remote verification with explicit
 Syft and GitHub transport fixtures. They do not qualify native Syft package
 recognition or perform live publication.
+
+The separate `test_sbom_cli.sh` suite executes the actual `dsr` program and production
+GitHub adapters, substituting only Syft and outbound `gh`/`curl` executables.
+Standalone module calls remain supported with the same selection format.

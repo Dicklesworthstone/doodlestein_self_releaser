@@ -3360,6 +3360,61 @@ replacement. Finish release signing before rotating its identity.
 
 ---
 
+### `dsr sbom`
+
+Generate, validate and publish inventories through the same complete-set engines
+used by release finalization. Every operation validates all options before scanner
+or remote work; unknown, duplicate/alias-duplicate and missing-value options return
+`4` instead of silently dropping the requested policy.
+
+```bash
+dsr sbom generate PATH [--format FORMAT] [--output FILE] [--scan-timeout SECONDS]
+dsr sbom verify DOCUMENT [--format FORMAT]
+dsr sbom generate-artifacts ARTIFACTS_DIR [ARTIFACT_SET_OPTIONS] [--scan-timeout SECONDS]
+dsr sbom verify-artifacts ARTIFACTS_DIR [ARTIFACT_SET_OPTIONS]
+dsr sbom publish-artifacts ARTIFACTS_DIR --repo OWNER/REPO --tag TAG \
+    [ARTIFACT_SET_OPTIONS] [--dry-run] [--allow-published]
+dsr sbom verify-release --repo OWNER/REPO --tag TAG --manifest-sha256 SHA256 \
+    [--format FORMAT]
+```
+
+Artifact-set options are `--format`, `--output-dir` and `--selection FILE`.
+Selection binds exact payload names and SHA256 values, including licenses and
+runtime data. Omission retains the existing top-level discovery policy. The format
+defaults to SPDX except for single-document verification, which auto-detects unless
+`--format` is supplied. SPDX/CycloneDX aliases are normalized; a valid document of
+the wrong requested format fails verification. Generation accepts a per-scanner
+deadline; verified retries and verification require no scanner.
+
+Publication requires a complete local inventory and an existing release containing
+matching payloads. It uploads only the standards documents and aggregate inventory,
+retains all identity/byte checks, reuses identical assets and verifies remote bytes
+before reporting completion. Adding documents to a published release requires
+`--allow-published`. It does not create releases/tags or change draft visibility.
+Remote verification requires an independently selected manifest digest and checks
+the complete remote payload/document set against it. No command authenticates
+signatures, scanner identity or build provenance.
+
+Plain generation and local artifact verification print one complete path on success;
+single-document verification leaves stdout empty. Remote operations print one JSON
+receipt. Global `--json` emits a single `sbom-OPERATION` envelope on success or failure.
+`details.authenticated` is false. Verification reports `details.valid` and a
+`verification_scope` of `document`, `local-artifacts` or `remote-release`. The latter
+two scopes check artifact bytes as well as documents; document validation checks
+DSR's supported document contract, not the complete external standards schemas.
+Remote engine results are preserved under `details.receipt`. Publication preview
+sets `dry_run: true` and `publication_verified: false`; completed publication sets
+`publication_verified: true` only after the engine's independent verification.
+
+Global `--dry-run` is supported for publication preflight, including remote reads
+with no upload calls. Generation refuses it with exit `4` before scanning or writing
+documents. Verification remains read-only. Local conflicts return `2`, missing
+dependencies/credentials `3`, scanner/transport interruption `5`, remote integrity
+failure `7`, and transport failures `8`; document validation failures retain their
+underlying status. See [SBOM lifecycle](SBOM.md) and [explicit inputs](SBOM_SELECTION.md).
+
+---
+
 ### `dsr slsa`
 
 Generate or verify SLSA v1 statements through the same library used by release

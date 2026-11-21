@@ -8,27 +8,51 @@ not need it.
 
 ## Commands
 
-The existing `dsr sbom generate` and `dsr sbom verify` commands use the hardened
-single-document library functions. The complete release-set operations and the
-single-scan JSON wrapper are also available through the standalone module:
+The public `dsr sbom` commands use the same single-document, complete-inventory
+and remote-publication engines as the sourceable modules:
 
 ```bash
-bash src/sbom.sh artifacts dist/v1.2.3 --format spdx
-bash src/sbom.sh verify-artifacts dist/v1.2.3 --format spdx
+dsr sbom generate dist/v1.2.3/tool.tar.gz --format spdx
+dsr sbom verify dist/v1.2.3/tool.tar.gz.sbom.spdx.json --format spdx
 
-bash src/sbom.sh artifacts dist/v1.2.3 \
+dsr sbom generate-artifacts dist/v1.2.3 --format spdx
+dsr sbom verify-artifacts dist/v1.2.3 --format spdx
+
+dsr sbom generate-artifacts dist/v1.2.3 \
   --format cyclonedx --output-dir release-metadata/v1.2.3
-bash src/sbom.sh verify-artifacts dist/v1.2.3 \
+dsr sbom verify-artifacts dist/v1.2.3 \
   --format cyclonedx --output-dir release-metadata/v1.2.3
 
-bash src/sbom.sh json dist/v1.2.3/tool.tar.gz --format spdx
+dsr --json sbom generate-artifacts dist/v1.2.3 --selection inputs.json
 
 # Attach the verified inventory to an existing release with matching payloads.
-bash src/sbom.sh publish-artifacts dist/v1.2.3 \
+dsr sbom publish-artifacts dist/v1.2.3 \
   --repo OWNER/REPO --tag v1.2.3 --dry-run
-bash src/sbom.sh publish-artifacts dist/v1.2.3 \
+dsr sbom publish-artifacts dist/v1.2.3 \
   --repo OWNER/REPO --tag v1.2.3
 ```
+
+`verify --format FORMAT` enforces the requested document format; omission permits
+automatic format detection. Each command rejects unknown, duplicate and incomplete
+options, including unsupported signature options. Checking a standards document
+does not check its referenced artifact bytes or authenticate its producer.
+
+In plain mode, generation prints one document or complete manifest path;
+`verify-artifacts` prints the verified manifest path, and single-document `verify`
+keeps stdout empty. The remote commands print their authoritative JSON receipt.
+Global `--json` wraps every operation, including failure, in one DSR envelope.
+`details.verification_scope` distinguishes `document`, `local-artifacts` and
+`remote-release`. `details.authenticated` is always false: no SBOM command verifies
+signatures or build provenance. Remote receipts remain under `details.receipt`;
+publication preview reports `dry_run: true` and `publication_verified: false`.
+A verified publication can still target a draft; release visibility is unchanged.
+
+The standalone `bash src/sbom.sh` interface remains available, using `artifacts`
+for batch generation and the same `verify-artifacts`, `publish-artifacts` and
+`verify-release` names. Its `json` command wraps a single scan without DSR's global
+envelope. Public generation commands reject global `--dry-run` before scanning or
+writing output; use publication preflight or `dsr release --dry-run --sbom` to plan
+publication without generating new documents.
 
 For sourced usage, the corresponding APIs are `sbom_generate`,
 `sbom_generate_project`, `sbom_generate_json`, `sbom_generate_artifacts`,
@@ -51,8 +75,8 @@ DSR_SBOM_TIMEOUT=1800 dsr fallback tool --version v1.2.3 --sbom
 
 Ordinary `dsr release` and `dsr fallback` invoke complete-set generation when
 requested with `--sbom`, `--sbom-format FORMAT`, or `sbom.enabled: true` in
-configuration. The standalone batch and remote commands remain available through
-the `bash src/sbom.sh` entry points shown above.
+configuration. Use `dsr sbom` for independently generating, inspecting or attaching
+an existing inventory.
 
 ## Generate complete coverage during publication
 
@@ -195,6 +219,7 @@ possible transient change on an adversarial filesystem.
 ```bash
 bash scripts/tests/test_sbom_release.sh
 bash scripts/tests/test_sbom_batch.sh
+bash scripts/tests/test_sbom_cli.sh
 bash scripts/tests/test_release_resume.sh
 bats tests/unit/test_sbom.bats
 ```
@@ -213,11 +238,12 @@ artifacts and SBOMs. The remote verifier checks both, against a manifest digest
 chosen independently of the release being inspected:
 
 ```bash
-bash src/sbom.sh verify-release --repo OWNER/REPO --tag v1.2.3 \
+dsr sbom verify-release --repo OWNER/REPO --tag v1.2.3 \
   --manifest-sha256 EXPECTED_64_HEX_SHA256 --format spdx
 ```
 
-The equivalent dedicated command is `bash src/sbom_release.sh verify`. For sourced
+Equivalent standalone commands are `bash src/sbom.sh verify-release` and
+`bash src/sbom_release.sh verify`. For sourced
 use, load `src/sbom_release.sh` and call `sbom_verify_release` with the same options.
 Supply the digest from a separately verified local inventory
 or another trusted channel; obtaining both the manifest and its purported
@@ -272,14 +298,14 @@ change release visibility, or promote a draft.
 
 ```bash
 # Generate locally first; this is the only step that needs Syft.
-bash src/sbom.sh artifacts dist/v1.2.3 --format spdx
+dsr sbom generate-artifacts dist/v1.2.3 --format spdx
 
 # Read-only preflight: local verification plus uncached remote observations.
-bash src/sbom.sh publish-artifacts dist/v1.2.3 \
+dsr sbom publish-artifacts dist/v1.2.3 \
   --repo OWNER/REPO --tag v1.2.3 --format spdx --dry-run
 
 # Add documents to the existing draft; the complete inventory is uploaded last.
-bash src/sbom.sh publish-artifacts dist/v1.2.3 \
+dsr sbom publish-artifacts dist/v1.2.3 \
   --repo OWNER/REPO --tag v1.2.3 --format spdx
 ```
 

@@ -19246,50 +19246,76 @@ cmd_sbom() {
     shift 2>/dev/null || true
 
     case "$subcmd" in
-        generate)
-            _sbom_generate "$@"
-            ;;
-        verify)
-            _sbom_verify "$@"
+        generate|generate-artifacts|verify|verify-artifacts|publish-artifacts|verify-release)
+            _sbom_command "$subcmd" "$@"
             ;;
         --help|-h|help|"")
             cat << 'EOF'
-dsr sbom - Software Bill of Materials (SBOM) generation
+dsr sbom - Software Bill of Materials (SBOM) lifecycle
 
 USAGE:
     dsr sbom generate <path> [options]
-    dsr sbom verify <sbom-file>
+    dsr sbom generate-artifacts <artifacts-dir> [options]
+    dsr sbom verify <sbom-file> [--format FORMAT]
+    dsr sbom verify-artifacts <artifacts-dir> [options]
+    dsr sbom publish-artifacts <artifacts-dir> --repo OWNER/REPO --tag TAG [options]
+    dsr sbom verify-release --repo OWNER/REPO --tag TAG --manifest-sha256 SHA256 [options]
 
 SUBCOMMANDS:
-    generate    Generate SBOM for a project or artifact
-    verify      Verify an SBOM file is valid
+    generate            Generate one document for a project or artifact
+    generate-artifacts  Generate or resume a complete local artifact inventory
+    verify              Validate one supported SPDX/CycloneDX document
+    verify-artifacts    Check a complete local inventory against current bytes
+    publish-artifacts   Attach verified documents to an existing GitHub release
+    verify-release      Verify remote payloads and documents against a chosen digest
 
 OPTIONS:
-    --format, -f <fmt>  Output format: spdx (default) or cyclonedx
-    --output, -o <file> Output file (default: auto-generated)
-    --scan-timeout <s>  Syft command deadline, 1..86400 seconds (default 900)
+    --format, -f <fmt>   spdx (default) or cyclonedx; verify auto-detects if omitted
+    --output, -o <file>  Single generated document destination (generate only)
+    --output-dir <dir>   Local inventory metadata directory (artifact-set commands)
+    --selection <file>   Exact payload names/SHA256 (artifact-set commands)
+    --scan-timeout <s>   Syft deadline, 1..86400 seconds (generation only)
+    --repo OWNER/REPO    GitHub repository (remote commands)
+    --tag TAG           Existing GitHub release tag (remote commands)
+    --manifest-sha256 H  Independently selected inventory digest (verify-release)
+    --allow-published   Permit additions to a published release (publish-artifacts)
+    --dry-run           Read-only publication preflight (publish-artifacts)
 
 DESCRIPTION:
-    Generates Software Bill of Materials using syft for supply chain
-    transparency. SBOMs can be attached to releases for compliance.
+    Single-document verification checks the supported document contract.
+    Artifact-set verification additionally checks the exact payload and document
+    bytes. These commands do not verify signatures, builder identity or provenance.
+
+    Remote verification requires a digest selected independently of the release.
+    Publication reuses matching documents and uploads the complete inventory last;
+    it does not create tags/releases, upload payloads or change release visibility.
+    Generation does not support --dry-run and refuses it before scanning/writing.
     DSR_SBOM_TIMEOUT sets the default deadline, including release and fallback
     scans. Failed or interrupted scans retain diagnostics and preserve prior
     output; incomplete scan bytes are never published as a successful SBOM.
 
 REQUIREMENTS:
-    - syft must be installed: curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s
+    - jq and SHA256 utilities; syft for new scans only
+    - GitHub credentials for remote commands; Python 3 for explicit selections
 
 EXAMPLES:
     dsr sbom generate /path/to/project          # Generate SPDX SBOM
     dsr sbom generate /path/to/binary --format cyclonedx
-    dsr sbom verify sbom.spdx.json              # Verify SBOM format
+    dsr sbom verify sbom.spdx.json --format spdx
+    dsr sbom generate-artifacts ./dist --selection ./inputs.json
+    dsr sbom verify-artifacts ./dist --selection ./inputs.json
+    dsr --json --dry-run sbom publish-artifacts ./dist --repo OWNER/REPO --tag v1.2.3
+    dsr sbom verify-release --repo OWNER/REPO --tag v1.2.3 --manifest-sha256 EXPECTED_SHA256
 
 EXIT CODES:
     0  - Success
     1  - Error generating/verifying SBOM
-    3  - syft not installed
+    2  - Local artifact/metadata conflict
+    3  - Dependency or credential unavailable
     4  - Invalid arguments
-    5  - Scanner deadline or interruption
+    5  - Scanner/transport deadline or interruption
+    7  - Remote release integrity failure
+    8  - GitHub transport failure
 EOF
             return 0
             ;;
@@ -19301,87 +19327,151 @@ EOF
     esac
 }
 
-_sbom_generate() {
-    local target=""
-    local format="spdx"
-    local output=""
-    local scan_timeout="${DSR_SBOM_TIMEOUT-900}"
-
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --format|-f) format="$2"; shift 2 ;;
-            --output|-o) output="$2"; shift 2 ;;
-            --scan-timeout)
-                [[ $# -ge 2 && -n "${2:-}" ]] || { log_error "--scan-timeout requires seconds"; return 4; }
-                scan_timeout="$2"; shift 2 ;;
-            -*) log_error "Unknown option: $1"; return 4 ;;
-            *) target="$1"; shift ;;
+# Keep the complete release-set engines behind the same public CLI as single
+# scans. Parse the entire request before running a scanner or remote operation;
+# accepting a document must never silently discard the caller's format/policy.
+_sbom_command() {
+    local operation="$1" function_name minimum=1 maximum=1 generating=false remote=false
+    local option value exit_code=0 error='' output='' receipt=null details start=$SECONDS
+    local format="${SBOM_DEFAULT_FORMAT:-spdx}" selection='' repo='' tag='' expected=''
+    local dry="${DRY_RUN:-false}" canonical
+    local -a inputs=() arguments=()
+    local -A seen=()
+    shift
+    case "$operation" in
+        generate) function_name=sbom_generate; generating=true ;;
+        generate-artifacts) function_name=sbom_generate_artifacts; generating=true ;;
+        verify) function_name=sbom_verify; format='' ;;
+        verify-artifacts) function_name=sbom_verify_artifacts ;;
+        publish-artifacts) function_name=sbom_publish_artifacts; remote=true ;;
+        verify-release) function_name=sbom_verify_release; remote=true; minimum=0; maximum=0 ;;
+        *) return 4 ;;
+    esac
+    while (($#)); do
+        option=$1
+        case "$option" in -f) option=--format ;; -o) option=--output ;; esac
+        if [[ "$option" != -* ]]; then
+            inputs+=("$option"); shift
+            if ((${#inputs[@]} > maximum)); then
+                error="Too many positional arguments for sbom $operation"; exit_code=4; break
+            fi
+            continue
+        fi
+        case "$operation:$option" in
+            generate:--format|generate:--output|generate:--scan-timeout|\
+            generate-artifacts:--format|generate-artifacts:--output-dir|\
+            generate-artifacts:--selection|generate-artifacts:--scan-timeout|\
+            verify:--format|verify-artifacts:--format|verify-artifacts:--output-dir|verify-artifacts:--selection|\
+            publish-artifacts:--repo|publish-artifacts:--tag|publish-artifacts:--format|\
+            publish-artifacts:--output-dir|publish-artifacts:--selection|publish-artifacts:--allow-published|\
+            verify-release:--repo|verify-release:--tag|verify-release:--format|verify-release:--manifest-sha256) ;;
+            *) error="Unknown option for sbom $operation: $1"; exit_code=4; break ;;
         esac
-    done
-
-    if [[ -z "$target" ]]; then
-        log_error "Target path required"
-        return 4
-    fi
-
-    local start_time
-    start_time=$(date +%s)
-
-    local -a args=(--scan-timeout "$scan_timeout")
-    [[ -n "$output" ]] && args+=("--output" "$output")
-
-    # The SBOM path is stdout; diagnostics stay on stderr, where a failure's
-    # cause (syft missing, unreadable target) is shown instead of discarded.
-    if _dsr_capture sbom_generate "$target" --format "$format" ${args[@]+"${args[@]}"}; then
-        local duration=$(($(date +%s) - start_time))
-        if $JSON_MODE; then
-            json_envelope "sbom-generate" "success" 0 "$(jq -nc \
-                --arg target "$target" \
-                --arg format "$format" \
-                --arg output "$_DSR_CAPTURED_OUT" \
-                --argjson duration "$duration" \
-                '{target: $target, format: $format, output: $output, duration_seconds: $duration}')"
+        if [[ -n "${seen[$option]:-}" ]]; then
+            error="Duplicate SBOM option: $option"; exit_code=4; break
+        fi
+        seen[$option]=1
+        if [[ "$option" == --allow-published ]]; then
+            arguments+=("$option"); shift; continue
+        fi
+        if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
+            error="$option requires a value"; exit_code=4; break
+        fi
+        value=$2
+        if [[ "$option" == --format ]]; then
+            format=$value
         else
-            printf '%s\n' "$_DSR_CAPTURED_OUT"
+            arguments+=("$option" "$value")
         fi
-        return 0
-    else
-        local exit_code=$?
-        local duration=$(($(date +%s) - start_time))
-        if [[ -z "$_DSR_CAPTURED_ERR" ]]; then
-            _DSR_CAPTURED_ERR="SBOM generation failed for $target (exit $exit_code)"
-            log_error "$_DSR_CAPTURED_ERR"
-        fi
-        if $JSON_MODE; then
-            json_envelope "sbom-generate" "error" "$exit_code" "$(jq -nc \
-                --arg error "$_DSR_CAPTURED_ERR" \
-                --argjson duration "$duration" \
-                '{error: $error, duration_seconds: $duration}')"
-        fi
-        return $exit_code
+        case "$option" in
+            --selection) selection=$value ;; --repo) repo=$value ;;
+            --tag) tag=$value ;; --manifest-sha256) expected=$value ;;
+        esac
+        shift 2
+    done
+    if ((exit_code == 0 && ${#inputs[@]} < minimum)); then
+        error="Missing input for sbom $operation; run 'dsr sbom --help'"; exit_code=4
     fi
-}
-
-_sbom_verify() {
-    local sbom_file="${1:-}"
-
-    if [[ -z "$sbom_file" ]]; then
-        log_error "SBOM file required"
-        return 4
+    if ((exit_code == 0)) && $remote && [[ -z "$repo" || -z "$tag" ||
+          ( "$operation" == verify-release && -z "$expected" ) ]]; then
+        error="sbom $operation requires --repo and --tag; verify-release also requires --manifest-sha256"; exit_code=4
     fi
-
-    if sbom_verify "$sbom_file"; then
-        if $JSON_MODE; then
-            json_envelope "sbom-verify" "ok" 0 "$(jq -nc --arg file "$sbom_file" '{file: $file, valid: true}')"
-        fi
-        return 0
-    else
-        local exit_code=$?
-        if $JSON_MODE; then
-            json_envelope "sbom-verify" "error" "$exit_code" "$(jq -nc --arg file "$sbom_file" '{file: $file, valid: false}')"
-        fi
-        return $exit_code
+    if ((exit_code == 0)) && $generating && $dry; then
+        error="SBOM generation does not support --dry-run; no documents were written"; exit_code=4
     fi
+    if ((exit_code == 0)) && [[ -n "$format" ]]; then
+        if canonical=$(_sbom_format "$format"); then
+            format=$canonical; arguments+=(--format "$format")
+        else
+            exit_code=$?; error="Unsupported SBOM format: $format"
+        fi
+    fi
+    if ((exit_code == 0)) && $remote; then
+        _dsr_require sbom_release
+        if ! declare -F "$function_name" >/dev/null; then
+            error='SBOM release module unavailable'; exit_code=3
+        fi
+        [[ "$operation" != publish-artifacts || "$dry" != true ]] || arguments+=(--dry-run)
+    fi
+    if ((exit_code == 0)); then
+        _dsr_capture "$function_name" ${inputs[@]+"${inputs[@]}"} ${arguments[@]+"${arguments[@]}"} || exit_code=$?
+        output=$_DSR_CAPTURED_OUT
+        if ((exit_code != 0)); then
+            error="${_DSR_CAPTURED_ERR:-SBOM $operation failed (exit $exit_code)}"
+            output=''
+        elif $remote; then
+            # Stream potentially large publication plans; no release inventory
+            # or receipt belongs in a single exec argument.
+            if ! receipt=$(jq -ce -s --arg operation "$operation" --argjson dry "$dry" '
+                if length == 1 and (.[0] | type == "object" and .schema_version == 1 and
+                    if $operation == "publish-artifacts" then
+                        .kind == "dsr-sbom-publication" and .dry_run == $dry and
+                        .status == (if $dry then "planned" else "verified" end)
+                    else .kind == "dsr-sbom-remote-verification" and .status == "verified" end)
+                then .[0] else error("expected one complete SBOM operation receipt") end
+            ' <<< "$output" 2>/dev/null); then
+                error='SBOM operation did not return one complete receipt'; exit_code=1; receipt=null; output=''
+            fi
+        fi
+    fi
+    [[ -z "$error" ]] || log_error "$error"
+    if $JSON_MODE; then
+        local path_output=''
+        $remote || path_output=$output
+        details=$(jq -nc --arg operation "$operation" --arg target "${inputs[0]:-}" \
+            --arg format "$format" --arg output "$path_output" --arg selection "$selection" \
+            --arg repo "$repo" --arg tag "$tag" --arg expected "$expected" \
+            --arg error "$error" --argjson code "$exit_code" --argjson dry "$dry" \
+            --argjson duration "$((SECONDS-start))" --slurpfile receipt /dev/fd/3 '
+            {authenticated:false,duration_seconds:$duration,
+             format:(if $format=="" then null else $format end)} +
+            (if $operation=="verify" then
+                {file:$target,valid:($code==0),verification_scope:"document"}
+             elif $operation=="verify-release" then
+                {repository:$repo,tag:$tag,manifest_sha256:$expected,valid:($code==0),
+                 verification_scope:"remote-release",receipt:$receipt[0]}
+             elif $operation=="publish-artifacts" then
+                {target:$target,repository:$repo,tag:$tag,dry_run:$dry,
+                 publication_verified:($code==0 and ($dry|not)),receipt:$receipt[0]}
+             else
+                {target:$target,output:(if $code==0 then $output else null end)} +
+                (if $operation=="verify-artifacts" then
+                    {valid:($code==0),verification_scope:"local-artifacts"}
+                 else {evidence_kind:"scanner-observation"} end) +
+                (if $operation=="generate" then {} else
+                    {manifest:(if $code==0 then $output else null end)} end)
+             end) +
+            (if $selection=="" then {} else {selection:$selection} end) +
+            (if $code==0 then {} else {error:$error} end)
+        ' 3<<< "$receipt") || return 1
+        local envelope_status=success
+        if ((exit_code != 0)); then envelope_status=error
+        elif [[ "$operation" == verify* ]]; then envelope_status=ok; fi
+        json_envelope "sbom-$operation" "$envelope_status" "$exit_code" "$details" || return 1
+    elif ((exit_code == 0)) && [[ "$operation" != verify ]]; then
+        printf '%s\n' "$output" || return 1
+    fi
+    return "$exit_code"
 }
 
 # ============================================================================

@@ -794,8 +794,8 @@ export -f _sbom_snapshot_artifacts _sbom_receipt_shape _sbom_verify_entry
 export -f _sbom_read_selection _sbom_selection_gate
 export -f _sbom_publish_record _sbom_verify_manifest _sbom_artifacts sbom_verify_artifacts
 
-# Standalone module entry points expose complete release-set operations without
-# relying on the monolithic dsr CLI (which currently exposes generate/verify).
+# Standalone module entry points expose the same release-set engines used by
+# the public dsr sbom CLI, without its global options or JSON envelope.
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     set -uo pipefail
     _sbom_command="${1:-help}"

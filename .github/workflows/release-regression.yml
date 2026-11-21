@@ -19,6 +19,7 @@ on:
       - scripts/tests/test_release_integrity.sh
       - scripts/tests/test_release_integrity_finalize.sh
       - scripts/tests/test_sbom_batch.sh
+      - scripts/tests/test_sbom_cli.sh
       - scripts/tests/test_sbom_publish.sh
       - src/release_finalize.sh
       - src/release_builds.sh
@@ -61,6 +62,7 @@ on:
       - scripts/tests/test_release_bundle_variants.sh
       - scripts/tests/test_release_packaging.sh
       - scripts/tests/test_release_packaging_variants.sh
+      - scripts/tests/test_release_source_companions.sh
       - scripts/tests/test_release_install.sh
       - scripts/tests/test_release_install_fetch.sh
       - scripts/tests/test_release_install_variants.sh
@@ -128,7 +130,10 @@ jobs:
           bash -n src/sbom.sh
           bash -n src/sbom_release.sh
           bash -n scripts/tests/test_sbom_batch.sh
+          bash -n scripts/tests/test_sbom_cli.sh
           shellcheck -S warning src/sbom.sh src/sbom_release.sh scripts/tests/test_sbom_batch.sh
+          shellcheck -S warning scripts/tests/test_sbom_cli.sh
+          timeout 120 bash scripts/tests/test_sbom_cli.sh
           timeout 120 bash scripts/tests/test_sbom_batch.sh --selected-payload-scale-only
           timeout 120 bash scripts/tests/test_sbom_batch.sh
           timeout 120 bash scripts/tests/test_sbom_publish.sh
@@ -256,7 +261,7 @@ jobs:
           set -euo pipefail
           files=(src/release_builds.sh src/release_packaging.sh src/release_packaging_pipeline.sh
                  scripts/tests/test_release_build_plan_variants.sh scripts/tests/test_release_packaging.sh
-                 scripts/tests/test_release_packaging_variants.sh)
+                 scripts/tests/test_release_packaging_variants.sh scripts/tests/test_release_source_companions.sh)
           for source in "${files[@]}"; do
             bash -n "$source"
             shellcheck -S warning "$source"
@@ -264,6 +269,7 @@ jobs:
           bash scripts/tests/test_release_build_plan_variants.sh 2>&1 | tee "$RUNNER_TEMP/packaging-evidence/build-plan-variants.log"
           bash scripts/tests/test_release_packaging.sh 2>&1 | tee "$RUNNER_TEMP/packaging-evidence/packaging.log"
           bash scripts/tests/test_release_packaging_variants.sh 2>&1 | tee "$RUNNER_TEMP/packaging-evidence/packaging-variants.log"
+          timeout 120 bash scripts/tests/test_release_source_companions.sh 2>&1 | tee "$RUNNER_TEMP/packaging-evidence/source-companions.log"
           test -z "$(git status --porcelain)"
       - name: Retain packaging validation evidence
         if: always()
