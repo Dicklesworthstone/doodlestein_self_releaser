@@ -4,7 +4,7 @@ Use the read-only audit command when a release needs complete payload coverage,
 not a checksum-file syntax check or a three-file spot check:
 
 ```bash
-bash src/release_checksums.sh --repo owner/tool --tag v1.2.3 \
+dsr release checksums audit --repo owner/tool --tag v1.2.3 \
   --output-dir /srv/audits/tool-v1.2.3-attempt-1
 ```
 
@@ -13,7 +13,13 @@ The output directory must be new, absolute, and have an existing parent. Omit
 its downloaded evidence and JSON result, including failed attempts. Repeat an
 audit in a new directory; the auditor never repairs or overwrites prior evidence.
 
-This command is also sourceable as `release_verify_checksums`. A Unix host with
+The public command returns the authoritative audit receipt; global `--json`
+wraps it in `details.receipt` without changing its trust scope. Global
+`--dry-run` checks local inputs and dependencies through the auditor's preflight,
+without credentials, network or an audit output directory. Its resume and pinned
+inventory-recheck options are available unchanged. The standalone
+`bash src/release_checksums.sh` interface is also sourceable as
+`release_verify_checksums`. A Unix host with
 Bash 4+, Python 3, jq, and curl 8.4.0 or newer is required. The curl minimum ensures that the
 maximum download size applies during a transfer even without Content-Length.
 It is not a claim that arbitrary old curl installations are security-qualified.
@@ -225,10 +231,10 @@ bash src/checksum_sync.sh verify-release --repo owner/tool --tag v1.2.3
 For downstream updates, select `--verify-release` on the existing sync command:
 
 ```bash
-bash src/checksum_sync.sh sync tool v1.2.3 --repo owner/tool \
+dsr release checksums sync tool v1.2.3 --repo owner/tool \
   --target-repo owner/installers --verify-release --dry-run --json
 
-bash src/checksum_sync.sh sync tool v1.2.3 --repo owner/tool \
+dsr release checksums sync tool v1.2.3 --repo owner/tool \
   --target-repo owner/installers --verify-release --push --json
 ```
 
@@ -246,6 +252,14 @@ committed downstream. Each downstream mutation rechecks the held receipt and
 export identity. Unrelated repository files and earlier commits remain intact.
 No push occurs unless `--push` was requested; ordinary local checksum commits
 remain available in the retained sync workspace.
+
+The public CLI requires an explicit source `--repo` and preserves the existing
+sync engine. Plain mode returns its complete receipt; JSON mode retains that
+receipt under `details.receipt`, including partial outcomes. Recovery consumes
+the saved `result_file` or `sync_plan.path`, with its independently held digest,
+using `dsr release checksums recover`. Do not substitute the outer CLI envelope
+for the original saved result. Cancellation sent to the public CLI reaches the
+owned engine and audit processes before later downstream work can start.
 
 `--dry-run --verify-release` performs the read-only remote audit and retains its
 evidence, but does not clone or mutate downstream repositories. `--external`

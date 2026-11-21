@@ -1223,6 +1223,233 @@ checksum_sync_json() (
     return "$code"
 )
 
+# The public CLI uses these same engines, including the standalone sync
+# process that forwards cancellation to its separately owned audit worker.
+# Receipts are read through pipes, never packed into an exec argument.
+_cs_cli_execute() {
+    local module_dir
+    module_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || return 3
+    command -v python3 >/dev/null || {
+        _cs_log_error 'Python 3 is required for release checksum commands'
+        return 3
+    }
+    exec python3 -I - "$module_dir" "$@" <<'PY'
+import datetime
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+import uuid
+
+module = Path(sys.argv[1])
+json_mode, dry_run = sys.argv[2] == 'true', sys.argv[3] == 'true'
+version = sys.argv[4]
+action = sys.argv[5] if len(sys.argv) > 5 else 'help'
+arguments = sys.argv[6:]
+started = time.monotonic()
+started_at = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+child = None
+interrupted = False
+HELP = '''dsr release checksums - Audit, synchronize, and recover release checksums
+
+USAGE:
+    dsr release checksums audit --repo OWNER/REPO --tag vVERSION [options]
+    dsr release checksums sync TOOL VERSION --repo OWNER/REPO [options]
+    dsr release checksums recover --result FILE --result-sha256 SHA256
+        --target-repo OWNER/REPO --output-dir NEW_DIRECTORY [--push]
+    dsr release checksums recover --plan FILE --plan-sha256 SHA256
+        --output-dir NEW_DIRECTORY [--execute [--push]]
+
+audit checks every eligible release payload and retains its complete evidence.
+sync accepts local manifests/artifacts, or --verify-release for a complete audit
+before downstream commits. Repeat --target-repo for multiple destinations.
+Remote writes require explicit --push or --external; without either, sync retains
+local commits. --external creates review issues. --repo is required for sync.
+recover uses an independently held result/plan digest and preserves prior evidence.
+Without --push/--execute it reconciles state; it does not deliver new commits.
+
+Global --dry-run maps audit to local preflight without network or audit output;
+sync validates and plans (with --verify-release it still downloads audit evidence).
+Recovery has no dry-run: omit --push/--execute for reconciliation with local receipts.
+Each action's --help lists its engine options. Plain output is one engine receipt;
+--json wraps that exact receipt in details.receipt. Checksums do not authenticate
+the publisher or source. Retained result_file and sync_plan paths remain the
+authority for recovery; do not pin the outer CLI envelope instead.
+'''
+
+class Failure(Exception):
+    def __init__(self, message, code=4):
+        super().__init__(message)
+        self.code = code
+
+def stop(signum, frame):
+    global interrupted
+    interrupted = True
+    if child is not None and child.poll() is None:
+        try:
+            child.send_signal(signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    signal.signal(sig, stop)
+
+def pairs(items):
+    result = {}
+    for key, value in items:
+        if key in result:
+            raise ValueError('duplicate checksum result member')
+        result[key] = value
+    return result
+
+def emit(details, code, raw=None):
+    if json_mode:
+        result = dict(command='release-checksums', status='success' if code == 0 else
+                      ('partial' if details.get('receipt', {}).get('status') == 'partial' else 'error'),
+                      exit_code=code, run_id=str(uuid.uuid4()), started_at=started_at,
+                      duration_ms=int((time.monotonic() - started) * 1000), tool='dsr', version=version,
+                      details=dict(details, action=action))
+        print(json.dumps(result, sort_keys=True, separators=(',', ':')))
+    elif raw is not None:
+        sys.stdout.buffer.write(raw)
+    else:
+        print(json.dumps(dict(details, action=action), sort_keys=True, separators=(',', ':')))
+
+try:
+    if action in ('help', '--help', '-h'):
+        if json_mode:
+            emit(dict(status='help', help=HELP), 0)
+        else:
+            print(HELP, file=sys.stderr, end='')
+        sys.exit(0)
+    if action not in ('audit', 'sync', 'recover'):
+        raise Failure('Unknown release checksum action: ' + action)
+    # This boundary rejects ambiguous public input before any engine can
+    # create a workspace or mutate a downstream repository. Preserve exact
+    # values; only normalize known spelling aliases and global dry-run.
+    values = {
+        'audit': {'--repo', '--tag', '--release-id', '--checksum-asset', '--checksum-mode',
+                  '--output-dir', '--resume-from', '--recheck-from', '--audit-sha256',
+                  '--timeout', '--max-asset-bytes', '--max-total-bytes'},
+        'sync': {'--tool', '--version', '--repo', '--artifacts-dir', '--manifest', '--target-repo',
+                 '--checksums-file', '--checksum-mode', '--checksum-asset', '--audit-timeout',
+                 '--audit-max-asset-bytes', '--audit-max-total-bytes', '--audit-resume-from'},
+        'recover': {'--result', '--result-sha256', '--target-repo', '--output-dir', '--timeout',
+                    '--plan', '--plan-sha256'},
+    }[action]
+    flags = {
+        'audit': {'--preflight', '--include-metadata'},
+        'sync': {'--push', '--external', '--include-metadata', '--prefer-gh', '--verify-release'},
+        'recover': {'--push', '--execute'},
+    }[action]
+    aliases = {'-h': '--help', '-n': '--dry-run'}
+    if action == 'sync':
+        aliases.update({'-t': '--tool', '-V': '--version', '-a': '--artifacts-dir',
+                        '-r': '--target-repo', '--open-issue': '--external'})
+    forwarded, seen, positional = [], set(), []
+    index = 0
+    help_requested = False
+    while index < len(arguments):
+        argument = arguments[index]
+        key, separator, inline = argument.partition('=')
+        key = aliases.get(key, key)
+        if key.startswith('-'):
+            if key not in values | flags | {'--help', '--dry-run'}:
+                raise Failure('Unknown option for ' + action + ': ' + key)
+            if key in seen and not (action == 'sync' and key == '--target-repo'):
+                raise Failure('Duplicate checksum option: ' + key)
+            seen.add(key)
+            if key in values:
+                if not separator:
+                    index += 1
+                    if index >= len(arguments):
+                        raise Failure('Missing value for ' + key)
+                    inline = arguments[index]
+                if not inline or inline.startswith('-'):
+                    raise Failure('Missing value for ' + key)
+                forwarded.extend((key, inline))
+            else:
+                if separator:
+                    raise Failure('Flag does not take a value: ' + key)
+                if key == '--dry-run':
+                    dry_run = True
+                elif key == '--help':
+                    help_requested = True
+                    forwarded.append(key)
+                else:
+                    forwarded.append(key)
+        else:
+            if action != 'sync' or len(positional) >= 2:
+                raise Failure('Unexpected positional checksum argument')
+            positional.append(argument)
+            forwarded.append(argument)
+        index += 1
+    if action == 'sync':
+        if positional and ('--tool' in seen or '--version' in seen):
+            raise Failure('Use positional TOOL VERSION or --tool/--version, not both')
+        if not help_requested and '--repo' not in seen:
+            raise Failure('Checksum sync requires an explicit --repo OWNER/REPO')
+        forwarded.append('--json')
+    if dry_run and not help_requested:
+        if action == 'recover':
+            raise Failure('Recovery has no dry-run; omit --push/--execute to reconcile without delivery')
+        if action == 'audit':
+            if '--preflight' not in seen:
+                forwarded.append('--preflight')
+        else:
+            forwarded.append('--dry-run')
+    command = ['bash', str(module / {'audit': 'release_checksums.sh',
+               'sync': 'checksum_sync.sh', 'recover': 'checksum_sync_recover.sh'}[action])]
+    if action == 'sync':
+        command.append('sync')
+    command.extend(forwarded)
+    if interrupted:
+        raise Failure('Release checksum command interrupted before launch', 5)
+    environment = {key: value for key, value in os.environ.items()
+                   if not key.startswith('BASH_FUNC_') and key not in ('BASH_ENV', 'ENV')}
+    child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             env=environment, start_new_session=True)
+    if interrupted:
+        stop(signal.SIGTERM, None)
+    output, _ = child.communicate()
+    code = child.returncode
+    if code < 0:
+        raise Failure('Release checksum command interrupted before a complete receipt', 5)
+    if help_requested and code == 0:
+        if json_mode:
+            emit(dict(status='help', help=output.decode('utf-8')), 0)
+        else:
+            sys.stderr.buffer.write(output)
+        sys.exit(0)
+    try:
+        receipt = json.loads(output, object_pairs_hook=pairs,
+                            parse_constant=lambda _: (_ for _ in ()).throw(ValueError('nonfinite result')))
+    except (ValueError, UnicodeError) as error:
+        raise Failure('Checksum engine did not return one complete JSON receipt', code or 7) from error
+    expected = {'audit': {'dsr-release-checksum-verification', 'dsr-release-checksum-inventory-check'},
+                'sync': {'dsr-checksum-sync-result'},
+                'recover': {'dsr-checksum-delivery-recovery', 'dsr-checksum-sync-continuation'}}[action]
+    if (not isinstance(receipt, dict) or receipt.get('kind') not in expected or
+            type(receipt.get('exit_code')) is not int or receipt['exit_code'] != code):
+        raise Failure('Checksum receipt identity or exit code contradicts the selected engine', 7)
+    emit(dict(status=receipt['status'], authenticated=False, source_verified=False,
+              dry_run=bool(receipt.get('dry_run') or receipt.get('preflight')), receipt=receipt), code, output)
+    sys.exit(code)
+except (Failure, OSError, ValueError, TypeError, KeyError) as error:
+    code = getattr(error, 'code', 7)
+    print('[release-checksums] ' + str(error), file=sys.stderr)
+    emit(dict(status='error', error=str(error), authenticated=False, source_verified=False), code)
+    sys.exit(code)
+finally:
+    if child is not None and child.poll() is None:
+        child.send_signal(signal.SIGTERM)
+        child.wait()
+PY
+}
+
 # ============================================================================
 # Exports
 # ============================================================================
@@ -1234,6 +1461,7 @@ export -f checksum_manifest_normalize checksum_generate checksum_verify checksum
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     command="${1:-}"; shift 2>/dev/null || true
     case "$command" in
+        _cli) _cs_cli_execute "$@" ;;
         generate) checksum_generate "$@" ;;
         verify) checksum_verify "$@" ;;
         normalize) checksum_manifest_normalize "$@" ;;

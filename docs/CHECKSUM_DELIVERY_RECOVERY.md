@@ -17,14 +17,14 @@ with complete acknowledged-commit and audit evidence is also accepted.
 sha256sum < "$SYNC_WORKSPACE/result.json"
 
 # Reconcile only: network reads, local logs and a local lock, no remote writes.
-bash src/checksum_sync.sh recover \
+dsr release checksums recover \
   --result "$SYNC_WORKSPACE/result.json" \
   --result-sha256 "$REVIEWED_RESULT_SHA256" \
   --target-repo owner/installers \
   --output-dir /srv/recovery/check-1
 
 # Explicitly permit one push of the already-validated checksum commit.
-bash src/checksum_sync.sh recover \
+dsr release checksums recover \
   --result "$SYNC_WORKSPACE/result.json" \
   --result-sha256 "$REVIEWED_RESULT_SHA256" \
   --target-repo owner/installers \
@@ -40,6 +40,15 @@ project roots retain the checksum-sync prohibition. Generation/build hosts and
 release assets are not modified. Python 3 on POSIX, Bash, Git, jq and the existing
 bounded auditor transport are required. `--timeout` bounds each subprocess;
 it does not change release policy or grant a retry.
+
+The public CLI exposes both the single-result recovery shown here and complete
+`--plan FILE --plan-sha256 DIGEST` continuation. Plain output is the engine's
+receipt; global `--json` places the same receipt under `details.receipt`.
+Process status and partial/uncertain delivery outcomes remain authoritative.
+Recovery does not support `--dry-run`; omit `--push` and `--execute` for
+reconciliation without delivery. That mode still reads remote state and retains
+local evidence. The standalone `bash src/checksum_sync.sh recover` interface
+continues to use the same engines.
 
 Sync itself now requires Python 3 before any downstream effects, including
 unaudited sync, to retain complete recovery results. The persistence helper

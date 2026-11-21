@@ -26,6 +26,7 @@
         "build",
         "release",
         "release-verify",
+        "release-checksums",
         "slsa-publish-release",
         "slsa-verify-remote",
         "slsa-fetch-release",

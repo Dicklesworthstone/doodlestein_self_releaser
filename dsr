@@ -9504,10 +9504,12 @@ USAGE:
     dsr release <tool> <version> --resume --publish-draft
     dsr release verify <tool> <version>   (verify existing release)
     dsr release dispatch --outbox <file> (recover a saved downstream handoff)
+    dsr release checksums <action> [options]
 
 SUBCOMMANDS:
     verify    Verify release assets against build manifest
     dispatch  Inspect or resume the saved downstream delivery outbox
+    checksums Audit release bytes, synchronize downstream checksums, or recover delivery
 
 OPTIONS:
     -t, --tool <name>        Tool to release (or first positional arg)
@@ -12477,6 +12479,13 @@ _dispatch_saved_plan() {
     done < <(jq -c '.requests[]' <<< "$plan")
     _dp_state_valid "$file" "$plan" || return 2
     printf '%s\n' "$plan"
+}
+
+cmd_release_checksums() {
+    # Replace the public process so cancellation reaches the receipt adapter
+    # immediately. Its workers retain the existing engines' cleanup policies.
+    BASH_ENV='' ENV='' exec bash "$SCRIPT_DIR/src/checksum_sync.sh" _cli \
+        "$JSON_MODE" "$DRY_RUN" "$DSR_VERSION" "$@"
 }
 
 cmd_release_dispatch() {
@@ -20260,6 +20269,10 @@ main() {
         release)
             # Check for subcommand
             case "${1:-}" in
+                checksums)
+                    shift
+                    cmd_release_checksums "$@"
+                    ;;
                 dispatch)
                     shift
                     cmd_release_dispatch "$@"

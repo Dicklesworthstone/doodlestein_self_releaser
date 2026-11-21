@@ -13,6 +13,11 @@ on:
       - src/release_payloads.sh
       - src/sbom.sh
       - src/sbom_release.sh
+      - src/checksum_sync.sh
+      - src/checksum_sync_recover.sh
+      - src/checksum_sync_resume.sh
+      - src/release_checksums.sh
+      - scripts/tests/test_checksum_cli.sh
       - scripts/tests/test_release_payloads.sh
       - scripts/tests/test_release_payload_pipeline.sh
       - scripts/tests/test_release_finalize.sh
@@ -88,6 +93,30 @@ concurrency:
   group: release-regression-refs/heads/main
   cancel-in-progress: false
 jobs:
+  checksum-delivery:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install checksum delivery regression dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends git jq python3 python3-jsonschema shellcheck coreutils
+      - name: Validate audited checksum commits and pinned recovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n src/checksum_sync.sh
+          bash -n scripts/tests/test_checksum_cli.sh
+          shellcheck -S warning src/checksum_sync.sh scripts/tests/test_checksum_cli.sh
+          timeout 120 bash scripts/tests/test_checksum_cli.sh
+          timeout 120 bash scripts/tests/test_checksum_sync_pipeline.sh
+          timeout 120 bash scripts/tests/test_checksum_sync_recovery.sh
+          test -z "$(git status --porcelain)"
   payload-publication:
     runs-on: ubuntu-24.04
     timeout-minutes: 10

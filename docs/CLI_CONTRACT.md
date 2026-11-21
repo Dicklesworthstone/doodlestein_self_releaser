@@ -2281,6 +2281,66 @@ concurrent privileged mutation.
 
 ---
 
+### `dsr release checksums`
+
+Audit a complete release, synchronize its checksums to downstream repositories,
+and recover delivery using the existing retained results and plans:
+
+```bash
+dsr release checksums audit --repo OWNER/TOOL --tag v1.2.3 --checksum-mode sidecars
+dsr release checksums sync TOOL v1.2.3 --repo OWNER/TOOL \
+    --target-repo OWNER/INSTALLERS --verify-release --dry-run
+dsr release checksums sync TOOL v1.2.3 --repo OWNER/TOOL \
+    --target-repo OWNER/INSTALLERS --verify-release --push
+dsr release checksums recover --result /absolute/sync/result.json \
+    --result-sha256 HELD_DIGEST --target-repo OWNER/INSTALLERS \
+    --output-dir /absolute/new-recovery --push
+dsr release checksums recover --plan /absolute/sync/sync-plan.json \
+    --plan-sha256 HELD_DIGEST --output-dir /absolute/new-continuation --execute --push
+```
+
+`audit` uses the complete payload auditor, including aggregate/sidecar selection,
+bounded acquisition, interrupted-download resume and independently pinned
+inventory rechecks. Global `--dry-run` selects its local `--preflight`: options,
+local evidence and dependencies are checked without credentials, network or a
+new audit directory. An inventory recheck retains its distinct receipt kind and
+never claims to have downloaded or reverified the payloads again.
+
+`sync` requires an explicit source `--repo`. It accepts either positional
+`TOOL VERSION` or `--tool`/`--version`, repeatable `--target-repo`, a local
+`--manifest`/`--artifacts-dir`, or `--verify-release` with the auditor's selection
+and limits. Remote auditing must succeed before downstream changes. Without
+`--push`, commits remain in the reported workspace; `--external` explicitly
+selects review issues instead of commits. Global dry-run preserves the engine's
+planning behavior: it creates no downstream checkout or commit, but audited
+planning still downloads and retains checksum evidence.
+
+`recover` preserves the result and complete-plan recovery engines' independent
+digest, original audit, exact commit and destination checks. A result recovery
+only pushes with `--push`; plan continuation needs `--execute`, and its push
+choice must match the original plan. Already-applied commits are reconciled
+without another push. Recovery has no dry-run; the CLI rejects that flag rather
+than silently discarding delivery options. Omit `--push`/`--execute` for
+reconciliation that performs network reads and retains local evidence.
+
+Plain output is one authoritative engine receipt. Global `--json` emits a
+`release-checksums` envelope with `details.action`, `details.receipt`, and the
+actual exit status, including partial downstream completion. Keep the original
+`receipt.result_file` or `receipt.sync_plan.path` and independently selected
+digest for recovery; the outer envelope is not the retained recovery authority.
+`authenticated` and `source_verified` remain false. Cancellation of the public
+CLI is forwarded to the engine, which stops its owned acquisition processes
+and retains its actual result. The adapter does not reinterpret checksum
+consistency as publisher authentication or erase an acknowledged remote effect.
+
+Unknown, duplicate, missing and operation-inappropriate options return `4`
+before launching an engine. Repeated destinations remain supported. The engines'
+exit codes, signatures of retained evidence and explicit mutation choices are
+unchanged. See [checksum audits](RELEASE_CHECKSUMS.md) and
+[delivery recovery](CHECKSUM_DELIVERY_RECOVERY.md).
+
+---
+
 ### `dsr release source-only`
 
 Publish or recover a release with exactly zero uploaded assets. The repository
