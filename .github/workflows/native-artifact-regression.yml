@@ -14,6 +14,7 @@ on:
       - scripts/tests/test_git_build_context.sh
       - scripts/tests/test_act_build_cmd_tokens.sh
       - scripts/tests/test_act_runner_native.sh
+      - scripts/tests/test_native_environment_literals.sh
       - scripts/tests/test_native_source_sync.sh
       - scripts/tests/test_config.sh
       - scripts/tests/test_disk_free_floor.sh
@@ -97,7 +98,7 @@ jobs:
           set -euo pipefail
           if [[ "$RUNNER_OS" == Linux ]]; then
             sudo apt-get update
-            sudo apt-get install -y --no-install-recommends jq xz-utils golang-go minisign zip unzip msitools wixl rsync python3 gcc openssl shellcheck gh
+            sudo apt-get install -y --no-install-recommends jq xz-utils golang-go minisign zip unzip msitools wixl rsync python3 gcc openssl shellcheck gh zsh
           else
             for tool in jq xz go minisign rsync shellcheck; do
               command -v "$tool" >/dev/null || brew install "$tool"
@@ -200,6 +201,21 @@ jobs:
           set -euo pipefail
           timeout 120 bash scripts/tests/test_act_runner_native.sh --large-inventory-only \
             2>&1 | tee "$RUNNER_TEMP/collector-evidence/native-large-inventory.log"
+          test -z "$(git status --porcelain)"
+      - name: Preserve literal build environments through Cargo and native launchers
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v cargo >/dev/null
+          command -v rustc >/dev/null
+          command -v zsh >/dev/null
+          bash -n scripts/tests/test_native_environment_literals.sh
+          shellcheck -S warning scripts/tests/test_native_environment_literals.sh
+          deadline=$(command -v timeout || command -v gtimeout)
+          "$deadline" 120 bash scripts/tests/test_native_environment_literals.sh \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/native-environment-literals.log"
+          "$deadline" 120 bash scripts/tests/test_act_runner_native.sh --unix-native-env-only \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/native-launch-environment.log"
           test -z "$(git status --porcelain)"
       - name: Validate complete native workspace archives
         shell: bash

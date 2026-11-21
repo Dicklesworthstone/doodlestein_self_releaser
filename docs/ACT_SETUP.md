@@ -105,6 +105,31 @@ dsr doctor
 | `windows-*` | Native SSH to wlap |
 | `self-hosted` | Check labels, route accordingly |
 
+## Unix native build environment
+
+Values in a repository's `env` and `cross_compile.<platform>.env` are literal
+environment data. DSR preserves quotes, dollar signs, backticks, backslashes,
+spaces and empty values through both Cargo metadata preparation and the native
+build command. Platform values override global values, including an explicit
+empty string. For example, the quotes required by Rust's `--cfg` syntax reach
+the compiler unchanged:
+
+```yaml
+env:
+  RUSTFLAGS: '--cfg release_channel="stable"'
+  BUILD_NOTE: '$HOME is literal text in this value'
+cross_compile:
+  linux/amd64:
+    env:
+      BUILD_NOTE: ''
+```
+
+Supply concrete paths in environment values; `${HOME}` and `$(...)` are not
+expanded there. Shell operations belong in `build_cmd`, subject to the existing
+strict-build command policy. Environment names must be portable identifiers,
+and values containing NUL, carriage return or newline are rejected before
+serialization.
+
 ## Windows native source synchronization
 
 Windows jobs run natively over SSH, not inside act's Linux containers. Configure

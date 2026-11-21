@@ -7552,7 +7552,11 @@ SH
         env_name="${env_pair%%=*}"
         [[ "$env_pair" == *=* && "$env_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 4
         [[ "$env_name" == CARGO_HOME ]] && continue
-        if [[ "${env_name^^}" =~ $sdk_regex ]]; then
+        # Configured values are literal environment data. Preserve quoted
+        # Rust flags and shell metacharacters through the worker's parser;
+        # the same rule applies to non-SDK build-script inputs.
+        if [[ "${env_name^^}" =~ $sdk_regex || "$env_pair" == *'$'* ||
+              "$env_pair" == *'"'* || "$env_pair" == *'`'* || "$env_pair" == *'\'* ]]; then
             printf -v env_quoted '%q' "$env_pair"
             printf 'export %s\n' "$env_quoted"
         else
@@ -14809,9 +14813,13 @@ EOF
             if { [[ "$language" == go ]] && $strict_native_build &&
                  jq -e --arg name "$env_name" 'has($name)' \
                      <<< "$build_influence_env_json" >/dev/null; } ||
-               [[ "$language" == rust && "${env_name^^}" =~ $sdk_regex ]]; then
+               [[ "$language" == rust && "${env_name^^}" =~ $sdk_regex ]] ||
+               [[ "$env_pair" == *'$'* || "$env_pair" == *'"'* ||
+                  "$env_pair" == *'`'* || "$env_pair" == *'\'* ]]; then
                 # Policy receipts describe literal reviewed values. Shell
                 # expansion must not replace a flag or workfile after capture.
+                # General recipe values, including RUSTFLAGS and build-script
+                # inputs, need the same protection on every native language.
                 local env_pair_quoted
                 printf -v env_pair_quoted '%q' "$env_pair"
                 env_exports+="export $env_pair_quoted; "

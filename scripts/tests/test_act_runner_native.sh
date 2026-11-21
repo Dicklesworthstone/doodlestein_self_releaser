@@ -5,6 +5,8 @@
 #
 # Tests native build SSH command construction with mocks.
 # Covers: command construction, path handling, env vars, SCP, error handling.
+# --unix-native-env-only runs the generated Unix environment at the compiler
+# boundary; test_native_environment_literals.sh separately compiles real Rust.
 
 set -uo pipefail
 
@@ -3970,7 +3972,8 @@ CASES
 
 test_unix_rust_sdk_environment() {
     log_test "Unix strict and ordinary Rust: configured SDK selectors replace ambient values"
-    local mode result cmd launch observed status cleanup SDK_COMMAND_FILE
+    local mode result cmd launch observed status cleanup SDK_COMMAND_FILE literal_env
+    literal_env='  $DSR_ENV_AMBIENT "quoted" \slash `printf backtick-expanded` $(printf command-expanded) = value  '
     if ! cleanup=$(_act_unix_rust_sdk_env_cleanup) || [[ -z "$cleanup" ]]; then
         log_fail "Unix SDK cleanup program could not be generated"
         return
@@ -3979,6 +3982,7 @@ test_unix_rust_sdk_environment() {
         reset_state
         MOCK_LANGUAGE=rust
         MOCK_PLATFORM_ENV=$'OPENSSL_DIR=/configured/openssl with spaces\nOPENSSL_STATIC=1\nPKG_CONFIG=/configured/pkg-config\nPKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=/configured/pkgconfig\nLIBCLANG_PATH=/configured/libclang\nRCH_DISABLED=0\nRCH_CARGO_WRAPPER_BYPASS=0\nRCH_CARGO_WRAPPER_ORIGIN=caller'
+        MOCK_PLATFORM_ENV+=$'\nRUSTFLAGS=--cfg dsr_build="release"\nREVIEW_EMPTY=\n'"REVIEW_NOTE=$literal_env"
         MOCK_BUILD_CMD='cargo build --release'
         SDK_COMMAND_FILE="$MOCK_DIR/sdk-unix-$mode-command"
         MOCK_SSH_STREAM_FILE="$MOCK_DIR/sdk-unix-$mode-artifact"
@@ -4011,7 +4015,8 @@ test_unix_rust_sdk_environment() {
             skip { next }
             match($0, /["][$]dsr_tool_python["] -I - (record|verify) /) { print substr($0, 1, RSTART - 1); skip = 1; next }
             { print }')
-        observed=$(RCH_CARGO_WRAPPER_BYPASS=0 RCH_CARGO_WRAPPER_ORIGIN=inherited \
+        observed=$(DSR_ENV_AMBIENT=must-not-expand \
+            RCH_CARGO_WRAPPER_BYPASS=0 RCH_CARGO_WRAPPER_ORIGIN=inherited \
             OPENSSL_DIR=/ambient/openssl OPENSSL_NO_VENDOR=1 \
             X86_64_PC_WINDOWS_MSVC_OPENSSL_DIR=/ambient/target-openssl \
             PKG_CONFIG=/ambient/pkg-config TARGET_PKG_CONFIG_PATH=/ambient/target-pc \
@@ -4036,6 +4041,14 @@ test_unix_rust_sdk_environment() {
             log_pass "$mode Unix generated SDK cleanup removes inherited selectors and records configured values"
         else
             log_fail "$mode Unix SDK environment/receipt mismatch: status=$status result=$result"
+        fi
+        if [[ "$status" -eq 0 ]] &&
+           grep -Fx 'RUSTFLAGS=--cfg dsr_build="release"' <<< "$observed" >/dev/null &&
+           grep -Fx "REVIEW_NOTE=$literal_env" <<< "$observed" >/dev/null &&
+           grep -Fx 'REVIEW_EMPTY=' <<< "$observed" >/dev/null; then
+            log_pass "$mode Unix native launcher preserves quoted Rust flags and literal recipe values"
+        else
+            log_fail "$mode Unix native launcher expanded or changed configured environment bytes"
         fi
         if [[ "$status" -eq 0 ]] &&
            printf '%s\n' "$observed" | grep -Fx 'RCH_DISABLED=1' >/dev/null &&
@@ -8063,6 +8076,12 @@ test_windows_private_cache_collection() {
 }
 
 main() {
+    if [[ "${1:-}" == --unix-native-env-only ]]; then
+        test_unix_rust_sdk_environment
+        printf 'Unix native environment tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return $?
+    fi
     if [[ "${1:-}" == --rch-managed-env-only ]]; then
         test_unix_rust_sdk_environment
         test_windows_rust_sdk_environment
