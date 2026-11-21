@@ -3,6 +3,7 @@
 # No remote build execution, signing or GitHub publication is claimed.
 # --remote-retry-only exercises bare Windows output collection and packaging.
 # --executable-kind-only exercises executable admission and archive staging.
+# DSR_TEST_EXECUTABLE_KIND_GROUP partitions only that lane into elf-pe or macho.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 3; }
@@ -36,6 +37,13 @@ import zipfile
 root = Path(sys.argv[1])
 retry_only = sys.argv[2] == '--remote-retry-only'
 executable_kind_only = sys.argv[2] == '--executable-kind-only'
+executable_kind_group = os.environ.get('DSR_TEST_EXECUTABLE_KIND_GROUP', 'all')
+if executable_kind_group not in ('all', 'elf-pe', 'macho'):
+    print('DSR_TEST_EXECUTABLE_KIND_GROUP must be all, elf-pe or macho', file=sys.stderr)
+    raise SystemExit(4)
+if 'DSR_TEST_EXECUTABLE_KIND_GROUP' in os.environ and not executable_kind_only:
+    print('DSR_TEST_EXECUTABLE_KIND_GROUP requires --executable-kind-only', file=sys.stderr)
+    raise SystemExit(4)
 module = Path(os.environ.get('DSR_TEST_ACT_RUNNER', str(root / 'src/act_runner.sh')))
 for tool in ('bash','git','jq','cc','tar','gzip','zip','unzip','xz'):
     if not shutil.which(tool):
@@ -789,6 +797,10 @@ def executable_kind_regressions():
             changed.chmod(0o700)
             samples.append((target+' format-only '+label, changed, target, False))
     for index, (label, original, target, accepted) in enumerate(samples):
+        if executable_kind_group == 'elf-pe' and target.startswith('darwin/'):
+            continue
+        if executable_kind_group == 'macho' and not target.startswith('darwin/'):
+            continue
         case = work / ('executable-kind-'+str(index))
         collected = case / 'collected'
         collected.mkdir(parents=True, mode=0o700)
@@ -854,7 +866,7 @@ if retry_only:
     raise SystemExit(0)
 if executable_kind_only:
     executable_kind_regressions()
-    print(f'Executable admission: {passed} assertions passed; {skipped} unavailable-fixture skips; fixtures: {work}')
+    print(f'Executable admission: {passed} assertions passed; {skipped} unavailable-fixture skips; group: {executable_kind_group}; fixtures: {work}')
     raise SystemExit(0)
 
 for target,binary in fixtures.items():

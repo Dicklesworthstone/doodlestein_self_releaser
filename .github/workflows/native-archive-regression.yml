@@ -111,5 +111,9 @@ jobs:
         run: |
           set -euo pipefail
           timeout_bin=$(command -v timeout || command -v gtimeout)
-          DSR_TEST_TAR=gnu "$timeout_bin" 120 bash scripts/tests/test_native_single_archives.sh --executable-kind-only
-          DSR_TEST_TAR=bsd "$timeout_bin" 120 bash scripts/tests/test_native_single_archives.sh --executable-kind-only
+          for archive_writer in gnu bsd; do
+            for image_group in elf-pe macho; do
+              DSR_TEST_TAR="$archive_writer" DSR_TEST_EXECUTABLE_KIND_GROUP="$image_group" \
+                "$timeout_bin" 120 bash scripts/tests/test_native_single_archives.sh --executable-kind-only
+            done
+          done

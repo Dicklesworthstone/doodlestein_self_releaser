@@ -2734,6 +2734,25 @@ _install_from_source() {
         _log_error "Source builds need Bash 4+ (this is $BASH_VERSION); rerun the installer under a newer bash (e.g. Homebrew's bash)"
         return 3
     fi
+    # The source engine builds for the native host. An explicit release ABI
+    # request remains exact when acquisition or freshness selects this path;
+    # it must not silently become a different native build. Check before any
+    # checkout, toolchain bootstrap, compiler execution or installation writes.
+    if [[ -n "$_LIBC" ]]; then
+        local source_libc
+        if [[ "$_INSTALL_PLATFORM" != linux/* ]]; then
+            _log_error "--libc is supported only on Linux"
+            return 4
+        fi
+        if ! source_libc=$(_detect_linux_libc); then
+            _log_error "Cannot identify native Linux libc for the requested source build (--libc $_LIBC)"
+            return 4
+        fi
+        if [[ "$source_libc" != "$_LIBC" ]]; then
+            _log_error "Native source builds use $source_libc and cannot satisfy --libc $_LIBC; install a matching release or build on the requested libc"
+            return 4
+        fi
+    fi
     if [[ -z "$ref" ]]; then
         if [[ -n "$_VERSION" ]]; then ref="refs/tags/$_VERSION"; else ref=HEAD; fi
     fi

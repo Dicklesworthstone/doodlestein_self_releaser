@@ -1297,34 +1297,211 @@ function Invoke-DsrSourceGit {
     return Invoke-DsrSourceCommand $Git ($options + $Arguments) $Directory $Log $Timeout $Environment -FailureCode 8 -Capture:$Capture
 }
 
-function Get-DsrSourceFiles {
+function Get-DsrSourceInventory {
     param([string]$Listing)
-    if (-not $Listing -or -not $Listing.EndsWith([string][char]0)) { Stop-DsrInstall 'Missing or incomplete pinned source inventory' 7 }
+    # An empty committed child tree is valid. ls-tree's successful exit is
+    # already required by the acquisition caller; nonempty output is framed.
+    if ($Listing -and -not $Listing.EndsWith([string][char]0)) { Stop-DsrInstall 'Incomplete pinned source inventory' 7 }
     $files = [Collections.Generic.List[string]]::new()
+    $links = [Collections.Generic.List[object]]::new()
     $nodes = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($entry in $Listing.Split([char]0)) {
         if (-not $entry) { continue }
-        if ($files.Count -ge 100000 -or $entry -cnotmatch '^(100644|100755) blob ([0-9a-f]{40}|[0-9a-f]{64})\t(.+)$') {
-            Stop-DsrInstall 'Source installation requires regular tracked files; submodules and symbolic links are unsupported' 4
+        if ($files.Count + $links.Count -ge 100000 -or
+            $entry -cnotmatch '^(100644|100755|160000) (blob|commit) ([0-9a-f]{40}|[0-9a-f]{64})\t(.+)$') {
+            Stop-DsrInstall 'Source installation requires regular tracked files or pinned gitlinks; symbolic links are unsupported' 4
         }
-        $name = $Matches[3]
+        $mode = $Matches[1]
+        $type = $Matches[2]
+        $commit = $Matches[3]
+        $name = $Matches[4]
+        if (($mode -ceq '160000') -ne ($type -ceq 'commit')) { Stop-DsrInstall 'Invalid pinned source entry kind' 4 }
         if (-not (Test-DsrSourceRelativePath $name)) { Stop-DsrInstall 'Unsafe Windows source member' 4 }
         $parts = $name.Split('/')
         $prefix = ''
         for ($index = 0; $index -lt $parts.Count; $index++) {
             $prefix = if ($prefix) { $prefix + '/' + $parts[$index] } else { $parts[$index] }
-            $kind = if ($index -eq $parts.Count - 1) { 'file' } else { 'directory' }
+            $kind = if ($index -lt $parts.Count - 1) { 'directory' } elseif ($mode -ceq '160000') { 'repository' } else { 'file' }
             if ($nodes.ContainsKey($prefix)) {
                 $prior = $nodes[$prefix]
-                if ($prior.path -cne $prefix -or $prior.kind -cne $kind -or $kind -ceq 'file') {
+                if ($prior.path -cne $prefix -or $prior.kind -cne $kind -or $kind -cne 'directory') {
                     Stop-DsrInstall 'Case-colliding or ambiguous Windows source tree' 4
                 }
             } else { $nodes.Add($prefix, @{ path = $prefix; kind = $kind }) }
         }
-        $files.Add($name)
+        if ($mode -ceq '160000') { $links.Add(@{ path = $name; source_commit = $commit }) }
+        else { $files.Add($name) }
     }
     $files.Sort([StringComparer]::Ordinal)
-    return ,$files.ToArray()
+    return @{ files = $files.ToArray(); submodules = $links.ToArray(); entry_count = $files.Count + $links.Count }
+}
+
+function Resolve-DsrSourceSubmoduleRepository {
+    param([string]$Parent, [string]$Url)
+    if ($Url.StartsWith('https://github.com/', [StringComparison]::Ordinal)) { $repository = $Url.Substring(19) }
+    elseif ($Url.StartsWith('../../', [StringComparison]::Ordinal)) { $repository = $Url.Substring(6) }
+    elseif ($Url.StartsWith('../', [StringComparison]::Ordinal)) { $repository = $Parent.Split('/')[0] + '/' + $Url.Substring(3) }
+    else { Stop-DsrInstall 'Submodules must select GitHub HTTPS repositories' 4 }
+    if ($repository.EndsWith('.git', [StringComparison]::Ordinal)) { $repository = $repository.Substring(0, $repository.Length - 4) }
+    if ($repository -cnotmatch '^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$') {
+        Stop-DsrInstall 'Unsafe or unsupported submodule repository' 4
+    }
+    return $repository
+}
+
+# Every operation in acquisition or graph validation shares its caller's
+# deadline. Repository count cannot multiply SourceTimeout into an unbounded
+# sequence of requests or local identity checks.
+function Invoke-DsrSourceAcquisitionGit {
+    param($Node, $Graph, [string[]]$Arguments, [string]$Label, [switch]$Capture)
+    $remaining = [Math]::Ceiling(($Graph.timeout * 1000 - $Graph.clock.ElapsedMilliseconds) / 1000.0)
+    if ($remaining -le 0) { Stop-DsrInstall 'Source graph operation exceeded its complete-graph deadline' 5 }
+    $result = Invoke-DsrSourceGit $Graph.git $Arguments $Node.root ([IO.Path]::Combine($Node.logs, $Label)) `
+        ([int]$remaining) $Node.repository $Node.environment -Capture:$Capture
+    if ($Graph.clock.ElapsedMilliseconds -ge $Graph.timeout * 1000) {
+        Stop-DsrInstall 'Source graph operation exceeded its complete-graph deadline' 5
+    }
+    if ($Capture) { return $result }
+}
+
+function Get-DsrSourceSubmoduleDeclarations {
+    param($Node, $Graph, $Inventory)
+    $links = @($Inventory.submodules)
+    if ($links.Count -eq 0) { return ,@() }
+    if ('.gitmodules' -cnotin $Inventory.files) { Stop-DsrInstall 'Pinned gitlinks require a committed regular .gitmodules' 4 }
+    # Parse the committed blob directly. Neither a working-tree replacement,
+    # an include directive nor a custom update command supplies URL authority.
+    try {
+        $records = Invoke-DsrSourceAcquisitionGit $Node $Graph `
+            @('config', '--no-includes', '--null', '--blob', ($Node.source_commit + ':.gitmodules'),
+                '--get-regexp', '^submodule\..*\.(path|url)$') 'git-modules' -Capture
+    } catch {
+        if ($_.Exception.Data.Contains('DsrExitCode') -and $_.Exception.Data['DsrExitCode'] -eq 5) { throw }
+        Stop-DsrInstall 'Invalid committed submodule declarations' 4
+    }
+    if (-not $records -or -not $records.EndsWith([string][char]0)) {
+        Stop-DsrInstall 'Missing or incomplete committed submodule declarations' 4
+    }
+    $paths = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+    $urls = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+    $names = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($record in $records.Split([char]0)) {
+        if (-not $record) { continue }
+        $separator = $record.IndexOf("`n", [StringComparison]::Ordinal)
+        if ($separator -le 0) { Stop-DsrInstall 'Invalid committed submodule declaration' 4 }
+        $key = $record.Substring(0, $separator)
+        $value = $record.Substring($separator + 1)
+        if ($key -cnotmatch '^submodule\.([A-Za-z0-9_][A-Za-z0-9._/-]*)\.(path|url)$') {
+            Stop-DsrInstall 'Unsafe or unsupported submodule name' 4
+        }
+        $name = $Matches[1]
+        $field = $Matches[2]
+        if ($field -ceq 'path') {
+            if (-not (Test-DsrSourceRelativePath $value) -or $paths.ContainsKey($name) -or $names.ContainsKey($value)) {
+                Stop-DsrInstall 'Repeated, case-colliding or unsafe submodule path' 4
+            }
+            $paths.Add($name, $value)
+            $names.Add($value, $name)
+        } else {
+            if ($urls.ContainsKey($name)) { Stop-DsrInstall 'Repeated submodule URL' 4 }
+            $urls.Add($name, (Resolve-DsrSourceSubmoduleRepository $Node.repository $value))
+        }
+    }
+    if ($paths.Count -ne $links.Count -or $urls.Count -ne $links.Count) {
+        Stop-DsrInstall 'Submodule declarations must match every pinned gitlink exactly' 4
+    }
+    $children = [Collections.Generic.List[object]]::new()
+    foreach ($link in $links) {
+        if (-not $names.ContainsKey($link.path)) { Stop-DsrInstall 'Missing pinned submodule declaration' 4 }
+        $name = $names[$link.path]
+        if ($paths[$name] -cne $link.path -or -not $urls.ContainsKey($name)) {
+            Stop-DsrInstall 'Ambiguous pinned submodule declaration' 4
+        }
+        $path = Get-DsrPlainPath ([IO.Path]::Combine($Node.root, $link.path)) -Directory
+        if (@([IO.Directory]::EnumerateFileSystemEntries($path)).Count -ne 0) {
+            Stop-DsrInstall 'Pinned submodule destination is not an empty plain directory' 7
+        }
+        $fullPath = if ($Node.path) { $Node.path + '/' + $link.path } else { $link.path }
+        if (-not (Test-DsrSourceRelativePath $fullPath)) { Stop-DsrInstall 'Nested submodule path exceeds the source bounds' 4 }
+        $children.Add(@{ root = $path; path = $fullPath; repository = $urls[$name]; source_commit = $link.source_commit })
+    }
+    return ,$children.ToArray()
+}
+
+function Add-DsrSourceRepository {
+    param($Graph, [string]$Repository, [string]$Reference, [string]$Root, [string]$Path = '', [int]$Depth = 0)
+    if ($Depth -gt 16 -or $Graph.nodes.Count -ge 256) { Stop-DsrInstall 'Source submodules exceed 16 levels or 256 repositories' 4 }
+    $node = @{ repository = $Repository; path = $Path; root = (Get-DsrPlainPath $Root -Directory);
+        environment = (Get-DsrSourceGitEnvironment $Repository -Authenticate);
+        logs = (New-DsrPrivateDirectory ([IO.Path]::Combine($Graph.logs, ('source-' + $Graph.nodes.Count)))) }
+    $null = Invoke-DsrSourceAcquisitionGit $node $Graph @('init', '--quiet', '--template=', '.') 'git-init'
+    # Pin all repository plumbing, including after compiler code has run.
+    # A later core.worktree, alternate index or ambient Git selector cannot
+    # redirect our source identity checks to a different checkout.
+    $gitDirectory = Get-DsrPlainPath ([IO.Path]::Combine($node.root, '.git')) -Directory
+    $node.environment.GIT_DIR = $gitDirectory
+    $node.environment.GIT_COMMON_DIR = $gitDirectory
+    $node.environment.GIT_WORK_TREE = $node.root
+    $node.environment.GIT_INDEX_FILE = [IO.Path]::Combine($gitDirectory, 'index')
+    $node.environment.GIT_OBJECT_DIRECTORY = [IO.Path]::Combine($gitDirectory, 'objects')
+    if ($Reference.StartsWith('refs/', [StringComparison]::Ordinal)) {
+        $null = Invoke-DsrSourceAcquisitionGit $node $Graph @('check-ref-format', $Reference) 'git-ref'
+    }
+    $null = Invoke-DsrSourceAcquisitionGit $node $Graph @('remote', 'add', 'origin', (Get-DsrSourceRepositoryUrl $Repository)) 'git-origin'
+    $null = Invoke-DsrSourceAcquisitionGit $node $Graph `
+        @('fetch', '--quiet', '--depth=1', '--no-tags', '--recurse-submodules=no', 'origin', $Reference) 'git-fetch'
+    $commit = (Invoke-DsrSourceAcquisitionGit $node $Graph @('rev-parse', '--verify', 'FETCH_HEAD^{commit}') 'git-pin' -Capture).Trim()
+    if ($commit -cnotmatch '^([0-9a-f]{40}|[0-9a-f]{64})$' -or
+        ($Reference -match '^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$' -and $commit -cne $Reference.ToLowerInvariant())) {
+        Stop-DsrInstall 'Fetched source does not match the selected commit' 7
+    }
+    $node.source_commit = $commit
+    $listing = Invoke-DsrSourceAcquisitionGit $node $Graph @('ls-tree', '-rz', '--full-tree', $commit) 'git-tree' -Capture
+    $inventory = Get-DsrSourceInventory $listing
+    $Graph.entry_count += $inventory.entry_count
+    if ($Graph.entry_count -gt 100000) { Stop-DsrInstall 'Source graph exceeds 100000 tracked entries' 4 }
+    $null = Invoke-DsrSourceAcquisitionGit $node $Graph `
+        @('-c', 'advice.detachedHead=false', 'checkout', '--quiet', '--detach', $commit) 'git-checkout'
+    $Graph.nodes.Add($node)
+    foreach ($file in $inventory.files) {
+        $fullPath = if ($Path) { $Path + '/' + $file } else { $file }
+        if (-not (Test-DsrSourceRelativePath $fullPath)) { Stop-DsrInstall 'Nested source member exceeds the source bounds' 4 }
+        $Graph.files.Add($fullPath)
+    }
+    $children = Get-DsrSourceSubmoduleDeclarations $node $Graph $inventory
+    if ($children.Count -gt 0 -and ($Depth -ge 16 -or $Graph.nodes.Count + $children.Count -gt 256)) {
+        Stop-DsrInstall 'Source submodules exceed 16 levels or 256 repositories' 4
+    }
+    foreach ($child in $children) {
+        Write-DsrInstallVerbose ('Fetching pinned submodule ' + $child.path + ' at ' + $child.source_commit)
+        $null = Add-DsrSourceRepository $Graph $child.repository $child.source_commit $child.root $child.path ($Depth + 1)
+    }
+    return $node
+}
+
+function Assert-DsrSourceGraph {
+    param($Graph, [string]$Phase)
+    # Initial validation is still part of acquisition. Final validation gets
+    # one fresh graph-wide budget after the independently bounded compilers.
+    $verification = if ($Phase -ceq 'initial') { $Graph } else {
+        @{ git = $Graph.git; timeout = $Graph.timeout; clock = [Diagnostics.Stopwatch]::StartNew() }
+    }
+    foreach ($node in $Graph.nodes) {
+        $null = Get-DsrPlainPath $node.environment.GIT_DIR -Directory
+        $null = Get-DsrPlainPath $node.environment.GIT_OBJECT_DIRECTORY -Directory
+        $null = Get-DsrPlainPath $node.environment.GIT_INDEX_FILE -File
+        try {
+            $commit = (Invoke-DsrSourceAcquisitionGit $node $verification @('rev-parse', '--verify', 'HEAD^{commit}') `
+                ('git-' + $Phase + '-pin') -Capture).Trim()
+            if ($commit -cne $node.source_commit) { Stop-DsrInstall 'Source compilation changed a pinned repository identity' 7 }
+            $null = Invoke-DsrSourceAcquisitionGit $node $verification `
+                @('diff-index', '--cached', '--quiet', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', $node.source_commit, '--') `
+                ('git-' + $Phase + '-index')
+        } catch {
+            if ($_.Exception.Data.Contains('DsrExitCode') -and $_.Exception.Data['DsrExitCode'] -eq 5) { throw }
+            Stop-DsrInstall 'Source compilation changed a pinned repository identity or staged tree' 7
+        }
+    }
 }
 
 function Get-DsrSourceTreeEvidence {
@@ -1859,23 +2036,13 @@ function Build-DsrSourceFamily {
     $logs = New-DsrPrivateDirectory ([IO.Path]::Combine($Work, 'logs'))
     $source = New-DsrPrivateDirectory ([IO.Path]::Combine($Work, 'source'))
     $output = New-DsrPrivateDirectory ([IO.Path]::Combine($Work, 'output'))
-    $gitEnvironment = Get-DsrSourceGitEnvironment $Policy.repo -Authenticate
-    $repositoryUrl = Get-DsrSourceRepositoryUrl $Policy.repo
-    $gitBase = @{ Git = $git.Source; Directory = $source; Timeout = $Timeout; Repository = $Policy.repo; Environment = $gitEnvironment }
-    $null = Invoke-DsrSourceGit @gitBase -Arguments @('init', '--quiet', '--template=', '.') -Log ([IO.Path]::Combine($logs, 'git-init'))
-    if ($Reference.StartsWith('refs/', [StringComparison]::Ordinal)) {
-        $null = Invoke-DsrSourceGit @gitBase -Arguments @('check-ref-format', $Reference) -Log ([IO.Path]::Combine($logs, 'git-ref'))
-    }
-    $null = Invoke-DsrSourceGit @gitBase -Arguments @('remote', 'add', 'origin', $repositoryUrl) -Log ([IO.Path]::Combine($logs, 'git-origin'))
-    $null = Invoke-DsrSourceGit @gitBase -Arguments @('fetch', '--quiet', '--depth=1', '--no-tags', '--recurse-submodules=no', 'origin', $Reference) -Log ([IO.Path]::Combine($logs, 'git-fetch'))
-    $commit = (Invoke-DsrSourceGit @gitBase -Arguments @('rev-parse', '--verify', 'FETCH_HEAD^{commit}') -Log ([IO.Path]::Combine($logs, 'git-pin')) -Capture).Trim()
-    if ($commit -cnotmatch '^([0-9a-f]{40}|[0-9a-f]{64})$' -or
-        ($Reference -match '^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$' -and $commit -cne $Reference.ToLowerInvariant())) {
-        Stop-DsrInstall 'Fetched source does not match the selected commit' 7
-    }
-    $listing = Invoke-DsrSourceGit @gitBase -Arguments @('ls-tree', '-rz', '--full-tree', $commit) -Log ([IO.Path]::Combine($logs, 'git-tree')) -Capture
-    $files = Get-DsrSourceFiles $listing
-    $null = Invoke-DsrSourceGit @gitBase -Arguments @('-c', 'advice.detachedHead=false', 'checkout', '--quiet', '--detach', $commit) -Log ([IO.Path]::Combine($logs, 'git-checkout'))
+    $graph = @{ git = $git.Source; logs = $logs; timeout = $Timeout; clock = [Diagnostics.Stopwatch]::StartNew();
+        nodes = [Collections.Generic.List[object]]::new(); files = [Collections.Generic.List[string]]::new(); entry_count = 0 }
+    $rootRepository = Add-DsrSourceRepository $graph $Policy.repo $Reference $source
+    $commit = $rootRepository.source_commit
+    $graph.files.Sort([StringComparer]::Ordinal)
+    $files = $graph.files.ToArray()
+    Assert-DsrSourceGraph $graph 'initial'
     $sourceEvidence = Get-DsrSourceTreeEvidence $source $files
     $buildRoot = if ($Policy.source.subdir -ceq '.') { $source } else { [IO.Path]::Combine($source, $Policy.source.subdir) }
     $buildRoot = Get-DsrPlainPath $buildRoot -Directory
@@ -1934,8 +2101,8 @@ function Build-DsrSourceFamily {
     } else {
         $compilerDetails = Build-DsrBunSourceOutputs $Policy $Selection $Platform $source $files $buildRoot $output $logs $Timeout $compilerTool.Source
     }
-    $finalCommit = (Invoke-DsrSourceGit @gitBase -Arguments @('rev-parse', '--verify', 'HEAD^{commit}') -Log ([IO.Path]::Combine($logs, 'git-final-pin')) -Capture).Trim()
-    if ($finalCommit -cne $commit -or (Get-DsrSourceTreeEvidence $source $files) -cne $sourceEvidence) {
+    Assert-DsrSourceGraph $graph 'final'
+    if ((Get-DsrSourceTreeEvidence $source $files) -cne $sourceEvidence) {
         Stop-DsrInstall 'Source compilation changed the pinned tracked inputs' 7
     }
     $rows = @()
@@ -1953,6 +2120,11 @@ function Build-DsrSourceFamily {
         platform = $Platform;
         release_target_triple = $Selection.target_triple; source_subdir = $Policy.source.subdir;
         binaries = @($rows); sha256 = $primaryRow.sha256; size_bytes = $primaryRow.size_bytes; signed_release = $false }
+    if ($graph.nodes.Count -gt 1) {
+        $receipt.submodules = @($graph.nodes | Where-Object { $_.path } | ForEach-Object {
+            @{ path = $_.path; repository = $_.repository; source_commit = $_.source_commit }
+        })
+    }
     foreach ($key in $compilerDetails.Keys) { $receipt[$key] = $compilerDetails[$key] }
     Write-DsrNewTextFile ([IO.Path]::Combine($Work, 'source-receipt.json')) ($receipt | ConvertTo-Json -Depth 8 -Compress)
     return @{ directory = $output; receipt = $receipt; expected = $expected }

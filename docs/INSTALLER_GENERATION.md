@@ -1071,6 +1071,13 @@ Installation still refuses before discovery when source consent is absent,
 libc is unknown, or an explicit `--libc` request cannot be satisfied. An
 unsupported host also remains an error.
 
+An explicit `--libc` selection also remains binding for source installation.
+The source engine builds natively: `--from-source --libc musl` on a GNU host
+refuses before fetching or compiling, as does an unavailable musl release that
+would otherwise fall back to a GNU source build. A matching native libc permits
+the source build; unidentified native libc and non-Linux source hosts refuse
+the explicit option. Release downloads retain their existing variant selection.
+
 The focused regression adapts libc discovery while using real local Git tags,
 Go compilation and installed executables. It is also included in the full
 generated-source installer suite:

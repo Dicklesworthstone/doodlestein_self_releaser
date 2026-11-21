@@ -550,6 +550,7 @@ test_libc_source_fallback() {
     cat > "$TEMP/bin/ldd" <<'LIBC'
 #!/usr/bin/env bash
 case "${INSTALLER_TEST_LIBC:-}" in
+    gnu) printf 'ldd (GNU libc) 2.36 (installer routing fixture)\n'; exit 0 ;;
     musl) printf 'musl libc (installer routing fixture)\n'; exit 0 ;;
     unknown) printf 'DSR unidentified runtime fixture\n'; exit 0 ;;
 esac
@@ -606,6 +607,34 @@ HOST
     check 'unsatisfied explicit libc never invokes source' no_source
     check 'unsatisfied explicit libc refuses before release discovery' no_http
 
+    INSTALLER_TEST_LIBC=gnu run_case abi-explicit-native-source good \
+        --from-source --libc gnu --version v1.0.0 --source-timeout 60
+    check 'matching explicit libc permits the native source build' equal "$status" 0
+    check 'matching explicit libc preserves the selected source tag' source_json "$TAG_PIN"
+    check 'matching explicit libc source installs the real executable' equal "$("$CASE/install/app")" tagged-source-v1
+    check 'explicit native source needs no release discovery' no_http
+
+    INSTALLER_TEST_LIBC=gnu run_case abi-explicit-cross-source good \
+        --from-source --libc musl --version v1.0.0 --source-timeout 60
+    check 'explicit source cannot silently ignore the requested libc' equal "$status" 4
+    check 'cross-libc source refuses before Git or compiler execution' no_source
+    check 'cross-libc explicit source refuses before HTTP' no_http
+    check 'cross-libc source emits one JSON refusal' error_json
+    check 'cross-libc source leaves installation absent' test ! -e "$CASE/install/app"
+
+    INSTALLER_TEST_LIBC=musl run_case abi-explicit-cross-fallback download-fail \
+        --allow-source-build --libc gnu --version v1.0.0 --source-timeout 60
+    check 'unavailable explicit release cannot fall back to a different native libc' equal "$status" 4
+    check 'cross-libc release fallback never executes source' no_source
+    check 'cross-libc release fallback emits one JSON refusal' error_json
+    check 'cross-libc release fallback leaves installation absent' test ! -e "$CASE/install/app"
+
+    INSTALLER_TEST_LIBC=musl run_case abi-explicit-cross-discovery discovery-fail \
+        --allow-source-build --libc gnu --source-timeout 60
+    check 'unavailable latest release preserves the explicit libc request' equal "$status" 4
+    check 'cross-libc discovery fallback never executes source' no_source
+    check 'cross-libc discovery fallback emits one JSON refusal' error_json
+
     # Production also recognizes an installed musl loader. Do not hide that
     # evidence or claim an unknown-libc fixture when this host supplies it.
     for loader in /lib/ld-musl-*.so.1 /usr/lib/ld-musl-*.so.1; do
@@ -618,6 +647,12 @@ HOST
         check 'unknown libc still refuses source fallback' equal "$status" 4
         check 'unknown libc never executes source' no_source
         check 'unknown libc refuses before release discovery' no_http
+
+        INSTALLER_TEST_LIBC=unknown run_case abi-explicit-unknown-source good \
+            --from-source --libc gnu --version v1.0.0 --source-timeout 60
+        check 'an explicit source libc requires identifiable native libc' equal "$status" 4
+        check 'unknown native libc cannot execute the explicit source build' no_source
+        check 'unknown native libc source refuses before HTTP' no_http
     fi
 
     INSTALLER_TEST_HOST=unknown run_case abi-unknown-host good --allow-source-build
