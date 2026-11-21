@@ -71,6 +71,7 @@ on:
       - scripts/tests/test_docker_release.sh
       - tests/unit/test_docker.bats
       - scripts/tests/test_slsa_cli.sh
+      - scripts/tests/test_slsa_remote_cli.sh
       - scripts/tests/test_slsa_snapshot.sh
       - scripts/tests/test_release_source_only.sh
       - scripts/tests/test_release_source_only_exact_tag.sh
@@ -150,7 +151,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends jq python3 python3-cryptography minisign shellcheck util-linux coreutils procps
+          sudo apt-get install -y --no-install-recommends jq python3 python3-cryptography python3-jsonschema minisign shellcheck util-linux coreutils procps
       - name: Validate complete selected evidence and finalization recovery
         shell: bash
         run: |
@@ -159,8 +160,11 @@ jobs:
           bash -n src/release_integrity.sh
           bash -n scripts/tests/test_release_finalize.sh
           bash -n scripts/tests/test_slsa_cli.sh
+          bash -n scripts/tests/test_slsa_remote_cli.sh
           shellcheck -S warning src/release_finalize_core.sh src/release_integrity.sh scripts/tests/test_release_finalize.sh scripts/tests/test_slsa_cli.sh
           timeout 120 bash scripts/tests/test_slsa_cli.sh
+          shellcheck -S warning scripts/tests/test_slsa_remote_cli.sh
+          timeout 120 bash scripts/tests/test_slsa_remote_cli.sh
           timeout 120 bash scripts/tests/test_release_finalize.sh --large-selection-only
           timeout 120 bash scripts/tests/test_release_bundle_variants.sh --large-plan-only
           timeout 120 bash scripts/tests/test_release_finalize.sh

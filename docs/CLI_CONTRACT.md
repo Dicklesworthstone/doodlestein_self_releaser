@@ -3438,7 +3438,9 @@ underlying status. See [SBOM lifecycle](SBOM.md) and [explicit inputs](SBOM_SELE
 ### `dsr slsa`
 
 Generate or verify SLSA v1 statements through the same library used by release
-finalization. These commands do not upload artifacts or sign new statements.
+finalization. Local generation and verification do not upload artifacts or sign
+new statements. The remote commands below publish existing authenticated proofs
+or acquire and verify complete release snapshots.
 
 ```bash
 dsr slsa generate ARTIFACT [--repo-path SOURCE_DIR] [--builder ID] \
@@ -3493,6 +3495,46 @@ Unknown, duplicate or incomplete options and excess positional arguments return
 `4`. Other statuses are `0` for success, `1` for verification failure, `2` for a
 conflicting existing output and `3` for an unavailable dependency. See
 [release provenance](PROVENANCE.md) for trust scope and standalone module APIs.
+
+#### Remote provenance and authenticated snapshots
+
+```bash
+dsr slsa publish-release STATEMENT ARTIFACTS_DIR [REMOTE_POLICY] [--signature FILE] [--dry-run]
+dsr slsa verify-remote [REMOTE_POLICY] [--jobs N]
+dsr slsa fetch-release [REMOTE_POLICY] --output-dir DIRECTORY [--resume] [--jobs N]
+dsr slsa verify-snapshot DIRECTORY [REMOTE_POLICY]
+dsr slsa describe-contract --release-contract FILE --targets PLATFORM_LIST
+```
+
+`REMOTE_POLICY` requires `--repo OWNER/REPO`, `--tag vVERSION`, `--sha COMMIT`,
+`--builder ID`, `--public-key FILE` and `--targets PLATFORM_LIST`. Optional
+`--statement-name`, `--statement-sha256`, `--manifest-sha256`, `--invocation-id`
+and `--release-contract` further constrain the selected evidence. Parallel
+verification/acquisition accepts `--jobs` from 1 through 32. `--builder/-b` and
+publication `--dry-run/-n` are supported aliases; unknown, duplicate or misplaced
+options fail before engine execution. Existing `verify-release` continues to
+verify local artifact files, while `verify-remote` checks GitHub release bytes.
+
+Publication verifies the selected key, complete local subject set and expected
+source/build policy. Its dry-run authenticates only that local evidence and
+performs no credential lookup or remote request. Actual publication preserves
+the engine's draft-only additions and identical-public-retry policy and reports
+success after remote verification. It does not create tags/releases or promote
+a draft. Fetch retains a verified complete snapshot; `--resume` rechecks its
+original checkpoint and downloads missing work. Fetch refuses global dry-run
+with exit `4` before creating output, locks or checkpoints.
+
+Offline `verify-snapshot` authenticates retained local bytes and explicitly
+reports `remote_current: false`. `describe-contract` checks the selected release
+content contract and target set without claiming authentication. All new plain
+commands return one complete engine receipt. JSON command names are
+`slsa-publish-release`, `slsa-verify-remote`, `slsa-fetch-release`,
+`slsa-verify-snapshot` and `slsa-describe-contract`, with status `success` or
+`error`. `details.policy` retains caller expectations and `details.receipt`
+preserves the engine result. `verification_scope` distinguishes `local-release`,
+`remote-release`, `local-snapshot` and `contract-shape`. Publication preview sets
+`local_statement_authenticated: true` only after a successful local check and
+`publication_verified: false`; errors do not retain authenticated success.
 
 ---
 

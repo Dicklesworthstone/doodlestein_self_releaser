@@ -7,7 +7,7 @@ creates a release, uploads assets, signs a statement or runs a downloaded binary
 ## Fetch a complete snapshot
 
 ```bash
-bash src/slsa_remote.sh fetch-release \
+dsr slsa fetch-release \
   --repo OWNER/REPO --tag v1.2.3 --sha "$REVIEWED_SOURCE_COMMIT" \
   --builder "$TRUSTED_BUILDER_ID" --public-key /srv/keys/release.pub \
   --targets linux/amd64,darwin/arm64,windows/arm64 \
@@ -64,7 +64,8 @@ the first invocation.
 Fetch needs Bash, jq, Minisign, Python 3, flock, the ordinary GitHub transport
 dependencies and a usable GitHub credential. The source release must already
 have manifest-backed signed provenance; unsigned releases cannot use this path.
-The ordinary `verify-release` and `publish-release` operations are unchanged.
+The public `verify-remote` and `publish-release` operations use the same trust
+policy. `dsr slsa verify-release` continues to check local artifacts.
 
 ## Resume an interrupted download
 
@@ -72,7 +73,7 @@ For a large release, add `--resume` to the first fetch and repeat the identical
 selection after a connection failure or interruption:
 
 ```bash
-bash src/slsa_remote.sh fetch-release --resume \
+dsr slsa fetch-release --resume \
   --repo OWNER/REPO --tag v1.2.3 --sha "$REVIEWED_SOURCE_COMMIT" \
   --builder "$TRUSTED_BUILDER_ID" --public-key /srv/keys/release.pub \
   --targets linux/amd64,darwin/arm64,windows/arm64 \
@@ -122,12 +123,12 @@ against arbitrary same-user filesystem changes.
 
 ## Download independent assets concurrently
 
-Add `--jobs N` to `fetch-release` or `verify-release` to download up to `N`
+Add `--jobs N` to `fetch-release` or `verify-remote` to download up to `N`
 signed payloads at once. The default is `1`; accepted values are `1` through
 `32`. For example, a resumable four-worker acquisition uses:
 
 ```bash
-bash src/slsa_remote.sh fetch-release --resume --jobs 4 \
+dsr slsa fetch-release --resume --jobs 4 \
   --repo OWNER/REPO --tag v1.2.3 --sha "$REVIEWED_SOURCE_COMMIT" \
   --builder "$TRUSTED_BUILDER_ID" --public-key /srv/keys/release.pub \
   --targets linux/amd64,darwin/arm64,windows/arm64 \
@@ -158,15 +159,16 @@ The `acquisition` counts retain their existing meaning. Offline
 ## Offline verification
 
 ```bash
-bash src/slsa_remote.sh verify-snapshot /srv/downloads/tool-v1.2.3 \
+dsr slsa verify-snapshot /srv/downloads/tool-v1.2.3 \
   --repo OWNER/REPO --tag v1.2.3 --sha "$REVIEWED_SOURCE_COMMIT" \
   --builder "$TRUSTED_BUILDER_ID" --public-key /srv/keys/release.pub \
   --targets linux/amd64,darwin/arm64,windows/arm64
 ```
 
-This command needs only the local SLSA modules, Bash, jq, Minisign and ordinary
-filesystem/hash tools. It does not load the GitHub or SBOM scanner modules,
-resolve credentials, query a tag, or fetch a missing file. Supply the same
+Offline verification needs Bash, jq, Minisign and ordinary filesystem/hash tools.
+It does not resolve credentials, query a tag, or fetch a missing file. The
+standalone `bash src/slsa_remote.sh verify-snapshot` entry point also avoids
+loading GitHub and SBOM scanner modules. Supply the same
 independent trust policy and optional build pins again. It reauthenticates the
 proof and every payload, rejects extra/missing files and symlinks, and checks
 safe, case-unambiguous names and declared formats. Snapshots support at most 256
@@ -190,6 +192,11 @@ latest-version or chronological anti-rollback service.
 The sourceable APIs are `slsa_fetch_release` and `slsa_verify_snapshot` with the
 same arguments. Success emits one JSON object; failures return nonzero without
 a success object, following the existing remote SLSA API contract.
+The public commands preserve this plain receipt. Global `--json` wraps it in a
+`slsa-fetch-release` or `slsa-verify-snapshot` envelope under `details.receipt`;
+errors carry a null receipt and `authenticated: false`. Fetch refuses global
+`--dry-run` before writing a destination or checkpoint. All required and optional
+trust-policy selections are the same as the sourceable APIs.
 
 For explicit multi-binary installation, [RELEASE_INSTALLATION.md](RELEASE_INSTALLATION.md)
 describes `src/release_install.sh`. It reauthenticates the snapshot, stages the

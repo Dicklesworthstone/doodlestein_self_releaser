@@ -1,8 +1,8 @@
 # Release provenance
 
 DSR supports in-toto statements with the SLSA v1 predicate. The public
-`dsr slsa` commands and the sourceable `src/slsa.sh` module share the same
-artifact, manifest and signer checks. The module also provides standalone
+`dsr slsa` commands and the sourceable `src/slsa.sh` and `src/slsa_remote.sh`
+modules share the same artifact, manifest and signer checks. The modules also provide standalone
 commands, so release verification does not need build-host configuration or a
 source checkout.
 
@@ -46,6 +46,46 @@ arguments are refused. `generate` also exposes the module's `--build-type` and
 statement; verification remains read-only. The public CLI is exercised with real
 Git repositories, artifact bytes, and Minisign keys/signatures by
 `bash scripts/tests/test_slsa_cli.sh`.
+
+### Publish, download and reauthenticate through the public CLI
+
+The complete signed-release lifecycle is available without invoking source files:
+
+| Command | Inputs and result |
+|---------|-------------------|
+| `dsr slsa publish-release STATEMENT ARTIFACTS_DIR` | Authenticate prepared local proof and payloads, attach the statement/signature to an existing draft, then independently verify remote bytes |
+| `dsr slsa verify-remote` | Authenticate the GitHub statement and every payload against independently selected release policy |
+| `dsr slsa fetch-release --output-dir DIR` | Retain those exact verified bytes as a complete snapshot; `--resume` preserves verified progress |
+| `dsr slsa verify-snapshot DIR` | Reauthenticate a local snapshot without remote reads |
+| `dsr slsa describe-contract --release-contract FILE --targets PLATFORM,...` | Validate and canonicalize exact asset/variant requirements without authentication |
+
+The first four commands require `--repo`, `--tag`, `--sha`, `--builder`,
+`--public-key` and the complete `--targets` matrix. They forward every selected
+statement/manifest digest, invocation, remote statement name and release contract
+to the existing engine. `verify-release STATEMENT ARTIFACTS_DIR` retains its
+local meaning; `verify-remote` selects the GitHub consumer flow. The local
+`--repository` and `--source-commit` options are not substitutes for remote
+`--repo` and `--sha`; unsupported or duplicate options fail before execution.
+
+These commands print one engine receipt in plain mode. With global `--json`,
+they emit a `slsa-OPERATION` envelope with `status: success` or `status: error`,
+the complete engine result in `details.receipt`, and supplied expectations in
+`details.policy`. Failure clears the receipt and reports `authenticated: false`.
+Remote verification identifies `verification_scope: remote-release`; offline
+verification identifies `local-snapshot` and `remote_current: false`. Neither
+scope authenticates the truth of a compiler's claim or certifies a SLSA level.
+
+Publication dry-run, selected globally or after `publish-release`, authenticates
+the local statement and payloads without credential lookup or remote calls. Its
+scope is `local-release`, `local_statement_authenticated` is true on success,
+and `publication_verified` remains false. Fetch refuses `--dry-run` before
+creating a snapshot, lock or checkpoint. Contract description always reports
+`authenticated: false`; it does not obtain policy from a signed statement.
+
+`bash scripts/tests/test_slsa_remote_cli.sh` exercises the actual public
+generation/signing/publication/consumer commands with genuine Git and Minisign,
+complete artifact sets and real filesystem recovery. Only the outbound `gh`
+and `curl` executables are protocol fixtures; this is not live GitHub acceptance.
 
 ## Generate from the recorded build
 
@@ -256,15 +296,15 @@ policy. It explicitly reports that the signer is not authenticated.
 
 ## Publish signed provenance and verify GitHub bytes
 
-The remote companion, `src/slsa_remote.sh`, uses the existing uncached release
-and numeric-asset-ID transport. It does not use statement-embedded download
+The public remote commands use `src/slsa_remote.sh` and the existing uncached
+release and numeric-asset-ID transport. They do not use statement-embedded download
 URLs, infer a trust key from GitHub, or execute downloaded binaries.
 
 After generating and signing the manifest-backed statement above, attach it
 to an existing draft whose complete payload set has already been uploaded:
 
 ```bash
-bash src/slsa_remote.sh publish-release /path/to/release.intoto.jsonl /path/to/dist \
+dsr slsa publish-release /path/to/release.intoto.jsonl /path/to/dist \
   --repo OWNER/REPO --tag v1.2.3 --sha "$SOURCE_SHA" \
   --builder https://example.org/builders/dsr-production \
   --public-key /path/to/trusted-minisign.pub \
@@ -306,7 +346,7 @@ A consumer can verify the GitHub release without local artifacts, a source
 checkout, or the private build manifest:
 
 ```bash
-bash src/slsa_remote.sh verify-release \
+dsr slsa verify-remote \
   --repo OWNER/REPO --tag v1.2.3 --sha "$SOURCE_SHA" \
   --builder https://example.org/builders/dsr-production \
   --public-key /path/to/trusted-minisign.pub \
@@ -350,6 +390,9 @@ the integrated provenance policy below to gate promotion. Remote observations ar
 GitHub transaction. Signatures authenticate the producer's statement, not the
 truth of its compilation claim, every toolchain component, or a SLSA build level.
 Sourceable APIs are `slsa_publish_release` and `slsa_verify_remote`.
+The standalone module retains its `publish-release` and `verify-release`
+entry points; the public remote verifier is named `verify-remote` to distinguish
+it from local `dsr slsa verify-release`.
 
 Run `bash scripts/tests/test_slsa_remote.sh` for complete-set policy, byte drift,
 remote identity changes, interrupted upload recovery and read-only retry tests.

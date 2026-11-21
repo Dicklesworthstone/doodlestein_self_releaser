@@ -19576,6 +19576,9 @@ cmd_slsa() {
         generate|generate-manifest|verify|verify-release)
             _slsa_command "$subcmd" "$@"
             ;;
+        publish-release|verify-remote|fetch-release|verify-snapshot|describe-contract)
+            _slsa_remote_command "$subcmd" "$@"
+            ;;
         --help|-h|help|"")
             cat << 'EOF'
 dsr slsa - SLSA provenance attestation
@@ -19585,12 +19588,22 @@ USAGE:
     dsr slsa generate-manifest <manifest> <artifacts-dir> --repository OWNER/REPO [options]
     dsr slsa verify <artifact> [provenance] [options]
     dsr slsa verify-release <provenance> <artifacts-dir> [options]
+    dsr slsa publish-release <provenance> <artifacts-dir> <release-policy> [options]
+    dsr slsa verify-remote <release-policy> [options]
+    dsr slsa fetch-release <release-policy> --output-dir DIR [--resume] [options]
+    dsr slsa verify-snapshot DIR <release-policy> [options]
+    dsr slsa describe-contract --release-contract FILE --targets PLATFORM,...
 
 SUBCOMMANDS:
     generate           Record one artifact and an optional source observation
     generate-manifest  Record the complete successful build's artifact set
     verify             Verify one named artifact and every selected trust policy
     verify-release     Verify every subject and optionally the exact build manifest
+    publish-release    Publish an already-signed statement pair to an existing draft
+    verify-remote      Authenticate the GitHub release and every payload's bytes
+    fetch-release      Retain a complete authenticated release for offline use
+    verify-snapshot    Reauthenticate local snapshot bytes without contacting GitHub
+    describe-contract Validate and describe an independently selected asset contract
 
 OPTIONS:
     --builder, -b <id>        Builder identity to record or require
@@ -19607,6 +19620,21 @@ OPTIONS:
     --public-key <file>       Authenticate the statement; requires --builder
     --signature <file>        Detached signature (default: <provenance>.minisig)
 
+RELEASE POLICY (publish-release, verify-remote, fetch-release, verify-snapshot):
+    --repo OWNER/REPO --tag vVERSION --sha COMMIT
+    --builder ID --public-key FILE --targets PLATFORM,...
+    All six selections are required; --sha is the full expected source commit.
+    --statement-name NAME    Remote basename (default: release.intoto.jsonl)
+    --statement-sha256 HASH  Require these exact signed statement bytes
+    --manifest-sha256 HASH   Require the original private build manifest digest
+    --invocation-id ID       Require the selected build invocation
+    --release-contract FILE Require exact asset names, formats and compiler variants
+    --signature FILE        Prepared local signature (publish-release only)
+    --dry-run, -n           Authenticate local publication inputs without remote calls
+    --output-dir DIR        New absolute snapshot destination (fetch-release only)
+    --resume                Retain/reuse authenticated completed payloads (fetch only)
+    --jobs 1..32            Payload download concurrency (verify-remote/fetch only)
+
 DESCRIPTION:
     Generation emits unsigned SLSA v1 statements. generate records a post-build
     observation; generate-manifest binds every artifact's bytes, recorded source,
@@ -19619,6 +19647,13 @@ DESCRIPTION:
     Supply --manifest, --repository and --builder to require the exact build set.
     Generation does not support --dry-run; verification performs read-only checks.
 
+    verify-release checks a local artifact directory; verify-remote checks GitHub.
+    Remote operations require manifest-backed signed provenance and independently
+    selected signer, source and complete platform policy. Publication never signs
+    or creates a release. Its dry-run authenticates local inputs only. Fetch refuses
+    --dry-run before creating a destination; offline verification does not claim
+    the remote release is current. describe-contract does not authenticate anything.
+
 EXAMPLES:
     dsr slsa generate ./build/ntm-linux-amd64
     dsr slsa generate ./build/ntm-darwin-arm64 --builder "https://github.com/Dicklesworthstone/dsr"
@@ -19628,6 +19663,8 @@ EXAMPLES:
     dsr slsa verify-release ./release.intoto.jsonl ./build \
         --manifest ./manifest.json --repository OWNER/REPO \
         --builder dsr/production --public-key ./trusted.pub
+    dsr slsa verify-remote --repo OWNER/REPO --tag v1.2.3 --sha "$SOURCE_SHA" \
+        --builder dsr/production --public-key ./trusted.pub --targets linux/amd64
 
 EXIT CODES:
     0  - Success
@@ -19635,6 +19672,9 @@ EXIT CODES:
     2  - Existing provenance conflicts with the selected build
     3  - Required verifier or dependency is unavailable
     4  - Invalid arguments
+    5  - Transport deadline or interruption
+    7  - Remote release or signed policy integrity failure
+    8  - GitHub transport failure
 EOF
             return 0
             ;;
@@ -19744,6 +19784,155 @@ _slsa_command() {
         elif ! $generating; then envelope_status=ok; fi
         json_envelope "slsa-$operation" "$envelope_status" "$exit_code" "$details" || return 1
     elif ((exit_code == 0)) && $generating; then
+        printf '%s\n' "$output" || return 1
+    fi
+    return "$exit_code"
+}
+
+# Remote provenance keeps its own required trust policy and receipt contract.
+# Do not reinterpret local verify-release or infer a signer/source selection from
+# downloaded evidence. The existing engine owns every byte and publication gate.
+_slsa_remote_command() {
+    local operation="$1" function_name count=0 option value exit_code=0 start=$SECONDS
+    local error='' output='' receipt=null details policy dry="${DRY_RUN:-false}"
+    local repo='' tag='' sha='' builder='' public_key='' targets='' contract='' destination=''
+    local statement='' statement_hash='' manifest_hash='' invocation='' signature='' jobs=1 resume=false
+    local -a inputs=() arguments=()
+    local -A seen=()
+    shift
+    case "$operation" in
+        publish-release) function_name=slsa_publish_release; count=2 ;;
+        verify-remote) function_name=slsa_verify_remote ;;
+        fetch-release) function_name=slsa_fetch_release ;;
+        verify-snapshot) function_name=slsa_verify_snapshot; count=1 ;;
+        describe-contract) function_name=slsa_describe_contract ;;
+        *) return 4 ;;
+    esac
+    while (($#)); do
+        option=$1
+        case "$option" in -b) option=--builder ;; -n) option=--dry-run ;; esac
+        if [[ "$option" != -* ]]; then
+            inputs+=("$option"); shift
+            if ((${#inputs[@]} > count)); then
+                error="Too many positional arguments for slsa $operation"; exit_code=4; break
+            fi
+            continue
+        fi
+        case "$operation:$option" in
+            describe-contract:--release-contract|describe-contract:--targets) ;;
+            describe-contract:*) error="Unknown option for slsa $operation: $1"; exit_code=4; break ;;
+            *:--repo|*:--tag|*:--sha|*:--builder|*:--public-key|*:--targets|*:--statement-name|\
+            *:--statement-sha256|*:--manifest-sha256|*:--invocation-id|*:--release-contract|\
+            publish-release:--signature|publish-release:--dry-run|fetch-release:--output-dir|\
+            fetch-release:--resume|fetch-release:--jobs|verify-remote:--jobs) ;;
+            *) error="Unknown option for slsa $operation: $1"; exit_code=4; break ;;
+        esac
+        if [[ -n "${seen[$option]:-}" ]]; then
+            error="Duplicate SLSA option: $option"; exit_code=4; break
+        fi
+        seen[$option]=1
+        case "$option" in
+            --dry-run) dry=true; shift; continue ;;
+            --resume) resume=true; arguments+=("$option"); shift; continue ;;
+        esac
+        if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
+            error="$option requires a value"; exit_code=4; break
+        fi
+        value=$2; arguments+=("$option" "$value")
+        case "$option" in
+            --repo) repo=$value ;; --tag) tag=$value ;; --sha) sha=$value ;;
+            --builder) builder=$value ;; --public-key) public_key=$value ;; --targets) targets=$value ;;
+            --release-contract) contract=$value ;; --output-dir) destination=$value ;;
+            --statement-name) statement=$value ;; --statement-sha256) statement_hash=$value ;;
+            --manifest-sha256) manifest_hash=$value ;; --invocation-id) invocation=$value ;;
+            --signature) signature=$value ;; --jobs) jobs=$value ;;
+        esac
+        shift 2
+    done
+    if ((exit_code == 0 && ${#inputs[@]} != count)); then
+        error="Missing input for slsa $operation; run 'dsr slsa --help'"; exit_code=4
+    fi
+    if ((exit_code == 0)); then
+        if [[ "$operation" == describe-contract ]]; then
+            if [[ -z "$contract" || -z "$targets" ]]; then
+                error='slsa describe-contract requires --release-contract and --targets'; exit_code=4
+            fi
+        elif [[ -z "$repo" || -z "$tag" || -z "$sha" || -z "$builder" || -z "$public_key" || -z "$targets" ]]; then
+            error="slsa $operation requires --repo, --tag, --sha, --builder, --public-key and --targets"; exit_code=4
+        elif [[ "$operation" == fetch-release && -z "$destination" ]]; then
+            error='slsa fetch-release requires --output-dir'; exit_code=4
+        fi
+    fi
+    if ((exit_code == 0)) && [[ "$operation" == fetch-release ]] && $dry; then
+        error='SLSA fetch does not support --dry-run; no snapshot or checkpoint was written'; exit_code=4
+    fi
+    if ((exit_code == 0)); then
+        _dsr_require slsa_remote
+        if ! declare -F "$function_name" >/dev/null; then
+            error='SLSA remote module unavailable'; exit_code=3
+        fi
+        [[ "$operation" != publish-release || "$dry" != true ]] || arguments+=(--dry-run)
+    fi
+    if ((exit_code == 0)); then
+        _dsr_capture "$function_name" ${inputs[@]+"${inputs[@]}"} ${arguments[@]+"${arguments[@]}"} || exit_code=$?
+        output=$_DSR_CAPTURED_OUT
+        if ((exit_code != 0)); then
+            error="${_DSR_CAPTURED_ERR:-SLSA $operation failed (exit $exit_code)}"; output=''
+        elif ! receipt=$(jq -ce -s --arg operation "$operation" --argjson dry "$dry" \
+            --arg destination "$destination" '
+            def remote: type=="object" and .schema_version==1 and
+                .kind=="dsr-slsa-remote-verification" and .status=="verified" and .authenticated==true;
+            if length==1 and (.[0] | type=="object" and
+                if $operation=="verify-remote" then remote
+                elif $operation=="publish-release" then
+                    .kind=="dsr-slsa-publication" and .dry_run==$dry and
+                    (if $dry then .status=="planned" and .local_statement_authenticated==true and .remote_verified==false
+                     else .status=="verified" and (.verification|remote) end)
+                elif $operation=="fetch-release" then
+                    .kind=="dsr-slsa-fetch" and .status=="verified" and .authenticated==true and
+                    .snapshot==$destination and (.verification|remote)
+                elif $operation=="verify-snapshot" then
+                    .kind=="dsr-slsa-snapshot-verification" and .status=="verified" and
+                    .authenticated==true and .remote_current==false
+                else .kind=="dsr-slsa-release-contract" and .authenticated==false and (.contract|type=="object") end)
+            then .[0] else error("expected one complete SLSA operation receipt") end
+        ' <<< "$output" 2>/dev/null); then
+            error='SLSA operation did not return one complete receipt'; exit_code=1; receipt=null; output=''
+        fi
+    fi
+    [[ -z "$error" ]] || log_error "$error"
+    if $JSON_MODE; then
+        policy=$(jq -nc --arg repository "$repo" --arg tag "$tag" --arg source_commit "$sha" \
+            --arg builder "$builder" --arg public_key "$public_key" --arg targets "$targets" \
+            --arg statement_name "$statement" --arg statement_sha256 "$statement_hash" \
+            --arg manifest_sha256 "$manifest_hash" --arg invocation_id "$invocation" \
+            --arg release_contract "$contract" --arg signature "$signature" \
+            '$ARGS.named|with_entries(select(.value!=""))|if has("targets") then .targets|=split(",") else . end') || return 1
+        details=$(jq -nc --arg operation "$operation" --arg first "${inputs[0]:-}" \
+            --arg second "${inputs[1]:-}" --arg destination "$destination" --arg jobs "$jobs" \
+            --arg error "$error" --argjson code "$exit_code" --argjson dry "$dry" --argjson resume "$resume" \
+            --argjson duration "$((SECONDS-start))" --slurpfile receipt /dev/fd/3 --slurpfile policy /dev/fd/4 '
+            {authenticated:($code==0 and $operation!="describe-contract"),
+             authentication_requested:($operation!="describe-contract"),duration_seconds:$duration,
+             policy:$policy[0],receipt:$receipt[0]} +
+            (if $operation=="publish-release" then
+                {provenance:$first,artifacts_dir:$second,dry_run:$dry,
+                 local_statement_authenticated:($code==0),publication_verified:($code==0 and ($dry|not)),
+                 verification_scope:(if $dry then "local-release" else "remote-release" end)}
+             elif $operation=="verify-remote" then
+                {valid:($code==0),verification_scope:"remote-release",jobs:$jobs}
+             elif $operation=="fetch-release" then
+                {snapshot:(if $code==0 then $destination else null end),resumable:$resume,
+                 verification_scope:"remote-release",jobs:$jobs}
+             elif $operation=="verify-snapshot" then
+                {valid:($code==0),snapshot:$first,verification_scope:"local-snapshot",remote_current:false}
+             else {verification_scope:"contract-shape"} end) +
+            (if $code==0 then {} else {error:$error} end)
+        ' 3<<< "$receipt" 4<<< "$policy") || return 1
+        local envelope_status=success
+        ((exit_code == 0)) || envelope_status=error
+        json_envelope "slsa-$operation" "$envelope_status" "$exit_code" "$details" || return 1
+    elif ((exit_code == 0)); then
         printf '%s\n' "$output" || return 1
     fi
     return "$exit_code"
