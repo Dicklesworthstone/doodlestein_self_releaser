@@ -1910,6 +1910,8 @@ records = [dict(id=i + 1, name=('payload-' + 'x' * 180 + '-%04d.bin' % i if scen
            for i in range(count)]
 if scenario == 'starter':
     records[0].update(state='starter', size=0, digest=None)
+if scenario == 'interrupted-conflict-page':
+    records[1]['id'] = records[0]['id']
 if scenario in ('duplicate-id', 'duplicate-name', 'case-alias', 'unsafe-name', 'invalid-size',
                 'invalid-id', 'invalid-state', 'invalid-digest'):
     key, value = {
@@ -1945,7 +1947,9 @@ PY
     printf '%s\n' "$page" >> "$TEMP_DIR/requests"
     if [[ "$page" == 2 ]]; then
       case "$scenario" in
-        failed-page) return 22 ;; interrupted-page) return 130 ;; auth-page) return 3 ;;
+        failed-page) return 22 ;;
+        interrupted-page|interrupted-conflict-page) return "${INVENTORY_STOP_STATUS:-130}" ;;
+        auth-page) return 3 ;;
       esac
     fi
     if [[ "$scenario" == unterminated ]]; then
@@ -1996,7 +2000,8 @@ exact-200 0 3
 large 0 7
 starter 0 1
 failed-page 8 2
-interrupted-page 5 2
+interrupted-page 130 2
+interrupted-conflict-page 130 2
 auth-page 3 2
 malformed-page 8 2
 oversized-page 8 2
@@ -2013,6 +2018,11 @@ unterminated 8 100
 INVENTORY_CASES
   run_test release_inventory_invalid_identity test_release_inventory_rejects_invalid_identity
 }
+
+test_release_inventory_terminal_status() (
+  local INVENTORY_STOP_STATUS="$1"
+  test_release_inventory_scenario interrupted-page "$INVENTORY_STOP_STATUS" 2
+)
 
 test_release_upload_scenario() (
   local scenario="$1" expected_status="$2" expected_posts="$3" expected_downloads="${4:-0}"
@@ -2737,6 +2747,11 @@ run_immutable_tag_ruleset_scenario() {
   gh_api() {
     local endpoint="${1:-}" live_json history_state get_count=0
     printf '%s\n' "$*" >> "$IMMUTABLE_RULESET_CALL_LOG"
+    if [[ -n "${IMMUTABLE_RULESET_STOP_AT:-}" &&
+          "$(wc -l < "$IMMUTABLE_RULESET_CALL_LOG")" -eq "$IMMUTABLE_RULESET_STOP_AT" ]]; then
+      printf '{"partial":"untrusted response from a stopped request"}\n'
+      return "$IMMUTABLE_RULESET_STOP_STATUS"
+    fi
     live_json='{
       "id":42,
       "name":"Immutable release tags",
@@ -2843,6 +2858,30 @@ test_immutable_tag_ruleset_receipt_binds_live_history() {
     ' <<< "$IMMUTABLE_RULESET_OUTPUT" >/dev/null 2>&1 && \
     [[ $(wc -l < "$IMMUTABLE_RULESET_CALL_LOG" | tr -d '[:space:]') -eq 5 ]] && \
     ! grep -v -- '--no-cache' "$IMMUTABLE_RULESET_CALL_LOG" | grep -q .
+}
+
+test_immutable_tag_ruleset_terminal_status() (
+  local IMMUTABLE_RULESET_STOP_AT="$1" IMMUTABLE_RULESET_STOP_STATUS="$2"
+  run_immutable_tag_ruleset_scenario valid
+  [[ "$IMMUTABLE_RULESET_STATUS" -eq "$IMMUTABLE_RULESET_STOP_STATUS" &&
+     -z "$IMMUTABLE_RULESET_OUTPUT" &&
+     "$(wc -l < "$IMMUTABLE_RULESET_CALL_LOG")" -eq "$IMMUTABLE_RULESET_STOP_AT" ]]
+)
+
+run_strict_verification_interruption_tests() {
+  local status phase selected="${1:-all}"
+  case "$selected" in all|2|5|124|125|129|130|131|137|143|255) ;; *) return 4 ;; esac
+  for status in 2 5 124 125 129 130 131 137 143 255; do
+    [[ "$selected" == all || "$selected" == "$status" ]] || continue
+    run_test "release_inventory_terminal_$status" test_release_inventory_terminal_status "$status"
+    for phase in 1 2 3 4 5; do
+      run_test "tag_ruleset_request_${phase}_terminal_$status" \
+        test_immutable_tag_ruleset_terminal_status "$phase" "$status"
+    done
+  done
+  run_test release_inventory_interruption_beats_parser_failure \
+    test_release_inventory_scenario interrupted-conflict-page 130 2
+  run_test tag_ruleset_valid_control test_immutable_tag_ruleset_receipt_binds_live_history
 }
 
 test_immutable_tag_ruleset_receipt_rejects_bypass_or_redaction() {
@@ -3192,6 +3231,13 @@ main() {
     exit $?
   fi
 
+  if [[ "${1:-}" == --strict-verification-interruption-only ]]; then
+    run_strict_verification_interruption_tests "${2:-all}" || exit $?
+    printf 'Strict verification interruptions: %s passed, %s failed\n' "$TESTS_PASSED" "$TESTS_FAILED"
+    [[ "$TESTS_FAILED" -eq 0 ]]
+    exit $?
+  fi
+
   if [[ "${1:-}" == --api-deadline-only ]]; then
     run_api_deadline_regressions
     printf 'API deadlines and custody: %s passed, %s failed\n' "$TESTS_PASSED" "$TESTS_FAILED"
@@ -3444,6 +3490,7 @@ UPLOAD_SCENARIOS
 
   echo ""
   echo "Immutable Tag Ruleset Receipts:"
+  run_strict_verification_interruption_tests
   run_test "immutable_tag_ruleset_receipt_binds_live_history" \
     test_immutable_tag_ruleset_receipt_binds_live_history
   run_test "immutable_tag_ruleset_receipt_rejects_bypass_or_redaction" \

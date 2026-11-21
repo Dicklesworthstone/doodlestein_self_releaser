@@ -811,7 +811,7 @@ gh_get_immutable_tag_ruleset_receipt() {
     local tag="${4:-}"
     local ruleset_endpoint history_endpoint expected_self
     local repository_json ruleset_before history_list history_version_id
-    local history_version ruleset_after receipt
+    local history_version ruleset_after receipt request_status
 
     if [[ ! "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ || \
           ! "$repository_id" =~ ^[1-9][0-9]*$ || \
@@ -829,16 +829,22 @@ gh_get_immutable_tag_ruleset_receipt() {
     history_endpoint="repos/$repo/rulesets/$ruleset_id/history"
     expected_self="https://api.github.com/repos/$repo/rulesets/$ruleset_id"
     repository_json=$(gh_api "repos/$repo" --no-cache 2>/dev/null) || {
+        request_status=$?
         _gh_log_error "Could not bind GitHub repository identity for $repo"
+        if _gh_operation_interrupted "$request_status"; then return "$request_status"; fi
         return 1
     }
     ruleset_before=$(gh_api "$ruleset_endpoint" --no-cache 2>/dev/null) || {
+        request_status=$?
         _gh_log_error "Could not fetch immutable tag ruleset $ruleset_id for $repo"
+        if _gh_operation_interrupted "$request_status"; then return "$request_status"; fi
         return 1
     }
     history_list=$(gh_api "$history_endpoint?per_page=100&page=1" \
         --no-cache 2>/dev/null) || {
+        request_status=$?
         _gh_log_error "Could not fetch immutable tag-ruleset history"
+        if _gh_operation_interrupted "$request_status"; then return "$request_status"; fi
         return 1
     }
     history_version_id=$(jq -er '
@@ -853,11 +859,15 @@ gh_get_immutable_tag_ruleset_receipt() {
     }
     history_version=$(gh_api "$history_endpoint/$history_version_id" \
         --no-cache 2>/dev/null) || {
+        request_status=$?
         _gh_log_error "Could not fetch current immutable tag-ruleset history state"
+        if _gh_operation_interrupted "$request_status"; then return "$request_status"; fi
         return 1
     }
     ruleset_after=$(gh_api "$ruleset_endpoint" --no-cache 2>/dev/null) || {
+        request_status=$?
         _gh_log_error "Could not re-fetch immutable tag ruleset $ruleset_id for $repo"
+        if _gh_operation_interrupted "$request_status"; then return "$request_status"; fi
         return 1
     }
 
@@ -1584,7 +1594,8 @@ gh_release_asset_inventory() (
                     --no-cache) || request_status=$?
                 if ((request_status != 0)); then
                     _gh_log_error "Cannot read release asset inventory for $repo/$release_id (page $page)"
-                    case "$request_status" in 3|5) return "$request_status" ;; 130|143) return 5 ;; *) return 8 ;; esac
+                    if _gh_operation_interrupted "$request_status"; then return "$request_status"; fi
+                    case "$request_status" in 3) return 3 ;; *) return 8 ;; esac
                 fi
                 if ! jq -es '
                     def id: type == "number" and floor == . and . > 0 and . <= 9007199254740991;
@@ -1614,6 +1625,14 @@ gh_release_asset_inventory() (
                            (map(.name | ascii_downcase) | unique | length) == length
                 then sort_by(.id) else error("duplicate release asset name or ID") end' || exit 7
         }
+        # A validator may also fail when a stopped producer leaves an
+        # incomplete stream. Preserve the transport's terminal status first.
+        local -a inventory_status=("${PIPESTATUS[@]}")
+        if _gh_operation_interrupted "${inventory_status[0]}"; then
+            exit "${inventory_status[0]}"
+        fi
+        ((inventory_status[1] == 0)) || exit "${inventory_status[1]}"
+        exit "${inventory_status[0]}"
     ) || status=$?
     [[ "$status" -eq 0 ]] || return "$status"
     printf '%s\n' "$inventory"
