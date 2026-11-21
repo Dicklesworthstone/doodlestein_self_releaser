@@ -773,7 +773,9 @@ gh_download_release_asset() {
         fi
         $retryable || break
         if ((attempt < max_attempts)); then
-            _gh_retry_pause "$retry_delay" "$attempt" "$rate_limited" || { status=$?; break; }
+            # Staging was already removed. Preserve a cancelled wait without
+            # confusing its typed exit 5 with curl's proxy lookup failure.
+            _gh_retry_pause "$retry_delay" "$attempt" "$rate_limited" || return $?
         fi
     done
 
@@ -792,6 +794,7 @@ gh_download_release_asset() {
     fi
 
     _gh_log_error "Failed to download GitHub release asset ID $asset_id after $attempt attempt(s)"
+    [[ "$transport" != curl || "$status" != 5 ]] || return 8
     return "$status"
 }
 
@@ -1616,15 +1619,28 @@ gh_release_asset_inventory() (
     printf '%s\n' "$inventory"
 )
 
+# Cancellation and supervision failures are terminal for an in-flight
+# publication. A new invocation must decide whether the remote write committed;
+# the stopped invocation must not reconcile it into success or keep writing.
+# Call this only on adapter statuses, not raw curl errors (curl 5 is DNS).
+_gh_operation_interrupted() {
+    local status="${1:-0}"
+    [[ "$status" =~ ^[0-9]+$ ]] || return 1
+    ((status == 2 || status == 5 || status == 124 || status == 125 ||
+      (status >= 129 && status <= 255)))
+}
+
 # Search the complete, uncached release inventory, not the truncated embedded
 # .assets array. Return 0 + one asset, 1 for absence, 7 for ambiguity, 8 for an
 # unavailable/incomplete inventory. Never interpret a failed GET as absence.
 _gh_find_release_asset() {
     local repo="$1" release_id="$2" name="$3"
-    local page=1 response matches count found=""
+    local page=1 response matches count status found=""
     while ((page <= 100)); do
-        if ! response=$(gh_api "repos/$repo/releases/$release_id/assets?per_page=100&page=$page" --no-cache); then
+        if response=$(gh_api "repos/$repo/releases/$release_id/assets?per_page=100&page=$page" --no-cache); then :; else
+            status=$?
             _gh_log_error "Cannot read release asset inventory for $repo/$release_id"
+            if _gh_operation_interrupted "$status"; then return "$status"; fi
             return 8
         fi
         if ! jq -es 'length == 1 and (.[0] | type == "array" and length <= 100 and
@@ -1683,6 +1699,7 @@ _gh_verify_uploaded_asset() {
             download_status=$?
             _gh_log_error "Cannot verify digest-less release asset: $name"
             ((download_status != 63)) || return 7
+            if _gh_operation_interrupted "$download_status"; then return "$download_status"; fi
             return 8
         fi
         downloaded_sha=$(_gh_asset_sha256 "$workdir/verified") || return $?
@@ -1980,7 +1997,7 @@ gh_upload_asset_dual() {
     esac
 
     local versioned_result="failed" compat_result="skipped"
-    local versioned_error="" compat_error=""
+    local versioned_error="" compat_error="" upload_status=0 interrupted=false
 
     # Upload with versioned name
     _gh_log_info "Uploading: $versioned_name"
@@ -1988,6 +2005,8 @@ gh_upload_asset_dual() {
         versioned_result="uploaded"
         _gh_log_ok "  Uploaded: $versioned_name"
     else
+        upload_status=$?
+        if _gh_operation_interrupted "$upload_status"; then interrupted=true; fi
         versioned_error="Upload failed for $versioned_name"
         _gh_log_error "  $versioned_error"
     fi
@@ -1999,6 +2018,8 @@ gh_upload_asset_dual() {
             compat_result="uploaded"
             _gh_log_ok "  Uploaded: $compat_name"
         else
+            upload_status=$?
+            if _gh_operation_interrupted "$upload_status"; then interrupted=true; fi
             compat_result="failed"
             compat_error="Upload failed for $compat_name"
             _gh_log_error "  $compat_error"
@@ -2022,6 +2043,7 @@ gh_upload_asset_dual() {
             same_names: $same
         }'
 
+    if $interrupted; then return 5; fi
     if [[ "$versioned_result" != "uploaded" ]]; then
         return 7
     fi
@@ -2218,6 +2240,7 @@ export -f _gh_log_warn _gh_log_error
 export -f gh_get_immutable_tag_ruleset_receipt
 export -f gh_workflow_runs gh_workflow_active_runs gh_workflow_run gh_releases gh_latest_release
 export -f gh_create_release gh_upload_asset gh_upload_asset_named gh_upload_asset_dual
+export -f _gh_operation_interrupted
 export -f gh_release_asset_inventory
 export -f gh_compare gh_tags gh_repo
 export -f gh_resolve_tag_sha gh_repository_dispatch

@@ -143,6 +143,8 @@ elif endpoint=='upload-boundary':
     asset={'id':aid,'name':name,'state':'uploaded','size':len(data),'digest':'sha256:'+hashlib.sha256(data).hexdigest(),
            'browser_download_url':'https://github.com/owner/app/releases/download/v1.2.3/'+name}
     r['assets'].append(asset);(c/'remote.json').write_text(json.dumps(r));print(json.dumps(asset))
+    if control.get('upload_stop_status') and control.get('upload_stop_name',name)==name:
+        sys.exit(control['upload_stop_status'])
     if control.get('lost_upload_name')==name:sys.exit(1)
 elif endpoint=='checksum-download':
     matches=[a for a in r['assets'] if a.get('browser_download_url')==args[1]]
@@ -154,6 +156,7 @@ elif endpoint=='repos/owner/app/releases' and '--post' in args:
            html_url='https://github.com/owner/app/releases/tag/untagged-fixture')
     control['absent']=False;(c/'control.json').write_text(json.dumps(control))
     (c/'remote.json').write_text(json.dumps(r));print(json.dumps(r))
+    if control.get('create_stop_status'):sys.exit(control['create_stop_status'])
 elif endpoint.startswith('repos/owner/app/releases?'):
     print(json.dumps([] if control.get('absent') or 'page=2' in endpoint else [dict(r,id=99) if control.get('wrong_scan_id') else r]))
 elif endpoint=='repos/owner/app/git/ref/tags/v1.2.3':
@@ -704,7 +707,59 @@ def prepare_cases(cases):
         prepared=list(pool.map(lambda case: setup(*case),cases))
     return zip(cases,prepared)
 
-def test_fallback_recovery(pagination_only=False, prerelease_only=False):
+def interruption_statuses():
+    selected=os.environ.get('DSR_TEST_RELEASE_INTERRUPTION_STATUS','all')
+    if selected not in ('all','5','124','130'):
+        raise AssertionError('Select a known strict interruption status: all, 5, 124, or 130')
+    return (5,124,130) if selected=='all' else (int(selected),)
+
+
+def test_strict_upload_interruptions():
+    for stop_status in interruption_statuses():
+        c,env,_,_=setup('upload-stop-'+str(stop_status),{'absent':True,'upload_stop_status':stop_status})
+        result=subprocess.run(['bash','-c',script,'fixture','publish'],env=env,capture_output=True,text=True)
+        (c/'interrupted.stdout').write_text(result.stdout)
+        (c/'interrupted.stderr').write_text(result.stderr)
+        check('strict upload '+str(stop_status)+' is terminal interrupted',result.returncode==5)
+        details=json.loads(result.stdout)['details']
+        rows=[json.loads(line) for line in (c/'requests.jsonl').read_text().splitlines()]
+        check('strict upload '+str(stop_status)+' stops before reconciliation or publication',
+              [row for row in rows if row[0]=='upload-boundary']==[rows[-1]] and
+              not any('--method' in row for row in rows) and
+              json.loads((c/'remote.json').read_text())['draft'] is True)
+        check('strict upload '+str(stop_status)+' retains original custody and uncertainty',
+              details['verification']=='interrupted' and
+              details['interruption']==dict(stage='upload',exit_code=stop_status,outcome='unconfirmed') and
+              Path(details['create_response']).is_file() and
+              json.loads(Path(details['create_response']).read_text())['assets']==[] and
+              len(json.loads((c/'remote.json').read_text())['assets'])==1)
+        validator=Draft202012Validator(json.loads((root/'schemas/release-details.json').read_text()))
+        check('strict upload '+str(stop_status)+' result satisfies release schema',not list(validator.iter_errors(details)))
+
+
+def test_strict_creation_interruptions():
+    for stop_status in interruption_statuses():
+        c,env,_,_=setup('creation-stop-'+str(stop_status),{'absent':True,'create_stop_status':stop_status})
+        result=subprocess.run(['bash','-c',script,'fixture','publish'],env=env,capture_output=True,text=True)
+        (c/'interrupted.stdout').write_text(result.stdout)
+        (c/'interrupted.stderr').write_text(result.stderr)
+        check('strict creation '+str(stop_status)+' is terminal interrupted',result.returncode==5)
+        details=json.loads(result.stdout)['details']
+        rows=[json.loads(line) for line in (c/'requests.jsonl').read_text().splitlines()]
+        check('strict creation '+str(stop_status)+' makes no later remote request',
+              '--post' in rows[-1] and sum('--post' in row for row in rows)==1 and
+              not any(row[0]=='upload-boundary' or '--method' in row for row in rows))
+        custody=Path(details['creation_custody_dir'])
+        check('strict creation '+str(stop_status)+' keeps pending intent without inventing authority',
+              details['interruption']==dict(stage='create',exit_code=stop_status,outcome='unconfirmed') and
+              (custody/'creation-intent.json').is_file() and not list(custody.glob('dsr-api-response.*')) and
+              json.loads((c/'remote.json').read_text())['draft'] is True and
+              json.loads((c/'remote.json').read_text())['assets']==[])
+        validator=Draft202012Validator(json.loads((root/'schemas/release-details.json').read_text()))
+        check('strict creation '+str(stop_status)+' result satisfies release schema',not list(validator.iter_errors(details)))
+
+
+def test_fallback_recovery(pagination_only=False, prerelease_only=False, interruption_only=False):
     run_id='11111111-1111-4111-8111-111111111111'
     missing='payload.tar.gz.sha256'
 
@@ -764,6 +819,35 @@ def test_fallback_recovery(pagination_only=False, prerelease_only=False):
               len([row for row in rows if '--post' in row])==1 and
               json.loads((c/'remote.json').read_text())['draft'] is True)
         return c,env,output,details['publication_recovery']
+
+    if interruption_only:
+        for stop_status in interruption_statuses():
+            label='repair-stop-'+str(stop_status)
+            c,env,output,recovery=interrupt_upload(label)
+            response=Path(recovery['create_response'])
+            original=response.read_bytes();original_inode=response.stat().st_ino
+            intent=Path(recovery['intent']);original_intent=intent.read_bytes()
+            (c/'control.json').write_text(json.dumps({'upload_stop_status':stop_status,'upload_stop_name':missing}))
+            result,rows=invoke_fallback(c,env,output,True,label='interrupted')
+            check(label+' remains interrupted after server accepts the asset',result.returncode==5)
+            details=json.loads(result.stdout)['details']
+            check(label+' stops before remote reconciliation and finalization',
+                  [row for row in rows if row[0]=='upload-boundary']==[rows[-1]] and
+                  not any('--post' in row or '--method' in row for row in rows) and
+                  details['phases']['release']=='failed' and
+                  details['publication_recovery']['status']=='ready' and
+                  json.loads((c/'remote.json').read_text())['draft'] is True)
+            check(label+' keeps exact original response and recovery intent',
+                  response.read_bytes()==original and response.stat().st_ino==original_inode and
+                  intent.read_bytes()==original_intent)
+            (c/'control.json').write_text('{}')
+            resumed,rows=invoke_fallback(c,env,output,True,label='explicit-resume')
+            check(label+' explicit resume verifies committed bytes without reuploading',
+                  resumed.returncode==0 and not any('--post' in row or row[0]=='upload-boundary' for row in rows) and
+                  json.loads(resumed.stdout)['details']['publication_recovery']['status']=='finalized' and
+                  json.loads((c/'remote.json').read_text())['draft'] is False and
+                  response.read_bytes()==original and response.stat().st_ino==original_inode)
+        return
 
     if prerelease_only:
         selected=os.environ.get('DSR_TEST_STRICT_PRERELEASE_CASE','all')
@@ -1654,6 +1738,16 @@ def test_custom_artifact_repair():
           len([row for row in rows if row[0]=='checksum-download'])==2 and not mutations(rows))
 
 
+if os.environ.get('DSR_TEST_STRICT_INTERRUPTION_ONLY')=='1':
+    selected=os.environ.get('DSR_TEST_STRICT_INTERRUPTION_CASE','all')
+    if selected not in ('all','upload','create','repair'):
+        raise AssertionError('Select a known strict interruption case: all, upload, create, or repair')
+    if selected in ('all','upload'):test_strict_upload_interruptions()
+    if selected in ('all','create'):test_strict_creation_interruptions()
+    if selected in ('all','repair'):test_fallback_recovery(interruption_only=True)
+    print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
+    raise SystemExit(0)
+
 if os.environ.get('DSR_TEST_STRICT_ACFS_CHECKER_ONLY')=='1':
     test_acfs_checksum_checker_publication()
     print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
@@ -1922,5 +2016,8 @@ for (label,controls),(c,env,response,_) in prepare_cases([('post-metadata-drift'
 test_fallback_recovery()
 test_fallback_recovery(pagination_only=True)
 test_fallback_recovery(prerelease_only=True)
+test_strict_upload_interruptions()
+test_strict_creation_interruptions()
+test_fallback_recovery(interruption_only=True)
 print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
 PY

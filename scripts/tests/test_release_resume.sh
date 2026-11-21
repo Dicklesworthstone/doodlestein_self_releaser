@@ -62,7 +62,13 @@ gh_check() { return 0; }
 gh_check_token() { return 0; }
 _gh_resolve_token() { printf 'fixture-token\n'; }
 _gh_response_header() { :; }
-_gh_retry_pause() { printf 'PAUSE\n' >> "$CALLS"; }
+_gh_retry_pause() {
+    printf 'PAUSE\n' >> "$CALLS"
+    if [[ "${UPLOAD_STOP_STATUS:-0}" == 5 ]]; then
+        printf 'UPLOAD-STOP 5\n' >> "$CALLS"
+        return 5
+    fi
+}
 _gh_is_rate_limited() { return 1; }
 _release_require_publishable_artifacts() { return 0; }
 _release_contract_create_nonce() { printf '%064d\n' 1; }
@@ -129,7 +135,9 @@ setup() {
     DSR_CONFIG=()
     STRICT_CONTRACT=null COLLIDE_NAMES=false
     LOOKUP_FAIL=false INVENTORY_FAIL=false UPLOAD_FAIL=false LOST_RESPONSE=false
+    UPLOAD_STOP_STATUS=0 UPLOAD_STOP_COMMITTED=false
     CREATE_FAIL=true FINAL_DRIFT=false VISIBILITY_DRIFT=false FAIL_NAME=""
+    CREATE_STOP_STATUS=0
     LOST_CREATE_RESPONSE=false PUBLISH_FAIL=false LOST_PUBLISH_RESPONSE=false
     PUBLISH_ASSET_DRIFT=false PUBLISH_METADATA_DRIFT=false UPLOAD_METADATA_DRIFT=false
     UPLOAD_DESTINATION_DRIFT=false PUBLISH_DESTINATION_DRIFT=false
@@ -212,6 +220,10 @@ gh_create_release() (
         fi
         $LOST_CREATE_RESPONSE && return 8
         cat "$CASE/release.json"
+        if [[ "$CREATE_STOP_STATUS" != 0 ]]; then
+            printf 'CREATE-STOP %s\n' "$CREATE_STOP_STATUS" >> "$CALLS"
+            return "$CREATE_STOP_STATUS"
+        fi
     }
     gh_create_release "$@"
 )
@@ -373,6 +385,11 @@ curl() {
     printf 'POST %s\n' "$name" >> "$CALLS"
     printf 'UPLOAD-VISIBILITY %s %s\n' "$name" "$(jq -r '.draft' "$CASE/release.json")" >> "$CALLS"
     printf 'HTTP/1.1 201 Created\r\n\r\n' > "$headers"
+    if [[ "$UPLOAD_STOP_STATUS" == 5 ]]; then printf '503'; return 0; fi
+    if [[ "$UPLOAD_STOP_STATUS" != 0 ]] && ! $UPLOAD_STOP_COMMITTED; then
+        printf 'UPLOAD-STOP %s\n' "$UPLOAD_STOP_STATUS" >> "$CALLS"
+        return "$UPLOAD_STOP_STATUS"
+    fi
     if $UPLOAD_FAIL || [[ "$name" == "$FAIL_NAME" ]]; then printf '503'; return 0; fi
     remote_put "$name" "$payload" || return 4
     jq -c '.[-1]' "$CASE/inventory.json" > "$response"
@@ -394,6 +411,10 @@ curl() {
             mv "$CASE/release.next" "$CASE/release.json" || return 4
     fi
     : > "$CASE/post-complete"
+    if [[ "$UPLOAD_STOP_STATUS" != 0 ]]; then
+        printf 'UPLOAD-STOP %s\n' "$UPLOAD_STOP_STATUS" >> "$CALLS"
+        return "$UPLOAD_STOP_STATUS"
+    fi
     if $LOST_RESPONSE; then printf '000'; return 28; fi
     printf '201'
 }
@@ -2545,6 +2566,96 @@ test_staged_interrupted_upload_resumes_and_publishes() {
         jq -e '.details.draft==false and .details.success==2' "$CASE/stdout" >/dev/null
 }
 
+test_staged_cancelled_upload_stops_and_requires_explicit_resume() {
+    local stop_status intent before committed
+    local -a stop_statuses=(2 5 124 125 129 130 131 137 143)
+    case "${DSR_TEST_RELEASE_INTERRUPTION_STATUS:-all}" in
+        all) ;;
+        2|5|124|125|129|130|131|137|143) stop_statuses=("$DSR_TEST_RELEASE_INTERRUPTION_STATUS") ;;
+        *) printf 'Unknown upload interruption status selector\n' >&2; return 1 ;;
+    esac
+    for stop_status in "${stop_statuses[@]}"; do
+        printf 'Checking interrupted upload status %s\n' "$stop_status"
+        setup "staged_cancel_$stop_status"
+        CREATE_FAIL=false UPLOAD_STOP_STATUS="$stop_status"
+        # The write may already have committed before its response is stopped.
+        # A caller cancellation must never be turned into publication success.
+        UPLOAD_STOP_COMMITTED=true
+        printf 'second payload\n' > "$CASE/artifacts/second.bin"
+        run_release --verify-upgrade
+        [[ $STATUS -eq 5 ]] || return 1
+        jq -e --argjson rc "$stop_status" '
+            .status=="error" and .exit_code==5 and .details.verification=="interrupted" and
+            .details.interruption.exit_code==$rc and .details.interruption.stage=="upload" and
+            .details.interruption.outcome=="unconfirmed" and .details.draft==true and
+            .details.dispatch.status=="skipped"' "$CASE/stdout" >/dev/null || return 1
+        [[ $(grep -c '^POST ' "$CALLS") -eq 1 &&
+           "$(tail -n 1 "$CALLS")" == "UPLOAD-STOP $stop_status" ]] || return 1
+        ! grep -q '^PUBLISH\|^DISPATCH\|^UPGRADE' "$CALLS" || return 1
+        jq -e '.draft==true' "$CASE/release.json" >/dev/null || return 1
+        intent=$(jq -r '.details.staging_receipt' "$CASE/stdout") || return 1
+        [[ -f "$intent" ]] || return 1
+        before=$(_gh_asset_sha256 "$intent") || return 1
+        committed=$(jq -r '.[0].name // empty' "$CASE/inventory.json") || return 1
+        UPLOAD_STOP_STATUS=0
+        : > "$CALLS"
+        run_release --resume
+        [[ $STATUS -eq 0 && "$(_gh_asset_sha256 "$intent")" == "$before" ]] || return 1
+        ! grep -q '^CREATE' "$CALLS" && grep -Fxq PUBLISH "$CALLS" || return 1
+        [[ -z "$committed" ]] || ! grep -Fxq "POST $committed" "$CALLS" || return 1
+    done
+}
+
+test_staged_cancelled_alias_upload_stops_remaining_names() {
+    setup staged_cancel_alias
+    CREATE_FAIL=false UPLOAD_STOP_STATUS=130 UPLOAD_STOP_COMMITTED=true
+    cp "$CASE/artifacts/payload.bin" "$CASE/artifacts/tool-1.2.3-linux-amd64.tar.gz" &&
+        cp "$CASE/artifacts/payload.bin" "$CASE/artifacts/tool-linux-amd64.tar.gz" &&
+        cp "$CASE/artifacts/payload.bin" "$CASE/artifacts/tool-linux-x86_64.tar.gz" &&
+        mv "$CASE/artifacts/payload.bin" "$CASE/fixture-payload.bin" || return 1
+    staged_manifest tool-linux-amd64.tar.gz tool-1.2.3-linux-amd64.tar.gz tool-linux-x86_64.tar.gz || return 1
+    jq '.artifacts |= map(.target="linux/amd64" | .archive_format="tar.gz")' \
+        "$CASE/artifacts/tool-v1.2.3-manifest.json" > "$CASE/manifest.next" &&
+        mv "$CASE/manifest.next" "$CASE/artifacts/tool-v1.2.3-manifest.json" || return 1
+    run_release
+    [[ $STATUS -eq 5 && $(grep -c '^POST ' "$CALLS") -eq 1 &&
+       "$(tail -n 1 "$CALLS")" == 'UPLOAD-STOP 130' ]] &&
+        jq -e '.details.interruption.exit_code==130 and .details.verification=="interrupted"' "$CASE/stdout" >/dev/null &&
+        jq -e '.draft==true' "$CASE/release.json" >/dev/null
+}
+
+test_staged_cancelled_creation_preserves_uncertain_custody() {
+    local stop_status intent
+    local -a stop_statuses=(5 124 130)
+    case "${DSR_TEST_RELEASE_INTERRUPTION_STATUS:-all}" in
+        all) ;;
+        5|124|130) stop_statuses=("$DSR_TEST_RELEASE_INTERRUPTION_STATUS") ;;
+        *) printf 'Unknown creation interruption status selector\n' >&2; return 1 ;;
+    esac
+    for stop_status in "${stop_statuses[@]}"; do
+        printf 'Checking interrupted creation status %s\n' "$stop_status"
+        setup "staged_create_stop_$stop_status"
+        CREATE_FAIL=false CREATE_STOP_STATUS="$stop_status"
+        run_release
+        [[ $STATUS -eq 5 && "$(tail -n 1 "$CALLS")" == "CREATE-STOP $stop_status" ]] || return 1
+        ! grep -q '^API\|^POST\|^PUBLISH\|^DISPATCH' "$CALLS" || return 1
+        jq -e --argjson rc "$stop_status" '
+            .status=="error" and .exit_code==5 and .details.verification=="interrupted" and
+            .details.interruption=={stage:"create",exit_code:$rc,outcome:"unconfirmed"}' "$CASE/stdout" >/dev/null || return 1
+        intent=$(jq -r '.details.staging_receipt' "$CASE/stdout") || return 1
+        [[ -f "$intent" && "${intent%/*}" == "$(jq -r '.details.creation_custody_dir' "$CASE/stdout")" ]] || return 1
+        jq -e '.draft==true and .assets==[]' "$CASE/release.json" >/dev/null || return 1
+        # A stopped transport's output is not a successful original POST
+        # receipt; explicit resume must still refuse to adopt the draft.
+        if [[ "$stop_status" == 130 ]]; then
+            CREATE_STOP_STATUS=0
+            : > "$CALLS"
+            run_release --resume
+            [[ $STATUS -ne 0 ]] && ! grep -q '^CREATE\|^POST\|^PUBLISH\|^DISPATCH' "$CALLS" || return 1
+        fi
+    done
+}
+
 test_staged_generated_checksums_remain_bound_across_retry() {
     setup staged_checksums
     CREATE_FAIL=false FAIL_NAME=payload.bin
@@ -3537,6 +3648,8 @@ for test in test_release_auth_cancellation_never_falls_back_or_publishes \
     test_release_dispatch_large_inventory_recovers_exact_outbox \
     test_release_dispatch_large_inventory_refuses_late_page_drift test_staged_dry_run_creates_no_custody \
     test_staged_interrupted_upload_resumes_and_publishes test_staged_generated_checksums_remain_bound_across_retry \
+    test_staged_cancelled_upload_stops_and_requires_explicit_resume test_staged_cancelled_alias_upload_stops_remaining_names \
+    test_staged_cancelled_creation_preserves_uncertain_custody \
     test_staged_manifest_aliases_are_all_verified test_staged_explicit_draft_stays_private_on_resume \
     test_promotion_requires_resume_and_refuses_draft_flag test_promotion_keeps_strict_finalization_separate \
     test_promotion_requires_original_creation_custody \

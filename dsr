@@ -11016,6 +11016,29 @@ EOF
         fi
     fi
 
+    if _gh_operation_interrupted "$create_status"; then
+        # Creation may have reached GitHub even without a complete original
+        # response. Retain the intent, but never adopt a later GET as proof or
+        # turn cancellation into another write in this invocation.
+        local interrupted_creation_custody="$create_response_dir" interrupted_creation_details
+        $release_contract_enabled || interrupted_creation_custody="$ordinary_custody_dir"
+        log_error "Release creation stopped (exit $create_status); remote outcome is unconfirmed"
+        log_info "Pending creation custody is retained: $interrupted_creation_custody"
+        if $JSON_MODE; then
+            interrupted_creation_details=$(jq -nc --arg repo "$repo" --arg version "$version" \
+                --arg tag "$tag" --arg custody "$interrupted_creation_custody" \
+                --arg staging_receipt "$ordinary_intent" --argjson rc "$create_status" \
+                --arg artifacts_dir "$(cd "$artifacts_dir" && pwd -P)" '
+                {repo:$repo,version:$version,tag:$tag,stage:"create",verification:"interrupted",
+                 error:"Release creation interrupted; remote outcome is unconfirmed",
+                 interruption:{stage:"create",exit_code:$rc,outcome:"unconfirmed"},
+                 creation_custody_dir:$custody,artifacts_dir:$artifacts_dir,
+                 staging_receipt:(if $staging_receipt=="" then null else $staging_receipt end)}') || return 4
+            json_envelope "release" "error" 5 "$interrupted_creation_details"
+        fi
+        return 5
+    fi
+
     if $release_contract_enabled && [[ $create_status -eq 0 ]]; then
         local -a create_responses=("$create_response_dir"/dsr-api-response.????????)
         local creation_fingerprint
@@ -11364,7 +11387,7 @@ EOF
     }
 
     # Upload each file
-    local idx=0
+    local idx=0 upload_interrupted=false upload_stop_status=0
     for file in "${files_to_upload[@]}"; do
         idx=$((idx + 1))
         local filename
@@ -11421,8 +11444,13 @@ EOF
                 _release_record_uploaded "$filename" "uploaded" "$size_bytes" "$content_type"
                 uploaded_name_set["$filename"]=1
             else
+                upload_stop_status=$?
                 log_error "  Failed to upload: $filename"
                 _release_record_failed "$filename" "$strict_upload_result"
+                if _gh_operation_interrupted "$upload_stop_status"; then
+                    upload_interrupted=true
+                    break
+                fi
                 strict_upload_response_failures+=("$(jq -nc \
                     --arg name "$filename" \
                     --argjson size_bytes "$size_bytes" \
@@ -11472,8 +11500,13 @@ EOF
                         uploaded_name_set["$upload_name"]=1
                         uploaded_sha_set["$upload_name"]="$upload_sha"
                     else
+                        upload_stop_status=$?
                         log_error "  Failed to upload: $upload_name"
                         _release_record_failed "$upload_name" "Verified upload failed (see release log): $upload_result"
+                        if _gh_operation_interrupted "$upload_stop_status"; then
+                            upload_interrupted=true
+                            break 2
+                        fi
                     fi
                 done
                 continue
@@ -11504,16 +11537,25 @@ EOF
             uploaded_name_set["$filename"]=1
             uploaded_sha_set["$filename"]="$upload_sha"
         else
+            upload_stop_status=$?
             log_error "  Failed to upload: $filename"
             log_error "  Error: $upload_result"
             _release_record_failed "$filename" "Verified upload failed (see release log): $upload_result"
+            if _gh_operation_interrupted "$upload_stop_status"; then
+                upload_interrupted=true
+                break
+            fi
         fi
     done
 
     # Verify uploaded assets match the selected release contract.
     local verification_status="skipped"
     local missing_assets=()
-    if $release_contract_enabled; then
+    if $upload_interrupted; then
+        verification_status="interrupted"
+        log_error "Release upload stopped (exit $upload_stop_status); remote outcome is unconfirmed"
+        log_info "Publication custody is retained. Explicitly resume to verify remote bytes before continuing."
+    elif $release_contract_enabled; then
         local expected_assets_json
         local upload_failures=${#failed_assets[@]}
         local remote_verified=false
@@ -11735,7 +11777,7 @@ EOF
         done < <(jq -r '.artifacts[] | .name // .filename' <<< "$ordinary_manifest")
     fi
 
-    if ! $release_contract_enabled; then
+    if ! $release_contract_enabled && ! $upload_interrupted; then
         # Re-read by immutable release ID after all uploads. A local journal,
         # an earlier POST response, or an earlier matching name is not proof
         # that the final release still contains the selected artifact bytes.
@@ -11904,12 +11946,15 @@ EOF
 
     local status="success"
     local exit_code=0
-    if [[ $failed_count -gt 0 ]]; then
+    if $upload_interrupted; then
+        status="error"
+        exit_code=5
+    elif [[ $failed_count -gt 0 ]]; then
         status="partial"
         exit_code=1
     fi
 
-    if $release_contract_enabled && [[ $exit_code -ne 0 ]]; then
+    if ! $upload_interrupted && $release_contract_enabled && [[ $exit_code -ne 0 ]]; then
         if _release_contract_confirm_or_restore_bound_draft \
             "$repo" "$release_id" "$tag"; then
             draft=true
@@ -11917,7 +11962,7 @@ EOF
             draft=false
             log_error "Strict release failure could not confirm a bound draft state"
         fi
-    elif $ordinary_owned && ! $ordinary_external_publication && [[ $exit_code -ne 0 ]]; then
+    elif ! $upload_interrupted && $ordinary_owned && ! $ordinary_external_publication && [[ $exit_code -ne 0 ]]; then
         if _release_ordinary_restore_draft; then
             draft=true
         else
@@ -12006,7 +12051,7 @@ EOF
         release_custody_error="Release finished but its build custody could not be released"
         log_error "$release_custody_error"
         status=error
-        exit_code=4
+        $upload_interrupted || exit_code=4
     fi
 
     # Output
@@ -12031,6 +12076,8 @@ EOF
             --slurpfile uploaded /dev/fd/3 \
             --slurpfile failed /dev/fd/4 \
             --arg verification "$verification_status" \
+            --argjson upload_interrupted "$upload_interrupted" \
+            --argjson upload_stop_status "$upload_stop_status" \
             --argjson tag_ruleset_receipt "$release_contract_tag_ruleset_receipt" \
             --argjson total "$total_files" \
             --argjson success "$success_count" \
@@ -12079,7 +12126,10 @@ EOF
                     repos: (if $dispatch_repos == "" then [] else ($dispatch_repos | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))) end),
                     results: $dispatch_results
                 }
-            } + (if $custody_error == "" then {} else
+            } + (if $upload_interrupted then
+                {interruption:{stage:"upload",exit_code:$upload_stop_status,outcome:"unconfirmed"}}
+                else {} end)
+              + (if $custody_error == "" then {} else
                 {stage:"build_custody",error:$custody_error} end)' \
             3< <(printf '%s\n' "${uploaded_assets[@]}") \
             4< <(printf '%s\n' "${failed_assets[@]}") \
@@ -14836,6 +14886,10 @@ EOF
             [[ "$name" != *.sha256 && "$name" != *.minisig ]] || content_type=text/plain
             upload_rc=0
             gh_upload_asset "$(jq -r '.upload_url' <<< "$strict_observed")" "$file" "$content_type" >&2 || upload_rc=$?
+            if _gh_operation_interrupted "$upload_rc"; then
+                log_error "Strict repair upload stopped (exit $upload_rc); original publication custody is retained"
+                return 5
+            fi
             # A lost response is success only after a fresh complete inventory
             # and downloaded bytes prove that this exact asset was accepted.
             _fallback_strict_observe || return $?

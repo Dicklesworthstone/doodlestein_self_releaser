@@ -1478,6 +1478,27 @@ set. Drafts and partial uploads retain their receipts too, preserving inputs for
 finalization or retry. Resume still verifies the actual remote assets; a saved
 receipt never authorizes skipping verification or publishing a draft.
 
+An upload or creation adapter cancellation, transport signal, or expired supervision
+deadline stops the release with exit `5`. This includes interruption while
+reading the asset inventory or downloading an existing asset for verification.
+The stopped invocation performs no later upload, reconciliation, promotion,
+draft restoration, or dispatch. JSON output records
+`details.verification: "interrupted"` and an `interruption` object containing
+`stage: "create"` or `"upload"`, the original adapter `exit_code`, and `outcome: "unconfirmed"`.
+The `draft` field describes the last observed visibility; interruption cannot
+establish whether GitHub accepted the in-flight request. Original creation
+custody and any verified upload receipts remain available. Explicitly resume
+to reconcile the retained bytes before continuing. Strict fallback repair
+preserves the same interrupted exit and publication handoff, so a watcher blocks
+automatic retries even when GitHub accepted the upload before cancellation.
+Interrupted creation reports `details.creation_custody_dir`, retaining its
+pending intent without treating partial transport output as a successful
+original POST response. A draft missing that original response cannot be
+adopted automatically by a later retry.
+Ordinary retryable network errors retain their existing bounded reconciliation
+behavior; an exhausted curl proxy lookup is a network failure, not caller
+cancellation.
+
 An explicitly requested draft remains private when a later `--resume` omits
 `--draft`; an unrelated existing draft also remains private. Existing public
 releases without staged creation custody retain ordinary upload behavior.

@@ -1439,6 +1439,9 @@ test_download_transport_scenario() (
         destination-appeared) mkdir "$destination" || return 4 ;;
       esac
     fi
+    # curl's raw status 5 is a retryable proxy DNS error, whereas the shared
+    # adapter's status 5 means the caller interrupted its retry wait.
+    if [[ "$scenario" == curl-proxy-unavailable ]]; then code=000; result=5; fi
     if [[ -n "$headers" ]]; then
       printf 'HTTP/2 %s\r\n' "$code" > "$headers"
       case "$scenario" in
@@ -1721,6 +1724,7 @@ curl-forbidden 22 1
 curl-not-found 22 1
 curl-503 0 2
 curl-network 0 2
+curl-proxy-unavailable 8 3
 curl-partial 0 2
 curl-cancel 130 1
 curl-write-error 23 1
@@ -2597,6 +2601,65 @@ print('Upload deadlines: five stopped operations and three byte-verified recover
 PY
 }
 
+test_upload_preserves_interrupted_reads() (
+  local phase stop_status status receipt name='asset.tar.gz'
+  local payload="$TEMP_DIR/asset.tar.gz" calls="$TEMP_DIR/upload-read.calls"
+  export DSR_GH_TOKEN=fixture-token GH_MAX_RETRIES=1 GH_RETRY_DELAY=0
+  printf 'authenticated release payload\n' > "$payload"
+  receipt=$(jq -nc --arg name "$name" --argjson size "$(wc -c < "$payload")" \
+    '{id:42,name:$name,state:"uploaded",size:$size,digest:null}') || return 1
+  gh_api() {
+    printf 'GET\n' >> "$calls"
+    [[ "$phase" != inventory ]] || return "$stop_status"
+    jq -s '.' <<< "$receipt"
+  }
+  gh_download_release_asset() {
+    printf 'DOWNLOAD\n' >> "$calls"
+    return "$stop_status"
+  }
+  curl() { printf 'UNEXPECTED POST\n' >> "$calls"; return 91; }
+  for phase in inventory download; do
+    for stop_status in 2 5 124 125 129 130 131 137 143; do
+      : > "$calls"
+      status=0
+      gh_upload_asset_named 'https://uploads.github.com/repos/owner/repo/releases/9/assets' \
+        "$payload" "$name" > "$TEMP_DIR/upload-read.stdout" 2> "$TEMP_DIR/upload-read.stderr" || status=$?
+      assert_equals "$stop_status" "$status" "$phase interruption survives upload adapter" || return 1
+      [[ ! -s "$TEMP_DIR/upload-read.stdout" ]] || return 1
+      if [[ "$phase" == inventory ]]; then
+        cmp -s "$calls" <(printf 'GET\n') || return 1
+      else
+        cmp -s "$calls" <(printf 'GET\nDOWNLOAD\n') || return 1
+      fi
+    done
+  done
+)
+
+test_dual_upload_preserves_interruption() (
+  local status stop_status phase calls="$TEMP_DIR/dual-stop.calls"
+  printf 'release payload\n' > "$TEMP_DIR/payload.tar.gz"
+  gh_upload_asset_named() {
+    printf '%s\n' "$3" >> "$calls"
+    [[ "$phase" != compat || "$3" != tool-1.2.3-linux-amd64.tar.gz ]] || return 0
+    return "$stop_status"
+  }
+  for phase in versioned compat; do
+    for stop_status in 5 124 130; do
+      : > "$calls"
+      status=0
+      gh_upload_asset_dual 'https://uploads.github.com/repos/owner/repo/releases/9/assets' \
+        "$TEMP_DIR/payload.tar.gz" tool 1.2.3 linux amd64 tar.gz \
+        > "$TEMP_DIR/dual-stop.stdout" 2> "$TEMP_DIR/dual-stop.stderr" || status=$?
+      assert_equals 5 "$status" "dual upload interruption" || return 1
+      if [[ "$phase" == versioned ]]; then
+        cmp -s "$calls" <(printf 'tool-1.2.3-linux-amd64.tar.gz\n') || return 1
+      else
+        cmp -s "$calls" <(printf 'tool-1.2.3-linux-amd64.tar.gz\ntool-linux-amd64.tar.gz\n') || return 1
+      fi
+    done
+  done
+)
+
 test_upload_rejects_invalid_auth_deadlines() (
   local asset="$TEMP_DIR/asset" value status
   printf 'payload\n' > "$asset"
@@ -2614,6 +2677,8 @@ test_upload_rejects_invalid_auth_deadlines() (
 
 run_upload_deadline_regressions() {
   run_test upload_bounds_credentials_and_transfers test_upload_bounds_credentials_and_transfers
+  run_test upload_preserves_interrupted_reads test_upload_preserves_interrupted_reads
+  run_test dual_upload_preserves_interruption test_dual_upload_preserves_interruption
   run_test upload_rejects_invalid_auth_deadlines test_upload_rejects_invalid_auth_deadlines
   local scenario status posts downloads
   while read -r scenario status posts downloads; do
@@ -3262,6 +3327,8 @@ API_SCENARIOS
   run_test "upload_rejects_invalid_retry_configuration" test_upload_rejects_invalid_retry_configuration
   run_test "upload_rejects_source_mutation_during_snapshot" test_upload_rejects_source_mutation_during_snapshot
   run_test "upload_bounds_credentials_and_transfers" test_upload_bounds_credentials_and_transfers
+  run_test "upload_preserves_interrupted_reads" test_upload_preserves_interrupted_reads
+  run_test "dual_upload_preserves_interruption" test_dual_upload_preserves_interruption
   run_test "upload_rejects_invalid_auth_deadlines" test_upload_rejects_invalid_auth_deadlines
   local scenario expected_status expected_posts expected_downloads
   while read -r scenario expected_status expected_posts expected_downloads; do

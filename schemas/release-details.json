@@ -30,6 +30,22 @@
       "type": "string",
       "description": "Error explanation when publication admission or cleanup failed"
     },
+    "interruption": {
+      "type": "object",
+      "required": ["stage", "exit_code", "outcome"],
+      "properties": {
+        "stage": { "type": "string", "enum": ["create", "upload"] },
+        "exit_code": { "type": "integer", "minimum": 1, "maximum": 255 },
+        "outcome": { "const": "unconfirmed" }
+      },
+      "additionalProperties": false,
+      "description": "Stopped creation or upload adapter outcome; original status is retained while the release exits 5 and requires explicit reconciliation"
+    },
+    "creation_custody_dir": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Private directory retaining pending intent after interrupted creation; its existence does not establish a successful original POST response"
+    },
     "release_id": {
       "type": "integer",
       "description": "GitHub release ID"
@@ -65,7 +81,7 @@
     },
     "draft": {
       "type": "boolean",
-      "description": "Whether release is a draft"
+      "description": "Last observed draft visibility; an interrupted operation has not reverified the remote state"
     },
     "promotion_requested": {
       "type": "boolean",
