@@ -1559,6 +1559,7 @@ for arch, machine in (("amd64", 62), ("arm64", 183)):
     header = bytearray(64)
     header[:7] = b"\x7fELF\x02\x01\x01"
     struct.pack_into("<HHI", header, 16, 2, machine, 1)
+    struct.pack_into("<Q", header, 24, 0x1000)
     header.extend(("inert " + arch + " header fixture\n").encode())
     with tarfile.open(fixtures / primary(arch), "w:gz") as archive:
         member = tarfile.TarInfo("typedact")

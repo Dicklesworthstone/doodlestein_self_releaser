@@ -606,6 +606,39 @@ def members_for(platform):
             ('LICENSE', b'', 0o644, 'file')]
 
 
+# A completed worker receipt proves custody, not that its bytes are runnable.
+# Clear only the ELF entry point in genuine cross-compiled outputs and bind
+# fresh truthful receipts; recovery must still refuse the image, both raw and
+# archived. Cover the 32-bit address field independently of the 64-bit field.
+kind_controls = []
+for platform in ('linux/amd64', 'linux/arm64', 'linux/armv7', 'freebsd/amd64'):
+    base_state = issue_state if platform in ('linux/armv7', 'freebsd/amd64') else state
+    original = Path(base_state['target_statuses'][platform]['result']['artifact_path'])
+    content = bytearray(original.read_bytes())
+    width = 4 if content[4] == 1 else 8
+    content[24:24 + width] = b'\0' * width
+    filename = assets / ('no-entry-' + platform.replace('/', '-'))
+    filename.write_bytes(content)
+    filename.chmod(0o700)
+    kind_controls.append(('ELF without an entry point on ' + platform, platform, filename, base_state))
+if native_platform.startswith('linux/') and shutil.which('cc'):
+    library_source = work / 'library.c'
+    library_source.write_text('int library_function(void) { return 17; }\n')
+    library = assets / 'genuine-shared-library'
+    run(['cc', '-shared', '-fPIC', str(library_source), '-o', str(library)], timeout=60)
+    library.chmod(0o700)
+    kind_controls.append(('genuine ELF shared library', native_platform, library, state))
+for label, platform, filename, base_state in kind_controls:
+    before = snapshot_tree(filename.parent)
+    refuse(label + ' cannot become a raw recovered executable',
+           bind_primary(copy.deepcopy(base_state), platform, filename), code=7)
+    check(label + ' raw refusal preserves original producer custody', snapshot_tree(filename.parent) == before)
+    for format_name in ('tar.gz', 'tar.xz', 'zip'):
+        archive = write_archive(format_name, [('bin/demo', filename.read_bytes(), 0o755, 'file')])
+        refuse(label + ' cannot become a recovered ' + format_name + ' executable',
+               bind_primary(copy.deepcopy(base_state), platform, archive), code=7)
+
+
 packaged = copy.deepcopy(state)
 formats = {}
 for platform in platforms:

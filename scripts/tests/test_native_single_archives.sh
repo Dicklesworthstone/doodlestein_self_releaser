@@ -2,10 +2,11 @@
 # Real native archive-branch, Git-source and collection-receipt regressions.
 # No remote build execution, signing or GitHub publication is claimed.
 # --remote-retry-only exercises bare Windows output collection and packaging.
+# --executable-kind-only exercises executable admission and archive staging.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 3; }
-case "$#:${1:-}" in 0:|1:--remote-retry-only) ;; *) echo "Usage: $0 [--remote-retry-only]" >&2; exit 4 ;; esac
+case "$#:${1:-}" in 0:|1:--remote-retry-only|1:--executable-kind-only) ;; *) echo "Usage: $0 [--remote-retry-only|--executable-kind-only]" >&2; exit 4 ;; esac
 python3 - "$ROOT" "${1:-}" <<'PY'
 #!/usr/bin/env python3
 """Exercise the real native packaging block and its collection validators.
@@ -25,6 +26,7 @@ from pathlib import Path
 import platform
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -33,6 +35,7 @@ import zipfile
 
 root = Path(sys.argv[1])
 retry_only = sys.argv[2] == '--remote-retry-only'
+executable_kind_only = sys.argv[2] == '--executable-kind-only'
 module = Path(os.environ.get('DSR_TEST_ACT_RUNNER', str(root / 'src/act_runner.sh')))
 for tool in ('bash','git','jq','cc','tar','gzip','zip','unzip','xz'):
     if not shutil.which(tool):
@@ -100,6 +103,10 @@ def shell(function, *args, rc=0):
     return p.stdout.decode().rstrip('\n')
 
 def selection(label, value, target='linux/amd64', expected='app', rc=0, function='_act_workspace_binaries_for_target', purpose=None, inherited=False):
+    # The default lane owns the inventory/configuration matrix. Keep the
+    # independent executable-kind lane focused on collected image admission.
+    if executable_kind_only:
+        return
     file = work / ('selection-' + str(passed) + '.json')
     file.write_text(value if isinstance(value, str) else json.dumps(value))
     program = 'source "$1"; shift; "$@"'
@@ -409,12 +416,12 @@ if clang:
         command([clang,'--target=aarch64-linux-gnu','-fuse-ld=lld','-nostdlib','-Wl,-e,main',source_c,'-o',binary])
         fixtures['linux/arm64'] = binary
 
-def compile_pe64(input_source, output):
+def compile_pe64(input_source, output, shared=False):
     obj = output.with_suffix('.obj')
     if clang and shutil.which('lld-link'):
         command([clang, '--target=x86_64-pc-windows-msvc', '-c', input_source, '-o', obj])
         command([shutil.which('lld-link'), '/entry:main', '/subsystem:console', '/nodefaultlib',
-                 '/out:'+str(output), obj])
+                 *(['/dll'] if shared else []), '/out:'+str(output), obj])
         return True
     # GNU binutils can also compile/link this freestanding C fixture as PE64.
     # This uses real COFF objects and a real PE linker, never a fabricated header.
@@ -426,7 +433,8 @@ def compile_pe64(input_source, output):
             command([cc, '-c', '-ffreestanding', '-fno-asynchronous-unwind-tables',
                      '-fno-stack-protector', input_source, '-o', elf])
             command([copier, '--remove-section=.comment', '-O', 'pe-x86-64', elf, obj])
-            command([linker, '-m', 'i386pep', '-e', 'main', '--subsystem', 'console', '-o', output, obj])
+            command([linker, '-m', 'i386pep', '-e', 'main', '--subsystem', 'console',
+                     *(['--dll'] if shared else []), '-o', output, obj])
             return True
     return False
 
@@ -434,6 +442,24 @@ if 'windows/amd64' not in fixtures:
     binary = work / 'windows-amd64.exe'
     if compile_pe64(source_c, binary):
         fixtures['windows/amd64'] = binary
+if executable_kind_only and shutil.which('go'):
+    go_env = dict(os.environ, CGO_ENABLED='0', GOENV='off', GOTOOLCHAIN='local',
+                  GO111MODULE='off', GOWORK='off', GOPROXY='off', GOSUMDB='off', GOFLAGS='')
+    version = subprocess.run(['go', 'version'], env=go_env, capture_output=True, timeout=10)
+    if version.returncode == 0 and version.stdout.startswith(b'go version go'):
+        go_source = work / 'image-kind.go'
+        go_source.write_text('package main\nfunc main() {}\n')
+        # Go links genuine Mach-O programs without an Apple SDK. These are
+        # cross-compiled positive controls, not native macOS execution proof.
+        for arch in ('amd64', 'arm64'):
+            target = 'darwin/' + arch
+            if target not in fixtures:
+                binary = work / ('go-darwin-' + arch)
+                print('Compiling genuine Mach-O executable: ' + target, flush=True)
+                command(['go', 'build', '-trimpath', '-o', binary, go_source],
+                        env=dict(go_env, GOOS='darwin', GOARCH=arch))
+                binary.chmod(0o700)
+                fixtures[target] = binary
 for target in ('linux/amd64','linux/arm64','darwin/amd64','darwin/arm64','windows/amd64','windows/arm64'):
     if target not in fixtures:
         skipped += 1
@@ -693,9 +719,142 @@ def remote_retry_regressions():
     check('retry and refusal cases never modify compiler-produced input executables',
           before=={str(path):metadata_snapshot(path) for path in (primary,helper)})
 
-remote_retry_regressions()
+def executable_kind_regressions():
+    global skipped
+    samples = [('host executable', local_binary, host, True)]
+    relocatable = work / 'relocatable-object'
+    command([cc, '-c', source_c, '-o', relocatable])
+    relocatable.chmod(0o700)
+    samples.append(('genuine relocatable object', relocatable, host, False))
+    library = work / 'shared-library'
+    command([cc, '-dynamiclib' if host.startswith('darwin/') else '-shared',
+             '-fPIC', source_c, '-o', library])
+    library.chmod(0o700)
+    samples.append(('genuine shared library', library, host, False))
+    if host.startswith('linux/'):
+        for label, flags, expected_kind in (
+            ('fixed-address ELF executable', ['-no-pie'], 2),
+            ('dynamic PIE executable', ['-fPIE', '-pie'], 3),
+            ('static PIE executable', ['-static-pie'], 3),
+        ):
+            executable = work / label.replace(' ', '-')
+            build = subprocess.run([cc, *flags, str(source_c), '-o', str(executable)],
+                                   capture_output=True, timeout=60)
+            if build.returncode and label == 'static PIE executable':
+                skipped += 1
+                print('SKIP genuine static PIE: compiler/static runtime unavailable: ' +
+                      (build.stderr.decode(errors='replace').splitlines() or ['linker returned no diagnostic'])[0], flush=True)
+                continue
+            check(label + ' genuinely links with the requested ELF type',
+                  build.returncode == 0 and struct.unpack_from('<H', executable.read_bytes(), 16)[0] == expected_kind)
+            check(label + ' runs before collection',subprocess.run([str(executable)],timeout=10).returncode == 17)
+            samples.append((label, executable, host, True))
+        for label, offset, fmt, value in (
+            ('ELF core image', 16, '<H', 4),
+            ('ELF without an entry point', 24, '<Q', 0),
+        ):
+            changed = work / label.replace(' ', '-')
+            content = bytearray(local_binary.read_bytes())
+            struct.pack_into(fmt, content, offset, value)
+            changed.write_bytes(content)
+            changed.chmod(0o700)
+            samples.append((label, changed, host, False))
+    if 'windows/amd64' in fixtures:
+        executable = fixtures['windows/amd64']
+        samples.append(('genuine PE executable', executable, 'windows/amd64', True))
+        library = work / 'genuine-library.dll'
+        check('DLL control is produced by a real PE linker',compile_pe64(source_c, library, shared=True))
+        samples.append(('genuine PE DLL', library, 'windows/amd64', False))
+        content = bytearray(executable.read_bytes())
+        pe_offset = struct.unpack_from('<I', content, 60)[0]
+        flags = struct.unpack_from('<H', content, pe_offset + 22)[0]
+        struct.pack_into('<H', content, pe_offset + 22, flags & ~2)
+        unlinked = work / 'PE-without-executable-flag.exe'
+        unlinked.write_bytes(content)
+        samples.append(('PE without executable flag', unlinked, 'windows/amd64', False))
+    # Format-only mutations are explicit: they exercise both supported Mach-O
+    # CPU encodings even when this runner has no Apple linker. They are never
+    # executed and do not count as native macOS build evidence.
+    for target, cpu in (('darwin/amd64', 0x1000007), ('darwin/arm64', 0x100000c)):
+        if target in fixtures:
+            original = fixtures[target].read_bytes()
+            samples.append(('genuine '+target+' executable', fixtures[target], target, True))
+        else:
+            original = struct.pack('<IIIIIIII', 0xfeedfacf, cpu, 0, 2, 0, 0, 0, 0)
+        for kind, label in ((1, 'relocatable object'), (6, 'dynamic library'), (8, 'bundle')):
+            changed = work / (target.replace('/', '-')+'-'+label.replace(' ', '-'))
+            content = bytearray(original)
+            struct.pack_into('<I', content, 12, kind)
+            changed.write_bytes(content)
+            changed.chmod(0o700)
+            samples.append((target+' format-only '+label, changed, target, False))
+    for index, (label, original, target, accepted) in enumerate(samples):
+        case = work / ('executable-kind-'+str(index))
+        collected = case / 'collected'
+        collected.mkdir(parents=True, mode=0o700)
+        selected_name = 'app.exe' if target.startswith('windows/') else 'app'
+        source_before = metadata_snapshot(original)
+        receipt = json.loads(shell('_act_collect_stream_exclusive',collected/selected_name,
+                                   '600' if target.startswith('windows/') else '700',
+                                   '_act_stream_local_file',original))
+        check(label+' retains genuine byte/inode custody before admission',
+              receipt['sha256']==sha(original) and receipt['size_bytes']==original.stat().st_size and
+              Path(receipt['path']).stat().st_ino!=original.stat().st_ino)
+        shell('_act_accept_collected_binary',receipt['path'],target,'go',rc=0 if accepted else 1)
+        shell('_act_validate_additional_artifact',receipt['path'],target,'binary',
+              receipt['sha256'],receipt['size_bytes'],receipt['identity'],rc=0 if accepted else 4)
+        for fmt in ('raw','tar.gz','tar.xz','zip'):
+            config_dir = case / fmt / 'config'
+            (config_dir/'repos.d').mkdir(parents=True)
+            asset = 'app-'+target.replace('/', '-')+'.'+('tar.gz' if fmt=='raw' else fmt)
+            contract = {'exact_primary_assets':{target:asset}}
+            config = {'binary_name':'app','targets':[target],'release_contract':contract}
+            write(config_dir/'repos.d/app.yaml',config)
+            selected = receipt
+            if fmt != 'raw':
+                function = {'tar.gz':'_act_stream_workspace_tar_gz',
+                            'tar.xz':'_act_stream_workspace_tar_xz','zip':'_act_stream_workspace_zip'}[fmt]
+                selected = json.loads(shell('_act_collect_stream_exclusive',case/fmt/asset,'600',
+                                            function,collected,selected_name))
+                shell('_act_validate_target_archive',selected['path'],fmt,selected_name,target,
+                      rc=0 if accepted else 4)
+            result = {'artifact_path':selected['path'],'artifact_paths':[selected['path']],
+                      'collected_sha256':selected['sha256'],'collected_size_bytes':selected['size_bytes'],
+                      'collected_identity':selected['identity']}
+            environment = dict(os.environ,DSR_CONFIG_DIR=str(config_dir),ACT_REPOS_DIR=str(config_dir/'repos.d'),
+                               ACT_ARTIFACTS_DIR=str(case/fmt/'artifacts'))
+            program = ('source "$1" || exit $?; '
+                       'source "$(dirname "$1")/config.sh" || exit $?; '
+                       'source "$(dirname "$1")/packaging.sh" || exit $?; '
+                       'shift; _act_stage_contract_primary "$@"')
+            process = subprocess.run(['bash','-c',program,'_',str(module),'app','v1.2.3','image-kind',
+                                      target,json.dumps(result),json.dumps(contract)],
+                                     env=environment,capture_output=True,timeout=60)
+            (case/fmt/'stage.stdout').write_bytes(process.stdout)
+            (case/fmt/'stage.stderr').write_bytes(process.stderr)
+            check(label+' '+fmt+' contract admission '+('succeeds' if accepted else 'refuses'),
+                  process.returncode==(0 if accepted else 4) and (accepted or process.stdout==b''))
+            if accepted:
+                staged = json.loads(process.stdout)
+                archive = Path(staged['artifact_path'])
+                archive_format = 'tar.gz' if fmt=='raw' else fmt
+                check(label+' '+fmt+' preserves complete executable bytes in the admitted archive',
+                      read_archive(archive,archive_format)[selected_name][0]==original.read_bytes() and
+                      staged['staged_sha256']==sha(archive))
+            else:
+                check(label+' '+fmt+' creates no publishable artifact directory',
+                      not Path(environment['ACT_ARTIFACTS_DIR']).exists())
+        check(label+' validation leaves producer bytes and permissions unchanged',
+              metadata_snapshot(original)==source_before)
+
+if not executable_kind_only:
+    remote_retry_regressions()
 if retry_only:
     print(f'Native Windows collection retries: {passed} passed, {skipped} unavailable-toolchain skips; fixtures: {work}')
+    raise SystemExit(0)
+if executable_kind_only:
+    executable_kind_regressions()
+    print(f'Executable admission: {passed} assertions passed; {skipped} unavailable-fixture skips; fixtures: {work}')
     raise SystemExit(0)
 
 for target,binary in fixtures.items():

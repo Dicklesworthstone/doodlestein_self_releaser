@@ -198,6 +198,9 @@ def binary_platform(data):
         order = "<" if data[5] == 1 else ">"
         kind, machine = struct.unpack_from(order + "HH", data, 16)
         need(kind in (2, 3), "ELF payload is not an executable")
+        need(data[4] in (1, 2), "invalid ELF address class")
+        entry = struct.unpack_from(order + ("I" if data[4] == 1 else "Q"), data, 24)[0]
+        need(entry != 0, "ELF payload has no executable entry point")
         architecture = {(1, 3): "386", (1, 40): "armv7", (2, 62): "amd64", (2, 183): "arm64"}.get((data[4], machine))
         # FreeBSD and Linux both use ELF. Preserve the OS identity instead of
         # admitting FreeBSD bytes as a Linux payload (or the reverse).

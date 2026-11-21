@@ -1109,6 +1109,7 @@ raw.mkdir()
 header = bytearray(64)
 header[:7] = b'\x7fELF\x02\x01\x01'
 struct.pack_into('<HHI', header, 16, 2, 62, 1)
+struct.pack_into('<Q', header, 24, 0x1000)
 header.extend(b'inert format-admission fixture; never executed\n')
 primary_name = 'inventory-tool-1.0.0-linux-amd64.tar.gz'
 primary = io.BytesIO()
@@ -4349,12 +4350,14 @@ else:
         content = bytearray(64)
         content[:7] = b'\x7fELF\x02\x01\x01'
         struct.pack_into('<HH', content, 16, 2, 62)
+        struct.pack_into('<Q', content, 24, 0x1000)
     else:
         content = bytearray(96)
         content[:2] = b'MZ'
         struct.pack_into('<I', content, 60, 64)
         content[64:68] = b'PE\x00\x00'
         struct.pack_into('<H', content, 68, 0x8664)
+        struct.pack_into('<H', content, 86, 0x0002)
         struct.pack_into('<H', content, 88, 0x020b)
     content += ('controlled header fixture: ' + triple + '\n').encode()
     with path.open('xb') as stream:
@@ -7365,7 +7368,8 @@ write_minimal_target_binary() {
             machine='\x3e\x00'
             [[ "$target" == "linux/arm64" ]] && machine='\xb7\x00'
             printf '\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00%b' "$machine" > "$path"
-            printf '\x00%.0s' {1..44} >> "$path"
+            printf '\x01\x00\x00\x00\x00\x10\x00\x00\x00\x00\x00\x00' >> "$path"
+            printf '\x00%.0s' {1..32} >> "$path"
             chmod +x "$path"
             ;;
         darwin/amd64|darwin/arm64)
@@ -7381,8 +7385,8 @@ write_minimal_target_binary() {
             printf 'MZ' > "$path"
             printf '\x00%.0s' {1..58} >> "$path"
             printf '\x40\x00\x00\x00PE\x00\x00%b' "$machine" >> "$path"
-            printf '\x00%.0s' {1..18} >> "$path"
-            printf '\x0b\x02' >> "$path"
+            printf '\x00%.0s' {1..16} >> "$path"
+            printf '\x02\x00\x0b\x02' >> "$path"
             ;;
         *)
             return 4

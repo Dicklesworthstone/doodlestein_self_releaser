@@ -3091,19 +3091,19 @@ write_mock_artifact() {
     fi
     case "$kind" in
         macho-arm64)
-            { printf '\317\372\355\376\014\000\000\001'; head -c 24 /dev/zero; } > "$dest"
+            { printf '\317\372\355\376\014\000\000\001'; head -c 4 /dev/zero; printf '\002\000\000\000'; head -c 16 /dev/zero; } > "$dest"
             ;;
         macho-amd64)
-            { printf '\317\372\355\376\007\000\000\001'; head -c 24 /dev/zero; } > "$dest"
+            { printf '\317\372\355\376\007\000\000\001'; head -c 4 /dev/zero; printf '\002\000\000\000'; head -c 16 /dev/zero; } > "$dest"
             ;;
         elf-amd64)
-            { printf '\177ELF\002\001'; head -c 12 /dev/zero; printf '\076\000'; head -c 44 /dev/zero; } > "$dest"
+            { printf '\177ELF\002\001\001'; head -c 9 /dev/zero; printf '\002\000\076\000\001\000\000\000\000\020\000\000\000\000\000\000'; head -c 32 /dev/zero; } > "$dest"
             ;;
         elf-arm64)
-            { printf '\177ELF\002\001'; head -c 12 /dev/zero; printf '\267\000'; head -c 44 /dev/zero; } > "$dest"
+            { printf '\177ELF\002\001\001'; head -c 9 /dev/zero; printf '\002\000\267\000\001\000\000\000\000\020\000\000\000\000\000\000'; head -c 32 /dev/zero; } > "$dest"
             ;;
         pe-amd64)
-            { printf 'MZ'; head -c 58 /dev/zero; printf '\100\000\000\000PE\000\000\144\206'; head -c 18 /dev/zero; printf '\013\002'; head -c 6 /dev/zero; } > "$dest"
+            { printf 'MZ'; head -c 58 /dev/zero; printf '\100\000\000\000PE\000\000\144\206'; head -c 16 /dev/zero; printf '\002\000\013\002'; head -c 6 /dev/zero; } > "$dest"
             ;;
         *)
             : > "$dest"
@@ -3674,7 +3674,7 @@ test_unix_rust_isolation_executes_outside_operator_config() {
     # This checks Cargo configuration isolation on the executing host. The
     # separately synthetic ELF collection fixture does not require installing
     # a Linux standard library on a Mac merely to check a two-function library.
-    MOCK_BUILD_CMD='git diff-index --quiet HEAD -- && cargo check --offline --quiet --target "$(rustc -vV | sed -n "s/^host: //p")" && if cargo operator-alias >/dev/null 2>&1; then exit 91; fi && printf "%s\n%s\n" "$PWD" "$CARGO_HOME" > "$DSR_PROBE_OUTPUT" && mkdir -p "$CARGO_TARGET_DIR/$CARGO_BUILD_TARGET/release" && { printf "\177ELF\002\001"; head -c 12 /dev/zero; printf "\076\000"; head -c 44 /dev/zero; } > "$CARGO_TARGET_DIR/$CARGO_BUILD_TARGET/release/tool" && chmod 755 "$CARGO_TARGET_DIR/$CARGO_BUILD_TARGET/release/tool"'
+    MOCK_BUILD_CMD='git diff-index --quiet HEAD -- && cargo check --offline --quiet --target "$(rustc -vV | sed -n "s/^host: //p")" && if cargo operator-alias >/dev/null 2>&1; then exit 91; fi && printf "%s\n%s\n" "$PWD" "$CARGO_HOME" > "$DSR_PROBE_OUTPUT" && mkdir -p "$CARGO_TARGET_DIR/$CARGO_BUILD_TARGET/release" && { printf "\177ELF\002\001\001"; head -c 9 /dev/zero; printf "\002\000\076\000\001\000\000\000\000\020\000\000\000\000\000\000"; head -c 32 /dev/zero; } > "$CARGO_TARGET_DIR/$CARGO_BUILD_TARGET/release/tool" && chmod 755 "$CARGO_TARGET_DIR/$CARGO_BUILD_TARGET/release/tool"'
     MOCK_PLATFORM_ENV="CARGO_HOME=$operator_home/.cargo
 CARGO_TARGET_DIR=relative-operator-target
 DSR_PROBE_OUTPUT=$probe_output"

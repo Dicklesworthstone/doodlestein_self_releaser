@@ -1374,8 +1374,8 @@ _act_validate_target_binary_reader() {
     local reader="$5"
     shift 5
     local reader_args=("$@")
-    local header machine pe_offset_hex pe_offset optional_magic
-    local elf_class elf_machine elf_minimum elf_osabi pe_machine pe_magic
+    local header machine pe_offset_hex pe_offset optional_magic pe_characteristics
+    local elf_class elf_machine elf_minimum elf_osabi elf_kind elf_entry pe_machine pe_magic
 
     if [[ ! "$size" =~ ^[1-9][0-9]*$ ]]; then
         _log_error "Target primary has no readable bytes: $label"
@@ -1392,17 +1392,29 @@ _act_validate_target_binary_reader() {
                 linux/armv7) elf_class=01 elf_minimum=52 elf_machine=2800 ;;
             esac
             if ((size < elf_minimum)) || \
-               ! header=$("$reader" "${reader_args[@]}" 0 20); then
+               ! header=$("$reader" "${reader_args[@]}" 0 32); then
                 _log_error "Target primary is not a complete ELF header for $target: $label"
                 return 4
             fi
             machine="${header:36:4}"
             elf_osabi="${header:14:2}"
+            elf_kind="${header:32:4}"
+            elf_entry="${header:48:16}"
+            [[ "$elf_class" != 01 ]] || elf_entry="${header:48:8}"
             if [[ "${header:0:8}" != "7f454c46" || "${header:8:2}" != "$elf_class" || \
                   "${header:10:2}" != "01" || "$machine" != "$elf_machine" ]] || \
                { [[ "$target" == freebsd/* ]] && [[ "$elf_osabi" != 09 ]]; } || \
                { [[ "$target" == linux/* ]] && [[ "$elf_osabi" != 00 && "$elf_osabi" != 03 ]]; }; then
                 _log_error "Target primary ELF format/OS/architecture does not match $target: $label"
+                return 4
+            fi
+            # ET_DYN also represents dynamic and static PIE executables. A
+            # shared library normally has no entry point; zero explicitly
+            # denotes that absence in ELF. Keep the address as hex so valid
+            # 64-bit entries never depend on signed shell arithmetic.
+            if [[ "$elf_kind" != 0200 && "$elf_kind" != 0300 ]] ||
+               [[ ! "$elf_entry" == *[1-9a-f]* ]]; then
+                _log_error "Target primary ELF is not an executable image with an entry point: $label"
                 return 4
             fi
             if [[ "$executable" != "true" ]]; then
@@ -1412,7 +1424,7 @@ _act_validate_target_binary_reader() {
             ;;
         darwin/amd64|darwin/arm64)
             if ((size < 32)) || \
-               ! header=$("$reader" "${reader_args[@]}" 0 8); then
+               ! header=$("$reader" "${reader_args[@]}" 0 16); then
                 _log_error "Target primary is not a complete Mach-O 64 header: $label"
                 return 4
             fi
@@ -1421,6 +1433,12 @@ _act_validate_target_binary_reader() {
                { [[ "$target" == "darwin/amd64" ]] && [[ "$machine" != "07000001" ]]; } || \
                { [[ "$target" == "darwin/arm64" ]] && [[ "$machine" != "0c000001" ]]; }; then
                 _log_error "Target primary Mach-O format/architecture does not match $target: $label"
+                return 4
+            fi
+            # MH_OBJECT, MH_DYLIB and MH_BUNDLE can have the same CPU and
+            # executable permission bits; only MH_EXECUTE is a program.
+            if [[ "${header:24:8}" != 02000000 ]]; then
+                _log_error "Target primary Mach-O is not an executable image: $label"
                 return 4
             fi
             if [[ "$executable" != "true" ]]; then
@@ -1443,11 +1461,20 @@ _act_validate_target_binary_reader() {
             fi
             pe_offset=$((0x${pe_offset_hex:6:2}${pe_offset_hex:4:2}${pe_offset_hex:2:2}${pe_offset_hex:0:2}))
             if ((pe_offset < 64 || pe_offset + 26 > size)) || \
-               [[ "$("$reader" "${reader_args[@]}" "$pe_offset" 4 2>/dev/null || true)" != "50450000" ]] || \
-               ! machine=$("$reader" "${reader_args[@]}" "$((pe_offset + 4))" 2) || \
-               ! optional_magic=$("$reader" "${reader_args[@]}" "$((pe_offset + 24))" 2) || \
-               [[ "$optional_magic" != "$pe_magic" || "$machine" != "$pe_machine" ]]; then
+               ! header=$("$reader" "${reader_args[@]}" "$pe_offset" 26) || \
+               [[ "${header:0:8}" != 50450000 ]]; then
+                _log_error "Target primary PE header is truncated or invalid: $label"
+                return 4
+            fi
+            machine="${header:8:4}"
+            optional_magic="${header:48:4}"
+            pe_characteristics=$((0x${header:46:2}${header:44:2}))
+            if [[ "$optional_magic" != "$pe_magic" || "$machine" != "$pe_machine" ]]; then
                 _log_error "Target primary PE format/architecture does not match $target: $label"
+                return 4
+            fi
+            if (( (pe_characteristics & 0x0002) == 0 || (pe_characteristics & 0x2000) != 0 )); then
+                _log_error "Target primary PE is not an executable image or is a DLL: $label"
                 return 4
             fi
             ;;
