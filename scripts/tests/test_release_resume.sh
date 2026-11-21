@@ -75,6 +75,11 @@ _release_contract_create_nonce() { printf '%064d\n' 1; }
 _release_contract_preflight() { printf 'STRICT-PREFLIGHT\n' >> "$CALLS"; return 4; }
 gh_resolve_tag_sha() {
     printf 'TAG-RESOLVE %s %s\n' "$1" "$2" >> "$CALLS"
+    if [[ "${LATE_STOP_PHASE:-}" == source && "${LATE_STOP_STATUS:-0}" != 0 && ! -e "$CASE/late-stop" ]] &&
+       late_fixture_uploads_verified; then
+        late_fixture_stop verification "$LATE_STOP_STATUS"
+        return $?
+    fi
     if [[ -n "${STAGED_SOURCE_SHA:-}" ]]; then
         case "$STAGED_REMOTE_MODE" in
             unavailable) return 8 ;;
@@ -139,6 +144,10 @@ setup() {
     CREATE_FAIL=true FINAL_DRIFT=false VISIBILITY_DRIFT=false FAIL_NAME=""
     CREATE_STOP_STATUS=0
     LOST_CREATE_RESPONSE=false PUBLISH_FAIL=false LOST_PUBLISH_RESPONSE=false
+    PUBLISH_STOP_STATUS=0 PUBLISH_STOP_COMMITTED=false
+    RESTORE_STOP_STATUS=0 RESTORE_STOP_COMMITTED=false
+    LATE_STOP_PHASE="" LATE_STOP_STATUS=0 LATE_EXPECT_UPLOADS=1 LATE_DIGESTLESS=false
+    PUBLIC_VERIFY_UNAVAILABLE=false
     PUBLISH_ASSET_DRIFT=false PUBLISH_METADATA_DRIFT=false UPLOAD_METADATA_DRIFT=false
     UPLOAD_DESTINATION_DRIFT=false PUBLISH_DESTINATION_DRIFT=false
     EXTRA_ASSET=false DROP_SIDECAR="" CREATE_INTENT_DRIFT=false
@@ -160,6 +169,21 @@ remote_put() {
                digest:(if $digest then "sha256:"+$sha else null end)}]' \
         "$CASE/inventory.json" > "$CASE/inventory.next" && \
         mv "$CASE/inventory.next" "$CASE/inventory.json"
+}
+
+# Faults begin only after real upload verification persisted its receipt.
+# This keeps the interrupted read in the finalization phase rather than the
+# shared uploader's earlier inventory lookup.
+late_fixture_uploads_verified() {
+    local receipt="$DSR_STATE_DIR/releases/tool-v1.2.3-upload.json"
+    [[ -f "$receipt" ]] && jq -e --argjson count "$LATE_EXPECT_UPLOADS" \
+        '(.uploaded|length) >= $count' "$receipt" >/dev/null
+}
+
+late_fixture_stop() {
+    printf 'LATE-STOP %s %s\n' "$1" "$2" >> "$CALLS"
+    : > "$CASE/late-stop"
+    return "$2"
 }
 
 journal() {
@@ -245,9 +269,17 @@ gh_api() {
         if [[ "$data" == '{"draft":false}' ]]; then
             printf 'PUBLISH\n' >> "$CALLS"
             $PUBLISH_FAIL && return 8
+            if [[ "$PUBLISH_STOP_STATUS" != 0 ]] && ! $PUBLISH_STOP_COMMITTED; then
+                late_fixture_stop publish "$PUBLISH_STOP_STATUS"
+                return $?
+            fi
         else
             [[ "$data" == '{"draft":true}' ]] || return 8
             printf 'RESTORE-DRAFT\n' >> "$CALLS"
+            if [[ "$RESTORE_STOP_STATUS" != 0 ]] && ! $RESTORE_STOP_COMMITTED; then
+                late_fixture_stop restore "$RESTORE_STOP_STATUS"
+                return $?
+            fi
         fi
         jq --argjson patch "$data" '. + $patch |
             .html_url=(if .draft then "https://github.com/owner/repo/releases/tag/untagged-fedcba9876543210"
@@ -268,10 +300,45 @@ gh_api() {
                     "$CASE/release.json" > "$CASE/release.next" &&
                     mv "$CASE/release.next" "$CASE/release.json" || return 8
             fi
+            if [[ "$PUBLISH_STOP_STATUS" != 0 ]]; then
+                late_fixture_stop publish "$PUBLISH_STOP_STATUS"
+                return $?
+            fi
             $LOST_PUBLISH_RESPONSE && return 8
+        elif [[ "$RESTORE_STOP_STATUS" != 0 ]]; then
+            late_fixture_stop restore "$RESTORE_STOP_STATUS"
+            return $?
         fi
         cat "$CASE/release.json"
         return 0
+    fi
+    if [[ "$method" == GET ]] && { [[ "$LATE_STOP_STATUS" != 0 ]] || $PUBLIC_VERIFY_UNAVAILABLE; } &&
+       late_fixture_uploads_verified; then
+        local visible_draft stop_read=false stop_stage=verification
+        visible_draft=$(jq -r '.draft' "$CASE/release.json") || return 4
+        if $PUBLIC_VERIFY_UNAVAILABLE && [[ "$visible_draft" == false &&
+           "$endpoint" == repos/owner/repo/releases/9 && ! -e "$CASE/public-verify-unavailable" ]]; then
+            : > "$CASE/public-verify-unavailable"
+            printf 'PUBLIC-VERIFY-UNAVAILABLE\n' >> "$CALLS"
+            return 8
+        fi
+        if [[ "$LATE_STOP_STATUS" != 0 && ! -e "$CASE/late-stop" ]]; then
+            case "$LATE_STOP_PHASE" in
+                metadata) [[ "$endpoint" == repos/owner/repo/releases/9 && "$visible_draft" == true ]] && stop_read=true ;;
+                inventory) [[ "$endpoint" == repos/owner/repo/releases/9/assets\?* && "$visible_draft" == true ]] && stop_read=true ;;
+                public-metadata) [[ "$endpoint" == repos/owner/repo/releases/9 && "$visible_draft" == false ]] && stop_read=true ;;
+                public-inventory) [[ "$endpoint" == repos/owner/repo/releases/9/assets\?* && "$visible_draft" == false ]] && stop_read=true ;;
+                existing-recheck) [[ "$endpoint" == repos/owner/repo/releases/9/assets\?* ]] && stop_read=true ;;
+                restore-read)
+                    if [[ "$endpoint" == repos/owner/repo/releases/9 && -e "$CASE/public-verify-unavailable" ]]; then
+                        stop_read=true stop_stage=restore
+                    fi ;;
+            esac
+            if $stop_read; then
+                late_fixture_stop "$stop_stage" "$LATE_STOP_STATUS"
+                return $?
+            fi
+        fi
     fi
     case "$endpoint" in
         repos/*/dispatches)
@@ -308,9 +375,10 @@ gh_api() {
                 jq 'map(.digest="sha256:"+("0"*64))' "$CASE/inventory.json" > "$CASE/inventory.next"
                 mv "$CASE/inventory.next" "$CASE/inventory.json"
             fi
-            jq --argjson page "$page" --argjson padding "$API_ASSET_LABEL_SIZE" '
+            jq --argjson page "$page" --argjson padding "$API_ASSET_LABEL_SIZE" --argjson digestless "$LATE_DIGESTLESS" '
                 .[(($page-1)*100):($page*100)] |
-                map(if $padding > 0 then . + {label:("x" * $padding)} else . end)
+                map((if $padding > 0 then . + {label:("x" * $padding)} else . end) |
+                    if $digestless then .digest=null else . end)
             ' "$CASE/inventory.json"
             ;;
         repos/owner/repo/releases/tags/v1.2.3|repos/owner/repo/releases/9)
@@ -332,6 +400,11 @@ gh_api() {
 
 gh_download_release_asset() {
     printf 'DOWNLOAD %s %s\n' "$1" "$2" >> "$CALLS"
+    if [[ "$LATE_STOP_PHASE" == download && "$LATE_STOP_STATUS" != 0 && ! -e "$CASE/late-stop" ]] &&
+       late_fixture_uploads_verified; then
+        late_fixture_stop verification "$LATE_STOP_STATUS"
+        return $?
+    fi
     [[ ! -e "$3" ]] && cp "$CASE/remote/$2" "$3"
 }
 
@@ -2656,6 +2729,178 @@ test_staged_cancelled_creation_preserves_uncertain_custody() {
     done
 }
 
+late_interruption_statuses() {
+    case "${DSR_TEST_RELEASE_INTERRUPTION_STATUS:-all}" in
+        all) printf '%s\n' 5 124 130 ;;
+        5|124|130) printf '%s\n' "$DSR_TEST_RELEASE_INTERRUPTION_STATUS" ;;
+        *) printf 'Unknown finalization interruption status selector\n' >&2; return 1 ;;
+    esac
+}
+
+late_assert_interrupted() {
+    local stage="$1" stopped_status="$2" last_draft="$3"
+    [[ $STATUS -eq 5 && "$(tail -n 1 "$CALLS")" == "LATE-STOP $stage $stopped_status" ]] || return 1
+    ! grep -Eq '^DISPATCH|^UPGRADE' "$CALLS" || return 1
+    jq -e --arg stage "$stage" --argjson rc "$stopped_status" --argjson draft "$last_draft" '
+        .status=="error" and .exit_code==5 and .details.verification=="interrupted" and
+        .details.interruption=={stage:$stage,exit_code:$rc,outcome:"unconfirmed"} and
+        .details.draft==$draft and .details.dispatch.status=="skipped" and
+        (.details.assets_uploaded|length)>0' "$CASE/stdout" >/dev/null
+}
+
+late_capture_custody() {
+    LATE_INTENT=$(jq -r '.details.staging_receipt' "$CASE/stdout") || return 1
+    local -a responses=("${LATE_INTENT%/*}"/dsr-api-response.????????)
+    [[ -f "$LATE_INTENT" && ${#responses[@]} -eq 1 && -f "${responses[0]}" ]] || return 1
+    LATE_RESPONSE="${responses[0]}"
+    jq -e '.draft==true and .assets==[]' "$LATE_RESPONSE" >/dev/null || return 1
+    cp "$LATE_INTENT" "$CASE/late-original-intent.json" &&
+        cp "$LATE_RESPONSE" "$CASE/late-original-response.json" || return 1
+    LATE_INTENT_INODE=$(stat -c '%d:%i' "$LATE_INTENT") || return 1
+    LATE_RESPONSE_INODE=$(stat -c '%d:%i' "$LATE_RESPONSE") || return 1
+}
+
+late_assert_custody_unchanged() {
+    cmp -s "$LATE_INTENT" "$CASE/late-original-intent.json" &&
+        cmp -s "$LATE_RESPONSE" "$CASE/late-original-response.json" &&
+        [[ "$(stat -c '%d:%i' "$LATE_INTENT")" == "$LATE_INTENT_INODE" &&
+           "$(stat -c '%d:%i' "$LATE_RESPONSE")" == "$LATE_RESPONSE_INODE" ]]
+}
+
+late_assert_public_resume() {
+    local expected_publish="$1"
+    [[ $STATUS -eq 0 ]] && ! grep -Eq '^CREATE|^POST |^RESTORE-DRAFT' "$CALLS" || return 1
+    if [[ "$expected_publish" == true ]]; then
+        [[ $(grep -c '^PUBLISH$' "$CALLS") -eq 1 ]] || return 1
+    else
+        ! grep -q '^PUBLISH$' "$CALLS" || return 1
+    fi
+    grep -Fxq DISPATCH "$CALLS" && grep -Fxq UPGRADE "$CALLS" &&
+        jq -e '.details.draft==false and .details.verification=="ok" and
+            .details.dispatch.status=="completed"' "$CASE/stdout" >/dev/null &&
+        jq -e '.draft==false' "$CASE/release.json" >/dev/null && late_assert_custody_unchanged
+}
+
+test_staged_interrupted_publish_preserves_uncertainty_and_resumes() {
+    local stop_status committed statuses
+    statuses=$(late_interruption_statuses) || return 1
+    while IFS= read -r stop_status; do
+        for committed in false true; do
+            setup "publish_stop_${stop_status}_${committed}"
+            CREATE_FAIL=false PUBLISH_STOP_STATUS="$stop_status" PUBLISH_STOP_COMMITTED="$committed"
+            run_release --verify-upgrade
+            late_assert_interrupted publish "$stop_status" true || return 1
+            [[ $(grep -c '^PUBLISH$' "$CALLS") -eq 1 ]] && ! grep -q '^RESTORE-DRAFT' "$CALLS" || return 1
+            jq -e --argjson committed "$committed" '.draft==($committed|not)' "$CASE/release.json" >/dev/null || return 1
+            late_capture_custody || return 1
+            PUBLISH_STOP_STATUS=0
+            : > "$CALLS"
+            run_release --resume --verify-upgrade
+            late_assert_public_resume "$([[ "$committed" == true ]] && echo false || echo true)" || return 1
+        done
+    done <<< "$statuses"
+}
+
+test_staged_interrupted_final_verification_stops_and_resumes() {
+    local phase last_draft expected_publish
+    for phase in metadata inventory download source public-metadata public-inventory; do
+        if [[ "$phase" == source ]]; then
+            manifest_source_setup "verify_stop_$phase" || return 1
+            LATE_EXPECT_UPLOADS=4
+        else
+            setup "verify_stop_$phase"
+            CREATE_FAIL=false
+        fi
+        LATE_STOP_PHASE="$phase" LATE_STOP_STATUS=130
+        [[ "$phase" != download ]] || LATE_DIGESTLESS=true
+        run_release --verify-upgrade
+        last_draft=true expected_publish=true
+        if [[ "$phase" == public-* ]]; then expected_publish=false; fi
+        # A successful metadata GET precedes the stopped public inventory
+        # read; retain that visibility without accepting publication success.
+        [[ "$phase" != public-inventory ]] || last_draft=false
+        late_assert_interrupted verification 130 "$last_draft" || return 1
+        ! grep -q '^RESTORE-DRAFT' "$CALLS" || return 1
+        if [[ "$phase" != public-* ]]; then ! grep -q '^PUBLISH$' "$CALLS" || return 1; fi
+        late_capture_custody || return 1
+        LATE_STOP_STATUS=0
+        : > "$CALLS"
+        run_release --resume --verify-upgrade
+        late_assert_public_resume "$expected_publish" || return 1
+    done
+}
+
+test_existing_public_release_interrupted_recheck_stops() {
+    setup existing_verify_stop
+    printf 'second payload\n' > "$CASE/artifacts/second.bin"
+    LATE_EXPECT_UPLOADS=2 LATE_STOP_PHASE=existing-recheck LATE_STOP_STATUS=130
+    run_release --verify-upgrade
+    late_assert_interrupted verification 130 false || return 1
+    jq -e '.details.staging_receipt==null and .details.success==2' "$CASE/stdout" >/dev/null || return 1
+    LATE_STOP_STATUS=0
+    : > "$CALLS"
+    run_release --resume --verify-upgrade
+    [[ $STATUS -eq 0 ]] && ! grep -Eq '^CREATE|^POST |^PUBLISH|^RESTORE-DRAFT' "$CALLS" &&
+        grep -Fxq DISPATCH "$CALLS" && grep -Fxq UPGRADE "$CALLS"
+}
+
+test_staged_interrupted_restore_preserves_last_visibility_and_resumes() {
+    local stop_status committed statuses
+    statuses=$(late_interruption_statuses) || return 1
+    while IFS= read -r stop_status; do
+        for committed in false true; do
+            setup "restore_stop_${stop_status}_${committed}"
+            CREATE_FAIL=false PUBLIC_VERIFY_UNAVAILABLE=true
+            RESTORE_STOP_STATUS="$stop_status" RESTORE_STOP_COMMITTED="$committed"
+            run_release --verify-upgrade
+            late_assert_interrupted restore "$stop_status" false || return 1
+            [[ $(grep -c '^RESTORE-DRAFT$' "$CALLS") -eq 1 ]] || return 1
+            jq -e --argjson committed "$committed" '.draft==$committed' "$CASE/release.json" >/dev/null || return 1
+            late_capture_custody || return 1
+            RESTORE_STOP_STATUS=0 PUBLIC_VERIFY_UNAVAILABLE=false
+            : > "$CALLS"
+            run_release --resume --verify-upgrade
+            late_assert_public_resume "$committed" || return 1
+        done
+    done <<< "$statuses"
+
+    setup restore_read_stop
+    CREATE_FAIL=false PUBLIC_VERIFY_UNAVAILABLE=true LATE_STOP_PHASE=restore-read LATE_STOP_STATUS=130
+    run_release --verify-upgrade
+    late_assert_interrupted restore 130 true || return 1
+    ! grep -q '^RESTORE-DRAFT' "$CALLS" || return 1
+    late_capture_custody || return 1
+    LATE_STOP_STATUS=0 PUBLIC_VERIFY_UNAVAILABLE=false
+    : > "$CALLS"
+    run_release --resume --verify-upgrade
+    late_assert_public_resume false
+}
+
+test_promotion_interrupted_publish_preserves_explicit_intent() {
+    local committed
+    for committed in false true; do
+        promotion_setup "promotion_stop_$committed" || return 1
+        PUBLISH_STOP_STATUS=130 PUBLISH_STOP_COMMITTED="$committed"
+        run_release --resume --publish-draft --verify-upgrade
+        late_assert_interrupted publish 130 true && promotion_custody_unchanged || return 1
+        PUBLISH_STOP_STATUS=0
+        : > "$CALLS"
+        run_release --resume --verify-upgrade
+        [[ $STATUS -eq 0 ]] && ! grep -Eq '^CREATE|^POST |^PUBLISH|^RESTORE-DRAFT' "$CALLS" &&
+            promotion_custody_unchanged || return 1
+        if [[ "$committed" == false ]]; then
+            jq -e '.details.draft==true' "$CASE/stdout" >/dev/null &&
+                ! grep -Eq '^DISPATCH|^UPGRADE' "$CALLS" || return 1
+            : > "$CALLS"
+            run_release --resume --publish-draft --verify-upgrade
+            [[ $STATUS -eq 0 && $(grep -c '^PUBLISH$' "$CALLS") -eq 1 ]] &&
+                ! grep -Eq '^CREATE|^POST |^RESTORE-DRAFT' "$CALLS" || return 1
+        fi
+        jq -e '.details.draft==false' "$CASE/stdout" >/dev/null &&
+            grep -Fxq DISPATCH "$CALLS" && promotion_custody_unchanged || return 1
+    done
+}
+
 test_staged_generated_checksums_remain_bound_across_retry() {
     setup staged_checksums
     CREATE_FAIL=false FAIL_NAME=payload.bin
@@ -3650,6 +3895,11 @@ for test in test_release_auth_cancellation_never_falls_back_or_publishes \
     test_staged_interrupted_upload_resumes_and_publishes test_staged_generated_checksums_remain_bound_across_retry \
     test_staged_cancelled_upload_stops_and_requires_explicit_resume test_staged_cancelled_alias_upload_stops_remaining_names \
     test_staged_cancelled_creation_preserves_uncertain_custody \
+    test_staged_interrupted_publish_preserves_uncertainty_and_resumes \
+    test_staged_interrupted_final_verification_stops_and_resumes \
+    test_existing_public_release_interrupted_recheck_stops \
+    test_staged_interrupted_restore_preserves_last_visibility_and_resumes \
+    test_promotion_interrupted_publish_preserves_explicit_intent \
     test_staged_manifest_aliases_are_all_verified test_staged_explicit_draft_stays_private_on_resume \
     test_promotion_requires_resume_and_refuses_draft_flag test_promotion_keeps_strict_finalization_separate \
     test_promotion_requires_original_creation_custody \

@@ -191,6 +191,8 @@ elif endpoint=='repos/owner/app/releases/9':
                 time.sleep(0.02)
         if patch.get('draft') is False and control.get('fail_publish'):
             print('Controlled publication failure',file=sys.stderr);sys.exit(1)
+        if patch.get('draft') is False and control.get('publish_stop_before'):
+            sys.exit(control['publish_stop_status'])
         r.update(patch)
         if r['draft'] is False and control.get('raw_drift_after_publish'):
             p=c/'downstream/checksums.yaml'
@@ -200,6 +202,10 @@ elif endpoint=='repos/owner/app/releases/9':
         if r['draft'] is False and control.get('metadata_drift_after_publish'):r['body']='changed after publish'
         if r['draft'] is False and control.get('prerelease_drift_after_publish'):r['prerelease']=not r['prerelease']
         (c/'remote.json').write_text(json.dumps(r));print(json.dumps(r))
+        if patch.get('draft') is False and control.get('publish_stop_status'):
+            sys.exit(control['publish_stop_status'])
+        if patch.get('draft') is True and control.get('restore_stop_status'):
+            sys.exit(control['restore_stop_status'])
         sys.exit(1 if control.get('lost_patch') else 0)
     count=control.get('reads',0)+1;control['reads']=count
     if count==2 and control.get('receipt_replace'):
@@ -757,6 +763,49 @@ def test_strict_creation_interruptions():
               json.loads((c/'remote.json').read_text())['assets']==[])
         validator=Draft202012Validator(json.loads((root/'schemas/release-details.json').read_text()))
         check('strict creation '+str(stop_status)+' result satisfies release schema',not list(validator.iter_errors(details)))
+
+
+def test_strict_publication_interruptions():
+    for stop_status in interruption_statuses():
+        for accepted in (False, True):
+            label='publish-stop-'+str(stop_status)+('-accepted' if accepted else '-unaccepted')
+            c,env,_,_=setup(label,{'absent':True,'publish_stop_status':stop_status,
+                                  'publish_stop_before':not accepted})
+            result=subprocess.run(['bash','-c',script,'fixture','publish'],env=env,capture_output=True,text=True)
+            (c/'interrupted.stdout').write_text(result.stdout)
+            (c/'interrupted.stderr').write_text(result.stderr)
+            check(label+' is terminal interrupted',result.returncode==5)
+            details=json.loads(result.stdout)['details']
+            rows=[json.loads(line) for line in (c/'requests.jsonl').read_text().splitlines()]
+            patches=[row for row in rows if '--method' in row]
+            check(label+' performs no remote work after the interrupted publish',
+                  len(patches)==1 and rows[-1]==patches[0] and
+                  json.loads(patches[0][patches[0].index('--data')+1])['draft'] is False and
+                  json.loads((c/'remote.json').read_text())['draft'] is not accepted)
+            response=Path(details['create_response']);original=response.read_bytes();identity=response.stat().st_ino
+            check(label+' retains original authority and last observed visibility',
+                  details['verification']=='interrupted' and details['draft'] is True and
+                  details['interruption']==dict(stage='publish',exit_code=stop_status,outcome='unconfirmed') and
+                  json.loads(original)['draft'] is True and json.loads(original)['assets']==[])
+            validator=Draft202012Validator(json.loads((root/'schemas/release-details.json').read_text()))
+            check(label+' result satisfies release schema',not list(validator.iter_errors(details)))
+            controls=json.loads((c/'control.json').read_text())
+            controls.pop('publish_stop_status');controls.pop('publish_stop_before')
+            (c/'control.json').write_text(json.dumps(controls))
+            offset=len(rows)
+            env['TMPDIR']=details['finalization_tmpdir']
+            resumed=subprocess.run(['bash','-c',script,'fixture','public-finalize','app','1.2.3',
+                                    '--create-response',str(response),'--no-dispatch'],
+                                   env=env,capture_output=True,text=True)
+            (c/'resumed.stdout').write_text(resumed.stdout)
+            (c/'resumed.stderr').write_text(resumed.stderr)
+            later=[json.loads(line) for line in (c/'requests.jsonl').read_text().splitlines()][offset:]
+            check(label+' explicitly finalizes the same retained release without reupload',
+                  resumed.returncode==0 and json.loads((c/'remote.json').read_text())['draft'] is False and
+                  sum('--method' in row for row in later)==(0 if accepted else 1) and
+                  not any('--post' in row or row[0]=='upload-boundary' for row in later))
+            check(label+' preserves the exact original response through recovery',
+                  response.read_bytes()==original and response.stat().st_ino==identity)
 
 
 def test_fallback_recovery(pagination_only=False, prerelease_only=False, interruption_only=False):
@@ -1740,11 +1789,12 @@ def test_custom_artifact_repair():
 
 if os.environ.get('DSR_TEST_STRICT_INTERRUPTION_ONLY')=='1':
     selected=os.environ.get('DSR_TEST_STRICT_INTERRUPTION_CASE','all')
-    if selected not in ('all','upload','create','repair'):
-        raise AssertionError('Select a known strict interruption case: all, upload, create, or repair')
+    if selected not in ('all','upload','create','repair','publish'):
+        raise AssertionError('Select a known strict interruption case: all, upload, create, repair, or publish')
     if selected in ('all','upload'):test_strict_upload_interruptions()
     if selected in ('all','create'):test_strict_creation_interruptions()
     if selected in ('all','repair'):test_fallback_recovery(interruption_only=True)
+    if selected in ('all','publish'):test_strict_publication_interruptions()
     print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
     raise SystemExit(0)
 
@@ -2018,6 +2068,7 @@ test_fallback_recovery(pagination_only=True)
 test_fallback_recovery(prerelease_only=True)
 test_strict_upload_interruptions()
 test_strict_creation_interruptions()
+test_strict_publication_interruptions()
 test_fallback_recovery(interruption_only=True)
 print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
 PY

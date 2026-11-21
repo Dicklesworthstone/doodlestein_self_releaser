@@ -1501,6 +1501,14 @@ custody and any verified upload receipts remain available. Explicitly resume
 to reconcile the retained bytes before continuing. Strict fallback repair
 preserves the same interrupted exit and publication handoff, so a watcher blocks
 automatic retries even when GitHub accepted the upload before cancellation.
+
+Strict contract publication also stops immediately when its publish PATCH
+is interrupted, whether GitHub accepted it or left the release as a draft.
+The original creation response remains unchanged; a later explicit finalization
+observes current visibility and publishes only when the release is still a draft.
+An interrupted publish never triggers compensating restoration or downstream
+dispatch in that invocation.
+
 Interrupted creation reports `details.creation_custody_dir`, retaining its
 pending intent without treating partial transport output as a successful
 original POST response. A draft missing that original response cannot be

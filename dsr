@@ -11727,25 +11727,29 @@ EOF
                     local postpublish_tag_valid=false
                     local postpublish_ruleset_valid=false
                     local postpublish_raw_installer_valid=false
-                    if published_release_json=$(_release_contract_verify_remote_assets \
+                    if _release_record_interruption publish "$publish_patch_status"; then
+                        _release_record_failed "publish" "Publication interrupted; remote outcome is unconfirmed"
+                    elif published_release_json=$(_release_contract_verify_remote_assets \
                         "$repo" "$release_id" "$expected_assets_json" false "$tag" \
                         "$release_contract_metadata_json"); then
                         postpublish_assets_valid=true
                     fi
-                    if _release_contract_verify_remote_tag_identity \
+                    if ! $release_interrupted && _release_contract_verify_remote_tag_identity \
                         "$repo" "$tag" "$expected_git_sha"; then
                         postpublish_tag_valid=true
                     fi
-                    if _release_contract_verify_tag_ruleset_receipt \
+                    if ! $release_interrupted && _release_contract_verify_tag_ruleset_receipt \
                         "$release_contract_tag_ruleset_receipt"; then
                         postpublish_ruleset_valid=true
                     fi
-                    if _release_contract_verify_raw_installer_checksum \
+                    if ! $release_interrupted && _release_contract_verify_raw_installer_checksum \
                         "$(jq -c '.raw_installer_checksum // null' <<< "$release_contract_plan")" >/dev/null; then
                         postpublish_raw_installer_valid=true
                     fi
 
-                    if $postpublish_assets_valid && $postpublish_tag_valid && \
+                    if $release_interrupted; then
+                        : # Explicit recovery must observe whether the stopped PATCH committed.
+                    elif $postpublish_assets_valid && $postpublish_tag_valid && \
                        $postpublish_ruleset_valid && $postpublish_raw_installer_valid; then
                         draft=false
                         local published_url
