@@ -8414,7 +8414,11 @@ _source_release_identity() {
         log_error "Source-only publication requires a clean checkout at the exact peeled tag"
         return 4
     }
-    _release_contract_verify_remote_tag_identity "$repo" "$tag" "$expected_sha" || return 4
+    _release_contract_verify_remote_tag_identity "$repo" "$tag" "$expected_sha" || {
+        local identity_status=$?
+        if _gh_operation_interrupted "$identity_status"; then return "$identity_status"; fi
+        return 4
+    }
 }
 
 _source_release_metadata_matches() {
@@ -8539,8 +8543,19 @@ PY
 
 _release_finalize_observe() {
     local repo="$1" id="$2" plan="$3" draft="$4" tag="$5" metadata="$6"
-    local observed
-    observed=$(_release_contract_verify_remote_assets "$repo" "$id" "$plan" "$draft" "$tag" "$metadata") || return 7
+    local observed observe_status
+    observed=$(_release_contract_verify_remote_assets "$repo" "$id" "$plan" "$draft" "$tag" "$metadata") || {
+        observe_status=$?
+        if _gh_operation_interrupted "$observe_status"; then
+            # The verifier may retain a completed metadata observation when
+            # a later read stops. It is visibility evidence, never success.
+            if _source_release_metadata_matches "$observed" "$metadata" "$id" any; then
+                printf '%s\n' "$observed"
+            fi
+            return "$observe_status"
+        fi
+        return 7
+    }
     _source_release_metadata_matches "$observed" "$metadata" "$id" "$draft" || return 7
     printf '%s\n' "$observed"
 }
@@ -8576,8 +8591,22 @@ cmd_release_finalize() {
         _release_finalize_result_rc=5
         log_error "Strict release finalization interrupted"
         if $JSON_MODE; then
+            local interruption_details='{"stage":"interrupted","error":"Strict release finalization interrupted"}'
+            local retained_interruption
+            if [[ -n "$_release_finalize_result_work" &&
+                  -f "$_release_finalize_result_work/interruption.json" &&
+                  ! -L "$_release_finalize_result_work/interruption.json" ]] &&
+               retained_interruption=$(jq -ce -s '
+                    select(length == 1) | .[0] |
+                    select(.stage == "interrupted" and .verification == "interrupted" and
+                        (.interruption | .outcome == "unconfirmed" and
+                            (.stage == "verification" or .stage == "publish" or .stage == "restore") and
+                            (.exit_code | type == "number" and floor == . and . >= 1 and . <= 255)))
+                ' "$_release_finalize_result_work/interruption.json" 2>/dev/null); then
+                interruption_details="$retained_interruption"
+            fi
             json_envelope release-finalize error 5 \
-                '{"stage":"interrupted","error":"Strict release finalization interrupted"}' || _release_finalize_result_emit=$?
+                "$interruption_details" || _release_finalize_result_emit=$?
         fi
     elif [[ -n "$_release_finalize_result_work" ]]; then
         [[ ! -f "$_release_finalize_result_work/stderr" ]] ||
@@ -8806,15 +8835,48 @@ _release_finalize_execute_locked() {
         return 4
     fi
     manifest="$artifacts/$tool-$tag-manifest.json"
-    local frozen plan saved metadata release_id receipt_sha receipt_dir scan observed
+    local frozen plan saved metadata="" release_id="" receipt_sha receipt_dir scan observed
+    local output="" final_output="" finalize_last_observed=""
+    _release_finalize_interrupted() {
+        local operation="$1" operation_status="$2" last_observation="${3:-}" last_draft=null
+        _gh_operation_interrupted "$operation_status" || return 1
+        if [[ -n "$last_observation" ]] &&
+           _source_release_metadata_matches "$last_observation" "$metadata" "$release_id" any; then
+            finalize_last_observed="$last_observation"
+        fi
+        if [[ -n "$finalize_last_observed" ]]; then
+            last_draft=$(jq -r '.draft' <<< "$finalize_last_observed") || last_draft=null
+        fi
+        # Preserve original and pending receipts byte-for-byte. This separate
+        # result record is read only after the owned publication work drains.
+        jq -nc --arg repo "$repo" --arg tag "$tag" --argjson id "${release_id:-null}" \
+            --arg response "$response" --arg custody "$receipt_dir" --arg pending "$output" \
+            --arg operation "$operation" --argjson code "$operation_status" --argjson draft "$last_draft" '
+            {stage:"interrupted",error:"Strict release finalization interrupted",verification:"interrupted",
+             repo:$repo,tag:$tag,create_response:$response,finalization_tmpdir:$custody,
+             pending_receipt:(if $pending == "" then null else $pending end),
+             interruption:{stage:$operation,exit_code:$code,outcome:"unconfirmed"}} |
+            if $id == null then . else . + {release_id:$id} end |
+            if $draft == null then . else . + {draft:$draft} end' \
+            > "$_release_finalize_result_work/interruption.json" ||
+            log_error "Could not retain detailed interrupted-finalization output"
+        log_error "Strict finalization $operation stopped (exit $operation_status); remote outcome is unconfirmed"
+        return 0
+    }
     # Recovery authority is the original private POST response retained by the
     # GitHub adapter, not a tag lookup, upload journal, or caller-supplied ID.
     receipt_dir="$_release_finalize_receipt_dir"
     frozen=$(_source_release_read_private_receipt "$response" "$receipt_dir" "" "" "dsr-api-response.") || return 4
     saved=$(jq -c '.record' <<< "$frozen") || return 4
     receipt_sha=$(jq -r '.sha256' <<< "$frozen") || return 4
-    plan=$(_release_contract_preflight "$tool" "$tag" "$repo" "$path" "$artifacts" "$manifest" "$contract" verify) || return 4
-    _source_release_identity "$repo" "$path" "$tag" "$(jq -r '.git_sha' <<< "$plan")" || return 4
+    plan=$(_release_contract_preflight "$tool" "$tag" "$repo" "$path" "$artifacts" "$manifest" "$contract" verify) || {
+        if _release_finalize_interrupted verification "$?"; then return 5; fi
+        return 4
+    }
+    _source_release_identity "$repo" "$path" "$tag" "$(jq -r '.git_sha' <<< "$plan")" || {
+        if _release_finalize_interrupted verification "$?"; then return 5; fi
+        return 4
+    }
     _source_release_inputs_match "$config" "$config_sha" "$response" "$receipt_sha" "$registry" "$registry_sha" || return 4
     if ! jq -e --arg repo "$repo" --arg tag "$tag" --arg sha "$(jq -r '.git_sha' <<< "$plan")" '
         (.id | type == "number" and floor == . and . > 0 and . <= 9007199254740991) and
@@ -8829,25 +8891,40 @@ _release_finalize_execute_locked() {
     fi
     release_id=$(jq -r '.id' <<< "$saved") || return 4
     metadata=$(jq -c '{tag_name,name,body,prerelease,target_commitish}' <<< "$saved") || return 4
-    scan=$(_release_contract_scan_release_by_tag "$repo" "$tag") || return 7
+    scan=$(_release_contract_scan_release_by_tag "$repo" "$tag") || {
+        if _release_finalize_interrupted verification "$?"; then return 5; fi
+        return 7
+    }
     jq -e --argjson id "$release_id" '.count == 1 and .release.id == $id' <<< "$scan" >/dev/null || return 7
-    observed=$(_release_finalize_observe "$repo" "$release_id" "$(jq -c '.assets' <<< "$plan")" any "$tag" "$metadata") || return 7
+    observed=$(_release_finalize_observe "$repo" "$release_id" "$(jq -c '.assets' <<< "$plan")" any "$tag" "$metadata") || {
+        if _release_finalize_interrupted verification "$?" "$observed"; then return 5; fi
+        return 7
+    }
+    finalize_last_observed="$observed"
     local current_fingerprint current_plan
     current_fingerprint=$(_source_release_read_private_receipt "$response" "$receipt_dir" "" "" "dsr-api-response.") || return 4
     [[ "$current_fingerprint" == "$frozen" && -f "$config" && ! -L "$config" &&
        "$(_gh_asset_sha256 "$config")" == "$config_sha" ]] || return 4
     _source_release_inputs_match "$config" "$config_sha" "$response" "$receipt_sha" "$registry" "$registry_sha" || return 4
-    current_plan=$(_release_contract_preflight "$tool" "$tag" "$repo" "$path" "$artifacts" "$manifest" "$contract" verify) || return 4
+    current_plan=$(_release_contract_preflight "$tool" "$tag" "$repo" "$path" "$artifacts" "$manifest" "$contract" verify) || {
+        if _release_finalize_interrupted verification "$?"; then return 5; fi
+        return 4
+    }
     jq -e --slurpfile expected /dev/fd/3 '. == $expected[0]' \
         3<<< "$plan" <<< "$current_plan" >/dev/null || return 4
-    _release_contract_verify_remote_tag_identity "$repo" "$tag" "$(jq -r '.git_sha' <<< "$plan")" || return 7
-    _release_contract_verify_tag_ruleset_receipt "$(jq -c '.tag_ruleset_receipt' <<< "$plan")" || return 7
+    _release_contract_verify_remote_tag_identity "$repo" "$tag" "$(jq -r '.git_sha' <<< "$plan")" || {
+        if _release_finalize_interrupted verification "$?"; then return 5; fi
+        return 7
+    }
+    _release_contract_verify_tag_ruleset_receipt "$(jq -c '.tag_ruleset_receipt' <<< "$plan")" || {
+        if _release_finalize_interrupted verification "$?"; then return 5; fi
+        return 7
+    }
     if $DRY_RUN; then
         jq -nc --argjson id "$release_id" '{status:"dry_run",release_id:$id}' \
             > "$_release_finalize_result_work/completion.json"
         return $?
     fi
-    local output final_output
     mkdir -p "$state_dir/releases" || return 7
     [[ -d "$state_dir/releases" && ! -L "$state_dir/releases" ]] || return 7
     output=$(umask 077; mktemp "$state_dir/releases/$tool-$tag-finalization-pending.XXXXXXXX") || return 7
@@ -8860,47 +8937,92 @@ _release_finalize_execute_locked() {
     jq -e '.status == "pending"' "$output" >/dev/null || return 7
     # Re-observe all remote bytes and the complete original nonce-bound
     # metadata immediately before changing only this proven draft's state.
-    observed=$(_release_finalize_observe "$repo" "$release_id" "$(jq -c '.assets' <<< "$plan")" any "$tag" "$metadata") || return 7
+    observed=$(_release_finalize_observe "$repo" "$release_id" "$(jq -c '.assets' <<< "$plan")" any "$tag" "$metadata") || {
+        if _release_finalize_interrupted verification "$?" "$observed"; then return 5; fi
+        return 7
+    }
+    finalize_last_observed="$observed"
     current_fingerprint=$(_source_release_read_private_receipt "$response" "$receipt_dir" "" "" "dsr-api-response.") || return 4
     [[ "$current_fingerprint" == "$frozen" && -f "$config" && ! -L "$config" &&
        "$(_gh_asset_sha256 "$config")" == "$config_sha" ]] || return 4
     _source_release_inputs_match "$config" "$config_sha" "$response" "$receipt_sha" "$registry" "$registry_sha" || return 4
-    current_plan=$(_release_contract_preflight "$tool" "$tag" "$repo" "$path" "$artifacts" "$manifest" "$contract" verify) || return 4
+    current_plan=$(_release_contract_preflight "$tool" "$tag" "$repo" "$path" "$artifacts" "$manifest" "$contract" verify) || {
+        if _release_finalize_interrupted verification "$?"; then return 5; fi
+        return 4
+    }
     jq -e --slurpfile expected /dev/fd/3 '. == $expected[0]' \
         3<<< "$plan" <<< "$current_plan" >/dev/null || return 4
-    _release_contract_verify_remote_tag_identity "$repo" "$tag" "$(jq -r '.git_sha' <<< "$plan")" || return 7
-    _release_contract_verify_tag_ruleset_receipt "$(jq -c '.tag_ruleset_receipt' <<< "$plan")" || return 7
-    _source_release_identity "$repo" "$path" "$tag" "$(jq -r '.git_sha' <<< "$plan")" || return 4
-    _release_contract_verify_raw_installer_checksum "$(jq -c '.raw_installer_checksum // null' <<< "$plan")" >/dev/null || return 7
+    _release_contract_verify_remote_tag_identity "$repo" "$tag" "$(jq -r '.git_sha' <<< "$plan")" || {
+        if _release_finalize_interrupted verification "$?"; then return 5; fi
+        return 7
+    }
+    _release_contract_verify_tag_ruleset_receipt "$(jq -c '.tag_ruleset_receipt' <<< "$plan")" || {
+        if _release_finalize_interrupted verification "$?"; then return 5; fi
+        return 7
+    }
+    _source_release_identity "$repo" "$path" "$tag" "$(jq -r '.git_sha' <<< "$plan")" || {
+        if _release_finalize_interrupted verification "$?"; then return 5; fi
+        return 4
+    }
+    _release_contract_verify_raw_installer_checksum "$(jq -c '.raw_installer_checksum // null' <<< "$plan")" >/dev/null || {
+        if _release_finalize_interrupted verification "$?"; then return 5; fi
+        return 7
+    }
     if jq -e '.draft == true' <<< "$observed" >/dev/null; then
-        gh_api "repos/$repo/releases/$release_id" --method PATCH --data '{"draft":false}' --no-cache >/dev/null || true
+        gh_api "repos/$repo/releases/$release_id" --method PATCH --data '{"draft":false}' --no-cache >/dev/null || {
+            if _release_finalize_interrupted publish "$?"; then return 5; fi
+        }
     fi
     local valid=true
-    observed=$(_release_finalize_observe "$repo" "$release_id" "$(jq -c '.assets' <<< "$plan")" false "$tag" "$metadata") || valid=false
+    if observed=$(_release_finalize_observe "$repo" "$release_id" "$(jq -c '.assets' <<< "$plan")" false "$tag" "$metadata"); then
+        finalize_last_observed="$observed"
+    else
+        if _release_finalize_interrupted verification "$?" "$observed"; then return 5; fi
+        valid=false
+    fi
     current_fingerprint=$(_source_release_read_private_receipt "$response" "$receipt_dir" "" "" "dsr-api-response.") || valid=false
     [[ "$current_fingerprint" == "$frozen" && -f "$config" && ! -L "$config" &&
        "$(_gh_asset_sha256 "$config")" == "$config_sha" ]] || valid=false
     _source_release_inputs_match "$config" "$config_sha" "$response" "$receipt_sha" "$registry" "$registry_sha" || valid=false
-    current_plan=$(_release_contract_preflight "$tool" "$tag" "$repo" "$path" "$artifacts" "$manifest" "$contract" verify) || valid=false
+    current_plan=$(_release_contract_preflight "$tool" "$tag" "$repo" "$path" "$artifacts" "$manifest" "$contract" verify) || {
+        if _release_finalize_interrupted verification "$?"; then return 5; fi
+        valid=false
+    }
     jq -e --slurpfile expected /dev/fd/3 '. == $expected[0]' \
         3<<< "$plan" <<< "${current_plan:-null}" >/dev/null || valid=false
-    _release_contract_verify_remote_tag_identity "$repo" "$tag" "$(jq -r '.git_sha' <<< "$plan")" || valid=false
-    _release_contract_verify_tag_ruleset_receipt "$(jq -c '.tag_ruleset_receipt' <<< "$plan")" || valid=false
-    _source_release_identity "$repo" "$path" "$tag" "$(jq -r '.git_sha' <<< "$plan")" || valid=false
+    _release_contract_verify_remote_tag_identity "$repo" "$tag" "$(jq -r '.git_sha' <<< "$plan")" || {
+        if _release_finalize_interrupted verification "$?"; then return 5; fi
+        valid=false
+    }
+    _release_contract_verify_tag_ruleset_receipt "$(jq -c '.tag_ruleset_receipt' <<< "$plan")" || {
+        if _release_finalize_interrupted verification "$?"; then return 5; fi
+        valid=false
+    }
+    _source_release_identity "$repo" "$path" "$tag" "$(jq -r '.git_sha' <<< "$plan")" || {
+        if _release_finalize_interrupted verification "$?"; then return 5; fi
+        valid=false
+    }
+    local restore_observation
     if ! $valid; then
-        _source_release_restore_draft "$repo" "$release_id" "$metadata" || true
+        restore_observation=$(_source_release_restore_draft "$repo" "$release_id" "$metadata") || {
+            if _release_finalize_interrupted restore "$?" "$restore_observation"; then return 5; fi
+        }
         log_error "Strict finalization failed post-publication revalidation"
         return 7
     fi
     final_output=$(umask 077; mktemp "$state_dir/releases/$tool-$tag-finalized.XXXXXXXX") || {
-        _source_release_restore_draft "$repo" "$release_id" "$metadata" || true
+        restore_observation=$(_source_release_restore_draft "$repo" "$release_id" "$metadata") || {
+            if _release_finalize_interrupted restore "$?" "$restore_observation"; then return 5; fi
+        }
         return 7
     }
     if ! jq -n --arg repo "$repo" --arg tag "$tag" --argjson id "$release_id" \
         --arg response "$response" --arg sha "$receipt_sha" --slurpfile plan /dev/fd/3 \
         --arg pending "$output" --slurpfile release /dev/fd/4 '{schema:"dsr.strict_finalization_receipt.v1",status:"success",repo:$repo,tag:$tag,release_id:$id,create_response:$response,create_response_sha256:$sha,pending_receipt:$pending,plan:$plan[0],release:$release[0]}' \
         3<<< "$plan" 4<<< "$observed" > "$final_output"; then
-        _source_release_restore_draft "$repo" "$release_id" "$metadata" || true
+        restore_observation=$(_source_release_restore_draft "$repo" "$release_id" "$metadata") || {
+            if _release_finalize_interrupted restore "$?" "$restore_observation"; then return 5; fi
+        }
         return 7
     fi
     jq -nc --arg receipt "$final_output" --argjson id "$release_id" \

@@ -1426,6 +1426,67 @@ exit "$status"
               lease_available(c,'v1.2.3') and lease_available(c,'1.2.3'))
 
 
+def test_standalone_finalization_interruptions():
+    names=('publish-accepted','publish-unaccepted')
+    selected=os.environ.get('DSR_TEST_STANDALONE_FINALIZE_CASE','')
+    if selected and (selected not in names or os.environ.get('DSR_TEST_STANDALONE_FINALIZE_INTERRUPTION_ONLY')!='1'):
+        raise AssertionError('Select a known standalone finalizer interruption case together with its focused lane')
+    for stop_status in interruption_statuses():
+        for name in names:
+            if selected and name!=selected:continue
+            accepted=name=='publish-accepted'
+            label='standalone-'+name+'-'+str(stop_status)
+            c,env,_,_=setup(label,{'absent':True})
+            created=subprocess.run(['bash','-c',script,'fixture','create'],
+                                   env=env,capture_output=True,text=True,timeout=120)
+            (c/'producer.stdout').write_text(created.stdout);(c/'producer.stderr').write_text(created.stderr)
+            check(label+' uses the actual signed draft producer',created.returncode==0)
+            details=json.loads(created.stdout)['details']
+            response=Path(details['create_response']);env['TMPDIR']=details['finalization_tmpdir']
+            original=response.read_bytes();identity=(response.stat().st_dev,response.stat().st_ino)
+            controls=json.loads((c/'control.json').read_text())
+            controls.update(publish_stop_status=stop_status,publish_stop_before=not accepted)
+            (c/'control.json').write_text(json.dumps(controls));(c/'requests.jsonl').write_text('')
+            args=['bash','-c',script,'fixture','public-finalize','app','1.2.3',
+                  '--create-response',str(response),'--no-dispatch']
+            result=subprocess.run(args,env=env,capture_output=True,text=True,timeout=120)
+            (c/'interrupted.stdout').write_text(result.stdout);(c/'interrupted.stderr').write_text(result.stderr)
+            check(label+' is terminal interrupted',result.returncode==5)
+            envelope=json.loads(result.stdout);details=envelope['details']
+            rows=[json.loads(line) for line in (c/'requests.jsonl').read_text().splitlines()]
+            patches=[row for row in rows if '--method' in row]
+            check(label+' stops at the interrupted publication boundary',
+                  len(patches)==1 and rows[-1]==patches[0] and
+                  json.loads(patches[0][patches[0].index('--data')+1])['draft'] is False and
+                  json.loads((c/'remote.json').read_text())['draft'] is not accepted)
+            pending=list((c/'state/releases').glob('app-v1.2.3-finalization-pending.*'))
+            check(label+' retains the original authority and uncertain pending publication',
+                  envelope['command']=='release-finalize' and envelope['status']=='error' and
+                  envelope['exit_code']==5 and details['stage']=='interrupted' and details['draft'] is True and
+                  details['interruption']==dict(stage='publish',exit_code=stop_status,outcome='unconfirmed') and
+                  details['create_response']==str(response) and len(pending)==1 and
+                  details['pending_receipt']==str(pending[0]) and
+                  json.loads(pending[0].read_text())['status']=='pending' and
+                  not list((c/'state/releases').glob('app-v1.2.3-finalized.*')) and
+                  response.read_bytes()==original and (response.stat().st_dev,response.stat().st_ino)==identity)
+            pending_bytes=pending[0].read_bytes();pending_identity=(pending[0].stat().st_dev,pending[0].stat().st_ino)
+            controls=json.loads((c/'control.json').read_text())
+            controls.pop('publish_stop_status');controls.pop('publish_stop_before')
+            (c/'control.json').write_text(json.dumps(controls));(c/'requests.jsonl').write_text('')
+            resumed=subprocess.run(args,env=env,capture_output=True,text=True,timeout=120)
+            (c/'resumed.stdout').write_text(resumed.stdout);(c/'resumed.stderr').write_text(resumed.stderr)
+            later=[json.loads(line) for line in (c/'requests.jsonl').read_text().splitlines()]
+            check(label+' explicitly resumes without reupload or compensating restoration',
+                  resumed.returncode==0 and json.loads((c/'remote.json').read_text())['draft'] is False and
+                  sum('--method' in row for row in later)==(0 if accepted else 1) and
+                  not any('--post' in row or row[0]=='upload-boundary' for row in later) and
+                  all(json.loads(row[row.index('--data')+1])['draft'] is False for row in later if '--method' in row))
+            check(label+' preserves exact creation and pending custody through explicit recovery',
+                  response.read_bytes()==original and (response.stat().st_dev,response.stat().st_ino)==identity and
+                  pending[0].read_bytes()==pending_bytes and
+                  (pending[0].stat().st_dev,pending[0].stat().st_ino)==pending_identity)
+
+
 def test_public_finalizer_lifecycle():
     names=('success','term','kill','borrowed-success','borrowed-term','borrowed-kill','relative-success')
     selected=os.environ.get('DSR_TEST_STRICT_CLI_CASE','')
@@ -1787,6 +1848,11 @@ def test_custom_artifact_repair():
           len([row for row in rows if row[0]=='checksum-download'])==2 and not mutations(rows))
 
 
+if os.environ.get('DSR_TEST_STANDALONE_FINALIZE_INTERRUPTION_ONLY')=='1':
+    test_standalone_finalization_interruptions()
+    print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
+    raise SystemExit(0)
+
 if os.environ.get('DSR_TEST_STRICT_INTERRUPTION_ONLY')=='1':
     selected=os.environ.get('DSR_TEST_STRICT_INTERRUPTION_CASE','all')
     if selected not in ('all','upload','create','repair','publish'):
@@ -2069,6 +2135,7 @@ test_fallback_recovery(prerelease_only=True)
 test_strict_upload_interruptions()
 test_strict_creation_interruptions()
 test_strict_publication_interruptions()
+test_standalone_finalization_interruptions()
 test_fallback_recovery(interruption_only=True)
 print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
 PY

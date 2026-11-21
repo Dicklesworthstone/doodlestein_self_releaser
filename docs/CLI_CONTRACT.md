@@ -1358,6 +1358,17 @@ Cancellation cannot recall a request GitHub has already accepted. The original
 private creation response and pending finalization evidence remain available;
 retrying the same command rechecks exact local and remote evidence before
 reporting success or attempting promotion again.
+A cancellation reported by the publication adapter also returns exit `5`,
+without a subsequent remote read, publication retry, or draft restoration.
+The error envelope includes `details.interruption` with `stage: "publish"`,
+the original adapter `exit_code`, and `outcome: "unconfirmed"`.
+`details.draft` records the last completed metadata observation that matched
+the retained release. `create_response`, `finalization_tmpdir`, and
+`pending_receipt` identify the retained recovery inputs; the original
+creation response and pending receipt keep their exact bytes. Explicitly
+rerunning finalization recognizes an already accepted publication without
+reuploading assets or restoring the release to a draft. Ordinary retryable
+transport failures continue to reconcile using fresh remote evidence.
 
 New ordinary releases are created as private drafts. DSR freezes every selected
 asset name, size, and SHA-256, including the manifest, generated checksums, and
