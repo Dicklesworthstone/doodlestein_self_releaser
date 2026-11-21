@@ -1285,7 +1285,7 @@ function Invoke-DsrSourceGit {
         [int]$Timeout, [string]$Repository, $Environment, [switch]$Capture)
     $nullDevice = if ([OperatingSystem]::IsWindows()) { 'NUL' } else { '/dev/null' }
     $options = @('-c', ('core.hooksPath=' + $nullDevice), '-c', 'core.fsmonitor=false', '-c', 'submodule.recurse=false',
-        '-c', 'core.autocrlf=false', '-c', 'core.eol=lf', '-c', 'credential.helper=', '-c', 'credential.interactive=false',
+        '-c', 'core.autocrlf=false', '-c', 'core.eol=lf', '-c', 'core.symlinks=false', '-c', 'credential.helper=', '-c', 'credential.interactive=false',
         '-c', 'core.askPass=', '-c', 'http.extraHeader=', '-c', 'http.followRedirects=false', '-c', 'http.sslVerify=true',
         '-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always')
     if ([OperatingSystem]::IsWindows()) { $options += @('-c', 'core.longpaths=true') }
@@ -1304,12 +1304,15 @@ function Get-DsrSourceInventory {
     if ($Listing -and -not $Listing.EndsWith([string][char]0)) { Stop-DsrInstall 'Incomplete pinned source inventory' 7 }
     $files = [Collections.Generic.List[string]]::new()
     $links = [Collections.Generic.List[object]]::new()
+    $symlinks = [Collections.Generic.List[object]]::new()
+    $rows = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $directories = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $nodes = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($entry in $Listing.Split([char]0)) {
         if (-not $entry) { continue }
-        if ($files.Count + $links.Count -ge 100000 -or
-            $entry -cnotmatch '^(100644|100755|160000) (blob|commit) ([0-9a-f]{40}|[0-9a-f]{64})\t(.+)$') {
-            Stop-DsrInstall 'Source installation requires regular tracked files or pinned gitlinks; symbolic links are unsupported' 4
+        if ($files.Count + $links.Count + $symlinks.Count -ge 100000 -or
+            $entry -cnotmatch '^(100644|100755|120000|160000) (blob|commit) ([0-9a-f]{40}|[0-9a-f]{64})\t(.+)$') {
+            Stop-DsrInstall 'Unsupported or excessive pinned Windows source entries' 4
         }
         $mode = $Matches[1]
         $type = $Matches[2]
@@ -1321,19 +1324,159 @@ function Get-DsrSourceInventory {
         $prefix = ''
         for ($index = 0; $index -lt $parts.Count; $index++) {
             $prefix = if ($prefix) { $prefix + '/' + $parts[$index] } else { $parts[$index] }
-            $kind = if ($index -lt $parts.Count - 1) { 'directory' } elseif ($mode -ceq '160000') { 'repository' } else { 'file' }
+            $kind = if ($index -lt $parts.Count - 1) { 'directory' } elseif ($mode -ceq '160000') { 'repository' } elseif ($mode -ceq '120000') { 'link' } else { 'file' }
             if ($nodes.ContainsKey($prefix)) {
                 $prior = $nodes[$prefix]
                 if ($prior.path -cne $prefix -or $prior.kind -cne $kind -or $kind -cne 'directory') {
                     Stop-DsrInstall 'Case-colliding or ambiguous Windows source tree' 4
                 }
             } else { $nodes.Add($prefix, @{ path = $prefix; kind = $kind }) }
+            if ($kind -ceq 'directory') { $null = $directories.Add($prefix) }
         }
+        $rows.Add($name, @{ mode = $mode; git_blob = $commit })
         if ($mode -ceq '160000') { $links.Add(@{ path = $name; source_commit = $commit }) }
+        elseif ($mode -ceq '120000') { $symlinks.Add(@{ path = $name; git_blob = $commit }) }
         else { $files.Add($name) }
     }
     $files.Sort([StringComparer]::Ordinal)
-    return @{ files = $files.ToArray(); submodules = $links.ToArray(); entry_count = $files.Count + $links.Count }
+    return @{ files = $files.ToArray(); submodules = $links.ToArray(); symlinks = $symlinks.ToArray();
+        rows = $rows; directories = $directories; entry_count = $files.Count + $links.Count + $symlinks.Count }
+}
+
+function Get-DsrSourceGitBlobHash {
+    param([string]$Path, [string]$Expected)
+    $stream = Open-DsrReadFile (Get-DsrPlainPath $Path -File)
+    $algorithm = if ($Expected.Length -eq 40) { [Security.Cryptography.HashAlgorithmName]::SHA1 } else { [Security.Cryptography.HashAlgorithmName]::SHA256 }
+    $hash = [Security.Cryptography.IncrementalHash]::CreateHash($algorithm)
+    try {
+        $length = $stream.Length
+        $header = 'blob ' + $length.ToString([Globalization.CultureInfo]::InvariantCulture) + [char]0
+        $hash.AppendData([Text.Encoding]::ASCII.GetBytes($header))
+        $buffer = [byte[]]::new(65536)
+        while (($count = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) { $hash.AppendData($buffer, 0, $count) }
+        if ($stream.Position -ne $length -or $stream.Length -ne $length) { Stop-DsrInstall 'Tracked source changed while its Git blob was checked' 7 }
+        return [Convert]::ToHexString($hash.GetHashAndReset()).ToLowerInvariant()
+    } finally { $hash.Dispose(); $stream.Dispose() }
+}
+
+# Match the strict Windows snapshot policy: links select an exact regular
+# tracked file in their own repository, never another link or repository.
+function Resolve-DsrSourceLinkReferent {
+    param([string]$Path, [string]$Target, $Inventory, [string]$DisplayPath)
+    if (-not $Target -or $Target.StartsWith('/') -or $Target.Length -gt 32760 -or
+        $Target -cnotmatch '\A[A-Za-z0-9_./+@~#,=()\[\] -]+\z') {
+        Stop-DsrInstall ('Unsafe tracked source link: ' + $DisplayPath) 4
+    }
+    $parts = [Collections.Generic.List[string]]::new()
+    $slash = $Path.LastIndexOf('/')
+    if ($slash -ge 0) { foreach ($part in $Path.Substring(0, $slash).Split('/')) { $parts.Add($part) } }
+    foreach ($part in $Target.Split('/')) {
+        $cursor = $parts -join '/'
+        if ($cursor -and -not $Inventory.directories.Contains($cursor)) {
+            Stop-DsrInstall ('Tracked source link traverses a non-directory: ' + $DisplayPath) 4
+        }
+        if (-not $part -or $part -ceq '.') { continue }
+        if ($part -ceq '..') {
+            if ($parts.Count -eq 0) { Stop-DsrInstall ('Tracked source link escapes its repository: ' + $DisplayPath) 4 }
+            $parts.RemoveAt($parts.Count - 1)
+            continue
+        }
+        if (-not (Test-DsrSourceRelativePath $part)) { Stop-DsrInstall ('Unsafe tracked source link component: ' + $DisplayPath) 4 }
+        $parts.Add($part)
+        $cursor = $parts -join '/'
+        if ($Inventory.rows.ContainsKey($cursor) -and $Inventory.rows[$cursor].mode -ceq '160000') {
+            Stop-DsrInstall ('Tracked source link enters a nested repository: ' + $DisplayPath) 4
+        }
+    }
+    $relative = $parts -join '/'
+    if (-not $Inventory.rows.ContainsKey($relative) -or $Inventory.rows[$relative].mode -cnotin @('100644', '100755')) {
+        Stop-DsrInstall ('Tracked source link requires an exact tracked regular file without chains: ' + $DisplayPath) 4
+    }
+    return $relative
+}
+
+function Convert-DsrSourceLinks {
+    param($Node, $Graph, $Inventory)
+    foreach ($link in $Inventory.symlinks) {
+        $index = $Graph.materializations.Count
+        $path = if ($Node.path) { $Node.path + '/' + $link.path } else { $link.path }
+        if (-not (Test-DsrSourceRelativePath $path)) { Stop-DsrInstall 'Nested tracked source link exceeds the source bounds' 4 }
+        $destination = Get-DsrPlainPath ([IO.Path]::Combine($Node.root, $link.path)) -File
+        $literal = [IO.Path]::Combine($Node.logs, ('link-' + $index + '-literal'))
+        Copy-DsrNewFile $destination $literal
+        $literalEvidence = Get-DsrFileEvidence $literal
+        if ($literalEvidence.size_bytes -lt 1 -or $literalEvidence.size_bytes -gt 32760) {
+            Stop-DsrInstall ('Unsafe tracked source link text: ' + $path) 4
+        }
+        if ((Get-DsrSourceGitBlobHash $literal $link.git_blob) -cne $link.git_blob) {
+            Stop-DsrInstall ('Tracked source link text differs from its pinned Git blob: ' + $path) 7
+        }
+        $stream = Open-DsrReadFile $literal
+        $reader = $null
+        try {
+            # Do not consume a BOM or otherwise normalize the literal link.
+            $reader = [IO.StreamReader]::new($stream, [Text.UTF8Encoding]::new($false, $true), $false, 4096, $true)
+            $target = $reader.ReadToEnd()
+        } catch { Stop-DsrInstall ('Invalid tracked source link text: ' + $path) 4 }
+        finally { if ($null -ne $reader) { $reader.Dispose() }; $stream.Dispose() }
+        $referent = Resolve-DsrSourceLinkReferent $link.path $target $Inventory $path
+        $fullReferent = if ($Node.path) { $Node.path + '/' + $referent } else { $referent }
+        if (-not (Test-DsrSourceRelativePath $fullReferent)) { Stop-DsrInstall 'Nested tracked link referent exceeds the source bounds' 4 }
+        $referentPath = Get-DsrPlainPath ([IO.Path]::Combine($Node.root, $referent)) -File
+        $referentBlob = $Inventory.rows[$referent].git_blob
+        $evidence = Get-DsrFileEvidence $referentPath
+        if ((Get-DsrSourceGitBlobHash $referentPath $referentBlob) -cne $referentBlob) {
+            # Authenticate supported Git checkout conversions forward, as the
+            # Bash source engine does. Never run an external filter as proof.
+            $attributes = Invoke-DsrSourceAcquisitionGit $Node $Graph `
+                @('--literal-pathspecs', 'check-attr', '-z', 'filter', '--', $referent) ('link-' + $index + '-attributes') -Capture
+            $fields = $attributes.Split([char]0)
+            if ($fields.Count -ne 4 -or $fields[0] -cne $referent -or $fields[1] -cne 'filter' -or $fields[3] -or
+                $fields[2] -cnotmatch '^[A-Za-z0-9_/-][A-Za-z0-9._/-]*$') {
+                Stop-DsrInstall ('Unsupported tracked link referent conversion: ' + $path) 4
+            }
+            $filter = $fields[2]
+            $label = 'link-' + $index + '-referent'
+            $null = Invoke-DsrSourceAcquisitionGit $Node $Graph `
+                @('-c', ('filter.' + $filter + '.clean='), '-c', ('filter.' + $filter + '.smudge='),
+                  '-c', ('filter.' + $filter + '.process='), '-c', ('filter.' + $filter + '.required=false'),
+                  'cat-file', '--filters', ('--path=' + $referent), $referentBlob) $label
+            $expected = Get-DsrFileEvidence ([IO.Path]::Combine($Node.logs, ($label + '.stdout')))
+            if ($evidence.sha256 -cne $expected.sha256 -or $evidence.size_bytes -ne $expected.size_bytes) {
+                Stop-DsrInstall ('Tracked link referent differs from its pinned source: ' + $path) 7
+            }
+        }
+        $candidate = [IO.Path]::Combine($Node.logs, ('link-' + $index + '-copy'))
+        Copy-DsrNewFile $referentPath $candidate
+        $copied = Get-DsrFileEvidence $candidate
+        if ($copied.sha256 -cne $evidence.sha256 -or $copied.size_bytes -ne $evidence.size_bytes) {
+            Stop-DsrInstall ('Tracked link referent changed while materializing: ' + $path) 7
+        }
+        $null = Get-DsrPlainPath $destination -File
+        [IO.File]::Move($candidate, $destination, $true)
+        $Graph.materializations.Add(@{ path = $path; git_blob = $link.git_blob; link_target = $target;
+            referent_path = $fullReferent; referent_git_blob = $referentBlob;
+            sha256 = $evidence.sha256; size_bytes = $evidence.size_bytes;
+            literal_path = $literal; literal_sha256 = $literalEvidence.sha256; literal_size_bytes = $literalEvidence.size_bytes })
+        $Graph.files.Add($path)
+    }
+}
+
+function Assert-DsrSourceMaterializations {
+    param($Graph)
+    foreach ($link in $Graph.materializations) {
+        $literal = Get-DsrFileEvidence $link.literal_path
+        if ($literal.sha256 -cne $link.literal_sha256 -or $literal.size_bytes -ne $link.literal_size_bytes -or
+            (Get-DsrSourceGitBlobHash $link.literal_path $link.git_blob) -cne $link.git_blob) {
+            Stop-DsrInstall ('Retained tracked link text changed: ' + $link.path) 7
+        }
+        foreach ($path in @($link.path, $link.referent_path)) {
+            $evidence = Get-DsrFileEvidence (Get-DsrPlainPath ([IO.Path]::Combine($Graph.root, $path)) -File)
+            if ($evidence.sha256 -cne $link.sha256 -or $evidence.size_bytes -ne $link.size_bytes) {
+                Stop-DsrInstall ('Materialized tracked link or referent changed: ' + $link.path) 7
+            }
+        }
+    }
 }
 
 function Resolve-DsrSourceSubmoduleRepository {
@@ -1468,6 +1611,7 @@ function Add-DsrSourceRepository {
         if (-not (Test-DsrSourceRelativePath $fullPath)) { Stop-DsrInstall 'Nested source member exceeds the source bounds' 4 }
         $Graph.files.Add($fullPath)
     }
+    Convert-DsrSourceLinks $node $Graph $inventory
     $children = Get-DsrSourceSubmoduleDeclarations $node $Graph $inventory
     if ($children.Count -gt 0 -and ($Depth -ge 16 -or $Graph.nodes.Count + $children.Count -gt 256)) {
         Stop-DsrInstall 'Source submodules exceed 16 levels or 256 repositories' 4
@@ -1505,13 +1649,19 @@ function Assert-DsrSourceGraph {
 }
 
 function Get-DsrSourceTreeEvidence {
-    param([string]$Root, [string[]]$Files)
+    param([string]$Root, [string[]]$Files, [object[]]$Materializations = @())
     $rows = [Text.StringBuilder]::new()
     foreach ($name in $Files) {
         $path = Get-DsrPlainPath ([IO.Path]::Combine($Root, $name)) -File
         $evidence = Get-DsrFileEvidence $path
         $null = $rows.Append($name).Append([char]0).Append($evidence.sha256).Append([char]0)
         $null = $rows.Append($evidence.size_bytes.ToString([Globalization.CultureInfo]::InvariantCulture)).Append("`n")
+    }
+    foreach ($link in $Materializations) {
+        $null = $rows.Append('materialized-symlink').Append([char]0).Append($link.path).Append([char]0)
+        $null = $rows.Append($link.git_blob).Append([char]0).Append($link.link_target).Append([char]0)
+        $null = $rows.Append($link.referent_path).Append([char]0).Append($link.referent_git_blob).Append([char]0)
+        $null = $rows.Append($link.sha256).Append([char]0).Append($link.size_bytes.ToString([Globalization.CultureInfo]::InvariantCulture)).Append("`n")
     }
     return Get-DsrBytesHash ([Text.Encoding]::UTF8.GetBytes($rows.ToString()))
 }
@@ -2036,14 +2186,16 @@ function Build-DsrSourceFamily {
     $logs = New-DsrPrivateDirectory ([IO.Path]::Combine($Work, 'logs'))
     $source = New-DsrPrivateDirectory ([IO.Path]::Combine($Work, 'source'))
     $output = New-DsrPrivateDirectory ([IO.Path]::Combine($Work, 'output'))
-    $graph = @{ git = $git.Source; logs = $logs; timeout = $Timeout; clock = [Diagnostics.Stopwatch]::StartNew();
-        nodes = [Collections.Generic.List[object]]::new(); files = [Collections.Generic.List[string]]::new(); entry_count = 0 }
+    $graph = @{ git = $git.Source; root = $source; logs = $logs; timeout = $Timeout; clock = [Diagnostics.Stopwatch]::StartNew();
+        nodes = [Collections.Generic.List[object]]::new(); files = [Collections.Generic.List[string]]::new(); entry_count = 0;
+        materializations = [Collections.Generic.List[object]]::new() }
     $rootRepository = Add-DsrSourceRepository $graph $Policy.repo $Reference $source
     $commit = $rootRepository.source_commit
     $graph.files.Sort([StringComparer]::Ordinal)
     $files = $graph.files.ToArray()
+    Assert-DsrSourceMaterializations $graph
     Assert-DsrSourceGraph $graph 'initial'
-    $sourceEvidence = Get-DsrSourceTreeEvidence $source $files
+    $sourceEvidence = Get-DsrSourceTreeEvidence $source $files $graph.materializations.ToArray()
     $buildRoot = if ($Policy.source.subdir -ceq '.') { $source } else { [IO.Path]::Combine($source, $Policy.source.subdir) }
     $buildRoot = Get-DsrPlainPath $buildRoot -Directory
     $primary = $Policy.binary_name
@@ -2102,7 +2254,8 @@ function Build-DsrSourceFamily {
         $compilerDetails = Build-DsrBunSourceOutputs $Policy $Selection $Platform $source $files $buildRoot $output $logs $Timeout $compilerTool.Source
     }
     Assert-DsrSourceGraph $graph 'final'
-    if ((Get-DsrSourceTreeEvidence $source $files) -cne $sourceEvidence) {
+    Assert-DsrSourceMaterializations $graph
+    if ((Get-DsrSourceTreeEvidence $source $files $graph.materializations.ToArray()) -cne $sourceEvidence) {
         Stop-DsrInstall 'Source compilation changed the pinned tracked inputs' 7
     }
     $rows = @()
@@ -2123,6 +2276,13 @@ function Build-DsrSourceFamily {
     if ($graph.nodes.Count -gt 1) {
         $receipt.submodules = @($graph.nodes | Where-Object { $_.path } | ForEach-Object {
             @{ path = $_.path; repository = $_.repository; source_commit = $_.source_commit }
+        })
+    }
+    if ($graph.materializations.Count -gt 0) {
+        $receipt.materialized_symlinks = @($graph.materializations | ForEach-Object {
+            @{ path = $_.path; git_blob = $_.git_blob; link_target = $_.link_target;
+                referent_path = $_.referent_path; referent_git_blob = $_.referent_git_blob;
+                sha256 = $_.sha256; size_bytes = $_.size_bytes }
         })
     }
     foreach ($key in $compilerDetails.Keys) { $receipt[$key] = $compilerDetails[$key] }

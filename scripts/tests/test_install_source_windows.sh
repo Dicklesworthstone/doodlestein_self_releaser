@@ -10,7 +10,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 dependencies=(pwsh git go cargo rustc minisign python3 jq yq)
 if [[ " $* " == *' --bun-only '* || " $* " == *' --bun-workspaces-only '* ]]; then
     dependencies=(pwsh git bun minisign python3 jq yq)
-elif [[ " $* " == *' --freshness-only '* || " $* " == *' --fallback-only '* || " $* " == *' --acquisition-errors-only '* || " $* " == *' --freshness-deadline-only '* || " $* " == *' --go-only '* || " $* " == *' --go-workspace-only '* || " $* " == *' --go-modules-only '* || " $* " == *' --submodules-only '* ]]; then
+elif [[ " $* " == *' --freshness-only '* || " $* " == *' --fallback-only '* || " $* " == *' --acquisition-errors-only '* || " $* " == *' --freshness-deadline-only '* || " $* " == *' --go-only '* || " $* " == *' --go-workspace-only '* || " $* " == *' --go-modules-only '* || " $* " == *' --submodules-only '* || " $* " == *' --symlinks-only '* ]]; then
     dependencies=(pwsh git go minisign python3 jq yq)
 fi
 for dependency in "${dependencies[@]}"; do
@@ -45,6 +45,8 @@ arguments.add_argument("--go-workspace-only", action="store_true", help="Run the
 arguments.add_argument("--go-modules-only", action="store_true", help="Run ordinary Go module source-custody and vendoring controls")
 arguments.add_argument("--submodules-only", action="store_true", help="Run recursive pinned Git submodule source installation controls")
 arguments.add_argument("--submodule-baseline-project", type=Path, help="Frozen checkout before Windows source submodule support")
+arguments.add_argument("--symlinks-only", action="store_true", help="Run authenticated tracked-link materialization controls")
+arguments.add_argument("--symlink-baseline-project", type=Path, help="Frozen checkout before Windows source tracked-link support")
 arguments.add_argument("--module-baseline-project", type=Path, help="Frozen checkout before ordinary Go module confinement")
 arguments.add_argument("--go-only", action="store_true", help="Run Go source and signed-release controls without Rust compilation")
 arguments.add_argument("--bun-only", action="store_true", help="Run genuine Bun/TypeScript Windows source installation controls")
@@ -214,6 +216,7 @@ if (Get-Command Invoke-DsrSourceGit -ErrorAction SilentlyContinue) {
     }
     $script:RealSourceCommand = ${function:Invoke-DsrSourceCommand}
     $script:MutatedSource = $false
+    $script:MutatedCheckout = $false
     function Invoke-DsrSourceCommand {
         param([string]$Executable, [string[]]$Arguments, [string]$Directory, [string]$Log,
             [int]$Timeout, $Environment = @{}, [int]$FailureCode = 6, [switch]$Capture)
@@ -227,6 +230,14 @@ if (Get-Command Invoke-DsrSourceGit -ErrorAction SilentlyContinue) {
             } else { '' })
         } | ConvertTo-Json -Compress) + "`n"))
         $result = & $script:RealSourceCommand @PSBoundParameters
+        if ($script:Fixture.Contains('mutate_checkout_member') -and -not $script:MutatedCheckout -and
+            'checkout' -cin $Arguments) {
+            $member = [IO.Path]::Combine($Directory, $script:Fixture.mutate_checkout_member)
+            if ([IO.File]::Exists($member)) {
+                [IO.File]::AppendAllText($member, 'x')
+                $script:MutatedCheckout = $true
+            }
+        }
         if ($script:Fixture.Contains('acquisition_pause_ms') -and 'fetch' -cin $Arguments) {
             [Threading.Thread]::Sleep([int]$script:Fixture.acquisition_pause_ms)
         }
@@ -269,6 +280,21 @@ if (Get-Command Invoke-DsrSourceGit -ErrorAction SilentlyContinue) {
             $child = [IO.Path]::Combine($Directory, 'nested/lib')
             & git -C $child update-index --chmod=+x -- value.go
             if ($LASTEXITCODE -ne 0) { throw 'Submodule index fixture could not change its staged file mode' }
+            $script:MutatedSource = $true
+        }
+        if ($script:Fixture.Contains('mutate_link_evidence') -and $script:Fixture.mutate_link_evidence -and
+            -not $script:MutatedSource -and $Arguments[0] -ceq 'build') {
+            $evidence = @(Get-ChildItem -LiteralPath ([IO.Path]::GetDirectoryName($Log)) -Recurse -File -Filter 'link-*-literal')
+            if ($evidence.Count -eq 0) { throw 'Tracked-link fixture could not find its retained literal evidence' }
+            [IO.File]::AppendAllText($evidence[0].FullName, 'x')
+            $script:MutatedSource = $true
+        }
+        if ($script:Fixture.Contains('mutate_link_index') -and $script:Fixture.mutate_link_index -and
+            -not $script:MutatedSource -and $Arguments[0] -ceq 'build') {
+            $replacement = (& git -C $Directory hash-object -w --no-filters -- shared/message.txt).Trim()
+            if ($LASTEXITCODE -ne 0) { throw 'Tracked-link fixture could not create its replacement Git blob' }
+            & git -C $Directory update-index --cacheinfo "120000,$replacement,apps/primary/message.txt"
+            if ($LASTEXITCODE -ne 0) { throw 'Tracked-link fixture could not replace the staged literal link blob' }
             $script:MutatedSource = $true
         }
         if ($Capture) { return $result }
@@ -1340,6 +1366,198 @@ if options.bun_only or options.bun_workspaces_only:
         test_bun_sources()
     test_bun_workspaces()
     print(f"Windows Bun source tests: {passed} passed, {failed} failed", flush=True)
+    raise SystemExit(1 if failed else 0)
+
+
+def test_source_symlinks():
+    def repository(label, contents, links=(), gitlinks=()):
+        directory = root / (label + "-upstream")
+        directory.mkdir()
+        required(["git", "init", "--quiet", "--initial-branch=main", directory], label + "-init")
+        required(["git", "-C", directory, "config", "user.email", "fixture@example.invalid"], label + "-email")
+        required(["git", "-C", directory, "config", "user.name", "DSR Tracked Link Fixture"], label + "-name")
+        for name, value in contents.items():
+            path = directory / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(value)
+        required(["git", "-C", directory, "add", "."], label + "-add")
+        # Actual Git symlink entries without requiring fixture OS privileges.
+        for number, (path, target) in enumerate(links):
+            literal = root / (label + "-literal-" + str(number))
+            literal.write_bytes(target if isinstance(target, bytes) else target.encode())
+            blob = required(["git", "-C", directory, "hash-object", "-w", "--no-filters", literal],
+                            label + "-blob-" + str(number))
+            required(["git", "-C", directory, "update-index", "--add", "--cacheinfo", f"120000,{blob},{path}"],
+                     label + "-link-" + str(number))
+        for number, (path, pin) in enumerate(gitlinks):
+            required(["git", "-C", directory, "update-index", "--add", "--cacheinfo", f"160000,{pin},{path}"],
+                     label + "-gitlink-" + str(number))
+        required(["git", "-C", directory, "commit", "--quiet", "-m", label], label + "-commit")
+        pin = required(["git", "-C", directory, "rev-parse", "HEAD"], label + "-pin")
+        return directory, pin
+
+    ordinary, ordinary_result, ordinary_fixture = invoke("links-ordinary-source")
+    check("ordinary regular-file source still builds both configured genuine PE outputs",
+          ordinary.returncode == 0 and len(ordinary_result.get("binaries", [])) == 2 and
+          all(machine(Path(ordinary_fixture["parameters"]["Prefix"]) / row["name"]) == 0x8664
+              for row in ordinary_result.get("binaries", [])),
+          ordinary.stderr.decode(errors="replace"))
+
+    main_source = 'package main\nimport ("fmt"; _ "embed")\n//go:embed message.txt\nvar message string\nfunc main() { fmt.Print(message) }\n'
+    child_files = {
+        "go.mod": "module example.invalid/source-links\n\ngo 1.22\n",
+        "apps/primary/main.go": main_source,
+        "cmd/helper/main.go": main_source,
+        "shared/message.txt": "pinned-linked-source\n",
+        ".gitattributes": "shared/message.txt text eol=crlf\n",
+    }
+    child_links = [("apps/primary/message.txt", "../../shared/message.txt"),
+                   ("cmd/helper/message.txt", "../../shared/message.txt")]
+    child, child_pin = repository("links-child", child_files, child_links)
+    root_modules = '[submodule "tool"]\n path = vendor/tool\n url = ../links-child.git\n'
+    root_files = {".gitmodules": root_modules, "docs/AGENTS.md": "Pinned vendor documentation.\n"}
+    source, source_pin = repository("links-root", root_files, [("docs/CLAUDE.md", "AGENTS.md")],
+                                    [("vendor/tool", child_pin)])
+    repository_map = {"fixture/source-links": source.as_uri(), "fixture/links-child": child.as_uri()}
+    config("source-links", local_path=str(source), source_subdir="vendor/tool")
+    generated, selected_runtime, selected_policy = generate("source-links", "links-generate")
+    check("public generator creates the source policy for the linked pinned child",
+          generated.returncode == 0, generated.stderr.decode(errors="replace"))
+    if generated.returncode:
+        return
+
+    def run(label, *, checkout_runtime=selected_runtime, source_ref=source_pin, repositories=None, parameters=None, **changes):
+        params = {"SourceRef": source_ref}
+        params.update(parameters or {})
+        return invoke(label, selected_runtime=checkout_runtime, parameters=params,
+                      extra={"GOPROXY": "off", "GOSUMDB": "off", "CGO_ENABLED": "0"},
+                      repositories=repositories or repository_map, **changes)
+
+    if options.symlink_baseline_project:
+        old_generated, old_runtime, old_policy = generate("source-links", "links-baseline-generate",
+            checkout=options.symlink_baseline_project.resolve(), destination=root / "links-baseline-generated")
+        old, _, old_fixture = run("links-baseline", checkout_runtime=old_runtime)
+        check("same genuine linked source graph reproduces the original installer refusal",
+              old_generated.returncode == 0 and old_policy == selected_policy and old.returncode == 4 and
+              not any(row["arguments"][0] == "build" for row in calls(old_fixture)),
+              old.stderr.decode(errors="replace"))
+
+    built, result, fixture = run("links-positive")
+    check("relative tracked links at root and inside a pinned child compile and install a complete family",
+          built.returncode == 0 and result.get("source", {}).get("source_commit") == source_pin and
+          {row["name"] for row in result.get("binaries", [])} == {"app.exe", "helper.exe"},
+          built.stderr.decode(errors="replace"))
+    if built.returncode:
+        return
+    prefix = Path(fixture["parameters"]["Prefix"])
+    original = {name: digest(prefix / name) for name in ("app.exe", "helper.exe")}
+    copied = b"pinned-linked-source\r\n"
+    check("both genuine PE binaries embed the authenticated Git-converted referent bytes",
+          all(machine(prefix / name) == 0x8664 and copied in (prefix / name).read_bytes() for name in original))
+    expected_links = {}
+    for repository_path, pin, path, target, referent, materialized in [
+        (source, source_pin, "docs/CLAUDE.md", "AGENTS.md", "docs/AGENTS.md", b"Pinned vendor documentation.\n"),
+        (child, child_pin, "apps/primary/message.txt", "../../shared/message.txt", "shared/message.txt", copied),
+        (child, child_pin, "cmd/helper/message.txt", "../../shared/message.txt", "shared/message.txt", copied),
+    ]:
+        prefix_path = "" if repository_path == source else "vendor/tool/"
+        blob = required(["git", "-C", repository_path, "rev-parse", pin + ":" + path],
+                        "links-expected-" + path.replace("/", "-"))
+        referent_blob = required(["git", "-C", repository_path, "rev-parse", pin + ":" + referent],
+                                 "links-referent-" + path.replace("/", "-"))
+        expected_links[prefix_path + path] = {
+            "path": prefix_path + path, "git_blob": blob, "link_target": target,
+            "referent_path": prefix_path + referent, "referent_git_blob": referent_blob,
+            "sha256": hashlib.sha256(materialized).hexdigest(), "size_bytes": len(materialized),
+        }
+    actual_links = result["source"].get("materialized_symlinks", [])
+    check("receipt binds every original link blob and literal to the pinned referent and actual copied bytes",
+          len(actual_links) == 3 and {row["path"]: row for row in actual_links} == expected_links)
+    check("durable receipt retains exact child pin and link evidence without private filesystem paths",
+          result["source"].get("submodules") == [{"path": "vendor/tool", "repository": "fixture/links-child",
+                                                  "source_commit": child_pin}] and
+          json.loads(Path(result["source_receipt"]["path"]).read_text()) == result["source"] and
+          str(root) not in json.dumps(result["source"]))
+    checkout_calls = [row for row in calls(fixture) if "checkout" in row["arguments"]]
+    check("both real checkouts disable OS symlink creation and the source path performs no HTTP",
+          len(checkout_calls) == 2 and all("core.symlinks=false" in row["arguments"] for row in checkout_calls) and no_http(fixture))
+
+    for label, injection in (
+        ("links-materialized-drift", {"mutate_source": True, "mutate_source_member": "apps/primary/message.txt"}),
+        ("links-referent-drift", {"mutate_source": True, "mutate_source_member": "shared/message.txt"}),
+        ("links-literal-drift", {"mutate_link_evidence": True}),
+        ("links-index-drift", {"mutate_link_index": True}),
+    ):
+        refused, _, refused_fixture = run(label, parameters={"Prefix": str(prefix)}, **injection)
+        check(label + " after genuine compilation refuses and preserves every installed executable",
+              refused.returncode == 7 and any(row["arguments"][0] == "build" for row in calls(refused_fixture)) and
+              all(digest(prefix / name) == value for name, value in original.items()),
+              refused.stderr.decode(errors="replace"))
+    rollback, _, _ = run("links-rollback", parameters={"Prefix": str(prefix)}, move_fault=True)
+    check("linked source families retain ordinary second-move rollback",
+          rollback.returncode == 7 and all(digest(prefix / name) == value for name, value in original.items()),
+          rollback.stderr.decode(errors="replace"))
+    for label, member in (("links-checkout-literal", "docs/CLAUDE.md"), ("links-checkout-referent", "docs/AGENTS.md")):
+        refused, _, refused_fixture = run(label, parameters={"Prefix": str(prefix)}, mutate_checkout_member=member)
+        check(label + " cannot supply unauthenticated bytes to the compiler",
+              refused.returncode == 7 and not any(row["arguments"][0] == "build" for row in calls(refused_fixture)) and
+              all(digest(prefix / name) == value for name, value in original.items()),
+              refused.stderr.decode(errors="replace"))
+
+    unsafe = [
+        ("outside", [("docs/CLAUDE.md", "../../outside")]),
+        ("absolute", [("docs/CLAUDE.md", "/outside")]),
+        ("drive", [("docs/CLAUDE.md", "C:/outside")]),
+        ("admin", [("docs/CLAUDE.md", "../.git/config")]),
+        ("missing", [("docs/CLAUDE.md", "MISSING.md")]),
+        ("directory", [("docs/CLAUDE.md", "../docs")]),
+        ("case", [("docs/CLAUDE.md", "agents.md")]),
+        ("transient-file", [("docs/CLAUDE.md", "AGENTS.md/../AGENTS.md")]),
+        ("cross-submodule", [("docs/CLAUDE.md", "../vendor/tool/shared/message.txt")]),
+        ("empty", [("docs/CLAUDE.md", "")]),
+        ("newline", [("docs/CLAUDE.md", "AGENTS.md\n")]),
+        ("invalid-utf8", [("docs/CLAUDE.md", b"\xff")]),
+        ("chain", [("docs/CLAUDE.md", "SECOND.md"), ("docs/SECOND.md", "AGENTS.md")]),
+        ("cycle", [("docs/CLAUDE.md", "SECOND.md"), ("docs/SECOND.md", "CLAUDE.md")]),
+    ]
+    for label, links in unsafe:
+        invalid, pin = repository("links-" + label, root_files, links, [("vendor/tool", child_pin)])
+        mapping = dict(repository_map, **{"fixture/source-links": invalid.as_uri()})
+        refused, _, refused_fixture = run("links-" + label, repositories=mapping, source_ref=pin,
+                                         parameters={"Prefix": str(prefix)})
+        check(label + " link is refused before compilation and preserves the installed family",
+              refused.returncode == 4 and not any(row["arguments"][0] == "build" for row in calls(refused_fixture)) and
+              all(digest(prefix / name) == value for name, value in original.items()),
+              refused.stderr.decode(errors="replace"))
+
+    escaped_child, escaped_pin = repository("links-child-escape", child_files,
+        [("apps/primary/message.txt", "../../../docs/AGENTS.md"), child_links[1]])
+    escaped_root, escaped_root_pin = repository("links-child-escape-root", root_files, (),
+                                               [("vendor/tool", escaped_pin)])
+    refused, _, refused_fixture = run("links-child-escape",
+        repositories={"fixture/source-links": escaped_root.as_uri(), "fixture/links-child": escaped_child.as_uri()},
+        source_ref=escaped_root_pin, parameters={"Prefix": str(prefix)})
+    check("a child link cannot escape to an otherwise tracked regular file in its parent repository",
+          refused.returncode == 4 and not any(row["arguments"][0] == "build" for row in calls(refused_fixture)) and
+          all(digest(prefix / name) == value for name, value in original.items()),
+          refused.stderr.decode(errors="replace"))
+
+    long_child, long_child_pin = repository("links-long-child", {"target": "bounded\n"}, [("l" * 240, "target")])
+    long_path = "/".join(["p" * 200] * 4)
+    long_root, long_pin = repository("links-long-root",
+        {".gitmodules": root_modules.replace("vendor/tool", long_path)}, (), [(long_path, long_child_pin)])
+    refused, _, refused_fixture = run("links-flattened-bound",
+        repositories={"fixture/source-links": long_root.as_uri(), "fixture/links-child": long_child.as_uri()}, source_ref=long_pin)
+    check("nested materialized links retain the existing flattened path-length bound",
+          refused.returncode == 4 and b"Nested tracked source link exceeds the source bounds" in refused.stderr and
+          not any(row["arguments"][0] == "build" for row in calls(refused_fixture)),
+          refused.stderr.decode(errors="replace"))
+
+
+if options.symlinks_only:
+    test_source_symlinks()
+    print(f"Windows tracked source-link tests: {passed} passed, {failed} failed", flush=True)
+    print("Real Git and Go PE compilation through portable PowerShell; native Windows and live GitHub remain unqualified.", flush=True)
     raise SystemExit(1 if failed else 0)
 
 

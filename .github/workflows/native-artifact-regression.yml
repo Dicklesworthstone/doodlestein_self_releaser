@@ -474,6 +474,7 @@ jobs:
           timeout 120 bash scripts/tests/test_install_source_windows.sh --acquisition-errors-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/windows-acquisition-errors.log"
           timeout 120 bash scripts/tests/test_install_source_windows.sh --fallback-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/windows-source-fallback.log"
           timeout 120 bash scripts/tests/test_install_source_windows.sh --submodules-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/windows-source-submodules.log"
+          timeout 120 bash scripts/tests/test_install_source_windows.sh --symlinks-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/windows-source-symlinks.log"
           test -z "$(git status --porcelain)"
       - name: Validate native compilation, manifests and signed provenance
         shell: bash

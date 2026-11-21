@@ -2450,8 +2450,12 @@ It requires existing Git and the selected compiler, executes repository/dependen
 build code, and never installs a compiler automatically. `-SourceRef` accepts `HEAD`
 (the default), a full commit SHA, `refs/heads/BRANCH` or `refs/tags/TAG`. The
 fetched ref is resolved once to a commit in a private detached checkout; an
-explicit SHA must match exactly. Symbolic links, submodules, unsafe Windows
-paths and case collisions in the selected source tree are refused. Go settings
+explicit SHA must match exactly. Recursive submodules are fetched at each
+parent's exact gitlink commit, with committed `.gitmodules` declarations and
+repository-scoped credentials. The complete acquisition shares one
+`-SourceTimeout` deadline and is bounded by 16 child levels, 256 repositories
+and 100000 tracked entries. Unsafe Windows paths and case collisions are
+refused. Go settings
 cannot inherit a different `GOOS`, `GOARCH`, `GOFLAGS`, `GOENV`, `GOWORK` or an
 automatic toolchain download. Existing dependency access and caches otherwise
 remain the installing user's Go environment.
@@ -2464,6 +2468,26 @@ retain its tracked-source fingerprint, and pass PE checks before any installed
 executable changes. Expected output hashes remain bound through the existing
 journaled family installation and recovery path. Failed builds retain private
 diagnostics and leave installed executables untouched.
+
+Tracked file links such as `CLAUDE.md -> AGENTS.md` may select an exact-case
+regular tracked file in the same repository. Private checkouts disable OS
+symlink creation; the installer authenticates the literal Git link blob and
+the referent, then replaces the plain link-text stub with a regular copy.
+Committed checkout conversions such as line-ending rules are authenticated
+against Git's converted blob output without using external filters as proof.
+No Windows symbolic-link privileges are required.
+
+Absolute and escaping targets, administration paths, directory links, link
+chains, cycles, missing referents, reparse points and cross-submodule referents
+are refused before compilation. A link cannot enter a nested repository even
+temporarily before `..`, or escape from a child into its parent. The original
+link text is retained independently of the materialized file and index. Before
+and after compiling, the pinned graph, original link evidence, referent bytes,
+materialized copies and complete tracked-source fingerprint must still agree.
+Source receipts add `submodules: [{path, repository, source_commit}]` and
+`materialized_symlinks` entries with `path`, `git_blob`, `link_target`,
+`referent_path`, `referent_git_blob`, `sha256` and `size_bytes`. All paths are
+root-relative; the hash and size bind the actual copied bytes.
 
 Without a `go.work`, the main module's local replacement directives must still
 resolve to exact committed modules inside the pinned checkout. Absolute paths,
@@ -2807,8 +2831,9 @@ identity using explicit Git directory/worktree paths. Untracked compiler outputs
 remain permitted; ordinary checkout line-ending conversion is preserved.
 Source receipts add `submodules: [{path, repository, source_commit}]`, with paths
 relative to the root checkout. This is a before/after source consistency check,
-not isolation of repository build code. Native PowerShell source installers
-retain their existing submodule refusal.
+not isolation of repository build code. Generated PowerShell source installers
+also support the pinned recursive graph, with the Windows regular-file link
+materialization rules described above.
 
 For generated Bash installers using an explicit token without `gh`,
 `--allow-source-build` permits fallback on classified release discovery,

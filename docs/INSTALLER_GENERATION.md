@@ -602,8 +602,9 @@ workspace selected by the nearest `go.work` inside the fetched repository. A
 moduleless workspace root can select separate `cmd/<name>` command modules.
 The [committed Go workspace rules](#committed-go-workspaces) apply to both source
 engines, including local replacements, workspace vendoring and receipt fields.
-Source paths must be relative and Windows-safe. The installer rejects tracked symlinks, submodules,
-case aliases and file/directory collisions before checkout. It resolves every
+Source paths must be relative and Windows-safe. The installer rejects case
+aliases and file/directory collisions before checkout. Pinned submodules and
+confined tracked file links are supported as described below. It resolves every
 selected package and requires `package main` before the first build. Per-target
 workspace lists also apply to source builds, including ARM64-specific families.
 
@@ -893,7 +894,22 @@ the table above. Declarations are parsed directly from the committed
 `.gitmodules` blob without following includes or executing update commands.
 Missing, repeated, case-colliding, escaping and unmatched declarations refuse
 the build; an unavailable child commit cannot retry its default branch.
-Symbolic links and reparse points remain unsupported.
+
+Tracked file links such as `CLAUDE.md -> AGENTS.md` are materialized as regular
+copies without Windows symlink privileges. A relative link must select an
+exact-case regular tracked file in the same repository. Absolute or escaping
+targets, Git administration paths, directory links, link chains, cycles and
+missing referents are refused. A link cannot enter another submodule, even
+temporarily before `..`, or escape a child into its parent repository. Actual
+filesystem symlinks and reparse points remain refused.
+
+The installer authenticates the original literal link blob and the referent
+against the pinned Git tree before copying. Supported Git checkout conversions,
+including committed line-ending rules, are verified against Git's converted
+blob output without executing external filters as verification. The receipt
+adds `materialized_symlinks` records containing `path`, `git_blob`, `link_target`,
+`referent_path`, `referent_git_blob`, `sha256` and `size_bytes`; paths are relative
+to the root checkout and the hash and size describe the actual copied bytes.
 
 The acquisition graph is limited to 16 child levels, 256 repositories including
 the root, and 100000 tracked entries. One `-SourceTimeout` deadline covers all
@@ -901,7 +917,9 @@ recursive acquisition commands; each later compiler command retains its existing
 deadline. Before and after compilation, every repository must retain its pinned
 HEAD and staged tree, including gitlink identities and file modes. The installer
 also compares the actual bytes of every tracked regular file across the graph,
-with explicit Git directory, worktree, index and object-directory bindings.
+including each materialized link and referent, and retains the original link
+text independently of the working copy and index. These checks use explicit
+Git directory, worktree, index and object-directory bindings.
 The source receipt adds the root-relative `submodules` inventory shown above.
 These checks preserve the ordinary PE validation and complete-family
 installation, rollback and recovery behavior; they do not sandbox build code.
@@ -911,6 +929,7 @@ real Git repositories and genuine Go compilation of Windows x64/ARM64 families:
 
 ```bash
 bash scripts/tests/test_install_source_windows.sh --submodules-only
+bash scripts/tests/test_install_source_windows.sh --symlinks-only
 ```
 
 Its local Git transport and portable PowerShell host adapters make this a source
