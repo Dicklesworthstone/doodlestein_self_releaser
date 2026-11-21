@@ -140,6 +140,33 @@ native_build:
 | `-s GITHUB_TOKEN` | Pass secrets | `-s GITHUB_TOKEN` |
 | `-e <event.json>` | Event payload | `-e event.json` |
 
+### Release tag context
+
+When `dsr build` runs a workflow for a version such as `v1.2.3`, the selected
+tag is available in both GitHub expression contexts and the step environment:
+
+- `github.ref` and `github.event.ref` are `refs/tags/v1.2.3`.
+- `github.ref_name` is `v1.2.3`, and `github.ref_type` is `tag`.
+- `GITHUB_EVENT_PATH` points to the push payload containing that exact `ref`.
+- `GITHUB_REF`, `GITHUB_REF_NAME`, and `GITHUB_REF_TYPE` carry the same values.
+
+This lets a release job guarded by
+`if: startsWith(github.event.ref, 'refs/tags/')` run as it does for a tag push.
+Environment variables alone do not populate `github.event`; act reads that
+context from its [event payload](https://nektosact.com/usage/index.html#using-event-file-to-provide-complete-event-payload).
+
+Each invocation writes its own private `RUN_ID.event.json` beside its log and
+passes it with `--eventpath`. Concurrent jobs and retries keep separate payloads,
+and the event file is excluded from the uploaded artifact inventory. The
+selected release tag takes precedence over additional environment overrides.
+Invalid Git tag names and explicit competing `-e`/`--eventpath` options fail
+before execution or run-storage allocation. The generated payload supplies
+the selected `ref`; it does not fabricate other GitHub webhook properties.
+
+Direct sourceable `act_run_workflow` calls may omit job, event, and version;
+the default event is `push`. Calls without a version and calls using an event
+other than `push` retain their custom event-file behavior.
+
 ## Known Limitations
 
 ### Jobs That Cannot Run in act

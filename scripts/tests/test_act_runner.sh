@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_act_runner.sh - Unit tests for act_runner.sh module
 #
-# Usage: ./test_act_runner.sh [--workflow-isolation-only | --worker-admission-cancel-only | --typed-companions-only | --shared-matrix-only | --workflow-variants-only | --variant-companions-only]
+# Usage: ./test_act_runner.sh [--tag-event-only | --workflow-isolation-only | --worker-admission-cancel-only | --typed-companions-only | --shared-matrix-only | --workflow-variants-only | --variant-companions-only]
 #
 # Tests act integration functions without actually running Docker
 
@@ -869,6 +869,191 @@ EOF
     fi
 }
 
+# Exercise the complete workflow invocation against a recording executable.
+# Set DSR_TEST_REAL_ACT to an installed act binary to also run an actual local
+# host job whose condition and output use github.event, without Docker/actions.
+test_workflow_tag_event() {
+    log_test "workflow tag event and optional invocation arguments"
+    if python3 -I - "$SRC_DIR/act_runner.sh" "${DSR_TEST_REAL_ACT:-}" <<'PY'
+import json
+import os
+from pathlib import Path
+import stat
+import subprocess
+import sys
+import tempfile
+
+module = Path(sys.argv[1]).resolve()
+real_act = Path(sys.argv[2]).resolve() if sys.argv[2] else None
+root = Path(tempfile.mkdtemp(prefix='dsr-workflow-tag-')).resolve()
+print('Retained workflow tag fixtures: ' + str(root), flush=True)
+checks, failures = 0, []
+
+
+def check(label, condition):
+    global checks
+    checks += 1
+    print(('PASS ' if condition else 'FAIL ') + label, flush=True)
+    if not condition:
+        failures.append(label)
+
+
+source = root / 'source'
+source.mkdir()
+(source / 'workflow.yml').write_text('name: fixture\non: push\njobs: {}\n')
+custom = root / 'custom-event.json'
+custom.write_text('{"ref":"refs/heads/custom","inputs":{"literal":"keep me"}}\n')
+transport = '''#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+payload = None
+event_path = None
+environment = {}
+for index, value in enumerate(args):
+    if value == '--eventpath':
+        event_path = args[index + 1]
+    if value == '--env':
+        key, value = args[index + 1].split('=', 1)
+        environment[key] = value
+if event_path:
+    payload = json.loads(pathlib.Path(event_path).read_text())
+pathlib.Path(os.environ['DSR_EVENT_LAUNCH']).write_text(json.dumps({
+    'argv': args, 'environment': environment, 'event_path': event_path, 'payload': payload}))
+'''
+driver = '''source "$1" || exit $?
+shift
+act_check() { return 0; }
+act_run_workflow "$@"
+'''
+
+
+def invoke(label, arguments, actual=False):
+    directory = root / label
+    directory.mkdir()
+    home = directory / 'home'
+    home.mkdir()
+    (home / '.actrc').write_text('-P ubuntu-latest=-self-hosted\n')
+    binary_dir = directory / 'bin'
+    binary_dir.mkdir()
+    binary = binary_dir / 'act'
+    if actual:
+        binary.symlink_to(real_act)
+    else:
+        binary.write_text(transport)
+        binary.chmod(0o755)
+    environment = os.environ.copy()
+    environment.update(PATH=str(binary_dir) + os.pathsep + environment['PATH'],
+                       HOME=str(home), XDG_CONFIG_HOME=str(home / '.config'),
+                       XDG_CACHE_HOME=str(home / '.cache'), DSR_CACHE_DIR=str(directory / 'cache'),
+                       ACT_ARTIFACTS_DIR=str(directory / 'artifacts'),
+                       ACT_LOGS_DIR=str(directory / 'logs'), ACT_TIMEOUT='25',
+                       DSR_EVENT_LAUNCH=str(directory / 'launch.json'))
+    result = subprocess.run(['bash', '-c', driver, '_', str(module)] + arguments,
+                            env=environment, stdin=subprocess.DEVNULL, capture_output=True, timeout=35)
+    (directory / 'stdout').write_bytes(result.stdout)
+    (directory / 'stderr').write_bytes(result.stderr)
+    launch = directory / 'launch.json'
+    return result, json.loads(launch.read_text()) if launch.exists() else None, directory
+
+
+for optional in ([], ['build'], ['build', 'workflow_dispatch']):
+    result, launch, _ = invoke('optional-' + str(len(optional)), [str(source), 'workflow.yml'] + optional)
+    check('documented invocation with %d arguments succeeds' % (2 + len(optional)), result.returncode == 0)
+    argv = launch['argv'] if launch else []
+    check('optional arguments never become duplicate positional act arguments',
+          argv.count(str(source)) == 1 and argv.count('workflow.yml') == 1 and
+          argv.count('workflow_dispatch' if len(optional) == 2 else 'push') == 1 and
+          (argv.count('build') == 1 if optional else '-j' not in argv))
+
+for label, version in (('tag', '1.2.3'), ('prefixed-tag', 'v1.2.3'), ('quoted-tag', 'release"candidate')):
+    result, launch, directory = invoke(label, [str(source), 'workflow.yml', 'build', 'push', version,
+        '--env', 'GITHUB_REF=refs/heads/contradiction', '--matrix', 'label:two words'])
+    tag = 'v' + version.removeprefix('v')
+    check(label + ' produces one successful workflow receipt',
+          result.returncode == 0 and json.loads(result.stdout)['status'] == 'success')
+    check(label + ' sends its exact tag through the GitHub event payload',
+          launch is not None and launch['payload'] == {'ref': 'refs/tags/' + tag})
+    check(label + ' keeps event and environment contexts consistent',
+          launch is not None and launch['environment'].get('GITHUB_REF') == 'refs/tags/' + tag and
+          launch['environment'].get('GITHUB_REF_NAME') == tag and
+          launch['environment'].get('GITHUB_REF_TYPE') == 'tag')
+    event = Path(launch['event_path']) if launch and launch['event_path'] else None
+    check(label + ' retains private event evidence outside uploaded artifacts',
+          event is not None and event.is_file() and stat.S_IMODE(event.stat().st_mode) == 0o600 and
+          event.parent == directory / 'logs' and json.loads(result.stdout)['artifact_count'] == 0)
+    check(label + ' preserves literal additional arguments', launch is not None and 'label:two words' in launch['argv'])
+
+for index, extra in enumerate((['--eventpath', str(custom)], ['--eventpath=' + str(custom)],
+                               ['-e', str(custom)], ['-e' + str(custom)], ['--'])):
+    result, launch, directory = invoke('conflicting-event-' + str(index),
+        [str(source), 'workflow.yml', 'build', 'push', 'v1.2.3'] + extra)
+    check('conflicting event selector %d refuses before storage or execution' % index,
+          result.returncode == 4 and launch is None and not (directory / 'artifacts').exists() and
+          not (directory / 'logs').exists() and not result.stdout)
+
+for index, arguments in enumerate(([], [str(source)],
+        [str(source), 'workflow.yml', 'build', 'push', 'bad tag'],
+        [str(source), 'workflow.yml', 'build', 'push', '../other'])):
+    result, launch, directory = invoke('invalid-' + str(index), arguments)
+    check('invalid invocation %d refuses without execution or persistent storage' % index,
+          result.returncode == 4 and launch is None and not (directory / 'artifacts').exists() and
+          not (directory / 'logs').exists() and not result.stdout)
+
+for label, event, version in (('versionless-custom', 'push', ''), ('other-event-custom', 'workflow_dispatch', 'v1.2.3')):
+    result, launch, _ = invoke(label, [str(source), 'workflow.yml', 'build', event, version,
+                                    '--eventpath', str(custom)])
+    check(label + ' preserves explicit caller-owned event data',
+          result.returncode == 0 and launch is not None and launch['event_path'] == str(custom) and
+          launch['payload'] == json.loads(custom.read_text()))
+
+if real_act:
+    workflow = source / 'tag.yml'
+    workflow.write_text('''name: Actual tag context
+on: push
+jobs:
+  release:
+    if: startsWith(github.event.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Read event and expression contexts
+        run: |
+          printf '%s|%s|%s|%s\\n' '${{ github.event.ref }}' '${{ github.ref }}' '${{ github.ref_name }}' '${{ github.ref_type }}' > "$DSR_EVENT_RESULT"
+          cat "$GITHUB_EVENT_PATH" > "$DSR_EVENT_PAYLOAD"
+''')
+    for command in (['git', 'init', '-q', '-b', 'main', str(source)],
+                    ['git', '-C', str(source), 'add', '.'],
+                    ['git', '-C', str(source), '-c', 'user.name=DSR Test', '-c',
+                     'user.email=test@example.invalid', 'commit', '-qm', 'tag fixture'],
+                    ['git', '-C', str(source), 'tag', 'v1.2.3'],
+                    ['git', '-C', str(source), 'remote', 'add', 'origin', 'https://github.com/example/tag-fixture']):
+        subprocess.run(command, check=True, capture_output=True)
+    result, _, directory = invoke('actual-act', [str(source), 'tag.yml', 'release', 'push', 'v1.2.3',
+        '-P', 'ubuntu-latest=-self-hosted', '--action-offline-mode',
+        '--artifact-server-addr', '127.0.0.1', '--artifact-server-port', '0',
+        '--cache-server-addr', '127.0.0.1',
+        '--env', 'DSR_EVENT_RESULT=' + str(source / 'tag-context.txt'),
+        '--env', 'DSR_EVENT_PAYLOAD=' + str(source / 'tag-payload.json')], actual=True)
+    marker = source / 'tag-context.txt'
+    payload = source / 'tag-payload.json'
+    check('actual act runs the release job selected by github.event.ref',
+          result.returncode == 0 and marker.exists())
+    check('actual act expressions retain the selected tag across every context',
+          marker.exists() and marker.read_text() == 'refs/tags/v1.2.3|refs/tags/v1.2.3|v1.2.3|tag\n')
+    check('actual GITHUB_EVENT_PATH contains the selected push tag',
+          payload.exists() and json.loads(payload.read_text()).get('ref') == 'refs/tags/v1.2.3')
+    if result.returncode or not marker.exists():
+        print((directory / 'stderr').read_text(), file=sys.stderr)
+
+print('Workflow tag event results: %d checks, %d failures' % (checks, len(failures)), flush=True)
+raise SystemExit(bool(failures))
+PY
+    then
+        log_pass "Workflow invocation preserves tag event identity and optional arguments"
+    else
+        log_fail "Workflow invocation lost tag event identity or optional arguments"
+    fi
+}
+
 # bd-1d26: without any runner-image mapping, act opens a first-run image
 # survey that exits on EOF. A non-interactive run must fail with dependency
 # exit 3 and a remediation message before launching act, while a repo-level
@@ -1206,6 +1391,11 @@ for case in ('ordinary', 'writable-parent'):
                   'GITHUB_REF=refs/tags/v1.2.3' in launch['argv'] and
                   'GITHUB_REF_NAME=v1.2.3' in launch['argv'] and
                   'GITHUB_REF_TYPE=tag' in launch['argv'])
+            event_path = Path(launch['argv'][launch['argv'].index('--eventpath') + 1]) if '--eventpath' in launch['argv'] else None
+            check(case + ': ' + name + ' retains its own private tag event outside uploads',
+                  event_path is not None and event_path == Path(result['log_file']).with_suffix('.event.json') and
+                  json.loads(event_path.read_text()) == {'ref': 'refs/tags/v1.2.3'} and
+                  stat.S_IMODE(event_path.stat().st_mode) == 0o600)
             check(case + ': ' + name + ' owns private artifact storage and log',
                   stat.S_IMODE(Path(result['artifact_dir']).stat().st_mode) == 0o700 and
                   stat.S_IMODE(Path(result['log_file']).stat().st_mode) == 0o600)
@@ -3205,6 +3395,11 @@ PY
 
 # Main
 main() {
+    if [[ "${1:-}" == "--tag-event-only" ]]; then
+        test_workflow_tag_event
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return
+    fi
     if [[ "${1:-}" == "--owned-timeouts-only" ]]; then
         test_timeout_owned_groups
         [[ "$FAIL_COUNT" -eq 0 ]]
@@ -3274,6 +3469,7 @@ main() {
     test_act_cleanup
     test_workflow_validation
     test_act_run_workflow_injects_tag_env
+    test_workflow_tag_event
     test_act_run_workflow_requires_runner_image_mapping
     test_act_run_workflow_isolates_parent_write_workflows
     test_concurrent_workflow_isolation

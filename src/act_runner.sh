@@ -3076,16 +3076,48 @@ _act_validate_workflow_source_results() {
 # Run a workflow via act
 # Usage: act_run_workflow <repo_path> <workflow> [job] [event] [version] [extra_args...]
 # Returns: exit code (0=success, 1=partial, 6=build failed, 3=dependency error)
-# Note: When version is provided, GITHUB_REF/GITHUB_REF_NAME/GITHUB_REF_TYPE are injected
-#       to simulate a tag push for release workflows
+# When version is provided, the selected tag owns the GitHub ref environment.
+# Push workflows also receive a private event payload so github.event.ref and
+# GITHUB_EVENT_PATH describe the same tag as the github.ref expression context.
 act_run_workflow() {
+    if [[ $# -lt 2 ]]; then
+        _log_error "act_run_workflow requires a repository path and workflow"
+        return 4
+    fi
     local repo_path="$1"
     local workflow="$2"
     local job="${3:-}"
     local event="${4:-push}"
     local version="${5:-}"
-    shift 5 2>/dev/null || true
+    if [[ $# -gt 5 ]]; then shift 5; else set --; fi
     local extra_args=("$@")
+
+    local tag="" argument
+    if [[ -n "$version" ]]; then
+        tag="v${version#v}"
+        if ! git check-ref-format "refs/tags/$tag" >/dev/null 2>&1; then
+            _log_error "Invalid workflow release tag: $tag"
+            return 4
+        fi
+        # A caller-supplied event file could disagree with the selected tag or
+        # silently lose its custom fields if replaced. Refuse that ambiguity
+        # before allocating storage. Versionless and non-push callers retain
+        # their existing ability to provide a complete custom event payload.
+        for argument in "${extra_args[@]}"; do
+            case "$argument" in
+                --)
+                    _log_error "Workflow release arguments cannot end option parsing before the selected tag context"
+                    return 4
+                    ;;
+                -e|-e?*|--eventpath|--eventpath=*)
+                    if [[ "$event" == push ]]; then
+                        _log_error "A versioned push owns its tag event; remove the explicit act eventpath option"
+                        return 4
+                    fi
+                    ;;
+            esac
+        done
+    fi
 
     local workflow_path="$repo_path/$workflow"
     if [[ ! -f "$workflow_path" ]]; then
@@ -3154,16 +3186,6 @@ act_run_workflow() {
     # Add event
     act_cmd+=("$event")
 
-    # Inject tag context for release workflows when version is provided
-    # This simulates a tag push so workflows can detect the version
-    if [[ -n "$version" ]]; then
-        local tag="v${version#v}"  # Ensure v prefix, avoid doubling
-        act_cmd+=(--env "GITHUB_REF=refs/tags/$tag")
-        act_cmd+=(--env "GITHUB_REF_NAME=$tag")
-        act_cmd+=(--env "GITHUB_REF_TYPE=tag")
-        _log_info "Injecting tag context: $tag"
-    fi
-
     # Ensure USER is set inside act containers (some workflows rely on it)
     if [[ -n "${USER:-}" ]]; then
         act_cmd+=(--env "USER=$USER")
@@ -3176,6 +3198,27 @@ act_run_workflow() {
     # Add any extra arguments
     if [[ ${#extra_args[@]} -gt 0 ]]; then
         act_cmd+=("${extra_args[@]}")
+    fi
+
+    # act reads github.event from its event file, independently of --env.
+    # Keep release context last so configured env/actrc values cannot make
+    # github.ref disagree with the version this invocation is building.
+    if [[ -n "$tag" ]]; then
+        act_cmd+=(--env "GITHUB_REF=refs/tags/$tag")
+        act_cmd+=(--env "GITHUB_REF_NAME=$tag")
+        act_cmd+=(--env "GITHUB_REF_TYPE=tag")
+        if [[ "$event" == push ]]; then
+            local event_file="$ACT_LOGS_DIR/$run_id.event.json"
+            # Store control data beside the log, never inside the upload
+            # inventory. Each concurrent run/retry owns a separate private file.
+            if ! (umask 077; set -o noclobber;
+                  jq -nc --arg ref "refs/tags/$tag" '{ref:$ref}' > "$event_file"); then
+                _log_error "Failed to reserve the workflow tag event: $event_file"
+                return 4
+            fi
+            act_cmd+=(--eventpath "$event_file")
+        fi
+        _log_info "Injecting tag context: $tag"
     fi
 
     local isolated_home=""
