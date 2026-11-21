@@ -123,9 +123,102 @@ expect 'all full retains wait-compatible host' 0 '["alpha","best available (at c
     projection '[.selected,.reason]' selector_choose_host --target linux/amd64 --json
 selector_release_slot gamma held >/dev/null 2>&1 || exit 1
 HEALTH='["gamma","delta","gamma"]'
-expect 'deduplication and deterministic tie break' 0 '["delta","gamma"]' projection 'map(.hostname)' selector_get_candidates --target linux/amd64
+expect 'deduplication and deterministic tie break' 0 '["delta","gamma"]' projection 'map(.hostname)' selector_get_candidates
 HEALTH='["delta","gamma"]'
-expect 'tie independent of health ordering' 0 delta selector_choose_host --target linux/amd64
+expect 'tie independent of health ordering' 0 delta selector_choose_host
+
+# A healthy machine with the same OS is not automatically a cross compiler.
+# Retain the unfiltered ordering controls above, then prove target eligibility
+# independently of local-host bonuses, spare capacity and preferences.
+HEALTH='["alpha","gamma","delta"]'
+expect 'ARM64 target selects the actual ARM64 host over local x64' 0 delta selector_choose_host --target linux/arm64
+expect 'target inventory excludes opposite architectures' 0 '["delta"]' \
+    projection 'map(.hostname)' selector_get_candidates --target linux/arm64
+expect 'x64 target excludes healthy ARM64 hosts' 0 '["alpha","gamma"]' \
+    projection 'map(.hostname)' selector_get_candidates --target linux/amd64
+expect 'preference cannot authorize an implicit cross build' 0 delta selector_choose_host --target linux/arm64 --prefer alpha
+expect 'toolchain capability does not establish target architecture' 1 '' selector_choose_host --target linux/arm64 --capability rust
+selector_acquire_slot delta occupied >/dev/null 2>&1 || exit 1
+expect 'full matching host waits instead of spilling to a different architecture' 0 '["delta","best available (at capacity)"]' \
+    projection '[.selected,.reason]' selector_choose_host --target linux/arm64 --json
+selector_release_slot delta occupied >/dev/null 2>&1 || exit 1
+HEALTH='["alpha","gamma"]'
+expect 'an OS match without an architecture match cannot schedule' 1 '' selector_choose_host --target linux/arm64
+
+# Exercise the actual native route and build-matrix consumers with real
+# configuration parsing. Only the health inventory is a controlled boundary;
+# no SSH or compiler is needed to prove which worker would receive the task.
+native_route() (
+    local scenario="$1" route_root="$work/route-$1"
+    mkdir -p "$route_root/config/repos.d" "$route_root/source" || return 1
+    export DSR_CONFIG_DIR="$route_root/config" DSR_HOSTS_FILE="$route_root/config/hosts.yaml"
+    export DSR_STATE_DIR="$route_root/state" DSR_CACHE_DIR="$route_root/cache"
+    export ACT_CONFIG_DIR="$route_root/config"
+    _SELECTOR_STATE_DIR="" _SELECTOR_LOCKS_DIR=""
+    # shellcheck source=/dev/null
+    source "$ROOT/src/config.sh" || return $?
+    # shellcheck source=/dev/null
+    source "${DSR_ROUTING_MODULE:-$ROOT/src/act_runner.sh}" || return $?
+    cat > "$DSR_HOSTS_FILE" <<'JSON'
+{"hosts":{
+  "trj":{"platform":"linux/amd64","connection":"local","concurrency":4},
+  "armbox":{"platform":"linux/arm64","connection":"ssh","concurrency":1}
+}}
+JSON
+    jq -nc --arg path "$route_root/source" '{tool_name:"route",repo:"example/route",
+        local_path:$path,language:"go",binary_name:"route",build_cmd:"custom-builder",
+        targets:["linux/amd64","linux/arm64"],
+        act_job_map:{"linux/amd64":null,"linux/arm64":null}}' \
+        > "$ACT_REPOS_DIR/route.yaml" || return 1
+    HEALTH='["trj","armbox"]'
+    case "$scenario" in
+        strategy|matrix) ;;
+        no-match|no-match-matrix) HEALTH='["trj"]' ;;
+        no-health) HEALTH='[]' ;;
+        selector-disabled) export DSR_DISABLE_HOST_SELECTOR=1 ;;
+        native-default) HEALTH='[]'; act_get_native_host linux/amd64 route; return $? ;;
+        mapped-cross)
+            HEALTH='["trj"]'
+            jq '. + {platform_mapping:{"linux/arm64":"trj"}}' "$DSR_HOSTS_FILE" > "$route_root/hosts.json" || return 1
+            cp "$route_root/hosts.json" "$DSR_HOSTS_FILE" || return 1
+            ;;
+        pinned-cross|legacy-pin)
+            local key=cross_compile
+            [[ "$scenario" != legacy-pin ]] || key=hosts
+            jq --arg key "$key" '.[$key] =
+                (if $key == "hosts" then {"linux/arm64":"trj"}
+                 else {"linux/arm64":{host:"trj"}} end)' \
+                "$ACT_REPOS_DIR/route.yaml" > "$route_root/repo.json" || return 1
+            cp "$route_root/repo.json" "$ACT_REPOS_DIR/route.yaml" || return 1
+            ;;
+        *) return 4 ;;
+    esac
+    local result status=0
+    if [[ "$scenario" == *matrix ]]; then
+        result=$(act_build_matrix route) || status=$?
+        [[ $status -eq 0 ]] || return "$status"
+        jq -c 'map([.platform,.host])' <<< "$result"
+    else
+        result=$(act_get_build_strategy route linux/arm64) || status=$?
+        [[ $status -eq 0 ]] || return "$status"
+        jq -c '[.platform,.method,.host]' <<< "$result"
+    fi
+)
+if command -v yq >/dev/null; then
+    expect 'native build strategy receives the matching ARM64 worker' 0 '["linux/arm64","native","armbox"]' native_route strategy
+    expect 'complete native matrix assigns each physical architecture' 0 '[["linux/amd64","trj"],["linux/arm64","armbox"]]' native_route matrix
+    expect 'selector refusal cannot fall through to an x64 legacy alias' 1 '' native_route no-match
+    expect 'missing health cannot invent a cross build on the legacy host' 1 '' native_route no-health
+    expect 'disabled selector does not imply cross compilation' 1 '' native_route selector-disabled
+    expect 'a missing architecture fails the whole build matrix' 1 '' native_route no-match-matrix
+    expect 'matching native legacy default remains available' 0 trj native_route native-default
+    expect 'explicit platform mapping retains intentional cross builds' 0 '["linux/arm64","native","trj"]' native_route mapped-cross
+    expect 'per-repository cross host retains intentional cross builds' 0 '["linux/arm64","native","trj"]' native_route pinned-cross
+    expect 'legacy per-repository host pin retains intentional cross builds' 0 '["linux/arm64","native","trj"]' native_route legacy-pin
+else
+    printf 'SKIP: yq is required for integrated native route controls\n' >&2
+fi
+
 HEALTH_STATUS=8
 expect 'health failure is not a successful inventory' 8 '' selector_get_candidates
 expect 'health failure propagates through selection' 8 '' selector_choose_host

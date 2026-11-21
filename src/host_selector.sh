@@ -495,12 +495,12 @@ selector_get_candidates() {
         platform=$(jq -r --arg h "$hostname" '.hosts[$h].platform // ""' <<< "$config") || return 4
         connection=$(jq -r --arg h "$hostname" '.hosts[$h].connection // "ssh"' <<< "$config") || return 4
 
-        # Filter by target platform if specified
-        if [[ -n "$os" ]]; then
-            local host_os="${platform%/*}"
-            if [[ "$host_os" != "$os" ]]; then
-                continue
-            fi
+        # Dynamic spillover requires the complete physical target. Sharing an
+        # OS does not establish that a host has the other architecture's SDK,
+        # linker, runner or dependencies. Explicit cross-build routes are
+        # resolved by act_get_native_host before/after automatic selection.
+        if [[ -n "$target" && "$platform" != "$target" ]]; then
+            continue
         fi
 
         # Calculate score (higher is better)
@@ -649,7 +649,7 @@ selector_queue_status() {
 
     local config path
     config=$(_sel_hosts_json) || return $?
-    local status=()
+    local host_statuses=()
 
     # Include synthetic act-local and removed hosts that still own build slots,
     # not only hosts that currently occur in the configuration.
@@ -684,11 +684,11 @@ selector_queue_status() {
                 available: $available,
                 at_capacity: ($available <= 0)
             }') || return 4
-        status+=("$entry")
+        host_statuses+=("$entry")
     done <<< "$hostnames"
 
-    if [[ ${#status[@]} -gt 0 ]]; then
-        printf '%s\n' "${status[@]}" | jq -s '.'
+    if [[ ${#host_statuses[@]} -gt 0 ]]; then
+        printf '%s\n' "${host_statuses[@]}" | jq -s '.'
     else
         echo "[]"
     fi

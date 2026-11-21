@@ -223,6 +223,14 @@ before compilation, including explicitly pinned hosts. Recipes that select an
 executable path, wrapper, or nondefault toolchain keep their existing build
 context checks instead of being judged against an unrelated ambient compiler.
 
+Automatic native scheduling selects hosts with the requested operating system
+and architecture. A free x64 host cannot displace an ARM64 builder solely because
+both run Linux. When matching hosts are busy, the build waits for their capacity.
+Intentional cross builds remain available through per-repository
+`cross_compile.<platform>.host` or `hosts` pins, and explicit `platform_mapping`
+fallbacks. An unconfigured legacy host alias cannot supply a missing architecture;
+the build strategy and matrix report failure instead of emitting an empty route.
+
 Unix source synchronization preserves file contents, permissions and links,
 while newly transferred files belong to the account receiving the build over
 SSH. This also applies to root workers and the tar fallback, so a macOS

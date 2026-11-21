@@ -3873,6 +3873,17 @@ act_get_native_host() {
         fi
     fi
 
+    # An implicit legacy alias cannot invent a cross compiler after the
+    # selector found no matching architecture. Intentional cross-host builds
+    # remain available through the explicit repository pins or platform map
+    # above, including their established same-host multi-target recipes.
+    local default_platform
+    default_platform=$(_act_get_host_platform "$default_host") || return 1
+    if [[ "$default_platform" != "$platform" ]]; then
+        _log_error "No native host matches $platform; configure an explicit cross_compile host or platform_mapping for a cross build"
+        return 1
+    fi
+
     echo "$default_host"
 }
 
@@ -3891,7 +3902,11 @@ act_get_build_strategy() {
         method="act"
     else
         job=""
-        host=$(act_get_native_host "$platform" "$tool_name")
+        host=$(act_get_native_host "$platform" "$tool_name") || return $?
+        if [[ -z "$host" ]]; then
+            _log_error "No native host configured for platform: $platform"
+            return 4
+        fi
         method="native"
     fi
 
@@ -3947,11 +3962,11 @@ act_build_matrix() {
     local tool_name="$1"
     local targets strategies=()
 
-    targets=$(act_get_targets "$tool_name")
+    targets=$(act_get_targets "$tool_name") || return $?
 
     for target in $targets; do
         local strategy
-        strategy=$(act_get_build_strategy "$tool_name" "$target")
+        strategy=$(act_get_build_strategy "$tool_name" "$target") || return $?
         strategies+=("$strategy")
     done
 

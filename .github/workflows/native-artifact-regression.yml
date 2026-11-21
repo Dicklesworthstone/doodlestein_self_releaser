@@ -18,6 +18,7 @@ on:
       - scripts/tests/test_config.sh
       - scripts/tests/test_disk_free_floor.sh
       - scripts/tests/test_host_health.sh
+      - scripts/tests/test_host_scheduling.sh
       - scripts/tests/test_host_config_admission.sh
       - scripts/tests/test_artifact_formats.sh
       - scripts/tests/test_ordinary_collection_inventory.sh
@@ -46,6 +47,7 @@ on:
       - src/config.sh
       - src/git_ops.sh
       - src/host_health.sh
+      - src/host_selector.sh
       - src/install_gen.sh
       - src/install_gen_windows.ps1
       - src/install_source.sh
@@ -316,6 +318,7 @@ jobs:
         run: |
           set -euo pipefail
           bash -n scripts/tests/test_act_orchestration.sh
+          timeout 120 bash scripts/tests/test_host_scheduling.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/host-scheduling.log"
           bash scripts/tests/test_act_orchestration.sh --stdin-isolation-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/stdin-isolation.log"
           bash scripts/tests/test_act_orchestration.sh --worker-lifecycle-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/worker-lifecycle.log"
           bash scripts/tests/test_act_orchestration.sh --dispatch-reservation-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/dispatch-reservation.log"
