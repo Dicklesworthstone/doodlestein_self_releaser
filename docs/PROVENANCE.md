@@ -1,8 +1,51 @@
 # Release provenance
 
-DSR supports in-toto statements with the SLSA v1 predicate. The sourceable
-`src/slsa.sh` module also provides standalone commands, so release verification
-does not need build-host configuration or a source checkout.
+DSR supports in-toto statements with the SLSA v1 predicate. The public
+`dsr slsa` commands and the sourceable `src/slsa.sh` module share the same
+artifact, manifest and signer checks. The module also provides standalone
+commands, so release verification does not need build-host configuration or a
+source checkout.
+
+## Public CLI and verification policy
+
+`dsr slsa verify ARTIFACT [STATEMENT]` checks the named artifact. The default
+statement is `ARTIFACT.intoto.jsonl`. It enforces every selected `--builder`,
+`--build-type`, `--invocation-id`, `--source-repository` and `--source-commit`
+policy. Source repository and commit must be selected together. Authentication
+requires both an independently selected `--public-key` and an expected
+`--builder`; `--signature` can select a different detached signature file.
+Without a key, matching bytes and identity fields do not authenticate a producer.
+
+```bash
+dsr --json slsa verify ./dist/tool ./release.intoto.jsonl \
+  --builder https://example.org/builders/dsr-production \
+  --public-key ./trusted-minisign.pub \
+  --source-repository https://github.com/OWNER/REPO --source-commit "$SOURCE_SHA"
+```
+
+Use `dsr slsa verify-release STATEMENT ARTIFACTS_DIR` to check every named
+subject, including helper binaries and installer aliases. Add `--manifest`,
+`--repository OWNER/REPO` and `--builder` to require the exact successful build
+and its complete subject set. Both verification forms pass the selected trust
+policy to the same library that authenticates the statement and checks bytes.
+Missing or incorrect signatures, mismatched identities, and malformed options
+return failure; they never fall back to digest-only verification.
+
+In JSON mode, `details.valid` reports the complete selected verification result.
+`details.authenticated` is true only when verification succeeds with the selected
+public key and builder. `authentication_requested` distinguishes signed and
+unsigned calls, `verification_scope` is `artifact` or `release`, and `policy`
+records the supplied expectations. Generation always reports
+`authenticated: false`, with `evidence_kind: post-build-observation` or
+`build-manifest`. Successful plain generation emits only its output path;
+plain verification keeps diagnostics on stderr and stdout empty.
+
+Unknown options, repeated policy options, missing values and excess positional
+arguments are refused. `generate` also exposes the module's `--build-type` and
+`--invocation-id` fields. Generation refuses `--dry-run` before writing a
+statement; verification remains read-only. The public CLI is exercised with real
+Git repositories, artifact bytes, and Minisign keys/signatures by
+`bash scripts/tests/test_slsa_cli.sh`.
 
 ## Generate from the recorded build
 
@@ -10,7 +53,7 @@ Use a successful schema `1.0.0` DSR build manifest and a directory containing
 its final artifacts under their release basenames:
 
 ```bash
-bash src/slsa.sh generate-manifest /path/to/manifest.json /path/to/dist \
+dsr slsa generate-manifest /path/to/manifest.json /path/to/dist \
   --repository OWNER/REPO \
   --builder https://example.org/builders/dsr-production \
   --output /path/to/release.intoto.jsonl
@@ -178,7 +221,7 @@ dsr signing sign /path/to/release.intoto.jsonl
 Then verify using an independently trusted public key and expected builder:
 
 ```bash
-bash src/slsa.sh verify-release /path/to/release.intoto.jsonl /path/to/dist \
+dsr slsa verify-release /path/to/release.intoto.jsonl /path/to/dist \
   --builder https://example.org/builders/dsr-production \
   --public-key /path/to/trusted-minisign.pub \
   --manifest /path/to/manifest.json --repository OWNER/REPO

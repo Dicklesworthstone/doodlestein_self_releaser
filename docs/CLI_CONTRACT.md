@@ -3339,6 +3339,67 @@ replacement. Finish release signing before rotating its identity.
 
 ---
 
+### `dsr slsa`
+
+Generate or verify SLSA v1 statements through the same library used by release
+finalization. These commands do not upload artifacts or sign new statements.
+
+```bash
+dsr slsa generate ARTIFACT [--repo-path SOURCE_DIR] [--builder ID] \
+    [--build-type TYPE] [--invocation-id ID] [--output FILE]
+dsr slsa generate-manifest MANIFEST ARTIFACTS_DIR --repository OWNER/REPO \
+    [--builder ID] [--output FILE]
+dsr slsa verify ARTIFACT [STATEMENT] [VERIFICATION_OPTIONS]
+dsr slsa verify-release STATEMENT ARTIFACTS_DIR [VERIFICATION_OPTIONS] \
+    [--manifest MANIFEST --repository OWNER/REPO --builder ID]
+```
+
+| Operation | Evidence selected |
+|-----------|-------------------|
+| `generate` | One artifact plus an optional explicit source-checkout observation |
+| `generate-manifest` | Every artifact and recorded source/build identity in a successful manifest |
+| `verify` | The named artifact's bytes, statement structure, and all supplied verification policy |
+| `verify-release` | Every named subject's bytes and all supplied verification policy |
+
+Verification options are `--builder ID`, `--build-type URI`,
+`--invocation-id ID`, `--source-repository URI`, `--source-commit SHA`,
+`--public-key FILE` and `--signature FILE`. Source repository and commit must
+appear together. A public key requires an explicit expected builder; a signature
+override requires a public key. The default detached signature is
+`STATEMENT.minisig`. `verify-release --manifest` additionally requires
+`--repository` and `--builder`, binding the complete statement to that exact
+successful build, including the subject set and invocation.
+
+The CLI forwards all selected policies. An incorrect or missing signer,
+signature, expected identity or subject fails verification. Without a public
+key, verification does not authenticate the statement's producer. `verify`
+does not claim to check other subjects in a multi-subject statement.
+
+Generation defaults to `INPUT.intoto.jsonl`; `generate` also accepts the
+`--builder/-b` and `--output/-o` aliases. Manifest generation binds the original
+manifest digest and checks every artifact's hash and size before publishing its
+statement. Existing identical manifest statements are reused byte-for-byte;
+conflicting outputs and orphan signatures are preserved and refused. Generation
+rejects global `--dry-run` with exit `4` before writing a statement.
+
+JSON uses `slsa-generate`, `slsa-generate-manifest`, `slsa-verify` and
+`slsa-verify-release` command names. Verification details include `valid`,
+`authenticated`, `authentication_requested`, `verification_scope` (`artifact`
+or `release`), `provenance` and `policy`. `authenticated` is true only after
+successful verification with the caller-selected key and builder. Generation
+always reports `authenticated: false`, an `evidence_kind`
+(`post-build-observation` or `build-manifest`) and the output path on success.
+Errors preserve the operation's nonzero status and do not claim a successful
+output or authenticated verification. Plain generation prints only the output
+path; plain verification prints no stdout. Diagnostics stay on stderr.
+
+Unknown, duplicate or incomplete options and excess positional arguments return
+`4`. Other statuses are `0` for success, `1` for verification failure, `2` for a
+conflicting existing output and `3` for an unavailable dependency. See
+[release provenance](PROVENANCE.md) for trust scope and standalone module APIs.
+
+---
+
 ### `dsr verify upgrade`
 
 Check that a tool's update command resolves the intended release:

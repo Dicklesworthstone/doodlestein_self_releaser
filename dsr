@@ -19339,11 +19339,8 @@ cmd_slsa() {
     shift 2>/dev/null || true
 
     case "$subcmd" in
-        generate)
-            _slsa_generate "$@"
-            ;;
-        verify)
-            _slsa_verify "$@"
+        generate|generate-manifest|verify|verify-release)
+            _slsa_command "$subcmd" "$@"
             ;;
         --help|-h|help|"")
             cat << 'EOF'
@@ -19351,37 +19348,58 @@ dsr slsa - SLSA provenance attestation
 
 USAGE:
     dsr slsa generate <artifact> [options]
-    dsr slsa verify <artifact> [provenance]
+    dsr slsa generate-manifest <manifest> <artifacts-dir> --repository OWNER/REPO [options]
+    dsr slsa verify <artifact> [provenance] [options]
+    dsr slsa verify-release <provenance> <artifacts-dir> [options]
 
 SUBCOMMANDS:
-    generate    Generate SLSA v1 provenance for an artifact
-    verify      Verify SLSA provenance matches artifact digest
+    generate           Record one artifact and an optional source observation
+    generate-manifest  Record the complete successful build's artifact set
+    verify             Verify one named artifact and every selected trust policy
+    verify-release     Verify every subject and optionally the exact build manifest
 
 OPTIONS:
-    --builder, -b <id>   Builder identity URL
-    --output, -o <file>  Output file (default: <artifact>.intoto.jsonl)
-    --repo-path <dir>    Source checkout to record (origin URL, commit, ref,
-                         dirty flag). Without it no source is recorded.
+    --builder, -b <id>        Builder identity to record or require
+    --output, -o <file>       Generation output (default: <input>.intoto.jsonl)
+    --repo-path <dir>         Explicit source checkout observation (generate)
+    --build-type <type>       Generation type suffix or expected verification URI
+    --invocation-id <id>      Invocation to record or require
+    --repository OWNER/REPO   Manifest repository identity (generate-manifest,
+                              or verify-release with --manifest)
+    --manifest <file>        Exact expected successful build (verify-release;
+                              also requires --repository and --builder)
+    --source-repository URI   Expected source URI (verification only)
+    --source-commit SHA       Expected source commit; requires --source-repository
+    --public-key <file>       Authenticate the statement; requires --builder
+    --signature <file>        Detached signature (default: <provenance>.minisig)
 
 DESCRIPTION:
-    Generates an SLSA v1 provenance statement (in-toto) for an artifact.
-    It is a post-build observation, not an authenticated build record.
+    Generation emits unsigned SLSA v1 statements. generate records a post-build
+    observation; generate-manifest binds every artifact's bytes, recorded source,
+    invocation and completion time to the original successful build manifest.
+    Sign the resulting statement separately with 'dsr signing sign'.
 
-    The statement includes:
-    - Artifact name and SHA256 digest
-    - Builder identity
-    - Observation time (not an invented build start/finish)
-    - Git source info, only from an explicit --repo-path
+    Verification with --public-key authenticates the caller-selected signer and
+    builder. Without it, matching bytes and policy do not authenticate a producer.
+    verify checks one named artifact; verify-release checks every named subject.
+    Supply --manifest, --repository and --builder to require the exact build set.
+    Generation does not support --dry-run; verification performs read-only checks.
 
 EXAMPLES:
     dsr slsa generate ./build/ntm-linux-amd64
     dsr slsa generate ./build/ntm-darwin-arm64 --builder "https://github.com/Dicklesworthstone/dsr"
     dsr slsa generate /tmp/out/ntm-linux-amd64 --repo-path /data/projects/ntm
-    dsr slsa verify ./build/ntm-linux-amd64
+    dsr slsa generate-manifest ./manifest.json ./build --repository OWNER/REPO
+    dsr slsa verify ./build/ntm-linux-amd64 --builder dsr/production --public-key ./trusted.pub
+    dsr slsa verify-release ./release.intoto.jsonl ./build \
+        --manifest ./manifest.json --repository OWNER/REPO \
+        --builder dsr/production --public-key ./trusted.pub
 
 EXIT CODES:
     0  - Success
     1  - Verification failed / digest mismatch
+    2  - Existing provenance conflicts with the selected build
+    3  - Required verifier or dependency is unavailable
     4  - Invalid arguments
 EOF
             return 0
@@ -19394,101 +19412,107 @@ EOF
     esac
 }
 
-_slsa_generate() {
-    local artifact=""
-    local builder_id="$SLSA_BUILDER_ID"
-    local output=""
-    local repo_path=""
-
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --builder|-b) builder_id="$2"; shift 2 ;;
-            --output|-o) output="$2"; shift 2 ;;
-            --repo-path) repo_path="$2"; shift 2 ;;
-            -*) log_error "Unknown option: $1"; return 4 ;;
-            *) artifact="$1"; shift ;;
+# The library owns byte, manifest and signer admission. Keep every explicitly
+# selected policy when crossing the public CLI boundary; a digest-only success
+# must never stand in for a requested signer/builder verification.
+_slsa_command() {
+    local operation="$1" function_name minimum maximum generating=false
+    local option value exit_code=0 error='' output='' start=$SECONDS details
+    local builder='' public_key='' repository='' manifest='' provenance=''
+    local build_type='' source_repository='' source_commit='' invocation=''
+    local -a inputs=() arguments=()
+    local -A seen=()
+    shift
+    case "$operation" in
+        generate) function_name=slsa_generate; minimum=1; maximum=1; generating=true ;;
+        generate-manifest) function_name=slsa_generate_manifest; minimum=2; maximum=2; generating=true ;;
+        verify) function_name=slsa_verify; minimum=1; maximum=2 ;;
+        verify-release) function_name=slsa_verify_release; minimum=2; maximum=2 ;;
+        *) return 4 ;;
+    esac
+    $generating && builder="$SLSA_BUILDER_ID"
+    while (($#)); do
+        option=$1
+        case "$option" in -b) option=--builder ;; -o) option=--output ;; esac
+        if [[ "$option" != -* ]]; then
+            inputs+=("$option"); shift
+            if ((${#inputs[@]} > maximum)); then
+                error="Too many positional arguments for slsa $operation"; exit_code=4; break
+            fi
+            continue
+        fi
+        case "$operation:$option" in
+            generate:--builder|generate:--output|generate:--repo-path|generate:--build-type|generate:--invocation-id|\
+            generate-manifest:--builder|generate-manifest:--output|generate-manifest:--repository|\
+            verify:--builder|verify:--build-type|verify:--source-repository|verify:--source-commit|\
+            verify:--invocation-id|verify:--public-key|verify:--signature|\
+            verify-release:--builder|verify-release:--build-type|verify-release:--source-repository|\
+            verify-release:--source-commit|verify-release:--invocation-id|verify-release:--public-key|\
+            verify-release:--signature|verify-release:--manifest|verify-release:--repository) ;;
+            *) error="Unknown option for slsa $operation: $1"; exit_code=4; break ;;
         esac
+        if [[ -n "${seen[$option]:-}" ]]; then
+            error="Duplicate SLSA option: $option"; exit_code=4; break
+        fi
+        if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
+            error="$option requires a value"; exit_code=4; break
+        fi
+        value=$2; seen[$option]=1
+        arguments+=("$option" "$value")
+        case "$option" in
+            --builder) builder=$value ;; --public-key) public_key=$value ;;
+            --repository) repository=$value ;; --manifest) manifest=$value ;;
+            --build-type) build_type=$value ;; --source-repository) source_repository=$value ;;
+            --source-commit) source_commit=$value ;; --invocation-id) invocation=$value ;;
+        esac
+        shift 2
     done
-
-    if [[ -z "$artifact" ]]; then
-        log_error "Artifact path required"
-        return 4
+    if ((exit_code == 0 && ${#inputs[@]} < minimum)); then
+        error="Missing input for slsa $operation; run 'dsr slsa --help'"; exit_code=4
     fi
-    if [[ ! -f "$artifact" ]]; then
-        log_error "Artifact not found (or not a regular file): $artifact"
-        $JSON_MODE && json_envelope "slsa-generate" "error" 4 "$(jq -nc --arg artifact "$artifact" '{error: "artifact not found", artifact: $artifact}')"
-        return 4
+    if ((exit_code == 0)) && $generating && ${DRY_RUN:-false}; then
+        error="SLSA generation does not support --dry-run; no statement was written"; exit_code=4
     fi
-
-    local start_time
-    start_time=$(date +%s)
-
-    local -a args=()
-    [[ -n "$output" ]] && args+=("--output" "$output")
-    [[ -n "$repo_path" ]] && args+=("--repo-path" "$repo_path")
-
-    if _dsr_capture slsa_generate "$artifact" --builder "$builder_id" ${args[@]+"${args[@]}"}; then
-        local duration=$(($(date +%s) - start_time))
-        if $JSON_MODE; then
-            json_envelope "slsa-generate" "success" 0 "$(jq -nc \
-                --arg artifact "$artifact" \
-                --arg builder "$builder_id" \
-                --arg output "$_DSR_CAPTURED_OUT" \
-                --argjson duration "$duration" \
-                '{artifact: $artifact, builder: $builder, output: $output, duration_seconds: $duration}')"
-        else
-            printf '%s\n' "$_DSR_CAPTURED_OUT"
+    if ((exit_code == 0)); then
+        _dsr_capture "$function_name" "${inputs[@]}" ${arguments[@]+"${arguments[@]}"} || exit_code=$?
+        output=$_DSR_CAPTURED_OUT
+        if ((exit_code != 0)); then
+            error="${_DSR_CAPTURED_ERR:-SLSA $operation failed (exit $exit_code)}"
         fi
-        return 0
-    else
-        local exit_code=$?
-        local duration=$(($(date +%s) - start_time))
-        if [[ -z "$_DSR_CAPTURED_ERR" ]]; then
-            _DSR_CAPTURED_ERR="SLSA provenance generation failed for $artifact (exit $exit_code; 4 = invalid arguments, output path or repository)"
-            log_error "$_DSR_CAPTURED_ERR"
-        fi
-        if $JSON_MODE; then
-            json_envelope "slsa-generate" "error" "$exit_code" "$(jq -nc \
-                --arg error "$_DSR_CAPTURED_ERR" \
-                --argjson duration "$duration" \
-                '{error: $error, duration_seconds: $duration}')"
-        fi
-        return $exit_code
     fi
-}
-
-_slsa_verify() {
-    local artifact="${1:-}"
-    local provenance="${2:-}"
-
-    if [[ -z "$artifact" ]]; then
-        log_error "Artifact path required"
-        return 4
+    [[ -z "$error" ]] || log_error "$error"
+    if $JSON_MODE; then
+        [[ "$operation" != verify ]] || provenance="${inputs[1]:-${inputs[0]:-}.intoto.jsonl}"
+        [[ "$operation" != verify-release ]] || provenance="${inputs[0]:-}"
+        details=$(jq -nc --arg operation "$operation" --arg first "${inputs[0]:-}" \
+            --arg second "${inputs[1]:-}" --arg output "$output" --arg builder "$builder" \
+            --arg public_key "$public_key" --arg repository "$repository" --arg manifest "$manifest" \
+            --arg provenance "$provenance" --arg build_type "$build_type" \
+            --arg source_repository "$source_repository" --arg source_commit "$source_commit" \
+            --arg invocation "$invocation" --arg error "$error" --argjson code "$exit_code" \
+            --argjson generating "$generating" --argjson duration "$((SECONDS-start))" '
+            {authenticated:($code==0 and ($generating|not) and $public_key!=""),duration_seconds:$duration} +
+            (if $generating then
+                {builder:$builder,output:(if $code==0 then $output else null end),
+                 evidence_kind:(if $operation=="generate" then "post-build-observation" else "build-manifest" end)} +
+                (if $operation=="generate" then {artifact:$first}
+                 else {manifest:$first,artifacts_dir:$second,repository:$repository} end)
+             else
+                {valid:($code==0),provenance:$provenance,authentication_requested:($public_key!=""),
+                 verification_scope:(if $operation=="verify" then "artifact" else "release" end),
+                 policy:({builder:$builder,public_key:$public_key,build_type:$build_type,
+                     source_repository:$source_repository,source_commit:$source_commit,invocation_id:$invocation,
+                     manifest:$manifest,repository:$repository} | with_entries(select(.value!="")))} +
+                (if $operation=="verify" then {artifact:$first} else {artifacts_dir:$second} end)
+             end) + (if $code==0 then {} else {error:$error} end)') || return 1
+        local envelope_status=success
+        if ((exit_code != 0)); then envelope_status=error
+        elif ! $generating; then envelope_status=ok; fi
+        json_envelope "slsa-$operation" "$envelope_status" "$exit_code" "$details" || return 1
+    elif ((exit_code == 0)) && $generating; then
+        printf '%s\n' "$output" || return 1
     fi
-
-    local start_time
-    start_time=$(date +%s)
-
-    if slsa_verify "$artifact" "$provenance"; then
-        local duration=$(($(date +%s) - start_time))
-        if $JSON_MODE; then
-            json_envelope "slsa-verify" "ok" 0 "$(jq -nc \
-                --arg artifact "$artifact" \
-                --argjson duration "$duration" \
-                '{artifact: $artifact, valid: true, duration_seconds: $duration}')"
-        fi
-        return 0
-    else
-        local exit_code=$?
-        local duration=$(($(date +%s) - start_time))
-        if $JSON_MODE; then
-            json_envelope "slsa-verify" "error" "$exit_code" "$(jq -nc \
-                --arg artifact "$artifact" \
-                --argjson duration "$duration" \
-                '{artifact: $artifact, valid: false, duration_seconds: $duration}')"
-        fi
-        return $exit_code
-    fi
+    return "$exit_code"
 }
 
 # ============================================================================
