@@ -854,8 +854,8 @@ or prove that source was never temporarily changed during compilation.
 This feature applies to newly generated Bash installers and the checked-in
 `bv`, `cass`, and `ntm` clients. Those clients were regenerated through the public
 generator while preserving their repository identities, naming and platform
-policies, source selections, and original bundled skill contents. Native
-PowerShell source installers retain their existing submodule refusal.
+policies, source selections, and original bundled skill contents. Newly generated
+PowerShell installers support the recursive source path described below.
 
 The shipped-client regression executes the actual `bv` and `ntm` entrypoints
 against local Git repositories with pinned child and grandchild modules. It
@@ -876,6 +876,47 @@ real checkout filters, ignored source injection and CRLF filenames:
 ```bash
 bash scripts/tests/test_install_source_submodules.sh --admission-only
 ```
+
+### Pinned Git submodules in Windows source builds
+
+Newly generated PowerShell installers accept recursive Git submodules through
+the existing `-FromSource` and explicitly consented source-fallback paths. A
+configured `source_subdir` may be inside a child or grandchild repository. The
+complete regular-file inventory is available to the existing Rust, Go and Bun
+source resolvers, including committed Go local replacements and workspace
+members inside children.
+
+Each child is fetched at its parent's exact gitlink commit into an independent
+Git directory. The same selected account is scoped separately to each canonical
+GitHub repository. The supported HTTPS and relative URL forms are the same as
+the table above. Declarations are parsed directly from the committed
+`.gitmodules` blob without following includes or executing update commands.
+Missing, repeated, case-colliding, escaping and unmatched declarations refuse
+the build; an unavailable child commit cannot retry its default branch.
+Symbolic links and reparse points remain unsupported.
+
+The acquisition graph is limited to 16 child levels, 256 repositories including
+the root, and 100000 tracked entries. One `-SourceTimeout` deadline covers all
+recursive acquisition commands; each later compiler command retains its existing
+deadline. Before and after compilation, every repository must retain its pinned
+HEAD and staged tree, including gitlink identities and file modes. The installer
+also compares the actual bytes of every tracked regular file across the graph,
+with explicit Git directory, worktree, index and object-directory bindings.
+The source receipt adds the root-relative `submodules` inventory shown above.
+These checks preserve the ordinary PE validation and complete-family
+installation, rollback and recovery behavior; they do not sandbox build code.
+
+The focused regression invokes the public generator and source installer with
+real Git repositories and genuine Go compilation of Windows x64/ARM64 families:
+
+```bash
+bash scripts/tests/test_install_source_windows.sh --submodules-only
+```
+
+Its local Git transport and portable PowerShell host adapters make this a source
+and transaction regression, not native Windows filesystem or live GitHub
+transport qualification. Existing generated clients gain this support when
+regenerated through `dsr installer generate TOOL --shell powershell`.
 
 ### Committed Go workspaces
 

@@ -10,7 +10,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 dependencies=(pwsh git go cargo rustc minisign python3 jq yq)
 if [[ " $* " == *' --bun-only '* || " $* " == *' --bun-workspaces-only '* ]]; then
     dependencies=(pwsh git bun minisign python3 jq yq)
-elif [[ " $* " == *' --freshness-only '* || " $* " == *' --fallback-only '* || " $* " == *' --acquisition-errors-only '* || " $* " == *' --freshness-deadline-only '* || " $* " == *' --go-only '* || " $* " == *' --go-workspace-only '* || " $* " == *' --go-modules-only '* ]]; then
+elif [[ " $* " == *' --freshness-only '* || " $* " == *' --fallback-only '* || " $* " == *' --acquisition-errors-only '* || " $* " == *' --freshness-deadline-only '* || " $* " == *' --go-only '* || " $* " == *' --go-workspace-only '* || " $* " == *' --go-modules-only '* || " $* " == *' --submodules-only '* ]]; then
     dependencies=(pwsh git go minisign python3 jq yq)
 fi
 for dependency in "${dependencies[@]}"; do
@@ -43,6 +43,8 @@ arguments.add_argument("--rust-baseline-project", type=Path, help="Frozen checko
 arguments.add_argument("--workspace-baseline-project", type=Path, help="Frozen checkout before committed Go workspace support")
 arguments.add_argument("--go-workspace-only", action="store_true", help="Run the generated Go workspace caller regression")
 arguments.add_argument("--go-modules-only", action="store_true", help="Run ordinary Go module source-custody and vendoring controls")
+arguments.add_argument("--submodules-only", action="store_true", help="Run recursive pinned Git submodule source installation controls")
+arguments.add_argument("--submodule-baseline-project", type=Path, help="Frozen checkout before Windows source submodule support")
 arguments.add_argument("--module-baseline-project", type=Path, help="Frozen checkout before ordinary Go module confinement")
 arguments.add_argument("--go-only", action="store_true", help="Run Go source and signed-release controls without Rust compilation")
 arguments.add_argument("--bun-only", action="store_true", help="Run genuine Bun/TypeScript Windows source installation controls")
@@ -195,7 +197,14 @@ function Get-DsrHostPlatform { return $script:Fixture.platform }
 if (Get-Command Invoke-DsrSourceGit -ErrorAction SilentlyContinue) {
     # Only the remote boundary changes: Git itself performs every real init,
     # fetch, pin, inventory and checkout using this separate local repository.
-    function Get-DsrSourceRepositoryUrl { param([string]$Repository); return $script:Fixture.repository_url }
+    function Get-DsrSourceRepositoryUrl {
+        param([string]$Repository)
+        if ($script:Fixture.Contains('repositories')) {
+            if (-not $script:Fixture.repositories.Contains($Repository)) { throw 'Unmapped fixture source repository' }
+            return $script:Fixture.repositories[$Repository]
+        }
+        return $script:Fixture.repository_url
+    }
     $script:RealSourceGit = ${function:Invoke-DsrSourceGit}
     function Invoke-DsrSourceGit {
         param([string]$Git, [string[]]$Arguments, [string]$Directory, [string]$Log,
@@ -218,6 +227,9 @@ if (Get-Command Invoke-DsrSourceGit -ErrorAction SilentlyContinue) {
             } else { '' })
         } | ConvertTo-Json -Compress) + "`n"))
         $result = & $script:RealSourceCommand @PSBoundParameters
+        if ($script:Fixture.Contains('acquisition_pause_ms') -and 'fetch' -cin $Arguments) {
+            [Threading.Thread]::Sleep([int]$script:Fixture.acquisition_pause_ms)
+        }
         if ($script:Fixture.Contains('inject_untracked_workspace') -and $script:Fixture.inject_untracked_workspace -and
             'checkout' -cin $Arguments) {
             [IO.File]::WriteAllText([IO.Path]::Combine($Directory, 'go.work'), "go 1.22`nuse ./project`n")
@@ -239,6 +251,24 @@ if (Get-Command Invoke-DsrSourceGit -ErrorAction SilentlyContinue) {
             -not $script:MutatedSource -and $Arguments[0] -ceq 'build') {
             $member = if ($script:Fixture.Contains('mutate_source_member')) { $script:Fixture.mutate_source_member } else { 'apps/primary/main.go' }
             [IO.File]::AppendAllText([IO.Path]::Combine($Directory, $member), "`n// injected tracked-source mutation`n")
+            $script:MutatedSource = $true
+        }
+        if ($script:Fixture.Contains('mutate_submodule_head') -and $script:Fixture.mutate_submodule_head -and
+            -not $script:MutatedSource -and $Arguments[0] -ceq 'build') {
+            $child = [IO.Path]::Combine($Directory, 'nested/lib')
+            $head = (& git -C $child rev-parse HEAD).Trim()
+            $tree = (& git -C $child rev-parse 'HEAD^{tree}').Trim()
+            $replacement = (& git -C $child -c 'user.name=DSR Source Fixture' -c 'user.email=fixture@example.invalid' `
+                commit-tree $tree -p $head -m 'Different commit with identical tracked bytes').Trim()
+            if ($LASTEXITCODE -ne 0) { throw 'Submodule identity fixture could not create its real commit' }
+            [IO.File]::WriteAllText([IO.Path]::Combine($child, '.git/HEAD'), $replacement + "`n")
+            $script:MutatedSource = $true
+        }
+        if ($script:Fixture.Contains('mutate_submodule_index') -and $script:Fixture.mutate_submodule_index -and
+            -not $script:MutatedSource -and $Arguments[0] -ceq 'build') {
+            $child = [IO.Path]::Combine($Directory, 'nested/lib')
+            & git -C $child update-index --chmod=+x -- value.go
+            if ($LASTEXITCODE -ne 0) { throw 'Submodule index fixture could not change its staged file mode' }
             $script:MutatedSource = $true
         }
         if ($Capture) { return $result }
@@ -1310,6 +1340,181 @@ if options.bun_only or options.bun_workspaces_only:
         test_bun_sources()
     test_bun_workspaces()
     print(f"Windows Bun source tests: {passed} passed, {failed} failed", flush=True)
+    raise SystemExit(1 if failed else 0)
+
+
+def test_source_submodules():
+    def repository(label, contents, gitlinks=()):
+        directory = root / (label + "-upstream")
+        directory.mkdir()
+        required(["git", "init", "--quiet", "--initial-branch=main", directory], label + "-init")
+        required(["git", "-C", directory, "config", "user.email", "fixture@example.invalid"], label + "-email")
+        required(["git", "-C", directory, "config", "user.name", "DSR Submodule Fixture"], label + "-name")
+        for name, value in contents.items():
+            path = directory / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(value)
+        required(["git", "-C", directory, "add", "."], label + "-add")
+        for number, (path, pin) in enumerate(gitlinks):
+            required(["git", "-C", directory, "update-index", "--add", "--cacheinfo", f"160000,{pin},{path}"],
+                     label + "-link-" + str(number))
+        required(["git", "-C", directory, "commit", "--quiet", "-m", label], label + "-commit")
+        pin = required(["git", "-C", directory, "rev-parse", "HEAD"], label + "-pin")
+        return directory, pin
+
+    leaf, leaf_pin = repository("submodule-leaf", {
+        "go.mod": "module example.invalid/submodule-leaf\n\ngo 1.22\n",
+        "value.go": 'package leaf\nfunc Value() string { return "pinned-recursive-submodule" }\n',
+    })
+    main_source = 'package main\nimport ("fmt"; leaf "example.invalid/submodule-leaf")\nfunc main() { fmt.Println(leaf.Value()) }\n'
+    child, child_pin = repository("submodule-child", {
+        "go.mod": "module example.invalid/submodule-app\n\ngo 1.22\nrequire example.invalid/submodule-leaf v0.0.0\nreplace example.invalid/submodule-leaf => ./nested/lib\n",
+        "apps/primary/main.go": main_source,
+        "cmd/helper/main.go": main_source.replace("leaf.Value()", '"helper-" + leaf.Value()'),
+        "cmd/arm-helper/main.go": main_source.replace("leaf.Value()", '"arm-helper-" + leaf.Value()'),
+        ".gitmodules": '[submodule "nested-library"]\n path = nested/lib\n url = ../../other/leaf.git\n branch = main\n ignore = all\n update = none\n',
+    }, [("nested/lib", leaf_pin)])
+    root_modules = '[submodule "tool"]\n path = vendor/tool\n url = ../child.git\n branch = main\n ignore = all\n update = none\n'
+    source, source_pin = repository("submodule-root", {"README": "Pinned recursive source family\n", ".gitmodules": root_modules},
+                                    [("vendor/tool", child_pin)])
+    required(["git", "-C", source, "tag", "-a", "v1.2.3", "-m", "Pinned recursive family"], "submodule-root-tag")
+    for label, directory, path, text in (("leaf", leaf, "value.go", 'package leaf\nfunc Value() string { return "unselected-newer-submodule" }\n'),
+                                       ("child", child, "apps/primary/main.go", main_source.replace("leaf.Value()", '"unselected-newer-child"'))):
+        (directory / path).write_text(text)
+        required(["git", "-C", directory, "add", path], "submodule-advance-" + label + "-add")
+        required(["git", "-C", directory, "commit", "--quiet", "-m", "Advance unselected branch"], "submodule-advance-" + label + "-commit")
+    repository_map = {"fixture/submodule-source": source.as_uri(), "fixture/child": child.as_uri(), "other/leaf": leaf.as_uri()}
+    config("submodule-source", local_path=str(source), source_subdir="vendor/tool")
+    generated, selected_runtime, selected_policy = generate("submodule-source", "submodule-generate")
+    check("public generator admits a Windows source root inside a pinned submodule", generated.returncode == 0,
+          generated.stderr.decode(errors="replace"))
+    if generated.returncode:
+        return
+
+    def run(label, *, checkout_runtime=selected_runtime, source_ref="refs/tags/v1.2.3", repositories=None, parameters=None, **changes):
+        params = {"SourceRef": source_ref}
+        params.update(parameters or {})
+        extra = {"GOPROXY": "off", "GOSUMDB": "off", "CGO_ENABLED": "0"}
+        extra.update(changes.pop("extra", {}))
+        return invoke(label, selected_runtime=checkout_runtime, parameters=params, extra=extra,
+                      repositories=repositories or repository_map, **changes)
+
+    if options.submodule_baseline_project:
+        old_generated, old_runtime, old_policy = generate("submodule-source", "submodule-baseline-generate",
+            checkout=options.submodule_baseline_project.resolve(), destination=root / "submodule-baseline-generated")
+        old, _, old_fixture = run("submodule-baseline", checkout_runtime=old_runtime)
+        check("same real recursive Git fixture reproduces the original Windows submodule refusal",
+              old_generated.returncode == 0 and old_policy == selected_policy and old.returncode == 4 and
+              not any(row["arguments"][0] == "build" for row in calls(old_fixture)) and
+              not Path(old_fixture["parameters"]["Prefix"]).exists(), old.stderr.decode(errors="replace"))
+
+    token = "fixture-submodule-account"
+    built, result, fixture = run("submodule-family", extra={"DSR_GH_TOKEN": token})
+    check("recursive exact gitlink pins compile and install a complete genuine x64 PE family",
+          built.returncode == 0 and result.get("source", {}).get("source_commit") == source_pin,
+          built.stderr.decode(errors="replace"))
+    if built.returncode:
+        return
+    prefix = Path(fixture["parameters"]["Prefix"])
+    original = {name: digest(prefix / name) for name in ("app.exe", "helper.exe")}
+    check("newer child branches and update/ignore settings cannot replace either committed pin",
+          all(machine(prefix / name) == 0x8664 and b"pinned-recursive-submodule" in (prefix / name).read_bytes() and
+              b"unselected-newer-submodule" not in (prefix / name).read_bytes() and
+              b"unselected-newer-child" not in (prefix / name).read_bytes() for name in original))
+    expected_submodules = [
+        {"path": "vendor/tool", "repository": "fixture/child", "source_commit": child_pin},
+        {"path": "vendor/tool/nested/lib", "repository": "other/leaf", "source_commit": leaf_pin},
+    ]
+    check("durable source receipt records each recursive repository and pin without temporary paths",
+          result["source"].get("submodules") == expected_submodules and
+          str(root) not in json.dumps(result["source"]) and
+          json.loads(Path(result["source_receipt"]["path"]).read_text()) == result["source"] and
+          all(row["sha256"] == original[row["name"]] for row in result["binaries"]))
+    fetches = [row for row in calls(fixture) if "fetch" in row["arguments"]]
+    expected_authorization = hashlib.sha256(b"Authorization: Basic " + base64.b64encode(("x-access-token:" + token).encode())).hexdigest()
+    check("every exact-pin fetch uses the same selected account scoped to that child repository",
+          len(fetches) == 3 and [row["arguments"][-1] for row in fetches] == ["refs/tags/v1.2.3", child_pin, leaf_pin] and
+          all(row["git_authorization_sha256"] == expected_authorization and
+              "--config-env=http.https://github.com/" + repository + ".git.extraHeader=DSR_INSTALLER_GIT_AUTHORIZATION" in row["arguments"]
+              for row, repository in zip(fetches, ["fixture/submodule-source", "fixture/child", "other/leaf"])) and
+          token not in Path(fixture["commands"]).read_text() and token not in (built.stdout + built.stderr).decode(errors="replace"))
+    check("submodule source installation uses the existing committed Go local-module selection without HTTP",
+          no_http(fixture) and result["source"].get("go_module", {}).get("local_replacements", [])[0].get("path") ==
+          "vendor/tool/nested/lib")
+
+    arm, arm_result, arm_fixture = run("submodule-arm64", platform="windows/arm64")
+    check("the same recursive source graph builds the configured ARM64 executable family",
+          arm.returncode == 0 and {row["name"] for row in arm_result.get("binaries", [])} == {"app.exe", "arm-helper.exe"} and
+          all(machine(Path(arm_fixture["parameters"]["Prefix"]) / row["name"]) == 0xAA64 for row in arm_result.get("binaries", [])),
+          arm.stderr.decode(errors="replace"))
+
+    for label, injection in (("submodule-byte-drift", {"mutate_source": True, "mutate_source_member": "nested/lib/value.go"}),
+                             ("submodule-head-drift", {"mutate_submodule_head": True}),
+                             ("submodule-index-drift", {"mutate_submodule_index": True})):
+        refused, _, _ = run(label, parameters={"Prefix": str(prefix)}, **injection)
+        check(label + " after genuine compilation preserves every previous executable",
+              refused.returncode == 7 and all(digest(prefix / name) == value for name, value in original.items()),
+              refused.stderr.decode(errors="replace"))
+    rollback, _, _ = run("submodule-rollback", parameters={"Prefix": str(prefix)}, move_fault=True)
+    check("recursive source families retain ordinary second-move rollback", rollback.returncode == 7 and
+          all(digest(prefix / name) == value for name, value in original.items()), rollback.stderr.decode(errors="replace"))
+
+    invalid_cases = {
+        "missing-declarations": {"README": "Missing .gitmodules\n"},
+        "unknown-host": {".gitmodules": root_modules.replace("../child.git", "https://example.invalid/child.git")},
+        "credential-url": {".gitmodules": root_modules.replace("../child.git", "https://secret@github.com/fixture/child.git")},
+        "escape-path": {".gitmodules": root_modules.replace("vendor/tool", "../outside")},
+        "duplicate-url": {".gitmodules": root_modules + " url = ../child.git\n"},
+        "unmatched-declaration": {".gitmodules": root_modules.replace("vendor/tool", "vendor/other")},
+        "case-declaration": {".gitmodules": root_modules.replace("vendor/tool", "vendor/Tool")},
+        "malformed-declarations": {".gitmodules": '[submodule "tool"\n path = vendor/tool\n'},
+    }
+    for label, contents in invalid_cases.items():
+        invalid, invalid_pin = repository("submodule-" + label, contents, [("vendor/tool", child_pin)])
+        mapping = dict(repository_map, **{"fixture/submodule-source": invalid.as_uri()})
+        refused, _, refused_fixture = run("submodule-" + label, repositories=mapping, source_ref=invalid_pin,
+                                         parameters={"Prefix": str(prefix)})
+        check(label + " is refused before any child fetch or compiler and preserves the old family",
+              refused.returncode == 4 and len([row for row in calls(refused_fixture) if "fetch" in row["arguments"]]) == 1 and
+              not any(row["arguments"][0] == "build" for row in calls(refused_fixture)) and
+              all(digest(prefix / name) == value for name, value in original.items()), refused.stderr.decode(errors="replace"))
+
+    collision, collision_pin = repository("submodule-case-collision", {".gitmodules": root_modules},
+                                          [("vendor/tool", child_pin), ("vendor/Tool", child_pin)])
+    collided, _, collided_fixture = run("submodule-case-collision",
+        repositories=dict(repository_map, **{"fixture/submodule-source": collision.as_uri()}), source_ref=collision_pin)
+    check("case-colliding gitlinks are refused before checkout or compiler execution",
+          collided.returncode == 4 and not any("checkout" in row["arguments"] for row in calls(collided_fixture)))
+
+    missing, missing_pin = repository("submodule-missing-pin", {".gitmodules": root_modules}, [("vendor/tool", "1" * 40)])
+    missing_result, _, missing_fixture = run("submodule-missing-pin",
+        repositories=dict(repository_map, **{"fixture/submodule-source": missing.as_uri()}), source_ref=missing_pin,
+        parameters={"Prefix": str(prefix)})
+    check("an unavailable gitlink never retries a branch or compiles a partial source graph",
+          missing_result.returncode == 8 and [row["arguments"][-1] for row in calls(missing_fixture) if "fetch" in row["arguments"]] ==
+          [missing_pin, "1" * 40] and not any(row["arguments"][0] == "build" for row in calls(missing_fixture)) and
+          all(digest(prefix / name) == value for name, value in original.items()))
+
+    limit_paths = ["child-" + str(index) for index in range(256)]
+    limit_modules = "".join(f'[submodule "{path}"]\n path = {path}\n url = ../child.git\n' for path in limit_paths)
+    limit_root, limit_pin = repository("submodule-count-bound", {".gitmodules": limit_modules},
+                                      [(path, child_pin) for path in limit_paths])
+    limit, _, limit_fixture = run("submodule-count-bound",
+        repositories=dict(repository_map, **{"fixture/submodule-source": limit_root.as_uri()}), source_ref=limit_pin)
+    check("the 256-repository graph bound refuses excessive children before fetching any",
+          limit.returncode == 4 and len([row for row in calls(limit_fixture) if "fetch" in row["arguments"]]) == 1 and
+          not any(row["arguments"][0] == "build" for row in calls(limit_fixture)))
+    timeout, _, timeout_fixture = run("submodule-complete-deadline", acquisition_pause_ms=1200,
+        parameters={"SourceTimeout": 2, "Prefix": str(prefix)})
+    check("one deadline covers recursive acquisition instead of restarting for every repository",
+          timeout.returncode == 5 and not any(row["arguments"][0] == "build" for row in calls(timeout_fixture)) and
+          all(digest(prefix / name) == value for name, value in original.items()), timeout.stderr.decode(errors="replace"))
+
+
+if options.submodules_only:
+    test_source_submodules()
+    print(f"Windows recursive source submodule tests: {passed} passed, {failed} failed", flush=True)
+    print("Real Git and Go PE compilation through portable PowerShell; native Windows and live GitHub remain unqualified.", flush=True)
     raise SystemExit(1 if failed else 0)
 
 
