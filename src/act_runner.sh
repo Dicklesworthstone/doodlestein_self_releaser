@@ -9432,6 +9432,16 @@ _act_sync_sibling_crates() {
     local tool_name="${config_file##*/}"
     tool_name="${tool_name%.yaml}"
 
+    local config_json language
+    config_json=$(yq -o=json -I=0 '.' "$config_file" 2>/dev/null) || return 4
+    language=$(jq -ers '
+        if length == 1 and (.[0] | type == "object") then .[0]
+        else error("expected one repository configuration mapping") end |
+        if .language == null then ""
+        elif (.language | type) == "string" then .language
+        else error("language must be a string") end
+    ' <<< "$config_json") || return 4
+
     local remote_parent
     # Compute the parent directory of the remote project path
     if _act_is_windows_host "$host"; then
@@ -9486,6 +9496,12 @@ _act_sync_sibling_crates() {
             sync_failed=true
             continue
         fi
+        # Siblings also carry Go modules and Bun/TypeScript imports. Only an
+        # explicitly Rust project uses this Cargo path adaptation; other
+        # languages must retain their selected source bytes, including any
+        # incidental Cargo.toml. Missing language is not a Rust default.
+        [[ "$language" == rust ]] || continue
+
         # Rewrite absolute path to relative in remote Cargo.toml
         # e.g., path = "/dp/asupersync" → path = "../asupersync"
         # Was previously hardcoded to the literal hostname "wlap" —

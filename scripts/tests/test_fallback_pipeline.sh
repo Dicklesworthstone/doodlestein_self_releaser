@@ -1897,7 +1897,7 @@ test_isolated_source_sync_paths() {
     printf 'dirty original\n' > "$CASE/original-dependency/src.txt"
     printf 'pinned bytes\n' > "$CASE/private-dependency/src.txt"
     printf '[dependencies]\nlocal = { path = "%s" }\n' "$CASE/original-dependency" > "$CASE/remote/source/Cargo.toml"
-    jq --arg path "$CASE/original-dependency" '.sibling_crates=[{relative_path:"dependency",local_path:$path}]' \
+    jq --arg path "$CASE/original-dependency" '.language="rust" | .sibling_crates=[{relative_path:"dependency",local_path:$path}]' \
         "$ACT_REPOS_DIR/tool.yaml" > "$CASE/sync-config.json"
     mv "$CASE/sync-config.json" "$ACT_REPOS_DIR/tool.yaml"
     local _ACT_ISOLATED_SOURCE_TOOL=tool _ACT_ISOLATED_SOURCE_PATHS

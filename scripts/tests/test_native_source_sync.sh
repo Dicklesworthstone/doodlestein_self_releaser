@@ -16,6 +16,8 @@
 # bindings; --ordinary-resume-only exercises a real Go matrix through cmd_build.
 # Use --go-siblings-only for real parallel Go replacements and workspaces,
 # including the source selection and receipts of private output stages.
+# Use --sibling-language-only for real rsync/Go/PowerShell sibling sync: only
+# Rust rewrites Cargo manifests. Unix transport does not qualify native NTFS.
 # Use --bun-siblings-only for ordinary Bun/TypeScript parallel Linux builds
 # preserving selected sibling imports when the scheduler isolates an output.
 # Use --windows-strict-go-only for genuine PowerShell source staging and Go
@@ -1997,6 +1999,190 @@ assert b'first-input' in payload and b'second-input' not in payload
 PY
     printf 'Ordinary native resume: %s checks, %s failures\n' "$checks" "$failures"
     [[ "$failures" == 0 ]]
+)
+
+test_sibling_language_sync() (
+    local dependency work
+    for dependency in bash git jq yq python3 rsync go pwsh iconv base64; do
+        command -v "$dependency" >/dev/null || {
+            printf 'SKIP: sibling language sync requires %s\n' "$dependency"
+            return 77
+        }
+    done
+    [[ $(uname -s) == Linux && $(go version) == 'go version go'* ]] || {
+        printf 'SKIP: sibling language sync requires Linux and the Go compiler\n'
+        return 77
+    }
+    work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-sibling-language.XXXXXXXX") || return 1
+    printf 'Sibling language evidence: %s\n' "$work"
+    python3 -I - "${DSR_TEST_ACT_RUNNER:-$ROOT/src/act_runner.sh}" "$work" <<'PY'
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+module, work = (Path(value).resolve() for value in sys.argv[1:])
+checks, failures = 0, []
+selected = b'package helper\nfunc Value() string { return "selected-sibling-input" }\n'
+missing = object()
+
+
+def check(label, condition):
+    global checks
+    checks += 1
+    print(('PASS ' if condition else 'FAIL ') + label, flush=True)
+    if not condition:
+        failures.append(label)
+
+
+# The production sync helper and production rsync selection/copy run intact.
+# Host routing selects its local transport; SSH executes genuine PowerShell
+# or Bash. A hard link supplies .NET's literal Windows filename on Unix, so
+# the generated encoded PowerShell script runs without rewriting its bytes.
+harness = r'''
+source "$1" || exit
+case_dir="$6"
+_act_is_local_host() { return 0; }
+_act_is_windows_host() { [[ "$1" == windows ]]; }
+_act_ssh_exec() {
+    printf '%s\n' "$2" >> "$case_dir/patch.log"
+    if [[ "$1" == windows ]]; then
+        local -a command_parts=()
+        read -r -a command_parts <<< "$2"
+        [[ "${command_parts[0]}" == powershell && "${command_parts[3]}" == -EncodedCommand ]] || return 97
+        (cd "$case_dir" && pwsh "${command_parts[@]:1}")
+    else
+        bash -c "$2"
+    fi
+}
+_act_sync_sibling_crates "$2" "$3" "$4" 1 "$5"
+'''
+
+
+def fixture(name, language, *, host='windows', cargo=False, projection=False,
+            transfer_failure=False, raw_config=None):
+    case = work / name
+    project = case / 'remote' / 'source'
+    helper = case / 'configured' / 'helper'
+    project.mkdir(parents=True)
+    helper.mkdir(parents=True)
+    (helper / 'go.mod').write_text('module example.local/helper\n\ngo 1.19\n')
+    (helper / 'helper.go').write_bytes(selected)
+    config = {'sibling_crates': [{'relative_path': 'helper', 'local_path': str(helper),
+                                 'respect_gitignore': False}]}
+    if language is not missing:
+        config['language'] = language
+    config_file = case / 'tool.yaml'
+    config_file.write_text(json.dumps(config) if raw_config is None else raw_config)
+    manifest = project / 'Cargo.toml'
+    original = ('# Preserve this unrelated manifest byte for byte.\n'
+                '[dependencies.helper]\npath = "' + str(helper) + '"\n').encode()
+    if cargo:
+        manifest.write_bytes(original)
+        if host == 'windows':
+            alias = case / (str(project).replace('/', '\\') + '\\Cargo.toml')
+            os.link(manifest, alias)
+    projection_root = ''
+    if projection:
+        projection_root = str(case / 'projection')
+        shutil.copytree(helper, Path(projection_root) / 'helper')
+        # The selected snapshot is authoritative even when live inputs change.
+        (helper / 'helper.go').write_text('invalid ambient Go source\n')
+    if transfer_failure:
+        (project.parent / 'helper').write_text('receiver path is occupied\n')
+    environment = dict(os.environ, DSR_SYNC_TIMEOUT='10', NO_COLOR='1')
+    result = subprocess.run(['bash', '-c', harness, 'sibling-language', str(module), host,
+                             str(project), str(config_file), projection_root, str(case)],
+                            env=environment, capture_output=True, timeout=20)
+    (case / 'sync.stdout').write_bytes(result.stdout)
+    (case / 'sync.stderr').write_bytes(result.stderr)
+    (case / 'sync.status').write_text(str(result.returncode) + '\n')
+    return case, project, helper, manifest, original, result
+
+
+def synced(name, item):
+    case, project, helper, manifest, original, result = item
+    check(name + ': sibling sync succeeds', result.returncode == 0)
+    received = project.parent / 'helper' / 'helper.go'
+    check(name + ': receiver contains selected sibling bytes',
+          received.is_file() and received.read_bytes() == selected)
+    return case, project
+
+
+for layout in ('replace', 'workspace'):
+    name = 'windows-go-' + layout
+    item = fixture(name, 'go', projection=(layout == 'workspace'))
+    case, project = synced(name, item)
+    check(name + ': no Cargo patch command', not (case / 'patch.log').exists())
+    go_mod = 'module example.local/app\n\ngo 1.19\n\nrequire example.local/helper v0.0.0\n'
+    if layout == 'replace':
+        go_mod += 'replace example.local/helper => ../helper\n'
+    else:
+        (project / 'go.work').write_text('go 1.19\n\nuse (\n  .\n  ../helper\n)\n')
+        check(name + ': live sibling remains unchanged',
+              (item[2] / 'helper.go').read_text() == 'invalid ambient Go source\n')
+    (project / 'go.mod').write_text(go_mod)
+    (project / 'main.go').write_text('package main\nimport("fmt"; "example.local/helper")\n'
+                                   'func main() { fmt.Println(helper.Value()) }\n')
+    environment = dict(os.environ, GOPROXY='off', GOSUMDB='off', GOTOOLCHAIN='local',
+                       CGO_ENABLED='0', GOFLAGS='', GOOS='linux', GOMAXPROCS='2',
+                       GOWORK='off' if layout == 'replace' else str(project / 'go.work'),
+                       GOCACHE=os.environ.get('DSR_TEST_GOCACHE', str(work / 'go-cache')))
+    binary = case / 'app'
+    result = subprocess.run(['go', '-C', str(project), 'build', '-o', str(binary), '.'],
+                            env=environment, capture_output=True, timeout=45)
+    (case / 'build.stdout').write_bytes(result.stdout)
+    (case / 'build.stderr').write_bytes(result.stderr)
+    check(name + ': real Go compiles the transferred sibling', result.returncode == 0)
+    if result.returncode == 0:
+        run = subprocess.run([str(binary)], capture_output=True, timeout=5)
+        check(name + ': executable uses the selected sibling',
+              run.returncode == 0 and run.stdout == b'selected-sibling-input\n')
+
+for language in ('bun', 'typescript'):
+    name = 'windows-' + language + '-without-cargo'
+    case, _ = synced(name, fixture(name, language))
+    check(name + ': no Cargo patch command', not (case / 'patch.log').exists())
+
+for host in ('unix', 'windows'):
+    for label, language in [('go', 'go'), ('bun', 'bun'), ('typescript', 'typescript'),
+                            ('unspecified', missing), ('null', None)]:
+        name = host + '-' + label + '-incidental-cargo'
+        item = fixture(name, language, host=host, cargo=True)
+        case, _ = synced(name, item)
+        check(name + ': incidental Cargo manifest remains byte-exact', item[3].read_bytes() == item[4])
+        check(name + ': no Cargo patch command', not (case / 'patch.log').exists())
+
+    name = host + '-rust'
+    item = fixture(name, 'rust', host=host, cargo=True)
+    case, _ = synced(name, item)
+    check(name + ': Cargo dependency becomes relative',
+          item[3].read_bytes() == item[4].replace(str(item[2]).encode(), b'../helper'))
+    check(name + ': actual patch command executes', (case / 'patch.log').is_file())
+
+item = fixture('windows-rust-missing-manifest', 'rust')
+check('Rust missing Cargo manifest remains a sync failure', item[5].returncode != 0)
+check('Rust missing manifest reaches the actual PowerShell check',
+      (item[0] / 'patch.log').is_file() and b'Could not find file' in item[5].stderr)
+
+for language in ('go', 'rust'):
+    item = fixture(language + '-transfer-failure', language, cargo=True, transfer_failure=True)
+    check(language + ': genuine receiver preparation failure rejects sync', item[5].returncode != 0)
+    check(language + ': failed transfer does not patch source',
+          not (item[0] / 'patch.log').exists() and item[3].read_bytes() == item[4])
+
+for label, language, raw in [('list', ['rust'], None), ('boolean', False, None),
+                              ('documents', missing, 'language: go\n---\nlanguage: rust\n')]:
+    item = fixture('invalid-' + label, language, raw_config=raw)
+    check(label + ': malformed language/configuration refuses before transfer',
+          item[5].returncode == 4 and not (item[1].parent / 'helper').exists()
+          and not (item[0] / 'patch.log').exists())
+
+print(f'Sibling language sync: {checks - len(failures)} passed, {len(failures)} failed', flush=True)
+raise SystemExit(bool(failures))
+PY
 )
 
 test_ordinary_go_siblings() (
@@ -4312,6 +4498,10 @@ if [[ "${1:-}" == --ordinary-inputs-only ]]; then
 fi
 if [[ "${1:-}" == --ordinary-resume-only ]]; then
     test_ordinary_source_resume
+    exit $?
+fi
+if [[ "${1:-}" == --sibling-language-only ]]; then
+    test_sibling_language_sync
     exit $?
 fi
 if [[ "${1:-}" == --go-siblings-only ]]; then

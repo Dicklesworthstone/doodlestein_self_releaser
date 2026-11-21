@@ -1049,6 +1049,13 @@ Staged roots are retained for subsequent resume. Ordinary staging requires
 rsync and Python 3 on the controller. Windows Git-context import requires
 PowerShell 7 and Git; Unix import requires Bash, Git, jq, and a SHA-256 utility.
 
+Sibling synchronization rewrites absolute dependency paths in the remote
+`Cargo.toml` only when the repository explicitly sets `language: rust`.
+Go, Bun, TypeScript, and repositories without a language setting retain their
+selected manifest bytes and do not require a Cargo manifest. Their sibling
+directories preserve the configured relative layout for imports, Go replacements,
+and Go workspaces.
+
 When ordinary parallel Go, Bun or TypeScript targets on one Unix host share an
 in-tree output path, the scheduler can move a conflicting target into a private
 source copy. That copy preserves the synchronized sibling layout and selected
