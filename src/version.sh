@@ -99,30 +99,61 @@ _version_detect_by_language() {
     esac
 }
 
-# Extract one scalar TOML key from an exact table. This fallback is deliberately
-# section-aware: a dependency/profile version must never be mistaken for the
-# package version.
-_version_from_toml_table() {
-    local toml_file="$1"
-    local table="$2"
-    local key="$3"
-    local line=""
+# Read only the authoritative version fields with a complete TOML parser.
+# Line matching cannot distinguish metadata from multiline strings or handle
+# literal/quoted keys and inherited tables. Reject malformed/duplicate keys
+# before any caller can create a release tag. Cargo still resolves inheritance.
+_version_toml_metadata() {
+    if ! command -v python3 &>/dev/null; then
+        log_error 'Python 3.11+ is required to read TOML release versions'
+        return 1
+    fi
+    python3 -I - "$1" "$2" <<'PY'
+import json
+import sys
 
-    line=$(awk -v wanted="[$table]" -v wanted_key="$key" '
-        /^[[:space:]]*\[[^]]+\][[:space:]]*(#.*)?$/ {
-            current = $0
-            sub(/[[:space:]]*#.*/, "", current)
-            gsub(/[[:space:]]/, "", current)
-            next
-        }
-        current == wanted && $0 ~ "^[[:space:]]*" wanted_key "[[:space:]]*=" {
-            print
-            exit
-        }
-    ' "$toml_file")
+try:
+    import tomllib
+except ImportError:
+    print('[version] Python 3.11+ is required to read TOML release versions', file=sys.stderr)
+    raise SystemExit(1)
 
-    [[ -n "$line" ]] || return 1
-    printf '%s\n' "$line" | sed -E 's/^[^=]*=[[:space:]]*"([^"]*)".*/\1/'
+try:
+    with open(sys.argv[1], 'rb') as source:
+        document = tomllib.load(source)
+    if sys.argv[2] == 'rust':
+        package = document.get('package')
+        if package is not None and not isinstance(package, dict):
+            raise ValueError('package must be a TOML table')
+        version = (package or {}).get('version')
+        if version is not None and not isinstance(version, (str, dict)):
+            raise ValueError('package.version must be a string or inherited table')
+        result = {'version': version if isinstance(version, str) else None,
+                  'root_inherited': isinstance(version, dict) and version.get('workspace') is True}
+    elif sys.argv[2] == 'python':
+        project = document.get('project', {})
+        if not isinstance(project, dict):
+            raise ValueError('project must be a TOML table')
+        if 'version' in project:
+            version = project['version']
+        else:
+            # Poetry can supply the base version for project.dynamic, as well
+            # as older projects containing only the tool.poetry table.
+            tool = document.get('tool', {})
+            poetry = tool.get('poetry', {}) if isinstance(tool, dict) else None
+            if not isinstance(poetry, dict):
+                raise ValueError('tool.poetry must be a TOML table')
+            version = poetry.get('version')
+        if version is not None and not isinstance(version, str):
+            raise ValueError('the project release version must be a string')
+        result = {'version': version}
+    else:
+        raise ValueError('unknown TOML version source')
+    print(json.dumps(result, separators=(',', ':')))
+except (OSError, UnicodeError, ValueError) as error:
+    print('[version] Cannot read release metadata in ' + sys.argv[1] + ': ' + str(error), file=sys.stderr)
+    raise SystemExit(1)
+PY
 }
 
 # Extract a Rust package/workspace version without guessing.
@@ -140,8 +171,9 @@ _version_from_cargo_toml() {
         return 1
     fi
 
-    local root_version=""
-    root_version=$(_version_from_toml_table "$cargo_file" package version 2>/dev/null || true)
+    local root_version="" version_metadata
+    version_metadata=$(_version_toml_metadata "$cargo_file" rust) || return 1
+    root_version=$(jq -r '.version // empty' <<< "$version_metadata") || return 1
     if [[ -z "$main_package" && -n "$root_version" ]]; then
         if [[ "$root_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
             echo "$root_version"
@@ -149,6 +181,14 @@ _version_from_cargo_toml() {
         fi
         log_error "Invalid Rust package version in $cargo_file: $root_version"
         return 1
+    fi
+
+    # A root package remains the release source when its version is inherited.
+    # Other workspace members may have different versions; only a virtual
+    # workspace needs the common-version rule below. An explicit package still
+    # overrides this implicit root selection.
+    if [[ -z "$main_package" ]] && jq -e '.root_inherited' <<< "$version_metadata" >/dev/null; then
+        main_package=.
     fi
 
     if ! command -v cargo &>/dev/null || ! command -v jq &>/dev/null; then
@@ -333,10 +373,9 @@ _version_from_pyproject() {
         return 1
     fi
 
-    local version
-    # Simple grep for version line (handles most cases)
-    version=$(grep -E -m1 '^[[:space:]]*version[[:space:]]*=[[:space:]]*"' "$pyproject_file" 2>/dev/null | \
-             sed -E 's/.*version[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/')
+    local version metadata
+    metadata=$(_version_toml_metadata "$pyproject_file" python) || return 1
+    version=$(jq -r '.version // empty' <<< "$metadata") || return 1
 
     if [[ -n "$version" && "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
         echo "$version"
@@ -666,4 +705,4 @@ version_tag_all() {
 # Export functions
 export -f version_detect version_needs_tag version_create_tag version_info_json version_tag_all
 export -f _version_detect_by_language _version_from_cargo_toml _version_from_go
-export -f _version_from_package_json _version_from_pyproject _version_from_toml_table
+export -f _version_from_package_json _version_from_pyproject _version_toml_metadata

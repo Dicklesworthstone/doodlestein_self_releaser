@@ -22,7 +22,8 @@ setup() {
     harness_setup
 
     # Source the version module
-    source "$PROJECT_ROOT/src/version.sh"
+    # shellcheck source=/dev/null
+    source "${DSR_TEST_VERSION_MODULE:-$PROJECT_ROOT/src/version.sh}"
 
     # Create a mock repo directory
     MOCK_REPO="$TEST_TMPDIR/mock_repo"
@@ -131,6 +132,87 @@ EOF
     version=$(version_detect "$MOCK_REPO")
 
     assert_equal "1.0.0+build.123" "$version"
+}
+
+@test "rust: literal TOML strings and quoted package keys select the real version" {
+    cat > "$MOCK_REPO/Cargo.toml" << 'EOF'
+['package']
+name = 'test-tool'
+description = '''
+version = "9.9.9"
+'''
+'version' = '1.2.3'
+EOF
+
+    run version_detect "$MOCK_REPO"
+
+    assert_equal "0" "$status"
+    assert_equal "1.2.3" "$output"
+}
+
+@test "rust: inline inherited root version wins over other workspace members" {
+    cat > "$MOCK_REPO/Cargo.toml" << 'EOF'
+[package]
+name = "release-root"
+version = { workspace = true }
+edition = "2021"
+
+[workspace]
+members = ["crates/other"]
+resolver = "2"
+
+[workspace.package]
+version = "2.3.4"
+EOF
+    mkdir -p "$MOCK_REPO/src"
+    printf 'pub fn marker() {}\n' > "$MOCK_REPO/src/lib.rs"
+    add_workspace_member other 8.9.0
+    lock_workspace
+
+    run version_detect "$MOCK_REPO"
+    assert_equal "0" "$status"
+    assert_equal "2.3.4" "$output"
+
+    run version_detect "$MOCK_REPO" rust other
+    assert_equal "0" "$status"
+    assert_equal "8.9.0" "$output"
+}
+
+@test "rust: duplicate version keys never create a tag or use another ecosystem" {
+    cat > "$MOCK_REPO/Cargo.toml" << 'EOF'
+[package]
+version = "1.2.3"
+version = "4.5.6"
+EOF
+    printf '{"version":"9.9.9"}\n' > "$MOCK_REPO/package.json"
+    git -C "$MOCK_REPO" add Cargo.toml package.json
+    git -C "$MOCK_REPO" commit -qm 'Invalid Rust version metadata'
+
+    run version_create_tag "$MOCK_REPO"
+
+    [[ "$status" -ne 0 ]]
+    [[ -z "$(git -C "$MOCK_REPO" tag --list)" ]]
+}
+
+@test "rust: missing root version does not invent Cargo's default release version" {
+    cat > "$MOCK_REPO/Cargo.toml" << 'EOF'
+[package]
+name = "unversioned-root"
+edition = "2021"
+
+[workspace]
+members = ["crates/release"]
+resolver = "2"
+EOF
+    mkdir -p "$MOCK_REPO/src"
+    printf 'pub fn marker() {}\n' > "$MOCK_REPO/src/lib.rs"
+    add_workspace_member release 8.9.0
+    lock_workspace
+
+    run version_detect "$MOCK_REPO"
+
+    assert_equal "0" "$status"
+    assert_equal "8.9.0" "$output"
 }
 
 @test "rust: detect an inherited workspace package version" {
@@ -426,6 +508,141 @@ EOF
     version=$(version_detect "$MOCK_REPO")
 
     assert_equal "1.0.0" "$version"
+}
+
+@test "python: dependency versions cannot replace the project release version" {
+    cat > "$MOCK_REPO/pyproject.toml" << 'EOF'
+[tool.poetry.dependencies.example]
+version = "9.9.9"
+
+[tool.poetry]
+version = "8.8.8"
+
+[project]
+name = "release-project"
+version = "1.2.3"
+EOF
+    git -C "$MOCK_REPO" add pyproject.toml
+    git -C "$MOCK_REPO" commit -qm 'Project and unrelated versions'
+
+    run version_create_tag "$MOCK_REPO" --language python
+
+    assert_equal "0" "$status"
+    assert_equal "v1.2.3" "$(git -C "$MOCK_REPO" tag --list)"
+    assert_equal "$(git -C "$MOCK_REPO" rev-parse HEAD)" \
+        "$(git -C "$MOCK_REPO" rev-parse 'v1.2.3^{commit}')"
+}
+
+@test "python: quoted keys and multiline descriptions are parsed as TOML" {
+    cat > "$MOCK_REPO/pyproject.toml" << 'EOF'
+[project]
+description = '''
+[project]
+version = "9.9.9"
+'''
+'version' = '2.3.4'
+EOF
+
+    run version_detect "$MOCK_REPO" python
+
+    assert_equal "0" "$status"
+    assert_equal "2.3.4" "$output"
+}
+
+@test "python: dependency-only version metadata cannot create a release tag" {
+    cat > "$MOCK_REPO/pyproject.toml" << 'EOF'
+[project]
+name = "dynamic-version"
+dynamic = ["version"]
+
+[tool.poetry.dependencies.example]
+version = "9.9.9"
+EOF
+    git -C "$MOCK_REPO" add pyproject.toml
+    git -C "$MOCK_REPO" commit -qm 'No static project version'
+
+    run version_create_tag "$MOCK_REPO" --language python
+
+    [[ "$status" -ne 0 ]]
+    [[ -z "$(git -C "$MOCK_REPO" tag --list)" ]]
+}
+
+@test "python: Poetry base version remains available for dynamic project metadata" {
+    cat > "$MOCK_REPO/pyproject.toml" << 'EOF'
+[project]
+name = "poetry-project"
+dynamic = ["version"]
+
+[tool.poetry.dependencies.example]
+version = "9.9.9"
+
+[tool.poetry]
+version = '3.4.5'
+EOF
+
+    run version_detect "$MOCK_REPO" python
+
+    assert_equal "0" "$status"
+    assert_equal "3.4.5" "$output"
+}
+
+@test "python: invalid authoritative version cannot fall back to Poetry" {
+    cat > "$MOCK_REPO/pyproject.toml" << 'EOF'
+[tool.poetry]
+version = "9.9.9"
+
+[project]
+version = false
+EOF
+
+    run version_detect "$MOCK_REPO" python
+
+    [[ "$status" -ne 0 ]]
+}
+
+@test "python: duplicate version keys refuse tag creation" {
+    cat > "$MOCK_REPO/pyproject.toml" << 'EOF'
+[project]
+version = "1.2.3"
+version = "4.5.6"
+EOF
+    git -C "$MOCK_REPO" add pyproject.toml
+    git -C "$MOCK_REPO" commit -qm 'Invalid Python version metadata'
+
+    run version_create_tag "$MOCK_REPO" --language python
+
+    [[ "$status" -ne 0 ]]
+    [[ -z "$(git -C "$MOCK_REPO" tag --list)" ]]
+}
+
+@test "python: exported detector retains its TOML parser in a child shell" {
+    printf "[project]\nversion = '1.2.3'\n" > "$MOCK_REPO/pyproject.toml"
+
+    run bash -c 'version_detect "$1" python' bash "$MOCK_REPO"
+
+    assert_equal "0" "$status"
+    assert_equal "1.2.3" "$output"
+}
+
+@test "version CLI: exact project metadata governs JSON inspection and created tags" {
+    cat > "$MOCK_REPO/pyproject.toml" << 'EOF'
+[tool.poetry.dependencies.example]
+version = "9.9.9"
+
+[project]
+version = '1.2.3'
+EOF
+    git -C "$MOCK_REPO" add pyproject.toml
+    git -C "$MOCK_REPO" commit -qm 'Project version for public CLI'
+
+    bats_require_minimum_version 1.5.0
+    run --separate-stderr bash "$PROJECT_ROOT/dsr" --json version detect "$MOCK_REPO"
+    assert_equal "0" "$status"
+    printf '%s\n' "$output" | jq -e '.status == "success" and .details.version == "1.2.3"'
+
+    run bash "$PROJECT_ROOT/dsr" version tag "$MOCK_REPO"
+    assert_equal "0" "$status"
+    assert_equal "v1.2.3" "$(git -C "$MOCK_REPO" tag --list)"
 }
 
 # ============================================================================

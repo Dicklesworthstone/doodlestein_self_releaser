@@ -134,6 +134,9 @@ Required:
 - **jq** — JSON parsing
 - **yq (mikefarah v4)** — Read and safely edit YAML configuration
 
+For automatic Rust and Python version detection:
+- **Python 3.11+** — Parse `Cargo.toml` and `pyproject.toml` with the standard TOML parser
+
 For local builds:
 - **docker** — Required for nektos/act containers
 - **act** — `brew install act` or [nektos/act releases](https://github.com/nektos/act/releases)
@@ -1644,9 +1647,16 @@ writing cleanup records. Use `--json` for per-host results and retention reasons
 ### `dsr version`
 
 Detect a repository's authoritative version and create an annotated release
-tag. For Rust virtual workspaces, set `main_package` in the tool's
+tag. Rust and Python metadata use Python 3.11+ to parse TOML, including quoted
+keys, literal strings and workspace inheritance; duplicate keys and malformed
+documents are refused before tagging. Python uses `project.version` when
+present, otherwise the Poetry base version at `tool.poetry.version`. Dependency
+versions and version-like text in descriptions are never release versions.
+For Rust virtual workspaces, set `main_package` in the tool's
 `repos.d/<tool>.yaml`; without it, all publishable workspace members must have
-one common version. Ambiguous or unreadable workspaces fail closed and never
+one common version. A root package with an inherited version uses that package's
+resolved version unless `main_package` selects another member.
+Ambiguous or unreadable workspaces fail closed and never
 fall through to an unrelated ecosystem manifest. Workspace resolution is
 read-only (`cargo metadata --locked --offline`), so it requires `cargo`, `jq`,
 and a current `Cargo.lock`.
