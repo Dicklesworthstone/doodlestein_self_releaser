@@ -226,8 +226,15 @@ Missing local objects require restoring the reviewed source first.
 Companion source paths and archive destinations may have up to 16 safe segments
 and 1,024 characters, with at most 128 characters per segment. Parent
 directories such as `share/demo` are created in the private archive payload.
-There are at most 256 distinct source companions. Selected Git files must be
-regular files; links, submodules and directory sources are refused. Absolute
+There are at most 256 distinct source companions. A path may descend through
+recursive Git submodules: each parent tree's gitlink selects the exact child
+commit, and the child must have an initialized local worktree at that path for
+initial acquisition. Its current HEAD, working files and Git replacement
+objects cannot change the selected bytes. Missing pinned child objects,
+uninitialized or redirected child worktrees, and cyclic commit chains are
+refused; the existing path-depth and object limits bound the complete proof.
+No child is fetched, checked out or updated. The final selected entry must be a
+regular Git file; symbolic links, a gitlink itself, and directory sources are refused. Absolute
 paths, traversal, empty or dot segments and backslashes are refused. Binary
 members and source companions share a case-insensitive destination namespace,
 including implicit directories: `share` cannot be both a file and a parent,
@@ -247,8 +254,11 @@ payloads are unsigned until the existing finalizer signs their new bytes.
 Each completed package retains raw commit, ancestor-tree, and blob objects under
 `release/source/companions/`. `packaging_evidence.source_companions` records the
 selected commit, every source path/blob/Git mode/content hash/size, and the
-retained object inventory. Retry recomputes Git object identities and traverses
-the retained tree chain, rather than trusting a rewritten per-file receipt.
+retained object inventory. When paths traverse submodules, its `gitlinks` array
+also records each traversed source path and pinned child commit. The retained
+objects include those child commits and their trees, so retry recomputes Git
+object identities and traverses the complete parent-to-child chain without
+trusting a rewritten per-file or submodule receipt.
 The proof is bounded to 2,048 objects, 64 MiB per object, and 256 MiB total;
 individual Git reads have a 60-second timeout and owned process-group cleanup.
 

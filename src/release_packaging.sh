@@ -317,7 +317,7 @@ def companion_proof(base, create=False):
     need(objects.is_dir(), "missing retained companion Git proof")
     cached, total = {}, 0
 
-    def read_object(kind, oid):
+    def read_object(kind, oid, object_repo=None):
         nonlocal total
         key = kind + "-" + oid
         if key in cached:
@@ -325,11 +325,11 @@ def companion_proof(base, create=False):
         need(match(oid, r"[0-9a-f]{40}") and len(cached) < 2048, "invalid or excessive companion proof")
         file = objects / key
         if create:
-            size = git_read(repository, "cat-file", "-s", oid).strip()
+            size = git_read(object_repo or repository, "cat-file", "-s", oid).strip()
             need(re.fullmatch(rb"[0-9]{1,10}", size) is not None and int(size) <= 64 * 1024 * 1024,
                  "companion Git object exceeds 64 MiB", 4)
             need(total + int(size) <= 256 * 1024 * 1024, "companion Git proof exceeds 256 MiB", 4)
-            data = git_read(repository, "cat-file", kind, oid)
+            data = git_read(object_repo or repository, "cat-file", kind, oid)
             need(len(data) == int(size), "companion Git object size changed")
         else:
             size = regular(file).stat().st_size
@@ -345,16 +345,21 @@ def companion_proof(base, create=False):
         cached[key] = data
         return data
 
-    # Keep the complete commit/tree chain, not just producer-written filename
-    # and hash claims. Retry can prove each blob/mode belongs to --sha without
-    # the original checkout or Git executable, even after receipts are edited.
-    commit = read_object("commit", args.sha)
-    first = commit.split(b"\n", 1)[0]
-    need(re.fullmatch(rb"tree [0-9a-f]{40}", first) is not None, "invalid companion source commit")
+    # Keep the complete commit/tree/gitlink chain, not just producer-written
+    # filename and hash claims. A gitlink selects the child's exact commit;
+    # neither its mutable HEAD nor working-tree bytes supply release data.
+    # Retry proves the same chain from retained objects without Git/checkouts.
+    def commit_tree(oid, object_repo=None):
+        commit = read_object("commit", oid, object_repo)
+        first = commit.split(b"\n", 1)[0]
+        need(re.fullmatch(rb"tree [0-9a-f]{40}", first) is not None, "invalid companion source commit")
+        return first[5:].decode()
+
+    root_tree = commit_tree(args.sha)
     trees = {}
-    def tree(oid):
+    def tree(oid, object_repo=None):
         if oid not in trees:
-            data = read_object("tree", oid)
+            data = read_object("tree", oid, object_repo)
             entries, pos = {}, 0
             while pos < len(data):
                 space, end = data.find(b" ", pos), data.find(b"\0", pos)
@@ -366,22 +371,40 @@ def companion_proof(base, create=False):
                 pos = end + 21
             trees[oid] = entries
         return trees[oid]
-    files = []
+    files, gitlinks = [], {}
     for selected_path in source_files:
-        oid = first[5:].decode()
+        oid, selected_repo = root_tree, repository
+        commits = {args.sha}
         parts = selected_path.split("/")
         for index, part in enumerate(parts):
-            entry = tree(oid).get(part.encode())
+            entry = tree(oid, selected_repo).get(part.encode())
             need(entry is not None, "companion absent from pinned source: " + selected_path, 4)
             mode, oid = entry
+            if mode == "160000" and index < len(parts) - 1:
+                link_path = "/".join(parts[:index + 1])
+                need(oid not in commits, "cyclic companion submodule commits", 4)
+                commits.add(oid)
+                need(link_path not in gitlinks or gitlinks[link_path] == oid,
+                     "conflicting companion submodule commit", 4)
+                gitlinks[link_path] = oid
+                if create:
+                    selected_repo = path(str(repository / link_path))
+                    need(selected_repo.is_dir() and
+                         git_read(selected_repo, "rev-parse", "--show-toplevel").decode().rstrip("\n") == str(selected_repo),
+                         "companion submodule must be an initialized local Git worktree: " + link_path, 4)
+                oid = commit_tree(oid, selected_repo)
+                continue
             need(mode in (("100644", "100755") if index == len(parts) - 1 else ("40000",)),
                  "companion path is not a regular Git file: " + selected_path, 4)
-        data = read_object("blob", oid)
+        data = read_object("blob", oid, selected_repo)
         files.append(dict(source=selected_path, git_blob_sha=oid, git_mode=mode,
                           sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data)))
     need({p.name for p in objects.iterdir()} == set(cached), "retained companion object namespace changed")
-    return dict(kind="git-commit-source-files", schema_version=1, git_sha=args.sha, files=files,
-                objects=[dict(name=k, sha256=hashlib.sha256(v).hexdigest(), size_bytes=len(v)) for k, v in sorted(cached.items())])
+    proof = dict(kind="git-commit-source-files", schema_version=1, git_sha=args.sha, files=files,
+                 objects=[dict(name=k, sha256=hashlib.sha256(v).hexdigest(), size_bytes=len(v)) for k, v in sorted(cached.items())])
+    if gitlinks:
+        proof["gitlinks"] = [dict(path=p, git_sha=s) for p, s in sorted(gitlinks.items())]
+    return proof
 
 def member_destination(payload, selected_path, directories):
     # Only the private, already admitted payload is traversed. Cache each

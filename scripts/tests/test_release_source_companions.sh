@@ -5,7 +5,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 for tool in python3 git jq tar zip unzip xz flock find cp mv mktemp; do
     command -v "$tool" >/dev/null || { printf 'SKIP requires %s\n' "$tool"; exit 3; }
 done
-python3 - "$ROOT" <<'PY'
+python3 - "$ROOT" "$@" <<'PY'
 import copy
 import hashlib
 import io
@@ -24,6 +24,8 @@ root = Path(sys.argv[1])
 script = Path(os.environ.get("DSR_PACKAGING_TEST_SCRIPT", str(root / "src/release_packaging.sh")))
 work = Path(tempfile.mkdtemp(prefix="dsr-source-companions-"))
 passed = 0
+if sys.argv[2:] not in ([], ["--submodules-only"]):
+    raise SystemExit("usage: test_release_source_companions.sh [--submodules-only]")
 
 def check(label, condition):
     global passed
@@ -124,7 +126,199 @@ def finalize_preview(plan_file, bundle, selected_recipe, source_repo=True, expec
     check('finalizer dry-run never creates persistent bundle output', not bundle.exists())
     return value
 
+def submodule_tests():
+    global checkout, commit, incoming, manifest, pins, recipe
+    checkout = work / "submodule-checkout"
+    nested = checkout / "runtime/data"
+    nested.mkdir(parents=True)
+    runtime = checkout / "runtime"
+
+    def at(repo, *arguments, data=None):
+        return subprocess.run(["git", "-C", str(repo), *arguments], input=data,
+                              capture_output=True, check=True).stdout
+
+    for repo in (checkout, runtime, nested):
+        at(repo, "init", "-q")
+        at(repo, "config", "user.name", "DSR Test")
+        at(repo, "config", "user.email", "dsr-test@example.invalid")
+    message = b"exact nested runtime data\n"
+    hook = b"#!/bin/sh\nprintf 'pinned nested hook\\n'\n"
+    (nested / "message.txt").write_bytes(message)
+    (nested / "hook").write_bytes(hook)
+    (nested / "hook").chmod(0o755)
+    at(nested, "add", ".")
+    at(nested, "commit", "-qm", "pinned nested data")
+    nested_commit = at(nested, "rev-parse", "HEAD").decode().strip()
+    license_bytes = b"runtime dependency license\n"
+    (runtime / "LICENSE").write_bytes(license_bytes)
+    (runtime / "linked-data").symlink_to("data", target_is_directory=True)
+    (runtime / ".gitmodules").write_text('[submodule "data"]\npath = data\nurl = https://github.com/owner/data.git\n')
+    at(runtime, "add", "LICENSE", "linked-data", ".gitmodules")
+    at(runtime, "update-index", "--add", "--cacheinfo", "160000," + nested_commit + ",data")
+    at(runtime, "commit", "-qm", "pinned runtime dependency")
+    runtime_commit = at(runtime, "rev-parse", "HEAD").decode().strip()
+    (checkout / ".gitmodules").write_text('[submodule "runtime"]\npath = runtime\nurl = https://github.com/owner/runtime.git\n')
+    (checkout / "README").write_text("release with pinned runtime resources\n")
+    at(checkout, "remote", "add", "origin", "https://github.com/owner/demo.git")
+    at(checkout, "add", "README", ".gitmodules")
+    at(checkout, "update-index", "--add", "--cacheinfo", "160000," + runtime_commit + ",runtime")
+    at(checkout, "commit", "-qm", "release source")
+    at(checkout, "tag", "v1.2.3")
+    commit = at(checkout, "rev-parse", "HEAD").decode().strip()
+    at(checkout, "submodule", "absorbgitdirs")
+    check("recursive source fixture uses real absorbed submodule Git directories",
+          (runtime / ".git").is_file() and (nested / ".git").is_file())
+
+    # Both mutable child HEADs and the working files disagree with the root's
+    # gitlink pins. Only the original commit/tree/blob chain may be packaged.
+    (nested / "message.txt").write_text("wrong newer runtime data\n")
+    at(nested, "add", "message.txt")
+    at(nested, "commit", "-qm", "newer nested data")
+    (nested / "message.txt").write_text("wrong uncommitted runtime data\n")
+    at(runtime, "commit", "--allow-empty", "-qm", "newer runtime HEAD")
+    (runtime / "LICENSE").write_text("wrong uncommitted license\n")
+    blob = at(nested, "rev-parse", nested_commit + ":message.txt").decode().strip()
+    replacement = at(nested, "hash-object", "-w", "--stdin", data=b"replacement-object poison\n").decode().strip()
+    at(nested, "replace", blob, replacement)
+    incoming = work / "submodule-producer"
+    incoming.mkdir()
+    app = b'#!/bin/sh\ncd "$(dirname "$0")/.." || exit 1\nexec cat share/demo/message.txt\n'
+    (incoming / "app").write_bytes(app)
+    (incoming / "app").chmod(0o755)
+    manifest = work / "submodule-producer.json"
+    original = manifest_for(incoming, manifest)
+    pins = {manifest: sha(manifest)}
+    includes = [dict(source="runtime/LICENSE", path="share/demo/LICENSE"),
+                dict(source="runtime/data/message.txt", path="share/demo/message.txt"),
+                dict(source="runtime/data/hook", path="libexec/hook")]
+    recipe = dict(schema_version=1, artifacts=[dict(name="runtime." + fmt, target="linux/amd64",
+        archive_format=fmt, members=[dict(source="app", path="bin/demo")], source_files=includes,
+        aliases=["runtime-compat." + fmt]) for fmt in ("tar.gz", "tar.xz", "zip")])
+    recipe_file = work / "submodule-recipe.json"
+    write(recipe_file, recipe)
+    source_command = ["bash", str(script), "--recipe", str(recipe_file), "--check-source", "--source-repo", str(checkout),
+                      "--repo", "owner/demo", "--tag", "v1.2.3", "--sha", commit]
+
+    def preflight(label, expected=0):
+        p = subprocess.run(source_command, capture_output=True, timeout=60)
+        if p.returncode != expected:
+            raise AssertionError(label + f": expected {expected}, got {p.returncode}: " + p.stderr.decode())
+        result = json.loads(p.stdout)
+        check(label, result["exit_code"] == expected and result["publishable"] is False)
+        return result
+
+    proof = preflight("source preflight resolves both exact nested gitlink commits")["source_companions"]
+    check("source evidence names every traversed submodule and its pinned commit", proof["gitlinks"] ==
+          [dict(path="runtime", git_sha=runtime_commit), dict(path="runtime/data", git_sha=nested_commit)])
+    plan = dict(schema_version=1, repo="owner/demo", tool="demo", tag="v1.2.3", source_sha=commit,
+        required_targets=["linux/amd64"], required_assets=original["required_assets"],
+        builds=[dict(id="native", manifest=str(manifest), manifest_sha256=pins[manifest],
+                     artifacts_dir=str(incoming), targets=["linux/amd64"])])
+    plan_file = work / "submodule-build-set.json"
+    write(plan_file, plan)
+    preview = finalize_preview(plan_file, work / "submodule-preview", recipe_file)
+    check("public finalizer plans a release with recursive source resources",
+          preview["status"] == "planned" and preview["packaging"]["source_files"] == sorted(m["source"] for m in includes))
+
+    # An unavailable or redirected child must not fall through to the parent
+    # repository, a newer HEAD, a symlink, or working files with matching names.
+    held = work / "held-runtime"
+    runtime.rename(held)
+    runtime.mkdir()
+    preflight("uninitialized child cannot borrow the parent repository", 4)
+    at(runtime, "init", "-q")
+    at(runtime, "config", "user.name", "DSR Test")
+    at(runtime, "config", "user.email", "dsr-test@example.invalid")
+    (runtime / "LICENSE").write_bytes(license_bytes)
+    at(runtime, "add", "LICENSE")
+    at(runtime, "commit", "-qm", "unrelated child with matching working bytes")
+    preflight("a different child repository cannot replace the selected commit", 4)
+    runtime.rename(work / "unrelated-runtime")
+    runtime.symlink_to(held, target_is_directory=True)
+    preflight("symlinked child checkout cannot redirect companion acquisition", 7)
+    runtime.rename(work / "held-runtime-alias")
+    held.rename(runtime)
+    configured_worktree = at(runtime, "config", "core.worktree").decode().strip()
+    at(runtime, "config", "core.worktree", str(work))
+    preflight("child core.worktree redirection is refused", 4)
+    at(runtime, "config", "core.worktree", configured_worktree)
+    for source in ("runtime", "runtime/linked-data/message.txt", "runtime/data/absent",
+                   "runtime/data/../message.txt", "/".join(["runtime"] * 17)):
+        invalid = copy.deepcopy(recipe)
+        invalid["artifacts"][0]["source_files"] = [dict(source=source, path="share/refused")]
+        write(recipe_file, invalid)
+        preflight("invalid recursive companion is refused: " + source, 4)
+    write(recipe_file, recipe)
+
+    output = work / "submodule-package"
+    result = run(output)
+    completed = json.loads(Path(result["manifest"]).read_text())
+    check("completed recursive proof equals the admitted preflight proof",
+          completed["packaging_evidence"]["source_companions"] == proof)
+    check("recursive packaging preserves original producer identity and compiler evidence",
+          completed["source"] == original["source"] and completed["build_environments"] == original["build_environments"])
+    pipeline_work = work / "submodule-pipeline"
+    pipeline_work.mkdir()
+    pipeline("_rf_packaging_preview", recipe_file, pipeline_work)
+    write(pipeline_work / "packaging-result.json", result)
+    pipeline("_rf_packaging_handoff", output, pins[manifest], plan_file, pipeline_work)
+    check("completed recursive package passes the public finalization handoff", True)
+    expected_payload = {"bin/demo": (app, 0o111), "share/demo/LICENSE": (license_bytes, 0),
+                        "share/demo/message.txt": (message, 0), "libexec/hook": (hook, 0o111)}
+    for fmt in ("tar.gz", "tar.xz", "zip"):
+        packaged = Path(result["artifacts_dir"]) / ("runtime." + fmt)
+        check(fmt + " packages pinned child bytes and modes despite mutable HEAD and replacements", payload(packaged) == expected_payload)
+        check(fmt + " recursive companion alias preserves exact archive bytes",
+              sha(packaged) == sha(Path(result["artifacts_dir"]) / ("runtime-compat." + fmt)))
+        dest = work / ("submodule-extracted-" + fmt)
+        dest.mkdir()
+        subprocess.run(["bash", "-c", 'source "$1/src/packaging.sh"; packaging_extract_payload "$2" "$3" "$4"',
+                        "_", str(root), str(packaged), fmt, str(dest)], capture_output=True, check=True)
+        executed = subprocess.run([str(dest / "bin/demo")], capture_output=True)
+        hook_result = subprocess.run([str(dest / "libexec/hook")], capture_output=True)
+        check(fmt + " installed application runs using pinned nested runtime data",
+              executed.returncode == 0 and executed.stdout == message and hook_result.stdout == b"pinned nested hook\n")
+    retained = output / "release/source/companions"
+    for oid in (runtime_commit, nested_commit):
+        file = retained / ("commit-" + oid)
+        saved = file.read_bytes()
+        file.write_bytes(saved + b"forged child commit")
+        run(output, 7, source_repo=False)
+        check("tampered child commit is refused without repair", file.read_bytes() != saved)
+        file.write_bytes(saved)
+    selected_commit = retained / ("commit-" + nested_commit)
+    held_commit = work / "held-child-commit"
+    selected_commit.rename(held_commit)
+    run(output, 7, source_repo=False)
+    check("missing retained child commit cannot be reconstructed from receipt claims", not selected_commit.exists())
+    held_commit.rename(selected_commit)
+    saved = Path(result["manifest"]).read_bytes()
+    forged_manifest = copy.deepcopy(completed)
+    forged_manifest["packaging_evidence"]["source_companions"]["gitlinks"][1]["git_sha"] = "b" * 40
+    write(Path(result["manifest"]), forged_manifest)
+    run(output, 7, source_repo=False)
+    Path(result["manifest"]).write_bytes(saved)
+    snapshots = {str(p.relative_to(output)): (p.stat().st_ino, p.stat().st_mtime_ns, sha(p))
+                 for p in output.rglob("*") if p.is_file()}
+    checkout.rename(work / "offline-submodule-checkout")
+    incoming.rename(work / "offline-submodule-producer")
+    manifest.rename(work / "offline-submodule-manifest")
+    no_git = work / "no-git"
+    no_git.mkdir()
+    (no_git / "git").write_text("#!/bin/sh\nexit 97\n")
+    (no_git / "git").chmod(0o755)
+    run(output, source_repo=False, env=dict(os.environ, PATH=str(no_git) + os.pathsep + os.environ["PATH"]))
+    check("offline retry revalidates complete nested proof without Git, source or producer",
+          snapshots == {str(p.relative_to(output)): (p.stat().st_ino, p.stat().st_mtime_ns, sha(p))
+                        for p in output.rglob("*") if p.is_file()})
+    pipeline("_rf_packaging_handoff", output, pins[manifest], plan_file, pipeline_work)
+    check("offline recursive package still passes public finalization handoff", True)
+
 try:
+    if sys.argv[2:] == ["--submodules-only"]:
+        submodule_tests()
+        print(f"Recursive source companion integration: {passed} assertions passed", flush=True)
+        raise SystemExit(0)
     checkout = work / "checkout"
     checkout.mkdir()
     git("init", "-q")
@@ -410,6 +604,7 @@ try:
     check('offline-reverified companion package still passes finalizer handoff', True)
     after = {str(p.relative_to(out)): (p.stat().st_ino, p.stat().st_mtime_ns, sha(p)) for p in out.rglob("*") if p.is_file()}
     check("offline resume revalidates evidence without rewriting any file", snapshots == after)
+    submodule_tests()
     print(f"Source companion integration: {passed} assertions passed", flush=True)
 finally:
     if os.environ.get("DSR_RETAIN_TEST_EVIDENCE") == "1":

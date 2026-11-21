@@ -86,7 +86,11 @@ This is one entry in the recipe's `artifacts` array. Supply `--source-repo` to
 the packaging command (or `--packaging-source-repo` to the finalizer) when
 selecting source companions. Source files come from the selected release
 commit, including their executable bits; working-copy contents never supply
-these bytes. Nested layouts use the same archive admission, complete output
+these bytes. A path such as `runtime/data/model.bin` may descend through
+recursively pinned submodules. Each selected submodule must have an initialized
+local checkout, and its parent gitlink determines the commit to read, even when
+the submodule's HEAD or working files have changed. No source is downloaded.
+Nested layouts use the same archive admission, complete output
 inventory and retained retry evidence as flat layouts. A complete prebuilt
 archive whose selected companions already match keeps its exact compressed
 bytes. See [source companion custody](PACKAGED_RELEASE_FINALIZATION.md#include-license-and-other-files-from-the-exact-release-commit)
