@@ -6895,7 +6895,8 @@ print(hashlib.sha256(data).hexdigest())') || return 4
 
 _release_contract_public_main() {
     set -o pipefail
-    gh_api "repos/$1/git/ref/heads/main" --no-cache | python3 -I -c '
+    local -a read_status=()
+    if gh_api "repos/$1/git/ref/heads/main" --no-cache | python3 -I -c '
 import json, re, sys
 def unique(pairs):
     result = {}
@@ -6911,14 +6912,22 @@ if (value.get("ref") != "refs/heads/main" or obj.get("type") != "commit"
         or not isinstance(sha, str) or re.fullmatch("[0-9a-f]{40}", sha) is None
         or sha == "0" * 40):
     raise SystemExit("Malformed public main ref")
-print(sha)'
+print(sha)'; then
+        return 0
+    else
+        read_status=("${PIPESTATUS[@]}")
+        if _gh_operation_interrupted "${read_status[0]}"; then return "${read_status[0]}"; fi
+        if ((read_status[1] >= 129 && read_status[1] <= 255)); then return "${read_status[1]}"; fi
+        return 7
+    fi
 }
 
 # Decode a GitHub contents response only after validating its complete blob
 # identity. Streams avoid the operating system limit on per-argument size.
 _release_contract_public_text_file() {
     set -o pipefail
-    gh_api "repos/$1/contents/$3?ref=$2" --no-cache | python3 -I -c '
+    local -a read_status=()
+    if gh_api "repos/$1/contents/$3?ref=$2" --no-cache | python3 -I -c '
 import base64, hashlib, json, sys
 def unique(pairs):
     result = {}
@@ -6941,7 +6950,14 @@ if len(data) != value["size"] or blob != value.get("sha"):
     raise SystemExit("Checksum contents do not match their Git blob")
 if "\0" in data.decode("utf-8"):
     raise SystemExit("Checksum text contains NUL")
-sys.stdout.buffer.write(data)' "$3"
+sys.stdout.buffer.write(data)' "$3"; then
+        return 0
+    else
+        read_status=("${PIPESTATUS[@]}")
+        if _gh_operation_interrupted "${read_status[0]}"; then return "${read_status[0]}"; fi
+        if ((read_status[1] >= 129 && read_status[1] <= 255)); then return "${read_status[1]}"; fi
+        return 7
+    fi
 }
 
 # Execute the existing ACFS URL checker from the same immutable downstream
@@ -6963,7 +6979,11 @@ _release_contract_acfs_installer_checksum() {
           { set +o noclobber
             _release_contract_public_text_file "$downstream" "$revision" "scripts/lib/$file"
           } > "$snapshot/$file"
-        ) || return 7
+        ) || {
+            status=$?
+            if _gh_operation_interrupted "$status"; then return "$status"; fi
+            return 7
+        }
     done
     # Use the current Bash (ACFS needs Bash 4+) with a minimal public-download
     # environment. No release credentials or ambient Bash hooks reach it.
@@ -6975,7 +6995,11 @@ _release_contract_acfs_installer_checksum() {
     ) || status=$?
     cat "$snapshot/stderr" >&2 || return 7
     (( status == 0 )) || {
-        log_error "Required ACFS checksum checker failed (exit $status)"; return 7;
+        log_error "Required ACFS checksum checker failed (exit $status)"
+        # This is a child program, not a GitHub adapter: its ordinary exit5
+        # must not be reinterpreted as DSR cancellation.
+        if ((status >= 129 && status <= 255)); then return "$status"; fi
+        return 7
     }
     actual=$(cat "$snapshot/stdout") || return 7
     [[ "$actual" =~ ^[0-9a-f]{64}$ ]] || {
@@ -6990,7 +7014,7 @@ _release_contract_acfs_installer_checksum() {
 _release_contract_verify_raw_installer_checksum() {
 (
     set -o pipefail
-    local plan="${1:-null}" repo downstream path key installer_path url expected source_ref downstream_ref text actual
+    local plan="${1:-null}" repo downstream path key installer_path url expected source_ref downstream_ref text actual status current_ref
     [[ "$plan" != null ]] || return 0
     jq -e '
         type == "object" and
@@ -7007,19 +7031,31 @@ _release_contract_verify_raw_installer_checksum() {
     expected=$(jq -r '.sha256' <<< "$plan") || return 4
     url="https://raw.githubusercontent.com/$repo/refs/heads/main/$installer_path"
     [[ "$(jq -r '.url' <<< "$plan")" == "$url" ]] || return 4
-    source_ref=$(_release_contract_public_main "$repo") || return 7
-    downstream_ref=$(_release_contract_public_main "$downstream") || return 7
+    source_ref=$(_release_contract_public_main "$repo") || return $?
+    downstream_ref=$(_release_contract_public_main "$downstream") || return $?
     # A cached raw-main response must not rescue a different current main
     # installer. Bind that public authority to an immutable Git blob too.
-    actual=$(_release_contract_public_text_file "$repo" "$source_ref" "$installer_path" |
-        python3 -I -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())') || return 7
+    actual=$(
+        local -a hash_status=()
+        if _release_contract_public_text_file "$repo" "$source_ref" "$installer_path" |
+           python3 -I -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())'; then
+            return 0
+        else
+            hash_status=("${PIPESTATUS[@]}")
+            if _gh_operation_interrupted "${hash_status[0]}"; then return "${hash_status[0]}"; fi
+            if ((hash_status[1] >= 129 && hash_status[1] <= 255)); then return "${hash_status[1]}"; fi
+            return 7
+        fi
+    ) || return $?
     [[ "$actual" == "$expected" ]] || {
         log_error 'Immutable public main installer differs from release-source bytes'; return 7;
     }
     if [[ "$(jq -r '.policy.checker // ""' <<< "$plan")" == acfs ]]; then
-        actual=$(_release_contract_acfs_installer_checksum "$downstream" "$downstream_ref" "$url") || return 7
+        actual=$(_release_contract_acfs_installer_checksum "$downstream" "$downstream_ref" "$url") || return $?
     else
-        actual=$(curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+        actual=$(
+        local -a download_status=()
+        if curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
         --connect-timeout 10 --max-time 30 --max-filesize 2097152 \
         --user-agent "doodlestein_self_releaser-agent (+https://github.com/$repo)" \
         "$url" | python3 -I -c '
@@ -7027,15 +7063,32 @@ import hashlib, sys
 data = sys.stdin.buffer.read(2097153)
 if not 0 < len(data) <= 2097152:
     raise SystemExit("Raw installer response has invalid size")
-print(hashlib.sha256(data).hexdigest())') || return 7
+print(hashlib.sha256(data).hexdigest())'; then
+            return 0
+        else
+            download_status=("${PIPESTATUS[@]}")
+            if ((download_status[0] >= 129 && download_status[0] <= 255)); then
+                return "${download_status[0]}"
+            fi
+            if ((download_status[1] >= 129 && download_status[1] <= 255)); then
+                return "${download_status[1]}"
+            fi
+            return 7
+        fi
+        ) || {
+            status=$?
+            # curl5 is a proxy/DNS failure, not the adapter's interrupted5.
+            if ((status >= 129 && status <= 255)); then return "$status"; fi
+            return 7
+        }
     fi
     [[ "$actual" == "$expected" ]] || {
         log_error 'Public main installer differs from release-source bytes'; return 7;
     }
-    text=$(_release_contract_public_text_file "$downstream" "$downstream_ref" "$path") || return 7
+    text=$(_release_contract_public_text_file "$downstream" "$downstream_ref" "$path") || return $?
     # Accept the downstream generator's canonical byte shape, not aliases,
     # duplicate keys or another document that a YAML reader might reinterpret.
-    if ! printf '%s\n' "$text" | python3 -I -c '
+    if printf '%s\n' "$text" | python3 -I -c '
 import re, sys
 selected, url, digest = sys.argv[1:]
 entries = {}
@@ -7066,12 +7119,20 @@ if (not root or any(len(fields) != 2 or not fields[0].startswith("    url:")
                     or not fields[1].startswith("    sha256:") for fields in entries.values())
         or entries.get(selected) != [f"    url: \"{url}\"", f"    sha256: \"{digest}\""]):
     raise SystemExit("Downstream entry does not pin the exact installer URL and digest")
-' "$key" "$url" "$expected"; then
+' "$key" "$url" "$expected"; then :; else
+        local -a checksum_status=("${PIPESTATUS[@]}")
+        if ((checksum_status[1] >= 129 && checksum_status[1] <= 255)); then
+            return "${checksum_status[1]}"
+        fi
         log_error 'Committed downstream checksum does not pin this raw installer; run the downstream refresh/check and push it before publication'
         return 7
     fi
-    [[ "$(_release_contract_public_main "$downstream")" == "$downstream_ref" &&
-       "$(_release_contract_public_main "$repo")" == "$source_ref" ]] || {
+    current_ref=$(_release_contract_public_main "$downstream") || return $?
+    [[ "$current_ref" == "$downstream_ref" ]] || {
+        log_error 'Public source or downstream main moved during installer verification'; return 7;
+    }
+    current_ref=$(_release_contract_public_main "$repo") || return $?
+    [[ "$current_ref" == "$source_ref" ]] || {
         log_error 'Public source or downstream main moved during installer verification'; return 7;
     }
     log_info "Verified raw installer $expected; source main $source_ref, downstream $downstream main $downstream_ref"
@@ -7336,7 +7397,9 @@ _release_contract_preflight() {
         return 4
     }
     remote_tag_sha=$(gh_resolve_tag_sha "$repo" "$tag" 2>/dev/null) || {
+        local tag_status=$?
         log_error "Could not dereference GitHub tag $tag in $repo"
+        if _gh_operation_interrupted "$tag_status"; then return "$tag_status"; fi
         return 4
     }
     manifest_git_sha=$(jq -r '.source.git_sha' "$manifest_file")
@@ -7361,7 +7424,9 @@ _release_contract_preflight() {
             '.github_tag_ruleset.ruleset_id' <<< "$contract_json") || return 4
         tag_ruleset_policy_json=$(gh_get_immutable_tag_ruleset_receipt \
             "$repo" "$tag_ruleset_repository_id" "$tag_ruleset_id" "$tag") || {
+            local ruleset_status=$?
             log_error "Live GitHub tag-ruleset verification failed for $repo"
+            if _gh_operation_interrupted "$ruleset_status"; then return "$ruleset_status"; fi
             return 4
         }
         tag_ruleset_policy_sha256=$(_release_sha256_line \
@@ -7807,7 +7872,11 @@ _release_contract_preflight() {
     assets_json=$(printf '%s\n' "${planned_assets[@]}" | jq -sc '.') || return 4
     raw_installer_plan=$(_release_contract_raw_installer_plan "$repo" "$head_sha" "$local_path" "$contract_json") || return 4
     if [[ "$sidecar_mode" != plan ]]; then
-        _release_contract_verify_raw_installer_checksum "$raw_installer_plan" >/dev/null || return 4
+        _release_contract_verify_raw_installer_checksum "$raw_installer_plan" >/dev/null || {
+            local installer_status=$?
+            if _gh_operation_interrupted "$installer_status"; then return "$installer_status"; fi
+            return 4
+        }
     fi
     jq -nc \
         --arg tool "$tool_name" \
@@ -7869,7 +7938,9 @@ _release_contract_verify_tag_ruleset_receipt() {
     git_sha=$(jq -r '.git_sha' <<< "$frozen_receipt") || return 1
     policy_json=$(gh_get_immutable_tag_ruleset_receipt \
         "$repo" "$repository_id" "$ruleset_id" "$tag") || {
+        local ruleset_status=$?
         log_error "Could not refresh the frozen immutable-tag ruleset receipt"
+        if _gh_operation_interrupted "$ruleset_status"; then return "$ruleset_status"; fi
         return 1
     }
     policy_sha256=$(_release_sha256_line "$policy_json") || return 1
@@ -7905,7 +7976,9 @@ _release_contract_verify_remote_tag_identity() {
         return 1
     fi
     remote_git_sha=$(gh_resolve_tag_sha "$repo" "$tag" 2>/dev/null) || {
+        local tag_status=$?
         log_error "Could not resolve remote release tag immediately before publication"
+        if _gh_operation_interrupted "$tag_status"; then return "$tag_status"; fi
         return 1
     }
     if [[ "$remote_git_sha" != "$expected_git_sha" ]]; then
@@ -7920,8 +7993,14 @@ _release_contract_verify_remote_tag_identity() {
 # embedded assets may be truncated; every embedded row must still agree with
 # the authoritative listing, but it never establishes that listing's extent.
 _release_contract_observe_remote_inventory() {
-    local repo="$1" release_id="$2" before inventory after
-    before=$(gh_api "repos/$repo/releases/$release_id" --no-cache) || return 1
+    local repo="$1" release_id="$2" before inventory after observe_status
+    local retain_observation="${3:-false}"
+    [[ "$retain_observation" == true || "$retain_observation" == false ]] || return 1
+    before=$(gh_api "repos/$repo/releases/$release_id" --no-cache) || {
+        observe_status=$?
+        if _gh_operation_interrupted "$observe_status"; then return "$observe_status"; fi
+        return 1
+    }
     if ! jq -es --argjson id "$release_id" '
         length == 1 and (.[0] | type == "object" and .id == $id and
         (.assets | type == "array") and (.draft | type == "boolean"))
@@ -7929,8 +8008,22 @@ _release_contract_observe_remote_inventory() {
         log_error "GitHub returned invalid release metadata before inventory verification"
         return 1
     fi
-    inventory=$(gh_release_asset_inventory "$repo" "$release_id") || return 1
-    after=$(gh_api "repos/$repo/releases/$release_id" --no-cache) || return 1
+    inventory=$(gh_release_asset_inventory "$repo" "$release_id") || {
+        observe_status=$?
+        if _gh_operation_interrupted "$observe_status"; then
+            $retain_observation && printf '%s\n' "$before"
+            return "$observe_status"
+        fi
+        return 1
+    }
+    after=$(gh_api "repos/$repo/releases/$release_id" --no-cache) || {
+        observe_status=$?
+        if _gh_operation_interrupted "$observe_status"; then
+            $retain_observation && printf '%s\n' "$before"
+            return "$observe_status"
+        fi
+        return 1
+    }
     if ! jq -cse --slurpfile before /dev/fd/3 --slurpfile inventory /dev/fd/4 '
         def identity: {id,tag_name,name,body,draft,prerelease,target_commitish,upload_url};
         def record: {id,name,state,size,digest};
@@ -7961,6 +8054,8 @@ _release_contract_verify_remote_assets() {
     local expected_tag="${5:-}"
     local expected_metadata_json="${6:-null}"
     local release_json=""
+    local retain_observation="${7:-false}" observe_status
+    [[ "$retain_observation" == true || "$retain_observation" == false ]] || return 1
 
     if [[ ! "$release_id" =~ ^[1-9][0-9]*$ ]]; then
         log_error "GitHub release ID is invalid: $release_id"
@@ -7970,8 +8065,16 @@ _release_contract_verify_remote_assets() {
         log_error "Expected release tag is required for strict remote verification"
         return 1
     fi
-    release_json=$(_release_contract_observe_remote_inventory "$repo" "$release_id") || {
+    release_json=$(_release_contract_observe_remote_inventory "$repo" "$release_id" "$retain_observation") || {
+        observe_status=$?
         log_error "Could not fetch draft release for remote verification"
+        if _gh_operation_interrupted "$observe_status"; then
+            if $retain_observation && _source_release_metadata_matches \
+                    "$release_json" "$expected_metadata_json" "$release_id" any; then
+                printf '%s\n' "$release_json"
+            fi
+            return "$observe_status"
+        fi
         return 1
     }
     if ! jq -e \
@@ -8049,14 +8152,30 @@ _release_contract_verify_remote_assets() {
 
     if jq -e 'any(.[]; .kind == "minisign")' \
         <<< "$expected_assets_json" >/dev/null 2>&1; then
-        if ! _release_contract_verify_remote_signed_bytes \
-            "$repo" "$release_json" "$expected_assets_json"; then
+        if _release_contract_verify_remote_signed_bytes \
+            "$repo" "$release_json" "$expected_assets_json"; then :; else
+            observe_status=$?
+            if _gh_operation_interrupted "$observe_status"; then
+                if $retain_observation && _source_release_metadata_matches \
+                        "$release_json" "$expected_metadata_json" "$release_id" any; then
+                    printf '%s\n' "$release_json"
+                fi
+                return "$observe_status"
+            fi
             return 1
         fi
 
         local release_json_after=""
         release_json_after=$(_release_contract_observe_remote_inventory "$repo" "$release_id") || {
+            observe_status=$?
             log_error "Could not re-fetch release after remote signature verification"
+            if _gh_operation_interrupted "$observe_status"; then
+                if $retain_observation && _source_release_metadata_matches \
+                        "$release_json" "$expected_metadata_json" "$release_id" any; then
+                    printf '%s\n' "$release_json"
+                fi
+                return "$observe_status"
+            fi
             return 1
         }
         if ! jq -e --slurpfile before /dev/fd/3 '
@@ -8152,10 +8271,11 @@ _release_contract_verify_remote_signed_bytes() {
         primary_download="$download_dir/$pair_index.primary"
         signature_download="$download_dir/$pair_index.minisig"
 
-        if ! gh_download_release_asset "$repo" "$primary_id" "$primary_download" "$primary_size" || \
-           ! gh_download_release_asset "$repo" "$signature_id" "$signature_download" "$signature_size"; then
+        if gh_download_release_asset "$repo" "$primary_id" "$primary_download" "$primary_size" && \
+           gh_download_release_asset "$repo" "$signature_id" "$signature_download" "$signature_size"; then :; else
+            status=$?
             log_error "Could not download signed release pair: $primary_name"
-            status=1
+            _gh_operation_interrupted "$status" || status=1
             break
         fi
 
@@ -8201,7 +8321,7 @@ _release_contract_verify_remote_signed_bytes() {
     rmdir -- "$download_dir" 2>/dev/null || true
     if [[ $status -ne 0 ]]; then
         log_error "Remote signed release byte verification failed"
-        return 1
+        return "$status"
     fi
     return 0
 }
@@ -8211,7 +8331,11 @@ _release_contract_observe_draft_state() {
     local release_id="$2"
     local release_json=""
 
-    release_json=$(gh_api "repos/$repo/releases/$release_id" --no-cache 2>/dev/null) || return 1
+    release_json=$(gh_api "repos/$repo/releases/$release_id" --no-cache 2>/dev/null) || {
+        local observe_status=$?
+        if _gh_operation_interrupted "$observe_status"; then return "$observe_status"; fi
+        return 1
+    }
     jq -er \
         --argjson release_id "$release_id" '
             if .id == $release_id and (.draft | type == "boolean")
@@ -8225,24 +8349,31 @@ _release_contract_restore_draft() {
     local repo="$1"
     local release_id="$2"
     local expected_tag="$3"
-    local attempt observed_state=""
+    local attempt observed_state="" restore_status
     local max_attempts=3
     local retry_delay="${DSR_RELEASE_STATE_RETRY_DELAY_SECONDS:-1}"
 
     [[ "$retry_delay" =~ ^[0-9]+$ ]] || retry_delay=1
     for ((attempt = 1; attempt <= max_attempts; attempt++)); do
-        # A transport error is ambiguous: the PATCH may have committed. Always
-        # observe the release state before deciding whether another attempt is needed.
+        # Ordinary transport errors are ambiguous and can be reconciled. A
+        # terminal cancellation leaves that decision to a new invocation.
         gh_api "repos/$repo/releases/$release_id" \
-            --method PATCH --data '{"draft":true}' --no-cache >/dev/null 2>&1 || true
+            --method PATCH --data '{"draft":true}' --no-cache >/dev/null 2>&1 || {
+            restore_status=$?
+            if _gh_operation_interrupted "$restore_status"; then return "$restore_status"; fi
+        }
         observed_state=$(_release_contract_observe_draft_state \
-            "$repo" "$release_id" 2>/dev/null || true)
+            "$repo" "$release_id" 2>/dev/null) || {
+            restore_status=$?
+            if _gh_operation_interrupted "$restore_status"; then return "$restore_status"; fi
+            observed_state=""
+        }
         if [[ "$observed_state" == "true" ]]; then
             log_warn "Restored strict release $expected_tag to draft after failed publication verification"
             return 0
         fi
         if ((attempt < max_attempts && retry_delay > 0)); then
-            sleep "$retry_delay"
+            sleep "$retry_delay" || return $?
         fi
     done
 
@@ -8257,7 +8388,11 @@ _release_contract_confirm_or_restore_draft() {
     local observed_state=""
 
     observed_state=$(_release_contract_observe_draft_state \
-        "$repo" "$release_id" 2>/dev/null || true)
+        "$repo" "$release_id" 2>/dev/null) || {
+        local observe_status=$?
+        if _gh_operation_interrupted "$observe_status"; then return "$observe_status"; fi
+        observed_state=""
+    }
     if [[ "$observed_state" == "true" ]]; then
         return 0
     fi
@@ -8277,7 +8412,9 @@ _release_contract_scan_release_by_tag() {
     while ((page <= max_pages)); do
         page_json=$(gh_api "repos/$repo/releases?per_page=100&page=$page" \
             --no-cache 2>/dev/null) || {
+            local scan_status=$?
             log_error "Could not scan GitHub releases for strict tag $expected_tag"
+            if _gh_operation_interrupted "$scan_status"; then return "$scan_status"; fi
             return 1
         }
         if ! jq -e 'type == "array" and length <= 100' \
@@ -8329,7 +8466,11 @@ _release_contract_observe_bound_draft() {
     local release_json=""
 
     [[ "$release_id" =~ ^[1-9][0-9]*$ ]] || return 1
-    release_json=$(gh_api "repos/$repo/releases/$release_id" --no-cache 2>/dev/null) || return 1
+    release_json=$(gh_api "repos/$repo/releases/$release_id" --no-cache 2>/dev/null) || {
+        local observe_status=$?
+        if _gh_operation_interrupted "$observe_status"; then return "$observe_status"; fi
+        return 1
+    }
     if ! jq -e \
         --argjson release_id "$release_id" \
         --arg expected_tag "$expected_tag" '
@@ -8348,13 +8489,19 @@ _release_contract_confirm_or_restore_bound_draft() {
     local repo="$1"
     local release_id="$2"
     local expected_tag="$3"
-    local release_json="" attempt
+    local release_json="" attempt restore_status
+    local retain_observation="${4:-false}"
     local max_attempts=3
     local retry_delay="${DSR_RELEASE_STATE_RETRY_DELAY_SECONDS:-1}"
 
     [[ "$retry_delay" =~ ^[0-9]+$ ]] || retry_delay=1
     [[ "$release_id" =~ ^[1-9][0-9]*$ ]] || return 1
-    release_json=$(gh_api "repos/$repo/releases/$release_id" --no-cache 2>/dev/null) || return 1
+    [[ "$retain_observation" == true || "$retain_observation" == false ]] || return 1
+    release_json=$(gh_api "repos/$repo/releases/$release_id" --no-cache 2>/dev/null) || {
+        restore_status=$?
+        if _gh_operation_interrupted "$restore_status"; then return "$restore_status"; fi
+        return 1
+    }
     if ! jq -e \
         --argjson release_id "$release_id" \
         --arg expected_tag "$expected_tag" '
@@ -8371,14 +8518,26 @@ _release_contract_confirm_or_restore_bound_draft() {
 
     for ((attempt = 1; attempt <= max_attempts; attempt++)); do
         gh_api "repos/$repo/releases/$release_id" \
-            --method PATCH --data '{"draft":true}' --no-cache >/dev/null 2>&1 || true
+            --method PATCH --data '{"draft":true}' --no-cache >/dev/null 2>&1 || {
+            restore_status=$?
+            if _gh_operation_interrupted "$restore_status"; then
+                $retain_observation && printf '%s\n' "$release_json"
+                return "$restore_status"
+            fi
+        }
         if _release_contract_observe_bound_draft \
             "$repo" "$release_id" "$expected_tag" >/dev/null 2>&1; then
             log_warn "Restored strict release $expected_tag to its ID-bound draft"
             return 0
+        else
+            restore_status=$?
+            if _gh_operation_interrupted "$restore_status"; then
+                $retain_observation && printf '%s\n' "$release_json"
+                return "$restore_status"
+            fi
         fi
         if ((attempt < max_attempts && retry_delay > 0)); then
-            sleep "$retry_delay"
+            sleep "$retry_delay" || return $?
         fi
     done
 
@@ -8434,12 +8593,20 @@ _source_release_metadata_matches() {
 }
 
 _source_release_observe() {
-    local repo="$1" release_id="$2" expected="$3" draft="$4" observed="" assets=""
-    observed=$(gh_api "repos/$repo/releases/$release_id" --no-cache) || return 1
+    local repo="$1" release_id="$2" expected="$3" draft="$4" observed="" assets="" observe_status
+    observed=$(gh_api "repos/$repo/releases/$release_id" --no-cache) || {
+        observe_status=$?
+        if _gh_operation_interrupted "$observe_status"; then return "$observe_status"; fi
+        return 1
+    }
     _source_release_metadata_matches "$observed" "$expected" "$release_id" "$draft" || return 1
     jq -es 'length == 1 and .[0].assets == []' <<< "$observed" >/dev/null || return 1
     # Embedded release.assets is not an authoritative complete inventory.
-    assets=$(gh_api "repos/$repo/releases/$release_id/assets?per_page=100&page=1" --no-cache) || return 1
+    assets=$(gh_api "repos/$repo/releases/$release_id/assets?per_page=100&page=1" --no-cache) || {
+        observe_status=$?
+        if _gh_operation_interrupted "$observe_status"; then return "$observe_status"; fi
+        return 1
+    }
     jq -es 'length == 1 and .[0] == []' <<< "$assets" >/dev/null || return 1
     printf '%s\n' "$observed"
 }
@@ -8449,7 +8616,7 @@ _source_release_restore_draft() {
     # Callers reach rollback only after full nonce-bound creation custody is
     # proven. Later body drift must still return that owned ID/tag to draft.
     tag=$(jq -r '.tag_name' <<< "$expected") || return 1
-    _release_contract_confirm_or_restore_bound_draft "$repo" "$release_id" "$tag"
+    _release_contract_confirm_or_restore_bound_draft "$repo" "$release_id" "$tag" "${4:-false}"
 }
 
 _source_release_inputs_match() {
@@ -8544,7 +8711,7 @@ PY
 _release_finalize_observe() {
     local repo="$1" id="$2" plan="$3" draft="$4" tag="$5" metadata="$6"
     local observed observe_status
-    observed=$(_release_contract_verify_remote_assets "$repo" "$id" "$plan" "$draft" "$tag" "$metadata") || {
+    observed=$(_release_contract_verify_remote_assets "$repo" "$id" "$plan" "$draft" "$tag" "$metadata" true) || {
         observe_status=$?
         if _gh_operation_interrupted "$observe_status"; then
             # The verifier may retain a completed metadata observation when
@@ -9004,14 +9171,14 @@ _release_finalize_execute_locked() {
     }
     local restore_observation
     if ! $valid; then
-        restore_observation=$(_source_release_restore_draft "$repo" "$release_id" "$metadata") || {
+        restore_observation=$(_source_release_restore_draft "$repo" "$release_id" "$metadata" true) || {
             if _release_finalize_interrupted restore "$?" "$restore_observation"; then return 5; fi
         }
         log_error "Strict finalization failed post-publication revalidation"
         return 7
     fi
     final_output=$(umask 077; mktemp "$state_dir/releases/$tool-$tag-finalized.XXXXXXXX") || {
-        restore_observation=$(_source_release_restore_draft "$repo" "$release_id" "$metadata") || {
+        restore_observation=$(_source_release_restore_draft "$repo" "$release_id" "$metadata" true) || {
             if _release_finalize_interrupted restore "$?" "$restore_observation"; then return 5; fi
         }
         return 7
@@ -9020,7 +9187,7 @@ _release_finalize_execute_locked() {
         --arg response "$response" --arg sha "$receipt_sha" --slurpfile plan /dev/fd/3 \
         --arg pending "$output" --slurpfile release /dev/fd/4 '{schema:"dsr.strict_finalization_receipt.v1",status:"success",repo:$repo,tag:$tag,release_id:$id,create_response:$response,create_response_sha256:$sha,pending_receipt:$pending,plan:$plan[0],release:$release[0]}' \
         3<<< "$plan" 4<<< "$observed" > "$final_output"; then
-        restore_observation=$(_source_release_restore_draft "$repo" "$release_id" "$metadata") || {
+        restore_observation=$(_source_release_restore_draft "$repo" "$release_id" "$metadata" true) || {
             if _release_finalize_interrupted restore "$?" "$restore_observation"; then return 5; fi
         }
         return 7
@@ -10082,12 +10249,29 @@ EOF
     local release_contract_metadata_json='null'
     local release_contract_git_sha=""
     local release_contract_tag_ruleset_receipt='null'
+    _release_interrupted_admission() {
+        local admission_status="$1" admission_stage="${2:-verification}"
+        _gh_operation_interrupted "$admission_status" || return 1
+        log_error "Strict release $admission_stage stopped (exit $admission_status)"
+        if $JSON_MODE; then
+            json_envelope "release" "error" 5 "$(jq -nc --arg repo "$repo" --arg tag "$tag" --arg version "$version" \
+                --argjson code "$admission_status" --arg stage "$admission_stage" \
+                --arg response "${create_response:-}" --arg custody "${create_response_dir:-}" '
+                {repo:$repo,version:$version,tag:$tag,stage:$stage,verification:"interrupted",
+                 error:("Strict release " + $stage + " interrupted"),
+                 interruption:{stage:$stage,exit_code:$code,outcome:"unconfirmed"}} |
+                if $custody == "" then . else . + {creation_custody_dir:$custody} end |
+                if $response == "" then . else . + {create_response:$response,finalization_tmpdir:$custody} end')"
+        fi
+        return 0
+    }
     if $release_contract_enabled; then
         local contract_sidecar_mode="create"
         $DRY_RUN && contract_sidecar_mode="plan"
-        if ! release_contract_plan=$(_release_contract_preflight \
+        if release_contract_plan=$(_release_contract_preflight \
             "$tool_name" "$tag" "$repo" "$local_path" "$artifacts_dir" \
-            "$manifest_file" "$release_contract_json" "$contract_sidecar_mode"); then
+            "$manifest_file" "$release_contract_json" "$contract_sidecar_mode"); then :; else
+            if _release_interrupted_admission "$?"; then return 5; fi
             return 4
         fi
         release_contract_git_sha=$(jq -r '.git_sha' <<< "$release_contract_plan")
@@ -10708,7 +10892,11 @@ EOF
         local scan_json="" match_count=""
 
         scan_json=$(_release_contract_scan_release_by_tag \
-            "$check_repo" "$check_tag") || return 1
+            "$check_repo" "$check_tag") || {
+            local scan_status=$?
+            if _gh_operation_interrupted "$scan_status"; then return "$scan_status"; fi
+            return 1
+        }
         match_count=$(jq -er '
             if type == "object" and
                ((.count == 0 and .release == null) or
@@ -10735,7 +10923,11 @@ EOF
 
         [[ "$observe_release_id" =~ ^[1-9][0-9]*$ ]] || return 1
         observed_json=$(gh_api "repos/$observe_repo/releases/$observe_release_id" \
-            --no-cache 2>/dev/null) || return 1
+            --no-cache 2>/dev/null) || {
+            local observe_status=$?
+            if _gh_operation_interrupted "$observe_status"; then return "$observe_status"; fi
+            return 1
+        }
         if ! jq -e \
             --argjson release_id "$observe_release_id" \
             --slurpfile expected /dev/fd/3 '
@@ -10760,7 +10952,7 @@ EOF
         local restore_repo="$1"
         local restore_release_id="$2"
         local expected_metadata_json="$3"
-        local observed_json="" attempt
+        local observed_json="" attempt restore_status
         local max_attempts=3
         local retry_delay="${DSR_RELEASE_STATE_RETRY_DELAY_SECONDS:-1}"
 
@@ -10770,23 +10962,34 @@ EOF
             # match alone must never authorize mutation after ambiguous create.
             observed_json=$(_release_contract_observe_owned_release \
                 "$restore_repo" "$restore_release_id" "$expected_metadata_json" \
-                2>/dev/null || true)
+                2>/dev/null) || {
+                restore_status=$?
+                if _gh_operation_interrupted "$restore_status"; then return "$restore_status"; fi
+                return 1
+            }
             [[ -n "$observed_json" ]] || return 1
             if jq -e '.draft == true' <<< "$observed_json" >/dev/null 2>&1; then
                 return 0
             fi
 
             gh_api "repos/$restore_repo/releases/$restore_release_id" \
-                --method PATCH --data '{"draft":true}' --no-cache >/dev/null 2>&1 || true
+                --method PATCH --data '{"draft":true}' --no-cache >/dev/null 2>&1 || {
+                restore_status=$?
+                if _gh_operation_interrupted "$restore_status"; then return "$restore_status"; fi
+            }
             observed_json=$(_release_contract_observe_owned_release \
                 "$restore_repo" "$restore_release_id" "$expected_metadata_json" \
-                2>/dev/null || true)
+                2>/dev/null) || {
+                restore_status=$?
+                if _gh_operation_interrupted "$restore_status"; then return "$restore_status"; fi
+                observed_json=""
+            }
             if [[ -n "$observed_json" ]] && \
                jq -e '.draft == true' <<< "$observed_json" >/dev/null 2>&1; then
                 return 0
             fi
             if ((attempt < max_attempts && retry_delay > 0)); then
-                sleep "$retry_delay"
+                sleep "$retry_delay" || return $?
             fi
         done
         return 1
@@ -11058,11 +11261,13 @@ EOF
     fi
     if $release_contract_enabled; then
         release_args+=" --target-commitish $release_contract_git_sha"
-        if ! _release_contract_require_tag_release_absent "$repo" "$tag"; then
+        if _release_contract_require_tag_release_absent "$repo" "$tag"; then :; else
+            if _release_interrupted_admission "$?"; then return 5; fi
             return 7
         fi
-        if ! _release_contract_verify_tag_ruleset_receipt \
-            "$release_contract_tag_ruleset_receipt"; then
+        if _release_contract_verify_tag_ruleset_receipt \
+            "$release_contract_tag_ruleset_receipt"; then :; else
+            if _release_interrupted_admission "$?"; then return 5; fi
             log_error "Immutable-tag governance changed before strict draft admission"
             return 1
         fi
@@ -11197,13 +11402,19 @@ EOF
             local observed_release_scan="" observed_release_id=""
             local observed_owned_release_json=""
             observed_release_scan=$(_release_contract_scan_release_by_tag \
-                "$repo" "$tag" 2>/dev/null || true)
+                "$repo" "$tag" 2>/dev/null) || {
+                if _release_interrupted_admission "$?"; then return 5; fi
+                observed_release_scan=""
+            }
             observed_release_id=$(jq -r \
                 'if .count == 1 then .release.id // empty else empty end' \
                 <<< "$observed_release_scan" 2>/dev/null)
             observed_owned_release_json=$(_release_contract_observe_owned_release \
                 "$repo" "$observed_release_id" "$release_contract_metadata_json" \
-                2>/dev/null || true)
+                2>/dev/null) || {
+                if _release_interrupted_admission "$?"; then return 5; fi
+                observed_owned_release_json=""
+            }
             if [[ -n "$observed_owned_release_json" ]] && \
                jq -e '.draft == true and (.assets | length == 0)' \
                 <<< "$observed_owned_release_json" >/dev/null 2>&1 && \
@@ -11212,6 +11423,7 @@ EOF
                 release_json="$observed_owned_release_json"
                 log_warn "Create response failed, but no-cache observation confirmed the exact new empty draft"
             else
+                if _release_interrupted_admission "$?"; then return 5; fi
                 log_error "Failed to create an exact staging draft: $create_error"
                 # The ID/tag pair is not an ownership proof. Only a fresh
                 # ID-bound observation carrying this invocation's nonce and
@@ -11219,7 +11431,9 @@ EOF
                 if [[ -n "$observed_owned_release_json" ]]; then
                     _release_contract_confirm_or_restore_owned_draft \
                         "$repo" "$observed_release_id" \
-                        "$release_contract_metadata_json" >/dev/null 2>&1 || true
+                        "$release_contract_metadata_json" >/dev/null 2>&1 || {
+                        if _release_interrupted_admission "$?" restore; then return 5; fi
+                    }
                 fi
                 return 7
             fi
@@ -11337,11 +11551,16 @@ EOF
             local observed_owned_release_json=""
             observed_owned_release_json=$(_release_contract_observe_owned_release \
                 "$repo" "$release_id" "$release_contract_metadata_json" \
-                2>/dev/null || true)
+                2>/dev/null) || {
+                if _release_interrupted_admission "$?"; then return 5; fi
+                observed_owned_release_json=""
+            }
             if [[ -n "$observed_owned_release_json" ]]; then
                 _release_contract_confirm_or_restore_owned_draft \
                     "$repo" "$release_id" \
-                    "$release_contract_metadata_json" >/dev/null 2>&1 || true
+                    "$release_contract_metadata_json" >/dev/null 2>&1 || {
+                    if _release_interrupted_admission "$?" restore; then return 5; fi
+                }
             fi
             return 7
         fi
@@ -11531,7 +11750,10 @@ EOF
         # An observation helper may retain metadata from a completed read
         # before a later inventory/download/tag read was interrupted. This is
         # visibility evidence only; the failed verification cannot publish.
-        if [[ -n "$last_observation" ]] && $ordinary_owned; then
+        if [[ -n "$last_observation" ]] && $release_contract_enabled &&
+           _source_release_metadata_matches "$last_observation" "$release_contract_metadata_json" "$release_id" any; then
+            draft=$(jq -r '.draft' <<< "$last_observation")
+        elif [[ -n "$last_observation" ]] && $ordinary_owned; then
             if _release_ordinary_metadata_matches "$last_observation" true; then
                 draft=true
                 release_url=$(jq -r '.html_url' <<< "$last_observation")
@@ -11715,18 +11937,20 @@ EOF
     elif $release_contract_enabled; then
         local expected_assets_json
         local upload_failures=${#failed_assets[@]}
-        local remote_verified=false
+        local remote_verified=false strict_observed="" strict_status
         expected_assets_json=$(jq -c '.assets' <<< "$release_contract_plan")
 
-        if _release_contract_verify_remote_assets \
+        if strict_observed=$(_release_contract_verify_remote_assets \
             "$repo" "$release_id" "$expected_assets_json" true "$tag" \
-            "$release_contract_metadata_json" >/dev/null; then
+            "$release_contract_metadata_json" true); then
             remote_verified=true
             verification_status="exact"
             log_ok "Remote draft contains the exact contracted asset set and sizes"
         else
+            strict_status=$?
             verification_status="incomplete"
             _release_record_failed "remote-verification" "Remote asset set or size mismatch"
+            _release_record_interruption verification "$strict_status" "$strict_observed" || true
         fi
 
         if $remote_verified && [[ ${#strict_upload_response_failures[@]} -gt 0 ]]; then
@@ -11755,16 +11979,18 @@ EOF
                 upload_failures=${#failed_assets[@]}
                 log_warn "Upload response failure(s) reconciled by exact no-cache draft verification"
             else
+                strict_status=$?
                 verification_status="incomplete"
                 _release_record_failed "upload-reconciliation" \
                     "Remote tag identity changed after ambiguous upload response"
                 upload_failures=${#failed_assets[@]}
+                _release_record_interruption verification "$strict_status" "$strict_observed" || true
             fi
         fi
 
         local publish_preflight_valid=false
         local current_release_contract_plan=""
-        if [[ $upload_failures -eq 0 ]] && $remote_verified; then
+        if ! $release_interrupted && [[ $upload_failures -eq 0 ]] && $remote_verified; then
             if current_release_contract_plan=$(_release_contract_preflight \
                 "$tool_name" "$tag" "$repo" "$local_path" "$artifacts_dir" \
                 "$manifest_file" "$release_contract_json" verify); then
@@ -11784,29 +12010,33 @@ EOF
                     log_error "Strict release plan changed after upload; leaving the staging draft unpublished"
                 fi
             else
+                strict_status=$?
                 _release_record_failed "publish-preflight" \
                     "Source, artifact, or tag identity changed before publication"
                 log_error "Strict release preflight no longer holds; leaving the staging draft unpublished"
+                _release_record_interruption verification "$strict_status" "$strict_observed" || true
             fi
         fi
 
-        if [[ $upload_failures -eq 0 ]] && $remote_verified && $publish_preflight_valid; then
+        if ! $release_interrupted && [[ $upload_failures -eq 0 ]] && $remote_verified && $publish_preflight_valid; then
             local expected_git_sha
             expected_git_sha=$(jq -r '.git_sha' <<< "$release_contract_plan")
             if $requested_draft; then
-                if _release_contract_verify_remote_assets \
+                if strict_observed=$(_release_contract_verify_remote_assets \
                     "$repo" "$release_id" "$expected_assets_json" true "$tag" \
-                    "$release_contract_metadata_json" >/dev/null && \
+                    "$release_contract_metadata_json" true) && \
                    _release_contract_verify_remote_tag_identity \
                     "$repo" "$tag" "$expected_git_sha" && \
                    _release_contract_verify_tag_ruleset_receipt \
                     "$release_contract_tag_ruleset_receipt"; then
                     log_ok "Strict release retained as an exact verified draft by request"
                 else
+                    strict_status=$?
                     verification_status="incomplete"
                     _release_record_failed "draft-verification" \
                         "Remote draft or tag changed before final verification"
                     log_error "Strict draft changed before final verification"
+                    _release_record_interruption verification "$strict_status" "$strict_observed" || true
                 fi
             else
                 local publish_release_payload
@@ -11825,19 +12055,24 @@ EOF
                         "$repo" "$release_id" "$tag" >/dev/null 2>&1 || true
                     return 4
                 }
-                if ! _release_contract_verify_remote_assets \
+                local strict_gate_status=0
+                if strict_observed=$(_release_contract_verify_remote_assets \
                     "$repo" "$release_id" "$expected_assets_json" true "$tag" \
-                    "$release_contract_metadata_json" >/dev/null || \
-                   ! _release_contract_verify_remote_tag_identity \
-                    "$repo" "$tag" "$expected_git_sha" || \
-                   ! _release_contract_verify_tag_ruleset_receipt \
-                    "$release_contract_tag_ruleset_receipt" || \
-                   ! _release_contract_verify_raw_installer_checksum \
-                    "$(jq -c '.raw_installer_checksum // null' <<< "$release_contract_plan")" >/dev/null; then
+                    "$release_contract_metadata_json" true) && \
+                   _release_contract_verify_remote_tag_identity \
+                    "$repo" "$tag" "$expected_git_sha" && \
+                   _release_contract_verify_tag_ruleset_receipt \
+                    "$release_contract_tag_ruleset_receipt" && \
+                   _release_contract_verify_raw_installer_checksum \
+                    "$(jq -c '.raw_installer_checksum // null' <<< "$release_contract_plan")" >/dev/null; then :; else
+                    strict_gate_status=$?
+                fi
+                if ((strict_gate_status != 0)); then
                     verification_status="incomplete"
                     _release_record_failed "publish" \
                         "Remote draft or tag changed immediately before publication"
                     log_error "Remote draft or tag changed immediately before publication"
+                    _release_record_interruption verification "$strict_gate_status" "$strict_observed" || true
                 else
                     local publish_patch_status=0
                     gh_api "repos/$repo/releases/$release_id" \
@@ -11853,20 +12088,32 @@ EOF
                         _release_record_failed "publish" "Publication interrupted; remote outcome is unconfirmed"
                     elif published_release_json=$(_release_contract_verify_remote_assets \
                         "$repo" "$release_id" "$expected_assets_json" false "$tag" \
-                        "$release_contract_metadata_json"); then
+                        "$release_contract_metadata_json" true); then
                         postpublish_assets_valid=true
+                    else
+                        _release_record_interruption verification "$?" "$published_release_json" || true
                     fi
-                    if ! $release_interrupted && _release_contract_verify_remote_tag_identity \
-                        "$repo" "$tag" "$expected_git_sha"; then
-                        postpublish_tag_valid=true
+                    if ! $release_interrupted; then
+                        if _release_contract_verify_remote_tag_identity "$repo" "$tag" "$expected_git_sha"; then
+                            postpublish_tag_valid=true
+                        else
+                            _release_record_interruption verification "$?" "$published_release_json" || true
+                        fi
                     fi
-                    if ! $release_interrupted && _release_contract_verify_tag_ruleset_receipt \
-                        "$release_contract_tag_ruleset_receipt"; then
-                        postpublish_ruleset_valid=true
+                    if ! $release_interrupted; then
+                        if _release_contract_verify_tag_ruleset_receipt "$release_contract_tag_ruleset_receipt"; then
+                            postpublish_ruleset_valid=true
+                        else
+                            _release_record_interruption verification "$?" "$published_release_json" || true
+                        fi
                     fi
-                    if ! $release_interrupted && _release_contract_verify_raw_installer_checksum \
-                        "$(jq -c '.raw_installer_checksum // null' <<< "$release_contract_plan")" >/dev/null; then
-                        postpublish_raw_installer_valid=true
+                    if ! $release_interrupted; then
+                        if _release_contract_verify_raw_installer_checksum \
+                            "$(jq -c '.raw_installer_checksum // null' <<< "$release_contract_plan")" >/dev/null; then
+                            postpublish_raw_installer_valid=true
+                        else
+                            _release_record_interruption verification "$?" "$published_release_json" || true
+                        fi
                     fi
 
                     if $release_interrupted; then
@@ -11885,8 +12132,13 @@ EOF
                         verification_status="incomplete"
                         local observed_draft_state=""
                         observed_draft_state=$(_release_contract_observe_draft_state \
-                            "$repo" "$release_id" 2>/dev/null || true)
-                        if [[ "$observed_draft_state" == "true" ]]; then
+                            "$repo" "$release_id" 2>/dev/null) || {
+                            _release_record_interruption restore "$?" "$published_release_json" || true
+                            observed_draft_state=""
+                        }
+                        if $release_interrupted; then
+                            : # No restoration after interrupted state discovery.
+                        elif [[ "$observed_draft_state" == "true" ]]; then
                             draft=true
                             _release_record_failed "publish" \
                                 "Publish attempt left the verified release as a draft"
@@ -11898,9 +12150,12 @@ EOF
                             _release_record_failed "publish" \
                                 "Publication state failed exact no-cache verification"
                             log_error "Publication state failed exact no-cache verification"
-                            if _release_contract_confirm_or_restore_bound_draft \
-                                "$repo" "$release_id" "$tag"; then
+                            local restore_observation=""
+                            if restore_observation=$(_release_contract_confirm_or_restore_bound_draft \
+                                "$repo" "$release_id" "$tag" true); then
                                 draft=true
+                            else
+                                _release_record_interruption restore "$?" "$restore_observation" || true
                             fi
                         fi
                     fi
@@ -12164,12 +12419,21 @@ EOF
     fi
 
     if ! $release_interrupted && $release_contract_enabled && [[ $exit_code -ne 0 ]]; then
-        if _release_contract_confirm_or_restore_bound_draft \
-            "$repo" "$release_id" "$tag"; then
+        local final_restore_observation=""
+        if final_restore_observation=$(_release_contract_confirm_or_restore_bound_draft \
+            "$repo" "$release_id" "$tag" true); then
             draft=true
         else
-            draft=false
-            log_error "Strict release failure could not confirm a bound draft state"
+            local restore_status=$?
+            if _release_record_interruption restore "$restore_status" "$final_restore_observation"; then
+                _release_record_failed "restore" "Draft restoration interrupted; remote outcome is unconfirmed"
+                failed_count=${#failed_assets[@]}
+                status="error"
+                exit_code=5
+            else
+                draft=false
+                log_error "Strict release failure could not confirm a bound draft state"
+            fi
         fi
     elif ! $release_interrupted && $ordinary_owned && ! $ordinary_external_publication && [[ $exit_code -ne 0 ]]; then
         if _release_ordinary_restore_draft; then

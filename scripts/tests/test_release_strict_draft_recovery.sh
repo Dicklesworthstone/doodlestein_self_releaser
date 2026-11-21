@@ -93,7 +93,27 @@ endpoint=args[0]
 control=json.loads((c/'control.json').read_text())
 with (c/'requests.jsonl').open('a') as f:f.write(json.dumps(args)+'\n')
 r=json.loads((c/'remote.json').read_text())
+def stop_boundary(name):
+    if control.get('helper_stop_boundary')!=name:
+        return
+    phase=control.get('helper_stop_phase','any')
+    if phase=='published' and (r['draft'] or not control.get('publication_attempts')):
+        return
+    if phase=='restoring' and not control.get('restoration_attempts'):
+        return
+    if phase=='complete-draft' and (not r['draft'] or len(r['assets'])!=len(json.loads((c/'plan.json').read_text())['assets'])):
+        return
+    count=control.get('helper_boundary_calls',0)+1
+    control['helper_boundary_calls']=count
+    (c/'control.json').write_text(json.dumps(control))
+    if count<=control.get('helper_stop_skip',0):
+        return
+    (c/'stopped-request.json').write_text(json.dumps(args))
+    if control.get('helper_partial_metadata'):
+        print(json.dumps(r))
+    sys.exit(control['helper_stop_status'])
 if endpoint.startswith(('repos/owner/', 'repos/Dicklesworthstone/agentic_coding_flywheel_setup/')) and '/git/ref/heads/main' in endpoint:
+    stop_boundary('raw-main')
     if control.get('raw_auth_denied'):
         print('Controlled authentication refusal',file=sys.stderr);sys.exit(1)
     source=endpoint.startswith('repos/owner/app/')
@@ -109,6 +129,7 @@ if endpoint.startswith(('repos/owner/', 'repos/Dicklesworthstone/agentic_coding_
     print(json.dumps(value))
 elif endpoint.startswith(('repos/owner/app/contents/install.sh?ref=', 'repos/owner/downstream/contents/',
                           'repos/Dicklesworthstone/agentic_coding_flywheel_setup/contents/')):
+    stop_boundary('raw-file')
     ref=endpoint.split('?ref=',1)[1]
     source=endpoint.startswith('repos/owner/app/')
     path=endpoint.split('/contents/',1)[1].split('?ref=',1)[0]
@@ -128,9 +149,31 @@ elif endpoint.startswith(('repos/owner/app/contents/install.sh?ref=', 'repos/own
     if control.get('raw_bad_size'):value['size']+=1
     print(json.dumps(value))
 elif endpoint=='raw-installer-download':
+    stop_boundary('raw-curl')
     data=(c/'repo/install.sh').read_bytes()
     if control.get('raw_wrong_bytes'):data+=b'changed public installer\n'
     sys.stdout.buffer.write(data)
+elif endpoint=='signed-download':
+    stop_boundary('download')
+    target=Path(args[2]);assert not target.exists()
+    target.write_bytes((c/'bytes'/args[1]).read_bytes())
+elif endpoint=='repos/owner/app' or endpoint.startswith('repos/owner/app/rulesets/'):
+    stop_boundary('ruleset')
+    policy={'id':22,'name':'immutable tags','source':'owner/app','source_type':'Repository',
+            'target':'tag','enforcement':'active','bypass_actors':[],
+            'conditions':{'ref_name':{'include':['refs/tags/v*'],'exclude':[]}},
+            'rules':[{'type':'update'},{'type':'deletion'}],
+            'node_id':'ruleset-node','created_at':'2026-01-01T00:00:00Z','updated_at':'2026-01-01T00:00:00Z',
+            'current_user_can_bypass':'never','_links':{'self':{'href':'https://api.github.com/repos/owner/app/rulesets/22'}}}
+    if endpoint=='repos/owner/app':
+        value={'id':11,'node_id':'repository-node','full_name':'owner/app'}
+    elif '/history/33' in endpoint:
+        value={'version_id':33,'updated_at':policy['updated_at'],'state':policy}
+    elif '/history?' in endpoint:
+        value=[{'version_id':33,'updated_at':policy['updated_at']}]
+    else:
+        value=policy
+    print(json.dumps(value))
 elif endpoint=='upload-boundary':
     source=Path(args[1]);name=args[2];data=source.read_bytes();aid=100+len(r['assets'])
     if control.get('pause_upload'):
@@ -158,8 +201,10 @@ elif endpoint=='repos/owner/app/releases' and '--post' in args:
     (c/'remote.json').write_text(json.dumps(r));print(json.dumps(r))
     if control.get('create_stop_status'):sys.exit(control['create_stop_status'])
 elif endpoint.startswith('repos/owner/app/releases?'):
+    stop_boundary('scan')
     print(json.dumps([] if control.get('absent') or 'page=2' in endpoint else [dict(r,id=99) if control.get('wrong_scan_id') else r]))
 elif endpoint=='repos/owner/app/git/ref/tags/v1.2.3':
+    stop_boundary('tag')
     moved=control.get('tag_drift_always') or (control.get('tag_drift_after_publish') and not r['draft'])
     print(json.dumps({'object':{'type':'commit','sha':'f'*40 if moved else os.environ['SOURCE_SHA']}}))
 elif endpoint=='repos/owner/app/releases/9':
@@ -178,6 +223,13 @@ elif endpoint=='repos/owner/app/releases/9':
                 lock.write_text('changed fixture custody record\n')
     if '--method' in args:
         patch=json.loads(args[args.index('--data')+1])
+        if patch.get('draft') is False:
+            control['publication_attempts']=control.get('publication_attempts',0)+1
+        elif patch.get('draft') is True:
+            control['restoration_attempts']=control.get('restoration_attempts',0)+1
+        (c/'control.json').write_text(json.dumps(control))
+        if patch.get('draft') is True:
+            stop_boundary('restore')
         if patch.get('draft') is False and control.get('pause_promotion'):
             # Model an exec transport which retains no build/supervisor fds
             # and needs escalation to stop. Only the explicit fixture gate
@@ -207,6 +259,7 @@ elif endpoint=='repos/owner/app/releases/9':
         if patch.get('draft') is True and control.get('restore_stop_status'):
             sys.exit(control['restore_stop_status'])
         sys.exit(1 if control.get('lost_patch') else 0)
+    stop_boundary('metadata')
     count=control.get('reads',0)+1;control['reads']=count
     if count==2 and control.get('receipt_replace'):
         p=c/'tmp/dsr-api-response.ABCDEF12'; retained=p.with_name(p.name+'.retained');p.rename(retained)
@@ -223,6 +276,7 @@ elif endpoint=='repos/owner/app/releases/9':
         observed['assets'][0]=dict(observed['assets'][0],size='invalid')
     print(json.dumps(observed))
 elif endpoint.startswith('repos/owner/app/releases/9/assets?'):
+    stop_boundary('inventory')
     page=int(endpoint.rsplit('page=',1)[1]);assets=list(r['assets'])
     if page==1:
         control['inventories']=control.get('inventories',0)+1
@@ -246,6 +300,7 @@ else:print('Unexpected API '+endpoint,file=sys.stderr);sys.exit(89)
 
 script = r'''
 set -uo pipefail
+[[ "${STRICT_TEST_LASTPIPE:-false}" != true ]] || shopt -s lastpipe
 source "$ROOT/src/github.sh"
 source "$ROOT/src/config.sh"
 source "$ROOT/src/git_ops.sh"
@@ -292,7 +347,34 @@ curl() {
     [[ "${!#}" == 'https://raw.githubusercontent.com/owner/app/refs/heads/main/install.sh' ]] || return 89
     python3 "$CASE/api.py" raw-installer-download
 }
-gh_download_release_asset() { test ! -e "$3" && cp "$CASE/bytes/$2" "$3"; }
+# Stop only the selected external validation process after it consumes input.
+# Production pipeline status selection and every upstream adapter remain real.
+python3() {
+    if [[ "${STRICT_TEST_PYTHON_STOP:-}" != '' && "${1:-}" == -I && "${2:-}" == -c ]]; then
+        local selected=false
+        case "${STRICT_TEST_PYTHON_STAGE:-}:${3:-}" in
+            main:*'value = json.load(sys.stdin'*) selected=true ;;
+            text:*'import base64, hashlib, json, sys'*) selected=true ;;
+            hash:*'import hashlib,sys; print(hashlib.sha256'*) selected=true ;;
+            download:*'data = sys.stdin.buffer.read(2097153)'*) selected=true ;;
+            checksum:*'selected, url, digest = sys.argv[1:]'*) selected=true ;;
+        esac
+        if $selected; then
+            command cat >/dev/null
+            return "$STRICT_TEST_PYTHON_STOP"
+        fi
+    fi
+    command python3 "$@"
+}
+jq() {
+    if [[ "${STRICT_TEST_JQ_STOP:-}" != '' && "${1:-}" == -cse &&
+          "${2:-}" == *'map(.name | ascii_downcase)'* ]]; then
+        command cat >/dev/null
+        return "$STRICT_TEST_JQ_STOP"
+    fi
+    command jq "$@"
+}
+gh_download_release_asset() { python3 "$CASE/api.py" signed-download "$2" "$3"; }
 mktemp() {
     if [[ "${FAIL_PENDING:-false}" == true && "$*" == *finalization-pending* ]]; then return 1; fi
     if [[ "${FAIL_FINAL:-false}" == true && "$*" == *-finalized.* ]]; then return 1; fi
@@ -317,7 +399,7 @@ if [[ "$1" == create || "$1" == publish || "$1" == fallback || "$1" == verify ||
     # Route that credential boundary to the same explicit HTTP fixture; never
     # depend on a developer's logged-in account to exercise draft creation.
     _gh_check_cli_auth() { return 0; }
-    gh_download_release_asset() { test ! -e "$3" && cp "$CASE/bytes/$2" "$3"; }
+    gh_download_release_asset() { python3 "$CASE/api.py" signed-download "$2" "$3"; }
     _gh_api_with_gh() {
         case "$2" in
             POST) python3 "$CASE/api.py" < <(printf '%s\0' "$1" --post "$3") ;;
@@ -392,6 +474,9 @@ if [[ "$1" == create || "$1" == publish || "$1" == fallback || "$1" == verify ||
         }
         cmd_fallback app --version 1.2.3 --expected-sha "$SOURCE_SHA" "$@"
     fi
+elif [[ "$1" == helper ]]; then
+    shift
+    "$@"
 elif [[ "$1" == prepare ]]; then
     act_load_repo_config app || exit
     contract=$(config_get_release_contract_json app) || exit
@@ -403,7 +488,7 @@ else
 fi
 '''
 
-def setup(label, controls=None, extra_assets=0, long_names=False, large_notes=False, raw_installer=False, acfs_checker=False):
+def setup(label, controls=None, extra_assets=0, long_names=False, large_notes=False, raw_installer=False, acfs_checker=False, tag_ruleset=False):
     c=work/label;shutil.copytree(base,c)
     case_sha=sha
     if large_notes:
@@ -419,6 +504,8 @@ def setup(label, controls=None, extra_assets=0, long_names=False, large_notes=Fa
     (c/'api.py').write_text(api);(c/'requests.jsonl').write_text('');(c/'control.json').write_text(json.dumps(controls or {}))
     extra_names=['companion-%03d-%s.txt'%(i,'x'*220 if long_names else 'data') for i in range(extra_assets)]
     selected_contract=dict(contract,exact_additional_assets=contract['exact_additional_assets']+extra_names)
+    if tag_ruleset:
+        selected_contract['github_tag_ruleset']={'repository_id':11,'ruleset_id':22}
     if raw_installer or acfs_checker:
         selected_contract['raw_installer_checksum']={'downstream_repo':'owner/downstream','checksum_path':'checksums.yaml',
                                                      'installer_key':'app','installer_path':'install.sh'}
@@ -715,9 +802,117 @@ def prepare_cases(cases):
 
 def interruption_statuses():
     selected=os.environ.get('DSR_TEST_RELEASE_INTERRUPTION_STATUS','all')
-    if selected not in ('all','5','124','130'):
-        raise AssertionError('Select a known strict interruption status: all, 5, 124, or 130')
+    if selected not in ('all','2','5','124','125','129','130','143','255'):
+        raise AssertionError('Select a known strict interruption or supervisor status')
     return (5,124,130) if selected=='all' else (int(selected),)
+
+
+def test_shared_strict_helper_interruptions():
+    names=('inventory','download','tag','ruleset','raw-main','raw-file','scan','restore','preflight')
+    selected=os.environ.get('DSR_TEST_STRICT_HELPER_CASE','all')
+    if selected not in ('all',)+names+('raw-curl','visibility','transient','consumer'):
+        raise AssertionError('Select a known shared strict helper case')
+    for name in names:
+        if selected not in ('all',name):continue
+        for stop_status in interruption_statuses():
+            label='helper-'+name+'-'+str(stop_status)
+            c,env,_,original=setup(label,raw_installer=name.startswith('raw-'),tag_ruleset=name=='ruleset')
+            plan=json.loads((c/'plan.json').read_text())
+            boundary='tag' if name=='preflight' else name
+            controls={'helper_stop_boundary':boundary,'helper_stop_status':stop_status}
+            if name=='restore':
+                remote=json.loads((c/'remote.json').read_text());remote['draft']=False
+                (c/'remote.json').write_text(json.dumps(remote))
+            (c/'control.json').write_text(json.dumps(controls))
+            if name in ('inventory','download'):
+                args=['_release_contract_verify_remote_assets','owner/app','9',json.dumps(plan['assets']),
+                      'true','v1.2.3',json.dumps(original)]
+            elif name=='tag':
+                args=['_release_contract_verify_remote_tag_identity','owner/app','v1.2.3',env['SOURCE_SHA']]
+            elif name=='ruleset':
+                args=['_release_contract_verify_tag_ruleset_receipt',json.dumps(plan['tag_ruleset_receipt'])]
+            elif name.startswith('raw-'):
+                args=['_release_contract_verify_raw_installer_checksum',json.dumps(plan['raw_installer_checksum'])]
+            elif name=='scan':
+                args=['_release_contract_scan_release_by_tag','owner/app','v1.2.3']
+            elif name=='restore':
+                args=['_source_release_restore_draft','owner/app','9',json.dumps(original)]
+            else:
+                directory=c/'state/artifacts/app-v1.2.3'
+                args=['_release_contract_preflight','app','v1.2.3','owner/app',str(c/'repo'),str(directory),
+                      str(directory/'app-v1.2.3-manifest.json'),json.dumps(plan['contract']),'verify']
+            result=subprocess.run(['bash','-c',script,'fixture','helper']+args,
+                                  env=env,capture_output=True,text=True,timeout=120)
+            (c/'interrupted.stdout').write_text(result.stdout);(c/'interrupted.stderr').write_text(result.stderr)
+            rows=[json.loads(line) for line in (c/'requests.jsonl').read_text().splitlines()]
+            check(label+' retains the original terminal adapter status',result.returncode==stop_status)
+            check(label+' stops before any later request',rows[-1]==json.loads((c/'stopped-request.json').read_text()))
+            check(label+' preserves the legacy empty failure stream',result.stdout=='')
+
+    if selected in ('all','raw-curl'):
+        c,env,_,_=setup('helper-raw-curl-dns',raw_installer=True)
+        plan=json.loads((c/'plan.json').read_text())
+        (c/'control.json').write_text(json.dumps({'helper_stop_boundary':'raw-curl','helper_stop_status':5}))
+        result=subprocess.run(['bash','-c',script,'fixture','helper','_release_contract_verify_raw_installer_checksum',
+                               json.dumps(plan['raw_installer_checksum'])],env=env,capture_output=True,text=True,timeout=120)
+        check('raw curl DNS exit5 remains an ordinary verification failure',result.returncode==7 and not result.stdout)
+
+    if selected in ('all','visibility'):
+        for retained in (False,True):
+            c,env,_,original=setup('helper-visibility-'+str(retained))
+            plan=json.loads((c/'plan.json').read_text())
+            (c/'control.json').write_text(json.dumps({'helper_stop_boundary':'inventory','helper_stop_status':130}))
+            args=['_release_contract_verify_remote_assets','owner/app','9',json.dumps(plan['assets']),
+                  'true','v1.2.3',json.dumps(original)]
+            if retained:args+=['true']
+            result=subprocess.run(['bash','-c',script,'fixture','helper']+args,
+                                  env=env,capture_output=True,text=True,timeout=120)
+            check('metadata retention is explicitly selected '+str(retained),result.returncode==130 and
+                  (json.loads(result.stdout)['draft'] is True if retained else result.stdout==''))
+        for mismatch in ('tag_name','body','target_commitish'):
+            c,env,_,original=setup('helper-visibility-wrong-'+mismatch)
+            plan=json.loads((c/'plan.json').read_text())
+            original[mismatch]='foreign-'+mismatch
+            (c/'control.json').write_text(json.dumps({'helper_stop_boundary':'inventory','helper_stop_status':130,
+                                                    'helper_partial_metadata':True}))
+            result=subprocess.run(['bash','-c',script,'fixture','helper','_release_contract_verify_remote_assets',
+                                  'owner/app','9',json.dumps(plan['assets']),'true','v1.2.3',json.dumps(original),'true'],
+                                  env=env,capture_output=True,text=True,timeout=120)
+            check('unbound '+mismatch+' never becomes retained visibility',result.returncode==130 and result.stdout=='')
+
+    if selected in ('all','transient'):
+        c,env,_,original=setup('helper-transient-restoration',{'lost_patch':True})
+        remote=json.loads((c/'remote.json').read_text());remote['draft']=False
+        (c/'remote.json').write_text(json.dumps(remote))
+        result=subprocess.run(['bash','-c',script,'fixture','helper','_source_release_restore_draft',
+                               'owner/app','9',json.dumps(original)],env=env,capture_output=True,text=True,timeout=120)
+        rows=[json.loads(line) for line in (c/'requests.jsonl').read_text().splitlines()]
+        check('ordinary lost restoration response still reconciles',result.returncode==0 and not result.stdout and
+              json.loads((c/'remote.json').read_text())['draft'] is True and sum('--method' in row for row in rows)==1)
+
+
+    if selected in ('all','consumer'):
+        for stage,stop,expected in [('main',143,143),('text',143,143),('hash',143,143),('download',143,143),
+                                    ('checksum',143,143),('main',5,7)]:
+            c,env,_,_=setup('helper-consumer-'+stage+'-'+str(stop),raw_installer=True)
+            plan=json.loads((c/'plan.json').read_text())
+            env.update(STRICT_TEST_PYTHON_STAGE=stage,STRICT_TEST_PYTHON_STOP=str(stop))
+            result=subprocess.run(['bash','-c',script,'fixture','helper','_release_contract_verify_raw_installer_checksum',
+                                   json.dumps(plan['raw_installer_checksum'])],env=env,capture_output=True,text=True,timeout=120)
+            rows=[json.loads(line) for line in (c/'requests.jsonl').read_text().splitlines()]
+            check(stage+' consumer exit'+str(stop)+' retains its correct classification',
+                  result.returncode==expected and not result.stdout)
+            check(stage+' consumer stop prevents subsequent source observations',
+                  len(rows)=={'main':1,'text':3,'hash':3,'download':4,'checksum':5}[stage])
+        for stop,expected in [(143,143),(5,7)]:
+            c,env,_,_=setup('helper-inventory-consumer-'+str(stop))
+            env.update(STRICT_TEST_JQ_STOP=str(stop),STRICT_TEST_LASTPIPE='true')
+            result=subprocess.run(['bash','-c',script,'fixture','helper','gh_release_asset_inventory','owner/app','9'],
+                                  env=env,capture_output=True,text=True,timeout=120)
+            rows=[json.loads(line) for line in (c/'requests.jsonl').read_text().splitlines()]
+            check('lastpipe inventory consumer exit'+str(stop)+' retains its correct classification',
+                  result.returncode==expected and not result.stdout)
+            check('inventory consumer stop does not re-read complete input',len(rows)==1)
 
 
 def test_strict_upload_interruptions():
@@ -741,6 +936,81 @@ def test_strict_upload_interruptions():
               len(json.loads((c/'remote.json').read_text())['assets'])==1)
         validator=Draft202012Validator(json.loads((root/'schemas/release-details.json').read_text()))
         check('strict upload '+str(stop_status)+' result satisfies release schema',not list(validator.iter_errors(details)))
+
+
+def test_strict_verification_interruptions():
+    names=('inventory','download','tag','ruleset','raw-main','raw-file','restore','restore-read','pre-inventory','preflight','prescan')
+    selected=os.environ.get('DSR_TEST_STRICT_VERIFICATION_CASE','inventory')
+    entry=os.environ.get('DSR_TEST_STRICT_VERIFICATION_ENTRY','finalize')
+    if selected not in names or entry not in ('finalize','publish'):
+        raise AssertionError('Select a known strict verification boundary and finalize/publish entry')
+    for stop_status in interruption_statuses():
+        label='strict-'+entry+'-'+selected+'-'+str(stop_status)
+        c,env,_,_=setup(label,{'absent':True},raw_installer=selected.startswith('raw-'),tag_ruleset=selected=='ruleset')
+        response=None
+        original=None
+        identity=None
+        if entry=='finalize':
+            created=subprocess.run(['bash','-c',script,'fixture','create'],
+                                   env=env,capture_output=True,text=True,timeout=120)
+            (c/'producer.stdout').write_text(created.stdout);(c/'producer.stderr').write_text(created.stderr)
+            check(label+' uses the real signed draft producer',created.returncode==0)
+            details=json.loads(created.stdout)['details']
+            response=Path(details['create_response']);env['TMPDIR']=details['finalization_tmpdir']
+            original=response.read_bytes();identity=(response.stat().st_dev,response.stat().st_ino)
+        boundary={'restore-read':'metadata','pre-inventory':'inventory','preflight':'tag','prescan':'scan'}.get(selected,selected)
+        phase={'restore-read':'restoring','pre-inventory':'complete-draft','preflight':'any','prescan':'any'}.get(selected,'published')
+        controls=json.loads((c/'control.json').read_text())
+        controls.update(helper_stop_boundary=boundary,helper_stop_status=stop_status,helper_stop_phase=phase)
+        if selected in ('restore','restore-read'):controls['tag_drift_after_publish']=True
+        if selected=='restore-read':controls['helper_partial_metadata']=True
+        (c/'control.json').write_text(json.dumps(controls));(c/'requests.jsonl').write_text('')
+        args=['bash','-c',script,'fixture','publish'] if entry=='publish' else [
+            'bash','-c',script,'fixture','public-finalize','app','1.2.3',
+            '--create-response',str(response),'--no-dispatch']
+        result=subprocess.run(args,env=env,capture_output=True,text=True,timeout=120)
+        (c/'interrupted.stdout').write_text(result.stdout);(c/'interrupted.stderr').write_text(result.stderr)
+        check(label+' is terminal interrupted',result.returncode==5)
+        rows=[json.loads(line) for line in (c/'requests.jsonl').read_text().splitlines()]
+        check(label+' makes no request after the stopped boundary',
+              rows[-1]==json.loads((c/'stopped-request.json').read_text()))
+        envelope=json.loads(result.stdout);details=envelope['details']
+        stage='restore' if selected in ('restore','restore-read') else 'verification'
+        check(label+' reports original status and unconfirmed outcome',
+              envelope['status']=='error' and envelope['exit_code']==5 and
+              details['verification']=='interrupted' and
+              details['interruption']==dict(stage=stage,exit_code=stop_status,outcome='unconfirmed'))
+        if selected in ('preflight','prescan'):
+            check(label+' allocates no draft or finalization receipt after cancelled admission',
+                  not any('--post' in row or '--method' in row or row[0]=='upload-boundary' for row in rows) and
+                  not list((c/'state/releases').glob('app-v1.2.3-finalization-pending.*')))
+            continue
+        last_draft=selected=='pre-inventory'
+        check(label+' retains only completed bound visibility',details['draft'] is last_draft)
+        if entry=='publish':
+            response=Path(details['create_response']);env['TMPDIR']=details['finalization_tmpdir']
+            original=response.read_bytes();identity=(response.stat().st_dev,response.stat().st_ino)
+        pending=list((c/'state/releases').glob('app-v1.2.3-finalization-pending.*'))
+        pending_before={p:(p.read_bytes(),p.stat().st_dev,p.stat().st_ino) for p in pending}
+        check(label+' preserves original response and pending uncertainty',
+              response.read_bytes()==original and (response.stat().st_dev,response.stat().st_ino)==identity and
+              all(json.loads(p.read_text())['status']=='pending' for p in pending) and
+              not list((c/'state/releases').glob('app-v1.2.3-finalized.*')))
+        controls=json.loads((c/'control.json').read_text())
+        for key in ('helper_stop_boundary','helper_stop_status','helper_stop_phase','helper_partial_metadata','tag_drift_after_publish'):
+            controls.pop(key,None)
+        (c/'control.json').write_text(json.dumps(controls));(c/'requests.jsonl').write_text('')
+        resumed=subprocess.run(['bash','-c',script,'fixture','public-finalize','app','1.2.3',
+                                '--create-response',str(response),'--no-dispatch'],
+                               env=env,capture_output=True,text=True,timeout=120)
+        (c/'resumed.stdout').write_text(resumed.stdout);(c/'resumed.stderr').write_text(resumed.stderr)
+        later=[json.loads(line) for line in (c/'requests.jsonl').read_text().splitlines()]
+        check(label+' explicitly resumes the same release without reupload',resumed.returncode==0 and
+              not any('--post' in row or row[0]=='upload-boundary' for row in later) and
+              json.loads((c/'remote.json').read_text())['draft'] is False)
+        check(label+' recovery preserves immutable original and pending receipts',
+              response.read_bytes()==original and (response.stat().st_dev,response.stat().st_ino)==identity and
+              all((p.read_bytes(),p.stat().st_dev,p.stat().st_ino)==before for p,before in pending_before.items()))
 
 
 def test_strict_creation_interruptions():
@@ -1848,6 +2118,16 @@ def test_custom_artifact_repair():
           len([row for row in rows if row[0]=='checksum-download'])==2 and not mutations(rows))
 
 
+if os.environ.get('DSR_TEST_STRICT_VERIFICATION_INTERRUPTION_ONLY')=='1':
+    test_strict_verification_interruptions()
+    print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
+    raise SystemExit(0)
+
+if os.environ.get('DSR_TEST_STRICT_HELPER_INTERRUPTION_ONLY')=='1':
+    test_shared_strict_helper_interruptions()
+    print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
+    raise SystemExit(0)
+
 if os.environ.get('DSR_TEST_STANDALONE_FINALIZE_INTERRUPTION_ONLY')=='1':
     test_standalone_finalization_interruptions()
     print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
@@ -2136,6 +2416,8 @@ test_strict_upload_interruptions()
 test_strict_creation_interruptions()
 test_strict_publication_interruptions()
 test_standalone_finalization_interruptions()
+test_shared_strict_helper_interruptions()
+test_strict_verification_interruptions()
 test_fallback_recovery(interruption_only=True)
 print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
 PY

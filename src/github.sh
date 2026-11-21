@@ -1573,8 +1573,9 @@ _gh_asset_sha256() {
 # The 100-page bound includes the required empty page after an exact multiple
 # of 100 assets. Returned rows retain stable identities and an API-provided
 # browser download URL when present; unrelated uploader metadata is omitted.
-# Returns: 0 complete, 3 dependency/auth, 4 invalid arguments, 5 interrupted,
+# Returns: 0 complete, 3 dependency/auth, 4 invalid arguments,
 # 7 duplicate identities, 8 unavailable/malformed/incomplete inventory.
+# Terminal adapter and validator signal statuses are preserved unchanged.
 gh_release_asset_inventory() (
     local repo="${1:-}" release_id="${2:-}" inventory status=0
     if [[ ! "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ||
@@ -1586,6 +1587,7 @@ gh_release_asset_inventory() (
     jq -en --argjson id "$release_id" '$id <= 9007199254740991' >/dev/null || return 4
     inventory=$(
         set -o pipefail
+        local -a inventory_status=()
         (
             local page=1 response count request_status
             while ((page <= 100)); do
@@ -1620,19 +1622,20 @@ gh_release_asset_inventory() (
             done
             _gh_log_error "Release inventory exceeded the 100-page safety limit"
             return 8
-        ) | {
-            jq -cse 'if (map(.id) | unique | length) == length and
+        ) | jq -cse 'if (map(.id) | unique | length) == length and
                            (map(.name | ascii_downcase) | unique | length) == length
-                then sort_by(.id) else error("duplicate release asset name or ID") end' || exit 7
-        }
-        # A validator may also fail when a stopped producer leaves an
-        # incomplete stream. Preserve the transport's terminal status first.
-        local -a inventory_status=("${PIPESTATUS[@]}")
+                then sort_by(.id) else error("duplicate release asset name or ID") end'
+        inventory_status=("${PIPESTATUS[@]}")
+        # A parser refusal on an incomplete page cannot replace a terminal
+        # transport status with an ordinary inventory failure.
         if _gh_operation_interrupted "${inventory_status[0]}"; then
-            exit "${inventory_status[0]}"
+            return "${inventory_status[0]}"
         fi
-        ((inventory_status[1] == 0)) || exit "${inventory_status[1]}"
-        exit "${inventory_status[0]}"
+        if ((inventory_status[1] >= 129 && inventory_status[1] <= 255)); then
+            return "${inventory_status[1]}"
+        fi
+        ((inventory_status[1] == 0)) || return 7
+        return "${inventory_status[0]}"
     ) || status=$?
     [[ "$status" -eq 0 ]] || return "$status"
     printf '%s\n' "$inventory"
