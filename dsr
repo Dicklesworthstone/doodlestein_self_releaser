@@ -13324,13 +13324,17 @@ EOF
     local release_json
     if $release_contract_enabled; then
         local release_scan="" scanned_release_id=""
-        release_scan=$(_release_contract_scan_release_by_tag "$repo" "$tag" 2>/dev/null || true)
+        release_scan=$(_release_contract_scan_release_by_tag "$repo" "$tag" 2>/dev/null) || {
+            if _release_contract_report_interruption "$?" release-verify verification "$repo" "$tag"; then return 5; fi
+        }
         scanned_release_id=$(jq -r \
             'if .count == 1 then .release.id // empty else empty end' \
             <<< "$release_scan" 2>/dev/null)
         if [[ "$scanned_release_id" =~ ^[1-9][0-9]*$ ]]; then
             release_json=$(gh_api "repos/$repo/releases/$scanned_release_id" \
-                --no-cache 2>/dev/null || true)
+                --no-cache 2>/dev/null) || {
+                if _release_contract_report_interruption "$?" release-verify verification "$repo" "$tag"; then return 5; fi
+            }
         else
             release_json=""
         fi
@@ -13395,9 +13399,10 @@ EOF
         # Repair creates a missing sidecar only at its per-upload mutation
         # boundary, after re-confirming the remote release is still a draft.
         local contract_sidecar_mode="plan"
-        if ! release_contract_plan=$(_release_contract_preflight \
+        if release_contract_plan=$(_release_contract_preflight \
             "$tool_name" "$tag" "$repo" "$local_path" "$artifacts_dir" \
-            "$manifest_file" "$release_contract_json" "$contract_sidecar_mode"); then
+            "$manifest_file" "$release_contract_json" "$contract_sidecar_mode"); then :; else
+            if _release_contract_report_interruption "$?" release-verify verification "$repo" "$tag"; then return 5; fi
             return 4
         fi
         strict_tag_ruleset_receipt=$(jq -c \
@@ -13433,6 +13438,7 @@ EOF
             assets_json=$(jq -c '.assets' <<< "$release_json")
             asset_count=$(jq 'length' <<< "$assets_json")
         else
+            if _release_contract_report_interruption "$?" release-verify verification "$repo" "$tag"; then return 5; fi
             strict_remote_records_valid=false
         fi
     elif [[ -f "$manifest_file" ]]; then
@@ -13668,7 +13674,9 @@ EOF
                     local upload_content_type="application/octet-stream"
 
                     bound_draft_json=$(_release_contract_observe_bound_draft \
-                        "$repo" "$release_id" "$tag" 2>/dev/null || true)
+                        "$repo" "$release_id" "$tag" 2>/dev/null) || {
+                        if _release_contract_report_interruption "$?" release-verify verification "$repo" "$tag"; then return 5; fi
+                    }
                     if [[ -z "$bound_draft_json" ]] || ! jq -e '
                         all(.assets[];
                             (.id | type == "number" and floor == . and . > 0) and
@@ -13728,15 +13736,18 @@ EOF
                         upload_content_type="text/plain"
                     fi
                     log_info "  Uploading by release ID to draft: $missing"
-                    if ! _release_contract_verify_tag_ruleset_receipt \
-                        "$strict_tag_ruleset_receipt"; then
+                    if _release_contract_verify_tag_ruleset_receipt \
+                        "$strict_tag_ruleset_receipt"; then :; else
+                        if _release_contract_report_interruption "$?" release-verify verification "$repo" "$tag"; then return 5; fi
                         log_error "Immutable-tag governance changed before strict repair upload"
                         strict_fix_failed=true
                         break
-                    elif upload_result=$(gh_upload_asset "$bound_upload_url" "$file_path" \
+                    fi
+                    if upload_result=$(gh_upload_asset "$bound_upload_url" "$file_path" \
                         "$upload_content_type" 2>&1); then
                         log_ok "    Uploaded to ID-bound draft"
                     else
+                        if _release_contract_report_interruption "$?" release-verify upload "$repo" "$tag"; then return 5; fi
                         log_error "Strict ID-bound repair upload returned an ambiguous failure for $missing"
                         [[ -n "$upload_result" ]] && log_error "  Error: $upload_result"
                         strict_fix_failed=true
@@ -13759,7 +13770,9 @@ EOF
                     planned_path="${expected_asset_paths[$planned_name]:-}"
                     if [[ ! -e "$planned_path" && ! -L "$planned_path" ]]; then
                         bound_sidecar_draft_json=$(_release_contract_observe_bound_draft \
-                            "$repo" "$release_id" "$tag" 2>/dev/null || true)
+                            "$repo" "$release_id" "$tag" 2>/dev/null) || {
+                            if _release_contract_report_interruption "$?" release-verify verification "$repo" "$tag"; then return 5; fi
+                        }
                         if [[ -z "$bound_sidecar_draft_json" ]]; then
                             log_error "Strict release left draft state before sidecar materialization"
                             strict_fix_failed=true
@@ -13817,6 +13830,8 @@ EOF
                _release_contract_verify_tag_ruleset_receipt \
                 "$strict_tag_ruleset_receipt"; then
                 repaired_plan_valid=true
+            else
+                if _release_contract_report_interruption "$?" release-verify verification "$repo" "$tag"; then return 5; fi
             fi
 
             if $repaired_plan_valid; then
@@ -13834,11 +13849,12 @@ EOF
             fi
 
             if $strict_fix_failed; then
-                if ! _release_contract_confirm_or_restore_bound_draft \
+                if _release_contract_confirm_or_restore_bound_draft \
                     "$repo" "$release_id" "$tag"; then
-                    log_error "Strict repair failed and the release could not be left as a verified draft"
-                else
                     log_warn "Strict repair failed; release remains a draft"
+                else
+                    if _release_contract_report_interruption "$?" release-verify restore "$repo" "$tag"; then return 5; fi
+                    log_error "Strict repair failed and the release could not be left as a verified draft"
                 fi
             fi
         else
@@ -14517,7 +14533,7 @@ EOF
     # The dry-run path must also remain entirely free of filesystem writes.
     local checks_status="pending" build_status="pending" verification_status="pending"
     local signing_status="skipped" release_status="pending" artifacts_count=0
-    local publication_recovery=null
+    local publication_recovery=null fallback_interruption=null
     # steps[] (schemas/fallback-details.json): the throttle check, then build
     # (quality gate, build, verification, signing), then release. Each step's
     # outcome follows from the phase that ended the run.
@@ -14525,6 +14541,29 @@ EOF
     local fallback_build_started_ms="" fallback_release_started_ms=""
     _fallback_now_ms() {
         _get_ms_timestamp 2>/dev/null || echo $(( $(date +%s) * 1000 ))
+    }
+
+    _fallback_record_interruption() {
+        local stage="$1" operation_status="$2" child_result="${3:-}" inherited=""
+        [[ "$fallback_interruption" == null ]] || return 0
+        if [[ -n "$child_result" ]]; then
+            inherited=$(jq -cse '
+                select(length == 1) | .[0] |
+                select((.command == "release" or .command == "release-finalize") and
+                    .status == "error" and .exit_code == 5) |
+                .details.interruption |
+                select(type == "object" and (.stage | type == "string" and length > 0) and
+                    (.exit_code | type == "number" and floor == . and . >= 1 and . <= 255) and
+                    .outcome == "unconfirmed") | {stage,exit_code,outcome}
+            ' <<< "$child_result" 2>/dev/null) || inherited=""
+            if [[ -n "$inherited" ]] && _gh_operation_interrupted "$(jq -r '.exit_code' <<< "$inherited")"; then
+                fallback_interruption="$inherited"
+                return 0
+            fi
+        fi
+        _gh_operation_interrupted "$operation_status" || return 1
+        fallback_interruption=$(jq -nc --arg stage "$stage" --argjson code "$operation_status" \
+            '{stage:$stage,exit_code:$code,outcome:"unconfirmed"}') || return 4
     }
 
     _fallback_result() {
@@ -14544,6 +14583,7 @@ EOF
                 --slurpfile workflow_event /dev/fd/3 \
                 --argjson isolate_source "$isolate_source" --argjson materialization "$source_materialization" \
                 --argjson publication_recovery "$publication_recovery" \
+                --argjson interruption "$fallback_interruption" \
                 --arg checks "$checks_status" --arg build "$build_status" \
                 --arg verification "$verification_status" --arg signing "$signing_status" \
                 --arg release "$release_status" --arg phase "$phase" --arg error "$error" \
@@ -14588,7 +14628,8 @@ EOF
                 + (if $watch_admission == null then {} else
                     {watch_admission:$watch_admission,watch_observation:$watch_observation} end)
                 + (if $isolate_source then {isolated_source:true,source_materialization:$materialization} else {} end)
-                + (if $publication_recovery == null then {} else {publication_recovery:$publication_recovery} end)' \
+                + (if $publication_recovery == null then {} else {publication_recovery:$publication_recovery} end)
+                + (if $interruption == null then {} else {interruption:$interruption} end)' \
                 3<<< "$configured_workflow_event") || return 4
             if ! json_envelope fallback "$status" "$rc" "$details"; then
                 log_error "Could not write the final fallback result; inspect retained publication evidence before retrying"
@@ -15220,6 +15261,17 @@ EOF
     local strict_release_id="" strict_custody_ready=false strict_observed=""
     local strict_bytes_dir="" strict_seen_assets='[]'
 
+    # Preserve terminal adapter statuses through the fallback custody helpers.
+    # Ordinary failures retain their existing input/verification classifications.
+    _fallback_strict_operation() {
+        local failure_status="$1" operation_status=0
+        shift
+        "$@" || operation_status=$?
+        [[ "$operation_status" -ne 0 ]] || return 0
+        if _gh_operation_interrupted "$operation_status"; then return "$operation_status"; fi
+        return "$failure_status"
+    }
+
     _fallback_strict_prepare() {
         local expected candidate proof count=0
         jq -e '(.exact_primary_assets | length) as $primaries |
@@ -15231,8 +15283,8 @@ EOF
         }
         strict_build_run=$(jq -er '.run_id | select(type == "string" and
             test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$"))' <<< "$manifest_json") || return 4
-        _source_release_identity "$repo" "$local_path" "$tag" \
-            "$(jq -r '.source.git_sha' <<< "$manifest_json")" || return 4
+        _fallback_strict_operation 4 _source_release_identity "$repo" "$local_path" "$tag" \
+            "$(jq -r '.source.git_sha' <<< "$manifest_json")" || return $?
         strict_artifacts=$(cd -- "$output_dir" && pwd -P) || return 4
         strict_manifest="$strict_artifacts/${manifest_file##*/}"
         strict_config="$ACT_REPOS_DIR/$tool_name.yaml"
@@ -15299,11 +15351,12 @@ EOF
             [[ "$proof" == "$strict_response_proof" ]] || return 4
             proof=$(_source_release_read_private_receipt "$strict_handoff/custody.json" "$strict_handoff" "" "" "custody.") || return 4
             [[ "$proof" == "$strict_custody_proof" ]] || return 4
-            plan=$(_release_contract_preflight "$tool_name" "$tag" "$repo" "$local_path" \
-                "$strict_artifacts" "$strict_manifest" "$contract" verify) || return 4
+            plan=$(_fallback_strict_operation 4 _release_contract_preflight "$tool_name" "$tag" "$repo" "$local_path" \
+                "$strict_artifacts" "$strict_manifest" "$contract" verify) || return $?
             jq -e --slurpfile expected /dev/fd/3 \
                 '. == $expected[0]' 3<<< "$strict_plan" <<< "$plan" >/dev/null || return 4
-            _source_release_identity "$repo" "$local_path" "$tag" "$(jq -r '.git_sha' <<< "$strict_plan")" || return 4
+            _fallback_strict_operation 4 _source_release_identity "$repo" "$local_path" "$tag" \
+                "$(jq -r '.git_sha' <<< "$strict_plan")" || return $?
         fi
     }
 
@@ -15381,7 +15434,7 @@ EOF
         jq -en --argjson proof "$strict_custody_proof" --argjson binding "$binding" \
             '$proof.record == $binding' >/dev/null || return 4
         strict_custody_ready=true
-        _fallback_strict_inputs_match || return 4
+        _fallback_strict_inputs_match || return $?
         publication_recovery=$(jq -c --arg response "$strict_response" --arg directory "$strict_custody" \
             --argjson id "$strict_release_id" '. + {status:"ready",create_response:$response,
             finalization_tmpdir:$directory,release_id:$id}' <<< "$publication_recovery") || return 4
@@ -15389,10 +15442,10 @@ EOF
 
     _fallback_strict_observe() {
         local observed inventory scan after asset file size sha identity cached_identity
-        _fallback_strict_inputs_match || return 4
-        scan=$(_release_contract_scan_release_by_tag "$repo" "$tag") || return 7
+        _fallback_strict_inputs_match || return $?
+        scan=$(_fallback_strict_operation 7 _release_contract_scan_release_by_tag "$repo" "$tag") || return $?
         jq -e --argjson id "$strict_release_id" '.count == 1 and .release.id == $id' <<< "$scan" >/dev/null || return 7
-        observed=$(_release_contract_observe_remote_inventory "$repo" "$strict_release_id") || return 7
+        observed=$(_fallback_strict_operation 7 _release_contract_observe_remote_inventory "$repo" "$strict_release_id") || return $?
         _source_release_metadata_matches "$observed" "$strict_metadata" "$strict_release_id" any || return 7
         inventory=$(jq -c '.assets' <<< "$observed") || return 7
         if ! jq -e --slurpfile plan /dev/fd/3 --slurpfile seen /dev/fd/4 \
@@ -15426,8 +15479,8 @@ EOF
             file="$strict_bytes_dir/$(jq -r '.id' <<< "$asset")"
             identity=$(jq -c '{id,name,state,size,digest}' <<< "$asset") || return 7
             if [[ ! -e "$file" && ! -L "$file" && ! -e "$file.json" && ! -L "$file.json" ]]; then
-                gh_download_release_asset "$repo" "$(jq -r '.id' <<< "$asset")" "$file" \
-                    "$(jq -r '.size' <<< "$asset")" || return 7
+                _fallback_strict_operation 7 gh_download_release_asset "$repo" "$(jq -r '.id' <<< "$asset")" "$file" \
+                    "$(jq -r '.size' <<< "$asset")" || return $?
                 (umask 077; set -C; printf '%s\n' "$identity" > "$file.json") || return 7
             fi
             [[ -f "$file" && ! -L "$file" && -f "$file.json" && ! -L "$file.json" ]] || return 7
@@ -15438,7 +15491,7 @@ EOF
             jq -e --arg sha "sha256:$sha" --argjson size "$size" \
                 '.digest == $sha and .size == $size' <<< "$asset" >/dev/null || return 7
         done < <(jq -c '.[]' <<< "$inventory")
-        after=$(_release_contract_observe_remote_inventory "$repo" "$strict_release_id") || return 7
+        after=$(_fallback_strict_operation 7 _release_contract_observe_remote_inventory "$repo" "$strict_release_id") || return $?
         _source_release_metadata_matches "$after" "$strict_metadata" "$strict_release_id" any || return 7
         jq -e --slurpfile before /dev/fd/3 '
             def identity: {id,tag_name,name,body,prerelease,target_commitish,draft,upload_url,
@@ -15464,7 +15517,7 @@ EOF
                 continue
             fi
             jq -e '.draft == true' <<< "$strict_observed" >/dev/null || return 7
-            _fallback_strict_inputs_match || return 4
+            _fallback_strict_inputs_match || return $?
             file=$(jq -r '.path' <<< "$asset") || return 4
             _release_contract_verify_local_asset "$file" "$name" \
                 "$(jq -r '.size_bytes' <<< "$asset")" "$(jq -r '.sha256' <<< "$asset")" || return 4
@@ -15474,7 +15527,8 @@ EOF
             gh_upload_asset "$(jq -r '.upload_url' <<< "$strict_observed")" "$file" "$content_type" >&2 || upload_rc=$?
             if _gh_operation_interrupted "$upload_rc"; then
                 log_error "Strict repair upload stopped (exit $upload_rc); original publication custody is retained"
-                return 5
+                _fallback_record_interruption upload "$upload_rc" || return 5
+                return "$upload_rc"
             fi
             # A lost response is success only after a fresh complete inventory
             # and downloaded bytes prove that this exact asset was accepted.
@@ -15484,9 +15538,15 @@ EOF
                 return 7
             fi
         done < <(jq -c '.assets[]' <<< "$strict_plan")
-        _fallback_strict_inputs_match || return 4
+        _fallback_strict_inputs_match || return $?
         final_result=$(TMPDIR="$strict_custody" JSON_MODE=true cmd_release_finalize "$tool_name" "$version" \
-            --artifacts "$strict_artifacts" --create-response "$strict_response" --no-dispatch) || return $?
+            --artifacts "$strict_artifacts" --create-response "$strict_response" --no-dispatch) || {
+            local finalize_status=$?
+            if _gh_operation_interrupted "$finalize_status"; then
+                _fallback_record_interruption finalize "$finalize_status" "$final_result" || return 5
+            fi
+            return "$finalize_status"
+        }
         jq -es --argjson id "$strict_release_id" 'length == 1 and (.[0] |
             .command == "release-finalize" and .status == "success" and .exit_code == 0 and
             .details.release_id == $id and (.details.receipt | type == "string" and startswith("/")))' \
@@ -15504,7 +15564,7 @@ EOF
             .plan == $plan and .release.id == $id and .release.draft == false and
             .release.prerelease == $prerelease' \
             3<<< "$strict_plan" <<< "$final_proof" >/dev/null || return 7
-        _fallback_strict_inputs_match || return 4
+        _fallback_strict_inputs_match || return $?
         publication_recovery=$(jq -c --arg receipt "$final_receipt" \
             '. + {status:"finalized",finalization_receipt:$receipt}' <<< "$publication_recovery") || return 4
         release_result=$(jq -nc --arg repo "$repo" --arg tag "$tag" --argjson id "$strict_release_id" \
@@ -15534,9 +15594,15 @@ EOF
             [[ "$(jq -r '.count' <<< "$scan")" == 1 ]] && release_args+=(--resume)
         fi
         if [[ -n "$expected_sha" ]]; then
-            local observed_tag_sha
-            if ! observed_tag_sha=$(gh_resolve_tag_sha "$repo" "$tag" 2>/dev/null); then
+            local observed_tag_sha observed_tag_status=0
+            observed_tag_sha=$(gh_resolve_tag_sha "$repo" "$tag" 2>/dev/null) || observed_tag_status=$?
+            if [[ "$observed_tag_status" -ne 0 ]]; then
                 release_status="blocked"
+                if _gh_operation_interrupted "$observed_tag_status"; then
+                    _fallback_record_interruption tag "$observed_tag_status" || return 5
+                    _fallback_result 5 release "Remote workflow tag inspection interrupted (exit $observed_tag_status)"
+                    return 5
+                fi
                 _fallback_result 8 release "Could not verify the remote tag against the expected workflow commit"
                 return 8
             fi
@@ -15556,8 +15622,15 @@ EOF
         _fallback_check_watch_admission || return $?
         local release_result="" custody_rc=0
         if [[ "$contract" != null ]]; then
-            if ! _fallback_strict_prepare || ! _fallback_strict_capture; then
+            _fallback_strict_prepare || custody_rc=$?
+            if [[ "$custody_rc" -eq 0 ]]; then _fallback_strict_capture || custody_rc=$?; fi
+            if [[ "$custody_rc" -ne 0 ]]; then
                 release_status="blocked"
+                if _gh_operation_interrupted "$custody_rc"; then
+                    _fallback_record_interruption custody "$custody_rc" || return 5
+                    _fallback_result 5 release "Strict publication custody inspection interrupted (exit $custody_rc); original receipts are retained"
+                    return 5
+                fi
                 [[ "$publication_recovery" == null ]] || publication_recovery=$(jq -c '.status="blocked"' <<< "$publication_recovery")
                 _fallback_result 4 release "Strict publication custody or frozen inputs could not be verified"
                 return 4
@@ -15565,8 +15638,15 @@ EOF
             if $strict_custody_ready; then
                 _fallback_strict_recover || rc=$?
             else
-                if ! _fallback_strict_inputs_match; then
+                custody_rc=0
+                _fallback_strict_inputs_match || custody_rc=$?
+                if [[ "$custody_rc" -ne 0 ]]; then
                     release_status="blocked"
+                    if _gh_operation_interrupted "$custody_rc"; then
+                        _fallback_record_interruption inputs "$custody_rc" || return 5
+                        _fallback_result 5 release "Strict publication inputs inspection interrupted (exit $custody_rc); original receipts are retained"
+                        return 5
+                    fi
                     _fallback_result 4 release "Strict publication inputs changed before creation"
                     return 4
                 fi
@@ -15575,14 +15655,29 @@ EOF
                 release_args[3]="$strict_artifacts"
                 release_result=$(_DSR_STRICT_CREATE_CUSTODY_PARENT="$strict_handoff" \
                     TMPDIR="$strict_handoff" JSON_MODE=true cmd_release "${release_args[@]}") || rc=$?
-                _fallback_strict_capture || custody_rc=$?
-                if [[ $custody_rc -ne 0 ]] || { [[ $rc -eq 0 ]] && ! $strict_custody_ready; }; then
-                    publication_recovery=$(jq -c '.status="blocked"' <<< "$publication_recovery")
-                    [[ $rc -ne 0 ]] || rc=7
+                # Capture performs remote preflight/tag verification. A stopped
+                # release must leave its existing handoff and original response
+                # untouched until a separate invocation requests recovery.
+                if ! _gh_operation_interrupted "$rc"; then
+                    _fallback_strict_capture || custody_rc=$?
+                    if _gh_operation_interrupted "$custody_rc"; then
+                        rc="$custody_rc"
+                    elif [[ $custody_rc -ne 0 ]] || { [[ $rc -eq 0 ]] && ! $strict_custody_ready; }; then
+                        publication_recovery=$(jq -c '.status="blocked"' <<< "$publication_recovery")
+                        [[ $rc -ne 0 ]] || rc=7
+                    fi
                 fi
             fi
         else
             release_result=$(JSON_MODE=true cmd_release "${release_args[@]}") || rc=$?
+        fi
+        if [[ "$contract" != null ]] && _gh_operation_interrupted "$rc"; then
+            local interrupted_status
+            release_status="failed"
+            _fallback_record_interruption release "$rc" "$release_result" || return 5
+            interrupted_status=$(jq -r '.exit_code' <<< "$fallback_interruption") || return 5
+            _fallback_result 5 release "Strict release interrupted (exit $interrupted_status); original publication custody is retained"
+            return 5
         fi
         if [[ $rc -ne 0 ]]; then
             release_status="failed"

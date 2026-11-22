@@ -41,6 +41,17 @@
       "$ref": "#/$defs/workflow_event",
       "description": "Configured workflow event and canonical payload selected for this fallback, including a dry-run plan"
     },
+    "interruption": {
+      "type": "object",
+      "required": ["stage", "exit_code", "outcome"],
+      "additionalProperties": false,
+      "description": "Original terminal adapter status retained when strict publication or recovery stops",
+      "properties": {
+        "stage": { "type": "string", "minLength": 1 },
+        "exit_code": { "type": "integer", "minimum": 1, "maximum": 255 },
+        "outcome": { "const": "unconfirmed" }
+      }
+    },
     "watch_observation": {
       "type": ["object", "null"],
       "description": "Latest fresh admission result; null before a check or after its refusal",

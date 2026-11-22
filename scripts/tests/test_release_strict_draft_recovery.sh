@@ -187,6 +187,7 @@ elif endpoint=='upload-boundary':
            'browser_download_url':'https://github.com/owner/app/releases/download/v1.2.3/'+name}
     r['assets'].append(asset);(c/'remote.json').write_text(json.dumps(r));print(json.dumps(asset))
     if control.get('upload_stop_status') and control.get('upload_stop_name',name)==name:
+        (c/'stopped-request.json').write_text(json.dumps(args))
         sys.exit(control['upload_stop_status'])
     if control.get('lost_upload_name')==name:sys.exit(1)
 elif endpoint=='checksum-download':
@@ -458,7 +459,7 @@ if [[ "$1" == create || "$1" == publish || "$1" == fallback || "$1" == verify ||
         notify_event() { printf '%s\n' "$1" >> "$CASE/notifications"; }
         qg_run_checks() { printf 'quality\n' >> "$CASE/build-calls"; }
         cmd_build() {
-            local out="" tasks run
+            local out="" tasks run result
             while (($#)); do
                 case "$1" in --output-dir) out="$2"; shift 2 ;; *) shift ;; esac
             done
@@ -470,6 +471,11 @@ if [[ "$1" == create || "$1" == publish || "$1" == fallback || "$1" == verify ||
             tasks=$(_act_build_task_plan app 1.2.3 '["linux/amd64"]' true) || return 4
             build_state_set_context app 1.2.3 "$run" "$SOURCE_SHA" v1.2.3 '{}' "$out" 1 '{}' release \
                 "$tasks" '' null "$(_act_sha256 "$ACT_REPOS_DIR/app.yaml")" || return 4
+            # This fixture compiler reports the event selected by the real
+            # planner, so completed reuse retains the same workflow binding.
+            result=$(jq -c '.[0] | {result:{status:"success",method:.method,
+                platform:.platform,workflow_event:.workflow_event}}' <<< "$tasks") || return 4
+            build_state_update_target app 1.2.3 linux/amd64 completed "$result" "$run" || return 4
             build_state_update_status app 1.2.3 completed "$run" || return 4
         }
         cmd_fallback app --version 1.2.3 --expected-sha "$SOURCE_SHA" "$@"
@@ -1078,7 +1084,8 @@ def test_strict_publication_interruptions():
                   response.read_bytes()==original and response.stat().st_ino==identity)
 
 
-def test_fallback_recovery(pagination_only=False, prerelease_only=False, interruption_only=False):
+def test_fallback_recovery(pagination_only=False, prerelease_only=False, interruption_only=False,
+                           caller_interruption_only=False):
     run_id='11111111-1111-4111-8111-111111111111'
     missing='payload.tar.gz.sha256'
 
@@ -1138,6 +1145,61 @@ def test_fallback_recovery(pagination_only=False, prerelease_only=False, interru
               len([row for row in rows if '--post' in row])==1 and
               json.loads((c/'remote.json').read_text())['draft'] is True)
         return c,env,output,details['publication_recovery']
+
+    if caller_interruption_only:
+        selected=os.environ.get('DSR_TEST_FALLBACK_CALLER_INTERRUPTION_CASE','all')
+        if selected not in ('all','release','tag','scan','inventory','download'):
+            raise AssertionError('Select a known fallback caller interruption case')
+        for stop_status in interruption_statuses():
+            for boundary in ('release','tag','scan','inventory','download'):
+                if selected not in ('all',boundary):
+                    continue
+                label='caller-'+boundary+'-'+str(stop_status)
+                if boundary=='release':
+                    c,env,output=prepare(label,{'upload_stop_status':stop_status,'upload_stop_name':missing})
+                    result,rows=invoke_fallback(c,env,output,label='interrupted')
+                    details=json.loads(result.stdout)['details']
+                    intent=Path(details['publication_recovery']['intent'])
+                    responses=list(intent.parent.glob('dsr-create-custody.*/dsr-api-response.????????'))
+                    check(label+' normalizes the stopped release to fallback interruption',
+                          result.returncode==5 and details['phases']['release']=='failed' and
+                          details['interruption']==dict(stage='upload',exit_code=stop_status,outcome='unconfirmed') and
+                          str(stop_status) in details['error'])
+                    check(label+' never captures or reads remotely after the stopped upload',
+                          rows[-1]==json.loads((c/'stopped-request.json').read_text()) and
+                          rows[-1][0]=='upload-boundary' and
+                          not (intent.parent/'custody.json').exists())
+                    check(label+' retains the original creation response and prepared handoff',
+                          len(responses)==1 and responses[0].is_file() and
+                          details['publication_recovery']['status']=='prepared' and
+                          len([row for row in rows if '--post' in row])==1 and
+                          json.loads((c/'remote.json').read_text())['draft'] is True)
+                else:
+                    c,env,output,recovery=interrupt_upload(label)
+                    response=Path(recovery['create_response'])
+                    original=response.read_bytes();original_inode=response.stat().st_ino
+                    intent=Path(recovery['intent']);original_intent=intent.read_bytes()
+                    controls={'helper_stop_boundary':boundary,'helper_stop_status':stop_status}
+                    # Skip the early expected-tag lookup and preparation's
+                    # source checks to stop inside custody preflight itself.
+                    if boundary=='tag':controls['helper_stop_skip']=3
+                    (c/'control.json').write_text(json.dumps(controls))
+                    result,rows=invoke_fallback(c,env,output,True,label='interrupted')
+                    details=json.loads(result.stdout)['details']
+                    check(label+' preserves terminal inspection as fallback interruption',
+                          result.returncode==5 and str(stop_status) in details['error'] and
+                          details['interruption']['exit_code']==stop_status and
+                          details['interruption']['outcome']=='unconfirmed')
+                    check(label+' performs no later reconciliation or publication request',
+                          rows[-1]==json.loads((c/'stopped-request.json').read_text()) and not mutations(rows))
+                    check(label+' preserves original custody without upgrading recovery',
+                          response.read_bytes()==original and response.stat().st_ino==original_inode and
+                          intent.read_bytes()==original_intent and
+                          details['publication_recovery']['status'] in ('prepared','ready') and
+                          json.loads((c/'remote.json').read_text())['draft'] is True)
+                validator=Draft202012Validator(json.loads((root/'schemas/fallback-details.json').read_text()))
+                check(label+' interrupted result satisfies fallback schema',not list(validator.iter_errors(details)))
+        return
 
     if interruption_only:
         for stop_status in interruption_statuses():
@@ -2117,6 +2179,56 @@ def test_custom_artifact_repair():
           json.loads(result.stdout)['details']['checksums']['errors']==[] and
           len([row for row in rows if row[0]=='checksum-download'])==2 and not mutations(rows))
 
+
+def test_release_verify_caller_interruptions():
+    selected=os.environ.get('DSR_TEST_RELEASE_VERIFY_INTERRUPTION_CASE','all')
+    if selected not in ('all','scan','inventory','upload'):
+        raise AssertionError('Select a known release-verify caller interruption case')
+    for boundary in ('scan','inventory','upload'):
+        if selected not in ('all',boundary):
+            continue
+        label='verify-caller-'+boundary
+        c,env,response,_=setup(label)
+        original=response.read_bytes();original_inode=response.stat().st_ino
+        if boundary=='upload':
+            remote=json.loads((c/'remote.json').read_text())
+            missing=remote['assets'].pop()['name']
+            (c/'remote.json').write_text(json.dumps(remote))
+            controls={'upload_stop_status':130,'upload_stop_name':missing}
+        else:
+            controls={'helper_stop_boundary':boundary,'helper_stop_status':130}
+        (c/'control.json').write_text(json.dumps(controls))
+        stdout=c/'interrupted.stdout';stderr=c/'interrupted.stderr'
+        with stdout.open('w') as out, stderr.open('w') as err:
+            result=subprocess.run(['bash','-c',script,'fixture','verify','false','--fix'],
+                                  env=env,stdout=out,stderr=err,text=True)
+        rows=[json.loads(line) for line in (c/'requests.jsonl').read_text().splitlines()]
+        value=json.loads(stdout.read_text())
+        check(label+' returns interrupted with the original adapter status',
+              result.returncode==5 and value['command']=='release-verify' and
+              value['exit_code']==5 and value['details']['interruption']['exit_code']==130)
+        check(label+' stops at the interrupted remote operation',
+              rows[-1]==json.loads((c/'stopped-request.json').read_text()))
+        if boundary=='upload':
+            check(label+' stops before restore or reconciliation after server acceptance',
+                  rows[-1][0]=='upload-boundary' and
+                  not any('--post' in row or '--method' in row for row in rows))
+        else:
+            check(label+' performs no repair mutation after an interrupted read',
+                  not any('--post' in row or '--method' in row or row[0]=='upload-boundary' for row in rows))
+        check(label+' preserves the original response receipt',
+              response.read_bytes()==original and response.stat().st_ino==original_inode)
+
+
+if os.environ.get('DSR_TEST_RELEASE_VERIFY_INTERRUPTION_ONLY')=='1':
+    test_release_verify_caller_interruptions()
+    print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
+    raise SystemExit(0)
+
+if os.environ.get('DSR_TEST_FALLBACK_CALLER_INTERRUPTION_ONLY')=='1':
+    test_fallback_recovery(caller_interruption_only=True)
+    print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
+    raise SystemExit(0)
 
 if os.environ.get('DSR_TEST_STRICT_VERIFICATION_INTERRUPTION_ONLY')=='1':
     test_strict_verification_interruptions()
