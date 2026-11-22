@@ -7274,13 +7274,13 @@ if (not root or any(len(fields) != 2 or not fields[0].startswith("    url:")
 # Report cancellation before a command has created its publication result
 # accumulator. Ordinary failures keep their existing diagnostics and codes.
 _release_contract_report_interruption() {
-    local operation_status="$1" command="$2" stage="$3" repo="$4" tag="$5"
+    local operation_status="$1" command="$2" stage="$3" repo="$4" tag="$5" version="${6:-$5}"
     _gh_operation_interrupted "$operation_status" || return 1
     log_error "Release $stage stopped (exit $operation_status); explicit recovery is required"
     if $JSON_MODE; then
-        json_envelope "$command" error 5 "$(jq -nc --arg repo "$repo" --arg tag "$tag" \
+        json_envelope "$command" error 5 "$(jq -nc --arg repo "$repo" --arg version "$version" --arg tag "$tag" \
             --arg stage "$stage" --argjson code "$operation_status" '
-            {repo:$repo,tag:$tag,stage:"interrupted",verification:"interrupted",
+            {repo:$repo,version:$version,tag:$tag,stage:"interrupted",verification:"interrupted",
              error:"Release operation interrupted",
              interruption:{stage:$stage,exit_code:$code,outcome:"unconfirmed"}}')"
     fi
@@ -10204,15 +10204,29 @@ EOF
             # GitHub creates a missing tag at target_commitish, else at the
             # default branch head. Origin already holding a different commit
             # under this tag would publish other source than was tagged here.
-            local origin_tags origin_tag_sha=""
-            if [[ -n "$release_tag_sha" ]] && ! $release_contract_enabled &&
-               origin_tags=$(git -C "$local_path" ls-remote --tags origin \
-                    "refs/tags/$tag" "refs/tags/$tag^{}" 2>/dev/null); then
-                origin_tag_sha=$(awk -v peeled="refs/tags/$tag^{}" -v ref="refs/tags/$tag" '
-                    $2 == peeled { p = $1 } $2 == ref { d = $1 } END { print (p != "" ? p : d) }' <<< "$origin_tags")
-                if [[ -n "$origin_tag_sha" && "$origin_tag_sha" != "$release_tag_sha" ]]; then
-                    log_error "origin's $tag is $origin_tag_sha but the local $tag is $release_tag_sha"
-                    return 4
+            local origin_tags origin_tag_sha="" origin_status=0
+            if [[ -n "$release_tag_sha" ]] && ! $release_contract_enabled; then
+                if origin_tags=$(git -C "$local_path" ls-remote --tags origin \
+                        "refs/tags/$tag" "refs/tags/$tag^{}" 2>/dev/null); then
+                    origin_tag_sha=$(awk -v peeled="refs/tags/$tag^{}" -v ref="refs/tags/$tag" '
+                        $2 == peeled { p = $1 } $2 == ref { d = $1 } END { print (p != "" ? p : d) }' <<< "$origin_tags")
+                    if [[ -n "$origin_tag_sha" && "$origin_tag_sha" != "$release_tag_sha" ]]; then
+                        log_error "origin's $tag is $origin_tag_sha but the local $tag is $release_tag_sha"
+                        return 4
+                    fi
+                else
+                    origin_status=$?
+                    # An unavailable origin can still be checked through the
+                    # authoritative GitHub read below. Cancellation or a
+                    # stopped supervisor cannot authorize that next operation.
+                    # These are raw Git statuses: ordinary fatal 128 and SSH
+                    # 255 are not GitHub adapter cancellation statuses.
+                    case "$origin_status" in
+                        124|125|129|130|131|137|143)
+                            _release_contract_report_interruption "$origin_status" release origin_tag "$repo" "$tag" "$version"
+                            return 5
+                            ;;
+                    esac
                 fi
             fi
         elif $verify_tag; then

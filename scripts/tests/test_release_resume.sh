@@ -32,7 +32,7 @@ source <(awk '/^_release_prepare_ordinary_sbom\(\) \(/{copy=1} copy{print} copy 
 # shellcheck source=/dev/null
 source <(awk '/^_release_sbom_policy\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "${DSR_TEST_HELPERS_FILE:-$PROJECT_ROOT/dsr}")
 # shellcheck source=/dev/null
-source <(awk '/^_release_file_size\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "${DSR_TEST_COMMAND_FILE:-$PROJECT_ROOT/dsr}")
+source <(awk '/^(_release_file_size|_release_contract_report_interruption)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "${DSR_TEST_COMMAND_FILE:-$PROJECT_ROOT/dsr}")
 # shellcheck source=/dev/null
 source <(awk '/^_dispatch_[a-z_]+\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "${DSR_TEST_COMMAND_FILE:-$PROJECT_ROOT/dsr}")
 # shellcheck source=/dev/null
@@ -3489,6 +3489,80 @@ test_staged_pinned_tag_is_verified() { staged_tag_case valid; }
 test_staged_moved_tag_blocks_publication() { staged_tag_case moved; }
 test_staged_unavailable_tag_blocks_publication() { staged_tag_case unavailable; }
 test_staged_postpublish_tag_drift_restores_draft() { staged_tag_case after-publish; }
+
+# Git's optional origin observation is still an operation that can be stopped.
+# Use the actual release command and a real local commit/tag and manifest.
+# The origin transport returns the selected outcome; a downstream sentinel
+# observes admission to publication custody without creating a real release.
+release_origin_boundary_case() {
+    local observation_status="$1" expected_status="$2"
+    setup "origin_observation_$observation_status"
+    CREATE_FAIL=false
+    git init -q -b main "$CASE/checkout" &&
+        git -C "$CASE/checkout" -c user.name=t -c user.email=t@example.invalid commit -q --allow-empty -m tagged &&
+        git -C "$CASE/checkout" tag v1.2.3 || return 1
+    STAGED_SOURCE_SHA=$(git -C "$CASE/checkout" rev-parse HEAD) || return 1
+    act_get_local_path() { printf '%s\n' "$CASE/checkout"; }
+    git_ops_tag_exists() { command git -C "$1" rev-parse -q --verify "refs/tags/$2" >/dev/null; }
+    git_ops_tag_sha() { command git -C "$1" rev-parse --verify "$2^{commit}"; }
+    git() {
+        if [[ "${1:-}" == -C && "${2:-}" == "$CASE/checkout" && "${3:-}" == ls-remote ]]; then
+            printf 'ORIGIN-OBSERVE %s\n' "$observation_status" >> "$CALLS"
+            if [[ "$observation_status" == 0 ]]; then
+                printf '%s\trefs/tags/v1.2.3\n' "$STAGED_SOURCE_SHA"
+            fi
+            return "$observation_status"
+        fi
+        command git "$@"
+    }
+    _dsr_require() {
+        if [[ "$1" == build_state ]]; then
+            printf 'CUSTODY-BOUNDARY\n' >> "$CALLS"
+            return 3
+        fi
+        return 0
+    }
+    manifest payload.bin || return 1
+    local payload="$CASE/artifacts/payload.bin" manifest_file="$CASE/artifacts/tool-v1.2.3-manifest.json"
+    local payload_identity manifest_identity
+    payload_identity=$(_act_file_identity "$payload") || return 1
+    manifest_identity=$(_act_file_identity "$manifest_file") || return 1
+    cp "$payload" "$CASE/payload.before" && cp "$manifest_file" "$CASE/manifest.before" || return 1
+    run_release --no-dispatch
+    if [[ "$STATUS" != "$expected_status" ]]; then
+        printf 'origin status %s: release returned %s, expected %s\n' \
+            "$observation_status" "$STATUS" "$expected_status" >&2
+        cat "$CASE/stderr" >&2
+        return 1
+    fi
+    if [[ "$expected_status" == 5 ]]; then
+        [[ "$(cat "$CALLS")" == "ORIGIN-OBSERVE $observation_status" ]] &&
+            jq -e --argjson code "$observation_status" '.status=="error" and .exit_code==5 and
+                .details.repo=="owner/repo" and .details.version=="1.2.3" and .details.tag=="v1.2.3" and
+                .details.interruption.stage=="origin_tag" and
+                .details.interruption.exit_code==$code' "$CASE/stdout" >/dev/null &&
+            [[ ! -e "$CASE/create-request.json" && ! -e "$DSR_STATE_DIR/builds" ]] || return 1
+    else
+        [[ "$(cat "$CALLS")" == $'ORIGIN-OBSERVE '"$observation_status"$'\nCUSTODY-BOUNDARY' ]] || return 1
+    fi
+    [[ ! -e "$CASE/create-request.json" && ! -e "$DSR_STATE_DIR/builds" &&
+       "$(_act_file_identity "$payload")" == "$payload_identity" &&
+       "$(_act_file_identity "$manifest_file")" == "$manifest_identity" ]] &&
+        cmp -s "$payload" "$CASE/payload.before" &&
+        cmp -s "$manifest_file" "$CASE/manifest.before"
+}
+
+test_release_origin_boundary_sigint() { release_origin_boundary_case 130 5; }
+test_release_origin_boundary_sigterm() { release_origin_boundary_case 143 5; }
+test_release_origin_boundary_sighup() { release_origin_boundary_case 129 5; }
+test_release_origin_boundary_sigquit() { release_origin_boundary_case 131 5; }
+test_release_origin_boundary_sigkill() { release_origin_boundary_case 137 5; }
+test_release_origin_boundary_deadline() { release_origin_boundary_case 124 5; }
+test_release_origin_boundary_supervisor() { release_origin_boundary_case 125 5; }
+test_release_origin_boundary_transport() { release_origin_boundary_case 128 3; }
+test_release_origin_boundary_ssh() { release_origin_boundary_case 255 3; }
+test_release_origin_boundary_success() { release_origin_boundary_case 0 3; }
+
 test_staged_absent_tag_is_created_at_pinned_commit() { staged_tag_case absent-empty; }
 test_staged_absent_tag_with_prefix_sibling_can_publish() { staged_tag_case absent-prefix; }
 test_staged_absent_tag_probe_unavailable_is_refused() { staged_tag_case absent-unavailable; }
@@ -3925,6 +3999,10 @@ for test in test_release_auth_cancellation_never_falls_back_or_publishes \
     test_staged_storage_refusal_precedes_creation test_staged_concurrent_complete_publication_is_preserved \
     test_staged_pinned_tag_is_verified test_staged_moved_tag_blocks_publication \
     test_staged_unavailable_tag_blocks_publication test_staged_postpublish_tag_drift_restores_draft \
+    test_release_origin_boundary_sigint test_release_origin_boundary_sigterm test_release_origin_boundary_sighup \
+    test_release_origin_boundary_sigquit test_release_origin_boundary_sigkill test_release_origin_boundary_deadline \
+    test_release_origin_boundary_supervisor test_release_origin_boundary_transport test_release_origin_boundary_ssh \
+    test_release_origin_boundary_success \
     test_staged_absent_tag_is_created_at_pinned_commit test_staged_absent_tag_with_prefix_sibling_can_publish \
     test_staged_absent_tag_probe_unavailable_is_refused test_staged_absent_tag_probe_malformed_is_refused \
     test_staged_absent_tag_probe_nonarray_is_refused test_staged_absent_tag_probe_exact_ref_is_refused \

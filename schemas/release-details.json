@@ -34,7 +34,7 @@
       "type": "object",
       "required": ["stage", "exit_code", "outcome"],
       "properties": {
-        "stage": { "type": "string", "enum": ["create", "upload", "verification", "publish", "restore"] },
+        "stage": { "type": "string", "enum": ["origin_tag", "create", "upload", "verification", "publish", "restore"] },
         "exit_code": { "type": "integer", "minimum": 1, "maximum": 255 },
         "outcome": { "const": "unconfirmed" }
       },
