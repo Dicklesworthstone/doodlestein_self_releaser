@@ -17912,6 +17912,294 @@ except (OSError, ValueError, TypeError, KeyError, RecursionError) as error:
 PY
 }
 
+# Ordinary cache cleanup is never authority to retire retained source. Inventory
+# checkpoints once, including latest runs and historical source-sync receipts,
+# then inspect each old cache entry without following directory links. Protection
+# markers are opaque: their presence protects data even when their payload is
+# damaged. Only the separate --snapshots path may establish retirement authority.
+_prune_cache_inventory() {
+    python3 -I - "$1" "$2" "$3" "$4" "${5:-}" 3<<< "${6:-null}" <<'PY'
+import json
+import os
+import re
+import stat
+import sys
+
+state_dir, cache_dir = sys.argv[1:3]
+cutoff = int(sys.argv[4]) - (int(sys.argv[3]) + 1) * 86400
+result = {'eligible': [], 'retained': [], 'errors': [],
+          'checkpoints': {}, 'candidates': {}}
+protected = {}
+entries_seen = 0
+bytes_read = 0
+markers = {'.sbh-protect', '.dsr-snapshot-owner.json'}
+directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+def identity(item):
+    return [item.st_dev, item.st_ino, item.st_mode, item.st_size,
+            item.st_mtime_ns, item.st_ctime_ns]
+
+def budget(count=1):
+    global entries_seen
+    entries_seen += count
+    if entries_seen > 1000000:
+        raise ValueError('cache protection inventory exceeds its entry budget')
+
+def error(path, message):
+    result['errors'].append({'code': 'E054', 'path': path, 'message': message})
+
+def retain(path, reason, protected_path=None):
+    item = {'path': path, 'reason': reason}
+    if protected_path is not None:
+        item['protected_path'] = protected_path
+    result['retained'].append(item)
+
+def variants(path):
+    if not isinstance(path, str) or not path or '\0' in path:
+        raise ValueError('invalid checkpoint source path')
+    # Windows host roots cannot overlap this Unix cache namespace.
+    if re.match(r'^[A-Za-z]:[/\\]', path):
+        return set()
+    if not os.path.isabs(path):
+        raise ValueError('checkpoint source path is not absolute')
+    return {os.path.normpath(path), os.path.realpath(path)}
+
+def protect(path, reason):
+    for normalized in variants(path):
+        protected.setdefault(normalized, reason)
+
+def collect(value):
+    if isinstance(value, dict):
+        if 'source_roots' in value:
+            roots = value['source_roots']
+            if not isinstance(roots, dict):
+                raise ValueError('invalid checkpoint source_roots map')
+            for root in roots.values():
+                protect(root, 'source_roots')
+                # Legacy strict snapshots have no owner pin. Their source and
+                # private Cargo/cache siblings still form one retained unit.
+                if isinstance(root, str) and os.path.basename(root.rstrip('/')) == 'source':
+                    protect(os.path.dirname(root.rstrip('/')), 'source_roots')
+        if 'snapshot_owners' in value:
+            owners = value['snapshot_owners']
+            if not isinstance(owners, dict):
+                raise ValueError('invalid checkpoint snapshot_owners map')
+            for owner in owners.values():
+                if not isinstance(owner, dict):
+                    raise ValueError('invalid checkpoint snapshot owner')
+                protect(owner.get('path'), 'snapshot_ownership')
+                protect(owner.get('source_root'), 'snapshot_ownership')
+                if 'physical_path' in owner:
+                    protect(owner['physical_path'], 'snapshot_ownership')
+        for child in value.values():
+            collect(child)
+    elif isinstance(value, list):
+        for child in value:
+            collect(child)
+
+def receipt(value):
+    return value is None or (isinstance(value, dict) and
+                            isinstance(value.get('source_roots'), dict))
+
+def unique_object(pairs):
+    value = {}
+    for key, child in pairs:
+        if key in value:
+            raise ValueError('duplicate checkpoint field')
+        value[key] = child
+    return value
+
+def read_checkpoint(directory, descriptor, names):
+    global bytes_read
+    info = os.stat('state.json', dir_fd=descriptor, follow_symlinks=False)
+    if not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o444:
+        raise ValueError('checkpoint is not a readable regular file')
+    if info.st_size > 32 * 1024 * 1024:
+        raise ValueError('checkpoint exceeds its byte budget')
+    with os.fdopen(os.open('state.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                           dir_fd=descriptor), 'rb') as stream:
+        opened = os.fstat(stream.fileno())
+        if opened != info:
+            raise ValueError('checkpoint changed before inspection')
+        payload = stream.read(32 * 1024 * 1024 + 1)
+        bytes_read += len(payload)
+        if len(payload) > 32 * 1024 * 1024 or bytes_read > 128 * 1024 * 1024:
+            raise ValueError('checkpoint inventory exceeds its byte budget')
+        after = os.fstat(stream.fileno())
+    current = os.stat('state.json', dir_fd=descriptor, follow_symlinks=False)
+    if identity(opened) != identity(after) or identity(after) != identity(current):
+        raise ValueError('checkpoint changed during inspection')
+    result['checkpoints'][os.path.join(directory, 'state.json')] = identity(current)
+    value = json.loads(payload, object_pairs_hook=unique_object)
+    if not isinstance(value, dict) or [value.get(key) for key in ('tool', 'version', 'run_id')] != names:
+        raise ValueError('checkpoint identity does not match its namespace')
+    context = value.get('context', {})
+    history = value.get('source_sync_history', [])
+    if (not isinstance(context, dict) or not receipt(context.get('source_sync')) or
+            not isinstance(history, list) or any(not isinstance(item, dict) or
+                'receipt' not in item or not receipt(item['receipt']) for item in history)):
+        raise ValueError('checkpoint source-sync custody is incomplete')
+    collect(value)
+
+def traversal_error(failure):
+    raise failure
+
+def checkpoint_inventory():
+    root = os.path.join(state_dir, 'builds')
+    try:
+        root_info = os.lstat(root)
+    except FileNotFoundError:
+        result['checkpoints'][root] = None
+        return
+    if not stat.S_ISDIR(root_info.st_mode):
+        raise ValueError('build checkpoint root is not a concrete directory')
+    for directory, directories, files, descriptor in os.fwalk(
+            root, follow_symlinks=False, onerror=traversal_error):
+        relative = os.path.relpath(directory, root)
+        names = [] if relative == '.' else relative.split(os.sep)
+        budget(len(directories) + len(files) + 1)
+        info = os.fstat(descriptor)
+        result['checkpoints'][directory] = identity(info)
+        if not info.st_mode & 0o444:
+            raise ValueError('checkpoint directory is not readable')
+        if len(names) == 3:
+            read_checkpoint(directory, descriptor, names)
+            directories[:] = []
+            continue
+        for name in directories + files:
+            if name.startswith('.'):
+                continue
+            info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            if len(names) == 2 and name == 'latest':
+                if not stat.S_ISLNK(info.st_mode):
+                    raise ValueError('latest checkpoint is not a link to a concrete run')
+                target = os.readlink(name, dir_fd=descriptor)
+                if (not target or target.startswith('.') or '/' in target or
+                        not stat.S_ISDIR(os.stat(target, dir_fd=descriptor,
+                                                follow_symlinks=False).st_mode)):
+                    raise ValueError('latest checkpoint target is unverifiable')
+            elif not stat.S_ISDIR(info.st_mode):
+                raise ValueError('checkpoint namespace contains an unverifiable entry')
+        directories[:] = [name for name in directories if not name.startswith('.') and
+                          not (len(names) == 2 and name == 'latest')]
+
+def marker_in_ancestors(path):
+    directory = os.path.dirname(path)
+    while True:
+        descriptor = os.open(directory, directory_flags)
+        try:
+            for marker in sorted(markers):
+                try:
+                    os.stat(marker, dir_fd=descriptor, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                return os.path.join(directory, marker)
+        finally:
+            os.close(descriptor)
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            return None
+        directory = parent
+
+def marker_in_candidate(path, info, observations):
+    observations[path] = identity(info)
+    if os.path.basename(path) in markers:
+        return path
+    if not stat.S_ISDIR(info.st_mode):
+        return None
+    for directory, directories, files, descriptor in os.fwalk(
+            path, follow_symlinks=False, onerror=traversal_error):
+        budget(len(directories) + len(files) + 1)
+        if os.path.relpath(directory, path).count(os.sep) > 256:
+            raise ValueError('cache protection inventory exceeds its depth budget')
+        # A mode-zero directory is uninspectable even when this command has
+        # elevated privileges; do not turn unavailable protection into absence.
+        info = os.fstat(descriptor)
+        observations[directory] = identity(info)
+        if not info.st_mode & 0o444:
+            raise ValueError('cache directory is not readable')
+        for marker in sorted(markers.intersection(directories + files)):
+            return os.path.join(directory, marker)
+    return None
+
+if sys.argv[5]:
+    # Recheck metadata and marker presence immediately before one removal.
+    # This does not acquire producer custody or promise atomic exclusion; it
+    # prevents a changed checkpoint/candidate from inheriting an earlier scan's
+    # decision without reparsing every checkpoint for every cache directory.
+    path = sys.argv[5]
+    try:
+        with os.fdopen(3) as stream:
+            prior = json.load(stream)
+        for observations in (prior['checkpoints'], prior['candidates'][path]):
+            for observed, expected in observations.items():
+                budget()
+                try:
+                    current = identity(os.lstat(observed))
+                except FileNotFoundError:
+                    current = None
+                if current != expected:
+                    raise ValueError('source custody or cache entry changed after inventory: ' + observed)
+        marker = marker_in_ancestors(path) or marker_in_candidate(path, os.lstat(path), {})
+        if marker is not None:
+            retain(path, 'protection_marker', marker)
+        else:
+            result['eligible'].append(path)
+    except (OSError, ValueError, TypeError, KeyError, RecursionError) as failure:
+        retain(path, 'protection_unavailable')
+        error(path, 'Cannot recheck cache protection: ' + str(failure))
+    print(json.dumps(result, separators=(',', ':')))
+    sys.exit(0)
+
+try:
+    candidates = []
+    descriptor = os.open(cache_dir, directory_flags)
+    try:
+        if not os.fstat(descriptor).st_mode & 0o444:
+            raise ValueError('cache root is not readable')
+        with os.scandir(descriptor) as entries:
+            for entry in entries:
+                budget()
+                info = entry.stat(follow_symlinks=False)
+                if info.st_mtime <= cutoff:
+                    candidates.append((os.path.join(cache_dir, entry.name), info))
+    finally:
+        os.close(descriptor)
+    if candidates:
+        custody_available = True
+        try:
+            checkpoint_inventory()
+        except (OSError, ValueError, TypeError, RecursionError) as failure:
+            custody_available = False
+            error(os.path.join(state_dir, 'builds'), 'Cannot inspect retained source custody: ' + str(failure))
+        for path, info in sorted(candidates):
+            try:
+                overlap = next(((root, reason) for root, reason in protected.items()
+                    if any(os.path.commonpath((candidate, root)) in (candidate, root)
+                           for candidate in variants(path))), None)
+                if overlap is not None:
+                    retain(path, overlap[1], overlap[0])
+                    continue
+                observations = {}
+                marker = marker_in_ancestors(path) or marker_in_candidate(path, info, observations)
+                if marker is not None:
+                    retain(path, 'protection_marker', marker)
+                elif not custody_available:
+                    retain(path, 'protection_unavailable')
+                else:
+                    result['eligible'].append(path)
+                    result['candidates'][path] = observations
+            except (OSError, ValueError, TypeError, RecursionError) as failure:
+                retain(path, 'protection_unavailable')
+                error(path, 'Cannot inspect cache protection: ' + str(failure))
+except (OSError, ValueError, TypeError, RecursionError) as failure:
+    result['eligible'] = []
+    retain(cache_dir, 'protection_unavailable')
+    error(cache_dir, 'Cannot inventory cache protection: ' + str(failure))
+print(json.dumps(result, separators=(',', ':')))
+PY
+}
+
 cmd_prune() {
     # Keep build-custody descriptors and signal cleanup inside this invocation.
     (
@@ -17985,6 +18273,7 @@ explicitly admits its source retirement. Its checkpoint and latest link stay.
 Build checkpoints with retained source roots or unverifiable state are kept.
 Busy or unverifiable build leases prevent artifact-set and checkpoint pruning.
 Unfinished artifact sets and outputs with unknown ownership are kept.
+Cache cleanup preserves retained source roots, snapshot caches and protection markers.
 Snapshot cleanup requires original producer ownership receipts and a completed
 publishable artifact set. Legacy or unverifiable snapshots are kept.
 
@@ -18059,6 +18348,7 @@ EOF
     local errors=()
     local retained_build_paths=()
     local retained_artifact_paths=()
+    local retained_cache_paths=()
     local snapshot_results=()
     local retained_snapshot_paths=()
 
@@ -18568,21 +18858,49 @@ EOF
         done
     fi
 
-    # Prune cache entries
+    # Cache age alone cannot retire source snapshots or private dependency
+    # caches. A single bounded inventory covers latest and historical custody
+    # before any cache entry reaches the ordinary removal path.
     if ! $snapshots_only && ! $custody_failed && [[ -d "$cache_dir" ]]; then
-        while IFS= read -r path; do
-            _prune_consider "$path"
-        done < <(find "$cache_dir" -mindepth 1 -maxdepth 1 -mtime +"$max_age_days" 2>/dev/null)
+        local cache_inventory cache_recheck item
+        if cache_inventory=$(_prune_cache_inventory "$state_dir" "$cache_dir" "$max_age_days" "$now_epoch") &&
+           jq -e 'type == "object" and (.eligible | type == "array") and
+             (.retained | type == "array") and (.errors | type == "array")' \
+             <<< "$cache_inventory" >/dev/null; then
+            while IFS= read -r item; do
+                retained_cache_paths+=("$item")
+                $JSON_MODE || log_info "Retaining cache entry: $(jq -r '.path' <<< "$item") ($(jq -r '.reason' <<< "$item"))"
+            done < <(jq -c '.retained[]' <<< "$cache_inventory")
+            while IFS= read -r item; do
+                _prune_error E054 "$(jq -r '.message' <<< "$item")" "$(jq -r '.path' <<< "$item")"
+            done < <(jq -c '.errors[]' <<< "$cache_inventory")
+            while IFS= read -r -d '' path; do
+                if cache_recheck=$(_prune_cache_inventory "$state_dir" "$cache_dir" "$max_age_days" \
+                        "$now_epoch" "$path" "$cache_inventory") &&
+                   jq -e --arg path "$path" '.eligible == [$path]' <<< "$cache_recheck" >/dev/null; then
+                    _prune_consider "$path"
+                else
+                    retained_cache_paths+=("$(jq -nc --arg path "$path" \
+                        '{path:$path,reason:"protection_unavailable"}')")
+                    _prune_error E054 "Cache protection changed or became unavailable before removal" "$path"
+                fi
+            done < <(jq -j '.eligible[] | ., "\u0000"' <<< "$cache_inventory")
+        else
+            retained_cache_paths+=("$(jq -nc --arg path "$cache_dir" \
+                '{path:$path,reason:"protection_unavailable"}')")
+            _prune_error E054 "Cannot inventory cache protection; Python 3 and readable custody are required" "$cache_dir"
+        fi
     fi
 
     local pruned_json errors_json retained_build_json retained_artifact_json details_json
-    local snapshots_json retained_snapshot_json
+    local snapshots_json retained_snapshot_json retained_cache_json
     pruned_json=$(printf '%s\n' "${pruned_items[@]}" | jq -sc '.' 2>/dev/null || echo "[]")
     errors_json=$(printf '%s\n' "${errors[@]}" | jq -sc '.' 2>/dev/null || echo "[]")
     retained_build_json=$(printf '%s\n' ${retained_build_paths[@]+"${retained_build_paths[@]}"} | jq -sc '.')
     retained_artifact_json=$(printf '%s\n' ${retained_artifact_paths[@]+"${retained_artifact_paths[@]}"} | jq -sc '.')
     snapshots_json=$(printf '%s\n' ${snapshot_results[@]+"${snapshot_results[@]}"} | jq -sc '.')
     retained_snapshot_json=$(printf '%s\n' ${retained_snapshot_paths[@]+"${retained_snapshot_paths[@]}"} | jq -sc '.')
+    retained_cache_json=$(printf '%s\n' ${retained_cache_paths[@]+"${retained_cache_paths[@]}"} | jq -sc '.')
 
     local status="success"
     local exit_code=0
@@ -18609,15 +18927,17 @@ EOF
             --slurpfile errors /dev/fd/6 \
             --slurpfile snapshot_results /dev/fd/7 \
             --slurpfile retained_snapshot_paths /dev/fd/8 \
+            --slurpfile retained_cache_paths /dev/fd/9 \
             '{state_dir: $state_dir, dry_run: $dry_run, cutoff_days: $cutoff_days, keep_last: $keep_last,
               snapshots_only: $snapshots_only, include_latest: $include_latest,
               keep_releases: $keep_releases, kept_for_releases: $kept_for_releases,
               pruned_count: $pruned_count, bytes_freed: $bytes_freed, pruned_paths: $pruned_paths[0],
               retained_build_paths: $retained_build_paths[0], retained_artifact_paths: $retained_artifact_paths[0],
               snapshot_results: $snapshot_results[0], retained_snapshot_paths: $retained_snapshot_paths[0],
+              retained_cache_paths: $retained_cache_paths[0],
               errors: $errors[0]}' 3<<< "$pruned_json" 4<<< "$retained_build_json" \
             5<<< "$retained_artifact_json" 6<<< "$errors_json" \
-            7<<< "$snapshots_json" 8<<< "$retained_snapshot_json") || return 1
+            7<<< "$snapshots_json" 8<<< "$retained_snapshot_json" 9<<< "$retained_cache_json") || return 1
         json_envelope "prune" "$status" "$exit_code" "$details_json"
     else
         if $dry_run; then

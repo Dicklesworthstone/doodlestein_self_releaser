@@ -66,6 +66,11 @@
       "items": { "$ref": "#/$defs/retained_artifact_item" },
       "description": "Artifact directories or adjacent manifests retained because build custody, publication completion or canonical ownership could not be established"
     },
+    "retained_cache_paths": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/retained_cache_item" },
+      "description": "Cache entries retained because they overlap source or snapshot custody, contain a protection marker, or cannot be inspected safely"
+    },
     "snapshot_results": {
       "type": "array",
       "items": { "$ref": "#/$defs/snapshot_result" },
@@ -83,6 +88,21 @@
     }
   },
   "$defs": {
+    "retained_cache_item": {
+      "type": "object",
+      "required": ["path", "reason"],
+      "properties": {
+        "path": { "type": "string" },
+        "reason": {
+          "enum": ["source_roots", "snapshot_ownership", "protection_marker", "protection_unavailable"]
+        },
+        "protected_path": {
+          "type": "string",
+          "description": "Overlapping retained source or snapshot path, or the opaque protection marker"
+        }
+      },
+      "additionalProperties": false
+    },
     "snapshot_result": {
       "type": "object",
       "required": ["host", "source_root", "path", "status", "size_bytes"],

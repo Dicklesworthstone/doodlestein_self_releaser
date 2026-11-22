@@ -4,7 +4,7 @@
 # Tests prune subcommand with real behavior (no mocks).
 # Verifies safety guardrails, dry-run, and JSON output.
 #
-# Run: ./scripts/tests/e2e_prune.sh [--snapshot-only|--snapshot-race-only|--snapshot-boundary-only|--snapshot-latest-only]
+# Run: ./scripts/tests/e2e_prune.sh [--cache-custody-only|--snapshot-only|--snapshot-race-only|--snapshot-boundary-only|--snapshot-latest-only]
 
 set -uo pipefail
 
@@ -1042,6 +1042,326 @@ test_prune_allows_explicit_no_sync_history() {
     [[ -d "$directory/latest-run" ]] || problems+=("latest run was removed")
     prune_case_result "prune removes an ordinary completed run with an explicit null source-sync receipt" "${problems[@]}"
     harness_teardown
+}
+
+# These public-command regressions leave source, checkpoint and cache fixtures
+# intact. The one non-preview case records the actual rm boundary instead of
+# deleting anything, so the same fixtures can safely expose the original bug.
+prune_age_cache_entries() {
+    python3 - "$@" <<'PY'
+import os, sys, time
+old = time.time() - 60 * 86400
+for path in sys.argv[1:]:
+    os.utime(path, (old, old), follow_symlinks=False)
+PY
+}
+
+prune_reported_cache_retention() {
+    exec_stdout | jq -e --arg path "$1" --arg reason "$2" \
+        'any(.details.retained_cache_paths[]?; .path == $path and .reason == $reason)' >/dev/null
+}
+
+prune_cache_schema_valid() {
+    python3 - "$PROJECT_ROOT/schemas" "$_EXEC_STDOUT_FILE" <<'PY'
+import json
+from pathlib import Path
+import sys
+from jsonschema import Draft202012Validator, FormatChecker
+schemas = Path(sys.argv[1])
+with open(sys.argv[2]) as stream:
+    document = json.load(stream)
+for name, value in [('envelope.json', document), ('prune-details.json', document['details'])]:
+    with (schemas / name).open() as stream:
+        Draft202012Validator(json.load(stream), format_checker=FormatChecker()).validate(value)
+PY
+}
+
+test_prune_cache_source_custody() {
+    ((TESTS_RUN++))
+    local location="$1"
+    harness_setup
+    seed_minimal_config
+    seed_prune_pair cache-tool v1.0.0
+    local snapshot="$DSR_CACHE_DIR/strict-snapshots" root checkpoint current='{}' history='[]'
+    local ordinary="$DSR_CACHE_DIR/strict-snapshots-sibling" candidate reason=source_roots
+    local before after roots problems=()
+    checkpoint="$DSR_STATE_DIR/builds/cache-tool/v1.0.0/old-run/state.json"
+    root="$snapshot/run/source"
+    candidate="$snapshot"
+    if [[ "$location" == reverse-root ]]; then
+        root="$TEST_TMPDIR/retained-checkout"
+        export DSR_CACHE_DIR="$root/build-cache"
+        candidate="$DSR_CACHE_DIR/registry"
+        ordinary=""
+    elif [[ "$location" == owner-parent ]]; then
+        root="$snapshot/run/tree"
+        export DSR_CACHE_DIR="$snapshot/run"
+        candidate="$DSR_CACHE_DIR/.cargo-home"
+        ordinary=""
+        reason=snapshot_ownership
+    fi
+    mkdir -p "$root" "$candidate" "$snapshot/run/.cargo-home/registry"
+    printf 'retained reviewed source\n' > "$root/Cargo.toml"
+    printf 'pinned offline dependencies\n' > "$snapshot/run/.cargo-home/registry/pinned-source"
+    if [[ -n "$ordinary" ]]; then
+        mkdir -p "$ordinary"
+        printf 'ordinary expired cache\n' > "$ordinary/data"
+        prune_age_cache_entries "$ordinary"
+    fi
+    roots=$(jq -nc --arg root "$root" '{builder:$root}')
+    case "$location" in
+        history) history=$(jq -nc --argjson roots "$roots" '[{receipt:{source_roots:$roots}}]') ;;
+        latest)
+            checkpoint="$DSR_STATE_DIR/builds/cache-tool/v1.0.0/latest-run/state.json"
+            current="$roots"
+            ;;
+        *) current="$roots" ;;
+    esac
+    write_prune_run_state "$checkpoint" cache-tool v1.0.0 "$(basename "${checkpoint%/state.json}")" "$current" "$history"
+    if [[ "$location" == owner-parent ]]; then
+        # Retention uses the pinned parent as protection, never as deletion
+        # authority. The separate snapshot suite exercises producer attestation.
+        jq --arg root "$root" --arg parent "${root%/tree}" \
+            '.context.snapshot_owners = {builder:{source_root:$root,path:$parent,physical_path:$parent}}' \
+            "$checkpoint" > "$TEST_TMPDIR/owner-state.json"
+        mv "$TEST_TMPDIR/owner-state.json" "$checkpoint"
+    fi
+    prune_age_cache_entries "$candidate"
+    before=$(prune_tree_inventory "$snapshot" "$root" "$checkpoint" "$candidate")
+    exec_run "$DSR_CMD" --json --dry-run prune --max-age 30 --keep-last 0 --force
+    after=$(prune_tree_inventory "$snapshot" "$root" "$checkpoint" "$candidate")
+    [[ "$(exec_status)" -eq 0 && "$before" == "$after" ]] || problems+=("preview failed or changed retained source/cache/checkpoint")
+    prune_reported_cache_retention "$candidate" "$reason" || problems+=("$location cache protection was not reported")
+    ! prune_reported_path "$candidate" || problems+=("retained source/cache was selected for deletion")
+    if [[ -n "$ordinary" ]]; then
+        prune_reported_path "$ordinary" || problems+=("unrelated similarly named cache was suppressed")
+    fi
+    prune_cache_schema_valid || problems+=("public response violates its JSON schemas")
+    prune_case_result "ordinary prune preserves $location source custody across cache boundaries" "${problems[@]}"
+    harness_teardown
+}
+
+test_prune_cache_markers() {
+    ((TESTS_RUN++))
+    local location="$1"
+    harness_setup
+    seed_minimal_config
+    local candidate="$DSR_CACHE_DIR/protected" owner="$DSR_CACHE_DIR/owned"
+    local ordinary="$DSR_CACHE_DIR/ordinary" outside="$TEST_TMPDIR/linked-target"
+    local before after problems=()
+    mkdir -p "$candidate/source" "$candidate/.cargo-home" "$owner" "$ordinary" "$outside"
+    printf 'retained source\n' > "$candidate/source/main.rs"
+    printf 'pinned cache\n' > "$candidate/.cargo-home/dependency"
+    printf 'opaque legacy protection\n' > "$outside/.sbh-protect"
+    if [[ "$location" == ancestor ]]; then
+        printf 'protect all descendants\n' > "$TEST_TMPDIR/.sbh-protect"
+    else
+        # A marker link protects its containing tree without reading its target.
+        ln -s "$TEST_TMPDIR/absent-marker-target" "$candidate/.sbh-protect"
+        printf '{damaged-owner-receipt\n' > "$owner/.dsr-snapshot-owner.json"
+        # Discovery must not follow this directory link and treat the target's
+        # marker as a marker in the disposable directory that contains the link.
+        ln -s "$outside" "$ordinary/link"
+    fi
+    prune_age_cache_entries "$candidate" "$owner" "$ordinary"
+    before=$(prune_tree_inventory "$DSR_CACHE_DIR" "$outside")
+    exec_run "$DSR_CMD" --json --dry-run prune --max-age 30 --keep-last 0 --force
+    after=$(prune_tree_inventory "$DSR_CACHE_DIR" "$outside")
+    [[ "$(exec_status)" -eq 0 && "$before" == "$after" ]] || problems+=("marker preview failed or changed retained files")
+    prune_reported_cache_retention "$candidate" protection_marker || problems+=("$location marker did not protect source and sibling cache")
+    prune_reported_cache_retention "$owner" protection_marker || problems+=("$location marker did not protect owner directory")
+    ! prune_reported_path "$candidate" && ! prune_reported_path "$owner" || problems+=("protected directory was selected")
+    if [[ "$location" == ancestor ]]; then
+        prune_reported_cache_retention "$ordinary" protection_marker || problems+=("marker above cache root was ignored")
+    else
+        prune_reported_path "$ordinary" || problems+=("discovery followed a directory link or suppressed unrelated cleanup")
+    fi
+    prune_cache_schema_valid || problems+=("public response violates its JSON schemas")
+    prune_case_result "ordinary cache prune honors $location markers without following directory links" "${problems[@]}"
+    harness_teardown
+}
+
+test_prune_cache_unavailable_custody() {
+    ((TESTS_RUN++))
+    local kind="$1"
+    harness_setup
+    seed_minimal_config
+    seed_prune_pair cache-tool v1.0.0
+    local checkpoint="$DSR_STATE_DIR/builds/cache-tool/v1.0.0/latest-run/state.json"
+    local candidate="$DSR_CACHE_DIR/expired" other="$TEST_TMPDIR/linked-checkpoint.json"
+    local before after problems=()
+    mkdir -p "$candidate"
+    printf 'cache requiring proven absence of source custody\n' > "$candidate/payload"
+    case "$kind" in
+        malformed) printf '{"tool":' > "$checkpoint" ;;
+        linked)
+            mv "$checkpoint" "$other"
+            ln -s "$other" "$checkpoint"
+            ;;
+        namespace-link)
+            mv "$DSR_STATE_DIR/builds/cache-tool" "$TEST_TMPDIR/linked-tool"
+            ln -s "$TEST_TMPDIR/linked-tool" "$DSR_STATE_DIR/builds/cache-tool"
+            ;;
+        incomplete-history)
+            write_prune_run_state "$checkpoint" cache-tool v1.0.0 latest-run '{}' '[{}]'
+            ;;
+    esac
+    prune_age_cache_entries "$candidate"
+    before=$(prune_tree_inventory "$DSR_STATE_DIR/builds" "$candidate" "$other")
+    exec_run "$DSR_CMD" --json --dry-run prune --max-age 30 --keep-last 0 --force
+    after=$(prune_tree_inventory "$DSR_STATE_DIR/builds" "$candidate" "$other")
+    [[ "$(exec_status)" -eq 1 && "$before" == "$after" ]] || problems+=("unavailable custody was not a read-only partial failure")
+    prune_reported_cache_retention "$candidate" protection_unavailable || problems+=("unprovable cache selection was not retained")
+    ! prune_reported_path "$candidate" || problems+=("cache was selected despite unavailable custody")
+    exec_stdout | jq -e '.status == "partial" and any(.details.errors[]?; .code == "E054")' >/dev/null || problems+=("missing explicit protection error")
+    prune_cache_schema_valid || problems+=("public response violates its JSON schemas")
+    prune_case_result "ordinary prune retains cache when $kind checkpoint custody cannot be inspected" "${problems[@]}"
+    harness_teardown
+}
+
+test_prune_cache_unreadable_candidate() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_minimal_config
+    local candidate="$DSR_CACHE_DIR/unreadable" ordinary="$DSR_CACHE_DIR/ordinary"
+    local before after problems=()
+    mkdir -p "$candidate/hidden" "$ordinary"
+    printf 'opaque protection\n' > "$candidate/hidden/.sbh-protect"
+    printf 'ordinary cache\n' > "$ordinary/payload"
+    chmod 000 "$candidate/hidden"
+    prune_age_cache_entries "$candidate" "$ordinary"
+    before=$(python3 - "$candidate/hidden" <<'PY'
+import os, sys
+s = os.lstat(sys.argv[1])
+print((s.st_dev, s.st_ino, s.st_mode, s.st_mtime_ns, s.st_ctime_ns))
+PY
+)
+    exec_run "$DSR_CMD" --json --dry-run prune --max-age 30 --keep-last 0 --force
+    after=$(python3 - "$candidate/hidden" <<'PY'
+import os, sys
+s = os.lstat(sys.argv[1])
+print((s.st_dev, s.st_ino, s.st_mode, s.st_mtime_ns, s.st_ctime_ns))
+PY
+)
+    [[ "$(exec_status)" -eq 1 && "$before" == "$after" ]] || problems+=("unreadable protection was treated as absent or changed")
+    prune_reported_cache_retention "$candidate" protection_unavailable || problems+=("uninspectable candidate was not retained")
+    ! prune_reported_path "$candidate" || problems+=("uninspectable candidate was selected")
+    prune_reported_path "$ordinary" || problems+=("candidate failure blocked unrelated ordinary cache")
+    prune_cache_schema_valid || problems+=("public response violates its JSON schemas")
+    # Restore only fixture access after all preservation assertions so retained
+    # evidence remains inspectable and normal harness cleanup remains possible.
+    chmod 700 "$candidate/hidden"
+    prune_case_result "unreadable cache protection retains only the affected candidate" "${problems[@]}"
+    harness_teardown
+}
+
+test_prune_cache_removal_boundary() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_minimal_config
+    local candidate="$DSR_CACHE_DIR/protected" ordinary="$DSR_CACHE_DIR/ordinary"
+    local before after real_rm problems=()
+    mkdir -p "$candidate/source" "$candidate/.cargo-home" "$ordinary" "$TEST_TMPDIR/bin"
+    printf 'retained source\n' > "$candidate/source/main.rs"
+    printf 'retained cache\n' > "$candidate/.cargo-home/pinned"
+    printf 'snapshot protection\n' > "$candidate/.sbh-protect"
+    printf 'expired ordinary cache\n' > "$ordinary/data"
+    real_rm=$(command -v rm)
+    cat > "$TEST_TMPDIR/bin/rm" <<'SH'
+#!/usr/bin/env bash
+if [[ "$#" == 2 && ( "$1" == -rf || "$1" == -f ) && "$2" == "$DSR_CACHE_DIR/"* ]]; then
+    printf '%s\n' "$2" >> "$PRUNE_CACHE_REMOVALS"
+    exit 0
+fi
+exec "$PRUNE_CACHE_REAL_RM" "$@"
+SH
+    chmod +x "$TEST_TMPDIR/bin/rm"
+    prune_age_cache_entries "$candidate" "$ordinary"
+    before=$(prune_tree_inventory "$candidate")
+    exec_run env PATH="$TEST_TMPDIR/bin:$PATH" PRUNE_CACHE_REMOVALS="$TEST_TMPDIR/removals" \
+        PRUNE_CACHE_REAL_RM="$real_rm" "$DSR_CMD" --json prune --max-age 30 --keep-last 0 --force
+    after=$(prune_tree_inventory "$candidate")
+    [[ "$(exec_status)" -eq 0 && "$before" == "$after" ]] || problems+=("non-preview prune changed protected source/cache")
+    [[ -f "$TEST_TMPDIR/removals" && "$(cat "$TEST_TMPDIR/removals")" == "$ordinary" ]] || problems+=("actual removal boundary admitted protected data or suppressed ordinary cache")
+    prune_reported_cache_retention "$candidate" protection_marker || problems+=("non-preview protection was not reported")
+    ! prune_reported_path "$candidate" && prune_reported_path "$ordinary" || problems+=("non-preview report disagrees with removal boundary")
+    prune_cache_schema_valid || problems+=("public response violates its JSON schemas")
+    prune_case_result "ordinary non-preview prune admits only unrelated cache to its removal boundary" "${problems[@]}"
+    harness_teardown
+}
+
+test_prune_cache_inventory_change() {
+    ((TESTS_RUN++))
+    local kind="$1"
+    harness_setup
+    seed_minimal_config
+    seed_prune_pair cache-tool v1.0.0
+    local candidate="$DSR_CACHE_DIR/expired" ordinary="$DSR_CACHE_DIR/ordinary"
+    local checkpoint="$DSR_STATE_DIR/builds/cache-tool/v1.0.0/latest-run/state.json"
+    local real_python problems=()
+    real_python=$(command -v python3)
+    mkdir -p "$candidate/nested" "$ordinary" "$TEST_TMPDIR/bin"
+    printf 'retained cache payload\n' > "$candidate/nested/payload"
+    printf 'ordinary payload\n' > "$ordinary/data"
+    prune_age_cache_entries "$candidate" "$ordinary"
+    cat > "$TEST_TMPDIR/bin/python3" <<'SH'
+#!/usr/bin/env bash
+if [[ "$#" == 7 && "$1" == -I && "$2" == - && "$4" == "$DSR_CACHE_DIR" && -z "$7" ]]; then
+    "$PRUNE_CACHE_REAL_PYTHON" "$@" > "$PRUNE_CACHE_MUTATION_DIR/inventory.json" || exit $?
+    if [[ "$PRUNE_CACHE_MUTATION_KIND" == checkpoint ]]; then
+        jq --arg root "$PRUNE_CACHE_MUTATION_TARGET" '.context.source_roots = {builder:$root}' \
+            "$PRUNE_CACHE_MUTATION_CHECKPOINT" > "$PRUNE_CACHE_MUTATION_DIR/next-state.json" || exit 1
+        mv "$PRUNE_CACHE_MUTATION_DIR/next-state.json" "$PRUNE_CACHE_MUTATION_CHECKPOINT" || exit 1
+    else
+        printf 'new source protection\n' > "$PRUNE_CACHE_MUTATION_TARGET/nested/.sbh-protect" || exit 1
+    fi
+    : > "$PRUNE_CACHE_MUTATION_DIR/mutated"
+    cat "$PRUNE_CACHE_MUTATION_DIR/inventory.json"
+    exit $?
+fi
+exec "$PRUNE_CACHE_REAL_PYTHON" "$@"
+SH
+    chmod +x "$TEST_TMPDIR/bin/python3"
+    exec_run env PATH="$TEST_TMPDIR/bin:$PATH" PRUNE_CACHE_REAL_PYTHON="$real_python" \
+        PRUNE_CACHE_MUTATION_DIR="$TEST_TMPDIR" PRUNE_CACHE_MUTATION_KIND="$kind" \
+        PRUNE_CACHE_MUTATION_TARGET="$candidate" PRUNE_CACHE_MUTATION_CHECKPOINT="$checkpoint" \
+        "$DSR_CMD" --json --dry-run prune --max-age 30 --keep-last 0 --force
+    [[ -f "$TEST_TMPDIR/mutated" ]] || problems+=("fixture never changed the inventoried protection evidence")
+    [[ "$(exec_status)" -eq 1 && -f "$candidate/nested/payload" ]] || problems+=("changed evidence did not produce a retained partial result")
+    prune_reported_cache_retention "$candidate" protection_unavailable || problems+=("candidate reused stale protection observations")
+    ! prune_reported_path "$candidate" || problems+=("changed candidate was still selected")
+    if [[ "$kind" == marker ]]; then
+        prune_reported_path "$ordinary" || problems+=("candidate-local change blocked unrelated cache")
+    else
+        prune_reported_cache_retention "$ordinary" protection_unavailable || problems+=("changed checkpoint custody was not rechecked for the next candidate")
+    fi
+    prune_cache_schema_valid || problems+=("public response violates its JSON schemas")
+    prune_case_result "cache cleanup rechecks $kind evidence before admitting removal" "${problems[@]}"
+    harness_teardown
+}
+
+run_cache_custody_prune_tests() {
+    if ! command -v python3 &>/dev/null ||
+       ! python3 -c 'from jsonschema import Draft202012Validator, FormatChecker' >/dev/null 2>&1; then
+        ((TESTS_RUN++))
+        skip "Python jsonschema required for cache custody response validation"
+        return 0
+    fi
+    echo ""
+    echo "Ordinary Cache Source Custody Tests:"
+    local location
+    for location in context history latest reverse-root owner-parent; do
+        test_prune_cache_source_custody "$location"
+    done
+    test_prune_cache_markers subtree
+    test_prune_cache_markers ancestor
+    for location in malformed linked namespace-link incomplete-history; do
+        test_prune_cache_unavailable_custody "$location"
+    done
+    test_prune_cache_unreadable_candidate
+    test_prune_cache_removal_boundary
+    test_prune_cache_inventory_change marker
+    test_prune_cache_inventory_change checkpoint
 }
 
 # ============================================================================
@@ -2246,8 +2566,8 @@ echo "=== E2E: dsr prune Tests ==="
 echo ""
 
 case "${1:-}" in
-    ""|--snapshot-only|--snapshot-race-only|--snapshot-boundary-only|--snapshot-latest-only) ;;
-    *) echo "Usage: $0 [--snapshot-only|--snapshot-race-only|--snapshot-boundary-only|--snapshot-latest-only]" >&2; exit 2 ;;
+    ""|--cache-custody-only|--snapshot-only|--snapshot-race-only|--snapshot-boundary-only|--snapshot-latest-only) ;;
+    *) echo "Usage: $0 [--cache-custody-only|--snapshot-only|--snapshot-race-only|--snapshot-boundary-only|--snapshot-latest-only]" >&2; exit 2 ;;
 esac
 
 if [[ -z "${1:-}" ]]; then
@@ -2307,7 +2627,13 @@ echo "Stream Separation Tests:"
 test_prune_stream_separation
 fi
 
-if [[ "${1:-}" == --snapshot-race-only ]]; then
+if [[ -z "${1:-}" || "${1:-}" == --cache-custody-only ]]; then
+    run_cache_custody_prune_tests
+fi
+
+if [[ "${1:-}" == --cache-custody-only ]]; then
+    :
+elif [[ "${1:-}" == --snapshot-race-only ]]; then
     test_prune_snapshots_descendant_move
 elif [[ "${1:-}" == --snapshot-boundary-only ]]; then
     test_prune_snapshots_nested_custody

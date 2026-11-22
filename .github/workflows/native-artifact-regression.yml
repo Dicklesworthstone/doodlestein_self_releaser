@@ -369,6 +369,10 @@ jobs:
         run: |
           set -euo pipefail
           bash -n scripts/tests/e2e_prune.sh
+          deadline=$(command -v timeout || command -v gtimeout)
+          python3 -m venv "$RUNNER_TEMP/prune-schema-env"
+          "$RUNNER_TEMP/prune-schema-env/bin/pip" install 'jsonschema==4.25.1'
+          PATH="$RUNNER_TEMP/prune-schema-env/bin:$PATH" "$deadline" 120 bash scripts/tests/e2e_prune.sh --cache-custody-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/cache-source-custody.log"
           bash scripts/tests/test_act_orchestration.sh --snapshot-owners-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/snapshot-ownership.log"
           bash scripts/tests/e2e_prune.sh --snapshot-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/snapshot-retirement.log"
           test -z "$(git status --porcelain)"
