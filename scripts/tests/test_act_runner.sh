@@ -1061,6 +1061,32 @@ for label, configuration, event_name, expected_payload in configured_cases:
     check(label + ' disables ambient input files', launch is not None and
           launch['argv'][launch['argv'].index('--input-file') + 1] == '/dev/null')
 
+for label in ('managed-push', 'managed-release', 'managed-dispatch'):
+    plan = plans[label]
+    result, launch, _ = invoke(label + '-source-context',
+        [str(source), 'workflow.yml', 'build', plan['event'], 'v1.2.3',
+         '--env', 'SHA_REF=' + 'b' * 40, '--env', 'GITHUB_SHA=' + 'c' * 40], plan=plan,
+        ambient_vars={'_ACT_WORKFLOW_EVENT_SOURCE_SHA': 'a' * 40})
+    check(label + ' keeps admitted SHA after caller environment overrides',
+          result.returncode == 0 and launch is not None and
+          launch['environment'].get('SHA_REF') == 'a' * 40 and
+          launch['environment'].get('GITHUB_SHA') == 'a' * 40)
+
+result, launch, directory = invoke('invalid-admitted-source-sha',
+    [str(source), 'workflow.yml', 'build', 'push', 'v1.2.3'], plan=plans['managed-push'],
+    ambient_vars={'_ACT_WORKFLOW_EVENT_SOURCE_SHA': 'not-a-commit'})
+check('invalid admitted source SHA refuses before execution or storage',
+      result.returncode == 4 and launch is None and not (directory / 'artifacts').exists())
+
+result, launch, _ = invoke('unmanaged-source-context',
+    [str(source), 'workflow.yml', 'build', 'push', 'v1.2.3',
+     '--env', 'SHA_REF=' + 'b' * 40, '--env', 'GITHUB_SHA=' + 'c' * 40],
+    ambient_vars={'_ACT_WORKFLOW_EVENT_SOURCE_SHA': 'a' * 40})
+check('unmanaged library calls retain caller-owned source environment',
+      result.returncode == 0 and launch is not None and
+      launch['environment'].get('SHA_REF') == 'b' * 40 and
+      launch['environment'].get('GITHUB_SHA') == 'c' * 40)
+
 invalid_configurations = [
     [], {'workflow_event': None}, {'workflow_event': 'pull_request'},
     {'workflow_event_payload': None}, {'workflow_event_payload': []},
@@ -1169,6 +1195,39 @@ jobs:
           payload.exists() and json.loads(payload.read_text()).get('ref') == 'refs/tags/v1.2.3')
     if result.returncode or not marker.exists():
         print((directory / 'stderr').read_text(), file=sys.stderr)
+
+    sha = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
+    (source / 'source-context.yml').write_text('''name: Actual managed source context
+on: [push, release, workflow_dispatch]
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          printf '%s|%s|%s|%s\\n' '${{ github.sha }}' "$GITHUB_SHA" '${{ github.ref }}' "$GITHUB_REF" > "$DSR_EVENT_RESULT"
+''')
+    env_file = root / 'foreign.env'
+    env_file.write_text('SHA_REF=' + 'b' * 40 + '\nGITHUB_SHA=' + 'c' * 40 + '\nGITHUB_REF=refs/heads/foreign\n')
+    for name, event, extra, ambient, bound in (
+        ('caller', 'release', ['--env', 'SHA_REF=' + 'b' * 40, '--env', 'GITHUB_SHA=' + 'c' * 40,
+                              '--env', 'GITHUB_REF=refs/heads/foreign'], '', {'_ACT_WORKFLOW_EVENT_SOURCE_SHA': sha}),
+        ('actrc', 'workflow_dispatch', [], '--env SHA_REF=' + 'b' * 40 + '\n--env GITHUB_SHA=' + 'c' * 40 + '\n', {}),
+        ('envfile', 'push', ['--env-file', str(env_file)], '', {})):
+        marker = source / ('source-context-' + name + '.txt')
+        plan = plans[{'release': 'managed-release', 'workflow_dispatch': 'managed-dispatch', 'push': 'managed-push'}[event]]
+        result, _, directory = invoke('actual-source-' + name,
+            [str(source), 'source-context.yml', 'source', event, 'v1.2.3',
+             '-P', 'ubuntu-latest=-self-hosted', '--action-offline-mode',
+             '--artifact-server-addr', '127.0.0.1', '--artifact-server-port', '0',
+             '--cache-server-addr', '127.0.0.1', '--env', 'DSR_EVENT_RESULT=' + str(marker)] + extra,
+            actual=True, plan=plan, ambient=ambient, ambient_vars=bound)
+        check('actual ' + name + ' overrides cannot change managed SHA or tag contexts',
+              result.returncode == 0 and marker.exists() and
+              marker.read_text() == sha + '|' + sha + '|refs/tags/v1.2.3|refs/tags/v1.2.3\n')
+        check('actual ' + name + ' source binding preserves the admitted event receipt',
+              result.returncode == 0 and json.loads(result.stdout).get('workflow_event') == plan)
+        if result.returncode or not marker.exists():
+            print((directory / 'stderr').read_text(), file=sys.stderr)
 
 print('Workflow tag event results: %d checks, %d failures' % (checks, len(failures)), flush=True)
 raise SystemExit(bool(failures))

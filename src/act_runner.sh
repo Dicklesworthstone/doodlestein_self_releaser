@@ -3295,7 +3295,7 @@ act_run_workflow() {
     if [[ $# -gt 5 ]]; then shift 5; else set --; fi
     local extra_args=("$@")
 
-    local event_plan="${_ACT_WORKFLOW_EVENT_PLAN:-null}" event_payload="" event_file=""
+    local event_plan="${_ACT_WORKFLOW_EVENT_PLAN:-null}" event_payload="" event_file="" event_source_sha=""
     if [[ "$event_plan" != null ]]; then
         local normalized_event
         normalized_event=$(jq -ce '
@@ -3321,6 +3321,18 @@ act_run_workflow() {
         done
         _act_ambient_argument_admission event || return 4
         event_payload=$(jq -cS .payload <<< "$event_plan") || return 4
+        # The coordinator's source identity survives ordinary/native argument
+        # separation below. Direct managed invocations use their local HEAD;
+        # a Git-less library fixture retains its empty source context.
+        event_source_sha="${_ACT_WORKFLOW_EVENT_SOURCE_SHA:-}"
+        if [[ -z "$event_source_sha" ]]; then
+            event_source_sha=$(_act_strict_git -C "$repo_path" rev-parse --verify 'HEAD^{commit}' 2>/dev/null) || event_source_sha=""
+        fi
+        if [[ -n "$event_source_sha" && ( ! "$event_source_sha" =~ ^[0-9a-fA-F]{40}$ ||
+              "$event_source_sha" == 0000000000000000000000000000000000000000 ) ]]; then
+            _log_error "Managed workflow source requires an admitted commit SHA"
+            return 4
+        fi
     fi
 
     local tag="" argument
@@ -3461,6 +3473,10 @@ act_run_workflow() {
         # Disable act's implicit .input file: it is not part of the frozen
         # recipe. Explicit and ambient --input overrides were refused above.
         act_cmd+=(--input-file /dev/null --eventpath "$event_file")
+        # act constructs github.sha from SHA_REF, then GITHUB_SHA from that
+        # context. Final explicit values override CLI/actrc flags and env
+        # files, including an empty context when no Git identity is available.
+        act_cmd+=(--env "SHA_REF=$event_source_sha" --env "GITHUB_SHA=$event_source_sha")
     fi
 
     local isolated_home=""
@@ -16813,6 +16829,7 @@ _act_build_orchestration_target() {
     local _ACT_WORKFLOW_SOURCE_PLAN="${12:-}" _ACT_WORKFLOW_SOURCE_TOOL="$tool_name"
     local _ACT_EXPECTED_REPO_CONFIG_SHA256="${13:-}"
     local _ACT_WORKFLOW_EVENT_PLAN="${14:-null}"
+    local _ACT_WORKFLOW_EVENT_SOURCE_SHA="$release_git_sha"
     if [[ -n "$_ACT_EXPECTED_REPO_CONFIG_SHA256" ]] &&
        ! _act_repo_config_matches "$tool_name" "$_ACT_EXPECTED_REPO_CONFIG_SHA256"; then
         return 4
