@@ -10187,6 +10187,26 @@ EOF
     log_info "Releasing $tool_name $version to $repo"
     log_set_tool "$tool_name"
 
+    _release_interrupted_admission() {
+        local admission_status="$1" admission_stage="${2:-verification}"
+        _gh_operation_interrupted "$admission_status" || return 1
+        log_error "Release $admission_stage stopped (exit $admission_status)"
+        if $JSON_MODE; then
+            json_envelope "release" "error" 5 "$(jq -nc --arg repo "$repo" --arg tag "$tag" --arg version "$version" \
+                --argjson code "$admission_status" --arg stage "$admission_stage" \
+                --arg response "${create_response:-}" \
+                --arg custody "${create_response_dir:-${ordinary_custody_dir:-}}" \
+                --arg staging_receipt "${ordinary_intent:-}" '
+                {repo:$repo,version:$version,tag:$tag,stage:$stage,verification:"interrupted",
+                 error:("Release " + $stage + " interrupted"),
+                 interruption:{stage:$stage,exit_code:$code,outcome:"unconfirmed"}} |
+                if $custody == "" then . else . + {creation_custody_dir:$custody} end |
+                if $response == "" then . else . + {create_response:$response,finalization_tmpdir:$custody} end |
+                if $staging_receipt == "" then . else . + {staging_receipt:$staging_receipt} end')"
+        fi
+        return 0
+    }
+
     # Verify tag exists (if requested or local_path available)
     if $verify_tag || [[ -n "$local_path" && -d "$local_path" ]]; then
         if [[ -n "$local_path" && -d "$local_path" ]]; then
@@ -10452,22 +10472,6 @@ EOF
     local release_contract_metadata_json='null'
     local release_contract_git_sha=""
     local release_contract_tag_ruleset_receipt='null'
-    _release_interrupted_admission() {
-        local admission_status="$1" admission_stage="${2:-verification}"
-        _gh_operation_interrupted "$admission_status" || return 1
-        log_error "Strict release $admission_stage stopped (exit $admission_status)"
-        if $JSON_MODE; then
-            json_envelope "release" "error" 5 "$(jq -nc --arg repo "$repo" --arg tag "$tag" --arg version "$version" \
-                --argjson code "$admission_status" --arg stage "$admission_stage" \
-                --arg response "${create_response:-}" --arg custody "${create_response_dir:-}" '
-                {repo:$repo,version:$version,tag:$tag,stage:$stage,verification:"interrupted",
-                 error:("Strict release " + $stage + " interrupted"),
-                 interruption:{stage:$stage,exit_code:$code,outcome:"unconfirmed"}} |
-                if $custody == "" then . else . + {creation_custody_dir:$custody} end |
-                if $response == "" then . else . + {create_response:$response,finalization_tmpdir:$custody} end')"
-        fi
-        return 0
-    }
     if $release_contract_enabled; then
         local contract_sidecar_mode="create"
         $DRY_RUN && contract_sidecar_mode="plan"
@@ -11439,8 +11443,12 @@ EOF
 
     if ! $release_contract_enabled; then
         if $verify_tag && [[ -z "$release_tag_sha" ]]; then
-            if ! release_tag_sha=$(gh_resolve_tag_sha "$repo" "$tag") ||
-               [[ ! "$release_tag_sha" =~ ^[0-9a-f]{40}$ || "$release_tag_sha" =~ ^0{40}$ ]]; then
+            if release_tag_sha=$(gh_resolve_tag_sha "$repo" "$tag"); then :; else
+                if _release_interrupted_admission "$?"; then return 5; fi
+                log_error "--verify-tag requires an observable source commit for $repo $tag"
+                return 7
+            fi
+            if [[ ! "$release_tag_sha" =~ ^[0-9a-f]{40}$ || "$release_tag_sha" =~ ^0{40}$ ]]; then
                 log_error "--verify-tag requires an observable source commit for $repo $tag"
                 return 7
             fi
@@ -11448,8 +11456,11 @@ EOF
         # Refuse a conflicting/unknown source before even creating a draft.
         # Resume first recovers original custody below, so a retained draft
         # may still prove that its not-yet-created tag belongs to this intent.
-        if ! $resume && ! _release_ordinary_source_matches true; then
-            return 7
+        if ! $resume; then
+            if _release_ordinary_source_matches true; then :; else
+                if _release_interrupted_admission "$?"; then return 5; fi
+                return 7
+            fi
         fi
     fi
 
@@ -11533,8 +11544,12 @@ EOF
         # Authenticated collection reads include drafts. A failed lookup is
         # unknown, not permission to create another release or trust a journal.
         local resume_scan
-        if ! resume_scan=$(_release_contract_scan_release_by_tag "$repo" "$tag") ||
-           ! release_json=$(jq -ces '
+        if resume_scan=$(_release_contract_scan_release_by_tag "$repo" "$tag"); then :; else
+            if _release_interrupted_admission "$?"; then return 5; fi
+            log_error "Cannot resume without one observable release for $repo $tag"
+            return 7
+        fi
+        if ! release_json=$(jq -ces '
                if length == 1 and .[0].count == 1 and
                   (.[0].release | type == "object")
                then .[0].release else error("release not found or ambiguous") end
@@ -11642,7 +11657,14 @@ EOF
             fi
         else
             # Check if release already exists
-            release_json=$(gh_api "repos/$repo/releases/tags/$tag" --no-cache 2>/dev/null)
+            # A complete-looking body is not a successful observation when
+            # its transport was interrupted or failed after emitting bytes.
+            # Never turn that uncertain read into an upload or publication.
+            if release_json=$(gh_api "repos/$repo/releases/tags/$tag" --no-cache 2>/dev/null); then :; else
+                if _release_interrupted_admission "$?"; then return 5; fi
+                log_error "Could not observe the existing release after failed creation"
+                return 7
+            fi
             if [[ -n "$release_json" ]] && echo "$release_json" | jq -e '.id' &>/dev/null; then
                 log_info "Release $tag already exists, using existing release"
             else
@@ -11733,7 +11755,10 @@ EOF
         # --resume, to the commit selected by the manifest/local tag/intent.
         local ordinary_allow_absent_tag=false
         if $ordinary_owned && $draft; then ordinary_allow_absent_tag=true; fi
-        _release_ordinary_source_matches "$ordinary_allow_absent_tag" || return 7
+        if _release_ordinary_source_matches "$ordinary_allow_absent_tag"; then :; else
+            if _release_interrupted_admission "$?"; then return 5; fi
+            return 7
+        fi
     fi
 
     if $release_contract_enabled; then

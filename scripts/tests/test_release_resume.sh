@@ -75,6 +75,11 @@ _release_contract_create_nonce() { printf '%064d\n' 1; }
 _release_contract_preflight() { printf 'STRICT-PREFLIGHT\n' >> "$CALLS"; return 4; }
 gh_resolve_tag_sha() {
     printf 'TAG-RESOLVE %s %s\n' "$1" "$2" >> "$CALLS"
+    if early_fixture_should_stop source; then
+        if $EARLY_STOP_BODY; then printf '%s\n' "${STAGED_SOURCE_SHA:-0000000000000000000000000000000000000001}"; fi
+        early_fixture_stop source
+        return $?
+    fi
     if [[ "${LATE_STOP_PHASE:-}" == source && "${LATE_STOP_STATUS:-0}" != 0 && ! -e "$CASE/late-stop" ]] &&
        late_fixture_uploads_verified; then
         late_fixture_stop verification "$LATE_STOP_STATUS"
@@ -143,6 +148,7 @@ setup() {
     UPLOAD_STOP_STATUS=0 UPLOAD_STOP_COMMITTED=false
     CREATE_FAIL=true FINAL_DRIFT=false VISIBILITY_DRIFT=false FAIL_NAME=""
     CREATE_STOP_STATUS=0
+    EARLY_STOP_BOUNDARY="" EARLY_STOP_STATUS=0 EARLY_STOP_BODY=false EARLY_STOP_OCCURRENCE=1
     LOST_CREATE_RESPONSE=false PUBLISH_FAIL=false LOST_PUBLISH_RESPONSE=false
     PUBLISH_STOP_STATUS=0 PUBLISH_STOP_COMMITTED=false
     RESTORE_STOP_STATUS=0 RESTORE_STOP_COMMITTED=false
@@ -155,6 +161,25 @@ setup() {
     API_ASSET_LABEL_SIZE=0 API_INVENTORY_FAIL_PAGE=0
     export DSR_RELEASE_STATE_RETRY_DELAY_SECONDS=0
     export GH_MAX_RETRIES=2 GH_RETRY_DELAY=0
+}
+
+# Admission faults can return complete-looking bytes before their nonzero
+# status. Only the network boundary is adapted: the release caller must honor
+# both halves of that result before it can upload or dispatch anything.
+early_fixture_should_stop() {
+    local boundary="$1" count=0
+    [[ "${EARLY_STOP_BOUNDARY:-}" == "$boundary" && "${EARLY_STOP_STATUS:-0}" != 0 &&
+       ! -e "$CASE/early-stop" ]] || return 1
+    if [[ -f "$CASE/early-count" ]]; then count=$(< "$CASE/early-count"); fi
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$CASE/early-count" || return 1
+    [[ "$count" == "$EARLY_STOP_OCCURRENCE" ]]
+}
+
+early_fixture_stop() {
+    : > "$CASE/early-stop" || return 4
+    printf 'EARLY-STOP %s %s\n' "$1" "$EARLY_STOP_STATUS" >> "$CALLS"
+    return "$EARLY_STOP_STATUS"
 }
 
 remote_put() {
@@ -215,6 +240,11 @@ manifest_alias() {
 
 _release_contract_scan_release_by_tag() {
     printf 'SCAN %s %s\n' "$1" "$2" >> "$CALLS"
+    if early_fixture_should_stop scan; then
+        if $EARLY_STOP_BODY; then jq -nc --slurpfile release "$CASE/release.json" '{count:1,release:$release[0]}'; fi
+        early_fixture_stop scan
+        return $?
+    fi
     $LOOKUP_FAIL && return 8
     jq -nc --slurpfile release "$CASE/release.json" '{count:1,release:$release[0]}'
 }
@@ -264,6 +294,12 @@ gh_api() {
             *) shift ;;
         esac
     done
+    if [[ "$method" == GET && "$endpoint" == repos/owner/repo/releases/tags/v1.2.3 ]] &&
+       early_fixture_should_stop lookup; then
+        if $EARLY_STOP_BODY; then cat "$CASE/release.json"; fi
+        early_fixture_stop lookup
+        return $?
+    fi
     if [[ "$method" == PATCH ]]; then
         [[ "$endpoint" == repos/owner/repo/releases/9 ]] || return 8
         if [[ "$data" == '{"draft":false}' ]]; then
@@ -352,6 +388,11 @@ gh_api() {
             ;;
         repos/owner/repo/git/matching-refs/tags/v1.2.3)
             printf 'TAG-ABSENCE\n' >> "$CALLS"
+            if early_fixture_should_stop absence; then
+                if $EARLY_STOP_BODY; then printf '[]\n'; fi
+                early_fixture_stop absence
+                return $?
+            fi
             case "$STAGED_REMOTE_MODE" in
                 absent-unavailable) return 8 ;;
                 absent-malformed) printf '[{"ref":"refs/tags/v1.2.3-rc.1","object":{"sha":"short"}}]\n' ;;
@@ -664,6 +705,136 @@ test_release_auth_healthy_and_token_fallback_still_publish() {
         printf '  preserved successful %s publication\n' "$phase"
     done
 }
+
+# Exercise the first remote observations separately from upload/finalization
+# interruption: a JSON-looking response with a failed status grants no release
+# authority. Retained fixtures make forbidden requests and mutations visible.
+early_admission_case() {
+    local scenario="$1" stop_status="$2" response_body="$3" expected_status="${4:-5}"
+    local identity_before identity_after original_intent="" original_response="" boundary
+    local expected_stage=verification
+    local -a options=() selected_inputs=() retained_custody=()
+    case "$scenario" in
+        source-before|source-after|absence)
+            manifest_source_setup "early_${scenario}_${stop_status}_${response_body}" || return 1
+            ;;
+        *) setup "early_${scenario}_${stop_status}_${response_body}" || return 1 ;;
+    esac
+    case "$scenario" in
+        lookup) boundary=lookup ;;
+        scan) boundary=scan; options=(--resume) ;;
+        origin)
+            boundary=origin expected_stage=origin_tag
+            command git init -q "$CASE/checkout" &&
+                command git -C "$CASE/checkout" -c user.name=fixture -c user.email=fixture@example.invalid \
+                    commit -q --allow-empty -m tagged &&
+                command git -C "$CASE/checkout" tag v1.2.3 || return 1
+            STAGED_SOURCE_SHA=$(command git -C "$CASE/checkout" rev-parse HEAD) || return 1
+            act_get_local_path() { printf '%s\n' "$CASE/checkout"; }
+            git_ops_tag_exists() { command git -C "$1" rev-parse -q --verify "refs/tags/$2" >/dev/null; }
+            git_ops_tag_sha() { command git -C "$1" rev-parse --verify "$2^{commit}"; }
+            git() {
+                if [[ "${1:-}" == -C && "${2:-}" == "$CASE/checkout" && "${3:-}" == ls-remote ]]; then
+                    printf 'ORIGIN-LOOKUP\n' >> "$CALLS"
+                    if early_fixture_should_stop origin; then
+                        if $EARLY_STOP_BODY; then printf '%s\trefs/tags/v1.2.3\n' "$STAGED_SOURCE_SHA"; fi
+                        early_fixture_stop origin
+                        return $?
+                    fi
+                    printf '%s\trefs/tags/v1.2.3\n' "$STAGED_SOURCE_SHA"
+                    return 0
+                fi
+                command git "$@"
+            }
+            ;;
+        verify-tag) boundary=source; options=(--verify-tag) ;;
+        source-before) boundary=source ;;
+        source-after) boundary=source; EARLY_STOP_OCCURRENCE=2 ;;
+        absence) boundary=absence; STAGED_REMOTE_MODE=absent-empty ;;
+        *) return 1 ;;
+    esac
+    EARLY_STOP_BOUNDARY="$boundary" EARLY_STOP_STATUS="$stop_status" EARLY_STOP_BODY="$response_body"
+    selected_inputs=("$CASE/artifacts/payload.bin")
+    if [[ -f "$CASE/artifacts/tool-v1.2.3-manifest.json" ]]; then
+        selected_inputs+=("$CASE/artifacts/tool-v1.2.3-manifest.json")
+    fi
+    identity_before=$(release_custody_inventory "${selected_inputs[@]}") || return 1
+    cp "$CASE/inventory.json" "$CASE/inventory.before" || return 1
+    run_release ${options[@]+"${options[@]}"} --verify-upgrade
+    cp "$CASE/stdout" "$CASE/stopped.stdout" && cp "$CASE/stderr" "$CASE/stopped.stderr" &&
+        cp "$CALLS" "$CASE/stopped.calls" || return 1
+    [[ $STATUS -eq $expected_status && -f "$CASE/early-stop" &&
+       "$(tail -n 1 "$CALLS")" == "EARLY-STOP $boundary $stop_status" ]] || {
+        printf 'Admission %s/%s returned %s; expected %s with no request after EARLY-STOP\n' \
+            "$scenario" "$stop_status" "$STATUS" "$expected_status" >&2
+        return 1
+    }
+    ! grep -Eq '^POST |^PUBLISH|^RESTORE-DRAFT|^DISPATCH|^UPGRADE' "$CALLS" || return 1
+    cmp -s "$CASE/inventory.before" "$CASE/inventory.json" || return 1
+    identity_after=$(release_custody_inventory "${selected_inputs[@]}") || return 1
+    [[ "$identity_after" == "$identity_before" ]] || return 1
+    if [[ "$scenario" == origin ]]; then
+        [[ ! -e "$DSR_STATE_DIR/builds" &&
+           -z "$(find "$DSR_STATE_DIR/releases" -mindepth 1 -print -quit)" ]] || return 1
+    fi
+    release_custody_try_acquire v1.2.3 && release_custody_try_acquire 1.2.3 || return 1
+    if [[ "$expected_status" == 5 ]]; then
+        jq -es --argjson code "$stop_status" --arg stage "$expected_stage" '
+            length==1 and (.[0]|.command=="release" and .status=="error" and .exit_code==5 and
+                .details.verification=="interrupted" and
+                .details.interruption=={stage:$stage,exit_code:$code,outcome:"unconfirmed"})
+        ' "$CASE/stdout" >/dev/null || return 1
+    else
+        # A transient incomplete lookup is still a refusal, but it is not a
+        # cancellation. Complete-looking bytes cannot turn either into success.
+        ! jq -e '.status=="success" or .exit_code==0 or .details.verification=="interrupted"' \
+            "$CASE/stdout" >/dev/null 2>&1 || return 1
+    fi
+    if [[ "$scenario" == source-after ]]; then
+        [[ $(grep -c '^CREATE ' "$CALLS") -eq 1 ]] || return 1
+        jq -e '.draft==true and .assets==[]' "$CASE/release.json" >/dev/null || return 1
+        retained_custody=("$DSR_STATE_DIR"/releases/dsr-publication.*/intent.json)
+        [[ ${#retained_custody[@]} -eq 1 && -f "${retained_custody[0]}" ]] || return 1
+        original_intent=${retained_custody[0]}
+        retained_custody=("${original_intent%/*}"/dsr-api-response.????????)
+        [[ ${#retained_custody[@]} -eq 1 && -f "${retained_custody[0]}" ]] || return 1
+        original_response=${retained_custody[0]}
+        identity_before=$(release_custody_inventory "${selected_inputs[@]}" "$original_intent" "$original_response") || return 1
+    elif [[ "$scenario" != lookup ]]; then
+        ! grep -q '^CREATE ' "$CALLS" || return 1
+    fi
+
+    # An explicit retry re-observes the same release. It must still complete
+    # after the refusal without another create, replacing payload bytes, or
+    # acquiring publication authority from a failed observation.
+    EARLY_STOP_STATUS=0 STAGED_REMOTE_MODE=valid
+    : > "$CALLS"
+    run_release --resume --verify-upgrade
+    [[ $STATUS -eq 0 ]] && ! grep -q '^CREATE ' "$CALLS" &&
+        grep -Fxq 'POST payload.bin' "$CALLS" && grep -Fxq DISPATCH "$CALLS" &&
+        grep -Fxq UPGRADE "$CALLS" || return 1
+    jq -es 'length==1 and (.[0]|.status=="success" and .exit_code==0 and
+        .details.verification=="ok" and .details.draft==false)' "$CASE/stdout" >/dev/null || return 1
+    if [[ -n "$original_intent" ]]; then
+        identity_after=$(release_custody_inventory "${selected_inputs[@]}" "$original_intent" "$original_response") || return 1
+        [[ "$identity_after" == "$identity_before" ]] && grep -Fxq PUBLISH "$CALLS" || return 1
+    else
+        identity_after=$(release_custody_inventory "${selected_inputs[@]}") || return 1
+        [[ "$identity_after" == "$identity_before" ]] && ! grep -q '^PUBLISH$' "$CALLS" || return 1
+    fi
+    return 0
+}
+
+test_ordinary_admission_cancelled_lookup_with_body() { early_admission_case lookup 130 true; }
+test_ordinary_admission_cancelled_lookup_without_body() { early_admission_case lookup 130 false; }
+test_ordinary_admission_timed_out_lookup_with_body() { early_admission_case lookup 124 true; }
+test_ordinary_admission_incomplete_lookup_with_body() { early_admission_case lookup 8 true 7; }
+test_ordinary_admission_cancelled_resume_scan() { early_admission_case scan 5 true; }
+test_ordinary_admission_cancelled_origin_read() { early_admission_case origin 130 true; }
+test_ordinary_admission_cancelled_verify_tag() { early_admission_case verify-tag 130 true; }
+test_ordinary_admission_cancelled_source_before_create() { early_admission_case source-before 130 true; }
+test_ordinary_admission_cancelled_absence_probe() { early_admission_case absence 124 true; }
+test_ordinary_admission_cancelled_source_after_create() { early_admission_case source-after 130 true; }
 
 # Keep the output old without regenerating checksum files during publication.
 # The actual prune command must be able to select it by age when no lease is
@@ -3895,6 +4066,12 @@ for test in test_release_auth_cancellation_never_falls_back_or_publishes \
     test_release_auth_invalid_deadline_never_launches_credentials \
     test_release_auth_refusal_never_tries_another_transport \
     test_release_auth_healthy_and_token_fallback_still_publish \
+    test_ordinary_admission_cancelled_lookup_with_body test_ordinary_admission_cancelled_lookup_without_body \
+    test_ordinary_admission_timed_out_lookup_with_body test_ordinary_admission_incomplete_lookup_with_body \
+    test_ordinary_admission_cancelled_resume_scan test_ordinary_admission_cancelled_origin_read \
+    test_ordinary_admission_cancelled_verify_tag \
+    test_ordinary_admission_cancelled_source_before_create test_ordinary_admission_cancelled_absence_probe \
+    test_ordinary_admission_cancelled_source_after_create \
     test_release_keeps_artifacts_during_publication \
     test_release_refuses_busy_canonical_custody test_release_refuses_busy_bare_custody \
     test_release_refuses_inherited_worker_custody test_release_caller_flag_cannot_bypass_custody \

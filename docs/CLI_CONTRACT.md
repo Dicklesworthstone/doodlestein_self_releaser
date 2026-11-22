@@ -1615,6 +1615,13 @@ deadline stops the release with exit `5`. Ordinary publication also stops on
 interruption during final verification, publication, or restoration of a draft.
 This includes interrupted release metadata, asset inventory, source-tag reads,
 and downloads used to verify existing assets.
+The same rule applies before creation and upload: explicit tag verification,
+source and absent-tag checks, `--resume` discovery, and the existing-release
+lookup after an ordinary create conflict all require a successful observation.
+A failed lookup cannot authorize uploads merely because it emitted a complete
+JSON response before returning nonzero. Ordinary lookup failures keep their
+release-failure status; cancellation and deadline expiry retain their original
+adapter status in the interruption result.
 The stopped invocation performs no later upload, reconciliation, promotion,
 draft restoration, or dispatch. JSON output records
 `details.verification: "interrupted"` and an `interruption` object containing
