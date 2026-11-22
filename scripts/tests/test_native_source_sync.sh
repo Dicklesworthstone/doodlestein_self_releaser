@@ -8,6 +8,8 @@
 # this mode never claims a Darwin compiler or artifact execution.
 # Use --git-selection-only for genuine Git/rsync selection without a compiler.
 # Use --source-transport-only for bounded admission and actual rsync/tar stdin.
+# Use --source-interruption-only for actual tar/Git staging across siblings and
+# hosts: cancellation stops later writes and retains completed source receipts.
 # Use --ownership-only for actual rsync/tar/Git source ownership checks. Running
 # as root with a full UID map also covers UID 501 and a non-root SSH receiver.
 # Use --windows-source-links-only for real Git archives and PowerShell regular
@@ -46,6 +48,368 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 ROOT="${DSR_TEST_ROOT:-$ROOT}"
 
+test_source_sync_interruption() (
+    local dependency work
+    for dependency in bash python3 git jq yq tar ps; do
+        command -v "$dependency" >/dev/null 2>&1 || {
+            printf 'SKIP: source interruption requires %s\n' "$dependency"
+            return 77
+        }
+    done
+    work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-source-interruption.XXXXXXXX") || return 1
+    printf 'Source interruption evidence: %s\n' "$work"
+    python3 -I - "${DSR_TEST_ACT_RUNNER:-$ROOT/src/act_runner.sh}" "$work" "$ROOT" <<'PY'
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+module, work, root = (Path(value).resolve() for value in sys.argv[1:])
+checks, failures = 0, []
+
+
+def check(label, condition):
+    global checks
+    checks += 1
+    print(('PASS ' if condition else 'FAIL ') + label, flush=True)
+    if not condition:
+        failures.append(label)
+
+
+bin_dir = work / 'bin'
+bin_dir.mkdir()
+ssh = bin_dir / 'ssh'
+# The service boundary runs actual receiver shell programs and tar extraction.
+# Only the selected operation returns the transport's native exit status.
+ssh.write_text(r'''#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+null_input = False
+while args and args[0].startswith('-'):
+    option = args.pop(0)
+    if option in ('-o', '-p', '-l'):
+        args.pop(0)
+    elif option == '-n':
+        null_input = True
+    elif option not in ('-T', '-q'):
+        raise SystemExit(97)
+if len(args) < 2:
+    raise SystemExit(97)
+host, command = args[0], ' '.join(args[1:])
+if 'tar --no-same-owner -xzf -' in command:
+    phase = 'transfer'
+elif 'perl -pi' in command:
+    phase = 'patch'
+elif 'cat >' in command and '.dsr-context-' in command:
+    phase = 'context_transfer'
+elif 'DSR_ORDINARY_GIT_CONTEXT' in command:
+    phase = 'context_restore'
+elif 'pwd -P' in command:
+    phase = 'prepare'
+else:
+    phase = 'strict'
+trace = Path(os.environ['DSR_STOP_TRACE'])
+previous = trace.read_text().splitlines() if trace.exists() else []
+with trace.open('a') as stream:
+    stream.write(json.dumps({'host': host, 'phase': phase, 'command': command}) + '\n')
+status = int(os.environ.get('DSR_STOP_STATUS', '0'))
+if status and (not os.environ.get('DSR_STOP_HOST') or host == os.environ['DSR_STOP_HOST']) and \
+        (not os.environ.get('DSR_STOP_PHASE') or phase == os.environ['DSR_STOP_PHASE']) and \
+        (not os.environ.get('DSR_STOP_PATH') or os.environ['DSR_STOP_PATH'] in command) and \
+        (not os.environ.get('DSR_STOP_NTH') or len(previous) + 1 == int(os.environ['DSR_STOP_NTH'])):
+    raise SystemExit(status)
+if null_input:
+    descriptor = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(descriptor, 0)
+    os.close(descriptor)
+os.execv('/bin/sh', ['/bin/sh', '-c', command])
+''')
+ssh.chmod(0o755)
+
+json_fault_bin = work / 'json-fault-bin'
+json_fault_bin.mkdir()
+jq = json_fault_bin / 'jq'
+jq.write_text('#!/usr/bin/env python3\nREAL_JQ = ' + repr(shutil.which('jq')) + '\n' + r'''
+import os, sys
+phase = os.environ.get('DSR_STOP_JSON_FAILURE', '')
+needle = '.status="interrupted" | .exit_code=$code' if phase == 'row' else '$interrupted_exit != 0'
+if phase and any(needle in argument for argument in sys.argv[1:]):
+    with open(os.environ['DSR_STOP_JSON_FAULT_MARKER'], 'w') as stream:
+        stream.write(phase + '\n')
+    sys.stderr.write('Injected source diagnostic serialization failure.\n')
+    raise SystemExit(74)
+os.execv(REAL_JQ, [REAL_JQ, *sys.argv[1:]])
+''')
+jq.chmod(0o755)
+
+source = work / 'source'
+source.mkdir()
+(source / 'payload.txt').write_text('Selected main source bytes.\n')
+subprocess.run(['git', '-C', str(source), 'init', '-q'], check=True)
+subprocess.run(['git', '-C', str(source), 'add', '.'], check=True)
+subprocess.run(['git', '-C', str(source), '-c', 'user.name=DSR Test',
+                '-c', 'user.email=dsr-test@example.invalid', 'commit', '-qm', 'Source stop fixture'], check=True)
+revision = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
+siblings = []
+for name in ('first', 'stopped', 'later'):
+    path = work / name
+    path.mkdir()
+    (path / 'payload.txt').write_text(f'Selected {name} source bytes.\n')
+    siblings.append({'local_path': str(path), 'relative_path': name, 'respect_gitignore': False})
+
+driver = work / 'driver.sh'
+driver.write_text(r'''#!/usr/bin/env bash
+set -uo pipefail
+module=$1 mode=$2 destination=$3
+if [[ "$mode" == public* ]]; then
+    export SCRIPT_DIR="$4" JSON_MODE=true DRY_RUN=false VERBOSE=false DSR_VERSION=fixture
+    for item in logging config build_state artifact_naming host_selector host_health git_ops packaging; do
+        source "$SCRIPT_DIR/src/$item.sh" || exit $?
+    done
+    declare -A _DSR_LOADED_MODULES=([packaging]=1 [artifact_naming]=1 [act_runner]=1)
+    source <(awk '/^(_dsr_require|cmd_build)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' \
+        "${DSR_TEST_COMMAND_FILE:-$SCRIPT_DIR/dsr}") || exit $?
+    source <(awk '/^json_envelope\(\) \{/{copy=1} copy{print} copy && /^# ====/{exit}' \
+        "${DSR_TEST_COMMAND_FILE:-$SCRIPT_DIR/dsr}") || exit $?
+    build_state_init || exit $?
+fi
+source "$module" || exit $?
+# Host health and SSH are service boundaries. Source selection, archives,
+# source receipts, Git export/import and source coordination run unchanged.
+host_health_is_ready() { return 0; }
+_act_is_local_host() { [[ "$1" == act ]]; }
+_act_is_windows_host() { return 1; }
+_act_get_ssh_destination() { printf '%s\n' "$1"; }
+# Deliberately qualify the supported real-tar fallback rather than depend on
+# an installed remote rsync server. Local frozen projections still use rsync.
+_act_has_rsync() { [[ "$1" == act ]]; }
+case "$mode" in
+    sibling) _act_sync_sibling_crates receiver "$destination/main" "$ACT_REPOS_DIR/demo.yaml" 3 ;;
+    hosts) act_sync_sources demo linux/amd64 linux/arm64 darwin/arm64 ;;
+    staged) act_sync_sources demo --stage-ordinary -- linux/amd64 linux/arm64 darwin/arm64 ;;
+    strict) _act_sync_strict_checkout receiver "$DSR_STOP_SOURCE" "$DSR_STOP_REVISION" \
+        "$destination/source" source.tar demo ;;
+    public*)
+        # A tripwire, never an accepted build result: the cancelled command
+        # must return before dispatch or compiler admission.
+        act_orchestrate_build() { printf 'unexpected dispatch\n' >> "$DSR_STOP_BACKEND"; return 97; }
+        selector_acquire_slot() { printf 'unexpected capacity\n' >> "$DSR_STOP_BACKEND"; return 97; }
+        if [[ "$mode" != public ]]; then
+            # These deliberately invalid transport receipts prove the public
+            # command cannot discard an authoritative cancellation status.
+            act_sync_sources() {
+                [[ "$mode" != public-malformed ]] || printf 'not a source receipt\n'
+                return "$DSR_STOP_STATUS"
+            }
+        fi
+        cmd_build demo --version 1.0.0 --output-dir "$destination/output"
+        ;;
+esac
+''')
+
+
+def prepare(name, *, language='go', sibling=False):
+    case = work / name
+    (case / 'config/repos.d').mkdir(parents=True)
+    destination = case / 'remote'
+    if sibling:
+        (destination / 'main').mkdir(parents=True)
+        (destination / 'main/Cargo.toml').write_text(
+            '[patch.crates-io]\n' + ''.join(f'{item["relative_path"]} = {{ path = "{item["local_path"]}" }}\n'
+                                           for item in siblings))
+    hosts = dict(zip(('linux/amd64', 'linux/arm64', 'darwin/arm64'), ('first', 'stopped', 'later')))
+    config = {'tool_name': 'demo', 'repo': 'example/demo', 'binary_name': 'demo',
+              'language': language, 'local_path': str(source),
+              'hosts': hosts, 'host_paths': {host: str(destination / host / 'source') for host in hosts.values()},
+              'build_cmd': 'go build', 'targets': list(hosts)}
+    if sibling:
+        config['sibling_crates'] = siblings
+    # JSON is a YAML subset and avoids a second YAML serializer in the fixture.
+    (case / 'config/repos.d/demo.yaml').write_text(json.dumps(config))
+    (case / 'config/hosts.yaml').write_text(json.dumps({'hosts': {
+        host: {'build_root': str(destination / host)} for host in hosts.values()}}))
+    return case, destination
+
+
+def run(case, destination, mode, *, status=0, host='', phase='', path='', nth='', suffix='first', serialization=''):
+    trace = case / f'{suffix}.ssh.jsonl'
+    env = dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ['PATH'],
+               DSR_CONFIG_DIR=str(case / 'config'), DSR_HOSTS_FILE=str(case / 'config/hosts.yaml'),
+               DSR_STATE_DIR=str(case / 'state'), ACT_ARTIFACTS_DIR=str(case / 'artifacts'),
+               DSR_SYNC_TIMEOUT='10', DSR_STOP_TRACE=str(trace), DSR_STOP_STATUS=str(status),
+               DSR_STOP_HOST=host, DSR_STOP_PHASE=phase, DSR_STOP_PATH=path, DSR_STOP_NTH=str(nth),
+               DSR_STOP_SOURCE=str(source), DSR_STOP_REVISION=revision,
+               DSR_STOP_JSON_FAILURE=serialization, DSR_STOP_JSON_FAULT_MARKER=str(case / 'json-failure'),
+               DSR_STOP_BACKEND=str(case / 'unexpected-backend'), SHELL='/bin/bash')
+    if serialization:
+        env['PATH'] = str(json_fault_bin) + os.pathsep + env['PATH']
+    result = subprocess.run(['bash', str(driver), str(module), mode, str(destination), str(root)],
+                            env=env, text=True, capture_output=True, timeout=60)
+    (case / f'{suffix}.stdout').write_text(result.stdout)
+    (case / f'{suffix}.stderr').write_text(result.stderr)
+    calls = [json.loads(line) for line in trace.read_text().splitlines()] if trace.exists() else []
+    receipt = None
+    if mode in ('hosts', 'staged') or mode.startswith('public'):
+        try:
+            receipt = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            pass
+    return result, calls, receipt
+
+
+for code in (130, 143, 255, 23, 0):
+    case, destination = prepare(f'siblings-{code}', sibling=True)
+    result, calls, _ = run(case, destination, 'sibling', status=code, phase='transfer',
+                           path=str(destination / 'stopped'))
+    terminal = code in (130, 143)
+    check(f'sibling {code}: correct native exit', result.returncode == (code if terminal else 1 if code else 0))
+    check(f'sibling {code}: completed source bytes retained',
+          (destination / 'first/payload.txt').read_bytes() == (work / 'first/payload.txt').read_bytes())
+    check(f'sibling {code}: later receiver follows cancellation contract',
+          any(str(destination / 'later') in call['command'] for call in calls) != terminal)
+    check(f'sibling {code}: later source writes follow cancellation contract',
+          (destination / 'later/payload.txt').exists() != terminal)
+
+for code in (130, 143, 255):
+    case, destination = prepare(f'cargo-patch-{code}', language='rust', sibling=True)
+    result, calls, _ = run(case, destination, 'sibling', status=code, phase='patch', path=str(work / 'stopped'))
+    terminal = code in (130, 143)
+    check(f'Cargo patch {code}: correct native exit', result.returncode == (code if terminal else 1))
+    check(f'Cargo patch {code}: no later sibling after cancellation',
+          (destination / 'later/payload.txt').exists() != terminal)
+    check(f'Cargo patch {code}: first completed patch retained',
+          'first = { path = "../first" }' in (destination / 'main/Cargo.toml').read_text())
+
+
+def host_checks(mode, code, phase='transfer'):
+    case, destination = prepare(f'{mode}-{phase}-{code}')
+    result, calls, receipt = run(case, destination, mode, status=code, host='stopped', phase=phase)
+    terminal = code in (130, 143)
+    label = f'{mode} {phase} {code}'
+    check(label + ': correct native exit', result.returncode == (code if terminal else 1 if code else 0))
+    check(label + ': one structured source receipt', isinstance(receipt, dict))
+    if not isinstance(receipt, dict):
+        return
+    check(label + ': later host receives no operation after cancellation',
+          any(call['host'] == 'later' for call in calls) != terminal)
+    check(label + ': successful first host retains source bytes',
+          (Path(receipt.get('source_roots', {}).get('first', '/missing')) / 'payload.txt').exists()
+          and (Path(receipt['source_roots']['first']) / 'payload.txt').read_bytes()
+          == (source / 'payload.txt').read_bytes())
+    expected_hosts = ['first', 'stopped'] if terminal else ['first', 'stopped', 'later']
+    check(label + ': receipt describes only attempted hosts',
+          [item.get('host') for item in receipt.get('hosts', [])] == expected_hosts)
+    check(label + ': overall result cannot authorize cancelled sources',
+          receipt.get('status') == ('interrupted' if terminal else 'partial' if code else 'success'))
+    if terminal:
+        check(label + ': retained raw cancellation reason',
+              receipt.get('exit_code') == code and receipt.get('interruption', {}).get('host') == 'stopped'
+              and receipt.get('hosts', [])[-1].get('status') == 'interrupted')
+        check(label + ': unfinished host is never admitted', set(receipt.get('source_roots', {})) == {'first'})
+        if 'first' not in receipt.get('source_roots', {}):
+            return
+        retained_receipt = (case / 'first.stdout').read_bytes()
+        first_path = Path(receipt['source_roots']['first'])
+        retained_source = (first_path / 'payload.txt').read_bytes()
+        retry, retry_calls, retry_receipt = run(case, destination, mode, suffix='explicit-retry')
+        check(label + ': explicit healthy retry completes all hosts',
+              retry.returncode == 0 and isinstance(retry_receipt, dict) and retry_receipt.get('status') == 'success'
+              and retry_receipt.get('synced') == 3)
+        check(label + ': explicit retry preserves original receipt and completed source bytes',
+              (case / 'first.stdout').read_bytes() == retained_receipt
+              and (first_path / 'payload.txt').read_bytes() == retained_source)
+        if mode == 'staged':
+            check(label + ': explicit retry uses a fresh source stage',
+                  retry_receipt.get('source_roots', {}).get('first') != str(first_path))
+
+
+for code in (130, 143, 255, 0):
+    host_checks('hosts', code)
+
+for serialization in ('row', 'final'):
+    for code in (130, 143):
+        case, destination = prepare(f'json-{serialization}-{code}')
+        result, calls, receipt = run(case, destination, 'hosts', status=code, host='stopped',
+                                     phase='transfer', serialization=serialization)
+        check(f'diagnostic {serialization}/{code}: fault reaches post-cancel serializer',
+              (case / 'json-failure').exists())
+        check(f'diagnostic {serialization}/{code}: missing JSON cannot erase cancellation',
+              result.returncode == code and not result.stdout.strip() and receipt is None)
+        check(f'diagnostic {serialization}/{code}: completed sources remain and later host never starts',
+              (destination / 'first/source/payload.txt').read_bytes() == (source / 'payload.txt').read_bytes()
+              and not any(call['host'] == 'later' for call in calls))
+case, destination = prepare('json-final-ordinary-error')
+result, calls, _ = run(case, destination, 'hosts', status=255, host='stopped', phase='transfer', serialization='final')
+check('diagnostic ordinary255: failed serialization retains configuration failure',
+      result.returncode == 4 and (case / 'json-failure').exists() and not result.stdout.strip())
+check('diagnostic ordinary255: ordinary transport failure still allows later host',
+      any(call['host'] == 'later' for call in calls) and (destination / 'later/source/payload.txt').exists())
+
+# Frozen ordinary sources require genuine rsync and a disk-backed destination.
+# A tmpfs run still qualifies sibling and multi-host transport cancellation.
+filesystem = subprocess.run(['stat', '-f', '-c', '%T', str(work)], text=True,
+                             capture_output=True, check=False).stdout.strip()
+if shutil.which('rsync') and filesystem not in ('tmpfs', 'ramfs'):
+    for phase in ('prepare', 'transfer', 'context_transfer', 'context_restore'):
+        for code in (130, 143):
+            host_checks('staged', code, phase)
+    host_checks('staged', 255, 'context_transfer')
+    host_checks('staged', 0)
+    for code in (130, 143):
+        case, destination = prepare(f'public-{code}')
+        result, calls, receipt = run(case, destination, 'public', status=code, host='stopped', phase='transfer')
+        check(f'public {code}: cancellation maps to public exit5', result.returncode == 5)
+        check(f'public {code}: one interrupted build envelope retains exact source receipt',
+              isinstance(receipt, dict) and receipt.get('command') == 'build'
+              and receipt.get('exit_code') == 5 and receipt.get('details', {}).get('sync_exit_code') == code
+              and receipt.get('details', {}).get('source_sync', {}).get('status') == 'interrupted'
+              and receipt.get('details', {}).get('targets') == [])
+        check(f'public {code}: neither later source host nor build dispatcher starts',
+              not any(call['host'] == 'later' for call in calls) and not (case / 'unexpected-backend').exists())
+else:
+    print('SKIP: frozen staged-host receipts require rsync and disk-backed TMPDIR', flush=True)
+
+for mode in ('public-malformed', 'public-missing'):
+    for code in (130, 143):
+        case, destination = prepare(f'{mode}-{code}')
+        result, calls, receipt = run(case, destination, mode, status=code)
+        check(f'{mode} {code}: cancellation remains public exit5 without valid evidence', result.returncode == 5)
+        check(f'{mode} {code}: invalid evidence is not fabricated or admitted',
+              isinstance(receipt, dict) and receipt.get('exit_code') == 5
+              and receipt.get('details', {}).get('source_sync', 'missing') is None
+              and receipt.get('details', {}).get('sync_exit_code') == code
+              and receipt.get('details', {}).get('targets') == [])
+        check(f'{mode} {code}: neither source receiver nor build dispatcher starts',
+              not calls and not (case / 'unexpected-backend').exists())
+
+# Strict tracked-byte source transport must preserve cancellation through its
+# archive, manifest and post-extraction admission steps. Successful receivers
+# execute the real archive/digest/verifier programs without a compiler mock.
+if filesystem not in ('tmpfs', 'ramfs'):
+    for position in (1, 2, 3):
+        for code in (130, 143, 255):
+            case, destination = prepare(f'strict-{position}-{code}')
+            result, calls, _ = run(case, destination, 'strict', status=code, nth=position)
+            check(f'strict operation {position}/{code}: correct failure exit',
+                  result.returncode == (code if code in (130, 143) else 4))
+            check(f'strict operation {position}/{code}: no subsequent source operation', len(calls) == position)
+    case, destination = prepare('strict-healthy')
+    result, calls, _ = run(case, destination, 'strict')
+    check('strict healthy: genuine source archive and manifest verification succeed', result.returncode == 0)
+    check('strict healthy: selected bytes arrive intact',
+          (destination / 'source/payload.txt').exists()
+          and (destination / 'source/payload.txt').read_bytes() == (source / 'payload.txt').read_bytes())
+else:
+    print('SKIP: strict source snapshots require a disk-backed TMPDIR', flush=True)
+
+print(f'Source interruption: {checks - len(failures)}/{checks} passed', flush=True)
+raise SystemExit(bool(failures))
+PY
+)
+
 test_source_transport_admission() (
     local dependency work
     for dependency in bash python3 git jq rsync tar base64 iconv ps; do
@@ -82,7 +446,7 @@ subprocess.run(['git', '-C', str(source), '-c', 'user.name=DSR Test',
                 '-c', 'user.email=dsr-test@example.invalid', 'commit', '-qm',
                 'Source transfer fixture'], check=True)
 (source / 'ignored.txt').write_text('This file is outside the Git source selection.\n')
-real_tar, real_git = shutil.which('tar'), shutil.which('git')
+real_tar, real_git, real_sh = shutil.which('tar'), shutil.which('git'), shutil.which('sh')
 checks, failures = 0, []
 
 
@@ -173,6 +537,22 @@ args = sys.argv[1:]
 selected = ((name == 'tar' and args and args[0] in ('czf', '-czf')) or
             (name == 'git' and 'ls-files' in args and '--cached' in args))
 case = Path(os.environ['DSR_SYNC_TEST_CASE'])
+signal_source = name if selected else ''
+if name == 'git' and 'rev-parse' in args and '--is-inside-work-tree' in args:
+    counter = case / 'git-probe-count'
+    occurrence = int(counter.read_text()) + 1 if counter.exists() else 1
+    counter.write_text(str(occurrence))
+    signal_source = f'probe-{occurrence}'
+elif name == 'git' and 'ls-files' in args and '--ignored' in args:
+    signal_source = 'excludes'
+if signal_source and os.environ.get('DSR_SYNC_TEST_PRODUCER_SIGNAL') == signal_source:
+    signum = int(os.environ['DSR_SYNC_TEST_SIGNAL_NUMBER'])
+    (case / 'producer-signal.json').write_text(json.dumps({'producer': signal_source, 'signal': signum}))
+    if selected:
+        # Secondary archive/receiver failures must not conceal this signal.
+        os.write(1, b'interrupted archive stream\n' if name == 'tar' else b'absent-source-member\0')
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
 if selected:
     with (case / 'producer-events').open('a') as stream:
         stream.write(name + '\n')
@@ -192,12 +572,30 @@ for name in ('tar', 'git'):
     path = bin_dir / name
     path.write_text(producer)
     path.chmod(0o755)
+preparer = bin_dir / 'sh'
+preparer.write_text(r'''#!/usr/bin/env python3
+import os, signal, sys
+from pathlib import Path
+if len(sys.argv) > 2 and sys.argv[1] == '-c' and 'dsr_source_path=' in sys.argv[2]:
+    case = Path(os.environ['DSR_SYNC_TEST_CASE'])
+    (case / 'local-preparation').write_text('entered actual local source preparation\n')
+    status = int(os.environ.get('DSR_SYNC_TEST_LOCAL_PREP_STATUS', '0'))
+    if status in (130, 143):
+        signum = status - 128
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+    if status:
+        raise SystemExit(status)
+program = os.environ['DSR_SYNC_TEST_REAL_SH']
+os.execv(program, [program, *sys.argv[1:]])
+''')
+preparer.chmod(0o755)
 driver = work / 'driver.bash'
 driver.write_text(r'''#!/usr/bin/env bash
 set -uo pipefail
 source "$1" || exit $?
 shift
-_act_is_local_host() { return 1; }
+_act_is_local_host() { [[ "${DSR_SYNC_TEST_LOCAL:-0}" == 1 ]]; }
 _act_is_windows_host() { [[ "$DSR_SYNC_TEST_PLATFORM" == windows ]]; }
 _act_get_ssh_destination() { printf '%s\n' fixture-builder; }
 status=0
@@ -225,7 +623,7 @@ def alive(pid):
     return bool(state) and not state.startswith('Z')
 
 
-def run(label, action, platform='unix', cancel=False, **settings):
+def run(label, action, platform='unix', cancel=False, plain=False, **settings):
     case = work / label
     case.mkdir()
     target = case / 'destination'
@@ -237,12 +635,19 @@ def run(label, action, platform='unix', cancel=False, **settings):
                        DSR_SYNC_TEST_PROBE_STATUS='0', DSR_SYNC_TEST_MKDIR_STATUS='0',
                        DSR_SYNC_TEST_RSYNC_STATUS='0', DSR_SYNC_TEST_TAR_STATUS='0',
                        DSR_SYNC_TEST_REAL_TAR=real_tar, DSR_SYNC_TEST_REAL_GIT=real_git,
+                       DSR_SYNC_TEST_REAL_SH=real_sh, DSR_SYNC_TEST_LOCAL='0',
+                       DSR_SYNC_TEST_LOCAL_PREP_STATUS='0',
                        DSR_SYNC_TEST_PRODUCER_STALL='', DSR_SYNC_TEST_PRODUCER_STATUS='',
+                       DSR_SYNC_TEST_PRODUCER_SIGNAL='', DSR_SYNC_TEST_SIGNAL_NUMBER='',
                        DSR_SYNC_TEST_GIT_SELECTION='',
                        NO_COLOR='1')
     environment.update(settings)
     remote = 'C:/dsr-fixture/source' if platform == 'windows' else str(target)
-    arguments = [str(source), remote] if action == 'sync' else [remote]
+    selected_source = source
+    if plain:
+        selected_source = case / 'plain-source'
+        shutil.copytree(source, selected_source, ignore=shutil.ignore_patterns('.git'))
+    arguments = [str(selected_source), remote] if action == 'sync' else [remote]
     process = subprocess.Popen(['bash', str(driver), str(module), action, *arguments],
                                env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, start_new_session=True)
@@ -370,6 +775,18 @@ for status in (130, 143, 255):
     check('tar receiver refusal ' + str(status) + ' preserves caller stdin and source custody',
           result['stdout'] == b'remaining:caller-source-record\n' and not result['target'].exists())
 
+for status in (130, 143, 23, 0):
+    result = run(f'local-preparation-{status}', 'sync', DSR_SYNC_TEST_LOCAL='1',
+                 DSR_SYNC_TEST_LOCAL_PREP_STATUS=str(status), DSR_SYNC_TIMEOUT='10')
+    check(f'local preparation {status}: actual shell boundary is reached',
+          (result['target'].parent / 'local-preparation').exists())
+    check(f'local preparation {status}: only cancellation keeps its native exit',
+          not result['timed_out'] and result['status'] == (status if status in (130, 143) else 4 if status else 0))
+    check(f'local preparation {status}: transfer follows the source admission result',
+          not result['events'] and result['stdout'] == b'remaining:caller-source-record\n'
+          and ((not result['target'].exists()) if status else
+               (result['target'] / 'payload.bin').read_bytes() == (source / 'payload.bin').read_bytes()))
+
 # A deadline on only SSH leaves the archive writer and its Git inventory
 # outside the owned group. The original pipeline waits forever for these
 # producers even after its receiver has timed out or refused the request.
@@ -397,6 +814,37 @@ check('cancellation reaches the actual producer before the signal', result['canc
 check('cancellation drains the complete transfer before its independent failsafe',
       not result['timed_out'] and result['status'] != 0 and result['elapsed'] < 13)
 check('cancellation leaves no live producer descendants', not result['timed_out'] and not result['live'])
+
+for producer_name in ('tar', 'git'):
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        result = run(f'{producer_name}-signal-{signum}', 'sync', DSR_SYNC_TEST_PROBE_STATUS='1',
+                     DSR_SYNC_TEST_PRODUCER_SIGNAL=producer_name, DSR_SYNC_TEST_SIGNAL_NUMBER=str(signum),
+                     DSR_SYNC_TEST_GIT_SELECTION='1', DSR_SYNC_TIMEOUT='10')
+        marker = result['target'].parent / 'producer-signal.json'
+        check(f'{producer_name} signal {signum}: actual producer receives the requested signal',
+              marker.exists() and json.loads(marker.read_text()) == {'producer': producer_name, 'signal': signum})
+        check(f'{producer_name} signal {signum}: cancellation wins over secondary archive/receiver errors',
+              not result['timed_out'] and result['status'] == 128 + signum)
+        check(f'{producer_name} signal {signum}: caller input and process custody are preserved',
+              not result['live'] and result['stdout'] == b'remaining:caller-source-record\n')
+
+for probe_name in ('probe-1', 'probe-2', 'excludes'):
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        result = run(f'git-{probe_name}-signal-{signum}', 'sync', DSR_SYNC_TEST_PROBE_STATUS='1',
+                     DSR_SYNC_TEST_PRODUCER_SIGNAL=probe_name, DSR_SYNC_TEST_SIGNAL_NUMBER=str(signum),
+                     DSR_SYNC_TEST_GIT_SELECTION='1', DSR_SYNC_TIMEOUT='10')
+        marker = result['target'].parent / 'producer-signal.json'
+        check(f'Git {probe_name}/{signum}: actual selection operation receives the signal',
+              marker.exists() and json.loads(marker.read_text()) == {'producer': probe_name, 'signal': signum})
+        check(f'Git {probe_name}/{signum}: cancellation cannot fall back to plain source copying',
+              not result['timed_out'] and result['status'] == 128 + signum
+              and not result['target'].exists() and not any(event['phase'] == 'tar' for event in result['events']))
+
+result = run('plain-source-healthy', 'sync', plain=True, DSR_SYNC_TEST_PROBE_STATUS='1',
+             DSR_SYNC_TEST_GIT_SELECTION='1', DSR_SYNC_TIMEOUT='10')
+check('ordinary non-Git source still uses the successful plain tar fallback',
+      result['status'] == 0 and not result['timed_out']
+      and (result['target'] / 'payload.bin').read_bytes() == (source / 'payload.bin').read_bytes())
 
 result = run('tar-complete-producer-failed', 'sync', DSR_SYNC_TEST_PROBE_STATUS='1',
              DSR_SYNC_TEST_PRODUCER_STATUS='23', DSR_SYNC_TIMEOUT='10')
@@ -4452,6 +4900,10 @@ IGNORE
     [[ "$selection_failures" -eq 0 ]]
 )
 
+if [[ "${1:-}" == --source-interruption-only ]]; then
+    test_source_sync_interruption
+    exit $?
+fi
 if [[ "${1:-}" == --source-transport-only ]]; then
     test_source_transport_admission
     exit $?
@@ -4563,6 +5015,9 @@ if [[ "${1:-}" == --ownership-only ]]; then
     exit $?
 fi
 if [[ $# -eq 0 ]]; then
+    source_interruption_status=0
+    test_source_sync_interruption || source_interruption_status=$?
+    [[ "$source_interruption_status" == 0 || "$source_interruption_status" == 77 ]] || exit "$source_interruption_status"
     source_transport_status=0
     test_source_transport_admission || source_transport_status=$?
     [[ "$source_transport_status" == 0 || "$source_transport_status" == 77 ]] || exit "$source_transport_status"

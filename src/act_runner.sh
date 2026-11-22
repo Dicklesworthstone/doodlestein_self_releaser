@@ -5749,6 +5749,7 @@ _act_git_sync_excludes() {
             esac
             printf '/%s\0' "$ignored_path" || return 1
         done
+    _act_source_sync_pipeline_status "${PIPESTATUS[@]}"
 }
 
 # A receiver must own its source root and existing Git administration. Do not
@@ -5792,18 +5793,56 @@ _act_transfer_source_tar() (
     local respect_gitignore_excludes="$4"
     shift 4
     set -o pipefail
+    local source_git_status=1
+    if $respect_gitignore_excludes; then
+        source_git_status=0
+        git -C "$local_path" rev-parse --is-inside-work-tree >/dev/null 2>&1 || source_git_status=$?
+        _act_source_sync_interrupted "$source_git_status" && return "$source_git_status"
+    fi
     {
-        if $respect_gitignore_excludes &&
-           git -C "$local_path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        if [[ "$source_git_status" == 0 ]]; then
             git -C "$local_path" ls-files --cached --others --exclude-standard -z |
                 COPYFILE_DISABLE=1 tar -czf - -C "$local_path" "$@" --null -T -
+            _act_source_sync_pipeline_status "${PIPESTATUS[@]}"
         else
             cd "$local_path" && COPYFILE_DISABLE=1 tar czf - "$@" .
         fi
     } |
         ssh -T -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
             -o StrictHostKeyChecking=accept-new "$ssh_destination" "$remote_extract_cmd"
+    _act_source_sync_pipeline_status "${PIPESTATUS[@]}"
 )
+
+_act_source_sync_interrupted() {
+    # Native transports retain their own exit status. In particular, SSH 255
+    # is a transport failure and must not be mistaken for operator cancellation.
+    [[ "$1" == 130 || "$1" == 143 ]]
+}
+
+# A cancelled Git inventory or archive writer can leave a truncated stream;
+# the receiver then fails too. Preserve the original cancellation instead of
+# allowing pipefail's secondary receiver error to authorize another host.
+# Without cancellation, keep the existing rightmost nonzero pipeline status.
+_act_source_sync_pipeline_status() {
+    local status pipeline_status=0
+    for status in "$@"; do
+        _act_source_sync_interrupted "$status" && return "$status"
+        [[ "$status" == 0 ]] || pipeline_status="$status"
+    done
+    return "$pipeline_status"
+}
+
+# These source steps historically classify ordinary failures as configuration
+# errors. Preserve that contract while allowing cancellation to reach the host
+# coordinator before it stages another source or starts a compiler.
+_act_source_sync_step() {
+    local source_step_status=0
+    "$@" || source_step_status=$?
+    if [[ "$source_step_status" == 0 ]] || _act_source_sync_interrupted "$source_step_status"; then
+        return "$source_step_status"
+    fi
+    return 4
+}
 
 # Sync source code to remote host via rsync
 # Usage: _act_sync_source <host> <local_path> <remote_path> [extra_excludes...]
@@ -5854,13 +5893,19 @@ _act_sync_source() (
     # inventory changes recursion and receiver cleanup; literal ignored-path
     # exclusions retain both while avoiding gitignore/rsync syntax confusion.
     if $respect_gitignore_excludes; then
-        if [[ "$(git -C "$local_path" rev-parse --is-inside-work-tree 2>/dev/null)" == true ]]; then
+        local source_is_git source_selection_status=0
+        source_is_git=$(git -C "$local_path" rev-parse --is-inside-work-tree 2>/dev/null) || source_selection_status=$?
+        _act_source_sync_interrupted "$source_selection_status" && return "$source_selection_status"
+        if [[ "$source_is_git" == true ]]; then
             git_excludes=$(mktemp "${TMPDIR:-/tmp}/dsr-source-excludes.XXXXXXXX") || {
                 _log_error "Could not reserve Git source selection for $local_path"
                 return 4
             }
-            if ! _act_git_sync_excludes "$local_path" > "$git_excludes"; then
+            source_selection_status=0
+            _act_git_sync_excludes "$local_path" > "$git_excludes" || source_selection_status=$?
+            if [[ "$source_selection_status" != 0 ]]; then
                 _log_error "Could not enumerate Git source exclusions for $local_path"
+                _act_source_sync_interrupted "$source_selection_status" && return "$source_selection_status"
                 return 4
             fi
             exclude_args+=(--from0 "--exclude-from=$git_excludes")
@@ -5915,7 +5960,7 @@ _act_sync_source() (
 
         local prepare_command
         prepare_command=$(_act_source_sync_prepare_sh "$remote_path") || return 4
-        sh -c "$prepare_command" || return 4
+        _act_source_sync_step sh -c "$prepare_command" || return $?
         local sync_cmd_output sync_cmd_status
         # Equal size and timestamp do not prove equal source bytes (for
         # example, rapid checkouts or restored timestamps). A successful sync
@@ -6182,6 +6227,7 @@ _act_strict_snapshot_exec() {
             "$destination" 'exec "$SHELL" -s' <<< "$wrapped") || status=$?
     fi
     if [[ "$status" -ne 0 ]]; then
+        _act_source_sync_interrupted "$status" && return "$status"
         [[ "$status" -eq 4 ]] && return 4
         _log_error "Strict snapshot worker execution failed on $host (exit $status)"
         return 8
@@ -8774,8 +8820,8 @@ _act_sync_strict_checkout() {
     if [[ -n "$snapshot_owner_pin" ]]; then
         [[ "$archive_name" == source.tar ]] || return 4
         owner_run_id=$(jq -er '.run_id | strings' <<< "$snapshot_owner_pin") || return 4
-        observed_owner=$(_act_strict_snapshot_owner "$host" "$remote_path" \
-            "$label" "$owner_run_id" "$revision") || return 4
+        observed_owner=$(_act_source_sync_step _act_strict_snapshot_owner "$host" "$remote_path" \
+            "$label" "$owner_run_id" "$revision") || return $?
         if ! jq -es 'length == 2 and .[0] == .[1]' \
             <<< "$snapshot_owner_pin"$'\n'"$observed_owner" >/dev/null; then
             _log_error "Strict snapshot ownership changed before source population"
@@ -8893,29 +8939,35 @@ _act_sync_strict_checkout() {
         # `while read` loop over dependency checkouts, and an ssh that inherits
         # the loop's stdin swallows the remaining entries, so only the first
         # dependency reached a Windows host.
-        if ! _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh -n \
+        if _act_source_sync_step _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh -n \
             -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
-            -o StrictHostKeyChecking=accept-new "$ssh_destination" "$setup_command" || \
-           ! _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" scp \
+            -o StrictHostKeyChecking=accept-new "$ssh_destination" "$setup_command" && \
+           _act_source_sync_step _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" scp \
             -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
             -o StrictHostKeyChecking=accept-new "$archive_path" \
-            "${ssh_destination}:${remote_archive}" </dev/null || \
-           ! _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" scp \
+            "${ssh_destination}:${remote_archive}" </dev/null && \
+           _act_source_sync_step _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" scp \
             -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
             -o StrictHostKeyChecking=accept-new "$manifest_path" \
             "${ssh_destination}:${remote_manifest}" </dev/null; then
+            :
+        else
+            local transfer_status=$?
             _log_error "Strict fresh Windows source transfer failed for $label"
-            return 4
+            return "$transfer_status"
         fi
         # Authenticate both original inputs before creating any source files.
         # A Git symlink is materialized only after its link text and tracked
         # regular referent have both matched the controller's source manifest.
         verify_command=$(_act_windows_source_command "$host" "$remote_path" "$verify_script") || return 4
-        if ! remote_digest=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh -n \
+        if remote_digest=$(_act_source_sync_step _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh -n \
             -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
             -o StrictHostKeyChecking=accept-new "$ssh_destination" "$verify_command"); then
+            :
+        else
+            local transfer_status=$?
             _log_error "Strict fresh Windows source sync failed for $label"
-            return 4
+            return "$transfer_status"
         fi
     else
         local remote_cmd parent_setup
@@ -8925,11 +8977,14 @@ _act_sync_strict_checkout() {
             parent_setup="test -d '$snapshot_parent'; test ! -L '$snapshot_parent'"
         fi
         remote_cmd="set -e; set -C; umask 077; $parent_setup; test ! -e '$remote_path'; test ! -L '$remote_path'; test ! -e '$remote_archive'; test ! -L '$remote_archive'; mkdir '$remote_path'; cat > '$remote_archive'; tar -xf '$remote_archive' -C '$remote_path'; if command -v sha256sum >/dev/null 2>&1; then sha256sum '$remote_archive' | awk '{print \$1}'; else shasum -a 256 '$remote_archive' | awk '{print \$1}'; fi"
-        if ! remote_digest=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh \
+        if remote_digest=$(_act_source_sync_step _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh \
             -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
             -o StrictHostKeyChecking=accept-new "$ssh_destination" "$remote_cmd" < "$archive_path"); then
+            :
+        else
+            local transfer_status=$?
             _log_error "Strict fresh remote source sync failed for $label"
-            return 4
+            return "$transfer_status"
         fi
     fi
 
@@ -8953,16 +9008,16 @@ _act_sync_strict_checkout() {
         # The manifest was transferred and authenticated before extraction;
         # re-observe its held identity instead of uploading it a second time.
         manifest_verify_command=$(_act_windows_encoded_powershell "\$ErrorActionPreference='Stop'; ${reparse_guard} Assert-PlainDirectory '${win_snapshot_parent}'; Assert-PlainDirectory '${win_remote_path}'; Assert-PlainFile '${win_remote_archive}'; Assert-PlainFile '${win_remote_manifest}'; (Get-FileHash -Algorithm SHA256 -LiteralPath '${win_remote_manifest}').Hash.ToLowerInvariant()" pwsh) || return 4
-        remote_manifest_digest=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh -n \
+        remote_manifest_digest=$(_act_source_sync_step _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh -n \
             -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
             -o StrictHostKeyChecking=accept-new "$ssh_destination" \
-            "$manifest_verify_command") || return 4
+            "$manifest_verify_command") || return $?
     else
         local manifest_remote_cmd
         manifest_remote_cmd="set -e; set -C; umask 077; test ! -e '$remote_manifest'; test ! -L '$remote_manifest'; cat > '$remote_manifest'; if command -v sha256sum >/dev/null 2>&1; then sha256sum '$remote_manifest' | awk '{print \$1}'; else shasum -a 256 '$remote_manifest' | awk '{print \$1}'; fi"
-        remote_manifest_digest=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh \
+        remote_manifest_digest=$(_act_source_sync_step _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh \
             -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
-            -o StrictHostKeyChecking=accept-new "$ssh_destination" "$manifest_remote_cmd" < "$manifest_path") || return 4
+            -o StrictHostKeyChecking=accept-new "$ssh_destination" "$manifest_remote_cmd" < "$manifest_path") || return $?
     fi
     remote_manifest_digest=$(printf '%s\n' "$remote_manifest_digest" | tr -d '\r' | tail -1 | tr '[:upper:]' '[:lower:]')
     if [[ "$remote_manifest_digest" != "$local_manifest_digest" ]]; then
@@ -8977,10 +9032,12 @@ _act_sync_strict_checkout() {
     # path, rather than after every target in the matrix has compiled.
     if ! _act_is_local_host "$host"; then
         local admitted_digests
-        if ! admitted_digests=$(_act_run_strict_snapshot_verifier "$host" "$ssh_destination" \
+        local admission_status=0
+        admitted_digests=$(_act_run_strict_snapshot_verifier "$host" "$ssh_destination" \
                 "$remote_path" "$remote_archive" "$remote_manifest" \
-                "$local_manifest_digest" "$expected_object_count" "$local_digest" </dev/null) || \
-           [[ "$admitted_digests" != "$local_digest $local_manifest_digest" ]]; then
+                "$local_manifest_digest" "$expected_object_count" "$local_digest" </dev/null) || admission_status=$?
+        _act_source_sync_interrupted "$admission_status" && return "$admission_status"
+        if [[ "$admission_status" != 0 || "$admitted_digests" != "$local_digest $local_manifest_digest" ]]; then
             _log_error "Extracted strict source snapshot failed admission on $host for $label; no target was built"
             return 4
         fi
@@ -9289,6 +9346,7 @@ _act_run_strict_snapshot_verifier() {
         _log_error "Strict source verification of $remote_path on $host timed out after ${_ACT_SYNC_TIMEOUT}s; raise DSR_SYNC_TIMEOUT and resume"
         return 4
     elif [[ $verify_status -ne 0 ]]; then
+        _act_source_sync_interrupted "$verify_status" && return "$verify_status"
         return 4
     fi
     digests=$(printf '%s\n' "$verify_output" | tr -d '\r' | tail -1 | tr '[:upper:]' '[:lower:]')
@@ -9625,20 +9683,20 @@ _act_restore_ordinary_git_context() {
         remote_context=$(jq -c --arg path "$win_bundle" '.bundle_path=$path' <<< "$context") || return 4
         guard=$(_act_windows_reparse_guard_script) || return 4
         command=$(_act_windows_encoded_powershell "\$ErrorActionPreference='Stop'; $guard Assert-PlainDirectory '$win_source'; if (Get-Item -LiteralPath '$win_bundle' -Force -ErrorAction SilentlyContinue) { throw 'Git context bundle already exists' }" pwsh) || return 4
-        _act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT" </dev/null || return 4
-        _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" scp -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
+        _act_source_sync_step _act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT" </dev/null || return $?
+        _act_source_sync_step _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" scp -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
             -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$bundle" \
-            "$destination:$remote_bundle" </dev/null || return 4
+            "$destination:$remote_bundle" </dev/null || return $?
         script=$(git_ops_build_context_powershell "$win_source" "$remote_context") || return 4
         command=$(_act_windows_source_command "$host" "$win_source" "$script") || return 4
-        restored=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT" </dev/null) || return 4
+        restored=$(_act_source_sync_step _act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT" </dev/null) || return $?
     else
         destination=$(_act_get_ssh_destination "$host") || return 4
         local script quoted_source quoted_context
         command="set -e; set -C; umask 077; test -d '${source_root%/*}'; test ! -L '${source_root%/*}'; cat > '$remote_bundle'"
-        _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
+        _act_source_sync_step _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
             -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$destination" "$command" \
-            < "$bundle" || return 4
+            < "$bundle" || return $?
         script=$(declare -f _git_ops_build_git _git_ops_build_sha256 _git_ops_build_refs git_ops_restore_build_context) || return 4
         script=$'set -uo pipefail\n'"$script"
         printf -v quoted_source '%q' "$source_root"
@@ -9649,7 +9707,7 @@ _act_restore_ordinary_git_context() {
         # would reintroduce the exec limit for a large tag inventory. Parse
         # the complete importer before running it and isolate its stdin.
         printf -v command "bash -s <<'DSR_ORDINARY_GIT_CONTEXT'\n{\n%s\n} </dev/null\nDSR_ORDINARY_GIT_CONTEXT\n" "$script"
-        restored=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT" </dev/null) || return 4
+        restored=$(_act_source_sync_step _act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT" </dev/null) || return $?
     fi
     # Logs belong on stderr; the importer returns exactly one JSON receipt.
     jq -sce --slurpfile expected /dev/fd/3 --arg root "$source_root" '
@@ -9736,8 +9794,11 @@ _act_sync_sibling_crates() {
             done < <(yq -r ".sibling_crates[$idx].extra_excludes // [] | .[]" "$config_file" 2>/dev/null || true)
         fi
 
-        if ! _act_sync_source "$host" "$sib_local" "$sib_remote_path" "${sync_args[@]}"; then
+        local sibling_status=0
+        _act_sync_source "$host" "$sib_local" "$sib_remote_path" "${sync_args[@]}" || sibling_status=$?
+        if [[ "$sibling_status" != 0 ]]; then
             _log_error "Failed to sync sibling crate: $sib_relative"
+            _act_source_sync_interrupted "$sibling_status" && return "$sibling_status"
             sync_failed=true
             continue
         fi
@@ -9765,8 +9826,10 @@ _act_sync_sibling_crates() {
             if patch_output=$(_act_ssh_exec "$host" "$(_act_windows_encoded_powershell "[System.IO.File]::WriteAllText('${toml_path}', [System.IO.File]::ReadAllText('${toml_path}').Replace('${sib_configured}','${relative_ref}'))")" 30 2>&1); then
                 _log_ok "Patched Cargo.toml on $host: $sib_configured → $relative_ref"
             else
+                sibling_status=$?
                 _log_error "Failed to patch Cargo.toml on $host for sibling $sib_relative"
                 [[ -n "$patch_output" ]] && printf '%s\n' "$patch_output" >&2
+                _act_source_sync_interrupted "$sibling_status" && return "$sibling_status"
                 sync_failed=true
             fi
         else
@@ -9776,8 +9839,10 @@ _act_sync_sibling_crates() {
             if patch_output=$(_act_ssh_exec "$host" "cd '${remote_path}' && perl -pi -e 's|\\Q${sib_configured}\\E|${relative_ref}|g' Cargo.toml" 30 2>&1); then
                 _log_ok "Patched Cargo.toml on $host: $sib_configured → $relative_ref"
             else
+                sibling_status=$?
                 _log_error "Failed to patch Cargo.toml on $host for sibling $sib_relative"
                 [[ -n "$patch_output" ]] && printf '%s\n' "$patch_output" >&2
+                _act_source_sync_interrupted "$sibling_status" && return "$sibling_status"
                 sync_failed=true
             fi
         fi
@@ -10184,6 +10249,7 @@ act_sync_sources() {
 
     local synced=0
     local failed=0
+    local interrupted_exit=0 interrupted_host="" interrupted_stage=""
     local results=()
     local source_root_entries=()
     local snapshot_owners_json='{}'
@@ -10217,20 +10283,28 @@ act_sync_sources() {
         # way so progress detail is never lost.
         local source_synced=false
         local host_sync_output="" snapshot_owner_pin="" snapshot_owner_ready=true
+        local host_sync_status=0 host_sync_stage=source_transfer
         if $strict_release; then
             if ! _act_is_windows_host "$host"; then
                 # Retain the issuance pin before any source or cache write.
                 # A later observation cannot adopt a replaced owner marker.
-                if ! snapshot_owner_pin=$(_act_create_strict_snapshot_owner "$host" \
+                if snapshot_owner_pin=$(_act_create_strict_snapshot_owner "$host" \
                     "$remote_path" "$tool_name" "$strict_run_id" "$strict_git_sha"); then
+                    :
+                else
+                    host_sync_status=$?
+                    host_sync_stage=snapshot_ownership
                     host_sync_output="Cannot issue private strict snapshot ownership for $host"
                     snapshot_owner_ready=false
                 fi
             fi
-            if $snapshot_owner_ready && \
-               host_sync_output=$(_act_sync_strict_checkout "$host" "$local_path" "$strict_git_sha" \
-                    "$remote_path" "source.tar" "$tool_name" "$snapshot_owner_pin" 2>&1); then
-                source_synced=true
+            if $snapshot_owner_ready; then
+                if host_sync_output=$(_act_sync_strict_checkout "$host" "$local_path" "$strict_git_sha" \
+                        "$remote_path" "source.tar" "$tool_name" "$snapshot_owner_pin" 2>&1); then
+                    source_synced=true
+                else
+                    host_sync_status=$?
+                fi
             fi
         elif $stage_ordinary; then
             local prepared_source_root stage_name="${remote_path%/source}"
@@ -10244,14 +10318,23 @@ act_sync_sources() {
                     if host_sync_output=$(_act_sync_source "$host" "$ordinary_projection/source" "$remote_path" \
                             --no-gitignore-excludes 2>&1); then
                         source_synced=true
+                    else
+                        host_sync_status=$?
                     fi
                 else
                     host_sync_output="Fresh source stage did not return its canonical path"
                 fi
+            else
+                host_sync_status=$?
+                host_sync_stage=source_preparation
             fi
-        elif host_sync_output=$(_act_sync_source "$host" "$local_path" "$remote_path" \
-            "${main_sync_excludes[@]}" 2>&1); then
-            source_synced=true
+        else
+            if host_sync_output=$(_act_sync_source "$host" "$local_path" "$remote_path" \
+                    "${main_sync_excludes[@]}" 2>&1); then
+                source_synced=true
+            else
+                host_sync_status=$?
+            fi
         fi
         [[ -n "$host_sync_output" ]] && printf '%s\n' "$host_sync_output" >&2
 
@@ -10269,12 +10352,14 @@ act_sync_sources() {
                     relative_path=$(jq -r '.relative_path' <<< "$dependency")
                     dependency_local=$(jq -r '.local_path' <<< "$dependency")
                     dependency_sha=$(jq -r '.git_sha' <<< "$dependency")
+                    dependency_sync_status=0
                     dependency_sync_output=$(_act_sync_strict_checkout "$host" "$dependency_local" "$dependency_sha" \
                         "${remote_path%/source}/$relative_path" \
-                        "dependency-${relative_path}.tar" "$relative_path" 2>&1 </dev/null)
-                    dependency_sync_status=$?
+                        "dependency-${relative_path}.tar" "$relative_path" 2>&1 </dev/null) || dependency_sync_status=$?
                     [[ -n "$dependency_sync_output" ]] && printf '%s\n' "$dependency_sync_output" >&2
                     if [[ "$dependency_sync_status" -ne 0 ]]; then
+                        host_sync_status="$dependency_sync_status"
+                        host_sync_stage=source_dependency
                         host_sync_output="$dependency_sync_output"
                         sync_ok=false
                         break
@@ -10282,11 +10367,13 @@ act_sync_sources() {
                 done < <(jq -c '.[]' <<< "$strict_dependency_checkouts")
             elif [[ "$sibling_count" -gt 0 && "$remote_path" != "$local_path" ]]; then
                 local sibling_sync_output sibling_sync_status
+                sibling_sync_status=0
                 sibling_sync_output=$(_act_sync_sibling_crates "$host" "$remote_path" "$config_file" \
-                    "$sibling_count" "$ordinary_projection" 2>&1)
-                sibling_sync_status=$?
+                    "$sibling_count" "$ordinary_projection" 2>&1) || sibling_sync_status=$?
                 [[ -n "$sibling_sync_output" ]] && printf '%s\n' "$sibling_sync_output" >&2
                 if [[ "$sibling_sync_status" -ne 0 ]]; then
+                    host_sync_status="$sibling_sync_status"
+                    host_sync_stage=source_dependency
                     host_sync_output="$sibling_sync_output"
                     sync_ok=false
                 fi
@@ -10318,6 +10405,8 @@ act_sync_sources() {
                                  .[$name]=$receipt' 3<<< "$restored_context" <<< "$restored_siblings") || return 4
                         fi
                     else
+                        host_sync_status=$?
+                        host_sync_stage=git_context
                         host_sync_output="Git context import failed for $context_relative: $import_output"
                         printf '%s\n' "$host_sync_output" >&2
                         sync_ok=false
@@ -10331,9 +10420,10 @@ act_sync_sources() {
             fi
 
             if $sync_ok && [[ -n "$snapshot_owner_pin" ]]; then
-                local observed_snapshot_owner
-                if observed_snapshot_owner=$(_act_strict_snapshot_owner "$host" "$remote_path" \
-                    "$tool_name" "$strict_run_id" "$strict_git_sha") && \
+                local observed_snapshot_owner snapshot_observation_status=0
+                observed_snapshot_owner=$(_act_strict_snapshot_owner "$host" "$remote_path" \
+                    "$tool_name" "$strict_run_id" "$strict_git_sha") || snapshot_observation_status=$?
+                if [[ "$snapshot_observation_status" == 0 ]] && \
                    jq -es 'length == 2 and .[0] == .[1]' \
                         <<< "$snapshot_owner_pin"$'\n'"$observed_snapshot_owner" >/dev/null; then
                     snapshot_owners_json=$(jq -c --arg host "$host" --slurpfile pin /dev/fd/3 \
@@ -10341,6 +10431,8 @@ act_sync_sources() {
                          else error("Expected exactly one issued snapshot pin") end' \
                         3<<< "$snapshot_owner_pin" <<< "$snapshot_owners_json") || return 4
                 else
+                    host_sync_status="$snapshot_observation_status"
+                    host_sync_stage=snapshot_ownership
                     host_sync_output="Strict snapshot ownership changed during source population"
                     _log_error "$host_sync_output"
                     sync_ok=false
@@ -10375,11 +10467,23 @@ act_sync_sources() {
                 --arg error "$(_act_sync_error_summary "$host_sync_output")" \
                 '{host: $host, path: $path, status: "failed", error: $error}')")
         fi
+        if _act_source_sync_interrupted "$host_sync_status"; then
+            interrupted_exit="$host_sync_status"
+            interrupted_host="$host"
+            interrupted_stage="$host_sync_stage"
+            local interrupted_index=$((${#results[@]} - 1))
+            results[$interrupted_index]=$(jq -c --argjson code "$interrupted_exit" \
+                --arg stage "$interrupted_stage" \
+                '.status="interrupted" | .exit_code=$code | .interrupted_stage=$stage' \
+                <<< "${results[$interrupted_index]}") || return "$interrupted_exit"
+            _log_warn "Source synchronization interrupted on $host; later hosts were not started"
+            break
+        fi
     done
 
     # Earlier hosts cannot remain admitted if the controller identity moved
     # while a later host was transferring its source or context bundle.
-    if $stage_ordinary && { ! _act_verify_ordinary_git_contexts "$ordinary_contexts" ||
+    if [[ "$interrupted_exit" == 0 ]] && $stage_ordinary && { ! _act_verify_ordinary_git_contexts "$ordinary_contexts" ||
         [[ "$(_act_ordinary_source_inputs "$ordinary_projection" "$ordinary_contexts")" != "$ordinary_source_inputs" ]]; }; then
         synced=0
         failed=${#hosts_to_sync[@]}
@@ -10396,7 +10500,9 @@ act_sync_sources() {
 
     # Determine overall status
     local status
-    if [[ $failed -eq 0 ]]; then
+    if [[ "$interrupted_exit" != 0 ]]; then
+        status="interrupted"
+    elif [[ $failed -eq 0 ]]; then
         status="success"
     elif [[ $synced -gt 0 ]]; then
         status="partial"
@@ -10422,6 +10528,9 @@ act_sync_sources() {
         --argjson synced "$synced" \
         --argjson failed "$failed" \
         --argjson duration "$total_duration" \
+        --argjson interrupted_exit "$interrupted_exit" \
+        --arg interrupted_host "$interrupted_host" \
+        --arg interrupted_stage "$interrupted_stage" \
         --slurpfile contexts /dev/fd/3 \
         --slurpfile owners /dev/fd/4 \
         --argjson source_roots "$source_roots_json" \
@@ -10442,7 +10551,10 @@ act_sync_sources() {
             hosts: $hosts,
             source_roots: $source_roots,
             target_hosts: $target_hosts
-        } + (if ($owners | length) > 0 then {snapshot_owners:$owners} else {} end) +
+        } + (if $interrupted_exit != 0 then {exit_code:$interrupted_exit,
+            interruption:{host:$interrupted_host,stage:$interrupted_stage,exit_code:$interrupted_exit}}
+            else {} end) +
+            (if ($owners | length) > 0 then {snapshot_owners:$owners} else {} end) +
             (if $staged_ordinary then {staged_ordinary:true,git_context:$git_context,source_inputs:$source_inputs,
             sibling_git_contexts:$sibling_git_contexts} else {} end) +
             (if ($submodule_git_contexts | length) > 0 then {submodule_git_contexts:$submodule_git_contexts} else {} end) |
@@ -10450,8 +10562,14 @@ act_sync_sources() {
                 .source_materialization=$identity |
                 .hosts |= map(if .status == "success" then . + {source_materialization:$identity} else . end)
             end' 3<<< "$results_json"$'\n'"$primary_git_context"$'\n'"$sibling_git_contexts"$'\n'"$submodule_git_contexts" \
-            4<<< "$snapshot_owners_json" || return 4
+            4<<< "$snapshot_owners_json" || {
+                # Missing diagnostics cannot turn a known cancellation into an
+                # ordinary source failure or authorize a later build attempt.
+                [[ "$interrupted_exit" == 0 ]] || return "$interrupted_exit"
+                return 4
+            }
 
+    [[ "$interrupted_exit" == 0 ]] || return "$interrupted_exit"
     if [[ $failed -gt 0 ]]; then
         return 1
     fi
@@ -17787,8 +17905,14 @@ _act_relocate_failed_target() {
     if $qualified; then
         sync_args=(--target-hosts-json "$(jq -cn --arg target "$target" --arg host "$host" '{($target):$host}')")
     fi
-    if ! sync_json=$(act_sync_sources "$tool" --strict-release --run-id "$run_id" \
-        --git-sha "$(jq -r '.git_sha' <<< "$before")" "${sync_args[@]}" -- "$target"); then
+    local source_sync_status=0
+    sync_json=$(act_sync_sources "$tool" --strict-release --run-id "$run_id" \
+        --git-sha "$(jq -r '.git_sha' <<< "$before")" "${sync_args[@]}" -- "$target") || source_sync_status=$?
+    if [[ "$source_sync_status" != 0 ]]; then
+        # A stopped transfer cannot authorize an implicit recovery attempt,
+        # even if an earlier snapshot might be complete. A later explicit
+        # retry will repeat admission and verify that retained source itself.
+        _act_source_sync_interrupted "$source_sync_status" && return "$source_sync_status"
         # A previous attempt may have finished immutable staging before a
         # later verification or state write failed. Reuse only the complete
         # canonical snapshot whose archive, manifest and checkout all verify
@@ -18695,11 +18819,16 @@ act_orchestrate_build() {
                 fi
             fi
             if [[ -n "$resume_target_host" ]]; then
-                if ! $strict_release_contract ||
-                   ! resume_state=$(_act_relocate_failed_target "$tool_name" "$version" \
-                        "$run_id" "$resume_state" "$resume_target_host" "$resume_target_host_approval"); then
+                local relocation_status=4
+                if $strict_release_contract; then
+                    relocation_status=0
+                    resume_state=$(_act_relocate_failed_target "$tool_name" "$version" \
+                        "$run_id" "$resume_state" "$resume_target_host" "$resume_target_host_approval") || relocation_status=$?
+                fi
+                if [[ "$relocation_status" != 0 ]]; then
                     _log_error "Failed-target relocation refused; prior attempts retained"
                     _act_release_orchestration_lock
+                    _act_source_sync_interrupted "$relocation_status" && return "$relocation_status"
                     return 4
                 fi
                 source_roots_json=$(jq -c '.context.source_roots' <<< "$resume_state")

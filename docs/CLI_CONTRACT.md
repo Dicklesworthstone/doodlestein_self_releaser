@@ -1071,6 +1071,27 @@ authoritative manifest while any target remains unsuccessful.
 Both local and SSH rsync transfers use checksums to detect edited files whose
 sizes and timestamps match the older destination files.
 
+Source synchronization treats exit `130` and `143` as interruption. Once observed,
+it stops the remaining sibling and host transfers, including when an interrupted
+Git inventory or archive writer causes a secondary receiver failure. The internal
+receipt has `status: "interrupted"`, the original `exit_code`, and
+`interruption: {host, stage, exit_code}`. Its host rows describe only attempted
+hosts; the interrupted row retains `exit_code` and `interrupted_stage`. Previously
+completed host rows and source paths remain evidence, but this invocation does
+not admit any compilation or automatic recovery after the interruption.
+Ordinary transport failures, including SSH exit `255`, keep their existing
+partial-failure behavior.
+
+The public `build` command, including `--sync-only`, returns exit `5` for this
+initial synchronization interruption. Its JSON details include
+`stage: "source_sync"`, `sync_exit_code`, the available `source_sync` receipt,
+and `interruption: {stage: "source_sync", exit_code, outcome: "unconfirmed"}`.
+An absent or malformed diagnostic receipt is represented as `source_sync: null`;
+it cannot erase the known interruption or authorize compilation. Failure to
+serialize the internal receipt also preserves the original interruption status.
+An explicit later invocation repeats source admission and transfer checks while
+retaining completed stages and verified artifact receipts.
+
 Native Unix admission checks the actual selected source, build, Cargo and recipe
 temporary paths in addition to the host's default storage roles. Source planning
 checks every required host/path combination before any source export or transfer;
@@ -1329,6 +1350,13 @@ or overwritten. Reuse repeats host capability and writable-path admission before
 snapshot inspection or Cargo metadata preparation; an existing snapshot cannot
 override a current host or storage refusal. No successful target is rebuilt by
 relocation admission.
+
+An interrupted relocation source transfer returns its original `130` or `143`
+through the coordinator after releasing its owned build lock. That invocation
+does not attempt snapshot recovery, update the checkpoint, reserve an attempt,
+or dispatch a worker. The watcher treats the result as terminal until an explicit
+operator retry. An ordinary staging failure may still recover a complete,
+independently verified snapshot under the existing relocation checks.
 
 `--diagnostic-native` requires an enabled strict release contract and an explicit
 nonempty, unique subset of its native targets. The clean tagged source, pinned

@@ -825,6 +825,16 @@ retries. `--sync-only` exits 1 if any host fails. Use `--no-sync` when you manag
 the remote sources separately for a new run. A staged run cannot discard its
 source binding by adding `--no-sync` on resume.
 
+Cancellation during source synchronization stops the remaining sibling and host
+transfers before compilation. `build` and `build --sync-only` return exit `5`
+when a source operation reports interruption (`130` or `143`), retaining that
+original status and the attempted hosts in JSON when a receipt is available.
+An interrupted archive producer remains a cancellation even if its receiver
+also fails on the truncated stream. Completed source stages and artifacts stay
+available for an explicit retry. Relocation also stops before snapshot recovery
+or dispatch and preserves its original interruption status through the build
+coordinator; the watcher does not automatically replay it.
+
 Normal native builds stage source in fresh directories under the host's
 configured `build_root`, or its default disk staging location. Each stage
 receives the controller's Git HEAD, branch, and tags through a verified bundle,

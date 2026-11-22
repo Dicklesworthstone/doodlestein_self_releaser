@@ -4443,6 +4443,24 @@ EOF
             sync_status="unknown"
         fi
 
+        # A stopped receiver must not authorize another host, compilation, or
+        # automatic retry, even if it could not finish its diagnostic receipt.
+        if [[ "$sync_exit" == 130 || "$sync_exit" == 143 ]]; then
+            log_error "Source synchronization interrupted (exit $sync_exit); explicit retry is required"
+            if $JSON_MODE; then
+                local sync_interruption_json
+                sync_interruption_json=$(jq -nc --arg repo "$ACT_REPO_GITHUB" --arg version "$tag" \
+                    --argjson code "$sync_exit" --slurpfile receipt /dev/fd/3 '
+                    {repo:$repo,version:$version,targets:[],stage:"source_sync",
+                     error:"Source synchronization interrupted",
+                     source_sync:$receipt[0],sync_exit_code:$code,
+                     interruption:{stage:"source_sync",exit_code:$code,outcome:"unconfirmed"}}' \
+                    3<<< "${sync_json:-null}") || return 5
+                json_envelope "build" "error" 5 "$sync_interruption_json"
+            fi
+            return 5
+        fi
+
         # Both the command result and the host receipt must agree. A success
         # string alone cannot authorize builds after a failed transfer.
         local sync_receipt_valid=true
@@ -4637,8 +4655,11 @@ EOF
         log_error "Build coordinator did not return exactly one complete JSON result"
         [[ "$orchestrator_exit" -ne 0 ]] || orchestrator_exit=4
         if $JSON_MODE; then
-            json_envelope "build" "error" "$orchestrator_exit" \
-                '{"error":"Build coordinator did not return exactly one complete JSON result"}'
+            local coordinator_error_json
+            coordinator_error_json=$(jq -nc --arg repo "$ACT_REPO_GITHUB" --arg version "$tag" \
+                '{repo:$repo,version:$version,targets:[],
+                  error:"Build coordinator did not return exactly one complete JSON result"}') || return "$orchestrator_exit"
+            json_envelope "build" "error" "$orchestrator_exit" "$coordinator_error_json"
         fi
         return "$orchestrator_exit"
     fi

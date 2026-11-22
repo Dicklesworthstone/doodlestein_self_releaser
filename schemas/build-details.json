@@ -47,7 +47,23 @@
     },
     "source_sync": {
       "type": ["object", "null"],
-      "description": "Complete ordinary source synchronization receipt, including host/path bindings and failed transfers; null when synchronization was bypassed or the build used strict snapshots"
+      "description": "Source synchronization receipt, including host/path bindings and failed or interrupted transfers; null when no complete receipt is available"
+    },
+    "sync_exit_code": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 255,
+      "description": "Original source synchronization command status"
+    },
+    "interruption": {
+      "type": "object",
+      "required": ["stage", "exit_code", "outcome"],
+      "additionalProperties": false,
+      "properties": {
+        "stage": { "const": "source_sync" },
+        "exit_code": { "enum": [130, 143] },
+        "outcome": { "const": "unconfirmed" }
+      }
     },
     "error": {
       "type": "string",

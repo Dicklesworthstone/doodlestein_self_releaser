@@ -29,6 +29,8 @@
 # planning, workers, durable receipts and exact-run resume. Set DSR_TEST_REAL_ACT
 # to also execute release/dispatch/push jobs with act's local host runner.
 # --workflow-event-real-act-only runs just those genuine host-runner controls.
+# --relocation-stop-only checks source-transfer cancellation through the real
+# approved relocation/checkpoint path and explicit immutable-snapshot recovery.
 
 set -uo pipefail
 
@@ -4643,7 +4645,7 @@ fi
 # Source snapshots, native Go compilation, collection, state and locks are real;
 # health/slot decisions are controlled local boundaries, not host qualification.
 # --snapshot-owners-only reuses the public strict-sync/checkpoint fixture.
-# --relocation-matrix-only, --relocation-variant-only and --relocation-preview-only use explicit ELF/PE
+# --relocation-matrix-only, --relocation-variant-only, --relocation-stop-only and --relocation-preview-only use explicit ELF/PE
 # header producers and a Cargo metadata adapter. They test the task, source,
 # checkpoint and manifest protocol, not native Rust compilation, libc
 # compatibility, or Windows execution.
@@ -4653,6 +4655,7 @@ test_relocation_recovery() {
     for dependency in python3 git jq yq go rsync tar gzip; do
         if [[ "$dependency" == go &&
               ( "${1:-}" == --relocation-matrix-only || "${1:-}" == --relocation-variant-only ||
+                "${1:-}" == --relocation-stop-only ||
                 "${1:-}" == --relocation-preview-only || "${1:-}" == --recipe-binding-only ||
                 "${1:-}" == --snapshot-owners-only ) ]]; then continue; fi
         command -v "$dependency" >/dev/null || {
@@ -4677,7 +4680,8 @@ variant_only = sys.argv[2] == '--relocation-variant-only'
 preview_only = sys.argv[2] == '--relocation-preview-only'
 recipe_only = sys.argv[2] == '--recipe-binding-only'
 snapshot_only = sys.argv[2] == '--snapshot-owners-only'
-matrix_only = variant_only or preview_only or recipe_only or snapshot_only or sys.argv[2] == '--relocation-matrix-only'
+stop_only = sys.argv[2] == '--relocation-stop-only'
+matrix_only = variant_only or preview_only or recipe_only or snapshot_only or stop_only or sys.argv[2] == '--relocation-matrix-only'
 root = Path(tempfile.mkdtemp(prefix='dsr-relocation-recovery-'))
 print('Retained relocation recovery evidence: ' + str(root), flush=True)
 systems = {'Linux': 'linux', 'Darwin': 'darwin'}
@@ -4734,10 +4738,11 @@ with (case / 'recipe-events').open('a') as stream:
     stream.write(key + '\n')
 result = dict(platform=target, target_triple=triple, method='native', host=host,
               build_influence_env=dict(CARGO_BUILD_TARGET=triple, DSR_TARGET_TRIPLE=triple,
-                  DSR_RELEASE_GIT_SHA=sha, DSR_RELEASE_GIT_REF=ref),
+                  DSR_RELEASE_GIT_SHA=sha, DSR_RELEASE_GIT_REF=ref, DSR_RUST_ENV_POLICY='1'),
               # These are controlled protocol fields, not compiler attestation.
               # The actual manifest still enforces their exact source/triple binding.
-              cargo_isolation=dict(mode='strict-release-snapshot', toolchain=dict(target_triple=triple)))
+              cargo_isolation=dict(mode='strict-release-snapshot', toolchain=dict(target_triple=triple,
+                  selection=dict(native_environment=dict(DSR_RUST_ENV_POLICY='1')))))
 failed_tasks = (case / 'failures').read_text().splitlines()
 if target in failed_tasks or key in failed_tasks:
     result.update(status='failed', exit_code=6, error='explicit matrix producer failure')
@@ -4813,12 +4818,55 @@ if [[ "$RELOC_MODE" == matrix ]]; then
             "$RELOC_PHASE" "$6" "$7"
     }
 fi
-if [[ "${RELOC_VARIANT_FIXTURE:-0}" == 1 || "${RELOC_RECIPE_BINDING_FIXTURE:-0}" == 1 ]]; then
+if [[ "${RELOC_VARIANT_FIXTURE:-0}" == 1 || "${RELOC_RECIPE_BINDING_FIXTURE:-0}" == 1 ||
+      "${RELOC_STOP_FIXTURE:-0}" == 1 ]]; then
     _act_verify_strict_source_roots() (
         printf '%s\n' "$3" >> "$RELOC_CASE/source-probes" || exit 1
+        if [[ "${RELOC_STOP_FIXTURE:-0}" == 1 ]]; then
+            printf 'SOURCE-PROBE\n' >> "$RELOC_CASE/boundaries" || exit 1
+        fi
         source "$RELOC_PROJECT/src/act_runner.sh" || exit 1
         _act_verify_strict_source_roots "$@"
     )
+fi
+if [[ "${RELOC_STOP_FIXTURE:-0}" == 1 ]]; then
+    # An optional exact, unchanged relocation function supports a paired
+    # baseline without changing its surrounding real coordinator or fixtures.
+    if [[ -n "${DSR_TEST_RELOCATION_STOP_BASELINE:-}" ]]; then
+        source "$DSR_TEST_RELOCATION_STOP_BASELINE" || exit 1
+    fi
+    eval "$(declare -f _act_relocate_failed_target | sed '1s/_act_relocate_failed_target/_reloc_observed_relocation/')"
+    _act_relocate_failed_target() {
+        local relocation_status=0
+        _reloc_observed_relocation "$@" || relocation_status=$?
+        printf '%s\n' "$relocation_status" >> "$RELOC_CASE/relocation-statuses" || return 1
+        return "$relocation_status"
+    }
+    if [[ "$RELOC_PHASE" != first && "${RELOC_SOURCE_SYNC_STOP:-}" =~ ^(130|143|255)$ ]]; then
+        act_sync_sources() (
+            local argument recovery=false sync_result sync_status=0
+            for argument in "$@"; do
+                [[ "$argument" != --admission-only ]] || recovery=true
+            done
+            source "$RELOC_PROJECT/src/act_runner.sh" || exit 1
+            if $recovery; then
+                printf 'RECOVERY-ADMISSION\n' >> "$RELOC_CASE/boundaries" || exit 1
+                act_sync_sources "$@"
+                exit $?
+            fi
+            # Retain genuine immutable staging and its evidence. Inject only
+            # the transport's result at the relocation boundary; a complete
+            # existing snapshot must not authorize implicit work after a stop.
+            sync_result=$(act_sync_sources "$@") || sync_status=$?
+            if [[ "$sync_status" == 0 ]]; then
+                printf '%s\n' "$sync_result" > "$RELOC_CASE/stopped-source-sync.json" || exit 1
+            fi
+            printf 'SOURCE-SYNC-STOP %s underlying=%s\n' "$RELOC_SOURCE_SYNC_STOP" "$sync_status" \
+                >> "$RELOC_CASE/boundaries" || exit 1
+            printf '%s\n' "$sync_result"
+            exit "$RELOC_SOURCE_SYNC_STOP"
+        )
+    fi
 fi
 if [[ "${RELOC_CHECKPOINT_RACE:-0}" == 1 ]]; then
     # Retain the genuine lease acquisition, then introduce a valid but changed
@@ -5177,6 +5225,87 @@ def mutate_evidence(transform):
                 state['target_statuses'][failed]['result'].pop(key, None)
         save(path, state)
     return change
+
+
+if stop_only:
+    case, env, targets = fixture('relocation-source-stop', 'matrix')
+    env['RELOC_STOP_FIXTURE'] = '1'
+    code, first = invoke(case, env, 'first')
+    details = first.get('details', {})
+    if not check('source stop: genuine matrix retains two completed variants and a failed singleton',
+                 code == 1 and details.get('success') == 2 and details.get('failed') == 1):
+        print((case / 'first.stderr').read_text()[-7000:], flush=True)
+        raise AssertionError('Source stop fixture did not reach its partial build')
+    env['RELOC_RUN'] = details['run_id']
+    path = state_file(case, env['RELOC_RUN'])
+    initial = read(path)
+    (case / 'first.state.json').write_bytes(path.read_bytes())
+    completed = [native + '@' + gnu, native + '@' + musl]
+    evidence = retained(initial)
+    approve(case, env, failed, 'replacement', 'replacement')
+    before_state = path.read_bytes()
+    before_events = events(case)
+    source_evidence = None
+    for status in (130, 143):
+        env['RELOC_SOURCE_SYNC_STOP'] = str(status)
+        before_boundaries = len(observations(case, 'boundaries'))
+        code, unused = invoke(case, env, 'resume', 'source-stop-' + str(status), preflight_exit=status)
+        boundaries = observations(case, 'boundaries')[before_boundaries:]
+        helper_statuses = observations(case, 'relocation-statuses')
+        stopped = check('source stop %d: helper and command preserve cancellation without recovery or workers' % status,
+              code == status and helper_statuses[-1:] == [str(status)] and
+              bool(boundaries) and boundaries[-1].startswith('SOURCE-SYNC-STOP %d ' % status) and
+              'RECOVERY-ADMISSION' not in boundaries and events(case) == before_events)
+        check('source stop %d: public error retains build identity without claiming target execution' % status,
+              unused.get('status') == 'error' and unused.get('exit_code') == status and
+              unused.get('details', {}).get('repo') == 'fixture/relocfixture' and
+              unused['details'].get('version') == 'v1.0.0' and unused['details'].get('targets') == [])
+        check('source stop %d: checkpoint, approval route and every prior receipt remain immutable' % status,
+              path.read_bytes() == before_state and unchanged(evidence) and
+              not read(path).get('relocations') and
+              read(path)['target_statuses'][failed]['attempts'] == 1)
+        # If an incumbent actually continued, retain its counterexample and
+        # stop: a changed checkpoint cannot seed another independent stop.
+        if not stopped or path.read_bytes() != before_state:
+            print((case / ('source-stop-' + str(status) + '.stderr')).read_text()[-5000:], flush=True)
+            raise AssertionError('Interrupted relocation continued past its source boundary')
+        synced = read(case / 'stopped-source-sync.json')
+        source = Path(synced['source_roots']['replacement'])
+        if source_evidence is None:
+            source_evidence = {item:(digest(item), item.stat().st_ino)
+                               for item in source.rglob('*') if item.is_file()}
+        check('source stop %d: real replacement snapshot remains available unchanged for explicit recovery' % status,
+              synced.get('status') == 'success' and synced.get('target_hosts') == {failed:'replacement'} and
+              source.is_dir() and bool(source_evidence) and unchanged(source_evidence))
+
+    # SSH/transport exit255 remains an ordinary failure. The later explicit
+    # approved retry may re-admit and reuse the genuine existing snapshot.
+    env['RELOC_SOURCE_SYNC_STOP'] = '255'
+    (case / 'failures').write_text('')
+    before_boundaries = len(observations(case, 'boundaries'))
+    code, resumed = invoke(case, env, 'resume', 'explicit-recovery-after-stop')
+    final = read(path)
+    boundaries = observations(case, 'boundaries')[before_boundaries:]
+    check('source stop: explicit retry retains ordinary255 admission and verified snapshot recovery',
+          code == 0 and 'RECOVERY-ADMISSION' in boundaries and
+          observations(case, 'relocation-statuses') == ['130', '143', '0'] and
+          len(final.get('relocations', [])) == 1 and
+          final['relocations'][0]['verified_source_sync'].get('reused_verified_snapshot') is True)
+    check('source stop: recovered command executes only the failed target and preserves prior evidence',
+          final['status'] == 'completed' and resumed.get('details', {}).get('run_id') == initial['run_id'] and
+          events(case) == before_events + [failed] and final['target_statuses'][failed]['attempts'] == 2 and
+          all(final['target_statuses'][key] == initial['target_statuses'][key] for key in completed) and
+          unchanged(evidence) and unchanged(source_evidence))
+    manifest = read(case / 'output/relocfixture-v1.0.0-manifest.json')
+    check('source stop: recovered publication manifest keeps all three variants and truthful hosts',
+          manifest.get('publishable') is True and manifest.get('run_id') == initial['run_id'] and
+          manifest.get('summary') == dict(total=3, success=3, failed=0) and
+          all(row['host'] == ('replacement' if row['target'] == failed else 'completed')
+              for row in manifest.get('build_environments', [])) and
+          all(digest(case / 'output' / row['name']) == row['sha256'] for row in manifest.get('artifacts', [])))
+    save(root / 'summary.json', dict(checks=checks, failures=failures, native=native))
+    print('Relocation source cancellation: %d checks, %d failures' % (checks, failures), flush=True)
+    raise SystemExit(bool(failures))
 
 
 if snapshot_only:
@@ -6267,6 +6396,7 @@ PY
 
 if [[ "${1:-}" == --relocation-recovery-only || "${1:-}" == --relocation-hosts-only ||
       "${1:-}" == --relocation-matrix-only || "${1:-}" == --relocation-variant-only ||
+      "${1:-}" == --relocation-stop-only ||
       "${1:-}" == --relocation-preview-only || "${1:-}" == --recipe-binding-only ||
       "${1:-}" == --snapshot-owners-only ]]; then
     test_relocation_recovery "$1"
@@ -11125,6 +11255,13 @@ case "$relocation_matrix_status" in
     0) pass "reviewed singleton relocation preserves completed native variants and updates their matrix configuration binding" ;;
     77) skip "mixed relocation integration requires its local fixture dependencies" ;;
     *) fail "mixed native matrix could not safely relocate its failed singleton target" ;;
+esac
+relocation_stop_status=0
+test_relocation_recovery --relocation-stop-only || relocation_stop_status=$?
+case "$relocation_stop_status" in
+    0) pass "interrupted relocation stops before implicit recovery and explicit retry preserves ordinary transport recovery" ;;
+    77) skip "relocation source cancellation requires its local fixture dependencies" ;;
+    *) fail "relocation source cancellation started later work, changed evidence, or blocked explicit recovery" ;;
 esac
 relocation_variant_status=0
 test_relocation_recovery --relocation-variant-only || relocation_variant_status=$?
