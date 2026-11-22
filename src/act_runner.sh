@@ -11773,6 +11773,519 @@ _act_finalize_frankenterm_windows_family() {
         --manifest "$root/ft-windows-amd64.component-manifest.json" >/dev/null
 }
 
+# Resolve direct Go recipes before dispatch without executing their shell text.
+# The plan retains literal argv, cwd and environment selection; Go itself later
+# supplies package names on the selected worker. Opaque build scripts keep the
+# existing declared artifact convention, but an unproved direct Go invocation
+# must not fall back to an old executable in GOBIN.
+_act_go_output_plan() {
+    local source_root="$1" build_env="$2" build_cmd="$3" shell_kind="${4:-unix}"
+    python3 -I - "$source_root" "$shell_kind" 3<<< "$build_env" 4<<< "$build_cmd" <<'PY'
+import json, ntpath, os, posixpath, re, shlex, sys
+
+root, shell = sys.argv[1:]
+windows = shell == 'windows'
+paths = ntpath if windows else posixpath
+
+def fail(message):
+    raise ValueError('Go output selection: ' + message)
+
+def words(text):
+    # Preserve quote evidence, as the Cargo invocation reader does. shlex's
+    # non-POSIX mode splits NAME="two words"; POSIX mode loses literal dollars.
+    result, word, quote, index = [], [], '', 0
+    while index < len(text):
+        char = text[index]
+        if char == '\\' and not windows and quote != "'":
+            if index + 1 == len(text):
+                fail('unfinished shell escape')
+            if text[index + 1] != '\n':
+                word.extend(text[index:index + 2])
+            index += 2
+            continue
+        if quote:
+            word.append(char)
+            if char == quote:
+                quote = ''
+        elif char == '"' or (char == "'" and not windows):
+            quote = char
+            word.append(char)
+        elif char in ' \t\r\n;&|()<>':
+            if word:
+                result.append(''.join(word)); word = []
+            if char == '\n':
+                result.append(char)
+            elif char in ';&|()<>':
+                end = index + 1
+                while end < len(text) and text[end] in ';&|()<>':
+                    end += 1
+                result.append(text[index:end]); index = end; continue
+        elif char == '#' and not word and not windows:
+            end = text.find('\n', index)
+            index = len(text) if end < 0 else end
+            continue
+        else:
+            word.append(char)
+        index += 1
+    if quote:
+        fail('unfinished shell quote')
+    if word:
+        result.append(''.join(word))
+    return result
+
+def literal(raw, environment, forbidden=()):
+    result, quote, index = [], '', 0
+    while index < len(raw):
+        char = raw[index]
+        if char == '\\' and not windows and quote != "'":
+            if index + 1 == len(raw):
+                fail('unfinished shell escape')
+            following = raw[index + 1]
+            if quote == '"' and following not in '$`"\\\n':
+                result.append(char); index += 1; continue
+            result.append(following); index += 2; continue
+        if char == '"' or (char == "'" and not windows):
+            if not quote:
+                quote = char; index += 1; continue
+            if quote == char:
+                quote = ''; index += 1; continue
+        if not windows and char == '$' and quote != "'":
+            match = re.match(r'\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))', raw[index:])
+            if not match or (match[1] or match[2]) not in environment:
+                fail('unresolved shell variable in direct Go invocation')
+            if (match[1] or match[2]) in forbidden:
+                fail('argv expansion of a same-command environment assignment is ambiguous; use literal argv')
+            value = environment[match[1] or match[2]]
+            if not quote and (not value or re.search(r'[\s*?\[]', value)):
+                fail('unquoted Go selector requires shell splitting or globbing')
+            result.append(value); index += len(match[0]); continue
+        if windows and char in '%!^':
+            fail('CMD expansion in Go selectors is not literal; use the recipe environment')
+        if quote != "'" and char == '`':
+            fail('command substitution in Go selector')
+        if not quote and char in '*?[]{}~':
+            fail('shell expansion in Go selector')
+        result.append(char); index += 1
+    value = ''.join(result)
+    if any(ord(char) < 32 for char in value) or '\x7f' in value:
+        fail('control character in Go selector')
+    return value
+
+def go_words(value):
+    # cmd/internal/quoted.Split, also used by strict Go source-flag admission.
+    result = []
+    while value:
+        value = value.lstrip(' \t\r\n')
+        if not value:
+            break
+        if value[0] in "\"'":
+            quote, value = value[0], value[1:]
+            end = value.find(quote)
+            if end < 0:
+                fail('unterminated GOFLAGS field')
+            result.append(value[:end]); value = value[end + 1:]
+        else:
+            field = re.match(r'[^ \t\r\n]+', value)[0]
+            result.append(field); value = value[len(field):]
+    return result
+
+def absolute(value, cwd):
+    if not value:
+        fail('empty output/cwd selector')
+    if windows and (value.startswith(('\\\\', '//')) or
+                    (ntpath.splitdrive(value)[0] and not ntpath.isabs(value))):
+        fail('drive-relative or UNC Go output path')
+    return paths.normpath(value if paths.isabs(value) else paths.join(cwd, value)).replace('\\', '/') if windows else paths.normpath(value if paths.isabs(value) else paths.join(cwd, value))
+
+value_flags = {'-asmflags', '-buildmode', '-compiler', '-coverpkg', '-coverprofile',
+               '-gccgoflags', '-gcflags', '-installsuffix', '-ldflags', '-mod',
+               '-modfile', '-o', '-overlay', '-p', '-pkgdir', '-tags', '-toolexec'}
+value_flags |= {'-' + value for value in value_flags}
+
+def flags(argv, initial):
+    output, mode, selected, packages = None, None, [], []
+    for goflags, arguments in ((True, go_words(initial)), (False, argv)):
+        index = 0
+        while index < len(arguments):
+            word = arguments[index]
+            if not goflags and (word == '--' or not word.startswith('-')):
+                packages = arguments[index + (word == '--'):]; break
+            name, equals, value = word.partition('=')
+            if not word.startswith('-') or word in ('-', '--'):
+                fail('invalid GOFLAGS field')
+            if name in ('-n', '--n') and value != 'false':
+                fail('go build -n does not produce release outputs')
+            if name in value_flags and not equals:
+                if goflags or index + 1 == len(arguments):
+                    fail(name + ' requires a literal value')
+                index += 1; value = arguments[index]
+            if name in ('-o', '--o'):
+                output = value
+            else:
+                if name in ('-buildmode', '--buildmode') and value not in ('', 'default', 'exe', 'pie'):
+                    fail('Go buildmode does not produce a native executable')
+                if name in ('-mod', '--mod'):
+                    mode = value
+                # go list accepts Go build flags. Prevent an explicitly writable
+                # module mode from changing source during this later observation.
+                if name in ('-mod', '--mod') and value == 'mod':
+                    value = 'readonly'
+                selected.extend([name + '=' + value] if name in value_flags or equals else [word])
+            index += 1
+    return output, selected, packages or ['.'], mode
+
+try:
+    environment = dict(line.rstrip('\n').split('=', 1) for line in os.fdopen(3) if '=' in line)
+    command = os.fdopen(4).read()
+    if not re.search(r'\bgo(?:\.exe)?\b', command):
+        print('null'); raise SystemExit(0)
+    statements, current, unsupported = [], [], False
+    for token in words(command):
+        if token and all(char in ';&|()\n' for char in token):
+            if current:
+                statements.append(current); current = []
+            if token not in (';', '&&', '\n') and not (windows and token == '&'):
+                unsupported = True
+        else:
+            current.append(token)
+    if current:
+        statements.append(current)
+    operations, cwd, unset, saw_go = [], root, set(), False
+    for statement in statements:
+        # Redirections are not Go arguments, including when flags follow them.
+        raw, index = [], 0
+        while index < len(statement):
+            token = statement[index]
+            if token and all(char in '<>&|' for char in token):
+                if token not in ('<', '>', '>>', '2>', '>&', '&>') or index + 1 == len(statement):
+                    unsupported = True; break
+                if raw and raw[-1].isdigit():
+                    raw.pop()
+                index += 2; continue
+            raw.append(token); index += 1
+        if not raw:
+            continue
+        effective, removed, clear, position = dict(environment), set(unset), False, 0
+        inline_names = set()
+        def assignments():
+            global position
+            while position < len(raw) and re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', raw[position]):
+                name, value = raw[position].split('=', 1)
+                effective[name] = literal(value, environment)
+                removed.discard(name); inline_names.add(name); position += 1
+        assignments()
+        if position == len(raw):
+            unsupported = True  # Shell-only assignments do not establish export state.
+            environment, unset = effective, removed; continue
+        program = literal(raw[position], effective, inline_names); position += 1
+        if program == 'export' and not windows:
+            assignments()
+            if position != len(raw):
+                unsupported = True
+            environment, unset = effective, removed; continue
+        if program == 'unset' and not windows:
+            for name in raw[position:]:
+                if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name):
+                    unsupported = True; continue
+                environment.pop(name, None); unset.add(name)
+            continue
+        selected_cwd, terminal_exec = cwd, False
+        while program in ('command', 'exec', 'env') and not windows:
+            terminal_exec = terminal_exec or program == 'exec'
+            if program == 'command' and position < len(raw) and raw[position] in ('-v', '-V'):
+                program = ''; break
+            if program == 'env':
+                while position < len(raw):
+                    option = literal(raw[position], effective, inline_names)
+                    if option in ('-i', '--ignore-environment'):
+                        effective, removed, clear = {}, set(), True; position += 1
+                    elif option in ('-u', '--unset', '-C', '--chdir'):
+                        if position + 1 == len(raw):
+                            fail('incomplete env selector')
+                        value = literal(raw[position + 1], effective, inline_names); position += 2
+                        if option in ('-u', '--unset'):
+                            effective.pop(value, None); removed.add(value)
+                        else:
+                            selected_cwd = absolute(value, selected_cwd)
+                    elif option == '--':
+                        position += 1; break
+                    else:
+                        break
+                assignments()
+            elif position < len(raw) and raw[position] == '--':
+                position += 1
+            if position == len(raw):
+                program = ''; break
+            if raw[position].startswith('-'):
+                fail('unsupported wrapper around Go command')
+            program = literal(raw[position], effective, inline_names); position += 1
+        if program == 'cd' and len(raw[position:]) == 1:
+            cwd = absolute(literal(raw[position], effective, inline_names), cwd); continue
+        # Match the Cargo reader's context-changing builtin boundary. Only the
+        # literal export/unset/cd and transparent wrappers handled above have
+        # established effects on the later compiler's environment and scope.
+        if program in ('cd', 'pushd', 'popd', 'source', '.', 'eval', 'exec', 'exit', 'return',
+                       'export', 'unset', 'set', 'shopt', 'alias', 'unalias',
+                       'declare', 'typeset', 'readonly', 'local', 'read', 'readarray',
+                       'mapfile', 'getopts', 'let', 'hash', 'enable', 'trap', 'builtin', 'command',
+                       'if', 'then', 'elif', 'else', 'fi', 'for', 'while', 'until', 'do', 'done',
+                       'case', 'esac', 'select', 'in', 'break', 'continue', 'function', 'functions',
+                       'unfunction', 'autoload', 'time', '!', 'coproc'):
+            unsupported = True
+        if program == 'printf' and position < len(raw) and literal(raw[position], effective, inline_names).startswith('-v'):
+            unsupported = True
+        executable = program.replace('\\', '/').rsplit('/', 1)[-1].lower()
+        if executable not in ('go', 'go.exe'):
+            if executable in ('bash', 'sh', 'zsh', 'dash', 'cmd', 'cmd.exe', 'powershell', 'pwsh') and any(re.search(r'\bgo(?:\.exe)?\s', arg) for arg in raw[position:]):
+                fail('shell-wrapped Go output cannot be determined; use a direct command')
+            if any(arg.strip('"\'').replace('\\', '/').rsplit('/', 1)[-1] in ('go', 'go.exe') for arg in raw[position:]):
+                unsupported = True; saw_go = True
+            if terminal_exec:
+                unsupported = True
+            continue
+        saw_go = True
+        argv = [literal(arg, effective, inline_names) for arg in raw[position:]]
+        if argv and (argv[0] == '-C' or argv[0].startswith('-C=')):
+            if argv[0] == '-C':
+                if len(argv) < 2:
+                    fail('missing go -C directory')
+                selected_cwd = absolute(argv[1], selected_cwd); argv = argv[2:]
+            else:
+                selected_cwd = absolute(argv[0][3:], selected_cwd); argv = argv[1:]
+        if argv and argv[0] == 'env' and any(arg in ('-w', '-u') for arg in argv[1:]):
+            fail('persistent go env mutation inside a build recipe')
+        if not argv or argv[0] not in ('build', 'install'):
+            if terminal_exec:
+                break
+            continue
+        kind, argv = argv[0], argv[1:]
+        output, list_flags, packages, mode = flags(argv, effective.get('GOFLAGS', ''))
+        if kind == 'install' and output is not None:
+            fail('go install does not accept -o')
+        if any('@' in package for package in packages):
+            fail('version-query packages are outside the selected source tree')
+        operations.append(dict(program=program, cwd=selected_cwd, environment=effective,
+            unset=sorted(removed), clear_environment=clear, kind=kind,
+            output=None if not output else absolute(output, selected_cwd),
+            arguments=['list', '-find', '-json'] + list_flags + packages,
+            files=all(package.endswith('.go') for package in packages)))
+        if terminal_exec:
+            break
+    if saw_go and unsupported:
+        fail('conditional, piped or opaque Go command context; use a literal foreground command chain')
+    print(json.dumps(dict(shell=shell, source_root=root, operations=operations) if operations else None, separators=(',', ':')))
+except (OSError, ValueError, IndexError) as error:
+    print('[act] ' + str(error), file=sys.stderr)
+    raise SystemExit(4)
+PY
+}
+
+# Observe the exact -o operand on the actual worker. Only directories, default
+# builds and installs need Go metadata; an explicit output file is already
+# unambiguous. -find avoids dependency traversal, writable -mod=mod is replaced
+# in the plan, and proxy/sumdb access is disabled for this observation.
+_act_go_output_probe_script() {
+    local plan="$1" strict="${2:-false}"
+    python3 -I - "$strict" 3<<< "$plan" 4< <(_act_go_ambient_env_names) <<'PY'
+import json, os, sys
+plan = json.load(os.fdopen(3))
+plan['clear_selectors'] = os.fdopen(4).read().splitlines() if sys.argv[1] == 'true' else []
+if plan['shell'] == 'windows':
+    import base64
+    payload = base64.b64encode(json.dumps(plan).encode()).decode()
+    print("$ErrorActionPreference='Stop'; $plan=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + payload + "')) | ConvertFrom-Json")
+    print(r'''
+$original=[Environment]::GetEnvironmentVariables('Process'); $observations=@()
+function Get-GoSourceControls {
+    $rows=@(); $root=$plan.source_root
+    if($plan.clear_selectors.Count -gt 0) { $root=Split-Path -Parent $root }
+    foreach($file in @(Get-ChildItem -LiteralPath $root -File -Recurse -Force)) {
+        if($file.Name -in @('go.mod','go.sum','go.work','go.work.sum')) {
+            $rows+=@{path=$file.FullName;length=$file.Length;hash=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash}
+        }
+    }
+    ConvertTo-Json -InputObject @($rows | Sort-Object {$_.path}) -Compress -Depth 4
+}
+foreach ($op in $plan.operations) {
+    $environment=@{}; foreach($key in $original.Keys) { $environment[$key]=$original[$key] }
+    foreach($key in $plan.clear_selectors) { $environment.Remove($key) }
+    foreach($key in @($environment.Keys)) { if($plan.clear_selectors.Count -gt 0 -and $key -match '^PKG_CONFIG($|_)') { $environment.Remove($key) } }
+    foreach($key in $op.unset) { $environment.Remove($key) }
+    foreach($entry in $op.environment.PSObject.Properties) { $environment[$entry.Name]=[string]$entry.Value }
+    $environment['GOPROXY']='off'; $environment['GONOPROXY']='none'; $environment['GOSUMDB']='off'
+    foreach($key in @([Environment]::GetEnvironmentVariables('Process').Keys)) { if(-not $environment.ContainsKey($key)) { [Environment]::SetEnvironmentVariable($key,$null,'Process') } }
+    foreach($key in $environment.Keys) { [Environment]::SetEnvironmentVariable($key,$environment[$key],'Process') }
+    Set-Location -LiteralPath $op.cwd
+    $facts=(& $op.program env -json) -join "`n"
+    if($LASTEXITCODE -ne 0) { throw 'Go environment observation failed' }
+    $facts=$facts | ConvertFrom-Json
+    $expected=''; if($op.environment.PSObject.Properties.Name -contains 'GOFLAGS') { $expected=[string]$op.environment.GOFLAGS }
+    if([string]$facts.GOFLAGS -cne $expected) { throw 'Effective worker GOFLAGS differs from the reviewed output plan; configure it in the recipe' }
+    $isDirectory=$false; $packages=''
+    if($null -ne $op.output) {
+        $item=Get-Item -LiteralPath $op.output -Force
+        if(($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Linked Go output operand' }
+        $isDirectory=$item.PSIsContainer
+    }
+    if($null -eq $op.output -or $isDirectory -or $op.kind -eq 'install') {
+        $before=Get-GoSourceControls
+        foreach($entry in $facts.PSObject.Properties) { [Environment]::SetEnvironmentVariable($entry.Name,[string]$entry.Value,'Process') }
+        [Environment]::SetEnvironmentVariable('GOFLAGS','','Process')
+        # argv already contains the reviewed flags. GOENV=off prevents an empty
+        # variable from silently restoring a persisted GOFLAGS during this query.
+        [Environment]::SetEnvironmentVariable('GOENV','off','Process')
+        $arguments=@($op.arguments); $packages=(& $op.program @arguments) -join "`n"
+        if($LASTEXITCODE -ne 0) { throw 'Go output metadata observation failed' }
+        if($packages.Length -gt 8388608) { throw 'Go output metadata exceeds limit' }
+        if((Get-GoSourceControls) -cne $before) { throw 'Go output observation changed source control files' }
+    }
+    $observations+=@{directory=$isDirectory;packages=$packages}
+}
+ConvertTo-Json -InputObject @($observations) -Compress -Depth 5
+''')
+else:
+    print("python3 -I - <<'DSR_GO_OUTPUT_PROBE'")
+    print('import hashlib, json, os, stat, subprocess, sys')
+    print('plan = json.loads(' + repr(json.dumps(plan)) + ')')
+    print(r'''
+observations = []
+def source_controls():
+    root = os.path.dirname(plan['source_root']) if plan['clear_selectors'] else plan['source_root']
+    rows = {}
+    for directory, _, names in os.walk(root, followlinks=False):
+        for name in set(names) & {'go.mod', 'go.sum', 'go.work', 'go.work.sum'}:
+            path = os.path.join(directory, name)
+            info = os.lstat(path)
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError('Go source control file is not regular')
+            with open(path, 'rb') as stream:
+                digest = hashlib.sha256(stream.read()).hexdigest()
+            rows[path] = (info.st_dev, info.st_ino, info.st_mode, info.st_size, digest)
+    return rows
+for op in plan['operations']:
+    environment = {} if op['clear_environment'] else dict(os.environ)
+    for key in list(environment):
+        if key in plan['clear_selectors'] or (plan['clear_selectors'] and key.upper().startswith('PKG_CONFIG')):
+            environment.pop(key, None)
+    for key in op['unset']:
+        environment.pop(key, None)
+    environment.update(op['environment'])
+    environment.update(GOPROXY='off', GONOPROXY='none', GOSUMDB='off')
+    facts = subprocess.run([op['program'], 'env', '-json'], cwd=op['cwd'],
+                           env=environment, stdout=subprocess.PIPE, check=True)
+    facts = json.loads(facts.stdout)
+    if facts.get('GOFLAGS') != op['environment'].get('GOFLAGS', ''):
+        raise ValueError('effective worker GOFLAGS differs from the reviewed output plan; configure it in the recipe')
+    directory, packages = False, ''
+    if op['output'] is not None:
+        info = os.lstat(op['output'])
+        if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+            raise ValueError('Go output operand is not a regular file or directory')
+        directory = stat.S_ISDIR(info.st_mode)
+    if op['output'] is None or directory or op['kind'] == 'install':
+        before = source_controls()
+        environment.update(facts)
+        environment.update(GOFLAGS='', GOENV='off')
+        result = subprocess.run([op['program'], *op['arguments']], cwd=op['cwd'],
+                                env=environment, stdout=subprocess.PIPE, check=True)
+        if len(result.stdout) > 8 * 1024 * 1024:
+            raise ValueError('Go output metadata exceeds limit')
+        packages = result.stdout.decode('utf-8')
+        if source_controls() != before:
+            raise ValueError('Go output observation changed source control files')
+    observations.append(dict(directory=directory, packages=packages))
+print(json.dumps(observations, separators=(',', ':')))
+''')
+    print('DSR_GO_OUTPUT_PROBE')
+PY
+}
+
+_act_go_resolve_outputs() {
+    local host="$1" plan="$2" binaries="$3" platform="$4" strict="${5:-false}"
+    local program observations shell_kind probe_timeout="$_ACT_SYNC_TIMEOUT" build_shell=""
+    shell_kind=$(jq -er '.shell' <<< "$plan") || return 4
+    program=$(_act_go_output_probe_script "$plan" "$strict") || return 4
+    if [[ "$shell_kind" == windows ]]; then
+        program=$(_act_windows_build_guard_script "$probe_timeout" "$program") || return 4
+        program=$(_act_windows_encoded_powershell "$program") || return 4
+        probe_timeout=$((probe_timeout + 60))
+    else
+        _act_is_local_host "$host" && build_shell="$BASH"
+        program=$(_act_unix_build_guard_script "$probe_timeout" "$program" "$build_shell") || return 4
+        probe_timeout=$((probe_timeout + 10))
+    fi
+    observations=$(_act_ssh_exec "$host" "$program" "$probe_timeout") || return $?
+    python3 -I - "$platform" 3<<< "$plan" 4<<< "$observations" 5<<< "$binaries" <<'PY'
+import json, ntpath, os, posixpath, re, sys
+try:
+    plan, observations = json.load(os.fdopen(3)), json.load(os.fdopen(4))
+    binaries = [line.rstrip('\n') for line in os.fdopen(5) if line.rstrip('\n')]
+    windows = sys.argv[1].startswith('windows/')
+    paths = ntpath if plan['shell'] == 'windows' else posixpath
+    if not isinstance(observations, list) or len(observations) != len(plan['operations']):
+        raise ValueError('incomplete Go output observation')
+    def key(name):
+        return re.sub(r'(?i)\.exe$', '', name).lower() if windows else name
+    selected = {key(name): name for name in binaries}
+    if not binaries or len(selected) != len(binaries):
+        raise ValueError('invalid configured Go binary family')
+    produced = []
+    for operation, observation in zip(plan['operations'], observations):
+        if type(observation.get('directory')) is not bool or not isinstance(observation.get('packages'), str):
+            raise ValueError('invalid Go output observation')
+        if operation['output'] is not None and not observation['directory']:
+            produced.append(operation['output']); continue
+        data, packages, decoder, package_count = observation['packages'].lstrip(), [], json.JSONDecoder(), 0
+        while data:
+            package, offset = decoder.raw_decode(data); data = data[offset:].lstrip()
+            package_count += 1
+            if not isinstance(package, dict) or package.get('Error'):
+                raise ValueError('unresolved Go output package')
+            if package.get('Name') == 'main':
+                packages.append(package)
+        if operation['kind'] == 'build' and operation['output'] is None and (package_count != 1 or len(packages) != 1):
+            continue  # Library/multipackage builds are compile-only operations.
+        for package in packages:
+            if operation['kind'] == 'install':
+                output = package.get('Target')
+                if not isinstance(output, str) or not paths.isabs(output):
+                    raise ValueError('Go install did not report an absolute executable target')
+            else:
+                if operation['files']:
+                    files = package.get('GoFiles') or package.get('CgoFiles') or []
+                    name = paths.basename(files[0])[:-3] if files else ''
+                else:
+                    imported = package.get('ImportPath', '')
+                    name = posixpath.basename(imported)
+                    if package.get('Module') and re.fullmatch(r'v(?:[2-9]|[1-9][0-9]+)', name):
+                        name = posixpath.basename(posixpath.dirname(imported))
+                if not name or '/' in name or '\\' in name or name in ('.', '..'):
+                    raise ValueError('Go package lacks an executable name')
+                if windows:
+                    name += '.exe'
+                output = paths.join(operation['output'] or operation['cwd'], name)
+            produced.append(output.replace('\\', '/') if plan['shell'] == 'windows' else output)
+    if not produced or len(set(produced)) != len(produced):
+        raise ValueError('missing or competing Go output producers')
+    outputs = {}
+    for source in produced:
+        name = selected.get(key(paths.basename(source)))
+        if len(binaries) == 1 and len(produced) == 1:
+            name = binaries[0]
+        if name is not None:
+            if name in outputs:
+                raise ValueError('multiple Go outputs select the same release binary')
+            outputs[name] = source
+    if set(outputs) != set(binaries):
+        raise ValueError('Go output packages do not match the configured binary family')
+    directories = {paths.dirname(value) for value in outputs.values()}
+    print(json.dumps(dict(binaries=outputs, directory=next(iter(directories)) if len(directories) == 1 else None), separators=(',', ':')))
+except (OSError, ValueError, KeyError, TypeError, IndexError) as error:
+    print('[act] Go output selection: ' + str(error), file=sys.stderr)
+    raise SystemExit(4)
+PY
+}
+
 # Resolve a built output inside the language's effective output directory.
 # Usage: act_get_remote_artifact_path <language> <remote_path> <build_env> <name> <platform> [build_profile] [binary|file]
 # Only native binaries receive the Windows .exe suffix. Configured companion
@@ -14924,6 +15437,20 @@ act_run_native_build() {
         build_influence_env_json=$(_act_go_build_influence_json "$build_env") || return 4
     fi
 
+    local go_output_plan=null go_outputs=null go_output_error="" go_output_directory=""
+    if [[ "$language" == go ]]; then
+        local go_shell_kind=unix
+        _act_is_windows_host "$host" && go_shell_kind=windows
+        if ! go_output_plan=$(_act_go_output_plan "$artifact_source_root" "$build_env" \
+                "$build_cmd" "$go_shell_kind"); then
+            jq -nc --arg platform "$platform" --arg host "$host" \
+                '{platform:$platform,method:"native",host:$host,status:"error",exit_code:4,
+                  stage:"go_output_selection",artifact_path:"",artifact_paths:[],
+                  error:"Go output selection is ambiguous; use a literal foreground build or install command"}'
+            return 4
+        fi
+    fi
+
     if ! _act_is_windows_host "$host"; then
         local native_working_root="${nonstrict_source_root:-${output_stage_source:-$remote_path}}"
         native_writable_paths=$(_act_native_writable_paths_json "$remote_path" "$native_working_root" \
@@ -15715,6 +16242,21 @@ EOF
         fi
     fi
 
+    if [[ $exit_code -eq 0 && "$go_output_plan" != null ]]; then
+        local go_binaries="${workspace_binaries:-$binary_name}" go_output_status=0
+        go_outputs=$(_act_go_resolve_outputs "$host" "$go_output_plan" "$go_binaries" \
+            "$platform" "$strict_native_build" 2> >(tee -a "$log_file" >&2)) || go_output_status=$?
+        if [[ $go_output_status -eq 0 ]] &&
+           go_output_directory=$(jq -er '.directory // ""' <<< "$go_outputs"); then
+            :
+        else
+            exit_code="$go_output_status"
+            [[ $exit_code -ne 0 ]] || exit_code=4
+            go_output_error="Cannot resolve the exact outputs of the successful Go command; refusing artifact collection"
+            _log_error "$go_output_error"
+        fi
+    fi
+
     # The ephemeral stage root (isolated source copy + fresh cargo-home) is
     # never needed once the build command has exited: artifacts are collected
     # from CARGO_TARGET_DIR, which always lives outside it. Remove it on every
@@ -15731,7 +16273,7 @@ EOF
 
     # Determine result
     local status local_artifact_path="" local_artifact_paths=()
-    local native_execution_error=""
+    local native_execution_error="$go_output_error"
     local additional_artifact_receipts=()
     local collected_sha256="" collected_size_bytes=0 collected_identity=""
     local strict_collection_receipts=()
@@ -15802,10 +16344,20 @@ EOF
         local download_failed=false
         for bin in "${binaries_to_download[@]}"; do
             local remote_artifact_path
-            remote_artifact_path=$(act_get_remote_artifact_path "$language" "$artifact_source_root" "$build_env" "$bin" "$platform" "$build_profile")
+            if [[ "$go_output_plan" != null ]]; then
+                remote_artifact_path=$(jq -er --arg name "$bin" '.binaries[$name] | strings | select(length>0)' \
+                    <<< "$go_outputs") || return 4
+            else
+                remote_artifact_path=$(act_get_remote_artifact_path "$language" "$artifact_source_root" "$build_env" "$bin" "$platform" "$build_profile")
+            fi
 
             local artifact_filename
-            artifact_filename=$(basename "$remote_artifact_path")
+            if [[ "$go_output_plan" != null ]]; then
+                artifact_filename="$bin"
+                [[ "$platform" != windows/* ]] || artifact_filename="${bin%.[eE][xX][eE]}.exe"
+            else
+                artifact_filename=$(basename "$remote_artifact_path")
+            fi
             local this_artifact_path="$artifact_dir/$artifact_filename"
             local member_collected=false workspace_member_receipt=""
             local collection_receipt="" collection_mode=""
@@ -15817,7 +16369,7 @@ EOF
                 [[ "$platform" == windows/* ]] && collection_mode=600
                 if _act_is_local_host "$host"; then
                     local copy_src="$remote_artifact_path"
-                    if [[ ! -f "$copy_src" && "$copy_src" == *.exe && \
+                    if [[ "$go_output_plan" == null && ! -f "$copy_src" && "$copy_src" == *.exe && \
                           -f "${copy_src%.exe}" && ! -L "${copy_src%.exe}" ]]; then
                         copy_src="${copy_src%.exe}"
                         _log_info "Windows artifact lacks .exe suffix; streaming $copy_src"
@@ -15841,7 +16393,7 @@ EOF
                         "$ssh_destination" "$remote_artifact_path") || collection_receipt=""
                 fi
 
-                if [[ -z "$collection_receipt" && "$remote_artifact_path" == *.exe ]] && \
+                if [[ "$go_output_plan" == null && -z "$collection_receipt" && "$remote_artifact_path" == *.exe ]] && \
                    ! _act_is_local_host "$host"; then
                     local fallback_dir alt_remote_artifact_path="${remote_artifact_path%.exe}"
                     if fallback_dir=$(mktemp -d "$artifact_dir/retry.XXXXXXXX") && \
@@ -15922,7 +16474,7 @@ EOF
                 # returned the same (first-collected) binary for every
                 # target.
                 local copy_src="$remote_artifact_path"
-                if [[ ! -f "$copy_src" ]] && [[ "$copy_src" == *.exe ]]; then
+                if [[ "$go_output_plan" == null && ! -f "$copy_src" && "$copy_src" == *.exe ]]; then
                     local alt_src="${copy_src%.exe}"
                     if [[ -f "$alt_src" ]]; then
                         copy_src="$alt_src"
@@ -15975,7 +16527,7 @@ EOF
                 # dest keeps its .exe suffix so downstream packaging still
                 # produces a conventional Windows bv.exe.
                 local fallback_ok=false
-                if [[ "$remote_artifact_path" == *.exe ]]; then
+                if [[ "$go_output_plan" == null && "$remote_artifact_path" == *.exe ]]; then
                     local alt_remote_artifact_path="${remote_artifact_path%.exe}"
                     local alt_scp_output
                     if alt_scp_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" scp \
@@ -16086,13 +16638,15 @@ EOF
                 download_failed=true
                 continue
             fi
-            archive_file_remote=$(act_get_remote_artifact_path \
+            if [[ "$go_output_plan" != null && -n "$go_output_directory" ]]; then
+                archive_file_remote="$go_output_directory/$archive_file"
+            elif [[ "$go_output_plan" != null ]] || ! archive_file_remote=$(act_get_remote_artifact_path \
                 "$language" "$artifact_source_root" "$build_env" "$archive_file" \
-                "$platform" "$build_profile" file) || {
+                "$platform" "$build_profile" file); then
                 _log_error "Cannot resolve workspace archive member: $archive_file"
                 download_failed=true
                 continue
-            }
+            fi
             archive_file_local="$artifact_dir/$archive_file"
             archive_file_mode=600
             [[ "$archive_file_executable" == "true" ]] && archive_file_mode=700
@@ -16177,13 +16731,15 @@ EOF
                 download_failed=true
                 continue
             fi
-            additional_remote=$(act_get_remote_artifact_path \
+            if [[ "$go_output_plan" != null && -n "$go_output_directory" ]]; then
+                additional_remote="$go_output_directory/$additional_name"
+            elif [[ "$go_output_plan" != null ]] || ! additional_remote=$(act_get_remote_artifact_path \
                 "$language" "$artifact_source_root" "$build_env" "$additional_name" \
-                "$platform" "$build_profile" file) || {
+                "$platform" "$build_profile" file); then
                 _log_error "Cannot resolve additional release artifact: $additional_name"
                 download_failed=true
                 continue
-            }
+            fi
             additional_local="$artifact_dir/$additional_name"
             additional_receipt=""
             if $strict_native_build; then

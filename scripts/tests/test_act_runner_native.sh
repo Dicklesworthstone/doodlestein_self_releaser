@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_act_runner_native.sh - Unit tests for act_runner.sh native build SSH logic
 #
-# Usage: ./test_act_runner_native.sh [--typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --large-inventory-only | --workspace-archives-only | --failure-evidence-only | --env-precedence-only | --archive-delivery-only | --zig-dispatch-only | --glibc-routing-only | --windows-launcher-transfer-only | --artifact-transfer-only]
+# Usage: ./test_act_runner_native.sh [--go-outputs-only | --typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --large-inventory-only | --workspace-archives-only | --failure-evidence-only | --env-precedence-only | --archive-delivery-only | --zig-dispatch-only | --glibc-routing-only | --windows-launcher-transfer-only | --artifact-transfer-only]
 #
 # Tests native build SSH command construction with mocks.
 # Covers: command construction, path handling, env vars, SCP, error handling.
@@ -13,6 +13,187 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SRC_DIR="$PROJECT_ROOT/src"
+
+# Genuine Go compiler and native backend: the installed-directory decoy must
+# never replace the actual command output. Only host health is a fixture; the
+# launcher, metadata probes, compiler, executable validation and collection run.
+test_go_native_output_selection() {
+    local dependency
+    for dependency in python3 jq yq go; do
+        command -v "$dependency" >/dev/null || { printf 'SKIP: Go output test needs %s\n' "$dependency"; return 3; }
+    done
+    [[ "$(go version 2>/dev/null)" == 'go version go'* ]] || { printf 'SKIP: real Go compiler unavailable\n'; return 3; }
+    python3 -I - "$PROJECT_ROOT" <<'PY'
+import hashlib, json, os, pathlib, shutil, subprocess, sys, tarfile, tempfile
+
+root = pathlib.Path(sys.argv[1])
+work = pathlib.Path(tempfile.mkdtemp(prefix='dsr-go-outputs-'))
+print('Retained Go output evidence: ' + str(work), flush=True)
+environment = {key: value for key, value in os.environ.items() if not key.startswith('BASH_FUNC_')}
+environment.update(GOENV='off', GOTOOLCHAIN='local', CGO_ENABLED='0', GOMAXPROCS='2',
+                   GOCACHE=str(work / 'go-cache'), GOPROXY='off', GOSUMDB='off', RCH_REQUIRE_REMOTE='0')
+environment.pop('GOFLAGS', None)
+host_go = json.loads(subprocess.run(['go', 'env', '-json', 'GOHOSTOS', 'GOHOSTARCH'],
+                    env=environment, check=True, capture_output=True, text=True, timeout=10).stdout)
+host_platform = host_go['GOHOSTOS'] + '/' + host_go['GOHOSTARCH']
+environment.update(GOOS=host_go['GOHOSTOS'], GOARCH=host_go['GOHOSTARCH'])
+print('Executable Go fixture platform: ' + host_platform, flush=True)
+if environment.get('DSR_TEST_ACT_RUNNER'):
+    # Retain the complete original module at a normal module-relative location.
+    # A line-based function extractor cannot distinguish heredoc closing braces.
+    baseline = work / 'baseline-module'
+    baseline.mkdir()
+    for dependency in (root / 'src').iterdir():
+        if dependency.name == 'act_runner.sh':
+            shutil.copy2(environment['DSR_TEST_ACT_RUNNER'], baseline / dependency.name)
+        else:
+            (baseline / dependency.name).symlink_to(dependency.resolve(), target_is_directory=dependency.is_dir())
+    environment['DSR_TEST_ACT_RUNNER'] = str(baseline / 'act_runner.sh')
+checks = failures = 0
+
+def check(label, ok):
+    global checks, failures
+    checks += 1; failures += not ok
+    print(('PASS: ' if ok else 'FAIL: ') + label, flush=True)
+
+def write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+def build(source, destination):
+    subprocess.run(['go', '-C', str(source), 'build', '-p=1', '-buildvcs=false', '-o', str(destination), '.'],
+                   env=environment, check=True, timeout=35, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+stale_source = work / 'stale-source'
+write(stale_source / 'go.mod', 'module fixture.invalid/stale\n\ngo 1.21\n')
+write(stale_source / 'main.go', 'package main\nfunc main() { println("stale-11") }\n')
+stale = work / 'stale'
+build(stale_source, stale)
+stale_hash = hashlib.sha256(stale.read_bytes()).hexdigest()
+driver = r'''
+set -uo pipefail
+root=$1; case_root=$2; platform=$3
+export DSR_CONFIG_DIR="$case_root/config" DSR_STATE_DIR="$case_root/state" DSR_CACHE_DIR="$case_root/cache"
+export ACT_REPOS_DIR="$DSR_CONFIG_DIR/repos.d" DSR_HOSTS_FILE="$DSR_CONFIG_DIR/hosts.yaml"
+export ACT_ARTIFACTS_DIR="$case_root/artifacts" ACT_LOGS_DIR="$case_root/logs" DSR_BUILD_TIMEOUT=30
+source "$root/src/config.sh" || exit 90
+source "${DSR_TEST_ACT_RUNNER:-$root/src/act_runner.sh}" || exit 91
+source "$root/src/artifact_naming.sh" || exit 92
+host_health_is_ready() { return 0; }
+act_run_native_build outputs "$platform" v1.0.0 output-test '' '' '' localnative
+'''
+
+def run_case(name, command, *, expected=True, platform=host_platform, overrides=None,
+             inherited=None, library=False, family=None, preparation=None):
+    case = work / name
+    source, installed = case / 'source', case / 'installed'
+    source.mkdir(parents=True); installed.mkdir()
+    write(source / 'go.mod', 'module fixture.invalid/actual/v2\n\ngo 1.21\n')
+    write(source / 'main.go', 'package main\nfunc main() { println("fresh-73") }\n')
+    if library:
+        write(source / 'library/lib.go', 'package library\nconst Value = 73\n')
+    for binary in ['tool', 'actual', 'ghost']:
+        shutil.copy2(stale, installed / binary)
+        shutil.copy2(stale, source / binary)
+    (source / 'dist').mkdir()
+    if family:
+        for binary in family:
+            write(source / 'cmd' / binary / 'main.go',
+                  'package main\nfunc main() { println("fresh-' + binary + '") }\n')
+    recipe_env = {key: environment[key] for key in ('PATH', 'GOCACHE', 'GOTOOLCHAIN', 'GOENV', 'CGO_ENABLED', 'GOMAXPROCS')}
+    if 'GOROOT' in environment:
+        recipe_env['GOROOT'] = environment['GOROOT']
+    recipe_env['GOBIN'] = str(installed)
+    if overrides:
+        recipe_env.update({key: str(value).replace('@CASE@', str(case)) for key, value in overrides.items()})
+    if preparation:
+        preparation(case)
+    config = dict(tool_name='outputs', repo='fixture/outputs', language='go', binary_name='tool',
+                  local_path=str(source), targets=[platform], act_job_map={platform: None},
+                  hosts={platform: 'localnative'}, build_cmd=command.replace('@CASE@', str(case)),
+                  env=recipe_env, artifact_naming='${name}-${version}-${os}-${arch}.${ext}',
+                  archive_format={'linux': 'tar.gz', 'windows': 'zip'}, include_files=[],
+                  include_extra_files=False, flat_archive=True)
+    if family:
+        config['workspace_binaries'] = family
+    write(case / 'config/repos.d/outputs.yaml', json.dumps(config))
+    write(case / 'config/hosts.yaml', json.dumps(dict(schema_version='1.0.0', hosts={
+        'localnative': dict(platform=host_platform, connection='local', concurrency=1)})))
+    env = dict(environment)
+    if inherited:
+        env.update(inherited)
+    before = (source / 'go.mod').read_bytes()
+    result = subprocess.run(['bash', '-c', driver, 'go-output-test', str(root), str(case), platform],
+                            env=env, capture_output=True, text=True, timeout=45)
+    write(case / 'result.json', result.stdout); write(case / 'stderr.log', result.stderr)
+    try:
+        receipt = json.loads(result.stdout)
+    except ValueError:
+        receipt = {}
+    if expected:
+        ok = result.returncode == 0 and receipt.get('status') == 'success'
+        artifacts = receipt.get('artifact_paths', [])
+        if ok and len(artifacts) == 1:
+            artifact = pathlib.Path(artifacts[0])
+            if family:
+                with tarfile.open(artifact) as archive:
+                    members = {member.name.lstrip('./'): member for member in archive.getmembers() if member.isfile()}
+                    ok = set(members) == set(family)
+                    for binary in family:
+                        destination = case / ('extracted-' + binary)
+                        destination.write_bytes(archive.extractfile(members[binary]).read()); destination.chmod(0o700)
+                        output = subprocess.run([str(destination)], capture_output=True, text=True, timeout=5)
+                        ok = ok and output.returncode == 0 and output.stderr.strip() == 'fresh-' + binary
+            elif platform.startswith('windows/'):
+                ok = artifact.name == 'tool.exe' and artifact.read_bytes()[:2] == b'MZ'
+            else:
+                output = subprocess.run([str(artifact)], capture_output=True, text=True, timeout=5)
+                ok = output.returncode == 0 and output.stderr.strip() == 'fresh-73'
+        else:
+            ok = False
+        check(name + ' collects the actual fresh command output', ok)
+    else:
+        check(name + ' refuses stale output authority', result.returncode != 0 and not receipt.get('artifact_paths'))
+    check(name + ' preserves source controls', before == (source / 'go.mod').read_bytes())
+    return case, receipt
+
+case, _ = run_case('explicit-file', 'go build -p=1 -buildvcs=false -o tool .')
+check('go build leaves old GOBIN executable untouched', hashlib.sha256((case / 'installed/tool').read_bytes()).hexdigest() == stale_hash)
+run_case('explicit-alias', 'go build -p=1 -buildvcs=false -o chosen-name .')
+run_case('existing-directory', 'go build -p=1 -buildvcs=false -o dist .')
+run_case('default-module-name', 'go build -p=1 -buildvcs=false .')
+run_case('install-target', 'go install -p=1 -buildvcs=false .')
+run_case('reviewed-goflags-directory', 'go build -p=1 -buildvcs=false .', overrides={'GOFLAGS': '-o=dist'})
+run_case('command-overrides-goflags', 'go build -p=1 -buildvcs=false -o tool .', overrides={'GOFLAGS': '-o=dist'})
+run_case('compile-only-decoy', 'go build -p=1 -buildvcs=false ./...', library=True, expected=False)
+run_case('compile-only-then-producer', 'go build -p=1 -buildvcs=false ./... && go build -p=1 -buildvcs=false -o chosen-name .', library=True)
+run_case('ambient-no-build', 'go build -p=1 -buildvcs=false -o tool .', inherited={'GOFLAGS': '-n'}, expected=False)
+run_case('persisted-output', 'go build -p=1 -buildvcs=false .', expected=False,
+         overrides={'GOENV': '@CASE@/go-env'},
+         preparation=lambda case: write(case / 'go-env', 'GOFLAGS=-o=elsewhere\n'))
+run_case('workspace-chain', 'go build -p=1 -buildvcs=false -o dist/alpha ./cmd/alpha && go build -p=1 -buildvcs=false -o dist/beta ./cmd/beta', family=['alpha', 'beta'])
+run_case('unix-windows-explicit-no-suffix', 'go build -p=1 -buildvcs=false -o chosen-name .', platform='windows/amd64')
+for name, command in [
+    ('exit-before-build', 'exit 0; go build -o tool .'),
+    ('mutating-go-env', 'go env -w GOFLAGS=-n; go build -o tool .; go env -u GOFLAGS'),
+    ('conditional-output', 'if true; then go build -o tool .; fi'),
+    ('prefix-expansion', 'GOBIN=@CASE@/source go build -o "$GOBIN/tool" .'),
+    ('prefix-cd-expansion', 'GOBIN=@CASE@/source cd "$GOBIN"; go build -o tool .'),
+    ('unexported-selector', 'GOBIN=@CASE@/source; go install .'),
+    ('declared-selector', 'declare -x GOFLAGS=-n; go build -o tool .'),
+]:
+    case, receipt = run_case(name, command, expected=False)
+    check(name + ' refuses before compiler dispatch', 'native_execution' not in receipt)
+
+print(f'Go native outputs: checks={checks} passed={checks-failures} failed={failures}', flush=True)
+raise SystemExit(bool(failures))
+PY
+}
+
+if [[ "${1:-}" == --go-outputs-only ]]; then
+    test_go_native_output_selection
+    exit $?
+fi
 
 # Run real native collection and external SSH/SCP processes under the existing
 # transfer budget. Host readiness and compiler execution are controlled; the
@@ -2855,10 +3036,25 @@ _test_native_windows_toolchain() {
 _act_ssh_exec() {
     local host="$1"
     local cmd
+    cmd=$(_test_decode_remote_command "$2")
+    if [[ "$cmd" == *DSR_GO_OUTPUT_PROBE* || "$cmd" == *Get-GoSourceControls* ]]; then
+        # Synthetic worker metadata for the command-construction suite only.
+        # The --go-outputs-only lane compiles and observes real Go packages.
+        # Record this transport separately so compiler guard assertions still
+        # count the one actual build invocation, not its metadata observation.
+        printf 'GO_OUTPUT_PROBE_HOST:%s\nGO_OUTPUT_PROBE_TIMEOUT:%s\n' \
+            "$host" "${3:-0}" >> "$SSH_ARGS_FILE"
+        local probe_status
+        probe_status=$(cat "$SSH_EXIT_CODE_FILE")
+        if [[ "$probe_status" -eq 0 ]]; then
+            jq -nc --arg name "${MOCK_BINARY_NAME:-tool}" \
+                '[{directory:false,packages:({Name:"main",ImportPath:("fixture/"+$name)}|tojson)}]'
+        fi
+        return "$probe_status"
+    fi
     if [[ "$2" == '# DSR_UNIX_BUILD_GUARD'* ]]; then
         printf 'UNIX_GUARD_TIMEOUT:%s\n' "${3:-0}" >> "$SSH_ARGS_FILE"
     fi
-    cmd=$(_test_decode_remote_command "$2")
     # Append for subshell-safe capture: a build now issues follow-up exec
     # calls (stage-root cleanup) and the build command must stay recorded.
     # Prefix every line so get_ssh_cmd retains the complete PowerShell command,
@@ -3407,6 +3603,11 @@ test_unix_cd_command() {
         log_pass "Ordinary native compiler is supervised once with transport cleanup grace"
     else
         log_fail "Ordinary native compiler lacks its Unix host guard"
+    fi
+    if [[ "$(grep '^GO_OUTPUT_PROBE_TIMEOUT:' "$SSH_ARGS_FILE")" == "GO_OUTPUT_PROBE_TIMEOUT:$((_ACT_SYNC_TIMEOUT + 10))" ]]; then
+        log_pass "Go output observation has a separate supervised transport"
+    else
+        log_fail "Go output observation was not separately supervised"
     fi
 }
 

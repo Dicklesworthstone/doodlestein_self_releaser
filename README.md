@@ -322,6 +322,24 @@ Unix staging reserves the sibling names `source` and `cargo-home`, and verifies
 that every controller checkout still matches its pin before staging. Source-root
 verification is separate from Go compiler and module-cache isolation.
 
+For native recipes that directly run `go build` or `go install`, DSR collects
+the output selected by that command. An explicit `-o` file is collected from
+that exact path; an output directory, default build name, or installation
+target is resolved with Go on the selected worker. The configured release
+binary name is preserved even when the compiler's output has a different name.
+An existing executable in `GOBIN` cannot substitute for `go build -o tool .`.
+Workspace recipes must identify one unambiguous producer for every requested
+executable; compiling library packages alone does not establish an output.
+
+Use literal foreground commands for direct Go recipes. Conditional output
+selection, unmodelled shell state changes and ambiguous variable expansion are
+refused. Configure intentional `GOFLAGS` in the recipe's `env` entries:
+different inherited or persisted worker flags prevent collection, including
+flags that make a successful command produce no executable. Output metadata
+queries use the worker's Go context, disable dependency downloads, retain
+timeout supervision, and refuse changes to Go source control files. Recipes
+that invoke a separate build script keep their declared artifact convention.
+
 Strict Go workers also clear inherited compiler and source selectors before
 applying the reviewed repository recipe. They use `GOENV=off`, empty `GOFLAGS`,
 `GOTOOLCHAIN=local`, and `GO111MODULE=on` by default. A committed root `go.work`
