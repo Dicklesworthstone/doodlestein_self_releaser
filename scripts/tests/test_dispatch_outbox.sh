@@ -4,6 +4,11 @@
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 MODULE="${DISPATCH_TEST_MODULE:-$ROOT/src/dispatch.sh}"
+TEST_MODE="${1:-}"
+[[ $# -eq 0 || ( $# -eq 1 && "$TEST_MODE" == --interruption-only ) ]] || {
+    printf 'Usage: %s [--interruption-only]\n' "$0" >&2
+    exit 4
+}
 WORK=$(mktemp -d)
 trap 'rm -rf -- "$WORK"' EXIT
 mkdir -p "$WORK/bin" "$WORK/cases"
@@ -33,6 +38,7 @@ if [[ "$repo" == owner/b ]]; then
         reject) code=422 ;;
         uncertain) code=000; rc=28 ;;
         auth-like-transport) code=000; rc=3 ;;
+        interrupted) code="${DP_STOP_HTTP:-204}"; rc="${DP_STOP_STATUS:-130}" ;;
         cooldown) code=429; extra=$'Retry-After: 86400\r\n' ;;
         unknown-cooldown) code=429; extra=$'Retry-After: Wed, 21 Oct 2030 07:28:00 GMT\r\n' ;;
         elapsed) code=429; extra=$'Retry-After: 0\r\n' ;;
@@ -73,7 +79,7 @@ check() {
 new_case() {
     CASE="$WORK/cases/$1"; mkdir "$CASE"
     export DP_CASE="$CASE" DSR_STATE_DIR="$CASE/state" DSR_GH_TOKEN=fixture-token
-    unset DP_MODE DP_AUTH_FAIL_AT DP_AUTH_STALL_AT DP_PREPARE_FAIL DP_STDIN_CONSUMER DRY_RUN
+    unset DP_MODE DP_AUTH_FAIL_AT DP_AUTH_STALL_AT DP_PREPARE_FAIL DP_STDIN_CONSUMER DP_STOP_STATUS DP_STOP_HTTP DRY_RUN
     : > "$CASE/calls.jsonl"
 }
 capture() { status=0; "$@" > "$CASE/out" 2> "$CASE/err" || status=$?; }
@@ -108,6 +114,130 @@ stdin_six_release() {
             false false stdin_consuming_guard
     fi
 }
+
+# Curl's exit/status boundary is injected; the real outbox, supervisor, files,
+# hashes and subprocesses run. An HTTP 204 body cannot acknowledge a stopped
+# request or permit another destination POST in the same invocation.
+for stopped in 130 124; do
+    new_case "interrupted-$stopped"
+    export DP_MODE=interrupted DP_STOP_STATUS="$stopped"
+    capture release --repos owner/a,owner/b,owner/c
+    check "transport $stopped stops the active release dispatch" test "$status" -eq 5
+    check "transport $stopped performs no later destination POST" test "$(count)" -eq 2
+    STATE=$(state_path)
+    check "transport $stopped retains accepted, uncertain and never-started work" jq -e \
+        --argjson stopped "$stopped" '
+            [.deliveries[].repo]==["owner/a","owner/b","owner/c"] and
+            .deliveries[0].history[-1].outcome=="accepted" and
+            .deliveries[1].history[-1].outcome=="uncertain" and
+            .deliveries[2].history==[] and
+            (.deliveries[1].history[-1].receipt |
+                .exit_code==5 and .attempts==1 and .http_status=="204" and
+                .interruption=={stage:"transport",exit_code:$stopped,outcome:"unconfirmed"})
+        ' "$STATE"
+    check "transport $stopped returns one interrupted aggregate" jq -e \
+        '.status=="incomplete" and .exit_code==5 and
+         [.results[].outcome]==["accepted","uncertain","pending"]' "$CASE/out"
+    cp "$STATE" "$CASE/interrupted-state.json"
+    cp "$CASE/owner_b.json" "$CASE/interrupted-request.json"
+    stopped_history=$(jq -Sc '.deliveries[1]' "$STATE")
+    accepted_history=$(jq -Sc '.deliveries[0]' "$STATE")
+    capture without_auth release --repos owner/a,owner/b,owner/c --status
+    check "transport $stopped offline inspection reports unresolved delivery" test "$status" -eq 8
+    check "transport $stopped offline inspection preserves all evidence" cmp -s "$STATE" "$CASE/interrupted-state.json"
+    check "transport $stopped inspection never calls a destination" test "$(count)" -eq 2
+    unset DP_MODE DP_STOP_STATUS
+    capture release --repos owner/a,owner/b,owner/c
+    check "transport $stopped explicit resume keeps the stopped POST uncertain" test "$status" -eq 8
+    check "transport $stopped ordinary resume sends only never-started work" test "$(count)" -eq 3
+    check "transport $stopped ordinary resume preserves the original uncertain history" \
+        test "$(jq -Sc '.deliveries[1]' "$STATE")" = "$stopped_history"
+    capture release --repos owner/a,owner/b,owner/c --retry-uncertain
+    check "transport $stopped consented resend can finish the exact saved plan" test "$status" -eq 0
+    check "transport $stopped consented resend touches only the uncertain destination" test "$(count)" -eq 4
+    check "transport $stopped consented resend preserves original request bytes" cmp -s "$CASE/owner_b.json" "$CASE/interrupted-request.json"
+    check "transport $stopped accepted history is never rewritten" test "$(jq -Sc '.deliveries[0]' "$STATE")" = "$accepted_history"
+    check "transport $stopped recovered history retains stop evidence and consent" jq -e \
+        --argjson stopped "$stopped" '
+            .deliveries[1].history | length==2 and
+            .[0].receipt.interruption.exit_code==$stopped and
+            .[1].outcome=="accepted" and .[1].resend_uncertain==true
+        ' "$STATE"
+    interrupted_state=$(jq '.deliveries[1].history[0].receipt.interruption.exit_code=28' "$STATE")
+    printf '%s\n' "$interrupted_state" > "$STATE"
+    capture release --repos owner/a,owner/b,owner/c
+    check "transport $stopped rejects forged interruption classification" test "$status" -eq 2
+    check "transport $stopped corrupt evidence performs no POST" test "$(count)" -eq 4
+done
+
+# Raw curl proxy/DNS failure and its own network timeout remain ordinary
+# unknown delivery; they do not cancel other pending destinations.
+for stopped in 5 28; do
+    new_case "ordinary-transport-$stopped"
+    export DP_MODE=interrupted DP_STOP_STATUS="$stopped" DP_STOP_HTTP=000
+    capture release --repos owner/a,owner/b,owner/c
+    check "raw curl $stopped preserves ordinary uncertain status" test "$status" -eq 8
+    check "raw curl $stopped does not cancel unaffected destinations" test "$(count)" -eq 3
+    STATE=$(state_path)
+    check "raw curl $stopped cannot manufacture cancellation evidence" jq -e \
+        '[.deliveries[].history[-1].outcome]==["accepted","uncertain","accepted"] and
+         (.deliveries[1].history[-1].receipt | .exit_code==8 and (has("interruption")|not))' "$STATE"
+done
+
+# A receipt encoder can emit bytes and still fail. Once the transport has
+# stopped, that local reporting failure must not allow another destination.
+new_case stopped-receipt-error
+export DP_MODE=interrupted DP_STOP_STATUS=130
+with_failed_receipt_writer() (
+    result_writer=$(declare -f _dp_result)
+    _dp_result() {
+        local writer_fails=false
+        [[ "$1" != owner/b || -e "$DP_CASE/receipt-failed" ]] || writer_fails=true
+        # Restore the real encoder inside this worker before invoking it.
+        # The marker also lets the coordinator's fallback retain real bytes.
+        eval "$result_writer"
+        _dp_result "$@" || return $?
+        if $writer_fails; then
+            : > "$DP_CASE/receipt-failed" || return 1
+            return 1
+        fi
+    }
+    release --repos owner/a,owner/b,owner/c
+)
+capture with_failed_receipt_writer
+check 'failed receipt encoding cannot erase an observed transport stop' test "$status" -eq 5
+check 'failed receipt encoding after a stop never starts another destination' test "$(count)" -eq 2
+STATE=$(state_path)
+check 'failed receipt encoding retains cancellation and pending work' jq -e \
+    '.deliveries[1].history[-1].receipt.exit_code==5 and
+     .deliveries[1].history[-1].receipt.interruption.exit_code==130 and
+     .deliveries[2].history==[]' "$STATE"
+
+# Explicit worker failure injection: a stopped delivery can emit no receipt.
+# Its retained sending intent proves an attempt may have crossed the boundary,
+# never permission to start the remaining configured destinations.
+new_case receiptless-stop
+receiptless_stop() (
+    _dp_deliver() {
+        printf '{"destination":"%s"}\n' "$1" >> "$DP_CASE/calls.jsonl"
+        return 143
+    }
+    release --repos owner/a,owner/b
+)
+capture receiptless_stop
+check 'a stopped worker without a receipt terminates the active outbox' test "$status" -eq 5
+check 'a receiptless stop never starts a later destination' test "$(count)" -eq 1
+STATE=$(state_path)
+check 'a receiptless stop retains uncertainty and its original status' jq -e \
+    '.deliveries[1].history==[] and (.deliveries[0].history[-1] |
+     .outcome=="uncertain" and .receipt.exit_code==5 and
+     .receipt.interruption.exit_code==143 and .receipt.http_status==null)' "$STATE"
+
+if [[ "$TEST_MODE" == --interruption-only ]]; then
+    printf '\nDispatch interruption checks: %d; failures: %d\n' "$checks" "$failures"
+    [[ "$failures" -eq 0 ]]
+    exit $?
+fi
 
 # Captured from the unchanged default plan at 4008703. Retained outboxes must
 # remain readable without changing request hashes or receiver delivery IDs.
@@ -443,7 +573,7 @@ done
 new_case transport-deadline
 export DP_MODE=stall
 DISPATCH_TIMEOUT=1 capture release
-check 'transport deadline preserves delivery uncertainty' test "$status" -eq 8
+check 'transport deadline stops the dispatch with delivery uncertainty' test "$status" -eq 5
 check 'transport deadline attempts each destination once' test "$(count)" -eq 2
 STATE=$(state_path)
 accepted_before=$(jq -Sc '.deliveries[0]' "$STATE")

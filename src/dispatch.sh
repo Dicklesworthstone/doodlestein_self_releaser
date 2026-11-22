@@ -18,6 +18,16 @@ _dp_repo() {
 
 _dp_int() { [[ "$1" =~ ^(0|[1-9][0-9]{0,5})$ ]] && (( $1 >= $2 && $1 <= $3 )); }
 
+# Classify the curl/supervisor boundary, not GitHub CLI exit codes. In
+# particular, curl 5 is a proxy lookup failure and 28 is a network deadline;
+# neither is an explicit cancellation of the complete dispatch invocation.
+_dp_transport_stopped() {
+    local status="${1:-0}"
+    [[ "$status" =~ ^[0-9]+$ ]] || return 1
+    ((status == 42 || status == 124 || status == 125 ||
+      (status >= 129 && status <= 255)))
+}
+
 _dp_body() {
     local event="$1" payload="$2"
     [[ -n "$event" && "$event" != *[[:cntrl:]]* ]] || return 4
@@ -119,8 +129,11 @@ _dp_header() {
 _dp_result() {
     jq -nc --arg repo "$1" --arg event "$2" --arg outcome "$3" \
         --argjson code "$4" --argjson attempts "$5" --arg http "$6" --argjson retry_at "${7:-null}" \
+        --argjson stopped "${8:-0}" \
         '{repo:$repo,event_type:$event,outcome:$outcome,exit_code:$code,
-          attempts:$attempts,http_status:(if $http=="" then null else $http end),retry_not_before:$retry_at}'
+          attempts:$attempts,http_status:(if $http=="" then null else $http end),retry_not_before:$retry_at} +
+         (if $stopped == 0 then {} else
+            {interruption:{stage:"transport",exit_code:$stopped,outcome:"unconfirmed"}} end)'
 }
 
 # A known failure before any HTTP invocation is safe to retry normally. Keep
@@ -135,7 +148,7 @@ _dp_blocked_result() {
 _dp_deliver() (
     set -o pipefail
     local repo="$1" event="$2" body="$3" guard="${4:-}" work attempt=0 rc=0 http=''
-    local outcome=uncertain code=8 delay retry_after remaining reset now retry_at=null
+    local outcome=uncertain code=8 delay retry_after remaining reset now retry_at=null stopped=0
     [[ -z "$guard" ]] || declare -F "$guard" >/dev/null || {
         _dp_blocked_result "$repo" "$event" 3; return $?;
     }
@@ -169,8 +182,11 @@ _dp_deliver() (
         fi
         attempt=$((attempt + 1))
         _dp_http "$repo" "$work/body" "$work" || rc=$?
+        if _dp_transport_stopped "$rc"; then stopped="$rc"; fi
         if ! http=$(cat "$work/code"); then
-            outcome=uncertain; code=8; break
+            outcome=uncertain; code=8
+            ((stopped == 0)) || code=5
+            break
         fi
         # _dp_http returns 3 without invoking curl when its last token lookup
         # fails. Curl's write-out supplies a status (including 000) when it
@@ -182,6 +198,10 @@ _dp_deliver() (
         [[ "$http" =~ ^[0-9]{3}$ ]] || http=''
         if (( rc != 0 )); then
             outcome=uncertain; code=8
+            # Bytes emitted before a stopped transport do not acknowledge the
+            # POST. Preserve uncertainty for explicit recovery while telling
+            # the coordinator to stop this invocation before another target.
+            ((stopped == 0)) || code=5
             break
         fi
         case "$http" in
@@ -221,7 +241,10 @@ _dp_deliver() (
     done
     _dp_log_info "$repo: $outcome (HTTP ${http:-unknown}, attempts $attempt)"
     [[ "$outcome" == rate_limited ]] || retry_at=null
-    _dp_result "$repo" "$event" "$outcome" "$code" "$attempt" "$http" "$retry_at" || return 1
+    _dp_result "$repo" "$event" "$outcome" "$code" "$attempt" "$http" "$retry_at" "$stopped" || {
+        ((stopped == 0)) || return 5
+        return 1
+    }
     return "$code"
 )
 
@@ -412,18 +435,24 @@ _dp_state_valid() {
         (if ($plans | length) == 1 then $plans[0]
          else error("Expected one dispatch plan") end) as $plan |
         def integer: type=="number" and .>=0 and .==floor;
+        def interruption:
+            type=="object" and (keys==["exit_code","outcome","stage"]) and
+            .stage=="transport" and .outcome=="unconfirmed" and
+            (.exit_code|integer and (.==5 or .==42 or .==124 or .==125 or (.>=129 and .<=255)));
         def receipt($r; $t):
             type=="object" and .repo==$r.repo and .event_type==($r.body|fromjson|.event_type) and
             (.attempts|integer and .<=10) and (.outcome=="blocked" or .attempts>=1) and
             (.http_status==null or (.http_status|type=="string" and test("^[0-9]{3}$"))) and
             (.retry_not_before==null or (.retry_not_before|integer and .<=9999999999)) and
             (.outcome=="rate_limited" or .retry_not_before==null) and .outcome==$t.outcome and
+            (if has("interruption") then .outcome=="uncertain" and .exit_code==5 and
+                (.interruption|interruption) else .exit_code!=5 or .outcome=="blocked" end) and
             (if .outcome=="accepted" then .exit_code==0 and .http_status=="204"
              elif .outcome=="rejected" then
                 (.exit_code==3 and (.http_status=="401" or .http_status=="403" or .http_status==null)) or
                 (.exit_code==7 and (["400","404","405","410","422"]|index($t.receipt.http_status))!=null)
              elif .outcome=="rate_limited" then .exit_code==8 and (.http_status=="403" or .http_status=="429")
-             elif .outcome=="uncertain" then .exit_code==8
+             elif .outcome=="uncertain" then .exit_code==8 or .exit_code==5
              elif .outcome=="blocked" then .http_status==null and
                  (.exit_code|integer and .>=1 and .<=8)
              else false end);
@@ -481,7 +510,7 @@ _dp_release_outbox() (
     umask 077
     local plan="$1" root="$2" retry_uncertain="$3" inspect="$4" guard="${5:-}" identity key session file
     local require_existing="${6:-false}"
-    local work='' state next oldhash current i indices repo body event receipt outcome rc=0 retry_at now result
+    local work='' state next oldhash current i indices repo body event receipt outcome rc=0 retry_at now result stopped
     [[ "$require_existing" == true || "$require_existing" == false ]] || return 4
     [[ -z "$guard" ]] || declare -F "$guard" >/dev/null || return 3
     identity=$(_dp_outbox_identity "$plan") || return $?
@@ -564,17 +593,27 @@ _dp_release_outbox() (
         # after this point leaves a sending/uncertain state, not pending work.
         result=0
         receipt=$(_dp_deliver "$repo" "$event" "$body" "$guard") || result=$?
+        stopped=0
+        # A worker can be signalled before it emits any receipt. Its saved
+        # sending intent remains authoritative: the POST outcome is unknown,
+        # and no subsequent destination may be started in this invocation.
+        if ((result == 5)) || _dp_transport_stopped "$result"; then stopped="$result"; fi
         if ! jq -e -s --arg repo "$repo" --arg event "$event" --argjson rc "$result" '
                 length==1 and (.[0]|type=="object" and .repo==$repo and .event_type==$event and
                 .exit_code==$rc and (.attempts|type=="number" and .>=0) and
                 ((.outcome=="accepted" and $rc==0 and .http_status=="204") or
                  (.outcome!="accepted" and $rc!=0)))' <<< "$receipt" >/dev/null 2>&1; then
-            receipt=$(_dp_result "$repo" "$event" uncertain 8 1 '') || return 1
+            if ((stopped != 0)); then
+                receipt=$(_dp_result "$repo" "$event" uncertain 5 1 '' null "$stopped") || return 1
+            else
+                receipt=$(_dp_result "$repo" "$event" uncertain 8 1 '') || return 1
+            fi
         fi
         next=$(jq -Sc --argjson i "$i" --argjson receipt "$receipt" \
             '.deliveries[$i].history[-1] += {outcome:$receipt.outcome,receipt:$receipt}' <<< "$state") || return 1
         oldhash=$(_dp_state_write "$file" "$next" "$oldhash" "$work" "$plan") || return $?
         state="$next"
+        if ((stopped != 0)); then rc=5; break; fi
         if [[ "$(jq -r '.outcome' <<< "$receipt")" == blocked ]]; then rc="$result"; break; fi
     done 3<<< "$indices" </dev/null
     current=$(_dp_state_hash "$file") || return $?
@@ -685,7 +724,7 @@ dispatch_release_json() (
     return "$rc"
 )
 
-export -f _dp_log_error _dp_log_info _dp_repo _dp_int _dp_body _dp_resolve_token _dp_get_token
+export -f _dp_log_error _dp_log_info _dp_repo _dp_int _dp_transport_stopped _dp_body _dp_resolve_token _dp_get_token
 export -f _dp_config _dp_http _dp_header _dp_result _dp_blocked_result _dp_deliver _dp_repos
 export -f _dp_digest_text _dp_state_hash _dp_release_plan _dp_outbox_identity _dp_state_valid _dp_state_write
 export -f _dp_outbox_summary _dp_release_outbox

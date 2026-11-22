@@ -46,6 +46,8 @@ case "${DP_MODE:-success}" in
     forbidden-rate) code=403; extra=$'Retry-After: 0\r\n' ;;
     secondary) code=429 ;;
     mixed) [[ "$repo" != owner/b ]] || code=422 ;;
+    stopped) code=204; rc="${DP_STOP_STATUS:-130}" ;;
+    self-term) kill -TERM "$$"; exit 99 ;;
     delay) sleep 0.15 ;;
     stall) sleep 4 ;;
 esac
@@ -78,7 +80,7 @@ new_case() {
     CASE="$WORK/cases/$1"; mkdir "$CASE"; export DP_TEST_CASE="$CASE"
     export DSR_STATE_DIR="$CASE/state"
     : > "$CASE/calls"; : > "$CASE/argv"; : > "$CASE/gh-calls"
-    unset DP_MODE DP_READ_STDIN DP_AUTH_STALL DRY_RUN
+    unset DP_MODE DP_READ_STDIN DP_AUTH_STALL DP_STOP_STATUS DRY_RUN
     export DSR_GH_TOKEN=dsr-explicit GITHUB_TOKEN=github-other GH_TOKEN=gh-other
 }
 capture() { status=0; "$@" > "$CASE/out" 2> "$CASE/err" || status=$?; }
@@ -120,6 +122,26 @@ for pair in lost:8 server:8 bad-ack:8 forbidden:3 unauthorized:3 invalid:7 redir
     check "$mode is not blindly replayed" test "$(count)" -eq 1
     check "$mode never reports acceptance" jq -e '.outcome!="accepted" and .exit_code!=0' "$CASE/out"
 done
+
+for stopped in 42 124 125 130 137 143; do
+    new_case "stopped-$stopped"; export DP_MODE=stopped DP_STOP_STATUS="$stopped"
+    capture dispatch_event owner/repo release
+    check "transport stop $stopped returns interruption" test "$status" -eq 5
+    check "transport stop $stopped is never retried" test "$(count)" -eq 1
+    check "transport stop $stopped keeps outcome uncertain despite an emitted 204" jq -e \
+        --argjson stopped "$stopped" '
+            .outcome=="uncertain" and .exit_code==5 and .attempts==1 and .http_status=="204" and
+            .interruption=={stage:"transport",exit_code:$stopped,outcome:"unconfirmed"}
+        ' "$CASE/out"
+done
+
+new_case self-term; export DP_MODE=self-term
+capture dispatch_event owner/repo release
+check 'an actually signalled curl process returns interruption' test "$status" -eq 5
+check 'an actually signalled curl process is not retried' test "$(count)" -eq 1
+check 'signal termination retains transport uncertainty' jq -e \
+    '.outcome=="uncertain" and .exit_code==5 and .http_status==null and
+     .interruption.exit_code==143' "$CASE/out"
 
 new_case rate; export DP_MODE=rate
 capture dispatch_event owner/repo release
@@ -225,10 +247,11 @@ started=$SECONDS
 DISPATCH_TIMEOUT=1 capture dispatch_event owner/repo release
 elapsed=$((SECONDS-started))
 check 'transport process respects the external deadline' test "$elapsed" -lt 4
-check 'transport deadline returns uncertain delivery' test "$status" -eq 8
+check 'transport deadline stops delivery with an uncertain outcome' test "$status" -eq 5
 check 'transport deadline never blindly replays a started POST' test "$(count)" -eq 1
 check 'transport deadline retains its attempted request' jq -e \
-    '.outcome=="uncertain" and .attempts==1 and .exit_code==8 and .http_status==null' "$CASE/out"
+    '.outcome=="uncertain" and .attempts==1 and .exit_code==5 and .http_status==null and
+     .interruption.exit_code==124' "$CASE/out"
 
 new_case batch-invalid
 capture dispatch_batch release --repos 'owner/valid,../invalid' --payload '{}'

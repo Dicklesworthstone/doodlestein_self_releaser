@@ -135,6 +135,17 @@ After checking the receiver and its deduplication policy, an operator can select
 recorded in attempt history. This option can cause duplicate downstream effects;
 it does not make the GitHub dispatch endpoint exactly-once.
 
+An explicit transport cancellation or termination by DSR's request supervisor
+also stops the current release fan-out before any later destination is started.
+That invocation returns exit `5`; its attempted destination remains `uncertain`,
+with the observed transport or worker status in `receipt.interruption.exit_code` and
+`outcome: "unconfirmed"`. Even a complete HTTP `204` emitted before the failed
+transport cannot acknowledge that request. Accepted destinations retain their
+exact history, and unstarted destinations remain pending. A fresh ordinary
+resume can deliver the pending work, while replaying the interrupted POST still
+requires `--retry-uncertain`. Offline inspection reports unresolved uncertainty
+as exit `8` and preserves every saved byte.
+
 State lives under `DISPATCH_STATE_DIR`, otherwise
 `${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/dispatch`. An explicit
 `--state-dir` overrides that root. Each invocation has a digest-named directory
@@ -193,9 +204,12 @@ curl, including on hosts without GNU `timeout`. A credential lookup that times
 out returns dependency error 3 before starting a POST. Pending work remains
 pending; an existing delivery intent records a blocked receipt with no new
 HTTP attempt and can be retried normally. If the transport has started when
-its deadline expires, delivery remains uncertain (exit 8), even if no HTTP
-status was returned. It is never replayed automatically. Each lookup and
-transport has its own deadline; this setting is not a whole-release deadline.
+its deadline expires, delivery remains uncertain even if no HTTP status was
+returned. A curl network deadline remains exit `8`; expiry of DSR's
+outer supervisor stops the invocation with exit `5` and retains the original
+supervisor status in the uncertain receipt. Neither is replayed automatically.
+Each lookup and transport has its own deadline; this setting is not a
+whole-release deadline.
 
 ## API and structured output
 
@@ -222,8 +236,9 @@ unresolved, never substituted with an unrelated PWD commit.
 
 Typical exits are 0 for acknowledged completion or an explicitly labeled plan,
 1 for incomplete fan-out or local I/O failure, 2 for plan/state/lock conflict,
-3 for missing credentials/dependencies, 4 for invalid arguments, 7 for a single
-request's definitive rejection, and 8 for uncertain delivery or an exhausted
+3 for missing credentials/dependencies, 4 for invalid arguments, 5 for an
+interrupted dispatch invocation, 7 for a single request's definitive rejection,
+and 8 for uncertain delivery or an exhausted
 single-request rate limit. These are also the saved-handoff recovery command's
 exits; the publishing command separately reports downstream failure in its
 dispatch details without changing successful publication into an upload error.

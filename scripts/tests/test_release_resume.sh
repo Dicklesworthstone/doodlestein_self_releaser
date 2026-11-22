@@ -458,6 +458,7 @@ dispatch_fixture_response() {
         case "$DISPATCH_MODE" in
             reject) code=422 ;;
             uncertain) code=000; rc=28 ;;
+            interrupted) code=204; rc="${DISPATCH_STOP_STATUS:-130}" ;;
         esac
     fi
     if [[ "$DISPATCH_MODE" == draft-after-first && "$destination" == owner/a ]]; then
@@ -2340,6 +2341,93 @@ test_release_dispatch_saved_state_is_validated_before_network() {
         cmp -s "$CALLS" "$CASE/calls.before"
 }
 
+test_release_dispatch_interrupt_preserves_publication() {
+    local stopped outbox
+    for stopped in 130 124; do
+        setup "dispatch_interrupted_$stopped"
+        export DSR_DISPATCH_REPOS=owner/a,owner/b,owner/c
+        DISPATCH_MODE=interrupted DISPATCH_STOP_STATUS="$stopped"
+        run_release --resume
+        outbox=$(jq -r '.details.dispatch.outbox_file // empty' "$CASE/stdout")
+        [[ $STATUS -eq 0 && -f "$outbox" && ! -e "$CASE/dispatch/owner_c.json" ]] &&
+            jq -e '.draft==false' "$CASE/release.json" >/dev/null &&
+            jq -e -s 'length==2 and [.[].destination]==["owner/a","owner/b"]' \
+                "$CASE/dispatch-calls.jsonl" >/dev/null &&
+            jq -e -s 'length==1 and (.[0] | .status=="success" and .exit_code==0 and
+                .details.dispatch.status=="failed" and .details.dispatch.exit_code==5 and
+                [.details.dispatch.results[].outcome]==["accepted","uncertain","pending"])' \
+                "$CASE/stdout" >/dev/null &&
+            jq -e --argjson stopped "$stopped" '
+                [.deliveries[].history|length]==[1,1,0] and
+                .deliveries[0].history[0].outcome=="accepted" and
+                (.deliveries[1].history[0].receipt |
+                    .outcome=="uncertain" and .exit_code==5 and .http_status=="204" and
+                    .interruption=={stage:"transport",exit_code:$stopped,outcome:"unconfirmed"})
+            ' "$outbox" >/dev/null || return 1
+    done
+}
+
+test_release_dispatch_saved_interrupt_propagates_and_recovers() {
+    local stopped outbox inspect_status accepted_history
+    for stopped in 130 124; do
+        setup "dispatch_saved_interrupted_$stopped"
+        export DSR_DISPATCH_REPOS=owner/a,owner/b,owner/c
+        # Save a valid plan with one accepted destination and two pending.
+        # The real publication guard stops delivery when the fixture becomes
+        # draft after its first POST; no outbox state is fabricated.
+        DISPATCH_MODE=draft-after-first
+        run_release --resume
+        outbox=$(jq -r '.details.dispatch.outbox_file // empty' "$CASE/stdout")
+        [[ $STATUS -eq 0 && -f "$outbox" ]] &&
+            jq -e '.details.dispatch.exit_code==7 and
+                [.details.dispatch.results[].outcome]==["accepted","pending","pending"]' \
+                "$CASE/stdout" >/dev/null || return 1
+        accepted_history=$(jq -Sc '.deliveries[0]' "$outbox") || return 1
+        jq '.draft=false' "$CASE/release.json" > "$CASE/restored-release.json" &&
+            mv "$CASE/restored-release.json" "$CASE/release.json" || return 1
+        DISPATCH_MODE=interrupted DISPATCH_STOP_STATUS="$stopped"
+        run_dispatch_recovery --outbox "$outbox"
+        [[ $STATUS -eq 5 && ! -e "$CASE/dispatch/owner_c.json" ]] &&
+            jq -e -s 'length==2 and [.[].destination]==["owner/a","owner/b"]' \
+                "$CASE/dispatch-calls.jsonl" >/dev/null &&
+            jq -e -s --argjson stopped "$stopped" 'length==1 and (.[0] |
+                .command=="release-dispatch" and .exit_code==5 and .details.exit_code==5 and
+                [.details.results[].outcome]==["accepted","uncertain","pending"] and
+                .details.results[1].receipt.interruption.exit_code==$stopped)' \
+                "$CASE/stdout" >/dev/null || return 1
+        cp "$outbox" "$CASE/stopped-outbox.json" &&
+            cp "$CALLS" "$CASE/stopped-calls" &&
+            cp "$CASE/dispatch/owner_b.json" "$CASE/stopped-request.json" || return 1
+        inspect_status=0
+        (
+            _dp_get_token() { printf 'AUTH-ATTEMPT\n' >> "$CALLS"; return 3; }
+            unset DSR_GH_TOKEN GITHUB_TOKEN GH_TOKEN
+            run_dispatch_recovery --outbox "$outbox" --status
+            exit "$STATUS"
+        ) || inspect_status=$?
+        [[ $inspect_status -eq 8 ]] &&
+            cmp -s "$outbox" "$CASE/stopped-outbox.json" &&
+            cmp -s "$CALLS" "$CASE/stopped-calls" &&
+            jq -e '.command=="release-dispatch" and .exit_code==8' "$CASE/stdout" >/dev/null || return 1
+        DISPATCH_MODE=success
+        run_dispatch_recovery --outbox "$outbox"
+        [[ $STATUS -eq 8 ]] &&
+            jq -e -s 'length==3 and [.[].destination]==["owner/a","owner/b","owner/c"]' \
+                "$CASE/dispatch-calls.jsonl" >/dev/null &&
+            jq -e '.deliveries[1].history|length==1' "$outbox" >/dev/null || return 1
+        run_dispatch_recovery --outbox "$outbox" --retry-uncertain
+        [[ $STATUS -eq 0 && "$(jq -Sc '.deliveries[0]' "$outbox")" == "$accepted_history" ]] &&
+            cmp -s "$CASE/dispatch/owner_b.json" "$CASE/stopped-request.json" &&
+            jq -e -s 'length==4 and [.[].destination]==["owner/a","owner/b","owner/c","owner/b"]' \
+                "$CASE/dispatch-calls.jsonl" >/dev/null &&
+            jq -e --argjson stopped "$stopped" '.deliveries[1].history | length==2 and
+                .[0].receipt.interruption.exit_code==$stopped and
+                .[1].outcome=="accepted" and .[1].resend_uncertain==true' "$outbox" >/dev/null &&
+            jq -e '.command=="release-dispatch" and .exit_code==0 and
+                .details.status=="accepted" and .details.exit_code==0' "$CASE/stdout" >/dev/null || return 1
+    done
+}
+
 test_invalid_journal_is_not_upload_authority() {
     setup invalid_journal
     printf 'not json' > "$DSR_STATE_DIR/releases/tool-v1.2.3-upload.json"
@@ -4119,6 +4207,8 @@ for test in test_release_auth_cancellation_never_falls_back_or_publishes \
     test_release_dispatch_saved_uncertain_requires_explicit_retry \
     test_release_dispatch_saved_recovery_refuses_remote_drift \
     test_release_dispatch_saved_state_is_validated_before_network \
+    test_release_dispatch_interrupt_preserves_publication \
+    test_release_dispatch_saved_interrupt_propagates_and_recovers \
     test_invalid_journal_is_not_upload_authority test_empty_artifacts_are_not_a_release \
     test_unmanifested_directory_is_refused test_artifacts_must_come_from_the_tagged_commit \
     test_manifest_source_without_checkout_pins_creation_and_dispatch \
