@@ -13339,7 +13339,9 @@ EOF
             release_json=""
         fi
     else
-        release_json=$(gh_api "repos/$repo/releases/tags/$tag" 2>/dev/null)
+        release_json=$(gh_api "repos/$repo/releases/tags/$tag" 2>/dev/null) || {
+            if _release_contract_report_interruption "$?" release-verify verification "$repo" "$tag"; then return 5; fi
+        }
     fi
     if [[ -z "$release_json" ]] || ! echo "$release_json" | jq -e '.id' &>/dev/null; then
         log_error "Release $tag not found in $repo"
@@ -13862,7 +13864,7 @@ EOF
             # successful upload response alone does not prove the final release
             # still serves the requested asset.
             local repair_identity="" repair_upload_url="" repair_manifest_sha="$ordinary_repair_manifest_sha" repair_rows=""
-            local repair_result="" repair_asset="" repair_inventory=""
+            local repair_result="" repair_asset="" repair_inventory="" repair_status=0
             local -A repair_shas=() repair_sizes=() repair_remote_ids=()
 
             _release_ordinary_repair_identity() {
@@ -13882,9 +13884,11 @@ EOF
 
             _release_ordinary_repair_source_matches() {
                 [[ -n "$ordinary_repair_source_sha" ]] || return 0
-                local remote_sha
-                if ! remote_sha=$(gh_resolve_tag_sha "$repo" "$tag"); then
+                local remote_sha request_status
+                if remote_sha=$(gh_resolve_tag_sha "$repo" "$tag"); then :; else
+                    request_status=$?
                     log_error "Could not resolve repair source tag $tag to the manifest commit"
+                    if _gh_operation_interrupted "$request_status"; then return "$request_status"; fi
                     return 1
                 fi
                 if [[ "$remote_sha" != "$ordinary_repair_source_sha" ]]; then
@@ -13894,12 +13898,20 @@ EOF
             }
 
             _release_ordinary_repair_context_matches() {
-                local observed identity encoded_tag
-                observed=$(gh_api "repos/$repo/releases/$release_id" --no-cache) || return 1
+                local observed identity encoded_tag request_status
+                if observed=$(gh_api "repos/$repo/releases/$release_id" --no-cache); then :; else
+                    request_status=$?
+                    if _gh_operation_interrupted "$request_status"; then return "$request_status"; fi
+                    return 1
+                fi
                 identity=$(_release_ordinary_repair_identity "$observed") || return 1
                 [[ "$identity" == "$repair_identity" ]] || return 1
                 encoded_tag=$(jq -rn --arg tag "$tag" '$tag | @uri') || return 1
-                observed=$(gh_api "repos/$repo/releases/tags/$encoded_tag" --no-cache) || return 1
+                if observed=$(gh_api "repos/$repo/releases/tags/$encoded_tag" --no-cache); then :; else
+                    request_status=$?
+                    if _gh_operation_interrupted "$request_status"; then return "$request_status"; fi
+                    return 1
+                fi
                 identity=$(_release_ordinary_repair_identity "$observed") || return 1
                 [[ "$identity" == "$repair_identity" ]] || return 1
                 _release_ordinary_repair_source_matches
@@ -13918,10 +13930,14 @@ EOF
             )
 
             _release_ordinary_repair_inventory() {
-                local page=1 response count inventory='[]'
+                local page=1 response count inventory='[]' request_status
                 while ((page <= 100)); do
-                    response=$(gh_api "repos/$repo/releases/$release_id/assets?per_page=100&page=$page" \
-                        --no-cache) || return 1
+                    if response=$(gh_api "repos/$repo/releases/$release_id/assets?per_page=100&page=$page" \
+                        --no-cache); then :; else
+                        request_status=$?
+                        if _gh_operation_interrupted "$request_status"; then return "$request_status"; fi
+                        return 1
+                    fi
                     if ! jq -es '
                         length == 1 and (.[0] | type == "array" and length <= 100 and
                             all(.[]; type == "object" and
@@ -13942,8 +13958,8 @@ EOF
                         jq -ce '
                             select((([.[].id] | unique | length) == length) and
                                    (([.[].name] | unique | length) == length))
-                        ' <<< "$inventory"
-                        return $?
+                        ' <<< "$inventory" || return 1
+                        return 0
                     fi
                     page=$((page + 1))
                 done
@@ -13971,7 +13987,10 @@ EOF
                 done <<< "$repair_rows"
 
                 for missing in ${assets_to_fix[@]+"${assets_to_fix[@]}"}; do
-                    if ! _release_ordinary_repair_context_matches ||
+                    repair_status=0
+                    _release_ordinary_repair_context_matches || repair_status=$?
+                    if _release_contract_report_interruption "$repair_status" release-verify verification "$repo" "$tag"; then return 5; fi
+                    if ((repair_status != 0)) ||
                        [[ "$(_gh_asset_sha256 "$manifest_file")" != "$repair_manifest_sha" ]]; then
                         ordinary_repair_errors+=("Release identity, source tag, or selected manifest changed before repair upload")
                         break
@@ -13984,13 +14003,15 @@ EOF
                             continue
                         }
                     else
+                        if _release_contract_report_interruption "$?" release-verify upload "$repo" "$tag"; then return 5; fi
                         ordinary_repair_errors+=("Verified upload failed: $missing")
                     fi
                 done
 
                 # Observe release identity before the final asset snapshot so
                 # no later release response can contain ignored asset changes.
-                if ! _release_ordinary_repair_context_matches; then
+                if _release_ordinary_repair_context_matches; then :; else
+                    if _release_contract_report_interruption "$?" release-verify verification "$repo" "$tag"; then return 5; fi
                     ordinary_repair_errors+=("Release identity or source tag changed after repair")
                 fi
                 # Derive every required name from the same complete paginated
@@ -13998,7 +14019,10 @@ EOF
                 # rather than combining individually successful stale scans.
                 present_assets=()
                 missing_assets=()
-                if ! repair_inventory=$(_release_ordinary_repair_inventory); then
+                repair_status=0
+                repair_inventory=$(_release_ordinary_repair_inventory) || repair_status=$?
+                if ((repair_status != 0)); then
+                    if _release_contract_report_interruption "$repair_status" release-verify verification "$repo" "$tag"; then return 5; fi
                     ordinary_repair_errors+=("Could not read a complete, unambiguous remote asset inventory after repair")
                 else
                     for expected in "${expected_assets[@]}"; do
@@ -14013,6 +14037,7 @@ EOF
                         elif _release_ordinary_repair_verify_asset "$expected" "$repair_asset"; then
                             present_assets+=("$expected")
                         else
+                            if _release_contract_report_interruption "$?" release-verify verification "$repo" "$tag"; then return 5; fi
                             ordinary_repair_errors+=("Remote asset differs from the selected manifest: $expected")
                         fi
                     done
@@ -14023,7 +14048,8 @@ EOF
                 # Asset inventory reads and byte verification can outlive the
                 # earlier release observation. Re-resolve the actual Git ref
                 # before reporting success, including repairs with no uploads.
-                if ! _release_ordinary_repair_source_matches; then
+                if _release_ordinary_repair_source_matches; then :; else
+                    if _release_contract_report_interruption "$?" release-verify verification "$repo" "$tag"; then return 5; fi
                     ordinary_repair_errors+=("Release tag no longer matches the selected manifest source after repair")
                 fi
             fi

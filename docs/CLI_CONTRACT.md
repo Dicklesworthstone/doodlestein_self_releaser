@@ -1503,6 +1503,17 @@ strict checksum-sidecar materialization. Repair failures appear in
 `details.repair.errors` when present; normal verification and dry-run output keep
 their existing shape.
 
+Ordinary repair stops on a terminal adapter status during release discovery,
+release-ID or tag context checks, source-ref verification, uploads, final
+paginated inventory, or remote asset-byte verification. It returns exit `5`
+with one `details.interruption` object containing the original `exit_code`,
+`stage: "verification"` or `"upload"`, and `outcome: "unconfirmed"`. No later
+GitHub read or upload runs in that invocation. Local artifacts and manifest
+custody remain unchanged, and owned build leases are released. A fresh explicit
+repair verifies the selected release and already accepted bytes before uploading
+only missing assets. Local validation errors retain ordinary failure semantics;
+raw curl exit `5` remains a transport failure with bounded reconciliation.
+
 Downstream dispatch uses a persistent outbox keyed by the source repository and
 GitHub release ID. Accepted destinations are skipped across process restarts;
 definitively rejected destinations can retry, and uncertain POSTs require an

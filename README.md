@@ -1211,6 +1211,13 @@ matching the owned release can establish its last known visibility. Ordinary
 transient failures still use bounded reconciliation; an explicit retry
 revalidates the retained creation and publication evidence.
 
+Ordinary `dsr release verify TOOL VERSION --fix` also stops immediately when
+release discovery, source verification, asset inspection, or an upload is
+interrupted. It returns exit `5` and retains the original adapter status in
+`details.interruption`. An upload may already have reached GitHub; rerunning
+the same repair command verifies the existing release and uploads only missing
+assets. Selected local artifacts and their manifest remain unchanged.
+
 ### `dsr installer`
 
 Generate the `curl | bash` installer for a tool from its `repos.d/<tool>.yaml`:

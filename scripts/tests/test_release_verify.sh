@@ -2675,6 +2675,22 @@ seed_ordinary_verify_repair() {
 }
 
 create_ordinary_verify_repair_mock() {
+    _ordinary_repair_stop_boundary() {
+        local phase="$1" request="$2" count
+        [[ -n "${ORDINARY_REPAIR_STOP_CASE:-}" ]] || return 0
+        printf '%s\n' "$request" >> "$ORDINARY_REPAIR_ROOT/network"
+        [[ "$phase" == "$ORDINARY_REPAIR_STOP_CASE" &&
+           ! -e "$ORDINARY_REPAIR_ROOT/stopped" ]] || return 0
+        count=0
+        [[ ! -f "$ORDINARY_REPAIR_ROOT/boundary-count" ]] ||
+            count=$(cat "$ORDINARY_REPAIR_ROOT/boundary-count")
+        count=$((count + 1))
+        printf '%s\n' "$count" > "$ORDINARY_REPAIR_ROOT/boundary-count"
+        [[ "$count" == "${ORDINARY_REPAIR_STOP_AFTER:-1}" ]] || return 0
+        printf '%s\n' "$request" > "$ORDINARY_REPAIR_ROOT/stopped"
+        wc -l < "$ORDINARY_REPAIR_ROOT/network" > "$ORDINARY_REPAIR_ROOT/stopped-count"
+        return "${ORDINARY_REPAIR_STOP_STATUS:-130}"
+    }
     _ordinary_repair_release_json() {
         jq -nc --arg tag "$(cat "$ORDINARY_REPAIR_ROOT/tag")" \
             --arg upload_repo "$(cat "$ORDINARY_REPAIR_ROOT/upload-repo")" \
@@ -2694,6 +2710,15 @@ create_ordinary_verify_repair_mock() {
                 ;;
             api)
                 printf '%s\n' "${2:-}" >> "$ORDINARY_REPAIR_ROOT/api-calls"
+                local phase=other
+                case "${2:-}" in
+                    */git/ref/tags/*) phase=source ;;
+                    */releases/tags/*) phase=tag ;;
+                    */releases/12345) phase=context ;;
+                    */releases/12345/assets\?*) phase=inventory ;;
+                    */releases/assets/*) phase=download ;;
+                esac
+                _ordinary_repair_stop_boundary "$phase" "GET:${2:-}" || return $?
                 if [[ -n "${VERIFY_FIX_CUSTODY_ROOT:-}" ]]; then
                     _verify_fix_custody_boundary "${2:-}" || return $?
                 fi
@@ -2771,9 +2796,17 @@ create_ordinary_verify_repair_mock() {
                         fi
                         snapshot=$(jq --argjson start "$(((10#$page - 1) * 100))" \
                             '.[$start:($start + 100)]' "$ORDINARY_REPAIR_ROOT/assets.json") || return 9
+                        if [[ "${ORDINARY_REPAIR_STOP_CASE:-}" == download && "$inventory_gets" -ge 3 ]]; then
+                            snapshot=$(jq 'map(if .id == 101 then del(.digest) else . end)' \
+                                <<< "$snapshot") || return 9
+                        fi
                         printf '%s\n' "$snapshot" > "$ORDINARY_REPAIR_ROOT/last-inventory.json"
                         printf '%s\n' "$snapshot"
                         return 0
+                        ;;
+                    repos/testuser/test-tool/releases/assets/101)
+                        cat "${ORDINARY_REPAIR_MANIFEST%/*}/test-tool-linux-amd64"
+                        return $?
                         ;;
                 esac
                 ;;
@@ -2837,6 +2870,9 @@ create_ordinary_verify_repair_mock() {
                 > "$ORDINARY_REPAIR_ROOT/assets.next" || return 9
             mv "$ORDINARY_REPAIR_ROOT/assets.next" "$ORDINARY_REPAIR_ROOT/assets.json" || return 9
         fi
+        # Stop after the server accepted the bytes. A cancelled caller must
+        # leave their uncertain outcome for a new invocation to reconcile.
+        _ordinary_repair_stop_boundary upload "POST:$url" || return $?
         if [[ "$ORDINARY_REPAIR_MODE" == tag_after_upload ]]; then
             printf 'v9.9.9\n' > "$ORDINARY_REPAIR_ROOT/tag"
         fi
@@ -2853,13 +2889,124 @@ create_ordinary_verify_repair_mock() {
             printf '201'
         fi
     }
-    export -f gh curl _ordinary_repair_release_json
+    export -f gh curl _ordinary_repair_release_json _ordinary_repair_stop_boundary
 }
 
 remove_ordinary_verify_repair_mock() {
-    unset -f gh curl _ordinary_repair_release_json
+    unset -f gh curl _ordinary_repair_release_json _ordinary_repair_stop_boundary
     unset ORDINARY_REPAIR_ROOT ORDINARY_REPAIR_MODE ORDINARY_REPAIR_MANIFEST
+    unset ORDINARY_REPAIR_STOP_CASE ORDINARY_REPAIR_STOP_AFTER ORDINARY_REPAIR_STOP_STATUS
 }
+
+# Execute the public CLI, including release_formulas' metadata/repair dispatch.
+# Each interruption fires once, so a broken caller exposes later API requests
+# and writes instead of merely encountering the same injected failure again.
+_verify_ordinary_repair_interruption_case() {
+    local boundary="$1" occurrence="$2" expected_posts="$3" stage="${4:-verification}"
+    local stop_status="${5:-${DSR_TEST_RELEASE_INTERRUPTION_STATUS:-130}}" expected_status="${6:-5}"
+    ((TESTS_RUN++))
+    if [[ "$HAS_YQ" != true ]]; then skip "yq required for repair interruption"; return 0; fi
+    harness_setup
+    seed_repos_config
+    if ! seed_ordinary_verify_repair source_valid; then
+        fail "ordinary repair interruption fixture setup"
+        harness_teardown
+        return 0
+    fi
+    # A second missing asset exposes an interrupted first upload followed by
+    # an unauthorized later write; recovery must reuse the accepted first one.
+    printf '[]\n' > "$ORDINARY_REPAIR_ROOT/assets.json"
+    : > "$ORDINARY_REPAIR_ROOT/network"
+    export ORDINARY_REPAIR_STOP_CASE="$boundary" ORDINARY_REPAIR_STOP_AFTER="$occurrence"
+    export ORDINARY_REPAIR_STOP_STATUS="$stop_status"
+    create_ordinary_verify_repair_mock
+    local before after status posts attempted stop_count network_count version problems=()
+    before=$(_verify_fix_custody_inventory "${ORDINARY_REPAIR_MANIFEST%/*}")
+    DSR_GH_TOKEN=release-fixture-token GITHUB_TOKEN=ci-fixture-token \
+        GH_TOKEN=ambient-fixture-token GH_HOST=enterprise.fixture.invalid \
+        GH_MAX_RETRIES=1 GH_RETRY_DELAY=0 PATH="$TEST_TMPDIR/bin:$PATH" exec_run \
+        timeout 120 "$DSR_CMD" --json release verify test-tool v1.0.0 --fix
+    status=$(exec_status)
+    exec_stdout > "$ORDINARY_REPAIR_ROOT/stopped.stdout"
+    exec_stderr > "$ORDINARY_REPAIR_ROOT/stopped.stderr"
+    [[ "$status" == "$expected_status" ]] || problems+=("public exit $status, expected $expected_status")
+    [[ -s "$ORDINARY_REPAIR_ROOT/stopped" ]] || problems+=("did not reach selected $boundary boundary")
+    posts=$(awk '/^post:/{n++} END {print n+0}' "$ORDINARY_REPAIR_ROOT/uploads")
+    attempted=$(awk '/^attempt-post:/{n++} END {print n+0}' "$ORDINARY_REPAIR_ROOT/uploads")
+    [[ "$posts" == "$expected_posts" && "$attempted" == "$expected_posts" ]] ||
+        problems+=("observed $posts accepted / $attempted attempted uploads, expected $expected_posts")
+    if [[ "$expected_status" == 5 ]]; then
+        jq -es --arg stage "$stage" --argjson code "$stop_status" '
+            length == 1 and (.[0] | .command == "release-verify" and .status == "error" and
+                .exit_code == 5 and .details.interruption ==
+                {stage:$stage,exit_code:$code,outcome:"unconfirmed"})
+        ' "$ORDINARY_REPAIR_ROOT/stopped.stdout" >/dev/null || problems+=("missing original interruption receipt")
+        stop_count=$(cat "$ORDINARY_REPAIR_ROOT/stopped-count" 2>/dev/null) || stop_count=missing
+        network_count=$(wc -l < "$ORDINARY_REPAIR_ROOT/network")
+        [[ "$network_count" == "$stop_count" ]] || problems+=("GitHub requests continued after interruption")
+    else
+        jq -es 'length == 1 and (.[0] | .status == "success" and .exit_code == 0 and
+            (.details | has("interruption") | not) and .details.verification.missing == 0)' \
+            "$ORDINARY_REPAIR_ROOT/stopped.stdout" >/dev/null || problems+=("ordinary transport failure did not reconcile")
+    fi
+    after=$(_verify_fix_custody_inventory "${ORDINARY_REPAIR_MANIFEST%/*}")
+    [[ "$before" == "$after" ]] || problems+=("stopped repair changed selected manifest or artifact custody")
+    for version in v1.0.0 1.0.0; do
+        _verify_fix_custody_probe "$version" || problems+=("stopped repair leaked $version build lease")
+    done
+
+    # A fresh command independently observes the same release and bytes. It
+    # uploads only missing names and must never replace an accepted payload.
+    export ORDINARY_REPAIR_STOP_CASE=recovery
+    DSR_GH_TOKEN=release-fixture-token GITHUB_TOKEN=ci-fixture-token \
+        GH_TOKEN=ambient-fixture-token GH_HOST=enterprise.fixture.invalid \
+        GH_MAX_RETRIES=1 GH_RETRY_DELAY=0 PATH="$TEST_TMPDIR/bin:$PATH" exec_run \
+        timeout 120 "$DSR_CMD" --json release verify test-tool v1.0.0 --fix
+    exec_stdout > "$ORDINARY_REPAIR_ROOT/recovery.stdout"
+    exec_stderr > "$ORDINARY_REPAIR_ROOT/recovery.stderr"
+    [[ "$(exec_status)" == 0 ]] || problems+=("explicit recovery failed: $(exec_status)")
+    jq -es 'length == 1 and (.[0] | .status == "success" and .exit_code == 0 and
+        .details.release_id == 12345 and .details.verification.missing == 0 and
+        (.details.assets.present | sort) == ["test-tool-darwin-arm64","test-tool-linux-amd64"] and
+        (.details | has("interruption") | not))' "$ORDINARY_REPAIR_ROOT/recovery.stdout" >/dev/null ||
+        problems+=("recovery did not verify the original release's complete bytes")
+    [[ $(awk '/^post:/{n++} END {print n+0}' "$ORDINARY_REPAIR_ROOT/uploads") == 2 &&
+       $(awk '/^attempt-post:/{n++} END {print n+0}' "$ORDINARY_REPAIR_ROOT/uploads") == 2 ]] ||
+        problems+=("recovery duplicated an accepted upload")
+    jq -e 'length == 2 and ([.[].id] | sort) == [101,102] and
+        ([.[].name] | unique | length) == 2' "$ORDINARY_REPAIR_ROOT/assets.json" >/dev/null ||
+        problems+=("recovery replaced or duplicated remote assets")
+    after=$(_verify_fix_custody_inventory "${ORDINARY_REPAIR_MANIFEST%/*}")
+    [[ "$before" == "$after" ]] || problems+=("recovery changed selected manifest or artifact custody")
+    for version in v1.0.0 1.0.0; do
+        _verify_fix_custody_probe "$version" || problems+=("recovery leaked $version build lease")
+    done
+    if [[ ${#problems[@]} == 0 ]]; then
+        if [[ "$expected_status" == 5 ]]; then
+            pass "ordinary repair $boundary/$occurrence status $stop_status stops safely and explicitly recovers the same release"
+        else
+            pass "ordinary raw curl status $stop_status reconciles accepted bytes without cancellation or duplicate uploads"
+        fi
+    else
+        fail "ordinary repair $boundary/$occurrence status $stop_status"
+        printf '  %s\n' "${problems[@]}"
+        cat "$ORDINARY_REPAIR_ROOT/stopped.stdout"
+        tail -12 "$ORDINARY_REPAIR_ROOT/stopped.stderr"
+    fi
+    remove_ordinary_verify_repair_mock
+    harness_teardown
+}
+
+test_verify_fix_stops_interrupted_discovery() { _verify_ordinary_repair_interruption_case tag 1 0; }
+test_verify_fix_stops_interrupted_context() { _verify_ordinary_repair_interruption_case context 1 0; }
+test_verify_fix_stops_interrupted_tag_context() { _verify_ordinary_repair_interruption_case tag 2 0; }
+test_verify_fix_stops_interrupted_source() { _verify_ordinary_repair_interruption_case source 1 0; }
+test_verify_fix_stops_interrupted_upload() { _verify_ordinary_repair_interruption_case upload 1 1 upload; }
+test_verify_fix_stops_interrupted_final_context() { _verify_ordinary_repair_interruption_case context 3 2; }
+test_verify_fix_stops_interrupted_final_inventory() { _verify_ordinary_repair_interruption_case inventory 3 2; }
+test_verify_fix_stops_interrupted_asset_download() { _verify_ordinary_repair_interruption_case download 1 2; }
+test_verify_fix_stops_interrupted_final_source() { _verify_ordinary_repair_interruption_case source 4 2; }
+test_verify_fix_reconciles_ordinary_curl_failure() { _verify_ordinary_repair_interruption_case upload 1 2 upload 5 0; }
 
 # Exercise real repair and prune commands with real inherited kernel leases.
 # Only the existing GitHub transport fixtures pause or inject owner-record drift.
@@ -3884,6 +4031,16 @@ test_strict_fix_refuses_release_tag_rebind_before_mutation
 test_strict_fix_final_get_rejects_postcheck_asset_flip
 test_strict_fix_dry_run_leaves_draft_and_sidecars_untouched
 test_verify_fix_attempts_upload
+test_verify_fix_stops_interrupted_discovery
+test_verify_fix_stops_interrupted_context
+test_verify_fix_stops_interrupted_tag_context
+test_verify_fix_stops_interrupted_source
+test_verify_fix_stops_interrupted_upload
+test_verify_fix_stops_interrupted_final_context
+test_verify_fix_stops_interrupted_final_inventory
+test_verify_fix_stops_interrupted_asset_download
+test_verify_fix_stops_interrupted_final_source
+test_verify_fix_reconciles_ordinary_curl_failure
 test_verify_fix_uses_selected_github_identity
 test_verify_fix_uses_custom_artifacts
 test_verify_custom_manifest_identity
