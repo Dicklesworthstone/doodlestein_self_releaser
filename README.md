@@ -1799,11 +1799,14 @@ result. Resume requires the same event, payload, and original result evidence;
 changing the recipe requires a new build.
 
 `watch --auto-fallback` requires the observed workflow event to match this
-configuration as well as the exact repository, tag, source, run, and attempt.
-Deferred work and retries retain the original configured payload. A changed
-payload, missing event evidence, or a mismatched upstream event withholds the
-automatic fallback. Existing recovery journals without event custody require
-an explicit manual fallback.
+configuration as well as the exact repository, tag, source, workflow file and
+ID, run, and attempt. Deferred work and retries retain that original workflow
+identity and configured payload. A changed workflow, attempt, or payload
+withholds automatic fallback. Configure the actual repository-relative workflow
+path, such as `.github/workflows/release.yml`; a bare `release.yml` is ambiguous
+for automatic admission because the local runner treats it as a root-level
+file. Existing recovery journals without the original workflow and event
+custody require an explicit manual fallback.
 
 GitHub's workflow-run API does not provide the original dispatch inputs or
 release action. Automatic fallback replays the reviewed configuration above;

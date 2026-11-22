@@ -1761,6 +1761,7 @@ EOF
                      ((.path // "") | split("/") | last) as $file |
                      {repo: $r.repo, tool: $r.tool,
                       workflow: (if $file != "" then $file else (.workflow_name // "unknown") end),
+                      workflow_path: .path,
                       run_id: .id, run_attempt: .run_attempt, workflow_id: .workflow_id,
                        status: .status, queue_time_seconds: .age_seconds,
                       threshold_seconds: $threshold, created_at: .created_at,
@@ -2045,8 +2046,12 @@ _watch_load_triggered() {
                     (.key | test("^[1-9][0-9]{0,15}$")) and
                     ($state.runs[.key] == null) and (($state.attempts // {})[.key] == null) and
                     (.value | type == "object" and
-                        ((keys - ["workflow_event"]) == ["head_sha","isolate_source","queued_epoch","repo","tool","version"]) and
+                        ((keys - ["workflow_event","workflow_id","workflow_path","run_attempt"]) ==
+                            ["head_sha","isolate_source","queued_epoch","repo","tool","version"]) and
                         ((has("workflow_event") | not) or (.workflow_event | type == "object")) and
+                        ((has("workflow_path") | not) or (.workflow_path | type == "string")) and
+                        ((has("workflow_id") | not) or (.workflow_id | integer and . >= 1 and . <= 9007199254740991)) and
+                        ((has("run_attempt") | not) or (.run_attempt | integer and . >= 1 and . <= 9007199254740991)) and
                         source_identity and .head_sha != "0000000000000000000000000000000000000000" and
                         .isolate_source == true and
                         (.queued_epoch | integer and . >= 0 and . <= 9007199254740991)))))
@@ -2398,6 +2403,38 @@ _watch_jittered_sleep() {
 # so each is announced once per watcher rather than on every poll.
 declare -A _WATCH_REPORTED=()
 
+# GitHub run paths may append an @ref to the workflow file. Keep that complete
+# string as custody, but compare its file component to the configured selector.
+# Do not derive missing paths from display names or workflow IDs.
+_watch_workflow_file() {
+    local observed="$1" file="${1%%@*}"
+    [[ "$file" =~ ^\.github/workflows/[A-Za-z0-9._-]+\.ya?ml$ &&
+       "$observed" != *[[:space:][:cntrl:]]* ]] || return 4
+    [[ "$observed" == "$file" || "$observed" == "$file"@?* ]] || return 4
+    printf '%s\n' "$file"
+}
+
+# Both never-started candidates and failed attempts retain the original run's
+# workflow file, ID and attempt. A later observation cannot fill missing
+# custody or replace it with a rerun, even when tag, commit and event match.
+_watch_retained_workflow_matches() {
+    local record="$1" observed="$2"
+    jq -en --slurpfile records /dev/fd/3 --slurpfile observations /dev/fd/4 '
+        def identifier: type == "number" and floor == . and . >= 1 and . <= 9007199254740991;
+        if ($records | length) != 1 or ($observations | length) != 1 then false else
+            ($records[0] | (.watch_admission // .)) as $original |
+            $observations[0] as $current |
+            ($original.workflow_id | identifier) and ($original.run_attempt | identifier) and
+            ($original.workflow_path | type == "string" and length > 0) and
+            ($original.workflow_event.event | IN("push","release","workflow_dispatch")) and
+            $original.workflow_id == $current.workflow_id and $original.run_attempt == $current.run_attempt and
+            $original.workflow_path == ($current.workflow_path // $current.path) and
+            ($current.workflow_path == null or $current.path == null or $current.workflow_path == $current.path) and
+            $original.workflow_event.event == $current.event
+        end
+    ' 3<<< "$record" 4<<< "$observed" >/dev/null 2>&1
+}
+
 # A watcher decision is conditional authority for one workflow attempt, not a
 # manual request to release the same source under any later upstream state.
 _watch_validate_admission_json() {
@@ -2405,10 +2442,12 @@ _watch_validate_admission_json() {
     jq -es --arg repo "$repo" --arg version "$version" --arg sha "$sha" '
         def identifier: type == "number" and floor == . and . >= 1 and . <= 9007199254740991;
         length == 1 and (.[0] | type == "object" and
-            keys == ["git_sha","reason","repo","run_attempt","run_id","threshold_seconds","version","workflow_event","workflow_id"] and
+            keys == ["git_sha","reason","repo","run_attempt","run_id","threshold_seconds","version","workflow_event","workflow_id","workflow_path"] and
             (.run_id | type == "string" and test("^[1-9][0-9]{0,15}$") and
                 (tonumber <= 9007199254740991)) and
             (.run_attempt | identifier) and (.workflow_id | identifier) and
+            (.workflow_path | type == "string" and
+                test("^[.]github/workflows/[A-Za-z0-9._-]+[.]ya?ml(@[^[:space:][:cntrl:]]+)?$")) and
             (.repo | type == "string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) and
             (.version | type == "string" and test("^v[0-9]+\\.[0-9]+\\.[0-9]+([.+-][0-9A-Za-z.+-]*)?$")) and
             (.git_sha | type == "string" and test("^[0-9a-f]{40}$") and
@@ -2434,15 +2473,16 @@ _watch_validate_admission_json() {
 _watch_admit_upstream() {
     (
     local tool="$1" admission="$2" repo version sha run_id reason threshold current_threshold
-    local observed after waiting=null status=0 now identity_filter workflow_event
+    local observed after waiting=null status=0 now identity_filter workflow_event workflow_path
     repo=$(jq -er '.repo' <<< "$admission") || return 4
     version=$(jq -er '.version' <<< "$admission") || return 4
     sha=$(jq -er '.git_sha' <<< "$admission") || return 4
     _watch_validate_admission_json "$admission" "$repo" "$version" "$sha" || return 4
     run_id=$(jq -r '.run_id' <<< "$admission") || return 4
+    workflow_path=$(jq -r '.workflow_path' <<< "$admission") || return 4
     reason=$(jq -r '.reason' <<< "$admission") || return 4
     threshold=$(jq -r '.threshold_seconds' <<< "$admission") || return 4
-    _watch_configured_repo_matches "$tool" "$repo" "$run_id" || return 2
+    _watch_configured_repo_matches "$tool" "$repo" "$run_id" "$workflow_path" || return 2
     workflow_event=$(_act_workflow_event_plan_json "$tool" "$version") || return 4
     if ! jq -e --slurpfile plan /dev/fd/3 '.workflow_event == $plan[0]' \
         <<< "$admission" 3<<< "$workflow_event" >/dev/null; then
@@ -2468,6 +2508,7 @@ _watch_admit_upstream() {
             .repository.full_name == $expected.repo and
             .head_branch == $expected.version and .head_sha == $expected.git_sha and
             .run_attempt == $expected.run_attempt and .workflow_id == $expected.workflow_id and
+            .path == $expected.workflow_path and
             .event == $expected.workflow_event.event and
             (.status | type == "string") and
             (.conclusion | type == "null" or type == "string");
@@ -2534,6 +2575,7 @@ _watch_admit_upstream() {
     printf '%s\n' "$after" "$waiting" | jq -sc --argjson expected "$admission" \
         --argjson threshold "$threshold" --argjson now "$now" '
         {run_id:$expected.run_id,run_attempt:$expected.run_attempt,workflow_id:$expected.workflow_id,
+         workflow_path:$expected.workflow_path,
          reason:$expected.reason,status:.[0].status,conclusion:.[0].conclusion,
          event:.[0].event,workflow_event_sha256:$expected.workflow_event.payload_sha256,
          threshold_seconds:$threshold,checked_epoch:$now}
@@ -2544,7 +2586,8 @@ _watch_admit_upstream() {
 }
 
 _watch_configured_repo_matches() {
-    local tool="$1" repo="$2" run_id="$3" configured inventory
+    local tool="$1" repo="$2" run_id="$3" workflow_path="$4" configured inventory
+    local observed_file config_file document selector configured_file
     if ! inventory=$(_check_configured_repos true); then
         log_warn "Cannot admit run $run_id: repository automation configuration is invalid or unavailable"
         return 1
@@ -2560,6 +2603,26 @@ _watch_configured_repo_matches() {
         log_warn "Automatic fallback disabled for $tool (run $run_id); retaining existing recovery history"
         return 1
     fi
+    observed_file=$(_watch_workflow_file "$workflow_path") || {
+        log_warn "Run $run_id has no unambiguous original workflow path; automatic fallback withheld"
+        return 1
+    }
+    # Read the same per-tool selector/default used by the build planner. A
+    # registry alias or a display-name match cannot authorize a different act
+    # workflow after a queued observation or while a deferred release waits.
+    config_file="${ACT_REPOS_DIR:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.d}/$tool.yaml"
+    document=$(_config_read_single_mapping_json "$config_file") || return 1
+    selector=$(jq -er '(if .workflow == null then ".github/workflows/release.yml" else .workflow end) |
+        strings | select(length > 0)' <<< "$document") || return 1
+    [[ "$selector" != *@* ]] || return 1
+    configured_file=$(_watch_workflow_file "$selector") || {
+        log_warn "Automatic fallback for $tool requires an explicit workflow: .github/workflows/<file>.yml path"
+        return 1
+    }
+    if [[ "$observed_file" != "$configured_file" ]]; then
+        log_warn "Run $run_id does not match the configured workflow file; automatic fallback withheld"
+        return 1
+    fi
     return 0
 }
 
@@ -2573,7 +2636,7 @@ _watch_configured_repo_matches() {
 _watch_terminal_retry_runs() {
     local state="$1" check_output="$2" now="$3" candidates candidate record
     local include_pending="${4:-true}"
-    local run_id tool repo observed conclusion pending observed_status completion_exit
+    local run_id tool repo observed conclusion pending observed_status completion_exit workflow_path
     candidates=$(printf '%s\n' "$state" "$check_output" | jq -sc \
         --argjson now "$now" --argjson maximum "$_WATCH_MAX_ATTEMPTS" --argjson include_pending "$include_pending" '
         . as $inputs | ($inputs[1].details.throttled | map(.run_id | tostring)) as $observed |
@@ -2603,7 +2666,8 @@ _watch_terminal_retry_runs() {
             log_warn "Fallback for run $run_id lacks verified result evidence; automatic retry blocked"
             continue
         fi
-        _watch_configured_repo_matches "$tool" "$repo" "$run_id" || continue
+        workflow_path=$(jq -r '(.watch_admission // .).workflow_path // ""' <<< "$record") || return 4
+        _watch_configured_repo_matches "$tool" "$repo" "$run_id" "$workflow_path" || continue
         observed_status=0
         observed=$(gh_api "repos/$repo/actions/runs/$run_id" --no-cache) || observed_status=$?
         if ((observed_status != 0)); then
@@ -2628,6 +2692,10 @@ _watch_terminal_retry_runs() {
             log_warn "Upstream identity is missing or changed for run $run_id; automatic retry withheld"
             continue
         fi
+        if ! _watch_retained_workflow_matches "$record" "$observed"; then
+            log_warn "Original workflow identity or attempt changed for run $run_id; automatic recovery withheld"
+            continue
+        fi
         if ! jq -e '.status == "completed" and
                 (.conclusion | IN("failure", "timed_out", "startup_failure"))' \
                 <<< "$observed" >/dev/null; then
@@ -2637,9 +2705,12 @@ _watch_terminal_retry_runs() {
             if [[ "$pending" == true ]] && jq -e '.status == "completed" and
                     (.conclusion | IN("success", "cancelled"))' <<< "$observed" >/dev/null; then
                 conclusion=$(jq -r .conclusion <<< "$observed") || return 4
-                jq -nc --arg run "$run_id" --argjson record "$record" --arg conclusion "$conclusion" '
+                jq -nc --arg run "$run_id" --argjson record "$record" --arg conclusion "$conclusion" \
+                    --slurpfile observed /dev/fd/3 '
                     {run_id:$run,tool:$record.tool,repo:$record.repo,head_branch:$record.version,
-                     head_sha:$record.head_sha,retry_reason:"upstream_resolved",upstream_conclusion:$conclusion}' || return 4
+                     head_sha:$record.head_sha,retry_reason:"upstream_resolved",upstream_conclusion:$conclusion,
+                     run_attempt:$observed[0].run_attempt,workflow_id:$observed[0].workflow_id,
+                     workflow_path:$observed[0].path,event:$observed[0].event}' 3<<< "$observed" || return 4
             else
                 log_debug "Run $run_id is not a completed upstream failure; retaining its fallback candidate"
             fi
@@ -2650,7 +2721,8 @@ _watch_terminal_retry_runs() {
             --slurpfile observed /dev/fd/3 '
             {run_id:$run,tool:$record.tool,repo:$record.repo,head_branch:$record.version,
              head_sha:$record.head_sha,retry_reason:"upstream_failure",upstream_conclusion:$conclusion,
-             run_attempt:$observed[0].run_attempt,workflow_id:$observed[0].workflow_id,event:$observed[0].event}' \
+             run_attempt:$observed[0].run_attempt,workflow_id:$observed[0].workflow_id,
+             workflow_path:$observed[0].path,event:$observed[0].event}' \
             3<<< "$observed" || return 4
     done <<< "$candidates"
 }
@@ -2756,7 +2828,7 @@ _watch_iteration() {
     fi
 
     # Process new throttled runs and source-verified terminal recovery candidates.
-    local run run_id repo tool_name ref sha record pending_record bound_record
+    local run run_id repo tool_name ref sha record pending_record bound_record workflow_path
     local attempt resume outcome next_retry isolate_source retry_reason completion_exit watch_admission workflow_event
     while IFS= read -r run; do
         run_id=$(jq -r '.run_id // empty | tostring' <<< "$run")
@@ -2765,6 +2837,7 @@ _watch_iteration() {
         tool_name=$(jq -r '.tool // ""' <<< "$run")
         ref=$(jq -r '.head_branch // ""' <<< "$run")
         sha=$(jq -r '.head_sha // ""' <<< "$run")
+        workflow_path=$(jq -r '.workflow_path // ""' <<< "$run") || return 4
 
         record=$(jq -c --arg id "$run_id" '.attempts[$id] // null' <<< "$state") || return 4
         pending_record=$(jq -c --arg id "$run_id" '.pending[$id] // null' <<< "$state") || return 4
@@ -2775,6 +2848,10 @@ _watch_iteration() {
                 .tool == $tool and .repo == $repo and .version == $version and .head_sha == $sha
             ' <<< "$bound_record" >/dev/null; then
             log_error "Observed identity changed for run $run_id; automatic fallback blocked"
+            continue
+        fi
+        if [[ "$bound_record" != null ]] && ! _watch_retained_workflow_matches "$bound_record" "$run"; then
+            log_warn "Run $run_id lacks unchanged original workflow identity and attempt custody; automatic fallback withheld"
             continue
         fi
         attempt=1; resume=""; isolate_source=true
@@ -2853,7 +2930,7 @@ _watch_iteration() {
                 ${#fallback_args[@]} -eq 0 || ! "$sha" =~ ^[0-9a-f]{40}$ ||
                 "$sha" == 0000000000000000000000000000000000000000 ]]; then
             log_warn "Run $run_id has no unambiguous version tag and source commit; automatic fallback blocked"
-        elif ! _watch_configured_repo_matches "$tool_name" "$repo" "$run_id"; then
+        elif ! _watch_configured_repo_matches "$tool_name" "$repo" "$run_id" "$workflow_path"; then
             # The check or retained queue may predate an opt-out. Re-read
             # before every automatic start, retry, capacity deferral or plan.
             # No attempt, cooldown, checkpoint or pending identity is changed.
@@ -2870,16 +2947,28 @@ _watch_iteration() {
                 <<< "$bound_record" 3<<< "$workflow_event" >/dev/null; then
             log_warn "Run $run_id lacks unchanged workflow event custody; use an explicit manual fallback"
             continue
+        elif ! watch_admission=$(jq -c --slurpfile event /dev/fd/3 '
+                {run_id:(.run_id | tostring),run_attempt,workflow_id,workflow_path,repo,version:.head_branch,git_sha:.head_sha,
+                 workflow_event:$event[0],
+                 reason:(if .retry_reason == "upstream_failure" then "upstream_failure" else "throttled" end),
+                 threshold_seconds:(if .retry_reason == "upstream_failure" then 0 else .threshold_seconds end)}
+            ' <<< "$run" 3<<< "$workflow_event"); then
+            return 4
+        elif ! _watch_validate_admission_json "$watch_admission" "$repo" "$ref" "$sha"; then
+            log_warn "Run $run_id lacks complete original workflow-attempt admission; automatic fallback withheld"
+            continue
         elif ((active_count >= _WATCH_MAX_CONCURRENT)); then
             # Retain a never-started source identity without claiming an
             # attempt or output. A later fresh observation must still admit
             # it, including if this original workflow has since failed.
             if ! $dry_run && [[ "$record" == null && "$pending_record" == null ]]; then
                 state=$(jq -c --arg id "$run_id" --arg tool "$tool_name" --arg repo "$repo" \
-                    --arg version "$ref" --arg sha "$sha" --argjson now "$now" --slurpfile event /dev/fd/3 '
+                    --arg version "$ref" --arg sha "$sha" --argjson now "$now" --slurpfile admission /dev/fd/3 '
                     .pending[$id] = {tool:$tool,repo:$repo,version:$version,head_sha:$sha,
-                        isolate_source:true,queued_epoch:$now,workflow_event:$event[0]}' \
-                        <<< "$state" 3<<< "$workflow_event") || return 4
+                        isolate_source:true,queued_epoch:$now,workflow_event:$admission[0].workflow_event,
+                        workflow_id:$admission[0].workflow_id,workflow_path:$admission[0].workflow_path,
+                        run_attempt:$admission[0].run_attempt}' \
+                        <<< "$state" 3<<< "$watch_admission") || return 4
                 _watch_save_triggered "$state" || return 4
             fi
             _WATCH_DEFERRED_COUNT=$((_WATCH_DEFERRED_COUNT + 1))
@@ -2901,16 +2990,6 @@ _watch_iteration() {
             elif [[ -e "$output" || -L "$output" ]]; then
                 log_error "Unclaimed watcher artifact directory already exists: $output"
                 return 4
-            fi
-            watch_admission=$(jq -c --slurpfile event /dev/fd/3 '
-                {run_id:(.run_id | tostring),run_attempt,workflow_id,repo,version:.head_branch,git_sha:.head_sha,
-                 workflow_event:$event[0],
-                 reason:(if .retry_reason == "upstream_failure" then "upstream_failure" else "throttled" end),
-                 threshold_seconds:(if .retry_reason == "upstream_failure" then 0 else .threshold_seconds end)}
-            ' <<< "$run" 3<<< "$workflow_event") || return 4
-            if ! _watch_validate_admission_json "$watch_admission" "$repo" "$ref" "$sha"; then
-                log_warn "Run $run_id lacks complete workflow-attempt admission; automatic fallback withheld"
-                continue
             fi
             log_info "Starting fallback for $tool_name (run $run_id, attempt $attempt)..."
             _watch_launch_attempt "$run_id" "$tool_name" "$repo" "$ref" "$sha" "$attempt" "$resume" "$isolate_source" "$watch_admission" "$_WATCH_PARALLEL_JOBS" || return $?

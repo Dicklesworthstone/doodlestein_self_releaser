@@ -30,7 +30,7 @@ source "$ROOT/src/github.sh"
 COMMAND_FILE="${DSR_TEST_COMMAND_FILE:-$ROOT/dsr}"
 HELPERS_FILE="${DSR_TEST_HELPERS_FILE:-$COMMAND_FILE}"
 # shellcheck source=/dev/null
-source <(awk '/^(_release_file_size|_release_sha256|_release_require_publishable_artifacts|_release_sbom_policy|_check_configured_repos|_check_waiting_jobs|_watch_configured_repo_matches|_watch_validate_admission_json|_watch_admit_upstream)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$HELPERS_FILE")
+source <(awk '/^(_release_file_size|_release_sha256|_release_require_publishable_artifacts|_release_sbom_policy|_check_configured_repos|_check_waiting_jobs|_watch_workflow_file|_watch_configured_repo_matches|_watch_validate_admission_json|_watch_admit_upstream)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$HELPERS_FILE")
 # shellcheck source=/dev/null
 source <(awk '/^cmd_fallback\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "$COMMAND_FILE")
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/dsr-fallback-tests.XXXXXXXX") || exit 1
@@ -573,12 +573,12 @@ watch_admission_fixture() {
     export DSR_CONFIG_DIR="$CASE" DSR_REPOS_FILE="$CASE/repos.yaml"
     jq -nc --arg path "$CASE/source" '
         {tool_name:"tool",repo:"owner/tool",local_path:$path,enabled:true,
-         language:"go",binary_name:"tool",workflow:"release.yml",
+         language:"go",binary_name:"tool",workflow:".github/workflows/release.yml",
          targets:["linux/amd64","darwin/arm64"]}' > "$ACT_REPOS_DIR/tool.yaml" || return 1
     local workflow_event
     workflow_event=$(_act_workflow_event_plan_json tool v1.2.3) || return 1
     WATCH_ADMISSION=$(jq -nc --arg sha "$SOURCE_SHA" --slurpfile event /dev/fd/3 '
-        {run_id:"12345",run_attempt:2,workflow_id:17,repo:"owner/tool",
+        {run_id:"12345",run_attempt:2,workflow_id:17,workflow_path:".github/workflows/release.yml",repo:"owner/tool",
          version:"v1.2.3",git_sha:$sha,reason:"throttled",threshold_seconds:600,
          workflow_event:$event[0]}' 3<<< "$workflow_event") || return 1
     jq -nc --arg sha "$SOURCE_SHA" '
@@ -602,6 +602,8 @@ watch_admission_fixture() {
                 cat "$CASE/watch-jobs.json" || return 1
                 if [[ "$WATCH_HTTP_DRIFT" == attempt ]]; then
                     watch_admission_update_json "$CASE/watch-run.json" '.run_attempt=3' || return 1
+                elif [[ "$WATCH_HTTP_DRIFT" == workflow ]]; then
+                    watch_admission_update_json "$CASE/watch-run.json" '.path += "@another-ref"' || return 1
                 fi ;;
             *) return 99 ;;
         esac
@@ -638,6 +640,11 @@ test_watch_admission_initial_refusal() {
         recent) watch_admission_update_json "$CASE/watch-jobs.json" '.jobs[0].created_at=(now | todateiso8601)' || return 1 ;;
         attempt) expected_rc=4; watch_admission_update_json "$CASE/watch-run.json" '.run_attempt=3' || return 1 ;;
         workflow) expected_rc=4; watch_admission_update_json "$CASE/watch-run.json" '.workflow_id=18' || return 1 ;;
+        workflow-path) expected_rc=4; watch_admission_update_json "$CASE/watch-run.json" '.path=".github/workflows/another.yml"' || return 1 ;;
+        workflow-ref) expected_rc=4; watch_admission_update_json "$CASE/watch-run.json" '.path += "@another-ref"' || return 1 ;;
+        missing-path) expected_rc=4; watch_admission_update_json "$CASE/watch-run.json" 'del(.path)' || return 1 ;;
+        configured-workflow) watch_admission_update_json "$ACT_REPOS_DIR/tool.yaml" '.workflow=".github/workflows/another.yml"' || return 1 ;;
+        bare-workflow) watch_admission_update_json "$ACT_REPOS_DIR/tool.yaml" '.workflow="release.yml"' || return 1 ;;
         source) expected_rc=4; watch_admission_update_json "$CASE/watch-run.json" '.head_sha=("f"*40)' || return 1 ;;
         event) expected_rc=4; watch_admission_update_json "$CASE/watch-run.json" '.event="release"' || return 1 ;;
         missing-event) expected_rc=4; watch_admission_update_json "$CASE/watch-run.json" 'del(.event)' || return 1 ;;
@@ -647,6 +654,7 @@ test_watch_admission_initial_refusal() {
         unreadable) expected_rc=8; WATCH_HTTP_RC=8 ;;
         interrupted) expected_rc=5; WATCH_HTTP_RC=130 ;;
         jobs-rerun) expected_rc=4; WATCH_HTTP_DRIFT=attempt ;;
+        jobs-workflow) expected_rc=4; WATCH_HTTP_DRIFT=workflow ;;
         *) return 1 ;;
     esac
     run_fallback --expected-sha "$SOURCE_SHA" --isolate-source --watch-admission "$WATCH_ADMISSION"
@@ -654,10 +662,21 @@ test_watch_admission_initial_refusal() {
        ! -e "$DSR_STATE_DIR/fallback-sources" ]] && one_result &&
         ! grep -Eq '^(INIT|LOCK|CHECK|BUILD|SIGN|RELEASE)( |$)' "$CALLS" &&
         jq -e '.details.phase=="admission" and .details.phases.release=="blocked"' "$CASE/stdout" >/dev/null || return 1
-    if [[ "$1" == jobs-rerun ]]; then
+    if [[ "$1" == jobs-rerun || "$1" == jobs-workflow ]]; then
         [[ "$(grep -c '^UPSTREAM repos/owner/tool/actions/runs/12345 --no-cache$' "$CALLS")" == 2 ]] &&
             grep -Fq 'UPSTREAM repos/owner/tool/actions/runs/12345/attempts/2/jobs?per_page=100&page=1 --no-cache' "$CALLS"
     fi
+}
+test_watch_admission_workflow_ref() {
+    watch_admission_fixture workflow-ref || return 1
+    watch_admission_update_json "$CASE/watch-run.json" '.path += "@refs/tags/v1.2.3"' || return 1
+    WATCH_ADMISSION=$(jq --slurpfile observed "$CASE/watch-run.json" \
+        '.workflow_path=$observed[0].path' <<< "$WATCH_ADMISSION") || return 1
+    run_fallback --expected-sha "$SOURCE_SHA" --watch-admission "$WATCH_ADMISSION"
+    [[ "$RC" == 0 ]] && one_result && grep -q '^BUILD ' "$CALLS" && grep -q '^RELEASE ' "$CALLS" &&
+        jq -e '.details.watch_admission.workflow_path == ".github/workflows/release.yml@refs/tags/v1.2.3" and
+            .details.watch_observation.workflow_path == .details.watch_admission.workflow_path' \
+            "$CASE/stdout" >/dev/null
 }
 test_watch_configured_event() {
     local event="$1" plan
@@ -706,6 +725,8 @@ test_watch_admission_arguments() {
     local admission="$WATCH_ADMISSION"
     case "$1" in
         missing-field) admission=$(jq 'del(.run_attempt)' <<< "$admission") || return 1 ;;
+        missing-workflow-path) admission=$(jq 'del(.workflow_path)' <<< "$admission") || return 1 ;;
+        malformed-workflow-path) admission=$(jq '.workflow_path=".github/workflows/../release.yml"' <<< "$admission") || return 1 ;;
         extra-field) admission=$(jq '.unexpected=true' <<< "$admission") || return 1 ;;
         fractional-attempt) admission=$(jq '.run_attempt=1.5' <<< "$admission") || return 1 ;;
         wrong-repo) admission=$(jq '.repo="owner/other"' <<< "$admission") || return 1 ;;
@@ -2023,12 +2044,13 @@ run_test test_throttle_check_interruption
 run_test test_throttle_check_manual_request 0
 run_test test_throttle_check_manual_request 8
 for mode in throttled failure timed_out startup_failure; do run_test test_watch_admission_success "$mode"; done
-for mode in success cancelled failed active waiting recent attempt workflow source event missing-event configured-event configured-payload disabled unreadable interrupted jobs-rerun; do
+for mode in success cancelled failed active waiting recent attempt workflow workflow-path workflow-ref missing-path configured-workflow bare-workflow source event missing-event configured-event configured-payload disabled unreadable interrupted jobs-rerun jobs-workflow; do
     run_test test_watch_admission_initial_refusal "$mode"
 done
+run_test test_watch_admission_workflow_ref
 for event in push release workflow_dispatch; do run_test test_watch_configured_event "$event"; done
 for mode in quality build signing; do run_test test_watch_admission_late_refusal "$mode"; done
-for mode in missing-field extra-field fractional-attempt wrong-repo bad-reason bad-threshold missing-expected build-only; do
+for mode in missing-field missing-workflow-path malformed-workflow-path extra-field fractional-attempt wrong-repo bad-reason bad-threshold missing-expected build-only; do
     run_test test_watch_admission_arguments "$mode"
 done
 for rc in 1 2 3 4 5 6 8 130 143; do run_test test_build_failure "$rc"; done

@@ -639,6 +639,25 @@ the same plan, and automatic retries without original event custody are
 withheld. `watch_observation` includes the observed `event` and the configured
 `workflow_event_sha256` after a successful check.
 
+Automatic admission also retains the original `workflow_path`, `workflow_id`,
+and `run_attempt`. The path is GitHub's exact value, including an optional
+`@ref` suffix, and both fresh observations must match it. Its file component
+must match the actual configured repository-relative
+`.github/workflows/<file>.yml` or `.yaml` path (or the existing canonical
+default). Bare names, display names, and IDs never substitute for that file.
+This prevents a deferred run from selecting a different root-level workflow
+or a newly configured recipe. Manual workflow selection keeps its literal
+path behavior.
+
+Capacity-deferred records preserve all three fields before an attempt starts.
+Queued retries and terminal-failure recovery require their original values;
+they cannot adopt a later workflow ID, run attempt, or path from a fresh
+observation. Older journals missing this custody remain readable and unchanged,
+but require explicit manual fallback. `check` reports `workflow_path` when
+GitHub supplies it, and successful `watch_observation` records retain the same
+path. Invalid or incomplete admission cannot create a pending candidate or
+claim a dry-run launch.
+
 The GitHub workflow-run API exposes the event name, not the original webhook
 body. Dispatch inputs and release action are taken from the explicit reviewed
 `workflow_event_payload` configuration; DSR does not claim to reconstruct or

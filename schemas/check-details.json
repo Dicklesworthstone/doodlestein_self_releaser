@@ -84,6 +84,10 @@
           "type": "string",
           "description": "Workflow file name"
         },
+        "workflow_path": {
+          "type": "string",
+          "description": "Exact path reported by GitHub, including any @ref suffix; required as original workflow custody before automatic fallback"
+        },
         "run_id": {
           "type": "integer",
           "description": "GitHub Actions run ID"

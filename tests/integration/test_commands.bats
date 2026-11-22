@@ -949,7 +949,7 @@ PY
 _watch_configure_ntm() {
     command -v yq >/dev/null || skip "Real yq is required for watcher admission"
     mkdir -p "$DSR_CONFIG_DIR/repos.d"
-    printf 'tool_name: ntm\nrepo: Dicklesworthstone/ntm\nworkflow: release.yml\n%s\n' \
+    printf 'tool_name: ntm\nrepo: Dicklesworthstone/ntm\nworkflow: .github/workflows/release.yml\n%s\n' \
         "${1:-}" > "$DSR_CONFIG_DIR/repos.d/ntm.yaml"
 }
 
@@ -1117,7 +1117,8 @@ _watch_completed() {
 _watch_run_json() {
     jq -nc --arg sha "${1:-1111111111111111111111111111111111111111}" '
         {details:{throttled:[{run_id:12345,repo:"Dicklesworthstone/ntm",tool:"ntm",
-            head_branch:"v1.2.3",head_sha:$sha,run_attempt:1,workflow_id:17,threshold_seconds:600,event:"push"}]}}'
+            head_branch:"v1.2.3",head_sha:$sha,run_attempt:1,workflow_id:17,
+            workflow_path:".github/workflows/release.yml",threshold_seconds:600,event:"push"}]}}'
 }
 
 _watch_multiple_runs_json() {
@@ -1174,6 +1175,7 @@ _watch_upstream_run_json() {
         --arg sha "${3:-1111111111111111111111111111111111111111}" '
         {id:12345,repository:{full_name:"Dicklesworthstone/ntm"},
          head_branch:"v1.2.3",head_sha:$sha,status:$status,run_attempt:1,workflow_id:17,event:"push",
+         path:".github/workflows/release.yml",
          conclusion:(if $conclusion == "" then null else $conclusion end)}'
 }
 
@@ -1193,7 +1195,7 @@ _watch_isolated_pipeline_fixture() {
     DSR_WATCH_PINNED_SHA=$(git -C "$TEST_TMPDIR/developer-source" rev-parse HEAD)
     jq -nc --arg path "$TEST_TMPDIR/developer-source" \
         '{tool_name:"ntm",repo:"Dicklesworthstone/ntm",local_path:$path,language:"go",
-          binary_name:"ntm",targets:["linux/amd64"],workflow:"release.yml"}' \
+          binary_name:"ntm",targets:["linux/amd64"],workflow:".github/workflows/release.yml"}' \
         > "$DSR_CONFIG_DIR/repos.d/ntm.yaml"
     _watch_upstream_run_json queued "" "$DSR_WATCH_PINNED_SHA" |
         jq '. + {created_at:"2000-01-01T00:00:00Z",run_started_at:"2000-01-01T00:00:00Z",
@@ -1206,7 +1208,7 @@ root="${DSR_ROUTING_TEST_ROOT:-$DSR_PROJECT_ROOT}"
 for module in config act_runner git_ops build_state signing sbom github; do
     source "$root/src/$module.sh" || exit 3
 done
-source <(awk '/^(_release_file_size|_release_sha256|_release_require_publishable_artifacts|_release_sbom_policy|_check_configured_repos|_check_waiting_jobs|_watch_configured_repo_matches|_watch_validate_admission_json|_watch_admit_upstream|cmd_fallback)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$root/dsr") || exit 3
+source <(awk '/^(_release_file_size|_release_sha256|_release_require_publishable_artifacts|_release_sbom_policy|_check_configured_repos|_check_waiting_jobs|_watch_workflow_file|_watch_configured_repo_matches|_watch_validate_admission_json|_watch_admit_upstream|cmd_fallback)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$root/dsr") || exit 3
 JSON_MODE=true DRY_RUN=false
 log_info() { printf '%s\n' "$*" >&2; }
 log_warn() { log_info "$@"; }
@@ -1608,6 +1610,228 @@ PY
     run _routing_watch "$(_watch_run_json)" --auto-fallback --max-concurrent 1
     assert_equal 0 "$status"
     _watch_completed
+    assert_equal 2 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+}
+
+@test "workflow custody: deferred release cannot adopt a changed configured workflow" {
+    _watch_pending_fixture
+    local before
+    before=$(cat "$DSR_STATE_DIR/triggered.json")
+    _mock_watch_upstream_run "$(_watch_upstream_run_json completed failure)"
+    _watch_configure_ntm
+    yq -i '.workflow = ".github/workflows/replacement.yml"' "$DSR_CONFIG_DIR/repos.d/ntm.yaml"
+
+    # The old release left the queue while capacity was occupied. Its failure
+    # must not become authority to execute the newly selected workflow.
+    run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --max-concurrent 1
+    assert_equal 0 "$status"
+    assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    [[ ! -e "$DSR_STATE_DIR/watch-artifacts/12345" ]]
+
+    run _routing_watch "$(_watch_run_json)" --auto-fallback --dry-run --max-concurrent 1
+    assert_equal 0 "$status"
+    [[ "$output" != *"Would trigger fallback"* ]]
+    assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+
+    # Restoring the same workflow is an explicit policy change; the original
+    # candidate can still start attempt 1 without inventing a checkpoint.
+    _watch_configure_ntm
+    run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --max-concurrent 1
+    assert_equal 0 "$status"
+    _watch_completed
+    assert_equal 2 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    jq -e '.attempts["12345"] | .attempt == 1 and .resume_run_id == "" and
+        .watch_admission.workflow_path == ".github/workflows/release.yml" and
+        .watch_admission.workflow_id == 17 and .watch_admission.run_attempt == 1' \
+        "$DSR_STATE_DIR/triggered.json"
+}
+
+@test "workflow custody: checker preserves the observed file ref ID and attempt" {
+    harness_create_config
+    _setup_repos_d
+    _mock_active_inventory hidden
+    jq 'map(if .id == 555 then .path=".github/workflows/release.yml@refs/tags/v1.2.3" |
+        .run_attempt=2 else . end)' "$TEST_TMPDIR/active-history.json" > "$TEST_TMPDIR/qualified-history.json"
+    cp "$TEST_TMPDIR/qualified-history.json" "$TEST_TMPDIR/active-history.json"
+    run _routing_dsr --json check ntm
+    assert_equal 1 "$status"
+    jq -e '.details.throttled | length == 1 and (.[0] |
+        .workflow_path == ".github/workflows/release.yml@refs/tags/v1.2.3" and
+        .workflow_id == 17 and .run_attempt == 2)' <<< "$output"
+}
+
+@test "workflow custody: explicit file and default retain exact GitHub path spelling" {
+    harness_create_config
+    local selection path run_id=12345 check_json
+    for selection in full default; do
+        _watch_configure_ntm
+        path=.github/workflows/release.yml
+        case "$selection" in
+            full) yq -i '.workflow=".github/workflows/release.yml"' "$DSR_CONFIG_DIR/repos.d/ntm.yaml" ;;
+            default) yq -i 'del(.workflow)' "$DSR_CONFIG_DIR/repos.d/ntm.yaml"; path+=@refs/tags/v1.2.3 ;;
+        esac
+        check_json=$(_watch_run_json | jq --argjson id "$run_id" --arg path "$path" \
+            '.details.throttled[0] += {run_id:$id,workflow_path:$path}')
+        run _routing_watch "$check_json" --auto-fallback
+        assert_equal 0 "$status"
+        _watch_completed "$run_id"
+        jq -e --arg id "$run_id" --arg path "$path" '.attempts[$id].watch_admission |
+            .workflow_path == $path and .workflow_id == 17 and .run_attempt == 1' \
+            "$DSR_STATE_DIR/triggered.json"
+        run_id=$((run_id + 1))
+    done
+    assert_equal 2 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+}
+
+@test "workflow custody: a root workflow with the same basename cannot inherit GitHub authority" {
+    harness_create_config
+    _watch_configure_ntm
+    local source="$TEST_TMPDIR/two-workflows" before
+    mkdir -p "$source/.github/workflows"
+    printf 'name: GitHub release\non: push\njobs: {}\n' > "$source/.github/workflows/release.yml"
+    printf 'name: Different root recipe\non: push\njobs: {}\n' > "$source/release.yml"
+    jq -nc --arg source "$source" '{tool_name:"ntm",repo:"Dicklesworthstone/ntm",local_path:$source,
+        language:"go",binary_name:"ntm",targets:["linux/amd64"],workflow:".github/workflows/release.yml"}' \
+        > "$DSR_CONFIG_DIR/repos.d/ntm.yaml"
+    run _routing_watch "$(_watch_run_json)" --auto-fallback --dry-run
+    assert_equal 0 "$status"
+    assert_contains "$output" "Would trigger fallback"
+    yq -i '.workflow="release.yml"' "$DSR_CONFIG_DIR/repos.d/ntm.yaml"
+
+    # The real configured runner keeps this literal repository-relative path.
+    # Automatic admission must not silently prepend .github/workflows/ and
+    # certify the different root-level recipe as the original GitHub file.
+    run --separate-stderr bash -c '
+        source "$1/src/config.sh"
+        source "$1/src/act_runner.sh"
+        act_load_repo_config ntm || exit $?
+        [[ "$ACT_REPO_WORKFLOW" == release.yml ]] || exit 99
+        cat "$ACT_REPO_LOCAL_PATH/$ACT_REPO_WORKFLOW"
+    ' _ "${DSR_ROUTING_TEST_ROOT:-$DSR_PROJECT_ROOT}"
+    assert_equal 0 "$status"
+    assert_contains "$output" "Different root recipe"
+    before=$(git hash-object "$source/release.yml")
+    run _routing_watch "$(_watch_run_json)" --auto-fallback
+    assert_equal 0 "$status"
+    assert_contains "$output" "requires an explicit workflow: .github/workflows/"
+    [[ ! -e "$TEST_TMPDIR/fallback.starts" && ! -e "$DSR_STATE_DIR/triggered.json" ]]
+    assert_equal "$before" "$(git hash-object "$source/release.yml")"
+}
+
+@test "workflow custody: unknown or mismatched paths cannot launch defer or preview" {
+    harness_create_config
+    _watch_configure_ntm
+    local mutation check_json
+    for mutation in 'del(.workflow_path)' '.workflow_path=".github/workflows/another.yml"' \
+        '.workflow_path=".github/workflows/../release.yml"' \
+        '.workflow_path=".github/workflows/release.yml@"' '.workflow_path=17'; do
+        check_json=$(_watch_run_json | jq ".details.throttled[0] |= ($mutation)")
+        run _routing_watch "$check_json" --auto-fallback
+        assert_equal 0 "$status"
+        [[ ! -e "$TEST_TMPDIR/fallback.starts" && ! -e "$DSR_STATE_DIR/triggered.json" ]]
+        run _routing_watch "$check_json" --auto-fallback --dry-run
+        assert_equal 0 "$status"
+        [[ "$output" != *"Would trigger fallback"* && ! -e "$DSR_STATE_DIR/triggered.json" ]]
+    done
+}
+
+@test "workflow custody: a workflow policy change after the queued poll withdraws a fresh launch" {
+    harness_create_config
+    _watch_configure_ntm
+    yq '.workflow=".github/workflows/replacement.yml"' "$DSR_CONFIG_DIR/repos.d/ntm.yaml" > "$TEST_TMPDIR/replacement.yaml"
+    DSR_WATCH_FIXTURE_CONFIG_AFTER_CHECK="$TEST_TMPDIR/replacement.yaml" \
+        run _routing_watch "$(_watch_run_json)" --auto-fallback
+    assert_equal 0 "$status"
+    assert_contains "$output" "does not match the configured workflow file"
+    [[ ! -e "$TEST_TMPDIR/fallback.starts" && ! -e "$DSR_STATE_DIR/triggered.json" &&
+       ! -e "$DSR_STATE_DIR/watch-artifacts/12345" ]]
+}
+
+@test "workflow custody: deferred recovery keeps its original workflow ID attempt and ref" {
+    _watch_pending_fixture
+    local before mutation
+    before=$(cat "$DSR_STATE_DIR/triggered.json")
+    _mock_watch_upstream_run "$(_watch_upstream_run_json completed failure)"
+    for mutation in '.workflow_id=18' '.run_attempt=2' '.path=".github/workflows/another.yml"' \
+        '.path=".github/workflows/release.yml@refs/tags/v1.2.3"' 'del(.path)'; do
+        _watch_upstream_run_json completed failure | jq "$mutation" > "$TEST_TMPDIR/watch-upstream.json"
+        run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --max-concurrent 1
+        assert_equal 0 "$status"
+        assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+        assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    done
+    _watch_upstream_run_json completed failure > "$TEST_TMPDIR/watch-upstream.json"
+    run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --max-concurrent 1
+    assert_equal 0 "$status"
+    _watch_completed
+    assert_equal 2 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    jq -e '.attempts["12345"].watch_admission | .workflow_id == 17 and .run_attempt == 1 and
+        .workflow_path == ".github/workflows/release.yml"' "$DSR_STATE_DIR/triggered.json"
+}
+
+@test "workflow custody: legacy unbound pending work stays immutable without automatic adoption" {
+    _watch_pending_fixture
+    jq 'del(.pending["12345"].workflow_path,.pending["12345"].workflow_id,.pending["12345"].run_attempt)' \
+        "$DSR_STATE_DIR/triggered.json" > "$TEST_TMPDIR/legacy-pending.json"
+    cp "$TEST_TMPDIR/legacy-pending.json" "$DSR_STATE_DIR/triggered.json"
+    _mock_watch_upstream_run "$(_watch_upstream_run_json completed failure)"
+
+    run _routing_watch "$(_watch_run_json)" --auto-fallback --max-concurrent 1
+    assert_equal 0 "$status"
+    cmp "$TEST_TMPDIR/legacy-pending.json" "$DSR_STATE_DIR/triggered.json"
+    run _routing_watch "$(_watch_run_json)" --auto-fallback --dry-run --max-concurrent 1
+    assert_equal 0 "$status"
+    [[ "$output" != *"Would trigger fallback"* ]]
+    cmp "$TEST_TMPDIR/legacy-pending.json" "$DSR_STATE_DIR/triggered.json"
+    run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --max-concurrent 1
+    assert_equal 0 "$status"
+    cmp "$TEST_TMPDIR/legacy-pending.json" "$DSR_STATE_DIR/triggered.json"
+    [[ ! -e "$TEST_TMPDIR/watch-upstream.calls" && ! -e "$DSR_STATE_DIR/watch-artifacts/12345" ]]
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+}
+
+@test "workflow custody: failed retries cannot replace their original workflow attempt" {
+    harness_create_config
+    _watch_configure_ntm
+    local sha check_json checkpoint=12345678-1234-1234-1234-123456789abc
+    local before mutation directory checkpoint_before
+    sha=$(_watch_checkpoint_source_sha)
+    check_json=$(_watch_run_json "$sha")
+    DSR_WATCH_FIXTURE_STATUS=6 run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal 0 "$status"
+    _watch_completed
+    _watch_seed_mixed_checkpoint "$checkpoint" "$DSR_STATE_DIR/watch-artifacts/12345" "$sha"
+    run _routing_watch '{"details":{"throttled":[]}}' --retry-delay 1
+    assert_equal 0 "$status"
+    before=$(cat "$DSR_STATE_DIR/triggered.json")
+    directory=$(jq -r '.attempts["12345"].attempt_id' "$DSR_STATE_DIR/triggered.json")
+    cp "$DSR_STATE_DIR/watch-attempts/$directory/result.json" "$TEST_TMPDIR/original-failed-result.json"
+    checkpoint_before=$(git hash-object "$DSR_STATE_DIR/builds/ntm/v1.2.3/$checkpoint/state.json")
+    sleep 1
+
+    for mutation in '.workflow_id=18' '.run_attempt=2' \
+        '.workflow_path=".github/workflows/release.yml@refs/tags/v1.2.3"'; do
+        run _routing_watch "$(jq ".details.throttled[0] |= ($mutation)" <<< "$check_json")" \
+            --auto-fallback --retry-delay 1
+        assert_equal 0 "$status"
+        assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+        assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    done
+    _mock_watch_upstream_run "$(_watch_upstream_run_json completed failure "$sha" | jq '.run_attempt=2')"
+    run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --retry-delay 1
+    assert_equal 0 "$status"
+    assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+
+    run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal 0 "$status"
+    _watch_completed
+    jq -e --arg run "$checkpoint" '.attempts["12345"] | .attempt == 2 and .resume_run_id == $run and
+        .watch_admission.workflow_id == 17 and .watch_admission.run_attempt == 1 and
+        .watch_admission.workflow_path == ".github/workflows/release.yml"' "$DSR_STATE_DIR/triggered.json"
+    cmp "$TEST_TMPDIR/original-failed-result.json" "$DSR_STATE_DIR/watch-attempts/$directory/result.json"
+    assert_equal "$checkpoint_before" "$(git hash-object "$DSR_STATE_DIR/builds/ntm/v1.2.3/$checkpoint/state.json")"
     assert_equal 2 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
 }
 
