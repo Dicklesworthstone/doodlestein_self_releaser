@@ -794,7 +794,7 @@ first build. It preserves the existing readonly/vendor dependency policy and
 builds for the installing machine, regardless of inherited `GOOS`, `GOARCH`,
 or `GOFLAGS`.
 
-Rust source builds use the installed compiler they probe, a private Cargo output
+By default, Rust source builds use the installed compiler they probe, a private Cargo output
 directory, and the installing machine's target. Ambient `RUSTC`,
 `RUSTC_WRAPPER`, and `RUSTC_WORKSPACE_WRAPPER` cannot substitute a different
 compiler or wrapper. Inherited `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, and
@@ -802,6 +802,50 @@ compiler or wrapper. Inherited `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, and
 `.cargo/config.toml` can supply its own compiler flags. Existing compiler homes
 and dependency caches remain available; this is a locally built source result,
 not a hermetic or signed release.
+
+### RCH-delivered Rust source executables
+
+The Bash source installer can consume the POSIX RCH Cargo JSON delivery mode
+when the caller explicitly selects both of its controls:
+
+```bash
+RCH_CARGO_JSON_STDOUT=1 RCH_REQUIRE_REMOTE=1 \
+  bash ./install.sh --from-source --source-ref refs/tags/v1.2.3
+```
+
+This mode requires a compatible RCH Cargo shim, Python 3 and `b3sum`, in addition
+to the ordinary Rust source-build dependencies. `RCH_REQUIRE_REMOTE` must be
+`1`; the installer preserves that policy. It does not enable RCH or choose a
+worker on the caller's behalf. The selected Cargo shim and local Rust host probe
+must already be usable: this mode does not bootstrap a local toolchain, even
+when `--install-toolchain` permits one. Ordinary source builds keep their
+existing toolchain and Cargo output selection and acquire no Python or BLAKE3
+dependency from this feature.
+
+RCH delivers selected executables into an invocation-private directory beneath
+the requested Cargo target root. The installer verifies the complete requested
+family against one shared wrapper, build and delivery receipt before returning
+any executable paths. Each selected record must match its retained original
+worker record and its projected source paths. The retained compiler stdout,
+complete stderr and delivered executables must match their BLAKE3 bindings;
+missing, changed, linked, ambiguous or unsuccessful evidence refuses the build.
+Only files in the selected private delivery directory are eligible. Verified
+executables are copied into the installer's own private output directory, then
+pass through the existing source receipt and complete-family installation
+transaction.
+
+Retained RCH receipt paths must have concrete directory ancestors. If the RCH
+state directory is reached through a symlink, configure `RCH_STATE_HOME` with
+its physical path before invoking this mode.
+
+The source receipt includes `rch_delivery` and explicitly records
+`compiler_identity_attested: false` and `source_content_attested: false`. Its
+compiler description identifies remote delivery; the local Rust probe is
+retained separately. These observations bind delivered bytes to the selected
+RCH invocation. The strict DSR native release backend has additional compiler,
+SDK and source attestation requirements and remains a separate execution path.
+The installed result keeps `signed_release: false`, and ordinary source-code
+execution consent is still required.
 
 ### Pinned Git submodules in Bash source builds
 

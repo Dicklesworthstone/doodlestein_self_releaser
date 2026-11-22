@@ -6,9 +6,269 @@
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 case "$#:${1:-}" in
-    0:|1:--bun-contracts-only|1:--bun-workspaces-only) ;;
-    *) printf 'Usage: %s [--bun-contracts-only|--bun-workspaces-only]\n' "$0" >&2; exit 4 ;;
+    0:|1:--bun-contracts-only|1:--bun-workspaces-only|1:--cargo-delivery-only) ;;
+    *) printf 'Usage: %s [--bun-contracts-only|--bun-workspaces-only|--cargo-delivery-only]\n' "$0" >&2; exit 4 ;;
 esac
+
+# The compiler boundary emits the current RCH producer's retained-record shape.
+# Hashing, descriptor/path validation, family staging and source receipts are real;
+# this is consumer interoperability coverage, not live worker qualification.
+test_cargo_delivery_contracts() (
+    for dependency in git jq ps python3 b3sum; do
+        command -v "$dependency" >/dev/null 2>&1 || {
+            printf 'SKIP: RCH Cargo delivery contracts require %s\n' "$dependency"; return 77;
+        }
+    done
+    # shellcheck source=../../src/install_source.sh
+    source "${DSR_INSTALL_SOURCE_ENGINE:-$ROOT/src/install_source.sh}"
+    local fixtures good=0 bad=0 fault result code base upstream pin
+    fixtures=$(mktemp -d "${TMPDIR:-/tmp}/dsr-cargo-delivery.XXXXXXXX") || return 1
+    fixtures=$(cd "$fixtures" && pwd -P) || return 1
+    printf 'RCH Cargo consumer evidence: %s\n' "$fixtures"
+    delivery_check() {
+        local label="$1"; shift
+        if "$@"; then good=$((good + 1)); printf 'PASS: %s\n' "$label"
+        else bad=$((bad + 1)); printf 'FAIL: %s\n' "$label" >&2; fi
+    }
+    delivery_equal() { [[ "$1" == "$2" ]]; }
+    rustc() {
+        [[ "$*" == -vV ]] || return 1
+        printf 'rustc 1.92.0 (local compiler-boundary probe)\nhost: x86_64-unknown-linux-gnu\n'
+    }
+    cargo() {
+        if [[ "${1:-}" == --version ]]; then
+            printf 'cargo 1.92.0 (compiler-boundary fixture)\n'
+            return 0
+        fi
+        python3 -I - "$base" "$fault" "$PWD" "$@" <<'PY'
+import copy
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+base, fault, source, *arguments = sys.argv[1:]
+base, source = Path(base), Path(source)
+host = arguments[arguments.index("--target") + 1]
+target = Path(arguments[arguments.index("--target-dir") + 1])
+names = [arguments[i + 1] for i, item in enumerate(arguments) if item == "--bin"]
+(base / "cargo.calls").write_text(json.dumps({"arguments": arguments,
+    "rustc": os.environ.get("RUSTC"), "require_remote": os.environ.get("RCH_REQUIRE_REMOTE")}))
+wrapper = "rch-source-fixture"
+identifier = "01234567-89ab-4cde-8fab-0123456789ab"
+caller = target / (".rch-delivered-" + wrapper + "-" + identifier)
+receipts = base / "receipts"
+receipts.mkdir()
+stdout = receipts / (wrapper + ".cargo-stdout-" + identifier)
+stderr = receipts / (wrapper + ".cargo-stderr-" + identifier)
+stderr.write_text("complete compiler diagnostics\n")
+def b3(path):
+    with path.open("rb") as stream:
+        return subprocess.check_output(["b3sum", "--no-names"], stdin=stream).decode().strip()
+original, delivered, payloads = [], [], []
+for name in names:
+    relative = Path(host) / "release" / name
+    conventional = target / relative
+    conventional.parent.mkdir(parents=True, exist_ok=True)
+    # Shared paths deliberately contain a different native payload.
+    shutil.copyfile("/bin/false" if name == "app" else "/bin/true", conventional)
+    executable = conventional if fault == "conventional" else caller / relative
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile("/bin/true" if name == "app" else "/bin/false", executable)
+    payloads.append(executable)
+    worker = {"reason": "compiler-artifact", "package_id": "path+file:///worker/checkout#" + name + "@1.0.0",
+        "manifest_path": "/worker/checkout/Cargo.toml", "target": {"kind": ["bin"], "crate_types": ["bin"],
+        "name": name, "src_path": "/worker/checkout/src/" + name + ".rs", "edition": "2021"},
+        "profile": {"test": False}, "features": [], "fresh": False,
+        "executable": "/worker/target/" + str(relative), "filenames": ["/worker/target/" + str(relative)]}
+    if fault == "source-projection" and name == "app":
+        worker["target"]["src_path"] = "/another/checkout/src/" + name + ".rs"
+    if fault == "profile":
+        worker["profile"]["test"] = True
+    original.append(worker)
+    record = copy.deepcopy(worker)
+    record["manifest_path"] = str(source / "Cargo.toml")
+    record["target"]["src_path"] = str(source / "src" / (name + ".rs"))
+    record["executable"] = str(executable)
+    record["filenames"] = [str(executable)]
+    delivered.append(record)
+terminal = {"reason": "build-finished", "success": fault != "failed-build"}
+stdout.write_text("".join(json.dumps(record) + "\n" for record in original + [terminal]) +
+                  "---RCH-TELEMETRY---\n{\"worker\":\"fixture\"}\n")
+binding = {"path": str(stdout), "blake3": b3(stdout), "wrapper_id": wrapper, "build_id": 41,
+    "published_output_root": str(target), "caller_output_root": str(caller),
+    # Both lexical and physical worker roots are legal producer projections.
+    "remote_project_root": "/worker/physical-checkout", "stderr": {
+        "path": str(stderr), "blake3": b3(stderr), "bytes": stderr.stat().st_size, "exit_code": 0}}
+for record, worker, payload in zip(delivered, original, payloads):
+    if fault != "conventional":
+        record["rch"] = {"worker_record": copy.deepcopy(worker), "receipt": copy.deepcopy(binding),
+                         "executable_blake3": b3(payload)}
+if fault == "stdout-corrupt":
+    stdout.write_text(stdout.read_text() + "changed retained stdout\n")
+elif fault == "stderr-corrupt":
+    stderr.write_bytes(b"x" * stderr.stat().st_size)
+elif fault == "payload-corrupt":
+    payloads[-1].write_bytes(b"changed executable bytes")
+elif fault == "payload-link":
+    payloads[-1].rename(base / "original-payload")
+    payloads[-1].symlink_to(base / "original-payload")
+elif fault == "receipt-link":
+    stdout.rename(base / "original-stdout")
+    stdout.symlink_to(base / "original-stdout")
+elif fault == "receipt-parent-link":
+    receipts.rename(base / "physical-receipts")
+    receipts.symlink_to(base / "physical-receipts", target_is_directory=True)
+elif fault == "mixed-receipt":
+    delivered[-1]["rch"]["receipt"]["build_id"] = 42
+elif fault == "wrong-root":
+    for record in delivered:
+        record["rch"]["receipt"]["published_output_root"] = str(base / "other-target")
+elif fault == "worker-record":
+    delivered[-1]["rch"]["worker_record"]["fresh"] = True
+elif fault == "changed-record":
+    delivered[-1]["fresh"] = True
+elif fault == "outside-executable":
+    delivered[-1]["executable"] = str(base / "outside")
+elif fault == "missing-member":
+    delivered = delivered[:-1]
+elif fault == "duplicate-member":
+    delivered.append(delivered[-1])
+for record in delivered + [terminal]:
+    print(json.dumps(record))
+PY
+    }
+    delivery_case() (
+        local label="$1" fault="$2" base="$fixtures/$1" status=0
+        mkdir -p "$base/source/src" "$base/output" || return 1
+        printf '[package]\nname="delivery-fixture"\nversion="1.0.0"\nedition="2021"\n' > "$base/source/Cargo.toml"
+        for member in app helper; do printf 'fn main() {}\n' > "$base/source/src/$member.rs"; done
+        export RCH_CARGO_JSON_STDOUT=1 RCH_REQUIRE_REMOTE=1
+        unset RUSTC
+        [[ "$fault" != conventional && "$fault" != no-opt-in ]] || unset RCH_CARGO_JSON_STDOUT
+        [[ "$fault" != supplied-rustc ]] || export RUSTC=caller-selected-rustc
+        [[ "$fault" != remote-unset ]] || unset RCH_REQUIRE_REMOTE
+        [[ "$fault" != remote-false ]] || export RCH_REQUIRE_REMOTE=0
+        if [[ "$fault" == polluted-python ]]; then
+            mkdir "$base/python-imports" || return 1
+            printf 'raise RuntimeError("ambient Python import executed")\n' > "$base/python-imports/json.py"
+            export PYTHONPATH="$base/python-imports"
+        fi
+        if [[ "$fault" == bootstrap-ready || "$fault" == bootstrap-probe ]]; then
+            export _ISB_INSTALL_TOOLCHAIN=true
+            toolchain_bootstrap() { : > "$base/bootstrap.called"; return 9; }
+            if [[ "$fault" == bootstrap-probe ]]; then
+                rustc() { return 1; }
+            fi
+        fi
+        if [[ "$fault" == missing-python3 || "$fault" == missing-b3sum ||
+              "$fault" == missing-cargo || "$fault" == missing-rustc ]]; then
+            command() {
+                [[ "${1:-}" != -v || "${2:-}" != "${fault#missing-}" ]] || return 1
+                builtin command "$@"
+            }
+        fi
+        _isb_compile rust "$base/source" "$base/output" app '' '' 5 helper app \
+            > "$base/result" 2> "$base/stderr" || status=$?
+        printf '%s' "$status"
+    )
+    code=$(delivery_case 'healthy space' healthy)
+    delivery_check 'explicit RCH JSON mode admits the complete delivered family' delivery_equal "$code" 0
+    result=$(cat "$fixtures/healthy space/result")
+    delivery_check 'RCH family staging preserves requested member order' delivery_equal "$result" \
+        "$(printf '%s/output/bin/helper\n%s/output/bin/app' "$fixtures/healthy space" "$fixtures/healthy space")"
+    delivery_check 'primary staging uses verified delivered bytes instead of stale shared output' \
+        cmp -s /bin/true "$fixtures/healthy space/output/bin/app"
+    delivery_check 'companion staging uses its own verified delivered bytes' \
+        cmp -s /bin/false "$fixtures/healthy space/output/bin/helper"
+    delivery_check 'RCH command explicitly requests JSON and preserves remote policy without a local RUSTC path' \
+        jq -e '.arguments | index("--message-format=json,json-render-diagnostics") != null' "$fixtures/healthy space/cargo.calls"
+    delivery_check 'RCH compiler command preserves supplied remote policy and leaves absent RUSTC unset' \
+        jq -e '.rustc == null and .require_remote == "1"' "$fixtures/healthy space/cargo.calls"
+    delivery_check 'RCH delivery metadata identifies exact family without attesting compiler or source content' \
+        jq -e '.build_id == 41 and .compiler_identity_attested == false and .source_content_attested == false and
+            [.binaries[].name] == ["helper","app"] and all(.binaries[]; .blake3 | test("^[0-9a-f]{64}$"))' \
+        "$fixtures/healthy space/output/rch-delivery.json"
+    code=$(delivery_case conventional conventional)
+    delivery_check 'ordinary Cargo still accepts its exact conventional output paths' delivery_equal "$code" 0
+    delivery_check 'ordinary Cargo retains its compiler and message-format policy' jq -e \
+        '.rustc == "rustc" and (.arguments | index("--message-format=json-render-diagnostics") != null)' \
+        "$fixtures/conventional/cargo.calls"
+    code=$(delivery_case supplied-rustc supplied-rustc)
+    delivery_check 'explicit RCH delivery preserves a caller-supplied compiler policy' delivery_equal "$code" 0
+    delivery_check 'caller RUSTC reaches RCH unchanged' jq -e '.rustc == "caller-selected-rustc"' "$fixtures/supplied-rustc/cargo.calls"
+    code=$(delivery_case polluted-python polluted-python)
+    delivery_check 'receipt validation ignores ambient Python module imports' delivery_equal "$code" 0
+    code=$(delivery_case bootstrap-ready bootstrap-ready)
+    delivery_check 'authorized bootstrap does not replace an existing RCH client route' delivery_equal "$code" 0
+    delivery_check 'a usable RCH host probe never bootstraps a plain local Cargo' test ! -e "$fixtures/bootstrap-ready/bootstrap.called"
+    code=$(delivery_case bootstrap-probe bootstrap-probe)
+    delivery_check 'an unavailable RCH host probe is a dependency refusal' delivery_equal "$code" 3
+    delivery_check 'an unavailable host probe cannot trigger authorized local bootstrap' test ! -e "$fixtures/bootstrap-probe/bootstrap.called"
+    delivery_check 'an unavailable host probe cannot dispatch Cargo' test ! -e "$fixtures/bootstrap-probe/cargo.calls"
+    for fault in missing-python3 missing-b3sum missing-cargo missing-rustc; do
+        code=$(delivery_case "$fault" "$fault")
+        delivery_check "explicit RCH mode reports $fault as a dependency failure" delivery_equal "$code" 3
+        delivery_check "$fault is refused before compiling" test ! -e "$fixtures/$fault/cargo.calls"
+    done
+    for fault in remote-unset remote-false; do
+        code=$(delivery_case "$fault" "$fault")
+        delivery_check "explicit RCH mode refuses $fault policy" delivery_equal "$code" 4
+        delivery_check "$fault is refused before compiling" test ! -e "$fixtures/$fault/cargo.calls"
+    done
+    for fault in no-opt-in stdout-corrupt stderr-corrupt payload-corrupt payload-link receipt-link receipt-parent-link \
+        mixed-receipt wrong-root worker-record changed-record outside-executable missing-member \
+        duplicate-member failed-build source-projection profile; do
+        code=$(delivery_case "$fault" "$fault")
+        delivery_check "RCH $fault fails closed" delivery_equal "$code" 6
+        delivery_check "RCH $fault returns no partial family or success metadata" \
+            test ! -s "$fixtures/$fault/result"
+        delivery_check "RCH $fault does not stage the first member" test ! -e "$fixtures/$fault/output/bin"
+    done
+    # Exercise the public source engine too: the selected checkout, commit pin,
+    # complete family receipt and compiler-identity wording must survive the
+    # same real fetch/graph/compile/receipt flow used by generated installers.
+    upstream="$fixtures/upstream"
+    mkdir -p "$upstream/src" || return 1
+    printf '[package]\nname="delivery-fixture"\nversion="1.0.0"\nedition="2021"\n' > "$upstream/Cargo.toml"
+    for member in app helper; do printf 'fn main() {}\n' > "$upstream/src/$member.rs"; done
+    git init -q -b main "$upstream" || return 1
+    git -C "$upstream" config user.name 'DSR RCH consumer fixture' || return 1
+    git -C "$upstream" config user.email 'fixture@example.invalid' || return 1
+    git -C "$upstream" add . || return 1
+    git -C "$upstream" commit -qm 'Pinned source delivery family' || return 1
+    pin=$(git -C "$upstream" rev-parse HEAD) || return 1
+    export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$fixtures/gitconfig"
+    export DSR_GH_TOKEN='' GITHUB_TOKEN='' GH_TOKEN=''
+    export RCH_CARGO_JSON_STDOUT=1 RCH_REQUIRE_REMOTE=1
+    unset RUSTC
+    gh() { return 1; }
+    git config --file "$GIT_CONFIG_GLOBAL" url."file://$upstream".insteadOf https://github.com/fixture/rch-source.git || return 1
+    for fault in healthy payload-corrupt; do
+        base="$fixtures/source-$fault"
+        mkdir "$base" || return 1
+        code=0
+        install_source_build fixture/rch-source HEAD rust app "$base/build" \
+            --allow-build --timeout 15 --bin helper --bin app \
+            > "$base/result.json" 2> "$base/stderr" || code=$?
+        if [[ "$fault" == healthy ]]; then
+            delivery_check 'public source engine returns a complete RCH-built family' delivery_equal "$code" 0
+            delivery_check 'source receipt binds the pinned commit, complete family, and honest compiler identity' \
+                jq -es --arg pin "$pin" 'length == 1 and (.[0] | .source_commit == $pin and [.binaries[].name] == ["helper","app"] and
+                  .compiler == "RCH remote compilation (compiler identity not attested)" and
+                  .rch_delivery.compiler_identity_attested == false and .rch_delivery.source_content_attested == false and
+                  (.rch_delivery.local_rustc_probe | contains("local compiler-boundary probe")) and
+                  .signed_release == false)' "$base/result.json"
+        else
+            delivery_check 'public source engine rejects a corrupt later delivered member' delivery_equal "$code" 6
+            delivery_check 'public source engine publishes no receipt for a partial RCH family' test ! -e "$base/build/receipt.json"
+        fi
+    done
+    printf 'RCH Cargo delivery consumer: %s passed, %s failed\n' "$good" "$bad"
+    [[ $bad -eq 0 ]]
+)
 
 test_bun_family_contracts() (
     for dependency in jq ps; do
@@ -222,6 +482,10 @@ test_bun_workspaces() (
     [[ $bad -eq 0 ]]
 )
 
+if [[ "${1:-}" == --cargo-delivery-only ]]; then
+    test_cargo_delivery_contracts
+    exit $?
+fi
 if [[ "${1:-}" == --bun-contracts-only ]]; then
     test_bun_family_contracts
     exit $?

@@ -98,7 +98,7 @@ jobs:
           set -euo pipefail
           if [[ "$RUNNER_OS" == Linux ]]; then
             sudo apt-get update
-            sudo apt-get install -y --no-install-recommends jq xz-utils golang-go minisign zip unzip msitools wixl rsync python3 gcc openssl shellcheck gh zsh
+            sudo apt-get install -y --no-install-recommends jq xz-utils golang-go minisign zip unzip msitools wixl rsync python3 gcc openssl shellcheck gh zsh b3sum
           else
             for tool in jq xz go minisign rsync shellcheck; do
               command -v "$tool" >/dev/null || brew install "$tool"
@@ -439,6 +439,15 @@ jobs:
           bash scripts/tests/test_install_source_family.sh --bun-workspaces-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/bun-workspaces.log"
           bash scripts/tests/test_generated_workspace_installer.sh --go-bun-source-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/go-bun-source-families.log"
           timeout 120 bash scripts/tests/test_upgrade_verify.sh --bun-source-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/bun-source-upgrade.log"
+          test -z "$(git status --porcelain)"
+      - name: Validate RCH Cargo delivery consumers
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/tests/test_install_source_family.sh
+          timeout 120 bash scripts/tests/test_install_source_family.sh --cargo-delivery-only \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/rch-cargo-delivery-consumer.log"
           test -z "$(git status --porcelain)"
       - name: Validate bounded installer freshness acquisition
         if: runner.os == 'Linux'

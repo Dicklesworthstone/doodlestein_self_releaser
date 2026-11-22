@@ -2435,6 +2435,302 @@ _isb_bun_context() (
         > "$output/bun-context.json"
 )
 
+# RCH's explicit Cargo JSON mode advertises invocation-private delivered copies,
+# not the mutable conventional Cargo output. Verify its retained producer records
+# and fingerprints before admitting the complete family into our own staging tree.
+# This establishes delivery identity, not remote source/compiler attestation.
+_isb_rch_cargo_outputs() (
+    local tree="$1" output="$2" host="$3" limit="$4"
+    shift 4
+    python3 -I - "$tree" "${_ISB_CHECKOUT_ROOT:-$tree}" "$output" "$host" "$limit" "$@" <<'PY'
+import copy
+import hashlib
+import json
+import os
+from pathlib import PurePosixPath
+import re
+import stat
+import subprocess
+import sys
+
+tree, checkout, output, host, limit, *names = sys.argv[1:]
+limit = int(limit)
+MAX_RECEIPT = 64 * 1024 * 1024  # RCH MAX_CARGO_OUTPUT_RECEIPT_BYTES
+MAX_PAYLOAD = 4 * 1024 * 1024 * 1024
+HEX = re.compile(r"[0-9a-f]{64}\Z")
+UUID = r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}"
+directories = {}
+files = []
+
+def require(ok, message):
+    if not ok:
+        raise ValueError(message)
+
+def path(value):
+    require(isinstance(value, str) and value.startswith("/") and
+            not any(ord(c) < 32 or ord(c) == 127 for c in value) and
+            "\\" not in value, "invalid absolute delivery path")
+    parsed = PurePosixPath(value)
+    require(str(parsed) == value and ".." not in parsed.parts, "noncanonical delivery path")
+    return parsed
+
+def below(value, root):
+    relative = path(value).relative_to(path(root))
+    require(relative.parts, "delivery path names a root")
+    return relative
+
+def identity(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink,
+            info.st_uid, info.st_gid, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+def directory(value):
+    value = str(path(value))
+    if value in directories:
+        return directories[value][0]
+    if value == "/":
+        fd = os.open(value, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        parent, name = None, None
+    else:
+        parent = directory(str(path(value).parent))
+        name = path(value).name
+        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+    directories[value] = (fd, parent, name, os.fstat(fd))
+    return fd
+
+class File:
+    def __init__(self, value, maximum, nonempty=False):
+        self.path = path(value)
+        self.parent = directory(str(self.path.parent))
+        self.fd = os.open(self.path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                          dir_fd=self.parent)
+        self.before = os.fstat(self.fd)
+        files.append(self)
+        require(stat.S_ISREG(self.before.st_mode) and self.before.st_size <= maximum and
+                (not nonempty or self.before.st_size > 0), "invalid retained file size or type")
+        self.check()
+
+    def check(self):
+        current = os.stat(self.path.name, dir_fd=self.parent, follow_symlinks=False)
+        require(identity(current) == identity(self.before) == identity(os.fstat(self.fd)),
+                "retained file changed during delivery validation")
+
+    def chunks(self):
+        self.check()
+        os.lseek(self.fd, 0, os.SEEK_SET)
+        remaining = self.before.st_size
+        while remaining:
+            data = os.read(self.fd, min(1024 * 1024, remaining))
+            require(data, "retained file was truncated")
+            remaining -= len(data)
+            yield data
+        require(not os.read(self.fd, 1), "retained file grew")
+        self.check()
+
+    def blake3(self, expected):
+        require(isinstance(expected, str) and HEX.fullmatch(expected), "invalid BLAKE3 fingerprint")
+        self.check()
+        os.lseek(self.fd, 0, os.SEEK_SET)
+        result = subprocess.run(["b3sum", "--no-names"], stdin=self.fd, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, timeout=limit, check=True)
+        require(result.stdout.decode("ascii").strip() == expected, "retained BLAKE3 fingerprint mismatch")
+        self.check()
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        require(key not in result, "duplicate JSON object key")
+        result[key] = value
+    return result
+
+def records(source):
+    # Cargo diagnostics may share the log. Only complete JSON records are data;
+    # duplicate keys and nonfinite numbers are never accepted as producer data.
+    pending = b""
+    result = []
+    telemetry = False
+    for chunk in source.chunks():
+        pending += chunk
+        lines = pending.split(b"\n")
+        pending = lines.pop()
+        for line in lines:
+            if line.rstrip(b"\r") == b"---RCH-TELEMETRY---":
+                telemetry = True
+            if telemetry:
+                continue
+            try:
+                value = json.loads(line, object_pairs_hook=unique_object,
+                                   parse_constant=lambda _: (_ for _ in ()).throw(ValueError("invalid JSON number")))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if isinstance(value, dict):
+                result.append(value)
+    if pending.strip() and not telemetry:
+        try:
+            value = json.loads(pending, object_pairs_hook=unique_object,
+                               parse_constant=lambda _: (_ for _ in ()).throw(ValueError("invalid JSON number")))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            value = None
+        if isinstance(value, dict):
+            result.append(value)
+    finished = [record for record in result if record.get("reason") == "build-finished"]
+    require(len(finished) == 1 and finished[0].get("success") is True and
+            result[-1] is finished[0], "Cargo delivery lacks one successful terminal build record")
+    return result
+
+def selected(all_records):
+    result = []
+    for name in names:
+        providers = [record for record in all_records if record.get("reason") == "compiler-artifact" and
+                     record.get("target", {}).get("name") == name and
+                     "bin" in record.get("target", {}).get("kind", [])]
+        require(len(providers) == 1, "Cargo delivery has missing or ambiguous executable providers")
+        record = providers[0]
+        require(record["target"]["kind"] == ["bin"] and
+                isinstance(record.get("package_id"), str) and record["package_id"] and
+                record.get("profile", {}).get("test") is False, "invalid executable provider record")
+        result.append(record)
+    return result
+
+def revalidate():
+    for value, (fd, parent, name, before) in directories.items():
+        current = os.fstat(fd)
+        named = os.stat(name, dir_fd=parent, follow_symlinks=False) if parent is not None else os.lstat(value)
+        require(stat.S_ISDIR(named.st_mode) and (before.st_dev, before.st_ino) ==
+                (current.st_dev, current.st_ino) == (named.st_dev, named.st_ino),
+                "delivery directory identity changed")
+    for source in files:
+        source.check()
+
+try:
+    require(names and len(set(names)) == len(names), "invalid requested executable family")
+    target_root = str(path(output) / "target")
+    caller_records = selected(records(File(output + "/build.log", 3 * MAX_RECEIPT)))
+    receipt = caller_records[0].get("rch", {}).get("receipt")
+    require(isinstance(receipt, dict) and set(receipt) == {
+        "path", "blake3", "wrapper_id", "build_id", "published_output_root",
+        "caller_output_root", "remote_project_root", "stderr"}, "unrecognized RCH receipt binding")
+    wrapper = receipt["wrapper_id"]
+    require(isinstance(wrapper, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}", wrapper),
+            "invalid RCH wrapper identity")
+    require(type(receipt["build_id"]) is int and receipt["build_id"] > 0, "invalid RCH build identity")
+    caller_root = path(receipt["caller_output_root"])
+    require(receipt["published_output_root"] == target_root and str(caller_root.parent) == target_root and
+            re.fullmatch(r"\.rch-delivered-" + re.escape(wrapper) + "-" + UUID, caller_root.name),
+            "RCH delivery is not bound to this invocation's target directory")
+    remote_project = str(path(receipt["remote_project_root"]))
+    stderr = receipt["stderr"]
+    require(isinstance(stderr, dict) and set(stderr) == {"path", "blake3", "bytes", "exit_code"} and
+            type(stderr["bytes"]) is int and 0 <= stderr["bytes"] <= MAX_RECEIPT and
+            type(stderr["exit_code"]) is int and stderr["exit_code"] == 0, "invalid retained diagnostics receipt")
+    stdout_file = File(receipt["path"], MAX_RECEIPT, True)
+    stderr_file = File(stderr["path"], MAX_RECEIPT)
+    for source, label in [(stdout_file, "stdout"), (stderr_file, "stderr")]:
+        require(re.fullmatch(re.escape(wrapper) + r"\.cargo-" + label + "-" + UUID, source.path.name),
+                "retained receipt path is not bound to its wrapper")
+    require(stdout_file.path.parent == stderr_file.path.parent and
+            stderr_file.before.st_size == stderr["bytes"], "retained diagnostics identity mismatch")
+    stdout_file.blake3(receipt["blake3"])
+    stderr_file.blake3(stderr["blake3"])
+    original_records = records(stdout_file)
+    original_selected = selected(original_records)
+    candidates = []
+    cursor = path(tree)
+    while True:
+        candidates.append(str(cursor))
+        if str(cursor) == checkout:
+            break
+        require(cursor != cursor.parent and path(checkout) in cursor.parents, "source tree escapes checkout")
+        cursor = cursor.parent
+    projections, outputs, binary_evidence = [], [], []
+    remote_output = None
+    for name, record, original in zip(names, caller_records, original_selected):
+        extension = record.get("rch")
+        require(isinstance(extension, dict) and set(extension) == {"worker_record", "receipt", "executable_blake3"} and
+                extension["receipt"] == receipt and extension["worker_record"] == original and
+                sum(item == original for item in original_records) == 1 and "rch" not in original,
+                "RCH executable lacks its exact shared producer record")
+        relative = PurePosixPath(host) / "release" / name
+        executable = str(caller_root / relative)
+        require(record.get("executable") == executable, "RCH executable does not match selected host/name")
+        worker_executable = path(original.get("executable"))
+        require(worker_executable.parts[-3:] == relative.parts, "worker executable target/name mismatch")
+        worker_root = str(worker_executable.parents[2])
+        require(remote_output is None or remote_output == worker_root, "mixed worker output roots")
+        remote_output = worker_root
+        expected = copy.deepcopy(original)
+        expected["executable"] = executable
+        require(isinstance(original.get("filenames"), list) and original["executable"] in original["filenames"],
+                "worker executable is absent from its output set")
+        expected["filenames"] = [str(caller_root / below(item, worker_root)) for item in original["filenames"]]
+        for old, new in [(original.get("manifest_path"), record.get("manifest_path")),
+                         (original["target"].get("src_path"), record["target"].get("src_path"))]:
+            path(old)
+            below(new, checkout)
+            File(new, MAX_PAYLOAD, True)
+            projections.append((old, new))
+        require(path(record["manifest_path"]).name == "Cargo.toml", "invalid projected Cargo manifest")
+        expected["manifest_path"] = record["manifest_path"]
+        expected["target"]["src_path"] = record["target"]["src_path"]
+        expected["rch"] = extension
+        require(record == expected, "RCH record changed fields outside the producer's path projection")
+        payload = File(executable, MAX_PAYLOAD, True)
+        payload.blake3(extension["executable_blake3"])
+        outputs.append(payload)
+        binary_evidence.append({"name": name, "blake3": extension["executable_blake3"],
+            "worker_record_sha256": hashlib.sha256(json.dumps(original, sort_keys=True,
+                separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()})
+    # RCH can retain both a lexical worker source root and its physical root.
+    # Its public binding names only the latter. Accept one consistent alias,
+    # with all source-relative projections rooted in the pinned local checkout.
+    def source_projection(local_root):
+        aliases = set()
+        for old, new in projections:
+            try:
+                relative = below(new, local_root)
+            except ValueError:
+                return False
+            old_path = path(old)
+            if old_path.parts[-len(relative.parts):] != relative.parts:
+                return False
+            aliases.add(str(old_path.parents[len(relative.parts) - 1]))
+        return len(aliases - {remote_project}) <= 1
+    require(any(source_projection(root) for root in candidates), "inconsistent worker-to-checkout source projection")
+    revalidate()
+    staged = path(output) / "bin"
+    os.mkdir(str(staged), 0o700)
+    stage_fd = directory(str(staged))
+    paths = []
+    for name, payload, evidence in zip(names, outputs, binary_evidence):
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700, dir_fd=stage_fd)
+        with os.fdopen(fd, "wb") as destination:
+            for chunk in payload.chunks():
+                destination.write(chunk)
+            destination.flush()
+            os.fsync(destination.fileno())
+        copied = str(staged / name)
+        File(copied, MAX_PAYLOAD, True).blake3(evidence["blake3"])
+        paths.append(copied)
+    revalidate()
+    metadata = {"contract": "rch-cargo-json-delivery", "wrapper_id": wrapper, "build_id": receipt["build_id"],
+        "compiler_identity_attested": False, "source_content_attested": False,
+        "stdout_blake3": receipt["blake3"], "stderr_blake3": stderr["blake3"],
+        "stdout_size_bytes": stdout_file.before.st_size, "stderr_size_bytes": stderr["bytes"],
+        "binaries": binary_evidence}
+    with open(output + "/rch-delivery.json", "x", encoding="utf-8") as destination:
+        json.dump(metadata, destination, separators=(",", ":"))
+        destination.write("\n")
+    print("\n".join(paths))
+except (OSError, ValueError, KeyError, TypeError, AttributeError, UnicodeError, subprocess.SubprocessError) as error:
+    print("[source-build] RCH Cargo delivery validation failed: " + str(error), file=sys.stderr)
+    sys.exit(6)
+finally:
+    for source in files:
+        os.close(source.fd)
+    for fd, _, _, _ in directories.values():
+        os.close(fd)
+PY
+)
+
 # Build only the requested executable family, into a new private output directory.
 # Never run arbitrary command strings from installer configuration.
 _isb_compile() (
@@ -2448,7 +2744,30 @@ _isb_compile() (
     case "$language" in
         rust)
             [[ -f Cargo.toml && ! -L Cargo.toml ]] || return 4
-            _isb_prepare_toolchain "$language" "$tree" "$output" "$limit" || return $?
+            local rustc_command rch_delivery=false dependency delivered_paths
+            if [[ "${RCH_CARGO_JSON_STDOUT:-}" == 1 ]]; then
+                rch_delivery=true
+                [[ "${RCH_REQUIRE_REMOTE:-}" == 1 ]] || {
+                    _isb_log 'Explicit RCH Cargo delivery requires RCH_REQUIRE_REMOTE=1; local fallback is not admitted'
+                    return 4
+                }
+                for dependency in python3 b3sum cargo rustc; do
+                    command -v "$dependency" >/dev/null 2>&1 || {
+                        _isb_log "Explicit RCH Cargo delivery requires $dependency; install it before retrying"
+                        case "$dependency" in cargo|rustc)
+                            _isb_log 'Prepare the RCH Cargo shim and local Rust host probe; this mode does not bootstrap a plain local Cargo'
+                            ;;
+                        esac
+                        return 3
+                    }
+                done
+            fi
+            # Bootstrap prepends a private plain Cargo, replacing the caller's
+            # RCH shim. Explicit delivery requires an already usable client
+            # route and host probe, even when local bootstrap was authorized.
+            if ! $rch_delivery; then
+                _isb_prepare_toolchain "$language" "$tree" "$output" "$limit" || return $?
+            fi
             # rustup proxies may auto-install a missing repository-selected
             # toolchain. Any separately authorized bootstrap is already active;
             # never let a proxy modify an existing global installation.
@@ -2458,19 +2777,36 @@ _isb_compile() (
             # inherited Cargo-only RUSTC or build-cache wrapper. Preserve
             # compiler homes and dependency caches, as the Windows source
             # engine does, while keeping this attempt's outputs private.
-            local rustc_command
             rustc_command=$(command -v rustc) || return 3
-            export RUSTC="$rustc_command" RUSTC_WRAPPER='' RUSTC_WORKSPACE_WRAPPER=''
+            # In RCH mode the local probe establishes the requested host, not
+            # the remote compiler identity. Preserve caller RUSTC policy;
+            # do not export a local absolute compiler path to the worker.
+            if ! $rch_delivery; then
+                export RUSTC="$rustc_command"
+            fi
+            export RUSTC_WRAPPER='' RUSTC_WORKSPACE_WRAPPER=''
             # Empty flag variables still suppress .cargo/config.toml. Remove
             # ambient overrides so the pinned project's cfg/link flags apply.
             unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS
-            _isb_run "$limit" "$output/compiler.log" "$rustc_command" -vV || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
+            _isb_run "$limit" "$output/compiler.log" "$rustc_command" -vV || {
+                status=$?; [[ $status == 5 ]] && return 5
+                if $rch_delivery; then
+                    _isb_log 'RCH delivery requires a usable local Rust host probe; prepare it before retrying (isolated bootstrap would replace the RCH Cargo shim)'
+                    return 3
+                fi
+                return 6
+            }
             host=$(sed -n 's/^host: //p' "$output/compiler.log")
             [[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 6
             export CARGO_BUILD_TARGET="$host" CARGO_TARGET_DIR="$output/target" CARGO_INCREMENTAL=0
             local artifact_path cargo_name windows_paths=false
             case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) windows_paths=true ;; esac
-            local -a args=(build --locked --release --message-format=json-render-diagnostics
+            local message_format=json-render-diagnostics
+            if $rch_delivery; then
+                $windows_paths && { _isb_log 'RCH Cargo delivery requires a POSIX installer host'; return 4; }
+                message_format=json,json-render-diagnostics
+            fi
+            local -a args=(build --locked --release "--message-format=$message_format"
                 --target "$host" --target-dir "$output/target")
             if [[ -n "$package" ]]; then
                 args+=(--package "$package")
@@ -2487,6 +2823,11 @@ _isb_compile() (
                 targets+=("$output/target/$host/release/$name")
             done
             _isb_run "$limit" "$output/build.log" cargo "${args[@]}" || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
+            if $rch_delivery; then
+                delivered_paths=$(_isb_rch_cargo_outputs "$tree" "$output" "$host" "$limit" "${binaries[@]}") || return $?
+                targets=()
+                while IFS= read -r target; do targets+=("$target"); done <<< "$delivered_paths"
+            else
             for target in "${targets[@]}"; do
                 name="${target##*/}"
                 cargo_name="$name"
@@ -2518,6 +2859,7 @@ _isb_compile() (
                     return 6
                 fi
             done
+            fi
             ;;
         go)
             resolved_entries=$(_isb_source_entries "$language" "$tree" "$binary" "$entry" "${binaries[@]}") || return $?
@@ -2732,7 +3074,7 @@ install_source_build() (
     [[ $index -eq ${#binary_names[@]} && -n "$primary_payload" ]] || return 6
     payload="$primary_payload"; sha="$primary_sha"; size="$primary_size"
     binaries_json=$(printf '%s\n' "${binary_receipts[@]}" | jq -sc '.') || return 1
-    local toolchain_receipt=null go_context_file=/dev/null bun_context_file=/dev/null
+    local toolchain_receipt=null go_context_file=/dev/null bun_context_file=/dev/null rch_context_file=/dev/null
     if [[ -f "$output/toolchain/receipt.json" ]]; then
         toolchain_receipt=$(jq -ce 'del(.root,.bin_dir)' "$output/toolchain/receipt.json") || return 7
     fi
@@ -2744,23 +3086,30 @@ install_source_build() (
         bun_context_file="$output/bun-context.json"
         [[ -f "$bun_context_file" && ! -L "$bun_context_file" ]] || return 7
     fi
+    if [[ "$language" == rust && "${RCH_CARGO_JSON_STDOUT:-}" == 1 ]]; then
+        rch_context_file="$output/rch-delivery.json"
+        [[ -f "$rch_context_file" && ! -L "$rch_context_file" ]] || return 7
+    fi
     receipt=$(jq -c --arg repo "$repo" --arg ref "$ref" --arg commit "$commit" \
         --arg language "$language" --arg path "$payload" --arg sha "$sha" --argjson size "$size" \
         --argjson binaries "$binaries_json" \
         --argjson toolchain "$toolchain_receipt" \
         --slurpfile go_context "$go_context_file" \
         --slurpfile bun_context "$bun_context_file" \
+        --slurpfile rch_context "$rch_context_file" \
         --arg compiler "$(cat "$output/compiler.log")" \
         '[.[] | select(.path != "")] as $submodules |
          {schema_version:1,method:"source",repository:$repo,requested_ref:$ref,source_commit:$commit,
-          language:$language,path:$path,sha256:$sha,size_bytes:$size,compiler:$compiler,
+          language:$language,path:$path,sha256:$sha,size_bytes:$size,
+          compiler:(if $rch_context[0] == null then $compiler else "RCH remote compilation (compiler identity not attested)" end),
           binaries:$binaries,signed_release:false} +
           (if $toolchain == null then {} else {toolchain:$toolchain} end) +
           (if $go_context[0].go_workspace == null then {} else {go_workspace:$go_context[0].go_workspace} end) +
           ($bun_context[0] // {}) +
+          (if $rch_context[0] == null then {} else {rch_delivery:($rch_context[0] + {local_rustc_probe:$compiler})} end) +
           (if ($submodules | length) == 0 then {} else {submodules:$submodules} end)' <<< "$_ISB_SOURCE_GRAPH") || return 1
     (set -C; printf '%s\n' "$receipt" > "$destination/receipt.json") || return 1
-    _isb_log "Built $binary; SHA256 $sha (locally built, not a signed release)"
+    _isb_log "Built $binary from source; SHA256 $sha (not a signed release)"
     printf '%s\n' "$receipt"
 )
 
