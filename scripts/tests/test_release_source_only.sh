@@ -31,8 +31,13 @@ names = ['_source_release_identity', '_source_release_metadata_matches',
          '_release_contract_scan_release_by_tag', '_release_contract_create_nonce',
          '_release_contract_observe_bound_draft',
          '_release_contract_confirm_or_restore_bound_draft', '_release_file_size']
+names += ['_release_contract_report_interruption', 'json_envelope']
 functions = work / 'functions.sh'
-functions.write_text('\n'.join(re.search(r'^' + re.escape(n) + r'\(\) \{\n.*?^\}', source, re.M | re.S).group(0) for n in names))
+extracted=[]
+for name in names:
+    ending=r'^EOF\n\}' if name=='json_envelope' else r'^\}'
+    extracted.append(re.search(r'^'+re.escape(name)+r'\(\) \{\n.*?'+ending,source,re.M|re.S).group(0))
+functions.write_text('\n'.join(extracted))
 print('Fixtures: ' + str(work), flush=True)
 checks = 0
 
@@ -44,7 +49,7 @@ def assert_ok(label, value):
     print('PASS ' + label, flush=True)
 
 api_source = r'''
-import json, os
+import atexit, fnmatch, hashlib, json, os
 from pathlib import Path
 import sys
 case=Path(os.environ['CASE']); args=sys.argv[1:]
@@ -57,6 +62,29 @@ control=json.loads((case/'control.json').read_text())
 with (case/'requests.jsonl').open('a') as f: f.write(json.dumps(args)+'\n')
 release_file=case/'remote.json'
 release=json.loads(release_file.read_text()) if release_file.exists() else None
+method='POST' if '--post' in args else (args[args.index('--method')+1] if '--method' in args else 'GET')
+patch=json.loads(args[args.index('--data')+1]) if '--data' in args else {}
+phase='restored' if control.get('restore_accepted') else ('public' if release and not release['draft'] else 'draft')
+stop=control.get('stop_request',{})
+if (stop and fnmatch.fnmatchcase(endpoint,stop['endpoint']) and method==stop.get('method','GET') and
+        (not stop.get('phase') or stop['phase']==phase) and
+        ('patch_draft' not in stop or patch.get('draft') is stop['patch_draft'])):
+    control['stop_seen']=control.get('stop_seen',0)+1
+    (case/'control.json').write_text(json.dumps(control))
+    if control['stop_seen']==stop.get('occurrence',1):
+        receipts={str(path):dict(sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                                inode=path.stat().st_ino,status=json.loads(path.read_text())['status'])
+                  for path in (case/'state'/'source-only').glob('*.json.*')}
+        (case/'stopped-request.json').write_text(json.dumps(dict(
+            request=args,count=len((case/'requests.jsonl').read_text().splitlines()),
+            status=stop['status'],receipts=receipts)))
+        if stop.get('output')=='complete':
+            def finish():
+                sys.stdout.flush();sys.stderr.flush();os._exit(stop['status'])
+            atexit.register(finish)
+        else:
+            if stop.get('output')=='partial':print('{"incomplete":')
+            sys.exit(stop['status'])
 if endpoint=='repos/owner/app/releases' and '--post' in args:
     data=json.loads(args[args.index('--post')+1]); data.update(id=9,assets=[],html_url='https://github.com/owner/app/releases/tag/v1.2.3')
     if control.get('wrong_create_body'): data['body']='peer-owned body'
@@ -98,6 +126,8 @@ elif endpoint=='repos/owner/app/releases/9' and '--method' in args:
     data=json.loads(args[args.index('--data')+1])
     if control.get('reject_publish') and data.get('draft') is False: sys.exit(87)
     release.update(data)
+    if data.get('draft') is True:
+        control['restore_accepted']=True;(case/'control.json').write_text(json.dumps(control))
     if control.get('body_changes_after_publish') and data.get('draft') is False: release['body']='another worker changed body'
     release_file.write_text(json.dumps(release))
     if control.get('kill_after_publish') and data.get('draft') is False:
@@ -147,7 +177,7 @@ def setup(label, controls=None):
     (case/'requests.jsonl').write_text('')
     return case, repo, config
 
-def invoke(case, flags=None, dry=False, binary=False):
+def invoke(case, flags=None, dry=False, binary=False, json_mode=False):
     env=dict(os.environ,CASE=str(case),DSR_CONFIG_DIR=str(case),DSR_STATE_DIR=str(case/'state'),
              ROOT=str(root),FUNCTIONS=str(functions),NO_COLOR='1')
     script=r'''
@@ -165,22 +195,134 @@ _dsr_require() { :; }
 gh_check() { return 0; }
 gh_check_token() { return 0; }
 gh_api() { python3 "$CASE/api.py" < <(printf '%s\0' "$@" ); }
-JSON_MODE=false
+JSON_MODE="$3"
+DSR_VERSION=fixture
 DRY_RUN="$1"
 command_name="$2"
-shift 2
+shift 3
 export DSR_SOURCE_TEST_CONTROLLER_PID="$BASHPID"
 "$command_name" "$@"
 '''
     args=['bash','-c',script,'source-release-test','true' if dry else 'false',
-          'cmd_release' if binary else 'cmd_release_source_only','app','1.2.3']
+          'cmd_release' if binary else 'cmd_release_source_only',str(json_mode).lower(),'app','1.2.3']
     if flags is None: flags=['--notes-file',str(case/'notes.md'),'--no-dispatch']
     proc=subprocess.run(args+flags,env=env,capture_output=True,text=True,timeout=60)
     (case/'stdout.log').write_text(proc.stdout); (case/'stderr.log').write_text(proc.stderr)
     requests=[json.loads(l) for l in (case/'requests.jsonl').read_text().splitlines()]
-    if proc.returncode not in (0,4,7):
+    if proc.returncode not in (0,4,5,7):
         print(proc.stderr,flush=True)
     return proc, requests
+
+
+def test_source_only_interruptions(smoke=False):
+    names=('tag','initial-scan','create-before','create-after','created-scan','inventory',
+           'pre-publish-tag','publish-before','publish-after','post-read','post-inventory',
+           'post-tag','restore-patch-before','restore-patch-after','restore-read',
+           'resume-read','resume-tag')
+    selected=os.environ.get('DSR_TEST_SOURCE_ONLY_INTERRUPTION_CASE','all')
+    status_selected=os.environ.get('DSR_TEST_RELEASE_INTERRUPTION_STATUS','all')
+    if (selected not in ('all',)+names or
+            (selected!='all' and os.environ.get('DSR_TEST_SOURCE_ONLY_INTERRUPTION_ONLY')!='1')):
+        raise AssertionError('Select a known source-only interruption case with its ONLY selector')
+    statuses=(2,5,124,125,129,130,137,143,255) if status_selected=='all' else (int(status_selected),)
+    if any(status not in (2,5,124,125,129,130,137,143,255) for status in statuses):
+        raise AssertionError('Select a supported source-only terminal adapter status')
+    chosen=('create-after','publish-after','post-inventory') if smoke else names
+    if not smoke:
+        # Ordinary ambiguous POST/PATCH responses still reconcile against real
+        # nonce-owned metadata and retain a successful private receipt.
+        for label,control in [('valid',{}),('lost-post',{'lost_post':True}),('lost-patch',{'lost_patch':True})]:
+            case,_,_=setup('interruption-control-'+label,control)
+            proc,requests=invoke(case,json_mode=True)
+            assert_ok('source interruption '+label+' control publishes and observes success',
+                      proc.returncode==0 and json.loads(proc.stdout)['status']=='success' and
+                      json.loads((case/'remote.json').read_text())['draft'] is False)
+    for status in (130,) if smoke else statuses:
+        for name in chosen:
+            if not smoke and selected not in ('all',name):continue
+            label='source-stop-'+name+'-'+str(status)
+            case,_,_=setup(label)
+            flags=['--notes-file',str(case/'notes.md'),'--no-dispatch']
+            original=None
+            if name.startswith('resume-'):
+                producer,_=invoke(case,flags+['--draft'],json_mode=True)
+                assert_ok(label+' starts with a real retained source draft',producer.returncode==0)
+                original=Path(json.loads(producer.stdout)['details']['receipt'])
+                flags+=['--resume-receipt',str(original),'--publish-draft']
+            rule=dict(status=status,output='partial')
+            controls={}
+            stage='verification'
+            if name in ('tag','pre-publish-tag','post-tag','resume-tag'):
+                rule['endpoint']='repos/owner/app/git/ref/tags/v1.2.3'
+                if name=='pre-publish-tag':rule['occurrence']=4
+                elif name=='post-tag':rule['phase']='public'
+                elif name=='resume-tag':rule['occurrence']=2
+            elif name in ('initial-scan','created-scan'):
+                rule.update(endpoint='repos/owner/app/releases?*',occurrence=2 if name=='created-scan' else 1)
+            elif name.startswith('create-'):
+                stage='create'
+                rule.update(endpoint='repos/owner/app/releases',method='POST',
+                            output='complete' if name=='create-after' else 'partial')
+            elif name in ('inventory','post-inventory'):
+                rule.update(endpoint='repos/owner/app/releases/9/assets?*',
+                            phase='public' if name=='post-inventory' else 'draft')
+            elif name.startswith('publish-'):
+                stage='publish'
+                rule.update(endpoint='repos/owner/app/releases/9',method='PATCH',patch_draft=False,
+                            output='complete' if name=='publish-after' else 'partial')
+            elif name in ('post-read','resume-read'):
+                rule.update(endpoint='repos/owner/app/releases/9',phase='public' if name=='post-read' else 'draft')
+            else:
+                stage='restore'
+                controls['move_tag_after_publish']=True
+                rule['endpoint']='repos/owner/app/releases/9'
+                if name=='restore-read':rule['phase']='restored'
+                else:
+                    rule.update(method='PATCH',patch_draft=True,
+                                output='complete' if name=='restore-patch-after' else 'partial')
+            controls['stop_request']=rule
+            (case/'control.json').write_text(json.dumps(controls));(case/'requests.jsonl').write_text('')
+            proc,requests=invoke(case,flags,json_mode=True)
+            assert_ok(label+' returns public interruption status',proc.returncode==5)
+            envelope=json.loads(proc.stdout)
+            assert_ok(label+' retains the original stop in one JSON error response',
+                      envelope['command']=='release source-only' and envelope['status']=='error' and
+                      envelope['exit_code']==5 and envelope['details']['interruption']==dict(
+                          stage=stage,exit_code=status,outcome='unconfirmed'))
+            marker=json.loads((case/'stopped-request.json').read_text())
+            assert_ok(label+' performs no API request after the stopped operation',
+                      len(requests)==marker['count'] and requests[-1]==marker['request'])
+            receipts=list((case/'state'/'source-only').glob('*.json.*'))
+            assert_ok(label+' preserves every held receipt inode and byte without success conversion',
+                      {str(path) for path in receipts}==set(marker['receipts']) and
+                      all(hashlib.sha256(Path(path).read_bytes()).hexdigest()==record['sha256'] and
+                          Path(path).stat().st_ino==record['inode'] and
+                          (record['status']=='pending' or Path(path)==original)
+                          for path,record in marker['receipts'].items()))
+            if name in ('create-after','publish-after','post-read','post-inventory','post-tag',
+                        'restore-patch-before','restore-patch-after','restore-read'):
+                expected_draft=name in ('create-after','restore-patch-after','restore-read')
+                assert_ok(label+' leaves the exact server visibility reached before stopping',
+                          json.loads((case/'remote.json').read_text())['draft'] is expected_draft)
+            if name.startswith(('publish-','post-','restore-')):
+                pending=[json.loads(path.read_text()) for path in receipts if path!=original]
+                assert_ok(label+' retains the exact release ID before publication or recovery',
+                          len(pending)==1 and pending[0]['status']=='pending' and
+                          pending[0]['release_id']==9 and pending[0]['tag']=='v1.2.3' and
+                          pending[0]['git_sha']==(case/'sha').read_text().strip() and
+                          pending[0]['publication_requested'] is True)
+            if any(record['status']=='pending' for record in marker['receipts'].values()):
+                assert_ok(label+' exposes its preserved recovery receipt path',
+                          any(path in proc.stderr for path,record in marker['receipts'].items()
+                              if record['status']=='pending'))
+
+
+if os.environ.get('DSR_TEST_SOURCE_ONLY_INTERRUPTION_ONLY')=='1':
+    test_source_only_interruptions()
+    print(json.dumps({'passed':True,'checks':checks,'fixtures':str(work)}),flush=True)
+    raise SystemExit(0)
+
+test_source_only_interruptions(smoke=True)
 
 for label,control in [('publish',{}),('lost-post',{'lost_post':True}),('lost-patch',{'lost_patch':True}),('annotated-remote',{'annotated_remote':True})]:
     case,repo,config=setup(label,control); proc,requests=invoke(case)
