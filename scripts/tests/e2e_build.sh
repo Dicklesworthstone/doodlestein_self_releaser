@@ -565,7 +565,7 @@ run_lane_build() (
         [[ "$1" == act-local ]] || return 4
         printf 'release %s %s\n' "$1" "$2" >> "$TEST_TMPDIR/reservations.log"
     }
-    export SCRIPT_DIR="$PROJECT_ROOT" JSON_MODE=true DRY_RUN=false VERBOSE=false DSR_VERSION=fixture
+    export SCRIPT_DIR="$PROJECT_ROOT" JSON_MODE=true DRY_RUN=false VERBOSE=false DSR_VERSION=0.0.0-fixture
     declare -A _DSR_LOADED_MODULES=([packaging]=1 [artifact_naming]=1 [host_selector]=1)
     # Run the actual command definitions, without changing their source.
     # shellcheck disable=SC1090
@@ -2104,6 +2104,176 @@ RECEIPT_FIXTURE
     done
 }
 
+test_build_orchestration_cancellation() {
+    if [[ "$HAS_YQ" != true ]] || ! command -v python3 &>/dev/null ||
+       ! python3 -c 'from jsonschema import Draft202012Validator, FormatChecker' >/dev/null 2>&1; then
+        ((TESTS_RUN++))
+        skip "yq and Python jsonschema required for orchestration cancellation tests"
+        return 0
+    fi
+    harness_setup
+    local installation="$TEST_TMPDIR/installation" repo_dir="$TEST_TMPDIR/repo"
+    local snapshot="$TEST_TMPDIR/snapshot.py" schema_dir="$PROJECT_ROOT/schemas"
+    local scenario code receipt serializer case_dir output_dir problems=()
+    seed_raw_lane_fixture "$repo_dir"
+    if ! mkdir -p "$installation" || ! cp "$DSR_CMD" "$installation/dsr" ||
+       ! cp -R "$PROJECT_ROOT/src" "$installation/src"; then
+        ((TESTS_RUN++))
+        fail "could not prepare orchestration cancellation installation"
+        harness_teardown
+        return 1
+    fi
+    cat > "$snapshot" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+observed = {}
+for path in sorted(root.rglob("*")):
+    info = path.lstat()
+    observed[str(path.relative_to(root))] = {
+        "device": info.st_dev, "inode": info.st_ino, "mode": info.st_mode,
+        "size": info.st_size, "mtime_ns": info.st_mtime_ns,
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None,
+    }
+print(json.dumps(observed, sort_keys=True))
+PY
+    cat >> "$installation/src/act_runner.sh" <<'CANCELLATION_FIXTURE'
+
+# The actual command runs through ordinary source admission and locking. Only
+# the coordinator boundary is controlled: a worker has retained real output
+# when the coordinator exits, with or without a usable receipt on stdout.
+eval "_cancel_original_$(declare -f _act_additional_artifact_receipts_json)"
+eval "_cancel_original_$(declare -f act_generate_manifest)"
+_act_additional_artifact_receipts_json() {
+    printf 'collection\n' >> "$LANE_CANCEL_CASE_ROOT/downstream.calls"
+    _cancel_original__act_additional_artifact_receipts_json "$@"
+}
+act_generate_manifest() {
+    printf 'manifest\n' >> "$LANE_CANCEL_CASE_ROOT/downstream.calls"
+    _cancel_original_act_generate_manifest "$@"
+}
+act_orchestrate_build() {
+    local worker="$LANE_CANCEL_OUTPUT/targets/linux-amd64" run_id
+    mkdir -p "$worker" || return 4
+    printf '#!/bin/sh\necho retained-worker-output\n' > "$worker/lane-tool" || return 4
+    chmod 751 "$worker/lane-tool" || return 4
+    run_id=$(command jq -r '.run_id' "$LANE_CANCEL_OUTPUT/.dsr-build-purpose.json") || return 4
+    command jq -nc --arg run "$run_id" --arg path "$worker/lane-tool" '
+        {run_id:$run,status:"success",summary:{total:1,success:1,failed:0},
+         targets:[{platform:"linux/amd64",host:"act-local",method:"act",status:"success",
+                   artifact_path:$path,artifact_paths:[$path]}]}' > "$worker/result.json" || return 4
+    python3 "$LANE_CANCEL_SNAPSHOT" "$LANE_CANCEL_OUTPUT" > "$LANE_CANCEL_CASE_ROOT/before.json" || return 4
+    case "$LANE_CANCEL_RECEIPT" in
+        empty) ;;
+        malformed) printf '{"summary":\n' ;;
+        success) command cat "$worker/result.json" ;;
+        *) return 4 ;;
+    esac
+    printf 'returned %s\n' "$LANE_CANCEL_STATUS" > "$LANE_CANCEL_CASE_ROOT/coordinator.returned"
+    return "$LANE_CANCEL_STATUS"
+}
+jq() {
+    if [[ "$LANE_CANCEL_SERIALIZER" == details && -f "$LANE_CANCEL_CASE_ROOT/coordinator.returned" ]]; then
+        local argument
+        for argument in "$@"; do
+            if [[ "$argument" == *orchestrator_exit_code* ]]; then
+                printf 'details\n' >> "$LANE_CANCEL_CASE_ROOT/serialization.failed"
+                return 73
+            fi
+        done
+    fi
+    command jq "$@"
+}
+cat() {
+    if [[ $# == 0 && "$LANE_CANCEL_SERIALIZER" == envelope &&
+          -f "$LANE_CANCEL_CASE_ROOT/coordinator.returned" ]]; then
+        printf 'envelope\n' >> "$LANE_CANCEL_CASE_ROOT/serialization.failed"
+        return 74
+    fi
+    command cat "$@"
+}
+CANCELLATION_FIXTURE
+    cat >> "$installation/src/packaging.sh" <<'CANCELLATION_PACKAGING'
+
+eval "_cancel_original_$(declare -f packaging_repack_archive)"
+packaging_repack_archive() {
+    printf 'packaging\n' >> "$LANE_CANCEL_CASE_ROOT/downstream.calls"
+    _cancel_original_packaging_repack_archive "$@"
+}
+CANCELLATION_PACKAGING
+    for scenario in 130:empty:none 143:empty:none 130:malformed:none 143:malformed:none \
+        130:success:none 143:success:none 130:success:details 143:success:details \
+        130:success:envelope 143:success:envelope 7:success:none; do
+        ((TESTS_RUN++))
+        IFS=: read -r code receipt serializer <<< "$scenario"
+        case_dir="$TEST_TMPDIR/${scenario//:/-}"
+        output_dir="$case_dir/output"
+        problems=()
+        mkdir -p "$case_dir"
+        LANE_CANCEL_STATUS="$code" LANE_CANCEL_RECEIPT="$receipt" LANE_CANCEL_SERIALIZER="$serializer" \
+            LANE_CANCEL_OUTPUT="$output_dir" LANE_CANCEL_CASE_ROOT="$case_dir" LANE_CANCEL_SNAPSHOT="$snapshot" \
+            PROJECT_ROOT="$installation" DSR_CMD="$installation/dsr" \
+            exec_run run_lane_build lane-tool --version 1.2.3 --output-dir "$output_dir"
+        [[ "$(exec_status)" == "$code" ]] || problems+=("exit $(exec_status), expected $code")
+        [[ -s "$case_dir/coordinator.returned" ]] || problems+=("coordinator boundary was not reached")
+        if [[ "$code" == 7 ]]; then
+            # Ordinary partial failure still collects completed worker output.
+            # This control proves the success-shaped receipt reaches collection
+            # when there is no cancellation, using the same fixture and command.
+            [[ -s "$case_dir/downstream.calls" && -f "$output_dir/lane-tool" ]] ||
+                problems+=("ordinary failure no longer collects completed workers")
+        else
+            [[ ! -s "$case_dir/downstream.calls" ]] || problems+=("downstream collection, packaging or manifest ran")
+            if ! python3 "$snapshot" "$output_dir" > "$case_dir/after.json" ||
+               ! cmp -s "$case_dir/before.json" "$case_dir/after.json"; then
+                problems+=("retained output bytes, identity, permissions or inventory changed after cancellation")
+            fi
+        fi
+        [[ ! -e "$output_dir/lane-tool-v1.2.3-manifest.json" ]] || problems+=("manifest was published")
+        jq -e '.publishable == false and .publication_status == "pending"' \
+            "$output_dir/.dsr-build-purpose.json" >/dev/null 2>&1 || problems+=("pending publication marker changed")
+        if [[ "$serializer" != none ]]; then
+            [[ -s "$case_dir/serialization.failed" && ! -s "$_EXEC_STDOUT_FILE" ]] ||
+                problems+=("requested serialization failure was not exercised cleanly")
+        else
+            exec_stdout | jq -es --argjson code "$code" '
+                length == 1 and (.[0] | .command == "build" and .status == "error" and .exit_code == $code and
+                (if $code == 7 then .details.targets[0].status == "success" else
+                    .details.repo == "testuser/lane-tool" and .details.version == "v1.2.3" and
+                    .details.targets == [] and .details.stage == "orchestration" and
+                    .details.orchestrator_exit_code == $code and (.details.error | length > 0) end))
+            ' >/dev/null 2>&1 || problems+=("missing or contradictory build envelope")
+            if ! python3 - "$schema_dir" "$_EXEC_STDOUT_FILE" <<'PY'
+import json
+from pathlib import Path
+import sys
+from jsonschema import Draft202012Validator, FormatChecker
+
+schemas = Path(sys.argv[1])
+with open(sys.argv[2]) as stream:
+    result = json.load(stream)
+for name, value in (("envelope.json", result), ("build-details.json", result["details"])):
+    with (schemas / name).open() as stream:
+        schema = json.load(stream)
+    Draft202012Validator(schema, format_checker=FormatChecker()).validate(value)
+PY
+            then
+                problems+=("response violates the public JSON schemas")
+            fi
+        fi
+        if [[ ${#problems[@]} == 0 ]]; then
+            pass "build orchestration boundary $scenario"
+        else
+            fail "build orchestration boundary $scenario: ${problems[*]}"
+            echo "stderr: $(exec_stderr | tail -15)"
+        fi
+    done
+    harness_teardown
+}
+
 if [[ "${1:-}" == --variant-inventory-only ]]; then
     test_build_packages_each_target_triple_variant
     test_build_refuses_unproduced_target_triple_variant
@@ -2119,6 +2289,13 @@ if [[ "${1:-}" == --command-receipt-only ]]; then
     test_build_command_receipt_streams
     printf '\nCommand receipts: %s passed, %s failed, %s skipped\n' "$TESTS_PASSED" "$TESTS_FAILED" "$TESTS_SKIPPED"
     [[ "$TESTS_FAILED" == 0 ]]
+    exit $?
+fi
+
+if [[ "${1:-}" == --orchestration-cancellation-only ]]; then
+    test_build_orchestration_cancellation
+    printf '\nOrchestration cancellation: %s passed, %s failed, %s skipped\n' "$TESTS_PASSED" "$TESTS_FAILED" "$TESTS_SKIPPED"
+    [[ "$TESTS_FAILED" == 0 && "$TESTS_SKIPPED" == 0 ]]
     exit $?
 fi
 
@@ -2192,6 +2369,7 @@ test_build_refuses_secondary_variant_include_conflict
 echo ""
 echo "Durable Publication and Raw Archive Packaging:"
 test_build_command_receipt_streams
+test_build_orchestration_cancellation
 test_build_failed_compiler_is_not_publishable
 test_build_inflight_is_not_publishable
 test_build_raw_archives_preserve_nested_payloads

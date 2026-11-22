@@ -24,7 +24,11 @@
 #   - coordinator matrix/Zig planning accepts large generated observers while
 #     preserving target refusal, worker environment isolation and caller stdin.
 #
-# Usage: ./scripts/tests/test_ssh_exec_large_program.sh [--cargo-selection-only|--coordinator-planning-only]
+# --metadata-interruption-only exercises real signalled SSH processes and
+# descendant cleanup through strict metadata/source-closure admission.
+# --metadata-admission-only exercises real target/task loops around a failed
+# metadata service, including diagnostic serialization failure.
+# Usage: ./scripts/tests/test_ssh_exec_large_program.sh [--cargo-selection-only|--coordinator-planning-only|--metadata-interruption-only|--metadata-admission-only]
 #
 # Exit codes:
 #   0 - All tests passed
@@ -40,8 +44,12 @@ if [[ "${1:-}" == --cargo-selection-only && $# == 1 ]]; then
     MODE=cargo-selection
 elif [[ "${1:-}" == --coordinator-planning-only && $# == 1 ]]; then
     MODE=coordinator-planning
+elif [[ "${1:-}" == --metadata-interruption-only && $# == 1 ]]; then
+    MODE=metadata-interruption
+elif [[ "${1:-}" == --metadata-admission-only && $# == 1 ]]; then
+    MODE=metadata-admission
 elif (( $# != 0 )); then
-    printf 'Usage: %s [--cargo-selection-only|--coordinator-planning-only]\n' "$0" >&2
+    printf 'Usage: %s [--cargo-selection-only|--coordinator-planning-only|--metadata-interruption-only|--metadata-admission-only]\n' "$0" >&2
     exit 4
 fi
 
@@ -318,6 +326,276 @@ test_linux_argv_negative_control() {
     errors=$(bash -lc "$program" 2>&1 >/dev/null) || rc=$?
     check "Linux refuses the same program in argv (exit 126)" test "$rc" -eq 126
     check "Linux reports Argument list too long" grep -qi 'argument list too long' <<< "$errors"
+}
+
+test_metadata_interruption() {
+    python3 -I - "$ACT_RUNNER_MODULE" "$WORK" <<'PY'
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+module = Path(sys.argv[1]).resolve()
+work = Path(sys.argv[2]) / 'metadata-interruption'
+work.mkdir(mode=0o700)
+bin_dir = work / 'bin'
+bin_dir.mkdir()
+checks, failures = 0, []
+
+
+def check(label, valid):
+    global checks
+    checks += 1
+    print(('PASS ' if valid else 'FAIL ') + label, flush=True)
+    if not valid:
+        failures.append(label)
+
+
+# Only the remote Cargo operation is a service boundary. The generated
+# production program, external SSH argv/stdin, owned supervisor, metadata
+# decoder and source-closure status propagation are real. No compiler or
+# authenticated dependency-source success is claimed by this transport test.
+ssh = bin_dir / 'ssh'
+ssh.write_text(r'''#!/usr/bin/env python3
+import json, os, signal, subprocess, sys, time
+from pathlib import Path
+case = Path(os.environ['DSR_METADATA_CASE'])
+args = sys.argv[1:]
+with (case / 'launches.jsonl').open('a') as stream:
+    stream.write(json.dumps({'argv': args, 'pid': os.getpid()}) + '\n')
+program = sys.stdin.buffer.read()
+(case / 'program.sh').write_bytes(program)
+if len(program) <= 131072 or args[-1] != 'exec "$SHELL" -s':
+    raise SystemExit(97)
+mode = os.environ['DSR_METADATA_MODE']
+if mode in ('130', '143'):
+    # Retire an actual receiver with SIGINT/SIGTERM while its ordinary child
+    # ignores TERM. The production supervisor must drain that child before
+    # returning the receiver's native cancellation status.
+    ready = case / 'descendant.ready'
+    child = subprocess.Popen([sys.executable, '-c',
+        'import os,signal,sys,time; '
+        'signal.signal(signal.SIGTERM,signal.SIG_IGN); '
+        'open(sys.argv[1],"w").write(str(os.getpid())); time.sleep(60)', str(ready)])
+    deadline = time.monotonic() + 5
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if not ready.exists():
+        raise SystemExit(97)
+    # A complete-looking response must never override an unsuccessful exit.
+    source = os.environ['DSR_METADATA_SOURCE']
+    print(source, flush=True)
+    print(json.dumps({'workspace_root': source, 'packages': [
+        {'manifest_path': source + '/Cargo.toml', 'source': None}]}), flush=True)
+    stopped = signal.SIGINT if mode == '130' else signal.SIGTERM
+    signal.signal(stopped, signal.SIG_DFL)
+    os.kill(os.getpid(), stopped)
+elif mode == 'malformed':
+    print('partial metadata')
+elif mode == 'success':
+    source = os.environ['DSR_METADATA_SOURCE']
+    print(source)
+    print(json.dumps({'workspace_root': source, 'packages': [
+        {'manifest_path': source + '/Cargo.toml', 'source': None}]}))
+else:
+    raise SystemExit(int(mode))
+''')
+ssh.chmod(0o700)
+driver = work / 'driver.sh'
+driver.write_text(r'''#!/usr/bin/env bash
+set -uo pipefail
+source "$1" || exit $?
+_act_is_local_host() { return 1; }
+_act_is_windows_host() { return 1; }
+_act_get_ssh_destination() { printf '%s\n' fixture-metadata; }
+case "$2" in
+    metadata) _act_strict_cargo_metadata_json fixture "$DSR_METADATA_SOURCE" ;;
+    closure) _act_validate_strict_cargo_source_closure fixture "$DSR_METADATA_SOURCE" '[]' ;;
+    *) exit 97 ;;
+esac
+''')
+
+
+def running(pid):
+    observed = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True)
+    return observed.returncode == 0 and bool(observed.stdout.strip()) and not observed.stdout.lstrip().startswith('Z')
+
+
+for action in ('metadata', 'closure'):
+    for mode in ('130', '143', '255', '124', '4', 'malformed', 'success'):
+        case = work / (action + '-' + mode)
+        case.mkdir()
+        source = case / 'source'
+        source.mkdir()
+        environment = dict(os.environ, DSR_METADATA_CASE=str(case), DSR_METADATA_MODE=mode,
+                           DSR_METADATA_SOURCE=str(source), DSR_SYNC_TIMEOUT='15', SHELL=shutil.which('bash'),
+                           PATH=str(bin_dir) + os.pathsep + os.environ['PATH'])
+        result = subprocess.run(['bash', str(driver), str(module), action], env=environment,
+                                capture_output=True, timeout=25, input=b'caller input must stay isolated\n')
+        (case / 'stdout').write_bytes(result.stdout)
+        (case / 'stderr').write_bytes(result.stderr)
+        expected = int(mode) if mode in ('130', '143') else 0 if mode == 'success' else 4
+        label = action + '/' + mode
+        check(label + ': retains cancellation and existing ordinary refusal classification (actual %d, expected %d)' %
+              (result.returncode, expected), result.returncode == expected)
+        launches = [json.loads(row) for row in (case / 'launches.jsonl').read_text().splitlines()]
+        check(label + ': exactly one bounded SSH argv carries the oversized production program on stdin',
+              len(launches) == 1 and max(len(os.fsencode(arg)) for arg in launches[0]['argv']) < 65536
+              and (case / 'program.sh').stat().st_size > 131072)
+        if mode != 'success':
+            check(label + ': failed receiver emits no accepted metadata or source receipt', result.stdout == b'')
+        elif action == 'metadata':
+            receipt = json.loads(result.stdout)
+            check(label + ': valid service response retains the exact source binding',
+                  receipt['source_root'] == str(source) and receipt['metadata']['workspace_root'] == str(source))
+        if mode in ('130', '143'):
+            pid = int((case / 'descendant.ready').read_text())
+            check(label + ': owned TERM-resistant descendant is drained before return', not running(pid))
+
+print('Metadata interruption: %d/%d passed' % (checks - len(failures), checks), flush=True)
+raise SystemExit(bool(failures))
+PY
+}
+
+test_metadata_admission() {
+    command -v yq >/dev/null || { log_fail "Missing metadata admission test dependency: yq"; return 3; }
+    python3 -I - "$ACT_RUNNER_MODULE" "$WORK" <<'PY'
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+module = Path(sys.argv[1]).resolve()
+work = Path(sys.argv[2]) / 'metadata-admission'
+work.mkdir(mode=0o700)
+checks, failures = 0, []
+
+
+def check(label, valid):
+    global checks
+    checks += 1
+    print(('PASS ' if valid else 'FAIL ') + label, flush=True)
+    if not valid:
+        failures.append(label)
+
+
+# These helpers consume a source route already admitted by the coordinator.
+# Keep canonical path construction, real recipe/target selection, task loops,
+# metadata program generation and status policy in the test. Only the remote
+# metadata service is substituted; this does not qualify snapshot creation or
+# native compilation. The separate interruption test exercises actual signals.
+driver = work / 'driver.sh'
+driver.write_text(r'''#!/usr/bin/env bash
+set -uo pipefail
+source "$1" || exit $?
+act_load_repo_config metafixture || exit $?
+run_id=01234567-89ab-4cde-8fab-0123456789ab
+first_root=$(_act_strict_source_root_path "$ACT_REPO_LOCAL_PATH" metafixture "$run_id" first) || exit $?
+later_root=$(_act_strict_source_root_path "$ACT_REPO_LOCAL_PATH" metafixture "$run_id" later) || exit $?
+roots=$(jq -nc --arg first "$first_root" --arg later "$later_root" '{first:$first,later:$later}') || exit $?
+printf '%s\n' "$roots" > "$DSR_METADATA_CASE/roots.json" || exit $?
+real_jq=$(command -v jq) || exit $?
+if [[ "$DSR_METADATA_SERIALIZER_FAIL" == 1 ]]; then
+    jq() {
+        local argument
+        for argument in "$@"; do
+            if [[ "$argument" == *'error: $error'* ]]; then
+                printf '%s\n' diagnostic > "$DSR_METADATA_CASE/serializer.called" || return 97
+                return 73
+            fi
+        done
+        "$real_jq" "$@"
+    }
+fi
+_act_ssh_exec() {
+    local call_index source_root
+    printf '%s\n' "$1" >> "$DSR_METADATA_CASE/calls" || return 97
+    call_index=$(wc -l < "$DSR_METADATA_CASE/calls") || return 97
+    printf '%s' "$2" > "$DSR_METADATA_CASE/programs/$call_index.sh" || return 97
+    if [[ "$DSR_METADATA_MODE" != success ]]; then
+        return "$DSR_METADATA_MODE"
+    fi
+    source_root=$("$real_jq" -r --arg host "$1" '.[$host]' "$DSR_METADATA_CASE/roots.json") || return 97
+    printf '%s\n' "$source_root"
+    "$real_jq" -nc --arg root "$source_root" '{workspace_root:$root,
+      packages:[{manifest_path:($root+"/Cargo.toml"),source:null}]}'
+}
+case "$DSR_METADATA_ACTION" in
+    target)
+        _act_validate_strict_target_cargo_source_closure metafixture linux/amd64 1.0.0 first "$first_root" '[]'
+        ;;
+    tasks)
+        hosts='{"linux/amd64@x86_64-unknown-linux-gnu":"first","linux/amd64@x86_64-unknown-linux-musl":"first","linux/arm64":"later"}'
+        tasks='[{"key":"linux/amd64@x86_64-unknown-linux-gnu","platform":"linux/amd64","target_triple":"x86_64-unknown-linux-gnu"},{"key":"linux/amd64@x86_64-unknown-linux-musl","platform":"linux/amd64","target_triple":"x86_64-unknown-linux-musl"},{"key":"linux/arm64","platform":"linux/arm64","target_triple":"aarch64-unknown-linux-gnu"}]'
+        _act_validate_strict_task_sources metafixture 1.0.0 "$run_id" "$roots" "$hosts" "$tasks" '[]'
+        ;;
+    *) exit 97 ;;
+esac
+''')
+
+cases = [(action, mode, False) for action in ('target', 'tasks')
+         for mode in ('130', '143', '255', '124', '4', 'success')]
+cases += [('tasks', mode, True) for mode in ('130', '143')]
+for action, mode, serializer_fail in cases:
+    label = action + '/' + mode + ('/serializer-failure' if serializer_fail else '')
+    case = work / label.replace('/', '-')
+    config = case / 'config'
+    (config / 'repos.d').mkdir(parents=True)
+    (case / 'programs').mkdir()
+    (case / 'checkout').mkdir()
+    recipe = dict(tool_name='metafixture', repo='fixture/metafixture', language='rust',
+                  local_path=str(case / 'checkout'), binary_name='metafixture',
+                  build_cmd='cargo build --release --locked --offline',
+                  targets=['linux/amd64', 'linux/arm64'],
+                  target_triples={'linux/amd64': ['x86_64-unknown-linux-gnu', 'x86_64-unknown-linux-musl'],
+                                  'linux/arm64': 'aarch64-unknown-linux-gnu'},
+                  env={'CARGO_BUILD_JOBS': '2'})
+    (config / 'repos.d/metafixture.yaml').write_text(json.dumps(recipe) + '\n')
+    (config / 'hosts.yaml').write_text(json.dumps(dict(hosts={
+        host: dict(platform='linux/amd64', connection='ssh', hostname='fixture.invalid',
+                   build_root=str(case / host)) for host in ('first', 'later')})) + '\n')
+    environment = dict(os.environ, DSR_CONFIG_DIR=str(config), ACT_CONFIG_DIR=str(config), ACT_REPOS_DIR=str(config / 'repos.d'),
+                       DSR_HOSTS_FILE=str(config / 'hosts.yaml'), DSR_METADATA_CASE=str(case),
+                       DSR_METADATA_ACTION=action, DSR_METADATA_MODE=mode,
+                       DSR_METADATA_SERIALIZER_FAIL='1' if serializer_fail else '0')
+    environment.pop('DSR_STRICT_BUILD_ROOT', None)
+    result = subprocess.run(['bash', str(driver), str(module)], env=environment,
+                            stdin=subprocess.DEVNULL, capture_output=True, timeout=20)
+    (case / 'stdout').write_bytes(result.stdout)
+    (case / 'stderr').write_bytes(result.stderr)
+    expected = int(mode) if mode in ('130', '143') else 0 if mode == 'success' else 4
+    check(label + ': original cancellation or ordinary refusal reaches the caller (actual %d, expected %d)' %
+          (result.returncode, expected), result.returncode == expected)
+    calls = (case / 'calls').read_text().splitlines() if (case / 'calls').exists() else []
+    expected_calls = ['first', 'first'] + (['later'] if action == 'tasks' else []) if mode == 'success' else ['first']
+    check(label + ': failure stops before the next compiler variant or host; success admits the complete route',
+          calls == expected_calls)
+    programs = list((case / 'programs').glob('*.sh'))
+    check(label + ': each observed service call receives the actual oversized metadata program',
+          len(programs) == len(expected_calls) and all(path.stat().st_size > 131072 for path in programs))
+    if serializer_fail:
+        check(label + ': failed diagnostic serialization cannot replace cancellation or emit a partial receipt',
+              (case / 'serializer.called').is_file() and result.stdout == b'')
+    elif action == 'tasks' and mode != 'success':
+        try:
+            receipt = json.loads(result.stdout)
+        except (ValueError, UnicodeDecodeError):
+            receipt = {}
+        check(label + ': admission diagnostic remains non-successful and binds its original status',
+              receipt.get('status') == 'error' and receipt.get('targets') == []
+              and receipt.get('exit_code', result.returncode) == expected
+              and (mode not in ('130', '143') or 'interrupted' in receipt.get('error', '')))
+    else:
+        check(label + ': no task or source receipt escapes a component-only admission call', result.stdout == b'')
+
+print('Metadata target/task admission: %d/%d passed' % (checks - len(failures), checks), flush=True)
+raise SystemExit(bool(failures))
+PY
 }
 
 test_large_cargo_selection_receipts() {
@@ -667,6 +945,20 @@ raise SystemExit(bool(failures))
 PY
 }
 
+if [[ "$MODE" == metadata-admission ]]; then
+    check "Strict target/task loops preserve metadata cancellation and diagnostic failure precedence" test_metadata_admission
+    log_info "Results: $PASS_COUNT/$TEST_COUNT passed, $FAIL_COUNT failed"
+    [[ "$FAIL_COUNT" -eq 0 ]]
+    exit $?
+fi
+
+if [[ "$MODE" == metadata-interruption ]]; then
+    check "Strict metadata retains real transport cancellation and drains owned descendants" test_metadata_interruption
+    log_info "Results: $PASS_COUNT/$TEST_COUNT passed, $FAIL_COUNT failed"
+    [[ "$FAIL_COUNT" -eq 0 ]]
+    exit $?
+fi
+
 if [[ "$MODE" == coordinator-planning ]]; then
     test_large_coordinator_planning
     log_info "Results: $PASS_COUNT/$TEST_COUNT passed, $FAIL_COUNT failed"
@@ -692,6 +984,8 @@ test_large_program_with_syntax_error_runs_nothing
 test_large_program_timeout_status
 test_actual_metadata_program_reaches_first_command
 test_linux_argv_negative_control
+check "Strict metadata retains real transport cancellation and drains owned descendants" test_metadata_interruption
+check "Strict target/task loops preserve metadata cancellation and diagnostic failure precedence" test_metadata_admission
 check "Actual large Cargo selection receipts survive every caller boundary" test_large_cargo_selection_receipts
 
 log_info "Results: $PASS_COUNT/$TEST_COUNT passed, $FAIL_COUNT failed"

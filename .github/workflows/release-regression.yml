@@ -49,6 +49,7 @@ on:
       - 'scripts/tests/test_xwin*.sh'
       - schemas/manifest.json
       - schemas/envelope.json
+      - schemas/build-details.json
       - scripts/tests/test_json_schemas.sh
       - scripts/tests/test_cargo_cache.sh
       - scripts/tests/test_cargo_sources.sh
@@ -58,6 +59,7 @@ on:
       - scripts/tests/test_host_config_admission.sh
       - scripts/tests/test_release_resume.sh
       - scripts/tests/e2e_build.sh
+      - scripts/tests/test_ssh_exec_large_program.sh
       - scripts/tests/test_release_verify.sh
       - scripts/tests/test_release_builds.sh
       - scripts/tests/test_release_builds_resume.sh
@@ -367,10 +369,19 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends bats jq python3 cargo rustc rsync shellcheck curl util-linux golang-go zip unzip xz-utils
+          sudo apt-get install -y --no-install-recommends bats jq python3 python3-jsonschema cargo rustc rsync shellcheck curl util-linux golang-go zip unzip xz-utils
           mkdir -p "$RUNNER_TEMP/dsr-test-bin"
           GOBIN="$RUNNER_TEMP/dsr-test-bin" go install github.com/mikefarah/yq/v4@v4.47.1
           echo "$RUNNER_TEMP/dsr-test-bin" >> "$GITHUB_PATH"
+      - name: Preserve cancellation through Cargo admission and the build command
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/tests/test_ssh_exec_large_program.sh
+          bash -n scripts/tests/e2e_build.sh
+          timeout 120 bash scripts/tests/test_ssh_exec_large_program.sh --metadata-interruption-only
+          timeout 120 bash scripts/tests/test_ssh_exec_large_program.sh --metadata-admission-only
+          timeout 120 bash scripts/tests/e2e_build.sh --orchestration-cancellation-only
       - name: Verify complete ordinary variant inventories and primary alias ownership
         shell: bash
         run: |

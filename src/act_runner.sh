@@ -8708,8 +8708,14 @@ _act_strict_cargo_metadata_json() {
         metadata_command+=$'\n'"$metadata_body"$'\n''printf '\''%s\n'\'' "$physical_source_root"; test -f "$strict_home/.dsr-cargo-metadata.json"; test ! -L "$strict_home/.dsr-cargo-metadata.json"; cat "$strict_home/.dsr-cargo-metadata.json"'
     fi
 
-    if ! metadata_output=$(_act_ssh_exec "$host" "$metadata_command" "$_ACT_SYNC_TIMEOUT") || \
-       [[ "$metadata_output" != *$'\n'* ]]; then
+    if metadata_output=$(_act_source_sync_step _act_ssh_exec "$host" "$metadata_command" "$_ACT_SYNC_TIMEOUT"); then
+        :
+    else
+        local metadata_status=$?
+        _log_error "Locked offline Cargo metadata failed for strict source root on $host"
+        return "$metadata_status"
+    fi
+    if [[ "$metadata_output" != *$'\n'* ]]; then
         _log_error "Locked offline Cargo metadata failed for strict source root on $host"
         return 4
     fi
@@ -8766,8 +8772,8 @@ _act_validate_strict_target_cargo_source_closure() {
         target_slug="${platform//\//-}"
         [[ -z "$selected" ]] || target_slug+="-$selected"
         build_env+=$'\n'"CARGO_TARGET_DIR=${source_root%/*}/.cargo-target-$target_slug"
-        _act_validate_strict_cargo_source_closure \
-            "$host" "$source_root" "$dependencies" "$build_cmd" "$build_env" || return 4
+        _act_source_sync_step _act_validate_strict_cargo_source_closure \
+            "$host" "$source_root" "$dependencies" "$build_cmd" "$build_env" || return $?
     done <<< "$configured"
 }
 
@@ -17954,7 +17960,7 @@ _act_relocate_failed_target() {
         dependency_checkouts=$(_act_release_source_dependency_checkouts_json "$tool") || return 4
     fi
     _act_validate_strict_task_sources "$tool" "$version" "$run_id" "$roots" "$hosts" \
-        "$(jq -c '.context.build_tasks' <<< "$before")" "$dependency_checkouts" || return 4
+        "$(jq -c '.context.build_tasks' <<< "$before")" "$dependency_checkouts" || return $?
     source_inventory=$(_act_relocation_source_inventory "$tool" "$(jq -r '.git_sha' <<< "$before")") || return 4
     [[ "$(_act_sha256 "$config_file")" == "$repo_hash" &&
        "$(_act_sha256 "$hosts_file")" == "$hosts_hash" &&
@@ -18129,7 +18135,7 @@ _act_validate_strict_task_sources() {
     local tool="$1" version="$2" run_id="$3" roots="$4" hosts="$5" tasks="$6"
     local dependencies="$7" validate_cargo="${8:-true}"
     local expected_hosts actual_hosts source_host configured_path expected_root actual_root
-    local task platform triple key
+    local task platform triple key source_admission_status admission_error
     if ! _act_is_uuid "$run_id" ||
        ! expected_hosts=$(jq -cen --slurpfile hosts /dev/fd/3 --slurpfile tasks /dev/fd/4 '
          def one: if length == 1 then .[0] else error("exactly one route document required") end;
@@ -18172,12 +18178,19 @@ _act_validate_strict_task_sources() {
             if [[ "$key" != "$platform" ]]; then
                 triple=$(jq -er '.target_triple | strings | select(length > 0)' <<< "$task") || return 4
             fi
-            if ! _act_validate_strict_target_cargo_source_closure "$tool" "$platform" "$version" \
-                    "$source_host" "$actual_root" "$dependencies" "$triple"; then
+            source_admission_status=0
+            _act_validate_strict_target_cargo_source_closure "$tool" "$platform" "$version" \
+                "$source_host" "$actual_root" "$dependencies" "$triple" || source_admission_status=$?
+            if [[ "$source_admission_status" != 0 ]]; then
                 _log_error "Strict Cargo source closure validation failed for $key on $source_host"
-                jq -nc --arg tool "$tool" --arg error "Cargo source closure does not match pinned dependencies" \
-                    '{tool: $tool, status: "error", summary: {total: 0, success: 0, failed: 0}, error: $error, targets: []}'
-                return 4
+                admission_error="Cargo source closure does not match pinned dependencies"
+                if _act_source_sync_interrupted "$source_admission_status"; then
+                    admission_error="Cargo source admission interrupted; explicit retry is required"
+                fi
+                jq -nc --arg tool "$tool" --arg error "$admission_error" --argjson code "$source_admission_status" \
+                    '{tool: $tool, status: "error", exit_code: $code,
+                      summary: {total: 0, success: 0, failed: 0}, error: $error, targets: []}' || return "$source_admission_status"
+                return "$source_admission_status"
             fi
         done < <(jq -c --arg host "$source_host" --slurpfile hosts /dev/fd/3 \
             '.[] | select($hosts[0][.key] == $host)' 3<<< "$hosts" <<< "$tasks")
@@ -18537,6 +18550,7 @@ act_orchestrate_build() {
     # parent process; workers communicate through immutable result sidecars.
     local run_id requested_run_id="${supplied_run_id:-${DSR_RUN_ID:-}}"
     local lock_acquired_here=false caller_holds_lock=false state_available=false
+    local source_admission_status=0
     [[ "${DSR_BUILD_LOCK_HELD_BY_CALLER:-0}" == "1" ]] && caller_holds_lock=true
 
     _act_release_orchestration_lock() {
@@ -18811,11 +18825,12 @@ act_orchestrate_build() {
                 # The old failed host may be unreachable; this pass checks
                 # canonical custody without attempting worker preparation.
                 [[ -n "$resume_target_host" ]] && validate_resume_cargo=false
-                if ! _act_validate_strict_task_sources "$tool_name" "$version" "$run_id" \
-                        "$source_roots_json" "$effective_task_hosts_json" "$build_tasks_json" \
-                        "$source_dependency_checkouts_json" "$validate_resume_cargo"; then
+                _act_validate_strict_task_sources "$tool_name" "$version" "$run_id" \
+                    "$source_roots_json" "$effective_task_hosts_json" "$build_tasks_json" \
+                    "$source_dependency_checkouts_json" "$validate_resume_cargo" || source_admission_status=$?
+                if [[ "$source_admission_status" != 0 ]]; then
                     _act_release_orchestration_lock
-                    return 4
+                    return "$source_admission_status"
                 fi
             fi
             if [[ -n "$resume_target_host" ]]; then
@@ -18877,12 +18892,14 @@ act_orchestrate_build() {
                 _act_release_orchestration_lock
                 return 4
             fi
-            if $strict_release_contract &&
-               ! _act_validate_strict_task_sources "$tool_name" "$version" "$requested_run_id" \
+            if $strict_release_contract; then
+                _act_validate_strict_task_sources "$tool_name" "$version" "$requested_run_id" \
                     "$source_roots_json" "$effective_task_hosts_json" "$build_tasks_json" \
-                    "$source_dependency_checkouts_json"; then
-                _act_release_orchestration_lock
-                return 4
+                    "$source_dependency_checkouts_json" || source_admission_status=$?
+                if [[ "$source_admission_status" != 0 ]]; then
+                    _act_release_orchestration_lock
+                    return "$source_admission_status"
+                fi
             fi
             if ! run_id=$(DSR_RUN_ID="$requested_run_id" \
                 build_state_create "$tool_name" "$version" "${targets// /,}") || \
@@ -18905,11 +18922,11 @@ act_orchestrate_build() {
         return 4
     else
         run_id="$requested_run_id"
-        if $strict_release_contract &&
-           ! _act_validate_strict_task_sources "$tool_name" "$version" "$run_id" \
+        if $strict_release_contract; then
+            _act_validate_strict_task_sources "$tool_name" "$version" "$run_id" \
                 "$source_roots_json" "$effective_task_hosts_json" "$build_tasks_json" \
-                "$source_dependency_checkouts_json"; then
-            return 4
+                "$source_dependency_checkouts_json" || source_admission_status=$?
+            [[ "$source_admission_status" == 0 ]] || return "$source_admission_status"
         fi
     fi
 

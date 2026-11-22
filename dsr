@@ -4638,6 +4638,25 @@ EOF
         --parallel-jobs "$parallel_jobs" --output-dir "$output_dir" -- \
         $target_list) || orchestrator_exit=$?
 
+    # Cancellation is terminal even if the coordinator returned a complete
+    # receipt or lost its receipt while stopping. Preserve retained workers and
+    # checkpoints for an explicit retry; do not collect, repackage, or publish
+    # local manifests after the source admission or build was interrupted.
+    if [[ "$orchestrator_exit" == 130 || "$orchestrator_exit" == 143 ]]; then
+        [[ -z "$full_output" ]] || printf '%s\n' "$full_output" >&2
+        log_error "Build orchestration interrupted (exit $orchestrator_exit); explicit retry is required"
+        if $JSON_MODE; then
+            local orchestration_interruption_json
+            orchestration_interruption_json=$(jq -nc --arg repo "$ACT_REPO_GITHUB" --arg version "$tag" \
+                --argjson code "$orchestrator_exit" '
+                {repo:$repo,version:$version,targets:[],stage:"orchestration",
+                 error:"Build orchestration interrupted; explicit retry is required",
+                 orchestrator_exit_code:$code}') || return "$orchestrator_exit"
+            json_envelope "build" "error" "$orchestrator_exit" "$orchestration_interruption_json"
+        fi
+        return "$orchestrator_exit"
+    fi
+
     # The coordinator owns stdout; compiler/transport logs remain diagnostic.
     # Admit one complete result before collecting any files or interpreting
     # summary counts as shell arithmetic. A successful process alone cannot
