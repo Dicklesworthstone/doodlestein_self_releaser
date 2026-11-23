@@ -236,19 +236,38 @@ def source_language_families():
             wrapper.chmod(0o755)
     curl = tools / "curl"
     curl.write_text("""#!/usr/bin/env python3
-import os, pathlib, shutil, sys
-args = sys.argv[1:]
+import json, os, pathlib, sys
+args = iter(sys.argv[1:])
+url = destination = write_out = ''
+for arg in args:
+    if arg in ('-o', '--output'):
+        destination = next(args, '')
+    elif arg in ('-w', '--write-out'):
+        write_out = next(args, '')
+    elif arg == '--config':
+        if next(args, '') == '-':
+            for line in sys.stdin:
+                if line.startswith('url = '):
+                    url = json.loads(line[6:])
+    elif arg.startswith('https://'):
+        url = arg
 with open(os.environ['FAMILY_RELEASE_CALLS'], 'a') as out:
-    out.write(' '.join(args) + '\\n')
-if os.environ['FAMILY_RELEASE_MODE'] != 'bad-checksum' or '-o' not in args:
-    sys.exit(22)
-url = args[-1]
-output = pathlib.Path(args[args.index('-o') + 1])
-if url.endswith('.tar.gz.sha256'):
-    output.write_text('0' * 64 + '  ' + url.rsplit('/', 1)[1][:-7] + '\\n')
-elif url.endswith('.tar.gz'):
-    shutil.copyfile(os.environ['FAMILY_RELEASE_ARCHIVE'], output)
-else:
+    out.write(url + '\\n')
+if not destination or not url.startswith('https://github.com/example/nativefamily-go/releases/download/v1.2.5/'):
+    sys.exit(23)
+output = pathlib.Path(destination)
+code = 404
+output.write_bytes(b'')
+if os.environ['FAMILY_RELEASE_MODE'] == 'bad-checksum':
+    if url.endswith('.tar.gz.sha256'):
+        output.write_text('0' * 64 + '  ' + url.rsplit('/', 1)[1][:-7] + '\\n')
+        code = 200
+    elif url.endswith('.tar.gz'):
+        output.write_bytes(pathlib.Path(os.environ['FAMILY_RELEASE_ARCHIVE']).read_bytes())
+        code = 200
+if '%{http_code}' in write_out:
+    print(str(code) + '\\n', end='')
+elif code != 200:
     sys.exit(22)
 """)
     curl.chmod(0o755)
@@ -450,6 +469,9 @@ else:
             before = calls.read_bytes()
             install("go-corrupt-release-cannot-fall-back", script, destination, version="1.2.5",
                     extra=["--allow-source-build", "--yes", "--source-timeout", "90"], selected_env=bad_env, success=False)
+            check("bad release checksum reaches the integrity gate",
+                  b"Checksum mismatch" in
+                  (work / f"{sequence:03d}-go-corrupt-release-cannot-fall-back.log").read_bytes())
             check("bad release checksum cannot start a source family build", calls.read_bytes() == before)
             check("bad release checksum preserves the complete installation", snapshot(destination, inodes=True) == prior)
 
@@ -663,31 +685,44 @@ shutil.copy2(v1, remote / asset)
 shutil.copy2(Path(str(v1) + ".sha256"), remote / (asset + ".sha256"))
 transports = work / "transports"
 (transports / "curl").write_text("""#!/usr/bin/env python3
+import json
 import os
 from pathlib import Path
-import shutil
 import sys
 args = iter(sys.argv[1:])
-destination = url = ''
+destination = url = write_out = ''
 for arg in args:
     if arg in ('-o', '--output'):
         destination = next(args, '')
-    elif arg in ('--proto', '--proto-redir', '--connect-timeout', '--max-time', '--retry', '--max-redirs', '-w'):
+    elif arg in ('-w', '--write-out'):
+        write_out = next(args, '')
+    elif arg == '--config':
+        if next(args, '') == '-':
+            for line in sys.stdin:
+                if line.startswith('url = '):
+                    url = json.loads(line[6:])
+    elif arg in ('--proto', '--proto-redir', '--connect-timeout', '--max-time', '--retry', '--max-redirs'):
         next(args, '')
     elif arg.startswith('https:'):
         url = arg
 with open(os.environ['FAMILY_TRANSPORT_LOG'], 'a') as log:
     log.write(url + '\\n')
-prefix = 'https://github.com/example/nativefamily/releases/download/v1.2.3/'
+prefix = 'https://github.com/example/nativefamily/releases/download/'
 if not url.startswith(prefix) or not destination:
-    sys.exit(22)
-name = url[len(prefix):]
-if '/' in name or not name:
-    sys.exit(22)
+    sys.exit(23)
+tag, separator, name = url[len(prefix):].partition('/')
+if not separator or tag not in ('v1.2.3', 'v1.2.5') or '/' in name or not name:
+    sys.exit(23)
 source = Path(os.environ['FAMILY_REMOTE']) / name
-if not source.is_file():
+code = 200 if tag == 'v1.2.3' and source.is_file() else 404
+if code == 200:
+    Path(destination).write_bytes(source.read_bytes())
+else:
+    Path(destination).write_bytes(b'')
+if '%{http_code}' in write_out:
+    print(str(code) + '\\n', end='')
+elif code != 200:
     sys.exit(22)
-shutil.copyfile(source, destination)
 """)
 (transports / "gh").write_text("#!/usr/bin/env bash\nprintf 'gh unavailable\\n' >> \"$FAMILY_TRANSPORT_LOG\"\nexit 1\n")
 for name in ["curl", "gh"]:

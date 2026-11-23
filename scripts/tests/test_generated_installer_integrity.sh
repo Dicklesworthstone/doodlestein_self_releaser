@@ -1855,7 +1855,7 @@ if command -v setsid >/dev/null; then
         < "$installer" > "$case_dir/out" 2> "$case_dir/err" || status=$?
     check 'piped install without a terminal keeps the existing binary' \
         test "$status" -eq 1 -a "$(cat "$case_dir/bin/demo")" == previous
-    check 'piped install without a terminal points at --yes' grep -q -- 'Re-run with --yes' "$case_dir/err"
+    check 'piped install without a terminal points at --yes' grep -qi -- 'No terminal.*re-run with --yes' "$case_dir/err"
 fi
 
 # Archive configuration must survive generation, not just runtime-variable

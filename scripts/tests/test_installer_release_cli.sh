@@ -212,9 +212,13 @@ check("public recipe inspection retains normalized compiler and data selectors",
       len(described["recipe"]["files"]) == 3)
 output_state = inspect_tree(outputs, include_root=True)
 planned = invoke("generate-release", generate_args, prefix=["--dry-run"], label="global generator dry-run")
+expected_engines = {name: digest(root / "src" / name) for name in (
+    "release_install.sh", "slsa_remote.sh", "slsa.sh", "platforms.sh", "packaging.sh",
+    "sbom_release.sh", "sbom.sh", "github.sh", "guardrails.sh", "secrets.sh")}
 check("generator dry-run validates its complete bundle without output or lock changes",
       planned["status"] == "planned" and planned["dry_run"] is True and planned["authenticated"] is False and
-      len(planned["engines"]) == 8 and not planned["reused"] and inspect_tree(outputs, include_root=True) == output_state)
+      planned["engines"] == expected_engines and not planned["reused"] and
+      inspect_tree(outputs, include_root=True) == output_state)
 bad_policy = copy.deepcopy(policy)
 bad_policy["recipes"][0]["files"][0]["path"] = "bin/runtime.json"
 bad_policy_file = save(work / "bad-policy.json", bad_policy)
