@@ -232,11 +232,21 @@ pid = int(pathlib.Path(sys.argv[1]).read_text())
 status = pathlib.Path(f"/proc/{pid}/stat")
 assert not status.exists() or status.read_text().split()[2] == "Z"
 PY
+INTERRUPTED_RECEIPT="$CASE/builds/attempts/native/000001/driver-exit.json"
+assert 'supervisor retains the observed compiler signal before retry' jq -e \
+    '.kind=="dsr-release-driver-exit" and (.wait_status==-15 or .wait_status==143) and
+     .exit_code==143 and .manifest==null' "$INTERRUPTED_RECEIPT"
+INTERRUPTED_IDENTITY=$(file_identity "$INTERRUPTED_RECEIPT")
 printf 'success\n' > "$CASE/driver-mode"
 run_code 'interrupted native plan restarts safely and completes packaged finalization' 0 fixture_plan_flow
 assert 'retry retains the interrupted attempt and one successful replacement' jq -e \
-    '(.jobs.native.attempts|length)==2 and .jobs.native.attempts[0].status=="interrupted" and
-     .jobs.native.attempts[1].status=="completed"' "$CASE/builds/state.json"
+    --arg observed "$(_rf_hash "$INTERRUPTED_RECEIPT")" \
+    '(.jobs.native.attempts|length)==2 and
+     (.jobs.native.attempts[0] | .status=="failed" and .exit_code==143 and
+      .supervised==true and .driver_exit_sha256==$observed) and
+     (.jobs.native.attempts[1] | .status=="completed" and .exit_code==0)' "$CASE/builds/state.json"
+assert 'retry preserves the original observed cancellation bytes and inode' test \
+    "$INTERRUPTED_IDENTITY" = "$(file_identity "$INTERRUPTED_RECEIPT")"
 
 printf '\nPackaged build-plan finalization: %s passed, %s failed\n' "$((checks-failures))" "$failures"
 [[ "$failures" == 0 ]]

@@ -350,14 +350,24 @@ setup() {
     OUT="$CASE/artifacts"
 }
 checkpoint() {
-    local recipe_digest
+    local recipe_digest tasks='null'
     recipe_digest=$(_release_sha256 "$ACT_REPOS_DIR/tool.yaml") || return 1
+    if [[ "$1" == completed ]]; then
+        # A completed workflow is reusable only with its original task and
+        # event custody. Keep the real planner at this fixture boundary.
+        tasks=$(_act_build_task_plan tool 1.2.3 '["linux/amd64","darwin/arm64"]' false) || return 1
+    fi
     jq -nc --arg status "$1" --arg sha "$SOURCE_SHA" --arg run "$RUN" --arg out "$OUT" \
-        --arg recipe "$recipe_digest" '
+        --arg recipe "$recipe_digest" --argjson tasks "$tasks" '
         {tool:"tool",version:"1.2.3",run_id:$run,status:$status,git_sha:$sha,
          targets:["linux/amd64","darwin/arm64"],
          context:{output_dir:$out,build_purpose:"release",publishable:true,
-                  repo_config_sha256:$recipe}}' > "$CASE/checkpoint.json"
+                  repo_config_sha256:$recipe}} |
+        if $tasks == null then . else
+            .context.build_tasks=$tasks |
+            .target_statuses=($tasks | map({key:.key,value:{status:"completed",result:
+                {status:"success",method:.method,platform:.platform,workflow_event:.workflow_event}}}) | from_entries)
+        end' > "$CASE/checkpoint.json"
 }
 completed_fixture() {
     git -C "$CASE/source" init -q
@@ -951,7 +961,9 @@ gh_resolve_tag_sha() {
 }
 case "$PARTIAL_MODE" in
     first)
-        cmd_build tool --version 1.2.3 --no-sync --jobs "$PARTIAL_JOBS" --output-dir "$PARTIAL_CASE/output" ;;
+        # Retain the real selected-source receipt on the original attempt.
+        # A --no-sync run has no ordinary-source custody to authorize reuse.
+        cmd_build tool --version 1.2.3 --jobs "$PARTIAL_JOBS" --output-dir "$PARTIAL_CASE/output" ;;
     plan)
         build_state_init && build_state_resume tool 1.2.3 "$PARTIAL_RUN" ;;
     status)
@@ -1036,6 +1048,8 @@ def seed(name, jobs):
     check(name + ': actual persisted checkpoint is partial with exact target outcomes',
           state['status'] == 'partial' and state['context']['parallel_jobs'] == jobs and
           state['context'].get('repo_config_sha256') == digest(case / 'config/repos.d/tool.yaml') and
+          state['context']['source_sync'].get('staged_ordinary') is True and
+          isinstance(state['context']['source_sync'].get('source_inputs'), dict) and
           state['target_statuses']['linux/amd64']['status'] == 'completed' and
           state['target_statuses']['linux/arm64']['status'] == 'failed' and
           state['target_statuses']['linux/arm64']['result']['exit_code'] == 17)
@@ -1231,15 +1245,29 @@ test_completed_default_output() {
 }
 test_completed_task_plan() {
     setup "completed-plan-$1"; completed_fixture
-    local tasks
+    local tasks filter='.'
     tasks=$(_act_build_task_plan tool 1.2.3 '["linux/amd64","darwin/arm64"]' false) || return 1
     jq --argjson tasks "$tasks" '.context.build_tasks=$tasks' "$CASE/checkpoint.json" > "$CASE/planned-state.json"
     mv "$CASE/planned-state.json" "$CASE/checkpoint.json"
-    if [[ "$1" == drift ]]; then
-        jq '.context.build_tasks |= reverse' "$CASE/checkpoint.json" > "$CASE/drifted-state.json"
-        mv "$CASE/drifted-state.json" "$CASE/checkpoint.json"
-    fi
+    case "$1" in
+        matching) ;;
+        drift) filter='.context.build_tasks |= reverse' ;;
+        missing-plan) filter='del(.context.build_tasks)' ;;
+        plan-event) filter='.context.build_tasks[0].workflow_event.event="workflow_dispatch"' ;;
+        missing-event) filter='del(.target_statuses["linux/amd64"].result.workflow_event)' ;;
+        changed-event) filter='.target_statuses["linux/amd64"].result.workflow_event.payload.ref="refs/tags/v9.9.9"' ;;
+        sidecar-event)
+            jq '.target_statuses["linux/amd64"].result | .workflow_event.payload_sha256=("f"*64)' \
+                "$CASE/checkpoint.json" > "$CASE/retained-result.json" || return 1
+            filter='.target_statuses["linux/amd64"].result_path=$sidecar' ;;
+        *) return 1 ;;
+    esac
+    jq --arg sidecar "$CASE/retained-result.json" "$filter" \
+        "$CASE/checkpoint.json" > "$CASE/drifted-state.json" || return 1
+    mv "$CASE/drifted-state.json" "$CASE/checkpoint.json"
+    local before; before=$(_release_sha256 "$CASE/checkpoint.json") || return 1
     run_fallback --resume
+    [[ "$(_release_sha256 "$CASE/checkpoint.json")" == "$before" ]] || return 1
     if [[ "$1" == matching ]]; then
         [[ "$RC" == 0 ]] && one_result && ! grep -q '^BUILD ' "$CALLS" && grep -q '^RELEASE ' "$CALLS"
     else
@@ -1509,7 +1537,7 @@ isolated_workflow_checkpoint() {
         .context.source_sync=$sync[0] | .context.build_tasks=$tasks[0] |
         .source_sync_history=[{receipt:$sync[0]}] |
         .target_statuses=($tasks[0] | map({key:.key,value:{status:"completed",result:
-            ({status:"success",method:.method,platform:.platform,source_sync:$target[0]} +
+            ({status:"success",method:.method,platform:.platform,workflow_event:.workflow_event,source_sync:$target[0]} +
              if $layout[0] == null then {} else {source_layout:$layout[0]} end)}}) | from_entries)
     ' "$CASE/checkpoint.json" > "$CASE/workflow-checkpoint.json" || return 1
     mv "$CASE/workflow-checkpoint.json" "$CASE/checkpoint.json"
@@ -1870,6 +1898,7 @@ test_isolated_source_sibling_resume() {
     receipt=$(jq -nc --arg sha "$SOURCE_SHA" --arg revision "$revision" \
         '{git_context:{git_sha:$sha},sibling_git_contexts:{dependency:{git_sha:$revision}}}')
     jq --argjson receipt "$receipt" --arg recipe "$(_release_sha256 "$ACT_REPOS_DIR/tool.yaml")" '
+        del(.context.build_tasks) |
         .context.repo_config_sha256=$recipe |
         .context.source_sync=$receipt | .source_sync_history=[{receipt:$receipt}] |
         .target_statuses=(.targets | map({key:.,value:{status:"completed",result:{status:"success",method:"native",source_sync:$receipt}}}) | from_entries)
@@ -2081,8 +2110,9 @@ run_test test_invalid_argument --resume=unsafe
 run_test test_completed_resume true
 run_test test_completed_resume false
 run_test test_completed_default_output
-run_test test_completed_task_plan matching
-run_test test_completed_task_plan drift
+for mode in matching drift missing-plan plan-event missing-event changed-event sidecar-event; do
+    run_test test_completed_task_plan "$mode"
+done
 for mode in matching excluded selected permissions unbound quality; do
     run_test test_completed_ordinary_source_inputs "$mode"
 done

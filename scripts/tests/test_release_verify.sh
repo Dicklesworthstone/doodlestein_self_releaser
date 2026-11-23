@@ -176,6 +176,8 @@ create_mock_gh() {
 }
 
 seed_strict_verify_fixture() {
+    # These synthetic payloads model retained workflow output. Do not claim
+    # native Go execution without its compiler-policy and source receipts.
     local tool="test-tool"
     local tag="v1.0.0"
     unset STRICT_VERIFY_RELEASE_TAG STRICT_VERIFY_CORRUPT_REMOTE_ASSET_NAME
@@ -189,9 +191,11 @@ seed_strict_verify_fixture() {
     unset STRICT_VERIFY_RELEASE_LIST_LOG STRICT_VERIFY_RELEASE_ID_LOG
     STRICT_VERIFY_REPO="$TEST_TMPDIR/strict-repo"
     STRICT_VERIFY_TAG_GET_COUNT_FILE="$TEST_TMPDIR/strict-tag-get-count"
+    STRICT_VERIFY_ASSET_LIST_LOG="$TEST_TMPDIR/strict-asset-list.log"
     local artifacts_dir="$DSR_STATE_DIR/artifacts/${tool}-${tag}"
     mkdir -p "$STRICT_VERIFY_REPO" "$DSR_CONFIG_DIR/repos.d" "$artifacts_dir"
     printf '0\n' > "$STRICT_VERIFY_TAG_GET_COUNT_FILE"
+    : > "$STRICT_VERIFY_ASSET_LIST_LOG"
 
     git -C "$STRICT_VERIFY_REPO" init -q
     git -C "$STRICT_VERIFY_REPO" config user.name "DSR Test"
@@ -202,6 +206,7 @@ seed_strict_verify_fixture() {
     git -C "$STRICT_VERIFY_REPO" tag -a "$tag" -m "$tag"
     STRICT_VERIFY_SHA=$(git -C "$STRICT_VERIFY_REPO" rev-parse HEAD)
     export STRICT_VERIFY_REPO STRICT_VERIFY_SHA STRICT_VERIFY_TAG_GET_COUNT_FILE
+    export STRICT_VERIFY_ASSET_LIST_LOG
 
     cat > "$DSR_CONFIG_DIR/repos.d/${tool}.yaml" << YAML
 tool_name: $tool
@@ -212,6 +217,8 @@ build_cmd: go build ./...
 binary_name: $tool
 targets:
   - linux/amd64
+act_job_map:
+  linux/amd64: build-linux
 release_contract:
   checksum_sidecar: sha256
   exact_primary_assets:
@@ -257,6 +264,8 @@ YAML
             duration_ms: 1,
             status: "success",
             summary: {total: 1, success: 1, failed: 0},
+            requested_targets: ["linux/amd64"],
+            build_environments: [{target: "linux/amd64", method: "act", host: "act-local"}],
             artifacts: [
                 {name: ($tool + "-linux-amd64"), target: "linux/amd64", sha256: $sha, size_bytes: $size, build_purpose: "release", publishable: true},
                 {name: ($tool + ".sbom.spdx.json"), target: "additional", sha256: $additional_sha, size_bytes: $additional_size, build_purpose: "release", publishable: true}
@@ -315,6 +324,8 @@ build_cmd: go build ./...
 binary_name: $tool
 targets:
   - linux/amd64
+act_job_map:
+  linux/amd64: build-linux
 release_contract:
   checksum_sidecar: sha256
   exact_primary_assets:
@@ -357,6 +368,8 @@ local_path: $STRICT_VERIFY_REPO
 language: go
 binary_name: test-tool
 targets: [linux/amd64]
+act_job_map:
+  linux/amd64: build-linux
 release_contract:
   checksum_sidecar: sha256
   exact_primary_assets:
@@ -512,6 +525,15 @@ create_strict_verify_mock_gh() {
                         ;;
                     repos/testuser/test-tool/releases/tags/v1.0.0)
                         return 1
+                        ;;
+                    repos/testuser/test-tool/releases/123/assets\?per_page=100\&page=*)
+                        local asset_page="${endpoint##*=}"
+                        [[ "$asset_page" =~ ^[1-9][0-9]*$ ]] || return 1
+                        printf '%s\n' "$endpoint" >> "$STRICT_VERIFY_ASSET_LIST_LOG"
+                        jq -c --argjson page "$asset_page" \
+                            '.[(($page - 1) * 100):($page * 100)]' \
+                            <<< "$STRICT_VERIFY_ASSETS"
+                        return $?
                         ;;
                     repos/testuser/test-tool/releases/assets/*)
                         [[ "$*" == *"Accept: application/octet-stream"* ]] || return 1
@@ -1303,6 +1325,39 @@ test_verify_refuses_diagnostic_purpose_before_remote_access() {
     done
 }
 
+test_strict_verify_rejects_unreceipted_native_manifest() {
+    ((TESTS_RUN++))
+
+    if [[ "$HAS_YQ" != "true" ]]; then
+        skip "yq required for strict release contract parsing"
+        return 0
+    fi
+
+    harness_setup
+    seed_strict_verify_fixture
+    # Changing the configured task to native must not let a retained workflow
+    # row substitute for the native compiler evidence required by that task.
+    yq -i 'del(.act_job_map)' "$DSR_CONFIG_DIR/repos.d/test-tool.yaml"
+    create_strict_verify_fix_mock_gh true
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" release verify test-tool v1.0.0 --fix
+    local status
+    status=$(exec_status)
+    if [[ "$status" -eq 4 && ! -e "${STRICT_VERIFY_PRIMARY_PATH}.sha256" &&
+          ! -s "$STRICT_FIX_UPLOAD_LOG" && ! -s "$STRICT_FIX_PATCH_LOG" ]] &&
+        exec_stderr_contains "native policy receipt"; then
+        pass "strict repair refuses workflow evidence for a configured native Go build before mutation"
+    else
+        fail "strict repair must retain the native compiler-policy admission gate"
+        echo "status: $status"
+        echo "stderr: $(exec_stderr | tail -20)"
+    fi
+
+    remove_strict_verify_mock_gh
+    unset -f _strict_fix_release_json
+    harness_teardown
+}
+
 test_strict_verify_requires_exact_names_sizes_and_sidecars() {
     ((TESTS_RUN++))
 
@@ -1320,7 +1375,7 @@ test_strict_verify_requires_exact_names_sizes_and_sidecars() {
     status=$(exec_status)
     output=$(exec_stdout)
 
-    if [[ $status -eq 0 ]] && echo "$output" | jq -e '
+    if [[ $status -eq 0 && -s "$STRICT_VERIFY_ASSET_LIST_LOG" ]] && echo "$output" | jq -e '
         .details.verification.expected == 3 and
         .details.verification.present == 3 and
         .details.verification.missing == 0 and
@@ -3930,6 +3985,7 @@ echo ""
 
 if [[ "${DSR_RELEASE_VERIFY_STRICT_ONLY:-0}" == "1" ]]; then
     echo "Strict Release Contract Tests (mocked gh):"
+    test_strict_verify_rejects_unreceipted_native_manifest
     test_strict_verify_requires_exact_names_sizes_and_sidecars
     test_strict_verify_rejects_extra_or_incomplete_remote_assets
     test_strict_verify_rejects_remote_digest_mismatch
@@ -3986,6 +4042,7 @@ test_verify_all_assets_present
 test_verify_detects_missing_assets
 test_verify_detects_extra_assets
 test_verify_refuses_diagnostic_purpose_before_remote_access
+test_strict_verify_rejects_unreceipted_native_manifest
 test_strict_verify_requires_exact_names_sizes_and_sidecars
 test_strict_verify_rejects_extra_or_incomplete_remote_assets
 test_strict_verify_rejects_remote_digest_mismatch

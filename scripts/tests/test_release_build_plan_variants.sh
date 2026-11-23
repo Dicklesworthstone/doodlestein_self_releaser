@@ -348,7 +348,9 @@ for tool in ('tar','xz','zip','unzip'):
         raise RuntimeError('packaged finalizer tests require ' + tool)
 for filename in ('release_finalize.sh','release_packaging.sh','release_packaging_pipeline.sh','packaging.sh'):
     shutil.copy2(root / 'src' / filename, runtime / 'src' / filename)
-(runtime / 'src/release_finalize_core.sh').write_text(r'''#!/usr/bin/env bash
+(runtime / 'src/release_finalize_core.sh').write_text(
+    (root / 'src/release_finalize_core.sh').read_text() + r'''
+# Retain the production process/result supervisor; only publication is a fixture.
 _rf_log() { printf '[engine-fixture] %s\n' "$*" >&2; }
 release_finalize() {
     local root=$1 manifest='' repo=''

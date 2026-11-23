@@ -25,7 +25,7 @@ production_sha = hashlib.sha256((root / "dsr").read_bytes()).hexdigest()
 # Reuse only the unchanged stock helper definitions, before its first test.
 # No existing assertions are executed, rewritten, or suppressed by this file.
 python_marker = 'python3 - "$ROOT" <<\'PY\'\n'
-test_marker = "\nfor label,control in [('publish',{})"
+test_marker = "\nif os.environ.get('DSR_TEST_SOURCE_ONLY_INTERRUPTION_ONLY')=='1':"
 assert stock_bytes.decode().count(python_marker) == 1
 helper_text = stock_bytes.decode().split(python_marker, 1)[1]
 assert helper_text.count(test_marker) == 1
