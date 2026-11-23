@@ -1291,6 +1291,10 @@ _isb_checkout() (
             -c http.followRedirects=false -c http.sslVerify=true)
     fi
     _isb_git "${git_options[@]}" init -q --template= "$dir" || return 8
+    # Compiler subprocesses (including Go's VCS stamping) invoke Git directly,
+    # without this helper's -c override. Bind every acquired repository's own
+    # worktree so a global core.worktree cannot select an unrelated checkout.
+    _isb_git "${git_options[@]}" -C "$dir" config --local core.worktree "$dir" || return 8
     _isb_git ${git_options[@]+"${git_options[@]}"} -C "$dir" remote add origin "https://github.com/$repo.git" || return 8
     _isb_git ${git_options[@]+"${git_options[@]}"} -C "$dir" fetch -q --depth=1 --no-tags --recurse-submodules=no origin "$ref" || return 8
     local commit
@@ -2957,6 +2961,17 @@ install_source_build() (
     local repo="${1:-}" ref="${2:-}" language="${3:-}" binary="${4:-}" destination="${5:-}"
     [[ $# -ge 5 ]] || return 4
     shift 5
+    # Acquisition helpers already isolate their own Git commands. Keep that
+    # isolation for compilers and build scripts too: Go, for example, shells
+    # out to Git when embedding its VCS revision. Inherited repository selectors
+    # must not stamp a pinned build with the caller's HEAD or modify its index.
+    # This function is a subshell; the caller's environment stays unchanged.
+    # User credential/URL configuration remains available for dependencies.
+    unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE
+    unset GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+    unset GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT
+    unset GIT_IMPLICIT_WORK_TREE GIT_PREFIX GIT_SHALLOW_FILE GIT_GRAFT_FILE
+    unset GIT_NAMESPACE GIT_REPLACE_REF_BASE GIT_TEMPLATE_DIR
     local allow=false subdir=. entry='' package='' limit=3600 _ISB_INSTALL_TOOLCHAIN=false
     local -a binaries=()
     while (($#)); do

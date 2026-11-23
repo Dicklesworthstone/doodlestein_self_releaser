@@ -707,12 +707,45 @@ GOOS=windows GOARCH=arm64 GOFLAGS='-buildmode=archive' run_build env HEAD go fix
 check 'ambient cross-compile target cannot produce a foreign executable' equal "$status" 0
 check 'ambient override build runs on this host' equal "$("$(jq -r .path "$TEMP/results/env.json")")" source-main-v2
 # git -C alone is insufficient when GIT_DIR/GIT_WORK_TREE are inherited.
-GIT_DIR="$TEMP/upstream/.git" GIT_WORK_TREE="$TEMP/upstream" GIT_INDEX_FILE="$TEMP/unwanted-index" \
+git_environment_build() {
+    local GIT_DIR="$TEMP/upstream/.git" GIT_WORK_TREE="$TEMP/upstream" GIT_INDEX_FILE="$TEMP/unwanted-index"
+    local GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0="$TEMP/upstream"
+    export GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
     run_build git-env refs/tags/v1.0.0 go fixture "$TEMP/git-env-build" --allow-build --timeout 60
+    check 'source build preserves caller Git directory environment' equal "$GIT_DIR" "$TEMP/upstream/.git"
+    check 'source build preserves caller Git worktree environment' equal "$GIT_WORK_TREE" "$TEMP/upstream"
+    check 'source build preserves caller Git index environment' equal "$GIT_INDEX_FILE" "$TEMP/unwanted-index"
+    check 'source build preserves caller process-local Git configuration' equal \
+        "$GIT_CONFIG_COUNT:$GIT_CONFIG_KEY_0:$GIT_CONFIG_VALUE_0" "1:core.worktree:$TEMP/upstream"
+}
+git_environment_build
 check 'ambient Git plumbing does not redirect source operations' equal "$status" 0
+GIT_ENV_PAYLOAD=$(jq -r .path "$TEMP/results/git-env.json")
+go version -m "$GIT_ENV_PAYLOAD" > "$TEMP/results/git-env.buildinfo" 2> "$TEMP/results/git-env.buildinfo.err"
+check 'real Go executable embeds the requested tag revision, not caller HEAD' \
+    grep -Fq $'\tbuild\tvcs.revision='"$PIN" "$TEMP/results/git-env.buildinfo"
+check 'real Go executable records a clean pinned checkout with caller Git selectors present' \
+    grep -Fq $'\tbuild\tvcs.modified=false' "$TEMP/results/git-env.buildinfo"
+check 'source receipt agrees with the real executable VCS revision' equal \
+    "$(jq -r .source_commit "$TEMP/results/git-env.json")" "$PIN"
 check 'original checkout HEAD is preserved' equal "$(git -C "$TEMP/upstream" rev-parse HEAD)" "$HEAD_PIN"
 check 'original checkout remains on main' equal "$(git -C "$TEMP/upstream" symbolic-ref --short HEAD)" main
 check 'foreign index path was never created' test ! -e "$TEMP/unwanted-index"
+# Git's global worktree setting also affects compiler-invoked Git. Acquisition
+# must persist its private worktree in local configuration for those subprocesses.
+git config --file "$GIT_CONFIG_GLOBAL" core.worktree "$TEMP/upstream"
+run_build git-global-worktree refs/tags/v1.0.0 go fixture "$TEMP/git-global-worktree-build" --allow-build --timeout 60
+check 'global Git worktree cannot redirect the source compiler' equal "$status" 0
+GIT_GLOBAL_PAYLOAD=$(jq -r .path "$TEMP/results/git-global-worktree.json")
+go version -m "$GIT_GLOBAL_PAYLOAD" > "$TEMP/results/git-global-worktree.buildinfo" \
+    2> "$TEMP/results/git-global-worktree.buildinfo.err"
+check 'real Go executable embeds the source tag despite global core.worktree' \
+    grep -Fq $'\tbuild\tvcs.revision='"$PIN" "$TEMP/results/git-global-worktree.buildinfo"
+check 'real Go executable stays clean despite global core.worktree' \
+    grep -Fq $'\tbuild\tvcs.modified=false' "$TEMP/results/git-global-worktree.buildinfo"
+check 'global caller Git configuration remains unchanged' equal \
+    "$(git config --file "$GIT_CONFIG_GLOBAL" --get core.worktree)" "$TEMP/upstream"
+git config --file "$GIT_CONFIG_GLOBAL" --unset core.worktree
 # Nested Go commands use a native argv entry and real compiler.
 mkdir -p "$TEMP/upstream/cmd/fixture"
 cat > "$TEMP/upstream/cmd/fixture/main.go" <<'GO'
