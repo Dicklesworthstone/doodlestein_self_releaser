@@ -648,7 +648,16 @@ if [[ "$endpoint" =~ /runs/([0-9]+)/attempts/2/jobs\? ]]; then
     fi
     if [[ "$run_id" == 201 ]]; then
         case "$INDEPENDENT_JOB_CASE" in
-            cancel-jobs|cross-repo-cancel|queued-cancel) exit "${INDEPENDENT_CANCEL_CODE:-2}" ;;
+            cancel-jobs|cross-repo-cancel|queued-cancel)
+                # Emit valid bytes before a real process signal or explicit
+                # cancellation; the API status must still withdraw admission.
+                printf '%s\n' '{"total_count":0,"jobs":[]}'
+                if [[ -n "${INDEPENDENT_CANCEL_SIGNAL:-}" ]]; then
+                    ulimit -c 0
+                    kill -s "$INDEPENDENT_CANCEL_SIGNAL" "$$"
+                    exit 99
+                fi
+                exit "${INDEPENDENT_CANCEL_CODE:-2}" ;;
             wrong-source|wrong-attempt|invalid-time|malformed|short-page|recovered) ;;
             *) printf 'gh: Bad gateway (HTTP 502)\n' >&2; exit 1 ;;
         esac
@@ -823,6 +832,38 @@ SCRIPT
         [[ ! -e "$TEST_TMPDIR/fallback.args" ]]
     done
     assert_equal 2 "$(wc -l < "$TEST_TMPDIR/watch-check.polls" | tr -d ' ')"
+}
+
+@test "independent job scan: crashed inspection withdraws another repository's verified queue" {
+    harness_create_config
+    _setup_repos_d
+    _mock_independent_job_inventory cross-repo-cancel
+    export INDEPENDENT_CANCEL_SIGNAL=SEGV
+    mkdir -p "$DSR_STATE_DIR/check"
+    printf '%s\n' '{"previous_completed_snapshot":true}' > "$DSR_STATE_DIR/check/last.json"
+    cp "$DSR_STATE_DIR/check/last.json" "$TEST_TMPDIR/previous-check.json"
+    run _routing_dsr --json check bv ntm
+    assert_equal 5 "$status"
+    jq -e '.status == "error" and .exit_code == 5 and
+        .details.throttled == [] and .details.healthy == [] and
+        .details.repos[0].status == "throttled" and .details.skipped[0].run_id == 201' <<< "$output"
+    cmp "$TEST_TMPDIR/previous-check.json" "$DSR_STATE_DIR/check/last.json"
+    ! grep -Eq 'runs/(202|203|204)/attempts/2/jobs' "$TEST_TMPDIR/gh.calls"
+}
+
+@test "independent job scan: signalled transport stops continuous watch before fallback" {
+    harness_create_config
+    _setup_repos_d
+    _mock_independent_job_inventory cancel-jobs
+    export INDEPENDENT_CANCEL_SIGNAL=PIPE
+    DSR_WATCH_FIXTURE_REAL_CHECK=1 DSR_WATCH_FIXTURE_CONTINUOUS=1 \
+        run --separate-stderr _routing_watch '{}' --auto-fallback
+    assert_equal 5 "$status"
+    jq -e '.status == "error" and .exit_code == 5 and
+        .details.triggered_state.attempts == {} and .details.triggered_state.pending == {}' <<< "$output"
+    [[ ! -e "$TEST_TMPDIR/fallback.args" && ! -e "$DSR_STATE_DIR/check/last.json" ]]
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/watch-check.polls" | tr -d ' ')"
+    ! grep -q 'runs/202/attempts/2/jobs' "$TEST_TMPDIR/gh.calls"
 }
 
 @test "job scan: long executing or approval-pending workflows do not trigger fallback" {
@@ -2882,6 +2923,26 @@ EOF
         [[ "$stderr" != *"Would trigger fallback"* ]]
         assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
     done
+}
+
+@test "watch recovery signal exits retain pending custody without admitting another release" {
+    _watch_pending_fixture
+    _mock_watch_upstream_run "$(_watch_upstream_run_json completed failure)"
+    local before check_json stopped
+    before=$(cat "$DSR_STATE_DIR/triggered.json")
+    check_json=$(_watch_multiple_runs_json | jq '.details.throttled |= [.[2]]')
+    for stopped in 139 141 255; do
+        DSR_WATCH_UPSTREAM_STATUS="$stopped" \
+            run --separate-stderr _routing_watch "$check_json" --auto-fallback
+        assert_equal 5 "$status"
+        assert_contains "$stderr" "Upstream recovery inspection interrupted"
+        assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+        jq -e '.exit_code == 5 and .details.triggered_state.pending["12345"] != null and
+            .details.triggered_state.attempts["12347"] == null' <<< "$output"
+        assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+        [[ ! -e "$DSR_STATE_DIR/watch-artifacts/12345" && ! -e "$DSR_STATE_DIR/watch-artifacts/12347" ]]
+    done
+    assert_equal 3 "$(wc -l < "$TEST_TMPDIR/watch-upstream.calls" | tr -d ' ')"
 }
 
 @test "watch recovery cancellation withdraws earlier verified recovery candidates" {

@@ -677,6 +677,33 @@ test_watch_admission_initial_refusal() {
             grep -Fq 'UPSTREAM repos/owner/tool/actions/runs/12345/attempts/2/jobs?per_page=100&page=1 --no-cache' "$CALLS"
     fi
 }
+test_watch_admission_transport_stop() {
+    local stop_at="$1" stop_status="$2" expected_status="$3"
+    watch_admission_fixture "transport-$stop_at-$stop_status" || return 1
+    gh_api() {
+        printf 'UPSTREAM %s\n' "$*" >> "$CALLS"
+        [[ $# == 2 && "$2" == --no-cache ]] || return 99
+        case "$1" in
+            repos/owner/tool/actions/runs/12345) cat "$CASE/watch-run.json" || return 1 ;;
+            'repos/owner/tool/actions/runs/12345/attempts/2/jobs?per_page=100&page=1')
+                cat "$CASE/watch-jobs.json" || return 1 ;;
+            *) return 99 ;;
+        esac
+        # Valid output followed by failure must stop at the first run read,
+        # the attempt-pinned job inventory, or the final run observation.
+        if [[ "$(grep -c '^UPSTREAM ' "$CALLS")" == "$stop_at" ]]; then
+            return "$stop_status"
+        fi
+    }
+    run_fallback --expected-sha "$SOURCE_SHA" --isolate-source --watch-admission "$WATCH_ADMISSION"
+    [[ "$RC" == "$expected_status" && ! -e "$OUT" && ! -e "$CASE/lock" &&
+       ! -e "$DSR_STATE_DIR/fallback-sources" ]] && one_result || return 1
+    [[ "$(grep -c '^UPSTREAM ' "$CALLS")" == "$stop_at" ]] || return 1
+    ! grep -Eq '^(INIT|LOCK|CHECK|BUILD|SIGN|RELEASE)( |$)' "$CALLS" || return 1
+    jq -e '.details.phase == "admission" and .details.phases.release == "blocked" and
+        .details.watch_observation == null' "$CASE/stdout" >/dev/null
+}
+
 test_watch_admission_workflow_ref() {
     watch_admission_fixture workflow-ref || return 1
     watch_admission_update_json "$CASE/watch-run.json" '.path += "@refs/tags/v1.2.3"' || return 1
@@ -2077,6 +2104,14 @@ for mode in success cancelled failed active waiting recent attempt workflow work
     run_test test_watch_admission_initial_refusal "$mode"
 done
 run_test test_watch_admission_workflow_ref
+for stopped_boundary in 1 2 3; do
+    for stopped_status in 139 141 255; do
+        run_test test_watch_admission_transport_stop "$stopped_boundary" "$stopped_status" 5
+    done
+    for stopped_status in 8 124 125 137; do
+        run_test test_watch_admission_transport_stop "$stopped_boundary" "$stopped_status" 8
+    done
+done
 for event in push release workflow_dispatch; do run_test test_watch_configured_event "$event"; done
 for mode in quality build signing; do run_test test_watch_admission_late_refusal "$mode"; done
 for mode in missing-field missing-workflow-path malformed-workflow-path extra-field fractional-attempt wrong-repo bad-reason bad-threshold missing-expected build-only; do

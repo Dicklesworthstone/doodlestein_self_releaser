@@ -1238,6 +1238,18 @@ gh_workflow_runs() {
     gh_api "$endpoint"
 }
 
+# Monitoring may retry ordinary unavailable reads, but an interrupted
+# inspection withdraws every candidate from that poll. The timeout supervisor
+# reserves 124/125/137 for deadlines or supervision failures; unlike an
+# unsupervised fallback child, status 137 here does not identify cancellation.
+# Use only on adapter statuses, never raw curl errors (curl 5 is DNS).
+_gh_monitoring_interrupted() {
+    local status="${1:-0}"
+    [[ "$status" =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
+    ((status == 2 || status == 5 ||
+      (status >= 129 && status <= 255 && status != 137)))
+}
+
 # Enumerate active runs for throttle detection. Filter before paginating so
 # completed runs cannot hide an older queue. GitHub limits filtered searches
 # to 1,000 results; refuse incomplete inventories instead of guessing healthy.
@@ -1273,11 +1285,10 @@ gh_workflow_active_runs() {
             request_status=0
             response=$(gh_api "$endpoint?per_page=100&status=$status&page=$page" --no-cache) || request_status=$?
             if ((request_status != 0)); then
-                case "$request_status" in
-                    2|5|129|130|131|143)
-                        _gh_log_error "Workflow-run inspection interrupted for $repo"
-                        return 5 ;;
-                esac
+                if _gh_monitoring_interrupted "$request_status"; then
+                    _gh_log_error "Workflow-run inspection interrupted for $repo"
+                    return 5
+                fi
                 _gh_log_error "Cannot read $status workflow runs for $repo (page $page)"
                 return 8
             fi
@@ -1359,11 +1370,10 @@ gh_workflow_jobs() {
         request_status=0
         response=$(gh_api "$endpoint?${query}per_page=100&page=$page" --no-cache) || request_status=$?
         if ((request_status != 0)); then
-            case "$request_status" in
-                2|5|129|130|131|143)
-                    _gh_log_error "Workflow-job inspection interrupted for $repo run $run_id"
-                    return 5 ;;
-            esac
+            if _gh_monitoring_interrupted "$request_status"; then
+                _gh_log_error "Workflow-job inspection interrupted for $repo run $run_id"
+                return 5
+            fi
             _gh_log_error "Cannot read workflow jobs for $repo run $run_id (page $page)"
             return 8
         fi
@@ -2266,7 +2276,7 @@ export -f _gh_log_warn _gh_log_error
 export -f gh_get_immutable_tag_ruleset_receipt
 export -f gh_workflow_runs gh_workflow_active_runs gh_workflow_run gh_releases gh_latest_release
 export -f gh_create_release gh_upload_asset gh_upload_asset_named gh_upload_asset_dual
-export -f _gh_operation_interrupted
+export -f _gh_operation_interrupted _gh_monitoring_interrupted
 export -f gh_release_asset_inventory
 export -f gh_compare gh_tags gh_repo
 export -f gh_resolve_tag_sha gh_repository_dispatch

@@ -3099,6 +3099,86 @@ test_dispatch_fails_on_error_response() (
   [[ $status -ne 0 ]]
 )
 
+test_workflow_reader_stopped_status() (
+  local reader="$1" stopped_status="$2" expected_status="$3" result status=0
+  gh_api() {
+    printf '%s\n' "$1" >> "$TEMP_DIR/workflow.calls"
+    # Completed-looking output cannot supersede a failed transport status.
+    printf '%s\n' '{"total_count":0,"workflow_runs":[],"jobs":[]}'
+    return "$stopped_status"
+  }
+  if [[ "$reader" == active ]]; then
+    result=$(gh_workflow_active_runs owner/repo) || status=$?
+  else
+    result=$(gh_workflow_jobs owner/repo 123 1) || status=$?
+  fi
+  [[ "$status" == "$expected_status" && -z "$result" ]] || return 1
+  [[ "$(wc -l < "$TEMP_DIR/workflow.calls" | tr -d ' ')" == 1 ]]
+)
+
+test_workflow_reader_stopped_later_page() (
+  local reader="$1" result status=0
+  gh_api() {
+    printf '%s\n' "$1" >> "$TEMP_DIR/workflow.calls"
+    if [[ "$1" == *'page=1' ]]; then
+      if [[ "$reader" == active ]]; then
+        jq -nc '{total_count:101,workflow_runs:[range(1;101) |
+          {id:.,status:"queued",created_at:"2000-01-01T00:00:00Z"}]}'
+      else
+        jq -nc '{total_count:101,jobs:[range(1;101) |
+          {id:.,run_id:123,run_attempt:1,status:"queued",head_sha:("1"*40)}]}'
+      fi
+      return 0
+    fi
+    printf '%s\n' '{"total_count":0,"workflow_runs":[],"jobs":[]}'
+    return 139
+  }
+  if [[ "$reader" == active ]]; then
+    result=$(gh_workflow_active_runs owner/repo) || status=$?
+  else
+    result=$(gh_workflow_jobs owner/repo 123 1) || status=$?
+  fi
+  [[ "$status" == 5 && -z "$result" ]] || return 1
+  [[ "$(wc -l < "$TEMP_DIR/workflow.calls" | tr -d ' ')" == 2 ]] || return 1
+  ! grep -q 'status=in_progress\|page=3' "$TEMP_DIR/workflow.calls"
+)
+
+test_exported_workflow_reader_interruption() (
+  local status=0
+  bash -c 'gh_api() { return 141; }; gh_workflow_active_runs owner/repo' \
+    > "$TEMP_DIR/exported.stdout" 2> "$TEMP_DIR/exported.stderr" || status=$?
+  [[ "$status" == 5 && ! -s "$TEMP_DIR/exported.stdout" ]]
+)
+
+run_workflow_interruption_tests() {
+  local reader stopped_status expected_status
+  for reader in active jobs; do
+    while read -r stopped_status expected_status; do
+      run_test "workflow_${reader}_stopped_${stopped_status}" \
+        test_workflow_reader_stopped_status "$reader" "$stopped_status" "$expected_status"
+    done <<'WORKFLOW_STATUSES'
+2 5
+5 5
+129 5
+130 5
+131 5
+138 5
+139 5
+141 5
+143 5
+255 5
+8 8
+22 8
+124 8
+125 8
+137 8
+WORKFLOW_STATUSES
+    run_test "workflow_${reader}_stopped_later_page" \
+      test_workflow_reader_stopped_later_page "$reader"
+  done
+  run_test workflow_exported_interruption test_exported_workflow_reader_interruption
+}
+
 # ============================================================================
 # Main Test Runner
 # ============================================================================
@@ -3195,6 +3275,13 @@ PY
 main() {
   echo "=== github.sh Tests ==="
   echo ""
+
+  if [[ "${1:-}" == --workflow-interruption-only ]]; then
+    run_workflow_interruption_tests
+    printf 'Workflow interruptions: %s passed, %s failed\n' "$TESTS_PASSED" "$TESTS_FAILED"
+    [[ "$TESTS_FAILED" -eq 0 ]]
+    exit $?
+  fi
 
   if [[ "${1:-}" == --tag-resolution-only ]]; then
     run_tag_resolution_tests
@@ -3328,6 +3415,7 @@ main() {
   echo "API Argument Parsing:"
   run_test "api_rejects_empty_endpoint" test_api_rejects_empty_endpoint
   run_test "api_rejects_unknown_option" test_api_rejects_unknown_option
+  run_workflow_interruption_tests
   run_test api_complete_request_deadlines test_api_enforces_complete_request_deadlines
   run_test api_rejects_invalid_deadlines_before_credentials test_api_rejects_invalid_deadlines_before_credentials
   run_exported_api_regressions

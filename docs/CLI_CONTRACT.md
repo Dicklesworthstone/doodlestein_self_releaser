@@ -514,7 +514,14 @@ Explicit cancellation during authentication, run listing, or job inspection
 aborts the entire check with exit 5, withdraws any previously observed fallback
 candidates, and preserves the last completed check snapshot. Both continuous
 and single-pass watchers stop on that cancellation without launching workers
-or starting another poll.
+or starting another poll. Workflow-read crashes and other signal-like adapter
+exits also stop admission, including during pagination and revalidation of
+retained pending or failed work. A successful-looking response body cannot
+override the failed process status. Supervised read statuses 124, 125 and 137
+remain unavailable reads (exit 8): the deadline supervisor also uses 137 for
+forced termination, so that status does not identify cancellation. The direct
+check child has no such supervisor; its signal-like exits, including 137,
+stop the watcher with exit 5.
 
 Each throttled row includes `queue_reason: "workflow_queue"` for a queued
 workflow with a complete empty job inventory, or `queue_reason: "job_queue"`

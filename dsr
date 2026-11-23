@@ -1809,11 +1809,11 @@ _check_waiting_jobs() {
     ' || analysis_status=$?
     # jq uses exit 5 for invalid source/timestamp evidence too. Normalize its
     # validation failures separately from API and process-signal interruption.
-    case "$analysis_status" in
-        0) return 0 ;;
-        129|130|131|143) return 5 ;;
-        *) return 8 ;;
-    esac
+    [[ "$analysis_status" -ne 0 ]] || return 0
+    # This jq process has no timeout wrapper, so every signal-like exit is
+    # terminal. Its ordinary validation status 5 remains an unreadable result.
+    if ((analysis_status >= 129 && analysis_status <= 255)); then return 5; fi
+    return 8
 }
 
 # Check a single repo for throttling
@@ -2515,7 +2515,7 @@ _watch_admit_upstream() {
     '
     observed=$(gh_api "repos/$repo/actions/runs/$run_id" --no-cache) || status=$?
     if ((status != 0)); then
-        case "$status" in 2|5|129|130|131|143) return 5 ;; esac
+        if _gh_monitoring_interrupted "$status"; then return 5; fi
         log_warn "Cannot revalidate upstream run $run_id; automatic fallback withheld"
         return 8
     fi
@@ -2540,7 +2540,7 @@ _watch_admit_upstream() {
         status=0
         waiting=$(_check_waiting_jobs "$repo" "$observed" "$threshold" "$now") || status=$?
         if ((status != 0)); then
-            case "$status" in 2|5|129|130|131|143) return 5 ;; esac
+            if _gh_monitoring_interrupted "$status"; then return 5; fi
             log_warn "Cannot revalidate jobs for run $run_id; automatic fallback withheld"
             return 8
         fi
@@ -2554,7 +2554,7 @@ _watch_admit_upstream() {
     status=0
     after=$(gh_api "repos/$repo/actions/runs/$run_id" --no-cache) || status=$?
     if ((status != 0)); then
-        case "$status" in 2|5|129|130|131|143) return 5 ;; esac
+        if _gh_monitoring_interrupted "$status"; then return 5; fi
         log_warn "Cannot finish upstream revalidation for run $run_id; automatic fallback withheld"
         return 8
     fi
@@ -2671,13 +2671,12 @@ _watch_terminal_retry_runs() {
         observed_status=0
         observed=$(gh_api "repos/$repo/actions/runs/$run_id" --no-cache) || observed_status=$?
         if ((observed_status != 0)); then
-            case "$observed_status" in
-                2|5|129|130|131|143)
-                    # Withdraw every candidate from this poll, including
-                    # earlier recovery responses and newly observed queues.
-                    log_error "Upstream recovery inspection interrupted for run $run_id"
-                    return 5 ;;
-            esac
+            if _gh_monitoring_interrupted "$observed_status"; then
+                # Withdraw every candidate from this poll, including
+                # earlier recovery responses and newly observed queues.
+                log_error "Upstream recovery inspection interrupted for run $run_id"
+                return 5
+            fi
             log_warn "Cannot verify upstream run $run_id; retaining its fallback candidate for a later check"
             continue
         fi
@@ -2778,11 +2777,12 @@ _watch_iteration() {
             # result and backoff even when one such recovery can start.
             check_output='{"details":{"throttled":[]}}'
         elif [[ $check_exit -ne 1 ]]; then
-            case "$check_exit" in
-                5|129|130|131|143)
-                    log_error "Throttle check interrupted"
-                    return 5 ;;
-            esac
+            # This child has no timeout wrapper. In particular, its own
+            # SIGKILL must not become a retryable poll failure.
+            if _watch_interrupted_exit "$check_exit"; then
+                log_error "Throttle check interrupted"
+                return 5
+            fi
             log_error "Throttle check failed (exit $check_exit); run 'dsr check' for details"
             return 1
         else
