@@ -643,10 +643,13 @@ def supervise_driver(job, attempt, session, command, manifest, environment, bind
     os.close(ready_read)
     driver = None
     cancel_at = None
+    cancel_signal = None
+    handled_signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
     def cancel(signum, frame):
-        nonlocal cancel_at
-        if cancel_at is None:
+        nonlocal cancel_at, cancel_signal
+        if cancel_signal is None:
+            cancel_signal = signum
             cancel_at = time.monotonic()
 
     def owned_children(deadline):
@@ -703,7 +706,7 @@ def supervise_driver(job, attempt, session, command, manifest, environment, bind
 
     try:
         os.setsid()
-        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        for sig in handled_signals:
             signal.signal(sig, cancel)
         # Linux is already required for execution. Adopt orphaned descendants
         # so an escaped background writer cannot keep mutating sealed evidence.
@@ -741,7 +744,24 @@ def supervise_driver(job, attempt, session, command, manifest, environment, bind
                    "stderr": file_observation(attempt / "stderr.log"),
                    "manifest": file_observation(manifest, optional=True),
                    "native_checkpoint": driver_checkpoint(job, session)}
-        write(attempt / "driver-exit.json", receipt)
+        # The driver can finish successfully before supervision is cancelled
+        # during descendant settlement or evidence observation. Keep its actual
+        # wait status, but never seal that interrupted supervision as success.
+        # Evidence acquisition stays interruptible. Block these signals while
+        # selecting and publishing the terminal receipt, including any already
+        # pending. Signals arriving after that selection are delivered after
+        # sealing and cannot revoke the selected result.
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, handled_signals)
+        try:
+            if cancel_signal is None:
+                pending = signal.sigpending()
+                cancel_signal = next((sig for sig in handled_signals if sig in pending), None)
+            if cancel_signal is not None:
+                receipt["supervisor_signal"] = int(cancel_signal)
+                receipt["exit_code"] = 128 + int(cancel_signal)
+            write(attempt / "driver-exit.json", receipt)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         return receipt["exit_code"]
     except BaseException as exc:
         try:
@@ -760,14 +780,17 @@ def driver_completion(job, attempt, session, command, manifest, retained_manifes
         item["driver_exit_sha256"] = evidence["sha256"]
         save_state()
     receipt = json.loads(data, object_pairs_hook=pairs)
-    require(isinstance(receipt, dict) and set(receipt) == {"schema_version", "kind", "identity", "wait_status",
-            "exit_code", "stdout", "stderr", "manifest", "native_checkpoint"} and
+    require(isinstance(receipt, dict) and set(receipt) - {"supervisor_signal"} ==
+            {"schema_version", "kind", "identity", "wait_status", "exit_code", "stdout", "stderr", "manifest", "native_checkpoint"} and
+            ("supervisor_signal" not in receipt or
+             (type(receipt["supervisor_signal"]) is int and receipt["supervisor_signal"] in (1, 2, 15))) and
             type(receipt["schema_version"]) is int and receipt["schema_version"] == 1 and
             receipt["kind"] == "dsr-release-driver-exit" and
             receipt["identity"] == driver_binding(job, attempt, command) and
             type(receipt["wait_status"]) is int and -64 <= receipt["wait_status"] <= 255 and
             type(receipt["exit_code"]) is int and receipt["exit_code"] ==
-            (receipt["wait_status"] if receipt["wait_status"] >= 0 else 128 - receipt["wait_status"]),
+            (128 + receipt["supervisor_signal"] if "supervisor_signal" in receipt else
+             receipt["wait_status"] if receipt["wait_status"] >= 0 else 128 - receipt["wait_status"]),
             "invalid or unrelated driver exit receipt")
     observed_manifest = file_observation(manifest, optional=True)
     if observed_manifest is None and retained_manifest is not None and receipt["manifest"] is not None:

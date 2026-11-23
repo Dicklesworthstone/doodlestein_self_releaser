@@ -294,8 +294,24 @@ the command runs, observes its real wait status, stops and reaps remaining local
 descendants, then writes an exclusive, fsynced `driver-exit.json` in that attempt.
 The receipt binds the original argv, plan/job/attempt identity, command and input
 documents, stdout and stderr bytes, selected manifest, and the native checkpoint
-when exact native resume is enabled. Its status comes from the actual child;
-JSON claiming success cannot replace a nonzero or signal exit.
+when exact native resume is enabled. Its `wait_status` always records the actual
+driver outcome; JSON claiming success cannot replace a nonzero or signal exit.
+
+A supervisor can receive cancellation after its driver exits, while it settles
+descendants or reads the evidence. The first caught SIGINT, SIGTERM or SIGHUP is
+then recorded as `supervisor_signal`, and the receipt's effective `exit_code` is
+`128 + supervisor_signal`, even when the actual driver returned zero. That
+attempt cannot supply a completed shard or publishable bundle. Receipt admission
+requires the exact supported integer signal and matching effective status; older
+uncancelled receipts retain their existing interpretation.
+
+Evidence collection remains interruptible. After all evidence is acquired, the
+supervisor blocks these signals, includes already pending cancellation, and
+selects and publishes its terminal receipt. Signals arriving after status
+selection are delivered after sealing and cannot revoke the selected completion.
+This is a defined publication boundary, not a guarantee of bounded filesystem
+write or fsync latency.
+
 CLI cancellation still exits with interruption code `5`. When the supervisor
 observes a terminal signal, attempt history retains that actual normalized exit
 (for example, `143` for SIGTERM) as a failed attempt. `interrupted` identifies
@@ -347,6 +363,10 @@ artifact import, an escaped writer retaining stdout and the lock, and a
 signal-ignoring child during cancellation. Use `DSR_BUILD_COMPLETION_ONLY=1` to
 run just these completion controls. Compilation remains an explicit fixture;
 process supervision, wait statuses, custody, admission and recovery are real.
+The existing build-plan suite also covers supervisor signals after a successful
+driver exit, first-signal precedence, malformed signal evidence, explicit fresh
+retry, and post-selection completion reuse. Run these focused cases with
+`DSR_BUILD_SUPERVISOR_ONLY=1 bash scripts/tests/test_release_builds.sh`.
 
 ### Recover completed native and Windows cross-compilation
 

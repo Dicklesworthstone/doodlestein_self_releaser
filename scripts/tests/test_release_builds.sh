@@ -215,6 +215,133 @@ print(json.dumps(response))
         value = json.loads(proc.stdout)
         check('one JSON envelope agrees with process exit', value['exit_code']==expected)
         return value
+    def supervisor_signal_cases():
+        # The native compiler remains the explicit driver fixture above. Inject
+        # real process signals at named filesystem boundaries in the unmodified
+        # coordinator, avoiding a race with scheduler or filesystem speed.
+        hooks = work / 'supervisor-signal-hooks'
+        hooks.mkdir()
+        (hooks / 'sitecustomize.py').write_text(r'''
+import json
+import os
+import signal
+
+original_open, original_link = os.open, os.link
+
+def inject(point, selected):
+    if (os.environ.get("DSR_TEST_SUPERVISOR_POINT") != point or
+            os.fspath(selected) != os.environ.get("DSR_TEST_SUPERVISOR_PATH")):
+        return
+    try:
+        descriptor = original_open(os.environ["DSR_TEST_SUPERVISOR_MARKER"],
+                                   os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return
+    signals = [int(value) for value in os.environ["DSR_TEST_SUPERVISOR_SIGNALS"].split(",")]
+    try:
+        os.write(descriptor, json.dumps({"pid": os.getpid(), "point": point,
+                 "path": os.fspath(selected), "signals": signals,
+                 "blocked": sorted(int(sig) for sig in signal.pthread_sigmask(signal.SIG_BLOCK, []))}).encode())
+    finally:
+        os.close(descriptor)
+    for selected_signal in signals:
+        os.kill(os.getpid(), selected_signal)
+
+def observe_open(selected, flags, *args, **kwargs):
+    descriptor = original_open(selected, flags, *args, **kwargs)
+    if flags & os.O_NOFOLLOW:
+        inject("observation", selected)
+    return descriptor
+
+def publish_link(source, destination, *args, **kwargs):
+    result = original_link(source, destination, *args, **kwargs)
+    inject("publication", destination)
+    return result
+
+os.open, os.link = observe_open, publish_link
+''')
+        selected = work / 'supervisor-signal-plan.json'
+        encode(selected, dict(plan, required_targets=a['targets'], builds=[a]))
+        controls['linux'].write_text('good')
+
+        def environment(folder, point, signals):
+            attempt = folder / 'attempts/linux/000001'
+            target = attempt / ('stdout.json' if point == 'observation' else 'driver-exit.json')
+            return dict(fixture_env, PYTHONPATH=str(hooks),
+                        DSR_TEST_SUPERVISOR_POINT=point, DSR_TEST_SUPERVISOR_PATH=str(target),
+                        DSR_TEST_SUPERVISOR_MARKER=str(work / (folder.name + '.signal.json')),
+                        DSR_TEST_SUPERVISOR_SIGNALS=','.join(str(sig) for sig in signals))
+
+        for label, signals in (('int', [2]), ('term', [15]), ('hup', [1]), ('first-int', [2, 15])):
+            folder = work / ('supervisor-' + label)
+            result = run(folder, 1, selected, env=environment(folder, 'observation', signals))
+            receipt_path = folder / 'attempts/linux/000001/driver-exit.json'
+            receipt = read(receipt_path)
+            record = read(folder / 'state.json')['jobs']['linux']
+            injection = read(work / (folder.name + '.signal.json'))
+            check(label + ': real signal reaches a separate supervisor before sealing',
+                  injection['pid'] != os.getpid() and injection['point'] == 'observation' and
+                  all(sig not in injection['blocked'] for sig in signals))
+            check(label + ': cancellation retains true successful driver wait status',
+                  receipt['wait_status'] == 0 and receipt['supervisor_signal'] == signals[0] and
+                  receipt['exit_code'] == 128 + signals[0] and
+                  record['attempts'][0]['exit_code'] == 128 + signals[0])
+            check(label + ': interrupted supervision cannot become publishable',
+                  not result['publishable'] and result['failed_builds'] == ['linux'] and
+                  record['complete'] is None and record['candidate'] is None and
+                  not (folder / 'completed/linux').exists() and not (folder / 'bundle').exists())
+
+            if label == 'term':
+                saved_receipt = receipt_path.read_bytes()
+                saved_state = read(folder / 'state.json')
+                before_events = trace.read_bytes()
+                for invalid in (True, None, 0, 9, '15'):
+                    damaged = dict(receipt, supervisor_signal=invalid,
+                                   exit_code=128 + invalid if isinstance(invalid, int) else 0)
+                    encode(receipt_path, damaged)
+                    # Reproduce interruption before the first observation pin,
+                    # so the production schema gate, not hash drift, is tested.
+                    replay = json.loads(json.dumps(saved_state))
+                    previous = replay['jobs']['linux']['attempts'][0]
+                    previous.update(status='running', exit_code=None, completion_pending=True)
+                    previous.pop('driver_exit_sha256', None)
+                    encode(folder / 'state.json', replay)
+                    refusal = run(folder, 1, selected)
+                    refused_record = read(folder / 'state.json')['jobs']['linux']
+                    check('invalid supervisor signal ' + repr(invalid) + ' cannot authorize recovery',
+                          not refusal['publishable'] and refused_record['complete'] is None and
+                          len(refused_record['attempts']) == 1 and trace.read_bytes() == before_events and
+                          'invalid or unrelated driver exit receipt' in run.stderr)
+                receipt_path.write_bytes(saved_receipt)
+                encode(folder / 'state.json', saved_state)
+
+            observed = receipt_path.read_bytes()
+            completed = run(folder, selected=selected)
+            check(label + ': explicit healthy retry retains cancellation and runs one fresh attempt',
+                  completed['publishable'] and receipt_path.read_bytes() == observed and
+                  [(item['status'], item['exit_code']) for item in
+                   read(folder / 'state.json')['jobs']['linux']['attempts']] ==
+                  [('failed', 128 + signals[0]), ('completed', 0)])
+
+        folder = work / 'supervisor-post-seal'
+        result = run(folder, selected=selected, env=environment(folder, 'publication', [15]))
+        receipt = read(folder / 'attempts/linux/000001/driver-exit.json')
+        injection = read(work / (folder.name + '.signal.json'))
+        check('a signal within receipt publication is deferred until sealing finishes',
+              injection['point'] == 'publication' and 15 in injection['blocked'] and
+              receipt['wait_status'] == 0 and receipt['exit_code'] == 0 and
+              'supervisor_signal' not in receipt and result['publishable'])
+        before_events = trace.read_bytes()
+        completed = run(folder, selected=selected)
+        check('post-seal cancellation cannot revoke a verified receipt or force recompilation',
+              completed['publishable'] and trace.read_bytes() == before_events and
+              len(read(folder / 'state.json')['jobs']['linux']['attempts']) == 1)
+
+    if os.environ.get('DSR_BUILD_SUPERVISOR_ONLY') == '1':
+        supervisor_signal_cases()
+        print(f'Supervisor signal receipt tests: {passes} passed, 0 failed', flush=True)
+        print('Retained fixtures: ' + str(work), flush=True)
+        sys.exit(0)
     output = work/'builds'
     result = run(output, extra=('--dry-run','--jobs','2'))
     check('planning starts no builders and creates no state', result['status']=='planned' and not output.exists() and not trace.exists())
@@ -607,6 +734,7 @@ print(json.dumps(response))
     imported['builds']=[dict(next(j for j in read(output/'build-set.json')['builds'] if j['id']=='linux'),driver='import')]
     encode(work/'import.json',imported); before_trace=trace.read_bytes(); run(work/'import',selected=work/'import.json')
     check('pre-pinned imported builds need no compiler execution',trace.read_bytes()==before_trace)
+    supervisor_signal_cases()
     print(f'\nRelease build-plan execution: {passes} passed, 0 failed',flush=True)
 except Exception:
     print('Retained failing fixtures: '+str(work),file=sys.stderr)
