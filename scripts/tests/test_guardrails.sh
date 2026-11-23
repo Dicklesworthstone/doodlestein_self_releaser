@@ -504,9 +504,11 @@ test_command_deadline_consumers() {
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 module = Path(sys.argv[1])
 root = Path(tempfile.mkdtemp(prefix="dsr-command-deadlines-"))
@@ -635,6 +637,67 @@ run_with_timeout "$3" printf 'must not start\n'
 ''', "_", str(module), engine, duration], capture_output=True, text=True, timeout=5)
         check(engine + ": invalid deadline refuses before execution: " + duration,
               refused.returncode == 4 and refused.stdout == "")
+
+# Signal the live anchor itself, leaving the waiter to consume its receipt.
+# A descendant writes only after surviving TERM long enough to prove the
+# cancellation grace is retained, and must be gone before the API returns.
+anchor_payload = root / "signal-anchor.py"
+anchor_payload.write_text(r'''
+import os, signal, sys, time
+from pathlib import Path
+case = Path(sys.argv[1])
+if os.fork() == 0:
+    received = []
+    signal.signal(signal.SIGTERM, lambda *_: received.append(True))
+    (case / "child.pid").write_text(str(os.getpid()))
+    while not received:
+        time.sleep(0.01)
+    time.sleep(0.5)
+    (case / "grace").write_text("survived TERM\n")
+    time.sleep(30)
+    raise SystemExit(0)
+deadline = time.monotonic() + 5
+while not (case / "child.pid").exists():
+    if time.monotonic() >= deadline:
+        raise SystemExit(97)
+    time.sleep(0.01)
+os.kill(os.getpgrp(), int(sys.argv[2]))
+time.sleep(30)
+''')
+anchor_driver = r'''
+source "$1/guardrails.sh" || exit 90
+if [[ "$2" == portable ]]; then _dsr_timeout_cmd() { printf ''; }; fi
+run_with_timeout 15 "$3" "$4" "$5" "$6"
+'''
+for engine in ("system", "portable"):
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        label = engine + "/" + signal.Signals(signum).name
+        case = root / ("anchor-" + engine + "-" + str(int(signum)))
+        case.mkdir()
+        began = time.monotonic()
+        result = subprocess.run(
+            ["bash", "-c", anchor_driver, "_", str(module), engine,
+             sys.executable, str(anchor_payload), str(case), str(int(signum))],
+            input="", text=True, capture_output=True, timeout=23)
+        elapsed = time.monotonic() - began
+        (case / "stdout").write_text(result.stdout)
+        (case / "stderr").write_text(result.stderr)
+        check(label + ": anchor cancellation preserves the raw signal status",
+              result.returncode == 128 + signum and result.stdout == "")
+        check(label + ": cancellation retains the resistant descendant grace",
+              (case / "grace").exists() and elapsed >= 1.5)
+        state = "missing pid"
+        if (case / "child.pid").is_file():
+            pid = int((case / "child.pid").read_text())
+            for _ in range(50):
+                status = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
+                                        capture_output=True, text=True, timeout=5)
+                state = status.stdout.strip()
+                if not state or state.startswith("Z"):
+                    break
+                time.sleep(0.02)
+        check(label + ": cancellation drains the resistant descendant",
+              not state or state.startswith("Z"))
 
 empty_path = root / "no-executables"
 empty_path.mkdir()

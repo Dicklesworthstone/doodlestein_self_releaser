@@ -189,14 +189,21 @@ _dsr_timeout_group() {
     shift 4
     [[ "$input_fd" =~ ^[0-9]+$ && "$output_fd" =~ ^[0-9]+$ ]] || return 4
     local group_pid="$BASHPID" child="" finished=false cancelled=false
-    local control="" running="" status=0 read_status=0
+    local control="" running="" status=0 read_status=0 cancel_status=0
     local watchdog_read="" watchdog_write="" watchdog_pid="" watchdog_message="" expired=false
     local -a _DSR_TIMEOUT_WATCHDOG=()
     local _DSR_TIMEOUT_WATCHDOG_PID=""
     set +m
     trap - EXIT
-    trap 'cancelled=true' INT TERM HUP PIPE
+    trap '(( cancel_status != 0 )) || cancel_status=130; cancelled=true' INT
+    trap '(( cancel_status != 0 )) || cancel_status=143; cancelled=true' TERM
+    trap '(( cancel_status != 0 )) || cancel_status=129; cancelled=true' HUP
+    trap '(( cancel_status != 0 )) || cancel_status=141; cancelled=true' PIPE
     if ! IFS= read -r control || [[ "$control" != start ]] || $cancelled; then
+        if (( cancel_status != 0 )); then
+            printf 'exit:%s\n' "$cancel_status" || true
+            return "$cancel_status"
+        fi
         return 130
     fi
     if [[ -z "$timeout_command" ]]; then
@@ -212,6 +219,9 @@ _dsr_timeout_group() {
            ! IFS= read -r -u "$watchdog_read" watchdog_message ||
            [[ "$watchdog_message" != ready ]] || $cancelled; then
             trap '' INT TERM HUP PIPE
+            if (( cancel_status != 0 )); then
+                printf 'exit:%s\n' "$cancel_status" || true
+            fi
             kill -KILL -- "-$group_pid" 2>/dev/null || true
             return 4
         fi
@@ -241,6 +251,7 @@ _dsr_timeout_group() {
                 *$'\n'"$child"$'\n'*) ;;
                 *)
                     wait "$child" || status=$?
+                    $cancelled && break
                     $expired && status=124
                     finished=true
                     printf 'exit:%s\n' "$status" || break
@@ -257,6 +268,7 @@ _dsr_timeout_group() {
                     ;;
                 *) watchdog_message=error ;;
             esac
+            $cancelled && break
             case "$watchdog_message" in
                 '') ;;
                 deadline)
@@ -286,6 +298,11 @@ _dsr_timeout_group() {
         (( read_status > 128 )) || break
     done
     trap '' INT TERM HUP PIPE
+    if ! $finished && (( cancel_status != 0 )); then
+        # Report the cancellation before cleanup kills this live group anchor.
+        # Keep finished=false so resistant descendants still receive their grace.
+        printf 'exit:%s\n' "$cancel_status" || true
+    fi
     kill -TERM -- "-$group_pid" 2>/dev/null || true
     if ! $finished; then
         # Finish within the outer worker's cancellation grace.
