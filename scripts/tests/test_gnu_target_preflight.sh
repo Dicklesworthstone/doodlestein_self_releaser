@@ -119,7 +119,11 @@ command_case 'quoted target flag and value preserve explicit toolchain selection
 command_case 'quoted whole equals argument is admitted' "cargo zigbuild '--target=$BAD'" 0
 command_case 'double-quoted equals value is admitted' "cargo zigbuild --target=\"$BAD\"" 0
 command_case 'line continuation preserves the literal selector' $'cargo zigbuild --target \\\n'"$BAD" 0
-command_case 'concatenated quote fragments cannot bypass native parser limitations' "cargo zigbuild --target '$GOOD.'2.28" 4
+command_case 'literal quote fragments preserve the native explicit target selection' "cargo zigbuild --target '$GOOD.'2.28" 0
+command_case 'quote fragments cannot grant ordinary Cargo a Zig-qualified target' "cargo build --target '$GOOD.'2.28" 4
+command_case 'quote fragments cannot conceal conflicting target selections' "cargo zigbuild --target '$GOOD.'2.28 --target '$GOOD.'2.17" 4
+command_case 'quote fragments cannot conceal active command substitution' "cargo zigbuild --target '$GOOD.'\$(touch '$WORK/executed')2.28" 4
+command_case 'quote fragments cannot conceal active parameter expansion' "cargo zigbuild --target '$GOOD.'\${DSR_UNREVIEWED_FLOOR:-2.28}" 4
 command_case 'later repeated target is still inspected' "cargo zigbuild --target $GOOD --target $BAD" 4
 command_case 'command-scoped Cargo target assignment is refused' "CARGO_BUILD_TARGET='$BAD' cargo build --release" 4
 command_case 'command-scoped DSR target assignment is refused' "env DSR_TARGET_TRIPLE=$ARM cargo build --release" 4

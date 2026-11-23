@@ -3647,6 +3647,11 @@ EOF
     # The coordinator receives this same digest rather than recapturing a
     # potentially changed recipe after synchronization.
     local build_repo_config_sha256
+    if [[ ! -f "$ACT_REPOS_DIR/${tool_name}.yaml" ]]; then
+        log_error "Tool '$tool_name' not found in repos.d"
+        log_info "Available tools: $(act_list_tools 2>/dev/null | tr '\n' ' ')"
+        return 4
+    fi
     build_repo_config_sha256=$(_act_sha256 "$ACT_REPOS_DIR/${tool_name}.yaml") || return 4
     [[ "$build_repo_config_sha256" =~ ^[0-9a-f]{64}$ ]] || return 4
 

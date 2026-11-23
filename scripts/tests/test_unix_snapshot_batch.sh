@@ -516,6 +516,7 @@ from pathlib import Path, PurePosixPath
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import zlib
 
@@ -628,7 +629,13 @@ check('production manifest contains every exact recursive Git blob and gitlink',
 check('production manifest retains nested and empty repository boundaries',
       all(rows[path][1] == '160000' for path in ('vendor/dep', 'vendor/dep/nested/leaf', 'vendor/dep/empty', 'vendor/standalone')))
 source = work / 'selected-source'; source.mkdir()
-run(['tar', '-xf', str(archive), '-C', str(source)], check=True)
+# Verify the archive's mode authority as well as its extracted representation.
+# The fixture deliberately uses umask 077; request preserved permissions so
+# the test's extractor cannot strip the bits it is about to verify.
+with tarfile.open(archive) as selected_archive:
+    check('production archive records the exact child executable mode',
+          selected_archive.getmember('vendor/dep/run.sh').mode == 0o755)
+run(['tar', '-xpf', str(archive), '-C', str(source)], check=True)
 check('production archive contains pinned child and nested contents',
       (source / 'vendor/dep/data.txt').read_bytes() == b'pinned child source\n' and
       (source / 'vendor/dep/nested/leaf/leaf.txt').read_bytes() == b'pinned nested source\n')
@@ -757,10 +764,16 @@ check('missing child object cannot produce a successful recovery hash',
       call('_act_git_archive_sha256', project, revision).returncode != 0)
 held_object.rename(object_file)
 original_object = object_file.read_bytes()
+# Git stores loose objects read-only. Inject the corrupt bytes as their owner
+# so this negative control also runs without root privileges, then restore
+# both the original contents and permissions before the recovery proof.
+original_object_mode = object_file.stat().st_mode & 0o777
+object_file.chmod(original_object_mode | 0o200)
 object_file.write_bytes(zlib.compress(b'blob 6\x00forged'))
 check('validly encoded object with wrong content hash refuses native export',
       call('_act_write_git_archive_evidence', project, revision, work / 'wrong-object.tar').returncode != 0)
 object_file.write_bytes(original_object)
+object_file.chmod(original_object_mode)
 
 marker = child / '.git'; original_marker = marker.read_bytes()
 external = work / 'external-git-administration'

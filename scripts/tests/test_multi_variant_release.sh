@@ -177,7 +177,7 @@ MUSL_SHA=$(_gh_asset_sha256 "$WORK/producer/$MUSL_NAME") || exit 1
 act_check() { return 0; }
 act_check_prereqs() { return 0; }
 act_orchestrate_build() {
-    local tool="$1" version="$2" run result requested_run="$RUN"
+    local tool="$1" version="$2" run result workflow_event requested_run="$RUN"
     printf '%s\n' "$*" >> "$ORCHESTRATION_CALLS"
     [[ "$tool" == variantdemo && "$version" == 1.2.3 ]] || return 4
     shift 2
@@ -194,11 +194,14 @@ act_orchestrate_build() {
     done
     run=$(DSR_RUN_ID="$requested_run" build_state_create "$tool" "$version" "$PLATFORM") || return 4
     build_state_update_status "$tool" "$version" running "$run" || return 4
+    workflow_event=$(_act_workflow_event_plan_json "$tool" "$version") || return 4
     result=$(jq -nc --arg tool "$tool" --arg version "$version" --arg run "$run" \
-        --arg platform "$PLATFORM" --arg directory "$WORKFLOW_ARTIFACTS" --arg source "$SOURCE_SHA" '
+        --arg platform "$PLATFORM" --arg directory "$WORKFLOW_ARTIFACTS" --arg source "$SOURCE_SHA" \
+        --argjson workflow_event "$workflow_event" '
         {tool:$tool,version:$version,run_id:$run,status:"success",git_sha:$source,git_ref:"v1.2.3",
          build_purpose:"release",publishable:true,summary:{total:1,success:1,failed:0},
-         targets:[{platform:$platform,method:"act",host:"local",status:"success",artifact_dir:$directory}]}') || return 4
+         targets:[{platform:$platform,method:"act",host:"local",status:"success",artifact_dir:$directory,
+                   workflow_event:$workflow_event}]}') || return 4
     build_state_update_target "$tool" "$version" "$PLATFORM" completed \
         "$(jq -c '{result:.targets[0]}' <<< "$result")" "$run" || return 4
     printf '%s\n' "$result"
@@ -470,15 +473,23 @@ cp "$WORK/reviewed-config.yaml" "$WORK/config/repos.d/variantdemo.yaml" || exit 
 mkdir "$WORK/primary-name" || exit 1
 cp "$WORK/producer/$GNU_NAME" "$WORK/primary-name/variantdemo-1.2.3.tar.gz" || exit 1
 result=$(jq -nc --arg directory "$WORK/primary-name" --arg platform "$PLATFORM" \
-    --arg source "$SOURCE_SHA" --arg run "$RUN" '
+    --arg source "$SOURCE_SHA" --arg run "$RUN" \
+    --argjson workflow_event "$(_act_workflow_event_plan_json variantdemo 1.2.3)" '
     {tool:"variantdemo",version:"1.2.3",run_id:$run,status:"success",git_sha:$source,git_ref:"v1.2.3",
-     summary:{total:1,success:1,failed:0},targets:[{platform:$platform,method:"act",status:"success",artifact_dir:$directory}]}') || exit 1
+     summary:{total:1,success:1,failed:0},targets:[{platform:$platform,method:"act",status:"success",artifact_dir:$directory,
+                                                workflow_event:$workflow_event}]}') || exit 1
 run_code 'a generic workflow filename records the configured primary variant' 0 "$WORK/primary-name-result" \
     act_generate_manifest "$result" "$WORK/primary-name-manifest.json"
 check 'primary-name inference preserves explicit identity and actual bytes' jq -e \
     --arg triple "$GNU_TRIPLE" --arg sha "$GNU_SHA" '
     (.artifacts|length)==1 and .artifacts[0].target_triple==$triple and .artifacts[0].sha256==$sha' \
     "$WORK/primary-name-manifest.json"
+for custody_change in 'del(.targets[0].workflow_event)' '.targets[0].workflow_event.payload.ref="refs/tags/v9.9.9"'; do
+    changed_result=$(jq -c "$custody_change" <<< "$result") || exit 1
+    run_code 'missing or changed workflow event custody withholds the manifest' 4 \
+        "$WORK/workflow-custody-refusal" act_generate_manifest "$changed_result" "$WORK/workflow-custody-manifest.json"
+    check 'workflow custody refusal leaves no completed manifest' test ! -e "$WORK/workflow-custody-manifest.json"
+done
 for case_name in two-name-triples contradictory-marker; do
     directory="$WORK/$case_name"
     mkdir "$directory" || exit 1
@@ -486,9 +497,11 @@ for case_name in two-name-triples contradictory-marker; do
     [[ "$case_name" != two-name-triples ]] || name="variantdemo-1.2.3-$GNU_TRIPLE-$MUSL_TRIPLE.tar.gz"
     cp "$WORK/producer/$GNU_NAME" "$directory/$name" || exit 1
     result=$(jq -nc --arg directory "$directory" --arg platform "$PLATFORM" \
-        --arg source "$SOURCE_SHA" --arg run "$RUN" '
+        --arg source "$SOURCE_SHA" --arg run "$RUN" \
+        --argjson workflow_event "$(_act_workflow_event_plan_json variantdemo 1.2.3)" '
         {tool:"variantdemo",version:"1.2.3",run_id:$run,status:"success",git_sha:$source,git_ref:"v1.2.3",
-         summary:{total:1,success:1,failed:0},targets:[{platform:$platform,method:"act",status:"success",artifact_dir:$directory}]}') || exit 1
+         summary:{total:1,success:1,failed:0},targets:[{platform:$platform,method:"act",status:"success",artifact_dir:$directory,
+                                                    workflow_event:$workflow_event}]}') || exit 1
     run_code "$case_name cannot become a publishable manifest" 4 "$WORK/$case_name-result" \
         act_generate_manifest "$result" "$WORK/$case_name-manifest.json"
     check "$case_name leaves no completed manifest" test ! -e "$WORK/$case_name-manifest.json"

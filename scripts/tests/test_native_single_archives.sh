@@ -273,6 +273,10 @@ _test_native_packaging() {
     local -a additional_artifact_receipts=()
     local host=act language=go build_env='' build_profile=release ssh_destination=''
     local artifact_source_root="$DSR_TEST_ARCHIVE_INPUTS" output_stage_root='' additional_json='[]'
+    # This extraction starts after native command-output discovery. Its input
+    # is the supplied compiled file, not a Go command whose outputs need
+    # resolution; retain the production default for that earlier context.
+    local go_output_plan=null go_outputs=null go_output_directory=''
     local download_failed=false
     workspace_binaries=$(_act_workspace_binaries_for_target "$config_file" "$platform") || return $?
     binary_name=$(jq -r '.binary_name' "$config_file") || return 4

@@ -250,6 +250,29 @@ class InvocationBoundaryTests(unittest.TestCase):
         with self.assertRaisesRegex(Refused, 'versioned targets'):
             invoke('cargo zigbuild', environment={'CARGO_BUILD_TARGET': TRIPLE + '.2.28'})
 
+    def test_explicit_zig_literal_fragments_keep_shell_bytes_and_task_identity(self):
+        program = '''source "$1" || exit $?;
+_act_validate_native_target_command "$2" "$3" "$4" || exit $?;
+_act_explicit_zigbuild_selection "$2" "$3"'''
+        for target in (TRIPLE, 'aarch64-unknown-linux-gnu'):
+            environment = 'CARGO_BUILD_TARGET=' + target + '\nDSR_TARGET_TRIPLE=' + target
+            for literal in ("'" + target + ".'2.28", '"' + target + '.2."28'):
+                with self.subTest(target=target, literal=literal):
+                    shell_bytes = subprocess.run(['bash', '-c', "printf '%s' " + literal],
+                                                 capture_output=True, check=True, timeout=10).stdout
+                    self.assertEqual(shell_bytes, (target + '.2.28').encode())
+                    command = 'cargo zigbuild --target ' + literal
+                    result = subprocess.run(['bash', '-c', program, '_', str(MODULE), command,
+                                             environment, target], text=True, capture_output=True, timeout=30)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(json.loads(result.stdout), {
+                        'rust_target': target, 'zig_target': shell_bytes.decode(), 'glibc_floor': '2.28'})
+                    wrong_target = 'aarch64-unknown-linux-gnu' if target == TRIPLE else TRIPLE
+                    result = subprocess.run(['bash', '-c', program, '_', str(MODULE), command,
+                                             environment, wrong_target], text=True, capture_output=True, timeout=30)
+                    self.assertEqual(result.returncode, 4, result.stderr)
+                    self.assertEqual(result.stdout, '')
+
     def test_unversioned_zig_targets_request_dispatch_without_a_glibc_floor(self):
         for target in (TRIPLE, 'aarch64-unknown-linux-gnu', 'x86_64-unknown-linux-musl',
                        'aarch64-unknown-linux-musl', 'aarch64-apple-darwin'):
