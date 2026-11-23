@@ -4,8 +4,9 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 MODULE="${DISPATCH_TEST_MODULE:-$ROOT/src/dispatch.sh}"
 TEST_MODE="${1:-}"
-[[ $# -eq 0 || ( $# -eq 1 && "$TEST_MODE" == --batch-interruption-only ) ]] || {
-    printf 'Usage: %s [--batch-interruption-only]\n' "$0" >&2
+[[ $# -eq 0 || ( $# -eq 1 && ( "$TEST_MODE" == --batch-interruption-only ||
+    "$TEST_MODE" == --credential-interruption-only ) ) ]] || {
+    printf 'Usage: %s [--batch-interruption-only|--credential-interruption-only]\n' "$0" >&2
     exit 4
 }
 WORK=$(mktemp -d)
@@ -70,6 +71,11 @@ cat > "$WORK/bin/gh" <<'GH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$DP_TEST_CASE/gh-calls"
 [[ "$*" == 'auth token --hostname github.com' ]] || exit 9
+if [[ "$(wc -l < "$DP_TEST_CASE/gh-calls")" == "${DP_AUTH_STOP_AT:-0}" ]]; then
+    printf '%s' 'discarded-helper-token'
+    if [[ "${DP_AUTH_STOP_STATUS:-130}" == signal ]]; then kill -TERM "$$"; exit 99; fi
+    exit "${DP_AUTH_STOP_STATUS:-130}"
+fi
 if [[ "${DP_READ_STDIN:-false}" == true ]]; then
     cat > "$DP_TEST_CASE/stdin-$BASHPID"
 fi
@@ -90,7 +96,7 @@ new_case() {
     CASE="$WORK/cases/$1"; mkdir "$CASE"; export DP_TEST_CASE="$CASE"
     export DSR_STATE_DIR="$CASE/state"
     : > "$CASE/calls"; : > "$CASE/argv"; : > "$CASE/gh-calls"
-    unset DP_MODE DP_READ_STDIN DP_AUTH_STALL DP_STOP_STATUS DRY_RUN
+    unset DP_MODE DP_READ_STDIN DP_AUTH_STALL DP_STOP_STATUS DP_AUTH_STOP_AT DP_AUTH_STOP_STATUS DRY_RUN
     export DSR_GH_TOKEN=dsr-explicit GITHUB_TOKEN=github-other GH_TOKEN=gh-other
 }
 capture() { status=0; "$@" > "$CASE/out" 2> "$CASE/err" || status=$?; }
@@ -111,6 +117,107 @@ auth_inputs_empty() {
         return 1
     }
 }
+
+# The real credential supervisor is used for both supported helper paths. A
+# token emitted before an unsuccessful helper exit must never authorize curl.
+with_credential_helper() (
+    local provider="$1"; shift
+    unset DSR_GH_TOKEN GITHUB_TOKEN GH_TOKEN
+    unset -f secrets_get_gh_token gh
+    if [[ "$provider" == secrets ]]; then
+        secrets_get_gh_token() { gh auth token --hostname github.com; }
+    fi
+    "$@"
+)
+
+if [[ "$TEST_MODE" != --batch-interruption-only ]]; then
+    for provider in gh secrets; do
+        for stopped in 2 130 137; do
+            for lookup in 1 2; do
+                new_case "credential-$provider-$stopped-$lookup"
+                export DP_AUTH_STOP_AT="$lookup" DP_AUTH_STOP_STATUS="$stopped"
+                capture with_credential_helper "$provider" dispatch_event owner/repo release
+                check "$provider cancellation $stopped at lookup $lookup stops delivery" test "$status" -eq 5
+                check "$provider cancellation $stopped at lookup $lookup sends no POST" test "$(count)" -eq 0
+                check "$provider cancellation $stopped at lookup $lookup stops credential reads" \
+                    test "$(wc -l < "$CASE/gh-calls")" -eq "$lookup"
+                check "$provider cancellation $stopped at lookup $lookup is known unsent" jq -e \
+                    '.outcome=="blocked" and .exit_code==5 and .attempts==0 and .http_status==null and
+                     (has("interruption")|not)' "$CASE/out"
+                check "$provider cancelled token is not exposed" absent_text "$CASE/out" discarded-helper-token
+            done
+        done
+    done
+
+    new_case credential-actual-signal
+    export DP_AUTH_STOP_AT=2 DP_AUTH_STOP_STATUS=signal
+    capture with_credential_helper gh dispatch_event owner/repo release
+    check 'actually signalled credential helper stops before POST' test "$status,$(count)" = '5,0'
+    check 'actually signalled credential helper retains a zero-attempt refusal' jq -e \
+        '.outcome=="blocked" and .exit_code==5 and .attempts==0 and .http_status==null' "$CASE/out"
+
+    new_case credential-exported-functions
+    export DP_AUTH_STOP_AT=2 DP_AUTH_STOP_STATUS=130
+    capture with_credential_helper gh bash -c 'dispatch_event owner/repo release'
+    check 'exported dispatch functions preserve credential cancellation in a fresh Bash' \
+        test "$status,$(count)" = '5,0'
+    check 'fresh Bash retains known-unsent credential refusal' jq -e \
+        '.outcome=="blocked" and .exit_code==5 and .attempts==0 and .http_status==null' "$CASE/out"
+
+    new_case credential-ordinary-failure
+    export DP_AUTH_STOP_AT=2 DP_AUTH_STOP_STATUS=1
+    capture with_credential_helper gh dispatch_event owner/repo release
+    check 'ordinary credential failure keeps dependency status and sends no POST' test "$status,$(count)" = '3,0'
+    check 'ordinary credential refusal is not marked as cancellation' jq -e \
+        '.outcome=="blocked" and .exit_code==3 and .attempts==0' "$CASE/out"
+
+    for lookup in 1 2; do
+        new_case "credential-receipt-failure-$lookup"
+        export DP_AUTH_STOP_AT="$lookup" DP_AUTH_STOP_STATUS=130
+        failed_credential_receipt() (
+            _dp_result() { return 19; }
+            with_credential_helper gh dispatch_event owner/repo release
+        )
+        capture failed_credential_receipt
+        check "credential cancellation $lookup survives failed receipt encoding" test "$status" -eq 5
+        check "failed credential receipt $lookup never permits a POST" test "$(count)" -eq 0
+    done
+
+    for scheduling in serial parallel; do
+        new_case "credential-batch-$scheduling"
+        batch_args=()
+        [[ "$scheduling" != parallel ]] || batch_args=(--parallel)
+        credential_batch() (
+            unset DSR_GH_TOKEN GITHUB_TOKEN GH_TOKEN
+            secrets_get_gh_token() {
+                # The sourceable helper can observe its caller's delivery
+                # identity. This makes concurrent worker admission deterministic.
+                printf '%s\n' "${repo:-preflight}" >> "$DP_TEST_CASE/helper-calls"
+                [[ "${repo:-}" != owner/b ]] || return 130
+                printf fixture-token
+            }
+            dispatch_batch --event release --repos owner/a,owner/b,owner/c,owner/d \
+                ${batch_args[@]+"${batch_args[@]}"}
+        )
+        capture credential_batch
+        check "$scheduling batch stops after credential cancellation" test "$status" -eq 5
+        check "$scheduling batch retains its already admitted peer only" test "$(count)" -eq 1
+        check "$scheduling batch never reads credentials for later targets" \
+            absent_text "$CASE/helper-calls" owner/c
+        check "$scheduling batch never admits the final target" absent_text "$CASE/helper-calls" owner/d
+        check "$scheduling batch distinguishes accepted, blocked and pending work" jq -e \
+            '.exit_code==5 and (.results|length)==4 and
+             (.results[0] | .outcome=="accepted" and .attempts==1) and
+             (.results[1] | .outcome=="blocked" and .exit_code==5 and .attempts==0) and
+             all(.results[2:][]; .outcome=="pending" and .exit_code==5 and .attempts==0)' "$CASE/out"
+    done
+fi
+
+if [[ "$TEST_MODE" == --credential-interruption-only ]]; then
+    printf '\nDispatch credential interruption checks: %d; failures: %d\n' "$checks" "$failures"
+    [[ "$failures" -eq 0 ]]
+    exit $?
+fi
 
 # Cancellation applies to the whole batch, including serial delivery. Already
 # admitted parallel siblings finish and retain their actual acknowledgements;

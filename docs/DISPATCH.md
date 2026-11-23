@@ -211,6 +211,16 @@ supervisor status in the uncertain receipt. Neither is replayed automatically.
 Each lookup and transport has its own deadline; this setting is not a
 whole-release deadline.
 
+Cancelling a credential helper stops the invocation with exit `5` before any
+later destination starts. This applies to both authentication preflight and the
+final token lookup immediately before a POST. If that final lookup stops, the
+current delivery is `blocked` with zero HTTP attempts, so ordinary recovery may
+retry it without `--retry-uncertain`. Earlier accepted deliveries retain their
+history and later destinations remain pending. A credential helper's own signal
+exit is distinguished from expiration of DSR's credential deadline; the latter
+keeps the dependency-error behavior described above. Cancellation remains terminal
+even if the result receipt cannot be encoded.
+
 ## API and structured output
 
 The sourced APIs are `dispatch_event`, `dispatch_batch`, `dispatch_release`, and

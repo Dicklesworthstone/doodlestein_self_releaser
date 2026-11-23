@@ -28,6 +28,16 @@ _dp_transport_stopped() {
       (status >= 129 && status <= 255)))
 }
 
+# gh reserves 2 for user cancellation. A credential helper may also report
+# DSR's interrupted status or a signal exit. Normalize these BEFORE returning
+# through the supervisor so an actual helper SIGKILL (137) stays distinct from
+# the supervisor's existing credential-deadline classification.
+_dp_auth_cancelled() {
+    local status="${1:-0}"
+    [[ "$status" =~ ^[0-9]+$ ]] || return 1
+    ((status == 2 || status == 5 || (status >= 129 && status <= 255)))
+}
+
 _dp_body() {
     local event="$1" payload="$2"
     [[ -n "$event" && "$event" != *[[:cntrl:]]* ]] || return 4
@@ -45,12 +55,20 @@ _dp_body() {
 
 _dp_resolve_token() (
     set +x
-    local token="${DSR_GH_TOKEN:-${GITHUB_TOKEN:-${GH_TOKEN:-}}}"
+    local token="${DSR_GH_TOKEN:-${GITHUB_TOKEN:-${GH_TOKEN:-}}}" status=0
     if [[ -z "$token" ]] && command -v secrets_get_gh_token >/dev/null; then
-        token=$(secrets_get_gh_token 2>/dev/null) || return 3
+        token=$(secrets_get_gh_token 2>/dev/null) || status=$?
+    fi
+    if ((status != 0)); then
+        _dp_auth_cancelled "$status" && return 5
+        return 3
     fi
     if [[ -z "$token" ]] && command -v gh >/dev/null; then
-        token=$(GH_HOST=github.com gh auth token --hostname github.com 2>/dev/null) || return 3
+        token=$(GH_HOST=github.com gh auth token --hostname github.com 2>/dev/null) || status=$?
+    fi
+    if ((status != 0)); then
+        _dp_auth_cancelled "$status" && return 5
+        return 3
     fi
     [[ "$token" =~ ^[A-Za-z0-9_.-]+$ ]] || return 3
     printf '%s' "$token"
@@ -73,13 +91,21 @@ _dp_get_token() (
     if (( status != 0 )); then
         if (( status == 124 || status == 137 )); then
             _dp_log_error "GitHub credential lookup exceeded ${seconds}s"
+        elif _dp_auth_cancelled "$status"; then
+            return 5
         fi
         return 3
     fi
 )
 
 dispatch_check_auth() {
-    _dp_get_token >/dev/null && return 0
+    local status=0
+    _dp_get_token >/dev/null || status=$?
+    ((status != 0)) || return 0
+    if ((status == 5)); then
+        _dp_log_error 'GitHub credential lookup cancelled'
+        return 5
+    fi
     _dp_log_error 'GitHub authentication required (DSR_GH_TOKEN, GITHUB_TOKEN, GH_TOKEN, or gh auth)'
     return 3
 }
@@ -100,7 +126,7 @@ _dp_config() {
 _dp_http() (
     set +x
     local repo="$1" body="$2" dir="$3" token
-    token=$(_dp_get_token) || return 3
+    token=$(_dp_get_token) || return $?
     printf 'header = "Authorization: Bearer %s"\n' "$token" |
         run_with_timeout "${DISPATCH_TIMEOUT:-30}" \
         curl -q --config - --silent --show-error --proto '=https' \
@@ -139,7 +165,10 @@ _dp_result() {
 # A known failure before any HTTP invocation is safe to retry normally. Keep
 # it distinct from a missing receipt after the transport may have run.
 _dp_blocked_result() {
-    _dp_result "$1" "$2" blocked "$3" 0 '' || return 1
+    _dp_result "$1" "$2" blocked "$3" 0 '' || {
+        (( $3 == 5 )) && return 5
+        return 1
+    }
     return "$3"
 }
 
@@ -152,7 +181,10 @@ _dp_deliver() (
     [[ -z "$guard" ]] || declare -F "$guard" >/dev/null || {
         _dp_blocked_result "$repo" "$event" 3; return $?;
     }
-    dispatch_check_auth || { _dp_blocked_result "$repo" "$event" 3; return $?; }
+    dispatch_check_auth || {
+        rc=$?
+        _dp_blocked_result "$repo" "$event" "$rc"; return $?
+    }
     command -v curl >/dev/null || {
         _dp_log_error 'curl is required'
         _dp_blocked_result "$repo" "$event" 3; return $?
@@ -188,12 +220,12 @@ _dp_deliver() (
             ((stopped == 0)) || code=5
             break
         fi
-        # _dp_http returns 3 without invoking curl when its last token lookup
-        # fails. Curl's write-out supplies a status (including 000) when it
-        # runs; a nonempty or unreadable response is never proof of no POST.
-        if (( rc == 3 )) && [[ -z "$http" ]]; then
+        # Credential refusal (3) or cancellation (5) before curl is known
+        # unsent. Curl's own 3/5 errors emit a write-out status, including 000;
+        # never confuse those actual transport attempts with this boundary.
+        if (( rc == 3 || rc == 5 )) && [[ -z "$http" ]]; then
             attempt=$((attempt - 1))
-            outcome=blocked; code=3; break
+            outcome=blocked; code="$rc"; break
         fi
         [[ "$http" =~ ^[0-9]{3}$ ]] || http=''
         if (( rc != 0 )); then
@@ -242,7 +274,7 @@ _dp_deliver() (
     _dp_log_info "$repo: $outcome (HTTP ${http:-unknown}, attempts $attempt)"
     [[ "$outcome" == rate_limited ]] || retry_at=null
     _dp_result "$repo" "$event" "$outcome" "$code" "$attempt" "$http" "$retry_at" "$stopped" || {
-        ((stopped == 0)) || return 5
+        ((code == 5 || stopped != 0)) && return 5
         return 1
     }
     return "$code"
@@ -618,7 +650,7 @@ _dp_release_outbox() (
         esac
         # Missing credentials/dependencies cannot create an ambiguous sending
         # record, and complete accepted retries never need credentials at all.
-        dispatch_check_auth || { rc=3; break; }
+        dispatch_check_auth || { rc=$?; break; }
         command -v curl >/dev/null || { rc=3; break; }
         repo=$(jq -r --argjson i "$i" '.plan.requests[$i].repo' <<< "$state") || return 1
         body=$(jq -r --argjson i "$i" '.plan.requests[$i].body' <<< "$state") || return 1
@@ -768,7 +800,7 @@ dispatch_release_json() (
     return "$rc"
 )
 
-export -f _dp_log_error _dp_log_info _dp_repo _dp_int _dp_transport_stopped _dp_body _dp_resolve_token _dp_get_token
+export -f _dp_log_error _dp_log_info _dp_repo _dp_int _dp_transport_stopped _dp_auth_cancelled _dp_body _dp_resolve_token _dp_get_token
 export -f _dp_config _dp_http _dp_header _dp_result _dp_blocked_result _dp_deliver _dp_repos
 export -f _dp_digest_text _dp_state_hash _dp_release_plan _dp_outbox_identity _dp_state_valid _dp_state_write
 export -f _dp_outbox_summary _dp_release_outbox

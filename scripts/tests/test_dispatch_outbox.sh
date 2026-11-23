@@ -5,8 +5,9 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 MODULE="${DISPATCH_TEST_MODULE:-$ROOT/src/dispatch.sh}"
 TEST_MODE="${1:-}"
-[[ $# -eq 0 || ( $# -eq 1 && "$TEST_MODE" == --interruption-only ) ]] || {
-    printf 'Usage: %s [--interruption-only]\n' "$0" >&2
+[[ $# -eq 0 || ( $# -eq 1 && ( "$TEST_MODE" == --interruption-only ||
+    "$TEST_MODE" == --credential-interruption-only ) ) ]] || {
+    printf 'Usage: %s [--interruption-only|--credential-interruption-only]\n' "$0" >&2
     exit 4
 }
 WORK=$(mktemp -d)
@@ -62,6 +63,10 @@ if [[ "${DP_STDIN_CONSUMER:-}" == auth ]]; then
 fi
 printf 'lookup\n' >> "$DP_CASE/auth-lookups"
 lookups=$(wc -l < "$DP_CASE/auth-lookups")
+if (( lookups == ${DP_AUTH_STOP_AT:-0} )); then
+    printf '%s' discarded-helper-token
+    exit "${DP_AUTH_STOP_STATUS:-130}"
+fi
 if (( lookups == ${DP_AUTH_FAIL_AT:-0} )); then exit 1; fi
 if (( lookups == ${DP_AUTH_STALL_AT:-0} )); then sleep 4; fi
 printf '%s' fixture-token
@@ -79,7 +84,7 @@ check() {
 new_case() {
     CASE="$WORK/cases/$1"; mkdir "$CASE"
     export DP_CASE="$CASE" DSR_STATE_DIR="$CASE/state" DSR_GH_TOKEN=fixture-token
-    unset DP_MODE DP_AUTH_FAIL_AT DP_AUTH_STALL_AT DP_PREPARE_FAIL DP_STDIN_CONSUMER DP_STOP_STATUS DP_STOP_HTTP DRY_RUN
+    unset DP_MODE DP_AUTH_FAIL_AT DP_AUTH_STALL_AT DP_AUTH_STOP_AT DP_AUTH_STOP_STATUS DP_PREPARE_FAIL DP_STDIN_CONSUMER DP_STOP_STATUS DP_STOP_HTTP DRY_RUN
     : > "$CASE/calls.jsonl"
 }
 capture() { status=0; "$@" > "$CASE/out" 2> "$CASE/err" || status=$?; }
@@ -114,6 +119,75 @@ stdin_six_release() {
             false false stdin_consuming_guard
     fi
 }
+
+# Credential cancellation is known-unsent, including after the durable sending
+# intent. It stops later targets without turning ordinary recovery into an
+# uncertain resend or discarding an already accepted destination.
+if [[ "$TEST_MODE" != --interruption-only ]]; then
+    for pair in 1:2 2:130 3:130 6:130; do
+        lookup="${pair%:*}" stopped="${pair#*:}"
+        new_case "credential-stop-$lookup"
+        export DP_AUTH_STOP_AT="$lookup" DP_AUTH_STOP_STATUS="$stopped"
+        capture with_rotating_auth release --repos owner/a,owner/b,owner/c
+        check "credential stop $lookup returns interruption" test "$status" -eq 5
+        expected_posts=0
+        [[ "$lookup" != 6 ]] || expected_posts=1
+        check "credential stop $lookup performs no later POST" test "$(count)" -eq "$expected_posts"
+        check "credential stop $lookup performs no later credential read" \
+            test "$(wc -l < "$CASE/auth-lookups")" -eq "$lookup"
+        STATE=$(state_path)
+        accepted_before=$(jq -Sc '[.deliveries[]|select(.history[-1].outcome=="accepted")]' "$STATE")
+        if [[ "$lookup" == 1 ]]; then
+            check 'preflight cancellation leaves all work pending' jq -e \
+                'all(.deliveries[]; .history==[])' "$STATE"
+        else
+            check "credential stop $lookup records only known-unsent refused work" jq -e \
+                --argjson accepted "$expected_posts" '
+                (.deliveries[$accepted].history | length==1 and
+                    (.[0] | .outcome=="blocked" and .resend_uncertain==false and
+                     (.receipt | .outcome=="blocked" and .exit_code==5 and .attempts==0 and
+                      .http_status==null and (has("interruption")|not)))) and
+                all(.deliveries[($accepted+1):][]; .history==[])' "$STATE"
+        fi
+        capture without_auth release --repos owner/a,owner/b,owner/c --status
+        check "credential stop $lookup remains inspectable without credentials" test "$status" -eq 1
+        check "credential stop $lookup inspection leaves requests untouched" test "$(count)" -eq "$expected_posts"
+        unset DP_AUTH_STOP_AT DP_AUTH_STOP_STATUS
+        capture release --repos owner/a,owner/b,owner/c
+        if ((status != 0)); then
+            printf 'Credential recovery %s failed with exit %s:\n' "$lookup" "$status"
+            cat "$CASE/err" "$CASE/out"
+        fi
+        check "credential stop $lookup recovers without uncertain resend" test "$status" -eq 0
+        check "credential stop $lookup recovery sends each destination once" test "$(count)" -eq 3
+        check "credential stop $lookup recovery preserves accepted peer evidence" jq -e \
+            --argjson before "$accepted_before" \
+            '.deliveries as $current | all($before[]; . as $saved | any($current[]; .==$saved))' "$STATE"
+        check "credential stop $lookup recovery has no uncertain retry" jq -e \
+            'all(.deliveries[]; .history[-1].outcome=="accepted" and all(.history[]; .resend_uncertain==false))' "$STATE"
+    done
+
+    new_case credential-stop-after-rate-limit
+    export DP_MODE=elapsed DP_AUTH_STOP_AT=4 DP_AUTH_STOP_STATUS=130
+    capture with_rotating_auth release --repos owner/b,owner/c
+    check 'credential cancellation after rate limiting stops the invocation' test "$status" -eq 5
+    check 'credential cancellation after rate limiting starts no later POST' test "$(count)" -eq 1
+    STATE=$(state_path)
+    check 'credential cancellation preserves actual rejected attempts and pending peers' jq -e \
+        '(.deliveries[0].history[0].receipt | .outcome=="blocked" and .exit_code==5 and
+         .attempts==1 and .http_status==null) and .deliveries[1].history==[]' "$STATE"
+    unset DP_MODE DP_AUTH_STOP_AT DP_AUTH_STOP_STATUS
+    capture release --repos owner/b,owner/c
+    check 'known rejected attempt recovers with ordinary retry after cancellation' test "$status,$(count)" = '0,3'
+    check 'credential recovery never claims uncertain resend consent' jq -e \
+        'all(.deliveries[].history[]; .resend_uncertain==false)' "$STATE"
+fi
+
+if [[ "$TEST_MODE" == --credential-interruption-only ]]; then
+    printf '\nDispatch credential outbox checks: %d; failures: %d\n' "$checks" "$failures"
+    [[ "$failures" -eq 0 ]]
+    exit $?
+fi
 
 # Curl's exit/status boundary is injected; the real outbox, supervisor, files,
 # hashes and subprocesses run. An HTTP 204 body cannot acknowledge a stopped
