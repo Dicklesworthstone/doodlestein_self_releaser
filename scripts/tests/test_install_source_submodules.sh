@@ -15,7 +15,7 @@ TEST_MODE="${1:-}"
     exit 4
 }
 dependencies=(git jq go ps tar cmp)
-[[ "$TEST_MODE" != --admission-only ]] || dependencies=(git jq cmp)
+[[ "$TEST_MODE" != --admission-only ]] || dependencies=(git jq cmp tar)
 [[ "$TEST_MODE" != --shipped-only ]] || dependencies+=(python3)
 for dependency in "${dependencies[@]}"; do
     command -v "$dependency" >/dev/null 2>&1 || {
@@ -114,6 +114,55 @@ test_source_admission() (
     check 'post-build verification still admits untracked compiler output' equal "$STATUS" 0
     check 'untracked compiler output does not alter pinned source fingerprint' \
         equal "$(cat "$base/pristine/after-output")" "$digest"
+
+    # Ambient Git templates and core.worktree can redirect a successful
+    # checkout outside the owned source directory. Exercise real acquisition
+    # and admission with an unrelated caller repository, retaining its exact
+    # files/modes and the global URL rewrite used by ordinary Git credentials.
+    local isolation_label isolation caller
+    for isolation_label in template-environment template-config worktree-config repository-environment; do
+        isolation="$base/isolation-$isolation_label"
+        caller="$isolation/caller"
+        mkdir -p "$isolation/template/hooks" && git init -q "$caller" || return 1
+        printf 'unrelated caller work\n' > "$caller/keep.txt"
+        cp -- "$GIT_CONFIG_GLOBAL" "$isolation/gitconfig" || return 1
+        printf '[core]\n\tworktree = %s\n' "$caller" > "$isolation/template/config"
+        printf '#!/usr/bin/env bash\nprintf invoked >> "$DSR_TEST_GIT_ISOLATION_HOOK"\n' \
+            > "$isolation/template/hooks/post-checkout"
+        chmod +x "$isolation/template/hooks/post-checkout" || return 1
+        tar -cf "$isolation/before.tar" -C "$caller" . || return 1
+        STATUS=0
+        (
+            export GIT_CONFIG_GLOBAL="$isolation/gitconfig"
+            export DSR_TEST_GIT_ISOLATION_HOOK="$isolation/hook-executed"
+            case "$isolation_label" in
+                template-environment) export GIT_TEMPLATE_DIR="$isolation/template" ;;
+                template-config)
+                    git config --file "$GIT_CONFIG_GLOBAL" init.templateDir "$isolation/template" || exit 1 ;;
+                worktree-config)
+                    git config --file "$GIT_CONFIG_GLOBAL" core.worktree "$caller" || exit 1 ;;
+                repository-environment)
+                    export GIT_DIR="$caller/.git" GIT_WORK_TREE="$caller" GIT_COMMON_DIR="$caller/.git"
+                    export GIT_INDEX_FILE="$caller/.git/index" GIT_OBJECT_DIRECTORY="$caller/.git/objects"
+                    export GIT_ALTERNATE_OBJECT_DIRECTORIES="$base/upstream/.git/objects"
+                    export GIT_SHALLOW_FILE="$caller/.git/shallow" GIT_GRAFT_FILE="$caller/.git/grafts"
+                    export GIT_NAMESPACE=caller-private GIT_PREFIX=caller/ GIT_IMPLICIT_WORK_TREE=0
+                    export GIT_REPLACE_REF_BASE=refs/caller-replace/ GIT_NO_REPLACE_OBJECTS=0
+                    ;;
+            esac
+            _isb_checkout_source example/source-admission "$pin" "$isolation/source" "$isolation/graph" || exit $?
+            graph=$(cat "$isolation/graph/repositories.json") || exit 1
+            _isb_verify_source_graph "$isolation/source" "$graph" "$isolation/graph" initial > "$isolation/proof"
+        ) > "$isolation/acquisition.log" 2>&1 || STATUS=$?
+        check "$isolation_label acquires and authenticates the selected source" equal "$STATUS" 0
+        tar -cf "$isolation/after.tar" -C "$caller" . || return 1
+        check "$isolation_label preserves all unrelated caller bytes and modes" \
+            cmp -s "$isolation/before.tar" "$isolation/after.tar"
+        check "$isolation_label leaves the source in its own indexed repository" \
+            bash -c '[[ -d "$1/.git" && -f "$1/.git/index" && -f "$1/main.go" ]]' _ "$isolation/source"
+        check "$isolation_label publishes a nonempty authenticated source fingerprint" test -s "$isolation/proof"
+        check "$isolation_label never executes inherited template hooks" test ! -e "$isolation/hook-executed"
+    done
 
     admission_checkout late-blob || return 1
     printf 'unreviewed bytes beyond the first hash batch\n' > "$base/late-blob/source/zz-last.data"
@@ -356,6 +405,7 @@ import os
 import pathlib
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -381,6 +431,13 @@ def check(label, condition):
 
 def command(arguments, **kwargs):
     return subprocess.run(arguments, capture_output=True, text=True, timeout=60, **kwargs)
+
+
+def tree_snapshot(directory):
+    return {str(path.relative_to(directory)): [stat.S_IMODE(path.lstat().st_mode),
+            os.readlink(path) if path.is_symlink() else
+            hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else "directory"]
+            for path in sorted(directory.rglob("*"))}
 
 
 policies = {
@@ -521,15 +578,33 @@ environment.update(PATH=str(work / "bin") + os.pathsep + environment["PATH"], HO
 def run(tool, label, options, mode="boundary"):
     case = work / f"{tool}-{label}"
     (case / "tmp").mkdir(parents=True)
-    environment.update(DSR_SHIPPED_CALLS=str(case / "calls"), DSR_SHIPPED_HTTP=str(case / "http.jsonl"),
-                       DSR_SHIPPED_MODE=mode, DSR_SHIPPED_REPOSITORY=policies[tool][0],
-                       DSR_SHIPPED_RELEASES=str(work / f"{tool}-releases"), TMPDIR=str(case / "tmp"))
+    case_environment = dict(environment, DSR_SHIPPED_CALLS=str(case / "calls"),
+                            DSR_SHIPPED_HTTP=str(case / "http.jsonl"), DSR_SHIPPED_MODE=mode,
+                            DSR_SHIPPED_REPOSITORY=policies[tool][0],
+                            DSR_SHIPPED_RELEASES=str(work / f"{tool}-releases"), TMPDIR=str(case / "tmp"))
+    if label == "source":
+        caller, template = case / "caller", case / "template"
+        initialized = command([real_git, "init", "-q", str(caller)], env=case_environment)
+        if initialized.returncode:
+            raise RuntimeError(initialized.stderr)
+        (caller / "keep.txt").write_text("unrelated caller work\n")
+        (case / "caller-before.json").write_text(json.dumps(tree_snapshot(caller)))
+        (template / "hooks").mkdir(parents=True)
+        (template / "config").write_text('[core]\n\tworktree = ' + str(caller) + '\n')
+        hook = template / "hooks/post-checkout"
+        hook.write_text('#!/usr/bin/env bash\nprintf invoked >> "$DSR_SHIPPED_TEMPLATE_HOOK"\n')
+        hook.chmod(0o755)
+        configuration = case / "gitconfig"
+        configuration.write_text(pathlib.Path(environment["GIT_CONFIG_GLOBAL"]).read_text() +
+                                 '[init]\n\ttemplateDir = ' + str(template) + '\n')
+        case_environment.update(GIT_CONFIG_GLOBAL=str(configuration), GIT_TEMPLATE_DIR=str(template),
+                                DSR_SHIPPED_TEMPLATE_HOOK=str(case / "template-hook-executed"))
     arguments = ["bash", str(root / "installers" / tool / "install.sh"), "--json", "--non-interactive",
                  "--no-skills", "--cache-dir", str(case / "cache"), "--dir", str(case / "install"), *options]
     (case / "argv.json").write_text(json.dumps(arguments) + "\n")
     # Retain partial evidence even if the unchanged caller deadline expires.
     with (case / "stdout.json").open("w") as output, (case / "stderr.log").open("w") as diagnostics:
-        result = subprocess.run(arguments, env=environment, stdout=output, stderr=diagnostics, timeout=60)
+        result = subprocess.run(arguments, env=case_environment, stdout=output, stderr=diagnostics, timeout=60)
     try:
         receipt = json.loads((case / "stdout.json").read_text())
     except ValueError:
@@ -546,6 +621,10 @@ for tool in ("bv", "ntm"):
     binary = case / "install" / tool
     source = receipt.get("source", {})
     check(f"shipped {tool} entrypoint builds and installs with real Git and Go", result.returncode == 0 and binary.is_file())
+    check(f"shipped {tool} recursive source checkout preserves unrelated caller Git data despite ambient templates",
+          tree_snapshot(case / "caller") == json.loads((case / "caller-before.json").read_text()))
+    check(f"shipped {tool} source checkout never runs ambient template hooks",
+          not (case / "template-hook-executed").exists())
     check(f"shipped {tool} source receipt binds the annotated tag and both pinned gitlinks",
           receipt.get("method") == "source" and receipt.get("signed_release") is False and
           source.get("repository") == policies[tool][0] and source.get("source_commit") == root_pin and

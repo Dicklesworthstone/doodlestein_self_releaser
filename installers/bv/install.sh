@@ -1250,6 +1250,8 @@ _isb_git() (
     unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE
     unset GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
     unset GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT
+    unset GIT_IMPLICIT_WORK_TREE GIT_PREFIX GIT_SHALLOW_FILE GIT_GRAFT_FILE
+    unset GIT_NAMESPACE GIT_REPLACE_REF_BASE GIT_TEMPLATE_DIR
     export GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1
     git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c submodule.recurse=false "$@"
 )
@@ -1257,7 +1259,9 @@ _isb_git() (
 _isb_checkout() (
     set +x
     local repo="$1" ref="$2" dir="$3" token='' token_status=0 trace_name authorization
-    local -a git_options=() init_options=()
+    # A global core.worktree or template must not redirect this checkout into
+    # another directory, even when ordinary user credentials remain enabled.
+    local -a git_options=(-c "core.worktree=$dir")
     token=$(_installer_github_token) || token_status=$?
     # With no selected GitHub credential, retain the existing Git-only path:
     # anonymous HTTPS, user credential helpers and configured URL policy.
@@ -1282,12 +1286,11 @@ _isb_checkout() (
         # --config-env is supported by Git 2.31+. An older Git refuses this
         # command before network access rather than ignoring the credential
         # policy as an unknown -c option could.
-        git_options=(-c credential.helper= -c credential.interactive=false -c core.askPass=
+        git_options+=(-c credential.helper= -c credential.interactive=false -c core.askPass=
             -c http.extraHeader= "--config-env=http.https://github.com/$repo.git.extraHeader=DSR_INSTALLER_GIT_AUTHORIZATION"
             -c http.followRedirects=false -c http.sslVerify=true)
-        init_options=(--template=)
     fi
-    _isb_git ${git_options[@]+"${git_options[@]}"} init -q ${init_options[@]+"${init_options[@]}"} "$dir" || return 8
+    _isb_git "${git_options[@]}" init -q --template= "$dir" || return 8
     _isb_git ${git_options[@]+"${git_options[@]}"} -C "$dir" remote add origin "https://github.com/$repo.git" || return 8
     _isb_git ${git_options[@]+"${git_options[@]}"} -C "$dir" fetch -q --depth=1 --no-tags --recurse-submodules=no origin "$ref" || return 8
     local commit
@@ -1332,12 +1335,12 @@ _isb_acquire_submodules() {
     local repo="$1" tree="$2" prefix="$3" depth="$4" number="$_ISB_SOURCE_REPO_COUNT"
     local record mode type oid path metadata key field name value child_repo full_path
     local commit entries_file="$_ISB_SOURCE_GRAPH_DIR/tree-$number" config_file="$_ISB_SOURCE_GRAPH_DIR/modules-$number"
-    local -a paths=() pins=()
+    local -a paths=() pins=() context=(-C "$tree" -c "core.worktree=$tree")
     local -A declarations=() urls=() names_by_path=() folded_paths=()
-    commit=$(_isb_git -C "$tree" rev-parse --verify 'HEAD^{commit}') || return 8
+    commit=$(_isb_git "${context[@]}" rev-parse --verify 'HEAD^{commit}') || return 8
     jq -nc --arg path "$prefix" --arg repo "$repo" --arg commit "$commit" \
         '{path:$path,repository:$repo,source_commit:$commit}' >> "$_ISB_SOURCE_GRAPH_DIR/repositories.jsonl" || return 1
-    _isb_git -C "$tree" ls-tree -r -z --full-tree "$commit" > "$entries_file" || return 8
+    _isb_git "${context[@]}" ls-tree -r -z --full-tree "$commit" > "$entries_file" || return 8
     while IFS= read -r -d '' record; do
         _ISB_SOURCE_ENTRY_COUNT=$((_ISB_SOURCE_ENTRY_COUNT + 1))
         ((_ISB_SOURCE_ENTRY_COUNT <= 100000)) || { _isb_log 'Source graph exceeds 100000 tracked entries'; return 4; }
@@ -1359,7 +1362,7 @@ _isb_acquire_submodules() {
     # --no-includes prevents local/global files named by .gitmodules from
     # becoming dependency authority. Other fields (update, branch, ignore)
     # are never executed or used to relax commit/content verification.
-    _isb_git -C "$tree" config --no-includes --null --file "$tree/.gitmodules" \
+    _isb_git "${context[@]}" config --no-includes --null --file "$tree/.gitmodules" \
         --get-regexp '^submodule\..*\.(path|url)$' > "$config_file" || return 4
     while IFS= read -r -d '' record; do
         [[ "$record" == *$'\n'* ]] || return 4
@@ -1403,7 +1406,7 @@ _isb_acquire_submodules() {
         full_path="${prefix:+$prefix/}$path"
         _isb_log "Fetching submodule $full_path at ${pins[$index]} ($child_repo)"
         _isb_checkout "$child_repo" "${pins[$index]}" "$tree/$path" || return $?
-        [[ "$(_isb_git -C "$tree/$path" rev-parse --verify 'HEAD^{commit}')" == "${pins[$index]}" ]] || return 8
+        [[ "$(_isb_git -C "$tree/$path" -c "core.worktree=$tree/$path" rev-parse --verify 'HEAD^{commit}')" == "${pins[$index]}" ]] || return 8
         _isb_acquire_submodules "$child_repo" "$tree/$path" "$full_path" "$((depth + 1))" || return $?
     done
 }
@@ -1430,6 +1433,8 @@ _isb_verify_source_repository() (
        -f "$tree/.git/index" && ! -L "$tree/.git/index" ]] || return 6
     unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE
     unset GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT
+    unset GIT_IMPLICIT_WORK_TREE GIT_PREFIX GIT_SHALLOW_FILE GIT_GRAFT_FILE
+    unset GIT_NAMESPACE GIT_REPLACE_REF_BASE GIT_TEMPLATE_DIR
     export GIT_DIR="$tree/.git" GIT_WORK_TREE="$tree" GIT_COMMON_DIR="$tree/.git"
     export GIT_INDEX_FILE="$tree/.git/index" GIT_OBJECT_DIRECTORY="$tree/.git/objects"
     export GIT_NO_REPLACE_OBJECTS=1 GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
@@ -2133,24 +2138,25 @@ _isb_source_committed_file() {
             root="$root/$owner_path"; relative="${path#"$root"/}"
         fi
     fi
-    row=$(_isb_git --literal-pathspecs -C "$root" ls-tree "$reference" -- "$relative") || return 4
+    local -a context=(-C "$root" -c "core.worktree=$root")
+    row=$(_isb_git "${context[@]}" --literal-pathspecs ls-tree "$reference" -- "$relative") || return 4
     [[ -n "$row" && "$row" != *$'\n'* ]] || return 4
     IFS=$' \t' read -r mode type oid rest <<< "$row"
     [[ "$type" == blob && ( "$mode" == 100644 || "$mode" == 100755 ) &&
        ( "$oid" =~ ^[0-9a-f]{40}$ || "$oid" =~ ^[0-9a-f]{64}$ ) ]] || return 4
-    actual=$(_isb_git -C "$root" hash-object --no-filters -- "$path") || return 4
+    actual=$(_isb_git "${context[@]}" hash-object --no-filters -- "$path") || return 4
     if [[ "$actual" != "$oid" ]]; then
         # A normal checkout can apply core.autocrlf or tracked text/eol
         # attributes. Let Git perform that normalization, but disable the
         # selected external filter driver before hashing: metadata admission
         # must not execute a clean/process hook. The receipt still hashes the
         # actual checkout bytes that Go parses, including their line endings.
-        attributes=$(_isb_git --literal-pathspecs -C "$root" check-attr filter -- "$relative") || return 4
+        attributes=$(_isb_git "${context[@]}" --literal-pathspecs check-attr filter -- "$relative") || return 4
         [[ "$attributes" != *$'\n'* && "$attributes" == *': filter: '* ]] || return 4
         filter="${attributes#*: filter: }"
         [[ "$filter" =~ ^[A-Za-z0-9_/-][A-Za-z0-9._/-]*$ ]] || return 4
-        actual=$(_isb_git -c "filter.$filter.clean=" -c "filter.$filter.process=" \
-            -c "filter.$filter.required=false" -C "$root" hash-object --path="$relative" -- "$path") || return 4
+        actual=$(_isb_git "${context[@]}" -c "filter.$filter.clean=" -c "filter.$filter.process=" \
+            -c "filter.$filter.required=false" hash-object --path="$relative" -- "$path") || return 4
     fi
     [[ "$actual" == "$oid" ]] || return 4
     # Empty committed go.sum files are valid; payload hashing intentionally
@@ -3039,7 +3045,7 @@ install_source_build() (
     _isb_run "$limit" "$destination/fetch.log" _isb_checkout_source "$repo" "$ref" "$tree" "$graph_dir" || {
         status=$?; case "$status" in 1|3|4|5) return "$status" ;; *) return 8 ;; esac
     }
-    commit=$(_isb_git -C "$tree" rev-parse --verify 'HEAD^{commit}') || return 8
+    commit=$(_isb_git -C "$tree" -c "core.worktree=$tree" rev-parse --verify 'HEAD^{commit}') || return 8
     _ISB_SOURCE_GRAPH=$(jq -ce '.' "$graph_dir/repositories.json") || return 8
     source_state=$(_isb_verify_source_graph "$tree" "$_ISB_SOURCE_GRAPH" "$graph_dir" initial) || return $?
     _isb_path_in_tree "$tree" "$subdir" && [[ -d "$tree/$subdir" ]] || return 4
