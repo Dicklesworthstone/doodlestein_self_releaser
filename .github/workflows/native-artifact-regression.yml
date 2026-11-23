@@ -203,6 +203,15 @@ jobs:
           timeout 120 bash scripts/tests/test_act_runner_native.sh --go-outputs-only \
             2>&1 | tee "$RUNNER_TEMP/collector-evidence/go-native-outputs.log"
           test -z "$(git status --porcelain)"
+      - name: Refuse skipped or mutated Go output producers
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go version
+          timeout 120 bash scripts/tests/test_act_runner_native.sh --go-command-context-only \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/go-native-command-context.log"
+          test -z "$(git status --porcelain)"
       - name: Preserve complete large native artifact inventories
         if: runner.os == 'Linux'
         shell: bash

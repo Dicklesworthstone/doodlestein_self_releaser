@@ -11895,7 +11895,15 @@ def absolute(value, cwd):
     if windows and (value.startswith(('\\\\', '//')) or
                     (ntpath.splitdrive(value)[0] and not ntpath.isabs(value))):
         fail('drive-relative or UNC Go output path')
-    return paths.normpath(value if paths.isabs(value) else paths.join(cwd, value)).replace('\\', '/') if windows else paths.normpath(value if paths.isabs(value) else paths.join(cwd, value))
+    if windows:
+        # A rooted CMD path such as \dist retains the active drive. An
+        # explicit drive-qualified path replaces it; ntpath.join models both.
+        return paths.normpath(paths.join(cwd, value)).replace('\\', '/')
+    return paths.normpath(value if paths.isabs(value) else paths.join(cwd, value))
+
+def executable_name(program):
+    name = program.replace('\\', '/').rsplit('/', 1)[-1]
+    return name.lower() if windows else name
 
 value_flags = {'-asmflags', '-buildmode', '-compiler', '-coverpkg', '-coverprofile',
                '-gccgoflags', '-gcflags', '-installsuffix', '-ldflags', '-mod',
@@ -11937,21 +11945,54 @@ def flags(argv, initial):
 try:
     environment = dict(line.rstrip('\n').split('=', 1) for line in os.fdopen(3) if '=' in line)
     command = os.fdopen(4).read()
-    if not re.search(r'\bgo(?:\.exe)?\b', command):
+    if not re.search(r'\bgo(?:\.exe)?\b', command, re.IGNORECASE if windows else 0):
         print('null'); raise SystemExit(0)
+    tokens = words(command)
     statements, current, unsupported = [], [], False
-    for token in words(command):
+    # Even an otherwise stateless marker or redirection can change exported
+    # compiler selectors in the parent shell. Preserve quote evidence and
+    # inspect every word before removing redirections or ignoring commands.
+    if not windows:
+        for raw in tokens:
+            quote, index = '', 0
+            while index < len(raw):
+                char = raw[index]
+                if char == '\\' and quote != "'":
+                    index += 2; continue
+                if char in "\"'" and (not quote or quote == char):
+                    quote = '' if quote else char
+                if char == '$' and quote != "'" and (raw.startswith(('$((', '$['), index) or
+                        re.match(r'\$\{[A-Za-z_][A-Za-z0-9_]*(?:\[|:?=)', raw[index:])):
+                    unsupported = True
+                index += 1
+    group, group_sizes = 0, {}
+    for token in tokens:
         if token and all(char in ';&|()\n' for char in token):
             if current:
-                statements.append(current); current = []
-            if token not in (';', '&&', '\n') and not (windows and token == '&'):
+                statements.append((group, current)); current = []
+                group_sizes[group] = group_sizes.get(group, 0) + 1
+                if token != '&&':
+                    group += 1
+            if token not in (('&&', '&', '\n') if windows else (';', '&&', '\n')):
                 unsupported = True
         else:
             current.append(token)
     if current:
-        statements.append(current)
+        statements.append((group, current))
+        group_sizes[group] = group_sizes.get(group, 0) + 1
+    final_group = statements[-1][0] if statements else 0
+
+    def unproved_list(selected_group):
+        # Unix errexit protects a standalone foreground command, but a failed
+        # predicate in `false && go build ...; true` skips the producer and is
+        # hidden by the later list. The same applies to inferred cd/export/
+        # unset effects. CMD has no errexit, so even a standalone producer can
+        # fail before a later successful sequential command. A final && chain
+        # remains supported: whole-recipe success proves every member ran.
+        return selected_group != final_group and (windows or group_sizes[selected_group] > 1)
+
     operations, cwd, unset, saw_go = [], root, set(), False
-    for statement in statements:
+    for statement_group, statement in statements:
         # Redirections are not Go arguments, including when flags follow them.
         raw, index = [], 0
         while index < len(statement):
@@ -11978,12 +12019,16 @@ try:
             unsupported = True  # Shell-only assignments do not establish export state.
             environment, unset = effective, removed; continue
         program = literal(raw[position], effective, inline_names); position += 1
+        if windows:
+            program = program.lstrip('@')  # CMD's echo-suppression prefix.
         if program == 'export' and not windows:
+            unsupported = unsupported or unproved_list(statement_group)
             assignments()
             if position != len(raw):
                 unsupported = True
             environment, unset = effective, removed; continue
         if program == 'unset' and not windows:
+            unsupported = unsupported or unproved_list(statement_group)
             for name in raw[position:]:
                 if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name):
                     unsupported = True; continue
@@ -12019,12 +12064,20 @@ try:
             if raw[position].startswith('-'):
                 fail('unsupported wrapper around Go command')
             program = literal(raw[position], effective, inline_names); position += 1
-        if program == 'cd' and len(raw[position:]) == 1:
-            cwd = absolute(literal(raw[position], effective, inline_names), cwd); continue
+        context_program = program.lower() if windows else program
+        directory_command = context_program == 'cd' or (windows and context_program == 'chdir')
+        change_drive = (directory_command and windows and len(raw[position:]) == 2 and
+                        literal(raw[position], effective, inline_names).lower() == '/d')
+        if directory_command and (len(raw[position:]) == 1 or change_drive):
+            unsupported = unsupported or unproved_list(statement_group)
+            destination = absolute(literal(raw[position + int(change_drive)], effective, inline_names), cwd)
+            if windows and not change_drive and paths.splitdrive(destination)[0].lower() != paths.splitdrive(cwd)[0].lower():
+                fail('CMD cd across drives requires an explicit /d selector')
+            cwd = destination; continue
         # Match the Cargo reader's context-changing builtin boundary. Only the
         # literal export/unset/cd and transparent wrappers handled above have
         # established effects on the later compiler's environment and scope.
-        if program in ('cd', 'pushd', 'popd', 'source', '.', 'eval', 'exec', 'exit', 'return',
+        if context_program in ('cd', 'pushd', 'popd', 'source', '.', 'eval', 'exec', 'exit', 'return',
                        'export', 'unset', 'set', 'shopt', 'alias', 'unalias',
                        'declare', 'typeset', 'readonly', 'local', 'read', 'readarray',
                        'mapfile', 'getopts', 'let', 'hash', 'enable', 'trap', 'builtin', 'command',
@@ -12032,13 +12085,20 @@ try:
                        'case', 'esac', 'select', 'in', 'break', 'continue', 'function', 'functions',
                        'unfunction', 'autoload', 'time', '!', 'coproc'):
             unsupported = True
+        if windows and (context_program.split('/', 1)[0] in
+                        ('set', 'exit', 'call', 'goto', 'setlocal', 'endlocal', 'chdir', 'shift') or
+                        re.match(r'^(?:cd|chdir)[.\\/]', context_program) or
+                        context_program.endswith(('.cmd', '.bat'))):
+            # Batch programs execute inside CMD and can change its environment
+            # or cwd. They do not have the isolation of a Unix child process.
+            unsupported = True
         if program == 'printf' and position < len(raw) and literal(raw[position], effective, inline_names).startswith('-v'):
             unsupported = True
-        executable = program.replace('\\', '/').rsplit('/', 1)[-1].lower()
+        executable = executable_name(program)
         if executable not in ('go', 'go.exe'):
-            if executable in ('bash', 'sh', 'zsh', 'dash', 'cmd', 'cmd.exe', 'powershell', 'pwsh') and any(re.search(r'\bgo(?:\.exe)?\s', arg) for arg in raw[position:]):
+            if executable in ('bash', 'sh', 'zsh', 'dash', 'cmd', 'cmd.exe', 'powershell', 'powershell.exe', 'pwsh', 'pwsh.exe') and any(re.search(r'\bgo(?:\.exe)?\s', arg, re.IGNORECASE if windows else 0) for arg in raw[position:]):
                 fail('shell-wrapped Go output cannot be determined; use a direct command')
-            if any(arg.strip('"\'').replace('\\', '/').rsplit('/', 1)[-1] in ('go', 'go.exe') for arg in raw[position:]):
+            if any(executable_name(arg.strip('"\'')) in ('go', 'go.exe') for arg in raw[position:]):
                 unsupported = True; saw_go = True
             if terminal_exec:
                 unsupported = True
@@ -12059,6 +12119,7 @@ try:
                 break
             continue
         kind, argv = argv[0], argv[1:]
+        unsupported = unsupported or unproved_list(statement_group)
         output, list_flags, packages, mode = flags(argv, effective.get('GOFLAGS', ''))
         if kind == 'install' and output is not None:
             fail('go install does not accept -o')
@@ -12072,7 +12133,7 @@ try:
         if terminal_exec:
             break
     if saw_go and unsupported:
-        fail('conditional, piped or opaque Go command context; use a literal foreground command chain')
+        fail('conditional, mutating, piped or opaque Go command context; use a literal foreground command chain')
     print(json.dumps(dict(shell=shell, source_root=root, operations=operations) if operations else None, separators=(',', ':')))
 except (OSError, ValueError, IndexError) as error:
     print('[act] ' + str(error), file=sys.stderr)

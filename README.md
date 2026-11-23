@@ -333,7 +333,17 @@ executable; compiling library packages alone does not establish an output.
 
 Use literal foreground commands for direct Go recipes. Conditional output
 selection, unmodelled shell state changes and ambiguous variable expansion are
-refused. Configure intentional `GOFLAGS` in the recipe's `env` entries:
+refused before dispatch. A final `mkdir -p dist && go build -o dist/tool .`
+chain is supported, including multiple executable producers joined with `&&`.
+A chain such as `false && go build -o tool .; true` is refused: its successful
+shell status cannot prove that the compiler ran. Unix standalone producers
+separated by `;` retain the worker's error-stop behavior. Windows CMD recipes
+must keep their producers in the final `&&` chain; a later `&` or newline can
+otherwise conceal a failed build. CMD directory changes across drives require
+an explicit `cd /d`. Shell expansions that can mutate compiler settings are
+also refused in surrounding commands and redirection paths.
+
+Configure intentional `GOFLAGS` in the recipe's `env` entries:
 different inherited or persisted worker flags prevent collection, including
 flags that make a successful command produce no executable. Output metadata
 queries use the worker's Go context, disable dependency downloads, retain

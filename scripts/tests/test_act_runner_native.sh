@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_act_runner_native.sh - Unit tests for act_runner.sh native build SSH logic
 #
-# Usage: ./test_act_runner_native.sh [--go-outputs-only | --typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --large-inventory-only | --workspace-archives-only | --failure-evidence-only | --env-precedence-only | --archive-delivery-only | --zig-dispatch-only | --glibc-routing-only | --windows-launcher-transfer-only | --artifact-transfer-only]
+# Usage: ./test_act_runner_native.sh [--go-outputs-only | --go-command-context-only | --typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --large-inventory-only | --workspace-archives-only | --failure-evidence-only | --env-precedence-only | --archive-delivery-only | --zig-dispatch-only | --glibc-routing-only | --windows-launcher-transfer-only | --artifact-transfer-only]
 #
 # Tests native build SSH command construction with mocks.
 # Covers: command construction, path handling, env vars, SCP, error handling.
@@ -23,15 +23,19 @@ test_go_native_output_selection() {
         command -v "$dependency" >/dev/null || { printf 'SKIP: Go output test needs %s\n' "$dependency"; return 3; }
     done
     [[ "$(go version 2>/dev/null)" == 'go version go'* ]] || { printf 'SKIP: real Go compiler unavailable\n'; return 3; }
-    python3 -I - "$PROJECT_ROOT" <<'PY'
+    python3 -I - "$PROJECT_ROOT" "${1:-outputs}" <<'PY'
 import hashlib, json, os, pathlib, shutil, subprocess, sys, tarfile, tempfile
 
 root = pathlib.Path(sys.argv[1])
 work = pathlib.Path(tempfile.mkdtemp(prefix='dsr-go-outputs-'))
 print('Retained Go output evidence: ' + str(work), flush=True)
 environment = {key: value for key, value in os.environ.items() if not key.startswith('BASH_FUNC_')}
+# A declared real compiler cache lets repeated baseline/candidate controls use
+# the same standard-library cache. Every source and output path stays fresh,
+# and the genuine Go commands and their existing deadlines remain unchanged.
 environment.update(GOENV='off', GOTOOLCHAIN='local', CGO_ENABLED='0', GOMAXPROCS='2',
-                   GOCACHE=str(work / 'go-cache'), GOPROXY='off', GOSUMDB='off', RCH_REQUIRE_REMOTE='0')
+                   GOCACHE=os.environ.get('DSR_TEST_GO_CACHE') or str(work / 'go-cache'),
+                   GOPROXY='off', GOSUMDB='off', RCH_REQUIRE_REMOTE='0')
 environment.pop('GOFLAGS', None)
 host_go = json.loads(subprocess.run(['go', 'env', '-json', 'GOHOSTOS', 'GOHOSTARCH'],
                     env=environment, check=True, capture_output=True, text=True, timeout=10).stdout)
@@ -84,7 +88,7 @@ act_run_native_build outputs "$platform" v1.0.0 output-test '' '' '' localnative
 '''
 
 def run_case(name, command, *, expected=True, platform=host_platform, overrides=None,
-             inherited=None, library=False, family=None, preparation=None):
+             inherited=None, library=False, family=None, preparation=None, predispatch=False):
     case = work / name
     source, installed = case / 'source', case / 'installed'
     source.mkdir(parents=True); installed.mkdir()
@@ -108,6 +112,10 @@ def run_case(name, command, *, expected=True, platform=host_platform, overrides=
         recipe_env.update({key: str(value).replace('@CASE@', str(case)) for key, value in overrides.items()})
     if preparation:
         preparation(case)
+    if predispatch:
+        # A result with no artifact alone could be an unrelated later failure.
+        # This marker proves admission stopped the actual user recipe as well.
+        command = 'printf dispatched > .dsr-command-dispatched; ' + command
     config = dict(tool_name='outputs', repo='fixture/outputs', language='go', binary_name='tool',
                   local_path=str(source), targets=[platform], act_job_map={platform: None},
                   hosts={platform: 'localnative'}, build_cmd=command.replace('@CASE@', str(case)),
@@ -154,36 +162,107 @@ def run_case(name, command, *, expected=True, platform=host_platform, overrides=
         check(name + ' collects the actual fresh command output', ok)
     else:
         check(name + ' refuses stale output authority', result.returncode != 0 and not receipt.get('artifact_paths'))
+    if predispatch:
+        check(name + ' stops before recipe execution',
+              not (source / '.dsr-command-dispatched').exists() and 'native_execution' not in receipt)
     check(name + ' preserves source controls', before == (source / 'go.mod').read_bytes())
     return case, receipt
 
-case, _ = run_case('explicit-file', 'go build -p=1 -buildvcs=false -o tool .')
-check('go build leaves old GOBIN executable untouched', hashlib.sha256((case / 'installed/tool').read_bytes()).hexdigest() == stale_hash)
-run_case('explicit-alias', 'go build -p=1 -buildvcs=false -o chosen-name .')
-run_case('existing-directory', 'go build -p=1 -buildvcs=false -o dist .')
-run_case('default-module-name', 'go build -p=1 -buildvcs=false .')
-run_case('install-target', 'go install -p=1 -buildvcs=false .')
-run_case('reviewed-goflags-directory', 'go build -p=1 -buildvcs=false .', overrides={'GOFLAGS': '-o=dist'})
-run_case('command-overrides-goflags', 'go build -p=1 -buildvcs=false -o tool .', overrides={'GOFLAGS': '-o=dist'})
-run_case('compile-only-decoy', 'go build -p=1 -buildvcs=false ./...', library=True, expected=False)
-run_case('compile-only-then-producer', 'go build -p=1 -buildvcs=false ./... && go build -p=1 -buildvcs=false -o chosen-name .', library=True)
-run_case('ambient-no-build', 'go build -p=1 -buildvcs=false -o tool .', inherited={'GOFLAGS': '-n'}, expected=False)
-run_case('persisted-output', 'go build -p=1 -buildvcs=false .', expected=False,
-         overrides={'GOENV': '@CASE@/go-env'},
-         preparation=lambda case: write(case / 'go-env', 'GOFLAGS=-o=elsewhere\n'))
-run_case('workspace-chain', 'go build -p=1 -buildvcs=false -o dist/alpha ./cmd/alpha && go build -p=1 -buildvcs=false -o dist/beta ./cmd/beta', family=['alpha', 'beta'])
-run_case('unix-windows-explicit-no-suffix', 'go build -p=1 -buildvcs=false -o chosen-name .', platform='windows/amd64')
-for name, command in [
-    ('exit-before-build', 'exit 0; go build -o tool .'),
-    ('mutating-go-env', 'go env -w GOFLAGS=-n; go build -o tool .; go env -u GOFLAGS'),
-    ('conditional-output', 'if true; then go build -o tool .; fi'),
-    ('prefix-expansion', 'GOBIN=@CASE@/source go build -o "$GOBIN/tool" .'),
-    ('prefix-cd-expansion', 'GOBIN=@CASE@/source cd "$GOBIN"; go build -o tool .'),
-    ('unexported-selector', 'GOBIN=@CASE@/source; go install .'),
-    ('declared-selector', 'declare -x GOFLAGS=-n; go build -o tool .'),
-]:
-    case, receipt = run_case(name, command, expected=False)
-    check(name + ' refuses before compiler dispatch', 'native_execution' not in receipt)
+if sys.argv[2] == 'context':
+    # The positive combines ordinary separators, an optional stateless marker,
+    # literal expansion-looking text, and a final complete-family conjunction.
+    run_case('foreground-context',
+             'printf "%s" \'${GOFLAGS:=-n}\' >/dev/null; false && printf optional; mkdir -p dist && '
+             'go build -p=1 -buildvcs=false -o dist/alpha ./cmd/alpha && go build -p=1 -buildvcs=false -o dist/beta ./cmd/beta',
+             overrides={'GOFLAGS': ''}, family=['alpha', 'beta'])
+    run_case('terminal-failure', 'go build -p=1 -buildvcs=false -o tool . && false', expected=False)
+    run_case('masked-failed-predicate', 'false && go build -p=1 -buildvcs=false -o tool .; true',
+             expected=False, predispatch=True)
+    run_case('masked-family-producer',
+             'false && go build -p=1 -buildvcs=false -o dist/alpha ./cmd/alpha; go build -p=1 -buildvcs=false -o dist/beta ./cmd/beta',
+             family=['alpha', 'beta'], expected=False, predispatch=True,
+             preparation=lambda case: shutil.copy2(stale, case / 'source/dist/alpha'))
+    run_case('skipped-directory-change', 'false && cd dist; go build -p=1 -buildvcs=false -o tool .',
+             expected=False, predispatch=True,
+             preparation=lambda case: shutil.copy2(stale, case / 'source/dist/tool'))
+    run_case('marker-word-mutation', 'printf "%s" "${GOFLAGS:=-n}" >/dev/null; go build -p=1 -buildvcs=false -o tool .',
+             overrides={'GOFLAGS': ''}, expected=False, predispatch=True)
+    run_case('redirection-word-mutation', 'printf marker > "${GOFLAGS:=-n}"; go build -p=1 -buildvcs=false -o tool .',
+             overrides={'GOFLAGS': ''}, expected=False, predispatch=True)
+
+    # These are coordinator admission checks, not native CMD execution claims.
+    # CMD builtins are case-insensitive and sequential commands have no
+    # equivalent of the Unix worker's errexit guarantee.
+    planner_driver = 'source "${DSR_TEST_ACT_RUNNER:-$1/src/act_runner.sh}"; _act_go_output_plan "$2" GOFLAGS= "$3" "$4"'
+    expected_paths = {
+        'CMD explicit drive change': ('D:/other', 'D:/other/tool.exe'),
+        'CMD rooted directory change': ('C:/other', 'C:/other/tool.exe'),
+        'CMD rooted output': ('C:/source', 'C:/outputs/tool.exe'),
+    }
+    for name, command, shell, accepted in [
+        ('Unix multiline conjunction', 'mkdir -p dist &&\ngo build -o dist/tool .\n', 'unix', True),
+        ('Unix standalone producers', 'go build -o alpha .; go build -o beta .', 'unix', True),
+        ('Unix skipped export', 'false && export GOBIN=/tmp/stale; go install .', 'unix', False),
+        ('Unix skipped unset', 'false && unset GOFLAGS; go build -o tool .', 'unix', False),
+        ('Unix arithmetic marker', 'printf "%s" "$((GOFLAGS=1))"; go build -o tool .', 'unix', False),
+        ('CMD final conjunction', 'mkdir dist && go build -o dist/tool.exe .', 'windows', True),
+        ('CMD stateless prefix', 'ver & go build -o tool.exe .', 'windows', True),
+        ('CMD uppercase compiler', 'GO.EXE build -o tool.exe .', 'windows', True),
+        ('CMD uppercase compiler mutation', 'SET GOFLAGS=-n && GO.EXE build -o tool.exe .', 'windows', False),
+        ('CMD echo-suppressed compiler', '@GO.EXE build -o tool.exe .', 'windows', True),
+        ('CMD echo-suppressed mutation', '@SET GOFLAGS=-n && GO.EXE build -o tool.exe .', 'windows', False),
+        ('CMD uppercase wrapped compiler', 'cmd /c "GO build -o tool.exe ."', 'windows', False),
+        ('CMD opaque uppercase wrapper', 'wrapper GO.EXE build -o tool.exe .', 'windows', False),
+        ('CMD implicit drive change', 'cd D:/other && go build -o tool.exe .', 'windows', False),
+        ('CMD explicit drive change', 'CD /D D:/other && go build -o tool.exe .', 'windows', True),
+        ('CMD rooted directory change', 'CD /D /other && go build -o tool.exe .', 'windows', True),
+        ('CMD rooted output', 'go build -o /outputs/tool.exe .', 'windows', True),
+        ('CMD implicit parent directory change', 'cd.. && go build -o tool.exe .', 'windows', False),
+        ('CMD uppercase environment mutation', 'SET GOFLAGS=-n && go build -o tool.exe .', 'windows', False),
+        ('CMD uppercase early exit', 'EXIT 0 & go build -o tool.exe .', 'windows', False),
+        ('CMD masked producer', 'go build -o tool.exe . & echo done', 'windows', False),
+        ('CMD newline-masked producer', 'go build -o tool.exe .\necho done', 'windows', False),
+        ('CMD batch context mutation', 'call setup.cmd && go build -o tool.exe .', 'windows', False),
+        ('CMD implicit batch context mutation', 'setup.cmd && go build -o tool.exe .', 'windows', False),
+    ]:
+        source_root = 'C:/source' if shell == 'windows' else '/tmp/source'
+        result = subprocess.run(['bash', '-c', planner_driver, 'go-planner', str(root), source_root, command, shell],
+                                env=environment, capture_output=True, text=True, timeout=10)
+        planned = json.loads(result.stdout) if result.returncode == 0 else None
+        path_matches = (name not in expected_paths or isinstance(planned, dict) and
+                        bool(planned.get('operations')) and
+                        (planned['operations'][0]['cwd'], planned['operations'][0]['output']) == expected_paths[name])
+        check(name + (' remains admitted' if accepted else ' is refused before dispatch'),
+              (result.returncode == 0 and isinstance(planned, dict) and bool(planned.get('operations')) and path_matches)
+              if accepted else result.returncode != 0 and not result.stdout)
+else:
+    case, _ = run_case('explicit-file', 'go build -p=1 -buildvcs=false -o tool .')
+    check('go build leaves old GOBIN executable untouched', hashlib.sha256((case / 'installed/tool').read_bytes()).hexdigest() == stale_hash)
+    run_case('explicit-alias', 'go build -p=1 -buildvcs=false -o chosen-name .')
+    run_case('existing-directory', 'go build -p=1 -buildvcs=false -o dist .')
+    run_case('default-module-name', 'go build -p=1 -buildvcs=false .')
+    run_case('install-target', 'go install -p=1 -buildvcs=false .')
+    run_case('reviewed-goflags-directory', 'go build -p=1 -buildvcs=false .', overrides={'GOFLAGS': '-o=dist'})
+    run_case('command-overrides-goflags', 'go build -p=1 -buildvcs=false -o tool .', overrides={'GOFLAGS': '-o=dist'})
+    run_case('compile-only-decoy', 'go build -p=1 -buildvcs=false ./...', library=True, expected=False)
+    run_case('compile-only-then-producer', 'go build -p=1 -buildvcs=false ./... && go build -p=1 -buildvcs=false -o chosen-name .', library=True)
+    run_case('ambient-no-build', 'go build -p=1 -buildvcs=false -o tool .', inherited={'GOFLAGS': '-n'}, expected=False)
+    run_case('persisted-output', 'go build -p=1 -buildvcs=false .', expected=False,
+             overrides={'GOENV': '@CASE@/go-env'},
+             preparation=lambda case: write(case / 'go-env', 'GOFLAGS=-o=elsewhere\n'))
+    run_case('workspace-chain', 'go build -p=1 -buildvcs=false -o dist/alpha ./cmd/alpha && go build -p=1 -buildvcs=false -o dist/beta ./cmd/beta', family=['alpha', 'beta'])
+    run_case('unix-windows-explicit-no-suffix', 'go build -p=1 -buildvcs=false -o chosen-name .', platform='windows/amd64')
+    for name, command in [
+        ('exit-before-build', 'exit 0; go build -o tool .'),
+        ('mutating-go-env', 'go env -w GOFLAGS=-n; go build -o tool .; go env -u GOFLAGS'),
+        ('conditional-output', 'if true; then go build -o tool .; fi'),
+        ('prefix-expansion', 'GOBIN=@CASE@/source go build -o "$GOBIN/tool" .'),
+        ('prefix-cd-expansion', 'GOBIN=@CASE@/source cd "$GOBIN"; go build -o tool .'),
+        ('unexported-selector', 'GOBIN=@CASE@/source; go install .'),
+        ('declared-selector', 'declare -x GOFLAGS=-n; go build -o tool .'),
+    ]:
+        case, receipt = run_case(name, command, expected=False)
+        check(name + ' refuses before compiler dispatch', 'native_execution' not in receipt)
 
 print(f'Go native outputs: checks={checks} passed={checks-failures} failed={failures}', flush=True)
 raise SystemExit(bool(failures))
@@ -192,6 +271,10 @@ PY
 
 if [[ "${1:-}" == --go-outputs-only ]]; then
     test_go_native_output_selection
+    exit $?
+fi
+if [[ "${1:-}" == --go-command-context-only ]]; then
+    test_go_native_output_selection context
     exit $?
 fi
 
