@@ -3,6 +3,11 @@
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 MODULE="${DISPATCH_TEST_MODULE:-$ROOT/src/dispatch.sh}"
+TEST_MODE="${1:-}"
+[[ $# -eq 0 || ( $# -eq 1 && "$TEST_MODE" == --batch-interruption-only ) ]] || {
+    printf 'Usage: %s [--batch-interruption-only]\n' "$0" >&2
+    exit 4
+}
 WORK=$(mktemp -d)
 trap 'rm -rf -- "$WORK"' EXIT
 mkdir -p "$WORK/bin" "$WORK/cases"
@@ -46,6 +51,11 @@ case "${DP_MODE:-success}" in
     forbidden-rate) code=403; extra=$'Retry-After: 0\r\n' ;;
     secondary) code=429 ;;
     mixed) [[ "$repo" != owner/b ]] || code=422 ;;
+    batch-stopped)
+        if [[ "$repo" == owner/b ]]; then code=204; rc="${DP_STOP_STATUS:-130}"
+        elif [[ "$repo" == owner/a ]]; then sleep 0.15; fi ;;
+    batch-self-term)
+        if [[ "$repo" == owner/b ]]; then kill -TERM "$$"; exit 99; fi ;;
     stopped) code=204; rc="${DP_STOP_STATUS:-130}" ;;
     self-term) kill -TERM "$$"; exit 99 ;;
     delay) sleep 0.15 ;;
@@ -101,6 +111,105 @@ auth_inputs_empty() {
         return 1
     }
 }
+
+# Cancellation applies to the whole batch, including serial delivery. Already
+# admitted parallel siblings finish and retain their actual acknowledgements;
+# every later destination remains explicitly unstarted in the result.
+for scheduling in serial parallel; do
+    batch_args=()
+    [[ "$scheduling" != parallel ]] || batch_args=(--parallel)
+    for stopped in 130 124; do
+        new_case "batch-stop-$scheduling-$stopped"
+        export DP_MODE=batch-stopped DP_STOP_STATUS="$stopped"
+        capture dispatch_batch release --repos owner/a,owner/b,owner/c,owner/d \
+            ${batch_args[@]+"${batch_args[@]}"}
+        check "$scheduling batch stop $stopped preserves interruption exit" test "$status" -eq 5
+        check "$scheduling batch stop $stopped starts no later destinations" test "$(count)" -eq 2
+        check "$scheduling batch stop $stopped retains each destination's real outcome" jq -e \
+            --argjson stopped "$stopped" '
+                .status=="incomplete" and .exit_code==5 and
+                [.results[].repo]==["owner/a","owner/b","owner/c","owner/d"] and
+                [.results[].outcome]==["accepted","uncertain","pending","pending"] and
+                (.results[0] | .exit_code==0 and .attempts==1 and .http_status=="204") and
+                (.results[1] | .exit_code==5 and .attempts==1 and .http_status=="204" and
+                    .interruption=={stage:"transport",exit_code:$stopped,outcome:"unconfirmed"}) and
+                all(.results[2:][]; .exit_code==5 and .attempts==0 and .http_status==null and
+                    .retry_not_before==null and (has("interruption")|not))
+            ' "$CASE/out"
+        check "$scheduling batch stop $stopped reaps the admitted successful peer" test -s "$CASE/body-owner_a.json"
+    done
+    # Curl 5 is a proxy lookup failure, whereas delivery exit 5 is the public
+    # interruption status. The transport adapter keeps those domains separate.
+    for ordinary in 5 28; do
+        new_case "batch-ordinary-$scheduling-$ordinary"
+        export DP_MODE=batch-stopped DP_STOP_STATUS="$ordinary"
+        capture dispatch_batch release --repos owner/a,owner/b,owner/c,owner/d \
+            ${batch_args[@]+"${batch_args[@]}"}
+        check "$scheduling raw curl $ordinary remains an ordinary incomplete batch" test "$status" -eq 1
+        check "$scheduling raw curl $ordinary continues every unaffected destination" test "$(count)" -eq 4
+        check "$scheduling raw curl $ordinary keeps uncertainty without inventing interruption" jq -e \
+            '.exit_code==1 and [.results[].outcome]==["accepted","uncertain","accepted","accepted"] and
+             (.results[1] | .exit_code==8 and (has("interruption")|not))' "$CASE/out"
+    done
+done
+
+new_case batch-signalled-transport; export DP_MODE=batch-self-term
+capture bash "$MODULE" batch release --repos owner/a,owner/b,owner/c --parallel
+check 'standalone batch propagates actual transport signal interruption' test "$status" -eq 5
+check 'standalone batch stops before an unstarted destination' test "$(count)" -eq 2
+check 'standalone batch retains signal evidence and the admitted peer result' jq -e \
+    '.exit_code==5 and [.results[].outcome]==["accepted","uncertain","pending"] and
+     .results[1].http_status==null and .results[1].interruption.exit_code==143' "$CASE/out"
+
+# The actual worker can die before its delivery encoder runs. Retain the
+# unknown request outcome, stop admission and still reap every admitted peer.
+batch_receiptless_worker() (
+    _dp_deliver() {
+        if [[ "$1" == owner/b ]]; then
+            kill -KILL "$BASHPID"
+            return 99
+        fi
+        bash -c 'source "$1" || exit $?; shift; _dp_deliver "$@"' bash "$MODULE" "$@"
+    }
+    dispatch_batch release --repos owner/a,owner/b,owner/c "$@"
+)
+for scheduling in serial parallel; do
+    batch_args=()
+    [[ "$scheduling" != parallel ]] || batch_args=(--parallel)
+    new_case "batch-receiptless-$scheduling"
+    capture batch_receiptless_worker ${batch_args[@]+"${batch_args[@]}"}
+    check "$scheduling batch preserves receiptless worker interruption" test "$status" -eq 5
+    check "$scheduling batch performs only its surviving admitted peer POST" test "$(count)" -eq 1
+    check "$scheduling batch reports missing receipt conservatively without losing pending work" jq -e \
+        '.exit_code==5 and [.results[].outcome]==["accepted","uncertain","pending"] and
+         (.results[1] | .exit_code==5 and .http_status==null and
+            .interruption=={stage:"transport",exit_code:137,outcome:"unconfirmed"}) and
+         .results[2].attempts==0' "$CASE/out"
+done
+
+batch_failed_acknowledgement() (
+    _dp_deliver() {
+        if [[ "$1" == owner/b ]]; then
+            _dp_result "$1" "$2" accepted 0 1 204
+            return 5
+        fi
+        bash -c 'source "$1" || exit $?; shift; _dp_deliver "$@"' bash "$MODULE" "$@"
+    }
+    dispatch_batch release --repos owner/a,owner/b,owner/c
+)
+new_case batch-failed-acknowledgement
+capture batch_failed_acknowledgement
+check 'batch rejects an apparent acknowledgement followed by worker interruption' test "$status" -eq 5
+check 'batch never continues after a receipt and worker status conflict' test "$(count)" -eq 1
+check 'batch replaces an unconfirmed acknowledgement with uncertainty' jq -e \
+    '[.results[].outcome]==["accepted","uncertain","pending"] and
+     .results[1].http_status==null and .results[1].interruption.exit_code==5' "$CASE/out"
+
+if [[ "$TEST_MODE" == --batch-interruption-only ]]; then
+    printf '\nDispatch batch interruption checks: %d; failures: %d\n' "$checks" "$failures"
+    [[ "$failures" -eq 0 ]]
+    exit $?
+fi
 
 new_case success
 capture dispatch_event Owner/Repo release --payload '{"version":"v1.2.3"}'

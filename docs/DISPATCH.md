@@ -225,7 +225,16 @@ bash src/dispatch.sh batch custom-event --repos owner/a,owner/b --parallel
 ```
 
 Generic event/batch calls do not use the persistent release outbox. Their JSON
-results classify each target as accepted, rejected, rate-limited, or uncertain.
+results classify each target as accepted, rejected, rate-limited, blocked, or
+uncertain. A stopped generic batch returns exit `5` and lists destinations
+that never started as `pending`, with zero attempts and no HTTP status. In
+parallel mode, workers already admitted in the same wave are reaped and retain
+their individual results; no later wave starts. A missing receipt from a
+signalled worker remains uncertain, even if that worker emitted an apparent
+acknowledgement before exiting. Ordinary request failures still allow the rest
+of the batch to run. Inspect the returned outcomes before manually repeating a
+generic batch: unlike release outbox recovery, it has no saved deduplication
+history and repeats destinations that were already accepted.
 The release JSON includes the outbox path and all per-target outcomes, including
 pending work and invocation counts. JSON wrappers preserve nonzero process exits
 and keep diagnostics separate from structured details.

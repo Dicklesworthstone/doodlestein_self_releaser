@@ -321,31 +321,75 @@ dispatch_batch() (
     fi
     dispatch_check_auth || return $?
     command -v curl >/dev/null || return 3
-    local work i=0 index rc=0 failed=0 limit=1
-    local -a pids=()
+    local work i=0 index rc=0 failed=0 limit=1 stopped=false report_failed=false
+    local -a pids=() worker_repos=() worker_indices=()
     work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-dispatch-batch.XXXXXXXX") || return 1
     trap 'rm -rf -- "$work"' EXIT
     trap 'for index in "${pids[@]}"; do kill "$index" 2>/dev/null || :; done; wait; exit 5' HUP INT TERM
     [[ "$parallel" != true ]] || limit="${DISPATCH_PARALLELISM:-4}"
+    # Reap the complete admitted wave before deciding whether another may
+    # start. A sibling already in flight can still acknowledge its own POST;
+    # preserve that result without admitting any later wave after a stop.
+    _dp_batch_reap() {
+        local worker worker_status path
+        for ((worker=0; worker<${#pids[@]}; worker++)); do
+            worker_status=0
+            wait "${pids[$worker]}" || worker_status=$?
+            ((worker_status == 0)) || failed=$((failed + 1))
+            path="$work/${worker_indices[$worker]}"
+            if ((worker_status == 5)) || _dp_transport_stopped "$worker_status"; then
+                stopped=true
+                # A signal may kill the worker before its receipt is written,
+                # or after it emitted an apparent acknowledgement. Preserve a
+                # valid interrupted receipt; otherwise the request is unknown.
+                if [[ "$worker_status" != 5 ]] || ! jq -es --arg repo "${worker_repos[$worker]}" --arg event "$event" '
+                    length==1 and (.[0] | type=="object" and .repo==$repo and
+                        .event_type==$event and .exit_code==5 and
+                        (.outcome=="uncertain" or .outcome=="blocked") and
+                        (.attempts|type=="number" and floor==. and .>=0 and .<=10))
+                    ' "$path.raw" >/dev/null 2>&1; then
+                    _dp_result "${worker_repos[$worker]}" "$event" uncertain 5 1 '' null \
+                        "$worker_status" > "$path.json" || report_failed=true
+                    continue
+                fi
+            fi
+            cat -- "$path.raw" > "$path.json" || report_failed=true
+        done
+        pids=(); worker_repos=(); worker_indices=()
+    }
     while IFS= read -r repo; do
+        if $stopped; then
+            # These destinations never reached a worker or transport. Report
+            # the full requested inventory without fabricating HTTP attempts.
+            _dp_result "$repo" "$event" pending 5 0 '' > "$work/$i.json" || report_failed=true
+            i=$((i + 1))
+            continue
+        fi
         # A transport/auth descendant must not read the remaining repository
         # records from this loop's stdin. Isolate the whole delivery worker.
-        _dp_deliver "$repo" "$event" "$body" </dev/null > "$work/$i.json" &
-        pids+=("$!"); i=$((i + 1))
+        _dp_deliver "$repo" "$event" "$body" </dev/null > "$work/$i.raw" &
+        pids+=("$!"); worker_repos+=("$repo"); worker_indices+=("$i"); i=$((i + 1))
         if (( ${#pids[@]} >= limit )); then
-            for index in "${pids[@]}"; do wait "$index" || failed=$((failed + 1)); done
-            pids=()
+            _dp_batch_reap
         fi
     done <<< "$selected"
-    for index in "${pids[@]}"; do wait "$index" || failed=$((failed + 1)); done
+    _dp_batch_reap
     (( failed == 0 )) || rc=1
+    $stopped && rc=5
+    if $report_failed; then
+        ((rc == 5)) && return 5
+        return 1
+    fi
     # Reconcile against the requested inventory, not the number of workers the
     # loop happened to launch; a short dispatch must never report acceptance.
     jq -sc --argjson rc "$rc" --arg repos "$selected" '
         ($repos|split("\n")|sort) as $expected |
         if ([.[].repo]|sort) == $expected and all(.[]; type=="object" and has("outcome"))
         then {status:(if $rc==0 then "accepted" else "incomplete" end),exit_code:$rc,results:sort_by(.repo)}
-        else error("Missing or mismatched dispatch outcomes") end' "$work/"*.json || return 1
+        else error("Missing or mismatched dispatch outcomes") end' "$work/"*.json || {
+            ((rc == 5)) && return 5
+            return 1
+        }
     return "$rc"
 )
 
