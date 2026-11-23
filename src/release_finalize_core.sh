@@ -302,7 +302,11 @@ _rf_require() {
         # shellcheck source=src/sbom_release.sh
         source "$_RELEASE_FINALIZE_DIR/sbom_release.sh" || return 3
     fi
-    _sbr_require
+    _sbr_require || return $?
+    if ! declare -F _gh_operation_interrupted >/dev/null; then
+        # shellcheck source=src/github.sh
+        source "$_RELEASE_FINALIZE_DIR/github.sh" || return 3
+    fi
 }
 
 _rf_payload_require() {
@@ -1042,7 +1046,7 @@ _rf_execute_locked() {
         }
         [[ "$(_rf_hash "$file")" == "$oldhash" ]] || return 2
     fi
-    local context context_key initial_draft
+    local context context_key initial_draft observed_context selected_inventory
     if [[ "$create_draft" == true ]]; then
         # Use the planned note bytes, not a mutable file reread after preflight.
         preparation_notes="$work/release-notes"
@@ -1241,7 +1245,8 @@ _rf_execute_locked() {
         [[ "$(_rf_hash "$build_manifest")" == "$build_pin" ]] || return 2
         [[ "$(_rf_hash "$build_snapshot")" == "$build_pin" ]] || return 2
         _rf_integrity_inputs_gate "$work" || return $?
-        [[ "$(_sbr_context "$repo" "$tag" "$work")" == "$context" ]] || {
+        observed_context=$(_sbr_context "$repo" "$tag" "$work") || return $?
+        [[ "$observed_context" == "$context" ]] || {
             _rf_log 'Release changed before payload publication'; return 7;
         }
         payload_result=$(release_upload_payloads "$root" --build-manifest "$build_snapshot" \
@@ -1268,7 +1273,8 @@ _rf_execute_locked() {
             integrity_key=$(_rf_integrity_key "$saved" "$repo" "$tag" "$sha" "$integrity_token" \
                 "$integrity_hash" "$integrity_selection" "$integrity_documents") || return 7
             _RF_INTEGRITY_ASSETS=$(jq -cS '.assets' <<< "$integrity_key") || return 1
-            _rf_integrity_assets_gate "$(_sbr_inventory "$repo" "$(jq -r '.release.id' <<< "$context")" "$work")" || return $?
+            selected_inventory=$(_sbr_inventory "$repo" "$(jq -r '.release.id' <<< "$context")" "$work") || return $?
+            _rf_integrity_assets_gate "$selected_inventory" || return $?
         fi
         integrity_snapshot=$(_rf_integrity_snapshot "$integrity_dir" "$integrity_documents" "$work") || return $?
         _rf_integrity_inputs_gate "$work" || return $?
@@ -1301,7 +1307,8 @@ _rf_execute_locked() {
         if [[ "$saved" != null ]]; then
             _RF_PROVENANCE_KEY=$(_rf_provenance_key "$saved" "$repo" "$tag" "$sha" \
                 "$provenance_policy" "$provenance_documents") || return 7
-            _rf_provenance_assets_gate "$(_sbr_inventory "$repo" "$(jq -r .release.id <<< "$context")" "$work")" || return $?
+            selected_inventory=$(_sbr_inventory "$repo" "$(jq -r .release.id <<< "$context")" "$work") || return $?
+            _rf_provenance_assets_gate "$selected_inventory" || return $?
         fi
         result=$(slsa_publish_release "$provenance_file" "$root" "${provenance_args[@]}") || return $?
         provenance_result=$(jq -ecsS 'if length==1 and (.[0]|.kind=="dsr-slsa-publication" and
@@ -1333,7 +1340,8 @@ _rf_execute_locked() {
     fi
     state=$(jq -cS --arg sha "$pin" '.manifest_sha256=$sha' <<< "$state") || return 1
     oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
-    [[ "$(_sbr_context "$repo" "$tag" "$work")" == "$context" ]] || { _rf_log 'Release changed before SBOM publication'; return 7; }
+    observed_context=$(_sbr_context "$repo" "$tag" "$work") || return $?
+    [[ "$observed_context" == "$context" ]] || { _rf_log 'Release changed before SBOM publication'; return 7; }
     if [[ "$require_signatures" == true ]]; then
         local integrity_inventory
         integrity_inventory=$(_sbr_inventory "$repo" "$(jq -r '.release.id' <<< "$context")" "$work") || return $?
@@ -1384,6 +1392,10 @@ _rf_execute_locked() {
         _rf_gate "$repo" "$tag" "$sha" "$evidence" true "$manifest" "$work" || return $?
         promotion_attempted=true
         _rf_promote "$repo" "$(jq -r '.release.id' <<< "$verification")" "$work" || promotion_rc=$?
+        if _gh_operation_interrupted "$promotion_rc"; then
+            _rf_log "Draft promotion interrupted (exit $promotion_rc); explicit recovery is required"
+            return 5
+        fi
         # Reconcile a lost PATCH acknowledgement by reading actual state, not by
         # replaying the PATCH. The same verification runs after a process restart.
         verification=$(sbom_verify_release --repo "$repo" --tag "$tag" --format "$format" --manifest-sha256 "$pin") || return $?

@@ -9,6 +9,7 @@ on:
       - src/dispatch.sh
       - src/version.sh
       - src/release_finalize_core.sh
+      - src/release_prepare.sh
       - src/release_integrity.sh
       - src/release_payloads.sh
       - src/sbom.sh
@@ -21,6 +22,8 @@ on:
       - scripts/tests/test_release_payloads.sh
       - scripts/tests/test_release_payload_pipeline.sh
       - scripts/tests/test_release_finalize.sh
+      - scripts/tests/test_release_prepare.sh
+      - scripts/tests/test_release_prepare_finalize.sh
       - scripts/tests/test_release_integrity.sh
       - scripts/tests/test_release_integrity_finalize.sh
       - scripts/tests/test_sbom_batch.sh
@@ -170,6 +173,42 @@ jobs:
           timeout 120 bash scripts/tests/test_sbom_batch.sh
           timeout 120 bash scripts/tests/test_sbom_publish.sh
           test -z "$(git status --porcelain)"
+  draft-custody:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install draft custody regression dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends git jq python3 shellcheck curl util-linux coreutils procps
+          mkdir -p "$RUNNER_TEMP/draft-custody-evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/draft-custody-evidence/head.txt"
+      - name: Validate interrupted draft creation and promotion recovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(src/release_prepare.sh src/release_finalize_core.sh
+                 scripts/tests/test_release_prepare.sh scripts/tests/test_release_prepare_finalize.sh)
+          for source in "${files[@]}"; do
+            bash -n "$source"
+            shellcheck -S warning "$source"
+          done
+          timeout 120 bash scripts/tests/test_release_prepare.sh 2>&1 | tee "$RUNNER_TEMP/draft-custody-evidence/preparation.log"
+          timeout 120 bash scripts/tests/test_release_prepare_finalize.sh 2>&1 | tee "$RUNNER_TEMP/draft-custody-evidence/finalization.log"
+          test -z "$(git status --porcelain)"
+      - name: Retain draft custody validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: draft-custody-evidence
+          path: ${{ runner.temp }}/draft-custody-evidence
+          retention-days: 7
+          if-no-files-found: error
   signed-finalization:
     runs-on: ubuntu-24.04
     timeout-minutes: 15

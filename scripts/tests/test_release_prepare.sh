@@ -3,25 +3,47 @@
 # Bash, jq, hashing, locks, argument validation, atomic state and processes are real.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
+# Keep the real adapter status policy loaded before replacing transport only.
+# shellcheck source=src/github.sh
+source "$ROOT/src/github.sh"
 # shellcheck source=src/release_prepare.sh
-source "$ROOT/src/release_prepare.sh"
+source "${PREPARE_TEST_MODULE:-$ROOT/src/release_prepare.sh}"
 TMP=$(mktemp -d)
 CASE='' OUT='' RC=0 PASSED=0 FAILED=0 TOTAL=0
 SHA=1111111111111111111111111111111111111111
 OTHER=2222222222222222222222222222222222222222
+# A transport may finish its remote effect, print a complete response, and
+# still return a terminal status. Inject one such result and record the exact
+# boundary so every later request or write is independently observable.
+fixture_stop() {
+    local boundary="$1" selected='' occurrence=0 status=0 seen=0
+    [[ -f "$CASE/stop-request" && ! -e "$CASE/stop-seen" ]] || return 0
+    read -r selected occurrence status < "$CASE/stop-request" || return 1
+    [[ "$boundary" == "$selected" ]] || return 0
+    [[ ! -f "$CASE/stop-count" ]] || read -r seen < "$CASE/stop-count"
+    seen=$((seen+1))
+    printf '%s\n' "$seen" > "$CASE/stop-count"
+    ((seen == occurrence)) || return 0
+    printf 'STOP %s %s\n' "$boundary" "$status" >> "$CASE/calls"
+    printf '%s\n' "$status" > "$CASE/stop-seen"
+    return "$status"
+}
 # These replace authentication, transport and the transport timeout only.
 _sbr_require() { [[ ! -e "$CASE/auth-fail" ]]; }
 _sbr_run() { "$@"; }
 gh_resolve_tag_sha() {
     [[ ! -e "$CASE/tag-missing" ]] || return 7
-    cat "$CASE/sha"
+    cat "$CASE/sha" || return $?
+    fixture_stop tag
 }
 _sbr_api() {
+    local boundary=''
     printf 'GET %s\n' "$1" >> "$CASE/calls"
     [[ ! -e "$CASE/read-fail" ]] || return 8
     case "$1" in
-        repos/acme/tool) cat "$CASE/repository" ;;
+        repos/acme/tool) boundary=repository; cat "$CASE/repository" ;;
         repos/acme/tool/releases\?*)
+            boundary=listing
             if [[ -e "$CASE/list-bad" ]]; then printf '{}\n'; return; fi
             if [[ -e "$CASE/list-multiple-json" ]]; then printf '[]\n[]\n'; return; fi
             if [[ -e "$CASE/repeated-pages" ]]; then
@@ -33,24 +55,28 @@ _sbr_api() {
                 jq -nc '[{id:41,tag_name:"v1.2.3"},{id:42,tag_name:"v1.2.3"}]'
             elif [[ -e "$CASE/release" ]]; then jq -c '[.]' "$CASE/release"
             else printf '[]\n'; fi ;;
-        repos/acme/tool/releases/*) [[ -e "$CASE/release" ]] && cat "$CASE/release" ;;
+        repos/acme/tool/releases/*) boundary=context; [[ -e "$CASE/release" ]] && cat "$CASE/release" ;;
         *) return 8 ;;
-    esac
+    esac || return $?
+    fixture_stop "$boundary"
 }
 gh() {
     if [[ "${5:-}" == PATCH ]]; then
         [[ "$1 $2 $3 $4 $5 $6 $7" == 'api --hostname github.com --method PATCH repos/acme/tool/releases/42 --input' ]] || return 98
         jq -e '.=={draft:false,make_latest:"false"}' "$8" >/dev/null || return 98
         printf 'PATCH\n' >> "$CASE/calls"
+        fixture_stop promote-before || return $?
         [[ ! -e "$CASE/patch-fail" ]] || return 8
         mutate "$CASE/release" '.draft=false' || return 1
         [[ ! -e "$CASE/patch-lost" ]] || return 8
-        cat "$CASE/release"
+        cat "$CASE/release" || return $?
+        fixture_stop promote || return $?
         return
     fi
     [[ "$1 $2 $3 $4 $5 $6 $7" == 'api --hostname github.com --method POST repos/acme/tool/releases --input' ]] || return 98
     printf 'POST\n' >> "$CASE/calls"
     cp "$8" "$CASE/request"
+    fixture_stop create-before || return $?
     [[ ! -e "$CASE/post-slow" ]] || sleep 1
     [[ ! -e "$CASE/post-fail" ]] || return 22
     [[ ! -e "$CASE/false-success" ]] || { printf '{}\n'; return 0; }
@@ -64,6 +90,7 @@ gh() {
     [[ ! -e "$CASE/post-duplicate" ]] || touch "$CASE/duplicate"
     [[ ! -e "$CASE/lost-ack" ]] || return 8
     if [[ -e "$CASE/wrong-id" ]]; then printf '{"id":99}\n'; else cat "$CASE/release"; fi
+    fixture_stop create
 }
 new_case() {
     CASE=$(mktemp -d "$TMP/case.XXXXXXXX")
@@ -84,6 +111,7 @@ check() {
 }
 assert_rc() { [[ "$RC" -eq "$1" ]]; }
 posts() { [[ $(grep -c '^POST$' "$CASE/calls" || true) -eq "$1" ]]; }
+stopped_last() { [[ -f "$CASE/stop-seen" && "$(tail -n 1 "$CASE/calls")" == STOP\ * ]]; }
 json() { jq -es "$1" <<< "$OUT" >/dev/null 2>&1; }
 state_file() { find "$CASE/state" -name state.json -type f; }
 mutate() {
@@ -93,6 +121,83 @@ mutate() {
 }
 
 [[ "${DSR_PREPARE_FIXTURES_ONLY:-false}" != true ]] || return 0
+
+test_terminal_creation() {
+    local status original_request selected="${1:-all}"
+    case "$selected" in all|2|5|124|125|130|143) ;; *) return 4 ;; esac
+    for status in 2 5 124 125 130 143; do
+        [[ "$selected" == all || "$selected" == "$status" ]] || continue
+        new_case
+        printf 'create 1 %s\n' "$status" > "$CASE/stop-request"
+        run
+        check assert_rc 5
+        check json 'length==1 and (.[0]|.status=="error" and .exit_code==5)'
+        check stopped_last
+        check posts 1
+        check jq -e '.phase=="uncertain" and .attempts==1 and .candidate_id==null and .context==null' "$(state_file)"
+        check jq -e '.id==42 and .draft==true' "$CASE/release"
+        original_request=$(_rp_hash < "$CASE/request")
+        # A new invocation may reconcile the accepted draft without another
+        # POST. The stopped invocation may not make that decision itself.
+        run
+        check assert_rc 0
+        check posts 1
+        check json '.[0].context.release.id==42 and .[0].creation_attempts==1'
+        check test "$(_rp_hash < "$CASE/request")" = "$original_request"
+    done
+    [[ "$selected" == all || "$selected" == 5 ]] || return 0
+    new_case
+    printf 'create-before 1 5\n' > "$CASE/stop-request"
+    run
+    check assert_rc 5
+    check stopped_last
+    check posts 1
+    check test ! -e "$CASE/release"
+    run
+    check assert_rc 2
+    check posts 1
+    run --retry-uncertain
+    check assert_rc 0
+    check posts 2
+}
+
+test_terminal_preparation_reads() {
+    local probe boundary occurrence selected="${1:-all}"
+    case "$selected" in all|tag:2|tag:3|tag:4|tag:5|listing:3|context:2) ;; *) return 4 ;; esac
+    # Pre-intent, pre-POST, post-POST and final source checks, followed by the
+    # last listing and context checks that bind a preparation receipt.
+    for probe in tag:2 tag:3 tag:4 tag:5 listing:3 context:2; do
+        [[ "$selected" == all || "$selected" == "$probe" ]] || continue
+        boundary="${probe%:*}"; occurrence="${probe#*:}"
+        new_case
+        printf '%s %s 5\n' "$boundary" "$occurrence" > "$CASE/stop-request"
+        run
+        check assert_rc 5
+        check stopped_last
+        check json '.[0].status=="error" and .[0].exit_code==5'
+        check jq -e '.phase!="prepared"' "$(state_file)"
+        run
+        # Pre-POST uncertainty still requires explicit retry; once a draft
+        # exists the same retained intent is sufficient to recover it.
+        if [[ ! -e "$CASE/release" && "$RC" -eq 2 ]]; then run --retry-uncertain; fi
+        check assert_rc 0
+        check posts 1
+        check json '.[0].context.release.id==42'
+    done
+}
+
+case "${1:-}" in
+    --terminal-creation-only|--terminal-reads-only|--terminal-creation=*|--terminal-reads=*)
+        case "$1" in
+            --terminal-creation-only) test_terminal_creation ;;
+            --terminal-reads-only) test_terminal_preparation_reads ;;
+            --terminal-creation=*) test_terminal_creation "${1#*=}" || exit $? ;;
+            --terminal-reads=*) test_terminal_preparation_reads "${1#*=}" || exit $? ;;
+        esac
+        printf '%s checks: %s passed, %s failed. Fixtures retained at %s\n' "$TOTAL" "$PASSED" "$FAILED" "$TMP"
+        ((FAILED==0))
+        exit $? ;;
+esac
 
 test_large_notes() {
     new_case
@@ -147,6 +252,9 @@ if [[ "${1:-}" == --large-notes-only ]]; then
     ((FAILED==0))
     exit $?
 fi
+
+test_terminal_creation
+test_terminal_preparation_reads
 
 new_case
 run --existing-only

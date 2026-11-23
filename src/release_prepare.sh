@@ -17,7 +17,11 @@ _rp_require() {
     fi
     command -v gh >/dev/null || { _rp_log 'gh is required'; return 3; }
     dsr_lock_available || return $?
-    _sbr_require
+    _sbr_require || return $?
+    if ! declare -F _gh_operation_interrupted >/dev/null; then
+        # shellcheck source=src/github.sh
+        source "$_RELEASE_PREPARE_DIR/github.sh" || return 3
+    fi
 }
 
 _rp_hash() (
@@ -204,6 +208,7 @@ _rp_execute() (
     mkdir -p -- "$root" || return 1
     root=$(cd "$root" && pwd -P) || return 1
     local key session file state old=absent source saved id context response='' post_rc=0 candidate=null request
+    local observed_source observed_id observed_context
     key=$(jq -cnS --arg repo "$repo" --arg tag "$tag" '{repo:$repo,tag:$tag}' | _rp_hash) || return $?
     session="$root/$key"
     [[ ! -L "$session" ]] || return 2
@@ -243,15 +248,17 @@ _rp_execute() (
         if [[ "$(jq -r .phase <<< "$state")" != pending && "$retry" != true ]]; then
             _rp_log 'Creation outcome is uncertain; inspect GitHub before --retry-uncertain'; return 2
         fi
-        [[ "$(_rp_source "$plan")" == "$source" ]] || return 7
+        observed_source=$(_rp_source "$plan") || return $?
+        [[ "$observed_source" == "$source" ]] || return 7
         state=$(jq -cS '.phase="sending"|.attempts+=1' <<< "$state") || return 1
         old=$(_rp_save "$file" "$state" "$old" "$plan") || return $?
         request=$(mktemp "$session/.request.XXXXXXXX") || return 1
         jq -cS .request <<< "$plan" > "$request" || return 1
         chmod 400 "$request" || return 1
         # No mutation is allowed after an unpersisted or externally edited intent.
-        [[ "$(_rp_hash < "$file")" == "$old" && "$(_rp_source "$plan")" == "$source" &&
-           "$(_rp_hash < "$file")" == "$old" &&
+        [[ "$(_rp_hash < "$file")" == "$old" ]] || return 2
+        observed_source=$(_rp_source "$plan") || return $?
+        [[ "$observed_source" == "$source" && "$(_rp_hash < "$file")" == "$old" &&
            "$(_rp_hash < "$request")" == "$(jq -cS .request <<< "$plan" | _rp_hash)" ]] || return 2
         response=$(_rp_post "$repo" "$request" 2>/dev/null) || post_rc=$?
         if ((post_rc==0)); then
@@ -260,7 +267,16 @@ _rp_execute() (
         fi
         state=$(jq -cS --argjson candidate "$candidate" '.phase="uncertain"|.candidate_id=$candidate' <<< "$state") || return 1
         old=$(_rp_save "$file" "$state" "$old" "$plan") || return $?
-        [[ "$(_rp_source "$plan")" == "$source" ]] || return 7
+        # A cancelled POST may already have created the draft. Keep its exact
+        # intent for an explicit retry, but do not read or publish anything
+        # else in the stopped invocation. Ordinary lost acknowledgements still
+        # reconcile below without replaying the non-idempotent POST.
+        if _gh_operation_interrupted "$post_rc"; then
+            _rp_log "Draft creation interrupted (exit $post_rc); recovery state retained at $file"
+            return 5
+        fi
+        observed_source=$(_rp_source "$plan") || return $?
+        [[ "$observed_source" == "$source" ]] || return 7
         id=$(_rp_find "$repo" "$tag") || return $?
         [[ "$id" != null ]] || {
             _rp_log 'Creation could not be confirmed; no automatic POST retry'; return 8;
@@ -282,8 +298,12 @@ _rp_execute() (
     fi
     # Check the full listing again, not just the selected ID: duplicate drafts
     # created by another machine must block handoff to finalization.
-    [[ "$(_rp_source "$plan")" == "$source" && "$(_rp_find "$repo" "$tag")" == "$id" &&
-       "$(_rp_context "$plan" "$source" "$id")" == "$context" ]] || return 7
+    observed_source=$(_rp_source "$plan") || return $?
+    [[ "$observed_source" == "$source" ]] || return 7
+    observed_id=$(_rp_find "$repo" "$tag") || return $?
+    [[ "$observed_id" == "$id" ]] || return 7
+    observed_context=$(_rp_context "$plan" "$source" "$id") || return $?
+    [[ "$observed_context" == "$context" ]] || return 7
     state=$(jq -cS --argjson context "$context" '.phase="prepared"|.context=$context' <<< "$state") || return 1
     old=$(_rp_save "$file" "$state" "$old" "$plan") || return $?
     printf '%s\n' "$plan" "$context" | jq -cs --argjson attempts "$(jq -r .attempts <<< "$state")" --arg file "$file" \

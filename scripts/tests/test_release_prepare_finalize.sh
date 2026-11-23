@@ -77,7 +77,8 @@ _sbr_context() {
     source=$(_rp_source "$plan") || return $?
     id=$(_rp_find acme/tool v1.2.3) || return $?
     [[ "$id" != null ]] || return 7
-    _rp_context "$plan" "$source" "$id"
+    _rp_context "$plan" "$source" "$id" || return $?
+    fixture_stop final-context
 }
 _sbr_inventory() { cat "$CASE/inventory"; }
 _sbr_inventory_sha256() { jq -cS 'sort_by(.name)' <<< "$1" | _rf_digest; }
@@ -193,6 +194,76 @@ final_state() { find "$CASE/finalize" -maxdepth 2 -type f -name state.json; }
 
 [[ "${DSR_PREPARE_FINALIZE_FIXTURES_ONLY:-false}" != true ]] || return 0
 
+test_terminal_pipeline() {
+    local selected="${1:-all}" probe boundary status original_manifest original_payload preparation
+    case "$selected" in all|create:5|create:130|promote:5|promote:143|promote-before:5|context:1|context:3) ;; *) return 4 ;; esac
+    for probe in create:5 create:130 promote:5 promote:143 promote-before:5 context:1 context:3; do
+        [[ "$selected" == all || "$selected" == "$probe" ]] || continue
+        boundary="${probe%:*}"; status="${probe#*:}"
+        new_pipeline
+        original_manifest=$(_rf_hash "$CASE/build.json")
+        original_payload=$(_rf_hash "$CASE/artifacts/tool.tar.gz")
+        if [[ "$boundary" == context ]]; then
+            printf 'final-context %s 5\n' "$status" > "$CASE/stop-request"
+        else
+            printf '%s 1 %s\n' "$boundary" "$status" > "$CASE/stop-request"
+        fi
+        create_pipeline --promote --tool tool --dispatch-repos acme/checksums
+        check assert_rc 5
+        check json 'length==1 and (.[0]|.status=="error" and .exit_code==5)'
+        check stopped_last
+        check posts 1
+        check count 'DISPATCH false' 0
+        case "$boundary" in
+            create)
+                check count UPLOAD 0
+                check count SBOM_UPLOAD 0
+                check count PATCH 0
+                preparation=$(find "$CASE/finalize" -path '*/preparation/*/state.json' -type f)
+                check jq -e '.phase=="uncertain" and .attempts==1 and .context==null' "$preparation"
+                check jq -e '.id==42 and .draft==true' "$CASE/release" ;;
+            promote|promote-before)
+                check count UPLOAD 1
+                check count SBOM_UPLOAD 2
+                check count PATCH 1
+                check jq -e '.phase=="promoting" and .promotion_attempts==1' "$(final_state)"
+                if [[ "$boundary" == promote ]]; then
+                    check jq -e '.id==42 and .draft==false' "$CASE/release"
+                else check jq -e '.id==42 and .draft==true' "$CASE/release"; fi ;;
+            context)
+                if [[ "$status" == 1 ]]; then check count UPLOAD 0
+                else check count UPLOAD 1; fi
+                check count SBOM_UPLOAD 0
+                check count PATCH 0
+                check jq -e '.phase=="preparing"' "$(final_state)" ;;
+        esac
+        check test "$(_rf_hash "$CASE/build.json")" = "$original_manifest"
+        check test "$(_rf_hash "$CASE/artifacts/tool.tar.gz")" = "$original_payload"
+        # The same command explicitly reconciles its owned draft or already
+        # public release, reusing the exact accepted payloads and metadata.
+        create_pipeline --promote --tool tool --dispatch-repos acme/checksums
+        check assert_rc 0
+        check json '.[0].status=="complete" and .[0].verification.release.id==42'
+        check posts 1
+        check count UPLOAD 1
+        check count SBOM_UPLOAD 2
+        if [[ "$boundary" == promote-before ]]; then check count PATCH 2
+        else check count PATCH 1; fi
+        check count 'DISPATCH false' 1
+        check test "$(_rf_hash "$CASE/build.json")" = "$original_manifest"
+        check test "$(_rf_hash "$CASE/artifacts/tool.tar.gz")" = "$original_payload"
+    done
+}
+
+case "${1:-}" in
+    --terminal-only|--terminal=*)
+        if [[ "$1" == --terminal-only ]]; then test_terminal_pipeline
+        else test_terminal_pipeline "${1#*=}" || exit $?; fi
+        printf '%s checks: %s passed, %s failed. Fixtures retained at %s\n' "$TOTAL" "$PASSED" "$FAILED" "$TMP"
+        ((FAILED==0))
+        exit $? ;;
+esac
+
 test_large_note_finalization() {
     new_pipeline
     jq -nrj '"\\" * 65534 + "\n\n"' > "$CASE/notes"
@@ -235,6 +306,8 @@ if [[ "${1:-}" == --large-notes-only ]]; then
     ((FAILED==0))
     exit $?
 fi
+
+test_terminal_pipeline
 
 new_pipeline
 create_pipeline --dry-run
