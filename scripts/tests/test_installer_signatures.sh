@@ -759,9 +759,16 @@ def archive(path, source):
 valid = root / 'valid-source'
 source_tree(valid)
 valid_archive = archive(root / 'valid.tar.gz', valid)
+# Recent Git versions may detach automatic maintenance after commit/fetch.
+# These tiny fixtures need no maintenance, and snapshots must not race its
+# transient lock files or unrelated background mutations.
+fixture_git_config = '[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n'
+fixture_configuration = root / 'fixture.gitconfig'
+fixture_configuration.write_text(fixture_git_config)
 git_environment = os.environ.copy()
 git_environment.update(GIT_AUTHOR_NAME='DSR fixture', GIT_AUTHOR_EMAIL='fixture@example.invalid',
-                       GIT_COMMITTER_NAME='DSR fixture', GIT_COMMITTER_EMAIL='fixture@example.invalid')
+                       GIT_COMMITTER_NAME='DSR fixture', GIT_COMMITTER_EMAIL='fixture@example.invalid',
+                       GIT_CONFIG_GLOBAL=str(fixture_configuration), GIT_CONFIG_NOSYSTEM='1')
 for args in (['-c', 'init.defaultBranch=main', 'init', str(valid)],
              ['-C', str(valid), 'add', '.'],
              ['-C', str(valid), 'commit', '-m', 'Fixture release'],
@@ -823,10 +830,20 @@ exec "$DSR_FIXTURE_REAL_LN" "$@"
 ''')
     wrappers.joinpath('git').write_text('''#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$DSR_FIXTURE_CASE/git.calls"
-if [[ "$1" == clone && "${DSR_FIXTURE_FAULT:-}" == stalled-clone ]]; then
+original=("$@")
+directory=''
+while (($#)); do
+  case "$1" in
+    -C) directory="$2"; shift 2 ;;
+    -c|--git-dir|--work-tree) shift 2 ;;
+    --git-dir=*|--work-tree=*) shift ;;
+    *) break ;;
+  esac
+done
+if [[ "${1:-}" == clone && "${DSR_FIXTURE_FAULT:-}" == stalled-clone ]]; then
   exec "$DSR_FIXTURE_CASE/wrappers/stall-request"
 fi
-if [[ "${3:-}" == fetch && "${DSR_FIXTURE_FAULT:-}" == stalled-credential ]]; then
+if [[ "${1:-}" == fetch && "${DSR_FIXTURE_FAULT:-}" == stalled-credential ]]; then
   # Exercise genuine Git credential-helper dispatch underneath the supervised
   # acquisition. No remote is contacted and the helper never returns a token.
   printf 'protocol=https\\nhost=github.com\\n\\n' |
@@ -834,16 +851,16 @@ if [[ "${3:-}" == fetch && "${DSR_FIXTURE_FAULT:-}" == stalled-credential ]]; th
       -c "credential.helper=!\\\"$DSR_FIXTURE_CASE/wrappers/stall-request\\\"" credential fill
   exit $?
 fi
-if [[ "$1" == clone && "${DSR_FIXTURE_FAULT:-}" == partial-clone ]]; then
+if [[ "${1:-}" == clone && "${DSR_FIXTURE_FAULT:-}" == partial-clone ]]; then
   mkdir -p -- "${@: -1}"
   printf 'partial clone fixture\\n' > "${@: -1}/partial"
   exit 42
 fi
-if [[ "${DSR_FIXTURE_FAULT:-}" == partial-tag-fetch && "${3:-}" == fetch ]]; then
-  printf 'partial tag fetch fixture\\n' > "$2/partial"
+if [[ "${DSR_FIXTURE_FAULT:-}" == partial-tag-fetch && "${1:-}" == fetch ]]; then
+  printf 'partial tag fetch fixture\\n' > "$directory/partial"
   exit 42
 fi
-exec "$DSR_FIXTURE_REAL_GIT" "$@"
+exec "$DSR_FIXTURE_REAL_GIT" "${original[@]}"
 ''')
     wrappers.joinpath('stall-request').write_text('''#!/usr/bin/env bash
 exec "$DSR_FIXTURE_PYTHON" "$DSR_FIXTURE_CASE/stall.py"
@@ -861,7 +878,7 @@ time.sleep(30)
     for path in wrappers.iterdir():
         path.chmod(0o755)
     configuration = task_home / '.gitconfig'
-    configuration.write_text('[url "' + valid.as_uri() + '"]\n'
+    configuration.write_text(fixture_git_config + '[url "' + valid.as_uri() + '"]\n'
                              '\tinsteadOf = https://github.com/Dicklesworthstone/doodlestein_self_releaser.git\n')
     environment = os.environ.copy()
     for key in ('REPO_DIR', 'DSR_DEST', 'DSR_REPO_DIR', 'DSR_DATA_DIR', 'GIT_DIR', 'GIT_WORK_TREE', 'DSR_INSTALLER_TIMEOUT'):
@@ -965,7 +982,7 @@ def request_case(label, fault, arguments, cancel=None, skills=False):
                      'stalled-network': 1, 'stalled-clone': 1, 'stalled-credential': 1,
                      'stalled-skill': 2}[fault]
     check(label + ' does not start a later HTTP acquisition', len(http) == expected_http)
-    acquisitions = [line for line in git if line.startswith('clone ') or ' fetch ' in line]
+    acquisitions = [line for line in git if line.startswith('clone ') or ' clone ' in line or ' fetch ' in line]
     check(label + ' does not retry source acquisition', len(acquisitions) == (1 if fault in ('stalled-clone', 'stalled-credential', 'stalled-skill') else 0))
     if skills:
         check(label + ' keeps its successfully activated source usable', run([str(target / 'dsr')]).stdout.strip() == 'new')
@@ -1120,7 +1137,7 @@ def release_repository(name, branch='main', tag='', annotated=False):
 
 def point_to_remote(context, remote):
     Path(context[3]['GIT_CONFIG_GLOBAL']).write_text(
-        '[url "' + remote.as_uri() + '"]\n'
+        fixture_git_config + '[url "' + remote.as_uri() + '"]\n'
         '\tinsteadOf = https://github.com/Dicklesworthstone/doodlestein_self_releaser.git\n')
 
 branch_only, _ = release_repository('branch-only-remote', branch='v1.2.3')
@@ -1174,6 +1191,92 @@ result = invoke(context, ['--version', 'main'])
 check('explicit main continues to select the main branch', result.returncode == 0 and
       run([real_git, '-C', str(context[1]), 'symbolic-ref', '--short', 'HEAD']).stdout.strip() == 'main' and
       run([str(context[2] / 'dsr')]).stdout.strip() == 'release-tag')
+
+# Installers may be called from Git hooks or wrappers that export repository
+# plumbing. Real Git must write only to the private candidate, not to that
+# caller's worktree, index, object storage, shallow file, or configuration.
+# The URL rewrite remains configured globally: suppressing all user Git config
+# would hide the fault by breaking acquisition instead of isolating it.
+isolation_cases = [(name, 'v1.2.3') for name in (
+    'repository', 'common-directory', 'index', 'objects', 'shallow',
+    'namespace', 'config-file', 'config-count', 'config-parameters',
+    'templates', 'hooks', 'relative-path')]
+isolation_cases.extend((name, 'main') for name in ('index', 'templates', 'hooks'))
+for label, requested in isolation_cases:
+    context = setup('git-isolation-' + label + '-' + requested)
+    case, selected, target, environment = context
+    caller = case / 'caller'
+    git_checked('init', '-q', str(caller))
+    (caller / 'keep.txt').write_text('unrelated caller work\n')
+    hooks = case / 'hooks'
+    hooks.mkdir()
+    for hook in ('post-checkout', 'fsmonitor'):
+        script = hooks / hook
+        script.write_text('#!/usr/bin/env bash\nprintf invoked >> "$DSR_FIXTURE_CASE/hook-called"\n')
+        script.chmod(0o755)
+    if label == 'repository':
+        environment.update(GIT_DIR=str(caller / '.git'), GIT_WORK_TREE=str(caller),
+                           GIT_INDEX_FILE=str(caller / '.git/index'))
+    elif label == 'common-directory':
+        environment['GIT_COMMON_DIR'] = str(caller / '.git')
+    elif label == 'index':
+        environment['GIT_INDEX_FILE'] = str(caller / '.git/index')
+    elif label == 'objects':
+        environment.update(GIT_OBJECT_DIRECTORY=str(caller / '.git/objects'),
+                           GIT_ALTERNATE_OBJECT_DIRECTORIES=str(valid / '.git/objects'))
+    elif label == 'shallow':
+        environment['GIT_SHALLOW_FILE'] = str(caller / '.git/shallow')
+    elif label == 'namespace':
+        environment.update(GIT_NAMESPACE='caller-private', GIT_IMPLICIT_WORK_TREE='0',
+                           GIT_PREFIX='caller/', GIT_REPLACE_REF_BASE='refs/caller-replace/',
+                           GIT_NO_REPLACE_OBJECTS='0')
+    elif label == 'config-file':
+        environment['GIT_CONFIG'] = str(caller / '.git/config')
+    elif label == 'config-count':
+        environment.update(GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='core.worktree',
+                           GIT_CONFIG_VALUE_0=str(caller))
+    elif label == 'config-parameters':
+        environment['GIT_CONFIG_PARAMETERS'] = "'core.worktree'='" + str(caller) + "'"
+    elif label == 'templates':
+        template = case / 'git-template'
+        template.mkdir()
+        (template / 'config').write_text('[core]\n\tworktree = ' + str(caller) + '\n')
+        shutil.copytree(hooks, template / 'hooks')
+        environment['GIT_TEMPLATE_DIR'] = str(template)
+        with Path(environment['GIT_CONFIG_GLOBAL']).open('a') as output:
+            output.write('[init]\n\ttemplateDir = ' + str(template) + '\n')
+    elif label == 'hooks':
+        with Path(environment['GIT_CONFIG_GLOBAL']).open('a') as output:
+            output.write('[core]\n\thooksPath = ' + str(hooks) + '\n\tfsmonitor = ' + str(hooks / 'fsmonitor') + '\n')
+    caller_before, caller_id = tree_snapshot(caller), identity(caller)
+    arguments = ['--version', requested]
+    if label == 'relative-path':
+        arguments.extend(['--repo-dir', os.path.relpath(selected), '--dest', os.path.relpath(target)])
+    description = requested + ' with ' + label
+    result = invoke(context, arguments)
+    check(description + ' cannot redirect public source installation', result.returncode == 0 and
+          run([str(target / 'dsr')]).stdout.strip() == 'new')
+    check(description + ' preserves every caller file, Git object, index, and configuration',
+          tree_snapshot(caller) == caller_before and identity(caller) == caller_id)
+    check(description + ' leaves an independent candidate repository',
+          (selected / '.git').is_dir() and
+          run([real_git, '-C', str(selected), 'rev-parse', '--verify', 'HEAD']).stdout.strip() ==
+          git_checked('-C', str(valid), 'rev-parse', 'HEAD') and
+          (selected / '.git/index').is_file())
+    check(description + ' never executes inherited hooks or filesystem monitors', not (case / 'hook-called').exists())
+    if requested != 'main':
+        before, old_id = tree_snapshot(selected), identity(selected)
+        calls = (case / 'git.calls').read_text()
+        acquired = result.returncode == 0
+        if acquired:
+            result = invoke(context, arguments)
+        later = (case / 'git.calls').read_text()[len(calls):]
+        check(description + ' readback recognizes its own exact installed tag', acquired and result.returncode == 0 and
+              tree_snapshot(selected) == before and identity(selected) == old_id and
+              not any(' clone ' in ' ' + line or ' fetch ' in ' ' + line for line in later.splitlines()))
+        check(description + ' readback preserves caller data and suppresses executable Git hooks',
+              tree_snapshot(caller) == caller_before and identity(caller) == caller_id and
+              not (case / 'hook-called').exists())
 
 context = setup('exact-noop', old_version='1.2.3')
 for args in (['-c', 'init.defaultBranch=main', 'init', str(context[1])],

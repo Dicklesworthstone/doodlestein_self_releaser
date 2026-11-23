@@ -515,20 +515,36 @@ check_write_permissions() {
   fi
 }
 
+# A hook or wrapper can export Git's repository-local environment. Without
+# isolation, even `git -C "$candidate" init/fetch/checkout` can mutate that
+# caller's repository, worktree, index, or object storage. Keep user/system
+# credential helpers and URL policy, but never import another repository's
+# plumbing or execute its hooks/monitor while inspecting or acquiring source.
+installer_git() (
+  unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE
+  unset GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+  unset GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT
+  unset GIT_IMPLICIT_WORK_TREE GIT_PREFIX GIT_SHALLOW_FILE GIT_GRAFT_FILE
+  unset GIT_NAMESPACE GIT_REPLACE_REF_BASE GIT_TEMPLATE_DIR
+  export GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1
+  git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c submodule.recurse=false "$@"
+)
+
 installed_matches_requested_tag() {
   local top head tag ref
-  top=$(git -C "$REPO_DIR" rev-parse --show-toplevel 2>/dev/null) || return 1
+  local context=(-C "$REPO_DIR" -c "core.worktree=$REPO_DIR")
+  top=$(installer_git "${context[@]}" rev-parse --show-toplevel 2>/dev/null) || return 1
   [[ "$top" == "$REPO_DIR" ]] || return 1
-  head=$(git -C "$REPO_DIR" rev-parse --verify HEAD 2>/dev/null) || return 1
+  head=$(installer_git "${context[@]}" rev-parse --verify HEAD 2>/dev/null) || return 1
   # Main can contain many newer commits with an unchanged DSR_VERSION. Only
   # an unchanged checkout of the requested local tag can satisfy a pinned
   # version without acquisition. Missing/unverifiable identities are misses.
   build_clone_refs
   for ref in "${CLONE_REFS[@]}"; do
-    tag=$(git -C "$REPO_DIR" rev-parse --verify "refs/tags/$ref^{commit}" 2>/dev/null) || continue
+    tag=$(installer_git "${context[@]}" rev-parse --verify "refs/tags/$ref^{commit}" 2>/dev/null) || continue
     if [[ "$tag" == "$head" ]] &&
-       git -C "$REPO_DIR" diff-index --cached --quiet HEAD -- &&
-       git -C "$REPO_DIR" diff-files --quiet --; then
+       installer_git "${context[@]}" diff-index --cached --quiet HEAD -- &&
+       installer_git "${context[@]}" diff-files --quiet --; then
       return 0
     fi
   done
@@ -820,6 +836,7 @@ clone_repo_ref() {
   local clone_ref="$1"
   local error_file="$2"
   local destination="$3"
+  local context=(-C "$destination" -c "core.worktree=$destination")
 
   if [ "$VERSION_EXPLICIT" -eq 1 ] && [[ "$VERSION" != main ]]; then
     # A branch and a tag may have the same short name. Fetch only the exact
@@ -827,16 +844,18 @@ clone_repo_ref() {
     # Each attempt has its own private destination and retained diagnostics.
     (
       local tag_ref="refs/tags/$clone_ref" commit
-      git check-ref-format "$tag_ref" || exit 1
-      git init --quiet "$destination" || exit $?
-      git -C "$destination" remote add origin "https://github.com/${OWNER}/${REPO}.git" || exit $?
-      git -C "$destination" fetch --quiet --depth 1 --no-tags origin "$tag_ref:$tag_ref" || exit $?
-      commit=$(git -C "$destination" rev-parse --verify "$tag_ref^{commit}") || exit $?
-      git -C "$destination" checkout --quiet --detach "$commit" || exit $?
-      [[ "$(git -C "$destination" rev-parse --verify HEAD)" == "$commit" ]]
+      installer_git check-ref-format "$tag_ref" || exit 1
+      # A template may contain its own core.worktree or executable hooks.
+      # The installer needs none; --template= also overrides init.templateDir.
+      installer_git -c "core.worktree=$destination" init --quiet --template= "$destination" || exit $?
+      installer_git "${context[@]}" remote add origin "https://github.com/${OWNER}/${REPO}.git" || exit $?
+      installer_git "${context[@]}" fetch --quiet --depth 1 --no-tags origin "$tag_ref:$tag_ref" || exit $?
+      commit=$(installer_git "${context[@]}" rev-parse --verify "$tag_ref^{commit}") || exit $?
+      installer_git "${context[@]}" checkout --quiet --detach "$commit" || exit $?
+      [[ "$(installer_git "${context[@]}" rev-parse --verify HEAD)" == "$commit" ]]
     ) 2>"$error_file"
   else
-    git clone --quiet --depth 1 --branch "$clone_ref" \
+    installer_git -c "core.worktree=$destination" clone --quiet --template= --depth 1 --branch "$clone_ref" \
       "https://github.com/${OWNER}/${REPO}.git" "$destination" 2>"$error_file"
   fi
 }
@@ -990,7 +1009,9 @@ validate_repo() {
     return 1
   fi
 
-  chmod +x "$candidate/dsr" || return 1
+  # Preserve the freshly checked-out file's stat identity when it already has
+  # execute permission; a redundant chmod makes Git's next tag readback dirty.
+  [[ -x "$candidate/dsr" ]] || chmod +x "$candidate/dsr" || return 1
   size=$(wc -c <"$candidate/dsr" | tr -d ' ') || return 1
   INSTALL_REPO_NEW_ID=$(install_path_identity "$candidate") || return 1
   if [ "$VERSION_EXPLICIT" -eq 0 ]; then VERSION="$version"; fi
