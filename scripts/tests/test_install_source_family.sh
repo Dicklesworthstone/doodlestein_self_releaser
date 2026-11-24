@@ -6,9 +6,189 @@
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 case "$#:${1:-}" in
-    0:|1:--bun-contracts-only|1:--bun-workspaces-only|1:--cargo-delivery-only) ;;
-    *) printf 'Usage: %s [--bun-contracts-only|--bun-workspaces-only|--cargo-delivery-only]\n' "$0" >&2; exit 4 ;;
+    0:|1:--bun-contracts-only|1:--bun-workspaces-only|1:--cargo-delivery-only|1:--cargo-source-providers-only) ;;
+    *) printf 'Usage: %s [--bun-contracts-only|--bun-workspaces-only|--cargo-delivery-only|--cargo-source-providers-only]\n' "$0" >&2; exit 4 ;;
 esac
+
+# Real Cargo must select committed entry files, including the complete family,
+# before it can execute a repository build script. Only the explicit artifact
+# drift case changes compiler stdout; its compilation and source checkout stay
+# genuine. All Git acquisition uses one local committed fixture.
+test_cargo_source_providers() (
+    local dependency fixtures upstream status=0 good=0 bad=0 calls='' record_drift=false
+    for dependency in git jq cargo rustc ps cmp; do
+        command -v "$dependency" >/dev/null 2>&1 || {
+            printf 'SKIP: Cargo source-provider controls require %s\n' "$dependency"; return 77;
+        }
+    done
+    # shellcheck source=../../src/install_source.sh
+    source "${DSR_INSTALL_SOURCE_ENGINE:-$ROOT/src/install_source.sh}"
+    fixtures=$(mktemp -d "${TMPDIR:-/tmp}/dsr-cargo-source-providers.XXXXXXXX") || return 1
+    fixtures=$(cd "$fixtures" && pwd -P) || return 1
+    upstream="$fixtures/upstream"
+    printf 'Cargo source-provider evidence: %s\n' "$fixtures"
+    mkdir -p "$upstream/src" "$upstream/helper/src" "$fixtures/cargo-home" || return 1
+    export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$fixtures/gitconfig"
+    export DSR_GH_TOKEN='' GITHUB_TOKEN='' GH_TOKEN=''
+    export CARGO_HOME="$fixtures/cargo-home" CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2
+    export RUSTUP_AUTO_INSTALL=0 RCH_DISABLED=1 RCH_CARGO_WRAPPER_BYPASS=1
+    unset RCH_CARGO_JSON_STDOUT RCH_REQUIRE_REMOTE
+    gh() { return 1; }
+    provider_check() {
+        local label="$1"; shift
+        if "$@"; then good=$((good + 1)); printf 'PASS: %s\n' "$label"
+        else bad=$((bad + 1)); printf 'FAIL: %s\n' "$label" >&2; fi
+    }
+    provider_equal() { [[ "$1" == "$2" ]]; }
+    provider_root_manifest() {
+        cat > "$upstream/Cargo.toml" <<TOML
+[package]
+name = "root-package"
+version = "1.0.0"
+edition = "2021"
+[workspace]
+members = ["helper"]
+default-members = ["$1"]
+resolver = "2"
+[[bin]]
+name = "app"
+path = "src/main.rs"
+TOML
+    }
+    provider_helper_manifest() {
+        cat > "$upstream/helper/Cargo.toml" <<TOML
+[package]
+name = "helper-package"
+version = "1.0.0"
+edition = "2021"
+[features]
+default = ["cli"]
+cli = []
+[[bin]]
+name = "helper"
+path = "$1"
+required-features = ["cli"]
+TOML
+    }
+    provider_commit() {
+        git -C "$upstream" add . && git -C "$upstream" commit -qm "$1"
+    }
+    cargo() {
+        local code=0
+        printf '%s\n' "${1:-}" >> "$calls"
+        if $record_drift && [[ "${1:-}" == build ]]; then
+            command cargo "$@" > "$calls.stdout" || code=$?
+            jq -c 'if .reason == "compiler-artifact"
+                then .target.src_path += ".unselected" else . end' "$calls.stdout" || return 1
+            return "$code"
+        fi
+        command cargo "$@"
+    }
+    provider_build() {
+        local label="$1" primary="$2"; shift 2
+        status=0; calls="$fixtures/$label.calls"
+        : > "$calls"
+        DSR_SOURCE_PROVIDER_MARKER="$fixtures/$label.build-script" \
+            install_source_build fixture/source-providers HEAD rust "$primary" "$fixtures/$label" \
+                --allow-build --timeout 60 "$@" > "$fixtures/$label.json" 2> "$fixtures/$label.log" || status=$?
+    }
+    provider_refused() {
+        local label="$1" reason="$2"
+        provider_check "$reason is refused" provider_equal "$status" 6
+        provider_check "$reason emits no successful source receipt" test ! -s "$fixtures/$label.json"
+        provider_check "$reason leaves no durable source receipt" test ! -e "$fixtures/$label/receipt.json"
+        provider_check "$reason is refused before cargo build" \
+            bash -c '! grep -qx build "$1"' _ "$fixtures/$label.calls"
+        provider_check "$reason cannot execute the pinned repository build script" \
+            test ! -e "$fixtures/$label.build-script"
+    }
+    provider_root_manifest .
+    provider_helper_manifest src/main.rs
+    cat > "$upstream/build.rs" <<'RUST'
+fn main() {
+    let output = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    std::fs::write(output.join("generated.rs"), "const MESSAGE: &str = \"pinned-app\";\n").unwrap();
+    if let Ok(marker) = std::env::var("DSR_SOURCE_PROVIDER_MARKER") {
+        std::fs::write(marker, "repository build script executed\n").unwrap();
+    }
+}
+RUST
+    cat > "$upstream/src/main.rs" <<'RUST'
+include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+fn main() { println!("{}", MESSAGE); }
+RUST
+    printf 'fn main() { println!("pinned-helper"); }\n' > "$upstream/helper/src/main.rs"
+    printf 'fn main() { println!("external-unpinned-provider"); }\n' > "$fixtures/outside.rs"
+    git init -q -b main "$upstream" || return 1
+    git -C "$upstream" config user.name 'DSR source-provider fixture' || return 1
+    git -C "$upstream" config user.email 'source-provider@example.invalid' || return 1
+    command cargo generate-lockfile --offline --manifest-path "$upstream/Cargo.toml" || return 1
+    provider_commit 'Pinned Cargo family with generated build-script inputs' || return 1
+    git config --file "$GIT_CONFIG_GLOBAL" \
+        url."file://$upstream".insteadOf https://github.com/fixture/source-providers.git || return 1
+
+    provider_build complete app --bin helper --bin app
+    provider_check 'committed complete Rust family still builds' provider_equal "$status" 0
+    provider_check 'a committed entry may include generated OUT_DIR code' provider_equal \
+        "$("$fixtures/complete/output/target/"*/release/app 2>/dev/null)" pinned-app
+    provider_check 'the companion executes its own committed source entry' provider_equal \
+        "$("$fixtures/complete/output/target/"*/release/helper 2>/dev/null)" pinned-helper
+    provider_check 'complete source receipt preserves requested member order' \
+        jq -e '[.binaries[].name] == ["helper","app"] and .signed_release == false' "$fixtures/complete.json"
+
+    provider_build package-feature helper --package helper-package --no-default-features --feature cli
+    provider_check 'bare member-specific features keep explicit package semantics' provider_equal "$status" 0
+    provider_check 'member feature policy is retained in the source receipt' jq -e \
+        '.cargo_features == ["cli"] and .cargo_no_default_features == true' "$fixtures/package-feature.json"
+
+    provider_build member-directory helper --subdir helper
+    provider_check 'a member directory is selected independently of workspace root defaults' provider_equal "$status" 0
+    provider_check 'member source selection executes the pinned companion' provider_equal \
+        "$("$fixtures/member-directory/output/target/"*/release/helper 2>/dev/null)" pinned-helper
+
+    provider_root_manifest helper
+    provider_commit 'Root package delegates default builds to workspace member' || return 1
+    provider_build default-member helper
+    provider_check 'root-package workspaces honor explicit default-members' provider_equal "$status" 0
+    provider_check 'workspace default-member selection executes its actual binary' provider_equal \
+        "$("$fixtures/default-member/output/target/"*/release/helper 2>/dev/null)" pinned-helper
+    provider_root_manifest .
+    provider_commit 'Restore root default member' || return 1
+
+    record_drift=true
+    provider_build artifact-drift app --bin helper --bin app
+    record_drift=false
+    provider_check 'actual Cargo artifacts must retain their admitted source identity' provider_equal "$status" 6
+    provider_check 'source identity drift cannot emit a successful family receipt' test ! -s "$fixtures/artifact-drift.json"
+    provider_check 'artifact drift control reached the real compiler' grep -qx build "$fixtures/artifact-drift.calls"
+
+    # Spaces and harmless dot segments are valid committed entry paths.
+    cp "$upstream/helper/src/main.rs" "$upstream/helper/entry with space.rs" || return 1
+    provider_helper_manifest 'src/../entry with space.rs'
+    provider_commit 'Committed entry with normalized components and spaces' || return 1
+    provider_build normalized app --bin helper --bin app
+    provider_check 'confined normalized Cargo entry paths retain support for spaces' provider_equal "$status" 0
+    provider_check 'normalized companion still executes committed bytes' provider_equal \
+        "$("$fixtures/normalized/output/target/"*/release/helper 2>/dev/null)" pinned-helper
+
+    provider_helper_manifest "$fixtures/outside.rs"
+    provider_commit 'External absolute executable provider' || return 1
+    provider_build outside app --bin app --bin helper
+    provider_refused outside 'an external companion entry'
+    provider_build unselected app
+    provider_check 'an unrelated unselected workspace provider does not block the root package' provider_equal "$status" 0
+    provider_check 'unselected external source never replaces the requested root binary' provider_equal \
+        "$("$fixtures/unselected/output/target/"*/release/app 2>/dev/null)" pinned-app
+
+    provider_helper_manifest src/main.rs
+    mv "$upstream/helper/src/main.rs" "$upstream/helper/src/retained-main.rs" || return 1
+    ln -s "$fixtures/outside.rs" "$upstream/helper/src/main.rs" || return 1
+    provider_commit 'Linked executable provider' || return 1
+    provider_build linked app --bin app --bin helper
+    provider_refused linked 'a linked companion entry'
+    printf 'Cargo source-provider tests: %s passed, %s failed\n' "$good" "$bad"
+    [[ $bad -eq 0 ]]
+)
 
 # The compiler boundary emits the current RCH producer's retained-record shape.
 # Hashing, descriptor/path validation, family staging and source receipts are real;
@@ -482,6 +662,10 @@ test_bun_workspaces() (
     [[ $bad -eq 0 ]]
 )
 
+if [[ "${1:-}" == --cargo-source-providers-only ]]; then
+    test_cargo_source_providers
+    exit $?
+fi
 if [[ "${1:-}" == --cargo-delivery-only ]]; then
     test_cargo_delivery_contracts
     exit $?
@@ -845,4 +1029,5 @@ check 'source drift leaves no admitted receipt on disk' test ! -e "$WORK/mutatio
 
 printf 'Source family tests: %s passed, %s failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]] || exit 1
-test_bun_family_contracts
+test_bun_family_contracts || exit $?
+test_cargo_source_providers

@@ -499,6 +499,9 @@ jobs:
           set -euo pipefail
           cargo --version
           rustc --version
+          bash -n scripts/tests/test_install_source_family.sh
+          timeout 120 bash scripts/tests/test_install_source_family.sh --cargo-source-providers-only \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/rust-source-providers.log"
           bash -n scripts/tests/test_generated_workspace_installer.sh
           timeout 120 bash scripts/tests/test_generated_workspace_installer.sh --cargo-features-only \
             2>&1 | tee "$RUNNER_TEMP/collector-evidence/rust-source-features.log"
