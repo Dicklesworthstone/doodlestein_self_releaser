@@ -10,6 +10,8 @@ on:
       - scripts/tests/test_act_runner.sh
       - scripts/tests/test_act_orchestration.sh
       - scripts/tests/test_build_state.sh
+      - scripts/tests/test_quality_gates.sh
+      - scripts/verify_quality_receipt.sh
       - scripts/tests/e2e_prune.sh
       - scripts/tests/test_git_build_context.sh
       - scripts/tests/test_act_build_cmd_tokens.sh
@@ -56,6 +58,7 @@ on:
       - src/toolchain_detect.sh
       - src/upgrade_verify.sh
       - src/packaging.sh
+      - src/quality_gates.sh
       - src/platforms.sh
       - src/slsa.sh
       - src/source_snapshot_windows.ps1
@@ -110,6 +113,17 @@ jobs:
           mkdir -p "$RUNNER_TEMP/dsr-test-bin"
           GOBIN="$RUNNER_TEMP/dsr-test-bin" go install github.com/mikefarah/yq/v4@v4.47.1
           echo "$RUNNER_TEMP/dsr-test-bin" >> "$GITHUB_PATH"
+      - name: Stop interrupted quality checks and preserve deadline behavior
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shellcheck -S warning src/quality_gates.sh scripts/verify_quality_receipt.sh scripts/tests/test_quality_gates.sh
+          timeout 120 bash scripts/tests/test_quality_gates.sh --interruption-only \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/quality-interruption.log"
+          timeout 120 bash scripts/tests/test_quality_gates.sh --lifecycle-only \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/quality-lifecycle.log"
+          test -z "$(git status --porcelain)"
       - name: Validate pinned recursive installer source
         shell: bash
         run: |

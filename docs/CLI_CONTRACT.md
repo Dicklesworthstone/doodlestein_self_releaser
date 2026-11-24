@@ -3078,6 +3078,18 @@ checks and the selected deadline, without executing them. Source inventory and
 configuration reads are outside the per-command execution budget; deliberately
 detached sessions are outside process-group cleanup.
 
+A signal-interrupted check stops the gate with exit 5 and aggregate status
+`interrupted`. Its receipt retains the raw signal exit code and complete log;
+the remaining configured commands appear, in order, as `not_run` with
+`executed: false`, a null exit code and no log. The `interrupted` and `not_run`
+counts distinguish the stopped command from its unexecuted suffix. The runner
+uses a private completion record to distinguish a check killed by SIGKILL from
+the supervisor's deadline escalation. Ordinary check failures, including a
+command that returns 5, and deadline failures still continue through the
+remaining commands and return aggregate exit 1. If interruption evidence cannot
+be retained or encoded, exit 5 remains terminal without claiming a complete
+receipt. Global `--json` also preserves outer `status: "interrupted"` and exit 5.
+
 The registry containing the check inventory is hashed before reading the
 commands and checked again before dispatch and after execution. A change while
 loading the inventory refuses dispatch. A change during execution produces
@@ -3087,7 +3099,11 @@ loading the inventory refuses dispatch. A change during execution produces
 the standalone receipt verifier can still verify an invalidated gate's evidence.
 This applies even when that registry lives outside the source tree and every
 individual command succeeds. The existing raw-source before/after checks remain
-in force.
+in force. An interrupted gate retains both configuration and source observations
+but keeps `interrupted` status and exit 5 when either changes; it cannot authorize
+a release. The standalone verifier validates the interrupted inventory, count
+arithmetic, retained registry and executed logs, including null log fields for
+commands that never ran.
 
 ---
 
@@ -3131,6 +3147,12 @@ and publication while releasing the coordinator lock. Its step carries
 `throttled` and the check's own exit code. The build step covers the quality
 gate, build, artifact verification and signing; `--build-only` runs the build
 step alone. `details.steps[]` lists the steps that ran.
+
+An interruption during the quality gate also returns 5, releases the coordinator
+lock and reports `details.phase: "checks"`. It marks checks `interrupted`, build
+and release `blocked`, and verification and signing `skipped`; no subsequent
+check, build, signing or publication stage starts. An ordinary failed quality
+gate retains the existing build-failure exit 6.
 
 `--resume=RUN_UUID` accepts a saved `partial` build as well as failed or
 interrupted builds. It retains the original run UUID and output directory,

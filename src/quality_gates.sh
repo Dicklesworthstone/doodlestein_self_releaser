@@ -32,6 +32,7 @@
 #   1 - one or more checks failed, or the source moved during the run
 #   2 - dry run: checks planned, none executed (never a pass)
 #   4 - configuration failure (missing/malformed/unreadable/zero checks)
+#   5 - check interrupted; remaining checks were not run
 
 set -uo pipefail
 
@@ -383,8 +384,9 @@ _qg_run_single_check() {
     # caller captures status with || suppresses even the program's explicit
     # set -e. Stream the complete program so long YAML blocks stay out of
     # argv. The shell parses the entire group before replacing program stdin.
-    local program
+    local program completion_file
     printf -v program '{\n%s\n} </dev/null' "$cmd"
+    completion_file=$(mktemp "${log_file}.completion.XXXXXXXX") || return 4
     (
         # Exported caller options must not silently enable errexit or POSIX
         # behavior in a check. This changes only the execution subshell;
@@ -394,32 +396,68 @@ _qg_run_single_check() {
         # deliberate closed-descriptor probes fatal; clearing only the export
         # would protect the fresh program but leave supervision unusable.
         set +e +o posix
+        # Record the check's own completion before crossing the timeout
+        # boundary. A signal-killed program can return 137, which the
+        # supervisor also uses for deadline escalation. Translate the former
+        # in this live launcher so those two events remain distinguishable.
+        # Only the launcher owns fd 3; configured programs cannot accidentally
+        # write status bytes through an inherited descriptor.
         cd -- "$resolved_cwd" && BASH_ENV='' ENV='' run_with_timeout "$timeout_seconds" \
-            "$BASH" --noprofile --norc -u -o pipefail -s <<< "$program"
-    ) >> "$log_file" 2>&1 || exit_code=$?
+            "$BASH" --noprofile --norc -u -o pipefail -c '
+                "$BASH" --noprofile --norc -u -o pipefail -s 3>&-
+                check_status=$?
+                if (( check_status > 128 )); then
+                    printf "%s\n" "$check_status" >&3 || exit 5
+                    exit 5
+                fi
+                printf "%s\n" "$check_status" >&3 || exit 4
+                exit "$check_status"
+            ' dsr-quality-check <<< "$program"
+    ) 3> "$completion_file" >> "$log_file" 2>&1 || exit_code=$?
+    local interrupted=false completion_status="" evidence_error=4
+    IFS= read -r completion_status < "$completion_file" || true
+    if [[ "$exit_code" -eq 5 && "$completion_status" =~ ^[0-9]{1,3}$ ]] &&
+       (( 10#$completion_status > 128 && 10#$completion_status <= 255 )); then
+        exit_code=$((10#$completion_status))
+        interrupted=true
+    elif [[ "$exit_code" -eq 5 && "$completion_status" != 5 ]]; then
+        # Only a valid completion record can identify an ordinary check exit
+        # 5. If recording a known signal failed, retain the stop without
+        # inventing a raw signal code or a complete evidence receipt.
+        _qg_log_error "Check interrupted, but its completion status could not be retained — full log: $log_file"
+        return 5
+    elif (( exit_code > 128 && exit_code != 137 )); then
+        # External cancellation of the supervisor is terminal too. Its
+        # documented 124/137 deadline outcomes remain ordinary failures.
+        interrupted=true
+    fi
+    $interrupted && evidence_error=5
     # The supervisor drains the command group before returning, including
     # descendants left behind by a successful shell. Only now is the log
     # complete and safe to hash; ordinary descendants cannot outlive it.
     # Commands are allowed to finish without a newline. Keep the status
     # trailer on its own line so independent verification can always find it.
-    printf '\n# exit_code: %s\n' "$exit_code" >> "$log_file" || return 4
+    printf '\n# exit_code: %s\n' "$exit_code" >> "$log_file" || return "$evidence_error"
 
-    end_ms=$(_qg_now_ms) || return 4
+    end_ms=$(_qg_now_ms) || return "$evidence_error"
     duration_ms=$((end_ms - start_ms))
 
     if [[ $exit_code -eq 0 ]]; then
         _qg_log_ok "  ✓ Passed (${duration_ms}ms)"
+    elif $interrupted; then
+        _qg_log_error "  Interrupted (exit code: $exit_code) — full log: $log_file"
     else
         _qg_log_error "  ✗ Failed (exit code: $exit_code) — full log: $log_file"
     fi
 
     local preview log_sha
-    preview=$(tail -c 1000 "$log_file" | jq -Rs '.')
-    log_sha=$(_qg_sha256 "$log_file")
+    preview=$(tail -c 1000 "$log_file" | jq -Rs '.') || return "$evidence_error"
+    log_sha=$(_qg_sha256 "$log_file") || return "$evidence_error"
 
     printf '%s' "$cmd" | jq -Rsc \
         --arg cwd "$resolved_cwd" \
         --argjson exit_code "$exit_code" \
+        --argjson interrupted "$interrupted" \
         --argjson duration_ms "$duration_ms" \
         --argjson timeout_seconds "$timeout_seconds" \
         --argjson preview "$preview" \
@@ -427,7 +465,7 @@ _qg_run_single_check() {
         --arg log_sha "$log_sha" \
         '{
             command: .,
-            status: (if $exit_code == 0 then "passed" else "failed" end),
+            status: (if $interrupted then "interrupted" elif $exit_code == 0 then "passed" else "failed" end),
             executed: true,
             passed: ($exit_code == 0),
             exit_code: $exit_code,
@@ -437,7 +475,9 @@ _qg_run_single_check() {
             output_preview: $preview,
             log_path: $log_path,
             log_sha256: $log_sha
-        }'
+        }' || return "$evidence_error"
+    $interrupted && return 5
+    return 0
 }
 
 # Run all quality checks for a tool
@@ -500,6 +540,7 @@ Exit Codes:
   1  - One or more checks failed, or the source moved during the run
   2  - Dry run: planned only, nothing executed
   4  - Invalid arguments or configuration (missing/malformed/zero checks)
+  5  - Check interrupted; remaining checks were not run
 EOF
                 return 0
                 ;;
@@ -657,7 +698,7 @@ EOF
     # Run each check
     local results=()
     local total_start_ms total_end_ms
-    local passed=0 failed=0 planned=0 idx=0
+    local passed=0 failed=0 planned=0 interrupted=0 not_run=0 idx=0 evidence_error=4
     total_start_ms=$(_qg_now_ms) || return 4
 
     # Materialize the complete command inventory before executing anything.
@@ -677,28 +718,50 @@ EOF
         [[ -z "$cmd" ]] && continue
         idx=$((idx + 1))
 
-        local result status
-        result=$(DSR_QUALITY_RUN_DIR="$run_dir" DSR_QUALITY_TIMEOUT="$timeout_seconds" \
-            _qg_run_single_check "$cmd" "$work_dir" "$dry_run" \
-                "$run_dir/check-$idx.log")
+        local result status check_rc=0
+        if [[ "$interrupted" -gt 0 ]]; then
+            # Keep the full ordered inventory without inventing an execution,
+            # exit status, or log for commands never started after a stop.
+            result=$(printf '%s' "$cmd" | jq -Rsc --argjson timeout_seconds "$timeout_seconds" '{
+                command: ., status: "not_run", executed: false, passed: false,
+                exit_code: null, duration_ms: 0, timeout_seconds: $timeout_seconds,
+                output_preview: "not run: an earlier check was interrupted",
+                log_path: null, log_sha256: null
+            }') || return 5
+        else
+            result=$(DSR_QUALITY_RUN_DIR="$run_dir" DSR_QUALITY_TIMEOUT="$timeout_seconds" \
+                _qg_run_single_check "$cmd" "$work_dir" "$dry_run" \
+                    "$run_dir/check-$idx.log") || check_rc=$?
+            case "$check_rc" in
+                0) ;;
+                5) evidence_error=5 ;;
+                *) return "$check_rc" ;;
+            esac
+        fi
         results+=("$result")
 
-        status=$(echo "$result" | jq -r '.status')
+        status=$(printf '%s' "$result" | jq -er '.status') || return "$evidence_error"
+        if [[ "$check_rc" -eq 5 && "$status" != interrupted ]]; then
+            return 5
+        fi
         case "$status" in
             passed)  passed=$((passed + 1)) ;;
             planned) planned=$((planned + 1)) ;;
-            *)       failed=$((failed + 1)) ;;
+            failed) failed=$((failed + 1)) ;;
+            interrupted) interrupted=$((interrupted + 1)); evidence_error=5 ;;
+            not_run) not_run=$((not_run + 1)) ;;
+            *) return "$evidence_error" ;;
         esac
     done
 
-    total_end_ms=$(_qg_now_ms) || return 4
+    total_end_ms=$(_qg_now_ms) || return "$evidence_error"
     local total_duration_ms=$((total_end_ms - total_start_ms))
     echo "" >&2
 
     local snapshot_after
     if ! snapshot_after=$(_qg_source_snapshot "$work_dir"); then
         _qg_log_error "Could not snapshot the quality check source after execution"
-        return 4
+        return "$evidence_error"
     fi
     local moving=false
     if ! $dry_run && [[ "$snapshot_before" != "$snapshot_after" ]]; then
@@ -715,28 +778,30 @@ EOF
     # Build results JSON
     local checks_json
     if [[ ${#results[@]} -gt 0 ]]; then
-        checks_json=$(printf '%s\n' "${results[@]}" | jq -s '.')
+        checks_json=$(printf '%s\n' "${results[@]}" | jq -s '.') || return "$evidence_error"
     else
         checks_json='[]'
     fi
 
     local observed executed classified incomplete=false
     observed=${#results[@]}
-    executed=$((passed + failed))
-    classified=$((passed + failed + planned))
+    executed=$((passed + failed + interrupted))
+    classified=$((passed + failed + planned + interrupted + not_run))
     if [[ "$observed" -ne "$check_count" || "$classified" -ne "$check_count" ]]; then
         incomplete=true
         _qg_log_error "Quality gate inventory incomplete: observed=$observed classified=$classified expected=$check_count"
     elif $dry_run && [[ "$planned" -ne "$check_count" ]]; then
         incomplete=true
         _qg_log_error "Dry-run inventory incomplete: planned=$planned expected=$check_count"
-    elif ! $dry_run && [[ "$executed" -ne "$check_count" ]]; then
+    elif ! $dry_run && [[ "$interrupted" -eq 0 && "$executed" -ne "$check_count" ]]; then
         incomplete=true
         _qg_log_error "Executed quality gate inventory incomplete: executed=$executed expected=$check_count"
     fi
 
     local overall
-    if $incomplete; then
+    if [[ "$interrupted" -gt 0 ]]; then
+        overall="interrupted"
+    elif $incomplete; then
         overall="incomplete"
     elif $moving_config; then
         overall="invalidated-config"
@@ -768,6 +833,8 @@ EOF
         --argjson passed "$passed" \
         --argjson failed "$failed" \
         --argjson planned "$planned" \
+        --argjson interrupted "$interrupted" \
+        --argjson not_run "$not_run" \
         --argjson total "$check_count" \
         --argjson duration_ms "$total_duration_ms" \
         --argjson timeout_seconds "$timeout_seconds" \
@@ -790,18 +857,24 @@ EOF
             passed: $passed,
             failed: $failed,
             planned: $planned,
+            interrupted: $interrupted,
+            not_run: $not_run,
             total: $total,
             duration_ms: $duration_ms,
             timeout_seconds: $timeout_seconds
-        }' <<< "$checks_json") || return 4
+        }' <<< "$checks_json") || return "$evidence_error"
 
     # Durable aggregate receipt next to the per-check logs.
-    printf '%s\n' "$result_json" > "$run_dir/receipt.json" || return 4
+    printf '%s\n' "$result_json" > "$run_dir/receipt.json" || return "$evidence_error"
 
     # Output result
     echo "$result_json"
 
     # Log summary + exit per contract
+    if [[ "$interrupted" -gt 0 ]]; then
+        _qg_log_error "Quality gates INTERRUPTED: $executed/$check_count executed, $not_run not run — receipt: $run_dir/receipt.json"
+        return 5
+    fi
     if $incomplete; then
         _qg_log_error "Quality gates INCOMPLETE: observed $observed/$check_count, executed $executed/$check_count — receipt: $run_dir/receipt.json"
         return 1

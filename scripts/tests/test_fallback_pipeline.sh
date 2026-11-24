@@ -832,6 +832,25 @@ test_quality_failure() {
     [[ "$RC" == 6 ]] && one_result && blocked &&
         ! grep -q '^BUILD' "$CALLS" && grep -q -- '--skip-checks' "$CALLS"
 }
+test_quality_interruption_real() {
+    setup "quality-interruption-$1"
+    # Keep the real gate and its real timeout supervisor. Only the already
+    # controlled build/publication boundaries from this suite remain mocked.
+    # shellcheck source=src/quality_gates.sh
+    source "$ROOT/src/quality_gates.sh" || return 1
+    export DSR_CONFIG_DIR="$CASE/config" DSR_REPOS_FILE="$CASE/repos.yaml"
+    export DSR_QUALITY_LOG_DIR="$CASE/quality-logs" DSR_QUALITY_TIMEOUT=10
+    export DSR_QUALITY_TEST_CASE="$CASE"
+    jq -nc --arg command "kill -$1 \"\$\$\"" '{tools:{tool:{checks:[
+        $command, "printf later > \"$DSR_QUALITY_TEST_CASE/later\""
+    ]}}}' > "$DSR_REPOS_FILE" || return 1
+    run_fallback
+    [[ "$RC" == 5 && ! -e "$CASE/later" && ! -e "$CASE/lock" ]] &&
+        one_result && blocked && ! grep -q '^BUILD\|^SIGN \|^RELEASE ' "$CALLS" &&
+        jq -e '.details.phase == "checks" and .details.phases.checks == "interrupted" and
+            .details.phases.build == "blocked" and .details.phases.release == "blocked" and
+            .details.error == "Quality checks interrupted"' "$CASE/stdout" >/dev/null
+}
 test_build_only() {
     setup build_only; run_fallback --build-only
     [[ "$RC" == 0 && ! -e "$CASE/lock" ]] && one_result && ! grep -q '^RELEASE\|^THROTTLE' "$CALLS" &&
@@ -2131,6 +2150,7 @@ run_test test_state_failure
 run_test test_lock_failure 2
 run_test test_lock_failure 8
 run_test test_quality_failure
+for signal_name in TERM KILL; do run_test test_quality_interruption_real "$signal_name"; done
 run_test test_build_only
 for rc in 1 7 8 130; do run_test test_release_failure "$rc"; done
 for mode in draft missing-visibility wrong-tag wrong-repo malformed; do run_test test_release_requires_public_confirmation "$mode"; done

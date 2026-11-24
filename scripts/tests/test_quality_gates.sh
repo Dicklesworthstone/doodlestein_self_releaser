@@ -1976,6 +1976,216 @@ raise SystemExit(bool(failures))
 PY
 }
 
+test_quality_interruption() {
+    command -v python3 >/dev/null || return 77
+    python3 -I - "${DSR_TEST_QUALITY_GATES:-$PROJECT_ROOT/src/quality_gates.sh}" "$PROJECT_ROOT" <<'PY'
+import copy
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+
+module, root = map(Path, sys.argv[1:])
+work = Path(tempfile.mkdtemp(prefix='dsr-quality-interruption-'))
+print('Quality interruption evidence: ' + str(work), flush=True)
+checks, failures = 0, []
+
+
+def check(label, condition):
+    global checks
+    checks += 1
+    print(('PASS ' if condition else 'FAIL ') + label, flush=True)
+    if not condition:
+        failures.append(label)
+
+
+driver = work / 'driver.bash'
+driver.write_text('''#!/usr/bin/env bash
+set -uo pipefail
+source "$1" || exit $?
+if [[ "$2" == portable ]]; then _dsr_timeout_cmd() { printf '\\n'; }; fi
+if [[ "$2" == completion-failure ]]; then
+    # Keep real supervision and real signalled checks; fail only the private
+    # launcher completion channel, independently of command stdout/stderr.
+    run_with_timeout() {
+        if [[ -f "$DSR_QUALITY_TEST_CASE/first" ]]; then
+            _dsr_run_with_timeout _dsr_timeout_cmd "$@" 3>&-
+        else
+            _dsr_run_with_timeout _dsr_timeout_cmd "$@"
+        fi
+    }
+fi
+if [[ "$2" == encoding-failure ]]; then
+    jq() {
+        case "$*" in *'--argjson interrupted true'*) return 7 ;; esac
+        command jq "$@"
+    }
+fi
+qg_run_checks example --work-dir "$3"
+''')
+
+
+def verify(case, receipt, name='receipt', extra_document=None):
+    path = case / (name + '.json')
+    contents = json.dumps(receipt)
+    if extra_document is not None:
+        contents += '\n' + json.dumps(extra_document)
+    path.write_text(contents)
+    result = subprocess.run(['bash', str(root / 'scripts/verify_quality_receipt.sh'), str(path)],
+                            capture_output=True, text=True, timeout=5)
+    (case / (name + '-verification.log')).write_text(result.stdout + result.stderr)
+    return result.returncode
+
+
+def run(label, program, engine='default', bound='10', cli=False):
+    case = work / label
+    case.mkdir()
+    source = case / 'source'
+    source.mkdir()
+    programs = ['printf first > "$DSR_QUALITY_TEST_CASE/first"', program,
+                'printf later > "$DSR_QUALITY_TEST_CASE/later"']
+    config = case / 'repos.yaml'
+    config.write_text(json.dumps({'tools': {'example': {'checks': programs}}}))
+    env = dict(os.environ, DSR_QUALITY_TIMEOUT=bound, DSR_QUALITY_TEST_CASE=str(case),
+               DSR_QUALITY_LOG_DIR=str(case / 'logs'), DSR_CONFIG_DIR=str(case / 'config'),
+               DSR_REPOS_FILE=str(config), NO_COLOR='1')
+    argv = ['bash', str(driver), str(module), engine, str(source)]
+    if cli:
+        argv = ['bash', str(root / 'dsr'), '--json', 'quality', 'example',
+                '--work-dir', str(source), '--check-timeout', bound]
+    process = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, start_new_session=True)
+    expired = False
+    try:
+        stdout, stderr = process.communicate(timeout=12)
+    except subprocess.TimeoutExpired:
+        expired = True
+        os.killpg(process.pid, signal.SIGKILL)
+        stdout, stderr = process.communicate(timeout=3)
+    (case / 'stdout').write_text(stdout)
+    (case / 'stderr').write_text(stderr)
+    (case / 'status.json').write_text(json.dumps({'exit_code': process.returncode,
+        'outer_expired': expired, 'argv': argv}))
+    try:
+        result = json.loads(stdout)
+    except ValueError:
+        result = {}
+    receipt = result.get('details', {}) if cli else result
+    return case, receipt, result, process.returncode, expired, programs
+
+
+for engine, sig, raw in [('default', 'TERM', 143), ('default', 'KILL', 137),
+                         ('default', 'INT', 130), ('portable', 'TERM', 143),
+                         ('portable', 'KILL', 137)]:
+    label = engine + '-' + sig
+    case, receipt, _, rc, expired, programs = run(label, 'kill -' + sig + ' "$$"', engine)
+    inventory = receipt.get('checks', [])
+    check(label + ' returns terminal interruption within the unchanged 12-second bound',
+          not expired and rc == 5 and receipt.get('status') == 'interrupted')
+    check(label + ' stops later hooks and preserves the complete ordered inventory',
+          (case / 'first').exists() and not (case / 'later').exists() and
+          [r.get('command') for r in inventory] == programs and
+          [r.get('status') for r in inventory] == ['passed', 'interrupted', 'not_run'])
+    check(label + ' retains the real signal code without fabricating a later execution',
+          len(inventory) == 3 and inventory[1].get('exit_code') == raw and
+          inventory[1].get('executed') is True and inventory[2].get('executed') is False and
+          inventory[2].get('exit_code') is None and inventory[2].get('log_path') is None and
+          inventory[2].get('log_sha256') is None and
+          not list((case / 'logs').rglob('check-3.log')))
+    check(label + ' counts executed and unexecuted checks accurately',
+          all(receipt.get(k) == v for k, v in dict(total=3, observed=3, executed=2,
+              passed=1, failed=0, planned=0, interrupted=1, not_run=1).items()))
+    log = Path(inventory[1]['log_path']) if len(inventory) == 3 and inventory[1].get('log_path') else None
+    check(label + ' final signal log and aggregate verify independently',
+          log is not None and log.is_file() and
+          inventory[1].get('log_sha256') == hashlib.sha256(log.read_bytes()).hexdigest() and
+          ('# exit_code: ' + str(raw)).encode() in log.read_bytes() and verify(case, receipt) == 0)
+    if engine == 'default' and sig == 'TERM' and len(inventory) == 3:
+        for mutation in ('reordered', 'claimed-log', 'claimed-pass'):
+            tampered = copy.deepcopy(receipt)
+            if mutation == 'reordered':
+                tampered['checks'][1], tampered['checks'][2] = tampered['checks'][2], tampered['checks'][1]
+            elif mutation == 'claimed-log':
+                tampered['checks'][2]['log_path'] = inventory[0].get('log_path')
+            else:
+                tampered['status'] = 'passed'
+            check('verifier rejects ' + mutation + ' interruption evidence', verify(case, tampered, mutation) != 0)
+        marker = case / 'arithmetic-was-evaluated'
+        invalid_counts = [('interrupted', 'a[$(printf owned > ' + str(marker) + ')]'),
+                          ('not_run', None), ('not_run', False), ('total', 1.5),
+                          ('passed', -1), ('planned', 2147483648)]
+        refused = []
+        for index, (field, value) in enumerate(invalid_counts):
+            tampered = copy.deepcopy(receipt)
+            tampered[field] = value
+            refused.append(verify(case, tampered, 'invalid-count-' + str(index)) == 4)
+        check('verifier refuses malformed counts before Bash arithmetic or command substitution',
+              all(refused) and not marker.exists())
+        tampered = copy.deepcopy(receipt)
+        tampered['interrupted'] = invalid_counts[0][1]
+        check('a trailing valid document cannot hide a malformed count in an earlier document',
+              verify(case, tampered, 'multiple-documents', receipt) == 4 and not marker.exists())
+
+for raw in (1, 5, 124, 125, 128):
+    label = 'ordinary-exit-' + str(raw)
+    case, receipt, _, rc, expired, _ = run(label, 'exit ' + str(raw))
+    check(label + ' remains an ordinary failure and later hooks run',
+          not expired and rc == 1 and receipt.get('status') == 'failed' and
+          receipt.get('passed') == 2 and receipt.get('failed') == 1 and (case / 'later').exists())
+    if raw == 1:
+        legacy = copy.deepcopy(receipt)
+        legacy.pop('interrupted', None)
+        legacy.pop('not_run', None)
+        check('verifier still accepts legacy receipts without the new optional counts',
+              verify(case, legacy, 'legacy') == 0)
+
+for engine in ('default', 'portable'):
+    case, receipt, _, rc, expired, _ = run(engine + '-deadline', 'sleep 120', engine, bound='1')
+    inventory = receipt.get('checks', [])
+    check(engine + ' real supervisor deadline still fails and executes the later hook',
+          not expired and rc == 1 and receipt.get('status') == 'failed' and
+          len(inventory) == 3 and inventory[1].get('exit_code') in (124, 137) and
+          receipt.get('passed') == 2 and receipt.get('failed') == 1 and (case / 'later').exists() and
+          verify(case, receipt) == 0)
+
+case, receipt, _, rc, expired, _ = run('registry-drift',
+    '''printf '%s\\n' '{"tools":{"example":{"checks":["false"]}}}' > "$DSR_REPOS_FILE"; kill -TERM "$$"''')
+check('registry drift cannot erase a terminal interruption or start later checks',
+      not expired and rc == 5 and receipt.get('status') == 'interrupted' and
+      receipt.get('config_sha256') != receipt.get('config_sha256_after') and
+      not (case / 'later').exists() and verify(case, receipt) == 0)
+
+case, receipt, _, rc, expired, _ = run('encoding-failure', 'kill -TERM "$$"', 'encoding-failure')
+check('receipt encoding failure preserves exit 5 and never starts the later hook',
+      not expired and rc == 5 and not (case / 'later').exists() and receipt == {})
+
+for sig in ('TERM', 'KILL'):
+    case, receipt, _, rc, expired, _ = run('completion-failure-' + sig,
+        'kill -' + sig + ' "$$"', 'completion-failure')
+    check('completion channel failure after ' + sig + ' preserves exit 5 without invented evidence',
+          not expired and rc == 5 and not (case / 'later').exists() and receipt == {})
+
+if module.resolve() == (root / 'src/quality_gates.sh').resolve():
+    case, receipt, envelope, rc, expired, _ = run('public-cli', 'kill -TERM "$$"', cli=True)
+    check('public quality command retains exit 5 and an interrupted envelope',
+          not expired and rc == 5 and envelope.get('status') == 'interrupted' and
+          envelope.get('exit_code') == 5 and receipt.get('status') == 'interrupted' and
+          not (case / 'later').exists())
+
+print(f'Quality interruption: {checks - len(failures)}/{checks} passed', flush=True)
+raise SystemExit(bool(failures))
+PY
+}
+
+if [[ "${1:-}" == --interruption-only ]]; then
+    test_quality_interruption
+    exit $?
+fi
+
 if [[ "${1:-}" == --lifecycle-only ]]; then
     test_quality_lifecycle
     exit $?

@@ -6488,6 +6488,7 @@ DESCRIPTION:
     DSR_QUALITY_TIMEOUT sets the per-check deadline for quality and fallback.
     --check-timeout overrides it for this command. Deadline failures preserve
     complete logs and fail the release gate; later configured checks still run.
+    Interrupted checks stop the gate immediately; remaining checks are not run.
 
 CONFIGURATION:
     Configure checks in ~/.config/dsr/repos.yaml:
@@ -6509,6 +6510,7 @@ EXIT CODES:
     1  - One or more checks failed
     2  - Dry run: checks planned, none executed (never a pass)
     4  - Invalid arguments, or no checks configured
+    5  - Check interrupted; remaining checks were not run
 EOF
                 return 0
                 ;;
@@ -6550,6 +6552,7 @@ EOF
             0) status="success" ;;
             2) status="planned" ;;
             4) status="config-error" ;;
+            5) status="interrupted" ;;
             *) status="failure" ;;
         esac
         json_envelope "quality" "$status" "$exit_code" "$result"
@@ -15259,6 +15262,12 @@ EOF
     # JSON channel so the pipeline always emits exactly one result envelope.
     qg_run_checks "${quality_args[@]}" >&2 || rc=$?
     if [[ $rc -ne 0 ]]; then
+        if [[ $rc -eq 5 ]]; then
+            checks_status="interrupted"; build_status="blocked"
+            verification_status="skipped"; signing_status="skipped"; release_status="blocked"
+            _fallback_result 5 checks "Quality checks interrupted"
+            return 5
+        fi
         checks_status="failed"
         [[ $rc -eq 1 ]] && rc=6
         _fallback_result "$rc" checks "Quality checks failed"
