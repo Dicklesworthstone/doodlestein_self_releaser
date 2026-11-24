@@ -6,6 +6,305 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 INSTALLERS="${DSR_PUBLIC_INSTALLER_ROOT:-$ROOT/installers}"
+
+test_skill_destinations() {
+    python3 -I - "$ROOT" "$INSTALLERS" "${1:-}" <<'SKILL_TEST_PY'
+import base64
+import fcntl
+import gzip
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+root, installers = map(Path, sys.argv[1:3])
+limits_only = sys.argv[3] == '--limits-only'
+work = Path(tempfile.mkdtemp(prefix='dsr-public-skills-')).resolve()
+print('Public skill destination evidence retained: ' + str(work), flush=True)
+environment = {key: value for key, value in os.environ.items()
+               if key not in ('BASH_ENV', 'ENV') and not key.startswith('BASH_FUNC_')}
+environment.update(NO_COLOR='1', DSR_GH_TOKEN='', GH_TOKEN='', GITHUB_TOKEN='')
+system = {'Linux': 'linux', 'Darwin': 'darwin'}[platform.system()]
+architecture = {'x86_64': 'amd64', 'aarch64': 'arm64', 'arm64': 'arm64'}[platform.machine()]
+passed = failed = 0
+
+
+def check(label, condition):
+    global passed, failed
+    if condition:
+        passed += 1
+        print('PASS: ' + label, flush=True)
+    else:
+        failed += 1
+        print('FAIL: ' + label, flush=True)
+
+
+def snapshot(directory):
+    return {str(path.relative_to(directory)): (stat.S_IFMT(path.lstat().st_mode),
+            stat.S_IMODE(path.lstat().st_mode), path.lstat().st_ino,
+            os.readlink(path) if path.is_symlink() else path.read_bytes() if path.is_file() else None)
+            for path in directory.rglob('*')}
+
+
+def content_snapshot(directory):
+    return {name: (value[0], value[1], value[3]) for name, value in snapshot(directory).items()}
+
+
+def run(label, script, case, package, env=None):
+    result = subprocess.run(['bash', str(script), '--version', 'v1.2.3', '--offline', str(package),
+        '--yes', '--non-interactive', '--json', '--dir', str(case / 'bin'),
+        '--cache-dir', str(case / 'cache')], cwd=case,
+        env=env or dict(environment, HOME=str(case / 'home')), stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, timeout=30)
+    (case / (label + '.out')).write_bytes(result.stdout)
+    (case / (label + '.err')).write_bytes(result.stderr)
+    try:
+        receipt = json.loads(result.stdout)
+    except (ValueError, UnicodeDecodeError):
+        receipt = {}
+    check(label + ' keeps verified binary installation successful',
+          result.returncode == 0 and receipt.get('status') == 'success' and
+          (case / 'bin' / script.parent.name).read_bytes() == executable)
+    return result
+
+
+def prepare(tool, scenario):
+    case = work / (tool + '-' + scenario)
+    home = case / 'home'
+    skill = home / '.claude/skills' / tool
+    skill.parent.mkdir(parents=True)
+    (home / '.codex').mkdir()
+    sentinel = case / 'outside'
+    sentinel.mkdir()
+    (sentinel / 'SKILL.md').write_bytes(b'unrelated original skill\n')
+    if scenario == 'directory-symlink':
+        skill.symlink_to(sentinel, target_is_directory=True)
+    else:
+        skill.mkdir()
+        (skill / 'custom/nested').mkdir(parents=True)
+        (skill / 'custom/nested/settings').write_bytes(b'private configuration\n')
+        (skill / 'custom/nested/settings').chmod(0o640)
+        if scenario == 'file-symlink':
+            (skill / 'SKILL.md').symlink_to(sentinel / 'SKILL.md')
+        elif scenario == 'hardlink':
+            os.link(sentinel / 'SKILL.md', skill / 'SKILL.md')
+        elif scenario == 'file-directory-conflict':
+            (skill / 'SKILL.md').mkdir()
+            (skill / 'SKILL.md/custom').write_bytes(b'conflicting custom directory\n')
+        else:
+            (skill / 'SKILL.md').write_bytes(b'previous skill text\n')
+    return case, skill, sentinel
+
+
+(work / 'payload.c').write_text('#include <stdio.h>\nint main(void) { puts("skill fixture 1.2.3"); return 0; }\n')
+subprocess.run(['cc', str(work / 'payload.c'), '-o', str(work / 'fixture')], check=True)
+executable = (work / 'fixture').read_bytes()
+local = work / 'source'
+(local / '.claude/skills/demo/references').mkdir(parents=True)
+(local / '.claude/skills/demo/SKILL.md').write_bytes(b'# Generated fixture skill\n')
+(local / '.claude/skills/demo/references/guide.md').write_bytes(b'Embedded nested reference\n')
+config = work / 'config'
+(config / 'repos.d').mkdir(parents=True)
+(config / 'repos.d/demo.yaml').write_text('tool_name: demo\nrepo: example/demo\nbinary_name: demo\n'
+    'language: go\narchive_format: tar.gz\nlocal_path: ' + str(local) + '\n')
+generated_environment = dict(environment, DSR_CONFIG_DIR=str(config), DSR_INSTALLER_DIR=str(work / 'generated'))
+generated = subprocess.run(['bash', '-c', 'source "$1/src/install_gen.sh"; install_gen_create demo --config-dir "$2"',
+    '_', str(root), str(config)], cwd=work, env=generated_environment, stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE, timeout=30)
+(work / 'generation.err').write_bytes(generated.stderr)
+if generated.returncode:
+    raise RuntimeError(generated.stderr.decode(errors='replace'))
+scripts = [Path(generated.stdout.decode().strip())] + [installers / tool / 'install.sh' for tool in ('bv', 'cass', 'ntm')]
+
+# Inject failures at actual filesystem syscalls in the optional Python process;
+# the generated public installer and the production publisher stay unchanged.
+tools = work / 'tools'
+tools.mkdir()
+wrapper = tools / 'python3'
+wrapper.write_text('#!' + sys.executable + '\n' + '''
+import os, sys
+if sys.argv[1:3] == ['-I', '-']:
+    program = sys.stdin.read()
+    if program.startswith('# DSR optional skill publication:') and sys.argv[3] == os.environ.get('SKILL_FAULT_DEST'):
+        prefix = ''' + repr('''import os
+_skill_original_write = os.write
+_skill_original_rename = os.rename
+_skill_writes = 0
+def _skill_write(fd, data):
+    global _skill_writes
+    _skill_writes += 1
+    if os.environ['SKILL_FAULT'] == 'copy' and _skill_writes == 2:
+        raise OSError('injected partial skill copy')
+    return _skill_original_write(fd, data)
+def _skill_rename(source, destination, **kwargs):
+    if source == 'candidate':
+        if os.environ['SKILL_FAULT'] == 'rename':
+            raise OSError('injected skill publication failure')
+        if os.environ['SKILL_FAULT'] == 'stop':
+            os._exit(71)
+    return _skill_original_rename(source, destination, **kwargs)
+os.write = _skill_write
+os.rename = _skill_rename
+''') + '''
+        program = prefix + program
+    os.execv(''' + repr(sys.executable) + ''', [''' + repr(sys.executable) + ''', '-I', '-c', program, *sys.argv[3:]])
+os.execv(''' + repr(sys.executable) + ''', [''' + repr(sys.executable) + ''', *sys.argv[1:]])
+''')
+wrapper.chmod(0o755)
+
+for script in scripts:
+    tool = script.parent.name
+    b64 = re.search(r"^_SKILL_ARCHIVE_B64='([^']*)'$", script.read_text(), re.M).group(1)
+    with tarfile.open(fileobj=io.BytesIO(base64.b64decode(b64)), mode='r:gz') as bundle:
+        member = next(member for member in bundle if str(Path(member.name)) == 'SKILL.md')
+        expected_skill = bundle.extractfile(member).read()
+    asset = (f'cass-{system}-{architecture}.tar.gz' if tool == 'cass' else
+             f'{tool}_1.2.3_{system}_{architecture}.tar.gz' if tool in ('bv', 'ntm') else
+             f'demo-1.2.3-{system}-{architecture}.tar.gz')
+    package = work / asset
+    with tarfile.open(package, 'w:gz') as archive:
+        member = tarfile.TarInfo(tool)
+        member.size, member.mode = len(executable), 0o755
+        archive.addfile(member, io.BytesIO(executable))
+    Path(str(package) + '.sha256').write_text(hashlib.sha256(package.read_bytes()).hexdigest() + '  ' + asset + '\n')
+    scenarios = ['normal', 'directory-symlink', 'file-symlink', 'hardlink', 'file-directory-conflict']
+    if limits_only:
+        scenarios = []
+    if tool == 'demo' and not limits_only:
+        scenarios += ['copy', 'rename', 'stop', 'locked', 'parent-symlink', 'special']
+    for scenario in scenarios:
+        case, skill, sentinel = prepare(tool, scenario)
+        if scenario == 'parent-symlink':
+            # Link a previously absent agent directory without moving user data.
+            linked_home = case / 'linked-home'
+            linked_home.mkdir()
+            (linked_home / '.claude').symlink_to(case / 'home/.claude', target_is_directory=True)
+            (linked_home / '.codex').mkdir()
+            home = linked_home
+        else:
+            home = case / 'home'
+        if scenario == 'special':
+            os.mkfifo(skill / 'pipe')
+        previous = snapshot(skill)
+        custom = content_snapshot(skill / 'custom') if (skill / 'custom').is_dir() else None
+        original_sentinel = snapshot(sentinel)
+        env = dict(environment, HOME=str(home))
+        if scenario in ('copy', 'rename', 'stop'):
+            env.update(PATH=str(tools) + os.pathsep + environment['PATH'], SKILL_FAULT=scenario,
+                       SKILL_FAULT_DEST=str(skill))
+        held = None
+        if scenario == 'locked':
+            held = open(skill.parent / ('.' + tool + '.dsr-skill.lock'), 'wb')
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = run(tool + '-' + scenario, script, case, package, env)
+        if held is not None:
+            held.close()
+        check(tool + '-' + scenario + ' preserves unrelated sentinel bytes and inode', snapshot(sentinel) == original_sentinel)
+        if scenario == 'normal':
+            check(tool + ' updates the existing skill and preserves nested custom files',
+                  (skill / 'SKILL.md').read_bytes() == expected_skill and content_snapshot(skill / 'custom') == custom)
+            retained = list(skill.parent.glob('.' + tool + '.skill-update.*/previous'))
+            check(tool + ' retains the exact previous skill tree', len(retained) == 1 and snapshot(retained[0]) == previous)
+        elif scenario == 'stop':
+            retained = list(skill.parent.glob('.' + tool + '.skill-update.*/previous'))
+            check('uncatchable skill stop retains original tree', len(retained) == 1 and snapshot(retained[0]) == previous)
+            retry = run('stopped-retry', script, case, package)
+            check('retry refuses to abandon an unfinished skill publication', not skill.exists() and
+                  b'Unfinished skill publication' in retry.stderr and snapshot(retained[0]) == previous)
+        else:
+            check(tool + '-' + scenario + ' refuses without changing the original skill tree', snapshot(skill) == previous and
+                  (b'optional skill installation skipped' in result.stderr))
+            if scenario in ('copy', 'rename', 'locked'):
+                retry = run(scenario + '-retry', script, case, package)
+                check(scenario + ' can retry safely after failure', (skill / 'SKILL.md').read_bytes() == expected_skill and
+                      content_snapshot(skill / 'custom') == custom and retry.returncode == 0)
+        check(tool + '-' + scenario + ' independently installs a fresh Codex skill',
+              (home / '.codex/skills' / tool / 'SKILL.md').read_bytes() == expected_skill)
+
+# Binary-only users need no Python dependency. Exercise the actual PATH lookup,
+# not a fake Python command which would still appear installed to command -v.
+case, skill, sentinel = prepare('demo', 'without-python')
+without_python = case / 'tools'
+without_python.mkdir()
+for name in ('bash env uname tr sed grep mktemp mkdir cp chmod mv rm rmdir head tail cat wc '
+             'sha256sum shasum openssl tar gzip unzip base64 readlink ps sleep date stat dirname '
+             'basename find xargs sort cut od getconf ldd file flock awk tee dd touch uniq').split():
+    executable_path = shutil.which(name)
+    if executable_path:
+        (without_python / name).symlink_to(executable_path)
+previous = snapshot(skill)
+result = run('without-python', scripts[0], case, work / f'demo-1.2.3-{system}-{architecture}.tar.gz',
+             dict(environment, HOME=str(case / 'home'), PATH=str(without_python)))
+check('missing Python preserves the complete existing skill tree', snapshot(skill) == previous)
+check('missing Python skips fresh optional skills with an actionable warning',
+      not (case / 'home/.codex/skills/demo').exists() and
+      b'Python 3 is required for safe publication' in result.stderr)
+
+# A GNU long-name header expands before tarfile yields an ordinary member.
+# Compress it in bounded chunks and supply it through the generator's archive
+# command, so this exercises a genuine standalone client with hostile metadata.
+oversized_archive = work / 'oversized-metadata.tar.gz'
+header = tarfile.TarInfo('././@LongLink')
+header.type = tarfile.GNUTYPE_LONGNAME
+header.size = 64 * 1024 * 1024 + 1
+with open(oversized_archive, 'wb') as output, gzip.GzipFile(fileobj=output, mode='wb', mtime=0) as compressed:
+    compressed.write(header.tobuf(format=tarfile.GNU_FORMAT))
+    for unused in range(64):
+        compressed.write(b'a' * (1024 * 1024))
+    compressed.write(b'\0' + b'\0' * 511)
+    member = tarfile.TarInfo('SKILL.md')
+    member.size, member.mode = 5, 0o644
+    compressed.write(member.tobuf(format=tarfile.GNU_FORMAT))
+    compressed.write(b'skill' + b'\0' * 507 + b'\0' * 1024)
+archive_tools = work / 'archive-tools'
+archive_tools.mkdir()
+(archive_tools / 'tar').write_text('#!/bin/sh\n'
+    'if [ "$1" = -czf ] && [ "$2" = - ]; then exec cat "$SKILL_ARCHIVE_FIXTURE"; fi\n'
+    'exec "$SKILL_REAL_TAR" "$@"\n')
+(archive_tools / 'tar').chmod(0o755)
+oversized_environment = dict(generated_environment, PATH=str(archive_tools) + os.pathsep + environment['PATH'],
+    DSR_INSTALLER_DIR=str(work / 'oversized-generated'), SKILL_ARCHIVE_FIXTURE=str(oversized_archive),
+    SKILL_REAL_TAR=shutil.which('tar'))
+oversized_generation = subprocess.run(['bash', '-c',
+    'source "$1/src/install_gen.sh"; install_gen_create demo --config-dir "$2"', '_', str(root), str(config)],
+    cwd=work, env=oversized_environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+(work / 'oversized-generation.err').write_bytes(oversized_generation.stderr)
+if oversized_generation.returncode:
+    raise RuntimeError(oversized_generation.stderr.decode(errors='replace'))
+case, skill, sentinel = prepare('demo', 'expanded-header')
+previous = snapshot(skill)
+original_sentinel = snapshot(sentinel)
+result = run('expanded-header', Path(oversized_generation.stdout.decode().strip()), case,
+             work / f'demo-1.2.3-{system}-{architecture}.tar.gz')
+check('oversized compressed metadata is refused at the expanded byte limit',
+      b'Expanded skill archive exceeds the byte limit' in result.stderr)
+check('oversized metadata preserves every original skill and unrelated sentinel',
+      snapshot(skill) == previous and snapshot(sentinel) == original_sentinel)
+check('oversized metadata is rejected before staging or fresh destination creation',
+      not list(skill.parent.glob('.demo.*')) and not (case / 'home/.codex/skills').exists())
+print(f'Public skill destinations: {passed} passed, {failed} failed', flush=True)
+raise SystemExit(1 if failed else 0)
+SKILL_TEST_PY
+}
+
+if [[ "${1:-}" == --skills-only ]]; then
+    test_skill_destinations
+    exit $?
+fi
+if [[ "${1:-}" == --skills-limits-only ]]; then
+    test_skill_destinations --limits-only
+    exit $?
+fi
+
 for dependency in python3 openssl curl cc tar jq; do
     command -v "$dependency" >/dev/null || { printf 'SKIP: %s required\n' "$dependency"; exit 3; }
 done
@@ -267,4 +566,5 @@ for tool in bv cass ntm; do
     check "$tool altered offline cache never triggers network" test ! -s "$case_dir/transport.log"
 done
 printf 'Public installers: %s passed, %s failed\n' "$passed" "$failed"
-[[ "$failed" == 0 ]]
+[[ "$failed" == 0 ]] || exit 1
+test_skill_destinations

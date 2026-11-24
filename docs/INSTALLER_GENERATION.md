@@ -16,6 +16,39 @@ sourcing the module to select an output root; the default is `./installers`.
 Success prints only the generated installer path to stdout. Diagnostics and
 retained-history paths go to stderr.
 
+## Optional bundled agent skills
+
+Bash installers can install their bundled skill beneath `~/.claude/skills/TOOL`
+and `~/.codex/skills/TOOL`. This optional step requires Python 3 with Unix
+filesystem and locking support. A missing prerequisite or refused skill update
+leaves a successfully verified executable installation successful and prints a
+warning on stderr.
+
+Skill updates prepare a complete replacement in a private sibling directory.
+Existing custom files and nested directories are preserved; archive members
+replace only matching regular files in that staged copy. A linked destination
+or parent, symlink, hardlinked file, special entry, foreign-owned content, or
+file/directory conflict is refused before publication. The installer never
+copies archive contents directly into the live skill tree.
+
+After a successful update, the previous complete tree remains beneath
+`.TOOL.skill-update.<nonce>/previous` beside the skill directory. The installer
+prints its recovery path. An ordinary publication failure restores the original
+when the destination is still vacant. If an uncatchable stop occurs between the
+two directory renames, the original remains in that recovery directory and a
+later attempt refuses to abandon it; inspect the printed path before retrying.
+No automatic cleanup removes the retained original.
+
+An advisory lock serializes cooperating installers. Readers can observe a brief
+gap between the old and new directory names, and publication does not provide an
+atomic transaction against arbitrary concurrent filesystem edits by the same
+user. Archive and existing-tree admission are bounded to 64 MiB, 10,000 entries
+and 64 nested path components. Run the public destination regressions with:
+
+```bash
+bash scripts/tests/test_public_installers.sh --skills-only
+```
+
 ## Executable target checks in Bash installers
 
 After checksum and configured signature verification, the generated Bash

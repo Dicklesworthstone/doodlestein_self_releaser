@@ -2570,75 +2570,276 @@ _decode_skill_archive() {
 }
 
 _install_skill_archive_to_dir() {
-    local skill_dir="$1"
-    local stage_dir=""
-
-    stage_dir="$(mktemp -d 2>/dev/null || true)"
-    if [[ -z "$stage_dir" || ! -d "$stage_dir" ]]; then
-        _log_warn "Failed to create temporary directory for skill installation"
+    # Skills are optional. Python supplies portable no-follow, directory-relative
+    # filesystem operations; its absence must never fail the binary install.
+    if ! command -v python3 >/dev/null 2>&1; then
+        _log_warn 'Skipping optional skill installation: Python 3 is required for safe publication'
         return 1
     fi
+    python3 -I - "$1" 3<<< "$_SKILL_ARCHIVE_B64" <<'DSR_SKILL_PUBLISH_PY'
+# DSR optional skill publication: never merge into a live destination tree.
+import base64
+import contextlib
+import fcntl
+import gzip
+import hashlib
+import io
+import os
+import secrets
+import stat
+import sys
+import tarfile
 
-    # Pre-validate the archive listing before extracting.  Skill
-    # content is publisher-controlled, but a compromised release
-    # tarball could contain absolute paths, ".." traversal entries,
-    # or symlinks that escape $stage_dir during extraction (or worse,
-    # during the subsequent `cp -R "$stage_dir/." "$skill_dir/"`
-    # which faithfully recreates symlinks under ~/.claude/).  Reject
-    # any entry whose name starts with `/`, contains `../`, or whose
-    # type-flag indicates a symlink/hardlink.  Then extract with the
-    # safest tar flags available on both GNU and BSD tar.
-    local listing=""
-    listing=$(_decode_skill_archive | tar -tzf - 2>/dev/null) || {
-        rm -rf "$stage_dir" 2>/dev/null || true
-        _log_warn "Failed to read embedded skill archive"
-        return 1
-    }
-    if printf '%s\n' "$listing" | grep -E '^/|(^|/)\.\.(/|$)' >/dev/null 2>&1; then
-        rm -rf "$stage_dir" 2>/dev/null || true
-        _log_warn "Skill archive contains unsafe path entries; refusing to extract"
-        return 1
-    fi
+LIMIT = 64 * 1024 * 1024
+COUNT = 10000
+stack = contextlib.ExitStack()
+chain = []
+stage = None
+saved = False
+published = False
+destination = os.path.abspath(sys.argv[1])
 
-    if ! _decode_skill_archive | tar -xzf - \
-            --no-same-owner \
-            --no-same-permissions \
-            -C "$stage_dir" >/dev/null 2>&1; then
-        # Retry without the GNU-only flags for BSD tar (macOS).
-        if ! _decode_skill_archive | tar -xzf - -C "$stage_dir" >/dev/null 2>&1; then
-            rm -rf "$stage_dir" 2>/dev/null || true
-            _log_warn "Failed to extract embedded skill archive"
-            return 1
-        fi
-    fi
 
-    # Belt-and-suspenders: walk the staged tree and reject any
-    # symlinks before we copy.  Catches whatever tar didn't filter.
-    # Capture the whole walk: `find | grep -q .` lets grep's early exit
-    # SIGPIPE find once many links exist, and pipefail then reported "no
-    # symlinks".  A failed walk refuses the install rather than passing it.
-    local staged_links=""
-    if ! staged_links=$(find "$stage_dir" -type l 2>/dev/null) || \
-       [[ -n "$staged_links" ]]; then
-        rm -rf "$stage_dir" 2>/dev/null || true
-        _log_warn "Skill archive contains symbolic links (or could not be scanned); refusing to install"
-        return 1
-    fi
+def need(condition, message):
+    if not condition:
+        raise ValueError(message)
 
-    if [[ ! -f "$stage_dir/SKILL.md" ]]; then
-        rm -rf "$stage_dir" 2>/dev/null || true
-        _log_warn "Embedded skill archive is missing SKILL.md"
-        return 1
-    fi
-    mkdir -p "$skill_dir"
-    if ! cp -R "$stage_dir/." "$skill_dir/" 2>/dev/null; then
-        rm -rf "$stage_dir" 2>/dev/null || true
-        _log_warn "Failed to install skill archive into $skill_dir"
-        return 1
-    fi
 
-    rm -rf "$stage_dir" 2>/dev/null || true
-    return 0
+@contextlib.contextmanager
+def opened(name, flags, parent=None, mode=0o600):
+    fd = os.open(name, flags | os.O_NOFOLLOW, mode, dir_fd=parent)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def keep(name, flags, parent=None):
+    return stack.enter_context(opened(name, flags, parent))
+
+
+def identity(value):
+    return (value.st_dev, value.st_ino, value.st_mode, value.st_uid)
+
+
+def fingerprint(value):
+    return identity(value) + (value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+
+
+def entry(directory, name):
+    try:
+        return os.stat(name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def write_all(fd, data):
+    while data:
+        count = os.write(fd, data)
+        need(count > 0, 'Incomplete skill copy')
+        data = data[count:]
+
+
+def tree(directory, copy=None):
+    records = {}
+    total = 0
+
+    def visit(source, target, prefix, depth):
+        nonlocal total
+        need(depth <= 64 and len(records) < COUNT, 'Skill tree exceeds the depth or entry limit')
+        original = os.fstat(source)
+        need(original.st_uid == os.geteuid(), 'Skill directory is owned by another user')
+        records[prefix] = (fingerprint(original), None)
+        for name in sorted(os.listdir(source)):
+            path = prefix + '/' + name if prefix else name
+            need(len(records) < COUNT, 'Skill tree exceeds the entry limit')
+            before = os.stat(name, dir_fd=source, follow_symlinks=False)
+            need(before.st_uid == os.geteuid(), 'Skill entry is owned by another user: ' + path)
+            if stat.S_ISDIR(before.st_mode):
+                with opened(name, os.O_RDONLY | os.O_DIRECTORY, source) as child:
+                    need(fingerprint(os.fstat(child)) == fingerprint(before), 'Skill directory changed: ' + path)
+                    if target is None:
+                        visit(child, None, path, depth + 1)
+                    else:
+                        os.mkdir(name, 0o700, dir_fd=target)
+                        with opened(name, os.O_RDONLY | os.O_DIRECTORY, target) as output:
+                            visit(child, output, path, depth + 1)
+            else:
+                need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1,
+                     'Refusing linked or special skill entry: ' + path)
+                total += before.st_size
+                need(total <= LIMIT, 'Skill tree exceeds the byte limit')
+                with opened(name, os.O_RDONLY | os.O_NONBLOCK, source) as child, contextlib.ExitStack() as files:
+                    need(fingerprint(os.fstat(child)) == fingerprint(before), 'Skill file changed: ' + path)
+                    output = files.enter_context(opened(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, target)) if target is not None else None
+                    digest = hashlib.sha256()
+                    remaining = before.st_size
+                    while remaining:
+                        data = os.read(child, min(remaining, 65536))
+                        need(data, 'Skill file shortened during copy: ' + path)
+                        remaining -= len(data)
+                        digest.update(data)
+                        if output is not None:
+                            write_all(output, data)
+                    need(not os.read(child, 1) and fingerprint(os.fstat(child)) == fingerprint(before),
+                         'Skill file changed during copy: ' + path)
+                    if output is not None:
+                        os.fchmod(output, stat.S_IMODE(before.st_mode))
+                        os.utime(output, ns=(before.st_atime_ns, before.st_mtime_ns))
+                    records[path] = (fingerprint(before), digest.hexdigest())
+        need(fingerprint(os.fstat(source)) == fingerprint(original), 'Skill directory changed during copy')
+
+    visit(directory, copy, '', 0)
+    return records
+
+
+try:
+    # Validate every archive entry before creating any skill destination.
+    with os.fdopen(3, 'rb') as encoded:
+        data = encoded.read(LIMIT + 1)
+    need(len(data) <= LIMIT, 'Embedded skill archive exceeds the byte limit')
+    with gzip.GzipFile(fileobj=io.BytesIO(base64.b64decode(data.strip(), validate=True))) as compressed:
+        decoded = compressed.read(LIMIT + 1)
+    need(len(decoded) <= LIMIT, 'Expanded skill archive exceeds the byte limit')
+    archive = tarfile.open(fileobj=io.BytesIO(decoded), mode='r:')
+    members = {}
+    total = 0
+    for member_index, member in enumerate(archive):
+        need(member_index < COUNT, 'Skill archive exceeds the entry limit')
+        parts = [part for part in member.name.split('/') if part and part != '.']
+        need(not member.name.startswith('/') and '..' not in parts and '\x00' not in member.name and len(parts) <= 64,
+             'Unsafe path in skill archive')
+        need(member.isdir() or member.isfile(), 'Linked or special entry in skill archive')
+        need(not member.isdir() or member.size == 0, 'Nonempty directory entry in skill archive')
+        if not parts:
+            need(member.isdir(), 'Invalid skill archive root')
+            continue
+        path = '/'.join(parts)
+        need(path not in members and len(members) < COUNT, 'Duplicate or excessive skill archive entries')
+        total += member.size
+        need(0 <= member.size <= LIMIT and total <= LIMIT, 'Skill archive exceeds the byte limit')
+        members[path] = member
+    need('SKILL.md' in members and members['SKILL.md'].isfile(), 'Skill archive is missing SKILL.md')
+
+    parts = destination.split('/')[1:]
+    need(parts and all(part not in ('', '.', '..') for part in parts), 'Invalid skill destination')
+    parent_fd = keep('/', os.O_RDONLY | os.O_DIRECTORY)
+    for component in parts[:-1]:
+        if entry(parent_fd, component) is None:
+            os.mkdir(component, 0o755, dir_fd=parent_fd)
+        child = keep(component, os.O_RDONLY | os.O_DIRECTORY, parent_fd)
+        chain.append((parent_fd, component, identity(os.fstat(child))))
+        parent_fd = child
+    name = parts[-1]
+    lock_name = '.' + name + '.dsr-skill.lock'
+    lock = keep(lock_name, os.O_RDWR | os.O_CREAT | os.O_NONBLOCK, parent_fd)
+    lock_stat = os.fstat(lock)
+    need(stat.S_ISREG(lock_stat.st_mode) and lock_stat.st_nlink == 1 and lock_stat.st_uid == os.geteuid(),
+         'Unsafe skill publication lock')
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    # An uncatchable stop between the two directory renames leaves the original
+    # in a private recovery directory. A retry must not silently abandon it.
+    for retained in os.listdir(parent_fd):
+        if retained.startswith('.' + name + '.skill-update.'):
+            with opened(retained, os.O_RDONLY | os.O_DIRECTORY, parent_fd) as recovery:
+                need(entry(recovery, 'previous') is None or entry(recovery, 'completed') is not None,
+                     'Unfinished skill publication requires inspection: ' + retained)
+    original = entry(parent_fd, name)
+    old_fd = None
+    before = None
+    if original is not None:
+        need(stat.S_ISDIR(original.st_mode), 'Refusing linked or non-directory skill destination')
+        old_fd = keep(name, os.O_RDONLY | os.O_DIRECTORY, parent_fd)
+        need(fingerprint(os.fstat(old_fd)) == fingerprint(original), 'Skill destination changed')
+        before = tree(old_fd)
+    # File/directory conflicts must never discard custom nested content.
+    for path, member in members.items():
+        components = path.split('/')
+        for index in range(1, len(components) + 1):
+            selected = '/'.join(components[:index])
+            expected_dir = index < len(components) or member.isdir()
+            if selected in members:
+                need(members[selected].isdir() == expected_dir, 'Conflicting skill archive path: ' + selected)
+            if before is not None and selected in before:
+                need(stat.S_ISDIR(before[selected][0][2]) == expected_dir,
+                     'Skill file/directory conflict: ' + selected)
+
+    stage = '.' + name + '.skill-update.' + secrets.token_hex(12)
+    os.mkdir(stage, 0o700, dir_fd=parent_fd)
+    stage_fd = keep(stage, os.O_RDONLY | os.O_DIRECTORY, parent_fd)
+    os.mkdir('candidate', 0o700, dir_fd=stage_fd)
+    candidate = keep('candidate', os.O_RDONLY | os.O_DIRECTORY, stage_fd)
+    if old_fd is not None:
+        need(tree(old_fd, candidate) == before, 'Skill tree changed before staging')
+    # All writes below target the private candidate, never existing user files.
+    for path, member in sorted(members.items(), key=lambda item: (item[0].count('/'), item[0])):
+        components = path.split('/')
+        with contextlib.ExitStack() as directories:
+            target = candidate
+            for component in components[:-1]:
+                if entry(target, component) is None:
+                    os.mkdir(component, 0o755, dir_fd=target)
+                target = directories.enter_context(opened(component, os.O_RDONLY | os.O_DIRECTORY, target))
+            leaf = components[-1]
+            if member.isdir():
+                if entry(target, leaf) is None:
+                    os.mkdir(leaf, 0o755, dir_fd=target)
+            else:
+                if entry(target, leaf) is not None:
+                    with opened(leaf, os.O_RDONLY, target) as copied:
+                        os.fchmod(copied, 0o600)
+                with opened(leaf, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, target) as output:
+                    source = archive.extractfile(member)
+                    remaining = member.size
+                    while remaining:
+                        chunk = source.read(min(remaining, 65536))
+                        need(chunk, 'Incomplete skill archive file: ' + path)
+                        write_all(output, chunk)
+                        remaining -= len(chunk)
+                    source.close()
+                    os.fchmod(output, 0o755 if member.mode & 0o111 else 0o644)
+    # Restore custom directory modes after all private candidate writes finish.
+    for path, record in sorted((before or {}).items(), key=lambda item: -item[0].count('/')):
+        if path and stat.S_ISDIR(record[0][2]):
+            with opened(path, os.O_RDONLY | os.O_DIRECTORY, candidate) as directory:
+                os.fchmod(directory, stat.S_IMODE(record[0][2]))
+    os.fchmod(candidate, stat.S_IMODE(original.st_mode) if original is not None else 0o755)
+    for directory, component, expected in chain:
+        current = entry(directory, component)
+        need(current is not None and identity(current) == expected, 'Skill parent directory changed')
+    current_lock = entry(parent_fd, lock_name)
+    need(current_lock is not None and identity(current_lock) == identity(lock_stat), 'Skill publication lock changed')
+    current = entry(parent_fd, name)
+    if original is None:
+        need(current is None, 'Skill destination appeared during installation')
+    else:
+        need(current is not None and fingerprint(current) == fingerprint(original) and tree(old_fd) == before,
+             'Skill destination changed during installation')
+        os.rename(name, 'previous', src_dir_fd=parent_fd, dst_dir_fd=stage_fd)
+        saved = True
+    try:
+        os.rename('candidate', name, src_dir_fd=stage_fd, dst_dir_fd=parent_fd)
+        published = True
+    except OSError:
+        # Do not overwrite an independent writer while restoring our original.
+        if saved and entry(parent_fd, name) is None:
+            os.rename('previous', name, src_dir_fd=stage_fd, dst_dir_fd=parent_fd)
+            saved = False
+        raise
+    if saved:
+        with opened('completed', os.O_WRONLY | os.O_CREAT | os.O_EXCL, stage_fd) as completed:
+            write_all(completed, b'published\n')
+        print('[skills] Previous skill tree retained: ' + os.path.join(os.path.dirname(destination), stage, 'previous'), file=sys.stderr)
+except (OSError, ValueError, tarfile.TarError, EOFError) as error:
+    print('[skills] Warning: optional skill installation skipped: ' + str(error), file=sys.stderr)
+    if stage is not None:
+        print('[skills] Staging/recovery files retained: ' + os.path.join(os.path.dirname(destination), stage), file=sys.stderr)
+    if saved and not published:
+        print('[skills] Original skill tree is retained as previous; destination needs inspection before retry', file=sys.stderr)
+    sys.exit(1)
+finally:
+    stack.close()
+DSR_SKILL_PUBLISH_PY
 }
 
 # Install skill for Claude Code
