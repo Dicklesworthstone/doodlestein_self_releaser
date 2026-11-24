@@ -1711,6 +1711,17 @@ EOF
         result=$(_check_repo "$repo" "$threshold" "$now" "${workflow##*/}")
         local status=$?
 
+        local projection_status=0
+        result=$(jq -c --arg tool "$tool" '. + {tool: (if $tool == "" then null else $tool end)}' \
+            <<< "$result" 2>/dev/null) || projection_status=$?
+        if ((projection_status != 0)); then
+            # An unsupervised parser crash withdraws the complete poll just
+            # like an interrupted run/job read. Never retain an earlier
+            # repository's launch authorization after losing this observation.
+            result=$(_check_observation_failure "$projection_status" "$repo" "$workflow" "unreadable check result")
+            local failure_status=$?
+            [[ "$status" == 5 ]] || status="$failure_status"
+        fi
         if [[ $status -eq 1 ]]; then
             any_throttled=true
         elif [[ $status -eq 5 ]]; then
@@ -1718,9 +1729,6 @@ EOF
         elif [[ $status -ne 0 ]]; then
             any_error=true
         fi
-        result=$(jq -c --arg tool "$tool" '. + {tool: (if $tool == "" then null else $tool end)}' \
-            <<< "$result" 2>/dev/null) || result=$(jq -nc --arg repo "$repo" \
-            '{repo: $repo, status: "error", error: "unreadable check result"}')
 
         results+=("$result")
 
@@ -1782,13 +1790,34 @@ EOF
     return "$summary_exit"
 }
 
+# jq validation errors are ordinary unavailable observations, including its
+# semantic-error status 5. These parsers have no deadline wrapper: every
+# signal-like status, including SIGKILL, must instead terminate the whole poll.
+_check_observation_failure() {
+    local process_status="$1" repo="$2" workflow="$3" reason="$4" status=8
+    if ((process_status >= 129 && process_status <= 255)); then
+        status=5
+        reason="workflow analysis interrupted"
+    fi
+    jq -nc --arg repo "$repo" --arg workflow "$workflow" --arg reason "$reason" \
+        '{repo:$repo,status:"error",error:$reason,
+          workflow:(if $workflow == "" then null else $workflow end)}'
+    return "$status"
+}
+
 # Return the run with evidence of stalled job dispatch, or null while work is
 # executing/awaiting approval. Job timestamps are optional in GitHub responses;
 # the latest observed run/job activity provides a conservative queue baseline.
 _check_waiting_jobs() {
     local repo="$1" run="$2" threshold="$3" now="$4" jobs run_id attempt analysis_status=0
-    run_id=$(jq -r '.id' <<< "$run") || return 8
-    attempt=$(jq -r '.run_attempt // empty' <<< "$run") || return 8
+    run_id=$(jq -r '.id' <<< "$run") || {
+        _check_observation_failure "$?" "$repo" "" "failed to read workflow identity"
+        return $?
+    }
+    attempt=$(jq -r '.run_attempt // empty' <<< "$run") || {
+        _check_observation_failure "$?" "$repo" "" "failed to read workflow attempt"
+        return $?
+    }
     jobs=$(gh_workflow_jobs "$repo" "$run_id" "$attempt") || return $?
     printf '%s\n' "$run" "$jobs" | jq -sc --argjson now "$now" --argjson threshold "$threshold" '
         .[0] as $run | .[1].jobs as $jobs |
@@ -1844,18 +1873,23 @@ _check_repo() {
               workflow:(if $workflow == "" then null else $workflow end)}'
         return 5
     fi
-    if [[ $fetch_status -ne 0 ]] || [[ -z "$runs_json" ]] ||
-       ! jq -e 'type == "object"' <<< "$runs_json" >/dev/null 2>&1; then
+    if [[ $fetch_status -ne 0 ]] || [[ -z "$runs_json" ]]; then
         jq -nc --arg repo "$repo" --arg workflow "$workflow" \
             '{repo: $repo, status: "error", error: "failed to fetch runs",
               workflow: (if $workflow == "" then null else $workflow end)}'
         return 8
     fi
+    local analysis_status=0
+    jq -e 'type == "object"' <<< "$runs_json" >/dev/null 2>&1 || analysis_status=$?
+    if ((analysis_status != 0)); then
+        _check_observation_failure "$analysis_status" "$repo" "$workflow" "failed to fetch runs"
+        return $?
+    fi
 
     # Analyze the complete inventory in one stream. Malformed timestamps
     # make the repository unreadable; they must not become an empty queue.
     local result
-    if ! result=$(jq -ce --arg repo "$repo" --arg workflow "$workflow" \
+    result=$(jq -ce --arg repo "$repo" --arg workflow "$workflow" \
             --argjson now "$now" --argjson threshold "$threshold" '
         .workflow_runs | map(
             (.created_at | fromdateiso8601) as $created |
@@ -1876,11 +1910,10 @@ _check_repo() {
              oldest_queued_seconds: ([.queued_runs[].age_seconds] | max // 0)} |
         . + {oldest_queued_minutes: ((.oldest_queued_seconds / 60) | floor),
              status: (if .queued_count > 0 or .stuck_in_progress_count > 0
-                      then "throttled" else "ok" end)}' <<< "$runs_json" 2>/dev/null); then
-        jq -nc --arg repo "$repo" --arg workflow "$workflow" \
-            '{repo: $repo, status: "error", error: "invalid active-run timestamps",
-              workflow: (if $workflow == "" then null else $workflow end)}'
-        return 8
+                      then "throttled" else "ok" end)}' <<< "$runs_json" 2>/dev/null) || analysis_status=$?
+    if ((analysis_status != 0)); then
+        _check_observation_failure "$analysis_status" "$repo" "$workflow" "invalid active-run timestamps"
+        return $?
     fi
 
     # GitHub can label a workflow queued while some of its jobs are running.
@@ -1889,9 +1922,18 @@ _check_repo() {
     # empty inventory remains evidence for an old, wholly queued workflow.
     # Each inventory authorizes only its own run. An unreadable run cannot
     # invalidate a separately proven queue from this complete active listing.
-    local run checked inspection_status
+    local run checked inspection_status inventory
     local -a job_observations=()
+    # Check the producer before consuming any rows. A process substitution
+    # loses jq's status and can turn a failed enumeration into a healthy empty
+    # repository or authorize only the rows emitted before the failure.
+    inventory=$(jq -c '.queued_runs[], .stuck_runs[]' <<< "$result") || analysis_status=$?
+    if ((analysis_status != 0)); then
+        _check_observation_failure "$analysis_status" "$repo" "$workflow" "failed to enumerate active runs"
+        return $?
+    fi
     while IFS= read -r run; do
+        [[ -n "$run" ]] || continue
         inspection_status=0
         checked=$(_check_waiting_jobs "$repo" "$run" "$threshold" "$now") || inspection_status=$?
         if [[ $inspection_status -eq 5 ]]; then
@@ -1905,7 +1947,7 @@ _check_repo() {
                 '{run_id:$run_id,reason:"failed to inspect workflow jobs"}') || return 8
         fi
         [[ "$checked" == null ]] || job_observations+=("$checked")
-    done < <(jq -c '.queued_runs[], .stuck_runs[]' <<< "$result")
+    done <<< "$inventory"
     result=$({
         printf '%s\n' "$result"
         if ((${#job_observations[@]})); then printf '%s\n' "${job_observations[@]}"; fi
@@ -1919,10 +1961,20 @@ _check_repo() {
         .oldest_queued_minutes = ((.oldest_queued_seconds / 60) | floor) |
         .status = (if .queued_count > 0 or .stuck_in_progress_count > 0 then "throttled"
                    elif (.job_errors | length) > 0 then "error" else "ok" end) |
-        if .status == "error" then . + {error:"failed to inspect workflow jobs"} else . end') || return 8
+        if .status == "error" then . + {error:"failed to inspect workflow jobs"} else . end') || analysis_status=$?
+    if ((analysis_status != 0)); then
+        _check_observation_failure "$analysis_status" "$repo" "$workflow" "failed to assemble workflow observations"
+        return $?
+    fi
 
+    local result_status
+    result_status=$(jq -r '.status' <<< "$result") || analysis_status=$?
+    if ((analysis_status != 0)); then
+        _check_observation_failure "$analysis_status" "$repo" "$workflow" "failed to classify workflow observations"
+        return $?
+    fi
     printf '%s\n' "$result"
-    case "$(jq -r '.status' <<< "$result")" in
+    case "$result_status" in
         throttled) return 1 ;;
         error) return 8 ;;
         *) return 0 ;;

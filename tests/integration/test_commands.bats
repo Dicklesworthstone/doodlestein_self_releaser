@@ -654,8 +654,13 @@ if [[ "$endpoint" =~ /runs/([0-9]+)/attempts/2/jobs\? ]]; then
                 printf '%s\n' '{"total_count":0,"jobs":[]}'
                 if [[ -n "${INDEPENDENT_CANCEL_SIGNAL:-}" ]]; then
                     ulimit -c 0
-                    kill -s "$INDEPENDENT_CANCEL_SIGNAL" "$$"
-                    exit 99
+                    # Bash may inherit SIGPIPE ignored from the test runner.
+                    # Reset it in the actual process being signalled.
+                    exec python3 -I -c 'import os, signal, sys
+selected = getattr(signal, "SIG" + sys.argv[1])
+selected == signal.SIGKILL or signal.signal(selected, signal.SIG_DFL)
+os.kill(os.getpid(), selected)
+raise SystemExit(99)' "$INDEPENDENT_CANCEL_SIGNAL"
                 fi
                 exit "${INDEPENDENT_CANCEL_CODE:-2}" ;;
             wrong-source|wrong-attempt|invalid-time|malformed|short-page|recovered) ;;
@@ -864,6 +869,139 @@ SCRIPT
     [[ ! -e "$TEST_TMPDIR/fallback.args" && ! -e "$DSR_STATE_DIR/check/last.json" ]]
     assert_equal 1 "$(wc -l < "$TEST_TMPDIR/watch-check.polls" | tr -d ' ')"
     ! grep -q 'runs/202/attempts/2/jobs' "$TEST_TMPDIR/gh.calls"
+}
+
+# Exercise actual parser processes at the complete-observation boundaries.
+# Network fixtures still return valid API documents; only the selected jq
+# process stops, after an independent repository has already proved a queue.
+_mock_check_parser_failure() {
+    export DSR_CHECK_REAL_JQ
+    [[ -n "${DSR_CHECK_REAL_JQ:-}" ]] || DSR_CHECK_REAL_JQ=$(type -P jq)
+    export DSR_CHECK_PARSER_STAGE="$1" DSR_CHECK_PARSER_SIGNAL="${2:-KILL}"
+    mock_command_script jq 'selected=false
+for argument in "$@"; do
+    case "$DSR_CHECK_PARSER_STAGE:$argument" in
+        analysis:*".workflow_runs | map("*|inventory:".queued_runs[], .stuck_runs[]"|identity:".id"|attempt:".run_attempt // empty"|aggregate:*"queued_runs:[.[1:][]"*|decoration:*". + {tool:"*)
+            selected=true ;;
+    esac
+done
+if $selected; then
+    input=$(cat) || exit 99
+    if [[ "$*" == *"Dicklesworthstone/ntm"* ]] ||
+       "$DSR_CHECK_REAL_JQ" -es '\''any(.[]; .repo == "Dicklesworthstone/ntm" or .id == 201)'\'' <<< "$input" >/dev/null 2>&1; then
+        printf "%s\n" "$DSR_CHECK_PARSER_STAGE" >> "$TEST_TMPDIR/check-parser.failed"
+        if [[ "$DSR_CHECK_PARSER_SIGNAL" == ordinary ]]; then exit 4; fi
+        ulimit -c 0
+        # Reset inherited ignored dispositions before delivering a real signal.
+        exec python3 -I -c '\''import os, signal, sys
+selected = getattr(signal, "SIG" + sys.argv[1])
+selected == signal.SIGKILL or signal.signal(selected, signal.SIG_DFL)
+os.kill(os.getpid(), selected)
+raise SystemExit(99)'\'' "$DSR_CHECK_PARSER_SIGNAL"
+    fi
+    printf "%s\n" "$input" | "$DSR_CHECK_REAL_JQ" "$@"
+else
+    exec "$DSR_CHECK_REAL_JQ" "$@"
+fi'
+}
+
+@test "check parser: signalled analysis withdraws earlier queues without replacing the snapshot" {
+    harness_create_config
+    _setup_repos_d
+    _mock_independent_job_inventory cross-repo
+    mkdir -p "$DSR_STATE_DIR/check"
+    printf '%s\n' '{"previous_completed_snapshot":true}' > "$DSR_STATE_DIR/check/last.json"
+    cp "$DSR_STATE_DIR/check/last.json" "$TEST_TMPDIR/previous-check.json"
+    _mock_check_parser_failure analysis
+    run _routing_dsr --json check bv ntm
+    assert_equal 5 "$status"
+    "$DSR_CHECK_REAL_JQ" -e '.status == "error" and .exit_code == 5 and
+        .details.throttled == [] and .details.healthy == [] and
+        .details.repos[0].status == "throttled"' <<< "$output"
+    cmp "$TEST_TMPDIR/previous-check.json" "$DSR_STATE_DIR/check/last.json"
+    [[ -s "$TEST_TMPDIR/check-parser.failed" ]]
+    ! grep -q 'runs/201/attempts/2/jobs' "$TEST_TMPDIR/gh.calls"
+}
+
+@test "check parser: interrupted run enumeration cannot become an empty healthy inventory" {
+    harness_create_config
+    _setup_repos_d
+    _mock_independent_job_inventory cross-repo
+    _mock_check_parser_failure inventory PIPE
+    run _routing_dsr --json check bv ntm
+    assert_equal 5 "$status"
+    "$DSR_CHECK_REAL_JQ" -e '.details.throttled == [] and .details.healthy == [] and
+        .details.repos[1].status == "error"' <<< "$output"
+    [[ -s "$TEST_TMPDIR/check-parser.failed" && ! -e "$DSR_STATE_DIR/check/last.json" ]]
+    ! grep -q 'runs/201/attempts/2/jobs' "$TEST_TMPDIR/gh.calls"
+}
+
+@test "check parser: interrupted observation aggregation withdraws earlier queues" {
+    harness_create_config
+    _setup_repos_d
+    _mock_independent_job_inventory cross-repo
+    _mock_check_parser_failure aggregate SEGV
+    run _routing_dsr --json check bv ntm
+    assert_equal 5 "$status"
+    "$DSR_CHECK_REAL_JQ" -e '.details.throttled == [] and .details.healthy == [] and
+        .details.repos[0].status == "throttled"' <<< "$output"
+    [[ -s "$TEST_TMPDIR/check-parser.failed" && ! -e "$DSR_STATE_DIR/check/last.json" ]]
+}
+
+@test "check parser: interrupted workflow selectors withdraw earlier queues before job requests" {
+    harness_create_config
+    _setup_repos_d
+    local selector
+    for selector in identity attempt; do
+        _mock_independent_job_inventory cross-repo
+        _mock_check_parser_failure "$selector"
+        run _routing_dsr --json check bv ntm
+        assert_equal 5 "$status"
+        "$DSR_CHECK_REAL_JQ" -e '.details.throttled == [] and .details.healthy == [] and
+            .details.repos[0].status == "throttled"' <<< "$output"
+        [[ -s "$TEST_TMPDIR/check-parser.failed" && ! -e "$DSR_STATE_DIR/check/last.json" ]]
+        ! grep -q 'runs/201/attempts/2/jobs' "$TEST_TMPDIR/gh.calls"
+    done
+}
+
+@test "check parser: interrupted result projection withdraws earlier queues" {
+    harness_create_config
+    _setup_repos_d
+    _mock_independent_job_inventory cross-repo
+    _mock_check_parser_failure decoration
+    run _routing_dsr --json check bv ntm
+    assert_equal 5 "$status"
+    "$DSR_CHECK_REAL_JQ" -e '.status == "error" and .exit_code == 5 and
+        .details.throttled == [] and .details.healthy == []' <<< "$output"
+    [[ -s "$TEST_TMPDIR/check-parser.failed" && ! -e "$DSR_STATE_DIR/check/last.json" ]]
+}
+
+@test "check parser: interrupted analysis stops continuous watch before fallback" {
+    harness_create_config
+    _setup_repos_d
+    _mock_independent_job_inventory cross-repo
+    _mock_check_parser_failure analysis
+    DSR_WATCH_FIXTURE_REAL_CHECK=1 DSR_WATCH_FIXTURE_CONTINUOUS=1 \
+        run --separate-stderr _routing_watch '{}' --auto-fallback
+    assert_equal 5 "$status"
+    "$DSR_CHECK_REAL_JQ" -e '.status == "error" and .exit_code == 5 and
+        .details.triggered_state.attempts == {} and .details.triggered_state.pending == {}' <<< "$output"
+    [[ ! -e "$TEST_TMPDIR/fallback.args" && ! -e "$DSR_STATE_DIR/check/last.json" ]]
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/watch-check.polls" | tr -d ' ')"
+    [[ -s "$TEST_TMPDIR/check-parser.failed" ]]
+}
+
+@test "check parser: ordinary enumeration errors preserve independent verified queues" {
+    harness_create_config
+    _setup_repos_d
+    _mock_independent_job_inventory cross-repo
+    _mock_check_parser_failure inventory ordinary
+    run _routing_dsr --json check ntm bv
+    assert_equal 1 "$status"
+    "$DSR_CHECK_REAL_JQ" -e '.status == "partial" and (.details.throttled | map(.run_id)) == [301] and
+        .details.healthy == [] and .details.skipped[0].repo == "Dicklesworthstone/ntm"' <<< "$output"
+    [[ -s "$TEST_TMPDIR/check-parser.failed" ]]
+    ! grep -q 'runs/201/attempts/2/jobs' "$TEST_TMPDIR/gh.calls"
 }
 
 @test "job scan: long executing or approval-pending workflows do not trigger fallback" {
