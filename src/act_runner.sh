@@ -11028,7 +11028,7 @@ _act_windows_rust_sdk_env_cleanup() {
 # applying the reviewed recipe. cgo's C/C++ child also honors header, library
 # and compiler-subprogram search paths even when Go's own flags are empty.
 _act_go_ambient_env_names() {
-    printf '%s\n' GOOS GOARCH GOENV GOFLAGS GOWORK GOTOOLCHAIN GO111MODULE GOROOT \
+    printf '%s\n' GOOS GOARCH GOENV GOFLAGS GOWORK GOTOOLCHAIN GO111MODULE GOROOT CDPATH \
         GOEXPERIMENT GODEBUG GOCACHEPROG GO_EXTLINK_ENABLED GOFIPS140 GCCGO GOAMD64 GOARM GOARM64 \
         GO386 GOMIPS GOMIPS64 GOPPC64 GORISCV64 GOWASM CGO_ENABLED CGO_CFLAGS \
         CGO_CPPFLAGS CGO_CXXFLAGS CGO_FFLAGS CGO_LDFLAGS CGO_CFLAGS_ALLOW \
@@ -11274,15 +11274,17 @@ PY
 # records portable graph-relative identity; the actual process gets the rebased
 # absolute path in this attempt's private copy.
 _act_strict_go_workfile_json() {
-    local tool="$1" sha="$2" selected="$3" stage_source="$4"
+    local tool="$1" sha="$2" selected="$3" stage_source="$4" command_plan="${5:-null}"
+    local managed_gowork="${6:-}"
     local checkout dependencies sources
     checkout=$(act_get_local_path "$tool") || return 4
     dependencies=$(_act_release_source_dependency_checkouts_json "$tool") || return 4
     sources=$(jq -cn --arg path "$checkout" --arg sha "$sha" --argjson deps "$dependencies" \
         '[{relative_path:"source",local_path:$path,git_sha:$sha}] + $deps') || return 4
-    python3 -I - "$selected" "$stage_source" "$sources" <<'PY'
+    python3 -I - "$selected" "$stage_source" "$sources" "$managed_gowork" 3<<< "$command_plan" <<'PY'
 import hashlib
 import json
+import ntpath
 import os
 import posixpath
 import re
@@ -11411,8 +11413,9 @@ def go_directives(contents):
         raise ValueError('unterminated Go module block')
 
 try:
-    selected, stage_source, encoded = sys.argv[1:]
+    selected, stage_source, encoded, managed_gowork = sys.argv[1:]
     sources = json.loads(encoded)
+    command_plan = json.load(os.fdopen(3))
     roots = {row['relative_path']: row for row in sources}
     if len(roots) != len(sources) or 'source' not in roots:
         raise ValueError('invalid admitted Go source graph')
@@ -11484,6 +11487,142 @@ try:
     for path in inventory:
         if path.endswith('/go.mod'):
             validate_paths(path, committed_contents(path))
+
+    if command_plan is not None:
+        # Direct Go commands are already interpreted for output ownership.
+        # Admit their original local input selectors against the same pinned
+        # graph, before a compiler runs and again when output is reused. This
+        # does not interpret opaque build scripts or authenticate module caches.
+        if (not isinstance(command_plan, dict) or
+                command_plan.get('shell') not in ('unix', 'windows') or
+                not isinstance(command_plan.get('operations'), list)):
+            raise ValueError('invalid direct Go command plan')
+        windows = command_plan['shell'] == 'windows'
+        paths = ntpath if windows else posixpath
+
+        def spelling(value):
+            return value.replace('\\', '/').lower() if windows else value
+
+        source_root = spelling(stage_source)
+        if (not paths.isabs(stage_source) or not source_root.endswith('/source') or
+                spelling(paths.normpath(stage_source)) != source_root or
+                (windows and not re.match(r'^[a-z]:/', source_root)) or
+                spelling(command_plan.get('source_root', '')) != source_root):
+            raise ValueError('invalid private Go command source root')
+        namespace = source_root[:-len('/source')]
+        entries = {spelling(path): entry for path, entry in inventory.items()}
+        known_directories = {spelling(path) for path in directories}
+        known_roots = {spelling(path) for path in roots}
+        if (len(entries) != len(inventory) or len(known_directories) != len(directories) or
+                len(known_roots) != len(roots)):
+            raise ValueError('ambiguous case in pinned Go source paths')
+
+        def local_input(value, cwd, file=False, internal=False):
+            if (not isinstance(value, str) or not value or
+                    any(ord(character) < 32 or ord(character) == 127 for character in value)):
+                raise ValueError('invalid direct Go local source selector')
+            if windows and (value.startswith(('\\\\', '//')) or
+                            (ntpath.splitdrive(value)[0] and not ntpath.isabs(value))):
+                raise ValueError('drive-relative or UNC Go source selector')
+            # A retained receipt cannot authorize an absolute source by
+            # relabelling its private prefix. Explicit source paths must be
+            # relative; absolute output paths remain supported independently.
+            if not internal and (paths.isabs(value) or
+                                 (windows and value.startswith(('/', '\\')))):
+                # ntpath.isabs changed for single-leading-slash paths in
+                # Python 3.13; CMD still resolves them from the drive root.
+                raise ValueError('strict Go source selectors must be relative: ' + value)
+            # Do not normpath away a linked/missing ancestor or an escape
+            # before checking it. The worker would traverse that component.
+            raw = spelling(paths.join(cwd, value))
+            if not raw.startswith(namespace + '/'):
+                raise ValueError('direct Go source is outside the pinned graph: ' + value)
+            pending = raw[len(namespace) + 1:].split('/')
+            components, links = [], 0
+            while pending:
+                component = pending.pop(0)
+                if component in ('', '.'):
+                    continue
+                if component == '..':
+                    if not components:
+                        raise ValueError('direct Go source escapes the pinned graph: ' + value)
+                    components.pop()
+                    continue
+                if component.lower() == '.git':
+                    raise ValueError('direct Go source enters Git metadata: ' + value)
+                components.append(component)
+                path = '/'.join(components)
+                if path in known_directories:
+                    continue
+                mode, kind, oid, checkout = entries.get(path, ('', '', '', ''))
+                if mode == '120000' and kind == 'blob' and file and not pending:
+                    # Unix retains safe tracked links; Windows materializes
+                    # them. Resolve final file links from their pinned blobs,
+                    # within the same admitted root, on both worker types.
+                    links += 1
+                    if links > 32:
+                        raise ValueError('cyclic direct Go source link: ' + value)
+                    target = subprocess.check_output(
+                        ['git', '-C', checkout, 'cat-file', 'blob', oid],
+                        env=environment).decode('utf-8')
+                    if (not target or target.startswith('/') or '\\' in target or ':' in target or
+                            any(ord(character) < 32 or ord(character) == 127 for character in target)):
+                        raise ValueError('unsafe direct Go source link: ' + value)
+                    resolved = posixpath.normpath(posixpath.join(posixpath.dirname(path), spelling(target)))
+                    if resolved.split('/')[0] != components[0]:
+                        raise ValueError('direct Go source link leaves its pinned root: ' + value)
+                    components.pop()
+                    pending = spelling(target).split('/')
+                    continue
+                if pending or mode not in ('100644', '100755') or kind != 'blob':
+                    raise ValueError('direct Go source is unpinned, missing or linked: ' + value)
+            path = '/'.join(components)
+            if not components or components[0] not in known_roots:
+                raise ValueError('direct Go source escapes the pinned graph: ' + value)
+            if file:
+                mode, kind, _, _ = entries.get(path, ('', '', '', ''))
+                if mode not in ('100644', '100755') or kind != 'blob':
+                    raise ValueError('direct Go source requires a committed regular file: ' + value)
+            elif path not in known_directories:
+                raise ValueError('direct Go cwd/package requires a committed directory: ' + value)
+
+        for operation in command_plan['operations']:
+            effective = operation['environment']
+            if (not managed_gowork or not isinstance(effective, dict) or
+                    effective.get('GOENV') != 'off' or effective.get('GOWORK') != managed_gowork):
+                raise ValueError('direct Go commands must retain managed GOENV and GOWORK')
+            if operation.get('workfile_overridden') and effective['GOWORK'] != 'off':
+                # Comparing absolute strings is insufficient when readmission
+                # derives a private workfile prefix from a retained receipt.
+                # Only recipe-level non-off workfiles can select pinned bytes.
+                raise ValueError('non-off GOWORK must be selected in the reviewed recipe environment')
+            cwd = operation['cwd']
+            traversals = operation['directories']
+            packages = operation['packages']
+            if not isinstance(traversals, list) or not isinstance(packages, list):
+                raise ValueError('direct Go command lacks original source selectors')
+            for directory in traversals:
+                if directory.get('cdpath'):
+                    raise ValueError('strict Go cd must not use CDPATH')
+                local_input(directory['path'], directory['cwd'])
+            local_input(cwd, stage_source, internal=True)
+            for package in packages:
+                if not isinstance(package, str) or not package:
+                    raise ValueError('invalid direct Go package selector')
+                is_file = package.endswith('.go')
+                local = (is_file or package in ('.', '..') or package.startswith(('./', '../')) or
+                         paths.isabs(package) or
+                         (windows and (package.startswith(('/', '\\', '.\\', '..\\')) or
+                                       ntpath.splitdrive(package)[0])))
+                if not local:
+                    continue
+                selected_path = spelling(package)
+                if not is_file and selected_path.endswith('/...'):
+                    selected_path = selected_path[:-len('/...')]
+                if '...' in selected_path:
+                    raise ValueError('unsupported direct Go local package pattern: ' + package)
+                local_input(selected_path, cwd, file=is_file)
+
     if any(ord(character) < 32 for character in selected) or '\\' in selected:
         raise ValueError('GOWORK must be a literal portable path inside an admitted source root')
     if selected == 'off':
@@ -11540,11 +11679,21 @@ except (KeyError, TypeError, ValueError, OSError, subprocess.CalledProcessError)
 PY
 }
 
+# The plan is produced from the fully managed environment and the expanded
+# command. A null plan represents an opaque reviewed script, whose internals
+# are outside the supported direct-Go command boundary.
+_act_validate_strict_go_command_sources() {
+    local tool="$1" sha="$2" stage_source="$3" command_plan="$4" environment="$5" managed_gowork
+    [[ "$command_plan" == null ]] && return 0
+    managed_gowork=$(act_get_build_env_value "$environment" GOWORK) || return 4
+    _act_strict_go_workfile_json "$tool" "$sha" off "$stage_source" "$command_plan" "$managed_gowork" >/dev/null
+}
+
 _act_strict_go_build_env() {
     local tool="$1" sha="$2" ref="$3" stage_source="$4" environment="$5"
     local command="${6:-}"
     local pair name value workfile normalized pkg_config_regex selected=''
-    local result=$'GOENV=off\nGOFLAGS=\nGOTOOLCHAIN=local\nGO111MODULE=on' governed=$'\n'
+    local result=$'GOENV=off\nGOFLAGS=\nGOTOOLCHAIN=local\nGO111MODULE=on\nCDPATH=' governed=$'\n'
     governed+="$(_act_go_ambient_env_names)"$'\n'
     pkg_config_regex=$(_act_go_pkg_config_env_regex)
     [[ "$sha" =~ ^[0-9a-f]{40}$ && "$sha" != 0000000000000000000000000000000000000000 && -n "$ref" ]] || return 4
@@ -11567,6 +11716,12 @@ _act_strict_go_build_env() {
                 fi
                 continue ;;
             GOWORK) selected="$value"; continue ;;
+            CDPATH)
+                if [[ -n "$value" ]]; then
+                    _log_error 'Strict Go builds require empty CDPATH; use relative source directories'
+                    return 4
+                fi
+                continue ;;
             DSR_GO_ENV_POLICY|DSR_GO_WORKFILE|DSR_GO_WORKFILE_SHA256|DSR_GO_WORKFILE_GIT_SHA|\
             DSR_RELEASE_GIT_SHA|DSR_RELEASE_GIT_REF) continue ;;
         esac
@@ -11575,7 +11730,7 @@ _act_strict_go_build_env() {
     _act_validate_strict_go_source_flags "$result" "$command" || return 4
     workfile=$(_act_strict_go_workfile_json "$tool" "$sha" "$selected" "$stage_source") || return 4
     result+=$'\n'"GOWORK=$(jq -r '.gowork' <<< "$workfile")"
-    result+=$'\n'"DSR_GO_ENV_POLICY=3"
+    result+=$'\n'"DSR_GO_ENV_POLICY=4"
     result+=$'\n'"DSR_GO_WORKFILE=$(jq -r '.path' <<< "$workfile")"
     result+=$'\n'"DSR_GO_WORKFILE_SHA256=$(jq -r '.sha256' <<< "$workfile")"
     result+=$'\n'"DSR_GO_WORKFILE_GIT_SHA=$(jq -r '.git_sha' <<< "$workfile")"
@@ -11589,24 +11744,30 @@ _act_strict_go_build_env() {
 # admitting its retained release manifest. Failed readiness attempts have no
 # compiled output and do not need this receipt.
 _act_validate_strict_go_result() {
-    local tool="$1" result="$2" sha="$3" ref="$4" platform="$5"
+    local tool="$1" result="$2" sha="$3" ref="$4" platform="$5" version="${6:-}"
     local language environment expected actual workfile gowork stage_source command
+    local host shell_kind=unix binary_name target_triple command_plan
     language=$(yq -r '.language // ""' "$ACT_REPOS_DIR/$tool.yaml") || return 4
     [[ "$language" == go ]] || return 0
     jq -e '(.status // "") | IN("success","ok","passed")' <<< "$result" >/dev/null || return 0
     if ! actual=$(jq -ce --arg platform "$platform" '
         select(.method=="native" and (.platform // .target)==$platform) |
         .build_influence_env | select(type=="object" and all(.[];type=="string") and
-            .DSR_GO_ENV_POLICY=="3" and .GOENV=="off")' <<< "$result"); then
-        _log_error 'Strict native Go output lacks the current compiler environment policy receipt (DSR_GO_ENV_POLICY=3); start a fresh release build'
+            .DSR_GO_ENV_POLICY=="4" and .GOENV=="off")' <<< "$result"); then
+        _log_error 'Strict native Go output lacks the current compiler environment policy receipt (DSR_GO_ENV_POLICY=4); start a fresh release build'
         return 4
     fi
+    [[ -n "$version" ]] || return 4
+    host=$(jq -er '.host | strings | select(length > 0)' <<< "$result") || return 4
+    _act_is_windows_host "$host" && shell_kind=windows
     workfile=$(jq -er '.DSR_GO_WORKFILE | strings' <<< "$actual") || return 4
     gowork=$(jq -er '.GOWORK | strings' <<< "$actual") || return 4
     stage_source='/.dsr-go-receipt/source'
+    [[ "$shell_kind" == windows ]] && stage_source='C:/.dsr-go-receipt/source'
     if [[ -n "$workfile" ]]; then
-        # Only the attempt's private prefix varies between otherwise identical
-        # executions; its workfile suffix must match the pinned graph identity.
+        # The private prefix may vary, but the suffix identifies the pinned
+        # workfile. Only relative command source selectors are admitted, so
+        # this receipt prefix cannot authorize external absolute Go inputs.
         if [[ "$gowork" != *"/$workfile" ]]; then
             _log_error 'Strict Go workfile receipt does not match its staged compiler selection'
             return 4
@@ -11617,7 +11778,13 @@ _act_validate_strict_go_result() {
     fi
     environment=$(act_get_build_env "$tool" "$platform") || return 4
     command=$(act_get_build_cmd "$tool" "$platform") || return 4
+    binary_name=$(yq -r '.binary_name // ""' "$ACT_REPOS_DIR/$tool.yaml") || return 4
+    target_triple=$(jq -r '.target_triple // ""' <<< "$result") || return 4
+    command=$(act_substitute_build_cmd_tokens "$command" "${binary_name:-$tool}" \
+        "$version" "${platform%%/*}" "${platform##*/}" "$target_triple") || return 4
     environment=$(_act_strict_go_build_env "$tool" "$sha" "$ref" "$stage_source" "$environment" "$command") || return 4
+    command_plan=$(_act_go_output_plan "$stage_source" "$environment" "$command" "$shell_kind") || return 4
+    _act_validate_strict_go_command_sources "$tool" "$sha" "$stage_source" "$command_plan" "$environment" || return 4
     expected=$(_act_go_build_influence_json "$environment") || return 4
     if [[ "$(jq -cS . <<< "$actual")" != "$(jq -cS . <<< "$expected")" ]]; then
         _log_error 'Strict Go output no longer matches the reviewed compiler selectors or pinned workfile; start a fresh release build'
@@ -11876,6 +12043,13 @@ def absolute(value, cwd):
         return paths.normpath(paths.join(cwd, value)).replace('\\', '/')
     return paths.normpath(value if paths.isabs(value) else paths.join(cwd, value))
 
+def directory(value, cwd, traversals, cdpath=None):
+    # Retain the original traversal, not only its normalized destination:
+    # link/.. and missing/.. are meaningful filesystem operations. Shell cd
+    # also needs its search path at this step, before a later unset hides it.
+    traversals.append(dict(path=value, cwd=cwd, cdpath=cdpath))
+    return absolute(value, cwd)
+
 def executable_name(program):
     name = program.replace('\\', '/').rsplit('/', 1)[-1]
     return name.lower() if windows else name
@@ -11967,6 +12141,8 @@ try:
         return selected_group != final_group and (windows or group_sizes[selected_group] > 1)
 
     operations, cwd, unset, saw_go = [], root, set(), False
+    directories = []
+    workfile_overridden = False
     for statement_group, statement in statements:
         # Redirections are not Go arguments, including when flags follow them.
         raw, index = [], 0
@@ -11982,12 +12158,14 @@ try:
         if not raw:
             continue
         effective, removed, clear, position = dict(environment), set(unset), False, 0
+        effective_workfile_overridden = workfile_overridden
         inline_names = set()
         def assignments():
-            global position
+            global position, effective_workfile_overridden
             while position < len(raw) and re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', raw[position]):
                 name, value = raw[position].split('=', 1)
                 effective[name] = literal(value, environment)
+                effective_workfile_overridden = effective_workfile_overridden or name == 'GOWORK'
                 removed.discard(name); inline_names.add(name); position += 1
         assignments()
         if position == len(raw):
@@ -12001,7 +12179,9 @@ try:
             assignments()
             if position != len(raw):
                 unsupported = True
-            environment, unset = effective, removed; continue
+            environment, unset = effective, removed
+            workfile_overridden = effective_workfile_overridden
+            continue
         if program == 'unset' and not windows:
             unsupported = unsupported or unproved_list(statement_group)
             for name in raw[position:]:
@@ -12010,6 +12190,7 @@ try:
                 environment.pop(name, None); unset.add(name)
             continue
         selected_cwd, terminal_exec = cwd, False
+        selected_directories = list(directories)
         while program in ('command', 'exec', 'env') and not windows:
             terminal_exec = terminal_exec or program == 'exec'
             if program == 'command' and position < len(raw) and raw[position] in ('-v', '-V'):
@@ -12026,7 +12207,7 @@ try:
                         if option in ('-u', '--unset'):
                             effective.pop(value, None); removed.add(value)
                         else:
-                            selected_cwd = absolute(value, selected_cwd)
+                            selected_cwd = directory(value, selected_cwd, selected_directories)
                     elif option == '--':
                         position += 1; break
                     else:
@@ -12045,7 +12226,11 @@ try:
                         literal(raw[position], effective, inline_names).lower() == '/d')
         if directory_command and (len(raw[position:]) == 1 or change_drive):
             unsupported = unsupported or unproved_list(statement_group)
-            destination = absolute(literal(raw[position + int(change_drive)], effective, inline_names), cwd)
+            selected_directory = literal(raw[position + int(change_drive)], effective, inline_names)
+            if not windows and selected_directory.startswith(('-', '+')):
+                fail('shell cd options and directory-stack selection are not literal source paths')
+            destination = directory(selected_directory, cwd, directories,
+                                    None if windows else effective.get('CDPATH') or effective.get('cdpath'))
             if windows and not change_drive and paths.splitdrive(destination)[0].lower() != paths.splitdrive(cwd)[0].lower():
                 fail('CMD cd across drives requires an explicit /d selector')
             cwd = destination; continue
@@ -12084,9 +12269,9 @@ try:
             if argv[0] == '-C':
                 if len(argv) < 2:
                     fail('missing go -C directory')
-                selected_cwd = absolute(argv[1], selected_cwd); argv = argv[2:]
+                selected_cwd = directory(argv[1], selected_cwd, selected_directories); argv = argv[2:]
             else:
-                selected_cwd = absolute(argv[0][3:], selected_cwd); argv = argv[1:]
+                selected_cwd = directory(argv[0][3:], selected_cwd, selected_directories); argv = argv[1:]
         if argv and argv[0] == 'env' and any(arg in ('-w', '-u') for arg in argv[1:]):
             fail('persistent go env mutation inside a build recipe')
         if not argv or argv[0] not in ('build', 'install'):
@@ -12101,6 +12286,8 @@ try:
         if any('@' in package for package in packages):
             fail('version-query packages are outside the selected source tree')
         operations.append(dict(program=program, cwd=selected_cwd, environment=effective,
+            directories=selected_directories, packages=packages,
+            workfile_overridden=effective_workfile_overridden,
             unset=sorted(removed), clear_environment=clear, kind=kind,
             output=None if not output else absolute(output, selected_cwd),
             arguments=['list', '-find', '-json'] + list_flags + packages,
@@ -15485,6 +15672,14 @@ act_run_native_build() {
                   error:"Go output selection is ambiguous; use a literal foreground build or install command"}'
             return 4
         fi
+        if $strict_native_build && ! _act_validate_strict_go_command_sources \
+                "$tool_name" "$release_git_sha" "$artifact_source_root" "$go_output_plan" "$build_env"; then
+            jq -nc --arg platform "$platform" --arg host "$host" \
+                '{platform:$platform,method:"native",host:$host,status:"error",exit_code:4,
+                  stage:"go_source_selection",artifact_path:"",artifact_paths:[],
+                  error:"Direct Go source selectors must stay relative to the pinned source graph"}'
+            return 4
+        fi
     fi
 
     if ! _act_is_windows_host "$host"; then
@@ -15565,6 +15760,9 @@ act_run_native_build() {
             while IFS= read -r go_env_name; do
                 cargo_env_to_unset+=("$go_env_name")
             done < <(_act_go_ambient_env_names)
+            # zsh ties this array to CDPATH; clear either inherited spelling
+            # before the managed empty CDPATH is exported below.
+            cargo_env_to_unset+=(cdpath)
         else
             # Ordinary builds still bind only the requested target pair.
             cargo_env_to_unset=(GOOS GOARCH)
@@ -19405,7 +19603,7 @@ act_orchestrate_build() {
                 fi
                 if $strict_release_contract && [[ "$resume_method" == native && -n "$resume_receipt" ]] &&
                    ! _act_validate_strict_native_result "$tool_name" "$resume_receipt" \
-                       "$resume_go_sha" "$resume_go_ref" "$resume_platform"; then
+                       "$resume_go_sha" "$resume_go_ref" "$resume_platform" "$version"; then
                     _act_release_orchestration_lock
                     return 4
                 fi
@@ -19432,7 +19630,7 @@ act_orchestrate_build() {
                     fi
                     if $strict_release_contract && [[ "$resume_method" == native ]] &&
                        ! _act_validate_strict_native_result "$tool_name" "$resume_receipt" \
-                           "$resume_go_sha" "$resume_go_ref" "$resume_platform"; then
+                           "$resume_go_sha" "$resume_go_ref" "$resume_platform" "$version"; then
                         _act_release_orchestration_lock
                         return 4
                     fi
@@ -19957,7 +20155,7 @@ act_orchestrate_build() {
                 break
             fi
             if $strict_release_contract && [[ "$(jq -r .method <<< "$task_json")" == native && -n "$persisted_result" ]] &&
-               ! _act_validate_strict_native_result "$tool_name" "$persisted_result" "$git_sha" "$git_ref" "$target"; then
+               ! _act_validate_strict_native_result "$tool_name" "$persisted_result" "$git_sha" "$git_ref" "$target" "$version"; then
                 _act_refuse_retained_target "Resume native result lost its compiler policy binding: $target" "$prior_attempts"
                 break
             fi
@@ -19995,7 +20193,7 @@ act_orchestrate_build() {
                     break
                 fi
                 if $strict_release_contract && [[ "$(jq -r .method <<< "$task_json")" == native ]] &&
-                   ! _act_validate_strict_native_result "$tool_name" "$recovered_result" "$git_sha" "$git_ref" "$target"; then
+                   ! _act_validate_strict_native_result "$tool_name" "$recovered_result" "$git_sha" "$git_ref" "$target" "$version"; then
                     _act_refuse_retained_target "Resume native sidecar lost its compiler policy binding: $target" "$prior_attempts"
                     break
                 fi
@@ -20802,7 +21000,8 @@ _act_validate_native_manifest_inventory() {
             _act_validate_strict_native_result "$tool" "$row" \
                 "$(jq -r '.source.git_sha // ""' <<< "$manifest")" \
                 "$(jq -r '.source.git_ref // ""' <<< "$manifest")" \
-                "$(jq -r '.platform' <<< "$row")" || return 4
+                "$(jq -r '.platform' <<< "$row")" \
+                "$(jq -er '.version | strings | select(length > 0)' <<< "$manifest")" || return 4
         fi
     done <<< "$native_rows"
     artifacts=$(jq -c '.artifacts' <<< "$manifest") || return 4
@@ -21970,7 +22169,7 @@ export -f _act_rust_sdk_influence_regex _act_unix_rust_sdk_env_cleanup
 export -f _act_rust_native_build_env _act_rust_native_selectors_json
 export -f _act_validate_strict_rust_result _act_validate_strict_native_result
 export -f _act_strict_go_workfile_json _act_strict_go_build_env _act_validate_strict_go_result
-export -f _act_validate_strict_go_source_flags
+export -f _act_validate_strict_go_source_flags _act_validate_strict_go_command_sources
 export -f act_run_native_build act_orchestrate_build act_generate_manifest
 export -f _act_result_artifact_receipts _act_target_result_available
 export -f _act_backend_result_json

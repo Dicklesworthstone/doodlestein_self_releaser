@@ -1779,7 +1779,7 @@ its pinned archive and manifest before the build command runs. Missing or
 changed sibling inputs refuse compilation, and the final source check still
 requires the original snapshots to be unchanged before publication.
 
-Strict native Go results retain `DSR_GO_ENV_POLICY=3` in `build_influence_env`,
+Strict native Go results retain `DSR_GO_ENV_POLICY=4` in `build_influence_env`,
 together with the effective reviewed Go selectors and release source identity.
 Workers clear inherited compiler, architecture, cgo and workspace selectors,
 including the complete `PKG_CONFIG` / `PKG_CONFIG_*` family on Unix and Windows.
@@ -1816,6 +1816,26 @@ containment checks. All committed module manifests are checked, including
 currently inactive replacements, because a reviewed build command can select
 any of those modules. Versioned module replacements remain supported.
 
+Direct `go build` and `go install` commands must also select their local source
+from that graph. DSR checks the original `cd`, `env -C`, `go -C`, local package
+and `.go` file operands before compilation, including when `-o` names an explicit
+output file. Each source operand must be relative and traverse committed
+paths; absolute source paths, escapes, missing or untracked inputs and linked
+directories are refused. Relative pinned siblings, nested submodules, `./...`
+package patterns and safe final tracked file links remain supported. Absolute
+output destinations remain supported independently. Directory traversal is
+checked before normalization, so `linked/..` cannot hide an external input.
+
+Strict Go workers clear inherited `CDPATH` and zsh's `cdpath` alias, bind empty
+`CDPATH` in the policy receipt, and reject nonempty configured search paths.
+Direct shell directory changes also retain their effective search path at each
+step, so a later `unset` cannot conceal a previous redirected `cd`. Bare `-` or
+`+` directory-stack/option forms are refused; use `./-` or `./+1` for literal
+committed directory names. Direct operations must preserve managed `GOENV=off`
+and the selected staged `GOWORK`; removing those settings or selecting a
+non-off workfile inside the command is refused. Configure intentional workfile
+selection in the recipe's `env`, where its Git identity can be checked.
+
 Native strict builds refuse nonempty Go `-overlay` and `-modfile` selections.
 An overlay can replace otherwise pinned source files, and an alternate module
 file can replace the admitted dependency graph without changing the recorded
@@ -1833,8 +1853,10 @@ remain data. It does not execute or sandbox arbitrary recipe scripts.
 The same source-path admission runs again when constructing each worker's
 compiler policy and when validating retained output for resume or publication.
 It does not need a Go compiler on the coordinator and does not fetch dependency
-modules. This checks pinned module/workspace metadata; it does not sandbox
-arbitrary reviewed build commands or authenticate downloaded module-cache bytes.
+modules. Direct-command validation uses the same expanded version, binary and
+target tokens as the worker. It checks pinned module/workspace metadata and
+supported direct local-source selectors; it does not interpret opaque reviewed
+build scripts or authenticate downloaded module-cache bytes.
 
 Strict Go resume validates both embedded results and immutable result sidecars
 against the current recipe and pinned workfile identity before changing the
@@ -1842,8 +1864,10 @@ checkpoint or dispatching workers. Publication requires exactly one matching
 native receipt for each configured native contract target; removing, duplicating
 or relabelling rows cannot bypass this requirement. Older strict Go outputs
 without current policy evidence, including policy-1 outputs that did not isolate
-the pkg-config selector family and policy-2 outputs that did not isolate C compiler
-search selectors, require a fresh release build before resume or publication. Changing an old receipt's marker is not a substitute for rebuilding.
+the pkg-config selector family, policy-2 outputs that did not isolate C compiler
+search selectors, and policy-3 outputs without direct-source admission, require a
+fresh release build before resume or publication. Changing an old receipt's
+marker is not a substitute for rebuilding.
 This policy does not attest the installed Go executable or all downloaded
 dependency-cache bytes.
 

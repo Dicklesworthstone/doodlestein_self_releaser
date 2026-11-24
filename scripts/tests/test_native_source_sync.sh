@@ -35,6 +35,9 @@
 # simultaneous pinned amd64/386 Go builds with private verified stages.
 # Use --strict-go-context-only for actual Go policy and retained-output admission.
 # Use --strict-go-paths-only for pinned local Go dependency boundaries.
+# Use --strict-go-inputs-only for direct Go source selection, genuine retained
+# output resume and publication; --strict-go-inputs-external-only isolates the
+# actual external-file counterexample for a paired incoming-module comparison.
 # Use --strict-go-flags-only for alternate-module/overlay source admission,
 # actual Go flag parsing, and retained native-policy refusal.
 # Use --strict-cgo-selectors-only for genuine C header selection and compiler
@@ -1438,7 +1441,7 @@ GO
     check_cgo_selector 'native child receives the reviewed include path' test "$(cat "$work/child-reviewed")" = "$work/reviewed"
     check_cgo_selector 'manifest records current policy and only reviewed C compiler selectors' jq -e --arg path "$work/reviewed" --arg sha "$sha" '
         .publishable==true and .source.git_sha==$sha and (.build_environments[0].build_influence_env |
-        .DSR_GO_ENV_POLICY=="3" and .C_INCLUDE_PATH==$path and
+        .DSR_GO_ENV_POLICY=="4" and .C_INCLUDE_PATH==$path and
         (has("CPATH")|not) and (has("COMPILER_PATH")|not) and (has("GCC_EXEC_PREFIX")|not) and
         (has("LIBRARY_PATH")|not) and (has("CPLUS_INCLUDE_PATH")|not) and (has("OBJC_INCLUDE_PATH")|not))
         ' "$work/output/cgoselector-v1.0.0-manifest.json"
@@ -1457,6 +1460,353 @@ GO
         "$(jq -c '.release_contract' "$config")" > "$work/changed-selector.out" 2> "$work/changed-selector.log" || status=$?
     check_cgo_selector 'changing reviewed C header selection invalidates retained output' test "$status" -ne 0
     printf 'Strict cgo selectors: %s checks, %s failures; evidence %s\n' "$checks" "$failures" "$work"
+    [[ "$failures" -eq 0 ]]
+)
+
+test_strict_go_command_inputs() (
+    local mode="${1:-all}" dependency item work config sha status checks=0 failures=0
+    local environment policy plan label build_command expected index=0 shell_kind stage sibling_sha
+    local run state_file sidecar before_state before_events retained manifest first_digest kind
+    for dependency in bash git jq yq python3 go tar; do
+        command -v "$dependency" >/dev/null || { printf 'SKIP: strict Go inputs require %s\n' "$dependency"; return 77; }
+    done
+    [[ $(uname -s)/$(uname -m) == Linux/x86_64 && $(go version) == 'go version go'* ]] || return 77
+    work=$(mktemp -d "${DSR_TEST_DISK_ROOT:-${TMPDIR:-/tmp}}/dsr-go-inputs.XXXXXXXX") || return 1
+    printf 'Strict Go command-input evidence: %s\n' "$work"
+    mkdir -p "$work/config/repos.d" "$work/source/app" "$work/source/links" "$work/source/reader" \
+        "$work/source/-" "$work/source/--" "$work/source/+1" "$work/sibling" "$work/submodule" \
+        "$work/outside/app" "$work/outside/provider" "$work/stages" \
+        "$work/absolute/amd64" "$work/absolute/386" || return 1
+    export DSR_CONFIG_DIR="$work/config" ACT_CONFIG_DIR="$work/config" ACT_REPOS_DIR="$work/config/repos.d"
+    export DSR_STATE_DIR="$work/state" DSR_CACHE_DIR="$work/cache"
+    export DSR_HOSTS_FILE="$work/config/hosts.yaml" DSR_REPOS_FILE="$work/config/repos.yaml"
+    export DSR_DISABLE_HOST_SELECTOR=1 RCH_DISABLED=1 RCH_CARGO_WRAPPER_BYPASS=1 NO_COLOR=1 GOMAXPROCS=1
+    printf 'module example.local/goinputs\n\ngo 1.19\n' > "$work/source/go.mod"
+    printf 'go 1.19\nuse .\n' > "$work/source/go.work"
+    cat > "$work/source/main.go" <<'GO'
+package main
+var version, revision, reference string
+func main() { println("PINNED|" + version + "|" + revision + "|" + reference) }
+GO
+    command cp "$work/source/main.go" "$work/source/app/main.go" || return 1
+    for item in - -- +1; do
+        command cp "$work/source/main.go" "$work/source/$item/main.go" || return 1
+    done
+    ln -s ../main.go "$work/source/links/entry.go" || return 1
+    ln -s app "$work/source/app-link" || return 1
+    printf 'package main\nimport "example.local/provider"\nfunc main() { println(provider.Message) }\n' \
+        > "$work/source/reader/main.go"
+    printf 'module example.local/provider\n\ngo 1.19\n' > "$work/outside/provider/go.mod"
+    printf 'package provider\nconst Message = "EXTERNAL-WORKSPACE"\n' > "$work/outside/provider/provider.go"
+    printf 'go 1.19\nuse ./provider\n' > "$work/outside/go.work"
+    printf 'module example.local/outside\n\ngo 1.19\n' > "$work/outside/app/go.mod"
+    printf 'package main\nfunc main() { println("EXTERNAL-CDPATH") }\n' > "$work/outside/app/main.go"
+    for item in sibling submodule; do
+        printf 'module example.local/%s\n\ngo 1.19\n' "$item" > "$work/$item/go.mod"
+        printf 'package main\nfunc main() { println("PINNED-%s") }\n' "$item" > "$work/$item/main.go"
+        git -C "$work/$item" init -q -b main || return 1
+        git -C "$work/$item" add . || return 1
+        git -C "$work/$item" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm pinned-dependency || return 1
+    done
+    git -C "$work/source" init -q -b main || return 1
+    git -c protocol.file.allow=always -C "$work/source" submodule add -q "$work/submodule" nested || return 1
+    git -C "$work/source" add . || return 1
+    git -C "$work/source" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm pinned-inputs || return 1
+    git -C "$work/source" tag v1.0.0 || return 1
+    sha=$(git -C "$work/source" rev-parse HEAD) || return 1
+    sibling_sha=$(git -C "$work/sibling" rev-parse HEAD) || return 1
+    jq -n --arg work "$work" '{schema_version:"1.0.0",hosts:{
+        localnative:{platform:"linux/amd64",connection:"local",concurrency:1,build_root:($work+"/stages")},
+        windowsmodel:{platform:"windows/amd64",connection:"ssh",build_root:"C:/builds"}},
+        platform_mapping:{"linux/amd64":"localnative","linux/386":"localnative"}}' > "$DSR_HOSTS_FILE" || return 1
+    config="$ACT_REPOS_DIR/goinputs.yaml"
+    build_command='printf "%s\n" "$DSR_TARGET_ARCH" >> "$PROBE_EVENTS"; go build -p=1 -buildvcs=false -o "$PROBE_OUTPUT/amd64/goinputs" "$PROBE_EXTERNAL"'
+    jq -n --arg work "$work" --arg path "$PATH" --arg command "$build_command" --arg pin "$sibling_sha" \
+        --arg cache "${DSR_TEST_GOCACHE:-$work/go-cache}" '{
+        tool_name:"goinputs",repo:"example/goinputs",local_path:($work+"/source"),language:"go",
+        binary_name:"goinputs",targets:["linux/amd64"],act_job_map:{"linux/amd64":null},
+        hosts:{"linux/amd64":"localnative"},sibling_crates:[{local_path:($work+"/sibling"),relative_path:"sibling",revision:$pin}],
+        build_cmd:$command,env:{PATH:$path,PROBE_EVENTS:($work+"/compiler-events"),
+          PROBE_OUTPUT:($work+"/absolute"),PROBE_EXTERNAL:($work+"/outside/main.go"),
+          PROBE_ALLOW:($work+"/allow-386"),PROBE_WORKFILE:($work+"/outside/go.work"),
+          GOCACHE:$cache,GOMAXPROCS:"1",CGO_ENABLED:"0",GOWORK:"off",GOPROXY:"off",GOSUMDB:"off",GOTELEMETRY:"off"},
+        release_contract:{checksum_sidecar:"sha256",exact_primary_assets:{"linux/amd64":"goinputs-linux-amd64"}}}
+        ' > "$work/external-recipe.json" || return 1
+    command cp "$work/external-recipe.json" "$config" || return 1
+    for item in logging config build_state act_runner artifact_naming host_selector host_health git_ops packaging; do
+        if [[ "$item" == act_runner ]]; then
+            # shellcheck disable=SC1090 # Paired baseline uses its exact incoming module.
+            source "${DSR_TEST_ACT_RUNNER:-$ROOT/src/act_runner.sh}" || return 1
+        else
+            # shellcheck disable=SC1090 # Actual public command dependencies.
+            source "$ROOT/src/$item.sh" || return 1
+        fi
+    done
+    check_go_input() {
+        local label="$1"; shift
+        checks=$((checks + 1))
+        if "$@"; then printf 'PASS: Go command inputs: %s\n' "$label"
+        else failures=$((failures + 1)); printf 'FAIL: Go command inputs: %s\n' "$label" >&2; fi
+    }
+    run_input_compiler() (
+        local selected_workfile="$1"; shift
+        unset CDPATH cdpath
+        cd "$work/source" || exit 1
+        GOENV=off GOWORK="$selected_workfile" GOTOOLCHAIN=local GO111MODULE=on GOFLAGS= \
+            GOOS=linux GOARCH=amd64 GOAMD64=v1 GOPROXY=off GOSUMDB=off GOTELEMETRY=off \
+            CGO_ENABLED=0 GOMAXPROCS=1 GOCACHE="${DSR_TEST_GOCACHE:-$work/go-cache}" go "$@"
+    )
+    printf 'BOUNDARY: real Git, Go, cmd_build, checkpoints and publication; only fixture host health/capacity is controlled. Windows cases below interpret paths, not native NTFS execution.\n'
+    for item in ONE TWO; do
+        printf 'package main\nfunc main() { println("EXTERNAL-%s") }\n' "$item" > "$work/outside/main.go"
+        status=0
+        run_input_compiler off build -p=1 -buildvcs=false -o "$work/compiler-$item" "$work/outside/main.go" \
+            > "$work/compiler-$item.out" 2> "$work/compiler-$item.log" || status=$?
+        check_go_input "real Go accepts external source revision $item" test "$status" -eq 0
+        [[ "$status" -eq 0 ]] || { cat "$work/compiler-$item.log" >&2; return 1; }
+        check_go_input "external revision $item determines actual executable bytes" \
+            test "$("$work/compiler-$item" 2>&1)" = "EXTERNAL-$item"
+    done
+    check_go_input 'external mutation changes executable hash without changing pinned source' \
+        test "$(_act_sha256 "$work/compiler-ONE")" != "$(_act_sha256 "$work/compiler-TWO")"
+    check_go_input 'compiler counterexamples preserve the pinned checkout' git -C "$work/source" diff --quiet HEAD --
+    status=0
+    run_input_compiler "$work/outside/go.work" build -p=1 -buildvcs=false -o "$work/compiler-workspace" reader/main.go \
+        > "$work/compiler-workspace.out" 2> "$work/compiler-workspace.log" || status=$?
+    check_go_input 'real file-mode Go can resolve imports through an external workspace' test "$status" -eq 0
+    [[ "$status" -eq 0 ]] || { cat "$work/compiler-workspace.log" >&2; return 1; }
+    check_go_input 'external workspace supplies the compiled imported bytes' \
+        test "$("$work/compiler-workspace" 2>&1)" = EXTERNAL-WORKSPACE
+
+    host_health_is_ready() { return 0; }
+    selector_acquire_slot() { return 0; }
+    selector_release_slot() { return 0; }
+    build_state_init || return 1
+    export SCRIPT_DIR="$ROOT" JSON_MODE=true DRY_RUN=false VERBOSE=false DSR_VERSION=fixture DSR_KEEP_BUILD_STAGES=1
+    declare -A _DSR_LOADED_MODULES=([packaging]=1 [artifact_naming]=1)
+    # shellcheck disable=SC1090 # Production build and release admission, no external publication.
+    source <(awk '/^(_dsr_require|cmd_build|_release_sha256|_release_require_publishable_artifacts)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$ROOT/dsr") || return 1
+    # shellcheck disable=SC1090
+    source <(awk '/^json_envelope\(\) \{/{copy=1} copy{print} copy && /^# ====/{exit}' "$ROOT/dsr") || return 1
+    status=0
+    cmd_build goinputs --version 1.0.0 --output-dir "$work/refused" \
+        > "$work/refused.json" 2> "$work/refused.log" || status=$?
+    check_go_input 'public strict build refuses the absolute external Go file' test "$status" -ne 0
+    build_state_get goinputs 1.0.0 > "$work/refused-state.json" || { cat "$work/refused.log" >&2; return 1; }
+    check_go_input 'public refusal identifies the direct-source boundary' jq -e '
+        .target_statuses["linux/amd64"] |
+        .status=="failed" and .result.stage=="go_source_selection"' "$work/refused-state.json"
+    check_go_input 'public source refusal precedes the configured compiler command' test ! -e "$work/compiler-events"
+    if [[ "$status" -eq 0 ]]; then
+        # This branch makes the baseline failure meaningful: it must have
+        # compiled and admitted real external bytes, not merely missed a helper.
+        check_go_input 'baseline counterexample actually executes external code' \
+            test "$("$work/refused/goinputs-linux-amd64" 2>&1)" = EXTERNAL-TWO
+        check_go_input 'baseline counterexample reaches actual publication admission' \
+            _release_require_publishable_artifacts "$work/refused" "$work/refused/goinputs-v1.0.0-manifest.json" true
+        first_digest=$(_act_sha256 "$work/refused/goinputs-linux-amd64") || return 1
+        printf 'package main\nfunc main() { println("EXTERNAL-THREE") }\n' > "$work/outside/main.go"
+        status=0
+        cmd_build goinputs --version 1.0.0 --output-dir "$work/baseline-changed" \
+            > "$work/baseline-changed.json" 2> "$work/baseline-changed.log" || status=$?
+        check_go_input 'baseline same recipe and source pin admits mutated external input' test "$status" -eq 0
+        [[ "$status" -eq 0 ]] || { cat "$work/baseline-changed.log" >&2; return 1; }
+        check_go_input 'baseline repeated release actually changes executable bytes' \
+            test "$first_digest" != "$(_act_sha256 "$work/baseline-changed/goinputs-linux-amd64")"
+        check_go_input 'baseline repeated release retains the identical source identity' \
+            jq -e --arg sha "$sha" '.source.git_sha==$sha and .publishable==true' \
+                "$work/baseline-changed/goinputs-v1.0.0-manifest.json"
+    fi
+    if [[ "$mode" == external ]]; then
+        printf 'Strict Go external inputs: %s checks, %s failures; evidence %s\n' "$checks" "$failures" "$work"
+        [[ "$failures" -eq 0 ]]
+        return $?
+    fi
+
+    environment=$(act_get_build_env goinputs linux/amd64) || return 1
+    policy=$(_act_strict_go_build_env goinputs "$sha" v1.0.0 '/private/attempt/source' "$environment" 'go build .') || return 1
+    while IFS= read -r item; do
+        label=$(jq -r '.label' <<< "$item") || return 1
+        build_command=$(jq -r '.command' <<< "$item") || return 1
+        expected=$(jq -r '.status' <<< "$item") || return 1
+        shell_kind=$(jq -r '.shell // "unix"' <<< "$item") || return 1
+        stage=/private/attempt/source
+        [[ "$shell_kind" == windows ]] && stage=C:/private/attempt/source
+        index=$((index + 1)); status=0
+        if plan=$(_act_go_output_plan "$stage" "$policy" "$build_command" "$shell_kind" 2> "$work/plan-$index.log"); then
+            printf '%s\n' "$plan" > "$work/plan-$index.json"
+            _act_validate_strict_go_command_sources goinputs "$sha" "$stage" "$plan" "$policy" \
+                > "$work/input-$index.out" 2> "$work/input-$index.log" || status=$?
+        else
+            status=$?
+        fi
+        check_go_input "$label direct-source admission" test "$status" -eq "$expected"
+    done <<'CASES'
+{"label":"relative main package with absolute output","command":"go build -o /independent/output .","status":0}
+{"label":"relative pinned file","command":"go build -o /independent/output main.go","status":0}
+{"label":"relative Go cwd","command":"go -C app build -o /independent/output .","status":0}
+{"label":"relative env cwd","command":"env -C app go build -o /independent/output .","status":0}
+{"label":"relative shell cwd","command":"cd app; go build -o /independent/output .","status":0}
+{"label":"pinned sibling cwd","command":"go -C ../sibling build -o /independent/output .","status":0}
+{"label":"pinned submodule cwd","command":"go -C nested build -o /independent/output .","status":0}
+{"label":"pinned final file link","command":"go build -o /independent/output links/entry.go","status":0}
+{"label":"literal dash directory","command":"cd ./-; go build -o /independent/output .","status":0}
+{"label":"literal plus directory","command":"cd ./+1; go build -o /independent/output .","status":0}
+{"label":"managed selectors restated off","command":"env GOENV=off GOWORK=off go build main.go","status":0}
+{"label":"pinned local install","command":"go install ./app","status":0}
+{"label":"external file install","command":"go install /outside/main.go","status":4}
+{"label":"external absolute file","command":"go build -o out /outside/main.go","status":4}
+{"label":"external absolute Go cwd","command":"go -C /outside build -o out .","status":4}
+{"label":"external absolute env cwd","command":"env -C /outside go build -o out .","status":4}
+{"label":"external absolute shell cwd","command":"cd /outside; go build -o out .","status":4}
+{"label":"unadmitted sibling file","command":"go build ../unadmitted/main.go","status":4}
+{"label":"escaped namespace file","command":"go build ../../main.go","status":4}
+{"label":"missing ancestor before normalization","command":"go -C missing/../app build .","status":4}
+{"label":"linked directory before normalization","command":"go -C app-link/.. build main.go","status":4}
+{"label":"Git metadata file","command":"go build .git/main.go","status":4}
+{"label":"previous shell directory","command":"cd -; go build .","status":4}
+{"label":"shell cd option","command":"cd --; go build .","status":4}
+{"label":"zsh directory stack","command":"cd +1; go build .","status":4}
+{"label":"inline CDPATH hidden by unset","command":"export CDPATH=/outside; cd app; unset CDPATH; go build .","status":4}
+{"label":"inline cdpath hidden by unset","command":"export cdpath=/outside; cd app; unset cdpath; go build .","status":4}
+{"label":"inline external workspace","command":"GOWORK=/outside/go.work go build main.go","status":4}
+{"label":"exported external workspace","command":"export GOWORK=/outside/go.work; go build main.go; unset GOWORK","status":4}
+{"label":"workspace unset before build","command":"export GOWORK=/outside/go.work; unset GOWORK; go build main.go","status":4}
+{"label":"inline persistent Go settings","command":"GOENV=/outside/go.env go build main.go","status":4}
+{"label":"unset persistent Go policy","command":"env -u GOENV go build main.go","status":4}
+{"label":"unset workspace policy","command":"env -u GOWORK go build main.go","status":4}
+{"label":"cleared compiler environment","command":"env -i go build main.go","status":4}
+{"label":"earlier external operation","command":"go build -o first /outside/main.go; go build -o second main.go","status":4}
+{"label":"Windows relative pinned sibling","command":"go -C ..\\SIBLING build -o D:\\independent\\output.exe .","shell":"windows","status":0}
+{"label":"Windows rooted matching file","command":"go build /private/attempt/source/main.go","shell":"windows","status":4}
+{"label":"Windows rooted matching package","command":"go build /private/attempt/source/app","shell":"windows","status":4}
+{"label":"Windows rooted matching cwd","command":"go -C \\private\\attempt\\source build .","shell":"windows","status":4}
+{"label":"Windows drive-relative source","command":"go build C:main.go","shell":"windows","status":4}
+CASES
+
+    # A genuine partial release leaves a successful retained target. The other
+    # target fails a literal foreground gate before its Go command; repairing
+    # that external gate keeps the pinned source and recipe unchanged.
+    build_command='printf "%s\n" "$DSR_TARGET_ARCH" >> "$PROBE_EVENTS"; cd app; go build -p=1 -buildvcs=false -ldflags "-X main.version=${version} -X main.revision=$DSR_RELEASE_GIT_SHA -X main.reference=$DSR_RELEASE_GIT_REF" -o "$PROBE_OUTPUT/${arch}/goinputs" .'
+    jq --arg command "$build_command" '
+        .build_cmd=$command | .targets=["linux/amd64","linux/386"] |
+        .act_job_map["linux/386"]=null | .hosts["linux/386"]="localnative" |
+        .cross_compile["linux/386"].build_cmd=("test -e \"$PROBE_ALLOW\"; "+$command) |
+        .release_contract.exact_primary_assets["linux/386"]="goinputs-linux-386"
+        ' "$work/external-recipe.json" > "$work/pinned-recipe.json" || return 1
+    command cp "$work/pinned-recipe.json" "$config" || return 1
+    export CDPATH="$work/outside"
+    status=0
+    cmd_build goinputs --version 1.0.0 --output-dir "$work/pinned" \
+        > "$work/pinned.json" 2> "$work/pinned.log" || status=$?
+    check_go_input 'real matrix records the failed 386 gate' test "$status" -ne 0
+    build_state_get goinputs 1.0.0 > "$work/pinned-state.json" || { cat "$work/pinned.log" >&2; return 1; }
+    check_go_input 'literal source policy retains the successfully compiled amd64 target' jq -e '
+        .target_statuses["linux/amd64"].status=="completed" and
+        .target_statuses["linux/386"].status=="failed" and
+        (.target_statuses["linux/amd64"].result.build_influence_env |
+         .DSR_GO_ENV_POLICY=="4" and .CDPATH=="" and .GOENV=="off" and .GOWORK=="off")
+        ' "$work/pinned-state.json"
+    retained=$(jq -ce '.target_statuses["linux/amd64"].result | select(.status=="success")' \
+        "$work/pinned-state.json") || { cat "$work/pinned.log" >&2; return 1; }
+    check_go_input 'managed version SHA and ref reach genuine Go despite inherited CDPATH' \
+        test "$("$(jq -er '.artifact_path' <<< "$retained")" 2>&1)" \
+        = "PINNED|1.0.0|$sha|$(jq -er '.git_ref' "$work/pinned-state.json")"
+    run=$(jq -er '.run_id' "$work/pinned-state.json") || return 1
+    state_file="$DSR_STATE_DIR/builds/goinputs/1.0.0/$run/state.json"
+    sidecar=$(jq -er '.target_statuses["linux/amd64"].result_path' "$state_file") || return 1
+    command cp "$state_file" "$work/original-state.json" || return 1
+    command cp "$sidecar" "$work/original-sidecar.json" || return 1
+    for kind in embedded sidecar; do
+        command cp "$work/original-state.json" "$state_file" || return 1
+        command cp "$work/original-sidecar.json" "$sidecar" || return 1
+        if [[ "$kind" == embedded ]]; then
+            jq '.target_statuses["linux/amd64"].result.build_influence_env.DSR_GO_ENV_POLICY="3"' \
+                "$work/original-state.json" > "$state_file" || return 1
+        else
+            jq '.build_influence_env.DSR_GO_ENV_POLICY="3"' "$work/original-sidecar.json" > "$sidecar" || return 1
+        fi
+        before_state=$(_act_sha256 "$state_file") || return 1
+        before_events=$(_act_sha256 "$work/compiler-events") || return 1
+        status=0
+        cmd_build goinputs --version 1.0.0 --resume="$run" --output-dir "$work/pinned" \
+            > "$work/old-$kind.json" 2> "$work/old-$kind.log" || status=$?
+        check_go_input "public resume refuses policy3 $kind output" test "$status" -ne 0
+        check_go_input "$kind refusal reaches compiler-policy admission" \
+            grep -q 'DSR_GO_ENV_POLICY=4' "$work/old-$kind.log"
+        check_go_input "$kind refusal preserves the checkpoint" test "$before_state" = "$(_act_sha256 "$state_file")"
+        check_go_input "$kind refusal dispatches no command" test "$before_events" = "$(_act_sha256 "$work/compiler-events")"
+    done
+    command cp "$work/original-state.json" "$state_file" || return 1
+    command cp "$work/original-sidecar.json" "$sidecar" || return 1
+
+    # Recompute command admission against actual retained compiler output.
+    # These shared-consumer checks intentionally bypass recipe-hash refusal,
+    # so a passing negative needs the source guard itself.
+    for build_command in \
+        'go build -o out "$PROBE_EXTERNAL"' \
+        'go -C /outside build -o out .' \
+        'go build ../unadmitted/main.go' \
+        'GOWORK="$PROBE_WORKFILE" go build reader/main.go' \
+        'env -u GOENV go build main.go' \
+        'export cdpath=/outside; cd app; unset cdpath; go build .'; do
+        index=$((index + 1))
+        jq --arg command "$build_command" '.build_cmd=$command' "$work/pinned-recipe.json" > "$config" || return 1
+        status=0
+        _act_validate_strict_go_result goinputs "$retained" "$sha" \
+            "$(jq -er '.git_ref' "$work/pinned-state.json")" linux/amd64 1.0.0 \
+            > "$work/readmit-$index.out" 2> "$work/readmit-$index.log" || status=$?
+        check_go_input "retained direct-source selector $index is refused" test "$status" -eq 4
+        check_go_input "retained selector $index reaches pinned input validation" \
+            grep -q 'Strict Go source paths and workfile policy' "$work/readmit-$index.log"
+    done
+
+    # A self-declared private prefix cannot make an explicit external workfile
+    # appear authorized. The positive uses inherited recipe-selected GOWORK;
+    # only the negative writes that same non-off value in the command itself.
+    jq '.env.GOWORK="go.work" | .build_cmd="go build main.go"' "$work/pinned-recipe.json" > "$config" || return 1
+    environment=$(act_get_build_env goinputs linux/amd64) || return 1
+    policy=$(_act_strict_go_build_env goinputs "$sha" \
+        "$(jq -er '.git_ref' "$work/pinned-state.json")" "$work/relabelled/source" "$environment" 'go build main.go') || return 1
+    item=$(jq -c --argjson environment "$(_act_go_build_influence_json "$policy")" \
+        '.build_influence_env=$environment' <<< "$retained") || return 1
+    check_go_input 'inherited pinned workspace passes receipt command admission' \
+        _act_validate_strict_go_result goinputs "$item" "$sha" \
+            "$(jq -er '.git_ref' "$work/pinned-state.json")" linux/amd64 1.0.0
+    jq --arg workfile "$work/relabelled/source/go.work" \
+        '.build_cmd=("GOWORK=\""+$workfile+"\" go build main.go")' "$config" > "$work/relabelled-recipe.json" || return 1
+    command cp "$work/relabelled-recipe.json" "$config" || return 1
+    status=0
+    _act_validate_strict_go_result goinputs "$item" "$sha" \
+        "$(jq -er '.git_ref' "$work/pinned-state.json")" linux/amd64 1.0.0 \
+        > "$work/relabelled.out" 2> "$work/relabelled.log" || status=$?
+    check_go_input 'receipt prefix relabelling cannot authorize explicit external GOWORK' test "$status" -eq 4
+    check_go_input 'relabelling reaches original command-workfile provenance' \
+        grep -q 'non-off GOWORK must be selected in the reviewed recipe' "$work/relabelled.log"
+
+    command cp "$work/pinned-recipe.json" "$config" || return 1
+    : > "$work/allow-386"
+    status=0
+    cmd_build goinputs --version 1.0.0 --resume="$run" --output-dir "$work/pinned" \
+        > "$work/resumed.json" 2> "$work/resumed.log" || status=$?
+    check_go_input 'public resume completes after repairing only the failed target gate' test "$status" -eq 0
+    [[ "$status" -eq 0 ]] || { cat "$work/resumed.log" >&2; return 1; }
+    check_go_input 'resume reuses amd64 without recompiling it' test "$(grep -cx amd64 "$work/compiler-events")" -eq 1
+    check_go_input 'resume compiles the repaired 386 target once' test "$(grep -cx 386 "$work/compiler-events")" -eq 1
+    check_go_input 'real checkpoint preserves one amd64 and two 386 attempts' jq -e '
+        .status=="completed" and .target_statuses["linux/amd64"].attempts==1 and
+        .target_statuses["linux/386"].attempts==2' "$state_file"
+    manifest="$work/pinned/goinputs-v1.0.0-manifest.json"
+    check_go_input 'both literal-source outputs pass actual publication admission' \
+        _release_require_publishable_artifacts "$work/pinned" "$manifest" true
+    jq '.build_environments[0].build_influence_env.DSR_GO_ENV_POLICY="3"' \
+        "$manifest" > "$work/old-manifest.json" || return 1
+    status=0
+    _act_validate_contract_variant_inventory goinputs "$(cat "$work/old-manifest.json")" \
+        "$(jq -c '.release_contract' "$config")" > "$work/old-manifest.out" 2> "$work/old-manifest.log" || status=$?
+    check_go_input 'release inventory refuses policy3 retained output' test "$status" -eq 4
+    check_go_input 'release refusal requires current compiler policy' grep -q 'DSR_GO_ENV_POLICY=4' "$work/old-manifest.log"
+    printf 'Strict Go command inputs: %s checks, %s failures; evidence %s\n' "$checks" "$failures" "$work"
     [[ "$failures" -eq 0 ]]
 )
 
@@ -1609,9 +1959,9 @@ CASES
                 "$work/recipe.json" > "$config" || return 1
             result=$(_act_go_build_influence_json "$policy") || return 1
         fi
-        result=$(jq -nc --argjson environment "$result" '{method:"native",status:"success",platform:"linux/amd64",build_influence_env:$environment}') || return 1
+        result=$(jq -nc --argjson environment "$result" '{method:"native",status:"success",platform:"linux/amd64",host:"localnative",build_influence_env:$environment}') || return 1
         status=0
-        _act_validate_strict_go_result sourceflags "$result" "$sha" v1.0.0 linux/amd64 \
+        _act_validate_strict_go_result sourceflags "$result" "$sha" v1.0.0 linux/amd64 1.0.0 \
             > "$work/retained-$variant.out" 2> "$work/retained-$variant.log" || status=$?
         check_go_flag "retained $variant selector is refused by the resume/publication consumer" test "$status" -eq 4
         check_go_flag "retained $variant reaches source-selector validation" \
@@ -1619,9 +1969,9 @@ CASES
     done
     command cp "$work/recipe.json" "$config" || return 1
     result=$(jq -nc --argjson environment "$(_act_go_build_influence_json "$policy")" \
-        '{method:"native",status:"success",platform:"linux/amd64",build_influence_env:$environment}') || return 1
+        '{method:"native",status:"success",platform:"linux/amd64",host:"localnative",build_influence_env:$environment}') || return 1
     check_go_flag 'unchanged safe retained output still passes the shared consumer' \
-        _act_validate_strict_go_result sourceflags "$result" "$sha" v1.0.0 linux/amd64
+        _act_validate_strict_go_result sourceflags "$result" "$sha" v1.0.0 linux/amd64 1.0.0
 
     host_health_is_ready() { return 0; }
     selector_acquire_slot() { return 0; }
@@ -1889,12 +2239,12 @@ test_strict_go_context() (
     if [[ "$status" -ne 0 ]]; then cat "$runtime/no-workfile.log" >&2; return 1; fi
     check_go_policy 'real binary retains pinned bytes despite ambient linker flags' \
         test "$("$runtime/no-workfile/context-linux-amd64" 2>&1)" = pinned-default
-    check_go_policy 'unrelated recipe environment keeps its existing shell expansion' \
-        test "$(cat "$runtime/recipe-expansion")" = recipe-env-expanded
+    check_go_policy 'unrelated recipe environment retains its reviewed literal value' \
+        test "$(cat "$runtime/recipe-expansion")" = '$DSR_GO_RECIPE_MARKER'
     check_go_policy 'manifest records the actual no-workfile compiler policy' jq -e --arg sha "$sha" '
         .publishable==true and .source.git_sha==$sha and
         (.build_environments[0].build_influence_env |
-         .DSR_GO_ENV_POLICY=="3" and .GOENV=="off" and .GOFLAGS=="" and .GOWORK=="off" and
+         .DSR_GO_ENV_POLICY=="4" and .GOENV=="off" and .GOFLAGS=="" and .GOWORK=="off" and
          .GOTOOLCHAIN=="local" and .GO111MODULE=="on" and .GOOS=="linux" and .GOARCH=="amd64" and
          .DSR_GO_WORKFILE=="" and .DSR_GO_WORKFILE_SHA256=="" and (has("GOAMD64")|not))
         ' "$runtime/no-workfile/context-v1.0.0-manifest.json"
@@ -1915,7 +2265,7 @@ test_strict_go_context() (
         "$(jq -c '.release_contract' "$config")" > "$runtime/policy-one.out" 2> "$runtime/policy-one.log" || status=$?
     check_go_policy 'release consumer refuses policy one without pkg-config isolation evidence' test "$status" -ne 0
     check_go_policy 'obsolete policy refusal requires a fresh build, not receipt migration' \
-        grep -q 'DSR_GO_ENV_POLICY=3.*start a fresh release build' "$runtime/policy-one.log"
+        grep -q 'DSR_GO_ENV_POLICY=4.*start a fresh release build' "$runtime/policy-one.log"
     for kind in empty relabelled duplicated; do
         case "$kind" in
             empty) jq '.build_environments=[]' "$runtime/no-workfile/context-v1.0.0-manifest.json" ;;
@@ -1980,7 +2330,8 @@ test_strict_go_context() (
     jq '.targets=["linux/amd64","linux/386"] |
         .act_job_map["linux/386"]=null | .hosts["linux/386"]="localnative" |
         .release_contract.exact_primary_assets["linux/386"]="context-linux-386" |
-        .build_cmd="printf \"%s\\n\" \"$DSR_TARGET_ARCH\" >> \"$PROBE_EVENTS\"; if [ \"$DSR_TARGET_ARCH\" = 386 ]; then exit 7; fi; go build -p=1 -buildvcs=false -o context ."
+        .build_cmd="printf \"%s\\n\" \"$DSR_TARGET_ARCH\" >> \"$PROBE_EVENTS\"; go build -p=1 -buildvcs=false -o context ." |
+        .cross_compile["linux/386"].build_cmd="printf \"%s\\n\" \"$DSR_TARGET_ARCH\" >> \"$PROBE_EVENTS\"; false; go build -p=1 -buildvcs=false -o context ."
         ' "$config" > "$runtime/mixed-config.json" || return 1
     command cp "$runtime/mixed-config.json" "$config" || return 1
     status=0
@@ -1991,7 +2342,7 @@ test_strict_go_context() (
     check_go_policy 'mixed checkpoint retains a real successful Go target' jq -e '
         .target_statuses["linux/amd64"].status=="completed" and
         .target_statuses["linux/386"].status=="failed" and
-        .target_statuses["linux/amd64"].result.build_influence_env.DSR_GO_ENV_POLICY=="3"
+        .target_statuses["linux/amd64"].result.build_influence_env.DSR_GO_ENV_POLICY=="4"
         ' "$runtime/mixed-state.json"
     run=$(jq -er '.run_id' "$runtime/mixed-state.json") || return 1
     state_file="$DSR_STATE_DIR/builds/context/1.0.1/$run/state.json"
@@ -2085,11 +2436,17 @@ GO
     git -C "$work/source" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm pinned-cgo || return 1
     git -C "$work/source" tag v1.0.2 || return 1
     sha=$(git -C "$work/source" rev-parse HEAD) || return 1
-    jq --arg directory "$pkg_reviewed" --arg program "$pkg_program" --arg cc "$pkg_cc" --arg runtime "$runtime" '
+    local cgo_build_command
+    cgo_build_command=$(cat <<'GO_COMMAND'
+printf "%s\n" "$PKG_CONFIG_LIBDIR" "$PKG_CONFIG_DSR_REVIEWED" > "$PROBE_PKG_REVIEWED"; python3 -c 'import os; [print(os.environ[key]) for key in ("PKG_CONFIG_PATH", "PKG_CONFIG_SYSROOT_DIR", "PKG_CONFIG_DSR_UNREVIEWED", "pkg_config_path") if key in os.environ]' > "$PROBE_PKG_AMBIENT"; go build -p=1 -buildvcs=false -o context .
+GO_COMMAND
+    ) || return 1
+    jq --arg directory "$pkg_reviewed" --arg program "$pkg_program" --arg cc "$pkg_cc" --arg runtime "$runtime" \
+        --arg command "$cgo_build_command" '
         .env.GOFLAGS="" | .env.CGO_ENABLED="1" | .env.CC=$cc | .env.PKG_CONFIG=$program |
         .env.PKG_CONFIG_LIBDIR=$directory | .env.PKG_CONFIG_DSR_REVIEWED="$DSR_GO_RECIPE_MARKER" |
         .env.PROBE_PKG_REVIEWED=($runtime+"/pkg-reviewed") | .env.PROBE_PKG_AMBIENT=($runtime+"/pkg-ambient") |
-        .build_cmd="printf \"%s\\n\" \"$PKG_CONFIG_LIBDIR\" \"$PKG_CONFIG_DSR_REVIEWED\" > \"$PROBE_PKG_REVIEWED\"; printenv PKG_CONFIG_PATH PKG_CONFIG_SYSROOT_DIR PKG_CONFIG_DSR_UNREVIEWED pkg_config_path > \"$PROBE_PKG_AMBIENT\" || true; go build -p=1 -buildvcs=false -o context ."
+        .build_cmd=$command
         ' "$runtime/workspace-config.json" > "$runtime/cgo-config.json" || return 1
     command cp "$runtime/cgo-config.json" "$config" || return 1
     export PKG_CONFIG_PATH="$pkg_ambient" PKG_CONFIG_SYSROOT_DIR="$work/ambient-sysroot"
@@ -2109,7 +2466,7 @@ GO
         --arg directory "$pkg_reviewed" --arg program "$pkg_program" --arg sha "$sha" '
         .publishable==true and .source.git_sha==$sha and
         (.build_environments[0].build_influence_env |
-         .DSR_GO_ENV_POLICY=="3" and .CGO_ENABLED=="1" and .PKG_CONFIG==$program and
+         .DSR_GO_ENV_POLICY=="4" and .CGO_ENABLED=="1" and .PKG_CONFIG==$program and
          .PKG_CONFIG_LIBDIR==$directory and .PKG_CONFIG_DSR_REVIEWED=="$DSR_GO_RECIPE_MARKER" and
          (has("PKG_CONFIG_PATH")|not) and (has("PKG_CONFIG_SYSROOT_DIR")|not) and
          (has("PKG_CONFIG_DSR_UNREVIEWED")|not) and (has("pkg_config_path")|not))
@@ -3613,7 +3970,7 @@ def run_layout(layout):
               observed[0]['GO111MODULE']=='on' and
               observed[0]['GOWORK']==('off' if layout=='replace' else observed[0]['cwd']+'/go.work') and
               all(observed[0][name] is None for name in ('GOAMD64','GOEXPERIMENT','GOROOT','GOCACHEPROG')) and
-              policy.get('DSR_GO_ENV_POLICY')=='3' and policy.get('GOENV')==observed[0]['GOENV'] and
+              policy.get('DSR_GO_ENV_POLICY')=='4' and policy.get('GOENV')==observed[0]['GOENV'] and
               policy.get('GOFLAGS')==observed[0]['GOFLAGS'] and policy.get('GO111MODULE')==observed[0]['GO111MODULE'] and
               policy.get('GOOS')==observed[0]['GOOS'] and policy.get('GOARCH')==observed[0]['GOARCH'] and
               policy.get('DSR_GO_WORKFILE')==('' if layout=='replace' else 'source/go.work'))
@@ -4922,6 +5279,14 @@ if [[ "${1:-}" == --strict-rust-selector-cache-only ]]; then
 fi
 if [[ "${1:-}" == --strict-cgo-selectors-only ]]; then
     test_strict_cgo_selectors
+    exit $?
+fi
+if [[ "${1:-}" == --strict-go-inputs-only ]]; then
+    test_strict_go_command_inputs
+    exit $?
+fi
+if [[ "${1:-}" == --strict-go-inputs-external-only ]]; then
+    test_strict_go_command_inputs external
     exit $?
 fi
 if [[ "${1:-}" == --strict-go-flags-only ]]; then

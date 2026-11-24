@@ -331,6 +331,16 @@ An existing executable in `GOBIN` cannot substitute for `go build -o tool .`.
 Workspace recipes must identify one unambiguous producer for every requested
 executable; compiling library packages alone does not establish an output.
 
+For strict releases, direct Go commands must use relative local source paths
+inside the pinned main, sibling or submodule graph. This includes `.go` files,
+local packages and directory changes through `cd`, `env -C` or `go -C`.
+Absolute source paths, untracked inputs and linked directories are refused;
+absolute output destinations remain supported. DSR disables inherited `CDPATH`
+and checks each directory change before normalization. Workfile selection belongs
+in the recipe's `env`; direct commands must preserve the managed `GOENV` and
+`GOWORK` policy. Resume and publication repeat these checks. Earlier strict Go
+receipts require a fresh build under `DSR_GO_ENV_POLICY=4`.
+
 Use literal foreground commands for direct Go recipes. Conditional output
 selection, unmodelled shell state changes and ambiguous variable expansion are
 refused before dispatch. A final `mkdir -p dist && go build -o dist/tool .`
