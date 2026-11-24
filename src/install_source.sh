@@ -1672,7 +1672,7 @@ PY
 # while the resulting receipt still identifies the fetched repository commit.
 _isb_cargo_source_context() (
     local root="$1" tree="$2" output="$3" limit="$4" package="$5" windows="$6" names="$7"
-    local metadata="$output/cargo-metadata.json" context="$output/cargo-sources.json"
+    local metadata="$output/cargo-metadata.json" cargo_sources="$output/cargo-sources.json"
     local manifest="$tree/Cargo.toml" workspace path status=0
     if $windows; then
         command -v cygpath >/dev/null 2>&1 || return 3
@@ -1722,7 +1722,7 @@ _isb_cargo_source_context() (
             (.manifest_path | source_path) and (.src_path | source_path))) |
         .providers as $providers |
         select(all($names[]; . as $name | any($providers[]; .name == $name)))
-    ' "$metadata" > "$context"; then
+    ' "$metadata" > "$cargo_sources"; then
         _isb_log 'Cargo did not identify the selected source executable providers'
         return 6
     fi
@@ -1739,14 +1739,14 @@ _isb_cargo_source_context() (
         directory=$(_isb_go_directory "$root" "$root" "$directory") || return 1
         _isb_source_committed_file "$root" "$directory/${relative##*/}" >/dev/null
     }
-    workspace=$(jq -r '.workspace_root' "$context") || return 6
+    workspace=$(jq -r '.workspace_root' "$cargo_sources") || return 6
     if ! _isb_cargo_source_file "$manifest" ||
        ! _isb_cargo_source_file "$workspace/Cargo.toml" ||
        ! _isb_cargo_source_file "$workspace/Cargo.lock"; then
         _isb_log 'Rust source builds require a committed manifest and workspace Cargo.lock inside the pinned checkout'
         return 4
     fi
-    jq -r '[.providers[] | .manifest_path, .src_path] | unique[]' "$context" \
+    jq -r '[.providers[] | .manifest_path, .src_path] | unique[]' "$cargo_sources" \
         > "$output/cargo-source-paths" || return 6
     while IFS= read -r path; do
         if ! _isb_cargo_source_file "$path"; then

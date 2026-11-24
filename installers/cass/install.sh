@@ -2758,6 +2758,97 @@ finally:
 PY
 )
 
+# Admit local Cargo executable providers before any build script runs. Metadata
+# supplies Cargo's workspace/default-member selection; the fetched Git graph
+# supplies authority for the workspace lock, package manifests and entry files.
+# A --bin name alone can otherwise compile an absolute external source path
+# while the resulting receipt still identifies the fetched repository commit.
+_isb_cargo_source_context() (
+    local root="$1" tree="$2" output="$3" limit="$4" package="$5" windows="$6" names="$7"
+    local metadata="$output/cargo-metadata.json" cargo_sources="$output/cargo-sources.json"
+    local manifest="$tree/Cargo.toml" workspace path status=0
+    if $windows; then
+        command -v cygpath >/dev/null 2>&1 || return 3
+        manifest=$(cygpath -am "$manifest") || return 6
+    fi
+    _isb_cargo_metadata() {
+        # Cargo warnings belong in the retained log, not in the JSON document.
+        # --no-deps describes declared targets without resolving features.
+        # In particular, a bare feature selected by build --package may not
+        # belong to the current root package. Leave feature selection to the
+        # unchanged build command and bind its actual artifact afterwards.
+        cargo metadata --format-version=1 --no-deps --locked \
+            --manifest-path "$manifest" > "$metadata"
+    }
+    _isb_run "$limit" "$output/cargo-metadata.log" _isb_cargo_metadata || {
+        status=$?; [[ "$status" == 5 ]] && return 5; return 6;
+    }
+    if ! jq -e --arg manifest "$manifest" --arg package "$package" \
+        --argjson windows "$windows" --argjson names "$names" '
+        def native_path:
+            if $windows then gsub("\\\\"; "/") | ascii_downcase else . end;
+        def source_path:
+            type == "string" and length > 0 and (test("[[:cntrl:]]") | not);
+        select(type == "object" and .version == 1 and
+            (.workspace_root | source_path) and
+            (.workspace_members | type == "array" and length > 0) and
+            (.packages | type == "array" and length > 0)) |
+        . as $workspace |
+        [.packages[] | select(.id as $id | $workspace.workspace_members | index($id) != null)] as $members |
+        (if $package != "" then $members | map(select(.name == $package))
+         elif ($names | length) > 1 then $members
+         elif ($manifest | native_path) == (($workspace.workspace_root + "/Cargo.toml") | native_path) and
+             ($workspace.workspace_default_members | type) == "array" then
+             $members | map(select(.id as $id | $workspace.workspace_default_members | index($id) != null))
+         else [$members[] | select((.manifest_path | native_path) == ($manifest | native_path))] as $current |
+             if ($current | length) == 1 then $current
+             elif ($workspace.workspace_default_members | type) == "array" then
+                 $members | map(select(.id as $id | $workspace.workspace_default_members | index($id) != null))
+             else $members end
+         end) as $packages |
+        select($package == "" or ($packages | length) == 1) |
+        {workspace_root:$workspace.workspace_root,
+         providers:[$names[] as $name | $packages[] as $package | $package.targets[] |
+             select(.name == $name and (.kind | type == "array" and index("bin") != null)) |
+             {name:$name,package_id:$package.id,manifest_path:$package.manifest_path,src_path:.src_path}]} |
+        select(all(.providers[]; (.package_id | type == "string" and length > 0) and
+            (.manifest_path | source_path) and (.src_path | source_path))) |
+        .providers as $providers |
+        select(all($names[]; . as $name | any($providers[]; .name == $name)))
+    ' "$metadata" > "$cargo_sources"; then
+        _isb_log 'Cargo did not identify the selected source executable providers'
+        return 6
+    fi
+    _isb_cargo_source_file() {
+        local file="$1" relative directory
+        if $windows; then file=$(cygpath -au -- "$file") || return 1; fi
+        [[ "$file" == "$root/"* ]] || return 1
+        relative="${file#"$root"/}"
+        directory=.
+        [[ "$relative" != */* ]] || directory="${relative%/*}"
+        # Reuse the checkout-bounded directory walker. It resolves harmless
+        # dot components without following links or crossing the fetched root;
+        # filenames themselves may contain spaces or other valid Git bytes.
+        directory=$(_isb_go_directory "$root" "$root" "$directory") || return 1
+        _isb_source_committed_file "$root" "$directory/${relative##*/}" >/dev/null
+    }
+    workspace=$(jq -r '.workspace_root' "$cargo_sources") || return 6
+    if ! _isb_cargo_source_file "$manifest" ||
+       ! _isb_cargo_source_file "$workspace/Cargo.toml" ||
+       ! _isb_cargo_source_file "$workspace/Cargo.lock"; then
+        _isb_log 'Rust source builds require a committed manifest and workspace Cargo.lock inside the pinned checkout'
+        return 4
+    fi
+    jq -r '[.providers[] | .manifest_path, .src_path] | unique[]' "$cargo_sources" \
+        > "$output/cargo-source-paths" || return 6
+    while IFS= read -r path; do
+        if ! _isb_cargo_source_file "$path"; then
+            _isb_log "Cargo executable provider is outside the committed source graph: $path"
+            return 6
+        fi
+    done < "$output/cargo-source-paths"
+)
+
 # Build only the requested executable family, into a new private output directory.
 # Never run arbitrary command strings from installer configuration.
 _isb_compile() (
@@ -2849,6 +2940,7 @@ _isb_compile() (
             fi
             local -a args=(build --locked --release "--message-format=$message_format"
                 --target "$host" --target-dir "$output/target")
+            local -a cargo_names=()
             for feature in ${features[@]+"${features[@]}"}; do args+=(--features "$feature"); done
             $no_default_features && args+=(--no-default-features)
             if [[ -n "$package" ]]; then
@@ -2863,8 +2955,16 @@ _isb_compile() (
                 cargo_name="$name"
                 $windows_paths && cargo_name="${cargo_name%.exe}"
                 args+=(--bin "$cargo_name")
+                cargo_names+=("$cargo_name")
                 targets+=("$output/target/$host/release/$name")
             done
+            local source_context=/dev/null requested_names
+            if ! $rch_delivery && [[ -n "${_ISB_CHECKOUT_ROOT:-}" ]]; then
+                requested_names=$(printf '%s\n' "${cargo_names[@]}" | jq -Rsc 'split("\n")[:-1]') || return 1
+                _isb_cargo_source_context "$_ISB_CHECKOUT_ROOT" "$tree" "$output" "$limit" \
+                    "$package" "$windows_paths" "$requested_names" || return $?
+                source_context="$output/cargo-sources.json"
+            fi
             _isb_run "$limit" "$output/build.log" cargo "${args[@]}" || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
             if $rch_delivery; then
                 delivered_paths=$(_isb_rch_cargo_outputs "$tree" "$output" "$host" "$limit" "${binaries[@]}") || return $?
@@ -2888,7 +2988,7 @@ _isb_compile() (
                 # may provide each requested output, using Cargo's resolved
                 # package/default-feature/required-feature selection.
                 if ! jq -eRs --arg name "$cargo_name" --arg path "$artifact_path" \
-                    --argjson windows "$windows_paths" '
+                    --argjson windows "$windows_paths" --slurpfile sources "$source_context" '
                     def native_path:
                         if $windows then gsub("\\\\"; "/") | ascii_downcase else . end;
                     [split("\n")[] | fromjson? |
@@ -2896,7 +2996,11 @@ _isb_compile() (
                             (.target.kind | type == "array" and index("bin") != null))] |
                     length == 1 and (.[0].executable | type == "string") and
                     (.[0].executable | native_path) == ($path | native_path) and
-                    (.[0].package_id | type == "string" and length > 0)
+                    (.[0].package_id | type == "string" and length > 0) and
+                    (.[0] as $built | ($sources | length) == 0 or
+                        any($sources[0].providers[]; .name == $name and .package_id == $built.package_id and
+                            (.manifest_path | native_path) == ($built.manifest_path | native_path) and
+                            (.src_path | native_path) == ($built.target.src_path | native_path)))
                 ' "$output/build.log" >/dev/null; then
                     _isb_log "Cargo did not identify exactly one executable provider for: $name"
                     return 6

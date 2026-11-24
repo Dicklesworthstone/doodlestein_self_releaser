@@ -40,6 +40,11 @@ test_cargo_source_providers() (
         else bad=$((bad + 1)); printf 'FAIL: %s\n' "$label" >&2; fi
     }
     provider_equal() { [[ "$1" == "$2" ]]; }
+    provider_binary_output() {
+        local -a provider_matches=("$fixtures/$1/output/target/"*/release/"$2")
+        ((${#provider_matches[@]} == 1)) || return 1
+        "${provider_matches[0]}" 2>/dev/null
+    }
     provider_root_manifest() {
         cat > "$upstream/Cargo.toml" <<TOML
 [package]
@@ -130,9 +135,9 @@ RUST
     provider_build complete app --bin helper --bin app
     provider_check 'committed complete Rust family still builds' provider_equal "$status" 0
     provider_check 'a committed entry may include generated OUT_DIR code' provider_equal \
-        "$("$fixtures/complete/output/target/"*/release/app 2>/dev/null)" pinned-app
+        "$(provider_binary_output complete app)" pinned-app
     provider_check 'the companion executes its own committed source entry' provider_equal \
-        "$("$fixtures/complete/output/target/"*/release/helper 2>/dev/null)" pinned-helper
+        "$(provider_binary_output complete helper)" pinned-helper
     provider_check 'complete source receipt preserves requested member order' \
         jq -e '[.binaries[].name] == ["helper","app"] and .signed_release == false' "$fixtures/complete.json"
 
@@ -144,14 +149,14 @@ RUST
     provider_build member-directory helper --subdir helper
     provider_check 'a member directory is selected independently of workspace root defaults' provider_equal "$status" 0
     provider_check 'member source selection executes the pinned companion' provider_equal \
-        "$("$fixtures/member-directory/output/target/"*/release/helper 2>/dev/null)" pinned-helper
+        "$(provider_binary_output member-directory helper)" pinned-helper
 
     provider_root_manifest helper
     provider_commit 'Root package delegates default builds to workspace member' || return 1
     provider_build default-member helper
     provider_check 'root-package workspaces honor explicit default-members' provider_equal "$status" 0
     provider_check 'workspace default-member selection executes its actual binary' provider_equal \
-        "$("$fixtures/default-member/output/target/"*/release/helper 2>/dev/null)" pinned-helper
+        "$(provider_binary_output default-member helper)" pinned-helper
     provider_root_manifest .
     provider_commit 'Restore root default member' || return 1
 
@@ -169,7 +174,7 @@ RUST
     provider_build normalized app --bin helper --bin app
     provider_check 'confined normalized Cargo entry paths retain support for spaces' provider_equal "$status" 0
     provider_check 'normalized companion still executes committed bytes' provider_equal \
-        "$("$fixtures/normalized/output/target/"*/release/helper 2>/dev/null)" pinned-helper
+        "$(provider_binary_output normalized helper)" pinned-helper
 
     provider_helper_manifest "$fixtures/outside.rs"
     provider_commit 'External absolute executable provider' || return 1
@@ -178,7 +183,7 @@ RUST
     provider_build unselected app
     provider_check 'an unrelated unselected workspace provider does not block the root package' provider_equal "$status" 0
     provider_check 'unselected external source never replaces the requested root binary' provider_equal \
-        "$("$fixtures/unselected/output/target/"*/release/app 2>/dev/null)" pinned-app
+        "$(provider_binary_output unselected app)" pinned-app
 
     provider_helper_manifest src/main.rs
     mv "$upstream/helper/src/main.rs" "$upstream/helper/src/retained-main.rs" || return 1
