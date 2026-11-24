@@ -122,6 +122,55 @@ mutate() {
 
 [[ "${DSR_PREPARE_FIXTURES_ONLY:-false}" != true ]] || return 0
 
+# Sourceable consumers may receive their authentication and transport adapters
+# from the caller. A pure cancellation policy must not load another transport
+# over them or require github.sh in an otherwise complete narrow installation.
+test_sourceable_transport() {
+    local module lock_mode installed
+    for module in release_prepare release_finalize_core; do
+        for lock_mode in inherited fresh; do
+            new_case
+            installed="$CASE/installed"
+            mkdir "$installed" || return 1
+            case "$module" in
+                release_prepare)
+                    cp "${PREPARE_TEST_MODULE:-$ROOT/src/release_prepare.sh}" "$installed/$module.sh" || return 1 ;;
+                release_finalize_core)
+                    cp "${FINALIZE_CORE_TEST_MODULE:-$ROOT/src/release_finalize_core.sh}" "$installed/$module.sh" || return 1 ;;
+            esac
+            cp "$ROOT/src/guardrails.sh" "$installed/guardrails.sh" || return 1
+            RC=0
+            OUT=$(
+                unset -f _gh_operation_interrupted
+                [[ "$lock_mode" != fresh ]] || unset -f dsr_lock_fd
+                gh_api() { printf '{"selected_transport":"caller"}\n'; }
+                sbom_publish_artifacts() { return 97; }
+                sbom_verify_release() { return 98; }
+                # shellcheck source=/dev/null
+                source "$installed/$module.sh" || exit $?
+                case "$module" in
+                    release_prepare) _rp_require || exit $? ;;
+                    release_finalize_core) _rf_require || exit $? ;;
+                esac
+                gh_api repos/acme/tool || exit $?
+                _rp_source "$(jq -nc --arg sha "$SHA" \
+                    '{repo:"acme/tool",request:{tag_name:"v1.2.3",target_commitish:$sha}}')" || exit $?
+                for stopped in 2 5 124 125 129 130 137 139 141 143 255; do
+                    _gh_operation_interrupted "$stopped" || exit 1
+                done
+                for ordinary in 0 1 3 4 6 7 8 22 128; do
+                    if _gh_operation_interrupted "$ordinary"; then exit 1; fi
+                done
+            ) 2> "$CASE/diagnostics" || RC=$?
+            check assert_rc 0
+            check json 'length==2 and .[0].selected_transport=="caller" and
+                .[1].repository.full_name=="acme/tool" and .[1].tag_commit=="1111111111111111111111111111111111111111"'
+            check posts 0
+            check test ! -e "$CASE/state"
+        done
+    done
+}
+
 test_terminal_creation() {
     local status original_request selected="${1:-all}"
     case "$selected" in all|2|5|124|125|130|143) ;; *) return 4 ;; esac
@@ -187,6 +236,11 @@ test_terminal_preparation_reads() {
 }
 
 case "${1:-}" in
+    --sourceable-only)
+        test_sourceable_transport || exit $?
+        printf '%s checks: %s passed, %s failed. Fixtures retained at %s\n' "$TOTAL" "$PASSED" "$FAILED" "$TMP"
+        ((FAILED==0))
+        exit $? ;;
     --terminal-creation-only|--terminal-reads-only|--terminal-creation=*|--terminal-reads=*)
         case "$1" in
             --terminal-creation-only) test_terminal_creation ;;
@@ -198,6 +252,8 @@ case "${1:-}" in
         ((FAILED==0))
         exit $? ;;
 esac
+
+test_sourceable_transport || exit $?
 
 test_large_notes() {
     new_case

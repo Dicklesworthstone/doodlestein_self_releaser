@@ -3,7 +3,7 @@
 # Never create/move tags, publish, edit, delete, or upload release assets.
 
 _RELEASE_PREPARE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
-if ! declare -F dsr_lock_fd >/dev/null; then
+if ! declare -F dsr_lock_fd >/dev/null || ! declare -F _gh_operation_interrupted >/dev/null; then
     # shellcheck source=src/guardrails.sh
     source "$_RELEASE_PREPARE_DIR/guardrails.sh" || { return 3 2>/dev/null || exit 3; }
 fi
@@ -18,10 +18,6 @@ _rp_require() {
     command -v gh >/dev/null || { _rp_log 'gh is required'; return 3; }
     dsr_lock_available || return $?
     _sbr_require || return $?
-    if ! declare -F _gh_operation_interrupted >/dev/null; then
-        # shellcheck source=src/github.sh
-        source "$_RELEASE_PREPARE_DIR/github.sh" || return 3
-    fi
 }
 
 _rp_hash() (

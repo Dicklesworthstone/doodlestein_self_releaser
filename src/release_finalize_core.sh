@@ -4,7 +4,7 @@
 # A verified SBOM inventory is byte-integrity evidence, not a signed build claim.
 
 _RELEASE_FINALIZE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
-if ! declare -F dsr_lock_fd >/dev/null; then
+if ! declare -F dsr_lock_fd >/dev/null || ! declare -F _gh_operation_interrupted >/dev/null; then
     # shellcheck source=src/guardrails.sh
     source "$_RELEASE_FINALIZE_DIR/guardrails.sh" || { return 3 2>/dev/null || exit 3; }
 fi
@@ -303,10 +303,6 @@ _rf_require() {
         source "$_RELEASE_FINALIZE_DIR/sbom_release.sh" || return 3
     fi
     _sbr_require || return $?
-    if ! declare -F _gh_operation_interrupted >/dev/null; then
-        # shellcheck source=src/github.sh
-        source "$_RELEASE_FINALIZE_DIR/github.sh" || return 3
-    fi
 }
 
 _rf_payload_require() {

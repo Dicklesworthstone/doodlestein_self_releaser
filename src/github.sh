@@ -25,7 +25,7 @@ fi
 
 # Resolve source-relative dependencies before exported functions enter child
 # shells, where BASH_SOURCE is "environment" and the working directory varies.
-if ! declare -F run_with_timeout >/dev/null; then
+if ! declare -F run_with_timeout >/dev/null || ! declare -F _gh_operation_interrupted >/dev/null; then
     # shellcheck source=src/guardrails.sh
     source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/guardrails.sh" || { return 3 2>/dev/null || exit 3; }
 fi
@@ -1650,17 +1650,6 @@ gh_release_asset_inventory() (
     [[ "$status" -eq 0 ]] || return "$status"
     printf '%s\n' "$inventory"
 )
-
-# Cancellation and supervision failures are terminal for an in-flight
-# publication. A new invocation must decide whether the remote write committed;
-# the stopped invocation must not reconcile it into success or keep writing.
-# Call this only on adapter statuses, not raw curl errors (curl 5 is DNS).
-_gh_operation_interrupted() {
-    local status="${1:-0}"
-    [[ "$status" =~ ^[0-9]+$ ]] || return 1
-    ((status == 2 || status == 5 || status == 124 || status == 125 ||
-      (status >= 129 && status <= 255)))
-}
 
 # Search the complete, uncached release inventory, not the truncated embedded
 # .assets array. Return 0 + one asset, 1 for absence, 7 for ambiguity, 8 for an

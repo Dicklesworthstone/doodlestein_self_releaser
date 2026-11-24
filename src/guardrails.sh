@@ -770,6 +770,19 @@ confirm() {
 # Exports
 # ============================================================================
 
+# Cancellation and supervision failures are terminal for an in-flight
+# publication. A new invocation must decide whether the remote write committed;
+# the stopped invocation must not reconcile it into success or keep writing.
+# This pure status policy lives with supervision, so sourceable release
+# consumers do not need to load or replace their selected transport adapter.
+# Call this only on adapter statuses, not raw curl errors (curl 5 is DNS).
+_gh_operation_interrupted() {
+    local status="${1:-0}"
+    [[ "$status" =~ ^[0-9]+$ ]] || return 1
+    ((status == 2 || status == 5 || status == 124 || status == 125 ||
+      (status >= 129 && status <= 255)))
+}
+
 # Direct native and pinned-xwin backends do not establish RCH admission.
 # Keep their policy parsing and refusal identical until the real backend exists.
 dsr_native_rch_policy() {
@@ -820,6 +833,7 @@ export -f is_color_disabled color
 export -f is_non_interactive confirm
 export -f dsr_native_rch_policy dsr_native_rch_environment_policy
 export -f dsr_lock_available dsr_lock_fd
+export -f _gh_operation_interrupted
 export -f run_with_timeout _dsr_timeout_cmd _dsr_run_with_timeout
 export -f _dsr_timeout_group _dsr_timeout_watchdog
 
