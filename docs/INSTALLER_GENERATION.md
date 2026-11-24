@@ -327,7 +327,7 @@ workspace_binaries_by_target:
   windows/arm64: [tool]
 ```
 
-ZIP, tar.gz and raw executable assets are supported. A raw asset supplies exactly one
+ZIP, tar.gz, tar.xz and raw executable assets are supported. A raw asset supplies exactly one
 executable; its strict release basename can differ from the installed `.exe`
 name. Archives must contain exactly one regular member for every selected executable.
 Per-target workspace lists replace the global family, and an empty list selects
@@ -346,7 +346,21 @@ to 4 GiB, every regular member to 2 GiB, extended metadata to 1 MiB per record,
 and the physical archive to 10,000 headers. It also checks the gzip trailer's
 CRC and length against the actual decompressed bytes. Only selected executables
 are written to private staging; the complete archive is admitted before any
-installed file is replaced. `tar.xz` remains unsupported by this native installer.
+installed file is replaced.
+
+XZ-compressed TAR releases require an installed `xz` application on `PATH`.
+The installer does not download a decoder. It supplies the verified private
+payload on standard input and sends decoded bytes through the same bounded TAR
+reader, without letting the decoder choose filesystem destinations. Decoder
+memory is limited to 256 MiB and decoding has a 120-second deadline. Inherited
+`XZ_DEFAULTS` and `XZ_OPT` options are cleared for that child process.
+
+The installer consumes the complete XZ stream and requires a successful decoder
+exit before publishing any executable. Corrupt or truncated compression,
+trailing non-XZ data, a decoder failure, an expanded-size refusal or a decoding
+deadline returns 7 and cannot authorize source fallback. A missing decoder
+returns dependency exit 3. Existing signature, cache, PE-machine and complete
+executable-family transaction checks apply to XZ releases as well.
 
 The focused archive regression uses the real DSR packager, generated installers,
 genuine Go-built x64/ARM64 PE files and Minisign signatures:

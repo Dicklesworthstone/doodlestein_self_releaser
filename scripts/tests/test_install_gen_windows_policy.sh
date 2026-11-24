@@ -131,6 +131,39 @@ check('real publication naming preserves version tokens, architecture aliases an
       platforms.get('windows/arm64', {}).get('target_triple') == 'aarch64-pc-windows-msvc', result)
 
 selected = configuration()
+selected['archive_format'] = {'windows': 'tar.xz'}
+case = fresh('tar-xz-policy', selected)
+result = invoke(case)
+platforms = document(result).get('platforms', {})
+check('tar.xz policy retains real per-target naming and complete executable families',
+      result.returncode == 0 and
+      platforms.get('windows/amd64', {}).get('name') == 'example-v${version}-x64-x86_64-pc-windows-msvc.tar.xz' and
+      platforms.get('windows/arm64', {}).get('name') == 'example-v${version}-a64-aarch64-pc-windows-msvc.tar.xz' and
+      platforms.get('windows/amd64', {}).get('format') == 'tar.xz' and
+      platforms.get('windows/arm64', {}).get('format') == 'tar.xz' and
+      platforms.get('windows/arm64', {}).get('binaries') == ['example.exe', 'worker.exe'], result)
+
+case = fresh('tar-xz-public-plan', selected, existing=False)
+before = snapshot(case / 'config')
+result = invoke(case, 'public')
+check('public tar.xz planning preserves configuration and creates no output or locks',
+      result.returncode == 0 and document(result).get('details', {}).get('dry_run') is True and
+      not (case / 'output').exists() and snapshot(case / 'config') == before, result)
+
+selected['targets'] = ['windows/amd64', 'windows/arm64']
+selected['release_contract'] = {'checksum_sidecar': 'sha256', 'exact_primary_assets': {
+    'windows/amd64': 'literal-x64-family.tar.xz', 'windows/arm64': 'literal-arm64-family.tar.xz'}}
+case = fresh('tar-xz-literal-contract', selected)
+result = invoke(case)
+platforms = document(result).get('platforms', {})
+check('strict tar.xz contracts preserve literal archive names and every selected family member',
+      result.returncode == 0 and
+      platforms.get('windows/amd64', {}).get('name') == 'literal-x64-family.tar.xz' and
+      platforms.get('windows/arm64', {}).get('name') == 'literal-arm64-family.tar.xz' and
+      platforms.get('windows/amd64', {}).get('format') == 'tar.xz' and
+      platforms.get('windows/arm64', {}).get('binaries') == ['example.exe', 'worker.exe'], result)
+
+selected = configuration()
 selected.pop('artifact_naming')
 selected.pop('arch_aliases')
 selected.pop('target_triples')

@@ -23,6 +23,7 @@ $ErrorActionPreference = 'Stop'
 $script:DsrWindowsInstallPolicyBase64 = '__DSR_WINDOWS_INSTALL_POLICY_B64__'
 $script:DsrMaximumPayloadBytes = 2147483648L
 $script:DsrMaximumExpandedBytes = 4294967296L
+$script:DsrXzTimeoutSeconds = 120
 
 function Stop-DsrInstall {
     param([string]$Message, [int]$Code = 4, [switch]$TransientAcquisition, [int]$HttpStatus = 0)
@@ -189,7 +190,7 @@ function Get-DsrInstallPolicy {
         Assert-DsrFields $selection @('name', 'format', 'binaries', 'target_triple')
         if ($selection.name -isnot [string] -or
             -not (Test-DsrWindowsName $selection.name.Replace('${version}', '1.2.3')) -or
-            $selection.format -cnotin @('zip', 'tar.gz', 'none') -or
+            $selection.format -cnotin @('zip', 'tar.gz', 'tar.xz', 'none') -or
             $selection.binaries -isnot [array] -or $selection.binaries.Count -lt 1 -or
             $selection.binaries.Count -gt 64 -or $selection.target_triple -isnot [string] -or
             ($selection.target_triple -and -not (Test-DsrName $selection.target_triple))) {
@@ -956,13 +957,152 @@ public sealed class DsrWindowsTarReadStream : Stream {
     return [DsrWindowsTarReadStream]::new($Stream, $script:DsrMaximumExpandedBytes)
 }
 
-function Expand-DsrTarGzipPayload {
+function New-DsrXzReadStream {
+    param([IO.Stream]$Stream)
+    $command = Get-Command xz -CommandType Application -ErrorAction SilentlyContinue
+    if ($null -eq $command) {
+        Stop-DsrInstall 'A tar.xz release requires an installed xz application; install it before retrying' 3
+    }
+    if (-not ('DsrWindowsXzReadStream' -as [type])) {
+        # XZ is only a decoder here: it receives verified private bytes on stdin
+        # and cannot choose output paths. The ordinary TAR reader still owns
+        # every archive/member limit. Drain and validate decoder completion even
+        # after TAR's terminator; otherwise a late XZ checksum error is lost.
+        Add-Type -TypeDefinition @'
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+public sealed class DsrWindowsXzReadStream : Stream {
+    private readonly Process process = new Process();
+    private readonly CancellationTokenSource deadline = new CancellationTokenSource();
+    private readonly MemoryStream diagnostics = new MemoryStream();
+    private Task input, errors;
+    private bool started, completed, disposed;
+    private long position;
+    public DsrWindowsXzReadStream(string executable, Stream source, int timeoutSeconds) {
+        if (timeoutSeconds < 1 || timeoutSeconds > 120)
+            throw new ArgumentOutOfRangeException(nameof(timeoutSeconds));
+        ProcessStartInfo start = new ProcessStartInfo(executable);
+        start.UseShellExecute = false;
+        start.CreateNoWindow = true;
+        start.RedirectStandardInput = true;
+        start.RedirectStandardOutput = true;
+        start.RedirectStandardError = true;
+        foreach (string argument in new[] {
+            "--decompress", "--stdout", "--format=xz", "--threads=1",
+            "--memlimit-decompress=256MiB"
+        }) start.ArgumentList.Add(argument);
+        // Inherited options such as --single-stream can hide trailing data.
+        // Change only this child environment, including Windows case aliases.
+        foreach (string name in new System.Collections.Generic.List<string>(start.Environment.Keys)) {
+            if (name.Equals("XZ_DEFAULTS", StringComparison.OrdinalIgnoreCase) ||
+                name.Equals("XZ_OPT", StringComparison.OrdinalIgnoreCase))
+                start.Environment.Remove(name);
+        }
+        process.StartInfo = start;
+        try {
+            if (!process.Start()) throw new IOException("Could not start the installed XZ decoder");
+            started = true;
+            deadline.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
+            input = Feed(source);
+            errors = DrainErrors();
+        } catch { Dispose(); throw; }
+    }
+    private async Task Feed(Stream source) {
+        try {
+            await source.CopyToAsync(process.StandardInput.BaseStream, 65536, deadline.Token).ConfigureAwait(false);
+        } finally { process.StandardInput.BaseStream.Dispose(); }
+    }
+    private async Task DrainErrors() {
+        byte[] buffer = new byte[4096];
+        int count;
+        while ((count = await process.StandardError.BaseStream.ReadAsync(
+            buffer, 0, buffer.Length, deadline.Token).ConfigureAwait(false)) != 0) {
+            int keep = (int)Math.Min(count, 8192 - diagnostics.Length);
+            if (keep > 0) diagnostics.Write(buffer, 0, keep);
+        }
+    }
+    public override int Read(byte[] buffer, int offset, int count) {
+        if (disposed) throw new ObjectDisposedException(nameof(DsrWindowsXzReadStream));
+        if (count == 0) return 0;
+        try {
+            int read = process.StandardOutput.BaseStream.ReadAsync(buffer, offset, count, deadline.Token)
+                .WaitAsync(deadline.Token).GetAwaiter().GetResult();
+            position = checked(position + read);
+            if (read == 0) Complete();
+            return read;
+        } catch (OperationCanceledException error) {
+            throw new InvalidDataException("XZ decoding or output draining exceeded its deadline", error);
+        }
+    }
+    public void Complete() {
+        if (completed) return;
+        try {
+            process.WaitForExitAsync(deadline.Token).GetAwaiter().GetResult();
+            errors.WaitAsync(deadline.Token).GetAwaiter().GetResult();
+            if (process.ExitCode != 0)
+                throw new InvalidDataException("XZ decoder rejected the compressed stream (exit " +
+                    process.ExitCode + "): " + Encoding.UTF8.GetString(diagnostics.ToArray()).Trim());
+            input.WaitAsync(deadline.Token).GetAwaiter().GetResult();
+            deadline.Token.ThrowIfCancellationRequested();
+            completed = true;
+        } catch (OperationCanceledException error) {
+            throw new InvalidDataException("XZ decoding or output draining exceeded its deadline", error);
+        }
+    }
+    protected override void Dispose(bool disposing) {
+        if (!disposed && disposing) {
+            disposed = true;
+            deadline.Cancel();
+            if (started) {
+                try {
+                    if (!process.HasExited) { process.Kill(true); process.WaitForExit(1000); }
+                } catch { }
+                // Closing our pipes bounds cleanup even if an exited parent
+                // left an inherited pipe in a descendant. Do not claim custody
+                // of descendants already orphaned by an external decoder.
+                try { process.StandardInput.BaseStream.Dispose(); } catch { }
+                try { process.StandardOutput.BaseStream.Dispose(); } catch { }
+                try { process.StandardError.BaseStream.Dispose(); } catch { }
+            }
+            try {
+                if (input != null && errors != null) Task.WhenAll(input, errors).Wait(1000);
+            } catch { }
+            process.Dispose();
+            deadline.Dispose();
+            diagnostics.Dispose();
+        }
+        base.Dispose(disposing);
+    }
+    public override bool CanRead => !disposed;
+    public override bool CanSeek => false;
+    public override bool CanWrite => false;
+    public override long Length => throw new NotSupportedException();
+    public override long Position { get => position; set => throw new NotSupportedException(); }
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    public override void Flush() { }
+}
+'@
+    }
+    return [DsrWindowsXzReadStream]::new($command.Source, $Stream, $script:DsrXzTimeoutSeconds)
+}
+
+function Expand-DsrTarPayload {
     param([string]$Payload, $Selection, [string]$Destination)
     $stream = Open-DsrReadFile $Payload
-    $gzip = $null; $bounded = $null; $archive = $null
+    $decoded = $null; $bounded = $null; $archive = $null
     try {
-        $gzip = [IO.Compression.GZipStream]::new($stream, [IO.Compression.CompressionMode]::Decompress, $true)
-        $bounded = New-DsrTarReadStream $gzip
+        if ($Selection.format -ceq 'tar.xz') {
+            $decoded = New-DsrXzReadStream $stream
+        } else {
+            $decoded = [IO.Compression.GZipStream]::new($stream, [IO.Compression.CompressionMode]::Decompress, $true)
+        }
+        $bounded = New-DsrTarReadStream $decoded
         $archive = [System.Formats.Tar.TarReader]::new($bounded, $true)
         $nodes = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
         $explicitNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -1021,25 +1161,29 @@ function Expand-DsrTarGzipPayload {
         }
         # TarReader stops at the first zero header. Drain through the same
         # bounded framing reader to reject hidden entries, trailing garbage,
-        # incomplete terminators and gzip corruption before installation.
+        # incomplete terminators and compression corruption before installation.
         $bounded.Complete()
-        # GZipStream may report clean EOF when an entire gzip footer is
-        # missing. Bind the actual final trailer to every decompressed byte
-        # instead of treating the TAR terminator as compression completion.
-        if ($stream.Length -lt 18) { Stop-DsrInstall 'Truncated gzip payload' 7 }
-        $stream.Position = $stream.Length - 8
-        $footer = [IO.BinaryReader]::new($stream, [Text.Encoding]::UTF8, $true)
-        try {
-            if ($footer.ReadUInt32() -ne $bounded.Crc32 -or
-                $footer.ReadUInt32() -ne ($bounded.Position -band 4294967295L)) {
-                Stop-DsrInstall 'Invalid or missing gzip checksum/length trailer' 7
-            }
-        } finally { $footer.Dispose() }
+        if ($Selection.format -ceq 'tar.xz') {
+            $decoded.Complete()
+        } else {
+            # GZipStream may report clean EOF when an entire gzip footer is
+            # missing. Bind the actual final trailer to every decompressed byte
+            # instead of treating the TAR terminator as compression completion.
+            if ($stream.Length -lt 18) { Stop-DsrInstall 'Truncated gzip payload' 7 }
+            $stream.Position = $stream.Length - 8
+            $footer = [IO.BinaryReader]::new($stream, [Text.Encoding]::UTF8, $true)
+            try {
+                if ($footer.ReadUInt32() -ne $bounded.Crc32 -or
+                    $footer.ReadUInt32() -ne ($bounded.Position -band 4294967295L)) {
+                    Stop-DsrInstall 'Invalid or missing gzip checksum/length trailer' 7
+                }
+            } finally { $footer.Dispose() }
+        }
         if ($selected.Count -ne $Selection.binaries.Count) { Stop-DsrInstall 'TAR does not contain every selected executable' 7 }
     } finally {
         if ($null -ne $archive) { $archive.Dispose() }
         if ($null -ne $bounded) { $bounded.Dispose() }
-        if ($null -ne $gzip) { $gzip.Dispose() }
+        if ($null -ne $decoded) { $decoded.Dispose() }
         $stream.Dispose()
     }
 }
@@ -1049,8 +1193,8 @@ function Expand-DsrPayload {
     $null = New-DsrPrivateDirectory $Destination
     if ($Selection.format -ceq 'none') {
         Copy-DsrNewFile $Payload ([IO.Path]::Combine($Destination, $Selection.binaries[0]))
-    } elseif ($Selection.format -ceq 'tar.gz') {
-        Expand-DsrTarGzipPayload $Payload $Selection $Destination
+    } elseif ($Selection.format -cin @('tar.gz', 'tar.xz')) {
+        Expand-DsrTarPayload $Payload $Selection $Destination
     } else {
         $stream = Open-DsrReadFile $Payload
         $archive = $null
@@ -1590,7 +1734,8 @@ Options:
   -Help          Show this help
 
 Every selected executable is checked before replacement. Configured release
-signatures require Minisign. Release executables are never run and PATH is not edited.
+signatures require Minisign. tar.xz releases also require an installed xz application;
+no decoder is downloaded. Release executables are never run and PATH is not edited.
 -FromSource and -AllowSourceBuild run repository/dependency build code and produce a local build,
 not an authenticated signed release. It never installs a compiler automatically.
 -SourceIfStale requires -AllowSourceBuild and latest online mode. Unknown freshness

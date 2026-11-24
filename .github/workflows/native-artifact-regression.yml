@@ -36,6 +36,8 @@ on:
       - installers/cass/install.sh
       - installers/ntm/install.sh
       - scripts/tests/test_install_source_windows.sh
+      - scripts/tests/test_install_gen_windows_archives.sh
+      - scripts/tests/test_install_gen_windows_policy.sh
       - scripts/tests/test_install_source_family.sh
       - scripts/tests/test_toolchain_detect.sh
       - scripts/tests/test_upgrade_verify.sh
@@ -332,7 +334,7 @@ jobs:
           timeout 120 bash scripts/tests/test_native_source_sync.sh --bun-siblings-only \
             2>&1 | tee "$RUNNER_TEMP/collector-evidence/ordinary-bun-siblings.log"
           test -z "$(git status --porcelain)"
-      - name: Verify Windows Go staging with genuine PowerShell and PE outputs
+      - name: Verify Windows Go staging and verified archive installers
         if: runner.os == 'Linux'
         shell: bash
         run: |
@@ -350,6 +352,12 @@ jobs:
             export PATH="$RUNNER_TEMP/dsr-powershell:$PATH"
             echo "$RUNNER_TEMP/dsr-powershell" >> "$GITHUB_PATH"
           fi
+          timeout 120 bash scripts/tests/test_install_gen_windows_policy.sh \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/windows-installer-policy.log"
+          DOTNET_PROCESSOR_COUNT=1 timeout 120 bash scripts/tests/test_install_gen_windows_archives.sh \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/windows-installer-tar-gzip.log"
+          DOTNET_PROCESSOR_COUNT=1 timeout 120 bash scripts/tests/test_install_gen_windows_archives.sh --format tar.xz \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/windows-installer-tar-xz.log"
           DOTNET_PROCESSOR_COUNT=1 timeout 120 bash scripts/tests/test_native_source_sync.sh --windows-strict-go-only \
             2>&1 | tee "$RUNNER_TEMP/collector-evidence/windows-go-staging.log"
           test -z "$(git status --porcelain)"
