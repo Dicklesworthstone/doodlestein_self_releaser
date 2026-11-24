@@ -493,6 +493,9 @@ jobs:
           bash -n scripts/tests/test_generated_workspace_installer.sh
           timeout 120 bash scripts/tests/test_generated_workspace_installer.sh --cargo-features-only \
             2>&1 | tee "$RUNNER_TEMP/collector-evidence/rust-source-features.log"
+          bash -n scripts/tests/test_upgrade_verify.sh
+          timeout 120 bash scripts/tests/test_upgrade_verify.sh --rust-features-only \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/rust-source-upgrade.log"
           test -z "$(git status --porcelain)"
       - name: Validate RCH Cargo delivery consumers
         if: runner.os == 'Linux'

@@ -1400,6 +1400,10 @@ still requires every selected executable to compile before replacing the
 installed family. See [Rust source features](docs/INSTALLER_GENERATION.md#rust-source-features)
 for validation rules and package-qualified selectors.
 
+The same recipe selection applies when `dsr verify upgrade TOOL --build-from-source`
+compiles a Rust updater locally, so a feature-gated updater can be checked before
+or after publication.
+
 Private GitHub source builds use the same account as release downloads and
 freshness checks: `DSR_GH_TOKEN`, then `GITHUB_TOKEN`, then `GH_TOKEN`, then the
 stored GitHub.com login. Authenticated source fetches require Git 2.31 or newer

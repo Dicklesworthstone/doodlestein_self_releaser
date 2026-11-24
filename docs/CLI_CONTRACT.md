@@ -3874,7 +3874,14 @@ check after successful public publication; drafts do not run the hook.
 
 When the executable is absent, or `--build-from-source` is selected, verification
 builds the configured primary executable from `local_path`. Go, Rust, Bun and
-TypeScript are supported. Bun/TypeScript requires an installed Bun compiler and
+TypeScript are supported. Rust builds honor `source_features` and
+`source_no_default_features` from the repository recipe, passing the same literal
+selection to Cargo build and metadata. Absent settings retain Cargo defaults.
+Malformed feature policy, or either Cargo setting on a non-Rust recipe, fails
+before compilation or the updater runs. The source installer's feature-name
+grammar, bounds and duplicate checks apply here too.
+
+Bun/TypeScript requires an installed Bun compiler and
 uses the source installer's entry, frozen-lock and workspace rules: `source_subdir`
 selects the project, `source_entry` selects the primary entry when present, and
 otherwise the exact `binary_name` entry or scalar `bin` in `package.json` applies.

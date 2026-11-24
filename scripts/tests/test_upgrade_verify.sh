@@ -1119,6 +1119,152 @@ SH
     done
 }
 
+# Compile a dependency-free Rust updater through the public CLI. Its runtime
+# verdict proves which cfg features actually reached rustc; a transparent Cargo
+# recorder also checks that build and metadata receive the same literal argv.
+test_rust_source_features() {
+    local dependency
+    TESTS_RUN=$((TESTS_RUN + 1))
+    for dependency in cargo rustc jq yq python3; do
+        if ! command -v "$dependency" >/dev/null; then
+            skip "Rust source upgrade features require $dependency"
+            return 0
+        fi
+    done
+    if python3 - "$PROJECT_ROOT" <<'PY'
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+project = Path(sys.argv[1])
+root = Path(tempfile.mkdtemp(prefix='dsr-upgrade-rust-features-'))
+print('Rust upgrade feature evidence: ' + str(root), flush=True)
+real_cargo = shutil.which('cargo')
+base_env = os.environ.copy()
+for name in ('DSR_CONFIG_FILE', 'DSR_REPOS_FILE', 'DSR_HOSTS_FILE', 'ACT_REPOS_DIR',
+             'DSR_GH_TOKEN', 'GITHUB_TOKEN', 'GH_TOKEN', 'CARGO_BUILD_TARGET',
+             'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER'):
+    base_env.pop(name, None)
+cases = [
+    ('legacy-defaults', {}, True, 0),
+    ('explicit-defaults', {'source_features': ['cli']}, True, 0),
+    ('empty-defaults', {'source_features': [], 'source_no_default_features': False}, True, 0),
+    ('gated-binary', {'source_features': ['cli']}, True, 0),
+    ('without-defaults', {'source_features': ['cli'], 'source_no_default_features': True}, False, 0),
+    ('qualified', {'source_features': ['feature-probe/cli'], 'source_no_default_features': True}, False, 0),
+    ('missing-required', {'source_no_default_features': True}, False, 1),
+    ('duplicate', {'source_features': ['cli', 'cli']}, False, 1),
+    ('option', {'source_features': ['--all-features']}, False, 1),
+    ('newline', {'source_features': ['cli\n']}, False, 1),
+    ('scalar', {'source_features': 'cli'}, False, 1),
+    ('null-features', {'source_features': None}, False, 1),
+    ('string-boolean', {'source_no_default_features': 'false'}, False, 1),
+    ('null-boolean', {'source_no_default_features': None}, False, 1),
+    ('go-empty', {'language': 'go', 'source_features': []}, False, 1),
+    ('go-false', {'language': 'go', 'source_no_default_features': False}, False, 1),
+    ('bun-empty', {'language': 'bun', 'source_features': []}, False, 1),
+    ('typescript-false', {'language': 'typescript', 'source_no_default_features': False}, False, 1),
+]
+for name, changes, defaults, expected in cases:
+    case = root / name
+    source = case / 'source checkout'
+    (source / 'src').mkdir(parents=True)
+    (case / 'config/repos.d').mkdir(parents=True)
+    (case / 'bin').mkdir()
+    manifest_defaults = ['default-on'] if name == 'gated-binary' else ['cli', 'default-on']
+    (source / 'Cargo.toml').write_text('''[package]
+name = "feature-probe"
+version = "1.2.3"
+edition = "2021"
+[features]
+default = ''' + json.dumps(manifest_defaults) + '''
+default-on = []
+cli = []
+[[bin]]
+name = "dsr-feature-updater"
+path = "src/main.rs"
+required-features = ["cli"]
+''')
+    (source / 'src/main.rs').write_text(r'''use std::{env, fs::OpenOptions, io::Write};
+fn main() {
+    let args: Vec<_> = env::args().skip(1).collect();
+    if args != ["update", "--check"] { std::process::exit(64); }
+    let actual = format!("cli={} default={}", cfg!(feature="cli"), cfg!(feature="default-on"));
+    let mut proof = OpenOptions::new().create(true).append(true)
+        .open(env::var("DSR_UPGRADE_FEATURE_PROBE").unwrap()).unwrap();
+    writeln!(proof, "{}", actual).unwrap();
+    if actual != env::var("DSR_UPGRADE_FEATURE_EXPECT").unwrap() { std::process::exit(70); }
+    println!("Latest version: 1.2.3\nUpdate available");
+}
+''')
+    config = dict(tool_name='feature-probe', repo='fixture/feature-probe', language='rust',
+                  binary_name='dsr-feature-updater', local_path=str(source),
+                  upgrade_check_args=['update', '--check'])
+    config.update(changes)
+    (case / 'config/repos.d/feature-probe.yaml').write_text(json.dumps(config))
+    if config['language'] == 'go':
+        (source / 'go.mod').write_text('module example.invalid/feature-probe\n')
+        (source / 'main.go').write_text('package main\nfunc main() {}\n')
+    (case / 'bin/cargo').write_text('''#!/usr/bin/env bash
+jq -nc --args '$ARGS.positional' -- "$@" >> "$DSR_UPGRADE_CARGO_CALLS" || exit 90
+exec "$DSR_UPGRADE_REAL_CARGO" "$@"
+''')
+    for executable in ('go', 'bun', 'dsr-feature-updater'):
+        (case / 'bin' / executable).write_text('''#!/usr/bin/env bash
+printf '%s\\n' "${0##*/}" >> "$DSR_UPGRADE_UNEXPECTED_CALLS"
+exit 99
+''')
+    for executable in (case / 'bin').iterdir():
+        executable.chmod(0o700)
+    env = base_env.copy()
+    for variable, directory in {'DSR_CONFIG_DIR': 'config', 'DSR_STATE_DIR': 'state',
+                                'DSR_CACHE_DIR': 'cache', 'XDG_CONFIG_HOME': 'xdg-config',
+                                'XDG_STATE_HOME': 'xdg-state', 'XDG_CACHE_HOME': 'xdg-cache'}.items():
+        env[variable] = str(case / directory)
+    env.update(PATH=str(case / 'bin') + os.pathsep + base_env['PATH'],
+               CARGO_TARGET_DIR=str(case / 'cargo-target'), CARGO_NET_OFFLINE='true',
+               RUSTUP_AUTO_INSTALL='0', DSR_UPGRADE_REAL_CARGO=real_cargo,
+               DSR_UPGRADE_CARGO_CALLS=str(case / 'cargo.calls'),
+               DSR_UPGRADE_FEATURE_PROBE=str(case / 'updater.calls'),
+               DSR_UPGRADE_UNEXPECTED_CALLS=str(case / 'unexpected.calls'),
+               DSR_UPGRADE_FEATURE_EXPECT='cli=true default=' + str(defaults).lower())
+    result = subprocess.run([str(project / 'dsr'), '--json', 'verify', 'upgrade', 'feature-probe',
+                             '--build-from-source', '--version', '1.2.3'],
+                            cwd=project, env=env, capture_output=True, timeout=45)
+    (case / 'stdout').write_bytes(result.stdout)
+    (case / 'stderr').write_bytes(result.stderr)
+    assert result.returncode == expected, name + ': ' + result.stderr.decode(errors='replace')
+    receipt = json.loads(result.stdout)
+    assert receipt['command'] == 'verify-upgrade' and receipt['exit_code'] == expected, (name, receipt)
+    assert not (case / 'unexpected.calls').exists(), name + ': invoked an installed updater or another compiler'
+    calls = [json.loads(line) for line in (case / 'cargo.calls').read_text().splitlines()] if (case / 'cargo.calls').exists() else []
+    if expected == 0:
+        assert [args[0] for args in calls] == ['build', 'metadata'], (name, calls)
+        for args in calls:
+            features = [args[i + 1] for i, arg in enumerate(args) if arg == '--features']
+            assert features == changes.get('source_features', []), (name, args)
+            assert args.count('--no-default-features') == int(changes.get('source_no_default_features', False)), (name, args)
+        assert (case / 'updater.calls').read_text() == env['DSR_UPGRADE_FEATURE_EXPECT'] + '\n', name
+    else:
+        assert not (case / 'updater.calls').exists(), name + ': invalid or incomplete recipe ran updater'
+        if name == 'missing-required':
+            assert len(calls) == 1 and calls[0][0] == 'build', (name, calls)
+        else:
+            assert calls == [], name + ': invalid recipe reached Cargo'
+    print('PASS: Rust source upgrade feature policy ' + name, flush=True)
+print('Rust source upgrade feature cases: ' + str(len(cases)) + ' passed, 0 failed', flush=True)
+PY
+    then
+        pass "Rust upgrade builds honor configured features and refuse invalid recipes"
+    else
+        fail "Rust upgrade source feature controls"
+    fi
+}
+
 # ============================================================================
 # Cleanup
 # ============================================================================
@@ -1138,6 +1284,12 @@ echo ""
 if [[ "${1:-}" == --bun-source-only ]]; then
     test_bun_source_upgrade
     printf 'Bun source checks: %s; passed: %s; skipped: %s; failed: %s\n' \
+        "$TESTS_RUN" "$TESTS_PASSED" "$TESTS_SKIPPED" "$TESTS_FAILED"
+    [[ "$TESTS_FAILED" -eq 0 ]]; exit $?
+fi
+if [[ "${1:-}" == --rust-features-only ]]; then
+    test_rust_source_features
+    printf 'Rust source checks: %s; passed: %s; skipped: %s; failed: %s\n' \
         "$TESTS_RUN" "$TESTS_PASSED" "$TESTS_SKIPPED" "$TESTS_FAILED"
     [[ "$TESTS_FAILED" -eq 0 ]]; exit $?
 fi
@@ -1175,6 +1327,7 @@ test_real_timeout_after_positive_output_fails
 test_cli_dry_run_runs_and_builds_nothing
 test_cli_all_selection_and_options
 test_bun_source_upgrade
+test_rust_source_features
 
 echo ""
 echo "Repository Finding Tests:"

@@ -601,19 +601,73 @@ _upgrade_build_bun_tool() (
     cp -p -- "$built" "$tmpdir/$binary_name" || return 1
 )
 
+# Read Cargo feature options without evaluating configuration as shell source.
+# The installer engine owns feature-name grammar, bounds and uniqueness; this
+# local verification caller shares that admission and the strict YAML parser.
+# Print one argument per line, with no output when the recipe has no opt-in.
+_upgrade_source_cargo_arguments() (
+    local tool_name="$1" language="$2" config_file source_dir configuration selection feature
+    config_file="${ACT_REPOS_DIR:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.d}/$tool_name.yaml"
+    [[ ! -L "$config_file" ]] || return 4
+    [[ -f "$config_file" ]] || return 0
+    command -v jq >/dev/null && command -v yq >/dev/null || return 3
+    source_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || return 3
+    if ! declare -F _config_read_single_mapping_json >/dev/null; then
+        # shellcheck source=SCRIPTDIR/config.sh
+        source "$source_dir/config.sh" || return 3
+    fi
+    configuration=$(_config_read_single_mapping_json "$config_file") || return $?
+    jq -e 'has("source_features") or has("source_no_default_features")' \
+        <<< "$configuration" >/dev/null || return 0
+    if [[ "$language" != rust ]] || ! jq -e \
+            '(has("language") | not) or .language == "rust"' <<< "$configuration" >/dev/null; then
+        log_error 'Cargo feature selection is only supported for Rust'
+        return 4
+    fi
+    selection=$(jq -ce '
+        {features:(if has("source_features") then .source_features else [] end),
+         no_default_features:(if has("source_no_default_features") then .source_no_default_features else false end)} |
+        select((.features | type == "array" and all(.[];
+            type == "string" and (test("[[:cntrl:]]") | not))) and
+            (.no_default_features | type == "boolean"))
+    ' <<< "$configuration") || return 4
+    if ! declare -F _isb_cargo_features_valid >/dev/null; then
+        # shellcheck source=SCRIPTDIR/install_source.sh
+        source "$source_dir/install_source.sh" || return 3
+    fi
+    local -a features=()
+    mapfile -t features < <(jq -r '.features[]' <<< "$selection")
+    _isb_cargo_features_valid ${features[@]+"${features[@]}"} || return 4
+    for feature in ${features[@]+"${features[@]}"}; do
+        printf '%s\n' --features "$feature"
+    done
+    if jq -e '.no_default_features' <<< "$selection" >/dev/null; then
+        printf '%s\n' --no-default-features
+    fi
+    return 0
+)
+
 # Build tool from source
 _upgrade_build_tool() {
     local tool_name="$1"
     local repo_dir="$2"
     local binary_name="${3:-$tool_name}"
-    local tmpdir
-    tmpdir=$(mktemp -d) || return 1
-
-    local bin_path="$tmpdir/$binary_name"
-    local language=''
+    local language='' build_language cargo_arguments
+    local -a cargo_options=()
     if declare -F config_get_tool_field >/dev/null; then
         language=$(config_get_tool_field "$tool_name" language '') || return $?
     fi
+    build_language="$language"
+    if [[ "$language" != bun && "$language" != typescript ]]; then
+        if [[ -f "$repo_dir/go.mod" ]]; then build_language=go
+        elif [[ -f "$repo_dir/Cargo.toml" ]]; then build_language=rust
+        fi
+    fi
+    cargo_arguments=$(_upgrade_source_cargo_arguments "$tool_name" "$build_language") || return $?
+    [[ -z "$cargo_arguments" ]] || mapfile -t cargo_options <<< "$cargo_arguments"
+    local tmpdir
+    tmpdir=$(mktemp -d) || return 1
+    local bin_path="$tmpdir/$binary_name"
 
     if [[ "$language" == bun || "$language" == typescript ]]; then
         log_debug "Building Bun/TypeScript project..."
@@ -638,11 +692,12 @@ _upgrade_build_tool() {
         log_debug "Building Rust project..."
         if cargo build --release \
                 --manifest-path "$repo_dir/Cargo.toml" \
-                --bin "$binary_name" 2>/dev/null; then
+                --bin "$binary_name" ${cargo_options[@]+"${cargo_options[@]}"} 2>/dev/null; then
             local target_dir target_path
             if command -v jq &>/dev/null; then
                 target_dir=$(cargo metadata --no-deps --format-version=1 \
-                                --manifest-path "$repo_dir/Cargo.toml" 2>/dev/null \
+                                --manifest-path "$repo_dir/Cargo.toml" \
+                                ${cargo_options[@]+"${cargo_options[@]}"} 2>/dev/null \
                                 | jq -r '.target_directory // empty' 2>/dev/null)
             fi
             [[ -z "$target_dir" ]] && target_dir="${CARGO_TARGET_DIR:-$repo_dir/target}"
@@ -665,5 +720,5 @@ _upgrade_build_tool() {
 # Export functions
 export -f upgrade_verify_tool upgrade_verify_all upgrade_verify_json
 export -f _upgrade_check_succeeded _upgrade_extract_latest_version _upgrade_check_args _upgrade_has_explicit_check_args
-export -f _upgrade_tool_binary_name _upgrade_find_repo_dir _upgrade_build_tool
+export -f _upgrade_tool_binary_name _upgrade_find_repo_dir _upgrade_build_tool _upgrade_source_cargo_arguments
 export -f _upgrade_build_bun_tool
