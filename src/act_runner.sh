@@ -12043,11 +12043,11 @@ def absolute(value, cwd):
         return paths.normpath(paths.join(cwd, value)).replace('\\', '/')
     return paths.normpath(value if paths.isabs(value) else paths.join(cwd, value))
 
-def directory(value, cwd, traversals, cdpath=None):
+def directory(value, cwd, traversals, cdpath=None, logical=False):
     # Retain the original traversal, not only its normalized destination:
     # link/.. and missing/.. are meaningful filesystem operations. Shell cd
     # also needs its search path at this step, before a later unset hides it.
-    traversals.append(dict(path=value, cwd=cwd, cdpath=cdpath))
+    traversals.append(dict(path=value, cwd=cwd, cdpath=cdpath, logical=logical))
     return absolute(value, cwd)
 
 def executable_name(program):
@@ -12230,7 +12230,8 @@ try:
             if not windows and selected_directory.startswith(('-', '+')):
                 fail('shell cd options and directory-stack selection are not literal source paths')
             destination = directory(selected_directory, cwd, directories,
-                                    None if windows else effective.get('CDPATH') or effective.get('cdpath'))
+                                    None if windows else effective.get('CDPATH') or effective.get('cdpath'),
+                                    logical=True)
             if windows and not change_drive and paths.splitdrive(destination)[0].lower() != paths.splitdrive(cwd)[0].lower():
                 fail('CMD cd across drives requires an explicit /d selector')
             cwd = destination; continue
@@ -12289,7 +12290,7 @@ try:
             directories=selected_directories, packages=packages,
             workfile_overridden=effective_workfile_overridden,
             unset=sorted(removed), clear_environment=clear, kind=kind,
-            output=None if not output else absolute(output, selected_cwd),
+            output=None if not output else absolute(output, selected_cwd), output_operand=output,
             arguments=['list', '-find', '-json'] + list_flags + packages,
             files=all(package.endswith('.go') for package in packages)))
         if terminal_exec:
@@ -12372,6 +12373,14 @@ else:
     print('plan = json.loads(' + repr(json.dumps(plan)) + ')')
     print(r'''
 observations = []
+def require_unambiguous_path(path):
+    # The coordinator cannot resolve worker symlinks. Lexically removing
+    # link/.. from go -C, env -C or -o can select an unrelated old executable
+    # even after a successful compiler exit. Keep the original operand and
+    # require the worker's filesystem to agree with the normalized plan.
+    normalized = os.path.normpath(path)
+    if normalized != path and not os.path.samestat(os.stat(path), os.stat(normalized)):
+        raise ValueError('physical Go path changes identity when normalized; use a canonical selector: ' + path)
 def source_controls():
     root = os.path.dirname(plan['source_root']) if plan['clear_selectors'] else plan['source_root']
     rows = {}
@@ -12386,6 +12395,11 @@ def source_controls():
             rows[path] = (info.st_dev, info.st_ino, info.st_mode, info.st_size, digest)
     return rows
 for op in plan['operations']:
+    for traversal in op['directories']:
+        if not traversal.get('logical', False):
+            require_unambiguous_path(os.path.join(traversal['cwd'], traversal['path']))
+    if op.get('output_operand'):
+        require_unambiguous_path(os.path.join(op['cwd'], op['output_operand']))
     environment = {} if op['clear_environment'] else dict(os.environ)
     for key in list(environment):
         if key in plan['clear_selectors'] or (plan['clear_selectors'] and key.upper().startswith('PKG_CONFIG')):
@@ -17986,6 +18000,14 @@ try:
     root, relocated_root = canonical(root), canonical(relocated_root)
     rows = []
     for operation, moved_operation in zip(plan['operations'], relocated['operations']):
+        if shell != 'windows' and (any(not step.get('logical', False) and
+                '..' in step['path'].split('/') for step in operation['directories']) or
+                '..' in (operation.get('output_operand') or '').split('/')):
+            # The worker may traverse a symlink before its parent component.
+            # Do not claim a private in-tree destination from lexical cleanup;
+            # collection independently checks that spelling on the worker.
+            rows = ['external\t*']
+            break
         output, moved = destination(operation), destination(moved_operation)
         if output == '*' or not paths.isabs(output):
             rows = ['external\t*']

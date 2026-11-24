@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_act_runner_native.sh - Unit tests for act_runner.sh native build SSH logic
 #
-# Usage: ./test_act_runner_native.sh [--go-outputs-only | --go-command-context-only | --typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --large-inventory-only | --workspace-archives-only | --failure-evidence-only | --env-precedence-only | --archive-delivery-only | --zig-dispatch-only | --glibc-routing-only | --windows-launcher-transfer-only | --artifact-transfer-only]
+# Usage: ./test_act_runner_native.sh [--go-outputs-only | --go-command-context-only | --go-paths-only | --typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --large-inventory-only | --workspace-archives-only | --failure-evidence-only | --env-precedence-only | --archive-delivery-only | --zig-dispatch-only | --glibc-routing-only | --windows-launcher-transfer-only | --artifact-transfer-only]
 #
 # Tests native build SSH command construction with mocks.
 # Covers: command construction, path handling, env vars, SCP, error handling.
@@ -168,7 +168,61 @@ def run_case(name, command, *, expected=True, platform=host_platform, overrides=
     check(name + ' preserves source controls', before == (source / 'go.mod').read_bytes())
     return case, receipt
 
-if sys.argv[2] == 'context':
+if sys.argv[2] == 'paths':
+    def linked_source(case):
+        physical = case / 'source/physical'
+        write(physical / 'go.mod', 'module fixture.invalid/physical\n\ngo 1.21\n')
+        write(physical / 'main.go', 'package main\nfunc main() { println("fresh-physical-89") }\n')
+        write(physical / 'child/go.mod', 'module fixture.invalid/child\n\ngo 1.21\n')
+        write(physical / 'child/main.go', 'package main\nfunc main() { println("fresh-73") }\n')
+        (case / 'source/jump').symlink_to('physical/child', target_is_directory=True)
+
+    # The compiler really resolves jump/.. through the symlink. A lexical
+    # cleanup instead selects source/tool, which contains the old executable.
+    # Require the precise refusal plus a successful fresh compiler output so
+    # a failed setup, health check or compiler cannot satisfy the regression.
+    for name, command, expected_output, output_name in [
+        ('physical-go-cwd', 'go -C jump/.. build -p=1 -buildvcs=false -o tool .', 'fresh-physical-89', 'tool'),
+        ('physical-go-default-cwd', 'go -C jump/.. build -p=1 -buildvcs=false .', 'fresh-physical-89', 'physical'),
+        ('physical-env-cwd', 'env -C jump/.. go build -p=1 -buildvcs=false -o tool .', 'fresh-physical-89', 'tool'),
+        ('physical-cwd-after-logical-cd', 'cd jump && go -C .. build -p=1 -buildvcs=false -o tool .', 'fresh-physical-89', 'tool'),
+        ('physical-output-operand', 'go build -p=1 -buildvcs=false -o jump/../tool .', 'fresh-73', 'tool'),
+    ]:
+        case, receipt = run_case(name, command, expected=False, preparation=linked_source)
+        compiled = case / 'source/physical' / output_name
+        fresh = subprocess.run([str(compiled)], capture_output=True, text=True, timeout=5) if compiled.is_file() else None
+        check(name + ' really compiled the physical destination', fresh is not None and
+              fresh.returncode == 0 and fresh.stderr.strip() == expected_output)
+        check(name + ' reports worker path identity divergence',
+              'physical Go path changes identity when normalized' in (case / 'stderr.log').read_text())
+
+    # Logical shell cd retains the shell's path semantics. Ordinary parent
+    # traversals without a divergent symlink and symlink-only selectors also
+    # keep working; the fix does not ban these useful recipe forms.
+    run_case('logical-shell-cwd', 'cd jump/.. && go build -p=1 -buildvcs=false -o tool .',
+             preparation=linked_source)
+    run_case('ordinary-go-parent', 'go -C dist/.. build -p=1 -buildvcs=false -o tool .')
+    run_case('ordinary-env-parent', 'env -C dist/.. go build -p=1 -buildvcs=false -o tool .')
+    run_case('ordinary-output-parent', 'go build -p=1 -buildvcs=false -o dist/../tool .')
+    run_case('symlink-without-parent', 'go -C jump build -p=1 -buildvcs=false -o tool .',
+             preparation=linked_source)
+
+    path_driver = 'source "${DSR_TEST_ACT_RUNNER:-$1/src/act_runner.sh}"; _act_go_output_paths "$2" "" "$3" unix'
+    source_root = '/worker/source'
+    for name, command, expected in [
+        ('physical Go cwd', 'go -C jump/.. build -o tool .', 'external\t*'),
+        ('physical env cwd', 'env -C jump/.. go build -o tool .', 'external\t*'),
+        ('physical cwd after logical cd', 'cd jump && go -C .. build -o tool .', 'external\t*'),
+        ('physical output operand', 'go build -o jump/../tool .', 'external\t*'),
+        ('unobserved parent without symlink', 'go -C dist/.. build -o tool .', 'external\t*'),
+        ('logical shell cwd', 'cd jump/.. && go build -o tool .', 'in-tree\t/worker/source/tool'),
+        ('ordinary relative output', 'go build -o dist/tool .', 'in-tree\t/worker/source/dist/tool'),
+    ]:
+        result = subprocess.run(['bash', '-c', path_driver, 'go-paths', str(root), source_root, command],
+                                env=environment, capture_output=True, text=True, timeout=10)
+        check(name + ' retains conservative scheduler ownership',
+              result.returncode == 0 and result.stdout.strip() == expected)
+elif sys.argv[2] == 'context':
     # The positive combines ordinary separators, an optional stateless marker,
     # literal expansion-looking text, and a final complete-family conjunction.
     run_case('foreground-context',
@@ -275,6 +329,10 @@ if [[ "${1:-}" == --go-outputs-only ]]; then
 fi
 if [[ "${1:-}" == --go-command-context-only ]]; then
     test_go_native_output_selection context
+    exit $?
+fi
+if [[ "${1:-}" == --go-paths-only ]]; then
+    test_go_native_output_selection paths
     exit $?
 fi
 
