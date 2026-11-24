@@ -17772,16 +17772,75 @@ _act_build_orchestration_target() {
     return "$exit_code"
 }
 
-# Output files a native target's build writes on its host, one
+# Project the collector's direct Go command plan into scheduler-owned output
+# namespaces. A literal -o can name either a file or a directory on the worker;
+# reserve its descendants too instead of guessing its type on this machine.
+# Replanning against a different source root proves whether source staging
+# actually moves each destination. An absolute path below the original root
+# is still shared, just like an absolute path outside it.
+# Returns 1 for an opaque recipe which retains declared-output conventions.
+_act_go_output_paths() {
+    local source_root="$1" build_env="$2" build_cmd="$3" shell_kind="$4"
+    local plan relocated_plan relocated_root=/.dsr-output-relocation/source
+    [[ "$shell_kind" != windows ]] || relocated_root=Z:/.dsr-output-relocation/source
+    plan=$(_act_go_output_plan "$source_root" "$build_env" "$build_cmd" "$shell_kind") || return 4
+    [[ "$plan" != null ]] || return 1
+    relocated_plan=$(_act_go_output_plan "$relocated_root" "$build_env" "$build_cmd" "$shell_kind") || return 4
+    python3 -I - "$source_root" "$relocated_root" "$shell_kind" \
+        3<<< "$plan" 4<<< "$relocated_plan" <<'PY'
+import json, ntpath, os, posixpath, sys
+
+root, relocated_root, shell = sys.argv[1:]
+paths = ntpath if shell == 'windows' else posixpath
+
+def canonical(path):
+    value = paths.normpath(path)
+    return value.replace('\\', '/').lower() if shell == 'windows' else value
+
+def destination(operation):
+    if operation['kind'] == 'install':
+        # Without an explicit GOBIN the actual worker's Go settings determine
+        # the installation directory. Reserve the host's unknown namespace;
+        # do not substitute the controller's GOPATH/HOME or a source-tree bin.
+        value = operation['environment'].get('GOBIN', '')
+        return canonical(value) if value and paths.isabs(value) else '*'
+    return canonical(operation['output'] or operation['cwd'])
+
+try:
+    plan, relocated = json.load(os.fdopen(3)), json.load(os.fdopen(4))
+    if len(plan['operations']) != len(relocated['operations']):
+        raise ValueError('Go output plan changed during relocation analysis')
+    root, relocated_root = canonical(root), canonical(relocated_root)
+    rows = []
+    for operation, moved_operation in zip(plan['operations'], relocated['operations']):
+        output, moved = destination(operation), destination(moved_operation)
+        if output == '*' or not paths.isabs(output):
+            rows = ['external\t*']
+            break
+        inside = output == root or output.startswith(root.rstrip('/') + '/')
+        expected = canonical(paths.join(relocated_root, paths.relpath(output, root))) if inside else ''
+        private = inside and moved != output and moved == expected
+        row = ('in-tree' if private else 'external') + '\t' + output
+        if row not in rows:
+            rows.append(row)
+    print('\n'.join(rows))
+except (OSError, ValueError, KeyError, TypeError) as error:
+    print('[act] Cannot establish Go output ownership: ' + str(error), file=sys.stderr)
+    raise SystemExit(4)
+PY
+}
+
+# Output namespaces a native target's build writes on its host, one
 # "<in-tree|external><TAB><path>" line per binary, so the orchestrator can keep
 # --parallel targets from overwriting each other's binaries. A path is
-# in-tree when it lies under the build's source root (a per-target source
-# copy then makes it private). A trailing .exe is dropped: Go's `-o name`
-# never appends it, so windows and unix targets can share one file. Rust
+# in-tree only when a per-target source copy makes it private. A Go output
+# operand owns both its exact path and descendants; '*' reserves an unknown
+# worker-selected installation directory. A trailing .exe is dropped only
+# for opaque recipes with the historical declared-output convention. Rust
 # targets print nothing (Cargo scopes outputs by target triple), as do act
 # targets and unreadable configs (the build itself reports those).
 _act_native_output_paths() {
-    local tool_name="$1" target="$2" host="$3" strict="$4" source_roots_json="$5"
+    local tool_name="$1" target="$2" host="$3" strict="$4" source_roots_json="$5" version="${6:-0}"
     local config_file="$ACT_REPOS_DIR/${tool_name}.yaml"
     local language remote_path build_env build_profile binaries bin path
 
@@ -17802,7 +17861,22 @@ _act_native_output_paths() {
     fi
     remote_path="${remote_path%/}"
     [[ -n "$remote_path" ]] || return 0
-    build_env=$(act_get_build_env "$tool_name" "$target" 2>/dev/null) || return 0
+    build_env=$(act_get_build_env "$tool_name" "$target" 2>/dev/null) || return 4
+    if [[ "$language" == go ]]; then
+        local command binary_name shell_kind=unix output_paths output_status=0
+        command=$(act_get_build_cmd "$tool_name" "$target") || return 4
+        binary_name=$(yq -r '.binary_name // ""' "$config_file") || return 4
+        [[ -n "$binary_name" ]] || binary_name="$tool_name"
+        command=$(act_substitute_build_cmd_tokens "$command" "$binary_name" "$version" \
+            "${target%%/*}" "${target##*/}") || return 4
+        _act_is_windows_host "$host" && shell_kind=windows
+        output_paths=$(_act_go_output_paths "$remote_path" "$build_env" "$command" "$shell_kind") || output_status=$?
+        case "$output_status" in
+            0) printf '%s\n' "$output_paths"; return 0 ;;
+            1) ;; # Reviewed opaque recipes retain their declared convention.
+            *) return "$output_status" ;;
+        esac
+    fi
     build_profile=$(yq -r '.build_profile // "release"' "$config_file" 2>/dev/null) || return 0
     binaries=$(_act_workspace_binaries_for_target "$config_file" "$target" 2>/dev/null) || return 0
     [[ -n "$binaries" ]] || binaries=$(yq -r '.binary_name // ""' "$config_file" 2>/dev/null) || return 0
@@ -17819,12 +17893,13 @@ _act_native_output_paths() {
     done <<< "$binaries"
 }
 
-# Only default Go output paths are proven relocatable into a strict private
-# source stage. An explicit GOBIN may still name the original snapshot or
-# escape a relative path, so preserve conflict serialization for that case.
+# A strict private source stage needs relocatable command-selected outputs as
+# well as the existing Go environment policy. An explicit GOBIN may still name
+# the original snapshot or escape a relative path, so retain serialization.
 # Returns 0 for private staging, 1 for deferral, and 4 for unreadable policy.
 _act_strict_go_output_stage_policy() {
-    local tool_name="$1" platform="$2" language build_env env_pair go_bin=""
+    local tool_name="$1" platform="$2" output_paths="${3:-}" language build_env env_pair go_bin=""
+    [[ "$output_paths" != *$'external\t'* ]] || return 1
     language=$(yq -r '.language // ""' "$ACT_REPOS_DIR/${tool_name}.yaml") || return 4
     [[ "$language" == go ]] || return 1
     build_env=$(act_get_build_env "$tool_name" "$platform") || return 4
@@ -19580,7 +19655,8 @@ act_orchestrate_build() {
     # Print the first still-running target on <host> that writes any of the
     # output paths in <paths> (lines from _act_native_output_paths).
     _act_active_output_conflict() {
-        local conflict_host="$1" conflict_paths="$2" conflict_index path
+        local conflict_host="$1" conflict_paths="$2" conflict_index path active_path
+        local candidate_namespace active_namespace
         [[ -n "$conflict_paths" ]] || return 0
         for ((conflict_index = 0; conflict_index < ${#worker_pids[@]}; conflict_index++)); do
             [[ -z "${worker_reaped[$conflict_index]:-}" ]] || continue
@@ -19588,10 +19664,18 @@ act_orchestrate_build() {
             [[ -n "${worker_output_paths[$conflict_index]}" ]] || continue
             while IFS= read -r path; do
                 [[ -n "$path" ]] || continue
-                if grep -Fxq -- "${path#*$'\t'}" <<< "$(cut -f2- <<< "${worker_output_paths[$conflict_index]}")"; then
-                    printf '%s\n' "${worker_targets[$conflict_index]}"
-                    return 0
-                fi
+                candidate_namespace="${path#*$'\t'}"
+                while IFS= read -r active_path; do
+                    [[ -n "$active_path" ]] || continue
+                    active_namespace="${active_path#*$'\t'}"
+                    if [[ "$candidate_namespace" == '*' || "$active_namespace" == '*' ||
+                          "$candidate_namespace" == "$active_namespace" ||
+                          "$candidate_namespace" == "${active_namespace%/}/"* ||
+                          "$active_namespace" == "${candidate_namespace%/}/"* ]]; then
+                        printf '%s\n' "${worker_targets[$conflict_index]}"
+                        return 0
+                    fi
+                done <<< "${worker_output_paths[$conflict_index]}"
             done <<< "$conflict_paths"
         done
         return 0
@@ -20126,13 +20210,16 @@ act_orchestrate_build() {
         local output_paths="" output_stage=0 output_conflict=""
         if (( parallel_jobs > 1 )) &&
            { [[ "$target_sync_receipt" == null ]] || [[ "$(jq -r '.status' <<< "$target_sync_receipt")" == success ]]; }; then
-            output_paths=$(_act_native_output_paths "$tool_name" "$target" "$host" \
-                "$strict_release_contract" "$source_roots_json")
+            if ! output_paths=$(_act_native_output_paths "$tool_name" "$target" "$host" \
+                    "$strict_release_contract" "$source_roots_json" "$version"); then
+                _act_fail_coordinator "Unable to establish native output ownership for $tool_name/$target"
+                break
+            fi
             output_conflict=$(_act_active_output_conflict "$host" "$output_paths")
             if [[ -n "$output_conflict" ]]; then
                 local output_stage_allowed=true output_stage_policy_status=0
                 if $strict_release_contract; then
-                    _act_strict_go_output_stage_policy "$tool_name" "$target" || output_stage_policy_status=$?
+                    _act_strict_go_output_stage_policy "$tool_name" "$target" "$output_paths" || output_stage_policy_status=$?
                     case "$output_stage_policy_status" in
                         0) ;;
                         1) output_stage_allowed=false ;;

@@ -826,6 +826,17 @@ by `release` and `release verify`, including when `--no-manifest` is requested.
 Use `--resume` to retry packaging or finish interrupted publication from the
 verified target receipts without rebuilding completed targets.
 
+Parallel native Go builds reserve the output destinations selected by the actual
+`go build` or `go install` command. Targets that write the same file or an
+overlapping output directory on one host wait for each other; independent hosts
+can continue. An absolute `-o` path remains shared even when it points inside the
+original source directory, because copying the source cannot relocate that
+argument. Relative outputs may use private source stages when replanning the
+command proves that their destinations move with the source. A `go install`
+without an explicit absolute `GOBIN` is serialized conservatively on its host,
+rather than guessing the worker's installation directory from the controller's
+environment. Deferred targets do not consume an attempt or acquire a build slot.
+
 Every run retains the SHA-256 of its exact `repos.d/<tool>.yaml` bytes,
 including ordinary builds and platforms with only one target triple. Resume
 requires that saved recipe before preparing sources or reusing artifacts.

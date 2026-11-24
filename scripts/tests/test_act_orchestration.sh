@@ -6,6 +6,8 @@
 # compiler, Docker, SSH, or host-health fixtures. --output-queue-only exercises
 # deferred shared outputs, independent hosts, cancellation and exact-run resume.
 # --host-capacity-only covers the same queue with real one-slot host leases.
+# --go-output-ownership-only verifies that command-selected absolute Go outputs
+# remain serialized while independent hosts run and completed work is reused.
 # --artifact-inventory-only exercises large completion receipts and reuse
 # against real files without compilers, Docker, SSH, or host-health fixtures.
 # --workflow-inventory-only exercises complete typed workflow collection and
@@ -2267,8 +2269,29 @@ act_run_native_build() {
 }
 args=(--run-id "$DSR_QUEUE_RUN")
 [[ "$DSR_QUEUE_PHASE" != resume ]] || args=(--resume-run-id "$DSR_QUEUE_RUN")
+status=0
 act_orchestrate_build queuefixture 1.0.0 --parallel-jobs 2 --no-source-sync-gate \
-    --output-dir "$DSR_QUEUE_CASE/output" "${args[@]}"
+    --output-dir "$DSR_QUEUE_CASE/output" "${args[@]}" || status=$?
+if [[ "$DSR_QUEUE_ROUTE" == absolute && "$DSR_QUEUE_PHASE" == first ]]; then
+    # The real coordinator defined this helper and drained all workers. Check
+    # its directory overlap boundary without another compiler/timing fixture.
+    (
+        worker_pids=(1)
+        worker_hosts=(shared)
+        worker_targets=(owner)
+        worker_output_paths=($'external\t/shared/bin')
+        declare -A worker_reaped=()
+        _act_active_output_conflict shared $'external\t/shared/bin/fixture' > "$DSR_QUEUE_CASE/directory-conflict"
+        _act_active_output_conflict shared $'external\t/shared/binary/fixture' > "$DSR_QUEUE_CASE/sibling-conflict"
+        _act_active_output_conflict independent $'external\t/shared/bin' > "$DSR_QUEUE_CASE/other-host-conflict"
+        _act_active_output_conflict shared $'external\t*' > "$DSR_QUEUE_CASE/unknown-conflict"
+        worker_output_paths=($'external\t/shared/bin/fixture')
+        _act_active_output_conflict shared $'external\t/shared/bin' > "$DSR_QUEUE_CASE/parent-conflict"
+        _act_go_output_paths /source '' 'go build -o fixture .' unix > "$DSR_QUEUE_CASE/relative-output"
+        _act_go_output_paths /source '' 'go -C subdir build -o fixture .' unix > "$DSR_QUEUE_CASE/relative-cwd-output"
+    ) || exit 4
+fi
+exit "$status"
 ''')
 holder = root / 'holder.sh'
 holder.write_text(r'''#!/usr/bin/env bash
@@ -2348,7 +2371,9 @@ def invoke(case, env, targets, mode, phase):
 
 cases = [('windows', 'success'), ('external', 'retry'), ('external', 'cancel')]
 capacity_cases = [('capacity', mode) for mode in ('success', 'retry', 'cancel', 'busy')]
-if selection == '--host-capacity-only':
+if selection == '--go-output-ownership-only':
+    cases = [('absolute', 'retry'), ('absolute-source', 'success')]
+elif selection == '--host-capacity-only':
     cases = capacity_cases
 elif selection != '--output-queue-only':
     cases += capacity_cases
@@ -2366,6 +2391,12 @@ for route, mode in cases:
                   cross_compile={target: {'host': host} for target, host in hosts.items()})
     if route == 'external':
         config['env'] = {'GOBIN': str(case / 'shared-bin')}
+        config['build_cmd'] = 'go build -o "$GOBIN/fixture" ./cmd/fixture'
+    elif route in ('absolute', 'absolute-source'):
+        # Both are fixed absolute destinations. Even one lexically below the
+        # source root is unchanged when the worker copies that source elsewhere.
+        destination = case / ('source' if route == 'absolute-source' else 'shared-bin') / 'fixture'
+        config['build_cmd'] = 'go build -o "' + str(destination) + '" ./cmd/fixture'
     elif route == 'capacity':
         # Rust output paths are isolated by the runner. The only blocker in
         # this case is the actual host lease, not a shared-output fixture.
@@ -2412,6 +2443,13 @@ for route, mode in cases:
               sorted(row['target'] for row in events(case, 'resume') if row['state'] == 'start') == sorted(targets))
         continue
     result, state, workspace = invoke(case, env, targets, mode, 'first')
+    if route == 'absolute':
+        for name, expected in (
+                ('directory-conflict', 'owner\n'), ('parent-conflict', 'owner\n'),
+                ('unknown-conflict', 'owner\n'), ('sibling-conflict', ''), ('other-host-conflict', ''),
+                ('relative-output', 'in-tree\t/source/fixture\n'),
+                ('relative-cwd-output', 'in-tree\t/source/subdir/fixture\n')):
+            check(case.name + ': output ownership control ' + name, (case / name).read_text() == expected)
     timeline = events(case)
     check(case.name + ': every backend starts under its real bound-host lease',
           bool(timeline) and all(row['lease'] and row['host'] == hosts[row['target']]
@@ -2461,7 +2499,8 @@ raise SystemExit(bool(failures))
 PY
 }
 
-if [[ "${1:-}" == --output-queue-only || "${1:-}" == --host-capacity-only ]]; then
+if [[ "${1:-}" == --output-queue-only || "${1:-}" == --host-capacity-only ||
+      "${1:-}" == --go-output-ownership-only ]]; then
     test_parallel_output_queue "$1"
     exit $?
 fi
