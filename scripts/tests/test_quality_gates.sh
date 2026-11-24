@@ -1993,6 +1993,18 @@ module, root = map(Path, sys.argv[1:])
 work = Path(tempfile.mkdtemp(prefix='dsr-quality-interruption-'))
 print('Quality interruption evidence: ' + str(work), flush=True)
 checks, failures = 0, []
+portable = work / 'without-timeout'
+portable.mkdir()
+# Preserve the actual host tools and remove only the optional timer providers.
+for directory in os.get_exec_path():
+    source = Path(directory or '.').absolute()
+    if not source.is_dir():
+        continue
+    for executable in source.iterdir():
+        target = portable / executable.name
+        if executable.name not in ('timeout', 'gtimeout') and not target.exists() and \
+                executable.is_file() and os.access(executable, os.X_OK):
+            target.symlink_to(executable)
 
 
 def check(label, condition):
@@ -2007,15 +2019,14 @@ driver = work / 'driver.bash'
 driver.write_text('''#!/usr/bin/env bash
 set -uo pipefail
 source "$1" || exit $?
-if [[ "$2" == portable ]]; then _dsr_timeout_cmd() { printf '\\n'; }; fi
 if [[ "$2" == completion-failure ]]; then
     # Keep real supervision and real signalled checks; fail only the private
     # launcher completion channel, independently of command stdout/stderr.
     run_with_timeout() {
         if [[ -f "$DSR_QUALITY_TEST_CASE/first" ]]; then
-            _dsr_run_with_timeout _dsr_timeout_cmd "$@" 3>&-
+            _dsr_run_with_timeout "$@" 3>&-
         else
-            _dsr_run_with_timeout _dsr_timeout_cmd "$@"
+            _dsr_run_with_timeout "$@"
         fi
     }
 fi
@@ -2053,6 +2064,8 @@ def run(label, program, engine='default', bound='10', cli=False):
     env = dict(os.environ, DSR_QUALITY_TIMEOUT=bound, DSR_QUALITY_TEST_CASE=str(case),
                DSR_QUALITY_LOG_DIR=str(case / 'logs'), DSR_CONFIG_DIR=str(case / 'config'),
                DSR_REPOS_FILE=str(config), NO_COLOR='1')
+    if engine == 'portable':
+        env['PATH'] = str(portable)
     argv = ['bash', str(driver), str(module), engine, str(source)]
     if cli:
         argv = ['bash', str(root / 'dsr'), '--json', 'quality', 'example',

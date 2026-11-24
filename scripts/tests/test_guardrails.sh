@@ -515,6 +515,22 @@ root = Path(tempfile.mkdtemp(prefix="dsr-command-deadlines-"))
 print("Retained command deadline fixture: " + str(root), flush=True)
 checks = 0
 failures = 0
+portable = root / "without-timeout"
+portable.mkdir()
+# Exercise the same real tools with only the optional timer providers absent.
+for directory in os.get_exec_path():
+    source = Path(directory or ".").absolute()
+    if not source.is_dir():
+        continue
+    for executable in source.iterdir():
+        target = portable / executable.name
+        if executable.name not in ("timeout", "gtimeout") and not target.exists() and \
+                executable.is_file() and os.access(executable, os.X_OK):
+            target.symlink_to(executable)
+paths = {"system": os.environ["PATH"], "portable": str(portable)}
+
+def environment(engine):
+    return dict(os.environ, PATH=paths[engine])
 
 def check(label, valid):
     global checks, failures
@@ -537,11 +553,6 @@ source "$1/logging.sh" || exit 90
 source "$1/host_health.sh" || exit 90
 source "$1/canary.sh" || exit 90
 source "$1/upgrade_verify.sh" || exit 90
-if [[ "$2" == portable ]]; then
-    _dsr_timeout_cmd() { printf ''; }
-    _hh_timeout_cmd() { printf ''; }
-    _canary_timeout_cmd() { printf ''; }
-fi
 # Only configuration lookup is replaced. The real verification entry points,
 # subprocess execution, deadline ownership and JSON verdicts are exercised.
 _upgrade_tool_binary_name() { printf '%s\n' timeout-probe; }
@@ -568,7 +579,7 @@ for engine in ("system", "portable"):
                 executable.write_text(probe)
                 executable.chmod(0o755)
             env = dict(os.environ, DSR_DEADLINE_CASE=str(case), DSR_DEADLINE_MODE=mode,
-                       PATH=str(case / "bin") + os.pathsep + os.environ["PATH"], NO_COLOR="1")
+                       PATH=str(case / "bin") + os.pathsep + paths[engine], NO_COLOR="1")
             result = subprocess.run(["bash", "-c", driver, "_", str(module), engine, consumer],
                                     env=env, input="", text=True, capture_output=True, timeout=8)
             (case / "stdout").write_text(result.stdout)
@@ -590,51 +601,48 @@ for engine in ("system", "portable"):
                       report["exit_code"] == (0 if mode == "quick" else 124) and
                       report["latest_version"] == "1.2.3")
 
-# Public callers may wrap a transport in an unexported function. GNU timeout
-# cannot execute that function, so exercise the actual inherited definition.
+# Public callers may wrap a transport in an unexported function. Exercise the
+# actual inherited definition both with and without external timeout commands.
 public_driver = r'''
 source "$1/guardrails.sh" || exit 90
-if [[ "$2" == portable ]]; then _dsr_timeout_cmd() { printf ''; }; fi
 secret_value='retained local value'
 payload() { printf '<%s> <%s>\n' "$secret_value" "$1"; cat; return 23; }
 run_with_timeout 1 payload 'space argument'
 '''
 for engine in ("system", "portable"):
     result = subprocess.run(["bash", "-c", public_driver, "_", str(module), engine],
-                            input="original stdin\n", text=True, capture_output=True, timeout=5)
+                            input="original stdin\n", text=True, capture_output=True, timeout=5,
+                            env=environment(engine))
     check(engine + ": public API preserves unexported function, arguments, stdin and status",
           result.returncode == 23 and
           result.stdout == "<retained local value> <space argument>\noriginal stdin\n")
     function_deadline = subprocess.run(["bash", "-c", r'''
 source "$1/guardrails.sh" || exit 90
-if [[ "$2" == portable ]]; then _dsr_timeout_cmd() { printf ''; }; fi
 payload() { sleep 2; printf 'late\n'; }
 run_with_timeout 0.2 payload
-''', "_", str(module), engine], capture_output=True, text=True, timeout=8)
+''', "_", str(module), engine], capture_output=True, text=True, timeout=8, env=environment(engine))
     check(engine + ": unexported function cannot run beyond its deadline",
           function_deadline.returncode == 124 and function_deadline.stdout == "")
     builtin = subprocess.run(["bash", "-c", r'''
 source "$1/guardrails.sh" || exit 90
-if [[ "$2" == portable ]]; then _dsr_timeout_cmd() { printf ''; }; fi
 run_with_timeout 1 printf '<%s>\n' 'space argument' ''
-''', "_", str(module), engine], capture_output=True, text=True, timeout=5)
+''', "_", str(module), engine], capture_output=True, text=True, timeout=5, env=environment(engine))
     check(engine + ": public API preserves shell builtin arguments",
           builtin.returncode == 0 and builtin.stdout == "<space argument>\n<>\n")
     sleep_override = subprocess.run(["bash", "-c", r'''
 source "$1/guardrails.sh" || exit 90
-if [[ "$2" == portable ]]; then _dsr_timeout_cmd() { printf ''; }; fi
 sleep() { printf 'caller sleep must not control the deadline\n' >&2; return 0; }
 run_with_timeout 1 bash -c 'command sleep 0.1; printf "completed\n"'
-''', "_", str(module), engine], capture_output=True, text=True, timeout=5)
+''', "_", str(module), engine], capture_output=True, text=True, timeout=5, env=environment(engine))
     check(engine + ": internal clock bypasses caller backoff functions",
           sleep_override.returncode == 0 and sleep_override.stdout == "completed\n" and
           "caller sleep" not in sleep_override.stderr)
     for duration in ("0", "0.00", "-1", "bad", "1m"):
         refused = subprocess.run(["bash", "-c", r'''
 source "$1/guardrails.sh" || exit 90
-if [[ "$2" == portable ]]; then _dsr_timeout_cmd() { printf ''; }; fi
 run_with_timeout "$3" printf 'must not start\n'
-''', "_", str(module), engine, duration], capture_output=True, text=True, timeout=5)
+''', "_", str(module), engine, duration], capture_output=True, text=True, timeout=5,
+            env=environment(engine))
         check(engine + ": invalid deadline refuses before execution: " + duration,
               refused.returncode == 4 and refused.stdout == "")
 
@@ -666,7 +674,6 @@ time.sleep(30)
 ''')
 anchor_driver = r'''
 source "$1/guardrails.sh" || exit 90
-if [[ "$2" == portable ]]; then _dsr_timeout_cmd() { printf ''; }; fi
 run_with_timeout 15 "$3" "$4" "$5" "$6"
 '''
 for engine in ("system", "portable"):
@@ -678,7 +685,7 @@ for engine in ("system", "portable"):
         result = subprocess.run(
             ["bash", "-c", anchor_driver, "_", str(module), engine,
              sys.executable, str(anchor_payload), str(case), str(int(signum))],
-            input="", text=True, capture_output=True, timeout=23)
+            input="", text=True, capture_output=True, timeout=23, env=environment(engine))
         elapsed = time.monotonic() - began
         (case / "stdout").write_text(result.stdout)
         (case / "stderr").write_text(result.stderr)
@@ -722,6 +729,85 @@ PY
   fi
 }
 
+test_timeout_provider_independence() {
+  if ! command -v python3 >/dev/null; then
+    printf '%s\n' 'SKIP: timeout provider regression requires python3'
+    return
+  fi
+  ((TESTS_RUN++))
+  if python3 - "${DSR_TEST_GUARDRAILS:-$PROJECT_ROOT/src/guardrails.sh}" <<'PY'
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+
+module = Path(sys.argv[1]).resolve()
+root = Path(tempfile.mkdtemp(prefix="dsr-timeout-providers-"))
+print("Retained timeout provider fixture: " + str(root), flush=True)
+bash = shutil.which("bash")
+sleep = shutil.which("sleep")
+assert bash and sleep, "the real Bash and sleep executables are required"
+portable = root / "without-timeout"
+portable.mkdir()
+(portable / "sleep").symlink_to(sleep)
+unusable = root / "unusable-timeout"
+unusable.mkdir()
+calls = root / "provider-calls"
+for name in ("timeout", "gtimeout"):
+    executable = unusable / name
+    executable.write_text('#!/bin/sh\nprintf "called\\n" >> "$DSR_TEST_TIMEOUT_CALLS"\nexit 99\n')
+    executable.chmod(0o755)
+paths = {"system": os.environ["PATH"], "without-timeout": str(portable),
+         "unusable-timeout": str(unusable) + os.pathsep + str(portable)}
+# An actual provider (for example the official uutils 0.10.0 binary) can be
+# supplied without downloading tools or substituting its signal semantics.
+selected = os.environ.get("DSR_TEST_TIMEOUT_EXECUTABLE", "")
+if selected:
+    executable = Path(selected).resolve(strict=True)
+    assert executable.is_file() and os.access(executable, os.X_OK)
+    provider = root / "selected-provider"
+    provider.mkdir()
+    (provider / "timeout").symlink_to(executable)
+    paths["selected-provider"] = str(provider) + os.pathsep + str(portable)
+
+checks = failures = 0
+for provider, path in paths.items():
+    for ignored in (False, True):
+        def inherited_signal():
+            signal.signal(signal.SIGINT, signal.SIG_IGN if ignored else signal.SIG_DFL)
+        cases = [("exit-" + str(code), "raise SystemExit(" + str(code) + ")", code)
+                 for code in (0, 2, 23)]
+        cases += [(name, "import os,signal; signal.signal(signal." + name +
+                   ",signal.SIG_DFL); os.kill(os.getpid(),signal." + name + ")", 128 + int(number))
+                  for name, number in (("SIGINT", signal.SIGINT), ("SIGTERM", signal.SIGTERM),
+                                       ("SIGPIPE", signal.SIGPIPE))]
+        for name, program, expected in cases:
+            label = provider + "/" + ("ignored-INT" if ignored else "default-INT") + "/" + name
+            result = subprocess.run([bash, "-c", 'source "$1" || exit 90; run_with_timeout 3 "$2" -c "$3"',
+                                     "_", str(module), sys.executable, program],
+                                    env=dict(os.environ, PATH=path, DSR_TEST_TIMEOUT_CALLS=str(calls)),
+                                    capture_output=True, text=True, preexec_fn=inherited_signal, timeout=8)
+            valid = result.returncode == expected and result.stdout == ""
+            checks += 1
+            failures += not valid
+            print(("PASS " if valid else "FAIL ") + label + ": expected " + str(expected) +
+                  ", observed " + str(result.returncode), flush=True)
+checks += 1
+failures += calls.exists()
+print(("FAIL " if calls.exists() else "PASS ") + "external timeout providers are never invoked", flush=True)
+print("Timeout providers: %d checks, %d failures" % (checks, failures), flush=True)
+raise SystemExit(bool(failures))
+PY
+  then
+    pass "Actual command statuses survive timeout provider and inherited signal differences"
+  else
+    fail "Timeout provider independence"
+  fi
+}
+
 # Cleanup
 cleanup() {
   rm -rf "$TEMP_DIR"
@@ -734,6 +820,11 @@ trap cleanup EXIT
 
 echo "Running guardrails module tests..."
 echo ""
+
+if [[ "${1:-}" == --timeout-providers-only ]]; then
+  test_timeout_provider_independence
+  [[ $TESTS_FAILED -eq 0 ]] && exit 0 || exit 1
+fi
 
 # Bash version tests
 test_require_bash_4_passes
@@ -769,8 +860,9 @@ test_is_non_interactive_with_ci
 test_is_non_interactive_with_flag
 test_confirm_uses_default_in_ci
 
-# Real public consumers with and without GNU timeout
+# Real public consumers with and without external timeout executables.
 test_command_deadline_consumers
+test_timeout_provider_independence
 
 # The same inherited lock domain with util-linux or Python, including crashes.
 test_descriptor_lock_backends

@@ -351,27 +351,8 @@ _HH_CLOCK_DRIFT_WARN=30      # Warn if clock drift > 30 seconds
 _HH_SSH_TIMEOUT=10           # SSH connect timeout (seconds)
 _HH_CMD_TIMEOUT=30           # Command execution timeout (seconds)
 
-# Timeout helper (supports GNU timeout and coreutils gtimeout)
-_HH_TIMEOUT_CMD=""
-_hh_timeout_cmd() {
-    if [[ -n "$_HH_TIMEOUT_CMD" ]]; then
-        echo "$_HH_TIMEOUT_CMD"
-        return 0
-    fi
-
-    if command -v timeout &>/dev/null; then
-        _HH_TIMEOUT_CMD="timeout"
-    elif command -v gtimeout &>/dev/null; then
-        _HH_TIMEOUT_CMD="gtimeout"
-    else
-        _HH_TIMEOUT_CMD=""
-    fi
-
-    echo "$_HH_TIMEOUT_CMD"
-}
-
 _hh_run_with_timeout() {
-    _dsr_run_with_timeout _hh_timeout_cmd "$@"
+    run_with_timeout "$@"
 }
 
 # Colors for output (if not disabled)

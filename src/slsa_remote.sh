@@ -385,7 +385,7 @@ _slr_parallel_payloads() (
                 for descriptor in "${writers[@]}" "${readers[@]}"; do
                     eval "exec ${descriptor}>&-"
                 done
-                _dsr_timeout_group "$input_fd" "$output_fd" '' "${SBOM_REMOTE_TIMEOUT:-900}" \
+                _dsr_timeout_group "$input_fd" "$output_fd" "${SBOM_REMOTE_TIMEOUT:-900}" \
                     _sbr_download "$repo" "${assets[$index]}" "${hashes[$index]}" "$work" false _slr_pool_transport
             ) < "$pool/$index.control" > "$pool/$index.result" &
             pids[$index]=$!

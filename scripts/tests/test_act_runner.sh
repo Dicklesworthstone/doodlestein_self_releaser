@@ -2602,7 +2602,7 @@ PY
 }
 
 test_timeout_owned_groups() {
-    log_test "Real GNU and portable timeout groups retain descendants until cleanup"
+    log_test "Owned deadline groups retain descendants with and without external timeout tools"
     if python3 - "${DSR_TEST_ACT_RUNNER:-$SRC_DIR/act_runner.sh}" <<'PY'
 import ctypes
 import hashlib
@@ -2611,6 +2611,7 @@ import json
 import os
 from pathlib import Path
 import select
+import shutil
 import signal
 import subprocess
 import sys
@@ -2621,6 +2622,20 @@ module = Path(sys.argv[1]).resolve()
 root = Path(tempfile.mkdtemp(prefix='dsr-timeout-owned-groups-'))
 print('Retained timeout ownership fixture: ' + str(root), flush=True)
 checks = failures = 0
+portable = root / 'without-timeout'
+portable.mkdir()
+for name in ('bash', 'cat', 'date', 'dirname', 'env', 'flock', 'jq', 'mkdir',
+             'ps', 'python3', 'sleep', 'stat', 'uname', 'hostname', 'id',
+             'wc', 'sed', 'sort', 'head', 'tr', 'grep', 'cut', 'basename',
+             'readlink', 'realpath', 'touch', 'chmod', 'mktemp', 'find',
+             'sha256sum', 'shasum'):
+    executable = shutil.which(name)
+    if executable:
+        (portable / name).symlink_to(executable)
+paths = {'system': os.environ['PATH'], 'portable': str(portable)}
+
+def environment(engine):
+    return dict(os.environ, PATH=paths[engine])
 if sys.platform.startswith('linux'):
     libc = ctypes.CDLL(None, use_errno=True)
     if libc.prctl(36, 1, 0, 0, 0) != 0:
@@ -2740,16 +2755,14 @@ driver = root / 'driver.bash'
 driver.write_text(r'''set -uo pipefail
 source "$1" || exit 90
 case_dir="$2" mode="$3" probe="$4" leader="$5" engine="$6"
-if [[ "$engine" == portable ]]; then
-    _act_timeout_cmd() { printf ''; }
-fi
 if [[ "$mode" == wrapper_lost ]]; then
-    selected_timeout=$(_act_timeout_cmd)
-    _act_timeout_cmd() {
-        # This helper runs in command substitution. Replacing that child
-        # makes getppid identify the actual managed wrapper, without ps.
-        exec python3 -c 'import os,pathlib,sys; (pathlib.Path(sys.argv[1])/"wrapper.pid").write_text(str(os.getppid())); print(sys.argv[2])' \
-            "$case_dir" "$selected_timeout"
+    type() {
+        # Observe the actual waiter at its dependency check without changing
+        # that check's result or replacing the production supervisor.
+        if [[ "$#" == 2 && "$1" == -P && "$2" == sleep ]]; then
+            printf '%s\n' "$BASHPID" > "$case_dir/wrapper.pid"
+        fi
+        builtin type "$@"
     }
 elif [[ "$mode" == watchdog_lost ]]; then
     watchdog_definition=$(declare -f _dsr_timeout_watchdog)
@@ -2806,7 +2819,8 @@ try:
                 process = subprocess.Popen(['bash', str(driver), str(module), str(case),
                                             mode, str(probe), str(leader), engine],
                                            stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                           start_new_session=True, preexec_fn=fixture_signals)
+                                           start_new_session=True, preexec_fn=fixture_signals,
+                                           env=environment(engine))
                 if not until(lambda: (case / 'descendant.json').exists() and
                              (case / 'descendant.json').stat().st_size > 0):
                     raise RuntimeError('command descendant did not start')
@@ -2875,9 +2889,6 @@ try:
     io_driver.write_text(r'''set -uo pipefail
 source "$1" || exit 90
 case_dir="$2" monitor="$3" engine="$4"
-if [[ "$engine" == portable ]]; then
-    _act_timeout_cmd() { printf ''; }
-fi
 [[ "$monitor" != on ]] || set -m
 exec 10< "$case_dir/fd-input" 11> "$case_dir/fd-output"
 coproc FOREIGN_TIMEOUT_TEST {
@@ -2913,7 +2924,7 @@ exit 37
         (case / 'fd-input').write_text('fd-input\n')
         result = subprocess.run(['bash', str(io_driver), str(module), str(case), monitor, engine],
                                 input='real-stdin\n', text=True, capture_output=True, timeout=10,
-                                preexec_fn=fixture_signals)
+                                preexec_fn=fixture_signals, env=environment(engine))
         (case / 'stdout').write_text(result.stdout)
         (case / 'stderr').write_text(result.stderr)
         check(label + ': preserve status, monitor, signal trap and foreign coprocess', result.returncode == 37)
@@ -2924,37 +2935,34 @@ exit 37
         check(label + ': preserve real stderr', 'real-stderr\n' in result.stderr)
         payload = b'large stdin with binary bytes\x00\xff\n' * 65536
         large = subprocess.run(['bash', '-c', r'''source "$1"
-if [[ "$2" == portable ]]; then _act_timeout_cmd() { printf ''; }; fi
 _act_run_with_timeout 5 python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())'
-''', '_', str(module), engine], input=payload, capture_output=True, timeout=10)
+''', '_', str(module), engine], input=payload, capture_output=True, timeout=10, env=environment(engine))
         check(label + ': large binary stdin is streamed unchanged',
               large.returncode == 0 and large.stdout.strip().decode() == hashlib.sha256(payload).hexdigest())
     fallback = subprocess.run(['bash', '-c', r'''source "$1"
-_act_timeout_cmd() { printf ''; }
 payload() { printf 'fallback:<%s>\n' "$1"; cat; return 23; }
 _act_run_with_timeout 1 payload 'space argument'
-''', '_', str(module)], input='fallback stdin\n', text=True, capture_output=True, timeout=5)
+''', '_', str(module)], input='fallback stdin\n', text=True, capture_output=True, timeout=5,
+        env=environment('portable'))
     check('portable timeout preserves direct function status', fallback.returncode == 23)
     check('portable timeout preserves direct function arguments and streams',
           fallback.stdout == 'fallback:<space argument>\nfallback stdin\n')
     missing_sleep = subprocess.run(['bash', '-c', r'''source "$1"
-_act_timeout_cmd() { printf ''; }
 command() {
     if [[ "${1:-}" == -v && "${2:-}" == sleep ]]; then return 1; fi
     builtin command "$@"
 }
 payload() { printf 'must not start\n'; }
 _act_run_with_timeout 1 payload
-''', '_', str(module)], text=True, capture_output=True, timeout=5)
+''', '_', str(module)], text=True, capture_output=True, timeout=5, env=environment('portable'))
     check('missing portable timer dependency refuses before the payload',
           missing_sleep.returncode == 3 and missing_sleep.stdout == '' and
           'sleep is required' in missing_sleep.stderr)
     for duration in ('', '0', '0.00', '-1', 'bad', '1m'):
         invalid = subprocess.run(['bash', '-c', r'''source "$1"
-_act_timeout_cmd() { printf ''; }
 payload() { printf 'must not start\n'; }
 _act_run_with_timeout "$2" payload
-''', '_', str(module), duration], text=True, capture_output=True, timeout=5)
+''', '_', str(module), duration], text=True, capture_output=True, timeout=5, env=environment('portable'))
         check('portable timeout rejects invalid bound ' + repr(duration),
               invalid.returncode == 4 and invalid.stdout == '')
 finally:

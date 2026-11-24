@@ -26,6 +26,18 @@ binary = work / 'bin'
 binary.mkdir()
 checks = failures = 0
 print('SBOM lifecycle fixtures: ' + str(work), flush=True)
+portable = work / 'without-timeout'
+portable.mkdir()
+# Keep real scanner dependencies while exercising a host with no timer CLI.
+for directory in os.get_exec_path():
+    source = Path(directory or '.').absolute()
+    if not source.is_dir():
+        continue
+    for executable in source.iterdir():
+        target = portable / executable.name
+        if executable.name not in ('timeout', 'gtimeout') and not target.exists() and \
+                executable.is_file() and os.access(executable, os.X_OK):
+            target.symlink_to(executable)
 document = dict(spdxVersion='SPDX-2.3', dataLicense='CC0-1.0', SPDXID='SPDXRef-DOCUMENT',
                 name='scanner-fixture', documentNamespace='https://example.test/lifecycle',
                 creationInfo=dict(creators=['Tool: process-fixture'], created='2026-11-14T00:00:00Z'),
@@ -72,7 +84,6 @@ source "$1/src/guardrails.sh" || exit 3
 source "$2" || exit 3
 engine=$3 action=$4
 shift 4
-if [[ "$engine" == portable ]]; then _dsr_timeout_cmd() { printf ''; }; fi
 if [[ "$engine" == strict-caller ]]; then set -e -o posix; export SHELLOPTS; fi
 case "$action" in
     version) sbom_version ;;
@@ -101,7 +112,8 @@ def run(case, engine='gnu', action='generate', mode='healthy', seconds='1', args
         args = [] if action == 'version' else [case / 'input.bin', '--output', case / 'proof.json']
     number = len(list(case.glob('invocation-*.json')))
     out, err = case / ('stdout-'+str(number)), case / ('stderr-'+str(number))
-    env = dict(os.environ, PATH=str(binary)+':'+os.environ['PATH'], DSR_SBOM_TIMEOUT=seconds,
+    path = str(portable) if engine == 'portable' else os.environ['PATH']
+    env = dict(os.environ, PATH=str(binary)+':'+path, DSR_SBOM_TIMEOUT=seconds,
                SBOM_OUTPUT_DIR='', SBOM_LIFECYCLE_CASE=str(case), SBOM_LIFECYCLE_MODE=mode,
                SBOM_LIFECYCLE_DOCUMENT=str(work / 'document.json'))
     started = time.monotonic()

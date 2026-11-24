@@ -42,27 +42,8 @@ CANARY_STATE_DIR="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/ca
 # Timeout for each test (seconds)
 CANARY_TIMEOUT=300
 
-# Timeout helper (supports GNU timeout and coreutils gtimeout)
-_CANARY_TIMEOUT_CMD=""
-_canary_timeout_cmd() {
-    if [[ -n "$_CANARY_TIMEOUT_CMD" ]]; then
-        echo "$_CANARY_TIMEOUT_CMD"
-        return 0
-    fi
-
-    if command -v timeout &>/dev/null; then
-        _CANARY_TIMEOUT_CMD="timeout"
-    elif command -v gtimeout &>/dev/null; then
-        _CANARY_TIMEOUT_CMD="gtimeout"
-    else
-        _CANARY_TIMEOUT_CMD=""
-    fi
-
-    echo "$_CANARY_TIMEOUT_CMD"
-}
-
 _canary_run_with_timeout() {
-    _dsr_run_with_timeout _canary_timeout_cmd "$@"
+    run_with_timeout "$@"
 }
 
 # Shell-escape a string for safe remote execution (single-quote strategy)

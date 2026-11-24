@@ -2696,29 +2696,9 @@ _act_validate_contract_source_identity() {
     return 0
 }
 
-# Prefer GNU timeout/coreutils gtimeout; the owned group also has a portable
-# watchdog for coordinators where neither executable is installed.
-_ACT_TIMEOUT_CMD=""
-_act_timeout_cmd() {
-    if [[ -n "$_ACT_TIMEOUT_CMD" ]]; then
-        echo "$_ACT_TIMEOUT_CMD"
-        return 0
-    fi
-
-    if command -v timeout &>/dev/null; then
-        _ACT_TIMEOUT_CMD="timeout"
-    elif command -v gtimeout &>/dev/null; then
-        _ACT_TIMEOUT_CMD="gtimeout"
-    else
-        _ACT_TIMEOUT_CMD=""
-    fi
-
-    echo "$_ACT_TIMEOUT_CMD"
-}
-
 # Shared ownership also protects health probes and post-release verification.
 _act_run_with_timeout() {
-    _dsr_run_with_timeout _act_timeout_cmd "$@"
+    run_with_timeout "$@"
 }
 
 # Return the first act config file in a home directory that has --bind without
@@ -3508,19 +3488,14 @@ act_run_workflow() {
     local start_time
     start_time=$(date +%s)
 
-    # Run act with timeout
-    # Use PIPESTATUS to capture the actual command exit code, not tee's
-    local timeout_cmd
-    timeout_cmd=$(_act_timeout_cmd)
-    if [[ -z "$timeout_cmd" ]]; then
-        _log_info "GNU timeout not available; supervising act with the portable deadline"
-    fi
+    # Run act with the shared owned watchdog. PIPESTATUS retains the actual
+    # command exit rather than tee's diagnostic-stream status.
     if [[ "$source_layout" != null ]] && ! act_source_verify "$source_layout"; then
         _log_error "Pinned workflow source evidence changed before execution"
         return 4
     fi
     # The shared wrapper owns a separate process group, forwards orchestration
-    # cancellation into it, and waits for escalation with either timer engine.
+    # cancellation into it, and waits for its bounded cleanup to complete.
     if [[ -n "$isolated_home" ]]; then
         HOME="$isolated_home" \
         XDG_CONFIG_HOME="$isolated_home/.config" \

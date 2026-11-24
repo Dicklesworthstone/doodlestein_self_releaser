@@ -81,7 +81,7 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/dsr-ssh-large-program.XXXXXXXX") || exit 1
 log_info "Retained fixtures: $WORK"
 mkdir -p "$WORK/bin"
 
-# A recording ssh executable (a shell function would not survive `timeout`).
+# A recording ssh executable exercises the same process boundary as real SSH.
 cat > "$WORK/bin/ssh" <<'MOCK'
 #!/usr/bin/env bash
 printf '%s\n' "$@" > "$DSR_TEST_SSH_DIR/ssh.args"
@@ -289,10 +289,6 @@ done')
 
 test_large_program_timeout_status() {
     local program rc=0 started elapsed
-    if [[ -z "$(_act_timeout_cmd)" ]]; then
-        log_info "SKIP large program timeout: no timeout command on this host"
-        return
-    fi
     TEST_LOCAL_HOST=true
     program=$(padded_program 'sleep 30')
     started=$(date +%s)

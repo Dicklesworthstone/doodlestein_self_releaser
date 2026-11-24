@@ -149,15 +149,6 @@ PY
 # Owned Command Deadlines
 # ============================================================================
 
-_dsr_timeout_cmd() {
-    if command -v timeout >/dev/null 2>&1; then
-        printf '%s\n' timeout
-    elif command -v gtimeout >/dev/null 2>&1; then
-        printf '%s\n' gtimeout
-    fi
-    return 0
-}
-
 # The timer reports deadlines over its private pipe, never to a reusable PID.
 # The live group anchor owns every termination signal, including cleanup of
 # this timer and its sleeps. Its stdin is separate from the command's input.
@@ -181,12 +172,13 @@ _dsr_timeout_watchdog() {
     IFS= read -r control || true
 }
 
-# A GNU timeout leader can exit before a resistant descendant, abandoning its
-# kill-after timer. Keep timeout --foreground and all ordinary descendants in
-# the group of this live anchor. The portable engine uses that same ownership.
+# Keep the command and its watchdog in the group of this live anchor. External
+# timeout implementations can rewrite signal exits (including uutils when the
+# caller inherited ignored SIGINT), and their leaders can exit before resistant
+# descendants. Observe the actual command and own the deadline independently.
 _dsr_timeout_group() {
-    local input_fd="$1" output_fd="$2" timeout_command="$3" seconds="$4"
-    shift 4
+    local input_fd="$1" output_fd="$2" seconds="$3"
+    shift 3
     [[ "$input_fd" =~ ^[0-9]+$ && "$output_fd" =~ ^[0-9]+$ ]] || return 4
     local group_pid="$BASHPID" child="" finished=false cancelled=false
     local control="" running="" status=0 read_status=0 cancel_status=0
@@ -206,38 +198,33 @@ _dsr_timeout_group() {
         fi
         return 130
     fi
-    if [[ -z "$timeout_command" ]]; then
-        coproc _DSR_TIMEOUT_WATCHDOG {
-            eval "exec ${input_fd}<&- ${output_fd}>&-"
-            _dsr_timeout_watchdog "$seconds"
-        }
-        watchdog_read="${_DSR_TIMEOUT_WATCHDOG[0]:-}"
-        watchdog_write="${_DSR_TIMEOUT_WATCHDOG[1]:-}"
-        watchdog_pid="${_DSR_TIMEOUT_WATCHDOG_PID:-}"
-        if [[ ! "$watchdog_read" =~ ^[0-9]+$ || ! "$watchdog_write" =~ ^[0-9]+$ ||
-              ! "$watchdog_pid" =~ ^[1-9][0-9]*$ ]] ||
-           ! IFS= read -r -u "$watchdog_read" watchdog_message ||
-           [[ "$watchdog_message" != ready ]] || $cancelled; then
-            trap '' INT TERM HUP PIPE
-            if (( cancel_status != 0 )); then
-                printf 'exit:%s\n' "$cancel_status" || true
-            fi
-            kill -KILL -- "-$group_pid" 2>/dev/null || true
-            return 4
+    coproc _DSR_TIMEOUT_WATCHDOG {
+        eval "exec ${input_fd}<&- ${output_fd}>&-"
+        _dsr_timeout_watchdog "$seconds"
+    }
+    watchdog_read="${_DSR_TIMEOUT_WATCHDOG[0]:-}"
+    watchdog_write="${_DSR_TIMEOUT_WATCHDOG[1]:-}"
+    watchdog_pid="${_DSR_TIMEOUT_WATCHDOG_PID:-}"
+    if [[ ! "$watchdog_read" =~ ^[0-9]+$ || ! "$watchdog_write" =~ ^[0-9]+$ ||
+          ! "$watchdog_pid" =~ ^[1-9][0-9]*$ ]] ||
+       ! IFS= read -r -u "$watchdog_read" watchdog_message ||
+       [[ "$watchdog_message" != ready ]] || $cancelled; then
+        trap '' INT TERM HUP PIPE
+        if (( cancel_status != 0 )); then
+            printf 'exit:%s\n' "$cancel_status" || true
         fi
+        kill -KILL -- "-$group_pid" 2>/dev/null || true
+        return 4
     fi
     (
         eval "exec ${input_fd}<&- ${output_fd}>&-"
-        if [[ -n "$timeout_command" ]]; then
-            exec "$timeout_command" --foreground --kill-after=5 "$seconds" "$@"
-        else
-            # External commands replace this PID so an intermediate shell
-            # cannot hide a still-running, TERM-resistant command leader.
-            case "$(type -t -- "$1")" in
-                function|builtin) "$@" ;;
-                *) exec "$@" ;;
-            esac
-        fi
+        # External commands replace this PID so an intermediate shell cannot
+        # hide a still-running, TERM-resistant command leader. Functions and
+        # builtins retain their inherited shell definitions and environment.
+        case "$(type -t -- "$1")" in
+            function|builtin) "$@" ;;
+            *) exec "$@" ;;
+        esac
     ) <&"$input_fd" >&"$output_fd" &
     child=$!
     eval "exec ${input_fd}<&- ${output_fd}>&-"
@@ -280,7 +267,7 @@ _dsr_timeout_group() {
                     if [[ "$watchdog_message" == force ]]; then
                         status=137
                     else
-                        printf '%s\n' '[dsr] Portable timeout watchdog could not maintain its deadline' >&2
+                        printf '%s\n' '[dsr] Timeout watchdog could not maintain its deadline' >&2
                         status=125
                     fi
                     finished=true
@@ -313,24 +300,19 @@ _dsr_timeout_group() {
     return 4
 }
 
-# Private entry point lets existing callers retain their timer-selection hook.
-# Resolve it INSIDE the waiting subshell so the parent-lifetime channel always
-# belongs to the process that selected the engine and actually waits for it.
+# The parent-lifetime channel belongs to the process that actually waits for
+# the command. The watchdog is authoritative on every host; neither timeout
+# availability nor its implementation changes command or cancellation status.
 _dsr_run_with_timeout() (
-    [[ $# -ge 3 ]] || return 4
-    local selector="$1" seconds="$2" cmd
-    shift 2
+    [[ $# -ge 2 ]] || return 4
+    local seconds="$1"
+    shift
     if [[ ! "$seconds" =~ ^[0-9]+([.][0-9]+)?$ || -z "${seconds//[0.]/}" ]]; then
         printf '[dsr] Timeout requires a positive duration in seconds: %s\n' "$seconds" >&2
         return 4
     fi
-    cmd=$("$selector") || return 3
-    # GNU timeout cannot execute an unexported shell function or builtin.
-    # The forked portable engine retains their real definitions and environment.
-    case "$(type -t -- "$1")" in function|builtin) cmd="" ;; esac
-    if [[ -z "$cmd" ]] &&
-       { ! command -v sleep >/dev/null 2>&1 || ! type -P sleep >/dev/null 2>&1; }; then
-        printf '%s\n' '[dsr] sleep is required to supervise commands without timeout or gtimeout' >&2
+    if ! command -v sleep >/dev/null 2>&1 || ! type -P sleep >/dev/null 2>&1; then
+        printf '%s\n' '[dsr] sleep is required to supervise command deadlines' >&2
         return 3
     fi
 
@@ -387,7 +369,7 @@ _dsr_run_with_timeout() (
     set -m
     launch_pending=true
     coproc _DSR_TIMEOUT_GROUP {
-        _dsr_timeout_group "$input_fd" "$output_fd" "$cmd" "$seconds" "$@"
+        _dsr_timeout_group "$input_fd" "$output_fd" "$seconds" "$@"
     }
     timeout_pid="${_DSR_TIMEOUT_GROUP_PID:-}"
     result_fd="${_DSR_TIMEOUT_GROUP[0]:-}"
@@ -418,7 +400,7 @@ _dsr_run_with_timeout() (
 # Completion retains command status; deadline exits are 124 or escalated 137.
 # Missing dependencies/invalid bounds refuse before launching the command.
 run_with_timeout() {
-    _dsr_run_with_timeout _dsr_timeout_cmd "$@"
+    _dsr_run_with_timeout "$@"
 }
 
 # ============================================================================
@@ -834,7 +816,7 @@ export -f is_non_interactive confirm
 export -f dsr_native_rch_policy dsr_native_rch_environment_policy
 export -f dsr_lock_available dsr_lock_fd
 export -f _gh_operation_interrupted
-export -f run_with_timeout _dsr_timeout_cmd _dsr_run_with_timeout
+export -f run_with_timeout _dsr_run_with_timeout
 export -f _dsr_timeout_group _dsr_timeout_watchdog
 
 export EXIT_SUCCESS EXIT_DEPENDENCY_ERROR EXIT_INVALID_ARGS

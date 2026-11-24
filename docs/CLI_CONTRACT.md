@@ -946,14 +946,16 @@ Timed local commands also remain in an owned process group. A command leader
 exiting does not abandon a descendant that ignored termination; cleanup finishes
 before the timeout wrapper returns its actual command or deadline status.
 The timed command retains its original stdin, including staged script input.
-When neither `timeout` nor `gtimeout` is installed, a Bash watchdog enforces
-the positive duration in seconds and the same five-second escalation. It
-preserves shell functions, argument boundaries and inherited descriptors.
+A Bash watchdog enforces the positive duration in seconds and five-second
+escalation on every host. Installed `timeout` or `gtimeout` implementations
+cannot change the command's exit or signal status. The supervisor preserves
+shell functions, argument boundaries and inherited descriptors.
 An unavailable timer or lost watchdog refuses the operation instead of
 allowing it to continue without a deadline.
 Host-health probes, installer canaries and upgrade verification use the same
-owned deadline supervisor. Their configured time limits still apply without
-GNU timeout, and a probe's early success text cannot override its timeout status.
+owned deadline supervisor. Their configured time limits apply independently
+of external timeout tools, and a probe's early success text cannot override its
+timeout status.
 Queued tasks that have never run report
 `status: "skipped"` and `attempt: 0`, without a log or result path. They remain
 pending in run state, so exact-run resume starts their first attempt while
