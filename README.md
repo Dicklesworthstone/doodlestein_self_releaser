@@ -1485,6 +1485,7 @@ dsr watch                                       # Default: check every 60s
 dsr watch --interval 30 --auto-fallback         # Auto-trigger on throttle
 dsr watch --auto-fallback --max-concurrent 4    # Admit up to four fallback pipelines
 dsr watch --auto-fallback --max-concurrent 2 --jobs 4  # Four target builds per release
+dsr watch --auto-fallback --prerelease         # Publish automatic fallbacks as prereleases
 dsr watch --notify desktop                      # Desktop notifications
 ```
 
@@ -1516,6 +1517,13 @@ registry entry cannot override a disabled per-tool repository. Explicit
 manual diagnosis and recovery; `enabled` controls watcher automation.
 
 The watcher admits at most two fallback pipelines at once by default;
+`--prerelease` selects the publication channel explicitly; a tag such as
+`v1.2.3-rc.1` does not select it automatically. The watcher passes that choice
+to fallback and records `prerelease_requested` in its JSON results, deferred
+work and attempt journal. Restart with the same choice to recover a retained
+run: changing the channel withholds that run without spending its retry budget.
+Report-only and dry-run modes show the selection without launching a worker.
+
 `--max-concurrent` accepts 1–32. Target builds within each fallback remain serial
 unless `--parallel` / `-p`, `--parallel=N`, or `--jobs N` is selected. Bare
 `--parallel` uses `DSR_BUILD_PARALLELISM`, defaulting to 2; explicit counts accept

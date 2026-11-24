@@ -557,6 +557,7 @@ dsr watch [--interval <seconds>] [--auto-fallback] [--notify <method>]
 |------|---------|-------------|
 | `--interval` | 60 | Check interval in seconds |
 | `--auto-fallback` | false | Auto-trigger fallback on throttle |
+| `--prerelease` | false | Publish automatic fallbacks as prereleases; retain that choice across retries |
 | `--max-attempts` | 3 | Maximum attempts per observed run, from 1 through 10 |
 | `--retry-delay` | 60 | Initial retry cooldown in seconds, from 1 through 3600 |
 | `--max-concurrent` | 2 | Active watcher fallback pipelines, from 1 through 32 |
@@ -564,6 +565,22 @@ dsr watch [--interval <seconds>] [--auto-fallback] [--notify <method>]
 | `--parallel=N`, `--jobs N` | 1 | Explicit target concurrency per fallback, from 1 through 32 |
 | `--once` | false | Check once using the same exclusive lock and recovery journal |
 | `--notify` | none | Notification: slack\|discord\|desktop\|none |
+
+`--prerelease` explicitly selects prerelease publication for automatic fallbacks.
+The default remains stable publication; a version suffix such as `-rc.1` does
+not infer this option. It is also accepted in report-only and dry-run modes,
+where it appears in plans and suggested fallback commands without enabling
+automatic execution. Once and continuous JSON report
+`details.prerelease_requested` for the current watcher invocation.
+
+Started attempts and capacity-deferred candidates retain their own
+`prerelease_requested` value. Restarting with a different choice withholds those
+candidates without replacing their retained identity or spending retry budget.
+Repeat the original choice to recover them, or use explicit manual fallback
+after inspecting their publication state. Legacy journals lacking this field
+retain the historical stable default. A completed prerelease attempt must
+report both the requested policy and confirmed prerelease publication before
+the watcher admits success.
 
 Target scheduling is serial by default, including when `DSR_BUILD_PARALLELISM`
 is set. Only bare `--parallel` / `-p` selects that environment default; unset or

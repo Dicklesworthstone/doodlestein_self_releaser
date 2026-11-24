@@ -1045,7 +1045,7 @@ case "$1" in
         # real arguments supply invocation identity; no watcher state is read
         # or manufactured by the fixture.
         tool="$4"; shift 4
-        version="" source="" output="" admission="" parallel_jobs=1
+        version="" source="" output="" admission="" parallel_jobs=1 prerelease=false
         while (($#)); do
             case "$1" in
                 --version) version="$2"; shift 2 ;;
@@ -1053,6 +1053,7 @@ case "$1" in
                 --output-dir) output="$2"; shift 2 ;;
                 --watch-admission) admission="$2"; shift 2 ;;
                 --jobs) parallel_jobs="$2"; shift 2 ;;
+                --prerelease) prerelease=true; shift ;;
                 --isolate-source|--resume=*) shift ;;
                 *) exit 99 ;;
             esac
@@ -1060,10 +1061,11 @@ case "$1" in
         rc="${DSR_WATCH_FIXTURE_STATUS:-0}"
         receipt=$(jq -nc --arg tool "$tool" --arg version "$version" --arg sha "$source" \
             --arg output "$output" --arg run "$DSR_RUN_ID" --argjson admission "$admission" --argjson rc "$rc" \
-            --argjson parallel_jobs "$parallel_jobs" '
+            --argjson parallel_jobs "$parallel_jobs" --argjson prerelease "$prerelease" '
             {command:"fallback",status:(if $rc == 0 then "success" elif $rc == 1 then "partial" else "error" end),
              exit_code:$rc,details:{tool:$tool,repo:$admission.repo,version:$version,expected_sha:$sha,
                output_dir:$output,run_id:$run,build_only:false,watch_admission:$admission,parallel_jobs:$parallel_jobs,
+               prerelease_requested:$prerelease,prerelease:$prerelease,
                phase:(if $rc == 0 then "complete" else "build" end),
                phases:{release:(if $rc == 0 then "success" else "blocked" end)}}}') || exit 99
         case "${DSR_WATCH_FIXTURE_RECEIPT:-valid}" in
@@ -1080,6 +1082,11 @@ case "$1" in
             wrong-jobs) receipt=$(jq '.details.parallel_jobs += 1' <<< "$receipt") ;;
             missing-jobs) receipt=$(jq 'del(.details.parallel_jobs)' <<< "$receipt") ;;
             string-jobs) receipt=$(jq '.details.parallel_jobs |= tostring' <<< "$receipt") ;;
+            wrong-prerelease) receipt=$(jq '.details.prerelease_requested |= not' <<< "$receipt") ;;
+            missing-prerelease) receipt=$(jq 'del(.details.prerelease_requested)' <<< "$receipt") ;;
+            string-prerelease) receipt=$(jq '.details.prerelease_requested |= tostring' <<< "$receipt") ;;
+            stable-publication) receipt=$(jq '.details.prerelease=false' <<< "$receipt") ;;
+            observed-prerelease) receipt=$(jq '.details.prerelease=true' <<< "$receipt") ;;
             wrong-exit) receipt=$(jq '.exit_code += 1' <<< "$receipt") ;;
             wrong-status) receipt=$(jq '.status="error"' <<< "$receipt") ;;
             unpublished) receipt=$(jq '.details.phases.release="blocked"' <<< "$receipt") ;;
@@ -1338,7 +1345,12 @@ cmd_build() {
 cmd_release() {
     printf 'published\n' >> "$TEST_TMPDIR/release.calls" || return 4
     act_get_local_path ntm > "$TEST_TMPDIR/release-source" || return 4
-    printf '%s\n' '{"command":"release","status":"success","exit_code":0,"details":{"repo":"Dicklesworthstone/ntm","tag":"v1.2.3","release_id":9,"draft":false,"prerelease":false}}'
+    printf '%s\0' "$@" >> "$TEST_TMPDIR/release.args" || return 4
+    local prerelease=false argument
+    for argument in "$@"; do [[ "$argument" != --prerelease ]] || prerelease=true; done
+    jq -nc --argjson prerelease "$prerelease" '
+        {command:"release",status:"success",exit_code:0,
+         details:{repo:"Dicklesworthstone/ntm",tag:"v1.2.3",release_id:9,draft:false,prerelease:$prerelease}}'
 }
 cmd_fallback "$@"
 EOF
@@ -2251,11 +2263,13 @@ PY
 # execute unchanged. Faults alter only the child's result channel.
 _watch_refuse_completion_receipt() {
     local mode="$1" child_status="${2:-0}" check_json attempt directory
+    local -a prerelease_args=()
+    [[ "${3:-false}" != true ]] || prerelease_args=(--prerelease)
     harness_create_config
     _watch_configure_ntm
     check_json=$(_watch_run_json)
     DSR_WATCH_FIXTURE_RECEIPT="$mode" DSR_WATCH_FIXTURE_STATUS="$child_status" \
-        run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+        run _routing_watch "$check_json" --auto-fallback --retry-delay 1 ${prerelease_args[@]+"${prerelease_args[@]}"}
     assert_equal 0 "$status"
     _watch_completed
     attempt=$(jq -r '.attempts["12345"].attempt_id' "$DSR_STATE_DIR/triggered.json")
@@ -2263,7 +2277,7 @@ _watch_refuse_completion_receipt() {
     cp "$directory/result.json" "$TEST_TMPDIR/retained-result.json"
     cp "$directory/completion.json" "$TEST_TMPDIR/retained-completion.json"
 
-    run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    run _routing_watch "$check_json" --auto-fallback --retry-delay 1 ${prerelease_args[@]+"${prerelease_args[@]}"}
     assert_equal 0 "$status"
     assert_equal blocked "$(jq -r '.attempts["12345"].status' "$DSR_STATE_DIR/triggered.json")"
     jq -e --argjson rc "$child_status" '.attempts["12345"] |
@@ -2528,7 +2542,7 @@ esac
 # An ordinary build refusal has a complete error report, unlike a crash.
 # Bind that report to the actual child invocation before returning exit 6.
 tool="$1"; shift
-version="" source="" output="" admission="" parallel_jobs=1
+version="" source="" output="" admission="" parallel_jobs=1 prerelease=false
 while (($#)); do
     case "$1" in
         --version) version="$2"; shift 2 ;;
@@ -2536,16 +2550,18 @@ while (($#)); do
         --output-dir) output="$2"; shift 2 ;;
         --watch-admission) admission="$2"; shift 2 ;;
         --jobs) parallel_jobs="$2"; shift 2 ;;
+        --prerelease) prerelease=true; shift ;;
         --isolate-source|--resume=*) shift ;;
         *) exit 99 ;;
     esac
 done
 jq -nc --arg tool "$tool" --arg version "$version" --arg sha "$source" \
     --arg output "$output" --arg run "$DSR_RUN_ID" --argjson admission "$admission" \
-    --argjson parallel_jobs "$parallel_jobs" '
+    --argjson parallel_jobs "$parallel_jobs" --argjson prerelease "$prerelease" '
     {command:"fallback",status:"error",exit_code:6,
      details:{tool:$tool,repo:$admission.repo,version:$version,expected_sha:$sha,
        output_dir:$output,run_id:$run,build_only:false,watch_admission:$admission,parallel_jobs:$parallel_jobs,
+       prerelease_requested:$prerelease,prerelease:$prerelease,
        phase:"build",phases:{release:"blocked"}}}' || exit 99
 exit 6
 EOF
@@ -3631,6 +3647,208 @@ EOF
 
 @test "watch target parallelism refuses a string instead of a numeric result bound" {
     _watch_refuse_completion_receipt string-jobs
+}
+
+
+@test "watch prerelease plans explicit publication without enabling workers or writing state" {
+    harness_create_config
+    _watch_configure_ntm
+    run --separate-stderr _routing_watch "$(_watch_run_json)" --prerelease --dry-run
+    assert_equal 0 "$status"
+    jq -e '.details | .prerelease_requested == true and .auto_fallback == false' <<< "$output"
+    [[ "$stderr" == *"dsr fallback ntm --version v1.2.3 --prerelease"* ]]
+    run --separate-stderr _routing_watch "$(_watch_run_json)" --auto-fallback --prerelease --dry-run
+    assert_equal 0 "$status"
+    jq -e '.details | .prerelease_requested == true and .dry_run == true and .active_attempts == 0' <<< "$output"
+    [[ "$stderr" == *"Would trigger fallback for ntm --version v1.2.3 --prerelease"* ]]
+    DSR_WATCH_FIXTURE_CONTINUOUS=1 run --separate-stderr _routing_watch \
+        '{"details":{"throttled":[]}}' --prerelease --dry-run
+    assert_equal 0 "$status"
+    jq -e '.details | .mode == "continuous" and .prerelease_requested == true' <<< "$output"
+    [[ ! -e "$TEST_TMPDIR/fallback.args" && ! -e "$DSR_STATE_DIR/triggered.json" &&
+       ! -e "$DSR_STATE_DIR/watch.lock" && ! -e "$DSR_STATE_DIR/watch-attempts" ]]
+}
+
+@test "watch prerelease reaches the real isolated fallback and publication boundary" {
+    _watch_isolated_pipeline_fixture
+    run --separate-stderr _routing_watch "$(_watch_run_json "$DSR_WATCH_PINNED_SHA")" \
+        --auto-fallback --prerelease
+    assert_equal 0 "$status"
+    _watch_completed
+    local directory
+    directory="$DSR_STATE_DIR/watch-attempts/$(jq -r '.attempts["12345"].attempt_id' "$DSR_STATE_DIR/triggered.json")"
+    jq -Rse 'split("\u0000") | index("--prerelease") != null' "$TEST_TMPDIR/fallback.args"
+    jq -Rse 'split("\u0000") | index("--prerelease") != null' "$TEST_TMPDIR/release.args"
+    jq -e '.details.prerelease_requested == true and .details.prerelease == true and
+        .details.isolated_source == true and .details.phases.release == "success"' "$directory/result.json"
+    jq -e '.exit_code == 0 and .result_status == "valid"' "$directory/completion.json"
+    run _routing_watch '{"details":{"throttled":[]}}'
+    assert_equal 0 "$status"
+    jq -e '.attempts["12345"] | .prerelease_requested == true and .status == "succeeded"' \
+        "$DSR_STATE_DIR/triggered.json"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/release.calls" | tr -d ' ')"
+}
+
+@test "watch prerelease defaults do not infer publication mode from version suffixes" {
+    harness_create_config
+    _watch_configure_ntm
+    run --separate-stderr _routing_watch \
+        "$(_watch_run_json | jq '.details.throttled[0].head_branch="v1.2.3-rc.1"')" --auto-fallback
+    assert_equal 0 "$status"
+    _watch_completed
+    jq -e '.details.prerelease_requested == false and
+        .details.triggered_state.attempts["12345"].prerelease_requested == false' <<< "$output"
+    jq -Rse 'split("\u0000") | index("--prerelease") == null' "$TEST_TMPDIR/fallback.args"
+}
+
+@test "watch prerelease defaults preserve an existing prerelease observed by ordinary fallback" {
+    harness_create_config
+    _watch_configure_ntm
+    DSR_WATCH_FIXTURE_RECEIPT=observed-prerelease run _routing_watch "$(_watch_run_json)" --auto-fallback
+    assert_equal 0 "$status"
+    _watch_completed
+    run _routing_watch '{"details":{"throttled":[]}}'
+    assert_equal 0 "$status"
+    jq -e '.attempts["12345"] | .prerelease_requested == false and .status == "succeeded"' \
+        "$DSR_STATE_DIR/triggered.json"
+}
+
+_watch_prerelease_retry() {
+    local requested="$1" check_json directory
+    local -a original=() changed=(--prerelease)
+    if [[ "$requested" == true ]]; then original=(--prerelease); changed=(); fi
+    harness_create_config
+    _watch_configure_ntm
+    check_json=$(_watch_run_json)
+    DSR_WATCH_FIXTURE_STATUS=6 run _routing_watch "$check_json" --auto-fallback --retry-delay 1 \
+        ${original[@]+"${original[@]}"}
+    assert_equal 0 "$status"
+    _watch_completed
+    directory="$DSR_STATE_DIR/watch-attempts/$(jq -r '.attempts["12345"].attempt_id' "$DSR_STATE_DIR/triggered.json")"
+    cp "$directory/result.json" "$TEST_TMPDIR/original-result.json"
+    cp "$directory/completion.json" "$TEST_TMPDIR/original-completion.json"
+    run _routing_watch '{"details":{"throttled":[]}}' --retry-delay 1
+    assert_equal 0 "$status"
+    cp "$DSR_STATE_DIR/triggered.json" "$TEST_TMPDIR/original-journal.json"
+    sleep 1
+    run --separate-stderr _routing_watch "$check_json" --auto-fallback --retry-delay 1 \
+        ${changed[@]+"${changed[@]}"}
+    assert_equal 0 "$status"
+    [[ "$stderr" == *"different prerelease selection"* ]]
+    cmp "$TEST_TMPDIR/original-journal.json" "$DSR_STATE_DIR/triggered.json"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    run _routing_watch "$check_json" --auto-fallback --retry-delay 1 ${original[@]+"${original[@]}"}
+    assert_equal 0 "$status"
+    _watch_completed
+    jq -e --argjson requested "$requested" '.attempts["12345"] |
+        .attempt == 2 and .prerelease_requested == $requested and .head_sha == ("1" * 40)' \
+        "$DSR_STATE_DIR/triggered.json"
+    cmp "$TEST_TMPDIR/original-result.json" "$directory/result.json"
+    cmp "$TEST_TMPDIR/original-completion.json" "$directory/completion.json"
+    assert_equal 2 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+}
+
+@test "watch prerelease retry cannot drop the original explicit selection" {
+    _watch_prerelease_retry true
+}
+
+@test "watch prerelease retry cannot add a different publication selection" {
+    _watch_prerelease_retry false
+}
+
+@test "watch prerelease deferral retains its selection across restarts and upstream recovery" {
+    harness_create_config
+    _watch_configure_ntm
+    local check_json first_status original
+    check_json=$(_watch_multiple_runs_json | jq '.details.throttled |= [.[1], .[0]]')
+    DSR_WATCH_FIXTURE_WAIT="$TEST_TMPDIR/finish-child" run --separate-stderr _routing_watch \
+        "$check_json" --auto-fallback --max-concurrent 1 --prerelease
+    first_status=$status
+    touch "$TEST_TMPDIR/finish-child"
+    _watch_completed 12346
+    assert_equal 0 "$first_status"
+    run _routing_watch '{"details":{"throttled":[]}}'
+    assert_equal 0 "$status"
+    jq -e '.pending["12345"].prerelease_requested == true and
+        .attempts["12346"].prerelease_requested == true and .attempts["12346"].status == "succeeded"' \
+        "$DSR_STATE_DIR/triggered.json"
+    original=$(cat "$DSR_STATE_DIR/triggered.json")
+    _mock_watch_upstream_run "$(_watch_upstream_run_json completed failure)"
+    run --separate-stderr _routing_watch '{"details":{"throttled":[]}}' --auto-fallback
+    assert_equal 0 "$status"
+    [[ "$stderr" == *"different prerelease selection"* ]]
+    assert_equal "$original" "$(cat "$DSR_STATE_DIR/triggered.json")"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+    run _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --prerelease
+    assert_equal 0 "$status"
+    _watch_completed
+    jq -e '.pending == {} and (.attempts["12345"] |
+        .attempt == 1 and .prerelease_requested == true and .watch_admission.reason == "upstream_failure")' \
+        "$DSR_STATE_DIR/triggered.json"
+    jq -Rse 'split("\u0000") | map(select(. == "--prerelease")) | length == 2' "$TEST_TMPDIR/fallback.args"
+}
+
+@test "watch prerelease legacy retry keeps the historical default and original receipts" {
+    harness_create_config
+    _watch_configure_ntm
+    local check_json directory
+    check_json=$(_watch_run_json)
+    DSR_WATCH_FIXTURE_STATUS=6 run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal 0 "$status"
+    _watch_completed
+    directory="$DSR_STATE_DIR/watch-attempts/$(jq -r '.attempts["12345"].attempt_id' "$DSR_STATE_DIR/triggered.json")"
+    jq 'del(.attempts["12345"].prerelease_requested)' "$DSR_STATE_DIR/triggered.json" > "$TEST_TMPDIR/legacy-journal.json"
+    mv "$TEST_TMPDIR/legacy-journal.json" "$DSR_STATE_DIR/triggered.json"
+    cp "$directory/result.json" "$TEST_TMPDIR/legacy-result.json"
+    cp "$directory/completion.json" "$TEST_TMPDIR/legacy-completion.json"
+    run _routing_watch '{"details":{"throttled":[]}}' --retry-delay 1
+    assert_equal 0 "$status"
+    cp "$DSR_STATE_DIR/triggered.json" "$TEST_TMPDIR/reconciled-journal.json"
+    sleep 1
+    run --separate-stderr _routing_watch "$check_json" --auto-fallback --retry-delay 1 --prerelease
+    assert_equal 0 "$status"
+    [[ "$stderr" == *"different prerelease selection"* ]]
+    cmp "$TEST_TMPDIR/reconciled-journal.json" "$DSR_STATE_DIR/triggered.json"
+    run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal 0 "$status"
+    _watch_completed
+    jq -e '.attempts["12345"] | .attempt == 2 and .prerelease_requested == false' "$DSR_STATE_DIR/triggered.json"
+    cmp "$TEST_TMPDIR/legacy-result.json" "$directory/result.json"
+    cmp "$TEST_TMPDIR/legacy-completion.json" "$directory/completion.json"
+    jq -Rse 'split("\u0000") | index("--prerelease") == null' "$TEST_TMPDIR/fallback.args"
+}
+
+@test "watch prerelease rejects malformed retained selections without rewriting history" {
+    harness_create_config
+    _watch_configure_ntm
+    _watch_large_history
+    cp "$DSR_STATE_DIR/triggered.json" "$TEST_TMPDIR/valid-history.json"
+    local value
+    for value in null 0 1 '"true"' '[]' '{}'; do
+        jq --argjson selected "$value" '.attempts["100499"].prerelease_requested=$selected' \
+            "$TEST_TMPDIR/valid-history.json" > "$DSR_STATE_DIR/triggered.json"
+        cp "$DSR_STATE_DIR/triggered.json" "$TEST_TMPDIR/invalid-selection.json"
+        run _routing_watch "$(_watch_run_json)" --auto-fallback
+        assert_equal 4 "$status"
+        cmp "$TEST_TMPDIR/invalid-selection.json" "$DSR_STATE_DIR/triggered.json"
+        [[ ! -e "$TEST_TMPDIR/fallback.args" && ! -e "$TEST_TMPDIR/watch-check.started" ]]
+    done
+}
+
+@test "watch prerelease refuses a child receipt for a different explicit selection" {
+    _watch_refuse_completion_receipt wrong-prerelease
+}
+
+@test "watch prerelease refuses a new child receipt missing its selection" {
+    _watch_refuse_completion_receipt missing-prerelease
+}
+
+@test "watch prerelease refuses a nonboolean child selection" {
+    _watch_refuse_completion_receipt string-prerelease
+}
+
+@test "watch prerelease refuses stable publication when prerelease was requested" {
+    _watch_refuse_completion_receipt stable-publication 0 true
 }
 
 @test "watch recovery refuses source identity changes and legacy unknown outcomes" {
