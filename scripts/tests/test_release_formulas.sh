@@ -7,7 +7,8 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 source "$PROJECT_ROOT/src/github.sh"
-source "$PROJECT_ROOT/src/release_formulas.sh"
+# shellcheck source=src/release_formulas.sh
+source "${FORMULAS_TEST_MODULE:-$PROJECT_ROOT/src/release_formulas.sh}"
 
 ROOT=$(mktemp -d "${TMPDIR:-/tmp}/dsr-formulas-tests.XXXXXXXX") || exit 1
 # Retain fixtures and diagnostics for failed-test investigation.
@@ -34,6 +35,7 @@ export GIT_CONFIG_GLOBAL=/dev/null
 export NO_COLOR=1
 
 CASE="" SCENARIO="" API_CALLS="" GIT_CALLS="" TAG_CALLS=""
+FORMULA_INTERRUPT_STAGE='' FORMULA_INTERRUPT_CODE=130
 SHA=0123456789abcdef0123456789abcdef01234567
 HASH=""
 
@@ -42,6 +44,7 @@ seed() {
     mkdir -p "$CASE/homebrew-source/Formula" "$CASE/scoop-source/bucket" "$CASE/config" "$CASE/tmp"
     API_CALLS="$CASE/api.calls" GIT_CALLS="$CASE/git.calls" TAG_CALLS="$CASE/tag.calls"
     : > "$API_CALLS"; : > "$GIT_CALLS"; : > "$TAG_CALLS"
+    : > "$CASE/operations"
     printf 'verified release bytes\n' > "$CASE/payload"
     HASH=$(sha256sum "$CASE/payload" | awk '{print $1}')
     cat > "$CASE/homebrew-source/Formula/tool.rb" <<'RUBY'
@@ -122,12 +125,17 @@ git_ops_version_to_tag() { printf 'v%s\n' "${1#v}"; }
 _gh_asset_sha256() { sha256sum "$1" | awk '{print $1}'; }
 gh_resolve_tag_sha() {
     printf 'tag\n' >> "$TAG_CALLS"
+    formula_interrupt initial-tag || return $?
+    if [[ $(wc -l < "$TAG_CALLS") -gt 1 ]]; then
+        formula_interrupt revalidate-tag || return $?
+    fi
     if [[ "$SCENARIO" == moved-tag && $(wc -l < "$TAG_CALLS") -gt 1 ]]; then
         printf '1111111111111111111111111111111111111111\n'
     else printf '%s\n' "$SHA"; fi
 }
 _gh_find_release_asset() {
     printf 'asset %s %s %s\n' "$1" "$2" "$3" >> "$API_CALLS"
+    formula_interrupt find-asset || return $?
     local result
     [[ "$SCENARIO" != missing-arm || "$3" != *aarch64-pc-windows* ]] || return 1
     result=$(jq -c --arg name "$3" '[.[] | select(.name==$name)]' "$CASE/assets.json") || return 8
@@ -136,6 +144,7 @@ _gh_find_release_asset() {
 }
 gh_download_release_asset() {
     printf 'download %s %s\n' "$1" "$2" >> "$API_CALLS"
+    formula_interrupt download || return $?
     [[ "$SCENARIO" != download-fails ]] || return 8
     [[ ! -e "$3" ]] || return 4
     if [[ "$SCENARIO" == wrong-bytes ]]; then printf 'altered release bytes!\n' > "$3"
@@ -146,15 +155,18 @@ gh_api() {
     printf 'api %s %s\n' "$endpoint" "${2:-}" >> "$API_CALLS"
     case "$endpoint" in
         repos/owner/tool/releases/tags/*|repos/owner/tool/releases/9)
+            formula_interrupt release-read || return $?
             [[ "$SCENARIO" != missing-release ]] || return 8
             jq -nc --argjson draft "$([[ "$SCENARIO" == draft-release ]] && echo true || echo false)" \
                 '{id:9,tag_name:"v1.0.1",draft:$draft,assets:[]}' ;;
         repos/owner/tool/releases/assets/*)
+            formula_interrupt asset-read || return $?
             id="${endpoint##*/}"
             if [[ "$SCENARIO" == changed-asset ]]; then
                 jq -c --argjson id "$id" '.[] | select(.id==$id) | .name="changed-name"' "$CASE/assets.json"
             else jq -c --argjson id "$id" '.[] | select(.id==$id)' "$CASE/assets.json"; fi ;;
         repos/owner/homebrew-tap/contents/*|repos/owner/scoop-bucket/contents/*)
+            formula_interrupt recipe-read || return $?
             path="${endpoint#*/contents/}"
             manager=homebrew
             [[ "$endpoint" != *scoop-bucket* ]] || manager=scoop
@@ -168,7 +180,7 @@ gh_api() {
 # disabling). Only route its network clone URLs to private real bare repos.
 git() {
     local -a args=()
-    local arg manager=homebrew is_commit=false is_push=false
+    local arg manager=homebrew is_commit=false is_push=false operation=''
     for arg in "$@"; do
         case "$arg" in
             https://github.com/owner/homebrew-tap.git) arg="$CASE/homebrew.git" ;;
@@ -177,12 +189,24 @@ git() {
             commit) is_commit=true ;;
             push) is_push=true ;;
         esac
+        case "$arg" in clone|symbolic-ref|add|commit|rev-parse|push) operation="$arg" ;; esac
         args+=("$arg")
     done
     printf '%s\n' "${args[*]}" >> "$GIT_CALLS"
+    formula_interrupt "$manager-$operation" || return $?
     [[ ! ( "$SCENARIO" == commit-fails && "$is_commit" == true ) ]] || return 1
     [[ ! ( "$SCENARIO" == push-fails && "$is_push" == true && "$manager" == scoop ) ]] || return 1
-    command git "${args[@]}"
+    command git "${args[@]}" || return $?
+    formula_interrupt "$manager-$operation-accepted"
+}
+
+formula_interrupt() {
+    local stage="$1"
+    printf '%s\n' "$stage" >> "$CASE/operations"
+    if [[ "$FORMULA_INTERRUPT_STAGE" == "$stage" ]]; then
+        printf 'interrupted %s %s\n' "$stage" "$FORMULA_INTERRUPT_CODE" >> "$CASE/operations"
+        return "$FORMULA_INTERRUPT_CODE"
+    fi
 }
 
 invoke() {
@@ -195,6 +219,121 @@ invoke() {
 }
 remote_sha() { command git --git-dir="$CASE/$1.git" rev-parse refs/heads/main; }
 no_pushes() { ! grep -q ' push ' "$GIT_CALLS"; }
+
+# Real bare repositories make an accepted-but-interrupted push distinguishable
+# from an ordinary failure. The stopped invocation must never advance to the
+# next manager, and an explicit new invocation must reconcile the actual branch.
+formula_cancellation_cases() {
+    local stage code before_brew before_scoop workspace count_before
+    for stage in release-read initial-tag recipe-read find-asset download asset-read revalidate-tag; do
+        seed "cancel-$stage" || return 1
+        before_brew=$(remote_sha homebrew); before_scoop=$(remote_sha scoop)
+        FORMULA_INTERRUPT_STAGE="$stage" FORMULA_INTERRUPT_CODE=130
+        invoke true
+        check "$stage preserves public interruption status" equal "$RESULT" 5
+        check "$stage retains original interruption evidence" json_is "$CASE/output.json" \
+            '.exit_code==5 and .details.operation_exit_code==130'
+        check "$stage stops before another adapter operation" equal "$(tail -1 "$CASE/operations")" "interrupted $stage 130"
+        check "$stage cannot change Homebrew" equal "$(remote_sha homebrew)" "$before_brew"
+        check "$stage cannot change Scoop" equal "$(remote_sha scoop)" "$before_scoop"
+        FORMULA_INTERRUPT_STAGE=''
+    done
+    for stage in homebrew-clone homebrew-add homebrew-commit-accepted homebrew-push homebrew-push-accepted scoop-push-accepted; do
+        seed "cancel-$stage" || return 1
+        before_brew=$(remote_sha homebrew); before_scoop=$(remote_sha scoop)
+        FORMULA_INTERRUPT_STAGE="$stage" FORMULA_INTERRUPT_CODE=143
+        invoke false --push
+        check "$stage preserves public interruption status" equal "$RESULT" 5
+        check "$stage retains original interruption evidence" json_is "$CASE/output.json" \
+            '.exit_code==5 and .details.operation_exit_code==143'
+        check "$stage stops before another adapter operation" equal "$(tail -1 "$CASE/operations")" "interrupted $stage 143"
+        if [[ "$stage" != scoop-push-accepted ]]; then
+            check "$stage never publishes the next manager" equal "$(remote_sha scoop)" "$before_scoop"
+        else
+            check 'terminal interruption preserves the first confirmed push without a partial-success envelope' \
+                json_is "$CASE/output.json" '.status=="error" and .exit_code==5 and
+                    .details.pushed==true and .details.homebrew.status=="pushed" and .details.scoop.status=="interrupted"'
+        fi
+        if [[ "$stage" == *push-accepted ]]; then
+            check "$stage fixture performed a real remote push" test "$(remote_sha homebrew)" != "$before_brew"
+            check "$stage reports the unacknowledged push honestly" json_is "$CASE/output.json" \
+                '(.details.homebrew.status=="interrupted" and .details.homebrew.push_outcome=="uncertain") or
+                 (.details.scoop.status=="interrupted" and .details.scoop.push_outcome=="uncertain")'
+        fi
+        if [[ "$stage" != homebrew-clone ]]; then
+            workspace=$(jq -r '.details.work_dir' "$CASE/output.json")
+            check "$stage retains its private working evidence" test -s "$workspace/result.json"
+        fi
+        FORMULA_INTERRUPT_STAGE=''
+        count_before=$(grep -c ' push ' "$GIT_CALLS" || true)
+        invoke false --push
+        check "$stage explicit recovery succeeds" equal "$RESULT" 0
+        check "$stage recovery publishes complete recipes" bash -c \
+            'git --git-dir="$1" show main:Formula/tool.rb | grep -q "version \"1.0.1\"" &&
+             git --git-dir="$2" show main:bucket/tool.json | jq -e ".version==\"1.0.1\"" >/dev/null' \
+            _ "$CASE/homebrew.git" "$CASE/scoop.git"
+        if [[ "$stage" == homebrew-push-accepted ]]; then
+            check 'accepted interrupted Homebrew push is not repeated on explicit retry' \
+                equal "$(grep -c ' push ' "$GIT_CALLS")" "$((count_before+1))"
+        fi
+    done
+    # Distinguish cancelled/supervisor statuses from ordinary Git 128 and
+    # network failure; ordinary errors retain the existing partial behavior.
+    for code in 2 5 124 125 129 137 141; do
+        seed "cancel-download-$code" || return 1
+        FORMULA_INTERRUPT_STAGE=download FORMULA_INTERRUPT_CODE="$code"
+        invoke true --skip-homebrew
+        check "download status $code remains terminal" equal "$RESULT" 5
+        check "download status $code is retained" json_is "$CASE/output.json" \
+            ".details.operation_exit_code==$code"
+        check "download status $code stops later calls" equal "$(tail -1 "$CASE/operations")" "interrupted download $code"
+        FORMULA_INTERRUPT_STAGE=''
+    done
+}
+
+formula_routing_cases() {
+    local caller before_index before_ref sentinel work
+    seed routing || return 1
+    caller="$CASE/caller"
+    mkdir -p "$caller/bucket" "$CASE/ambient-template"
+    command git init -q -b main "$caller" || return 1
+    printf 'caller work must survive\n' > "$caller/bucket/tool.json"
+    command git -C "$caller" add . || return 1
+    command git -C "$caller" commit -qm caller || return 1
+    printf 'unstaged caller edit\n' >> "$caller/bucket/tool.json"
+    before_index=$(sha256sum "$caller/.git/index")
+    before_ref=$(command git -C "$caller" rev-parse HEAD)
+    sentinel=$(sha256sum "$caller/bucket/tool.json")
+    printf '[core]\nworktree = %s\n' "$caller" > "$CASE/ambient-template/config"
+    # All variables are scoped to the command's existing subshell. Local test
+    # setup and independent observations retain their real repository routing.
+    (
+        export GIT_DIR="$caller/.git" GIT_COMMON_DIR="$caller/.git" GIT_WORK_TREE="$caller"
+        export GIT_INDEX_FILE="$caller/.git/index" GIT_OBJECT_DIRECTORY="$caller/.git/objects"
+        export GIT_TEMPLATE_DIR="$CASE/ambient-template" GIT_CONFIG_COUNT=1
+        export GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0="$caller"
+        invoke false --skip-homebrew --push
+        printf '%s\n' "$RESULT" > "$CASE/routing-status"
+    )
+    check 'formula publication ignores caller Git routing' equal "$(cat "$CASE/routing-status")" 0
+    check 'caller Git index is byte-identical after formula publication' equal "$(sha256sum "$caller/.git/index")" "$before_index"
+    check 'caller branch is unchanged after formula publication' equal "$(command git -C "$caller" rev-parse HEAD)" "$before_ref"
+    check 'caller working file is untouched after formula publication' equal "$(sha256sum "$caller/bucket/tool.json")" "$sentinel"
+    check 'only the selected Scoop repository receives the new recipe' bash -c \
+        'git --git-dir="$1" show main:bucket/tool.json | jq -e ".version==\"1.0.1\"" >/dev/null' _ "$CASE/scoop.git"
+    work=$(jq -r '.details.work_dir' "$CASE/output.json")
+    if [[ -d "$work/scoop/.git" ]]; then
+        check 'private formula repository owns its index and objects' bash -c \
+            'test -f "$1/.git/index" && test -d "$1/.git/objects" && test ! -e "$1/.git/objects/info/alternates"' _ "$work/scoop"
+    else check 'private formula repository owns its index and objects' false; fi
+}
+
+case "${FORMULAS_TEST_SCOPE:-all}" in
+    cancellation) formula_cancellation_cases; printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"; [[ "$FAIL" -eq 0 ]]; exit $? ;;
+    routing) formula_routing_cases; printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"; [[ "$FAIL" -eq 0 ]]; exit $? ;;
+    all) ;;
+    *) printf 'Unknown formula test scope\n' >&2; exit 4 ;;
+esac
 
 seed dry-run || exit 1
 before_brew=$(remote_sha homebrew); before_scoop=$(remote_sha scoop)
@@ -426,6 +565,9 @@ status=0
 JSON_MODE=false cmd_release_formulas --help > "$CASE/help.out" || status=$?
 check 'help succeeds without authentication or network' equal "$status" 0
 check 'help documents usage and manager options' grep -q -- '--homebrew-tap' "$CASE/help.out"
+
+formula_routing_cases
+formula_cancellation_cases
 
 printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

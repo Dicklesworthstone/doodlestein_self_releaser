@@ -15,23 +15,65 @@ _formulas_error() {
     return "$code"
 }
 
+_formulas_operation_error() {
+    local status="$1" fallback="$2" message="$3" workspace="${4:-}"
+    if _gh_operation_interrupted "$status"; then
+        log_error "$message (interrupted operation, exit $status)"
+        if [[ "${JSON_MODE:-false}" == true ]]; then
+            json_envelope release-formulas error 5 \
+                "$(jq -nc --arg error "$message" --arg work "$workspace" --argjson status "$status" \
+                    '{error:$error,operation_exit_code:$status,pushed:false,
+                      work_dir:(if $work=="" then null else $work end)}')"
+        fi
+        return 5
+    fi
+    _formulas_error "$fallback" "$message"
+}
+
+# An adapter cancellation is not an ordinary unavailable recipe/release. Keep
+# its original status until the public command records it and stops. In
+# particular, raw curl 5 is normalized by the download adapter before this
+# policy is applied, while Git's ordinary fatal status 128 remains retryable.
+_formulas_failure_status() {
+    if _gh_operation_interrupted "$1"; then return "$1"; fi
+    return "$2"
+}
+
 # Git credentials are scoped to this invocation, not written to global config
-# or embedded in URLs. Disable hooks so editing a recipe never executes it.
-_formulas_git() {
-    local token
-    token=$(_gh_resolve_token) || return 3
-    DSR_FORMULAS_GIT_TOKEN="$token" GIT_TERMINAL_PROMPT=0 \
-        git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+# or embedded in URLs. Keep user identity and URL settings, but isolate all
+# repository/index plumbing and injected configuration from the caller. The
+# selected clone owns its worktree even with an ambient core.worktree setting.
+_formulas_git() (
+    set +x
+    local token status=0 worktree=''
+    token=$(_gh_resolve_token) || status=$?
+    ((status == 0)) || { _formulas_failure_status "$status" 3; return $?; }
+    unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE
+    unset GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+    unset GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT
+    unset GIT_IMPLICIT_WORK_TREE GIT_PREFIX GIT_SHALLOW_FILE GIT_GRAFT_FILE
+    unset GIT_NAMESPACE GIT_REPLACE_REF_BASE GIT_TEMPLATE_DIR
+    unset GIT_GLOB_PATHSPECS GIT_NOGLOB_PATHSPECS GIT_ICASE_PATHSPECS
+    export GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1 GIT_LITERAL_PATHSPECS=1
+    case "${1:-}" in
+        -C) worktree="${2:-}" ;;
+        clone) worktree="${*: -1}" ;;
+    esac
+    [[ -n "$worktree" && "$worktree" == /* ]] || return 4
+    DSR_FORMULAS_GIT_TOKEN="$token" \
+        git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c submodule.recurse=false \
+        -c "core.worktree=$worktree" \
         -c credential.helper= \
         -c 'credential.helper=!f() { if [ "$1" = get ]; then printf "%s\n" "username=x-access-token" "password=$DSR_FORMULAS_GIT_TOKEN"; fi; }; f' \
         "$@"
-}
+)
 
 # Read a recipe without cloning or creating commits (dry-run). The contents
 # endpoint must identify the exact regular file requested, not a symlink/array.
 _formulas_fetch_recipe() {
-    local repo="$1" path="$2" destination="$3" response
-    response=$(gh_api "repos/$repo/contents/$path" --no-cache) || return 8
+    local repo="$1" path="$2" destination="$3" response status=0
+    response=$(gh_api "repos/$repo/contents/$path" --no-cache) || status=$?
+    ((status == 0)) || { _formulas_failure_status "$status" 8; return $?; }
     jq -es --arg path "$path" 'length == 1 and (.[0] |
         type == "object" and .type == "file" and .path == $path and
         .encoding == "base64" and (.content | type == "string"))' \
@@ -278,7 +320,7 @@ _formulas_plan_assets() {
     local repo="$1" tag="$2" release_id="$3" scan="$4" work="$5"
     local prefix="https://github.com/$repo/releases/download/"
     local url base rest old_tag old_name name fragment asset id size hash digest old_version new_tag
-    local cached receipt actual_size after plan_json
+    local cached receipt actual_size after plan_json status
     jq -es 'length == 1 and (.[0] | type == "object" and
         (.version == null or (.version | type) == "string") and
         (.urls | type == "array" and all(.[]; type == "string")))' \
@@ -317,10 +359,12 @@ _formulas_plan_assets() {
                  ($oldver | escaped) + ")(?=$|[-_.])") as $pattern |
              $name | gsub($pattern; .prefix +
                  (if .value == $oldtag then $newtag else $ver end))') || return 4
-        asset=$(_gh_find_release_asset "$repo" "$release_id" "$name") || {
+        status=0
+        asset=$(_gh_find_release_asset "$repo" "$release_id" "$name") || status=$?
+        if ((status != 0)); then
             log_error "No unambiguous release asset for recipe: $name"
-            return 7
-        }
+            _formulas_failure_status "$status" 7; return $?
+        fi
         jq -es --arg name "$name" 'length == 1 and (.[0] |
             .name == $name and .state == "uploaded" and
             (.id | type == "number" and floor == . and . > 0 and . <= 9007199254740991) and
@@ -332,7 +376,7 @@ _formulas_plan_assets() {
             local download_status=0
             gh_download_release_asset "$repo" "$id" "$cached" "$size" || download_status=$?
             ((download_status != 63)) || return 7
-            ((download_status == 0)) || return 8
+            ((download_status == 0)) || { _formulas_failure_status "$download_status" 8; return $?; }
             [[ -f "$cached" && ! -L "$cached" ]] || return 7
             hash=$(_gh_asset_sha256 "$cached") || return 3
             actual_size=$(wc -c < "$cached") || return 4
@@ -351,7 +395,9 @@ _formulas_plan_assets() {
         jq -e --argjson asset "$asset" '
             (.asset | {id,name,state,size,digest,created_at,updated_at}) ==
             ($asset | {id,name,state,size,digest,created_at,updated_at})' "$receipt" >/dev/null || return 7
-        after=$(gh_api "repos/$repo/releases/assets/$id" --no-cache) || return 8
+        status=0
+        after=$(gh_api "repos/$repo/releases/assets/$id" --no-cache) || status=$?
+        ((status == 0)) || { _formulas_failure_status "$status" 8; return $?; }
         jq -es --argjson asset "$asset" 'length == 1 and
             (.[0] | {id,name,state,size,digest,created_at,updated_at}) ==
             ($asset | {id,name,state,size,digest,created_at,updated_at})' <<< "$after" >/dev/null || return 7
@@ -366,18 +412,21 @@ _formulas_plan_assets() {
 # Recheck both tag binding and immutable asset identities before publication.
 _formulas_revalidate() {
     local repo="$1" tag="$2" release_id="$3" sha="$4" plan="$5"
-    local release current item id fresh
+    local release current item id fresh status=0
     jq -es 'length == 1 and (.[0] | type == "object" and length > 0)' \
         "$plan" >/dev/null || return 7
-    current=$(gh_resolve_tag_sha "$repo" "$tag") || return 8
+    current=$(gh_resolve_tag_sha "$repo" "$tag") || status=$?
+    ((status == 0)) || { _formulas_failure_status "$status" 8; return $?; }
     [[ "$current" == "$sha" ]] || { log_error "Release tag moved during formula update"; return 7; }
-    release=$(gh_api "repos/$repo/releases/$release_id" --no-cache) || return 8
+    release=$(gh_api "repos/$repo/releases/$release_id" --no-cache) || status=$?
+    ((status == 0)) || { _formulas_failure_status "$status" 8; return $?; }
     jq -es --arg tag "$tag" --argjson id "$release_id" 'length == 1 and
         (.[0] | .id == $id and .tag_name == $tag and .draft == false)' \
         <<< "$release" >/dev/null || return 7
     while IFS= read -r item; do
         id=$(jq -r '.id' <<< "$item") || return 7
-        fresh=$(_gh_find_release_asset "$repo" "$release_id" "$(jq -r '.name' <<< "$item")") || return 7
+        fresh=$(_gh_find_release_asset "$repo" "$release_id" "$(jq -r '.name' <<< "$item")") || status=$?
+        ((status == 0)) || { _formulas_failure_status "$status" 7; return $?; }
         jq -es --argjson before "$item" 'length == 1 and
             (.[0] | {id,name,state,size,digest,created_at,updated_at}) ==
             ($before | {id,name,state,size,digest,created_at,updated_at})' \
@@ -458,7 +507,7 @@ HELP
         return "$authentication_status"
     fi
     act_load_repo_config "$tool_name" >/dev/null || { _formulas_error 4 "Tool not found: $tool_name"; return 4; }
-    local repo tag release release_id source_sha config_file
+    local repo tag release release_id source_sha config_file status=0
     repo=$(act_get_repo "$tool_name") || return 4
     [[ "$repo" == */* ]] || repo="Dicklesworthstone/$repo"
     tag=$(git_ops_version_to_tag "$version") || return 4
@@ -476,9 +525,10 @@ HELP
             _formulas_error 4 "Invalid repository: $dependency"; return 4
         }
     done
-    release=$(gh_api "repos/$repo/releases/tags/$tag" --no-cache) || {
-        _formulas_error 7 "Release not found: $repo $tag"; return 7
-    }
+    release=$(gh_api "repos/$repo/releases/tags/$tag" --no-cache) || status=$?
+    if ((status != 0)); then
+        _formulas_operation_error "$status" 7 "Release observation did not complete: $repo $tag"; return $?
+    fi
     if ! jq -es --arg tag "$tag" 'length == 1 and (.[0] |
         .tag_name == $tag and .draft == false and
         (.id | type == "number" and floor == . and . > 0 and . <= 9007199254740991))' \
@@ -486,7 +536,10 @@ HELP
         _formulas_error 7 "Expected a published release with the exact requested tag"; return 7
     fi
     release_id=$(jq -r '.id' <<< "$release") || return 7
-    source_sha=$(gh_resolve_tag_sha "$repo" "$tag") || { _formulas_error 7 "Cannot bind release tag"; return 7; }
+    source_sha=$(gh_resolve_tag_sha "$repo" "$tag") || status=$?
+    if ((status != 0)); then
+        _formulas_operation_error "$status" 7 'Cannot bind release tag'; return $?
+    fi
     [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || return 7
 
     umask 077
@@ -503,14 +556,15 @@ HELP
         work=$(mktemp -d "$state_root/${tool_name}-${tag}.XXXXXXXX") || return 4
         log_info "Formula workspace: $work"
     fi
-    trap 'exit 5' INT TERM
+    work=$(cd "$work" && pwd -P) || return 4
+    trap 'exit 5' INT TERM HUP
     printf '{}\n' > "$work/plan.json" || return 4
     local -a managers=()
     $skip_homebrew || managers+=(homebrew)
     $skip_scoop || managers+=(scoop)
     local -A repositories=([homebrew]="$homebrew_tap" [scoop]="$scoop_bucket")
     local -A paths=([homebrew]="Formula/$tool_name.rb" [scoop]="bucket/$tool_name.json")
-    local manager recipe path kind status=0
+    local manager recipe path kind
     # Complete preflight for EVERY requested manager before making any commit.
     for manager in "${managers[@]}"; do
         path="${paths[$manager]}"
@@ -519,28 +573,36 @@ HELP
             _formulas_fetch_recipe "${repositories[$manager]}" "$path" "$recipe" || status=$?
         else
             recipe="$work/$manager/$path"
-            _formulas_git clone --depth 1 -- "https://github.com/${repositories[$manager]}.git" \
+            _formulas_git clone --depth 1 --no-recurse-submodules --template= -- "https://github.com/${repositories[$manager]}.git" \
                 "$work/$manager" >&2 || status=$?
             if [[ $status -eq 0 && ( -L "$work/$manager/${path%%/*}" || -L "$recipe" || ! -f "$recipe" ) ]]; then
                 status=4
             fi
         fi
         if [[ $status -ne 0 ]]; then
-            _formulas_error 1 "Cannot load $manager recipe; no repositories were pushed (workspace: $work)"; return 1
+            _formulas_operation_error "$status" 1 "Cannot load $manager recipe; no repositories were pushed" "$work"; return $?
         fi
-        if ! "_formulas_$manager" scan "$recipe" "$work/plan.json" "${tag#v}" > "$work/$manager.scan.json" ||
-           ! _formulas_plan_assets "$repo" "$tag" "$release_id" "$work/$manager.scan.json" "$work" ||
-           ! "_formulas_$manager" apply "$recipe" "$work/plan.json" "${tag#v}" > "$work/$manager.updated"; then
-            _formulas_error 1 "Cannot verify/render $manager recipe; no repositories were pushed (workspace: $work)"; return 1
+        "_formulas_$manager" scan "$recipe" "$work/plan.json" "${tag#v}" > "$work/$manager.scan.json" || status=$?
+        if ((status == 0)); then
+            _formulas_plan_assets "$repo" "$tag" "$release_id" "$work/$manager.scan.json" "$work" || status=$?
+        fi
+        if ((status == 0)); then
+            "_formulas_$manager" apply "$recipe" "$work/plan.json" "${tag#v}" > "$work/$manager.updated" || status=$?
+        fi
+        if ((status != 0)); then
+            _formulas_operation_error "$status" 1 "Cannot verify/render $manager recipe; no repositories were pushed" "$work"; return $?
         fi
     done
-    if ! _formulas_revalidate "$repo" "$tag" "$release_id" "$source_sha" "$work/plan.json"; then
-        _formulas_error 7 "Release changed during preflight; no repositories were pushed"; return 7
+    _formulas_revalidate "$repo" "$tag" "$release_id" "$source_sha" "$work/plan.json" || status=$?
+    if ((status != 0)); then
+        _formulas_operation_error "$status" 7 "Release changed during preflight; no repositories were pushed" "$work"; return $?
     fi
 
     local results='{}' result branch commit changed any_pushed=false failures=0 successes=0
+    local operation_status=0 terminal_status=0 push_attempted=false push_outcome
     for manager in "${managers[@]}"; do
         status=0 changed=false branch="" commit="" kind=planned
+        operation_status=0 push_attempted=false push_outcome=not_attempted
         if [[ "$dry_run" != "true" ]]; then
             path="${paths[$manager]}" recipe="$work/$manager/${paths[$manager]}"
             branch=$(_formulas_git -C "$work/$manager" symbolic-ref --short HEAD) || status=$?
@@ -562,26 +624,52 @@ HELP
             if [[ $status -ne 0 ]]; then kind=commit_failed
             elif ! $changed; then kind=unchanged
             elif ! $push_changes; then kind=committed
-            elif ! _formulas_revalidate "$repo" "$tag" "$release_id" "$source_sha" "$work/plan.json"; then
-                kind=release_changed; status=7
-            elif _formulas_git -C "$work/$manager" push origin "HEAD:refs/heads/$branch" >&2; then
-                kind=pushed; any_pushed=true
-            else kind=push_failed; status=1; fi
+            else
+                _formulas_revalidate "$repo" "$tag" "$release_id" "$source_sha" "$work/plan.json" || status=$?
+                if ((status != 0)); then
+                    kind=release_changed
+                    operation_status="$status"
+                    _formulas_failure_status "$status" 7; status=$?
+                else
+                    push_attempted=true
+                    _formulas_git -C "$work/$manager" push origin "HEAD:refs/heads/$branch" >&2 || status=$?
+                    if ((status == 0)); then
+                        kind=pushed; any_pushed=true; push_outcome=confirmed
+                    else
+                        kind=push_failed; push_outcome=uncertain; operation_status="$status"
+                        _formulas_failure_status "$status" 1; status=$?
+                    fi
+                fi
+            fi
+        fi
+        if _gh_operation_interrupted "$status"; then
+            terminal_status="$status" operation_status="$status" kind=interrupted status=5
+        elif ((operation_status == 0)); then
+            operation_status="$status"
         fi
         if [[ $status -eq 0 ]]; then successes=$((successes + 1)); else failures=$((failures + 1)); fi
         result=$(jq -nc --arg status "$kind" --arg repo "${repositories[$manager]}" \
             --arg path "${paths[$manager]}" --arg branch "$branch" --arg commit "$commit" \
-            --argjson code "$status" --argjson changed "$changed" \
+            --argjson code "$status" --argjson changed "$changed" --argjson operation "$operation_status" \
+            --argjson attempted "$push_attempted" --arg outcome "$push_outcome" \
             '{status:$status,repo:$repo,path:$path,branch:$branch,commit:$commit,
               updated:($changed and $code == 0),pushed:($status == "pushed"),exit_code:$code,
+              operation_exit_code:$operation,push_attempted:$attempted,push_outcome:$outcome,
               error:(if $code == 0 then null else $status end)}') || return 4
         results=$(jq -nc --argjson results "$results" --arg manager "$manager" \
             --argjson result "$result" '$results + {($manager):$result}') || return 4
+        # A stopped write may already have committed remotely. Retain the
+        # local commit and exact attempt, but do not observe/retry it or touch
+        # another manager until a new explicit invocation reconciles it.
+        ((terminal_status == 0)) || break
     done
     local exit_code=0 overall=success details duration workspace="$work"
     if [[ $failures -gt 0 ]]; then
         exit_code=1; overall=error
         [[ $successes -gt 0 ]] && overall=partial
+    fi
+    if ((terminal_status != 0)); then
+        exit_code=5; overall=error
     fi
     [[ "$dry_run" == "true" ]] && workspace=""
     duration=$(($(date +%s) - start_time))
@@ -589,11 +677,13 @@ HELP
         --arg repo "$repo" --arg sha "$source_sha" --argjson release_id "$release_id" \
         --arg work_dir "$workspace" --argjson results "$results" --slurpfile plan "$work/plan.json" \
         --argjson pushed "$any_pushed" --argjson dry_run "$dry_run" --argjson duration "$duration" \
+        --argjson stopped "$terminal_status" --argjson skip_brew "$skip_homebrew" --argjson skip_scoop "$skip_scoop" \
         '{tool:$tool,version:$version,tag:$tag,repo:$repo,release_id:$release_id,git_sha:$sha,
           work_dir:(if $work_dir == "" then null else $work_dir end),
-          homebrew:(($results.homebrew // {status:"skipped",updated:false,pushed:false,error:null}) |
+          operation_exit_code:$stopped,
+          homebrew:(($results.homebrew // {status:(if $stopped!=0 and ($skip_brew|not) then "not_attempted" else "skipped" end),updated:false,pushed:false,error:null}) |
             . + {tap: (.repo // null)}),
-          scoop:(($results.scoop // {status:"skipped",updated:false,pushed:false,error:null}) |
+          scoop:(($results.scoop // {status:(if $stopped!=0 and ($skip_scoop|not) then "not_attempted" else "skipped" end),updated:false,pushed:false,error:null}) |
             . + {bucket: (.repo // null)}),
           assets:$plan[0],pushed:$pushed,dry_run:$dry_run,duration_seconds:$duration}') || return 4
     printf '%s\n' "$details" > "$work/result.json" || return 4
