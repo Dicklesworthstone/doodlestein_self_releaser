@@ -23,6 +23,7 @@ $ErrorActionPreference = 'Stop'
 $script:DsrWindowsInstallPolicyBase64 = 'eyJzY2hlbWFfdmVyc2lvbiI6MSwidG9vbCI6Im50bSIsInJlcG8iOiJEaWNrbGVzd29ydGhzdG9uZS9udG0iLCJiaW5hcnlfbmFtZSI6Im50bS5leGUiLCJwdWJsaWNfa2V5IjoiIiwicGxhdGZvcm1zIjp7IndpbmRvd3MvYW1kNjQiOnsibmFtZSI6Im50bV8ke3ZlcnNpb259X3dpbmRvd3NfYW1kNjQuemlwIiwiZm9ybWF0IjoiemlwIiwiYmluYXJpZXMiOlsibnRtLmV4ZSJdLCJ0YXJnZXRfdHJpcGxlIjoieDg2XzY0LXBjLXdpbmRvd3MtbXN2YyJ9LCJ3aW5kb3dzL2FybTY0Ijp7Im5hbWUiOiJudG1fJHt2ZXJzaW9ufV93aW5kb3dzX2FybTY0LnppcCIsImZvcm1hdCI6InppcCIsImJpbmFyaWVzIjpbIm50bS5leGUiXSwidGFyZ2V0X3RyaXBsZSI6ImFhcmNoNjQtcGMtd2luZG93cy1tc3ZjIn0sIndpbmRvd3MvMzg2Ijp7Im5hbWUiOiJudG1fJHt2ZXJzaW9ufV93aW5kb3dzXzM4Ni56aXAiLCJmb3JtYXQiOiJ6aXAiLCJiaW5hcmllcyI6WyJudG0uZXhlIl0sInRhcmdldF90cmlwbGUiOiJpNjg2LXBjLXdpbmRvd3MtbXN2YyJ9fSwic291cmNlIjp7Imxhbmd1YWdlIjoiZ28iLCJzdWJkaXIiOiIuIiwiZW50cnkiOiIifX0='
 $script:DsrMaximumPayloadBytes = 2147483648L
 $script:DsrMaximumExpandedBytes = 4294967296L
+$script:DsrXzTimeoutSeconds = 120
 
 function Stop-DsrInstall {
     param([string]$Message, [int]$Code = 4, [switch]$TransientAcquisition, [int]$HttpStatus = 0)
@@ -189,7 +190,7 @@ function Get-DsrInstallPolicy {
         Assert-DsrFields $selection @('name', 'format', 'binaries', 'target_triple')
         if ($selection.name -isnot [string] -or
             -not (Test-DsrWindowsName $selection.name.Replace('${version}', '1.2.3')) -or
-            $selection.format -cnotin @('zip', 'tar.gz', 'none') -or
+            $selection.format -cnotin @('zip', 'tar.gz', 'tar.xz', 'none') -or
             $selection.binaries -isnot [array] -or $selection.binaries.Count -lt 1 -or
             $selection.binaries.Count -gt 64 -or $selection.target_triple -isnot [string] -or
             ($selection.target_triple -and -not (Test-DsrName $selection.target_triple))) {
@@ -956,13 +957,152 @@ public sealed class DsrWindowsTarReadStream : Stream {
     return [DsrWindowsTarReadStream]::new($Stream, $script:DsrMaximumExpandedBytes)
 }
 
-function Expand-DsrTarGzipPayload {
+function New-DsrXzReadStream {
+    param([IO.Stream]$Stream)
+    $command = Get-Command xz -CommandType Application -ErrorAction SilentlyContinue
+    if ($null -eq $command) {
+        Stop-DsrInstall 'A tar.xz release requires an installed xz application; install it before retrying' 3
+    }
+    if (-not ('DsrWindowsXzReadStream' -as [type])) {
+        # XZ is only a decoder here: it receives verified private bytes on stdin
+        # and cannot choose output paths. The ordinary TAR reader still owns
+        # every archive/member limit. Drain and validate decoder completion even
+        # after TAR's terminator; otherwise a late XZ checksum error is lost.
+        Add-Type -TypeDefinition @'
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+public sealed class DsrWindowsXzReadStream : Stream {
+    private readonly Process process = new Process();
+    private readonly CancellationTokenSource deadline = new CancellationTokenSource();
+    private readonly MemoryStream diagnostics = new MemoryStream();
+    private Task input, errors;
+    private bool started, completed, disposed;
+    private long position;
+    public DsrWindowsXzReadStream(string executable, Stream source, int timeoutSeconds) {
+        if (timeoutSeconds < 1 || timeoutSeconds > 120)
+            throw new ArgumentOutOfRangeException(nameof(timeoutSeconds));
+        ProcessStartInfo start = new ProcessStartInfo(executable);
+        start.UseShellExecute = false;
+        start.CreateNoWindow = true;
+        start.RedirectStandardInput = true;
+        start.RedirectStandardOutput = true;
+        start.RedirectStandardError = true;
+        foreach (string argument in new[] {
+            "--decompress", "--stdout", "--format=xz", "--threads=1",
+            "--memlimit-decompress=256MiB"
+        }) start.ArgumentList.Add(argument);
+        // Inherited options such as --single-stream can hide trailing data.
+        // Change only this child environment, including Windows case aliases.
+        foreach (string name in new System.Collections.Generic.List<string>(start.Environment.Keys)) {
+            if (name.Equals("XZ_DEFAULTS", StringComparison.OrdinalIgnoreCase) ||
+                name.Equals("XZ_OPT", StringComparison.OrdinalIgnoreCase))
+                start.Environment.Remove(name);
+        }
+        process.StartInfo = start;
+        try {
+            if (!process.Start()) throw new IOException("Could not start the installed XZ decoder");
+            started = true;
+            deadline.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
+            input = Feed(source);
+            errors = DrainErrors();
+        } catch { Dispose(); throw; }
+    }
+    private async Task Feed(Stream source) {
+        try {
+            await source.CopyToAsync(process.StandardInput.BaseStream, 65536, deadline.Token).ConfigureAwait(false);
+        } finally { process.StandardInput.BaseStream.Dispose(); }
+    }
+    private async Task DrainErrors() {
+        byte[] buffer = new byte[4096];
+        int count;
+        while ((count = await process.StandardError.BaseStream.ReadAsync(
+            buffer, 0, buffer.Length, deadline.Token).ConfigureAwait(false)) != 0) {
+            int keep = (int)Math.Min(count, 8192 - diagnostics.Length);
+            if (keep > 0) diagnostics.Write(buffer, 0, keep);
+        }
+    }
+    public override int Read(byte[] buffer, int offset, int count) {
+        if (disposed) throw new ObjectDisposedException(nameof(DsrWindowsXzReadStream));
+        if (count == 0) return 0;
+        try {
+            int read = process.StandardOutput.BaseStream.ReadAsync(buffer, offset, count, deadline.Token)
+                .WaitAsync(deadline.Token).GetAwaiter().GetResult();
+            position = checked(position + read);
+            if (read == 0) Complete();
+            return read;
+        } catch (OperationCanceledException error) {
+            throw new InvalidDataException("XZ decoding or output draining exceeded its deadline", error);
+        }
+    }
+    public void Complete() {
+        if (completed) return;
+        try {
+            process.WaitForExitAsync(deadline.Token).GetAwaiter().GetResult();
+            errors.WaitAsync(deadline.Token).GetAwaiter().GetResult();
+            if (process.ExitCode != 0)
+                throw new InvalidDataException("XZ decoder rejected the compressed stream (exit " +
+                    process.ExitCode + "): " + Encoding.UTF8.GetString(diagnostics.ToArray()).Trim());
+            input.WaitAsync(deadline.Token).GetAwaiter().GetResult();
+            deadline.Token.ThrowIfCancellationRequested();
+            completed = true;
+        } catch (OperationCanceledException error) {
+            throw new InvalidDataException("XZ decoding or output draining exceeded its deadline", error);
+        }
+    }
+    protected override void Dispose(bool disposing) {
+        if (!disposed && disposing) {
+            disposed = true;
+            deadline.Cancel();
+            if (started) {
+                try {
+                    if (!process.HasExited) { process.Kill(true); process.WaitForExit(1000); }
+                } catch { }
+                // Closing our pipes bounds cleanup even if an exited parent
+                // left an inherited pipe in a descendant. Do not claim custody
+                // of descendants already orphaned by an external decoder.
+                try { process.StandardInput.BaseStream.Dispose(); } catch { }
+                try { process.StandardOutput.BaseStream.Dispose(); } catch { }
+                try { process.StandardError.BaseStream.Dispose(); } catch { }
+            }
+            try {
+                if (input != null && errors != null) Task.WhenAll(input, errors).Wait(1000);
+            } catch { }
+            process.Dispose();
+            deadline.Dispose();
+            diagnostics.Dispose();
+        }
+        base.Dispose(disposing);
+    }
+    public override bool CanRead => !disposed;
+    public override bool CanSeek => false;
+    public override bool CanWrite => false;
+    public override long Length => throw new NotSupportedException();
+    public override long Position { get => position; set => throw new NotSupportedException(); }
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    public override void Flush() { }
+}
+'@
+    }
+    return [DsrWindowsXzReadStream]::new($command.Source, $Stream, $script:DsrXzTimeoutSeconds)
+}
+
+function Expand-DsrTarPayload {
     param([string]$Payload, $Selection, [string]$Destination)
     $stream = Open-DsrReadFile $Payload
-    $gzip = $null; $bounded = $null; $archive = $null
+    $decoded = $null; $bounded = $null; $archive = $null
     try {
-        $gzip = [IO.Compression.GZipStream]::new($stream, [IO.Compression.CompressionMode]::Decompress, $true)
-        $bounded = New-DsrTarReadStream $gzip
+        if ($Selection.format -ceq 'tar.xz') {
+            $decoded = New-DsrXzReadStream $stream
+        } else {
+            $decoded = [IO.Compression.GZipStream]::new($stream, [IO.Compression.CompressionMode]::Decompress, $true)
+        }
+        $bounded = New-DsrTarReadStream $decoded
         $archive = [System.Formats.Tar.TarReader]::new($bounded, $true)
         $nodes = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
         $explicitNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -1021,25 +1161,29 @@ function Expand-DsrTarGzipPayload {
         }
         # TarReader stops at the first zero header. Drain through the same
         # bounded framing reader to reject hidden entries, trailing garbage,
-        # incomplete terminators and gzip corruption before installation.
+        # incomplete terminators and compression corruption before installation.
         $bounded.Complete()
-        # GZipStream may report clean EOF when an entire gzip footer is
-        # missing. Bind the actual final trailer to every decompressed byte
-        # instead of treating the TAR terminator as compression completion.
-        if ($stream.Length -lt 18) { Stop-DsrInstall 'Truncated gzip payload' 7 }
-        $stream.Position = $stream.Length - 8
-        $footer = [IO.BinaryReader]::new($stream, [Text.Encoding]::UTF8, $true)
-        try {
-            if ($footer.ReadUInt32() -ne $bounded.Crc32 -or
-                $footer.ReadUInt32() -ne ($bounded.Position -band 4294967295L)) {
-                Stop-DsrInstall 'Invalid or missing gzip checksum/length trailer' 7
-            }
-        } finally { $footer.Dispose() }
+        if ($Selection.format -ceq 'tar.xz') {
+            $decoded.Complete()
+        } else {
+            # GZipStream may report clean EOF when an entire gzip footer is
+            # missing. Bind the actual final trailer to every decompressed byte
+            # instead of treating the TAR terminator as compression completion.
+            if ($stream.Length -lt 18) { Stop-DsrInstall 'Truncated gzip payload' 7 }
+            $stream.Position = $stream.Length - 8
+            $footer = [IO.BinaryReader]::new($stream, [Text.Encoding]::UTF8, $true)
+            try {
+                if ($footer.ReadUInt32() -ne $bounded.Crc32 -or
+                    $footer.ReadUInt32() -ne ($bounded.Position -band 4294967295L)) {
+                    Stop-DsrInstall 'Invalid or missing gzip checksum/length trailer' 7
+                }
+            } finally { $footer.Dispose() }
+        }
         if ($selected.Count -ne $Selection.binaries.Count) { Stop-DsrInstall 'TAR does not contain every selected executable' 7 }
     } finally {
         if ($null -ne $archive) { $archive.Dispose() }
         if ($null -ne $bounded) { $bounded.Dispose() }
-        if ($null -ne $gzip) { $gzip.Dispose() }
+        if ($null -ne $decoded) { $decoded.Dispose() }
         $stream.Dispose()
     }
 }
@@ -1049,8 +1193,8 @@ function Expand-DsrPayload {
     $null = New-DsrPrivateDirectory $Destination
     if ($Selection.format -ceq 'none') {
         Copy-DsrNewFile $Payload ([IO.Path]::Combine($Destination, $Selection.binaries[0]))
-    } elseif ($Selection.format -ceq 'tar.gz') {
-        Expand-DsrTarGzipPayload $Payload $Selection $Destination
+    } elseif ($Selection.format -cin @('tar.gz', 'tar.xz')) {
+        Expand-DsrTarPayload $Payload $Selection $Destination
     } else {
         $stream = Open-DsrReadFile $Payload
         $archive = $null
@@ -1170,7 +1314,7 @@ function Test-DsrSourceRelativePath {
 
 function Assert-DsrSourcePolicy {
     param($Source)
-    Assert-DsrFields $Source @('language', 'subdir') @('entry', 'package')
+    Assert-DsrFields $Source @('language', 'subdir') @('entry', 'package', 'features', 'no_default_features')
     if (-not (Test-DsrSourceRelativePath $Source.subdir -Root)) { Stop-DsrInstall 'Invalid embedded Windows source directory' }
     if ($Source.language -cin @('go', 'bun', 'typescript')) {
         Assert-DsrFields $Source @('language', 'subdir', 'entry')
@@ -1178,10 +1322,26 @@ function Assert-DsrSourcePolicy {
             Stop-DsrInstall 'Invalid embedded Windows Go/Bun source selection'
         }
     } elseif ($Source.language -ceq 'rust') {
-        Assert-DsrFields $Source @('language', 'subdir', 'package')
+        Assert-DsrFields $Source @('language', 'subdir', 'package') @('features', 'no_default_features')
         if ($Source.package -isnot [string] -or ($Source.package -and
             ($Source.package.Length -gt 128 -or -not (Test-DsrName $Source.package)))) {
             Stop-DsrInstall 'Invalid embedded Windows Rust source selection'
+        }
+        if ($Source.Contains('features')) {
+            if ($Source.features -isnot [array] -or $Source.features.Count -gt 64) {
+                Stop-DsrInstall 'Rust source features must be an array of at most 64 literal feature names' 4
+            }
+            $features = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            foreach ($feature in $Source.features) {
+                if ($feature -isnot [string] -or $feature.Length -gt 128 -or
+                    $feature -cnotmatch '\A[A-Za-z0-9_][A-Za-z0-9_.+\-]*(/[A-Za-z0-9_][A-Za-z0-9_.+\-]*)?\z' -or
+                    -not $features.Add($feature)) {
+                    Stop-DsrInstall 'Rust source features must be unique literal feature or package/feature names' 4
+                }
+            }
+        }
+        if ($Source.Contains('no_default_features') -and $Source.no_default_features -isnot [bool]) {
+            Stop-DsrInstall 'Rust source no_default_features must be a Boolean' 4
         }
     } else {
         Stop-DsrInstall 'Unsupported embedded Windows source language'
@@ -1930,6 +2090,16 @@ function Build-DsrRustSourceOutputs {
     param($Policy, $Selection, [string]$Platform, [string]$Source, [string[]]$Files,
         [string]$BuildRoot, [string]$Output, [string]$Logs, [string]$Work, [int]$Timeout,
         [string]$Cargo, [string]$Rustc)
+    # Revalidate the embedded selection at the compiler boundary as well as
+    # public admission. Each feature remains one argv value; repository data
+    # never becomes a shell fragment or another Cargo option.
+    Assert-DsrSourcePolicy $Policy.source
+    [string[]]$features = @()
+    if ($Policy.source.Contains('features')) { $features = @($Policy.source.features) }
+    $noDefaultFeatures = $Policy.source.Contains('no_default_features') -and $Policy.source.no_default_features
+    $featureArguments = @()
+    if ($noDefaultFeatures) { $featureArguments += '--no-default-features' }
+    foreach ($feature in $features) { $featureArguments += @('--features', $feature) }
     $target = $Selection.target_triple
     $targetPattern = switch ($Platform) {
         'windows/amd64' { '^x86_64-pc-windows-(msvc|gnu|gnullvm)$' }
@@ -1962,7 +2132,7 @@ function Build-DsrRustSourceOutputs {
         $cargoVersion -cnotmatch '^cargo [0-9]' -or $cargoVersion.Length -gt 4096) {
         Stop-DsrInstall 'Invalid installed Rust compiler identity' 6
     }
-    $metadataArguments = @('metadata', '--format-version=1', '--no-deps', '--locked', '--manifest-path', $manifest)
+    $metadataArguments = @('metadata', '--format-version=1', '--no-deps', '--locked', '--manifest-path', $manifest) + $featureArguments
     $metadataText = Invoke-DsrSourceCommand @cargoBase -Arguments $metadataArguments -Log ([IO.Path]::Combine($Logs, 'cargo-metadata')) -Capture
     $metadata = ConvertFrom-DsrJson $metadataText
     if ($metadata -isnot [Collections.IDictionary] -or -not $metadata.Contains('version') -or $metadata.version -ne 1 -or
@@ -2022,6 +2192,7 @@ function Build-DsrRustSourceOutputs {
     if ($Policy.source.package) { $buildArguments += @('--package', $Policy.source.package) }
     elseif ($Selection.binaries.Count -gt 1) { $buildArguments += '--workspace' }
     foreach ($provider in $providers) { $buildArguments += @('--bin', $provider.cargo_bin) }
+    $buildArguments += $featureArguments
     $buildText = Invoke-DsrSourceCommand @cargoBase -Arguments $buildArguments -Log ([IO.Path]::Combine($Logs, 'cargo-build')) -Capture
     $artifacts = @()
     foreach ($line in $buildText.Split("`n")) {
@@ -2049,7 +2220,8 @@ function Build-DsrRustSourceOutputs {
         }
     }
     return @{ compiler = $compiler; cargo_version = $cargoVersion; cargo_target = $target;
-        source_package = $Policy.source.package; source_entries = @($providers) }
+        source_package = $Policy.source.package; source_entries = @($providers);
+        cargo_features = @($features); cargo_no_default_features = [bool]$noDefaultFeatures }
 }
 
 function Get-DsrBunDependencyContext {
@@ -2729,7 +2901,8 @@ Options:
   -Help          Show this help
 
 Every selected executable is checked before replacement. Configured release
-signatures require Minisign. Release executables are never run and PATH is not edited.
+signatures require Minisign. tar.xz releases also require an installed xz application;
+no decoder is downloaded. Release executables are never run and PATH is not edited.
 -FromSource and -AllowSourceBuild run repository/dependency build code and produce a local build,
 not an authenticated signed release. It never installs a compiler automatically.
 -SourceIfStale requires -AllowSourceBuild and latest online mode. Unknown freshness

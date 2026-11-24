@@ -757,7 +757,9 @@ resolved commit, tracked-source digest, compiler identity, source selectors,
 per-executable entries and byte evidence. For Rust, `cargo_target` records the
 explicit compilation triple, `cargo_version` identifies Cargo, and each
 `source_entries` row retains its Cargo binary, package ID, manifest and source
-path. For Go, `go_target` records the actual `windows` OS and Go architecture;
+path. `cargo_features` records the requested feature list and
+`cargo_no_default_features` records whether Cargo defaults were disabled. For
+Go, `go_target` records the actual `windows` OS and Go architecture;
 `release_target_triple` is labeled as the configured release selector rather
 than a claimed Go compiler ABI. Bun and TypeScript receipts retain the compiler
 identity, explicit `bun_target`, each selected `source_entries` path, the committed
@@ -849,6 +851,46 @@ compiler or wrapper. Inherited `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, and
 `.cargo/config.toml` can supply its own compiler flags. Existing compiler homes
 and dependency caches remain available; this is a locally built source result,
 not a hermetic or signed release.
+
+### Rust source features
+
+Use the repository recipe to select Cargo features for both generated Bash and
+Windows source installers:
+
+```yaml
+language: rust
+binary_name: app
+workspace_binaries: [app, helper]
+source_features: [cli, worker/service]
+source_no_default_features: true
+```
+
+`source_features` is an optional array of at most 64 unique strings. Each string
+is 1–128 ASCII characters and follows
+`[A-Za-z0-9_][A-Za-z0-9_.+-]*`, optionally followed by one `/` and another name
+with the same grammar. A selector such as `worker/service` enables the `service`
+feature of the `worker` package. Commas, whitespace, shell expressions and
+option-shaped strings are not accepted. `source_no_default_features` is an
+optional Boolean, not a quoted string. Both settings require `language: rust`,
+even when the list is empty or the Boolean is false. Invalid policy stops
+generation before it can replace an existing installer.
+
+Each selection becomes a separate literal `--features` argument. A true
+`source_no_default_features` adds `--no-default-features`; absent settings use
+Cargo's normal defaults. This does not disable features enabled by dependencies.
+DSR does not enable all features automatically or infer features from binary
+names. Configure the features needed by every selected binary's
+`required-features`; a missing feature or unknown selector fails the complete
+build and leaves the previous installed family intact.
+
+Windows metadata and compilation use the same feature arguments. Both source
+engines retain the exact requested array in `cargo_features` and the Boolean in
+`cargo_no_default_features` in the local-build receipt. These fields describe
+the requested Cargo selection, not a complete resolved dependency feature graph.
+Generated installers embed this policy; they do not accept an end-user feature
+override. Direct Bash callers of `install_source_build` can supply repeated
+`--feature NAME` arguments and `--no-default-features` under the same validation
+rules, before source acquisition or compiler execution.
 
 ### RCH-delivered Rust source executables
 

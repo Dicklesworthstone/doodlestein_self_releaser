@@ -1385,6 +1385,21 @@ verify before the family is installed. Source installation still requires
 [source family contract](docs/INSTALLER_GENERATION.md#executable-families-from-source)
 for entry selection, dependency locking and failure behavior.
 
+Rust source installers can select features required by their executable family:
+
+```yaml
+language: rust
+source_features: [cli, worker/service]
+source_no_default_features: true
+```
+
+These recipe settings apply to both Bash and Windows source builds. Omit them
+to keep Cargo's normal defaults. Each feature is passed as a literal Cargo
+argument, and the source receipt records the exact selection. The installer
+still requires every selected executable to compile before replacing the
+installed family. See [Rust source features](docs/INSTALLER_GENERATION.md#rust-source-features)
+for validation rules and package-qualified selectors.
+
 Private GitHub source builds use the same account as release downloads and
 freshness checks: `DSR_GH_TOKEN`, then `GITHUB_TOKEN`, then `GH_TOKEN`, then the
 stored GitHub.com login. Authenticated source fetches require Git 2.31 or newer

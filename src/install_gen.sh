@@ -129,6 +129,8 @@ SOURCE_LANGUAGE='__SOURCE_LANGUAGE__'
 SOURCE_SUBDIR='__SOURCE_SUBDIR__'
 SOURCE_ENTRY='__SOURCE_ENTRY__'
 SOURCE_PACKAGE='__SOURCE_PACKAGE__'
+SOURCE_CARGO_FEATURES=(__SOURCE_CARGO_FEATURES__)
+SOURCE_CARGO_NO_DEFAULT_FEATURES=__SOURCE_CARGO_NO_DEFAULT_FEATURES__
 
 __SOURCE_BUILD_ENGINE__
 
@@ -2970,6 +2972,9 @@ _install_from_source() {
     $_INSTALL_TOOLCHAIN && args+=(--install-toolchain)
     [[ -z "$SOURCE_ENTRY" ]] || args+=(--entry "$SOURCE_ENTRY")
     [[ -z "$SOURCE_PACKAGE" ]] || args+=(--package "$SOURCE_PACKAGE")
+    local feature
+    for feature in ${SOURCE_CARGO_FEATURES[@]+"${SOURCE_CARGO_FEATURES[@]}"}; do args+=(--feature "$feature"); done
+    $SOURCE_CARGO_NO_DEFAULT_FEATURES && args+=(--no-default-features)
     for name in "${_INSTALL_NAMES[@]}"; do args+=(--bin "$name"); done
     _KEEP_SOURCE_LOGS=true
     receipt=$(install_source_build "$REPO" "$ref" "$SOURCE_LANGUAGE" "$BINARY_NAME" \
@@ -3862,6 +3867,44 @@ _install_gen_yaml_get() {
     echo "$default"
 }
 
+# Share one typed Rust source policy between the Bash and PowerShell generators.
+# A config value is data, never a Cargo command fragment. Absent settings retain
+# Cargo's normal defaults; explicitly configured settings belong only to Rust.
+_install_gen_cargo_selection() {
+    local file="$1" language="$2" selection
+    if ! command -v yq >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+        # The dependency-free identity parser admits only plain block keys.
+        # Reject quoted, flow, merge and other complex mappings before using
+        # a textual absence check; never silently discard configured policy.
+        _install_gen_identities "$file" cargo-policy >/dev/null || return $?
+        if grep -Eq '^[[:space:]]*(source_features|source_no_default_features):' "$file"; then
+            log_error 'yq and jq are required to validate Rust source feature selection'
+            return 3
+        fi
+        printf '%s\n' '{"features":[],"no_default_features":false}'
+        return 0
+    fi
+    if ! selection=$(yq -o=json -I=0 'to_entries' "$file" | jq -ces --arg language "$language" '
+        def feature: type == "string" and length > 0 and length <= 128 and
+            test("\\A[A-Za-z0-9_][A-Za-z0-9_.+-]*(/[A-Za-z0-9_][A-Za-z0-9_.+-]*)?\\z");
+        if length != 1 or (.[0] | type != "array" or
+            (all(.[]; type == "object" and (.key | type == "string")) | not) or
+            (map(.key) | unique | length) != length)
+        then error("expected one unambiguous configuration mapping") else .[0] | from_entries end |
+        if $language != "rust" and (has("source_features") or has("source_no_default_features"))
+        then error("Cargo feature selection is only supported for Rust") else . end |
+        {features:(if has("source_features") then .source_features else [] end),
+         no_default_features:(if has("source_no_default_features") then .source_no_default_features else false end)} |
+        if (.features | type == "array" and length <= 64 and all(.[]; feature) and
+            (unique | length) == length) and (.no_default_features | type == "boolean")
+        then . else error("invalid Rust source feature selection") end
+    '); then
+        log_error 'Invalid Rust source features or default-feature policy'
+        return 4
+    fi
+    printf '%s\n' "$selection"
+}
+
 # The key line of a minisign public key: the line itself, or the second line
 # of a minisign.pub file. Prints nothing (status 4) for anything else.
 _install_gen_pubkey_line() {
@@ -4200,12 +4243,20 @@ install_gen_create() {
     local artifact_naming linux_libc_fallback=none workspace_binary_cases libc_independent_go_cases native_variant_cases
     local contract_model strict_release_contract=false contract_asset_cases=''
     local source_subdir source_entry source_package source_engine toolchain_engine field value output_observation
+    local cargo_selection source_cargo_features source_cargo_no_default_features
 
     local identities
     identities=$(_install_gen_identities "$config_file" "$tool_name") || return $?
     IFS=$'\t' read -r tool_name repo binary_name <<< "$identities" || return 4
     output_observation=$(_install_gen_output inspect "$_IG_OUTPUT_DIR" "$tool_name") || return $?
     language=$(_install_gen_yaml_get "$config_file" "language" "go")
+    cargo_selection=$(_install_gen_cargo_selection "$config_file" "$language") || return $?
+    if command -v jq >/dev/null 2>&1; then
+        source_cargo_features=$(jq -r '.features[] | @sh' <<< "$cargo_selection") || return 4
+        source_cargo_no_default_features=$(jq -r '.no_default_features' <<< "$cargo_selection") || return 4
+    else
+        source_cargo_features=''; source_cargo_no_default_features=false
+    fi
     workflow_path=$(_install_gen_yaml_get "$config_file" "workflow" ".github/workflows/release.yml")
     local_path=$(_install_gen_yaml_get "$config_file" "local_path" "")
     workspace_binary_cases=$(_install_gen_workspace_cases "$config_file" "$binary_name") || return $?
@@ -4510,6 +4561,10 @@ install_gen_create() {
         fi
     fi
 
+    # Substitute these validated literals last. A legal Cargo feature can look
+    # like a template marker; it must remain literal data in the generated list.
+    template="${template//__SOURCE_CARGO_NO_DEFAULT_FEATURES__/"$source_cargo_no_default_features"}"
+    template="${template//__SOURCE_CARGO_FEATURES__/"$source_cargo_features"}"
     output_file=$(printf '%s\n' "$template" | _install_gen_output publish \
         "$_IG_OUTPUT_DIR" "$tool_name" "$output_observation") || return $?
 
@@ -4533,7 +4588,7 @@ install_gen_create() {
 _install_gen_windows_policy() (
     local config_file="$1" requested="$2" identities tool repo binary config_dir config_tool
     local document targets platform triple format archive_formats local_path key contract_model
-    local names row plan name source_policy policy='{}' version_marker='0.0.0-DSRINSTALLERVERSION'
+    local names row plan name source_policy cargo_selection policy='{}' version_marker='0.0.0-DSRINSTALLERVERSION'
     command -v yq >/dev/null && command -v jq >/dev/null || {
         log_error 'yq and jq are required to generate a PowerShell installer'; return 3;
     }
@@ -4549,7 +4604,8 @@ _install_gen_windows_policy() (
     source "$_IG_SCRIPT_DIR/artifact_naming.sh" || return 3
     export DSR_REPOS_FILE=''
     document=$(_config_read_single_mapping_json "$config_file") || return 4
-    source_policy=$(jq -c '
+    cargo_selection=$(_install_gen_cargo_selection "$config_file" "$(jq -r '.language // ""' <<< "$document")") || return $?
+    source_policy=$(jq -c --argjson cargo "$cargo_selection" '
         def source_path:
             type == "string" and length > 0 and length <= 1024 and
             (. == "." or (split("/") | length <= 64 and all(.[];
@@ -4568,7 +4624,7 @@ _install_gen_windows_policy() (
                 ($source.package | type == "string" and (. == "" or
                     (test("^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$") and (contains("..") | not)))) and
                 ((.source_entry // "") == "")
-            then $source else error("invalid Windows Rust source selection") end
+            then $source + $cargo else error("invalid Windows Rust source selection") end
         else null end
     ' <<< "$document") || return 4
     targets=$(_config_get_tool_targets_json "$config_tool") || return 4

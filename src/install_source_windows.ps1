@@ -19,7 +19,7 @@ function Test-DsrSourceRelativePath {
 
 function Assert-DsrSourcePolicy {
     param($Source)
-    Assert-DsrFields $Source @('language', 'subdir') @('entry', 'package')
+    Assert-DsrFields $Source @('language', 'subdir') @('entry', 'package', 'features', 'no_default_features')
     if (-not (Test-DsrSourceRelativePath $Source.subdir -Root)) { Stop-DsrInstall 'Invalid embedded Windows source directory' }
     if ($Source.language -cin @('go', 'bun', 'typescript')) {
         Assert-DsrFields $Source @('language', 'subdir', 'entry')
@@ -27,10 +27,26 @@ function Assert-DsrSourcePolicy {
             Stop-DsrInstall 'Invalid embedded Windows Go/Bun source selection'
         }
     } elseif ($Source.language -ceq 'rust') {
-        Assert-DsrFields $Source @('language', 'subdir', 'package')
+        Assert-DsrFields $Source @('language', 'subdir', 'package') @('features', 'no_default_features')
         if ($Source.package -isnot [string] -or ($Source.package -and
             ($Source.package.Length -gt 128 -or -not (Test-DsrName $Source.package)))) {
             Stop-DsrInstall 'Invalid embedded Windows Rust source selection'
+        }
+        if ($Source.Contains('features')) {
+            if ($Source.features -isnot [array] -or $Source.features.Count -gt 64) {
+                Stop-DsrInstall 'Rust source features must be an array of at most 64 literal feature names' 4
+            }
+            $features = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            foreach ($feature in $Source.features) {
+                if ($feature -isnot [string] -or $feature.Length -gt 128 -or
+                    $feature -cnotmatch '\A[A-Za-z0-9_][A-Za-z0-9_.+\-]*(/[A-Za-z0-9_][A-Za-z0-9_.+\-]*)?\z' -or
+                    -not $features.Add($feature)) {
+                    Stop-DsrInstall 'Rust source features must be unique literal feature or package/feature names' 4
+                }
+            }
+        }
+        if ($Source.Contains('no_default_features') -and $Source.no_default_features -isnot [bool]) {
+            Stop-DsrInstall 'Rust source no_default_features must be a Boolean' 4
         }
     } else {
         Stop-DsrInstall 'Unsupported embedded Windows source language'
@@ -779,6 +795,16 @@ function Build-DsrRustSourceOutputs {
     param($Policy, $Selection, [string]$Platform, [string]$Source, [string[]]$Files,
         [string]$BuildRoot, [string]$Output, [string]$Logs, [string]$Work, [int]$Timeout,
         [string]$Cargo, [string]$Rustc)
+    # Revalidate the embedded selection at the compiler boundary as well as
+    # public admission. Each feature remains one argv value; repository data
+    # never becomes a shell fragment or another Cargo option.
+    Assert-DsrSourcePolicy $Policy.source
+    [string[]]$features = @()
+    if ($Policy.source.Contains('features')) { $features = @($Policy.source.features) }
+    $noDefaultFeatures = $Policy.source.Contains('no_default_features') -and $Policy.source.no_default_features
+    $featureArguments = @()
+    if ($noDefaultFeatures) { $featureArguments += '--no-default-features' }
+    foreach ($feature in $features) { $featureArguments += @('--features', $feature) }
     $target = $Selection.target_triple
     $targetPattern = switch ($Platform) {
         'windows/amd64' { '^x86_64-pc-windows-(msvc|gnu|gnullvm)$' }
@@ -811,7 +837,7 @@ function Build-DsrRustSourceOutputs {
         $cargoVersion -cnotmatch '^cargo [0-9]' -or $cargoVersion.Length -gt 4096) {
         Stop-DsrInstall 'Invalid installed Rust compiler identity' 6
     }
-    $metadataArguments = @('metadata', '--format-version=1', '--no-deps', '--locked', '--manifest-path', $manifest)
+    $metadataArguments = @('metadata', '--format-version=1', '--no-deps', '--locked', '--manifest-path', $manifest) + $featureArguments
     $metadataText = Invoke-DsrSourceCommand @cargoBase -Arguments $metadataArguments -Log ([IO.Path]::Combine($Logs, 'cargo-metadata')) -Capture
     $metadata = ConvertFrom-DsrJson $metadataText
     if ($metadata -isnot [Collections.IDictionary] -or -not $metadata.Contains('version') -or $metadata.version -ne 1 -or
@@ -871,6 +897,7 @@ function Build-DsrRustSourceOutputs {
     if ($Policy.source.package) { $buildArguments += @('--package', $Policy.source.package) }
     elseif ($Selection.binaries.Count -gt 1) { $buildArguments += '--workspace' }
     foreach ($provider in $providers) { $buildArguments += @('--bin', $provider.cargo_bin) }
+    $buildArguments += $featureArguments
     $buildText = Invoke-DsrSourceCommand @cargoBase -Arguments $buildArguments -Log ([IO.Path]::Combine($Logs, 'cargo-build')) -Capture
     $artifacts = @()
     foreach ($line in $buildText.Split("`n")) {
@@ -898,7 +925,8 @@ function Build-DsrRustSourceOutputs {
         }
     }
     return @{ compiler = $compiler; cargo_version = $cargoVersion; cargo_target = $target;
-        source_package = $Policy.source.package; source_entries = @($providers) }
+        source_package = $Policy.source.package; source_entries = @($providers);
+        cargo_features = @($features); cargo_no_default_features = [bool]$noDefaultFeatures }
 }
 
 function Get-DsrBunDependencyContext {

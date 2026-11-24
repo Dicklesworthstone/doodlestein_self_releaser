@@ -7,6 +7,230 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Exercise the actual generated policy and Windows Rust source engine without
+# requiring a Windows Rust standard library on this host. Cargo metadata and
+# compiler identities are real. The Windows compilation response is an explicit
+# protocol boundary backed by a genuine Go-produced PE, so this lane proves
+# argv/receipt/copy admission, not native Windows Rust compilation.
+test_rust_features_policy() {
+    local dependency
+    for dependency in pwsh git go cargo rustc minisign python3 jq yq; do
+        if ! command -v "$dependency" >/dev/null 2>&1; then
+            printf 'SKIP: Windows Rust feature controls require %s\n' "$dependency"
+            return 0
+        fi
+    done
+    python3 - "$PROJECT_ROOT" <<'PY'
+import base64
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+project = Path(sys.argv[1])
+work = Path(tempfile.mkdtemp(prefix='dsr-windows-rust-features-'))
+print('Windows Rust feature evidence: ' + str(work), flush=True)
+env = os.environ.copy()
+for name, directory in {'DSR_CONFIG_DIR': 'config', 'DSR_STATE_DIR': 'state',
+                        'DSR_CACHE_DIR': 'cache', 'DSR_INSTALLER_DIR': 'generated',
+                        'XDG_CONFIG_HOME': 'xdg-config', 'XDG_STATE_HOME': 'xdg-state',
+                        'XDG_CACHE_HOME': 'xdg-cache'}.items():
+    env[name] = str(work / directory)
+for name in ('DSR_REPOS_FILE', 'DSR_GH_TOKEN', 'GITHUB_TOKEN', 'GH_TOKEN'):
+    env.pop(name, None)
+env.update(CARGO_NET_OFFLINE='true', RUSTUP_AUTO_INSTALL='0')
+(work / 'config/repos.d').mkdir(parents=True)
+source = work / 'source'
+(source / 'src').mkdir(parents=True)
+(source / 'Cargo.toml').write_text('''[package]
+name = "feature-probe"
+version = "0.1.0"
+edition = "2021"
+[features]
+default = ["default-on"]
+default-on = []
+cli = []
+[[bin]]
+name = "app"
+path = "src/main.rs"
+required-features = ["cli"]
+''')
+(source / 'src/main.rs').write_text('fn main() { println!("feature-probe"); }\n')
+
+def run(arguments, label, extra=None, timeout=30):
+    selected = env.copy()
+    selected.update(extra or {})
+    result = subprocess.run(list(map(str, arguments)), env=selected, cwd=project,
+                            capture_output=True, timeout=timeout)
+    (work / (label + '.stdout')).write_bytes(result.stdout)
+    (work / (label + '.stderr')).write_bytes(result.stderr)
+    if result.returncode:
+        raise AssertionError(label + ': ' + result.stderr.decode(errors='replace'))
+    return result
+
+run(['cargo', 'generate-lockfile', '--offline', '--manifest-path', source / 'Cargo.toml'], 'lock')
+run(['minisign', '-G', '-W', '-p', work / 'key.pub', '-s', work / 'key.sec'], 'keygen')
+go_source = work / 'pe.go'
+go_source.write_text('package main\nfunc main() {}\n')
+pe = work / 'fixture.exe'
+run(['go', 'build', '-trimpath', '-o', pe, go_source], 'pe-fixture',
+    dict(GOOS='windows', GOARCH='amd64', GOFLAGS='', GOENV='off', GOWORK='off',
+         GOTOOLCHAIN='local', CGO_ENABLED='0'), timeout=60)
+config = dict(tool_name='feature-probe', repo='fixture/feature-probe', binary_name='app',
+              language='rust', local_path=str(source), targets=['windows/amd64'],
+              target_triples={'windows/amd64': 'x86_64-pc-windows-msvc'}, archive_format='zip',
+              artifact_naming='${name}-${version}-${os}-${arch}',
+              source_features=['cli'], source_no_default_features=True,
+              minisign_pubkey=(work / 'key.pub').read_text().splitlines()[-1])
+(work / 'config/repos.d/feature-probe.yaml').write_text(json.dumps(config))
+run([project / 'dsr', '--json', '--non-interactive', 'installer', 'generate',
+     'feature-probe', '--shell', 'powershell'], 'generate')
+runtime = work / 'generated/feature-probe/install.ps1'
+encoded = re.findall(r"\$script:DsrWindowsInstallPolicyBase64 = '([A-Za-z0-9+/=]+)'", runtime.read_text())
+assert len(encoded) == 1
+policy = json.loads(base64.b64decode(encoded[0]))
+assert policy['source']['features'] == ['cli'] and policy['source']['no_default_features'] is True
+print('PASS: generated Windows policy retains explicit Rust feature selection', flush=True)
+
+fixture = dict(source=str(source), pe=str(pe), cargo=shutil.which('cargo'), rustc=shutil.which('rustc'),
+               work=str(work), policy=policy)
+(work / 'fixture.json').write_text(json.dumps(fixture))
+driver = work / 'driver.ps1'
+driver.write_text(r'''param([string]$Runtime, [string]$FixturePath)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$fixture = ConvertFrom-Json ([IO.File]::ReadAllText($FixturePath)) -AsHashtable
+$text = [IO.File]::ReadAllText($Runtime)
+$marker = '# DSR_WINDOWS_INSTALL_DISPATCH:'
+$offset = $text.IndexOf($marker, [StringComparison]::Ordinal)
+if ($offset -le 0 -or $offset -ne $text.LastIndexOf($marker, [StringComparison]::Ordinal)) { throw 'Invalid dispatch marker' }
+. ([scriptblock]::Create($text.Substring(0, $offset)))
+$script:FeatureChecks = 0
+function Check-FeatureCase([string]$Name, [bool]$Condition) {
+    if (-not $Condition) { throw $Name }
+    $script:FeatureChecks++
+    Write-Host ('PASS: ' + $Name)
+}
+function New-FeaturePolicy {
+    return @{ language='rust'; subdir='.'; package='' }
+}
+$valid = @( (New-FeaturePolicy),
+    @{language='rust';subdir='.';package='';features=@();no_default_features=$false},
+    @{language='rust';subdir='.';package='';features=@('cli','feature-probe/default-on','_private','named.feature+1','CLI')},
+    @{language='rust';subdir='.';package='';features=@(0..63 | ForEach-Object { 'feature' + $_ })},
+    @{language='rust';subdir='.';package='';features=@('a' * 128);no_default_features=$true})
+foreach ($sourcePolicy in $valid) { Assert-DsrSourcePolicy $sourcePolicy }
+Check-FeatureCase 'legacy, empty, qualified, case-distinct and bounded feature policies are accepted' $true
+$invalid = @( $null, 'cli', 7, @(''), @('cli','cli'), @('--all-features'),
+    @('cli,other'), @('cli other'), @("cli`n"), @("cli`t"), @('pkg/'), @('/cli'),
+    @('pkg/cli/other'), @('dep:cli'), @('a' * 129), @(0..64 | ForEach-Object { 'feature' + $_ }))
+$index = 0
+foreach ($features in $invalid) {
+    $candidate = New-FeaturePolicy
+    $candidate.features = $features
+    $refused = $false
+    try { Assert-DsrSourcePolicy $candidate } catch { $refused = $true }
+    Check-FeatureCase ('invalid feature selector is refused: ' + $index) $refused
+    $index++
+}
+foreach ($value in @($null, 0, 1, 'true', 'false', @())) {
+    $candidate = New-FeaturePolicy
+    $candidate.no_default_features = $value
+    $refused = $false
+    try { Assert-DsrSourcePolicy $candidate } catch { $refused = $true }
+    Check-FeatureCase ('non-Boolean default-feature policy is refused: ' + $index) $refused
+    $index++
+}
+foreach ($language in @('go','bun','typescript')) {
+    foreach ($property in @('features','no_default_features')) {
+        $candidate = @{language=$language;subdir='.';entry=''}
+        if ($property -ceq 'features') { $candidate.features=@() } else { $candidate.no_default_features=$false }
+        $refused = $false
+        try { Assert-DsrSourcePolicy $candidate } catch { $refused = $true }
+        Check-FeatureCase ($language + ' rejects Rust-only policy ' + $property) $refused
+    }
+}
+$script:RealFeatureCommand = ${function:Invoke-DsrSourceCommand}
+$script:FeatureCalls = [Collections.Generic.List[object]]::new()
+$script:FeatureMetadata = $null
+function Invoke-DsrSourceCommand {
+    param([string]$Executable, [string[]]$Arguments, [string]$Directory, [string]$Log,
+        [int]$Timeout, $Environment=@{}, [int]$FailureCode=6, [switch]$Capture)
+    $script:FeatureCalls.Add(@{executable=$Executable;arguments=@($Arguments)})
+    if ($Arguments[0] -ceq 'build') {
+        # This is the only compiler protocol fixture. Metadata, private output
+        # admission, PE validation, hashing and returned receipts remain real.
+        $target = $Arguments[[Array]::IndexOf($Arguments, '--target') + 1]
+        $directory = New-DsrDirectoryChain ([IO.Path]::Combine($Environment.CARGO_TARGET_DIR, $target, 'release'))
+        $destination = [IO.Path]::Combine($directory, 'app.exe')
+        Copy-DsrNewFile $fixture.pe $destination
+        $package = @($script:FeatureMetadata.packages | Where-Object { $_.name -ceq 'feature-probe' })[0]
+        return (@{reason='compiler-artifact';package_id=$package.id;target=@{name='app';kind=@('bin')};
+            executable=$destination} | ConvertTo-Json -Depth 8 -Compress)
+    }
+    $result = & $script:RealFeatureCommand @PSBoundParameters
+    if ($Arguments[0] -ceq 'metadata') { $script:FeatureMetadata = ConvertFrom-Json $result -AsHashtable }
+    if ($Capture) { return $result }
+}
+$selection = $fixture.policy.platforms['windows/amd64']
+foreach ($case in @(
+    @{name='legacy';source=(New-FeaturePolicy);features=@();disabled=$false},
+    @{name='empty';source=@{language='rust';subdir='.';package='';features=@();no_default_features=$false};features=@();disabled=$false},
+    @{name='enabled';source=$fixture.policy.source;features=@('cli');disabled=$true},
+    @{name='qualified';source=@{language='rust';subdir='.';package='feature-probe';features=@('feature-probe/cli')};features=@('feature-probe/cli');disabled=$false})) {
+    $script:FeatureCalls.Clear()
+    $caseRoot = New-DsrPrivateDirectory ([IO.Path]::Combine($fixture.work, $case.name))
+    $output = New-DsrPrivateDirectory ([IO.Path]::Combine($caseRoot, 'output'))
+    $logs = New-DsrPrivateDirectory ([IO.Path]::Combine($caseRoot, 'logs'))
+    $policy = @{repo='fixture/feature-probe';source=$case.source}
+    $receipt = Build-DsrRustSourceOutputs $policy $selection 'windows/amd64' $fixture.source `
+        @('Cargo.toml','Cargo.lock','src/main.rs') $fixture.source $output $logs $caseRoot 20 $fixture.cargo $fixture.rustc
+    $requests = @($script:FeatureCalls | Where-Object { $_.arguments[0] -cin @('metadata','build') })
+    Check-FeatureCase ($case.name + ' uses one real metadata request and one observed build request') ($requests.Count -eq 2)
+    foreach ($request in $requests) {
+        $selected = @()
+        for ($i=0; $i -lt $request.arguments.Count; $i++) {
+            if ($request.arguments[$i] -ceq '--features') { $selected += $request.arguments[++$i] }
+        }
+        Check-FeatureCase ($case.name + ' ' + $request.arguments[0] + ' preserves literal feature argv and default policy') `
+            (((ConvertTo-Json -Compress -InputObject @($selected)) -ceq (ConvertTo-Json -Compress -InputObject @($case.features))) -and
+             (('--no-default-features' -cin $request.arguments) -eq $case.disabled))
+    }
+    Check-FeatureCase ($case.name + ' receipt retains exactly the selected Cargo feature policy') `
+        (($receipt.cargo_features -is [array]) -and
+         ((ConvertTo-Json -Compress -InputObject @($receipt.cargo_features)) -ceq (ConvertTo-Json -Compress -InputObject @($case.features))) -and
+         ($receipt.cargo_no_default_features -is [bool]) -and ($receipt.cargo_no_default_features -eq $case.disabled))
+    Check-FeatureCase ($case.name + ' preserves actual PE payload bytes during output admission') `
+        (Test-DsrSameEvidence (Get-DsrFileEvidence $fixture.pe) (Get-DsrFileEvidence ([IO.Path]::Combine($output, 'app.exe'))))
+}
+$script:FeatureCalls.Clear()
+$invalidPolicy = @{repo='fixture/feature-probe';source=@{language='rust';subdir='.';package='';features=@('--all-features')}}
+$before = @(Get-ChildItem -LiteralPath $fixture.work -Force).Count
+$refused = $false
+try {
+    $null = Build-DsrRustSourceOutputs $invalidPolicy $selection 'windows/amd64' $fixture.source `
+        @('Cargo.toml','Cargo.lock','src/main.rs') $fixture.source '' '' ([IO.Path]::Combine($fixture.work, 'invalid')) 20 $fixture.cargo $fixture.rustc
+} catch { $refused=$true }
+Check-FeatureCase 'compiler boundary rejects malformed policy before tools or output allocation' `
+    ($refused -and $script:FeatureCalls.Count -eq 0 -and @(Get-ChildItem -LiteralPath $fixture.work -Force).Count -eq $before)
+Write-Host ('Windows Rust feature boundary checks: ' + $script:FeatureChecks + ' passed, 0 failed')
+''')
+result = run(['pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-File', driver,
+              runtime, work / 'fixture.json'], 'controls', timeout=90)
+print(result.stdout.decode(), end='', flush=True)
+PY
+}
+
+if [[ "$#" == 1 && "$1" == --rust-features-only ]]; then
+    test_rust_features_policy
+    exit $?
+fi
+
 dependencies=(pwsh git go cargo rustc minisign python3 jq yq)
 if [[ " $* " == *' --bun-only '* || " $* " == *' --bun-workspaces-only '* ]]; then
     dependencies=(pwsh git bun minisign python3 jq yq)

@@ -2759,6 +2759,11 @@ Windows target in private output. Package identity, tracked-source stability,
 PE architecture and each output's bytes are verified before installation. Rust
 receipts report the actual `cargo_target` and compiler/package evidence.
 
+Rust recipes may set `source_features` and `source_no_default_features` using
+the source-feature contract below. Windows uses identical literal feature
+arguments for metadata and compilation, and retains `cargo_features` and
+`cargo_no_default_features` in the source receipt.
+
 Bun and TypeScript source builds use `source_subdir` and optional `source_entry`.
 They require committed regular `package.json` and `bun.lock` or `bun.lockb` files.
 For a workspace member, the lock may live at a committed ancestor workspace
@@ -2988,6 +2993,22 @@ member's hash and size while preserving the primary receipt fields. Source
 builds require explicit consent through `--from-source` or
 `--allow-source-build` and preserve the configured source-family selection.
 Integrity or installation failures never trigger source fallback.
+
+For Rust, `source_features` is an optional array of at most 64 unique literal
+selectors, each 1–128 ASCII characters matching
+`[A-Za-z0-9_][A-Za-z0-9_.+-]*(/[A-Za-z0-9_][A-Za-z0-9_.+-]*)?`.
+`source_no_default_features` is an optional strict Boolean. Each selector adds
+one `--features` argument; a true Boolean adds `--no-default-features`. Omitted
+settings keep Cargo's normal defaults. Both fields are refused for non-Rust
+recipes, including explicit `[]` or `false`, and invalid configuration cannot
+replace an existing generated installer. Generated Bash and Windows installers
+embed the same selection without accepting a runtime feature override. Direct
+`install_source_build` callers can use repeated `--feature NAME` and
+`--no-default-features`; invalid selections fail before acquisition or compilation.
+The source receipt's `cargo_features` array and `cargo_no_default_features`
+Boolean describe the requested selection. They do not claim to enumerate all
+features enabled by the dependency graph. A selected executable whose required
+features remain disabled prevents installation of the entire family.
 
 Source checkout uses the same GitHub identity as release acquisition and
 freshness: `DSR_GH_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`, then stored GitHub.com

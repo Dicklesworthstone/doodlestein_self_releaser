@@ -7,8 +7,8 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 # Run the identical public integration against a retained baseline checkout.
 ROOT="${DSR_TEST_ROOT:-$ROOT}"
 MODE="${1:-}"
-[[ $# -eq 0 || ( $# -eq 1 && "$MODE" == --go-bun-source-only ) ]] || {
-    printf 'Usage: %s [--go-bun-source-only]\n' "$0" >&2
+[[ $# -eq 0 || ( $# -eq 1 && ( "$MODE" == --go-bun-source-only || "$MODE" == --cargo-features-only ) ) ]] || {
+    printf 'Usage: %s [--go-bun-source-only|--cargo-features-only]\n' "$0" >&2
     exit 4
 }
 # Source cases intentionally use Git's local URL rewrite with no GitHub login.
@@ -52,6 +52,7 @@ import zipfile
 root, work = map(Path, sys.argv[1:3])
 platform, triple = sys.argv[3:5]
 source_families_only = sys.argv[5] == "--go-bun-source-only"
+cargo_features_only = sys.argv[5] == "--cargo-features-only"
 names = ["nativefamily", "family-helper", "family-agent"]
 passed = failed = sequence = 0
 env = os.environ.copy()
@@ -476,9 +477,168 @@ elif code != 200:
             check("bad release checksum preserves the complete installation", snapshot(destination, inodes=True) == prior)
 
 
+def cargo_feature_families():
+    # Required-feature targets are genuine Cargo binaries in two workspace
+    # packages. The real public generator, pinned checkout, compiler, family
+    # transaction and receipt run end to end without fetching dependencies.
+    selected = names[:2]
+    upstream = work / "cargo-feature-upstream"
+    (upstream / "src").mkdir(parents=True)
+    (upstream / "helper/src").mkdir(parents=True)
+    (upstream / "Cargo.toml").write_text(
+        '[package]\nname="nativefamily"\nversion="1.2.5"\nedition="2021"\n'
+        '[workspace]\nmembers=["helper"]\nresolver="2"\n'
+        '[features]\ndefault=["default_mode"]\ndefault_mode=[]\ncli=[]\n'
+        '__SOURCE_CARGO_NO_DEFAULT_FEATURES__=[]\n'
+        '[[bin]]\nname="nativefamily"\npath="src/main.rs"\nrequired-features=["cli"]\n')
+    (upstream / "helper/Cargo.toml").write_text(
+        '[package]\nname="helper"\nversion="1.2.5"\nedition="2021"\n'
+        '[features]\ndefault=["default_mode"]\ndefault_mode=[]\nhelper_cli=[]\n'
+        '[[bin]]\nname="family-helper"\npath="src/main.rs"\nrequired-features=["helper_cli"]\n')
+    for package, name in [("", selected[0]), ("helper", selected[1])]:
+        (upstream / package / "src/main.rs").write_text(
+            'fn main() { let mode = if cfg!(feature="default_mode") { "default" } '
+            'else { "minimal" }; println!("' + name + ' 1.2.5-{}", mode); }\n')
+    required("feature-git-init", ["git", "init", "-q", "-b", "main", upstream])
+    required("feature-git-name", ["git", "-C", upstream, "config", "user.name", "DSR integration"])
+    required("feature-git-email", ["git", "-C", upstream, "config", "user.email", "test@example.invalid"])
+    required("feature-lockfile", ["cargo", "generate-lockfile", "--offline",
+                                  "--manifest-path", upstream / "Cargo.toml"])
+    required("feature-git-add", ["git", "-C", upstream, "add", "Cargo.toml", "Cargo.lock",
+                                "src/main.rs", "helper/Cargo.toml", "helper/src/main.rs"])
+    required("feature-git-commit", ["git", "-C", upstream, "commit", "-qm", "feature-gated executable family"])
+    required("feature-git-tag", ["git", "-C", upstream, "tag", "v1.2.5"])
+    pin = required("feature-git-pin", ["git", "-C", upstream, "rev-parse", "HEAD"]).stdout.decode().strip()
+    required("feature-git-transport", ["git", "config", "--file", env["GIT_CONFIG_GLOBAL"],
+             "url." + upstream.as_uri() + ".insteadOf", "https://github.com/example/nativefamily.git"])
+
+    def configure(label, policy, members=selected):
+        config(family=members)
+        path = work / "config/repos.d/nativefamily.yaml"
+        value = json.loads(path.read_text())
+        value.update(policy)
+        path.write_text(json.dumps(value) + "\n")
+        return generate("cargo-features-" + label)
+
+    destination = work / "cargo-features-installed"
+    source_args = ["--from-source", "--source-timeout", "30"]
+    script = configure("required-without-opt-in", {})
+    install("feature-required-no-opt-in", script, destination, version="1.2.5",
+            extra=source_args, success=False)
+    check("required-feature family stays unavailable without explicit opt-in", not destination.exists())
+
+    features = ["cli", "helper/helper_cli", "__SOURCE_CARGO_NO_DEFAULT_FEATURES__"]
+    script = configure("explicit", {"source_features": features})
+    check("legal template-marker feature remains literal data",
+          "'__SOURCE_CARGO_NO_DEFAULT_FEATURES__'" in script.read_text())
+    receipt = install("feature-explicit-family", script, destination, version="1.2.5", extra=source_args)
+    family("feature-explicit-family", destination, "1.2.5-default", expected=selected, receipt=receipt)
+    source = receipt.get("source", {})
+    check("feature receipt binds exact ordered Cargo selection and default policy",
+          source.get("cargo_features") == features and source.get("cargo_no_default_features") is False
+          and source.get("source_commit") == pin and source.get("requested_ref") == "refs/tags/v1.2.5")
+
+    script = configure("minimal", {"source_features": features, "source_no_default_features": True})
+    receipt = install("feature-minimal-family", script, destination, version="1.2.5",
+                      extra=[*source_args, "--yes"])
+    family("feature-minimal-family", destination, "1.2.5-minimal", expected=selected, receipt=receipt)
+    check("no-default-features receipt records the explicit policy",
+          receipt.get("source", {}).get("cargo_features") == features
+          and receipt.get("source", {}).get("cargo_no_default_features") is True)
+
+    package_script = configure("selected-package", {"source_features": ["cli"],
+                               "source_no_default_features": True, "source_package": "nativefamily"},
+                               members=[selected[0]])
+    package_destination = work / "cargo-feature-package-installed"
+    receipt = install("feature-selected-package", package_script, package_destination,
+                      version="1.2.5", extra=source_args)
+    family("feature-selected-package", package_destination, "1.2.5-minimal",
+           expected=[selected[0]], receipt=receipt)
+
+    before = snapshot(destination, inodes=True)
+    unknown = configure("unknown", {"source_features": ["does_not_exist"]})
+    failure = install("feature-unknown-refused", unknown, destination, version="1.2.5",
+                      extra=[*source_args, "--yes"], success=False)
+    check("unknown Cargo feature cannot partially replace an installed family",
+          snapshot(destination, inodes=True) == before)
+    check("failed feature build cannot claim a source receipt", "source" not in failure)
+
+    # Rejections target an existing output so malformed policy cannot replace
+    # a working installer; JSON-as-YAML retains every scalar's actual type.
+    published = script.read_bytes()
+    output_root = script.parents[1]
+    invalid = [
+        ("scalar", {"source_features": "cli"}),
+        ("null-list", {"source_features": None}),
+        ("bool-list", {"source_features": True}),
+        ("numeric-member", {"source_features": [1]}),
+        ("empty-name", {"source_features": [""]}),
+        ("duplicate", {"source_features": ["cli", "cli"]}),
+        ("comma", {"source_features": ["cli,helper_cli"]}),
+        ("space", {"source_features": ["cli helper_cli"]}),
+        ("newline", {"source_features": ["cli\n"]}),
+        ("option", {"source_features": ["--all-features"]}),
+        ("shell", {"source_features": ["$(touch feature-policy-executed)"]}),
+        ("extra-slash", {"source_features": ["helper/cli/more"]}),
+        ("long-name", {"source_features": ["a" * 129]}),
+        ("long-list", {"source_features": ["feature" + str(i) for i in range(65)]}),
+        ("string-bool", {"source_no_default_features": "true"}),
+        ("null-bool", {"source_no_default_features": None}),
+        ("numeric-bool", {"source_no_default_features": 1}),
+        ("go-empty-opt-in", {"language": "go", "source_features": []}),
+        ("bun-false-opt-in", {"language": "bun", "source_no_default_features": False}),
+    ]
+    for label, policy in invalid:
+        config(family=selected)
+        path = work / "config/repos.d/nativefamily.yaml"
+        value = json.loads(path.read_text())
+        value.update(policy)
+        path.write_text(json.dumps(value) + "\n")
+        result = command("feature-invalid-" + label,
+                         ["bash", root / "dsr", "--json", "installer", "generate", "nativefamily",
+                          "--output-dir", output_root])
+        check("invalid feature policy " + label + " returns configuration failure", result.returncode == 4)
+        check("invalid feature policy " + label + " preserves published installer", script.read_bytes() == published)
+    check("feature strings never execute shell syntax", not (work / "feature-policy-executed").exists())
+
+    # The reusable source API validates policy before acquisition, compiler
+    # dispatch or destination creation, including callers without a generator.
+    marker = work / "feature-validation-calls"
+    direct_env = env | {"DSR_FEATURE_VALIDATION_CALLS": str(marker)}
+    program = ('source "$1" || exit; shift; '
+               '_isb_checkout_source() { printf "checkout\\n" >> "$DSR_FEATURE_VALIDATION_CALLS"; return 99; }; '
+               '_isb_compile() { printf "compile\\n" >> "$DSR_FEATURE_VALIDATION_CALLS"; return 99; }; '
+               'install_source_build "$@"')
+    direct = [
+        ("missing", "rust", ["--feature"]),
+        ("empty", "rust", ["--feature", ""]),
+        ("newline", "rust", ["--feature", "cli\n"]),
+        ("duplicate", "rust", ["--feature", "cli", "--feature", "cli"]),
+        ("option", "rust", ["--feature", "--all-features"]),
+        ("non-rust", "go", ["--feature", "cli"]),
+        ("non-rust-defaults", "bun", ["--no-default-features"]),
+        ("long", "rust", ["--feature", "a" * 129]),
+        ("count", "rust", [arg for i in range(65) for arg in ("--feature", "f" + str(i))]),
+    ]
+    for label, language, options in direct:
+        direct_destination = work / ("feature-invalid-source-" + label)
+        result = command("feature-direct-invalid-" + label,
+                         ["bash", "-c", program, "feature-validation", root / "src/install_source.sh",
+                          "example/nativefamily", "refs/tags/v1.2.5", language, selected[0],
+                          direct_destination, "--allow-build", *options], selected_env=direct_env)
+        check("source API rejects invalid feature policy " + label + " before work",
+              result.returncode == 4 and not direct_destination.exists() and not result.stdout
+              and not marker.exists())
+
+
 if source_families_only:
     source_language_families()
     print(f"Generated Go/Bun source families: {passed} passed, {failed} failed", flush=True)
+    sys.exit(1 if failed else 0)
+
+if cargo_features_only:
+    cargo_feature_families()
+    print(f"Generated Cargo feature families: {passed} passed, {failed} failed", flush=True)
     sys.exit(1 if failed else 0)
 
 

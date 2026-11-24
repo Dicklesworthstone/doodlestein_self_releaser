@@ -73,6 +73,8 @@ SOURCE_LANGUAGE='go'
 SOURCE_SUBDIR='.'
 SOURCE_ENTRY=''
 SOURCE_PACKAGE=''
+SOURCE_CARGO_FEATURES=()
+SOURCE_CARGO_NO_DEFAULT_FEATURES=false
 
 #!/usr/bin/env bash
 # toolchain_detect.sh - Toolchain detection and installation for dsr installers
@@ -1102,6 +1104,7 @@ export -f toolchain_bootstrap
 # install_source_build owner/repo ref language binary new_directory --allow-build
 #   [--subdir relative/path] [--entry relative/path] [--package cargo_package]
 #   [--bin name ...] [--timeout seconds] [--install-toolchain]
+#   [--feature cargo_feature ...] [--no-default-features] (Rust only)
 # Timeout applies to each fetch/compiler command, including its children.
 # stdout: one receipt JSON after a successful build; stderr: progress/errors.
 # Exit: 3 missing dependency, 4 invalid input, 5 timeout/interruption,
@@ -1112,6 +1115,20 @@ _isb_log() { printf '[source-build] %s\n' "$*" >&2; }
 
 _isb_name() {
     [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]
+}
+
+# Cargo accepts one feature or a package/feature selector per argument. Keep
+# the configured list explicit: separators, option syntax and shell code are
+# not feature names, and a repeated selection is an ambiguous recipe.
+_isb_cargo_features_valid() {
+    local feature LC_ALL=C
+    local pattern='^[A-Za-z0-9_][A-Za-z0-9_.+-]*(/[A-Za-z0-9_][A-Za-z0-9_.+-]*)?$'
+    local -A cargo_features_seen=()
+    (($# <= 64)) || return 1
+    for feature in "$@"; do
+        [[ ${#feature} -le 128 && "$feature" =~ $pattern && -z "${cargo_features_seen[$feature]:-}" ]] || return 1
+        cargo_features_seen[$feature]=1
+    done
 }
 
 _isb_binary_name() {
@@ -2746,7 +2763,21 @@ PY
 _isb_compile() (
     local language="$1" tree="$2" output="$3" binary="$4" entry="$5" package="$6" limit="$7"
     shift 7
-    local -a binaries=("$@") targets=() entries=()
+    local -a binaries=() targets=() entries=() features=()
+    local no_default_features=false cargo_selection=false feature
+    while (($#)); do
+        case "$1" in
+            --feature)
+                [[ $# -ge 2 ]] || return 4
+                features+=("$2"); cargo_selection=true; shift 2 ;;
+            --no-default-features)
+                no_default_features=true; cargo_selection=true; shift ;;
+            -*) return 4 ;;
+            *) binaries+=("$1"); shift ;;
+        esac
+    done
+    _isb_cargo_features_valid ${features[@]+"${features[@]}"} || return 4
+    [[ "$language" == rust || "$cargo_selection" == false ]] || return 4
     ((${#binaries[@]})) || binaries=("$binary")
     local status=0 host target name mod=readonly resolved_entries selected_entry index log
     cd "$tree" || return 4
@@ -2818,6 +2849,8 @@ _isb_compile() (
             fi
             local -a args=(build --locked --release "--message-format=$message_format"
                 --target "$host" --target-dir "$output/target")
+            for feature in ${features[@]+"${features[@]}"}; do args+=(--features "$feature"); done
+            $no_default_features && args+=(--no-default-features)
             if [[ -n "$package" ]]; then
                 args+=(--package "$package")
             elif ((${#binaries[@]} > 1)); then
@@ -2973,12 +3006,14 @@ install_source_build() (
     unset GIT_IMPLICIT_WORK_TREE GIT_PREFIX GIT_SHALLOW_FILE GIT_GRAFT_FILE
     unset GIT_NAMESPACE GIT_REPLACE_REF_BASE GIT_TEMPLATE_DIR
     local allow=false subdir=. entry='' package='' limit=3600 _ISB_INSTALL_TOOLCHAIN=false
-    local -a binaries=()
+    local no_default_features=false cargo_selection=false cargo_features_json='[]' feature
+    local -a binaries=() features=() cargo_options=()
     while (($#)); do
         case "$1" in
             --allow-build) allow=true; shift ;;
             --install-toolchain) _ISB_INSTALL_TOOLCHAIN=true; shift ;;
-            --subdir|--entry|--package|--timeout|--bin)
+            --no-default-features) no_default_features=true; cargo_selection=true; shift ;;
+            --subdir|--entry|--package|--timeout|--bin|--feature)
                 [[ $# -ge 2 && -n "$2" ]] || return 4
                 case "$1" in
                     --subdir) subdir="$2" ;;
@@ -2986,6 +3021,7 @@ install_source_build() (
                     --package) package="$2" ;;
                     --timeout) limit="$2" ;;
                     --bin) binaries+=("$2") ;;
+                    --feature) features+=("$2"); cargo_selection=true ;;
                 esac
                 shift 2 ;;
             *) return 4 ;;
@@ -3003,6 +3039,14 @@ install_source_build() (
     case "$language" in rust|go|bun|typescript) ;; *) _isb_log "Unsupported source language: $language"; return 4 ;; esac
     [[ "$language" != rust || -z "$entry" ]] || { _isb_log 'Rust selects the configured binary, not --entry'; return 4; }
     [[ "$language" == rust || -z "$package" ]] || { _isb_log '--package is only supported for Rust'; return 4; }
+    [[ "$language" == rust || "$cargo_selection" == false ]] || {
+        _isb_log 'Cargo feature selection is only supported for Rust'; return 4;
+    }
+    _isb_cargo_features_valid ${features[@]+"${features[@]}"} || {
+        _isb_log 'Cargo features must be at most 64 unique feature or package/feature names, each at most 128 characters'; return 4;
+    }
+    for feature in ${features[@]+"${features[@]}"}; do cargo_options+=(--feature "$feature"); done
+    $no_default_features && cargo_options+=(--no-default-features)
     ((${#binaries[@]})) || binaries=("$binary")
     local -A binary_keys=()
     local -a binary_names=()
@@ -3037,6 +3081,9 @@ install_source_build() (
     for tool in git jq ps cmp; do
         command -v "$tool" >/dev/null 2>&1 || { _isb_log "Required source-build dependency missing: $tool"; return 3; }
     done
+    if ((${#features[@]})); then
+        cargo_features_json=$(printf '%s\n' "${features[@]}" | jq -Rsc 'split("\n")[:-1]') || return 1
+    fi
     case "$language" in rust) tool=cargo ;; go) tool=go ;; *) tool=bun ;; esac
     if ! $_ISB_INSTALL_TOOLCHAIN; then
         command -v "$tool" >/dev/null 2>&1 || { _isb_log "Install $tool first, or opt in with --install-toolchain"; return 3; }
@@ -3067,7 +3114,8 @@ install_source_build() (
     local build_root _ISB_CHECKOUT_ROOT="$tree"
     build_root=$(cd "$tree/$subdir" && pwd -P) || return 4
     _isb_log "Building ${binary_names[*]} from pinned commit $commit ($language)"
-    payloads=$(_isb_compile "$language" "$build_root" "$output" "$binary" "$entry" "$package" "$limit" "${binaries[@]}") || return $?
+    payloads=$(_isb_compile "$language" "$build_root" "$output" "$binary" "$entry" "$package" "$limit" \
+        ${cargo_options[@]+"${cargo_options[@]}"} "${binaries[@]}") || return $?
     # Preserve the source pin through compilation. Build scripts may not move
     # HEAD or modify tracked inputs and then claim they built the pinned tree.
     final_source_state=$(_isb_verify_source_graph "$tree" "$_ISB_SOURCE_GRAPH" "$graph_dir") || return $?
@@ -3114,6 +3162,7 @@ install_source_build() (
     receipt=$(jq -c --arg repo "$repo" --arg ref "$ref" --arg commit "$commit" \
         --arg language "$language" --arg path "$payload" --arg sha "$sha" --argjson size "$size" \
         --argjson binaries "$binaries_json" \
+        --argjson cargo_features "$cargo_features_json" --argjson cargo_no_default_features "$no_default_features" \
         --argjson toolchain "$toolchain_receipt" \
         --slurpfile go_context "$go_context_file" \
         --slurpfile bun_context "$bun_context_file" \
@@ -3124,6 +3173,8 @@ install_source_build() (
           language:$language,path:$path,sha256:$sha,size_bytes:$size,
           compiler:(if $rch_context[0] == null then $compiler else "RCH remote compilation (compiler identity not attested)" end),
           binaries:$binaries,signed_release:false} +
+          (if $language == "rust" then {cargo_features:$cargo_features,
+            cargo_no_default_features:$cargo_no_default_features} else {} end) +
           (if $toolchain == null then {} else {toolchain:$toolchain} end) +
           (if $go_context[0].go_workspace == null then {} else {go_workspace:$go_context[0].go_workspace} end) +
           ($bun_context[0] // {}) +
@@ -5972,6 +6023,9 @@ _install_from_source() {
     $_INSTALL_TOOLCHAIN && args+=(--install-toolchain)
     [[ -z "$SOURCE_ENTRY" ]] || args+=(--entry "$SOURCE_ENTRY")
     [[ -z "$SOURCE_PACKAGE" ]] || args+=(--package "$SOURCE_PACKAGE")
+    local feature
+    for feature in ${SOURCE_CARGO_FEATURES[@]+"${SOURCE_CARGO_FEATURES[@]}"}; do args+=(--feature "$feature"); done
+    $SOURCE_CARGO_NO_DEFAULT_FEATURES && args+=(--no-default-features)
     for name in "${_INSTALL_NAMES[@]}"; do args+=(--bin "$name"); done
     _KEEP_SOURCE_LOGS=true
     receipt=$(install_source_build "$REPO" "$ref" "$SOURCE_LANGUAGE" "$BINARY_NAME" \
