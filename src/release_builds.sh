@@ -723,16 +723,25 @@ def supervise_driver(job, attempt, session, command, manifest, environment, bind
             pass
         os.close(ready_write)
         ready_write = None
-        driver = subprocess.Popen(["timeout", "--foreground", "--kill-after=5s", str(job["timeout"]) + "s"] + command,
+        # Own the deadline here, alongside cancellation and descendant custody.
+        # External timeout providers can rewrite a real signal into 2 or 124,
+        # making the durable receipt disagree with the driver's actual exit.
+        deadline = time.monotonic() + job["timeout"]
+        driver = subprocess.Popen(command,
                                   env=environment, stdin=subprocess.DEVNULL, start_new_session=True,
                                   pass_fds=(lockfd,))
+        deadline_at = None
         forwarded = False
         while driver.poll() is None:
-            if cancel_at is not None:
+            now = time.monotonic()
+            if cancel_at is None and deadline_at is None and now >= deadline:
+                deadline_at = now
+            if cancel_at is not None or deadline_at is not None:
                 if not forwarded:
                     kill_group(driver, signal.SIGTERM)
                     forwarded = True
-                if time.monotonic() >= cancel_at + 3:
+                if ((cancel_at is not None and now >= cancel_at + 3) or
+                        (deadline_at is not None and now >= deadline_at + 5)):
                     kill_group(driver, signal.SIGKILL)
             time.sleep(0.02)
         observed_status = driver.wait()
@@ -744,6 +753,11 @@ def supervise_driver(job, attempt, session, command, manifest, environment, bind
                    "stderr": file_observation(attempt / "stderr.log"),
                    "manifest": file_observation(manifest, optional=True),
                    "native_checkpoint": driver_checkpoint(job, session)}
+        if deadline_at is not None:
+            # A driver may handle TERM and exit zero; retain that real wait
+            # status without admitting an execution that exceeded its budget.
+            receipt["deadline_exceeded"] = True
+            receipt["exit_code"] = 124
         # The driver can finish successfully before supervision is cancelled
         # during descendant settlement or evidence observation. Keep its actual
         # wait status, but never seal that interrupted supervision as success.
@@ -780,16 +794,18 @@ def driver_completion(job, attempt, session, command, manifest, retained_manifes
         item["driver_exit_sha256"] = evidence["sha256"]
         save_state()
     receipt = json.loads(data, object_pairs_hook=pairs)
-    require(isinstance(receipt, dict) and set(receipt) - {"supervisor_signal"} ==
+    require(isinstance(receipt, dict) and set(receipt) - {"supervisor_signal", "deadline_exceeded"} ==
             {"schema_version", "kind", "identity", "wait_status", "exit_code", "stdout", "stderr", "manifest", "native_checkpoint"} and
             ("supervisor_signal" not in receipt or
              (type(receipt["supervisor_signal"]) is int and receipt["supervisor_signal"] in (1, 2, 15))) and
+            ("deadline_exceeded" not in receipt or receipt["deadline_exceeded"] is True) and
             type(receipt["schema_version"]) is int and receipt["schema_version"] == 1 and
             receipt["kind"] == "dsr-release-driver-exit" and
             receipt["identity"] == driver_binding(job, attempt, command) and
             type(receipt["wait_status"]) is int and -64 <= receipt["wait_status"] <= 255 and
             type(receipt["exit_code"]) is int and receipt["exit_code"] ==
             (128 + receipt["supervisor_signal"] if "supervisor_signal" in receipt else
+             124 if "deadline_exceeded" in receipt else
              receipt["wait_status"] if receipt["wait_status"] >= 0 else 128 - receipt["wait_status"]),
             "invalid or unrelated driver exit receipt")
     observed_manifest = file_observation(manifest, optional=True)
@@ -1122,7 +1138,7 @@ try:
                          "admission_timeout": args.admission_timeout}).decode(), end="")
         sys.exit(0)
     require(sys.platform.startswith("linux"), "build-plan execution requires Linux", 3)
-    for tool in ("bash", "jq", "flock", "timeout", "sha256sum"):
+    for tool in ("bash", "jq", "flock", "sha256sum"):
         require(shutil.which(tool), "missing dependency: " + tool, 3)
     # Evaluate the canonical native policy only after validating every driver.
     # Importing completed artifacts starts no compiler. A mixed plan still

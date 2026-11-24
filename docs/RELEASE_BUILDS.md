@@ -94,7 +94,7 @@ bash src/release_builds.sh --plan /srv/release-plan.json \
 Planning validates the plan and returns `publishable: false` without spawning
 builders, checking host credentials, creating persistent state, or validating
 compiler installations. Live execution requires Linux, Python 3, Bash, jq,
-flock, GNU timeout, SHA-256 tooling and the selected builders' dependencies.
+flock, SHA-256 tooling and the selected builders' dependencies.
 The output parent must exist. Paths must be absolute and canonical; symlink
 components are refused. Use a new output directory outside source checkouts.
 Xwin run-directory restrictions still apply, including no whitespace in paths.
@@ -296,6 +296,17 @@ The receipt binds the original argv, plan/job/attempt identity, command and inpu
 documents, stdout and stderr bytes, selected manifest, and the native checkpoint
 when exact native resume is enabled. Its `wait_status` always records the actual
 driver outcome; JSON claiming success cannot replace a nonzero or signal exit.
+
+The supervisor enforces each job's timeout with its own monotonic clock,
+starting immediately before driver launch. It does not invoke a host `timeout`
+utility. A deadline sends TERM and allows up to five seconds before KILL;
+the receipt records `deadline_exceeded: true` and effective exit `124` while
+preserving the actual driver `wait_status`. A driver that handles TERM and
+returns zero still cannot supply a completed shard after its deadline. An
+ordinary driver exit `124` has no deadline marker. The optional marker must be
+the literal boolean `true` and agree with the effective status during recovery.
+Cancellation of the supervisor takes precedence over a previously reached
+deadline and never extends either cleanup budget.
 
 A supervisor can receive cancellation after its driver exits, while it settles
 descendants or reads the evidence. The first caught SIGINT, SIGTERM or SIGHUP is

@@ -3,7 +3,7 @@
 # admission. Native DSR and xwin compilation are explicit driver-boundary fixtures.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
-for tool in python3 bash jq flock timeout sha256sum; do
+for tool in python3 bash jq flock sha256sum; do
     command -v "$tool" >/dev/null || { printf 'SKIP requires %s\n' "$tool"; exit 0; }
 done
 [[ "$(uname -s)" == Linux ]] || { printf 'SKIP requires Linux\n'; exit 0; }
@@ -52,7 +52,7 @@ try:
     (repo / "dsr").write_text('#!/usr/bin/env bash\nexec python3 "$(dirname "$0")/driver.py" dsr "$@"\n')
     (repo / "scripts/xwin-build.sh").write_text('#!/usr/bin/env bash\nexec python3 "$(dirname "$0")/../driver.py" xwin "$@"\n')
     (repo / "driver.py").write_text(r'''
-import fcntl, hashlib, json, os, subprocess, sys, time
+import fcntl, hashlib, json, os, signal, subprocess, sys, time
 from pathlib import Path
 kind, args = sys.argv[1], sys.argv[2:]
 def arg(flag): return args[args.index(flag)+1]
@@ -99,13 +99,22 @@ if start_barrier and spec['id'] in ('linux', 'darwin'):
     while time.monotonic()<deadline and not all((barrier/name).exists() for name in ('linux', 'darwin')):
         time.sleep(.01)
     assert all((barrier/name).exists() for name in ('linux', 'darwin')), 'parallel driver did not start'
-if mode in ('slow', 'leak'):
+if mode in ('slow', 'slow-resistant', 'slow-zero', 'leak'):
+    if mode == 'slow-resistant':
+        signal.signal(signal.SIGTERM, lambda signum, frame: event('term'))
+    elif mode == 'slow-zero':
+        signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
     sleeper = subprocess.Popen(['sleep', '60'])
     Path(spec['control']+'.pid').write_text(str(sleeper.pid))
+    event('descendant-ready')
     if mode == 'slow': sleeper.wait()
+    elif mode != 'leak':
+        while True: time.sleep(1)
 time.sleep(spec.get('delay', 0.3))
 if mode == 'fail':
     event('end'); sys.exit(42)
+if mode in ('exit2', 'exit124'):
+    event('end'); sys.exit(int(mode[4:]))
 output.mkdir(parents=True)
 artifacts = []
 for target in targets:
@@ -337,6 +346,125 @@ os.open, os.link = observe_open, publish_link
               completed['publishable'] and trace.read_bytes() == before_events and
               len(read(folder / 'state.json')['jobs']['linux']['attempts']) == 1)
 
+    def supervisor_deadline_cases():
+        # A hostile/incompatible PATH timeout must never sit between the real
+        # driver and its already-owned supervisor. The payload processes,
+        # signals, monotonic clocks, evidence files and recovery are real.
+        shadow = work / 'timeout-shadow'
+        shadow.mkdir()
+        timeout_marker = work / 'external-timeout-called'
+        timeout_program = shadow / 'timeout'
+        timeout_program.write_text('#!/usr/bin/env python3\nfrom pathlib import Path\n'
+                                   + 'Path(' + repr(str(timeout_marker)) + ').write_text("called")\n'
+                                   + 'raise SystemExit(2)\n')
+        timeout_program.chmod(0o700)
+        environment = dict(fixture_env, PATH=str(shadow) + os.pathsep + fixture_env['PATH'])
+        selected = work / 'owned-deadline-plan.json'
+        selected_plan = dict(plan, required_targets=a['targets'], builds=[dict(a, timeout=1)])
+        encode(selected, selected_plan)
+
+        def dead(pid):
+            status = Path('/proc') / str(pid) / 'stat'
+            return not status.exists() or status.read_text().split(') ', 1)[1].split()[0] == 'Z'
+
+        for mode, statuses, expired in (('exit2', (2,), False), ('exit124', (124,), False),
+                                        ('slow', (-15, 143), True), ('slow-zero', (0,), True),
+                                        ('slow-resistant', (-9, 137), True)):
+            controls['linux'].write_text(mode)
+            folder = work / ('owned-' + mode)
+            started = time.monotonic()
+            result = run(folder, 1, selected, env=environment)
+            elapsed = time.monotonic() - started
+            receipt_path = folder / 'attempts/linux/000001/driver-exit.json'
+            receipt = read(receipt_path)
+            record = read(folder / 'state.json')['jobs']['linux']
+            check(mode + ': retains the actual driver wait status', receipt['wait_status'] in statuses)
+            check(mode + ': deadline evidence agrees with the effective failure',
+                  (receipt.get('deadline_exceeded') is True if expired else 'deadline_exceeded' not in receipt) and
+                  receipt['exit_code'] == (124 if expired else statuses[0]) and
+                  record['attempts'][0]['exit_code'] == receipt['exit_code'])
+            check(mode + ': failed or overdue drivers cannot publish a bundle',
+                  not result['publishable'] and record['complete'] is None and record['candidate'] is None and
+                  not (folder / 'completed/linux').exists() and not (folder / 'bundle').exists())
+            if expired:
+                check(mode + ': compiler descendants stop before the receipt is used',
+                      dead(int(Path(str(controls['linux']) + '.pid').read_text())))
+            if mode == 'slow-resistant':
+                check('deadline keeps the existing five-second TERM grace before KILL', elapsed >= 5.8)
+            if mode == 'slow-zero':
+                saved_receipt = receipt_path.read_bytes()
+                saved_state = read(folder / 'state.json')
+                before_events = trace.read_bytes()
+                for invalid in (False, None, 0, 1, 'true'):
+                    encode(receipt_path, dict(receipt, deadline_exceeded=invalid))
+                    replay = json.loads(json.dumps(saved_state))
+                    previous = replay['jobs']['linux']['attempts'][0]
+                    previous.update(status='running', exit_code=None, completion_pending=True)
+                    previous.pop('driver_exit_sha256', None)
+                    encode(folder / 'state.json', replay)
+                    refusal = run(folder, 1, selected, env=environment)
+                    refused = read(folder / 'state.json')['jobs']['linux']
+                    check('invalid deadline marker ' + repr(invalid) + ' cannot authorize recovery',
+                          not refusal['publishable'] and refused['complete'] is None and
+                          len(refused['attempts']) == 1 and trace.read_bytes() == before_events and
+                          'invalid or unrelated driver exit receipt' in run.stderr)
+                receipt_path.write_bytes(saved_receipt)
+                encode(folder / 'state.json', saved_state)
+                controls['linux'].write_text('good')
+                completed = run(folder, selected=selected, env=environment)
+                check('explicit retry retains exact deadline evidence and runs one fresh attempt',
+                      completed['publishable'] and receipt_path.read_bytes() == saved_receipt and
+                      [(item['status'], item['exit_code']) for item in
+                       read(folder / 'state.json')['jobs']['linux']['attempts']] ==
+                      [('failed', 124), ('completed', 0)])
+        for label, mode, after_deadline in (('cancel-before-deadline', 'slow', False),
+                                             ('cancel-during-grace', 'slow-resistant', True)):
+            controls['linux'].write_text(mode)
+            selected_plan['builds'][0]['timeout'] = 1 if after_deadline else 20
+            encode(selected, selected_plan)
+            folder = work / label
+            before_events = len(trace.read_text().splitlines())
+            # Use the host PATH here as well: this reproduces signal rewriting
+            # by a real incompatible timeout provider, when one is installed.
+            proc = subprocess.Popen(['bash', str(script), '--plan', str(selected),
+                                     '--output-dir', str(folder)], env=fixture_env,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                until = time.monotonic() + 10
+                phase = 'term' if after_deadline else 'descendant-ready'
+                while time.monotonic() < until:
+                    events = [json.loads(row) for row in trace.read_text().splitlines()[before_events:]]
+                    if any(event['phase'] == phase for event in events):
+                        break
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.02)
+                check(label + ': real driver reaches the requested cancellation boundary',
+                      any(event['phase'] == phase for event in events) and proc.poll() is None)
+                proc.send_signal(signal.SIGTERM)
+                out, err = proc.communicate(timeout=10)
+                check(label + ': public cancellation remains terminal',
+                      proc.returncode == 5 and json.loads(out)['exit_code'] == 5)
+            finally:
+                if proc.poll() is None:
+                    proc.terminate()
+                    proc.communicate(timeout=10)
+            receipt = read(folder / 'attempts/linux/000001/driver-exit.json')
+            check(label + ': supervisor signal outranks deadline without replacing driver status',
+                  receipt['supervisor_signal'] == 15 and receipt['exit_code'] == 143 and
+                  receipt['wait_status'] in ((-9, 137) if after_deadline else (-15, 143)) and
+                  (receipt.get('deadline_exceeded') is True if after_deadline else 'deadline_exceeded' not in receipt))
+            check(label + ': no descendant survives or completed shard appears',
+                  dead(int(Path(str(controls['linux']) + '.pid').read_text())) and
+                  not (folder / 'completed/linux').exists() and not (folder / 'bundle').exists())
+        check('release supervision never invokes the PATH timeout provider', not timeout_marker.exists())
+        controls['linux'].write_text('good')
+
+    if os.environ.get('DSR_BUILD_DEADLINE_ONLY') == '1':
+        supervisor_deadline_cases()
+        print(f'Owned deadline receipt tests: {passes} passed, 0 failed', flush=True)
+        print('Retained fixtures: ' + str(work), flush=True)
+        sys.exit(0)
     if os.environ.get('DSR_BUILD_SUPERVISOR_ONLY') == '1':
         supervisor_signal_cases()
         print(f'Supervisor signal receipt tests: {passes} passed, 0 failed', flush=True)
@@ -734,6 +862,7 @@ os.open, os.link = observe_open, publish_link
     imported['builds']=[dict(next(j for j in read(output/'build-set.json')['builds'] if j['id']=='linux'),driver='import')]
     encode(work/'import.json',imported); before_trace=trace.read_bytes(); run(work/'import',selected=work/'import.json')
     check('pre-pinned imported builds need no compiler execution',trace.read_bytes()==before_trace)
+    supervisor_deadline_cases()
     supervisor_signal_cases()
     print(f'\nRelease build-plan execution: {passes} passed, 0 failed',flush=True)
 except Exception:
