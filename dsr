@@ -20036,13 +20036,17 @@ _verify_upgrade() {
             fi
             return 0
         else
+            local all_status=$? all_exit_code=1
+            [[ "$all_status" != 5 ]] || all_exit_code=5
             local duration=$(($(date +%s) - start_time))
             if $JSON_MODE; then
-                json_envelope "verify-upgrade" "error" 1 "{\"mode\": \"all\", \"dry_run\": $dry_run_flag, \"duration_seconds\": $duration}"
+                json_envelope "verify-upgrade" "error" "$all_exit_code" "{\"mode\": \"all\", \"dry_run\": $dry_run_flag, \"duration_seconds\": $duration}"
+            elif [[ "$all_exit_code" == 5 ]]; then
+                log_error "Upgrade verification interrupted"
             else
                 log_error "Some upgrade verifications failed"
             fi
-            return 1
+            return "$all_exit_code"
         fi
     fi
 
@@ -20076,6 +20080,8 @@ _verify_upgrade() {
     local exit_code=0
     if [[ $verify_status -eq 4 ]]; then
         exit_code=4
+    elif [[ $verify_status -eq 5 ]]; then
+        exit_code=5
     elif [[ $verify_status -ne 0 ]]; then
         exit_code=1
     fi

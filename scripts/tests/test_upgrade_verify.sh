@@ -584,8 +584,12 @@ printf 'Latest version: 1.2.3\nUpdate available\n'
 EOF
     cat > "$TEST_TMPDIR/bin/go" << 'EOF'
 #!/usr/bin/env bash
-[[ "$PWD" == "$DSR_UPGRADE_BULK_ROOT/source checkout" && $# -eq 4 &&
-   "$1" == build && "$2" == -o && "$4" == . ]] || exit 64
+[[ "$PWD" == "$DSR_UPGRADE_BULK_ROOT/source checkout" ]] || exit 64
+if [[ $# -eq 4 && "$1" == list && "$2" == -f && "$3" == '{{.Name}}' && "$4" == ./. ]]; then
+    printf 'main\n'
+    exit 0
+fi
+[[ $# -eq 4 && "$1" == build && "$2" == -o && "$4" == ./. ]] || exit 64
 printf 'build\n' >> "$DSR_UPGRADE_BULK_ROOT/build.calls"
 [[ ! -f "$DSR_UPGRADE_BULK_ROOT/fail-build" ]] || exit 32
 cat "$DSR_UPGRADE_BULK_ROOT/built-updater" > "$3" || exit 1
@@ -1121,7 +1125,7 @@ SH
 
 # Compile a dependency-free Rust updater through the public CLI. Its runtime
 # verdict proves which cfg features actually reached rustc; a transparent Cargo
-# recorder also checks that build and metadata receive the same literal argv.
+# recorder also checks the literal build argv and private artifact output policy.
 test_rust_source_features() {
     local dependency
     TESTS_RUN=$((TESTS_RUN + 1))
@@ -1243,7 +1247,10 @@ exit 99
     assert not (case / 'unexpected.calls').exists(), name + ': invoked an installed updater or another compiler'
     calls = [json.loads(line) for line in (case / 'cargo.calls').read_text().splitlines()] if (case / 'cargo.calls').exists() else []
     if expected == 0:
-        assert [args[0] for args in calls] == ['build', 'metadata'], (name, calls)
+        assert [args[0] for args in calls] == ['build'], (name, calls)
+        assert '--message-format=json-render-diagnostics' in calls[0], (name, calls)
+        assert '--target-dir' in calls[0], (name, calls)
+        assert calls[0][calls[0].index('--target-dir') + 1] != env['CARGO_TARGET_DIR'], (name, calls)
         for args in calls:
             features = [args[i + 1] for i, arg in enumerate(args) if arg == '--features']
             assert features == changes.get('source_features', []), (name, args)
@@ -1265,6 +1272,288 @@ PY
     fi
 }
 
+# Exercise source recipe selection through the public CLI with real local
+# compilers. These are intentionally non-Git checkouts: upgrade verification
+# must not reinterpret them as authenticated installer source acquisitions.
+test_source_recipe_layouts() {
+    local dependency status=0
+    TESTS_RUN=$((TESTS_RUN + 1))
+    for dependency in jq yq python3; do
+        if ! command -v "$dependency" >/dev/null; then
+            skip "Source layout upgrade checks require $dependency"
+            return 0
+        fi
+    done
+    python3 - "$PROJECT_ROOT" <<'PY' || status=$?
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+project = Path(sys.argv[1])
+root = Path(tempfile.mkdtemp(prefix='dsr-upgrade-source-layouts-'))
+print('Source layout evidence: ' + str(root), flush=True)
+base_env = os.environ.copy()
+for name in ('DSR_CONFIG_FILE', 'DSR_REPOS_FILE', 'DSR_HOSTS_FILE', 'ACT_REPOS_DIR',
+             'DSR_GH_TOKEN', 'GITHUB_TOKEN', 'GH_TOKEN', 'CARGO_BUILD_TARGET',
+             'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER',
+             'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GOOS', 'GOARCH', 'GOFLAGS',
+             'GOWORK', 'GOENV', 'GOTOOLCHAIN'):
+    base_env.pop(name, None)
+go = shutil.which('go')
+cargo = shutil.which('cargo')
+rustc = shutil.which('rustc')
+if go and subprocess.run([go, 'version'], capture_output=True, timeout=10).returncode:
+    go = None
+host = ''
+if cargo and rustc:
+    probe = subprocess.run([rustc, '-vV'], capture_output=True, text=True, timeout=15)
+    if probe.returncode == 0:
+        host = next((line[6:] for line in probe.stdout.splitlines() if line.startswith('host: ')), '')
+if not host:
+    cargo = None
+
+def write(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(data)
+
+def fixture(name, language):
+    case = root / name
+    source = case / 'source checkout'
+    source.mkdir(parents=True)
+    (case / 'config/repos.d').mkdir(parents=True)
+    (case / 'tmp').mkdir()
+    (case / 'bin').mkdir()
+    env = base_env.copy()
+    for variable, directory in {'DSR_CONFIG_DIR': 'config', 'DSR_STATE_DIR': 'state',
+                                'DSR_CACHE_DIR': 'cache', 'XDG_CONFIG_HOME': 'xdg-config',
+                                'XDG_STATE_HOME': 'xdg-state', 'XDG_CACHE_HOME': 'xdg-cache'}.items():
+        env[variable] = str(case / directory)
+    env.update(PATH=str(case / 'bin') + os.pathsep + base_env['PATH'],
+               TMPDIR=str(case / 'tmp'), CARGO_TARGET_DIR=str(case / 'shared-cargo-target'),
+               CARGO_NET_OFFLINE='true', RUSTUP_AUTO_INSTALL='0', GOTOOLCHAIN='local', GOPROXY='off',
+               DSR_BUILD_TIMEOUT='30', DSR_LAYOUT_CALLS=str(case / 'updater.calls'))
+    config = dict(tool_name='layout', repo='fixture/layout', language=language,
+                  binary_name='dsr-layout-updater', local_path=str(source),
+                  upgrade_check_args=['update', '--check'])
+    return case, source, env, config
+
+def invoke(case, env, config, expected=0, ran=True, extra=()):
+    write(case / 'config/repos.d/layout.yaml', json.dumps(config))
+    result = subprocess.run([str(project / 'dsr'), '--json', 'verify', 'upgrade', 'layout',
+                             '--build-from-source', '--version', '1.2.3', *extra],
+                            cwd=project, env=env, capture_output=True, timeout=45)
+    (case / 'stdout').write_bytes(result.stdout)
+    (case / 'stderr').write_bytes(result.stderr)
+    assert result.returncode == expected, (case.name, result.returncode, result.stderr.decode(errors='replace'))
+    envelope = json.loads(result.stdout)
+    assert envelope['command'] == 'verify-upgrade' and envelope['exit_code'] == expected, (case.name, envelope)
+    calls = case / 'updater.calls'
+    if ran:
+        assert calls.read_text() == 'selected\n', (case.name, calls.read_text())
+    else:
+        assert not calls.exists(), case.name + ': updater ran after refusal or interruption'
+    assert not (case / 'shared-cargo-target').exists(), case.name + ': shared Cargo outputs were modified'
+    print('PASS: source upgrade recipe ' + case.name, flush=True)
+
+go_source = r'''package main
+import ("fmt"; "os")
+func main() {
+    if len(os.Args) != 3 || os.Args[1] != "update" || os.Args[2] != "--check" { os.Exit(64) }
+    if err := os.WriteFile(os.Getenv("DSR_LAYOUT_CALLS"), []byte("selected\n"), 0600); err != nil { panic(err) }
+    fmt.Println("Latest version: 1.2.3\nUpdate available")
+}
+'''
+rust_source = r'''fn main() {
+    if std::env::args().skip(1).collect::<Vec<_>>() != ["update", "--check"] { std::process::exit(64) }
+    std::fs::write(std::env::var("DSR_LAYOUT_CALLS").unwrap(), "selected\n").unwrap();
+    println!("Latest version: 1.2.3\nUpdate available");
+}
+'''
+real_cases = 0
+if go:
+    for name in ('go-custom-entry', 'go-conventional-entry', 'go-inferred-nested',
+                 'go-no-main-filename', 'go-diagnostics', 'go-library', 'go-unsafe-entry', 'go-unsafe-subdir'):
+        case, source, env, config = fixture(name, 'go')
+        tree = source / 'apps/cli'
+        config['source_subdir'] = 'apps/cli'
+        entry = 'entry'
+        config['source_entry'] = entry
+        if name == 'go-conventional-entry':
+            entry = 'cmd/dsr-layout-updater'
+            config.pop('source_entry')
+        elif name == 'go-inferred-nested':
+            config.pop('language')
+        elif name == 'go-no-main-filename':
+            entry = '.'
+            config.pop('source_entry')
+        write(tree / 'go.mod', 'module example.invalid/layout\n\ngo 1.19\n')
+        write(tree / entry / 'program.go', go_source if name != 'go-library' else 'package library\n')
+        expected = 0
+        if name == 'go-diagnostics':
+            write(case / 'bin/go', '#!/usr/bin/env bash\n'
+                  'if [[ "$1" == list ]]; then printf "module download diagnostic\\n" >&2; fi\n'
+                  'exec "$DSR_LAYOUT_REAL_GO" "$@"\n')
+            (case / 'bin/go').chmod(0o700)
+            env['DSR_LAYOUT_REAL_GO'] = go
+        if name == 'go-library':
+            expected = 1
+        elif name == 'go-unsafe-entry':
+            config['source_entry'] = '../outside'
+            expected = 1
+        elif name == 'go-unsafe-subdir':
+            config['source_subdir'] = '../outside'
+            expected = 1
+        invoke(case, env, config, expected, ran=expected == 0)
+        real_cases += 1
+else:
+    print('INFO: genuine Go compiler unavailable; Go source layout cases skipped', flush=True)
+
+if cargo:
+    for name in ('rust-local-no-lock', 'rust-nested-package', 'rust-member',
+                 'rust-default-member', 'rust-host-target', 'rust-package-features',
+                 'rust-diagnostics', 'rust-missing-package', 'rust-ambiguous-binary', 'rust-invalid-selector'):
+        case, source, env, config = fixture(name, 'rust')
+        nested = name != 'rust-local-no-lock'
+        workspace = source / 'workspace' if nested else source
+        if nested:
+            write(workspace / 'Cargo.toml', '[workspace]\nresolver = "2"\nmembers = ["cli", "other"]\n' +
+                  ('default-members = ["cli", "other"]\n' if name == 'rust-ambiguous-binary' else
+                   'default-members = ["cli"]\n' if name == 'rust-default-member' else
+                   'default-members = ["other"]\n'))
+            crate = workspace / 'cli'
+            write(workspace / 'other/Cargo.toml', '[package]\nname = "other"\nversion = "1.0.0"\nedition = "2021"\n'
+                  '[[bin]]\nname = "dsr-layout-updater"\npath = "main.rs"\n')
+            write(workspace / 'other/main.rs', 'fn main() { std::process::exit(71) }\n')
+            config.update(source_subdir='workspace', source_package='selected-cli')
+        else:
+            crate = workspace
+        manifest = '[package]\nname = "selected-cli"\nversion = "1.2.3"\nedition = "2021"\n' \
+                   '[[bin]]\nname = "dsr-layout-updater"\npath = "main.rs"\n'
+        code = rust_source
+        expected = 0
+        if name == 'rust-member':
+            config['source_subdir'] = 'workspace/cli'
+            config.pop('source_package')
+        elif name == 'rust-default-member':
+            config.pop('source_package')
+        elif name == 'rust-host-target':
+            write(workspace / '.cargo/config.toml', '[build]\ntarget = ' + json.dumps(host) +
+                  '\nrustflags = ["--cfg", "selected_tree"]\n')
+            code = '#[cfg(not(selected_tree))]\ncompile_error!("selected project config was ignored");\n' + code
+        elif name == 'rust-package-features':
+            manifest += 'required-features = ["cli"]\n[features]\ndefault = []\ncli = []\n'
+            config.update(source_features=['selected-cli/cli'], source_no_default_features=True)
+            code = '#[cfg(not(feature = "cli"))]\ncompile_error!("selected package feature was ignored");\n' + code
+        elif name == 'rust-diagnostics':
+            write(case / 'bin/cargo', r'''#!/usr/bin/env bash
+printf '%s\n' '{"reason":"build-finished","success":false}' >&2
+exec "$DSR_LAYOUT_REAL_CARGO" "$@"
+''')
+            (case / 'bin/cargo').chmod(0o700)
+            env['DSR_LAYOUT_REAL_CARGO'] = cargo
+        elif name == 'rust-missing-package':
+            config['source_package'] = 'absent'
+            expected = 1
+        elif name == 'rust-ambiguous-binary':
+            config.pop('source_package')
+            expected = 1
+        elif name == 'rust-invalid-selector':
+            config['source_package'] = ['selected-cli']
+            expected = 1
+        write(crate / 'Cargo.toml', manifest)
+        write(crate / 'main.rs', code)
+        invoke(case, env, config, expected, ran=expected == 0)
+        real_cases += 1
+    # A fresh Bash imports the exported builder while running outside src/.
+    # A misleading cwd-local module must never become the implementation.
+    case, source, env, config = fixture('rust-exported-child', 'rust')
+    write(source / 'Cargo.toml', '[package]\nname="exported"\nversion="1.2.3"\nedition="2021"\n'
+          '[[bin]]\nname="dsr-layout-updater"\npath="main.rs"\n')
+    write(source / 'main.rs', rust_source)
+    write(case / 'config/repos.d/layout.yaml', json.dumps(config))
+    foreign = case / 'foreign cwd'
+    foreign.mkdir()
+    write(foreign / 'install_source.sh', 'printf bad > "$DSR_LAYOUT_IMPORT_PROBE"\nreturn 99\n')
+    env.update(DSR_LAYOUT_PROJECT=str(project), DSR_LAYOUT_SOURCE=str(source),
+               DSR_LAYOUT_IMPORT_PROBE=str(case / 'wrong-import'))
+    script = r'''source "$1/src/logging.sh" || exit 90
+source "$1/src/upgrade_verify.sh" || exit 90
+cd "$2" || exit 90
+bash -c 'source "$DSR_LAYOUT_PROJECT/src/logging.sh" || exit 90; _upgrade_build_tool layout "$DSR_LAYOUT_SOURCE" dsr-layout-updater'
+'''
+    result = subprocess.run(['bash', '-c', script, '_', str(project), str(foreign)],
+                            env=env, capture_output=True, timeout=45)
+    (case / 'stdout').write_bytes(result.stdout)
+    (case / 'stderr').write_bytes(result.stderr)
+    assert result.returncode == 0, ('rust-exported-child', result.stderr.decode(errors='replace'))
+    executable = Path(result.stdout.decode().strip())
+    assert executable.is_file() and not executable.is_symlink(), executable
+    check = subprocess.run([str(executable), 'update', '--check'], env=env, capture_output=True, timeout=10)
+    assert check.returncode == 0 and (case / 'updater.calls').read_text() == 'selected\n', check.stderr
+    assert not (case / 'wrong-import').exists(), 'exported helper imported a cwd-local module'
+    assert not (case / 'shared-cargo-target').exists(), 'exported helper used shared Cargo output'
+    real_cases += 1
+    print('PASS: source upgrade recipe rust-exported-child', flush=True)
+else:
+    print('INFO: genuine Cargo/rustc unavailable; Rust source layout cases skipped', flush=True)
+
+# Explicit process-boundary faults: these wrappers are not compiler success
+# fixtures. Signal/deadline results must stop the public caller and bulk loop.
+for name in ('build-signal', 'build-pipe-signal', 'build-terminal-status', 'build-deadline', 'bulk-cancel'):
+    case, source, env, config = fixture(name, 'go')
+    write(source / 'go.mod', 'module example.invalid/layout\n')
+    write(source / 'main.go', go_source)
+    wrapper = r'''#!/usr/bin/env bash
+case "$1" in
+    list) printf 'main\n' ;;
+    build)
+        printf '%s\n' "$PWD" >> "$DSR_LAYOUT_BUILDS"
+        case "$DSR_LAYOUT_FAULT" in
+            deadline) sleep 10 ;;
+            pipe) exec python3 -c 'import os, signal; signal.signal(signal.SIGPIPE, signal.SIG_DFL); os.kill(os.getpid(), signal.SIGPIPE)' ;;
+            terminal) exit 255 ;;
+            *) kill -TERM "$BASHPID" ;;
+        esac
+        ;;
+    *) exit 64 ;;
+esac
+'''
+    write(case / 'bin/go', wrapper)
+    (case / 'bin/go').chmod(0o700)
+    env.update(DSR_LAYOUT_FAULT={'build-deadline': 'deadline', 'build-pipe-signal': 'pipe',
+                               'build-terminal-status': 'terminal'}.get(name, 'signal'),
+               DSR_LAYOUT_BUILDS=str(case / 'build.calls'), DSR_BUILD_TIMEOUT='1')
+    if name != 'bulk-cancel':
+        invoke(case, env, config, 5, ran=False)
+    else:
+        config['tool_name'] = 'a-first'
+        write(case / 'config/repos.d/a-first.yaml', json.dumps(config))
+        later = dict(config, tool_name='z-later')
+        write(case / 'config/repos.d/z-later.yaml', json.dumps(later))
+        result = subprocess.run([str(project / 'dsr'), '--json', 'verify', 'upgrade', '--all',
+                                 '--build-from-source'], cwd=project, env=env, capture_output=True, timeout=15)
+        (case / 'stdout').write_bytes(result.stdout)
+        (case / 'stderr').write_bytes(result.stderr)
+        assert result.returncode == 5, (name, result.returncode, result.stderr.decode(errors='replace'))
+        assert json.loads(result.stdout)['exit_code'] == 5, name
+        assert len((case / 'build.calls').read_text().splitlines()) == 1, name + ': later tool built'
+        assert not (case / 'updater.calls').exists(), name
+        print('PASS: source upgrade recipe ' + name, flush=True)
+print('Real compiler source layout cases: ' + str(real_cases) + '; process interruption cases: 5', flush=True)
+if real_cases == 0:
+    sys.exit(77)
+PY
+    case "$status" in
+        0) pass "Local source recipes select and verify real nested Go/Rust updaters" ;;
+        77) skip "Real source layout compilation requires Go or Cargo/rustc" ;;
+        *) fail "Local source recipe selection or interruption controls" ;;
+    esac
+}
+
 # ============================================================================
 # Cleanup
 # ============================================================================
@@ -1284,6 +1573,12 @@ echo ""
 if [[ "${1:-}" == --bun-source-only ]]; then
     test_bun_source_upgrade
     printf 'Bun source checks: %s; passed: %s; skipped: %s; failed: %s\n' \
+        "$TESTS_RUN" "$TESTS_PASSED" "$TESTS_SKIPPED" "$TESTS_FAILED"
+    [[ "$TESTS_FAILED" -eq 0 ]]; exit $?
+fi
+if [[ "${1:-}" == --source-layouts-only ]]; then
+    test_source_recipe_layouts
+    printf 'Source layout checks: %s; passed: %s; skipped: %s; failed: %s\n' \
         "$TESTS_RUN" "$TESTS_PASSED" "$TESTS_SKIPPED" "$TESTS_FAILED"
     [[ "$TESTS_FAILED" -eq 0 ]]; exit $?
 fi
@@ -1328,6 +1623,7 @@ test_cli_dry_run_runs_and_builds_nothing
 test_cli_all_selection_and_options
 test_bun_source_upgrade
 test_rust_source_features
+test_source_recipe_layouts
 
 echo ""
 echo "Repository Finding Tests:"

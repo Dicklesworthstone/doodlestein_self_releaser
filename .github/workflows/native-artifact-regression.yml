@@ -509,6 +509,19 @@ jobs:
           timeout 120 bash scripts/tests/test_upgrade_verify.sh --rust-features-only \
             2>&1 | tee "$RUNNER_TEMP/collector-evidence/rust-source-upgrade.log"
           test -z "$(git status --porcelain)"
+      - name: Validate local Go and Rust upgrade source layouts
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go version
+          cargo --version
+          rustc --version
+          bash -n src/upgrade_verify.sh
+          bash -n scripts/tests/test_upgrade_verify.sh
+          timeout 120 bash scripts/tests/test_upgrade_verify.sh --source-layouts-only \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/upgrade-source-layouts.log"
+          test -z "$(git status --porcelain)"
       - name: Validate RCH Cargo delivery consumers
         if: runner.os == 'Linux'
         shell: bash

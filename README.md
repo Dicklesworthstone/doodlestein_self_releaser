@@ -1400,9 +1400,15 @@ still requires every selected executable to compile before replacing the
 installed family. See [Rust source features](docs/INSTALLER_GENERATION.md#rust-source-features)
 for validation rules and package-qualified selectors.
 
-The same recipe selection applies when `dsr verify upgrade TOOL --build-from-source`
-compiles a Rust updater locally, so a feature-gated updater can be checked before
-or after publication.
+`dsr verify upgrade TOOL --build-from-source` uses the same source layout and
+feature selection when compiling the primary updater locally. `source_subdir`
+selects a nested Go or Rust project, `source_entry` selects a Go main package,
+and `source_package` selects a Rust workspace package. Rust builds honor
+`source_features` and `source_no_default_features`, including member-specific
+features, and use Cargo's actual executable record from a private target
+directory. Local Go and Rust projects can be checked before committing them or
+creating a lockfile. The configured updater check then runs on the freshly
+compiled executable.
 
 Private GitHub source builds use the same account as release downloads and
 freshness checks: `DSR_GH_TOKEN`, then `GITHUB_TOKEN`, then `GH_TOKEN`, then the

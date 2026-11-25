@@ -3881,12 +3881,26 @@ check after successful public publication; drafts do not run the hook.
 
 When the executable is absent, or `--build-from-source` is selected, verification
 builds the configured primary executable from `local_path`. Go, Rust, Bun and
-TypeScript are supported. Rust builds honor `source_features` and
-`source_no_default_features` from the repository recipe, passing the same literal
-selection to Cargo build and metadata. Absent settings retain Cargo defaults.
-Malformed feature policy, or either Cargo setting on a non-Rust recipe, fails
-before compilation or the updater runs. The source installer's feature-name
-grammar, bounds and duplicate checks apply here too.
+TypeScript are supported. `source_subdir` selects the project directory; when
+`language` is absent, Go or Rust is inferred from that directory. Source paths
+must remain inside the local tree without symlink traversal. Local Go and Rust
+verification accepts uncommitted projects and does not require a preexisting
+lockfile.
+
+For Go, `source_entry` selects the main package relative to the selected project.
+Otherwise the source installer's conventional primary entry selection applies.
+`go list` must identify exactly one main package before compilation. For Rust,
+`source_package` selects a workspace package; absent a package selector, Cargo's
+current-package/default-member rules apply. The build runs from the selected
+project directory so its Cargo configuration applies. Compilation uses a fresh
+private target directory, and verification selects the primary executable from
+Cargo's successful compiler-artifact stream instead of guessing `target/release`.
+
+Rust builds honor `source_features` and `source_no_default_features` from the
+repository recipe, passing the literal selection to Cargo build. Absent settings
+retain Cargo defaults. Malformed feature policy, or either Cargo setting on a
+non-Rust recipe, fails before compilation or the updater runs. The source
+installer's feature-name grammar, bounds and duplicate checks apply here too.
 
 Bun/TypeScript requires an installed Bun compiler and
 uses the source installer's entry, frozen-lock and workspace rules: `source_subdir`
@@ -3897,9 +3911,11 @@ unchanged. A nested workspace uses its admitted root lock and selected member.
 Missing or unsafe entries, changed or inconsistent locks and compilation errors
 fail verification before executing the update command.
 
-Bun dependency installation and compilation use `DSR_BUILD_TIMEOUT` (default
-3600 seconds per operation). Compilation produces a fresh temporary executable
-and does not replace an installed tool or provision a compiler. This verifies
+Source dependency installation, Go package inspection and compilation use
+`DSR_BUILD_TIMEOUT` (default 3600 seconds per operation). A stopped or timed-out
+source build returns interruption status 5; `--all` stops before the next tool.
+Compilation produces a fresh temporary executable and does not replace an
+installed tool or provision a compiler. This verifies
 the primary updater; it does not build or install a complete release family.
 `--dry-run` reports the planned build and check without executing them. JSON
 mode preserves the command's success or failure and does not run the updater a

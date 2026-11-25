@@ -17,8 +17,12 @@
 #   - logging.sh (for log_info, log_error, etc.)
 #   - config.sh (for repos config)
 
+# Exported helpers may run in a fresh Bash whose BASH_SOURCE is environment.
+# Bind module imports to the actual sourced file, never that child shell cwd.
+_DSR_UPGRADE_VERIFY_DIR=$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || { return 3 2>/dev/null || exit 3; }
+export _DSR_UPGRADE_VERIFY_DIR
 # shellcheck source=src/guardrails.sh
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/guardrails.sh" || { return 3 2>/dev/null || exit 3; }
+source "$_DSR_UPGRADE_VERIFY_DIR/guardrails.sh" || { return 3 2>/dev/null || exit 3; }
 
 # ============================================================================
 # Configuration
@@ -92,10 +96,15 @@ upgrade_verify_tool() {
             bin_path="<$binary_name built from $repo_dir>"
         else
             log_info "Building $binary_name from source for $tool_name..."
-            bin_path=$(_upgrade_build_tool "$tool_name" "$repo_dir" "$binary_name")
+            local build_status=0
+            bin_path=$(_upgrade_build_tool "$tool_name" "$repo_dir" "$binary_name") || build_status=$?
 
-            if [[ -z "$bin_path" || ! -x "$bin_path" ]]; then
+            if [[ "$build_status" != 0 || -z "$bin_path" || ! -f "$bin_path" ||
+                  ! -x "$bin_path" || -L "$bin_path" ]]; then
                 log_error "Failed to build $binary_name for $tool_name"
+                if ((build_status == 5 || build_status == 124 || (build_status >= 129 && build_status <= 255))); then
+                    return 5
+                fi
                 return 1
             fi
 
@@ -267,10 +276,16 @@ upgrade_verify_all() {
             continue
         fi
 
+        local verify_status=0
         if upgrade_verify_tool "$tool_name" ${args[@]+"${args[@]}"}; then
             ((passed++))
             results+=("$(jq -nc --arg tool "$tool_name" '{tool: $tool, status: "passed"}')")
         else
+            verify_status=$?
+            if [[ "$verify_status" == 5 ]]; then
+                log_error "Upgrade verification interrupted; later tools were not started"
+                return 5
+            fi
             ((failed++))
             results+=("$(jq -nc --arg tool "$tool_name" '{tool: $tool, status: "failed"}')")
         fi
@@ -555,7 +570,8 @@ _upgrade_build_bun_tool() (
     command -v jq >/dev/null && command -v yq >/dev/null &&
         command -v git >/dev/null && command -v ps >/dev/null || return 3
     [[ "$limit" =~ ^[1-9][0-9]{0,4}$ ]] || return 4
-    source_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || return 3
+    source_dir="${_DSR_UPGRADE_VERIFY_DIR:-}"
+    [[ "$source_dir" == /* && -d "$source_dir" && ! -L "$source_dir" ]] || return 3
     # shellcheck source=SCRIPTDIR/install_source.sh
     source "$source_dir/install_source.sh" || return 3
     _isb_name "$binary_name" && [[ "$binary_name" != *..* ]] || return 4
@@ -583,7 +599,7 @@ _upgrade_build_bun_tool() (
     tree="$_ISB_CHECKOUT_ROOT"
     [[ "$subdir" == . ]] || tree+="/$subdir"
     [[ -d "$tree" ]] || return 4
-    output="$tmpdir/build"
+    output="$tmpdir/.build"
     mkdir "$output" || return 1
     built=$(_isb_compile "$language" "$tree" "$output" "$binary_name" "$entry" '' "$limit") || status=$?
     if ((status != 0)); then
@@ -611,7 +627,8 @@ _upgrade_source_cargo_arguments() (
     [[ ! -L "$config_file" ]] || return 4
     [[ -f "$config_file" ]] || return 0
     command -v jq >/dev/null && command -v yq >/dev/null || return 3
-    source_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || return 3
+    source_dir="${_DSR_UPGRADE_VERIFY_DIR:-}"
+    [[ "$source_dir" == /* && -d "$source_dir" && ! -L "$source_dir" ]] || return 3
     if ! declare -F _config_read_single_mapping_json >/dev/null; then
         # shellcheck source=SCRIPTDIR/config.sh
         source "$source_dir/config.sh" || return 3
@@ -647,75 +664,151 @@ _upgrade_source_cargo_arguments() (
     return 0
 )
 
-# Build tool from source
-_upgrade_build_tool() {
+# Build the configured primary updater from a local checkout. Share installer
+# recipe/path admission and command supervision, but retain local verification
+# semantics: Go/Rust inputs need not be committed or have a pre-existing lock.
+# This is not a pinned-source build receipt or a release artifact attestation.
+_upgrade_build_tool() (
     local tool_name="$1"
     local repo_dir="$2"
     local binary_name="${3:-$tool_name}"
-    local language='' build_language cargo_arguments
+    local source_dir configuration='{}' selection config_file root tree subdir entry package language
+    local cargo_arguments limit="${DSR_BUILD_TIMEOUT:-3600}" status=0 log_file selected package_name
     local -a cargo_options=()
-    if declare -F config_get_tool_field >/dev/null; then
-        language=$(config_get_tool_field "$tool_name" language '') || return $?
+    command -v jq >/dev/null && command -v ps >/dev/null || return 3
+    [[ "$limit" =~ ^[1-9][0-9]{0,4}$ ]] || return 4
+    source_dir="${_DSR_UPGRADE_VERIFY_DIR:-}"
+    [[ "$source_dir" == /* && -d "$source_dir" && ! -L "$source_dir" ]] || return 3
+    # shellcheck source=SCRIPTDIR/install_source.sh
+    source "$source_dir/install_source.sh" || return 3
+    _isb_name "$tool_name" && _isb_name "$binary_name" || return 4
+    config_file="${ACT_REPOS_DIR:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.d}/$tool_name.yaml"
+    [[ ! -L "$config_file" ]] || return 4
+    if [[ -e "$config_file" ]]; then
+        [[ -f "$config_file" ]] || return 4
+        command -v yq >/dev/null || return 3
+        if ! declare -F _config_read_single_mapping_json >/dev/null; then
+            # shellcheck source=SCRIPTDIR/config.sh
+            source "$source_dir/config.sh" || return 3
+        fi
+        configuration=$(_config_read_single_mapping_json "$config_file") || return $?
     fi
-    build_language="$language"
-    if [[ "$language" != bun && "$language" != typescript ]]; then
-        if [[ -f "$repo_dir/go.mod" ]]; then build_language=go
-        elif [[ -f "$repo_dir/Cargo.toml" ]]; then build_language=rust
+    selection=$(jq -ce '
+        {language:(if has("language") then .language else "" end),
+         subdir:(if has("source_subdir") then .source_subdir else "." end),
+         entry:(if has("source_entry") then .source_entry else "" end),
+         package:(if has("source_package") then .source_package else "" end)} |
+        select((.language | type == "string") and
+               (.subdir | type == "string" and length > 0) and
+               (.entry | type == "string") and (.package | type == "string"))
+    ' <<< "$configuration") || return 4
+    language=$(jq -r .language <<< "$selection") || return 4
+    subdir=$(jq -r .subdir <<< "$selection") || return 4
+    entry=$(jq -r .entry <<< "$selection") || return 4
+    package=$(jq -r .package <<< "$selection") || return 4
+    root=$(cd "$repo_dir" && pwd -P) || return 4
+    _isb_path_in_tree "$root" "$subdir" || return 4
+    tree="$root"
+    [[ "$subdir" == . ]] || tree+="/$subdir"
+    [[ -d "$tree" ]] || return 4
+    [[ -z "$entry" ]] || _isb_relative_path "$entry" || return 4
+    [[ -z "$package" ]] || _isb_name "$package" || return 4
+    if [[ -z "$language" ]]; then
+        if [[ -f "$tree/go.mod" ]]; then language=go
+        elif [[ -f "$tree/Cargo.toml" ]]; then language=rust
         fi
     fi
-    cargo_arguments=$(_upgrade_source_cargo_arguments "$tool_name" "$build_language") || return $?
+    case "$language" in go|rust|bun|typescript) ;; *) return 4 ;; esac
+    [[ "$language" != rust || -z "$entry" ]] || return 4
+    [[ "$language" == rust || -z "$package" ]] || return 4
+    cargo_arguments=$(_upgrade_source_cargo_arguments "$tool_name" "$language") || return $?
     [[ -z "$cargo_arguments" ]] || mapfile -t cargo_options <<< "$cargo_arguments"
     local tmpdir
+    umask 077
     tmpdir=$(mktemp -d) || return 1
+    tmpdir=$(cd "$tmpdir" && pwd -P) || return 1
     local bin_path="$tmpdir/$binary_name"
+    # Compiler stdout is protocol data. Keep warnings/download diagnostics on
+    # stderr in the watchdog log instead of mixing them into names or JSON.
+    _upgrade_capture_stdout() {
+        local destination="$1"
+        shift
+        "$@" > "$destination"
+    }
 
     if [[ "$language" == bun || "$language" == typescript ]]; then
         log_debug "Building Bun/TypeScript project..."
         _upgrade_build_bun_tool "$tool_name" "$repo_dir" "$binary_name" "$tmpdir" || return $?
-    elif [[ -f "$repo_dir/go.mod" ]]; then
-        # Go project.  cd into the module so module-mode resolves
-        # correctly regardless of the caller's PWD; the subshell
-        # contains the cd so the rest of the script is unaffected.
+    elif [[ "$language" == go ]]; then
+        command -v go >/dev/null || return 3
+        selected=$(_isb_source_entries go "$tree" "$binary_name" "$entry" "$binary_name") || return $?
+        mkdir "$tmpdir/.build" || return 1
         log_debug "Building Go project..."
-        if [[ -d "$repo_dir/cmd/$binary_name" ]]; then
-            ( cd "$repo_dir" && go build -o "$bin_path" "./cmd/$binary_name" ) 2>/dev/null
-        elif [[ -f "$repo_dir/main.go" ]]; then
-            ( cd "$repo_dir" && go build -o "$bin_path" . ) 2>/dev/null
-        fi
-    elif [[ -f "$repo_dir/Cargo.toml" ]]; then
-        # Rust project.  Use --bin so we get the right binary in
-        # multi-binary crates, then ask cargo where target_directory
-        # actually is so this works under CARGO_TARGET_DIR overrides
-        # (e.g. /data/tmp/cargo-target on this VPS).  Previously we
-        # hardcoded $repo_dir/target/release/$tool_name, which
-        # silently failed whenever CARGO_TARGET_DIR was set.
-        log_debug "Building Rust project..."
-        if cargo build --release \
-                --manifest-path "$repo_dir/Cargo.toml" \
-                --bin "$binary_name" ${cargo_options[@]+"${cargo_options[@]}"} 2>/dev/null; then
-            local target_dir target_path
-            if command -v jq &>/dev/null; then
-                target_dir=$(cargo metadata --no-deps --format-version=1 \
-                                --manifest-path "$repo_dir/Cargo.toml" \
-                                ${cargo_options[@]+"${cargo_options[@]}"} 2>/dev/null \
-                                | jq -r '.target_directory // empty' 2>/dev/null)
+        _isb_run "$limit" "$tmpdir/.build/package.log" _upgrade_capture_stdout \
+            "$tmpdir/.build/package-name" _isb_in_dir "$tree" \
+            go list -f '{{.Name}}' "./$selected" || status=$?
+        if ((status == 0)); then
+            package_name=$(cat "$tmpdir/.build/package-name") || status=$?
+            if ((status == 0)) && [[ "$package_name" != main ]]; then
+                log_error "Configured Go source entry is not one executable: $selected"
+                status=6
             fi
-            [[ -z "$target_dir" ]] && target_dir="${CARGO_TARGET_DIR:-$repo_dir/target}"
-            target_path="$target_dir/release/$binary_name"
-            if [[ -f "$target_path" ]]; then
-                cp "$target_path" "$bin_path"
+        fi
+        if ((status == 0)); then
+            _isb_run "$limit" "$tmpdir/.build/compile.log" _isb_in_dir "$tree" \
+                go build -o "$bin_path" "./$selected" || status=$?
+        fi
+    else
+        command -v cargo >/dev/null || return 3
+        [[ -f "$tree/Cargo.toml" && ! -L "$tree/Cargo.toml" ]] || return 4
+        mkdir "$tmpdir/.build" || return 1
+        local -a build_args=(build --release --message-format=json-render-diagnostics
+            --manifest-path "$tree/Cargo.toml" --target-dir "$tmpdir/.build/target" --bin "$binary_name")
+        [[ -z "$package" ]] || build_args+=(--package "$package")
+        build_args+=(${cargo_options[@]+"${cargo_options[@]}"})
+        log_debug "Building Rust project..."
+        log_file="$tmpdir/.build/compile.log"
+        _isb_run "$limit" "$log_file" _upgrade_capture_stdout "$tmpdir/.build/artifacts.jsonl" \
+            _isb_in_dir "$tree" cargo "${build_args[@]}" || status=$?
+        if ((status == 0)); then
+            # Cargo's actual artifact record owns the output path, including
+            # .cargo/config.toml build.target and Windows executable suffixes.
+            # Never execute a guessed or stale shared target/release binary.
+            selected=$(jq -erRs --arg name "$binary_name" '
+                [split("\n")[] | fromjson?] as $messages |
+                [$messages[] | select(.reason == "compiler-artifact" and
+                    .target.name == $name and (.target.kind | index("bin") != null))] as $binaries |
+                select(($binaries | length) == 1 and
+                    ([$messages[] | select(.reason == "build-finished")] | length == 1) and
+                    any($messages[]; .reason == "build-finished" and .success == true)) |
+                $binaries[0].executable | select(type == "string" and length > 0 and
+                    (test("[[:cntrl:]]") | not))
+            ' "$tmpdir/.build/artifacts.jsonl") || {
+                status=$?
+                # jq uses 5 for an empty/invalid artifact selection, not the
+                # watchdog interruption code. Preserve actual signal statuses.
+                if ((status != 124 && status < 129)); then status=6; fi
+            }
+            if ((status == 0)); then
+                [[ "$selected" == "$tmpdir/.build/target/"* && -f "$selected" &&
+                   -s "$selected" && -x "$selected" && ! -L "$selected" ]] &&
+                    _isb_path_in_tree "$tmpdir/.build/target" "${selected#"$tmpdir/.build/target/"}" || status=6
+            fi
+            if ((status == 0)); then
+                cp -p -- "$selected" "$bin_path" || status=$?
             fi
         fi
     fi
 
-    if [[ -x "$bin_path" ]]; then
-        echo "$bin_path"
+    if ((status == 0)) && [[ -f "$bin_path" && -s "$bin_path" && -x "$bin_path" && ! -L "$bin_path" ]]; then
+        printf '%s\n' "$bin_path"
         return 0
     fi
 
-    rm -rf "$tmpdir"
-    return 1
-}
+    log_error "Source verification build failed; diagnostics: $tmpdir"
+    if ((status == 5 || status == 124 || (status >= 129 && status <= 255))); then return 5; fi
+    return 6
+)
 
 # Export functions
 export -f upgrade_verify_tool upgrade_verify_all upgrade_verify_json
