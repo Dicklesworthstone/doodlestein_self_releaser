@@ -837,7 +837,10 @@ function Build-DsrRustSourceOutputs {
         $cargoVersion -cnotmatch '^cargo [0-9]' -or $cargoVersion.Length -gt 4096) {
         Stop-DsrInstall 'Invalid installed Rust compiler identity' 6
     }
-    $metadataArguments = @('metadata', '--format-version=1', '--no-deps', '--locked', '--manifest-path', $manifest) + $featureArguments
+    # Nonresolving metadata describes declared providers. A bare feature for
+    # build --package can belong only to that member, not the current root;
+    # applying it here would reject a valid build before package selection.
+    $metadataArguments = @('metadata', '--format-version=1', '--no-deps', '--locked', '--manifest-path', $manifest)
     $metadataText = Invoke-DsrSourceCommand @cargoBase -Arguments $metadataArguments -Log ([IO.Path]::Combine($Logs, 'cargo-metadata')) -Capture
     $metadata = ConvertFrom-DsrJson $metadataText
     if ($metadata -isnot [Collections.IDictionary] -or -not $metadata.Contains('version') -or $metadata.version -ne 1 -or
@@ -852,7 +855,9 @@ function Build-DsrRustSourceOutputs {
     $lock = [IO.Path]::Combine($workspace, 'Cargo.lock')
     $lockRelative = [IO.Path]::GetRelativePath($Source, $lock).Replace('\', '/')
     $manifestRelative = [IO.Path]::GetRelativePath($Source, $manifest).Replace('\', '/')
-    if ($lockRelative -cnotin $Files -or $manifestRelative -cnotin $Files) {
+    $workspaceManifest = Get-DsrPlainPath ([IO.Path]::Combine($workspace, 'Cargo.toml')) -File
+    $workspaceManifestRelative = [IO.Path]::GetRelativePath($Source, $workspaceManifest).Replace('\', '/')
+    if ($lockRelative -cnotin $Files -or $manifestRelative -cnotin $Files -or $workspaceManifestRelative -cnotin $Files) {
         Stop-DsrInstall 'Rust source installation requires a committed Cargo.toml and workspace Cargo.lock' 4
     }
     $null = Get-DsrPlainPath $lock -File
@@ -864,10 +869,16 @@ function Build-DsrRustSourceOutputs {
     } elseif ($Selection.binaries.Count -eq 1) {
         # Match cargo build's current-package/default-members behavior. A
         # complete multi-package family deliberately selects the workspace.
-        $current = @($packages | Where-Object { [IO.Path]::GetFullPath($_.manifest_path).Equals($manifest, $pathComparison) })
-        if ($current.Count -eq 1) { $packages = $current }
-        elseif ($metadata.Contains('workspace_default_members')) {
+        if ($manifest.Equals($workspaceManifest, $pathComparison) -and $metadata.Contains('workspace_default_members')) {
+            # An explicit workspace default-members selection also applies
+            # when the workspace root is itself a package.
             $packages = @($packages | Where-Object { $_.id -cin $metadata.workspace_default_members })
+        } else {
+            $current = @($packages | Where-Object { [IO.Path]::GetFullPath($_.manifest_path).Equals($manifest, $pathComparison) })
+            if ($current.Count -eq 1) { $packages = $current }
+            elseif ($metadata.Contains('workspace_default_members')) {
+                $packages = @($packages | Where-Object { $_.id -cin $metadata.workspace_default_members })
+            }
         }
     }
     $providers = @()
@@ -912,6 +923,19 @@ function Build-DsrRustSourceOutputs {
         if ($selected.Count -ne 1 -or $selected[0].package_id -cne $provider.package_id -or
             $selected[0].executable -isnot [string] -or -not $selected[0].executable) {
             Stop-DsrInstall ('Cargo did not produce one executable from its selected provider: ' + $provider.name) 6
+        }
+        $record = $selected[0]
+        if (-not $record.Contains('manifest_path') -or $record.manifest_path -isnot [string] -or
+            -not [IO.Path]::IsPathFullyQualified($record.manifest_path) -or
+            -not $record.target.Contains('src_path') -or $record.target.src_path -isnot [string] -or
+            -not [IO.Path]::IsPathFullyQualified($record.target.src_path)) {
+            Stop-DsrInstall ('Cargo executable lacks its admitted source identity: ' + $provider.name) 6
+        }
+        $builtManifest = Get-DsrPlainPath $record.manifest_path -File
+        $builtEntry = Get-DsrPlainPath $record.target.src_path -File
+        if (-not $builtManifest.Equals([IO.Path]::GetFullPath([IO.Path]::Combine($Source, $provider.manifest)), $pathComparison) -or
+            -not $builtEntry.Equals([IO.Path]::GetFullPath([IO.Path]::Combine($Source, $provider.entry)), $pathComparison)) {
+            Stop-DsrInstall ('Cargo executable changed its admitted source provider: ' + $provider.name) 6
         }
         $expected = [IO.Path]::Combine($targetDirectory, $target, 'release', $provider.name)
         $produced = Get-DsrPlainPath $selected[0].executable -File

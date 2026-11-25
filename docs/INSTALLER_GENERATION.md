@@ -670,8 +670,10 @@ the installer reads Cargo metadata and requires exactly one workspace package
 and binary target to provide each selected executable. A complete family may
 span packages outside the workspace's default members. Set `source_package` to
 restrict all selected binaries to one named package; a companion cannot silently
-come from another package. For a singleton without `source_package`, Cargo's
-current package or default workspace members apply. Rust uses binary names,
+come from another package. For a singleton without `source_package`, a build at
+the workspace root selects Cargo's default members even when the root is also a
+package. A build in a member directory selects that current package. Both the
+selected package manifest and the workspace manifest must be committed. Rust uses binary names,
 so `source_entry` must be unset.
 
 One `cargo build --locked --release` invocation builds the selected family for
@@ -685,7 +687,7 @@ project-specific cfg and linker flags. Inherited compiler wrappers are cleared.
 `RUSTUP_AUTO_INSTALL=0`
 prevents repository toolchain files from implicitly installing a compiler.
 Cargo's actual compiler-artifact messages must name exactly the selected
-providers and private executable paths before PE architecture checks and
+package, manifest, source entry and private executable paths before PE architecture checks and
 installation proceed. Missing or stale locks, ambiguous providers and partial
 compilation failures leave the existing installation unchanged.
 
@@ -909,8 +911,9 @@ names. Configure the features needed by every selected binary's
 `required-features`; a missing feature or unknown selector fails the complete
 build and leaves the previous installed family intact.
 
-Windows metadata and compilation use the same feature arguments. Both source
-engines retain the exact requested array in `cargo_features` and the Boolean in
+Both engines leave feature resolution to the selected `cargo build` invocation;
+their nonresolving metadata queries describe declared providers without applying
+package-specific build features. Both source engines retain the exact requested array in `cargo_features` and the Boolean in
 `cargo_no_default_features` in the local-build receipt. These fields describe
 the requested Cargo selection, not a complete resolved dependency feature graph.
 Generated installers embed this policy; they do not accept an end-user feature

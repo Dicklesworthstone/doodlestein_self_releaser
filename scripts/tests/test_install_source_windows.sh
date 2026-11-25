@@ -98,7 +98,92 @@ assert policy['source']['features'] == ['cli'] and policy['source']['no_default_
 print('PASS: generated Windows policy retains explicit Rust feature selection', flush=True)
 
 fixture = dict(source=str(source), pe=str(pe), cargo=shutil.which('cargo'), rustc=shutil.which('rustc'),
-               work=str(work), policy=policy)
+               work=str(work), policy=policy,
+               source_module=os.environ.get('DSR_TEST_INSTALL_SOURCE_WINDOWS_MODULE', ''))
+workspace = work / 'workspace'
+workspace_files = {
+    'Cargo.toml': '''[package]
+name = "root-provider"
+version = "0.1.0"
+edition = "2021"
+[workspace]
+members = ["member", "companion"]
+default-members = ["member"]
+resolver = "2"
+[[bin]]
+name = "root-app"
+path = "src/main.rs"
+''',
+    'src/main.rs': 'fn main() { println!("root-provider"); }\n',
+    'member/Cargo.toml': '''[package]
+name = "member-provider"
+version = "0.1.0"
+edition = "2021"
+[features]
+cli = []
+[[bin]]
+name = "app"
+path = "src/main.rs"
+[[bin]]
+name = "app-feature"
+path = "src/feature.rs"
+required-features = ["cli"]
+''',
+    'member/src/main.rs': 'fn main() { println!("member-provider"); }\n',
+    'member/src/feature.rs': '#[cfg(not(feature="cli"))]\ncompile_error!("cli is required");\nfn main() { println!("member-feature"); }\n',
+    'companion/Cargo.toml': '''[package]
+name = "companion-provider"
+version = "0.1.0"
+edition = "2021"
+[[bin]]
+name = "helper"
+path = "src/main.rs"
+''',
+    'companion/src/main.rs': 'fn main() { println!("companion-provider"); }\n',
+}
+for relative, content in workspace_files.items():
+    destination = workspace / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(content)
+run(['cargo', 'generate-lockfile', '--offline', '--manifest-path', workspace / 'Cargo.toml'], 'workspace-lock')
+run(['git', 'init', '-q', '-b', 'main', workspace], 'workspace-init')
+run(['git', '-C', workspace, 'add', '.'], 'workspace-add')
+run(['git', '-C', workspace, '-c', 'user.name=DSR installer fixture',
+     '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'Pinned Rust workspace'], 'workspace-commit')
+fixture['workspace'] = str(workspace)
+fixture['workspace_files'] = run(['git', '-C', workspace, 'ls-files', '-z'], 'workspace-files').stdout.decode().split('\0')[:-1]
+fixture['workspace_commit'] = run(['git', '-C', workspace, 'rev-parse', 'HEAD'], 'workspace-pin').stdout.decode().strip()
+fixture['workspace_cases'] = []
+compiler = run(['rustc', '-vV'], 'oracle-compiler').stdout.decode()
+host = re.search(r'^host: (\S+)$', compiler, re.M).group(1)
+for name, subdir, package, features, binaries in (
+        ('default-member', '.', '', [], ['app']),
+        ('member-feature', '.', 'member-provider', ['cli'], ['app-feature']),
+        ('member-current', 'companion', '', [], ['helper']),
+        ('workspace-family', '.', '', [], ['app', 'helper'])):
+    arguments = ['cargo', 'build', '--locked', '--offline', '--release', '--message-format=json',
+                 '--manifest-path', workspace / subdir / 'Cargo.toml', '--target', host,
+                 '--target-dir', work / 'oracle-target']
+    if package:
+        arguments += ['--package', package]
+    elif len(binaries) > 1:
+        arguments += ['--workspace']
+    for feature in features:
+        arguments += ['--features', feature]
+    for binary in binaries:
+        arguments += ['--bin', binary]
+    oracle = run(arguments, 'oracle-' + name,
+                 dict(RUSTC=shutil.which('rustc'), RUSTC_WRAPPER='', RUSTC_WORKSPACE_WRAPPER='',
+                      RUSTFLAGS='', CARGO_ENCODED_RUSTFLAGS=''), timeout=45)
+    records = [json.loads(line) for line in oracle.stdout.decode().splitlines() if line.startswith('{')]
+    providers = [record for record in records if record.get('reason') == 'compiler-artifact'
+                 and record.get('target', {}).get('name') in binaries and record.get('executable')]
+    assert len(providers) == len(binaries), name + ': actual Cargo did not identify the requested family'
+    for provider in providers:
+        run([provider['executable']], 'oracle-output-' + name + '-' + provider['target']['name'])
+    fixture['workspace_cases'].append(dict(name=name, subdir=subdir, package=package, features=features,
+                                          binaries=[binary + '.exe' for binary in binaries], providers=providers))
+    print('PASS: real Cargo builds and executes ' + name + ' from the committed workspace', flush=True)
 (work / 'fixture.json').write_text(json.dumps(fixture))
 driver = work / 'driver.ps1'
 driver.write_text(r'''param([string]$Runtime, [string]$FixturePath)
@@ -110,11 +195,12 @@ $marker = '# DSR_WINDOWS_INSTALL_DISPATCH:'
 $offset = $text.IndexOf($marker, [StringComparison]::Ordinal)
 if ($offset -le 0 -or $offset -ne $text.LastIndexOf($marker, [StringComparison]::Ordinal)) { throw 'Invalid dispatch marker' }
 . ([scriptblock]::Create($text.Substring(0, $offset)))
+if ($fixture.source_module) { . ([scriptblock]::Create([IO.File]::ReadAllText($fixture.source_module))) }
 $script:FeatureChecks = 0
+$script:FeatureFailures = 0
 function Check-FeatureCase([string]$Name, [bool]$Condition) {
-    if (-not $Condition) { throw $Name }
-    $script:FeatureChecks++
-    Write-Host ('PASS: ' + $Name)
+    if ($Condition) { $script:FeatureChecks++; Write-Host ('PASS: ' + $Name) }
+    else { $script:FeatureFailures++; Write-Host ('FAIL: ' + $Name) }
 }
 function New-FeaturePolicy {
     return @{ language='rust'; subdir='.'; package='' }
@@ -158,6 +244,8 @@ foreach ($language in @('go','bun','typescript')) {
 $script:RealFeatureCommand = ${function:Invoke-DsrSourceCommand}
 $script:FeatureCalls = [Collections.Generic.List[object]]::new()
 $script:FeatureMetadata = $null
+$script:WorkspaceCase = $null
+$script:ArtifactChange = ''
 function Invoke-DsrSourceCommand {
     param([string]$Executable, [string[]]$Arguments, [string]$Directory, [string]$Log,
         [int]$Timeout, $Environment=@{}, [int]$FailureCode=6, [switch]$Capture)
@@ -167,10 +255,31 @@ function Invoke-DsrSourceCommand {
         # admission, PE validation, hashing and returned receipts remain real.
         $target = $Arguments[[Array]::IndexOf($Arguments, '--target') + 1]
         $directory = New-DsrDirectoryChain ([IO.Path]::Combine($Environment.CARGO_TARGET_DIR, $target, 'release'))
+        if ($null -ne $script:WorkspaceCase) {
+            $records = @()
+            foreach ($provider in $script:WorkspaceCase.providers) {
+                $record = ConvertFrom-DsrJson (ConvertTo-Json -Depth 30 -Compress -InputObject $provider)
+                $destination = [IO.Path]::Combine($directory, ($record.target.name + '.exe'))
+                Copy-DsrNewFile $fixture.pe $destination
+                $record.executable = $destination
+                $record.filenames = @($destination)
+                switch ($script:ArtifactChange) {
+                    'manifest' { $record.manifest_path = [IO.Path]::Combine($fixture.workspace, 'companion', 'Cargo.toml') }
+                    'entry' { $record.target.src_path = [IO.Path]::Combine($fixture.workspace, 'companion', 'src', 'main.rs') }
+                    'missing-manifest' { $record.Remove('manifest_path') }
+                    'missing-entry' { $record.target.Remove('src_path') }
+                    'package' { $record.package_id = 'unselected-package' }
+                }
+                $records += ConvertTo-Json -Depth 30 -Compress -InputObject $record
+            }
+            return $records -join "`n"
+        }
         $destination = [IO.Path]::Combine($directory, 'app.exe')
         Copy-DsrNewFile $fixture.pe $destination
         $package = @($script:FeatureMetadata.packages | Where-Object { $_.name -ceq 'feature-probe' })[0]
-        return (@{reason='compiler-artifact';package_id=$package.id;target=@{name='app';kind=@('bin')};
+        $entry = @($package.targets | Where-Object { $_.name -ceq 'app' -and 'bin' -cin $_.kind })[0]
+        return (@{reason='compiler-artifact';package_id=$package.id;manifest_path=$package.manifest_path;
+            target=@{name='app';kind=@('bin');src_path=$entry.src_path};
             executable=$destination} | ConvertTo-Json -Depth 8 -Compress)
     }
     $result = & $script:RealFeatureCommand @PSBoundParameters
@@ -197,9 +306,14 @@ foreach ($case in @(
         for ($i=0; $i -lt $request.arguments.Count; $i++) {
             if ($request.arguments[$i] -ceq '--features') { $selected += $request.arguments[++$i] }
         }
-        Check-FeatureCase ($case.name + ' ' + $request.arguments[0] + ' preserves literal feature argv and default policy') `
-            (((ConvertTo-Json -Compress -InputObject @($selected)) -ceq (ConvertTo-Json -Compress -InputObject @($case.features))) -and
-             (('--no-default-features' -cin $request.arguments) -eq $case.disabled))
+        if ($request.arguments[0] -ceq 'metadata') {
+            Check-FeatureCase ($case.name + ' metadata describes declarations without resolving build features') `
+                ($selected.Count -eq 0 -and '--no-default-features' -cnotin $request.arguments)
+        } else {
+            Check-FeatureCase ($case.name + ' build preserves literal feature argv and default policy') `
+                (((ConvertTo-Json -Compress -InputObject @($selected)) -ceq (ConvertTo-Json -Compress -InputObject @($case.features))) -and
+                 (('--no-default-features' -cin $request.arguments) -eq $case.disabled))
+        }
     }
     Check-FeatureCase ($case.name + ' receipt retains exactly the selected Cargo feature policy') `
         (($receipt.cargo_features -is [array]) -and
@@ -218,6 +332,79 @@ try {
 } catch { $refused=$true }
 Check-FeatureCase 'compiler boundary rejects malformed policy before tools or output allocation' `
     ($refused -and $script:FeatureCalls.Count -eq 0 -and @(Get-ChildItem -LiteralPath $fixture.work -Force).Count -eq $before)
+$script:ProviderFailures = 0
+function Check-ProviderCase([string]$Name, [bool]$Condition) {
+    if ($Condition) { $script:FeatureChecks++; Write-Host ('PASS: ' + $Name) }
+    else { $script:ProviderFailures++; Write-Host ('FAIL: ' + $Name) }
+}
+function Invoke-WorkspaceProviderCase($Case, [string]$Suffix) {
+    $script:FeatureCalls.Clear()
+    $script:WorkspaceCase = $Case
+    $caseRoot = New-DsrPrivateDirectory ([IO.Path]::Combine($fixture.work, ('provider-' + $Case.name + $Suffix)))
+    $output = New-DsrPrivateDirectory ([IO.Path]::Combine($caseRoot, 'output'))
+    $logs = New-DsrPrivateDirectory ([IO.Path]::Combine($caseRoot, 'logs'))
+    $sourcePolicy = @{language='rust';subdir=$Case.subdir;package=$Case.package;features=@($Case.features)}
+    $buildRoot = if ($Case.subdir -ceq '.') { $fixture.workspace } else { [IO.Path]::Combine($fixture.workspace, $Case.subdir) }
+    $selected = @{target_triple='x86_64-pc-windows-msvc';binaries=@($Case.binaries)}
+    $receipt = $null
+    $failure = $null
+    try {
+        $receipt = Build-DsrRustSourceOutputs @{repo='fixture/workspace';source=$sourcePolicy} $selected `
+            'windows/amd64' $fixture.workspace @($fixture.workspace_files) $buildRoot $output $logs $caseRoot `
+            20 $fixture.cargo $fixture.rustc
+    } catch { $failure = $_.Exception }
+    return @{receipt=$receipt;failure=$failure;output=$output}
+}
+foreach ($case in $fixture.workspace_cases) {
+    $result = Invoke-WorkspaceProviderCase $case ''
+    Check-ProviderCase ($case.name + ' admits the same providers as an actual Cargo build') ($null -eq $result.failure)
+    if ($null -ne $result.failure) { Write-Host ('Observed refusal: ' + $result.failure.Message); continue }
+    foreach ($provider in $case.providers) {
+        $name = $provider.target.name + '.exe'
+        $entry = @($result.receipt.source_entries | Where-Object { $_.name -ceq $name })
+        Check-ProviderCase ($case.name + ' receipt binds real package, manifest and entry for ' + $name) `
+            ($entry.Count -eq 1 -and $entry[0].package_id -ceq $provider.package_id -and
+             $entry[0].manifest -ceq [IO.Path]::GetRelativePath($fixture.workspace, $provider.manifest_path).Replace('\', '/') -and
+             $entry[0].entry -ceq [IO.Path]::GetRelativePath($fixture.workspace, $provider.target.src_path).Replace('\', '/'))
+        Check-ProviderCase ($case.name + ' stages the verified PE bytes for ' + $name) `
+            (Test-DsrSameEvidence (Get-DsrFileEvidence $fixture.pe) (Get-DsrFileEvidence ([IO.Path]::Combine($result.output, $name))))
+    }
+    $requests = @($script:FeatureCalls | Where-Object { $_.arguments[0] -ceq 'build' })
+    $features = @()
+    $package = ''
+    $bins = @()
+    if ($requests.Count -eq 1) {
+        $arguments = $requests[0].arguments
+        for ($index=0; $index -lt $arguments.Count; $index++) {
+            if ($arguments[$index] -ceq '--features') { $features += $arguments[++$index] }
+            elseif ($arguments[$index] -ceq '--package') { $package = $arguments[++$index] }
+            elseif ($arguments[$index] -ceq '--bin') { $bins += $arguments[++$index] }
+        }
+    }
+    Check-ProviderCase ($case.name + ' preserves actual build package, features and complete binary selection') `
+        ($requests.Count -eq 1 -and $package -ceq $case.package -and
+         (ConvertTo-Json -Compress -InputObject @($features)) -ceq (ConvertTo-Json -Compress -InputObject @($case.features)) -and
+         (ConvertTo-Json -Compress -InputObject @($bins)) -ceq (ConvertTo-Json -Compress -InputObject @($case.binaries | ForEach-Object { $_.Substring(0, $_.Length - 4) })) -and
+         (('--workspace' -cin $requests[0].arguments) -eq ($case.binaries.Count -gt 1 -and -not $case.package)))
+}
+$case = @($fixture.workspace_cases | Where-Object { $_.name -ceq 'member-current' })[0]
+# Use a distinct real source path for the identity attacks against helper.
+$case = ConvertFrom-DsrJson (ConvertTo-Json -Depth 30 -Compress -InputObject $case)
+$case.subdir = 'member'
+$case.package = 'member-provider'
+$case.features = @()
+$case.binaries = @('app.exe')
+$case.providers = @(@($fixture.workspace_cases | Where-Object { $_.name -ceq 'default-member' })[0].providers)
+foreach ($mutation in @('manifest','entry','missing-manifest','missing-entry','package')) {
+    $script:ArtifactChange = $mutation
+    $result = Invoke-WorkspaceProviderCase $case ('-' + $mutation)
+    Check-ProviderCase ('refuses changed artifact provider ' + $mutation) `
+        ($null -ne $result.failure -and $result.failure.Data.Contains('DsrExitCode') -and $result.failure.Data['DsrExitCode'] -eq 6)
+    Check-ProviderCase ('changed artifact provider stages no selected executable: ' + $mutation) `
+        (-not [IO.File]::Exists([IO.Path]::Combine($result.output, 'app.exe')))
+}
+Write-Host ('Windows Rust provider checks: ' + $script:ProviderFailures + ' failed')
+if ($script:ProviderFailures -or $script:FeatureFailures) { exit 1 }
 Write-Host ('Windows Rust feature boundary checks: ' + $script:FeatureChecks + ' passed, 0 failed')
 ''')
 result = run(['pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-File', driver,
