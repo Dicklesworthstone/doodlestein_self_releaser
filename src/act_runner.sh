@@ -14026,14 +14026,16 @@ def invocation_selection():
             explicit_toolchain = True
             if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', toolchain):
                 fail('Cargo +toolchain must be one literal installed toolchain name')
-        for arg in argv:
+        # Optional profile planning ignores rustc/application argument tails.
+        # Keep the existing strict attestation guard over the full invocation.
+        cargo_arguments = argv[:argv.index('--')] if '--' in argv else argv
+        for arg in (cargo_arguments if mode == 'profile' else argv):
             if arg == '--config' or arg.startswith('--config=') or arg == '-C' or arg.startswith('-C'):
                 fail('Cargo --config/-C changes selection outside the attested invocation; use the configured build environment/cwd')
         # Cargo accepts -Z after the subcommand too. Host/profile switches
         # change which flags rustc sees, so the cfg guard must cover the whole
         # Cargo argument region, not only the global-options prefix. Stop at
         # --: those words belong to rustc or the executed test/application.
-        cargo_arguments = argv[:argv.index('--')] if '--' in argv else argv
         if any(key.startswith('cfg(') for key in cargo_config['target']) and any(
                 re.match(r'^-[vqkrw]*Z', arg) for arg in cargo_arguments):
             fail('unstable Cargo options are outside cfg target attestation')

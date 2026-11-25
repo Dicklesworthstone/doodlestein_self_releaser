@@ -953,6 +953,19 @@ class ExplicitProfileSelectionTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertEqual(self.profile(command), expected)
 
+    def test_profile_planning_scopes_cargo_options_before_the_compiler_tail(self):
+        for options in ('-C opt-level=0', '-Copt-level=0',
+                        '--config local.toml', '--config=local.toml'):
+            tail_command = 'cargo rustc --profile ship -- ' + options
+            cargo_command = 'cargo rustc --profile ship ' + options
+            with self.subTest(options=options):
+                self.assertEqual(self.profile(tail_command), 'ship')
+                self.assertIsNone(self.profile(cargo_command))
+                # Existing strict observation keeps refusing both forms.
+                for command in (tail_command, cargo_command):
+                    with self.assertRaisesRegex(Refused, 'Cargo --config/-C'):
+                        invoke(command)
+
     def test_preparation_and_test_commands_do_not_select_the_release_profile(self):
         self.assertEqual(self.profile(
             'cargo metadata --format-version=1 && cargo build --profile ship'), 'ship')
