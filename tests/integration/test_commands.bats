@@ -881,16 +881,19 @@ _mock_check_parser_failure() {
     mock_command_script jq 'selected=false
 for argument in "$@"; do
     case "$DSR_CHECK_PARSER_STAGE:$argument" in
-        analysis:*".workflow_runs | map("*|inventory:".queued_runs[], .stuck_runs[]"|identity:".id"|attempt:".run_attempt // empty"|aggregate:*"queued_runs:[.[1:][]"*|decoration:*". + {tool:"*)
+        analysis:*".workflow_runs | map("*|inventory:".queued_runs[], .stuck_runs[]"|identity:".id"|attempt:".run_attempt // empty"|aggregate:*"queued_runs:[.[1:][]"*|decoration:*". + {tool:"*|target-tool:".tool // \"\""|target-repo:".repo // \"\""|target-workflow:".workflow // \"\""|results:"."|summary:*". as \$repos |"*|snapshot:*"checked_at: \$at"*|envelope:*"not one value"*)
             selected=true ;;
     esac
 done
 if $selected; then
     input=$(cat) || exit 99
     if [[ "$*" == *"Dicklesworthstone/ntm"* ]] ||
-       "$DSR_CHECK_REAL_JQ" -es '\''any(.[]; .repo == "Dicklesworthstone/ntm" or .id == 201)'\'' <<< "$input" >/dev/null 2>&1; then
+       "$DSR_CHECK_REAL_JQ" -es '\''any(.[] | .. | objects;
+           .repo == "Dicklesworthstone/ntm" or .id == 201 or
+           any(.repos_checked[]?; . == "Dicklesworthstone/ntm"))'\'' <<< "$input" >/dev/null 2>&1; then
         printf "%s\n" "$DSR_CHECK_PARSER_STAGE" >> "$TEST_TMPDIR/check-parser.failed"
         if [[ "$DSR_CHECK_PARSER_SIGNAL" == ordinary ]]; then exit 4; fi
+        if [[ "$DSR_CHECK_PARSER_SIGNAL" == semantic ]]; then exit 5; fi
         ulimit -c 0
         # Reset inherited ignored dispositions before delivering a real signal.
         exec python3 -I -c '\''import os, signal, sys
@@ -1002,6 +1005,145 @@ fi'
         .details.healthy == [] and .details.skipped[0].repo == "Dicklesworthstone/ntm"' <<< "$output"
     [[ -s "$TEST_TMPDIR/check-parser.failed" ]]
     ! grep -q 'runs/201/attempts/2/jobs' "$TEST_TMPDIR/gh.calls"
+}
+
+# Keep the complete public preflight and its watchdog. Only gh is replaced;
+# a synthetic chosen token prevents any stored-credential lookup or network use.
+_mock_check_auth_status_failure() {
+    export DSR_GH_TOKEN=dsr-offline-integration-fixture GH_API_TIMEOUT=10
+    export DSR_CHECK_AUTH_FAILURE="$1"
+    mock_command_script gh 'printf "%s\n" "$*" >> "$TEST_TMPDIR/check-auth.calls"
+[[ "${1:-}" == auth && "${2:-}" == status ]] || exit 99
+case "$DSR_CHECK_AUTH_FAILURE" in
+    SEGV|PIPE|KILL)
+        ulimit -c 0
+        exec python3 -I -c '\''import os, signal, sys
+selected = getattr(signal, "SIG" + sys.argv[1])
+selected == signal.SIGKILL or signal.signal(selected, signal.SIG_DFL)
+os.kill(os.getpid(), selected)
+raise SystemExit(99)'\'' "$DSR_CHECK_AUTH_FAILURE"
+        ;;
+    *) exit "$DSR_CHECK_AUTH_FAILURE" ;;
+esac'
+}
+
+@test "check parser: authentication keeps signal cancellation separate from deadlines and ordinary refusal" {
+    harness_create_config
+    _setup_repos_d
+    mkdir -p "$DSR_STATE_DIR/check"
+    printf '%s\n' '{"previous_completed_snapshot":true}' > "$DSR_STATE_DIR/check/last.json"
+    cp "$DSR_STATE_DIR/check/last.json" "$TEST_TMPDIR/previous-check.json"
+    local fault expected
+    for fault in SEGV PIPE 255 2 124 125 KILL 4; do
+        case "$fault" in
+            SEGV|PIPE|255|2) expected=5 ;;
+            124|125|KILL) expected=8 ;;
+            *) expected=3 ;;
+        esac
+        _mock_check_auth_status_failure "$fault"
+        run _routing_dsr --json check ntm
+        assert_equal "$expected" "$status"
+        jq -e --argjson expected "$expected" '.status == "error" and .exit_code == $expected and
+            .details.error == (if $expected == 5 then "GitHub authentication was interrupted"
+                elif $expected == 8 then "GitHub authentication could not complete within its deadline"
+                else "GitHub authentication required" end)' <<< "$output"
+        cmp "$TEST_TMPDIR/previous-check.json" "$DSR_STATE_DIR/check/last.json"
+    done
+    assert_equal 8 "$(wc -l < "$TEST_TMPDIR/check-auth.calls" | tr -d ' ')"
+    ! grep -Ev '^auth status --hostname github.com$' "$TEST_TMPDIR/check-auth.calls"
+}
+
+@test "check parser: interrupted authentication stops continuous watch before fallback or another poll" {
+    harness_create_config
+    _setup_repos_d
+    _mock_check_auth_status_failure PIPE
+    DSR_WATCH_FIXTURE_REAL_CHECK=1 DSR_WATCH_FIXTURE_CONTINUOUS=1 \
+        run --separate-stderr _routing_watch '{}' --auto-fallback
+    assert_equal 5 "$status"
+    jq -e '.status == "error" and .exit_code == 5 and
+        .details.triggered_state.attempts == {} and .details.triggered_state.pending == {}' <<< "$output"
+    [[ ! -e "$TEST_TMPDIR/fallback.args" && ! -e "$DSR_STATE_DIR/check/last.json" ]]
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/watch-check.polls" | tr -d ' ')"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/check-auth.calls" | tr -d ' ')"
+}
+
+@test "check parser: completion stops interrupted configured selectors before repository requests" {
+    harness_create_config
+    _setup_repos_d
+    _mock_independent_job_inventory cross-repo
+    _mock_check_parser_failure target-tool PIPE
+    run _routing_dsr --json check ntm
+    assert_equal 5 "$status"
+    "$DSR_CHECK_REAL_JQ" -e '.status == "error" and .exit_code == 5 and
+        .details.throttled == [] and .details.healthy == []' <<< "$output"
+    [[ -s "$TEST_TMPDIR/check-parser.failed" && ! -e "$DSR_STATE_DIR/check/last.json" ]]
+    [[ ! -e "$TEST_TMPDIR/gh.calls" ]]
+}
+
+@test "check parser: completion withdraws earlier queues after a target selector is interrupted" {
+    harness_create_config
+    _setup_repos_d
+    mkdir -p "$DSR_STATE_DIR/check"
+    printf '%s\n' '{"previous_completed_snapshot":true}' > "$DSR_STATE_DIR/check/last.json"
+    cp "$DSR_STATE_DIR/check/last.json" "$TEST_TMPDIR/previous-check.json"
+    local stage
+    for stage in target-repo target-workflow; do
+        _mock_independent_job_inventory cross-repo
+        _mock_check_parser_failure "$stage" SEGV
+        run _routing_dsr --json check
+        assert_equal 5 "$status"
+        "$DSR_CHECK_REAL_JQ" -e '.status == "error" and .exit_code == 5 and
+            .details.throttled == [] and .details.healthy == []' <<< "$output"
+        cmp "$TEST_TMPDIR/previous-check.json" "$DSR_STATE_DIR/check/last.json"
+        [[ -s "$TEST_TMPDIR/check-parser.failed" ]]
+        ! grep -q 'repos/Dicklesworthstone/ntm/actions/' "$TEST_TMPDIR/gh.calls"
+    done
+}
+
+@test "check parser: completion cannot publish a snapshot after result assembly is interrupted" {
+    harness_create_config
+    _setup_repos_d
+    mkdir -p "$DSR_STATE_DIR/check"
+    printf '%s\n' '{"previous_completed_snapshot":true}' > "$DSR_STATE_DIR/check/last.json"
+    cp "$DSR_STATE_DIR/check/last.json" "$TEST_TMPDIR/previous-check.json"
+    local stage
+    for stage in results summary envelope snapshot; do
+        _mock_independent_job_inventory cross-repo
+        _mock_check_parser_failure "$stage"
+        run _routing_dsr --json check bv ntm
+        assert_equal 5 "$status"
+        "$DSR_CHECK_REAL_JQ" -e '.status == "error" and .exit_code == 5 and
+            .details.throttled == [] and .details.healthy == []' <<< "$output"
+        cmp "$TEST_TMPDIR/previous-check.json" "$DSR_STATE_DIR/check/last.json"
+        [[ -s "$TEST_TMPDIR/check-parser.failed" ]]
+    done
+}
+
+@test "check parser: completion classifies ordinary assembly failure without actionable queues" {
+    harness_create_config
+    _setup_repos_d
+    _mock_independent_job_inventory cross-repo
+    _mock_check_parser_failure summary semantic
+    run _routing_dsr --json check bv ntm
+    assert_equal 8 "$status"
+    "$DSR_CHECK_REAL_JQ" -e '.status == "error" and .exit_code == 8 and
+        .details.throttled == [] and .details.healthy == []' <<< "$output"
+    [[ -s "$TEST_TMPDIR/check-parser.failed" && ! -e "$DSR_STATE_DIR/check/last.json" ]]
+}
+
+@test "check parser: completion interruption stops continuous watch before fallback" {
+    harness_create_config
+    _setup_repos_d
+    _mock_independent_job_inventory cross-repo
+    _mock_check_parser_failure summary PIPE
+    DSR_WATCH_FIXTURE_REAL_CHECK=1 DSR_WATCH_FIXTURE_CONTINUOUS=1 \
+        run --separate-stderr _routing_watch '{}' --auto-fallback
+    assert_equal 5 "$status"
+    "$DSR_CHECK_REAL_JQ" -e '.status == "error" and .exit_code == 5 and
+        .details.triggered_state.attempts == {} and .details.triggered_state.pending == {}' <<< "$output"
+    [[ ! -e "$TEST_TMPDIR/fallback.args" && ! -e "$DSR_STATE_DIR/check/last.json" ]]
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/watch-check.polls" | tr -d ' ')"
+    [[ -s "$TEST_TMPDIR/check-parser.failed" ]]
 }
 
 @test "job scan: long executing or approval-pending workflows do not trigger fallback" {

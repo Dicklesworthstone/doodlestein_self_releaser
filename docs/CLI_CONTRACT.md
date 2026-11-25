@@ -523,6 +523,13 @@ forced termination, so that status does not identify cancellation. The direct
 check child has no such supervisor; its signal-like exits, including 137,
 stop the watcher with exit 5.
 
+Repository selection and final result assembly must also complete before a poll
+can authorize fallback. An interrupted parser returns exit 5 with empty
+`throttled` and `healthy` arrays and preserves the previous completed snapshot.
+Ordinary selection failures return 4; ordinary response or snapshot serialization
+failures return 8. The JSON response is prepared before the completed snapshot
+is replaced, so a failed final parser cannot leave a successful observation.
+
 Each throttled row includes `queue_reason: "workflow_queue"` for a queued
 workflow with a complete empty job inventory, or `queue_reason: "job_queue"`
 for stalled job dispatch in either workflow status. The latter

@@ -230,7 +230,7 @@ _dsr_capture() {
 }
 
 # JSON envelope helper
-# Usage: json_envelope <command> <status> <exit_code> [details_json]
+# Usage: json_envelope <command> <status> <exit_code> [details_json] [strict_details]
 json_envelope() {
     local cmd="$1"
     local vstatus="$2"  # renamed to avoid potential conflict
@@ -243,6 +243,10 @@ json_envelope() {
     if normalized=$(jq -ces 'if length == 1 then .[0] else error("not one value") end' <<< "$details" 2>/dev/null); then
         details="$normalized"
     else
+        local normalization_status=$?
+        # Admission callers must distinguish a stopped parser from a completed
+        # response. Keep the diagnostic fallback for other command callers.
+        [[ "${5:-false}" != true ]] || return "$normalization_status"
         log_warn "Internal: $cmd produced malformed JSON details; reporting them as text"
         details=$(jq -nc --arg raw "$details" '{error: "malformed details", raw: $raw}')
     fi
@@ -1508,22 +1512,43 @@ _check_configured_repos() {
     printf '%s\n' ${admitted[@]+"${admitted[@]}"}
 }
 
+# Withdraw the complete poll after a selector or output parser fails. Raw jq
+# status 5 is a semantic error; only signal-like statuses mean interruption.
+# Threshold was already validated before any caller reaches this boundary.
+_check_abort_observation() {
+    local process_status="$1" failure_status="$2" threshold="$3" reason="$4"
+    if ((process_status >= 129 && process_status <= 255)); then
+        failure_status=5
+    fi
+    log_error "$reason"
+    if $JSON_MODE; then
+        json_envelope check error "$failure_status" \
+            "{\"threshold_seconds\":$threshold,\"repos_checked\":[],\"throttled\":[],\"healthy\":[],\"skipped\":[],\"repos\":[],\"error\":\"Check inspection did not complete\"}"
+    fi
+    return "$failure_status"
+}
+
 # Save the outcome of one check as state/check/last.json (atomic replace).
 _check_save_snapshot() {
     local threshold="$1"
     shift
     local dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/check" tmp
+    local snapshot
+    # Complete parsing before making snapshot state. A parser signal must
+    # reach cmd_check rather than become successful temporary-file cleanup.
+    snapshot=$(printf '%s\n' "$@" | jq -sc --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --argjson threshold "$threshold" '
+        {checked_at: $at, threshold_seconds: $threshold, repos_checked: [.[].repo],
+         throttled: [.[] | select(.status == "throttled") | .repo],
+         skipped: [.[] | select(.status == "error" or ((.job_errors // []) | length > 0)) | .repo]}') || return $?
     mkdir -p "$dir" 2>/dev/null || return 0
     tmp=$(mktemp "$dir/.last.XXXXXXXX" 2>/dev/null) || return 0
-    if printf '%s\n' "$@" | jq -sc --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --argjson threshold "$threshold" '
-            {checked_at: $at, threshold_seconds: $threshold, repos_checked: [.[].repo],
-             throttled: [.[] | select(.status == "throttled") | .repo],
-             skipped: [.[] | select(.status == "error" or ((.job_errors // []) | length > 0)) | .repo]}' > "$tmp" 2>/dev/null &&
+    if printf '%s\n' "$snapshot" > "$tmp" &&
        mv -f -- "$tmp" "$dir/last.json"; then
         return 0
     fi
     rm -f -- "$tmp"
+    return 0
 }
 
 cmd_check() {
@@ -1645,8 +1670,13 @@ EOF
             [[ -n "$arg" ]] || continue
             found=""
             for line in ${configured_repos[@]+"${configured_repos[@]}"}; do
-                tool=$(jq -r '.tool // ""' <<< "$line")
-                repo=$(jq -r '.repo // ""' <<< "$line")
+                if tool=$(jq -r '.tool // ""' <<< "$line") &&
+                   repo=$(jq -r '.repo // ""' <<< "$line"); then
+                    :
+                else
+                    _check_abort_observation "$?" 4 "$threshold" "Could not resolve the requested repository configuration"
+                    return $?
+                fi
                 if [[ "$arg" == "$tool" || "${arg,,}" == "${repo,,}" ]]; then
                     found="$line"
                     break
@@ -1656,7 +1686,10 @@ EOF
                 # Unconfigured short names keep the historical default owner.
                 repo="$arg"
                 [[ "$repo" == */* ]] || repo="Dicklesworthstone/$repo"
-                found=$(jq -nc --arg repo "$repo" '{tool: null, repo: $repo, workflow: null}')
+                found=$(jq -nc --arg repo "$repo" '{tool: null, repo: $repo, workflow: null}') || {
+                    _check_abort_observation "$?" 4 "$threshold" "Could not prepare the requested repository"
+                    return $?
+                }
             fi
             targets+=("$found")
         done
@@ -1685,10 +1718,15 @@ EOF
             124|125|137)
                 authentication_status=8
                 authentication_error="GitHub authentication could not complete within its deadline" ;;
-            2|129|130|131|143)
-                authentication_status=5
-                authentication_error="GitHub authentication was interrupted" ;;
-            *) authentication_status=3 ;;
+            *)
+                if ((authentication_status == 2 ||
+                      (authentication_status >= 129 && authentication_status <= 255))); then
+                    authentication_status=5
+                    authentication_error="GitHub authentication was interrupted"
+                else
+                    authentication_status=3
+                fi
+                ;;
         esac
         log_error "$authentication_error"
         $JSON_MODE && json_envelope "check" "error" "$authentication_status" \
@@ -1703,9 +1741,14 @@ EOF
     now=$(date +%s)
 
     for line in "${targets[@]}"; do
-        tool=$(jq -r '.tool // ""' <<< "$line")
-        repo=$(jq -r '.repo // ""' <<< "$line")
-        workflow=$(jq -r '.workflow // ""' <<< "$line")
+        if tool=$(jq -r '.tool // ""' <<< "$line") &&
+           repo=$(jq -r '.repo // ""' <<< "$line") &&
+           workflow=$(jq -r '.workflow // ""' <<< "$line"); then
+            :
+        else
+            _check_abort_observation "$?" 4 "$threshold" "Could not inspect the selected repository configuration"
+            return $?
+        fi
         $all_workflows && workflow=""
         local result
         result=$(_check_repo "$repo" "$threshold" "$now" "${workflow##*/}")
@@ -1738,12 +1781,6 @@ EOF
         $interrupted && break
     done
 
-    # An interrupted poll cannot replace the last completed observation or
-    # authorize previously collected candidates from another repository.
-    if ! $interrupted; then
-        ${DRY_RUN:-false} || _check_save_snapshot "$threshold" "${results[@]}"
-    fi
-
     # Throttling is actionable even when another repo could not be read; an
     # unreadable repo is never reported as healthy.
     # Envelope status per docs/CLI_CONTRACT.md: success|partial|error.
@@ -1756,12 +1793,16 @@ EOF
         summary_status="error" summary_exit=8
     fi
 
-    # JSON output (schemas/check-details.json)
+    # Render the complete response privately before recording or emitting a
+    # completed observation. No partial parser output authorizes a fallback.
+    local check_output=""
     if $JSON_MODE; then
-        local results_json
-        results_json=$(printf '%s\n' "${results[@]}" | jq -sc '.')
-        json_envelope "check" "$summary_status" "$summary_exit" \
-            "$(jq -c --argjson threshold "$threshold" --argjson interrupted "$interrupted" '. as $repos |
+        local results_json check_details
+        results_json=$(printf '%s\n' "${results[@]}" | jq -sc '.') || {
+            _check_abort_observation "$?" 8 "$threshold" "Could not assemble the repository observations"
+            return $?
+        }
+        check_details=$(jq -c --argjson threshold "$threshold" --argjson interrupted "$interrupted" '. as $repos |
                 {threshold_seconds: $threshold,
                  repos_checked: [$repos[].repo],
                  throttled: (if $interrupted then [] else [$repos[] | select(.status == "throttled") | . as $r |
@@ -1784,9 +1825,27 @@ EOF
                      elif .status == "error" then
                          {repo:.repo,reason:(.error // "check failed")}
                      else empty end],
-                 repos: $repos}' <<< "$results_json")"
+                 repos: $repos}' <<< "$results_json") || {
+            _check_abort_observation "$?" 8 "$threshold" "Could not summarize the repository observations"
+            return $?
+        }
+        check_output=$(json_envelope "check" "$summary_status" "$summary_exit" "$check_details" true) || {
+            _check_abort_observation "$?" 8 "$threshold" "Could not render the completed check response"
+            return $?
+        }
     fi
 
+    # An interrupted poll or incomplete output cannot replace the previous
+    # completed snapshot, even after an earlier repository proved a queue.
+    if ! $interrupted && ! ${DRY_RUN:-false}; then
+        _check_save_snapshot "$threshold" "${results[@]}" || {
+            _check_abort_observation "$?" 8 "$threshold" "Could not prepare the completed check snapshot"
+            return $?
+        }
+    fi
+    if $JSON_MODE; then
+        printf '%s\n' "$check_output" || return 8
+    fi
     return "$summary_exit"
 }
 
