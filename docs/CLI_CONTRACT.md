@@ -927,6 +927,17 @@ uses the existing configured/default target derivation when enabled. Explicit
 native variant conflicts continue to stop dispatch, and policy checks retain
 all declarations so a later value cannot hide an earlier remote-build requirement.
 
+Native Rust builds infer the output profile from literal `--profile`, `--release`
+or `-r` selectors in directly parsed Cargo build commands. A custom profile keeps
+its own output directory even when it inherits `release`; `dev` and `test` map
+to `debug`, while `release` and `bench` map to `release`. Primary binaries,
+executable families, companions and strict cache identity share that selection.
+Conflicting explicit profiles, or a mix of explicit and implicit profiles among
+parsed executable-producing invocations, return configuration error `4` before
+dispatch. Opaque commands and commands without an explicit profile keep the
+configured `build_profile` (default `release`). Profile discovery does not run
+the build command or inspect the coordinator's Cargo configuration.
+
 Native Go builds derive `GOOS` and `GOARCH` from the requested platform;
 the `armv7` alias resolves to `GOARCH=arm` and `GOARM=7`.
 Platform-specific `cross_compile.<platform>.env` values override global `env`

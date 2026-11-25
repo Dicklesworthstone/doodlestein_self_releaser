@@ -12523,6 +12523,36 @@ except (OSError, ValueError, KeyError, TypeError, IndexError) as error:
 PY
 }
 
+# Resolve only literal Cargo profile options through the shared command reader.
+# No compiler or worker/coordinator Cargo configuration is executed or loaded.
+# Empty output leaves the recipe's declared profile in charge of opaque builds.
+_act_cargo_explicit_profile() {
+    local build_cmd="$1" build_env="$2" script pair
+    local -a pairs=()
+    while IFS= read -r pair; do
+        [[ -z "$pair" ]] && continue
+        [[ "$pair" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || return 4
+        pairs+=("$pair")
+    done <<< "$build_env"
+    script=$(_act_toolchain_identity_script profile /dev/null "$build_cmd") || return 4
+    env -i "${pairs[@]}" "$BASH" -p -s <<< "$script"
+}
+
+# Cargo's built-in profile names and output directories are not identical.
+# A custom profile keeps its own directory, even when it inherits release.
+_act_cargo_profile_directory() {
+    local profile="$1"
+    [[ "$profile" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]] || {
+        _log_error "Invalid Cargo output profile: $profile"
+        return 4
+    }
+    case "$profile" in
+        dev|test) printf '%s\n' debug ;;
+        release|bench) printf '%s\n' release ;;
+        *) printf '%s\n' "$profile" ;;
+    esac
+}
+
 # Resolve a built output inside the language's effective output directory.
 # Usage: act_get_remote_artifact_path <language> <remote_path> <build_env> <name> <platform> [build_profile] [binary|file]
 # Only native binaries receive the Windows .exe suffix. Configured companion
@@ -12549,6 +12579,7 @@ act_get_remote_artifact_path() {
         rust)
             local cargo_target_dir=""
             local cargo_build_target=""
+            build_profile=$(_act_cargo_profile_directory "$build_profile") || return 4
             cargo_target_dir=$(act_get_build_env_value "$build_env" "CARGO_TARGET_DIR" 2>/dev/null || true)
             cargo_build_target=$(act_get_build_env_value "$build_env" "CARGO_BUILD_TARGET" 2>/dev/null || true)
             cargo_target_dir="${cargo_target_dir%/}"
@@ -13196,13 +13227,14 @@ PY
 # Internal metadata mode runs locked/offline metadata with the same selection;
 # context mode passes selected executable authority to the intermediate cache.
 # Routing mode only classifies compiler commands for the default glibc floor;
-# it neither observes a toolchain nor creates a build identity receipt.
+# profile mode reads explicit output-profile selectors without inspecting the
+# coordinator's Cargo configuration. Neither mode attests a build toolchain.
 # Args: mode output_json build_cmd extra_tools(space-separated) receipt_pin expected_cwd zig_shim_dir
 _act_toolchain_identity_script() {
     local mode="$1" output="$2" build_cmd="$3" extra_tools="${4:-}" receipt_pin="${5:-}" expected_cwd="${6:-}"
     local zig_shim_dir="${7:-}" zig_shim_hash="" shim_dir_q shim_hash_q
     local output_q command_q extra_q pin_q cwd_q native_regex_q native_c_regex_q python_q=python3
-    [[ "$mode" == record || "$mode" == verify || "$mode" == read || "$mode" == metadata || "$mode" == context || "$mode" == target || "$mode" == selection || "$mode" == routing ]] || return 4
+    [[ "$mode" == record || "$mode" == verify || "$mode" == read || "$mode" == metadata || "$mode" == context || "$mode" == target || "$mode" == selection || "$mode" == routing || "$mode" == profile ]] || return 4
     [[ "$output" == /* && "$output" != *..* ]] || return 4
     [[ -z "$expected_cwd" || ( "$expected_cwd" == /* && "$expected_cwd" != *..* ) ]] || return 4
     if [[ -n "$zig_shim_dir" ]]; then
@@ -13225,7 +13257,7 @@ _act_toolchain_identity_script() {
     # Command planning runs on the coordinator without invoking any build
     # tools or reading its Cargo configuration. The configured PATH may be a
     # remote host path, so use the coordinator's absolute Python interpreter.
-    if [[ "$mode" == target || "$mode" == selection || "$mode" == routing ]]; then
+    if [[ "$mode" == target || "$mode" == selection || "$mode" == routing || "$mode" == profile ]]; then
         python_q=$(command -v python3) || return 4
         printf -v python_q '%q' "$python_q"
     else
@@ -13243,8 +13275,23 @@ mode, output, command, extra, receipt_pin, expected_cwd, zig_shim_dir, zig_shim_
 native_environment_pattern = re.compile(sys.argv[9], re.IGNORECASE)
 native_c_environment_pattern = re.compile(sys.argv[10], re.IGNORECASE)
 
+class OpaqueCargoProfile(Exception):
+    pass
+
+
 def fail(message):
+    if mode == 'profile':
+        # Profile discovery is optional for ordinary recipes. The strict
+        # observer remains authoritative in all its original modes; an opaque
+        # shell context or unrelated dynamic argument cannot add a new refusal
+        # to a build that already declares its output profile.
+        raise OpaqueCargoProfile(message)
     sys.stderr.write('[dsr] toolchain identity: ' + message + '\n')
+    sys.exit(86)
+
+
+def profile_error(message):
+    sys.stderr.write('[dsr] Cargo profile selection: ' + message + '\n')
     sys.exit(86)
 
 if expected_cwd:
@@ -13786,7 +13833,7 @@ def cargo_configuration():
 
 
 cargo_config, cargo_config_receipts = (({'build': {}, 'target': {}, 'alias': {}}, [])
-                                     if mode in ('target', 'selection', 'routing') else cargo_configuration())
+                                     if mode in ('target', 'selection', 'routing', 'profile') else cargo_configuration())
 
 
 def cargo_shell_words(text):
@@ -13875,6 +13922,7 @@ def invocation_selection():
         statements.append(current)
 
     selections, commands, assigned_environment, context_change = [], [], set(), None
+    output_profiles = []
     for words in statements:
         # A redirection can occur anywhere in a simple command: arguments
         # after it still reach Cargo. Remove each operator/operand, preserving
@@ -13939,7 +13987,7 @@ def invocation_selection():
         # literal Cargo/cross path owns its own dispatch, while strict receipt
         # modes still require the original direct `cargo` invocation below.
         route_program = pathlib.PurePosixPath(program).name
-        if mode == 'routing' and route_program in ('cargo', 'cross'):
+        if mode in ('routing', 'profile') and route_program in ('cargo', 'cross'):
             program = 'cargo'
         if program != 'cargo':
             if pathlib.PurePosixPath(program).name == 'cargo' or \
@@ -14006,6 +14054,36 @@ def invocation_selection():
         subcommand = argv[cursor]
         if mode == 'routing':
             commands.append(route_program + ':' + subcommand)
+            continue
+        if mode == 'profile':
+            # These commands produce ordinary Cargo executable outputs. Tests,
+            # metadata and dependency preparation do not select the release
+            # family's output directory. No compiler or local config is read.
+            produces = subcommand in ('build', 'rustc', 'zigbuild')
+            if subcommand == 'xwin':
+                produces = cursor + 1 < len(argv) and argv[cursor + 1] in ('build', 'rustc')
+            if not produces:
+                continue
+            profiles, index = [], cursor + 1
+            while index < len(argv):
+                argument = argv[index]
+                if argument == '--':
+                    break
+                if argument == '--profile':
+                    index += 1
+                    if index == len(argv):
+                        profile_error('Cargo --profile requires a literal profile')
+                    profiles.append(argv[index])
+                elif argument.startswith('--profile='):
+                    profiles.append(argument.split('=', 1)[1])
+                elif argument in ('--release', '-r') or re.fullmatch(r'-[vq]*r[vq]*', argument):
+                    profiles.append('release')
+                index += 1
+            if any(not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_-]*', profile) for profile in profiles):
+                profile_error('Cargo profile must be a literal safe output-directory name')
+            if len(set(profiles)) > 1:
+                profile_error('conflicting explicit Cargo profiles in one invocation')
+            output_profiles.append(profiles[0] if profiles else None)
             continue
         if subcommand in cargo_config['alias']:
             fail('Cargo alias cannot be attested as a direct compiler invocation: ' + subcommand)
@@ -14079,6 +14157,18 @@ def invocation_selection():
         # An explicit + selector has higher priority than RUSTUP_TOOLCHAIN.
         selection['environment']['RUSTUP_TOOLCHAIN'] = toolchain or ''
         selections.append((selection, env, explicit_toolchain))
+    if mode == 'profile':
+        explicit_profiles = {profile for profile in output_profiles if profile is not None}
+        # An opaque script or a recipe without an explicit profile keeps its
+        # declared build_profile. Do not infer worker build.profile settings.
+        if not explicit_profiles:
+            return None
+        if context_change:
+            fail('Cargo context changes inside build_cmd (' + context_change +
+                 '); configure its environment/cwd outside the command')
+        if len(explicit_profiles) != 1 or None in output_profiles:
+            profile_error('native Cargo executable producers need one common explicit profile')
+        return next(iter(explicit_profiles))
     if mode == 'routing':
         owned = {'cargo:zigbuild', 'cargo:xwin', 'cross:build'}
         # Metadata preparation does not choose a compiler. A plain Cargo
@@ -14103,6 +14193,15 @@ def invocation_selection():
 
 if mode == 'routing':
     sys.stdout.write('owned\n' if invocation_selection() else 'default\n')
+    sys.exit(0)
+
+if mode == 'profile':
+    try:
+        selected_profile = invocation_selection()
+    except OpaqueCargoProfile:
+        selected_profile = None
+    if selected_profile is not None:
+        sys.stdout.write(selected_profile + '\n')
     sys.exit(0)
 
 selection, probe_env, explicit_toolchain, cargo_commands, assigned_environment = invocation_selection()
@@ -15096,6 +15195,23 @@ act_run_native_build() {
             '{platform: $platform, target_triple: $triple, status: "error", exit_code: 4,
               error: "Build command conflicts with selected native target variant"}'
         return 4
+    fi
+
+    if [[ "$language" == rust ]]; then
+        local explicit_cargo_profile
+        if ! explicit_cargo_profile=$(_act_cargo_explicit_profile "$build_cmd" "$build_env"); then
+            _log_error "Cannot resolve one native Cargo output profile; use a literal profile shared by every executable producer"
+            return 4
+        fi
+        if [[ -n "$explicit_cargo_profile" ]]; then
+            build_profile="$explicit_cargo_profile"
+            _log_info "Collecting the explicit Cargo profile: $build_profile"
+        fi
+        _act_cargo_profile_directory "$build_profile" >/dev/null || return 4
+        if [[ -n "$strict_cache_contract" ]]; then
+            strict_cache_contract=$(jq -c --arg profile "$build_profile" '.profile = $profile' \
+                <<< "$strict_cache_contract") || return 4
+        fi
     fi
 
     # Determine remote path (check host_paths.<host> first, fallback to local_path)
@@ -22185,6 +22301,7 @@ export -f act_list_tools act_build_matrix
 export -f act_get_build_cmd act_substitute_build_cmd_tokens act_get_build_env act_get_repo act_get_local_path
 export -f _act_materialized_source_path
 export -f act_get_build_env_value act_get_remote_artifact_path
+export -f _act_cargo_profile_directory _act_cargo_explicit_profile
 export -f _act_native_c_env_names _act_native_c_influence_regex
 export -f _act_go_ambient_env_names _act_go_pkg_config_env_regex _act_go_build_influence_json
 export -f _act_rust_sdk_influence_regex _act_unix_rust_sdk_env_cleanup

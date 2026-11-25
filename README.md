@@ -1990,6 +1990,22 @@ commands can branch on `DSR_TARGET_OS` / `DSR_TARGET_ARCH` /
 `DSR_TARGET_PLATFORM` / `DSR_TARGET_TRIPLE` without parsing paths. Opt out of
 the derivation with `derive_cargo_build_target: false`.
 
+Native Rust collection also follows an explicit literal Cargo profile in the
+build command:
+
+```yaml
+build_cmd: cargo build --locked --profile ship
+```
+
+For a custom `[profile.ship]`, artifacts come from `target/<triple>/ship/`,
+even when that profile inherits from `release`. Cargo's built-in `dev` and
+`test` profiles use `debug/`; `release` and `bench` use `release/`. The same
+selection applies to the primary executable, executable families, companions
+and strict cache identity. If a command has multiple executable-producing Cargo
+invocations, their explicit profiles must agree. Opaque scripts and commands
+without an explicit profile keep the recipe's `build_profile` (default
+`release`); declare that field when a script chooses its profile internally.
+
 Linux Rust builds targeting `*-linux-gnu` — ordinary and strict
 release-contract builds alike — default to a **portable glibc floor of
 2.28**: a `cargo` shim (staged with the isolated source, or beside a strict

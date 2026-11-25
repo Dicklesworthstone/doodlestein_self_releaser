@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_act_runner_native.sh - Unit tests for act_runner.sh native build SSH logic
 #
-# Usage: ./test_act_runner_native.sh [--go-outputs-only | --go-command-context-only | --go-paths-only | --typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --large-inventory-only | --workspace-archives-only | --failure-evidence-only | --env-precedence-only | --archive-delivery-only | --zig-dispatch-only | --glibc-routing-only | --windows-launcher-transfer-only | --artifact-transfer-only]
+# Usage: ./test_act_runner_native.sh [--cargo-profiles-only | --go-outputs-only | --go-command-context-only | --go-paths-only | --typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --large-inventory-only | --workspace-archives-only | --failure-evidence-only | --env-precedence-only | --archive-delivery-only | --zig-dispatch-only | --glibc-routing-only | --windows-launcher-transfer-only | --artifact-transfer-only]
 #
 # Tests native build SSH command construction with mocks.
 # Covers: command construction, path handling, env vars, SCP, error handling.
@@ -13,6 +13,165 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SRC_DIR="$PROJECT_ROOT/src"
+
+# Real offline Cargo compilation through the native launcher and collector.
+# Host readiness is the only adapter; no compiler, artifact, archive or profile
+# selection is mocked. The retained paths permit replay on a baseline module.
+test_cargo_native_profile_selection() {
+    local dependency
+    for dependency in bash python3 git jq yq cargo rustc tar gzip; do
+        command -v "$dependency" >/dev/null || {
+            printf 'Missing Cargo profile test dependency: %s\n' "$dependency"
+            return 3
+        }
+    done
+    python3 -I - "$PROJECT_ROOT" <<'PY'
+import hashlib, json, os, pathlib, shlex, shutil, subprocess, sys, tarfile, tempfile
+
+root = pathlib.Path(sys.argv[1])
+work = pathlib.Path(tempfile.mkdtemp(prefix='dsr-cargo-profiles-'))
+print('Retained native Cargo profile evidence: ' + str(work), flush=True)
+environment = {key: value for key, value in os.environ.items()
+               if not key.startswith(('BASH_FUNC_', 'CARGO_')) and key not in
+               ('RUSTFLAGS', 'RUSTDOCFLAGS', 'RUSTC', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER')}
+environment.update(CARGO_HOME=str(work / 'unused-ambient-cargo'), CARGO_NET_OFFLINE='true',
+                   RCH_REQUIRE_REMOTE='0', DSR_KEEP_BUILD_STAGES='1', NO_COLOR='1')
+compiler = subprocess.run(['rustc', '-vV'], env=environment, check=True,
+                          capture_output=True, text=True, timeout=15).stdout
+triple = next(line.split(': ', 1)[1] for line in compiler.splitlines() if line.startswith('host: '))
+platforms = {'x86_64-unknown-linux-gnu': 'linux/amd64', 'aarch64-unknown-linux-gnu': 'linux/arm64',
+             'x86_64-apple-darwin': 'darwin/amd64', 'aarch64-apple-darwin': 'darwin/arm64'}
+if triple not in platforms:
+    print('Cargo profile fixture requires a supported native Unix host', file=sys.stderr)
+    sys.exit(3)
+platform = platforms[triple]
+if environment.get('DSR_TEST_ACT_RUNNER'):
+    baseline = work / 'baseline-module'
+    baseline.mkdir()
+    for module in (root / 'src').iterdir():
+        if module.name == 'act_runner.sh':
+            shutil.copy2(environment['DSR_TEST_ACT_RUNNER'], baseline / module.name)
+        else:
+            (baseline / module.name).symlink_to(module.resolve(), target_is_directory=module.is_dir())
+    environment['DSR_TEST_ACT_RUNNER'] = str(baseline / 'act_runner.sh')
+checks = failures = 0
+
+def check(label, condition):
+    global checks, failures
+    checks += 1
+    failures += not condition
+    print(('PASS: ' if condition else 'FAIL: ') + label, flush=True)
+
+def write(path, contents):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(contents)
+
+driver = r'''
+set -uo pipefail
+root=$1; case_root=$2; platform=$3
+export DSR_CONFIG_DIR="$case_root/config" DSR_STATE_DIR="$case_root/state" DSR_CACHE_DIR="$case_root/cache"
+export ACT_REPOS_DIR="$DSR_CONFIG_DIR/repos.d" DSR_HOSTS_FILE="$DSR_CONFIG_DIR/hosts.yaml"
+export ACT_ARTIFACTS_DIR="$case_root/artifacts" ACT_LOGS_DIR="$case_root/logs" DSR_BUILD_TIMEOUT=30
+source "$root/src/config.sh" || exit 90
+source "${DSR_TEST_ACT_RUNNER:-$root/src/act_runner.sh}" || exit 91
+source "$root/src/artifact_naming.sh" || exit 92
+host_health_is_ready() { return 0; }
+act_run_native_build profiles "$platform" v1.0.0 profile-test '' '' '' localnative
+'''
+
+def run_case(name, command, directory, *, declared=None, family=False, refused=False):
+    case = work / name
+    source = case / 'source'
+    source.mkdir(parents=True)
+    write(source / 'Cargo.toml', '[package]\nname="profiletool"\nversion="1.0.0"\nedition="2021"\n'
+          '[profile.ship]\ninherits="release"\nopt-level=0\n')
+    write(source / 'Cargo.lock', 'version = 3\n[[package]]\nname = "profiletool"\nversion = "1.0.0"\n')
+    write(source / 'src/main.rs', 'fn main() { println!("fresh-profiletool"); }\n')
+    if family:
+        write(source / 'src/bin/profilehelper.rs', 'fn main() { println!("fresh-profilehelper"); }\n')
+    write(source / 'build-profile.sh', 'cargo build --locked --offline --profile ship\n')
+    marker = case / 'compiler-dispatched'
+    recipe = 'printf dispatched > ' + shlex.quote(str(marker)) + '; ' + command
+    env = {'PATH': environment['PATH'], 'CARGO_TARGET_DIR': str(case / 'targets'),
+           'CARGO_NET_OFFLINE': 'true'}
+    for key in ('RUSTUP_HOME', 'RUSTUP_TOOLCHAIN'):
+        if key in environment:
+            env[key] = environment[key]
+    config = dict(tool_name='profiles', repo='fixture/profiles', language='rust',
+                  binary_name='profiletool', local_path=str(source), build_cmd=recipe,
+                  targets=[platform], act_job_map={platform: None}, hosts={platform: 'localnative'},
+                  linux_glibc_floor='native', env=env, archive_format='tar.gz',
+                  artifact_naming='${name}-${version}-${os}-${arch}.${ext}',
+                  include_files=[], include_extra_files=False, flat_archive=True)
+    if declared is not None:
+        config['build_profile'] = declared
+    if family:
+        config['workspace_binaries'] = ['profiletool', 'profilehelper']
+    write(case / 'config/repos.d/profiles.yaml', json.dumps(config))
+    write(case / 'config/hosts.yaml', json.dumps(dict(schema_version='1.0.0', hosts={
+        'localnative': dict(platform=platform, connection='local', concurrency=1,
+                            build_root=str(case / 'stages'))})))
+    result = subprocess.run(['bash', '-c', driver, 'cargo-profile-test', str(root), str(case), platform],
+                            env=environment, capture_output=True, text=True, timeout=45)
+    write(case / 'stdout.json', result.stdout)
+    write(case / 'stderr.log', result.stderr)
+    try:
+        receipt = json.loads(result.stdout)
+    except ValueError:
+        receipt = {}
+    if refused:
+        check(name + ': inconsistent profiles refuse before the build program',
+              result.returncode == 4 and not marker.exists() and
+              not receipt.get('artifact_path') and not receipt.get('artifact_paths'))
+        return
+    ok = result.returncode == 0 and receipt.get('status') == 'success'
+    check(name + ': native Cargo build and collection succeed', ok)
+    paths = receipt.get('artifact_paths', [])
+    if not ok or len(paths) != 1:
+        check(name + ': selected executable family is complete', False)
+        return
+    artifact = pathlib.Path(paths[0])
+    target = pathlib.Path(receipt['cargo_isolation']['target_dir']) / triple / directory
+    names = ['profiletool', 'profilehelper'] if family else ['profiletool']
+    executable_bytes = {}
+    if family:
+        with tarfile.open(artifact) as archive:
+            members = {member.name.lstrip('./'): member for member in archive.getmembers() if member.isfile()}
+            if set(members) == set(names):
+                executable_bytes = {name: archive.extractfile(members[name]).read() for name in names}
+    else:
+        executable_bytes['profiletool'] = artifact.read_bytes()
+    matched = set(executable_bytes) == set(names)
+    for binary in names:
+        if binary not in executable_bytes or not (target / binary).is_file():
+            matched = False
+            continue
+        matched = matched and hashlib.sha256(executable_bytes[binary]).digest() == \
+            hashlib.sha256((target / binary).read_bytes()).digest()
+        executable = case / ('run-' + binary)
+        executable.write_bytes(executable_bytes[binary])
+        executable.chmod(0o700)
+        output = subprocess.run([str(executable)], capture_output=True, text=True, timeout=5)
+        matched = matched and output.returncode == 0 and output.stdout.strip() == 'fresh-' + binary
+    check(name + ': collected bytes equal and execute the actual selected-profile outputs', matched)
+
+run_case('custom-inherits-release', 'cargo build --locked --offline --profile ship', 'ship')
+run_case('built-in-dev', 'cargo build --locked --offline --profile dev', 'debug', declared='dev')
+run_case('built-in-bench', 'cargo build --locked --offline --profile bench', 'release', declared='bench')
+run_case('implicit-declared-dev', 'cargo build --locked --offline', 'debug', declared='dev')
+run_case('opaque-declared-ship', 'bash build-profile.sh', 'ship', declared='ship')
+run_case('complete-custom-family', 'cargo build --locked --offline --bins --profile=ship', 'ship', family=True)
+run_case('conflicting-producers',
+         'cargo build --profile ship && cargo build --release', '', refused=True)
+print('Native Cargo profile checks: %d passed, %d failed' % (checks - failures, failures), flush=True)
+sys.exit(1 if failures else 0)
+PY
+}
+
+if [[ "${1:-}" == --cargo-profiles-only ]]; then
+    test_cargo_native_profile_selection
+    exit $?
+fi
 
 # Genuine Go compiler and native backend: the installed-directory decoy must
 # never replace the actual command output. Only host health is a fixture; the
@@ -6663,6 +6822,7 @@ test_scp_rust_artifact_path_with_custom_profile() {
     MOCK_BINARY_NAME="mytool"
     MOCK_LOCAL_PATH="/local/path/mytool"
     MOCK_BUILD_PROFILE="release-interactive"
+    MOCK_BUILD_CMD="cargo build --profile release-interactive"
     MOCK_PLATFORM_ENV=$'CARGO_TARGET_DIR=/Users/jemanuel/tmp/rch-target-dsr\nCARGO_BUILD_TARGET=aarch64-apple-darwin'
 
     local result target

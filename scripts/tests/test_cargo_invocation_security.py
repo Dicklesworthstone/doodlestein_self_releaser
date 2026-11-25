@@ -924,5 +924,108 @@ class CargoCompatibilityTests(unittest.TestCase):
         self.assertEqual(row['rustflags'], ['-C', '', 'linker=evil'])
 
 
+
+class ExplicitProfileSelectionTests(unittest.TestCase):
+    def profile(self, command):
+        # Execute the emitted noncompiling mode, including its optional-profile
+        # fallback. The other tests keep their strict refusal adapter unchanged.
+        result = subprocess.run(
+            [shutil.which('bash'), '-p', '-s'], input=emit('profile', command),
+            env={'PATH': '/missing/worker/tools', 'CARGO_BUILD_TARGET': TRIPLE},
+            capture_output=True, text=True, timeout=10)
+        if result.returncode:
+            raise Refused(result.stderr)
+        return result.stdout.strip() or None
+
+    def test_literal_named_and_builtin_profiles(self):
+        for command, expected in (
+            ('cargo build --profile ship', 'ship'),
+            ('cargo +nightly build --profile=release-lto', 'release-lto'),
+            ('cargo build --profile="release-"lto', 'release-lto'),
+            ('cargo rustc --profile dev -- -C opt-level=0', 'dev'),
+            ('cargo zigbuild --profile ship --target ' + TRIPLE, 'ship'),
+            ('cargo xwin build --profile ship', 'ship'),
+            ('cross build --profile ship', 'ship'),
+            ('cargo build --release', 'release'),
+            ('cargo build -r', 'release'),
+            ('cargo build -rv', 'release'),
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(self.profile(command), expected)
+
+    def test_preparation_and_test_commands_do_not_select_the_release_profile(self):
+        self.assertEqual(self.profile(
+            'cargo metadata --format-version=1 && cargo build --profile ship'), 'ship')
+        self.assertEqual(self.profile(
+            'cargo test --release && cargo build --profile ship'), 'ship')
+        self.assertEqual(self.profile(
+            'cargo build -p first --profile ship && cargo build -p second --profile=ship'), 'ship')
+        # These words reach rustc/the test binary, not Cargo's profile selector.
+        self.assertIsNone(self.profile('cargo rustc -- --profile fake'))
+        self.assertIsNone(self.profile('cargo test -- --profile fake'))
+
+    def test_opaque_and_implicit_recipes_retain_the_declared_profile(self):
+        for command in (
+            'bash scripts/build.sh', 'make release', ':',
+            'cargo build --locked', 'cargo fetch', 'cargo xwin check',
+            'cd subdir && cargo build --release',
+            "bash -c 'cargo build --profile ship'",
+            'cargo build --release --features "$FEATURES"',
+            'cargo build --profile ship --target-dir "$CARGO_TARGET_DIR"',
+            'cargo build --profile "$PROFILE"',
+        ):
+            with self.subTest(command=command):
+                self.assertIsNone(self.profile(command))
+
+    def test_ambiguous_or_invalid_literal_profile_selection_is_refused(self):
+        for command in (
+            'cargo build --profile',
+            'cargo build --profile=',
+            'cargo build --profile ../elsewhere',
+            'cargo build --profile ship --release',
+            'cargo build --profile ship && cargo build --profile fast',
+            'cargo build --profile ship && cargo build',
+            'cargo build && cargo build --profile ship',
+        ):
+            with self.subTest(command=command), self.assertRaises(Refused):
+                self.profile(command)
+
+    def test_profile_discovery_never_executes_dynamic_shell_selectors(self):
+        work = Path(tempfile.mkdtemp(prefix='dsr-cargo-profile-dynamic-'))
+        marker = work / 'selector-ran'
+        command = 'cargo build --profile "$(touch ' + shlex.quote(str(marker)) + ')"'
+        self.assertIsNone(self.profile(command))
+        self.assertFalse(marker.exists())
+
+    def test_exported_artifact_resolver_normalizes_profiles_in_bash_children(self):
+        program = r'''
+source "$1" || exit $?
+"$BASH" -c 'for profile in dev test bench release-lto; do
+    act_get_remote_artifact_path rust /work "" tool linux/amd64 "$profile" || exit $?
+done'
+'''
+        result = subprocess.run(['bash', '-c', program, 'profile-child', str(MODULE)],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [
+            '/work/target/debug/tool', '/work/target/debug/tool',
+            '/work/target/release/tool', '/work/target/release-lto/tool'])
+
+    def test_generated_profile_mode_needs_no_worker_tools_or_cargo_configuration(self):
+        work = Path(tempfile.mkdtemp(prefix='dsr-cargo-profile-plan-'))
+        (work / '.cargo').mkdir()
+        (work / '.cargo/config.toml').write_text('deliberately invalid TOML')
+        marker = work / 'startup-ran'
+        startup = work / 'startup.sh'
+        startup.write_text('printf called > ' + shlex.quote(str(marker)) + '\n')
+        program = emit('profile', 'cargo build --profile release-lto')
+        result = subprocess.run(
+            [shutil.which('bash'), '-p', '-s'], input=program, cwd=work,
+            env={'PATH': '/missing/worker/tools', 'BASH_ENV': str(startup)},
+            capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'release-lto\n')
+        self.assertFalse(marker.exists())
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
