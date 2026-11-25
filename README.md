@@ -1485,6 +1485,12 @@ The GitHub tag is checked again immediately before release. An explicit version
 is required, and dsr leaves checkout selection to you; `--build-only` needs no
 remote tag lookup.
 
+Interrupted release lookups and publication return exit `5`, retain the original
+stage and status in JSON, and require an explicit retry. The watcher does not
+automatically replay them. Existing completed builds and release evidence stay
+available for recovery; ordinary unavailable lookups and lock conflicts keep
+their existing error behavior.
+
 Retry an interrupted strict publication with `--resume=RUN_UUID`, the original
 version, and the same `--output-dir`. Fallback retains private creation custody,
 verifies existing remote bytes, uploads only missing assets, and invokes the

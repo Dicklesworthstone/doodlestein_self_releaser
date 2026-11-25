@@ -207,6 +207,11 @@ cmd_release() {
             elif $mode=="prerelease" then .details.prerelease=true
             elif $mode=="missing-prerelease" then del(.details.prerelease)
             elif $mode=="malformed-prerelease" then .details.prerelease="true"
+            elif $mode=="interrupted" then
+                .details.interruption={stage:"upload",exit_code:130,outcome:"unconfirmed"}
+            elif $mode=="invalid-interruption" then
+                .details.interruption={stage:"upload",exit_code:8,outcome:"unconfirmed"}
+            elif $mode=="success-before-interruption" then .status="success" | .exit_code=0
             else . end'
     fi
     if [[ "${_ACT_ISOLATED_SOURCE_TOOL:-}" == tool ]]; then
@@ -859,8 +864,10 @@ test_build_only() {
 }
 test_release_failure() {
     setup "release-$1"; RELEASE_RC="$1"; run_fallback
-    [[ "$RC" == "$1" && ! -e "$CASE/lock" ]] && one_result && ! grep -q '^NOTIFY fallback.success' "$CALLS" &&
-        jq -e --argjson rc "$1" '[.details.steps[] | [.command, .exit_code]] ==
+    local expected_status="$1"
+    [[ "$expected_status" != 130 ]] || expected_status=5
+    [[ "$RC" == "$expected_status" && ! -e "$CASE/lock" ]] && one_result && ! grep -q '^NOTIFY fallback.success' "$CALLS" &&
+        jq -e --argjson rc "$expected_status" '[.details.steps[] | [.command, .exit_code]] ==
             [["check", 1], ["build", 0], ["release", $rc]]' "$CASE/stdout" >/dev/null
 }
 test_release_requires_public_confirmation() {
@@ -1417,6 +1424,133 @@ test_release_scan_failure() {
     setup scan_failure; completed_fixture; SCAN_RC=8
     run_fallback --resume
     [[ "$RC" == 8 && ! -e "$CASE/lock" ]] && one_result && ! grep -q '^RELEASE ' "$CALLS"
+}
+# Keep the shared paginated release reader and the public fallback command
+# real. A transport or parser can produce valid-looking output and then stop;
+# neither that output nor a previously completed build authorizes publication.
+test_release_resume_scan_terminal() {
+    local boundary="$1" stopped_status="$2" expected_status="$3"
+    setup "resume-scan-$boundary-$stopped_status"
+    completed_fixture || return 1
+    local checkpoint_before manifest_before payload_before
+    checkpoint_before=$(_release_sha256 "$CASE/checkpoint.json") || return 1
+    manifest_before=$(_release_sha256 "$OUT/tool-v1.2.3-manifest.json") || return 1
+    payload_before=$(_release_sha256 "$OUT/worker") || return 1
+    # shellcheck source=/dev/null
+    source <(awk '/^_release_contract_scan_release_by_tag\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "$HELPERS_FILE")
+    gh_api() {
+        printf 'SCAN_HTTP %s\n' "$*" >> "$CALLS"
+        [[ "$1" == 'repos/owner/tool/releases?per_page=100&page=1' && "$2" == --no-cache ]] || return 99
+        if [[ "$boundary" == malformed-row ]]; then printf '[42]\n'; return 0; fi
+        printf '[{"id":9,"tag_name":"v1.2.3"}]\n'
+        if [[ "$boundary" == transport ]]; then return "$stopped_status"; fi
+    }
+    jq() {
+        local parsed_status=0 selected=false
+        command jq "$@" || parsed_status=$?
+        [[ "$parsed_status" == 0 ]] || return "$parsed_status"
+        case "$boundary" in
+            page)
+                [[ "$1" == -e && "$2" == 'type == "array" and length <= 100' ]] && selected=true ;;
+            merge)
+                [[ "$1" == -c && "${2:-}" == -s && "${3:-}" == -e && "${5:-}" == expected_tag ]] && selected=true ;;
+            matches-count|page-count)
+                if [[ "$1" == length ]]; then
+                    if [[ -e "$CASE/first-scan-count" ]]; then
+                        [[ "$boundary" == page-count ]] && selected=true
+                    else
+                        : > "$CASE/first-scan-count"
+                        [[ "$boundary" == matches-count ]] && selected=true
+                    fi
+                fi ;;
+            result)
+                [[ "$1" == -c && "${2:-}" == -e && "${3:-}" == *'then {count: length'* ]] && selected=true ;;
+            admission)
+                [[ "$1" == -es && "${2:-}" == --arg && "${3:-}" == tag ]] && selected=true ;;
+        esac
+        if $selected; then
+            printf 'SCAN_STOP %s %s\n' "$boundary" "$stopped_status" >> "$CALLS"
+            return "$stopped_status"
+        fi
+        return 0
+    }
+    run_fallback --resume
+    [[ "$RC" == "$expected_status" && ! -e "$CASE/lock" ]] && one_result &&
+        [[ "$(_release_sha256 "$CASE/checkpoint.json")" == "$checkpoint_before" &&
+           "$(_release_sha256 "$OUT/tool-v1.2.3-manifest.json")" == "$manifest_before" &&
+           "$(_release_sha256 "$OUT/worker")" == "$payload_before" ]] &&
+        ! grep -q '^BUILD ' "$CALLS" || return 1
+    [[ "$boundary" == transport || "$boundary" == none || "$boundary" == malformed-row ]] ||
+        grep -q "^SCAN_STOP $boundary $stopped_status$" "$CALLS" || return 1
+    if [[ "$expected_status" == 0 ]]; then
+        grep -q '^RELEASE .*--resume' "$CALLS"
+    else
+        ! grep -q '^RELEASE \|^NOTIFY fallback.success' "$CALLS" || return 1
+        if [[ "$expected_status" == 5 ]]; then
+            command jq -e --argjson stopped "$stopped_status" '
+                .details.phase == "release" and .details.phases.release == "blocked" and
+                .details.interruption == {stage:"scan",exit_code:$stopped,outcome:"unconfirmed"} and
+                .details.steps[-1].exit_code == 5' "$CASE/stdout" >/dev/null
+        else
+            command jq -e '.details.phase == "release" and
+                (.details | has("interruption") | not)' "$CASE/stdout" >/dev/null
+        fi
+    fi
+}
+test_release_publication_interruption() {
+    local stopped_status="$1" mode="$2" retained_status="$1" retained_stage=release
+    setup "release-interruption-$stopped_status-$mode"
+    completed_fixture || return 1
+    RELEASE_EXISTS=true RELEASE_RC="$stopped_status" RELEASE_RESULT_MODE="$mode"
+    if [[ "$mode" == interrupted ]]; then retained_status=130; retained_stage=upload; fi
+    local checkpoint_before manifest_before payload_before
+    checkpoint_before=$(_release_sha256 "$CASE/checkpoint.json") || return 1
+    manifest_before=$(_release_sha256 "$OUT/tool-v1.2.3-manifest.json") || return 1
+    payload_before=$(_release_sha256 "$OUT/worker") || return 1
+    run_fallback --resume
+    [[ "$RC" == 5 && ! -e "$CASE/lock" ]] && one_result &&
+        ! grep -q '^BUILD \|^NOTIFY fallback.success' "$CALLS" &&
+        [[ "$(_release_sha256 "$CASE/checkpoint.json")" == "$checkpoint_before" &&
+           "$(_release_sha256 "$OUT/tool-v1.2.3-manifest.json")" == "$manifest_before" &&
+           "$(_release_sha256 "$OUT/worker")" == "$payload_before" ]] &&
+        jq -e --arg stage "$retained_stage" --argjson stopped "$retained_status" '
+            .details.phases.release == "failed" and
+            .details.interruption == {stage:$stage,exit_code:$stopped,outcome:"unconfirmed"} and
+            .details.steps[-1].exit_code == 5' "$CASE/stdout" >/dev/null
+}
+# Replay the actual fallback result through the watcher's retained-result
+# admission. Even an older journal labeling this attempt "failed" must not
+# restart publication after cancellation; ordinary unavailable reads/conflicts
+# still retain their existing automatic retry policy.
+test_release_resume_retry_policy() {
+    local stage="$1" stopped_status="$2" expected_status="$3" expected_retry="$4"
+    watch_admission_fixture "resume-retry-$stage-$stopped_status" || return 1
+    OUT="$DSR_STATE_DIR/watch-artifacts/12345"
+    export DSR_RUN_ID=watch-12345-1
+    cmd_build tool --version 1.2.3 --output-dir "$OUT" >/dev/null || return 1
+    checkpoint completed || return 1
+    : > "$CALLS"
+    if [[ "$stage" == scan ]]; then SCAN_RC="$stopped_status"
+    else RELEASE_RC="$stopped_status"; RELEASE_EXISTS=true; fi
+    run_fallback --resume --expected-sha "$SOURCE_SHA" --watch-admission "$WATCH_ADMISSION"
+    [[ "$RC" == "$expected_status" && ! -e "$CASE/lock" ]] && one_result || return 1
+    # shellcheck source=/dev/null
+    source <(awk '/^(_watch_interrupted_exit|_watch_fallback_result_evidence|_watch_retry_result_verified)\(\) [({]/{copy=1} copy{print} copy && /^[)}]$/{copy=0}' "$HELPERS_FILE")
+    local _WATCH_STATE_DIR="$DSR_STATE_DIR" attempt_dir result_sha record retry_status=0
+    attempt_dir="$_WATCH_STATE_DIR/watch-attempts/12345-1"
+    mkdir -p "$attempt_dir" || return 1
+    cp "$CASE/stdout" "$attempt_dir/result.json" || return 1
+    result_sha=$(_release_sha256 "$attempt_dir/result.json") || return 1
+    jq -nc --arg sha "$result_sha" --argjson rc "$RC" '
+        {run_id:"12345",attempt_id:"12345-1",attempt:1,exit_code:$rc,finished_epoch:1000,
+         result_status:"valid",result_sha256:$sha}' > "$attempt_dir/completion.json" || return 1
+    record=$(jq -nc --arg sha "$SOURCE_SHA" --argjson admission "$WATCH_ADMISSION" --argjson rc "$RC" '
+        {status:"failed",result_status:"valid",attempt_id:"12345-1",attempt:1,
+         exit_code:$rc,finished_epoch:1000,tool:"tool",repo:"owner/tool",version:"v1.2.3",
+         head_sha:$sha,watch_admission:$admission,parallel_jobs:1,prerelease_requested:false}') || return 1
+    _watch_retry_result_verified 12345 "$record" || retry_status=$?
+    [[ "$retry_status" == "$expected_retry" &&
+       "$(_release_sha256 "$attempt_dir/result.json")" == "$result_sha" ]]
 }
 test_signing_interruption() {
     setup "sign-interrupt-$1"; SIGN_RC="$1"; run_fallback
@@ -2152,7 +2286,7 @@ run_test test_lock_failure 8
 run_test test_quality_failure
 for signal_name in TERM KILL; do run_test test_quality_interruption_real "$signal_name"; done
 run_test test_build_only
-for rc in 1 7 8 130; do run_test test_release_failure "$rc"; done
+for rc in 1 2 3 4 7 8 128 130; do run_test test_release_failure "$rc"; done
 for mode in draft missing-visibility wrong-tag wrong-repo malformed; do run_test test_release_requires_public_confirmation "$mode"; done
 run_test test_release_public_confirmation_completes
 run_test test_resume_reaches_build
@@ -2176,6 +2310,32 @@ for mode in missing malformed cancelled diagnostic selected; do run_test test_in
 run_test test_signature_resume
 for mode in existing-corrupt existing-symlink missing corrupt mutate manifest; do run_test test_signature_failure "$mode"; done
 run_test test_release_scan_failure
+for scan_boundary in transport page merge matches-count page-count result admission; do
+    run_test test_release_resume_scan_terminal "$scan_boundary" 130 5
+done
+for scan_boundary in page merge matches-count page-count result admission; do
+    for parser_status in 2 5; do
+        run_test test_release_resume_scan_terminal "$scan_boundary" "$parser_status" 8
+    done
+done
+run_test test_release_resume_scan_terminal malformed-row 0 8
+for stopped_status in 2 5 124 125 129 137 139 141 143 255; do
+    run_test test_release_resume_scan_terminal transport "$stopped_status" 5
+done
+for failed_status in 1 3 4 8 128; do
+    run_test test_release_resume_scan_terminal transport "$failed_status" 8
+done
+run_test test_release_resume_scan_terminal none 0 0
+for stopped_status in 5 124 125 129 130 137 139 141 143 255; do
+    run_test test_release_publication_interruption "$stopped_status" public
+done
+for release_mode in interrupted invalid-interruption malformed success-before-interruption; do
+    run_test test_release_publication_interruption 5 "$release_mode"
+done
+run_test test_release_resume_retry_policy scan 130 5 1
+run_test test_release_resume_retry_policy publication 124 5 1
+run_test test_release_resume_retry_policy scan 8 8 0
+run_test test_release_resume_retry_policy publication 2 2 0
 for rc in 5 130 143; do run_test test_signing_interruption "$rc"; done
 run_test test_unusable_signing_key_blocks_release
 run_test test_missing_signing_key_releases_unsigned_loudly

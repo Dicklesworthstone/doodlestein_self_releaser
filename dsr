@@ -8725,24 +8725,29 @@ _release_contract_confirm_or_restore_draft() {
 _release_contract_scan_release_by_tag() {
     local repo="$1"
     local expected_tag="$2"
-    local page=1 page_json="" page_count=0
+    local page=1 page_json="" page_count=0 match_count=0 scan_status=0
     local max_pages=1000
     local matches='[]'
 
     while ((page <= max_pages)); do
         page_json=$(gh_api "repos/$repo/releases?per_page=100&page=$page" \
             --no-cache 2>/dev/null) || {
-            local scan_status=$?
+            scan_status=$?
             log_error "Could not scan GitHub releases for strict tag $expected_tag"
             if _gh_operation_interrupted "$scan_status"; then return "$scan_status"; fi
             return 1
         }
-        if ! jq -e 'type == "array" and length <= 100' \
-            <<< "$page_json" >/dev/null 2>&1; then
+        jq -e 'type == "array" and length <= 100' \
+            <<< "$page_json" >/dev/null 2>&1 || {
+            scan_status=$?
             log_error "GitHub returned an invalid strict release-list page"
+            # jq's ordinary usage/runtime errors include 2 and 5. Those are
+            # not the transport adapter's interruption codes; only an actual
+            # signal-like parser exit withdraws this invocation's authority.
+            if ((scan_status > 128)); then return "$scan_status"; fi
             return 1
-        fi
-        if ! matches=$(
+        }
+        matches=$(
             printf '%s\n%s\n' "$matches" "$page_json" |
                 jq -c -s -e \
                     --arg expected_tag "$expected_tag" '
@@ -8755,15 +8760,31 @@ _release_contract_scan_release_by_tag() {
                         error("invalid strict release scan input")
                     end
                 '
-        ); then
+        ) || {
+            scan_status=$?
             log_error "GitHub returned an invalid strict release-list page"
+            if ((scan_status > 128)); then return "$scan_status"; fi
             return 1
-        fi
-        if [[ $(jq 'length' <<< "$matches") -gt 1 ]]; then
+        }
+        # A parser may emit a plausible count before it is interrupted. Check
+        # both observations before using either value to authorize a release
+        # or stop pagination; emitted stdout alone is not a completed read.
+        match_count=$(jq 'length' <<< "$matches") || {
+            scan_status=$?
+            log_error "Could not count matching releases for strict tag $expected_tag"
+            if ((scan_status > 128)); then return "$scan_status"; fi
+            return 1
+        }
+        if [[ "$match_count" -gt 1 ]]; then
             log_error "Multiple GitHub releases use strict tag $expected_tag"
             return 1
         fi
-        page_count=$(jq 'length' <<< "$page_json")
+        page_count=$(jq 'length' <<< "$page_json") || {
+            scan_status=$?
+            log_error "Could not count the strict release-list page"
+            if ((scan_status > 128)); then return "$scan_status"; fi
+            return 1
+        }
         ((page_count < 100)) && break
         page=$((page + 1))
     done
@@ -8776,7 +8797,11 @@ _release_contract_scan_release_by_tag() {
         'if type == "array" and length <= 1
          then {count: length, release: (.[0] // null)}
          else error("invalid strict release scan result")
-         end' <<< "$matches"
+         end' <<< "$matches" || {
+        scan_status=$?
+        if ((scan_status > 128)); then return "$scan_status"; fi
+        return 1
+    }
 }
 
 _release_contract_observe_bound_draft() {
@@ -15929,16 +15954,32 @@ EOF
         case "$sbom_override" in true) release_args+=(--sbom) ;; false) release_args+=(--no-sbom) ;; esac
         [[ -z "$sbom_format" ]] || release_args+=(--sbom-format "$sbom_format")
         if $resume && [[ "$contract" == null ]]; then
-            local scan
-            if ! scan=$(_release_contract_scan_release_by_tag "$repo" "$tag") ||
-               ! jq -es --arg tag "$tag" 'length == 1 and (.[0] |
-                    (.count == 0 and .release == null) or
-                    (.count == 1 and (.release | type == "object" and .tag_name == $tag)))' \
-                <<< "$scan" >/dev/null; then
+            local scan scan_count="" scan_status=0
+            scan=$(_release_contract_scan_release_by_tag "$repo" "$tag") || scan_status=$?
+            if [[ "$scan_status" == 0 ]]; then
+                scan_count=$(jq -es --arg tag "$tag" '
+                    if length == 1 and (.[0] |
+                        (.count == 0 and .release == null) or
+                        (.count == 1 and (.release | type == "object" and .tag_name == $tag)))
+                    then .[0].count else error("invalid release scan result") end' \
+                    <<< "$scan") || {
+                    scan_status=$?
+                    # Preserve actual parser signals without mistaking jq's
+                    # ordinary error status 5 for an adapter cancellation.
+                    ((scan_status > 128)) || scan_status=1
+                }
+            fi
+            if [[ "$scan_status" != 0 ]]; then
+                release_status="blocked"
+                if _gh_operation_interrupted "$scan_status"; then
+                    _fallback_record_interruption scan "$scan_status" || return 5
+                    _fallback_result 5 release "Release inspection interrupted (exit $scan_status); retained outputs require explicit recovery"
+                    return 5
+                fi
                 _fallback_result 8 release "Could not unambiguously resolve release for resume"
                 return 8
             fi
-            [[ "$(jq -r '.count' <<< "$scan")" == 1 ]] && release_args+=(--resume)
+            [[ "$scan_count" == 1 ]] && release_args+=(--resume)
         fi
         if [[ -n "$expected_sha" ]]; then
             local observed_tag_sha observed_tag_status=0
@@ -16018,12 +16059,18 @@ EOF
         else
             release_result=$(JSON_MODE=true cmd_release "${release_args[@]}") || rc=$?
         fi
-        if [[ "$contract" != null ]] && _gh_operation_interrupted "$rc"; then
-            local interrupted_status
+        # The ordinary release command owns the same remote publication
+        # boundaries as the strict path. Preserve its interruption receipt and
+        # normalize stopped child processes before the watcher classifies the
+        # fallback as retryable. Public ordinary exit 2 remains a lock conflict;
+        # it is not the adapter's stopped-supervisor status.
+        if _gh_operation_interrupted "$rc" && { [[ "$contract" != null ]] || [[ "$rc" != 2 ]]; }; then
+            local interrupted_status interrupted_label="Release"
+            [[ "$contract" == null ]] || interrupted_label="Strict release"
             release_status="failed"
             _fallback_record_interruption release "$rc" "$release_result" || return 5
             interrupted_status=$(jq -r '.exit_code' <<< "$fallback_interruption") || return 5
-            _fallback_result 5 release "Strict release interrupted (exit $interrupted_status); original publication custody is retained"
+            _fallback_result 5 release "$interrupted_label interrupted (exit $interrupted_status); original publication custody is retained"
             return 5
         fi
         if [[ $rc -ne 0 ]]; then

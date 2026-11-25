@@ -3257,6 +3257,15 @@ unavailable. Retrying an ordinary publication with `--resume` uses its retained
 creation intent to finish an owned interrupted draft; it cannot publish an
 unrelated draft.
 
+Interrupted release discovery or publication returns fallback exit `5` for both
+ordinary and strict releases. `details.interruption` retains the failed stage
+and original status, and the watcher requires explicit recovery rather than
+automatically replaying that attempt. Release discovery checks each completed
+page, count and result parse before using its output. An ordinary unavailable
+or malformed lookup still returns `8`, and an ordinary release lock conflict
+still returns `2`. These failures preserve the completed build checkpoint,
+manifest and payloads.
+
 Strict fallback retains a private, build-bound publication handoff before draft
 creation. `--resume=RUN_UUID` reuses its completed build, original creation
 response, signed asset plan, and canonical output directory. It verifies fresh
