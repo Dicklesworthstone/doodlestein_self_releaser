@@ -1458,6 +1458,13 @@ dsr release --repo <name> --version <tag> [--draft] [--prerelease] [--dispatch]
 | `--no-sbom` | false | Disable automatic generation without discarding retained public metadata |
 | `--sbom-format` | `sbom.format`, default `spdx` | Select `spdx` or `cyclonedx` and enable generation |
 
+Ordinary release publication bounds its preliminary `git ls-remote` origin-tag
+inspection by `GH_API_TIMEOUT` (default 60 seconds), including credential helpers
+and owned child processes. The observation receives closed stdin. A deadline or
+interruption returns exit `5` at `details.interruption.stage: "origin_tag"`
+before artifact custody or publication. Ordinary Git fatal status `128` and SSH
+transport failure `255` still defer to the authoritative GitHub tag checks.
+
 Binary publication, strict draft finalization, and `release verify --fix` hold
 the same kernel leases used by build collection and artifact pruning, from
 before the first artifact/manifest read through upload, repair or finalization
@@ -4237,7 +4244,7 @@ Structured error codes for programmatic handling:
 | `DSR_GH_TOKEN` | | Highest-priority GitHub API token for DSR |
 | `GITHUB_TOKEN` | | GitHub API token, after `DSR_GH_TOKEN` |
 | `GH_TOKEN` | | GitHub API token, after `DSR_GH_TOKEN` and `GITHUB_TOKEN` |
-| `GH_API_TIMEOUT` | 60 | Positive integer seconds per complete JSON API attempt, standalone authentication check or whole watcher preflight (maximum 999999) |
+| `GH_API_TIMEOUT` | 60 | Positive integer seconds per complete JSON API attempt, standalone authentication check, ordinary release origin inspection or whole watcher preflight (maximum 999999) |
 | `DSR_SLACK_WEBHOOK` | config `notifications.slack_webhook` | Slack incoming webhook for `--notify slack` |
 | `DSR_DISCORD_WEBHOOK` | config `notifications.discord_webhook` | Discord webhook for `--notify discord` |
 | `DSR_NOTIFY_TIMEOUT` | 20 | Positive integer seconds per complete external notification channel (maximum 999999) |

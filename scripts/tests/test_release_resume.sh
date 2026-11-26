@@ -3816,11 +3816,100 @@ test_release_origin_boundary_sigterm() { release_origin_boundary_case 143 5; }
 test_release_origin_boundary_sighup() { release_origin_boundary_case 129 5; }
 test_release_origin_boundary_sigquit() { release_origin_boundary_case 131 5; }
 test_release_origin_boundary_sigkill() { release_origin_boundary_case 137 5; }
+test_release_origin_boundary_sigsegv() { release_origin_boundary_case 139 5; }
+test_release_origin_boundary_sigpipe() { release_origin_boundary_case 141 5; }
+test_release_origin_boundary_signal_ceiling() { release_origin_boundary_case 192 5; }
 test_release_origin_boundary_deadline() { release_origin_boundary_case 124 5; }
 test_release_origin_boundary_supervisor() { release_origin_boundary_case 125 5; }
 test_release_origin_boundary_transport() { release_origin_boundary_case 128 3; }
 test_release_origin_boundary_ssh() { release_origin_boundary_case 255 3; }
 test_release_origin_boundary_success() { release_origin_boundary_case 0 3; }
+
+# Exercise the real deadline supervisor against an external Git transport,
+# rather than returning a synthetic timeout status. The selected input and
+# local Git tag are real; the custody sentinel proves no publication began.
+release_origin_transport_case() {
+    local mode="$1" input_after="" process_state pid started
+    setup "origin_transport_$mode" || return 1
+    command git init -q -b main "$CASE/checkout" &&
+        command git -C "$CASE/checkout" -c user.name=t -c user.email=t@example.invalid \
+            commit -q --allow-empty -m tagged &&
+        command git -C "$CASE/checkout" tag v1.2.3 || return 1
+    STAGED_SOURCE_SHA=$(command git -C "$CASE/checkout" rev-parse HEAD) || return 1
+    act_get_local_path() { printf '%s\n' "$CASE/checkout"; }
+    git_ops_tag_exists() { command git -C "$1" rev-parse -q --verify "refs/tags/$2" >/dev/null; }
+    git_ops_tag_sha() { command git -C "$1" rev-parse --verify "$2^{commit}"; }
+    _dsr_require() {
+        [[ "$1" != build_state ]] || { printf 'CUSTODY-BOUNDARY\n' >> "$CALLS"; return 3; }
+    }
+    manifest payload.bin || return 1
+    cp "$CASE/artifacts/payload.bin" "$CASE/payload.before" &&
+        cp "$CASE/artifacts/tool-v1.2.3-manifest.json" "$CASE/manifest.before" || return 1
+    mkdir -p "$CASE/bin" || return 1
+    export DSR_TEST_ORIGIN_GIT DSR_TEST_ORIGIN_CASE="$CASE" DSR_TEST_ORIGIN_MODE="$mode"
+    export DSR_TEST_ORIGIN_SHA="$STAGED_SOURCE_SHA" GH_API_TIMEOUT=1
+    DSR_TEST_ORIGIN_GIT=$(command -v git) || return 1
+    cat > "$CASE/bin/git" <<'GIT'
+#!/usr/bin/env bash
+set -uo pipefail
+if [[ "${1:-}" == -C && "${2:-}" == "$DSR_TEST_ORIGIN_CASE/checkout" && "${3:-}" == ls-remote ]]; then
+    printf 'ORIGIN-TRANSPORT\n' >> "$DSR_TEST_ORIGIN_CASE/calls"
+    printf '%s\n' "$BASHPID" > "$DSR_TEST_ORIGIN_CASE/origin.pid"
+    if IFS= read -r input; then
+        printf 'ORIGIN-READ-INPUT\n' >> "$DSR_TEST_ORIGIN_CASE/calls"
+    fi
+    if [[ "$DSR_TEST_ORIGIN_MODE" == deadline ]]; then
+        sleep 30 &
+        child=$!
+        printf '%s\n' "$child" > "$DSR_TEST_ORIGIN_CASE/origin-child.pid"
+        wait "$child"
+    fi
+    printf '%s\trefs/tags/v1.2.3\n' "$DSR_TEST_ORIGIN_SHA"
+    exit 0
+fi
+exec "$DSR_TEST_ORIGIN_GIT" "$@"
+GIT
+    chmod +x "$CASE/bin/git" || return 1
+    export PATH="$CASE/bin:$PATH"
+    if [[ "$mode" == invalid ]]; then
+        # Authentication has its own deadline validation. Isolate the origin
+        # boundary too, so an unchecked helper invocation cannot pass this case.
+        gh_require_auth() { return 0; }
+        GH_API_TIMEOUT=0
+    fi
+    printf 'retained caller input\n' > "$CASE/input"
+    exec 9< "$CASE/input"
+    started=$SECONDS
+    run_release --no-dispatch <&9
+    IFS= read -r input_after <&9 || true
+    exec 9<&-
+    [[ "$input_after" == 'retained caller input' ]] || return 1
+    if [[ "$mode" == deadline ]]; then
+        [[ "$STATUS" == 5 && $((SECONDS - started)) -lt 10 &&
+           "$(cat "$CALLS")" == ORIGIN-TRANSPORT ]] || return 1
+        jq -es 'length == 1 and (.[0] | .exit_code == 5 and .status == "error" and
+            .details.interruption.stage == "origin_tag" and
+            (.details.interruption.exit_code == 124 or .details.interruption.exit_code == 137))' \
+            "$CASE/stdout" >/dev/null || return 1
+        for pid in "$CASE/origin.pid" "$CASE/origin-child.pid"; do
+            [[ -s "$pid" ]] || return 1
+            process_state=$(ps -o stat= -p "$(cat "$pid")" 2>/dev/null) || process_state=""
+            [[ -z "$process_state" || "$process_state" == Z* ]] || return 1
+        done
+    elif [[ "$mode" == invalid ]]; then
+        [[ "$STATUS" == 4 && ! -s "$CALLS" && ! -e "$CASE/origin.pid" ]] || return 1
+    else
+        [[ "$STATUS" == 3 && "$(cat "$CALLS")" == $'ORIGIN-TRANSPORT\nCUSTODY-BOUNDARY' ]] || return 1
+    fi
+    [[ ! -e "$DSR_STATE_DIR/builds" && ! -e "$CASE/create-request.json" &&
+       ! -e "$CASE/artifacts/SHA256SUMS" ]] &&
+        cmp -s "$CASE/artifacts/payload.bin" "$CASE/payload.before" &&
+        cmp -s "$CASE/artifacts/tool-v1.2.3-manifest.json" "$CASE/manifest.before"
+}
+
+test_release_origin_boundary_real_deadline() { release_origin_transport_case deadline; }
+test_release_origin_boundary_retains_stdin() { release_origin_transport_case healthy; }
+test_release_origin_boundary_invalid_deadline() { release_origin_transport_case invalid; }
 
 test_staged_absent_tag_is_created_at_pinned_commit() { staged_tag_case absent-empty; }
 test_staged_absent_tag_with_prefix_sibling_can_publish() { staged_tag_case absent-prefix; }
@@ -4268,6 +4357,8 @@ for test in test_release_auth_cancellation_never_falls_back_or_publishes \
     test_staged_unavailable_tag_blocks_publication test_staged_postpublish_tag_drift_restores_draft \
     test_release_origin_boundary_sigint test_release_origin_boundary_sigterm test_release_origin_boundary_sighup \
     test_release_origin_boundary_sigquit test_release_origin_boundary_sigkill test_release_origin_boundary_deadline \
+    test_release_origin_boundary_sigsegv test_release_origin_boundary_sigpipe test_release_origin_boundary_signal_ceiling \
+    test_release_origin_boundary_real_deadline test_release_origin_boundary_retains_stdin test_release_origin_boundary_invalid_deadline \
     test_release_origin_boundary_supervisor test_release_origin_boundary_transport test_release_origin_boundary_ssh \
     test_release_origin_boundary_success \
     test_staged_absent_tag_is_created_at_pinned_commit test_staged_absent_tag_with_prefix_sibling_can_publish \

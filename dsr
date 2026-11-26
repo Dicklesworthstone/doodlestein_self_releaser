@@ -10425,10 +10425,13 @@ EOF
             # GitHub creates a missing tag at target_commitish, else at the
             # default branch head. Origin already holding a different commit
             # under this tag would publish other source than was tagged here.
-            local origin_tags origin_tag_sha="" origin_status=0
+            local origin_tags origin_timeout origin_tag_sha="" origin_status=0
             if [[ -n "$release_tag_sha" ]] && ! $release_contract_enabled; then
-                if origin_tags=$(git -C "$local_path" ls-remote --tags origin \
-                        "refs/tags/$tag" "refs/tags/$tag^{}" 2>/dev/null); then
+                # Credential helpers and SSH may stall before Git returns.
+                # Own their deadline and keep the caller's input untouched.
+                origin_timeout=$(_gh_api_timeout) || return $?
+                if origin_tags=$(run_with_timeout "$origin_timeout" git -C "$local_path" ls-remote --tags origin \
+                        "refs/tags/$tag" "refs/tags/$tag^{}" </dev/null 2>/dev/null); then
                     origin_tag_sha=$(awk -v peeled="refs/tags/$tag^{}" -v ref="refs/tags/$tag" '
                         $2 == peeled { p = $1 } $2 == ref { d = $1 } END { print (p != "" ? p : d) }' <<< "$origin_tags")
                     if [[ -n "$origin_tag_sha" && "$origin_tag_sha" != "$release_tag_sha" ]]; then
@@ -10442,12 +10445,11 @@ EOF
                     # stopped supervisor cannot authorize that next operation.
                     # These are raw Git statuses: ordinary fatal 128 and SSH
                     # 255 are not GitHub adapter cancellation statuses.
-                    case "$origin_status" in
-                        124|125|129|130|131|137|143)
-                            _release_contract_report_interruption "$origin_status" release origin_tag "$repo" "$tag" "$version"
-                            return 5
-                            ;;
-                    esac
+                    if (( origin_status == 124 || origin_status == 125 ||
+                          (origin_status >= 129 && origin_status <= 192) )); then
+                        _release_contract_report_interruption "$origin_status" release origin_tag "$repo" "$tag" "$version"
+                        return 5
+                    fi
                 fi
             fi
         elif $verify_tag; then
