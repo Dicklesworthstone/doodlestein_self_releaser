@@ -92,6 +92,14 @@ _act_file_identity() {
     return 4
 }
 
+# Native SSH transfers use raw process statuses. Preserve signal exits without
+# treating SSH's 255 or the supervisor's 124/125/137 failures as cancellation.
+_act_artifact_transfer_interrupted() {
+    local status="${1:-0}"
+    [[ "$status" =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
+    ((status >= 129 && status <= 192 && status != 137))
+}
+
 # Collect producer stdout into a newly-created file while holding the original
 # destination inode open. The receipt is emitted only after the producer exits
 # successfully and the descriptor/path identity, digest, and size remain
@@ -119,7 +127,13 @@ _act_collect_stream_exclusive() {
             # substitutions; a producer that inherits that stdin (ssh does)
             # drains the loop's remaining lines, so only the first artifact
             # is ever collected.
-            "$@" >&9 </dev/null || exit 7
+            if "$@" >&9 </dev/null; then
+                :
+            else
+                local stream_status=$?
+                _act_artifact_transfer_interrupted "$stream_status" && exit "$stream_status"
+                exit 7
+            fi
             chmod "$mode" /dev/fd/9 || exit 4
 
             local fd_identity_after path_identity_after sha_before size_before
@@ -16660,6 +16674,35 @@ EOF
     local collected_sha256="" collected_size_bytes=0 collected_identity=""
     local strict_collection_receipts=()
     local workspace_member_receipts=()
+    # Stop before any alias retry, sibling transfer or archive work. Keep the
+    # completed compiler observation truthful, but advertise no collected bytes.
+    # Partial files and private stages remain available for explicit recovery.
+    _act_stop_native_collection() {
+        local transfer_status="$1"
+        _act_artifact_transfer_interrupted "$transfer_status" || return 1
+        local message="Native artifact collection interrupted on $host (exit $transfer_status)"
+        _log_error "$message"
+        jq -nc --arg tool "$tool_name" --arg platform "$platform" --arg host "$host" \
+            --arg target_triple "$native_target_triple" --argjson code "$transfer_status" \
+            --argjson duration "$duration" --arg log_file "$log_file" --arg error "$message" \
+            --arg phase "$native_execution_phase" --arg timeout "$native_execution_timeout" \
+            --arg transport_timeout "$native_execution_transport_timeout" \
+            --argjson command_exit "$native_execution_exit" \
+            --argjson dispatched "$native_build_program_dispatched" '
+            def seconds: if test("^[1-9][0-9]*$") then tonumber else null end;
+            {tool:$tool, platform:$platform, host:$host, method:"native",
+             target_triple:(if $target_triple == "" then null else $target_triple end),
+             status:"failed", exit_code:$code, duration_seconds:$duration,
+             artifact_path:"", artifact_paths:[], additional_artifacts:[],
+             collected_sha256:null, collected_size_bytes:null, collected_identity:null,
+             log_file:$log_file, stage:"artifact_collection", error:$error,
+             native_execution:{phase:$phase, timeout_seconds:($timeout | seconds),
+                 transport_timeout_seconds:($transport_timeout | seconds),
+                 command_exit_code:$command_exit, failure_kind:null,
+                 build_program_dispatched:$dispatched}}' || true
+        # A failed diagnostic serializer must not erase known cancellation.
+        return 0
+    }
     if [[ $exit_code -eq 0 ]]; then
         _log_ok "Build completed on $host in ${duration}s"
         status="success"
@@ -16742,7 +16785,7 @@ EOF
             fi
             local this_artifact_path="$artifact_dir/$artifact_filename"
             local member_collected=false workspace_member_receipt=""
-            local collection_receipt="" collection_mode=""
+            local collection_receipt="" collection_mode="" collection_status=0
 
             _log_info "Downloading artifact: ${host}:${remote_artifact_path}"
             local scp_output
@@ -16761,19 +16804,21 @@ EOF
                             _act_stream_local_file "$copy_src"); then
                         :
                     else
+                        collection_status=$?
                         collection_receipt=""
                     fi
                 elif _act_is_windows_host "$host"; then
                     collection_receipt=$(_act_collect_stream_exclusive \
                         "$this_artifact_path" "$collection_mode" \
                         _act_stream_remote_windows_file \
-                        "$host" "$remote_artifact_path") || collection_receipt=""
+                        "$host" "$remote_artifact_path") || { collection_status=$?; collection_receipt=""; }
                 else
                     collection_receipt=$(_act_collect_stream_exclusive \
                         "$this_artifact_path" "$collection_mode" \
                         _act_stream_remote_unix_file \
-                        "$ssh_destination" "$remote_artifact_path") || collection_receipt=""
+                        "$ssh_destination" "$remote_artifact_path") || { collection_status=$?; collection_receipt=""; }
                 fi
+                if _act_stop_native_collection "$collection_status"; then return "$collection_status"; fi
 
                 if [[ "$go_output_plan" == null && -z "$collection_receipt" && "$remote_artifact_path" == *.exe ]] && \
                    ! _act_is_local_host "$host"; then
@@ -16810,13 +16855,14 @@ EOF
                             collection_receipt=$(_act_collect_stream_exclusive \
                                 "$this_artifact_path" "$collection_mode" \
                                 _act_stream_remote_windows_file \
-                                "$host" "$alt_remote_artifact_path") || collection_receipt=""
+                                "$host" "$alt_remote_artifact_path") || { collection_status=$?; collection_receipt=""; }
                         else
                             collection_receipt=$(_act_collect_stream_exclusive \
                                 "$this_artifact_path" "$collection_mode" \
                                 _act_stream_remote_unix_file \
-                                "$ssh_destination" "$alt_remote_artifact_path") || collection_receipt=""
+                                "$ssh_destination" "$alt_remote_artifact_path") || { collection_status=$?; collection_receipt=""; }
                         fi
+                        if _act_stop_native_collection "$collection_status"; then return "$collection_status"; fi
                         [[ -z "$collection_receipt" ]] || \
                             _log_info "Windows artifact lacks .exe suffix; streamed $alt_remote_artifact_path"
                     fi
@@ -16878,6 +16924,8 @@ EOF
                         download_failed=true
                     fi
                 else
+                    collection_status=$?
+                    if _act_stop_native_collection "$collection_status"; then return "$collection_status"; fi
                     _log_error "Failed to copy artifact $bin from local host ($copy_src)"
                     echo "Local cp failed for $bin: $copy_src" >> "$log_file"
                     download_failed=true
@@ -16901,6 +16949,8 @@ EOF
                     download_failed=true
                 fi
             else
+                collection_status=$?
+                if _act_stop_native_collection "$collection_status"; then return "$collection_status"; fi
                 # Windows cross-compile fallback (symmetric with the local-host
                 # branch above): `go build -o <name> ./cmd/x` does NOT append
                 # `.exe` on any GOOS, so when act_get_remote_artifact_path
@@ -16931,6 +16981,8 @@ EOF
                         fi
                         fallback_ok=true
                     else
+                        collection_status=$?
+                        if _act_stop_native_collection "$collection_status"; then return "$collection_status"; fi
                         # Annotate the log with the fallback attempt for
                         # triageability; the primary error still wins the
                         # top-level "SCP error:" line.
@@ -17033,22 +17085,24 @@ EOF
             archive_file_mode=600
             [[ "$archive_file_executable" == "true" ]] && archive_file_mode=700
             archive_file_receipt=""
+            local archive_file_status=0
             if $strict_native_build; then
                 if _act_is_local_host "$host"; then
                     archive_file_receipt=$(_act_collect_stream_exclusive \
                         "$archive_file_local" "$archive_file_mode" \
-                        _act_stream_local_file "$archive_file_remote") || archive_file_receipt=""
+                        _act_stream_local_file "$archive_file_remote") || { archive_file_status=$?; archive_file_receipt=""; }
                 elif _act_is_windows_host "$host"; then
                     archive_file_receipt=$(_act_collect_stream_exclusive \
                         "$archive_file_local" "$archive_file_mode" \
                         _act_stream_remote_windows_file \
-                        "$host" "$archive_file_remote") || archive_file_receipt=""
+                        "$host" "$archive_file_remote") || { archive_file_status=$?; archive_file_receipt=""; }
                 else
                     archive_file_receipt=$(_act_collect_stream_exclusive \
                         "$archive_file_local" "$archive_file_mode" \
                         _act_stream_remote_unix_file \
-                        "$ssh_destination" "$archive_file_remote") || archive_file_receipt=""
+                        "$ssh_destination" "$archive_file_remote") || { archive_file_status=$?; archive_file_receipt=""; }
                 fi
+                if _act_stop_native_collection "$archive_file_status"; then return "$archive_file_status"; fi
                 if [[ -n "$archive_file_receipt" ]] && \
                    { [[ -z "$workspace_binaries" ]] || \
                      workspace_member_receipt=$(_act_workspace_member_receipt \
@@ -17069,6 +17123,8 @@ EOF
                     local_artifact_paths+=("$archive_file_local")
                     [[ -z "$workspace_binaries" ]] || workspace_member_receipts+=("$archive_file_receipt")
                 else
+                    archive_file_status=$?
+                    if _act_stop_native_collection "$archive_file_status"; then return "$archive_file_status"; fi
                     _log_error "Failed to collect workspace archive member $archive_file from $host:$archive_file_remote"
                     download_failed=true
                 fi
@@ -17084,6 +17140,8 @@ EOF
                 local_artifact_paths+=("$archive_file_local")
                 [[ -z "$workspace_binaries" ]] || workspace_member_receipts+=("$archive_file_receipt")
             else
+                archive_file_status=$?
+                if _act_stop_native_collection "$archive_file_status"; then return "$archive_file_status"; fi
                 _log_error "Failed to collect workspace archive member $archive_file from $host:$archive_file_remote"
                 download_failed=true
             fi
@@ -17124,40 +17182,50 @@ EOF
             fi
             additional_local="$artifact_dir/$additional_name"
             additional_receipt=""
+            local additional_status=0
             if $strict_native_build; then
                 if _act_is_local_host "$host"; then
                     additional_receipt=$(_act_collect_stream_exclusive \
                         "$additional_local" "$additional_mode" _act_stream_local_file \
-                        "$additional_remote") || additional_receipt=""
+                        "$additional_remote") || { additional_status=$?; additional_receipt=""; }
                 elif _act_is_windows_host "$host"; then
                     additional_receipt=$(_act_collect_stream_exclusive \
                         "$additional_local" "$additional_mode" _act_stream_remote_windows_file \
-                        "$host" "$additional_remote") || additional_receipt=""
+                        "$host" "$additional_remote") || { additional_status=$?; additional_receipt=""; }
                 else
                     additional_receipt=$(_act_collect_stream_exclusive \
                         "$additional_local" "$additional_mode" _act_stream_remote_unix_file \
-                        "$ssh_destination" "$additional_remote") || additional_receipt=""
+                        "$ssh_destination" "$additional_remote") || { additional_status=$?; additional_receipt=""; }
                 fi
+                if _act_stop_native_collection "$additional_status"; then return "$additional_status"; fi
                 if [[ -z "$additional_receipt" ]]; then
                     _log_error "Failed to collect additional release artifact $additional_name from $host:$additional_remote"
                     download_failed=true
                     continue
                 fi
             else
-                if _act_is_local_host "$host" && \
-                   [[ -f "$additional_remote" && ! -L "$additional_remote" ]] && \
-                   cp "$additional_remote" "$additional_local" && \
-                   chmod "$additional_mode" "$additional_local"; then
-                    :
-                elif ! _act_is_local_host "$host" && \
-                     _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" scp \
-                         -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
-                         -o StrictHostKeyChecking=accept-new \
-                         "${ssh_destination}:${additional_remote}" \
-                         "$additional_local" </dev/null >/dev/null 2>&1 && \
-                     chmod "$additional_mode" "$additional_local"; then
-                    :
+                if _act_is_local_host "$host"; then
+                    if [[ -f "$additional_remote" && ! -L "$additional_remote" ]] && \
+                       cp "$additional_remote" "$additional_local" && \
+                       chmod "$additional_mode" "$additional_local"; then
+                        :
+                    else
+                        additional_status=$?
+                    fi
                 else
+                    if _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" scp \
+                           -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
+                           -o StrictHostKeyChecking=accept-new \
+                           "${ssh_destination}:${additional_remote}" \
+                           "$additional_local" </dev/null >/dev/null 2>&1 && \
+                       chmod "$additional_mode" "$additional_local"; then
+                        :
+                    else
+                        additional_status=$?
+                    fi
+                fi
+                if [[ "$additional_status" -ne 0 ]]; then
+                    if _act_stop_native_collection "$additional_status"; then return "$additional_status"; fi
                     _log_error "Failed to collect additional release artifact $additional_name from $host:$additional_remote"
                     download_failed=true
                     continue
@@ -17316,7 +17384,7 @@ EOF
             # All workspace producers use the same fresh held destination.
             # An archiver failure never becomes a raw-binary fallback, and a
             # zero-exit partial ZIP still has to prove its complete payload.
-            local archive_receipt="" archive_mode=700
+            local archive_receipt="" archive_mode=700 archive_status=0
             [[ "$platform" == windows/* ]] && archive_mode=600
             if _act_is_safe_basename "$archive_name"; then
                 case "$archive_ext" in
@@ -17325,23 +17393,24 @@ EOF
                             archive_receipt=$(_act_collect_stream_exclusive \
                                 "$archive_path" "$archive_mode" \
                                 _act_stream_workspace_zip "$artifact_dir" \
-                                "${archive_files[@]}") || archive_receipt=""
+                                "${archive_files[@]}") || { archive_status=$?; archive_receipt=""; }
                         fi
                         ;;
                     tar.gz)
                         archive_receipt=$(_act_collect_stream_exclusive \
                             "$archive_path" "$archive_mode" \
                             _act_stream_workspace_tar_gz "$artifact_dir" \
-                            "${archive_files[@]}") || archive_receipt=""
+                            "${archive_files[@]}") || { archive_status=$?; archive_receipt=""; }
                         ;;
                     tar.xz)
                         archive_receipt=$(_act_collect_stream_exclusive \
                             "$archive_path" "$archive_mode" \
                             _act_stream_workspace_tar_xz "$artifact_dir" \
-                            "${archive_files[@]}") || archive_receipt=""
+                            "${archive_files[@]}") || { archive_status=$?; archive_receipt=""; }
                         ;;
                 esac
             fi
+            if _act_stop_native_collection "$archive_status"; then return "$archive_status"; fi
             if [[ -n "$archive_receipt" ]] && \
                ! _act_validate_release_archive_metadata "$archive_path" "$archive_ext"; then
                 _log_error "Workspace archive metadata is not normalized for publication: $platform"
@@ -20233,6 +20302,16 @@ act_orchestrate_build() {
                         # not an operator interruption. Keep the first cause
                         # while cancelling and draining all remaining peers.
                         _act_fail_coordinator "Could not retain completed target outcome for ${worker_targets[$reap_index]}"
+                    else
+                        local completed_exit completed_target="${worker_targets[$reap_index]}"
+                        completed_exit=$(jq -r '.exit_code // 0' \
+                            <<< "${final_results[$completed_target]}") || completed_exit="$worker_status"
+                        # The admitted receipt is authoritative: a completed
+                        # success survives later cleanup death, but a cancelled
+                        # backend must stop queued targets and drain its peers.
+                        if _act_artifact_transfer_interrupted "$completed_exit"; then
+                            _act_cancel_parallel_workers
+                        fi
                     fi
                     return 0
                 fi
@@ -20769,12 +20848,12 @@ act_orchestrate_build() {
     if ! _act_repo_config_matches "$tool_name" "$repo_config_sha256"; then
         coordinator_error="Repository configuration changed during build execution; restore the saved recipe or start a fresh run"
     fi
-    if $strict_release_contract && \
+    if $strict_release_contract && ! $interrupted && \
        ! _act_validate_contract_source_identity \
             "$version" "$git_sha" "$git_ref" "$tool_name"; then
         source_validation_failed=true
     fi
-    if $strict_release_contract && ! $source_validation_failed && \
+    if $strict_release_contract && ! $interrupted && ! $source_validation_failed && \
        ! _act_verify_strict_source_roots \
             "$tool_name" "$git_sha" "$source_roots_json"; then
         source_validation_failed=true
@@ -22329,6 +22408,6 @@ export -f _act_strict_go_workfile_json _act_strict_go_build_env _act_validate_st
 export -f _act_validate_strict_go_source_flags _act_validate_strict_go_command_sources
 export -f act_run_native_build act_orchestrate_build act_generate_manifest
 export -f _act_result_artifact_receipts _act_target_result_available
-export -f _act_backend_result_json
+export -f _act_backend_result_json _act_artifact_transfer_interrupted
 export -f _act_build_orchestration_target _act_run_target_worker
 export -f act_sync_sources

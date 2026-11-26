@@ -1961,6 +1961,15 @@ compilation finishes. A failed transfer cannot admit partial bytes; successful
 compiler execution evidence remains separate from the collection failure.
 Private partial files and their existing identities are retained for diagnosis.
 
+A signal interruption during collection stops filename retries, remaining
+executable transfers, archive members, companion downloads and archive creation.
+The failed target retains the original interruption status and advertises no
+completed artifact family. The coordinator stops queued targets and drains active
+peers after retaining that interrupted target's result; an explicit resume can
+retry unfinished targets. A completed successful target receipt remains valid if
+its worker later terminates during cleanup. SSH failures and supervised transfer
+deadlines retain their existing error handling.
+
 The ordinary tar fallback supervises the entire source-transfer pipeline under
 the same deadline: Git file selection, archive creation and the SSH receiver.
 A stalled local producer cannot keep a build waiting after the receiver has

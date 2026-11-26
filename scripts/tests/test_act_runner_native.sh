@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_act_runner_native.sh - Unit tests for act_runner.sh native build SSH logic
 #
-# Usage: ./test_act_runner_native.sh [--cargo-profiles-only | --go-outputs-only | --go-command-context-only | --go-paths-only | --go-chdir-only | --typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --large-inventory-only | --workspace-archives-only | --failure-evidence-only | --env-precedence-only | --archive-delivery-only | --zig-dispatch-only | --glibc-routing-only | --windows-launcher-transfer-only | --artifact-transfer-only]
+# Usage: ./test_act_runner_native.sh [--cargo-profiles-only | --go-outputs-only | --go-command-context-only | --go-paths-only | --go-chdir-only | --typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --large-inventory-only | --workspace-archives-only | --failure-evidence-only | --env-precedence-only | --archive-delivery-only | --zig-dispatch-only | --glibc-routing-only | --windows-launcher-transfer-only | --artifact-transfer-only | --artifact-cancellation-only]
 #
 # Tests native build SSH command construction with mocks.
 # Covers: command construction, path handling, env vars, SCP, error handling.
@@ -543,7 +543,7 @@ test_native_artifact_transfer_deadline() {
     for dependency in bash python3 jq yq git gzip iconv base64 ps; do
         command -v "$dependency" >/dev/null || { printf 'Missing test dependency: %s\n' "$dependency" >&2; return 3; }
     done
-    python3 -I - "$PROJECT_ROOT" <<'PY'
+    python3 -I - "$PROJECT_ROOT" "${1:-deadline}" <<'PY'
 import hashlib
 import json
 import os
@@ -560,6 +560,7 @@ root = Path(sys.argv[1])
 module = Path(os.environ.get('DSR_TEST_ACT_RUNNER', str(root / 'src/act_runner.sh'))).resolve()
 work = Path(tempfile.mkdtemp(prefix='dsr-native-artifact-transfer-'))
 print('Retained native artifact transfer evidence: ' + str(work), flush=True)
+cancellation_only = sys.argv[2] == 'cancellation'
 checks = failures = 0
 
 
@@ -596,7 +597,7 @@ def alive(pid):
 bin_dir = work / 'bin'
 bin_dir.mkdir()
 transport = r'''#!/usr/bin/env python3
-import base64, hashlib, json, os, re, shlex, subprocess, sys, time
+import base64, hashlib, json, os, re, shlex, signal, subprocess, sys, time
 from pathlib import Path
 case = Path(os.environ['DSR_COLLECTION_CASE'])
 kind = Path(sys.argv[0]).name
@@ -632,7 +633,7 @@ if not payload_path.is_file():
 else:
     payload = payload_path.read_bytes()
     record.update(bytes=len(payload), sha256=hashlib.sha256(payload).hexdigest())
-    data = payload[:97] if mode in ('fail', 'stall') else payload
+    data = payload[:97] if mode in ('fail', 'stall') or mode.startswith('signal:') else payload
     if kind == 'scp':
         Path(destination).write_bytes(data)
     else:
@@ -656,6 +657,15 @@ with (case / 'transfers.jsonl').open('a') as stream:
 print('controlled transfer diagnostic: ' + name, file=sys.stderr, flush=True)
 if mode == 'stall' and not record.get('missing'):
     time.sleep(30)
+if mode.startswith('signal:') and not record.get('missing'):
+    import resource
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    number = int(mode.split(':', 1)[1])
+    signal.signal(number, signal.SIG_DFL)
+    os.kill(os.getpid(), number)
+    raise SystemExit(94)
+if mode.startswith('exit:') and not record.get('missing'):
+    raise SystemExit(int(mode.split(':', 1)[1]))
 raise SystemExit(23 if mode == 'fail' or record.get('missing') else 0)
 '''
 for name in ('ssh', 'scp'):
@@ -722,7 +732,8 @@ inputs = work / 'inputs'
 inputs.mkdir()
 payload = bytes(range(256)) * 64
 (inputs / 'payload.bin').write_bytes(payload)
-header = b'MZ' + b'\0' * 58 + b'\x40\0\0\0PE\0\0\x64\x86' + b'\0' * 18 + b'\x0b\x02' + b'\0' * 6
+# A PE executable must carry IMAGE_FILE_EXECUTABLE_IMAGE in its COFF flags.
+header = b'MZ' + b'\0' * 58 + b'\x40\0\0\0PE\0\0\x64\x86' + b'\0' * 16 + b'\x02\0\x0b\x02' + b'\0' * 6
 (inputs / 'collect.exe').write_bytes(header + payload)
 (inputs / 'NOTICE').write_bytes(b'retained archive member\n' * 10)
 (inputs / 'metadata.json').write_text(json.dumps({'source': sha, 'value': 'retained companion'}))
@@ -734,7 +745,8 @@ environment = dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ['PATH
     ACT_LOGS_DIR=str(work / 'logs'), RCH_REQUIRE_REMOTE='0', NO_COLOR='1')
 
 
-def invoke(label, operation, mode='success', fault='payload.bin', family=False, destination=None):
+def invoke(label, operation, mode='success', fault='payload.bin', family=False, destination=None,
+           siblings=False):
     case = work / label
     case.mkdir()
     recipe = {'tool_name': 'collect', 'language': 'bun', 'repo': 'owner/collect',
@@ -742,7 +754,8 @@ def invoke(label, operation, mode='success', fault='payload.bin', family=False, 
         'build_cmd': 'bun build --compile ./main.ts --outfile collect.exe',
         'host_paths': {'fixture': 'C:/fixture/source'}, 'targets': ['windows/amd64']}
     if family:
-        recipe.update(workspace_binaries=['collect'], archive_format='zip',
+        recipe.update(workspace_binaries=['collect', 'collect-worker', 'collect-last'] if siblings else ['collect'],
+            archive_format='zip',
             workspace_archive_files={'windows/amd64': [{'name': 'NOTICE', 'executable': False}]},
             workspace_additional_artifacts={'windows/amd64': [{'name': 'metadata.json', 'format': 'json'}]})
     (config / 'repos.d/collect.yaml').write_text(json.dumps(recipe))
@@ -803,6 +816,109 @@ def stalled(label, operation, fault, family=False):
               if (case / 'build-events').exists() else False)
     return result
 
+
+if cancellation_only:
+    held = {}
+
+    def cancelled(label, operation, number, fault='payload.bin', family=False,
+                  names=None, siblings=False):
+        prior_paths = {str(path) for path in (work / 'artifacts').rglob('*') if path.is_file()}
+        case, target, status, outer, _, records, live, receipt = invoke(
+            label, operation, 'signal:' + str(number), fault, family, siblings=siblings)
+        faults = [row for row in records if row['name'] == fault and not row.get('missing')]
+        check(label + ': actual producer signal survives the collector and caller',
+              status == 128 + number and not outer and len(faults) == 1 and not live)
+        check(label + ': cancellation stops all later transfers and preserves stdin',
+              [row['name'] for row in records] == (names or [fault]) and
+              all(row['stdin_bytes'] == 0 for row in records))
+        if operation in ('unix', 'windows'):
+            check(label + ': partial stream has no admitted receipt',
+                  not receipt and target.is_file() and target.read_bytes() == payload[:97])
+        else:
+            observed = receipt.get('native_execution', {})
+            check(label + ': native receipt advertises no complete artifact family',
+                  receipt.get('status') == 'failed' and receipt.get('exit_code') == 128 + number and
+                  receipt.get('stage') == 'artifact_collection' and
+                  receipt.get('artifact_path') == '' and receipt.get('artifact_paths') == [] and
+                  receipt.get('additional_artifacts') == [] and
+                  all(receipt.get(key) is None for key in (
+                      'collected_sha256', 'collected_size_bytes', 'collected_identity')))
+            check(label + ': successful compiler observation remains truthful',
+                  observed.get('command_exit_code') == 0 and observed.get('failure_kind') is None and
+                  observed.get('build_program_dispatched') is True and
+                  (case / 'build-events').is_file() and
+                  (case / 'build-events').read_text().splitlines() == ['completed compiler'])
+            # Observe the fault before any explicit retry. For strict streams,
+            # the collector destination is in the retained private artifact tree.
+            fault_bytes = (inputs / fault).read_bytes()[:97]
+            destinations = [Path(row['destination']) for row in faults
+                            if Path(row['destination']).is_file()]
+            if operation == 'strict':
+                destinations = [path for path in (work / 'artifacts').rglob('*')
+                                if str(path) not in prior_paths and path.is_file() and
+                                path.read_bytes() == fault_bytes]
+            check(label + ': failed transfer bytes remain available for explicit recovery',
+                  bool(destinations) and any(path.read_bytes() == fault_bytes for path in destinations))
+            for path in destinations:
+                held[str(path)] = fingerprint(path)
+
+    # Six distinct real signals exercise the common stream collector without
+    # repeating the expensive native build fixture for every signal.
+    for number in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT,
+                   signal.SIGSEGV, signal.SIGPIPE, signal.SIGTERM):
+        cancelled('stream-signal-' + str(number), 'unix', number)
+
+    # A usable bare-name artifact makes an unintended retry observable.
+    (inputs / 'collect').write_bytes((inputs / 'collect.exe').read_bytes())
+    for operation in ('ordinary', 'strict'):
+        for number in (signal.SIGINT, signal.SIGTERM):
+            cancelled(operation + '-primary-' + str(number), operation, number,
+                      'collect.exe', True)
+
+    (inputs / 'collect.exe').rename(inputs / 'retained-signal-collect.exe')
+    for operation in ('ordinary', 'strict'):
+        cancelled(operation + '-alias', operation, signal.SIGINT, 'collect', True,
+                  ['collect.exe', 'collect'])
+    (inputs / 'retained-signal-collect.exe').rename(inputs / 'collect.exe')
+
+    for name in ('collect-worker.exe', 'collect-last.exe'):
+        (inputs / name).write_bytes((inputs / 'collect.exe').read_bytes())
+    for operation in ('ordinary', 'strict'):
+        cancelled(operation + '-later-binary', operation, signal.SIGTERM,
+                  'collect-worker.exe', True, ['collect.exe', 'collect-worker.exe'], True)
+        cancelled(operation + '-archive-member', operation, signal.SIGINT,
+                  'NOTICE', True, ['collect.exe', 'NOTICE'])
+        cancelled(operation + '-companion', operation, signal.SIGTERM,
+                  'metadata.json', True, ['collect.exe', 'NOTICE', 'metadata.json'])
+
+    for code in (23, 124, 125, 137, 255):
+        case, target, status, outer, _, records, live, receipt = invoke(
+            'ordinary-status-' + str(code), 'unix', 'exit:' + str(code))
+        check('ordinary status ' + str(code) + ': existing collection error policy is unchanged',
+              status == 7 and not outer and not live and not receipt and len(records) == 1)
+
+    for operation in ('ordinary', 'strict'):
+        case, _, status, outer, _, records, live, receipt = invoke(
+            operation + '-healthy-family', operation, family=True)
+        archive = Path(receipt.get('artifact_path') or '/nonexistent-dsr-transfer-fixture')
+        check(operation + ': explicit healthy retry collects the complete family',
+              status == 0 and not outer and not live and receipt.get('status') == 'success' and
+              archive.is_file() and [row['name'] for row in records] ==
+              ['collect.exe', 'NOTICE', 'metadata.json'])
+        exact_archive = False
+        if archive.is_file():
+            with zipfile.ZipFile(archive) as bundle:
+                exact_archive = sorted(bundle.namelist()) == ['NOTICE', 'collect.exe'] and all(
+                    bundle.read(name) == (inputs / name).read_bytes() for name in bundle.namelist())
+        companions = receipt.get('additional_artifacts', [])
+        check(operation + ': successful archive and companion preserve exact producer bytes',
+              exact_archive and len(companions) == 1 and
+              companions[0].get('sha256') ==
+              hashlib.sha256((inputs / 'metadata.json').read_bytes()).hexdigest())
+    check('explicit retries preserve prior failed-transfer bytes and inode identities',
+          len(held) >= 8 and all(fingerprint(path) == identity for path, identity in held.items()))
+    print(f'Native artifact cancellation: {checks-failures} passed, {failures} failed', flush=True)
+    sys.exit(1 if failures else 0)
 
 unix_failure = stalled('strict-unix-stall', 'unix', 'payload.bin')
 stalled('strict-windows-stall', 'windows', 'payload.bin')
@@ -865,8 +981,12 @@ sys.exit(1 if failures else 0)
 PY
 }
 
-if [[ "${1:-}" == --artifact-transfer-only ]]; then
-    test_native_artifact_transfer_deadline
+if [[ "${1:-}" == --artifact-transfer-only || "${1:-}" == --artifact-cancellation-only ]]; then
+    if [[ "$1" == --artifact-cancellation-only ]]; then
+        test_native_artifact_transfer_deadline cancellation
+    else
+        test_native_artifact_transfer_deadline
+    fi
     exit $?
 fi
 

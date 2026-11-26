@@ -6,6 +6,8 @@
 # compiler, Docker, SSH, or host-health fixtures. --output-queue-only exercises
 # deferred shared outputs, independent hosts, cancellation and exact-run resume.
 # --host-capacity-only covers the same queue with real one-slot host leases.
+# --coordinator-cancellation-only stops queued targets after a cancelled backend,
+# drains active peers and preserves successful receipts despite late cleanup death.
 # --go-output-ownership-only verifies that command-selected absolute Go outputs
 # remain serialized while independent hosts run and completed work is reused.
 # --artifact-inventory-only exercises large completion receipts and reuse
@@ -2586,6 +2588,17 @@ if mode == 'readiness':
     # The actual native runner converts this health refusal into its own
     # structured result. No compiler or successful artifact is simulated.
     raise SystemExit(1)
+if mode.startswith('backend-cancel-'):
+    if target == 'linux/amd64':
+        while not (case / 'cancel-ready').is_file():
+            time.sleep(0.02)
+        code = int(mode.rsplit('-', 1)[1])
+        print(json.dumps(dict(platform=target, method='native', host=host, status='failed',
+              exit_code=code, stage='artifact_collection', artifact_path='', artifact_paths=[],
+              error='controlled artifact producer interruption')), flush=True)
+        raise SystemExit(code)
+    while True:
+        time.sleep(0.05)
 if mode in ('cancel', 'custody-cancel') or (mode == 'timeout' and target == 'linux/amd64'):
     while True:
         time.sleep(0.05)
@@ -2649,6 +2662,15 @@ selector_acquire_slot() {
 }
 selector_release_slot() {
     printf '%s\n' "$2" >> "$DSR_STDIN_CASE/released-slots"
+    if [[ "$DSR_STDIN_MODE" == child-durable-success-pipe &&
+          "$DSR_STDIN_PHASE" == first && "$2" == *-linux-amd64-attempt-1 ]]; then
+        # The immutable success already exists. A raw 141 would be terminal
+        # without that admitted receipt. Avoid re-entering this fixture's
+        # completed capacity release through the EXIT trap.
+        printf '%s\n' "$BASHPID" > "$DSR_STDIN_CASE/cleanup-signal"
+        trap - EXIT
+        kill -PIPE "$BASHPID"
+    fi
     if [[ "$DSR_STDIN_MODE" == child-durable-success-killed &&
           "$DSR_STDIN_PHASE" == first && "$2" == *-linux-amd64-attempt-1 ]]; then
         # A durable receipt already exists at this boundary. The coordinator
@@ -2690,6 +2712,7 @@ act_run_native_build() {
     [[ "$native_mode" != readiness ]] || native_mode=success
     [[ "$native_mode" != sidecar-failure-recovery ]] || native_mode=failure
     [[ "$DSR_STDIN_MODE" != cancel && "$DSR_STDIN_MODE" != custody-cancel ]] || deadline=60
+    [[ "$native_mode" != backend-cancel-* ]] || deadline=60
     if [[ "$DSR_STDIN_MODE" == timeout && "$2" == linux/amd64 ]]; then deadline=1; fi
     _act_run_with_timeout "$deadline" python3 "$DSR_STDIN_WORKER" \
         "$DSR_STDIN_CASE" "$2" "$attempt" "$native_mode" "$8"
@@ -2826,6 +2849,10 @@ def invoke(case, identity, jobs, mode, phase, retry_max=3, expected_code=None):
                 wait_for(process, lambda: len(events(case)) == jobs,
                          str(case) + ': cancellable descendants did not start')
                 process.send_signal(signal.SIGTERM)
+            if mode.startswith('backend-cancel-'):
+                wait_for(process, lambda: len(events(case)) == jobs,
+                         str(case) + ': initial native descendants did not start')
+                (case / 'cancel-ready').write_text('all initial backends are running\n')
         code = process.wait(timeout=45)
     except BaseException:
         if process.poll() is None:
@@ -2851,7 +2878,8 @@ def invoke(case, identity, jobs, mode, phase, retry_max=3, expected_code=None):
     state = read(state_path)
     (case / (phase + '.state.json')).write_text(json.dumps(state) + '\n')
     if expected_code is None:
-        expected_code = (0 if mode in ('child-success', 'child-durable-success-killed') else 1) \
+        expected_code = (0 if mode in ('child-success', 'child-durable-success-killed',
+                                        'child-durable-success-pipe') else 1) \
             if mode.startswith('child-') else {
             'success': 0, 'failure': 1, 'timeout': 1, 'readiness': 1, 'cancel': 130,
             'missing-receipt': 6, 'killed-worker': 6,
@@ -2921,6 +2949,57 @@ def verify_attempts(case, value, state, expected_counts, expected_codes, label, 
     check(label + ': target completion does not claim finalized publication',
           (state['status'] == 'targets-complete') == completed and
           state['status'] != 'completed' and not (case / 'output/.dsr-build-purpose.json').exists())
+
+
+if sys.argv[3] == '--coordinator-cancellation-only':
+    for jobs, code in ((1, 130), (3, 143)):
+        mode = 'backend-cancel-' + str(code)
+        case, identity = fixture(jobs, mode)
+        first, state = invoke(case, identity, jobs, mode, 'first', expected_code=130)
+        counts = {target: 1 for target in targets[:jobs]}
+        codes = {target: code if index == 0 else 130
+                 for index, target in enumerate(targets[:jobs])}
+        verify_attempts(case, first, state, counts, codes, case.name + '/cancel')
+        check(case.name + ': admitted backend cancellation stops the undispatched queue',
+              len(events(case)) == jobs and first['targets'][0]['exit_code'] == code and
+              first['targets'][0]['stage'] == 'artifact_collection' and
+              all(row['status'] == 'skipped' and row['attempt'] == 0
+                  for row in first['targets'][jobs:]) and state['status'] == 'failed')
+        for event in events(case):
+            probe = subprocess.run(['ps', '-p', str(event['pid']), '-o', 'stat='],
+                                   capture_output=True, timeout=2)
+            check(case.name + ': active native peer has stopped before return',
+                  probe.returncode != 0 or probe.stdout.strip().startswith(b'Z'))
+        workspace = case / 'state/builds/stdinfixture/1.0.0' / identity
+        immutable = {path: path.read_bytes() for directory in ('output', 'logs', 'results')
+                     for path in ((case / directory) if directory == 'output' else
+                                  workspace / directory).rglob('*') if path.is_file()}
+        resumed, resumed_state = invoke(case, identity, jobs, 'success', 'resume')
+        expected_counts = {target: counts.get(target, 0) + 1 for target in targets}
+        verify_attempts(case, resumed, resumed_state, expected_counts, {}, case.name + '/resume')
+        check(case.name + ': explicit retry completes every unfinished target without rewriting evidence',
+              all(not row.get('resume_reused') for row in resumed['targets']) and
+              all(path.read_bytes() == data for path, data in immutable.items()))
+
+    for mode, code in (('failure', 9), ('timeout', 124)):
+        case, identity = fixture(3, mode)
+        first, state = invoke(case, identity, 3, mode, 'first')
+        verify_attempts(case, first, state, {target: 1 for target in targets},
+                        {'linux/amd64': code}, case.name + '/ordinary')
+        check(case.name + ': ordinary failure and deadline still allow independent targets',
+              len(events(case)) == 6 and first['summary']['success'] == 5)
+
+    case, identity = fixture(3, 'child-durable-success-pipe')
+    first, state = invoke(case, identity, 3, 'child-durable-success-pipe', 'first')
+    verify_attempts(case, first, state, {target: 1 for target in targets}, {}, case.name + '/first')
+    check(case.name + ': durable success survives SIGPIPE during outer worker cleanup',
+          (case / 'cleanup-signal').is_file() and first['targets'][0]['exit_code'] == 0 and
+          first['summary']['success'] == 6)
+    resumed, state = invoke(case, identity, 3, 'success', 'resume')
+    check(case.name + ': terminal successes are reused without another backend',
+          len(events(case)) == 6 and all(row.get('resume_reused') for row in resumed['targets']))
+    print('Coordinator cancellation: %d checks passed' % checks, flush=True)
+    raise SystemExit(0)
 
 
 def invocation_identity_cases():
@@ -6716,7 +6795,8 @@ if [[ "${1:-}" == --worker-lifecycle-only ]]; then
     exit $?
 fi
 
-if [[ "${1:-}" == --stdin-isolation-only || "${1:-}" == --coordinator-receipt-only ||
+if [[ "${1:-}" == --coordinator-cancellation-only ||
+      "${1:-}" == --stdin-isolation-only || "${1:-}" == --coordinator-receipt-only ||
       "${1:-}" == --sidecar-recovery-only || "${1:-}" == --worker-completion-only ||
       "${1:-}" == --host-readiness-only || "${1:-}" == --host-readiness-cli-only ||
       "${1:-}" == --coordinator-custody-only || "${1:-}" == --invocation-identity-only ]]; then
