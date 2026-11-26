@@ -236,6 +236,8 @@ jobs:
           go version
           timeout 120 bash scripts/tests/test_act_runner_native.sh --go-paths-only \
             2>&1 | tee "$RUNNER_TEMP/collector-evidence/go-native-paths.log"
+          timeout 120 bash scripts/tests/test_act_runner_native.sh --go-chdir-only \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/go-native-chdir.log"
           test -z "$(git status --porcelain)"
       - name: Preserve complete large native artifact inventories
         if: runner.os == 'Linux'

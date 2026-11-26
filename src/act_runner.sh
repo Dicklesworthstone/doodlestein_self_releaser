@@ -12266,13 +12266,21 @@ try:
             continue
         saw_go = True
         argv = [literal(arg, effective, inline_names) for arg in raw[position:]]
-        if argv and (argv[0] == '-C' or argv[0].startswith('-C=')):
-            if argv[0] == '-C':
-                if len(argv) < 2:
-                    fail('missing go -C directory')
-                selected_cwd = directory(argv[1], selected_cwd, selected_directories); argv = argv[2:]
-            else:
-                selected_cwd = directory(argv[0][3:], selected_cwd, selected_directories); argv = argv[1:]
+        # Go consumes one -C/--C before dispatch. It can be the first global
+        # argument or the first flag after build/install. In both positions,
+        # output paths and package metadata are relative to the new directory.
+        chdir_index = 1 if argv and argv[0] in ('build', 'install') else 0
+        if chdir_index < len(argv):
+            flag, equals, operand = argv[chdir_index].partition('=')
+            if flag in ('-C', '--C'):
+                end = chdir_index + 1
+                if not equals:
+                    if end == len(argv):
+                        fail('missing go -C directory')
+                    operand = argv[end]
+                    end += 1
+                selected_cwd = directory(operand, selected_cwd, selected_directories)
+                del argv[chdir_index:end]
         if argv and argv[0] == 'env' and any(arg in ('-w', '-u') for arg in argv[1:]):
             fail('persistent go env mutation inside a build recipe')
         if not argv or argv[0] not in ('build', 'install'):

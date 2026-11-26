@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_act_runner_native.sh - Unit tests for act_runner.sh native build SSH logic
 #
-# Usage: ./test_act_runner_native.sh [--cargo-profiles-only | --go-outputs-only | --go-command-context-only | --go-paths-only | --typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --large-inventory-only | --workspace-archives-only | --failure-evidence-only | --env-precedence-only | --archive-delivery-only | --zig-dispatch-only | --glibc-routing-only | --windows-launcher-transfer-only | --artifact-transfer-only]
+# Usage: ./test_act_runner_native.sh [--cargo-profiles-only | --go-outputs-only | --go-command-context-only | --go-paths-only | --go-chdir-only | --typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only | --large-inventory-only | --workspace-archives-only | --failure-evidence-only | --env-precedence-only | --archive-delivery-only | --zig-dispatch-only | --glibc-routing-only | --windows-launcher-transfer-only | --artifact-transfer-only]
 #
 # Tests native build SSH command construction with mocks.
 # Covers: command construction, path handling, env vars, SCP, error handling.
@@ -328,7 +328,42 @@ def run_case(name, command, *, expected=True, platform=host_platform, overrides=
     check(name + ' preserves source controls', before == (source / 'go.mod').read_bytes())
     return case, receipt
 
-if sys.argv[2] == 'paths':
+if sys.argv[2] == 'chdir':
+    def nested(case):
+        write(case / 'source/nested/main.go', 'package main\nfunc main() { println("fresh-73") }\n')
+
+    for name, command in [
+        ('global-long-chdir', 'go --C=nested build -p=1 -buildvcs=false -o tool .'),
+        ('build-inline-chdir', 'go build -C=nested -p=1 -buildvcs=false -o tool .'),
+        ('build-split-chdir', 'go build --C nested -p=1 -buildvcs=false -o tool .'),
+    ]:
+        case, _ = run_case(name, command, preparation=nested)
+        compiled = case / 'source/nested/tool'
+        fresh = subprocess.run([str(compiled)], capture_output=True, text=True, timeout=5) if compiled.is_file() else None
+        check(name + ' compiles fresh nested output and preserves both stale alternatives',
+              fresh is not None and fresh.returncode == 0 and fresh.stderr.strip() == 'fresh-73' and
+              all(hashlib.sha256((case / directory / 'tool').read_bytes()).hexdigest() == stale_hash
+                  for directory in ('source', 'installed')))
+
+    run_case('install-selected-directory', 'go install -C nested -p=1 -buildvcs=false .', preparation=nested)
+
+    def family_decoys(case):
+        for name in ('alpha', 'beta'):
+            shutil.copy2(stale, case / 'source' / name)
+
+    run_case('chdir-family', 'go build --C=cmd/alpha -o alpha . && go build -C=cmd/beta -o beta .',
+             family=['alpha', 'beta'], preparation=family_decoys)
+    ownership_driver = 'source "${DSR_TEST_ACT_RUNNER:-$1/src/act_runner.sh}"; _act_go_output_paths "$2" "" "$3" "$4"'
+    for name, root_path, command, shell, expected in [
+        ('subcommand relative output', '/source', 'go build -C nested -o out .', 'unix', 'in-tree\t/source/nested/out'),
+        ('global absolute cwd', '/source', 'go --C /shared build -o out .', 'unix', 'external\t/shared/out'),
+        ('subcommand physical parent', '/source', 'go build --C=link/.. -o out .', 'unix', 'external\t*'),
+        ('Windows drive selection', 'C:/source', 'go.exe build --C=D:/other -o tool.exe .', 'windows', 'external\td:/other/tool.exe'),
+    ]:
+        result = subprocess.run(['bash', '-c', ownership_driver, 'chdir-ownership', str(root), root_path, command, shell],
+                                env=environment, capture_output=True, text=True, timeout=10)
+        check(name + ' reserves the worker output namespace', result.returncode == 0 and result.stdout.strip() == expected)
+elif sys.argv[2] == 'paths':
     def linked_source(case):
         physical = case / 'source/physical'
         write(physical / 'go.mod', 'module fixture.invalid/physical\n\ngo 1.21\n')
@@ -493,6 +528,10 @@ if [[ "${1:-}" == --go-command-context-only ]]; then
 fi
 if [[ "${1:-}" == --go-paths-only ]]; then
     test_go_native_output_selection paths
+    exit $?
+fi
+if [[ "${1:-}" == --go-chdir-only ]]; then
+    test_go_native_output_selection chdir
     exit $?
 fi
 
