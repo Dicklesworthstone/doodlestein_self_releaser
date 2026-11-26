@@ -703,9 +703,26 @@ _upgrade_build_tool() (
     [[ -d "$tree" ]] || return 4
     [[ -z "$entry" ]] || _isb_relative_path "$entry" || return 4
     [[ -z "$package" ]] || _isb_name "$package" || return 4
+    # Go searches parents for a workspace even when the current directory
+    # has its own module. Limit both searches to this configured local_path.
+    local cursor="$tree" go_work="" go_mod=""
+    if [[ -z "$language" || "$language" == go ]]; then
+        while :; do
+            if [[ -z "$go_work" && ( -e "$cursor/go.work" || -L "$cursor/go.work" ) ]]; then
+                go_work="$cursor/go.work"
+            fi
+            if [[ -z "$go_mod" && ( -e "$cursor/go.mod" || -L "$cursor/go.mod" ) ]]; then
+                go_mod="$cursor/go.mod"
+            fi
+            [[ "$cursor" != "$root" && "$cursor" != / ]] || break
+            cursor="${cursor%/*}"
+            [[ -n "$cursor" ]] || cursor=/
+        done
+    fi
     if [[ -z "$language" ]]; then
         if [[ -f "$tree/go.mod" ]]; then language=go
         elif [[ -f "$tree/Cargo.toml" ]]; then language=rust
+        elif [[ -n "$go_work" || -n "$go_mod" ]]; then language=go
         fi
     fi
     case "$language" in go|rust|bun|typescript) ;; *) return 4 ;; esac
@@ -731,6 +748,22 @@ _upgrade_build_tool() (
         _upgrade_build_bun_tool "$tool_name" "$repo_dir" "$binary_name" "$tmpdir" || return $?
     elif [[ "$language" == go ]]; then
         command -v go >/dev/null || return 3
+        if [[ -z "$go_work" && -z "$go_mod" ]]; then
+            log_error "No Go workspace or module within the configured checkout: $tree"
+            return 4
+        fi
+        local metadata
+        for metadata in "$go_work" "$go_mod"; do
+            [[ -z "$metadata" || ( -f "$metadata" && ! -L "$metadata" ) ]] || {
+                log_error "Go source metadata must be a regular file: $metadata"
+                return 4
+            }
+        done
+        # Run the local updater for this host. Caller build flags (including
+        # -overlay and -modfile), cross targets and external workfiles can
+        # otherwise change the program being verified.
+        export GOENV=off GOWORK="${go_work:-off}" GOFLAGS='' GO111MODULE=on
+        export GOTOOLCHAIN=local GOOS='' GOARCH=''
         selected=$(_isb_source_entries go "$tree" "$binary_name" "$entry" "$binary_name") || return $?
         mkdir "$tmpdir/.build" || return 1
         log_debug "Building Go project..."

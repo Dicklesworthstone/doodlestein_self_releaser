@@ -1378,7 +1378,7 @@ test_source_recipe_layouts() {
             return 0
         fi
     done
-    python3 - "$PROJECT_ROOT" <<'PY' || status=$?
+    python3 - "$PROJECT_ROOT" "${1:-layouts}" <<'PY' || status=$?
 import json
 import os
 from pathlib import Path
@@ -1476,6 +1476,83 @@ rust_source = r'''fn main() {
 }
 '''
 real_cases = 0
+if sys.argv[2] == 'go-workspaces':
+    if not go:
+        print('Genuine Go compiler unavailable', flush=True)
+        sys.exit(77)
+    # The updater reports the version compiled from its sibling module. A
+    # second workfile can select the same main package with different bytes.
+    cases = ('moduleless-root', 'inferred-subdir', 'foreign-workfile', 'parent-workfile',
+             'nested-workfile', 'standalone', 'host-target', 'persisted-goenv',
+             'linked-workfile', 'orphan-package')
+    failures = []
+    for name in cases:
+        case, source, env, config = fixture(name, 'go')
+        project_root = source / 'nested' if name == 'nested-workfile' else source
+        member = project_root / 'app'
+        config.update(source_subdir=str(member.relative_to(source)), source_entry='command')
+        selected_code = go_source.replace('import ("fmt"; "os")', 'import ("fmt"; "os"; "example.invalid/shared")').replace(
+            'fmt.Println("Latest version: 1.2.3\\nUpdate available")',
+            'fmt.Printf("Latest version: %s\\nUpdate available\\n", shared.Version)')
+        write(member / 'go.mod', 'module example.invalid/app\n\ngo 1.19\n')
+        write(member / 'command/main.go', selected_code)
+        def sibling(path, version):
+            write(path / 'go.mod', 'module example.invalid/shared\n\ngo 1.19\n')
+            write(path / 'version.go', 'package shared\nconst Version = "' + version + '"\n')
+        sibling(project_root / 'shared', '1.2.3')
+        sibling(case / 'outside', '9.9.9')
+        def workspace(path, modules):
+            write(path, 'go 1.19\nuse (\n' + ''.join(
+                '  ' + json.dumps('./' + os.path.relpath(p, path.parent)) + '\n' for p in modules) + ')\n')
+        foreign = case / 'go.work'
+        workspace(foreign, [member, case / 'outside'])
+        if name not in ('standalone', 'orphan-package', 'parent-workfile'):
+            workspace(project_root / 'go.work', [member, project_root / 'shared'])
+        if name == 'moduleless-root':
+            config.pop('language')
+            config.update(source_subdir='.', source_entry='app/command')
+        if name == 'inferred-subdir':
+            config.pop('language')
+            config.update(source_subdir='app/command', source_entry='.')
+        if name == 'foreign-workfile':
+            env['GOWORK'] = str(foreign)
+        if name == 'parent-workfile':
+            write(member / 'go.mod', 'module example.invalid/app\n\ngo 1.19\n'
+                  'require example.invalid/shared v0.0.0\nreplace example.invalid/shared => ../shared\n')
+        if name == 'nested-workfile':
+            workspace(source / 'go.work', [member, case / 'outside'])
+        if name in ('standalone', 'orphan-package'):
+            write(member / 'command/main.go', go_source)
+        if name == 'standalone':
+            # An unrelated ancestor workfile would exclude our module.
+            workspace(foreign, [case / 'outside'])
+            config.update(source_subdir='app/command', source_entry='.')
+        if name in ('host-target', 'persisted-goenv'):
+            # Local upgrade checks must execute the freshly compiled program.
+            if name == 'host-target':
+                env.update(GOOS='plan9', GOARCH='386', GOFLAGS='-tags=ambient', GO111MODULE='off')
+            else:
+                write(case / 'user-go-env', 'GOOS=plan9\nGOARCH=386\nGOFLAGS=-tags=ambient\n')
+                env['GOENV'] = str(case / 'user-go-env')
+            write(member / 'command/ambient.go', '//go:build ambient\n\npackage main\nvar _ = ambientBuildMustNotRun\n')
+        if name == 'linked-workfile':
+            (project_root / 'go.work').rename(project_root / 'real.work')
+            (project_root / 'go.work').symlink_to('real.work')
+        if name == 'orphan-package':
+            # A module outside local_path must not supply missing project metadata.
+            (member / 'go.mod').rename(member / 'unselected.mod')
+            write(case / 'go.mod', 'module example.invalid/foreign\n\ngo 1.19\n')
+            foreign.rename(case / 'unselected.work')
+            source.rename(case / 'repo')
+            config['local_path'] = str(case / 'repo')
+        expected = 1 if name in ('linked-workfile', 'orphan-package') else 0
+        try:
+            invoke(case, env, config, expected=expected, ran=expected == 0)
+        except (AssertionError, subprocess.TimeoutExpired) as error:
+            failures.append(name)
+            print('FAIL: Go workspace ' + name + ': ' + str(error), flush=True)
+    print('Go workspace checks: %d passed, %d failed' % (len(cases)-len(failures), len(failures)), flush=True)
+    sys.exit(1 if failures else 0)
 if go:
     for name in ('go-custom-entry', 'go-conventional-entry', 'go-inferred-nested',
                  'go-no-main-filename', 'go-diagnostics', 'go-library', 'go-unsafe-entry', 'go-unsafe-subdir'):
@@ -1684,8 +1761,9 @@ if [[ "${1:-}" == --bun-source-only ]]; then
         "$TESTS_RUN" "$TESTS_PASSED" "$TESTS_SKIPPED" "$TESTS_FAILED"
     [[ "$TESTS_FAILED" -eq 0 ]]; exit $?
 fi
-if [[ "${1:-}" == --source-layouts-only ]]; then
-    test_source_recipe_layouts
+if [[ "${1:-}" == --source-layouts-only || "${1:-}" == --go-workspaces-only ]]; then
+    if [[ "$1" == --go-workspaces-only ]]; then test_source_recipe_layouts go-workspaces
+    else test_source_recipe_layouts; fi
     printf 'Source layout checks: %s; passed: %s; skipped: %s; failed: %s\n' \
         "$TESTS_RUN" "$TESTS_PASSED" "$TESTS_SKIPPED" "$TESTS_FAILED"
     [[ "$TESTS_FAILED" -eq 0 ]]; exit $?
@@ -1733,6 +1811,7 @@ test_module_json_inventory_does_not_build_missing_tools
 test_bun_source_upgrade
 test_rust_source_features
 test_source_recipe_layouts
+test_source_recipe_layouts go-workspaces
 
 echo ""
 echo "Repository Finding Tests:"

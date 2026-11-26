@@ -3925,6 +3925,10 @@ lockfile.
 
 For Go, `source_entry` selects the main package relative to the selected project.
 Otherwise the source installer's conventional primary entry selection applies.
+Go verification uses the closest `go.work` between the project and `local_path`,
+including workspaces with no root `go.mod`. A nested command can use its parent
+module. Without a repository workfile the check uses module mode. The verifier
+builds for the running host and ignores ambient `GOWORK`, `GOENV` and `GOFLAGS`.
 `go list` must identify exactly one main package before compilation. For Rust,
 `source_package` selects a workspace package; absent a package selector, Cargo's
 current-package/default-member rules apply. The build runs from the selected
