@@ -20314,7 +20314,7 @@ EOF
 }
 
 # ============================================================================
-# CANARY SUBCOMMAND - Installer Testing in Docker
+# CANARY SUBCOMMAND - Container and Native Installer Testing
 # ============================================================================
 
 cmd_canary() {
@@ -20336,26 +20336,29 @@ cmd_canary() {
             ;;
         --help|-h|help|"")
             cat << 'EOF'
-dsr canary - Test installers in Docker containers
+dsr canary - Test installers in Docker containers or on a native SSH host
 
 USAGE:
     dsr canary run <tool> [--os <image>] [--mode <vibe|safe>]
+    dsr canary run <tool> --host <ssh-host> [--mode <vibe|safe>]
     dsr canary run --all [--os <image>]
     dsr canary matrix [--tools <list>]
     dsr canary schedule [--cron <expr>] [--unschedule] [--show] [--dry-run]
     dsr canary results
 
 SUBCOMMANDS:
-    run         Run canary test for one or all tools
+    run         Run canary test for one tool or all local installers
     matrix      Run full test matrix (all images/modes)
     schedule    Setup daily canary cron job
     results     Show latest canary results
 
 OPTIONS:
     --os <image>    Docker image to test (default: ubuntu:24.04)
+    --host <host>   Native macOS SSH host for a single tool (no Docker required)
     --mode <mode>   Installation mode: vibe or safe (default: vibe)
     --all           Test all tools with installers
     --tools <list>  Comma-separated list of tools
+    --modes <list>  Matrix modes: vibe,safe (default: both)
     --cron <expr>   Cron schedule: five fields or @daily-style (default: "0 6 * * *")
     --unschedule    Remove the canary crontab entry
     --show          Show the canary crontab entry
@@ -20364,6 +20367,7 @@ OPTIONS:
 EXAMPLES:
     dsr canary run ntm                      Test ntm on ubuntu:24.04
     dsr canary run ntm --os debian:12       Test on specific image
+    dsr canary run ntm --host mmini         Test the native installer over SSH
     dsr canary run --all                    Test all tools
     dsr canary matrix                       Full test matrix
     dsr canary schedule                     Setup daily cron
@@ -20374,6 +20378,8 @@ EXIT CODES:
     1  - Some tests failed
     3  - Docker not available
     4  - Invalid arguments
+    5  - Installer test interrupted or timed out
+    8  - Native SSH connection failed
 EOF
             return 0
             ;;
@@ -20385,9 +20391,23 @@ EOF
     esac
 }
 
+# Keep the public CLI's semantic status while retaining raw child statuses in
+# saved reports. SSH uses 255 for transport failure, not for a process signal.
+_canary_cli_exit_code() {
+    local status="$1" backend="${2:-docker}"
+    case "$status" in
+        0|3|4|5) printf '%s\n' "$status" ;;
+        124) printf '5\n' ;;
+        127) printf '3\n' ;;
+        255) if [[ "$backend" == ssh ]]; then printf '8\n'; else printf '1\n'; fi ;;
+        *) if ((status >= 129 && status <= 192)); then printf '5\n'; else printf '1\n'; fi ;;
+    esac
+}
+
 _canary_run() {
     local tool=""
     local image="ubuntu:24.04"
+    local host="" image_explicit=false
     local mode="vibe"
     local all_tools=false
     local verbose=false
@@ -20395,10 +20415,18 @@ _canary_run() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --os|--image)
+                [[ $# -ge 2 && -n "$2" ]] || { log_error "$1 requires an image"; return 4; }
                 image="$2"
+                image_explicit=true
+                shift 2
+                ;;
+            --host)
+                [[ $# -ge 2 && -n "$2" ]] || { log_error "--host requires an SSH host"; return 4; }
+                host="$2"
                 shift 2
                 ;;
             --mode)
+                [[ $# -ge 2 && -n "$2" ]] || { log_error "--mode requires a mode"; return 4; }
                 mode="$2"
                 shift 2
                 ;;
@@ -20415,14 +20443,30 @@ _canary_run() {
                 return 4
                 ;;
             *)
+                [[ -z "$tool" ]] || { log_error "Select one tool or use --all"; return 4; }
                 tool="$1"
                 shift
                 ;;
         esac
     done
 
-    # Check Docker
-    if ! canary_check_docker; then
+    case "$mode" in vibe|safe) ;; *) log_error "Invalid canary mode: $mode"; return 4 ;; esac
+    if $all_tools; then
+        [[ -z "$tool" ]] || { log_error "Select one tool or use --all"; return 4; }
+    elif [[ ! "$tool" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        log_error "A valid tool name is required (or use --all)"
+        return 4
+    fi
+    if [[ -n "$host" ]]; then
+        if $all_tools || $image_explicit; then
+            log_error "--host selects one native tool and cannot be combined with --all or --os"
+            return 4
+        fi
+        [[ -n "$tool" ]] || { log_error "A tool is required with --host"; return 4; }
+    fi
+
+    # Native installer checks use SSH directly and do not depend on Docker.
+    if [[ -z "$host" ]] && ! canary_check_docker; then
         if $JSON_MODE; then
             json_envelope "canary" "error" 3 '{"error": "Docker not available"}'
         fi
@@ -20436,13 +20480,16 @@ _canary_run() {
         log_info "Running canary tests for all tools on $image ($mode mode)..."
         # stdout is the results object; progress and container output stay
         # on stderr instead of being parsed as part of it.
-        local status=0
-        results=$(canary_run_image "$image" --mode "$mode") || status=$?
+        local status=0 raw_status=0
+        results=$(canary_run_image "$image" --mode "$mode") || raw_status=$?
+        status=$(_canary_cli_exit_code "$raw_status")
         if ! jq -e 'type == "object" and has("results")' <<< "$results" >/dev/null 2>&1; then
             log_error "Canary run produced no results"
             $JSON_MODE && json_envelope "canary" "error" 1 '{"error": "canary run produced no results"}'
             return 1
         fi
+        results=$(jq -c --argjson raw "$raw_status" --argjson code "$status" \
+            '. + {raw_exit_code:$raw, exit_code:$code}' <<< "$results") || return 1
 
         if $JSON_MODE; then
             local duration=$(($(date +%s) - start_time))
@@ -20468,53 +20515,62 @@ _canary_run() {
         return 4
     fi
 
-    log_info "Running canary test for $tool on $image ($mode mode)..."
-
-    if canary_run_test "$tool" "$image" "$mode" "$verbose"; then
-        local duration=$(($(date +%s) - start_time))
-        if $JSON_MODE; then
-            json_envelope "canary" "success" 0 "$(jq -nc \
-                --arg tool "$tool" \
-                --arg image "$image" \
-                --arg mode "$mode" \
-                --argjson duration "$duration" \
-                '{tool: $tool, image: $image, mode: $mode, status: "passed", duration_seconds: $duration}')"
-        else
-            log_ok "Canary test passed for $tool on $image"
-        fi
-        return 0
+    local canary_status=0 exit_code=0 backend=docker location="$image"
+    if [[ -n "$host" ]]; then
+        backend=ssh
+        location="$host"
+        log_info "Running native canary test for $tool on $host ($mode mode)..."
+        canary_run_macos "$tool" "$host" "$mode" "$verbose" || canary_status=$?
     else
-        local duration=$(($(date +%s) - start_time))
-        if $JSON_MODE; then
-            json_envelope "canary" "error" 1 "$(jq -nc \
-                --arg tool "$tool" \
-                --arg image "$image" \
-                --arg mode "$mode" \
-                --argjson duration "$duration" \
-                '{tool: $tool, image: $image, mode: $mode, status: "failed", duration_seconds: $duration}')"
-        else
-            log_error "Canary test failed for $tool on $image"
-        fi
-        return 1
+        log_info "Running canary test for $tool on $image ($mode mode)..."
+        canary_run_test "$tool" "$image" "$mode" "$verbose" || canary_status=$?
     fi
+    exit_code=$(_canary_cli_exit_code "$canary_status" "$backend")
+    local duration=$(($(date +%s) - start_time)) result_status=failed envelope_status=error
+    if ((exit_code == 0)); then result_status=passed; envelope_status=success; fi
+    results=$(jq -nc --arg tool "$tool" --arg image "$image" --arg host "$host" \
+        --arg backend "$backend" --arg mode "$mode" --arg status "$result_status" \
+        --argjson code "$canary_status" --argjson exit_code "$exit_code" --argjson duration "$duration" '
+        {tool:$tool, backend:$backend, host:(if $host == "" then null else $host end),
+         image:(if $host == "" then $image else null end), mode:$mode,
+         status:$status, exit_code:$exit_code, raw_exit_code:$code, duration_seconds:$duration, total:1,
+         passed:(if $status == "passed" then 1 else 0 end),
+         failed:(if $status == "passed" then 0 else 1 end),
+         results:[{tool:$tool,status:$status,duration:$duration,exit_code:$code}]}') || return 1
+    if $JSON_MODE; then
+        json_envelope canary "$envelope_status" "$exit_code" "$results" || return 1
+    elif ((exit_code == 0)); then
+        log_ok "Canary test passed for $tool on $location"
+    else
+        log_error "Canary test failed for $tool on $location (exit $canary_status)"
+    fi
+    canary_save_results "$results" || log_warn "Could not save canary results"
+    return "$exit_code"
 }
 
 _canary_matrix() {
-    local tools_arg=""
-    local modes_arg=""
+    local matrix_args=()
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --tools)
-                tools_arg="--tools $2"
+                [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || {
+                    log_error "--tools requires a nonempty tool list"; return 4;
+                }
+                _canary_select_tools true "$2" >/dev/null || return $?
+                matrix_args+=("--tools" "$2")
                 shift 2
                 ;;
             --modes)
-                modes_arg="--modes $2"
+                [[ $# -ge 2 && "$2" =~ ^(vibe|safe)(,(vibe|safe))*$ ]] || {
+                    log_error "--modes requires a comma-separated list of vibe or safe"; return 4;
+                }
+                matrix_args+=("--modes" "$2")
                 shift 2
                 ;;
             *)
-                shift
+                log_error "Unknown canary matrix option: $1"
+                return 4
                 ;;
         esac
     done
@@ -20529,27 +20585,39 @@ _canary_matrix() {
 
     log_info "Running full canary matrix..."
 
-    local start_time
+    local start_time results status=0 raw_status=0 duration
     start_time=$(date +%s)
 
-    # shellcheck disable=SC2086  # Intentional word splitting
-    if canary_run_matrix $tools_arg $modes_arg; then
-        local duration=$(($(date +%s) - start_time))
+    results=$(canary_run_matrix "${matrix_args[@]}") || raw_status=$?
+    status=$(_canary_cli_exit_code "$raw_status")
+    duration=$(($(date +%s) - start_time))
+    if ! jq -es --argjson code "$raw_status" 'length == 1 and (.[0] |
+        type == "object" and .type == "matrix" and (.results | type) == "array" and
+        .exit_code == $code and
+        (if $code == 0 then .complete == true and .errors == 0 and .failed == 0 and
+            .total > 0 and .total == .expected else true end))' <<< "$results" >/dev/null 2>&1; then
+        [[ $status -ne 0 ]] || status=3
+        log_error "Canary matrix did not produce a valid report"
         if $JSON_MODE; then
-            json_envelope "canary-matrix" "ok" 0 "{\"duration_seconds\": $duration}"
-        else
-            log_ok "Matrix tests completed successfully"
+            json_envelope "canary-matrix" "error" "$status" "$(jq -nc \
+                --argjson duration "$duration" \
+                '{error: "canary matrix did not produce a valid report", duration_seconds: $duration}')"
         fi
-        return 0
-    else
-        local duration=$(($(date +%s) - start_time))
-        if $JSON_MODE; then
-            json_envelope "canary-matrix" "failed" 1 "{\"duration_seconds\": $duration}"
-        else
-            log_error "Some matrix tests failed"
-        fi
-        return 1
+        return "$status"
     fi
+    results=$(jq -c --argjson duration "$duration" --argjson code "$status" --argjson raw "$raw_status" \
+        '. + {duration_seconds: $duration, exit_code:$code, raw_exit_code:$raw}' \
+        <<< "$results") || return 3
+
+    canary_save_results "$results" || log_warn "Could not save canary matrix results"
+    if $JSON_MODE; then
+        json_envelope "canary-matrix" "$([[ $status -eq 0 ]] && echo success || echo error)" "$status" "$results"
+    elif [[ $status -eq 0 ]]; then
+        log_ok "Matrix tests completed successfully"
+    else
+        log_error "Canary matrix failed (exit $status)"
+    fi
+    return "$status"
 }
 
 _canary_schedule() {
@@ -20624,13 +20692,28 @@ _canary_results() {
                 "No canary results found"
             else
                 "Latest canary results (\(.timestamp // "unknown")):",
-                "  Image: \(.image // "unknown")",
-                "  Mode: \(.mode // "unknown")",
+                (if .type == "matrix" then
+                    "  Matrix: \(.images | length) images, \(.modes | length) modes",
+                    "  Status: \(.status)",
+                    "  Complete: \(.complete)",
+                    "  Reported tests: \(.total) / \(.expected)",
+                    "  Execution errors: \(.errors)"
+                 else
+                    (if .backend == "ssh" then "  Host: \(.host)" else "  Image: \(.image // "unknown")" end),
+                    "  Mode: \(.mode // "unknown")"
+                 end),
                 "  Passed: \(.passed // 0)",
                 "  Failed: \(.failed // 0)",
                 "",
                 "Results:",
-                (.results // [] | .[] | "  \(.tool): \(.status)")
+                (if .type == "matrix" then
+                    .results[] |
+                    "  \(.image) (\(.mode)): \(.status)",
+                    (if .error then "    \(.error)" else empty end),
+                    (.results[] | "    \(.tool): \(.status)")
+                 else
+                    (.results // [] | .[] | "  \(.tool): \(.status)")
+                 end)
             end
         '
     fi

@@ -366,36 +366,38 @@ if (set -o pipefail) 2>/dev/null; then
     set -o pipefail
 fi
 
+# Keep terminal statuses visible to the caller so a stopped install cannot be
+# reported as an ordinary failure or followed by another executable probe.
+canary_fail() {
+    failure_status=\$1
+    shift
+    printf '%s\n' "\$*" >&2
+    if [ "\$failure_status" -eq 5 ] || [ "\$failure_status" -eq 124 ] ||
+       { [ "\$failure_status" -ge 129 ] && [ "\$failure_status" -le 192 ]; }; then
+        exit "\$failure_status"
+    fi
+    exit 1
+}
+
 echo "=== Canary test: $tool on $image (mode: $mode) ==="
 
 # Install dependencies
-if ! sh -c "$install_deps"; then
-    echo "Dependency installation failed" >&2
-    exit 1
-fi
+sh -c "$install_deps" || canary_fail \$? "Dependency installation failed"
 
 # Run installer
 echo "Installing $tool..."
 if [ "$installer_source" = /install.sh ]; then
     # Local installer
-    if ! bash /install.sh$installer_args_shell 2>&1; then
-        echo "Installer failed" >&2
-        exit 1
-    fi
+    bash /install.sh$installer_args_shell 2>&1 || canary_fail \$? "Installer failed"
 else
     # Complete acquisition before executing any installer bytes. This also
     # preserves curl failures when the bootstrap shell has no pipefail.
-    installer_download=\$(mktemp) || exit 1
+    installer_download=\$(mktemp) || canary_fail \$? "Could not prepare installer download"
     trap 'rm -f "\$installer_download"' EXIT
-    if ! curl -A "dsr-canary (+https://github.com/Dicklesworthstone/doodlestein_self_releaser)" \\
-        -fsSL --connect-timeout 15 -o "\$installer_download" $(_canary_shell_escape "$installer_source"); then
-        echo "Installer download failed" >&2
-        exit 1
-    fi
-    if ! bash "\$installer_download"$installer_args_shell 2>&1; then
-        echo "Installer failed" >&2
-        exit 1
-    fi
+    curl -A "dsr-canary (+https://github.com/Dicklesworthstone/doodlestein_self_releaser)" \\
+        -fsSL --connect-timeout 15 -o "\$installer_download" $(_canary_shell_escape "$installer_source") ||
+        canary_fail \$? "Installer download failed"
+    bash "\$installer_download"$installer_args_shell 2>&1 || canary_fail \$? "Installer failed"
 fi
 
 export PATH="\$HOME/.local/bin:/usr/local/bin:/usr/bin:\$PATH"
@@ -414,8 +416,7 @@ if command -v "\$binary_name" >/dev/null 2>&1; then
         echo "✓ \$binary_name --version works"
     else
         status=\$?
-        echo "✗ \$binary_name --version failed (exit: \$status)" >&2
-        exit 1
+        canary_fail "\$status" "✗ \$binary_name --version failed (exit: \$status)"
     fi
 
     # Try --help
@@ -425,8 +426,7 @@ if command -v "\$binary_name" >/dev/null 2>&1; then
     else
         status=\$?
         head -5 /tmp/dsr-canary-help.txt
-        echo "✗ \$binary_name --help failed (exit: \$status)" >&2
-        exit 1
+        canary_fail "\$status" "✗ \$binary_name --help failed (exit: \$status)"
     fi
 else
     echo "✗ \$binary_name NOT found in PATH"
@@ -473,9 +473,11 @@ DOCKERFILE
 
     log_info "Building test image for $tool on $image..."
 
-    if ! docker build -t "$tag" "$tmpdir" &>/dev/null; then
-        log_error "Failed to build Docker image"
-        return 1
+    output=$(_canary_run_with_timeout "$CANARY_TIMEOUT" docker build -t "$tag" "$tmpdir" 2>&1) || status=$?
+    if [[ $status -ne 0 ]]; then
+        log_error "Failed to build Docker image (exit $status)"
+        [[ -z "$output" ]] || printf '%s\n' "$output" >&2
+        return "$status"
     fi
 
     log_info "Running canary test..."
@@ -493,70 +495,143 @@ DOCKERFILE
     return $status
 }
 
+# Resolve the selected tools once so every matrix cell exercises the same set.
+# An empty explicit selection is an error, not a request to test everything.
+_canary_select_tools() {
+    local supplied="${1:-false}" selection="${2:-}"
+    local installer_directory installer tool
+    local tools=()
+    if [[ "$supplied" == true ]]; then
+        if [[ ! "$selection" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*(,[A-Za-z0-9][A-Za-z0-9._-]*)*$ ]]; then
+            log_error "Expected a nonempty comma-separated list of canary tools"
+            return 4
+        fi
+        IFS=',' read -ra tools <<< "$selection"
+    else
+        installer_directory=$(_canary_installer_directory) || return $?
+        for installer in "$installer_directory"/*/install.sh; do
+            [[ -f "$installer" ]] || continue
+            tool="${installer%/install.sh}"
+            tool="${tool##*/}"
+            if [[ ! "$tool" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+                log_error "Invalid canary tool directory: $tool"
+                return 4
+            fi
+            tools+=("$tool")
+        done
+    fi
+    if [[ ${#tools[@]} -eq 0 ]]; then
+        log_error "No canary tools selected; generate installers or pass --tools"
+        return 4
+    fi
+    printf '%s\n' "${tools[@]}" | LC_ALL=C sort -u
+}
+
+# Accept only actual, self-consistent rows for the requested image/mode/tools.
+# A partial result can still preserve useful evidence, but cannot pass a matrix.
+_canary_validate_image_result() {
+    jq -ces --arg image "$1" --arg mode "$2" --argjson tools "$3" --argjson code "${4:-0}" '
+        if length != 1 then error("expected one image result") else .[0] end |
+        select(type == "object" and .image == $image and .mode == $mode and
+            (.results | type) == "array" and
+            all(.results[];
+                (.tool | type) == "string" and
+                (.status == "passed" or .status == "failed") and
+                (.duration | type) == "number" and .duration >= 0 and
+                (.duration | floor) == .duration and
+                (if has("exit_code") then
+                    (.exit_code | type) == "number" and
+                    (.exit_code | floor) == .exit_code and
+                    .exit_code >= 0 and .exit_code <= 255 and
+                    ((.status == "passed" and .exit_code == 0) or
+                     (.status == "failed" and .exit_code != 0))
+                 else true end)) and
+            ([.results[].tool] | unique | length) == (.results | length) and
+            (([.results[].tool] - $tools) | length) == 0 and
+            .passed == ([.results[] | select(.status == "passed")] | length) and
+            .failed == ([.results[] | select(.status == "failed")] | length) and
+            .total == (.results | length) and
+            (if has("exit_code") then .exit_code == $code else true end) and
+            (if has("expected") then .expected == ($tools | length) else true end) and
+            (if has("complete") then (.complete | type) == "boolean" else true end))'
+}
+
 # Run canary tests for all tools on a specific image
 # Usage: canary_run_image <image> [--tools tool1,tool2,...] [--mode vibe|safe]
 canary_run_image() {
-    local image="$1"
+    local image="${1:-}"
+    [[ -n "$image" ]] || { log_error "Canary image is required"; return 4; }
     shift
 
-    local tools=()
+    local tools=() selection="" selection_given=false selected_tools
     local mode="vibe"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --tools)
-                IFS=',' read -ra tools <<< "$2"
+                [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || {
+                    log_error "--tools requires a nonempty tool list"; return 4;
+                }
+                selection="$2"
+                selection_given=true
                 shift 2
                 ;;
             --mode)
+                [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || {
+                    log_error "--mode requires vibe or safe"; return 4;
+                }
                 mode="$2"
                 shift 2
                 ;;
             *)
-                shift
+                log_error "Unknown canary image option: $1"
+                return 4
                 ;;
         esac
     done
+    case "$mode" in vibe|safe) ;; *) log_error "Invalid canary mode: $mode"; return 4 ;; esac
+    selected_tools=$(_canary_select_tools "$selection_given" "$selection") || return $?
+    mapfile -t tools <<< "$selected_tools"
 
-    # Default to all tools with installers
-    if [[ ${#tools[@]} -eq 0 ]]; then
-        local installer_directory
-        installer_directory=$(_canary_installer_directory) || return $?
-        while IFS= read -r -d '' dir; do
-            tools+=("$(basename "$dir")")
-        done < <(find "$installer_directory" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
-    fi
-
-    local passed=0
-    local failed=0
+    local passed=0 failed=0 status=0 complete=true
     local results=()
-
+    local tool start_time tool_status row
     for tool in "${tools[@]}"; do
         log_info "Testing $tool on $image (mode: $mode)..."
-
-        local start_time
         start_time=$(date +%s)
-
-        if canary_run_test "$tool" "$image" "$mode"; then
+        tool_status=0
+        canary_run_test "$tool" "$image" "$mode" || tool_status=$?
+        if [[ $tool_status -eq 0 ]]; then
             log_ok "  $tool: PASSED"
             ((passed++))
-            results+=("$(jq -nc --arg tool "$tool" --argjson duration "$(($(date +%s) - start_time))" '{tool: $tool, status: "passed", duration: $duration}')")
         else
             log_error "  $tool: FAILED"
             ((failed++))
-            results+=("$(jq -nc --arg tool "$tool" --argjson duration "$(($(date +%s) - start_time))" '{tool: $tool, status: "failed", duration: $duration}')")
+            [[ $status -ne 0 && $status -ne 1 ]] || status=$tool_status
+        fi
+        row=$(jq -nc --arg tool "$tool" --argjson code "$tool_status" \
+            --argjson duration "$(($(date +%s) - start_time))" \
+            '{tool: $tool, status: (if $code == 0 then "passed" else "failed" end),
+              duration: $duration, exit_code: $code}') || return 3
+        results+=("$row")
+        if [[ $tool_status -eq 5 || ( $tool_status -ge 129 && $tool_status -le 192 ) ]]; then
+            status=$tool_status
+            complete=false
+            break
         fi
     done
 
-    # Return results as JSON
     local results_json
-    results_json=$(printf '%s\n' "${results[@]}" | jq -sc '.')
+    results_json=$(printf '%s\n' "${results[@]}" | jq -sc '.') || return 3
 
     jq -nc \
         --arg image "$image" \
         --arg mode "$mode" \
         --argjson passed "$passed" \
         --argjson failed "$failed" \
+        --argjson expected "${#tools[@]}" \
+        --argjson complete "$complete" \
+        --argjson code "$status" \
         --argjson results "$results_json" \
         '{
             image: $image,
@@ -564,64 +639,158 @@ canary_run_image() {
             passed: $passed,
             failed: $failed,
             total: ($passed + $failed),
+            expected: $expected,
+            complete: $complete,
+            exit_code: $code,
             results: $results
-        }'
+        }' || return 3
 
-    [[ $failed -eq 0 ]]
+    return "$status"
 }
 
 # Run the full test matrix
 # Usage: canary_run_matrix [--tools tool1,tool2,...] [--modes vibe,safe]
 canary_run_matrix() {
-    local tools_arg=""
+    local selection="" selection_given=false selected_tools tools_csv
+    local tools=()
     local modes=("${CANARY_MODES[@]}")
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --tools)
-                tools_arg="--tools $2"
+                [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || {
+                    log_error "--tools requires a nonempty tool list"; return 4;
+                }
+                selection="$2"
+                selection_given=true
                 shift 2
                 ;;
             --modes)
+                [[ $# -ge 2 && "$2" =~ ^(vibe|safe)(,(vibe|safe))*$ ]] || {
+                    log_error "--modes requires a comma-separated list of vibe or safe"; return 4;
+                }
                 IFS=',' read -ra modes <<< "$2"
                 shift 2
                 ;;
             *)
-                shift
+                log_error "Unknown canary matrix option: $1"
+                return 4
                 ;;
         esac
     done
 
-    local total_passed=0
-    local total_failed=0
-    local image_results=()
+    if [[ ${#CANARY_MATRIX[@]} -eq 0 || ${#modes[@]} -eq 0 ]]; then
+        log_error "Canary matrix requires at least one image and mode"
+        return 4
+    fi
+    local image mode
+    for image in "${CANARY_MATRIX[@]}"; do
+        [[ -n "$image" && "$image" != -* && "$image" != *[[:space:]]* ]] || {
+            log_error "Invalid canary matrix image: $image"; return 4;
+        }
+    done
+    for mode in "${modes[@]}"; do
+        case "$mode" in vibe|safe) ;; *) log_error "Invalid canary mode: $mode"; return 4 ;; esac
+    done
+    selected_tools=$(_canary_select_tools "$selection_given" "$selection") || return $?
+    mapfile -t tools <<< "$selected_tools"
+    tools_csv=$(IFS=','; printf '%s' "${tools[*]}")
+    local tools_json images_json modes_json
+    tools_json=$(printf '%s\n' "${tools[@]}" | jq -Rsc 'split("\n")[:-1]') || return 3
+    images_json=$(printf '%s\n' "${CANARY_MATRIX[@]}" | jq -Rsc 'split("\n")[:-1]') || return 3
+    modes_json=$(printf '%s\n' "${modes[@]}" | jq -Rsc 'split("\n")[:-1]') || return 3
 
+    local total_passed=0 total_failed=0 errors=0 status=0
+    local image_results=()
+    local result child_status cell_status cell_error cell_complete cell_total reported_complete passed failed
     for image in "${CANARY_MATRIX[@]}"; do
         for mode in "${modes[@]}"; do
             log_info "=== Matrix: $image ($mode mode) ==="
-
-            local result
-            # shellcheck disable=SC2086  # Intentional word splitting for tools_arg
-            result=$(canary_run_image "$image" $tools_arg --mode "$mode" 2>/dev/null) || true
-
-            local passed failed
-            passed=$(echo "$result" | jq -r '.passed // 0')
-            failed=$(echo "$result" | jq -r '.failed // 0')
-
+            child_status=0
+            result=$(canary_run_image "$image" --tools "$tools_csv" --mode "$mode") || child_status=$?
+            cell_error=""
+            cell_complete=true
+            if result=$(_canary_validate_image_result "$image" "$mode" "$tools_json" "$child_status" <<< "$result" 2>/dev/null); then
+                passed=$(jq -r '.passed' <<< "$result") || return 3
+                failed=$(jq -r '.failed' <<< "$result") || return 3
+                cell_total=$((passed + failed))
+                reported_complete=$(jq -r 'if has("complete") then .complete else true end' <<< "$result") || return 3
+                if [[ $cell_total -ne ${#tools[@]} || "$reported_complete" != true ]]; then
+                    cell_complete=false
+                    cell_error="Canary image did not report every selected tool"
+                    [[ $child_status -ne 0 ]] || child_status=3
+                elif [[ $child_status -eq 0 && $failed -ne 0 ]]; then
+                    cell_error="Canary image reported failures with a successful exit"
+                    child_status=3
+                elif [[ $child_status -ne 0 && ( $child_status -ne 1 || $failed -eq 0 ) ]]; then
+                    cell_error="Canary image exited with status $child_status"
+                fi
+            else
+                passed=0
+                failed=0
+                cell_complete=false
+                cell_error="Canary image produced no valid result"
+                [[ $child_status -ne 0 ]] || child_status=3
+                result=$(jq -nc --arg image "$image" --arg mode "$mode" \
+                    '{image: $image, mode: $mode, passed: 0, failed: 0, total: 0, results: []}') || return 3
+            fi
+            if [[ $child_status -eq 5 || ( $child_status -ge 129 && $child_status -le 192 ) ]]; then
+                cell_complete=false
+                cell_error="Canary image was interrupted (status $child_status)"
+            fi
+            cell_status=passed
+            if [[ -n "$cell_error" ]]; then
+                cell_status=error
+                ((errors++))
+                log_error "$cell_error: $image ($mode)"
+                [[ $status -ne 0 && $status -ne 1 ]] || status=$child_status
+            elif [[ $failed -ne 0 ]]; then
+                cell_status=failed
+                [[ $status -ne 0 ]] || status=1
+            fi
             ((total_passed += passed))
             ((total_failed += failed))
-
+            result=$(jq -c --arg status "$cell_status" --arg error "$cell_error" \
+                --argjson code "$child_status" --argjson expected "${#tools[@]}" \
+                --argjson complete "$cell_complete" \
+                '. + {status: $status, exit_code: $code, expected: $expected, complete: $complete} |
+                 if $error != "" then . + {error: $error} else del(.error) end' <<< "$result") || return 3
             image_results+=("$result")
+            if [[ $child_status -eq 5 || ( $child_status -ge 129 && $child_status -le 192 ) ]]; then
+                status=$child_status
+                break 2
+            fi
         done
     done
 
-    # Summary
-    echo ""
     log_info "=== Matrix Summary ==="
     log_info "Total passed: $total_passed"
     log_info "Total failed: $total_failed"
+    log_info "Execution errors: $errors"
 
-    [[ $total_failed -eq 0 ]]
+    local results_json
+    results_json=$(printf '%s\n' "${image_results[@]}" | jq -sc '.') || return 3
+    jq -nc --argjson tools "$tools_json" --argjson images "$images_json" \
+        --argjson modes "$modes_json" --argjson results "$results_json" \
+        --argjson passed "$total_passed" --argjson failed "$total_failed" \
+        --argjson errors "$errors" --argjson code "$status" '
+        {
+            type: "matrix",
+            status: (if $code == 0 then "passed" elif $errors > 0 then "error" else "failed" end),
+            exit_code: $code,
+            tools: $tools,
+            images: $images,
+            modes: $modes,
+            passed: $passed,
+            failed: $failed,
+            total: ($passed + $failed),
+            expected: (($tools | length) * ($images | length) * ($modes | length)),
+            errors: $errors,
+            complete: (($results | length) == (($images | length) * ($modes | length)) and
+                       all($results[]; .complete)),
+            results: $results
+        }' || return 3
+    return "$status"
 }
 
 # ============================================================================
@@ -629,11 +798,12 @@ canary_run_matrix() {
 # ============================================================================
 
 # Run canary test on macOS via SSH
-# Usage: canary_run_macos <tool> <host> <mode>
+# Usage: canary_run_macos <tool> <host> <mode> [verbose]
 canary_run_macos() {
     local tool="$1"
     local host="${2:-mmini}"
     local mode="${3:-vibe}"
+    local verbose="${4:-false}"
 
     if [[ ! "$tool" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ || -z "$host" ||
           "$host" == -* || "$host" == *[[:space:]]* || "$host" == *[[:cntrl:]]* ]]; then
@@ -652,43 +822,52 @@ canary_run_macos() {
 
     log_info "Running canary test for $tool on macOS ($host)..."
 
-    # Check SSH connectivity
-    if ! _canary_run_with_timeout 5 ssh -o ConnectTimeout=3 -o BatchMode=yes "$host" "echo ok" &>/dev/null; then
+    # Preserve interruption and transport status from the connectivity probe.
+    local output status=0
+    _canary_run_with_timeout 5 ssh -o ConnectTimeout=3 -o BatchMode=yes "$host" "echo ok" \
+        &>/dev/null || status=$?
+    if [[ $status -ne 0 ]]; then
         log_error "Cannot connect to $host"
-        return 1
+        return "$status"
     fi
 
-    local output
-    local status=0
     local remote_script remote_cmd local_source=false
     [[ ! -f "$installer_source" ]] || local_source=true
     remote_script=$(cat <<SCRIPT
 set -uo pipefail
-canary_dir=\$(mktemp -d "\${TMPDIR:-/tmp}/dsr-canary.XXXXXXXX") || exit 1
+canary_fail() {
+    failure_status=\$1
+    shift
+    printf '%s\n' "\$*" >&2
+    if [ "\$failure_status" -eq 5 ] || [ "\$failure_status" -eq 124 ] ||
+       { [ "\$failure_status" -ge 129 ] && [ "\$failure_status" -le 192 ]; }; then
+        exit "\$failure_status"
+    fi
+    exit 1
+}
+canary_dir=\$(mktemp -d "\${TMPDIR:-/tmp}/dsr-canary.XXXXXXXX") ||
+    canary_fail \$? 'Could not prepare installer directory'
 trap 'rm -rf -- "\$canary_dir"' EXIT
 trap 'exit 5' HUP INT TERM
 if $local_source; then
-    cat > "\$canary_dir/install.sh" || exit 1
+    cat > "\$canary_dir/install.sh" || canary_fail \$? 'Installer transfer failed'
 else
-    if ! curl -A 'dsr-canary (+https://github.com/Dicklesworthstone/doodlestein_self_releaser)' \\
-        -fsSL --connect-timeout 15 -o "\$canary_dir/install.sh" $(_canary_shell_escape "$installer_source"); then
-        echo 'Installer download failed' >&2
-        exit 1
-    fi
+    curl -A 'dsr-canary (+https://github.com/Dicklesworthstone/doodlestein_self_releaser)' \\
+        -fsSL --connect-timeout 15 -o "\$canary_dir/install.sh" $(_canary_shell_escape "$installer_source") ||
+        canary_fail \$? 'Installer download failed'
 fi
-if ! bash "\$canary_dir/install.sh"$installer_args_shell; then
-    echo 'Installer failed' >&2
-    exit 1
-fi
+bash "\$canary_dir/install.sh"$installer_args_shell || canary_fail \$? 'Installer failed'
 export PATH="\$HOME/.local/bin:/usr/local/bin:/usr/bin:\$PATH"
 binary_name=$(_canary_shell_escape "$binary_name")
 command -v "\$binary_name" >/dev/null 2>&1 || { echo "Missing installed executable: \$binary_name" >&2; exit 1; }
-"\$binary_name" --version || exit 1
-if ! "\$binary_name" --help > "\$canary_dir/help.txt" 2>&1; then
+"\$binary_name" --version || canary_fail \$? 'Installed executable --version failed'
+if "\$binary_name" --help > "\$canary_dir/help.txt" 2>&1; then
+    head -5 "\$canary_dir/help.txt"
+else
+    status=\$?
     head -5 "\$canary_dir/help.txt" >&2
-    exit 1
+    canary_fail "\$status" 'Installed executable --help failed'
 fi
-head -5 "\$canary_dir/help.txt"
 SCRIPT
     ) || return 1
     remote_cmd="bash -c $(_canary_shell_escape "$remote_script")"
@@ -702,6 +881,7 @@ SCRIPT
 
     if [[ $status -eq 0 ]]; then
         log_ok "$tool installed and working on $host"
+        [[ "$verbose" != true || -z "$output" ]] || printf '%s\n' "$output" >&2
     else
         log_error "$tool canary failed on $host"
         echo "$output" >&2

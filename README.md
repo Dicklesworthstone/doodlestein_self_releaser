@@ -1431,17 +1431,29 @@ and download verification.
 
 ### `dsr canary`
 
-Run a repository's installer in a clean Linux container, then require its
-installed executable's `--version` and `--help` probes to succeed:
+Run a repository's installer in a clean Linux container or on a native macOS
+host over SSH, then require its installed executable's `--version` and `--help`
+probes to succeed:
 
 ```bash
 dsr canary run ntm --os ubuntu:24.04 --mode safe
+dsr canary run ntm --host mmini --mode safe
+dsr --json canary matrix --tools ntm,cass --modes safe,vibe
+dsr canary results
 ```
+
+`--host` selects a single native test and needs no Docker. The SSH host must
+already have Bash, curl, and any installer prerequisites; DSR uses batch-mode
+SSH and bounds connectivity and execution time. A native canary installs on
+that host, so choose a host intended for installer testing. `--host` cannot be
+combined with `--os` or `--all`.
 
 The repository key, GitHub repository, and installed executable may differ.
 Canary runs prefer the selected local generated installer. When there is no
 local installer, `repo` selects the GitHub repository to download from and
 `install_script_path` selects the script within it (default: `install.sh`).
+An explicit repository override must match the local installer's declared
+repository; otherwise DSR downloads the configured repository's installer.
 `binary_name` selects the executable to probe. Generated DSR installers receive `--mode <mode>
 --non-interactive` by default; an owned installer can declare its exact argv in
 `repos.d/<tool>.yaml` (including an empty array):
@@ -1456,6 +1468,21 @@ canary_packages: [python3, minisign]
 
 Installer failure, a missing configured executable, or a failed probe makes the
 canary fail; none of those conditions are informational successes.
+
+The matrix uses the selected tools across the configured Linux images and
+modes. Without `--tools`, it discovers installers under `DSR_INSTALLER_DIR`
+(or the default generated directory) and rejects an empty selection. It saves
+successful, failed, and interrupted reports for `dsr canary results`.
+JSON output includes each image/mode result, every completed tool's status,
+duration and exit code, actual pass/fail totals, the expected test count,
+execution errors, and whether coverage is complete. Missing or malformed child
+results remain explicit errors; they cannot produce a successful matrix.
+Single-tool container and SSH runs also save their results, including the
+selected backend and host or image.
+The CLI returns `5` for interrupted or timed-out canaries and `8` for native
+SSH connection failures. Reports retain the original aggregate status in
+`raw_exit_code` and each child's status in its own `exit_code`, so automation
+can follow the CLI contract without losing the underlying failure evidence.
 
 ### `dsr fallback`
 
