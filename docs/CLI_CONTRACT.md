@@ -3251,6 +3251,15 @@ checkpoint does not bypass the build step or authorize publication; release
 still requires a complete, validated successful build. Cancelled or unknown
 checkpoint states are refused before execution.
 
+If a build stopped between recording completion and sealing its outputs,
+`fallback --resume=RUN_UUID` uses the pending marker bound to that run and
+source commit to finish local artifact collection through `build --resume`.
+The build revalidates retained worker results. Fallback verifies the sealed
+manifest and payloads before signing or contacting the release publisher.
+Completed checkpoint reuse requires the sealed marker and its manifest digest
+at verification and again after signing. Direct release of an explicitly
+supplied external artifact directory keeps its independent admission rules.
+
 Completed-build reuse also requires the saved repository recipe digest before
 isolated source materialization, quality hooks, signing, or publication. It
 rechecks the same bytes after quality hooks and before the release handoff;

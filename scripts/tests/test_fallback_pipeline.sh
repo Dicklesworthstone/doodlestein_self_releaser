@@ -224,6 +224,16 @@ cmd_release() {
     fi
     return "$RELEASE_RC"
 }
+
+seal_fixture_manifest() {
+    local directory="$1" name=tool-v1.2.3-manifest.json digest
+    digest=$(_release_sha256 "$directory/$name") || return 1
+    jq -nc --arg run "$RUN" --arg sha "$SOURCE_SHA" --arg name "$name" --arg digest "$digest" '
+        {publication_schema:1,publication_status:"completed",build_purpose:"release",
+         publishable:true,run_id:$run,git_sha:$sha,manifest_name:$name,manifest_sha256:$digest}
+    ' > "$directory/.dsr-build-purpose.json"
+}
+
 cmd_build() {
     printf 'BUILD %s flag=%s\n' "$*" "${DSR_BUILD_LOCK_HELD_BY_CALLER:-unset}" >> "$CALLS"
     jq -nc --args '$ARGS.positional' -- "$@" > "$CASE/build-arguments.json" || return 4
@@ -319,6 +329,9 @@ cmd_build() {
             esac
             ;;
     esac
+    if [[ "$BUILD_RC" == 0 && "$MANIFEST_MODE" == valid ]]; then
+        seal_fixture_manifest "$out" || return 4
+    fi
     if [[ "$BUILD_MUTATES_SOURCE" == true ]]; then printf 'mutated by build\n' >> "$(act_get_local_path tool)/src.txt"; fi
     if [[ -n "${BUILD_MUTATES_PINNED_CHILD:-}" ]]; then
         local private_source
@@ -908,7 +921,7 @@ test_partial_resume_real_workers() {
             return 1
         }
     done
-    python3 - "$ROOT" "$COMMAND_FILE" "$TEST_ROOT" <<'PY'
+    python3 - "$ROOT" "$COMMAND_FILE" "$TEST_ROOT" "${1:-partial}" <<'PY'
 from collections import Counter
 import hashlib
 import json
@@ -917,8 +930,9 @@ from pathlib import Path
 import subprocess
 import sys
 
-project, command, parent = map(Path, sys.argv[1:])
-root = parent / 'partial-real-workers'
+project, command, parent = map(Path, sys.argv[1:4])
+scenario = sys.argv[4]
+root = parent / (scenario + '-real-workers')
 root.mkdir()
 print('Retained public partial-resume fixture: ' + str(root), flush=True)
 checks = failures = 0
@@ -1013,7 +1027,15 @@ gh_resolve_tag_sha() {
     printf '%s\n' "$PARTIAL_SHA"
 }
 case "$PARTIAL_MODE" in
-    first)
+    first|stop-before-seal)
+        if [[ "$PARTIAL_MODE" == stop-before-seal ]]; then
+            mv() {
+                if [[ "${2:-}" == */publishable.json && "${3:-}" == "$PARTIAL_CASE/output/.dsr-build-purpose.json" ]]; then
+                    exit 86
+                fi
+                command mv "$@"
+            }
+        fi
         # Retain the real selected-source receipt on the original attempt.
         # A --no-sync run has no ordinary-source custody to authorize reuse.
         cmd_build tool --version 1.2.3 --jobs "$PARTIAL_JOBS" --output-dir "$PARTIAL_CASE/output" ;;
@@ -1076,6 +1098,8 @@ def invoke(case, env, mode, label=None, **extra):
     with (case / (label + '.stdout')).open('wb') as out, (case / (label + '.stderr')).open('wb') as err:
         result = subprocess.run(['bash', str(driver)], env=dict(env, PARTIAL_MODE=mode, **extra),
             stdin=subprocess.DEVNULL, stdout=out, stderr=err, timeout=90)
+    if mode == 'stop-before-seal':
+        return result.returncode, {}
     if mode == 'status':
         check(case.name + '/' + label + ': real state transition succeeds', result.returncode == 0)
         return result.returncode, {}
@@ -1116,6 +1140,68 @@ def seed(name, jobs):
           plan.get('completed_targets') == ['linux/amd64'] and plan.get('targets_to_process') == ['linux/arm64'])
     return case, env, state_path, state
 
+
+if scenario == 'pending-publication':
+    case, env = fixture(scenario, 2)
+    (case / 'repaired').touch()
+    code, _ = invoke(case, env, 'stop-before-seal')
+    if not check('real build reached the selected marker rename', code == 86):
+        print((case / 'stop-before-seal.stderr').read_text(), file=sys.stderr)
+        raise SystemExit(1)
+    marker = case / 'output/.dsr-build-purpose.json'
+    pending = read(marker)
+    identity = pending['run_id']
+    env['PARTIAL_RUN'] = identity
+    state_path = case / 'state/builds/tool/1.2.3' / identity / 'state.json'
+    state = read(state_path)
+    check('build interrupted at final marker rename with a real completed checkpoint',
+          state['status'] == 'completed' and pending['publishable'] is False and
+          pending['publication_status'] == 'pending' and pending['git_sha'] == env['PARTIAL_SHA'])
+    original_events = events(case)
+    original_state = state_path.read_bytes()
+    receipts = {Path(row['result_path']): digest(Path(row['result_path']))
+                for row in state['target_statuses'].values()}
+    check('both actual workers completed once and retained individual receipts',
+          Counter(e['platform'] for e in original_events) == Counter(targets) and len(receipts) == 2)
+    for key, value in [('run_id', '99999999-9999-4999-8999-999999999999'), ('git_sha', 'f' * 40)]:
+        marker.write_text(json.dumps(dict(pending, **{key: value})))
+        before = (case / 'boundaries').read_text()
+        code, result = invoke(case, env, 'publish', 'wrong-' + key)
+        after = (case / 'boundaries').read_text()[len(before):]
+        check('foreign ' + key + ' cannot reopen a completed checkpoint or reach publication',
+              code != 0 and result.get('exit_code') == code and 'PUBLISH ' not in after and
+              state_path.read_bytes() == original_state and events(case) == original_events)
+    marker.write_text(json.dumps(pending))
+    before = (case / 'boundaries').read_text()
+    code, result = invoke(case, env, 'publish', 'finish-seal')
+    after = (case / 'boundaries').read_text()[len(before):]
+    sealed = read(marker)
+    manifest = case / 'output/tool-v1.2.3-manifest.json'
+    check('fallback resumes the same UUID and confirms publication exactly once',
+          code == 0 and result.get('details', {}).get('resume_run_id') == identity and
+          result.get('details', {}).get('phases', {}).get('release') == 'success' and
+          sum(line.startswith('PUBLISH ') for line in after.splitlines()) == 1)
+    check('real build seals the manifest and its verified payloads before publication',
+          sealed.get('publication_status') == 'completed' and sealed.get('publishable') is True and
+          sealed.get('manifest_sha256') == digest(manifest) and read(manifest)['run_id'] == identity and
+          all(digest(case / 'output' / row['name']) == row['sha256'] for row in read(manifest)['artifacts']))
+    check('completion preserves worker receipts and does not rerun either compiler',
+          read(state_path)['status'] == 'completed' and events(case) == original_events and
+          all(digest(path) == sha for path, sha in receipts.items()))
+    if sealed.get('publication_status') == 'completed':
+        marker.rename(case / 'original-completed-marker.json')
+        for mode in ('missing', 'legacy'):
+            if mode == 'legacy':
+                marker.write_text(json.dumps({'build_purpose': 'release', 'publishable': True}))
+            before = (case / 'boundaries').read_text()
+            code, result = invoke(case, env, 'publish', mode + '-seal')
+            after = (case / 'boundaries').read_text()[len(before):]
+            check(mode + ' marker cannot authorize fallback publication of the completed build',
+                  code == 6 and result.get('details', {}).get('phase') == 'verification' and
+                  'PUBLISH ' not in after and events(case) == original_events and
+                  all(digest(path) == sha for path, sha in receipts.items()))
+    print('Interrupted local publication checks: %d, failures: %d' % (checks, failures), flush=True)
+    raise SystemExit(bool(failures))
 
 for jobs in (1, 2):
     case, env, state_path, initial = seed('jobs-' + str(jobs), jobs)
@@ -1289,6 +1375,44 @@ test_completed_resume() {
         jq -e --arg run "$RUN" '.details.resume_run_id==$run and .details.artifacts_count==2' "$CASE/stdout" >/dev/null || return 1
     if [[ "$1" == true ]]; then grep -q '^RELEASE .*--resume' "$CALLS"
     else ! grep -q '^RELEASE .*--resume' "$CALLS"; fi
+}
+# An explicitly supplied external release directory has no managed build state.
+# Missing markers remain supported by the ordinary release admission path.
+test_external_manifest_without_marker() {
+    setup external-manifest
+    mkdir -p "$OUT" || return 1
+    printf 'external payload\n' > "$OUT/tool"
+    jq -nc --arg sha "$(_release_sha256 "$OUT/tool")" --argjson size "$(_release_file_size "$OUT/tool")" '
+        {status:"success",artifacts:[{name:"tool",sha256:$sha,size_bytes:$size}]}
+    ' > "$OUT/tool-v1.2.3-manifest.json" || return 1
+    _release_require_publishable_artifacts "$OUT" "$OUT/tool-v1.2.3-manifest.json" false
+}
+test_completed_marker_routing() {
+    local mode="$1" marker
+    setup "marker-$mode"; completed_fixture || return 1
+    marker="$OUT/.dsr-build-purpose.json"
+    mv "$marker" "$CASE/original-marker.json" || return 1
+    case "$mode" in
+        pending|foreign)
+            local selected_run="$RUN"
+            [[ "$mode" != foreign ]] || selected_run=99999999-9999-4999-8999-999999999999
+            jq --arg run "$selected_run" '
+                .publishable=false | .publication_status="pending" | .run_id=$run |
+                del(.manifest_sha256,.manifest_name)
+            ' "$CASE/original-marker.json" > "$marker" || return 1 ;;
+        legacy) printf '%s\n' '{"build_purpose":"release","publishable":true}' > "$marker" ;;
+        missing) ;;
+        *) return 1 ;;
+    esac
+    run_fallback --resume="$RUN"
+    one_result && [[ ! -e "$CASE/lock" ]] || return 1
+    if [[ "$mode" == pending ]]; then
+        [[ "$RC" == 0 ]] && grep -Fq -- "--resume=$RUN" "$CASE/build-arguments.json" &&
+            grep -q '^RELEASE ' "$CALLS" &&
+            jq -e '.publication_status=="completed"' "$marker" >/dev/null
+    else
+        [[ "$RC" == 6 ]] && ! grep -q '^BUILD \|^SIGN \|^RELEASE ' "$CALLS"
+    fi
 }
 test_completed_default_output() {
     setup completed_output; completed_fixture
@@ -2124,7 +2248,8 @@ test_isolated_source_sibling_resume() {
                 .artifacts += [{name:"variant",sha256:$sha,size_bytes:$size,
                     target:$tasks[2].platform,target_triple:$tasks[2].target_triple}]
             ' "$OUT/tool-v1.2.3-manifest.json" > "$CASE/variant-manifest.json"
-            mv "$CASE/variant-manifest.json" "$OUT/tool-v1.2.3-manifest.json" ;;
+            mv "$CASE/variant-manifest.json" "$OUT/tool-v1.2.3-manifest.json" || return 1
+            seal_fixture_manifest "$OUT" || return 1 ;;
         history) jq '.source_sync_history[0].receipt.sibling_git_contexts.dependency.git_sha=("f"*40)' "$CASE/checkpoint.json" > "$CASE/revised-state.json" ;;
         embedded) jq '.target_statuses["linux/amd64"].result.source_sync.sibling_git_contexts.dependency.git_sha=("f"*40)' "$CASE/checkpoint.json" > "$CASE/revised-state.json" ;;
         sidecar)
@@ -2291,6 +2416,7 @@ for mode in draft missing-visibility wrong-tag wrong-repo malformed; do run_test
 run_test test_release_public_confirmation_completes
 run_test test_resume_reaches_build
 run_test test_partial_resume_real_workers
+run_test test_partial_resume_real_workers pending-publication
 run_test test_preserves_caller_state
 run_test test_signal_releases_lock checks
 run_test test_signal_releases_lock build
@@ -2299,6 +2425,8 @@ run_test test_invalid_argument --resume=unsafe
 run_test test_completed_resume true
 run_test test_completed_resume false
 run_test test_completed_default_output
+run_test test_external_manifest_without_marker
+for mode in pending foreign missing legacy; do run_test test_completed_marker_routing "$mode"; done
 for mode in matching drift missing-plan plan-event missing-event changed-event sidecar-event; do
     run_test test_completed_task_plan "$mode"
 done

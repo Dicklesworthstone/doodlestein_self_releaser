@@ -617,6 +617,19 @@ build_state_get() {
   printf '%s\n' "$state"
 }
 
+# Completion of the worker checkpoint precedes the final manifest and marker
+# renames. Only this run's pending marker permits reopening that checkpoint.
+build_state_publication_is_pending() {
+  local marker="$1" run="$2" sha="$3" purpose="$4"
+  [[ -f "$marker" && ! -L "$marker" ]] &&
+    jq -es --arg run "$run" --arg sha "$sha" --arg purpose "$purpose" '
+      length == 1 and (.[0] | type == "object" and
+        .build_purpose == $purpose and .publishable == false and
+        .publication_schema == 1 and .publication_status == "pending" and
+        .run_id == $run and .git_sha == $sha)
+    ' "$marker" >/dev/null
+}
+
 # Update build status
 build_state_update_status() {
   local tool="$1"

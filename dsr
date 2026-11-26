@@ -4172,13 +4172,8 @@ EOF
         if [[ "$(jq -r '.status // empty' <<< "$resume_state")" == completed ]]; then
             # Completion is persisted before the publication marker changes.
             # A crash in that interval must remain recoverable from receipts.
-            if [[ ! -f "$output_dir/.dsr-build-purpose.json" || -L "$output_dir/.dsr-build-purpose.json" ]] || \
-               ! jq -es --arg run "$resume_run_id" --arg sha "$build_source_sha" --arg purpose "$build_purpose" '
-                    length == 1 and (.[0] | type == "object" and
-                    .build_purpose == $purpose and .publishable == false and
-                    .publication_schema == 1 and .publication_status == "pending" and
-                    .run_id == $run and .git_sha == $sha)
-                ' "$output_dir/.dsr-build-purpose.json" >/dev/null; then
+            if ! build_state_publication_is_pending "$output_dir/.dsr-build-purpose.json" \
+                    "$resume_run_id" "$build_source_sha" "$build_purpose"; then
                 log_error "Completed build has no interrupted publication to resume"
                 return 4
             fi
@@ -6932,7 +6927,7 @@ _release_contract_verify_local_asset() {
 # This guard also applies when a tool's strict contract has since been removed.
 # A missing diagnostic manifest must never fall through to upload-all behavior.
 _release_require_publishable_artifacts() {
-    local artifacts_dir="$1" manifest_file="$2" strict="${3:-false}"
+    local artifacts_dir="$1" manifest_file="$2" strict="${3:-false}" require_seal="${4:-false}"
     local state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
     local physical_dir diagnostic_root
     physical_dir=$(cd "$artifacts_dir" 2>/dev/null && pwd -P) || return 4
@@ -6943,14 +6938,14 @@ _release_require_publishable_artifacts() {
         return 4
     fi
     local marker="$artifacts_dir/.dsr-build-purpose.json"
-    if [[ -e "$marker" || -L "$marker" ]]; then
+    if [[ "$require_seal" == true || -e "$marker" || -L "$marker" ]]; then
         if [[ ! -f "$marker" || -L "$marker" ]] || \
            ! jq -es 'length == 1 and (.[0] | type == "object" and
                 .build_purpose == "release" and .publishable == true)' "$marker" >/dev/null; then
             log_error "Artifact directory carries non-publishable or invalid build purpose"
             return 4
         fi
-        if jq -e 'has("publication_schema")' "$marker" >/dev/null; then
+        if [[ "$require_seal" == true ]] || jq -e 'has("publication_schema")' "$marker" >/dev/null; then
             local bound_manifest_name bound_manifest_sha actual_manifest_sha
             if ! jq -e '
                     .publication_schema == 1 and .publication_status == "completed" and
@@ -14603,6 +14598,7 @@ cmd_fallback() {
     local dry_run="$DRY_RUN" output_dir_explicit=false
     local parallel_jobs=1
     local resume_selector="latest" resume_run_id="" resume_state="" reuse_completed=false
+    local resume_publication=false
     local sbom_override="" sbom_format="" sbom_policy
 
     while [[ $# -gt 0 ]]; do
@@ -15149,7 +15145,13 @@ EOF
             return 4
         fi
         output_dir="$resume_output"
-        [[ "$(jq -r '.status' <<< "$resume_state")" == completed ]] && reuse_completed=true
+        if [[ "$(jq -r '.status' <<< "$resume_state")" == completed ]]; then
+            reuse_completed=true
+            if build_state_publication_is_pending "$output_dir/.dsr-build-purpose.json" \
+                    "$resume_run_id" "$(jq -r '.git_sha' <<< "$resume_state")" release; then
+                resume_publication=true
+            fi
+        fi
     fi
 
     _fallback_resume_source_admission() {
@@ -15472,9 +15474,12 @@ EOF
     _fallback_check_watch_admission || return $?
     local -a build_args=("$tool_name" --version "$version" --output-dir "$output_dir" --jobs "$parallel_jobs")
     $resume && build_args+=("--resume=$resume_run_id")
-    if $reuse_completed; then
+    if $reuse_completed && ! $resume_publication; then
         log_info "Source verified for completed build $resume_run_id; checking its artifacts before reuse"
     else
+        if $resume_publication; then
+            log_info "Completing interrupted artifact publication for build $resume_run_id"
+        fi
         cmd_build "${build_args[@]}" >&2 || rc=$?
     fi
     if [[ $rc -ne 0 ]]; then
@@ -15493,7 +15498,7 @@ EOF
     local manifest_sha name sha size actual_sha actual_size
     local -a payload_paths=()
     if [[ ! -f "$manifest_file" || -L "$manifest_file" ]] ||
-       ! _release_require_publishable_artifacts "$output_dir" "$manifest_file" false ||
+       ! _release_require_publishable_artifacts "$output_dir" "$manifest_file" false "$reuse_completed" ||
        ! manifest_json=$(jq -cse --arg tool "$tool_name" --arg tag "$tag" '
             if length == 1 and (.[0] |
                 type == "object" and .tool == $tool and .version == $tag and
@@ -15621,7 +15626,8 @@ EOF
     done < <(jq -r '.artifacts[] | [.name,.sha256,(.size_bytes|tostring)] | @tsv' <<< "$manifest_json")
     if [[ "$(_release_sha256 "$manifest_file")" != "$manifest_sha" ]] ||
        ! _act_repo_config_matches "$tool_name" "$fallback_repo_config_sha256" ||
-       { $reuse_completed && ! _fallback_verify_completed_source; } ||
+       { $reuse_completed && { ! _fallback_verify_completed_source ||
+           ! _release_require_publishable_artifacts "$output_dir" "$manifest_file" false true; }; } ||
        ! _fallback_verify_expected_source; then
         verification_status="failed"; release_status="blocked"
         _fallback_result 6 verification "Manifest, repository recipe, or completed source changed before release"

@@ -477,6 +477,12 @@ if [[ "$1" == create || "$1" == publish || "$1" == fallback || "$1" == verify ||
                 platform:.platform,workflow_event:.workflow_event}}' <<< "$tasks") || return 4
             build_state_update_target app 1.2.3 linux/amd64 completed "$result" "$run" || return 4
             build_state_update_status app 1.2.3 completed "$run" || return 4
+            local name=app-v1.2.3-manifest.json digest
+            digest=$(_act_sha256 "$out/$name") || return 4
+            jq -nc --arg run "$run" --arg sha "$SOURCE_SHA" --arg name "$name" --arg digest "$digest" '
+                {publication_schema:1,publication_status:"completed",build_purpose:"release",
+                 publishable:true,run_id:$run,git_sha:$sha,manifest_name:$name,manifest_sha256:$digest}
+            ' > "$out/.dsr-build-purpose.json" || return 4
         }
         cmd_fallback app --version 1.2.3 --expected-sha "$SOURCE_SHA" "$@"
     fi
