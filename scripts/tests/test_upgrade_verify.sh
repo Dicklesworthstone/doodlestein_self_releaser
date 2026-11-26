@@ -512,6 +512,75 @@ test_cli_process_status_and_output_agree() {
     harness_teardown
 }
 
+test_bulk_discovery_and_updater_stops() {
+    local scenario status code mode row_code later
+    for scenario in help-timeout help-term updater-term; do
+        ((TESTS_RUN++))
+        TEST_NAME="upgrade-$scenario" harness_setup
+        setup_module
+        # The first and last tools have explicit checks. The middle one needs
+        # discovery except when the selected updater itself is interrupted.
+        printf 'upgrade_check_args: [upgrade, --check]\n' > "$ACT_REPOS_DIR/a-first.yaml"
+        printf 'upgrade_check_args: [upgrade, --check]\n' > "$ACT_REPOS_DIR/z-last.yaml"
+        if [[ "$scenario" == updater-term ]]; then
+            cp "$ACT_REPOS_DIR/a-first.yaml" "$ACT_REPOS_DIR/m-probe.yaml"
+        else
+            printf 'binary_name: m-probe\n' > "$ACT_REPOS_DIR/m-probe.yaml"
+        fi
+        local PATH="$TEST_TMPDIR/bin:$PATH" UPGRADE_VERIFY_TIMEOUT=1
+        export DSR_UPGRADE_TEST_ROOT="$TEST_TMPDIR"
+        printf '%s\n' "$scenario" > "$TEST_TMPDIR/scenario"
+        cat > "$TEST_TMPDIR/bin/m-probe" <<'TOOL'
+#!/usr/bin/env bash
+name=${0##*/}
+printf '%s %s\n' "$name" "$*" >> "$DSR_UPGRADE_TEST_ROOT/visited"
+if [[ "$name" == m-probe ]]; then
+    printf 'upgrade available\nLatest version: 1.2.3\n'
+    if [[ "$(cat "$DSR_UPGRADE_TEST_ROOT/scenario")" == help-timeout ]]; then
+        exec sleep 4
+    fi
+    kill -TERM "$$"
+fi
+printf 'Latest version: 1.2.3\n'
+TOOL
+        chmod +x "$TEST_TMPDIR/bin/m-probe"
+        cp -p "$TEST_TMPDIR/bin/m-probe" "$TEST_TMPDIR/bin/a-first"
+        cp -p "$TEST_TMPDIR/bin/m-probe" "$TEST_TMPDIR/bin/z-last"
+        status=0
+        if [[ "$scenario" == help-timeout ]]; then
+            # Set the normal watchdog's per-tool bound to one second.
+            upgrade_verify_all --json --version 1.2.3 > "$TEST_TMPDIR/result" 2> "$TEST_TMPDIR/err" || status=$?
+            code=1 row_code=124 later=true mode=discovery
+        else
+            "$PROJECT_ROOT/dsr" --json verify upgrade --all --version 1.2.3 \
+                > "$TEST_TMPDIR/envelope" 2> "$TEST_TMPDIR/err" || status=$?
+            jq -e 'select(.exit_code == 5) | .details' "$TEST_TMPDIR/envelope" > "$TEST_TMPDIR/result"
+            code=5 row_code=143 later=false mode=discovery
+            [[ "$scenario" != updater-term ]] || mode=updater
+        fi
+        local middle='m-probe --help' expected
+        [[ "$mode" == discovery ]] || middle='m-probe upgrade --check'
+        expected=$(printf '%s\n' 'a-first upgrade --check' "$middle")
+        if $later; then expected+=$'\nz-last upgrade --check'; fi
+        if [[ "$status" == "$code" && "$(cat "$TEST_TMPDIR/visited")" == "$expected" ]] &&
+           jq -e --arg mode "$mode" --argjson code "$code" --argjson raw "$row_code" --argjson later "$later" '
+            .tools[1] as $row |
+            [.tools[].tool] == (if $later then ["a-first","m-probe","z-last"] else ["a-first","m-probe"] end) and
+            .summary == {passed:(if $later then 2 else 1 end), failed:(if $later then 1 else 0 end),
+                interrupted:(if $later then 0 else 1 end), skipped:0, planned:0} and
+            $row.verification_exit_code == $code and ($row.output | contains("Latest version: 1.2.3")) and
+            (if $mode == "discovery" then $row.phase == "discovery" and $row.exit_code == null and
+                $row.discovery_exit_code == $raw else $row.exit_code == $raw end)
+        ' "$TEST_TMPDIR/result" >/dev/null; then
+            pass "Bulk verification respects $scenario and records the attempted commands"
+        else
+            fail "Bulk verification lost $scenario or invoked an unexpected tool"
+        fi
+        unset DSR_UPGRADE_TEST_ROOT
+        harness_teardown
+    done
+}
+
 test_real_timeout_after_positive_output_fails() {
     ((TESTS_RUN++))
     TEST_NAME=upgrade-verdict-timeout harness_setup
@@ -1755,6 +1824,12 @@ trap cleanup EXIT
 echo "=== Upgrade Verify Tests ==="
 echo ""
 
+if [[ "${1:-}" == --runtime-stops-only ]]; then
+    test_real_timeout_after_positive_output_fails
+    test_bulk_discovery_and_updater_stops
+    [[ "$TESTS_FAILED" -eq 0 ]]; exit $?
+fi
+
 if [[ "${1:-}" == --bun-source-only ]]; then
     test_bun_source_upgrade
     printf 'Bun source checks: %s; passed: %s; skipped: %s; failed: %s\n' \
@@ -1805,6 +1880,7 @@ test_json_reports_exact_version_mismatch
 test_cli_json_failure_is_one_envelope_from_one_run
 test_cli_process_status_and_output_agree
 test_real_timeout_after_positive_output_fails
+test_bulk_discovery_and_updater_stops
 test_cli_dry_run_runs_and_builds_nothing
 test_cli_all_selection_and_options
 test_module_json_inventory_does_not_build_missing_tools

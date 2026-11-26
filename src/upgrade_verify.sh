@@ -133,10 +133,11 @@ upgrade_verify_tool() (
             if [[ "$build_status" != 0 || -z "$bin_path" || ! -f "$bin_path" ||
                   ! -x "$bin_path" || -L "$bin_path" ]]; then
                 log_error "Failed to build $binary_name for $tool_name"
-                _upgrade_result failed "Failed to build $binary_name for $tool_name"
                 if ((build_status == 5 || build_status == 124 || (build_status >= 129 && build_status <= 255))); then
+                    _upgrade_result interrupted "Source build interrupted"
                     return 5
                 fi
+                _upgrade_result failed "Failed to build $binary_name for $tool_name"
                 return 1
             fi
 
@@ -179,6 +180,13 @@ upgrade_verify_tool() (
     exit_code=0
     output=$(run_with_timeout "$UPGRADE_VERIFY_TIMEOUT" "$bin_path" "${check_args[@]}" 2>&1) || exit_code=$?
     latest_version=$(_upgrade_extract_latest_version "$output")
+
+    if _upgrade_command_cancelled "$exit_code"; then
+        log_error "Upgrade check interrupted for $tool_name (exit $exit_code)"
+        [[ -z "$built_tmpdir" ]] || rm -rf "$built_tmpdir"
+        _upgrade_result interrupted "Upgrade check interrupted"
+        return 5
+    fi
 
     # Informational output can precede a failed request or a timeout. Check the
     # actual process result before announcing an update or accepting its version.
@@ -315,8 +323,32 @@ upgrade_verify_all() (
             fi
             # Capture --help before searching it: `--help | grep -q` lets a
             # long help text SIGPIPE the tool and pipefail hides the match.
-            if [[ -n "$bin_path" ]] && grep -q "upgrade" <<< "$("$bin_path" --help 2>&1)"; then
-                has_upgrade=true
+            if [[ -n "$bin_path" ]]; then
+                local help_output help_status=0
+                help_output=$(run_with_timeout "$UPGRADE_VERIFY_TIMEOUT" "$bin_path" --help 2>&1) || help_status=$?
+                verify_status=0
+                if _upgrade_command_cancelled "$help_status"; then
+                    verify_status=5
+                    interrupted=true
+                elif [[ "$help_status" == 124 || "$help_status" == 137 ]]; then
+                    verify_status=1
+                fi
+                if ((verify_status != 0)); then
+                    log_error "Upgrade capability discovery stopped for $tool_name (exit $help_status)"
+                    if $structured; then
+                        row=$(printf '%s' "$help_output" | jq -Rsc --arg tool "$tool_name" \
+                            --argjson probe "$help_status" --argjson code "$verify_status" '
+                            {tool:$tool, phase:"discovery", exit_code:null, discovery_exit_code:$probe,
+                             verification_exit_code:$code, output:.,
+                             status:(if $code == 5 then "interrupted" else "error" end)}') || return "$verify_status"
+                        results+=("$row")
+                    fi
+                    $interrupted && break
+                    ((failed++))
+                    continue
+                fi
+                # Some CLIs print complete help with an ordinary nonzero exit.
+                grep -q "upgrade" <<< "$help_output" && has_upgrade=true
             fi
         fi
 
@@ -412,6 +444,12 @@ upgrade_verify_json() {
 # ============================================================================
 # Internal Helpers
 # ============================================================================
+
+# These are the cancellation signals trapped by the shared command supervisor.
+# A per-tool timeout (124, or 137 after escalation) is a failed check.
+_upgrade_command_cancelled() {
+    case "$1" in 129|130|141|143) return 0 ;; *) return 1 ;; esac
+}
 
 # Both output modes use the updater's process result as a prerequisite. Keep
 # the established zero-exit generic/no-update behavior, but an explicit asset
@@ -835,6 +873,6 @@ _upgrade_build_tool() (
 
 # Export functions
 export -f upgrade_verify_tool upgrade_verify_all upgrade_verify_json
-export -f _upgrade_check_succeeded _upgrade_extract_latest_version _upgrade_check_args _upgrade_has_explicit_check_args
+export -f _upgrade_command_cancelled _upgrade_check_succeeded _upgrade_extract_latest_version _upgrade_check_args _upgrade_has_explicit_check_args
 export -f _upgrade_tool_binary_name _upgrade_find_repo_dir _upgrade_build_tool _upgrade_source_cargo_arguments
 export -f _upgrade_build_bun_tool

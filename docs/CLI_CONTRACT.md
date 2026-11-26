@@ -3970,9 +3970,13 @@ Each selected tool includes its single-tool result and a
 `verification_exit_code`. The updater's own `exit_code` can be zero when an
 exact-version check fails. A skipped repository includes the reason.
 `details.summary` counts passed, planned, failed, skipped and interrupted
-checks. Source-build interruption returns 5 with the completed results and
-the interrupted tool; later repositories are absent because their checks
-never started.
+checks. Cancellation during source compilation, an updater, or its
+`--help` capability probe returns 5 and retains the earlier results.
+The interrupted tool is the last entry. Capability discovery uses the same
+30-second per-tool deadline as an update check. An expired probe records an
+error with `phase: "discovery"`, the supervisor's `discovery_exit_code`, and
+a null updater exit code. Other tools can still be checked after a per-tool
+deadline. Explicit `upgrade_check_args` bypasses discovery.
 
 ---
 
