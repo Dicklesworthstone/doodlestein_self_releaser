@@ -644,6 +644,235 @@ test_canary_script_fails_closed() {
     fi
 }
 
+# Exercise actual rendered programs, replacing only Docker, SSH and HTTP.
+# Bash array syntax in the fixture catches Alpine invoking a Bash installer
+# with its bootstrap shell instead of Bash after dependencies are installed.
+test_canary_execution() {
+    local engine="$1" scenario="$2"
+    ((TESTS_RUN++))
+    harness_setup
+    if (
+        export DSR_CONFIG_DIR="$TEST_TMPDIR/config"
+        export DSR_REPOS_FILE="$DSR_CONFIG_DIR/repos.yaml"
+        export DSR_INSTALLER_DIR="$TEST_TMPDIR/generated"
+        export DSR_CANARY_FIXTURE_DIR="$TEST_TMPDIR/fixture"
+        export DSR_CANARY_FIXTURE_SCENARIO="$scenario"
+        export DSR_CANARY_FIXTURE_ENGINE="$engine"
+        mkdir -p "$DSR_CONFIG_DIR/repos.d" "$DSR_INSTALLER_DIR/canary-alias" \
+            "$DSR_CANARY_FIXTURE_DIR/bin" || exit 1
+        export PATH="$DSR_CANARY_FIXTURE_DIR/bin:$PATH"
+        source "$PROJECT_ROOT/src/logging.sh"
+        source "$PROJECT_ROOT/src/config.sh"
+        source "$PROJECT_ROOT/src/canary.sh"
+        cat > "$DSR_CONFIG_DIR/repos.d/canary-alias.yaml" <<'YAML'
+tool_name: canary-alias
+repo: ForkOwner/actual-project
+binary_name: canary-fixture
+canary_installer_args:
+  - --label
+  - two words
+  - "$(false); 'literal'"
+YAML
+        if [[ "$scenario" == custom-path ]]; then
+            printf '%s\n' 'install_script_path: setup/install candidate.sh' \
+                >> "$DSR_CONFIG_DIR/repos.d/canary-alias.yaml"
+        fi
+        cat > "$DSR_CANARY_FIXTURE_DIR/installer.sh" <<'SH'
+#!/usr/bin/env bash
+words=(requires bash)
+[[ "${words[1]}" == bash ]] || exit 90
+printf 'installed\n' >> "$DSR_CANARY_FIXTURE_DIR/events"
+printf '%s\0' "$@" > "$DSR_CANARY_FIXTURE_DIR/argv"
+[[ "$DSR_CANARY_FIXTURE_SCENARIO" != installer-fails ]] || exit 17
+cat > "$DSR_CANARY_FIXTURE_DIR/bin/canary-fixture" <<'BIN'
+#!/usr/bin/env bash
+printf 'probe %s\n' "$1" >> "$DSR_CANARY_FIXTURE_DIR/events"
+[[ "$DSR_CANARY_FIXTURE_SCENARIO" != version-fails || "$1" != --version ]] || exit 31
+[[ "$DSR_CANARY_FIXTURE_SCENARIO" != help-fails || "$1" != --help ]] || exit 32
+echo 'canary-fixture: works'
+BIN
+chmod +x "$DSR_CANARY_FIXTURE_DIR/bin/canary-fixture"
+SH
+        cat > "$DSR_CANARY_FIXTURE_DIR/bin/curl" <<'SH'
+#!/usr/bin/env bash
+destination=""
+url=""
+while (($#)); do
+    case "$1" in
+        -o|--output) destination="$2"; shift 2 ;;
+        -A|--user-agent|--connect-timeout|--max-time) shift 2 ;;
+        https://*) url="$1"; shift ;;
+        *) shift ;;
+    esac
+done
+printf '%s\n' "$url" >> "$DSR_CANARY_FIXTURE_DIR/urls"
+[[ "$DSR_CANARY_FIXTURE_SCENARIO" != timeout ]] || sleep 30
+if [[ -n "$destination" ]]; then
+    cat "$DSR_CANARY_FIXTURE_DIR/installer.sh" > "$destination"
+else
+    cat "$DSR_CANARY_FIXTURE_DIR/installer.sh"
+fi
+[[ "$DSR_CANARY_FIXTURE_SCENARIO" != download-fails ]] || exit 22
+SH
+        cat > "$DSR_CANARY_FIXTURE_DIR/bin/ssh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$DSR_CANARY_FIXTURE_DIR/ssh-calls"
+command="${!#}"
+[[ "$command" != 'echo ok' ]] || exit 0
+exec bash -c "$command"
+SH
+        cat > "$DSR_CANARY_FIXTURE_DIR/bin/docker" <<'SH'
+#!/usr/bin/env bash
+case "$1" in
+    build)
+        context="${!#}"
+        cp "$context/test.sh" "$DSR_CANARY_FIXTURE_DIR/rendered.sh" || exit 1
+        if [[ -f "$context/install.sh" ]]; then
+            cp "$context/install.sh" "$DSR_CANARY_FIXTURE_DIR/selected-installer.sh" || exit 1
+        fi
+        ;;
+    run)
+        if [[ "$DSR_CANARY_FIXTURE_ENGINE" == alpine ]]; then
+            exec sh "$DSR_CANARY_FIXTURE_DIR/rendered.sh"
+        fi
+        exec bash "$DSR_CANARY_FIXTURE_DIR/rendered.sh"
+        ;;
+    info|rmi) ;;
+    *) exit 1 ;;
+esac
+SH
+        printf '%s\n' '#!/usr/bin/env sh' 'exit 0' > "$DSR_CANARY_FIXTURE_DIR/bin/apk"
+        printf '%s\n' '#!/usr/bin/env sh' 'exit 0' > "$DSR_CANARY_FIXTURE_DIR/bin/apt-get"
+        chmod +x "$DSR_CANARY_FIXTURE_DIR/bin/"* || exit 1
+        if [[ "$scenario" == local || "$scenario" == fork ]]; then
+            if [[ "$scenario" == local ]]; then
+                printf '%s\n' "REPO='ForkOwner/actual-project'" \
+                    > "$DSR_INSTALLER_DIR/canary-alias/install.sh"
+                cat "$DSR_CANARY_FIXTURE_DIR/installer.sh" >> "$DSR_INSTALLER_DIR/canary-alias/install.sh"
+            else
+                printf '%s\n' "REPO='OriginalOwner/old-project'" \
+                    'echo stale-local >> "$DSR_CANARY_FIXTURE_DIR/events"' \
+                    > "$DSR_INSTALLER_DIR/canary-alias/install.sh"
+            fi
+        fi
+        if [[ "$scenario" == download-fails || "$scenario" == installer-fails ]]; then
+            # Existing commands must not hide acquisition or installer failure.
+            printf '%s\n' '#!/usr/bin/env bash' \
+                'echo stale-probe >> "$DSR_CANARY_FIXTURE_DIR/events"' \
+                > "$DSR_CANARY_FIXTURE_DIR/bin/canary-fixture"
+            chmod +x "$DSR_CANARY_FIXTURE_DIR/bin/canary-fixture"
+        fi
+        local status=0 started=$SECONDS
+        if [[ "$scenario" == timeout ]]; then CANARY_TIMEOUT=1; fi
+        if [[ "$engine" == native ]]; then
+            canary_run_macos canary-alias canary-fixture-host safe || status=$?
+        else
+            canary_run_test canary-alias "$engine:fixture" safe || status=$?
+        fi
+        if [[ "$scenario" == timeout ]]; then
+            [[ "$status" == 124 || "$status" == 137 ]] && ((SECONDS - started < 10)) || exit 1
+            [[ ! -e "$DSR_CANARY_FIXTURE_DIR/events" ]] || exit 1
+            exit 0
+        fi
+        if [[ "$scenario" == local ]]; then
+            [[ ! -e "$DSR_CANARY_FIXTURE_DIR/urls" ]] || exit 1
+        else
+            local expected_url='https://raw.githubusercontent.com/ForkOwner/actual-project/main/install.sh'
+            [[ "$scenario" != custom-path ]] || expected_url='https://raw.githubusercontent.com/ForkOwner/actual-project/main/setup/install%20candidate.sh'
+            [[ "$(cat "$DSR_CANARY_FIXTURE_DIR/urls")" == "$expected_url" ]] || exit 1
+        fi
+        case "$scenario" in
+            download-fails)
+                [[ "$status" != 0 && ! -e "$DSR_CANARY_FIXTURE_DIR/events" ]] || exit 1 ;;
+            installer-fails)
+                [[ "$status" != 0 && "$(cat "$DSR_CANARY_FIXTURE_DIR/events")" == installed ]] || exit 1 ;;
+            version-fails)
+                [[ "$status" != 0 && "$(cat "$DSR_CANARY_FIXTURE_DIR/events")" == $'installed\nprobe --version' ]] || exit 1 ;;
+            help-fails)
+                [[ "$status" != 0 && "$(cat "$DSR_CANARY_FIXTURE_DIR/events")" == $'installed\nprobe --version\nprobe --help' ]] || exit 1 ;;
+            *)
+                [[ "$status" == 0 && "$(cat "$DSR_CANARY_FIXTURE_DIR/events")" == $'installed\nprobe --version\nprobe --help' ]] || exit 1
+                [[ "$(tr '\0' '\n' < "$DSR_CANARY_FIXTURE_DIR/argv")" == $'--label\ntwo words\n$(false); \'literal\'' ]] || exit 1 ;;
+        esac
+    ); then
+        pass "canary $engine execution: $scenario"
+    else
+        fail "canary $engine execution: $scenario"
+    fi
+    harness_teardown
+}
+
+test_canary_configured_installer_discovery() {
+    ((TESTS_RUN++))
+    harness_setup
+    if (
+        export DSR_INSTALLER_DIR="$TEST_TMPDIR/generated"
+        mkdir -p "$DSR_INSTALLER_DIR/selected" || exit 1
+        printf '%s\n' '#!/usr/bin/env bash' > "$DSR_INSTALLER_DIR/selected/install.sh"
+        source "$PROJECT_ROOT/src/logging.sh"
+        source "$PROJECT_ROOT/src/canary.sh"
+        canary_run_test() { printf '%s\n' "$1" >> "$TEST_TMPDIR/selected-tools"; }
+        local result
+        result=$(canary_run_image ubuntu:24.04) || exit 1
+        [[ "$(cat "$TEST_TMPDIR/selected-tools")" == selected ]] || exit 1
+        jq -e '.total == 1 and .passed == 1 and .results[0].tool == "selected"' <<< "$result" >/dev/null
+    ); then
+        pass "canary discovers tools from DSR_INSTALLER_DIR"
+    else
+        fail "canary should discover only tools in DSR_INSTALLER_DIR"
+    fi
+    harness_teardown
+}
+
+test_canary_repository_config() {
+    ((TESTS_RUN++))
+    harness_setup
+    if (
+        export DSR_CONFIG_DIR="$TEST_TMPDIR/config"
+        export DSR_REPOS_FILE="$DSR_CONFIG_DIR/repos.yaml"
+        export DSR_INSTALLER_DIR="$TEST_TMPDIR/generated"
+        mkdir -p "$DSR_CONFIG_DIR/repos.d" "$DSR_INSTALLER_DIR/canary-alias" || exit 1
+        source "$PROJECT_ROOT/src/logging.sh"
+        source "$PROJECT_ROOT/src/config.sh"
+        source "$PROJECT_ROOT/src/canary.sh"
+        cat > "$DSR_REPOS_FILE" <<'YAML'
+tools:
+  canary-alias:
+    repo: RegistryOwner/old-project
+YAML
+        cat > "$DSR_CONFIG_DIR/repos.d/canary-alias.yaml" <<'YAML'
+github:
+  repo: ForkOwner/actual-project
+install_script_path: setup/install candidate.sh
+YAML
+        printf '%s\n' "REPO='RegistryOwner/old-project'" \
+            > "$DSR_INSTALLER_DIR/canary-alias/install.sh"
+        local result status=0
+        result=$(_canary_installer_source canary-alias) || exit 1
+        [[ "$result" == 'https://raw.githubusercontent.com/ForkOwner/actual-project/main/setup/install%20candidate.sh' ]] || exit 1
+        printf '%s\n' 'repo: [wrong, type]' > "$DSR_CONFIG_DIR/repos.d/canary-alias.yaml"
+        result=$(_canary_installer_source canary-alias 2>/dev/null) || status=$?
+        [[ "$status" == 4 && -z "$result" ]] || exit 1
+    ); then
+        pass "canary preserves nested per-tool repository overrides and rejects invalid identity"
+    else
+        fail "canary repository configuration must not fall back to another project"
+    fi
+    harness_teardown
+}
+
+run_canary_execution_tests() {
+    test_canary_configured_installer_discovery
+    test_canary_repository_config
+    local scenario
+    for scenario in custom-path local fork download-fails installer-fails version-fails help-fails timeout; do
+        test_canary_execution native "$scenario"
+    done
+    for scenario in custom-path fork download-fails installer-fails help-fails; do
+        test_canary_execution alpine "$scenario"
+    done
+}
+
 test_canary_matrix_config() {
     ((TESTS_RUN++))
 
@@ -684,6 +913,13 @@ cleanup() {
     exec_cleanup 2>/dev/null || true
 }
 trap cleanup EXIT
+
+if [[ "${1:-}" == --execution-only ]]; then
+    run_canary_execution_tests
+    printf 'Canary execution: %s passed, %s failed\n' "$TESTS_PASSED" "$TESTS_FAILED"
+    [[ "$TESTS_FAILED" -eq 0 ]]
+    exit $?
+fi
 
 # ============================================================================
 # Run All Tests
@@ -730,6 +966,7 @@ test_canary_get_install_cmd
 test_canary_get_shell
 test_canary_uses_configured_binary_and_installer_arguments
 test_canary_script_fails_closed
+run_canary_execution_tests
 test_canary_matrix_config
 test_canary_modes_config
 

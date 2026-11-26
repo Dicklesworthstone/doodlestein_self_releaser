@@ -51,6 +51,83 @@ _canary_shell_escape() {
     printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\"'\"'/g")"
 }
 
+# Use the same generated-installer destination as `dsr installer generate`.
+_canary_installer_directory() {
+    local script_dir="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+    printf '%s\n' "${DSR_INSTALLER_DIR:-$script_dir/installers}"
+}
+
+# Resolve the actual repository before choosing a local or upstream installer.
+# The public tool key may be an alias, and a configured fork must never silently
+# run the checked-in installer's original repository instead. Read configuration
+# explicitly: a malformed file is not evidence that no override exists.
+_canary_installer_source() {
+    local tool="$1" config_dir="${DSR_CONFIG_DIR:-$HOME/.config/dsr}"
+    local registry="${DSR_REPOS_FILE:-$config_dir/repos.yaml}"
+    local tool_config="$config_dir/repos.d/$tool.yaml" config='{}' document
+    local repo script_path configured_repo local_installer declaration
+    [[ "$tool" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 4
+    command -v jq >/dev/null 2>&1 || return 3
+
+    if [[ -e "$registry" || -L "$registry" || -e "$tool_config" || -L "$tool_config" ]]; then
+        command -v yq >/dev/null 2>&1 &&
+            declare -F _config_read_single_mapping_json >/dev/null || {
+                log_error "Configuration support and yq are required to select a canary installer"
+                return 3
+            }
+    fi
+    if [[ -e "$registry" || -L "$registry" ]]; then
+        document=$(_config_read_single_mapping_json "$registry") || return $?
+        config=$(jq -ce --arg tool "$tool" '
+            (if has("tools") then .tools else {} end) |
+            if type != "object" then error("tools must be a mapping")
+            elif has($tool) then .[$tool] | if type == "object" then . else error("tool must be a mapping") end
+            else {} end' <<< "$document") || return 4
+        config=$(jq -c 'if has("repo") then . elif (.github | type) == "object" then
+            if (.github | has("repo")) then . + {repo:.github.repo} else . end else . end' \
+            <<< "$config") || return 4
+    fi
+    if [[ -e "$tool_config" || -L "$tool_config" ]]; then
+        document=$(_config_read_single_mapping_json "$tool_config") || return $?
+        # Normalize the older nested spelling before merging, so a per-tool
+        # github.repo also overrides a flat repository in the registry.
+        document=$(jq -c 'if has("repo") then . elif (.github | type) == "object" then
+            if (.github | has("repo")) then . + {repo:.github.repo} else . end else . end' \
+            <<< "$document") || return 4
+        config=$(printf '%s\n' "$config" "$document" | jq -sc '.[0] + .[1]') || return 4
+    fi
+    configured_repo=$(jq -r 'has("repo")' <<< "$config") || return 4
+    repo=$(jq -er --arg default "Dicklesworthstone/$tool" '
+        (if has("repo") then .repo else $default end) |
+        strings | select(test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$") and
+            (test("[\u0000-\u001f\u007f]") | not))' <<< "$config") || {
+        log_error "Invalid canary repository for $tool"
+        return 4
+    }
+    script_path=$(jq -er '
+        (if has("install_script_path") then .install_script_path else "install.sh" end) |
+        strings | select(length > 0 and (test("[\u0000-\u001f\u007f\\\\]") | not) and
+            (split("/") | all(. != "" and . != "." and . != "..")))' <<< "$config") || {
+        log_error "Invalid canary install_script_path for $tool"
+        return 4
+    }
+    local_installer="$(_canary_installer_directory)/$tool/install.sh"
+    if [[ -f "$local_installer" && "$script_path" == install.sh ]]; then
+        # Generated installers declare REPO once using a literal assignment.
+        # Do not source executable code to discover its repository. An unknown
+        # or conflicting declaration cannot override an explicit config.
+        declaration=$(sed -n '/^REPO=/p' "$local_installer") || return 4
+        if [[ "$configured_repo" == false || "$declaration" == "REPO='$repo'" ||
+              "$declaration" == "REPO=\"$repo\"" ]]; then
+            printf '%s\n' "$local_installer"
+            return 0
+        fi
+        log_info "Using $repo installer instead of a local installer with a different repository binding"
+    fi
+    script_path=$(printf '%s' "$script_path" | jq -sRr 'split("/") | map(@uri) | join("/")') || return 4
+    printf 'https://raw.githubusercontent.com/%s/main/%s\n' "$repo" "$script_path"
+}
+
 # ============================================================================
 # Docker Helpers
 # ============================================================================
@@ -254,18 +331,8 @@ canary_run_test() {
         mapfile -t canary_packages <<< "$canary_packages_output"
     fi
 
-    local installer_path
-    local installer_url
-
-    # Check for local installer first
-    local script_dir="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-    installer_path="$script_dir/installers/$tool/install.sh"
-
-    if [[ ! -f "$installer_path" ]]; then
-        # Try to construct URL from repos config
-        installer_url="https://raw.githubusercontent.com/Dicklesworthstone/$tool/main/install.sh"
-        installer_path=""
-    fi
+    local installer_source
+    installer_source=$(_canary_installer_source "$tool") || return $?
 
     # Prepare test directory.
     # RETURN handles normal exit; INT/TERM cover the common case where
@@ -274,7 +341,7 @@ canary_run_test() {
     # set time so the cleanup still works even after `local` scope
     # would otherwise hide it.
     local tmpdir
-    tmpdir=$(mktemp -d)
+    tmpdir=$(mktemp -d) || return 1
     # shellcheck disable=SC2064  # We want $tmpdir expanded now, at trap definition time
     trap "rm -rf '$tmpdir' 2>/dev/null; trap - RETURN INT TERM" RETURN INT TERM
 
@@ -285,20 +352,17 @@ canary_run_test() {
     shell=$(_canary_get_shell "$image")
 
     # If we have a local installer, copy it
-    local installer_source
-    if [[ -n "$installer_path" && -f "$installer_path" ]]; then
-        cp "$installer_path" "$tmpdir/install.sh"
-        chmod +x "$tmpdir/install.sh"
+    if [[ -f "$installer_source" ]]; then
+        cp "$installer_source" "$tmpdir/install.sh" || return 1
+        chmod +x "$tmpdir/install.sh" || return 1
         installer_source="/install.sh"
-    else
-        installer_source="$installer_url"
     fi
 
     # Create the test script
     cat > "$tmpdir/test.sh" << TESTSCRIPT
 #!/usr/bin/env $shell
 set -u
-if set -o pipefail 2>/dev/null; then
+if (set -o pipefail) 2>/dev/null; then
     set -o pipefail
 fi
 
@@ -312,16 +376,23 @@ fi
 
 # Run installer
 echo "Installing $tool..."
-if [ -f "/install.sh" ]; then
+if [ "$installer_source" = /install.sh ]; then
     # Local installer
-    if ! $shell /install.sh$installer_args_shell 2>&1; then
+    if ! bash /install.sh$installer_args_shell 2>&1; then
         echo "Installer failed" >&2
         exit 1
     fi
 else
-    # Remote installer
-    if ! curl -A "dsr-canary (+https://github.com/Dicklesworthstone/doodlestein_self_releaser)" -fsSL "$installer_source" |
-        $shell -s --$installer_args_shell 2>&1; then
+    # Complete acquisition before executing any installer bytes. This also
+    # preserves curl failures when the bootstrap shell has no pipefail.
+    installer_download=\$(mktemp) || exit 1
+    trap 'rm -f "\$installer_download"' EXIT
+    if ! curl -A "dsr-canary (+https://github.com/Dicklesworthstone/doodlestein_self_releaser)" \\
+        -fsSL --connect-timeout 15 -o "\$installer_download" $(_canary_shell_escape "$installer_source"); then
+        echo "Installer download failed" >&2
+        exit 1
+    fi
+    if ! bash "\$installer_download"$installer_args_shell 2>&1; then
         echo "Installer failed" >&2
         exit 1
     fi
@@ -449,10 +520,11 @@ canary_run_image() {
 
     # Default to all tools with installers
     if [[ ${#tools[@]} -eq 0 ]]; then
-        local script_dir="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+        local installer_directory
+        installer_directory=$(_canary_installer_directory) || return $?
         while IFS= read -r -d '' dir; do
             tools+=("$(basename "$dir")")
-        done < <(find "$script_dir/installers" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+        done < <(find "$installer_directory" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
     fi
 
     local passed=0
@@ -563,6 +635,21 @@ canary_run_macos() {
     local host="${2:-mmini}"
     local mode="${3:-vibe}"
 
+    if [[ ! "$tool" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ || -z "$host" ||
+          "$host" == -* || "$host" == *[[:space:]]* || "$host" == *[[:cntrl:]]* ]]; then
+        log_error "Invalid canary tool or SSH host"
+        return 4
+    fi
+    case "$mode" in vibe|safe) ;; *) log_error "Invalid canary mode: $mode"; return 4 ;; esac
+    local installer_source binary_name installer_args_output installer_arg installer_args_shell=""
+    installer_source=$(_canary_installer_source "$tool") || return $?
+    binary_name=$(_canary_get_binary_name "$tool") || return $?
+    installer_args_output=$(_canary_get_installer_args "$tool" "$mode") || return $?
+    while IFS= read -r installer_arg; do
+        [[ -n "$installer_arg" ]] || continue
+        installer_args_shell+=" $(_canary_shell_escape "$installer_arg")"
+    done <<< "$installer_args_output"
+
     log_info "Running canary test for $tool on macOS ($host)..."
 
     # Check SSH connectivity
@@ -571,25 +658,53 @@ canary_run_macos() {
         return 1
     fi
 
-    # Run installer via SSH
-    local installer_url="https://raw.githubusercontent.com/Dicklesworthstone/$tool/main/install.sh"
-
     local output
     local status=0
-    local installer_url_esc mode_esc tool_esc
-    installer_url_esc=$(_canary_shell_escape "$installer_url")
-    mode_esc=$(_canary_shell_escape "$mode")
-    tool_esc=$(_canary_shell_escape "$tool")
-    local remote_cmd
-    remote_cmd="curl -sSL $installer_url_esc | bash -s -- --mode $mode_esc --non-interactive && $tool_esc --version"
-
-    output=$(ssh "$host" "$remote_cmd" 2>&1) || status=$?
+    local remote_script remote_cmd local_source=false
+    [[ ! -f "$installer_source" ]] || local_source=true
+    remote_script=$(cat <<SCRIPT
+set -uo pipefail
+canary_dir=\$(mktemp -d "\${TMPDIR:-/tmp}/dsr-canary.XXXXXXXX") || exit 1
+trap 'rm -rf -- "\$canary_dir"' EXIT
+trap 'exit 5' HUP INT TERM
+if $local_source; then
+    cat > "\$canary_dir/install.sh" || exit 1
+else
+    if ! curl -A 'dsr-canary (+https://github.com/Dicklesworthstone/doodlestein_self_releaser)' \\
+        -fsSL --connect-timeout 15 -o "\$canary_dir/install.sh" $(_canary_shell_escape "$installer_source"); then
+        echo 'Installer download failed' >&2
+        exit 1
+    fi
+fi
+if ! bash "\$canary_dir/install.sh"$installer_args_shell; then
+    echo 'Installer failed' >&2
+    exit 1
+fi
+export PATH="\$HOME/.local/bin:/usr/local/bin:/usr/bin:\$PATH"
+binary_name=$(_canary_shell_escape "$binary_name")
+command -v "\$binary_name" >/dev/null 2>&1 || { echo "Missing installed executable: \$binary_name" >&2; exit 1; }
+"\$binary_name" --version || exit 1
+if ! "\$binary_name" --help > "\$canary_dir/help.txt" 2>&1; then
+    head -5 "\$canary_dir/help.txt" >&2
+    exit 1
+fi
+head -5 "\$canary_dir/help.txt"
+SCRIPT
+    ) || return 1
+    remote_cmd="bash -c $(_canary_shell_escape "$remote_script")"
+    if $local_source; then
+        output=$(_canary_run_with_timeout "$CANARY_TIMEOUT" ssh -o ConnectTimeout=3 -o BatchMode=yes \
+            "$host" "$remote_cmd" < "$installer_source" 2>&1) || status=$?
+    else
+        output=$(_canary_run_with_timeout "$CANARY_TIMEOUT" ssh -o ConnectTimeout=3 -o BatchMode=yes \
+            "$host" "$remote_cmd" </dev/null 2>&1) || status=$?
+    fi
 
     if [[ $status -eq 0 ]]; then
         log_ok "$tool installed and working on $host"
     else
         log_error "$tool canary failed on $host"
-        echo "$output"
+        echo "$output" >&2
     fi
 
     return $status

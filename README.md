@@ -1289,8 +1289,10 @@ dsr installer validate ntm                 # syntax, ShellCheck, safety checks
 dsr installer validate tool --shell powershell  # PowerShell syntax validation
 ```
 
-The default output directory (`installers/` beside dsr, or
-`DSR_INSTALLER_DIR`, or `--output-dir`) is the one `dsr canary` tests. Commit
+The default output directory is `installers/` beside dsr. Set
+`DSR_INSTALLER_DIR` to select another directory for both generation and later
+canary runs. A generation-only `--output-dir` override is not remembered by
+later commands; set `DSR_INSTALLER_DIR` to that path when testing it. Commit
 each generated `install.sh` or `install.ps1` to its tool's repository. Regenerate after
 changing a tool's naming, targets, workspace executables, or signing key,
 since these are embedded at generation (see "Installers and Verification").
@@ -1436,13 +1438,17 @@ installed executable's `--version` and `--help` probes to succeed:
 dsr canary run ntm --os ubuntu:24.04 --mode safe
 ```
 
-The repository key and installed executable may differ. `binary_name` selects
-the executable to probe. Generated DSR installers receive `--mode <mode>
+The repository key, GitHub repository, and installed executable may differ.
+Canary runs prefer the selected local generated installer. When there is no
+local installer, `repo` selects the GitHub repository to download from and
+`install_script_path` selects the script within it (default: `install.sh`).
+`binary_name` selects the executable to probe. Generated DSR installers receive `--mode <mode>
 --non-interactive` by default; an owned installer can declare its exact argv in
 `repos.d/<tool>.yaml` (including an empty array):
 
 ```yaml
 tool_name: frankenterm
+repo: Dicklesworthstone/frankenterm
 binary_name: ft
 canary_installer_args: []
 canary_packages: [python3, minisign]
