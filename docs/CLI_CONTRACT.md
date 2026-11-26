@@ -3912,8 +3912,15 @@ dsr verify upgrade --all --build-from-source
 The verifier uses the configured `binary_name` and `upgrade_check_args` (default
 `upgrade --check`). It executes the argument array directly, once per selected
 tool, and requires a successful process result. An explicit version must match
-the updater's reported latest version. `release --verify-upgrade` uses this same
-check after successful public publication; drafts do not run the hook.
+the updater's reported latest version. `release --verify-upgrade` runs this
+check once after successful public publication. In ordinary release JSON,
+`details.upgrade_verification` contains the check status, expected and observed
+versions, captured output, updater exit code, and `verification_exit_code`.
+For example, an updater that exits zero and reports an older release produces
+a failed check with `exit_code: 0` and `verification_exit_code: 1`. The release
+envelope still records successful publication. Requested checks that reach
+release reporting without running carry `status: "skipped"` and a reason of
+`draft`, `release_failed`, or `dry_run`.
 
 When the executable is absent, or `--build-from-source` is selected, verification
 builds the configured primary executable from `local_path`. Go, Rust, Bun and

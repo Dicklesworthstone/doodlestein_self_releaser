@@ -11256,6 +11256,7 @@ EOF
                 --argjson promotion_requested "$publish_draft" \
                 --argjson prerelease "$prerelease" \
                 --argjson file_count "$file_count" \
+                --argjson verify_upgrade "$verify_upgrade" \
                 --slurpfile artifacts /dev/fd/3 \
                 --slurpfile extra /dev/fd/4 \
                 --argjson strict "$release_contract_enabled" \
@@ -11273,7 +11274,8 @@ EOF
                   plan: (if $strict then {strict: true, assets: $contract_assets}
                          else {strict: false, artifacts: $artifacts, additional_files: $extra,
                                generated: ["SHA256SUMS", "<name>.sha256 per uploaded name"]} end),
-                  installer_check: $installer, sbom:$sbom}
+                  installer_check: $installer, sbom:$sbom} +
+                 (if $verify_upgrade then {upgrade_verification:{status:"skipped",reason:"dry_run"}} else {} end)
                  else error("Invalid release plan report inputs") end' \
                 3<<< "$plan_artifacts_json" 4<<< "$plan_extra_json" \
                 5< <(if $release_contract_enabled; then
@@ -12961,8 +12963,59 @@ EOF
         $release_interrupted || exit_code=4
     fi
 
+    # Publication is complete before this optional advisory check. Human and
+    # JSON callers each invoke the updater once, after releasing build custody.
+    local upgrade_report=null
+    _release_verify_requested_upgrade() {
+        $verify_upgrade || return 0
+        if [[ $exit_code -ne 0 ]]; then
+            upgrade_report='{"status":"skipped","reason":"release_failed"}'
+            log_info "Upgrade verification skipped because the release did not complete"
+            return 0
+        elif $draft; then
+            upgrade_report='{"status":"skipped","reason":"draft"}'
+            log_info "Upgrade verification skipped while release remains a draft"
+            return 0
+        fi
+
+        local check_rc=0 receipt_ok=true report
+        $JSON_MODE || echo ""
+        log_info "Running post-release upgrade verification..."
+        if $JSON_MODE; then
+            report=$(upgrade_verify_tool "$tool_name" --version "$version" --json) || check_rc=$?
+            # The updater's own exit_code may be null if it never ran. Keep
+            # the verifier's status separately, including a version mismatch
+            # after a zero-exit updater. Its captured output can exceed ARG_MAX.
+            if ! upgrade_report=$(jq -ces --arg tool "$tool_name" --arg version "${version#v}" \
+                    --argjson rc "$check_rc" '
+                select(length == 1) | .[0] |
+                select(type == "object" and .tool == $tool and .expected_version == $version and
+                    (if $rc == 0 then .status == "passed"
+                     elif $rc == 5 then .status == "interrupted"
+                     else (.status == "failed" or .status == "error") end)) |
+                . + {verification_exit_code:$rc}' <<< "$report"); then
+                receipt_ok=false
+                upgrade_report=$(jq -nc --argjson rc "$check_rc" '
+                    {status:"error",verification_exit_code:$rc,error:"Invalid upgrade verification report"}') || return 4
+            fi
+        else
+            upgrade_verify_tool "$tool_name" --version "$version" || check_rc=$?
+        fi
+        if [[ $check_rc -eq 0 ]] && $receipt_ok; then
+            log_ok "Upgrade verification passed for $tool_name"
+        elif [[ $check_rc -eq 5 ]] && $receipt_ok; then
+            log_warn "Upgrade verification interrupted for $tool_name"
+            log_info "Run 'dsr verify upgrade $tool_name' to retry"
+        else
+            log_warn "Upgrade verification failed for $tool_name"
+            log_info "Run 'dsr verify upgrade $tool_name' to debug"
+        fi
+        return 0
+    }
+
     # Output
     if $JSON_MODE; then
+        _release_verify_requested_upgrade || return $?
         local details
         details=$(jq -nc \
             --arg repo "$repo" \
@@ -12999,7 +13052,7 @@ EOF
             --arg dispatch_outbox "$dispatch_outbox" \
             --slurpfile reports /dev/fd/5 \
             --argjson completed "$([[ $exit_code -eq 0 ]] && ! $draft && echo true || echo false)" \
-            '($reports | if length == 3 then . else error("Expected three release reports") end) as $reports |
+            '($reports | if length == 4 then . else error("Expected four release reports") end) as $reports |
             $reports[0] as $dispatch_results | $reports[1] as $installer_check | $reports[2] as $sbom |
             {
                 repo: $repo,
@@ -13034,14 +13087,15 @@ EOF
                     repos: (if $dispatch_repos == "" then [] else ($dispatch_repos | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))) end),
                     results: $dispatch_results
                 }
-            } + (if $release_interrupted then
+            } + (if $reports[3] != null then {upgrade_verification:$reports[3]} else {} end)
+              + (if $release_interrupted then
                 {interruption:{stage:$release_stop_stage,exit_code:$release_stop_status,outcome:"unconfirmed"}}
                 else {} end)
               + (if $custody_error == "" then {} else
                 {stage:"build_custody",error:$custody_error} end)' \
             3< <(printf '%s\n' "${uploaded_assets[@]}") \
             4< <(printf '%s\n' "${failed_assets[@]}") \
-            5< <(printf '%s\n' "$dispatch_results_json" "$installer_report" "$ordinary_sbom_report")) || return 4
+            5< <(printf '%s\n' "$dispatch_results_json" "$installer_report" "$ordinary_sbom_report" "$upgrade_report")) || return 4
         json_envelope "release" "$status" "$exit_code" "$details"
     else
         echo ""
@@ -13075,21 +13129,7 @@ EOF
         if [[ ${#missing_assets[@]} -gt 0 ]]; then
             log_warn "Missing from manifest: ${missing_assets[*]}"
         fi
-    fi
-
-    # Run upgrade verification if requested and release succeeded
-    if $verify_upgrade && [[ $exit_code -eq 0 ]] && ! $draft; then
-        echo ""
-        log_info "Running post-release upgrade verification..."
-        if upgrade_verify_tool "$tool_name" --version "$version"; then
-            log_ok "Upgrade verification passed for $tool_name"
-        else
-            log_warn "Upgrade verification failed for $tool_name"
-            log_info "Run 'dsr verify upgrade $tool_name' to debug"
-            # Don't fail the release, just warn
-        fi
-    elif $verify_upgrade && $draft; then
-        log_info "Upgrade verification skipped while release remains a draft"
+        _release_verify_requested_upgrade || return $?
     fi
 
     return $exit_code

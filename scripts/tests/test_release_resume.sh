@@ -108,7 +108,13 @@ gh_resolve_tag_sha() {
         printf '%040d\n' 1
     fi
 }
-upgrade_verify_tool() { printf 'UPGRADE\n' >> "$CALLS"; }
+upgrade_verify_tool() {
+    printf 'UPGRADE\n' >> "$CALLS"
+    if [[ "${4:-}" == --json ]]; then
+        jq -nc --arg tool "$1" --arg version "${3#v}" \
+            '{tool:$tool,status:"passed",expected_version:$version,latest_version:$version,exit_code:0,output:""}'
+    fi
+}
 artifact_naming_generate_dual_for_tool() {
     local arch="$4"
     [[ "${COLLIDE_NAMES:-false}" == true ]] && arch=amd64
@@ -1290,6 +1296,99 @@ test_failed_resume_lookup_never_creates() {
     run_release --resume
     [[ $STATUS -eq 7 ]] && ! grep -q '^CREATE\|^POST\|^DISPATCH' "$CALLS"
 }
+
+# The public command, verifier, configured argv and updater process are real.
+# The surrounding suite provides local release/upload/dispatch adapters.
+release_upgrade_receipt_case() {
+    local mode="$1" expected_rc=0
+    setup "release_upgrade_$mode" || return 1
+    # shellcheck source=../../src/upgrade_verify.sh
+    source "$PROJECT_ROOT/src/upgrade_verify.sh" || return 1
+    mkdir "$CASE/bin" || return 1
+    printf '%s\n' 'upgrade_check_args: ["probe", "--latest"]' >> "$ACT_REPOS_DIR/tool.yaml"
+    export UPGRADE_TEST_MODE="$mode" UPGRADE_TEST_CALLS="$CASE/updater-calls"
+    export PATH="$CASE/bin:$PATH"
+    cat > "$CASE/bin/tool" <<'UPDATER'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$UPGRADE_TEST_CALLS"
+[[ "$#" == 2 && "$1" == probe && "$2" == --latest ]] || exit 4
+case "$UPGRADE_TEST_MODE" in
+    failed) printf 'Updater refused the request\n'; exit 17 ;;
+    interrupted) printf 'Partial updater output\n'; kill -TERM "$$" ;;
+    wrong-version) printf 'Latest version: 9.9.9\n' ;;
+    large) awk 'BEGIN {for (i=0; i<10000; ++i) printf "0123456789abcdef"; print ""}'
+           printf 'Latest version: 1.2.3\n' ;;
+    *) printf 'Latest version: 1.2.3\n' ;;
+esac
+UPDATER
+    chmod 700 "$CASE/bin/tool" || return 1
+    local -a options=(--resume --no-dispatch --verify-upgrade)
+    case "$mode" in
+        draft) jq '.draft=true' "$CASE/release.json" > "$CASE/draft.json" &&
+                   mv "$CASE/draft.json" "$CASE/release.json" || return 1 ;;
+        upload-failed) UPLOAD_FAIL=true; expected_rc=1 ;;
+        dry-run) options+=(--dry-run) ;;
+        human) JSON_MODE=false ;;
+        invalid)
+            upgrade_verify_tool() {
+                printf 'adapter\n' >> "$UPGRADE_TEST_CALLS"
+                printf '%s\n' '{"status":"passed"}' '{"status":"passed"}'
+            } ;;
+    esac
+    run_release "${options[@]}"
+    [[ "$STATUS" == "$expected_rc" ]] || return 1
+    if [[ "$mode" == human ]]; then
+        [[ "$(cat "$UPGRADE_TEST_CALLS")" == 'probe --latest' ]] &&
+            grep -q 'Upgrade verification passed for tool' "$CASE/stderr" &&
+            ! grep -q 'upgrade_verification' "$CASE/stdout"
+        return $?
+    fi
+    # jq alone would accept trailing blank records or two separate documents.
+    [[ "$(tail -c 2 "$CASE/stdout")" == '}' ]] &&
+        jq -es --argjson code "$expected_rc" 'length == 1 and .[0].exit_code == $code' \
+            "$CASE/stdout" >/dev/null || return 1
+    case "$mode" in
+        draft|upload-failed|dry-run)
+            local reason="$mode"
+            [[ "$mode" != upload-failed ]] || reason=release_failed
+            [[ "$mode" != dry-run ]] || reason=dry_run
+            [[ ! -e "$UPGRADE_TEST_CALLS" ]] &&
+                jq -e --arg reason "$reason" '.details.upgrade_verification ==
+                    {status:"skipped",reason:$reason}' "$CASE/stdout" >/dev/null
+            return $? ;;
+        invalid)
+            [[ "$(cat "$UPGRADE_TEST_CALLS")" == adapter ]] &&
+                jq -e '.status=="success" and .details.upgrade_verification.status=="error" and
+                       .details.upgrade_verification.verification_exit_code==0' "$CASE/stdout" >/dev/null
+            return $? ;;
+    esac
+    [[ "$(cat "$UPGRADE_TEST_CALLS")" == 'probe --latest' ]] || return 1
+    jq -e --arg mode "$mode" '
+        .status=="success" and .details.draft==false and .details.release_id==9 and
+        (.details.upgrade_verification | .tool=="tool" and .binary=="tool" and .expected_version=="1.2.3" and
+          (if $mode=="failed" then .status=="failed" and .verification_exit_code==1 and
+                .exit_code==17 and .output=="Updater refused the request"
+           elif $mode=="interrupted" then .status=="interrupted" and .verification_exit_code==5 and
+                .exit_code==143 and (.output|contains("Partial updater output")) and .found_asset==false
+           elif $mode=="wrong-version" then .status=="failed" and .verification_exit_code==1 and
+                .exit_code==0 and .latest_version=="9.9.9"
+           else .status=="passed" and .verification_exit_code==0 and .exit_code==0 and
+                .latest_version=="1.2.3" and
+                (if $mode=="large" then (.output|length)>150000 and (.output|endswith("Latest version: 1.2.3"))
+                 else .output=="Latest version: 1.2.3" end)
+           end))' "$CASE/stdout" >/dev/null
+}
+
+test_release_upgrade_receipt_passed() { release_upgrade_receipt_case passed; }
+test_release_upgrade_receipt_failed() { release_upgrade_receipt_case failed; }
+test_release_upgrade_receipt_wrong_version() { release_upgrade_receipt_case wrong-version; }
+test_release_upgrade_receipt_interrupted() { release_upgrade_receipt_case interrupted; }
+test_release_upgrade_receipt_large() { release_upgrade_receipt_case large; }
+test_release_upgrade_receipt_draft() { release_upgrade_receipt_case draft; }
+test_release_upgrade_receipt_upload_failure() { release_upgrade_receipt_case upload-failed; }
+test_release_upgrade_receipt_dry_run() { release_upgrade_receipt_case dry-run; }
+test_release_upgrade_receipt_human() { release_upgrade_receipt_case human; }
+test_release_upgrade_receipt_invalid() { release_upgrade_receipt_case invalid; }
 
 test_draft_resume_does_not_dispatch_or_verify_upgrade() {
     setup draft
@@ -4260,6 +4359,10 @@ for test in test_release_auth_cancellation_never_falls_back_or_publishes \
     test_saved_name_missing_remotely_is_uploaded test_identical_remote_is_reused_without_deletion \
     test_saved_name_with_changed_remote_fails_closed test_legacy_digestless_assets_are_hashed \
     test_unavailable_inventory_is_not_success test_failed_resume_lookup_never_creates \
+    test_release_upgrade_receipt_passed test_release_upgrade_receipt_failed test_release_upgrade_receipt_wrong_version \
+    test_release_upgrade_receipt_interrupted test_release_upgrade_receipt_large \
+    test_release_upgrade_receipt_draft test_release_upgrade_receipt_upload_failure \
+    test_release_upgrade_receipt_dry_run test_release_upgrade_receipt_human test_release_upgrade_receipt_invalid \
     test_draft_resume_does_not_dispatch_or_verify_upgrade test_named_upload_emits_one_json_envelope \
     test_prerelease_request_refuses_existing_stable_release \
     test_prerelease_resume_preserves_matching_public_mode test_prerelease_new_release_preserves_mode_through_promotion \
