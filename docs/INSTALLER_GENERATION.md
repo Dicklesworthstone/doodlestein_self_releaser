@@ -1267,9 +1267,8 @@ generated-source installer suite:
 bash scripts/tests/test_generated_installer_source.sh --libc-source-fallback-only
 ```
 
-When a required compiler is missing, or the installed Go compiler cannot run or
-is older than the pinned source requires, add **`--install-toolchain`** to prepare
-a compatible compiler inside that source attempt's private build directory:
+Use **`--install-toolchain`** to prepare a private compiler when the required
+compiler is missing or the installed compiler cannot satisfy the source requirements.
 
 ```bash
 # Build this release tag, preparing a compiler only if required.
@@ -1314,7 +1313,12 @@ timeout or interruption is terminal.
 Without `--install-toolchain`, no compiler download or replacement is authorized:
 an existing incompatible compiler can still fail the source build. Global Go
 executables, homes and profiles remain untouched even when a private compiler
-is selected. Rust and Bun retain their existing working compilers. Rustup
+is selected. For Bun and TypeScript, bootstrap consent checks the installed Bun
+against the exact `packageManager` pin and any `engines.bun` range in the
+selected dependency root's `package.json`. A matching Bun stays in use. A
+mismatch selects the checksum-verified private distribution, including when a
+workspace needs an older Bun than the one on the host. A cancelled or timed-out
+probe stops before any download. Rustup
 proxies can exist without the selected compiler: with bootstrap consent, a
 bounded probe checks availability with automatic Rustup installation disabled.
 A missing selected Rust compiler permits a private bootstrap; its probe timeout

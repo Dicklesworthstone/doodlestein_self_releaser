@@ -90,14 +90,14 @@ assert_json_valid() {
 
 run_test() {
   local test_name="$1"
-  local test_func="$2"
+  shift
 
   [[ -z "${DSR_TOOLCHAIN_TEST_FILTER:-}" || "$test_name" == *"$DSR_TOOLCHAIN_TEST_FILTER"* ]] || return 0
 
   ((TESTS_RUN+=1))
   echo -n "  $test_name... "
 
-  if $test_func 2>/dev/null; then
+  if "$@" 2>/dev/null; then
     echo "OK"
     ((TESTS_PASSED+=1))
   else
@@ -1233,6 +1233,58 @@ test_bootstrap_bun_incompatible_engine() (
   [[ "$BOOT_STATUS" == 7 && ! -e "$BOOT_CASE/output/receipt.json" ]]
 )
 
+# Exercise the bounded compiler selection used by Bun and TypeScript installers.
+# The private distribution and HTTP transport come from bootstrap_fixture.
+test_bootstrap_bun_installed() (
+  local mode="$1" language="$2" status=0 original_path
+  bootstrap_fixture || return 1
+  # shellcheck source=../../src/install_source.sh
+  source "$SRC_DIR/install_source.sh" || return 1
+  mkdir "$BOOT_CASE/build" "$BOOT_CASE/installed" || return 1
+  export BOOT_ROOT="$BOOT_CASE/build/toolchain" BOOT_BUN_CASE="$mode"
+  cat > "$BOOT_CASE/installed/bun" <<'BUN'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >> "$BOOT_CASE/probe-calls"
+case "$1" in
+  --version)
+    case "$BOOT_BUN_CASE" in
+      wrong-pin) echo 1.2.9 ;;
+      interrupted) exit 143 ;;
+      timeout) sleep 20 ;;
+      *) echo 1.2.3 ;;
+    esac ;;
+  --eval) [[ "$DSR_BOOTSTRAP_BUN_RANGE" == '^1.2.0' && "$BOOT_BUN_CASE" != wrong-range ]] ;;
+  *) exit 90 ;;
+esac
+BUN
+  chmod +x "$BOOT_CASE/installed/bun" || return 1
+  export PATH="$BOOT_CASE/installed:$PATH"
+  original_path="$PATH"
+  _ISB_INSTALL_TOOLCHAIN=true
+  local timeout=10
+  case "$mode" in
+    no-consent) _ISB_INSTALL_TOOLCHAIN=false ;;
+    timeout) timeout=1 ;;
+    invalid) printf '%s\n' '{"packageManager":"bun@"}' > "$BOOT_CASE/tree/package.json" ;;
+  esac
+  _isb_prepare_toolchain "$language" "$BOOT_CASE/tree" "$BOOT_CASE/build" "$timeout" \
+    > "$BOOT_CASE/out" 2> "$BOOT_CASE/log" || status=$?
+  case "$mode" in
+    wrong-pin|wrong-range)
+      [[ "$status" == 0 && "$(command -v bun)" == "$BOOT_ROOT/bun/bin/bun" ]] &&
+        jq -e '.version == "1.2.3" and .language == "bun"' "$BOOT_ROOT/receipt.json" >/dev/null ;;
+    compatible)
+      [[ "$status" == 0 && "$PATH" == "$original_path" && ! -e "$BOOT_CASE/requests" && ! -e "$BOOT_ROOT" ]] &&
+        grep -Fxq -- --eval "$BOOT_CASE/probe-calls" ;;
+    invalid)
+      [[ "$status" == 4 && ! -e "$BOOT_CASE/probe-calls" && ! -e "$BOOT_CASE/requests" && ! -e "$BOOT_ROOT" ]] ;;
+    interrupted|timeout)
+      [[ "$status" == 5 && ! -e "$BOOT_CASE/requests" && ! -e "$BOOT_ROOT" ]] ;;
+    no-consent)
+      [[ "$status" == 0 && ! -e "$BOOT_CASE/probe-calls" && ! -e "$BOOT_CASE/requests" && ! -e "$BOOT_ROOT" ]] ;;
+  esac
+)
+
 # ============================================================================
 # Main Test Runner
 # ============================================================================
@@ -1391,6 +1443,13 @@ main() {
   run_test "bootstrap_bun_pinned" test_bootstrap_bun_pinned
   run_test "bootstrap_bun_bad_hash" test_bootstrap_bun_bad_hash
   run_test "bootstrap_bun_incompatible_engine" test_bootstrap_bun_incompatible_engine
+  run_test "bootstrap_bun_installed_compatible" test_bootstrap_bun_installed compatible bun
+  run_test "bootstrap_bun_installed_wrong_pin" test_bootstrap_bun_installed wrong-pin bun
+  run_test "bootstrap_bun_installed_wrong_range" test_bootstrap_bun_installed wrong-range typescript
+  run_test "bootstrap_bun_installed_invalid_pin" test_bootstrap_bun_installed invalid bun
+  run_test "bootstrap_bun_installed_interrupted" test_bootstrap_bun_installed interrupted bun
+  run_test "bootstrap_bun_installed_timeout" test_bootstrap_bun_installed timeout bun
+  run_test "bootstrap_bun_installed_no_consent" test_bootstrap_bun_installed no-consent bun
 
   teardown
 

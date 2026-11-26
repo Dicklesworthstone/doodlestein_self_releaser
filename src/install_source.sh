@@ -854,8 +854,16 @@ _isb_probe_go() (
     go version
 )
 
+_isb_probe_bun() (
+    local expected="$2" observed
+    cd "$1" || return 4
+    observed=$(bun --version) || return $?
+    [[ "$observed" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && ( -z "$expected" || "$observed" == "$expected" ) ]] || return 1
+    _tc_bun_check_engine bun "$3"
+)
+
 # Activate an explicitly requested bootstrap when a compiler is unavailable,
-# or when an installed Go compiler is older than the pinned source requires.
+# or when an installed compiler cannot satisfy the pinned source requirements.
 # This runs inside _isb_compile's subshell, so PATH and language homes never
 # escape the source attempt or replace the caller's installed toolchain.
 _isb_prepare_toolchain() {
@@ -869,10 +877,7 @@ _isb_prepare_toolchain() {
     if command -v "$command" >/dev/null 2>&1 &&
        { [[ "$language" != rust ]] || command -v rustc >/dev/null 2>&1; }; then
         installed=true
-        if [[ "${_ISB_INSTALL_TOOLCHAIN:-false}" != true ||
-              ( "$language" != rust && "$language" != go ) ]]; then
-            return 0
-        fi
+        [[ "${_ISB_INSTALL_TOOLCHAIN:-false}" == true ]] || return 0
         if [[ "$language" == rust ]]; then
             # An unavailable rustup-selected compiler is a missing toolchain;
             # bootstrap privately instead of changing that rustup home.
@@ -887,7 +892,8 @@ _isb_prepare_toolchain() {
         return 3
     fi
     if ! declare -F toolchain_bootstrap >/dev/null 2>&1 ||
-       { [[ "$language" == go ]] && ! declare -F _tc_go_required_version >/dev/null 2>&1; }; then
+       { [[ "$language" == go ]] && ! declare -F _tc_go_required_version >/dev/null 2>&1; } ||
+       { [[ "$command" == bun ]] && ! declare -F _tc_bun_requirements >/dev/null 2>&1; }; then
         source_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || return 3
         [[ -f "$source_dir/toolchain_detect.sh" && ! -L "$source_dir/toolchain_detect.sh" ]] || return 3
         # shellcheck source=SCRIPTDIR/toolchain_detect.sh
@@ -919,6 +925,15 @@ _isb_prepare_toolchain() {
         else
             _isb_log 'The existing Go command is unavailable; preparing an isolated toolchain'
         fi
+    elif $installed && [[ "$command" == bun ]]; then
+        local requirements engine
+        requirements=$(_tc_bun_requirements "$tree") || return $?
+        required=$(jq -r '.version' <<< "$requirements") || return 4
+        engine=$(jq -r '.engine' <<< "$requirements") || return 4
+        _isb_run "$limit" "$output/toolchain-probe.log" _isb_probe_bun "$output" "$required" "$engine" || status=$?
+        ((status != 0)) || return 0
+        ((status != 5 && status < 128)) || return 5
+        _isb_log 'The existing Bun compiler cannot satisfy the selected package.json; preparing an isolated toolchain'
     fi
     root="$output/toolchain"
     _isb_log "Preparing a private $language toolchain; existing installations and profiles are preserved"

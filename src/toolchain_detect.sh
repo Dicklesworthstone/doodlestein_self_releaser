@@ -852,20 +852,36 @@ _tc_bootstrap_rust() {
     _TC_BOOTSTRAP_SHA="$expected"
 }
 
-_tc_bootstrap_bun() {
-    local tree="$1" root="$2" platform="$3" version engine target libc checksums expected actual member candidate
-    [[ -f "$tree/package.json" && ! -L "$tree/package.json" ]] || return 4
-    version=$(jq -ers '
+_tc_bun_requirements() {
+    local manifest="$1/package.json"
+    [[ -f "$manifest" && ! -L "$manifest" ]] || return 4
+    jq -ces '
+        def text: type == "string" and (test("[[:cntrl:]]") | not);
+        def release: test("^[0-9]+\\.[0-9]+\\.[0-9]+$");
         if length != 1 or (.[0]|type) != "object" then error("invalid package.json") else .[0] end |
-        (.packageManager // "") as $manager |
-        if ($manager|type) != "string" then error("invalid packageManager")
-        elif ($manager|startswith("bun@")) then $manager|ltrimstr("bun@") else "" end
-    ' "$tree/package.json") || return 4
-    engine=$(jq -er '.engines.bun // "" | if type == "string" then . else error("invalid Bun engine") end' "$tree/package.json") || return 4
-    if [[ -n "$version" && ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        _tc_log_error 'Bun packageManager must pin one released numeric version'; return 4
-    fi
-    [[ -n "$version" || ! "$engine" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || version="$engine"
+        (.packageManager | if . == null then "" else . end) as $manager |
+        (.engines.bun | if . == null then "" else . end) as $engine |
+        if ($manager|text|not) or ($engine|text|not) then error("invalid Bun compiler requirements")
+        elif ($manager|startswith("bun@")) then
+            ($manager|ltrimstr("bun@")) as $version |
+            if ($version|release) then {version:$version, engine:$engine}
+            else error("Bun packageManager must pin one released numeric version") end
+        else {version:(if ($engine|release) then $engine else "" end), engine:$engine} end
+    ' "$manifest" || return 4
+}
+
+_tc_bun_check_engine() {
+    [[ -n "$2" ]] || return 0
+    # Older Bun releases include an extra [eval] argument; pass the range as data.
+    DSR_BOOTSTRAP_BUN_RANGE="$2" "$1" --eval \
+        'if (!Bun.semver.satisfies(Bun.version, process.env.DSR_BOOTSTRAP_BUN_RANGE)) process.exit(1)'
+}
+
+_tc_bootstrap_bun() {
+    local tree="$1" root="$2" platform="$3" version engine requirements target libc checksums expected actual member candidate
+    requirements=$(_tc_bun_requirements "$tree") || return $?
+    version=$(jq -r '.version' <<< "$requirements") || return 4
+    engine=$(jq -r '.engine' <<< "$requirements") || return 4
     if [[ -z "$version" ]]; then
         _tc_bootstrap_fetch 'https://api.github.com/repos/oven-sh/bun/releases/latest' "$root/release.json" 8388608 || return $?
         version=$(jq -ers 'if length == 1 and (.[0].tag_name|type == "string" and test("^bun-v[0-9]+\\.[0-9]+\\.[0-9]+$"))
@@ -906,14 +922,9 @@ _tc_bootstrap_bun() {
     _TC_BOOTSTRAP_BIN="$root/bun/bin"
     _TC_BOOTSTRAP_VERSION=$("$_TC_BOOTSTRAP_BIN/bun" --version) || return 7
     [[ "$_TC_BOOTSTRAP_VERSION" == "$version" ]] || return 7
-    if [[ -n "$engine" ]]; then
-        # Bun before 1.3 included an extra [eval] argv entry. An invocation-only
-        # environment value preserves the same range across pinned versions.
-        DSR_BOOTSTRAP_BUN_RANGE="$engine" "$_TC_BOOTSTRAP_BIN/bun" --eval \
-            'if (!Bun.semver.satisfies(Bun.version, process.env.DSR_BOOTSTRAP_BUN_RANGE)) process.exit(1)' || {
-            _tc_log_error 'The selected Bun release does not satisfy package.json engines.bun'; return 7;
-        }
-    fi
+    (cd "$root" && _tc_bun_check_engine "$_TC_BOOTSTRAP_BIN/bun" "$engine") || {
+        _tc_log_error 'The selected Bun release does not satisfy package.json engines.bun'; return 7;
+    }
     _TC_BOOTSTRAP_SHA="$expected"
 }
 
