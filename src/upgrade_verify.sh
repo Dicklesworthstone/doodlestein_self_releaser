@@ -45,7 +45,7 @@ upgrade_verify_tool() (
     local version=""
     local build_from_source=false
     local dry_run=false
-    local structured=false
+    local structured=false installed_only=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -53,6 +53,7 @@ upgrade_verify_tool() (
             --build-from-source) build_from_source=true; shift ;;
             --dry-run) dry_run=true; shift ;;
             --json) structured=true; shift ;;
+            --installed-only) installed_only=true; shift ;;
             *) shift ;;
         esac
     done
@@ -97,6 +98,12 @@ upgrade_verify_tool() (
     elif [[ "$binary_name" != "$tool_name" ]] && command -v "$tool_name" &>/dev/null; then
         bin_path=$(command -v "$tool_name")
         log_debug "Found $tool_name at: $bin_path"
+    fi
+
+    # The module's no-argument JSON inventory only inspects installed tools.
+    if $installed_only && [[ -z "$bin_path" ]]; then
+        _upgrade_result error "Tool not found in PATH"
+        return 1
     fi
 
     # Track if we built from source (for cleanup)
@@ -238,10 +245,11 @@ upgrade_verify_tool() (
 
 # Verify upgrade command for all tools
 # Args: [--version <ver>] [--build-from-source] [--dry-run]
-upgrade_verify_all() {
+upgrade_verify_all() (
     local build_from_source=false
     local dry_run=false
     local version=""
+    local structured=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -250,6 +258,7 @@ upgrade_verify_all() {
                 version="$2"; shift 2 ;;
             --build-from-source) build_from_source=true; shift ;;
             --dry-run) dry_run=true; shift ;;
+            --json) structured=true; shift ;;
             *) shift ;;
         esac
     done
@@ -260,11 +269,25 @@ upgrade_verify_all() {
     $dry_run && args+=(--dry-run)
 
     local repos_dir="${ACT_REPOS_DIR:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.d}"
-    local results=()
+    local -a results=()
     local passed=0 failed=0 skipped=0
+    local row verify_status interrupted=false
+    _upgrade_all_report() {
+        $structured || return 0
+        printf '%s\n' ${results[@]+"${results[@]}"} |
+            jq -sc --argjson dry "$dry_run" --arg error "${1:-}" '
+                {mode:"all", dry_run:$dry, tools:., summary:{
+                    passed:map(select(.status == "passed"))|length,
+                    planned:map(select(.status == "planned"))|length,
+                    failed:map(select(.status == "failed" or .status == "error"))|length,
+                    interrupted:map(select(.status == "interrupted"))|length,
+                    skipped:map(select(.status == "skipped"))|length
+                }} + (if $error == "" then {} else {error:$error} end)'
+    }
 
     if [[ ! -d "$repos_dir" ]]; then
         log_error "repos.d directory not found: $repos_dir"
+        _upgrade_all_report "repos.d directory not found: $repos_dir"
         return 4
     fi
 
@@ -300,24 +323,47 @@ upgrade_verify_all() {
         if ! $has_upgrade; then
             log_debug "Skipping $tool_name: no update-check command"
             ((skipped++))
-            results+=("$(jq -nc --arg tool "$tool_name" '{tool: $tool, status: "skipped", reason: "no update-check command"}')")
+            if $structured; then
+                row=$(jq -nc --arg tool "$tool_name" '{tool:$tool, status:"skipped", reason:"no update-check command"}') || return 1
+                results+=("$row")
+            fi
             continue
         fi
 
-        local verify_status=0
-        if upgrade_verify_tool "$tool_name" ${args[@]+"${args[@]}"}; then
-            ((passed++))
-            results+=("$(jq -nc --arg tool "$tool_name" '{tool: $tool, status: "passed"}')")
+        verify_status=0
+        if $structured; then
+            row=$(upgrade_verify_tool "$tool_name" --json ${args[@]+"${args[@]}"}) || verify_status=$?
+            if ! row=$(jq -ces --arg tool "$tool_name" --argjson code "$verify_status" '
+                select(length == 1) | .[0] | select(type == "object" and .tool == $tool) |
+                .verification_exit_code = $code |
+                if $code == 5 then .status = "interrupted" else . end' <<< "$row"); then
+                # A missing receipt must never count as a passed check. Keep
+                # cancellation terminal even if formatting its evidence failed.
+                ((verify_status != 0)) || verify_status=1
+                row=$(jq -nc --arg tool "$tool_name" --argjson code "$verify_status" '
+                    {tool:$tool, status:(if $code == 5 then "interrupted" else "error" end),
+                     verification_exit_code:$code, error:"Could not read the verification result"}') || return "$verify_status"
+            fi
+            results+=("$row")
         else
-            verify_status=$?
+            upgrade_verify_tool "$tool_name" ${args[@]+"${args[@]}"} || verify_status=$?
+        fi
+        if [[ "$verify_status" == 0 ]]; then
+            ((passed++))
+        else
             if [[ "$verify_status" == 5 ]]; then
                 log_error "Upgrade verification interrupted; later tools were not started"
-                return 5
+                interrupted=true
+                break
             fi
             ((failed++))
-            results+=("$(jq -nc --arg tool "$tool_name" '{tool: $tool, status: "failed"}')")
         fi
     done
+
+    if $interrupted; then
+        _upgrade_all_report
+        return 5
+    fi
 
     # Summary
     if $dry_run; then
@@ -328,10 +374,12 @@ upgrade_verify_all() {
 
     if ((passed == 0 && failed == 0)); then
         log_error "No upgrade checks were selected"
+        _upgrade_all_report "No upgrade checks were selected"
         return 1
     fi
+    _upgrade_all_report || return 1
     [[ $failed -eq 0 ]]
-}
+)
 
 # Get upgrade verification results as JSON
 upgrade_verify_json() {
@@ -354,7 +402,7 @@ upgrade_verify_json() {
             $first || echo ","
             first=false
 
-            upgrade_verify_json "$tool_name" 2>/dev/null || true
+            upgrade_verify_tool "$tool_name" --json --installed-only 2>/dev/null || true
         done
 
         echo '], "platform": "'"$platform"'"}'

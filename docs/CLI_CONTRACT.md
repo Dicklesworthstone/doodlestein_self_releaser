@@ -3961,6 +3961,15 @@ automatic build for a missing binary. A dry run that would compile sets
 `details.build_planned` to true. The updater exit code is null until the check
 runs. Reporting the result never re-runs the updater.
 
+With `--all --json`, `details.tools` lists the repositories visited in order.
+Each selected tool includes its single-tool result and a
+`verification_exit_code`. The updater's own `exit_code` can be zero when an
+exact-version check fails. A skipped repository includes the reason.
+`details.summary` counts passed, planned, failed, skipped and interrupted
+checks. Source-build interruption returns 5 with the completed results and
+the interrupted tool; later repositories are absent because their checks
+never started.
+
 ---
 
 ### `dsr doctor`

@@ -495,6 +495,19 @@ test_cli_process_status_and_output_agree() {
     else
         fail "Large upgrade output was lost or the updater ran more than once"
     fi
+    ((TESTS_RUN++))
+    printf 'upgrade_check_args: [upgrade, --check]\n' > "$TEST_TMPDIR/repos.d/cli-verdict.yaml"
+    exec_run "$PROJECT_ROOT/dsr" --json verify upgrade --all --version 1.2.3
+    if [[ "$(exec_status)" == 0 && "$(wc -l < "$TEST_TMPDIR/check.calls")" -eq 2 ]] &&
+       exec_stdout | jq -es --rawfile report "$TEST_TMPDIR/check.stdout" '
+           length == 1 and (.[0] | .exit_code == 0 and .details.summary.passed == 1 and
+               (.details.tools | length == 1) and
+               (.details.tools[0] | .tool == "cli-verdict" and .verification_exit_code == 0 and
+                .output == ($report | rtrimstr("\n"))))' >/dev/null; then
+        pass "Bulk verification preserves the complete updater output in one row"
+    else
+        fail "Bulk verification dropped large output or repeated the updater"
+    fi
     unset DSR_UPGRADE_TEST_ROOT
     harness_teardown
 }
@@ -635,6 +648,25 @@ make_bulk_upgrade_config() {
     fi
 }
 
+test_module_json_inventory_does_not_build_missing_tools() {
+    ((TESTS_RUN++))
+    TEST_NAME=upgrade-inventory harness_setup
+    setup_module
+    make_bulk_upgrade_fixtures
+    make_bulk_upgrade_config bulk-source missing-updater true
+    local PATH="$TEST_TMPDIR/bin:$PATH"
+    exec_run upgrade_verify_json
+    if [[ "$(exec_status)" == 0 && ! -e "$TEST_TMPDIR/build.calls" && ! -e "$TEST_TMPDIR/check.calls" ]] &&
+       exec_stdout | jq -e '.tools | length == 1 and .[0].status == "error" and
+           .[0].error == "Tool not found in PATH"' >/dev/null; then
+        pass "Module JSON inventory preserves installed-only inspection"
+    else
+        fail "Module JSON inventory compiled a missing tool or lost its error"
+    fi
+    unset DSR_UPGRADE_BULK_ROOT
+    harness_teardown
+}
+
 test_cli_all_selection_and_options() {
     local scenario
     for scenario in version-mismatch version-match explicit-missing-dry explicit-source-dry \
@@ -735,6 +767,40 @@ test_cli_all_selection_and_options() {
                         .status == (if $code == 0 then "success" else "error" end) and
                         .details.mode == "all" and .details.dry_run == $dry)
                 ' <<< "$output" >/dev/null || problems+=("JSON verdict disagrees")
+                local skipped_count=0 selected_count=1
+                local version_index expected_version=""
+                for ((version_index=0; version_index<${#options[@]}; version_index++)); do
+                    if [[ "${options[version_index]}" == --version ]]; then
+                        expected_version="${options[version_index+1]#v}"
+                        break
+                    fi
+                done
+                case "$scenario" in
+                    mixed-capabilities) skipped_count=1 ;;
+                    no-updaters|no-updaters-dry) selected_count=0; skipped_count=1 ;;
+                    empty) selected_count=0 ;;
+                esac
+                jq -e --argjson skipped "$skipped_count" --argjson selected "$selected_count" \
+                    --arg version "$expected_version" \
+                    --argjson checks "$checks" --argjson expected "$expected" --argjson plan "$plan" \
+                    --argjson built "$([[ "$selected" == built && "$checks" -gt 0 ]] && echo true || echo false)" '
+                    .details | .tools as $tools | [$tools[] | select(.status != "skipped")] as $rows |
+                    (.summary == {
+                        passed:(if $expected == 0 and ($plan|not) then $selected else 0 end),
+                        planned:(if $plan then $selected else 0 end),
+                        failed:(if $expected != 0 then $selected else 0 end),
+                        skipped:$skipped, interrupted:0}) and
+                    ($tools|length) == $skipped + $selected and ($rows|length) == $selected and
+                    ([$tools[].tool] == ([$tools[].tool] | unique)) and
+                    all($tools[] | select(.status == "skipped"); .reason == "no update-check command") and
+                    all($rows[]; .verification_exit_code == $expected and .build_planned == $plan and
+                        .built_from_source == $built and
+                        .expected_version == (if $version == "" then null else $version end) and
+                        (if $checks > 0 then
+                            .exit_code == 0 and .latest_version == "1.2.3" and
+                            (.output | contains("Latest version: 1.2.3"))
+                         else .exit_code == null and .output == "" end))' \
+                    <<< "$output" >/dev/null || problems+=("per-tool receipts or summary disagree")
             fi
             if [[ "$expected" != 0 ]] &&
                grep -qiE 'verification PASSED for|All upgrade verifications passed' "$TEST_TMPDIR/$mode.stderr"; then
@@ -1575,7 +1641,13 @@ esac
         (case / 'stdout').write_bytes(result.stdout)
         (case / 'stderr').write_bytes(result.stderr)
         assert result.returncode == 5, (name, result.returncode, result.stderr.decode(errors='replace'))
-        assert json.loads(result.stdout)['exit_code'] == 5, name
+        report = json.loads(result.stdout)
+        assert report['exit_code'] == 5, name
+        assert report['details']['summary'] == dict(passed=0, planned=0, failed=0, skipped=0, interrupted=1), report
+        rows = report['details']['tools']
+        assert [row['tool'] for row in rows] == ['a-first'], rows
+        assert rows[0]['status'] == 'interrupted' and rows[0]['verification_exit_code'] == 5, rows
+        assert rows[0]['built_from_source'] is False and rows[0]['exit_code'] is None, rows
         assert len((case / 'build.calls').read_text().splitlines()) == 1, name + ': later tool built'
         assert not (case / 'updater.calls').exists(), name
         print('PASS: source upgrade recipe ' + name, flush=True)
@@ -1657,6 +1729,7 @@ test_cli_process_status_and_output_agree
 test_real_timeout_after_positive_output_fails
 test_cli_dry_run_runs_and_builds_nothing
 test_cli_all_selection_and_options
+test_module_json_inventory_does_not_build_missing_tools
 test_bun_source_upgrade
 test_rust_source_features
 test_source_recipe_layouts

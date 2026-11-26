@@ -20080,29 +20080,35 @@ _verify_upgrade() {
     [[ -n "$version" ]] && args+=("--version" "$version")
 
     if $all_tools; then
-        log_info "Verifying upgrade command for all tools..."
-
-        if upgrade_verify_all ${args[@]+"${args[@]}"}; then
-            local duration=$(($(date +%s) - start_time))
-            if $JSON_MODE; then
-                json_envelope "verify-upgrade" "success" 0 "{\"mode\": \"all\", \"dry_run\": $dry_run_flag, \"duration_seconds\": $duration}"
-            else
-                log_ok "All upgrade verifications passed"
-            fi
-            return 0
+        local all_status=0 all_outcome=success all_details="" duration
+        if $JSON_MODE; then
+            all_details=$(upgrade_verify_all --json ${args[@]+"${args[@]}"}) || all_status=$?
         else
-            local all_status=$? all_exit_code=1
-            [[ "$all_status" != 5 ]] || all_exit_code=5
-            local duration=$(($(date +%s) - start_time))
-            if $JSON_MODE; then
-                json_envelope "verify-upgrade" "error" "$all_exit_code" "{\"mode\": \"all\", \"dry_run\": $dry_run_flag, \"duration_seconds\": $duration}"
-            elif [[ "$all_exit_code" == 5 ]]; then
-                log_error "Upgrade verification interrupted"
-            else
-                log_error "Some upgrade verifications failed"
-            fi
-            return "$all_exit_code"
+            upgrade_verify_all ${args[@]+"${args[@]}"} || all_status=$?
         fi
+        case "$all_status" in
+            0) ;;
+            5) all_outcome=error ;;
+            *) all_outcome=error; all_status=1 ;;
+        esac
+        if $JSON_MODE; then
+            duration=$(($(date +%s) - start_time))
+            if ! all_details=$(jq -ces --argjson duration "$duration" '
+                select(length == 1) | .[0] | select(.mode == "all" and (.tools | type == "array")) |
+                .duration_seconds = $duration' <<< "$all_details"); then
+                [[ "$all_status" != 0 ]] || all_status=1
+                all_outcome=error
+                all_details="{\"mode\":\"all\",\"dry_run\":$dry_run_flag,\"duration_seconds\":$duration,\"error\":\"Could not assemble verification results\"}"
+            fi
+            json_envelope "verify-upgrade" "$all_outcome" "$all_status" "$all_details"
+        elif [[ "$all_status" == 0 ]]; then
+            log_ok "All upgrade verifications passed"
+        elif [[ "$all_status" == 5 ]]; then
+            log_error "Upgrade verification interrupted"
+        else
+            log_error "Some upgrade verifications failed"
+        fi
+        return "$all_status"
     fi
 
     if [[ -z "$tool_name" ]]; then
