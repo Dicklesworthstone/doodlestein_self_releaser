@@ -12523,18 +12523,17 @@ except (OSError, ValueError, KeyError, TypeError, IndexError) as error:
 PY
 }
 
-# Resolve only literal Cargo profile options through the shared command reader.
-# No compiler or worker/coordinator Cargo configuration is executed or loaded.
-# Empty output leaves the recipe's declared profile in charge of opaque builds.
-_act_cargo_explicit_profile() {
-    local build_cmd="$1" build_env="$2" script pair
+# Resolve a literal profile, or the default for a direct Cargo build. Opaque
+# recipes leave profile choice to the declaration. No worker tools are run.
+_act_cargo_output_profile() {
+    local build_cmd="$1" build_env="$2" implicit_profile="$3" script pair
     local -a pairs=()
     while IFS= read -r pair; do
         [[ -z "$pair" ]] && continue
         [[ "$pair" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || return 4
         pairs+=("$pair")
     done <<< "$build_env"
-    script=$(_act_toolchain_identity_script profile /dev/null "$build_cmd") || return 4
+    script=$(_act_toolchain_identity_script profile /dev/null "$build_cmd" "$implicit_profile") || return 4
     env -i "${pairs[@]}" "$BASH" -p -s <<< "$script"
 }
 
@@ -13923,6 +13922,7 @@ def invocation_selection():
 
     selections, commands, assigned_environment, context_change = [], [], set(), None
     output_profiles = []
+    direct_build = True
     for words in statements:
         # A redirection can occur anywhere in a simple command: arguments
         # after it still reach Cargo. Remove each operator/operand, preserving
@@ -13990,6 +13990,8 @@ def invocation_selection():
         if mode in ('routing', 'profile') and route_program in ('cargo', 'cross'):
             program = 'cargo'
         if program != 'cargo':
+            if program not in (':', 'true', 'false', 'echo', 'printf'):
+                direct_build = False
             if pathlib.PurePosixPath(program).name == 'cargo' or \
                     (program in ('rustup', 'sh', 'bash', 'zsh', 'dash', 'env', 'exec', 'eval', 'source', '.') and
                      any('cargo' in raw for raw in words[cursor:])):
@@ -14064,6 +14066,10 @@ def invocation_selection():
             produces = subcommand in ('build', 'rustc', 'zigbuild')
             if subcommand == 'xwin':
                 produces = cursor + 1 < len(argv) and argv[cursor + 1] in ('build', 'rustc')
+            if route_program != 'cargo' or subcommand not in (
+                    'build', 'rustc', 'check', 'test', 'fetch', 'metadata',
+                    'generate-lockfile', 'locate-project', 'pkgid', 'tree'):
+                direct_build = False
             if not produces:
                 continue
             profiles, index = [], cursor + 1
@@ -14161,10 +14167,11 @@ def invocation_selection():
         selections.append((selection, env, explicit_toolchain))
     if mode == 'profile':
         explicit_profiles = {profile for profile in output_profiles if profile is not None}
-        # An opaque script or a recipe without an explicit profile keeps its
-        # declared build_profile. Do not infer worker build.profile settings.
         if not explicit_profiles:
-            return None
+            # Cargo build/rustc defaults to dev. The caller supplies the
+            # declared override when present; unknown drivers retain the
+            # historical release fallback without guessing their output.
+            return extra if extra and output_profiles and direct_build and not context_change else None
         if context_change:
             fail('Cargo context changes inside build_cmd (' + context_change +
                  '); configure its environment/cwd outside the command')
@@ -15057,7 +15064,7 @@ act_run_native_build() {
     fi
 
     # Get build configuration
-    local local_path build_cmd build_env binary_name build_profile
+    local local_path build_cmd build_env binary_name build_profile declared_build_profile
     local config_file="$ACT_REPOS_DIR/${tool_name}.yaml"
 
     if [[ ! -f "$config_file" ]]; then
@@ -15089,7 +15096,8 @@ act_run_native_build() {
     # later in this backend. This remains a refusal, not RCH execution proof.
     dsr_native_rch_environment_policy "$platform" "$build_env" || return 4
     binary_name=$(yq -r '.binary_name // ""' "$config_file" 2>/dev/null)
-    build_profile=$(yq -r '.build_profile // "release"' "$config_file" 2>/dev/null)
+    declared_build_profile=$(yq -r '.build_profile // ""' "$config_file" 2>/dev/null) || return 4
+    build_profile="${declared_build_profile:-release}"
 
     local language
     language=$(yq -r '.language // ""' "$config_file" 2>/dev/null)
@@ -15200,14 +15208,14 @@ act_run_native_build() {
     fi
 
     if [[ "$language" == rust ]]; then
-        local explicit_cargo_profile
-        if ! explicit_cargo_profile=$(_act_cargo_explicit_profile "$build_cmd" "$build_env"); then
+        local cargo_profile
+        if ! cargo_profile=$(_act_cargo_output_profile "$build_cmd" "$build_env" "${declared_build_profile:-dev}"); then
             _log_error "Cannot resolve one native Cargo output profile; use a literal profile shared by every executable producer"
             return 4
         fi
-        if [[ -n "$explicit_cargo_profile" ]]; then
-            build_profile="$explicit_cargo_profile"
-            _log_info "Collecting the explicit Cargo profile: $build_profile"
+        if [[ -n "$cargo_profile" ]]; then
+            build_profile="$cargo_profile"
+            _log_info "Collecting Cargo profile: $build_profile"
         fi
         _act_cargo_profile_directory "$build_profile" >/dev/null || return 4
         if [[ -n "$strict_cache_contract" ]]; then
@@ -22303,7 +22311,7 @@ export -f act_list_tools act_build_matrix
 export -f act_get_build_cmd act_substitute_build_cmd_tokens act_get_build_env act_get_repo act_get_local_path
 export -f _act_materialized_source_path
 export -f act_get_build_env_value act_get_remote_artifact_path
-export -f _act_cargo_profile_directory _act_cargo_explicit_profile
+export -f _act_cargo_profile_directory _act_cargo_output_profile
 export -f _act_native_c_env_names _act_native_c_influence_regex
 export -f _act_go_ambient_env_names _act_go_pkg_config_env_regex _act_go_build_influence_json
 export -f _act_rust_sdk_influence_regex _act_unix_rust_sdk_env_cleanup

@@ -2008,9 +2008,11 @@ even when that profile inherits from `release`. Cargo's built-in `dev` and
 `test` profiles use `debug/`; `release` and `bench` use `release/`. The same
 selection applies to the primary executable, executable families, companions
 and strict cache identity. If a command has multiple executable-producing Cargo
-invocations, their explicit profiles must agree. Opaque scripts and commands
-without an explicit profile keep the recipe's `build_profile` (default
-`release`); declare that field when a script chooses its profile internally.
+invocations, their explicit profiles must agree. A direct `cargo build` or
+`cargo rustc` without a profile selector uses the configured `build_profile`,
+or Cargo's `dev` profile when the field is omitted. Opaque build scripts keep
+the `release` default. Set `build_profile` when a script chooses another
+profile internally.
 
 Linux Rust builds targeting `*-linux-gnu` — ordinary and strict
 release-contract builds alike — default to a **portable glibc floor of

@@ -159,6 +159,7 @@ run_case('custom-inherits-release', 'cargo build --locked --offline --profile sh
 run_case('built-in-dev', 'cargo build --locked --offline --profile dev', 'debug', declared='dev')
 run_case('built-in-bench', 'cargo build --locked --offline --profile bench', 'release', declared='bench')
 run_case('implicit-declared-dev', 'cargo build --locked --offline', 'debug', declared='dev')
+run_case('implicit-undeclared-family', 'cargo build --locked --offline --bins', 'debug', family=True)
 run_case('opaque-declared-ship', 'bash build-profile.sh', 'ship', declared='ship')
 run_case('complete-custom-family', 'cargo build --locked --offline --bins --profile=ship', 'ship', family=True)
 run_case('conflicting-producers',
@@ -3741,6 +3742,9 @@ yq() {
             ;;
         '.build_profile // "release"')
             echo "${MOCK_BUILD_PROFILE:-release}"
+            ;;
+        '.build_profile // ""')
+            echo "${MOCK_BUILD_PROFILE:-}"
             ;;
         '.strict_cargo_cache_root // ""')
             echo "${MOCK_STRICT_CARGO_CACHE_ROOT:-}"
