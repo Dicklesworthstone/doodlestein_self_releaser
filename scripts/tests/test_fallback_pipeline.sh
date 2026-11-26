@@ -170,6 +170,7 @@ signing_sign_batch() {
         if [[ "$SIGN_MODE" == corrupt ]]; then printf 'invalid\n' > "${1}.minisig"; fi
         if [[ "$SIGN_MODE" == mutate ]]; then printf 'mutated\n' >> "$1"; fi
         if [[ "$SIGN_MODE" == manifest ]]; then printf '\n' >> "$OUT/tool-v1.2.3-manifest.json"; fi
+        if [[ "$SIGN_MODE" == remove-marker ]]; then mv "$OUT/.dsr-build-purpose.json" "$CASE/previous-marker.json" || return 1; fi
         if [[ "$SIGN_MODE" == source ]]; then printf 'mutated by signer\n' >> "$(act_get_local_path tool)/src.txt"; fi
         if [[ "$SIGN_MODE" == submodule ]]; then printf 'mutated by signer\n' >> "$(act_get_local_path tool)/vendor/library/src.txt"; fi
         if [[ "$SIGN_MODE" == tag ]]; then git -C "$(act_get_local_path tool)" tag -f v1.2.3 "$OTHER_SHA" >/dev/null; fi
@@ -228,10 +229,10 @@ cmd_release() {
 seal_fixture_manifest() {
     local directory="$1" name=tool-v1.2.3-manifest.json digest
     digest=$(_release_sha256 "$directory/$name") || return 1
-    jq -nc --arg run "$RUN" --arg sha "$SOURCE_SHA" --arg name "$name" --arg digest "$digest" '
+    jq -ce --arg name "$name" --arg digest "$digest" '
         {publication_schema:1,publication_status:"completed",build_purpose:"release",
-         publishable:true,run_id:$run,git_sha:$sha,manifest_name:$name,manifest_sha256:$digest}
-    ' > "$directory/.dsr-build-purpose.json"
+         publishable:true,run_id:.run_id,git_sha:.source.git_sha,manifest_name:$name,manifest_sha256:$digest}
+    ' "$directory/$name" > "$directory/.dsr-build-purpose.json"
 }
 
 cmd_build() {
@@ -301,8 +302,8 @@ cmd_build() {
         {tool:"tool",version:"v1.2.3",status:"success",build_purpose:"release",publishable:true,
          run_id:$run,source:{git_sha:$source,git_ref:"v1.2.3"},
          summary:{total:2,success:2,failed:0},
-         artifacts:[{name:"daemon",sha256:$sha,size_bytes:$size},
-                    {name:"worker",sha256:$worker_sha,size_bytes:$worker_size}]}') || return 6
+         artifacts:[{name:"daemon",target:"linux/amd64",sha256:$sha,size_bytes:$size},
+                    {name:"worker",target:"darwin/arm64",sha256:$worker_sha,size_bytes:$worker_size}]}') || return 6
     case "$MANIFEST_MODE" in
         missing) ;;
         malformed) printf '{broken\n' > "$manifest" ;;
@@ -314,12 +315,18 @@ cmd_build() {
                 wrong-tool) body=$(jq '.tool="other"' <<< "$body") ;;
                 wrong-version) body=$(jq '.version="v9.0.0"' <<< "$body") ;;
                 wrong-source) body=$(jq '.source.git_sha=("f"*40)' <<< "$body") ;;
+                wrong-run) body=$(jq '.run_id="99999999-9999-4999-8999-999999999999"' <<< "$body") ;;
+                missing-native-target|cross-target-workflow) body=$(jq '.artifacts[1].target=.artifacts[0].target' <<< "$body") ;;
+                short-matrix) body=$(jq '.summary.total=1 | .summary.success=1' <<< "$body") ;;
                 duplicate) body=$(jq '.artifacts[1]=.artifacts[0]' <<< "$body") ;;
                 unsafe) body=$(jq '.artifacts[0].name="../foreign"' <<< "$body") ;;
                 diagnostic) body=$(jq '.publishable=false' <<< "$body") ;;
             esac
             printf '%s\n' "$body" > "$manifest"
+            if [[ "$BUILD_RC" == 0 ]]; then seal_fixture_manifest "$out" || return 4; fi
             case "$MANIFEST_MODE" in
+                missing-marker) mv "$out/.dsr-build-purpose.json" "$CASE/previous-marker.json" ;;
+                legacy-marker) printf '%s\n' '{"build_purpose":"release","publishable":true}' > "$out/.dsr-build-purpose.json" ;;
                 corrupt) printf 'different payload\n' > "$out/daemon" ;;
                 absent) mv "$out/worker" "$CASE/saved-worker" ;;
                 symlink) mv "$out/worker" "$CASE/saved-worker"; ln -s "$CASE/saved-worker" "$out/worker" ;;
@@ -329,9 +336,7 @@ cmd_build() {
             esac
             ;;
     esac
-    if [[ "$BUILD_RC" == 0 && "$MANIFEST_MODE" == valid ]]; then
-        seal_fixture_manifest "$out" || return 4
-    fi
+
     if [[ "$BUILD_MUTATES_SOURCE" == true ]]; then printf 'mutated by build\n' >> "$(act_get_local_path tool)/src.txt"; fi
     if [[ -n "${BUILD_MUTATES_PINNED_CHILD:-}" ]]; then
         local private_source
@@ -370,7 +375,7 @@ setup() {
 checkpoint() {
     local recipe_digest tasks='null'
     recipe_digest=$(_release_sha256 "$ACT_REPOS_DIR/tool.yaml") || return 1
-    if [[ "$1" == completed ]]; then
+    if [[ "$1" == completed || "${2:-}" == with-plan ]]; then
         # A completed workflow is reusable only with its original task and
         # event custody. Keep the real planner at this fixture boundary.
         tasks=$(_act_build_task_plan tool 1.2.3 '["linux/amd64","darwin/arm64"]' false) || return 1
@@ -905,6 +910,33 @@ test_resume_reaches_build() {
     setup resume; checkpoint failed; run_fallback --resume
     [[ "$RC" == 0 ]] && grep -q "^BUILD .*--resume=$RUN" "$CALLS" &&
         [[ $(grep -c '^STATE ' "$CALLS") == 1 ]]
+}
+
+test_managed_build_handoff() {
+    local status="$1" mode="$2" plan=""
+    local -a args=()
+    setup "managed-handoff-$status-$mode"
+    if [[ "$status" != fresh ]]; then
+        case "$mode" in
+            missing-native-target) act_platform_uses_act() { return 1; }; plan=with-plan ;;
+            cross-target-workflow) plan=with-plan ;;
+        esac
+        checkpoint "$status" "$plan" || return 1
+        args+=("--resume=$RUN")
+    fi
+    if [[ "$mode" == after-signing ]]; then SIGN_MODE=remove-marker
+    else MANIFEST_MODE="$mode"; fi
+    run_fallback "${args[@]}"
+    one_result && [[ ! -e "$CASE/lock" ]] && grep -q '^BUILD ' "$CALLS" || return 1
+    if [[ "$mode" == valid || "$mode" == cross-target-workflow ]]; then
+        [[ "$RC" == 0 ]] && grep -q '^RELEASE ' "$CALLS"
+    else
+        [[ "$RC" == 6 ]] && ! grep -q '^RELEASE ' "$CALLS" &&
+            jq -e '.details.phase=="verification" and .details.phases.verification=="failed" and
+                .details.phases.release=="blocked"' "$CASE/stdout" >/dev/null || return 1
+        if [[ "$mode" == after-signing ]]; then grep -q '^SIGN ' "$CALLS"
+        else ! grep -q '^SIGN ' "$CALLS"; fi
+    fi
 }
 
 # The public build command must produce the partial checkpoint consumed by the
@@ -2415,6 +2447,17 @@ for rc in 1 2 3 4 7 8 128 130; do run_test test_release_failure "$rc"; done
 for mode in draft missing-visibility wrong-tag wrong-repo malformed; do run_test test_release_requires_public_confirmation "$mode"; done
 run_test test_release_public_confirmation_completes
 run_test test_resume_reaches_build
+run_test test_managed_build_handoff fresh missing-marker
+run_test test_managed_build_handoff fresh after-signing
+run_test test_managed_build_handoff partial wrong-run
+run_test test_managed_build_handoff targets-complete wrong-source
+run_test test_managed_build_handoff failed short-matrix
+run_test test_managed_build_handoff targets-complete missing-native-target
+run_test test_managed_build_handoff targets-complete cross-target-workflow
+run_test test_managed_build_handoff partial missing-marker
+run_test test_managed_build_handoff targets-complete legacy-marker
+run_test test_managed_build_handoff running after-signing
+run_test test_managed_build_handoff targets-complete valid
 run_test test_partial_resume_real_workers
 run_test test_partial_resume_real_workers pending-publication
 run_test test_preserves_caller_state

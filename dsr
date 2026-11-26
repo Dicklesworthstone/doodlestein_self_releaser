@@ -15498,7 +15498,7 @@ EOF
     local manifest_sha name sha size actual_sha actual_size
     local -a payload_paths=()
     if [[ ! -f "$manifest_file" || -L "$manifest_file" ]] ||
-       ! _release_require_publishable_artifacts "$output_dir" "$manifest_file" false "$reuse_completed" ||
+       ! _release_require_publishable_artifacts "$output_dir" "$manifest_file" false true ||
        ! manifest_json=$(jq -cse --arg tool "$tool_name" --arg tag "$tag" '
             if length == 1 and (.[0] |
                 type == "object" and .tool == $tool and .version == $tag and
@@ -15529,18 +15529,20 @@ EOF
         _fallback_result 6 verification "Source changed during the build; expected workflow commit is no longer available"
         return 6
     fi
-    if $reuse_completed && ! jq -e --arg run "$resume_run_id" \
+    if $resume && ! jq -e --arg run "$resume_run_id" \
         --slurpfile state /dev/fd/3 '
             ($state | if length == 1 then .[0] else error("exactly one resumed build state required") end) as $state |
             .run_id == $run and .source.git_sha == $state.git_sha and
             .summary.total == (($state.context.build_tasks // $state.targets) | length) and
             (. as $manifest | all(($state.context.build_tasks // [])[];
-                if .method == "native" and (.target_triple | type == "string" and length > 0) then
+                if .method == "native" then
                     . as $task | any($manifest.artifacts[];
-                        .target == $task.platform and .target_triple == $task.target_triple)
+                        .target == $task.platform and
+                        (($task.target_triple // "") == "" or .target_triple == $task.target_triple))
                 else true end))
         ' 3<<< "$resume_state" <<< "$manifest_json" >/dev/null; then
-        _fallback_result 6 verification "Manifest does not belong to the completed build run"
+        verification_status="failed"; release_status="blocked"
+        _fallback_result 6 verification "Manifest does not match the resumed build run, source commit, or target matrix"
         return 6
     fi
     while IFS=$'\t' read -r name sha size; do
@@ -15626,11 +15628,11 @@ EOF
     done < <(jq -r '.artifacts[] | [.name,.sha256,(.size_bytes|tostring)] | @tsv' <<< "$manifest_json")
     if [[ "$(_release_sha256 "$manifest_file")" != "$manifest_sha" ]] ||
        ! _act_repo_config_matches "$tool_name" "$fallback_repo_config_sha256" ||
-       { $reuse_completed && { ! _fallback_verify_completed_source ||
-           ! _release_require_publishable_artifacts "$output_dir" "$manifest_file" false true; }; } ||
+       ! _release_require_publishable_artifacts "$output_dir" "$manifest_file" false true ||
+       { $reuse_completed && ! _fallback_verify_completed_source; } ||
        ! _fallback_verify_expected_source; then
         verification_status="failed"; release_status="blocked"
-        _fallback_result 6 verification "Manifest, repository recipe, or completed source changed before release"
+        _fallback_result 6 verification "Publication receipt, manifest, repository recipe, or source changed before release"
         return 6
     fi
 
