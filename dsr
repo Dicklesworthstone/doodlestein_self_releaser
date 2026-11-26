@@ -20102,27 +20102,11 @@ _verify_upgrade() {
         return 4
     fi
 
-    # Run the update check exactly once. The structured runner reports the
-    # check's output and versions, but it neither builds nor dry-runs, so
-    # those cases (and a binary missing from PATH, which the plain runner
-    # builds) go through upgrade_verify_tool and report its verdict.
     local verify_status=0 details=""
-    local binary_name
-    binary_name=$(_upgrade_tool_binary_name "$tool_name")
-    if $JSON_MODE && ! $dry_run_flag && ! $build_from_source &&
-       { command -v "$binary_name" &>/dev/null || command -v "$tool_name" &>/dev/null; }; then
+    if $JSON_MODE; then
         details=$(upgrade_verify_json "$tool_name" ${args[@]+"${args[@]}"}) || verify_status=$?
     else
         upgrade_verify_tool "$tool_name" ${args[@]+"${args[@]}"} || verify_status=$?
-        local outcome="passed"
-        if [[ $verify_status -ne 0 ]]; then
-            outcome="failed"
-        elif $dry_run_flag; then
-            outcome="planned"
-        fi
-        details=$(jq -nc --arg tool "$tool_name" --arg status "$outcome" \
-            --argjson dry_run "$dry_run_flag" --argjson built "$build_from_source" \
-            '{tool: $tool, status: $status, dry_run: $dry_run, built_from_source: $built}')
     fi
     local exit_code=0
     if [[ $verify_status -eq 4 ]]; then

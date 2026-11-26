@@ -475,6 +475,28 @@ test_cli_process_status_and_output_agree() {
     check_cli_verdict healthy-no-update 0 0 $'Latest version: 1.2.3\nNo update available\n' ''
     check_cli_verdict healthy-generic 0 0 $'Check completed.\n' '' ''
     check_cli_verdict healthy-silent 0 0 '' '' ''
+
+    ((TESTS_RUN++))
+    TEST_NAME=upgrade-large-output harness_setup
+    setup_module
+    make_verdict_tool '' '' 0
+    # Exceed Linux's per-argument limit. Keep the diagnostics and the final
+    # exact version in one receipt without passing the output in jq's argv.
+    head -c 160000 /dev/zero | tr '\0' x > "$TEST_TMPDIR/check.stdout"
+    printf '\nLatest version: 1.2.3\n' >> "$TEST_TMPDIR/check.stdout"
+    local PATH="$TEST_TMPDIR/bin:$PATH"
+    exec_run "$PROJECT_ROOT/dsr" --json verify upgrade cli-verdict --version 1.2.3
+    if [[ "$(exec_status)" == 0 && "$(wc -l < "$TEST_TMPDIR/check.calls")" -eq 1 ]] &&
+       exec_stdout | jq -es --rawfile report "$TEST_TMPDIR/check.stdout" '
+            length == 1 and (.[0] | .exit_code == 0 and
+                (.details | .latest_version == "1.2.3" and .built_from_source == false and
+                 .exit_code == 0 and .output == ($report | rtrimstr("\n"))))' >/dev/null; then
+        pass "Large upgrade output is retained in a single JSON receipt"
+    else
+        fail "Large upgrade output was lost or the updater ran more than once"
+    fi
+    unset DSR_UPGRADE_TEST_ROOT
+    harness_teardown
 }
 
 test_real_timeout_after_positive_output_fails() {
@@ -540,6 +562,12 @@ EOF
     [[ "$(exec_status)" -eq 0 ]] || problems+=("build dry-run exit $(exec_status)")
     [[ ! -e "$TEST_TMPDIR/cargo.calls" ]] || problems+=("dry run invoked cargo: $(cat "$TEST_TMPDIR/cargo.calls")")
     exec_stderr_contains "Would build cli-src from source" || problems+=("no build plan on stderr")
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$PROJECT_ROOT/dsr" --json verify upgrade cli-src --build-from-source --dry-run
+    [[ "$(exec_status)" -eq 0 ]] && exec_stdout | jq -e '
+        .details | .status == "planned" and .build_planned == true and
+        .built_from_source == false and .exit_code == null and .output == ""
+    ' >/dev/null || problems+=("JSON dry run claimed an executed build or updater")
+    [[ ! -e "$TEST_TMPDIR/cargo.calls" ]] || problems+=("JSON dry run invoked cargo")
 
     if [[ ${#problems[@]} -eq 0 ]]; then
         pass "verify upgrade --dry-run neither runs the check nor builds"
@@ -1341,21 +1369,29 @@ def fixture(name, language):
                   upgrade_check_args=['update', '--check'])
     return case, source, env, config
 
-def invoke(case, env, config, expected=0, ran=True, extra=()):
+def invoke(case, env, config, expected=0, ran=True, extra=(), force_build=True):
     write(case / 'config/repos.d/layout.yaml', json.dumps(config))
     result = subprocess.run([str(project / 'dsr'), '--json', 'verify', 'upgrade', 'layout',
-                             '--build-from-source', '--version', '1.2.3', *extra],
+                             *(['--build-from-source'] if force_build else []), '--version', '1.2.3', *extra],
                             cwd=project, env=env, capture_output=True, timeout=45)
     (case / 'stdout').write_bytes(result.stdout)
     (case / 'stderr').write_bytes(result.stderr)
     assert result.returncode == expected, (case.name, result.returncode, result.stderr.decode(errors='replace'))
     envelope = json.loads(result.stdout)
     assert envelope['command'] == 'verify-upgrade' and envelope['exit_code'] == expected, (case.name, envelope)
+    receipt = envelope['details']
+    assert receipt['built_from_source'] is ran and receipt['build_planned'] is False, (case.name, receipt)
+    assert receipt['binary'] == config['binary_name'] and receipt['expected_version'] == '1.2.3', receipt
+    assert receipt['status'] == ('passed' if expected == 0 else 'failed'), receipt
+    assert receipt['found_asset'] is (expected == 0), receipt
     calls = case / 'updater.calls'
     if ran:
         assert calls.read_text() == 'selected\n', (case.name, calls.read_text())
+        assert receipt['exit_code'] == 0 and receipt['latest_version'] == '1.2.3', receipt
+        assert 'Latest version: 1.2.3' in receipt['output'], receipt
     else:
         assert not calls.exists(), case.name + ': updater ran after refusal or interruption'
+        assert receipt['exit_code'] is None and receipt['latest_version'] is None and receipt['output'] == '', receipt
     assert not (case / 'shared-cargo-target').exists(), case.name + ': shared Cargo outputs were modified'
     print('PASS: source upgrade recipe ' + case.name, flush=True)
 
@@ -1407,7 +1443,7 @@ if go:
         elif name == 'go-unsafe-subdir':
             config['source_subdir'] = '../outside'
             expected = 1
-        invoke(case, env, config, expected, ran=expected == 0)
+        invoke(case, env, config, expected, ran=expected == 0, force_build=name != 'go-conventional-entry')
         real_cases += 1
 else:
     print('INFO: genuine Go compiler unavailable; Go source layout cases skipped', flush=True)
@@ -1466,7 +1502,7 @@ exec "$DSR_LAYOUT_REAL_CARGO" "$@"
             expected = 1
         write(crate / 'Cargo.toml', manifest)
         write(crate / 'main.rs', code)
-        invoke(case, env, config, expected, ran=expected == 0)
+        invoke(case, env, config, expected, ran=expected == 0, force_build=name != 'rust-local-no-lock')
         real_cases += 1
     # A fresh Bash imports the exported builder while running outside src/.
     # A misleading cwd-local module must never become the implementation.

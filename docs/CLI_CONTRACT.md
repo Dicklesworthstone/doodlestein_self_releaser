@@ -3938,8 +3938,12 @@ Compilation produces a fresh temporary executable and does not replace an
 installed tool or provision a compiler. This verifies
 the primary updater; it does not build or install a complete release family.
 `--dry-run` reports the planned build and check without executing them. JSON
-mode preserves the command's success or failure and does not run the updater a
-second time to assemble its response.
+mode reports the same updater output, process exit code and expected/observed
+versions for installed binaries and fresh source builds. In a single-tool
+response, `details.built_from_source` records a completed build, including an
+automatic build for a missing binary. A dry run that would compile sets
+`details.build_planned` to true. The updater exit code is null until the check
+runs. Reporting the result never re-runs the updater.
 
 ---
 

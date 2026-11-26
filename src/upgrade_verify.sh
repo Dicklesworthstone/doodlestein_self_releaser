@@ -38,19 +38,21 @@ UPGRADE_VERIFY_TIMEOUT=30
 # Verify upgrade command works for a tool
 # Args: tool_name [--version <ver>] [--build-from-source]
 # Returns: 0 on success, 1 on failure
-upgrade_verify_tool() {
+upgrade_verify_tool() (
     local tool_name="${1:-}"
     shift 1 2>/dev/null || true
 
     local version=""
     local build_from_source=false
     local dry_run=false
+    local structured=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --version|-V) version="$2"; shift 2 ;;
+            --version|-V) [[ $# -ge 2 ]] || return 4; version="$2"; shift 2 ;;
             --build-from-source) build_from_source=true; shift ;;
             --dry-run) dry_run=true; shift ;;
+            --json) structured=true; shift ;;
             *) shift ;;
         esac
     done
@@ -64,6 +66,26 @@ upgrade_verify_tool() {
 
     local binary_name
     binary_name=$(_upgrade_tool_binary_name "$tool_name")
+    local built=false build_planned=false output="" exit_code=null latest_version="" platform
+    platform="$(uname -s | tr '[:upper:]' '[:lower:]')/$(uname -m)"
+
+    # Both public output modes report the same attempt. A check that never
+    # started has no updater exit code, including planned and failed builds.
+    _upgrade_result() {
+        local verdict="$1" error="${2:-}"
+        $structured || return 0
+        printf '%s' "$output" | jq -Rsc --arg tool "$tool_name" --arg binary "$binary_name" \
+            --arg platform "$platform" --arg status "$verdict" --arg error "$error" \
+            --arg expected "${version#v}" --arg latest "$latest_version" \
+            --argjson dry_run "$dry_run" --argjson built "$built" \
+            --argjson plan "$build_planned" --argjson code "$exit_code" '
+            {tool:$tool, binary:$binary, platform:$platform, status:$status,
+             dry_run:$dry_run, built_from_source:$built, build_planned:$plan,
+             found_asset:($status == "passed"), exit_code:$code,
+             expected_version:(if $expected == "" then null else $expected end),
+             latest_version:(if $latest == "" then null else $latest end), output:.}
+             + (if $error == "" then {} else {error:$error} end)'
+    }
 
     # Find the tool binary
     local bin_path=""
@@ -87,12 +109,14 @@ upgrade_verify_tool() {
 
         if [[ -z "$repo_dir" || ! -d "$repo_dir" ]]; then
             log_error "Repository not found for $tool_name"
+            _upgrade_result error "Repository not found for $tool_name"
             return 1
         fi
 
         if $dry_run; then
             # A dry run reports the build; it does not compile anything.
             log_info "[DRY RUN] Would build $binary_name from source in $repo_dir"
+            build_planned=true
             bin_path="<$binary_name built from $repo_dir>"
         else
             log_info "Building $binary_name from source for $tool_name..."
@@ -102,6 +126,7 @@ upgrade_verify_tool() {
             if [[ "$build_status" != 0 || -z "$bin_path" || ! -f "$bin_path" ||
                   ! -x "$bin_path" || -L "$bin_path" ]]; then
                 log_error "Failed to build $binary_name for $tool_name"
+                _upgrade_result failed "Failed to build $binary_name for $tool_name"
                 if ((build_status == 5 || build_status == 124 || (build_status >= 129 && build_status <= 255))); then
                     return 5
                 fi
@@ -110,11 +135,13 @@ upgrade_verify_tool() {
 
             # Track the tmpdir for cleanup (bin_path is like /tmp/xxx/tool)
             built_tmpdir=$(dirname "$bin_path")
+            built=true
         fi
     fi
 
     if [[ -z "$bin_path" ]]; then
         log_error "$binary_name not found in PATH and --build-from-source not specified"
+        _upgrade_result error "$binary_name not found"
         return 1
     fi
 
@@ -122,6 +149,7 @@ upgrade_verify_tool() {
     if ! check_args_output=$(_upgrade_check_args "$tool_name"); then
         log_error "Invalid upgrade_check_args configuration for $tool_name"
         [[ -n "$built_tmpdir" ]] && rm -rf "$built_tmpdir"
+        _upgrade_result error "Invalid upgrade_check_args configuration"
         return 4
     fi
 
@@ -134,15 +162,16 @@ upgrade_verify_tool() {
 
     # Run upgrade check
     log_info "Running upgrade check..."
-    local output exit_code=0
-
     if $dry_run; then
         log_info "[DRY RUN] Would run: $check_command"
         [[ -n "$built_tmpdir" ]] && rm -rf "$built_tmpdir"
-        return 0
+        _upgrade_result planned
+        return $?
     fi
 
+    exit_code=0
     output=$(run_with_timeout "$UPGRADE_VERIFY_TIMEOUT" "$bin_path" "${check_args[@]}" 2>&1) || exit_code=$?
+    latest_version=$(_upgrade_extract_latest_version "$output")
 
     # Informational output can precede a failed request or a timeout. Check the
     # actual process result before announcing an update or accepting its version.
@@ -151,11 +180,11 @@ upgrade_verify_tool() {
         log_error "Exit code: $exit_code"
         log_error "Output: $output"
         [[ -n "$built_tmpdir" ]] && rm -rf "$built_tmpdir"
+        _upgrade_result failed
         return 1
     fi
 
     local current_version=""
-    local latest_version=""
 
     # Check for common success patterns
     # Here-strings keep `grep -q` from SIGPIPE-ing a writer of large output,
@@ -170,7 +199,6 @@ upgrade_verify_tool() {
 
     # Extract versions if present (using portable grep -oE)
     current_version=$(echo "$output" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
-    latest_version=$(_upgrade_extract_latest_version "$output")
 
     if [[ -n "$current_version" ]]; then
         log_debug "Current version: $current_version"
@@ -186,27 +214,27 @@ upgrade_verify_tool() {
             log_error "Expected latest version: $expected_version"
             log_error "Observed latest version: ${latest_version:-<none>}"
             [[ -n "$built_tmpdir" ]] && rm -rf "$built_tmpdir"
+            _upgrade_result failed
             return 1
         fi
         log_ok "$tool_name update check resolved exact version $expected_version"
     fi
 
     # Build result
-    local platform
-    platform="$(uname -s | tr '[:upper:]' '[:lower:]')/$(uname -m)"
+    # Preserve the reported uname platform; normalize the human-facing label.
+    local display_platform="$platform"
     case "$platform" in
-        linux/x86_64) platform="linux/amd64" ;;
-        linux/aarch64) platform="linux/arm64" ;;
-        darwin/arm64) platform="darwin/arm64" ;;
-        darwin/x86_64) platform="darwin/amd64" ;;
+        linux/x86_64) display_platform="linux/amd64" ;;
+        linux/aarch64) display_platform="linux/arm64" ;;
+        darwin/x86_64) display_platform="darwin/amd64" ;;
     esac
 
     # Cleanup built binary tmpdir
     [[ -n "$built_tmpdir" ]] && rm -rf "$built_tmpdir"
 
-    log_ok "Upgrade verification PASSED for $tool_name on $platform"
-    return 0
-}
+    log_ok "Upgrade verification PASSED for $tool_name on $display_platform"
+    _upgrade_result passed
+)
 
 # Verify upgrade command for all tools
 # Args: [--version <ver>] [--build-from-source] [--dry-run]
@@ -308,100 +336,14 @@ upgrade_verify_all() {
 # Get upgrade verification results as JSON
 upgrade_verify_json() {
     local tool_name="${1:-}"
-    local build_from_source=false
-    local version=""
-
     shift || true
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --build-from-source) build_from_source=true; shift ;;
-            --version|-V) version="$2"; shift 2 ;;
-            *) shift ;;
-        esac
-    done
-
-    local status=0
-    local output exit_code=0 platform
-
-    platform="$(uname -s | tr '[:upper:]' '[:lower:]')/$(uname -m)"
-
     if [[ -n "$tool_name" ]]; then
-        # Single tool
-        local binary_name
-        binary_name=$(_upgrade_tool_binary_name "$tool_name")
-
-        local bin_path
-        bin_path=$(command -v "$binary_name" 2>/dev/null || echo "")
-        if [[ -z "$bin_path" && "$binary_name" != "$tool_name" ]]; then
-            bin_path=$(command -v "$tool_name" 2>/dev/null || echo "")
-        fi
-
-        if [[ -z "$bin_path" ]]; then
-            jq -nc \
-                --arg tool "$tool_name" \
-                --arg binary "$binary_name" \
-                --arg platform "$platform" \
-                '{tool: $tool, binary: $binary, status: "error", error: "Tool not found in PATH", platform: $platform}'
-            return 1
-        fi
-
-        local check_args_output
-        if ! check_args_output=$(_upgrade_check_args "$tool_name"); then
-            jq -nc \
-                --arg tool "$tool_name" \
-                --arg platform "$platform" \
-                '{tool: $tool, status: "error", error: "Invalid upgrade_check_args configuration", platform: $platform}'
-            return 4
-        fi
-
-        local -a check_args=()
-        mapfile -t check_args <<< "$check_args_output"
-
-        output=$(run_with_timeout "$UPGRADE_VERIFY_TIMEOUT" "$bin_path" "${check_args[@]}" 2>&1) || exit_code=$?
-
-        local found_asset=false
-        local latest_version
-        latest_version=$(_upgrade_extract_latest_version "$output")
-        if _upgrade_check_succeeded "$exit_code" "$output"; then
-            found_asset=true
-            status=0
-        else
-            found_asset=false
-            status=1
-        fi
-
-        local expected_version="${version#v}"
-        if [[ -n "$version" && "$latest_version" != "$expected_version" ]]; then
-            found_asset=false
-            status=1
-        fi
-
-        local result_status
-        result_status=$([ $status -eq 0 ] && echo "passed" || echo "failed")
-        jq -nc \
-            --arg tool "$tool_name" \
-            --arg result_status "$result_status" \
-            --arg platform "$platform" \
-            --argjson found_asset "$found_asset" \
-            --argjson exit_code "${exit_code:-0}" \
-            --arg expected_version "$expected_version" \
-            --arg latest_version "$latest_version" \
-            --arg output "$output" \
-            '{
-                tool: $tool,
-                status: $result_status,
-                platform: $platform,
-                found_asset: $found_asset,
-                exit_code: $exit_code,
-                expected_version: (if $expected_version == "" then null else $expected_version end),
-                latest_version: (if $latest_version == "" then null else $latest_version end),
-                output: $output
-            }'
-        return $status
+        upgrade_verify_tool "$tool_name" --json "$@"
     else
         # All tools
         echo '{"tools": ['
-        local first=true
+        local first=true platform config_file
+        platform="$(uname -s | tr '[:upper:]' '[:lower:]')/$(uname -m)"
         local repos_dir="${ACT_REPOS_DIR:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.d}"
 
         for config_file in "$repos_dir"/*.yaml; do
