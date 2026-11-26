@@ -12,7 +12,8 @@
 #   [--subdir relative/path] [--entry relative/path] [--package cargo_package]
 #   [--bin name ...] [--timeout seconds] [--install-toolchain]
 #   [--feature cargo_feature ...] [--no-default-features] (Rust only)
-# Timeout applies to each fetch/compiler command, including its children.
+# Timeout applies to acquisition, each complete source-verification pass and
+# each compiler command, including their children.
 # stdout: one receipt JSON after a successful build; stderr: progress/errors.
 # Exit: 3 missing dependency, 4 invalid input, 5 timeout/interruption,
 #       6 build failure, 7 distribution verification, 8 retrieval failure,
@@ -505,6 +506,16 @@ _isb_verify_source_graph() {
     done <<< "$rows"
     _isb_sha256 "$manifest"
 }
+
+# _isb_run combines command output and diagnostics in its retained log. The
+# caller reserves descriptor 9 for the fingerprint's command-substitution pipe;
+# keep this authenticated value in memory rather than a build-writable file.
+# Only a successful whole verification may supply the before/after identity.
+_isb_capture_source_graph() (
+    # Keep every Git/hash subprocess in the watchdog's owned process group.
+    set +m
+    _isb_verify_source_graph "$@" >&9
+)
 
 _isb_in_dir() ( cd "$1" && shift && "$@" )
 
@@ -2133,9 +2144,16 @@ install_source_build() (
     _isb_run "$limit" "$destination/fetch.log" _isb_checkout_source "$repo" "$ref" "$tree" "$graph_dir" || {
         status=$?; case "$status" in 1|3|4|5) return "$status" ;; *) return 8 ;; esac
     }
-    commit=$(_isb_git -C "$tree" -c "core.worktree=$tree" rev-parse --verify 'HEAD^{commit}') || return 8
     _ISB_SOURCE_GRAPH=$(jq -ce '.' "$graph_dir/repositories.json") || return 8
-    source_state=$(_isb_verify_source_graph "$tree" "$_ISB_SOURCE_GRAPH" "$graph_dir" initial) || return $?
+    # Acquisition already records the root commit under its deadline. The
+    # bounded initial verification below checks that same commit against HEAD
+    # and the actual tracked bytes; do not run another unsupervised Git read.
+    commit=$(jq -er '.[0] | select(.path == "") | .source_commit |
+        select(type == "string" and test("^([0-9a-f]{40}|[0-9a-f]{64})$"))' \
+        <<< "$_ISB_SOURCE_GRAPH") || return 8
+    source_state=$(_isb_run "$limit" "$destination/verify-initial.log" \
+        _isb_capture_source_graph "$tree" "$_ISB_SOURCE_GRAPH" "$graph_dir" initial 9>&1) || return $?
+    [[ "$source_state" =~ ^[0-9a-f]{64}$ ]] || return 6
     _isb_path_in_tree "$tree" "$subdir" && [[ -d "$tree/$subdir" ]] || return 4
     local build_root _ISB_CHECKOUT_ROOT="$tree"
     build_root=$(cd "$tree/$subdir" && pwd -P) || return 4
@@ -2144,7 +2162,9 @@ install_source_build() (
         ${cargo_options[@]+"${cargo_options[@]}"} "${binaries[@]}") || return $?
     # Preserve the source pin through compilation. Build scripts may not move
     # HEAD or modify tracked inputs and then claim they built the pinned tree.
-    final_source_state=$(_isb_verify_source_graph "$tree" "$_ISB_SOURCE_GRAPH" "$graph_dir") || return $?
+    final_source_state=$(_isb_run "$limit" "$destination/verify-final.log" \
+        _isb_capture_source_graph "$tree" "$_ISB_SOURCE_GRAPH" "$graph_dir" verify 9>&1) || return $?
+    [[ "$final_source_state" =~ ^[0-9a-f]{64}$ ]] || return 6
     [[ "$final_source_state" == "$source_state" ]] || {
         _isb_log 'Build changed tracked source bytes, links or executable modes'; return 6;
     }

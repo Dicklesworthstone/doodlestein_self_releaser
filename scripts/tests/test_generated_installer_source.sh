@@ -10,8 +10,8 @@ ROOT="${DSR_TEST_ROOT:-$ROOT}"
 TEST_MODE="${1:-}"
 [[ $# -eq 0 || ( $# -eq 1 && ( "$TEST_MODE" == --go-workspace-bootstrap-only ||
     "$TEST_MODE" == --libc-source-fallback-only || "$TEST_MODE" == --acquisition-fallback-only ||
-    "$TEST_MODE" == --github-timeout-only ) ) ]] || {
-    printf 'Usage: %s [--go-workspace-bootstrap-only|--libc-source-fallback-only|--acquisition-fallback-only|--github-timeout-only]\n' "$0" >&2
+    "$TEST_MODE" == --github-timeout-only || "$TEST_MODE" == --source-verification-timeout-only ) ) ]] || {
+    printf 'Usage: %s [--go-workspace-bootstrap-only|--libc-source-fallback-only|--acquisition-fallback-only|--github-timeout-only|--source-verification-timeout-only]\n' "$0" >&2
     exit 4
 }
 for dependency in git jq go tar; do
@@ -300,6 +300,33 @@ GH
 cat > "$TEMP/bin/git" <<'GIT'
 #!/usr/bin/env bash
 printf 'git %s\n' "$*" >> "$CALLS"
+# Only the verification-time Git read is faulted. Source fetch, all other Git
+# commands and healthy hashing are genuine; GIT_DIR is set by the production
+# raw-source verifier and is absent from the acquisition helper's environment.
+fault="${SOURCE_VERIFICATION_FAULT:-}"
+if [[ -n "$fault" && " $* " == *' hash-object --no-filters -- '* &&
+      ( "${GIT_DIR:-}" == */source/.git || "${GIT_DIR:-}" == */source/./.git ) ]]; then
+    phase=initial
+    [[ ! -f "$CALLS.compiled" ]] || phase=final
+    if [[ "$fault" == "$phase-stall" ]]; then
+        printf '%s\n' "$fault" >> "$CALLS.verification-fault"
+        (
+            trap '' HUP INT TERM
+            sleep 30
+        ) &
+        resistant=$!
+        printf '%s %s\n' "$BASHPID" "$resistant" > "$CALLS.stall"
+        wait "$resistant"
+        exit 0
+    elif [[ "$fault" == "$phase-failure" ]]; then
+        printf '%s\n' "$fault" >> "$CALLS.verification-fault"
+        printf 'injected source verification read failure\n' >&2
+        exit 23
+    elif [[ "$fault" == diagnostics ]]; then
+        printf '%s\n' "$phase" >> "$CALLS.verification-diagnostics"
+        printf 'fixture diagnostic on successful source verification\n' >&2
+    fi
+fi
 exec "$GIT_REAL" "$@"
 GIT
 cat > "$TEMP/bin/go" <<'GOCMD'
@@ -316,6 +343,11 @@ esac
 if [[ "${GO_FAILURE:-}" == build && "$1" == build ]]; then
     echo 'intentional compilation failure' >&2
     exit 23
+fi
+if [[ -n "${SOURCE_VERIFICATION_FAULT:-}" && "$1" == build ]]; then
+    "$GO_REAL" "$@" || exit $?
+    printf 'genuine compilation completed\n' > "$CALLS.compiled" || exit 1
+    exit 0
 fi
 exec "$GO_REAL" "$@"
 GOCMD
@@ -891,6 +923,162 @@ raise SystemExit(0 if failed == 0 else 1)
 PY_GH_DEADLINES
 }
 
+# Exercise the public generated installer, not a replacement source verifier.
+# Git/Go and installation are real. The narrow Git adapter above stalls or
+# fails one raw-source read, including a child that ignores graceful shutdown.
+test_source_verification_deadlines() {
+    command -v python3 >/dev/null 2>&1 || {
+        printf 'SKIP: source verification deadline regression requires Python 3\n'; return 77;
+    }
+    python3 - "$INSTALLER" "$TEMP" "$TAG_PIN" <<'PY_SOURCE_DEADLINES'
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+installer, temporary = map(Path, sys.argv[1:3])
+pin = sys.argv[3]
+passed = failed = 0
+
+def check(label, condition):
+    global passed, failed
+    if condition:
+        passed += 1
+        print("PASS: " + label, flush=True)
+    else:
+        failed += 1
+        print("FAIL: " + label, flush=True)
+
+def active(pid):
+    observed = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    state = observed.stdout.strip()
+    if observed.returncode not in (0, 1):
+        raise RuntimeError("cannot observe source fixture process state")
+    return observed.returncode == 0 and bool(state) and not state.startswith("Z")
+
+def stop_session(session):
+    # The outer bound also cleans up the unchanged implementation's failure.
+    # A baseline killed here remains a failed deadline observation.
+    inventory = subprocess.check_output(["ps", "-axo", "pid="], text=True)
+    groups = set()
+    for text in inventory.split():
+        pid = int(text)
+        try:
+            if os.getsid(pid) == session:
+                groups.add(os.getpgid(pid))
+        except ProcessLookupError:
+            pass
+    for group in groups:
+        try:
+            os.killpg(group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+def invoke(fault, bound, outer_bound):
+    case = temporary / "results" / ("source-verification-" + fault)
+    (case / "tmp").mkdir(parents=True)
+    (case / "install").mkdir()
+    original = b"preserve previously installed executable\n"
+    (case / "install/app").write_bytes(original)
+    calls = case / "calls"
+    calls.write_text("")
+    environment = os.environ.copy()
+    environment.update(CALLS=str(calls), TMPDIR=str(case / "tmp"), MODE="discovery-fail",
+                       SOURCE_VERIFICATION_FAULT=fault, DSR_GH_TOKEN="", GITHUB_TOKEN="", GH_TOKEN="")
+    command = ["bash", str(installer), "--json", "--non-interactive", "--no-skills", "--yes",
+               "--from-source", "--version", "v1.0.0", "--source-timeout", str(bound),
+               "--dir", str(case / "install"), "--cache-dir", str(case / "cache")]
+    started = time.monotonic()
+    process = subprocess.Popen(command, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               start_new_session=True)
+    expired = False
+    try:
+        stdout, stderr = process.communicate(timeout=outer_bound)
+    except subprocess.TimeoutExpired:
+        expired = True
+        stop_session(process.pid)
+        stdout, stderr = process.communicate(timeout=5)
+    elapsed = time.monotonic() - started
+    (case / "out.json").write_bytes(stdout)
+    (case / "err").write_bytes(stderr)
+    try:
+        result = json.loads(stdout)
+    except (ValueError, UnicodeDecodeError):
+        result = {}
+    marker = Path(str(calls) + ".stall")
+    descendants = [int(pid) for pid in marker.read_text().split()] if marker.exists() else []
+    remaining = [pid for pid in descendants if active(pid)]
+    for pid in remaining:
+        try:
+            if os.getsid(pid) == process.pid:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    return case, original, process.returncode, expired, elapsed, result, calls, descendants, remaining
+
+# A genuine healthy build warms Go's cache before the short-deadline controls.
+# Diagnostics from successful Git reads must not contaminate the fingerprint.
+case, _, status, expired, _, result, calls, _, _ = invoke("diagnostics", 60, 80)
+check("source verification diagnostics preserve successful pinned source installation",
+      not expired and status == 0 and result.get("status") == "success" and
+      result.get("method") == "source" and result.get("source", {}).get("source_commit") == pin)
+binary = case / "install/app"
+output = None
+if status == 0 and binary.is_file():
+    execution = subprocess.run([str(binary)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+    output = execution.stdout if execution.returncode == 0 else None
+check("the healthy verified source executable really runs", output == b"tagged-source-v1\n")
+check("healthy source verification invokes a genuine compilation",
+      Path(str(calls) + ".compiled").is_file())
+diagnostics = Path(str(calls) + ".verification-diagnostics")
+check("successful verification exercises diagnostics before and after compilation",
+      diagnostics.is_file() and set(diagnostics.read_text().splitlines()) == {"initial", "final"})
+
+for phase in ("initial", "final"):
+    for failure in ("stall", "failure"):
+        fault = phase + "-" + failure
+        bound = 3 if failure == "stall" else 60
+        outer_bound = 15 if failure == "stall" else 80
+        case, original, status, expired, elapsed, result, calls, descendants, remaining = invoke(
+            fault, bound, outer_bound)
+        injected = Path(str(calls) + ".verification-fault")
+        check(fault + " reaches the intended Git verification boundary",
+              injected.is_file() and fault in injected.read_text().splitlines())
+        expected = 5 if failure == "stall" else 6
+        check(fault + " returns the source deadline or integrity status without hanging",
+              not expired and elapsed < outer_bound and status == expected)
+        check(fault + " emits one truthful public JSON failure", result.get("status") == "error")
+        check(fault + " preserves the installed executable",
+              (case / "install/app").read_bytes() == original)
+        compiled = Path(str(calls) + ".compiled").is_file()
+        check(fault + " is observed on the intended side of genuine compilation",
+              compiled == (phase == "final"))
+        if phase == "initial":
+            check(fault + " stops before any compiler operation",
+                  not any(line.startswith("go ") for line in calls.read_text().splitlines()))
+        check(fault + " publishes neither a source receipt nor an install transaction",
+              not list((case / "tmp").glob("**/source-build/receipt.json")) and
+              not (case / "install/.dsr-install.lock").exists() and not (case / "cache").exists())
+        if failure == "stall":
+            check(fault + " stops the stalled Git process and its TERM-resistant child",
+                  len(descendants) == 2 and not remaining)
+            check(fault + " retains the correct verification deadline evidence",
+                  bool(list((case / "tmp").glob("**/verify-" + phase + ".log.timeout"))))
+
+print(f"Source verification deadlines: {passed} passed, {failed} failed", flush=True)
+raise SystemExit(0 if failed == 0 else 1)
+PY_SOURCE_DEADLINES
+}
+
+if [[ "$TEST_MODE" == --source-verification-timeout-only ]]; then
+    test_source_verification_deadlines
+    exit $?
+fi
+
 if [[ "$TEST_MODE" == --github-timeout-only ]]; then
     test_github_acquisition_deadlines
     exit $?
@@ -918,6 +1106,7 @@ if [[ "$TEST_MODE" == --libc-source-fallback-only ]]; then
 fi
 
 test_github_acquisition_deadlines || exit 1
+test_source_verification_deadlines || exit 1
 test_acquisition_source_fallback || exit 1
 test_libc_source_fallback || exit 1
 

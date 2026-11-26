@@ -1014,6 +1014,15 @@ changing its bytes or switching its file kind still invalidates the result.
 It does not sandbox build code
 or prove that source was never temporarily changed during compilation.
 
+The current source engine applies `--source-timeout` separately to each complete
+verification pass, including its Git reads and file hashing, as well as to source
+acquisition and compiler commands. A deadline or failed verification stops before
+source receipt publication or installation. Diagnostics are retained in
+`verify-initial.log` and `verify-final.log` beneath the private source-build
+directory; successful command diagnostics do not become part of the source
+fingerprint. This deadline behavior is included in newly generated Bash installers.
+Checked-in clients require regeneration to acquire the updated verification path.
+
 This feature applies to newly generated Bash installers and the checked-in
 `bv`, `cass`, and `ntm` clients. Those clients were regenerated through the public
 generator while preserving their repository identities, naming and platform
