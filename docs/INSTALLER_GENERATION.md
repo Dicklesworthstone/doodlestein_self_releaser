@@ -931,14 +931,20 @@ RCH_CARGO_JSON_STDOUT=1 RCH_REQUIRE_REMOTE=1 \
   bash ./install.sh --from-source --source-ref refs/tags/v1.2.3
 ```
 
-This mode requires a compatible RCH Cargo shim, Python 3 and `b3sum`, in addition
-to the ordinary Rust source-build dependencies. `RCH_REQUIRE_REMOTE` must be
-`1`; the installer preserves that policy. It does not enable RCH or choose a
-worker on the caller's behalf. The selected Cargo shim and local Rust host probe
-must already be usable: this mode does not bootstrap a local toolchain, even
-when `--install-toolchain` permits one. Ordinary source builds keep their
-existing toolchain and Cargo output selection and acquire no Python or BLAKE3
-dependency from this feature.
+This mode requires the `rch` client, Python 3 and `b3sum`, in addition to the
+ordinary Rust source-build dependencies. `RCH_REQUIRE_REMOTE` must be `1`.
+The installer invokes `rch exec --require-remote -- cargo build ...` directly;
+it does not depend on a managed Cargo shim. The explicit command-line policy
+prevents a forced-local or disabled RCH configuration from compiling locally.
+Worker selection and admission remain RCH's responsibility, and an unavailable
+client or refused execution stops the source install without local fallback.
+
+The local Rust host probe must already be usable: this mode does not bootstrap
+a local toolchain, even when `--install-toolchain` permits one. Named Cargo JSON
+delivery stays enabled through `RCH_CARGO_JSON_STDOUT=1`; the client must support
+that delivery contract and `exec --require-remote`. Ordinary source builds keep
+their existing toolchain and Cargo output selection and acquire no RCH, Python
+or BLAKE3 dependency from this feature.
 
 RCH delivers selected executables into an invocation-private directory beneath
 the requested Cargo target root. The installer verifies the complete requested

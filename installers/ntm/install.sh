@@ -2877,26 +2877,31 @@ _isb_compile() (
         rust)
             [[ -f Cargo.toml && ! -L Cargo.toml ]] || return 4
             local rustc_command rch_delivery=false dependency delivered_paths
+            local -a cargo_command=(cargo)
             if [[ "${RCH_CARGO_JSON_STDOUT:-}" == 1 ]]; then
                 rch_delivery=true
                 [[ "${RCH_REQUIRE_REMOTE:-}" == 1 ]] || {
                     _isb_log 'Explicit RCH Cargo delivery requires RCH_REQUIRE_REMOTE=1; local fallback is not admitted'
                     return 4
                 }
-                for dependency in python3 b3sum cargo rustc; do
+                for dependency in python3 b3sum rch cargo rustc; do
                     command -v "$dependency" >/dev/null 2>&1 || {
                         _isb_log "Explicit RCH Cargo delivery requires $dependency; install it before retrying"
-                        case "$dependency" in cargo|rustc)
-                            _isb_log 'Prepare the RCH Cargo shim and local Rust host probe; this mode does not bootstrap a plain local Cargo'
+                        case "$dependency" in rch|cargo|rustc)
+                            _isb_log 'Prepare the RCH client, Cargo, and local Rust host probe; this mode does not bootstrap a local toolchain'
                             ;;
                         esac
                         return 3
                     }
                 done
+                export RCH_CARGO_JSON_STDOUT=1 RCH_REQUIRE_REMOTE=1
+                # Select the official compiler route explicitly. A plain Cargo
+                # installation must not compile locally before output validation
+                # discovers that no RCH delivery receipt was produced.
+                cargo_command=(rch exec --require-remote -- cargo)
             fi
-            # Bootstrap prepends a private plain Cargo, replacing the caller's
-            # RCH shim. Explicit delivery requires an already usable client
-            # route and host probe, even when local bootstrap was authorized.
+            # Explicit remote delivery requires an already usable RCH client
+            # and local host probe, even when local bootstrap was authorized.
             if ! $rch_delivery; then
                 _isb_prepare_toolchain "$language" "$tree" "$output" "$limit" || return $?
             fi
@@ -2923,7 +2928,7 @@ _isb_compile() (
             _isb_run "$limit" "$output/compiler.log" "$rustc_command" -vV || {
                 status=$?; [[ $status == 5 ]] && return 5
                 if $rch_delivery; then
-                    _isb_log 'RCH delivery requires a usable local Rust host probe; prepare it before retrying (isolated bootstrap would replace the RCH Cargo shim)'
+                    _isb_log 'RCH delivery requires a usable local Rust host probe; prepare it before retrying (local toolchain bootstrap is disabled in this mode)'
                     return 3
                 fi
                 return 6
@@ -2965,7 +2970,7 @@ _isb_compile() (
                     "$package" "$windows_paths" "$requested_names" || return $?
                 source_context="$output/cargo-sources.json"
             fi
-            _isb_run "$limit" "$output/build.log" cargo "${args[@]}" || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
+            _isb_run "$limit" "$output/build.log" "${cargo_command[@]}" "${args[@]}" || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
             if $rch_delivery; then
                 delivered_paths=$(_isb_rch_cargo_outputs "$tree" "$output" "$host" "$limit" "${binaries[@]}") || return $?
                 targets=()

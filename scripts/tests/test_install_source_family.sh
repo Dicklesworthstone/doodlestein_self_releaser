@@ -195,7 +195,7 @@ RUST
     [[ $bad -eq 0 ]]
 )
 
-# The compiler boundary emits the current RCH producer's retained-record shape.
+# The RCH client boundary emits the current producer's retained-record shape.
 # Hashing, descriptor/path validation, family staging and source receipts are real;
 # this is consumer interoperability coverage, not live worker qualification.
 test_cargo_delivery_contracts() (
@@ -220,7 +220,7 @@ test_cargo_delivery_contracts() (
         [[ "$*" == -vV ]] || return 1
         printf 'rustc 1.92.0 (local compiler-boundary probe)\nhost: x86_64-unknown-linux-gnu\n'
     }
-    cargo() {
+    delivery_producer() {
         if [[ "${1:-}" == --version ]]; then
             printf 'cargo 1.92.0 (compiler-boundary fixture)\n'
             return 0
@@ -325,6 +325,32 @@ for record in delivered + [terminal]:
     print(json.dumps(record))
 PY
     }
+    # Plain Cargo remains available without a managed shim. If the source
+    # engine accidentally calls it in remote mode, record the local attempt
+    # and produce conventional outputs that cannot authorize RCH delivery.
+    cargo() {
+        printf '%s\n' "$*" >> "$base/local-cargo.calls"
+        local fault="$fault"
+        [[ "${RCH_CARGO_JSON_STDOUT:-}" != 1 ]] || fault=conventional
+        delivery_producer "$@"
+    }
+    rch() {
+        python3 -I - "$base/rch.calls" "$@" <<'PY' || return 1
+import json, os, sys
+with open(sys.argv[1], "x", encoding="utf-8") as stream:
+    json.dump({"arguments": sys.argv[2:], "named_json": os.environ.get("RCH_CARGO_JSON_STDOUT"),
+               "require_remote": os.environ.get("RCH_REQUIRE_REMOTE"),
+               "rustc": os.environ.get("RUSTC")}, stream)
+PY
+        [[ $# -ge 4 && "$1" == exec && "$2" == --require-remote && "$3" == -- && "$4" == cargo ]] || return 97
+        shift 4
+        case "$fault" in
+            force-local|client-disabled) printf 'fixture RCH policy refuses local compilation\n' >&2; return 1 ;;
+            client-unavailable) printf 'fixture RCH daemon unavailable\n' >&2; return 103 ;;
+            client-timeout) sleep 30; return 1 ;;
+        esac
+        delivery_producer "$@"
+    }
     delivery_case() (
         local label="$1" fault="$2" base="$fixtures/$1" status=0
         mkdir -p "$base/source/src" "$base/output" || return 1
@@ -332,6 +358,7 @@ PY
         for member in app helper; do printf 'fn main() {}\n' > "$base/source/src/$member.rs"; done
         export RCH_CARGO_JSON_STDOUT=1 RCH_REQUIRE_REMOTE=1
         unset RUSTC
+        [[ "$fault" != unexported-mode ]] || export -n RCH_CARGO_JSON_STDOUT RCH_REQUIRE_REMOTE
         [[ "$fault" != conventional && "$fault" != no-opt-in ]] || unset RCH_CARGO_JSON_STDOUT
         [[ "$fault" != supplied-rustc ]] || export RUSTC=caller-selected-rustc
         [[ "$fault" != remote-unset ]] || unset RCH_REQUIRE_REMOTE
@@ -349,13 +376,15 @@ PY
             fi
         fi
         if [[ "$fault" == missing-python3 || "$fault" == missing-b3sum ||
-              "$fault" == missing-cargo || "$fault" == missing-rustc ]]; then
+              "$fault" == missing-rch || "$fault" == missing-cargo || "$fault" == missing-rustc ]]; then
             command() {
                 [[ "${1:-}" != -v || "${2:-}" != "${fault#missing-}" ]] || return 1
                 builtin command "$@"
             }
         fi
-        _isb_compile rust "$base/source" "$base/output" app '' '' 5 helper app \
+        local limit=5
+        [[ "$fault" != client-timeout ]] || limit=1
+        _isb_compile rust "$base/source" "$base/output" app '' '' "$limit" helper app \
             > "$base/result" 2> "$base/stderr" || status=$?
         printf '%s' "$status"
     )
@@ -372,6 +401,12 @@ PY
         jq -e '.arguments | index("--message-format=json,json-render-diagnostics") != null' "$fixtures/healthy space/cargo.calls"
     delivery_check 'RCH compiler command preserves supplied remote policy and leaves absent RUSTC unset' \
         jq -e '.rustc == null and .require_remote == "1"' "$fixtures/healthy space/cargo.calls"
+    delivery_check 'explicit delivery calls the real-client compiler interface with every Cargo argument' \
+        jq -e --slurpfile cargo "$fixtures/healthy space/cargo.calls" \
+            '.arguments[0:4] == ["exec","--require-remote","--","cargo"] and
+             .arguments[4:] == $cargo[0].arguments and .named_json == "1" and .require_remote == "1"' \
+            "$fixtures/healthy space/rch.calls"
+    delivery_check 'explicit delivery never invokes the plain local Cargo' test ! -e "$fixtures/healthy space/local-cargo.calls"
     delivery_check 'RCH delivery metadata identifies exact family without attesting compiler or source content' \
         jq -e '.build_id == 41 and .compiler_identity_attested == false and .source_content_attested == false and
             [.binaries[].name] == ["helper","app"] and all(.binaries[]; .blake3 | test("^[0-9a-f]{64}$"))' \
@@ -381,6 +416,11 @@ PY
     delivery_check 'ordinary Cargo retains its compiler and message-format policy' jq -e \
         '.rustc == "rustc" and (.arguments | index("--message-format=json-render-diagnostics") != null)' \
         "$fixtures/conventional/cargo.calls"
+    delivery_check 'ordinary Cargo does not dispatch the RCH client' test ! -e "$fixtures/conventional/rch.calls"
+    code=$(delivery_case unexported-mode unexported-mode)
+    delivery_check 'shell-local explicit mode reaches the RCH child as exported named JSON policy' delivery_equal "$code" 0
+    delivery_check 'the child process observes both explicit RCH policy settings' \
+        jq -e '.named_json == "1" and .require_remote == "1"' "$fixtures/unexported-mode/rch.calls"
     code=$(delivery_case supplied-rustc supplied-rustc)
     delivery_check 'explicit RCH delivery preserves a caller-supplied compiler policy' delivery_equal "$code" 0
     delivery_check 'caller RUSTC reaches RCH unchanged' jq -e '.rustc == "caller-selected-rustc"' "$fixtures/supplied-rustc/cargo.calls"
@@ -393,16 +433,27 @@ PY
     delivery_check 'an unavailable RCH host probe is a dependency refusal' delivery_equal "$code" 3
     delivery_check 'an unavailable host probe cannot trigger authorized local bootstrap' test ! -e "$fixtures/bootstrap-probe/bootstrap.called"
     delivery_check 'an unavailable host probe cannot dispatch Cargo' test ! -e "$fixtures/bootstrap-probe/cargo.calls"
-    for fault in missing-python3 missing-b3sum missing-cargo missing-rustc; do
+    for fault in missing-python3 missing-b3sum missing-rch missing-cargo missing-rustc; do
         code=$(delivery_case "$fault" "$fault")
         delivery_check "explicit RCH mode reports $fault as a dependency failure" delivery_equal "$code" 3
         delivery_check "$fault is refused before compiling" test ! -e "$fixtures/$fault/cargo.calls"
+        delivery_check "$fault cannot fall back to local Cargo" test ! -e "$fixtures/$fault/local-cargo.calls"
     done
     for fault in remote-unset remote-false; do
         code=$(delivery_case "$fault" "$fault")
         delivery_check "explicit RCH mode refuses $fault policy" delivery_equal "$code" 4
         delivery_check "$fault is refused before compiling" test ! -e "$fixtures/$fault/cargo.calls"
     done
+    for fault in force-local client-disabled client-unavailable; do
+        code=$(delivery_case "$fault" "$fault")
+        delivery_check "$fault from the RCH client remains a build failure" delivery_equal "$code" 6
+        delivery_check "$fault never invokes plain local Cargo" test ! -e "$fixtures/$fault/local-cargo.calls"
+        delivery_check "$fault produces no compiler output or partial family" test ! -e "$fixtures/$fault/cargo.calls"
+        delivery_check "$fault returns no successful output paths" test ! -s "$fixtures/$fault/result"
+    done
+    code=$(delivery_case client-timeout client-timeout)
+    delivery_check 'RCH client deadline remains an interrupted source build' delivery_equal "$code" 5
+    delivery_check 'RCH timeout does not retry through local Cargo' test ! -e "$fixtures/client-timeout/local-cargo.calls"
     for fault in no-opt-in stdout-corrupt stderr-corrupt payload-corrupt payload-link receipt-link receipt-parent-link \
         mixed-receipt wrong-root worker-record changed-record outside-executable missing-member \
         duplicate-member failed-build source-projection profile; do
