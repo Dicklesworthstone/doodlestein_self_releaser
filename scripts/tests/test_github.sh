@@ -2028,18 +2028,18 @@ test_release_upload_scenario() (
   local scenario="$1" expected_status="$2" expected_posts="$3" expected_downloads="${4:-0}"
   local fixture="$TEMP_DIR/upload"
   local source="$fixture/source with spaces/asset+build.tar.gz"
-  local expected="$fixture/expected" calls="$fixture/calls" posts="$fixture/posts"
+  local expected_payload="$fixture/expected" calls="$fixture/calls" posts="$fixture/posts"
   local downloads="$fixture/downloads" remote="$fixture/remote.json" digest size
   mkdir -p "${source%/*}" "$fixture/tmp" || return 1
   printf 'release-payload\000\001\377\n' > "$source"
-  cp "$source" "$expected" || return 1
+  cp "$source" "$expected_payload" || return 1
   if command -v sha256sum &>/dev/null; then
-    digest=$(sha256sum < "$expected") || return 1
+    digest=$(sha256sum < "$expected_payload") || return 1
   else
-    digest=$(shasum -a 256 < "$expected") || return 1
+    digest=$(shasum -a 256 < "$expected_payload") || return 1
   fi
   digest="${digest%% *}"
-  size=$(wc -c < "$expected"); size="${size//[[:space:]]/}"
+  size=$(wc -c < "$expected_payload"); size="${size//[[:space:]]/}"
   printf '0\n' > "$posts"; printf '0\n' > "$downloads"; : > "$calls"
   printf '[]\n' > "$remote"
   local TMPDIR="$fixture/tmp" GH_MAX_RETRIES=3 GH_RETRY_DELAY=0
@@ -2060,7 +2060,7 @@ test_release_upload_scenario() (
       '{id:42,name:$name,state:"uploaded",size:$size,digest:$digest}'
   }
   case "$scenario" in
-    existing|paginated|legacy|legacy-corrupt|legacy-download-fails|wrong-existing-digest|wrong-existing-size|starter|duplicate|duplicate-pages|bad-digest-type)
+    existing|paginated|legacy|legacy-corrupt|legacy-download-fails|wrong-existing-digest|wrong-existing-size|starter|duplicate|duplicate-pages|case-only|overlapping-pages|bad-digest-type)
       fixture_asset | jq -sc '.' > "$remote"
       case "$scenario" in
         legacy|legacy-corrupt|legacy-download-fails) fixture_asset | jq -sc 'map(del(.digest))' > "$remote" ;;
@@ -2068,6 +2068,8 @@ test_release_upload_scenario() (
         wrong-existing-size) fixture_asset | jq -sc 'map(.size += 1)' > "$remote" ;;
         starter) fixture_asset | jq -sc 'map(.state = "starter")' > "$remote" ;;
         duplicate) fixture_asset | jq -sc '. + [.[0] + {id:43}]' > "$remote" ;;
+        case-only) fixture_asset | jq -sc 'map(.name |= ascii_upcase)' > "$remote" ;;
+        overlapping-pages) fixture_asset unrelated.bin | jq -sc 'map(.id = 100)' > "$remote" ;;
         bad-digest-type) fixture_asset | jq -sc 'map(.digest = false)' > "$remote" ;;
       esac
       ;;
@@ -2086,9 +2088,9 @@ test_release_upload_scenario() (
         [[ "$scenario" == inventory-error ]] && return 1
         if [[ "$scenario" == malformed-inventory ]]; then printf '{}\n'; return 0; fi
         if [[ "$scenario" == multiple-inventories ]]; then printf '[]\n[]\n'; return 0; fi
-        if [[ "$scenario" == paginated || "$scenario" == inventory-tail-fails ]]; then
+        if [[ "$scenario" == paginated || "$scenario" == inventory-tail-fails || "$scenario" == overlapping-pages ]]; then
           if [[ "$2" == *page=1 ]]; then
-            jq -nc '[range(1;101) | {id:.,name:("other-" + tostring)}]'
+            jq -nc '[range(100;200) | {id:.,name:("other-" + tostring)}]'
           elif [[ "$scenario" == inventory-tail-fails ]]; then
             return 1
           else
@@ -2111,7 +2113,7 @@ test_release_upload_scenario() (
         elif [[ "$scenario" == legacy-download-fails ]]; then
           return 1
         else
-          cat "$expected"
+          cat "$expected_payload"
         fi
         ;;
       *) return 91 ;;
@@ -2131,13 +2133,14 @@ test_release_upload_scenario() (
       esac
     done
     [[ -n "$output" && -n "$payload" && "$payload" != "$source" ]] || return 92
-    cmp -s "$expected" "$payload" || return 93
+    cmp -s "$expected_payload" "$payload" || return 93
     read -r count < "$posts"; count=$((count + 1)); printf '%s\n' "$count" > "$posts"
     name="${url##*\?name=}"; name="${name//%2B/+}"
     asset=$(fixture_asset "$name")
     case "$scenario" in
       lost-response) code=000; rc=56 ;;
       raced-match|raced-conflict) code=422 ;;
+      raced-case-only) code=503; asset=$(jq -c '.name |= ascii_upcase' <<< "$asset") ;;
       starter-after-502) code=502; asset=$(jq -c '.state = "starter"' <<< "$asset") ;;
       retry-503|retry-429|retry-403|retry-after|long-cooldown|retry-403-after|retry-403-reset|long-403-cooldown|invalid-403-after|invalid-403-reset)
         if ((count == 1)); then
@@ -3565,6 +3568,9 @@ wrong-existing-size 7 0 0
 starter 7 0 0
 duplicate 7 0 0
 duplicate-pages 7 0 0
+case-only 7 0 0
+overlapping-pages 7 0 0
+raced-case-only 7 1 0
 bad-digest-type 7 0 0
 inventory-error 8 0 0
 inventory-tail-fails 8 0 0

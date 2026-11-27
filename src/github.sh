@@ -1602,6 +1602,9 @@ _gh_asset_sha256() {
 # Terminal adapter and validator signal statuses are preserved unchanged.
 gh_release_asset_inventory() (
     local repo="${1:-}" release_id="${2:-}" inventory status=0
+    # A named lookup needs every identity to establish uniqueness, but only
+    # its selected row's complete, original GitHub receipt for verification.
+    local wanted="${3:-}"
     if [[ ! "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ||
           ! "$release_id" =~ ^[1-9][0-9]{0,15}$ ]]; then
         _gh_log_error "Invalid repository or release ID for asset inventory"
@@ -1623,36 +1626,54 @@ gh_release_asset_inventory() (
                     if _gh_operation_interrupted "$request_status"; then return "$request_status"; fi
                     case "$request_status" in 3) return 3 ;; *) return 8 ;; esac
                 fi
-                if ! jq -es '
+                if jq -es --arg wanted "$wanted" '
                     def id: type == "number" and floor == . and . > 0 and . <= 9007199254740991;
                     def name: type == "string" and length > 0 and . != "." and . != ".." and
                         (test("[/\\\\\\x00-\\x1f\\x7f]") | not);
                     length == 1 and (.[0] | type == "array" and length <= 100 and all(.[];
                         type == "object" and (.id | id) and (.name | name) and
-                        (.state == "uploaded" or .state == "starter") and
+                        ($wanted != "" or ((.state == "uploaded" or .state == "starter") and
                         (.size | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
                         (.digest == null or (.digest | type == "string")) and
-                        (.browser_download_url == null or (.browser_download_url | type == "string"))))
-                ' <<< "$response" >/dev/null 2>&1; then
+                        (.browser_download_url == null or (.browser_download_url | type == "string"))))))
+                ' <<< "$response" >/dev/null 2>&1; then :; else
+                    request_status=$?
+                    if ((request_status >= 129)); then return "$request_status"; fi
                     _gh_log_error "Invalid release asset inventory for $repo/$release_id (page $page)"
                     return 8
                 fi
-                jq -c '.[] | {id,name,state,size,digest} +
-                    (if has("browser_download_url") then {browser_download_url} else {} end)' \
-                    <<< "$response" || return 8
-                count=$(jq -r 'length' <<< "$response") || return 8
+                jq -c --arg wanted "$wanted" '.[] |
+                    if $wanted == "" then {id,name,state,size,digest} +
+                        (if has("browser_download_url") then {browser_download_url} else {} end)
+                    elif .name == $wanted then .
+                    else {id,name} end' <<< "$response" || {
+                    request_status=$?
+                    if ((request_status >= 129)); then return "$request_status"; fi
+                    return 8
+                }
+                count=$(jq -r 'length' <<< "$response") || {
+                    request_status=$?
+                    if ((request_status >= 129)); then return "$request_status"; fi
+                    return 8
+                }
                 ((count == 100)) || return 0
                 page=$((page + 1))
             done
             _gh_log_error "Release inventory exceeded the 100-page safety limit"
             return 8
-        ) | jq -cse 'if (map(.id) | unique | length) == length and
-                           (map(.name | ascii_downcase) | unique | length) == length
-                then sort_by(.id) else error("duplicate release asset name or ID") end'
+        ) | jq -cs --arg wanted "$wanted" '
+            if (map(.id) | unique | length) != length or
+               (map(.name | ascii_downcase) | unique | length) != length
+            then error("duplicate release asset name or ID")
+            elif $wanted == "" then sort_by(.id)
+            else map(select((.name | ascii_downcase) == ($wanted | ascii_downcase))) | .[0] |
+                if . == null or .name == $wanted then .
+                else error("release asset name differs only by case") end
+            end'
         inventory_status=("${PIPESTATUS[@]}")
         # A parser refusal on an incomplete page cannot replace a terminal
         # transport status with an ordinary inventory failure.
-        if _gh_operation_interrupted "${inventory_status[0]}"; then
+        if ((inventory_status[0] >= 129)) || _gh_operation_interrupted "${inventory_status[0]}"; then
             return "${inventory_status[0]}"
         fi
         if ((inventory_status[1] >= 129 && inventory_status[1] <= 255)); then
@@ -1669,41 +1690,11 @@ gh_release_asset_inventory() (
 # .assets array. Return 0 + one asset, 1 for absence, 7 for ambiguity, 8 for an
 # unavailable/incomplete inventory. Never interpret a failed GET as absence.
 _gh_find_release_asset() {
-    local repo="$1" release_id="$2" name="$3"
-    local page=1 response matches count status found=""
-    while ((page <= 100)); do
-        if response=$(gh_api "repos/$repo/releases/$release_id/assets?per_page=100&page=$page" --no-cache); then :; else
-            status=$?
-            _gh_log_error "Cannot read release asset inventory for $repo/$release_id"
-            if _gh_operation_interrupted "$status"; then return "$status"; fi
-            return 8
-        fi
-        if ! jq -es 'length == 1 and (.[0] | type == "array" and length <= 100 and
-            all(.[]; type == "object" and (.name | type == "string") and
-                (.id | type == "number" and floor == . and . > 0 and . <= 9007199254740991)))' \
-            <<< "$response" >/dev/null 2>&1; then
-            _gh_log_error "Invalid release asset inventory for $repo/$release_id"
-            return 8
-        fi
-        matches=$(jq -c --arg name "$name" '[.[] | select(.name == $name)]' <<< "$response") || return 8
-        count=$(jq -r 'length' <<< "$matches") || return 8
-        if ((count > 1)) || { ((count == 1)) && [[ -n "$found" ]]; }; then
-            _gh_log_error "Ambiguous release asset name: $name"
-            return 7
-        fi
-        if ((count == 1)); then
-            found=$(jq -c '.[0]' <<< "$matches") || return 8
-        fi
-        count=$(jq -r 'length' <<< "$response") || return 8
-        if ((count < 100)); then
-            [[ -n "$found" ]] || return 1
-            printf '%s\n' "$found"
-            return 0
-        fi
-        page=$((page + 1))
-    done
-    _gh_log_error "Release inventory exceeded the 100-page safety limit"
-    return 8
+    local repo="$1" release_id="$2" name="$3" asset
+    [[ -n "$name" ]] || return 4
+    asset=$(gh_release_asset_inventory "$repo" "$release_id" "$name") || return $?
+    [[ "$asset" != null ]] || return 1
+    printf '%s\n' "$asset"
 }
 
 # An HTTP success, matching name, or matching size alone is NOT upload proof.
