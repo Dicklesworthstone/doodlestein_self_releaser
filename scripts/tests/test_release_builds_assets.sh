@@ -96,6 +96,7 @@ manifest.write_text(json.dumps({'schema_version':'1.0.0','tool':arg('--tool'),'v
     'source':{'git_sha':arg('--source-sha'),'git_ref':'refs/tags/'+arg('--release-tag'),'dependencies':[]},
     'summary':{'total':1,'success':1,'failed':0},'artifacts':artifacts,
     'build_environments':[{'target':'windows/arm64','target_triple':spec['target'],
+                           'command':['fixture/cargo-xwin','xwin','build','--release','--locked','--target',spec['target']],
                            'method':'pinned-cargo-xwin','build_influence_env':sdk_env,'selected_sdk':sdk_selection,
                            'toolchain':{'target':spec['target'],'manifest_sha256':sdk_key,
                                'inputs':{'target':spec['target'],'sysroot':{'url':sdk_url}},

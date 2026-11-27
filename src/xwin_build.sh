@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Execute a release-profile cargo-xwin binary set with the prepared
+# Execute a cargo-xwin binary set with the prepared
 # dsr-h4y0 inputs. This is not a replacement for DSR's source/release gates.
 _XWIN_BUILD_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 # shellcheck source=src/guardrails.sh
@@ -487,6 +487,8 @@ _xwb_build() {
     local manifest='' project='' run='' binary='' package='' cache='' cargo_cache='' seconds=3600 offline=false
     local release_repo='' release_tag='' release_tool='' source_sha='' asset_name='' release=false
     local sibling_crates='' sibling_hash='' source_set_receipt=''
+    local profile=release profile_dir
+    local -a profile_args=(--release)
     local all_features=false no_default_features=false feature_selection feature_arguments feature_hash argument
     local -a binaries=() feature_lists=() feature_args=()
     local -A seen=() binary_names=()
@@ -498,7 +500,7 @@ _xwb_build() {
             --offline) offline=true; shift ;;
             --all-features) all_features=true; shift ;;
             --no-default-features) no_default_features=true; shift ;;
-            --manifest|--project|--run-dir|--bin|--package|--cache-dir|--cargo-cache|--timeout|--release-repo|--release-tag|--source-sha|--tool|--asset-name|--sibling-crates|--features)
+            --manifest|--project|--run-dir|--bin|--package|--cache-dir|--cargo-cache|--timeout|--release-repo|--release-tag|--source-sha|--tool|--asset-name|--sibling-crates|--features|--profile)
                 [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || return 4
                 case "$1" in
                     --manifest) manifest=$2 ;; --project) project=$2 ;; --run-dir) run=$2 ;;
@@ -507,12 +509,20 @@ _xwb_build() {
                     --release-repo) release_repo=$2 ;; --release-tag) release_tag=$2 ;;
                     --source-sha) source_sha=$2 ;; --tool) release_tool=$2 ;; --asset-name) asset_name=$2 ;;
                     --sibling-crates) sibling_crates=$2 ;;
+                    --profile) profile=$2 ;;
                     --features) feature_lists+=("$2") ;;
                 esac
                 shift 2 ;;
             *) _xwt_log "Unknown build option: $1"; return 4 ;;
         esac
     done
+    [[ "$profile" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]] || { _xwt_log 'Invalid Cargo profile name'; return 4; }
+    [[ "$profile" == release ]] || profile_args=(--profile "$profile")
+    case "$profile" in
+        dev|test) profile_dir=debug ;;
+        release|bench) profile_dir=release ;;
+        *) profile_dir="$profile" ;;
+    esac
     feature_selection=$(_xwb_feature_selection "$all_features" "$no_default_features" "${feature_lists[@]}") || return $?
     feature_arguments=$(_xwb_feature_arguments "$feature_selection") || return 4
     while IFS= read -r argument; do [[ -z "$argument" ]] || feature_args+=("$argument"); done <<< "$feature_arguments"
@@ -671,7 +681,7 @@ _xwb_build() {
     fi
     # Invoke the pinned plugin directly: a project's Cargo alias named xwin
     # must not substitute a different executable for the attested plugin.
-    local -a command=("$run/bin/cargo-xwin" xwin build --release --locked --target "$target"
+    local -a command=("$run/bin/cargo-xwin" xwin build "${profile_args[@]}" --locked --target "$target"
         --manifest-path "$project/Cargo.toml" --target-dir "$run/target")
     for selected_binary in "${binaries[@]}"; do command+=(--bin "$selected_binary"); done
     if [[ "$release" == true ]]; then
@@ -714,7 +724,7 @@ _xwb_build() {
         cmp -s "$run/selection-before.json" "$run/selection-after.json" || return 7
         xwin_source_verify "$run/source" "$run/release-source.json" || return $?
         _xwb_artifact_messages "$run/build.messages.jsonl" "$run/selection-after.json" \
-            "$project" "$run/target/$target/release" || return $?
+            "$project" "$run/target/$target/$profile_dir" || return $?
     fi
     _xwb_versions "$plan" "$project" "$run/versions-after" "$run/environment.nul" > "$run/versions-after.json" || return $?
     cmp -s "$run/versions-before.json" "$run/versions-after.json" || return 7
@@ -733,8 +743,8 @@ _xwb_build() {
         bash "$_XWIN_BUILD_DIR/cargo_cache.sh" inventory "$run/cargo-home" "$run/cargo-cache-final.json" || return $?
     : > "$run/artifacts.jsonl" || return 1
     for selected_binary in "${binaries[@]}"; do
-        _pkg_path_has_no_links "$run/target" "$target/release/$selected_binary.exe" || return 7
-        path="$run/target/$target/release/$selected_binary.exe"
+        _pkg_path_has_no_links "$run/target" "$target/$profile_dir/$selected_binary.exe" || return 7
+        path="$run/target/$target/$profile_dir/$selected_binary.exe"
         [[ -f "$path" && ! -L "$path" ]] || return 7
         if [[ ${#binaries[@]} -gt 1 ]]; then
             asset_name="$selected_binary.exe"

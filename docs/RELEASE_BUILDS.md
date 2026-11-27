@@ -130,6 +130,11 @@ build both architectures from the same committed project and shared prepared-vie
 cache, with independent attempt directories and architecture-specific view keys.
 The compiler result, producer environment, pinned toolchain and each artifact's
 target triple must all agree with the job before its output is admitted.
+An optional `profile` selects the Cargo build profile for all binaries in that job.
+For example, `"profile": "release-interactive"` selects a custom workspace
+profile. The default is `release`. The coordinator verifies the selected
+profile in the retained build command when admitting or reusing a result.
+Changing the profile requires a new run directory.
 `package`, `asset_name`, `cargo_cache`, `cache_dir`, and `offline` are optional.
 Repository/tag/source SHA/tool come from the plan. To include pinned sibling
 repositories, add `"siblings": {"path": "/srv/pinned/siblings.json",

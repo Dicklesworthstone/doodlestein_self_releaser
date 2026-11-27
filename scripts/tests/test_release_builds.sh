@@ -146,6 +146,11 @@ if kind == 'xwin':
     value['build_environments'][0]['feature_selection'] = {
         'features':arg('--features').split(',') if '--features' in args else [], 'all_features':'--all-features' in args,
         'no_default_features':'--no-default-features' in args}
+    selector = ['--profile',arg('--profile')] if '--profile' in args else ['--release']
+    environment['command'] = ['fixture/cargo-xwin','xwin','build',*selector,'--locked','--target',spec['target']]
+    if mode == 'profile-drift': environment['command'][3:5] = ['--release']
+    if mode == 'profile-missing': del environment['command']
+    if mode == 'profile-duplicate': environment['command'].append('--profile=dev')
     if mode == 'feature-drift': value['build_environments'][0]['feature_selection']['features'] = []
     if mode == 'feature-missing': del value['build_environments'][0]['feature_selection']
     if mode == 'feature-boolean': value['build_environments'][0]['feature_selection']['all_features'] = 1
@@ -204,7 +209,7 @@ print(json.dumps(response))
                'toolchain_manifest':str(toolchain), 'toolchain_sha256':sha(toolchain), 'binary':'demo',
                'package':'demo-package', 'offline':True, 'asset_name':'demo-windows-arm64.exe',
                'features':['demo-package/tls','demo-package/cli','demo-package/tls'],
-               'all_features':True, 'no_default_features':True,
+               'all_features':True, 'no_default_features':True, 'profile':'ship',
                'siblings':{'path':str(siblings),'sha256':sha(siblings)}}
     plan = {'schema_version':1,'repo':'owner/demo','tool':'demo','tag':'v1.2.3','source_sha':'a'*40,
             'required_targets':['linux/amd64','darwin/arm64','windows/arm64'],'builds':[a,b,windows]}
@@ -536,6 +541,10 @@ os.open, os.link = observe_open, publish_link
     check('all targets reach the existing bundle collector', result['bundle']['targets']==sorted(plan['required_targets']))
     check('large producer evidence survives full execution/aggregation', Path(result['bundle']['manifest']).stat().st_size>450000)
     check('complete manifests are pinned only after successful execution', all(sha(Path(j['manifest']))==j['manifest_sha256'] for j in read(output/'build-set.json')['builds']))
+    windows_environment = next(e for e in read(Path(result['bundle']['manifest']))['build_environments']
+                               if e['target']=='windows/arm64')
+    check('custom Cargo profile reaches the driver and retained aggregate command',
+          windows_environment['command'][1:6] == ['xwin','build','--profile','ship','--locked'])
     check('selected Cargo features survive publication-manifest aggregation',
           next(e for e in read(Path(result['bundle']['manifest']))['build_environments'] if e['target']=='windows/arm64')['feature_selection'] ==
           {'features':['demo-package/cli','demo-package/tls'],'all_features':True,'no_default_features':True})
@@ -554,7 +563,7 @@ os.open, os.link = observe_open, publish_link
     changed=json.loads(json.dumps(plan)); changed['builds'][0]['timeout']=12; encode(work/'changed.json',changed)
     run(output,2,work/'changed.json')
     check('changed plans cannot reuse completed work', trace.read_bytes()==before_trace)
-    for key, replacement in (('features',['demo-package/cli']), ('all_features',False), ('no_default_features',False)):
+    for key, replacement in (('profile','dev'), ('features',['demo-package/cli']), ('all_features',False), ('no_default_features',False)):
         changed=json.loads(json.dumps(plan))
         next(j for j in changed['builds'] if j['id']=='windows')[key]=replacement
         encode(work/'changed-features.json',changed)
@@ -586,27 +595,35 @@ os.open, os.link = observe_open, publish_link
           (work/'malformed-mixed/completed/darwin/build-manifest.json').is_file())
     controls['linux'].write_text('good')
     feature_only=dict(plan,required_targets=windows['targets'],builds=[windows]); encode(work/'feature-only.json',feature_only)
-    for mode in ('feature-drift','feature-missing','feature-boolean'):
+    for mode in ('profile-drift','profile-missing','profile-duplicate','feature-drift','feature-missing','feature-boolean'):
         controls['windows'].write_text(mode)
         folder=work/('reject-'+mode)
         run(folder,1,work/'feature-only.json')
-        check(mode+' cannot admit a manifest with different Cargo feature authority',
+        check(mode+' cannot admit a manifest with different Cargo build selections',
               not (folder/'completed/windows').exists() and not (folder/'bundle').exists())
     controls['windows'].write_text('good')
     default_features=json.loads(json.dumps(feature_only))
-    for key in ('features','all_features','no_default_features'):
+    for key in ('features','all_features','no_default_features','profile'):
         del default_features['builds'][0][key]
     encode(work/'default-features.json',default_features)
     run(work/'default-features',selected=work/'default-features.json')
     check('omitted options match an explicitly recorded default Cargo selection',
           read(work/'default-features/completed/windows/build-manifest.json')['build_environments'][0]['feature_selection'] ==
           {'features':[],'all_features':False,'no_default_features':False})
+    explicit_release=json.loads(json.dumps(default_features))
+    explicit_release['builds'][0]['profile']='release'
+    encode(work/'release-profile.json',explicit_release)
+    before_trace=trace.read_bytes()
+    run(work/'default-features',selected=work/'release-profile.json')
+    check('explicit release profile reuses an omitted-profile build', trace.read_bytes()==before_trace)
     controls['windows'].write_text('feature-reverse')
     run(work/'feature-reverse',1,work/'default-features.json')
     check('default feature plan rejects a producer that explicitly disables defaults',
           not (work/'feature-reverse/completed/windows').exists() and not (work/'feature-reverse/bundle').exists())
     controls['windows'].write_text('good')
     for label, key, value in (
+        ('path-profile','profile','../ship'),
+        ('numeric-profile','profile',1),
         ('string-features','features','demo-package/cli'),
         ('empty-feature','features',['']),
         ('joined-features','features',['cli,tls']),

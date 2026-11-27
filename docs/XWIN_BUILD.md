@@ -31,8 +31,14 @@ bash scripts/xwin-build.sh \
 
 `--run-dir` must be a new absolute directory with an existing parent. No prior
 run is overwritten or implicitly resumed. `--package NAME` selects a workspace
-package; `--bin NAME` is mandatory. The build always uses `--release`,
-`--locked`, and the manifest's exact `--target`, either
+package. `--bin NAME` is mandatory. The default Cargo profile is `release`.
+Use `--profile NAME` to select a built-in profile or a custom profile from
+the pinned workspace, such as `--profile release-interactive`. All selected
+executables use that profile. Cargo reports executables under `debug/` for
+`dev` and `test`, under `release/` for `release` and `bench`, and under the
+profile's own name for a custom profile. Release admission checks the compiler
+messages against those exact paths. The build uses `--locked` and the
+manifest's exact `--target`, either
 `x86_64-pc-windows-msvc` or `aarch64-pc-windows-msvc`. There is no independent
 CLI target override. The project must have a
 regular `Cargo.toml` and `Cargo.lock`. `--timeout SECONDS` bounds compilation

@@ -102,6 +102,7 @@ if kind == "xwin":
                    CFLAGS="-nobuiltininc -I "+sdk_view+"/include",CXXFLAGS="-nobuiltininc -I "+sdk_view+"/include",LIB=sdk_view+"/lib")
     value["build_environments"] = [dict(target=target, target_triple=spec["target"],
         method="pinned-cargo-xwin",build_influence_env=sdk_env,
+        command=["fixture/cargo-xwin","xwin","build","--release","--locked","--target",spec["target"]],
         selected_sdk=dict(schema_version=1,kind="dsr-xwin-sdk-selection",manifest_sha256=sdk_key,target=spec["target"],
             view=sdk_view,cache_dir=sdk_cache,sysroot_link=sdk_cache+"/windows-msvc-sysroot",sysroot=sdk_view+"/sysroot",environment=sdk_env),
         toolchain=dict(target=spec["target"],manifest_sha256=sdk_key,inputs=dict(target=spec["target"],sysroot=dict(url=sdk_url)),

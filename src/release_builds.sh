@@ -252,7 +252,7 @@ def validate(value):
             require(type(job.get("resume", False)) is bool, "native resume must be boolean", 4)
         elif kind == "xwin":
             require({"project", "toolchain_manifest", "toolchain_sha256"} <= set(job) and
-                    set(job) <= base | {"project", "toolchain_manifest", "toolchain_sha256", "binary", "binaries", "package", "asset_name", "siblings", "cargo_cache", "cache_dir", "offline", "features", "all_features", "no_default_features"} and
+                    set(job) <= base | {"project", "toolchain_manifest", "toolchain_sha256", "binary", "binaries", "package", "asset_name", "siblings", "cargo_cache", "cache_dir", "offline", "features", "all_features", "no_default_features", "profile"} and
                     ("binary" in job) != ("binaries" in job), "xwin requires exactly one of binary or binaries", 4)
             path(job["project"]); path(job["toolchain_manifest"])
             binaries = job["binaries"] if "binaries" in job else [job["binary"]]
@@ -273,6 +273,10 @@ def validate(value):
                     path(job[key])
             if "package" in job:
                 require(matches(job["package"], r"[A-Za-z0-9][A-Za-z0-9_-]*"), "invalid package", 4)
+            if "profile" in job:
+                require(matches(job["profile"], r"[A-Za-z0-9_][A-Za-z0-9_-]*"), "invalid Cargo profile", 4)
+                if job["profile"] == "release":
+                    del job["profile"]  # Preserve the identity of existing default-profile plans.
             if "features" in job:
                 require(isinstance(job["features"], list) and all(cargo_feature(f) for f in job["features"]),
                         "features must be an array of Cargo feature names", 4)
@@ -409,6 +413,16 @@ def require_xwin_inventory(job, manifest, pin):
             toolchain.get("target") == xwin_target(job) and isinstance(toolchain.get("inputs"), dict) and
             toolchain["inputs"].get("target") == xwin_target(job),
             "xwin producer platform or toolchain target differs from the build plan")
+    # Check the profile selector in the producer's hash-bound command. The
+    # original pinned xwin driver always recorded argv with --release here.
+    argv = environment.get("command")
+    selector = ["--profile", job["profile"]] if "profile" in job else ["--release"]
+    prefix = ["xwin", "build", *selector, "--locked"]
+    require(isinstance(argv, list) and all(isinstance(arg, str) for arg in argv) and
+            argv[1:1 + len(prefix)] == prefix and Path(argv[0]).name == "cargo-xwin" and
+            not any(arg in ("--release", "-r", "--profile") or arg.startswith("--profile=")
+                    for arg in argv[1 + len(prefix):]),
+            "xwin build command does not attest the selected Cargo profile")
     has_selection = "feature_selection" in environment
     if has_selection or job.get("features") or job.get("all_features") or job.get("no_default_features"):
         expected = {"features": job.get("features", []), "all_features": job.get("all_features", False),
@@ -475,7 +489,7 @@ def xwin_command(job, attempt):
                "--tool", plan["tool"], "--timeout", str(job["timeout"])]
     for binary in job["binaries"] if "binaries" in job else [job["binary"]]:
         command += ["--bin", binary]
-    for key, option in (("package", "--package"), ("asset_name", "--asset-name"),
+    for key, option in (("package", "--package"), ("profile", "--profile"), ("asset_name", "--asset-name"),
                         ("cargo_cache", "--cargo-cache"), ("cache_dir", "--cache-dir")):
         if key in job:
             command += [option, job[key]]

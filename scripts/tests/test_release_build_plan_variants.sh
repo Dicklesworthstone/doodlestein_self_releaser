@@ -149,6 +149,7 @@ def fixture(base, arch, drivers=False):
             sdk_env = dict(XWIN_CACHE_DIR=sdk_cache,XWIN_CROSS_COMPILER='clang',XWIN_MSVC_SYSROOT_DOWNLOAD_URL=sdk_url,
                            CFLAGS='-nobuiltininc -I '+sdk_view+'/include',CXXFLAGS='-nobuiltininc -I '+sdk_view+'/include',LIB=sdk_view+'/lib')
             env = dict(target=target,target_triple=triple,method='pinned-cargo-xwin',
+                command=['fixture/cargo-xwin','xwin','build','--release','--locked','--target',triple],
                 build_influence_env=sdk_env,selected_sdk=dict(schema_version=1,kind='dsr-xwin-sdk-selection',
                     manifest_sha256=sdk_key,target=triple,view=sdk_view,cache_dir=sdk_cache,
                     sysroot_link=sdk_cache+'/windows-msvc-sysroot',sysroot=sdk_view+'/sysroot',environment=sdk_env),

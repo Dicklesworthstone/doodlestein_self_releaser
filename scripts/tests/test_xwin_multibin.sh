@@ -109,13 +109,21 @@ if role == 'cargo':
         'resolve':{'root':None, 'nodes':nodes}, 'target_directory':os.environ['CARGO_TARGET_DIR']}))
     sys.exit(0)
 assert role == 'cargo-xwin' and args[:2] == ['xwin', 'build']
-assert '--release' in args and '--locked' in args and '--offline' in args
+assert '--locked' in args and '--offline' in args
+if '--profile' in args:
+    assert args.count('--profile') == 1 and '--release' not in args
+    profile = args[args.index('--profile') + 1]
+else:
+    assert args.count('--release') == 1
+    profile = 'release'
 binaries = [args[i+1] for i, v in enumerate(args) if v == '--bin']
 packages = [args[i+1] for i, v in enumerate(args) if v == '--package']
 release = '--message-format=json' in args
 if release: assert sorted(packages) == sorted({p for b, p in spec if b in binaries})
 assert os.environ['XWIN_CROSS_COMPILER'] == 'clang' and not os.environ.get('UNRELATED_SECRET')
-output = Path(os.environ['CARGO_TARGET_DIR'])/'aarch64-pc-windows-msvc/release'
+profile_dir = {'dev':'debug', 'test':'debug', 'bench':'release'}.get(profile, profile)
+if mode == 'wrong-output-profile': profile_dir = 'release'
+output = Path(os.environ['CARGO_TARGET_DIR'])/'aarch64-pc-windows-msvc'/profile_dir
 output.mkdir(parents=True)
 messages = []
 for binary in binaries:
@@ -170,7 +178,7 @@ if release:
         'aliases':{'Kernel32.lib':'kernel32.lib'}}))
     def project(mode):
         p = work/('project-'+mode); p.mkdir()
-        write(p/'Cargo.toml', '[workspace]\nmembers=["server","client"]\n')
+        write(p/'Cargo.toml', '[workspace]\nmembers=["server","client"]\n[profile.ship]\ninherits="release"\n')
         write(p/'Cargo.lock', 'version = 3\n')
         write(p/'mode', mode+'\n')
         for number, binary in enumerate(('server', 'client'), 1):
@@ -222,11 +230,18 @@ if release:
     write(work/'proof.json', proof.decode())
     run('bash', '-c', 'source "$1/src/slsa.sh"; _slsa_release_assets "$2" "$3"', '_', str(root), str(work/'proof.json'), str(good/'artifacts'))
     check('existing release/SLSA admission verifies every named output', len(json.loads(proof)['subject'])==2)
-    same, _ = build('same-package')
+    same, shipped = build('same-package', extra=('--profile','ship'))
+    command = read(same/'release/build-manifest.json')['build_environments'][0]['command']
+    check('custom profile is retained with both executable outputs from that directory',
+          command[1:6] == ['xwin','build','--profile','ship','--locked'] and
+          all((same/'target/aarch64-pc-windows-msvc/ship'/(a['binary']+'.exe')).is_file()
+              for a in shipped['artifacts']))
     check('same-package binaries share a single package selection', read(same/'command.json').count('--package')==1)
     _, single = build('single', binaries=('server',), extra=('--asset-name','server-custom.exe'))
     check('single binary retains the scalar receipt and custom release name', single['artifact']==single['artifacts'][0] and single['artifact']['name']=='server-custom.exe')
-    ordinary, raw = build('ordinary', release=False)
+    ordinary, raw = build('ordinary', extra=('--profile','dev'), release=False)
+    check('dev profile collects the Cargo debug directory',
+          (ordinary/'target/aarch64-pc-windows-msvc/debug/server.exe').is_file())
     check('ordinary multi-binary mode also validates every output', [a['name'] for a in raw['artifacts']]==['server.exe','client.exe'])
     explicit_flags = ('--features','client-package/fast,server-package/portable','--features','client-package/fast',
                       '--no-default-features')
@@ -249,6 +264,7 @@ if release:
           selected_raw['feature_selection']['features']==['client-package/fast','server-package/portable'] and
           read(ordinary_features/'command.json').count('--features')==1)
     build('feature-selection-drift', 7, extra=explicit_flags)
+    build('wrong-output-profile', 7, extra=('--profile','ship'))
     for mode in ('metadata-missing','bad-version','inactive-feature','missing-message','duplicate-message','wrong-package',
                  'wrong-source','wrong-features','test-profile','unexpected-binary','early-finish','missing-secondary',
                  'truncated-secondary','linked-secondary','wrong-arch-secondary','source-drift'):
@@ -259,6 +275,8 @@ if release:
     for mode, bins, extra in (
         ('duplicate-bin', ('server','server'), ()), ('case-collision', ('server','SERVER'), ()),
         ('unsafe-bin', ('server','../client'), ()), ('single-name-for-multiple', ('server','client'), ('--asset-name','one.exe')),
+        ('unsafe-profile', ('server','client'), ('--profile','../ship')),
+        ('duplicate-profile', ('server','client'), ('--profile','dev','--profile','ship')),
         ('unsafe-feature', ('server','client'), ('--features','worker//hidden')),
         ('empty-feature', ('server','client'), ('--features',' , ')),
     ):

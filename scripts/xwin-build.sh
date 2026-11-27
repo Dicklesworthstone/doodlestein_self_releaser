@@ -5,7 +5,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 source "$SCRIPT_DIR/../src/xwin_build.sh" || exit 3
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
     printf '%s\n' 'Usage: xwin-build.sh --manifest FILE --project DIR --bin NAME [--bin NAME ...] --run-dir NEW_DIR' \
-        '       [--package NAME] [--cache-dir DIR] [--cargo-cache DIR] [--offline] [--timeout SECONDS]' \
+        '       [--package NAME] [--profile NAME] [--cache-dir DIR] [--cargo-cache DIR] [--offline] [--timeout SECONDS]' \
         '       [--features "NAME,PACKAGE/NAME ..."] [--all-features] [--no-default-features]' \
         '       [--release-repo OWNER/REPO --release-tag vX.Y.Z --source-sha COMMIT]' \
         '       [--tool NAME] [--asset-name NAME.exe] [--sibling-crates PINNED_SIBLINGS.json]' \
