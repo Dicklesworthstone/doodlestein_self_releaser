@@ -574,21 +574,25 @@ _gh_download_asset_attempt() {
     _gh_check_cli_auth 2>/dev/null || status=$?
     if ((status == 0)); then
         printf 'gh\n' > "$staged_file.transport" || return 4
-        if [[ -z "$maximum" ]]; then
-            secrets_run_gh api "repos/$repo/releases/assets/$asset_id" --hostname github.com \
+        (
+            # A binary artifact is always a machine stream, even when the
+            # operator normally forces gh colors, terminal output, or a pager.
+            unset GH_FORCE_TTY || exit 4
+            NO_COLOR=1 CLICOLOR=0 CLICOLOR_FORCE=0 GH_PAGER=cat \
+                secrets_run_gh api "repos/$repo/releases/assets/$asset_id" --hostname github.com --include \
                 -H "Accept: application/octet-stream" \
                 -H "Cache-Control: no-cache, no-store, max-age=0" \
-                -H "Pragma: no-cache" > "$staged_file" 2>/dev/null
-        else
-            secrets_run_gh api "repos/$repo/releases/assets/$asset_id" --hostname github.com \
-                -H "Accept: application/octet-stream" \
-                -H "Cache-Control: no-cache, no-store, max-age=0" \
-                -H "Pragma: no-cache" 2>/dev/null |
-                _gh_copy_download_body "$staged_file" "$maximum"
-            transfer_status=("${PIPESTATUS[@]}")
-            ((transfer_status[1] == 0)) || return "${transfer_status[1]}"
+                -H "Pragma: no-cache" </dev/null
+        ) 2>/dev/null | _gh_copy_download_body "$staged_file" "$maximum" true
+        transfer_status=("${PIPESTATUS[@]}")
+        # A bounded reader can close the pipe on overflow or malformed headers.
+        # Only that expected SIGPIPE may yield to its result. Preserve real
+        # cancellation/authentication even if EOF made the parser fail too.
+        if ((transfer_status[0] != 0 && transfer_status[0] != 1 && transfer_status[0] != 141)); then
             return "${transfer_status[0]}"
         fi
+        ((transfer_status[1] == 0)) || return "${transfer_status[1]}"
+        return "${transfer_status[0]}"
     elif ((status == 1)); then
         printf 'curl\n' > "$staged_file.transport" || return 4
         token=$(_gh_resolve_token) || return $?
@@ -624,35 +628,107 @@ _gh_download_asset_attempt() {
 }
 
 # Bound real bytes even when a response is chunked or advertises a false length.
-# Closing the pipe on overflow stops the producer; no whole body is buffered.
-# Exit 63 is a definitive size refusal, never a retryable transport failure.
+# gh --include emits its one final status/header block before the body. Split
+# that block without ever interpreting artifact bytes, including a body starting
+# with HTTP/. HTTP errors have separate bounded evidence; they cannot consume a
+# small checksum/signature payload budget and become a false size refusal.
+# Closing the pipe on payload overflow stops the producer. Exit 63 remains a
+# definitive payload size refusal, never a retryable transport failure.
 _gh_copy_download_body() {
     python3 -I -c '
 import os
+import re
 import sys
 
 class BodyTooLarge(Exception):
     pass
 
+class InvalidResponse(Exception):
+    pass
+
+def create(path):
+    return os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "wb")
+
+def header_line(value):
+    if not value.endswith(b"\n"):
+        raise InvalidResponse()
+    value = value[:-2] if value.endswith(b"\r\n") else value[:-1]
+    if any(c < 32 and c != 9 or c == 127 for c in value):
+        raise InvalidResponse()
+    return value
+
 try:
-    remaining = int(sys.argv[2])
-    fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "wb") as output:
+    remaining = int(sys.argv[2]) if sys.argv[2] else None
+    stream = sys.stdin.buffer
+    if sys.argv[3] == "true":
+        # gh prints the response after following redirects. Do not search for
+        # additional status lines in its body: those may be literal file bytes.
+        first = stream.readline(65537)
+        if not first:
+            # A failed CLI can have no HTTP response. Its raw exit status
+            # decides whether to retry; success without headers is refused.
+            sys.exit(0)
+        if len(first) > 65536:
+            raise InvalidResponse()
+        match = re.fullmatch(rb"HTTP/[0-9]+(?:\.[0-9]+)?[ \t]+([1-5][0-9]{2})(?:[ \t]+([^\r\n]*))?", header_line(first))
+        if match is None or match[1].startswith(b"1") or (match[2] or b"").lower() == b"connection established":
+            raise InvalidResponse()
+        code = match[1]
+        headers = bytearray(first)
         while True:
-            block = os.read(0, min(65536, remaining + 1))
+            line = stream.readline(65537 - len(headers))
+            if not line or len(headers) + len(line) > 65536:
+                raise InvalidResponse()
+            headers.extend(line)
+            value = header_line(line)
+            if not value:
+                break
+            field, separator, value = value.partition(b":")
+            if not separator or re.fullmatch(rb"[!#$%&\x27*+\-.^_\x60|~0-9A-Za-z]+", field) is None:
+                raise InvalidResponse()
+        with create(sys.argv[1] + ".headers") as output:
+            output.write(headers)
+        with create(sys.argv[1] + ".http") as output:
+            output.write(code + b"\n")
+        if not code.startswith(b"2"):
+            # Keep at most 64 KiB for structured secondary-rate-limit evidence.
+            # Drain the request inside its existing owned deadline, without
+            # retaining an unbounded error page or charging it to payload size.
+            retained = 0
+            truncated = False
+            with create(sys.argv[1] + ".error") as output:
+                while True:
+                    block = stream.read1(65536)
+                    if not block:
+                        break
+                    selected = block[:65536 - retained]
+                    truncated = truncated or len(selected) != len(block)
+                    output.write(selected)
+                    retained += len(selected)
+                if truncated:
+                    # A valid JSON prefix is not the complete server error.
+                    output.truncate(0)
+            sys.exit(0)
+    with create(sys.argv[1]) as output:
+        while True:
+            block = stream.read1(65536 if remaining is None else min(65536, remaining + 1))
             if not block:
                 break
-            output.write(block[:remaining])
-            if len(block) > remaining:
-                raise BodyTooLarge()
-            remaining -= len(block)
+            output.write(block if remaining is None else block[:remaining])
+            if remaining is not None:
+                if len(block) > remaining:
+                    raise BodyTooLarge()
+                remaining -= len(block)
+except InvalidResponse:
+    print("[github] Missing or invalid GitHub asset HTTP response", file=sys.stderr)
+    sys.exit(8)
 except BodyTooLarge:
     print("[github] Release asset body exceeds the selected byte limit", file=sys.stderr)
     sys.exit(63)
 except (OSError, ValueError):
     print("[github] Cannot retain bounded release asset body", file=sys.stderr)
     sys.exit(23)
-' "$1" "$2"
+' "$1" "$2" "${3:-false}"
 }
 
 # Keep publication in a separate helper so Bash can safely serialize the
@@ -730,7 +806,7 @@ gh_download_release_asset() {
         transport=$(cat "$staged_file.transport" 2>/dev/null) || transport=""
         http_code="" headers=""
         _GH_LAST_RETRY_AFTER="" _GH_LAST_RATE_REMAINING="" _GH_LAST_RATE_RESET=""
-        if [[ "$transport" == curl ]]; then
+        if [[ "$transport" == curl || "$transport" == gh ]]; then
             http_code=$(cat "$staged_file.http" 2>/dev/null) || http_code=""
             headers=$(cat "$staged_file.headers" 2>/dev/null) || headers=""
             _GH_LAST_RETRY_AFTER=$(_gh_response_header retry-after "$headers")
@@ -749,14 +825,21 @@ gh_download_release_asset() {
             break
         fi
 
-        rm -f -- "$staged_file" "$staged_file.headers" "$staged_file.http" "$staged_file.transport"
-        rmdir -- "$staging_dir" 2>/dev/null || true
-        # gh's cancellation/authentication statuses and supervisor failures
-        # must survive unchanged. Only an ordinary CLI failure or a known
-        # transient curl/HTTP error can justify another read attempt.
+        # Classify completed HTTP evidence before discarding private staging.
+        # A generic gh exit 1 does not distinguish 404/authorization failures
+        # from throttling or a broken connection. Preserve terminal statuses,
+        # and apply the same cooldown policy used by the JSON/curl adapters.
         retryable=false rate_limited=false
-        if [[ "$transport" == gh && "$status" == 1 ]]; then
-            retryable=true
+        if [[ "$transport" == gh && ( "$status" == 1 || "$status" == 22 ) ]]; then
+            if [[ "$http_code" == 429 ]] ||
+               { [[ "$http_code" == 403 ]] &&
+                 { [[ -n "$_GH_LAST_RETRY_AFTER" || "$_GH_LAST_RATE_REMAINING" == 0 ]] ||
+                   _gh_is_rate_limited --file "$staged_file.error"; }; }; then
+                retryable=true rate_limited=true
+            elif [[ "$http_code" =~ ^(408|5[0-9][0-9])$ ]] ||
+                 { [[ "$status" == 1 && ( -z "$http_code" || "$http_code" == 2* ) ]]; }; then
+                retryable=true
+            fi
         elif [[ "$transport" == curl ]]; then
             case "$status" in
                 5|6|7|16|18|28|35|52|55|56|92|95) retryable=true ;;
@@ -771,6 +854,8 @@ gh_download_release_asset() {
                     ;;
             esac
         fi
+        rm -f -- "$staged_file" "$staged_file.headers" "$staged_file.http" "$staged_file.transport" "$staged_file.error"
+        rmdir -- "$staging_dir" 2>/dev/null || true
         $retryable || break
         if ((attempt < max_attempts)); then
             # Staging was already removed. Preserve a cancelled wait without
@@ -787,7 +872,7 @@ gh_download_release_asset() {
         fi
     fi
 
-    rm -f -- "$staged_file" "$staged_file.headers" "$staged_file.http" "$staged_file.transport"
+    rm -f -- "$staged_file" "$staged_file.headers" "$staged_file.http" "$staged_file.transport" "$staged_file.error"
     rmdir -- "$staging_dir" 2>/dev/null || true
     if [[ $status -eq 0 ]]; then
         return 0
@@ -1203,12 +1288,20 @@ _gh_retry_pause() {
 
 # Recognize GitHub's top-level rate-limit error, not arbitrary payload text.
 # This classifies the body only; mutation retries also require an HTTP status.
+# --file reads bounded download error evidence without putting arbitrary body
+# bytes in Bash (which cannot preserve NULs).
 _gh_is_rate_limited() {
-    local response="$1"
+    local response="${1:-}"
+    local -a inputs=()
+    if [[ $# == 2 && "$response" == --file ]]; then
+        inputs=("$2")
+    elif [[ $# != 1 ]]; then
+        return 4
+    fi
     jq -es 'length == 1 and (.[0] | type == "object" and
         any(.message, .error; type == "string" and
             test("^(API rate limit exceeded|rate limit exceeded|You have exceeded (a secondary|the) rate limit)([[:space:][:punct:]]|$)"; "i")))' \
-        <<< "$response" >/dev/null 2>&1
+        ${inputs[@]+"${inputs[@]}"} <<< "$response" >/dev/null 2>&1
 }
 
 # ============================================================================

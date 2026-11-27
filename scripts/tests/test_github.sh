@@ -456,7 +456,9 @@ test_credential_transport_routing() (
         [[ "$selected" != none && "$requested_transport" != curl && "$token" != fixture-invalid ]] ;;
       api\ *)
         printf 'GH %s %s\n' "$host" "$token" >> "$calls"
-        if [[ "$2" == */releases/assets/* ]]; then printf 'credential-payload\000\001'
+        if [[ "$2" == */releases/assets/* ]]; then
+          [[ " $* " != *' --include '* ]] || printf 'HTTP/2.0 200 OK\r\n\r\n'
+          printf 'credential-payload\000\001'
         else printf 'HTTP/2.0 200 OK\r\n\r\n{"authenticated":true}\n'; fi ;;
       *) return 4 ;;
     esac
@@ -1374,6 +1376,7 @@ test_download_release_asset_uses_authenticated_gh() {
       return 0
     fi
     printf '%s\n' "$*" > "$gh_log"
+    [[ " $* " != *' --include '* ]] || printf 'HTTP/2.0 200 OK\n\r\n'
     printf 'gh-binary-bytes\001'
   }
 
@@ -1526,6 +1529,7 @@ test_download_transport_scenario() (
       esac
     fi
     printf 'ATTEMPT\n' >> "$calls"
+    [[ " $* " != *' --include '* ]] || printf 'HTTP/2.0 200 OK\r\n\r\n'
     printf 'partial\000response'
     case "$scenario" in
       cli-cancel) return 130 ;;
@@ -1617,10 +1621,14 @@ test_download_publication_race() (
   mkdir "$TEMP_DIR/other" || return 1
   gh() {
     [[ "${1:-} ${2:-}" != 'auth status' ]] || return 0
+    [[ " $* " != *' --include '* ]] || printf 'HTTP/2.0 200 OK\r\n\r\n'
     printf 'downloaded\000payload\377\n'
   }
   python3() {
-    [[ $# -eq 3 && "$1" == - ]] || return 91
+    if [[ $# -ne 3 || "$1" != - ]]; then
+      "$python_bin" "$@"
+      return $?
+    fi
     printf 'publication\n' > "$TEMP_DIR/publication.calls"
     case "$collision" in
       directory) mkdir "$3" || return 92 ;;
@@ -1669,6 +1677,7 @@ test_download_supports_relative_hyphen_paths() (
   mkdir ./-directory || return 1
   gh() {
     [[ "${1:-} ${2:-}" != 'auth status' ]] || return 0
+    [[ " $* " != *' --include '* ]] || printf 'HTTP/2.0 200 OK\r\n\r\n'
     printf 'relative\000payload\377\n\n'
   }
   for destination in relative.bin -leading.bin '-directory/-leading name.bin'; do
@@ -1697,6 +1706,7 @@ test_exported_download_scenario() (
       esac
     fi
     printf 'ATTEMPT\n' >> "$DSR_TEST_DOWNLOAD_DIR/exported.calls"
+    [[ " $* " != *' --include '* ]] || printf 'HTTP/2.0 200 OK\r\n\r\n'
     printf 'exported\000payload\377\n\n'
     [[ "$DSR_TEST_DOWNLOAD_CASE" != cli-cancel ]] || return 130
   }
@@ -1796,6 +1806,7 @@ gh() {
     [[ "$phase" != auth ]] || stall
     [[ "$phase" == auth || "$phase" == gh ]]
   else
+    [[ " $* " != *' --include '* ]] || printf 'HTTP/2.0 200 OK\r\n\r\n'
     printf 'partial\000body'
     stall
   fi
@@ -1835,8 +1846,227 @@ for phase in ('auth', 'gh', 'curl', 'token'):
 PY
 }
 
+
+# Keep the actual supervisor, bounded stream parser, retry policy and atomic
+# publication. Only gh and the retry clock are local protocol fixtures. Header
+# output is conditional, so the same cases can compare the unchanged baseline.
+test_download_gh_http_scenario() (
+  local download_http_case="$1" download_http_expected_status="$2"
+  local download_http_expected_attempts="$3" download_http_expected_waits="${4:--}"
+  local download_http_root="$TEMP_DIR/http-download" download_http_status=0 download_http_count
+  local download_http_destination="$TEMP_DIR/result.bin" download_http_limit
+  local GH_MAX_RETRIES=3 GH_RETRY_DELAY=0 GH_MAX_RETRY_WAIT=300
+  local GH_DOWNLOAD_TIMEOUT=5 GH_DOWNLOAD_CONNECT_TIMEOUT=2
+  export DSR_GH_TOKEN=http-download-fixture GITHUB_TOKEN='' GH_TOKEN=''
+  mkdir "$download_http_root" || return 1
+  printf '0\n' > "$download_http_root/attempts"
+  : > "$download_http_root/waits"
+  : > "$download_http_root/auth"
+  # NUL, high bytes, escapes, CRLF and trailing newlines must survive exactly.
+  # A payload may itself start with a complete-looking HTTP response.
+  printf 'HTTP/2 429\r\nRetry-After: 9999\r\n\r\n\000\001\377\033\r\n\n' > "$download_http_root/expected"
+  if [[ "$download_http_case" == empty ]]; then : > "$download_http_root/expected"; fi
+  download_http_limit=$(wc -c < "$download_http_root/expected") || return 1
+  download_http_limit="${download_http_limit//[[:space:]]/}"
+  [[ "$download_http_case" != oversized-payload ]] || download_http_limit=3
+  if [[ "$download_http_case" == forced-terminal ]]; then
+    export GH_FORCE_TTY=120 GH_PAGER=fixture-pager CLICOLOR_FORCE=1
+  fi
+  sleep() {
+    printf '%s\n' "$1" >> "$download_http_root/waits"
+    [[ "$download_http_case" != cancelled-wait ]]
+  }
+  date() {
+    if [[ "$*" == '+%s' ]]; then printf '1700000000\n'; else command date "$@"; fi
+  }
+  gh() {
+    if [[ "${1:-} ${2:-}" == 'auth status' ]]; then
+      printf 'auth\n' >> "$download_http_root/auth"
+      return 0
+    fi
+    [[ "${1:-}" == api && "${2:-}" == repos/owner/repo/releases/assets/60 ]] || return 91
+    local download_http_include=false download_http_argument download_http_request
+    local download_http_code=200 download_http_exit=0 download_http_headers=''
+    for download_http_argument in "$@"; do
+      [[ "$download_http_argument" != --include ]] || download_http_include=true
+    done
+    read -r download_http_request < "$download_http_root/attempts"
+    download_http_request=$((download_http_request + 1))
+    printf '%s\n' "$download_http_request" > "$download_http_root/attempts"
+    printf '%s\n' "$*" >> "$download_http_root/arguments"
+    if [[ "$download_http_case" == forced-terminal ]]; then
+      [[ -z "${GH_FORCE_TTY+x}" && "${NO_COLOR:-}" == 1 &&
+         "${CLICOLOR:-}" == 0 && "${CLICOLOR_FORCE:-}" == 0 &&
+         "${GH_PAGER:-}" == cat ]] || return 92
+    fi
+    if ((download_http_request == 1)) || [[ "$download_http_case" == exhausted ]]; then
+      case "$download_http_case" in
+        retry-after|large-error|exhausted|cancelled-wait|cancelled|cancelled-term|deadline-status|auth-status)
+          download_http_code=429; download_http_exit=1
+          download_http_headers=$'rEtRy-AfTeR: 7\r\n' ;;
+        retry-reset)
+          download_http_code=403; download_http_exit=1
+          download_http_headers=$'X-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 1700000011\r\n' ;;
+        retry-message|forbidden|unrelated-message|oversized-message|forbidden-capacity)
+          download_http_code=403; download_http_exit=1 ;;
+        unauthorized)
+          download_http_code=401; download_http_exit=1
+          download_http_headers=$'Retry-After: 7\r\n' ;;
+        not-found) download_http_code=404; download_http_exit=1 ;;
+        unavailable|request-timeout)
+          download_http_code=503; download_http_exit=1
+          [[ "$download_http_case" != request-timeout ]] || download_http_code=408 ;;
+        transient-with-backoff)
+          download_http_code=503; download_http_exit=1
+          download_http_headers=$'Retry-After: 3\r\n' ;;
+        excessive-wait)
+          download_http_code=429; download_http_exit=1
+          download_http_headers=$'Retry-After: 3600\r\n' ;;
+        invalid-wait)
+          download_http_code=429; download_http_exit=1
+          download_http_headers=$'Retry-After: tomorrow\r\n' ;;
+        error-with-success-exit)
+          download_http_code=429
+          download_http_headers=$'Retry-After: 7\r\n' ;;
+        network-failure) return 1 ;;
+        cancelled-empty) return 130 ;;
+        partial-transfer) download_http_exit=1 ;;
+        cancelled-partial)
+          $download_http_include && printf 'HTTP/2.0 429 Too Many Requests\nRetry-After:'
+          return 130 ;;
+      esac
+    fi
+    if [[ "$download_http_case" == forbidden-capacity ]]; then
+      download_http_headers=$'X-RateLimit-Remaining: 1\r\nX-RateLimit-Reset: 1700000011\r\n'
+    fi
+    if $download_http_include; then
+      case "$download_http_case" in
+        missing-header) printf 'raw\000payload\n'; return 0 ;;
+        incomplete-header) printf 'HTTP/2.0 200 OK\nContent-Type: application/octet-stream'; return 0 ;;
+        invalid-status) printf 'HTTP/2.0 000 Unknown\n\r\n'; return 0 ;;
+        interim-only) printf 'HTTP/1.1 100 Continue\r\n\r\n'; return 0 ;;
+        proxy-only) printf 'HTTP/1.1 200 Connection established\r\n\r\n'; return 0 ;;
+        excessive-header)
+          printf 'HTTP/2.0 200 OK\nX-Padding: %65536s\r\n\r\n' ''
+          return 0 ;;
+        invalid-header) printf 'HTTP/2.0 200 OK\nBad Header: value\r\n\r\n'; return 0 ;;
+        lf-headers) printf 'HTTP/2.0 %s OK\nContent-Type: application/octet-stream\n\n' "$download_http_code" ;;
+        crlf-headers) printf 'HTTP/1.1 %s OK\r\nContent-Type: application/octet-stream\r\n\r\n' "$download_http_code" ;;
+        no-header-fields) printf 'HTTP/2.0 %s OK\n\r\n' "$download_http_code" ;;
+        *) printf 'HTTP/2.0 %s Response\n%s\r\n' "$download_http_code" "$download_http_headers" ;;
+      esac
+    fi
+    if [[ "$download_http_code" == 2* ]]; then
+      if [[ "$download_http_case" == partial-transfer && "$download_http_request" == 1 ]]; then
+        head -c 5 "$download_http_root/expected"
+      else
+        cat "$download_http_root/expected"
+      fi
+    else
+      # A normal JSON error can be larger than a signature or checksum file.
+      case "$download_http_case" in
+        retry-message) printf '{"message":"You have exceeded a secondary rate limit."}\n' ;;
+        unrelated-message) printf '{"message":"Forbidden","detail":"API rate limit exceeded"}\n' ;;
+        oversized-message)
+          printf '{"message":"API rate limit exceeded"}'
+          printf '%70000s' ''
+          printf 'untrusted suffix' ;;
+        large-error) printf '{"message":"Unavailable","padding":"%70000s"}\n' '' ;;
+        *) printf '{"message":"Unavailable","padding":"%160s"}\n' '' ;;
+      esac
+    fi
+    case "$download_http_case" in
+      cancelled) return 130 ;;
+      cancelled-term) kill -TERM "$BASHPID"; return 93 ;;
+      deadline-status) return 124 ;;
+      auth-status) return 4 ;;
+    esac
+    return "$download_http_exit"
+  }
+  local -a download_http_args=(owner/repo 60 "$download_http_destination")
+  [[ "$download_http_case" == unbounded ]] || download_http_args+=("$download_http_limit")
+  gh_download_release_asset "${download_http_args[@]}" > "$download_http_root/stdout" \
+    2> "$download_http_root/stderr" || download_http_status=$?
+  read -r download_http_count < "$download_http_root/attempts"
+  if [[ "$download_http_status" != "$download_http_expected_status" ||
+        "$download_http_count" != "$download_http_expected_attempts" ]]; then
+    printf 'FAIL download %s: exit=%s attempts=%s expected=%s/%s\n' \
+      "$download_http_case" "$download_http_status" "$download_http_count" \
+      "$download_http_expected_status" "$download_http_expected_attempts"
+    cat "$download_http_root/stderr"
+    return 1
+  fi
+  if [[ "$download_http_expected_waits" == - ]]; then
+    [[ ! -s "$download_http_root/waits" ]] || return 1
+  else
+    cmp "$download_http_root/waits" <(printf '%s\n' "${download_http_expected_waits//,/$'\n'}") || return 1
+  fi
+  [[ ! -s "$download_http_root/stdout" ]] || return 1
+  [[ -z "$(find "$TEMP_DIR" -maxdepth 1 -name '.dsr-asset-download.*' -print -quit)" ]] || return 1
+  assert_equals "$download_http_expected_attempts" "$(wc -l < "$download_http_root/auth" | tr -d '[:space:]')" \
+    "one credential check per download attempt" || return 1
+  if ((download_http_status == 0)); then
+    cmp "$download_http_destination" "$download_http_root/expected" || return 1
+  else
+    [[ ! -e "$download_http_destination" && ! -L "$download_http_destination" ]] || return 1
+  fi
+  if [[ "$download_http_case" == forced-terminal ]]; then
+    [[ "$GH_FORCE_TTY" == 120 && "$GH_PAGER" == fixture-pager && "$CLICOLOR_FORCE" == 1 ]] || return 1
+  fi
+)
+
+run_download_gh_http_regressions() {
+  local scenario status attempts waits
+  while read -r scenario status attempts waits; do
+    run_test "download_gh_http_$scenario" test_download_gh_http_scenario "$scenario" "$status" "$attempts" "$waits"
+  done <<'GH_DOWNLOAD_HTTP_CASES'
+exact-binary 0 1 -
+unbounded 0 1 -
+empty 0 1 -
+lf-headers 0 1 -
+crlf-headers 0 1 -
+no-header-fields 0 1 -
+forced-terminal 0 1 -
+retry-after 0 2 7
+retry-reset 0 2 11
+retry-message 0 2 60
+large-error 0 2 7
+unavailable 0 2 0
+request-timeout 0 2 0
+transient-with-backoff 0 2 3
+error-with-success-exit 0 2 7
+network-failure 0 2 0
+partial-transfer 0 2 0
+unauthorized 1 1 -
+forbidden 1 1 -
+forbidden-capacity 1 1 -
+not-found 1 1 -
+unrelated-message 1 1 -
+oversized-message 1 1 -
+excessive-wait 8 1 -
+invalid-wait 8 1 -
+exhausted 1 3 7,7
+cancelled-wait 5 1 7
+cancelled 130 1 -
+cancelled-empty 130 1 -
+cancelled-term 143 1 -
+cancelled-partial 130 1 -
+deadline-status 124 1 -
+auth-status 4 1 -
+oversized-payload 63 1 -
+missing-header 8 1 -
+incomplete-header 8 1 -
+invalid-status 8 1 -
+interim-only 8 1 -
+proxy-only 8 1 -
+excessive-header 8 1 -
+invalid-header 8 1 -
+GH_DOWNLOAD_HTTP_CASES
+}
+
 run_asset_download_regressions() {
   local scenario status attempts
+  run_download_gh_http_regressions
   while read -r scenario status attempts; do
     run_test "download_$scenario" test_download_transport_scenario "$scenario" "$status" "$attempts"
   done <<'DOWNLOAD_SCENARIOS'
@@ -2234,6 +2464,9 @@ test_release_upload_scenario() (
         local count
         read -r count < "$downloads"
         printf '%s\n' "$((count + 1))" > "$downloads"
+        if [[ "$scenario" != legacy-download-fails && " $* " == *' --include '* ]]; then
+          printf 'HTTP/2.0 200 OK\r\n\r\n'
+        fi
         if [[ "$scenario" == legacy-corrupt ]]; then
           # Same byte count: size-only checks would incorrectly pass.
           printf 'RELEASE-payload\000\001\377\n'
@@ -3506,6 +3739,13 @@ main() {
   if [[ "${1:-}" == --api-retry-only ]]; then
     run_api_retry_regressions
     printf 'API retries: %s passed, %s failed\n' "$TESTS_PASSED" "$TESTS_FAILED"
+    [[ "$TESTS_FAILED" -eq 0 ]]
+    exit $?
+  fi
+  if [[ "${1:-}" == --asset-download-http-only ]]; then
+    run_download_gh_http_regressions
+    run_test "download_bounds_authentication_and_transfers" test_download_bounds_authentication_and_transfers
+    printf 'GitHub CLI binary HTTP downloads: %s passed, %s failed\n' "$TESTS_PASSED" "$TESTS_FAILED"
     [[ "$TESTS_FAILED" -eq 0 ]]
     exit $?
   fi

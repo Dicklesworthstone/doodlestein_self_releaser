@@ -412,6 +412,15 @@ jobs:
           mkdir -p "$RUNNER_TEMP/dsr-test-bin"
           GOBIN="$RUNNER_TEMP/dsr-test-bin" go install github.com/mikefarah/yq/v4@v4.47.1
           echo "$RUNNER_TEMP/dsr-test-bin" >> "$GITHUB_PATH"
+      - name: Verify throttled binary asset downloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n src/github.sh
+          bash -n scripts/tests/test_github.sh
+          shellcheck -S warning src/github.sh scripts/tests/test_github.sh
+          timeout 120 bash scripts/tests/test_github.sh --asset-download-http-only
+          test -z "$(git status --porcelain)"
       - name: Preserve cancellation through Cargo admission and the build command
         shell: bash
         run: |
