@@ -92,12 +92,35 @@ _act_file_identity() {
     return 4
 }
 
-# Native SSH transfers use raw process statuses. Preserve signal exits without
-# treating SSH's 255 or the supervisor's 124/125/137 failures as cancellation.
+# Native execution and transfers use raw process statuses. Preserve signal exits
+# without treating SSH's 255 or the supervisor's 124/125/137 as cancellation.
 _act_artifact_transfer_interrupted() {
     local status="${1:-0}"
     [[ "$status" =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
     ((status >= 129 && status <= 192 && status != 137))
+}
+
+# Preparation can stop before a private attempt log and full native receipt
+# exist. Emit only the observed interrupted phase, never partial cache stdout
+# or artifact authority. The caller retains the process status even when this
+# diagnostic cannot be serialized.
+_act_native_preparation_interrupted() {
+    local code="$1" tool="$2" platform="$3" host="$4" triple="$5" phase="$6" timeout="$7"
+    _act_artifact_transfer_interrupted "$code" || return 1
+    _log_error "Native $phase interrupted on $host (exit $code); explicit retry is required"
+    jq -nc --arg tool "$tool" --arg platform "$platform" --arg host "$host" \
+        --arg target "$triple" --arg phase "$phase" --argjson code "$code" --arg timeout "$timeout" '
+        def seconds: if test("^[1-9][0-9]*$") then tonumber else null end;
+        {tool:$tool,platform:$platform,host:$host,method:"native",
+         target_triple:(if $target == "" then null else $target end),
+         status:"failed",exit_code:$code,stage:$phase,
+         artifact_path:"",artifact_paths:[],additional_artifacts:[],
+         collected_sha256:null,collected_size_bytes:null,collected_identity:null,
+         error:("Native " + $phase + " interrupted; explicit retry is required"),
+         native_execution:{phase:$phase,
+             timeout_seconds:($timeout | seconds),transport_timeout_seconds:($timeout | seconds),
+             command_exit_code:$code,failure_kind:"command",build_program_dispatched:false}}' || true
+    return 0
 }
 
 # Collect producer stdout into a newly-created file while holding the original
@@ -5470,7 +5493,7 @@ _act_windows_command_script() {
 _act_windows_stage_build_script() {
     local host="$1" source_root="$2" script="$3"
     local destination uuid local_dir local_script remote_dir remote_script digest setup guard
-    local remote_parent remote_parent_q remote_dir_q remote_script_q
+    local remote_parent remote_parent_q remote_dir_q remote_script_q transfer_status=0
     destination=$(_act_get_ssh_destination "$host") || return 4
     uuid=$(_act_generate_uuid) || return 4
     _act_is_uuid "$uuid" || return 4
@@ -5494,13 +5517,21 @@ _act_windows_stage_build_script() {
     digest=$(_act_sha256 "$local_script") || return 4
     setup="\$ErrorActionPreference='Stop'; \$parent=Get-Item -LiteralPath '$remote_parent_q' -Force; if (-not \$parent.PSIsContainer -or ((\$parent.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Launcher parent is not a plain directory' }; if (Test-Path -LiteralPath '$remote_dir_q') { throw 'Launcher destination already exists' }; New-Item -ItemType Directory -Path '$remote_dir_q' | Out-Null; \$acl=Get-Acl -LiteralPath '$remote_dir_q'; \$acl.SetAccessRuleProtection(\$true,\$false); \$user=[Security.Principal.WindowsIdentity]::GetCurrent().User; \$rule=[Security.AccessControl.FileSystemAccessRule]::new(\$user,'FullControl','ContainerInherit,ObjectInherit','None','Allow'); \$acl.AddAccessRule(\$rule); Set-Acl -LiteralPath '$remote_dir_q' -AclObject \$acl"
     setup+="; \$system=[Security.Principal.SecurityIdentifier]::new('S-1-5-18'); \$systemRule=[Security.AccessControl.FileSystemAccessRule]::new(\$system,'FullControl','ContainerInherit,ObjectInherit','None','Allow'); \$acl.AddAccessRule(\$systemRule); Set-Acl -LiteralPath '$remote_dir_q' -AclObject \$acl"
-    _act_ssh_exec "$host" "$(_act_windows_encoded_powershell "$setup" pwsh)" 60 >&2 || return 4
+    _act_ssh_exec "$host" "$(_act_windows_encoded_powershell "$setup" pwsh)" 60 >&2 || transfer_status=$?
+    if [[ $transfer_status -ne 0 ]]; then
+        _act_artifact_transfer_interrupted "$transfer_status" && return "$transfer_status"
+        return 4
+    fi
     # Upload precedes the remote build deadline. Bound the whole transfer and
     # its descendants with the source-sync budget, including after connection.
     _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" scp -q \
         -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
         -o StrictHostKeyChecking=accept-new "$local_script" "$destination:$remote_script" \
-        </dev/null >&2 || return 4
+        </dev/null >&2 || transfer_status=$?
+    if [[ $transfer_status -ne 0 ]]; then
+        _act_artifact_transfer_interrupted "$transfer_status" && return "$transfer_status"
+        return 4
+    fi
     # A normal custom scan retains Defender policy; no exclusion, policy
     # bypass, or restoration of quarantined content is permitted here.
     guard="\$ErrorActionPreference='Stop'; \$item=Get-Item -LiteralPath '$remote_script_q' -Force; if (\$item.PSIsContainer -or ((\$item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Launcher is not a plain file' }; \$scanner=Join-Path \$env:ProgramFiles 'Windows Defender/MpCmdRun.exe'; if (Test-Path -LiteralPath \$scanner) { & \$scanner -Scan -ScanType 3 -File \$item.FullName | ForEach-Object { [Console]::Error.WriteLine(\$_) }; if (\$LASTEXITCODE -ne 0) { throw 'Launcher security scan failed' } }; \$held=[IO.File]::Open('$remote_script_q',[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read); try { \$actual=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(\$held)); if (\$actual -ne '$digest') { throw 'Launcher digest mismatch' }; & '$remote_script_q'; exit \$LASTEXITCODE } finally { \$held.Dispose() }"
@@ -5513,7 +5544,7 @@ _act_windows_stage_build_script() {
 # The full run UUID and a checked marker bind this directory to one source run.
 # Existing output trees are retained; this helper never moves or deletes them.
 _act_windows_short_target_directory() {
-    local host="$1" path="$2" run_id="$3" platform="$4" script short result
+    local host="$1" path="$2" run_id="$3" platform="$4" script short result command_status=0
     [[ "$path" =~ ^[A-Za-z]:/[A-Za-z0-9_./+-]+$ && "$path" != *..* ]] || return 4
     _act_is_uuid "$run_id" || return 4
     [[ "$platform" == windows/amd64 || "$platform" == windows/arm64 ]] || return 4
@@ -5529,7 +5560,11 @@ _act_windows_short_target_directory() {
     if [[ $storage_status -eq 0 ]]; then
         script+="; \$scratch=Join-Path '$short' 'scratch'; if (-not (Test-Path -LiteralPath \$scratch)) { New-Item -ItemType Directory -Path \$scratch | Out-Null }; \$scratchItem=Get-Item -LiteralPath \$scratch -Force; if (-not \$scratchItem.PSIsContainer -or ((\$scratchItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Build scratch is not a plain directory' }"
     fi
-    result=$(_act_ssh_exec "$host" "$(_act_windows_encoded_powershell "$script" pwsh)" 60) || return 4
+    result=$(_act_ssh_exec "$host" "$(_act_windows_encoded_powershell "$script" pwsh)" 60) || command_status=$?
+    if [[ $command_status -ne 0 ]]; then
+        _act_artifact_transfer_interrupted "$command_status" && return "$command_status"
+        return 4
+    fi
     result="${result//$'\r'/}"
     [[ "$result" == "$short" ]] || return 4
     printf '%s' "$short"
@@ -8029,7 +8064,10 @@ _act_finish_private_cargo_home_receipt() {
             ($receipt | if length == 1 then .[0]
              else error("exactly one private Cargo final receipt required") end) as $receipt |
             {command_exit_code: $command_exit, receipt: $receipt}' \
-            3<<< "${receipt:-null}" || return 4
+            3<<< "${receipt:-null}" || {
+                _act_artifact_transfer_interrupted "$result_exit" && return "$result_exit"
+                return 4
+            }
     elif [[ $result_exit -eq 0 ]]; then
         printf '%s\n' "$receipt"
     fi
@@ -15342,7 +15380,15 @@ act_run_native_build() {
             return 4
         fi
         if _act_is_windows_host "$host"; then
-            strict_cargo_target_dir=$(_act_windows_short_target_directory "$host" "$canonical_cargo_target_dir" "$run_id" "$platform") || return 4
+            local strict_target_prepare_status=0
+            strict_cargo_target_dir=$(_act_windows_short_target_directory "$host" "$canonical_cargo_target_dir" "$run_id" "$platform") || strict_target_prepare_status=$?
+            if [[ $strict_target_prepare_status -ne 0 ]]; then
+                if _act_native_preparation_interrupted "$strict_target_prepare_status" "$tool_name" \
+                        "$platform" "$host" "$native_target_triple" cargo_target_preparation 60; then
+                    return "$strict_target_prepare_status"
+                fi
+                return 4
+            fi
         fi
         while IFS= read -r env_pair; do
             [[ -z "$env_pair" || "$env_pair" == CARGO_TARGET_DIR=* || \
@@ -15416,9 +15462,15 @@ act_run_native_build() {
                 return 4
             fi
         fi
-        if ! strict_cargo_seed_json=$("$cargo_prepare" \
-                "$host" "$remote_path" "${platform//\//-}-${cargo_attempt//-/}" \
-                "$build_cmd" "$strict_build_env") || \
+        local strict_cargo_prepare_status=0
+        strict_cargo_seed_json=$("$cargo_prepare" \
+            "$host" "$remote_path" "${platform//\//-}-${cargo_attempt//-/}" \
+            "$build_cmd" "$strict_build_env") || strict_cargo_prepare_status=$?
+        if _act_native_preparation_interrupted "$strict_cargo_prepare_status" \
+                "$tool_name" "$platform" "$host" "$native_target_triple" cargo_preparation null; then
+            return "$strict_cargo_prepare_status"
+        fi
+        if [[ $strict_cargo_prepare_status -ne 0 ]] || \
            ! strict_cargo_home=$(jq -er '.cargo_home' <<< "$strict_cargo_seed_json"); then
             _log_error "Unable to prepare a private strict Cargo cache on $host"
             jq -nc '{status: "error", exit_code: 4, error: "Strict Cargo cache preparation failed"}'
@@ -16303,7 +16355,13 @@ EOF
         # Every guard needs its private launcher directory, including ordinary
         # and non-Rust builds. remote_path still names the existing source;
         # the future ordinary Cargo stage is prepared separately below.
-        remote_cmd=$(_act_windows_stage_build_script "$host" "$remote_path" "$windows_build_script") || return 4
+        local windows_stage_status=0
+        remote_cmd=$(_act_windows_stage_build_script "$host" "$remote_path" "$windows_build_script") || windows_stage_status=$?
+        if _act_native_preparation_interrupted "$windows_stage_status" \
+                "$tool_name" "$platform" "$host" "$native_target_triple" build_preparation null; then
+            return "$windows_stage_status"
+        fi
+        [[ $windows_stage_status -eq 0 ]] || return 4
         # Let the remote deadline retire its job before killing the transport.
         # This grace is not additional build time and never enables local work.
         build_transport_timeout=$((_ACT_BUILD_TIMEOUT + 60))
@@ -16335,6 +16393,11 @@ EOF
             nonstrict_prepare=_act_prepare_windows_nonstrict_cargo_home
             nonstrict_prepare_root="$remote_path"
         fi
+        native_execution_phase=cargo_preparation
+        native_execution_timeout="$_ACT_SYNC_TIMEOUT"
+        native_execution_transport_timeout="$_ACT_SYNC_TIMEOUT"
+        _act_log_native_execution "$log_file" start "$native_execution_phase" \
+            "$_ACT_SYNC_TIMEOUT" "$_ACT_SYNC_TIMEOUT" null false || true
         if _act_is_windows_host "$host"; then
             nonstrict_cargo_seed_json=$("$nonstrict_prepare" "$host" \
                 "$nonstrict_prepare_root" "$nonstrict_stage_root" "$nonstrict_cargo_home" 2>>"$log_file") || \
@@ -16344,6 +16407,9 @@ EOF
                 "$nonstrict_prepare_root" "$nonstrict_stage_root" "$nonstrict_cargo_home" "$remote_path" 2>>"$log_file") || \
                 nonstrict_prepare_status=$?
         fi
+        native_execution_exit="$nonstrict_prepare_status"
+        _act_log_native_execution "$log_file" finish "$native_execution_phase" \
+            "$_ACT_SYNC_TIMEOUT" "$_ACT_SYNC_TIMEOUT" "$nonstrict_prepare_status" false || true
         [[ -s "$log_file" ]] && cat "$log_file" >&2
         if [[ $nonstrict_prepare_status -eq 0 ]] && \
            nonstrict_seed_home=$(jq -er '.cargo_home' <<< "$nonstrict_cargo_seed_json") && \
@@ -16356,6 +16422,11 @@ EOF
         else
             _log_error "Unable to prepare a private Cargo dependency cache on $host; not building $platform" 2>&1 | tee -a "$log_file" >&2
             exit_code=4
+            native_execution_failure_kind=validation
+            if [[ $nonstrict_prepare_status -ne 0 ]]; then
+                native_execution_failure_kind=command
+                _act_artifact_transfer_interrupted "$nonstrict_prepare_status" && exit_code="$nonstrict_prepare_status"
+            fi
         fi
     fi
 
@@ -17509,6 +17580,13 @@ EOF
             fi
         fi
 
+    elif _act_artifact_transfer_interrupted "$exit_code"; then
+        # The coordinator uses this terminal receipt to stop queued tasks and
+        # drain peers. Mapping a caught signal to BUILD_FAILED would authorize
+        # later builds and automatic retries after an interrupted endpoint.
+        native_execution_error="Native ${native_execution_phase:-execution} interrupted on $host (exit $exit_code); explicit retry is required"
+        _log_error "$native_execution_error"
+        status="failed"
     elif [[ -n "$native_storage_error" ]]; then
         # A late capacity refusal never started the build command. Preserve
         # the admission outcome for public reporting and resume accounting.
@@ -17614,7 +17692,10 @@ EOF
           + (if $storage_error == "" then {} else
                {stage:"host_readiness",error:$storage_error} end)' \
         3< <(printf '%s' "${local_artifact_path:-}") \
-        <<< "$cargo_isolation_json"$'\n'"$artifact_paths_json"$'\n'"$additional_artifacts_json"$'\n'"$build_influence_env_json" || return 4
+        <<< "$cargo_isolation_json"$'\n'"$artifact_paths_json"$'\n'"$additional_artifacts_json"$'\n'"$build_influence_env_json" || {
+            _act_artifact_transfer_interrupted "$exit_code" && return "$exit_code"
+            return 4
+        }
 
     return "$exit_code"
 }
@@ -17950,6 +18031,25 @@ _act_backend_result_json() {
     ' <<< "$result"
 }
 
+# A cancelled backend cannot grant artifact authority, even if it emitted a
+# success-shaped or incomplete receipt before its process ended. Stop before
+# recipe re-observation and preserve the signal if diagnostic JSON fails too.
+_act_interrupted_backend_result() {
+    local code="$1" result="$2" platform="$3" method="$4" host="$5" triple="${6:-}"
+    _act_artifact_transfer_interrupted "$code" || return 1
+    jq -nc --rawfile result /dev/fd/3 --argjson code "$code" \
+        --arg platform "$platform" --arg method "$method" --arg host "$host" --arg triple "$triple" '
+        ($result | try fromjson catch null) as $receipt |
+        (if ($receipt | type) == "object" then $receipt
+         else {stage:"backend_receipt",error:"Backend interrupted before a complete result"} end) |
+        . + {platform:$platform,method:$method,host:$host,
+             target_triple:(if $triple == "" then .target_triple // null else $triple end),
+             status:"failed",exit_code:$code,artifact_path:"",artifact_paths:[],artifact_count:0,
+             additional_artifacts:[],collected_sha256:null,collected_size_bytes:null,collected_identity:null} |
+        del(.resume_artifacts,.artifact_dir,.workflow_artifact_dir)' 3<<< "$result" || true
+    return 0
+}
+
 # Execute exactly one target and emit exactly one compact JSON result on
 # stdout. Diagnostic/build output remains on stderr all the way to the worker.
 # Neither a compiler log line nor a partial/multiple result stream can replace
@@ -18056,6 +18156,9 @@ _act_build_orchestration_target() {
         full_output=$(act_run_workflow \
             "$local_path" "$workflow" "$job" "$event" "$version" \
             "${act_args[@]}") || exit_code=$?
+        if _act_interrupted_backend_result "$exit_code" "$full_output" "$target" act "$host" "$selected_triple"; then
+            return "$exit_code"
+        fi
         if ! result=$(jq -cse '
                 if length == 1 and (.[0] | type == "object") then .[0]
                 else error("exactly one backend result object required") end
@@ -18113,6 +18216,9 @@ _act_build_orchestration_target() {
         full_output=$(act_run_native_build \
             "$tool_name" "$target" "$version" "$run_id" "$remote_path_override" \
             "$release_git_sha" "$release_git_ref" "$host" "$selected_triple" "$ordinary_source_root") || exit_code=$?
+        if _act_interrupted_backend_result "$exit_code" "$full_output" "$target" native "$host" "$selected_triple"; then
+            return "$exit_code"
+        fi
         if ! result=$(jq -cse '
                 if length == 1 and (.[0] | type == "object") then .[0]
                 else error("exactly one backend result object required") end
@@ -18592,7 +18698,7 @@ _act_run_target_worker() {
         fi
     fi
 
-    local worker_status=0 result receipts frozen_result result_status
+    local worker_status=0 worker_receipt_failure_exit=4 result receipts frozen_result result_status
     local worker_monitor=false worker_message="" worker_protocol_valid=false
     [[ $- != *m* ]] || worker_monitor=true
     set -m
@@ -18628,6 +18734,13 @@ _act_run_target_worker() {
         worker_status="$worker_guard_exit"
         [[ "$worker_status" -ne 0 ]] || worker_status=6
     fi
+    # Once the owned backend reports cancellation, a transient receipt parse,
+    # serializer or write failure must not turn it into an ordinary failure
+    # that lets the coordinator dispatch more work. Keep this observation
+    # independent of worker_status, which command substitutions below replace.
+    if _act_artifact_transfer_interrupted "$worker_status"; then
+        worker_receipt_failure_exit="$worker_status"
+    fi
 
     # Retain the raw stream for diagnostics, but never read attempt.log as
     # authority: it contains compiler text and can contain arbitrary JSON.
@@ -18651,7 +18764,7 @@ _act_run_target_worker() {
        ! worker_status=$(jq -er '.exit_code' <<< "$result"); then
         _act_worker_release_slot
         trap - EXIT INT TERM HUP
-        return 4
+        return "$worker_receipt_failure_exit"
     fi
     result_status=$(jq -r '.status // "unknown"' <<< "$result")
     if [[ "$result_status" == success || "$result_status" == ok || "$result_status" == passed ]] && \
@@ -18694,7 +18807,7 @@ _act_run_target_worker() {
         # scope, including storage/receipt failures after a real build.
         _act_worker_release_slot
         trap - EXIT INT TERM HUP
-        return 4
+        return "$worker_receipt_failure_exit"
     fi
     _act_worker_release_slot
     trap - EXIT INT TERM HUP
@@ -22417,6 +22530,7 @@ export -f _act_strict_go_workfile_json _act_strict_go_build_env _act_validate_st
 export -f _act_validate_strict_go_source_flags _act_validate_strict_go_command_sources
 export -f act_run_native_build act_orchestrate_build act_generate_manifest
 export -f _act_result_artifact_receipts _act_target_result_available
-export -f _act_backend_result_json _act_artifact_transfer_interrupted
+export -f _act_backend_result_json _act_artifact_transfer_interrupted _act_native_preparation_interrupted
+export -f _act_interrupted_backend_result
 export -f _act_build_orchestration_target _act_run_target_worker
 export -f act_sync_sources

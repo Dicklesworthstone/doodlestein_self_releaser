@@ -1055,6 +1055,15 @@ source "$DSR_TRANSFER_MODULE" || exit $?
 decoded=$(_act_windows_command_script "${!#}") || exit 94
 if [[ "$decoded" == *'Launcher parent is not a plain directory'* ]]; then
     printf 'setup\n' >> "$DSR_TRANSFER_CASE/ssh-events"
+    if [[ "$DSR_TRANSFER_MODE" == setup-cancel-* ]]; then
+        python3 - "$DSR_TRANSFER_MODE" <<'SIGNAL'
+import os, signal, sys
+chosen = signal.SIGINT if sys.argv[1].endswith('-130') else signal.SIGTERM
+signal.signal(chosen, signal.SIG_DFL)
+os.kill(os.getpid(), chosen)
+SIGNAL
+        exit $?
+    fi
 else
     printf 'execute\n' >> "$DSR_TRANSFER_CASE/ssh-events"
     printf 'unexpected remote execution\n' >&2
@@ -1062,7 +1071,7 @@ else
 fi
 ''')
 (bin_dir / 'scp').write_text(r'''#!/usr/bin/env python3
-import hashlib, json, os, subprocess, sys, time
+import hashlib, json, os, signal, subprocess, sys, time
 from pathlib import Path
 case = Path(os.environ['DSR_TRANSFER_CASE'])
 mode = os.environ['DSR_TRANSFER_MODE']
@@ -1091,6 +1100,10 @@ record = dict(pid=os.getpid(), pgid=os.getpgrp(), child=child.pid if child else 
 (case / 'scp.json').write_text(json.dumps(record))
 print('SCP fixture progress on stdout', flush=True)
 print('SCP fixture diagnostic on stderr', file=sys.stderr, flush=True)
+if mode.startswith('upload-cancel-'):
+    chosen = signal.SIGINT if mode.endswith('-130') else signal.SIGTERM
+    signal.signal(chosen, signal.SIG_DFL)
+    os.kill(os.getpid(), chosen)
 if mode == 'stall':
     time.sleep(30)
 raise SystemExit(23 if mode == 'fail' else 0)
@@ -1218,6 +1231,24 @@ check('upload stdin is isolated and SCP progress remains on stderr',
       'SCP fixture progress on stdout' in (successful / 'stderr').read_text() and
       'SCP fixture diagnostic on stderr' in (successful / 'stderr').read_text() and
       'SCP fixture' not in (successful / 'stdout').read_text())
+for phase in ('setup', 'upload'):
+    for code in (130, 143):
+        label = phase + '-cancel-' + str(code)
+        case, status, outer, _, record, live, events = invoke('build', label, label)
+        try:
+            result = json.loads((case / 'stdout').read_text())
+        except ValueError:
+            result = {}
+        check(label + ': native launcher preserves actual transport cancellation',
+              status == code and not outer and not live and events == ['setup'] and
+              bool(record) == (phase == 'upload') and
+              result.get('status') == 'failed' and result.get('exit_code') == code)
+        check(label + ': interrupted preparation cannot authorize build output',
+              result.get('stage') == 'build_preparation' and
+              result.get('native_execution', {}).get('command_exit_code') == code and
+              result.get('native_execution', {}).get('build_program_dispatched') is False and
+              result.get('artifact_path') == '' and result.get('artifact_paths') == [] and
+              result.get('additional_artifacts') == [])
 print(f'Windows launcher transfer: {checks-failures} passed, {failures} failed', flush=True)
 sys.exit(1 if failures else 0)
 PY
@@ -7297,6 +7328,146 @@ test_ssh_timeout_json_status() {
 # Exercise the complete native entry point through its retained log and JSON
 # result. Only configuration/remote responses use this suite's existing
 # fixtures; this lane does not claim Rust compilation, real SSH, or signing.
+# Exercise the actual native preparation/verification consumers. Only the
+# remote endpoint is controlled: a real child terminates itself with INT/TERM,
+# and the native runner must preserve that outcome before scheduler admission.
+test_native_phase_cancellation() {
+    log_test "Native process cancellation stays terminal across preparation and compilation"
+    local mode platform phase signal case_dir result status expected dispatched
+    local selected_platform="${1:-}" selected_mode="${2:-}"
+    case "$selected_platform" in ''|linux/arm64|windows/amd64) ;; *) return 4 ;; esac
+    case "$selected_mode" in ''|strict|ordinary) ;; *) return 4 ;; esac
+    local original_ssh original_name
+    original_ssh=$(declare -f _act_ssh_exec)
+    original_name=${original_ssh/_act_ssh_exec ()/_test_uncancelled_ssh ()}
+    eval "$original_name"
+    local _ACT_SYNC_TIMEOUT=13 _ACT_BUILD_TIMEOUT=29
+    for mode in strict ordinary; do
+        [[ -z "$selected_mode" || "$selected_mode" == "$mode" ]] || continue
+        for platform in linux/arm64 windows/amd64; do
+            [[ -z "$selected_platform" || "$selected_platform" == "$platform" ]] || continue
+            for phase in cargo_target_preparation cargo_preparation build_execution cargo_final_verification; do
+                if [[ "$phase" == cargo_target_preparation &&
+                      ( "$mode" != strict || "$platform" != windows/* ) ]]; then
+                    continue
+                fi
+                for signal in INT TERM; do
+                    case_dir="$MOCK_DIR/native-cancel-$mode-${platform//\//-}-$phase-$signal"
+                    mkdir -p "$case_dir/logs" "$case_dir/artifacts"
+                    status=0 expected=130 dispatched=false
+                    [[ "$signal" != TERM ]] || expected=143
+                    [[ "$phase" != cargo_final_verification && "$phase" != build_execution ]] || dispatched=true
+                    (
+                        RCH_REQUIRE_REMOTE=0
+                        export ACT_LOGS_DIR="$case_dir/logs" ACT_ARTIFACTS_DIR="$case_dir/artifacts"
+                        SSH_ARGS_FILE="$case_dir/ssh-args"
+                        SCP_ARGS_FILE="$case_dir/scp-args"
+                        RAW_SSH_ARGS_FILE="$case_dir/raw-ssh-args"
+                        SSH_EXIT_CODE_FILE="$case_dir/ssh-status"
+                        SCP_EXIT_CODE_FILE="$case_dir/scp-status"
+                        RAW_SSH_EXIT_CODE_FILE="$case_dir/raw-ssh-status"
+                        printf '0\n' > "$SSH_EXIT_CODE_FILE"
+                        printf '0\n' > "$SCP_EXIT_CODE_FILE"
+                        printf '0\n' > "$RAW_SSH_EXIT_CODE_FILE"
+                        : > "$ACT_REPOS_DIR/tool.yaml"
+                        MOCK_LOCAL_PATH=/local/path/tool
+                        [[ "$platform" != windows/* ]] || MOCK_LOCAL_PATH=C:/fixture/source
+                        MOCK_LANGUAGE=rust MOCK_BINARY_NAME=tool
+                        MOCK_BUILD_CMD='cargo build --release --locked --bin tool'
+                        _act_is_windows_host() { [[ "$platform" == windows/* ]]; }
+                        _act_is_local_host() { return 1; }
+                        _act_ssh_exec() {
+                            local decoded current_phase=other
+                            decoded=$(_test_decode_remote_command "$2") || return 94
+                            case "$decoded" in
+                                *'Cargo target source identity mismatch'*)
+                                    current_phase=cargo_target_preparation ;;
+                                *DSR_NATIVE_CARGO_PREPARED*|*'dsr_seed_summary=$(_cargo_cache_run snapshot'*|\
+                                *'$dsrPrivateSummary | ConvertTo-Json'*|*'$dsrSummary | ConvertTo-Json'*)
+                                    current_phase=cargo_preparation ;;
+                                *'$dsrFinal | ConvertTo-Json'*|*DSR_PRIVATE_CACHE_SEED*)
+                                    current_phase=cargo_final_verification ;;
+                            esac
+                            if [[ "$2" == '# DSR_UNIX_BUILD_GUARD'* ||
+                                  "$decoded" == *'$dsrBuildResult=Invoke-DsrCargoContext -Context $dsrContext -Operation Build'* ||
+                                  "$current_phase" == other && "$platform" == windows/* &&
+                                  "$decoded" == *'$process=[Diagnostics.Process]::Start($psi)'* ]]; then
+                                current_phase=build_execution
+                            fi
+                            if [[ -e "$case_dir/interrupted" ]]; then
+                                printf '%s\n' "$current_phase" >> "$case_dir/after-interruption"
+                            fi
+                            if [[ "$current_phase" == "$phase" ]]; then
+                                printf '%s\n' "$current_phase" > "$case_dir/interrupted"
+                                "$BASH" -c 'kill -s "$1" "$BASHPID"' _ "$signal"
+                                return $?
+                            fi
+                            _test_uncancelled_ssh "$@"
+                        }
+                        # Cleanup is a separate local lifecycle operation; this
+                        # probe concerns dispatch of further source/compiler and
+                        # verification work after the endpoint is interrupted.
+                        _act_remove_build_stage_root() { return 0; }
+                        local source_root=''
+                        if [[ "$mode" == strict ]]; then
+                            source_root=/remote/cancel/source
+                            [[ "$platform" != windows/* ]] || source_root=C:/fixture/cancel/source
+                        fi
+                        act_run_native_build tool "$platform" v1.0.0 11111111-1111-4111-8111-111111111111 \
+                            "$source_root" '' '' fixture
+                    ) > "$case_dir/stdout" 2> "$case_dir/stderr" || status=$?
+                    result=$(cat "$case_dir/stdout")
+                    if [[ "$status" -eq "$expected" ]] && jq -se --argjson code "$expected" '
+                            length == 1 and .[0].status == "failed" and .[0].exit_code == $code
+                        ' <<< "$result" >/dev/null 2>&1; then
+                        log_pass "$mode $platform $phase $signal preserves process cancellation"
+                    else
+                        log_fail "$mode $platform $phase $signal changed cancellation to $status: $result"
+                    fi
+                    if [[ "$(cat "$case_dir/interrupted" 2>/dev/null)" == "$phase" &&
+                          ! -s "$case_dir/after-interruption" ]] &&
+                       jq -e --arg phase "$phase" --argjson raw "$expected" --argjson dispatched "$dispatched" '
+                            .native_execution.phase == $phase and
+                            .native_execution.command_exit_code == $raw and
+                            .native_execution.build_program_dispatched == $dispatched and
+                            .artifact_path == "" and .artifact_paths == [] and .additional_artifacts == []
+                        ' <<< "$result" >/dev/null 2>&1; then
+                        log_pass "$mode $platform $phase $signal stops later work and retains the interrupted phase"
+                    else
+                        log_fail "$mode $platform $phase $signal lost phase evidence or continued remote work"
+                    fi
+                done
+            done
+        done
+    done
+    # The final inventory transport can be interrupted while its diagnostic
+    # envelope also fails to serialize. The real process outcome must survive
+    # both failures; ordinary errors and deadlines retain their prior mapping.
+    local observed_exit
+    for observed_exit in 130 143 23 124; do
+        case_dir="$MOCK_DIR/native-cancel-final-envelope-$observed_exit"
+        mkdir -p "$case_dir"
+        status=0 expected=4
+        [[ "$observed_exit" != 130 && "$observed_exit" != 143 ]] || expected="$observed_exit"
+        (
+            _act_ssh_exec() {
+                case "$observed_exit" in
+                    130) "$BASH" -c 'kill -INT "$BASHPID"' ;;
+                    143) "$BASH" -c 'kill -TERM "$BASHPID"' ;;
+                    *) return "$observed_exit" ;;
+                esac
+            }
+            jq() { printf 'observed\n' > "$case_dir/serializer-failed"; return 23; }
+            _act_finish_private_cargo_home_receipt fixture 'controlled final inventory' /fixture/cargo true
+        ) > "$case_dir/stdout" 2> "$case_dir/stderr" || status=$?
+        if [[ "$status" -eq "$expected" && -f "$case_dir/serializer-failed" && ! -s "$case_dir/stdout" ]]; then
+            log_pass "final inventory envelope failure preserves process outcome $observed_exit"
+        else
+            log_fail "final inventory envelope failure changed process outcome $observed_exit to $status"
+        fi
+    done
+}
+
 test_native_failure_evidence() {
     log_test "Native failure evidence: distinguish preparation from build execution"
     local scenario case_dir result code expected_code expected_status phase raw kind
@@ -8744,6 +8915,12 @@ test_windows_private_cache_collection() {
 }
 
 main() {
+    if [[ "${1:-}" == --phase-cancellation-only ]]; then
+        test_native_phase_cancellation "${2:-}" "${3:-}"
+        printf 'Native phase cancellation tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return $?
+    fi
     if [[ "${1:-}" == --unix-native-env-only ]]; then
         test_unix_rust_sdk_environment
         printf 'Unix native environment tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"

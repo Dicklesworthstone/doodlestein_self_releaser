@@ -8,6 +8,8 @@
 # --host-capacity-only covers the same queue with real one-slot host leases.
 # --coordinator-cancellation-only stops queued targets after a cancelled backend,
 # drains active peers and preserves successful receipts despite late cleanup death.
+# --native-preparation-cancellation-only exercises production Rust preparation
+# through that coordinator using actual signal-terminated remote children.
 # --go-output-ownership-only verifies that command-selected absolute Go outputs
 # remain serialized while independent hosts run and completed work is reused.
 # --artifact-inventory-only exercises large completion receipts and reuse
@@ -522,6 +524,12 @@ fixture_backend() {
     cat "$fixture/backend.stderr" >&2
     return "$(cat "$fixture/backend.exit")"
 }
+if [[ -f "$fixture/serializer.fail" ]]; then
+    jq() {
+        if [[ -f "$fixture/backend.started" ]]; then return 23; fi
+        command jq "$@"
+    }
+fi
 if [[ "$boundary" == workflow* ]]; then
     PATH="$fixture/bin:$PATH"
     act_check() { return 0; }
@@ -598,7 +606,8 @@ cases = ('valid-pretty', 'valid-failure', 'success-nonzero', 'success-declared-f
          'success-string-exit', 'success-null-exit', 'failure-zero', 'failure-mismatched-exit',
          'unknown-status', 'stderr-only', 'empty-zero', 'missing-nonzero', 'chatter',
          'multiple', 'trailing-malformed', 'null', 'array', 'wrong-platform',
-         'missing-platform', 'wrong-method', 'missing-method', 'wrong-host', 'missing-host')
+         'missing-platform', 'wrong-method', 'missing-method', 'wrong-host', 'missing-host',
+         'cancel-130-success', 'cancel-143-empty', 'cancel-130-malformed', 'cancel-143-multiple')
 for boundary in ('native', 'act', 'worker'):
     for name in cases:
         # Workflow producers do not select their task identity: the production
@@ -656,11 +665,21 @@ for boundary in ('native', 'act', 'worker'):
         elif name == 'trailing-malformed':
             raw = json.dumps(receipt) + '\n{unfinished\n'
             expected = 4
+        elif name.startswith('cancel-'):
+            expected = int(name.split('-')[1])
+            if name.endswith('-empty'):
+                raw = ''
+            elif name.endswith('-malformed'):
+                raw = '{unfinished\n'
+            elif name.endswith('-multiple'):
+                raw += raw
         else:
             raw = json.dumps(None if name == 'null' else [receipt]) + '\n'
             expected = 4
         exit_code = 17 if name in ('valid-failure', 'success-nonzero') else 23 if name in (
             'missing-nonzero', 'failure-mismatched-exit') else 0
+        if name.startswith('cancel-'):
+            exit_code = expected
         (case / 'backend.stdout').write_text(raw)
         (case / 'backend.stderr').write_text(noise)
         (case / 'backend.exit').write_text(str(exit_code) + '\n')
@@ -688,6 +707,21 @@ for boundary in ('native', 'act', 'worker'):
                   'resume_artifacts' not in value and value.get('status') != 'success')
         diagnostics = (case / 'attempt.log').read_bytes() if boundary == 'worker' else result.stderr
         check(label + ': original diagnostic text is retained', noise.encode() in diagnostics)
+
+# A diagnostic failure after the native/workflow process has stopped cannot
+# turn known cancellation into a retryable configuration failure.
+for boundary in ('native', 'act'):
+    for code in (130, 143):
+        case, artifact, receipt = fixture(boundary, 'cancel-serializer-' + str(code))
+        (case / 'backend.stdout').write_text(json.dumps(receipt) + '\n')
+        (case / 'backend.stderr').write_text('retained cancellation diagnostic\n')
+        (case / 'backend.exit').write_text(str(code) + '\n')
+        (case / 'serializer.fail').write_text('fail only after backend execution\n')
+        result, value = run(case, boundary)
+        check(boundary + ': serializer failure preserves observed cancellation ' + str(code),
+              result.returncode == code and not result.stdout and not value and
+              b'retained cancellation diagnostic' in result.stderr and
+              artifact.read_bytes() == b'genuine collected output\n')
 
 # Retained bytes cannot rehabilitate a contradictory outcome from an earlier
 # run. Use the real successful worker receipt and its actual frozen artifact,
@@ -2573,7 +2607,7 @@ def wait_for(process, predicate, label):
 
 
 worker = root / 'native.py'
-worker.write_text(r'''import json, os, stat, sys, time
+worker.write_text(r'''import json, os, signal, stat, sys, time
 from pathlib import Path
 case, target, attempt, mode, host = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5]
 slug = target.replace('/', '-') + '.attempt-' + str(attempt)
@@ -2593,6 +2627,11 @@ if mode.startswith('backend-cancel-'):
         while not (case / 'cancel-ready').is_file():
             time.sleep(0.02)
         code = int(mode.rsplit('-', 1)[1])
+        if mode.startswith('backend-cancel-native-'):
+            selected_signal = signal.SIGINT if code == 130 else signal.SIGTERM
+            signal.signal(selected_signal, signal.SIG_DFL)
+            os.kill(os.getpid(), selected_signal)
+            raise SystemExit('signal unexpectedly returned')
         print(json.dumps(dict(platform=target, method='native', host=host, status='failed',
               exit_code=code, stage='artifact_collection', artifact_path='', artifact_paths=[],
               error='controlled artifact producer interruption')), flush=True)
@@ -2692,6 +2731,22 @@ selector_release_slot() {
     fi
 }
 act_run_native_build() {
+    if [[ "$DSR_STDIN_MODE" == backend-cancel-native-* ]]; then
+        (
+            # Keep the actual native backend, worker, receipt admission and
+            # scheduler. Only cache acquisition is a controlled remote endpoint;
+            # it must return a real signal outcome, not prebuilt cancellation JSON.
+            source "$DSR_STDIN_MODULE"
+            host_health_is_ready() { return 0; }
+            _act_prepare_unix_nonstrict_cargo_home() {
+                _act_run_with_timeout 60 python3 "$DSR_STDIN_WORKER" \
+                    "$DSR_STDIN_CASE" "$platform" "$attempt" "$DSR_STDIN_MODE" "$host"
+            }
+            _act_remove_build_stage_root() { return 0; }
+            act_run_native_build "$@"
+        )
+        return $?
+    fi
     if [[ ( "$DSR_STDIN_MODE" == readiness && "$2" == darwin/* ) ||
           ( "$DSR_STDIN_MODE" == readiness-recovery && "$2" == linux/amd64 ) ||
           "$DSR_STDIN_MODE" == cli-readiness ]]; then
@@ -2719,6 +2774,41 @@ act_run_native_build() {
 }
 # Explicit fault injection at the worker boundary tests the real parent's
 # recovery of a missing receipt, including an actual uncatchable child death.
+if [[ "$DSR_STDIN_MODE" == backend-cancel-native-normalize-failure-* ]]; then
+    source <(declare -f _act_backend_result_json |
+        sed '1s/_act_backend_result_json/_fixture_backend_result_json/')
+    _act_backend_result_json() {
+        if [[ "${FUNCNAME[1]:-}" == _act_run_target_worker &&
+              ( "${worker_status:-0}" == 130 || "${worker_status:-0}" == 143 ) ]]; then
+            builtin printf 'injected worker result normalization failure\n' >> "$DSR_STDIN_CASE/receipt-failure"
+            return 23
+        fi
+        _fixture_backend_result_json "$@"
+    }
+elif [[ "$DSR_STDIN_MODE" == backend-cancel-native-exit-read-failure-* ]]; then
+    jq() {
+        if [[ "${FUNCNAME[1]:-}" == _act_run_target_worker &&
+              ( "${worker_status:-0}" == 130 || "${worker_status:-0}" == 143 ) && "$#" == 2 &&
+              "$1" == -er && "$2" == .exit_code ]]; then
+            builtin printf 'injected worker exit-code read failure\n' >> "$DSR_STDIN_CASE/receipt-failure"
+            return 23
+        fi
+        command jq "$@"
+    }
+elif [[ "$DSR_STDIN_MODE" == backend-cancel-native-write-failure-* ]]; then
+    printf() {
+        if [[ ( "${worker_status:-0}" == 130 || "${worker_status:-0}" == 143 ) &&
+              "${FUNCNAME[1]:-}" == _act_write_worker_result &&
+              "$#" == 2 && "$1" == '%s\n' ]]; then
+            # The real exclusive redirection has already created the receipt.
+            # Fail its write only; the coordinator must recover the observed
+            # signal while retaining this empty, incomplete evidence.
+            builtin printf 'injected worker receipt write failure\n' >> "$DSR_STDIN_CASE/receipt-failure"
+            return 23
+        fi
+        builtin printf "$@"
+    }
+fi
 case "$DSR_STDIN_MODE" in
     missing-receipt) _act_run_target_worker() { return 0; } ;;
     killed-worker) _act_run_target_worker() { kill -KILL "$BASHPID"; } ;;
@@ -2811,11 +2901,14 @@ def fixture(jobs, mode):
         'schema_version': '1.0.0', 'platform_mapping': hosts,
         'hosts': {host: {'platform': target, 'connection': 'local'}
                   for target, host in hosts.items()}}))
-    (case / 'config/repos.d/stdinfixture.yaml').write_text(json.dumps({
+    configuration = {
         'tool_name': 'stdinfixture', 'repo': 'fixture/stdinfixture', 'language': 'go',
         'local_path': str(case / 'source'), 'binary_name': 'fixture',
         'targets': targets, 'cross_compile': {target: {'host': host}
-                                             for target, host in hosts.items()}}))
+                                             for target, host in hosts.items()}}
+    if mode.startswith('backend-cancel-native-'):
+        configuration.update(language='rust', build_cmd='cargo build --release', linux_glibc_floor='native')
+    (case / 'config/repos.d/stdinfixture.yaml').write_text(json.dumps(configuration))
     return case, str(uuid.uuid4())
 
 
@@ -2950,6 +3043,64 @@ def verify_attempts(case, value, state, expected_counts, expected_codes, label, 
           (state['status'] == 'targets-complete') == completed and
           state['status'] != 'completed' and not (case / 'output/.dsr-build-purpose.json').exists())
 
+
+if sys.argv[3] == '--native-cancellation-receipt-failure-only':
+    for failure, code in (('normalize', 130), ('exit-read', 143), ('write', 130)):
+        mode = 'backend-cancel-native-' + failure + '-failure-' + str(code)
+        case, identity = fixture(1, mode)
+        first, state = invoke(case, identity, 1, mode, 'first', expected_code=130)
+        row = first['targets'][0]
+        check(case.name + ': actual worker receipt failure was reached',
+              (case / 'receipt-failure').is_file() and
+              len((case / 'receipt-failure').read_text().splitlines()) == 1)
+        check(case.name + ': coordinator retains observed cancellation despite incomplete receipt',
+              row['status'] == 'failed' and row['exit_code'] == code and row['attempt'] == 1 and
+              state['target_statuses'][targets[0]]['result']['exit_code'] == code and
+              state['target_statuses'][targets[0]]['attempts'] == 1 and state['status'] == 'failed')
+        check(case.name + ': interrupted attempt has no reusable output',
+              not row.get('resume_artifacts') and not list((case / 'output').glob('*.bin')))
+        check(case.name + ': queued targets do not start and the failed attempt is not retried',
+              Counter(event['target'] for event in events(case)) == Counter({targets[0]: 1}) and
+              all(item['status'] == 'skipped' and item['attempt'] == 0 and item['exit_code'] == 130
+                  for item in first['targets'][1:]) and
+              all(state['target_statuses'][target]['status'] == 'pending' and
+                  state['target_statuses'][target]['attempts'] == 0 for target in targets[1:]))
+        check(case.name + ': worker releases its capacity after receipt failure',
+              len((case / 'released-slots').read_text().splitlines()) == 1)
+        receipt = Path(row['result_path'])
+        check(case.name + ': partial receipt evidence is not overwritten',
+              (receipt.is_file() and receipt.read_bytes() == b'') if failure == 'write'
+              else receipt.is_file() and read(receipt)['receipt_source'] == 'coordinator' and
+              read(receipt)['exit_code'] == code and read(receipt)['worker_exit_code'] == code)
+    print('Native cancellation receipt failure: %d checks passed' % checks, flush=True)
+    raise SystemExit(0)
+
+if sys.argv[3] == '--native-preparation-cancellation-only':
+    for jobs, code in ((1, 130), (3, 143)):
+        mode = 'backend-cancel-native-' + str(code)
+        case, identity = fixture(jobs, mode)
+        first, state = invoke(case, identity, jobs, mode, 'first', expected_code=130)
+        counts = {target: 1 for target in targets[:jobs]}
+        codes = {target: code if index == 0 else 130
+                 for index, target in enumerate(targets[:jobs])}
+        verify_attempts(case, first, state, counts, codes, case.name + '/cancel')
+        check(case.name + ': native preparation cancellation stops queued work without retry',
+              len(events(case)) == jobs and first['targets'][0]['exit_code'] == code and
+              first['targets'][0]['stage'] == 'cargo_preparation' and
+              first['targets'][0]['native_execution']['command_exit_code'] == code and
+              first['targets'][0]['native_execution']['build_program_dispatched'] is False and
+              all(row['status'] == 'skipped' and row['attempt'] == 0
+                  for row in first['targets'][jobs:]) and state['status'] == 'failed')
+        for event in events(case):
+            probe = subprocess.run(['ps', '-p', str(event['pid']), '-o', 'stat='],
+                                   capture_output=True, timeout=2)
+            check(case.name + ': interrupted native child has stopped before coordinator return',
+                  probe.returncode != 0 or probe.stdout.strip().startswith(b'Z'))
+        check(case.name + ': interrupted native builds create no reusable payloads',
+              not list((case / 'output').glob('*.bin')) and
+              all(not row.get('resume_artifacts') for row in first['targets']))
+    print('Native preparation coordinator cancellation: %d checks passed' % checks, flush=True)
+    raise SystemExit(0)
 
 if sys.argv[3] == '--coordinator-cancellation-only':
     for jobs, code in ((1, 130), (3, 143)):
@@ -6795,7 +6946,8 @@ if [[ "${1:-}" == --worker-lifecycle-only ]]; then
     exit $?
 fi
 
-if [[ "${1:-}" == --coordinator-cancellation-only ||
+if [[ "${1:-}" == --coordinator-cancellation-only || "${1:-}" == --native-preparation-cancellation-only ||
+      "${1:-}" == --native-cancellation-receipt-failure-only ||
       "${1:-}" == --stdin-isolation-only || "${1:-}" == --coordinator-receipt-only ||
       "${1:-}" == --sidecar-recovery-only || "${1:-}" == --worker-completion-only ||
       "${1:-}" == --host-readiness-only || "${1:-}" == --host-readiness-cli-only ||

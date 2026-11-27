@@ -293,6 +293,18 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/collector-evidence/artifact-cancellation.log"
           timeout 120 bash scripts/tests/test_act_orchestration.sh --coordinator-cancellation-only \
             2>&1 | tee "$RUNNER_TEMP/collector-evidence/coordinator-cancellation.log"
+          timeout 120 bash scripts/tests/test_act_runner_native.sh --phase-cancellation-only linux/arm64 \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/native-unix-phase-cancellation.log"
+          timeout 120 bash scripts/tests/test_act_runner_native.sh --phase-cancellation-only windows/amd64 strict \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/native-windows-strict-phase-cancellation.log"
+          timeout 120 bash scripts/tests/test_act_runner_native.sh --phase-cancellation-only windows/amd64 ordinary \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/native-windows-ordinary-phase-cancellation.log"
+          timeout 120 bash scripts/tests/test_act_orchestration.sh --native-preparation-cancellation-only \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/native-preparation-cancellation.log"
+          timeout 120 bash scripts/tests/test_act_orchestration.sh --native-cancellation-receipt-failure-only \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/native-cancellation-receipt-failure.log"
+          timeout 120 bash scripts/tests/test_act_orchestration.sh --backend-receipt-only \
+            2>&1 | tee "$RUNNER_TEMP/collector-evidence/backend-receipt.log"
           test -z "$(git status --porcelain)"
       - name: Build strict Go releases from pinned sibling snapshots
         if: runner.os == 'Linux'
