@@ -8832,6 +8832,8 @@ _release_contract_scan_release_by_tag() {
     local page=1 page_json="" page_count=0 match_count=0 scan_status=0
     local max_pages=1000
     local matches='[]'
+    local page_ids release_id
+    local -A seen_ids=()
 
     while ((page <= max_pages)); do
         page_json=$(gh_api "repos/$repo/releases?per_page=100&page=$page" \
@@ -8841,8 +8843,17 @@ _release_contract_scan_release_by_tag() {
             if _gh_operation_interrupted "$scan_status"; then return "$scan_status"; fi
             return 1
         }
-        jq -e 'type == "array" and length <= 100' \
-            <<< "$page_json" >/dev/null 2>&1 || {
+        # A row without a tag cannot establish that the selected tag is absent.
+        # Repeated IDs across pages likewise indicate a shifting or repeated
+        # listing. Refuse to authorize creation or recovery from either one.
+        page_ids=$(jq -ers '
+            def valid_id: type == "number" and . > 0 and . <= 9007199254740991 and . == floor;
+            if length == 1 and (.[0] | type == "array" and length <= 100 and
+                all(.[]; type == "object" and (.id | valid_id) and
+                    (.tag_name | type == "string" and length > 0 and (test("[\\x00-\\x1f\\x7f]") | not))))
+            then .[0] | map(.id | tostring) | join("\n")
+            else error("invalid release listing") end
+        ' <<< "$page_json" 2>/dev/null) || {
             scan_status=$?
             log_error "GitHub returned an invalid strict release-list page"
             # jq's ordinary usage/runtime errors include 2 and 5. Those are
@@ -8851,6 +8862,15 @@ _release_contract_scan_release_by_tag() {
             if ((scan_status > 128)); then return "$scan_status"; fi
             return 1
         }
+        if [[ -n "$page_ids" ]]; then
+            while IFS= read -r release_id; do
+                if [[ -n "${seen_ids[$release_id]:-}" ]]; then
+                    log_error "GitHub release listing repeated release ID $release_id"
+                    return 1
+                fi
+                seen_ids[$release_id]=1
+            done <<< "$page_ids"
+        fi
         matches=$(
             printf '%s\n%s\n' "$matches" "$page_json" |
                 jq -c -s -e \

@@ -1596,8 +1596,24 @@ test_release_resume_scan_terminal() {
     source <(awk '/^_release_contract_scan_release_by_tag\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "$HELPERS_FILE")
     gh_api() {
         printf 'SCAN_HTTP %s\n' "$*" >> "$CALLS"
-        [[ "$1" == 'repos/owner/tool/releases?per_page=100&page=1' && "$2" == --no-cache ]] || return 99
-        if [[ "$boundary" == malformed-row ]]; then printf '[42]\n'; return 0; fi
+        [[ "$1" == 'repos/owner/tool/releases?per_page=100&page='* && "$2" == --no-cache ]] || return 99
+        case "$boundary" in
+            malformed-row) printf '[42]\n'; return 0 ;;
+            missing-tag) printf '[{"id":17}]\n'; return 0 ;;
+            empty-tag) printf '[{"id":17,"tag_name":""}]\n'; return 0 ;;
+            invalid-id) printf '[{"id":1.5,"tag_name":"other"}]\n'; return 0 ;;
+            duplicate-id) printf '[{"id":9,"tag_name":"other"},{"id":9,"tag_name":"v1.2.3"}]\n'; return 0 ;;
+            overlap|multiple-pages)
+                case "${1##*=}" in
+                    1) command jq -nc '[range(100;200)|{id:.,tag_name:("v0."+tostring)}]'; return $? ;;
+                    2)
+                        if [[ "$boundary" == overlap ]]; then printf '[{"id":100,"tag_name":"v1.2.3"}]\n'
+                        else printf '[{"id":9,"tag_name":"v1.2.3"}]\n'; fi
+                        return 0 ;;
+                    *) return 99 ;;
+                esac ;;
+        esac
+        [[ "$1" == *page=1 ]] || return 99
         printf '[{"id":9,"tag_name":"v1.2.3"}]\n'
         if [[ "$boundary" == transport ]]; then return "$stopped_status"; fi
     }
@@ -1607,7 +1623,7 @@ test_release_resume_scan_terminal() {
         [[ "$parsed_status" == 0 ]] || return "$parsed_status"
         case "$boundary" in
             page)
-                [[ "$1" == -e && "$2" == 'type == "array" and length <= 100' ]] && selected=true ;;
+                [[ "$1" == -ers && "$2" == *'error("invalid release listing")'* ]] && selected=true ;;
             merge)
                 [[ "$1" == -c && "${2:-}" == -s && "${3:-}" == -e && "${5:-}" == expected_tag ]] && selected=true ;;
             matches-count|page-count)
@@ -1636,8 +1652,10 @@ test_release_resume_scan_terminal() {
            "$(_release_sha256 "$OUT/tool-v1.2.3-manifest.json")" == "$manifest_before" &&
            "$(_release_sha256 "$OUT/worker")" == "$payload_before" ]] &&
         ! grep -q '^BUILD ' "$CALLS" || return 1
-    [[ "$boundary" == transport || "$boundary" == none || "$boundary" == malformed-row ]] ||
-        grep -q "^SCAN_STOP $boundary $stopped_status$" "$CALLS" || return 1
+    case "$boundary" in
+        page|merge|matches-count|page-count|result|admission)
+            grep -q "^SCAN_STOP $boundary $stopped_status$" "$CALLS" || return 1 ;;
+    esac
     if [[ "$expected_status" == 0 ]]; then
         grep -q '^RELEASE .*--resume' "$CALLS"
     else
@@ -2490,6 +2508,10 @@ for scan_boundary in page merge matches-count page-count result admission; do
     done
 done
 run_test test_release_resume_scan_terminal malformed-row 0 8
+for scan_boundary in missing-tag empty-tag invalid-id duplicate-id overlap; do
+    run_test test_release_resume_scan_terminal "$scan_boundary" 0 8
+done
+run_test test_release_resume_scan_terminal multiple-pages 0 0
 for stopped_status in 2 5 124 125 129 137 139 141 143 255; do
     run_test test_release_resume_scan_terminal transport "$stopped_status" 5
 done
