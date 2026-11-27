@@ -7088,7 +7088,8 @@ _release_require_publishable_artifacts() {
 # SHA256SUMS would invalidate its detached signature. Missing files are staged
 # and published without clobbering; a failed retry never truncates evidence.
 _release_prepare_ordinary_checksums() (
-    local manifest="$1" directory="$2" expected="$3"
+    local manifest="$1" directory="$2" expected="$3" action="${4:-create}"
+    [[ "$action" == create || "$action" == plan ]] || return 4
     local rows name sha path suffix stage current
     local -a names=(SHA256SUMS)
     local -A retained=()
@@ -7117,6 +7118,9 @@ _release_prepare_ordinary_checksums() (
             done
         fi
     done
+    # All existing checksums passed manifest admission above. A preview needs
+    # no writable staging and must leave missing checksum files absent.
+    [[ "$action" != plan ]] || return 0
     # A completed retry does not create staging or rewrite any inode.
     if [[ ${#retained[@]} -eq ${#names[@]} ]]; then
         signing_validate_release_inventory "$manifest" "$directory" "$expected" || return $?
@@ -10713,8 +10717,8 @@ EOF
         ordinary_expected_sha["${manifest_file##*/}"]="$ordinary_manifest_sha"
         # Signing may be disabled or entirely reused. Publication still needs
         # the complete local inventory, not just byte-correct surviving rows.
-        signing_validate_release_inventory "$manifest_file" "$artifacts_dir" \
-            "${ordinary_expected_sha[${manifest_file##*/}]}" || return 4
+        _release_prepare_ordinary_checksums "$manifest_file" "$artifacts_dir" \
+            "${ordinary_expected_sha[${manifest_file##*/}]}" plan || return 4
     elif ! $release_contract_enabled; then
         local ordinary_file ordinary_name
         while IFS= read -r -d '' ordinary_file; do
@@ -11045,24 +11049,12 @@ EOF
         _release_plan_upload_names || return 4
     fi
 
-    if $sbom_enabled; then
-        local sbom_action=generate
-        $DRY_RUN && sbom_action=plan
-        ordinary_sbom_report=$(_release_prepare_ordinary_sbom "$manifest_file" "$artifacts_dir" \
-            "${ordinary_expected_sha[${manifest_file##*/}]}" "$sbom_format" "$sbom_action") || return $?
-        if ! $DRY_RUN; then
-            ordinary_sbom_hashes=$(jq -ce '._expected_sha256' <<< "$ordinary_sbom_report") || return 4
-            ordinary_sbom_report=$(jq -c 'del(._expected_sha256)' <<< "$ordinary_sbom_report") || return 4
-        fi
-    fi
-
     # Check the resolved ownership plan before any GitHub mutation. Shared
     # aliases keep their configured primary owner, but explicit artifact
     # bytes cannot collide with metadata or generated checksum names. Freeze
     # this inventory for the dry-run, checksums and actual upload loop.
     local -A ordinary_upload_names=() ordinary_alias_sha=() ordinary_alias_owner=()
     local -A ordinary_generated_names=()
-    local -A ordinary_sbom_expected_sha=()
     local -a ordinary_extra_files=()
     if ! $release_contract_enabled && $manifest_exists; then
         local row_name resolved_names alias_name alias_sha
@@ -11100,27 +11092,6 @@ EOF
         done
         ordinary_extra_files+=("$manifest_file")
         local extra_file extra_name extra_sha
-        if $sbom_enabled && ! $DRY_RUN; then
-            while IFS=$'\t' read -r extra_name extra_sha; do
-                extra_file="$artifacts_dir/$extra_name"
-                if [[ ! -s "$extra_file" || ! -f "$extra_file" || -L "$extra_file" ||
-                      "$(_gh_asset_sha256 "$extra_file")" != "$extra_sha" ]]; then
-                    log_error "Verified SBOM file is missing or changed: $extra_name"
-                    return 4
-                fi
-                if [[ -n "${ordinary_generated_names[$extra_name]:-}" ||
-                      ( -n "${ordinary_expected_sha[$extra_name]:-}" &&
-                        "${ordinary_expected_sha[$extra_name]}" != "$extra_sha" ) ||
-                      ( -n "${ordinary_alias_sha[$extra_name]:-}" &&
-                        "${ordinary_alias_sha[$extra_name]}" != "$extra_sha" ) ]]; then
-                    log_error "Verified SBOM name collides with release contents: $extra_name"
-                    return 4
-                fi
-                ordinary_sbom_expected_sha["$extra_name"]="$extra_sha"
-                ordinary_expected_sha["$extra_name"]="$extra_sha"
-                ordinary_extra_files+=("$extra_file")
-            done < <(jq -r 'to_entries[] | [.key,.value] | @tsv' <<< "$ordinary_sbom_hashes")
-        fi
         while IFS= read -r -d '' extra_file; do
             extra_name="${extra_file##*/}"
             # Per-scan receipts and the frozen retry plan are local controls.
@@ -11136,12 +11107,12 @@ EOF
                 log_error "Invalid release sidecar: $extra_name"
                 return 4
             fi
-            if [[ -n "${ordinary_sbom_expected_sha[$extra_name]:-}" ]]; then
-                if [[ "$extra_sha" != "${ordinary_sbom_expected_sha[$extra_name]}" ]]; then
-                    log_error "Verified SBOM file changed during release planning: $extra_name"
-                    return 4
-                fi
-                continue
+            # The selected manifest is authoritative even when it resides
+            # outside the payload directory. Refuse stale sidecars before
+            # including them in a preview or an immutable draft intent.
+            if ! _gh_manifest_has_upload_name "$manifest_file" "$extra_name" "$extra_file" "$extra_sha"; then
+                log_error "Release sidecar is not bound to the build manifest: $extra_name"
+                return 4
             fi
             if [[ -n "${ordinary_alias_sha[$extra_name]:-}" && "${ordinary_alias_sha[$extra_name]}" != "$extra_sha" ]]; then
                 log_error "Upload name $extra_name collides with an existing release sidecar"
@@ -11153,6 +11124,38 @@ EOF
             \( -name 'SHA256SUMS*' -o -name '*.sha256' -o -name '*.minisig' -o -name '*.sbom.*' \
                -o -name 'sbom-manifest.spdx.json' -o -name 'sbom-manifest.cdx.json' \
                -o -name '*.intoto.jsonl' \) -print0)
+
+        # Generate requested SBOMs only after existing release evidence has been admitted.
+        if $sbom_enabled; then
+            local sbom_action=generate
+            $DRY_RUN && sbom_action=plan
+            ordinary_sbom_report=$(_release_prepare_ordinary_sbom "$manifest_file" "$artifacts_dir" \
+                "${ordinary_expected_sha[${manifest_file##*/}]}" "$sbom_format" "$sbom_action") || return $?
+            if ! $DRY_RUN; then
+                ordinary_sbom_hashes=$(jq -ce '._expected_sha256' <<< "$ordinary_sbom_report") || return 4
+                ordinary_sbom_report=$(jq -c 'del(._expected_sha256)' <<< "$ordinary_sbom_report") || return 4
+                while IFS=$'\t' read -r extra_name extra_sha; do
+                    extra_file="$artifacts_dir/$extra_name"
+                    if [[ ! -s "$extra_file" || ! -f "$extra_file" || -L "$extra_file" ||
+                          "$(_gh_asset_sha256 "$extra_file")" != "$extra_sha" ]]; then
+                        log_error "Verified SBOM file is missing or changed: $extra_name"
+                        return 4
+                    fi
+                    if [[ -n "${ordinary_generated_names[$extra_name]:-}" ||
+                          ( -n "${ordinary_expected_sha[$extra_name]:-}" &&
+                            "${ordinary_expected_sha[$extra_name]}" != "$extra_sha" ) ||
+                          ( -n "${ordinary_alias_sha[$extra_name]:-}" &&
+                            "${ordinary_alias_sha[$extra_name]}" != "$extra_sha" ) ]]; then
+                        log_error "Verified SBOM name collides with release contents: $extra_name"
+                        return 4
+                    fi
+                    if [[ -z "${ordinary_expected_sha[$extra_name]:-}" ]]; then
+                        ordinary_extra_files+=("$extra_file")
+                    fi
+                    ordinary_expected_sha["$extra_name"]="$extra_sha"
+                done < <(jq -r 'to_entries[] | [.key,.value] | @tsv' <<< "$ordinary_sbom_hashes")
+            fi
+        fi
     fi
 
     # Check the names a project's own curl|bash installer downloads against the

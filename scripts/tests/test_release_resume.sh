@@ -3259,6 +3259,42 @@ test_promotion_interrupted_publish_preserves_explicit_intent() {
     done
 }
 
+test_sidecar_admission_precedes_draft_creation() {
+    local name options
+    for name in retired.bin.minisig retired.bin.sha256; do
+        sbom_setup "sidecar_admission_$name" || return 1
+        printf 'retained evidence\n' > "$CASE/artifacts/$name"
+        for options in preview fresh resume; do
+            case "$options" in
+                preview) DRY_RUN=true; run_release ;;
+                fresh) DRY_RUN=false; run_release --sbom ;;
+                resume) run_release --resume ;;
+            esac
+            [[ $STATUS == 4 && ! -e "$CASE/artifacts/SHA256SUMS" &&
+               ! -e "$CASE/artifacts/payload.bin.sha256" && ! -s "$SBOM_TEST_LOG" &&
+               ! -e "$CASE/artifacts/sbom-plan.spdx.json" ]] &&
+                grep -Fq "Release sidecar is not bound to the build manifest: $name" "$CASE/stderr" &&
+                ! grep -Eq '^CREATE|^POST |^PUBLISH|^DISPATCH' "$CALLS" || return 1
+        done
+        # Restore a valid inventory and prove that this same release can succeed.
+        mv "$CASE/artifacts/$name" "$CASE/$name" || return 1
+        run_release
+        [[ $STATUS == 0 ]] && grep -Fxq PUBLISH "$CALLS" || return 1
+    done
+}
+
+test_dry_run_refuses_orphan_checksum_signature() {
+    setup preview_orphan_checksum
+    staged_manifest payload.bin || return 1
+    printf 'retained signature\n' > "$CASE/artifacts/SHA256SUMS.minisig"
+    DRY_RUN=true
+    run_release
+    [[ $STATUS == 4 && ! -e "$CASE/artifacts/SHA256SUMS" &&
+       ! -e "$CASE/artifacts/payload.bin.sha256" && ! -s "$CALLS" ]] &&
+        grep -Fq 'orphan signature: SHA256SUMS.minisig' "$CASE/stderr" &&
+        grep -Fxq 'retained signature' "$CASE/artifacts/SHA256SUMS.minisig"
+}
+
 test_staged_generated_checksums_remain_bound_across_retry() {
     setup staged_checksums
     CREATE_FAIL=false FAIL_NAME=payload.bin
@@ -4425,6 +4461,7 @@ for test in test_release_auth_cancellation_never_falls_back_or_publishes \
     test_staged_large_inventory_publishes_and_resumes test_staged_large_inventory_drift_restores_draft \
     test_release_dispatch_large_inventory_recovers_exact_outbox \
     test_release_dispatch_large_inventory_refuses_late_page_drift test_staged_dry_run_creates_no_custody \
+    test_sidecar_admission_precedes_draft_creation test_dry_run_refuses_orphan_checksum_signature \
     test_staged_interrupted_upload_resumes_and_publishes test_staged_generated_checksums_remain_bound_across_retry \
     test_staged_cancelled_upload_stops_and_requires_explicit_resume test_staged_cancelled_alias_upload_stops_remaining_names \
     test_staged_cancelled_creation_preserves_uncertain_custody \
