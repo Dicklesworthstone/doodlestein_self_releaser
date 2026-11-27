@@ -2058,9 +2058,12 @@ even when that profile inherits from `release`. Cargo's built-in `dev` and
 `test` profiles use `debug/`; `release` and `bench` use `release/`. The same
 selection applies to the primary executable, executable families, companions
 and strict cache identity. If a command has multiple executable-producing Cargo
-invocations, their explicit profiles must agree. A direct `cargo build` or
-`cargo rustc` without a profile selector uses the configured `build_profile`,
-or Cargo's `dev` profile when the field is omitted. Opaque build scripts keep
+invocations, their profiles must agree. With the default `dev` profile,
+one command may omit the selector while another uses `--profile dev`.
+For direct `cargo build`, `cargo rustc`, `cargo zigbuild`, `cargo xwin build`,
+`cargo xwin rustc`, `cross build` and `cross rustc`, collection uses the
+explicit selector first, then the configured `build_profile`. With neither
+set, it collects Cargo's `dev` output from `debug/`. Opaque build scripts keep
 the `release` default. Set `build_profile` when a script chooses another
 profile internally.
 

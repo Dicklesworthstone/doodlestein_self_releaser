@@ -14088,9 +14088,12 @@ def invocation_selection():
             produces = subcommand in ('build', 'rustc', 'zigbuild')
             if subcommand == 'xwin':
                 produces = cursor + 1 < len(argv) and argv[cursor + 1] in ('build', 'rustc')
-            if route_program != 'cargo' or subcommand not in (
-                    'build', 'rustc', 'check', 'test', 'fetch', 'metadata',
-                    'generate-lockfile', 'locate-project', 'pkgid', 'tree'):
+            if route_program == 'cross':
+                if subcommand not in ('build', 'rustc'):
+                    direct_build = False
+            elif not produces and subcommand not in (
+                    'check', 'test', 'fetch', 'metadata', 'generate-lockfile',
+                    'locate-project', 'pkgid', 'tree'):
                 direct_build = False
             if not produces:
                 continue
@@ -14197,7 +14200,13 @@ def invocation_selection():
         if context_change:
             fail('Cargo context changes inside build_cmd (' + context_change +
                  '); configure its environment/cwd outside the command')
-        if len(explicit_profiles) != 1 or None in output_profiles:
+        # An implicit Cargo build and an explicit --profile dev produce
+        # the same profile. A configured override or an opaque producer
+        # prevents us from making that assignment for a mixed family.
+        if None in output_profiles and not (
+                direct_build and explicit_profiles == {'dev'} and extra in ('', 'dev')):
+            profile_error('native Cargo executable producers need one common profile')
+        if len(explicit_profiles) != 1:
             profile_error('native Cargo executable producers need one common explicit profile')
         return next(iter(explicit_profiles))
     if mode == 'routing':

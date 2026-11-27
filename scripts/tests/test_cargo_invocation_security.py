@@ -24,12 +24,12 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = Path(os.environ.get('DSR_TEST_ACT_RUNNER', str(ROOT / 'src/act_runner.sh')))
 TRIPLE = 'x86_64-unknown-linux-gnu'
-EMIT = 'source "$1" || exit $?; _act_toolchain_identity_script "$2" "$3" "$4" "" "" "" "$5"'
+EMIT = 'source "$1" || exit $?; _act_toolchain_identity_script "$2" "$3" "$4" "$6" "" "" "$5"'
 
 
-def emit(mode, command, shim_dir='', receipt='/tmp/dsr-unused-receipt.json'):
+def emit(mode, command, shim_dir='', receipt='/tmp/dsr-unused-receipt.json', extra=''):
     return subprocess.run(['bash', '-o', 'pipefail', '-c', EMIT, '_', str(MODULE),
-                           mode, str(receipt), command, str(shim_dir)],
+                           mode, str(receipt), command, str(shim_dir), extra],
                           capture_output=True, text=True, check=True, timeout=30).stdout
 
 
@@ -926,11 +926,11 @@ class CargoCompatibilityTests(unittest.TestCase):
 
 
 class ExplicitProfileSelectionTests(unittest.TestCase):
-    def profile(self, command):
+    def profile(self, command, implicit_profile=''):
         # Execute the emitted noncompiling mode, including its optional-profile
         # fallback. The other tests keep their strict refusal adapter unchanged.
         result = subprocess.run(
-            [shutil.which('bash'), '-p', '-s'], input=emit('profile', command),
+            [shutil.which('bash'), '-p', '-s'], input=emit('profile', command, extra=implicit_profile),
             env={'PATH': '/missing/worker/tools', 'CARGO_BUILD_TARGET': TRIPLE},
             capture_output=True, text=True, timeout=10)
         if result.returncode:
@@ -965,6 +965,27 @@ class ExplicitProfileSelectionTests(unittest.TestCase):
                 for command in (tail_command, cargo_command):
                     with self.assertRaisesRegex(Refused, 'Cargo --config/-C'):
                         invoke(command)
+
+    def test_default_profile_follows_recognized_cross_compilers(self):
+        for command in ('cargo zigbuild', 'cargo xwin build', 'cargo xwin rustc',
+                        'cross build', '/tools/cross rustc',
+                        'cargo fetch --locked && cargo xwin build'):
+            with self.subTest(command=command):
+                self.assertEqual(self.profile(command, 'dev'), 'dev')
+                self.assertEqual(self.profile(command, 'configured-profile'), 'configured-profile')
+        for command in ('cargo xwin check', 'cross test', 'make release && cross build'):
+            with self.subTest(command=command):
+                self.assertIsNone(self.profile(command, 'dev'))
+
+    def test_mixed_implicit_and_explicit_dev_producers(self):
+        for command in ('cargo build -p first && cargo build -p second --profile dev',
+                        'cross build --profile dev && cross build'):
+            with self.subTest(command=command):
+                self.assertEqual(self.profile(command, 'dev'), 'dev')
+                with self.assertRaises(Refused):
+                    self.profile(command, 'release')
+        with self.assertRaises(Refused):
+            self.profile('make release && cargo build && cargo build --profile dev', 'dev')
 
     def test_preparation_and_test_commands_do_not_select_the_release_profile(self):
         self.assertEqual(self.profile(

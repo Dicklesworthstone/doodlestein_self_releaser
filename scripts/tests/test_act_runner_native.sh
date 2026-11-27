@@ -162,6 +162,9 @@ run_case('implicit-declared-dev', 'cargo build --locked --offline', 'debug', dec
 run_case('implicit-undeclared-family', 'cargo build --locked --offline --bins', 'debug', family=True)
 run_case('opaque-declared-ship', 'bash build-profile.sh', 'ship', declared='ship')
 run_case('complete-custom-family', 'cargo build --locked --offline --bins --profile=ship', 'ship', family=True)
+run_case('mixed-default-dev-family',
+         'cargo build --locked --offline --bin profiletool && '
+         'cargo build --locked --offline --bin profilehelper --profile dev', 'debug', family=True)
 run_case('conflicting-producers',
          'cargo build --profile ship && cargo build --release', '', refused=True)
 print('Native Cargo profile checks: %d passed, %d failed' % (checks - failures, failures), flush=True)
