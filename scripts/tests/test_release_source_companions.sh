@@ -24,8 +24,8 @@ root = Path(sys.argv[1])
 script = Path(os.environ.get("DSR_PACKAGING_TEST_SCRIPT", str(root / "src/release_packaging.sh")))
 work = Path(tempfile.mkdtemp(prefix="dsr-source-companions-"))
 passed = 0
-if sys.argv[2:] not in ([], ["--submodules-only"]):
-    raise SystemExit("usage: test_release_source_companions.sh [--submodules-only]")
+if sys.argv[2:] not in ([], ["--submodules-only"], ["--standalone-only"]):
+    raise SystemExit("usage: test_release_source_companions.sh [--submodules-only|--standalone-only]")
 
 def check(label, condition):
     global passed
@@ -125,6 +125,98 @@ def finalize_preview(plan_file, bundle, selected_recipe, source_repo=True, expec
         raise AssertionError(f"finalizer: expected {expected}, got {p.returncode}: {p.stdout.decode()}\n{p.stderr.decode()}")
     check('finalizer dry-run never creates persistent bundle output', not bundle.exists())
     return value
+
+def standalone_tests():
+    source = work / "standalone-producer"
+    source.mkdir()
+    (source / "app").write_bytes(b"compiled producer bytes\n")
+    (source / "app").chmod(0o755)
+    producer = work / "standalone-manifest.json"
+    original = manifest_for(source, producer)
+    pins[producer] = sha(producer)
+    rows = [dict(name="demo", target="linux/amd64", archive_format="binary", source="app"),
+            dict(name="install.sh", target="additional", archive_format="none", source_file="install.sh",
+                 aliases=["bootstrap.sh"]),
+            dict(name="NOTICE", target="additional", archive_format="none", source_file="LICENSE")]
+    selected = dict(schema_version=1, artifacts=rows)
+    recipe_file = work / "standalone-recipe.json"
+    write(recipe_file, selected)
+    plan = dict(schema_version=1, repo="owner/demo", tool="demo", tag="v1.2.3", source_sha=commit,
+                required_targets=["linux/amd64"], required_assets=original["required_assets"],
+                builds=[dict(id="linux", manifest=str(producer), manifest_sha256=pins[producer],
+                             targets=["linux/amd64"], artifacts_dir=str(source))])
+    plan_file = work / "standalone-plan.json"
+    write(plan_file, plan)
+    preview = finalize_preview(plan_file, work / "standalone-plan", recipe_file)["packaging"]
+    check("installer, alias and notice are planned separately from compiler inputs",
+          preview["inputs"] == [{"name":"app", "target":"linux/amd64"}] and
+          preview["source_files"] == ["LICENSE", "install.sh"] and
+          [a["name"] for a in preview["required_assets"] if a["target"] == "additional"] ==
+          ["NOTICE", "bootstrap.sh", "install.sh"])
+    target, binary = "windows/amd64", "demo-x86_64-pc-windows-msvc.exe"
+    xwin = dict(id="xwin", driver="xwin", targets=[target], project=str(checkout), binary="demo",
+                toolchain_manifest=str(work / "toolchain.json"), toolchain_sha256="a" * 64)
+    xplan = work / "standalone-xwin-plan.json"
+    write(xplan, dict(plan, builds=[xwin], required_targets=[target],
+                      required_assets=[dict(name=binary, target=target, archive_format="binary")]))
+    write(recipe_file, dict(schema_version=1, artifacts=[dict(rows[0], target=target, source=binary), *rows[1:]]))
+    build_dir = work / "standalone-xwin-build"
+    p = subprocess.run(["bash", str(root / "src/release_finalize.sh"), "--build-plan", str(xplan),
+                        "--build-dir", str(build_dir), "--packaging-recipe", str(recipe_file),
+                        "--packaging-source-repo", str(checkout), "--dry-run"], capture_output=True, check=True)
+    check("xwin-only plan takes the standalone installer directly from the pinned checkout before compilation",
+          json.loads(p.stdout)["packaging"]["inputs"] == [dict(name=binary, target=target)] and not build_dir.exists())
+    for label, change in [
+        ("physical owner", dict(target="linux/amd64")), ("compiler identity", dict(target_triple="x86_64")),
+        ("binary claim", dict(archive_format="binary")), ("conflicting source", dict(source="app")),
+        ("unsafe source", dict(source_file="../LICENSE")), ("unsupported archive", dict(name="installer.zip")),
+        ("empty asset", dict(source_file="EMPTY")), ("untracked file", dict(source_file="untracked")),
+        ("symlink source", dict(source_file="linked-license")), ("alias collision", dict(aliases=["DEMO"]))]:
+        write(recipe_file, dict(schema_version=1, artifacts=[rows[0], dict(rows[1], **change)]))
+        result = finalize_preview(plan_file, work / "standalone-bad", recipe_file, expected=4)
+        check("preflight rejects " + label, result["status"] == "error")
+    write(recipe_file, dict(schema_version=1, artifacts=[rows[1]]))
+    finalize_preview(plan_file, work / "standalone-missing-primary", recipe_file, expected=4)
+    write(recipe_file, selected)
+    out = work / "standalone-output"
+    result = run(out, selected=selected, producer=(producer, source))
+    artifacts = Path(result["artifacts_dir"])
+    check("source-selected standalone installer is runnable with its tagged executable mode",
+          (artifacts / "install.sh").read_bytes() == committed["install.sh"] and
+          (artifacts / "install.sh").stat().st_mode & 0o111 == 0o111 and
+          subprocess.run([str(artifacts / "install.sh")]).returncode == 0)
+    check("aliases retain the same tagged bytes and mode, and a notice uses tagged content",
+          sha(artifacts / "bootstrap.sh") == sha(artifacts / "install.sh") and
+          (artifacts / "bootstrap.sh").stat().st_mode & 0o111 == 0o111 and
+          (artifacts / "NOTICE").read_bytes() == committed["LICENSE"] and
+          (artifacts / "NOTICE").stat().st_mode & 0o111 == 0)
+    w = work / "standalone-handoff"
+    w.mkdir()
+    pipeline("_rf_packaging_preview", recipe_file, w)
+    write(w / "packaging-result.json", result)
+    pipeline("_rf_packaging_handoff", out, pins[producer], plan_file, w)
+    manifest_path = Path(result["manifest"])
+    saved = manifest_path.read_bytes()
+    forged = json.loads(saved)
+    next(a for a in forged["artifacts"] if a["name"] == "bootstrap.sh")["sha256"] = "b" * 64
+    write(manifest_path, forged)
+    write(w / "packaging-result.json", dict(result, manifest_sha256=sha(manifest_path)))
+    pipeline("_rf_packaging_handoff", out, pins[producer], plan_file, w, expected=7)
+    manifest_path.write_bytes(saved)
+    write(w / "packaging-result.json", result)
+    check("finalizer rejects an alias digest that contradicts its selected Git file", True)
+    (artifacts / "install.sh").chmod(0o644)
+    run(out, 4, selected=selected, source_repo=False, producer=(producer, source))
+    (artifacts / "install.sh").chmod(0o755)
+    offline = work / "standalone-offline-checkout"
+    checkout.rename(offline)
+    try:
+        producer.rename(work / "standalone-offline-manifest")
+        source.rename(work / "standalone-offline-producer")
+        check("completed package revalidates standalone assets with producer and Git checkout offline",
+              run(out, selected=selected, source_repo=False, producer=(producer, source)) == result)
+    finally:
+        offline.rename(checkout)
 
 def submodule_tests():
     global checkout, commit, incoming, manifest, pins, recipe
@@ -354,6 +446,10 @@ try:
     manifest = work / "producer.json"
     original = manifest_for(incoming, manifest)
     pins = {manifest: sha(manifest)}
+    if sys.argv[2:] == ["--standalone-only"]:
+        standalone_tests()
+        print(f"Standalone source asset integration: {passed} assertions passed", flush=True)
+        raise SystemExit(0)
     includes = [dict(source=s, path=Path(s).name) for s in committed]
     recipe = dict(schema_version=1, artifacts=[dict(name="final." + fmt, target="linux/amd64", archive_format=fmt,
         source="producer." + fmt, source_files=includes, aliases=["compat." + fmt]) for fmt in ("tar.gz", "tar.xz", "zip")])

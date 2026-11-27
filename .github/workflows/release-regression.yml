@@ -344,6 +344,7 @@ jobs:
           bash scripts/tests/test_release_packaging.sh 2>&1 | tee "$RUNNER_TEMP/packaging-evidence/packaging.log"
           bash scripts/tests/test_release_packaging_variants.sh 2>&1 | tee "$RUNNER_TEMP/packaging-evidence/packaging-variants.log"
           timeout 120 bash scripts/tests/test_release_source_companions.sh 2>&1 | tee "$RUNNER_TEMP/packaging-evidence/source-companions.log"
+          timeout 120 bash scripts/tests/test_release_source_companions.sh --standalone-only 2>&1 | tee "$RUNNER_TEMP/packaging-evidence/standalone-source-assets.log"
           test -z "$(git status --porcelain)"
       - name: Retain packaging validation evidence
         if: always()

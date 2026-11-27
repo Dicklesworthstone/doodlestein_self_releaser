@@ -32,7 +32,7 @@ It does not compile, sign, upload, create releases or promote drafts.
 }
 ```
 
-Each artifact selects either `members` or `source`. `members` builds an archive
+Each artifact selects one of `members`, `source` or `source_file`. `members` builds an archive
 from explicitly mapped regular files, preserving which files are executable.
 Destinations may be nested relative paths such as `bin/demo` and
 `libexec/helper`; their parent directories are created inside the private
@@ -97,6 +97,30 @@ bytes. See [source companion custody](PACKAGED_RELEASE_FINALIZATION.md#include-l
 for the source selection and retry contract.
 
 ## Shared release payloads
+
+Use `source_file` to deliver a file from the tagged source as its own release
+download. For example, add this entry alongside the platform artifacts to ship
+the repository's installer under two download names.
+
+```json
+{
+  "name": "install.sh",
+  "target": "additional",
+  "archive_format": "none",
+  "source_file": "scripts/install.sh",
+  "aliases": ["bootstrap.sh"]
+}
+```
+
+Pass `--source-repo CHECKOUT` to the packager, or `--packaging-source-repo
+CHECKOUT` to the build-set or build-plan finalizer. The same pinned Git
+commit, tree and blob checks used for archive companions supply the exact
+bytes and executable mode. A standalone release download must be nonempty.
+The finalizer checks source availability before compilation. The completed
+package retains its Git proof and can verify the installer and aliases with
+the source checkout offline. These outputs appear in the packaged asset
+inventory under `additional`. The producer's required assets still describe
+the compiler outputs, so this also works with an xwin-only build plan.
 
 Recipes can consume explicitly declared shared producer assets with
 `target: "additional"`. For example, preserve a release notice unchanged:

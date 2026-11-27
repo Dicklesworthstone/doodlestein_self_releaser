@@ -125,8 +125,9 @@ def recipe(value):
     for item in value["artifacts"]:
         need(isinstance(item, dict), "invalid packaging artifact", 4)
         base = {"name", "target", "archive_format"}
-        need(base <= set(item) <= base | {"source", "members", "aliases", "source_files", "target_triple"} and
-             ("source" in item) != ("members" in item), "select source or members, not both", 4)
+        need(base <= set(item) <= base | {"source", "members", "source_file", "aliases", "source_files", "target_triple"} and
+             len({"source", "members", "source_file"} & set(item)) == 1,
+             "select exactly one of source, members or source_file", 4)
         need(name(item["name"]) and
              (item["target"] == "additional" or match(item["target"], PLATFORM_PATTERN)) and
              isinstance(item["archive_format"], str) and item["archive_format"] in ARCHIVES | RAW,
@@ -145,7 +146,11 @@ def recipe(value):
                 output["target_triple"] = item["target_triple"]
             outputs.append(output)
         item["aliases"].sort()
-        if "source" in item:
+        if "source_file" in item:
+            need(item["target"] == "additional" and item["archive_format"] == "none" and
+                 relative_path(item["source_file"]),
+                 "standalone source_file requires a shared raw output and a tracked relative path", 4)
+        elif "source" in item:
             need(name(item["source"]), "invalid source name", 4)
             sources.add((item["source"], item["target"]))
         else:
@@ -179,6 +184,7 @@ def recipe(value):
         member_namespace([m["path"] for m in item.get("members", []) + item.get("source_files", [])])
     need(len(outputs) <= 256 and len({a["name"].lower() for a in outputs}) == len(outputs),
          "colliding or excessive output/alias names", 4)
+    need(sources, "recipe must consume producer assets", 4)
     value["artifacts"].sort(key=lambda a: a["name"])
     inputs = [dict(name=n, target=t, **({"target_triple": source_triples[(n, t)]}
               if (n, t) in source_triples else {})) for n, t in sorted(sources)]
@@ -250,6 +256,8 @@ def source_contract(value):
             names = [item["source"]] if "source" in item else [m["source"] for m in item["members"]]
             need(all(records[n].get("target_triple") == item["target_triple"] for n in names),
                  "packaging compiler target differs from a producer input", 4)
+        if "source_file" in item:
+            continue
         if "members" in item:
             need(all(records[m["source"]]["archive_format"] in RAW and file_format(m["source"]) == "none"
                      for m in item["members"]), "archives cannot be nested as raw members", 4)
@@ -397,6 +405,7 @@ def companion_proof(base, create=False):
             need(mode in (("100644", "100755") if index == len(parts) - 1 else ("40000",)),
                  "companion path is not a regular Git file: " + selected_path, 4)
         data = read_object("blob", oid, selected_repo)
+        need(data or selected_path not in standalone_files, "standalone release asset is empty: " + selected_path, 4)
         files.append(dict(source=selected_path, git_blob_sha=oid, git_mode=mode,
                           sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data)))
     need({p.name for p in objects.iterdir()} == set(cached), "retained companion object namespace changed")
@@ -437,33 +446,38 @@ def member_destination(payload, selected_path, directories):
             directories[destination] = {}
         current = destination
 
-def add_companions(base, item, payload, proof, directories):
+def materialize_source_file(base, record, dest, create):
+    expected_bits = 0o111 if record["git_mode"] == "100755" else 0
+    if create:
+        copy_payload(base / "source/companions" / ("blob-" + record["git_blob_sha"]), dest)
+        dest.chmod(0o644 | expected_bits)
+    need(digest(dest) == record["sha256"] and bits(dest) == expected_bits,
+         "packaged file differs from pinned Git bytes or mode: " + str(dest), 4)
+
+def add_companions(base, item, payload, evidence, directories):
     added = []
-    evidence = {f["source"]: f for f in (proof or {}).get("files", [])}
     for member in item.get("source_files", []):
         record = evidence[member["source"]]
         dest, exists = member_destination(payload, member["path"], directories)
-        expected_bits = 0o111 if record["git_mode"] == "100755" else 0
-        if exists:
-            need(dest.is_file() and not dest.is_symlink() and
-                 digest(dest) == record["sha256"] and bits(dest) == expected_bits,
-                 "companion conflicts with producer archive: " + member["path"], 4)
-        else:
-            copy_payload(base / "source/companions" / ("blob-" + record["git_blob_sha"]), dest)
-            dest.chmod(0o644 | expected_bits)
-            need(digest(dest) == record["sha256"] and bits(dest) == expected_bits, "companion materialization changed")
+        need(not exists or (dest.is_file() and not dest.is_symlink()),
+             "companion conflicts with producer archive: " + member["path"], 4)
+        materialize_source_file(base, record, dest, not exists)
+        if not exists:
             added.append(member["path"])
     return added
 
 def materialize(base, records, work, build):
     proof = companion_proof(base)
+    evidence = {f["source"]: f for f in (proof or {}).get("files", [])}
     for index, item in enumerate(selected["artifacts"]):
         dest = base / "artifacts" / item["name"]
         fmt = item["archive_format"]
         payload = work / ("payload-%d" % index)
         payload.mkdir()
         directories = {}
-        if "members" in item:
+        if "source_file" in item:
+            materialize_source_file(base, evidence[item["source_file"]], dest, build)
+        elif "members" in item:
             members = []
             for member in item["members"]:
                 source = base / "source/artifacts" / member["source"]
@@ -475,7 +489,7 @@ def materialize(base, records, work, build):
                 need(not exists, "archive member destination already exists", 4)
                 copy_payload(source, member_file)
                 members.append(member["path"])
-            members = sorted(members + add_companions(base, item, payload, proof, directories))
+            members = sorted(members + add_companions(base, item, payload, evidence, directories))
             if build:
                 helper("packaging", "packaging_build_archive", fmt, dest, payload, *members)
             helper("packaging", "_pkg_archive_matches_payload", dest, fmt, payload, "\n".join(members), "normalized")
@@ -486,7 +500,7 @@ def materialize(base, records, work, build):
             if original in ARCHIVES:
                 helper("packaging", "packaging_extract_payload", source, original, payload)
                 members = helper("packaging", "packaging_payload_members", source, original)
-                added = add_companions(base, item, payload, proof, directories)
+                added = add_companions(base, item, payload, evidence, directories)
                 members = "\n".join(sorted(members.split("\n") + added))
                 if build:
                     if added:
@@ -569,7 +583,8 @@ try:
     need(len(flags) == len(set(flags)), "duplicate packaging option", 4)
     args = parser.parse_args(sys.argv[2:])
     selected, expected_assets, inputs = recipe(load(path(args.recipe)))
-    source_files = sorted({m["source"] for a in selected["artifacts"] for m in a.get("source_files", [])})
+    standalone_files = {a["source_file"] for a in selected["artifacts"] if "source_file" in a}
+    source_files = sorted(standalone_files | {m["source"] for a in selected["artifacts"] for m in a.get("source_files", [])})
     need(len(source_files) <= 256, "too many distinct source companions", 4)
     recipe_hash = hashlib.sha256(canonical(selected)).hexdigest()
     if args.describe:

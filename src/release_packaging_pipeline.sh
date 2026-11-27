@@ -11,7 +11,7 @@ _rf_packaging_preview() {
         (.recipe|type=="object") and (.recipe_sha256|type=="string" and test("^[0-9a-f]{64}$")) and
         (.required_assets|type=="array" and length>0) and (.inputs|type=="array" and length>0) and
         (.source_files|type=="array") and
-        .source_files==([.recipe.artifacts[].source_files[]?.source]|unique|sort))
+        .source_files==([.recipe.artifacts[] | (.source_file // empty), .source_files[]?.source]|unique|sort))
         then .[0].recipe else error("invalid packaging preview") end' \
         "$work/packaging-preview.json" | jq -cS . > "$work/packaging-recipe.json" || return 7
     [[ "$(_slsa_sha256 "$work/packaging-recipe.json")" == \
@@ -92,7 +92,8 @@ _rf_packaging_contract() {
                     (if has("target_triple") and ($input|has("target_triple")) then
                         .target_triple==$input.target_triple else true end))) and
             all($r.recipe.artifacts[]; . as $a |
-                if has("members") then all(.members[]; .source as $n |
+                if has("source_file") then .target=="additional" and .archive_format=="none"
+                elif has("members") then all(.members[]; .source as $n |
                     any($p.required_assets[]; .name==$n and (.archive_format|raw)))
                 else any($p.required_assets[]; .name==$a.source and
                     ((.archive_format|raw)==($a.archive_format|raw))) end)
@@ -137,7 +138,13 @@ _rf_packaging_handoff() {
                 .packaging_evidence.source_companions.kind=="git-commit-source-files" and
                 .packaging_evidence.source_companions.schema_version==1 and
                 .packaging_evidence.source_companions.git_sha==$p.source_sha and
-                ([.packaging_evidence.source_companions.files[].source]|sort)==$r.source_files
+                ([.packaging_evidence.source_companions.files[].source]|sort)==$r.source_files and
+                (.artifacts as $assets | .packaging_evidence.source_companions.files as $files |
+                    all($r.recipe.artifacts[]|select(has("source_file")); . as $a |
+                        any($files[]; . as $f | .source==$a.source_file and
+                            all(($a.name, $a.aliases[]); . as $n |
+                                any($assets[]; .name==$n and .target=="additional" and .archive_format=="none"
+                                    and .sha256==$f.sha256 and .size_bytes==$f.size_bytes)))))
              else (.packaging_evidence|has("source_companions")|not) end))' \
         "$package/release/build-manifest.json" >/dev/null || return 7
     [[ "$(_slsa_sha256 "$package/release/build-manifest.json")" == "$hash" ]] || return 7

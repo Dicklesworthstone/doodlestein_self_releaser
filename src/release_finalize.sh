@@ -342,7 +342,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
                 'Collect the complete pinned target matrix before any release API call; retry resumes verified imports.' \
                 'Identity, manifest and --upload-payloads come from the plan. Signing and --promote remain explicit.'
             printf '%s\n' 'Add --packaging-recipe RECIPE.json to either mode to package before signing and finalization.'
-            printf '%s\n' 'Recipes with source_files also need --packaging-source-repo CHECKOUT for initial packaging.' \
+            printf '%s\n' 'Recipes with source_files or source_file also need --packaging-source-repo CHECKOUT for initial packaging.' \
                 'Companion Git objects are checked before builders start; completed packages can reverify offline.'
             printf '\n%s\n' 'Build plan: --build-plan PLAN.json --build-dir DIR [--build-jobs N] [finalizer policy options]' \
                 'Execute native/xwin jobs, retain completed checkpoints, assemble every target, then finalize.' ;;
