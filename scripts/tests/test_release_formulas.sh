@@ -95,6 +95,21 @@ RUBY
   "autoupdate":{"architecture":{"64bit":{"url":"https://github.com/owner/tool/releases/download/v$version/tool-$version-x86_64-pc-windows-msvc.zip"}}}
 }
 JSON
+    case "$SCENARIO" in
+        flat-bucket|linked-bucket|truncated-bucket)
+            mv "$CASE/scoop-source/bucket/tool.json" "$CASE/scoop-source/tool.json" || return 1
+            if [[ "$SCENARIO" == linked-bucket ]]; then
+                mv "$CASE/scoop-source/bucket" "$CASE/scoop-source/elsewhere" || return 1
+                ln -s elsewhere "$CASE/scoop-source/bucket" || return 1
+            fi ;;
+        shadowed-root) printf 'inactive root copy\n' > "$CASE/scoop-source/tool.json" ;;
+        missing-nested)
+            mv "$CASE/scoop-source/bucket/tool.json" "$CASE/scoop-source/tool.json" || return 1
+            printf '{}\n' > "$CASE/scoop-source/bucket/another.json" ;;
+        linked-manifest)
+            mv "$CASE/scoop-source/bucket/tool.json" "$CASE/scoop-source/tool.json" || return 1
+            ln -s ../tool.json "$CASE/scoop-source/bucket/tool.json" || return 1 ;;
+    esac
     local name id=10 inventory='[]' size asset manager
     size=$(wc -c < "$CASE/payload"); size="${size//[[:space:]]/}"
     for name in tool-1.0.1-aarch64-apple-darwin.tar.gz tool-1.0.1-x86_64-apple-darwin.tar.gz \
@@ -165,6 +180,18 @@ gh_api() {
             if [[ "$SCENARIO" == changed-asset ]]; then
                 jq -c --argjson id "$id" '.[] | select(.id==$id) | .name="changed-name"' "$CASE/assets.json"
             else jq -c --argjson id "$id" '.[] | select(.id==$id)' "$CASE/assets.json"; fi ;;
+        repos/owner/scoop-bucket/git/trees/*)
+            formula_interrupt recipe-read || return $?
+            id=$(command git --git-dir="$CASE/scoop.git" rev-parse "${endpoint##*/}^{tree}") || return 8
+            command git --git-dir="$CASE/scoop.git" ls-tree "$id" |
+                jq -Rn --arg id "$id" --arg scenario "$SCENARIO" '
+                    {sha:$id, truncated:($scenario=="truncated-bucket"),
+                     tree:[inputs | capture("^(?<mode>[^ ]+) (?<type>[^ ]+) (?<sha>[^\\t]+)\\t(?<path>.+)$")]}' ;;
+        repos/owner/scoop-bucket/git/blobs/*)
+            formula_interrupt scoop-blob-read || return $?
+            id="${endpoint##*/}"
+            command git --git-dir="$CASE/scoop.git" cat-file blob "$id" | base64 |
+                jq -Rs --arg id "$id" '{sha:$id,type:"blob",encoding:"base64",content:.}' ;;
         repos/owner/homebrew-tap/contents/*|repos/owner/scoop-bucket/contents/*)
             formula_interrupt recipe-read || return $?
             path="${endpoint#*/contents/}"
@@ -219,6 +246,56 @@ invoke() {
 }
 remote_sha() { command git --git-dir="$CASE/$1.git" rev-parse refs/heads/main; }
 no_pushes() { ! grep -q ' push ' "$GIT_CALLS"; }
+
+formula_scoop_layout_cases() {
+    local original published scenario dry
+    seed flat-bucket || return 1
+    original=$(remote_sha scoop)
+    invoke true --skip-homebrew --push
+    check 'flat bucket preview succeeds' equal "$RESULT" 0
+    check 'preview selects the root manifest and verifies both downloads' json_is "$CASE/output.json" \
+        '.details.scoop.path=="tool.json" and .details.scoop.status=="planned" and (.details.assets|length)==2'
+    check 'flat preview leaves the remote unchanged' equal "$(remote_sha scoop)" "$original"
+    check 'flat preview never clones or commits the bucket' test ! -s "$GIT_CALLS"
+    invoke false --skip-homebrew --push
+    check 'flat bucket publication succeeds' equal "$RESULT" 0
+    published=$(remote_sha scoop)
+    check 'receipt names the actual updated file and pushed commit' json_is "$CASE/output.json" \
+        ".details.scoop.path==\"tool.json\" and .details.scoop.commit==\"$published\" and .details.scoop.pushed"
+    command git --git-dir="$CASE/scoop.git" show main:tool.json > "$CASE/published.json" || return 1
+    check 'root package contains verified hashes and new URLs' json_is "$CASE/published.json" \
+        ".version==\"1.0.1\" and all(.architecture[]; .hash==\"$HASH\" and (.url|contains(\"/v1.0.1/\")))"
+    invoke false --skip-homebrew --push
+    check 'root package retry is unchanged' json_is "$CASE/output.json" '.details.scoop.status=="unchanged"'
+    check 'retry retains exact root package commit' equal "$(remote_sha scoop)" "$published"
+
+    seed shadowed-root || return 1
+    for dry in true false; do
+        invoke "$dry" --skip-homebrew --push
+        check "nested manifest takes precedence (dry=$dry)" equal "$RESULT" 0
+        check "receipt records nested manifest (dry=$dry)" json_is "$CASE/output.json" '.details.scoop.path=="bucket/tool.json"'
+    done
+    check 'inactive root copy is preserved' equal "$(command git --git-dir="$CASE/scoop.git" show main:tool.json)" 'inactive root copy'
+    for scenario in missing-nested linked-bucket linked-manifest; do
+        seed "$scenario" || return 1
+        original=$(remote_sha scoop)
+        for dry in true false; do
+            invoke "$dry" --skip-homebrew --push
+            check "$scenario cannot select a different package (dry=$dry)" nonzero "$RESULT"
+            check "$scenario leaves remote intact (dry=$dry)" equal "$(remote_sha scoop)" "$original"
+        done
+    done
+    seed truncated-bucket || return 1
+    invoke true --skip-homebrew
+    check 'incomplete layout evidence cannot select the root manifest' nonzero "$RESULT"
+    check 'incomplete layout stops before the payload download' bash -c '! grep -q "^download " "$1"' _ "$API_CALLS"
+    seed flat-bucket-cancel || return 1
+    FORMULA_INTERRUPT_STAGE=scoop-blob-read FORMULA_INTERRUPT_CODE=143
+    invoke true --skip-homebrew
+    check 'interrupted immutable recipe read is terminal' equal "$RESULT" 5
+    check 'interrupted reader records original signal' json_is "$CASE/output.json" '.details.operation_exit_code==143'
+    FORMULA_INTERRUPT_STAGE=''
+}
 
 # Real bare repositories make an accepted-but-interrupted push distinguishable
 # from an ordinary failure. The stopped invocation must never advance to the
@@ -329,6 +406,7 @@ formula_routing_cases() {
 }
 
 case "${FORMULAS_TEST_SCOPE:-all}" in
+    scoop-layout) formula_scoop_layout_cases || exit 1; printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"; [[ "$FAIL" -eq 0 ]]; exit $? ;;
     cancellation) formula_cancellation_cases; printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"; [[ "$FAIL" -eq 0 ]]; exit $? ;;
     routing) formula_routing_cases; printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"; [[ "$FAIL" -eq 0 ]]; exit $? ;;
     all) ;;
@@ -342,6 +420,7 @@ check 'dry run succeeds' equal "$RESULT" 0
 check 'dry run output is a single JSON result' bash -c 'jq -es "length==1" "$1" >/dev/null' _ "$CASE/output.json"
 check 'dry run plans five exact assets' json_is "$CASE/output.json" '.details.assets | length==5'
 check 'dry run reports planned, not pushed' json_is "$CASE/output.json" '.details.homebrew.status=="planned" and .details.scoop.status=="planned" and .details.pushed==false and .details.work_dir==null'
+check 'each dry-run receipt names its own recipe' json_is "$CASE/output.json" '.details.homebrew.path=="Formula/tool.rb" and .details.scoop.path=="bucket/tool.json"'
 check 'dry run creates no persistent workspace' test ! -e "$DSR_STATE_DIR/formulas"
 check 'dry run never invokes Git' test ! -s "$GIT_CALLS"
 check 'dry run cleans its temporary workspace' equal "$(find "$TMPDIR" -mindepth 1 -maxdepth 1 | wc -l | tr -d '[:space:]')" 0
@@ -568,6 +647,7 @@ check 'help documents usage and manager options' grep -q -- '--homebrew-tap' "$C
 
 formula_routing_cases
 formula_cancellation_cases
+formula_scoop_layout_cases || exit 1
 
 printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

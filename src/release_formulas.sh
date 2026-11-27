@@ -78,13 +78,57 @@ _formulas_fetch_recipe() {
         type == "object" and .type == "file" and .path == $path and
         .encoding == "base64" and (.content | type == "string"))' \
         <<< "$response" >/dev/null || return 8
-    # GNU and BSD base64 use different switches. Never retry decoding into an
-    # existing partial output; the caller's staging file is not a live recipe.
+    _formulas_decode_recipe "$destination" <<< "$response"
+}
+
+_formulas_decode_recipe() {
+    local destination="$1"
+    # GNU and BSD base64 use different switches. The caller supplies a
+    # private staging path, never a live recipe.
     if printf '' | base64 --decode >/dev/null 2>&1; then
-        jq -r '.content' <<< "$response" | base64 --decode > "$destination"
+        jq -r '.content' | base64 --decode > "$destination"
     else
-        jq -r '.content' <<< "$response" | base64 -D > "$destination"
+        jq -r '.content' | base64 -D > "$destination"
     fi
+}
+
+# Scoop's Find-BucketDirectory selects bucket/ when present and the repository
+# root otherwise. Inspect complete nonrecursive trees, then fetch the exact
+# selected blob, so a moving branch or missing API response cannot switch
+# layouts between discovery and reading the recipe.
+_formulas_fetch_scoop() {
+    local repo="$1" filename="$2" destination="$3" tree=HEAD dir='' entry response sha status
+    while :; do
+        response=$(gh_api "repos/$repo/git/trees/$tree" --no-cache) || {
+            status=$?; _formulas_failure_status "$status" 8; return $?;
+        }
+        entry=$(jq -ers --arg name "$filename" --arg dir "$dir" --arg tree "$tree" '
+            select(length == 1) | .[0] |
+            select(.truncated == false and (.tree | type == "array") and
+                   ($tree == "HEAD" or .sha == $tree)) | .tree |
+            if $dir == "" and any(.[]; .path == "bucket") then
+                map(select(.path == "bucket")) | select(length == 1) | .[0] |
+                select(.type == "tree" and .mode == "040000")
+            else
+                map(select(.path == $name)) | select(length == 1) | .[0] |
+                select(.type == "blob" and (.mode == "100644" or .mode == "100755"))
+            end | select(.sha | type == "string" and test("^[0-9a-f]{40}$")) |
+            [.type, .sha] | @tsv' <<< "$response") || {
+            log_error "Cannot select a regular Scoop manifest at ${dir}$filename in $repo"
+            return 4
+        }
+        sha="${entry#*$'\t'}"
+        [[ "${entry%%$'\t'*}" == tree ]] || break
+        dir=bucket/ tree="$sha"
+    done
+    response=$(gh_api "repos/$repo/git/blobs/$sha" --no-cache) || {
+        status=$?; _formulas_failure_status "$status" 8; return $?;
+    }
+    jq -es --arg sha "$sha" 'length == 1 and (.[0] |
+        .sha == $sha and .encoding == "base64" and (.content | type == "string"))' \
+        <<< "$response" >/dev/null || return 8
+    _formulas_decode_recipe "$destination" <<< "$response" || return 4
+    printf '%s%s\n' "$dir" "$filename"
 }
 
 # scan: emit {version,urls}; apply: emit the edited formula on stdout. Ripper
@@ -474,7 +518,8 @@ OPTIONS:
 Global --dry-run validates recipes and downloads without commits or pushes.
 Every configured download must resolve to its exact release asset; bytes,
 size and available GitHub digests are verified. Homebrew requires Ruby for
-non-evaluating syntax parsing. Scoop architecture overrides are preserved.
+non-evaluating syntax parsing. Scoop uses bucket/<tool>.json when bucket/
+exists, otherwise <tool>.json at the repository root.
 Local commits and evidence are retained under XDG state when not a dry run.
 HELP
                 return 0 ;;
@@ -570,11 +615,18 @@ HELP
         path="${paths[$manager]}"
         if [[ "$dry_run" == "true" ]]; then
             recipe="$work/$manager.original"
-            _formulas_fetch_recipe "${repositories[$manager]}" "$path" "$recipe" || status=$?
+            if [[ "$manager" == scoop ]]; then
+                path=$(_formulas_fetch_scoop "${repositories[$manager]}" "$tool_name.json" "$recipe") || status=$?
+            else
+                _formulas_fetch_recipe "${repositories[$manager]}" "$path" "$recipe" || status=$?
+            fi
         else
-            recipe="$work/$manager/$path"
             _formulas_git clone --depth 1 --no-recurse-submodules --template= -- "https://github.com/${repositories[$manager]}.git" \
                 "$work/$manager" >&2 || status=$?
+            if [[ "$manager" == scoop && ! -e "$work/scoop/bucket" && ! -L "$work/scoop/bucket" ]]; then
+                path="$tool_name.json"
+            fi
+            recipe="$work/$manager/$path"
             if [[ $status -eq 0 && ( -L "$work/$manager/${path%%/*}" || -L "$recipe" || ! -f "$recipe" ) ]]; then
                 status=4
             fi
@@ -582,6 +634,7 @@ HELP
         if [[ $status -ne 0 ]]; then
             _formulas_operation_error "$status" 1 "Cannot load $manager recipe; no repositories were pushed" "$work"; return $?
         fi
+        paths[$manager]="$path"
         "_formulas_$manager" scan "$recipe" "$work/plan.json" "${tag#v}" > "$work/$manager.scan.json" || status=$?
         if ((status == 0)); then
             _formulas_plan_assets "$repo" "$tag" "$release_id" "$work/$manager.scan.json" "$work" || status=$?
@@ -603,8 +656,9 @@ HELP
     for manager in "${managers[@]}"; do
         status=0 changed=false branch="" commit="" kind=planned
         operation_status=0 push_attempted=false push_outcome=not_attempted
+        path="${paths[$manager]}"
         if [[ "$dry_run" != "true" ]]; then
-            path="${paths[$manager]}" recipe="$work/$manager/${paths[$manager]}"
+            recipe="$work/$manager/$path"
             branch=$(_formulas_git -C "$work/$manager" symbolic-ref --short HEAD) || status=$?
             if [[ $status -eq 0 ]]; then
                 if ! cmp -s "$recipe" "$work/$manager.updated"; then
