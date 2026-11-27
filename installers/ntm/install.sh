@@ -930,20 +930,36 @@ _tc_bootstrap_rust() {
     _TC_BOOTSTRAP_SHA="$expected"
 }
 
-_tc_bootstrap_bun() {
-    local tree="$1" root="$2" platform="$3" version engine target libc checksums expected actual member candidate
-    [[ -f "$tree/package.json" && ! -L "$tree/package.json" ]] || return 4
-    version=$(jq -ers '
+_tc_bun_requirements() {
+    local manifest="$1/package.json"
+    [[ -f "$manifest" && ! -L "$manifest" ]] || return 4
+    jq -ces '
+        def text: type == "string" and (test("[[:cntrl:]]") | not);
+        def release: test("^[0-9]+\\.[0-9]+\\.[0-9]+$");
         if length != 1 or (.[0]|type) != "object" then error("invalid package.json") else .[0] end |
-        (.packageManager // "") as $manager |
-        if ($manager|type) != "string" then error("invalid packageManager")
-        elif ($manager|startswith("bun@")) then $manager|ltrimstr("bun@") else "" end
-    ' "$tree/package.json") || return 4
-    engine=$(jq -er '.engines.bun // "" | if type == "string" then . else error("invalid Bun engine") end' "$tree/package.json") || return 4
-    if [[ -n "$version" && ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        _tc_log_error 'Bun packageManager must pin one released numeric version'; return 4
-    fi
-    [[ -n "$version" || ! "$engine" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || version="$engine"
+        (.packageManager | if . == null then "" else . end) as $manager |
+        (.engines.bun | if . == null then "" else . end) as $engine |
+        if ($manager|text|not) or ($engine|text|not) then error("invalid Bun compiler requirements")
+        elif ($manager|startswith("bun@")) then
+            ($manager|ltrimstr("bun@")) as $version |
+            if ($version|release) then {version:$version, engine:$engine}
+            else error("Bun packageManager must pin one released numeric version") end
+        else {version:(if ($engine|release) then $engine else "" end), engine:$engine} end
+    ' "$manifest" || return 4
+}
+
+_tc_bun_check_engine() {
+    [[ -n "$2" ]] || return 0
+    # Older Bun releases include an extra [eval] argument; pass the range as data.
+    DSR_BOOTSTRAP_BUN_RANGE="$2" "$1" --eval \
+        'if (!Bun.semver.satisfies(Bun.version, process.env.DSR_BOOTSTRAP_BUN_RANGE)) process.exit(1)'
+}
+
+_tc_bootstrap_bun() {
+    local tree="$1" root="$2" platform="$3" version engine requirements target libc checksums expected actual member candidate
+    requirements=$(_tc_bun_requirements "$tree") || return $?
+    version=$(jq -r '.version' <<< "$requirements") || return 4
+    engine=$(jq -r '.engine' <<< "$requirements") || return 4
     if [[ -z "$version" ]]; then
         _tc_bootstrap_fetch 'https://api.github.com/repos/oven-sh/bun/releases/latest' "$root/release.json" 8388608 || return $?
         version=$(jq -ers 'if length == 1 and (.[0].tag_name|type == "string" and test("^bun-v[0-9]+\\.[0-9]+\\.[0-9]+$"))
@@ -984,14 +1000,9 @@ _tc_bootstrap_bun() {
     _TC_BOOTSTRAP_BIN="$root/bun/bin"
     _TC_BOOTSTRAP_VERSION=$("$_TC_BOOTSTRAP_BIN/bun" --version) || return 7
     [[ "$_TC_BOOTSTRAP_VERSION" == "$version" ]] || return 7
-    if [[ -n "$engine" ]]; then
-        # Bun before 1.3 included an extra [eval] argv entry. An invocation-only
-        # environment value preserves the same range across pinned versions.
-        DSR_BOOTSTRAP_BUN_RANGE="$engine" "$_TC_BOOTSTRAP_BIN/bun" --eval \
-            'if (!Bun.semver.satisfies(Bun.version, process.env.DSR_BOOTSTRAP_BUN_RANGE)) process.exit(1)' || {
-            _tc_log_error 'The selected Bun release does not satisfy package.json engines.bun'; return 7;
-        }
-    fi
+    (cd "$root" && _tc_bun_check_engine "$_TC_BOOTSTRAP_BIN/bun" "$engine") || {
+        _tc_log_error 'The selected Bun release does not satisfy package.json engines.bun'; return 7;
+    }
     _TC_BOOTSTRAP_SHA="$expected"
 }
 
@@ -1105,7 +1116,8 @@ export -f toolchain_bootstrap
 #   [--subdir relative/path] [--entry relative/path] [--package cargo_package]
 #   [--bin name ...] [--timeout seconds] [--install-toolchain]
 #   [--feature cargo_feature ...] [--no-default-features] (Rust only)
-# Timeout applies to each fetch/compiler command, including its children.
+# Timeout applies to acquisition, each complete source-verification pass and
+# each compiler command, including their children.
 # stdout: one receipt JSON after a successful build; stderr: progress/errors.
 # Exit: 3 missing dependency, 4 invalid input, 5 timeout/interruption,
 #       6 build failure, 7 distribution verification, 8 retrieval failure,
@@ -1599,6 +1611,16 @@ _isb_verify_source_graph() {
     _isb_sha256 "$manifest"
 }
 
+# _isb_run combines command output and diagnostics in its retained log. The
+# caller reserves descriptor 9 for the fingerprint's command-substitution pipe;
+# keep this authenticated value in memory rather than a build-writable file.
+# Only a successful whole verification may supply the before/after identity.
+_isb_capture_source_graph() (
+    # Keep every Git/hash subprocess in the watchdog's owned process group.
+    set +m
+    _isb_verify_source_graph "$@" >&9
+)
+
 _isb_in_dir() ( cd "$1" && shift && "$@" )
 
 # Shared by Git source checkout, release acquisition and freshness in generated
@@ -1947,8 +1969,16 @@ _isb_probe_go() (
     go version
 )
 
+_isb_probe_bun() (
+    local expected="$2" observed
+    cd "$1" || return 4
+    observed=$(bun --version) || return $?
+    [[ "$observed" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && ( -z "$expected" || "$observed" == "$expected" ) ]] || return 1
+    _tc_bun_check_engine bun "$3"
+)
+
 # Activate an explicitly requested bootstrap when a compiler is unavailable,
-# or when an installed Go compiler is older than the pinned source requires.
+# or when an installed compiler cannot satisfy the pinned source requirements.
 # This runs inside _isb_compile's subshell, so PATH and language homes never
 # escape the source attempt or replace the caller's installed toolchain.
 _isb_prepare_toolchain() {
@@ -1962,10 +1992,7 @@ _isb_prepare_toolchain() {
     if command -v "$command" >/dev/null 2>&1 &&
        { [[ "$language" != rust ]] || command -v rustc >/dev/null 2>&1; }; then
         installed=true
-        if [[ "${_ISB_INSTALL_TOOLCHAIN:-false}" != true ||
-              ( "$language" != rust && "$language" != go ) ]]; then
-            return 0
-        fi
+        [[ "${_ISB_INSTALL_TOOLCHAIN:-false}" == true ]] || return 0
         if [[ "$language" == rust ]]; then
             # An unavailable rustup-selected compiler is a missing toolchain;
             # bootstrap privately instead of changing that rustup home.
@@ -1980,7 +2007,8 @@ _isb_prepare_toolchain() {
         return 3
     fi
     if ! declare -F toolchain_bootstrap >/dev/null 2>&1 ||
-       { [[ "$language" == go ]] && ! declare -F _tc_go_required_version >/dev/null 2>&1; }; then
+       { [[ "$language" == go ]] && ! declare -F _tc_go_required_version >/dev/null 2>&1; } ||
+       { [[ "$command" == bun ]] && ! declare -F _tc_bun_requirements >/dev/null 2>&1; }; then
         source_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || return 3
         [[ -f "$source_dir/toolchain_detect.sh" && ! -L "$source_dir/toolchain_detect.sh" ]] || return 3
         # shellcheck source=SCRIPTDIR/toolchain_detect.sh
@@ -2012,6 +2040,15 @@ _isb_prepare_toolchain() {
         else
             _isb_log 'The existing Go command is unavailable; preparing an isolated toolchain'
         fi
+    elif $installed && [[ "$command" == bun ]]; then
+        local requirements engine
+        requirements=$(_tc_bun_requirements "$tree") || return $?
+        required=$(jq -r '.version' <<< "$requirements") || return 4
+        engine=$(jq -r '.engine' <<< "$requirements") || return 4
+        _isb_run "$limit" "$output/toolchain-probe.log" _isb_probe_bun "$output" "$required" "$engine" || status=$?
+        ((status != 0)) || return 0
+        ((status != 5 && status < 128)) || return 5
+        _isb_log 'The existing Bun compiler cannot satisfy the selected package.json; preparing an isolated toolchain'
     fi
     root="$output/toolchain"
     _isb_log "Preparing a private $language toolchain; existing installations and profiles are preserved"
@@ -3216,9 +3253,16 @@ install_source_build() (
     _isb_run "$limit" "$destination/fetch.log" _isb_checkout_source "$repo" "$ref" "$tree" "$graph_dir" || {
         status=$?; case "$status" in 1|3|4|5) return "$status" ;; *) return 8 ;; esac
     }
-    commit=$(_isb_git -C "$tree" -c "core.worktree=$tree" rev-parse --verify 'HEAD^{commit}') || return 8
     _ISB_SOURCE_GRAPH=$(jq -ce '.' "$graph_dir/repositories.json") || return 8
-    source_state=$(_isb_verify_source_graph "$tree" "$_ISB_SOURCE_GRAPH" "$graph_dir" initial) || return $?
+    # Acquisition already records the root commit under its deadline. The
+    # bounded initial verification below checks that same commit against HEAD
+    # and the actual tracked bytes; do not run another unsupervised Git read.
+    commit=$(jq -er '.[0] | select(.path == "") | .source_commit |
+        select(type == "string" and test("^([0-9a-f]{40}|[0-9a-f]{64})$"))' \
+        <<< "$_ISB_SOURCE_GRAPH") || return 8
+    source_state=$(_isb_run "$limit" "$destination/verify-initial.log" \
+        _isb_capture_source_graph "$tree" "$_ISB_SOURCE_GRAPH" "$graph_dir" initial 9>&1) || return $?
+    [[ "$source_state" =~ ^[0-9a-f]{64}$ ]] || return 6
     _isb_path_in_tree "$tree" "$subdir" && [[ -d "$tree/$subdir" ]] || return 4
     local build_root _ISB_CHECKOUT_ROOT="$tree"
     build_root=$(cd "$tree/$subdir" && pwd -P) || return 4
@@ -3227,7 +3271,9 @@ install_source_build() (
         ${cargo_options[@]+"${cargo_options[@]}"} "${binaries[@]}") || return $?
     # Preserve the source pin through compilation. Build scripts may not move
     # HEAD or modify tracked inputs and then claim they built the pinned tree.
-    final_source_state=$(_isb_verify_source_graph "$tree" "$_ISB_SOURCE_GRAPH" "$graph_dir") || return $?
+    final_source_state=$(_isb_run "$limit" "$destination/verify-final.log" \
+        _isb_capture_source_graph "$tree" "$_ISB_SOURCE_GRAPH" "$graph_dir" verify 9>&1) || return $?
+    [[ "$final_source_state" =~ ^[0-9a-f]{64}$ ]] || return 6
     [[ "$final_source_state" == "$source_state" ]] || {
         _isb_log 'Build changed tracked source bytes, links or executable modes'; return 6;
     }
