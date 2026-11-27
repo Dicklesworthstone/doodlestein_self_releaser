@@ -367,9 +367,15 @@ _formulas_plan_assets() {
     local cached receipt actual_size after plan_json status
     jq -es 'length == 1 and (.[0] | type == "object" and
         (.version == null or (.version | type) == "string") and
-        (.urls | type == "array" and all(.[]; type == "string")))' \
+        (.urls | type == "array" and all(.[]; type == "string" and
+            (explode | all(.[]; . >= 32 and . != 127)))))' \
         "$scan" >/dev/null || return 4
     old_version=$(jq -r '.version // ""' "$scan") || return 4
+    # Read the complete selection before admitting its first URL. Process
+    # substitution would discard a producer failure after a valid prefix.
+    jq -r '.urls[]' "$scan" > "$work/recipe-urls" || {
+        status=$?; ((status < 129)) || return "$status"; return 4
+    }
     while IFS= read -r url; do
         [[ -n "$url" ]] || continue
         [[ "${url,,}" == "${prefix,,}"* ]] || continue
@@ -450,7 +456,7 @@ _formulas_plan_assets() {
             --argjson asset "$asset" \
             '.[$old] = {url: $url, sha256: $hash, asset: $asset}' "$work/plan.json") || return 4
         printf '%s\n' "$plan_json" > "$work/plan.json" || return 4
-    done < <(jq -r '.urls[]' "$scan")
+    done < "$work/recipe-urls"
 }
 
 # Recheck both tag binding and immutable asset identities before publication.
@@ -467,6 +473,10 @@ _formulas_revalidate() {
     jq -es --arg tag "$tag" --argjson id "$release_id" 'length == 1 and
         (.[0] | .id == $id and .tag_name == $tag and .draft == false)' \
         <<< "$release" >/dev/null || return 7
+    jq -c '[.[] | .asset] | unique_by(.id)[]' "$plan" > "$plan.assets" || {
+        status=$?; ((status < 129)) || return "$status"; return 7
+    }
+    [[ -s "$plan.assets" ]] || return 7
     while IFS= read -r item; do
         id=$(jq -r '.id' <<< "$item") || return 7
         fresh=$(_gh_find_release_asset "$repo" "$release_id" "$(jq -r '.name' <<< "$item")") || status=$?
@@ -475,7 +485,7 @@ _formulas_revalidate() {
             (.[0] | {id,name,state,size,digest,created_at,updated_at}) ==
             ($before | {id,name,state,size,digest,created_at,updated_at})' \
             <<< "$fresh" >/dev/null || return 7
-    done < <(jq -c '[.[] | .asset] | unique_by(.id)[]' "$plan")
+    done < "$plan.assets"
 }
 
 cmd_release_formulas() (

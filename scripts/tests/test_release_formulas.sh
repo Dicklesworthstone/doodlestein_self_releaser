@@ -371,6 +371,59 @@ formula_cancellation_cases() {
     done
 }
 
+formula_partial_inventory_cases() {
+    local phase before after result
+    for phase in recipe push stale push-error; do
+        seed "partial-$phase" || return 1
+        before=$(remote_sha scoop)
+        # Keep the real Git repositories and the real renderer. The only
+        # added fault is an inventory reader that emits a valid first record
+        # and then dies (or reports an ordinary jq runtime error).
+        (
+            jq() {
+                if [[ "$phase" == recipe && "${2:-}" == '.urls[]' ]]; then
+                    command jq -r '.urls[0]' "$3" || return 1
+                elif [[ "$phase" != recipe && "${2:-}" == '[.[] | .asset] | unique_by(.id)[]' ]]; then
+                    printf 'read\n' >> "$CASE/row-reads"
+                    if [[ $(wc -l < "$CASE/row-reads") -lt 2 ]]; then
+                        command jq "$@"; return $?
+                    fi
+                    if [[ "$phase" == stale ]]; then
+                        # Remote ARM64 changed after the first full check, just
+                        # before push. The emitted prefix covers x86_64 only.
+                        command jq 'map(if .name|contains("aarch64-pc-windows") then .size+=1 else . end)' \
+                            "$CASE/assets.json" > "$CASE/drift.json" || return 1
+                        cp "$CASE/drift.json" "$CASE/assets.json" || return 1
+                    fi
+                    command jq -c '[.[] | .asset] | unique_by(.id)[0]' "$3" || return 1
+                else
+                    command jq "$@"; return $?
+                fi
+                printf 'partial\n' >> "$CASE/parser-stopped"
+                if [[ "$phase" == push-error ]]; then return 5; fi
+                bash -c 'kill -KILL "$$"'
+            }
+            invoke false --skip-homebrew --push
+            printf '%s\n' "$RESULT" > "$CASE/command-status"
+        )
+        result=$(cat "$CASE/command-status") || return 1
+        after=$(remote_sha scoop)
+        check "$phase exercised the partial reader" test -s "$CASE/parser-stopped"
+        check "$phase never advanced the package remote" equal "$after" "$before"
+        check "$phase never attempted a push" no_pushes
+        if [[ "$phase" == push-error ]]; then
+            check 'jq semantic error prevents push with an ordinary failure' equal "$result" 1
+        else
+            check "$phase preserves public cancellation" equal "$result" 5
+            check "$phase retains the stopped parser status" json_is "$CASE/output.json" '.details.operation_exit_code==137'
+        fi
+        if [[ "$after" != "$before" ]]; then
+            command git --git-dir="$CASE/scoop.git" show main:bucket/tool.json > "$CASE/incorrectly-published.json"
+            printf 'Unexpected publication: %s\n' "$(command jq -c '{version,urls:[.architecture[].url]}' "$CASE/incorrectly-published.json")"
+        fi
+    done
+}
+
 formula_package_alias_cases() {
     local before_homebrew before_scoop status
     seed package-alias || return 1
@@ -450,6 +503,7 @@ formula_routing_cases() {
 }
 
 case "${FORMULAS_TEST_SCOPE:-all}" in
+    partial-rows) formula_partial_inventory_cases || exit 1; printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"; [[ "$FAIL" -eq 0 ]]; exit $? ;;
     package-alias) formula_package_alias_cases || exit 1; printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"; [[ "$FAIL" -eq 0 ]]; exit $? ;;
     scoop-layout) formula_scoop_layout_cases || exit 1; printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"; [[ "$FAIL" -eq 0 ]]; exit $? ;;
     cancellation) formula_cancellation_cases; printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"; [[ "$FAIL" -eq 0 ]]; exit $? ;;
@@ -694,6 +748,7 @@ formula_routing_cases
 formula_cancellation_cases
 formula_scoop_layout_cases || exit 1
 formula_package_alias_cases || exit 1
+formula_partial_inventory_cases || exit 1
 
 printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
