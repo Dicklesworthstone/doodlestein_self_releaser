@@ -15760,9 +15760,21 @@ EOF
     # authoritative manifest, not a prefix glob that misses workspace binaries
     # or mistakes logs, signatures, and stale files for completed builds.
     local manifest_file="$output_dir/${tool_name}-${tag}-manifest.json" manifest_json
-    local manifest_sha name sha size actual_sha actual_size
+    local manifest_snapshot manifest_sha name sha size actual_sha actual_size
+    local artifact_rows expected_artifacts inventory_rc=0
     local -a payload_paths=()
+    if ! manifest_snapshot=$(mktemp "${TMPDIR:-/tmp}/dsr-fallback-manifest.XXXXXXXX"); then
+        verification_status="failed"; release_status="blocked"
+        _fallback_result 6 verification "Could not create a build manifest snapshot"
+        return 6
+    fi
+    printf -v cleanup 'rm -f -- %q; %s' "$manifest_snapshot" "$cleanup"
+    # shellcheck disable=SC2064 # Preserve the existing lock cleanup and the snapshot path.
+    trap "$cleanup" EXIT
+    # Parse and hash the same bytes even if the build replaces its manifest.
     if [[ ! -f "$manifest_file" || -L "$manifest_file" ]] ||
+       ! cat "$manifest_file" > "$manifest_snapshot" ||
+       ! manifest_sha=$(_release_sha256 "$manifest_snapshot") ||
        ! _release_require_publishable_artifacts "$output_dir" "$manifest_file" false true ||
        ! manifest_json=$(jq -cse --arg tool "$tool_name" --arg tag "$tag" '
             if length == 1 and (.[0] |
@@ -15777,12 +15789,11 @@ EOF
                     (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
                     (.size_bytes | type == "number" and floor == . and . > 0)))
             then .[0] else error("incomplete build manifest") end
-        ' "$manifest_file"); then
+        ' "$manifest_snapshot"); then
         verification_status="failed"; release_status="blocked"
         _fallback_result 6 verification "A complete, publishable build manifest is required"
         return 6
     fi
-    manifest_sha=$(_release_sha256 "$manifest_file") || return 6
     if [[ -n "$expected_sha" ]] &&
        ! jq -e --arg sha "$expected_sha" '.source.git_sha == $sha' <<< "$manifest_json" >/dev/null; then
         verification_status="failed"; release_status="blocked"
@@ -15810,6 +15821,21 @@ EOF
         _fallback_result 6 verification "Manifest does not match the resumed build run, source commit, or target matrix"
         return 6
     fi
+    # A producer may emit valid rows before failing. Check its exit status
+    # before trusting any rows and retain the complete list through signing.
+    artifact_rows=$(jq -er '(.artifacts | length),
+        (.artifacts[] | [.name,.sha256,(.size_bytes|tostring)] | @tsv)' <<< "$manifest_json") || inventory_rc=$?
+    if [[ "$inventory_rc" != 0 ]]; then
+        verification_status="failed"; release_status="blocked"
+        if ((inventory_rc > 128)) && _fallback_record_interruption verification "$inventory_rc"; then
+            _fallback_result 5 verification "Artifact inventory read interrupted"
+            return 5
+        fi
+        _fallback_result 6 verification "Could not read the build artifact inventory"
+        return 6
+    fi
+    expected_artifacts=${artifact_rows%%$'\n'*}
+    artifact_rows=${artifact_rows#*$'\n'}
     while IFS=$'\t' read -r name sha size; do
         local file="$output_dir/$name"
         actual_sha=""; actual_size=""
@@ -15822,10 +15848,11 @@ EOF
             return 6
         fi
         payload_paths+=("$file")
-    done < <(jq -r '.artifacts[] | [.name,.sha256,(.size_bytes|tostring)] | @tsv' <<< "$manifest_json")
+    done <<< "$artifact_rows"
     artifacts_count=${#payload_paths[@]}
-    if [[ $artifacts_count -ne $(jq '.artifacts | length' <<< "$manifest_json") ||
+    if [[ "$artifacts_count" != "$expected_artifacts" ||
           "$(_release_sha256 "$manifest_file")" != "$manifest_sha" ]]; then
+        verification_status="failed"; release_status="blocked"
         _fallback_result 6 verification "Build manifest changed during verification"
         return 6
     fi
@@ -15887,10 +15914,11 @@ EOF
         local file="$output_dir/$name"
         if [[ ! -f "$file" || -L "$file" ]] ||
            [[ "$(_release_sha256 "$file")" != "$sha" || "$(_release_file_size "$file")" != "$size" ]]; then
+            verification_status="failed"; release_status="blocked"
             _fallback_result 6 verification "Artifact changed before release: $name"
             return 6
         fi
-    done < <(jq -r '.artifacts[] | [.name,.sha256,(.size_bytes|tostring)] | @tsv' <<< "$manifest_json")
+    done <<< "$artifact_rows"
     if [[ "$(_release_sha256 "$manifest_file")" != "$manifest_sha" ]] ||
        ! _act_repo_config_matches "$tool_name" "$fallback_repo_config_sha256" ||
        ! _release_require_publishable_artifacts "$output_dir" "$manifest_file" false true ||

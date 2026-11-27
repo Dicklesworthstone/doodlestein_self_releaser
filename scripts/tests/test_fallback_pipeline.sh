@@ -1616,6 +1616,50 @@ test_release_scan_failure() {
     run_fallback --resume
     [[ "$RC" == 8 && ! -e "$CASE/lock" ]] && one_result && ! grep -q '^RELEASE ' "$CALLS"
 }
+test_build_only_manifest_snapshot() {
+    local mode="$1" expected_status=6
+    setup "manifest-snapshot-$mode"
+    jq() {
+        if [[ "$mode" == rotated && "$*" == *'incomplete build manifest'* ]]; then
+            command jq "$@" || return $?
+            # A completed build can atomically replace a manifest and receipt
+            # while the consumer still holds the previous parsed inventory.
+            printf 'ROTATE\n' >> "$CALLS"
+            local manifest="$OUT/tool-v1.2.3-manifest.json"
+            command jq '.build_generation=2' "$manifest" > "$CASE/next.json" &&
+                mv "$CASE/next.json" "$manifest" && seal_fixture_manifest "$OUT"
+        elif [[ "$*" == *'@tsv'* && "$*" == *'.size_bytes|tostring'* ]]; then
+            if [[ "$mode" == signed-drift && -e "$CASE/finished-signing" ]]; then
+                # No second inventory read is available after the signer exits.
+                return 143
+            fi
+            command jq "$@" || return $?
+            if [[ "$mode" == interrupted || "$mode" == parser-error ]]; then
+                printf 'INVENTORY_STOP\n' >> "$CALLS"
+                [[ "$mode" == interrupted ]] && return 143
+                return 5
+            fi
+        else
+            command jq "$@"
+        fi
+    }
+    signing_verify() {
+        [[ "$(cat "${1}.minisig")" == "fixture-signature:$(_release_sha256 "$1")" ]] || return 1
+        if [[ "$mode" == signed-drift && "$1" == "$OUT/tool-v1.2.3-manifest.json" ]]; then
+            printf 'changed after signing\n' >> "$OUT/worker"
+            : > "$CASE/finished-signing"
+        fi
+    }
+    run_fallback --build-only
+    [[ "$mode" != interrupted ]] || expected_status=5
+    case "$mode" in
+        rotated) grep -qx ROTATE "$CALLS" && blocked || return 1 ;;
+        parser-error|interrupted) grep -qx INVENTORY_STOP "$CALLS" && blocked || return 1 ;;
+        signed-drift) [[ -e "$CASE/finished-signing" ]] && grep -q '^SIGN ' "$CALLS" || return 1 ;;
+    esac
+    [[ "$RC" == "$expected_status" && ! -e "$CASE/lock" ]] && one_result &&
+        jq -e '.details.phase=="verification" and .details.phases.release=="blocked"' "$CASE/stdout" >/dev/null
+}
 # Keep the shared paginated release reader and the public fallback command
 # real. A transport or parser can produce valid-looking output and then stop;
 # neither that output nor a previously completed build authorizes publication.
@@ -2535,6 +2579,9 @@ for mode in missing malformed cancelled diagnostic selected; do run_test test_in
 run_test test_signature_resume
 for mode in existing-corrupt existing-symlink missing corrupt mutate manifest; do run_test test_signature_failure "$mode"; done
 run_test test_release_scan_failure
+for mode in rotated interrupted parser-error signed-drift; do
+    run_test test_build_only_manifest_snapshot "$mode"
+done
 for scan_boundary in transport page merge matches-count page-count result admission; do
     run_test test_release_resume_scan_terminal "$scan_boundary" 130 5
 done
