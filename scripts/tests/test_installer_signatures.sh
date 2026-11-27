@@ -722,7 +722,10 @@ source_dir=$(CDPATH='' cd -P -- "$(dirname "$source_path")" && pwd -P) || exit 1
 for module in guardrails logging config platforms current; do
   source "$source_dir/src/$module.sh" || exit 1
 done
-if [[ "${1:-}" == --version ]]; then printf 'dsr version %s\\n' "$DSR_VERSION"
+if [[ "${1:-}" == --version ]]; then
+  [[ -z "${DSR_FIXTURE_CASE:-}" ]] || printf '%s\\n' "$DSR_VERSION" >> "$DSR_FIXTURE_CASE/version.calls"
+  if [[ "${DSR_FIXTURE_FAULT:-}" == stalled-version ]]; then exec "$DSR_FIXTURE_CASE/wrappers/stall-request"; fi
+  printf 'dsr version %s\\n' "$DSR_VERSION"
 elif [[ "${1:-}" == doctor ]]; then
   printf '%s\\n' "$DSR_VERSION" >> "$DSR_FIXTURE_CASE/doctor.calls"
   case "${DSR_FIXTURE_FAULT:-}" in
@@ -920,6 +923,9 @@ def process_live(pid):
 def request_case(label, fault, arguments, cancel=None, skills=False):
     context = setup(label)
     case, selected, target, environment = context
+    if fault == 'stalled-version':
+        for args in (['init'], ['add', '.'], ['commit', '-m', 'Installed release'], ['tag', 'v1.2.30']):
+            run([real_git, '-C', str(selected), *args], env=git_environment, check=True)
     before, old_id = tree_snapshot(selected), identity(selected)
     private = case / 'requests'
     private.mkdir()
@@ -986,7 +992,7 @@ def request_case(label, fault, arguments, cancel=None, skills=False):
     git = (case / 'git.calls').read_text().splitlines() if (case / 'git.calls').exists() else []
     expected_http = {'stalled-metadata': 1, 'stalled-redirect': 2, 'stalled-header': 3,
                      'stalled-network': 1, 'stalled-clone': 1, 'stalled-credential': 1,
-                     'stalled-skill': 2}[fault]
+                     'stalled-skill': 2, 'stalled-version': 0}[fault]
     check(label + ' does not start a later HTTP acquisition', len(http) == expected_http)
     acquisitions = [line for line in git if line.startswith('clone ') or ' clone ' in line or ' fetch ' in line]
     check(label + ' does not retry source acquisition', len(acquisitions) == (1 if fault in ('stalled-clone', 'stalled-credential', 'stalled-skill') else 0))
@@ -1057,12 +1063,24 @@ for label, fault, arguments in (
     ('network-deadline', 'stalled-network', ['--version', 'main']),
     ('clone-deadline', 'stalled-clone', ['--version', 'main']),
     ('credential-deadline', 'stalled-credential', ['--version', '1.2.3']),
+    ('installed-version-deadline', 'stalled-version', ['--version', '1.2.30']),
 ):
     request_case(label, fault, arguments)
 request_case('optional-skill-deadline', 'stalled-skill', ['--version', 'main'], skills=True)
 request_case('metadata-term', 'stalled-metadata', [], cancel=signal.SIGTERM)
 request_case('clone-term', 'stalled-clone', ['--version', 'main'], cancel=signal.SIGTERM)
 request_case('credential-int', 'stalled-credential', ['--version', '1.2.3'], cancel=signal.SIGINT)
+request_case('installed-version-term', 'stalled-version', ['--version', '1.2.30'], cancel=signal.SIGTERM)
+
+# Exercise the human summary as well as acquisition. Repair must never run an
+# old launcher; reporting a staged version must not start the new one either.
+for label, args in (('offline', ['--offline', str(valid_archive)]),
+                    ('main', ['--version', 'main']), ('forced', ['--force', '--version', 'v1.2.3'])):
+    case, selected, target, environment = setup('repair-version-' + label)
+    result = run(['bash', str(installer), '--no-gum', '--no-configure', *args], env=environment)
+    check(label + ' installs and reports the validated source version', result.returncode == 0 and
+          'dsr version 1.2.3' in result.stdout and run([str(target / 'dsr')]).stdout.strip() == 'new')
+    check(label + ' executes neither old nor new launcher for version reporting', not (case / 'version.calls').exists())
 
 for index, value in enumerate(('', '0', '01', '-1', '1.5', '3601', '999999999999999999999', '1;exit 0')):
     context = setup('invalid-budget-' + str(index))

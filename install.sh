@@ -64,9 +64,6 @@ OFFLINE_PUBKEY=""
 CLAUDE_STATUS=""
 CODEX_STATUS=""
 GEMINI_STATUS=""
-# Reserved for future use (version display in summary)
-# shellcheck disable=SC2034
-CLAUDE_BACKUP="" CLAUDE_VERSION="" CODEX_VERSION="" GEMINI_VERSION=""
 DETECTED_AGENTS=()
 
 # Lock management
@@ -144,7 +141,8 @@ Environment:
   DSR_DATA_DIR       Override data directory (default: ~/.local/share/dsr)
   DSR_REPO_DIR       Override repo clone directory (default: $DSR_DATA_DIR/repo)
   DSR_INSTALLER_TIMEOUT  Complete request budget, 1–3600 seconds (default:
-                         30 for HTTP and doctor, 300 for Git; includes helpers)
+                         10 for installed version checks, 30 for HTTP and
+                         doctor, 300 for Git; includes helpers)
   HTTPS_PROXY        Proxy for HTTPS connections
   HTTP_PROXY         Proxy for HTTP connections
 EOF
@@ -581,47 +579,35 @@ installed_matches_requested_tag() {
 }
 
 check_existing_install() {
-  local installed="$DEST/$BINARY_NAME" current="" current_version=""
-  if [[ -x "$installed" && ! -d "$installed" ]]; then
-    # Inspect the selected destination, never an unrelated dsr earlier on PATH.
-    # Capture the complete result first so head cannot turn SIGPIPE into a
-    # false failure under pipefail.
-    if command -v timeout >/dev/null 2>&1; then
-      current=$(timeout 10 "$installed" --version 2>/dev/null) || current=""
-    elif command -v gtimeout >/dev/null 2>&1; then
-      current=$(gtimeout 10 "$installed" --version 2>/dev/null) || current=""
-    else
-      current=$("$installed" --version 2>/dev/null) || current=""
-    fi
-    if [[ "$current" =~ ^dsr[[:blank:]]version[[:blank:]]v?([0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?)$ ]]; then
-      current_version="${BASH_REMATCH[1]}"
-    fi
-    # A version label cannot authenticate a newly supplied offline archive.
-    # A different --repo-dir also requires installing that selected source.
-    if [ "$FORCE_INSTALL" -eq 0 ] && [ "$VERSION_EXPLICIT" -eq 1 ] &&
-       [[ -z "$OFFLINE_TARBALL" && -n "$current_version" && "$current_version" == "${VERSION#v}" &&
-          -L "$installed" && "$(readlink "$installed")" == "$REPO_DIR/dsr" ]] &&
-       installed_matches_requested_tag; then
-      if ((VERIFY)); then run_doctor || return $?; fi
-      ok "dsr $VERSION is already installed"
-      info "Use --force to reinstall"
-      INSTALL_COMMITTED=1
-      # Still run agent configuration (idempotent)
-      if [ "$NO_CONFIGURE" -eq 0 ]; then
-        local configure_status=0
-        configure_agents || configure_status=$?
-        request_terminal_status "$configure_status" && return "$configure_status"
-        ((configure_status == 0)) || warn "Agent configuration did not complete; the installed dsr is unchanged"
-      fi
-      show_summary
-      exit 0
-    fi
-    if [ "$FORCE_INSTALL" -eq 0 ] && [ "$VERSION_EXPLICIT" -eq 0 ] &&
-       [[ -n "$current_version" && "$current_version" == "${VERSION#v}" ]]; then
-      info "Existing dsr version matches; checking the main-branch source clone for updates"
-    fi
-    info "Existing dsr at $installed: ${current:-version unavailable}"
+  local installed="$DEST/$BINARY_NAME" current status=0
+  # Only an already-selected, clean tagged checkout can satisfy this request
+  # without acquisition. Repair and replacement must work even when the old
+  # launcher cannot start.
+  [[ "$FORCE_INSTALL" == 0 && "$VERSION_EXPLICIT" == 1 && "$VERSION" != main &&
+     -z "$OFFLINE_TARBALL" && -L "$installed" && -f "$installed" && -x "$installed" &&
+     "$(readlink "$installed")" == "$REPO_DIR/dsr" ]] || return 0
+  installed_matches_requested_tag || return 0
+
+  request_workspace || return 1
+  run_request "${DSR_INSTALLER_TIMEOUT:-10}" "$installed" --version > "$INSTALL_REQUEST_DIR/body" || status=$?
+  request_terminal_status "$status" && return "$status"
+  ((status == 0)) || return 0
+  current=$(cat "$INSTALL_REQUEST_DIR/body") || return 1
+  [[ "$current" =~ ^dsr[[:blank:]]version[[:blank:]]v?([0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?)$ &&
+     "${BASH_REMATCH[1]}" == "${VERSION#v}" ]] || return 0
+  VERSION="${VERSION#v}"
+  if ((VERIFY)); then run_doctor || return $?; fi
+  ok "dsr $VERSION is already installed"
+  info "Use --force to reinstall"
+  INSTALL_COMMITTED=1
+  if [ "$NO_CONFIGURE" -eq 0 ]; then
+    local configure_status=0
+    configure_agents || configure_status=$?
+    request_terminal_status "$configure_status" && return "$configure_status"
+    ((configure_status == 0)) || warn "Agent configuration did not complete; the installed dsr is unchanged"
   fi
+  show_summary
+  exit 0
 }
 
 check_network() {
@@ -1065,7 +1051,7 @@ validate_repo() {
   [[ -x "$candidate/dsr" ]] || chmod +x "$candidate/dsr" || return 1
   size=$(wc -c <"$candidate/dsr" | tr -d ' ') || return 1
   INSTALL_REPO_NEW_ID=$(install_path_identity "$candidate") || return 1
-  if [ "$VERSION_EXPLICIT" -eq 0 ]; then VERSION="$version"; fi
+  VERSION="$version"
   ok "Repo validation passed ($(( size / 1024 )) KB script, $mod_count modules)"
 }
 
@@ -1242,37 +1228,19 @@ setup_config_dirs() {
 # Agent Detection
 # ============================================================
 
-try_version() {
-  local cmd="$1"
-  command -v "$cmd" >/dev/null 2>&1 || return 0
-  if command -v timeout >/dev/null 2>&1; then
-    timeout 1 "$cmd" --version 2>/dev/null | head -1 || true
-  elif command -v gtimeout >/dev/null 2>&1; then
-    gtimeout 1 "$cmd" --version 2>/dev/null | head -1 || true
-  else
-    "$cmd" --version 2>/dev/null | head -1 || true
-  fi
-}
-
 detect_agents() {
   DETECTED_AGENTS=()
 
-  # shellcheck disable=SC2034  # versions reserved for summary display
   if [[ -d "$HOME/.claude" ]] || command -v claude &>/dev/null; then
     DETECTED_AGENTS+=("claude-code")
-    CLAUDE_VERSION=$(try_version claude)
   fi
 
-  # shellcheck disable=SC2034
   if [[ -d "$HOME/.codex" ]] || command -v codex &>/dev/null; then
     DETECTED_AGENTS+=("codex-cli")
-    CODEX_VERSION=$(try_version codex)
   fi
 
-  # shellcheck disable=SC2034
   if [[ -d "$HOME/.gemini" ]] || [[ -d "$HOME/.gemini-cli" ]] || command -v gemini &>/dev/null; then
     DETECTED_AGENTS+=("gemini-cli")
-    GEMINI_VERSION=$(try_version gemini)
   fi
 }
 
@@ -1546,14 +1514,7 @@ show_summary() {
 
   local summary_lines=()
 
-  # Version info
-  local installed_version
-  if [ -x "$DEST/$BINARY_NAME" ]; then
-    installed_version=$("$DEST/$BINARY_NAME" --version 2>/dev/null | head -1 || echo "$VERSION")
-  else
-    installed_version="${VERSION:-unknown}"
-  fi
-  summary_lines+=("Version:  $installed_version")
+  summary_lines+=("Version:  dsr version $VERSION")
   summary_lines+=("Managed paths:")
   summary_lines+=("  Binary: $(status_path "$DEST/$BINARY_NAME")")
   summary_lines+=("  Repo:   $(status_path "$REPO_DIR")")
