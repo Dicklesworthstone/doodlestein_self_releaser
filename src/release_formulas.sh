@@ -479,19 +479,20 @@ _formulas_revalidate() {
 }
 
 cmd_release_formulas() (
-    local tool_name="" version="" homebrew_tap="" scoop_bucket=""
+    local tool_name="" version="" package_name="" homebrew_tap="" scoop_bucket=""
     local skip_homebrew=false skip_scoop=false push_changes=false
     local dry_run="${DRY_RUN:-false}" start_time
     start_time=$(date +%s)
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --tool|-t|--version|-V|--homebrew-tap|--scoop-bucket)
+            --tool|-t|--version|-V|--package-name|--homebrew-tap|--scoop-bucket)
                 if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
                     _formulas_error 4 "Missing value for $1"; return 4
                 fi
                 case "$1" in
                     --tool|-t) tool_name="$2" ;;
                     --version|-V) version="$2" ;;
+                    --package-name) package_name="$2" ;;
                     --homebrew-tap) homebrew_tap="$2" ;;
                     --scoop-bucket) scoop_bucket="$2" ;;
                 esac
@@ -509,6 +510,7 @@ USAGE:
 OPTIONS:
     -t, --tool <name>          Configured tool
     -V, --version <tag>        Published release tag
+    --package-name <name>      Recipe basename for both managers (e.g. ee)
     --homebrew-tap <repo>      Override configured Homebrew repository
     --scoop-bucket <repo>      Override configured Scoop repository
     --skip-homebrew            Update Scoop only
@@ -518,8 +520,11 @@ OPTIONS:
 Global --dry-run validates recipes and downloads without commits or pushes.
 Every configured download must resolve to its exact release asset; bytes,
 size and available GitHub digests are verified. Homebrew requires Ruby for
-non-evaluating syntax parsing. Scoop uses bucket/<tool>.json when bucket/
-exists, otherwise <tool>.json at the repository root.
+non-evaluating syntax parsing. Scoop uses bucket/<name>.json when bucket/
+exists, otherwise <name>.json at the repository root.
+The package name defaults to formulas.package_name in repos.d/<tool>.yaml,
+then to the tool key. It selects only the recipe filenames. Release assets
+must still belong to the tool's configured GitHub repository.
 Local commits and evidence are retained under XDG state when not a dry run.
 HELP
                 return 0 ;;
@@ -532,8 +537,9 @@ HELP
         esac
     done
     if [[ ! "$tool_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ||
-          ! "$version" =~ ^v?[0-9][A-Za-z0-9._+-]*$ ]]; then
-        _formulas_error 4 "A safe tool name and release version are required"; return 4
+          ! "$version" =~ ^v?[0-9][A-Za-z0-9._+-]*$ ||
+          ( -n "$package_name" && ! "$package_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ) ]]; then
+        _formulas_error 4 "A safe tool name, package name and release version are required"; return 4
     fi
     if $skip_homebrew && $skip_scoop; then
         _formulas_error 4 "Both package managers were disabled"; return 4
@@ -552,6 +558,25 @@ HELP
         return "$authentication_status"
     fi
     act_load_repo_config "$tool_name" >/dev/null || { _formulas_error 4 "Tool not found: $tool_name"; return 4; }
+    if [[ -z "$package_name" ]]; then
+        local tool_config="${ACT_REPOS_DIR:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.d}/$tool_name.yaml"
+        if [[ -f "$tool_config" ]]; then
+            # Validate the typed value before emitting shell text: a sequence,
+            # null member or trailing newline cannot silently redirect a write.
+            package_name=$(yq -o=json -I=0 '.formulas' "$tool_config" |
+                jq -ers --arg tool "$tool_name" '
+                    select(length == 1) | .[0] |
+                    if . == null then $tool
+                    elif type == "object" then
+                        if has("package_name") then .package_name else $tool end
+                    else empty end |
+                    select(type == "string" and test("\\A[A-Za-z0-9][A-Za-z0-9._-]*\\z"))') || {
+                _formulas_error 4 "Invalid formulas.package_name for $tool_name"; return 4
+            }
+        else
+            package_name="$tool_name"
+        fi
+    fi
     local repo tag release release_id source_sha config_file status=0
     repo=$(act_get_repo "$tool_name") || return 4
     [[ "$repo" == */* ]] || repo="Dicklesworthstone/$repo"
@@ -608,7 +633,7 @@ HELP
     $skip_homebrew || managers+=(homebrew)
     $skip_scoop || managers+=(scoop)
     local -A repositories=([homebrew]="$homebrew_tap" [scoop]="$scoop_bucket")
-    local -A paths=([homebrew]="Formula/$tool_name.rb" [scoop]="bucket/$tool_name.json")
+    local -A paths=([homebrew]="Formula/$package_name.rb" [scoop]="bucket/$package_name.json")
     local manager recipe path kind
     # Complete preflight for EVERY requested manager before making any commit.
     for manager in "${managers[@]}"; do
@@ -616,7 +641,7 @@ HELP
         if [[ "$dry_run" == "true" ]]; then
             recipe="$work/$manager.original"
             if [[ "$manager" == scoop ]]; then
-                path=$(_formulas_fetch_scoop "${repositories[$manager]}" "$tool_name.json" "$recipe") || status=$?
+                path=$(_formulas_fetch_scoop "${repositories[$manager]}" "$package_name.json" "$recipe") || status=$?
             else
                 _formulas_fetch_recipe "${repositories[$manager]}" "$path" "$recipe" || status=$?
             fi
@@ -624,7 +649,7 @@ HELP
             _formulas_git clone --depth 1 --no-recurse-submodules --template= -- "https://github.com/${repositories[$manager]}.git" \
                 "$work/$manager" >&2 || status=$?
             if [[ "$manager" == scoop && ! -e "$work/scoop/bucket" && ! -L "$work/scoop/bucket" ]]; then
-                path="$tool_name.json"
+                path="$package_name.json"
             fi
             recipe="$work/$manager/$path"
             if [[ $status -eq 0 && ( -L "$work/$manager/${path%%/*}" || -L "$recipe" || ! -f "$recipe" ) ]]; then
@@ -668,7 +693,7 @@ HELP
                         _formulas_git -C "$work/$manager" add -- "$path" >&2 || status=$?
                     fi
                     if [[ $status -eq 0 ]]; then
-                        _formulas_git -C "$work/$manager" commit -m "Update $tool_name to ${tag#v}" >&2 || status=$?
+                        _formulas_git -C "$work/$manager" commit -m "Update $package_name to ${tag#v}" >&2 || status=$?
                     fi
                 fi
                 if [[ $status -eq 0 ]]; then
@@ -727,12 +752,12 @@ HELP
     fi
     [[ "$dry_run" == "true" ]] && workspace=""
     duration=$(($(date +%s) - start_time))
-    details=$(jq -nc --arg tool "$tool_name" --arg version "${tag#v}" --arg tag "$tag" \
+    details=$(jq -nc --arg tool "$tool_name" --arg package "$package_name" --arg version "${tag#v}" --arg tag "$tag" \
         --arg repo "$repo" --arg sha "$source_sha" --argjson release_id "$release_id" \
         --arg work_dir "$workspace" --argjson results "$results" --slurpfile plan "$work/plan.json" \
         --argjson pushed "$any_pushed" --argjson dry_run "$dry_run" --argjson duration "$duration" \
         --argjson stopped "$terminal_status" --argjson skip_brew "$skip_homebrew" --argjson skip_scoop "$skip_scoop" \
-        '{tool:$tool,version:$version,tag:$tag,repo:$repo,release_id:$release_id,git_sha:$sha,
+        '{tool:$tool,package_name:$package,version:$version,tag:$tag,repo:$repo,release_id:$release_id,git_sha:$sha,
           work_dir:(if $work_dir == "" then null else $work_dir end),
           operation_exit_code:$stopped,
           homebrew:(($results.homebrew // {status:(if $stopped!=0 and ($skip_brew|not) then "not_attempted" else "skipped" end),updated:false,pushed:false,error:null}) |

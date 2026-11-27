@@ -96,6 +96,9 @@ RUBY
 }
 JSON
     case "$SCENARIO" in
+        package-alias)
+            cp "$CASE/homebrew-source/Formula/tool.rb" "$CASE/homebrew-source/Formula/ee.rb" || return 1
+            cp "$CASE/scoop-source/bucket/tool.json" "$CASE/scoop-source/bucket/ee.json" || return 1 ;;
         flat-bucket|linked-bucket|truncated-bucket)
             mv "$CASE/scoop-source/bucket/tool.json" "$CASE/scoop-source/tool.json" || return 1
             if [[ "$SCENARIO" == linked-bucket ]]; then
@@ -368,6 +371,47 @@ formula_cancellation_cases() {
     done
 }
 
+formula_package_alias_cases() {
+    local before_homebrew before_scoop status
+    seed package-alias || return 1
+    before_homebrew=$(remote_sha homebrew); before_scoop=$(remote_sha scoop)
+    invoke true --package-name ee
+    check 'alias preview selects both published package names' json_is "$CASE/output.json" \
+        '.details.tool=="tool" and .details.package_name=="ee" and .details.repo=="owner/tool" and
+         .details.homebrew.path=="Formula/ee.rb" and .details.scoop.path=="bucket/ee.json" and (.details.assets|length)==5'
+    invoke false --push --package-name ee
+    check 'aliased package publication succeeds' equal "$RESULT" 0
+    check 'alias publishes both verified files' json_is "$CASE/output.json" '.details.homebrew.pushed and .details.scoop.pushed'
+    check 'only the named Homebrew recipe changes' equal \
+        "$(command git --git-dir="$CASE/homebrew.git" diff --name-only "$before_homebrew" HEAD)" "Formula/ee.rb"
+    check 'only the named Scoop manifest changes' equal \
+        "$(command git --git-dir="$CASE/scoop.git" diff --name-only "$before_scoop" HEAD)" "bucket/ee.json"
+    invoke false --push --package-name ee
+    check 'retry of an aliased package preserves both commits' json_is "$CASE/output.json" \
+        '.details.homebrew.status=="unchanged" and .details.scoop.status=="unchanged"'
+    : > "$API_CALLS"
+    invoke false --push --package-name ../ee
+    check 'CLI refuses path-like package identities' equal "$RESULT" 4
+    check 'invalid package name stops before release discovery' test ! -s "$API_CALLS"
+    if command -v yq >/dev/null; then
+        mkdir -p "$DSR_CONFIG_DIR/repos.d" || return 1
+        printf 'formulas: {package_name: ee}\n' > "$DSR_CONFIG_DIR/repos.d/tool.yaml"
+        invoke true
+        check 'configured alias selects both recipes from the same release' json_is "$CASE/output.json" \
+            '.details.repo=="owner/tool" and .details.homebrew.path=="Formula/ee.rb" and .details.scoop.path=="bucket/ee.json"'
+        invoke true --package-name tool
+        check 'explicit selector overrides the configured alias' json_is "$CASE/output.json" \
+            '.details.package_name=="tool" and .details.homebrew.path=="Formula/tool.rb" and .details.scoop.path=="bucket/tool.json"'
+        for status in 'null' '["ee"]' '"ee\n"' '"../ee"'; do
+            printf 'formulas: {package_name: %s}\n' "$status" > "$DSR_CONFIG_DIR/repos.d/tool.yaml"
+            : > "$API_CALLS"
+            invoke false --push
+            check "invalid configured package identity fails: $status" equal "$RESULT" 4
+            check "invalid name stops before release discovery: $status" test ! -s "$API_CALLS"
+        done
+    fi
+}
+
 formula_routing_cases() {
     local caller before_index before_ref sentinel work
     seed routing || return 1
@@ -406,6 +450,7 @@ formula_routing_cases() {
 }
 
 case "${FORMULAS_TEST_SCOPE:-all}" in
+    package-alias) formula_package_alias_cases || exit 1; printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"; [[ "$FAIL" -eq 0 ]]; exit $? ;;
     scoop-layout) formula_scoop_layout_cases || exit 1; printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"; [[ "$FAIL" -eq 0 ]]; exit $? ;;
     cancellation) formula_cancellation_cases; printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"; [[ "$FAIL" -eq 0 ]]; exit $? ;;
     routing) formula_routing_cases; printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"; [[ "$FAIL" -eq 0 ]]; exit $? ;;
@@ -648,6 +693,7 @@ check 'help documents usage and manager options' grep -q -- '--homebrew-tap' "$C
 formula_routing_cases
 formula_cancellation_cases
 formula_scoop_layout_cases || exit 1
+formula_package_alias_cases || exit 1
 
 printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
