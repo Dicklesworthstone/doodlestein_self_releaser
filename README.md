@@ -125,6 +125,23 @@ chmod +x dsr
 sudo ln -s "$(pwd)/dsr" /usr/local/bin/dsr
 ```
 
+### Install a signed source archive offline
+
+Use a trusted copy of `install.sh` whose help lists `--offline-pubkey`. Place the
+release tarball and its `.minisig` file together. Supply the release public key
+you have independently verified. For example, to install the v0.2.3 source
+archive using an installer that supports signed offline installation:
+
+```bash
+bash ./install.sh --help | grep -F -- '--offline-pubkey' >/dev/null &&
+  bash ./install.sh --offline doodlestein_self_releaser-v0.2.3.tar.gz \
+    --offline-pubkey /path/to/trusted/minisign.pub --version v0.2.3
+```
+
+The installer runs Minisign on the staged archive before listing or extracting
+it. A missing verifier, missing proof, or signature mismatch stops installation.
+`--version` also checks the version marker in the authenticated source.
+
 ### Dependencies
 
 Required:

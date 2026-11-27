@@ -995,6 +995,55 @@ def request_case(label, fault, arguments, cancel=None, skills=False):
         check(label + ' leaves the previous launcher runnable', run([str(target / 'dsr')]).stdout.strip() == 'old')
     check(label + ' stays within the overall request budget', time.monotonic() - started < 6)
 
+# The public self-installer must verify the exact bytes it later extracts,
+# using an independently supplied key. Exercise real detached signatures.
+signed_args = ['--offline', str(valid_archive), '--offline-pubkey']
+trusted_key = root / 'trusted release.pub'
+signature = Path(str(valid_archive) + '.minisig')
+def refuse_signed(label, arguments, expected):
+    context = setup(label)
+    case, selected, target, _ = context
+    before, old_id = tree_snapshot(selected), identity(selected)
+    result = invoke(context, arguments)
+    preserved(label, context, before, old_id, result)
+    check(label + ' reports its own error status', result.returncode == expected)
+    check(label + ' stops before archive inspection',
+          not list(case.glob('.repo.install.*/archive.members')))
+    check(label + ' performs no network acquisition', not (case / 'http.calls').exists() and
+          not (case / 'git.calls').exists())
+
+refuse_signed('offline-key-without-archive', ['--offline-pubkey', str(trusted_key)], 4)
+refuse_signed('missing-offline-key-argument', ['--offline', str(valid_archive), '--offline-pubkey'], 4)
+
+minisign = shutil.which('minisign')
+if minisign:
+    secret = root / 'test-signing.key'
+    wrong_key = root / 'other.pub'
+    for private, public in ((secret, trusted_key), (root / 'other.key', wrong_key)):
+        run([minisign, '-G', '-W', '-s', str(private), '-p', str(public)]).check_returncode()
+    refuse_signed('missing-offline-signature', [*signed_args, str(trusted_key)], 7)
+    run([minisign, '-S', '-s', str(secret), '-m', str(valid_archive),
+         '-x', str(signature)]).check_returncode()
+    context = setup('authenticated-source-archive')
+    result = invoke(context, ['--offline', str(valid_archive), '--offline-pubkey=' + str(trusted_key),
+                              '--version', 'v1.2.3'])
+    check('a signed archive installs the complete executable', result.returncode == 0 and
+          run([str(context[2] / 'dsr')]).stdout.strip() == 'new')
+    check('signed offline success uses no network acquisition',
+          not (context[0] / 'http.calls').exists() and not (context[0] / 'git.calls').exists())
+    refuse_signed('wrong-offline-signing-key', [*signed_args, str(wrong_key)], 7)
+    refuse_signed('wrong-offline-signing-key-equals',
+                  ['--offline', str(valid_archive), '--offline-pubkey=' + str(wrong_key)], 7)
+    changed = root / 'changed-source'
+    source_tree(changed, label='other valid source')
+    alternate = archive(root / 'changed.tar.gz', changed)
+    shutil.copyfile(signature, str(alternate) + '.minisig')
+    refuse_signed('changed-signed-offline-source',
+                  ['--offline', str(alternate), '--offline-pubkey', str(trusted_key)], 7)
+else:
+    print('SKIP: authentic offline signature cases require minisign', flush=True)
+    refuse_signed('offline-verifier-unavailable', [*signed_args, str(trusted_key)], 3)
+
 for label, fault, arguments in (
     ('metadata-deadline', 'stalled-metadata', []),
     ('redirect-deadline', 'stalled-redirect', []),

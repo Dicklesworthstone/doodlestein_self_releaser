@@ -58,6 +58,7 @@ VERIFY=0
 SYSTEM=0
 UNINSTALL=0
 OFFLINE_TARBALL=""
+OFFLINE_PUBKEY=""
 
 # Agent status tracking
 CLAUDE_STATUS=""
@@ -114,6 +115,8 @@ Options:
   --no-configure     Skip AI agent skill installation
   --no-verify        Reserved for future checksum verification
   --offline FILE     Install from pre-downloaded repo tarball
+  --offline-pubkey FILE  Require FILE as the trusted Minisign public key for the
+                         archive; read its detached signature from ARCHIVE.minisig
   --repo-dir DIR     Clone repo to DIR (default: ~/.local/share/dsr/repo)
   --force            Reinstall even if same version exists
   --uninstall        Remove dsr and associated files
@@ -155,6 +158,16 @@ while [ $# -gt 0 ]; do
     --no-configure)  NO_CONFIGURE=1; shift ;;
     --no-verify)     shift ;;  # reserved for future checksum verification
     --offline)       OFFLINE_TARBALL="$2"; shift 2 ;;
+    --offline-pubkey=*)
+      set -- --offline-pubkey "${1#*=}" "${@:2}"
+      continue ;;
+    --offline-pubkey)
+      if [[ -z "${2:-}" || "$2" == --* || -n "$OFFLINE_PUBKEY" ]]; then
+        printf '%s\n' '--offline-pubkey requires one trusted public key file' >&2
+        exit 4
+      fi
+      OFFLINE_PUBKEY="$2"
+      shift 2 ;;
     --repo-dir)      REPO_DIR="$2"; shift 2 ;;
     --force)         FORCE_INSTALL=1; shift ;;
     --uninstall)     UNINSTALL=1; shift ;;
@@ -916,6 +929,26 @@ clone_or_update_repo() {
     # Freeze the supplied archive once. Listing and extraction must use the
     # same bytes, and a failed extraction must never be retried over its debris.
     cp -- "$OFFLINE_TARBALL" "$TMP/source.tar" || return 1
+    if [[ -n "$OFFLINE_PUBKEY" ]]; then
+      local signature="${OFFLINE_TARBALL}.minisig" verify_status=0
+      command -v minisign >/dev/null 2>&1 || {
+        err "Signed offline installation requires minisign"; return 3;
+      }
+      if [[ ! -f "$OFFLINE_PUBKEY" || ! -f "$signature" ]]; then
+        err "Signed offline installation requires the trusted public key and $signature"
+        return 7
+      fi
+      cp -- "$OFFLINE_PUBKEY" "$TMP/trusted.pub" || return 7
+      cp -- "$signature" "$TMP/source.minisig" || return 7
+      minisign -Vm "$TMP/source.tar" -p "$TMP/trusted.pub" -x "$TMP/source.minisig" \
+        </dev/null >&2 || verify_status=$?
+      if ((verify_status != 0)); then
+        ((verify_status < 128)) || return "$verify_status"
+        err "Offline archive signature verification failed"
+        return 7
+      fi
+      ok "Verified the offline archive signature"
+    fi
     if ! validate_source_archive "$TMP/source.tar"; then
       err "Offline archive is incomplete or contains unsafe source entries"
       return 1
@@ -1597,6 +1630,10 @@ show_summary() {
 
 main() {
   validate_request_timeout || return $?
+  if [[ -n "$OFFLINE_PUBKEY" && ( -z "$OFFLINE_TARBALL" || "$UNINSTALL" == 1 ) ]]; then
+    err "--offline-pubkey requires --offline FILE for an installation"
+    return 4
+  fi
   # Handle uninstall early
   if [ "$UNINSTALL" -eq 1 ]; then
     do_uninstall
