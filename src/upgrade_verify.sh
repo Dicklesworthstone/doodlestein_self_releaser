@@ -461,23 +461,57 @@ _upgrade_check_succeeded() {
     [[ "$match_status" == 1 ]]
 }
 
-# Extract the version identified as latest (or update-available) from tool
-# output. Prefer a line containing "latest" so a preceding current-version
-# line cannot satisfy an exact release check.
+# Exact release checks consume updater output from many independent CLIs.
+# Prefer an explicitly labelled latest version. For an update transition use
+# its destination. Conflicting observations at the same priority are ambiguous.
 _upgrade_extract_latest_version() {
-    local output="$1"
-    local version=""
-
-    version=$(printf '%s\n' "$output" | grep -i 'latest' |
-        grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?' |
-        tail -1 || true)
-    if [[ -z "$version" ]]; then
-        version=$(printf '%s\n' "$output" | grep -iE 'update.*available|available.*update' |
-            grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?' |
-            tail -1 || true)
-    fi
-
-    printf '%s\n' "${version#v}"
+    LC_ALL=C awk '
+        BEGIN {
+            core = "[0-9]+[.][0-9]+[.][0-9]+"
+            ids = "[0-9A-Za-z-]+([.][0-9A-Za-z-]+)*"
+            version = "[vV]?" core "(-" ids ")?([+]" ids ")?"
+            # Require a complete token, including prerelease and build metadata.
+            token = "^" version "($|[^[:alnum:]_.+-]|[.]([[:space:]]|$))"
+            latest = "(^|[^[:alnum:]_])latest([[:space:]_-]+(release|version|tag))*"
+            update = "(^|[^[:alnum:]_])((update|upgrade)( is)? available|available (update|upgrade))"
+            separator = "\"?([[:space:]]+is)?[[:space:]]*[:=!-]?[[:space:]]*\"?"
+        }
+        function read_version(text,    value) {
+            if (!match(text, token)) return ""
+            match(text, "^" version)
+            value = substr(text, 1, RLENGTH)
+            sub(/^[vV]/, "", value)
+            return value
+        }
+        function record(rank, value) {
+            if (!length(value)) return
+            if (rank in seen && seen[rank] != value) conflict[rank] = 1
+            seen[rank] = value
+        }
+        {
+            clean = $0
+            gsub(/\033\[[0-9;]*m/, "", clean)
+            line = clean
+            while (match(tolower(line), latest separator)) {
+                line = substr(line, RSTART + RLENGTH)
+                record(2, read_version(line))
+            }
+            line = clean
+            if (match(tolower(line), update separator)) {
+                text = substr(line, RSTART + RLENGTH)
+                # Examples include "Update available: 1.0.0 -> 2.0.0" and
+                # "Update available from v1.0.0 to v2.0.0".
+                lower = tolower(text)
+                if (match(lower, "^((from[[:space:]]+)?" version ")[[:space:]]*(->|=>|→|[[:space:]]to[[:space:]])[[:space:]]*"))
+                    text = substr(text, RSTART + RLENGTH)
+                record(1, read_version(text))
+            }
+        }
+        END {
+            rank = (2 in seen) ? 2 : 1
+            if (rank in seen && !(rank in conflict)) print seen[rank]
+        }
+    ' <<< "$1"
 }
 
 # Print the update-check argv, one argument per line. Arguments are read as a

@@ -328,6 +328,30 @@ EOF
     harness_teardown
 }
 
+test_latest_version_observations() {
+    harness_setup
+    setup_module
+    local expected line actual
+    while IFS='|' read -r expected line; do
+        ((TESTS_RUN++))
+        actual=$(_upgrade_extract_latest_version "$line")
+        if [[ "$actual" == "$expected" ]]; then
+            pass "Latest version selected for: $line"
+        else
+            fail "Expected '$expected', observed '$actual' for: $line"
+        fi
+    done <<'CASES'
+2.0.0|Update available from v1.9.0 to v2.0.0
+2.0.0|Update available: 1.9.0 -> 2.0.0
+2.0.0|{"latest_version":"2.0.0","current_version":"1.0.0"}
+1.2.3-rc.1+build.17|Latest release: v1.2.3-rc.1+build.17
+|Latest version: 1.2.3+
+|Current v1.2.3; latest version unknown
+|Latest: v1.2.2, Latest: v1.2.3
+CASES
+    harness_teardown
+}
+
 test_json_reports_exact_version_mismatch() {
     ((TESTS_RUN++))
     harness_setup
@@ -471,6 +495,10 @@ test_cli_process_status_and_output_agree() {
         $'Latest version: 1.2.3\nUpdate available\n' $'Error: asset not found\n'
     check_cli_verdict no-update-before-failure 43 1 \
         $'Latest version: 1.2.3\nAlready up to date\n' $'Error: upstream lookup failed\n'
+    check_cli_verdict latest-before-current 0 0 \
+        'Latest v2.0.0-rc.1+build.17 (current v1.0.0)' '' '2.0.0-rc.1+build.17'
+    check_cli_verdict installed-is-not-latest 0 1 \
+        'Latest v2.0.0 (current v1.0.0)' '' '1.0.0'
     check_cli_verdict healthy-update 0 0 $'Latest version: 1.2.3\nUpdate available\n' ''
     check_cli_verdict healthy-no-update 0 0 $'Latest version: 1.2.3\nNo update available\n' ''
     check_cli_verdict healthy-generic 0 0 $'Check completed.\n' '' ''
@@ -1863,6 +1891,7 @@ test_verify_uses_configured_binary_name
 test_verify_uses_configured_check_args
 test_rejects_invalid_configured_check_args
 test_exact_version_must_match_latest
+test_latest_version_observations
 
 echo ""
 echo "Upgrade Check Parsing Tests:"
