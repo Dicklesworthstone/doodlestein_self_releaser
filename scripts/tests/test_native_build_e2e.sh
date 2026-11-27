@@ -740,6 +740,46 @@ test_missing_tool_error_message() {
     cleanup_test_environment
 }
 
+test_release_plan_source_admission() {
+    ((TESTS_RUN++))
+    log_test "Release plan: reject a changed checkout before creating build output"
+    setup_test_environment
+
+    local tool_dir pinned observed output rc=0
+    tool_dir=$(setup_mock_go_tool)
+    create_tool_config "mock_go_tool" "$tool_dir" "go" "mock_go_tool"
+    pinned=$(git -C "$tool_dir" rev-parse HEAD) || { log_fail "Missing fixture HEAD"; cleanup_test_environment; return; }
+    if ! git -C "$tool_dir" -c user.name=Fixture -c user.email=fixture@example.invalid \
+            commit -q --allow-empty -m 'Later source'; then
+        log_fail "Could not advance fixture checkout"
+        cleanup_test_environment
+        return
+    fi
+    observed=$(git -C "$tool_dir" rev-parse HEAD)
+    output=$(DSR_BUILD_PLAN_SOURCE_SHA="$pinned" timeout 30 "$DSR_CMD" --json build mock_go_tool \
+        --version v0.1.0 --target linux/amd64 --output-dir "$TEST_TMPDIR/planned-output" \
+        2>"$TEST_TMPDIR/plan-error") || rc=$?
+    if [[ "$rc" == 4 && ! -e "$TEST_TMPDIR/planned-output" ]] &&
+       jq -es --arg expected "$pinned" --arg observed "$observed" '
+           length == 1 and (.[0] | .exit_code == 4 and .details.targets == [] and
+           .details.expected_sha == $expected and .details.head_sha == $observed)' <<< "$output" >/dev/null; then
+        log_pass "Release plan rejected the changed commit before output or execution"
+    else
+        log_fail "Incorrect build-plan source refusal (exit: $rc, output: $output)"
+    fi
+
+    rc=0
+    output=$(DSR_BUILD_PLAN_SOURCE_SHA="$observed" timeout 30 "$DSR_CMD" --json build mock_go_tool \
+        --version v0.1.0 --target linux/amd64 --dry-run 2>"$TEST_TMPDIR/plan-preview") || rc=$?
+    if [[ "$rc" == 0 ]] && jq -e '.details.mode == "dry_run" and (.details.targets | length) == 1' \
+            <<< "$output" >/dev/null; then
+        log_pass "Release plan accepted the selected checkout for a build preview"
+    else
+        log_fail "Matching plan commit did not reach build planning (exit: $rc, output: $output)"
+    fi
+    cleanup_test_environment
+}
+
 test_strict_build_rejects_existing_output_symlink() {
     ((TESTS_RUN++))
     log_test "Strict output: symlink is rejected before orchestration"
@@ -1045,6 +1085,7 @@ main() {
     # Error handling tests
     test_missing_tool_config_error
     test_missing_tool_error_message
+    test_release_plan_source_admission
     test_strict_build_rejects_existing_output_symlink
 
     # Multi-language config tests

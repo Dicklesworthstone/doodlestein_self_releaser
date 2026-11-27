@@ -853,7 +853,7 @@ def start_job(job):
             cfg = str(session / "config")
             environment.update(DSR_CONFIG_DIR=cfg, DSR_CONFIG_FILE=cfg + "/config.yaml",
                                DSR_REPOS_FILE=cfg + "/repos.yaml", DSR_HOSTS_FILE=cfg + "/hosts.yaml",
-                               DSR_STATE_DIR=str(session / "state"))
+                               DSR_STATE_DIR=str(session / "state"), DSR_BUILD_PLAN_SOURCE_SHA=plan["source_sha"])
             command = native_command(job, session, resume_id)
             manifest = session / "output" / (plan["tool"] + "-" + plan["tag"] + "-manifest.json")
             artifacts = session / "output"

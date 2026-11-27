@@ -3921,12 +3921,32 @@ EOF
         fi
     fi
 
-    # A local refs/replace namespace must never reinterpret the commit named by
-    # a strict release contract. Keep the override function-scoped so ordinary
-    # development builds retain the caller's Git semantics.
-    if $build_release_contract_enabled; then
+    # Strict releases and source-pinned plans refer to original Git objects.
+    local plan_source_sha="${DSR_BUILD_PLAN_SOURCE_SHA-}"
+    if $build_release_contract_enabled || [[ -n "${DSR_BUILD_PLAN_SOURCE_SHA+x}" ]]; then
         local GIT_NO_REPLACE_OBJECTS=1
         export GIT_NO_REPLACE_OBJECTS
+    fi
+
+    # Check the selected checkout before staging sources, acquiring a build
+    # lock or reserving an output directory. Keep the observed SHA for the
+    # staged-source comparison; the collector independently checks the manifest.
+    if [[ -n "${DSR_BUILD_PLAN_SOURCE_SHA+x}" ]]; then
+        if [[ ! "$plan_source_sha" =~ ^[0-9a-f]{40}$ || "$plan_source_sha" =~ ^0{40}$ ]]; then
+            log_error "Invalid source commit in release build plan"
+            return 4
+        fi
+        build_source_sha=$(git -C "$local_path" rev-parse --verify 'HEAD^{commit}' 2>/dev/null) || return 4
+        if [[ "$build_source_sha" != "$plan_source_sha" ]]; then
+            log_error "Release build plan requires $plan_source_sha; checkout is at $build_source_sha"
+            if $JSON_MODE; then
+                json_envelope "build" "error" 4 "$(jq -nc --arg repo "$ACT_REPO_GITHUB" \
+                    --arg version "$tag" --arg expected "$plan_source_sha" --arg observed "$build_source_sha" \
+                    '{repo:$repo,version:$version,targets:[],error:"Checkout differs from release build plan",
+                      expected_sha:$expected,head_sha:$observed}')"
+            fi
+            return 4
+        fi
     fi
 
     if $build_release_contract_enabled && $no_sync; then
@@ -3951,6 +3971,10 @@ EOF
             return 4
         fi
         build_source_sha=$(git -C "$local_path" rev-parse --verify HEAD 2>/dev/null) || return 4
+        if [[ -n "$plan_source_sha" && "$build_source_sha" != "$plan_source_sha" ]]; then
+            log_error "Release build checkout changed during strict source admission"
+            return 4
+        fi
         local build_tag_sha
         build_tag_sha=$(git_ops_tag_sha "$local_path" "$tag" 2>/dev/null) || return 4
         if [[ ! "$build_source_sha" =~ ^[0-9a-f]{40}$ || "$build_source_sha" != "$build_tag_sha" ]]; then
@@ -4163,6 +4187,7 @@ EOF
             return 4
         fi
         if [[ ! "$resume_sha" =~ ^[0-9a-f]{40}$ || "$current_sha" != "$resume_sha" || \
+              ( -n "$plan_source_sha" && "$resume_sha" != "$plan_source_sha" ) || \
               -z "$resume_output" || "$resume_output" != "$output_dir" ]]; then
             log_error "Resume state source commit or output directory does not match this build"
             return 4

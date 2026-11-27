@@ -67,6 +67,7 @@ if kind == 'dsr':
     output = Path(arg('--output-dir'))
     targets = arg('--targets').split(',')
     tool, tag, source = arg('--tool'), arg('--version'), spec['source']
+    assert os.environ['DSR_BUILD_PLAN_SOURCE_SHA'] == source
     manifest = output/(tool+'-'+tag+'-manifest.json')
 else:
     spec = json.loads(Path(arg('--manifest')).read_text())
@@ -211,7 +212,7 @@ print(json.dumps(response))
     # Only the copied compiler entry points above execute in this installation;
     # they are Python fixtures, not native or RCH builds. Keep that fixture policy
     # explicit; the real coordinator's required-remote refusal is tested below.
-    fixture_env = dict(os.environ, RCH_REQUIRE_REMOTE='0')
+    fixture_env = dict(os.environ, RCH_REQUIRE_REMOTE='0', DSR_BUILD_PLAN_SOURCE_SHA='ignored-caller-value')
     fixture_env.pop('RELEASE_BUILDS_TEST_START_BARRIER', None)
     def run(output, expected=0, selected=planfile, extra=(), env=None):
         proc = subprocess.run(['bash',str(script),'--plan',str(selected),'--output-dir',str(output)] + list(extra),
