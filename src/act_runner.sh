@@ -11837,7 +11837,7 @@ _act_validate_strict_go_result() {
     command=$(act_substitute_build_cmd_tokens "$command" "${binary_name:-$tool}" \
         "$version" "${platform%%/*}" "${platform##*/}" "$target_triple") || return 4
     environment=$(_act_strict_go_build_env "$tool" "$sha" "$ref" "$stage_source" "$environment" "$command") || return 4
-    command_plan=$(_act_go_output_plan "$stage_source" "$environment" "$command" "$shell_kind") || return 4
+    command_plan=$(_act_command_output_plan "$stage_source" "$environment" "$command" "$shell_kind") || return 4
     _act_validate_strict_go_command_sources "$tool" "$sha" "$stage_source" "$command_plan" "$environment" || return 4
     expected=$(_act_go_build_influence_json "$environment") || return 4
     if [[ "$(jq -cS . <<< "$actual")" != "$(jq -cS . <<< "$expected")" ]]; then
@@ -11974,17 +11974,19 @@ _act_finalize_frankenterm_windows_family() {
 # supplies package names on the selected worker. Opaque build scripts keep the
 # existing declared artifact convention, but an unproved direct Go invocation
 # must not fall back to an old executable in GOBIN.
-_act_go_output_plan() {
+_act_command_output_plan() {
     local source_root="$1" build_env="$2" build_cmd="$3" shell_kind="${4:-unix}"
-    python3 -I - "$source_root" "$shell_kind" 3<<< "$build_env" 4<<< "$build_cmd" <<'PY'
+    local compiler="${5:-go}" platform="${6:-}"
+    python3 -I - "$source_root" "$shell_kind" "$compiler" "$platform" 3<<< "$build_env" 4<<< "$build_cmd" <<'PY'
 import json, ntpath, os, posixpath, re, shlex, sys
 
-root, shell = sys.argv[1:]
+root, shell, compiler, platform = sys.argv[1:]
+compiler = 'bun' if compiler == 'typescript' else compiler
 windows = shell == 'windows'
 paths = ntpath if windows else posixpath
 
 def fail(message):
-    raise ValueError('Go output selection: ' + message)
+    raise ValueError(('Bun' if compiler == 'bun' else 'Go') + ' output selection: ' + message)
 
 def words(text):
     # Preserve quote evidence, as the Cargo invocation reader does. shlex's
@@ -12145,10 +12147,84 @@ def flags(argv, initial):
             index += 1
     return output, selected, packages or ['.'], mode
 
+def bun_output(argv, cwd, traversals):
+    # This is intentionally a literal CLI contract, not a Bun.build() or
+    # package-script interpreter. A selected output must not fall back to an
+    # old conventional binary after successful compilation elsewhere.
+    if traversals or cwd != root:
+        fail('Bun output selection requires the configured source cwd; use paths in --outfile instead of cd/--cwd')
+    value_options = {
+        '--outfile', '--target', '--define', '-d', '--external', '-e',
+        '--loader', '-l', '--format', '--env', '--conditions', '--packages',
+        '--banner', '--footer', '--drop', '--drop-label', '--tsconfig-override',
+        '--jsx-factory', '--jsx-fragment', '--jsx-import-source',
+        '--compile-exec-argv', '--compile-executable-path', '--asset',
+    }
+    bool_options = {
+        '--compile', '--minify', '--minify-syntax', '--minify-whitespace',
+        '--minify-identifiers', '--bytecode', '--production', '--no-clear-screen',
+        '--sourcemap', '--react-fast-refresh', '--jsx-runtime-automatic',
+    }
+    optional_equals = {'--sourcemap'}
+    output, target, entries, compile_selected = None, None, [], False
+    index = 1
+    while index < len(argv):
+        argument = argv[index]
+        if argument == '--':
+            entries.extend(argv[index + 1:]); break
+        option, equals, value = argument.partition('=')
+        if option in value_options:
+            if not equals:
+                index += 1
+                if index == len(argv):
+                    fail(option + ' requires a literal value')
+                value = argv[index]
+            if option == '--outfile':
+                if output is not None:
+                    fail('multiple Bun outfile selectors are ambiguous')
+                output = value
+            elif option == '--target':
+                if target is not None:
+                    fail('multiple Bun target selectors are ambiguous')
+                target = value
+        elif option in bool_options and (not equals or option in optional_equals):
+            compile_selected = compile_selected or option == '--compile'
+        elif argument.startswith('-'):
+            fail('unreviewed Bun build option for explicit outputs: ' + argument)
+        else:
+            entries.append(argument)
+        index += 1
+    if not compile_selected or len(entries) != 1:
+        fail('explicit Bun outputs require --compile and one literal entrypoint')
+    if not output or output in ('.', '..') or output.endswith(('/', '\\')):
+        fail('Bun --outfile must select one explicit executable filename')
+    if '..' in output.replace('\\', '/').split('/'):
+        fail('Bun outfile must not traverse parent components')
+    if target not in (None, 'bun'):
+        selected = re.fullmatch(r'bun-(linux|darwin|windows)-(x64|arm64)(?:-(?:baseline|modern))?(?:-musl)?', target)
+        if not selected:
+            fail('use a canonical bun-<os>-<arch> executable target')
+        selected_platform = selected[1] + '/' + ('amd64' if selected[2] == 'x64' else selected[2])
+        if selected_platform != platform:
+            fail('Bun target contradicts the requested native platform')
+    elif windows and not platform.startswith('windows/'):
+        fail('cross-platform Bun builds on Windows require an explicit --target')
+    if platform.startswith('windows/'):
+        if not windows and target in (None, 'bun'):
+            fail('Windows Bun cross builds require an explicit --target')
+        # Bun's compile writer appends .exe unless the literal suffix is
+        # already lower-case .exe (bun-v1.4.4 build_command.rs). Project that
+        # same exact file for the scheduler and collector, including app.EXE.exe.
+        if not output.endswith('.exe'):
+            output += '.exe'
+    return absolute(output, cwd), output
+
 try:
     environment = dict(line.rstrip('\n').split('=', 1) for line in os.fdopen(3) if '=' in line)
     command = os.fdopen(4).read()
-    if not re.search(r'\bgo(?:\.exe)?\b', command, re.IGNORECASE if windows else 0):
+    if compiler not in ('go', 'bun'):
+        fail('unknown native compiler')
+    if not re.search(r'\b' + compiler + r'(?:\.exe)?\b', command, re.IGNORECASE if windows else 0):
         print('null'); raise SystemExit(0)
     tokens = words(command)
     statements, current, unsupported = [], [], False
@@ -12197,6 +12273,7 @@ try:
     operations, cwd, unset, saw_go = [], root, set(), False
     directories = []
     workfile_overridden = False
+    bun_implicit_producer, bun_opaque_producer = False, False
     for statement_group, statement in statements:
         # Redirections are not Go arguments, including when flags follow them.
         raw, index = [], 0
@@ -12310,16 +12387,50 @@ try:
         if program == 'printf' and position < len(raw) and literal(raw[position], effective, inline_names).startswith('-v'):
             unsupported = True
         executable = executable_name(program)
-        if executable not in ('go', 'go.exe'):
-            if executable in ('bash', 'sh', 'zsh', 'dash', 'cmd', 'cmd.exe', 'powershell', 'powershell.exe', 'pwsh', 'pwsh.exe') and any(re.search(r'\bgo(?:\.exe)?\s', arg, re.IGNORECASE if windows else 0) for arg in raw[position:]):
-                fail('shell-wrapped Go output cannot be determined; use a direct command')
-            if any(executable_name(arg.strip('"\'')) in ('go', 'go.exe') for arg in raw[position:]):
+        if executable not in (compiler, compiler + '.exe'):
+            if executable in ('bash', 'sh', 'zsh', 'dash', 'cmd', 'cmd.exe', 'powershell', 'powershell.exe', 'pwsh', 'pwsh.exe') and any(re.search(r'\b' + compiler + r'(?:\.exe)?\s', arg, re.IGNORECASE if windows else 0) for arg in raw[position:]):
+                fail('shell-wrapped compiler output cannot be determined; use a direct command')
+            if any(executable_name(arg.strip('"\'')) in (compiler, compiler + '.exe') for arg in raw[position:]):
                 unsupported = True; saw_go = True
             if terminal_exec:
                 unsupported = True
             continue
         saw_go = True
+        if compiler == 'bun' and (position == len(raw) or literal(raw[position], effective, inline_names) != 'build'):
+            # Bun scripts are opaque and keep their declared output convention.
+            # Do not partially interpret a global-selector spelling of a
+            # direct build which would otherwise hide an explicit outfile.
+            classified = []
+            for argument in raw[position:]:
+                try:
+                    classified.append(literal(argument, effective, inline_names))
+                except ValueError:
+                    classified.append(None)  # Opaque script arguments need no interpretation.
+            if 'build' in classified and any(
+                    arg is not None and (arg == '--outfile' or arg.startswith('--outfile='))
+                    for arg in classified):
+                fail('put build directly after bun and configure its source cwd outside the command')
+            if position == len(raw) or raw[position] not in ('install', '--version', '-v', '--revision'):
+                bun_opaque_producer = True
+            if terminal_exec:
+                break
+            continue
         argv = [literal(arg, effective, inline_names) for arg in raw[position:]]
+        if compiler == 'bun':
+            if not any(arg == '--outfile' or arg.startswith('--outfile=') for arg in argv[1:]):
+                bun_implicit_producer = True
+                if terminal_exec:
+                    break
+                continue
+            output, operand = bun_output(argv, selected_cwd, selected_directories)
+            unsupported = unsupported or unproved_list(statement_group)
+            operations.append(dict(program=program, cwd=selected_cwd, environment=effective,
+                directories=selected_directories, packages=[], unset=sorted(removed),
+                clear_environment=clear, kind='build', output=output,
+                output_operand=operand, arguments=[], files=False))
+            if terminal_exec:
+                break
+            continue
         # Go consumes one -C/--C before dispatch. It can be the first global
         # argument or the first flag after build/install. In both positions,
         # output paths and package metadata are relative to the new directory.
@@ -12357,9 +12468,16 @@ try:
             files=all(package.endswith('.go') for package in packages)))
         if terminal_exec:
             break
+    if compiler == 'bun' and not operations:
+        print('null'); raise SystemExit(0)
+    if compiler == 'bun' and (bun_implicit_producer or bun_opaque_producer):
+        fail('every Bun executable producer must use one explicit --outfile')
     if saw_go and unsupported:
-        fail('conditional, mutating, piped or opaque Go command context; use a literal foreground command chain')
-    print(json.dumps(dict(shell=shell, source_root=root, operations=operations) if operations else None, separators=(',', ':')))
+        fail('conditional, mutating, piped or opaque compiler context; use a literal foreground command chain')
+    plan = dict(shell=shell, source_root=root, operations=operations) if operations else None
+    if plan is not None and compiler == 'bun':
+        plan['compiler'] = 'bun'
+    print(json.dumps(plan, separators=(',', ':')))
 except (OSError, ValueError, IndexError) as error:
     print('[act] ' + str(error), file=sys.stderr)
     raise SystemExit(4)
@@ -12370,7 +12488,7 @@ PY
 # builds and installs need Go metadata; an explicit output file is already
 # unambiguous. -find avoids dependency traversal, writable -mod=mod is replaced
 # in the plan, and proxy/sumdb access is disabled for this observation.
-_act_go_output_probe_script() {
+_act_command_output_probe_script() {
     local plan="$1" strict="${2:-false}"
     python3 -I - "$strict" 3<<< "$plan" 4< <(_act_go_ambient_env_names) <<'PY'
 import json, os, sys
@@ -12393,6 +12511,14 @@ function Get-GoSourceControls {
     ConvertTo-Json -InputObject @($rows | Sort-Object {$_.path}) -Compress -Depth 4
 }
 foreach ($op in $plan.operations) {
+    if($plan.compiler -eq 'bun') {
+        $item=Get-Item -LiteralPath $op.output -Force
+        if($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Bun output is not a regular executable file'
+        }
+        $observations+=@{directory=$false;packages=''}
+        continue
+    }
     $environment=@{}; foreach($key in $original.Keys) { $environment[$key]=$original[$key] }
     foreach($key in $plan.clear_selectors) { $environment.Remove($key) }
     foreach($key in @($environment.Keys)) { if($plan.clear_selectors.Count -gt 0 -and $key -match '^PKG_CONFIG($|_)') { $environment.Remove($key) } }
@@ -12462,6 +12588,12 @@ for op in plan['operations']:
             require_unambiguous_path(os.path.join(traversal['cwd'], traversal['path']))
     if op.get('output_operand'):
         require_unambiguous_path(os.path.join(op['cwd'], op['output_operand']))
+    if plan.get('compiler') == 'bun':
+        info = os.lstat(op['output'])
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError('Bun output is not a regular executable file')
+        observations.append(dict(directory=False, packages=''))
+        continue
     environment = {} if op['clear_environment'] else dict(os.environ)
     for key in list(environment):
         if key in plan['clear_selectors'] or (plan['clear_selectors'] and key.upper().startswith('PKG_CONFIG')):
@@ -12499,11 +12631,11 @@ print(json.dumps(observations, separators=(',', ':')))
 PY
 }
 
-_act_go_resolve_outputs() {
+_act_command_resolve_outputs() {
     local host="$1" plan="$2" binaries="$3" platform="$4" strict="${5:-false}"
     local program observations shell_kind probe_timeout="$_ACT_SYNC_TIMEOUT" build_shell=""
     shell_kind=$(jq -er '.shell' <<< "$plan") || return 4
-    program=$(_act_go_output_probe_script "$plan" "$strict") || return 4
+    program=$(_act_command_output_probe_script "$plan" "$strict") || return 4
     if [[ "$shell_kind" == windows ]]; then
         program=$(_act_windows_build_guard_script "$probe_timeout" "$program") || return 4
         program=$(_act_windows_encoded_powershell "$program") || return 4
@@ -12583,6 +12715,20 @@ except (OSError, ValueError, KeyError, TypeError, IndexError) as error:
     print('[act] Go output selection: ' + str(error), file=sys.stderr)
     raise SystemExit(4)
 PY
+}
+
+# Keep the Go-specific helper contract available to source-policy callers and
+# focused probes. Bun uses the shared planner with an explicit compiler/target.
+_act_go_output_plan() {
+    _act_command_output_plan "$1" "$2" "$3" "${4:-unix}" go
+}
+
+_act_go_output_probe_script() {
+    _act_command_output_probe_script "$@"
+}
+
+_act_go_resolve_outputs() {
+    _act_command_resolve_outputs "$@"
 }
 
 # Resolve a literal profile, or the default for a direct Cargo build. Opaque
@@ -15885,20 +16031,20 @@ act_run_native_build() {
         build_influence_env_json=$(_act_go_build_influence_json "$build_env") || return 4
     fi
 
-    local go_output_plan=null go_outputs=null go_output_error="" go_output_directory=""
-    if [[ "$language" == go ]]; then
-        local go_shell_kind=unix
-        _act_is_windows_host "$host" && go_shell_kind=windows
-        if ! go_output_plan=$(_act_go_output_plan "$artifact_source_root" "$build_env" \
-                "$build_cmd" "$go_shell_kind"); then
-            jq -nc --arg platform "$platform" --arg host "$host" \
+    local command_output_plan=null command_outputs=null command_output_error="" command_output_directory=""
+    if [[ "$language" == go || "$language" == bun || "$language" == typescript ]]; then
+        local command_shell_kind=unix
+        _act_is_windows_host "$host" && command_shell_kind=windows
+        if ! command_output_plan=$(_act_command_output_plan "$artifact_source_root" "$build_env" \
+                "$build_cmd" "$command_shell_kind" "$language" "$platform"); then
+            jq -nc --arg platform "$platform" --arg host "$host" --arg language "$language" \
                 '{platform:$platform,method:"native",host:$host,status:"error",exit_code:4,
-                  stage:"go_output_selection",artifact_path:"",artifact_paths:[],
-                  error:"Go output selection is ambiguous; use a literal foreground build or install command"}'
+                  stage:($language + "_output_selection"),artifact_path:"",artifact_paths:[],
+                  error:"Native output selection is ambiguous; use a literal foreground compiler command"}'
             return 4
         fi
-        if $strict_native_build && ! _act_validate_strict_go_command_sources \
-                "$tool_name" "$release_git_sha" "$artifact_source_root" "$go_output_plan" "$build_env"; then
+        if [[ "$language" == go ]] && $strict_native_build && ! _act_validate_strict_go_command_sources \
+                "$tool_name" "$release_git_sha" "$artifact_source_root" "$command_output_plan" "$build_env"; then
             jq -nc --arg platform "$platform" --arg host "$host" \
                 '{platform:$platform,method:"native",host:$host,status:"error",exit_code:4,
                   stage:"go_source_selection",artifact_path:"",artifact_paths:[],
@@ -16720,18 +16866,18 @@ EOF
         fi
     fi
 
-    if [[ $exit_code -eq 0 && "$go_output_plan" != null ]]; then
-        local go_binaries="${workspace_binaries:-$binary_name}" go_output_status=0
-        go_outputs=$(_act_go_resolve_outputs "$host" "$go_output_plan" "$go_binaries" \
-            "$platform" "$strict_native_build" 2> >(tee -a "$log_file" >&2)) || go_output_status=$?
-        if [[ $go_output_status -eq 0 ]] &&
-           go_output_directory=$(jq -er '.directory // ""' <<< "$go_outputs"); then
+    if [[ $exit_code -eq 0 && "$command_output_plan" != null ]]; then
+        local command_binaries="${workspace_binaries:-$binary_name}" command_output_status=0
+        command_outputs=$(_act_command_resolve_outputs "$host" "$command_output_plan" "$command_binaries" \
+            "$platform" "$strict_native_build" 2> >(tee -a "$log_file" >&2)) || command_output_status=$?
+        if [[ $command_output_status -eq 0 ]] &&
+           command_output_directory=$(jq -er '.directory // ""' <<< "$command_outputs"); then
             :
         else
-            exit_code="$go_output_status"
+            exit_code="$command_output_status"
             [[ $exit_code -ne 0 ]] || exit_code=4
-            go_output_error="Cannot resolve the exact outputs of the successful Go command; refusing artifact collection"
-            _log_error "$go_output_error"
+            command_output_error="Cannot resolve the exact outputs of the successful $language command; refusing artifact collection"
+            _log_error "$command_output_error"
         fi
     fi
 
@@ -16751,7 +16897,7 @@ EOF
 
     # Determine result
     local status local_artifact_path="" local_artifact_paths=()
-    local native_execution_error="$go_output_error"
+    local native_execution_error="$command_output_error"
     local additional_artifact_receipts=()
     local collected_sha256="" collected_size_bytes=0 collected_identity=""
     local strict_collection_receipts=()
@@ -16851,15 +16997,15 @@ EOF
         local download_failed=false
         for bin in "${binaries_to_download[@]}"; do
             local remote_artifact_path
-            if [[ "$go_output_plan" != null ]]; then
+            if [[ "$command_output_plan" != null ]]; then
                 remote_artifact_path=$(jq -er --arg name "$bin" '.binaries[$name] | strings | select(length>0)' \
-                    <<< "$go_outputs") || return 4
+                    <<< "$command_outputs") || return 4
             else
                 remote_artifact_path=$(act_get_remote_artifact_path "$language" "$artifact_source_root" "$build_env" "$bin" "$platform" "$build_profile")
             fi
 
             local artifact_filename
-            if [[ "$go_output_plan" != null ]]; then
+            if [[ "$command_output_plan" != null ]]; then
                 artifact_filename="$bin"
                 [[ "$platform" != windows/* ]] || artifact_filename="${bin%.[eE][xX][eE]}.exe"
             else
@@ -16876,7 +17022,7 @@ EOF
                 [[ "$platform" == windows/* ]] && collection_mode=600
                 if _act_is_local_host "$host"; then
                     local copy_src="$remote_artifact_path"
-                    if [[ "$go_output_plan" == null && ! -f "$copy_src" && "$copy_src" == *.exe && \
+                    if [[ "$command_output_plan" == null && ! -f "$copy_src" && "$copy_src" == *.exe && \
                           -f "${copy_src%.exe}" && ! -L "${copy_src%.exe}" ]]; then
                         copy_src="${copy_src%.exe}"
                         _log_info "Windows artifact lacks .exe suffix; streaming $copy_src"
@@ -16902,7 +17048,7 @@ EOF
                 fi
                 if _act_stop_native_collection "$collection_status"; then return "$collection_status"; fi
 
-                if [[ "$go_output_plan" == null && -z "$collection_receipt" && "$remote_artifact_path" == *.exe ]] && \
+                if [[ "$command_output_plan" == null && -z "$collection_receipt" && "$remote_artifact_path" == *.exe ]] && \
                    ! _act_is_local_host "$host"; then
                     local fallback_dir alt_remote_artifact_path="${remote_artifact_path%.exe}"
                     if fallback_dir=$(mktemp -d "$artifact_dir/retry.XXXXXXXX") && \
@@ -16984,7 +17130,7 @@ EOF
                 # returned the same (first-collected) binary for every
                 # target.
                 local copy_src="$remote_artifact_path"
-                if [[ "$go_output_plan" == null && ! -f "$copy_src" && "$copy_src" == *.exe ]]; then
+                if [[ "$command_output_plan" == null && ! -f "$copy_src" && "$copy_src" == *.exe ]]; then
                     local alt_src="${copy_src%.exe}"
                     if [[ -f "$alt_src" ]]; then
                         copy_src="$alt_src"
@@ -17041,7 +17187,7 @@ EOF
                 # dest keeps its .exe suffix so downstream packaging still
                 # produces a conventional Windows bv.exe.
                 local fallback_ok=false
-                if [[ "$go_output_plan" == null && "$remote_artifact_path" == *.exe ]]; then
+                if [[ "$command_output_plan" == null && "$remote_artifact_path" == *.exe ]]; then
                     local alt_remote_artifact_path="${remote_artifact_path%.exe}"
                     local alt_scp_output
                     if alt_scp_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" scp \
@@ -17154,9 +17300,9 @@ EOF
                 download_failed=true
                 continue
             fi
-            if [[ "$go_output_plan" != null && -n "$go_output_directory" ]]; then
-                archive_file_remote="$go_output_directory/$archive_file"
-            elif [[ "$go_output_plan" != null ]] || ! archive_file_remote=$(act_get_remote_artifact_path \
+            if [[ "$command_output_plan" != null && -n "$command_output_directory" ]]; then
+                archive_file_remote="$command_output_directory/$archive_file"
+            elif [[ "$command_output_plan" != null ]] || ! archive_file_remote=$(act_get_remote_artifact_path \
                 "$language" "$artifact_source_root" "$build_env" "$archive_file" \
                 "$platform" "$build_profile" file); then
                 _log_error "Cannot resolve workspace archive member: $archive_file"
@@ -17253,9 +17399,9 @@ EOF
                 download_failed=true
                 continue
             fi
-            if [[ "$go_output_plan" != null && -n "$go_output_directory" ]]; then
-                additional_remote="$go_output_directory/$additional_name"
-            elif [[ "$go_output_plan" != null ]] || ! additional_remote=$(act_get_remote_artifact_path \
+            if [[ "$command_output_plan" != null && -n "$command_output_directory" ]]; then
+                additional_remote="$command_output_directory/$additional_name"
+            elif [[ "$command_output_plan" != null ]] || ! additional_remote=$(act_get_remote_artifact_path \
                 "$language" "$artifact_source_root" "$build_env" "$additional_name" \
                 "$platform" "$build_profile" file); then
                 _log_error "Cannot resolve additional release artifact: $additional_name"
@@ -18286,13 +18432,14 @@ _act_build_orchestration_target() {
 # actually moves each destination. An absolute path below the original root
 # is still shared, just like an absolute path outside it.
 # Returns 1 for an opaque recipe which retains declared-output conventions.
-_act_go_output_paths() {
+_act_command_output_paths() {
     local source_root="$1" build_env="$2" build_cmd="$3" shell_kind="$4"
+    local compiler="${5:-go}" platform="${6:-}"
     local plan relocated_plan relocated_root=/.dsr-output-relocation/source
     [[ "$shell_kind" != windows ]] || relocated_root=Z:/.dsr-output-relocation/source
-    plan=$(_act_go_output_plan "$source_root" "$build_env" "$build_cmd" "$shell_kind") || return 4
+    plan=$(_act_command_output_plan "$source_root" "$build_env" "$build_cmd" "$shell_kind" "$compiler" "$platform") || return 4
     [[ "$plan" != null ]] || return 1
-    relocated_plan=$(_act_go_output_plan "$relocated_root" "$build_env" "$build_cmd" "$shell_kind") || return 4
+    relocated_plan=$(_act_command_output_plan "$relocated_root" "$build_env" "$build_cmd" "$shell_kind" "$compiler" "$platform") || return 4
     python3 -I - "$source_root" "$relocated_root" "$shell_kind" \
         3<<< "$plan" 4<<< "$relocated_plan" <<'PY'
 import json, ntpath, os, posixpath, sys
@@ -18345,6 +18492,10 @@ except (OSError, ValueError, KeyError, TypeError) as error:
 PY
 }
 
+_act_go_output_paths() {
+    _act_command_output_paths "$1" "$2" "$3" "$4" go
+}
+
 # Output namespaces a native target's build writes on its host, one
 # "<in-tree|external><TAB><path>" line per binary, so the orchestrator can keep
 # --parallel targets from overwriting each other's binaries. A path is
@@ -18377,7 +18528,7 @@ _act_native_output_paths() {
     remote_path="${remote_path%/}"
     [[ -n "$remote_path" ]] || return 0
     build_env=$(act_get_build_env "$tool_name" "$target" 2>/dev/null) || return 4
-    if [[ "$language" == go ]]; then
+    if [[ "$language" == go || "$language" == bun || "$language" == typescript ]]; then
         local command binary_name shell_kind=unix output_paths output_status=0
         command=$(act_get_build_cmd "$tool_name" "$target") || return 4
         binary_name=$(yq -r '.binary_name // ""' "$config_file") || return 4
@@ -18385,7 +18536,7 @@ _act_native_output_paths() {
         command=$(act_substitute_build_cmd_tokens "$command" "$binary_name" "$version" \
             "${target%%/*}" "${target##*/}") || return 4
         _act_is_windows_host "$host" && shell_kind=windows
-        output_paths=$(_act_go_output_paths "$remote_path" "$build_env" "$command" "$shell_kind") || output_status=$?
+        output_paths=$(_act_command_output_paths "$remote_path" "$build_env" "$command" "$shell_kind" "$language" "$target") || output_status=$?
         case "$output_status" in
             0) printf '%s\n' "$output_paths"; return 0 ;;
             1) ;; # Reviewed opaque recipes retain their declared convention.
