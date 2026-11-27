@@ -24,7 +24,7 @@
 #   --offline TARBALL  Install from pre-downloaded repo tarball
 #   --repo-dir DIR     Clone repo to DIR (default: ~/.local/share/dsr/repo)
 #   --force            Reinstall even if same version exists
-#   --uninstall        Remove dsr and associated files
+#   --uninstall        Deactivate the selected launcher; retain source, skills and data
 #   -h, --help         Show this help
 #
 # Updates are staged and validated before activation. Previous source checkouts
@@ -119,7 +119,7 @@ Options:
                          archive; read its detached signature from ARCHIVE.minisig
   --repo-dir DIR     Clone repo to DIR (default: ~/.local/share/dsr/repo)
   --force            Reinstall even if same version exists
-  --uninstall        Remove dsr and associated files
+  --uninstall        Deactivate the selected launcher; retain source, skills and data
   -h, --help         Show this help
 
 Updates retain the previous source in a sibling .<repo-name>.install.*/previous-repo
@@ -127,6 +127,10 @@ directory and any replaced launcher in --dest/.dsr-launcher.*/previous. Acquisit
 and validation do not change the active checkout. Handled activation failures and
 signals restore prior entries; abrupt power loss or SIGKILL can require manual
 recovery from the retained directories.
+
+Uninstall uses the same --dest and --repo-dir as installation (or --system for
+the system launcher). It retains the removed symlink in a recovery directory
+beside the launcher. Source, skills and data may serve other installations.
 
 Explicit versions select release tags (with or without a leading v), even when
 a branch has the same name. Use --version main to select the main branch.
@@ -149,7 +153,16 @@ EOF
 while [ $# -gt 0 ]; do
   case "$1" in
     --version)       VERSION="$2"; VERSION_EXPLICIT=1; shift 2 ;;
-    --dest)          DEST="$2"; shift 2 ;;
+    --dest=*|--repo-dir=*)
+      set -- "${1%%=*}" "${1#*=}" "${@:2}"
+      continue ;;
+    --dest|--repo-dir)
+      if [[ -z "${2:-}" || "$2" == --* ]]; then
+        printf '%s requires a directory\n' "$1" >&2
+        exit 4
+      fi
+      if [[ "$1" == --dest ]]; then DEST="$2"; else REPO_DIR="$2"; fi
+      shift 2 ;;
     --system)        SYSTEM=1; DEST="/usr/local/bin"; shift ;;
     --easy-mode)     EASY=1; shift ;;
     --verify)        VERIFY=1; shift ;;
@@ -168,11 +181,10 @@ while [ $# -gt 0 ]; do
       fi
       OFFLINE_PUBKEY="$2"
       shift 2 ;;
-    --repo-dir)      REPO_DIR="$2"; shift 2 ;;
     --force)         FORCE_INSTALL=1; shift ;;
     --uninstall)     UNINSTALL=1; shift ;;
     -h|--help)       usage; exit 0 ;;
-    *)               shift ;;
+    *)               printf 'Unknown installer argument: %s\n' "$1" >&2; exit 4 ;;
   esac
 done
 
@@ -796,6 +808,7 @@ prepare_install_paths() {
     return 1
   fi
   REPO_DIR="$selected_repo"; DEST="$selected_dest"
+  if ((UNINSTALL)); then return 0; fi
   mkdir -p -- "$(dirname "$REPO_DIR")" || return 1
   if [[ ! -d "$DEST" ]]; then install_destination_command mkdir -p -- "$DEST" || return 1; fi
 }
@@ -1100,7 +1113,7 @@ rollback_installation() {
   local failed=0 current="" link_target="$DEST/$BINARY_NAME"
   if [ "$INSTALL_LINK_SWITCH" -eq 1 ]; then
     current=$(install_path_identity "$link_target" destination 2>/dev/null) || current=""
-    if [[ "$current" == "$INSTALL_LINK_NEW_ID" ]]; then
+    if [[ -n "$INSTALL_LINK_NEW_ID" && "$current" == "$INSTALL_LINK_NEW_ID" ]]; then
       install_destination_command mv -- "$link_target" "$INSTALL_LINK_STAGE/uncommitted" || failed=1
     elif [[ -n "$current" && "$current" != "$INSTALL_LINK_OLD_ID" ]]; then
       err "Launcher changed outside this installation; recovery files remain at $INSTALL_LINK_STAGE"
@@ -1141,55 +1154,30 @@ rollback_installation() {
 # ============================================================
 
 do_uninstall() {
-  show_header
-  info "Uninstalling dsr..."
-
-  local found=0
-
-  # Remove binary/symlink
-  for path in "$HOME/.local/bin/dsr" "/usr/local/bin/dsr"; do
-    if [ -e "$path" ] || [ -L "$path" ]; then
-      if [ -w "$(dirname "$path")" ]; then
-        rm -f "$path"
-        ok "Removed $path"
-      else
-        sudo rm -f "$path"
-        ok "Removed $path (sudo)"
-      fi
-      found=1
-    fi
-  done
-
-  # Remove repo clone
-  local repo_dir="${DSR_REPO_DIR:-$DSR_DATA_DIR/repo}"
-  if [ -d "$repo_dir" ]; then
-    rm -rf "$repo_dir"
-    ok "Removed repo: $repo_dir"
-    found=1
+  local launcher="$DEST/$BINARY_NAME"
+  if [[ ! -e "$launcher" && ! -L "$launcher" ]]; then
+    info "No launcher installed at $launcher"
+    return 0
   fi
 
-  # Remove skill directories
-  for skill_dir in "$HOME/.claude/skills/dsr" "$HOME/.codex/skills/dsr"; do
-    if [ -d "$skill_dir" ]; then
-      rm -rf "$skill_dir"
-      ok "Removed skill directory: $skill_dir"
-      found=1
-    fi
-  done
-
-  if [ "$found" -eq 0 ]; then
-    warn "dsr does not appear to be installed"
-  else
-    ok "dsr uninstalled"
-    echo ""
-    info "Config directories preserved (remove manually if desired):"
-    info "  ~/.config/dsr/"
-    info "  ~/.local/state/dsr/"
-    info "  ~/.cache/dsr/"
-    info "  $(status_path "$DSR_DATA_DIR")/"
+  # install_binary publishes an absolute symlink to this exact checkout.
+  # A shared source or skill directory can serve multiple destinations.
+  if [[ ! -L "$launcher" || "$(readlink "$launcher")" != "$REPO_DIR/dsr" ]]; then
+    err "Refusing to remove $launcher: it is not a launcher for $REPO_DIR/dsr"
+    return 1
   fi
 
-  exit 0
+  INSTALL_LINK_OLD_ID=$(install_path_identity "$launcher" destination) || return 1
+  INSTALL_LINK_STAGE=$(install_destination_command mktemp -d "$DEST/.dsr-launcher.XXXXXXXX") || return 1
+  INSTALL_LINK_SWITCH=1
+  install_destination_command mv -- "$launcher" "$INSTALL_LINK_STAGE/previous" || return 1
+  [[ "$(install_path_identity "$INSTALL_LINK_STAGE/previous" destination)" == "$INSTALL_LINK_OLD_ID" ]] || {
+    err "Launcher identity changed during uninstall; inspect $INSTALL_LINK_STAGE"
+    return 1
+  }
+  INSTALL_COMMITTED=1
+  ok "Uninstalled launcher $launcher"
+  info "Source retained at $REPO_DIR. Agent skills and runtime data are preserved."
 }
 
 # ============================================================
@@ -1634,11 +1622,6 @@ main() {
     err "--offline-pubkey requires --offline FILE for an installation"
     return 4
   fi
-  # Handle uninstall early
-  if [ "$UNINSTALL" -eq 1 ]; then
-    do_uninstall
-  fi
-
   show_header
 
   # Cover metadata discovery too: cancellation must own requests even before
@@ -1647,6 +1630,13 @@ main() {
   trap 'installer_signal 129' HUP
   trap 'installer_signal 130' INT
   trap 'installer_signal 143' TERM
+
+  if ((UNINSTALL)); then
+    prepare_install_paths
+    acquire_lock
+    do_uninstall
+    return
+  fi
 
   # Platform + proxy
   detect_platform

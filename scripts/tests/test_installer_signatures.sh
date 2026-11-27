@@ -1409,6 +1409,72 @@ result = invoke(context, ['--offline', str(valid_archive)])
 check('an independent symlinked bin directory remains supported', result.returncode == 0 and run([str(target / 'dsr')]).stdout.strip() == 'new')
 check('installation preserves the selected bin directory alias', alias.is_symlink() and os.readlink(alias) == str(target))
 
+# Guard the machine's system bin even if this fixture is run against an old
+# installer that also attempts to remove /usr/local/bin/dsr.
+context = setup('uninstall-scope')
+case, selected, target, environment = context
+for command in ('rm', 'sudo'):
+    wrapper = case / 'wrappers' / command
+    if command == 'sudo':
+        wrapper.write_text('#!/bin/sh\nexit 99\n')
+    else:
+        wrapper.write_text('#!/bin/sh\nfor arg do [ "$arg" != /usr/local/bin/dsr ] || exit 99; done\n'
+                           'exec "$DSR_FIXTURE_REAL_RM" "$@"\n')
+        environment['DSR_FIXTURE_REAL_RM'] = shutil.which('rm')
+    wrapper.chmod(0o755)
+other_bin = case / 'home/.local/bin'
+other_bin.mkdir(parents=True)
+(other_bin / 'dsr').symlink_to(selected / 'dsr')
+skill = case / 'home/.claude/skills/dsr/SKILL.md'
+skill.parent.mkdir(parents=True)
+skill.write_text('user skill edits\n')
+before = tree_snapshot(selected)
+# Environment defaults disagree with the command line. Uninstall must honor
+# exactly the pair explicitly selected by the caller.
+environment.update(DSR_DEST=str(other_bin), DSR_REPO_DIR=str(case / 'unrelated'))
+(case / 'unrelated').mkdir()
+(case / 'unrelated/sentinel').write_text('private data\n')
+args = ['--uninstall', '--dest', str(target), '--repo-dir', str(selected)]
+old_link_id = identity(target / 'dsr')
+result = invoke(context, args, fault='launcher-signal')
+check('interrupted uninstall restores the exact launcher', result.returncode == 143 and
+      (target / 'dsr').is_symlink() and identity(target / 'dsr') == old_link_id)
+result = invoke(context, args)
+check('uninstall deactivates the requested launcher', result.returncode == 0 and
+      not os.path.lexists(target / 'dsr'))
+saved = list(target.glob('.dsr-launcher.*/previous'))
+check('uninstall retains the exact original launcher for recovery',
+      len(saved) == 1 and identity(saved[0]) == old_link_id)
+check('uninstall keeps the shared checkout and other launcher usable',
+      selected.is_dir() and tree_snapshot(selected) == before and
+      run([str(other_bin / 'dsr')]).stdout.strip() == 'old')
+check('uninstall preserves shared skills and unrelated data',
+      skill.is_file() and skill.read_text() == 'user skill edits\n' and
+      (case / 'unrelated/sentinel').is_file())
+check('repeated uninstall of the same launcher succeeds', invoke(context, args).returncode == 0)
+missing = case / 'never-created'
+result = invoke(context, ['--uninstall', '--dest=' + str(missing / 'bin'),
+                          '--repo-dir=' + str(missing / 'repo')])
+check('absent installation is a read-only no-op', result.returncode == 0 and not missing.exists())
+(target / 'dsr').symlink_to(case / 'unrelated/sentinel')
+result = invoke(context, args)
+check('foreign launcher cannot be uninstalled', result.returncode != 0 and
+      (target / 'dsr').is_symlink() and os.readlink(target / 'dsr') == str(case / 'unrelated/sentinel'))
+result = invoke(context, ['--uninstall', '--dset', str(target)])
+check('mistyped uninstall selector stops before choosing a default', result.returncode == 4 and
+      (other_bin / 'dsr').is_symlink())
+(target / 'dsr').rename(case / 'foreign-launcher')
+dangling = case / 'absent-source'
+(target / 'dsr').symlink_to(dangling / 'dsr')
+result = invoke(context, ['--uninstall', '--dest', str(target), '--repo-dir', str(dangling)])
+check('an owned dangling launcher can be deactivated', result.returncode == 0 and
+      not os.path.lexists(target / 'dsr') and not dangling.exists())
+(target / 'dsr').write_text('user program\n')
+result = invoke(context, args)
+check('a regular file at the selected destination survives', result.returncode != 0 and
+      (target / 'dsr').read_text() == 'user program\n')
+check('uninstall performs no acquisition', not (case / 'http.calls').exists() and not (case / 'git.calls').exists())
+
 print(f'Root installer transactions: {checks - len(failures)}/{checks} checks passed', flush=True)
 if failures:
     print('Fixture diagnostics: ' + str(root), file=sys.stderr)
