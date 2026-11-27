@@ -285,7 +285,52 @@ payload_large_selection_cases() {
     check 'large refusal performs no upload' test "$(count)" -eq 0
 }
 
+# Exercise a failed parser after the last inventory gate and before POST. A
+# complete public release must remain read-only even when the lookup was stopped.
+payload_lookup_failure_cases() {
+    local mode rc expected
+    for mode in public draft; do
+        new_case "lookup-$mode"
+        if [[ "$mode" == public ]]; then
+            seed a.tar.gz 101; seed b.zip 102; seed z-compat.tar.gz 103
+            change_json "$CASE/context.json" '.release.draft=false'
+        fi
+        cp "$CASE/inventory.json" "$CASE/before.json" || return 1
+        for rc in 130 5; do
+            expected=1; [[ "$rc" != 130 ]] || expected=5
+            capture upload_with_failed_lookup "$rc"
+            check "$mode release stops after lookup exit $rc" test "$status" -eq "$expected"
+            check "$mode lookup exit $rc reaches the publication decision" test -s "$CASE/lookup"
+            check "$mode lookup exit $rc sends no upload" test "$(count)" -eq 0
+            check "$mode lookup exit $rc preserves remote inventory" cmp -s "$CASE/before.json" "$CASE/inventory.json"
+            check "$mode lookup exit $rc emits no success receipt" test ! -s "$CASE/out"
+        done
+        capture upload
+        check "$mode release can resume from the retained plan" test "$status" -eq 0
+        if [[ "$mode" == public ]]; then check 'public retry stays read-only' test "$(count)" -eq 0
+        else check 'draft retry sends each missing payload once' test "$(count)" -eq 3; fi
+    done
+}
+upload_with_failed_lookup() (
+    local lookup_rc="$1"
+    : > "$CASE/lookup"
+    jq() {
+        if [[ "${5:-}" == 'any(.[];.name==$name)' ]]; then
+            printf '%s\n' "$lookup_rc" >> "$CASE/lookup"
+            printf 'false\n'
+            return "$lookup_rc"
+        fi
+        command jq "$@"
+    }
+    upload
+)
+
 if [[ "${DSR_PAYLOAD_FIXTURES_ONLY:-false}" == true ]]; then return 0; fi
+if [[ "${1:-}" == --lookup-only ]]; then
+    payload_lookup_failure_cases || failures=$((failures+1))
+    printf '\nPayload publication checks: %d; failures: %d\n' "$checks" "$failures"
+    [[ "$failures" -eq 0 ]]; exit $?
+fi
 if [[ "${1:-}" == --large-selection-only ]]; then
     payload_large_selection_cases || failures=$((failures+1))
     printf '\nPayload publication checks: %d; failures: %d\n' "$checks" "$failures"
@@ -296,6 +341,7 @@ if [[ "${1:-}" == --large-inventory-only ]]; then
     printf '\nPayload publication checks: %d; failures: %d\n' "$checks" "$failures"
     [[ "$failures" -eq 0 ]]; exit $?
 fi
+payload_lookup_failure_cases || failures=$((failures+1))
 new_case complete
 capture upload
 check 'all payloads upload from verified snapshots' test "$status" -eq 0

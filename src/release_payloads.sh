@@ -226,6 +226,7 @@ release_upload_payloads() (
     root=$(cd "$root" && pwd -P) || return 4
     local selection plan work cleanup entries entry name hash size context context_key key session file state oldhash
     local inventory current pinned names receipt uploaded=0 final fingerprint retained_complete=false
+    local draft present lookup_status
     work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-payload-stage.XXXXXXXX") || return 1
     printf -v cleanup 'rm -rf -- %q' "$work"
     # shellcheck disable=SC2064
@@ -297,7 +298,8 @@ release_upload_payloads() (
     current=$(_sbr_publication_gate "$repo" "$tag" "$context" "$inventory" "$names" "$work") || return $?
     _rup_preflight "$repo" "$current" "$plan" "$pinned" "$work" || return $?
     pinned=$(_rup_selected_assets "$current" "$plan") || return 1
-    if [[ "$(jq -r '.release.draft' <<< "$context")" != true &&
+    draft=$(jq -r '.release.draft' <<< "$context") || return 1
+    if [[ "$draft" != true &&
           "$(jq 'length' <<< "$pinned")" != "$(jq '.artifacts|length' <<< "$plan")" ]]; then
         _rup_log 'Missing payloads may only be uploaded to a draft release'; return 4
     fi
@@ -314,7 +316,17 @@ release_upload_payloads() (
         [[ "$(_slsa_sha256 "$file")" == "$oldhash" ]] || return 2
         current=$(_sbr_publication_gate "$repo" "$tag" "$context" "$current" "$names" "$work") || return $?
         _rup_preflight "$repo" "$current" "$plan" "$pinned" "$work" || return $?
-        if ! jq -e --arg name "$name" 'any(.[];.name==$name)' <<< "$current" >/dev/null; then
+        # Only a completed negative lookup in a draft permits an upload.
+        # jq can emit a value and then fail, including on a public read-only retry.
+        present=$(jq -r --arg name "$name" 'any(.[];.name==$name)' <<< "$current") || {
+            lookup_status=$?
+            _rup_log "Could not determine whether the release already contains $name (exit $lookup_status)"
+            if ((lookup_status > 128)); then return 5; fi
+            return 1
+        }
+        [[ "$present" == true || "$present" == false ]] || return 1
+        if [[ "$present" == false ]]; then
+            [[ "$draft" == true ]] || { _rup_log 'Refusing to upload a payload to a public release'; return 4; }
             receipt=$(_rup_upload "$(jq -r '.release.upload_url' <<< "$context")" "$work/payloads/$name" "$entry") || return $?
             uploaded=$((uploaded + 1))
             current=$(_sbr_publication_gate "$repo" "$tag" "$context" "$current" "$names" "$work") || return $?
