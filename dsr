@@ -1429,13 +1429,11 @@ _doctor_summary() {
 # disabled records so neither a duplicate registry entry nor a stale check can
 # revive an opt-out. Print nothing until the complete inventory is admitted.
 _check_configured_repos() {
-    local all_tools="${1:-false}"
     local config_dir="${DSR_CONFIG_DIR:-$HOME/.config/dsr}"
     local registry="${DSR_REPOS_FILE:-$config_dir/repos.yaml}"
     local file document registry_tools='{}' registry_entry registry_entries enabled line repo tool name
     local -a files=() records=()
-    local -A seen_repos=() seen_tools=() disabled_repos=()
-    [[ "$all_tools" == true || "$all_tools" == false ]] || return 4
+    local -A seen_tools=() disabled_repos=()
     for file in "$config_dir"/repos.d/*.yaml; do
         [[ "${file##*/}" != _* ]] || continue
         [[ -e "$file" || -L "$file" ]] || continue
@@ -1463,6 +1461,7 @@ _check_configured_repos() {
         line=$(jq -c --arg name "$name" --argjson enabled "$enabled" '
             {tool: (.tool_name // .name // ""), name: (.tool_name // .name // $name),
              repo: (.repo // .github.repo // ""), workflow: (.workflow // .github.workflow // ""),
+             default_workflow: (.workflow == null and .github.workflow == null),
              local_path: (.local_path // .local.path // ""), language: (.language // .local.language // ""),
              targets: (.targets // .build.targets // []), enabled: $enabled}' <<< "$document") || return 4
         repo=$(jq -er '.repo | strings' <<< "$line") || return 4
@@ -1503,10 +1502,6 @@ _check_configured_repos() {
         if [[ -n "${disabled_repos[${repo,,}]:-}" ]]; then
             line=$(jq -c '.enabled = false' <<< "$line") || return 4
         fi
-        if ! $all_tools && [[ -n "${seen_repos[${repo,,}]:-}" ]]; then
-            continue
-        fi
-        seen_repos["${repo,,}"]=1
         admitted+=("$line")
     done
     printf '%s\n' ${admitted[@]+"${admitted[@]}"}
@@ -1538,9 +1533,10 @@ _check_save_snapshot() {
     # reach cmd_check rather than become successful temporary-file cleanup.
     snapshot=$(printf '%s\n' "$@" | jq -sc --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         --argjson threshold "$threshold" '
-        {checked_at: $at, threshold_seconds: $threshold, repos_checked: [.[].repo],
-         throttled: [.[] | select(.status == "throttled") | .repo],
-         skipped: [.[] | select(.status == "error" or ((.job_errors // []) | length > 0)) | .repo]}') || return $?
+        (reduce .[] as $r ({}; .[$r.repo | ascii_downcase] += [$r]) | [.[]]) as $groups |
+        {checked_at: $at, threshold_seconds: $threshold, repos_checked: [$groups[][0].repo],
+         throttled: [$groups[] | select(any(.[]; .status == "throttled")) | .[0].repo],
+         skipped: [$groups[] | select(any(.[]; .status == "error" or ((.job_errors // []) | length > 0))) | .[0].repo]}') || return $?
     mkdir -p "$dir" 2>/dev/null || return 0
     tmp=$(mktemp "$dir/.last.XXXXXXXX" 2>/dev/null) || return 0
     if printf '%s\n' "$snapshot" > "$tmp" &&
@@ -1678,8 +1674,9 @@ EOF
                     return $?
                 fi
                 if [[ "$arg" == "$tool" || "${arg,,}" == "${repo,,}" ]]; then
-                    found="$line"
-                    break
+                    targets+=("$line")
+                    found=true
+                    [[ "$arg" != "$tool" ]] || break
                 fi
             done
             if [[ -z "$found" ]]; then
@@ -1690,8 +1687,8 @@ EOF
                     _check_abort_observation "$?" 4 "$threshold" "Could not prepare the requested repository"
                     return $?
                 }
+                targets+=("$found")
             fi
-            targets+=("$found")
         done
     fi
 
@@ -1700,6 +1697,32 @@ EOF
         $JSON_MODE && json_envelope "check" "error" 4 '{"error": "no repositories configured or given"}'
         return 4
     fi
+
+    # Several tools may ship from one repository using separate workflows.
+    # Preserve selection order and collapse aliases of the same API endpoint.
+    # A repository-wide poll keeps the workflow-to-tool map for attribution.
+    local planned_targets
+    planned_targets=$(printf '%s\n' "${targets[@]}" | jq -sc --argjson all "$all_workflows" '
+        reduce .[] as $row ({}; .[$row.repo | ascii_downcase] += [$row]) | .[] |
+        .[0] as $first |
+        # A repos.d recipe without a selector builds release.yml. Keep the
+        # historical unfiltered check for a lone tool, and include its default
+        # release route alongside explicitly configured sibling workflows.
+        (if length > 1 and any(.[]; (.workflow // "") != "") then
+            map(if .default_workflow then .workflow = ".github/workflows/release.yml" else . end)
+         else . end) |
+        reduce .[] as $row ({};
+            (($row.workflow // "") | split("/") | last // "") as $file |
+            if $file == "" or has($file) then . else .[$file] = $row end) |
+        if length == 0 then $first
+        elif $all then
+            if length == 1 then first(.[])
+            else $first + {tool:null, workflow_tools:map_values(.tool)} end
+        else .[] end') || {
+        _check_abort_observation "$?" 4 "$threshold" "Could not plan repository workflow checks"
+        return $?
+    }
+    mapfile -t targets <<< "$planned_targets"
 
     # A blocked credential helper must not freeze monitoring or turn a
     # cancellation into permission to try another authentication transport.
@@ -1755,8 +1778,17 @@ EOF
         local status=$?
 
         local projection_status=0
-        result=$(jq -c --arg tool "$tool" '. + {tool: (if $tool == "" then null else $tool end)}' \
-            <<< "$result" 2>/dev/null) || projection_status=$?
+        result=$(jq -c --arg tool "$tool" --slurpfile target /dev/fd/3 '
+            . + {tool: (if $tool == "" then null else $tool end)} |
+            if $target[0].workflow_tools == null then .
+            else
+                def owner:
+                    ((.path // "") | split("@")[0] // "") as $path |
+                    if ($path | startswith(".github/workflows/")) then
+                        $target[0].workflow_tools[$path | ltrimstr(".github/workflows/")]
+                    else null end;
+                (.queued_runs[]?, .stuck_runs[]?) |= (. + {tool:owner})
+            end' 3<<< "$line" <<< "$result" 2>/dev/null) || projection_status=$?
         if ((projection_status != 0)); then
             # An unsupervised parser crash withdraws the complete poll just
             # like an interrupted run/job read. Never retain an earlier
@@ -1803,12 +1835,13 @@ EOF
             return $?
         }
         check_details=$(jq -c --argjson threshold "$threshold" --argjson interrupted "$interrupted" '. as $repos |
+                (reduce .[] as $r ({}; .[$r.repo | ascii_downcase] += [$r]) | [.[]]) as $groups |
                 {threshold_seconds: $threshold,
-                 repos_checked: [$repos[].repo],
+                 repos_checked: [$groups[][0].repo],
                  throttled: (if $interrupted then [] else [$repos[] | select(.status == "throttled") | . as $r |
                      ((.queued_runs // []) + (.stuck_runs // []))[] |
-                     ((.path // "") | split("/") | last) as $file |
-                     {repo: $r.repo, tool: $r.tool,
+                     ((.path // "") | split("@")[0] // "" | split("/") | last // "") as $file |
+                     {repo: $r.repo, tool: (.tool // $r.tool),
                       workflow: (if $file != "" then $file else (.workflow_name // "unknown") end),
                       workflow_path: .path,
                       run_id: .id, run_attempt: .run_attempt, workflow_id: .workflow_id,
@@ -1818,7 +1851,7 @@ EOF
                       head_sha: .head_sha, event: .event, html_url: .html_url,
                       queue_reason: .queue_reason, queued_job_ids: .queued_job_ids} |
                      with_entries(select(.value != null))] end),
-                 healthy: (if $interrupted then [] else [$repos[] | select(.status == "ok") | .repo] end),
+                 healthy: (if $interrupted then [] else [$groups[] | select(all(.[]; .status == "ok")) | .[0].repo] end),
                  skipped: [$repos[] | . as $repo |
                      if ((.job_errors // []) | length) > 0 then
                          .job_errors[] | {repo:$repo.repo,run_id:.run_id,reason:.reason}
@@ -2720,7 +2753,7 @@ _watch_admit_upstream() {
 _watch_configured_repo_matches() {
     local tool="$1" repo="$2" run_id="$3" workflow_path="$4" configured inventory
     local observed_file config_file document selector configured_file
-    if ! inventory=$(_check_configured_repos true); then
+    if ! inventory=$(_check_configured_repos); then
         log_warn "Cannot admit run $run_id: repository automation configuration is invalid or unavailable"
         return 1
     fi
@@ -16454,7 +16487,7 @@ EOF
     fi
 
     local repos_json configured_output configured_status=0
-    configured_output=$(_check_configured_repos true) || configured_status=$?
+    configured_output=$(_check_configured_repos) || configured_status=$?
     if ((configured_status != 0)); then
         log_error "Cannot read repository automation configuration"
         if $JSON_MODE; then

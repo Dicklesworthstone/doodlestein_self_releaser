@@ -190,7 +190,7 @@ echo "{}"
 # runs elsewhere), recording each call; an empty listing is an API failure.
 _mock_gh_runs() {
     printf '%s' "$1" > "$TEST_TMPDIR/runs.json"
-    export GH_RETRY_DELAY=0
+    export MOCK_FILTER_RELEASE_WORKFLOWS="${2:-false}" GH_RETRY_DELAY=0
     mock_command_script "gh" "$(cat <<'SCRIPT'
 printf '%s\n' "$*" >> "$TEST_TMPDIR/gh.calls"
 if [[ "$1" == auth ]]; then
@@ -210,8 +210,13 @@ if [[ "$1" == api ]]; then
         desired=""
         [[ "$*" == *status=queued* ]] && desired=queued
         [[ "$*" == *status=in_progress* ]] && desired=in_progress
-        jq --arg desired "$desired" '
-            .workflow_runs |= map(select($desired == "" or .status == $desired)) |
+        file=""
+        if [[ "$MOCK_FILTER_RELEASE_WORKFLOWS" == true && "$2" =~ /workflows/([^/]+)/runs ]]; then
+            file="${BASH_REMATCH[1]}"
+        fi
+        jq --arg desired "$desired" --arg file "$file" '
+            .workflow_runs |= map(select(($desired == "" or .status == $desired) and
+                ($file == "" or ((.path // "") | split("@")[0]) == (".github/workflows/" + $file)))) |
             .total_count = (.workflow_runs | length)' "$TEST_TMPDIR/runs.json"
     else
         echo '{"total_count":0,"workflow_runs":[]}'
@@ -4483,6 +4488,59 @@ _watch_partial_refusal_case() {
     echo "$json" | jq -e '.details.repos_checked ==
             ["Dicklesworthstone/beads_viewer","Dicklesworthstone/ntm","test/test-tool"] and
         .details.healthy == .details.repos_checked and .details.throttled == [] and .details.skipped == []'
+}
+
+_shared_workflow_fixture() {
+    harness_create_config
+    _watch_configure_ntm
+    yq -i 'del(.workflow)' "$DSR_CONFIG_DIR/repos.d/ntm.yaml"
+    printf 'tool_name: worker\nrepo: Dicklesworthstone/ntm\nworkflow: .github/workflows/worker.yml\n' \
+        > "$DSR_CONFIG_DIR/repos.d/worker.yaml"
+    printf 'tools:\n  alias-worker:\n    repo: Dicklesworthstone/ntm\n    workflow: worker.yml\n' > "$DSR_CONFIG_DIR/repos.yaml"
+    local runs
+    runs=$(_queued_release_run | jq '
+        .workflow_runs[0] += {path:".github/workflows/worker.yml",event:"push"} |
+        .workflow_runs += [(.workflow_runs[0] + {id:67890,path:".github/workflows/lint.yml"}),
+                           (.workflow_runs[0] + {id:67891,path:null})]') || return 1
+    _mock_gh_runs "$runs" true
+}
+
+@test "shared repository check resolves a tool and polls every distinct release workflow for its repository" {
+    _shared_workflow_fixture
+    run _routing_dsr --json check worker
+    assert_equal 1 "$status"
+    jq -e '(.details.throttled | map([.tool,.run_id])) == [["worker",12345]]' <<< "$output"
+    ! grep -q 'actions/workflows/release.yml/' "$TEST_TMPDIR/gh.calls"
+
+    : > "$TEST_TMPDIR/gh.calls"
+    run _routing_dsr --json check Dicklesworthstone/ntm worker
+    assert_equal 1 "$status"
+    jq -e '.details.repos_checked == ["Dicklesworthstone/ntm"] and .details.healthy == [] and
+        (.details.repos | map([.tool,.status])) == [["ntm","ok"],["worker","throttled"]] and
+        (.details.throttled | map([.tool,.run_id])) == [["worker",12345]]' <<< "$output"
+    assert_equal 2 "$(grep -c '/workflows/worker.yml/runs?' "$TEST_TMPDIR/gh.calls")"
+    jq -e '.repos_checked == .throttled and .repos_checked == ["Dicklesworthstone/ntm"]' "$DSR_STATE_DIR/check/last.json"
+}
+
+@test "shared repository all-workflow scan polls once and leaves unrelated workflows unassigned" {
+    _shared_workflow_fixture
+    run _routing_dsr --json check --all
+    assert_equal 1 "$status"
+    jq -e '.details.repos_checked == ["Dicklesworthstone/ntm"] and
+        (.details.throttled | sort_by(.run_id) | map([.tool,.run_id])) ==
+            [["worker",12345],[null,67890],[null,67891]]' <<< "$output"
+    assert_equal 2 "$(grep -c '/actions/runs?' "$TEST_TMPDIR/gh.calls")"
+    ! grep -q '/actions/workflows/' "$TEST_TMPDIR/gh.calls"
+}
+
+@test "shared repository watcher starts the tool whose release workflow is queued" {
+    _shared_workflow_fixture
+    DSR_WATCH_FIXTURE_REAL_CHECK=1 run _routing_watch '{}' --auto-fallback
+    assert_equal 0 "$status"
+    _watch_completed 12345
+    jq -e '.attempts["12345"] | .tool == "worker" and
+        .watch_admission.workflow_path == ".github/workflows/worker.yml"' "$DSR_STATE_DIR/triggered.json"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
 }
 
 @test "dsr check --all checks every workflow" {

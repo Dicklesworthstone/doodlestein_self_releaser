@@ -813,7 +813,12 @@ dsr check --json                    # JSON output for scripting
 ```
 
 A configured tool's `workflow` is its release workflow; without `--all` only
-that workflow's runs count. Queued and in-progress runs are queried separately
+that workflow's runs count. When several tools share a repository, a tool name
+selects its own workflow. A repository name or the default check polls each
+distinct configured release workflow. Aliases using the same workflow share
+one poll. A per-tool opt-out still blocks automatic fallback across aliases of
+that repository. With `--all`, DSR polls the repository once and attributes runs to
+their configured workflows when it can identify the tool. Queued and in-progress runs are queried separately
 and paginated, so completed history cannot hide an older throttled release.
 For an older in-progress workflow, DSR also reads every job in the observed
 attempt. It reports throttling only when jobs are queued, none are executing
