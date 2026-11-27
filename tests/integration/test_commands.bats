@@ -3625,6 +3625,64 @@ EOF
     [[ ! -e "$DSR_STATE_DIR/builds/ntm/v1.2.3" ]]
 }
 
+@test "watch admission confirmation counts distinct polls and preserves preview state" {
+    harness_create_config
+    _watch_configure_ntm
+    local check_json before
+    check_json=$(_watch_run_json | jq '.details.throttled += .details.throttled')
+    run --separate-stderr _routing_watch "$check_json" --auto-fallback --confirm-polls 2
+    assert_equal 0 "$status"
+    jq -e '.details | .confirm_polls == 2 and .awaiting_confirmation == 1 and
+        .triggered_state.queue_samples["12345"].count == 1 and .triggered_state.attempts == {}' <<< "$output"
+    [[ ! -e "$TEST_TMPDIR/fallback.starts" ]]
+
+    before=$(cat "$DSR_STATE_DIR/triggered.json")
+    run --separate-stderr _routing_watch "$check_json" --dry-run --auto-fallback --confirm-polls 2
+    assert_equal 0 "$status"
+    assert_contains "$stderr" "Would trigger 1 fallback"
+    assert_equal "$before" "$(cat "$DSR_STATE_DIR/triggered.json")"
+    [[ ! -e "$TEST_TMPDIR/fallback.starts" ]]
+
+    run --separate-stderr _routing_watch "$check_json" --auto-fallback --confirm-polls 2
+    assert_equal 0 "$status"
+    _watch_completed
+    jq -e '.details | .awaiting_confirmation == 0 and .triggered_state.attempts["12345"].attempt == 1' <<< "$output"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+}
+
+@test "watch admission confirmation resets on reruns missing observations and cancellation" {
+    harness_create_config
+    _watch_configure_ntm
+    local first rerun
+    first=$(_watch_run_json)
+    rerun=$(jq '.details.throttled[0].run_attempt = 2' <<< "$first")
+    run --separate-stderr _routing_watch "$first" --auto-fallback --confirm-polls 2
+    assert_equal 0 "$status"
+    run --separate-stderr _routing_watch "$rerun" --auto-fallback --confirm-polls 2
+    assert_equal 0 "$status"
+    jq -e '.details.triggered_state.queue_samples["12345"] | .count == 1 and .identity.run_attempt == 2' <<< "$output"
+    run --separate-stderr _routing_watch '{"details":{"throttled":[]}}' --auto-fallback --confirm-polls 2
+    assert_equal 0 "$status"
+    jq -e '.details.triggered_state.queue_samples == null' <<< "$output"
+    run --separate-stderr _routing_watch "$rerun" --auto-fallback --confirm-polls 2
+    assert_equal 0 "$status"
+    DSR_WATCH_FIXTURE_CHECK_STATUS=5 run --separate-stderr _routing_watch "$rerun" --auto-fallback --confirm-polls 2
+    assert_equal 5 "$status"
+    run --separate-stderr _routing_watch "$rerun" --auto-fallback --confirm-polls 2
+    assert_equal 0 "$status"
+    jq -e '.details.triggered_state | .queue_samples["12345"].count == 1 and .attempts == {}' <<< "$output"
+    [[ ! -e "$TEST_TMPDIR/fallback.starts" ]]
+}
+
+@test "watch admission confirmation rejects invalid counts before preflight" {
+    local count
+    for count in 0 33 -1 1.5; do
+        run _routing_watch "$(_watch_run_json)" --confirm-polls "$count"
+        assert_equal 4 "$status"
+    done
+    [[ ! -e "$TEST_TMPDIR/watch-doctor.started" && ! -e "$DSR_STATE_DIR/watch.lock" ]]
+}
+
 @test "watch admission bounds active fallbacks across restarts and launches deferred runs after completion" {
     harness_create_config
     mkdir -p "$DSR_CONFIG_DIR/repos.d"

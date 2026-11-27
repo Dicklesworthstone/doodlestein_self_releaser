@@ -2138,6 +2138,10 @@ _watch_load_triggered() {
             (.head_sha | type == "string" and test("^[0-9a-f]{40}$"));
         if length == 1 and (.[0] | type == "object" and
             (.runs | type == "object" and all(.[]; type == "string")) and
+            ((.queue_samples // {}) | type == "object" and all(to_entries[];
+                (.key | test("^[1-9][0-9]{0,15}$")) and
+                (.value.identity | type == "object") and
+                (.value.count | integer and . >= 1 and . <= 32))) and
             ((.attempts // {}) | type == "object" and all(to_entries[];
                 (.key | test("^[1-9][0-9]{0,15}$")) and
                 (.value | type == "object" and
@@ -2873,6 +2877,19 @@ _watch_iteration() {
     active_count=$(jq '[.attempts[] | select(.status == "starting" or .status == "running")] | length' \
         <<< "$state") || return 4
 
+    # Consume the preceding poll's evidence before discovery. A killed,
+    # malformed or cancelled poll must break the streak across --once calls.
+    local previous_samples
+    previous_samples=$(jq -c '.queue_samples // {}' <<< "$state") || return 4
+    if $dry_run; then
+        previous_samples="${_WATCH_PREVIEW_SAMPLES:-$previous_samples}"
+        _WATCH_PREVIEW_SAMPLES='{}'
+    elif [[ "$previous_samples" != '{}' ]]; then
+        state=$(jq -c 'del(.queue_samples)' <<< "$state") || return 4
+        _watch_save_triggered "$state" || return 4
+    fi
+    _WATCH_CONFIRMING_COUNT=0
+
     log_info "Running throttle check..."
 
     # Run dsr check over every configured repo's release workflow. Carry the
@@ -2927,6 +2944,32 @@ _watch_iteration() {
         return 8
     fi
 
+    local samples='{}'
+    if ((_WATCH_CONFIRM_POLLS > 1)); then
+        # Bind a sample to the exact upstream attempt, source and threshold.
+        # Two rows for a run within one poll cannot confirm one another.
+        samples=$(printf '%s\n' "$previous_samples" "$check_output" | jq -cs '
+            .[0] as $before | .[1].details.throttled | group_by(.run_id | tostring) |
+            map(.[0] as $run |
+                (map({repo,tool,run_id,run_attempt,workflow_id,workflow_path,
+                      head_branch,head_sha,event,threshold_seconds}) | unique) as $identities |
+                select(($identities | length) == 1) |
+                ($run.run_id | tostring) as $id |
+                if ($id | test("^[1-9][0-9]{0,15}$") | not) then error("invalid run ID") else
+                    {key:$id, value:{identity:$identities[0],
+                     count:(if $before[$id].identity == $identities[0]
+                            then [32,$before[$id].count+1] | min else 1 end)}} end)
+            | from_entries') || return 8
+        _WATCH_CONFIRMING_COUNT=$(jq --argjson minimum "$_WATCH_CONFIRM_POLLS" \
+            '[.[] | select(.count < $minimum)] | length' <<< "$samples") || return 4
+        throttled_runs=$(jq -c --slurpfile samples /dev/fd/3 --argjson minimum "$_WATCH_CONFIRM_POLLS" '
+            .details.throttled[] | select($samples[0][.run_id | tostring].count >= $minimum)' \
+            <<< "$check_output" 3<<< "$samples") || return 8
+        if ((_WATCH_CONFIRMING_COUNT > 0)); then
+            log_info "Waiting for $_WATCH_CONFIRM_POLLS consecutive polls for $_WATCH_CONFIRMING_COUNT throttled run(s)"
+        fi
+    fi
+
     if $auto_fallback; then
         local terminal_retries include_pending=true
         # Waiting candidates cannot launch while every slot is occupied.
@@ -2938,8 +2981,16 @@ _watch_iteration() {
         fi
     fi
 
+    if $dry_run; then
+        _WATCH_PREVIEW_SAMPLES="$samples"
+    elif [[ "$samples" != '{}' ]]; then
+        state=$(jq -c --slurpfile samples /dev/fd/3 '.queue_samples = $samples[0]' \
+            <<< "$state" 3<<< "$samples") || return 4
+        _watch_save_triggered "$state" || return 4
+    fi
+
     if [[ -z "$throttled_runs" ]]; then
-        if [[ $iteration_exit -eq 0 ]]; then
+        if [[ $iteration_exit -eq 0 && $_WATCH_CONFIRMING_COUNT -eq 0 ]]; then
             log_ok "No throttled runs detected"
         fi
         return "$iteration_exit"
@@ -2958,9 +3009,14 @@ _watch_iteration() {
     # Process new throttled runs and source-verified terminal recovery candidates.
     local run run_id repo tool_name ref sha record pending_record bound_record workflow_path
     local attempt resume outcome next_retry isolate_source retry_reason completion_exit watch_admission workflow_event
+    local -A seen_run_ids=()
     while IFS= read -r run; do
         run_id=$(jq -r '.run_id // empty | tostring' <<< "$run")
         [[ "$run_id" =~ ^[1-9][0-9]{0,15}$ ]] || { log_error "Invalid throttled run ID"; return 8; }
+        if ((_WATCH_CONFIRM_POLLS > 1)); then
+            [[ -z "${seen_run_ids[$run_id]:-}" ]] || continue
+            seen_run_ids[$run_id]=1
+        fi
         repo=$(jq -r '.repo // ""' <<< "$run")
         tool_name=$(jq -r '.tool // ""' <<< "$run")
         ref=$(jq -r '.head_branch // ""' <<< "$run")
@@ -3155,6 +3211,7 @@ cmd_watch() {
     local _WATCH_LOCK_FD="" _WATCH_RUNNING=false
     local _WATCH_MAX_ATTEMPTS=3 _WATCH_RETRY_DELAY=60
     local _WATCH_MAX_CONCURRENT=2 _WATCH_DEFERRED_COUNT=0
+    local _WATCH_CONFIRM_POLLS=1 _WATCH_CONFIRMING_COUNT=0 _WATCH_PREVIEW_SAMPLES=""
     local _WATCH_PARALLEL_JOBS=1 _WATCH_PRERELEASE=false
     local interval=$_WATCH_DEFAULT_INTERVAL
     local daemon_mode=false
@@ -3195,12 +3252,13 @@ cmd_watch() {
                 _WATCH_PARALLEL_JOBS="$2"
                 shift 2
                 ;;
-            --max-attempts|--retry-delay|--max-concurrent)
+            --max-attempts|--retry-delay|--max-concurrent|--confirm-polls)
                 [[ $# -ge 2 ]] || { log_error "$1 requires a value"; return 4; }
                 case "$1" in
                     --max-attempts) _WATCH_MAX_ATTEMPTS="$2" ;;
                     --retry-delay) _WATCH_RETRY_DELAY="$2" ;;
                     --max-concurrent) _WATCH_MAX_CONCURRENT="$2" ;;
+                    --confirm-polls) _WATCH_CONFIRM_POLLS="$2" ;;
                 esac
                 shift 2
                 ;;
@@ -3235,6 +3293,7 @@ USAGE:
 OPTIONS:
     --interval, -i <sec>   Poll interval in seconds (default: 60)
     --auto-fallback        Start `dsr fallback` for each throttled release run
+    --confirm-polls <N>    Require 1-32 consecutive stalled polls (default: 1)
     --prerelease           Require prerelease publication for automatic fallbacks
     --max-attempts <N>     Maximum fallback attempts per run (1-10, default: 3)
     --retry-delay <sec>    Initial retry cooldown (1-3600, default: 60)
@@ -3329,6 +3388,10 @@ EOF
         log_error "Watch requires 1-32 concurrent fallbacks"
         return 4
     fi
+    if [[ ! "$_WATCH_CONFIRM_POLLS" =~ ^([1-9]|[12][0-9]|3[0-2])$ ]]; then
+        log_error "Watch requires 1-32 consecutive confirmation polls"
+        return 4
+    fi
     # Validate text before arithmetic, preflight, locks or child launch. An
     # inherited build default applies only when bare --parallel selects it.
     if [[ ! "$_WATCH_PARALLEL_JOBS" =~ ^([1-9]|[12][0-9]|3[0-2])$ ]]; then
@@ -3409,6 +3472,8 @@ EOF
                 --argjson auto_fallback "$auto_fallback" \
                 --argjson dry_run "$dry_run" \
                 --argjson max_concurrent "$_WATCH_MAX_CONCURRENT" \
+                --argjson confirm_polls "$_WATCH_CONFIRM_POLLS" \
+                --argjson confirming "$_WATCH_CONFIRMING_COUNT" \
                 --argjson parallel_jobs "$_WATCH_PARALLEL_JOBS" \
                 --argjson prerelease "$_WATCH_PRERELEASE" \
                 --argjson deferred "$_WATCH_DEFERRED_COUNT" '
@@ -3420,7 +3485,8 @@ EOF
                      active_attempts:([($state.attempts // {})[] |
                         select(.status == "starting" or .status == "running")] | length)}
                  else {mode:$mode, iterations:$iterations, triggered_state:$state} end) +
-                {parallel_jobs:$parallel_jobs,prerelease_requested:$prerelease} |
+                {parallel_jobs:$parallel_jobs,prerelease_requested:$prerelease,
+                 confirm_polls:$confirm_polls,awaiting_confirmation:$confirming} |
                 if $error == "" then . else . + {error:$error} end' <<< "$state"); then
             result=4
             log_error "Cannot assemble watcher result"

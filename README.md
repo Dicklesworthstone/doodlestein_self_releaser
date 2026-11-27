@@ -1564,6 +1564,7 @@ Continuous monitoring daemon.
 ```bash
 dsr watch                                       # Default: check every 60s
 dsr watch --interval 30 --auto-fallback         # Auto-trigger on throttle
+dsr watch --auto-fallback --confirm-polls 3     # Require three consecutive stalled polls
 dsr watch --auto-fallback --max-concurrent 4    # Admit up to four fallback pipelines
 dsr watch --auto-fallback --max-concurrent 2 --jobs 4  # Four target builds per release
 dsr watch --auto-fallback --prerelease         # Publish automatic fallbacks as prereleases
@@ -1575,6 +1576,15 @@ throttled release run once. With it, each run starts one `dsr fallback` for
 the repo's configured tool at the run's version tag; repos with no dsr tool
 are reported, never guessed. `dsr --dry-run watch --auto-fallback` shows which
 fallbacks would start.
+
+Use `--confirm-polls N` (1–32, default 1) to wait for the same upstream
+workflow attempt, source commit and queue threshold to appear stalled in N
+consecutive polls before reporting it, notifying, or scheduling a fallback.
+Timer-driven `--once` invocations share confirmation history with continuous
+watchers. A missing run, unreadable poll or interrupted check breaks the streak.
+Previews can use prior evidence without advancing the saved count. JSON
+reports the number of runs still waiting in `details.awaiting_confirmation`.
+Recovery from a confirmed terminal upstream failure uses its own exact-run check.
 
 Before monitoring, the complete `doctor --quick` preflight has one
 `GH_API_TIMEOUT` deadline (60 seconds by default), including dependency
