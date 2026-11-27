@@ -1154,6 +1154,13 @@ def test_fallback_recovery(pagination_only=False, prerelease_only=False, interru
 
     if draft_only:
         options=['--draft','--prerelease']
+        fresh,env,output=prepare('review-new')
+        result,rows=invoke_fallback(fresh,env,output,extra=options)
+        check('fresh strict draft completes with all assets and no publication request',
+              result.returncode==0 and json.loads(result.stdout)['details']['release']['draft'] is True and
+              json.loads((fresh/'remote.json').read_text())['draft'] is True and
+              len([row for row in rows if '--post' in row])==1 and
+              not any('--method' in row for row in rows))
         c,env,output,recovery=interrupt_upload('review-draft',options=options)
         response=Path(recovery['create_response'])
         original=response.read_bytes()
@@ -1177,8 +1184,28 @@ def test_fallback_recovery(pagination_only=False, prerelease_only=False, interru
         check('retry of complete draft verifies without building, uploading, or promoting',
               result.returncode==0 and not mutations(rows) and response.read_bytes()==original and
               (c/'build-calls').read_text().splitlines().count('build')==1)
-        remote=json.loads((c/'remote.json').read_text());remote['draft']=False
-        (c/'remote.json').write_text(json.dumps(remote))
+        handoff=json.loads(result.stdout)['details']['publication_recovery']
+        earlier=requests(c)
+        finalized=subprocess.run(['bash','-c',script,'fixture','public-finalize','app','1.2.3',
+                                  '--create-response',handoff['create_response'],'--no-dispatch'],
+                                 env=dict(env,TMPDIR=handoff['finalization_tmpdir']),capture_output=True,text=True)
+        (c/'review-finalize.stdout').write_text(finalized.stdout)
+        (c/'review-finalize.stderr').write_text(finalized.stderr)
+        check('public finalizer accepts the original review handoff',finalized.returncode==0)
+        envelope=json.loads(finalized.stdout)
+        receipt=json.loads(Path(envelope['details']['receipt']).read_text())
+        changes=mutations(requests(c)[len(earlier):])
+        remote=json.loads((c/'remote.json').read_text())
+        expected={a['name']:a['sha256'] for a in receipt['plan']['assets']}
+        actual={a['name']:hashlib.sha256((c/'bytes'/str(a['id'])).read_bytes()).hexdigest() for a in remote['assets']}
+        check('only the explicit finalizer promotes the same ID and exact verified release bytes',
+              envelope['command']=='release-finalize' and envelope['status']=='success' and
+              envelope['details']['release_id']==remote['id']==json.loads(original)['id']==9 and
+              remote['draft'] is False and remote['prerelease'] is True and actual==expected and
+              response.read_bytes()==original and not any('--method' in entry for entry in earlier) and
+              len(changes)==1 and changes[0][0]=='repos/owner/app/releases/9' and
+              changes[0][changes[0].index('--method')+1]=='PATCH' and
+              json.loads(changes[0][changes[0].index('--data')+1])['draft'] is False)
         result,rows=invoke_fallback(c,env,output,True,options,label='unexpected-public')
         check('externally published release cannot satisfy a private draft retry',
               result.returncode!=0 and not mutations(rows) and response.read_bytes()==original)
