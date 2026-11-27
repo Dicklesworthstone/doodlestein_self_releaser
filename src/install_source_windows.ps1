@@ -646,9 +646,18 @@ function Get-DsrGoWorkspaceVendor {
 
 function Get-DsrGoModuleContext {
     param([string]$Source, [string]$BuildRoot, [string[]]$Files, $GoBase, [string]$Logs)
-    $location = Resolve-DsrGoSourceModule $Source $BuildRoot '.' $Files
+    # Go resolves the nearest module above its working package. Stop at the
+    # pinned checkout and admit its manifest before resolving dependencies.
+    $moduleRoot = $BuildRoot
+    while ($true) {
+        $manifest = Get-DsrPlainPath ([IO.Path]::Combine($moduleRoot, 'go.mod'))
+        if ([IO.File]::Exists($manifest) -or [IO.Directory]::Exists($manifest)) { break }
+        if ($moduleRoot -ceq $Source) { Stop-DsrInstall 'No go.work or go.mod within the fetched checkout' 4 }
+        $moduleRoot = [IO.Path]::GetDirectoryName($moduleRoot)
+    }
+    $location = Resolve-DsrGoSourceModule $Source $moduleRoot '.' $Files
     $module = Read-DsrGoSourceModule $location $GoBase $Logs 0
-    $vendor = Get-DsrPlainPath ([IO.Path]::Combine($BuildRoot, 'vendor'))
+    $vendor = Get-DsrPlainPath ([IO.Path]::Combine($moduleRoot, 'vendor'))
     $vendorMode = [IO.Directory]::Exists($vendor)
     $vendorHash = ''
     if ($vendorMode) {
@@ -673,7 +682,7 @@ function Get-DsrGoModuleContext {
             # Admission does not resolve an external dependency graph merely
             # to prove a declaration unused. Every main-module local rule must
             # stay within the selected commit, as it does for a Go workspace.
-            $location = Resolve-DsrGoSourceModule $Source $BuildRoot $rule.replacement $Files
+            $location = Resolve-DsrGoSourceModule $Source $moduleRoot $rule.replacement $Files
             if ($replacementModules.ContainsKey($location.path)) { $selected = $replacementModules[$location.path] }
             else {
                 $selected = Read-DsrGoSourceModule $location $GoBase $Logs $moduleIndex

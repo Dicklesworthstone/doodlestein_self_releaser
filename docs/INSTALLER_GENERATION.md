@@ -1120,7 +1120,13 @@ Bash and native Windows source installers support tools whose commands depend on
 modules through a committed `go.work`. Starting at `source_subdir`, the installer
 selects the nearest `go.work` within the fetched repository. A workspace outside
 that checkout, including the caller's `GOWORK`, cannot select source inputs.
-Without a selected workfile, the existing standalone-module behavior applies.
+Without a selected workfile, the installer searches upwards from `source_subdir`
+to the checkout root for the nearest `go.mod`. For example, a tool can use
+`source_subdir: project/cmd/app` when its module lives in `project/go.mod`.
+The build runs from the configured package directory. The selected module
+directory supplies the base for local replacements and the module vendor tree.
+The manifest must be a committed regular file. The source receipt records its
+repository-relative directory and manifest digest under `source.go_module`.
 
 For example, this repository layout needs no `replace` directives in the
 application's `go.mod`:

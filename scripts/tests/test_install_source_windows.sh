@@ -2225,6 +2225,25 @@ def test_go_module_replacements():
               "go_mod_sha256": digest(module_upstream / "shared/go.mod")}] and
           module_receipt.get("vendor") is False and "go_workspace" not in details["source"] and
           str(root) not in json.dumps(module_receipt), json.dumps(module_receipt))
+    config("module-command", local_path=str(module_upstream), source_subdir="project/apps/primary",
+        source_entry="", workspace_binaries=[], workspace_binaries_by_target={})
+    nested_generated, nested_runtime, _ = generate("module-command", "module-generate-nested")
+    check("a package-directory installer generates through the public CLI", nested_generated.returncode == 0,
+          nested_generated.stderr.decode(errors="replace"))
+    if nested_generated.returncode:
+        return
+
+    def nested_install(label, reference, marker, receipt):
+        result, evidence, case = run(label, selected_runtime=nested_runtime, reference=reference)
+        exe = Path(case["parameters"]["Prefix"]) / "app.exe"
+        rows = evidence.get("binaries", [])
+        check(label + " builds the nested Windows executable with the module-root inputs",
+              result.returncode == 0 and len(rows) == 1 and exe.is_file() and machine(exe) == 0x8664 and
+              rows[0]["sha256"] == digest(exe) and marker.encode() in exe.read_bytes() and
+              evidence.get("source", {}).get("go_module") == receipt and no_http(case),
+              result.stderr.decode(errors="replace"))
+
+    nested_install("module-command-local", pinned_commit, "pinned-ordinary-module", module_receipt)
     arm, arm_details, arm_fixture = run("module-local-arm64", reference=pinned_commit, platform="windows/arm64")
     check("ordinary local module closure also compiles the selected ARM64 companion family",
           arm.returncode == 0 and installed_marker(arm_details, arm_fixture, "pinned-ordinary-module", 0xAA64) and
@@ -2302,6 +2321,7 @@ def test_go_module_replacements():
           vendor_receipt.get("vendor_modules_sha256") == digest(module_upstream / "project/vendor/modules.txt") and
           all("-mod=vendor" in row["arguments"] for row in calls(vendor_fixture) if row["arguments"][0] in ("list", "build")),
           vendored.stderr.decode(errors="replace"))
+    nested_install("module-command-vendor", vendor_commit, vendor_marker, vendor_receipt)
     vendor_manifest = (module_upstream / "project/vendor/modules.txt").read_text()
     write_files({"project/vendor/modules.txt": vendor_manifest.replace("v0.0.0", "v9.0.0")})
     invalid_vendor_commit = commit("module-inconsistent-vendor")

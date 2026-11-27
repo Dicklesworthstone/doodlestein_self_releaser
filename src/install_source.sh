@@ -1139,7 +1139,7 @@ _isb_source_committed_file() {
 # eventual Go invocation will use. Never inspect an ambient parent workspace.
 # Go itself still parses the complete file after a compiler is available.
 _isb_go_requirements() (
-    local root="$1" tree="$2" cursor="$2" relative selected=''
+    local root="$1" tree="$2" cursor="$2" relative selected='' module=''
     relative="${tree#"$root"/}"; [[ "$tree" != "$root" ]] || relative=.
     _isb_go_directory "$root" "$root" "$relative" >/dev/null 2>&1 || {
         _isb_log 'Go build directory escapes the fetched checkout'; return 4;
@@ -1149,10 +1149,14 @@ _isb_go_requirements() (
             selected="$cursor/go.work"
             break
         fi
+        if [[ -z "$module" && ( -e "$cursor/go.mod" || -L "$cursor/go.mod" ) ]]; then
+            module="$cursor/go.mod"
+        fi
         [[ "$cursor" != "$root" ]] || break
         cursor="${cursor%/*}"
     done
-    [[ -n "$selected" ]] || selected="$tree/go.mod"
+    [[ -n "$selected" ]] || selected="$module"
+    [[ -n "$selected" ]] || { _isb_log 'No go.work or go.mod within the fetched checkout'; return 4; }
     _isb_source_committed_file "$root" "$selected" >/dev/null || {
         _isb_log "The selected ${selected##*/} must be an unchanged committed regular file"; return 4;
     }
@@ -1194,8 +1198,8 @@ _isb_go_context() (
         documents+=("$output/go-workspace.log"); scopes+=("$work_dir")
     fi
     if [[ -z "$work" ]]; then
-        module_roots=("$tree")
-        work_dir="$tree"
+        work_dir="${requirements%/*}"
+        module_roots=("$work_dir")
     elif [[ -e "$work.sum" || -L "$work.sum" ]]; then
         _isb_source_committed_file "$root" "$work.sum" >/dev/null || {
             _isb_log 'go.work.sum must be an unchanged committed regular file'; return 4;
@@ -1238,7 +1242,9 @@ _isb_go_context() (
         if [[ -z "$work" ]]; then
             # Preserve standalone module vendoring, including legacy vendor
             # directories without a modules.txt when Go itself admits them.
-            [[ ! -e "$document" ]] || _isb_source_committed_file "$root" "$document" >/dev/null || return 4
+            if [[ -e "$document" ]]; then
+                vendor_hash=$(_isb_source_committed_file "$root" "$document") || return 4
+            fi
             vendor=true; mod=vendor
         elif [[ -f "$document" ]] && head -c 512 "$document" | jq -eRs '
             split("\n")[0] | if startswith("## ") then .[3:] | split(";") |
@@ -1322,9 +1328,11 @@ _isb_go_context() (
     jq -nc --arg work "${work:-off}" --arg path "$relative" --arg hash "$work_hash" --arg mod "$mod" \
         --argjson vendor "$vendor" --arg vendor_hash "$vendor_hash" --slurpfile modules "$output/go-modules.jsonl" \
         --slurpfile replacements "$output/go-replacements.jsonl" \
-        '{gowork:$work,mod:$mod,go_workspace:(if $work == "off" then null else
-          {path:$path,sha256:$hash,modules:$modules,local_replacements:$replacements,vendor:$vendor} +
-          (if $vendor then {vendor_modules_sha256:$vendor_hash} else {} end) end)}' \
+        '({local_replacements:$replacements,vendor:$vendor} +
+          (if $vendor_hash != "" then {vendor_modules_sha256:$vendor_hash} else {} end)) as $evidence |
+         {gowork:$work,mod:$mod} +
+          (if $work == "off" then {go_module:($modules[0] + $evidence)}
+           else {go_workspace:({path:$path,sha256:$hash,modules:$modules} + $evidence)} end)' \
         > "$output/go-context.json"
 )
 
@@ -1963,7 +1971,7 @@ _isb_compile() (
             export GOENV=off GOWORK=off GOTOOLCHAIN=local GOFLAGS='' GO111MODULE=on GOTELEMETRY=off
             local go_requirements
             go_requirements=$(_isb_go_requirements "${_ISB_CHECKOUT_ROOT:-$tree}" "$tree") || return $?
-            _isb_prepare_toolchain "$language" "$tree" "$output" "$limit" "$go_requirements" || return $?
+            _isb_prepare_toolchain "$language" "${go_requirements%/*}" "$output" "$limit" "$go_requirements" || return $?
             # Build for this installer host, not an inherited cross target.
             export GOOS='' GOARCH=''
             _isb_run "$limit" "$output/compiler.log" go version || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
@@ -2242,6 +2250,7 @@ install_source_build() (
             cargo_no_default_features:$cargo_no_default_features} else {} end) +
           (if $toolchain == null then {} else {toolchain:$toolchain} end) +
           (if $go_context[0].go_workspace == null then {} else {go_workspace:$go_context[0].go_workspace} end) +
+          (if $go_context[0].go_module == null then {} else {go_module:$go_context[0].go_module} end) +
           ($bun_context[0] // {}) +
           (if $rch_context[0] == null then {} else {rch_delivery:($rch_context[0] + {local_rustc_probe:$compiler})} end) +
           (if ($submodules | length) == 0 then {} else {submodules:$submodules} end)' <<< "$_ISB_SOURCE_GRAPH") || return 1

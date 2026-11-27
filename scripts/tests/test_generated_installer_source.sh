@@ -10,8 +10,9 @@ ROOT="${DSR_TEST_ROOT:-$ROOT}"
 TEST_MODE="${1:-}"
 [[ $# -eq 0 || ( $# -eq 1 && ( "$TEST_MODE" == --go-workspace-bootstrap-only ||
     "$TEST_MODE" == --libc-source-fallback-only || "$TEST_MODE" == --acquisition-fallback-only ||
-    "$TEST_MODE" == --github-timeout-only || "$TEST_MODE" == --source-verification-timeout-only ) ) ]] || {
-    printf 'Usage: %s [--go-workspace-bootstrap-only|--libc-source-fallback-only|--acquisition-fallback-only|--github-timeout-only|--source-verification-timeout-only]\n' "$0" >&2
+    "$TEST_MODE" == --github-timeout-only || "$TEST_MODE" == --source-verification-timeout-only ||
+    "$TEST_MODE" == --go-module-subdir-only ) ) ]] || {
+    printf 'Usage: %s [--go-workspace-bootstrap-only|--go-module-subdir-only|--libc-source-fallback-only|--acquisition-fallback-only|--github-timeout-only|--source-verification-timeout-only]\n' "$0" >&2
     exit 4
 }
 for dependency in git jq go tar; do
@@ -440,6 +441,61 @@ workspace_binary_receipt() {
         [.source.binaries[] | select(.name == $name and .sha256 == $digest and (has("path") | not))] | length == 1
     ' "$CASE/out.json" >/dev/null
 }
+
+test_go_module_subdir() (
+    local passed=0 failed=0 source="$TEMP/module-source" pin hash
+    export GIT_CONFIG_GLOBAL="$TEMP/module-gitconfig" DSR_CONFIG_DIR="$TEMP/module-config"
+    local _IG_OUTPUT_DIR="$TEMP/module-installers"
+    export GOPROXY=off GOSUMDB=off
+    mkdir -p "$DSR_CONFIG_DIR/repos.d" || return 1
+    "$GIT_REAL" clone -q --no-local "$TEMP/upstream" "$source" || return 1
+    "$GIT_REAL" -C "$source" config user.name 'DSR test'
+    "$GIT_REAL" -C "$source" config user.email 'nested@example.invalid'
+    "$GIT_REAL" config --file "$GIT_CONFIG_GLOBAL" url."file://$source".insteadOf https://github.com/example/source-app.git
+    printf 'invalid outer module\n' > "$source/go.mod"
+    mkdir "$source/shared" || return 1
+    printf 'module example.invalid/shared\n\ngo 1.20\n' > "$source/shared/go.mod"
+    printf 'package shared\nconst Value = "pinned module"\n' > "$source/shared/shared.go"
+    printf 'require example.invalid/shared v0.0.0\nreplace example.invalid/shared => ../shared\n' >> "$source/project/go.mod"
+    printf 'package main\nimport ("fmt"; "example.invalid/shared")\nfunc main() {fmt.Println(shared.Value)}\n' \
+        > "$source/project/cmd/app/main.go"
+    "$GIT_REAL" -C "$source" add . && "$GIT_REAL" -C "$source" commit -qm 'Nested command with a local module dependency' || return 1
+    "$GIT_REAL" -C "$source" tag v4.0.0 || return 1
+    pin=$("$GIT_REAL" -C "$source" rev-parse HEAD) || return 1
+    hash=$(_isb_sha256 "$source/project/go.mod") || return 1
+    cat > "$DSR_CONFIG_DIR/repos.d/app.yaml" <<'YAML'
+tool_name: app
+repo: example/source-app
+binary_name: app
+language: go
+source_subdir: project/cmd/app
+YAML
+    INSTALLER=$(install_gen_create app --config-dir "$DSR_CONFIG_DIR") || return 1
+    run_case module-command discovery-fail --from-source --version v4.0.0 --install-toolchain
+    check 'nested command installs from the pinned tag' source_json "$pin"
+    check 'nested command uses the nearest module and its relative replacement' workspace_binary_runs "$CASE/install/app" 'pinned module'
+    check 'receipt binds the selected module and its in-checkout replacement' jq -e --arg sha "$hash" '
+        .source.go_module | .path == "project" and .go_mod_sha256 == $sha and .vendor == false and
+        [.local_replacements[].path] == ["shared"]' "$CASE/out.json"
+    (cd "$source/project" && GOENV=off GOWORK=off "$GO_REAL" mod vendor) || return 1
+    "$GIT_REAL" -C "$source" mv shared retained-dependency || return 1
+    "$GIT_REAL" -C "$source" add project/vendor && "$GIT_REAL" -C "$source" commit -qm 'Self-contained committed module vendor tree' || return 1
+    run_case module-command-vendor discovery-fail --from-source
+    check 'nested command can build solely from its module-root vendor tree' workspace_binary_runs "$CASE/install/app" 'pinned module'
+    check 'module receipt records the selected vendor inventory' jq -e \
+        --arg sha "$(_isb_sha256 "$source/project/vendor/modules.txt")" '
+        .source.go_module | .vendor and .vendor_modules_sha256 == $sha and .local_replacements == []' "$CASE/out.json"
+    mkdir -p "$source/project/cmd/app/go.mod" "$TEMP/results/module-command-invalid/install"
+    printf 'invalid metadata object\n' > "$source/project/cmd/app/go.mod/entry"
+    "$GIT_REAL" -C "$source" add project/cmd && "$GIT_REAL" -C "$source" commit -qm 'Invalid nearest manifest' || return 1
+    printf 'previous executable\n' > "$TEMP/results/module-command-invalid/install/app"
+    run_case module-command-invalid discovery-fail --from-source --yes
+    check 'invalid nearest manifest prevents fallback to a higher module' equal "$status" 4
+    check 'refused module leaves previous executable intact' grep -Fxq 'previous executable' "$CASE/install/app"
+    check 'refused module stops before package lookup and build' bash -c '! grep -Eq "^go (list|build) " "$1"' _ "$CALLS"
+    printf 'Nested module source tests: %s passed, %s failed\n' "$passed" "$failed"
+    [[ "$failed" == 0 ]]
+)
 
 test_workspace_bootstrap() {
     # The configured executable family needs the real YAML parser. Preserve
@@ -1108,6 +1164,11 @@ if [[ "$TEST_MODE" == --go-workspace-bootstrap-only ]]; then
     exit $?
 fi
 
+if [[ "$TEST_MODE" == --go-module-subdir-only ]]; then
+    test_go_module_subdir
+    exit $?
+fi
+
 if [[ "$TEST_MODE" == --libc-source-fallback-only ]]; then
     test_libc_source_fallback || exit 1
     printf 'Generated libc source fallback: %s passed, %s failed\n' "$passed" "$failed"
@@ -1119,6 +1180,7 @@ test_github_acquisition_deadlines || exit 1
 test_source_verification_deadlines || exit 1
 test_acquisition_source_fallback || exit 1
 test_libc_source_fallback || exit 1
+test_go_module_subdir || exit 1
 
 run_case force-head discovery-fail --from-source --source-timeout 60
 check 'forced source works without release discovery' equal "$status" 0
