@@ -519,6 +519,17 @@ _isb_capture_source_graph() (
 
 _isb_in_dir() ( cd "$1" && shift && "$@" )
 
+# Keep compiler protocol output separate from download notices and warnings.
+# _isb_run owns stderr, deadlines and the complete command process group; this
+# adapter changes only stdout and preserves the command's exit status.
+_isb_capture_stdout() (
+    local destination="$1"
+    shift
+    [[ ! -e "$destination" && ! -L "$destination" ]] || return 4
+    set -o noclobber
+    "$@" > "$destination"
+)
+
 # Shared by Git source checkout, release acquisition and freshness in generated
 # installers, and usable when this source module is loaded alone. Match DSR's token order;
 # gh otherwise prefers GH_TOKEN and may inherit an unrelated enterprise host.
@@ -1803,7 +1814,7 @@ _isb_compile() (
     _isb_cargo_features_valid ${features[@]+"${features[@]}"} || return 4
     [[ "$language" == rust || "$cargo_selection" == false ]] || return 4
     ((${#binaries[@]})) || binaries=("$binary")
-    local status=0 host target name mod=readonly resolved_entries selected_entry index log
+    local status=0 host target name mod=readonly resolved_entries selected_entry index log package_output package_name
     cd "$tree" || return 4
     binary=$(_isb_binary_name "$binary") || return 4
     case "$language" in
@@ -1971,10 +1982,13 @@ _isb_compile() (
             for index in "${!entries[@]}"; do
                 log="$output/package.log"
                 ((${#entries[@]} == 1)) || log="$output/package-$index.log"
-                _isb_run "$limit" "$log" go list "-mod=$mod" -f '{{.Name}}' "./${entries[$index]}" || {
+                package_output="${log%.log}.stdout"
+                _isb_run "$limit" "$log" _isb_capture_stdout "$package_output" \
+                    go list "-mod=$mod" -f '{{.Name}}' "./${entries[$index]}" || {
                     status=$?; [[ $status == 5 ]] && return 5; return 6;
                 }
-                [[ "$(cat "$log")" == main ]] || {
+                package_name=$(cat -- "$package_output") || return 6
+                [[ "$package_name" == main ]] || {
                     _isb_log "Requested Go package is not one executable: ${binaries[$index]} (${entries[$index]})"; return 6;
                 }
             done

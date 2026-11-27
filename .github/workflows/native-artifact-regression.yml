@@ -31,6 +31,7 @@ on:
       - scripts/tests/test_generated_installer_private.sh
       - scripts/tests/test_generated_workspace_installer.sh
       - scripts/tests/test_install_source.sh
+      - scripts/tests/test_install_source_go_downloads.sh
       - scripts/tests/test_install_source_submodules.sh
       - installers/bv/install.sh
       - installers/cass/install.sh
@@ -492,6 +493,7 @@ jobs:
           go version
           bun --version
           bash -n src/install_source.sh
+          timeout 120 bash scripts/tests/test_install_source_go_downloads.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/source-go-downloads.log"
           bash scripts/tests/test_install_source.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/source-engine.log"
           bash scripts/tests/test_install_source_family.sh --bun-contracts-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/bun-family-contracts.log"
           bash scripts/tests/test_install_source_family.sh --bun-workspaces-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/bun-workspaces.log"
