@@ -13849,8 +13849,9 @@ EOF
             release_json=""
         fi
     else
-        release_json=$(gh_api "repos/$repo/releases/tags/$tag" 2>/dev/null) || {
+        release_json=$(gh_api "repos/$repo/releases/tags/$tag" --no-cache 2>/dev/null) || {
             if _release_contract_report_interruption "$?" release-verify verification "$repo" "$tag"; then return 5; fi
+            release_json=""
         }
     fi
     if [[ -z "$release_json" ]] || ! echo "$release_json" | jq -e '.id' &>/dev/null; then
@@ -13902,14 +13903,35 @@ EOF
 
     # Get release assets
     local assets_json
-    assets_json=$(echo "$release_json" | jq -c '.assets // []')
+    if $release_contract_enabled; then
+        # Strict verification independently binds the complete inventory below.
+        assets_json=$(jq -c '.assets // []' <<< "$release_json") || return 7
+    else
+        # GitHub can truncate the embedded array. Discover ordinary payloads
+        # by the selected release ID before reporting or planning any repair.
+        local inventory_status=0
+        if ! jq -es --arg tag "$tag" 'length == 1 and (.[0] | .tag_name == $tag and
+                (.id | type == "number" and . > 0 and . <= 9007199254740991 and . == floor))' \
+                <<< "$release_json" >/dev/null; then
+            log_error "Release metadata does not identify the requested tag $tag"
+            $JSON_MODE && json_envelope release-verify error 7 '{"error":"Release tag mismatch"}'
+            return 7
+        fi
+        assets_json=$(gh_release_asset_inventory "$repo" "$release_id") || inventory_status=$?
+        if ((inventory_status != 0)); then
+            if _release_contract_report_interruption "$inventory_status" release-verify verification "$repo" "$tag"; then return 5; fi
+            log_error "Could not verify the complete asset inventory for release $release_id"
+            $JSON_MODE && json_envelope release-verify error "$inventory_status" '{"error":"Complete release asset inventory unavailable"}'
+            return "$inventory_status"
+        fi
+    fi
     local asset_count
-    asset_count=$(echo "$assets_json" | jq 'length')
+    asset_count=$(jq 'length' <<< "$assets_json") || return 7
 
     log_info "Release has $asset_count asset(s)"
 
     # Load build manifest if available
-    local manifest_exists=false
+    local manifest_exists=false ordinary_names=""
     local expected_assets=()
     local release_contract_plan='{}'
     local strict_tag_ruleset_receipt='null'
@@ -13975,7 +13997,7 @@ EOF
         log_info "Using manifest: $manifest_file"
         # A legacy row may use filename alongside modern rows using name.
         # Validate the complete inventory before using any part of its output.
-        local ordinary_names permit_empty=false
+        local permit_empty=false
         # Real repair reports an empty inventory through its existing manifest
         # preflight and structured repair errors, including zero planned uploads.
         if $fix_missing && ! ${DRY_RUN:-false}; then permit_empty=true; fi
@@ -14004,6 +14026,21 @@ EOF
         done <<< "$ordinary_names"
     else
         log_warn "No manifest found - cannot verify completeness"
+    fi
+
+    if ! $release_contract_enabled; then
+        # An unfinished upload cannot satisfy a required name or be repaired
+        # by issuing a duplicate POST. Unrelated unfinished rows do not hide
+        # complete payloads and do not count as available downloads.
+        if ! assets_json=$(jq -ce --rawfile required /dev/fd/3 '
+            ($required | split("\n") | map(select(length > 0)) | INDEX(.)) as $required |
+            if any(.[]; .state == "starter" and (.name as $name | $required | has($name)))
+            then error("required release asset is unfinished") else map(select(.state == "uploaded")) end
+        ' 3<<< "$ordinary_names" <<< "$assets_json"); then
+            log_error "Could not verify uploaded assets against the selected manifest"
+            $JSON_MODE && json_envelope release-verify error 7 '{"error":"Required release assets unavailable"}'
+            return 7
+        fi
     fi
 
     # Build verification report
@@ -14482,44 +14519,6 @@ EOF
                     "${repair_shas[$name]}" "$asset" "$work" >/dev/null
             )
 
-            _release_ordinary_repair_inventory() {
-                local page=1 response count inventory='[]' request_status
-                while ((page <= 100)); do
-                    if response=$(gh_api "repos/$repo/releases/$release_id/assets?per_page=100&page=$page" \
-                        --no-cache); then :; else
-                        request_status=$?
-                        if _gh_operation_interrupted "$request_status"; then return "$request_status"; fi
-                        return 1
-                    fi
-                    if ! jq -es '
-                        length == 1 and (.[0] | type == "array" and length <= 100 and
-                            all(.[]; type == "object" and
-                                (.id | type == "number" and floor == . and . > 0 and
-                                    . <= 9007199254740991) and
-                                (.name | type == "string" and length > 0 and
-                                    (test("[[:cntrl:]]") | not))))
-                    ' <<< "$response" >/dev/null; then
-                        return 1
-                    fi
-                    count=$(jq -r 'length' <<< "$response") || return 1
-                    # Feed growing JSON through stdin, never an external
-                    # command argument. Preserve one complete observation for
-                    # every required name instead of mixing repeated scans.
-                    inventory=$(printf '%s\n%s\n' "$inventory" "$response" |
-                        jq -cs '.[0] + .[1]') || return 1
-                    if ((count < 100)); then
-                        jq -ce '
-                            select((([.[].id] | unique | length) == length) and
-                                   (([.[].name] | unique | length) == length))
-                        ' <<< "$inventory" || return 1
-                        return 0
-                    fi
-                    page=$((page + 1))
-                done
-                # A full final page cannot prove that pagination ended.
-                return 1
-            }
-
             if ! repair_identity=$(_release_ordinary_repair_identity "$release_json") ||
                ! repair_upload_url=$(jq -er '.upload_url' <<< "$repair_identity") ||
                [[ -z "$repair_manifest_sha" ]] ||
@@ -14573,7 +14572,7 @@ EOF
                 present_assets=()
                 missing_assets=()
                 repair_status=0
-                repair_inventory=$(_release_ordinary_repair_inventory) || repair_status=$?
+                repair_inventory=$(gh_release_asset_inventory "$repo" "$release_id") || repair_status=$?
                 if ((repair_status != 0)); then
                     if _release_contract_report_interruption "$repair_status" release-verify verification "$repo" "$tag"; then return 5; fi
                     ordinary_repair_errors+=("Could not read a complete, unambiguous remote asset inventory after repair")

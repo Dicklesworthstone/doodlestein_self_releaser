@@ -86,6 +86,8 @@ if args[:2]==['auth','token']:
 if args[:2]==['auth','status']:sys.exit(0 if identity==spec['selected'] else 1)
 if args and args[0]=='api':
     if identity!=spec['selected']:sys.exit(1)
+    if args[1]=='repos/owner/app/releases/321/assets?per_page=100&page=1':
+        print(json.dumps(json.loads((service/'release.json').read_text())['assets']));sys.exit(0)
     assert args[1]=='repos/owner/app/releases/tags/v1.2.3',args
     (base/'metadata-read').write_text('Production metadata adapter completed\n')
     print((service/'release.json').read_text());sys.exit(0)

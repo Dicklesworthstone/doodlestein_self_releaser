@@ -132,6 +132,13 @@ remove_release_verify_mock_gh() {
 
 create_mock_gh() {
     VERIFY_MOCK_RELEASE_JSON="${1:-}"
+    if [[ -n "$VERIFY_MOCK_RELEASE_JSON" ]]; then
+        VERIFY_MOCK_RELEASE_JSON=$(jq -c '
+            .tag_name //= "v1.0.0" |
+            .assets |= ((. // []) | to_entries | map(.key as $i | .value |
+                .id //= ($i + 1) | .state //= "uploaded" | .size //= 1))
+        ' <<< "$VERIFY_MOCK_RELEASE_JSON") || return 1
+    fi
     VERIFY_MOCK_API_STATUS="${2:-0}"
     VERIFY_MOCK_AUTH_STATUS="${3:-0}"
     VERIFY_MOCK_UPLOAD_STATUS="${4:-0}"
@@ -154,6 +161,12 @@ create_mock_gh() {
                     [[ " $* " != *' --include '* ]] || printf 'HTTP/2.0 200 OK\r\n\r\n'
                     printf '%s\n' "$VERIFY_MOCK_RELEASE_JSON"
                     return 0
+                fi
+                if [[ "$VERIFY_MOCK_API_STATUS" == 0 && "${2:-}" == */releases/12345/assets\?per_page=100\&page=* ]]; then
+                    local page=${2##*=}
+                    [[ " $* " != *' --include '* ]] || printf 'HTTP/2.0 200 OK\r\n\r\n'
+                    jq -c --argjson page "$page" '.assets[(($page-1)*100):($page*100)]' <<< "$VERIFY_MOCK_RELEASE_JSON"
+                    return $?
                 fi
                 printf '{"message":"Not Found"}\n' >&2
                 return "$VERIFY_MOCK_API_STATUS"
@@ -2808,7 +2821,7 @@ create_ordinary_verify_repair_mock() {
             {id:12345,tag_name:$tag,draft:$draft,prerelease:false,target_commitish:"main",
              html_url:"https://github.com/testuser/test-tool/releases/tag/v1.0.0",
              upload_url:("https://uploads.github.com/repos/" + $upload_repo + "/releases/12345/assets{?name,label}"),
-             assets:$assets[0]}'
+             assets:$assets[0][:100]}'
     }
     gh() {
         [[ "${GH_TOKEN:-}" == release-fixture-token && "${GH_HOST:-}" == github.com ]] || return 9
@@ -2896,7 +2909,7 @@ create_ordinary_verify_repair_mock() {
                               -s "$ORDINARY_REPAIR_ROOT/uploads" ]]; then
                             printf '%040d\n' 3 > "$ORDINARY_REPAIR_ROOT/source-sha"
                         fi
-                        if [[ "$ORDINARY_REPAIR_MODE" == inventory_coherence && "$inventory_gets" -eq 3 ]]; then
+                        if [[ "$ORDINARY_REPAIR_MODE" == inventory_coherence && "$inventory_gets" -eq 4 ]]; then
                             # A later complete response contradicts an earlier
                             # Linux row while still reporting valid Darwin.
                             jq 'map(if .name == "test-tool-linux-amd64" then
@@ -2906,7 +2919,7 @@ create_ordinary_verify_repair_mock() {
                         fi
                         snapshot=$(jq --argjson start "$(((10#$page - 1) * 100))" \
                             '.[$start:($start + 100)]' "$ORDINARY_REPAIR_ROOT/assets.json") || return 9
-                        if [[ "${ORDINARY_REPAIR_STOP_CASE:-}" == download && "$inventory_gets" -ge 3 ]]; then
+                        if [[ "${ORDINARY_REPAIR_STOP_CASE:-}" == download && "$inventory_gets" -ge 4 ]]; then
                             snapshot=$(jq 'map(if .id == 101 then del(.digest) else . end)' \
                                 <<< "$snapshot") || return 9
                         fi
@@ -3134,7 +3147,8 @@ test_verify_fix_stops_interrupted_tag_context() { _verify_ordinary_repair_interr
 test_verify_fix_stops_interrupted_source() { _verify_ordinary_repair_interruption_case source 1 0; }
 test_verify_fix_stops_interrupted_upload() { _verify_ordinary_repair_interruption_case upload 1 1 upload; }
 test_verify_fix_stops_interrupted_final_context() { _verify_ordinary_repair_interruption_case context 3 2; }
-test_verify_fix_stops_interrupted_final_inventory() { _verify_ordinary_repair_interruption_case inventory 3 2; }
+# Discovery now reads the complete release inventory before the two uploads.
+test_verify_fix_stops_interrupted_final_inventory() { _verify_ordinary_repair_interruption_case inventory 4 2; }
 test_verify_fix_stops_interrupted_asset_download() { _verify_ordinary_repair_interruption_case download 1 2; }
 test_verify_fix_stops_interrupted_final_source() { _verify_ordinary_repair_interruption_case source 4 2; }
 test_verify_fix_reconciles_ordinary_curl_failure() { _verify_ordinary_repair_interruption_case upload 1 2 upload 5 0; }
@@ -3669,6 +3683,60 @@ _verify_ordinary_repair_case() {
     harness_teardown
 }
 
+test_verify_paginated_ordinary_inventory() {
+    ((TESTS_RUN++))
+    if [[ "$HAS_YQ" != true ]]; then skip "yq required for paginated release verification"; return 0; fi
+    harness_setup
+    seed_repos_config
+    seed_ordinary_verify_repair already_present || return 1
+    create_ordinary_verify_repair_mock
+    local issue='' mode expected
+    local -a options=()
+    # The immutable asset collection includes the Darwin payload on page two.
+    # The metadata endpoint embeds only the first 100 assets.
+    jq '.[0:1] + [range(1000;1099) | {id:.,name:("extra-"+tostring),size:1,state:"uploaded"}] + .[1:]' \
+        "$ORDINARY_REPAIR_ROOT/assets.json" > "$ORDINARY_REPAIR_ROOT/complete.json" || return 1
+    for mode in verify plan repair unrelated-starter required-starter ambiguous interrupted; do
+        cp "$ORDINARY_REPAIR_ROOT/complete.json" "$ORDINARY_REPAIR_ROOT/assets.json" || return 1
+        : > "$ORDINARY_REPAIR_ROOT/inventory-pages"
+        expected=0; options=()
+        case "$mode" in
+            plan) options=(--fix --dry-run) ;;
+            repair) options=(--fix) ;;
+            unrelated-starter|required-starter)
+                local index=1
+                [[ "$mode" != required-starter ]] || { index=-1; expected=7; }
+                jq --argjson i "$index" '.[$i].state="starter"' "$ORDINARY_REPAIR_ROOT/complete.json" \
+                    > "$ORDINARY_REPAIR_ROOT/assets.json"
+                options=(--fix) ;;
+            ambiguous)
+                jq '.[-1].id=.[0].id' "$ORDINARY_REPAIR_ROOT/complete.json" > "$ORDINARY_REPAIR_ROOT/assets.json"
+                expected=7 ;;
+            interrupted)
+                export ORDINARY_REPAIR_STOP_CASE=inventory ORDINARY_REPAIR_STOP_AFTER=2 ORDINARY_REPAIR_STOP_STATUS=130
+                expected=5 ;;
+        esac
+        DSR_GH_TOKEN=release-fixture-token GH_MAX_RETRIES=1 GH_RETRY_DELAY=0 \
+            PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json release verify test-tool v1.0.0 "${options[@]}"
+        if [[ "$(exec_status)" != "$expected" || -s "$ORDINARY_REPAIR_ROOT/uploads" ]] ||
+           ! exec_stdout | jq -es --argjson expected "$expected" '
+               length==1 and .[0].exit_code==$expected and
+               (if $expected==0 then .[0].details |
+                   .verification.present==2 and .verification.missing==0 and
+                   (.repair.uploads // [])==[] and (.assets.present | index("test-tool-darwin-arm64")!=null)
+                else .[0].status=="error" end)' >/dev/null; then
+            issue+=" $mode(exit $(exec_status))"
+        fi
+        if [[ "$mode" != interrupted ]] && ! grep -qx 2 "$ORDINARY_REPAIR_ROOT/inventory-pages"; then
+            issue+=" $mode(skipped page 2)"
+        fi
+    done
+    if [[ -z "$issue" ]]; then pass "ordinary verification and repair reconcile complete ID-bound asset pages"
+    else fail "ordinary paginated inventory:$issue"; fi
+    remove_ordinary_verify_repair_mock
+    harness_teardown
+}
+
 test_verify_fix_attempts_upload() {
     _verify_ordinary_repair_case lost_ack 0 \
         "ordinary repair reconciles a lost acknowledgement through the ID-bound inventory"
@@ -4117,6 +4185,7 @@ echo "Asset Comparison Tests (mocked gh):"
 test_verify_all_assets_present
 test_verify_detects_missing_assets
 test_verify_ordinary_manifest_inventory
+test_verify_paginated_ordinary_inventory
 test_verify_detects_extra_assets
 test_verify_refuses_diagnostic_purpose_before_remote_access
 test_strict_verify_rejects_unreceipted_native_manifest
