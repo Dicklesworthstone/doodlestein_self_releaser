@@ -1557,7 +1557,7 @@ gh_upload_asset() {
     local upload_url="${1:-}"
     local file_path="${2:-}"
     local content_type="${3:-application/octet-stream}"
-    gh_upload_asset_named "$upload_url" "$file_path" "${file_path##*/}" "$content_type"
+    gh_upload_asset_named "$upload_url" "$file_path" "${file_path##*/}" "$content_type" "${@:4}"
 }
 
 # Hash file contents rather than hash-tool filename output (paths may contain
@@ -1775,7 +1775,15 @@ _gh_manifest_has_upload_name() {
 
 _gh_validate_upload_inventory() {
     local snapshot="$1" file="$2" upload_name="$3" sha="$4" manifest rows
-    _signing_release_snapshot_matches "$snapshot" "$file" || return $?
+    local anchor="${5:-$file}" selected="${6:-}" directory="${7:-}" expected="${8:-}"
+    _signing_release_snapshot_matches "$snapshot" "$anchor" || return $?
+    if [[ -n "$selected" ]]; then
+        signing_validate_release_inventory "$selected" "$directory" "$expected" || return $?
+        _gh_manifest_has_upload_name "$selected" "$upload_name" "$file" "$sha" || return 4
+        if [[ "$file" == "$selected" || "$upload_name" == "${selected##*/}" ]]; then
+            [[ "$file" == "$selected" && "$upload_name" == "${selected##*/}" && "$sha" == "$expected" ]] || return 4
+        fi
+    fi
     [[ "$snapshot" != '[]' ]] || return 0
     rows=$(jq -r '.[].manifest' <<< "$snapshot") || return 4
     while IFS= read -r manifest; do
@@ -1826,10 +1834,31 @@ gh_upload_asset_named() (
         return 3
     fi
     _gh_require_upload_inventory || return $?
-    local upload_inventory
-    upload_inventory=$(_signing_release_manifest_snapshot "$file_path") || return $?
+    local upload_inventory anchor="$file_path" selected="${5:-}" directory="${6:-}" expected="${7:-}" first file_dir root_dir
+    local -a inventory_args
+    if (( $# > 4 )); then
+        # The ordinary release command can retain its build manifest in state,
+        # separately from the release directory. Its state siblings describe
+        # different releases. Observe adjacent manifests beside the payloads.
+        [[ $# == 7 && -d "$directory" && ! -L "$directory" && -f "$selected" && ! -L "$selected" &&
+           "$expected" =~ ^[0-9a-f]{64}$ ]] || return 4
+        if [[ "$file_path" == "$selected" ]]; then
+            [[ "$(_gh_asset_sha256 "$selected")" == "$expected" ]] || return 4
+            first=$(jq -er '.artifacts[0].name' "$selected") || return 4
+            [[ "$first" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || return 4
+            anchor="$directory/$first"
+        else
+            file_dir=${file_path%/*}
+            [[ "$file_dir" != "$file_path" ]] || file_dir=.
+            file_dir=$(CDPATH= cd -- "${file_dir:-/}" && pwd -P) || return 4
+            root_dir=$(CDPATH= cd -- "$directory" && pwd -P) || return 4
+            [[ "$file_dir" == "$root_dir" ]] || return 4
+        fi
+    fi
+    upload_inventory=$(_signing_release_manifest_snapshot "$anchor") || return $?
     sha=$(_gh_asset_sha256 "$file_path") || return $?
-    _gh_validate_upload_inventory "$upload_inventory" "$file_path" "$upload_name" "$sha" || return $?
+    inventory_args=("$upload_inventory" "$file_path" "$upload_name" "$sha" "$anchor" "$selected" "$directory" "$expected")
+    _gh_validate_upload_inventory "${inventory_args[@]}" || return $?
     status=0
     token=$(run_with_timeout "$auth_timeout" _gh_resolve_token) || status=$?
     if ((status != 0)); then
@@ -1866,7 +1895,7 @@ gh_upload_asset_named() (
         if ((status == 0)); then
             _gh_log_info "Verifying existing release asset: $upload_name"
             asset=$(_gh_verify_uploaded_asset "$repo" "$upload_name" "$size" "$sha" "$asset" "$workdir") || return $?
-            _gh_validate_upload_inventory "$upload_inventory" "$file_path" "$upload_name" "$sha" || return $?
+            _gh_validate_upload_inventory "${inventory_args[@]}" || return $?
             printf '%s\n' "$asset"
             return 0
         elif ((status != 1)); then
@@ -1879,7 +1908,7 @@ gh_upload_asset_named() (
         : > "$workdir/headers" || return 4
         # A successful lookup is not permission to upload after the source
         # manifest changes. Recheck immediately before every network write.
-        _gh_validate_upload_inventory "$upload_inventory" "$file_path" "$upload_name" "$sha" || return $?
+        _gh_validate_upload_inventory "${inventory_args[@]}" || return $?
         http_code=$(run_with_timeout "$timeout" curl -sS --connect-timeout 15 --max-time "$timeout" \
             -X POST \
             -H "Accept: application/vnd.github+json" \
@@ -1903,7 +1932,7 @@ gh_upload_asset_named() (
         _GH_LAST_RATE_RESET=$(_gh_response_header x-ratelimit-reset "$headers")
         if ((curl_status == 0)) && [[ "$http_code" == "201" ]]; then
             asset=$(_gh_verify_uploaded_asset "$repo" "$upload_name" "$size" "$sha" "$response" "$workdir") || return $?
-            _gh_validate_upload_inventory "$upload_inventory" "$file_path" "$upload_name" "$sha" || return $?
+            _gh_validate_upload_inventory "${inventory_args[@]}" || return $?
             printf '%s\n' "$asset"
             return 0
         fi
@@ -1943,7 +1972,7 @@ gh_upload_asset_named() (
         if ((status == 0)); then
             _gh_log_info "Reconciling upload response failure: $upload_name"
             asset=$(_gh_verify_uploaded_asset "$repo" "$upload_name" "$size" "$sha" "$asset" "$workdir") || return $?
-            _gh_validate_upload_inventory "$upload_inventory" "$file_path" "$upload_name" "$sha" || return $?
+            _gh_validate_upload_inventory "${inventory_args[@]}" || return $?
             printf '%s\n' "$asset"
             return 0
         elif ((status != 1)); then

@@ -10649,7 +10649,7 @@ EOF
     # before creating a release or replacing any generated checksum sidecars.
     local ordinary_manifest='null'
     local -A ordinary_expected_sha=()
-    local -a ordinary_files=()
+    local -a ordinary_files=() ordinary_manifest_args=()
     if ! $release_contract_enabled && $manifest_exists; then
         local ordinary_manifest_sha
         if [[ -L "$manifest_file" ]] ||
@@ -10715,6 +10715,9 @@ EOF
             ordinary_expected_sha["$required_name"]="$required_sha"
         done < <(jq -r '.artifacts[] | [(.name // .filename), .sha256] | @tsv' <<< "$ordinary_manifest")
         ordinary_expected_sha["${manifest_file##*/}"]="$ordinary_manifest_sha"
+        if [[ "$manifest_file" != "$artifacts_dir/${manifest_file##*/}" ]]; then
+            ordinary_manifest_args=("$manifest_file" "$artifacts_dir" "$ordinary_manifest_sha")
+        fi
         # Signing may be disabled or entirely reused. Publication still needs
         # the complete local inventory, not just byte-correct surviving rows.
         _release_prepare_ordinary_checksums "$manifest_file" "$artifacts_dir" \
@@ -12398,7 +12401,8 @@ EOF
                         break 2
                     fi
                     local upload_result
-                    if upload_result=$(gh_upload_asset_named "$upload_url" "$file" "$upload_name" "$content_type"); then
+                    if upload_result=$(gh_upload_asset_named "$upload_url" "$file" "$upload_name" "$content_type" \
+                            ${ordinary_manifest_args[@]+"${ordinary_manifest_args[@]}"}); then
                         log_ok "  Verified upload: $upload_name ($size_bytes bytes)"
                         _release_record_uploaded "$upload_name" "uploaded" "$size_bytes" "$content_type" "$upload_result" "$upload_sha"
                         uploaded_name_set["$upload_name"]=1
@@ -12436,7 +12440,8 @@ EOF
             break
         fi
         local upload_result
-        if upload_result=$(gh_upload_asset "$upload_url" "$file" "$content_type"); then
+        if upload_result=$(gh_upload_asset "$upload_url" "$file" "$content_type" \
+                ${ordinary_manifest_args[@]+"${ordinary_manifest_args[@]}"}); then
             log_ok "  Verified upload: $filename ($size_bytes bytes)"
             _release_record_uploaded "$filename" "uploaded" "$size_bytes" "$content_type" "$upload_result" "$upload_sha"
             uploaded_name_set["$filename"]=1

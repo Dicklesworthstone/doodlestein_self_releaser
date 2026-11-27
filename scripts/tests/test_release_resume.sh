@@ -513,6 +513,9 @@ curl() {
     fi
     if $UPLOAD_FAIL || [[ "$name" == "$FAIL_NAME" ]]; then printf '503'; return 0; fi
     remote_put "$name" "$payload" || return 4
+    if [[ -n "${DRIFT_MANIFEST_AFTER_UPLOAD:-}" ]]; then
+        printf '\n' >> "$DRIFT_MANIFEST_AFTER_UPLOAD" || return 4
+    fi
     jq -c '.[-1]' "$CASE/inventory.json" > "$response"
     if $EXTRA_ASSET && ! jq -e 'any(.[]; .name=="unexpected.bin")' "$CASE/inventory.json" >/dev/null; then
         remote_put unexpected.bin "$payload" || return 4
@@ -3295,6 +3298,80 @@ test_dry_run_refuses_orphan_checksum_signature() {
         grep -Fxq 'retained signature' "$CASE/artifacts/SHA256SUMS.minisig"
 }
 
+test_staged_separate_manifest_publishes_and_resumes() {
+    setup staged_separate_manifest
+    CREATE_FAIL=false
+    local name=tool-v1.2.3-manifest.json selected="$CASE/state/artifacts" remote_id
+    staged_manifest payload.bin || return 1
+    mkdir -p "$selected" || return 1
+    mv "$CASE/artifacts/$name" "$selected/$name" || return 1
+    printf '{"artifacts":[]}\n' > "$selected/unrelated-build-manifest.json"
+    run_release
+    [[ $STATUS == 0 ]] && grep -Fxq PUBLISH "$CALLS" || return 1
+    remote_id=$(jq -er --arg name "$name" '.[] | select(.name==$name) | .id' "$CASE/inventory.json") || return 1
+    cmp -s "$selected/$name" "$CASE/remote/$remote_id" &&
+        jq -e 'map(.name)|sort == ["SHA256SUMS","payload.bin","payload.bin.sha256","tool-v1.2.3-manifest.json"]' "$CASE/inventory.json" >/dev/null || return 1
+    : > "$CALLS"
+    run_release --resume
+    [[ $STATUS == 0 && ! -e "$CASE/artifacts/$name" ]] &&
+        ! grep -Eq '^CREATE|^POST |^PUBLISH' "$CALLS"
+}
+
+test_separate_manifest_preserves_adjacent_and_source_checks() {
+    setup separate_manifest_conflicts
+    local name=tool-v1.2.3-manifest.json selected="$CASE/state/artifacts" pin status
+    local url='https://uploads.github.com/repos/owner/repo/releases/9/assets{?name,label}'
+    staged_manifest payload.bin || return 1
+    mkdir -p "$selected" || return 1
+    mv "$CASE/artifacts/$name" "$selected/$name" || return 1
+    pin=$(_gh_asset_sha256 "$selected/$name") || return 1
+    cp "$CASE/artifacts/payload.bin" "$CASE/other.bin" || return 1
+    status=0
+    gh_upload_asset_named "$url" "$CASE/other.bin" payload.bin application/octet-stream \
+        "$selected/$name" "$CASE/artifacts" "$pin" > "$CASE/rejected" || status=$?
+    [[ $status == 4 && ! -s "$CASE/rejected" && ! -s "$CALLS" ]] || return 1
+    status=0
+    gh_upload_asset_named "$url" "$selected/$name" renamed-manifest.json application/json \
+        "$selected/$name" "$CASE/artifacts" "$pin" > "$CASE/rejected" || status=$?
+    [[ $status == 4 && ! -s "$CASE/rejected" && ! -s "$CALLS" ]] || return 1
+    # A same-named manifest in the payload root can have a valid inventory
+    # and different source metadata. Only the frozen state file may supply
+    # the public manifest name, even if an adjacent snapshot also admits it.
+    jq '.run_id="different-build"' "$selected/$name" > "$CASE/artifacts/$name" || return 1
+    status=0
+    gh_upload_asset "$url" "$CASE/artifacts/$name" application/json \
+        "$selected/$name" "$CASE/artifacts" "$pin" > "$CASE/rejected" || status=$?
+    [[ $status == 4 && ! -s "$CASE/rejected" && ! -s "$CALLS" ]] || return 1
+    mv "$CASE/artifacts/$name" "$CASE/other-build.json" || return 1
+    printf '{"artifacts":[]}\n' > "$CASE/artifacts/conflicting-manifest.json"
+    status=0
+    gh_upload_asset "$url" "$selected/$name" application/json \
+        "$selected/$name" "$CASE/artifacts" "$pin" > "$CASE/rejected" || status=$?
+    [[ $status == 4 && ! -s "$CASE/rejected" && ! -s "$CALLS" ]]
+}
+
+test_staged_separate_manifest_drift_blocks_upload_completion() {
+    setup staged_separate_manifest_drift
+    CREATE_FAIL=false
+    local name=tool-v1.2.3-manifest.json selected="$CASE/state/artifacts"
+    staged_manifest payload.bin || return 1
+    mkdir -p "$selected" || return 1
+    mv "$CASE/artifacts/$name" "$selected/$name" || return 1
+    cp "$selected/$name" "$CASE/original-manifest" || return 1
+    # Inject a harmless JSON whitespace change after the first actual POST.
+    # The receipt must still bind the exact manifest bytes admitted up front.
+    local DRIFT_MANIFEST_AFTER_UPLOAD="$selected/$name"
+    run_release
+    [[ $STATUS != 0 && $(grep -c '^POST ' "$CALLS") == 1 ]] &&
+        ! grep -Eq '^PUBLISH|^DISPATCH' "$CALLS" &&
+        jq -e '.draft==true' "$CASE/release.json" >/dev/null || return 1
+    DRIFT_MANIFEST_AFTER_UPLOAD=''
+    cp "$CASE/original-manifest" "$selected/$name" || return 1
+    : > "$CALLS"
+    run_release --resume
+    [[ $STATUS == 0 ]] && grep -Fxq PUBLISH "$CALLS" && ! grep -q '^CREATE ' "$CALLS"
+}
+
 test_staged_generated_checksums_remain_bound_across_retry() {
     setup staged_checksums
     CREATE_FAIL=false FAIL_NAME=payload.bin
@@ -4462,6 +4539,8 @@ for test in test_release_auth_cancellation_never_falls_back_or_publishes \
     test_release_dispatch_large_inventory_recovers_exact_outbox \
     test_release_dispatch_large_inventory_refuses_late_page_drift test_staged_dry_run_creates_no_custody \
     test_sidecar_admission_precedes_draft_creation test_dry_run_refuses_orphan_checksum_signature \
+    test_staged_separate_manifest_publishes_and_resumes test_staged_separate_manifest_drift_blocks_upload_completion \
+    test_separate_manifest_preserves_adjacent_and_source_checks \
     test_staged_interrupted_upload_resumes_and_publishes test_staged_generated_checksums_remain_bound_across_retry \
     test_staged_cancelled_upload_stops_and_requires_explicit_resume test_staged_cancelled_alias_upload_stops_remaining_names \
     test_staged_cancelled_creation_preserves_uncertain_custody \
