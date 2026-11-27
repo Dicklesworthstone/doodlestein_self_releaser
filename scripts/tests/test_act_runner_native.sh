@@ -14,6 +14,267 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SRC_DIR="$PROJECT_ROOT/src"
 
+# Real Bun compilation through the native backend and collector. The only
+# runtime adapter is local host readiness; no compiler or artifact bytes are
+# mocked. Planner cases also cover CMD paths without claiming a Windows run.
+test_bun_native_output_selection() {
+    local dependency
+    for dependency in bash python3 jq yq bun cc tar gzip; do
+        command -v "$dependency" >/dev/null || {
+            printf 'Missing native Bun output test dependency: %s\n' "$dependency"
+            return 3
+        }
+    done
+    python3 -I - "$PROJECT_ROOT" "${1:-all}" <<'PY'
+import hashlib, json, os, pathlib, shlex, shutil, subprocess, sys, tarfile, tempfile
+
+root = pathlib.Path(sys.argv[1])
+work = pathlib.Path(tempfile.mkdtemp(prefix='dsr-bun-outputs-'))
+print('Retained native Bun output evidence: ' + str(work), flush=True)
+environment = {key: value for key, value in os.environ.items() if not key.startswith('BASH_FUNC_')}
+environment.update(RCH_REQUIRE_REMOTE='0', NO_COLOR='1',
+                   BUN_INSTALL_CACHE_DIR=str(work / 'bun-cache'))
+host = subprocess.run(['bun', '-e', 'console.log(process.platform + "/" + process.arch)'],
+                      env=environment, capture_output=True, text=True, timeout=10, check=True).stdout.strip()
+platform = {'linux/x64': 'linux/amd64', 'linux/arm64': 'linux/arm64',
+            'darwin/x64': 'darwin/amd64', 'darwin/arm64': 'darwin/arm64'}.get(host)
+if platform is None:
+    print('Native Bun fixture requires a supported Unix host', file=sys.stderr)
+    sys.exit(3)
+print('Real Bun version: ' + subprocess.check_output(['bun', '--version'], text=True).strip(), flush=True)
+if environment.get('DSR_TEST_ACT_RUNNER'):
+    baseline = work / 'baseline-module'
+    baseline.mkdir()
+    for module in (root / 'src').iterdir():
+        if module.name == 'act_runner.sh':
+            shutil.copy2(environment['DSR_TEST_ACT_RUNNER'], baseline / module.name)
+        else:
+            (baseline / module.name).symlink_to(module.resolve(), target_is_directory=module.is_dir())
+    environment['DSR_TEST_ACT_RUNNER'] = str(baseline / 'act_runner.sh')
+checks = failures = 0
+
+def check(label, ok):
+    global checks, failures
+    checks += 1
+    failures += not ok
+    print(('PASS: ' if ok else 'FAIL: ') + label, flush=True)
+
+def write(path, contents):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(contents)
+
+def digest(path):
+    with open(path, 'rb') as stream:
+        result = hashlib.sha256()
+        for block in iter(lambda: stream.read(1048576), b''):
+            result.update(block)
+        return result.hexdigest()
+
+write(work / 'stale.c', '#include <stdio.h>\nint main(void) { puts("stale-output"); return 0; }\n')
+subprocess.run(['cc', str(work / 'stale.c'), '-o', str(work / 'stale')],
+               env=environment, check=True, capture_output=True, timeout=20)
+stale_hash = digest(work / 'stale')
+driver = r'''
+set -uo pipefail
+root=$1; case_root=$2; platform=$3; mode=$4
+export DSR_CONFIG_DIR="$case_root/config" DSR_STATE_DIR="$case_root/state" DSR_CACHE_DIR="$case_root/cache"
+export ACT_REPOS_DIR="$DSR_CONFIG_DIR/repos.d" DSR_HOSTS_FILE="$DSR_CONFIG_DIR/hosts.yaml"
+export ACT_ARTIFACTS_DIR="$case_root/artifacts" ACT_LOGS_DIR="$case_root/logs" DSR_BUILD_TIMEOUT=30
+source "$root/src/config.sh" || exit 90
+source "${DSR_TEST_ACT_RUNNER:-$root/src/act_runner.sh}" || exit 91
+source "$root/src/artifact_naming.sh" || exit 92
+host_health_is_ready() { return 0; }
+case "$mode" in
+  build) act_run_native_build outputs "$platform" v1.0.0 bun-output-test '' '' '' localnative ;;
+  paths)
+    _act_is_windows_host() { [[ "${DSR_TEST_BUN_SHELL:-unix}" == windows ]]; }
+    _act_native_output_paths outputs "$platform" localnative false '{}' v1.0.0
+    ;;
+esac
+'''
+
+def setup(name, command, *, family=None, language='bun', target=platform, companion=False):
+    case = work / name
+    source = case / 'source'
+    (source / 'dist').mkdir(parents=True)
+    (source / 'nested').mkdir()
+    write(source / 'main.ts', 'console.log("fresh-tool");\n')
+    write(source / 'worker.ts', 'console.log("fresh-worker");\n')
+    write(source / 'package.json', '{"name":"native-output-fixture","private":true}\n')
+    for binary in ('tool', 'worker'):
+        shutil.copy2(work / 'stale', source / binary)
+        shutil.copy2(work / 'stale', source / 'dist' / binary)
+    marker = source / '.recipe-dispatched'
+    recipe = 'printf dispatched > ' + shlex.quote(str(marker)) + '; ' + command
+    config = dict(tool_name='outputs', repo='fixture/outputs', language=language,
+                  binary_name='tool', local_path=str(source), targets=[target],
+                  act_job_map={target: None}, hosts={target: 'localnative'},
+                  build_cmd=recipe, env={'PATH': environment['PATH']},
+                  artifact_naming='${name}-${version}-${os}-${arch}.${ext}',
+                  archive_format={'linux': 'tar.gz', 'darwin': 'tar.gz', 'windows': 'zip'},
+                  include_files=[], include_extra_files=False, flat_archive=True)
+    if family is not None:
+        config['workspace_binaries'] = family
+    if companion:
+        config['workspace_archive_files'] = {target: [{'name': 'NOTICE', 'executable': False}]}
+        write(source / 'dist/NOTICE', 'the selected output directory companion\n')
+    write(case / 'config/repos.d/outputs.yaml', json.dumps(config))
+    write(case / 'config/hosts.yaml', json.dumps(dict(schema_version='1.0.0', hosts={
+        'localnative': dict(platform=platform, connection='local', concurrency=1)})))
+    return case, source, marker
+
+def invoke(case, target=platform, mode='build', extra_environment=None):
+    env = dict(environment)
+    if extra_environment:
+        env.update(extra_environment)
+    result = subprocess.run(['bash', '-c', driver, 'bun-output-test',
+                             str(root), str(case), target, mode],
+                            env=env, capture_output=True, text=True, timeout=60)
+    write(case / (mode + '.stdout'), result.stdout)
+    write(case / (mode + '.stderr'), result.stderr)
+    return result
+
+def run_case(name, command, *, family=None, language='bun', companion=False,
+             expected=True, predispatch=False, selected='dist/emitted'):
+    case, source, marker = setup(name, command, family=family, language=language, companion=companion)
+    controls = {path.name: path.read_bytes() for path in
+                (source / 'main.ts', source / 'worker.ts', source / 'package.json')}
+    result = invoke(case)
+    try:
+        receipt = json.loads(result.stdout)
+    except ValueError:
+        receipt = {}
+    if not expected:
+        check(name + ': rejects stale executable authority',
+              result.returncode != 0 and not receipt.get('artifact_path') and not receipt.get('artifact_paths'))
+        if predispatch:
+            check(name + ': refuses before the actual recipe',
+                  result.returncode == 4 and not marker.exists())
+        return
+    paths = receipt.get('artifact_paths', [])
+    ok = result.returncode == 0 and receipt.get('status') == 'success' and len(paths) == 1
+    check(name + ': native build and collection succeed', ok)
+    fresh = False
+    if ok:
+        artifact = pathlib.Path(paths[0])
+        if family:
+            with tarfile.open(artifact) as archive:
+                members = {member.name.lstrip('./'): member for member in archive.getmembers() if member.isfile()}
+                expected_members = set(family) | ({'NOTICE'} if companion else set())
+                fresh = set(members) == expected_members
+                for binary in family:
+                    if binary not in members:
+                        fresh = False
+                        continue
+                    output = case / ('execute-' + binary)
+                    with archive.extractfile(members[binary]) as incoming, output.open('wb') as outgoing:
+                        shutil.copyfileobj(incoming, outgoing)
+                    output.chmod(0o700)
+                    execution = subprocess.run([str(output)], capture_output=True, text=True, timeout=5)
+                    fresh = fresh and digest(output) == digest(source / 'dist' / binary) and \
+                        execution.returncode == 0 and execution.stdout.strip() == 'fresh-' + binary
+                if companion and 'NOTICE' in members:
+                    fresh = fresh and archive.extractfile(members['NOTICE']).read() == (source / 'dist/NOTICE').read_bytes()
+        else:
+            execution = subprocess.run([str(artifact)], capture_output=True, text=True, timeout=5)
+            fresh = digest(artifact) == digest(source / selected) and \
+                execution.returncode == 0 and execution.stdout.strip() == 'fresh-tool'
+    check(name + ': collected bytes are the actual fresh compiled family', fresh)
+    if selected != 'tool':
+        check(name + ': leaves conventional stale outputs untouched',
+              all(digest(source / binary) == stale_hash for binary in ('tool', 'worker')))
+    check(name + ': preserves tracked source controls',
+          all((source / name).read_bytes() == contents for name, contents in controls.items()))
+
+if sys.argv[2] != 'plans':
+    run_case('conventional-control', 'bun build --compile ./main.ts --outfile tool', selected='tool')
+    run_case('nested-explicit-alias', 'bun build --compile ./main.ts --outfile=dist/emitted', language='typescript')
+    run_case('complete-family',
+             'bun build --compile ./main.ts --outfile dist/tool && '
+             'bun build --compile ./worker.ts --outfile dist/worker',
+             family=['tool', 'worker'], companion=True)
+    run_case('missing-family-member', 'bun build --compile ./main.ts --outfile dist/tool',
+             family=['tool', 'worker'], expected=False)
+    for name, command in [
+        ('help-nonproducer', 'bun build --compile ./main.ts --outfile dist/tool --help'),
+        ('quoted-global-help', 'bun --help "build" --compile ./main.ts "--outfile" dist/tool'),
+        ('disabled-compile', 'bun build --compile=false ./main.ts --outfile dist/tool'),
+        ('skipped-producer', 'false && bun build --compile ./main.ts --outfile dist/tool; true'),
+        ('mixed-implicit-producer',
+         'bun build --compile ./main.ts --outfile dist/tool && bun build --compile ./worker.ts'),
+        ('parent-traversal', 'bun build --compile ./main.ts --outfile dist/../tool'),
+        ('cwd-context', 'cd nested && bun build --compile ../main.ts --outfile dist/tool'),
+        ('quoted-global-cwd', 'bun --cwd . "build" --compile ./main.ts "--outfile" dist/tool'),
+        ('env-cwd-context', 'env -C nested bun build --compile ../main.ts --outfile dist/tool'),
+    ]:
+        run_case(name, command, expected=False, predispatch=True)
+
+for name, command, target, shell, expected in [
+    ('relative-namespace', 'bun build --compile ./main.ts --outfile dist/tool',
+     platform, 'unix', 'in-tree\t@SOURCE@/dist/tool'),
+    ('absolute-namespace', 'bun build --compile ./main.ts --outfile /shared/tool',
+     platform, 'unix', 'external\t/shared/tool'),
+    ('family-namespaces',
+     'bun build --compile ./main.ts --outfile dist/tool && bun build --compile ./worker.ts --outfile dist/worker',
+     platform, 'unix', 'in-tree\t@SOURCE@/dist/tool\nin-tree\t@SOURCE@/dist/worker'),
+    ('windows-suffix-cross', 'bun build --compile ./main.ts --target=bun-windows-x64 --outfile dist/tool',
+     'windows/amd64', 'unix', 'in-tree\t@SOURCE@/dist/tool.exe'),
+    ('windows-suffix-once', 'bun build --compile ./main.ts --target=bun-windows-x64 --outfile dist/tool.exe',
+     'windows/amd64', 'unix', 'in-tree\t@SOURCE@/dist/tool.exe'),
+    ('windows-case-sensitive-suffix', 'bun build --compile ./main.ts --target=bun-windows-x64 --outfile dist/tool.EXE',
+     'windows/amd64', 'unix', 'in-tree\t@SOURCE@/dist/tool.EXE.exe'),
+]:
+    case, source, marker = setup('plan-' + name, command, target=target)
+    # Namespace planning does not execute the command's marker or any compiler.
+    result = invoke(case, target, 'paths', {'DSR_TEST_BUN_SHELL': shell})
+    check(name + ': scheduler reserves the compiler-selected output',
+          result.returncode == 0 and result.stdout.strip() == expected.replace('@SOURCE@', str(source)) and
+          not marker.exists())
+
+planner_driver = r'''
+source "${DSR_TEST_ACT_RUNNER:-$1/src/act_runner.sh}" || exit 90
+case "$2" in
+    go) _act_go_output_plan "$3" "" "$4" "$5" ;;
+    bun) _act_command_output_plan "$3" "" "$4" "$5" bun "$6" ;;
+esac
+'''
+for label, compiler, command, shell, target, expected_path in [
+    ('Go explicit file remains unchanged', 'go', 'go build -o dist/tool .', 'unix', platform, '/source/dist/tool'),
+    ('Go Windows explicit file keeps exact operand', 'go', 'go build -o tool .', 'windows', 'windows/amd64', 'C:/source/tool'),
+    ('CMD Bun suffix', 'bun', 'bun build --compile ./main.ts --outfile dist/tool', 'windows', 'windows/amd64', 'C:/source/dist/tool.exe'),
+    ('CMD Bun quoted filename', 'bun', 'bun build --compile ./main.ts --outfile "dist/my tool.exe"', 'windows', 'windows/amd64', 'C:/source/dist/my tool.exe'),
+]:
+    source = 'C:/source' if shell == 'windows' else '/source'
+    result = subprocess.run(['bash', '-c', planner_driver, 'native-plan-test', str(root),
+                             compiler, source, command, shell, target],
+                            env=environment, capture_output=True, text=True, timeout=10)
+    try:
+        plan = json.loads(result.stdout)
+    except ValueError:
+        plan = None
+    check(label, result.returncode == 0 and isinstance(plan, dict) and
+          len(plan.get('operations', [])) == 1 and plan['operations'][0]['output'] == expected_path and
+          (compiler != 'go' or 'compiler' not in plan))
+for command in ('bun run build', 'bun ./build.ts', 'bash build.sh'):
+    result = subprocess.run(['bash', '-c', planner_driver, 'opaque-plan-test', str(root),
+                             'bun', '/source', command, 'unix', platform],
+                            env=environment, capture_output=True, text=True, timeout=10)
+    check(command + ': opaque recipe retains declared output convention',
+          result.returncode == 0 and result.stdout.strip() == 'null')
+print('Native Bun output checks: %d passed, %d failed' % (checks - failures, failures), flush=True)
+sys.exit(1 if failures else 0)
+PY
+}
+
+if [[ "${1:-}" == --bun-outputs-only || "${1:-}" == --bun-output-plans-only ]]; then
+    if [[ "$1" == --bun-output-plans-only ]]; then
+        test_bun_native_output_selection plans
+    else
+        test_bun_native_output_selection all
+    fi
+    exit $?
+fi
+
 # Real offline Cargo compilation through the native launcher and collector.
 # Host readiness is the only adapter; no compiler, artifact, archive or profile
 # selection is mocked. The retained paths permit replay on a baseline module.
