@@ -1679,7 +1679,9 @@ elif mode == 'metadata-prefix':
 elif mode == 'metadata':
     for name in ('tool-musl.bin.sha256', 'tool-musl.bin.minisig',
                  'tool-musl.sbom.spdx.json', 'tool-musl.intoto.jsonl',
-                 'tool-musl-manifest.json', 'SHA256SUMS.txt'):
+                 'tool-musl-manifest.json', 'SHA256SUMS.txt', 'tool-musl.spdx.json',
+                 'tool-musl.CDX.JSON', 'tool-musl.cdx.xml', 'tool-musl.bin.asc',
+                 'tool-musl.bin.md5', 'SHA512SUMS'):
         add(name, musl)
 elif mode in ('companion', 'companion-filename'):
     config['workspace_additional_artifacts'] = {

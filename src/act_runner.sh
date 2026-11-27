@@ -21126,7 +21126,7 @@ _act_validate_manifest_variant_coverage() {
                     select(.role != "additional" and
                         ($additional_names | index($name)) == null and
                         ($name | ascii_downcase |
-                            test("\\.(minisig|sig|sha256|sha512|intoto\\.jsonl)$|^sha256sums(\\.txt)?$|^checksums\\.txt$|\\.sbom\\.|-manifest\\.json$") | not)) |
+                            test("\\.(minisig|sig|asc|md5|sha256|sha512|intoto\\.jsonl|spdx(\\.json)?|cdx\\.(json|xml))$|^(sha(256|512)sums|checksums)(\\.txt)?$|\\.sbom\\.|-manifest\\.json$") | not)) |
                     {target, target_triple}]
             } end
         end

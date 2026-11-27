@@ -744,9 +744,8 @@ for mutation in \
         "$WORK/native-release-refusal-$PASS"
 done
 
-# One workflow job can deliver assets for another platform. An explicit act
-# receipt keeps that partial-variant workflow valid even without a matching
-# act job mapping for the artifact platform itself.
+# A workflow may deliver another platform's assets without a job on that
+# platform. The delivered platform still needs its complete variant set.
 DSR_VARIANT_PLATFORM="$PLATFORM" yq 'del(.act_job_map) |
     .targets=[strenv(DSR_VARIANT_PLATFORM),"windows/amd64"] |
     .act_job_map."windows/amd64"="release"' "$WORK/reviewed-config.yaml" > \
@@ -759,9 +758,19 @@ jq --arg name "$GNU_NAME" '
     .requested_targets=["windows/amd64"] |
     .build_environments[0].target="windows/amd64"
     ' "$MANIFEST" > "$cross_workflow_dir/variantdemo-v1.2.3-manifest.json" || exit 1
-: > "$CALLS"
+run_refusal 'cross-platform workflow cannot publish without the delivered musl variant' \
+    "$cross_workflow_dir" "$WORK/cross-workflow-incomplete"
+check 'cross-platform refusal identifies the omitted compiler variant' \
+    grep -Fq "Missing configured primary variant(s) for variantdemo $PLATFORM: $MUSL_TRIPLE" \
+    "$WORK/cross-workflow-incomplete.log"
+cp -p "$OUTPUT/$MUSL_NAME" "$cross_workflow_dir/$MUSL_NAME" || exit 1
+jq --arg gnu "$GNU_NAME" --arg musl "$MUSL_NAME" '
+    .artifacts |= map(select(.name==$gnu or .name==$musl)) |
+    .requested_targets=["windows/amd64"] |
+    .build_environments[0].target="windows/amd64"
+    ' "$MANIFEST" > "$cross_workflow_dir/variantdemo-v1.2.3-manifest.json" || exit 1
 DRY_RUN=true
-run_code 'one cross-platform act receipt may release its partial variant set' 0 \
+run_code 'one cross-platform act receipt can release both delivered variants' 0 \
     "$WORK/cross-workflow-plan" cmd_release variantdemo 1.2.3 --artifacts "$cross_workflow_dir"
 check 'cross-platform workflow planning makes no GitHub request' test ! -s "$CALLS"
 
