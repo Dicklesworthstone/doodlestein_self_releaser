@@ -16,7 +16,7 @@
 #   --dest DIR         Install to DIR (default: ~/.local/bin)
 #   --system           Install to /usr/local/bin (requires sudo)
 #   --easy-mode        Auto-update PATH in shell rc files + run doctor
-#   --verify           Run self-test after install
+#   --verify           Require the installed launcher to pass dsr doctor
 #   --quiet            Suppress non-error output
 #   --no-gum           Disable gum formatting even if available
 #   --no-configure     Skip AI agent skill installation
@@ -109,7 +109,7 @@ Options:
   --dest DIR         Install to DIR (default: ~/.local/bin)
   --system           Install to /usr/local/bin (requires sudo)
   --easy-mode        Auto-update PATH + run doctor + install skills
-  --verify           Run self-test after install
+  --verify           Require the installed launcher to pass dsr doctor
   --quiet            Suppress non-error output
   --no-gum           Disable gum formatting even if available
   --no-configure     Skip AI agent skill installation
@@ -132,6 +132,10 @@ Uninstall uses the same --dest and --repo-dir as installation (or --system for
 the system launcher). It retains the removed symlink in a recovery directory
 beside the launcher. Source, skills and data may serve other installations.
 
+With --verify, a failed or timed-out doctor check restores the previous launcher
+and checkout. An already-installed requested tag is also checked. With only
+--easy-mode, the same diagnostic is advisory.
+
 Explicit versions select release tags (with or without a leading v), even when
 a branch has the same name. Use --version main to select the main branch.
 
@@ -140,7 +144,7 @@ Environment:
   DSR_DATA_DIR       Override data directory (default: ~/.local/share/dsr)
   DSR_REPO_DIR       Override repo clone directory (default: $DSR_DATA_DIR/repo)
   DSR_INSTALLER_TIMEOUT  Complete request budget, 1–3600 seconds (default:
-                         30 for HTTP, 300 for Git; includes helper processes)
+                         30 for HTTP and doctor, 300 for Git; includes helpers)
   HTTPS_PROXY        Proxy for HTTPS connections
   HTTP_PROXY         Proxy for HTTP connections
 EOF
@@ -598,6 +602,7 @@ check_existing_install() {
        [[ -z "$OFFLINE_TARBALL" && -n "$current_version" && "$current_version" == "${VERSION#v}" &&
           -L "$installed" && "$(readlink "$installed")" == "$REPO_DIR/dsr" ]] &&
        installed_matches_requested_tag; then
+      if ((VERIFY)); then run_doctor || return $?; fi
       ok "dsr $VERSION is already installed"
       info "Use --force to reinstall"
       INSTALL_COMMITTED=1
@@ -1521,26 +1526,15 @@ maybe_add_path() {
 # ============================================================
 
 run_doctor() {
-  if [ "$VERIFY" -eq 0 ] && [ "$EASY" -eq 0 ]; then
-    return 0
-  fi
-
-  local dsr_bin="$DEST/$BINARY_NAME"
-  if [ ! -x "$dsr_bin" ]; then
-    warn "Cannot run diagnostics: $dsr_bin not found"
+  local dsr_bin="$DEST/$BINARY_NAME" status=0
+  if [[ ! -x "$dsr_bin" ]]; then
+    err "Cannot run diagnostics: $dsr_bin is not executable"
     return 1
   fi
-
-  info "Running post-install diagnostics..."
-  echo ""
-
-  if command -v timeout >/dev/null 2>&1; then
-    timeout 30 "$dsr_bin" doctor 2>&1 || true
-  else
-    "$dsr_bin" doctor 2>&1 || true
-  fi
-
-  echo ""
+  info "Running dsr doctor through $dsr_bin"
+  run_request "${DSR_INSTALLER_TIMEOUT:-30}" "$dsr_bin" doctor >&2 || status=$?
+  if ((status != 0)); then warn "dsr doctor exited with status $status"; fi
+  return "$status"
 }
 
 # ============================================================
@@ -1662,10 +1656,9 @@ main() {
   # Keep both previous entries until the source and launcher are installed.
   activate_source
   install_binary
-  INSTALL_COMMITTED=1
-
-  # Setup config directories
   setup_config_dirs
+  if ((VERIFY)); then run_doctor || return $?; fi
+  INSTALL_COMMITTED=1
 
   # Agent detection + skill installation
   local status=0
@@ -1676,8 +1669,9 @@ main() {
   # PATH setup
   maybe_add_path || warn "PATH configuration did not complete; dsr is installed at $DEST/$BINARY_NAME"
 
-  # Post-install diagnostics
-  run_doctor || warn "Post-install diagnostics did not complete; dsr is installed"
+  if ((EASY && ! VERIFY)); then
+    run_doctor || warn "Post-install diagnostics did not complete; dsr is installed"
+  fi
 
   # Summary
   show_summary

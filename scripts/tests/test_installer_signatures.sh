@@ -723,6 +723,12 @@ for module in guardrails logging config platforms current; do
   source "$source_dir/src/$module.sh" || exit 1
 done
 if [[ "${1:-}" == --version ]]; then printf 'dsr version %s\\n' "$DSR_VERSION"
+elif [[ "${1:-}" == doctor ]]; then
+  printf '%s\\n' "$DSR_VERSION" >> "$DSR_FIXTURE_CASE/doctor.calls"
+  case "${DSR_FIXTURE_FAULT:-}" in
+    failing-doctor) exit 42 ;;
+    stalled-doctor) exec "$DSR_FIXTURE_CASE/wrappers/stall-request" ;;
+  esac
 else fixture_current; fi
 '''.replace('VERSION_MARKER', version)
         if invalid == 'entry':
@@ -1341,6 +1347,13 @@ check('exact selected destination and source version is a no-op', result.returnc
 trace = (context[0] / 'git.trace').read_text() if (context[0] / 'git.trace').exists() else ''
 check('exact no-op does not acquire source or contact the network', not list(context[0].glob('.repo.install.*')) and ' clone ' not in trace and ' fetch ' not in trace and not (context[0] / 'http.calls').exists())
 
+result = invoke(context, ['--version', 'v1.2.3', '--verify'], fault='failing-doctor')
+calls = context[0] / 'doctor.calls'
+check('requested verification checks an already-installed exact tag', result.returncode == 42 and
+      calls.is_file() and calls.read_text().splitlines() == ['1.2.3'])
+check('failed exact-tag verification keeps its existing checkout', tree_snapshot(context[1]) == before and
+      identity(context[1]) == old_id and not list(context[0].glob('.repo.install.*')))
+
 # The real project can advance main without changing DSR_VERSION. A matching
 # marker must not silently defeat a request to switch back to a release tag.
 (context[1] / 'after-tag').write_text('newer main source with the same version\n')
@@ -1408,6 +1421,35 @@ environment['DSR_DEST'] = str(alias)
 result = invoke(context, ['--offline', str(valid_archive)])
 check('an independent symlinked bin directory remains supported', result.returncode == 0 and run([str(target / 'dsr')]).stdout.strip() == 'new')
 check('installation preserves the selected bin directory alias', alias.is_symlink() and os.readlink(alias) == str(target))
+
+for label, flags, fault, expected_status in (
+        ('verified-install', ['--verify', '--easy-mode'], '', 0),
+        ('verification-fails', ['--verify'], 'failing-doctor', 42),
+        ('verification-stalls', ['--verify'], 'stalled-doctor', 124),
+        ('advisory-doctor', ['--easy-mode'], 'failing-doctor', 0),
+        ('advisory-deadline', ['--easy-mode'], 'stalled-doctor', 0)):
+    context = setup(label, destination=False)
+    case, selected, target, environment = context
+    if fault == 'stalled-doctor':
+        environment['DSR_INSTALLER_TIMEOUT'] = '1'
+    # A regular launcher exercises rollback of both switched filesystem entries.
+    launcher = target / 'dsr'
+    launcher.write_text('#!/bin/sh\nprintf "old launcher\\n"\n')
+    launcher.chmod(0o755)
+    before, source_id, launcher_id = tree_snapshot(selected), identity(selected), identity(launcher)
+    result = invoke(context, ['--offline', str(valid_archive), *flags], fault=fault)
+    calls = case / 'doctor.calls'
+    check(label + ' reports the diagnostic outcome', result.returncode == expected_status)
+    check(label + ' runs the selected new launcher once', calls.is_file() and
+          calls.read_text().splitlines() == ['1.2.3'])
+    if expected_status:
+        check(label + ' restores the exact previous source and launcher',
+              selected.is_dir() and tree_snapshot(selected) == before and identity(selected) == source_id and
+              launcher.is_file() and not launcher.is_symlink() and identity(launcher) == launcher_id and
+              run([str(launcher)]).stdout.strip() == 'old launcher')
+    else:
+        check(label + ' retains the new installation', launcher.is_symlink() and
+              run([str(launcher)]).stdout.strip() == 'new')
 
 # Guard the machine's system bin even if this fixture is run against an old
 # installer that also attempts to remove /usr/local/bin/dsr.
