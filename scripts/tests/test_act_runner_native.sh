@@ -488,6 +488,13 @@ elif sys.argv[2] == 'context':
               (result.returncode == 0 and isinstance(planned, dict) and bool(planned.get('operations')) and path_matches)
               if accepted else result.returncode != 0 and not result.stdout)
 else:
+    # Use the shipped recipe verbatim. Its registry entry is named outputs,
+    # while the configured executable and Go package directory are named tool.
+    template = subprocess.check_output(['yq', '-r', '.build_cmd',
+                                        str(root / 'config/repos.d/_template_go.yaml')], text=True).strip()
+    run_case('shipped-go-template', template,
+             preparation=lambda case: write(case / 'source/cmd/tool/main.go',
+                                            'package main\nfunc main() { println("fresh-73") }\n'))
     case, _ = run_case('explicit-file', 'go build -p=1 -buildvcs=false -o tool .')
     check('go build leaves old GOBIN executable untouched', hashlib.sha256((case / 'installed/tool').read_bytes()).hexdigest() == stale_hash)
     run_case('explicit-alias', 'go build -p=1 -buildvcs=false -o chosen-name .')

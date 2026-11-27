@@ -10702,6 +10702,8 @@ act_substitute_build_cmd_tokens() {
     local version_stripped="${version#v}"
 
     cmd="${cmd//\$\{name\}/$name}"
+    # The shipped Go template uses this spelling in both -o and the package path.
+    cmd="${cmd//\$\{binary_name\}/$name}"
     cmd="${cmd//\$\{NAME\}/$name}"
     cmd="${cmd//\$\{tool\}/$name}"
     cmd="${cmd//\$\{TOOL\}/$name}"
