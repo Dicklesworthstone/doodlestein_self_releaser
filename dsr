@@ -13939,9 +13939,35 @@ EOF
     elif [[ -f "$manifest_file" ]]; then
         manifest_exists=true
         log_info "Using manifest: $manifest_file"
+        # A legacy row may use filename alongside modern rows using name.
+        # Validate the complete inventory before using any part of its output.
+        local ordinary_names permit_empty=false
+        # Real repair reports an empty inventory through its existing manifest
+        # preflight and structured repair errors, including zero planned uploads.
+        if $fix_missing && ! ${DRY_RUN:-false}; then permit_empty=true; fi
+        if ! ordinary_names=$(jq -rs --argjson permit_empty "$permit_empty" '
+            def asset_name:
+                if type != "object" then error("invalid artifact row")
+                elif .name != null and .filename != null and .name != .filename
+                then error("conflicting artifact names")
+                else .name // .filename end |
+                if type == "string" and test("^[A-Za-z0-9]") and
+                    (test("[^A-Za-z0-9._+-]") | not)
+                then . else error("invalid artifact name") end;
+            if length == 1 and (.[0].artifacts | type == "array") then .[0].artifacts
+            else error("expected one artifact inventory") end |
+            map(asset_name) |
+            if (length > 0 or $permit_empty) and length == (unique | length)
+            then .[] else error("empty or duplicate artifact inventory") end
+        ' "$manifest_file"); then
+            log_error "Invalid ordinary release manifest inventory"
+            $JSON_MODE && json_envelope release-verify error 4 \
+                '{"error":"Invalid ordinary release manifest inventory"}'
+            return 4
+        fi
         while IFS= read -r name; do
             [[ -n "$name" ]] && expected_assets+=("$name")
-        done < <(jq -r '.artifacts[]?.name // .artifacts[]?.filename // empty' "$manifest_file" 2>/dev/null)
+        done <<< "$ordinary_names"
     else
         log_warn "No manifest found - cannot verify completeness"
     fi

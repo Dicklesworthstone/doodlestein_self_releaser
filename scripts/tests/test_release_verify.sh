@@ -1235,6 +1235,57 @@ test_verify_detects_missing_assets() {
     harness_teardown
 }
 
+test_verify_ordinary_manifest_inventory() {
+    ((TESTS_RUN++))
+    if [[ "$HAS_YQ" != true ]]; then
+        skip "yq required for manifest verification"; return 0
+    fi
+    harness_setup
+    seed_repos_config
+    seed_manifest test-tool v1.0.0
+    local manifest="$DSR_STATE_DIR/artifacts/test-tool-v1.0.0/test-tool-v1.0.0-manifest.json"
+    local original="$TEST_TMPDIR/original-manifest.json" mutation
+    local -a failures=()
+    cp -- "$manifest" "$original" || { fail "ordinary manifest fixture setup"; harness_teardown; return; }
+    create_mock_gh '{"id":12345,"tag_name":"v1.0.0","assets":[{"name":"test-tool-linux-amd64"}]}'
+
+    # The missing legacy row must still be selected when a modern row exists.
+    # Identical aliases on a row identify one asset.
+    jq '.artifacts = [{name:"test-tool-linux-amd64",filename:"test-tool-linux-amd64"},
+                      {filename:"test-tool-darwin-arm64"}]' "$original" > "$manifest" || {
+        fail "mixed inventory fixture setup"; remove_release_verify_mock_gh; harness_teardown; return;
+    }
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json release verify test-tool v1.0.0
+    if [[ "$(exec_status)" != 1 ]] || ! exec_stdout | jq -e '
+        .details.verification.expected == 2 and
+        .details.assets.present == ["test-tool-linux-amd64"] and
+        .details.assets.missing == ["test-tool-darwin-arm64"]' >/dev/null; then
+        failures+=("mixed manifest did not report the missing legacy asset")
+    fi
+
+    for mutation in '[]' 'null' '{}' '[{}]' '[{name:"a",filename:"b"}]' \
+                    '[{name:"same"},{filename:"same"}]' '[{name:"ok"},{filename:"bad\nname"}]'; do
+        if ! jq ".artifacts = $mutation" "$original" > "$manifest"; then
+            failures+=("could not prepare invalid inventory: $mutation")
+            continue
+        fi
+        PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json release verify test-tool v1.0.0
+        if [[ "$(exec_status)" != 4 ]] || ! exec_stdout | jq -e '
+            .status == "error" and .exit_code == 4 and
+            .details.error == "Invalid ordinary release manifest inventory"' >/dev/null; then
+            failures+=("invalid inventory was not rejected: $mutation")
+        fi
+    done
+    if [[ ${#failures[@]} == 0 ]]; then
+        pass "ordinary verification compares mixed rows and rejects invalid inventories"
+    else
+        fail "ordinary manifest inventories"
+        printf '  %s\n' "${failures[@]}"
+    fi
+    remove_release_verify_mock_gh
+    harness_teardown
+}
+
 test_verify_detects_extra_assets() {
     ((TESTS_RUN++))
 
@@ -4061,6 +4112,7 @@ echo ""
 echo "Asset Comparison Tests (mocked gh):"
 test_verify_all_assets_present
 test_verify_detects_missing_assets
+test_verify_ordinary_manifest_inventory
 test_verify_detects_extra_assets
 test_verify_refuses_diagnostic_purpose_before_remote_access
 test_strict_verify_rejects_unreceipted_native_manifest
