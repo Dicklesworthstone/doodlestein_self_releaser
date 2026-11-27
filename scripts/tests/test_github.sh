@@ -3143,6 +3143,33 @@ test_workflow_reader_stopped_later_page() (
   ! grep -q 'status=in_progress\|page=3' "$TEMP_DIR/workflow.calls"
 )
 
+test_workflow_inventory_parser_failure() (
+  local reader="$1" phase="$2" parser_exit="$3" expected="$4" status=0 output
+  gh_api() {
+    printf '%s\n' "$1" >> "$TEMP_DIR/workflow.calls"
+    printf '%s\n' '{"total_count":0,"workflow_runs":[],"jobs":[]}'
+  }
+  jq() {
+    local filter="${!#}"
+    case "$phase:$filter" in
+      validation:*'length == 1 and (.[0]'*|merge:*'add | reduce .[]'*|report:*'{total_count:'*)
+        # A partial stdout prefix is never an admissible inventory.
+        printf '%s\n' '{"total_count":0,"workflow_runs":[],"jobs":[]}'
+        return "$parser_exit" ;;
+    esac
+    command jq "$@"
+  }
+  if [[ "$reader" == active ]]; then
+    output=$(gh_workflow_active_runs owner/repo) || status=$?
+  else
+    output=$(gh_workflow_jobs owner/repo 123 1) || status=$?
+  fi
+  [[ "$status" == "$expected" && -z "$output" ]] || return 1
+  local requests=1
+  [[ "$reader:$phase" != active:report ]] || requests=2
+  [[ "$(wc -l < "$TEMP_DIR/workflow.calls")" -eq "$requests" ]]
+)
+
 test_exported_workflow_reader_interruption() (
   local status=0
   bash -c 'gh_api() { return 141; }; gh_workflow_active_runs owner/repo' \
@@ -3175,6 +3202,14 @@ run_workflow_interruption_tests() {
 WORKFLOW_STATUSES
     run_test "workflow_${reader}_stopped_later_page" \
       test_workflow_reader_stopped_later_page "$reader"
+    run_test "workflow_${reader}_validator_killed" \
+      test_workflow_inventory_parser_failure "$reader" validation 137 5
+    run_test "workflow_${reader}_semantic_failure" \
+      test_workflow_inventory_parser_failure "$reader" validation 5 8
+    run_test "workflow_${reader}_merge_crashed" \
+      test_workflow_inventory_parser_failure "$reader" merge 139 5
+    run_test "workflow_${reader}_report_interrupted" \
+      test_workflow_inventory_parser_failure "$reader" report 141 5
   done
   run_test workflow_exported_interruption test_exported_workflow_reader_interruption
 }

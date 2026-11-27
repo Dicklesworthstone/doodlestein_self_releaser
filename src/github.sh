@@ -1250,6 +1250,17 @@ _gh_monitoring_interrupted() {
       (status >= 129 && status <= 255 && status != 137)))
 }
 
+# Workflow JSON parsers run outside the transport deadline. jq's semantic
+# error (5) is unavailable evidence, while even SIGKILL (137) here withdraws
+# the entire poll. Buffer stdout so a stopped parser cannot leak a prefix.
+_gh_workflow_jq() {
+    local output status=0
+    output=$(jq "$@") || status=$?
+    if ((status >= 129 && status <= 255)); then return 5; fi
+    ((status == 0)) || return 8
+    printf '%s\n' "$output"
+}
+
 # Enumerate active runs for throttle detection. Filter before paginating so
 # completed runs cannot hide an older queue. GitHub limits filtered searches
 # to 1,000 results; refuse incomplete inventories instead of guessing healthy.
@@ -1292,7 +1303,7 @@ gh_workflow_active_runs() {
                 _gh_log_error "Cannot read $status workflow runs for $repo (page $page)"
                 return 8
             fi
-            if ! jq -es --arg status "$status" 'length == 1 and (.[0] |
+            _gh_workflow_jq -es --arg status "$status" 'length == 1 and (.[0] |
                 type == "object" and
                 (.total_count | type == "number" and . >= 0 and floor == . and . <= 9007199254740991) and
                 (.workflow_runs | type == "array" and length <= 100) and
@@ -1307,23 +1318,24 @@ gh_workflow_active_runs() {
                         (type == "number" and . >= 1 and floor == . and . <= 9007199254740991)) and
                     (.workflow_id | type == "null" or
                         (type == "number" and . > 0 and floor == . and . <= 9007199254740991))))' \
-                    <<< "$response" >/dev/null 2>&1; then
+                    <<< "$response" >/dev/null 2>&1 || {
+                request_status=$?
                 _gh_log_error "Invalid $status workflow-run listing for $repo (page $page)"
-                return 8
-            fi
-            total_count=$(jq -r '.total_count' <<< "$response") || return 8
+                return "$request_status"
+            }
+            total_count=$(_gh_workflow_jq -r '.total_count' <<< "$response") || return $?
             if ((total_count > 1000)); then
                 _gh_log_error "$status workflow-run listing for $repo exceeds GitHub's 1,000-result limit"
                 return 8
             fi
             ((total_count > expected_count)) && expected_count=$total_count
-            page_runs=$(jq -c '.workflow_runs' <<< "$response") || return 8
-            page_count=$(jq -r 'length' <<< "$page_runs") || return 8
+            page_runs=$(_gh_workflow_jq -c '.workflow_runs' <<< "$response") || return $?
+            page_count=$(_gh_workflow_jq -r 'length' <<< "$page_runs") || return $?
             # Stream full API records: a single page can exceed the operating
             # system's argument-size limit. A repeated ID cannot fill a gap.
-            status_runs=$(printf '%s\n' "$status_runs" "$page_runs" | jq -sc '
-                add | reduce .[] as $run ({}; .[$run.id | tostring] = $run) | [.[]]') || return 8
-            unique_count=$(jq -r 'length' <<< "$status_runs") || return 8
+            status_runs=$(printf '%s\n' "$status_runs" "$page_runs" | _gh_workflow_jq -sc '
+                add | reduce .[] as $run ({}; .[$run.id | tostring] = $run) | [.[]]') || return $?
+            unique_count=$(_gh_workflow_jq -r 'length' <<< "$status_runs") || return $?
             if ((unique_count >= expected_count)); then
                 complete=true
                 break
@@ -1339,10 +1351,10 @@ gh_workflow_active_runs() {
         fi
         # A queued run may start between queries. Prefer its later
         # in_progress record and start time, retaining one record per run ID.
-        runs=$(printf '%s\n' "$runs" "$status_runs" | jq -sc '
-            add | reduce .[] as $run ({}; .[$run.id | tostring] = $run) | [.[]]') || return 8
+        runs=$(printf '%s\n' "$runs" "$status_runs" | _gh_workflow_jq -sc '
+            add | reduce .[] as $run ({}; .[$run.id | tostring] = $run) | [.[]]') || return $?
     done
-    printf '%s\n' "$runs" | jq -c '{total_count: length, workflow_runs: .}'
+    _gh_workflow_jq -c '{total_count: length, workflow_runs: .}' <<< "$runs"
 }
 
 # Read every job in one observed workflow attempt. A running workflow may be
@@ -1377,7 +1389,7 @@ gh_workflow_jobs() {
             _gh_log_error "Cannot read workflow jobs for $repo run $run_id (page $page)"
             return 8
         fi
-        if ! jq -es --arg run "$run_id" --arg attempt "$attempt" '
+        _gh_workflow_jq -es --arg run "$run_id" --arg attempt "$attempt" '
             def identifier: type == "number" and . > 0 and floor == . and . <= 9007199254740991;
             length == 1 and (.[0] | type == "object" and
                 (.total_count | type == "number" and . >= 0 and floor == . and . <= 1000) and
@@ -1391,19 +1403,20 @@ gh_workflow_jobs() {
                     (.run_attempt == null or (.run_attempt | identifier and
                         ($attempt == "" or tostring == $attempt))) and
                     all([.created_at,.started_at,.completed_at][]; type == "null" or type == "string")))
-            ' <<< "$response" >/dev/null 2>&1; then
+            ' <<< "$response" >/dev/null 2>&1 || {
+            request_status=$?
             _gh_log_error "Invalid or oversized workflow-job listing for $repo run $run_id (page $page)"
-            return 8
-        fi
-        total=$(jq -r '.total_count' <<< "$response") || return 8
+            return "$request_status"
+        }
+        total=$(_gh_workflow_jq -r '.total_count' <<< "$response") || return $?
         ((total > expected)) && expected=$total
-        page_jobs=$(jq -c '.jobs' <<< "$response") || return 8
-        count=$(jq -r 'length' <<< "$page_jobs") || return 8
-        jobs=$(printf '%s\n' "$jobs" "$page_jobs" | jq -sc '
-            add | reduce .[] as $job ({}; .[$job.id | tostring] = $job) | [.[]]') || return 8
-        unique=$(jq -r 'length' <<< "$jobs") || return 8
+        page_jobs=$(_gh_workflow_jq -c '.jobs' <<< "$response") || return $?
+        count=$(_gh_workflow_jq -r 'length' <<< "$page_jobs") || return $?
+        jobs=$(printf '%s\n' "$jobs" "$page_jobs" | _gh_workflow_jq -sc '
+            add | reduce .[] as $job ({}; .[$job.id | tostring] = $job) | [.[]]') || return $?
+        unique=$(_gh_workflow_jq -r 'length' <<< "$jobs") || return $?
         if ((unique >= expected)); then
-            printf '%s\n' "$jobs" | jq -c '{total_count:length,jobs:.}'
+            _gh_workflow_jq -c '{total_count:length,jobs:.}' <<< "$jobs"
             return $?
         fi
         if ((count < 100)); then
@@ -1414,14 +1427,15 @@ gh_workflow_jobs() {
             # The latest attempt may change between requests. Require the
             # first complete page to identify its attempt before requesting
             # another, then use the stable attempt endpoint for every page.
-            if ! inferred_attempt=$(jq -er '
+            inferred_attempt=$(_gh_workflow_jq -er '
                 [.jobs[].run_attempt] |
                 select(length > 0 and all(.[]; . != null)) | unique |
                 select(length == 1) | .[0]
-            ' <<< "$response"); then
+            ' <<< "$response") || {
+                request_status=$?
                 _gh_log_error "Cannot paginate workflow jobs without an unambiguous attempt for $repo run $run_id"
-                return 8
-            fi
+                return "$request_status"
+            }
             attempt="$inferred_attempt"
             endpoint="repos/$repo/actions/runs/$run_id/attempts/$attempt/jobs"
             query=''
@@ -2294,7 +2308,7 @@ export -f _gh_log_warn _gh_log_error
 export -f gh_get_immutable_tag_ruleset_receipt
 export -f gh_workflow_runs gh_workflow_active_runs gh_workflow_run gh_releases gh_latest_release
 export -f gh_create_release gh_upload_asset gh_upload_asset_named gh_upload_asset_dual
-export -f _gh_operation_interrupted _gh_monitoring_interrupted
+export -f _gh_operation_interrupted _gh_monitoring_interrupted _gh_workflow_jq
 export -f gh_release_asset_inventory
 export -f gh_compare gh_tags gh_repo
 export -f gh_resolve_tag_sha gh_repository_dispatch

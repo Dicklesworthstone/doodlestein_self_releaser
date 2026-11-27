@@ -881,6 +881,7 @@ _mock_check_parser_failure() {
     mock_command_script jq 'selected=false
 for argument in "$@"; do
     case "$DSR_CHECK_PARSER_STAGE:$argument" in
+        api-page:".workflow_runs") selected=true ;;
         analysis:*".workflow_runs | map("*|inventory:".queued_runs[], .stuck_runs[]"|identity:".id"|attempt:".run_attempt // empty"|aggregate:*"queued_runs:[.[1:][]"*|decoration:*". + {tool:"*|target-tool:".tool // \"\""|target-repo:".repo // \"\""|target-workflow:".workflow // \"\""|results:"."|summary:*". as \$repos |"*|snapshot:*"checked_at: \$at"*|envelope:*"not one value"*)
             selected=true ;;
     esac
@@ -906,6 +907,24 @@ raise SystemExit(99)'\'' "$DSR_CHECK_PARSER_SIGNAL"
 else
     exec "$DSR_CHECK_REAL_JQ" "$@"
 fi'
+}
+
+@test "check parser: a killed API page parser withdraws a previously verified repository" {
+    harness_create_config
+    _setup_repos_d
+    _mock_independent_job_inventory cross-repo
+    mkdir -p "$DSR_STATE_DIR/check"
+    printf '%s\n' '{"previous_completed_snapshot":true}' > "$DSR_STATE_DIR/check/last.json"
+    cp "$DSR_STATE_DIR/check/last.json" "$TEST_TMPDIR/previous-check.json"
+    _mock_check_parser_failure api-page KILL
+    run _routing_dsr --json check bv ntm
+    assert_equal 5 "$status"
+    "$DSR_CHECK_REAL_JQ" -e '.status == "error" and .exit_code == 5 and
+        .details.throttled == [] and .details.healthy == [] and
+        .details.repos[0].status == "throttled" and .details.repos[1].status == "error"' <<< "$output"
+    cmp "$TEST_TMPDIR/previous-check.json" "$DSR_STATE_DIR/check/last.json"
+    [[ -s "$TEST_TMPDIR/check-parser.failed" ]]
+    ! grep -q 'runs/201/attempts/2/jobs' "$TEST_TMPDIR/gh.calls"
 }
 
 @test "check parser: signalled analysis withdraws earlier queues without replacing the snapshot" {
